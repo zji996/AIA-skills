@@ -1,0 +1,10 @@
+# Local development and runtime artifacts
+.local/
+/tmp/
+.kilo/
+*.log
+*.events.jsonl
+*.prompt
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,3 @@
+[submodule "third_party/pi-kit"]
+	path = third_party/pi-kit
+	url = https://git.aiatechco.com:31443/zji996/pi-kit
