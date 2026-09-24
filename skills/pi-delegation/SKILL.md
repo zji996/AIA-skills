@@ -2,9 +2,8 @@
 name: pi-delegation
 description: 通过 Pi CLI 在后台并行调度外部模型。当有可独立验收的编码子任务想交出去、需要只读代码评审、想要第二意见或同时问多个问题时使用；提供 start/wait/status/result/stop 异步管理、写入互斥与完整答复留存。Use to delegate tasks, run parallel reviews or get a second opinion via Pi.
 license: MIT
-compatibility: Linux；需要 pi、jq、setsid、GNU timeout。
 metadata:
-  version: "2.1.0"
+  version: "2.1.1"
   exclude-agents: pi
 ---
 
@@ -14,21 +13,21 @@ metadata:
 
 ## 何时委派
 
-- **值得委派**：目标能独立验收（有明确的文件或测试结果）、背景几句话能交代清楚、多个任务可以并行，或者需要不同模型的独立视角。
-- **自己做更快**：改动只有几行、需要大量本会话才有的隐含上下文、或者下一步决策强依赖结果细节。
+- **优先考虑委派**：目标能独立验收（有明确的文件或测试结果）、背景几句话能交代清楚，尤其是主控能同时继续实现、集成或验证时。即使主控也能完成，低成本、快反馈的独立任务仍可能值得交给 Pi。
+- **直接处理**：任务短到委派与验收的开销更高，或下一步决策强依赖本会话尚未整理的上下文。
 - 委派出去的写入任务仍由主控负责验收，所以只委派你愿意逐行复核的范围。
 
 ## 环境准备
 
-缺少 `pi`、`jq`、`setsid` 或 `timeout` 时，脚本会一次列出所有缺少的依赖和安装命令。`pi` 由 pi-kit 安装：通过 AIA-skills 的 `bootstrap.sh --with-pi` 安装，或直接运行报错里给出的 pi-kit 命令；`--additive` 模式保留现有 Pi 设置与模型选择。未指定 `--provider/--model` 时使用 Pi 的 `defaultProvider`/`defaultModel`。
+适用于 Linux；需要 `pi`、`jq`、`setsid`、`flock` 和 GNU `timeout`。缺少依赖时，脚本会一次列出缺少项和安装命令。`pi` 由 pi-kit 安装：通过 AIA-skills 的 `bootstrap.sh --with-pi` 安装，或直接运行报错里给出的 pi-kit 命令；`--additive` 模式保留现有 Pi 设置与模型选择。未指定 `--provider/--model` 时使用 Pi 的 `defaultProvider`/`defaultModel`。
 
 ## 快速上手
 
 ```bash
 D=<本技能目录>/scripts/pi-delegate.sh
 
-# 咨询或评审：一条命令等到结果（超过 --max 仍未完成则返回 75，改用 wait 继续）
-$D run --read-only --name consult "对这个缓存方案给出三个主要风险：..."
+# 咨询或评审：给短任务设置 Pi 的运行时限；--max 只控制当前等待时长
+$D run --read-only --name consult --timeout 3m "对这个缓存方案给出三个主要风险：..."
 
 # 并行：同时发出多个任务，统一收取
 $D start --read-only --name review-api "审查 src/api/ 的错误处理..."
@@ -59,11 +58,12 @@ $D wait --all            # 退出码 75 表示仍有任务在跑，重复调用�
 
 ## 协作要点
 
-1. **写入互斥**：同一工作目录同时只允许一个写入任务，因为两个 Agent 同时改同一棵树几乎必然冲突。确需并行写入时给每个任务不同的 `--workdir`，或加 `--allow-parallel-writes` 并确保文件不重叠。
-2. **主控复核**：`ok` 只表示 Pi 正常结束并给出了答复，不代表改对了。写入任务结束后用 `git diff` 和关键验证命令自己确认。
-3. **失败处理**：`timeout`、`stopped`、`crashed` 时先看已生成的文件再决定是否重跑；反复超时说明任务太大，按可验收的文件或功能拆分。
-4. **不可嵌套**：被委派的 Pi 里调用本脚本会被拒绝；本技能也不会安装到 Pi 会扫描的技能目录。
-5. **收尾**：结果采纳后执行 `clean --finished`；需要留档的结论先整理进仓库文档。
+1. **写入互斥**：同一个运行记录根目录内，同一 `--workdir` 同时只允许一个写入任务。跨项目或从不同目录调用但指向同一工作目录时，统一设置 `PI_DELEGATE_RUNS`；否则各自的记录根目录互相不可见。确需并行写入时给每个任务不同的 `--workdir`，或加 `--allow-parallel-writes` 并确保文件不重叠。
+2. **短任务成本**：简短咨询与评审可设置较短的 `--timeout`，并在提示词中限定结论数量与答复长度。单次 `wait --max` 超时只结束本次等待，不会停止后台 Pi；不再需要任务结果时用 `stop`。
+3. **主控复核**：`ok` 只表示 Pi 正常结束并给出了答复，不代表改对了。写入任务结束后用 `git diff` 和关键验证命令自己确认。
+4. **失败处理**：`timeout`、`stopped`、`crashed` 时先看已生成的文件再决定是否重跑；反复超时说明任务太大，按可验收的文件或功能拆分。
+5. **不可嵌套**：被委派的 Pi 里调用本脚本会被拒绝；本技能也不会安装到 Pi 会扫描的技能目录。
+6. **收尾**：结果采纳后执行 `clean --finished`；需要留档的结论先整理进仓库文档。
 
 ## 委派提示词模板
 

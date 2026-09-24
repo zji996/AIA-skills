@@ -38,7 +38,7 @@ install_pi() {
   GIT_TERMINAL_PROMPT=0 git -C "$dir" submodule update --init --quiet -- third_party/pi-kit ||
     die "could not fetch third_party/pi-kit; skills are installed, re-run to retry Pi"
   sh "$dir/third_party/pi-kit/install.sh" "--$mode" </dev/null || die "pi-kit failed; skills are installed, re-run to retry Pi"
-  for tool in jq setsid timeout; do
+  for tool in jq setsid flock timeout; do
     command -v "$tool" >/dev/null || missing+=("$tool")
   done
   if (( ${#missing[@]} )); then

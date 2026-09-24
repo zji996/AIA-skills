@@ -498,6 +498,40 @@ class ScriptTests(unittest.TestCase):
         result = self.run_script(DELEGATE, "clean", "--finished", env=env)
         self.assertEqual(result.stdout.count("removed"), 2)
 
+    def test_delegate_concurrent_writers_share_start_lock(self):
+        env = self.delegate_env(sleep=30)
+        barrier = threading.Barrier(3)
+        results = []
+
+        def start(name):
+            barrier.wait()
+            results.append(self.run_script(DELEGATE, "start", "--name", name, "task", env=env))
+
+        workers = [threading.Thread(target=start, args=(name,)) for name in ("first", "second")]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(timeout=15)
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(sorted(result.returncode for result in results), [0, 2])
+        self.assertIn("still active", next(result.stderr for result in results if result.returncode == 2))
+        winner = json.loads(next(result.stdout for result in results if result.returncode == 0))["run"]
+        self.assertEqual(self.run_script(DELEGATE, "stop", winner, env=env).returncode, 0)
+
+    def test_delegate_stale_starting_run_does_not_block_writer(self):
+        env = self.delegate_env()
+        stale = self.work / "runs/stale"
+        stale.mkdir(parents=True)
+        (stale / "meta.json").write_text(json.dumps({
+            "run": "stale", "dir": str(stale), "workdir": str(self.work),
+            "mode": "write", "name": "stale", "startedEpoch": 1, "startedNs": 1,
+        }))
+        result = self.run_script(DELEGATE, "status", "stale", env=env)
+        self.assertEqual(json.loads(result.stdout)["state"], "crashed")
+        result = self.run_script(DELEGATE, "run", "--name", "next", "task", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_delegate_long_result_shows_tail_and_no_result_keeps_it_pending(self):
         env = self.delegate_env(answer="draft " * 1200 + "real answer")
         self.assertEqual(self.run_script(DELEGATE, "start", "question", env=env).returncode, 0)

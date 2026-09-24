@@ -47,7 +47,7 @@ die() {
 # Name every missing dependency at once, with a concrete way to install it.
 require_tools() {
   local tool missing=() hints=() kit
-  for tool in pi jq setsid timeout; do
+  for tool in pi jq setsid timeout flock; do
     command -v "$tool" >/dev/null && continue
     missing+=("$tool")
     case "$tool" in
@@ -62,6 +62,7 @@ require_tools() {
       jq) hints+=("jq: sudo apt install jq  (or your package manager)") ;;
       setsid) hints+=("setsid: sudo apt install util-linux") ;;
       timeout) hints+=("timeout: sudo apt install coreutils") ;;
+      flock) hints+=("flock: sudo apt install util-linux") ;;
     esac
   done
   (( ${#missing[@]} )) || return 0
@@ -139,7 +140,7 @@ supervisor_alive() {
 }
 
 run_state() {
-  local dir=$1
+  local dir=$1 started
   if [[ -f "$dir/exit_code" ]]; then
     if [[ -f "$dir/stopped" ]]; then
       echo stopped
@@ -153,7 +154,12 @@ run_state() {
   elif [[ -f "$dir/pid" ]]; then
     echo crashed
   else
-    echo starting
+    started="$(jq -r '.startedEpoch // 0' "$dir/meta.json")"
+    if (( $(date +%s) - started > 15 )); then
+      echo crashed
+    else
+      echo starting
+    fi
   fi
 }
 
@@ -301,7 +307,11 @@ start_run() {
 
   local mode=write
   (( read_only )) && mode=read-only
-  local dir
+  local dir root start_lock_fd
+  root="$(runs_root)"
+  mkdir -p "$root"
+  exec {start_lock_fd}> "$root/.start.lock"
+  flock "$start_lock_fd"
   if [[ "$mode" == write ]] && (( ! allow_parallel )); then
     while IFS= read -r dir; do
       if [[ "$(jq -r '.mode + "\t" + .workdir' "$dir/meta.json")" == "write	$workdir" ]] &&
@@ -311,9 +321,7 @@ start_run() {
     done < <(all_runs)
   fi
 
-  local root slug id
-  root="$(runs_root)"
-  mkdir -p "$root"
+  local slug id
   [[ -n "${PI_DELEGATE_RUNS:-}" || -f "$root/.gitignore" ]] || echo '*' > "$root/.gitignore"
   prune_expired_runs
   slug="$(printf '%s' "$name" | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^-*//; s/-*$//' | cut -c1-40)"
@@ -350,9 +358,14 @@ start_run() {
   setsid "$SELF" _supervise "$dir" < /dev/null > "$dir/supervisor.log" 2>&1 &
   local tries=0
   until [[ -s "$dir/pid" ]]; do
-    (( ++tries <= 50 )) || die "supervisor did not start; see $dir/supervisor.log"
+    (( ++tries <= 50 )) || {
+      echo 1 > "$dir/exit_code"
+      die "supervisor did not start; see $dir/supervisor.log"
+    }
     sleep 0.1
   done
+  flock -u "$start_lock_fd"
+  exec {start_lock_fd}>&-
   STARTED_DIR=$dir
 }
 
