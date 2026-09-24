@@ -4,7 +4,7 @@ description: 通过 Pi CLI 在后台并行调度外部模型。当有可独立�
 license: MIT
 compatibility: Linux；需要 pi、jq、setsid、GNU timeout。
 metadata:
-  version: "2.0.0"
+  version: "2.1.0"
   exclude-agents: pi
 ---
 
@@ -17,6 +17,10 @@ metadata:
 - **值得委派**：目标能独立验收（有明确的文件或测试结果）、背景几句话能交代清楚、多个任务可以并行，或者需要不同模型的独立视角。
 - **自己做更快**：改动只有几行、需要大量本会话才有的隐含上下文、或者下一步决策强依赖结果细节。
 - 委派出去的写入任务仍由主控负责验收，所以只委派你愿意逐行复核的范围。
+
+## 环境准备
+
+缺少 `pi`、`jq`、`setsid` 或 `timeout` 时，脚本会一次列出所有缺少的依赖和安装命令。`pi` 由 pi-kit 安装：通过 AIA-skills 的 `bootstrap.sh --with-pi` 安装，或直接运行报错里给出的 pi-kit 命令；`--additive` 模式保留现有 Pi 设置与模型选择。未指定 `--provider/--model` 时使用 Pi 的 `defaultProvider`/`defaultModel`。
 
 ## 快速上手
 

@@ -44,6 +44,32 @@ die() {
   exit 2
 }
 
+# Name every missing dependency at once, with a concrete way to install it.
+require_tools() {
+  local tool missing=() hints=() kit
+  for tool in pi jq setsid timeout; do
+    command -v "$tool" >/dev/null && continue
+    missing+=("$tool")
+    case "$tool" in
+      pi)
+        kit="$(cd -P "$SCRIPT_DIR/../../.." 2>/dev/null && pwd)/third_party/pi-kit/install.sh"
+        if [[ -f "$kit" ]]; then
+          hints+=("pi: sh $kit --additive")
+        else
+          hints+=("pi: curl -fsSL https://git.aiatechco.com:31443/zji996/pi-kit/raw/branch/main/install.sh | sh -s -- --additive"
+                  "    (GitHub: https://raw.githubusercontent.com/zji996/pi-kit/main/install.sh)")
+        fi ;;
+      jq) hints+=("jq: sudo apt install jq  (or your package manager)") ;;
+      setsid) hints+=("setsid: sudo apt install util-linux") ;;
+      timeout) hints+=("timeout: sudo apt install coreutils") ;;
+    esac
+  done
+  (( ${#missing[@]} )) || return 0
+  printf 'pi-delegate: missing required tools: %s\n' "${missing[*]}" >&2
+  printf '  %s\n' "${hints[@]}" >&2
+  exit 2
+}
+
 need_value() {
   (( $1 >= 2 )) && [[ -n "$2" ]] || die "$3 requires a value"
 }
@@ -271,9 +297,7 @@ start_run() {
   fi
   [[ -d "$workdir" ]] || die "workdir does not exist: $workdir"
   workdir="$(cd "$workdir" && pwd -P)"
-  command -v pi >/dev/null || die "pi is not installed"
-  command -v jq >/dev/null || die "jq is not installed"
-  command -v setsid >/dev/null || die "setsid is not installed"
+  require_tools
 
   local mode=write
   (( read_only )) && mode=read-only

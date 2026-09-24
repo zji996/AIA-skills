@@ -102,7 +102,7 @@ main() {
     echo "Pi prompt file does not exist: $prompt_file" >&2
     exit 2
   fi
-  command -v pi >/dev/null || { echo "pi is not installed" >&2; exit 2; }
+  command -v pi >/dev/null || { echo "pi is not installed; see pi-delegation SKILL.md for the pi-kit installer" >&2; exit 2; }
   command -v jq >/dev/null || { echo "jq is not installed" >&2; exit 2; }
 
   pi_args=(--no-session --mode json)

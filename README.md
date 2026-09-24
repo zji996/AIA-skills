@@ -44,9 +44,20 @@ curl -fsSL <上面任一链接> | bash -s -- --ref v2.0.0              # 安装�
 curl -fsSL <上面任一链接> | bash -s -- --copy                    # 拷贝安装
 curl -fsSL <上面任一链接> | bash -s -- agent-handoff             # 只安装指定技能
 curl -fsSL <上面任一链接> | bash -s -- --github --dir ~/aia-skills # 指定来源与位置
+curl -fsSL <上面任一链接> | bash -s -- --with-pi                 # 同时安装或更新 Pi（pi-delegation 需要）
 ```
 
-依赖 `git` 与 bash 4+（macOS 需先 `brew install bash`）。`pi-delegation` 仅支持 Linux。
+依赖 `git` 与 bash 4+（macOS 需先 `brew install bash`）。`pi-delegation` 仅支持 Linux，另需 `pi`、`jq`、`setsid` 与 GNU `timeout`。
+
+### Pi 与 pi-kit
+
+`pi-delegation` 调度的 Pi 由子模块 [`third_party/pi-kit`](third_party/pi-kit) 安装。子模块地址是相对地址，从主仓库克隆时指向主仓库的 pi-kit，从 GitHub 克隆时指向 GitHub 上的 pi-kit。
+
+- `--with-pi`：拉取子模块并运行 `pi-kit --additive`，安装或升级 Pi 与 pi-kit 管理的 Pi 包，不改动现有设置；没有 Node.js 22.19+ 时会免 root 安装便携版。完成后提示仍缺少的 `jq`、`setsid`、`timeout`。
+- `--with-pi-sync`：改为运行 `pi-kit --sync`，应用 pi-kit 的完整声明式配置，保留 `defaultProvider`、`defaultModel` 等本机设置。
+- 中国大陆网络可设置 `PI_KIT_MIRROR=cn` 强制使用 npmmirror。
+
+修改 pi-kit 时直接在 `third_party/pi-kit` 中提交，并先推送 pi-kit；然后在本仓库提交子模块指针，否则别人拉不到指针指向的提交。
 
 ### 从克隆的仓库安装
 

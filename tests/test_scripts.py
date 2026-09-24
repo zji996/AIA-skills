@@ -164,6 +164,47 @@ class ScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not a git checkout", result.stderr)
 
+    def test_bootstrap_with_pi_fetches_relative_pi_kit_submodule(self):
+        git_env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                   "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+                   # Local test remotes use the file transport, which Git blocks for submodules by default.
+                   "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "protocol.file.allow",
+                   "GIT_CONFIG_VALUE_0": "always"}
+
+        def git(repo, *args):
+            subprocess.run(["git", "-C", str(repo), *args], env=git_env, check=True, capture_output=True)
+
+        pi_kit = self.work / "pi-kit"
+        pi_kit.mkdir()
+        (pi_kit / "install.sh").write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$PI_KIT_LOG"\n')
+        for args in (["init", "-q", "-b", "main"], ["add", "-A"], ["commit", "-q", "-m", "kit"]):
+            git(pi_kit, *args)
+        upstream = self.work / "upstream"
+        for part in ("scripts", "skills"):
+            shutil.copytree(ROOT / part, upstream / part, ignore=shutil.ignore_patterns("__pycache__"))
+        git(upstream, "init", "-q", "-b", "main")
+        git(upstream, "submodule", "add", "-q", str(pi_kit), "third_party/pi-kit")
+        git(upstream, "config", "-f", ".gitmodules", "submodule.third_party/pi-kit.url", "../pi-kit")
+        for args in (["add", "-A"], ["commit", "-q", "-m", "v1"]):
+            git(upstream, *args)
+
+        home = self.work / "home"
+        checkout = self.work / "checkout"
+        log = self.work / "pi-kit.log"
+        env = {**git_env, "HOME": str(home), "AIA_SKILLS_PRIMARY": str(upstream),
+               "AIA_SKILLS_MIRROR": str(self.work / "missing.git"), "PI_KIT_LOG": str(log)}
+        result = self.run_script(BOOTSTRAP, "--dir", checkout, "agent-handoff", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((checkout / "third_party/pi-kit/install.sh").exists())
+        self.assertFalse(log.exists())
+        result = self.run_script(BOOTSTRAP, "--dir", checkout, "--with-pi", "agent-handoff", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((checkout / "third_party/pi-kit/install.sh").is_file())
+        result = self.run_script(BOOTSTRAP, "--dir", checkout, "--with-pi-sync", "agent-handoff", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(log.read_text().splitlines(), ["--additive", "--sync"])
+        self.assertEqual((home / ".agents/skills/agent-handoff").resolve(), checkout / "skills/agent-handoff")
+
     def test_check_rejects_invalid_metadata_and_links(self):
         repository = self.work / "repository"
         (repository / "scripts").mkdir(parents=True)
@@ -411,6 +452,17 @@ class ScriptTests(unittest.TestCase):
         result = self.run_script(DELEGATE, "wait", "--all", env=env)
         self.assertEqual(result.returncode, 0)
         self.assertIn("no active or undelivered", result.stderr)
+
+    def test_delegate_names_missing_pi_with_bundled_installer(self):
+        system_path = "/usr/bin:/bin"
+        if shutil.which("pi", path=system_path):
+            self.skipTest("pi is installed in a system directory")
+        env = {**os.environ, "PATH": system_path, "PI_DELEGATE_RUNS": str(self.work / "runs")}
+        result = self.run_script(DELEGATE, "start", "task", env=env)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("missing required tools: pi", result.stderr)
+        self.assertIn(f"sh {ROOT}/third_party/pi-kit/install.sh --additive", result.stderr)
+        self.assertFalse((self.work / "runs").exists())
 
     def test_delegate_refuses_nested_runs_and_exports_guard(self):
         env = self.delegate_env()

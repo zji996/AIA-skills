@@ -1,3 +1,5 @@
+# Relative to the superproject remote: the primary host resolves to its own
+# pi-kit and a GitHub clone resolves to github.com/zji996/pi-kit.
 [submodule "third_party/pi-kit"]
 	path = third_party/pi-kit
-	url = https://git.aiatechco.com:31443/zji996/pi-kit
+	url = ../pi-kit.git
