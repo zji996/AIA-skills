@@ -4,11 +4,12 @@
 
 - 让 Pi 并行审查一下 `src/api/` 和 `src/db/` 的错误处理，你继续做前端。
 - 这个缓存方案帮我找个便宜模型问问第二意见。
+- 这个动画页面我来做浏览器检查，你让 Pi 先审一下交互与小屏布局，给出最重要的三条意见。
 - Delegate the migration of these three config files to a background agent and review the diff afterwards.
 - 让 Pi 只读审查存储布局，控制台别刷读取步骤，只给我最终结论和错误。
 - 把这个 bug 交给 Pi 修，跑 `npm test` 通过才算完成，我先去做别的。
 
 ## 不应触发
 
-- 把这个函数的变量名改成驼峰。（改动太小，自己做更快）
+- 把这个函数的变量名改成驼峰。（委派与验收的开销高于直接修改）
 - 帮我配置 Pi 的默认模型。（是 Pi 配置问题，不是委派任务）

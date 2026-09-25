@@ -20,7 +20,7 @@
 | --- | --- | --- |
 | **`repo-governance`** | `skills/repo-governance/` | **上下文治理与审计**：定义 `AGENTS.md`、`docs/current.md`、决策记录的信息分层；`audit-context.py` 只读检查入口文件过长、下一步堆积、`.local/` 未忽略、文档断链等漂移问题。 |
 | **`agent-handoff`** | `skills/agent-handoff/` | **会话交接**：`handoff-snapshot.sh` 自动采集分支、HEAD、未提交文件、最近提交与未读取的委派任务，生成交接账本草稿，模型只需补充判断部分。 |
-| **`pi-delegation`** | `skills/pi-delegation/` | **Pi 后台协作**：把可验收的原子任务外包给 Pi 并行完成，只收结果；脚本代跑 `--accept` 验收命令并给出一行结论（delivered / answered / rejected / malformed…），过程留在 run 目录不进主控上下文；答复畸形自动重跑一次，写入互斥、禁止嵌套委派，且不会安装给 Pi 自己。 |
+| **`pi-delegation`** | `skills/pi-delegation/` | **Pi 后台协作**：尽早把可验收的原子任务外包给 Pi 并行完成，主控同时推进其他工作、只收结果；脚本代跑 `--accept` 验收命令并给出一行结论（delivered / answered / rejected / malformed…），过程留在 run 目录不进主控上下文；答复畸形自动重跑一次，写入互斥、禁止嵌套委派，且不会安装给 Pi 自己。 |
 | **`openai-image-gen`** | `skills/openai-image-gen/` | **图像生成落盘**：调用 OpenAI Image API 生成配图、Banner、图标等素材，直接写入本地文件并只返回一行 JSON；附提示词、尺寸与费用选择要点。 |
 
 ---

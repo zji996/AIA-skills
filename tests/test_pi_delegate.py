@@ -5,6 +5,8 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -169,6 +171,36 @@ class PiDelegateTests(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
         self.assertEqual(self.cli("clean", "--finished").stdout.count("removed"), 2)
+
+    def test_concurrent_writers_share_start_lock(self):
+        self.fake_pi([answer("slow"), SETTLED], sleep=30)
+        barrier, results = threading.Barrier(3), []
+
+        def start(name):
+            barrier.wait()
+            results.append(self.cli("start", "--name", name, "task"))
+
+        workers = [threading.Thread(target=start, args=(name,)) for name in ("first", "second")]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(timeout=20)
+        self.assertEqual(sorted(r.returncode for r in results), [0, 2])
+        self.assertIn("still active", next(r.stderr for r in results if r.returncode == 2))
+        winner = json.loads(next(r.stdout for r in results if r.returncode == 0))["run"]
+        self.assertEqual(self.cli("stop", winner).returncode, 0)
+
+    def test_stale_starting_run_does_not_block_writer(self):
+        stale = self.work / "runs/stale"
+        stale.mkdir(parents=True)
+        (stale / "meta.json").write_text(json.dumps({"run": "stale", "dir": str(stale), "workdir": str(self.work),
+                                                     "mode": "write", "name": "stale",
+                                                     "startedEpoch": int(time.time()) - 60, "startedNs": 1}))
+        self.assertEqual(json.loads(self.cli("status", "stale").stdout)["state"], "crashed")
+        self.fake_pi([answer("ok"), SETTLED])
+        result = self.cli("run", "--name", "next", "task")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_long_answer_shows_tail_and_no_result_keeps_it_pending(self):
         self.fake_pi([answer("draft " * 1200 + "real answer"), SETTLED])

@@ -10,6 +10,7 @@ Standard library only; Linux (process groups, /proc). Python 3.9+.
 """
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -27,6 +28,7 @@ USAGE_EXIT = 2
 SCRIPT = Path(__file__).resolve()
 FINISHED_OK = ("delivered", "answered")
 ACTIVE = ("starting", "running")
+STARTING_GRACE = 15  # seconds a run may wait for its supervisor before it counts as crashed
 # Pi-side glitch: a tool call printed as plain text ends the run with no work done.
 LEAKED_CALL = re.compile(r"\bcall:[\w.-]+(?::[\w-]+)?\{")
 
@@ -121,7 +123,11 @@ def run_state(run):
         return (read_json(run / "summary.json", {}) or {}).get("state", "crashed")
     if supervisor_alive(run):
         return "running"
-    return "crashed" if (run / "pid").is_file() else "starting"
+    if (run / "pid").is_file():
+        return "crashed"
+    # A supervisor that never started must not block writers in this workdir forever.
+    started = (read_json(run / "meta.json", {}) or {}).get("startedEpoch", 0)
+    return "starting" if time.time() - started <= STARTING_GRACE else "crashed"
 
 
 def events(run):
@@ -430,14 +436,21 @@ def start_run(args):
     workdir = str(workdir.resolve())
     missing_tools()
     mode = "read-only" if args.read_only else "write"
+    root = runs_root()
+    root.mkdir(parents=True, exist_ok=True)
+    # Concurrent starts would each miss the other's run in the exclusivity check; serialize them.
+    with open(root / ".start.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return create_run(args, prompt, workdir, mode, root)
+
+
+def create_run(args, prompt, workdir, mode, root):
     if mode == "write" and not args.allow_parallel_writes:
         for run in all_runs():
             meta = read_json(run / "meta.json", {}) or {}
             if meta.get("mode") == "write" and meta.get("workdir") == workdir and run_state(run) in ACTIVE:
                 die(f"write run {run.name} is still active in {workdir}; wait for it, use --read-only, "
                     "or pass --allow-parallel-writes")
-    root = runs_root()
-    root.mkdir(parents=True, exist_ok=True)
     if not os.environ.get("PI_DELEGATE_RUNS") and not (root / ".gitignore").exists():
         (root / ".gitignore").write_text("*\n")
     prune_expired()
@@ -466,6 +479,8 @@ def start_run(args):
         if (run / "pid").is_file():
             return run
         time.sleep(0.1)
+    write_json(run / "summary.json", {"state": "crashed", "error": "supervisor did not start"})
+    (run / "exit_code").write_text("1\n")
     die(f"supervisor did not start; see {run / 'supervisor.log'}")
 
 
