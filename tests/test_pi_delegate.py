@@ -31,6 +31,29 @@ SETTLED = {"type": "agent_settled"}
 LEAKED = "Let's read `trainingStyles.ts` as well.call:default_api:read{limit:120,offset:1,path:src/trainingStyles.ts}"
 
 
+def codex_events(answer_text="final answer", files=(), fail=None):
+    """Shape of real `codex exec --json` output (codex-cli 0.156), incl. its config-warning items."""
+    events = [{"type": "thread.started", "thread_id": "t1"},
+              {"type": "item.completed", "item": {"id": "item_0", "type": "error",
+                                                  "message": "Codex is ignoring 3 unrecognized configuration settings."}},
+              {"type": "turn.started"},
+              {"type": "item.completed", "item": {"id": "item_1", "type": "agent_message", "text": "Let me look first."}},
+              {"type": "item.started", "item": {"id": "item_2", "type": "command_execution", "command": "cat calc.py"}},
+              {"type": "item.completed", "item": {"id": "item_2", "type": "command_execution", "command": "cat calc.py",
+                                                  "exit_code": 0, "status": "completed"}}]
+    if files:
+        events.append({"type": "item.completed", "item": {"id": "item_3", "type": "file_change",
+                                                          "changes": [{"path": f, "kind": "update"} for f in files]}})
+    if fail:
+        events.append({"type": "turn.failed", "error": {"message": fail}})
+        return events
+    if answer_text is not None:
+        events.append({"type": "item.completed", "item": {"id": "item_4", "type": "agent_message", "text": answer_text}})
+    events.append({"type": "turn.completed", "usage": {"input_tokens": 52618, "cached_input_tokens": 38784,
+                                                       "output_tokens": 430}})
+    return events
+
+
 class PiDelegateTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="pi-delegate-")
@@ -53,6 +76,14 @@ class PiDelegateTests(unittest.TestCase):
         pi = self.bin / "pi"
         pi.write_text("\n".join(lines) + "\n")
         pi.chmod(0o755)
+
+    def fake_codex(self, events, pre=""):
+        lines = ["#!/bin/sh", 'cat > "$PI_LOG.codex-prompt"',
+                 'echo "$$ ${PI_DELEGATE_AGENT:-} ${PI_DELEGATE_ACTIVE:-} $*" >> "$PI_LOG.codex"', pre,
+                 "printf '%s\\n' " + " ".join(shlex.quote(json.dumps(e)) for e in events)]
+        codex = self.bin / "codex"
+        codex.write_text("\n".join(lines) + "\n")
+        codex.chmod(0o755)
 
     def cli(self, *args, stdin=None, cwd=None, timeout=30):
         return subprocess.run([str(DELEGATE), *map(str, args)], cwd=cwd or self.work, env=self.env,
@@ -272,6 +303,80 @@ class PiDelegateTests(unittest.TestCase):
         self.assertEqual(self.cli("start", "--timeout", "0", "task").returncode, 2)
         self.assertEqual(self.cli("start", "   ").returncode, 2)
         self.assertEqual(self.cli("start", "--workdir", self.work / "missing", "task").returncode, 2)
+
+    def test_codex_backend_delivers_through_the_same_contract(self):
+        self.fake_codex(codex_events("fixed add()", files=[str(self.work / "calc.py")]), pre="touch made.txt")
+        result = self.cli("run", "--agent", "codex", "--model", "gpt-test", "--thinking", "low",
+                          "--accept", "test -f made.txt", "修复 add")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.outcome(result)
+        self.assertEqual((state["state"], state["agent"], state["model"], state["turns"]),
+                         ("delivered", "codex", "gpt-test", 1))
+        self.assertEqual(state["files"], ["calc.py"])
+        self.assertEqual(state["tokens"], {"input": 52618, "output": 430, "cacheRead": 38784})
+        self.assertIn("fixed add()", result.stdout)
+        self.assertNotIn("Let me look first", result.stdout)
+        call = (self.work / "pi.log.codex").read_text().split()
+        self.assertEqual(call[1], "codex")  # the agent knows who it is, for nesting rules
+        args = " ".join(call[2:])
+        for flag in ("exec --json", "--skip-git-repo-check", "-m gpt-test", 'model_reasoning_effort="low"',
+                     'approval_policy="never"'):
+            self.assertIn(flag, args)
+        self.assertNotIn("--sandbox", args)
+        self.assertIn("```sh\ntest -f made.txt\n```", (self.work / "pi.log.codex-prompt").read_text())
+
+    def test_codex_failures_and_empty_answers(self):
+        self.fake_codex(codex_events(fail="stream disconnected"))
+        state = self.outcome(self.cli("run", "--agent", "codex", "task"))
+        self.assertEqual(state["state"], "failed")
+        self.assertIn("stream disconnected", state["error"])
+        self.fake_codex(codex_events(answer_text=None))
+        state = self.outcome(self.cli("run", "--agent", "codex", "--retries", "0", "task"))
+        self.assertEqual(state["state"], "answered")  # the earlier progress message is its last word
+        events = codex_events(answer_text=None)
+        events = [e for e in events if (e.get("item") or {}).get("type") != "agent_message"]
+        self.fake_codex(events)
+        self.assertEqual(self.outcome(self.cli("run", "--agent", "codex", "--retries", "0", "task"))["state"], "malformed")
+
+    def test_codex_read_only_is_stated_and_checked_by_outcome(self):
+        repo = self.work / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        self.fake_codex(codex_events("looked"), pre="echo oops > stray.txt")
+        state = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "--workdir", repo, "审查一下"))
+        self.assertEqual((state["state"], state["readOnlyViolation"]), ("failed", ["stray.txt"]))
+        self.assertIn("read-only run changed files", state["error"])
+        self.assertIn("只读任务", (self.work / "pi.log.codex-prompt").read_text())
+        (repo / "stray.txt").unlink()
+        self.fake_codex(codex_events("looked"))
+        self.assertEqual(self.outcome(self.cli("run", "--agent", "codex", "--read-only", "--workdir", repo,
+                                               "review"))["state"], "answered")
+
+    def test_nesting_rules(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        self.fake_codex(codex_events("ok"))
+        self.env["PI_DELEGATE_AGENT"] = "pi"
+        for agent in ("pi", "codex"):
+            result = self.cli("start", "--agent", agent, "task")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("Pi run cannot delegate", result.stderr)
+        self.env["PI_DELEGATE_AGENT"] = "codex"
+        result = self.cli("start", "--agent", "codex", "task")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("not to Codex", result.stderr)
+        self.assertEqual(self.outcome(self.cli("run", "--agent", "pi", "task"))["state"], "answered")
+        guard = (self.work / "pi.log").read_text().split()
+        self.assertEqual(guard[1], "1")  # Pi started by Codex still carries the no-delegation flag
+
+    def test_helper_may_write_inside_its_parents_workdir(self):
+        self.fake_pi([answer("slow"), SETTLED], sleep=30)
+        parent = json.loads(self.cli("start", "--name", "parent", "task").stdout)["run"]
+        self.assertEqual(self.cli("start", "--name", "rival", "task").returncode, 2)
+        self.fake_pi([answer("helper done"), SETTLED])
+        self.env.update(PI_DELEGATE_AGENT="codex", PI_DELEGATE_PARENT_RUN=parent)
+        self.assertEqual(self.outcome(self.cli("run", "--name", "helper", "task"))["state"], "answered")
+        del self.env["PI_DELEGATE_AGENT"], self.env["PI_DELEGATE_PARENT_RUN"]
+        self.cli("stop", parent)
 
 
 if __name__ == "__main__":

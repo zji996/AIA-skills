@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Delegate atomic tasks to Pi and judge them by their results.
+"""Delegate atomic tasks to Pi or Codex and judge them by their results.
 
 A run is fire-and-collect: `start` returns at once, `run`/`wait` block until the
 run finishes and print one outcome line plus the answer. When `--accept` is
 given, this script runs that command in the workdir after Pi finishes; its exit
 status, not Pi's own report, decides whether the task was delivered.
+
+Nesting: a Pi run cannot delegate at all; a Codex run may delegate to Pi but not to
+Codex. The calling agent always reviews and decides whether to adopt a result.
 
 Standard library only; Linux (process groups, /proc). Python 3.9+.
 """
@@ -31,6 +34,10 @@ ACTIVE = ("starting", "running")
 STARTING_GRACE = 15  # seconds a run may wait for its supervisor before it counts as crashed
 # Pi-side glitch: a tool call printed as plain text ends the run with no work done.
 LEAKED_CALL = re.compile(r"\bcall:[\w.-]+(?::[\w-]+)?\{")
+AGENTS = ("pi", "codex")
+DEFAULT_TIMEOUT = {"pi": "15m", "codex": "30m"}
+# Environment handed to a delegated agent; used to refuse self-delegation.
+ENV_AGENT, ENV_PARENT, ENV_LEGACY = "PI_DELEGATE_AGENT", "PI_DELEGATE_PARENT_RUN", "PI_DELEGATE_ACTIVE"
 
 
 def now_iso():
@@ -149,9 +156,10 @@ def status(run):
     state = run_state(run)
     summary = read_json(run / "summary.json", {}) or {}
     out = {"run": meta.get("run", run.name), "name": meta.get("name"), "state": state,
-           "mode": meta.get("mode")}
+           "agent": meta.get("agent", "pi"), "mode": meta.get("mode")}
     if summary:
-        for key in ("elapsedSeconds", "attempts", "model", "turns", "files", "accept", "tokens", "error"):
+        for key in ("elapsedSeconds", "attempts", "model", "turns", "files", "accept", "readOnlyViolation",
+                    "tokens", "error"):
             if summary.get(key) not in (None, [], {}):
                 out[key] = summary[key]
     else:
@@ -233,28 +241,102 @@ def filter_event(event):
     return []
 
 
-def leaked_tool_call(answer):
-    tail = answer.strip()[-600:]
-    return bool(LEAKED_CALL.search(tail)) and tail.endswith("}")
+def filter_codex_event(event):
+    """Map one `codex exec --json` event to compact log events."""
+    kind, item = event.get("type"), event.get("item") or {}
+    itype = item.get("type")
+    if kind == "item.started" and itype == "command_execution":
+        return [{"e": "bash", "cmd": clip(item.get("command", ""), 180)}]
+    if kind == "item.completed":
+        if itype == "command_execution":
+            return [{"e": "bash_done", "ok": item.get("exit_code") == 0}]
+        if itype == "file_change":
+            return [{"e": "edit", "path": change.get("path", "")} for change in item.get("changes") or []]
+        if itype == "agent_message":
+            return [{"e": "message", "text": item.get("text", "")}]
+        if itype == "error":  # Codex reports config warnings this way; they do not end the turn
+            return [{"e": "warning", "detail": clip(item.get("message", ""), 240)}]
+        if itype in ("mcp_tool_call", "web_search", "todo_list"):
+            return [{"e": "tool", "tool": itype, "arg": clip(item.get("query") or item.get("tool") or "", 160)}]
+        return []
+    if kind == "turn.completed":
+        usage = event.get("usage") or {}
+        return [{"e": "turn", "stopReason": "stop", "usage": {"input": usage.get("input_tokens"),
+                 "output": usage.get("output_tokens"), "cacheRead": usage.get("cached_input_tokens")}}]
+    if kind in ("turn.failed", "error"):
+        message = (event.get("error") or {}).get("message") or event.get("message") or kind
+        return [{"e": "turn_error", "detail": clip(message, 300)}]
+    return []
 
 
-def run_pi(meta, run, attempt, stop_flag, holder):
-    """Run Pi once; return (verdict, answer). Verdicts: ok, malformed, failed, timeout, killed, stopped."""
+def codex_model():
+    try:
+        text = (Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "config.toml").read_text()
+    except OSError:
+        return None
+    match = re.search(r'^model\s*=\s*"([^"]+)"', text, re.M)
+    return match.group(1) if match else None
+
+
+def agent_command(meta):
+    if meta["agent"] == "codex":
+        command = ["codex", "exec", "--json", "--skip-git-repo-check", "-C", meta["workdir"],
+                   "-c", 'approval_policy="never"']
+        if meta.get("model"):
+            command += ["-m", meta["model"]]
+        if meta.get("thinking"):
+            command += ["-c", f'model_reasoning_effort="{meta["thinking"]}"']
+        if meta.get("provider"):
+            command += ["-c", f'model_provider="{meta["provider"]}"']
+        return command + ["-"]
     command = ["pi", "--no-session", "--mode", "json"]
     for flag in ("provider", "model", "thinking"):
         if meta.get(flag):
             command += [f"--{flag}", meta[flag]]
     if meta["mode"] == "read-only":
         command += ["--tools", "read,grep,find,ls"]
-    command.append("-p")
-    env = {**os.environ, "PI_DELEGATE_ACTIVE": "1"}
+    return command + ["-p"]
+
+
+def agent_env(meta):
+    env = {k: v for k, v in os.environ.items() if k not in (ENV_AGENT, ENV_PARENT, ENV_LEGACY)}
+    env[ENV_AGENT] = meta["agent"]
+    env[ENV_PARENT] = meta["run"]
+    if meta["agent"] == "pi":
+        env[ENV_LEGACY] = "1"  # older scripts only know this flag
+    return env
+
+
+def caller_agent():
+    return os.environ.get(ENV_AGENT) or ("pi" if os.environ.get(ENV_LEGACY) else None)
+
+
+def nesting_error(agent):
+    caller = caller_agent()
+    if caller == "pi":
+        return "refusing nested delegation: a delegated Pi run cannot delegate further"
+    if caller == "codex" and agent == "codex":
+        return "refusing nested delegation: a delegated Codex run may delegate to Pi (--agent pi) but not to Codex"
+    return None
+
+
+def leaked_tool_call(answer):
+    tail = answer.strip()[-600:]
+    return bool(LEAKED_CALL.search(tail)) and tail.endswith("}")
+
+
+def run_agent(meta, run, attempt, stop_flag, holder):
+    """Run the agent once; return (verdict, answer). Verdicts: ok, malformed, failed, timeout, killed, stopped."""
+    codex = meta["agent"] == "codex"
+    command, env = agent_command(meta), agent_env(meta)
+    convert = filter_codex_event if codex else filter_event
     timed_out = threading.Event()
     with open(run / "prompt.md", "rb") as prompt, open(run / "stderr.log", "ab") as stderr, \
             open(run / "events.jsonl", "a", encoding="utf-8") as log:
         proc = subprocess.Popen(command, cwd=meta["workdir"], stdin=prompt, stdout=subprocess.PIPE,
                                 stderr=stderr, env=env, start_new_session=True)
         holder["pgid"] = proc.pid
-        (run / "pi.pid").write_text(str(proc.pid))
+        (run / "agent.pid").write_text(str(proc.pid))
 
         def expire():
             timed_out.set()
@@ -269,16 +351,24 @@ def run_pi(meta, run, attempt, stop_flag, holder):
                 event = json.loads(raw)
             except ValueError:
                 continue
-            for item in filter_event(event):
+            for item in convert(event):
+                if codex and item["e"] == "turn":
+                    item["model"] = meta.get("model") or codex_model()
                 item.update(attempt=attempt, at=now_iso())
                 log.write(json.dumps(item, ensure_ascii=False) + "\n")
                 log.flush()
                 if item["e"] == "turn":
-                    turn, answer = item, ""
-                elif item["e"] == "result":
+                    # Codex reports usage once per turn, after its last message.
+                    turn = item
+                    settled = settled or codex
+                    if not codex:
+                        answer = ""
+                elif item["e"] in ("result", "message"):
                     answer = item["text"]
                 elif item["e"] == "settled":
                     settled = True
+                elif item["e"] == "turn_error":
+                    turn = {"stopReason": "error"}
         code = proc.wait()
         timer.cancel()
     if stop_flag.is_set():
@@ -321,11 +411,19 @@ def git_changes(workdir):
     return sorted(set(out.splitlines()))
 
 
+def relative_to(path, workdir):
+    """Codex reports absolute paths, Pi and git relative ones; list each file once."""
+    try:
+        return str(Path(path).relative_to(workdir)) if os.path.isabs(path) else path
+    except ValueError:
+        return path
+
+
 def accept(meta, run):
     try:
         done = subprocess.run(meta["accept"], shell=True, cwd=meta["workdir"], capture_output=True, text=True,
                               timeout=meta["acceptTimeoutSeconds"],
-                              env={k: v for k, v in os.environ.items() if k != "PI_DELEGATE_ACTIVE"})
+                              env={k: v for k, v in os.environ.items() if k not in (ENV_AGENT, ENV_PARENT, ENV_LEGACY)})
         code, output = done.returncode, done.stdout + done.stderr
     except subprocess.TimeoutExpired as error:
         code = 124
@@ -354,7 +452,7 @@ def supervise(run):
     verdict, answer, attempts = "failed", "", 0
     try:
         for attempts in range(1, meta["retries"] + 2):
-            verdict, answer = run_pi(meta, run, attempts, stop_flag, holder)
+            verdict, answer = run_agent(meta, run, attempts, stop_flag, holder)
             if verdict != "malformed" or attempts > meta["retries"]:
                 break
             with open(run / "events.jsonl", "a", encoding="utf-8") as log:
@@ -365,8 +463,15 @@ def supervise(run):
             log.write(f"supervisor error: {error!r}\n")
     state = {"ok": "answered"}.get(verdict, verdict)
     summary = {"state": state, "attempts": attempts}
-    # Measure Pi's changes before acceptance, whose own byproducts (caches, reports) are not Pi's work.
+    # Measure the agent's changes before acceptance, whose own byproducts (caches, reports) are not its work.
     after = git_changes(meta["workdir"])
+    before = meta.get("gitBefore")
+    changed = sorted(line[3:] for line in set(after) - set(before)) if before is not None and after is not None else []
+    if meta["mode"] == "read-only" and changed and verdict == "ok":
+        # Codex cannot always be sandboxed (e.g. AppArmor blocks bwrap), so read-only is checked by outcome.
+        verdict = "failed"
+        summary["readOnlyViolation"] = changed
+        state = summary["state"] = "failed"
     if verdict == "ok" and meta.get("accept"):
         summary["accept"] = accept(meta, run)
         state = summary["state"] = "delivered" if summary["accept"]["ok"] else "rejected"
@@ -374,10 +479,8 @@ def supervise(run):
         (run / "result.md").write_text(answer.rstrip("\n") + "\n", encoding="utf-8")
     evs = events(run)
     turns = [e for e in evs if e.get("e") == "turn"]
-    files = {e["path"] for e in evs if e.get("e") in ("edit", "write") and e.get("path")}
-    before = meta.get("gitBefore")
-    if before is not None and after is not None:
-        files |= {line[3:] for line in set(after) - set(before)}
+    files = {relative_to(e["path"], meta["workdir"]) for e in evs if e.get("e") in ("edit", "write") and e.get("path")}
+    files |= set(changed)
     tokens = {k: sum((t.get("usage") or {}).get(k) or 0 for t in turns) for k in ("input", "output", "cacheRead")}
     summary.update(elapsedSeconds=int(time.time() - started), model=turns[-1].get("model") if turns else None,
                    turns=len(turns), files=sorted(files), tokens=tokens)
@@ -386,7 +489,8 @@ def supervise(run):
         tail = (run / "stderr.log").read_text(errors="replace").strip().splitlines()[-3:] \
             if (run / "stderr.log").is_file() else []
         hint = {"malformed": "answer was empty or a leaked tool call",
-                "timeout": f"Pi exceeded {meta['timeout']}"}.get(state)
+                "failed": "read-only run changed files" if summary.get("readOnlyViolation") else None,
+                "timeout": f"{meta.get('agent', 'pi')} exceeded {meta['timeout']}"}.get(state)
         message = "; ".join(x for x in [hint] + errors[-1:] + tail if x)
         if message:
             summary["error"] = clip(message, 600)
@@ -396,9 +500,11 @@ def supervise(run):
 
 # ------------------------------------------------------------------ commands
 
-def missing_tools():
-    if shutil.which("pi"):
+def missing_tools(agent):
+    if shutil.which(agent):
         return
+    if agent == "codex":
+        die("missing required tools: codex\n  codex: see https://github.com/openai/codex (npm i -g @openai/codex), then log in")
     kit = SCRIPT.parents[3] / "third_party/pi-kit/install.sh"
     hint = f"sh {kit} --additive" if kit.is_file() else (
         "curl -fsSL https://git.aiatechco.com:31443/zji996/pi-kit/raw/branch/main/install.sh | sh -s -- --additive"
@@ -418,8 +524,11 @@ def prune_expired():
 
 
 def start_run(args):
-    if os.environ.get("PI_DELEGATE_ACTIVE"):
-        die("refusing nested delegation: already running inside a delegated Pi")
+    error = nesting_error(args.agent)
+    if error:
+        die(error)
+    if args.timeout is None:
+        args.timeout = DEFAULT_TIMEOUT[args.agent]
     if args.prompt_file == "-":
         prompt = sys.stdin.read()
     elif args.prompt_file:
@@ -434,7 +543,7 @@ def start_run(args):
     if not workdir.is_dir():
         die(f"workdir does not exist: {workdir}")
     workdir = str(workdir.resolve())
-    missing_tools()
+    missing_tools(args.agent)
     mode = "read-only" if args.read_only else "write"
     root = runs_root()
     root.mkdir(parents=True, exist_ok=True)
@@ -444,20 +553,29 @@ def start_run(args):
         return create_run(args, prompt, workdir, mode, root)
 
 
-def with_acceptance(prompt, command):
-    """State the definition of done, as a delegator would, in the prompt's language."""
-    body = prompt.rstrip("\n")
-    if re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", prompt):
-        note = "完成标准：你结束后，委派方会在工作目录中运行下面的命令，退出码为 0 即视为完成。"
-    else:
-        note = "Definition of done: after you finish, the delegator runs this command in the working directory; exit code 0 counts as complete."
-    return f"{body}\n\n---\n{note}\n\n```sh\n{command}\n```\n"
+def with_contract(prompt, accept=None, read_only=False):
+    """State the task boundary and definition of done, as a delegator would, in the prompt's language."""
+    zh = bool(re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", prompt))
+    notes = []
+    if read_only:
+        notes.append("只读任务：不要创建、修改或删除任何文件；结束后会核对工作目录，任何改动都会使任务判为失败。" if zh else
+                     "Read-only task: do not create, modify or delete files; the working directory is checked afterwards "
+                     "and any change fails the task.")
+    if accept:
+        notes.append(("完成标准：你结束后，委派方会在工作目录中运行下面的命令，退出码为 0 即视为完成。" if zh else
+                      "Definition of done: after you finish, the delegator runs this command in the working directory; "
+                      "exit code 0 counts as complete.") + f"\n\n```sh\n{accept}\n```")
+    if not notes:
+        return prompt
+    return prompt.rstrip("\n") + "\n\n---\n" + "\n\n".join(notes) + "\n"
 
 
 def create_run(args, prompt, workdir, mode, root):
     if mode == "write" and not args.allow_parallel_writes:
         for run in all_runs():
             meta = read_json(run / "meta.json", {}) or {}
+            if run.name == os.environ.get(ENV_PARENT):
+                continue  # the caller's own run is waiting on this helper
             if meta.get("mode") == "write" and meta.get("workdir") == workdir and run_state(run) in ACTIVE:
                 die(f"write run {run.name} is still active in {workdir}; wait for it, use --read-only, "
                     "or pass --allow-parallel-writes")
@@ -474,15 +592,17 @@ def create_run(args, prompt, workdir, mode, root):
         except FileExistsError:
             run = root / f"{stamp}-{slug}-{os.urandom(2).hex()}"
     first_line = next((line.strip() for line in prompt.splitlines() if line.strip()), "")[:120]
-    if args.accept and not args.hide_accept:
-        prompt = with_acceptance(prompt, args.accept)
+    # Pi's read-only mode removes write tools; Codex gets the boundary in writing and a result check.
+    prompt = with_contract(prompt, None if args.hide_accept else args.accept,
+                           read_only=mode == "read-only" and args.agent == "codex")
     # prompt.md is exactly what Pi receives.
     (run / "prompt.md").write_text(prompt if prompt.endswith("\n") else prompt + "\n", encoding="utf-8")
-    meta = {"run": run.name, "dir": str(run), "workdir": workdir, "mode": mode, "name": args.name or first_line,
+    meta = {"run": run.name, "dir": str(run), "workdir": workdir, "mode": mode, "agent": args.agent,
+            "name": args.name or first_line,
             "provider": args.provider, "model": args.model, "thinking": args.thinking,
             "timeout": args.timeout, "timeoutSeconds": seconds(args.timeout),
             "accept": args.accept, "acceptTimeoutSeconds": seconds(args.accept_timeout),
-            "retries": args.retries, "gitBefore": git_changes(workdir) if mode == "write" else None,
+            "retries": args.retries, "gitBefore": git_changes(workdir),
             "startedAt": now_iso(), "startedEpoch": int(time.time()), "startedNs": time.time_ns()}
     write_json(run / "meta.json", meta)
     with open(run / "supervisor.log", "wb") as log:
@@ -606,7 +726,7 @@ def cmd_stop(args):
                     break
                 time.sleep(0.2)
             if not (run / "exit_code").is_file():  # supervisor is gone or wedged; finish the record here
-                for name in ("pi.pid", "pid"):
+                for name in ("agent.pid", "pi.pid", "pid"):
                     try:
                         kill_group(int((run / name).read_text()), grace=1)
                     except (OSError, ValueError):
@@ -647,7 +767,7 @@ def cmd_clean(args):
 def parser():
     top = argparse.ArgumentParser(
         prog="pi-delegate",
-        description="Delegate atomic tasks to Pi; judge them by results.",
+        description="Delegate atomic tasks to Pi (e.g. Gemini) or Codex (GPT); judge them by results.",
         epilog="States: running | delivered (accept passed) | answered (no --accept) | rejected (accept "
                "failed) | malformed (empty or leaked tool call after reruns) | failed | timeout | killed | "
                "stopped | crashed. Exit: 0 delivered/answered, 1 other finished, 2 usage, 75 still running "
@@ -658,14 +778,16 @@ def parser():
         p.add_argument("words", nargs="*", help="prompt text (or use --prompt / --prompt-file)")
         p.add_argument("--prompt", dest="prompt_text")
         p.add_argument("--prompt-file", help="file with the prompt, or - for stdin")
+        p.add_argument("--agent", choices=AGENTS, default="pi", help="who does the work (default pi)")
         p.add_argument("--name", help="short label used in the run id")
         p.add_argument("--workdir", help="directory Pi works in (default: cwd)")
-        p.add_argument("--read-only", action="store_true", help="only read/grep/find/ls tools")
+        p.add_argument("--read-only", action="store_true",
+                       help="no writes: Pi loses write tools; Codex is told and checked by git status afterwards")
         p.add_argument("--accept", help="shell command run in the workdir after Pi; exit 0 = delivered")
         p.add_argument("--hide-accept", action="store_true",
                        help="do not tell Pi the acceptance command (blind verification)")
         p.add_argument("--accept-timeout", default="10m")
-        p.add_argument("--timeout", default="15m", help="limit for each Pi attempt (default 15m)")
+        p.add_argument("--timeout", help="limit for each attempt (default 15m for pi, 30m for codex)")
         p.add_argument("--retries", type=int, default=1, choices=range(0, 4), metavar="N",
                        help="reruns after a malformed answer (default 1)")
         p.add_argument("--provider")

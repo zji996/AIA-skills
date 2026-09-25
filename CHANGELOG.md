@@ -4,6 +4,7 @@
 
 ### 技能
 
+- `pi-delegation` 3.2.0：新增 `--agent codex`，通过 `codex exec --json` 让 GPT 作为同事，共用验收、结论、run 目录与写入互斥；委派层级改为 Pi 不能再委派、Codex 可委派给 Pi 但不能委派给 Codex（`PI_DELEGATE_AGENT` / `PI_DELEGATE_PARENT_RUN`），委派者自己的 run 不阻塞其子任务写入。Codex 只读任务在说明中写明边界并以 git 核对结果（部分系统的 AppArmor 限制使其沙箱不可用）。SKILL.md 按任意主控模型可读的方式重写，明确采纳由主控把关。
 - `pi-delegation` 3.1.0：`--accept` 的命令默认以“完成标准”附在提示词末尾（按提示词语言用中文或英文），减少 Pi 自行摸索验证方式的轮次；`--hide-accept` 保留盲验。
 - `pi-delegation` 3.0.0（不兼容）：改为按结果委派，实现换成单文件 Python 标准库脚本 `scripts/pi_delegate.py`，不再依赖 `jq`、`setsid`、`timeout`；`pi-delegate.sh` 保留为转发入口，`pi-json-stream.sh` 移除（前台同步调用改用 `run`）。
   - 新增 `--accept <命令>`：Pi 结束后由脚本在 workdir 执行，状态分为 `delivered` / `answered` / `rejected` / `malformed` / `failed` / `timeout` / `killed` / `stopped` / `crashed`，取代原先只表示“有非空答复”的 `ok`。

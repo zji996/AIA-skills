@@ -20,7 +20,7 @@
 | --- | --- | --- |
 | **`repo-governance`** | `skills/repo-governance/` | **上下文治理与审计**：定义 `AGENTS.md`、`docs/current.md`、决策记录的信息分层；`audit-context.py` 只读检查入口文件过长、下一步堆积、`.local/` 未忽略、文档断链等漂移问题。 |
 | **`agent-handoff`** | `skills/agent-handoff/` | **会话交接**：`handoff-snapshot.sh` 自动采集分支、HEAD、未提交文件、最近提交与未读取的委派任务，生成交接账本草稿，模型只需补充判断部分。 |
-| **`pi-delegation`** | `skills/pi-delegation/` | **Pi 后台协作**：尽早把可验收的原子任务外包给 Pi 并行完成，主控同时推进其他工作、只收结果；脚本代跑 `--accept` 验收命令并给出一行结论（delivered / answered / rejected / malformed…），过程留在 run 目录不进主控上下文；答复畸形自动重跑一次，写入互斥、禁止嵌套委派，且不会安装给 Pi 自己。 |
+| **`pi-delegation`** | `skills/pi-delegation/` | **同事 Agent 委派**：尽早把可验收的原子任务外包给 Pi（如 Gemini）或 Codex（GPT）并行完成，主控同时推进其他工作、只收结果；脚本代跑 `--accept` 验收命令并给出一行结论（delivered / answered / rejected / malformed…），过程留在 run 目录不进主控上下文；答复畸形自动重跑一次，写入互斥、按层级限制嵌套（Codex 可再委派给 Pi，Pi 不能再委派），且不会安装给 Pi 自己。 |
 | **`openai-image-gen`** | `skills/openai-image-gen/` | **图像生成落盘**：调用 OpenAI Image API 生成配图、Banner、图标等素材，直接写入本地文件并只返回一行 JSON；附提示词、尺寸与费用选择要点。 |
 
 ---
@@ -47,7 +47,7 @@ curl -fsSL <上面任一链接> | bash -s -- --github --dir ~/aia-skills # 指�
 curl -fsSL <上面任一链接> | bash -s -- --with-pi                 # 同时安装或更新 Pi（pi-delegation 需要）
 ```
 
-依赖 `git` 与 bash 4+（macOS 需先 `brew install bash`）。`pi-delegation` 仅支持 Linux，另需 `pi` 与 `python3`（3.9+，仅标准库）。
+依赖 `git` 与 bash 4+（macOS 需先 `brew install bash`）。`pi-delegation` 仅支持 Linux，另需 `python3`（3.9+，仅标准库）以及所选同事的 CLI：`pi` 或 `codex`。
 
 ### Pi 与 pi-kit
 

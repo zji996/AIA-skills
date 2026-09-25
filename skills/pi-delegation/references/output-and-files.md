@@ -9,13 +9,13 @@
 
 | 文件 | 内容 |
 |---|---|
-| `meta.json` | 启动参数、workdir、模式、验收命令、启动时间 |
-| `prompt.md` | Pi 实际收到的提示词；有 `--accept` 且未加 `--hide-accept` 时末尾附完成标准 |
+| `meta.json` | 启动参数、同事（`agent`）、workdir、模式、验收命令、启动时间 |
+| `prompt.md` | 同事实际收到的任务说明；末尾可能附完成标准（`--accept`）与只读边界（Codex 只读任务） |
 | `events.jsonl` | 过滤后的全过程：读取、命令、编辑路径、错误、每轮模型与用量、重跑；不含编辑全文 |
 | `result.md` | 最后一轮的完整答复 |
-| `summary.json` | 结论：`state`、`attempts`、`files`、`accept`、`tokens`、`error` |
+| `summary.json` | 结论：`state`、`attempts`、`files`、`accept`、`readOnlyViolation`、`tokens`、`error` |
 | `accept.log` | 验收命令的完整输出与退出码 |
-| `stderr.log` | Pi 的标准错误 |
+| `stderr.log` | 同事 CLI 的标准错误 |
 | `exit_code` | 结束标记：`0` 为 delivered/answered，`1` 为其他结局；运行中不存在 |
 | `.delivered` | 结果已被 `run`/`wait`/`result` 读取过 |
 
@@ -33,4 +33,6 @@
 | `PI_DELEGATE_RESULT_CHARS` | 答复超过该长度只显示末尾，默认 6000 |
 | `PI_DELEGATE_KEEP_DAYS` | 自动清理天数，默认 7 |
 | `PI_DELEGATE_POLL` | 等待时的检查间隔秒数，默认 1 |
-| `PI_DELEGATE_ACTIVE` | 由脚本导出给 Pi；存在时拒绝再次委派 |
+| `PI_DELEGATE_AGENT` | 由脚本导出给同事（`pi`/`codex`），用于执行委派层级 |
+| `PI_DELEGATE_PARENT_RUN` | 由脚本导出给同事，值为其所在 run；它委派的写入任务不受这个 run 的写入互斥限制 |
+| `PI_DELEGATE_ACTIVE` | 旧版标记，仍导出给 Pi；存在时视为 Pi 调用者 |
