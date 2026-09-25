@@ -91,6 +91,22 @@ class PiDelegateTests(unittest.TestCase):
         self.assertIn("boom", state["accept"]["tail"])
         self.assertIn("[exit 3]", (Path(state["dir"]) / "accept.log").read_text())
 
+    def test_acceptance_command_is_shared_unless_hidden(self):
+        self.fake_pi([answer("done"), SETTLED])
+        state = self.outcome(self.cli("run", "--name", "zh", "--accept", "make test", "修复解析器"))
+        prompt = (Path(state["dir"]) / "prompt.md").read_text()
+        self.assertTrue(prompt.startswith("修复解析器\n"))
+        self.assertIn("完成标准", prompt)
+        self.assertIn("```sh\nmake test\n```", prompt)
+        self.assertEqual(state["name"], "zh")
+        state = self.outcome(self.cli("run", "--accept", "npm test", "Fix the parser"))
+        prompt = (Path(state["dir"]) / "prompt.md").read_text()
+        self.assertIn("Definition of done", prompt)
+        self.assertEqual(state["name"], "Fix the parser")
+        state = self.outcome(self.cli("run", "--accept", "true", "--hide-accept", "Fix it"))
+        self.assertEqual((Path(state["dir"]) / "prompt.md").read_text(), "Fix it\n")
+        self.assertEqual(state["state"], "delivered")
+
     def test_accept_timeout_is_rejected(self):
         self.fake_pi([answer("done"), SETTLED])
         state = self.outcome(self.cli("run", "--accept", "sleep 5", "--accept-timeout", "1", "task"))

@@ -10,7 +10,7 @@
 | 文件 | 内容 |
 |---|---|
 | `meta.json` | 启动参数、workdir、模式、验收命令、启动时间 |
-| `prompt.md` | 提示词原文 |
+| `prompt.md` | Pi 实际收到的提示词；有 `--accept` 且未加 `--hide-accept` 时末尾附完成标准 |
 | `events.jsonl` | 过滤后的全过程：读取、命令、编辑路径、错误、每轮模型与用量、重跑；不含编辑全文 |
 | `result.md` | 最后一轮的完整答复 |
 | `summary.json` | 结论：`state`、`attempts`、`files`、`accept`、`tokens`、`error` |

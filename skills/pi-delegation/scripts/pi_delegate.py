@@ -444,6 +444,16 @@ def start_run(args):
         return create_run(args, prompt, workdir, mode, root)
 
 
+def with_acceptance(prompt, command):
+    """State the definition of done, as a delegator would, in the prompt's language."""
+    body = prompt.rstrip("\n")
+    if re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", prompt):
+        note = "完成标准：你结束后，委派方会在工作目录中运行下面的命令，退出码为 0 即视为完成。"
+    else:
+        note = "Definition of done: after you finish, the delegator runs this command in the working directory; exit code 0 counts as complete."
+    return f"{body}\n\n---\n{note}\n\n```sh\n{command}\n```\n"
+
+
 def create_run(args, prompt, workdir, mode, root):
     if mode == "write" and not args.allow_parallel_writes:
         for run in all_runs():
@@ -463,8 +473,11 @@ def create_run(args, prompt, workdir, mode, root):
             break
         except FileExistsError:
             run = root / f"{stamp}-{slug}-{os.urandom(2).hex()}"
-    (run / "prompt.md").write_text(prompt if prompt.endswith("\n") else prompt + "\n", encoding="utf-8")
     first_line = next((line.strip() for line in prompt.splitlines() if line.strip()), "")[:120]
+    if args.accept and not args.hide_accept:
+        prompt = with_acceptance(prompt, args.accept)
+    # prompt.md is exactly what Pi receives.
+    (run / "prompt.md").write_text(prompt if prompt.endswith("\n") else prompt + "\n", encoding="utf-8")
     meta = {"run": run.name, "dir": str(run), "workdir": workdir, "mode": mode, "name": args.name or first_line,
             "provider": args.provider, "model": args.model, "thinking": args.thinking,
             "timeout": args.timeout, "timeoutSeconds": seconds(args.timeout),
@@ -649,6 +662,8 @@ def parser():
         p.add_argument("--workdir", help="directory Pi works in (default: cwd)")
         p.add_argument("--read-only", action="store_true", help="only read/grep/find/ls tools")
         p.add_argument("--accept", help="shell command run in the workdir after Pi; exit 0 = delivered")
+        p.add_argument("--hide-accept", action="store_true",
+                       help="do not tell Pi the acceptance command (blind verification)")
         p.add_argument("--accept-timeout", default="10m")
         p.add_argument("--timeout", default="15m", help="limit for each Pi attempt (default 15m)")
         p.add_argument("--retries", type=int, default=1, choices=range(0, 4), metavar="N",

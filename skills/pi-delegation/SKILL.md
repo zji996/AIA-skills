@@ -4,7 +4,7 @@ description: 把可独立验收的原子任务外包给 Pi 在后台并行完成
 license: MIT
 compatibility: Linux；需要 pi 与 python3（3.9+，仅标准库）。
 metadata:
-  version: "3.0.0"
+  version: "3.1.0"
   exclude-agents: pi
 ---
 
@@ -38,6 +38,7 @@ $D start --read-only --name review-db  "审查 src/db/ 的事务边界"
 $D wait --all
 ```
 
+- 有 `--accept` 时，脚本会在提示词末尾写明验收命令和“退出码 0 即完成”，像交代给同事的完成标准一样；需要盲验时加 `--hide-accept`。`prompt.md` 保存 Pi 实际收到的全文。
 - `run` 一直等到结束。在支持后台命令并会通知完成的环境（如 Claude Code）里，用后台方式启动 `run`，完成时直接收到结论，无需轮询。
 - 工具有单次时长上限的环境，给 `run`/`wait` 加 `--max 4m`；到时仍在运行就返回 75，稍后再 `wait`。`--max` 只结束这一次等待，Pi 仍在后台运行；不再需要结果时用 `stop`。
 - 简短咨询和评审可给较短的 `--timeout`（如 `3m`），这是 Pi 本身的运行上限。
@@ -70,7 +71,7 @@ $D wait --all
 | `stop <run>...` | 终止任务及其 Pi 进程组 |
 | `clean <run>...\|--finished [--force]` | 删除已结束的任务；`--finished` 默认保留结果未读取的 |
 
-启动选项：`--accept <命令>`、`--accept-timeout`（默认 10m）、`--read-only`（只开放 read/grep/find/ls，不是系统沙盒）、`--workdir`、`--timeout`（每次 Pi 运行，默认 15m）、`--retries`（答复畸形时的重跑次数，默认 1）、`--provider`/`--model`/`--thinking`（未指定时用 Pi 的默认设置）、`--allow-parallel-writes`。`<run>` 可以是完整 id、唯一片段、`last` 或 run 目录。`--progress` 会额外打印写入、错误与重试，默认不显示过程。
+启动选项：`--accept <命令>`、`--hide-accept`、`--accept-timeout`（默认 10m）、`--read-only`（只开放 read/grep/find/ls，不是系统沙盒）、`--workdir`、`--timeout`（每次 Pi 运行，默认 15m）、`--retries`（答复畸形时的重跑次数，默认 1）、`--provider`/`--model`/`--thinking`（未指定时用 Pi 的默认设置）、`--allow-parallel-writes`。`<run>` 可以是完整 id、唯一片段、`last` 或 run 目录。`--progress` 会额外打印写入、错误与重试，默认不显示过程。
 
 run 目录位置、文件与清理策略见 [references/output-and-files.md](references/output-and-files.md)。
 
