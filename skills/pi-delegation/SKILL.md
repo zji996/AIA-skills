@@ -1,79 +1,80 @@
 ---
 name: pi-delegation
-description: 通过 Pi CLI 在后台并行调度外部模型。当有可独立验收的编码子任务想交出去、需要只读代码评审、想要第二意见或同时问多个问题时使用；提供 start/wait/status/result/stop 异步管理、写入互斥与完整答复留存。Use to delegate tasks, run parallel reviews or get a second opinion via Pi.
+description: 把可独立验收的原子任务外包给 Pi 在后台并行完成，只收结果：写代码或测试、只读评审、第二意见、同时问多个问题。脚本代为运行验收命令并给出一行结论，中间过程不进入主控上下文。Use to delegate tasks, run parallel reviews or get a second opinion via Pi, judged by results.
 license: MIT
-compatibility: Linux；需要 pi、jq、setsid、GNU timeout。
+compatibility: Linux；需要 pi 与 python3（3.9+，仅标准库）。
 metadata:
-  version: "2.1.1"
+  version: "3.0.0"
   exclude-agents: pi
 ---
 
 # Pi Delegation (Pi 后台协作助手)
 
-`scripts/pi-delegate.sh` 在后台启动 Pi，每次运行对应一个 run 目录；主控 Agent 通过多次短时 `wait` 跟进，不受自身工具的单次时长上限影响。控制台只保留关键错误、写入、稀疏活动计数和最终答复，完整过程写入事件文件。Pi 的模型通常便宜且快，适合同时放出多个：写代码、做评审、问意见。
+像交代给同事一样委派：说清要什么、怎么算做完，然后去忙别的，回来只看结果。`scripts/pi_delegate.py` 在后台运行 Pi，结束后由脚本自己执行你给的验收命令，输出一行结论和 Pi 的答复；中间每一步读了什么、跑了什么都留在 run 目录，不进入你的上下文。
 
-## 何时委派
+它的价值在于省主控上下文、可以并行，以及得到另一个模型的独立视角。
 
-- **值得委派**：目标能独立验收（有明确的文件或测试结果）、背景几句话能交代清楚、多个任务可以并行，或者需要不同模型的独立视角。
-- **自己做更快**：改动只有几行、需要大量本会话才有的隐含上下文、或者下一步决策强依赖结果细节。
-- 委派出去的写入任务仍由主控负责验收，所以只委派你愿意逐行复核的范围。
+## 适合外包的任务
 
-## 环境准备
+- **原子化**：几句话能交代清楚，不依赖只有本会话才知道的隐含背景。
+- **可验收**：写入任务能用一条命令判断成败（测试、lint、脚本退出码）；只读任务的交付物就是答复本身。
+- **可并行**：互不依赖的调研、评审或改动可以同时放出，写入任务各用自己的 `--workdir`。
 
-缺少 `pi`、`jq`、`setsid` 或 `timeout` 时，脚本会一次列出所有缺少的依赖和安装命令。`pi` 由 pi-kit 安装：通过 AIA-skills 的 `bootstrap.sh --with-pi` 安装，或直接运行报错里给出的 pi-kit 命令；`--additive` 模式保留现有 Pi 设置与模型选择。未指定 `--provider/--model` 时使用 Pi 的 `defaultProvider`/`defaultModel`。
+改动只有几行、或下一步决策强依赖中间细节时，自己做更快。
 
-## 快速上手
+## 用法
 
 ```bash
-D=<本技能目录>/scripts/pi-delegate.sh
+D=<本技能目录>/scripts/pi_delegate.py
 
-# 咨询或评审：一条命令等到结果（超过 --max 仍未完成则返回 75，改用 wait 继续）
-$D run --read-only --name consult "对这个缓存方案给出三个主要风险：..."
-
-# 并行：同时发出多个任务，统一收取
-$D start --read-only --name review-api "审查 src/api/ 的错误处理..."
-$D start --name impl --workdir packages/web --prompt-file - <<'EOF'   # 写入任务，多行提示词走 stdin
-任务：...
-边界：...
+# 写入任务：给出验收命令，脚本在 Pi 结束后于 workdir 中执行，退出码 0 即交付
+$D run --name fix-parser --workdir packages/parser --accept "npm test" --prompt-file - <<'EOF'
+修复 parse() 对空输入抛异常的问题，保持现有接口不变。
 EOF
-$D wait --all            # 退出码 75 表示仍有任务在跑，重复调用即可
+
+# 只读任务：并行放出，统一收取
+$D start --read-only --name review-api "审查 src/api/ 的错误处理，列出真实缺陷"
+$D start --read-only --name review-db  "审查 src/db/ 的事务边界"
+$D wait --all
 ```
 
-多行提示词用 `--prompt-file -` 加 heredoc，脚本会保存为 run 目录里的 `prompt.md`，无需自己建临时文件。建议总是加 `--name`，便于辨认和引用。
+- `run` 一直等到结束。在支持后台命令并会通知完成的环境（如 Claude Code）里，用后台方式启动 `run`，完成时直接收到结论，无需轮询。
+- 工具有单次时长上限的环境，给 `run`/`wait` 加 `--max 4m`；到时仍在运行就返回 75，稍后再 `wait`。
+- 多行提示词用 `--prompt-file -` 加 heredoc，脚本保存为 run 目录里的 `prompt.md`。建议总加 `--name`。
 
-## 命令
+## 读结论
+
+每个结束的任务输出一行 JSON，之后是答复（超过 6000 字只显示末尾，`--full` 或 `result` 看全文）：
+
+| state | 含义 | 你要做的 |
+|---|---|---|
+| `delivered` | Pi 已答复且验收命令通过 | 看一眼 `files`，采纳 |
+| `answered` | Pi 已答复，未设验收 | 按答复内容判断 |
+| `rejected` | 验收命令失败，`accept.tail` 有输出末尾 | 看失败原因，决定修补或自己接手 |
+| `malformed` | 答复为空或是一段泄漏的工具调用，已自动重跑仍如此 | 换个模型或自己做 |
+| `failed` / `timeout` / `killed` / `crashed` | Pi 自身出错、超时或进程异常，`error` 有摘要 | 任务太大就拆小；否则自己接手 |
+| `stopped` | 被 `stop` 终止 | — |
+
+`files` 同时来自 Pi 的编辑记录和 workdir 的 git 状态变化（不含验收命令自身产生的文件）。退出码：`0` delivered/answered，`1` 其他已结束状态，`2` 用法错误或被拒绝，`75` 仍在运行。
+
+## 命令与选项
 
 | 命令 | 作用 |
 |---|---|
-| `start [选项] [提示词]` | 后台启动，立即输出一行状态 JSON |
-| `run [选项] [--max 240s]` | `start` 后接 `wait` |
-| `wait [<run>...\|--all] [--max 240s]` | 输出新增进度，结束时输出状态和最终答复；`--max 0` 只查看不等待 |
-| `status [<run>...]` | 每个任务一行 JSON，默认列出全部 |
+| `start [选项] [提示词]` | 后台启动，立即返回一行状态 |
+| `run [选项] [--max <时长>]` | 启动并等到结论 |
+| `wait [<run>...\|--all] [--max <时长>] [--no-result] [--full] [--progress]` | 等待并输出结论；`--all` 含仍在运行和尚未读取结果的任务 |
+| `status [<run>...]` | 每个任务一行 JSON；运行中带 `last` 与 `idleSeconds` |
 | `result [<run>] [--path]` | 输出完整答复 |
-| `stop <run>...` | 终止任务及其整个进程会话 |
-| `clean <run>...\|--finished [--force]` | 删除已结束的 run 目录；`--finished` 会保留结果未报告过的任务 |
+| `stop <run>...` | 终止任务及其 Pi 进程组 |
+| `clean <run>...\|--finished [--force]` | 删除已结束的任务；`--finished` 默认保留结果未读取的 |
 
-`<run>` 可以是完整 id、唯一片段、`last` 或 run 目录路径。启动选项：`--read-only`（只开放 read/grep/find/ls，不是系统沙盒）、`--provider`/`--model`/`--thinking`、`--timeout`（默认 15m）、`--workdir`、`--allow-parallel-writes`。退出码：`0` 成功，`1` 失败或被停止，`2` 用法错误或被拦截，`75` 仍在运行。
+启动选项：`--accept <命令>`、`--accept-timeout`（默认 10m）、`--read-only`（只开放 read/grep/find/ls，不是系统沙盒）、`--workdir`、`--timeout`（每次 Pi 运行，默认 15m）、`--retries`（答复畸形时的重跑次数，默认 1）、`--provider`/`--model`/`--thinking`（未指定时用 Pi 的默认设置）、`--allow-parallel-writes`。`<run>` 可以是完整 id、唯一片段、`last` 或 run 目录。`--progress` 会额外打印写入、错误与重试，默认不显示过程。
 
-状态字段、进度行含义、run 目录位置与清理策略见 [references/output-and-files.md](references/output-and-files.md)。
+run 目录位置、文件与清理策略见 [references/output-and-files.md](references/output-and-files.md)。
 
-## 协作要点
+## 边界
 
-1. **写入互斥**：同一工作目录同时只允许一个写入任务，因为两个 Agent 同时改同一棵树几乎必然冲突。确需并行写入时给每个任务不同的 `--workdir`，或加 `--allow-parallel-writes` 并确保文件不重叠。
-2. **主控复核**：`ok` 只表示 Pi 正常结束并给出了答复，不代表改对了。写入任务结束后用 `git diff` 和关键验证命令自己确认。
-3. **失败处理**：`timeout`、`stopped`、`crashed` 时先看已生成的文件再决定是否重跑；反复超时说明任务太大，按可验收的文件或功能拆分。
-4. **不可嵌套**：被委派的 Pi 里调用本脚本会被拒绝；本技能也不会安装到 Pi 会扫描的技能目录。
-5. **收尾**：结果采纳后执行 `clean --finished`；需要留档的结论先整理进仓库文档。
-
-## 委派提示词模板
-
-```text
-先读取并遵守 AGENTS.md 及与本任务直接相关的设计文档。
-任务：<具体、可独立验收的目标>。
-边界：<明确非目标与不应改动的文件>。
-成功标准：<功能行为与输出指标>。
-验证命令：<一两个必要的测试或 lint 命令；失败时定位后再重试>。
-交付形式：只报告产物位置、实际通过的验证和剩余风险；不复述指令或执行过程。
-```
-
-咨询类问题直接写清背景、约束和期望的回答形式即可；需要看代码时加 `--read-only` 并指明文件。
+1. **写入互斥**：同一 workdir 同时只允许一个写入任务；确需并行时各用不同 `--workdir`，或加 `--allow-parallel-writes` 并确保文件不重叠。
+2. **不可嵌套**：被委派的 Pi 里调用本脚本会被拒绝；本技能也不会安装到 Pi 扫描的技能目录。
+3. **环境**：缺少 `pi` 时脚本给出随仓库附带的 pi-kit 安装命令（`bootstrap.sh --with-pi` 同样可装）。

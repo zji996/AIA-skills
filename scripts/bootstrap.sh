@@ -38,11 +38,9 @@ install_pi() {
   GIT_TERMINAL_PROMPT=0 git -C "$dir" submodule update --init --quiet -- third_party/pi-kit ||
     die "could not fetch third_party/pi-kit; skills are installed, re-run to retry Pi"
   sh "$dir/third_party/pi-kit/install.sh" "--$mode" </dev/null || die "pi-kit failed; skills are installed, re-run to retry Pi"
-  for tool in jq setsid timeout; do
-    command -v "$tool" >/dev/null || missing+=("$tool")
-  done
+  command -v python3 >/dev/null || missing+=(python3)
   if (( ${#missing[@]} )); then
-    log "pi-delegation also needs: ${missing[*]} (e.g. sudo apt install jq util-linux coreutils)"
+    log "pi-delegation also needs: ${missing[*]} (e.g. sudo apt install python3)"
   fi
 }
 

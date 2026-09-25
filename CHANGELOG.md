@@ -4,6 +4,11 @@
 
 ### 技能
 
+- `pi-delegation` 3.0.0（不兼容）：改为按结果委派，实现换成单文件 Python 标准库脚本 `scripts/pi_delegate.py`，不再依赖 `jq`、`setsid`、`timeout`；`pi-delegate.sh` 保留为转发入口，`pi-json-stream.sh` 移除（前台同步调用改用 `run`）。
+  - 新增 `--accept <命令>`：Pi 结束后由脚本在 workdir 执行，状态分为 `delivered` / `answered` / `rejected` / `malformed` / `failed` / `timeout` / `killed` / `stopped` / `crashed`，取代原先只表示“有非空答复”的 `ok`。
+  - 答复为空或是泄漏的工具调用（如 `call:default_api:read{...}`）判为 `malformed`，默认自动重跑一次（`--retries`）。
+  - `run`/`wait` 默认一直等到结束且不打印过程，`--max` 可限时（仍返回 75），`--progress` 按需显示写入与错误；`files` 合并编辑记录与 workdir 的 git 变化，不计验收命令的副产物。
+  - `meta.json`、`exit_code`、`.delivered` 的含义不变，`agent-handoff` 无需修改。
 - `pi-delegation` 2.1.1：JSON stream 的控制台输出收敛为错误、写入、每 20 次动作计数及最终结果；完整过滤事件继续留档。更新对应 mock 测试，并实测只读 Pi 调用。
 - `pi-delegation` 2.1.0：缺少 `pi`、`jq`、`setsid`、`timeout` 时一次列出全部缺失项和安装命令，`pi` 指向随仓库附带的 pi-kit 安装脚本。
 

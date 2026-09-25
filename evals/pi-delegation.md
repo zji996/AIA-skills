@@ -6,6 +6,7 @@
 - 这个缓存方案帮我找个便宜模型问问第二意见。
 - Delegate the migration of these three config files to a background agent and review the diff afterwards.
 - 让 Pi 只读审查存储布局，控制台别刷读取步骤，只给我最终结论和错误。
+- 把这个 bug 交给 Pi 修，跑 `npm test` 通过才算完成，我先去做别的。
 
 ## 不应触发
 
