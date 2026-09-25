@@ -370,7 +370,7 @@ class ScriptTests(unittest.TestCase):
     def test_pi_long_result_is_previewed_on_stdout_but_retained_in_log(self):
         binary = self.work / "bin"
         binary.mkdir()
-        answer = "setup details " * 90 + "final delivery"
+        answer = "setup details " * 300 + "final delivery"
         event = {"type": "message_end", "message": {"role": "assistant", "stopReason": "stop",
                                                      "content": [{"type": "text", "text": answer}]}}
         pi = binary / "pi"
@@ -414,18 +414,42 @@ class ScriptTests(unittest.TestCase):
         result = self.run_script(DELEGATION, "5s", self.work, "prompt.txt", "events.jsonl", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         shown = [json.loads(line) for line in result.stdout.splitlines()]
-        self.assertEqual([item["count"] for item in shown if item["e"] == "checks"], [1, 5])
-        self.assertTrue(any(item["e"] == "check_done" and item["count"] == 8
-                            and item["ok"] is False for item in shown))
+        self.assertFalse(any(item["e"] in {"bash", "bash_done", "read", "turn", "checks", "check_done"}
+                             for item in shown))
         self.assertEqual(sum(item["e"] == "write" for item in shown), 1)
         self.assertEqual(next(item["detail"] for item in shown if item["e"] == "tool_error"),
                          "syntax error (Command exited with code 1)")
-        self.assertEqual(sum(item["e"] == "turn" for item in shown), 1)
+        self.assertEqual(next(item["text"] for item in shown if item["e"] == "result"), "done")
         self.assertEqual(shown[-1]["writes"], 1)
         self.assertEqual(shown[-1]["bashRuns"], 1)
         self.assertEqual(shown[-1]["failedBashRuns"], 1)
         self.assertEqual(shown[-1]["toolErrors"], 1)
         self.assertEqual(shown[-1]["tokens"]["input"], 85)
+
+    def test_pi_read_activity_is_aggregated(self):
+        binary = self.work / "bin"
+        binary.mkdir()
+        pi = binary / "pi"
+        events = [
+            {"type": "tool_execution_start", "toolName": "read", "args": {"path": f"file-{i}.txt"}}
+            for i in range(21)
+        ]
+        events.extend([
+            {"type": "message_end", "message": {"role": "assistant", "stopReason": "stop",
+                                         "content": [{"type": "text", "text": "finished"}]}},
+            {"type": "agent_settled"},
+        ])
+        pi.write_text("#!/bin/sh\nprintf '%s\\n' " + " ".join(shlex.quote(json.dumps(event)) for event in events) + "\n")
+        pi.chmod(0o755)
+        (self.work / "prompt.txt").write_text("inspect")
+        env = {**os.environ, "PATH": f"{binary}:{os.environ['PATH']}"}
+        result = self.run_script(DELEGATION, "5s", self.work, "prompt.txt", "events.jsonl", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        shown = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([item["actions"] for item in shown if item["e"] == "activity"], [20])
+        self.assertEqual([item["e"] for item in shown], ["activity", "result", "summary"])
+        self.assertEqual(sum(json.loads(line)["e"] == "read"
+                             for line in (self.work / "events.jsonl").read_text().splitlines()), 21)
 
     def delegate_env(self, answer="done", sleep=0):
         binary = self.work / "bin"

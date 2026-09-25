@@ -2,9 +2,9 @@
 
 ## 读懂输出
 
-- **进度行**：写入、bash 命令、只读工具及其参数、失败原因、重试、压缩；成功的 bash 结束事件和阶段事件不会打印。
+- **控制台进度**：仅显示写入、失败、重试、压缩及每 20 次只读/命令动作的计数；最终答复和总结必显示。单条读取、搜索和成功命令留在 `events.jsonl`，不占主控上下文。
 - **状态行**：`state`（running/ok/failed/timeout/killed/stopped/crashed）、`files`（写过的文件）、`turns`、`bashRuns`、`failedBashRuns`、`tokens`、`result` 与 `resultChars`。运行中还有 `last`（最近动作）和 `idleSeconds`；`last` 为 `thinking` 或 `answering` 时表示模型正在长时间生成，不是卡死。
-- **最终答复**：超过 6000 字符时只显示末尾（部分模型会把草稿写在正文前面，结论在最后），完整内容见 `result.md` 或加 `--full`。阈值可用 `PI_DELEGATE_RESULT_CHARS` 调整。
+- **最终答复**：直接运行 `pi-json-stream.sh` 时超过 2400 字符只显示末尾，完整内容保留在 `events.jsonl`；通过 `pi-delegate.sh` 运行时，超过 6000 字符只显示末尾，完整内容见 `result.md` 或加 `--full`。后者阈值可用 `PI_DELEGATE_RESULT_CHARS` 调整。
 
 ## 过程文件位置
 

@@ -173,29 +173,21 @@ main() {
       else
         empty
       end) | . + {at:(now | todateiso8601)}
-    ' | tee "$events_log" |
+  ' | tee "$events_log" |
     jq -n --unbuffered -c '
       foreach inputs as $event (
-        {checks:0, nodeCheck:false, show:null};
-        if $event.e == "bash" and $event.cmd == "node -e [inline script]" then
-          .checks += 1 |
-          .nodeCheck = true |
-          .show = (if .checks == 1 or (.checks % 5) == 0 then
-            {e:"checks", count:.checks, at:$event.at}
-          else null end)
-        elif $event.e == "bash" then
-          .nodeCheck = false | .show = $event
-        elif $event.e == "bash_done" and .nodeCheck then
-          .show = (if ($event.ok == false) or .checks == 1 or (.checks % 5) == 0 then
-            {e:"check_done", count:.checks, ok:$event.ok, at:$event.at}
-          else null end)
-        elif $event.e == "result" and ($event.text | length) > 800 then
-          .show = {e:"result", text:("..." + $event.text[-800:]), truncated:true, at:$event.at}
-        elif ($event.e == "turn" and $event.stopReason == "toolUse") or
-             ($event.e | IN("thinking", "answering", "tool_call")) then
-          .show = null
-        else
+        {actions:0, show:null};
+        if $event.e == "result" and ($event.text | length) > 2400 then
+          .show = {e:"result", text:("..." + $event.text[-2400:]), truncated:true, at:$event.at}
+        elif ($event.e | IN("result", "summary", "tool_error", "retry", "edit", "write", "compaction_start", "compaction_end")) then
           .show = $event
+        elif ($event.e | IN("bash", "read", "tool")) then
+          .actions += 1 |
+          .show = (if .actions % 20 == 0 then
+            {e:"activity", actions:.actions, at:$event.at}
+          else null end)
+        else
+          .show = null
         end;
         .show // empty
       )

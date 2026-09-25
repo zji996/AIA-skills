@@ -4,6 +4,7 @@
 
 ### 技能
 
+- `pi-delegation` 2.1.1：JSON stream 的控制台输出收敛为错误、写入、每 20 次动作计数及最终结果；完整过滤事件继续留档。更新对应 mock 测试，并实测只读 Pi 调用。
 - `pi-delegation` 2.1.0：缺少 `pi`、`jq`、`setsid`、`timeout` 时一次列出全部缺失项和安装命令，`pi` 指向随仓库附带的 pi-kit 安装脚本。
 
 ### 安装

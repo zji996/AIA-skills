@@ -5,6 +5,7 @@
 - 让 Pi 并行审查一下 `src/api/` 和 `src/db/` 的错误处理，你继续做前端。
 - 这个缓存方案帮我找个便宜模型问问第二意见。
 - Delegate the migration of these three config files to a background agent and review the diff afterwards.
+- 让 Pi 只读审查存储布局，控制台别刷读取步骤，只给我最终结论和错误。
 
 ## 不应触发
 

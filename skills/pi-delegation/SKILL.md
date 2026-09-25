@@ -4,13 +4,13 @@ description: 通过 Pi CLI 在后台并行调度外部模型。当有可独立�
 license: MIT
 compatibility: Linux；需要 pi、jq、setsid、GNU timeout。
 metadata:
-  version: "2.1.0"
+  version: "2.1.1"
   exclude-agents: pi
 ---
 
 # Pi Delegation (Pi 后台协作助手)
 
-`scripts/pi-delegate.sh` 在后台启动 Pi，每次运行对应一个 run 目录；主控 Agent 通过多次短时 `wait` 跟进，不受自身工具的单次时长上限影响。Pi 的模型通常便宜且快，适合同时放出多个：写代码、做评审、问意见。
+`scripts/pi-delegate.sh` 在后台启动 Pi，每次运行对应一个 run 目录；主控 Agent 通过多次短时 `wait` 跟进，不受自身工具的单次时长上限影响。控制台只保留关键错误、写入、稀疏活动计数和最终答复，完整过程写入事件文件。Pi 的模型通常便宜且快，适合同时放出多个：写代码、做评审、问意见。
 
 ## 何时委派
 
