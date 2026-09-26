@@ -8,7 +8,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from .changes import chain_changes, tree_changes
+from .changes import chain_changes, snapshot, tree_changes
 from .common import CONFIG_FILE, GUARD_VARS, SCRIPT, clip, die, git, now_iso, read_json, seconds, setting
 
 
@@ -169,12 +169,20 @@ def merge_text(top, before, after, path, target, label):
 
 
 def apply_conversation(run, merge=False, dry_run=False):
-    """Merge a finished worktree conversation, up to run, into the source working tree; the index is untouched."""
+    """Merge a finished worktree conversation into the source working tree; the index is untouched.
+
+    What is merged is the worktree as it is now, so touch-ups made there after the last run (by hand, or by a
+    run started with --workdir inside it) are included; without the worktree, the last recorded state is used.
+    """
     meta, top, _, after = chain_changes(run)
     tree = meta.get("worktree")
     if not tree:
         die(f"{run.name} worked in place; its changes are already in {meta.get('workdir')}")
     before, source, worktree = meta["chainBase"], tree["source"], Path(tree["path"])
+    after_large = (read_json(run / "changes.json", {}) or {}).get("afterLarge") or {}
+    now_snapshot = snapshot(worktree, run, meta.get("snapshotExclude") or ()) if worktree.is_dir() else None
+    if now_snapshot:
+        top, after, after_large = str(worktree), now_snapshot["tree"], now_snapshot["large"]
     changes = tree_changes(top, {"tree": before}, {"tree": after})
     actions, conflicts = [], []
     for change in changes:
@@ -201,7 +209,7 @@ def apply_conversation(run, merge=False, dry_run=False):
         else:
             conflicts.append(path)  # binary, symlink, or deleted on one side and edited on the other
     # Large untracked files were fingerprinted, not stored: copy them from the worktree itself.
-    for path in sorted(((read_json(run / "changes.json", {}) or {}).get("afterLarge") or {})):
+    for path in sorted(after_large):
         origin, target = worktree / path, Path(source) / path
         if not origin.is_file() or through_symlink(source, target) or entry_mode(target) == "dir":
             conflicts.append(path)

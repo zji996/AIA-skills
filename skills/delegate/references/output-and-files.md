@@ -6,9 +6,9 @@
 |---|---|
 | `start [选项] [任务说明]` | 后台启动，立即返回一行状态 |
 | `run [选项] [--max <时长>]` | 启动并等到结论 |
-| `reply <run> [消息] [--accept <命令>] [--image] [--timeout] [--max]` | 在同一会话里追问并等到结论：同一同事、workdir、worktree 与只读模式；`<run>` 指对话中任一轮，自动接在最新一轮后。验收命令默认沿用，换了才写进消息，`--accept ''` 取消；取消或隐藏已变更的命令时会告诉同事旧标准不再适用 |
+| `reply <run> [消息] [--fresh] [--accept <命令>] [--image] [--timeout] [--max]` | 接着上一轮的会话追问并等到结论（`--fresh` 则开新会话，消息须自足，验收命令照常附上）：同一同事、workdir、worktree 与只读模式；`<run>` 指对话中任一轮，自动接在最新一轮后。验收命令默认沿用，换了才写进消息，`--accept ''` 取消；取消或隐藏已变更的命令时会告诉同事旧标准不再适用 |
 | `diff [<run>] [--stat] [--total] [路径...]` | 以 `git diff` 输出该轮的改动；`--total` 为整段对话；终端下带颜色 |
-| `apply [<run>] [--dry-run] [--merge]` | 把 `--worktree` 对话的全部改动合并回原工作区（只写文件，不碰 index）：你没动过的文件直接写入（含权限位），双方都改过的文本做三方合并，大文件从 worktree 复制；经符号链接目录、文件与目录互换、二进制与符号链接冲突一律算冲突；有合并不了的冲突时什么都不写，`--merge` 则写入其余文件并在冲突处留冲突标记（其余冲突跳过）。没有跳过项时整段对话标记 `.applied` |
+| `apply [<run>] [--dry-run] [--merge]` | 把 `--worktree` 的现状（含最后一轮之后在 worktree 里的手工修改）相对对话起点的全部改动合并回原工作区（只写文件，不碰 index）：你没动过的文件直接写入（含权限位），双方都改过的文本做三方合并，大文件从 worktree 复制；经符号链接目录、文件与目录互换、二进制与符号链接冲突一律算冲突；有合并不了的冲突时什么都不写，`--merge` 则写入其余文件并在冲突处留冲突标记（其余冲突跳过）。没有跳过项时，共用该 worktree 的所有 run（含畸形的旁支）标记 `.applied` |
 | `wait [<run>...\|--all] [--max <时长>] [--no-result] [--full] [--progress]` | 等待并输出结论；`--all` 含仍在运行和尚未读取结果的任务 |
 | `status [<run>...]` | 每个任务一行 JSON；运行中带 `last` 与 `idleSeconds` |
 | `result [<run>] [--path]` | 输出完整答复 |
@@ -39,7 +39,7 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 
 ## 会话
 
-Pi 的会话保存在 run 目录的 `session/` 下（每次尝试一个 `--session-id`；`reply` 先复制上一轮的会话，清理早先的轮次不影响续接），Codex 使用自己的会话存储，`summary.json` 的 `session` 记下最后的会话 id；`reply` 以 `pi --session-id` / `codex exec resume` 续接。4.1 之前的 run 使用 `--no-session`，不能 `reply`。
+每轮的会话都属于自己的 run：Pi 保存在 run 目录的 `session/` 下，Codex 使用自己的会话存储，`summary.json` 的 `session` 记下会话 id。`reply` 在每次尝试时从上一轮的会话**分叉**（Pi `--fork` 上一轮会话文件的副本，Codex `exec fork`），上一轮的会话从不被改动：答复畸形重跑时从同一处重新开始，清理早先的轮次也不影响后续追问。结局为 `malformed` 的轮次不算对话的延续，之后的 `reply` 与 `apply` 都从它的上一轮接着。4.1 之前的 run 使用 `--no-session`，不能 `reply`。
 
 图片以绝对路径交给同事：Pi 作为 `@<路径>` 附件，Codex 作为 `--image`。
 
@@ -60,7 +60,7 @@ Pi 的会话保存在 run 目录的 `session/` 下（每次尝试一个 `--sessi
 | `summary.json` | 结论：`state`、`attempts`、`files`、`changes`、`accept`、`readOnlyViolation`、`tokens`、`session`、`error` |
 | `changes.json` / `changes.patch` | 前后快照的 tree、逐文件状态与行数；可直接 `git apply` 的补丁 |
 | `setup.log` | `--worktree` 的 `setup` 命令输出 |
-| `session/` | Pi 的会话记录，供 `reply` 续接 |
+| `session/` / `fork/` | Pi 本轮的会话；`reply` 分叉所用的上一轮会话副本 |
 | `.applied` | `--worktree` 的改动已由 `apply` 合并 |
 | `accept.log` | 验收命令的完整输出与退出码 |
 | `stderr.log` | 同事 CLI 的标准错误 |

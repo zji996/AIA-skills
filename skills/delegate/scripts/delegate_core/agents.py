@@ -1,4 +1,4 @@
-"""The colleagues: how Pi and Codex are started, resumed and read, and who may delegate."""
+"""The colleagues: how Pi and Codex are started, continued and read, and who may delegate."""
 
 import json
 import os
@@ -104,12 +104,15 @@ def codex_model():
 
 
 def agent_command(meta, session):
+    """A reply forks its parent's session on every attempt, so the parent is never changed and a rerun
+    after a malformed answer starts again from the same conversation instead of the broken one."""
+    fork = meta.get("fork")
     if meta["agent"] == "codex":
         # Full access on every host, whatever its own config.toml says: bwrap is often unavailable (AppArmor),
         # git makes writes recoverable, and read-only runs are checked by outcome afterwards.
-        # `resume` has no -C; the process cwd is the workdir either way.
-        command = ["codex", "exec"] + (["resume", session] if session else []) + ["--json", "--skip-git-repo-check"]
-        command += ([] if session else ["-C", meta["workdir"]]) + ["--dangerously-bypass-approvals-and-sandbox"]
+        # `fork` has no -C; the process cwd is the workdir either way.
+        command = ["codex", "exec"] + (["fork", fork] if fork else []) + ["--json", "--skip-git-repo-check"]
+        command += ([] if fork else ["-C", meta["workdir"]]) + ["--dangerously-bypass-approvals-and-sandbox"]
         if meta.get("model"):
             command += ["-m", meta["model"]]
         if meta.get("thinking"):
@@ -117,8 +120,9 @@ def agent_command(meta, session):
         if meta.get("provider"):
             command += ["-c", f'model_provider="{meta["provider"]}"']
         return command + [f"--image={image}" for image in meta.get("images") or []] + ["-"]
-    # Each run keeps a copy of its conversation under session/, so that `reply` can continue it.
-    command = ["pi", "--session-dir", meta["sessionDir"], "--session-id", session, "--mode", "json"]
+    # Each run keeps its conversation under session/, so that `reply` can fork it.
+    command = ["pi"] + (["--fork", fork] if fork else ["--session-id", session])
+    command += ["--session-dir", meta["sessionDir"], "--mode", "json"]
     for flag in ("provider", "model", "thinking"):
         if meta.get(flag):
             command += [f"--{flag}", meta[flag]]
@@ -126,6 +130,12 @@ def agent_command(meta, session):
         command += ["--tools", "read,grep,find,ls"]
     return command + ["-p"] + [f"@{image}" for image in meta.get("images") or []]
 
+
+
+def session_file(directory, session):
+    """Pi's file for a session id, or None."""
+    found = sorted(Path(directory or "/-").glob(f"*_{session}.jsonl")) if session else []
+    return found[-1] if found else None
 
 
 def agent_env(meta):
@@ -162,8 +172,9 @@ def leaked_tool_call(answer):
 def run_agent(meta, run, attempt, stop_flag, holder):
     """Run the agent once; return (verdict, answer). Verdicts: ok, malformed, failed, timeout, killed, stopped."""
     codex = meta["agent"] == "codex"
-    # A reply continues its parent's session; a fresh Pi attempt gets a session of its own.
-    session = meta.get("resume") or (None if codex else str(uuid.uuid4()))
+    # A fresh Pi attempt names its session; a forked one gets its id from Pi, and Codex reports its own.
+    session = None if codex or meta.get("fork") else str(uuid.uuid4())
+    known = set(Path(meta["sessionDir"]).glob("*.jsonl")) if not codex else set()
     command, env = agent_command(meta, session), agent_env(meta)
     convert = filter_codex_event if codex else filter_event
     timed_out = threading.Event()
@@ -209,6 +220,11 @@ def run_agent(meta, run, attempt, stop_flag, holder):
                     turn = {"stopReason": "error"}
         code = proc.wait()
         timer.cancel()
+        # Pi names a forked session itself (<time>_<id>.jsonl): record the one this attempt created.
+        created = sorted(set(Path(meta["sessionDir"]).glob("*.jsonl")) - known) if not codex else []
+        if created:
+            log.write(json.dumps({"e": "session", "id": created[-1].stem.split("_", 1)[-1], "attempt": attempt,
+                                  "at": now_iso()}) + "\n")
     if stop_flag.is_set():
         return "stopped", answer
     if timed_out.is_set():

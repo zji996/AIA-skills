@@ -10,11 +10,11 @@ import sys
 import time
 from pathlib import Path
 
-from .agents import missing_tools, nesting_error
+from .agents import missing_tools, nesting_error, session_file
 from .changes import snapshot
 from .common import ACTIVE, DEFAULT_TIMEOUT, SCRIPT, die, git_top, now_iso, read_json, seconds, setting, write_json
 from .runs import (
-    agent_alive, all_runs, capacity_error, machine_runs, prune_expired, run_state, runs_root, state_dir,
+    agent_alive, all_runs, capacity_error, machine_runs, prune_expired, replies_to, run_state, runs_root, state_dir,
 )
 from .worktree import worktree_config, worktrees_dir
 
@@ -114,10 +114,10 @@ def create_run(args, prompt, workdir, mode, root, extra):
                     (run_state(run) in ACTIVE or agent_alive(run)):
                 die(f"write run {run.name} is still active in {workdir}; wait for it, use --read-only, "
                     "or pass --allow-parallel-writes")
-    parent = extra.get("parent")
+    parent, fork = extra.get("parent"), extra.get("session")
     if parent:
         # Checked again under the start lock: two replies racing for one conversation would share its worktree.
-        later = [r.name for r in all_runs() if (read_json(r / "meta.json", {}) or {}).get("parent") == parent["run"]]
+        later = [r.name for r in replies_to(parent["run"])]
         if later:
             die(f"{parent['run']} already has a reply ({later[-1]}); wait for it and reply to that")
     if not setting("RUNS") and not (root / ".gitignore").exists():
@@ -132,7 +132,7 @@ def create_run(args, prompt, workdir, mode, root, extra):
         except FileExistsError:
             run = root / f"{stamp}-{slug}-{os.urandom(2).hex()}"
     first_line = next((line.strip() for line in prompt.splitlines() if line.strip()), "")[:120]
-    if parent:
+    if parent and fork:
         # The session already holds the contract; restate it only when the reply changes it.
         changed = args.accept != parent.get("accept")
         shown = args.accept if changed and not args.hide_accept else None
@@ -143,9 +143,11 @@ def create_run(args, prompt, workdir, mode, root, extra):
                                read_only=mode == "read-only" and args.agent == "codex")
     # prompt.md is exactly what the agent receives.
     (run / "prompt.md").write_text(prompt if prompt.endswith("\n") else prompt + "\n", encoding="utf-8")
-    if parent and Path(parent.get("sessionDir", "/-")).is_dir():
-        # Each run keeps its own copy of the conversation, so cleaning an earlier round cannot break a reply.
-        shutil.copytree(parent["sessionDir"], run / "session")
+    if parent and fork and parent["agent"] == "pi":
+        # Fork from a copy: cleaning or pruning an earlier round must not break this reply or its reruns.
+        source = session_file(parent["sessionDir"], fork)
+        (run / "fork").mkdir()
+        fork = str(shutil.copy2(source, run / "fork" / source.name))
     tree = extra.get("worktree")
     if tree and not tree.get("path"):
         # Outside the repository, so the caller's tools (test runners, linters, watchers) never see it.
@@ -170,7 +172,7 @@ def create_run(args, prompt, workdir, mode, root, extra):
             "top": top, "base": base, "snapshotExclude": exclude, "worktree": tree,
             "chainBase": (parent or {}).get("chainBase") or (base or {}).get("tree"),
             "sessionDir": str(run / "session"),
-            "parent": (parent or {}).get("run"), "resume": extra.get("resume"),
+            "parent": (parent or {}).get("run"), "fork": fork,
             "startedAt": now_iso(), "startedEpoch": int(time.time()), "startedNs": time.time_ns()}
     write_json(run / "meta.json", meta)
     # Only now: pruning may remove a reply's parent, whose session and worktree this run has taken over.

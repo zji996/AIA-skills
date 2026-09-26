@@ -4,6 +4,7 @@
 
 ### 技能
 
+- `delegate` 4.2.0：在真实前端任务中发现并修复：`reply` 改为每次尝试都从上一轮会话分叉（Pi `--fork`、Codex `exec fork`），上一轮会话从不被改动，畸形重跑从同一处重来；结局为 `malformed` 的轮次不算对话的延续，之后的 `reply`/`apply` 从它的上一轮接着；新增 `reply --fresh`，在同一 worktree 与对话里开新会话（Pi 在很长的会话上续接时容易连续畸形）；`apply` 合并 worktree 的现状，包含最后一轮之后在 worktree 里做的手工修改，并给共用该 worktree 的所有 run 标记 `.applied`。
 - `delegate` 4.1.2：修复第二轮审查的 7 个问题：supervisor 被杀后同事进程仍在运行时，`stop` 会终止它，`clean` 与写入互斥、整机并发都把它算作运行中；两个并发 `reply` 不再写同一 worktree；`reply` 启动时的过期清理不再删掉尚未复制的父会话；非 UTF-8 文件名不再使快照失败，快照失败时结论带 `warning` 并显示“changes unknown”，不再默默当作没有改动；子模块检出内的改动计入改动清单（`submodule contents`），worktree 中的子模块可写进 `link`；worktree 改为以快照提交（`commit-tree`，父提交为 HEAD）为起点，没有提交的新仓库也能用；`reply` 取消或隐藏已变更的验收命令时，告知同事旧的完成标准不再适用。
 - `delegate` 4.1.1：脚本按职责拆分，`scripts/delegate.py` 仍是唯一入口（命令与参数），实现放在 `scripts/delegate_core/`：`common`（设置与小工具）、`runs`（run 记录、状态、整机并发）、`agents`（Pi / Codex 的启动、续接与事件解析）、`changes`（快照与改动清单）、`worktree`（准备、清理与 `apply`）、`supervise`（重跑与验收）、`launch`（创建 run）。依赖单向、无循环；各定义逐字搬移，行为不变，仍只用标准库。
 - `delegate` 4.1.0：结论后输出 `changes` 改动清单（状态、路径、+/- 行数，没改时显示 `none`），按运行前后的工作区快照（借用 index 副本写 tree 对象，不动真实 index）计算，shell 改的文件也算，运行前的脏改动与验收副产物不算；新增 `diff` 查看完整差异。新增 `--worktree`：在仓库外的 detached worktree 里运行，从当前工作区快照起步，按仓库根 `.delegate.json` 复制/链接被忽略的文件并执行 `setup`（如 pnpm/uv 离线安装依赖）；`apply` 把整段对话的改动三方合并回原工作区，冲突时什么都不写（`--merge` 写冲突标记）。新增 `reply`：在同一会话、同一 worktree 里追问（Pi 改为保存会话，Codex 用 `exec resume`）。`agent-handoff` 会列出尚未合并的 worktree。

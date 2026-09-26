@@ -72,7 +72,8 @@ class DelegateTests(unittest.TestCase):
         """Each attempt is a list of events; later calls reuse the last attempt."""
         lines = ["#!/bin/sh", "cat > /dev/null", 'echo "$$ $PI_DELEGATE_ACTIVE $*" >> "$PI_LOG"',
                  # Like Pi, keep the session as <dir>/<time>_<id>.jsonl.
-                 'mkdir -p "$2" && touch "$2/t_$4.jsonl"',
+                 'dir=; id=; prev=; for a in "$@"; do case "$prev" in --session-dir) dir=$a;; --session-id) id=$a;; '
+                 'esac; prev=$a; done; [ -n "$dir" ] && mkdir -p "$dir" && touch "$dir/t_${id:-f$$}.jsonl"',
                  'n=$(wc -l < "$PI_LOG")', pre]
         for index, events in enumerate(attempts, 1):
             test = "true" if index == len(attempts) else f'[ "$n" -eq {index} ]'
@@ -525,8 +526,9 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual((second["state"], second["parent"], second["worktree"]),
                          ("delivered", first["run"], first["worktree"]))
         calls = [line.split() for line in (self.work / "pi.log").read_text().splitlines()]
-        session = lambda call: call[call.index("--session-id") + 1]
-        self.assertEqual(session(calls[0]), session(calls[1]))
+        fork = Path(calls[1][calls[1].index("--fork") + 1])  # a copy of the first run's session
+        self.assertEqual(fork.name, f"t_{calls[0][calls[0].index('--session-id') + 1]}.jsonl")
+        self.assertEqual(fork.parent, Path(second["dir"]) / "fork")
         self.assertEqual((Path(second["dir"]) / "prompt.md").read_text(), "one more thing\n")
         self.assertIn("+again", self.cli("diff", second["run"]).stdout)
         self.assertNotIn("+more", self.cli("diff", second["run"]).stdout)
@@ -541,7 +543,7 @@ class DelegateTests(unittest.TestCase):
         codex = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "look"))
         self.assertEqual(self.outcome(self.cli("reply", codex["run"], "and?"))["state"], "answered")
         call = (self.work / "pi.log.codex").read_text().splitlines()[-1]
-        self.assertIn("exec resume t1 --json", call)
+        self.assertIn("exec fork t1 --json", call)
         self.assertNotIn(" -C ", call)
 
     def test_apply_handles_modes_large_files_and_unsafe_paths(self):
@@ -573,7 +575,7 @@ class DelegateTests(unittest.TestCase):
         self.cli("clean", first["run"])
         self.assertEqual(self.outcome(self.cli("reply", second["run"], "again"))["state"], "answered")
         calls = [line.split() for line in (self.work / "pi.log").read_text().splitlines()]
-        self.assertEqual(len({call[call.index("--session-id") + 1] for call in calls}), 1)
+        self.assertTrue(all("--fork" in call for call in calls[1:]))
 
     def test_agent_that_outlives_its_supervisor_blocks_clean_until_stopped(self):
         self.fake_pi([answer("slow"), SETTLED], sleep=30)
@@ -639,6 +641,43 @@ class DelegateTests(unittest.TestCase):
         self.assertFalse(Path(first["dir"]).exists())  # pruned by the reply's own start
         self.assertTrue(any((Path(second["dir"]) / "session").glob("t_*.jsonl")))
         self.assertEqual(self.outcome(self.cli("reply", second["run"], "again"))["state"], "answered")
+
+    def test_malformed_reply_is_retried_from_the_parent_and_skipped(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        first = self.outcome(self.cli("run", "--read-only", "task"))
+        self.fake_pi([answer(LEAKED), SETTLED])
+        broken = self.outcome(self.cli("reply", first["run"], "more"))
+        self.assertEqual((broken["state"], broken["attempts"]), ("malformed", 2))
+        calls = [line.split() for line in (self.work / "pi.log").read_text().splitlines()]
+        forks = {call[call.index("--fork") + 1] for call in calls[1:]}
+        self.assertEqual(len(forks), 1)  # the rerun started again from the parent's conversation
+        self.fake_pi([answer("better"), SETTLED])
+        retry = self.outcome(self.cli("reply", first["run"], "more, again"))
+        self.assertEqual((retry["state"], retry["parent"]), ("answered", first["run"]))
+        repo = self.repo({"a.txt": "a\n"})
+        self.fake_pi([answer("ok"), SETTLED], pre="echo b >> a.txt")
+        root = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        self.fake_pi([answer(LEAKED), SETTLED])
+        dead_end = self.outcome(self.cli("reply", root["run"], "more"))
+        self.assertEqual(self.cli("apply", root["run"]).returncode, 0)
+        self.assertTrue((Path(dead_end["dir"]) / ".applied").exists())
+        self.assertNotIn("never applied", self.cli("clean", dead_end["run"]).stdout)
+
+    def test_fresh_reply_and_apply_take_the_worktree_as_it_is(self):
+        repo = self.repo({"a.txt": "a\n"})
+        self.fake_pi([answer("first"), SETTLED], pre="echo one >> a.txt")
+        first = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "task"))
+        self.fake_pi([answer("second"), SETTLED], pre="echo two >> a.txt")
+        second = self.outcome(self.cli("reply", "--fresh", first["run"], "--prompt", "standalone task"))
+        call = (self.work / "pi.log").read_text().splitlines()[-1].split()
+        self.assertIn("--session-id", call)
+        self.assertNotIn("--fork", call)
+        self.assertIn("Definition of done", (Path(second["dir"]) / "prompt.md").read_text())
+        self.assertEqual((second["parent"], second["worktree"]), (first["run"], first["worktree"]))
+        with open(Path(first["worktree"]) / "a.txt", "a") as touch_up:  # the caller finishes it by hand
+            touch_up.write("three\n")
+        self.assertEqual(self.cli("apply", first["run"]).returncode, 0)
+        self.assertEqual((repo / "a.txt").read_text(), "a\none\ntwo\nthree\n")
 
 
 def delegate_pid_alive(pid):

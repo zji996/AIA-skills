@@ -32,7 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # delegate_core/ sits next to this script
 
-from delegate_core.agents import kill_group, missing_tools, nesting_error
+from delegate_core.agents import kill_group, missing_tools, nesting_error, session_file
 from delegate_core.changes import chain_changes, print_changes
 from delegate_core.common import (
     ACTIVE, AGENTS, DEFAULT_TIMEOUT, FINISHED_OK, RUNNING_EXIT, SCRIPT, die, emit, read_json, seconds, setting,
@@ -137,9 +137,11 @@ def cmd_reply(args):
     summary = read_json(parent / "summary.json", {}) or {}
     if run_state(parent) in ACTIVE:
         die(f"{parent.name} is still running; wait for it before replying")
-    session = summary.get("session")
-    if not session or (meta.get("agent") == "pi" and not any(Path(meta.get("sessionDir", "/-")).glob(f"*{session}*"))):
-        die(f"{parent.name} has no saved session to continue (runs before delegate 4.1 kept none)")
+    session = None if args.fresh else summary.get("session")
+    if not args.fresh and (not session or (meta.get("agent") == "pi" and
+                                           not session_file(meta.get("sessionDir"), session))):
+        die(f"{parent.name} has no saved session to continue (runs before delegate 4.1 kept none); "
+            "use --fresh to start a new session in the same place")
     if meta.get("worktree") and not Path(meta["worktree"]["path"]).exists():
         die(f"the worktree of {parent.name} no longer exists: {meta['worktree']['path']}")
     error = nesting_error(meta["agent"])
@@ -152,7 +154,7 @@ def cmd_reply(args):
     args.accept = meta.get("accept") if args.accept is None else (args.accept or None)
     args.allow_parallel_writes = False
     prompt = read_prompt(args)
-    run = launch(args, prompt, meta["workdir"], meta["mode"], {"parent": meta, "resume": session,
+    run = launch(args, prompt, meta["workdir"], meta["mode"], {"parent": meta, "session": session,
                                                                   "worktree": meta.get("worktree")})
     print(f"delegate: started {run.name} (reply to {parent.name})", file=sys.stderr)
     return collect([run], args.max, args.progress, args.full, True)
@@ -179,7 +181,14 @@ def cmd_apply(args):
     run = latest_in_chain(resolve_run(args.run))
     if run_state(run) in ACTIVE:
         die(f"{run.name} is still running")
-    return apply_conversation(run, args.merge, args.dry_run)
+    code = apply_conversation(run, args.merge, args.dry_run)
+    if (run / ".applied").is_file():
+        # Every run on this worktree is merged now, including dead-end (malformed) replies beside the chain.
+        path = read_json(run / "meta.json", {})["worktree"]["path"]
+        for other in all_runs():
+            if ((read_json(other / "meta.json", {}) or {}).get("worktree") or {}).get("path") == path:
+                (other / ".applied").write_text((run / ".applied").read_text())
+    return code
 
 
 
@@ -315,6 +324,8 @@ def parser():
     reply.add_argument("--hide-accept", action="store_true")
     reply.add_argument("--accept-timeout", default="10m")
     reply.add_argument("--timeout")
+    reply.add_argument("--fresh", action="store_true",
+                       help="new session in the same workdir/worktree and conversation; the message must stand alone")
     collecting(reply)
     diff = sub.add_parser("diff", help="show a run's changes as a git diff")
     diff.add_argument("run", nargs="?", default="last")

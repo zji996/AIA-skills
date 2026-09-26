@@ -224,11 +224,17 @@ def capacity_error(agent, active):
 
 
 
+def replies_to(name, runs=None):
+    """Replies that continue a run. A malformed one is a dead end: the conversation goes on from its parent."""
+    return [r for r in (runs if runs is not None else all_runs())
+            if (read_json(r / "meta.json", {}) or {}).get("parent") == name and run_state(r) != "malformed"]
+
+
 def latest_in_chain(run):
     """A conversation is named by its first run; replies and apply act on its latest one."""
     runs = all_runs()
     while True:
-        replies = [r for r in runs if (read_json(r / "meta.json", {}) or {}).get("parent") == run.name]
+        replies = replies_to(run.name, runs)
         if not replies:
             return run
         run = replies[-1]
