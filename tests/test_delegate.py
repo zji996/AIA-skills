@@ -939,6 +939,48 @@ class DelegateTests(unittest.TestCase):
                                 capture_output=True, text=True).stdout.split()
         self.assertIn("vendor", staged)  # the new pointer shows against the caller's HEAD
 
+    def sub_repo(self):
+        """A repository with a committed submodule `vendor` (a worktree starts with it uninitialized)."""
+        repo = self.repo({"a.txt": "a\n"})
+        sub = self.work / "lib"
+        git = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always"]
+        subprocess.run(["git", "init", "-q", str(sub)], check=True)
+        (sub / "lib.txt").write_text("v1\n")
+        subprocess.run(["git", "-C", str(sub), *git, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(sub), *git, "commit", "-qm", "v1"], check=True)
+        subprocess.run(["git", "-C", str(repo), *git, "submodule", "add", "-q", str(sub), "vendor"], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-C", str(repo), *git, "commit", "-qm", "vendor"], check=True)
+        return repo
+
+    def test_initializing_a_submodule_to_run_tests_is_not_a_change(self):
+        repo = self.sub_repo()
+        init = "git -c protocol.file.allow=always submodule update --init -q vendor"
+        self.fake_pi([answer("done"), SETTLED], pre=f"{init}; echo more >> a.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        self.assertEqual(state["files"], ["a.txt"])  # the checkout it needed for tests is not its work
+        applied = self.cli("apply", state["run"])
+        self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+        self.assertEqual((repo / "a.txt").read_text(), "a\nmore\n")
+        # Editing inside the submodule it initialized is still a change.
+        self.fake_pi([answer("done"), SETTLED], pre=f"{init}; echo v2 >> vendor/lib.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        self.assertEqual(state["files"], ["vendor"])
+
+    def test_protected_paths_reject_a_run_that_touches_them(self):
+        repo = self.repo({"a.txt": "a\n", "tests/t.txt": "t\n", "docs/spec.md": "s\n"})
+        self.fake_pi([answer("done"), SETTLED], pre="echo x >> a.txt; echo cheat >> tests/t.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--protect", "tests/",
+                                      "--protect", "docs/spec.md", "--accept", "true", "task"))
+        self.assertEqual((state["state"], state["protectViolation"]), ("rejected", ["tests/t.txt"]))
+        self.assertNotIn("accept", state)  # acceptance never runs on a forbidden change
+        self.assertIn("protect", (Path(state["dir"]) / "prompt.md").read_text().lower())  # it was told
+        self.fake_pi([answer("done"), SETTLED], pre="echo x >> a.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--protect", "tests/",
+                                      "--accept", "true", "task"))
+        self.assertEqual(state["state"], "delivered")
+        self.assertNotIn("protectViolation", state)
+
     def test_worktree_in_a_repository_without_commits(self):
         repo = self.work / "fresh"
         subprocess.run(["git", "init", "-q", str(repo)], check=True)

@@ -22,6 +22,7 @@ pub struct Options {
     pub name: Option<String>,
     pub workdir: Option<String>,
     pub images: Vec<String>,
+    pub protect: Vec<String>,
     pub read_only: bool,
     pub in_place: bool,
     pub worktree: bool,
@@ -69,6 +70,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--read-only",
                 "--in-place",
                 "--worktree",
+                "--protect",
                 "--retries",
                 "--provider",
                 "--model",
@@ -87,6 +89,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             "--name",
             "--workdir",
             "--image",
+            "--protect",
             "--accept",
             "--accept-timeout",
             "--timeout",
@@ -115,6 +118,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--name" => o.name = Some(v),
                 "--workdir" => o.workdir = Some(v),
                 "--image" => o.images.push(v),
+                "--protect" => o.protect.push(v),
                 "--accept" => {
                     o.accept_set = true;
                     o.accept = Some(v)
@@ -291,7 +295,13 @@ pub fn has_read_only_contract(prompt: &str) -> bool {
     prompt.contains(READ_ONLY_ZH) || prompt.contains(READ_ONLY_EN)
 }
 
-pub fn contract(prompt: &str, accept: Option<&str>, read_only: bool, revoked: bool) -> String {
+pub fn contract(
+    prompt: &str,
+    accept: Option<&str>,
+    read_only: bool,
+    revoked: bool,
+    protect: &[String],
+) -> String {
     let zh = prompt.chars().any(|c| {
         (0x3040..=0x30ff).contains(&(c as u32)) || (0x4e00..=0x9fff).contains(&(c as u32))
     });
@@ -306,6 +316,14 @@ pub fn contract(prompt: &str, accept: Option<&str>, read_only: bool, revoked: bo
         let cmd = script().display().to_string();
         notes.push(if zh{format!("完成标准：你结束后，委派方会在工作目录中运行下面的命令，退出码为 0 即视为完成。\n\n```sh\n{a}\n```\n\n自己跑这条命令或其他耗时的检查时，前面加 `{cmd} lane`（如 `{cmd} lane {}`）：它与本机其他检查排队、一次只跑一个，排队时间不计入你的时限。",shell_quote(a))}else{format!("Definition of done: after you finish, the delegator runs this command in the working directory; exit code 0 counts as complete.\n\n```sh\n{a}\n```\n\nWhen you run this or another heavy check yourself, prefix it with `{cmd} lane` (e.g. `{cmd} lane {}`): it queues with the other checks on this machine, one at a time, and time spent queued does not count against your time limit.",shell_quote(a))});
     }
+    if !protect.is_empty() {
+        let paths = protect.join(", ");
+        notes.push(if zh {
+            format!("受保护路径：{paths}。不要创建、修改或删除这些路径；结束后会核对改动，触及受保护路径的任务会被拒绝。")
+        } else {
+            format!("Protected paths: {paths}. Do not create, modify, or delete these paths; changes to protected paths will reject the run.")
+        });
+    }
     if notes.is_empty() {
         prompt.into()
     } else {
@@ -315,6 +333,33 @@ pub fn contract(prompt: &str, accept: Option<&str>, read_only: bool, revoked: bo
             notes.join("\n\n")
         )
     }
+}
+fn normalize_protect(paths: &mut Vec<String>) -> Res<()> {
+    for path in paths.iter_mut() {
+        let directory = path.ends_with('/');
+        let components = Path::new(path.as_str()).components().collect::<Vec<_>>();
+        if components.is_empty()
+            || components
+                .iter()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(format!(
+                "--protect requires a repository-relative file or directory: {path}"
+            ));
+        }
+        let normalized = components
+            .iter()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        *path = normalized;
+        if directory {
+            path.push('/');
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(())
 }
 pub fn start(mut o: Options) -> Res<PathBuf> {
     if let Some(e) = nesting_error() {
@@ -345,6 +390,10 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         return Err("--in-place and --worktree contradict each other".into());
     }
     let repo = git_top(&workdir);
+    if !o.protect.is_empty() && repo.is_none() {
+        return Err("--protect needs a git repository".into());
+    }
+    normalize_protect(&mut o.protect)?;
     let mut extra = json!({"env":{}});
     if let Some(top) = &repo {
         let (env, cfg) = worktree::config(top)?;
@@ -405,6 +454,16 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     o.model = meta["model"].as_str().map(str::to_string);
     o.thinking = meta["thinking"].as_str().map(str::to_string);
     o.retries = n(&meta, "retries");
+    o.protect = meta["protect"]
+        .as_array()
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     if o.timeout.is_none() {
         o.timeout = Some(s(&meta, "timeout").into());
     }
@@ -599,6 +658,7 @@ pub fn launch(
             },
             false,
             changed && (o.hide_accept || o.accept.is_none()),
+            &o.protect,
         )
     } else {
         contract(
@@ -610,6 +670,7 @@ pub fn launch(
             },
             mode == "read-only" && (o.agent == "codex" || extra["worktree"].is_object()),
             false,
+            &o.protect,
         )
     };
     write(
@@ -687,7 +748,7 @@ pub fn launch(
     } else {
         top.unwrap_or_default()
     };
-    let meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":seconds(o.timeout.as_deref().unwrap_or("15m"))?,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
+    let meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":seconds(o.timeout.as_deref().unwrap_or("15m"))?,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
     write_json(run.join("meta.json"), &meta)?;
     runs::prune();
     let hash = sha1_smol::Sha1::from(run.to_string_lossy().as_bytes())

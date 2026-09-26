@@ -1,4 +1,4 @@
-# delegate 规格（v5.0）
+# delegate 规格（v5.1）
 
 > 本文是 `skills/delegate` 的**实现契约**：命令行、输出、run 目录、锁与状态机。它是 Rust 重写与 harness 原生接入的依据。
 > 本文不在技能目录内，技能加载时不会读取；模型使用技能只需 `SKILL.md`。行为以本文为准，实现与本文不一致时按缺陷处理。
@@ -74,6 +74,7 @@
 | `--retries N` | 1 | 0–3，答复畸形时的重跑次数 |
 | `--provider` `--model` `--thinking` | — | 透传给同事 CLI |
 | `--allow-parallel-writes` | 否 | 跳过写入互斥 |
+| `--protect <路径>` | — | 可重复；路径相对仓库根，末尾 `/` 表示目录前缀，否则精确匹配文件；需要 git 仓库。reply 继承上一轮设置，不可覆盖 |
 
 时长格式：`^\d+(\.\d+)?[smhd]?$`，无单位为秒，必须 > 0。
 
@@ -96,6 +97,7 @@
 | `accept{command,ok,exitCode,tail?,queuedSeconds?}` | 执行过验收 | `tail` 为失败输出末 1500 字符 |
 | `readOnlyViolation` | 只读 run 在自己的 worktree 中改了文件 | 文件列表 |
 | `workspaceChanged` | `--in-place` 只读 run 期间工作区有变化 | 文件列表；无法归属 |
+| `protectViolation` | 改动命中受保护路径 | 排序后的仓库相对路径列表 |
 | `tier` | 按档位选的同事 | `cheap` / `strong`；升档后为 `strong` |
 | `escalatedFrom` | 升过档 | 原先的同事 |
 | `queuedSeconds` | 同事在 lane 中排队 ≥1 秒 | |
@@ -184,6 +186,10 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 - 结果：`{"tree", "large", "submodules"}`。失败时结论带 `warning`，改动为 unknown。
 
 ### 6.2 改动
+
+子模块指纹保留原有 SHA-1 摘要，并记录检出的 `HEAD` 与是否干净。**仅在 worktree run 中**，起始快照没有该子模块的指纹、结束时子模块干净且 `HEAD` 等于结束快照 tree 中的 gitlink，视为仅初始化（同事为跑测试补齐了子模块）：不计入 `changes`/`files`，`apply` 不处理它。子模块内已跟踪或未跟踪文件有改动、或检出提交不同，照常计为改动。
+
+**受保护路径**：`--protect` 归一化、排序并去重后记入 `meta.json` 的 `protect`，任务说明末尾按说明语言附受保护路径约定。结束快照后若改动命中受保护路径，state 为 `rejected`，带 `protectViolation`，`error` 与 `next` 提示受保护路径被改动，不执行 `--accept`。这样的便宜档 run 有改动，不升档；只读核对照常记录。
 
 起始快照在创建 run 时取，结束快照在同事结束后、验收之前取（验收副产物不计）。改动 = 两个 tree 的 `diff --numstat/--name-status --no-renames`，加上 `large` 与子模块指纹的差异（子模块列为 `submodule contents`）。写入 `changes.json`（`base`、`after`、`top`、`afterLarge`、`changes[{path,status A|M|D,added,deleted,large?,submodule?}]`）与 `changes.patch`（`git diff --binary`）。非 git 目录退回到编辑事件中的路径。
 

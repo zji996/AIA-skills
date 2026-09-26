@@ -352,7 +352,7 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
             large = now["large"].clone();
         }
     }
-    let changes = tree_changes(&top, &json!({"tree":before}), &json!({"tree":after}))?;
+    let changes = tree_changes(&top, &json!({"tree":before}), &json!({"tree":after}), false)?;
     let mut actions = vec![];
     let mut conflicts = vec![];
     for c in changes {

@@ -33,6 +33,7 @@ fn status_line(run: &Path) -> String {
         "changes",
         "accept",
         "readOnlyViolation",
+        "protectViolation",
         "workspaceChanged",
         "escalatedFrom",
         "queuedSeconds",

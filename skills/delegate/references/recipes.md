@@ -10,6 +10,7 @@
 范围：<能改哪些目录/文件；不能碰什么>
 完成标准：<--accept 命令会自动附上；只读任务写清答复要包含什么，如"每条写 文件:行号、触发场景、后果，按严重程度排序">
 约束：<风格、依赖、不要重构无关代码、有疑问写在答复里而不是自作主张>
+证据：<审查/调研类：每条关于现状的断言附 文件:行号；区分"现状事实"与"建议"；不用形容词，给表格加结论>
 ```
 
 审查类任务再加一句"重点看 A、B，但不限于此"；需要它推翻你的判断时，写成"我怀疑 X，请证实或证伪"。
@@ -49,10 +50,9 @@ $D apply fix-lock
 迁移、重写这类任务，先把行为写成规格与黑盒测试，再委派；验收命令里禁止改动测试与规格，否则最省事的"通过"就是改测试：
 
 ```bash
-$D run --worktree --tier strong --name port --timeout 3h --accept-timeout 30m --accept '
-  set -e
-  git diff --quiet HEAD -- tests/ docs/spec.md      # worktree 中 HEAD 即起点，改了测试或规格直接失败
-  make build && make test' --prompt-file task.md
+$D run --worktree --tier strong --name port --timeout 3h --accept-timeout 30m \
+  --protect tests/ --protect docs/spec.md \      # 改了测试或规格直接判 rejected，验收都不跑
+  --accept 'make build && make test' --prompt-file task.md
 ```
 
 交付后仍要看 diff：测试没覆盖到的问题，验收也拦不住。发现漏洞时先补一条测试，再让同事修。
@@ -100,7 +100,7 @@ $D wait
 | 现象 | 原因与对策 |
 |---|---|
 | 同事交付 `delivered`，但改法有问题 | 验收只证明命令通过。看 `diff`；把漏掉的情形补成测试再 `reply` |
-| `apply` 报子模块冲突或出现意外的子模块改动 | 同事为跑测试初始化了子模块。合并前在其 worktree 里 `git submodule deinit -f <路径>` 撤掉 |
+| 改动清单里出现 `submodule contents` | 5.1 起，同事为跑测试而初始化的子模块会被自动识别并忽略；仍然出现，说明它在子模块里改了文件或切了提交，要看 `diff` |
 | worktree 里测试报找不到依赖或路径依赖 | 被忽略的依赖没带过去：在 `.delegate.json` 里 `link` 子模块、`setup` 装依赖 |
 | 便宜档的审查只看到现状、说不出"改了什么" | 它在非 git 目录或 `--in-place` 下运行：只读 Pi 此时没有 shell，跑不了 `git log`/`git diff`。去掉 `--in-place`（默认的快照里它有全部工具），或先把 diff 导出成文件交给它 |
 | 便宜档连续畸形 | 会话太长：`reply --fresh` 开新会话并写完整说明；或直接 `--tier strong` |

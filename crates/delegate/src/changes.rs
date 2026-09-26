@@ -113,7 +113,7 @@ pub fn snapshot(top: &Path, scratch: &Path, exclude: &[String]) -> Option<Value>
     let _ = fs::remove_file(index);
     result.ok()
 }
-fn submodule_fingerprints(top: &Path, exclude: &[String]) -> Res<BTreeMap<String, String>> {
+fn submodule_fingerprints(top: &Path, exclude: &[String]) -> Res<BTreeMap<String, Value>> {
     let mut prints = BTreeMap::new();
     for entry in zstrings(&git(top, &["ls-files", "-s", "-z"])?) {
         if !entry.starts_with("160000 ") {
@@ -129,18 +129,18 @@ fn submodule_fingerprints(top: &Path, exclude: &[String]) -> Res<BTreeMap<String
         {
             continue;
         }
-        let mut digest = sha1_smol::Sha1::new();
-        for args in [
-            &["rev-parse", "HEAD"][..],
-            &["diff", "--binary", "HEAD"],
-            &["ls-files", "-z", "--others", "--exclude-standard"],
-        ] {
-            digest.update(&git(&checkout, args)?);
-        }
-        for name in zstrings(&git(
+        let head_bytes = git(&checkout, &["rev-parse", "HEAD"])?;
+        let head = String::from_utf8_lossy(&head_bytes).trim_end().to_string();
+        let diff = git(&checkout, &["diff", "--binary", "HEAD"])?;
+        let untracked = git(
             &checkout,
             &["ls-files", "-z", "--others", "--exclude-standard"],
-        )?) {
+        )?;
+        let mut digest = sha1_smol::Sha1::new();
+        digest.update(&head_bytes);
+        digest.update(&diff);
+        digest.update(&untracked);
+        for name in zstrings(&untracked) {
             if let Ok(m) = fs::metadata(checkout.join(&name)) {
                 digest.update(
                     format!("{}:{}", m.len(), m.mtime() * 1_000_000_000 + m.mtime_nsec())
@@ -148,11 +148,26 @@ fn submodule_fingerprints(top: &Path, exclude: &[String]) -> Res<BTreeMap<String
                 );
             }
         }
-        prints.insert(path.to_string(), digest.digest().to_string());
+        prints.insert(path.to_string(), json!({"fingerprint":digest.digest().to_string(),"head":head,"clean":diff.is_empty() && untracked.is_empty()}));
     }
     Ok(prints)
 }
-pub fn tree_changes(top: &Path, before: &Value, after: &Value) -> Res<Vec<Value>> {
+fn gitlink(top: &Path, tree: &str, path: &str) -> Res<Option<String>> {
+    let entry = git(top, &["ls-tree", "-z", tree, "--", path])?;
+    let text = String::from_utf8_lossy(&entry);
+    let Some((attrs, name)) = text.trim_end_matches('\0').split_once('\t') else {
+        return Ok(None);
+    };
+    if name != path {
+        return Ok(None);
+    }
+    let fields: Vec<_> = attrs.split_whitespace().collect();
+    Ok(
+        (fields.len() == 3 && fields[0] == "160000" && fields[1] == "commit")
+            .then(|| fields[2].to_string()),
+    )
+}
+pub fn tree_changes(top: &Path, before: &Value, after: &Value, worktree: bool) -> Res<Vec<Value>> {
     let a = s(before, "tree");
     let b = s(after, "tree");
     let num = git(top, &["diff", "--numstat", "-z", "--no-renames", a, b])?;
@@ -199,6 +214,14 @@ pub fn tree_changes(top: &Path, before: &Value, after: &Value) -> Res<Vec<Value>
         for path in keys {
             let x = old.and_then(|m| m.get(&path));
             let y = new.and_then(|m| m.get(&path));
+            if kind == "submodules"
+                && worktree
+                && x.is_none()
+                && y.is_some_and(|v| crate::common::b(v, "clean"))
+                && gitlink(top, b, &path)?.as_deref() == y.map(|v| s(v, "head"))
+            {
+                continue;
+            }
             if x != y && (kind == "large" || !listed.contains(&path)) {
                 let status = if x.is_none() {
                     "A"
@@ -232,7 +255,7 @@ pub fn record(meta: &Value, run: &Path) -> Option<(Vec<Value>, Value)> {
         })
         .unwrap_or_default();
     let after = snapshot(top, run, &excludes)?;
-    let changes = tree_changes(top, base, &after).ok()?;
+    let changes = tree_changes(top, base, &after, meta["worktree"].is_object()).ok()?;
     let recorded = json!({"base":s(base,"tree"),"after":s(&after,"tree"),"top":top,"afterLarge":after["large"],"changes":changes});
     write_json(run.join("changes.json"), &recorded).ok()?;
     let patch = git(

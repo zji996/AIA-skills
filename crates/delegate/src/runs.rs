@@ -122,6 +122,9 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
         return None;
     }
     match state {
+        "rejected" if !sum["protectViolation"].is_null() => Some(format!(
+            "protected paths were changed; review protectViolation, restore them, then {script} reply {name} '<what to fix>'"
+        )),
         "rejected" => Some(format!(
             "read accept.tail; {script} reply {name} '<what to fix>' or take it over"
         )),
@@ -156,6 +159,7 @@ pub fn status(run: &Path) -> Value {
             "changes",
             "accept",
             "readOnlyViolation",
+            "protectViolation",
             "workspaceChanged",
             "escalatedFrom",
             "queuedSeconds",

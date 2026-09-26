@@ -10,6 +10,7 @@ const LAUNCH: &[(&str, &str)] = &[
     ("--read-only", "No writes: isolated agents are instructed and checked; Pi uses read-only tools without isolation. In git, reads a worktree snapshot by default."),
     ("--in-place", "Read-only: read the working tree instead of a snapshot."),
     ("--accept COMMAND", "Shell command run in the workdir after the agent; exit 0 means delivered."),
+    ("--protect PATH", "Protect a repository-relative file or directory prefix (trailing /); repeatable. Changes reject the run before acceptance."),
     ("--hide-accept", "Keep the acceptance command from the agent for blind verification."),
     ("--accept-timeout DURATION", "Acceptance command limit (default: 10m)."),
     ("--timeout DURATION", "Limit for each attempt (default: 15m Pi, 30m Codex)."),
@@ -38,6 +39,7 @@ const REPLY: &[(&str, &str)] = &[
     ("--name NAME", "Short label in the new run id."),
     ("--image PATH", "Attach an image; repeatable."),
     ("--accept COMMAND", "Replace the parent's acceptance command; '' removes it."),
+    ("--protect", "Protected paths are inherited from the previous run and cannot be changed in reply."),
     ("--hide-accept", "Keep the acceptance command from the agent."),
     ("--accept-timeout DURATION", "Acceptance command limit (default: 10m)."),
     ("--timeout DURATION", "Limit for the attempt (default: 15m Pi, 30m Codex)."),
@@ -89,7 +91,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("-h, --help", "Show this help."),
             ("--version", "Show the Cargo package version."),
         ]);
-        println!("\nStates: running | delivered (accept passed) | answered (no --accept) | rejected (accept failed) | malformed (empty or leaked tool call after reruns) | failed | timeout | killed | stopped | crashed.");
+        println!("\nStates: running | delivered (accept passed) | answered (no --accept) | rejected (accept failed or protected path changed) | malformed (empty or leaked tool call after reruns) | failed | timeout | killed | stopped | crashed.");
         println!(
             "Exit: 0 delivered/answered, 1 other finished, 2 usage, 75 still running at --max."
         );

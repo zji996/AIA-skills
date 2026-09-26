@@ -156,6 +156,23 @@ fn settle(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let protected = meta["protect"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let violations = changed
+        .iter()
+        .filter(|path| {
+            protected.iter().any(|rule| {
+                if rule.ends_with('/') {
+                    path.starts_with(rule)
+                } else {
+                    path == rule
+                }
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     if let Some((_, totals)) = &rec {
         sum["changes"] = totals.clone();
     } else if !s(meta, "top").is_empty() && setup_error.is_none() {
@@ -170,7 +187,14 @@ fn settle(
             sum["warning"] = json!("the working tree changed during this in-place read-only run; the changes may be the caller's own");
         }
     }
-    if verdict == "ok" && !s(meta, "accept").is_empty() && !lane::stopped() {
+    if !violations.is_empty() {
+        state = "rejected".into();
+        sum["state"] = json!(state);
+        sum["protectViolation"] = json!(violations);
+        sum["error"] = json!("protected paths were changed; review protectViolation and remove those changes before retrying");
+    }
+    if violations.is_empty() && verdict == "ok" && !s(meta, "accept").is_empty() && !lane::stopped()
+    {
         sum["accept"] = accept(meta, run, holder);
         state = if b(&sum["accept"], "ok") {
             "delivered"
@@ -188,8 +212,10 @@ fn escalate(
     state: &str,
     recorded: bool,
     changed: &[String],
+    protected: bool,
 ) -> Res<bool> {
     if s(meta, "tier") != "cheap"
+        || protected
         || !["malformed", "failed", "timeout", "rejected"].contains(&state)
     {
         return Ok(false);
@@ -219,7 +245,7 @@ fn escalate(
         if !launch::has_read_only_contract(&prompt) {
             write(
                 run.join("prompt.md"),
-                launch::contract(&prompt, None, true, false),
+                launch::contract(&prompt, None, true, false, &[]),
             )?;
         }
     }
@@ -248,7 +274,8 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<std::sync::Mutex<Option<
     let (mut state, mut sum, mut rec, mut changed) =
         settle(&meta, run, &verdict, &setup_error, holder.clone());
     let cheap = s(&meta, "agent").to_string();
-    if !lane::stopped() && escalate(&mut meta, run, &state, rec.is_some(), &changed)? {
+    let protected = !sum["protectViolation"].is_null();
+    if !lane::stopped() && escalate(&mut meta, run, &state, rec.is_some(), &changed, protected)? {
         log_event(
             run,
             json!({"e":"escalate","from":cheap,"to":s(&meta,"agent"),"after":state}),
