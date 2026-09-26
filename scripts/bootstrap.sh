@@ -17,7 +17,7 @@ usage: bootstrap.sh [--dir <path>] [--ref <branch|tag>] [--github | --source <gi
   --github        clone from GitHub instead of the primary repository
   --source        clone from a specific git URL
   --with-pi       also install or update Pi via the bundled pi-kit, keeping existing
-                  Pi settings and packages (pi-kit --additive); needed by pi-delegation
+                  Pi settings and packages (pi-kit --additive); needed by delegate
   --with-pi-sync  same, but apply pi-kit's full declarative setup (pi-kit --sync)
 Remaining arguments go to scripts/install.sh, e.g. --copy, --force or skill names.
 Set PI_KIT_MIRROR=cn to force npm mirrors in Mainland China.
@@ -40,7 +40,7 @@ install_pi() {
   sh "$dir/third_party/pi-kit/install.sh" "--$mode" </dev/null || die "pi-kit failed; skills are installed, re-run to retry Pi"
   command -v python3 >/dev/null || missing+=(python3)
   if (( ${#missing[@]} )); then
-    log "pi-delegation also needs: ${missing[*]} (e.g. sudo apt install python3)"
+    log "delegate also needs: ${missing[*]} (e.g. sudo apt install python3)"
   fi
 }
 

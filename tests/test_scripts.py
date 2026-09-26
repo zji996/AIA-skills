@@ -84,20 +84,23 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(self.run_script(INSTALL, "agent-handoff", "--force", env=env).returncode, 0)
         self.assertEqual(link.resolve(), ROOT / "skills/agent-handoff")
 
-    def test_install_keeps_pi_delegation_out_of_pi_directories(self):
+    def test_install_keeps_delegate_out_of_pi_directories(self):
         home = self.work / "home"
         shared = home / ".agents/skills"
         shared.mkdir(parents=True)
-        (shared / "pi-delegation").symlink_to(ROOT / "skills/pi-delegation")
+        (shared / "delegate").symlink_to(ROOT / "skills/delegate")
         (shared / "agent-delegation").symlink_to(ROOT / "skills/agent-delegation")
+        (home / ".codex/skills").mkdir(parents=True)
+        (home / ".codex/skills/pi-delegation").symlink_to(ROOT / "skills/pi-delegation")  # pre-4.0 name
         env = {**os.environ, "HOME": str(home)}
-        result = self.run_script(INSTALL, "pi-delegation", "repo-governance", env=env)
+        result = self.run_script(INSTALL, "delegate", "repo-governance", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse((shared / "pi-delegation").is_symlink())
+        self.assertFalse((shared / "delegate").is_symlink())
+        self.assertFalse((home / ".codex/skills/pi-delegation").is_symlink())
         self.assertFalse((shared / "agent-delegation").is_symlink())
         self.assertEqual((shared / "repo-governance").resolve(), ROOT / "skills/repo-governance")
         for directory in (".codex", ".cursor", ".claude", ".kilo"):
-            self.assertEqual((home / directory / "skills/pi-delegation").resolve(), ROOT / "skills/pi-delegation")
+            self.assertEqual((home / directory / "skills/delegate").resolve(), ROOT / "skills/delegate")
         self.assertFalse((home / ".codex/skills/repo-governance").exists())
         self.assertFalse((home / ".kilo/skills/repo-governance").exists())
 

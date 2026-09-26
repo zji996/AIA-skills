@@ -9,11 +9,17 @@ status, not Pi's own report, decides whether the task was delivered.
 Nesting: a Pi run cannot delegate at all; a Codex run may delegate to Pi but not to
 Codex. The calling agent always reviews and decides whether to adopt a result.
 
+Concurrency: active runs are counted per machine (all projects, nested runs included);
+a start beyond DELEGATE_MAX_ACTIVE (default 6) or DELEGATE_MAX_CODEX (default 3) is refused.
+
+Settings are read as DELEGATE_<NAME>, falling back to the pre-4.0 PI_DELEGATE_<NAME>.
+
 Standard library only; Linux (process groups, /proc). Python 3.9+.
 """
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -36,8 +42,14 @@ STARTING_GRACE = 15  # seconds a run may wait for its supervisor before it count
 LEAKED_CALL = re.compile(r"\bcall:[\w.-]+(?::[\w-]+)?\{")
 AGENTS = ("pi", "codex")
 DEFAULT_TIMEOUT = {"pi": "15m", "codex": "30m"}
+DEFAULT_LIMITS = {"MAX_ACTIVE": 6, "MAX_CODEX": 3}
 # Environment handed to a delegated agent; used to refuse self-delegation.
-ENV_AGENT, ENV_PARENT, ENV_LEGACY = "PI_DELEGATE_AGENT", "PI_DELEGATE_PARENT_RUN", "PI_DELEGATE_ACTIVE"
+ENV_AGENT, ENV_PARENT, ENV_LEGACY = "DELEGATE_AGENT", "DELEGATE_PARENT_RUN", "PI_DELEGATE_ACTIVE"
+GUARD_VARS = (ENV_AGENT, ENV_PARENT, ENV_LEGACY, "PI_DELEGATE_AGENT", "PI_DELEGATE_PARENT_RUN")
+
+
+def setting(name, default=None):
+    return os.environ.get(f"DELEGATE_{name}") or os.environ.get(f"PI_DELEGATE_{name}") or default
 
 
 def now_iso():
@@ -45,7 +57,7 @@ def now_iso():
 
 
 def die(message, code=USAGE_EXIT):
-    print(f"pi-delegate: {message}", file=sys.stderr)
+    print(f"delegate: {message}", file=sys.stderr)
     sys.exit(code)
 
 
@@ -72,8 +84,8 @@ def write_json(path, value):
 # ---------------------------------------------------------------- run storage
 
 def runs_root():
-    if os.environ.get("PI_DELEGATE_RUNS"):
-        return Path(os.environ["PI_DELEGATE_RUNS"])
+    if setting("RUNS"):
+        return Path(setting("RUNS"))
     try:
         top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True,
                              check=True).stdout.strip()
@@ -105,7 +117,7 @@ def resolve_run(ref):
     matches = [d for d in runs if ref in d.name]
     if len(matches) != 1:
         die(f"run '{ref}' matched {len(matches)} runs under {root} (runs live under the git root of the "
-            "directory where start ran; pass a run directory or set PI_DELEGATE_RUNS)")
+            "directory where start ran; pass a run directory or set DELEGATE_RUNS)")
     return matches[0]
 
 
@@ -280,26 +292,28 @@ def codex_model():
 
 def agent_command(meta):
     if meta["agent"] == "codex":
+        # Full access on every host, whatever its own config.toml says: bwrap is often unavailable (AppArmor),
+        # git makes writes recoverable, and read-only runs are checked by outcome afterwards.
         command = ["codex", "exec", "--json", "--skip-git-repo-check", "-C", meta["workdir"],
-                   "-c", 'approval_policy="never"']
+                   "--dangerously-bypass-approvals-and-sandbox"]
         if meta.get("model"):
             command += ["-m", meta["model"]]
         if meta.get("thinking"):
             command += ["-c", f'model_reasoning_effort="{meta["thinking"]}"']
         if meta.get("provider"):
             command += ["-c", f'model_provider="{meta["provider"]}"']
-        return command + ["-"]
+        return command + [f"--image={image}" for image in meta.get("images") or []] + ["-"]
     command = ["pi", "--no-session", "--mode", "json"]
     for flag in ("provider", "model", "thinking"):
         if meta.get(flag):
             command += [f"--{flag}", meta[flag]]
     if meta["mode"] == "read-only":
         command += ["--tools", "read,grep,find,ls"]
-    return command + ["-p"]
+    return command + ["-p"] + [f"@{image}" for image in meta.get("images") or []]
 
 
 def agent_env(meta):
-    env = {k: v for k, v in os.environ.items() if k not in (ENV_AGENT, ENV_PARENT, ENV_LEGACY)}
+    env = {k: v for k, v in os.environ.items() if k not in GUARD_VARS}
     env[ENV_AGENT] = meta["agent"]
     env[ENV_PARENT] = meta["run"]
     if meta["agent"] == "pi":
@@ -308,7 +322,7 @@ def agent_env(meta):
 
 
 def caller_agent():
-    return os.environ.get(ENV_AGENT) or ("pi" if os.environ.get(ENV_LEGACY) else None)
+    return setting("AGENT") or ("pi" if os.environ.get(ENV_LEGACY) else None)
 
 
 def nesting_error(agent):
@@ -423,7 +437,7 @@ def accept(meta, run):
     try:
         done = subprocess.run(meta["accept"], shell=True, cwd=meta["workdir"], capture_output=True, text=True,
                               timeout=meta["acceptTimeoutSeconds"],
-                              env={k: v for k, v in os.environ.items() if k not in (ENV_AGENT, ENV_PARENT, ENV_LEGACY)})
+                              env={k: v for k, v in os.environ.items() if k not in GUARD_VARS})
         code, output = done.returncode, done.stdout + done.stderr
     except subprocess.TimeoutExpired as error:
         code = 124
@@ -468,7 +482,7 @@ def supervise(run):
     before = meta.get("gitBefore")
     changed = sorted(line[3:] for line in set(after) - set(before)) if before is not None and after is not None else []
     if meta["mode"] == "read-only" and changed and verdict == "ok":
-        # Codex cannot always be sandboxed (e.g. AppArmor blocks bwrap), so read-only is checked by outcome.
+        # Codex runs unsandboxed, so read-only is checked by outcome.
         verdict = "failed"
         summary["readOnlyViolation"] = changed
         state = summary["state"] = "failed"
@@ -513,7 +527,7 @@ def missing_tools(agent):
 
 
 def prune_expired():
-    days = os.environ.get("PI_DELEGATE_KEEP_DAYS", "7")
+    days = setting("KEEP_DAYS", "7")
     if not days.isdigit() or int(days) == 0:
         return
     cutoff = time.time() - int(days) * 86400
@@ -521,6 +535,47 @@ def prune_expired():
         done = run / "exit_code"
         if (run / ".delivered").is_file() and done.is_file() and done.stat().st_mtime < cutoff:
             shutil.rmtree(run, ignore_errors=True)
+
+
+def state_dir():
+    # Deliberately not a DELEGATE_* setting: a delegated agent must not opt out of the machine's pool.
+    return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "delegate"
+
+
+def limit(name):
+    value = setting(name, str(DEFAULT_LIMITS[name]))
+    if not value.isdigit():
+        die(f"DELEGATE_{name} must be a non-negative integer (0 = unlimited), got {value!r}")
+    return int(value)
+
+
+def machine_runs(slots):
+    """Active runs on this machine, across projects; forget slots whose run has ended or vanished."""
+    active = []
+    for slot in slots.glob("*.slot"):
+        try:
+            run = Path(slot.read_text().strip())
+        except OSError:
+            continue
+        if (run / "meta.json").is_file() and run_state(run) in ACTIVE:
+            active.append(run)
+        else:
+            slot.unlink(missing_ok=True)
+    return active
+
+
+def capacity_error(agent, active):
+    agents = [(read_json(run / "meta.json", {}) or {}).get("agent", "pi") for run in active]
+    total, codex = limit("MAX_ACTIVE"), limit("MAX_CODEX")
+    if total and len(active) >= total:
+        reason = f"{len(active)} runs are active on this machine (DELEGATE_MAX_ACTIVE={total})"
+    elif agent == "codex" and codex and agents.count("codex") >= codex:
+        reason = f"{agents.count('codex')} Codex runs are active on this machine (DELEGATE_MAX_CODEX={codex})"
+    else:
+        return None
+    listing = "".join(f"\n  {status(run)['elapsedSeconds']:>5}s {kind:<5} {run}" for run, kind in zip(active, agents))
+    return (f"refusing to start: {reason}; collect results with wait before starting more, or stop runs "
+            f"no longer needed{listing}")
 
 
 def start_run(args):
@@ -543,14 +598,28 @@ def start_run(args):
     if not workdir.is_dir():
         die(f"workdir does not exist: {workdir}")
     workdir = str(workdir.resolve())
+    images = []
+    for image in args.image or []:
+        if not Path(image).is_file():
+            die(f"image does not exist: {image}")
+        images.append(str(Path(image).resolve()))
+    args.image = images
     missing_tools(args.agent)
     mode = "read-only" if args.read_only else "write"
     root = runs_root()
     root.mkdir(parents=True, exist_ok=True)
-    # Concurrent starts would each miss the other's run in the exclusivity check; serialize them.
-    with open(root / ".start.lock", "w") as lock:
+    slots = state_dir()
+    slots.mkdir(parents=True, exist_ok=True)
+    # Concurrent starts would each miss the other's run in the capacity and exclusivity checks; serialize them.
+    with open(slots / ".start.lock", "w") as machine_lock, open(root / ".start.lock", "w") as lock:
+        fcntl.flock(machine_lock, fcntl.LOCK_EX)
         fcntl.flock(lock, fcntl.LOCK_EX)
-        return create_run(args, prompt, workdir, mode, root)
+        error = capacity_error(args.agent, machine_runs(slots))
+        if error:
+            die(error)
+        run = create_run(args, prompt, workdir, mode, root)
+        (slots / (hashlib.sha1(str(run).encode()).hexdigest()[:16] + ".slot")).write_text(f"{run}\n")
+        return run
 
 
 def with_contract(prompt, accept=None, read_only=False):
@@ -558,9 +627,11 @@ def with_contract(prompt, accept=None, read_only=False):
     zh = bool(re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", prompt))
     notes = []
     if read_only:
-        notes.append("只读任务：不要创建、修改或删除任何文件；结束后会核对工作目录，任何改动都会使任务判为失败。" if zh else
+        notes.append("只读任务：不要创建、修改或删除任何文件；结束后会核对工作目录，任何改动都会使任务判为失败。"
+                     "用 delegate 委派子任务产生的记录在 git 忽略的目录里，不算改动，无需改动其存放位置。" if zh else
                      "Read-only task: do not create, modify or delete files; the working directory is checked afterwards "
-                     "and any change fails the task.")
+                     "and any change fails the task. Records of subtasks delegated with delegate live in git-ignored "
+                     "directories and do not count; leave their location as it is.")
     if accept:
         notes.append(("完成标准：你结束后，委派方会在工作目录中运行下面的命令，退出码为 0 即视为完成。" if zh else
                       "Definition of done: after you finish, the delegator runs this command in the working directory; "
@@ -574,12 +645,12 @@ def create_run(args, prompt, workdir, mode, root):
     if mode == "write" and not args.allow_parallel_writes:
         for run in all_runs():
             meta = read_json(run / "meta.json", {}) or {}
-            if run.name == os.environ.get(ENV_PARENT):
+            if run.name == setting("PARENT_RUN"):
                 continue  # the caller's own run is waiting on this helper
             if meta.get("mode") == "write" and meta.get("workdir") == workdir and run_state(run) in ACTIVE:
                 die(f"write run {run.name} is still active in {workdir}; wait for it, use --read-only, "
                     "or pass --allow-parallel-writes")
-    if not os.environ.get("PI_DELEGATE_RUNS") and not (root / ".gitignore").exists():
+    if not setting("RUNS") and not (root / ".gitignore").exists():
         (root / ".gitignore").write_text("*\n")
     prune_expired()
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", args.name or "").strip("-")[:40] or os.urandom(2).hex()
@@ -602,7 +673,7 @@ def create_run(args, prompt, workdir, mode, root):
             "provider": args.provider, "model": args.model, "thinking": args.thinking,
             "timeout": args.timeout, "timeoutSeconds": seconds(args.timeout),
             "accept": args.accept, "acceptTimeoutSeconds": seconds(args.accept_timeout),
-            "retries": args.retries, "gitBefore": git_changes(workdir),
+            "retries": args.retries, "images": args.image, "gitBefore": git_changes(workdir),
             "startedAt": now_iso(), "startedEpoch": int(time.time()), "startedNs": time.time_ns()}
     write_json(run / "meta.json", meta)
     with open(run / "supervisor.log", "wb") as log:
@@ -619,7 +690,7 @@ def create_run(args, prompt, workdir, mode, root):
 
 def print_answer(run, full):
     text = (run / "result.md").read_text(encoding="utf-8")
-    limit = int(os.environ.get("PI_DELEGATE_RESULT_CHARS", "6000"))
+    limit = int(setting("RESULT_CHARS", "6000"))
     print(f"\n===== result: {run.name} ({len(text)} chars) =====")
     if full or len(text) <= limit:
         print(text.rstrip("\n"))
@@ -642,7 +713,7 @@ def show_progress(run, tag):
 
 def collect(runs, max_seconds, progress, full, show_result):
     deadline = None if max_seconds is None else time.time() + max_seconds
-    poll = float(os.environ.get("PI_DELEGATE_POLL", "1"))
+    poll = float(setting("POLL", "1"))
     while True:
         active = False
         for run in runs:
@@ -667,20 +738,20 @@ def collect(runs, max_seconds, progress, full, show_result):
         if show_result or not has_result:
             (run / ".delivered").touch()
     if code == RUNNING_EXIT:
-        print(f"pi-delegate: still running; call wait again (exit {RUNNING_EXIT})", file=sys.stderr)
+        print(f"delegate: still running; call wait again (exit {RUNNING_EXIT})", file=sys.stderr)
     return code
 
 
 def cmd_start(args):
     run = start_run(args)
     emit(status(run))
-    print(f"pi-delegate: started {run.name}; collect with: {SCRIPT} wait {run.name}", file=sys.stderr)
+    print(f"delegate: started {run.name}; collect with: {SCRIPT} wait {run.name}", file=sys.stderr)
     return 0
 
 
 def cmd_run(args):
     run = start_run(args)
-    print(f"pi-delegate: started {run.name}", file=sys.stderr)
+    print(f"delegate: started {run.name}", file=sys.stderr)
     return collect([run], args.max, args.progress, args.full, True)
 
 
@@ -688,7 +759,7 @@ def cmd_wait(args):
     if args.all:
         runs = [r for r in all_runs() if run_state(r) in ACTIVE or not (r / ".delivered").is_file()]
         if not runs:
-            print("pi-delegate: no active or undelivered runs", file=sys.stderr)
+            print("delegate: no active or undelivered runs", file=sys.stderr)
             return 0
     else:
         runs = [resolve_run(ref) for ref in (args.runs or ["last"])]
@@ -705,7 +776,7 @@ def cmd_result(args):
     run = resolve_run(args.run)
     result = run / "result.md"
     if not result.is_file():
-        print(f"pi-delegate: no result for {run.name} (state: {run_state(run)})", file=sys.stderr)
+        print(f"delegate: no result for {run.name} (state: {run_state(run)})", file=sys.stderr)
         return 1
     print(str(result) if args.path else result.read_text(encoding="utf-8"), end="" if not args.path else "\n")
     if run_state(run) not in ACTIVE:
@@ -752,12 +823,12 @@ def cmd_clean(args):
             if (run / ".delivered").is_file() or args.force:
                 targets.append(run)
             elif run_state(run) not in ACTIVE:
-                print(f"pi-delegate: keep unreported run {run.name}; read it with wait/result or pass --force",
+                print(f"delegate: keep unreported run {run.name}; read it with wait/result or pass --force",
                       file=sys.stderr)
     for run in dict.fromkeys(targets):
         state = run_state(run)
         if state in ACTIVE:
-            print(f"pi-delegate: skip active run {run.name}", file=sys.stderr)
+            print(f"delegate: skip active run {run.name}", file=sys.stderr)
             continue
         shutil.rmtree(run, ignore_errors=True)
         print(f"removed {run.name} ({state})")
@@ -766,12 +837,12 @@ def cmd_clean(args):
 
 def parser():
     top = argparse.ArgumentParser(
-        prog="pi-delegate",
+        prog="delegate",
         description="Delegate atomic tasks to Pi (e.g. Gemini) or Codex (GPT); judge them by results.",
         epilog="States: running | delivered (accept passed) | answered (no --accept) | rejected (accept "
                "failed) | malformed (empty or leaked tool call after reruns) | failed | timeout | killed | "
                "stopped | crashed. Exit: 0 delivered/answered, 1 other finished, 2 usage, 75 still running "
-               "at --max. Runs live in $PI_DELEGATE_RUNS or <git root of cwd>/.local/run/pi.")
+               "at --max. Runs live in $DELEGATE_RUNS or <git root of cwd>/.local/run/pi.")
     sub = top.add_subparsers(dest="command", required=True)
 
     def launch(p):
@@ -780,9 +851,11 @@ def parser():
         p.add_argument("--prompt-file", help="file with the prompt, or - for stdin")
         p.add_argument("--agent", choices=AGENTS, default="pi", help="who does the work (default pi)")
         p.add_argument("--name", help="short label used in the run id")
-        p.add_argument("--workdir", help="directory Pi works in (default: cwd)")
+        p.add_argument("--workdir", help="directory the agent works in (default: cwd)")
+        p.add_argument("--image", action="append", metavar="PATH",
+                       help="attach an image to the prompt (repeatable); both agents can read images")
         p.add_argument("--read-only", action="store_true",
-                       help="no writes: Pi loses write tools; Codex is told and checked by git status afterwards")
+                       help="no writes: Pi loses write tools; Codex (unsandboxed) is told and checked by git status afterwards")
         p.add_argument("--accept", help="shell command run in the workdir after Pi; exit 0 = delivered")
         p.add_argument("--hide-accept", action="store_true",
                        help="do not tell Pi the acceptance command (blind verification)")

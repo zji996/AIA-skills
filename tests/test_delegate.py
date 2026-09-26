@@ -11,12 +11,11 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DELEGATE = ROOT / "skills/pi-delegation/scripts/pi_delegate.py"
-SHIM = ROOT / "skills/pi-delegation/scripts/pi-delegate.sh"
+DELEGATE = ROOT / "skills/delegate/scripts/delegate.py"
 
-spec = importlib.util.spec_from_file_location("pi_delegate", DELEGATE)
-pi_delegate = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(pi_delegate)
+spec = importlib.util.spec_from_file_location("delegate", DELEGATE)
+delegate = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(delegate)
 
 
 def answer(text, stop="stop"):
@@ -54,16 +53,17 @@ def codex_events(answer_text="final answer", files=(), fail=None):
     return events
 
 
-class PiDelegateTests(unittest.TestCase):
+class DelegateTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="pi-delegate-")
+        self.temp = tempfile.TemporaryDirectory(prefix="delegate-")
         self.addCleanup(self.temp.cleanup)
         self.work = Path(self.temp.name)
         self.bin = self.work / "bin"
         self.bin.mkdir()
-        self.env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "PI_DELEGATE_POLL": "0.1",
-                    "PI_DELEGATE_RUNS": str(self.work / "runs"), "PI_LOG": str(self.work / "pi.log")}
-        self.env.pop("PI_DELEGATE_ACTIVE", None)
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("DELEGATE_", "PI_DELEGATE_"))}
+        self.env.update(PATH=f"{self.bin}:{os.environ['PATH']}", DELEGATE_POLL="0.1",
+                        DELEGATE_RUNS=str(self.work / "runs"), XDG_STATE_HOME=str(self.work / "state"),
+                        PI_LOG=str(self.work / "pi.log"))
 
     def fake_pi(self, *attempts, pre="", sleep=0, code=0):
         """Each attempt is a list of events; later calls reuse the last attempt."""
@@ -79,7 +79,7 @@ class PiDelegateTests(unittest.TestCase):
 
     def fake_codex(self, events, pre=""):
         lines = ["#!/bin/sh", 'cat > "$PI_LOG.codex-prompt"',
-                 'echo "$$ ${PI_DELEGATE_AGENT:-} ${PI_DELEGATE_ACTIVE:-} $*" >> "$PI_LOG.codex"', pre,
+                 'echo "$$ ${DELEGATE_AGENT:-} ${PI_DELEGATE_ACTIVE:-} $*" >> "$PI_LOG.codex"', pre,
                  "printf '%s\\n' " + " ".join(shlex.quote(json.dumps(e)) for e in events)]
         codex = self.bin / "codex"
         codex.write_text("\n".join(lines) + "\n")
@@ -92,11 +92,10 @@ class PiDelegateTests(unittest.TestCase):
     def outcome(self, result):
         return next(json.loads(line) for line in result.stdout.splitlines() if line.startswith('{"run"'))
 
-    def test_answered_run_reports_once_and_shim_forwards(self):
+    def test_answered_run_reports_once(self):
         write = {"type": "tool_execution_start", "toolName": "write", "args": {"path": "a.txt", "content": "x" * 5000}}
         self.fake_pi([write, answer("final delivery"), SETTLED])
-        result = subprocess.run([str(SHIM), "run", "--name", "quick", "do", "it"], cwd=self.work, env=self.env,
-                                capture_output=True, text=True, timeout=30)
+        result = self.cli("run", "--name", "quick", "do", "it")
         self.assertEqual(result.returncode, 0, result.stderr)
         state = self.outcome(result)
         self.assertEqual((state["state"], state["files"], state["resultChars"], state["model"]),
@@ -178,9 +177,9 @@ class PiDelegateTests(unittest.TestCase):
         self.assertEqual(self.outcome(self.cli("run", "task"))["state"], "killed")
 
     def test_leak_detector_ignores_normal_prose(self):
-        self.assertTrue(pi_delegate.leaked_tool_call(LEAKED))
-        self.assertFalse(pi_delegate.leaked_tool_call("Use `call:default_api:read{...}` carefully.\nDone."))
-        self.assertFalse(pi_delegate.leaked_tool_call("Result: {a: 1}"))
+        self.assertTrue(delegate.leaked_tool_call(LEAKED))
+        self.assertFalse(delegate.leaked_tool_call("Use `call:default_api:read{...}` carefully.\nDone."))
+        self.assertFalse(delegate.leaked_tool_call("Result: {a: 1}"))
 
     def test_nested_delegation_is_refused_and_guard_exported(self):
         self.fake_pi([answer("ok"), SETTLED])
@@ -291,7 +290,7 @@ class PiDelegateTests(unittest.TestCase):
         repo = self.work / "repo"
         (repo / "sub").mkdir(parents=True)
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
-        del self.env["PI_DELEGATE_RUNS"]
+        del self.env["DELEGATE_RUNS"]
         self.fake_pi([answer("ok"), SETTLED])
         state = self.outcome(self.cli("run", "--read-only", "task", cwd=repo / "sub"))
         self.assertTrue(state["dir"].startswith(str(repo / ".local/run/pi/")))
@@ -320,8 +319,8 @@ class PiDelegateTests(unittest.TestCase):
         self.assertEqual(call[1], "codex")  # the agent knows who it is, for nesting rules
         args = " ".join(call[2:])
         for flag in ("exec --json", "--skip-git-repo-check", "-m gpt-test", 'model_reasoning_effort="low"',
-                     'approval_policy="never"'):
-            self.assertIn(flag, args)
+                     "--dangerously-bypass-approvals-and-sandbox"):
+            self.assertIn(flag, args)  # full access regardless of the host's config.toml
         self.assertNotIn("--sandbox", args)
         self.assertIn("```sh\ntest -f made.txt\n```", (self.work / "pi.log.codex-prompt").read_text())
 
@@ -355,12 +354,12 @@ class PiDelegateTests(unittest.TestCase):
     def test_nesting_rules(self):
         self.fake_pi([answer("ok"), SETTLED])
         self.fake_codex(codex_events("ok"))
-        self.env["PI_DELEGATE_AGENT"] = "pi"
+        self.env["DELEGATE_AGENT"] = "pi"
         for agent in ("pi", "codex"):
             result = self.cli("start", "--agent", agent, "task")
             self.assertEqual(result.returncode, 2)
             self.assertIn("Pi run cannot delegate", result.stderr)
-        self.env["PI_DELEGATE_AGENT"] = "codex"
+        self.env["DELEGATE_AGENT"] = "codex"
         result = self.cli("start", "--agent", "codex", "task")
         self.assertEqual(result.returncode, 2)
         self.assertIn("not to Codex", result.stderr)
@@ -373,10 +372,53 @@ class PiDelegateTests(unittest.TestCase):
         parent = json.loads(self.cli("start", "--name", "parent", "task").stdout)["run"]
         self.assertEqual(self.cli("start", "--name", "rival", "task").returncode, 2)
         self.fake_pi([answer("helper done"), SETTLED])
-        self.env.update(PI_DELEGATE_AGENT="codex", PI_DELEGATE_PARENT_RUN=parent)
+        self.env.update(PI_DELEGATE_AGENT="codex", PI_DELEGATE_PARENT_RUN=parent)  # pre-4.0 names still count
         self.assertEqual(self.outcome(self.cli("run", "--name", "helper", "task"))["state"], "answered")
         del self.env["PI_DELEGATE_AGENT"], self.env["PI_DELEGATE_PARENT_RUN"]
         self.cli("stop", parent)
+
+    def test_images_are_attached_for_both_agents(self):
+        image = self.work / "shot.png"
+        image.write_bytes(b"png")
+        self.fake_pi([answer("blue"), SETTLED])
+        self.assertEqual(self.cli("run", "--image", "shot.png", "what color?").returncode, 0)
+        self.assertTrue((self.work / "pi.log").read_text().split()[-1] == f"@{image}")
+        self.fake_codex(codex_events("blue"))
+        self.assertEqual(self.cli("run", "--agent", "codex", "--image", image, "what color?").returncode, 0)
+        args = (self.work / "pi.log.codex").read_text().split()
+        self.assertEqual(args[-2:], [f"--image={image}", "-"])
+        result = self.cli("start", "--image", "missing.png", "task")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("image does not exist", result.stderr)
+
+    def test_machine_wide_limits_refuse_extra_runs(self):
+        self.fake_pi([answer("slow"), SETTLED], sleep=30)
+        self.fake_codex(codex_events("ok"), pre="sleep 30")
+        self.env.update(DELEGATE_MAX_ACTIVE="2", DELEGATE_MAX_CODEX="1")
+        other = self.work / "other"
+        other.mkdir()
+        first = json.loads(self.cli("start", "--agent", "codex", "--name", "gpt", "task").stdout)["run"]
+        result = self.cli("start", "--agent", "codex", "--workdir", other, "task")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("DELEGATE_MAX_CODEX=1", result.stderr)
+        # Runs from another project (another runs root) share the machine's pool.
+        self.env["DELEGATE_RUNS"] = str(self.work / "runs2")
+        self.assertEqual(self.cli("start", "--read-only", "--name", "pi", "task").returncode, 0)
+        result = self.cli("start", "--read-only", "task")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("DELEGATE_MAX_ACTIVE=2", result.stderr)
+        self.assertIn(str(self.work / "runs"), result.stderr)
+        self.env["DELEGATE_RUNS"] = str(self.work / "runs")
+        self.cli("stop", first)
+        self.assertEqual(self.cli("start", "--read-only", "--name", "freed", "task").returncode, 0)
+        self.env["DELEGATE_MAX_ACTIVE"] = "0"  # 0 lifts the limit
+        self.assertEqual(self.cli("start", "--read-only", "task").returncode, 0)
+        self.env["DELEGATE_MAX_ACTIVE"] = "many"
+        self.assertIn("non-negative integer", self.cli("start", "--read-only", "task").stderr)
+        for root in ("runs", "runs2"):
+            self.env["DELEGATE_RUNS"] = str(self.work / root)
+            for line in self.cli("status").stdout.splitlines():
+                self.cli("stop", json.loads(line)["dir"])
 
 
 if __name__ == "__main__":
