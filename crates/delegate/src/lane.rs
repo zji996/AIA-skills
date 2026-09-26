@@ -58,6 +58,9 @@ pub fn supervisor_signal_pipe() -> io::Result<File> {
 }
 pub fn wake_lane_waiter_after_stop() {
     let thread_id = SUPERVISOR_THREAD.load(Ordering::SeqCst);
+    if thread_id != 0 {
+        unsafe { libc::pthread_kill(thread_id as libc::pthread_t, libc::SIGUSR1) };
+    }
     while LANE_WAITING.load(Ordering::SeqCst) {
         if thread_id != 0 {
             unsafe { libc::pthread_kill(thread_id as libc::pthread_t, libc::SIGUSR1) };

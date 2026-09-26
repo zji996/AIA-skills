@@ -4,6 +4,7 @@
 
 ### 技能
 
+- `delegate` 5.2.0：**编排**——主控声明"先 A 后 B"，由 delegate 执行，每一步仍是一层委派、结果都回到主控。`--after <run>`：立即创建 `waiting` 的 run，上游以 delivered/answered 结束后执行（阻塞在上游生命周期锁上），否则以 `skipped` 结束；等待期间不占名额，上游答复与改动的路径自动附在说明末尾。`--in <run>`：只读地在上游 worktree 的快照里工作（`git diff HEAD` 即上游改动），绝不改动上游。`reply --agent/--tier`：同一 worktree 换一位同事接着做。`.delegate.json` 的 `generated`：生成文件不参与三方合并，`apply` 后在源仓库重新生成，让都改契约的任务也能并行。任务名可按完全匹配的名称引用（`impl` 不再与 `impl-review` 冲突）。SKILL.md 的经验建议加入两种常用编排写法。
 - `delegate` 5.1.1：整机并发默认上限调为 8 个任务、其中 Codex 4 个（原为 6 与 3）。按这个项目的实测，能真正并行的独立工作流约 4～5 条，再多会让交付扎堆、主控审查质量下降；机器资源（每个 Codex 约 185 MB）不是瓶颈。
 - `delegate` 5.1.0：**同事为跑测试而初始化的子模块不再算作改动**：worktree 中起始未初始化、结束时干净且检出提交等于记录值的子模块视为仅初始化，不进改动清单、`apply` 不处理（此前每次合并前都要手动 deinit）。新增 **`--protect <路径>`**：受保护路径被改动即判 `rejected` 并带 `protectViolation`，不运行验收，替代在验收命令里手写 `git diff --quiet`；任务说明会写明哪些路径不许改，reply 沿用。SKILL.md 按同题对比重新定位两档（Pi：广度侦察、界面与前端、另一路视角；Codex：严密判断与风险、核实），新增"什么时候自己接手"与续接会话的判断；任务说明模板要求现状断言附 `文件:行号`。
 - `delegate` 5.0.1：实际使用中发现并修复。**只读 Pi 在自己的 worktree 中不再被限制工具**：隔离加事后核对已经兜底，它与 Codex 一样拿到全部工具（能看 git 历史与 diff、跑测试）、收到只读约定、执行 `setup`；只有无法隔离（非 git 或 `--in-place`）时才只保留读文件、搜索、列目录。**只读 worktree 保留快照 index**（`reset --soft`），主控未提交的子模块指针不再被误报为违规。新增 `--help`（顶层与各子命令）与 `--version`，状态行以 `run`、`name`、`state` 开头；`diff` 支持 `--` 分隔路径；升档补只读约定时不重复。Cargo 版本与技能版本一致（`check.sh` 检查）。`install.sh` 可用 `AIA_SKILLS_SKIP_BINARIES=1` 跳过二进制，安装测试不再依赖网络与编译器。新增 `docs/delegate-field-notes.md`，记录实战中的问题、做法与数据。

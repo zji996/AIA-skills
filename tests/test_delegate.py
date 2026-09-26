@@ -981,6 +981,81 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(state["state"], "delivered")
         self.assertNotIn("protectViolation", state)
 
+    def test_after_runs_a_step_when_its_upstream_is_done(self):
+        # A pipeline the caller declares: B starts when A ends, knows where A's answer is, and every result
+        # still comes back to the caller. B waits in the kernel on A's lifetime lock, not in a polling loop.
+        self.fake_pi([answer("scout: the callers are x.py and y.py"), SETTLED], sleep=1.5)
+        a = self.outcome(self.cli("start", "--read-only", "--name", "scout", "list the callers"))
+        self.env["DELEGATE_MAX_ACTIVE"] = "1"  # a step that is only waiting takes no slot
+        started = self.cli("start", "--read-only", "--after", "scout", "--name", "impl", "use the list")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        b = self.outcome(started)
+        self.assertEqual(b["state"], "waiting")
+        self.assertEqual(b["after"], a["run"])
+        done = self.cli("wait", "impl", timeout=60)
+        b = self.outcome(done)
+        self.assertEqual(b["state"], "answered")
+        prompt = (Path(b["dir"]) / "prompt.md").read_text()
+        self.assertIn(str(Path(a["dir"]) / "result.md"), prompt)  # where the upstream answer is
+        self.assertIn("scout", prompt)
+        # An upstream that did not deliver skips the step without starting a colleague.
+        del self.env["DELEGATE_MAX_ACTIVE"]
+        self.fake_pi([answer(LEAKED), SETTLED])
+        bad = self.outcome(self.cli("run", "--agent", "pi", "--read-only", "--retries", "0", "--name", "bad", "x"))
+        self.assertEqual(bad["state"], "malformed")
+        calls = len((self.work / "pi.log").read_text().splitlines())
+        skipped = self.outcome(self.cli("run", "--read-only", "--after", "bad", "--name", "next", "y"))
+        self.assertEqual(skipped["state"], "skipped")
+        self.assertIn("malformed", skipped["error"])
+        self.assertEqual(len((self.work / "pi.log").read_text().splitlines()), calls)
+        self.assertEqual(self.cli("start", "--after", "no-such-run", "x").returncode, 2)
+
+    def test_in_reviews_an_upstream_worktree_without_touching_it(self):
+        repo = self.repo({"a.txt": "a\n"})
+        self.fake_pi([answer("changed"), SETTLED], pre="echo impl >> a.txt")
+        impl = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "impl", "change a"))
+        # The reviewer reads what impl produced, in a snapshot of its worktree, with impl's changes against HEAD.
+        self.fake_pi([answer("reviewed"), SETTLED], pre='pwd > "$PI_LOG.cwd"; git diff HEAD > "$PI_LOG.diff"; '
+                                                        'echo stray > stray.txt')
+        review = self.outcome(self.cli("run", "--read-only", "--after", "impl", "--in", "impl", "--name", "rv",
+                                       "review impl"))
+        self.assertEqual(review["state"], "answered")
+        self.assertNotEqual(review["worktree"], impl["worktree"])
+        self.assertEqual((self.work / "pi.log.cwd").read_text().strip(), review["worktree"])
+        self.assertIn("+impl", (self.work / "pi.log.diff").read_text())
+        self.assertEqual(review["readOnlyViolation"], ["stray.txt"])
+        self.assertFalse((Path(impl["worktree"]) / "stray.txt").exists())  # impl's work is untouched
+        self.assertEqual(self.cli("apply", "impl").returncode, 0)
+        self.assertFalse((repo / "stray.txt").exists())
+        self.assertEqual(self.cli("run", "--in", "impl", "--name", "w", "write").returncode, 2)  # read-only only
+
+    def test_reply_can_hand_the_worktree_to_the_other_colleague(self):
+        repo = self.repo({"a.txt": "a\n"})
+        self.fake_pi([answer("draft"), SETTLED], pre="echo draft >> a.txt")
+        draft = self.outcome(self.cli("run", "--worktree", "--agent", "pi", "--workdir", repo, "--name", "d", "draft"))
+        self.fake_codex(codex_events("polished"), pre="echo polish >> a.txt")
+        polished = self.outcome(self.cli("reply", "d", "--agent", "codex", "polish the draft"))
+        self.assertEqual((polished["state"], polished["agent"], polished["worktree"]),
+                         ("answered", "codex", draft["worktree"]))
+        self.assertNotIn(" fork ", (self.work / "pi.log.codex").read_text())  # another model: a fresh session
+        self.assertEqual(self.cli("apply", "d").returncode, 0)
+        self.assertEqual((repo / "a.txt").read_text(), "a\ndraft\npolish\n")
+
+    def test_generated_files_are_regenerated_after_apply_not_merged(self):
+        repo = self.repo({"src.txt": "1\n2\n3\n", "gen/out.txt": "1\n2\n3\n"})
+        (repo / ".delegate.json").write_text(json.dumps({"generated": {"paths": ["gen/"],
+                                                                       "command": "cp src.txt gen/out.txt"}}))
+        self.fake_pi([answer("done"), SETTLED], pre="sed -i s/3/three/ src.txt; cp src.txt gen/out.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        # Meanwhile the caller changes the same source elsewhere and regenerates: gen/ now differs on both sides.
+        (repo / "src.txt").write_text("one\n2\n3\n")
+        (repo / "gen/out.txt").write_text("one\n2\n3\n")
+        applied = self.cli("apply", state["run"])
+        self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+        self.assertEqual((repo / "src.txt").read_text(), "one\n2\nthree\n")
+        self.assertEqual((repo / "gen/out.txt").read_text(), "one\n2\nthree\n")  # regenerated from the merge
+        self.assertIn("regenerated", applied.stdout + applied.stderr)
+
     def test_worktree_in_a_repository_without_commits(self):
         repo = self.work / "fresh"
         subprocess.run(["git", "init", "-q", str(repo)], check=True)

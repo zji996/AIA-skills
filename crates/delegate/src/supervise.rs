@@ -6,13 +6,14 @@ use crate::launch;
 use crate::runs;
 use crate::worktree;
 use serde_json::{json, Value};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicI32, Ordering},
     Arc,
 };
+use std::time::Duration;
 
 type Recorded = Option<(Vec<Value>, Value)>;
 
@@ -259,6 +260,81 @@ fn escalate(
 fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<std::sync::Mutex<Option<f64>>>) -> Res<()> {
     let mut meta = json(run.join("meta.json"));
     let started = epoch();
+    if !s(&meta, "after").is_empty() {
+        let upstream = PathBuf::from(s(&meta, "after"));
+        wait_for_run(&upstream);
+        if lane::stopped() {
+            return finish_skipped(run, "stopped while waiting for upstream");
+        }
+        let outcome = runs::state(&upstream);
+        let name = s(&json(upstream.join("meta.json")), "name").to_string();
+        if !["delivered", "answered"].contains(&outcome.as_str()) {
+            return finish_skipped(run, &format!("upstream {name} ended {outcome}"));
+        }
+        let prompt = read(run.join("prompt.md"));
+        let zh = prompt
+            .chars()
+            .any(|c| (0x4e00..=0x9fff).contains(&(c as u32)));
+        let patch = upstream.join("changes.patch");
+        let prior = json(upstream.join("meta.json"));
+        let note = if zh {
+            format!(
+                "\n\n上游任务：{name}\n结局：{outcome}\n答复全文：{}{}{}\n",
+                upstream.join("result.md").display(),
+                if patch.is_file() {
+                    format!("\n改动补丁：{}", patch.display())
+                } else {
+                    String::new()
+                },
+                if prior["worktree"].is_object() {
+                    format!("\n上游 worktree：{}", s(&prior["worktree"], "path"))
+                } else {
+                    String::new()
+                }
+            )
+        } else {
+            format!(
+                "\n\nUpstream task: {name}\nOutcome: {outcome}\nFull answer: {}{}{}\n",
+                upstream.join("result.md").display(),
+                if patch.is_file() {
+                    format!("\nChanges patch: {}", patch.display())
+                } else {
+                    String::new()
+                },
+                if prior["worktree"].is_object() {
+                    format!("\nUpstream worktree: {}", s(&prior["worktree"], "path"))
+                } else {
+                    String::new()
+                }
+            )
+        };
+        append(run.join("prompt.md"), &note)?;
+    }
+    if meta["worktree"]["in"].is_string() {
+        let in_run = Path::new(s(&meta["worktree"], "in"));
+        wait_for_run(in_run);
+        if lane::stopped() {
+            return finish_skipped(run, "stopped while waiting for review source");
+        }
+        let source = Path::new(s(&meta["worktree"], "source"));
+        let exclude = meta["snapshotExclude"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let base =
+            changes::snapshot(source, run, &exclude).ok_or("cannot snapshot upstream worktree")?;
+        meta["chainBase"] = base["tree"].clone();
+        meta["base"] = base;
+        write_json(run.join("meta.json"), &meta)?;
+    }
+    if !s(&meta, "after").is_empty() {
+        admit_waiting(run, &meta)?;
+    }
     let mut setup_error = None;
     if meta["worktree"].is_object() && !Path::new(s(&meta["worktree"], "path")).exists() {
         setup_error = match worktree::prepare(&meta, run) {
@@ -379,6 +455,89 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<std::sync::Mutex<Option<
         },
     )?;
     Ok(())
+}
+fn finish_skipped(run: &Path, reason: &str) -> Res<()> {
+    write_json(
+        run.join("summary.json"),
+        &json!({"state":"skipped","error":reason}),
+    )?;
+    write(run.join("exit_code"), "1\n")
+}
+fn wait_for_run(run: &Path) {
+    let poll = setting("POLL", "1").parse::<f64>().unwrap_or(1.0).max(0.01);
+    while runs::active(&runs::state(run)) && !lane::stopped() {
+        let path = run.join("supervisor.lock");
+        if path.is_file() {
+            let _ = lock(&path, false, false);
+        } else {
+            std::thread::sleep(Duration::from_secs_f64(poll));
+        }
+    }
+}
+fn wait_any(runs: Vec<PathBuf>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    for run in runs {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            wait_for_run(&run);
+            let _ = tx.send(());
+        });
+    }
+    drop(tx);
+    while !lane::stopped() {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+fn admit_waiting(run: &Path, meta: &Value) -> Res<()> {
+    let slots = state_dir();
+    let root = runs_root();
+    loop {
+        let machine = lock(&slots.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
+        let local = lock(&root.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
+        let others = launch::active_machine(&slots);
+        let full = launch::capacity(s(meta, "agent"), &others);
+        if let Err(reason) = &full {
+            if !reason.contains("runs are active") && !reason.contains("Codex runs are active") {
+                return full;
+            }
+        } else {
+            if s(meta, "mode") == "write" && !b(meta, "parallel") && !meta["worktree"].is_object() {
+                for other in runs::all_runs() {
+                    let m = json(other.join("meta.json"));
+                    if other != run
+                        && s(&m, "mode") == "write"
+                        && s(&m, "workdir") == s(meta, "workdir")
+                        && !other.join(".waiting").exists()
+                        && (runs::active(&runs::state(&other)) || runs::agent_alive(&other))
+                    {
+                        return Err(format!(
+                            "write run {} is still active in {}",
+                            other.display(),
+                            s(meta, "workdir")
+                        ));
+                    }
+                }
+            }
+            let hash = sha1_smol::Sha1::from(run.to_string_lossy().as_bytes())
+                .digest()
+                .to_string();
+            write(
+                slots.join(format!("{}.slot", &hash[..16])),
+                format!("{}\n", run.display()),
+            )?;
+            fs::remove_file(run.join(".waiting")).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        drop(local);
+        drop(machine);
+        wait_any(others);
+        if lane::stopped() {
+            return Err("stopped while waiting for capacity".into());
+        }
+    }
 }
 pub fn supervise(run: &Path) -> Res<()> {
     let _life = locked_file(

@@ -24,6 +24,7 @@ fn status_line(run: &Path) -> String {
         "tier",
         "mode",
         "parent",
+        "after",
         "worktree",
         "elapsedSeconds",
         "attempts",

@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "5.1.1"
+  version: "5.2.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -33,7 +33,8 @@ $D wait                                                                         
 | 独立审查、第二意见 | `$D start --read-only --tier strong "…"`（多路并行时各起一个，按子系统拆开） |
 | 看截图或设计图 | `$D start --read-only --image shot.png "…"` |
 | 改代码，测试通过才算完 | `$D run --worktree --accept "make check" "…"`，满意后 `$D apply <name>`；不许同事碰的路径加 `--protect tests/ --protect docs/spec.md` |
-| 接着上一轮追问或返工 | `$D reply <name> "…"`（同一会话、同一 worktree）；开新会话加 `--fresh` |
+| 接着上一轮追问或返工 | `$D reply <name> "…"`（同一会话、同一 worktree）；开新会话加 `--fresh`；换一位同事接着改加 `--agent codex` |
+| 先 A 后 B | `$D start --after <A> …`；审 A 的结果加 `--in <A> --read-only` |
 | 自己跑重检查 | `$D lane make check`（与同事的验收排队，一次一个） |
 | 看改了什么 / 停掉 / 清理 | `$D diff <name>` / `$D stop <name>` / `$D clean --finished` |
 
@@ -60,6 +61,7 @@ $D wait                                                                         
 - **什么时候自己改**：根因已经定位、改动很小、你清楚该怎么改时，自己改常常更快——派发、等待、审查、合并有固定开销。同一个问题返工一两轮仍不见好转，也值得考虑接手。需要只有你知道的背景时，先自己做，等能写成自足的说明再派。
 - **两档怎么搭配**：同题对比中，Pi 找到的具体代码事实更多、但偶有把现状说混；Codex 更准确、风险意识更强。分量重的审查可以两路并行、由你合并，效果通常好于任一方。
 - **审查类说明**：给出重点，但注明不限于此；给待证伪的假设，而不是结论；请它为关于现状的断言附上 `文件:行号`，能让说错的地方当场暴露。
+- **编排**：两三步的固定流程可以一次声明，结果都回到你这里。常用的两种：`start --worktree --name impl …` 之后 `start --after impl --in impl --read-only --name impl-review "逐块审 impl 的改动，标出高风险块，附 文件:行号"`（强档实现、便宜档预审，你拿着预审去看 diff）；或 `start --read-only --name scout "列出所有调用点"` 之后 `start --after scout --worktree …`（便宜档侦察、强档按清单实现）。写入方向的接力可以 `reply <name> --agent codex "…"`，在同一 worktree 换一位同事。链条一般不宜太长——每多一步误差叠加一次，需要判断的节点最好你插进来看。
 - **受保护路径**：重写、迁移这类任务，最省事的"通过"方式往往是改测试，可以用 `--protect tests/` 之类把它们保护起来。
 
 更多示例、任务说明模板与常见坑见 [references/recipes.md](references/recipes.md)。

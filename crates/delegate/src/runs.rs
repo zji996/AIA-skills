@@ -32,6 +32,13 @@ pub fn resolve(reference: &str) -> Res<PathBuf> {
     if root.join(reference).join("meta.json").is_file() {
         return Ok(root.join(reference));
     }
+    let named = runs
+        .iter()
+        .filter(|p| s(&json(p.join("meta.json")), "name") == reference)
+        .collect::<Vec<_>>();
+    if named.len() == 1 {
+        return Ok(named[0].clone());
+    }
     let matches = runs
         .iter()
         .filter(|p| {
@@ -69,6 +76,9 @@ pub fn state(run: &Path) -> String {
             .into();
     }
     if supervisor_alive(run) {
+        if run.join(".waiting").exists() {
+            return "waiting".into();
+        }
         return "running".into();
     }
     if run.join("pid").is_file() {
@@ -86,7 +96,7 @@ pub fn state(run: &Path) -> String {
     }
 }
 pub fn active(s: &str) -> bool {
-    s == "running" || s == "starting"
+    s == "running" || s == "starting" || s == "waiting"
 }
 pub fn events(run: &Path) -> Vec<Value> {
     read(run.join("events.jsonl"))
@@ -145,6 +155,10 @@ pub fn status(run: &Path) -> Value {
     }
     if !s(&meta, "parent").is_empty() {
         out["parent"] = meta["parent"].clone();
+    }
+    if !s(&meta, "after").is_empty() {
+        let upstream = Path::new(s(&meta, "after"));
+        out["after"] = json!(upstream.file_name().unwrap_or_default().to_string_lossy());
     }
     if meta["worktree"].is_object() {
         out["worktree"] = json!(s(&meta["worktree"], "path"));

@@ -20,6 +20,8 @@ const LAUNCH: &[(&str, &str)] = &[
     ("--thinking LEVEL", "Agent thinking level override."),
     ("--allow-parallel-writes", "Allow concurrent write runs in one workdir."),
     ("--worktree", "Write in a detached git worktree seeded from the current tree; merge with apply."),
+    ("--after RUN", "Wait for RUN to finish successfully before starting this step; waiting uses no active slot."),
+    ("--in RUN", "Read-only: review a separate snapshot of RUN's worktree after it finishes."),
 ];
 
 const COLLECT: &[(&str, &str)] = &[
@@ -44,6 +46,8 @@ const REPLY: &[(&str, &str)] = &[
     ("--accept-timeout DURATION", "Acceptance command limit (default: 10m)."),
     ("--timeout DURATION", "Limit for the attempt (default: 15m Pi, 30m Codex)."),
     ("--fresh", "Start a new session in the same workdir/worktree and conversation; message must stand alone."),
+    ("--agent pi|codex", "Hand the conversation to this agent; a change of agent starts a fresh session."),
+    ("--tier cheap|strong", "Hand the conversation to this tier; a change of agent starts a fresh session."),
 ];
 
 const COMMANDS: &[(&str, &str)] = &[
@@ -91,7 +95,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("-h, --help", "Show this help."),
             ("--version", "Show the Cargo package version."),
         ]);
-        println!("\nStates: running | delivered (accept passed) | answered (no --accept) | rejected (accept failed or protected path changed) | malformed (empty or leaked tool call after reruns) | failed | timeout | killed | stopped | crashed.");
+        println!("\nStates: waiting | running | delivered (accept passed) | answered (no --accept) | skipped (upstream failed) | rejected (accept failed or protected path changed) | malformed (empty or leaked tool call after reruns) | failed | timeout | killed | stopped | crashed.");
         println!(
             "Exit: 0 delivered/answered, 1 other finished, 2 usage, 75 still running at --max."
         );

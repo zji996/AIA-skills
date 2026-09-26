@@ -1,4 +1,4 @@
-# delegate 规格（v5.1）
+# delegate 规格（v5.2）
 
 > 本文是 `skills/delegate` 的**实现契约**：命令行、输出、run 目录、锁与状态机。它是 Rust 重写与 harness 原生接入的依据。
 > 本文不在技能目录内，技能加载时不会读取；模型使用技能只需 `SKILL.md`。行为以本文为准，实现与本文不一致时按缺陷处理。
@@ -52,7 +52,7 @@
 
 缺少同事 CLI 时退出码 2：Codex 提示安装并登录；Pi 提示 `sh <仓库>/third_party/pi-kit/install.sh --additive`，其中 `<仓库>` 为从可执行文件真实路径逐级向上、首个包含该安装脚本的目录，找不到时给出远程安装命令。
 
-`<run>` 解析顺序（必须）：含 `meta.json` 的目录路径 → `last`（最近启动的）→ 完整 id → 唯一子串；匹配数不为 1 即退出码 2。
+`<run>` 解析顺序（必须）：含 `meta.json` 的目录路径 → `last`（最近启动的）→ 完整 id → 唯一完全匹配的名称（`--name`）→ 唯一 id 子串；匹配数不为 1 即退出码 2。
 
 ### 2.3 启动选项
 
@@ -74,6 +74,8 @@
 | `--retries N` | 1 | 0–3，答复畸形时的重跑次数 |
 | `--provider` `--model` `--thinking` | — | 透传给同事 CLI |
 | `--allow-parallel-writes` | 否 | 跳过写入互斥 |
+| `--after <run>` | — | 立即创建 run（state `waiting`），上游以 delivered/answered 结束后才执行；其他结局使本 run 以 `skipped` 结束，`error` 写明上游名称与结局，exit_code 为 1 |
+| `--in <run>` | — | 仅与 `--read-only` 同用；在上游 worktree 当前状态的快照中运行（§6.3）；未给 `--after` 时上游必须已结束 |
 | `--protect <路径>` | — | 可重复；路径相对仓库根，末尾 `/` 表示目录前缀，否则精确匹配文件；需要 git 仓库。reply 继承上一轮设置，不可覆盖 |
 
 时长格式：`^\d+(\.\d+)?[smhd]?$`，无单位为秒，必须 > 0。
@@ -88,6 +90,7 @@
 |---|---|---|
 | `run` `name` `state` `agent` `mode` `dir` | 总是 | `mode` 为 `write` 或 `read-only`；`state` 见 §4 |
 | `parent` | reply | 上一轮 run id |
+| `after` | 使用 `--after` | 上游 run id |
 | `worktree` | 在 worktree 中运行 | worktree 路径 |
 | `elapsedSeconds` `turns` | 总是 | 运行中为实时值 |
 | `last` `idleSeconds` | 运行中 | 最近一个动作及其距今秒数 |
@@ -158,6 +161,13 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 - **升档**：`tier == "cheap"` 的 run 结局为 `malformed`/`failed`/`timeout`/`rejected`、未被 stop、且（只读，或快照成功且没有任何改动）时，若强档已安装并在整机容量内（在 `<state>/.start.lock` 下检查），在同一 run 中换强档再跑一轮：事件 `escalate{from,to,after}`，`meta.json` 的 `agent` 改为强档、`tier` 改为 `strong`、`fork` 清空、记 `escalatedFrom`；只读 run 升到 Codex 时在 `prompt.md` 末尾补只读约定（§7.3）。新一轮沿用重跑次数，`attempts` 接续计数；快照、只读核对与验收按新一轮重新进行，结论带 `escalatedFrom`。容量不足时记事件 `escalate_skipped`，不升档。每个 run 至多升档一次。
 - reply 沿用上一轮的 `agent` 与 `tier`。
 
+### 4.1.1 编排（`--after`、`--in`，必须）
+
+- 带 `--after` 的 supervisor 阻塞在上游的 `supervisor.lock` 上（上游无生命周期锁时按 `DELEGATE_POLL` 兜底），等待期间不启动同事。上游成功后，任务说明末尾按说明语言追加上游名称、结局、`result.md` 路径，以及存在时的 `changes.patch` 与 worktree 路径。
+- `waiting` 是未结束状态，`skipped` 是结束状态。waiting run 不占整机并发名额、也不参加写入互斥检查；离开等待时在 `<state>/.start.lock` 下重新检查容量，满额时等到任一运行中的 run 结束再检查。
+- `--in` 在被审查 run 结束后，对其 worktree 当前状态做快照并新建独立 worktree：HEAD 设为上游 worktree 的 HEAD，index 保持快照，使 `git diff HEAD` 显示上游的改动；workdir 映射到新 worktree 的对应目录，copy/link/setup 照常。只读违规只记在本 run，绝不改动上游 worktree。
+- 这不是嵌套：每一步都由主控声明，结果都回到主控。
+
 ### 4.2 判定
 
 同事一次尝试的判定（必须）：被 stop → `stopped`；超时 → `timeout`；非零退出 → 退出码为 -9/137 时 `killed`，否则 `failed`；最后一轮 `stopReason == "stop"` 且已 settled 时，答复为空或末尾是泄漏的工具调用（正则 `\bcall:[\w.-]+(?::[\w-]+)?\{`，且以 `}` 结尾）→ `malformed`，否则 `ok`；其余 → `failed`。`malformed` 最多重跑 `--retries` 次。
@@ -213,7 +223,9 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 | 二进制、符号链接、类型变化、删改冲突、经符号链接目录 | 冲突 |
 | 大文件 | 从 worktree 复制；源中已存在且不同即冲突 |
 
-有冲突且无 `--merge` 时**什么都不写**，退出码 1。完全成功时对话内所有 run 及共用该 worktree 的旁支 run 写 `.applied`。只读 run 与原地 run 拒绝 `apply`（退出码 2）。
+有冲突且无 `--merge` 时**什么都不写**，退出码 1。
+
+**生成文件**：`.delegate.json` 的 `"generated": {"paths": [...], "command": "..."}` 声明的路径（语义同 `--protect`）不做三方合并、也不覆盖；改动清单与 diff 仍如实列出。合并写入了文件后，通过 lane 在源仓库根以 `sh -c` 运行 `command` 重新生成，输出写入 run 目录的 `generate.log`；`--dry-run` 只报告将会重新生成；命令失败时退出码 1、显示日志末尾，已合并的文件保留。完全成功时对话内所有 run 及共用该 worktree 的旁支 run 写 `.applied`。只读 run 与原地 run 拒绝 `apply`（退出码 2）。
 
 ## 7. 会话与任务说明
 
@@ -246,7 +258,7 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 
 ### 7.4 reply（必须）
 
-接在对话**最新一轮**之后（结局为 `malformed` 的轮次跳过）；同一 agent、workdir、worktree、mode、env、provider/model/thinking、retries。每次尝试都从上一轮会话**分叉**（Pi 用会话文件副本 `--fork`，Codex `exec fork`），上一轮会话永不改动。`--fresh` 开新会话但留在同一对话与 worktree。同一轮已有进行中的 reply 时拒绝。
+接在对话**最新一轮**之后（结局为 `malformed` 的轮次跳过）；可用 `--agent`/`--tier` 换一位同事（agent 改变即隐含 `--fresh`，新消息须自足），否则同一 agent、workdir、worktree、mode、env、provider/model/thinking、retries。每次尝试都从上一轮会话**分叉**（Pi 用会话文件副本 `--fork`，Codex `exec fork`），上一轮会话永不改动。`--fresh` 开新会话但留在同一对话与 worktree。同一轮已有进行中的 reply 时拒绝。
 
 ## 8. lane：整机重任务队列（必须）
 

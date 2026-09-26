@@ -92,6 +92,52 @@ fn strings(v: &Value) -> Vec<String> {
         })
         .unwrap_or_default()
 }
+fn generated(source: &Path) -> Res<(Vec<String>, String)> {
+    let file = source.join(".delegate.json");
+    let cfg = json(&file);
+    let Some(spec) = cfg.get("generated") else {
+        return Ok((vec![], String::new()));
+    };
+    let paths = spec["paths"]
+        .as_array()
+        .ok_or_else(|| format!("{}: generated.paths must be a list", file.display()))?;
+    let mut rules = vec![];
+    for item in paths {
+        let path = item
+            .as_str()
+            .ok_or("generated.paths entries must be strings")?;
+        let core = path.trim_end_matches('/');
+        if core.is_empty()
+            || Path::new(core)
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(format!("invalid generated path: {path}"));
+        }
+        let mut normalized = Path::new(core)
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        if path.ends_with('/') {
+            normalized.push('/');
+        }
+        rules.push(normalized);
+    }
+    let command = spec["command"]
+        .as_str()
+        .ok_or("generated.command must be a string")?;
+    Ok((rules, command.to_string()))
+}
+fn matches_rule(path: &str, rules: &[String]) -> bool {
+    rules.iter().any(|rule| {
+        if rule.ends_with('/') {
+            path.starts_with(rule)
+        } else {
+            path == rule
+        }
+    })
+}
 fn copy_rec(src: &Path, dst: &Path) -> Res<()> {
     let m = fs::symlink_metadata(src).map_err(|e| e.to_string())?;
     if m.file_type().is_symlink() {
@@ -342,6 +388,7 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
     }
     let before = s(&meta, "chainBase").to_string();
     let source = PathBuf::from(s(&meta["worktree"], "source"));
+    let (generated_paths, generate_command) = generated(&source)?;
     let worktree = PathBuf::from(s(&meta["worktree"], "path"));
     let mut large = json(run.join("changes.json"))["afterLarge"].clone();
     let exclude = strings(&meta["snapshotExclude"]);
@@ -357,6 +404,9 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
     let mut conflicts = vec![];
     for c in changes {
         let path = s(&c, "path").to_string();
+        if matches_rule(&path, &generated_paths) {
+            continue;
+        }
         let target = source.join(&path);
         let (old_mode, old) = blob(&top, &before, &path)?;
         let (mode, new) = blob(&top, &after, &path)?;
@@ -439,6 +489,9 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
     }
     if let Some(obj) = large.as_object() {
         for path in obj.keys() {
+            if matches_rule(path, &generated_paths) {
+                continue;
+            }
             let origin = worktree.join(path);
             let target = source.join(path);
             if !origin.is_file()
@@ -471,6 +524,8 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
         return Ok(1);
     }
     let marked = actions.iter().any(|x| x.kind == "conflict-markers");
+    let regenerate =
+        !actions.is_empty() && !generated_paths.is_empty() && !generate_command.is_empty();
     for a in actions {
         if !dry {
             match a.kind.as_str() {
@@ -502,7 +557,48 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
     }
     if dry {
         eprintln!("delegate: dry run; nothing written");
-    } else if conflicts.is_empty() {
+        if regenerate {
+            println!(" regenerated      {} (dry run)", generated_paths.join(", "));
+        }
+    } else if regenerate {
+        let _slot = lane::acquire(
+            &format!(
+                "regenerate {}",
+                run.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            None,
+            |_, _| {},
+        )?;
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(&generate_command)
+            .current_dir(&source)
+            .output()
+            .map_err(|e| e.to_string())?;
+        let log = run.join("generate.log");
+        let mut body = output.stdout;
+        body.extend_from_slice(&output.stderr);
+        write(&log, &body)?;
+        if !output.status.success() {
+            let tail = String::from_utf8_lossy(&body)
+                .chars()
+                .rev()
+                .take(1500)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>();
+            eprintln!(
+                "delegate: regeneration failed ({}); {}\n{}",
+                output.status,
+                log.display(),
+                tail
+            );
+            return Ok(1);
+        }
+        println!(" regenerated      {}", generated_paths.join(", "));
+    }
+    if !dry && conflicts.is_empty() {
         let mut chain = run.to_path_buf();
         loop {
             write(chain.join(".applied"), format!("{}\n", iso()))?;

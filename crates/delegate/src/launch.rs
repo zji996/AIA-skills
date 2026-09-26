@@ -41,6 +41,8 @@ pub struct Options {
     pub progress: bool,
     pub full: bool,
     pub run: Option<String>,
+    pub after: Option<String>,
+    pub in_run: Option<String>,
 }
 impl Options {
     pub fn new() -> Self {
@@ -64,8 +66,6 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
         };
         if reply
             && [
-                "--agent",
-                "--tier",
                 "--workdir",
                 "--read-only",
                 "--in-place",
@@ -98,6 +98,8 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             "--model",
             "--thinking",
             "--max",
+            "--after",
+            "--in",
         ]
         .contains(&key);
         if takes {
@@ -132,6 +134,8 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--model" => o.model = Some(v),
                 "--thinking" => o.thinking = Some(v),
                 "--max" => o.max = Some(seconds(&v)?),
+                "--after" => o.after = Some(v),
+                "--in" => o.in_run = Some(v),
                 _ => {}
             }
         } else {
@@ -179,12 +183,19 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             || o.provider.is_some()
             || o.model.is_some()
             || o.thinking.is_some()
-            || !o.agent.is_empty()
+            || o.after.is_some()
+            || o.in_run.is_some()
         {
             return Err("unrecognized reply option".into());
         }
     } else if o.fresh {
         return Err("--fresh is only for reply".into());
+    }
+    if o.in_run.is_some() && !o.read_only {
+        return Err("--in requires --read-only".into());
+    }
+    if o.in_run.is_some() && o.in_place {
+        return Err("--in and --in-place contradict each other".into());
     }
     if !collect && (o.max.is_some() || o.progress || o.full) {
         return Err("unrecognized collecting option".into());
@@ -372,12 +383,32 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         .unwrap_or_else(|| if o.agent == "pi" { "15m" } else { "30m" }.into());
     o.timeout = Some(timeout);
     let prompt = read_prompt(&mut o)?;
-    let workdir = PathBuf::from(o.workdir.clone().unwrap_or_else(|| {
-        env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into()
-    }));
+    let after = o.after.as_deref().map(runs::resolve).transpose()?;
+    let in_run = o.in_run.as_deref().map(runs::resolve).transpose()?;
+    if let Some(upstream) = &in_run {
+        if after.is_none() && active(&state(upstream)) {
+            return Err("--in requires a finished run unless --after is given".into());
+        }
+        let prior = json(upstream.join("meta.json"));
+        if !prior["worktree"].is_object() || s(&prior["worktree"], "path").is_empty() {
+            return Err("--in requires a run with a worktree".into());
+        }
+    }
+    let workdir = PathBuf::from(
+        o.workdir
+            .clone()
+            .or_else(|| {
+                in_run
+                    .as_ref()
+                    .map(|r| s(&json(r.join("meta.json"))["worktree"], "sourceWorkdir").to_string())
+            })
+            .unwrap_or_else(|| {
+                env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into()
+            }),
+    );
     if !workdir.is_dir() {
         return Err(format!("workdir does not exist: {}", workdir.display()));
     }
@@ -398,7 +429,10 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     if let Some(top) = &repo {
         let (env, cfg) = worktree::config(top)?;
         extra["env"] = env;
-        if o.worktree || (o.read_only && !o.in_place) {
+        if let Some(upstream) = &in_run {
+            let prior = json(upstream.join("meta.json"));
+            extra["worktree"] = json!({"source":s(&prior["worktree"],"path"),"sourceWorkdir":s(&prior,"workdir"),"config":cfg,"in":upstream});
+        } else if o.worktree || (o.read_only && !o.in_place) {
             extra["worktree"] = json!({"source":top,"sourceWorkdir":workdir,"config":cfg});
         }
     }
@@ -409,6 +443,9 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         ));
     }
     let mode = if o.read_only { "read-only" } else { "write" };
+    if let Some(upstream) = &after {
+        extra["after"] = json!(upstream);
+    }
     launch(o, &prompt, &workdir, mode, &extra, None)
 }
 pub fn reply(mut o: Options) -> Res<PathBuf> {
@@ -420,6 +457,21 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
             "{} is still running; wait for it before replying",
             parent.file_name().unwrap_or_default().to_string_lossy()
         ));
+    }
+    let requested = o.agent.clone();
+    let requested_tier = o.tier.clone();
+    if !requested.is_empty() && requested_tier.is_some() {
+        return Err("--agent and --tier contradict each other; give one".into());
+    }
+    let agent = if let Some(tier) = requested_tier.as_deref() {
+        tier_agent(tier)?
+    } else if !requested.is_empty() {
+        requested
+    } else {
+        s(&meta, "agent").to_string()
+    };
+    if agent != s(&meta, "agent") {
+        o.fresh = true;
     }
     let session = if o.fresh {
         None
@@ -447,12 +499,20 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     if let Some(e) = nesting_error() {
         return Err(e);
     }
-    missing_tools(s(&meta, "agent"))?;
-    o.agent = s(&meta, "agent").into();
-    o.tier = meta["tier"].as_str().map(str::to_string);
-    o.provider = meta["provider"].as_str().map(str::to_string);
-    o.model = meta["model"].as_str().map(str::to_string);
-    o.thinking = meta["thinking"].as_str().map(str::to_string);
+    missing_tools(&agent)?;
+    o.agent = agent;
+    o.tier = requested_tier.or_else(|| {
+        if o.agent == s(&meta, "agent") {
+            meta["tier"].as_str().map(str::to_string)
+        } else {
+            None
+        }
+    });
+    if o.agent == s(&meta, "agent") {
+        o.provider = meta["provider"].as_str().map(str::to_string);
+        o.model = meta["model"].as_str().map(str::to_string);
+        o.thinking = meta["thinking"].as_str().map(str::to_string);
+    }
     o.retries = n(&meta, "retries");
     o.protect = meta["protect"]
         .as_array()
@@ -495,7 +555,10 @@ pub fn active_machine(slots: &Path) -> Vec<PathBuf> {
             let p = e.path();
             if p.extension().is_some_and(|x| x == "slot") {
                 let run = PathBuf::from(read(&p).trim());
-                if run.join("meta.json").is_file() && (active(&state(&run)) || agent_alive(&run)) {
+                if run.join("meta.json").is_file()
+                    && !run.join(".waiting").exists()
+                    && (active(&state(&run)) || agent_alive(&run))
+                {
                     out.push(run);
                 } else {
                     let _ = fs::remove_file(p);
@@ -574,8 +637,11 @@ pub fn launch(
     let _machine = lock(&slots.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
     let _local = lock(&root.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
     let active_runs = active_machine(&slots);
-    capacity(&o.agent, &active_runs)?;
-    if mode == "write" && !o.parallel && !extra["worktree"].is_object() {
+    let deferred = extra["after"].is_string();
+    if !deferred {
+        capacity(&o.agent, &active_runs)?;
+    }
+    if !deferred && mode == "write" && !o.parallel && !extra["worktree"].is_object() {
         for run in all_runs() {
             let m = json(run.join("meta.json"));
             if s(&m, "mode") == "write"
@@ -704,8 +770,13 @@ pub fn launch(
             run.file_name().unwrap_or_default().to_string_lossy()
         ));
         tree["path"] = json!(path);
-        wd = path.join(
+        let origin = if tree["in"].is_string() {
+            Path::new(s(&tree, "sourceWorkdir"))
+        } else {
             workdir
+        };
+        wd = path.join(
+            origin
                 .strip_prefix(s(&tree, "source"))
                 .unwrap_or(Path::new("")),
         );
@@ -728,8 +799,12 @@ pub fn launch(
             }
         }
     }
-    let mut base = top.as_deref().and_then(|p| snapshot(p, &run, &exclude));
-    if tree.is_object() && base.is_none() {
+    let mut base = if tree["in"].is_string() {
+        None
+    } else {
+        top.as_deref().and_then(|p| snapshot(p, &run, &exclude))
+    };
+    if tree.is_object() && tree["in"].is_null() && base.is_none() {
         let _ = fs::remove_dir_all(&run);
         return Err(format!(
             "cannot snapshot {} for the worktree",
@@ -748,16 +823,21 @@ pub fn launch(
     } else {
         top.unwrap_or_default()
     };
-    let meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":seconds(o.timeout.as_deref().unwrap_or("15m"))?,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
+    let meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":seconds(o.timeout.as_deref().unwrap_or("15m"))?,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
     write_json(run.join("meta.json"), &meta)?;
+    if deferred {
+        touch(run.join(".waiting"));
+    }
     runs::prune();
     let hash = sha1_smol::Sha1::from(run.to_string_lossy().as_bytes())
         .digest()
         .to_string();
-    write(
-        slots.join(format!("{}.slot", &hash[..16])),
-        format!("{}\n", run.display()),
-    )?;
+    if !deferred {
+        write(
+            slots.join(format!("{}.slot", &hash[..16])),
+            format!("{}\n", run.display()),
+        )?;
+    }
     let log = File::create(run.join("supervisor.log")).map_err(|e| e.to_string())?;
     let mut c = Command::new(script());
     c.arg("_supervise")

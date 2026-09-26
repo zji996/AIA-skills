@@ -51,7 +51,7 @@ pub fn missing_tools(agent: &str) -> Res<()> {
     let mut kit = None;
     while let Some(parent) = here.parent() {
         let p = parent.join("third_party/pi-kit/install.sh");
-        if p.is_file() {
+        if p.is_file() || parent.join("crates/delegate/Cargo.toml").is_file() {
             kit = Some(p);
             break;
         }
