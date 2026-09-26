@@ -79,9 +79,18 @@ publish() {
         -d "{\"tag_name\": \"$TAG\", \"name\": \"$NAME $VERSION\", \"body\": \"$notes\"}" \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
     fi
+    # Forgejo keeps same-named attachments side by side: upload only what the release lacks, so publishing
+    # again (e.g. after adding a token) is safe. Contents are pinned by bin.sha256, never replaced here.
+    local attached
+    attached="$(curl -fsS "${auth[@]}" "$FORGEJO_API/releases/$id" \
+      | python3 -c 'import json,sys; print("\n".join(a["name"] for a in json.load(sys.stdin)["assets"]))')"
     for file in "$DIST"/*; do
+      if grep -qxF "$(basename "$file")" <<<"$attached"; then
+        echo "  [Forgejo] already attached: $(basename "$file")"
+        continue
+      fi
       curl -fsS "${auth[@]}" -X POST "$FORGEJO_API/releases/$id/assets?name=$(basename "$file")" \
-        -F "attachment=@$file" >/dev/null || echo "  [Forgejo] upload failed (already there?): $(basename "$file")"
+        -F "attachment=@$file" >/dev/null || { echo "  [Forgejo] upload failed: $(basename "$file")" >&2; return 1; }
     done
     echo "  [Forgejo] ${FORGEJO_API%/api/v1/repos/*}/zji996/AIA-skills/releases/tag/$TAG"
   else

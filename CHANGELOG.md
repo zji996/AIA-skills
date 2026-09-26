@@ -35,7 +35,7 @@
 
 ### 安装
 
-- 技能可在 frontmatter 声明 `binary: <名>`：`install.sh` 在链接或复制前调用新增的 `scripts/fetch-binary.sh`，从 GitHub Release（`<名>-v<版本>`，次选 Forgejo）下载对应架构的二进制，按技能内提交的 `bin.sha256` 校验，不符即拒绝；下载不到而本机有 cargo 时从 `crates/<名>` 编译，`--build` 强制编译。新增 `scripts/release-binary.sh build|publish <技能>` 负责构建两个架构并发布；`check.sh` 检查 `bin.sha256` 与源码齐全。`bootstrap.sh` 不再检查 python3。
+- 技能可在 frontmatter 声明 `binary: <名>`：`install.sh` 在链接或复制前调用新增的 `scripts/fetch-binary.sh`，从 GitHub Release（`<名>-v<版本>`，次选 Forgejo）下载对应架构的二进制，按技能内提交的 `bin.sha256` 校验，不符即拒绝；下载不到而本机有 cargo 时从 `crates/<名>` 编译，`--build` 强制编译。新增 `scripts/release-binary.sh build|publish <技能>` 负责构建两个架构并发布（GitHub 为主，设了 `FORGEJO_TOKEN` 时也发到 Forgejo；可重复执行，已有的附件不重复上传）；`check.sh` 检查 `bin.sha256` 与源码齐全。`bootstrap.sh` 不再检查 python3。
 - `install.sh` 清理旧条目时，指向不含 `SKILL.md` 的目录的链接也视为过期：技能改名后旧目录常因残留 `__pycache__` 而未被删除，此前这类链接不会被清理。
 - `bootstrap.sh` 新增 `--with-pi` / `--with-pi-sync`：拉取 `third_party/pi-kit` 子模块并安装 Pi，最后提示仍缺少的委派依赖。
 - `third_party/pi-kit` 子模块改用相对地址，GitHub 克隆会从 GitHub 拉取 pi-kit。
