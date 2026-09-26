@@ -16,6 +16,7 @@ DELEGATE = ROOT / "skills/delegate/scripts/delegate.py"
 spec = importlib.util.spec_from_file_location("delegate", DELEGATE)
 delegate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(delegate)
+from delegate_core import agents  # noqa: E402 (importable once delegate.py has run)
 
 
 def answer(text, stop="stop"):
@@ -182,9 +183,9 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(self.outcome(self.cli("run", "task"))["state"], "killed")
 
     def test_leak_detector_ignores_normal_prose(self):
-        self.assertTrue(delegate.leaked_tool_call(LEAKED))
-        self.assertFalse(delegate.leaked_tool_call("Use `call:default_api:read{...}` carefully.\nDone."))
-        self.assertFalse(delegate.leaked_tool_call("Result: {a: 1}"))
+        self.assertTrue(agents.leaked_tool_call(LEAKED))
+        self.assertFalse(agents.leaked_tool_call("Use `call:default_api:read{...}` carefully.\nDone."))
+        self.assertFalse(agents.leaked_tool_call("Result: {a: 1}"))
 
     def test_nested_delegation_is_refused_and_guard_exported(self):
         self.fake_pi([answer("ok"), SETTLED])

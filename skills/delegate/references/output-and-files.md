@@ -88,3 +88,7 @@ Pi 的会话保存在 run 目录的 `session/` 下（每次尝试一个 `--sessi
 | `DELEGATE_AGENT` | 由脚本导出给同事（`pi`/`codex`），用于执行委派层级 |
 | `DELEGATE_PARENT_RUN` | 由脚本导出给同事，值为其所在 run；它委派的写入任务不受这个 run 的写入互斥限制 |
 | `PI_DELEGATE_ACTIVE` | 旧版标记，仍导出给 Pi；存在时视为 Pi 调用者 |
+
+## 代码结构
+
+`scripts/delegate.py` 是唯一入口，只含命令与参数解析；实现在 `scripts/delegate_core/`，依赖单向：`common` ← `agents`、`changes` ← `worktree` ← `runs` ← `supervise`、`launch` ← 入口。接入新的同事只需改 `agents.py`（启动命令、续接方式、事件解析）。
