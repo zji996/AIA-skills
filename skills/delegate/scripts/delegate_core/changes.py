@@ -1,5 +1,6 @@
 """What a run changed: working-tree snapshots as git trees, and their differences."""
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -35,12 +36,35 @@ def snapshot(top, scratch, exclude=()):
         skip = [f":(exclude,literal){path}" for path in sorted(set(large) | set(exclude) - set(ignored))]
         env = {**os.environ, "GIT_INDEX_FILE": str(index)}
         git(top, "add", "-A", "--", ".", *skip, env=env)
-        return {"tree": git(top, "write-tree", env=env).strip(), "large": large}
+        return {"tree": git(top, "write-tree", env=env).strip(), "large": large,
+                "submodules": submodule_fingerprints(top, set(exclude))}
     except (OSError, ValueError, subprocess.CalledProcessError):
         return None
     finally:
         index.unlink(missing_ok=True)
 
+
+
+def submodule_fingerprints(top, exclude):
+    """A tree records only a submodule's commit; fingerprint its checkout so edits inside it count too."""
+    prints = {}
+    for entry in git(top, "ls-files", "-s", "-z").split("\0"):
+        if not entry.startswith("160000 "):
+            continue
+        path = entry.split("\t", 1)[1]
+        checkout = Path(top) / path
+        if path in exclude or checkout.is_symlink() or not (checkout / ".git").exists():
+            continue
+        digest = hashlib.sha1()
+        for args in (("rev-parse", "HEAD"), ("diff", "--binary", "HEAD"),
+                     ("ls-files", "-z", "--others", "--exclude-standard")):
+            digest.update(git(checkout, *args, text=False))
+        for name in git(checkout, "ls-files", "-z", "--others", "--exclude-standard").split("\0"):
+            if name and (checkout / name).is_file():
+                info = (checkout / name).stat()
+                digest.update(f"{info.st_size}:{info.st_mtime_ns}".encode())
+        prints[path] = digest.hexdigest()
+    return prints
 
 
 def tree_changes(top, before, after):
@@ -56,11 +80,14 @@ def tree_changes(top, before, after):
     for status_letter, path in zip(out[0::2], out[1::2]):
         added, deleted = lines.get(path, (None, None))
         changes.append({"path": path, "status": status_letter[:1], "added": added, "deleted": deleted})
-    old, new = before.get("large") or {}, after.get("large") or {}
-    for path in sorted(set(old) | set(new)):
-        if old.get(path) != new.get(path):
-            letter = "A" if path not in old else "D" if path not in new else "M"
-            changes.append({"path": path, "status": letter, "added": None, "deleted": None, "large": True})
+    listed = {change["path"] for change in changes}
+    for kind in ("large", "submodules"):
+        old, new = before.get(kind) or {}, after.get(kind) or {}
+        for path in sorted(set(old) | set(new)):
+            if old.get(path) != new.get(path) and (kind == "large" or path not in listed):
+                letter = "A" if path not in old else "D" if path not in new else "M"
+                changes.append({"path": path, "status": letter, "added": None, "deleted": None,
+                                ("large" if kind == "large" else "submodule"): True})
     return sorted(changes, key=lambda change: change["path"])
 
 
@@ -95,7 +122,8 @@ def relative_to(path, workdir):
 
 def change_line(change):
     counts = "binary" if change["added"] is None else f"+{change['added']} -{change['deleted']}"
-    return f" {change['status']} {change['path']}  {'large file' if change.get('large') else counts}"
+    kind = "large file" if change.get("large") else "submodule contents" if change.get("submodule") else counts
+    return f" {change['status']} {change['path']}  {kind}"
 
 
 
@@ -104,7 +132,9 @@ def print_changes(run):
     recorded = read_json(run / "changes.json")
     meta = read_json(run / "meta.json", {}) or {}
     if recorded is None:
-        if meta.get("mode") == "write" and not meta.get("base"):
+        if (read_json(run / "summary.json", {}) or {}).get("warning"):
+            print(f"\n===== changes: {run.name}: unknown (the working tree could not be snapshotted) =====")
+        elif meta.get("mode") == "write":
             print(f"\n===== changes: {run.name}: not tracked (not a git repository; see files) =====")
         return
     changes = recorded["changes"]

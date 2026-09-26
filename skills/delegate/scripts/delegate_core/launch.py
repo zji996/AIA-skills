@@ -13,7 +13,9 @@ from pathlib import Path
 from .agents import missing_tools, nesting_error
 from .changes import snapshot
 from .common import ACTIVE, DEFAULT_TIMEOUT, SCRIPT, die, git_top, now_iso, read_json, seconds, setting, write_json
-from .runs import all_runs, capacity_error, machine_runs, prune_expired, run_state, runs_root, state_dir
+from .runs import (
+    agent_alive, all_runs, capacity_error, machine_runs, prune_expired, run_state, runs_root, state_dir,
+)
 from .worktree import worktree_config, worktrees_dir
 
 
@@ -79,10 +81,13 @@ def launch(args, prompt, workdir, mode, extra):
 
 
 
-def with_contract(prompt, accept=None, read_only=False):
+def with_contract(prompt, accept=None, read_only=False, revoked=False):
     """State the task boundary and definition of done, as a delegator would, in the prompt's language."""
     zh = bool(re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", prompt))
     notes = []
+    if revoked:
+        notes.append("完成标准有变：之前给出的验收命令不再适用。" if zh else
+                     "The definition of done has changed: the earlier acceptance command no longer applies.")
     if read_only:
         notes.append("只读任务：不要创建、修改或删除任何文件；结束后会核对工作目录，任何改动都会使任务判为失败。"
                      "用 delegate 委派子任务产生的记录在 git 忽略的目录里，不算改动，无需改动其存放位置。" if zh else
@@ -105,12 +110,18 @@ def create_run(args, prompt, workdir, mode, root, extra):
             meta = read_json(run / "meta.json", {}) or {}
             if run.name == setting("PARENT_RUN"):
                 continue  # the caller's own run is waiting on this helper
-            if meta.get("mode") == "write" and meta.get("workdir") == workdir and run_state(run) in ACTIVE:
+            if meta.get("mode") == "write" and meta.get("workdir") == workdir and \
+                    (run_state(run) in ACTIVE or agent_alive(run)):
                 die(f"write run {run.name} is still active in {workdir}; wait for it, use --read-only, "
                     "or pass --allow-parallel-writes")
+    parent = extra.get("parent")
+    if parent:
+        # Checked again under the start lock: two replies racing for one conversation would share its worktree.
+        later = [r.name for r in all_runs() if (read_json(r / "meta.json", {}) or {}).get("parent") == parent["run"]]
+        if later:
+            die(f"{parent['run']} already has a reply ({later[-1]}); wait for it and reply to that")
     if not setting("RUNS") and not (root / ".gitignore").exists():
         (root / ".gitignore").write_text("*\n")
-    prune_expired()
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", args.name or "").strip("-")[:40] or os.urandom(2).hex()
     stamp = time.strftime("%Y%m%d-%H%M%S")
     run = root / f"{stamp}-{slug}"
@@ -121,11 +132,11 @@ def create_run(args, prompt, workdir, mode, root, extra):
         except FileExistsError:
             run = root / f"{stamp}-{slug}-{os.urandom(2).hex()}"
     first_line = next((line.strip() for line in prompt.splitlines() if line.strip()), "")[:120]
-    parent = extra.get("parent")
     if parent:
         # The session already holds the contract; restate it only when the reply changes it.
-        contract = args.accept if args.accept != parent.get("accept") and not args.hide_accept else None
-        prompt = with_contract(prompt, contract)
+        changed = args.accept != parent.get("accept")
+        shown = args.accept if changed and not args.hide_accept else None
+        prompt = with_contract(prompt, shown, revoked=changed and not shown)
     else:
         # Pi's read-only mode removes write tools; Codex gets the boundary in writing and a result check.
         prompt = with_contract(prompt, None if args.hide_accept else args.accept,
@@ -145,7 +156,7 @@ def create_run(args, prompt, workdir, mode, root, extra):
     exclude = config["copy"] + config["link"]
     base = snapshot(top, run, exclude) if top else None
     if tree and base and not Path(tree["path"]).exists():
-        base["large"] = {}  # large untracked files stay behind; the worktree starts without them
+        base["large"] = base["submodules"] = {}  # neither is carried over; the worktree starts without them
         top = tree["path"]
     if tree and not base:
         shutil.rmtree(run, ignore_errors=True)
@@ -162,6 +173,8 @@ def create_run(args, prompt, workdir, mode, root, extra):
             "parent": (parent or {}).get("run"), "resume": extra.get("resume"),
             "startedAt": now_iso(), "startedEpoch": int(time.time()), "startedNs": time.time_ns()}
     write_json(run / "meta.json", meta)
+    # Only now: pruning may remove a reply's parent, whose session and worktree this run has taken over.
+    prune_expired()
     with open(run / "supervisor.log", "wb") as log:
         subprocess.Popen([sys.executable, str(SCRIPT), "_supervise", str(run)], stdin=subprocess.DEVNULL,
                          stdout=log, stderr=log, start_new_session=True)

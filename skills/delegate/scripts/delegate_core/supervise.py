@@ -73,6 +73,9 @@ def supervise(run):
     changed = [c["path"] for c in recorded[0]] if recorded else []
     if recorded:
         summary["changes"] = recorded[1]
+    elif meta.get("top") and not setup_error:
+        # Say so rather than report "no changes": a read-only run could not be verified either.
+        summary["warning"] = "could not snapshot the working tree; changes are unknown"
     if meta["mode"] == "read-only" and changed and verdict == "ok":
         # Codex runs unsandboxed, so read-only is checked by outcome.
         verdict = "failed"

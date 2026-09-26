@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux；需要 python3（3.9+，仅标准库），以及所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "4.1.1"
+  version: "4.1.2"
   exclude-agents: pi
 ---
 

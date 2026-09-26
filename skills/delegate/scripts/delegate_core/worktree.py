@@ -46,14 +46,22 @@ def prepare_worktree(meta, run):
     log = run / "setup.log"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        git(source, "worktree", "add", "--detach", str(path), "HEAD")
-        # The worktree starts from what the caller sees, uncommitted edits included.
-        git(path, "read-tree", "-u", "--reset", meta["base"]["tree"])
+        # The worktree starts from what the caller sees, uncommitted edits included: a commit of the snapshot
+        # on top of HEAD (or parentless in a repository without commits), referenced only by the worktree.
+        head = subprocess.run(["git", "-C", source, "rev-parse", "-q", "--verify", "HEAD^{commit}"],
+                              capture_output=True, text=True).stdout.strip()
+        identity = {f"GIT_{who}_{key}": value for who in ("AUTHOR", "COMMITTER")
+                    for key, value in (("NAME", "delegate"), ("EMAIL", "delegate@localhost"))}
+        commit = git(source, "commit-tree", meta["base"]["tree"], *(["-p", head] if head else []),
+                     "-m", f"delegate: working tree of {source} for {run.name}", env={**os.environ, **identity}).strip()
+        git(source, "worktree", "add", "--detach", str(path), commit)
     except (OSError, subprocess.CalledProcessError) as error:
         detail = getattr(error, "stderr", None) or str(error)
         return f"worktree setup failed: {clip(str(detail).strip(), 300)}"
     for item in config["copy"] + config["link"]:
         origin, target = Path(source) / item, path / item
+        if target.is_dir() and not target.is_symlink() and not any(target.iterdir()):
+            target.rmdir()  # e.g. a submodule, which a new worktree leaves as an empty directory
         if not origin.exists() or target.exists() or target.is_symlink():
             continue
         target.parent.mkdir(parents=True, exist_ok=True)

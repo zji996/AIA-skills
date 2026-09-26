@@ -101,7 +101,10 @@ def read_json(path, default=None):
 
 def write_json(path, value):
     temp = Path(str(path) + ".tmp")
-    temp.write_text(json.dumps(value, ensure_ascii=False) + "\n")
+    try:
+        temp.write_text(json.dumps(value, ensure_ascii=False) + "\n", encoding="utf-8")
+    except UnicodeEncodeError:  # an undecodable file name; escaped JSON still round-trips
+        temp.write_text(json.dumps(value) + "\n", encoding="utf-8")
     temp.replace(path)
 
 
@@ -118,8 +121,9 @@ def clip(text, limit):
 
 
 def git(top, *args, env=None, text=True):
-    return subprocess.run(["git", "-C", str(top), *args], capture_output=True, text=text, check=True,
-                          env=env).stdout
+    # Paths are bytes on Linux: undecodable file names round-trip through surrogateescape like os.fsdecode.
+    return subprocess.run(["git", "-C", str(top), *args], capture_output=True, check=True, env=env,
+                          **({"encoding": "utf-8", "errors": "surrogateescape"} if text else {})).stdout
 
 
 

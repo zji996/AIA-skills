@@ -3,6 +3,7 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -573,6 +574,79 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(self.outcome(self.cli("reply", second["run"], "again"))["state"], "answered")
         calls = [line.split() for line in (self.work / "pi.log").read_text().splitlines()]
         self.assertEqual(len({call[call.index("--session-id") + 1] for call in calls}), 1)
+
+    def test_agent_that_outlives_its_supervisor_blocks_clean_until_stopped(self):
+        self.fake_pi([answer("slow"), SETTLED], sleep=30)
+        run = Path(json.loads(self.cli("start", "--name", "orphan", "task").stdout)["dir"])
+        for _ in range(50):
+            if (run / "agent.pid").is_file():
+                break
+            time.sleep(0.1)
+        os.kill(int((run / "pid").read_text()), signal.SIGKILL)
+        agent = int((run / "agent.pid").read_text())
+        self.assertIn("outlived the supervisor", self.cli("clean", "orphan").stderr)
+        self.assertEqual(self.cli("start", "--name", "rival", "task").returncode, 2)  # still writing here
+        self.cli("stop", "orphan")
+        time.sleep(0.3)
+        self.assertFalse(delegate_pid_alive(agent))
+        self.assertIn("removed", self.cli("clean", "orphan").stdout)
+
+    def test_snapshot_survives_undecodable_names_and_sees_submodules(self):
+        repo = self.repo({"a.txt": "a\n"})
+        (repo / os.fsdecode(b"caf\xe9.txt")).write_text("x")
+        self.fake_codex(codex_events("looked"), pre="echo oops > stray.txt")
+        state = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "--workdir", repo, "review"))
+        self.assertEqual(state["readOnlyViolation"], ["stray.txt"])
+        (repo / "stray.txt").unlink()
+        sub = self.work / "lib"
+        subprocess.run(["git", "init", "-q", str(sub)], check=True)
+        (sub / "lib.txt").write_text("l\n")
+        git = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always"]
+        subprocess.run(["git", "-C", str(sub), *git, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(sub), *git, "commit", "-qm", "lib"], check=True)
+        subprocess.run(["git", "-C", str(repo), *git, "submodule", "add", "-q", str(sub), "vendor"], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-C", str(repo), *git, "commit", "-qm", "sub"], check=True)
+        self.fake_codex(codex_events("looked"), pre="echo edit >> vendor/lib.txt")
+        state = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "--workdir", repo, "review"))
+        self.assertEqual(state["readOnlyViolation"], ["vendor"])
+        self.assertIn(" M vendor  submodule contents", self.cli("wait", state["run"]).stdout)
+
+    def test_worktree_in_a_repository_without_commits(self):
+        repo = self.work / "fresh"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        (repo / "draft.txt").write_text("draft\n")
+        self.fake_pi([answer("done"), SETTLED], pre="grep -q draft draft.txt && echo more >> draft.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        self.assertEqual((state["state"], state["files"]), ("answered", ["draft.txt"]))
+        self.assertEqual(self.cli("apply", state["run"]).returncode, 0)
+        self.assertEqual((repo / "draft.txt").read_text(), "draft\nmore\n")
+
+    def test_reply_tells_the_agent_when_the_acceptance_command_changes(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        first = self.outcome(self.cli("run", "--accept", "true", "--prompt", "fix it"))
+        second = self.outcome(self.cli("reply", first["run"], "--accept", "", "--prompt", "now tidy up"))
+        self.assertNotIn("accept", second)
+        self.assertIn("no longer applies", (Path(second["dir"]) / "prompt.md").read_text())
+        third = self.outcome(self.cli("reply", second["run"], "--prompt", "and more"))
+        self.assertEqual((Path(third["dir"]) / "prompt.md").read_text(), "and more\n")
+
+    def test_reply_keeps_the_session_when_its_parent_is_pruned(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        first = self.outcome(self.cli("run", "--read-only", "task"))
+        os.utime(Path(first["dir"]) / "exit_code", (1, 1))
+        second = self.outcome(self.cli("reply", first["run"], "more"))
+        self.assertFalse(Path(first["dir"]).exists())  # pruned by the reply's own start
+        self.assertTrue(any((Path(second["dir"]) / "session").glob("t_*.jsonl")))
+        self.assertEqual(self.outcome(self.cli("reply", second["run"], "again"))["state"], "answered")
+
+
+def delegate_pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z"
 
 
 if __name__ == "__main__":

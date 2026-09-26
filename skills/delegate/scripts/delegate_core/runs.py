@@ -71,6 +71,15 @@ def supervisor_alive(run):
 
 
 
+def agent_alive(run):
+    """The agent's process group still exists, e.g. after its supervisor was killed."""
+    try:
+        pid = int((run / "agent.pid").read_text())
+        return pid_alive(pid) and os.getpgid(pid) == pid
+    except (OSError, ValueError):
+        return False
+
+
 def run_state(run):
     if (run / "exit_code").is_file():
         return (read_json(run / "summary.json", {}) or {}).get("state", "crashed")
@@ -110,7 +119,7 @@ def status(run):
             out[key] = meta[key]["path"] if key == "worktree" else meta[key]
     if summary:
         for key in ("elapsedSeconds", "attempts", "model", "turns", "files", "changes", "accept", "readOnlyViolation",
-                    "tokens", "error"):
+                    "tokens", "warning", "error"):
             if summary.get(key) not in (None, [], {}):
                 out[key] = summary[key]
     else:
@@ -192,7 +201,7 @@ def machine_runs(slots):
             run = Path(slot.read_text().strip())
         except OSError:
             continue
-        if (run / "meta.json").is_file() and run_state(run) in ACTIVE:
+        if (run / "meta.json").is_file() and (run_state(run) in ACTIVE or agent_alive(run)):
             active.append(run)
         else:
             slot.unlink(missing_ok=True)

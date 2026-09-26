@@ -40,7 +40,7 @@ from delegate_core.common import (
 )
 from delegate_core.launch import launch, read_prompt, start_run
 from delegate_core.runs import (
-    all_runs, events, latest_in_chain, remove_run, resolve_run, run_state, status, unmerged_worktree,
+    agent_alive, all_runs, events, latest_in_chain, remove_run, resolve_run, run_state, status, unmerged_worktree,
 )
 from delegate_core.supervise import supervise
 from delegate_core.worktree import apply_conversation
@@ -206,6 +206,8 @@ def cmd_result(args):
 def cmd_stop(args):
     for ref in args.runs:
         run = resolve_run(ref)
+        if run_state(run) not in ACTIVE and agent_alive(run):  # its supervisor died; the agent did not
+            kill_group(int((run / "agent.pid").read_text()), grace=1)
         if run_state(run) in ACTIVE:
             try:
                 os.kill(int((run / "pid").read_text()), signal.SIGTERM)
@@ -247,8 +249,9 @@ def cmd_clean(args):
                       file=sys.stderr)
     for run in dict.fromkeys(targets):
         state = run_state(run)
-        if state in ACTIVE:
-            print(f"delegate: skip active run {run.name}", file=sys.stderr)
+        if state in ACTIVE or agent_alive(run):
+            print(f"delegate: skip active run {run.name}" + ("" if state in ACTIVE else
+                  f" (its agent outlived the supervisor; stop it first: {SCRIPT} stop {run.name})"), file=sys.stderr)
             continue
         note = "; its worktree was never applied" if unmerged_worktree(run) else ""
         remove_run(run)
