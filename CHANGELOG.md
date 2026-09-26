@@ -4,6 +4,9 @@
 
 ### 技能
 
+- `delegate` Rust 实现（`crates/delegate`，与 Python 版并存，暂不替换）：由 Codex 按 `docs/delegate-spec.md` 实现，依赖仅 serde_json、libc、sha1_smol；release 约 1.1 MB，可 musl 静态链接。运行中的 supervisor 常驻约 2.9 MB（Python 版约 22 MB），空闲时零周期唤醒（10 秒内各线程上下文切换 0 次，修复前 697 次）。通过全部黑盒一致性测试（`DELEGATE_BIN`）。主控审查后修复了首版的 6 处问题：非 UTF-8 输出行会使读循环停止、三处周期轮询改为事件驱动（self-pipe、条件变量、阻塞 `waitid`）、lane 停止信号丢失唤醒、看门狗可能向复用的 PID 发信号。
+- `delegate` 测试：新增非 UTF-8 输出行不中断读取的用例；规格注明 JSON 空白与字段顺序不属于契约。
+- `agent-handoff` 2.1.2：读取 delegate 的 `meta.json` 时容忍任意 JSON 空白，Rust 实现写出的紧凑 JSON 此前会使"未合并 worktree"漏报。
 - `delegate` 4.4.0：新增整机重任务队列 `lane`：验收命令、worktree `setup`、同事自检与主控的 `delegate.py lane <命令>` 先进先出排队，默认同时一个（`DELEGATE_MAX_HEAVY`）；基于 flock 由内核唤醒，不轮询，进程崩溃即释放。排队时间不计入验收、setup 与同事的超时；同事超过 `--timeout` 时若仍在执行命令或刚有动静，最多宽限 50%（`DELEGATE_TIMEOUT_GRACE`）。验收与 setup 在独立进程组运行，超时或结束后整组清理，此前超时只杀 shell、子进程会残留。可用内存低于 `DELEGATE_MIN_AVAILABLE_MB`（默认 4096）拒绝启动。`.delegate.json` 新增 `env`，注入同事、验收与 setup（如 `CUDA_VISIBLE_DEVICES=""`）。`wait`/`run` 改为阻塞在 supervisor 的生命周期锁上，任务结束即返回。修复快照漏记：复制 index 时未保留 mtime，同一秒内写入且大小不变的改动可能不计入改动清单（git racy-clean 检测失效）。
 - `delegate` 4.4.0 经 Codex 审查后修复：排队中收到 stop 不再可能在取得名额后照常验收；`DELEGATE_LANE_HELD` 不再泄漏给经 lane 启动的 run；终止 `lane` 进程会先结束其命令的整个进程组；命令组在回收 shell 之前清理，不会按可能被复用的 PGID 发信号；同事超时改用单调时钟；信号处理函数中不再做不可重入的等待或启动线程。只读 worktree 的 HEAD 重置为主控的提交，未提交改动在 `git diff HEAD` 中可见。
 - 新增 `docs/delegate-spec.md`：delegate 的实现契约（命令、输出、状态机、快照、lane、锁与文件），供其他实现与 harness 接入；不在技能目录内，技能加载时不读取。`tests/test_delegate.py` 改为纯黑盒一致性套件，`DELEGATE_BIN` 可指向任意实现。

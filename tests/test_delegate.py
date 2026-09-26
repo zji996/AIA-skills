@@ -322,6 +322,13 @@ class DelegateTests(unittest.TestCase):
             self.fake_pi([answer(text), SETTLED])
             self.assertEqual(self.outcome(self.cli("run", "--retries", "0", "task"))["state"], state, text)
 
+    def test_undecodable_output_lines_are_skipped_not_fatal(self):
+        # One bad line must not stop the reader: the agent would block on a full pipe and the answer be lost.
+        self.fake_pi([answer("still read"), SETTLED], pre="printf '\\377\\376 not utf-8\\n'; printf '{\\\"x\\\": \\377}\\n'")
+        state = self.outcome(self.cli("run", "task"))
+        self.assertEqual(state["state"], "answered")
+        self.assertIn("still read", (Path(state["dir"]) / "result.md").read_text())
+
     def test_nested_delegation_is_refused_and_guard_exported(self):
         self.fake_pi([answer("ok"), SETTLED])
         self.assertEqual(self.cli("run", "task").returncode, 0)

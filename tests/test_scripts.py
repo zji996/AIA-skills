@@ -134,10 +134,10 @@ class ScriptTests(unittest.TestCase):
         self.assertTrue(copy.is_dir() and not copy.is_symlink())
         marker = (copy / ".aia-skills-install").read_text()
         self.assertIn(f"source={ROOT / 'skills'}", marker)
-        self.assertIn("version=2.1.1", marker)
+        self.assertIn("version=2.1.2", marker)
         self.assertTrue((copy / "scripts/handoff-snapshot.sh").is_file())
         self.assertNotIn("outdated", self.run_script(INSTALL, "--status", env=env).stdout)
-        (copy / ".aia-skills-install").write_text(marker.replace("version=2.1.1", "version=0.1.0"))
+        (copy / ".aia-skills-install").write_text(marker.replace("version=2.1.2", "version=0.1.0"))
         self.assertIn("outdated", self.run_script(INSTALL, "--status", env=env).stdout)
         self.assertEqual(self.run_script(INSTALL, "agent-handoff", env=env).returncode, 0)
         self.assertEqual(copy.resolve(), ROOT / "skills/agent-handoff")
@@ -270,9 +270,15 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("review", self.run_script(SNAPSHOT, "--repo", repo).stdout)
         tree = repo.parent / "wt"
         tree.mkdir()
-        (run / "meta.json").write_text(json.dumps({"worktree": {"source": str(repo), "path": str(tree)}}))
-        self.assertIn(f"20260101-000000-review 的 worktree 改动未合并：{tree}",
-                      self.run_script(SNAPSHOT, "--repo", repo).stdout)
+        # Any JSON formatting: the Python delegate writes ", "/": ", the Rust one compact separators.
+        for separators in ((", ", ": "), (",", ":")):
+            meta = {"mode": "write", "worktree": {"source": str(repo), "path": str(tree)}}
+            (run / "meta.json").write_text(json.dumps(meta, separators=separators))
+            self.assertIn(f"20260101-000000-review 的 worktree 改动未合并：{tree}",
+                          self.run_script(SNAPSHOT, "--repo", repo).stdout)
+            (run / "meta.json").write_text(json.dumps({**meta, "mode": "read-only"}, separators=separators))
+            self.assertNotIn("未合并", self.run_script(SNAPSHOT, "--repo", repo).stdout)  # a snapshot to read
+            (run / "meta.json").write_text(json.dumps(meta, separators=separators))
         (run / ".applied").touch()
         self.assertNotIn("review", self.run_script(SNAPSHOT, "--repo", repo).stdout)
 

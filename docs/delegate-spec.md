@@ -22,7 +22,7 @@
 
 ## 2. 命令行
 
-入口是单个可执行文件（现为 `scripts/delegate.py`）。所有输出 JSON 的行都是单行、UTF-8、`ensure_ascii=false`。诊断信息写 stderr，以 `delegate: ` 开头。
+入口是单个可执行文件：Python 实现 `skills/delegate/scripts/delegate.py`，Rust 实现 `crates/delegate`（`target/release/delegate`）。所有输出 JSON 的行都是单行、UTF-8、非 ASCII 字符不转义；**空白与字段顺序不属于契约**（两个实现不同），状态行以 `{"run"` 开头。读取方——包括读取 run 目录中 JSON 文件的 `agent-handoff`——必须按 JSON 解析或容忍任意空白，不得依赖文本格式。诊断信息写 stderr，以 `delegate: ` 开头。
 
 ### 2.1 退出码（必须）
 

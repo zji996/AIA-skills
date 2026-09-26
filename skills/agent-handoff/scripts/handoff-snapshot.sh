@@ -74,8 +74,9 @@ for meta in .local/run/pi/*/meta.json; do
   fi
   # --worktree 的改动留在独立 worktree，直到 `delegate apply`；同一对话只报最新一轮。
   # 只读任务的 worktree 只是供阅读的快照，没有可合并的改动。
-  worktree="$(grep -o '"path": "[^"]*"' "$meta" | head -1 | cut -d'"' -f4 || true)"
-  if grep -q '"mode": "read-only"' "$meta"; then
+  # 按 JSON 键匹配、容忍任意空白：delegate 的 Python 与 Rust 实现写出的格式不同。
+  worktree="$(grep -oE '"path"[[:space:]]*:[[:space:]]*"[^"]*"' "$meta" | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)"$/\1/' || true)"
+  if grep -qE '"mode"[[:space:]]*:[[:space:]]*"read-only"' "$meta"; then
     worktree=
   fi
   if [[ -f "$dir/exit_code" && -n "$worktree" && -d "$worktree" ]]; then
