@@ -11,11 +11,12 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicI32, Ordering},
-    Arc,
+    mpsc, Arc, Mutex,
 };
 use std::time::Duration;
 
 type Recorded = Option<(Vec<Value>, Value)>;
+type StopWaiter = Arc<Mutex<Option<mpsc::Sender<()>>>>;
 
 pub fn log_event(run: &Path, mut event: Value) {
     event["at"] = json!(iso());
@@ -257,7 +258,12 @@ fn escalate(
     write_json(run.join("meta.json"), meta)?;
     Ok(true)
 }
-fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<std::sync::Mutex<Option<f64>>>) -> Res<()> {
+fn inner(
+    run: &Path,
+    holder: Arc<AtomicI32>,
+    grace: Arc<Mutex<Option<f64>>>,
+    stop_waiter: &StopWaiter,
+) -> Res<()> {
     let mut meta = json(run.join("meta.json"));
     let started = epoch();
     if !s(&meta, "after").is_empty() {
@@ -317,7 +323,8 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<std::sync::Mutex<Option<
             return finish_skipped(run, "stopped while waiting for review source");
         }
         let source = Path::new(s(&meta["worktree"], "source"));
-        let exclude = meta["snapshotExclude"]
+        let upstream = json(in_run.join("meta.json"));
+        let exclude = upstream["snapshotExclude"]
             .as_array()
             .map(|a| {
                 a.iter()
@@ -333,7 +340,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<std::sync::Mutex<Option<
         write_json(run.join("meta.json"), &meta)?;
     }
     if !s(&meta, "after").is_empty() {
-        admit_waiting(run, &meta)?;
+        admit_waiting(run, &meta, stop_waiter)?;
     }
     let mut setup_error = None;
     if meta["worktree"].is_object() && !Path::new(s(&meta["worktree"], "path")).exists() {
@@ -474,8 +481,9 @@ fn wait_for_run(run: &Path) {
         }
     }
 }
-fn wait_any(runs: Vec<PathBuf>) {
-    let (tx, rx) = std::sync::mpsc::channel();
+fn wait_any(runs: Vec<PathBuf>, stop_waiter: &StopWaiter) {
+    let (tx, rx) = mpsc::channel();
+    *stop_waiter.lock().unwrap() = Some(tx.clone());
     for run in runs {
         let tx = tx.clone();
         std::thread::spawn(move || {
@@ -484,14 +492,12 @@ fn wait_any(runs: Vec<PathBuf>) {
         });
     }
     drop(tx);
-    while !lane::stopped() {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-        }
+    if !lane::stopped() {
+        let _ = rx.recv();
     }
+    *stop_waiter.lock().unwrap() = None;
 }
-fn admit_waiting(run: &Path, meta: &Value) -> Res<()> {
+fn admit_waiting(run: &Path, meta: &Value, stop_waiter: &StopWaiter) -> Res<()> {
     let slots = state_dir();
     let root = runs_root();
     loop {
@@ -533,7 +539,7 @@ fn admit_waiting(run: &Path, meta: &Value) -> Res<()> {
         }
         drop(local);
         drop(machine);
-        wait_any(others);
+        wait_any(others, stop_waiter);
         if lane::stopped() {
             return Err("stopped while waiting for capacity".into());
         }
@@ -547,11 +553,18 @@ pub fn supervise(run: &Path) -> Res<()> {
     write(run.join("pid"), std::process::id().to_string())?;
     let mut signals = lane::supervisor_signal_pipe().map_err(|e| e.to_string())?;
     let holder = Arc::new(AtomicI32::new(0));
-    let grace = Arc::new(std::sync::Mutex::new(None));
+    let grace = Arc::new(Mutex::new(None));
+    let stop_waiter: StopWaiter = Arc::new(Mutex::new(None));
     let h = holder.clone();
+    let waiter = stop_waiter.clone();
     std::thread::spawn(move || {
         let mut byte = [0];
         if signals.read_exact(&mut byte).is_ok() {
+            if let Ok(waiter) = waiter.lock() {
+                if let Some(tx) = waiter.as_ref() {
+                    let _ = tx.send(());
+                }
+            }
             lane::wake_lane_waiter_after_stop();
             let pid = h.load(Ordering::SeqCst);
             if pid > 0 {
@@ -559,7 +572,7 @@ pub fn supervise(run: &Path) -> Res<()> {
             }
         }
     });
-    if let Err(e) = inner(run, holder, grace) {
+    if let Err(e) = inner(run, holder, grace, &stop_waiter) {
         let _ = append(run.join("stderr.log"), &format!("supervisor error: {e}\n"));
         if !run.join("exit_code").exists() {
             let _ = write_json(

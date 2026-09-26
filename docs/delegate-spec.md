@@ -165,7 +165,7 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 
 - 带 `--after` 的 supervisor 阻塞在上游的 `supervisor.lock` 上（上游无生命周期锁时按 `DELEGATE_POLL` 兜底），等待期间不启动同事。上游成功后，任务说明末尾按说明语言追加上游名称、结局、`result.md` 路径，以及存在时的 `changes.patch` 与 worktree 路径。
 - `waiting` 是未结束状态，`skipped` 是结束状态。waiting run 不占整机并发名额、也不参加写入互斥检查；离开等待时在 `<state>/.start.lock` 下重新检查容量，满额时等到任一运行中的 run 结束再检查。
-- `--in` 在被审查 run 结束后，对其 worktree 当前状态做快照并新建独立 worktree：HEAD 设为上游 worktree 的 HEAD，index 保持快照，使 `git diff HEAD` 显示上游的改动；workdir 映射到新 worktree 的对应目录，copy/link/setup 照常。只读违规只记在本 run，绝不改动上游 worktree。
+- `--in` 在被审查 run 结束后，对其 worktree 当前状态做快照（排除上游的 `snapshotExclude`，即 link/copy 路径，它们保留起点 tree 中的原始条目）并新建独立 worktree：HEAD 设为上游 worktree 的 HEAD，index 保持快照，使 `git diff HEAD` 显示上游的改动；workdir 映射到新 worktree 的对应目录，copy/link/setup 照常。只读违规只记在本 run，绝不改动上游 worktree。
 - 这不是嵌套：每一步都由主控声明，结果都回到主控。
 
 ### 4.2 判定
@@ -224,6 +224,8 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 | 大文件 | 从 worktree 复制；源中已存在且不同即冲突 |
 
 有冲突且无 `--merge` 时**什么都不写**，退出码 1。
+
+**分轮合并**：完整成功的 `apply` 在各 run 的 `.applied` 中记录本次合入的 worktree tree、大文件指纹与内容摘要；之后的 reply 在 `meta.json` 的 `appliedBase` 中继承它。再次 `apply` 以最近一次完整合入的状态为基准，没有记录时用 `chainBase`。有跳过项、写了冲突标记或 `--dry-run` 时不推进基准。`diff --total` 仍展示整段对话；没有待合入的改动时输出 `no changes to apply`，退出码 0。
 
 **生成文件**：`.delegate.json` 的 `"generated": {"paths": [...], "command": "..."}` 声明的路径（语义同 `--protect`）不做三方合并、也不覆盖；改动清单与 diff 仍如实列出。合并写入了文件后，通过 lane 在源仓库根以 `sh -c` 运行 `command` 重新生成，输出写入 run 目录的 `generate.log`；`--dry-run` 只报告将会重新生成；命令失败时退出码 1、显示日志末尾，已合并的文件保留。完全成功时对话内所有 run 及共用该 worktree 的旁支 run 写 `.applied`。只读 run 与原地 run 拒绝 `apply`（退出码 2）。
 

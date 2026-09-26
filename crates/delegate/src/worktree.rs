@@ -3,7 +3,7 @@ use crate::common::*;
 use crate::lane;
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -221,6 +221,10 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<Option<String>> {
             copy_rec(&origin, &target)?;
         }
     }
+    // Managed paths can replace tracked entries such as gitlinks with local links.
+    for item in copies.iter().chain(links.iter()) {
+        let _ = git(&path, &["update-index", "--skip-worktree", "--", item]);
+    }
     let setup = strings(&cfg["setup"]);
     if setup.is_empty() {
         return Ok(None);
@@ -371,6 +375,34 @@ struct Action {
     mode: Option<String>,
     content: Vec<u8>,
 }
+fn applied_state(run: &Path, meta: &Value) -> Value {
+    let state = json(run.join(".applied"));
+    if !s(&state, "tree").is_empty() {
+        return state;
+    }
+    let mut parent = s(meta, "parent").to_string();
+    while !parent.is_empty() {
+        let path = run.parent().unwrap_or(Path::new("/")).join(&parent);
+        let state = json(path.join(".applied"));
+        if !s(&state, "tree").is_empty() {
+            return state;
+        }
+        parent = s(&json(path.join("meta.json")), "parent").to_string();
+    }
+    meta["appliedBase"].clone()
+}
+fn file_hash(path: &Path) -> Res<String> {
+    let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut hash = sha1_smol::Sha1::new();
+    let mut buffer = [0; 65536];
+    loop {
+        let size = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if size == 0 {
+            return Ok(hash.digest().to_string());
+        }
+        hash.update(&buffer[..size]);
+    }
+}
 pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
     let (meta, mut top, _, mut after) = chain_changes(run)?;
     if meta["worktree"].is_null() {
@@ -386,7 +418,12 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
             run.file_name().unwrap_or_default().to_string_lossy()
         ));
     }
-    let before = s(&meta, "chainBase").to_string();
+    let applied = applied_state(run, &meta);
+    let mut before = s(&applied, "tree");
+    if before.is_empty() {
+        before = s(&meta, "chainBase");
+    }
+    let mut before = before.to_string();
     let source = PathBuf::from(s(&meta["worktree"], "source"));
     let (generated_paths, generate_command) = generated(&source)?;
     let worktree = PathBuf::from(s(&meta["worktree"], "path"));
@@ -399,10 +436,23 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
             large = now["large"].clone();
         }
     }
-    let changes = tree_changes(&top, &json!({"tree":before}), &json!({"tree":after}), false)?;
+    let mut changes = tree_changes(
+        &top,
+        &json!({"tree":before,"large":applied["large"]}),
+        &json!({"tree":after,"large":large}),
+        false,
+    )?;
+    if changes.is_empty() && !s(&applied, "tree").is_empty() {
+        // A repeated apply still detects drift in files merged in an earlier round.
+        before = s(&meta, "chainBase").to_string();
+        changes = tree_changes(&top, &json!({"tree":before}), &json!({"tree":after}), false)?;
+    }
     let mut actions = vec![];
     let mut conflicts = vec![];
     for c in changes {
+        if b(&c, "large") {
+            continue;
+        }
         let path = s(&c, "path").to_string();
         if matches_rule(&path, &generated_paths) {
             continue;
@@ -496,10 +546,21 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
             let target = source.join(path);
             if !origin.is_file()
                 || through_symlink(&source, &target)
+                || target.is_symlink()
                 || entry_mode(&target).as_deref() == Some("dir")
             {
                 conflicts.push(path.clone());
-            } else if !target.exists() && !target.is_symlink() {
+            } else if !s(&applied, "tree").is_empty()
+                && before != s(&meta, "chainBase")
+                && applied["large"].get(path) == obj.get(path)
+                && applied["largeHashes"].get(path).and_then(Value::as_str)
+                    == Some(file_hash(&origin)?.as_str())
+            {
+                continue;
+            } else if !target.exists()
+                || applied["largeHashes"].get(path).and_then(Value::as_str)
+                    == Some(file_hash(&target)?.as_str())
+            {
                 actions.push(Action {
                     kind: "copied".into(),
                     path: path.clone(),
@@ -598,10 +659,19 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
         }
         println!(" regenerated      {}", generated_paths.join(", "));
     }
-    if !dry && conflicts.is_empty() {
+    if !dry && conflicts.is_empty() && !marked {
+        let mut large_hashes = serde_json::Map::new();
+        if let Some(obj) = large.as_object() {
+            for path in obj.keys() {
+                if !matches_rule(path, &generated_paths) {
+                    large_hashes.insert(path.clone(), json!(file_hash(&worktree.join(path))?));
+                }
+            }
+        }
+        let state = json!({"at":iso(),"tree":after,"large":large,"largeHashes":large_hashes});
         let mut chain = run.to_path_buf();
         loop {
-            write(chain.join(".applied"), format!("{}\n", iso()))?;
+            write_json(chain.join(".applied"), &state)?;
             let parent = s(&json(chain.join("meta.json")), "parent").to_string();
             if parent.is_empty()
                 || !chain

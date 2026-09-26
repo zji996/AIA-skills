@@ -1029,6 +1029,20 @@ class DelegateTests(unittest.TestCase):
         self.assertFalse((repo / "stray.txt").exists())
         self.assertEqual(self.cli("run", "--in", "impl", "--name", "w", "write").returncode, 2)  # read-only only
 
+    def test_in_ignores_linked_paths_of_the_upstream_worktree(self):
+        # A submodule the upstream worktree links (.delegate.json) is not its change: a reviewer working --in it
+        # must not see the link as a gitlink turned into a symlink, nor be blamed for it.
+        repo = self.sub_repo()
+        (repo / ".delegate.json").write_text(json.dumps({"worktree": {"link": ["vendor"]}}))
+        self.fake_pi([answer("changed"), SETTLED], pre="echo impl >> a.txt")
+        self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "impl", "change a"))
+        self.fake_pi([answer("reviewed"), SETTLED], pre='git diff HEAD --name-only > "$PI_LOG.names"')
+        review = self.outcome(self.cli("run", "--read-only", "--in", "impl", "--name", "rv", "review impl"))
+        self.assertEqual(review["state"], "answered")
+        self.assertEqual((self.work / "pi.log.names").read_text().split(), ["a.txt"])
+        for key in ("readOnlyViolation", "warning"):
+            self.assertNotIn(key, review)
+
     def test_reply_can_hand_the_worktree_to_the_other_colleague(self):
         repo = self.repo({"a.txt": "a\n"})
         self.fake_pi([answer("draft"), SETTLED], pre="echo draft >> a.txt")
@@ -1040,6 +1054,24 @@ class DelegateTests(unittest.TestCase):
         self.assertNotIn(" fork ", (self.work / "pi.log.codex").read_text())  # another model: a fresh session
         self.assertEqual(self.cli("apply", "d").returncode, 0)
         self.assertEqual((repo / "a.txt").read_text(), "a\ndraft\npolish\n")
+
+    def test_apply_after_an_earlier_apply_merges_only_what_is_new(self):
+        # Round one is applied (and committed); round two edits the very lines round one added. Applying the
+        # conversation again must start from what was already applied, not from the conversation's start.
+        repo = self.repo({"a.txt": "a\nb\nc\n", "b.txt": "x\n"})
+        git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t"]
+        self.fake_pi([answer("one"), SETTLED], pre="sed -i s/b/round-one/ a.txt")
+        first = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "conv", "one"))
+        self.assertEqual(self.cli("apply", first["run"]).returncode, 0)
+        subprocess.run([*git, "commit", "-qam", "round one"], check=True)
+        (repo / "b.txt").write_text("x\ncaller\n")  # the caller keeps working elsewhere
+        self.fake_pi([answer("two"), SETTLED], pre="sed -i s/round-one/round-two/ a.txt")
+        self.outcome(self.cli("reply", "conv", "two"))
+        applied = self.cli("apply", "conv")
+        self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+        self.assertEqual((repo / "a.txt").read_text(), "a\nround-two\nc\n")
+        self.assertEqual((repo / "b.txt").read_text(), "x\ncaller\n")
+        self.assertIn("no changes to apply", self.cli("apply", "conv").stderr)  # applying twice is harmless
 
     def test_generated_files_are_regenerated_after_apply_not_merged(self):
         repo = self.repo({"src.txt": "1\n2\n3\n", "gen/out.txt": "1\n2\n3\n"})
