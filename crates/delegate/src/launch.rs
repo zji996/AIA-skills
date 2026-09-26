@@ -284,6 +284,13 @@ pub fn read_prompt(o: &mut Options) -> Res<String> {
     }
     Ok(prompt)
 }
+const READ_ONLY_ZH: &str = "只读任务：不要创建、修改或删除任何文件；结束后会核对工作目录，改动不会被采纳，并会报告给委派方。用 delegate 委派子任务产生的记录在 git 忽略的目录里，不算改动，无需改动其存放位置。";
+const READ_ONLY_EN: &str = "Read-only task: do not create, modify or delete files; the working directory is checked afterwards, and any change is reported to the delegator and never adopted. Records of subtasks delegated with delegate live in git-ignored directories and do not count; leave their location as it is.";
+
+pub fn has_read_only_contract(prompt: &str) -> bool {
+    prompt.contains(READ_ONLY_ZH) || prompt.contains(READ_ONLY_EN)
+}
+
 pub fn contract(prompt: &str, accept: Option<&str>, read_only: bool, revoked: bool) -> String {
     let zh = prompt.chars().any(|c| {
         (0x3040..=0x30ff).contains(&(c as u32)) || (0x4e00..=0x9fff).contains(&(c as u32))
@@ -293,7 +300,7 @@ pub fn contract(prompt: &str, accept: Option<&str>, read_only: bool, revoked: bo
         notes.push(if zh{"完成标准有变：之前给出的验收命令不再适用。"}else{"The definition of done has changed: the earlier acceptance command no longer applies."}.to_string());
     }
     if read_only {
-        notes.push(if zh{"只读任务：不要创建、修改或删除任何文件；结束后会核对工作目录，改动不会被采纳，并会报告给委派方。用 delegate 委派子任务产生的记录在 git 忽略的目录里，不算改动，无需改动其存放位置。"}else{"Read-only task: do not create, modify or delete files; the working directory is checked afterwards, and any change is reported to the delegator and never adopted. Records of subtasks delegated with delegate live in git-ignored directories and do not count; leave their location as it is."}.to_string());
+        notes.push(if zh { READ_ONLY_ZH } else { READ_ONLY_EN }.to_string());
     }
     if let Some(a) = accept.filter(|x| !x.is_empty()) {
         let cmd = script().display().to_string();
@@ -343,10 +350,6 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         let (env, cfg) = worktree::config(top)?;
         extra["env"] = env;
         if o.worktree || (o.read_only && !o.in_place) {
-            let mut cfg = cfg;
-            if o.read_only && o.agent == "pi" {
-                cfg["setup"] = json!([]);
-            }
             extra["worktree"] = json!({"source":top,"sourceWorkdir":workdir,"config":cfg});
         }
     }
@@ -605,7 +608,7 @@ pub fn launch(
             } else {
                 o.accept.as_deref()
             },
-            mode == "read-only" && o.agent == "codex",
+            mode == "read-only" && (o.agent == "codex" || extra["worktree"].is_object()),
             false,
         )
     };

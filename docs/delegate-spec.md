@@ -164,9 +164,10 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 
 ## 5. 只读
 
-- Pi：以 `--tools read,grep,find,ls` 启动，没有写工具，也没有 shell。
+- **能隔离时**（在自己的 worktree 中，git 仓库的默认情况）：Pi 与 Codex 同等对待——全部工具（可运行 `git log`/`git diff` 与测试），任务说明末尾附只读约定（§7.3），结束后按快照核对。隔离与核对已兜底，工具限制不再必要。
+- **无法隔离时**（非 git 目录或 `--in-place`）：Pi 以 `--tools read,grep,find,ls` 启动（没有写工具，也没有 shell），不附约定；Codex 仍靠约定与（git 中的）事后核对。
 - Codex：以 full access 启动；任务说明末尾附只读约定（§7.3），结束后按快照核对。
-- 在 git 仓库中，只读 run **默认在 worktree 中运行**（§6.3），`--in-place` 除外。只读 worktree 的 HEAD 重置为主控的 HEAD（mixed），未提交改动在 `git diff HEAD` / `git status` 中可见。只读 Pi 的 worktree 不执行 `setup`。
+- 在 git 仓库中，只读 run **默认在 worktree 中运行**（§6.3），`--in-place` 除外。只读 worktree 的 HEAD 移到主控的 HEAD，**index 保持快照内容**（`git reset --soft`）：主控的未提交改动（含子模块指针）以已暂存的形式在 `git diff HEAD` / `git status` 中可见，又不影响结束时的快照比对。只读 worktree 与写入 worktree 一样执行 `setup`。
 - 核对：结束快照与起始快照有差异时，worktree 中记 `readOnlyViolation`（改动留在 worktree，不可 `apply`），原地记 `workspaceChanged`；两者都附 `warning`，state 仍为 `answered`/`delivered`。
 - 非 git 目录无法隔离与核对。
 
@@ -215,7 +216,7 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 Pi：
 ```
 pi (--session-id <uuid> | --fork <上一轮会话副本>) --session-dir <run>/session --mode json
-   [--provider P] [--model M] [--thinking T] [--tools read,grep,find,ls] -p [@<图片>...]   # stdin: prompt.md
+   [--provider P] [--model M] [--thinking T] [--tools read,grep,find,ls（仅无法隔离的只读）] -p [@<图片>...]   # stdin: prompt.md
 ```
 Codex：
 ```
@@ -232,7 +233,7 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 
 任务说明为中文（含 CJK 字符）时用中文附言，否则英文。以 `\n\n---\n` 与原文分隔：
 - 验收命令（未隐藏时）：说明"结束后委派方在工作目录运行此命令，退出码 0 视为完成"，附代码块，并提示自检时用 `<入口> lane <命令>` 排队、排队时间不计时。
-- Codex 只读：不得创建、修改、删除文件；改动会被报告且不被采纳；委派记录不算改动。
+- 只读约定（Codex 的一切只读 run，以及在 worktree 中的只读 Pi）：不得创建、修改、删除文件；改动会被报告且不被采纳；委派记录不算改动。升档时若 `prompt.md` 尚无这段约定才追加，不得重复。
 - reply 更改或取消验收命令时，说明旧标准不再适用。
 
 `prompt.md` 保存同事实际收到的全文。

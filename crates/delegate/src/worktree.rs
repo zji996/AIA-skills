@@ -152,7 +152,7 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<Option<String>> {
         return Ok(Some(format!("worktree setup failed: {}", clip(&e, 300))));
     }
     if s(meta, "mode") == "read-only" && !head.is_empty() {
-        let _ = git(&path, &["reset", "-q", &head]);
+        let _ = git(&path, &["reset", "-q", "--soft", &head]);
     }
     let copies = strings(&cfg["copy"]);
     let links = strings(&cfg["link"]);

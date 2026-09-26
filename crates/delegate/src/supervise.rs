@@ -216,10 +216,12 @@ fn escalate(
     }
     if s(meta, "mode") == "read-only" && strong == "codex" {
         let prompt = read(run.join("prompt.md"));
-        write(
-            run.join("prompt.md"),
-            launch::contract(&prompt, None, true, false),
-        )?;
+        if !launch::has_read_only_contract(&prompt) {
+            write(
+                run.join("prompt.md"),
+                launch::contract(&prompt, None, true, false),
+            )?;
+        }
     }
     meta["escalatedFrom"] = meta["agent"].clone();
     meta["agent"] = json!(strong);

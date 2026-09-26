@@ -136,8 +136,13 @@ for skill_md in "$REPO_ROOT/skills"/*/SKILL.md; do
   for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
     grep -qE "^[0-9a-f]{64}  $binary-$target\$" "$dir/bin.sha256" 2>/dev/null || missing+=" $target"
   done
+  version="$(sed -n '/^---$/,/^---$/p' "$skill_md" | sed -n 's/^[[:space:]]*version:[[:space:]]*//p' | head -1 | tr -d '"')"
+  crate_version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$REPO_ROOT/crates/$binary/Cargo.toml" 2>/dev/null | head -1)"
   if [ -n "$missing" ] || [ ! -f "$REPO_ROOT/crates/$binary/Cargo.toml" ]; then
     echo "  [FAIL] Binary $binary: bin.sha256 lacks${missing:- nothing} or crates/$binary is missing" >&2
+    errors=$((errors + 1))
+  elif [ "$crate_version" != "$version" ]; then
+    echo "  [FAIL] Binary $binary: crates/$binary is version $crate_version, the skill is $version" >&2
     errors=$((errors + 1))
   else
     echo "  [PASS] Binary checksums & source: $binary"

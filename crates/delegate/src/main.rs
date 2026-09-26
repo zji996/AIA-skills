@@ -1,6 +1,7 @@
 mod agents;
 mod changes;
 mod common;
+mod help;
 mod lane;
 mod launch;
 mod runs;
@@ -14,11 +15,52 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 fn status_line(run: &Path) -> String {
-    let mut status = runs::status(run);
-    let id = status["run"].clone();
-    status.as_object_mut().unwrap().remove("run");
-    let rest = status.to_string();
-    format!("{{\"run\":{},{}", id, &rest[1..])
+    let status = runs::status(run);
+    let keys = [
+        "run",
+        "name",
+        "state",
+        "agent",
+        "tier",
+        "mode",
+        "parent",
+        "worktree",
+        "elapsedSeconds",
+        "attempts",
+        "model",
+        "turns",
+        "files",
+        "changes",
+        "accept",
+        "readOnlyViolation",
+        "workspaceChanged",
+        "escalatedFrom",
+        "queuedSeconds",
+        "graceSeconds",
+        "tokens",
+        "warning",
+        "error",
+        "last",
+        "idleSeconds",
+        "result",
+        "resultChars",
+        "next",
+        "dir",
+    ];
+    let mut fields = Vec::new();
+    for key in keys {
+        if let Some(value) = status.get(key) {
+            fields.push(format!("\"{key}\":{value}"));
+        }
+    }
+    if let Some(object) = status.as_object() {
+        for (key, value) in object {
+            if !keys.contains(&key.as_str()) {
+                fields.push(format!("{}:{value}", json!(key)));
+            }
+        }
+    }
+    format!("{{{}}}", fields.join(","))
 }
 
 type Parsed = (Vec<String>, Vec<String>, Vec<(String, String)>);
@@ -298,7 +340,11 @@ fn stop(args: &[String]) -> Res<i32> {
     Ok(0)
 }
 fn diff(args: &[String]) -> Res<i32> {
-    let (pos, flags, _) = parse_simple(args, &["--stat", "--total"], &[])?;
+    let (options, separated_paths) = match args.iter().position(|arg| arg == "--") {
+        Some(index) => (&args[..index], &args[index + 1..]),
+        None => (args, &[][..]),
+    };
+    let (pos, flags, _) = parse_simple(options, &["--stat", "--total"], &[])?;
     let run = runs::resolve(pos.first().map(String::as_str).unwrap_or("last"))?;
     let (meta, top, mut before, after) = changes::chain_changes(&run)?;
     if has(&flags, "--total") {
@@ -319,6 +365,7 @@ fn diff(args: &[String]) -> Res<i32> {
     }
     cmd.args([&before, &after, "--"]);
     cmd.args(pos.iter().skip(1));
+    cmd.args(separated_paths);
     let status = cmd.status().map_err(|e| e.to_string())?;
     if !status.success() && run.join("changes.patch").is_file() && !has(&flags, "--total") {
         print!("{}", read(run.join("changes.patch")));
@@ -355,6 +402,29 @@ fn main_inner(args: &[String]) -> Res<i32> {
     let Some((command, rest)) = args.split_first() else {
         return Err("the following arguments are required: command".into());
     };
+    if command == "--version" {
+        println!("delegate {}", env!("CARGO_PKG_VERSION"));
+        return Ok(0);
+    }
+    if command == "--help" || command == "-h" {
+        help::print(None);
+        return Ok(0);
+    }
+    let help_requested = if command == "lane" {
+        let mut i = 0;
+        while rest.get(i).is_some_and(|arg| arg == "--label") {
+            i += 2;
+        }
+        rest.get(i)
+            .is_some_and(|arg| arg == "--help" || arg == "-h")
+    } else {
+        rest.iter()
+            .take_while(|arg| *arg != "--")
+            .any(|arg| arg == "--help" || arg == "-h")
+    };
+    if help_requested && help::print(Some(command)) {
+        return Ok(0);
+    }
     if command == "_supervise" {
         let run = rest.first().ok_or("missing run")?;
         supervise::supervise(Path::new(run))?;

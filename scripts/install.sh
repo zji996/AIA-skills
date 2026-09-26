@@ -202,8 +202,9 @@ install_copy() {
 
 echo "=== Installing AIA-skills ($MODE) ==="
 # A skill that declares `binary:` gets its prebuilt binary first, so a copy carries it too.
+# AIA_SKILLS_SKIP_BINARIES=1 leaves binaries alone (offline checks, tests of the installer itself).
 for skill in "${SELECTED_SKILLS[@]}"; do
-  if [ -n "$(frontmatter_value "$SKILLS_SRC/$skill/SKILL.md" binary)" ]; then
+  if [ -z "${AIA_SKILLS_SKIP_BINARIES:-}" ] && [ -n "$(frontmatter_value "$SKILLS_SRC/$skill/SKILL.md" binary)" ]; then
     "$REPO_ROOT/scripts/fetch-binary.sh" "$skill" || { echo "Skipping $skill: its binary is missing" >&2; exit 1; }
   fi
 done

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -110,6 +111,29 @@ class DelegateTests(unittest.TestCase):
         lines = [line for line in result.stdout.splitlines() if line.startswith('{"run"')]
         self.assertTrue(lines, result.stdout + result.stderr)
         return json.loads(lines[0])
+
+    def test_help_and_version_are_there_for_humans(self):
+        top = self.cli("--help")
+        self.assertEqual(top.returncode, 0, top.stderr)
+        for command in ("start", "run", "reply", "wait", "status", "result", "diff", "apply", "lane", "stop", "clean"):
+            self.assertIn(command, top.stdout)
+        for command, options in (("start", ("--tier", "--agent", "--read-only", "--accept", "--worktree", "--in-place")),
+                                 ("reply", ("--fresh", "--accept")), ("wait", ("--max", "--no-result")),
+                                 ("lane", ("--label",)), ("apply", ("--merge", "--dry-run"))):
+            result = self.cli(command, "--help")
+            self.assertEqual(result.returncode, 0, (command, result.stderr))
+            for option in options:
+                self.assertIn(option, result.stdout, command)
+        self.assertEqual(self.cli("-h").returncode, 0)
+        skill = (ROOT / "skills/delegate/SKILL.md").read_text()
+        version = re.search(r'^\s*version:\s*"?([\d.]+)', skill, re.M).group(1)
+        result = self.cli("--version")
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, f"delegate {version}"))
+
+    def test_outcome_line_leads_with_what_matters(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        line = next(l for l in self.cli("run", "--read-only", "task").stdout.splitlines() if l.startswith('{"run"'))
+        self.assertEqual(list(json.loads(line))[:3], ["run", "name", "state"])  # read at a glance, not alphabetically
 
     def test_answered_run_reports_once(self):
         write = {"type": "tool_execution_start", "toolName": "write", "args": {"path": "a.txt", "content": "x" * 5000}}
@@ -294,6 +318,7 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual((state["state"], state["attempts"]), ("answered", 2))
         self.assertIn("real answer", result.stdout)
         self.assertIn('"rerun"', (Path(state["dir"]) / "events.jsonl").read_text())
+        # Outside git nothing isolates or checks a read-only run: Pi keeps only its reading tools here.
         self.assertIn("--tools read,grep,find,ls", (self.work / "pi.log").read_text())
 
     def test_malformed_answers_fail_after_reruns(self):
@@ -537,7 +562,15 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual((repo / "a.txt").read_text(), "a\nuncommitted\ncaller\n")
         self.fake_pi([answer("ok"), SETTLED])
         pi = self.outcome(self.cli("run", "--read-only", "--workdir", repo, "review"))
-        self.assertFalse((Path(pi["worktree"]) / "setup-ran").exists())  # read-only Pi has no shell
+        # In its own worktree a read-only Pi is isolated and checked like Codex: full tools (git log/diff, tests),
+        # the boundary in writing, and the worktree set up for commands.
+        self.assertNotIn("--tools", (self.work / "pi.log").read_text().splitlines()[-1])
+        self.assertIn("Read-only task", (Path(pi["dir"]) / "prompt.md").read_text())
+        self.assertTrue((Path(pi["worktree"]) / "setup-ran").exists())
+        # Reading the live tree (--in-place) there is no isolation, so the tool limit comes back.
+        self.fake_pi([answer("ok"), SETTLED])
+        self.outcome(self.cli("run", "--read-only", "--in-place", "--workdir", repo, "review"))
+        self.assertIn("--tools read,grep,find,ls", (self.work / "pi.log").read_text().splitlines()[-1])
         cleaned = self.cli("clean", pi["run"]).stdout
         self.assertIn("removed", cleaned)
         self.assertNotIn("never applied", cleaned)  # a read-only worktree has nothing to merge
@@ -593,6 +626,7 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual((state["state"], state["agent"], state["tier"], state["escalatedFrom"], state["attempts"]),
                          ("answered", "codex", "strong", "pi", 2))
         self.assertIn("只读任务", (self.work / "pi.log.codex-prompt").read_text())  # Codex is told; Pi needed no words
+        self.assertEqual((self.work / "pi.log.codex-prompt").read_text().count("只读任务"), 1)
         self.assertIn("found it", (Path(state["dir"]) / "result.md").read_text())
         self.fake_codex(codex_events("more"))
         self.assertEqual(self.outcome(self.cli("reply", state["run"], "and?"))["agent"], "codex")
@@ -613,6 +647,12 @@ class DelegateTests(unittest.TestCase):
         self.fake_pi([answer(LEAKED), SETTLED])
         state = self.outcome(self.cli("run", "--agent", "pi", "--read-only", "--retries", "0", "task"))
         self.assertEqual((state["state"], state["agent"]), ("malformed", "pi"))
+        # In git the isolated Pi was told already; escalating must not say it twice.
+        self.fake_pi([answer(LEAKED), SETTLED])
+        self.fake_codex(codex_events("found it"))
+        state = self.outcome(self.cli("run", "--read-only", "--retries", "0", "--workdir", repo, "审查一下"))
+        self.assertEqual(state["escalatedFrom"], "pi")
+        self.assertEqual((self.work / "pi.log.codex-prompt").read_text().count("只读任务"), 1)
 
     def test_escalation_waits_for_room_in_the_strong_tier(self):
         del self.env["DELEGATE_STRONG_AGENT"]
@@ -711,6 +751,12 @@ class DelegateTests(unittest.TestCase):
         self.assertLess(result.stdout.index("===== changes"), result.stdout.index("===== result"))
         diff = self.cli("diff", "last").stdout
         self.assertIn("+theirs", diff)
+        # git-style path limiting, with or without the `--` separator
+        for args in (("diff", "last", "--", "dirty.txt"), ("diff", "last", "dirty.txt"), ("diff", "--", "dirty.txt")):
+            limited = self.cli(*args)
+            self.assertEqual(limited.returncode, 0, (args, limited.stderr))
+            self.assertIn("+theirs", limited.stdout, args)
+            self.assertNotIn("new.txt", limited.stdout, args)
         self.assertNotIn("+mine", diff)  # dirty before the run: not the agent's work
         self.assertEqual(subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--name-only"],
                                         capture_output=True, text=True).stdout, "")  # real index untouched
@@ -844,8 +890,7 @@ class DelegateTests(unittest.TestCase):
         self.assertIn("outlived the supervisor", self.cli("clean", "orphan").stderr)
         self.assertEqual(self.cli("start", "--name", "rival", "task").returncode, 2)  # still writing here
         self.cli("stop", "orphan")
-        time.sleep(0.3)
-        self.assertFalse(delegate_pid_alive(agent))
+        self.until(lambda: not delegate_pid_alive(agent), "the orphaned agent to go")  # not a fixed sleep: load varies
         self.assertIn("removed", self.cli("clean", "orphan").stdout)
 
     def test_snapshot_survives_undecodable_names_and_sees_submodules(self):
@@ -869,6 +914,30 @@ class DelegateTests(unittest.TestCase):
                                       "review"))
         self.assertEqual(state["workspaceChanged"], ["vendor"])
         self.assertIn(" M vendor  submodule contents", self.cli("wait", state["run"]).stdout)
+
+    def test_read_only_snapshot_keeps_uncommitted_submodule_pointers(self):
+        # The caller has moved a submodule forward without committing the pointer yet: a reader must see that,
+        # and must not be blamed for it (its worktree's index keeps the snapshot, only HEAD is the caller's).
+        repo = self.repo({"a.txt": "a\n"})
+        sub = self.work / "lib"
+        git = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always"]
+        subprocess.run(["git", "init", "-q", str(sub)], check=True)
+        (sub / "lib.txt").write_text("v1\n")
+        subprocess.run(["git", "-C", str(sub), *git, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(sub), *git, "commit", "-qm", "v1"], check=True)
+        subprocess.run(["git", "-C", str(repo), *git, "submodule", "add", "-q", str(sub), "vendor"], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-C", str(repo), *git, "commit", "-qm", "vendor"], check=True)
+        (repo / "vendor/lib.txt").write_text("v2\n")
+        subprocess.run(["git", "-C", str(repo / "vendor"), *git, "commit", "-qam", "v2"], check=True)
+        self.fake_codex(codex_events("looked"))
+        state = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "--workdir", repo, "review"))
+        self.assertEqual(state["state"], "answered")
+        for key in ("readOnlyViolation", "workspaceChanged", "warning"):
+            self.assertNotIn(key, state)
+        staged = subprocess.run(["git", "-C", state["worktree"], "diff", "--cached", "--name-only", "HEAD"],
+                                capture_output=True, text=True).stdout.split()
+        self.assertIn("vendor", staged)  # the new pointer shows against the caller's HEAD
 
     def test_worktree_in_a_repository_without_commits(self):
         repo = self.work / "fresh"
@@ -941,7 +1010,10 @@ def delegate_pid_alive(pid):
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    return Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z"
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:  # gone between the two checks
+        return False
 
 
 if __name__ == "__main__":

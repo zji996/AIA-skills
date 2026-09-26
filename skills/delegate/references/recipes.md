@@ -102,6 +102,7 @@ $D wait
 | 同事交付 `delivered`，但改法有问题 | 验收只证明命令通过。看 `diff`；把漏掉的情形补成测试再 `reply` |
 | `apply` 报子模块冲突或出现意外的子模块改动 | 同事为跑测试初始化了子模块。合并前在其 worktree 里 `git submodule deinit -f <路径>` 撤掉 |
 | worktree 里测试报找不到依赖或路径依赖 | 被忽略的依赖没带过去：在 `.delegate.json` 里 `link` 子模块、`setup` 装依赖 |
+| 便宜档的审查只看到现状、说不出"改了什么" | 它在非 git 目录或 `--in-place` 下运行：只读 Pi 此时没有 shell，跑不了 `git log`/`git diff`。去掉 `--in-place`（默认的快照里它有全部工具），或先把 diff 导出成文件交给它 |
 | 便宜档连续畸形 | 会话太长：`reply --fresh` 开新会话并写完整说明；或直接 `--tier strong` |
 | 被拒绝：并发已满 / 内存不足 | 先 `wait` 收结果或 `stop` 不再需要的任务；不要调大上限绕过 |
 | 验收在高负载时超时 | 重检查已整机排队且排队不计时；仍超时说明命令本身慢，调大 `--accept-timeout` |

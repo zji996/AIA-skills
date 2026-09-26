@@ -48,6 +48,8 @@ class ScriptTests(unittest.TestCase):
         self.work = Path(self.temp.name)
 
     def run_script(self, script, *args, env=None):
+        # The installer's own tests must not reach the network or a compiler for delegate's binary.
+        env = {**(env if env is not None else os.environ), "AIA_SKILLS_SKIP_BINARIES": "1"}
         return subprocess.run([str(script), *map(str, args)], cwd=self.work, env=env,
                               capture_output=True, text=True, timeout=15)
 

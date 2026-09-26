@@ -1,0 +1,149 @@
+const LAUNCH: &[(&str, &str)] = &[
+    ("words", "Prompt text (or use --prompt / --prompt-file)."),
+    ("--prompt TEXT", "Prompt text."),
+    ("--prompt-file FILE", "Read the prompt from FILE, or - for stdin."),
+    ("--tier cheap|strong", "Cheap: Pi for reading, summaries, copy, images; strong: Codex for code and rigorous review. Default: cheap for read-only, strong for writes. Failed cheap runs with no changes retry once at strong tier."),
+    ("--agent pi|codex", "Choose an agent directly; disables tier escalation."),
+    ("--name NAME", "Short label in the run id."),
+    ("--workdir DIR", "Agent working directory (default: cwd)."),
+    ("--image PATH", "Attach an image; repeatable, supported by both agents."),
+    ("--read-only", "No writes: isolated agents are instructed and checked; Pi uses read-only tools without isolation. In git, reads a worktree snapshot by default."),
+    ("--in-place", "Read-only: read the working tree instead of a snapshot."),
+    ("--accept COMMAND", "Shell command run in the workdir after the agent; exit 0 means delivered."),
+    ("--hide-accept", "Keep the acceptance command from the agent for blind verification."),
+    ("--accept-timeout DURATION", "Acceptance command limit (default: 10m)."),
+    ("--timeout DURATION", "Limit for each attempt (default: 15m Pi, 30m Codex)."),
+    ("--retries N", "Malformed-answer reruns, 0-3 (default: 1)."),
+    ("--provider NAME", "Pi provider override."),
+    ("--model NAME", "Agent model override."),
+    ("--thinking LEVEL", "Agent thinking level override."),
+    ("--allow-parallel-writes", "Allow concurrent write runs in one workdir."),
+    ("--worktree", "Write in a detached git worktree seeded from the current tree; merge with apply."),
+];
+
+const COLLECT: &[(&str, &str)] = &[
+    (
+        "--max DURATION",
+        "Stop waiting after this long; exit 75 if still running.",
+    ),
+    ("--progress", "Also print writes, errors, and retries."),
+    ("--full", "Print the whole answer instead of its tail."),
+];
+
+const REPLY: &[(&str, &str)] = &[
+    ("run", "Finished parent run to continue."),
+    ("words", "Follow-up message (or use --prompt / --prompt-file)."),
+    ("--prompt TEXT", "Follow-up message text."),
+    ("--prompt-file FILE", "Read the message from FILE, or - for stdin."),
+    ("--name NAME", "Short label in the new run id."),
+    ("--image PATH", "Attach an image; repeatable."),
+    ("--accept COMMAND", "Replace the parent's acceptance command; '' removes it."),
+    ("--hide-accept", "Keep the acceptance command from the agent."),
+    ("--accept-timeout DURATION", "Acceptance command limit (default: 10m)."),
+    ("--timeout DURATION", "Limit for the attempt (default: 15m Pi, 30m Codex)."),
+    ("--fresh", "Start a new session in the same workdir/worktree and conversation; message must stand alone."),
+];
+
+const COMMANDS: &[(&str, &str)] = &[
+    ("start", "Launch in the background and return at once."),
+    ("run", "Start, then wait for the outcome and answer."),
+    ("reply", "Continue a finished run's conversation."),
+    ("wait", "Wait for runs; print outcomes and answers."),
+    ("status", "Print one JSON status line per run."),
+    ("list", "Alias of status."),
+    ("result", "Print a run's full answer."),
+    ("diff", "Show a run's changes as a git diff."),
+    (
+        "apply",
+        "Merge a worktree conversation into the source tree.",
+    ),
+    ("lane", "Queue a heavy command with other machine checks."),
+    ("stop", "Terminate runs."),
+    ("clean", "Delete finished runs."),
+];
+
+fn options(rows: &[(&str, &str)]) {
+    for (name, description) in rows {
+        let mut line = format!("  {name:<26} ");
+        let indent = " ".repeat(29);
+        for word in description.split_whitespace() {
+            if line.len() + word.len() + 1 > 100 && line.len() > indent.len() {
+                println!("{}", line.trim_end());
+                line = indent.clone();
+            }
+            line.push_str(word);
+            line.push(' ');
+        }
+        println!("{}", line.trim_end());
+    }
+}
+
+pub fn print(command: Option<&str>) -> bool {
+    let Some(command) = command else {
+        println!("Usage: delegate [-h] [--version] <command> [options]\n");
+        println!("Delegate atomic tasks to Pi (Gemini) or Codex (GPT); judge them by results.\n");
+        println!("Commands:");
+        options(COMMANDS);
+        println!("\nOptions:");
+        options(&[
+            ("-h, --help", "Show this help."),
+            ("--version", "Show the Cargo package version."),
+        ]);
+        println!("\nStates: running | delivered (accept passed) | answered (no --accept) | rejected (accept failed) | malformed (empty or leaked tool call after reruns) | failed | timeout | killed | stopped | crashed.");
+        println!(
+            "Exit: 0 delivered/answered, 1 other finished, 2 usage, 75 still running at --max."
+        );
+        println!("Runs: $DELEGATE_RUNS or <git root of cwd>/.local/run/pi.");
+        return true;
+    };
+    let (usage, description, rows): (&str, &str, &[(&str, &str)]) = match command {
+        "start" => ("[options] [words ...]", "Launch in the background and return at once.", LAUNCH),
+        "run" => ("[options] [words ...]", "Start, then wait for the outcome and answer.", LAUNCH),
+        "reply" => ("[options] run [words ...]", "Continue a finished run with the same agent, workdir, and worktree.", REPLY),
+        "wait" => ("[options] [runs ...]", "Wait for runs and print outcomes and answers.", &[
+            ("runs", "Run ids or directories (default: active and undelivered runs)."),
+            ("--all", "Active and finished unreported runs (the default)."),
+            ("--no-result", "Print only the outcome line."),
+        ]),
+        "status" | "list" => ("[runs ...]", "Print one JSON status line per run.", &[
+            ("runs", "Run ids or directories (default: all runs)."),
+        ]),
+        "result" => ("[--path] [run]", "Print a run's full answer.", &[
+            ("run", "Run id or directory (default: last)."),
+            ("--path", "Print the result file path instead of its contents."),
+        ]),
+        "diff" => ("[--stat] [--total] [run] [--] [paths...]", "Show a run's changes as a git diff.", &[
+            ("run", "Run id or directory (default: last)."),
+            ("paths", "Limit the diff to these paths."),
+            ("--stat", "Show diff statistics."),
+            ("--total", "Show the whole conversation, not only this run."),
+        ]),
+        "apply" => ("[--merge] [--dry-run] [run]", "Merge a worktree conversation into the source working tree.", &[
+            ("run", "Run id or directory (default: last)."),
+            ("--merge", "Write conflict markers instead of stopping."),
+            ("--dry-run", "Check the merge without writing it."),
+        ]),
+        "lane" => ("[--label TEXT] [command ...]", "Queue a heavy command with acceptance checks, worktree setup, and other machine checks. DELEGATE_MAX_HEAVY run at once (default: 1). One argument is a shell command; no command lists the lane.", &[
+            ("--label TEXT", "Label shown in the lane listing."),
+            ("command", "Command and arguments to run; omit to list the lane."),
+        ]),
+        "stop" => ("runs ...", "Terminate one or more runs.", &[
+            ("runs", "One or more run ids or directories."),
+        ]),
+        "clean" => ("[--finished] [--force] [runs ...]", "Delete finished runs.", &[
+            ("runs", "Run ids or directories to remove."),
+            ("--finished", "Select all finished runs that have been reported."),
+            ("--force", "With --finished, also select unreported finished runs."),
+        ]),
+        _ => return false,
+    };
+    println!("Usage: delegate {command} {usage}\n");
+    println!("{description}\n");
+    println!("Options:");
+    options(&[("-h, --help", "Show this help.")]);
+    options(rows);
+    if matches!(command, "run" | "reply" | "wait") {
+        options(COLLECT);
+    }
+    true
+}

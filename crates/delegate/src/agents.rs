@@ -240,7 +240,7 @@ fn command(meta: &Value, session: Option<&str>) -> Vec<String> {
                 a.extend([format!("--{key}"), s(meta, key).into()]);
             }
         }
-        if s(meta, "mode") == "read-only" {
+        if s(meta, "mode") == "read-only" && !meta["worktree"].is_object() {
             a.extend(["--tools".into(), "read,grep,find,ls".into()]);
         }
         a.push("-p".into());
