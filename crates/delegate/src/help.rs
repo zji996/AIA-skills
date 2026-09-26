@@ -46,6 +46,7 @@ const REPLY: &[(&str, &str)] = &[
     ("--accept-timeout DURATION", "Acceptance command limit (default: 10m)."),
     ("--timeout DURATION", "Limit for the attempt (default: 15m Pi, 30m Codex)."),
     ("--fresh", "Start a new session in the same workdir/worktree and conversation; message must stand alone."),
+    ("--sync", "Merge the caller's later changes into the conversation worktree before replying; conflicts stop the reply."),
     ("--agent pi|codex", "Hand the conversation to this agent; a change of agent starts a fresh session."),
     ("--tier cheap|strong", "Hand the conversation to this tier; a change of agent starts a fresh session."),
 ];
@@ -109,6 +110,7 @@ pub fn print(command: Option<&str>) -> bool {
         "wait" => ("[options] [runs ...]", "Wait for runs and print outcomes and answers.", &[
             ("runs", "Run ids or directories (default: active and undelivered runs)."),
             ("--all", "Active and finished unreported runs (the default)."),
+            ("--machine", "Collect active and waiting runs registered across all repositories on this machine."),
             ("--no-result", "Print only the outcome line."),
         ]),
         "status" | "list" => ("[runs ...]", "Print one JSON status line per run.", &[

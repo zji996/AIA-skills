@@ -1,4 +1,4 @@
-# delegate 规格（v5.2）
+# delegate 规格（v5.3）
 
 > 本文是 `skills/delegate` 的**实现契约**：命令行、输出、run 目录、锁与状态机。它是 Rust 重写与 harness 原生接入的依据。
 > 本文不在技能目录内，技能加载时不会读取；模型使用技能只需 `SKILL.md`。行为以本文为准，实现与本文不一致时按缺陷处理。
@@ -262,6 +262,10 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 
 接在对话**最新一轮**之后（结局为 `malformed` 的轮次跳过）；可用 `--agent`/`--tier` 换一位同事（agent 改变即隐含 `--fresh`，新消息须自足），否则同一 agent、workdir、worktree、mode、env、provider/model/thinking、retries。每次尝试都从上一轮会话**分叉**（Pi 用会话文件副本 `--fork`，Codex `exec fork`），上一轮会话永不改动。`--fresh` 开新会话但留在同一对话与 worktree。同一轮已有进行中的 reply 时拒绝。
 
+### 7.5 reply --sync（必须）
+
+`reply <run> --sync` 仅适用于 worktree 对话。启动下一轮前，以对话起点快照（有最近一次完整 apply 或同步基准时用该基准）、源工作区当前快照与 worktree 当前状态做三方合并，只同步主控后来产生、尚未进入对话的改动。任一文件冲突时不写入 worktree、不启动同事，退出码 2，stderr 列出冲突路径。成功时新一轮的起始快照取同步后的 worktree，同步文件不计入该轮同事的 `files`；run 目录的 `sync.json` 记录同步文件列表，任务说明末尾按说明语言附同步提示；`.sync-base` 记录后续 apply 使用的合并基准，同步不创建 `.applied`，完整 apply 后同时推进两者。原地对话使用 `--sync` 为用法错误。
+
 ## 8. lane：整机重任务队列（必须）
 
 - 同时放行 `DELEGATE_MAX_HEAVY`（默认 1，0 不限）个；先到先得。
@@ -296,7 +300,7 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 
 ### 9.5 等待（`wait`/`run`）
 
-阻塞在各 run 的 `supervisor.lock` 共享锁上（每个一个线程），`--max` 到期即返回。仅在 `--progress`、supervisor 尚未加锁（刚启动）或 4.4 之前的 run 时按 `DELEGATE_POLL`（默认 1 秒）轮询。
+阻塞在各 run 的 `supervisor.lock` 共享锁上（每个一个线程），`--max` 到期即返回。`wait --machine` 在调用开始时从 `<state>` 的 slot 读取整机运行中或等待中的 run 目录并固定该列表（之后 slot 被清理不影响本次收取），跨仓库收取；不带 `--machine` 时只收取当前仓库的 run。仅在 `--progress`、supervisor 尚未加锁（刚启动）或 4.4 之前的 run 时按 `DELEGATE_POLL`（默认 1 秒）轮询。
 
 ## 10. 并发、准入与清理
 

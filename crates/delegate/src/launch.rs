@@ -37,6 +37,7 @@ pub struct Options {
     pub thinking: Option<String>,
     pub parallel: bool,
     pub fresh: bool,
+    pub sync: bool,
     pub max: Option<f64>,
     pub progress: bool,
     pub full: bool,
@@ -146,6 +147,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--hide-accept" => o.hide_accept = true,
                 "--allow-parallel-writes" => o.parallel = true,
                 "--fresh" => o.fresh = true,
+                "--sync" if reply => o.sync = true,
                 "--progress" => o.progress = true,
                 "--full" => o.full = true,
                 "--" => {
@@ -188,8 +190,8 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
         {
             return Err("unrecognized reply option".into());
         }
-    } else if o.fresh {
-        return Err("--fresh is only for reply".into());
+    } else if o.fresh || o.sync {
+        return Err("--fresh and --sync are only for reply".into());
     }
     if o.in_run.is_some() && !o.read_only {
         return Err("--in requires --read-only".into());
@@ -458,6 +460,17 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
             parent.file_name().unwrap_or_default().to_string_lossy()
         ));
     }
+    if o.sync {
+        let parent_name = parent.file_name().unwrap_or_default().to_string_lossy();
+        if let Some(existing) = all_runs().into_iter().find(|run| {
+            s(&json(run.join("meta.json")), "parent") == parent_name && state(run) != "malformed"
+        }) {
+            return Err(format!(
+                "{parent_name} already has a reply ({}); wait for it and reply to that",
+                existing.file_name().unwrap_or_default().to_string_lossy()
+            ));
+        }
+    }
     let requested = o.agent.clone();
     let requested_tier = o.tier.clone();
     if !requested.is_empty() && requested_tier.is_some() {
@@ -534,8 +547,39 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         o.accept = None;
     }
     let prompt = read_prompt(&mut o)?;
+    if o.sync && !meta["worktree"].is_object() {
+        return Err("--sync requires a worktree conversation".into());
+    }
+    let synced = if o.sync {
+        Some(worktree::sync(&parent, &meta)?)
+    } else {
+        None
+    };
+    let prompt = if let Some(paths) = &synced {
+        if prompt
+            .chars()
+            .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+        {
+            format!(
+                "{}\n\n主控在上一轮之后的改动已同步进工作目录：{}",
+                prompt.trim_end(),
+                if paths.is_empty() {
+                    "（无）".to_string()
+                } else {
+                    paths.join("、")
+                }
+            )
+        } else {
+            format!("{}\n\nThe caller's changes since the previous round have been synced into the workdir: {}", prompt.trim_end(), if paths.is_empty() { "(none)".to_string() } else { paths.join(", ") })
+        }
+    } else {
+        prompt
+    };
     let mut extra =
         json!({"parent":meta,"session":session,"env":meta["env"],"worktree":meta["worktree"]});
+    if let Some(paths) = synced {
+        extra["sync"] = json!({"files":paths});
+    }
     if extra["worktree"].is_null() {
         extra.as_object_mut().unwrap().remove("worktree");
     }
@@ -555,11 +599,10 @@ pub fn active_machine(slots: &Path) -> Vec<PathBuf> {
             let p = e.path();
             if p.extension().is_some_and(|x| x == "slot") {
                 let run = PathBuf::from(read(&p).trim());
-                if run.join("meta.json").is_file()
-                    && !run.join(".waiting").exists()
-                    && (active(&state(&run)) || agent_alive(&run))
-                {
-                    out.push(run);
+                if run.join("meta.json").is_file() && (active(&state(&run)) || agent_alive(&run)) {
+                    if !run.join(".waiting").exists() {
+                        out.push(run);
+                    }
                 } else {
                     let _ = fs::remove_file(p);
                 }
@@ -567,6 +610,18 @@ pub fn active_machine(slots: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+pub fn machine_runs(slots: &Path) -> Vec<PathBuf> {
+    let _guard = lock(&slots.join(".start.lock"), true, false).ok();
+    let Ok(entries) = fs::read_dir(slots) else {
+        return vec![];
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "slot"))
+        .map(|entry| PathBuf::from(read(entry.path()).trim()))
+        .filter(|run| run.join("meta.json").is_file() && active(&state(run)))
+        .collect()
 }
 pub fn capacity(agent: &str, active_runs: &[PathBuf]) -> Res<()> {
     let total = number("MAX_ACTIVE", 8)?;
@@ -824,7 +879,13 @@ pub fn launch(
         top.unwrap_or_default()
     };
     let applied_base = if parent.is_object() {
-        let state = json(Path::new(s(parent, "dir")).join(".applied"));
+        let parent_dir = Path::new(s(parent, "dir"));
+        let synced = json(parent_dir.join(".sync-base"));
+        let state = if !s(&synced, "tree").is_empty() {
+            synced
+        } else {
+            json(parent_dir.join(".applied"))
+        };
         if !s(&state, "tree").is_empty() {
             state
         } else {
@@ -835,6 +896,9 @@ pub fn launch(
     };
     let meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":seconds(o.timeout.as_deref().unwrap_or("15m"))?,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
     write_json(run.join("meta.json"), &meta)?;
+    if !extra["sync"].is_null() {
+        write_json(run.join("sync.json"), &extra["sync"])?;
+    }
     if deferred {
         touch(run.join(".waiting"));
     }
@@ -842,12 +906,10 @@ pub fn launch(
     let hash = sha1_smol::Sha1::from(run.to_string_lossy().as_bytes())
         .digest()
         .to_string();
-    if !deferred {
-        write(
-            slots.join(format!("{}.slot", &hash[..16])),
-            format!("{}\n", run.display()),
-        )?;
-    }
+    write(
+        slots.join(format!("{}.slot", &hash[..16])),
+        format!("{}\n", run.display()),
+    )?;
     let log = File::create(run.join("supervisor.log")).map_err(|e| e.to_string())?;
     let mut c = Command::new(script());
     c.arg("_supervise")

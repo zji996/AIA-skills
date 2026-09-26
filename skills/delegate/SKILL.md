@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "5.2.1"
+  version: "5.3.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -33,9 +33,10 @@ $D wait                                                                         
 | 独立审查、第二意见 | `$D start --read-only --tier strong "…"`（多路并行时各起一个，按子系统拆开） |
 | 看截图或设计图 | `$D start --read-only --image shot.png "…"` |
 | 改代码，测试通过才算完 | `$D run --worktree --accept "make check" "…"`，满意后 `$D apply <name>`；不许同事碰的路径加 `--protect tests/ --protect docs/spec.md` |
-| 接着上一轮追问或返工 | `$D reply <name> "…"`（同一会话、同一 worktree）；开新会话加 `--fresh`；换一位同事接着改加 `--agent codex` |
+| 接着上一轮追问或返工 | `$D reply <name> "…"`（同一会话、同一 worktree）；开新会话加 `--fresh`；换一位同事接着改加 `--agent codex`；你之后又改了代码（比如补了测试）想让它看到，加 `--sync` |
 | 先 A 后 B | `$D start --after <A> …`；审 A 的结果加 `--in <A> --read-only` |
 | 自己跑重检查 | `$D lane make check`（与同事的验收排队，一次一个） |
+| 同时在几个仓库派了任务 | 放一个后台 `$D wait --machine`，整机的都会收到 |
 | 看改了什么 / 停掉 / 清理 | `$D diff <name>` / `$D stop <name>` / `$D clean --finished` |
 
 多行说明用 `--prompt-file -` 加 heredoc；总加 `--name`，之后用它指代整段对话。更多完整示例、任务说明模板与常见坑见 [references/recipes.md](references/recipes.md)。
@@ -57,7 +58,7 @@ $D wait                                                                         
 
 以下来自实际使用，是建议而非规则，按具体情况取舍。
 
-- **续接还是新开**：返工建立在它已有理解上（审查意见、补测试）时，`reply` 通常最省事，不必重读材料。会话很长、答复开始畸形或方向已变，`--fresh` 往往更好。worktree 是启动时的快照，你之后在自己工作区做的改动（比如新写的测试）它看不到，这种时候另起 `start` 更合适。
+- **续接还是新开**：返工建立在它已有理解上（审查意见、补测试）时，`reply` 通常最省事，不必重读材料。会话很长、答复开始畸形或方向已变，`--fresh` 往往更好。worktree 是启动时的快照，你之后在自己工作区做的改动（比如新写的测试）它看不到，这时 `reply --sync` 可以把它们同步进去再续接。
 - **什么时候自己改**：根因已经定位、改动很小、你清楚该怎么改时，自己改常常更快——派发、等待、审查、合并有固定开销。同一个问题返工一两轮仍不见好转，也值得考虑接手。需要只有你知道的背景时，先自己做，等能写成自足的说明再派。
 - **两档怎么搭配**：同题对比中，Pi 找到的具体代码事实更多、但偶有把现状说混；Codex 更准确、风险意识更强。分量重的审查可以两路并行、由你合并，效果通常好于任一方。
 - **审查类说明**：给出重点，但注明不限于此；给待证伪的假设，而不是结论；请它为关于现状的断言附上 `文件:行号`，能让说错的地方当场暴露。

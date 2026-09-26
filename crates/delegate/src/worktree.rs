@@ -376,6 +376,10 @@ struct Action {
     content: Vec<u8>,
 }
 fn applied_state(run: &Path, meta: &Value) -> Value {
+    let state = json(run.join(".sync-base"));
+    if !s(&state, "tree").is_empty() {
+        return state;
+    }
     let state = json(run.join(".applied"));
     if !s(&state, "tree").is_empty() {
         return state;
@@ -383,6 +387,10 @@ fn applied_state(run: &Path, meta: &Value) -> Value {
     let mut parent = s(meta, "parent").to_string();
     while !parent.is_empty() {
         let path = run.parent().unwrap_or(Path::new("/")).join(&parent);
+        let state = json(path.join(".sync-base"));
+        if !s(&state, "tree").is_empty() {
+            return state;
+        }
         let state = json(path.join(".applied"));
         if !s(&state, "tree").is_empty() {
             return state;
@@ -402,6 +410,153 @@ fn file_hash(path: &Path) -> Res<String> {
         }
         hash.update(&buffer[..size]);
     }
+}
+pub fn sync(run: &Path, meta: &Value) -> Res<Vec<String>> {
+    let source = PathBuf::from(s(&meta["worktree"], "source"));
+    let worktree = PathBuf::from(s(&meta["worktree"], "path"));
+    let exclude = strings(&meta["snapshotExclude"]);
+    let current_source = snapshot(&source, run, &exclude)
+        .ok_or_else(|| format!("cannot snapshot {} for --sync", source.display()))?;
+    let applied = applied_state(run, meta);
+    let baseline = if !s(&applied, "tree").is_empty() {
+        applied
+    } else {
+        json!({"tree":s(meta,"chainBase"),"large":{}})
+    };
+    let changes = tree_changes(&source, &baseline, &current_source, false)?;
+    let mut actions = vec![];
+    let mut conflicts = vec![];
+    let mut paths = vec![];
+    for change in changes {
+        let path = s(&change, "path").to_string();
+        let target = worktree.join(&path);
+        if through_symlink(&worktree, &target) || entry_mode(&target).as_deref() == Some("dir") {
+            conflicts.push(path);
+            continue;
+        }
+        if b(&change, "submodule") {
+            conflicts.push(path);
+            continue;
+        }
+        if b(&change, "large") {
+            let origin = source.join(&path);
+            let content = current(&origin);
+            if content == current(&target) {
+                continue;
+            }
+            if baseline["large"].get(&path).is_some() || target.exists() || target.is_symlink() {
+                conflicts.push(path);
+            } else if let Some(content) = content {
+                paths.push(path.clone());
+                actions.push(Action {
+                    kind: "copied".into(),
+                    path,
+                    target,
+                    mode: entry_mode(&origin),
+                    content,
+                });
+            } else {
+                conflicts.push(path);
+            }
+            continue;
+        }
+        let (old_mode, old) = blob(&source, s(&baseline, "tree"), &path)?;
+        let (mode, new) = blob(&source, s(&current_source, "tree"), &path)?;
+        let now = current(&target);
+        let now_mode = entry_mode(&target);
+        let valid = |x: &Option<String>| {
+            x.as_deref()
+                .is_none_or(|v| ["100644", "100755", "120000"].contains(&v))
+        };
+        if !valid(&old_mode) || !valid(&mode) {
+            conflicts.push(path);
+        } else if now == new && now_mode == mode {
+            continue;
+        } else if now == old && (now_mode == old_mode || now_mode == mode) {
+            paths.push(path.clone());
+            actions.push(Action {
+                kind: if new.is_none() { "deleted" } else { "applied" }.into(),
+                path,
+                target,
+                mode,
+                content: new.unwrap_or_default(),
+            });
+        } else if let (Some(base), Some(theirs), Some(mine)) = (&old, &new, &now) {
+            if [old_mode.as_deref(), mode.as_deref(), now_mode.as_deref()].contains(&Some("120000"))
+                || base.contains(&0)
+                || theirs.contains(&0)
+                || mine.contains(&0)
+            {
+                conflicts.push(path);
+                continue;
+            }
+            let scratch = run.join(format!(".sync-merge-{}", std::process::id()));
+            fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+            let minefile = scratch.join("mine");
+            write(&minefile, mine)?;
+            let basefile = scratch.join("base");
+            write(&basefile, base)?;
+            let theirfile = scratch.join("theirs");
+            write(&theirfile, theirs)?;
+            let output = Command::new("git")
+                .arg("merge-file")
+                .args(["-L", "worktree", "-L", "base", "-L", "caller"])
+                .args([&minefile, &basefile, &theirfile])
+                .output()
+                .map_err(|e| e.to_string())?;
+            let merged = fs::read(&minefile).map_err(|e| e.to_string())?;
+            let _ = fs::remove_dir_all(scratch);
+            if output.status.success() {
+                paths.push(path.clone());
+                actions.push(Action {
+                    kind: "merged".into(),
+                    path,
+                    target,
+                    mode: if old_mode != mode { mode } else { None },
+                    content: merged,
+                });
+            } else {
+                conflicts.push(path);
+            }
+        } else {
+            conflicts.push(path);
+        }
+    }
+    if !conflicts.is_empty() {
+        return Err(format!("--sync conflict in: {}", conflicts.join(", ")));
+    }
+    for action in actions {
+        if action.kind == "deleted" {
+            fs::remove_file(&action.target).map_err(|e| e.to_string())?;
+        } else if let Some(mode) = action.mode.as_deref() {
+            write_entry(&action.target, mode, &action.content)?;
+        } else {
+            write(&action.target, &action.content)?;
+        }
+    }
+    let mut large_hashes = serde_json::Map::new();
+    if let Some(large) = current_source["large"].as_object() {
+        for path in large.keys() {
+            large_hashes.insert(path.clone(), json!(file_hash(&source.join(path))?));
+        }
+    }
+    let state = json!({"at":iso(),"tree":current_source["tree"],"large":current_source["large"],"largeHashes":large_hashes});
+    let mut chain = run.to_path_buf();
+    loop {
+        write_json(chain.join(".sync-base"), &state)?;
+        let parent = s(&json(chain.join("meta.json")), "parent").to_string();
+        if parent.is_empty()
+            || !chain
+                .parent()
+                .unwrap_or(Path::new("/"))
+                .join(&parent)
+                .is_dir()
+        {
+            break;
+        }
+        chain = chain.parent().unwrap().join(parent);
+    }
+    Ok(paths)
 }
 pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
     let (meta, mut top, _, mut after) = chain_changes(run)?;
@@ -672,6 +827,7 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
         let mut chain = run.to_path_buf();
         loop {
             write_json(chain.join(".applied"), &state)?;
+            write_json(chain.join(".sync-base"), &state)?;
             let parent = s(&json(chain.join("meta.json")), "parent").to_string();
             if parent.is_empty()
                 || !chain

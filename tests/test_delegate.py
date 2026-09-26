@@ -1073,6 +1073,54 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual((repo / "b.txt").read_text(), "x\ncaller\n")
         self.assertIn("no changes to apply", self.cli("apply", "conv").stderr)  # applying twice is harmless
 
+    def test_reply_sync_brings_the_callers_later_work_into_the_worktree(self):
+        # The caller wrote a test after the run started; `reply --sync` lets the colleague see it, and the
+        # caller's own work is not merged back twice.
+        repo = self.repo({"a.txt": "a\n", "b.txt": "b\n"})
+        self.fake_pi([answer("one"), SETTLED], pre="echo agent >> a.txt")
+        self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "conv", "one"))
+        (repo / "tests").mkdir()
+        (repo / "tests/new.txt").write_text("new test\n")
+        (repo / "b.txt").write_text("b\ncaller\n")
+        self.fake_pi([answer("two"), SETTLED], pre="cat tests/new.txt b.txt > seen.txt")
+        second = self.outcome(self.cli("reply", "conv", "--sync", "use the new test"))
+        self.assertEqual(second["state"], "answered")
+        self.assertEqual((Path(second["worktree"]) / "seen.txt").read_text(), "new test\nb\ncaller\n")
+        self.assertEqual(sorted(second["files"]), ["seen.txt"])  # synced files are the caller's, not its work
+        applied = self.cli("apply", "conv")
+        self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+        self.assertEqual((repo / "a.txt").read_text(), "a\nagent\n")
+        self.assertEqual((repo / "b.txt").read_text(), "b\ncaller\n")
+        self.assertTrue((repo / "seen.txt").exists())
+        # A sync that would conflict stops before the colleague starts, leaving the worktree as it was.
+        self.fake_pi([answer("three"), SETTLED], pre="echo agent2 >> a.txt")
+        self.outcome(self.cli("reply", "conv", "three"))
+        (repo / "a.txt").write_text("a\nagent\ncaller-too\n")
+        calls = len((self.work / "pi.log").read_text().splitlines())
+        refused = self.cli("reply", "conv", "--sync", "four")
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("conflict", refused.stderr)
+        self.assertIn("a.txt", refused.stderr)
+        self.assertEqual(len((self.work / "pi.log").read_text().splitlines()), calls)
+
+    def test_wait_machine_collects_runs_from_every_repository(self):
+        del self.env["DELEGATE_RUNS"]  # records live under each repository, as in real use
+        self.fake_pi([answer("done"), SETTLED], sleep=1)
+        names = []
+        for name in ("alpha", "beta"):
+            repo = self.work / name
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            self.assertEqual(self.cli("start", "--read-only", "--name", name, "task", cwd=repo).returncode, 0)
+            names.append(name)
+        elsewhere = self.work / "elsewhere"
+        elsewhere.mkdir()
+        self.assertIn("no active or undelivered runs", self.cli("wait", cwd=elsewhere).stderr)  # local only
+        result = self.cli("wait", "--machine", cwd=elsewhere, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        got = sorted(json.loads(l)["name"] for l in result.stdout.splitlines() if l.startswith('{"run"'))
+        self.assertEqual(got, names)
+
     def test_generated_files_are_regenerated_after_apply_not_merged(self):
         repo = self.repo({"src.txt": "1\n2\n3\n", "gen/out.txt": "1\n2\n3\n"})
         (repo / ".delegate.json").write_text(json.dumps({"generated": {"paths": ["gen/"],

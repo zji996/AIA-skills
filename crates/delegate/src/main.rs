@@ -395,6 +395,9 @@ fn apply(args: &[String]) -> Res<i32> {
         for other in runs::all_runs() {
             if s(&json(other.join("meta.json"))["worktree"], "path") == path {
                 let _ = write(other.join(".applied"), read(run.join(".applied")));
+                if run.join(".sync-base").is_file() {
+                    let _ = write(other.join(".sync-base"), read(run.join(".sync-base")));
+                }
             }
         }
     }
@@ -472,11 +475,23 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "wait" => {
             let (pos, flags, kv) = parse_simple(
                 rest,
-                &["--all", "--no-result", "--full", "--progress"],
+                &["--all", "--machine", "--no-result", "--full", "--progress"],
                 &["--max"],
             )?;
             let max = value(&kv, "--max").map(seconds).transpose()?;
-            let list = if has(&flags, "--all") || pos.is_empty() {
+            if has(&flags, "--machine") && !pos.is_empty() {
+                return Err("--machine does not take run arguments".into());
+            }
+            let list = if has(&flags, "--machine") {
+                let mut v = launch::machine_runs(&state_dir());
+                v.sort();
+                v.dedup();
+                if v.is_empty() {
+                    eprintln!("delegate: no active or undelivered runs");
+                    return Ok(0);
+                }
+                v
+            } else if has(&flags, "--all") || pos.is_empty() {
                 let v = runs::all_runs()
                     .into_iter()
                     .filter(|r| runs::active(&runs::state(r)) || !r.join(".delivered").exists())
