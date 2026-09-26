@@ -20,7 +20,7 @@ usage: bootstrap.sh [--dir <path>] [--ref <branch|tag>] [--github | --source <gi
                   Pi settings and packages (pi-kit --additive); needed by delegate
   --with-pi-sync  same, but apply pi-kit's full declarative setup (pi-kit --sync)
 Remaining arguments go to scripts/install.sh, e.g. --copy, --force or skill names.
-Set PI_KIT_MIRROR=cn to force npm mirrors in Mainland China.
+Set PI_KIT_MIRROR=cn to force npm mirrors (npmmirror).
 Re-running the same command updates an existing checkout.
 EOF
   exit 2

@@ -55,7 +55,7 @@ curl -fsSL <上面任一链接> | bash -s -- --with-pi                 # 同时�
 
 - `--with-pi`：拉取子模块并运行 `pi-kit --additive`，安装或升级 Pi 与 pi-kit 管理的 Pi 包，不改动现有设置；没有 Node.js 22.19+ 时会免 root 安装便携版。完成后提示是否缺少 `python3`。
 - `--with-pi-sync`：改为运行 `pi-kit --sync`，应用 pi-kit 的完整声明式配置，保留 `defaultProvider`、`defaultModel` 等本机设置。
-- 中国大陆网络可设置 `PI_KIT_MIRROR=cn` 强制使用 npmmirror。
+- 需要镜像加速时可设置 `PI_KIT_MIRROR=cn` 强制使用 npmmirror。
 
 修改 pi-kit 时直接在 `third_party/pi-kit` 中提交，并先推送 pi-kit；然后在本仓库提交子模块指针，否则别人拉不到指针指向的提交。
 
