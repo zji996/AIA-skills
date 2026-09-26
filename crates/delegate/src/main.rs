@@ -404,7 +404,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 &["--max"],
             )?;
             let max = value(&kv, "--max").map(seconds).transpose()?;
-            let list = if has(&flags, "--all") {
+            let list = if has(&flags, "--all") || pos.is_empty() {
                 let v = runs::all_runs()
                     .into_iter()
                     .filter(|r| runs::active(&runs::state(r)) || !r.join(".delivered").exists())
@@ -420,11 +420,6 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     .collect::<Res<Vec<_>>>()?
                     .into_iter()
                     .collect::<Vec<_>>()
-            };
-            let list = if list.is_empty() {
-                vec![runs::resolve("last")?]
-            } else {
-                list
             };
             Ok(collect(
                 &list,

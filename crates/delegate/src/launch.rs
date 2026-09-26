@@ -1,4 +1,4 @@
-use crate::agents::{missing_tools, nesting_error, session_file};
+use crate::agents::{agent_available, missing_tools, nesting_error, session_file};
 use crate::changes::snapshot;
 use crate::common::*;
 use crate::runs::{self, active, agent_alive, all_runs, state};
@@ -18,6 +18,7 @@ pub struct Options {
     pub prompt: Option<String>,
     pub prompt_file: Option<String>,
     pub agent: String,
+    pub tier: Option<String>,
     pub name: Option<String>,
     pub workdir: Option<String>,
     pub images: Vec<String>,
@@ -43,7 +44,6 @@ pub struct Options {
 impl Options {
     pub fn new() -> Self {
         Self {
-            agent: "pi".into(),
             accept_timeout: "10m".into(),
             retries: 1,
             ..Default::default()
@@ -64,6 +64,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
         if reply
             && [
                 "--agent",
+                "--tier",
                 "--workdir",
                 "--read-only",
                 "--in-place",
@@ -82,6 +83,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             "--prompt",
             "--prompt-file",
             "--agent",
+            "--tier",
             "--name",
             "--workdir",
             "--image",
@@ -109,6 +111,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--prompt" => o.prompt = Some(v),
                 "--prompt-file" => o.prompt_file = Some(v),
                 "--agent" => o.agent = v,
+                "--tier" => o.tier = Some(v),
                 "--name" => o.name = Some(v),
                 "--workdir" => o.workdir = Some(v),
                 "--image" => o.images.push(v),
@@ -172,7 +175,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             || o.provider.is_some()
             || o.model.is_some()
             || o.thinking.is_some()
-            || o.agent != "pi"
+            || !o.agent.is_empty()
         {
             return Err("unrecognized reply option".into());
         }
@@ -182,8 +185,14 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
     if !collect && (o.max.is_some() || o.progress || o.full) {
         return Err("unrecognized collecting option".into());
     }
-    if o.agent != "pi" && o.agent != "codex" {
+    if !o.agent.is_empty() && o.agent != "pi" && o.agent != "codex" {
         return Err("argument --agent: invalid choice".into());
+    }
+    if o.tier
+        .as_deref()
+        .is_some_and(|t| t != "cheap" && t != "strong")
+    {
+        return Err("argument --tier: invalid choice".into());
     }
     if !(0..=3).contains(&o.retries) {
         return Err("argument --retries: invalid choice".into());
@@ -193,6 +202,52 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
         seconds(t)?;
     }
     Ok(o)
+}
+fn tier_agent(tier: &str) -> Res<String> {
+    let agent = setting(
+        if tier == "cheap" {
+            "CHEAP_AGENT"
+        } else {
+            "STRONG_AGENT"
+        },
+        if tier == "cheap" { "pi" } else { "codex" },
+    );
+    if agent != "pi" && agent != "codex" {
+        return Err(format!(
+            "DELEGATE_{}_AGENT must be one of pi, codex, got {agent:?}",
+            tier.to_uppercase()
+        ));
+    }
+    Ok(agent)
+}
+pub fn strong_agent() -> Res<String> {
+    tier_agent("strong")
+}
+fn choose_agent(o: &mut Options) -> Res<()> {
+    if !o.agent.is_empty() {
+        if o.tier.is_some() {
+            return Err("--agent and --tier contradict each other; give one".into());
+        }
+        return Ok(());
+    }
+    let tier = o
+        .tier
+        .clone()
+        .unwrap_or_else(|| if o.read_only { "cheap" } else { "strong" }.into());
+    o.agent = tier_agent(&tier)?;
+    o.tier = Some(tier.clone());
+    if tier == "cheap" {
+        let strong = strong_agent()?;
+        if !agent_available(&o.agent) && agent_available(&strong) {
+            eprintln!(
+                "delegate: {} is not installed; using the strong tier ({strong})",
+                o.agent
+            );
+            o.agent = strong;
+            o.tier = Some("strong".into());
+        }
+    }
+    Ok(())
 }
 pub fn read_prompt(o: &mut Options) -> Res<String> {
     let prompt = if let Some(f) = &o.prompt_file {
@@ -255,9 +310,10 @@ pub fn contract(prompt: &str, accept: Option<&str>, read_only: bool, revoked: bo
     }
 }
 pub fn start(mut o: Options) -> Res<PathBuf> {
-    if let Some(e) = nesting_error(&o.agent) {
+    if let Some(e) = nesting_error() {
         return Err(e);
     }
+    choose_agent(&mut o)?;
     let timeout = o
         .timeout
         .clone()
@@ -336,11 +392,12 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
             s(&meta["worktree"], "path")
         ));
     }
-    if let Some(e) = nesting_error(s(&meta, "agent")) {
+    if let Some(e) = nesting_error() {
         return Err(e);
     }
     missing_tools(s(&meta, "agent"))?;
     o.agent = s(&meta, "agent").into();
+    o.tier = meta["tier"].as_str().map(str::to_string);
     o.provider = meta["provider"].as_str().map(str::to_string);
     o.model = meta["model"].as_str().map(str::to_string);
     o.thinking = meta["thinking"].as_str().map(str::to_string);
@@ -369,7 +426,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         Some(&parent),
     )
 }
-fn active_machine(slots: &Path) -> Vec<PathBuf> {
+pub fn active_machine(slots: &Path) -> Vec<PathBuf> {
     let mut out = vec![];
     if let Ok(e) = fs::read_dir(slots) {
         for e in e.flatten() {
@@ -386,7 +443,7 @@ fn active_machine(slots: &Path) -> Vec<PathBuf> {
     }
     out
 }
-fn capacity(agent: &str, active_runs: &[PathBuf]) -> Res<()> {
+pub fn capacity(agent: &str, active_runs: &[PathBuf]) -> Res<()> {
     let total = number("MAX_ACTIVE", 6)?;
     let codex = number("MAX_CODEX", 3)?;
     let codex_count = active_runs
@@ -459,9 +516,6 @@ pub fn launch(
     if mode == "write" && !o.parallel && !extra["worktree"].is_object() {
         for run in all_runs() {
             let m = json(run.join("meta.json"));
-            if run.file_name().unwrap_or_default().to_string_lossy() == setting("PARENT_RUN", "") {
-                continue;
-            }
             if s(&m, "mode") == "write"
                 && s(&m, "workdir") == workdir.to_string_lossy()
                 && (active(&state(&run)) || agent_alive(&run))
@@ -630,7 +684,7 @@ pub fn launch(
     } else {
         top.unwrap_or_default()
     };
-    let meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":seconds(o.timeout.as_deref().unwrap_or("15m"))?,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)?,"retries":o.retries,"images":o.images,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
+    let meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":seconds(o.timeout.as_deref().unwrap_or("15m"))?,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
     write_json(run.join("meta.json"), &meta)?;
     runs::prune();
     let hash = sha1_smol::Sha1::from(run.to_string_lossy().as_bytes())

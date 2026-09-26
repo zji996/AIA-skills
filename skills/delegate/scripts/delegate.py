@@ -6,8 +6,10 @@ run finishes and print one outcome line plus the answer. When `--accept` is
 given, this script runs that command in the workdir after Pi finishes; its exit
 status, not Pi's own report, decides whether the task was delivered.
 
-Nesting: a Pi run cannot delegate at all; a Codex run may delegate to Pi but not to
-Codex. The calling agent always reviews and decides whether to adopt a result.
+One level only: a delegated agent cannot delegate, so every result comes back to the caller,
+who reviews it and decides whether to adopt it. Colleagues are picked by tier (cheap for
+read-only, strong for writing); a failed cheap run that changed nothing is retried once with
+the strong tier.
 
 Concurrency: active runs are counted per machine (all projects, nested runs included);
 a start beyond DELEGATE_MAX_ACTIVE (default 6) or DELEGATE_MAX_CODEX (default 3) is refused.

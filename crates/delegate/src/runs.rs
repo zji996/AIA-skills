@@ -137,6 +137,9 @@ pub fn status(run: &Path) -> Value {
     let st = state(run);
     let sum = json(run.join("summary.json"));
     let mut out = json!({"run":meta.get("run").and_then(Value::as_str).unwrap_or_else(||run.file_name().and_then(|x|x.to_str()).unwrap_or("")),"name":meta.get("name"),"state":st,"agent":meta.get("agent").and_then(Value::as_str).unwrap_or("pi"),"mode":meta.get("mode")});
+    if !s(&meta, "tier").is_empty() {
+        out["tier"] = meta["tier"].clone();
+    }
     if !s(&meta, "parent").is_empty() {
         out["parent"] = meta["parent"].clone();
     }
@@ -154,6 +157,7 @@ pub fn status(run: &Path) -> Value {
             "accept",
             "readOnlyViolation",
             "workspaceChanged",
+            "escalatedFrom",
             "queuedSeconds",
             "graceSeconds",
             "tokens",

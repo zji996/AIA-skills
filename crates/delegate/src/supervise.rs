@@ -2,16 +2,19 @@ use crate::agents;
 use crate::changes;
 use crate::common::*;
 use crate::lane;
+use crate::launch;
 use crate::runs;
 use crate::worktree;
 use serde_json::{json, Value};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicI32, Ordering},
     Arc,
 };
+
+type Recorded = Option<(Vec<Value>, Value)>;
 
 pub fn log_event(run: &Path, mut event: Value) {
     event["at"] = json!(iso());
@@ -95,46 +98,53 @@ fn relative(path: &str, workdir: &str) -> String {
         path.into()
     }
 }
-fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<std::sync::Mutex<Option<f64>>>) -> Res<()> {
-    let meta = json(run.join("meta.json"));
-    let started = epoch();
-    let (mut verdict, mut answer, mut attempts, mut setup_error) =
-        ("failed".to_string(), String::new(), 0i64, None);
-    if meta["worktree"].is_object() && !Path::new(s(&meta["worktree"], "path")).exists() {
-        setup_error = worktree::prepare(&meta, run)?;
-    }
-    if setup_error.is_none() {
-        for attempt in 1..=n(&meta, "retries") + 1 {
-            attempts = attempt;
-            if lane::stopped() {
-                verdict = "stopped".into();
-                break;
-            }
-            match agents::run_agent(&meta, run, attempt, holder.clone(), grace.clone()) {
-                Ok((v, a)) => {
-                    verdict = v;
-                    answer = a;
-                }
-                Err(e) => {
-                    verdict = "failed".into();
-                    let _ = append(run.join("stderr.log"), &format!("supervisor error: {e}\n"));
-                    break;
-                }
-            }
-            if verdict != "malformed" || attempt > n(&meta, "retries") {
-                break;
-            }
-            log_event(run, json!({"e":"rerun","reason":"malformed answer"}));
+fn attempts_from(
+    meta: &Value,
+    run: &Path,
+    first: i64,
+    holder: Arc<AtomicI32>,
+    grace: Arc<std::sync::Mutex<Option<f64>>>,
+) -> (String, String, i64) {
+    let (mut verdict, mut answer, mut attempt) = ("failed".to_string(), String::new(), first - 1);
+    for current in first..first + n(meta, "retries") + 1 {
+        attempt = current;
+        if lane::stopped() {
+            verdict = "stopped".into();
+            break;
         }
+        match agents::run_agent(meta, run, attempt, holder.clone(), grace.clone()) {
+            Ok((v, a)) => {
+                verdict = v;
+                answer = a;
+            }
+            Err(e) => {
+                verdict = "failed".into();
+                let _ = append(run.join("stderr.log"), &format!("supervisor error: {e}\n"));
+                break;
+            }
+        }
+        if verdict != "malformed" || attempt >= first + n(meta, "retries") {
+            break;
+        }
+        log_event(run, json!({"e":"rerun","reason":"malformed answer"}));
     }
+    (verdict, answer, attempt)
+}
+fn settle(
+    meta: &Value,
+    run: &Path,
+    verdict: &str,
+    setup_error: &Option<String>,
+    holder: Arc<AtomicI32>,
+) -> (String, Value, Recorded, Vec<String>) {
     let mut state = if verdict == "ok" {
         "answered".to_string()
     } else {
-        verdict.clone()
+        verdict.into()
     };
-    let mut sum = json!({"state":state,"attempts":attempts});
+    let mut sum = json!({"state":state});
     let rec = if setup_error.is_none() {
-        changes::record(&meta, run)
+        changes::record(meta, run)
     } else {
         None
     };
@@ -148,20 +158,20 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<std::sync::Mutex<Option<
         .unwrap_or_default();
     if let Some((_, totals)) = &rec {
         sum["changes"] = totals.clone();
-    } else if !s(&meta, "top").is_empty() && setup_error.is_none() {
+    } else if !s(meta, "top").is_empty() && setup_error.is_none() {
         sum["warning"] = json!("could not snapshot the working tree; changes are unknown");
     }
-    if s(&meta, "mode") == "read-only" && !changed.is_empty() && verdict == "ok" {
+    if s(meta, "mode") == "read-only" && !changed.is_empty() && verdict == "ok" {
         if meta["worktree"].is_object() {
             sum["readOnlyViolation"] = json!(changed);
-            sum["warning"]=json!("the read-only run changed files in its own worktree; they stay there, never applied");
+            sum["warning"] = json!("the read-only run changed files in its own worktree; they stay there, never applied");
         } else {
             sum["workspaceChanged"] = json!(changed);
-            sum["warning"]=json!("the working tree changed during this in-place read-only run; the changes may be the caller's own");
+            sum["warning"] = json!("the working tree changed during this in-place read-only run; the changes may be the caller's own");
         }
     }
-    if verdict == "ok" && !s(&meta, "accept").is_empty() && !lane::stopped() {
-        sum["accept"] = accept(&meta, run, holder.clone());
+    if verdict == "ok" && !s(meta, "accept").is_empty() && !lane::stopped() {
+        sum["accept"] = accept(meta, run, holder);
         state = if b(&sum["accept"], "ok") {
             "delivered"
         } else {
@@ -170,6 +180,83 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<std::sync::Mutex<Option<
         .into();
         sum["state"] = json!(state);
     }
+    (state, sum, rec, changed)
+}
+fn escalate(
+    meta: &mut Value,
+    run: &Path,
+    state: &str,
+    recorded: bool,
+    changed: &[String],
+) -> Res<bool> {
+    if s(meta, "tier") != "cheap"
+        || !["malformed", "failed", "timeout", "rejected"].contains(&state)
+    {
+        return Ok(false);
+    }
+    if s(meta, "mode") != "read-only" && (!recorded || !changed.is_empty()) {
+        return Ok(false);
+    }
+    let strong = launch::strong_agent()?;
+    if strong == s(meta, "agent") || !agents::agent_available(&strong) {
+        return Ok(false);
+    }
+    let slots = state_dir();
+    let _guard = lock(&slots.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
+    let others: Vec<PathBuf> = launch::active_machine(&slots)
+        .into_iter()
+        .filter(|r| r != run)
+        .collect();
+    if launch::capacity(&strong, &others).is_err() {
+        log_event(
+            run,
+            json!({"e":"escalate_skipped","reason":format!("no room for {strong}")}),
+        );
+        return Ok(false);
+    }
+    if s(meta, "mode") == "read-only" && strong == "codex" {
+        let prompt = read(run.join("prompt.md"));
+        write(
+            run.join("prompt.md"),
+            launch::contract(&prompt, None, true, false),
+        )?;
+    }
+    meta["escalatedFrom"] = meta["agent"].clone();
+    meta["agent"] = json!(strong);
+    meta["tier"] = json!("strong");
+    meta["fork"] = Value::Null;
+    write_json(run.join("meta.json"), meta)?;
+    Ok(true)
+}
+fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<std::sync::Mutex<Option<f64>>>) -> Res<()> {
+    let mut meta = json(run.join("meta.json"));
+    let started = epoch();
+    let mut setup_error = None;
+    if meta["worktree"].is_object() && !Path::new(s(&meta["worktree"], "path")).exists() {
+        setup_error = match worktree::prepare(&meta, run) {
+            Ok(error) => error,
+            Err(e) => Some(clip(&format!("worktree setup failed: {e}"), 300)),
+        };
+    }
+    let (mut verdict, mut answer, mut attempts) = if setup_error.is_none() {
+        attempts_from(&meta, run, 1, holder.clone(), grace.clone())
+    } else {
+        ("failed".into(), String::new(), 0)
+    };
+    let (mut state, mut sum, mut rec, mut changed) =
+        settle(&meta, run, &verdict, &setup_error, holder.clone());
+    let cheap = s(&meta, "agent").to_string();
+    if !lane::stopped() && escalate(&mut meta, run, &state, rec.is_some(), &changed)? {
+        log_event(
+            run,
+            json!({"e":"escalate","from":cheap,"to":s(&meta,"agent"),"after":state}),
+        );
+        (verdict, answer, attempts) =
+            attempts_from(&meta, run, attempts + 1, holder.clone(), grace.clone());
+        (state, sum, rec, changed) = settle(&meta, run, &verdict, &setup_error, holder.clone());
+        sum["escalatedFrom"] = json!(cheap);
+    }
+    sum["attempts"] = json!(attempts);
     if !answer.trim().is_empty() {
         write(
             run.join("result.md"),

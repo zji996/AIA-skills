@@ -19,29 +19,29 @@ struct WatchState {
     commands: i32,
 }
 
-pub fn nesting_error(agent: &str) -> Option<String> {
+pub fn nesting_error() -> Option<String> {
     let caller = setting("AGENT", "");
     let caller = if caller.is_empty() && env::var_os("PI_DELEGATE_ACTIVE").is_some() {
         "pi"
     } else {
         &caller
     };
-    if caller == "pi" {
-        Some("refusing nested delegation: a delegated Pi run cannot delegate further".into())
-    } else if caller == "codex" && agent == "codex" {
-        Some("refusing nested delegation: a delegated Codex run may delegate to Pi (--agent pi) but not to Codex".into())
+    if !caller.is_empty() {
+        Some(format!("refusing nested delegation: this is a delegated {caller} run; do the work yourself and report back to your caller (`lane` for heavy checks still works)"))
     } else {
         None
     }
 }
-pub fn missing_tools(agent: &str) -> Res<()> {
-    let found = env::var_os("PATH").and_then(|p| {
-        env::split_paths(&p).find(|x| {
+pub fn agent_available(agent: &str) -> bool {
+    env::var_os("PATH").is_some_and(|p| {
+        env::split_paths(&p).any(|x| {
             fs::metadata(x.join(agent))
                 .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         })
-    });
-    if found.is_some() {
+    })
+}
+pub fn missing_tools(agent: &str) -> Res<()> {
+    if agent_available(agent) {
         return Ok(());
     }
     if agent == "codex" {
@@ -370,7 +370,6 @@ pub fn run_agent(
         .stderr(Stdio::from(stderr));
     clean_env(&mut c, &meta["env"]);
     c.env("DELEGATE_AGENT", s(meta, "agent"))
-        .env("DELEGATE_PARENT_RUN", s(meta, "run"))
         .env("DELEGATE_RUN_DIR", s(meta, "dir"));
     if !codex {
         c.env("PI_DELEGATE_ACTIVE", "1");
