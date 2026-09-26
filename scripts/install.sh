@@ -231,7 +231,7 @@ done
 
 while IFS= read -r entry; do
   if [ -L "$entry" ]; then
-    [ -e "$entry" ] && continue
+    [ -f "$entry/SKILL.md" ] && continue  # a renamed skill may leave a directory of caches behind
   elif [ -f "$SKILLS_SRC/$(basename "$entry")/SKILL.md" ]; then
     continue
   fi

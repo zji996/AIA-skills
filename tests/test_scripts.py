@@ -91,7 +91,11 @@ class ScriptTests(unittest.TestCase):
         (shared / "delegate").symlink_to(ROOT / "skills/delegate")
         (shared / "agent-delegation").symlink_to(ROOT / "skills/agent-delegation")
         (home / ".codex/skills").mkdir(parents=True)
-        (home / ".codex/skills/pi-delegation").symlink_to(ROOT / "skills/pi-delegation")  # pre-4.0 name
+        # Pre-4.0 name whose checkout still holds a cache directory after the rename.
+        leftover = ROOT / "skills/zz-renamed-skill-test"
+        (leftover / "scripts/__pycache__").mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, leftover, True)
+        (home / ".codex/skills/pi-delegation").symlink_to(leftover)
         env = {**os.environ, "HOME": str(home)}
         result = self.run_script(INSTALL, "delegate", "repo-governance", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
