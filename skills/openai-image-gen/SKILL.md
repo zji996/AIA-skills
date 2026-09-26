@@ -3,7 +3,7 @@ name: openai-image-gen
 description: 需要生成配图、Banner、图标、产品插图或 UI/游戏素材并直接保存为本地文件时使用；调用 OpenAI Image API，只输出一行结果 JSON，不把图片数据灌入上下文。Use to generate image assets, illustrations, banners or icons to disk.
 license: MIT
 metadata:
-  version: "1.1.0"
+  version: "1.1.1"
 ---
 
 # OpenAI Image Generation (本地图像生成)
@@ -41,4 +41,4 @@ $G -p "Wide cinematic banner of glowing neural network nodes in deep blue space"
 
 ## 凭据来源
 
-依次尝试：命令行参数 → `OPENAI_API_KEY`/`OPENAI_BASE_URL` → Codex `auth.json` 中的 API key → Codex `config.toml` 里当前选中 provider 的 `base_url` 与 Bearer key（两者需同时存在）。Codex 的 OAuth 登录态不能当作 API key 使用；只有登录态时，需要另外提供 key。依赖 `curl`、`jq`、`python3`。
+依次尝试：命令行参数 → `OPENAI_API_KEY`/`OPENAI_BASE_URL` → Codex `config.toml` 里当前选中 provider 的 `base_url` 与 Bearer key（两者需同时存在）→ Codex `auth.json` 中的 API key，发往 Codex 同样会发往的地址：选中 provider 设了 `requires_openai_auth` 时用它的 `base_url`，否则用官方 API。Codex 的 OAuth 登录态不能当作 API key 使用；只有登录态时，需要另外提供 key。依赖 `curl`、`jq`、`python3`。

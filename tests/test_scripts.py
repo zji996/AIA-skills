@@ -24,9 +24,11 @@ class ImageHandler(BaseHTTPRequestHandler):
     response_data = {"data": [{"b64_json": base64.b64encode(b"image-bytes").decode()}]}
     request_path = None
     request_data = None
+    request_auth = None
 
     def do_POST(self):
         type(self).request_path = self.path
+        type(self).request_auth = self.headers.get("Authorization")
         type(self).request_data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         payload = json.dumps(self.response_data).encode()
         self.send_response(self.response_status)
@@ -350,6 +352,35 @@ class ScriptTests(unittest.TestCase):
         result = self.run_script(IMAGE, "-p", "demo", "-o", self.work / "image.png", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(handler.request_path, "/v1/images/generations")
+
+    def codex_home(self, provider_lines, auth_key=None):
+        config = self.work / "codex"
+        config.mkdir(exist_ok=True)
+        (config / "config.toml").write_text('model_provider = "selected"\n[model_providers.selected]\n' + provider_lines)
+        if auth_key:
+            (config / "auth.json").write_text(json.dumps({"OPENAI_API_KEY": auth_key}))
+        env = {key: value for key, value in os.environ.items()
+               if key not in ("OPENAI_API_KEY", "OPENAI_BASE_URL")}
+        env["CODEX_HOME"] = str(config)
+        return env
+
+    def test_image_selected_provider_wins_over_auth_json(self):
+        server, handler = self.image_server()
+        env = self.codex_home(
+            f'base_url = "http://127.0.0.1:{server.server_port}"\n'
+            'http_headers = { "Authorization" = "Bearer provider-key" }\n', auth_key="auth-key")
+        result = self.run_script(IMAGE, "-p", "demo", "-o", self.work / "image.png", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(handler.request_auth, "Bearer provider-key")
+
+    def test_image_auth_json_follows_provider_that_requires_openai_auth(self):
+        server, handler = self.image_server()
+        env = self.codex_home(
+            f'base_url = "http://127.0.0.1:{server.server_port}/v1"\nrequires_openai_auth = true\n',
+            auth_key="auth-key")
+        result = self.run_script(IMAGE, "-p", "demo", "-o", self.work / "image.png", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(handler.request_auth, "Bearer auth-key")
 
     def test_image_missing_value_shows_usage(self):
         result = self.run_script(IMAGE, "--prompt", "demo", "--output")

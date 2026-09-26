@@ -19,8 +19,9 @@ Options:
 Authentication discovery order:
   1. CLI flags (--api-key / --base-url)
   2. Environment variables (OPENAI_API_KEY / OPENAI_BASE_URL)
-  3. ~/.codex/auth.json (OPENAI_API_KEY, with the official API URL)
-  4. ~/.codex/config.toml (selected provider's base_url and Bearer header together)
+  3. ~/.codex/config.toml (selected provider's base_url and Bearer header together)
+  4. ~/.codex/auth.json (OPENAI_API_KEY), sent where Codex sends it: the selected
+     provider's base_url when it sets requires_openai_auth, else the official API
 EOF
   exit 2
 }
@@ -101,12 +102,10 @@ AUTH_JSON="$CODEX_DIR/auth.json"
 BASE_URL="${CLI_BASE_URL:-${OPENAI_BASE_URL:-}}"
 API_KEY="${CLI_API_KEY:-${OPENAI_API_KEY:-}}"
 
-if [[ -z "$API_KEY" ]] && [[ -f "$AUTH_JSON" ]]; then
-  API_KEY=$(jq -r '.OPENAI_API_KEY // .openai_api_key // empty' "$AUTH_JSON" 2>/dev/null || true)
-fi
-
-if [[ -z "$API_KEY" ]] && [[ -f "$CONFIG_TOML" ]]; then
-  # Only use credentials from the selected provider, paired with its own URL.
+provider_url=""
+provider_key=""
+provider_openai_auth="false"
+if [[ -f "$CONFIG_TOML" ]]; then
   provider=$(python3 - "$CONFIG_TOML" <<'PY'
 import json
 import sys
@@ -120,18 +119,29 @@ try:
     headers = provider.get("http_headers", {})
     authorization = next((value for key, value in headers.items() if key.lower() == "authorization"), "")
     token = authorization.split(" ", 1)[1] if authorization.lower().startswith("bearer ") else ""
-    print(json.dumps({"url": provider.get("base_url", ""), "key": token}))
+    print(json.dumps({"url": provider.get("base_url", ""), "key": token,
+                      "openai_auth": bool(provider.get("requires_openai_auth", False))}))
 except (OSError, ValueError, TypeError, AttributeError) as exc:
     sys.exit(f"Error: Cannot read selected Codex provider: {exc}")
 PY
   )
   provider_url=$(jq -r '.url' <<<"$provider")
   provider_key=$(jq -r '.key' <<<"$provider")
-  if [[ -n "$provider_url" && -n "$provider_key" ]]; then
-    if [[ -z "$BASE_URL" || "${BASE_URL%/}" = "${provider_url%/}" ]]; then
-      API_KEY="$provider_key"
-      BASE_URL="${BASE_URL:-$provider_url}"
-    fi
+  provider_openai_auth=$(jq -r '.openai_auth' <<<"$provider")
+fi
+
+# The selected provider's own key only ever goes to its own URL.
+if [[ -z "$API_KEY" && -n "$provider_url" && -n "$provider_key" ]]; then
+  if [[ -z "$BASE_URL" || "${BASE_URL%/}" = "${provider_url%/}" ]]; then
+    API_KEY="$provider_key"
+    BASE_URL="${BASE_URL:-$provider_url}"
+  fi
+fi
+
+if [[ -z "$API_KEY" ]] && [[ -f "$AUTH_JSON" ]]; then
+  API_KEY=$(jq -r '.OPENAI_API_KEY // .openai_api_key // empty' "$AUTH_JSON" 2>/dev/null || true)
+  if [[ -n "$API_KEY" && -z "$BASE_URL" && "$provider_openai_auth" = "true" ]]; then
+    BASE_URL="$provider_url"
   fi
 fi
 
