@@ -4,6 +4,7 @@
 
 ### 技能
 
+- `delegate` 5.0.0（不兼容）：**只保留 Rust 实现**，入口由 `scripts/delegate.py` 改为 `bin/delegate`（Linux x86_64 / aarch64 的 musl 静态二进制，不再需要 Python）；Python 实现移除，最后一版见 tag `delegate-py-4.5.0`。行为不变，契约仍是 `docs/delegate-spec.md`，`tests/test_delegate.py` 默认测试已安装的二进制。
 - `delegate` 4.5.0：**只有一层委派**——同事（设有 `DELEGATE_AGENT` 等）调用 `start`/`run`/`reply` 一律拒绝，去掉父 run 的写入互斥豁免与 `DELEGATE_PARENT_RUN`，所有结果回到主控。**按档位选同事**：新增 `--tier cheap|strong`，只读默认便宜档、写入默认强档，档位映射由 `DELEGATE_CHEAP_AGENT` / `DELEGATE_STRONG_AGENT` 配置（默认 pi / codex），`--agent` 仍可直接指定；便宜档未安装时自动用强档。**自动升档**：便宜档畸形、出错、超时或验收失败，且为只读或未产生改动时，在同一 run 中换强档重跑一次（强档有容量时），结论带 `escalatedFrom`，升到 Codex 的只读任务补上只读约定。`wait` 不带参数时等所有未结束与未读取的任务。Rust 实现同步到 4.5（Codex 实现、主控审查），两个实现通过同一套 50 项黑盒用例。SKILL.md 改写为三步用法、场景速查与档位表，新增按需阅读的 `references/recipes.md`（任务说明模板、场景示例、常见坑）。
 - `delegate` Rust 实现（`crates/delegate`，与 Python 版并存，暂不替换）：由 Codex 按 `docs/delegate-spec.md` 实现，依赖仅 serde_json、libc、sha1_smol；release 约 1.1 MB，可 musl 静态链接。运行中的 supervisor 常驻约 2.9 MB（Python 版约 22 MB），空闲时零周期唤醒（10 秒内各线程上下文切换 0 次，修复前 697 次）。通过全部黑盒一致性测试（`DELEGATE_BIN`）。主控审查后修复了首版的 6 处问题：非 UTF-8 输出行会使读循环停止、三处周期轮询改为事件驱动（self-pipe、条件变量、阻塞 `waitid`）、lane 停止信号丢失唤醒、看门狗可能向复用的 PID 发信号。
 - `delegate` 测试：新增非 UTF-8 输出行不中断读取的用例；规格注明 JSON 空白与字段顺序不属于契约。
@@ -34,6 +35,7 @@
 
 ### 安装
 
+- 技能可在 frontmatter 声明 `binary: <名>`：`install.sh` 在链接或复制前调用新增的 `scripts/fetch-binary.sh`，从 GitHub Release（`<名>-v<版本>`，次选 Forgejo）下载对应架构的二进制，按技能内提交的 `bin.sha256` 校验，不符即拒绝；下载不到而本机有 cargo 时从 `crates/<名>` 编译，`--build` 强制编译。新增 `scripts/release-binary.sh build|publish <技能>` 负责构建两个架构并发布；`check.sh` 检查 `bin.sha256` 与源码齐全。`bootstrap.sh` 不再检查 python3。
 - `install.sh` 清理旧条目时，指向不含 `SKILL.md` 的目录的链接也视为过期：技能改名后旧目录常因残留 `__pycache__` 而未被删除，此前这类链接不会被清理。
 - `bootstrap.sh` 新增 `--with-pi` / `--with-pi-sync`：拉取 `third_party/pi-kit` 子模块并安装 Pi，最后提示仍缺少的委派依赖。
 - `third_party/pi-kit` 子模块改用相对地址，GitHub 克隆会从 GitHub 拉取 pi-kit。

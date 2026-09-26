@@ -108,4 +108,4 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 
 ## 代码结构
 
-`scripts/delegate.py` 是唯一入口，只含命令与参数解析；实现在 `scripts/delegate_core/`，依赖单向：`common` ← `agents`、`changes` ← `worktree` ← `runs` ← `supervise`、`launch` ← 入口。接入新的同事只需改 `agents.py`（启动命令、续接方式、事件解析）。
+`bin/delegate` 是安装时按 `bin.sha256` 校验下载的静态二进制（Linux x86_64 / aarch64，musl），源码在仓库的 `crates/delegate/`，行为契约见仓库的 `docs/delegate-spec.md`。接入新的同事只需改 `agents.rs`（启动命令、续接方式、事件解析）。

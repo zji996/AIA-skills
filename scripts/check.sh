@@ -127,6 +127,23 @@ for script in "$REPO_ROOT/skills"/*/scripts/*.py; do
   fi
 done
 
+# A skill with a prebuilt binary must list a checksum for every released target, and have its source.
+for skill_md in "$REPO_ROOT/skills"/*/SKILL.md; do
+  dir="$(dirname "$skill_md")"
+  binary="$(sed -n '/^---$/,/^---$/p' "$skill_md" | sed -n 's/^[[:space:]]*binary:[[:space:]]*//p' | head -1 | tr -d '"')"
+  [ -n "$binary" ] || continue
+  missing=""
+  for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+    grep -qE "^[0-9a-f]{64}  $binary-$target\$" "$dir/bin.sha256" 2>/dev/null || missing+=" $target"
+  done
+  if [ -n "$missing" ] || [ ! -f "$REPO_ROOT/crates/$binary/Cargo.toml" ]; then
+    echo "  [FAIL] Binary $binary: bin.sha256 lacks${missing:- nothing} or crates/$binary is missing" >&2
+    errors=$((errors + 1))
+  else
+    echo "  [PASS] Binary checksums & source: $binary"
+  fi
+done
+
 if [ "$errors" -gt 0 ]; then
   echo "Validation FAILED with $errors script errors." >&2
   exit 1

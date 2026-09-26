@@ -32,16 +32,12 @@ die() { printf 'bootstrap: %s\n' "$*" >&2; exit 1; }
 # pi-kit is a submodule with a URL relative to the checkout's origin, so it
 # comes from the same host the skills were cloned from.
 install_pi() {
-  local dir=$1 mode=$2 tool missing=()
+  local dir=$1 mode=$2
   log "Installing Pi via pi-kit ($mode)"
   git -C "$dir" submodule sync --quiet -- third_party/pi-kit
   GIT_TERMINAL_PROMPT=0 git -C "$dir" submodule update --init --quiet -- third_party/pi-kit ||
     die "could not fetch third_party/pi-kit; skills are installed, re-run to retry Pi"
   sh "$dir/third_party/pi-kit/install.sh" "--$mode" </dev/null || die "pi-kit failed; skills are installed, re-run to retry Pi"
-  command -v python3 >/dev/null || missing+=(python3)
-  if (( ${#missing[@]} )); then
-    log "delegate also needs: ${missing[*]} (e.g. sudo apt install python3)"
-  fi
 }
 
 main() {

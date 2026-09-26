@@ -13,7 +13,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 # Black-box conformance suite (docs/delegate-spec.md): every test drives the CLI as a subprocess, so any
 # implementation can be checked by pointing DELEGATE_BIN at its executable.
-DELEGATE = Path(os.environ.get("DELEGATE_BIN") or ROOT / "skills/delegate/scripts/delegate.py").resolve()
+DELEGATE = Path(os.environ.get("DELEGATE_BIN") or ROOT / "skills/delegate/bin/delegate").resolve()
+if not os.access(DELEGATE, os.X_OK):
+    raise RuntimeError(f"{DELEGATE} is missing: run scripts/fetch-binary.sh delegate (or --build after changing crates/)")
 
 
 def process_gone(pid_file):

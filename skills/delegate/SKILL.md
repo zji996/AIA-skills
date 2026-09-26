@@ -2,9 +2,10 @@
 name: delegate
 description: 把可独立验收的任务交给同事 Agent 在后台并行完成，你只收结果并把关。遇到这些情况时主动使用，不必等用户开口：要读很多文件但只需结论；改动前想要第二意见或独立审查；有两个以上互不依赖、能用命令验收的子任务；需要有人看截图或设计图给意见。同事分两档：便宜档 Pi（Gemini，读材料、摘要、文案、看图）与强档 Codex（GPT，写代码、严密审查），只读默认便宜档、写入默认强档，便宜档失败自动升档。脚本代跑验收命令，只给一行结论与下一步，过程不进主控上下文；整机并发与重检查有上限。Use to delegate or parallelize work proactively, and to get a second opinion, code review or image review from Gemini (Pi) or GPT (Codex), judged by results.
 license: MIT
-compatibility: Linux；需要 python3（3.9+，仅标准库），以及所选同事的 CLI：pi 或 codex。
+compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "4.5.0"
+  version: "5.0.0"
+  binary: delegate
   exclude-agents: pi
 ---
 
@@ -15,7 +16,7 @@ metadata:
 ## 三步用法
 
 ```bash
-D=<本技能目录>/scripts/delegate.py
+D=<本技能目录>/bin/delegate
 $D start --read-only --name review-api "审查 apps/api 的错误处理，只列真实缺陷，写明文件:行号"   # 1. 放出（可连放多个）
 $D wait                                                                                  # 2. 等：放后台，结束时会返回
 #                                                                                        # 3. 按结论行的 next 处理

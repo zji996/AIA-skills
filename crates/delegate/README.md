@@ -1,6 +1,7 @@
 # Rust delegate
 
-Native implementation of the `delegate` CLI contract in `docs/delegate-spec.md`.
+The `delegate` CLI (the only implementation; the contract is `docs/delegate-spec.md`).
+Releases: `scripts/release-binary.sh build|publish delegate`; installs: `scripts/fetch-binary.sh delegate`.
 The binary uses its own `_supervise` subcommand for each background run.
 
 ## Build
@@ -19,17 +20,17 @@ The musl build was verified as a stripped, statically linked PIE (about 1.2 MB).
 
 ## Modules
 
-| Rust | Python counterpart | Responsibility |
-| --- | --- | --- |
-| `main.rs` | `delegate.py` | CLI, output, collection, stop and cleanup |
-| `common.rs` | `delegate_core/common.py` | Settings, files, processes and Git helpers |
-| `launch.rs` | `delegate_core/launch.py` | Prompt, admission and run creation |
-| `runs.rs` | `delegate_core/runs.py` | Run lookup, status and retention |
-| `agents.rs` | `delegate_core/agents.py` | Pi/Codex commands, events and attempt verdicts |
-| `supervise.rs` | `delegate_core/supervise.py` | Background lifecycle and acceptance |
-| `lane.rs` | `delegate_core/lane.py` | Machine-wide heavy-work queue |
-| `changes.rs` | `delegate_core/changes.py` | Git snapshots and change records |
-| `worktree.rs` | `delegate_core/worktree.py` | Isolated worktrees and apply |
+| Module | Responsibility |
+| --- | --- |
+| `main.rs` | CLI, output, collection, stop and cleanup |
+| `common.rs` | Settings, files, processes and Git helpers |
+| `launch.rs` | Prompt, admission and run creation |
+| `runs.rs` | Run lookup, status and retention |
+| `agents.rs` | Pi/Codex commands, events and attempt verdicts |
+| `supervise.rs` | Background lifecycle and acceptance |
+| `lane.rs` | Machine-wide heavy-work queue |
+| `changes.rs` | Git snapshots and change records |
+| `worktree.rs` | Isolated worktrees and apply |
 
 Measured on 2026-09-27 with `/proc/<pid>/status`: a live `_supervise` process
 whose fake Pi agent was sleeping had `VmRSS: 2908 kB` (2.84 MiB). This measures

@@ -11,3 +11,6 @@ __pycache__/
 
 # Rust build output
 target/
+
+# Release builds
+/dist/

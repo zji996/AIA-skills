@@ -1,8 +1,8 @@
-# delegate 规格（v4.5）
+# delegate 规格（v5.0）
 
 > 本文是 `skills/delegate` 的**实现契约**：命令行、输出、run 目录、锁与状态机。它是 Rust 重写与 harness 原生接入的依据。
 > 本文不在技能目录内，技能加载时不会读取；模型使用技能只需 `SKILL.md`。行为以本文为准，实现与本文不一致时按缺陷处理。
-> 一致性验收：`tests/test_delegate.py` 以子进程黑盒方式驱动 CLI，任何实现都应通过（`DELEGATE_BIN` 指向被测可执行文件，见 §13）。
+> 一致性验收：`tests/test_delegate.py` 以子进程黑盒方式驱动 CLI，任何实现都应通过（`DELEGATE_BIN` 指向被测可执行文件，默认 `skills/delegate/bin/delegate`，见 §13）。
 
 关键词：**必须**＝契约的一部分，改变即不兼容；**应**＝推荐行为，可在不破坏调用方的前提下调整。
 
@@ -22,7 +22,7 @@
 
 ## 2. 命令行
 
-入口是单个可执行文件：Python 实现 `skills/delegate/scripts/delegate.py`，Rust 实现 `crates/delegate`（`target/release/delegate`）。所有输出 JSON 的行都是单行、UTF-8、非 ASCII 字符不转义；**空白与字段顺序不属于契约**（两个实现不同），状态行以 `{"run"` 开头。读取方——包括读取 run 目录中 JSON 文件的 `agent-handoff`——必须按 JSON 解析或容忍任意空白，不得依赖文本格式。诊断信息写 stderr，以 `delegate: ` 开头。
+入口是单个可执行文件：`crates/delegate` 构建的静态二进制，安装在 `skills/delegate/bin/delegate`（最后一个 Python 实现见 tag `delegate-py-4.5.0`）。所有输出 JSON 的行都是单行、UTF-8、非 ASCII 字符不转义；**空白与字段顺序不属于契约**（两个实现不同），状态行以 `{"run"` 开头。读取方——包括读取 run 目录中 JSON 文件的 `agent-handoff`——必须按 JSON 解析或容忍任意空白，不得依赖文本格式。诊断信息写 stderr，以 `delegate: ` 开头。
 
 ### 2.1 退出码（必须）
 
@@ -323,7 +323,7 @@ run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git �
 
 ## 13. 一致性验收
 
-`tests/test_delegate.py` 是纯黑盒套件：通过伪造的 `pi`/`codex`（写在临时 `PATH` 中的 shell 脚本）以子进程驱动 CLI，只观察输出、退出码与 run 目录中的文件，覆盖本文全部必须项。被测入口由 `DELEGATE_BIN` 指定（默认 Python 实现 `skills/delegate/scripts/delegate.py`）：
+`tests/test_delegate.py` 是纯黑盒套件：通过伪造的 `pi`/`codex`（写在临时 `PATH` 中的 shell 脚本）以子进程驱动 CLI，只观察输出、退出码与 run 目录中的文件，覆盖本文全部必须项。被测入口由 `DELEGATE_BIN` 指定（默认已安装的 `skills/delegate/bin/delegate`；改动 Rust 源码后用 `scripts/fetch-binary.sh --build delegate` 重建）：
 
 ```bash
 DELEGATE_BIN=<被测可执行文件> python3 -m unittest tests.test_delegate

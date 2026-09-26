@@ -47,7 +47,7 @@ curl -fsSL <上面任一链接> | bash -s -- --github --dir ~/aia-skills # 指�
 curl -fsSL <上面任一链接> | bash -s -- --with-pi                 # 同时安装或更新 Pi（delegate 需要）
 ```
 
-依赖 `git` 与 bash 4+（macOS 需先 `brew install bash`）。`delegate` 仅支持 Linux，另需 `python3`（3.9+，仅标准库）以及所选同事的 CLI：`pi` 或 `codex`。
+依赖 `git` 与 bash 4+（macOS 需先 `brew install bash`）。`delegate` 仅支持 Linux x86_64 / aarch64：安装时按 `skills/delegate/bin.sha256` 校验并下载 GitHub Release 中的静态二进制（下载不到而本机有 cargo 时从 `crates/delegate` 编译），另需所选同事的 CLI：`pi` 或 `codex`。
 
 ### Pi 与 pi-kit
 
@@ -101,7 +101,8 @@ cd AIA-skills
 
 ```bash
 ./scripts/check.sh
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v   # delegate 用例测已安装的 skills/delegate/bin/delegate
+./scripts/fetch-binary.sh --build delegate  # 改了 crates/delegate 后先重建再测
 ```
 
 `check.sh` 检查 frontmatter、`description` 是否写明触发场景、README 索引、`evals/` 触发示例、断链与脚本语法。依赖 Python 3.11+ 和 PyYAML；图像生成脚本另需 `curl`、`jq` 和有效的 OpenAI API key，调用会产生 API 费用。
