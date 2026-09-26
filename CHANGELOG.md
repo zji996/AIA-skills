@@ -4,6 +4,7 @@
 
 ### 技能
 
+- `delegate` 5.1.1：整机并发默认上限调为 8 个任务、其中 Codex 4 个（原为 6 与 3）。按这个项目的实测，能真正并行的独立工作流约 4～5 条，再多会让交付扎堆、主控审查质量下降；机器资源（每个 Codex 约 185 MB）不是瓶颈。
 - `delegate` 5.1.0：**同事为跑测试而初始化的子模块不再算作改动**：worktree 中起始未初始化、结束时干净且检出提交等于记录值的子模块视为仅初始化，不进改动清单、`apply` 不处理（此前每次合并前都要手动 deinit）。新增 **`--protect <路径>`**：受保护路径被改动即判 `rejected` 并带 `protectViolation`，不运行验收，替代在验收命令里手写 `git diff --quiet`；任务说明会写明哪些路径不许改，reply 沿用。SKILL.md 按同题对比重新定位两档（Pi：广度侦察、界面与前端、另一路视角；Codex：严密判断与风险、核实），新增"什么时候自己接手"与续接会话的判断；任务说明模板要求现状断言附 `文件:行号`。
 - `delegate` 5.0.1：实际使用中发现并修复。**只读 Pi 在自己的 worktree 中不再被限制工具**：隔离加事后核对已经兜底，它与 Codex 一样拿到全部工具（能看 git 历史与 diff、跑测试）、收到只读约定、执行 `setup`；只有无法隔离（非 git 或 `--in-place`）时才只保留读文件、搜索、列目录。**只读 worktree 保留快照 index**（`reset --soft`），主控未提交的子模块指针不再被误报为违规。新增 `--help`（顶层与各子命令）与 `--version`，状态行以 `run`、`name`、`state` 开头；`diff` 支持 `--` 分隔路径；升档补只读约定时不重复。Cargo 版本与技能版本一致（`check.sh` 检查）。`install.sh` 可用 `AIA_SKILLS_SKIP_BINARIES=1` 跳过二进制，安装测试不再依赖网络与编译器。新增 `docs/delegate-field-notes.md`，记录实战中的问题、做法与数据。
 - `delegate` 5.0.0（不兼容）：**只保留 Rust 实现**，入口由 `scripts/delegate.py` 改为 `bin/delegate`（Linux x86_64 / aarch64 的 musl 静态二进制，不再需要 Python）；Python 实现移除，最后一版见 tag `delegate-py-4.5.0`。行为不变，契约仍是 `docs/delegate-spec.md`，`tests/test_delegate.py` 默认测试已安装的二进制。

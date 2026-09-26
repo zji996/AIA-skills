@@ -93,8 +93,8 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 | 变量 | 作用 |
 |---|---|
 | `DELEGATE_RUNS` | run 根目录 |
-| `DELEGATE_MAX_ACTIVE` | 整机同时运行的任务上限，默认 6；`0` 不限 |
-| `DELEGATE_MAX_CODEX` | 其中 Codex 任务上限，默认 3；`0` 不限 |
+| `DELEGATE_MAX_ACTIVE` | 整机同时运行的任务上限，默认 8；`0` 不限 |
+| `DELEGATE_MAX_CODEX` | 其中 Codex 任务上限，默认 4；`0` 不限 |
 | `DELEGATE_MAX_HEAVY` | lane 同时放行的重命令数，默认 1；`0` 不限 |
 | `DELEGATE_MIN_AVAILABLE_MB` | 可用内存低于该值（MB）时拒绝启动，默认 4096；`0` 不检查 |
 | `DELEGATE_TIMEOUT_GRACE` | 同事超时后仍在工作时的宽限百分比，默认 50 |

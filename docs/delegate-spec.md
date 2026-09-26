@@ -286,7 +286,7 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 
 ## 10. 并发、准入与清理
 
-- 整机并发：`<state>/<sha1(run 路径)[:16]>.slot` 记录运行中的 run；`DELEGATE_MAX_ACTIVE`（默认 6）、`DELEGATE_MAX_CODEX`（默认 3），0 不限。超出即拒绝并列出运行中的任务。
+- 整机并发：`<state>/<sha1(run 路径)[:16]>.slot` 记录运行中的 run；`DELEGATE_MAX_ACTIVE`（默认 8）、`DELEGATE_MAX_CODEX`（默认 4），0 不限。超出即拒绝并列出运行中的任务。
 - 内存准入：`/proc/meminfo` 的 `MemAvailable` 低于 `DELEGATE_MIN_AVAILABLE_MB`（默认 4096，0 不查）时拒绝。
 - 启动在 `<state>/.start.lock` 与 `<runs>/.start.lock` 两把锁下进行，检查与登记不可交错。
 - 写入互斥：同一 workdir 同时只允许一个原地写入 run（`--allow-parallel-writes` 与 worktree run 除外）。

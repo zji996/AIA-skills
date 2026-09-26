@@ -506,8 +506,8 @@ pub fn active_machine(slots: &Path) -> Vec<PathBuf> {
     out
 }
 pub fn capacity(agent: &str, active_runs: &[PathBuf]) -> Res<()> {
-    let total = number("MAX_ACTIVE", 6)?;
-    let codex = number("MAX_CODEX", 3)?;
+    let total = number("MAX_ACTIVE", 8)?;
+    let codex = number("MAX_CODEX", 4)?;
     let codex_count = active_runs
         .iter()
         .filter(|r| s(&json(r.join("meta.json")), "agent") == "codex")
