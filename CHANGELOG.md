@@ -4,6 +4,9 @@
 
 ### 技能
 
+- `delegate` 4.4.0：新增整机重任务队列 `lane`：验收命令、worktree `setup`、同事自检与主控的 `delegate.py lane <命令>` 先进先出排队，默认同时一个（`DELEGATE_MAX_HEAVY`）；基于 flock 由内核唤醒，不轮询，进程崩溃即释放。排队时间不计入验收、setup 与同事的超时；同事超过 `--timeout` 时若仍在执行命令或刚有动静，最多宽限 50%（`DELEGATE_TIMEOUT_GRACE`）。验收与 setup 在独立进程组运行，超时或结束后整组清理，此前超时只杀 shell、子进程会残留。可用内存低于 `DELEGATE_MIN_AVAILABLE_MB`（默认 4096）拒绝启动。`.delegate.json` 新增 `env`，注入同事、验收与 setup（如 `CUDA_VISIBLE_DEVICES=""`）。`wait`/`run` 改为阻塞在 supervisor 的生命周期锁上，任务结束即返回。修复快照漏记：复制 index 时未保留 mtime，同一秒内写入且大小不变的改动可能不计入改动清单（git racy-clean 检测失效）。
+- `delegate` 4.4.0 经 Codex 审查后修复：排队中收到 stop 不再可能在取得名额后照常验收；`DELEGATE_LANE_HELD` 不再泄漏给经 lane 启动的 run；终止 `lane` 进程会先结束其命令的整个进程组；命令组在回收 shell 之前清理，不会按可能被复用的 PGID 发信号；同事超时改用单调时钟；信号处理函数中不再做不可重入的等待或启动线程。只读 worktree 的 HEAD 重置为主控的提交，未提交改动在 `git diff HEAD` 中可见。
+- 新增 `docs/delegate-spec.md`：delegate 的实现契约（命令、输出、状态机、快照、lane、锁与文件），供其他实现与 harness 接入；不在技能目录内，技能加载时不读取。`tests/test_delegate.py` 改为纯黑盒一致性套件，`DELEGATE_BIN` 可指向任意实现。
 - `delegate` 4.3.0：只读任务在 git 仓库里默认于独立 worktree 读启动时的工作区快照（含未提交改动），主控同时编辑不再被误判为同事违规；`--in-place` 退回原地读取。state 只描述答复：只读任务改了文件时仍为 `answered`，另带 `readOnlyViolation`（worktree 内，已隔离、不能 `apply`）或 `workspaceChanged`（原地运行，无法区分改动归属）与 `warning`，不再判为 `failed`。结论行新增 `next`，按状态给出可直接执行的下一步（`wait` / `diff` / `apply` / `reply` 等），SKILL.md 状态表相应精简；补充按子系统拆分审查、用完成通知代替轮询的指引。只读 Pi 的 worktree 不执行 `setup`。
 - `agent-handoff` 2.1.1：只读委派的 worktree 不再列为"未合并"。
 - `openai-image-gen` 1.1.1：凭据改为优先使用 Codex 当前选中 provider 的 `base_url` 与 Bearer key，再退回 `auth.json` 的 key；`auth.json` 的 key 按 Codex 的规则发往选中 provider（`requires_openai_auth`）或官方 API。此前 `auth.json` 有 key 时总被发往官方 API，配置了代理的机器会直接 401。

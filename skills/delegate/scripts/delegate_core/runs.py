@@ -8,7 +8,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .common import ACTIVE, DEFAULT_LIMITS, FINISHED_OK, SCRIPT, STARTING_GRACE, die, read_json, setting
+from .common import (
+    ACTIVE, DEFAULT_LIMITS, DEFAULT_MIN_AVAILABLE_MB, FINISHED_OK, SCRIPT, STARTING_GRACE, die, read_json, setting,
+)
 from .worktree import remove_worktree
 
 
@@ -119,7 +121,7 @@ def status(run):
             out[key] = meta[key]["path"] if key == "worktree" else meta[key]
     if summary:
         for key in ("elapsedSeconds", "attempts", "model", "turns", "files", "changes", "accept", "readOnlyViolation",
-                    "workspaceChanged", "tokens", "warning", "error"):
+                    "workspaceChanged", "queuedSeconds", "graceSeconds", "tokens", "warning", "error"):
             if summary.get(key) not in (None, [], {}):
                 out[key] = summary[key]
     else:
@@ -208,12 +210,6 @@ def prune_expired():
 
 
 
-def state_dir():
-    # Deliberately not a DELEGATE_* setting: a delegated agent must not opt out of the machine's pool.
-    return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "delegate"
-
-
-
 def limit(name):
     value = setting(name, str(DEFAULT_LIMITS[name]))
     if not value.isdigit():
@@ -250,6 +246,31 @@ def capacity_error(agent, active):
     listing = "".join(f"\n  {status(run)['elapsedSeconds']:>5}s {kind:<5} {run}" for run, kind in zip(active, agents))
     return (f"refusing to start: {reason}; collect results with wait before starting more, or stop runs "
             f"no longer needed{listing}")
+
+
+
+def available_mb():
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+
+def memory_error(active):
+    """Refuse a start that would leave the machine short of memory, before the OOM killer picks a victim."""
+    floor = setting("MIN_AVAILABLE_MB", str(DEFAULT_MIN_AVAILABLE_MB))
+    if not floor.isdigit():
+        die(f"DELEGATE_MIN_AVAILABLE_MB must be a non-negative integer (0 = no check), got {floor!r}")
+    available = available_mb()
+    if not int(floor) or available is None or available >= int(floor):
+        return None
+    listing = "".join(f"\n  {status(run)['elapsedSeconds']:>5}s {run}" for run in active)
+    return (f"refusing to start: only {available} MB of memory available (DELEGATE_MIN_AVAILABLE_MB={floor}); "
+            f"collect results with wait, or stop runs no longer needed{listing}")
 
 
 

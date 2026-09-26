@@ -21,7 +21,7 @@ def snapshot(top, scratch, exclude=()):
     try:
         real = Path(top) / git(top, "rev-parse", "--git-path", "index").strip()
         if real.is_file():
-            shutil.copyfile(real, index)
+            shutil.copy2(real, index)  # keep its mtime: git relies on it to re-check racily clean entries
         limit_bytes = int(setting("SNAPSHOT_MAX_BYTES", str(LARGE_UNTRACKED)))
         large = {}
         for path in git(top, "ls-files", "-z", "--others", "--exclude-standard").split("\0"):

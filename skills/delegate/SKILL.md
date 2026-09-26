@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux；需要 python3（3.9+，仅标准库），以及所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "4.3.0"
+  version: "4.4.0"
   exclude-agents: pi
 ---
 
@@ -48,10 +48,13 @@ $D wait --all
 $D run --worktree --agent codex --name api --accept "make check" "给上传接口加大小限制"
 $D reply api "边界值也补上测试"   # 同一会话、同一 worktree 接着改
 $D apply api                     # 把 worktree 现状三方合并回原工作区，不碰 index；有冲突则什么都不写
+# 你自己的重检查也走整机队列，与同事的验收排队、一次一个
+$D lane make check
 ```
 
-- **等待方式按你所在的环境选**：能在后台运行命令并在结束时收到通知的环境，把 `run` 或 `wait --all` 放到后台，等通知，不要用 `status` 反复轮询；单次工具调用有时长上限的环境，给 `run`/`wait` 加 `--max 4m`，到时返回 75，稍后再 `wait`。`--max` 只结束本次等待，同事仍在后台运行；不再需要时用 `stop`。
+- **等待方式按你所在的环境选**：能在后台运行命令并在结束时收到通知的环境，把 `run` 或一个 `wait --all` 放到后台（不必每个任务各开一个），等通知，不要用 `status` 反复轮询；`wait` 阻塞在任务的锁上，任务一结束立即返回；单次工具调用有时长上限的环境，给 `run`/`wait` 加 `--max 4m`，到时返回 75，稍后再 `wait`。`--max` 只结束本次等待，同事仍在后台运行；不再需要时用 `stop`。
 - **只读任务读的是快照**：在 git 仓库里，`--read-only` 默认在独立 worktree 里读启动那一刻的工作区（含未提交改动），你可以同时继续改代码，不会被算到它头上；它若违规写了文件，也只留在它自己的 worktree 里。确实要它读实时工作区时加 `--in-place`。
+- **重检查排队**：验收命令、worktree 的 `setup`、同事自检（任务说明里会教它用 `lane`）和你的 `$D lane <命令>` 共用一条整机队列，默认同时只跑一个（`DELEGATE_MAX_HEAVY`），先到先跑；排队时间不计入任何超时，`$D lane` 不带命令时列出队列。同事超过 `--timeout` 时若仍在执行命令或刚有动静，最多再宽限 50%（`DELEGATE_TIMEOUT_GRACE`）；超时的命令连同它的整个进程组一起结束。
 - 有 `--accept` 时，脚本会把验收命令作为“完成标准”附在任务说明末尾；需要盲验时加 `--hide-accept`。`prompt.md` 保存同事实际收到的全文。多行任务说明用 `--prompt-file -` 加 heredoc；建议总加 `--name`，`reply`/`apply` 用它指代整段对话。
 
 ## 读结论并把关
@@ -73,11 +76,11 @@ state 只描述答复，工作区核验另列：只读任务改了文件时，�
 
 ## 边界
 
-1. **并发上限**：按整台机器计数（跨项目，含同事再委派的子任务），默认同时最多 6 个，其中 Codex 最多 3 个；超出时拒绝并列出正在运行的任务。先 `wait` 收一批结果再派。上限由用户通过 `DELEGATE_MAX_ACTIVE` / `DELEGATE_MAX_CODEX` 设定（`0` 为不限），同事不要自行调整；委派记录写在 git 忽略的 `.local/run/`，不算只读任务的改动。
+1. **并发上限**：按整台机器计数（跨项目，含同事再委派的子任务），默认同时最多 6 个，其中 Codex 最多 3 个；超出时拒绝并列出正在运行的任务。本机可用内存低于 `DELEGATE_MIN_AVAILABLE_MB`（默认 4096）时同样拒绝启动。先 `wait` 收一批结果再派。上限由用户通过 `DELEGATE_MAX_ACTIVE` / `DELEGATE_MAX_CODEX` 设定（`0` 为不限），同事不要自行调整；委派记录写在 git 忽略的 `.local/run/`，不算只读任务的改动。
 2. **委派层级**：主控可委派给 `pi` 和 `codex`；Codex 可把子任务再交给 `pi`，不能交给 `codex`；Pi 不能再委派（本技能也不会安装到 Pi 扫描的目录）。
 3. **权限与只读**：Codex 固定以 `--dangerously-bypass-approvals-and-sandbox`（full access）启动，不依赖各机器 `~/.codex/config.toml`；写入靠 git 回退兜底，采纳前照常看 diff。Pi 的只读模式移除写工具；Codex 的只读由任务说明写明边界，结束后用快照核对并报告改动。非 git 目录无法隔离也无法核对，这时只读任务优先交给 Pi。
 4. **写入互斥**：同一 workdir 同时只允许一个写入任务（委派者自己的 run 与 `--worktree` 除外）；原地改时，你同时编辑的文件也会算进它的改动，要并行就用 `--worktree`。
 5. **环境**：缺少 `pi` 时脚本给出随仓库附带的 pi-kit 安装命令；缺少 `codex` 时提示安装并登录。经非交互 SSH 调用时这些 CLI 往往只在登录 shell 的 `PATH` 里。
-6. **worktree 与依赖**：worktree 放在 `~/.cache/delegate/worktrees/`，git 忽略的东西（依赖、`.env`）不会带过去，在仓库根 `.delegate.json` 的 `worktree` 下声明：`copy` 小配置、`link` 大而只读的目录、`setup` 用包管理器离线重建依赖（pnpm/uv 从硬链接缓存装，秒级）。别 link `node_modules`/`.venv`：可编辑安装指向原仓库，测试会跑原仓库的代码。`clean` 删除最后一个使用它的 run 时一并删掉 worktree。
+6. **worktree 与依赖**：worktree 放在 `~/.cache/delegate/worktrees/`，git 忽略的东西（依赖、`.env`）不会带过去，在仓库根 `.delegate.json` 的 `worktree` 下声明：`copy` 小配置、`link` 大而只读的目录、`setup` 用包管理器离线重建依赖（pnpm/uv 从硬链接缓存装，秒级）；顶层 `env` 注入同事、验收和 setup 的环境变量，例如 `{"CUDA_VISIBLE_DEVICES": ""}` 让同事碰不到 GPU。别 link `node_modules`/`.venv`：可编辑安装指向原仓库，测试会跑原仓库的代码。`clean` 删除最后一个使用它的 run 时一并删掉 worktree。
 
-命令（`start`/`run`/`reply`/`wait`/`status`/`result`/`diff`/`apply`/`stop`/`clean`）与全部选项见 `$D --help`；run 目录、文件、环境变量与清理策略见 [references/output-and-files.md](references/output-and-files.md)。
+命令（`start`/`run`/`reply`/`wait`/`status`/`result`/`diff`/`apply`/`lane`/`stop`/`clean`）与全部选项见 `$D --help`；run 目录、文件、环境变量与清理策略见 [references/output-and-files.md](references/output-and-files.md)。

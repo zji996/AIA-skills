@@ -9,18 +9,41 @@ import tempfile
 from pathlib import Path
 
 from .changes import chain_changes, snapshot, tree_changes
-from .common import CONFIG_FILE, GUARD_VARS, SCRIPT, clip, die, git, now_iso, read_json, seconds, setting
+from .common import (
+    CONFIG_FILE, GUARD_VARS, LANE_HELD, SCRIPT, clip, die, git, now_iso, read_json, run_shell, seconds, setting,
+)
+from .lane import heavy_slot
+
+
+def read_config(path):
+    if not path.is_file():
+        return {}
+    try:
+        config = json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        die(f"cannot read {path}: {error}")
+    if not isinstance(config, dict):
+        die(f"{path}: expected a JSON object")
+    return config
+
+
+
+def delegate_env(top):
+    """`.delegate.json` "env": variables for agents, acceptance and setup (e.g. CUDA_VISIBLE_DEVICES="")."""
+    path = Path(top) / CONFIG_FILE
+    env = read_config(path).get("env") or {}
+    if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
+        die(f"{path}: env must map names to strings")
+    return env
+
 
 
 def worktree_config(top):
     """`.delegate.json` at the repo root: which ignored files a worktree copies or links, and setup commands."""
     path = Path(top) / CONFIG_FILE
-    if not path.is_file():
-        return {"copy": [], "link": [], "setup": []}
-    try:
-        config = json.loads(path.read_text()).get("worktree") or {}
-    except (OSError, ValueError, AttributeError) as error:
-        die(f"cannot read {path}: {error}")
+    config = read_config(path).get("worktree") or {}
+    if not isinstance(config, dict):
+        die(f"{path}: worktree must be an object")
     out = {}
     for key in ("copy", "link", "setup"):
         value = config.get(key) or []
@@ -55,6 +78,10 @@ def prepare_worktree(meta, run):
         commit = git(source, "commit-tree", meta["base"]["tree"], *(["-p", head] if head else []),
                      "-m", f"delegate: working tree of {source} for {run.name}", env={**os.environ, **identity}).strip()
         git(source, "worktree", "add", "--detach", str(path), commit)
+        if meta["mode"] == "read-only" and head:
+            # A reader sees what the caller sees: HEAD is the caller's commit, uncommitted work shows in
+            # `git diff HEAD` and `git status`. Files stay as they are; changes are measured by snapshot anyway.
+            git(str(path), "reset", "-q", head)
     except (OSError, subprocess.CalledProcessError) as error:
         detail = getattr(error, "stderr", None) or str(error)
         return f"worktree setup failed: {clip(str(detail).strip(), 300)}"
@@ -71,17 +98,18 @@ def prepare_worktree(meta, run):
             shutil.copytree(origin, target, symlinks=True)
         else:
             shutil.copy2(origin, target)
+    if not config["setup"]:
+        return None
     env = {k: v for k, v in os.environ.items() if k not in GUARD_VARS}
+    env.update(meta.get("env") or {})
+    env[LANE_HELD] = "1"
     timeout = seconds(setting("SETUP_TIMEOUT", "10m"))
-    with open(log, "a", encoding="utf-8") as out:
+    # Installing dependencies is heavy too; the timeout starts once the lane lets it run.
+    with heavy_slot(f"setup {run.name}"), open(log, "a", encoding="utf-8") as out:
         for command in config["setup"]:
             out.write(f"$ {command}\n")
             out.flush()
-            try:
-                code = subprocess.run(command, shell=True, cwd=path, stdout=out, stderr=subprocess.STDOUT,
-                                      env=env, timeout=timeout).returncode
-            except subprocess.TimeoutExpired:
-                code = 124
+            code, _ = run_shell(command, path, env, timeout, out)
             out.write(f"[exit {code}]\n")
             if code != 0:
                 return f"worktree setup command failed (exit {code}): {command}; see {log}"

@@ -14,8 +14,17 @@
 | `result [<run>] [--path]` | 输出完整答复 |
 | `stop <run>...` | 终止任务及其进程组 |
 | `clean <run>...\|--finished [--force]` | 删除已结束的任务；`--finished` 默认保留结果未读取的 |
+| `lane [--label <文字>] [--] <命令>` | 在整机重任务队列里执行命令（一个参数按 shell 命令执行），退出码原样返回；不带命令时列出正在跑与排队的项 |
 
 启动选项：`--agent pi|codex`、`--image <路径>`（可重复）、`--accept <命令>`、`--hide-accept`、`--accept-timeout`（默认 10m）、`--read-only`、`--in-place`（只读任务读实时工作区而非快照）、`--workdir`、`--timeout`（每次尝试，pi 默认 15m，codex 默认 30m）、`--retries`（答复畸形时重跑次数，默认 1）、`--model`/`--thinking`/`--provider`（不指定时用各 CLI 自己的默认设置；Codex 的 `--thinking` 对应推理强度）、`--allow-parallel-writes`、`--worktree`。`<run>` 可以是完整 id、唯一片段、`last` 或 run 目录。
+
+## 重任务队列（lane）
+
+整机一条先进先出队列，同时放行 `DELEGATE_MAX_HEAVY` 个（默认 1，`0` 不限）：验收命令、worktree `setup`、同事与主控用 `lane` 跑的检查都在这里排队。每个排队者在 `${XDG_STATE_HOME:-~/.local/state}/delegate/lane/` 下有一张按到达时间命名的票，持有其排他 flock 直到结束；等待者阻塞在前一张票的锁上，由内核在其结束或进程死亡时唤醒，不轮询，崩溃不留死锁。已在队列内的命令（带 `DELEGATE_LANE_HELD`）再调用 `lane` 直接执行，不会等自己。
+
+排队时间不计时：验收的 `--accept-timeout` 与 `setup` 的超时从拿到名额开始算；同事自己用 `lane` 排队的时间记在 run 目录的 `lane-wait`，从它的 `--timeout` 中扣除。验收与 setup 命令在独立进程组中运行，超时或结束后整组清理，不留后台残留。
+
+同事的超时：到 `--timeout`（不含排队）时若有命令正在执行，或 120 秒内有事件，继续运行，最多到 `--timeout` 的 `1 + DELEGATE_TIMEOUT_GRACE/100` 倍（默认 1.5 倍）；结论里 `graceSeconds` 记下超出的秒数。
 
 ## 改动清单
 
@@ -59,12 +68,14 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 | `prompt.md` | 同事实际收到的任务说明；末尾可能附完成标准（`--accept`）与只读边界（Codex 只读任务） |
 | `events.jsonl` | 过滤后的全过程：读取、命令、编辑路径、错误、每轮模型与用量、重跑；不含编辑全文 |
 | `result.md` | 最后一轮的完整答复 |
-| `summary.json` | 结论：`state`、`attempts`、`files`、`changes`、`accept`、`readOnlyViolation` / `workspaceChanged`、`warning`、`tokens`、`session`、`error`（`next` 由 `status` 按当前状态现算，不落盘） |
+| `summary.json` | 结论：`state`、`attempts`、`files`、`changes`、`accept`、`readOnlyViolation` / `workspaceChanged`、`queuedSeconds`（同事在 lane 中排队的秒数）、`graceSeconds`、`warning`、`tokens`、`session`、`error`（`next` 由 `status` 按当前状态现算，不落盘） |
 | `changes.json` / `changes.patch` | 前后快照的 tree、逐文件状态与行数；可直接 `git apply` 的补丁 |
 | `setup.log` | `--worktree` 的 `setup` 命令输出 |
 | `session/` / `fork/` | Pi 本轮的会话；`reply` 分叉所用的上一轮会话副本 |
 | `.applied` | `--worktree` 的改动已由 `apply` 合并 |
-| `accept.log` | 验收命令的完整输出与退出码 |
+| `accept.log` | 验收命令的完整输出与退出码；`summary.json` 的 `accept.queuedSeconds` 是它在 lane 中排队的秒数 |
+| `supervisor.lock` | supervisor 在世期间持有的 flock，`wait` 阻塞在它上面 |
+| `lane-wait` / `lane-waiting-*` | 同事在 lane 中已排队的秒数 / 正在排队的标记 |
 | `stderr.log` | 同事 CLI 的标准错误 |
 | `exit_code` | 结束标记：`0` 为 delivered/answered，`1` 为其他结局；运行中不存在 |
 | `.delivered` | 结果已被 `run`/`wait`/`result` 读取过 |
@@ -84,9 +95,13 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 | `DELEGATE_RUNS` | run 根目录 |
 | `DELEGATE_MAX_ACTIVE` | 整机同时运行的任务上限，默认 6；`0` 不限 |
 | `DELEGATE_MAX_CODEX` | 其中 Codex 任务上限，默认 3；`0` 不限 |
+| `DELEGATE_MAX_HEAVY` | lane 同时放行的重命令数，默认 1；`0` 不限 |
+| `DELEGATE_MIN_AVAILABLE_MB` | 可用内存低于该值（MB）时拒绝启动，默认 4096；`0` 不检查 |
+| `DELEGATE_TIMEOUT_GRACE` | 同事超时后仍在工作时的宽限百分比，默认 50 |
+| `DELEGATE_RUN_DIR` / `DELEGATE_LANE_HELD` | 由脚本导出：同事所在 run 目录（用于扣除排队时间）/ 已在 lane 名额内 |
 | `DELEGATE_RESULT_CHARS` | 答复超过该长度只显示末尾，默认 6000 |
 | `DELEGATE_KEEP_DAYS` | 自动清理天数，默认 7 |
-| `DELEGATE_POLL` | 等待时的检查间隔秒数，默认 1 |
+| `DELEGATE_POLL` | `wait --progress`、4.4 之前的 run 与刚启动的 supervisor 的检查间隔秒数，默认 1；其余等待不轮询 |
 | `DELEGATE_AGENT` | 由脚本导出给同事（`pi`/`codex`），用于执行委派层级 |
 | `DELEGATE_PARENT_RUN` | 由脚本导出给同事，值为其所在 run；它委派的写入任务不受这个 run 的写入互斥限制 |
 | `PI_DELEGATE_ACTIVE` | 旧版标记，仍导出给 Pi；存在时视为 Pi 调用者 |

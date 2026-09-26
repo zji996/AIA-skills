@@ -1,4 +1,3 @@
-import importlib.util
 import json
 import os
 import shlex
@@ -12,12 +11,20 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DELEGATE = ROOT / "skills/delegate/scripts/delegate.py"
+# Black-box conformance suite (docs/delegate-spec.md): every test drives the CLI as a subprocess, so any
+# implementation can be checked by pointing DELEGATE_BIN at its executable.
+DELEGATE = Path(os.environ.get("DELEGATE_BIN") or ROOT / "skills/delegate/scripts/delegate.py").resolve()
 
-spec = importlib.util.spec_from_file_location("delegate", DELEGATE)
-delegate = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(delegate)
-from delegate_core import agents  # noqa: E402 (importable once delegate.py has run)
+
+def process_gone(pid_file):
+    try:
+        pid = int(Path(pid_file).read_text())
+    except (OSError, ValueError):
+        return True
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
+    except OSError:
+        return True
 
 
 def answer(text, stop="stop"):
@@ -151,6 +158,130 @@ class DelegateTests(unittest.TestCase):
         state = self.outcome(self.cli("run", "--accept", "sleep 5", "--accept-timeout", "1", "task"))
         self.assertEqual((state["state"], state["accept"]["exitCode"]), ("rejected", 124))
 
+    def until(self, condition, what, timeout=10):
+        deadline = time.time() + timeout
+        while not condition():
+            if time.time() > deadline:
+                self.fail(f"timed out waiting for {what}")
+            time.sleep(0.05)
+
+    def hold_lane(self, seconds):
+        """Occupy the heavy lane from another process, as a caller's own check would."""
+        holder = subprocess.Popen([str(DELEGATE), "lane", "--label", "caller check", f"sleep {seconds}"], env=self.env)
+        self.addCleanup(holder.kill)
+        self.until(lambda: "caller check" in self.cli("lane").stdout, "the lane holder")
+        return holder
+
+    def test_lane_runs_heavy_commands_one_at_a_time(self):
+        # mkdir fails if another command still holds the directory: overlap would show as a failure.
+        command = "mkdir held && sleep 0.6 && rmdir held"
+        runs = [subprocess.Popen([str(DELEGATE), "lane", command], cwd=self.work, env=self.env,
+                                 stderr=subprocess.PIPE, text=True) for _ in range(3)]
+        self.until(lambda: self.cli("lane").stdout.count("\n") == 3, "three commands in the lane")
+        listing = self.cli("lane").stdout
+        self.assertEqual((listing.count("running"), listing.count("queued")), (1, 2), listing)
+        self.assertEqual([r.wait(timeout=20) for r in runs], [0, 0, 0])
+        self.assertTrue(any("queued behind" in r.stderr.read() for r in runs))
+        self.assertEqual(self.cli("lane").stdout, "")
+        # Inside a slot, a nested lane runs at once instead of waiting for itself; exit codes pass through.
+        self.assertEqual(self.cli("lane", f"{DELEGATE} lane true", timeout=10).returncode, 0)
+        self.assertEqual(self.cli("lane", "--", "sh", "-c", "exit 3").returncode, 3)
+        self.env["DELEGATE_MAX_HEAVY"] = "x"
+        self.assertEqual(self.cli("lane", "true").returncode, 2)
+
+    def test_acceptance_queues_in_the_lane_and_its_leftovers_are_killed(self):
+        self.fake_pi([answer("done"), SETTLED])
+        self.hold_lane(2)
+        # The accept timeout starts once the lane lets it run, so queueing longer than it is fine.
+        state = self.outcome(self.cli("run", "--accept", "sleep 30 & echo $! > bg.pid; true", "--accept-timeout", "1",
+                                      "task"))
+        self.assertEqual(state["state"], "delivered")
+        self.assertGreaterEqual(state["accept"]["queuedSeconds"], 1)
+        self.assertIn(f"{DELEGATE} lane 'sleep 30 & echo $! > bg.pid; true'",
+                      (Path(state["dir"]) / "prompt.md").read_text())
+        pid = int((self.work / "bg.pid").read_text())
+        self.until(lambda: not Path(f"/proc/{pid}").exists(), "the background leftover to go")  # killed with its group
+        state = self.outcome(self.cli("run", "--accept", "sleep 30 & echo $! > bg.pid; wait", "--accept-timeout", "1",
+                                      "task"))
+        self.assertEqual((state["state"], state["accept"]["exitCode"]), ("rejected", 124))
+        self.assertIn("[accept timed out]", state["accept"]["tail"])
+        pid = int((self.work / "bg.pid").read_text())
+        self.until(lambda: not Path(f"/proc/{pid}").exists(), "the timed-out check's group to go")
+
+    def test_stop_while_queued_never_accepts_and_lane_held_does_not_leak(self):
+        self.fake_pi([answer("done"), SETTLED])
+        holder = self.hold_lane(30)
+        run = self.outcome(self.cli("start", "--accept", "touch accepted", "task"))
+        self.until(lambda: f"accept {run['run']}" in self.cli("lane").stdout, "the acceptance to queue")
+        self.assertEqual(self.outcome(self.cli("stop", run["run"]))["state"], "stopped")
+        holder.kill()
+        self.until(lambda: process_gone(Path(run["dir"]) / "pid"), "the supervisor to exit")
+        self.assertFalse((self.work / "accepted").exists())
+        self.assertEqual(self.cli("lane").stdout, "")
+        # Started from inside a lane command, a run still queues: the slot it was started in is not its own.
+        self.hold_lane(2)
+        self.env["DELEGATE_LANE_HELD"] = "1"
+        state = self.outcome(self.cli("run", "--accept", "true", "task"))
+        self.assertGreaterEqual(state["accept"]["queuedSeconds"], 1)
+
+    def test_terminating_lane_ends_its_command_before_the_slot_is_free(self):
+        lane = subprocess.Popen([str(DELEGATE), "lane", "sleep 30 & echo $! > bg.pid; wait"], cwd=self.work,
+                                env=self.env)
+        self.until(lambda: (self.work / "bg.pid").is_file() and (self.work / "bg.pid").read_text().strip(),
+                   "the command to start")
+        pid = int((self.work / "bg.pid").read_text())
+        lane.terminate()
+        self.assertEqual(lane.wait(timeout=10), 128 + signal.SIGTERM)
+        self.assertFalse(Path(f"/proc/{pid}").exists() and "Z" not in Path(f"/proc/{pid}/stat").read_text().split()[2])
+        self.assertEqual(self.cli("lane").stdout, "")
+
+    def test_timeout_grace_while_at_work_and_queue_time_is_free(self):
+        start = {"type": "tool_execution_start", "toolName": "bash", "args": {"command": "make check"}}
+        end = {"type": "tool_execution_end", "toolName": "bash"}
+        lines = ["#!/bin/sh", "cat > /dev/null", f"printf '%s\\n' {shlex.quote(json.dumps(start))}", "sleep 1.8",
+                 f"printf '%s\\n' {' '.join(shlex.quote(json.dumps(e)) for e in (end, answer('checked'), SETTLED))}"]
+        (self.bin / "pi").write_text("\n".join(lines) + "\n")
+        (self.bin / "pi").chmod(0o755)
+        # A command in progress at the timeout earns up to DELEGATE_TIMEOUT_GRACE percent more.
+        self.env["DELEGATE_TIMEOUT_GRACE"] = "100"
+        state = self.outcome(self.cli("run", "--timeout", "1", "task"))
+        self.assertEqual(state["state"], "answered")
+        self.assertGreaterEqual(state["graceSeconds"], 0)
+        self.env["DELEGATE_TIMEOUT_GRACE"] = "0"
+        self.assertEqual(self.outcome(self.cli("run", "--timeout", "1", "task"))["state"], "timeout")
+        # Waiting in the lane for its own check does not use up the agent's time.
+        self.fake_pi([answer("checked"), SETTLED], pre=f"{DELEGATE} lane true")
+        self.hold_lane(2.5)
+        state = self.outcome(self.cli("run", "--timeout", "1", "task"))
+        self.assertEqual(state["state"], "answered")
+        self.assertGreaterEqual(state["queuedSeconds"], 1)
+
+    def test_low_memory_refuses_to_start(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        self.env["DELEGATE_MIN_AVAILABLE_MB"] = str(1 << 40)
+        result = self.cli("start", "--read-only", "task")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("MB of memory available", result.stderr)
+        self.env["DELEGATE_MIN_AVAILABLE_MB"] = "0"
+        self.assertEqual(self.outcome(self.cli("run", "--read-only", "task"))["state"], "answered")
+
+    def test_config_env_reaches_agent_acceptance_and_setup(self):
+        repo = self.repo({"a.txt": "a\n", ".gitignore": "setup.env\n"})
+        (repo / ".delegate.json").write_text(json.dumps({"env": {"CUDA_VISIBLE_DEVICES": ""}, "worktree": {
+            "setup": ['echo "[${CUDA_VISIBLE_DEVICES-unset}]" > setup.env']}}))
+        self.env["CUDA_VISIBLE_DEVICES"] = "0"
+        self.fake_pi([answer("done"), SETTLED], pre='echo "[${CUDA_VISIBLE_DEVICES-unset}]" > agent.env')
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo,
+                                      "--accept", 'test "[${CUDA_VISIBLE_DEVICES-unset}]" = "[]"', "task"))
+        self.assertEqual(state["state"], "delivered")
+        tree = Path(state["worktree"])
+        self.assertEqual(((tree / "agent.env").read_text(), (tree / "setup.env").read_text()), ("[]\n", "[]\n"))
+        self.fake_pi([answer("again"), SETTLED], pre='echo "[${CUDA_VISIBLE_DEVICES-unset}]" > reply.env')
+        self.outcome(self.cli("reply", state["run"], "more"))
+        self.assertEqual((tree / "reply.env").read_text(), "[]\n")  # a reply keeps its conversation's env
+        (repo / ".delegate.json").write_text(json.dumps({"env": {"X": 1}}))
+        self.assertIn("env must map names to strings", self.cli("run", "--workdir", repo, "task").stderr)
+
     def test_leaked_tool_call_is_rerun_once(self):
         self.fake_pi([answer(LEAKED), SETTLED], [answer("real answer"), SETTLED])
         result = self.cli("run", "--read-only", "review")
@@ -186,9 +317,10 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(self.outcome(self.cli("run", "task"))["state"], "killed")
 
     def test_leak_detector_ignores_normal_prose(self):
-        self.assertTrue(agents.leaked_tool_call(LEAKED))
-        self.assertFalse(agents.leaked_tool_call("Use `call:default_api:read{...}` carefully.\nDone."))
-        self.assertFalse(agents.leaked_tool_call("Result: {a: 1}"))
+        for text, state in ((LEAKED, "malformed"), ("Use `call:default_api:read{...}` carefully.\nDone.", "answered"),
+                            ("Result: {a: 1}", "answered")):
+            self.fake_pi([answer(text), SETTLED])
+            self.assertEqual(self.outcome(self.cli("run", "--retries", "0", "task"))["state"], state, text)
 
     def test_nested_delegation_is_refused_and_guard_exported(self):
         self.fake_pi([answer("ok"), SETTLED])
@@ -387,13 +519,17 @@ class DelegateTests(unittest.TestCase):
             self.assertNotIn(key, state)
         worktree = Path(state["worktree"])
         self.assertEqual((worktree / "a.txt").read_text(), "a\nuncommitted\n")  # it read what the caller had
+        # ...and sees it as the caller does: uncommitted, on top of the caller's HEAD.
+        self.assertIn("+uncommitted", subprocess.run(["git", "-C", str(worktree), "diff", "HEAD"],
+                                                     capture_output=True, text=True).stdout)
         self.assertTrue((worktree / "setup-ran").exists())  # Codex may run commands, so setup runs
         self.assertEqual((repo / "a.txt").read_text(), "a\nuncommitted\ncaller\n")
         self.fake_pi([answer("ok"), SETTLED])
         pi = self.outcome(self.cli("run", "--read-only", "--workdir", repo, "review"))
         self.assertFalse((Path(pi["worktree"]) / "setup-ran").exists())  # read-only Pi has no shell
-        self.assertFalse(delegate.unmerged_worktree(Path(pi["dir"])))
-        self.assertIn("removed", self.cli("clean", pi["run"]).stdout)
+        cleaned = self.cli("clean", pi["run"]).stdout
+        self.assertIn("removed", cleaned)
+        self.assertNotIn("never applied", cleaned)  # a read-only worktree has nothing to merge
         self.assertFalse(Path(pi["worktree"]).exists())
 
     def test_nesting_rules(self):

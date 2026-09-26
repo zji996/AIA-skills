@@ -25,20 +25,23 @@ Standard library only; Linux (process groups, /proc). Python 3.9+.
 
 import argparse
 import os
+import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # delegate_core/ sits next to this script
 
-from delegate_core.agents import kill_group, missing_tools, nesting_error, session_file
+from delegate_core.agents import missing_tools, nesting_error, session_file
 from delegate_core.changes import chain_changes, print_changes
 from delegate_core.common import (
-    ACTIVE, AGENTS, DEFAULT_TIMEOUT, FINISHED_OK, RUNNING_EXIT, SCRIPT, die, emit, read_json, seconds, setting,
-    write_json,
+    ACTIVE, AGENTS, DEFAULT_TIMEOUT, ENV_RUN_DIR, FINISHED_OK, LANE_HELD, RUNNING_EXIT, SCRIPT, clip, die, emit,
+    end_group, kill_group, read_json, seconds, setting, write_json,
 )
+from delegate_core.lane import block_on, heavy_slot, holders
 from delegate_core.launch import launch, read_prompt, start_run
 from delegate_core.runs import (
     agent_alive, all_runs, events, latest_in_chain, remove_run, resolve_run, run_state, status, unmerged_worktree,
@@ -72,6 +75,22 @@ def show_progress(run, tag):
 
 
 
+def sleep_on_supervisors(runs, timeout):
+    """Block until every run's supervisor has exited (its lifetime lock is released) or timeout passes.
+    False when some run has no lock to wait on yet: a supervisor still starting, or a run from before 4.3."""
+    locks = [run / "supervisor.lock" for run in runs if run_state(run) in ACTIVE]
+    if not all(lock.is_file() for lock in locks):
+        return False
+    threads = [threading.Thread(target=block_on, args=(lock,), daemon=True) for lock in locks]
+    for thread in threads:
+        thread.start()
+    deadline = None if timeout is None else time.time() + timeout
+    for thread in threads:
+        thread.join(None if deadline is None else max(0.0, deadline - time.time()))
+    return True
+
+
+
 def collect(runs, max_seconds, progress, full, show_result):
     deadline = None if max_seconds is None else time.time() + max_seconds
     poll = float(setting("POLL", "1"))
@@ -83,7 +102,10 @@ def collect(runs, max_seconds, progress, full, show_result):
             active |= run_state(run) in ACTIVE
         if not active or (deadline is not None and time.time() >= deadline):
             break
-        time.sleep(poll)
+        left = None if deadline is None else deadline - time.time()
+        # --progress reports as things happen, so it looks every poll; otherwise sleep until the runs end.
+        if progress or not sleep_on_supervisors(runs, left):
+            time.sleep(poll if left is None else min(poll, left))
     code = 0
     for run in runs:
         state = run_state(run)
@@ -246,6 +268,46 @@ def cmd_stop(args):
 
 
 
+def cmd_lane(args):
+    """Run a heavy command in the machine's heavy lane, or list the lane."""
+    words = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
+    if not words:
+        for label, since, running in holders():
+            print(f"{'running' if running else 'queued ':<8} {since}  {label}")
+        return 0
+    command = words[0] if len(words) == 1 else shlex.join(words)
+    label = args.label or f"{Path.cwd().name}: {clip(command, 80)}"
+    shown = []
+
+    def waiting(ahead, labels):
+        if not shown:
+            print(f"delegate lane: queued behind {ahead}: {'; '.join(map(str, labels))}", file=sys.stderr, flush=True)
+            shown.append(True)
+
+    with heavy_slot(label, waiting, account=os.environ.get(ENV_RUN_DIR)) as queued:
+        if shown:
+            print(f"delegate lane: started after {queued:.0f}s in the queue", file=sys.stderr, flush=True)
+        env = {**os.environ, LANE_HELD: "1"}
+        # Its own group, so a signal to this process (or to the caller's group, e.g. an agent at its timeout)
+        # ends the whole command before the slot is given up, not just the shell.
+        proc = subprocess.Popen(command, shell=True, env=env, start_new_session=True)
+        stopped = [None]
+
+        def forward(signum, _frame):
+            if stopped[0] is not None:
+                return
+            stopped[0] = signum
+            end_group(proc.pid, 3)  # inside the 5 s a caller's kill_group allows before SIGKILL
+
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, forward)
+        code = proc.wait()
+        if stopped[0] is not None:
+            return 128 + stopped[0]
+        return code if code >= 0 else 128 - code
+
+
+
 def cmd_clean(args):
     if not args.finished and not args.runs:
         die("clean requires runs or --finished")
@@ -352,6 +414,13 @@ def parser():
     result.add_argument("--path", action="store_true")
     stop = sub.add_parser("stop", help="terminate runs")
     stop.add_argument("runs", nargs="+")
+    lane = sub.add_parser("lane", help="run a heavy command (e.g. make check) one at a time per machine; no command "
+                                       "lists the lane",
+                          description="Queue a heavy command with every other check on this machine: acceptance "
+                                      "commands, worktree setup, agents' own checks. DELEGATE_MAX_HEAVY run at once "
+                                      "(default 1). A single argument is a shell command.")
+    lane.add_argument("--label", help="what the lane listing shows for this command")
+    lane.add_argument("cmd", nargs=argparse.REMAINDER, metavar="command")
     clean = sub.add_parser("clean", help="delete finished runs")
     clean.add_argument("runs", nargs="*")
     clean.add_argument("--finished", action="store_true")
@@ -373,7 +442,7 @@ def main(argv):
                 die(str(error))
     handler = {"start": cmd_start, "run": cmd_run, "reply": cmd_reply, "diff": cmd_diff, "apply": cmd_apply,
                "wait": cmd_wait, "status": cmd_status, "list": cmd_status,
-               "result": cmd_result, "stop": cmd_stop, "clean": cmd_clean}[args.command]
+               "result": cmd_result, "stop": cmd_stop, "clean": cmd_clean, "lane": cmd_lane}[args.command]
     return handler(args)
 
 

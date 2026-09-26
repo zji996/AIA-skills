@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -12,11 +13,13 @@ from pathlib import Path
 
 from .agents import missing_tools, nesting_error, session_file
 from .changes import snapshot
-from .common import ACTIVE, DEFAULT_TIMEOUT, SCRIPT, die, git_top, now_iso, read_json, seconds, setting, write_json
-from .runs import (
-    agent_alive, all_runs, capacity_error, machine_runs, prune_expired, replies_to, run_state, runs_root, state_dir,
+from .common import (
+    ACTIVE, DEFAULT_TIMEOUT, LANE_HELD, SCRIPT, die, git_top, now_iso, read_json, seconds, setting, state_dir, write_json,
 )
-from .worktree import worktree_config, worktrees_dir
+from .runs import (
+    agent_alive, all_runs, capacity_error, machine_runs, memory_error, prune_expired, replies_to, run_state, runs_root,
+)
+from .worktree import delegate_env, worktree_config, worktrees_dir
 
 
 def read_prompt(args):
@@ -57,10 +60,11 @@ def start_run(args):
         die("--in-place is for --read-only runs; write runs work in place unless --worktree is given")
     if args.in_place and args.worktree:
         die("--in-place and --worktree contradict each other")
-    extra = {}
+    repo = git_top(workdir)
+    extra = {"env": delegate_env(repo) if repo else {}}
     # A read-only run reads a snapshot of the working tree, so the caller may keep editing meanwhile without
     # its edits being taken for the run's; outside git there is nothing to snapshot and it reads in place.
-    top = git_top(workdir) if args.worktree or (args.read_only and not args.in_place) else None
+    top = repo if args.worktree or (args.read_only and not args.in_place) else None
     if args.worktree and not top:
         die(f"--worktree needs a git repository: {workdir}")
     if top:
@@ -81,7 +85,8 @@ def launch(args, prompt, workdir, mode, extra):
     with open(slots / ".start.lock", "w") as machine_lock, open(root / ".start.lock", "w") as lock:
         fcntl.flock(machine_lock, fcntl.LOCK_EX)
         fcntl.flock(lock, fcntl.LOCK_EX)
-        error = capacity_error(args.agent, machine_runs(slots))
+        active = machine_runs(slots)
+        error = capacity_error(args.agent, active) or memory_error(active)
         if error:
             die(error)
         run = create_run(args, prompt, workdir, mode, root, extra)
@@ -106,7 +111,12 @@ def with_contract(prompt, accept=None, read_only=False, revoked=False):
     if accept:
         notes.append(("完成标准：你结束后，委派方会在工作目录中运行下面的命令，退出码为 0 即视为完成。" if zh else
                       "Definition of done: after you finish, the delegator runs this command in the working directory; "
-                      "exit code 0 counts as complete.") + f"\n\n```sh\n{accept}\n```")
+                      "exit code 0 counts as complete.") + f"\n\n```sh\n{accept}\n```\n\n" +
+                     (f"自己跑这条命令或其他耗时的检查时，前面加 `{SCRIPT} lane`（如 `{SCRIPT} lane {shlex.quote(accept)}`）："
+                      "它与本机其他检查排队、一次只跑一个，排队时间不计入你的时限。" if zh else
+                      f"When you run this or another heavy check yourself, prefix it with `{SCRIPT} lane` (e.g. "
+                      f"`{SCRIPT} lane {shlex.quote(accept)}`): it queues with the other checks on this machine, one at a time, "
+                      "and time spent queued does not count against your time limit."))
     if not notes:
         return prompt
     return prompt.rstrip("\n") + "\n\n---\n" + "\n\n".join(notes) + "\n"
@@ -179,6 +189,7 @@ def create_run(args, prompt, workdir, mode, root, extra):
             "accept": args.accept, "acceptTimeoutSeconds": seconds(args.accept_timeout),
             "retries": args.retries, "images": args.image,
             "top": top, "base": base, "snapshotExclude": exclude, "worktree": tree,
+            "env": extra.get("env") if "env" in extra else (parent or {}).get("env") or {},
             "chainBase": (parent or {}).get("chainBase") or (base or {}).get("tree"),
             "sessionDir": str(run / "session"),
             "parent": (parent or {}).get("run"), "fork": fork,
@@ -187,8 +198,10 @@ def create_run(args, prompt, workdir, mode, root, extra):
     # Only now: pruning may remove a reply's parent, whose session and worktree this run has taken over.
     prune_expired()
     with open(run / "supervisor.log", "wb") as log:
+        # Not LANE_HELD, when started from inside a `lane` command: the run outlives that slot.
         subprocess.Popen([sys.executable, str(SCRIPT), "_supervise", str(run)], stdin=subprocess.DEVNULL,
-                         stdout=log, stderr=log, start_new_session=True)
+                         stdout=log, stderr=log, start_new_session=True,
+                         env={k: v for k, v in os.environ.items() if k != LANE_HELD})
     for _ in range(50):
         if (run / "pid").is_file():
             return run

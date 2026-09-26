@@ -4,14 +4,17 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import threading
 import time
 import uuid
 from pathlib import Path
 
-from .common import ENV_AGENT, ENV_LEGACY, ENV_PARENT, GUARD_VARS, SCRIPT, clip, die, now_iso, setting
+from .common import (
+    BUSY_WINDOW, DEFAULT_TIMEOUT_GRACE, ENV_AGENT, ENV_LEGACY, ENV_PARENT, ENV_RUN_DIR, GUARD_VARS, SCRIPT, clip, die,
+    kill_group, now_iso, setting,
+)
+from .lane import queued_seconds
 
 
 # Pi-side glitch: a tool call printed as plain text ends the run with no work done.
@@ -140,8 +143,10 @@ def session_file(directory, session):
 
 def agent_env(meta):
     env = {k: v for k, v in os.environ.items() if k not in GUARD_VARS}
+    env.update(meta.get("env") or {})  # .delegate.json, e.g. CUDA_VISIBLE_DEVICES="" to keep agents off the GPU
     env[ENV_AGENT] = meta["agent"]
     env[ENV_PARENT] = meta["run"]
+    env[ENV_RUN_DIR] = meta["dir"]
     if meta["agent"] == "pi":
         env[ENV_LEGACY] = "1"  # older scripts only know this flag
     return env
@@ -177,7 +182,8 @@ def run_agent(meta, run, attempt, stop_flag, holder):
     known = set(Path(meta["sessionDir"]).glob("*.jsonl")) if not codex else set()
     command, env = agent_command(meta, session), agent_env(meta)
     convert = filter_codex_event if codex else filter_event
-    timed_out = threading.Event()
+    timed_out, finished = threading.Event(), threading.Event()
+    activity = {"last": time.monotonic(), "commands": 0}  # monotonic: a clock step must not end a run
     with open(run / "prompt.md", "rb") as prompt, open(run / "stderr.log", "ab") as stderr, \
             open(run / "events.jsonl", "a", encoding="utf-8") as log:
         if session:
@@ -187,13 +193,28 @@ def run_agent(meta, run, attempt, stop_flag, holder):
         holder["pgid"] = proc.pid
         (run / "agent.pid").write_text(str(proc.pid))
 
-        def expire():
-            timed_out.set()
-            kill_group(proc.pid)
+        def watch():
+            """--timeout, not counting time queued in the heavy lane; past it, grace while visibly at work."""
+            started, soft = time.monotonic(), meta["timeoutSeconds"]
+            grace = setting("TIMEOUT_GRACE", str(DEFAULT_TIMEOUT_GRACE))
+            hard = soft * (1 + (int(grace) if grace.isdigit() else DEFAULT_TIMEOUT_GRACE) / 100)
+            pause = soft
+            # Wake only when the verdict could change: time queued only ever pushes the deadline later.
+            while not finished.wait(max(pause, 0.05)):
+                spent = time.monotonic() - started - queued_seconds(run)
+                if spent < soft:
+                    pause = soft - spent
+                    continue
+                idle = time.monotonic() - activity["last"]
+                if spent < hard and (activity["commands"] > 0 or idle < BUSY_WINDOW):
+                    holder["graceSeconds"] = round(spent - soft, 1)
+                    pause = min(hard - spent, BUSY_WINDOW - idle if not activity["commands"] else hard - spent)
+                    continue
+                timed_out.set()
+                kill_group(proc.pid)
+                return
 
-        timer = threading.Timer(meta["timeoutSeconds"], expire)
-        timer.daemon = True
-        timer.start()
+        threading.Thread(target=watch, daemon=True).start()
         turn, answer, settled = None, "", False
         for raw in proc.stdout:
             try:
@@ -204,6 +225,9 @@ def run_agent(meta, run, attempt, stop_flag, holder):
                 if codex and item["e"] == "turn":
                     item["model"] = meta.get("model") or codex_model()
                 item.update(attempt=attempt, at=now_iso())
+                activity["last"] = time.monotonic()
+                if item["e"] in ("bash", "bash_done"):
+                    activity["commands"] = max(0, activity["commands"] + (1 if item["e"] == "bash" else -1))
                 log.write(json.dumps(item, ensure_ascii=False) + "\n")
                 log.flush()
                 if item["e"] == "turn":
@@ -219,7 +243,8 @@ def run_agent(meta, run, attempt, stop_flag, holder):
                 elif item["e"] == "turn_error":
                     turn = {"stopReason": "error"}
         code = proc.wait()
-        timer.cancel()
+        holder.pop("pgid", None)  # reaped: its pid may be reused, so a later stop must not signal it
+        finished.set()
         # Pi names a forked session itself (<time>_<id>.jsonl): record the one this attempt created.
         created = sorted(set(Path(meta["sessionDir"]).glob("*.jsonl")) - known) if not codex else []
         if created:
@@ -236,25 +261,6 @@ def run_agent(meta, run, attempt, stop_flag, holder):
             return "malformed", answer
         return "ok", answer
     return "failed", answer
-
-
-
-def kill_group(pgid, grace=5.0):
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    deadline = time.time() + grace
-    while time.time() < deadline:
-        try:
-            os.killpg(pgid, 0)
-        except ProcessLookupError:
-            return
-        time.sleep(0.1)
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
 
 
 
