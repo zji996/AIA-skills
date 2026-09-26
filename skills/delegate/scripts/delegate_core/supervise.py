@@ -1,17 +1,23 @@
 """The background supervisor: attempts, acceptance, and the summary."""
 
+import fcntl
 import json
 import os
+import shutil
 import signal
 import subprocess
 import threading
 import time
 from pathlib import Path
 
-from .agents import run_agent
+from .agents import run_agent, tier_agent
 from .changes import record_changes, relative_to
-from .common import FINISHED_OK, GUARD_VARS, LANE_HELD, clip, kill_group, now_iso, read_json, run_shell, write_json
+from .common import (
+    FINISHED_OK, GUARD_VARS, LANE_HELD, clip, kill_group, now_iso, read_json, run_shell, state_dir, write_json,
+)
 from .lane import WAITING, Cancelled, heavy_slot, locked_file, queued_seconds
+from .launch import with_contract
+from .runs import capacity_error, machine_runs
 from .runs import events
 from .worktree import prepare_worktree
 
@@ -52,6 +58,36 @@ def accept(meta, run, holder, stop_flag):
 
 
 
+def escalate(meta, run, state, recorded, changed):
+    """Hand a failed cheap-tier run to the strong tier, once, when that cannot build on half-done work.
+
+    Only runs whose tier was chosen (not --agent) qualify, and only when read-only or nothing was changed.
+    The strong tier must be installed and have room; meta.json is updated under the start lock, so the machine
+    pool counts the run as the strong agent from now on, and a reply continues the strong agent's session.
+    """
+    if meta.get("tier") != "cheap" or state not in ("malformed", "failed", "timeout", "rejected"):
+        return False
+    if meta["mode"] != "read-only" and (not recorded or changed):
+        return False
+    strong = tier_agent("strong")
+    if strong == meta["agent"] or not shutil.which(strong):
+        return False
+    slots = state_dir()
+    with open(slots / ".start.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if capacity_error(strong, [r for r in machine_runs(slots) if r != run]):
+            log_event(run, {"e": "escalate_skipped", "reason": f"no room for {strong}"})
+            return False
+        if meta["mode"] == "read-only" and strong == "codex":
+            # Pi's read-only mode needed no words; Codex is unsandboxed and must be told.
+            prompt = (run / "prompt.md").read_text(encoding="utf-8")
+            (run / "prompt.md").write_text(with_contract(prompt, read_only=True), encoding="utf-8")
+        meta.update(agent=strong, tier="strong", fork=None, escalatedFrom=meta["agent"])
+        write_json(run / "meta.json", meta)
+    return True
+
+
+
 def supervise(run):
     # Held until this process exits, however it exits: `wait` sleeps on it instead of polling.
     lifetime = locked_file(run / "supervisor.lock", str(os.getpid()))  # noqa: F841 (kept open on purpose)
@@ -74,50 +110,72 @@ def supervise(run):
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, on_stop)
     started = time.time()
-    verdict, answer, attempts, setup_error = "failed", "", 0, None
+
+    def attempts_from(first):
+        """Run the agent until its answer is not malformed or the reruns are spent: (verdict, answer, attempt)."""
+        verdict, answer, attempt = "failed", "", first - 1
+        try:
+            for attempt in range(first, first + meta["retries"] + 1):
+                if stop_flag.is_set():  # stopped during worktree setup or between attempts
+                    return "stopped", answer, attempt
+                verdict, answer = run_agent(meta, run, attempt, stop_flag, holder)
+                if verdict != "malformed" or attempt >= first + meta["retries"]:
+                    break
+                log_event(run, {"e": "rerun", "reason": "malformed answer"})
+        except Exception as error:  # the summary must always be written
+            verdict = "failed"
+            with open(run / "stderr.log", "a") as log:
+                log.write(f"supervisor error: {error!r}\n")
+        return verdict, answer, attempt
+
+    def settle(verdict):
+        """Snapshot, check read-only and accept: (state, summary, recorded, changed)."""
+        state = {"ok": "answered"}.get(verdict, verdict)
+        summary = {"state": state}
+        # Measure the agent's changes before acceptance, whose own byproducts (caches, reports) are not its work.
+        try:
+            recorded = None if setup_error else record_changes(meta, run)
+        except (OSError, subprocess.CalledProcessError):
+            recorded = None
+        changed = [c["path"] for c in recorded[0]] if recorded else []
+        if recorded:
+            summary["changes"] = recorded[1]
+        elif meta.get("top") and not setup_error:
+            # Say so rather than report "no changes": a read-only run could not be verified either.
+            summary["warning"] = "could not snapshot the working tree; changes are unknown"
+        if meta["mode"] == "read-only" and changed and verdict == "ok":
+            # Codex runs unsandboxed, so read-only is checked by outcome. The answer still stands on its own: the
+            # state says whether there is one, and the changes are reported beside it.
+            if meta.get("worktree"):
+                summary["readOnlyViolation"] = changed
+                summary["warning"] = ("the read-only run changed files in its own worktree; "
+                                      "they stay there, never applied")
+            else:
+                # In place, the caller's own edits during the run land in the same snapshot; they cannot be told
+                # apart.
+                summary["workspaceChanged"] = changed
+                summary["warning"] = ("the working tree changed during this in-place read-only run; "
+                                      "the changes may be the caller's own")
+        if verdict == "ok" and meta.get("accept") and not stop_flag.is_set():
+            summary["accept"] = accept(meta, run, holder, stop_flag)
+            state = summary["state"] = "delivered" if summary["accept"]["ok"] else "rejected"
+        return state, summary, recorded, changed
+
+    setup_error = None
     try:
         if meta.get("worktree") and not Path(meta["worktree"]["path"]).exists():
             setup_error = prepare_worktree(meta, run)
-        for attempts in range(1, 0 if setup_error else meta["retries"] + 2):
-            if stop_flag.is_set():  # stopped during worktree setup or between attempts
-                verdict = "stopped"
-                break
-            verdict, answer = run_agent(meta, run, attempts, stop_flag, holder)
-            if verdict != "malformed" or attempts > meta["retries"]:
-                break
-            with open(run / "events.jsonl", "a", encoding="utf-8") as log:
-                log.write(json.dumps({"e": "rerun", "reason": "malformed answer", "at": now_iso()}) + "\n")
-    except Exception as error:  # the summary must always be written
-        verdict = "failed"
-        with open(run / "stderr.log", "a") as log:
-            log.write(f"supervisor error: {error!r}\n")
-    state = {"ok": "answered"}.get(verdict, verdict)
-    summary = {"state": state, "attempts": attempts}
-    # Measure the agent's changes before acceptance, whose own byproducts (caches, reports) are not its work.
-    try:
-        recorded = None if setup_error else record_changes(meta, run)
-    except (OSError, subprocess.CalledProcessError):
-        recorded = None
-    changed = [c["path"] for c in recorded[0]] if recorded else []
-    if recorded:
-        summary["changes"] = recorded[1]
-    elif meta.get("top") and not setup_error:
-        # Say so rather than report "no changes": a read-only run could not be verified either.
-        summary["warning"] = "could not snapshot the working tree; changes are unknown"
-    if meta["mode"] == "read-only" and changed and verdict == "ok":
-        # Codex runs unsandboxed, so read-only is checked by outcome. The answer still stands on its own: the
-        # state says whether there is one, and the changes are reported beside it.
-        if meta.get("worktree"):
-            summary["readOnlyViolation"] = changed
-            summary["warning"] = "the read-only run changed files in its own worktree; they stay there, never applied"
-        else:
-            # In place, the caller's own edits during the run land in the same snapshot; they cannot be told apart.
-            summary["workspaceChanged"] = changed
-            summary["warning"] = ("the working tree changed during this in-place read-only run; "
-                                  "the changes may be the caller's own")
-    if verdict == "ok" and meta.get("accept") and not stop_flag.is_set():
-        summary["accept"] = accept(meta, run, holder, stop_flag)
-        state = summary["state"] = "delivered" if summary["accept"]["ok"] else "rejected"
+    except Exception as error:
+        setup_error = clip(f"worktree setup failed: {error!r}", 300)
+    verdict, answer, attempts = ("failed", "", 0) if setup_error else attempts_from(1)
+    state, summary, recorded, changed = settle(verdict)
+    cheap = meta["agent"]
+    if not stop_flag.is_set() and escalate(meta, run, state, recorded, changed):
+        log_event(run, {"e": "escalate", "from": cheap, "to": meta["agent"], "after": state})
+        verdict, answer, attempts = attempts_from(attempts + 1)
+        state, summary, recorded, changed = settle(verdict)
+        summary["escalatedFrom"] = cheap
+    summary["attempts"] = attempts
     if answer.strip():
         (run / "result.md").write_text(answer.rstrip("\n") + "\n", encoding="utf-8")
     evs = events(run)

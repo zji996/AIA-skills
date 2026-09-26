@@ -20,7 +20,7 @@
 | --- | --- | --- |
 | **`repo-governance`** | `skills/repo-governance/` | **上下文治理与审计**：定义 `AGENTS.md`、`docs/current.md`、决策记录的信息分层；`audit-context.py` 只读检查入口文件过长、下一步堆积、`.local/` 未忽略、文档断链等漂移问题。 |
 | **`agent-handoff`** | `skills/agent-handoff/` | **会话交接**：`handoff-snapshot.sh` 自动采集分支、HEAD、未提交文件、最近提交、未读取的委派任务与未合并的 worktree，生成交接账本草稿，模型只需补充判断部分。 |
-| **`delegate`** | `skills/delegate/` | **同事 Agent 委派**（4.0 前名为 `pi-delegation`）：主控主动把可验收的原子任务交给同事并行完成、只收结果——Pi（Gemini：说人话、便宜快速、够用，后端逻辑偏弱）或 Codex（GPT：谨慎、逻辑强，full access 运行），两者都能读图（`--image`）；脚本代跑 `--accept` 验收命令并给出一行结论（delivered / answered / rejected / malformed…）和按快照计算的改动清单（`diff` 看全文），过程留在 run 目录不进主控上下文；只读任务在 git 仓库里默认读 worktree 快照，主控可同时改代码而不被误判，state 只描述答复、工作区核验另列；结论行带 `next` 给出下一步命令；验收、setup 与检查走整机先进先出的重任务队列（`lane`，默认一次一个，flock 唤醒不轮询，排队不计时），超时后仍在工作可宽限，低内存拒绝启动，`.delegate.json` 的 `env` 可让同事碰不到 GPU；`--worktree` 隔离运行（`.delegate.json` 声明依赖怎么准备），`apply` 三方合并回来，`reply` 在同一会话里追问；整机并发上限（默认 6 个，其中 Codex 3 个）、写入互斥、按层级限制嵌套（Codex 可再委派给 Pi，Pi 不能再委派），且不会安装给 Pi 自己。 |
+| **`delegate`** | `skills/delegate/` | **同事 Agent 委派**：主控把可验收的原子任务交给同事在后台完成，只收结论与下一步（`next`）。同事分两档——便宜档 Pi（Gemini：读材料、摘要、文案、看图）与强档 Codex（GPT：写代码、严密审查），只读默认便宜档、写入默认强档，便宜档失败且未改动时自动升档；只有一层委派，结果都回到主控。脚本代跑 `--accept` 验收、按快照列出改动；只读任务默认读 worktree 快照，写入可 `--worktree` 隔离后 `apply` 三方合并，`reply` 续接会话。整机并发、内存准入与重任务队列（`lane`，flock 唤醒、排队不计时）由脚本执行。另有 Rust 实现（`crates/delegate`，supervisor 常驻约 3 MB）与实现规格 `docs/delegate-spec.md`。 |
 | **`openai-image-gen`** | `skills/openai-image-gen/` | **图像生成落盘**：调用 OpenAI Image API 生成配图、Banner、图标等素材，直接写入本地文件并只返回一行 JSON；附提示词、尺寸与费用选择要点。 |
 
 ---

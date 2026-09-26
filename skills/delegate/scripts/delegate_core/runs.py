@@ -116,12 +116,15 @@ def status(run):
     summary = read_json(run / "summary.json", {}) or {}
     out = {"run": meta.get("run", run.name), "name": meta.get("name"), "state": state,
            "agent": meta.get("agent", "pi"), "mode": meta.get("mode")}
+    if meta.get("tier"):
+        out["tier"] = meta["tier"]
     for key in ("parent", "worktree"):
         if meta.get(key):
             out[key] = meta[key]["path"] if key == "worktree" else meta[key]
     if summary:
         for key in ("elapsedSeconds", "attempts", "model", "turns", "files", "changes", "accept", "readOnlyViolation",
-                    "workspaceChanged", "queuedSeconds", "graceSeconds", "tokens", "warning", "error"):
+                    "workspaceChanged", "escalatedFrom", "queuedSeconds", "graceSeconds", "tokens", "warning",
+                    "error"):
             if summary.get(key) not in (None, [], {}):
                 out[key] = summary[key]
     else:

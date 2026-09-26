@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import subprocess
 import threading
 import time
@@ -11,7 +12,7 @@ import uuid
 from pathlib import Path
 
 from .common import (
-    BUSY_WINDOW, DEFAULT_TIMEOUT_GRACE, ENV_AGENT, ENV_LEGACY, ENV_PARENT, ENV_RUN_DIR, GUARD_VARS, SCRIPT, clip, die,
+    AGENTS, BUSY_WINDOW, DEFAULT_TIMEOUT_GRACE, ENV_AGENT, ENV_LEGACY, ENV_RUN_DIR, GUARD_VARS, SCRIPT, clip, die,
     kill_group, now_iso, setting,
 )
 from .lane import queued_seconds
@@ -144,8 +145,7 @@ def session_file(directory, session):
 def agent_env(meta):
     env = {k: v for k, v in os.environ.items() if k not in GUARD_VARS}
     env.update(meta.get("env") or {})  # .delegate.json, e.g. CUDA_VISIBLE_DEVICES="" to keep agents off the GPU
-    env[ENV_AGENT] = meta["agent"]
-    env[ENV_PARENT] = meta["run"]
+    env[ENV_AGENT] = meta["agent"]  # marks the process as a delegated agent: it may not delegate in turn
     env[ENV_RUN_DIR] = meta["dir"]
     if meta["agent"] == "pi":
         env[ENV_LEGACY] = "1"  # older scripts only know this flag
@@ -158,13 +158,38 @@ def caller_agent():
 
 
 
-def nesting_error(agent):
+def nesting_error():
+    """One level only: every result comes back to the caller, who can see and review it."""
     caller = caller_agent()
-    if caller == "pi":
-        return "refusing nested delegation: a delegated Pi run cannot delegate further"
-    if caller == "codex" and agent == "codex":
-        return "refusing nested delegation: a delegated Codex run may delegate to Pi (--agent pi) but not to Codex"
+    if caller:
+        return (f"refusing nested delegation: this is a delegated {caller} run; do the work yourself and report "
+                "back to your caller (`lane` for heavy checks still works)")
     return None
+
+
+
+def tier_agent(tier):
+    agent = setting(f"{tier.upper()}_AGENT", {"cheap": "pi", "strong": "codex"}[tier])
+    if agent not in AGENTS:
+        die(f"DELEGATE_{tier.upper()}_AGENT must be one of {', '.join(AGENTS)}, got {agent!r}")
+    return agent
+
+
+
+def choose_agent(args):
+    """--agent names the colleague outright; otherwise the tier does (read-only: cheap, write: strong).
+    A cheap colleague that is not installed gives way to the strong one, so hosts without it still work."""
+    if args.agent and args.tier:
+        die("--agent and --tier contradict each other; give one")
+    if args.agent:
+        args.tier = None
+        return
+    args.tier = args.tier or ("cheap" if args.read_only else "strong")
+    args.agent = tier_agent(args.tier)
+    strong = tier_agent("strong")
+    if args.tier == "cheap" and not shutil.which(args.agent) and shutil.which(strong):
+        print(f"delegate: {args.agent} is not installed; using the strong tier ({strong})", file=sys.stderr)
+        args.agent, args.tier = strong, "strong"
 
 
 

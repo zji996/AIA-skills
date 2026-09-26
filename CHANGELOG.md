@@ -4,6 +4,7 @@
 
 ### 技能
 
+- `delegate` 4.5.0：**只有一层委派**——同事（设有 `DELEGATE_AGENT` 等）调用 `start`/`run`/`reply` 一律拒绝，去掉父 run 的写入互斥豁免与 `DELEGATE_PARENT_RUN`，所有结果回到主控。**按档位选同事**：新增 `--tier cheap|strong`，只读默认便宜档、写入默认强档，档位映射由 `DELEGATE_CHEAP_AGENT` / `DELEGATE_STRONG_AGENT` 配置（默认 pi / codex），`--agent` 仍可直接指定；便宜档未安装时自动用强档。**自动升档**：便宜档畸形、出错、超时或验收失败，且为只读或未产生改动时，在同一 run 中换强档重跑一次（强档有容量时），结论带 `escalatedFrom`，升到 Codex 的只读任务补上只读约定。`wait` 不带参数时等所有未结束与未读取的任务。SKILL.md 改写为三步用法、场景速查与档位表，新增按需阅读的 `references/recipes.md`（任务说明模板、场景示例、常见坑）。
 - `delegate` Rust 实现（`crates/delegate`，与 Python 版并存，暂不替换）：由 Codex 按 `docs/delegate-spec.md` 实现，依赖仅 serde_json、libc、sha1_smol；release 约 1.1 MB，可 musl 静态链接。运行中的 supervisor 常驻约 2.9 MB（Python 版约 22 MB），空闲时零周期唤醒（10 秒内各线程上下文切换 0 次，修复前 697 次）。通过全部黑盒一致性测试（`DELEGATE_BIN`）。主控审查后修复了首版的 6 处问题：非 UTF-8 输出行会使读循环停止、三处周期轮询改为事件驱动（self-pipe、条件变量、阻塞 `waitid`）、lane 停止信号丢失唤醒、看门狗可能向复用的 PID 发信号。
 - `delegate` 测试：新增非 UTF-8 输出行不中断读取的用例；规格注明 JSON 空白与字段顺序不属于契约。
 - `agent-handoff` 2.1.2：读取 delegate 的 `meta.json` 时容忍任意 JSON 空白，Rust 实现写出的紧凑 JSON 此前会使"未合并 worktree"漏报。

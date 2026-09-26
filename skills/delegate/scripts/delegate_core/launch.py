@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from .agents import missing_tools, nesting_error, session_file
+from .agents import choose_agent, missing_tools, nesting_error, session_file
 from .changes import snapshot
 from .common import (
     ACTIVE, DEFAULT_TIMEOUT, LANE_HELD, SCRIPT, die, git_top, now_iso, read_json, seconds, setting, state_dir, write_json,
@@ -44,9 +44,10 @@ def read_prompt(args):
 
 
 def start_run(args):
-    error = nesting_error(args.agent)
+    error = nesting_error()
     if error:
         die(error)
+    choose_agent(args)
     if args.timeout is None:
         args.timeout = DEFAULT_TIMEOUT[args.agent]
     prompt = read_prompt(args)
@@ -127,8 +128,6 @@ def create_run(args, prompt, workdir, mode, root, extra):
     if mode == "write" and not args.allow_parallel_writes and not extra.get("worktree"):
         for run in all_runs():
             meta = read_json(run / "meta.json", {}) or {}
-            if run.name == setting("PARENT_RUN"):
-                continue  # the caller's own run is waiting on this helper
             if meta.get("mode") == "write" and meta.get("workdir") == workdir and \
                     (run_state(run) in ACTIVE or agent_alive(run)):
                 die(f"write run {run.name} is still active in {workdir}; wait for it, use --read-only, "
@@ -183,6 +182,7 @@ def create_run(args, prompt, workdir, mode, root, extra):
         shutil.rmtree(run, ignore_errors=True)
         die(f"cannot snapshot {tree['source']} for the worktree")
     meta = {"run": run.name, "dir": str(run), "workdir": workdir, "mode": mode, "agent": args.agent,
+            "tier": getattr(args, "tier", None),
             "name": args.name or (f"reply to {parent['name']}" if parent else first_line),
             "provider": args.provider, "model": args.model, "thinking": args.thinking,
             "timeout": args.timeout, "timeoutSeconds": seconds(args.timeout),

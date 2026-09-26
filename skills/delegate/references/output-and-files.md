@@ -9,14 +9,14 @@
 | `reply <run> [消息] [--fresh] [--accept <命令>] [--image] [--timeout] [--max]` | 接着上一轮的会话追问并等到结论（`--fresh` 则开新会话，消息须自足，验收命令照常附上）：同一同事、workdir、worktree 与只读模式；`<run>` 指对话中任一轮，自动接在最新一轮后。验收命令默认沿用，换了才写进消息，`--accept ''` 取消；取消或隐藏已变更的命令时会告诉同事旧标准不再适用 |
 | `diff [<run>] [--stat] [--total] [路径...]` | 以 `git diff` 输出该轮的改动；`--total` 为整段对话；终端下带颜色 |
 | `apply [<run>] [--dry-run] [--merge]` | 把 `--worktree` 的现状（含最后一轮之后在 worktree 里的手工修改）相对对话起点的全部改动合并回原工作区（只写文件，不碰 index）：你没动过的文件直接写入（含权限位），双方都改过的文本做三方合并，大文件从 worktree 复制；经符号链接目录、文件与目录互换、二进制与符号链接冲突一律算冲突；有合并不了的冲突时什么都不写，`--merge` 则写入其余文件并在冲突处留冲突标记（其余冲突跳过）。没有跳过项时，共用该 worktree 的所有 run（含畸形的旁支）标记 `.applied` |
-| `wait [<run>...\|--all] [--max <时长>] [--no-result] [--full] [--progress]` | 等待并输出结论；`--all` 含仍在运行和尚未读取结果的任务 |
+| `wait [<run>...\|--all] [--max <时长>] [--no-result] [--full] [--progress]` | 等待并输出结论；不指定任务时（或 `--all`）等所有仍在运行和尚未读取结果的任务 |
 | `status [<run>...]` | 每个任务一行 JSON；运行中带 `last` 与 `idleSeconds` |
 | `result [<run>] [--path]` | 输出完整答复 |
 | `stop <run>...` | 终止任务及其进程组 |
 | `clean <run>...\|--finished [--force]` | 删除已结束的任务；`--finished` 默认保留结果未读取的 |
 | `lane [--label <文字>] [--] <命令>` | 在整机重任务队列里执行命令（一个参数按 shell 命令执行），退出码原样返回；不带命令时列出正在跑与排队的项 |
 
-启动选项：`--agent pi|codex`、`--image <路径>`（可重复）、`--accept <命令>`、`--hide-accept`、`--accept-timeout`（默认 10m）、`--read-only`、`--in-place`（只读任务读实时工作区而非快照）、`--workdir`、`--timeout`（每次尝试，pi 默认 15m，codex 默认 30m）、`--retries`（答复畸形时重跑次数，默认 1）、`--model`/`--thinking`/`--provider`（不指定时用各 CLI 自己的默认设置；Codex 的 `--thinking` 对应推理强度）、`--allow-parallel-writes`、`--worktree`。`<run>` 可以是完整 id、唯一片段、`last` 或 run 目录。
+启动选项：`--tier cheap|strong`（默认只读 cheap、写入 strong；便宜档失败且未改动时自动升档一次）、`--agent pi|codex`（直接指定，与 `--tier` 互斥，不升档）、`--image <路径>`（可重复）、`--accept <命令>`、`--hide-accept`、`--accept-timeout`（默认 10m）、`--read-only`、`--in-place`（只读任务读实时工作区而非快照）、`--workdir`、`--timeout`（每次尝试，pi 默认 15m，codex 默认 30m）、`--retries`（答复畸形时重跑次数，默认 1）、`--model`/`--thinking`/`--provider`（不指定时用各 CLI 自己的默认设置；Codex 的 `--thinking` 对应推理强度）、`--allow-parallel-writes`、`--worktree`。`<run>` 可以是完整 id、唯一片段、`last` 或 run 目录。
 
 ## 重任务队列（lane）
 
@@ -102,8 +102,8 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 | `DELEGATE_RESULT_CHARS` | 答复超过该长度只显示末尾，默认 6000 |
 | `DELEGATE_KEEP_DAYS` | 自动清理天数，默认 7 |
 | `DELEGATE_POLL` | `wait --progress`、4.4 之前的 run 与刚启动的 supervisor 的检查间隔秒数，默认 1；其余等待不轮询 |
-| `DELEGATE_AGENT` | 由脚本导出给同事（`pi`/`codex`），用于执行委派层级 |
-| `DELEGATE_PARENT_RUN` | 由脚本导出给同事，值为其所在 run；它委派的写入任务不受这个 run 的写入互斥限制 |
+| `DELEGATE_CHEAP_AGENT` / `DELEGATE_STRONG_AGENT` | 档位对应的同事，默认 `pi` / `codex` |
+| `DELEGATE_AGENT` | 由脚本导出给同事（`pi`/`codex`）；设有它的进程不能再委派 |
 | `PI_DELEGATE_ACTIVE` | 旧版标记，仍导出给 Pi；存在时视为 Pi 调用者 |
 
 ## 代码结构

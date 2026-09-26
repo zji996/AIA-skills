@@ -143,7 +143,7 @@ def cmd_run(args):
 
 
 def cmd_wait(args):
-    if args.all:
+    if args.all or not args.runs:
         runs = [r for r in all_runs() if run_state(r) in ACTIVE or not (r / ".delivered").is_file()]
         if not runs:
             print("delegate: no active or undelivered runs", file=sys.stderr)
@@ -167,11 +167,11 @@ def cmd_reply(args):
             "use --fresh to start a new session in the same place")
     if meta.get("worktree") and not Path(meta["worktree"]["path"]).exists():
         die(f"the worktree of {parent.name} no longer exists: {meta['worktree']['path']}")
-    error = nesting_error(meta["agent"])
+    error = nesting_error()
     if error:
         die(error)
     missing_tools(meta["agent"])
-    for key in ("agent", "provider", "model", "thinking", "retries"):
+    for key in ("agent", "tier", "provider", "model", "thinking", "retries"):
         setattr(args, key, meta.get(key))
     args.timeout = args.timeout or meta.get("timeout") or DEFAULT_TIMEOUT[meta["agent"]]
     args.accept = meta.get("accept") if args.accept is None else (args.accept or None)
@@ -346,7 +346,11 @@ def parser():
         p.add_argument("words", nargs="*", help="prompt text (or use --prompt / --prompt-file)")
         p.add_argument("--prompt", dest="prompt_text")
         p.add_argument("--prompt-file", help="file with the prompt, or - for stdin")
-        p.add_argument("--agent", choices=AGENTS, default="pi", help="who does the work (default pi)")
+        p.add_argument("--tier", choices=("cheap", "strong"),
+                       help="cheap (Pi: reading, summaries, copy, images) or strong (Codex: code, rigorous review); "
+                            "default cheap for --read-only, strong otherwise. A failed cheap run is retried once "
+                            "with the strong tier when it changed nothing")
+        p.add_argument("--agent", choices=AGENTS, help="name the colleague outright instead of a tier (no escalation)")
         p.add_argument("--name", help="short label used in the run id")
         p.add_argument("--workdir", help="directory the agent works in (default: cwd)")
         p.add_argument("--image", action="append", metavar="PATH",
@@ -404,7 +408,7 @@ def parser():
     apply.add_argument("--dry-run", action="store_true")
     wait = sub.add_parser("wait", help="block until runs finish; print outcome and answer")
     wait.add_argument("runs", nargs="*")
-    wait.add_argument("--all", action="store_true", help="active runs plus finished unreported ones")
+    wait.add_argument("--all", action="store_true", help="active runs plus finished unreported ones (the default)")
     wait.add_argument("--no-result", action="store_true", help="print only the outcome line")
     collecting(wait)
     status_cmd = sub.add_parser("status", aliases=["list"], help="one JSON line per run")

@@ -73,7 +73,9 @@ class DelegateTests(unittest.TestCase):
         self.env.update(PATH=f"{self.bin}:{os.environ['PATH']}", DELEGATE_POLL="0.1",
                         DELEGATE_RUNS=str(self.work / "runs"), XDG_STATE_HOME=str(self.work / "state"),
                         XDG_CACHE_HOME=str(self.work / "cache"),
-                        PI_LOG=str(self.work / "pi.log"))
+                        PI_LOG=str(self.work / "pi.log"),
+                        # Both tiers map to the fake Pi unless a test says otherwise (see the tier tests).
+                        DELEGATE_STRONG_AGENT="pi")
 
     def fake_pi(self, *attempts, pre="", sleep=0, code=0):
         """Each attempt is a list of events; later calls reuse the last attempt."""
@@ -539,31 +541,100 @@ class DelegateTests(unittest.TestCase):
         self.assertNotIn("never applied", cleaned)  # a read-only worktree has nothing to merge
         self.assertFalse(Path(pi["worktree"]).exists())
 
-    def test_nesting_rules(self):
+    def test_delegated_agents_cannot_delegate_at_all(self):
         self.fake_pi([answer("ok"), SETTLED])
         self.fake_codex(codex_events("ok"))
-        self.env["DELEGATE_AGENT"] = "pi"
-        for agent in ("pi", "codex"):
-            result = self.cli("start", "--agent", agent, "task")
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("Pi run cannot delegate", result.stderr)
-        self.env["DELEGATE_AGENT"] = "codex"
-        result = self.cli("start", "--agent", "codex", "task")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("not to Codex", result.stderr)
-        self.assertEqual(self.outcome(self.cli("run", "--agent", "pi", "task"))["state"], "answered")
-        guard = (self.work / "pi.log").read_text().split()
-        self.assertEqual(guard[1], "1")  # Pi started by Codex still carries the no-delegation flag
+        self.assertEqual(self.outcome(self.cli("run", "--agent", "codex", "task"))["state"], "answered")
+        self.assertIn(" codex ", (self.work / "pi.log.codex").read_text())  # its agent carries DELEGATE_AGENT
+        # One level only, whoever the caller is and whatever it asks for: results come back to the caller.
+        for marker in ({"DELEGATE_AGENT": "codex"}, {"DELEGATE_AGENT": "pi"}, {"PI_DELEGATE_AGENT": "codex"}):
+            env = {**self.env, **marker}
+            for args in (["start", "--agent", "pi", "task"], ["run", "--tier", "cheap", "--read-only", "task"],
+                         ["reply", "last", "more"]):
+                result = subprocess.run([str(DELEGATE), *args], cwd=self.work, env=env, capture_output=True,
+                                        text=True, timeout=30)
+                self.assertEqual(result.returncode, 2, (marker, args))
+                self.assertIn("refusing nested delegation", result.stderr)
+            lane = subprocess.run([str(DELEGATE), "lane", "true"], cwd=self.work, env=env, timeout=30)
+            self.assertEqual(lane.returncode, 0)  # heavy checks still queue
 
-    def test_helper_may_write_inside_its_parents_workdir(self):
-        self.fake_pi([answer("slow"), SETTLED], sleep=30)
-        parent = json.loads(self.cli("start", "--name", "parent", "task").stdout)["run"]
-        self.assertEqual(self.cli("start", "--name", "rival", "task").returncode, 2)
-        self.fake_pi([answer("helper done"), SETTLED])
-        self.env.update(PI_DELEGATE_AGENT="codex", PI_DELEGATE_PARENT_RUN=parent)  # pre-4.0 names still count
-        self.assertEqual(self.outcome(self.cli("run", "--name", "helper", "task"))["state"], "answered")
-        del self.env["PI_DELEGATE_AGENT"], self.env["PI_DELEGATE_PARENT_RUN"]
-        self.cli("stop", parent)
+    def test_tier_picks_the_colleague(self):
+        del self.env["DELEGATE_STRONG_AGENT"]  # the real mapping: cheap = pi, strong = codex
+        self.fake_pi([answer("read it"), SETTLED])
+        self.fake_codex(codex_events("wrote it"))
+        state = self.outcome(self.cli("run", "--read-only", "task"))
+        self.assertEqual((state["agent"], state["tier"]), ("pi", "cheap"))  # reading defaults to cheap
+        state = self.outcome(self.cli("run", "task"))
+        self.assertEqual((state["agent"], state["tier"]), ("codex", "strong"))  # writing defaults to strong
+        state = self.outcome(self.cli("run", "--read-only", "--tier", "strong", "task"))
+        self.assertEqual(state["agent"], "codex")
+        state = self.outcome(self.cli("run", "--agent", "pi", "task"))
+        self.assertEqual(state["agent"], "pi")
+        self.assertNotIn("tier", state)  # named outright: no tier, no escalation
+        self.assertEqual(self.cli("run", "--agent", "pi", "--tier", "cheap", "task").returncode, 2)
+        self.env["DELEGATE_CHEAP_AGENT"] = "gemini"
+        self.assertIn("DELEGATE_CHEAP_AGENT", self.cli("run", "--read-only", "task").stderr)
+        del self.env["DELEGATE_CHEAP_AGENT"]
+        (self.bin / "pi").unlink()  # a host without Pi still works: the cheap tier gives way
+        self.env["PATH"] = f"{self.bin}:/usr/bin:/bin"
+        result = self.cli("run", "--read-only", "task")
+        self.assertEqual((self.outcome(result)["agent"], self.outcome(result)["tier"]), ("codex", "strong"))
+        self.assertIn("using the strong tier", result.stderr)
+
+    def test_failed_cheap_run_escalates_once_when_nothing_changed(self):
+        del self.env["DELEGATE_STRONG_AGENT"]
+        self.fake_pi([answer(LEAKED), SETTLED])
+        self.fake_codex(codex_events("found it"))
+        result = self.cli("run", "--read-only", "--retries", "0", "审查一下")
+        state = self.outcome(result)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual((state["state"], state["agent"], state["tier"], state["escalatedFrom"], state["attempts"]),
+                         ("answered", "codex", "strong", "pi", 2))
+        self.assertIn("只读任务", (self.work / "pi.log.codex-prompt").read_text())  # Codex is told; Pi needed no words
+        self.assertIn("found it", (Path(state["dir"]) / "result.md").read_text())
+        self.fake_codex(codex_events("more"))
+        self.assertEqual(self.outcome(self.cli("reply", state["run"], "and?"))["agent"], "codex")
+        # A write run that changed nothing and failed its check is handed over too...
+        repo = self.repo({"a.txt": "a\n"})
+        self.fake_pi([answer("done"), SETTLED])
+        self.fake_codex(codex_events("fixed"), pre="touch made.txt")
+        state = self.outcome(self.cli("run", "--tier", "cheap", "--workdir", repo, "--accept", "test -f made.txt",
+                                      "task"))
+        self.assertEqual((state["state"], state["escalatedFrom"], state["files"]), ("delivered", "pi", ["made.txt"]))
+        # ...but not one that left changes behind, nor one whose colleague was named outright.
+        (repo / "made.txt").unlink()
+        self.fake_pi([answer("done"), SETTLED], pre="echo half > partial.txt")
+        state = self.outcome(self.cli("run", "--tier", "cheap", "--workdir", repo, "--accept", "test -f made.txt",
+                                      "task"))
+        self.assertEqual((state["state"], state["agent"]), ("rejected", "pi"))
+        self.assertNotIn("escalatedFrom", state)
+        self.fake_pi([answer(LEAKED), SETTLED])
+        state = self.outcome(self.cli("run", "--agent", "pi", "--read-only", "--retries", "0", "task"))
+        self.assertEqual((state["state"], state["agent"]), ("malformed", "pi"))
+
+    def test_escalation_waits_for_room_in_the_strong_tier(self):
+        del self.env["DELEGATE_STRONG_AGENT"]
+        self.fake_pi([answer(LEAKED), SETTLED])
+        self.fake_codex(codex_events("ok"), pre='[ -n "$SLOW" ] && sleep 30')
+        env = {**self.env, "SLOW": "1"}
+        started = subprocess.run([str(DELEGATE), "start", "--agent", "codex", "--read-only", "busy"], cwd=self.work,
+                                 env=env, capture_output=True, text=True, timeout=30)
+        busy = json.loads(started.stdout.splitlines()[0])
+        self.env["DELEGATE_MAX_CODEX"] = "1"
+        state = self.outcome(self.cli("run", "--read-only", "--retries", "0", "task"))
+        self.assertEqual((state["state"], state["agent"]), ("malformed", "pi"))  # no room: not escalated
+        self.assertIn("escalate_skipped", (Path(state["dir"]) / "events.jsonl").read_text())
+        self.cli("stop", busy["run"])
+
+    def test_wait_without_runs_collects_everything_pending(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        for name in ("one", "two"):
+            self.assertEqual(self.cli("start", "--read-only", "--name", name, "task").returncode, 0)
+        result = self.cli("wait")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(sorted(json.loads(line)["name"] for line in result.stdout.splitlines()
+                                if line.startswith('{"run"')), ["one", "two"])
+        self.assertIn("no active or undelivered runs", self.cli("wait").stderr)
 
     def test_images_are_attached_for_both_agents(self):
         image = self.work / "shot.png"

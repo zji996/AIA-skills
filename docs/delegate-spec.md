@@ -1,4 +1,4 @@
-# delegate 规格（v4.4）
+# delegate 规格（v4.5）
 
 > 本文是 `skills/delegate` 的**实现契约**：命令行、输出、run 目录、锁与状态机。它是 Rust 重写与 harness 原生接入的依据。
 > 本文不在技能目录内，技能加载时不会读取；模型使用技能只需 `SKILL.md`。行为以本文为准，实现与本文不一致时按缺陷处理。
@@ -30,7 +30,7 @@
 |---|---|
 | 0 | 结局为 `delivered` / `answered`；或非等待类命令成功 |
 | 1 | 其他结局；`apply` 有冲突或写了冲突标记；`result` 无答复 |
-| 2 | 用法错误或被拒绝（参数非法、并发满、内存不足、违反委派层级、写入互斥） |
+| 2 | 用法错误或被拒绝（参数非法、并发满、内存不足、嵌套委派、写入互斥） |
 | 75 | `--max` 到期时仍有任务在运行 |
 | 其他 | `lane` 原样返回命令的退出码；命令被信号 N 结束或 lane 自身收到信号 N 时为 128+N |
 
@@ -41,7 +41,7 @@
 | `start` | 启动选项（§2.3）＋任务说明 | 创建 run 并启动 supervisor，立即输出一行状态（§3.1）；stderr 提示收取命令 |
 | `run` | 启动选项＋`--max`/`--progress`/`--full` | `start` 后等待，按 §3.2 输出 |
 | `reply <run> [消息]` | `--fresh` `--accept` `--hide-accept` `--accept-timeout` `--timeout` `--image` `--name` `--prompt(-file)` ＋等待选项 | 续接对话（§7） |
-| `wait [<run>...\|--all]` | `--max` `--no-result` `--full` `--progress` | 等待并输出；无参数等于 `last`；`--all` 取所有运行中或结果未读取的 run |
+| `wait [<run>...\|--all]` | `--max` `--no-result` `--full` `--progress` | 等待并输出；无参数（或 `--all`）取所有运行中或结果未读取的 run，没有时提示并以 0 退出 |
 | `status [<run>...]`（别名 `list`） | | 每个 run 一行状态；无参数列出全部 |
 | `result [<run>] [--path]` | | 输出完整答复（或其路径）；非运行中时标记已读取 |
 | `diff [<run>] [--stat] [--total] [路径...]` | | `git diff` 该 run 前后快照；`--total` 自对话起点；终端下带颜色；对象被清理时回退输出 `changes.patch` |
@@ -59,7 +59,8 @@
 | 选项 | 默认 | 说明 |
 |---|---|---|
 | 任务说明 | — | 位置参数拼接、`--prompt`、或 `--prompt-file`（`-` 为 stdin）；为空即退出码 2 |
-| `--agent pi\|codex` | `pi` | |
+| `--tier cheap\|strong` | 只读 `cheap`，写入 `strong` | 按档位选同事，映射见 §12；与 `--agent` 互斥（退出码 2） |
+| `--agent pi\|codex` | — | 直接指定同事，不属于任何档位，不升档 |
 | `--name` | 说明首行 | 用于 run id 与显示；run id 取其 `[A-Za-z0-9._-]` 片段，最长 40 |
 | `--workdir` | 当前目录 | 必须存在 |
 | `--image <路径>` | — | 可重复；解析为绝对路径 |
@@ -95,6 +96,8 @@
 | `accept{command,ok,exitCode,tail?,queuedSeconds?}` | 执行过验收 | `tail` 为失败输出末 1500 字符 |
 | `readOnlyViolation` | 只读 run 在自己的 worktree 中改了文件 | 文件列表 |
 | `workspaceChanged` | `--in-place` 只读 run 期间工作区有变化 | 文件列表；无法归属 |
+| `tier` | 按档位选的同事 | `cheap` / `strong`；升档后为 `strong` |
+| `escalatedFrom` | 升过档 | 原先的同事 |
 | `queuedSeconds` | 同事在 lane 中排队 ≥1 秒 | |
 | `graceSeconds` | 同事用了超时宽限 | 超出 `--timeout` 的秒数 |
 | `warning` `error` | | 人读文本 |
@@ -146,6 +149,14 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 | `running` | 无 `exit_code`，`pid` 对应进程存活且命令行含 `_supervise` |
 | `crashed` | 无 `exit_code`，且上述均不满足 |
 | 结束态 | 有 `exit_code`，取 `summary.json` 的 `state` |
+
+### 4.1 选同事与升档（必须）
+
+- 未给 `--agent` 时按档位选：`cheap` → `DELEGATE_CHEAP_AGENT`（默认 `pi`），`strong` → `DELEGATE_STRONG_AGENT`（默认 `codex`），值必须是 `pi`/`codex`。隐式的 `cheap` 档同事未安装、而强档已安装时，改用强档并在 stderr 说明。`meta.json` 与状态行记 `tier`（直接指定时无此字段）。
+- **升档**：`tier == "cheap"` 的 run 结局为 `malformed`/`failed`/`timeout`/`rejected`、未被 stop、且（只读，或快照成功且没有任何改动）时，若强档已安装并在整机容量内（在 `<state>/.start.lock` 下检查），在同一 run 中换强档再跑一轮：事件 `escalate{from,to,after}`，`meta.json` 的 `agent` 改为强档、`tier` 改为 `strong`、`fork` 清空、记 `escalatedFrom`；只读 run 升到 Codex 时在 `prompt.md` 末尾补只读约定（§7.3）。新一轮沿用重跑次数，`attempts` 接续计数；快照、只读核对与验收按新一轮重新进行，结论带 `escalatedFrom`。容量不足时记事件 `escalate_skipped`，不升档。每个 run 至多升档一次。
+- reply 沿用上一轮的 `agent` 与 `tier`。
+
+### 4.2 判定
 
 同事一次尝试的判定（必须）：被 stop → `stopped`；超时 → `timeout`；非零退出 → 退出码为 -9/137 时 `killed`，否则 `failed`；最后一轮 `stopReason == "stop"` 且已 settled 时，答复为空或末尾是泄漏的工具调用（正则 `\bcall:[\w.-]+(?::[\w-]+)?\{`，且以 `}` 结尾）→ `malformed`，否则 `ok`；其余 → `failed`。`malformed` 最多重跑 `--retries` 次。
 
@@ -211,7 +222,7 @@ Codex：
 codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dangerously-bypass-approvals-and-sandbox
    [-m M] [-c model_reasoning_effort="T"] [-c model_provider="P"] [--image=<图片>...] -     # stdin: prompt.md
 ```
-进程工作目录为 workdir，独立进程组。环境：去掉 §11 的保护变量，叠加 `.delegate.json` 的 `env`，再设 `DELEGATE_AGENT`、`DELEGATE_PARENT_RUN`、`DELEGATE_RUN_DIR`（Pi 另设 `PI_DELEGATE_ACTIVE=1`）。
+进程工作目录为 workdir，独立进程组。环境：去掉 §12 的保护变量，叠加 `.delegate.json` 的 `env`，再设 `DELEGATE_AGENT`、`DELEGATE_RUN_DIR`（Pi 另设 `PI_DELEGATE_ACTIVE=1`）。
 
 ### 7.2 事件
 
@@ -271,8 +282,8 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 - 整机并发：`<state>/<sha1(run 路径)[:16]>.slot` 记录运行中的 run；`DELEGATE_MAX_ACTIVE`（默认 6）、`DELEGATE_MAX_CODEX`（默认 3），0 不限。超出即拒绝并列出运行中的任务。
 - 内存准入：`/proc/meminfo` 的 `MemAvailable` 低于 `DELEGATE_MIN_AVAILABLE_MB`（默认 4096，0 不查）时拒绝。
 - 启动在 `<state>/.start.lock` 与 `<runs>/.start.lock` 两把锁下进行，检查与登记不可交错。
-- 写入互斥：同一 workdir 同时只允许一个原地写入 run；委派者自己的 run（`DELEGATE_PARENT_RUN`）与 worktree run 除外。
-- 委派层级：调用者为 Pi（`DELEGATE_AGENT=pi` 或 `PI_DELEGATE_ACTIVE`）时拒绝一切委派；为 Codex 时拒绝委派给 Codex。
+- 写入互斥：同一 workdir 同时只允许一个原地写入 run（`--allow-parallel-writes` 与 worktree run 除外）。
+- **只有一层委派**：调用者本身是同事（设有 `DELEGATE_AGENT`、`PI_DELEGATE_AGENT` 或 `PI_DELEGATE_ACTIVE`）时，`start`/`run`/`reply` 一律以退出码 2 拒绝；`lane` 等其他命令不受影响。所有结果都回到主控。
 - 自动清理：每次启动删除结束超过 `DELEGATE_KEEP_DAYS`（默认 7，0 关闭）天、已读取、且没有未 apply 写入 worktree 的 run。
 - `clean`：跳过运行中的与同事进程仍存活的；`--finished` 默认保留未读取的（`--force` 除外）；提示未 apply 的 worktree。
 
@@ -282,7 +293,7 @@ run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git �
 
 | 文件 | 写入者 | 内容 |
 |---|---|---|
-| `meta.json` | 启动方 | run、dir、workdir、mode、agent、name、provider、model、thinking、timeout(Seconds)、accept、acceptTimeoutSeconds、retries、images、top、base、snapshotExclude、worktree{source,sourceWorkdir,config,path}、env、chainBase、sessionDir、parent、fork、startedAt/Epoch/Ns |
+| `meta.json` | 启动方（升档时 supervisor 更新） | run、dir、workdir、mode、agent、tier、escalatedFrom、name、provider、model、thinking、timeout(Seconds)、accept、acceptTimeoutSeconds、retries、images、top、base、snapshotExclude、worktree{source,sourceWorkdir,config,path}、env、chainBase、sessionDir、parent、fork、startedAt/Epoch/Ns |
 | `prompt.md` | 启动方 | 同事收到的全文 |
 | `supervisor.lock` / `pid` / `agent.pid` | supervisor | 生命周期锁 / supervisor pid / 同事进程组 |
 | `events.jsonl` `stderr.log` `supervisor.log` | supervisor | §7.2 / 同事 stderr / supervisor 输出 |
@@ -308,7 +319,7 @@ run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git �
 
 `env` 为字符串到字符串的映射，注入同事、验收与 setup（原地与 worktree 均生效，reply 沿用）；`copy`/`link` 必须是仓库内相对路径。
 
-环境变量均先读 `DELEGATE_<名>`，再读 `PI_DELEGATE_<名>`：`RUNS`、`MAX_ACTIVE`、`MAX_CODEX`、`MAX_HEAVY`、`MIN_AVAILABLE_MB`、`TIMEOUT_GRACE`、`RESULT_CHARS`（6000）、`KEEP_DAYS`、`POLL`、`SNAPSHOT_MAX_BYTES`、`SETUP_TIMEOUT`（10m）。由实现导出、调用方不应设置的保护变量：`DELEGATE_AGENT`、`DELEGATE_PARENT_RUN`、`DELEGATE_RUN_DIR`、`DELEGATE_LANE_HELD`、`PI_DELEGATE_ACTIVE`、`PI_DELEGATE_AGENT`、`PI_DELEGATE_PARENT_RUN`。
+环境变量均先读 `DELEGATE_<名>`，再读 `PI_DELEGATE_<名>`：`RUNS`、`CHEAP_AGENT`（pi）、`STRONG_AGENT`（codex）、`MAX_ACTIVE`、`MAX_CODEX`、`MAX_HEAVY`、`MIN_AVAILABLE_MB`、`TIMEOUT_GRACE`、`RESULT_CHARS`（6000）、`KEEP_DAYS`、`POLL`、`SNAPSHOT_MAX_BYTES`、`SETUP_TIMEOUT`（10m）。由实现导出、调用方不应设置的保护变量：`DELEGATE_AGENT`、`DELEGATE_RUN_DIR`、`DELEGATE_LANE_HELD`、`PI_DELEGATE_ACTIVE`、`PI_DELEGATE_AGENT`、`PI_DELEGATE_PARENT_RUN`。
 
 ## 13. 一致性验收
 
