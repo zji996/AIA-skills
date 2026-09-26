@@ -178,6 +178,8 @@ def apply_conversation(run, merge=False, dry_run=False):
     tree = meta.get("worktree")
     if not tree:
         die(f"{run.name} worked in place; its changes are already in {meta.get('workdir')}")
+    if meta.get("mode") == "read-only":
+        die(f"{run.name} is read-only; its worktree is a snapshot to read, with nothing to apply")
     before, source, worktree = meta["chainBase"], tree["source"], Path(tree["path"])
     after_large = (read_json(run / "changes.json", {}) or {}).get("afterLarge") or {}
     now_snapshot = snapshot(worktree, run, meta.get("snapshotExclude") or ()) if worktree.is_dir() else None

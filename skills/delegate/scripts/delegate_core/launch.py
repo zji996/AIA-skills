@@ -53,12 +53,21 @@ def start_run(args):
     workdir = str(workdir.resolve())
     missing_tools(args.agent)
     mode = "read-only" if args.read_only else "write"
+    if args.in_place and not args.read_only:
+        die("--in-place is for --read-only runs; write runs work in place unless --worktree is given")
+    if args.in_place and args.worktree:
+        die("--in-place and --worktree contradict each other")
     extra = {}
-    if args.worktree:
-        top = git_top(workdir)
-        if not top:
-            die(f"--worktree needs a git repository: {workdir}")
-        extra["worktree"] = {"source": top, "sourceWorkdir": workdir, "config": worktree_config(top)}
+    # A read-only run reads a snapshot of the working tree, so the caller may keep editing meanwhile without
+    # its edits being taken for the run's; outside git there is nothing to snapshot and it reads in place.
+    top = git_top(workdir) if args.worktree or (args.read_only and not args.in_place) else None
+    if args.worktree and not top:
+        die(f"--worktree needs a git repository: {workdir}")
+    if top:
+        config = worktree_config(top)
+        if args.read_only and args.agent == "pi":
+            config = {**config, "setup": []}  # read-only Pi has no shell; dependencies are of no use to it
+        extra["worktree"] = {"source": top, "sourceWorkdir": workdir, "config": config}
     return launch(args, prompt, workdir, mode, extra)
 
 
@@ -89,11 +98,11 @@ def with_contract(prompt, accept=None, read_only=False, revoked=False):
         notes.append("完成标准有变：之前给出的验收命令不再适用。" if zh else
                      "The definition of done has changed: the earlier acceptance command no longer applies.")
     if read_only:
-        notes.append("只读任务：不要创建、修改或删除任何文件；结束后会核对工作目录，任何改动都会使任务判为失败。"
+        notes.append("只读任务：不要创建、修改或删除任何文件；结束后会核对工作目录，改动不会被采纳，并会报告给委派方。"
                      "用 delegate 委派子任务产生的记录在 git 忽略的目录里，不算改动，无需改动其存放位置。" if zh else
-                     "Read-only task: do not create, modify or delete files; the working directory is checked afterwards "
-                     "and any change fails the task. Records of subtasks delegated with delegate live in git-ignored "
-                     "directories and do not count; leave their location as it is.")
+                     "Read-only task: do not create, modify or delete files; the working directory is checked afterwards, "
+                     "and any change is reported to the delegator and never adopted. Records of subtasks delegated with "
+                     "delegate live in git-ignored directories and do not count; leave their location as it is.")
     if accept:
         notes.append(("完成标准：你结束后，委派方会在工作目录中运行下面的命令，退出码为 0 即视为完成。" if zh else
                       "Definition of done: after you finish, the delegator runs this command in the working directory; "

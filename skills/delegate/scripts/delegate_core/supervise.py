@@ -77,10 +77,16 @@ def supervise(run):
         # Say so rather than report "no changes": a read-only run could not be verified either.
         summary["warning"] = "could not snapshot the working tree; changes are unknown"
     if meta["mode"] == "read-only" and changed and verdict == "ok":
-        # Codex runs unsandboxed, so read-only is checked by outcome.
-        verdict = "failed"
-        summary["readOnlyViolation"] = changed
-        state = summary["state"] = "failed"
+        # Codex runs unsandboxed, so read-only is checked by outcome. The answer still stands on its own: the
+        # state says whether there is one, and the changes are reported beside it.
+        if meta.get("worktree"):
+            summary["readOnlyViolation"] = changed
+            summary["warning"] = "the read-only run changed files in its own worktree; they stay there, never applied"
+        else:
+            # In place, the caller's own edits during the run land in the same snapshot; they cannot be told apart.
+            summary["workspaceChanged"] = changed
+            summary["warning"] = ("the working tree changed during this in-place read-only run; "
+                                  "the changes may be the caller's own")
     if verdict == "ok" and meta.get("accept"):
         summary["accept"] = accept(meta, run)
         state = summary["state"] = "delivered" if summary["accept"]["ok"] else "rejected"
@@ -102,7 +108,6 @@ def supervise(run):
         tail = (run / "stderr.log").read_text(errors="replace").strip().splitlines()[-3:] \
             if (run / "stderr.log").is_file() else []
         hint = {"malformed": "answer was empty or a leaked tool call",
-                "failed": "read-only run changed files" if summary.get("readOnlyViolation") else None,
                 "timeout": f"{meta.get('agent', 'pi')} exceeded {meta['timeout']}"}.get(state)
         message = "; ".join(x for x in [setup_error or hint] + errors[-1:] + tail if x)
         if message:

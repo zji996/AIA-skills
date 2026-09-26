@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .common import ACTIVE, DEFAULT_LIMITS, STARTING_GRACE, die, read_json, setting
+from .common import ACTIVE, DEFAULT_LIMITS, FINISHED_OK, SCRIPT, STARTING_GRACE, die, read_json, setting
 from .worktree import remove_worktree
 
 
@@ -119,7 +119,7 @@ def status(run):
             out[key] = meta[key]["path"] if key == "worktree" else meta[key]
     if summary:
         for key in ("elapsedSeconds", "attempts", "model", "turns", "files", "changes", "accept", "readOnlyViolation",
-                    "tokens", "warning", "error"):
+                    "workspaceChanged", "tokens", "warning", "error"):
             if summary.get(key) not in (None, [], {}):
                 out[key] = summary[key]
     else:
@@ -144,14 +144,43 @@ def status(run):
     if result.is_file() and result.stat().st_size:
         out["result"] = str(result)
         out["resultChars"] = len(result.read_text(encoding="utf-8"))
+    step = next_step(run, meta, state, summary)
+    if step:
+        out["next"] = step
     out["dir"] = str(run)
     return out
 
 
 
+def next_step(run, meta, state, summary):
+    """What the caller does with this outcome, so it need not keep the state table in mind."""
+    name, script = meta.get("run", run.name), SCRIPT
+    if state in ACTIVE:
+        return f"{script} wait {name}"
+    if state in FINISHED_OK:
+        if meta.get("mode") != "write":
+            return None  # the answer is the deliverable
+        if not (summary.get("changes") or {}).get("files"):
+            return None
+        if not meta.get("worktree"):
+            return f"review {script} diff {name}; the changes are already in the working tree"
+        if not (run / ".applied").exists():
+            return f"review {script} diff {name} --total, then merge with {script} apply {name}"
+        return None
+    return {"rejected": f"read accept.tail; {script} reply {name} '<what to fix>' or take it over",
+            "malformed": "hand it to the other agent or do it yourself",
+            "failed": "read error; fix the cause or take it over",
+            "timeout": "split the task smaller or take it over",
+            "killed": "take it over or start it again", "crashed": "take it over or start it again"}.get(state)
+
+
+
 def unmerged_worktree(run):
-    tree = (read_json(run / "meta.json", {}) or {}).get("worktree") or {}
-    return bool(tree.get("path")) and Path(tree["path"]).exists() and not (run / ".applied").exists()
+    meta = read_json(run / "meta.json", {}) or {}
+    tree = meta.get("worktree") or {}
+    # A read-only run's worktree is only a snapshot to read; it has nothing to merge.
+    return meta.get("mode") == "write" and bool(tree.get("path")) and Path(tree["path"]).exists() \
+        and not (run / ".applied").exists()
 
 
 

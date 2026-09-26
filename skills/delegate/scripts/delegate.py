@@ -15,7 +15,8 @@ a start beyond DELEGATE_MAX_ACTIVE (default 6) or DELEGATE_MAX_CODEX (default 3)
 Changes: in a git repo, the whole working tree is snapshotted as a tree object before and after
 the agent (through a scratch index; the real index is untouched), so the outcome lists exactly
 what the run changed, apart from what was dirty already. `--worktree` runs in a detached worktree
-seeded with that snapshot; `apply` merges the result back. `reply` continues a run's session.
+seeded with that snapshot; `apply` merges the result back. Read-only runs read such a worktree by default,
+so the caller's edits meanwhile are neither seen as theirs nor in their way. `reply` continues a run's session.
 
 Settings are read as DELEGATE_<NAME>, falling back to the pre-4.0 PI_DELEGATE_<NAME>.
 
@@ -289,7 +290,10 @@ def parser():
         p.add_argument("--image", action="append", metavar="PATH",
                        help="attach an image to the prompt (repeatable); both agents can read images")
         p.add_argument("--read-only", action="store_true",
-                       help="no writes: Pi loses write tools; Codex (unsandboxed) is told and checked by git status afterwards")
+                       help="no writes: Pi loses write tools; Codex (unsandboxed) is told and checked afterwards. "
+                            "In git, it reads a worktree snapshot, so your own edits meanwhile are not taken for its")
+        p.add_argument("--in-place", action="store_true",
+                       help="read-only only: read the working tree itself instead of a worktree snapshot")
         p.add_argument("--accept", help="shell command run in the workdir after Pi; exit 0 = delivered")
         p.add_argument("--hide-accept", action="store_true",
                        help="do not tell Pi the acceptance command (blind verification)")

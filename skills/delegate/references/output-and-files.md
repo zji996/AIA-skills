@@ -15,7 +15,7 @@
 | `stop <run>...` | 终止任务及其进程组 |
 | `clean <run>...\|--finished [--force]` | 删除已结束的任务；`--finished` 默认保留结果未读取的 |
 
-启动选项：`--agent pi|codex`、`--image <路径>`（可重复）、`--accept <命令>`、`--hide-accept`、`--accept-timeout`（默认 10m）、`--read-only`、`--workdir`、`--timeout`（每次尝试，pi 默认 15m，codex 默认 30m）、`--retries`（答复畸形时重跑次数，默认 1）、`--model`/`--thinking`/`--provider`（不指定时用各 CLI 自己的默认设置；Codex 的 `--thinking` 对应推理强度）、`--allow-parallel-writes`、`--worktree`。`<run>` 可以是完整 id、唯一片段、`last` 或 run 目录。
+启动选项：`--agent pi|codex`、`--image <路径>`（可重复）、`--accept <命令>`、`--hide-accept`、`--accept-timeout`（默认 10m）、`--read-only`、`--in-place`（只读任务读实时工作区而非快照）、`--workdir`、`--timeout`（每次尝试，pi 默认 15m，codex 默认 30m）、`--retries`（答复畸形时重跑次数，默认 1）、`--model`/`--thinking`/`--provider`（不指定时用各 CLI 自己的默认设置；Codex 的 `--thinking` 对应推理强度）、`--allow-parallel-writes`、`--worktree`。`<run>` 可以是完整 id、唯一片段、`last` 或 run 目录。
 
 ## 改动清单
 
@@ -35,7 +35,9 @@
 - `setup`：依次在 worktree 根执行，输出写入 `setup.log`，任一失败即判 `failed`（`DELEGATE_SETUP_TIMEOUT`，默认 10m）。依赖用包管理器从本机缓存重建：pnpm 与 uv 以硬链接安装，几 GB 的环境也只需一两秒；不要 link `node_modules`、`.venv`，其中的可编辑安装指向原仓库源码。
 - 这三类路径不计入改动。子模块在新 worktree 里是空目录：只读使用时写进 `link`（会替换空目录），需要独立修改时在 `setup` 里初始化。
 
-worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 `git worktree remove`；`agent-handoff` 会列出尚未 `apply` 的 worktree。
+`--read-only` 在 git 仓库里默认也用这样的 worktree（`--in-place` 除外），只作为供阅读的快照：主控同时的编辑既不影响它读到的内容，也不会被算成它的改动；它违规写入的文件留在 worktree 里，记为 `readOnlyViolation`，不能 `apply`。只读 Pi 没有 shell，不执行 `setup`；Codex 照常执行（它可能跑测试）。
+
+worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 `git worktree remove`，过期清理同理；`agent-handoff` 会列出尚未 `apply` 的写入型 worktree。
 
 ## 会话
 
@@ -57,7 +59,7 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 | `prompt.md` | 同事实际收到的任务说明；末尾可能附完成标准（`--accept`）与只读边界（Codex 只读任务） |
 | `events.jsonl` | 过滤后的全过程：读取、命令、编辑路径、错误、每轮模型与用量、重跑；不含编辑全文 |
 | `result.md` | 最后一轮的完整答复 |
-| `summary.json` | 结论：`state`、`attempts`、`files`、`changes`、`accept`、`readOnlyViolation`、`tokens`、`session`、`error` |
+| `summary.json` | 结论：`state`、`attempts`、`files`、`changes`、`accept`、`readOnlyViolation` / `workspaceChanged`、`warning`、`tokens`、`session`、`error`（`next` 由 `status` 按当前状态现算，不落盘） |
 | `changes.json` / `changes.patch` | 前后快照的 tree、逐文件状态与行数；可直接 `git apply` 的补丁 |
 | `setup.log` | `--worktree` 的 `setup` 命令输出 |
 | `session/` / `fork/` | Pi 本轮的会话；`reply` 分叉所用的上一轮会话副本 |

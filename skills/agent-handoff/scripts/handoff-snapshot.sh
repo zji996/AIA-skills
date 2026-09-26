@@ -73,7 +73,11 @@ for meta in .local/run/pi/*/meta.json; do
     runs+=("$(basename "$dir") 已结束，结果未读取（exit $(cat "$dir/exit_code")）")
   fi
   # --worktree 的改动留在独立 worktree，直到 `delegate apply`；同一对话只报最新一轮。
+  # 只读任务的 worktree 只是供阅读的快照，没有可合并的改动。
   worktree="$(grep -o '"path": "[^"]*"' "$meta" | head -1 | cut -d'"' -f4 || true)"
+  if grep -q '"mode": "read-only"' "$meta"; then
+    worktree=
+  fi
   if [[ -f "$dir/exit_code" && -n "$worktree" && -d "$worktree" ]]; then
     if [[ -f "$dir/.applied" ]]; then
       unset "unmerged[$worktree]"

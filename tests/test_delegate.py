@@ -127,6 +127,7 @@ class DelegateTests(unittest.TestCase):
         state = self.outcome(result)
         self.assertEqual((state["state"], state["accept"]["exitCode"]), ("rejected", 3))
         self.assertIn("boom", state["accept"]["tail"])
+        self.assertIn(f"reply {state['run']}", state["next"])
         self.assertIn("[exit 3]", (Path(state["dir"]) / "accept.log").read_text())
 
     def test_acceptance_command_is_shared_unless_hidden(self):
@@ -351,13 +352,49 @@ class DelegateTests(unittest.TestCase):
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
         self.fake_codex(codex_events("looked"), pre="echo oops > stray.txt")
         state = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "--workdir", repo, "审查一下"))
-        self.assertEqual((state["state"], state["readOnlyViolation"]), ("failed", ["stray.txt"]))
-        self.assertIn("read-only run changed files", state["error"])
+        # The answer stands; the stray write stayed in the run's own worktree and is only reported.
+        self.assertEqual((state["state"], state["readOnlyViolation"]), ("answered", ["stray.txt"]))
+        self.assertIn("never applied", state["warning"])
+        self.assertNotIn("error", state)
+        self.assertFalse((repo / "stray.txt").exists())
+        self.assertTrue((Path(state["worktree"]) / "stray.txt").exists())
         self.assertIn("只读任务", (self.work / "pi.log.codex-prompt").read_text())
-        (repo / "stray.txt").unlink()
+        self.assertIn("nothing to apply", self.cli("apply", state["run"]).stderr)
         self.fake_codex(codex_events("looked"))
-        self.assertEqual(self.outcome(self.cli("run", "--agent", "codex", "--read-only", "--workdir", repo,
-                                               "review"))["state"], "answered")
+        clean = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "--workdir", repo, "review"))
+        self.assertEqual(clean["state"], "answered")
+        self.assertNotIn("readOnlyViolation", clean)
+        self.assertNotIn("next", clean)
+        # In place, a change cannot be told apart from the caller's own; it is reported, not judged.
+        self.fake_codex(codex_events("looked"), pre="echo oops > stray.txt")
+        state = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "--in-place", "--workdir", repo,
+                                      "review"))
+        self.assertEqual((state["state"], state["workspaceChanged"]), ("answered", ["stray.txt"]))
+        self.assertNotIn("worktree", state)
+        self.assertEqual(self.cli("run", "--in-place", "--workdir", repo, "task").returncode, 2)
+
+    def test_callers_edits_during_a_read_only_run_are_not_its_changes(self):
+        repo = self.repo({"a.txt": "a\n", ".gitignore": "setup-ran\n"})
+        (repo / ".delegate.json").write_text(json.dumps({"worktree": {"setup": ["touch setup-ran"]}}))
+        # While the reviewer reads, the caller keeps editing the real working tree.
+        self.fake_codex(codex_events("found a bug"), pre=f"echo caller >> {repo}/a.txt; echo new > {repo}/new.txt")
+        (repo / "a.txt").write_text("a\nuncommitted\n")
+        result = self.cli("run", "--agent", "codex", "--read-only", "--workdir", repo, "review")
+        state = self.outcome(result)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(state["state"], "answered")
+        for key in ("readOnlyViolation", "workspaceChanged", "warning", "error"):
+            self.assertNotIn(key, state)
+        worktree = Path(state["worktree"])
+        self.assertEqual((worktree / "a.txt").read_text(), "a\nuncommitted\n")  # it read what the caller had
+        self.assertTrue((worktree / "setup-ran").exists())  # Codex may run commands, so setup runs
+        self.assertEqual((repo / "a.txt").read_text(), "a\nuncommitted\ncaller\n")
+        self.fake_pi([answer("ok"), SETTLED])
+        pi = self.outcome(self.cli("run", "--read-only", "--workdir", repo, "review"))
+        self.assertFalse((Path(pi["worktree"]) / "setup-ran").exists())  # read-only Pi has no shell
+        self.assertFalse(delegate.unmerged_worktree(Path(pi["dir"])))
+        self.assertIn("removed", self.cli("clean", pi["run"]).stdout)
+        self.assertFalse(Path(pi["worktree"]).exists())
 
     def test_nesting_rules(self):
         self.fake_pi([answer("ok"), SETTLED])
@@ -481,6 +518,7 @@ class DelegateTests(unittest.TestCase):
         self.assertTrue(str(tree).startswith(str(self.work / "cache/delegate/worktrees")))
         self.assertEqual(state["files"], ["a.txt", "seen.txt"])  # link, copy and setup output are not its work
         self.assertEqual((repo / "a.txt").read_text(), "1\n2\n3\n4\n5\n")  # source untouched until apply
+        self.assertIn(f"apply {state['run']}", state["next"])
         self.assertIn("apply", result.stdout)
         (repo / "a.txt").write_text("1\n2\n3\n4\nfive\n")  # the caller keeps working meanwhile
         self.assertEqual(self.cli("apply", "--dry-run").returncode, 0)
@@ -489,6 +527,7 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
         self.assertEqual((repo / "a.txt").read_text(), "one\n2\n3\n4\nfive\n")
         self.assertEqual((repo / "seen.txt").read_text(), "seeded\n")
+        self.assertNotIn("next", self.outcome(self.cli("status", state["run"])))  # merged: nothing left to do
         (repo / "a.txt").write_text("uno\n2\n3\n4\nfive\n")
         (repo / "seen.txt").unlink()
         refused = self.cli("apply", state["run"])
@@ -599,7 +638,6 @@ class DelegateTests(unittest.TestCase):
         self.fake_codex(codex_events("looked"), pre="echo oops > stray.txt")
         state = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "--workdir", repo, "review"))
         self.assertEqual(state["readOnlyViolation"], ["stray.txt"])
-        (repo / "stray.txt").unlink()
         sub = self.work / "lib"
         subprocess.run(["git", "init", "-q", str(sub)], check=True)
         (sub / "lib.txt").write_text("l\n")
@@ -610,8 +648,10 @@ class DelegateTests(unittest.TestCase):
                        capture_output=True)
         subprocess.run(["git", "-C", str(repo), *git, "commit", "-qm", "sub"], check=True)
         self.fake_codex(codex_events("looked"), pre="echo edit >> vendor/lib.txt")
-        state = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "--workdir", repo, "review"))
-        self.assertEqual(state["readOnlyViolation"], ["vendor"])
+        # In place: a new worktree leaves submodules empty.
+        state = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "--in-place", "--workdir", repo,
+                                      "review"))
+        self.assertEqual(state["workspaceChanged"], ["vendor"])
         self.assertIn(" M vendor  submodule contents", self.cli("wait", state["run"]).stdout)
 
     def test_worktree_in_a_repository_without_commits(self):
