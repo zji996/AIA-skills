@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux；需要 python3（3.9+，仅标准库），以及所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "4.0.0"
+  version: "4.1.0"
   exclude-agents: pi
 ---
 
@@ -12,7 +12,7 @@ metadata:
 
 你是主控：把边界清楚的任务交给同事，自己继续推进，回来只看结果。同事交回的是草稿和执行结果，**是否采纳、如何整合始终由你决定**。
 
-`scripts/delegate.py` 负责启动同事、等待结束、在工作目录里运行你给的验收命令，最后输出一行 JSON 结论和同事的答复；过程细节留在 run 目录。
+`scripts/delegate.py` 负责启动同事、等待结束、在工作目录里运行你给的验收命令，最后输出一行 JSON 结论、改动清单和同事的答复；过程细节留在 run 目录。
 
 ## 选择同事
 
@@ -27,7 +27,7 @@ metadata:
 
 - **原子化**：几句话能交代清楚，不依赖只有你知道的隐含背景。
 - **可验收**：写入任务能用一条命令判断成败（测试、lint、脚本退出码）；只读任务的交付物就是答复。
-- **可并行**：互不依赖的任务同时放出；写入任务各用自己的 `--workdir`，或各自的 git worktree。
+- **可并行**：互不依赖的任务同时放出；并行写入各加 `--worktree`，互不干扰，也不碰你的工作区。
 
 改动只有几行、或下一步决策强依赖尚未整理的上下文时，直接自己做。
 
@@ -40,38 +40,41 @@ D=<本技能目录>/scripts/delegate.py
 $D run --agent codex --name fix-lock --workdir apps/api --accept "go test ./..." --prompt-file - <<'EOF'
 修复任务队列在并发取消时重复释放锁的问题，保持现有接口不变。
 EOF
-
 # 只读：并行放出，统一收取
 $D start --read-only --name ui-review --image shot.png "看这张截图，列出小屏布局最影响使用的三处问题"
 $D start --read-only --agent codex --name review-db "审查 src/db/ 的事务边界，只列真实缺陷"
 $D wait --all
+# 隔离：在独立 worktree 里改（从你当前的工作区起步，含未提交改动），满意再合并
+$D run --worktree --agent codex --name api --accept "make check" "给上传接口加大小限制"
+$D reply api "边界值也补上测试"   # 同一会话、同一 worktree 接着改
+$D apply api                     # 三方合并回原工作区，不碰 index；有冲突则什么都不写
 ```
 
 - **等待方式按你所在的环境选**：能在后台运行命令并在结束时收到通知的环境，直接后台运行 `run`，无需轮询；单次工具调用有时长上限的环境，给 `run`/`wait` 加 `--max 4m`，到时返回 75，稍后再 `wait`。`--max` 只结束本次等待，同事仍在后台运行；不再需要时用 `stop`。
-- 有 `--accept` 时，脚本会把验收命令作为“完成标准”附在任务说明末尾；需要盲验时加 `--hide-accept`。`prompt.md` 保存同事实际收到的全文。
-- 多行任务说明用 `--prompt-file -` 加 heredoc。建议总加 `--name`。
+- 有 `--accept` 时，脚本会把验收命令作为“完成标准”附在任务说明末尾；需要盲验时加 `--hide-accept`。`prompt.md` 保存同事实际收到的全文。多行任务说明用 `--prompt-file -` 加 heredoc；建议总加 `--name`，`reply`/`apply` 用它指代整段对话。
 
 ## 读结论并把关
 
-每个结束的任务输出一行 JSON，之后是答复（超过 6000 字只显示末尾，`--full` 或 `result` 看全文）：
+每个结束的任务输出一行 JSON，然后是 `changes` 改动清单（像 `git diff --stat`：状态、路径、+/- 行数；写入任务什么都没改时显示 `none`），最后是答复（超过 6000 字只显示末尾，`--full` 或 `result` 看全文）。改动按运行前后的工作区快照计算：shell 改的也算，运行前已有的脏改动和验收命令的副产物不算。`diff <run>` 看完整差异，`--total` 看整段对话。
 
 | state | 含义 | 你要做的 |
 |---|---|---|
-| `delivered` | 已答复且验收命令通过 | 复核 `files` 的 diff 再采纳 |
+| `delivered` | 已答复且验收命令通过 | 看 `diff` 再采纳；`--worktree` 的用 `apply` 合并 |
 | `answered` | 已答复，未设验收 | 按内容判断，关键结论去代码里核实 |
 | `rejected` | 验收命令失败，`accept.tail` 有输出末尾 | 看原因，修补或自己接手 |
 | `malformed` | 答复为空或是一段泄漏的工具调用，已自动重跑仍如此 | 换同事或自己做 |
 | `failed` | 同事出错，或只读任务改了文件（`readOnlyViolation` 列出） | 看 `error`；改动需手动还原 |
 | `timeout` / `killed` / `crashed` / `stopped` | 超时、进程异常或被终止 | 任务太大就拆小，否则自己接手 |
 
-`delivered` 只说明验收命令通过，不代表改法合适：采纳前看 diff。退出码：`0` delivered/answered，`1` 其他结局，`2` 用法错误或被拒绝（含并发已满、违反层级），`75` 仍在运行。
+`delivered` 只说明验收命令通过，不代表改法合适。退出码：`0` delivered/answered，`1` 其他结局，`2` 用法错误或被拒绝（含并发已满、违反层级），`75` 仍在运行。
 
 ## 边界
 
 1. **并发上限**：按整台机器计数（跨项目，含同事再委派的子任务），默认同时最多 6 个，其中 Codex 最多 3 个；超出时拒绝并列出正在运行的任务。先 `wait` 收一批结果再派。上限由用户通过 `DELEGATE_MAX_ACTIVE` / `DELEGATE_MAX_CODEX` 设定（`0` 为不限），同事不要自行调整；委派记录写在 git 忽略的 `.local/run/`，不算只读任务的改动。
 2. **委派层级**：主控可委派给 `pi` 和 `codex`；Codex 可把子任务再交给 `pi`，不能交给 `codex`；Pi 不能再委派（本技能也不会安装到 Pi 扫描的目录）。
 3. **权限与只读**：Codex 固定以 `--dangerously-bypass-approvals-and-sandbox`（full access）启动，不依赖各机器 `~/.codex/config.toml`；写入靠 git 回退兜底，采纳前照常看 diff。Pi 的只读模式移除写工具；Codex 的只读由任务说明写明边界，结束后用 git 核对工作目录，有改动即判 `failed`。非 git 目录无法核对，这时只读任务优先交给 Pi。
-4. **写入互斥**：同一 workdir 同时只允许一个写入任务（委派者自己的 run 除外）。确需并行时各用不同 `--workdir`，或加 `--allow-parallel-writes` 并确保文件不重叠。
+4. **写入互斥**：同一 workdir 同时只允许一个写入任务（委派者自己的 run 与 `--worktree` 除外）；原地改时，你同时编辑的文件也会算进它的改动，要并行就用 `--worktree`。
 5. **环境**：缺少 `pi` 时脚本给出随仓库附带的 pi-kit 安装命令；缺少 `codex` 时提示安装并登录。经非交互 SSH 调用时这些 CLI 往往只在登录 shell 的 `PATH` 里。
+6. **worktree 与依赖**：worktree 放在 `~/.cache/delegate/worktrees/`，git 忽略的东西（依赖、`.env`）不会带过去，在仓库根 `.delegate.json` 的 `worktree` 下声明：`copy` 小配置、`link` 大而只读的目录、`setup` 用包管理器离线重建依赖（pnpm/uv 从硬链接缓存装，秒级）。别 link `node_modules`/`.venv`：可编辑安装指向原仓库，测试会跑原仓库的代码。`clean` 删除最后一个使用它的 run 时一并删掉 worktree。
 
-命令（`start`/`run`/`wait`/`status`/`result`/`stop`/`clean`）与全部选项见 `$D --help`；run 目录、文件、环境变量与清理策略见 [references/output-and-files.md](references/output-and-files.md)。
+命令（`start`/`run`/`reply`/`wait`/`status`/`result`/`diff`/`apply`/`stop`/`clean`）与全部选项见 `$D --help`；run 目录、文件、环境变量与清理策略见 [references/output-and-files.md](references/output-and-files.md)。

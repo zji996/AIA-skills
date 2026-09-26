@@ -3,7 +3,7 @@ name: agent-handoff
 description: 会话上下文快满、要换 Agent 或换设备、任务需要暂停或交给他人时使用；脚本自动采集 Git 与委派任务状态，生成交接账本，接手者无需翻聊天记录即可继续。Use for handoff, resume, context checkpoint, pausing work.
 license: MIT
 metadata:
-  version: "2.0.0"
+  version: "2.1.0"
 ---
 
 # Agent Handoff (任务交接)

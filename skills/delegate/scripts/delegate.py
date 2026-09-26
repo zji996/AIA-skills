@@ -12,12 +12,18 @@ Codex. The calling agent always reviews and decides whether to adopt a result.
 Concurrency: active runs are counted per machine (all projects, nested runs included);
 a start beyond DELEGATE_MAX_ACTIVE (default 6) or DELEGATE_MAX_CODEX (default 3) is refused.
 
+Changes: in a git repo, the whole working tree is snapshotted as a tree object before and after
+the agent (through a scratch index; the real index is untouched), so the outcome lists exactly
+what the run changed, apart from what was dirty already. `--worktree` runs in a detached worktree
+seeded with that snapshot; `apply` merges the result back. `reply` continues a run's session.
+
 Settings are read as DELEGATE_<NAME>, falling back to the pre-4.0 PI_DELEGATE_<NAME>.
 
 Standard library only; Linux (process groups, /proc). Python 3.9+.
 """
 
 import argparse
+import tempfile
 import fcntl
 import hashlib
 import json
@@ -29,6 +35,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -46,6 +53,9 @@ DEFAULT_LIMITS = {"MAX_ACTIVE": 6, "MAX_CODEX": 3}
 # Environment handed to a delegated agent; used to refuse self-delegation.
 ENV_AGENT, ENV_PARENT, ENV_LEGACY = "DELEGATE_AGENT", "DELEGATE_PARENT_RUN", "PI_DELEGATE_ACTIVE"
 GUARD_VARS = (ENV_AGENT, ENV_PARENT, ENV_LEGACY, "PI_DELEGATE_AGENT", "PI_DELEGATE_PARENT_RUN")
+CONFIG_FILE = ".delegate.json"  # per repo, at its git root: {"worktree": {"copy": [], "link": [], "setup": []}}
+LARGE_UNTRACKED = 2 << 20  # untracked files above this are fingerprinted, not stored in the snapshot
+CHANGES_SHOWN = 40
 
 
 def setting(name, default=None):
@@ -169,8 +179,11 @@ def status(run):
     summary = read_json(run / "summary.json", {}) or {}
     out = {"run": meta.get("run", run.name), "name": meta.get("name"), "state": state,
            "agent": meta.get("agent", "pi"), "mode": meta.get("mode")}
+    for key in ("parent", "worktree"):
+        if meta.get(key):
+            out[key] = meta[key]["path"] if key == "worktree" else meta[key]
     if summary:
-        for key in ("elapsedSeconds", "attempts", "model", "turns", "files", "accept", "readOnlyViolation",
+        for key in ("elapsedSeconds", "attempts", "model", "turns", "files", "changes", "accept", "readOnlyViolation",
                     "tokens", "error"):
             if summary.get(key) not in (None, [], {}):
                 out[key] = summary[key]
@@ -257,6 +270,8 @@ def filter_codex_event(event):
     """Map one `codex exec --json` event to compact log events."""
     kind, item = event.get("type"), event.get("item") or {}
     itype = item.get("type")
+    if kind == "thread.started" and event.get("thread_id"):
+        return [{"e": "session", "id": event["thread_id"]}]
     if kind == "item.started" and itype == "command_execution":
         return [{"e": "bash", "cmd": clip(item.get("command", ""), 180)}]
     if kind == "item.completed":
@@ -290,12 +305,13 @@ def codex_model():
     return match.group(1) if match else None
 
 
-def agent_command(meta):
+def agent_command(meta, session):
     if meta["agent"] == "codex":
         # Full access on every host, whatever its own config.toml says: bwrap is often unavailable (AppArmor),
         # git makes writes recoverable, and read-only runs are checked by outcome afterwards.
-        command = ["codex", "exec", "--json", "--skip-git-repo-check", "-C", meta["workdir"],
-                   "--dangerously-bypass-approvals-and-sandbox"]
+        # `resume` has no -C; the process cwd is the workdir either way.
+        command = ["codex", "exec"] + (["resume", session] if session else []) + ["--json", "--skip-git-repo-check"]
+        command += ([] if session else ["-C", meta["workdir"]]) + ["--dangerously-bypass-approvals-and-sandbox"]
         if meta.get("model"):
             command += ["-m", meta["model"]]
         if meta.get("thinking"):
@@ -303,7 +319,8 @@ def agent_command(meta):
         if meta.get("provider"):
             command += ["-c", f'model_provider="{meta["provider"]}"']
         return command + [f"--image={image}" for image in meta.get("images") or []] + ["-"]
-    command = ["pi", "--no-session", "--mode", "json"]
+    # Each run keeps a copy of its conversation under session/, so that `reply` can continue it.
+    command = ["pi", "--session-dir", meta["sessionDir"], "--session-id", session, "--mode", "json"]
     for flag in ("provider", "model", "thinking"):
         if meta.get(flag):
             command += [f"--{flag}", meta[flag]]
@@ -342,11 +359,15 @@ def leaked_tool_call(answer):
 def run_agent(meta, run, attempt, stop_flag, holder):
     """Run the agent once; return (verdict, answer). Verdicts: ok, malformed, failed, timeout, killed, stopped."""
     codex = meta["agent"] == "codex"
-    command, env = agent_command(meta), agent_env(meta)
+    # A reply continues its parent's session; a fresh Pi attempt gets a session of its own.
+    session = meta.get("resume") or (None if codex else str(uuid.uuid4()))
+    command, env = agent_command(meta, session), agent_env(meta)
     convert = filter_codex_event if codex else filter_event
     timed_out = threading.Event()
     with open(run / "prompt.md", "rb") as prompt, open(run / "stderr.log", "ab") as stderr, \
             open(run / "events.jsonl", "a", encoding="utf-8") as log:
+        if session:
+            log.write(json.dumps({"e": "session", "id": session, "attempt": attempt, "at": now_iso()}) + "\n")
         proc = subprocess.Popen(command, cwd=meta["workdir"], stdin=prompt, stdout=subprocess.PIPE,
                                 stderr=stderr, env=env, start_new_session=True)
         holder["pgid"] = proc.pid
@@ -416,13 +437,90 @@ def kill_group(pgid, grace=5.0):
         pass
 
 
-def git_changes(workdir):
+# ----------------------------------------------------------- change tracking
+
+def git(top, *args, env=None, text=True):
+    return subprocess.run(["git", "-C", str(top), *args], capture_output=True, text=text, check=True,
+                          env=env).stdout
+
+
+def git_top(path):
     try:
-        out = subprocess.run(["git", "-C", workdir, "status", "--porcelain", "--untracked-files=all", "."],
-                             capture_output=True, text=True, check=True).stdout
+        return git(path, "rev-parse", "--show-toplevel").strip()
     except (OSError, subprocess.CalledProcessError):
         return None
-    return sorted(set(out.splitlines()))
+
+
+def snapshot(top, scratch, exclude=()):
+    """The working tree as a git tree object: tracked and untracked files, minus ignored ones.
+
+    Works on a copy of the real index (reusing its stat cache), so the repository's own index and
+    refs are untouched. Untracked files above DELEGATE_SNAPSHOT_MAX_BYTES are fingerprinted instead
+    of hashed into the object store. Returns None outside a git repository.
+    """
+    index = Path(scratch) / f".snapshot-index-{os.getpid()}-{threading.get_ident()}"
+    try:
+        real = Path(top) / git(top, "rev-parse", "--git-path", "index").strip()
+        if real.is_file():
+            shutil.copyfile(real, index)
+        limit_bytes = int(setting("SNAPSHOT_MAX_BYTES", str(LARGE_UNTRACKED)))
+        large = {}
+        for path in git(top, "ls-files", "-z", "--others", "--exclude-standard").split("\0"):
+            full = Path(top) / path
+            if path and full.is_file() and not full.is_symlink() and full.stat().st_size > limit_bytes:
+                info = full.stat()
+                large[path] = [info.st_size, info.st_mtime_ns]
+        # git refuses a pathspec naming an ignored path, even to exclude it; ignored paths need no exclusion.
+        exclude = [path for path in exclude if (Path(top) / path).exists() or (Path(top) / path).is_symlink()]
+        ignored = subprocess.run(["git", "-C", str(top), "check-ignore", "-z", "--stdin"], input="\0".join(exclude),
+                                 capture_output=True, text=True).stdout.split("\0") if exclude else []
+        skip = [f":(exclude,literal){path}" for path in sorted(set(large) | set(exclude) - set(ignored))]
+        env = {**os.environ, "GIT_INDEX_FILE": str(index)}
+        git(top, "add", "-A", "--", ".", *skip, env=env)
+        return {"tree": git(top, "write-tree", env=env).strip(), "large": large}
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return None
+    finally:
+        index.unlink(missing_ok=True)
+
+
+def tree_changes(top, before, after):
+    """[{path, status A|M|D, added, deleted}] between two snapshots; binary and large files count no lines."""
+    lines = {}
+    out = git(top, "diff", "--numstat", "-z", "--no-renames", before["tree"], after["tree"])
+    for record in out.split("\0"):
+        if record.count("\t") >= 2:
+            added, deleted, path = record.split("\t", 2)
+            lines[path] = (None, None) if added == "-" else (int(added), int(deleted))
+    changes = []
+    out = git(top, "diff", "--name-status", "-z", "--no-renames", before["tree"], after["tree"]).split("\0")
+    for status_letter, path in zip(out[0::2], out[1::2]):
+        added, deleted = lines.get(path, (None, None))
+        changes.append({"path": path, "status": status_letter[:1], "added": added, "deleted": deleted})
+    old, new = before.get("large") or {}, after.get("large") or {}
+    for path in sorted(set(old) | set(new)):
+        if old.get(path) != new.get(path):
+            letter = "A" if path not in old else "D" if path not in new else "M"
+            changes.append({"path": path, "status": letter, "added": None, "deleted": None, "large": True})
+    return sorted(changes, key=lambda change: change["path"])
+
+
+def record_changes(meta, run):
+    """Snapshot after the agent, write changes.json and changes.patch; return (changes, totals) or None."""
+    base = meta.get("base")
+    if not base:
+        return None
+    after = snapshot(meta["top"], run, meta.get("snapshotExclude") or ())
+    if not after:
+        return None
+    changes = tree_changes(meta["top"], base, after)
+    write_json(run / "changes.json", {"base": base["tree"], "after": after["tree"], "top": meta["top"],
+                                       "afterLarge": after["large"], "changes": changes})
+    patch = git(meta["top"], "diff", "--binary", "--no-renames", base["tree"], after["tree"], text=False)
+    (run / "changes.patch").write_bytes(patch)
+    totals = {"files": len(changes), "added": sum(c["added"] or 0 for c in changes),
+              "deleted": sum(c["deleted"] or 0 for c in changes), "after": after["tree"]}
+    return changes, totals
 
 
 def relative_to(path, workdir):
@@ -450,6 +548,101 @@ def accept(meta, run):
     return result
 
 
+# ------------------------------------------------------------------ worktrees
+
+def worktree_config(top):
+    """`.delegate.json` at the repo root: which ignored files a worktree copies or links, and setup commands."""
+    path = Path(top) / CONFIG_FILE
+    if not path.is_file():
+        return {"copy": [], "link": [], "setup": []}
+    try:
+        config = json.loads(path.read_text()).get("worktree") or {}
+    except (OSError, ValueError, AttributeError) as error:
+        die(f"cannot read {path}: {error}")
+    out = {}
+    for key in ("copy", "link", "setup"):
+        value = config.get(key) or []
+        value = [value] if isinstance(value, str) else value
+        if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+            die(f"{path}: worktree.{key} must be a list of strings")
+        if key != "setup" and any(os.path.isabs(v) or ".." in Path(v).parts for v in value):
+            die(f"{path}: worktree.{key} entries must be paths inside the repository")
+        out[key] = [v.strip().rstrip("/") if key != "setup" else v for v in value]
+    return out
+
+
+def worktrees_dir():
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "delegate/worktrees"
+
+
+def prepare_worktree(meta, run):
+    """Create the detached worktree, seed it with the caller's snapshot, then copy/link/setup. Returns an error."""
+    tree, config = meta["worktree"], meta["worktree"]["config"]
+    path, source = Path(tree["path"]), tree["source"]
+    log = run / "setup.log"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        git(source, "worktree", "add", "--detach", str(path), "HEAD")
+        # The worktree starts from what the caller sees, uncommitted edits included.
+        git(path, "read-tree", "-u", "--reset", meta["base"]["tree"])
+    except (OSError, subprocess.CalledProcessError) as error:
+        detail = getattr(error, "stderr", None) or str(error)
+        return f"worktree setup failed: {clip(str(detail).strip(), 300)}"
+    for item in config["copy"] + config["link"]:
+        origin, target = Path(source) / item, path / item
+        if not origin.exists() or target.exists() or target.is_symlink():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if item in config["link"]:
+            target.symlink_to(origin)
+        elif origin.is_dir():
+            shutil.copytree(origin, target, symlinks=True)
+        else:
+            shutil.copy2(origin, target)
+    env = {k: v for k, v in os.environ.items() if k not in GUARD_VARS}
+    timeout = seconds(setting("SETUP_TIMEOUT", "10m"))
+    with open(log, "a", encoding="utf-8") as out:
+        for command in config["setup"]:
+            out.write(f"$ {command}\n")
+            out.flush()
+            try:
+                code = subprocess.run(command, shell=True, cwd=path, stdout=out, stderr=subprocess.STDOUT,
+                                      env=env, timeout=timeout).returncode
+            except subprocess.TimeoutExpired:
+                code = 124
+            out.write(f"[exit {code}]\n")
+            if code != 0:
+                return f"worktree setup command failed (exit {code}): {command}; see {log}"
+    return None
+
+
+def remove_worktree(meta):
+    tree = meta.get("worktree") or {}
+    path = tree.get("path")
+    if not path or not Path(path).exists():
+        return
+    try:
+        git(tree["source"], "worktree", "remove", "--force", path)
+    except (OSError, subprocess.CalledProcessError):
+        shutil.rmtree(path, ignore_errors=True)
+        subprocess.run(["git", "-C", tree["source"], "worktree", "prune"], capture_output=True)
+
+
+def unmerged_worktree(run):
+    tree = (read_json(run / "meta.json", {}) or {}).get("worktree") or {}
+    return bool(tree.get("path")) and Path(tree["path"]).exists() and not (run / ".applied").exists()
+
+
+def remove_run(run):
+    """Delete a run directory; its worktree goes with the last run that uses it."""
+    meta = read_json(run / "meta.json", {}) or {}
+    shutil.rmtree(run, ignore_errors=True)
+    path = (meta.get("worktree") or {}).get("path")
+    if path and not any(((read_json(r / "meta.json", {}) or {}).get("worktree") or {}).get("path") == path
+                        for r in all_runs()):
+        remove_worktree(meta)
+
+
 def supervise(run):
     (run / "pid").write_text(str(os.getpid()))
     meta = read_json(run / "meta.json")
@@ -463,9 +656,14 @@ def supervise(run):
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, on_stop)
     started = time.time()
-    verdict, answer, attempts = "failed", "", 0
+    verdict, answer, attempts, setup_error = "failed", "", 0, None
     try:
-        for attempts in range(1, meta["retries"] + 2):
+        if meta.get("worktree") and not Path(meta["worktree"]["path"]).exists():
+            setup_error = prepare_worktree(meta, run)
+        for attempts in range(1, 0 if setup_error else meta["retries"] + 2):
+            if stop_flag.is_set():  # stopped during worktree setup or between attempts
+                verdict = "stopped"
+                break
             verdict, answer = run_agent(meta, run, attempts, stop_flag, holder)
             if verdict != "malformed" or attempts > meta["retries"]:
                 break
@@ -478,9 +676,13 @@ def supervise(run):
     state = {"ok": "answered"}.get(verdict, verdict)
     summary = {"state": state, "attempts": attempts}
     # Measure the agent's changes before acceptance, whose own byproducts (caches, reports) are not its work.
-    after = git_changes(meta["workdir"])
-    before = meta.get("gitBefore")
-    changed = sorted(line[3:] for line in set(after) - set(before)) if before is not None and after is not None else []
+    try:
+        recorded = None if setup_error else record_changes(meta, run)
+    except (OSError, subprocess.CalledProcessError):
+        recorded = None
+    changed = [c["path"] for c in recorded[0]] if recorded else []
+    if recorded:
+        summary["changes"] = recorded[1]
     if meta["mode"] == "read-only" and changed and verdict == "ok":
         # Codex runs unsandboxed, so read-only is checked by outcome.
         verdict = "failed"
@@ -493,8 +695,12 @@ def supervise(run):
         (run / "result.md").write_text(answer.rstrip("\n") + "\n", encoding="utf-8")
     evs = events(run)
     turns = [e for e in evs if e.get("e") == "turn"]
-    files = {relative_to(e["path"], meta["workdir"]) for e in evs if e.get("e") in ("edit", "write") and e.get("path")}
-    files |= set(changed)
+    # A snapshot is the truth (edits that were reverted do not count); edit events are the fallback outside git.
+    files = set(changed) if recorded else {relative_to(e["path"], meta["workdir"]) for e in evs
+                                           if e.get("e") in ("edit", "write") and e.get("path")}
+    sessions = [e["id"] for e in evs if e.get("e") == "session" and e.get("id")]
+    if sessions:
+        summary["session"] = sessions[-1]
     tokens = {k: sum((t.get("usage") or {}).get(k) or 0 for t in turns) for k in ("input", "output", "cacheRead")}
     summary.update(elapsedSeconds=int(time.time() - started), model=turns[-1].get("model") if turns else None,
                    turns=len(turns), files=sorted(files), tokens=tokens)
@@ -505,7 +711,7 @@ def supervise(run):
         hint = {"malformed": "answer was empty or a leaked tool call",
                 "failed": "read-only run changed files" if summary.get("readOnlyViolation") else None,
                 "timeout": f"{meta.get('agent', 'pi')} exceeded {meta['timeout']}"}.get(state)
-        message = "; ".join(x for x in [hint] + errors[-1:] + tail if x)
+        message = "; ".join(x for x in [setup_error or hint] + errors[-1:] + tail if x)
         if message:
             summary["error"] = clip(message, 600)
     write_json(run / "summary.json", summary)
@@ -533,8 +739,9 @@ def prune_expired():
     cutoff = time.time() - int(days) * 86400
     for run in all_runs():
         done = run / "exit_code"
-        if (run / ".delivered").is_file() and done.is_file() and done.stat().st_mtime < cutoff:
-            shutil.rmtree(run, ignore_errors=True)
+        if (run / ".delivered").is_file() and done.is_file() and done.stat().st_mtime < cutoff \
+                and not unmerged_worktree(run):
+            remove_run(run)
 
 
 def state_dir():
@@ -578,12 +785,7 @@ def capacity_error(agent, active):
             f"no longer needed{listing}")
 
 
-def start_run(args):
-    error = nesting_error(args.agent)
-    if error:
-        die(error)
-    if args.timeout is None:
-        args.timeout = DEFAULT_TIMEOUT[args.agent]
+def read_prompt(args):
     if args.prompt_file == "-":
         prompt = sys.stdin.read()
     elif args.prompt_file:
@@ -594,18 +796,38 @@ def start_run(args):
         prompt = args.prompt_text or " ".join(args.words)
     if not prompt.strip():
         die("empty prompt; pass --prompt-file, --prompt, or trailing text")
-    workdir = Path(args.workdir or os.getcwd())
-    if not workdir.is_dir():
-        die(f"workdir does not exist: {workdir}")
-    workdir = str(workdir.resolve())
     images = []
     for image in args.image or []:
         if not Path(image).is_file():
             die(f"image does not exist: {image}")
         images.append(str(Path(image).resolve()))
     args.image = images
+    return prompt
+
+
+def start_run(args):
+    error = nesting_error(args.agent)
+    if error:
+        die(error)
+    if args.timeout is None:
+        args.timeout = DEFAULT_TIMEOUT[args.agent]
+    prompt = read_prompt(args)
+    workdir = Path(args.workdir or os.getcwd())
+    if not workdir.is_dir():
+        die(f"workdir does not exist: {workdir}")
+    workdir = str(workdir.resolve())
     missing_tools(args.agent)
     mode = "read-only" if args.read_only else "write"
+    extra = {}
+    if args.worktree:
+        top = git_top(workdir)
+        if not top:
+            die(f"--worktree needs a git repository: {workdir}")
+        extra["worktree"] = {"source": top, "sourceWorkdir": workdir, "config": worktree_config(top)}
+    return launch(args, prompt, workdir, mode, extra)
+
+
+def launch(args, prompt, workdir, mode, extra):
     root = runs_root()
     root.mkdir(parents=True, exist_ok=True)
     slots = state_dir()
@@ -617,7 +839,7 @@ def start_run(args):
         error = capacity_error(args.agent, machine_runs(slots))
         if error:
             die(error)
-        run = create_run(args, prompt, workdir, mode, root)
+        run = create_run(args, prompt, workdir, mode, root, extra)
         (slots / (hashlib.sha1(str(run).encode()).hexdigest()[:16] + ".slot")).write_text(f"{run}\n")
         return run
 
@@ -641,8 +863,8 @@ def with_contract(prompt, accept=None, read_only=False):
     return prompt.rstrip("\n") + "\n\n---\n" + "\n\n".join(notes) + "\n"
 
 
-def create_run(args, prompt, workdir, mode, root):
-    if mode == "write" and not args.allow_parallel_writes:
+def create_run(args, prompt, workdir, mode, root, extra):
+    if mode == "write" and not args.allow_parallel_writes and not extra.get("worktree"):
         for run in all_runs():
             meta = read_json(run / "meta.json", {}) or {}
             if run.name == setting("PARENT_RUN"):
@@ -663,17 +885,45 @@ def create_run(args, prompt, workdir, mode, root):
         except FileExistsError:
             run = root / f"{stamp}-{slug}-{os.urandom(2).hex()}"
     first_line = next((line.strip() for line in prompt.splitlines() if line.strip()), "")[:120]
-    # Pi's read-only mode removes write tools; Codex gets the boundary in writing and a result check.
-    prompt = with_contract(prompt, None if args.hide_accept else args.accept,
-                           read_only=mode == "read-only" and args.agent == "codex")
-    # prompt.md is exactly what Pi receives.
+    parent = extra.get("parent")
+    if parent:
+        # The session already holds the contract; restate it only when the reply changes it.
+        contract = args.accept if args.accept != parent.get("accept") and not args.hide_accept else None
+        prompt = with_contract(prompt, contract)
+    else:
+        # Pi's read-only mode removes write tools; Codex gets the boundary in writing and a result check.
+        prompt = with_contract(prompt, None if args.hide_accept else args.accept,
+                               read_only=mode == "read-only" and args.agent == "codex")
+    # prompt.md is exactly what the agent receives.
     (run / "prompt.md").write_text(prompt if prompt.endswith("\n") else prompt + "\n", encoding="utf-8")
+    if parent and Path(parent.get("sessionDir", "/-")).is_dir():
+        # Each run keeps its own copy of the conversation, so cleaning an earlier round cannot break a reply.
+        shutil.copytree(parent["sessionDir"], run / "session")
+    tree = extra.get("worktree")
+    if tree and not tree.get("path"):
+        # Outside the repository, so the caller's tools (test runners, linters, watchers) never see it.
+        tree["path"] = str(worktrees_dir() / f"{Path(tree['source']).name}-{run.name}")
+        workdir = str(Path(tree["path"]) / os.path.relpath(tree["sourceWorkdir"], tree["source"]))
+    top = tree["path"] if tree and Path(tree["path"]).exists() else tree["source"] if tree else git_top(workdir)
+    config = tree["config"] if tree else {"copy": [], "link": []}
+    exclude = config["copy"] + config["link"]
+    base = snapshot(top, run, exclude) if top else None
+    if tree and base and not Path(tree["path"]).exists():
+        base["large"] = {}  # large untracked files stay behind; the worktree starts without them
+        top = tree["path"]
+    if tree and not base:
+        shutil.rmtree(run, ignore_errors=True)
+        die(f"cannot snapshot {tree['source']} for the worktree")
     meta = {"run": run.name, "dir": str(run), "workdir": workdir, "mode": mode, "agent": args.agent,
-            "name": args.name or first_line,
+            "name": args.name or (f"reply to {parent['name']}" if parent else first_line),
             "provider": args.provider, "model": args.model, "thinking": args.thinking,
             "timeout": args.timeout, "timeoutSeconds": seconds(args.timeout),
             "accept": args.accept, "acceptTimeoutSeconds": seconds(args.accept_timeout),
-            "retries": args.retries, "images": args.image, "gitBefore": git_changes(workdir),
+            "retries": args.retries, "images": args.image,
+            "top": top, "base": base, "snapshotExclude": exclude, "worktree": tree,
+            "chainBase": (parent or {}).get("chainBase") or (base or {}).get("tree"),
+            "sessionDir": str(run / "session"),
+            "parent": (parent or {}).get("run"), "resume": extra.get("resume"),
             "startedAt": now_iso(), "startedEpoch": int(time.time()), "startedNs": time.time_ns()}
     write_json(run / "meta.json", meta)
     with open(run / "supervisor.log", "wb") as log:
@@ -697,6 +947,39 @@ def print_answer(run, full):
     else:
         print(f"[showing the last {limit} chars; full answer: {run / 'result.md'}]\n..." + text[-limit:].rstrip("\n"))
     print(f"===== end: {run.name} =====", flush=True)
+
+
+def change_line(change):
+    counts = "binary" if change["added"] is None else f"+{change['added']} -{change['deleted']}"
+    return f" {change['status']} {change['path']}  {'large file' if change.get('large') else counts}"
+
+
+def print_changes(run):
+    """What the run changed, like `git diff --stat`, so the caller sees edits without reading the transcript."""
+    recorded = read_json(run / "changes.json")
+    meta = read_json(run / "meta.json", {}) or {}
+    if recorded is None:
+        if meta.get("mode") == "write" and not meta.get("base"):
+            print(f"\n===== changes: {run.name}: not tracked (not a git repository; see files) =====")
+        return
+    changes = recorded["changes"]
+    if not changes:
+        if meta.get("mode") == "write":
+            print(f"\n===== changes: {run.name}: none =====")
+        return
+    added, deleted = (sum(c[k] or 0 for c in changes) for k in ("added", "deleted"))
+    where = f"; worktree {meta['worktree']['path']}" if meta.get("worktree") else ""
+    count = f"{len(changes)} file{'s' if len(changes) != 1 else ''}"
+    print(f"\n===== changes: {run.name} ({count}, +{added} -{deleted}{where}) =====")
+    for change in changes[:CHANGES_SHOWN]:
+        print(change_line(change))
+    if len(changes) > CHANGES_SHOWN:
+        print(f" ... {len(changes) - CHANGES_SHOWN} more in {run / 'changes.json'}")
+    hint = f"{SCRIPT} diff {run.name}"
+    if meta.get("worktree"):
+        hint += f"; merge into {meta['worktree']['source']}: {SCRIPT} apply {run.name}"
+    print(f"diff: {hint}")
+    print(f"===== end changes: {run.name} =====", flush=True)
 
 
 def show_progress(run, tag):
@@ -732,6 +1015,7 @@ def collect(runs, max_seconds, progress, full, show_result):
             continue
         if state not in FINISHED_OK and code == 0:
             code = 1
+        print_changes(run)
         has_result = (run / "result.md").is_file()
         if has_result and show_result:
             print_answer(run, full)
@@ -764,6 +1048,208 @@ def cmd_wait(args):
     else:
         runs = [resolve_run(ref) for ref in (args.runs or ["last"])]
     return collect(runs, args.max, args.progress, args.full, not args.no_result)
+
+
+def latest_in_chain(run):
+    """A conversation is named by its first run; replies and apply act on its latest one."""
+    runs = all_runs()
+    while True:
+        replies = [r for r in runs if (read_json(r / "meta.json", {}) or {}).get("parent") == run.name]
+        if not replies:
+            return run
+        run = replies[-1]
+
+
+def cmd_reply(args):
+    parent = latest_in_chain(resolve_run(args.run))
+    meta = read_json(parent / "meta.json", {}) or {}
+    summary = read_json(parent / "summary.json", {}) or {}
+    if run_state(parent) in ACTIVE:
+        die(f"{parent.name} is still running; wait for it before replying")
+    session = summary.get("session")
+    if not session or (meta.get("agent") == "pi" and not any(Path(meta.get("sessionDir", "/-")).glob(f"*{session}*"))):
+        die(f"{parent.name} has no saved session to continue (runs before delegate 4.1 kept none)")
+    if meta.get("worktree") and not Path(meta["worktree"]["path"]).exists():
+        die(f"the worktree of {parent.name} no longer exists: {meta['worktree']['path']}")
+    error = nesting_error(meta["agent"])
+    if error:
+        die(error)
+    missing_tools(meta["agent"])
+    for key in ("agent", "provider", "model", "thinking", "retries"):
+        setattr(args, key, meta.get(key))
+    args.timeout = args.timeout or meta.get("timeout") or DEFAULT_TIMEOUT[meta["agent"]]
+    args.accept = meta.get("accept") if args.accept is None else (args.accept or None)
+    args.allow_parallel_writes = False
+    prompt = read_prompt(args)
+    run = launch(args, prompt, meta["workdir"], meta["mode"], {"parent": meta, "resume": session,
+                                                                  "worktree": meta.get("worktree")})
+    print(f"delegate: started {run.name} (reply to {parent.name})", file=sys.stderr)
+    return collect([run], args.max, args.progress, args.full, True)
+
+
+def chain_changes(run):
+    """(top, before tree, after tree) for a run, or for its whole conversation with total=True."""
+    meta = read_json(run / "meta.json", {}) or {}
+    recorded = read_json(run / "changes.json")
+    if not recorded:
+        die(f"{run.name} has no recorded changes (still running, not a git repository, or before delegate 4.1)")
+    top = recorded["top"]
+    if not Path(top).is_dir():  # a removed worktree; its objects live in the source repository
+        top = (meta.get("worktree") or {}).get("source", top)
+    return meta, top, recorded["base"], recorded["after"]
+
+
+def cmd_diff(args):
+    run = resolve_run(args.run)
+    meta, top, before, after = chain_changes(run)
+    if args.total:
+        before = meta.get("chainBase") or before
+    command = ["git", "-C", top, "diff", "--no-renames", f"--color={'always' if sys.stdout.isatty() else 'never'}"]
+    command += ["--stat"] if args.stat else []
+    result = subprocess.run(command + [before, after, "--", *args.paths])
+    if result.returncode != 0 and (run / "changes.patch").is_file() and not args.total:
+        sys.stdout.write((run / "changes.patch").read_text(errors="replace"))  # objects pruned; the file remains
+        return 0
+    return result.returncode
+
+
+def blob(top, tree, path):
+    """(mode, bytes) of path in tree; (None, None) when absent, (mode, None) for a directory or submodule."""
+    entry = git(top, "ls-tree", "-z", tree, "--", path).split("\0")[0]
+    if not entry:
+        return None, None
+    mode, kind, sha = entry.split("\t", 1)[0].split()
+    return (mode, git(top, "cat-file", "blob", sha, text=False)) if kind == "blob" else (mode, None)
+
+
+FILE_MODES = ("100644", "100755", "120000")
+
+
+def entry_mode(target):
+    if target.is_symlink():
+        return "120000"
+    if target.is_file():
+        return "100755" if target.stat().st_mode & 0o111 else "100644"
+    return "dir" if target.exists() else None
+
+
+def through_symlink(root, target):
+    """True when a directory on the way from root to target is a symlink, so writing could leave the tree."""
+    path = Path(root)
+    for part in target.relative_to(root).parts[:-1]:
+        path = path / part
+        if path.is_symlink():
+            return True
+    return False
+
+
+def current(target):
+    if target.is_symlink():
+        return os.readlink(target).encode()
+    return target.read_bytes() if target.is_file() else None
+
+
+def write_entry(target, mode, content):
+    if target.is_symlink() or target.exists():
+        target.unlink()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if mode == "120000":
+        target.symlink_to(content.decode())
+        return
+    target.write_bytes(content)
+    target.chmod(0o755 if mode == "100755" else 0o644)
+
+
+def merge_text(top, before, after, path, target, label):
+    """Three-way merge of the current file with the run's version; (exit code, merged bytes)."""
+    with tempfile.TemporaryDirectory() as scratch:
+        mine, base, theirs = (Path(scratch, name) for name in ("mine", "base", "theirs"))
+        mine.write_bytes(target.read_bytes())
+        base.write_bytes(blob(top, before, path)[1])
+        theirs.write_bytes(blob(top, after, path)[1])
+        code = subprocess.run(["git", "merge-file", "-L", "current", "-L", "base", "-L", label,
+                               str(mine), str(base), str(theirs)], capture_output=True).returncode
+        return code, mine.read_bytes()
+
+
+def cmd_apply(args):
+    """Merge a worktree run (its whole conversation) into the source working tree; the index is untouched."""
+    run = latest_in_chain(resolve_run(args.run))
+    if run_state(run) in ACTIVE:
+        die(f"{run.name} is still running")
+    meta, top, _, after = chain_changes(run)
+    tree = meta.get("worktree")
+    if not tree:
+        die(f"{run.name} worked in place; its changes are already in {meta.get('workdir')}")
+    before, source, worktree = meta["chainBase"], tree["source"], Path(tree["path"])
+    changes = tree_changes(top, {"tree": before}, {"tree": after})
+    actions, conflicts = [], []
+    for change in changes:
+        path, target = change["path"], Path(source) / change["path"]
+        old_mode, old = blob(top, before, path)
+        mode, new = blob(top, after, path)
+        now, now_mode = current(target), entry_mode(target)
+        if through_symlink(source, target) or now_mode == "dir" or \
+                not {old_mode, mode} <= set(FILE_MODES) | {None}:
+            conflicts.append(path)  # outside the tree via a symlink, or a file/directory swap
+        elif (now, now_mode) == (new, mode):
+            continue  # already there
+        elif (now, now_mode) == (old, old_mode) or (now == old and now_mode == mode):
+            actions.append(("deleted" if new is None else "applied", path, target, mode, new))
+        elif None not in (old, new, now) and "120000" not in (old_mode, mode, now_mode) \
+                and b"\0" not in old + new + now:
+            code, merged = merge_text(top, before, after, path, target, run.name)
+            if code == 0:
+                actions.append(("merged", path, target, mode if old_mode != mode else None, merged))
+            elif args.merge:
+                actions.append(("conflict-markers", path, target, None, merged))
+            else:
+                conflicts.append(path)
+        else:
+            conflicts.append(path)  # binary, symlink, or deleted on one side and edited on the other
+    # Large untracked files were fingerprinted, not stored: copy them from the worktree itself.
+    for path in sorted(((read_json(run / "changes.json", {}) or {}).get("afterLarge") or {})):
+        origin, target = worktree / path, Path(source) / path
+        if not origin.is_file() or through_symlink(source, target) or entry_mode(target) == "dir":
+            conflicts.append(path)
+        elif not target.exists() and not target.is_symlink():
+            actions.append(("copied", path, target, "large", origin))
+        elif not (target.is_file() and target.stat().st_size == origin.stat().st_size
+                  and target.read_bytes() == origin.read_bytes()):
+            conflicts.append(path)
+    if not actions and not conflicts:
+        print("delegate: no changes to apply", file=sys.stderr)
+        return 0
+    if conflicts and not args.merge:
+        for path in conflicts:
+            print(f" conflict         {path}")
+        print(f"delegate: nothing applied; {len(conflicts)} file(s) were also changed in {source} since the run "
+              "started. Rerun with --merge to apply the rest and write conflict markers into text files, "
+              f"or inspect with: {SCRIPT} diff {run.name} --total", file=sys.stderr)
+        return 1
+    for kind, path, target, mode, content in actions:
+        if not args.dry_run:
+            if kind == "deleted":
+                target.unlink()
+            elif kind == "copied":
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(content, target)
+            elif mode:
+                write_entry(target, mode, content)
+            else:
+                target.write_bytes(content)  # merged: keep the file's current mode
+        print(f" {kind:<16} {path}")
+    for path in conflicts:
+        print(f" {'skipped':<16} {path}  (binary, symlink, type change or large; take it from {worktree})")
+    if args.dry_run:
+        print("delegate: dry run; nothing written", file=sys.stderr)
+    elif not conflicts:
+        chain = run
+        while chain:  # the whole conversation is merged, not just its last run
+            (chain / ".applied").write_text(now_iso() + "\n")
+            parent = (read_json(chain / "meta.json", {}) or {}).get("parent")
+            chain = chain.parent / parent if parent and (chain.parent / parent).is_dir() else None
+    return 1 if conflicts or any(a[0] == "conflict-markers" for a in actions) else 0
 
 
 def cmd_status(args):
@@ -830,8 +1316,9 @@ def cmd_clean(args):
         if state in ACTIVE:
             print(f"delegate: skip active run {run.name}", file=sys.stderr)
             continue
-        shutil.rmtree(run, ignore_errors=True)
-        print(f"removed {run.name} ({state})")
+        note = "; its worktree was never applied" if unmerged_worktree(run) else ""
+        remove_run(run)
+        print(f"removed {run.name} ({state}{note})")
     return 0
 
 
@@ -867,6 +1354,8 @@ def parser():
         p.add_argument("--model")
         p.add_argument("--thinking")
         p.add_argument("--allow-parallel-writes", action="store_true")
+        p.add_argument("--worktree", action="store_true",
+                       help="work in a detached git worktree seeded with the current working tree; merge back with apply")
 
     def collecting(p):
         p.add_argument("--max", type=seconds, help="stop waiting after this long (exit 75 if still running)")
@@ -877,6 +1366,27 @@ def parser():
     run = sub.add_parser("run", help="start, then block until the outcome")
     launch(run)
     collecting(run)
+    reply = sub.add_parser("reply", help="continue a finished run's conversation (same agent, workdir, worktree)")
+    reply.add_argument("run")
+    reply.add_argument("words", nargs="*", help="the follow-up message (or use --prompt / --prompt-file)")
+    reply.add_argument("--prompt", dest="prompt_text")
+    reply.add_argument("--prompt-file", help="file with the message, or - for stdin")
+    reply.add_argument("--name")
+    reply.add_argument("--image", action="append", metavar="PATH")
+    reply.add_argument("--accept", help="replace the acceptance command ('' drops it); default: the parent's")
+    reply.add_argument("--hide-accept", action="store_true")
+    reply.add_argument("--accept-timeout", default="10m")
+    reply.add_argument("--timeout")
+    collecting(reply)
+    diff = sub.add_parser("diff", help="show a run's changes as a git diff")
+    diff.add_argument("run", nargs="?", default="last")
+    diff.add_argument("paths", nargs="*")
+    diff.add_argument("--stat", action="store_true")
+    diff.add_argument("--total", action="store_true", help="the whole conversation, not only this run")
+    apply = sub.add_parser("apply", help="merge a worktree run's conversation into the source working tree")
+    apply.add_argument("run", nargs="?", default="last")
+    apply.add_argument("--merge", action="store_true", help="write conflict markers instead of stopping")
+    apply.add_argument("--dry-run", action="store_true")
     wait = sub.add_parser("wait", help="block until runs finish; print outcome and answer")
     wait.add_argument("runs", nargs="*")
     wait.add_argument("--all", action="store_true", help="active runs plus finished unreported ones")
@@ -907,7 +1417,8 @@ def main(argv):
                 seconds(getattr(args, option))
             except argparse.ArgumentTypeError as error:
                 die(str(error))
-    handler = {"start": cmd_start, "run": cmd_run, "wait": cmd_wait, "status": cmd_status, "list": cmd_status,
+    handler = {"start": cmd_start, "run": cmd_run, "reply": cmd_reply, "diff": cmd_diff, "apply": cmd_apply,
+               "wait": cmd_wait, "status": cmd_status, "list": cmd_status,
                "result": cmd_result, "stop": cmd_stop, "clean": cmd_clean}[args.command]
     return handler(args)
 

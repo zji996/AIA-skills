@@ -19,8 +19,8 @@
 | 技能名称 | 目录 | 能力与适用场景 |
 | --- | --- | --- |
 | **`repo-governance`** | `skills/repo-governance/` | **上下文治理与审计**：定义 `AGENTS.md`、`docs/current.md`、决策记录的信息分层；`audit-context.py` 只读检查入口文件过长、下一步堆积、`.local/` 未忽略、文档断链等漂移问题。 |
-| **`agent-handoff`** | `skills/agent-handoff/` | **会话交接**：`handoff-snapshot.sh` 自动采集分支、HEAD、未提交文件、最近提交与未读取的委派任务，生成交接账本草稿，模型只需补充判断部分。 |
-| **`delegate`** | `skills/delegate/` | **同事 Agent 委派**（4.0 前名为 `pi-delegation`）：主控主动把可验收的原子任务交给同事并行完成、只收结果——Pi（Gemini：说人话、便宜快速、够用，后端逻辑偏弱）或 Codex（GPT：谨慎、逻辑强，full access 运行），两者都能读图（`--image`）；脚本代跑 `--accept` 验收命令并给出一行结论（delivered / answered / rejected / malformed…），过程留在 run 目录不进主控上下文；整机并发上限（默认 6 个，其中 Codex 3 个）、写入互斥、按层级限制嵌套（Codex 可再委派给 Pi，Pi 不能再委派），且不会安装给 Pi 自己。 |
+| **`agent-handoff`** | `skills/agent-handoff/` | **会话交接**：`handoff-snapshot.sh` 自动采集分支、HEAD、未提交文件、最近提交、未读取的委派任务与未合并的 worktree，生成交接账本草稿，模型只需补充判断部分。 |
+| **`delegate`** | `skills/delegate/` | **同事 Agent 委派**（4.0 前名为 `pi-delegation`）：主控主动把可验收的原子任务交给同事并行完成、只收结果——Pi（Gemini：说人话、便宜快速、够用，后端逻辑偏弱）或 Codex（GPT：谨慎、逻辑强，full access 运行），两者都能读图（`--image`）；脚本代跑 `--accept` 验收命令并给出一行结论（delivered / answered / rejected / malformed…）和按快照计算的改动清单（`diff` 看全文），过程留在 run 目录不进主控上下文；`--worktree` 隔离运行（`.delegate.json` 声明依赖怎么准备），`apply` 三方合并回来，`reply` 在同一会话里追问；整机并发上限（默认 6 个，其中 Codex 3 个）、写入互斥、按层级限制嵌套（Codex 可再委派给 Pi，Pi 不能再委派），且不会安装给 Pi 自己。 |
 | **`openai-image-gen`** | `skills/openai-image-gen/` | **图像生成落盘**：调用 OpenAI Image API 生成配图、Banner、图标等素材，直接写入本地文件并只返回一行 JSON；附提示词、尺寸与费用选择要点。 |
 
 ---
@@ -89,7 +89,7 @@ cd AIA-skills
 
 ### 技能间约定
 
-技能彼此独立，唯一的数据约定是：`agent-handoff` 的快照脚本读取 `delegate` 写在 `.local/run/pi/<run_id>/` 下的 `meta.json`、`exit_code` 与 `.delivered` 来判断未完成的委派任务。修改这些文件名或含义时要同步修改 `handoff-snapshot.sh` 及其测试。
+技能彼此独立，唯一的数据约定是：`agent-handoff` 的快照脚本读取 `delegate` 写在 `.local/run/pi/<run_id>/` 下的 `meta.json`（含 `worktree.path`）、`exit_code`、`.delivered` 与 `.applied` 来判断未完成的委派任务和未合并的 worktree。修改这些文件名或含义时要同步修改 `handoff-snapshot.sh` 及其测试。
 
 ### 版本与发布
 

@@ -132,10 +132,10 @@ class ScriptTests(unittest.TestCase):
         self.assertTrue(copy.is_dir() and not copy.is_symlink())
         marker = (copy / ".aia-skills-install").read_text()
         self.assertIn(f"source={ROOT / 'skills'}", marker)
-        self.assertIn("version=2.0.0", marker)
+        self.assertIn("version=2.1.0", marker)
         self.assertTrue((copy / "scripts/handoff-snapshot.sh").is_file())
         self.assertNotIn("outdated", self.run_script(INSTALL, "--status", env=env).stdout)
-        (copy / ".aia-skills-install").write_text(marker.replace("version=2.0.0", "version=0.1.0"))
+        (copy / ".aia-skills-install").write_text(marker.replace("version=2.1.0", "version=0.1.0"))
         self.assertIn("outdated", self.run_script(INSTALL, "--status", env=env).stdout)
         self.assertEqual(self.run_script(INSTALL, "agent-handoff", env=env).returncode, 0)
         self.assertEqual(copy.resolve(), ROOT / "skills/agent-handoff")
@@ -265,6 +265,13 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("?? AGENTS.md", result.stdout)
         self.assertIn("20260101-000000-review 已结束，结果未读取", result.stdout)
         (run / ".delivered").touch()
+        self.assertNotIn("review", self.run_script(SNAPSHOT, "--repo", repo).stdout)
+        tree = repo.parent / "wt"
+        tree.mkdir()
+        (run / "meta.json").write_text(json.dumps({"worktree": {"source": str(repo), "path": str(tree)}}))
+        self.assertIn(f"20260101-000000-review 的 worktree 改动未合并：{tree}",
+                      self.run_script(SNAPSHOT, "--repo", repo).stdout)
+        (run / ".applied").touch()
         self.assertNotIn("review", self.run_script(SNAPSHOT, "--repo", repo).stdout)
 
     def test_audit_context_reports_drift(self):

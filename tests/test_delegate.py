@@ -63,11 +63,14 @@ class DelegateTests(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items() if not k.startswith(("DELEGATE_", "PI_DELEGATE_"))}
         self.env.update(PATH=f"{self.bin}:{os.environ['PATH']}", DELEGATE_POLL="0.1",
                         DELEGATE_RUNS=str(self.work / "runs"), XDG_STATE_HOME=str(self.work / "state"),
+                        XDG_CACHE_HOME=str(self.work / "cache"),
                         PI_LOG=str(self.work / "pi.log"))
 
     def fake_pi(self, *attempts, pre="", sleep=0, code=0):
         """Each attempt is a list of events; later calls reuse the last attempt."""
         lines = ["#!/bin/sh", "cat > /dev/null", 'echo "$$ $PI_DELEGATE_ACTIVE $*" >> "$PI_LOG"',
+                 # Like Pi, keep the session as <dir>/<time>_<id>.jsonl.
+                 'mkdir -p "$2" && touch "$2/t_$4.jsonl"',
                  'n=$(wc -l < "$PI_LOG")', pre]
         for index, events in enumerate(attempts, 1):
             test = "true" if index == len(attempts) else f'[ "$n" -eq {index} ]'
@@ -90,7 +93,9 @@ class DelegateTests(unittest.TestCase):
                               input=stdin, capture_output=True, text=True, timeout=timeout)
 
     def outcome(self, result):
-        return next(json.loads(line) for line in result.stdout.splitlines() if line.startswith('{"run"'))
+        lines = [line for line in result.stdout.splitlines() if line.startswith('{"run"')]
+        self.assertTrue(lines, result.stdout + result.stderr)
+        return json.loads(lines[0])
 
     def test_answered_run_reports_once(self):
         write = {"type": "tool_execution_start", "toolName": "write", "args": {"path": "a.txt", "content": "x" * 5000}}
@@ -419,6 +424,154 @@ class DelegateTests(unittest.TestCase):
             self.env["DELEGATE_RUNS"] = str(self.work / root)
             for line in self.cli("status").stdout.splitlines():
                 self.cli("stop", json.loads(line)["dir"])
+
+    def repo(self, files):
+        repo = self.work / "repo"
+        repo.mkdir()
+        git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run(git[:3] + ["init", "-q"], check=True)
+        for name, text in files.items():
+            (repo / name).parent.mkdir(parents=True, exist_ok=True)
+            (repo / name).write_text(text)
+        subprocess.run(git + ["add", "-A"], check=True)
+        subprocess.run(git + ["commit", "-qm", "init"], check=True)
+        return repo
+
+    def test_changes_are_exact_and_listed_like_a_diffstat(self):
+        repo = self.repo({"dirty.txt": "a\n", "gone.txt": "bye\n", "kept.txt": "same\n", ".gitignore": "cache/\n"})
+        (repo / "dirty.txt").write_text("a\nmine\n")  # the caller's edit, before the run
+        (repo / "big.bin").write_bytes(b"0" * 64)
+        self.env["DELEGATE_SNAPSHOT_MAX_BYTES"] = "32"
+        self.fake_pi([answer("done"), SETTLED], pre="echo theirs >> dirty.txt; rm gone.txt; echo n > new.txt; "
+                     "echo x > kept.txt; echo same > kept.txt; mkdir cache; echo c > cache/f; echo 1 >> big.bin")
+        result = self.cli("run", "--workdir", repo, "task")
+        state = self.outcome(result)
+        self.assertEqual(state["files"], ["big.bin", "dirty.txt", "gone.txt", "new.txt"])
+        self.assertEqual({k: state["changes"][k] for k in ("files", "added", "deleted")},
+                         {"files": 4, "added": 2, "deleted": 1})
+        self.assertIn(" M dirty.txt  +1 -0", result.stdout)
+        self.assertIn(" D gone.txt  +0 -1", result.stdout)
+        self.assertIn(" M big.bin  large file", result.stdout)
+        self.assertLess(result.stdout.index("===== changes"), result.stdout.index("===== result"))
+        diff = self.cli("diff", "last").stdout
+        self.assertIn("+theirs", diff)
+        self.assertNotIn("+mine", diff)  # dirty before the run: not the agent's work
+        self.assertEqual(subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--name-only"],
+                                        capture_output=True, text=True).stdout, "")  # real index untouched
+        self.fake_pi([answer("looked"), SETTLED])
+        self.assertIn("===== changes: ", self.cli("run", "--workdir", repo, "task").stdout.split("none")[0])
+
+    def test_worktree_isolates_the_run_and_apply_merges_it_back(self):
+        repo = self.repo({"a.txt": "1\n2\n3\n4\n5\n", "b.txt": "b\n", ".gitignore": ".env\ndata/\n"})
+        (repo / ".delegate.json").write_text(json.dumps({"worktree": {
+            "copy": [".env"], "link": ["data"], "setup": ["test -f .env && touch setup-ran"]}}))
+        (repo / ".env").write_text("SECRET=1\n")
+        (repo / "data").mkdir()
+        (repo / "b.txt").write_text("b\nuncommitted\n")
+        self.fake_pi([answer("done"), SETTLED], pre='pwd > "$PI_LOG.cwd"; sed -i s/1/one/ a.txt; '
+                     'grep -q uncommitted b.txt && echo seeded > seen.txt; test -L data && rm setup-ran')
+        result = self.cli("run", "--worktree", "--accept", "test -f seen.txt", "--workdir", repo, "task")
+        state = self.outcome(result)
+        self.assertEqual(state["state"], "delivered", result.stdout + result.stderr)
+        tree = Path(state["worktree"])
+        self.assertEqual((self.work / "pi.log.cwd").read_text().strip(), str(tree))
+        self.assertTrue(str(tree).startswith(str(self.work / "cache/delegate/worktrees")))
+        self.assertEqual(state["files"], ["a.txt", "seen.txt"])  # link, copy and setup output are not its work
+        self.assertEqual((repo / "a.txt").read_text(), "1\n2\n3\n4\n5\n")  # source untouched until apply
+        self.assertIn("apply", result.stdout)
+        (repo / "a.txt").write_text("1\n2\n3\n4\nfive\n")  # the caller keeps working meanwhile
+        self.assertEqual(self.cli("apply", "--dry-run").returncode, 0)
+        self.assertFalse((repo / "seen.txt").exists())
+        applied = self.cli("apply", state["run"])
+        self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+        self.assertEqual((repo / "a.txt").read_text(), "one\n2\n3\n4\nfive\n")
+        self.assertEqual((repo / "seen.txt").read_text(), "seeded\n")
+        (repo / "a.txt").write_text("uno\n2\n3\n4\nfive\n")
+        (repo / "seen.txt").unlink()
+        refused = self.cli("apply", state["run"])
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("nothing applied", refused.stderr)
+        self.assertFalse((repo / "seen.txt").exists())
+        merged = self.cli("apply", "--merge", state["run"])
+        self.assertEqual(merged.returncode, 1)
+        self.assertIn("<<<<<<< current", (repo / "a.txt").read_text())
+        self.assertTrue((repo / "seen.txt").exists())
+        self.cli("clean", state["run"])
+        self.assertFalse(tree.exists())
+        self.assertNotIn(str(tree), subprocess.run(["git", "-C", str(repo), "worktree", "list"],
+                                                   capture_output=True, text=True).stdout)
+
+    def test_worktree_setup_failure_and_non_git_are_reported(self):
+        repo = self.repo({"a.txt": "a\n"})
+        (repo / ".delegate.json").write_text(json.dumps({"worktree": {"setup": "exit 7"}}))
+        self.fake_pi([answer("never"), SETTLED])
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        self.assertEqual(state["state"], "failed")
+        self.assertIn("exit 7", state["error"])
+        self.assertFalse((self.work / "pi.log").exists())
+        result = self.cli("start", "--worktree", "task")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("needs a git repository", result.stderr)
+
+    def test_reply_continues_the_session_in_the_same_place(self):
+        repo = self.repo({"a.txt": "a\n"})
+        self.fake_pi([answer("first"), SETTLED], pre="echo more >> a.txt")
+        first = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "task"))
+        self.fake_pi([answer("second"), SETTLED], pre="echo again >> a.txt")
+        result = self.cli("reply", first["run"], "one more thing")
+        second = self.outcome(result)
+        self.assertEqual((second["state"], second["parent"], second["worktree"]),
+                         ("delivered", first["run"], first["worktree"]))
+        calls = [line.split() for line in (self.work / "pi.log").read_text().splitlines()]
+        session = lambda call: call[call.index("--session-id") + 1]
+        self.assertEqual(session(calls[0]), session(calls[1]))
+        self.assertEqual((Path(second["dir"]) / "prompt.md").read_text(), "one more thing\n")
+        self.assertIn("+again", self.cli("diff", second["run"]).stdout)
+        self.assertNotIn("+more", self.cli("diff", second["run"]).stdout)
+        self.assertIn("+more", self.cli("diff", "--total", second["run"]).stdout)
+        self.fake_pi([answer("third"), SETTLED], pre="echo last >> a.txt")
+        third = self.outcome(self.cli("reply", first["run"], "and finally"))  # the conversation's latest run
+        self.assertEqual(third["parent"], second["run"])
+        self.assertEqual(self.cli("apply", first["run"]).returncode, 0)
+        self.assertEqual((repo / "a.txt").read_text(), "a\nmore\nagain\nlast\n")
+        self.assertTrue(all((Path(r["dir"]) / ".applied").exists() for r in (first, second, third)))
+        self.fake_codex(codex_events("ok"))
+        codex = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "look"))
+        self.assertEqual(self.outcome(self.cli("reply", codex["run"], "and?"))["state"], "answered")
+        call = (self.work / "pi.log.codex").read_text().splitlines()[-1]
+        self.assertIn("exec resume t1 --json", call)
+        self.assertNotIn(" -C ", call)
+
+    def test_apply_handles_modes_large_files_and_unsafe_paths(self):
+        repo = self.repo({"run.sh": "echo hi\n", "img.bin": "\0old", "sub/f.txt": "f\n"})
+        self.env["DELEGATE_SNAPSHOT_MAX_BYTES"] = "32"
+        self.fake_pi([answer("done"), SETTLED], pre="chmod +x run.sh; head -c 100 /dev/zero > big.dat; "
+                     "printf '\\0new' > img.bin; echo g > sub/f.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        self.assertIn(" A big.dat  large file", self.cli("wait", state["run"]).stdout)
+        (repo / "img.bin").write_bytes(b"\0mine")  # binary edited on both sides
+        outside = self.work / "outside"
+        outside.mkdir()
+        (outside / "f.txt").write_text("f\n")
+        shutil.rmtree(repo / "sub")
+        (repo / "sub").symlink_to(outside)  # writing through it would leave the repository
+        result = self.cli("apply", "--merge", state["run"])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("skipped          img.bin", result.stdout)
+        self.assertIn("skipped          sub/f.txt", result.stdout)
+        self.assertEqual((outside / "f.txt").read_text(), "f\n")
+        self.assertTrue(os.access(repo / "run.sh", os.X_OK))
+        self.assertEqual((repo / "big.dat").stat().st_size, 100)
+        self.assertFalse((Path(state["dir"]) / ".applied").exists())  # skipped files keep the worktree listed
+
+    def test_reply_survives_cleaning_earlier_rounds(self):
+        self.fake_pi([answer("one"), SETTLED])
+        first = self.outcome(self.cli("run", "--read-only", "task"))
+        second = self.outcome(self.cli("reply", first["run"], "more"))
+        self.cli("clean", first["run"])
+        self.assertEqual(self.outcome(self.cli("reply", second["run"], "again"))["state"], "answered")
+        calls = [line.split() for line in (self.work / "pi.log").read_text().splitlines()]
+        self.assertEqual(len({call[call.index("--session-id") + 1] for call in calls}), 1)
 
 
 if __name__ == "__main__":

@@ -63,6 +63,7 @@ else
 fi
 
 runs=()
+declare -A unmerged=()
 shopt -s nullglob
 for meta in .local/run/pi/*/meta.json; do
   dir="$(dirname "$meta")"
@@ -71,8 +72,20 @@ for meta in .local/run/pi/*/meta.json; do
   elif [[ ! -f "$dir/.delivered" ]]; then
     runs+=("$(basename "$dir") 已结束，结果未读取（exit $(cat "$dir/exit_code")）")
   fi
+  # --worktree 的改动留在独立 worktree，直到 `delegate apply`；同一对话只报最新一轮。
+  worktree="$(grep -o '"path": "[^"]*"' "$meta" | head -1 | cut -d'"' -f4 || true)"
+  if [[ -f "$dir/exit_code" && -n "$worktree" && -d "$worktree" ]]; then
+    if [[ -f "$dir/.applied" ]]; then
+      unset "unmerged[$worktree]"
+    else
+      unmerged[$worktree]="$(basename "$dir")"
+    fi
+  fi
 done
 shopt -u nullglob
+for worktree in "${!unmerged[@]}"; do
+  runs+=("${unmerged[$worktree]} 的 worktree 改动未合并：$worktree（delegate apply 或 clean）")
+done
 if (( ${#runs[@]} )); then
   echo "- 委派任务:"
   printf '    %s\n' "${runs[@]}"
