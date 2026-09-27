@@ -8,12 +8,17 @@
 #
 # publish needs `gh` logged in for GitHub (the primary download source). FORGEJO_TOKEN (write:repository)
 # also publishes to the Forgejo instance, which fetch-binary.sh tries second; without it that is skipped.
+# Agent shells often do not inherit it from ~/.bashrc, so it is read from FORGEJO_TOKEN_FILE when unset.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGETS=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl)
 FORGEJO_API="${FORGEJO_API:-https://git.aiatechco.com:31443/api/v1/repos/zji996/AIA-skills}"
 GITHUB_REPO="${GITHUB_REPO:-zji996/AIA-skills}"
+FORGEJO_TOKEN_FILE="${FORGEJO_TOKEN_FILE:-$HOME/.config/edge-gateway/forgejo-repoctl-token}"
+if [ -z "${FORGEJO_TOKEN:-}" ] && [ -r "$FORGEJO_TOKEN_FILE" ]; then
+  FORGEJO_TOKEN="$(tr -d '\r\n' < "$FORGEJO_TOKEN_FILE")"
+fi
 
 usage() { echo "usage: release-binary.sh build|publish <skill>" >&2; exit 2; }
 (( $# == 2 )) || usage
@@ -94,7 +99,7 @@ publish() {
     done
     echo "  [Forgejo] ${FORGEJO_API%/api/v1/repos/*}/zji996/AIA-skills/releases/tag/$TAG"
   else
-    echo "  [Forgejo] skipped: set FORGEJO_TOKEN to publish there too (optional; GitHub is the primary source)"
+    echo "  [Forgejo] skipped: set FORGEJO_TOKEN or FORGEJO_TOKEN_FILE to publish there too (optional; GitHub is the primary source)"
   fi
 }
 
