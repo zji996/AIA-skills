@@ -41,7 +41,7 @@ $D run --worktree --tier strong --name fix-lock --accept "go test ./internal/que
 要求：release 幂等且不引入新锁；补一个并发取消的回归测试。不要改公开接口。
 EOF
 $D diff fix-lock --total      # 审方向：改法对不对、有没有同类问题没顾及
-$D reply fix-lock "worker.go 的超时路径也会走 release，一并处理并补测试"   # 返工在同一会话里
+$D reply --wait fix-lock "worker.go 的超时路径也会走 release，一并处理并补测试"   # 返工并等结论；省略 --wait 可后台启动
 $D apply fix-lock
 ```
 
@@ -84,13 +84,14 @@ $D wait
 {
   "env": {"CUDA_VISIBLE_DEVICES": ""},
   "worktree": {
-    "copy": [".env"],
+    "copy": [".env", ".local/scan"],
     "link": ["third_party/some-submodule", "models/weights"],
     "setup": ["pnpm install --offline --frozen-lockfile", "uv sync --frozen --offline"]
   }
 }
 ```
 
+- `copy` 将被 git 忽略的文件或目录独立复制进 worktree；源不存在时跳过并提示。
 - `link` 适合只读的子模块与大目录（worktree 里子模块是空目录）；写入会落到原仓库。
 - `setup` 在重任务队列里执行；先在一个临时 worktree 里手动跑一遍，确认离线能装齐。
 - `env` 在原地运行时同样生效。

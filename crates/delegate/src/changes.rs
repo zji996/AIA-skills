@@ -152,7 +152,7 @@ fn submodule_fingerprints(top: &Path, exclude: &[String]) -> Res<BTreeMap<String
     }
     Ok(prints)
 }
-fn gitlink(top: &Path, tree: &str, path: &str) -> Res<Option<String>> {
+pub(crate) fn gitlink(top: &Path, tree: &str, path: &str) -> Res<Option<String>> {
     let entry = git(top, &["ls-tree", "-z", tree, "--", path])?;
     let text = String::from_utf8_lossy(&entry);
     let Some((attrs, name)) = text.trim_end_matches('\0').split_once('\t') else {
@@ -272,6 +272,185 @@ pub fn record(meta: &Value, run: &Path) -> Option<(Vec<Value>, Value)> {
     write(run.join("changes.patch"), patch).ok()?;
     let totals = json!({"files":changes.len(),"added":changes.iter().map(|x|n(x,"added")).sum::<i64>(),"deleted":changes.iter().map(|x|n(x,"deleted")).sum::<i64>(),"after":s(&after,"tree")});
     Some((changes, totals))
+}
+
+fn shape_limit() -> usize {
+    setting("SHAPE_LIMIT", "5")
+        .parse::<usize>()
+        .unwrap_or(5)
+        .clamp(1, 20)
+}
+
+fn config_path(path: &str) -> bool {
+    const NAMES: &[&str] = &[
+        "package.json",
+        "pnpm-lock.yaml",
+        "package-lock.json",
+        "yarn.lock",
+        "pyproject.toml",
+        "uv.lock",
+        "go.mod",
+        "go.sum",
+        "Cargo.toml",
+        "Cargo.lock",
+        "Makefile",
+        "GNUmakefile",
+    ];
+    let name = path.rsplit('/').next().unwrap_or(path);
+    NAMES.contains(&name)
+        || (name.starts_with("requirements") && name.ends_with(".txt"))
+        || name.starts_with("Dockerfile")
+        || (name.starts_with("docker-compose")
+            && (name.ends_with(".yml") || name.ends_with(".yaml")))
+        || path.starts_with(".github/workflows/")
+}
+
+fn area(path: &str) -> String {
+    let mut parts = path.split('/');
+    let first = parts.next().unwrap_or("");
+    let second = parts.next();
+    if first.is_empty() || second.is_none() {
+        ".".into()
+    } else if parts.next().is_none() {
+        first.into()
+    } else {
+        format!("{first}/{}", second.unwrap_or_default())
+    }
+}
+
+fn trimmed(items: &[Value], limit: usize) -> (Value, usize) {
+    (
+        json!(items.iter().take(limit).collect::<Vec<_>>()),
+        items.len().saturating_sub(limit),
+    )
+}
+
+pub fn shape(meta: &Value, run: &Path, changes: &[Value]) -> Res<Option<Value>> {
+    if s(meta, "mode") != "write" || changes.is_empty() {
+        return Ok(None);
+    }
+    let rec = json(run.join("changes.json"));
+    let top = Path::new(s(&rec, "top"));
+    let after = s(&rec, "after");
+    let mut dirs = BTreeMap::<String, (i64, i64)>::new();
+    let mut largest = Vec::<(String, usize)>::new();
+    let mut config = Vec::<String>::new();
+    let mut removed = Vec::<String>::new();
+    for change in changes {
+        let path = s(change, "path");
+        let entry = dirs.entry(area(path)).or_default();
+        entry.0 += n(change, "added");
+        entry.1 += n(change, "deleted");
+        if config_path(path) {
+            config.push(path.into());
+        }
+        if s(change, "status") == "D" {
+            removed.push(path.into());
+        } else if !b(change, "large") && !b(change, "submodule") {
+            let ls = git(top, &["ls-tree", "-z", after, "--", path])?;
+            if let Some(row) = ls
+                .split(|byte| *byte == 0)
+                .next()
+                .filter(|row| !row.is_empty())
+            {
+                let row = String::from_utf8_lossy(row);
+                if let Some((attrs, _)) = row.split_once('\t') {
+                    let fields = attrs.split_whitespace().collect::<Vec<_>>();
+                    if fields.len() == 3 && fields[1] == "blob" && fields[0] != "120000" {
+                        let bytes = git(top, &["cat-file", "blob", fields[2]])?;
+                        if !bytes.contains(&0) {
+                            let lines = bytes.iter().filter(|b| **b == b'\n').count()
+                                + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"));
+                            largest.push((path.into(), lines));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut dirs = dirs
+        .into_iter()
+        .map(|(path, (added, deleted))| json!({"path":path,"added":added,"deleted":deleted}))
+        .collect::<Vec<_>>();
+    dirs.sort_by(|a, b| {
+        (n(b, "added") + n(b, "deleted"))
+            .cmp(&(n(a, "added") + n(a, "deleted")))
+            .then_with(|| s(a, "path").cmp(s(b, "path")))
+    });
+    largest.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let largest = largest
+        .into_iter()
+        .map(|(path, lines)| json!({"path":path,"lines":lines}))
+        .collect::<Vec<_>>();
+    let limit = shape_limit();
+    let (dirs, dirs_more) = trimmed(&dirs, limit);
+    let (largest, largest_more) = trimmed(&largest, limit);
+    let config = config
+        .into_iter()
+        .map(|path| json!(path))
+        .collect::<Vec<_>>();
+    let removed = removed
+        .into_iter()
+        .map(|path| json!(path))
+        .collect::<Vec<_>>();
+    let (config, config_more) = trimmed(&config, limit);
+    let (removed, removed_more) = trimmed(&removed, limit);
+    let mut out = json!({"dirs":dirs,"largest":largest,"config":config,"removed":removed});
+    for (key, more) in [
+        ("dirsMore", dirs_more),
+        ("largestMore", largest_more),
+        ("configMore", config_more),
+        ("removedMore", removed_more),
+    ] {
+        if more > 0 {
+            out[key] = json!(more);
+        }
+    }
+    Ok(Some(out))
+}
+
+fn print_shape_list(label: &str, items: &[Value], more: i64, render: impl Fn(&Value) -> String) {
+    if items.is_empty() && more == 0 {
+        return;
+    }
+    let mut parts = items.iter().map(render).collect::<Vec<_>>();
+    if more > 0 {
+        parts.push(format!("+{more} more"));
+    }
+    println!(" {label}: {}", parts.join(", "));
+}
+
+pub fn print_shape(run: &Path) {
+    let sum = json(run.join("summary.json"));
+    let shape = &sum["shape"];
+    if !shape.is_object() {
+        return;
+    }
+    println!("===== shape =====");
+    for (key, label, more) in [
+        ("dirs", "areas", "dirsMore"),
+        ("largest", "largest after", "largestMore"),
+    ] {
+        if let Some(items) = shape[key].as_array() {
+            print_shape_list(label, items, n(shape, more), |x| {
+                if key == "dirs" {
+                    format!("{} +{} -{}", s(x, "path"), n(x, "added"), n(x, "deleted"))
+                } else {
+                    format!("{} ({} lines)", s(x, "path"), n(x, "lines"))
+                }
+            });
+        }
+    }
+    for (key, label, more) in [
+        ("config", "config", "configMore"),
+        ("removed", "removed", "removedMore"),
+    ] {
+        if let Some(items) = shape[key].as_array() {
+            print_shape_list(label, items, n(shape, more), |x| {
+                x.as_str().unwrap_or("").into()
+            });
+        }
+    }
 }
 pub fn print_changes(run: &Path) {
     let rec = json(run.join("changes.json"));

@@ -47,6 +47,7 @@ const REPLY: &[(&str, &str)] = &[
     ("--timeout DURATION", "Limit for the attempt (default: 15m Pi, 30m Codex)."),
     ("--fresh", "Start a new session in the same workdir/worktree and conversation; message must stand alone."),
     ("--sync", "Merge the caller's later changes into the conversation worktree before replying; conflicts stop the reply."),
+    ("--wait", "Wait for the reply's outcome and answer instead of returning after launch."),
     ("--agent pi|codex", "Hand the conversation to this agent; a change of agent starts a fresh session."),
     ("--tier cheap|strong", "Hand the conversation to this tier; a change of agent starts a fresh session."),
 ];
@@ -54,7 +55,10 @@ const REPLY: &[(&str, &str)] = &[
 const COMMANDS: &[(&str, &str)] = &[
     ("start", "Launch in the background and return at once."),
     ("run", "Start, then wait for the outcome and answer."),
-    ("reply", "Continue a finished run's conversation."),
+    (
+        "reply",
+        "Continue a finished run's conversation in the background.",
+    ),
     ("wait", "Wait for runs; print outcomes and answers."),
     ("status", "Print one JSON status line per run."),
     ("list", "Alias of status."),
@@ -106,7 +110,7 @@ pub fn print(command: Option<&str>) -> bool {
     let (usage, description, rows): (&str, &str, &[(&str, &str)]) = match command {
         "start" => ("[options] [words ...]", "Launch in the background and return at once.", LAUNCH),
         "run" => ("[options] [words ...]", "Start, then wait for the outcome and answer.", LAUNCH),
-        "reply" => ("[options] run [words ...]", "Continue a finished run with the same agent, workdir, and worktree.", REPLY),
+        "reply" => ("[options] run [words ...]", "Continue a finished run in the background with the same agent, workdir, and worktree. Use --wait to collect its answer.", REPLY),
         "wait" => ("[options] [runs ...]", "Wait for runs and print outcomes and answers.", &[
             ("runs", "Run ids or directories (default: active and undelivered runs)."),
             ("--all", "Active and finished unreported runs (the default)."),

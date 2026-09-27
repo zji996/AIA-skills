@@ -175,8 +175,11 @@ fn settle(
         })
         .cloned()
         .collect::<Vec<_>>();
-    if let Some((_, totals)) = &rec {
+    if let Some((changes, totals)) = &rec {
         sum["changes"] = totals.clone();
+        if let Ok(Some(shape)) = changes::shape(meta, run, changes) {
+            sum["shape"] = shape;
+        }
     } else if !s(meta, "top").is_empty() && setup_error.is_none() {
         sum["warning"] = json!("could not snapshot the working tree; changes are unknown");
     }

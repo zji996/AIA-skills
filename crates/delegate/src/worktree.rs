@@ -1,4 +1,4 @@
-use crate::changes::{chain_changes, snapshot, tree_changes};
+use crate::changes::{chain_changes, gitlink, snapshot, tree_changes};
 use crate::common::*;
 use crate::lane;
 use serde_json::{json, Value};
@@ -211,7 +211,14 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<Option<String>> {
         {
             let _ = fs::remove_dir(&target);
         }
-        if !origin.exists() || target.exists() || target.is_symlink() {
+        if !origin.exists() && !origin.is_symlink() {
+            eprintln!(
+                "delegate: worktree source missing, skipping {}",
+                origin.display()
+            );
+            continue;
+        }
+        if target.exists() || target.is_symlink() {
             continue;
         }
         fs::create_dir_all(target.parent().unwrap_or(&path)).map_err(|e| e.to_string())?;
@@ -437,11 +444,15 @@ pub fn sync(run: &Path, meta: &Value) -> Res<Vec<String>> {
     for change in changes {
         let path = s(&change, "path").to_string();
         let target = worktree.join(&path);
-        if through_symlink(&worktree, &target) || entry_mode(&target).as_deref() == Some("dir") {
-            conflicts.push(path);
+        if b(&change, "submodule") {
+            if gitlink(&source, s(&baseline, "tree"), &path)?
+                != gitlink(&source, s(&current_source, "tree"), &path)?
+            {
+                conflicts.push(path);
+            }
             continue;
         }
-        if b(&change, "submodule") {
+        if through_symlink(&worktree, &target) || entry_mode(&target).as_deref() == Some("dir") {
             conflicts.push(path);
             continue;
         }

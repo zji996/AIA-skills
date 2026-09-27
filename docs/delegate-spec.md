@@ -1,4 +1,4 @@
-# delegate 规格（v5.3）
+# delegate 规格（v5.4）
 
 > 本文是 `skills/delegate` 的**实现契约**：命令行、输出、run 目录、锁与状态机。它是 Rust 重写与 harness 原生接入的依据。
 > 本文不在技能目录内，技能加载时不会读取；模型使用技能只需 `SKILL.md`。行为以本文为准，实现与本文不一致时按缺陷处理。
@@ -40,7 +40,7 @@
 |---|---|---|
 | `start` | 启动选项（§2.3）＋任务说明 | 创建 run 并启动 supervisor，立即输出一行状态（§3.1）；stderr 提示收取命令 |
 | `run` | 启动选项＋`--max`/`--progress`/`--full` | `start` 后等待，按 §3.2 输出 |
-| `reply <run> [消息]` | `--fresh` `--accept` `--hide-accept` `--accept-timeout` `--timeout` `--image` `--name` `--prompt(-file)` ＋等待选项 | 续接对话（§7） |
+| `reply <run> [消息]` | `--fresh` `--sync` `--accept` `--hide-accept` `--accept-timeout` `--timeout` `--image` `--name` `--prompt(-file)`；`--wait` 时可用等待选项 | 续接对话并立即返回启动状态；`--wait` 等结论（§7） |
 | `wait [<run>...\|--all]` | `--max` `--no-result` `--full` `--progress` | 等待并输出；无参数（或 `--all`）取所有运行中或结果未读取的 run，没有时提示并以 0 退出 |
 | `status [<run>...]`（别名 `list`） | | 每个 run 一行状态；无参数列出全部 |
 | `result [<run>] [--path]` | | 输出完整答复（或其路径）；非运行中时标记已读取 |
@@ -97,6 +97,7 @@
 | `attempts` `model` `tokens{input,output,cacheRead}` | 已结束 | |
 | `files` | 有改动 | 相对路径列表 |
 | `changes{files,added,deleted,after}` | 快照成功 | `after` 为结束快照 tree |
+| `shape{dirs,largest,config,removed,*More?}` | 写入任务、快照有改动 | `dirs` 按前两级目录汇总增删行；`largest` 为改后文本文件总行数；`config` 为依赖清单、锁文件、构建与 CI 配置路径；`removed` 为删除路径。各列表默认最多 5 项，`DELEGATE_SHAPE_LIMIT` 可调（1–20），`dirsMore` 等字段为未显示项数。`changes` 仍表示整体总数，完整逐文件 diff 见 `changes.json` |
 | `accept{command,ok,exitCode,tail?,queuedSeconds?}` | 执行过验收 | `tail` 为失败输出末 1500 字符 |
 | `readOnlyViolation` | 只读 run 在自己的 worktree 中改了文件 | 文件列表 |
 | `workspaceChanged` | `--in-place` 只读 run 期间工作区有变化 | 文件列表；无法归属 |
@@ -120,12 +121,17 @@
  M path  +1 -0
  A big.bin  large file
  M vendor  submodule contents
+===== shape =====
+ areas: apps/api +12 -3
+ largest after: apps/api/server.rs (240 lines)
+ config: Cargo.toml
+ removed: apps/api/old.rs
 ===== result: <run> (<字符数> chars) =====
 <答复；超过 DELEGATE_RESULT_CHARS 只显示末尾，并注明全文路径>
 ===== end: <run> =====
 ```
 
-- 改动清单最多列 40 项；写入 run 无改动时输出 `===== changes: <run>: none =====`；快照失败时输出 `unknown`；非 git 的写入 run 输出 `not tracked`。
+- 改动清单最多列 40 项；有 `shape` 时在清单后输出简短 shape 小节；写入 run 无改动时输出 `===== changes: <run>: none =====`；快照失败时输出 `unknown`；非 git 的写入 run 输出 `not tracked`。
 - 只要打印了答复（或 run 无答复），即创建 `.delivered`。`--no-result` 只输出状态行，不标记已读取。
 - 仍在运行的 run 只输出状态行；此时 stderr 提示再次 `wait`，退出码 75。
 
@@ -208,7 +214,7 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 - 路径：`${XDG_CACHE_HOME:-~/.cache}/delegate/worktrees/<仓库名>-<run id>`。
 - 起点：`commit-tree <起始快照> [-p HEAD]`（作者 `delegate <delegate@localhost>`），`git worktree add --detach`。
 - `--workdir` 为子目录时，同事在 worktree 的对应子目录工作。
-- 准备：`copy`（复制）、`link`（符号链接，替换空目录，适合子模块）、`setup`（在 lane 中依次执行，§8）。任一步失败 → `failed`，`error` 说明。
+- 准备：`copy`（递归复制仓库根相对的文件或目录，包括被 git 忽略的路径，如 `.local/scan`）、`link`（符号链接，替换空目录，适合子模块）、`setup`（在 lane 中依次执行，§8）。`copy`/`link` 源不存在时跳过并向 stderr 提示；其余失败 → `failed`，`error` 说明。
 - 一个对话共享一个 worktree；`clean` 删除最后一个引用它的 run 时，在 worktree 自身 `git-common-dir` 所属的仓库执行 `git worktree remove --force`（失败则删目录后 `worktree prune`）；不依赖记录的来源路径，`--in` 的上游可能已先被清理。
 
 ### 6.4 apply（必须）
@@ -262,9 +268,11 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 
 接在对话**最新一轮**之后（结局为 `malformed` 的轮次跳过）；可用 `--agent`/`--tier` 换一位同事（agent 改变即隐含 `--fresh`，新消息须自足），否则同一 agent、workdir、worktree、mode、env、provider/model/thinking、retries。每次尝试都从上一轮会话**分叉**（Pi 用会话文件副本 `--fork`，Codex `exec fork`），上一轮会话永不改动。`--fresh` 开新会话但留在同一对话与 worktree。同一轮已有进行中的 reply 时拒绝。
 
+默认像 `start` 一样立即输出启动状态；`--wait` 像 `run` 一样收取结论与答复，`--max`/`--progress`/`--full` 仅可与 `--wait` 同用。`--sync` 在返回启动状态前完成，冲突时不启动。
+
 ### 7.5 reply --sync（必须）
 
-`reply <run> --sync` 仅适用于 worktree 对话。启动下一轮前，以对话起点快照（有最近一次完整 apply 或同步基准时用该基准）、源工作区当前快照与 worktree 当前状态做三方合并，只同步主控后来产生、尚未进入对话的改动。任一文件冲突时不写入 worktree、不启动同事，退出码 2，stderr 列出冲突路径。成功时新一轮的起始快照取同步后的 worktree，同步文件不计入该轮同事的 `files`；run 目录的 `sync.json` 记录同步文件列表，任务说明末尾按说明语言附同步提示；`.sync-base` 记录后续 apply 使用的合并基准，同步不创建 `.applied`，完整 apply 后同时推进两者。原地对话使用 `--sync` 为用法错误。
+`reply <run> --sync` 仅适用于 worktree 对话。启动下一轮前，以对话起点快照（有最近一次完整 apply 或同步基准时用该基准）、源工作区当前快照与 worktree 当前状态做三方合并，只同步主控后来产生、尚未进入对话的改动。未改变指针的 gitlink 不视作冲突，即使源与 worktree 的子模块指纹不同；主控改变 gitlink 指针则冲突。任一文件冲突时不写入 worktree、不启动同事，退出码 2，stderr 列出冲突路径。成功时新一轮的起始快照取同步后的 worktree，同步文件不计入该轮同事的 `files`；run 目录的 `sync.json` 记录同步文件列表，任务说明末尾按说明语言附同步提示；`.sync-base` 记录后续 apply 使用的合并基准，同步不创建 `.applied`，完整 apply 后同时推进两者。原地对话使用 `--sync` 为用法错误。
 
 ## 8. lane：整机重任务队列（必须）
 
@@ -339,10 +347,10 @@ run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git �
 
 ```json
 {"env": {"CUDA_VISIBLE_DEVICES": ""},
- "worktree": {"copy": [".env"], "link": ["third_party/sub"], "setup": ["pnpm install --offline --frozen-lockfile"]}}
+ "worktree": {"copy": [".env", ".local/scan"], "link": ["third_party/sub"], "setup": ["pnpm install --offline --frozen-lockfile"]}}
 ```
 
-`env` 为字符串到字符串的映射，注入同事、验收与 setup（原地与 worktree 均生效，reply 沿用）；`copy`/`link` 必须是仓库内相对路径。
+`env` 为字符串到字符串的映射，注入同事、验收与 setup（原地与 worktree 均生效，reply 沿用）；`copy`/`link` 必须是仓库内相对路径，缺源跳过并在启动命令与 supervisor 的 stderr 提示。
 
 环境变量均先读 `DELEGATE_<名>`，再读 `PI_DELEGATE_<名>`：`RUNS`、`CHEAP_AGENT`（pi）、`STRONG_AGENT`（codex）、`MAX_ACTIVE`、`MAX_CODEX`、`MAX_HEAVY`、`MIN_AVAILABLE_MB`、`TIMEOUT_GRACE`、`RESULT_CHARS`（6000）、`KEEP_DAYS`、`POLL`、`SNAPSHOT_MAX_BYTES`、`SETUP_TIMEOUT`（10m）。由实现导出、调用方不应设置的保护变量：`DELEGATE_AGENT`、`DELEGATE_RUN_DIR`、`DELEGATE_LANE_HELD`、`PI_DELEGATE_ACTIVE`、`PI_DELEGATE_AGENT`、`PI_DELEGATE_PARENT_RUN`。
 

@@ -33,6 +33,7 @@ fn status_line(run: &Path) -> String {
         "turns",
         "files",
         "changes",
+        "shape",
         "accept",
         "readOnlyViolation",
         "protectViolation",
@@ -237,6 +238,7 @@ fn collect(
             code = 1;
         }
         changes::print_changes(run);
+        changes::print_shape(run);
         let has_result = run.join("result.md").is_file();
         if has_result && show_result {
             // A truncated answer counts as reported, but clean keeps it until read in full.
@@ -311,7 +313,7 @@ fn stop(args: &[String]) -> Res<i32> {
         return Err("stop requires at least one run".into());
     }
     for reference in args {
-        let run = runs::resolve(reference)?;
+        let run = runs::resolve_head(reference)?;
         let old = runs::state(&run);
         if !runs::active(&old) && runs::agent_alive(&run) {
             let pid = read(run.join("agent.pid"))
@@ -363,7 +365,7 @@ fn diff(args: &[String]) -> Res<i32> {
         None => (args, &[][..]),
     };
     let (pos, flags, _) = parse_simple(options, &["--stat", "--total"], &[])?;
-    let run = runs::resolve(pos.first().map(String::as_str).unwrap_or("last"))?;
+    let run = runs::resolve_head(pos.first().map(String::as_str).unwrap_or("last"))?;
     let (meta, top, mut before, after) = changes::chain_changes(&run)?;
     if has(&flags, "--total") {
         before = s(&meta, "chainBase").into();
@@ -480,13 +482,21 @@ fn main_inner(args: &[String]) -> Res<i32> {
             let max = o.max;
             let prog = o.progress;
             let full = o.full;
+            let wait = o.wait;
             let parent = o.run.clone().unwrap_or_default();
             let run = launch::reply(o)?;
-            eprintln!(
-                "delegate: started {} (reply to {parent})",
-                run.file_name().unwrap_or_default().to_string_lossy()
-            );
-            Ok(collect(&[run], max, prog, full, true))
+            let name = run.file_name().unwrap_or_default().to_string_lossy();
+            if wait {
+                eprintln!("delegate: started {name} (reply to {parent})");
+                Ok(collect(&[run], max, prog, full, true))
+            } else {
+                println!("{}", status_line(&run));
+                eprintln!(
+                    "delegate: started {name} (reply to {parent}); collect with: {} wait {name}",
+                    script().display()
+                );
+                Ok(0)
+            }
         }
         "wait" => {
             let (pos, flags, kv) = parse_simple(
@@ -519,7 +529,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 v
             } else {
                 pos.iter()
-                    .map(|x| runs::resolve(x))
+                    .map(|x| runs::resolve_head(x))
                     .collect::<Res<Vec<_>>>()?
                     .into_iter()
                     .collect::<Vec<_>>()
@@ -538,7 +548,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 runs::all_runs()
             } else {
                 pos.iter()
-                    .map(|x| runs::resolve(x))
+                    .map(|x| runs::resolve_head(x))
                     .collect::<Res<Vec<_>>>()?
             };
             for run in list {
@@ -551,7 +561,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
             if pos.len() > 1 {
                 return Err("result takes one run".into());
             }
-            let run = runs::resolve(pos.first().map(String::as_str).unwrap_or("last"))?;
+            let run = runs::resolve_head(pos.first().map(String::as_str).unwrap_or("last"))?;
             let result = run.join("result.md");
             if !result.exists() {
                 eprintln!(

@@ -4,6 +4,7 @@
 
 ### 技能
 
+- `delegate` 5.4.0：`.delegate.json` 的 `worktree.copy` 明确支持复制被 git 忽略的文件与目录，缺源跳过并向 stderr 提示；`reply` 默认后台立即返回，`--wait` 显式等待结论；`reply --sync` 忽略未改变指针的 gitlink，保留对指针变化的冲突检查；写入任务结论从快照 diff 汇总目录、改后最大文件、配置路径与删除路径的 `shape`，列表有界且可调；用对话名引用时 `status`、`wait`、`result`、`diff`、`stop` 跟到最新一轮回复（与 `apply`、`reply` 一致），run id 仍精确指向该轮。
 - `delegate` 5.3.2：实战中发现并修复。`wait` 只显示了长答复的末尾时，run 记为 `.truncated`，`clean --finished` 与自动过期清理都保留它，并提示用 `result` 读全文（此前长报告读到一半就被清理，全文丢失）；完整打印或 `result` 成功写出全文后解除。SKILL.md 与 recipes 补充：便宜档在配置键、CLI 参数等仓库外事实上会编造，采纳前须对照一手来源核实。
 - `delegate` 5.3.1：实战中发现并修复。`clean` 按 worktree 自身的 `git-common-dir` 找到所属仓库再移除并 prune，不再依赖记录的来源路径；此前 `--in` 审查者的来源是上游 worktree，若先清理上游再清理审查者，审查者的 worktree 登记会残留在仓库里（`git worktree list` 显示 prunable）。
 - `delegate` 5.3.0：两项易用性改进。`reply --sync`：续接前把主控在任务启动后的改动（比如新写的测试）三方合并进对话的 worktree，冲突则停下、不启动同事；同步来的文件不算同事的改动，之后的 `apply` 也不会重复合并它们（此前只能另起任务）。`wait --machine`：从整机登记收取所有仓库中运行中或等待中的任务（此前每个仓库要各放一个 `wait`）。

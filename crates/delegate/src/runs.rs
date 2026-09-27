@@ -53,6 +53,14 @@ pub fn resolve(reference: &str) -> Res<PathBuf> {
     }
     Ok(matches[0].clone())
 }
+/// Like `resolve`, but a conversation name follows its reply chain to the newest run.
+pub fn resolve_head(reference: &str) -> Res<PathBuf> {
+    let run = resolve(reference)?;
+    if s(&json(run.join("meta.json")), "name") == reference {
+        return Ok(latest(run));
+    }
+    Ok(run)
+}
 pub fn supervisor_alive(run: &Path) -> bool {
     let pid = read(run.join("pid")).trim().parse::<i32>().unwrap_or(0);
     pid_alive(pid)
@@ -171,6 +179,7 @@ pub fn status(run: &Path) -> Value {
             "turns",
             "files",
             "changes",
+            "shape",
             "accept",
             "readOnlyViolation",
             "protectViolation",

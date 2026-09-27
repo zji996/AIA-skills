@@ -38,6 +38,7 @@ pub struct Options {
     pub parallel: bool,
     pub fresh: bool,
     pub sync: bool,
+    pub wait: bool,
     pub max: Option<f64>,
     pub progress: bool,
     pub full: bool,
@@ -148,6 +149,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--allow-parallel-writes" => o.parallel = true,
                 "--fresh" => o.fresh = true,
                 "--sync" if reply => o.sync = true,
+                "--wait" if reply => o.wait = true,
                 "--progress" => o.progress = true,
                 "--full" => o.full = true,
                 "--" => {
@@ -190,8 +192,8 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
         {
             return Err("unrecognized reply option".into());
         }
-    } else if o.fresh || o.sync {
-        return Err("--fresh and --sync are only for reply".into());
+    } else if o.fresh || o.sync || o.wait {
+        return Err("--fresh, --sync and --wait are only for reply".into());
     }
     if o.in_run.is_some() && !o.read_only {
         return Err("--in requires --read-only".into());
@@ -199,7 +201,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
     if o.in_run.is_some() && o.in_place {
         return Err("--in and --in-place contradict each other".into());
     }
-    if !collect && (o.max.is_some() || o.progress || o.full) {
+    if (!collect || (reply && !o.wait)) && (o.max.is_some() || o.progress || o.full) {
         return Err("unrecognized collecting option".into());
     }
     if !o.agent.is_empty() && o.agent != "pi" && o.agent != "codex" {
@@ -435,6 +437,19 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
             let prior = json(upstream.join("meta.json"));
             extra["worktree"] = json!({"source":s(&prior["worktree"],"path"),"sourceWorkdir":s(&prior,"workdir"),"config":cfg,"in":upstream});
         } else if o.worktree || (o.read_only && !o.in_place) {
+            for key in ["copy", "link"] {
+                if let Some(items) = cfg[key].as_array() {
+                    for item in items.iter().filter_map(Value::as_str) {
+                        let source = top.join(item);
+                        if !source.exists() && !source.is_symlink() {
+                            eprintln!(
+                                "delegate: worktree source missing, skipping {}",
+                                source.display()
+                            );
+                        }
+                    }
+                }
+            }
             extra["worktree"] = json!({"source":top,"sourceWorkdir":workdir,"config":cfg});
         }
     }

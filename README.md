@@ -20,7 +20,7 @@
 | --- | --- | --- |
 | **`repo-governance`** | `skills/repo-governance/` | **上下文治理与审计**：定义 `AGENTS.md`、`docs/current.md`、决策记录的信息分层；`audit-context.py` 只读检查入口文件过长、下一步堆积、`.local/` 未忽略、文档断链等漂移问题。 |
 | **`agent-handoff`** | `skills/agent-handoff/` | **会话交接**：`handoff-snapshot.sh` 自动采集分支、HEAD、未提交文件、最近提交、未读取的委派任务与未合并的 worktree，生成交接账本草稿，模型只需补充判断部分。 |
-| **`delegate`** | `skills/delegate/` | **同事 Agent 委派**：主控把可验收的原子任务交给同事在后台完成，只收结论与下一步（`next`）。同事分两档——便宜档 Pi（Gemini：读材料、摘要、文案、看图）与强档 Codex（GPT：写代码、严密审查），只读默认便宜档、写入默认强档，便宜档失败且未改动时自动升档；只有一层委派，结果都回到主控。脚本代跑 `--accept` 验收、按快照列出改动；只读任务默认读 worktree 快照，写入可 `--worktree` 隔离后 `apply` 三方合并，`reply` 续接会话。整机并发、内存准入与重任务队列（`lane`，flock 唤醒、排队不计时）由脚本执行。另有 Rust 实现（`crates/delegate`，supervisor 常驻约 3 MB）与实现规格 `docs/delegate-spec.md`。 |
+| **`delegate`** | `skills/delegate/` | **同事 Agent 委派**：主控把可验收的原子任务交给同事在后台完成，只收结论与下一步（`next`）。同事分两档——便宜档 Pi（Gemini：读材料、摘要、文案、看图）与强档 Codex（GPT：写代码、严密审查），只读默认便宜档、写入默认强档，便宜档失败且未改动时自动升档；只有一层委派，结果都回到主控。脚本代跑 `--accept` 验收、按快照列出改动，写入结论还汇总客观的改动形状（`shape`）；只读任务默认读 worktree 快照，写入可 `--worktree` 隔离后 `apply` 三方合并，`.delegate.json` 的 `worktree.copy` 可带入被忽略的材料；`reply` 默认后台续接，`--wait` 收取结论，`--sync` 同步主控后续改动。整机并发、内存准入与重任务队列（`lane`，flock 唤醒、排队不计时）由脚本执行。另有 Rust 实现（`crates/delegate`，supervisor 常驻约 3 MB）与实现规格 `docs/delegate-spec.md`。 |
 | **`openai-image-gen`** | `skills/openai-image-gen/` | **图像生成落盘**：调用 OpenAI Image API 生成配图、Banner、图标等素材，直接写入本地文件并只返回一行 JSON；附提示词、尺寸与费用选择要点。 |
 
 ---

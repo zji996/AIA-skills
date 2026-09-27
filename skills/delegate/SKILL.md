@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "5.3.2"
+  version: "5.4.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -33,13 +33,13 @@ $D wait                                                                         
 | 独立审查、第二意见 | `$D start --read-only --tier strong "…"`（多路并行时各起一个，按子系统拆开） |
 | 看截图或设计图 | `$D start --read-only --image shot.png "…"` |
 | 改代码，测试通过才算完 | `$D run --worktree --accept "make check" "…"`，满意后 `$D apply <name>`；不许同事碰的路径加 `--protect tests/ --protect docs/spec.md` |
-| 接着上一轮追问或返工 | `$D reply <name> "…"`（同一会话、同一 worktree）；开新会话加 `--fresh`；换一位同事接着改加 `--agent codex`；你之后又改了代码（比如补了测试）想让它看到，加 `--sync` |
+| 接着上一轮追问或返工 | `$D reply <name> "…"`（后台启动，同一会话、同一 worktree；需当场收结果加 `--wait`）；开新会话加 `--fresh`；换同事加 `--agent codex`；你之后又改了代码想让它看到，加 `--sync` |
 | 先 A 后 B | `$D start --after <A> …`；审 A 的结果加 `--in <A> --read-only` |
 | 自己跑重检查 | `$D lane make check`（与同事的验收排队，一次一个） |
 | 同时在几个仓库派了任务 | 放一个后台 `$D wait --machine`，整机的都会收到 |
 | 看改了什么 / 停掉 / 清理 | `$D diff <name>` / `$D stop <name>` / `$D clean --finished` |
 
-多行说明用 `--prompt-file -` 加 heredoc；总加 `--name`，之后用它指代整段对话。更多完整示例、任务说明模板与常见坑见 [references/recipes.md](references/recipes.md)。
+多行说明用 `--prompt-file -` 加 heredoc；总加 `--name`，之后用它指代整段对话（各命令都落到最新一轮回复）。更多完整示例、任务说明模板与常见坑见 [references/recipes.md](references/recipes.md)。
 
 ## 选档位
 
@@ -79,12 +79,14 @@ $D wait                                                                         
 
 state 只描述答复。只读任务改了文件时仍是 `answered`，另带 `readOnlyViolation`（留在它自己的 worktree，不会合并）或 `workspaceChanged`（`--in-place` 时无法归属）。改动清单按运行前后的工作区快照计算：shell 改的也算，运行前已有的改动与验收副产物不算。退出码：`0` delivered/answered，`1` 其他结局，`2` 用法错误或被拒绝，`75` 仍在运行。
 
+写入任务有改动时，结论的 `shape` 来自快照 diff：`dirs` 是目录增删行分布，`largest` 是改后文本文件总行数，`config` 是改动过的依赖/构建/CI 配置路径，`removed` 是删除路径；`*More` 是各列表未显示数量。`changes` 保留整体总数，完整逐文件信息在 `changes.json`。只读或无改动时无 `shape`。
+
 ## 边界
 
 1. **容量**：整机同时最多 8 个任务、其中强档 4 个，可用内存低于 4 GB 时拒绝启动；重检查（验收、setup、`lane`）整机一次一个，排队不计时。超出即拒绝并列出运行中的任务——先 `wait` 收一批。上限由用户设定（见 references），同事不要自行调整。
 2. **只读**：git 仓库里默认读启动时的工作区快照（独立 worktree，含未提交改动），你可以同时改代码；要读实时工作区加 `--in-place`。在快照里两位同事都有全部工具（能看 git 历史、跑测试），只读靠约定与事后核对，写了也只留在它自己的 worktree；非 git 目录或 `--in-place` 时 Pi 只剩读文件、搜索和列目录。
 3. **写入**：原地写入同一目录同时只能有一个，且你同时改的文件会算进它的改动；要并行或不想被打扰就加 `--worktree`。
-4. **worktree 依赖**：git 忽略的依赖不会带过去，在仓库根 `.delegate.json` 声明 `copy` / `link` / `setup`；顶层 `env` 注入同事、验收和 setup，例如 `{"CUDA_VISIBLE_DEVICES": ""}` 让同事碰不到 GPU。别 link `node_modules`/`.venv`。
+4. **worktree 依赖**：git 忽略的文件或目录不会带过去，在仓库根 `.delegate.json` 的 `worktree.copy` 列出需独立复制的路径（如 `.local/scan`），或用 `link` / `setup`；缺源会跳过并提示。顶层 `env` 注入同事、验收和 setup，例如 `{"CUDA_VISIBLE_DEVICES": ""}`。别 link `node_modules`/`.venv`。
 5. **超时**：`--timeout` 默认 Pi 15 分钟、Codex 30 分钟；到时若仍在执行命令会宽限最多 50%。任务太大就拆小。
 
 命令与全部选项见 `$D --help`；run 目录、文件、环境变量与清理策略见 [references/output-and-files.md](references/output-and-files.md)。

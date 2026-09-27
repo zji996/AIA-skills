@@ -118,7 +118,7 @@ class DelegateTests(unittest.TestCase):
         for command in ("start", "run", "reply", "wait", "status", "result", "diff", "apply", "lane", "stop", "clean"):
             self.assertIn(command, top.stdout)
         for command, options in (("start", ("--tier", "--agent", "--read-only", "--accept", "--worktree", "--in-place")),
-                                 ("reply", ("--fresh", "--accept")), ("wait", ("--max", "--no-result")),
+                                 ("reply", ("--fresh", "--accept", "--wait")), ("wait", ("--max", "--no-result")),
                                  ("lane", ("--label",)), ("apply", ("--merge", "--dry-run"))):
             result = self.cli(command, "--help")
             self.assertEqual(result.returncode, 0, (command, result.stderr))
@@ -305,7 +305,7 @@ class DelegateTests(unittest.TestCase):
         tree = Path(state["worktree"])
         self.assertEqual(((tree / "agent.env").read_text(), (tree / "setup.env").read_text()), ("[]\n", "[]\n"))
         self.fake_pi([answer("again"), SETTLED], pre='echo "[${CUDA_VISIBLE_DEVICES-unset}]" > reply.env')
-        self.outcome(self.cli("reply", state["run"], "more"))
+        self.outcome(self.cli("reply", "--wait", state["run"], "more"))
         self.assertEqual((tree / "reply.env").read_text(), "[]\n")  # a reply keeps its conversation's env
         (repo / ".delegate.json").write_text(json.dumps({"env": {"X": 1}}))
         self.assertIn("env must map names to strings", self.cli("run", "--workdir", repo, "task").stderr)
@@ -643,7 +643,7 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual((self.work / "pi.log.codex-prompt").read_text().count("只读任务"), 1)
         self.assertIn("found it", (Path(state["dir"]) / "result.md").read_text())
         self.fake_codex(codex_events("more"))
-        self.assertEqual(self.outcome(self.cli("reply", state["run"], "and?"))["agent"], "codex")
+        self.assertEqual(self.outcome(self.cli("reply", "--wait", state["run"], "and?"))["agent"], "codex")
         # A write run that changed nothing and failed its check is handed over too...
         repo = self.repo({"a.txt": "a\n"})
         self.fake_pi([answer("done"), SETTLED])
@@ -775,7 +775,48 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--name-only"],
                                         capture_output=True, text=True).stdout, "")  # real index untouched
         self.fake_pi([answer("looked"), SETTLED])
-        self.assertIn("===== changes: ", self.cli("run", "--workdir", repo, "task").stdout.split("none")[0])
+        unchanged = self.cli("run", "--workdir", repo, "task")
+        self.assertIn("===== changes: ", unchanged.stdout.split("none")[0])
+        self.assertNotIn("shape", self.outcome(unchanged))
+
+    def test_write_shape_uses_snapshot_diff_and_truncates_each_list(self):
+        repo = self.repo({"apps/api/service.py": "keep1\nkeep2\nold\n", "apps/api/other.py": "x\n",
+                          "packages/ui/button.ts": "old\n", "package.json": "{}\n",
+                          "pnpm-lock.yaml": "lock\n", "gone-a.txt": "a\n",
+                          "gone-b.txt": "b\n", "gone-c.txt": "c\n"})
+        self.env["DELEGATE_SHAPE_LIMIT"] = "2"
+        self.fake_pi([answer("done"), SETTLED], pre=(
+            "printf 'keep1\\nkeep2\\none\\ntwo\\nthree\\n' > apps/api/service.py; "
+            "printf 'one\\ntwo\\n' > apps/api/other.py; "
+            "printf 'x\\ny\\nz\\nq\\n' > packages/ui/button.ts; "
+            "echo x > package.json; echo y > pnpm-lock.yaml; "
+            "rm gone-a.txt gone-b.txt gone-c.txt; "
+            "mkdir -p .github/workflows; echo ci > .github/workflows/check.yml"))
+        result = self.cli("run", "--workdir", repo, "task")
+        state = self.outcome(result)
+        shape = state["shape"]
+        self.assertEqual(len(shape["dirs"]), 2)
+        self.assertGreaterEqual(shape["dirsMore"], 1)
+        self.assertEqual(shape["largest"], [
+            {"path": "apps/api/service.py", "lines": 5},
+            {"path": "packages/ui/button.ts", "lines": 4}])
+        self.assertEqual(shape["largestMore"], 4)
+        self.assertEqual(shape["config"], [".github/workflows/check.yml", "package.json"])
+        self.assertEqual(shape["configMore"], 1)
+        self.assertEqual(shape["removed"], ["gone-a.txt", "gone-b.txt"])
+        self.assertEqual(shape["removedMore"], 1)
+        self.assertIn("apps/api +5 -2", result.stdout)
+        self.assertIn("largest after: apps/api/service.py (5 lines)", result.stdout)
+        self.assertLess(result.stdout.index("===== changes"), result.stdout.index("===== shape"))
+        self.assertLess(result.stdout.index("===== shape"), result.stdout.index("===== result"))
+        self.assertEqual(json.loads((Path(state["dir"]) / "summary.json").read_text())["shape"], shape)
+
+    def test_read_only_shape_is_omitted_even_when_workspace_changes(self):
+        repo = self.repo({"a.txt": "a\n"})
+        self.fake_pi([answer("done"), SETTLED], pre="echo changed >> a.txt")
+        result = self.cli("run", "--read-only", "--workdir", repo, "task")
+        self.assertNotIn("shape", self.outcome(result))
+        self.assertNotIn("===== shape =====", result.stdout)
 
     def test_worktree_isolates_the_run_and_apply_merges_it_back(self):
         repo = self.repo({"a.txt": "1\n2\n3\n4\n5\n", "b.txt": "b\n", ".gitignore": ".env\ndata/\n"})
@@ -799,6 +840,7 @@ class DelegateTests(unittest.TestCase):
         (repo / "a.txt").write_text("1\n2\n3\n4\nfive\n")  # the caller keeps working meanwhile
         self.assertEqual(self.cli("apply", "--dry-run").returncode, 0)
         self.assertFalse((repo / "seen.txt").exists())
+
         applied = self.cli("apply", state["run"])
         self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
         self.assertEqual((repo / "a.txt").read_text(), "one\n2\n3\n4\nfive\n")
@@ -819,6 +861,28 @@ class DelegateTests(unittest.TestCase):
         self.assertNotIn(str(tree), subprocess.run(["git", "-C", str(repo), "worktree", "list"],
                                                    capture_output=True, text=True).stdout)
 
+    def test_worktree_copy_includes_ignored_files_and_directories_and_skips_missing(self):
+        repo = self.repo({"a.txt": "a\n", ".gitignore": ".local/\n.env\n"})
+        (repo / ".local/scan").mkdir(parents=True)
+        (repo / ".local/scan/material.txt").write_text("prepared\n")
+        (repo / ".env").write_text("TOKEN=local\n")
+        (repo / ".delegate.json").write_text(json.dumps({"worktree": {
+            "copy": [".local/scan", ".env", ".local/missing"]}}))
+        self.fake_pi([answer("done"), SETTLED], pre="test -f .local/scan/material.txt && test -f .env")
+        result = self.cli("run", "--worktree", "--workdir", repo, "task")
+        state = self.outcome(result)
+        tree = Path(state["worktree"])
+        self.assertEqual((tree / ".local/scan/material.txt").read_text(), "prepared\n")
+        self.assertEqual((tree / ".env").read_text(), "TOKEN=local\n")
+        (tree / ".local/scan/material.txt").write_text("colleague\n")
+        self.assertEqual((repo / ".local/scan/material.txt").read_text(), "prepared\n")
+        self.assertEqual(state["state"], "answered")
+        self.assertEqual(state.get("files", []), [])
+        self.assertIn(".local/missing", result.stderr)
+        log = (Path(state["dir"]) / "supervisor.log").read_text()
+        self.assertIn("worktree source missing, skipping", log)
+        self.assertIn(".local/missing", log)
+
     def test_worktree_setup_failure_and_non_git_are_reported(self):
         repo = self.repo({"a.txt": "a\n"})
         (repo / ".delegate.json").write_text(json.dumps({"worktree": {"setup": "exit 7"}}))
@@ -836,7 +900,7 @@ class DelegateTests(unittest.TestCase):
         self.fake_pi([answer("first"), SETTLED], pre="echo more >> a.txt")
         first = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "task"))
         self.fake_pi([answer("second"), SETTLED], pre="echo again >> a.txt")
-        result = self.cli("reply", first["run"], "one more thing")
+        result = self.cli("reply", "--wait", first["run"], "one more thing")
         second = self.outcome(result)
         self.assertEqual((second["state"], second["parent"], second["worktree"]),
                          ("delivered", first["run"], first["worktree"]))
@@ -849,17 +913,43 @@ class DelegateTests(unittest.TestCase):
         self.assertNotIn("+more", self.cli("diff", second["run"]).stdout)
         self.assertIn("+more", self.cli("diff", "--total", second["run"]).stdout)
         self.fake_pi([answer("third"), SETTLED], pre="echo last >> a.txt")
-        third = self.outcome(self.cli("reply", first["run"], "and finally"))  # the conversation's latest run
+        third = self.outcome(self.cli("reply", "--wait", first["run"], "and finally"))  # the conversation's latest run
         self.assertEqual(third["parent"], second["run"])
         self.assertEqual(self.cli("apply", first["run"]).returncode, 0)
         self.assertEqual((repo / "a.txt").read_text(), "a\nmore\nagain\nlast\n")
         self.assertTrue(all((Path(r["dir"]) / ".applied").exists() for r in (first, second, third)))
         self.fake_codex(codex_events("ok"))
         codex = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "look"))
-        self.assertEqual(self.outcome(self.cli("reply", codex["run"], "and?"))["state"], "answered")
+        self.assertEqual(self.outcome(self.cli("reply", "--wait", codex["run"], "and?"))["state"], "answered")
         call = (self.work / "pi.log.codex").read_text().splitlines()[-1]
         self.assertIn("exec fork t1 --json", call)
         self.assertNotIn(" -C ", call)
+
+    def test_reply_returns_immediately_unless_wait_is_requested(self):
+        self.fake_pi([answer("first"), SETTLED])
+        first = self.outcome(self.cli("run", "task"))
+        self.fake_pi([answer("later"), SETTLED], sleep=2)
+        launched = self.cli("reply", first["run"], "more")
+        self.assertEqual(launched.returncode, 0, launched.stderr)
+        state = self.outcome(launched)
+        self.assertEqual(state["state"], "running")
+        self.assertNotIn("later", launched.stdout)
+        self.assertFalse((Path(state["dir"]) / "exit_code").exists())
+        self.assertIn("later", self.cli("wait", state["run"]).stdout)
+        self.fake_pi([answer("waited"), SETTLED])
+        waited = self.cli("reply", "--wait", state["run"], "one more")
+        self.assertEqual(self.outcome(waited)["state"], "answered")
+        self.assertIn("waited", waited.stdout)
+        self.assertEqual(self.cli("reply", "--max", "1s", state["run"], "invalid").returncode, 2)
+
+    def test_a_conversation_name_refers_to_its_newest_reply(self):
+        self.fake_pi([answer("first"), SETTLED])
+        first = self.outcome(self.cli("run", "--name", "conv", "task"))
+        self.fake_pi([answer("second"), SETTLED])
+        second = self.outcome(self.cli("reply", "--wait", "conv", "more"))
+        self.assertEqual(self.outcome(self.cli("status", "conv"))["run"], second["run"])
+        self.assertIn("second", self.cli("result", "conv").stdout)
+        self.assertEqual(self.outcome(self.cli("status", first["run"]))["run"], first["run"])  # a run id stays exact
 
     def test_apply_handles_modes_large_files_and_unsafe_paths(self):
         repo = self.repo({"run.sh": "echo hi\n", "img.bin": "\0old", "sub/f.txt": "f\n"})
@@ -886,9 +976,9 @@ class DelegateTests(unittest.TestCase):
     def test_reply_survives_cleaning_earlier_rounds(self):
         self.fake_pi([answer("one"), SETTLED])
         first = self.outcome(self.cli("run", "--read-only", "task"))
-        second = self.outcome(self.cli("reply", first["run"], "more"))
+        second = self.outcome(self.cli("reply", "--wait", first["run"], "more"))
         self.cli("clean", first["run"])
-        self.assertEqual(self.outcome(self.cli("reply", second["run"], "again"))["state"], "answered")
+        self.assertEqual(self.outcome(self.cli("reply", "--wait", second["run"], "again"))["state"], "answered")
         calls = [line.split() for line in (self.work / "pi.log").read_text().splitlines()]
         self.assertTrue(all("--fork" in call for call in calls[1:]))
 
@@ -962,7 +1052,7 @@ class DelegateTests(unittest.TestCase):
         (sub / "lib.txt").write_text("v1\n")
         subprocess.run(["git", "-C", str(sub), *git, "add", "-A"], check=True)
         subprocess.run(["git", "-C", str(sub), *git, "commit", "-qm", "v1"], check=True)
-        subprocess.run(["git", "-C", str(repo), *git, "submodule", "add", "-q", str(sub), "vendor"], check=True,
+        subprocess.run(["git", "-C", str(repo), *git, "submodule", "add", "-q", sub.as_uri(), "vendor"], check=True,
                        capture_output=True)
         subprocess.run(["git", "-C", str(repo), *git, "commit", "-qm", "vendor"], check=True)
         return repo
@@ -1070,7 +1160,7 @@ class DelegateTests(unittest.TestCase):
         self.fake_pi([answer("draft"), SETTLED], pre="echo draft >> a.txt")
         draft = self.outcome(self.cli("run", "--worktree", "--agent", "pi", "--workdir", repo, "--name", "d", "draft"))
         self.fake_codex(codex_events("polished"), pre="echo polish >> a.txt")
-        polished = self.outcome(self.cli("reply", "d", "--agent", "codex", "polish the draft"))
+        polished = self.outcome(self.cli("reply", "--wait", "d", "--agent", "codex", "polish the draft"))
         self.assertEqual((polished["state"], polished["agent"], polished["worktree"]),
                          ("answered", "codex", draft["worktree"]))
         self.assertNotIn(" fork ", (self.work / "pi.log.codex").read_text())  # another model: a fresh session
@@ -1088,7 +1178,7 @@ class DelegateTests(unittest.TestCase):
         subprocess.run([*git, "commit", "-qam", "round one"], check=True)
         (repo / "b.txt").write_text("x\ncaller\n")  # the caller keeps working elsewhere
         self.fake_pi([answer("two"), SETTLED], pre="sed -i s/round-one/round-two/ a.txt")
-        self.outcome(self.cli("reply", "conv", "two"))
+        self.outcome(self.cli("reply", "--wait", "conv", "two"))
         applied = self.cli("apply", "conv")
         self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
         self.assertEqual((repo / "a.txt").read_text(), "a\nround-two\nc\n")
@@ -1105,7 +1195,7 @@ class DelegateTests(unittest.TestCase):
         (repo / "tests/new.txt").write_text("new test\n")
         (repo / "b.txt").write_text("b\ncaller\n")
         self.fake_pi([answer("two"), SETTLED], pre="cat tests/new.txt b.txt > seen.txt")
-        second = self.outcome(self.cli("reply", "conv", "--sync", "use the new test"))
+        second = self.outcome(self.cli("reply", "--wait", "conv", "--sync", "use the new test"))
         self.assertEqual(second["state"], "answered")
         self.assertEqual((Path(second["worktree"]) / "seen.txt").read_text(), "new test\nb\ncaller\n")
         self.assertEqual(sorted(second["files"]), ["seen.txt"])  # synced files are the caller's, not its work
@@ -1116,13 +1206,35 @@ class DelegateTests(unittest.TestCase):
         self.assertTrue((repo / "seen.txt").exists())
         # A sync that would conflict stops before the colleague starts, leaving the worktree as it was.
         self.fake_pi([answer("three"), SETTLED], pre="echo agent2 >> a.txt")
-        self.outcome(self.cli("reply", "conv", "three"))
+        self.outcome(self.cli("reply", "--wait", "conv", "three"))
         (repo / "a.txt").write_text("a\nagent\ncaller-too\n")
         calls = len((self.work / "pi.log").read_text().splitlines())
         refused = self.cli("reply", "conv", "--sync", "four")
         self.assertEqual(refused.returncode, 2)
         self.assertIn("conflict", refused.stderr)
         self.assertIn("a.txt", refused.stderr)
+        self.assertEqual(len((self.work / "pi.log").read_text().splitlines()), calls)
+
+    def test_reply_sync_ignores_unchanged_gitlinks_but_rejects_pointer_changes(self):
+        repo = self.sub_repo()
+        init = "git -c protocol.file.allow=always submodule update --init -q vendor"
+        self.fake_pi([answer("one"), SETTLED], pre=init)
+        self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "conv", "one"))
+        (repo / "a.txt").write_text("a\ncaller\n")
+        self.fake_pi([answer("two"), SETTLED], pre="test -f vendor/lib.txt && cat a.txt > seen.txt")
+        second = self.outcome(self.cli("reply", "--wait", "conv", "--sync", "two"))
+        self.assertEqual(second["state"], "answered")
+        self.assertEqual((Path(second["worktree"]) / "seen.txt").read_text(), "a\ncaller\n")
+        self.assertEqual(json.loads((Path(second["dir"]) / "sync.json").read_text())["files"], ["a.txt"])
+        vendor = repo / "vendor"
+        (vendor / "lib.txt").write_text("v2\n")
+        subprocess.run(["git", "-C", str(vendor), "add", "lib.txt"], check=True)
+        subprocess.run(["git", "-C", str(vendor), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-qm", "v2"], check=True)
+        calls = len((self.work / "pi.log").read_text().splitlines())
+        refused = self.cli("reply", "conv", "--sync", "three")
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("--sync conflict in: vendor", refused.stderr)
         self.assertEqual(len((self.work / "pi.log").read_text().splitlines()), calls)
 
     def test_wait_machine_collects_runs_from_every_repository(self):
@@ -1171,38 +1283,38 @@ class DelegateTests(unittest.TestCase):
     def test_reply_tells_the_agent_when_the_acceptance_command_changes(self):
         self.fake_pi([answer("ok"), SETTLED])
         first = self.outcome(self.cli("run", "--accept", "true", "--prompt", "fix it"))
-        second = self.outcome(self.cli("reply", first["run"], "--accept", "", "--prompt", "now tidy up"))
+        second = self.outcome(self.cli("reply", "--wait", first["run"], "--accept", "", "--prompt", "now tidy up"))
         self.assertNotIn("accept", second)
         self.assertIn("no longer applies", (Path(second["dir"]) / "prompt.md").read_text())
-        third = self.outcome(self.cli("reply", second["run"], "--prompt", "and more"))
+        third = self.outcome(self.cli("reply", "--wait", second["run"], "--prompt", "and more"))
         self.assertEqual((Path(third["dir"]) / "prompt.md").read_text(), "and more\n")
 
     def test_reply_keeps_the_session_when_its_parent_is_pruned(self):
         self.fake_pi([answer("ok"), SETTLED])
         first = self.outcome(self.cli("run", "--read-only", "task"))
         os.utime(Path(first["dir"]) / "exit_code", (1, 1))
-        second = self.outcome(self.cli("reply", first["run"], "more"))
+        second = self.outcome(self.cli("reply", "--wait", first["run"], "more"))
         self.assertFalse(Path(first["dir"]).exists())  # pruned by the reply's own start
         self.assertTrue(any((Path(second["dir"]) / "session").glob("t_*.jsonl")))
-        self.assertEqual(self.outcome(self.cli("reply", second["run"], "again"))["state"], "answered")
+        self.assertEqual(self.outcome(self.cli("reply", "--wait", second["run"], "again"))["state"], "answered")
 
     def test_malformed_reply_is_retried_from_the_parent_and_skipped(self):
         self.fake_pi([answer("ok"), SETTLED])
         first = self.outcome(self.cli("run", "--read-only", "task"))
         self.fake_pi([answer(LEAKED), SETTLED])
-        broken = self.outcome(self.cli("reply", first["run"], "more"))
+        broken = self.outcome(self.cli("reply", "--wait", first["run"], "more"))
         self.assertEqual((broken["state"], broken["attempts"]), ("malformed", 2))
         calls = [line.split() for line in (self.work / "pi.log").read_text().splitlines()]
         forks = {call[call.index("--fork") + 1] for call in calls[1:]}
         self.assertEqual(len(forks), 1)  # the rerun started again from the parent's conversation
         self.fake_pi([answer("better"), SETTLED])
-        retry = self.outcome(self.cli("reply", first["run"], "more, again"))
+        retry = self.outcome(self.cli("reply", "--wait", first["run"], "more, again"))
         self.assertEqual((retry["state"], retry["parent"]), ("answered", first["run"]))
         repo = self.repo({"a.txt": "a\n"})
         self.fake_pi([answer("ok"), SETTLED], pre="echo b >> a.txt")
         root = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
         self.fake_pi([answer(LEAKED), SETTLED])
-        dead_end = self.outcome(self.cli("reply", root["run"], "more"))
+        dead_end = self.outcome(self.cli("reply", "--wait", root["run"], "more"))
         self.assertEqual(self.cli("apply", root["run"]).returncode, 0)
         self.assertTrue((Path(dead_end["dir"]) / ".applied").exists())
         self.assertNotIn("never applied", self.cli("clean", dead_end["run"]).stdout)
@@ -1212,7 +1324,7 @@ class DelegateTests(unittest.TestCase):
         self.fake_pi([answer("first"), SETTLED], pre="echo one >> a.txt")
         first = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "task"))
         self.fake_pi([answer("second"), SETTLED], pre="echo two >> a.txt")
-        second = self.outcome(self.cli("reply", "--fresh", first["run"], "--prompt", "standalone task"))
+        second = self.outcome(self.cli("reply", "--wait", "--fresh", first["run"], "--prompt", "standalone task"))
         call = (self.work / "pi.log").read_text().splitlines()[-1].split()
         self.assertIn("--session-id", call)
         self.assertNotIn("--fork", call)
