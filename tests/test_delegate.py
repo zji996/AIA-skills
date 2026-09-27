@@ -5,6 +5,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -14,9 +15,31 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 # Black-box conformance suite (docs/delegate-spec.md): every test drives the CLI as a subprocess, so any
 # implementation can be checked by pointing DELEGATE_BIN at its executable.
-DELEGATE = Path(os.environ.get("DELEGATE_BIN") or ROOT / "skills/delegate/bin/delegate").resolve()
+# By default the suite builds crates/delegate and tests that, so a passing run always covers the current
+# source; the installed skills/delegate/bin/delegate is only used when there is no source or no cargo.
+
+
+def source_binary():
+    crate = ROOT / "crates/delegate"
+    if not (crate / "Cargo.toml").is_file() or not shutil.which("cargo"):
+        return None
+    built = subprocess.run(["cargo", "build", "--locked", "--quiet", "--message-format=json-render-diagnostics"],
+                           cwd=crate, stdout=subprocess.PIPE, text=True)
+    if built.returncode:
+        raise RuntimeError("cargo build of crates/delegate failed")
+    for line in built.stdout.splitlines():
+        event = json.loads(line)
+        if event.get("reason") == "compiler-artifact" and event.get("executable") \
+                and event["target"]["name"] == "delegate":
+            return Path(event["executable"])
+    raise RuntimeError("cargo build of crates/delegate produced no delegate executable")
+
+
+DELEGATE = Path(os.environ.get("DELEGATE_BIN") or source_binary() or ROOT / "skills/delegate/bin/delegate").resolve()
+if not os.environ.get("DELEGATE_BIN") and DELEGATE == (ROOT / "skills/delegate/bin/delegate").resolve():
+    print(f"note: no cargo or crates/delegate; testing the installed {DELEGATE}", file=sys.stderr)
 if not os.access(DELEGATE, os.X_OK):
-    raise RuntimeError(f"{DELEGATE} is missing: run scripts/fetch-binary.sh delegate (or --build after changing crates/)")
+    raise RuntimeError(f"{DELEGATE} is missing: install cargo, set DELEGATE_BIN, or run scripts/fetch-binary.sh delegate")
 
 
 def process_gone(pid_file):

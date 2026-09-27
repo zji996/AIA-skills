@@ -356,7 +356,7 @@ run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git �
 
 ## 13. 一致性验收
 
-`tests/test_delegate.py` 是纯黑盒套件：通过伪造的 `pi`/`codex`（写在临时 `PATH` 中的 shell 脚本）以子进程驱动 CLI，只观察输出、退出码与 run 目录中的文件，覆盖本文全部必须项。被测入口由 `DELEGATE_BIN` 指定（默认已安装的 `skills/delegate/bin/delegate`；改动 Rust 源码后用 `scripts/fetch-binary.sh --build delegate` 重建）：
+`tests/test_delegate.py` 是纯黑盒套件：通过伪造的 `pi`/`codex`（写在临时 `PATH` 中的 shell 脚本）以子进程驱动 CLI，只观察输出、退出码与 run 目录中的文件，覆盖本文全部必须项。被测入口由 `DELEGATE_BIN` 指定；未指定时套件先 `cargo build` `crates/delegate` 并测试产物，保证通过即覆盖当前源码；没有源码或 cargo 时才测已安装的 `skills/delegate/bin/delegate`，并在 stderr 提示：
 
 ```bash
 DELEGATE_BIN=<被测可执行文件> python3 -m unittest tests.test_delegate

@@ -101,8 +101,7 @@ cd AIA-skills
 
 ```bash
 ./scripts/check.sh
-python3 -m unittest discover -s tests -v   # delegate 用例测已安装的 skills/delegate/bin/delegate
-./scripts/fetch-binary.sh --build delegate  # 改了 crates/delegate 后先重建再测
+python3 -m unittest discover -s tests -v   # delegate 用例先 cargo build crates/delegate 再测它；无 cargo 时测已安装的 bin/delegate
 ```
 
 `check.sh` 检查 frontmatter、`description` 是否写明触发场景、README 索引、`evals/` 触发示例、断链与脚本语法。依赖 Python 3.11+ 和 PyYAML；图像生成脚本另需 `curl`、`jq` 和有效的 OpenAI API key，调用会产生 API 费用。

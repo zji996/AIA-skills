@@ -42,6 +42,10 @@
 - `pi-delegation` 2.1.1：更早委派可独立验收的任务，短评审建议限制运行时间与答复长度；启动写入任务时持有 `flock` 至 supervisor 就绪，过期 `starting` 记录不再永久阻塞同目录写入，并明确互斥仅覆盖同一运行记录根目录。
 - `pi-delegation` 2.1.0：缺少 `pi`、`jq`、`setsid`、`timeout` 时一次列出全部缺失项和安装命令，`pi` 指向随仓库附带的 pi-kit 安装脚本。
 
+### 仓库
+
+- `tests/test_delegate.py` 未设 `DELEGATE_BIN` 时先 `cargo build` `crates/delegate` 并测试产物；没有源码或 cargo 才退回已安装的 `bin/delegate` 并在 stderr 提示。此前默认测已安装的二进制，改了源码忘记重建时，测试会在旧代码上"通过"（5.4.0 开发中实际发生过）。
+
 ### 安装
 
 - 技能可在 frontmatter 声明 `binary: <名>`：`install.sh` 在链接或复制前调用新增的 `scripts/fetch-binary.sh`，从 GitHub Release（`<名>-v<版本>`，次选 Forgejo）下载对应架构的二进制，按技能内提交的 `bin.sha256` 校验，不符即拒绝；下载不到而本机有 cargo 时从 `crates/<名>` 编译，`--build` 强制编译。新增 `scripts/release-binary.sh build|publish <技能>` 负责构建两个架构并发布（GitHub 为主，设了 `FORGEJO_TOKEN` 时也发到 Forgejo；可重复执行，已有的附件不重复上传）；`check.sh` 检查 `bin.sha256` 与源码齐全。`bootstrap.sh` 不再检查 python3。
