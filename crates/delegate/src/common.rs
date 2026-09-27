@@ -322,7 +322,7 @@ pub fn shell_quote(s: &str) -> String {
     }
 }
 pub fn run_shell(
-    command: &str,
+    command: (&str, &str),
     cwd: &Path,
     run: &Path,
     extra: &Value,
@@ -330,7 +330,8 @@ pub fn run_shell(
     log: &mut File,
     holder: Option<&std::sync::atomic::AtomicI32>,
 ) -> Res<(i32, bool)> {
-    let mut c = Command::new("sh");
+    let (command, role) = command;
+    let mut c = crate::cleanup::scoped_command(run, role, "sh", &[]);
     c.arg("-c")
         .arg(command)
         .current_dir(cwd)

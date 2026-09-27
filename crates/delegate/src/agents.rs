@@ -6,7 +6,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, AtomicI32, Ordering},
     Arc, Condvar, Mutex,
@@ -362,9 +362,9 @@ pub fn run_agent(
         )
         .map_err(|e| e.to_string())?;
     }
-    let mut c = Command::new(&args[0]);
-    c.args(&args[1..])
-        .current_dir(s(meta, "workdir"))
+    let mut c =
+        crate::cleanup::scoped_command(run, &format!("agent-{attempt}"), &args[0], &args[1..]);
+    c.current_dir(s(meta, "workdir"))
         .stdin(Stdio::from(prompt))
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr));

@@ -4,6 +4,7 @@
 
 ### 技能
 
+- `delegate` 5.6.0：用户 systemd 可用时为同事、worktree setup 与验收各建独立 scope，结束时按 cgroup 回收并报告脱离进程组、清掉环境标记的后台进程；不可用或 `DELEGATE_CGROUP=0` 时沿用进程组与环境标记清理；回收先 SIGTERM 宽限 3 秒再 `cgroup.kill`，给同事留出写完会话的时间。`wait`/`status` 等按 run id 查找时，本仓库找不到会退到整机正在运行的任务，从别的目录执行 `next` 提示也能找到。
 - `delegate` 5.5.0：新 run 默认放 `.local/run/delegate`，继续查找旧 `.local/run/pi`；长答复保留头尾；结束时清理并报告后台进程及监听端口；空/缺失的 worktree link/copy 源进入 `warnings`；写入任务支持 `.delegate.json` 顶层默认 `accept`、`--no-accept` 关闭。补充并行文件所有权与仓库门禁经验。
 - `repo-governance` 2.2.0：新增 `adr-index.py`，从各 ADR 的标题与状态行生成 `INDEX.md` 中标记之间的表格（兼容 `状态: x`、`- 状态：x`、`- **Status**: x`），默认只核对、`--write` 重写；审计同时报告过期索引。审计新增 `--fail-on`，门禁可只让断链、点名不存在和索引过期失败，体积与过期类只打印。
 - `repo-governance` 2.1.1：点名路径检查只看带目录的路径；不带目录的裸文件名（如技能里的 `audit-context.py`）多半在仓库外，此前会误报。

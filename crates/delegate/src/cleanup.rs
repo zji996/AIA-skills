@@ -1,10 +1,159 @@
-use crate::common::{json, lock, write_json};
+use crate::common::{append, json, lock, read, setting, write_json};
 use serde_json::{json as value, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+static SYSTEMD: OnceLock<bool> = OnceLock::new();
+
+pub fn probe_systemd() {
+    SYSTEMD.get_or_init(|| {
+        setting("CGROUP", "1") != "0"
+            && std::env::var_os("XDG_RUNTIME_DIR").is_some()
+            && Command::new("systemd-run")
+                .args(["--user", "--scope", "--quiet", "--", "true"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+    });
+}
+
+pub fn scoped_command(run: &Path, role: &str, program: &str, args: &[String]) -> Command {
+    probe_systemd();
+    if SYSTEMD.get() != Some(&true) {
+        let mut command = Command::new(program);
+        command.args(args);
+        return command;
+    }
+    let name: String = run
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .chars()
+        .take(100)
+        .collect();
+    let raw = format!(
+        "delegate-{name}-{role}-{:x}-{:x}",
+        std::process::id(),
+        crate::common::now_ns()
+    );
+    let unit: String = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let Ok(_guard) = lock(&run.join("scopes.lock"), true, false) else {
+        let mut command = Command::new(program);
+        command.args(args);
+        return command;
+    };
+    if append(run.join("scopes"), &format!("{unit}.scope\n")).is_err() {
+        let mut command = Command::new(program);
+        command.args(args);
+        return command;
+    }
+    let mut command = Command::new("systemd-run");
+    command
+        .args(["--user", "--scope", "--quiet", "--collect", "--unit"])
+        .arg(unit)
+        .arg("--")
+        .arg(program)
+        .args(args);
+    command
+}
+
+fn scope_dirs(root: &Path, pids: &mut BTreeSet<i32>) {
+    if let Ok(data) = fs::read_to_string(root.join("cgroup.procs")) {
+        pids.extend(data.lines().filter_map(|line| line.parse::<i32>().ok()));
+    }
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                scope_dirs(&entry.path(), pids);
+            }
+        }
+    }
+}
+
+fn scopes(run: &Path) -> Vec<(String, PathBuf, BTreeSet<i32>)> {
+    if !run.join("scopes").is_file() {
+        return Vec::new();
+    }
+    let Ok(_guard) = lock(&run.join("scopes.lock"), true, false) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for unit in read(run.join("scopes")).lines() {
+        if !unit.starts_with("delegate-")
+            || !unit.ends_with(".scope")
+            || !unit
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+        {
+            continue;
+        }
+        let Ok(output) = Command::new("systemctl")
+            .args(["--user", "show", "-p", "ControlGroup", "--value", unit])
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let group = String::from_utf8_lossy(&output.stdout);
+        let group = group.trim();
+        let path = Path::new(group);
+        if !path.is_absolute()
+            || path.file_name().is_none_or(|name| name != unit)
+            || !path
+                .components()
+                .skip(1)
+                .all(|part| matches!(part, Component::Normal(_)))
+        {
+            continue;
+        }
+        let root = Path::new("/sys/fs/cgroup").join(group.trim_start_matches('/'));
+        let mut pids = BTreeSet::new();
+        scope_dirs(&root, &mut pids);
+        found.push((unit.to_string(), root, pids));
+    }
+    found
+}
+
+fn kill_scope(unit: &str, root: &Path, pids: &BTreeSet<i32>) {
+    if pids.is_empty() {
+        return;
+    }
+    let signal = |name| {
+        let _ = Command::new("systemctl")
+            .args(["--user", "kill", &format!("--signal={name}"), unit])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    };
+    // Terminate gracefully first so agents can flush their sessions; SIGKILL only what remains.
+    signal("SIGTERM");
+    let start = Instant::now();
+    while pids.iter().any(|pid| alive(*pid)) && start.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if pids.iter().any(|pid| alive(*pid)) && fs::write(root.join("cgroup.kill"), "1").is_err() {
+        signal("SIGKILL");
+    }
+}
 
 fn listening() -> BTreeMap<String, u16> {
     let mut ports = BTreeMap::new();
@@ -32,10 +181,15 @@ fn alive(pid: i32) -> bool {
         .unwrap_or(false)
 }
 
-fn members(run: &Path, pgid: i32) -> Vec<(i32, String, Vec<u16>, bool)> {
+fn members(
+    run: &Path,
+    pgid: i32,
+    scope_pids: &BTreeSet<i32>,
+) -> Vec<(i32, String, Vec<u16>, bool)> {
     let uid = unsafe { libc::geteuid() };
     let ports = listening();
     let marker = format!("DELEGATE_RUN_DIR={}", run.display());
+    let supervisor = read(run.join("pid")).trim().parse::<i32>().unwrap_or(0);
     let mut found = Vec::new();
     let Ok(entries) = fs::read_dir("/proc") else {
         return found;
@@ -45,14 +199,18 @@ fn members(run: &Path, pgid: i32) -> Vec<(i32, String, Vec<u16>, bool)> {
             continue;
         };
         let path = entry.path();
-        if !path.metadata().is_ok_and(|m| m.uid() == uid) || !alive(pid) {
+        if pid == std::process::id() as i32
+            || pid == supervisor
+            || !path.metadata().is_ok_and(|m| m.uid() == uid)
+            || !alive(pid)
+        {
             continue;
         }
         let in_group = pgid > 0 && unsafe { libc::getpgid(pid) } == pgid;
         let tagged = fs::read(path.join("environ"))
             .ok()
             .is_some_and(|env| env.split(|b| *b == 0).any(|v| v == marker.as_bytes()));
-        if !in_group && !tagged {
+        if !in_group && !tagged && !scope_pids.contains(&pid) {
             continue;
         }
         let command = fs::read(path.join("cmdline")).unwrap_or_default();
@@ -93,7 +251,18 @@ pub fn record(run: &Path, pgid: i32) {
     let Ok(_guard) = lock(&run.join("cleanup.lock"), true, false) else {
         return;
     };
-    let found = members(run, pgid);
+    let scopes = scopes(run);
+    let scope_pids = scopes
+        .iter()
+        .flat_map(|(_, _, pids)| pids.iter().copied())
+        .collect();
+    let found = members(run, pgid, &scope_pids);
+    let supervisor = read(run.join("pid")).trim().parse::<i32>().unwrap_or(0);
+    for (unit, root, pids) in &scopes {
+        if !pids.contains(&(std::process::id() as i32)) && !pids.contains(&supervisor) {
+            kill_scope(unit, root, pids);
+        }
+    }
     if found.is_empty() {
         return;
     }

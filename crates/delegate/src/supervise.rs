@@ -56,7 +56,7 @@ fn accept(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
     let _ = writeln!(log, "$ {}", s(meta, "accept"));
     let _ = log.flush();
     let (code, timed) = run_shell(
-        s(meta, "accept"),
+        (s(meta, "accept"), "accept"),
         Path::new(s(meta, "workdir")),
         run,
         &meta["env"],
@@ -568,6 +568,7 @@ fn admit_waiting(run: &Path, meta: &Value, stop_waiter: &StopWaiter) -> Res<()> 
     }
 }
 pub fn supervise(run: &Path) -> Res<()> {
+    crate::cleanup::probe_systemd();
     let _life = locked_file(
         &run.join("supervisor.lock"),
         &std::process::id().to_string(),

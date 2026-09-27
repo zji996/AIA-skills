@@ -1,4 +1,4 @@
-# delegate 规格（v5.4）
+# delegate 规格（v5.6）
 
 > 本文是 `skills/delegate` 的**实现契约**：命令行、输出、run 目录、锁与状态机。它是 Rust 重写与 harness 原生接入的依据。
 > 本文不在技能目录内，技能加载时不会读取；模型使用技能只需 `SKILL.md`。行为以本文为准，实现与本文不一致时按缺陷处理。
@@ -100,7 +100,7 @@
 | `changes{files,added,deleted,after}` | 快照成功 | `after` 为结束快照 tree |
 | `shape{dirs,largest,config,removed,*More?}` | 写入任务、快照有改动 | `dirs` 按前两级目录汇总增删行；`largest` 为改后文本文件总行数；`config` 为依赖清单、锁文件、构建与 CI 配置路径；`removed` 为删除路径。各列表默认最多 5 项，`DELEGATE_SHAPE_LIMIT` 可调（1–20），`dirsMore` 等字段为未显示项数。`changes` 仍表示整体总数，完整逐文件 diff 见 `changes.json` |
 | `accept{command,ok,exitCode,tail?,queuedSeconds?}` | 执行过验收 | `tail` 为失败输出末 1500 字符 |
-| `cleanup{terminated,ports,commands}` | 结束时清理过后台进程 | 清理数量、监听 TCP 端口及带 PID 的截短命令 |
+| `cleanup{terminated,ports,commands}` | 结束时清理过后台进程 | 结束时仍存活且被终止的进程数、监听 TCP 端口及带 PID 的截短命令；PID 去重 |
 | `warnings` | worktree 的 link/copy 源缺失或为空 | 警告字符串数组；`wait` 也显示 |
 | `readOnlyViolation` | 只读 run 在自己的 worktree 中改了文件 | 文件列表 |
 | `workspaceChanged` | `--in-place` 只读 run 期间工作区有变化 | 文件列表；无法归属 |
@@ -252,7 +252,7 @@ Codex：
 codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dangerously-bypass-approvals-and-sandbox
    [-m M] [-c model_reasoning_effort="T"] [-c model_provider="P"] [--image=<图片>...] -     # stdin: prompt.md
 ```
-进程工作目录为 workdir，独立进程组。环境：去掉 §12 的保护变量，叠加 `.delegate.json` 的 `env`，再设 `DELEGATE_AGENT`、`DELEGATE_RUN_DIR`（Pi 另设 `PI_DELEGATE_ACTIVE=1`）。
+进程工作目录为 workdir，独立进程组。用户 systemd 可用时，同事、每条 setup 与验收命令分别在 `systemd-run --user --scope --quiet --collect` 创建的 scope 内运行；supervisor 不在 scope 内。启动时探测一次，失败或 `DELEGATE_CGROUP=0`（也接受 `PI_DELEGATE_CGROUP=0`）则沿用进程组及环境标记回收。环境：去掉 §12 的保护变量，叠加 `.delegate.json` 的 `env`，再设 `DELEGATE_AGENT`、`DELEGATE_RUN_DIR`（Pi 另设 `PI_DELEGATE_ACTIVE=1`）。
 
 ### 7.2 事件
 
@@ -293,7 +293,7 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 
 ### 9.1 验收与 setup 命令（必须）
 
-`sh -c` 执行，独立进程组，stdin 为 `/dev/null`，stdout+stderr 写日志。环境：去掉保护变量、叠加 `env`、设 `DELEGATE_LANE_HELD=1` 与 `DELEGATE_RUN_DIR`。命令结束或超时后，**在回收 shell 之前**结束整个进程组（SIGTERM，宽限后 SIGKILL，存活判断排除僵尸），并按同 UID 的 `/proc/<pid>/environ` 清理逃出进程组的进程。超时退出码记 124，日志追加 `[accept timed out]` 与 `[exit N]`。
+`sh -c` 执行，独立进程组，stdin 为 `/dev/null`，stdout+stderr 写日志。环境：去掉保护变量、叠加 `env`、设 `DELEGATE_LANE_HELD=1` 与 `DELEGATE_RUN_DIR`。命令结束或超时后，**在回收 shell 之前**先读取各 scope 的 `ControlGroup`，递归收集 `cgroup.procs`，记录仍存活的同 UID 进程及其命令、监听端口；优先写 `cgroup.kill`，不可用则 `systemctl --user kill` 先发 SIGTERM、最多等待 2 秒后发 SIGKILL。随后结束整个进程组（SIGTERM，宽限后 SIGKILL，存活判断排除僵尸），并按同 UID 的 `/proc/<pid>/environ` 清理逃出进程组的进程。超时退出码记 124，日志追加 `[accept timed out]` 与 `[exit N]`。
 
 ### 9.2 同事超时（必须）
 
@@ -307,7 +307,7 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 
 ### 9.4 stop
 
-向 supervisor 发 SIGTERM；supervisor 结束同事或验收的进程组，排队中则放弃排队。12 秒内无 `exit_code` 时由 `stop` 直接结束残余进程组并写 `stopped`。supervisor 已死而同事仍在时，直接结束同事进程组。
+向 supervisor 发 SIGTERM；supervisor 回收该 run 的 scope、同事或验收的进程组，排队中则放弃排队。12 秒内无 `exit_code` 时由 `stop` 直接回收 scope 与残余进程组并写 `stopped`。supervisor 已死而同事仍在时，直接回收 scope 与同事进程组。回收不得触及 supervisor、主控的 `wait` 或其他排队任务。
 
 ### 9.5 等待（`wait`/`run`）
 
@@ -336,6 +336,7 @@ run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git �
 | `result.md` | supervisor | 最后一轮完整答复 |
 | `summary.json` | supervisor | §3.1 中结束后的字段 |
 | `cleanup.json` | supervisor | 已清理进程的 PID、命令与监听 TCP 端口 |
+| `scopes` / `scopes.lock` | supervisor | 本轮启动的唯一 systemd scope 单元名 / 并发读写锁 |
 | `changes.json` `changes.patch` | supervisor | §6.2 |
 | `accept.log` `setup.log` | supervisor | 命令、输出、`[exit N]` |
 | `lane-wait` `lane-waiting-<pid>` | lane | §8 |

@@ -260,10 +260,18 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<Option<String>> {
         .append(true)
         .open(&log)
         .map_err(|e| e.to_string())?;
-    for command in setup {
+    for (index, command) in setup.into_iter().enumerate() {
         writeln!(file, "$ {command}").map_err(|e| e.to_string())?;
         file.flush().map_err(|e| e.to_string())?;
-        let (code, _) = run_shell(&command, &path, run, &env, timeout, &mut file, None)?;
+        let (code, _) = run_shell(
+            (&command, &format!("setup-{}", index + 1)),
+            &path,
+            run,
+            &env,
+            timeout,
+            &mut file,
+            None,
+        )?;
         writeln!(file, "[exit {code}]").map_err(|e| e.to_string())?;
         if code != 0 {
             return Ok(Some(format!(

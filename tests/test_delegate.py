@@ -393,6 +393,55 @@ class DelegateTests(unittest.TestCase):
             self.assertIn(int((self.work / f"{label}.port").read_text()), state["cleanup"]["ports"])
             self.assertTrue(process_gone(self.work / f"{label}.pid"))
 
+    def test_cgroup_cleans_untagged_detached_agent_and_acceptance(self):
+        if not shutil.which("systemd-run"):
+            self.skipTest("systemd-run unavailable")
+        probe = subprocess.run(["systemd-run", "--user", "--scope", "--quiet", "--", "true"],
+                               env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if probe.returncode:
+            self.skipTest("systemd user scope unavailable")
+        for role in ("agent", "accept"):
+            with self.subTest(role=role):
+                pid_file = self.work / f"{role}-untagged.pid"
+                command = ("env -i setsid sh -c "
+                           + shlex.quote(f"echo $$ > {shlex.quote(str(pid_file))}; exec sleep 300")
+                           + " </dev/null >/dev/null 2>&1 & sleep .2")
+                self.fake_pi([answer("done"), SETTLED], pre=command if role == "agent" else "")
+                result = self.cli("run", *( ["--accept", command] if role == "accept" else []), "task")
+                state = self.outcome(result)
+                self.assertEqual(state["state"], "delivered" if role == "accept" else "answered", result.stderr)
+                pid = int(pid_file.read_text())
+                self.addCleanup(lambda p=pid: os.kill(p, signal.SIGKILL) if Path(f"/proc/{p}").exists() else None)
+                self.assertTrue(process_gone(pid_file))
+                self.assertIn(str(pid), json.loads((Path(state["dir"]) / "cleanup.json").read_text())["processes"])
+                self.assertGreaterEqual(state["cleanup"]["terminated"], 1)
+                self.assertIn(f"-{role}", (Path(state["dir"]) / "scopes").read_text())
+
+        repo = self.repo({"a.txt": "a\n"})
+        setup_pid = self.work / "setup-untagged.pid"
+        setup_command = ("env -i setsid sh -c "
+                         + shlex.quote(f"echo $$ > {shlex.quote(str(setup_pid))}; exec sleep 300")
+                         + " </dev/null >/dev/null 2>&1 & sleep .2")
+        (repo / ".delegate.json").write_text(json.dumps({"worktree": {"setup": [setup_command]}}))
+        self.fake_pi([answer("done"), SETTLED])
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        pid = int(setup_pid.read_text())
+        self.addCleanup(lambda p=pid: os.kill(p, signal.SIGKILL) if Path(f"/proc/{p}").exists() else None)
+        self.assertTrue(process_gone(setup_pid))
+        self.assertIn(str(pid), json.loads((Path(state["dir"]) / "cleanup.json").read_text())["processes"])
+        self.assertIn("-setup-1", (Path(state["dir"]) / "scopes").read_text())
+
+    def test_cgroup_opt_out_keeps_group_and_marker_cleanup(self):
+        self.env["DELEGATE_CGROUP"] = "0"
+        command = self.detached_server("opt-out-server")
+        self.fake_pi([answer("done"), SETTLED], pre=command)
+        state = self.outcome(self.cli("run", "task"))
+        self.assertFalse((Path(state["dir"]) / "scopes").exists())
+        self.assertFalse((Path(state["dir"]) / "scopes.lock").exists())
+        self.assertIn(str(int((self.work / "opt-out-server.pid").read_text())),
+                      json.loads((Path(state["dir"]) / "cleanup.json").read_text())["processes"])
+        self.assertTrue(process_gone(self.work / "opt-out-server.pid"))
+
     def test_empty_copy_and_uninitialized_gitlink_report_warnings(self):
         repo = self.repo({"a.txt": "a\n"})
         (repo / "empty").mkdir()
@@ -1408,6 +1457,21 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         got = sorted(json.loads(l)["name"] for l in result.stdout.splitlines() if l.startswith('{"run"'))
         self.assertEqual(got, names)
+
+    def test_wait_by_run_id_from_another_directory_finds_an_active_run(self):
+        del self.env["DELEGATE_RUNS"]
+        self.fake_pi([answer("done"), SETTLED], sleep=1)
+        repo = self.work / "alpha"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        started = self.cli("start", "--read-only", "--name", "alpha", "task", cwd=repo)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        run_id = json.loads(started.stdout.splitlines()[0])["run"]
+        elsewhere = self.work / "elsewhere"
+        elsewhere.mkdir()
+        result = self.cli("wait", run_id, cwd=elsewhere, timeout=60)  # the id printed in `next`
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout.splitlines()[0])["run"], run_id)
 
     def test_generated_files_are_regenerated_after_apply_not_merged(self):
         repo = self.repo({"src.txt": "1\n2\n3\n", "gen/out.txt": "1\n2\n3\n"})

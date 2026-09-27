@@ -39,6 +39,13 @@ pub fn resolve(reference: &str) -> Res<PathBuf> {
     {
         return Ok(exact.clone());
     }
+    // An active run started from another repository is still reachable by its id.
+    if let Some(active) = crate::launch::machine_runs(&crate::common::state_dir())
+        .into_iter()
+        .find(|p| p.file_name().is_some_and(|name| name == reference))
+    {
+        return Ok(active);
+    }
     let named = runs
         .iter()
         .filter(|p| s(&json(p.join("meta.json")), "name") == reference)
