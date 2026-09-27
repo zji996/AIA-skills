@@ -9,6 +9,7 @@ mod supervise;
 mod worktree;
 use common::*;
 use serde_json::json;
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -99,7 +100,8 @@ fn value<'a>(kv: &'a [(String, String)], key: &str) -> Option<&'a str> {
         .find(|(k, _)| k == key)
         .map(|(_, v)| v.as_str())
 }
-fn print_answer(run: &Path, full: bool) {
+/// Returns true when only the tail of the answer was shown.
+fn print_answer(run: &Path, full: bool) -> bool {
     let result = read(run.join("result.md"));
     let limit = setting("RESULT_CHARS", "6000")
         .parse::<usize>()
@@ -109,7 +111,8 @@ fn print_answer(run: &Path, full: bool) {
         run.file_name().unwrap_or_default().to_string_lossy(),
         result.chars().count()
     );
-    if full || result.chars().count() <= limit {
+    let truncated = !full && result.chars().count() > limit;
+    if !truncated {
         println!("{}", result.trim_end_matches('\n'));
     } else {
         let tail = result
@@ -130,6 +133,7 @@ fn print_answer(run: &Path, full: bool) {
         "===== end: {} =====",
         run.file_name().unwrap_or_default().to_string_lossy()
     );
+    truncated
 }
 fn progress(run: &Path, tag: &str) {
     let marker = run.join(".progress");
@@ -235,7 +239,12 @@ fn collect(
         changes::print_changes(run);
         let has_result = run.join("result.md").is_file();
         if has_result && show_result {
-            print_answer(run, full);
+            // A truncated answer counts as reported, but clean keeps it until read in full.
+            if print_answer(run, full) {
+                touch(run.join(".truncated"));
+            } else {
+                fs::remove_file(run.join(".truncated")).ok();
+            }
         }
         if show_result || !has_result {
             touch(run.join(".delivered"));
@@ -257,8 +266,15 @@ fn clean(args: &[String]) -> Res<i32> {
         .collect::<Res<Vec<_>>>()?;
     if has(&flags, "--finished") {
         for run in runs::all_runs() {
-            if run.join(".delivered").exists() || has(&flags, "--force") {
+            if has(&flags, "--force")
+                || (run.join(".delivered").exists() && !run.join(".truncated").exists())
+            {
                 targets.push(run);
+            } else if run.join(".delivered").exists() {
+                eprintln!(
+                    "delegate: keep run {0}; its answer was only shown truncated; read it with `result {0}` or pass --force",
+                    run.file_name().unwrap_or_default().to_string_lossy()
+                );
             } else if !runs::active(&runs::state(&run)) {
                 eprintln!(
                     "delegate: keep unreported run {}; read it with wait/result or pass --force",
@@ -548,8 +564,15 @@ fn main_inner(args: &[String]) -> Res<i32> {
             if has(&flags, "--path") {
                 println!("{}", result.display());
             } else {
-                print!("{}", read(&result));
-                io::stdout().flush().ok();
+                let mut out = io::stdout().lock();
+                // 全文确实写出后才解除保留，写入失败时 clean 仍会保留它。
+                if out
+                    .write_all(read(&result).as_bytes())
+                    .and_then(|()| out.flush())
+                    .is_ok()
+                {
+                    fs::remove_file(run.join(".truncated")).ok();
+                }
             }
             if !runs::active(&runs::state(&run)) {
                 touch(run.join(".delivered"));

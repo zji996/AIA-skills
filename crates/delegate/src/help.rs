@@ -140,8 +140,8 @@ pub fn print(command: Option<&str>) -> bool {
         ]),
         "clean" => ("[--finished] [--force] [runs ...]", "Delete finished runs.", &[
             ("runs", "Run ids or directories to remove."),
-            ("--finished", "Select all finished runs that have been reported."),
-            ("--force", "With --finished, also select unreported finished runs."),
+            ("--finished", "Select all finished runs that have been reported in full (answers shown truncated are kept until read with result)."),
+            ("--force", "With --finished, also select unreported or truncated finished runs."),
         ]),
         _ => return false,
     };

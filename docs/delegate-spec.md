@@ -309,8 +309,8 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 - 启动在 `<state>/.start.lock` 与 `<runs>/.start.lock` 两把锁下进行，检查与登记不可交错。
 - 写入互斥：同一 workdir 同时只允许一个原地写入 run（`--allow-parallel-writes` 与 worktree run 除外）。
 - **只有一层委派**：调用者本身是同事（设有 `DELEGATE_AGENT`、`PI_DELEGATE_AGENT` 或 `PI_DELEGATE_ACTIVE`）时，`start`/`run`/`reply` 一律以退出码 2 拒绝；`lane` 等其他命令不受影响。所有结果都回到主控。
-- 自动清理：每次启动删除结束超过 `DELEGATE_KEEP_DAYS`（默认 7，0 关闭）天、已读取、且没有未 apply 写入 worktree 的 run。
-- `clean`：跳过运行中的与同事进程仍存活的；`--finished` 默认保留未读取的（`--force` 除外）；提示未 apply 的 worktree。
+- 自动清理：每次启动删除结束超过 `DELEGATE_KEEP_DAYS`（默认 7，0 关闭）天、已读取（不含只显示过截断答复的）、且没有未 apply 写入 worktree 的 run。
+- `clean`：跳过运行中的与同事进程仍存活的；`--finished` 默认保留未读取的，以及只显示过截断答复的（`wait` 截断打印时写 `.truncated`，完整打印或 `result` 读全文后删除；`--force` 除外）；显式列出的 run 照常删除；提示未 apply 的 worktree。
 
 ## 11. 文件与目录
 

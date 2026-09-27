@@ -269,7 +269,12 @@ pub fn prune() {
     }
     for run in all_runs() {
         let done = run.join("exit_code");
-        if run.join(".delivered").is_file() && done.is_file() && !unmerged(&run) {
+        // 只显示过截断答复的 run 不自动清理，全文仍待读取。
+        if run.join(".delivered").is_file()
+            && !run.join(".truncated").exists()
+            && done.is_file()
+            && !unmerged(&run)
+        {
             use std::time::UNIX_EPOCH;
             let age = fs::metadata(&done)
                 .and_then(|x| x.modified())

@@ -454,6 +454,20 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(self.cli("wait", "pending", "--no-result").returncode, 0)
         self.assertEqual(self.cli("clean", "--finished", "--force").stdout.count("removed"), 2)
 
+    def test_clean_keeps_answers_shown_truncated_until_read_in_full(self):
+        self.fake_pi([answer("x" * 50), SETTLED])
+        self.env["DELEGATE_RESULT_CHARS"] = "10"
+        run = Path(json.loads(self.cli("start", "--name", "long", "task").stdout)["dir"])
+        self.assertIn("showing the last 10 chars", self.cli("wait", "long").stdout)
+        self.assertIn("only shown truncated", self.cli("clean", "--finished").stderr)
+        self.assertTrue(run.exists())
+        os.utime(run / "exit_code", (1, 1))
+        self.fake_pi([answer("ok"), SETTLED])
+        self.assertEqual(self.cli("run", "--name", "later", "task").returncode, 0)
+        self.assertTrue(run.exists())  # expired but only shown truncated: not pruned
+        self.assertEqual(self.cli("result", "long").stdout.strip(), "x" * 50)
+        self.assertIn("-long (answered)", self.cli("clean", "--finished").stdout)
+
     def test_git_reports_files_changed_outside_edit_tools(self):
         repo = self.work / "repo"
         repo.mkdir()
