@@ -217,7 +217,7 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 - 路径：`${XDG_CACHE_HOME:-~/.cache}/delegate/worktrees/<仓库名>-<run id>`。
 - 起点：`commit-tree <起始快照> [-p HEAD]`（作者 `delegate <delegate@localhost>`），`git worktree add --detach`。
 - `--workdir` 为子目录时，同事在 worktree 的对应子目录工作。
-- 准备：`copy`（递归复制仓库根相对的文件或目录，包括被 git 忽略的路径，如 `.local/scan`）、`link`（符号链接，替换空目录，适合子模块）、`setup`（在 lane 中依次执行，§8）。`copy`/`link` 源不存在时跳过并向 stderr 提示；其余失败 → `failed`，`error` 说明。
+- 准备：`copy`（递归复制仓库根相对的文件或目录，包括被 git 忽略的路径，如 `.local/scan`）、`link`（符号链接，替换空目录，适合子模块）、`setup`（在 lane 中依次执行，§8）、`writeSetup`（仅写入任务，在 `setup` 之后执行，适合只有构建和测试才需要的重环境）。`copy`/`link` 源不存在时跳过并向 stderr 提示；其余失败 → `failed`，`error` 说明。
 - 一个对话共享一个 worktree；`clean` 删除最后一个引用它的 run 时，在 worktree 自身 `git-common-dir` 所属的仓库执行 `git worktree remove --force`（失败则删目录后 `worktree prune`）；不依赖记录的来源路径，`--in` 的上游可能已先被清理。
 
 ### 6.4 apply（必须）
@@ -352,7 +352,7 @@ run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git �
 
 ```json
 {"env": {"CUDA_VISIBLE_DEVICES": ""},
- "worktree": {"copy": [".env", ".local/scan"], "link": ["third_party/sub"], "setup": ["pnpm install --offline --frozen-lockfile"]}}
+ "worktree": {"copy": [".env", ".local/scan"], "link": ["third_party/sub"], "setup": ["pnpm install --offline --frozen-lockfile"], "writeSetup": ["uv sync --frozen --offline"]}}
 ```
 
 `env` 为字符串到字符串的映射，注入同事、验收与 setup（原地与 worktree 均生效，reply 沿用）；`copy`/`link` 必须是仓库内相对路径，缺源跳过并在启动命令与 supervisor 的 stderr 提示。

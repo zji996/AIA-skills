@@ -87,7 +87,8 @@ $D wait
   "worktree": {
     "copy": [".env", ".local/scan"],
     "link": ["third_party/some-submodule", "models/weights"],
-    "setup": ["pnpm install --offline --frozen-lockfile", "uv sync --frozen --offline"]
+    "setup": ["pnpm install --offline --frozen-lockfile"],
+    "writeSetup": ["uv sync --frozen --offline"]
   }
 }
 ```
@@ -95,6 +96,7 @@ $D wait
 - `copy` 将被 git 忽略的文件或目录独立复制进 worktree；源不存在时跳过并提示。
 - `link` 适合只读的子模块与大目录（worktree 里子模块是空目录）；写入会落到原仓库。
 - `setup` 在重任务队列里执行；先在一个临时 worktree 里手动跑一遍，确认离线能装齐。
+- `writeSetup` 只在写入任务里、`setup` 之后执行：装起来慢、只有跑测试才用得上的环境（如含 torch 的 venv）放这里，只读侦察不必等。
 - `env` 在原地运行时同样生效。
 - 顶层 `accept` 只作用于写入任务；显式 `--accept` 覆盖，`--no-accept` 关闭。并行写入用 `--protect` 划分文件所有权；验收覆盖相关 ratchet、contracts、docs 门禁，合并后再跑全量。
 - 强档并发紧时界面实现可用 `--tier cheap`；广度侦察限定目录与条目数，大范围按目录拆多路（单次可能 5–10 分钟、上百轮）。

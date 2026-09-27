@@ -38,12 +38,13 @@
 
 ```json
 {"accept": "make check", "worktree": {"copy": [".env", ".local/scan"], "link": ["models/weights"],
-              "setup": ["pnpm install --offline --frozen-lockfile", "uv sync --frozen --offline"]}}
+              "setup": ["pnpm install --offline --frozen-lockfile"], "writeSetup": ["uv sync --frozen --offline"]}}
 ```
 
 - `copy`：仓库根相对路径；被 git 忽略的文件或目录（如 `.local/scan`）也会递归复制，改动不影响原仓库。源不存在或为空时在 stderr 和 `warnings` 提示。
 - `link`：大而只读的被忽略目录，建符号链接，写入会落到原仓库。
-- `setup`：依次在 worktree 根执行，输出写入 `setup.log`，任一失败即判 `failed`（`DELEGATE_SETUP_TIMEOUT`，默认 10m）。依赖用包管理器从本机缓存重建：pnpm 与 uv 以硬链接安装，几 GB 的环境也只需一两秒；不要 link `node_modules`、`.venv`，其中的可编辑安装指向原仓库源码。
+- `setup`：依次在 worktree 根执行，输出写入 `setup.log`，任一失败即判 `failed`（`DELEGATE_SETUP_TIMEOUT`，默认 10m）。依赖用包管理器从本机缓存重建：pnpm 与 uv 以硬链接安装，几乎不额外占盘，但文件多时仍慢（含 torch 的数 GB venv 约 1 分钟）；不要 link `node_modules`、`.venv`，其中的可编辑安装指向原仓库源码。
+- `writeSetup`：同 `setup`，只在写入任务里、`setup` 之后执行；只读任务跳过。
 - 这三类路径不计入改动。子模块在新 worktree 里是空目录：只读使用时写进 `link`（会替换空目录），需要独立修改时在 `setup` 里初始化。
 - 顶层 `accept` 是写入任务的默认验收命令；`--accept` 覆盖，`--no-accept` 关闭，只读任务不使用。
 

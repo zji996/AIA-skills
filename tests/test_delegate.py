@@ -758,6 +758,20 @@ class DelegateTests(unittest.TestCase):
         self.assertNotIn("worktree", state)
         self.assertEqual(self.cli("run", "--in-place", "--workdir", repo, "task").returncode, 2)
 
+    def test_write_setup_runs_only_for_write_tasks(self):
+        repo = self.repo({"a.txt": "a\n", ".gitignore": "setup-ran\nwrite-setup-ran\n"})
+        (repo / ".delegate.json").write_text(json.dumps({"worktree": {
+            "setup": ["touch setup-ran"], "writeSetup": ["test -f setup-ran && touch write-setup-ran"]}}))
+        self.fake_pi([answer("ok"), SETTLED])
+        read = self.outcome(self.cli("run", "--read-only", "--workdir", repo, "review"))
+        self.assertTrue((Path(read["worktree"]) / "setup-ran").exists())
+        self.assertFalse((Path(read["worktree"]) / "write-setup-ran").exists())
+        self.fake_codex(codex_events("done"))
+        write = self.outcome(self.cli("run", "--agent", "codex", "--worktree", "--workdir", repo, "task"))
+        self.assertTrue((Path(write["worktree"]) / "write-setup-ran").exists())  # after setup, in order
+        (repo / ".delegate.json").write_text(json.dumps({"worktree": {"writeSetup": "  "}}))
+        self.assertEqual(self.cli("run", "--worktree", "--workdir", repo, "task").returncode, 2)
+
     def test_callers_edits_during_a_read_only_run_are_not_its_changes(self):
         repo = self.repo({"a.txt": "a\n", ".gitignore": "setup-ran\n"})
         (repo / ".delegate.json").write_text(json.dumps({"worktree": {"setup": ["touch setup-ran"]}}))

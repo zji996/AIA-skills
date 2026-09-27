@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "5.6.0"
+  version: "5.7.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -88,7 +88,7 @@ state 只描述答复。只读任务改了文件时仍是 `answered`，另带 `r
 1. **容量**：整机同时最多 8 个任务、其中强档 4 个，可用内存低于 4 GB 时拒绝启动；重检查（验收、setup、`lane`）整机一次一个，排队不计时。超出即拒绝并列出运行中的任务——先 `wait` 收一批。上限由用户设定（见 references），同事不要自行调整。
 2. **只读**：git 仓库里默认读启动时的工作区快照（独立 worktree，含未提交改动），你可以同时改代码；要读实时工作区加 `--in-place`。在快照里两位同事都有全部工具（能看 git 历史、跑测试），只读靠约定与事后核对，写了也只留在它自己的 worktree；非 git 目录或 `--in-place` 时 Pi 只剩读文件、搜索和列目录。
 3. **写入**：原地写入同一目录同时只能有一个，且你同时改的文件会算进它的改动；要并行或不想被打扰就加 `--worktree`。
-4. **worktree 依赖与验收**：仓库根 `.delegate.json` 的 `worktree.copy` 可复制被忽略的材料，或用 `link` / `setup`；缺源或空源会在 `warnings` 提示。顶层 `env` 注入同事、验收和 setup；顶层 `accept` 是写入任务默认验收，`--accept` 覆盖、`--no-accept` 关闭。别 link `node_modules`/`.venv`。
+4. **worktree 依赖与验收**：仓库根 `.delegate.json` 的 `worktree.copy` 可复制被忽略的材料，或用 `link` / `setup`（`writeSetup` 只在写入任务执行）；缺源或空源会在 `warnings` 提示。顶层 `env` 注入同事、验收和 setup；顶层 `accept` 是写入任务默认验收，`--accept` 覆盖、`--no-accept` 关闭。别 link `node_modules`/`.venv`。
 5. **超时**：`--timeout` 默认 Pi 15 分钟、Codex 30 分钟；到时若仍在执行命令会宽限最多 50%。任务太大就拆小。
 
 命令与全部选项见 `$D --help`；run 目录、文件、环境变量与清理策略见 [references/output-and-files.md](references/output-and-files.md)。

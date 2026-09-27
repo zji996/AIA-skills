@@ -42,7 +42,7 @@ pub fn config(top: &Path) -> Res<(Value, Value, Option<String>)> {
         return Err(format!("{}: worktree must be an object", path.display()));
     }
     let mut out = json!({});
-    for key in ["copy", "link", "setup"] {
+    for key in ["copy", "link", "setup", "writeSetup"] {
         let value = work.get(key).cloned().unwrap_or(json!([]));
         let items = if let Some(s) = value.as_str() {
             vec![s.to_string()]
@@ -65,7 +65,7 @@ pub fn config(top: &Path) -> Res<(Value, Value, Option<String>)> {
                 path.display()
             ));
         }
-        if key != "setup"
+        if !key.ends_with("etup")
             && items.iter().any(|x| {
                 Path::new(x).is_absolute()
                     || Path::new(x).components().any(|c| c.as_os_str() == "..")
@@ -78,7 +78,7 @@ pub fn config(top: &Path) -> Res<(Value, Value, Option<String>)> {
         }
         out[key] = json!(items
             .iter()
-            .map(|x| if key == "setup" {
+            .map(|x| if key.ends_with("etup") {
                 x.clone()
             } else {
                 x.trim().trim_end_matches('/').to_string()
@@ -237,7 +237,11 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<Option<String>> {
     for item in copies.iter().chain(links.iter()) {
         let _ = git(&path, &["update-index", "--skip-worktree", "--", item]);
     }
-    let setup = strings(&cfg["setup"]);
+    let mut setup = strings(&cfg["setup"]);
+    // Heavy environments (e.g. a Python venv) only for tasks expected to build and test.
+    if s(meta, "mode") == "write" {
+        setup.extend(strings(&cfg["writeSetup"]));
+    }
     if setup.is_empty() {
         return Ok(None);
     }
