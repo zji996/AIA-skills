@@ -4,6 +4,7 @@
 
 ### 技能
 
+- `delegate` 5.5.0：新 run 默认放 `.local/run/delegate`，继续查找旧 `.local/run/pi`；长答复保留头尾；结束时清理并报告后台进程及监听端口；空/缺失的 worktree link/copy 源进入 `warnings`；写入任务支持 `.delegate.json` 顶层默认 `accept`、`--no-accept` 关闭。补充并行文件所有权与仓库门禁经验。
 - `repo-governance` 2.2.0：新增 `adr-index.py`，从各 ADR 的标题与状态行生成 `INDEX.md` 中标记之间的表格（兼容 `状态: x`、`- 状态：x`、`- **Status**: x`），默认只核对、`--write` 重写；审计同时报告过期索引。审计新增 `--fail-on`，门禁可只让断链、点名不存在和索引过期失败，体积与过期类只打印。
 - `repo-governance` 2.1.1：点名路径检查只看带目录的路径；不带目录的裸文件名（如技能里的 `audit-context.py`）多半在仓库外，此前会误报。
 - `repo-governance` 2.1.0：审计新增三项只读检查：`docs/current.md` 体积超预算（默认 8 KB）、带日期的条目过多（默认 5 条，常见于把上线流水写进 current.md）、入口文件与 `current.md` 用反引号点名的路径或 `make` 目标不存在（被 gitignore 的路径、通配写法与首段不在仓库里的记法不报）。信息分层表写明 AGENTS.md 放"改动如何生效"，current.md 只留未收口的状态、已完成记录在提交信息里。

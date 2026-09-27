@@ -418,6 +418,7 @@ pub fn run_agent(
                 }
             } else {
                 t.store(true, Ordering::SeqCst);
+                crate::cleanup::record(&runpath, pid);
                 kill_group(pid, 5.0);
                 break;
             };

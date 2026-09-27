@@ -5,10 +5,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub fn all_runs() -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(runs_root()) else {
-        return vec![];
-    };
-    let mut v = entries
+    let mut roots = vec![runs_root()];
+    if let Some(old) = legacy_runs_root() {
+        roots.push(old);
+    }
+    let mut v = roots
+        .into_iter()
+        .filter_map(|root| fs::read_dir(root).ok())
+        .flatten()
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.join("meta.json").is_file())
@@ -29,8 +33,11 @@ pub fn resolve(reference: &str) -> Res<PathBuf> {
             .cloned()
             .ok_or_else(|| format!("no runs under {}", root.display()));
     }
-    if root.join(reference).join("meta.json").is_file() {
-        return Ok(root.join(reference));
+    if let Some(exact) = runs
+        .iter()
+        .find(|p| p.file_name().is_some_and(|name| name == reference))
+    {
+        return Ok(exact.clone());
     }
     let named = runs
         .iter()
@@ -188,6 +195,8 @@ pub fn status(run: &Path) -> Value {
             "queuedSeconds",
             "graceSeconds",
             "tokens",
+            "cleanup",
+            "warnings",
             "warning",
             "error",
         ] {

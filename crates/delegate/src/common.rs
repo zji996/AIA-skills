@@ -131,7 +131,14 @@ pub fn runs_root() -> PathBuf {
         }
     }
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    git_top(&cwd).unwrap_or(cwd).join(".local/run/pi")
+    git_top(&cwd).unwrap_or(cwd).join(".local/run/delegate")
+}
+pub fn legacy_runs_root() -> Option<PathBuf> {
+    if !setting("RUNS", "").is_empty() {
+        return None;
+    }
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    Some(git_top(&cwd).unwrap_or(cwd).join(".local/run/pi"))
 }
 pub fn read(path: impl AsRef<Path>) -> String {
     fs::read_to_string(path).unwrap_or_default()
@@ -317,6 +324,7 @@ pub fn shell_quote(s: &str) -> String {
 pub fn run_shell(
     command: &str,
     cwd: &Path,
+    run: &Path,
     extra: &Value,
     timeout: f64,
     log: &mut File,
@@ -330,7 +338,8 @@ pub fn run_shell(
         .stdout(log.try_clone().map_err(|e| e.to_string())?)
         .stderr(Stdio::from(log.try_clone().map_err(|e| e.to_string())?));
     clean_env(&mut c, extra);
-    c.env("DELEGATE_LANE_HELD", "1");
+    c.env("DELEGATE_LANE_HELD", "1")
+        .env("DELEGATE_RUN_DIR", run);
     group(&mut c);
     let mut child = c.spawn().map_err(|e| e.to_string())?;
     let pid = child.id() as i32;
@@ -356,6 +365,7 @@ pub fn run_shell(
         let _ = tx.send(());
     });
     let timed = rx.recv_timeout(Duration::from_secs_f64(timeout)).is_err();
+    crate::cleanup::record(run, pid);
     end_group(pid, if timed { 5.0 } else { 2.0 });
     if let Some(h) = holder {
         h.store(0, std::sync::atomic::Ordering::SeqCst);

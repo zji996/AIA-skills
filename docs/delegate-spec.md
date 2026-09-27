@@ -67,7 +67,8 @@
 | `--read-only` | 否 | §5 |
 | `--in-place` | 否 | 仅与 `--read-only` 同用，与 `--worktree` 互斥 |
 | `--worktree` | 否 | 需要 git 仓库 |
-| `--accept <命令>` | — | shell 命令 |
+| `--accept <命令>` | `.delegate.json` 顶层 `accept`（仅写入） | shell 命令；显式参数覆盖默认 |
+| `--no-accept` | 否 | 禁用仓库默认验收；reply 中取消继承的验收 |
 | `--hide-accept` | 否 | 不在说明中附验收命令 |
 | `--accept-timeout` | `10m` | 自取得 lane 名额起计 |
 | `--timeout` | pi `15m`，codex `30m` | 每次尝试；§9.2 |
@@ -99,6 +100,8 @@
 | `changes{files,added,deleted,after}` | 快照成功 | `after` 为结束快照 tree |
 | `shape{dirs,largest,config,removed,*More?}` | 写入任务、快照有改动 | `dirs` 按前两级目录汇总增删行；`largest` 为改后文本文件总行数；`config` 为依赖清单、锁文件、构建与 CI 配置路径；`removed` 为删除路径。各列表默认最多 5 项，`DELEGATE_SHAPE_LIMIT` 可调（1–20），`dirsMore` 等字段为未显示项数。`changes` 仍表示整体总数，完整逐文件 diff 见 `changes.json` |
 | `accept{command,ok,exitCode,tail?,queuedSeconds?}` | 执行过验收 | `tail` 为失败输出末 1500 字符 |
+| `cleanup{terminated,ports,commands}` | 结束时清理过后台进程 | 清理数量、监听 TCP 端口及带 PID 的截短命令 |
+| `warnings` | worktree 的 link/copy 源缺失或为空 | 警告字符串数组；`wait` 也显示 |
 | `readOnlyViolation` | 只读 run 在自己的 worktree 中改了文件 | 文件列表 |
 | `workspaceChanged` | `--in-place` 只读 run 期间工作区有变化 | 文件列表；无法归属 |
 | `protectViolation` | 改动命中受保护路径 | 排序后的仓库相对路径列表 |
@@ -127,7 +130,7 @@
  config: Cargo.toml
  removed: apps/api/old.rs
 ===== result: <run> (<字符数> chars) =====
-<答复；超过 DELEGATE_RESULT_CHARS 只显示末尾，并注明全文路径>
+<答复；超过 DELEGATE_RESULT_CHARS 显示开头约 2/3 与结尾约 1/3，并注明省略字数及全文路径>
 ===== end: <run> =====
 ```
 
@@ -290,7 +293,7 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 
 ### 9.1 验收与 setup 命令（必须）
 
-`sh -c` 执行，独立进程组，stdin 为 `/dev/null`，stdout+stderr 写日志。环境：去掉保护变量、叠加 `env`、设 `DELEGATE_LANE_HELD=1`。命令结束或超时后，**在回收 shell 之前**结束整个进程组（SIGTERM，宽限后 SIGKILL，存活判断排除僵尸），避免后台残留，且 PGID 不会被复用。超时退出码记 124，日志追加 `[accept timed out]` 与 `[exit N]`。
+`sh -c` 执行，独立进程组，stdin 为 `/dev/null`，stdout+stderr 写日志。环境：去掉保护变量、叠加 `env`、设 `DELEGATE_LANE_HELD=1` 与 `DELEGATE_RUN_DIR`。命令结束或超时后，**在回收 shell 之前**结束整个进程组（SIGTERM，宽限后 SIGKILL，存活判断排除僵尸），并按同 UID 的 `/proc/<pid>/environ` 清理逃出进程组的进程。超时退出码记 124，日志追加 `[accept timed out]` 与 `[exit N]`。
 
 ### 9.2 同事超时（必须）
 
@@ -322,7 +325,7 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 
 ## 11. 文件与目录
 
-run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git 根下的 `.local/run/pi/`（不在仓库中则为当前目录下），首次创建时写入内容为 `*` 的 `.gitignore`；run 目录 `<YYYYmmdd-HHMMSS>-<slug>[-<4 hex>]`，权限 700。`<state>` 为 `${XDG_STATE_HOME:-~/.local/state}/delegate`，**不得**提供环境变量覆盖。
+run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git 根下的 `.local/run/delegate/`（不在仓库中则为当前目录下）；按名字/ID 也查找旧 `.local/run/pi/`。首次创建时写入内容为 `*` 的 `.gitignore`；run 目录 `<YYYYmmdd-HHMMSS>-<slug>[-<4 hex>]`，权限 700。`<state>` 为 `${XDG_STATE_HOME:-~/.local/state}/delegate`，**不得**提供环境变量覆盖。
 
 | 文件 | 写入者 | 内容 |
 |---|---|---|
@@ -332,6 +335,7 @@ run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git �
 | `events.jsonl` `stderr.log` `supervisor.log` | supervisor | §7.2 / 同事 stderr / supervisor 输出 |
 | `result.md` | supervisor | 最后一轮完整答复 |
 | `summary.json` | supervisor | §3.1 中结束后的字段 |
+| `cleanup.json` | supervisor | 已清理进程的 PID、命令与监听 TCP 端口 |
 | `changes.json` `changes.patch` | supervisor | §6.2 |
 | `accept.log` `setup.log` | supervisor | 命令、输出、`[exit N]` |
 | `lane-wait` `lane-waiting-<pid>` | lane | §8 |

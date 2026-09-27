@@ -65,7 +65,7 @@ fi
 runs=()
 declare -A unmerged=()
 shopt -s nullglob
-for meta in .local/run/pi/*/meta.json; do
+for meta in .local/run/delegate/*/meta.json .local/run/pi/*/meta.json; do
   dir="$(dirname "$meta")"
   if [[ ! -f "$dir/exit_code" ]]; then
     runs+=("$(basename "$dir") 可能仍在运行")

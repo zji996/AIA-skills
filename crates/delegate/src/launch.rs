@@ -146,6 +146,10 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--in-place" => o.in_place = true,
                 "--worktree" => o.worktree = true,
                 "--hide-accept" => o.hide_accept = true,
+                "--no-accept" => {
+                    o.accept_set = true;
+                    o.accept = None;
+                }
                 "--allow-parallel-writes" => o.parallel = true,
                 "--fresh" => o.fresh = true,
                 "--sync" if reply => o.sync = true,
@@ -431,25 +435,15 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     normalize_protect(&mut o.protect)?;
     let mut extra = json!({"env":{}});
     if let Some(top) = &repo {
-        let (env, cfg) = worktree::config(top)?;
+        let (env, cfg, default_accept) = worktree::config(top)?;
         extra["env"] = env;
+        if !o.read_only && !o.accept_set {
+            o.accept = default_accept;
+        }
         if let Some(upstream) = &in_run {
             let prior = json(upstream.join("meta.json"));
             extra["worktree"] = json!({"source":s(&prior["worktree"],"path"),"sourceWorkdir":s(&prior,"workdir"),"config":cfg,"in":upstream});
         } else if o.worktree || (o.read_only && !o.in_place) {
-            for key in ["copy", "link"] {
-                if let Some(items) = cfg[key].as_array() {
-                    for item in items.iter().filter_map(Value::as_str) {
-                        let source = top.join(item);
-                        if !source.exists() && !source.is_symlink() {
-                            eprintln!(
-                                "delegate: worktree source missing, skipping {}",
-                                source.display()
-                            );
-                        }
-                    }
-                }
-            }
             extra["worktree"] = json!({"source":top,"sourceWorkdir":workdir,"config":cfg});
         }
     }
@@ -689,6 +683,42 @@ pub fn capacity(agent: &str, active_runs: &[PathBuf]) -> Res<()> {
     }
     Ok(())
 }
+fn tree_source_warnings(extra: &Value) -> Vec<String> {
+    let tree = &extra["worktree"];
+    if !tree.is_object() || !tree["in"].is_null() {
+        return Vec::new();
+    }
+    let source = Path::new(s(tree, "source"));
+    let mut warnings = Vec::new();
+    for key in ["copy", "link"] {
+        if let Some(items) = tree["config"][key].as_array() {
+            for item in items.iter().filter_map(Value::as_str) {
+                let path = source.join(item);
+                let empty = path.is_dir()
+                    && fs::read_dir(&path).is_ok_and(|mut entries| entries.next().is_none());
+                if empty {
+                    let gitlink = git(source, &["ls-files", "-s", "--", item])
+                        .is_ok_and(|out| out.starts_with(b"160000 "));
+                    warnings.push(format!(
+                        "worktree.{key} source is empty{}: {}",
+                        if gitlink {
+                            " (uninitialized submodule)"
+                        } else {
+                            ""
+                        },
+                        path.display()
+                    ));
+                } else if !path.exists() && !path.is_symlink() {
+                    warnings.push(format!(
+                        "worktree.{key} source missing, skipping: {}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+    warnings
+}
 pub fn launch(
     mut o: Options,
     prompt: &str,
@@ -777,6 +807,13 @@ pub fn launch(
     }
     fs::create_dir(&run).map_err(|e| e.to_string())?;
     fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    let warnings = tree_source_warnings(extra);
+    if !warnings.is_empty() {
+        for warning in &warnings {
+            eprintln!("delegate: {warning}");
+        }
+        write_json(run.join("warnings.json"), &json!(warnings))?;
+    }
     let parent = &extra["parent"];
     let fork = extra
         .get("session")

@@ -58,6 +58,7 @@ fn accept(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
     let (code, timed) = run_shell(
         s(meta, "accept"),
         Path::new(s(meta, "workdir")),
+        run,
         &meta["env"],
         meta["acceptTimeoutSeconds"].as_f64().unwrap_or(600.0),
         &mut log,
@@ -455,6 +456,18 @@ fn inner(
             sum["error"] = json!(clip(&message, 600));
         }
     }
+    let pgid = read(run.join("agent.pid")).trim().parse().unwrap_or(0);
+    crate::cleanup::record(run, pgid);
+    if pgid > 0 && group_members(pgid) {
+        end_group(pgid, 2.0);
+    }
+    if let Some(cleanup) = crate::cleanup::summary(run) {
+        sum["cleanup"] = cleanup;
+    }
+    let warnings = json(run.join("warnings.json"));
+    if warnings.is_array() && !warnings.as_array().unwrap().is_empty() {
+        sum["warnings"] = warnings;
+    }
     write_json(run.join("summary.json"), &sum)?;
     write(
         run.join("exit_code"),
@@ -467,10 +480,16 @@ fn inner(
     Ok(())
 }
 fn finish_skipped(run: &Path, reason: &str) -> Res<()> {
-    write_json(
-        run.join("summary.json"),
-        &json!({"state":"skipped","error":reason}),
-    )?;
+    crate::cleanup::record(run, 0);
+    let mut summary = json!({"state":"skipped","error":reason});
+    if let Some(cleanup) = crate::cleanup::summary(run) {
+        summary["cleanup"] = cleanup;
+    }
+    let warnings = json(run.join("warnings.json"));
+    if warnings.as_array().is_some_and(|items| !items.is_empty()) {
+        summary["warnings"] = warnings;
+    }
+    write_json(run.join("summary.json"), &summary)?;
     write(run.join("exit_code"), "1\n")
 }
 fn wait_for_run(run: &Path) {
@@ -560,6 +579,7 @@ pub fn supervise(run: &Path) -> Res<()> {
     let stop_waiter: StopWaiter = Arc::new(Mutex::new(None));
     let h = holder.clone();
     let waiter = stop_waiter.clone();
+    let runpath = run.to_path_buf();
     std::thread::spawn(move || {
         let mut byte = [0];
         if signals.read_exact(&mut byte).is_ok() {
@@ -571,6 +591,7 @@ pub fn supervise(run: &Path) -> Res<()> {
             lane::wake_lane_waiter_after_stop();
             let pid = h.load(Ordering::SeqCst);
             if pid > 0 {
+                crate::cleanup::record(&runpath, pid);
                 kill_group(pid, 5.0);
             }
         }
@@ -578,10 +599,20 @@ pub fn supervise(run: &Path) -> Res<()> {
     if let Err(e) = inner(run, holder, grace, &stop_waiter) {
         let _ = append(run.join("stderr.log"), &format!("supervisor error: {e}\n"));
         if !run.join("exit_code").exists() {
-            let _ = write_json(
-                run.join("summary.json"),
-                &json!({"state":"failed","error":clip(&e,600)}),
-            );
+            let pgid = read(run.join("agent.pid")).trim().parse().unwrap_or(0);
+            crate::cleanup::record(run, pgid);
+            if pgid > 0 && group_members(pgid) {
+                end_group(pgid, 2.0);
+            }
+            let mut summary = json!({"state":"failed","error":clip(&e,600)});
+            if let Some(cleanup) = crate::cleanup::summary(run) {
+                summary["cleanup"] = cleanup;
+            }
+            let warnings = json(run.join("warnings.json"));
+            if warnings.as_array().is_some_and(|items| !items.is_empty()) {
+                summary["warnings"] = warnings;
+            }
+            let _ = write_json(run.join("summary.json"), &summary);
             let _ = write(run.join("exit_code"), "1\n");
         }
     }

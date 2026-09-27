@@ -9,7 +9,8 @@ const LAUNCH: &[(&str, &str)] = &[
     ("--image PATH", "Attach an image; repeatable, supported by both agents."),
     ("--read-only", "No writes: isolated agents are instructed and checked; Pi uses read-only tools without isolation. In git, reads a worktree snapshot by default."),
     ("--in-place", "Read-only: read the working tree instead of a snapshot."),
-    ("--accept COMMAND", "Shell command run in the workdir after the agent; exit 0 means delivered."),
+    ("--accept COMMAND", "Shell command run after a write task; overrides .delegate.json accept."),
+    ("--no-accept", "Disable the repository's default acceptance command."),
     ("--protect PATH", "Protect a repository-relative file or directory prefix (trailing /); repeatable. Changes reject the run before acceptance."),
     ("--hide-accept", "Keep the acceptance command from the agent for blind verification."),
     ("--accept-timeout DURATION", "Acceptance command limit (default: 10m)."),
@@ -30,7 +31,7 @@ const COLLECT: &[(&str, &str)] = &[
         "Stop waiting after this long; exit 75 if still running.",
     ),
     ("--progress", "Also print writes, errors, and retries."),
-    ("--full", "Print the whole answer instead of its tail."),
+    ("--full", "Print the whole answer instead of the abbreviated head and tail."),
 ];
 
 const REPLY: &[(&str, &str)] = &[
@@ -41,6 +42,7 @@ const REPLY: &[(&str, &str)] = &[
     ("--name NAME", "Short label in the new run id."),
     ("--image PATH", "Attach an image; repeatable."),
     ("--accept COMMAND", "Replace the parent's acceptance command; '' removes it."),
+    ("--no-accept", "Remove the parent's acceptance command."),
     ("--protect", "Protected paths are inherited from the previous run and cannot be changed in reply."),
     ("--hide-accept", "Keep the acceptance command from the agent."),
     ("--accept-timeout DURATION", "Acceptance command limit (default: 10m)."),
@@ -104,7 +106,7 @@ pub fn print(command: Option<&str>) -> bool {
         println!(
             "Exit: 0 delivered/answered, 1 other finished, 2 usage, 75 still running at --max."
         );
-        println!("Runs: $DELEGATE_RUNS or <git root of cwd>/.local/run/pi.");
+        println!("Runs: $DELEGATE_RUNS or <git root of cwd>/.local/run/delegate (old .local/run/pi runs remain readable).");
         return true;
     };
     let (usage, description, rows): (&str, &str, &[(&str, &str)]) = match command {

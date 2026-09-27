@@ -248,6 +248,7 @@ class DelegateTests(unittest.TestCase):
                                       "task"))
         self.assertEqual(state["state"], "delivered")
         self.assertGreaterEqual(state["accept"]["queuedSeconds"], 1)
+        self.assertGreaterEqual(state["cleanup"]["terminated"], 1)
         self.assertIn(f"{DELEGATE} lane 'sleep 30 & echo $! > bg.pid; true'",
                       (Path(state["dir"]) / "prompt.md").read_text())
         pid = int((self.work / "bg.pid").read_text())
@@ -255,6 +256,7 @@ class DelegateTests(unittest.TestCase):
         state = self.outcome(self.cli("run", "--accept", "sleep 30 & echo $! > bg.pid; wait", "--accept-timeout", "1",
                                       "task"))
         self.assertEqual((state["state"], state["accept"]["exitCode"]), ("rejected", 124))
+        self.assertGreaterEqual(state["cleanup"]["terminated"], 1)
         self.assertIn("[accept timed out]", state["accept"]["tail"])
         pid = int((self.work / "bg.pid").read_text())
         self.until(lambda: not Path(f"/proc/{pid}").exists(), "the timed-out check's group to go")
@@ -332,6 +334,106 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual((tree / "reply.env").read_text(), "[]\n")  # a reply keeps its conversation's env
         (repo / ".delegate.json").write_text(json.dumps({"env": {"X": 1}}))
         self.assertIn("env must map names to strings", self.cli("run", "--workdir", repo, "task").stderr)
+
+    def detached_server(self, label):
+        script = self.work / "server.py"
+        script.write_text("import os, socket, sys, time\n"
+                          "sock = socket.socket()\n"
+                          "sock.bind(('127.0.0.1', 0))\n"
+                          "sock.listen()\n"
+                          "open(sys.argv[1] + '.pid', 'w').write(str(os.getpid()))\n"
+                          "open(sys.argv[1] + '.port', 'w').write(str(sock.getsockname()[1]))\n"
+                          "time.sleep(60)\n")
+        prefix = self.work / label
+        self.addCleanup(lambda: os.kill(int(Path(str(prefix) + ".pid").read_text()), signal.SIGKILL)
+                        if Path(str(prefix) + ".pid").exists() and not process_gone(str(prefix) + ".pid") else None)
+        return f"setsid python3 {shlex.quote(str(script))} {shlex.quote(str(prefix))} >/dev/null 2>&1 & sleep .3"
+
+    def test_detached_agent_server_is_reported_and_terminated(self):
+        command = self.detached_server("agent-server")
+        self.fake_pi([answer("preview at localhost"), SETTLED], pre=command)
+        result = self.cli("run", "task")
+        state = self.outcome(result)
+        port = int((self.work / "agent-server.port").read_text())
+        self.assertGreaterEqual(state["cleanup"]["terminated"], 1)
+        self.assertIn(port, state["cleanup"]["ports"])
+        self.assertTrue(any("server.py" in command for command in state["cleanup"]["commands"]))
+        self.assertIn(f"端口 {port}", result.stdout)
+        self.assertTrue(process_gone(self.work / "agent-server.pid"))
+
+    def test_timeout_and_stop_clean_detached_processes(self):
+        self.env["DELEGATE_TIMEOUT_GRACE"] = "0"
+        timeout_command = self.detached_server("timeout-server")
+        self.fake_pi([answer("too late"), SETTLED], pre=timeout_command, sleep=30)
+        timed = self.outcome(self.cli("run", "--timeout", "1", "task"))
+        self.assertEqual(timed["state"], "timeout")
+        self.assertGreaterEqual(timed["cleanup"]["terminated"], 1)
+        self.assertTrue(process_gone(self.work / "timeout-server.pid"))
+
+        stop_command = self.detached_server("stop-server")
+        self.fake_pi([answer("too late"), SETTLED], pre=stop_command, sleep=30)
+        started = self.outcome(self.cli("start", "--name", "stopper", "task"))
+        self.until(lambda: (self.work / "stop-server.port").exists(), "detached stop server")
+        stopped = self.outcome(self.cli("stop", started["run"]))
+        self.assertEqual(stopped["state"], "stopped")
+        self.assertGreaterEqual(stopped["cleanup"]["terminated"], 1)
+        self.assertTrue(process_gone(self.work / "stop-server.pid"))
+
+    def test_setup_and_accept_detached_processes_are_cleaned(self):
+        repo = self.repo({"a.txt": "a\n"})
+        setup = self.detached_server("setup-server")
+        accept = self.detached_server("accept-server")
+        (repo / ".delegate.json").write_text(json.dumps({"worktree": {"setup": [setup + '; test -n "$DELEGATE_RUN_DIR"']}}))
+        self.fake_pi([answer("done"), SETTLED])
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo,
+                                      "--accept", accept + '; test -n "$DELEGATE_RUN_DIR"', "task"))
+        self.assertEqual(state["state"], "delivered")
+        self.assertGreaterEqual(state["cleanup"]["terminated"], 2)
+        for label in ("setup-server", "accept-server"):
+            self.assertIn(int((self.work / f"{label}.port").read_text()), state["cleanup"]["ports"])
+            self.assertTrue(process_gone(self.work / f"{label}.pid"))
+
+    def test_empty_copy_and_uninitialized_gitlink_report_warnings(self):
+        repo = self.repo({"a.txt": "a\n"})
+        (repo / "empty").mkdir()
+        (repo / "module").mkdir()
+        head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        subprocess.run(["git", "-C", str(repo), "update-index", "--add", "--cacheinfo",
+                        f"160000,{head},module"], check=True)
+        (repo / ".delegate.json").write_text(json.dumps({"worktree": {"copy": ["empty"], "link": ["module"]}}))
+        self.fake_pi([answer("done"), SETTLED])
+        result = self.cli("run", "--worktree", "--workdir", repo, "task")
+        state = self.outcome(result)
+        warnings = state["warnings"]
+        self.assertEqual(len(warnings), 2)
+        self.assertTrue(any("uninitialized submodule" in warning for warning in warnings))
+        self.assertIn("worktree.copy source is empty", result.stderr)
+        self.assertIn("warning: worktree.link source is empty", result.stdout)
+        self.assertEqual(json.loads((Path(state["dir"]) / "summary.json").read_text())["warnings"], warnings)
+        self.assertTrue((repo / "module").is_dir())
+
+    def test_repository_default_accept_applies_only_to_writes(self):
+        repo = self.repo({"a.txt": "a\n"})
+        (repo / ".delegate.json").write_text(json.dumps({"accept": "test -n \"$DELEGATE_RUN_DIR\" && touch accepted"}))
+        self.fake_pi([answer("done"), SETTLED])
+        default = self.outcome(self.cli("run", "--workdir", repo, "task"))
+        self.assertEqual(default["state"], "delivered")
+        self.assertTrue((repo / "accepted").exists())
+        self.assertIn("touch accepted", (Path(default["dir"]) / "prompt.md").read_text())
+        isolated = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        self.assertEqual(isolated["state"], "delivered")
+        self.assertEqual(isolated["accept"]["command"], "test -n \"$DELEGATE_RUN_DIR\" && touch accepted")
+        self.assertTrue((Path(isolated["worktree"]) / "accepted").exists())
+        override = self.outcome(self.cli("run", "--workdir", repo, "--accept", "true", "task"))
+        self.assertEqual(override["accept"]["command"], "true")
+        disabled = self.outcome(self.cli("run", "--workdir", repo, "--no-accept", "task"))
+        self.assertEqual(disabled["state"], "answered")
+        self.assertNotIn("accept", disabled)
+        read_only = self.outcome(self.cli("run", "--workdir", repo, "--read-only", "task"))
+        self.assertEqual(read_only["state"], "answered")
+        self.assertNotIn("accept", read_only)
+        (repo / ".delegate.json").write_text('{"accept": 3}')
+        self.assertIn("accept must be a string", self.cli("run", "--workdir", repo, "task").stderr)
 
     def test_leaked_tool_call_is_rerun_once(self):
         self.fake_pi([answer(LEAKED), SETTLED], [answer("real answer"), SETTLED])
@@ -455,7 +557,7 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("real answer", result.stdout)
         result = self.cli("wait", "--all")
-        self.assertIn("showing the last 6000 chars", result.stdout)
+        self.assertIn("省略 1212 字符", result.stdout)
         self.assertTrue(result.stdout.split("===== end")[0].rstrip().endswith("real answer"))
         self.assertLess(len(result.stdout), 8000)
         self.assertIn("draft draft", self.cli("wait", "last", "--full").stdout)
@@ -481,7 +583,7 @@ class DelegateTests(unittest.TestCase):
         self.fake_pi([answer("x" * 50), SETTLED])
         self.env["DELEGATE_RESULT_CHARS"] = "10"
         run = Path(json.loads(self.cli("start", "--name", "long", "task").stdout)["dir"])
-        self.assertIn("showing the last 10 chars", self.cli("wait", "long").stdout)
+        self.assertIn("省略 41 字符", self.cli("wait", "long").stdout)
         self.assertIn("only shown truncated", self.cli("clean", "--finished").stderr)
         self.assertTrue(run.exists())
         os.utime(run / "exit_code", (1, 1))
@@ -507,9 +609,38 @@ class DelegateTests(unittest.TestCase):
         del self.env["DELEGATE_RUNS"]
         self.fake_pi([answer("ok"), SETTLED])
         state = self.outcome(self.cli("run", "--read-only", "task", cwd=repo / "sub"))
-        self.assertTrue(state["dir"].startswith(str(repo / ".local/run/pi/")))
-        self.assertEqual((repo / ".local/run/pi/.gitignore").read_text(), "*\n")
+        self.assertTrue(state["dir"].startswith(str(repo / ".local/run/delegate/")))
+        self.assertEqual((repo / ".local/run/delegate/.gitignore").read_text(), "*\n")
         self.assertEqual(oct(Path(state["dir"]).stat().st_mode & 0o777), "0o700")
+
+    def test_old_default_run_directory_remains_resolvable(self):
+        repo = self.repo({"a.txt": "a\n"})
+        del self.env["DELEGATE_RUNS"]
+        self.fake_pi([answer("old answer"), SETTLED])
+        state = self.outcome(self.cli("run", "--read-only", "--name", "legacy", "task", cwd=repo))
+        old = repo / ".local/run/pi" / state["run"]
+        old.parent.mkdir(parents=True)
+        shutil.move(state["dir"], old)
+        meta = json.loads((old / "meta.json").read_text())
+        meta["dir"] = str(old)
+        (old / "meta.json").write_text(json.dumps(meta))
+        self.assertEqual(self.outcome(self.cli("status", "legacy", cwd=repo))["dir"], str(old))
+        self.assertIn("old answer", self.cli("result", state["run"], cwd=repo).stdout)
+        self.assertIn("old answer", self.cli("wait", "legacy", cwd=repo).stdout)
+        self.assertEqual(self.cli("diff", "legacy", cwd=repo).returncode, 0)
+        self.assertEqual(self.cli("clean", state["run"], cwd=repo).returncode, 0)
+        self.assertFalse(old.exists())
+
+    def test_long_unicode_answer_keeps_head_and_tail(self):
+        self.env["DELEGATE_RESULT_CHARS"] = "12"
+        self.fake_pi([answer("开" * 8 + "中" * 20 + "终" * 4), SETTLED])
+        result = self.cli("run", "--read-only", "task")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("开" * 8, result.stdout)
+        self.assertIn("终" * 3, result.stdout)
+        self.assertNotIn("中" * 2, result.stdout)
+        self.assertIn("省略 21 字符", result.stdout)  # result.md includes its final newline
+        self.assertIn("中" * 20, self.cli("result", "last").stdout)
 
     def test_invalid_arguments_are_usage_errors(self):
         self.fake_pi([answer("ok"), SETTLED])

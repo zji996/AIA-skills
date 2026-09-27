@@ -8,7 +8,7 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub fn config(top: &Path) -> Res<(Value, Value)> {
+pub fn config(top: &Path) -> Res<(Value, Value, Option<String>)> {
     let path = top.join(".delegate.json");
     let val = if path.is_file() {
         let v: Value = serde_json::from_str(&read(&path))
@@ -28,6 +28,11 @@ pub fn config(top: &Path) -> Res<(Value, Value)> {
     if !env.is_object() || !env.as_object().unwrap().iter().all(|(_, v)| v.is_string()) {
         return Err(format!("{}: env must map names to strings", path.display()));
     }
+    let accept = match val.get("accept") {
+        None => None,
+        Some(Value::String(command)) => Some(command.clone()),
+        _ => return Err(format!("{}: accept must be a string", path.display())),
+    };
     let work = val
         .get("worktree")
         .filter(|x| !x.is_null())
@@ -80,7 +85,7 @@ pub fn config(top: &Path) -> Res<(Value, Value)> {
             })
             .collect::<Vec<_>>());
     }
-    Ok((env, out))
+    Ok((env, out, accept))
 }
 fn strings(v: &Value) -> Vec<String> {
     v.as_array()
@@ -258,7 +263,7 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<Option<String>> {
     for command in setup {
         writeln!(file, "$ {command}").map_err(|e| e.to_string())?;
         file.flush().map_err(|e| e.to_string())?;
-        let (code, _) = run_shell(&command, &path, &env, timeout, &mut file, None)?;
+        let (code, _) = run_shell(&command, &path, run, &env, timeout, &mut file, None)?;
         writeln!(file, "[exit {code}]").map_err(|e| e.to_string())?;
         if code != 0 {
             return Ok(Some(format!(

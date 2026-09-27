@@ -1,5 +1,6 @@
 mod agents;
 mod changes;
+mod cleanup;
 mod common;
 mod help;
 mod lane;
@@ -42,6 +43,8 @@ fn status_line(run: &Path) -> String {
         "queuedSeconds",
         "graceSeconds",
         "tokens",
+        "cleanup",
+        "warnings",
         "warning",
         "error",
         "last",
@@ -101,7 +104,7 @@ fn value<'a>(kv: &'a [(String, String)], key: &str) -> Option<&'a str> {
         .find(|(k, _)| k == key)
         .map(|(_, v)| v.as_str())
 }
-/// Returns true when only the tail of the answer was shown.
+/// Returns true when the answer was abbreviated.
 fn print_answer(run: &Path, full: bool) -> bool {
     let result = read(run.join("result.md"));
     let limit = setting("RESULT_CHARS", "6000")
@@ -116,16 +119,17 @@ fn print_answer(run: &Path, full: bool) -> bool {
     if !truncated {
         println!("{}", result.trim_end_matches('\n'));
     } else {
-        let tail = result
+        let head_len = (limit * 2).div_ceil(3);
+        let tail_len = limit - head_len;
+        let head: String = result.chars().take(head_len).collect();
+        let tail: String = result
             .chars()
-            .rev()
-            .take(limit)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect::<String>();
+            .skip(result.chars().count() - tail_len)
+            .collect();
         println!(
-            "[showing the last {limit} chars; full answer: {}]\n...{}",
+            "{}\n[… 省略 {} 字符；完整答复: {}]\n{}",
+            head.trim_end_matches('\n'),
+            result.chars().count() - limit,
             run.join("result.md").display(),
             tail.trim_end_matches('\n')
         );
@@ -239,6 +243,32 @@ fn collect(
         }
         changes::print_changes(run);
         changes::print_shape(run);
+        let summary = json(run.join("summary.json"));
+        if let Some(cleanup) = summary.get("cleanup") {
+            let ports = cleanup["ports"]
+                .as_array()
+                .map(|v| {
+                    v.iter()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            println!(
+                "note: 任务结束时终止了 {} 个后台进程{}；答复中提到的服务/地址已不可用",
+                cleanup["terminated"],
+                if ports.is_empty() {
+                    String::new()
+                } else {
+                    format!("（端口 {ports}）")
+                }
+            );
+        }
+        if let Some(warnings) = summary["warnings"].as_array() {
+            for warning in warnings {
+                println!("warning: {}", warning.as_str().unwrap_or(""));
+            }
+        }
         let has_result = run.join("result.md").is_file();
         if has_result && show_result {
             // A truncated answer counts as reported, but clean keeps it until read in full.
@@ -320,6 +350,7 @@ fn stop(args: &[String]) -> Res<i32> {
                 .trim()
                 .parse::<i32>()
                 .unwrap_or(0);
+            cleanup::record(&run, pid);
             kill_group(pid, 1.0);
         }
         if runs::active(&old) {
@@ -339,10 +370,16 @@ fn stop(args: &[String]) -> Res<i32> {
                 for file in ["agent.pid", "pi.pid", "pid"] {
                     let pid = read(run.join(file)).trim().parse::<i32>().unwrap_or(0);
                     if pid > 0 {
+                        cleanup::record(&run, pid);
                         kill_group(pid, 1.0);
                     }
                 }
-                write_json(run.join("summary.json"), &json!({"state":"stopped"}))?;
+                cleanup::record(&run, 0);
+                let mut sum = json!({"state":"stopped"});
+                if let Some(cleanup) = cleanup::summary(&run) {
+                    sum["cleanup"] = cleanup;
+                }
+                write_json(run.join("summary.json"), &sum)?;
                 write(run.join("exit_code"), "1\n")?;
             } else {
                 let mut sum = json(run.join("summary.json"));

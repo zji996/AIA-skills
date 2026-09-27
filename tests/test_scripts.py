@@ -270,6 +270,13 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("`AGENTS.md`", result.stdout)
         self.assertIn("?? AGENTS.md", result.stdout)
         self.assertIn("20260101-000000-review 已结束，结果未读取", result.stdout)
+        new_run = repo / ".local/run/delegate/20260102-000000-build"
+        new_run.mkdir(parents=True)
+        (new_run / "meta.json").write_text("{}")
+        (new_run / "exit_code").write_text("0")
+        self.assertIn("20260102-000000-build 已结束，结果未读取",
+                      self.run_script(SNAPSHOT, "--repo", repo).stdout)
+        (new_run / ".delivered").touch()
         (run / ".delivered").touch()
         self.assertNotIn("review", self.run_script(SNAPSHOT, "--repo", repo).stdout)
         tree = repo.parent / "wt"

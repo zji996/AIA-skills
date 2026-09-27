@@ -83,6 +83,7 @@ $D wait
 ```json
 {
   "env": {"CUDA_VISIBLE_DEVICES": ""},
+  "accept": "./scripts/check.sh && python3 -m unittest discover -s tests",
   "worktree": {
     "copy": [".env", ".local/scan"],
     "link": ["third_party/some-submodule", "models/weights"],
@@ -95,6 +96,8 @@ $D wait
 - `link` 适合只读的子模块与大目录（worktree 里子模块是空目录）；写入会落到原仓库。
 - `setup` 在重任务队列里执行；先在一个临时 worktree 里手动跑一遍，确认离线能装齐。
 - `env` 在原地运行时同样生效。
+- 顶层 `accept` 只作用于写入任务；显式 `--accept` 覆盖，`--no-accept` 关闭。并行写入用 `--protect` 划分文件所有权；验收覆盖相关 ratchet、contracts、docs 门禁，合并后再跑全量。
+- 强档并发紧时界面实现可用 `--tier cheap`；广度侦察限定目录与条目数，大范围按目录拆多路（单次可能 5–10 分钟、上百轮）。
 
 ## 常见坑
 
@@ -108,7 +111,7 @@ $D wait
 | 被拒绝：并发已满 / 内存不足 | 先 `wait` 收结果或 `stop` 不再需要的任务；不要调大上限绕过 |
 | 验收在高负载时超时 | 重检查已整机排队且排队不计时；仍超时说明命令本身慢，调大 `--accept-timeout` |
 | 同事读到的代码和你当前的不一样 | 只读任务读的是启动时的快照；你之后的修改它看不到，需要时重新放一个 |
-| 清理后找不到长报告的全文 | `wait` 只显示答复末尾 6000 字；5.3.2 起只看过截断答复的任务 `clean --finished` 默认保留。要留存就先 `result <name> > 文件`，或调大 `DELEGATE_RESULT_CHARS` |
+| 清理后找不到长报告的全文 | `wait` 显示答复头尾共 6000 字；只看过截断答复的任务 `clean --finished` 默认保留。要留存就先 `result <name> > 文件`，或调大 `DELEGATE_RESULT_CHARS` |
 | 便宜档给的配置键、参数名不存在 | 仓库外知识会被编造：要求附出处，并对照 schema、源码或 `--help` 核实后再采纳 |
 | 任务拆得太碎，开销比收益大 | 适合委派的粒度：有明确完成标准、约 10 分钟到 2 小时的工作量 |
 
