@@ -3,7 +3,7 @@ name: repo-governance
 description: 仓库上下文治理。当需要搭建或整理 AGENTS.md、docs/current.md、决策记录，或发现文档与代码对不上、上下文开始漂移时使用；附带只读审计脚本定位问题。Use for repo context governance, AGENTS.md setup, docs drift audit.
 license: MIT
 metadata:
-  version: "2.0.0"
+  version: "2.1.0"
 ---
 
 # Repo Governance (仓库上下文治理)
@@ -13,10 +13,11 @@ metadata:
 ## 先审计
 
 ```bash
-<本技能目录>/scripts/audit-context.py [--repo <dir>] [--max-agents-lines 150] [--stale-days 30]
+<本技能目录>/scripts/audit-context.py [--repo <dir>] [--max-agents-lines 150] [--stale-days 30] \
+    [--max-current-kb 8] [--max-dated-items 5]
 ```
 
-只读，每个问题输出一行 `WARN <文件>: <原因>`，有问题时退出码为 1。检查项：入口文件是否缺失或过长、`docs/current.md` 的下一步是否过多或长期未更新、`.local/` 是否被 gitignore、Markdown 相对链接是否断裂。根据结果决定要不要动文档，不要为了"齐全"而补文件。
+只读，每个问题输出一行 `WARN <文件>: <原因>`，有问题时退出码为 1。检查项：入口文件是否缺失或过长；`docs/current.md` 的下一步是否过多、是否长期未更新、体积是否超预算、是否堆积了带日期的条目；入口文件与 `current.md` 用反引号点名的路径和 `make` 目标是否存在；`.local/` 是否被 gitignore；Markdown 相对链接是否断裂。根据结果决定要不要动文档，不要为了"齐全"而补文件。
 
 ## 两条原则
 
@@ -27,8 +28,8 @@ metadata:
 
 | 位置 | 放什么 | 为什么放这里 |
 | --- | --- | --- |
-| `AGENTS.md`（或等价入口） | 项目目标、关键命令、验证入口、高风险禁区 | 每个会话都会自动加载，越短越不容易被忽略 |
-| `docs/current.md` | 当前焦点、阻塞项、≤5 条下一步 | 长任务的断点；条目一多就失去"下一步"的意义，完成即清理 |
+| `AGENTS.md`（或等价入口） | 项目目标、关键命令、验证入口、改动如何生效（重建、重启、迁移）、高风险禁区 | 每个会话都会自动加载，越短越不容易被忽略 |
+| `docs/current.md` | 当前焦点、阻塞项、≤5 条下一步，以及尚未收口的状态（未验证、已提交未生效、已知风险） | 长任务的断点，每个会话都读；已完成、已上线的记录在提交信息里，完成即清理 |
 | `docs/reference/` | 已验证的稳定架构事实 | 与规划混在一起会误导接手者，规划内容需标注 *Proposed* |
 | `docs/decision/` | 影响深远的选型、备选方案与理由 | 代码能说明"是什么"，说明不了"为什么没选别的" |
 | `docs/roadmap.md` | 长期方向与里程碑 | 与当前任务解耦，避免 `current.md` 膨胀 |

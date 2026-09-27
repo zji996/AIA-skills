@@ -4,6 +4,7 @@
 
 ### 技能
 
+- `repo-governance` 2.1.0：审计新增三项只读检查：`docs/current.md` 体积超预算（默认 8 KB）、带日期的条目过多（默认 5 条，常见于把上线流水写进 current.md）、入口文件与 `current.md` 用反引号点名的路径或 `make` 目标不存在（被 gitignore 的路径、通配写法与首段不在仓库里的记法不报）。信息分层表写明 AGENTS.md 放"改动如何生效"，current.md 只留未收口的状态、已完成记录在提交信息里。
 - `delegate` 5.4.0：`.delegate.json` 的 `worktree.copy` 明确支持复制被 git 忽略的文件与目录，缺源跳过并向 stderr 提示；`reply` 默认后台立即返回，`--wait` 显式等待结论；`reply --sync` 忽略未改变指针的 gitlink，保留对指针变化的冲突检查；写入任务结论从快照 diff 汇总目录、改后最大文件、配置路径与删除路径的 `shape`，列表有界且可调；用对话名引用时 `status`、`wait`、`result`、`diff`、`stop` 跟到最新一轮回复（与 `apply`、`reply` 一致），run id 仍精确指向该轮。
 - `delegate` 5.3.2：实战中发现并修复。`wait` 只显示了长答复的末尾时，run 记为 `.truncated`，`clean --finished` 与自动过期清理都保留它，并提示用 `result` 读全文（此前长报告读到一半就被清理，全文丢失）；完整打印或 `result` 成功写出全文后解除。SKILL.md 与 recipes 补充：便宜档在配置键、CLI 参数等仓库外事实上会编造，采纳前须对照一手来源核实。
 - `delegate` 5.3.1：实战中发现并修复。`clean` 按 worktree 自身的 `git-common-dir` 找到所属仓库再移除并 prune，不再依赖记录的来源路径；此前 `--in` 审查者的来源是上游 worktree，若先清理上游再清理审查者，审查者的 worktree 登记会残留在仓库里（`git worktree list` 显示 prunable）。

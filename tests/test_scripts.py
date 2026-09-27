@@ -1,5 +1,6 @@
 import base64
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -303,6 +304,31 @@ class ScriptTests(unittest.TestCase):
         (repo / "docs/current.md").write_text("# Next steps\n- one\n")
         result = self.run_script(AUDIT, "--repo", repo)
         self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_audit_context_reports_bloat_and_names_that_do_not_exist(self):
+        repo = self.git_repo()
+        (repo / ".gitignore").write_text(".local/\n")
+        (repo / "Makefile").write_text("check:\n\ttrue\ndev-up dev-down:\n\ttrue\n")
+        (repo / "src/pkg").mkdir(parents=True)
+        (repo / "src/pkg/mod.py").write_text("")
+        (repo / "docs/decision").mkdir(parents=True)
+        (repo / "docs/decision/0001-a.md").write_text("# a\n")
+        (repo / "AGENTS.md").write_text(
+            "Run `make check`, `make dev-up`, `make te-*` and `make gone`.\n"
+            "See `src/pkg/mod.py`, `pkg/mod.py`, `src/pkg/old.py`, `src/missing/`, `async/await`, `3/5`, "
+            "`.local/plan/plan.md`, `a/.../b`.\n"
+            "```bash\nmake vanished\n```\n")
+        (repo / "docs/current.md").write_text(
+            "# Now\nRead `decision/0001-a.md`.\n" + "".join(f"- 2026-01-0{i} shipped\n" for i in range(1, 8))
+            + "x" * 9 * 1024 + "\n")
+        out = self.run_script(AUDIT, "--repo", repo).stdout
+        self.assertIn("docs/current.md: 9 KB (> 8)", out)
+        self.assertIn("docs/current.md: 7 dated entries (> 5)", out)
+        missing = sorted(re.findall(r"names `([^`]+)`", out))
+        self.assertEqual(missing, ["make gone", "make vanished", "src/missing/", "src/pkg/old.py"])
+        out = self.run_script(AUDIT, "--repo", repo, "--max-current-kb", "16", "--max-dated-items", "10").stdout
+        self.assertNotIn("KB (>", out)
+        self.assertNotIn("dated entries", out)
 
     def image_server(self, status=200, data=None):
         handler = type("Response", (ImageHandler,), {
