@@ -4,6 +4,7 @@
 
 ### 技能
 
+- `delegate` 5.3.1：实战中发现并修复。`clean` 按 worktree 自身的 `git-common-dir` 找到所属仓库再移除并 prune，不再依赖记录的来源路径；此前 `--in` 审查者的来源是上游 worktree，若先清理上游再清理审查者，审查者的 worktree 登记会残留在仓库里（`git worktree list` 显示 prunable）。
 - `delegate` 5.3.0：两项易用性改进。`reply --sync`：续接前把主控在任务启动后的改动（比如新写的测试）三方合并进对话的 worktree，冲突则停下、不启动同事；同步来的文件不算同事的改动，之后的 `apply` 也不会重复合并它们（此前只能另起任务）。`wait --machine`：从整机登记收取所有仓库中运行中或等待中的任务（此前每个仓库要各放一个 `wait`）。
 - `delegate` 5.2.1：在真实任务中使用 5.2.0 时发现并修复。**分轮合并**：同一对话已合并过一轮后，再次 `apply` 以上次合入的状态为基准，只合并新增的改动（此前第二轮改到第一轮新加的行就会整体冲突）。**`--in`** 的快照排除上游的 link/copy 路径，审查者不再看到子模块变成符号链接的假改动。等待容量改为事件唤醒，不再每 200 ms 醒一次。
 - `delegate` 5.2.0：**编排**——主控声明"先 A 后 B"，由 delegate 执行，每一步仍是一层委派、结果都回到主控。`--after <run>`：立即创建 `waiting` 的 run，上游以 delivered/answered 结束后执行（阻塞在上游生命周期锁上），否则以 `skipped` 结束；等待期间不占名额，上游答复与改动的路径自动附在说明末尾。`--in <run>`：只读地在上游 worktree 的快照里工作（`git diff HEAD` 即上游改动），绝不改动上游。`reply --agent/--tier`：同一 worktree 换一位同事接着做。`.delegate.json` 的 `generated`：生成文件不参与三方合并，`apply` 后在源仓库重新生成，让都改契约的任务也能并行。任务名可按完全匹配的名称引用（`impl` 不再与 `impl-review` 冲突）。SKILL.md 的经验建议加入两种常用编排写法。

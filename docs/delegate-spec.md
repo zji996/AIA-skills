@@ -209,7 +209,7 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 - 起点：`commit-tree <起始快照> [-p HEAD]`（作者 `delegate <delegate@localhost>`），`git worktree add --detach`。
 - `--workdir` 为子目录时，同事在 worktree 的对应子目录工作。
 - 准备：`copy`（复制）、`link`（符号链接，替换空目录，适合子模块）、`setup`（在 lane 中依次执行，§8）。任一步失败 → `failed`，`error` 说明。
-- 一个对话共享一个 worktree；`clean` 删除最后一个引用它的 run 时 `git worktree remove --force`。
+- 一个对话共享一个 worktree；`clean` 删除最后一个引用它的 run 时，在 worktree 自身 `git-common-dir` 所属的仓库执行 `git worktree remove --force`（失败则删目录后 `worktree prune`）；不依赖记录的来源路径，`--in` 的上游可能已先被清理。
 
 ### 6.4 apply（必须）
 

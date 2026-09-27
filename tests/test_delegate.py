@@ -1028,6 +1028,14 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(self.cli("apply", "impl").returncode, 0)
         self.assertFalse((repo / "stray.txt").exists())
         self.assertEqual(self.cli("run", "--in", "impl", "--name", "w", "write").returncode, 2)  # read-only only
+        # Cleaning removes the reviewer's worktree from the repository's registry too, not just the directory,
+        # even when the upstream it was taken from has been cleaned first.
+        self.assertIn("removed", self.cli("clean", "impl").stdout)
+        self.assertIn("removed", self.cli("clean", "rv").stdout)
+        listed = subprocess.run(["git", "-C", str(repo), "worktree", "list", "--porcelain"], capture_output=True,
+                                text=True).stdout
+        self.assertNotIn(review["worktree"], listed)
+        self.assertNotIn("prunable", listed)
 
     def test_in_ignores_linked_paths_of_the_upstream_worktree(self):
         # A submodule the upstream worktree links (.delegate.json) is not its change: a reviewer working --in it

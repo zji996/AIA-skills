@@ -268,15 +268,22 @@ pub fn remove(meta: &Value) {
     if !path.exists() {
         return;
     }
-    let source = Path::new(s(tree, "source"));
+    // Ask the worktree which repository owns it: the recorded source may be an upstream worktree
+    // (--in) that has already been cleaned, and pruning from there would leave this entry registered.
+    let owner = git_text(
+        path,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map(PathBuf::from)
+    .unwrap_or_else(|_| PathBuf::from(s(tree, "source")));
     if git(
-        source,
+        &owner,
         &["worktree", "remove", "--force", &path.to_string_lossy()],
     )
     .is_err()
     {
         let _ = fs::remove_dir_all(path);
-        let _ = git(source, &["worktree", "prune"]);
+        let _ = git(&owner, &["worktree", "prune"]);
     }
 }
 fn blob(top: &Path, tree: &str, path: &str) -> Res<(Option<String>, Option<Vec<u8>>)> {
