@@ -17,7 +17,7 @@ LINK = re.compile(r"!?\[[^\]]*\]\(([^\s)]+)(?:\s+[^)]*)?\)")
 DATED_ITEM = re.compile(r"^\s{0,3}(?:[-*+]|\d+[.)])\s+\**\d{4}-\d{2}-\d{2}")
 FENCE = re.compile(r"^\s*(```|~~~)")
 INLINE_CODE = re.compile(r"`([^`\n]+)`")
-PATHLIKE = re.compile(r"^\.?[\w.-]+(?:/[\w.@-]+)+/?$|^[\w.-]+\.(?:md|ya?ml|json|toml|sh|py|go|ts|tsx|mk)$")
+PATHLIKE = re.compile(r"^\.?[\w.-]+(?:/[\w.@-]+)+/?$")  # bare file names often live outside the repo
 MAKE_CALL = re.compile(r"\bmake\s+((?:[A-Z_]+=\S+\s+)*)([a-z][\w.-]*)(\*?)")
 MAKE_TARGET = re.compile(r"^([A-Za-z0-9_.-]+(?:\s+[A-Za-z0-9_.-]+)*)\s*:(?!=)", re.M)
 
