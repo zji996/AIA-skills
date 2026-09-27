@@ -4,6 +4,7 @@
 
 ### 技能
 
+- `repo-governance` 2.2.0：新增 `adr-index.py`，从各 ADR 的标题与状态行生成 `INDEX.md` 中标记之间的表格（兼容 `状态: x`、`- 状态：x`、`- **Status**: x`），默认只核对、`--write` 重写；审计同时报告过期索引。审计新增 `--fail-on`，门禁可只让断链、点名不存在和索引过期失败，体积与过期类只打印。
 - `repo-governance` 2.1.1：点名路径检查只看带目录的路径；不带目录的裸文件名（如技能里的 `audit-context.py`）多半在仓库外，此前会误报。
 - `repo-governance` 2.1.0：审计新增三项只读检查：`docs/current.md` 体积超预算（默认 8 KB）、带日期的条目过多（默认 5 条，常见于把上线流水写进 current.md）、入口文件与 `current.md` 用反引号点名的路径或 `make` 目标不存在（被 gitignore 的路径、通配写法与首段不在仓库里的记法不报）。信息分层表写明 AGENTS.md 放"改动如何生效"，current.md 只留未收口的状态、已完成记录在提交信息里。
 - `delegate` 5.4.0：`.delegate.json` 的 `worktree.copy` 明确支持复制被 git 忽略的文件与目录，缺源跳过并向 stderr 提示；`reply` 默认后台立即返回，`--wait` 显式等待结论；`reply --sync` 忽略未改变指针的 gitlink，保留对指针变化的冲突检查；写入任务结论从快照 diff 汇总目录、改后最大文件、配置路径与删除路径的 `shape`，列表有界且可调；用对话名引用时 `status`、`wait`、`result`、`diff`、`stop` 跟到最新一轮回复（与 `apply`、`reply` 一致），run id 仍精确指向该轮。

@@ -3,7 +3,7 @@ name: repo-governance
 description: 仓库上下文治理。当需要搭建或整理 AGENTS.md、docs/current.md、决策记录，或发现文档与代码对不上、上下文开始漂移时使用；附带只读审计脚本定位问题。Use for repo context governance, AGENTS.md setup, docs drift audit.
 license: MIT
 metadata:
-  version: "2.1.1"
+  version: "2.2.0"
 ---
 
 # Repo Governance (仓库上下文治理)
@@ -14,10 +14,20 @@ metadata:
 
 ```bash
 <本技能目录>/scripts/audit-context.py [--repo <dir>] [--max-agents-lines 150] [--stale-days 30] \
-    [--max-current-kb 8] [--max-dated-items 5]
+    [--max-current-kb 8] [--max-dated-items 5] [--fail-on all|entry,current,names,links,gitignore,adr-index]
 ```
 
-只读，每个问题输出一行 `WARN <文件>: <原因>`，有问题时退出码为 1。检查项：入口文件是否缺失或过长；`docs/current.md` 的下一步是否过多、是否长期未更新、体积是否超预算、是否堆积了带日期的条目；入口文件与 `current.md` 用反引号点名的路径和 `make` 目标是否存在；`.local/` 是否被 gitignore；Markdown 相对链接是否断裂。根据结果决定要不要动文档，不要为了"齐全"而补文件。
+只读，每个问题输出一行 `WARN <文件>: <原因>`，有问题时退出码为 1。检查项：入口文件是否缺失或过长；`docs/current.md` 的下一步是否过多、是否长期未更新、体积是否超预算、是否堆积了带日期的条目；入口文件与 `current.md` 用反引号点名的路径和 `make` 目标是否存在；`.local/` 是否被 gitignore；Markdown 相对链接是否断裂；ADR 索引是否与各 ADR 状态行一致。根据结果决定要不要动文档，不要为了"齐全"而补文件。
+
+接进仓库门禁时用 `--fail-on` 只让确定性问题失败（如 `links,names,adr-index`），体积与过期类只打印；脚本在技能目录里，门禁找不到它时应跳过而不是失败，干净克隆与没装技能的机器照常通过。
+
+## ADR 索引
+
+```bash
+<本技能目录>/scripts/adr-index.py [--repo <dir>] [--write]
+```
+
+决策目录（`docs/decision`、`docs/decisions` 或 `docs/adr`）的 `INDEX.md` 里用 `<!-- adr-index:start -->` 与 `<!-- adr-index:end -->` 包住表格后，表格由各 ADR 的一级标题与第一条"状态/Status"行生成：不带参数只核对（过期退出 1），`--write` 重写标记之间的内容，标记外的文字保持不变。改状态改 ADR 文件本身，索引不再手写，也就不会两处不一致。
 
 ## 两条原则
 

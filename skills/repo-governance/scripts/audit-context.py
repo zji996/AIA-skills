@@ -2,6 +2,7 @@
 """Read-only audit of a repository's agent-facing context files."""
 
 import argparse
+import importlib.util
 import re
 import subprocess
 import sys
@@ -10,6 +11,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 ENTRY_FILES = ("AGENTS.md", "CLAUDE.md")
+KINDS = ("entry", "current", "names", "links", "gitignore", "adr-index")
 NEXT_HEADING = re.compile(r"^#{1,6}\s*.*(下一步|next\s*actions?|next\s*steps?)", re.I)
 HEADING = re.compile(r"^#{1,6}\s")
 LIST_ITEM = re.compile(r"^\s{0,3}(?:[-*+]|\d+[.)])\s+\S")
@@ -87,6 +89,13 @@ def make_targets(repo):
     return targets
 
 
+def load_adr_index():
+    spec = importlib.util.spec_from_file_location("adr_index", Path(__file__).with_name("adr-index.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def markdown_files(repo):
     files = [repo / name for name in ENTRY_FILES if (repo / name).is_file()]
     docs = repo / "docs"
@@ -102,6 +111,8 @@ def main():
     parser.add_argument("--stale-days", type=int, default=30)
     parser.add_argument("--max-current-kb", type=int, default=8)
     parser.add_argument("--max-dated-items", type=int, default=5)
+    parser.add_argument("--fail-on", default="all", help="comma-separated kinds that set exit 1: "
+                        f"{','.join(KINDS)} (default: all; others are still printed)")
     args = parser.parse_args()
 
     repo = Path(args.repo).resolve()
@@ -114,47 +125,47 @@ def main():
 
     findings = []
 
-    def warn(path, message):
-        findings.append(f"WARN {path}: {message}")
+    def warn(kind, path, message):
+        findings.append((kind, f"WARN {path}: {message}"))
 
     entries = [repo / name for name in ENTRY_FILES if (repo / name).is_file()]
     if not entries:
-        warn("AGENTS.md", "missing; agents start without project commands or boundaries")
+        warn("entry", "AGENTS.md", "missing; agents start without project commands or boundaries")
     for entry in entries:
         lines = len(entry.read_text(encoding="utf-8", errors="replace").splitlines())
         if lines > args.max_agents_lines:
-            warn(entry.name, f"{lines} lines (> {args.max_agents_lines}); move stable details into docs/reference/")
+            warn("entry", entry.name, f"{lines} lines (> {args.max_agents_lines}); move stable details into docs/reference/")
 
     current = repo / "docs/current.md"
     if current.is_file():
         text = current.read_text(encoding="utf-8", errors="replace")
         actions = count_next_actions(text)
         if actions > 5:
-            warn("docs/current.md", f"{actions} next actions (> 5); archive finished items or split the focus")
+            warn("current", "docs/current.md", f"{actions} next actions (> 5); archive finished items or split the focus")
         age_days = (time.time() - last_change_epoch(repo, current, in_git)) // 86400
         if age_days > args.stale_days:
-            warn("docs/current.md", f"last changed {int(age_days)} days ago; confirm it still reflects the work")
+            warn("current", "docs/current.md", f"last changed {int(age_days)} days ago; confirm it still reflects the work")
         size_kb = len(text.encode("utf-8")) / 1024
         if size_kb > args.max_current_kb:
-            warn("docs/current.md", f"{size_kb:.0f} KB (> {args.max_current_kb}); every session reads it, keep only "
+            warn("current", "docs/current.md", f"{size_kb:.0f} KB (> {args.max_current_kb}); every session reads it, keep only "
                  "what the next step needs")
         dated = sum(1 for line in text.splitlines() if DATED_ITEM.match(line))
         if dated > args.max_dated_items:
-            warn("docs/current.md", f"{dated} dated entries (> {args.max_dated_items}); shipped work is recorded in "
+            warn("current", "docs/current.md", f"{dated} dated entries (> {args.max_dated_items}); shipped work is recorded in "
                  "git, keep only open state (unverified, not yet live, known risks)")
 
     targets = make_targets(repo)
     for doc in [*entries, *([current] if current.is_file() else [])]:
         prose, code = split_fences(doc.read_text(encoding="utf-8", errors="replace"))
         for token in missing_paths(repo, doc.parent, prose, in_git):
-            warn(doc.relative_to(repo), f"names `{token}`, which does not exist")
+            warn("names", doc.relative_to(repo), f"names `{token}`, which does not exist")
         if targets is not None:
             called = {m.group(2) for m in MAKE_CALL.finditer(prose + "\n" + code) if not m.group(3)}
             for target in sorted(called - targets):
-                warn(doc.relative_to(repo), f"names `make {target}`, which the Makefile does not define")
+                warn("names", doc.relative_to(repo), f"names `make {target}`, which the Makefile does not define")
 
     if in_git and git(repo, "check-ignore", "-q", ".local/probe") is None:
-        warn(".gitignore", ".local/ is not ignored; drafts and run artifacts may be committed")
+        warn("gitignore", ".gitignore", ".local/ is not ignored; drafts and run artifacts may be committed")
 
     for doc in markdown_files(repo):
         text = doc.read_text(encoding="utf-8", errors="replace")
@@ -163,12 +174,20 @@ def main():
                 continue
             path = unquote(target.split("#", 1)[0])
             if path and not (doc.parent / path).exists():
-                warn(doc.relative_to(repo), f"broken link: {target}")
+                warn("links", doc.relative_to(repo), f"broken link: {target}")
 
-    for line in findings:
+    stale_index = load_adr_index().check(repo)
+    if stale_index:
+        warn("adr-index", stale_index[0].relative_to(repo), "out of date with the ADR status lines; run adr-index.py --write")
+
+    fail_on = set(KINDS) if args.fail_on == "all" else {k.strip() for k in args.fail_on.split(",") if k.strip()}
+    unknown = fail_on - set(KINDS)
+    if unknown:
+        parser.error(f"unknown --fail-on kinds: {', '.join(sorted(unknown))}")
+    for _, line in findings:
         print(line)
     print(f"{len(findings)} finding(s) in {repo}" if findings else f"ok: {repo}")
-    return 1 if findings else 0
+    return 1 if any(kind in fail_on for kind, _ in findings) else 0
 
 
 if __name__ == "__main__":

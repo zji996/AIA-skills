@@ -18,6 +18,7 @@ BOOTSTRAP = ROOT / "scripts/bootstrap.sh"
 IMAGE = ROOT / "skills/openai-image-gen/scripts/generate-image.sh"
 SNAPSHOT = ROOT / "skills/agent-handoff/scripts/handoff-snapshot.sh"
 AUDIT = ROOT / "skills/repo-governance/scripts/audit-context.py"
+ADR_INDEX = ROOT / "skills/repo-governance/scripts/adr-index.py"
 
 
 class ImageHandler(BaseHTTPRequestHandler):
@@ -329,6 +330,36 @@ class ScriptTests(unittest.TestCase):
         out = self.run_script(AUDIT, "--repo", repo, "--max-current-kb", "16", "--max-dated-items", "10").stdout
         self.assertNotIn("KB (>", out)
         self.assertNotIn("dated entries", out)
+
+    def test_adr_index_is_generated_from_each_adr_status_line(self):
+        repo = self.git_repo()
+        (repo / ".gitignore").write_text(".local/\n")
+        (repo / "AGENTS.md").write_text("# ok\n")
+        adr = repo / "docs/decision"
+        adr.mkdir(parents=True)
+        (adr / "0001-a.md").write_text("# ADR 0001: 第一 | 决定\n\n状态: active（见 0002）\n")
+        (adr / "0002-b.md").write_text("# ADR-0002: Second\n\n- **Status**: Accepted（2026-06-23）\n")
+        (adr / "0003-c.md").write_text("# 0003 Third\n\n- 状态：superseded by ADR 0002\n")
+        (adr / "0004-d.md").write_text("# Fourth\n\nno status here\n")
+        (adr / "INDEX.md").write_text("# Index\n\nintro\n")
+        self.assertEqual(self.run_script(ADR_INDEX, "--repo", repo).returncode, 2)  # no markers: not managed
+        (adr / "INDEX.md").write_text("# Index\n\nintro\n<!-- adr-index:start -->\nold\n<!-- adr-index:end -->\ntail\n")
+        stale = self.run_script(ADR_INDEX, "--repo", repo)
+        self.assertEqual(stale.returncode, 1)
+        audit = self.run_script(AUDIT, "--repo", repo)
+        self.assertIn("INDEX.md: out of date", audit.stdout)
+        self.assertEqual(audit.returncode, 1)
+        self.assertEqual(self.run_script(AUDIT, "--repo", repo, "--fail-on", "links,names").returncode, 0)
+        self.assertEqual(self.run_script(AUDIT, "--repo", repo, "--fail-on", "nope").returncode, 2)
+        self.assertEqual(self.run_script(ADR_INDEX, "--repo", repo, "--write").returncode, 0)
+        text = (adr / "INDEX.md").read_text()
+        self.assertIn("| 0001 | [第一 \\| 决定](0001-a.md) | active（见 0002） |", text)
+        self.assertIn("| 0002 | [Second](0002-b.md) | Accepted（2026-06-23） |", text)
+        self.assertIn("| 0003 | [Third](0003-c.md) | superseded by ADR 0002 |", text)
+        self.assertIn("| 0004 | [Fourth](0004-d.md) | （未标状态） |", text)
+        self.assertTrue(text.startswith("# Index\n\nintro\n") and text.endswith("\ntail\n"))
+        self.assertEqual(self.run_script(ADR_INDEX, "--repo", repo).returncode, 0)
+        self.assertEqual(self.run_script(AUDIT, "--repo", repo).returncode, 0)
 
     def image_server(self, status=200, data=None):
         handler = type("Response", (ImageHandler,), {
