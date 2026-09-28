@@ -140,6 +140,7 @@
 | 从 .12 经 `ssh .6 'delegate start …'` 派出的 Codex 两次都在 5 秒内失败：`invalid_refresh_token`；同一台机器上登录 shell 里 `codex exec` 正常 | 非交互 SSH 的 PATH 没有 `~/.local/bin`，`codex` 解析到 `/snap/bin/codex` 0.114，snap 沙箱里的 home 存着过期的 ChatGPT 令牌；.18/.24 的 `codex`/`pi` 干脆找不到或是另一份 | 各机器 `~/.bashrc` 在交互判断前把 `~/.local/bin` 放到 PATH 最前 | **待改进**：结论行与 meta 记录实际调用的同事二进制路径与版本，失败时一眼能看出"用的不是你以为的那个"；`start` 发现 PATH 上有多个同名 CLI 时提示 |
 | 主控在 Claude Code 里前台反复 `wait --max 9m`，占住对话，最后用户手动转后台 | SKILL.md 的"放后台"只是建议，模型沿用了为无后台环境准备的 `--max` 写法 | 新增 `hooks/claude-code-background.py`（PreToolUse 拒绝前台 wait/run/reply --wait），装到有 Claude Code 的三台 | 靠文字约束的行为，在有 hook 的 harness 里改成拦截；拦截说明写清"怎么做对"，而不只是"不许" |
 | hook 初版拦下了主控写测试数据的 heredoc 与 `printf` 负载（文本里含 `$D run`） | 只按字面匹配调用写法 | 剥离 heredoc 正文、跳过 `--help`；命令行里直接出现的调用写法仍会被拦（有意），测试数据改放 heredoc | 拦截规则要按"执行位置"而不是"出现位置"判断，并为误判留测试 |
+| 仓库级修复分成两批强档写入并行（Rust 失败路径 / 脚本与文档），各自 `--protect` 对方的全部路径，版本号与 CHANGELOG 新条目留给主控 | 两批约 13–16 分钟交付，验收全过，`apply` 零冲突；主控审查只补了一处取舍说明（`clean --finished` 现在要 `--force` 才丢弃未合入的写入 worktree） | 按“文件所有权”而不是“功能”切分任务，并把版本、CHANGELOG、发布这类汇合点留给主控，可以让两路写入真正并行且一次合入 |
 
 ## 待改进（按收益排序）
 
@@ -152,4 +153,4 @@
 7. 生成文件：~~不参与合并、合并后重新生成~~（5.2.0 已完成）。
 8. ~~等待容量时每 200 ms 醒一次检查 stop，应改为事件驱动~~（5.2.1 已完成）。
 9. ~~无参 `wait` 按派发会话收取、旧任务一行提示、退出码只算本会话；`start` 提示仓库中未收的完成任务~~（5.8.0，见十一）。
-10. 结论与 meta 记录同事二进制的实际路径与版本；PATH 上有多个同名 CLI 时提示（见十二）。
+10. ~~结论与 meta 记录同事二进制的实际路径与版本~~（5.8.1）；PATH 上有多个同名 CLI 时提示（见十二）。
