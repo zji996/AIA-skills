@@ -3,7 +3,7 @@ name: repo-governance
 description: 仓库上下文治理。当需要搭建或整理 AGENTS.md、docs/current.md、决策记录，或发现文档与代码对不上、上下文开始漂移时使用；附带只读审计脚本定位问题。Use for repo context governance, AGENTS.md setup, docs drift audit.
 license: MIT
 metadata:
-  version: "3.0.0"
+  version: "3.0.1"
 ---
 
 # Repo Governance (仓库上下文治理)
@@ -19,7 +19,7 @@ metadata:
 
 只读，默认运行全部检查，每个问题输出一行 `WARN <文件>: <原因>`，命中 `--fail-on` 类别时退出 1。`--only` 只运行指定类别；`--report` 按占用率列出预算文件及每会话必读基线，始终退出 0。检查项：入口文件是否缺失或超预算；`docs/current.md` 的下一步是否过多、是否长期未更新、是否超预算、是否堆积了带日期的条目；入口文件与 `current.md` 用反引号点名的路径和 `make` 目标是否存在；`.local/` 是否被 gitignore；Markdown 相对链接是否断裂；ADR 索引是否与各 ADR 状态行一致。根据结果决定要不要动文档，不要为了"齐全"而补文件。
 
-预算由被审计仓库根目录的可选 `.repo-governance.json` 定义，例如 `{"budgets":{"AGENTS.md":5000,"docs/current.md":2500,"skills/*/SKILL.md":4000},"maxDatedItems":5,"maxNextActions":5,"staleDays":30}`。`budgets` 的键是相对仓库根的 glob；未配置时入口文件默认 5000 token，`docs/current.md` 默认 2500 token。命令行阈值覆盖配置，配置覆盖默认值；旧的 `--max-agents-lines` 与 `--max-current-kb` 显式传入时仍检查并提示弃用。估算公式为 CJK 字符数 + ceil(其余字符数 / 4)，只用于预算与比较，并非任何模型的精确计数。行数和 KB 对中英文、长短行失真：同样 8 KB，中文约 2700 token、英文约 2000 token；一行可能 10 字也可能 400 字。阈值属于仓库自身，应随仓库演进调整；先用 `--report` 看余量。
+预算由被审计仓库根目录的可选 `.repo-governance.json` 定义，例如 `{"budgets":{"AGENTS.md":5000,"docs/current.md":2500,"skills/*/SKILL.md":4000},"maxDatedItems":5,"maxNextActions":5,"staleDays":30}`。`budgets` 的键是相对仓库根的 glob，精确路径优先于通配（可给个别大文件单设“只减不增”的上限）；未配置时入口文件默认 5000 token，`docs/current.md` 默认 2500 token。命令行阈值覆盖配置，配置覆盖默认值；旧的 `--max-agents-lines` 与 `--max-current-kb` 显式传入时仍检查并提示弃用。估算公式为 CJK 字符数 + ceil(其余字符数 / 4)，只用于预算与比较，并非任何模型的精确计数。行数和 KB 对中英文、长短行失真：同样 8 KB，中文约 2700 token、英文约 2000 token；一行可能 10 字也可能 400 字。阈值属于仓库自身，应随仓库演进调整；先用 `--report` 看余量。
 
 接进仓库门禁时用 `--fail-on` 只让确定性问题失败（如 `links,names,adr-index`），体积与过期类只打印；脚本在技能目录里，门禁找不到它时应跳过而不是失败，干净克隆与没装技能的机器照常通过。
 

@@ -374,6 +374,16 @@ class ScriptTests(unittest.TestCase):
         self.assertLess(result.stdout.index("skills/demo/SKILL.md"), result.stdout.index("AGENTS.md"))
         self.assertIn("every-session baseline: ~12 tokens", result.stdout)
 
+    def test_audit_exact_budget_overrides_a_glob_written_after_it(self):
+        repo = self.git_repo()
+        (repo / "AGENTS.md").write_text("ok")
+        (repo / "docs").mkdir()
+        (repo / "docs/big.md").write_text("abcd" * 20)
+        (repo / ".repo-governance.json").write_text(
+            '{"budgets": {"docs/big.md": 30, "docs/*.md": 5}}')
+        result = self.run_script(AUDIT, "--repo", repo, "--report")
+        self.assertIn("docs/big.md: ~20 tokens / 30", result.stdout)
+
     def test_audit_counts_a_symlinked_entry_file_once(self):
         repo = self.git_repo()
         (repo / "AGENTS.md").write_text("abcd" * 8)

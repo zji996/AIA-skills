@@ -69,7 +69,9 @@ def budgeted_files(repo, config, entry_limit, current_limit):
             budgets[name] = ("entry", 5000)
     if (repo / "docs/current.md").is_file():
         budgets["docs/current.md"] = ("current", 2500)
-    for pattern, limit in config.get("budgets", {}).items():
+    # Exact paths override globs whatever their order in the file, so a per-file ceiling is never lost.
+    patterns = sorted(config.get("budgets", {}).items(), key=lambda item: not any(c in item[0] for c in "*?["))
+    for pattern, limit in patterns:
         for path in repo.glob(pattern):
             if path.is_file() and repo in path.resolve().parents:
                 name = path.relative_to(repo).as_posix()
