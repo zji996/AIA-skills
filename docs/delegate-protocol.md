@@ -48,11 +48,11 @@ delegate 负责一切与宿主无关的事：隔离（worktree、快照）、验
 {"protocol":1,"version":"5.9.0","caller":{"id":"…","source":"CLAUDE_CODE_SESSION_ID"},
  "agents":[{"name":"pi","tiers":["cheap"],"available":true,"bin":"/…/pi","version":"0.87.1","shadowed":[]},
            {"name":"codex","tiers":["strong"],"available":true,"bin":"/…/codex","version":"codex-cli 0.158.0",
-            "shadowed":["/snap/codex/…/codex"]}]}
+            "shadowed":["/snap/bin/codex"]}]}
 ```
 
 - `protocol` 不同于宿主预期时，适配器应提示升级而不是继续调用。
-- `agents[].bin` 是 PATH 上实际会执行的文件；`shadowed` 列出 PATH 里更靠后、被它遮住的同名可执行文件（例如旧的 snap 版本），用于排查“同事用错了版本”。
+- `agents[].bin` 是 PATH 上实际会执行的文件；`shadowed` 按 PATH 中的原路径列出更靠后、被它遮住的同名可执行文件（例如旧的 snap 版本），用于排查“同事用错了版本”。
 - `caller` 为 `null` 说明宿主没有导出会话标识。
 
 ## 5. 适配一个新宿主（清单）

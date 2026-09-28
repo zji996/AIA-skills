@@ -129,18 +129,20 @@ pub fn agent_bin(agent: &str) -> Option<PathBuf> {
         }
     })
 }
-/// Every executable named `agent` on PATH, resolved and in PATH order; the first one runs.
-fn agent_bins(agent: &str) -> Vec<PathBuf> {
-    let mut found: Vec<PathBuf> = vec![];
-    for dir in env::var_os("PATH")
+/// Every distinct executable named `agent` on PATH, in PATH order, as (PATH entry, real
+/// path); the first one runs. Entries are compared by real path, but reported as found,
+/// since launchers such as snap resolve to one shared binary.
+fn agent_bins(agent: &str) -> Vec<(PathBuf, PathBuf)> {
+    let mut found: Vec<(PathBuf, PathBuf)> = vec![];
+    let dirs = env::var_os("PATH")
         .map(|p| env::split_paths(&p).collect::<Vec<_>>())
-        .unwrap_or_default()
-    {
+        .unwrap_or_default();
+    for dir in dirs {
         let path = dir.join(agent);
         if fs::metadata(&path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0) {
             if let Ok(real) = path.canonicalize() {
-                if !found.contains(&real) {
-                    found.push(real);
+                if !found.iter().any(|(_, seen)| *seen == real) {
+                    found.push((path, real));
                 }
             }
         }
@@ -169,9 +171,9 @@ pub fn protocol() -> Value {
                 "name": agent.name,
                 "tiers": tiers_of(agent.name),
                 "available": !bins.is_empty(),
-                "bin": bins.first(),
+                "bin": bins.first().map(|(_, real)| real),
                 "version": version,
-                "shadowed": bins.iter().skip(1).collect::<Vec<_>>(),
+                "shadowed": bins.iter().skip(1).map(|(path, _)| path).collect::<Vec<_>>(),
             })
         })
         .collect::<Vec<_>>();

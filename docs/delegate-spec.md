@@ -1,4 +1,4 @@
-# delegate 规格（v5.9.0）
+# delegate 规格（v5.9.1）
 
 > 本文是 `skills/delegate` 的**实现契约**：命令行、输出、run 目录、锁与状态机。它是 Rust 重写与 harness 原生接入的依据。
 > 本文不在技能目录内，技能加载时不会读取；模型使用技能只需 `SKILL.md`。行为以本文为准，实现与本文不一致时按缺陷处理。
@@ -49,7 +49,7 @@
 | `lane [--label 文字] [--] [命令...]` | | §8；无命令时列出队列，每行 `running\|queued  <since>  <label>` |
 | `stop <run>...` | | §9.4 |
 | `clean <run>...\|--finished [--force]` | | §10 |
-| `protocol` | | 输出一行 JSON：`protocol`（宿主接入协议版本，当前 1）、`version`、`caller{id,source}`（未知时为 `null`）、`agents[]{name,tiers,available,bin,version,shadowed}`；`tiers` 是按当前配置（`DELEGATE_{CHEAP,STRONG}_AGENT`）该同事担任默认的档位列表，可为空，`bin` 为 PATH 上首个可执行文件的真实路径（不可用时为 `null`），`shadowed` 为 PATH 中更靠后、真实路径不同的同名可执行文件；退出码 0。供宿主适配器探测，见 [delegate-protocol.md](delegate-protocol.md) |
+| `protocol` | | 输出一行 JSON：`protocol`（宿主接入协议版本，当前 1）、`version`、`caller{id,source}`（未知时为 `null`）、`agents[]{name,tiers,available,bin,version,shadowed}`；`tiers` 是按当前配置（`DELEGATE_{CHEAP,STRONG}_AGENT`）该同事担任默认的档位列表，可为空，`bin` 为 PATH 上首个可执行文件的真实路径（不可用时为 `null`），`shadowed` 为 PATH 中更靠后、真实路径不同的同名可执行文件，按其在 PATH 中的路径列出（snap 等启动器都解析到同一文件，解析后看不出是谁）；退出码 0。供宿主适配器探测，见 [delegate-protocol.md](delegate-protocol.md) |
 
 缺少同事 CLI 时退出码 2：Codex 提示安装并登录；Pi 提示 `sh <仓库>/third_party/pi-kit/install.sh --additive`，其中 `<仓库>` 为从可执行文件真实路径逐级向上、首个包含该安装脚本的目录，找不到时给出远程安装命令。
 

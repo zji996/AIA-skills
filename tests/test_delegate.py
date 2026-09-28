@@ -984,7 +984,7 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(agents["pi"]["tiers"], ["cheap", "strong"])  # setUp maps strong to the fake Pi
         self.assertEqual(agents["pi"]["bin"], str((self.bin / "pi").resolve()))
         self.assertEqual(agents["pi"]["version"], "fake-pi 1.0")
-        self.assertEqual(agents["pi"]["shadowed"], [str((shadow / "pi").resolve())])
+        self.assertEqual(agents["pi"]["shadowed"], [str(shadow / "pi")])  # as found on PATH, not resolved
         self.assertEqual((agents["codex"]["tiers"], agents["codex"]["available"], agents["codex"]["bin"]),
                          ([], False, None))
         self.env.pop("DELEGATE_STRONG_AGENT")
