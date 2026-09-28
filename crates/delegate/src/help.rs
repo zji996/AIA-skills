@@ -130,6 +130,8 @@ pub fn print(command: Option<&str>) -> bool {
             ("--all", "Collect all active and undelivered runs in this repository, regardless of caller."),
             ("--machine", "Collect active and waiting runs registered across all repositories on this machine."),
             ("--no-result", "Print only the outcome line."),
+            ("--any", "Return once any run has finished: report the finished runs and name the rest on stderr. Repeat the same command for the next one."),
+            ("--stream", "Print one outcome line per run as each finishes (answers are read with wait <run>) and exit when none is left; without run arguments it also picks up runs this caller starts meanwhile. For hosts that turn each output line into a notification."),
         ]),
         "status" | "list" => ("[runs ...]", "Print one JSON status line per run.", &[
             ("runs", "Run ids or directories (default: all runs)."),

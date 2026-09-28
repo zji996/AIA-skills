@@ -941,6 +941,76 @@ class DelegateTests(unittest.TestCase):
                                 if line.startswith('{"run"')), ["one", "two"])
         self.assertIn("no active or undelivered runs", self.cli("wait").stderr)
 
+    def names(self, result):
+        return [json.loads(line)["name"] for line in result.stdout.splitlines() if line.startswith('{"run"')]
+
+    def test_wait_any_returns_each_run_as_it_finishes(self):
+        self.fake_pi([answer("ok"), SETTLED], pre='case "$*" in *slow*) sleep 4;; esac')
+        for name in ("slow", "fast"):
+            self.assertEqual(self.cli("start", "--read-only", "--name", name, "task").returncode, 0)
+        self.assertEqual(self.cli("wait", "--any", "--stream").returncode, 2)
+        first = self.cli("wait", "--any")
+        self.assertEqual((first.returncode, self.names(first)), (0, ["fast"]), first.stderr)
+        self.assertIn("ok", first.stdout)  # the answer comes with it
+        self.assertIn("1 still running", first.stderr)
+        self.assertIn("wait --any", first.stderr)
+        second = self.cli("wait", "--any")
+        self.assertEqual((second.returncode, self.names(second)), (0, ["slow"]), second.stderr)
+        self.assertNotIn("still running", second.stderr)
+        self.assertIn("no active or undelivered runs", self.cli("wait", "--any").stderr)
+        # Named runs that were already reported are skipped, so the same command can be repeated.
+        self.assertIn("no active or undelivered runs", self.cli("wait", "--any", "slow", "fast").stderr)
+
+    def test_wait_any_max_exits_75_when_nothing_finished(self):
+        self.fake_pi([answer("ok"), SETTLED], sleep=30)
+        self.assertEqual(self.cli("start", "--read-only", "--name", "slow", "task").returncode, 0)
+        result = self.cli("wait", "--any", "--max", "0.3")
+        self.assertEqual((result.returncode, self.names(result)), (75, []))
+        self.assertIn("call wait --any again", result.stderr)
+        self.cli("stop", "slow")
+
+    def test_wait_stream_prints_one_line_per_run_and_picks_up_new_runs(self):
+        self.env["DELEGATE_CALLER"] = "streamer"
+        self.fake_pi([answer("streamed answer"), SETTLED], pre='case "$*" in *slow*) sleep 4;; esac')
+        for name in ("slow", "fast"):
+            self.assertEqual(self.cli("start", "--read-only", "--name", name, "task").returncode, 0)
+        stream = subprocess.Popen([str(DELEGATE), "wait", "--stream"], cwd=self.work, env=self.env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(stream.kill)
+        first = json.loads(stream.stdout.readline())
+        self.assertEqual((first["name"], first["state"]), ("fast", "answered"))
+        self.assertTrue(first["report"].endswith(f"wait {first['run']}"))
+        self.assertEqual(self.cli("start", "--read-only", "--name", "late", "task").returncode, 0)
+        out, err = stream.communicate(timeout=30)
+        self.assertEqual(stream.returncode, 0, err)
+        rest = [json.loads(line)["name"] for line in out.splitlines()]
+        self.assertEqual(sorted(rest), ["late", "slow"])
+        self.assertNotIn("streamed answer", out)  # one line each; the answer is read with wait
+        self.assertIn("all 3 runs reported", err)
+        collected = self.cli("wait")
+        self.assertEqual(sorted(self.names(collected)), ["fast", "late", "slow"])
+        self.assertIn("streamed answer", collected.stdout)
+
+    def test_outcome_reports_source_changes_since_the_worktree_snapshot(self):
+        repo = self.repo({"a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n"})
+        self.fake_pi([answer("done"), SETTLED], pre="echo run > a.txt; echo run > b.txt")
+        result = self.cli("run", "--worktree", "--workdir", repo, "task")
+        state = self.outcome(result)
+        self.assertNotIn("sourceDrift", state)
+        (repo / "b.txt").write_text("caller\n")
+        (repo / "c.txt").write_text("caller\n")
+        (repo / "d.txt").write_text("new\n")
+        again = self.outcome(self.cli("wait", state["run"]))
+        self.assertEqual(again["sourceDrift"], {"files": 3, "overlap": ["b.txt"]})
+        self.assertIn("reply", again["next"])
+        self.assertIn("--sync", again["next"])
+        self.assertNotIn("sourceDrift", self.outcome(self.cli("status", state["run"])))  # status stays cheap
+        (repo / "b.txt").write_text("b\n")
+        calm = self.outcome(self.cli("wait", state["run"]))
+        self.assertEqual(calm["sourceDrift"], {"files": 2, "overlap": []})
+        self.assertIn(f"apply {state['run']}", calm["next"])
+        self.assertNotIn("--sync", calm["next"])
+
     def test_caller_is_written_for_start_run_reply_and_waiting_run(self):
         self.fake_pi([answer("ok"), SETTLED])
         self.env["CLAUDE_CODE_SESSION_ID"] = "claude-session"
@@ -1214,7 +1284,8 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(merged.returncode, 1)
         self.assertIn("<<<<<<< current", (repo / "a.txt").read_text())
         self.assertTrue((repo / "seen.txt").exists())
-        self.cli("clean", state["run"])
+        self.assertTrue((Path(state["dir"]) / ".applied").exists())  # markers landed every change
+        self.assertNotIn("never applied", self.cli("clean", state["run"]).stdout)
         self.assertFalse(tree.exists())
         self.assertNotIn(str(tree), subprocess.run(["git", "-C", str(repo), "worktree", "list"],
                                                    capture_output=True, text=True).stdout)

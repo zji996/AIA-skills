@@ -17,7 +17,29 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 fn status_line(run: &Path) -> String {
-    let status = runs::status(run);
+    format_status(runs::status(run))
+}
+/// A finished run's status, plus how far the source moved since its worktree snapshot.
+fn outcome_line(run: &Path) -> String {
+    let mut status = runs::status(run);
+    if runs::active(&runs::state(run)) {
+        return format_status(status);
+    }
+    if let Some(drift) = worktree::source_drift(run) {
+        let overlap = drift["overlap"].as_array().map_or(0, Vec::len)
+            + drift["overlapMore"].as_u64().unwrap_or(0) as usize;
+        if overlap > 0 {
+            let name = run.file_name().unwrap_or_default().to_string_lossy();
+            status["next"] = json!(format!(
+                "the source changed {overlap} of its files since the snapshot; review {script} diff {name} --total, then {script} apply {name} (stops on conflicts; --merge writes markers), or {script} reply {name} --sync '<rebase onto the current source>' first",
+                script = script().display()
+            ));
+        }
+        status["sourceDrift"] = drift;
+    }
+    format_status(status)
+}
+fn format_status(status: serde_json::Value) -> String {
     let keys = [
         "run",
         "name",
@@ -53,6 +75,7 @@ fn status_line(run: &Path) -> String {
         "idleSeconds",
         "result",
         "resultChars",
+        "sourceDrift",
         "next",
         "dir",
     ];
@@ -251,7 +274,7 @@ fn collect(
     let mut code = 0;
     for run in runs {
         let state = runs::state(run);
-        println!("{}", status_line(run));
+        println!("{}", outcome_line(run));
         if runs::active(&state) {
             code = 75;
             continue;
@@ -302,6 +325,184 @@ fn collect(
     }
     if code == 75 {
         eprintln!("delegate: still running; call wait again (exit 75)");
+    }
+    code
+}
+/// The runs a `wait` collects; the flag is set when a hint about other sessions' runs was printed.
+fn wait_list(pos: &[String], flags: &[String], quiet: bool) -> Res<(Vec<PathBuf>, bool)> {
+    if has(flags, "--machine") {
+        let mut v = launch::machine_runs(&state_dir());
+        v.sort();
+        v.dedup();
+        return Ok((v, false));
+    }
+    if !pos.is_empty() {
+        return Ok((
+            pos.iter()
+                .map(|x| runs::resolve_head(x))
+                .collect::<Res<Vec<_>>>()?,
+            false,
+        ));
+    }
+    let mut v = runs::all_runs()
+        .into_iter()
+        .filter(|r| runs::active(&runs::state(r)) || !r.join(".delivered").exists())
+        .collect::<Vec<_>>();
+    let mut hinted = false;
+    if !has(flags, "--all") {
+        if let Some(caller) = caller() {
+            let (own, other): (Vec<_>, Vec<_>) = v
+                .into_iter()
+                .partition(|run| json(run.join("meta.json"))["caller"].as_str() == Some(&caller));
+            if !quiet {
+                runs::other_runs_hint(&other);
+            }
+            hinted = !other.is_empty();
+            v = own;
+        }
+    }
+    Ok((v, hinted))
+}
+/// Blocks until the run leaves its active states: on its supervisor lock, else by polling.
+fn until_finished(run: &Path, poll: f64) {
+    while runs::active(&runs::state(run)) {
+        let lock = run.join("supervisor.lock");
+        if lock.is_file() {
+            let _held = common::lock(&lock, false, false);
+        }
+        if runs::active(&runs::state(run)) {
+            std::thread::sleep(Duration::from_secs_f64(poll));
+        }
+    }
+}
+/// `wait --any` reports the runs finished when the first one ends; `wait --stream` prints one
+/// outcome line per run as each ends and exits once none is left. A stream started without
+/// run arguments also picks up runs this caller starts while it waits.
+fn wait_each(
+    mut list: Vec<PathBuf>,
+    rescan: Option<(&[String], &[String])>,
+    max: Option<f64>,
+    stream: bool,
+    show_progress: bool,
+    full: bool,
+    show_result: bool,
+) -> i32 {
+    let begin = Instant::now();
+    let poll = setting("POLL", "1").parse::<f64>().unwrap_or(1.0).max(0.01);
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let mut watched = std::collections::HashSet::new();
+    let mut reported = std::collections::HashSet::new();
+    let mut code = 0;
+    loop {
+        if show_progress {
+            for run in &list {
+                progress(run, run.file_name().unwrap_or_default().to_str().unwrap_or(""));
+            }
+        }
+        let done = list
+            .iter()
+            .filter(|r| !reported.contains(*r) && !runs::active(&runs::state(r)))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !done.is_empty() {
+            if stream {
+                for run in &done {
+                    let state = runs::state(run);
+                    let mut line = outcome_line(run);
+                    if run.join("result.md").is_file() && !run.join(".delivered").exists() {
+                        // The answer is not printed here; name the command that reports it.
+                        line.pop();
+                        line.push_str(&format!(
+                            ",\"report\":{}}}",
+                            json!(format!(
+                                "{} wait {}",
+                                script().display(),
+                                run.file_name().unwrap_or_default().to_string_lossy()
+                            ))
+                        ));
+                    }
+                    println!("{line}");
+                    if !["delivered", "answered"].contains(&state.as_str()) {
+                        code = 1;
+                    }
+                }
+            } else {
+                code = collect(&done, None, false, full, show_result);
+            }
+            reported.extend(done);
+            if !stream {
+                break;
+            }
+        }
+        let pending = list
+            .iter()
+            .filter(|r| !reported.contains(*r))
+            .cloned()
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            break;
+        }
+        let left = max.map(|m| m - begin.elapsed().as_secs_f64());
+        if left.is_some_and(|l| l <= 0.0) {
+            if stream || reported.is_empty() {
+                code = 75;
+            }
+            break;
+        }
+        for run in pending {
+            if watched.insert(run.clone()) {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    until_finished(&run, poll);
+                    let _ = tx.send(());
+                });
+            }
+        }
+        let mut wake = left;
+        if show_progress {
+            wake = Some(wake.map_or(poll, |l| l.min(poll)));
+        }
+        if rescan.is_some() {
+            wake = Some(wake.map_or(5.0, |l| l.min(5.0)));
+        }
+        match wake {
+            Some(seconds) => {
+                let _ = rx.recv_timeout(Duration::from_secs_f64(seconds.max(0.0)));
+            }
+            None => {
+                let _ = rx.recv();
+            }
+        }
+        if let Some((pos, flags)) = rescan {
+            if let Ok((fresh, _)) = wait_list(pos, flags, true) {
+                for run in fresh {
+                    if !list.contains(&run) {
+                        list.push(run);
+                    }
+                }
+            }
+        }
+    }
+    let left = list
+        .iter()
+        .filter(|r| !reported.contains(*r))
+        .map(|r| r.file_name().unwrap_or_default().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    if !left.is_empty() {
+        eprintln!(
+            "delegate: {} still running ({}); {}",
+            left.len(),
+            left.join(", "),
+            if stream {
+                "call wait --stream again (exit 75)".to_string()
+            } else if code == 75 {
+                "call wait --any again (exit 75)".to_string()
+            } else {
+                format!("collect the next with: {} wait --any", script().display())
+            }
+        );
+    } else if stream {
+        eprintln!("delegate: all {} runs reported", reported.len());
     }
     code
 }
@@ -565,51 +766,48 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "wait" => {
             let (pos, flags, kv) = parse_simple(
                 rest,
-                &["--all", "--machine", "--no-result", "--full", "--progress"],
+                &[
+                    "--all",
+                    "--machine",
+                    "--no-result",
+                    "--full",
+                    "--progress",
+                    "--any",
+                    "--stream",
+                ],
                 &["--max"],
             )?;
             let max = value(&kv, "--max").map(seconds).transpose()?;
             if has(&flags, "--machine") && !pos.is_empty() {
                 return Err("--machine does not take run arguments".into());
             }
-            let list = if has(&flags, "--machine") {
-                let mut v = launch::machine_runs(&state_dir());
-                v.sort();
-                v.dedup();
-                if v.is_empty() {
+            let (any, stream) = (has(&flags, "--any"), has(&flags, "--stream"));
+            if any && stream {
+                return Err("--any and --stream cannot be combined".into());
+            }
+            let (mut list, hinted) = wait_list(&pos, &flags, false)?;
+            if any {
+                // A named run that was already reported in full is not waited for again, so
+                // repeating the same `wait --any` walks through the rest.
+                list.retain(|r| runs::active(&runs::state(r)) || !r.join(".delivered").exists());
+            }
+            if list.is_empty() {
+                if !hinted {
                     eprintln!("delegate: no active or undelivered runs");
-                    return Ok(0);
                 }
-                v
-            } else if has(&flags, "--all") || pos.is_empty() {
-                let mut v = runs::all_runs()
-                    .into_iter()
-                    .filter(|r| runs::active(&runs::state(r)) || !r.join(".delivered").exists())
-                    .collect::<Vec<_>>();
-                if pos.is_empty() && !has(&flags, "--all") {
-                    if let Some(caller) = caller() {
-                        let (own, other): (Vec<_>, Vec<_>) = v.into_iter().partition(|run| {
-                            json(run.join("meta.json"))["caller"].as_str() == Some(&caller)
-                        });
-                        runs::other_runs_hint(&other);
-                        v = own;
-                        if v.is_empty() && !other.is_empty() {
-                            return Ok(0);
-                        }
-                    }
-                }
-                if v.is_empty() {
-                    eprintln!("delegate: no active or undelivered runs");
-                    return Ok(0);
-                }
-                v
-            } else {
-                pos.iter()
-                    .map(|x| runs::resolve_head(x))
-                    .collect::<Res<Vec<_>>>()?
-                    .into_iter()
-                    .collect::<Vec<_>>()
-            };
+                return Ok(0);
+            }
+            if any || stream {
+                return Ok(wait_each(
+                    list,
+                    (stream && pos.is_empty()).then_some((pos.as_slice(), flags.as_slice())),
+                    max,
+                    stream,
+                    has(&flags, "--progress"),
+                    has(&flags, "--full"),
+                    !has(&flags, "--no-result"),
+                ));
+            }
             Ok(collect(
                 &list,
                 max,

@@ -41,7 +41,7 @@
 | `start` | 启动选项（§2.3）＋任务说明 | 创建 run 并启动 supervisor，立即输出一行状态（§3.1）；stderr 提示收取命令 |
 | `run` | 启动选项＋`--max`/`--progress`/`--full` | `start` 后等待，按 §3.2 输出 |
 | `reply <run> [消息]` | `--fresh` `--sync` `--accept` `--hide-accept` `--accept-timeout` `--timeout` `--image` `--name` `--prompt(-file)`；`--wait` 时可用等待选项 | 续接对话并立即返回启动状态；`--wait` 等结论（§7） |
-| `wait [<run>...\|--all]` | `--max` `--no-result` `--full` `--progress` | 等待并输出；无参数按派发会话收取（§9.5），`--all` 取本仓库所有运行中或结果未读取的 run；没有时以 0 退出 |
+| `wait [<run>...\|--all]` | `--max` `--no-result` `--full` `--progress` `--any` `--stream` | 等待并输出；无参数按派发会话收取（§9.5），`--all` 取本仓库所有运行中或结果未读取的 run；没有时以 0 退出。`--any` 与 `--stream` 见 §9.5 |
 | `status [<run>...]`（别名 `list`） | | 每个 run 一行状态；无参数列出全部 |
 | `result [<run>] [--path]` | | 输出完整答复（或其路径）；非运行中时标记已读取 |
 | `diff [<run>] [--stat] [--total] [路径...]` | | `git diff` 该 run 前后快照；`--total` 自对话起点；终端下带颜色；对象被清理时回退输出 `changes.patch` |
@@ -114,6 +114,8 @@
 | `graceSeconds` | 同事用了超时宽限 | 超出 `--timeout` 的秒数 |
 | `warning` `error` | | 人读文本 |
 | `result` `resultChars` | 有非空答复 | `result.md` 路径与字符数 |
+| `sourceDrift{files,overlap,overlapMore?}` | 结论块或 `wait --stream` 中已结束、未 apply、有改动的 worktree 写入 run，且源工作区自快照（或上次 apply / `--sync`）以来有变化 | `files` 为源工作区变化的文件数；`overlap` 为其中同事也改过的文件（最多 10 项）。`status` 不计算，保持轻量 |
+| `report` | `wait --stream` 行、有答复且未送达 | 读答复的命令 `wait <run>` |
 | `next` | 有建议动作 | 下一步（含可复制的命令），§3.3 |
 
 ### 3.2 结论块（`run` / `wait` / `reply`）
@@ -148,6 +150,7 @@
 | 运行中 | `wait <run>` |
 | 完成、写入、原地、有改动 | 查看 `diff <run>`（改动已在工作区） |
 | 完成、写入、worktree、有改动、未 apply | 查看 `diff <run> --total`，再 `apply <run>` |
+| 同上且 `sourceDrift.overlap` 非空 | 写明重叠文件数；`apply`（冲突即停，`--merge` 写冲突标记），或先 `reply <run> --sync` 让同事在最新源上收尾 |
 | 完成、只读或无改动或已 apply | 无 |
 | `rejected` | 读 `accept.tail`；`reply <run> '<要修的>'` 或接手 |
 | `malformed` / `failed` / `timeout` / `killed` / `crashed` | 换同事 / 读 error / 拆小 / 接手 |
@@ -317,6 +320,12 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 ### 9.5 等待（`wait`/`run`）
 
 阻塞在各 run 的 `supervisor.lock` 共享锁上（每个一个线程），`--max` 到期即返回。`wait --machine` 在调用开始时从 `<state>` 的 slot 读取整机运行中或等待中的 run 目录并固定该列表（之后 slot 被清理不影响本次收取），跨仓库收取；不带 `--machine` 时只收取当前仓库的 run。无参 `wait` 在 caller 已知时只选 caller 相同且运行中或未送达的 run；其他运行中或未送达的 run（含没有 caller 的旧 run）不收取、不输出结论块，只在 stderr 用一行报告数量、最多三个名称及年龄，并提示 `wait --all` / `clean <run>`。本会话没有可收取的 run 而有其他 run 时，提示后以 0 退出；都没有时沿用 `no active or undelivered runs`。caller 未知时无参 `wait` 与旧行为相同，收取全部。`wait --all`、`wait <run...>` 和 `wait --machine` 不受 caller 过滤；退出码只由实际收取的 run 决定。仅在 `--progress`、supervisor 尚未加锁（刚启动）或 4.4 之前的 run 时按 `DELEGATE_POLL`（默认 1 秒）轮询。
+
+逐个收取（5.11）：
+
+- `wait --any`：选出的 run 中已结束的立即输出结论块（§3.2）；都未结束时等到任一结束。只输出已结束的 run，其余在 stderr 列出名称并提示再次 `wait --any`。显式列出的 run 中已送达的跳过，因此重复同一条命令即可依次收完；全部已送达时同无参 `wait` 输出 `no active or undelivered runs` 并以 0 退出。退出码由本次输出的 run 决定；`--max` 到期仍无结束时退出码 75。
+- `wait --stream`：每个 run 结束时输出一行状态行（含 `sourceDrift`，有未读答复时带 `report`），不输出改动清单与答复、不标记 `.delivered`；全部输出后 stderr 写 `all <N> runs reported` 并退出。不带 run 参数时每 5 秒按同一规则（caller、`--all`、`--machine`）重新选取，把期间新派出的 run 也纳入；全部结束即退出，之后派出的 run 需要新的 `wait`。退出码：有非 delivered/answered 结局为 1，`--max` 到期仍有未结束的为 75，否则 0。
+- `--any` 与 `--stream` 互斥（退出码 2）。两者都与宿主无关：`--stream` 适合能把命令的每行输出变成通知的宿主，`--any` 适合只有“后台命令结束时通知”或只能分段调用的宿主（配合 `--max`）。
 
 ## 10. 并发、准入与清理
 

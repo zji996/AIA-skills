@@ -52,7 +52,9 @@ def main() -> int:
                     "delegate wait/run/reply --wait blocks until colleagues finish. Rerun the same "
                     "command with the Bash tool's run_in_background: true; you are notified when it "
                     "exits, so keep working meanwhile and do not poll. Use start (or reply without "
-                    "--wait) to launch, then one background wait."
+                    "--wait) to launch, then one background wait. To look at each run as it finishes, "
+                    "run `wait --stream` under the Monitor tool (one notification per run), or run "
+                    "`wait --any` in the background and repeat it after each notification."
                 ),
             }
         },

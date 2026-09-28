@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "5.10.0"
+  version: "5.11.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -23,6 +23,7 @@ $D wait                                                                         
 ```
 
 - **等待**：`wait`、`run`、`reply --wait` 会一直阻塞到同事结束，默认放后台：Claude Code 里给 Bash 工具加 `run_in_background: true`，结束时会收到通知，期间继续干别的，不要用 `status` 轮询（`hooks/claude-code-background.py` 可作为 PreToolUse hook 拒绝前台调用）。只有没有后台通知、单次调用又有时长上限的主控才用 `--max 4m`，返回 75 就稍后再 `wait`。无参 `wait` 只收本会话派出的任务；无会话标识时沿用收取全部的行为，`--all` 可收本仓库全部。
+- **逐个处理**：多路并行时不必等最慢的一个。宿主能把每行输出变成通知（Claude Code 的 Monitor）就放一个 `$D wait --stream`，每完工一个来一行结论，按行里的 `report` 读答复、按 `next` 合并；只有结束通知时后台跑 `$D wait --any`，处理完再放同一条。结论行带 `sourceDrift` 表示快照后你也改过源码，`overlap` 非空时先看 `next` 再决定 `apply` 还是 `reply --sync`。
 - **结论**：每个任务一行 JSON，随后是改动清单与答复。`next` 字段给出下一步（含可复制的命令），没有 `next` 就是答复本身即交付物。答复超过 6000 字（`DELEGATE_RESULT_CHARS`）显示开头和结尾，全文用 `$D result <name>`；只看过截断答复的任务 `clean --finished` 会保留，读过全文或加 `--force` 才删。`cleanup` 报告已终止的后台进程与端口，`warnings` 报告 worktree 源问题。
 
 ## 场景速查
@@ -37,6 +38,7 @@ $D wait                                                                         
 | 先 A 后 B | `$D start --after <A> …`；审 A 的结果加 `--in <A> --read-only` |
 | 自己跑重检查 | `$D lane make check`（与同事的验收排队，一次一个） |
 | 同时在几个仓库派了任务 | 放一个后台 `$D wait --machine`，整机的都会收到 |
+| 多路并行，谁先完工先处理谁 | `$D wait --stream`（流式通知）或后台 `$D wait --any`（每次一个，重复即可） |
 | 看改了什么 / 停掉 / 清理 | `$D diff <name>` / `$D stop <name>` / `$D clean --finished` |
 
 多行说明用 `--prompt-file -` 加 heredoc；总加 `--name`，之后用它指代整段对话（各命令都落到最新一轮回复）。更多完整示例、任务说明模板与常见坑见 [references/recipes.md](references/recipes.md)。

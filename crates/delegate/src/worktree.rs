@@ -444,6 +444,41 @@ fn file_hash(path: &Path) -> Res<String> {
         hash.update(&buffer[..size]);
     }
 }
+/// How far the source moved since a finished, unapplied worktree run took its snapshot:
+/// the number of changed files, and which of them the run changed too.
+pub fn source_drift(run: &Path) -> Option<Value> {
+    let meta = json(run.join("meta.json"));
+    if !meta["worktree"].is_object() || s(&meta, "mode") != "write" || run.join(".applied").exists() {
+        return None;
+    }
+    let (_, top, _, after) = chain_changes(run).ok()?;
+    let source = PathBuf::from(s(&meta["worktree"], "source"));
+    let applied = applied_state(run, &meta);
+    let baseline = if !s(&applied, "tree").is_empty() {
+        applied
+    } else {
+        json!({"tree":s(&meta,"chainBase"),"large":{}})
+    };
+    let ours = tree_changes(&top, &baseline, &json!({"tree":after}), false).ok()?;
+    if ours.is_empty() || !source.is_dir() {
+        return None;
+    }
+    let now = snapshot(&source, run, &strings(&meta["snapshotExclude"]))?;
+    let moved = tree_changes(&source, &baseline, &now, false).ok()?;
+    if moved.is_empty() {
+        return None;
+    }
+    let overlap = moved
+        .iter()
+        .map(|c| s(c, "path"))
+        .filter(|p| ours.iter().any(|c| s(c, "path") == *p))
+        .collect::<Vec<_>>();
+    let mut drift = json!({"files":moved.len(),"overlap":overlap.iter().take(10).collect::<Vec<_>>()});
+    if overlap.len() > 10 {
+        drift["overlapMore"] = json!(overlap.len() - 10);
+    }
+    Some(drift)
+}
 pub fn sync(run: &Path, meta: &Value) -> Res<Vec<String>> {
     let source = PathBuf::from(s(&meta["worktree"], "source"));
     let worktree = PathBuf::from(s(&meta["worktree"], "path"));
@@ -865,7 +900,8 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
         }
         println!(" regenerated      {}", generated_paths.join(", "));
     }
-    if !dry && conflicts.is_empty() && !marked {
+    // Conflict markers still land every change, so record it; only skipped files keep the run unapplied.
+    if !dry && conflicts.is_empty() {
         let mut large_hashes = serde_json::Map::new();
         if let Some(obj) = large.as_object() {
             for path in obj.keys() {
