@@ -201,7 +201,12 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
         )),
         "malformed" => Some("hand it to the other agent or do it yourself".into()),
         "failed" => Some("read error; fix the cause or take it over".into()),
-        "timeout" => Some("split the task smaller or take it over".into()),
+        "timeout" if s(meta, "mode") == "read-only" => Some(format!(
+            "{script} reply {name} 'answer with what you found so far' or split the question"
+        )),
+        "timeout" => Some(format!(
+            "its changes are kept; {script} reply {name} 'continue from your diff, then finish' or split what remains"
+        )),
         "killed" | "crashed" => Some("take it over or start it again".into()),
         _ => None,
     }

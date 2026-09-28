@@ -48,7 +48,7 @@ pub static AGENTS: &[AgentSpec] = &[
     AgentSpec {
         name: "pi",
         default_tier: Some("cheap"),
-        default_timeout: "15m",
+        default_timeout: "25m",
         heavy: false,
         session: SessionSource::DelegateFile,
         read_only_contract: false,
@@ -63,7 +63,7 @@ pub static AGENTS: &[AgentSpec] = &[
     AgentSpec {
         name: "codex",
         default_tier: Some("strong"),
-        default_timeout: "30m",
+        default_timeout: "50m",
         heavy: true,
         session: SessionSource::EventStream,
         read_only_contract: true,
@@ -594,9 +594,9 @@ pub fn run_agent(
     ));
     let start = Instant::now();
     let soft = meta["timeoutSeconds"].as_f64().unwrap_or(900.0);
-    let g = setting("TIMEOUT_GRACE", "50")
+    let g = setting("TIMEOUT_GRACE", "10")
         .parse::<f64>()
-        .unwrap_or(50.0);
+        .unwrap_or(10.0);
     let hard = soft * (1.0 + g / 100.0);
     let (watcher_state, t, go) = (watch.clone(), timed.clone(), grace_out.clone());
     let runpath = run.to_path_buf();

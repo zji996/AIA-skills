@@ -72,7 +72,7 @@
 | `--no-accept` | 否 | 禁用仓库默认验收；reply 中取消继承的验收 |
 | `--hide-accept` | 否 | 不在说明中附验收命令 |
 | `--accept-timeout` | `10m` | 自取得 lane 名额起计 |
-| `--timeout` | pi `15m`，codex `30m` | 每次尝试；§9.2 |
+| `--timeout` | pi `25m`，codex `50m` | 每次尝试；§9.2 |
 | `--retries N` | 1 | 0–3，答复畸形时的重跑次数 |
 | `--provider` `--model` `--thinking` | — | 透传给同事 CLI |
 | `--allow-parallel-writes` | 否 | 跳过写入互斥 |
@@ -303,7 +303,7 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 ### 9.2 同事超时（必须）
 
 - 计时用单调时钟，扣除 lane 排队时间。
-- 到 `--timeout` 时：若有命令正在执行（`bash` 多于 `bash_done`）或最近 120 秒内有事件，继续；最多到 `--timeout × (1 + DELEGATE_TIMEOUT_GRACE/100)`（默认 1.5 倍）。超出即结束同事进程组，判 `timeout`。
+- 到 `--timeout` 时：若有命令正在执行（`bash` 多于 `bash_done`）或最近 120 秒内有事件，继续；最多到 `--timeout × (1 + DELEGATE_TIMEOUT_GRACE/100)`（默认 1.1 倍）。超出即结束同事进程组，判 `timeout`。
 - 应只在判定可能变化的时刻醒来。
 
 ### 9.3 supervisor
