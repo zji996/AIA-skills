@@ -7,7 +7,8 @@
 # Without a download, a checkout that has cargo and crates/<name> builds it instead (--build forces that).
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Test fixtures may override the checkout; normal installs use this script's repository.
+REPO_ROOT="${AIA_SKILLS_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 # GitHub releases are the primary source; the Forgejo instance is tried second when it has them too.
 PRIMARY_RELEASES="${AIA_SKILLS_RELEASES:-https://github.com/zji996/AIA-skills/releases/download}"
 MIRROR_RELEASES="${AIA_SKILLS_MIRROR_RELEASES:-https://git.aiatechco.com:31443/zji996/AIA-skills/releases/download}"
@@ -61,22 +62,26 @@ build_from_source() {
 }
 
 fetch_skill() {
-  local skill=$1 dir="$REPO_ROOT/skills/$1" name version target asset expected tmp bin marker url
+  local skill=$1 dir="$REPO_ROOT/skills/$1" name version target asset expected tmp bin marker url actual
   name="$(frontmatter_value "$dir/SKILL.md" binary)"
   [ -n "$name" ] || return 0
   version="$(frontmatter_value "$dir/SKILL.md" version)"
   bin="$dir/bin/$name"
   marker="$dir/bin/.$name.installed"
   mkdir -p "$dir/bin"
-  if (( BUILD )); then
-    build_from_source "$name" "$bin" && echo "source $(sha256_of "$bin")" > "$marker" && return 0
-    echo "Cannot build $name: needs cargo and $REPO_ROOT/crates/$name" >&2
-    return 1
-  fi
   target="$(target_triple)"
   asset="$name-$target"
   expected="$(awk -v a="$asset" '$2 == a { print $1 }' "$dir/bin.sha256" 2>/dev/null)"
-  if [ -x "$bin" ] && [ -f "$marker" ] && [ "$(cat "$marker")" = "$version $expected" ] \
+  if (( BUILD )); then
+    install_source "$name" "$bin" "$marker" "$expected" "$version" || {
+      echo "Cannot build or verify $name from $REPO_ROOT/crates/$name" >&2
+      return 1
+    }
+    return 0
+  fi
+  if [ -x "$bin" ] && [ -f "$marker" ] &&
+      { [ "$(cat "$marker")" = "$version $expected" ] ||
+        [ "$(cat "$marker")" = "source-verified $version $expected" ]; } \
       && [ "$(sha256_of "$bin")" = "$expected" ]; then
     echo "  [Up to date] $bin ($name $version, $target)"
     return 0
@@ -99,14 +104,35 @@ fetch_skill() {
   else
     echo "  [No release] skills/$skill/bin.sha256 lists no $asset" >&2
   fi
-  if build_from_source "$name" "$bin"; then
-    echo "source $(sha256_of "$bin")" > "$marker"
-    echo "  [Built] $bin (no matching release could be downloaded)"
+  if install_source "$name" "$bin" "$marker" "$expected" "$version"; then
     return 0
   fi
-  echo "Cannot install $name $version for $target: download failed and cargo is not available." >&2
+  echo "Cannot install $name $version for $target: download failed and local build is unavailable or unverified." >&2
   echo "  Retry later, or install Rust (https://rustup.rs) and run: $0 --build $skill" >&2
   return 1
+}
+
+install_source() {
+  local name=$1 bin=$2 marker=$3 expected=$4 version=$5 tmp actual
+  tmp="$(mktemp "$(dirname "$bin")/.$name.build.XXXXXX")" || return 1
+  if ! build_from_source "$name" "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  actual="$(sha256_of "$tmp")"
+  if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
+    echo "  [Warning] 本机构建，未经发布校验: $name ($actual)" >&2
+    if [ "${AIA_SKILLS_REQUIRE_VERIFIED:-}" = 1 ]; then
+      rm -f -- "$tmp"
+      return 1
+    fi
+    mv -f -- "$tmp" "$bin"
+    printf 'source-unverified %s\n' "$actual" > "$marker"
+  else
+    mv -f -- "$tmp" "$bin"
+    printf 'source-verified %s %s\n' "$version" "$expected" > "$marker"
+  fi
+  echo "  [Built] $bin (local source, checksum ${actual})"
 }
 
 status=0

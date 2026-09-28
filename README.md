@@ -18,9 +18,9 @@
 
 | 技能名称 | 目录 | 能力与适用场景 |
 | --- | --- | --- |
-| **`repo-governance`** | `skills/repo-governance/` | **上下文治理与审计**：定义 `AGENTS.md`、`docs/current.md`、决策记录的信息分层；`audit-context.py` 按仓库配置估算 token 预算，支持 `--report`、`--only`，并检查下一步堆积、`.local/` 未忽略、文档断链等漂移问题。 |
-| **`agent-handoff`** | `skills/agent-handoff/` | **会话交接**：`handoff-snapshot.sh` 自动采集分支、HEAD、未提交文件、最近提交、未读取的委派任务与未合并的 worktree，生成交接账本草稿，模型只需补充判断部分。 |
-| **`delegate`** | `skills/delegate/` | **同事 Agent 委派**：后台运行 Pi/Codex，只收结论与下一步；无参 `wait` 按派发会话收取，遗留任务提示年龄。只读默认便宜档、写入默认强档；写入可用 `--worktree` 隔离后 `apply` 合并，并用 `--protect` 划分并行文件所有权。`.delegate.json` 支持 `worktree.copy/link/setup`、`env` 与写入任务默认 `accept`；工具运行验收，用户 systemd 可用时按 cgroup 清理同事及其后台进程，报告端口与空源警告。长答复显示头尾，全文保存在 run 中。整机并发与重检查队列由 Rust 实现（`crates/delegate`）管理。 |
+| **`repo-governance`** | `skills/repo-governance/` | **上下文治理与审计**：定义 `AGENTS.md`、`docs/current.md`、决策记录的信息分层；`audit-context.py` 按仓库配置估算 token 预算与上下文健康度，支持 `--report`、`--only`，并检查下一步堆积、`.local/` 未忽略、文档断链等漂移问题。 |
+| **`agent-handoff`** | `skills/agent-handoff/` | **会话交接**：`handoff-snapshot.sh` 自动采集分支、HEAD、未提交文件、最近提交、`.local/run/delegate/` 与旧 `.local/run/pi/` 的未读取委派任务和未合并 worktree，生成交接账本草稿。 |
+| **`delegate`** | `skills/delegate/` | **同事 Agent 委派**：后台运行 Pi/Codex，只收结论与下一步；无参 `wait` 按派发会话收取，遗留任务提示年龄。只读默认便宜档、写入默认强档；写入可用 `--worktree` 隔离后 `apply` 合并，并用 `--protect` 划分并行文件所有权。`.delegate.json` 支持 `worktree.copy/link/setup`、`env`、`generated` 与写入任务默认 `accept`；工具运行验收，用户 systemd 可用时按 cgroup 清理同事及其后台进程，报告端口与空源警告。长答复显示头尾，全文保存在 run 中。整机并发与重检查队列由 Rust 实现（`crates/delegate`）管理。 |
 | **`openai-image-gen`** | `skills/openai-image-gen/` | **图像生成落盘**：调用 OpenAI Image API 生成配图、Banner、图标等素材，直接写入本地文件并只返回一行 JSON；附提示词、尺寸与费用选择要点。 |
 
 ---
@@ -40,14 +40,14 @@ curl -fsSL https://raw.githubusercontent.com/zji996/AIA-skills/main/scripts/boot
 脚本把仓库克隆到 `~/.local/share/aia-skills`（主仓库克隆失败时自动改用 GitHub），然后以符号链接方式安装全部技能。重复运行同一条命令即可更新。常用参数：
 
 ```bash
-curl -fsSL <上面任一链接> | bash -s -- --ref v2.0.0              # 安装指定版本
+curl -fsSL <上面任一链接> | bash -s -- --ref v3.0.0              # 安装指定版本
 curl -fsSL <上面任一链接> | bash -s -- --copy                    # 拷贝安装
 curl -fsSL <上面任一链接> | bash -s -- agent-handoff             # 只安装指定技能
 curl -fsSL <上面任一链接> | bash -s -- --github --dir ~/aia-skills # 指定来源与位置
 curl -fsSL <上面任一链接> | bash -s -- --with-pi                 # 同时安装或更新 Pi（delegate 需要）
 ```
 
-依赖 `git` 与 bash 4+（macOS 需先 `brew install bash`）。`delegate` 仅支持 Linux x86_64 / aarch64：安装时按 `skills/delegate/bin.sha256` 校验并下载 GitHub Release 中的静态二进制（下载不到而本机有 cargo 时从 `crates/delegate` 编译），另需所选同事的 CLI：`pi` 或 `codex`。
+依赖 `git` 与 bash 4+（macOS 需先 `brew install bash`）。`delegate` 仅支持 Linux x86_64 / aarch64：安装时按 `skills/delegate/bin.sha256` 校验并下载 GitHub Release 中的静态二进制；下载不到而本机有 cargo 时从 `crates/delegate` 编译，不匹配校验和会提示未发布校验，`AIA_SKILLS_REQUIRE_VERIFIED=1` 可拒绝该构建。另需所选同事的 CLI：`pi` 或 `codex`。
 
 ### Pi 与 pi-kit
 
@@ -72,6 +72,7 @@ cd AIA-skills
 ./scripts/install.sh --status                         # 查看已安装条目，标出过期的拷贝
 ./scripts/install.sh --uninstall [<skill>...]         # 只删除本仓库安装的条目
 ./scripts/install.sh repo-governance --force          # 替换指向其他来源的同名符号链接
+./scripts/install-git-hooks.sh                         # 本仓库启用 pre-push 门禁
 ```
 
 **安装模式**：开发机用默认的符号链接，只存一份源码，保存即生效，`git pull` 就是更新。服务器、容器或其他机器用 `--copy`，每份拷贝带 `.aia-skills-install` 标记，记录来源、版本和提交号，`--status` 据此判断是否过期；更新时重新运行 `--copy` 即可。两种模式可以互相切换。
@@ -100,11 +101,10 @@ cd AIA-skills
 ### 验证
 
 ```bash
-./scripts/check.sh
-python3 -m unittest discover -s tests -v   # delegate 用例先 cargo build crates/delegate 再测它；无 cargo 时测已安装的 bin/delegate
+./scripts/verify.sh   # check.sh、单元测试；有 cargo 时运行 crates/delegate 的 clippy
 ```
 
-`check.sh` 检查 frontmatter、`description` 是否写明触发场景、README 索引、`evals/` 触发示例、断链与脚本语法。依赖 Python 3.11+ 和 PyYAML；图像生成脚本另需 `curl`、`jq` 和有效的 OpenAI API key，调用会产生 API 费用。
+`check.sh` 检查 frontmatter、`description` 是否含中英文触发场景、README 索引、`evals/` 触发示例、断链与脚本语法。`install-git-hooks.sh` 只设置本仓库的 `core.hooksPath`，pre-push 会调用 `verify.sh`。依赖 Python 3.11+ 和 PyYAML；图像生成脚本另需 `curl`、`jq` 和有效的 OpenAI API key，调用会产生 API 费用。
 
 ---
 

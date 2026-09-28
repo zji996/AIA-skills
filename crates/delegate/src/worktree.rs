@@ -431,11 +431,13 @@ fn applied_state(run: &Path, meta: &Value) -> Value {
     meta["appliedBase"].clone()
 }
 fn file_hash(path: &Path) -> Res<String> {
-    let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut hash = sha1_smol::Sha1::new();
     let mut buffer = [0; 65536];
     loop {
-        let size = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        let size = file
+            .read(&mut buffer)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         if size == 0 {
             return Ok(hash.digest().to_string());
         }
@@ -526,7 +528,8 @@ pub fn sync(run: &Path, meta: &Value) -> Res<Vec<String>> {
                 continue;
             }
             let scratch = run.join(format!(".sync-merge-{}", std::process::id()));
-            fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+            fs::create_dir_all(&scratch)
+                .map_err(|e| format!("{}: {e}", scratch.display()))?;
             let minefile = scratch.join("mine");
             write(&minefile, mine)?;
             let basefile = scratch.join("base");
@@ -686,9 +689,9 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
             let minefile = scratch.join("mine");
             let basefile = scratch.join("base");
             let theirfile = scratch.join("theirs");
-            write(&minefile, mine)?;
-            write(&basefile, base)?;
-            write(&theirfile, theirs)?;
+            write(&minefile, mine).map_err(|e| format!("{}: {e}", minefile.display()))?;
+            write(&basefile, base).map_err(|e| format!("{}: {e}", basefile.display()))?;
+            write(&theirfile, theirs).map_err(|e| format!("{}: {e}", theirfile.display()))?;
             let status = Command::new("git")
                 .arg("merge-file")
                 .args([
@@ -702,8 +705,10 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
                 .args([&minefile, &basefile, &theirfile])
                 .status()
                 .map_err(|e| e.to_string())?;
-            let merged = fs::read(&minefile).map_err(|e| e.to_string())?;
-            let _ = fs::remove_dir_all(scratch);
+            let merged = fs::read(&minefile)
+                .map_err(|e| format!("{}: {e}", minefile.display()))?;
+            fs::remove_dir_all(&scratch)
+                .map_err(|e| format!("{}: {e}", scratch.display()))?;
             if status.success() {
                 actions.push(Action {
                     kind: "merged".into(),
@@ -756,9 +761,12 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
                     path: path.clone(),
                     target,
                     mode: Some("large".into()),
-                    content: fs::read(origin).map_err(|e| e.to_string())?,
+                    content: fs::read(&origin)
+                        .map_err(|e| format!("{}: {e}", origin.display()))?,
                 });
-            } else if current(&target) != Some(fs::read(origin).map_err(|e| e.to_string())?) {
+            } else if current(&target)
+                != Some(fs::read(&origin).map_err(|e| format!("{}: {e}", origin.display()))?)
+            {
                 conflicts.push(path.clone());
             }
         }
@@ -779,23 +787,24 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
         !actions.is_empty() && !generated_paths.is_empty() && !generate_command.is_empty();
     for a in actions {
         if !dry {
-            match a.kind.as_str() {
+            let operation = match a.kind.as_str() {
                 "deleted" => {
-                    let _ = fs::remove_file(&a.target);
+                    fs::remove_file(&a.target).map_err(|e| e.to_string())
                 }
                 "copied" => {
                     fs::create_dir_all(a.target.parent().unwrap_or(&source))
-                        .map_err(|e| e.to_string())?;
-                    write(&a.target, &a.content)?;
+                        .map_err(|e| format!("apply {}: {e}", a.target.display()))?;
+                    write(&a.target, &a.content)
                 }
                 _ => {
                     if let Some(mode) = a.mode.as_deref() {
-                        write_entry(&a.target, mode, &a.content)?;
+                        write_entry(&a.target, mode, &a.content)
                     } else {
-                        write(&a.target, &a.content)?;
+                        write(&a.target, &a.content)
                     }
                 }
-            }
+            };
+            operation.map_err(|e| format!("apply {}: {e}", a.target.display()))?;
         }
         println!(" {:<16} {}", a.kind, a.path);
     }
@@ -820,17 +829,24 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
             None,
             |_, _| {},
         )?;
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(&generate_command)
-            .current_dir(&source)
-            .output()
-            .map_err(|e| e.to_string())?;
         let log = run.join("generate.log");
-        let mut body = output.stdout;
-        body.extend_from_slice(&output.stderr);
-        write(&log, &body)?;
-        if !output.status.success() {
+        let mut file = fs::File::create(&log)
+            .map_err(|e| format!("apply {}: {e}", log.display()))?;
+        let timeout = seconds(&setting("GENERATE_TIMEOUT", "10m"))?;
+        let (code, timed) = run_shell(
+            (&generate_command, "generate"),
+            &source,
+            run,
+            &meta["env"],
+            timeout,
+            &mut file,
+            None,
+        )
+        .map_err(|e| format!("apply generated.command: {e}"))?;
+        writeln!(file, "\n[exit {code}]")
+            .map_err(|e| format!("apply {}: {e}", log.display()))?;
+        if code != 0 {
+            let body = fs::read(&log).map_err(|e| format!("apply {}: {e}", log.display()))?;
             let tail = String::from_utf8_lossy(&body)
                 .chars()
                 .rev()
@@ -840,8 +856,8 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
                 .rev()
                 .collect::<String>();
             eprintln!(
-                "delegate: regeneration failed ({}); {}\n{}",
-                output.status,
+                "delegate: regeneration {} (exit {code}); {}\n{}",
+                if timed { "timed out" } else { "failed" },
                 log.display(),
                 tail
             );

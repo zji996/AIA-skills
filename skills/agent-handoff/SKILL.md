@@ -3,7 +3,7 @@ name: agent-handoff
 description: 会话上下文快满、要换 Agent 或换设备、任务需要暂停或交给他人时使用；脚本自动采集 Git 与委派任务状态，生成交接账本，接手者无需翻聊天记录即可继续。Use for handoff, resume, context checkpoint, pausing work.
 license: MIT
 metadata:
-  version: "2.1.2"
+  version: "2.1.3"
 ---
 
 # Agent Handoff (任务交接)
@@ -15,10 +15,10 @@ metadata:
 1. 运行快照脚本，拿到已填好事实的草稿：
 
    ```bash
-   <本技能目录>/scripts/handoff-snapshot.sh [--repo <dir>] [--commits 5]
+   <本技能目录>/scripts/handoff-snapshot.sh [--repo <dir>] [--commits <n>]
    ```
 
-   它会填入分支、HEAD、未提交文件、最近提交、要先读的项目文件（`AGENTS.md`、`docs/current.md`、`.local/plan/*.md`），以及 `.local/run/pi/` 里还在运行或结果还没读取的委派任务。
+   它会填入分支、HEAD、未提交文件、最近提交、要先读的项目文件（`AGENTS.md`、`docs/current.md`、`.local/plan/*.md`），以及 `.local/run/delegate/` 和旧 `.local/run/pi/` 里还在运行或结果未读取的任务，并提示尚未合并的写入型 worktree。
 
 2. 补全尖括号占位的部分：目标名称、已完成结果、验证状态、卡点、下一步、关键约束。这些需要判断，脚本给不了。
 3. 按场景输出：直接回复给用户，或写入 `.local/plan/handoff.md`。

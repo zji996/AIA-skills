@@ -33,12 +33,54 @@ pub fn nesting_error() -> Option<String> {
     }
 }
 pub fn agent_available(agent: &str) -> bool {
-    env::var_os("PATH").is_some_and(|p| {
-        env::split_paths(&p).any(|x| {
-            fs::metadata(x.join(agent))
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })
+    agent_bin(agent).is_some()
+}
+pub fn agent_bin(agent: &str) -> Option<PathBuf> {
+    env::split_paths(&env::var_os("PATH")?).find_map(|dir| {
+        let path = dir.join(agent);
+        if fs::metadata(&path)
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        {
+            path.canonicalize().ok()
+        } else {
+            None
+        }
     })
+}
+pub fn agent_identity(agent: &str) -> Res<(PathBuf, Option<String>)> {
+    let bin = agent_bin(agent).ok_or_else(|| format!("missing required tools: {agent}"))?;
+    let mut command = std::process::Command::new(&bin);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    group(&mut command);
+    let version = command.spawn().ok().and_then(|mut child| {
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if started.elapsed() < Duration::from_secs(2) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                _ => {
+                    end_group(child.id() as i32, 0.2);
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+        child.wait_with_output().ok().and_then(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .chain(String::from_utf8_lossy(&out.stderr).lines())
+                .last()
+                .map(str::to_string)
+                .filter(|line| !line.is_empty())
+        })
+    });
+    Ok((bin, version))
 }
 pub fn missing_tools(agent: &str) -> Res<()> {
     if agent_available(agent) {
@@ -339,7 +381,10 @@ pub fn run_agent(
         .ok()
         .map(|e| e.flatten().map(|x| x.path()).collect::<Vec<_>>())
         .unwrap_or_default();
-    let args = command(meta, session.as_deref());
+    let mut args = command(meta, session.as_deref());
+    if !s(meta, "agentBin").is_empty() {
+        args[0] = s(meta, "agentBin").to_string();
+    }
     let prompt = OpenOptions::new()
         .read(true)
         .open(run.join("prompt.md"))

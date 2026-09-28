@@ -1,4 +1,4 @@
-# delegate 规格（v5.6）
+# delegate 规格（v5.8.1）
 
 > 本文是 `skills/delegate` 的**实现契约**：命令行、输出、run 目录、锁与状态机。它是 Rust 重写与 harness 原生接入的依据。
 > 本文不在技能目录内，技能加载时不会读取；模型使用技能只需 `SKILL.md`。行为以本文为准，实现与本文不一致时按缺陷处理。
@@ -90,6 +90,7 @@
 | 字段 | 出现条件 | 含义 |
 |---|---|---|
 | `run` `name` `state` `agent` `mode` `dir` | 总是 | `mode` 为 `write` 或 `read-only`；`state` 见 §4 |
+| `agentBin` | 已解析同事程序 | 当前同事实际执行文件的绝对路径；升档后更新 |
 | `parent` | reply | 上一轮 run id |
 | `after` | 使用 `--after` | 上游 run id |
 | `worktree` | 在 worktree 中运行 | worktree 路径 |
@@ -237,7 +238,9 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 
 **分轮合并**：完整成功的 `apply` 在各 run 的 `.applied` 中记录本次合入的 worktree tree、大文件指纹与内容摘要；之后的 reply 在 `meta.json` 的 `appliedBase` 中继承它。再次 `apply` 以最近一次完整合入的状态为基准，没有记录时用 `chainBase`。有跳过项、写了冲突标记或 `--dry-run` 时不推进基准。`diff --total` 仍展示整段对话；没有待合入的改动时输出 `no changes to apply`，退出码 0。
 
-**生成文件**：`.delegate.json` 的 `"generated": {"paths": [...], "command": "..."}` 声明的路径（语义同 `--protect`）不做三方合并、也不覆盖；改动清单与 diff 仍如实列出。合并写入了文件后，通过 lane 在源仓库根以 `sh -c` 运行 `command` 重新生成，输出写入 run 目录的 `generate.log`；`--dry-run` 只报告将会重新生成；命令失败时退出码 1、显示日志末尾，已合并的文件保留。完全成功时对话内所有 run 及共用该 worktree 的旁支 run 写 `.applied`。只读 run 与原地 run 拒绝 `apply`（退出码 2）。
+删除、复制、写入或重新生成期间任何文件操作失败，`apply` 在 stderr 报告文件路径和原因，以非 0 退出，不写新的 `.applied` 或 `.sync-base`。此前已成功写入的文件保留，worktree 保留；下一次 `apply` 仍从最近一次完整成功的基准重试。冲突且未指定 `--merge` 时保持上述预检语义，源工作区不写入。
+
+**生成文件**：`.delegate.json` 的 `"generated": {"paths": [...], "command": "..."}` 声明的路径（语义同 `--protect`）不做三方合并、也不覆盖；改动清单与 diff 仍如实列出。合并写入了文件后，通过 lane 在源仓库根以 `sh -c` 运行 `command` 重新生成，输出写入 run 目录的 `generate.log`；命令使用 §9.1 的限时执行和进程组回收机制，超时由 `DELEGATE_GENERATE_TIMEOUT` 控制（默认 10m）。`--dry-run` 只报告将会重新生成；命令失败或超时时退出码 1、显示日志末尾，已合并的文件保留，lane 名额释放。完全成功时对话内所有 run 及共用该 worktree 的旁支 run 写 `.applied`。只读 run 与原地 run 拒绝 `apply`（退出码 2）。
 
 ## 7. 会话与任务说明
 
@@ -304,7 +307,7 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 
 ### 9.3 supervisor
 
-由入口以隐藏子命令 `_supervise <run 目录>` 启动（`running` 的判定依赖命令行含 `_supervise`），脱离会话（`start_new_session`），不继承 `DELEGATE_LANE_HELD`；启动后先持有 `<run>/supervisor.lock` 的排他 flock（临时名加锁后 rename）直到进程退出，再写 `pid`。启动方最多等 5 秒 `pid` 出现，否则写 `crashed`。无论何种异常都必须写出 `summary.json` 与 `exit_code`。
+由入口以隐藏子命令 `_supervise <run 目录>` 启动（`running` 的判定依赖命令行含 `_supervise`），脱离会话（`start_new_session`），不继承 `DELEGATE_LANE_HELD`；启动后先持有 `<run>/supervisor.lock` 的排他 flock（临时名加锁后 rename）直到进程退出，再写 `pid`。启动方最多等 5 秒 `pid` 出现；超时先终止整个 supervisor 进程组并回收子进程，再写 `crashed` 的 `summary.json` 与 `exit_code`，不得让迟到的 supervisor 改写 run。无论何种异常都必须写出 `summary.json` 与 `exit_code`。
 
 ### 9.4 stop
 
@@ -322,7 +325,7 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 - 写入互斥：同一 workdir 同时只允许一个原地写入 run（`--allow-parallel-writes` 与 worktree run 除外）。
 - **只有一层委派**：调用者本身是同事（设有 `DELEGATE_AGENT`、`PI_DELEGATE_AGENT` 或 `PI_DELEGATE_ACTIVE`）时，`start`/`run`/`reply` 一律以退出码 2 拒绝；`lane` 等其他命令不受影响。所有结果都回到主控。
 - 自动清理：每次启动删除结束超过 `DELEGATE_KEEP_DAYS`（默认 7，0 关闭）天、已读取（不含只显示过截断答复的）、且没有未 apply 写入 worktree 的 run。
-- `clean`：跳过运行中的与同事进程仍存活的；`--finished` 默认保留未读取的，以及只显示过截断答复的（`wait` 截断打印时写 `.truncated`，完整打印或 `result` 读全文后删除；`--force` 除外）；显式列出的 run 照常删除；提示未 apply 的 worktree。
+- `clean`：跳过运行中的与同事进程仍存活的；`--finished` 默认保留未读取的、只显示过截断答复的（`wait` 截断打印时写 `.truncated`，完整打印或 `result` 读全文后删除），以及未完整 apply 的 worktree run；`--force` 可覆盖这些保留条件。显式列出的 run 照常删除；提示未 apply 的 worktree。
 
 ## 11. 文件与目录
 
@@ -330,7 +333,7 @@ run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git �
 
 | 文件 | 写入者 | 内容 |
 |---|---|---|
-| `meta.json` | 启动方（升档时 supervisor 更新） | run、dir、workdir、mode、agent、tier、escalatedFrom、name、caller、provider、model、thinking、timeout(Seconds)、accept、acceptTimeoutSeconds、retries、images、top、base、snapshotExclude、worktree{source,sourceWorkdir,config,path}、env、chainBase、sessionDir、parent、fork、startedAt/Epoch/Ns |
+| `meta.json` | 启动方（升档时 supervisor 更新） | run、dir、workdir、mode、agent、agentBin（实际解析的绝对执行路径）、agentVersion（该执行文件 `--version` 输出最后一行；取不到则省略）、tier、escalatedFrom、name、caller、provider、model、thinking、timeout(Seconds)、accept、acceptTimeoutSeconds、retries、images、top、base、snapshotExclude、worktree{source,sourceWorkdir,config,path}、env、chainBase、sessionDir、parent、fork、startedAt/Epoch/Ns |
 | `prompt.md` | 启动方 | 同事收到的全文 |
 | `supervisor.lock` / `pid` / `agent.pid` | supervisor | 生命周期锁 / supervisor pid / 同事进程组 |
 | `events.jsonl` `stderr.log` `supervisor.log` | supervisor | §7.2 / 同事 stderr / supervisor 输出 |
@@ -360,7 +363,9 @@ run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git �
 
 `env` 为字符串到字符串的映射，注入同事、验收与 setup（原地与 worktree 均生效，reply 沿用）；`copy`/`link` 必须是仓库内相对路径，缺源跳过并在启动命令与 supervisor 的 stderr 提示。
 
-环境变量均先读 `DELEGATE_<名>`，再读 `PI_DELEGATE_<名>`：`RUNS`、`CHEAP_AGENT`（pi）、`STRONG_AGENT`（codex）、`MAX_ACTIVE`、`MAX_CODEX`、`MAX_HEAVY`、`MIN_AVAILABLE_MB`、`TIMEOUT_GRACE`、`RESULT_CHARS`（6000）、`KEEP_DAYS`、`POLL`、`SNAPSHOT_MAX_BYTES`、`SETUP_TIMEOUT`（10m）。`DELEGATE_CALLER` 单独按上述优先级取值，不读取 `PI_DELEGATE_CALLER`。由实现导出、调用方不应设置的保护变量：`DELEGATE_AGENT`、`DELEGATE_RUN_DIR`、`DELEGATE_LANE_HELD`、`PI_DELEGATE_ACTIVE`、`PI_DELEGATE_AGENT`、`PI_DELEGATE_PARENT_RUN`。
+环境变量均先读 `DELEGATE_<名>`，再读 `PI_DELEGATE_<名>`：`RUNS`、`CHEAP_AGENT`（pi）、`STRONG_AGENT`（codex）、`MAX_ACTIVE`、`MAX_CODEX`、`MAX_HEAVY`、`MIN_AVAILABLE_MB`、`TIMEOUT_GRACE`、`RESULT_CHARS`（6000）、`KEEP_DAYS`、`POLL`、`SNAPSHOT_MAX_BYTES`、`SETUP_TIMEOUT`（10m）、`GENERATE_TIMEOUT`（10m）。`DELEGATE_CALLER` 单独按上述优先级取值，不读取 `PI_DELEGATE_CALLER`。由实现导出、调用方不应设置的保护变量：`DELEGATE_AGENT`、`DELEGATE_RUN_DIR`、`DELEGATE_LANE_HELD`、`PI_DELEGATE_ACTIVE`、`PI_DELEGATE_AGENT`、`PI_DELEGATE_PARENT_RUN`。
+
+仅测试构建（debug）可用且默认关闭的环境变量：`DELEGATE_TEST_SUPERVISOR_DELAY` 使 supervisor 在写 `pid` 前延迟指定时长，`DELEGATE_TEST_STARTUP_TIMEOUT` 缩短启动方等待 `pid` 的时限；用于黑盒验证超时回收，正式发布构建忽略它们。
 
 ## 13. 一致性验收
 

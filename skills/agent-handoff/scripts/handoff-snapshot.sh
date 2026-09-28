@@ -74,10 +74,25 @@ for meta in .local/run/delegate/*/meta.json .local/run/pi/*/meta.json; do
   fi
   # --worktree 的改动留在独立 worktree，直到 `delegate apply`；同一对话只报最新一轮。
   # 只读任务的 worktree 只是供阅读的快照，没有可合并的改动。
-  # 按 JSON 键匹配、容忍任意空白：delegate 的 Python 与 Rust 实现写出的格式不同。
-  worktree="$(grep -oE '"path"[[:space:]]*:[[:space:]]*"[^"]*"' "$meta" | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)"$/\1/' || true)"
-  if grep -qE '"mode"[[:space:]]*:[[:space:]]*"read-only"' "$meta"; then
-    worktree=
+  if command -v python3 >/dev/null 2>&1; then
+    worktree="$(python3 - "$meta" <<'PY'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding='utf-8') as source:
+        data = json.load(source)
+    if data.get('mode') != 'read-only':
+        print(data.get('worktree', {}).get('path') or '')
+except (OSError, ValueError, TypeError, AttributeError):
+    pass
+PY
+)"
+  else
+    # Fallback cannot decode escaped JSON quotes or backslashes in paths.
+    worktree="$(grep -oE '"path"[[:space:]]*:[[:space:]]*"[^"]*"' "$meta" | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)"$/\1/' || true)"
+    if grep -qE '"mode"[[:space:]]*:[[:space:]]*"read-only"' "$meta"; then
+      worktree=
+    fi
   fi
   if [[ -f "$dir/exit_code" && -n "$worktree" && -d "$worktree" ]]; then
     if [[ -f "$dir/.applied" ]]; then

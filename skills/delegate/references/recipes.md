@@ -84,6 +84,7 @@ $D wait
 {
   "env": {"CUDA_VISIBLE_DEVICES": ""},
   "accept": "./scripts/check.sh && python3 -m unittest discover -s tests",
+  "generated": {"paths": ["src/generated/"], "command": "./scripts/generate.sh"},
   "worktree": {
     "copy": [".env", ".local/scan"],
     "link": ["third_party/some-submodule", "models/weights"],
@@ -99,6 +100,7 @@ $D wait
 - `writeSetup` 只在写入任务里、`setup` 之后执行：装起来慢、只有跑测试才用得上的环境（如含 torch 的 venv）放这里，只读侦察不必等。
 - `env` 在原地运行时同样生效。
 - 顶层 `accept` 只作用于写入任务；显式 `--accept` 覆盖，`--no-accept` 关闭。并行写入用 `--protect` 划分文件所有权；验收覆盖相关 ratchet、contracts、docs 门禁，合并后再跑全量。
+- `generated.paths` 的匹配语义同 `--protect`（目录以 `/` 结尾）。这些生成文件仍出现在改动清单和 diff 中，但 `apply` 不合并或覆盖它们；合并其他文件后，在源仓库根通过 lane 运行 `sh -c` 执行 `generated.command`，输出写入 run 目录的 `generate.log`。`--dry-run` 只报告动作；生成失败时已合并文件保留，需查看日志后重试。见 `docs/delegate-spec.md` §6.4。
 - 强档并发紧时界面实现可用 `--tier cheap`。
 
 ## 常见坑

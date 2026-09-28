@@ -106,7 +106,8 @@ class DelegateTests(unittest.TestCase):
 
     def fake_pi(self, *attempts, pre="", sleep=0, code=0):
         """Each attempt is a list of events; later calls reuse the last attempt."""
-        lines = ["#!/bin/sh", "cat > /dev/null", 'echo "$$ $PI_DELEGATE_ACTIVE $*" >> "$PI_LOG"',
+        lines = ["#!/bin/sh", '[ "$1" = --version ] && { echo "fake-pi 1.0"; exit 0; }',
+                 "cat > /dev/null", 'echo "$$ $PI_DELEGATE_ACTIVE $*" >> "$PI_LOG"',
                  # Like Pi, keep the session as <dir>/<time>_<id>.jsonl.
                  'dir=; id=; prev=; for a in "$@"; do case "$prev" in --session-dir) dir=$a;; --session-id) id=$a;; '
                  'esac; prev=$a; done; [ -n "$dir" ] && mkdir -p "$dir" && touch "$dir/t_${id:-f$$}.jsonl"',
@@ -120,7 +121,8 @@ class DelegateTests(unittest.TestCase):
         pi.chmod(0o755)
 
     def fake_codex(self, events, pre=""):
-        lines = ["#!/bin/sh", 'cat > "$PI_LOG.codex-prompt"',
+        lines = ["#!/bin/sh", '[ "$1" = --version ] && { echo "fake-codex 1.0"; exit 0; }',
+                 'cat > "$PI_LOG.codex-prompt"',
                  'echo "$$ ${DELEGATE_AGENT:-} ${PI_DELEGATE_ACTIVE:-} $*" >> "$PI_LOG.codex"', pre,
                  "printf '%s\\n' " + " ".join(shlex.quote(json.dumps(e)) for e in events)]
         codex = self.bin / "codex"
@@ -149,6 +151,9 @@ class DelegateTests(unittest.TestCase):
             for option in options:
                 self.assertIn(option, result.stdout, command)
         self.assertEqual(self.cli("-h").returncode, 0)
+        wait_help = self.cli("wait", "--help").stdout
+        self.assertIn("regardless of caller", " ".join(wait_help.split()))
+        self.assertNotIn("(the default)", wait_help)
         skill = (ROOT / "skills/delegate/SKILL.md").read_text()
         version = re.search(r'^\s*version:\s*"?([\d.]+)', skill, re.M).group(1)
         result = self.cli("--version")
@@ -158,6 +163,30 @@ class DelegateTests(unittest.TestCase):
         self.fake_pi([answer("ok"), SETTLED])
         line = next(l for l in self.cli("run", "--read-only", "task").stdout.splitlines() if l.startswith('{"run"'))
         self.assertEqual(list(json.loads(line))[:3], ["run", "name", "state"])  # read at a glance, not alphabetically
+
+    def test_agent_executable_and_version_are_recorded_in_meta_and_status(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        state = self.outcome(self.cli("run", "--agent", "pi", "task"))
+        meta = json.loads((Path(state["dir"]) / "meta.json").read_text())
+        self.assertEqual(meta["agentBin"], str((self.bin / "pi").resolve()))
+        self.assertTrue(Path(meta["agentBin"]).is_absolute())
+        self.assertEqual(meta["agentVersion"], "fake-pi 1.0")
+        self.assertEqual(state["agentBin"], meta["agentBin"])
+        self.assertEqual(self.outcome(self.cli("status", state["run"]))["agentBin"], meta["agentBin"])
+
+    def test_supervisor_startup_timeout_reaps_process_before_crashed_result(self):
+        self.fake_pi([answer("late"), SETTLED])
+        self.env.update(DELEGATE_TEST_SUPERVISOR_DELAY="2s", DELEGATE_TEST_STARTUP_TIMEOUT="0.2s")
+        result = self.cli("start", "--agent", "pi", "task")
+        self.assertNotEqual(result.returncode, 0)
+        run, = (self.work / "runs").glob("*/meta.json")
+        run = run.parent
+        self.assertEqual(self.outcome(self.cli("status", str(run)))["state"], "crashed")
+        self.assertTrue(process_gone(run / "startup.pid"))
+        before = {p.name: p.stat().st_mtime_ns for p in run.iterdir()}
+        time.sleep(2.1)
+        self.assertEqual(before, {p.name: p.stat().st_mtime_ns for p in run.iterdir()})
+        self.assertFalse((run / "pid").exists())
 
     def test_answered_run_reports_once(self):
         write = {"type": "tool_execution_start", "toolName": "write", "args": {"path": "a.txt", "content": "x" * 5000}}
@@ -1580,6 +1609,46 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual((repo / "src.txt").read_text(), "one\n2\nthree\n")
         self.assertEqual((repo / "gen/out.txt").read_text(), "one\n2\nthree\n")  # regenerated from the merge
         self.assertIn("regenerated", applied.stdout + applied.stderr)
+
+    def test_apply_delete_failure_keeps_worktree_unapplied(self):
+        repo = self.repo({"locked/old.txt": "old\n"})
+        self.fake_pi([answer("done"), SETTLED], pre="rm locked/old.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        directory = repo / "locked"
+        directory.chmod(0o555)
+        self.addCleanup(directory.chmod, 0o755)
+        if os.access(directory, os.W_OK):
+            self.skipTest("chmod cannot deny writes for this user")
+        failed = self.cli("apply", state["run"])
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("locked/old.txt", failed.stderr)
+        self.assertIn("Permission denied", failed.stderr)
+        run = Path(state["dir"])
+        self.assertFalse((run / ".applied").exists())
+        self.assertFalse((run / ".sync-base").exists())
+        self.assertTrue(Path(state["worktree"]).exists())
+        self.cli("clean", "--finished")
+        self.assertTrue(run.exists())
+        self.assertTrue(Path(state["worktree"]).exists())
+
+    def test_generation_timeout_fails_apply_and_releases_lane(self):
+        repo = self.repo({"src.txt": "old\n", "gen/out.txt": "old\n"})
+        (repo / ".delegate.json").write_text(json.dumps({"generated": {
+            "paths": ["gen/"], "command": "sleep 30; cp src.txt gen/out.txt"}}))
+        self.fake_pi([answer("done"), SETTLED], pre="echo new > src.txt; cp src.txt gen/out.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        self.env["DELEGATE_GENERATE_TIMEOUT"] = "0.2s"
+        failed = self.cli("apply", state["run"], timeout=15)
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        self.assertIn("timed out", failed.stderr)
+        run = Path(state["dir"])
+        self.assertFalse((run / ".applied").exists())
+        self.assertFalse((run / ".sync-base").exists())
+        self.assertEqual((repo / "src.txt").read_text(), "new\n")
+        started = time.monotonic()
+        lane = self.cli("lane", "true", timeout=5)
+        self.assertEqual(lane.returncode, 0, lane.stderr)
+        self.assertLess(time.monotonic() - started, 3)
 
     def test_worktree_in_a_repository_without_commits(self):
         repo = self.work / "fresh"

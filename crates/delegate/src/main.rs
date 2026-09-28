@@ -23,6 +23,7 @@ fn status_line(run: &Path) -> String {
         "name",
         "state",
         "agent",
+        "agentBin",
         "tier",
         "mode",
         "parent",
@@ -316,9 +317,16 @@ fn clean(args: &[String]) -> Res<i32> {
     if has(&flags, "--finished") {
         for run in runs::all_runs() {
             if has(&flags, "--force")
-                || (run.join(".delivered").exists() && !run.join(".truncated").exists())
+                || (run.join(".delivered").exists()
+                    && !run.join(".truncated").exists()
+                    && !runs::unmerged(&run))
             {
                 targets.push(run);
+            } else if runs::unmerged(&run) {
+                eprintln!(
+                    "delegate: keep unmerged worktree run {}; apply it or pass --force",
+                    run.file_name().unwrap_or_default().to_string_lossy()
+                );
             } else if run.join(".delivered").exists() {
                 eprintln!(
                     "delegate: keep run {0}; its answer was only shown truncated; read it with `result {0}` or pass --force",

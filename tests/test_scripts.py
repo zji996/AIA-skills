@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import importlib.util
 import json
 import re
@@ -16,6 +17,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 INSTALL = ROOT / "scripts/install.sh"
 CHECK = ROOT / "scripts/check.sh"
+FETCH = ROOT / "scripts/fetch-binary.sh"
+RELEASE = ROOT / "scripts/release-binary.sh"
+VERIFY = ROOT / "scripts/verify.sh"
+INSTALL_HOOKS = ROOT / "scripts/install-git-hooks.sh"
 BOOTSTRAP = ROOT / "scripts/bootstrap.sh"
 IMAGE = ROOT / "skills/openai-image-gen/scripts/generate-image.sh"
 SNAPSHOT = ROOT / "skills/agent-handoff/scripts/handoff-snapshot.sh"
@@ -141,14 +146,145 @@ class ScriptTests(unittest.TestCase):
         self.assertTrue(copy.is_dir() and not copy.is_symlink())
         marker = (copy / ".aia-skills-install").read_text()
         self.assertIn(f"source={ROOT / 'skills'}", marker)
-        self.assertIn("version=2.1.2", marker)
+        self.assertIn("version=2.1.3", marker)
         self.assertTrue((copy / "scripts/handoff-snapshot.sh").is_file())
         self.assertNotIn("outdated", self.run_script(INSTALL, "--status", env=env).stdout)
-        (copy / ".aia-skills-install").write_text(marker.replace("version=2.1.2", "version=0.1.0"))
+        (copy / ".aia-skills-install").write_text(marker.replace("version=2.1.3", "version=0.1.0"))
         self.assertIn("outdated", self.run_script(INSTALL, "--status", env=env).stdout)
         self.assertEqual(self.run_script(INSTALL, "agent-handoff", env=env).returncode, 0)
         self.assertEqual(copy.resolve(), ROOT / "skills/agent-handoff")
         self.assertTrue(copy.is_symlink())
+
+    def test_install_recovers_copy_and_link_after_replacement_failure(self):
+        home = self.work / "home"
+        env = {**os.environ, "HOME": str(home)}
+        dest = home / ".agents/skills/agent-handoff"
+        self.assertEqual(self.run_script(INSTALL, "--copy", "agent-handoff", env=env).returncode, 0)
+        (dest / "sentinel").write_text("old copy")
+        failed = {**env, "AIA_SKILLS_TEST_FAIL_REPLACE": "after_backup"}
+        for args in (("--copy", "agent-handoff"), ("agent-handoff",)):
+            result = self.run_script(INSTALL, *args, env=failed)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((dest / "sentinel").read_text(), "old copy")
+            self.assertFalse(dest.is_symlink())
+            self.assertEqual(list(dest.parent.glob(".agent-handoff.stage.*")), [])
+
+    def test_install_recovers_link_after_replacement_failure(self):
+        home = self.work / "home"
+        env = {**os.environ, "HOME": str(home)}
+        dest = home / ".agents/skills/agent-handoff"
+        self.assertEqual(self.run_script(INSTALL, "agent-handoff", env=env).returncode, 0)
+        result = self.run_script(INSTALL, "--copy", "agent-handoff",
+                                 env={**env, "AIA_SKILLS_TEST_FAIL_REPLACE": "after_backup"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(dest.is_symlink())
+        self.assertEqual(dest.resolve(), ROOT / "skills/agent-handoff")
+
+    def binary_fixture(self, name):
+        repo = self.work / name
+        skill = repo / "skills/demo"
+        crate = repo / "crates/demo"
+        dist = repo / "dist/demo-v1.2.3"
+        for directory in (skill, crate, dist):
+            directory.mkdir(parents=True)
+        (skill / "SKILL.md").write_text('---\nname: demo\nbinary: demo\nmetadata:\n  version: "1.2.3"\n---\n')
+        (crate / "Cargo.toml").write_text('[package]\nname = "demo"\nversion = "1.2.3"\n')
+        (crate / "Cargo.lock").write_text("# lock\n")
+        asset = "demo-x86_64-unknown-linux-musl"
+        (dist / asset).write_bytes(b"published")
+        checksum = hashlib.sha256(b"published").hexdigest()
+        (skill / "bin.sha256").write_text(f"{checksum}  {asset}\n")
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "skills", "crates"], check=True)
+        self.git_commit(repo)
+        return repo, skill, crate, dist, asset
+
+    def git_commit(self, repo):
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                        "commit", "-q", "-m", "fixture", "--allow-empty"], check=True)
+
+    def test_release_verify_accepts_committed_matching_artifacts(self):
+        repo, _, _, _, _ = self.binary_fixture("release-good")
+        env = {**os.environ, "AIA_SKILLS_REPO_ROOT": str(repo)}
+        self.assertEqual(self.run_script(RELEASE, "verify", "demo", env=env).returncode, 0)
+        subprocess.run(["git", "-C", str(repo), "tag", "demo-v1.2.3"], check=True)
+        self.assertEqual(self.run_script(RELEASE, "verify", "demo", env=env).returncode, 0)
+
+    def test_release_verify_rejects_version_dirty_paths_checksum_and_tag(self):
+        cases = {
+            "version": lambda r, s, c, d, a: (c / "Cargo.toml").write_text('[package]\nversion = "9.0.0"\n'),
+            "skill-untracked": lambda r, s, c, d, a: (s / "extra").write_text("dirty"),
+            "crate-staged": lambda r, s, c, d, a: self.stage_dirty_crate(r, c),
+            "lock-missing": lambda r, s, c, d, a: (c / "Cargo.lock").unlink(),
+            "checksum": lambda r, s, c, d, a: (d / a).write_bytes(b"tampered"),
+            "tag": lambda r, s, c, d, a: self.tag_previous_commit(r),
+        }
+        for name, change in cases.items():
+            with self.subTest(name=name):
+                fixture = self.binary_fixture(f"release-{name}")
+                change(*fixture)
+                result = self.run_script(RELEASE, "verify", "demo",
+                                         env={**os.environ, "AIA_SKILLS_REPO_ROOT": str(fixture[0])})
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def stage_dirty_crate(self, repo, crate):
+        (crate / "Cargo.lock").write_text("changed\n")
+        subprocess.run(["git", "-C", str(repo), "add", "crates/demo/Cargo.lock"], check=True)
+
+    def tag_previous_commit(self, repo):
+        self.git_commit(repo)
+        subprocess.run(["git", "-C", str(repo), "tag", "demo-v1.2.3", "HEAD~1"], check=True)
+
+    def test_release_publish_stops_before_tagging_when_verify_fails(self):
+        repo, skill, _, _, _ = self.binary_fixture("release-publish")
+        (skill / "extra").write_text("dirty")
+        result = self.run_script(RELEASE, "publish", "demo",
+                                 env={**os.environ, "AIA_SKILLS_REPO_ROOT": str(repo)})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Commit all changes", result.stderr)
+        tag = subprocess.run(["git", "-C", str(repo), "tag", "-l", "demo-v1.2.3"],
+                             capture_output=True, text=True, check=True)
+        self.assertEqual(tag.stdout, "")
+
+    def test_fetch_binary_fallback_marks_unverified_and_strict_mode_preserves_old(self):
+        repo, skill, crate, _, _ = self.binary_fixture("fetch-fallback")
+        fake = self.work / "fake-bin"
+        fake.mkdir()
+        for name, body in {
+            "curl": "#!/bin/sh\nexit 22\n",
+            "cargo": "#!/bin/sh\nmkdir -p target/release\nprintf local-build > target/release/demo\n",
+        }.items():
+            path = fake / name
+            path.write_text(body)
+            path.chmod(0o755)
+        env = {**os.environ, "PATH": f"{fake}:{os.environ['PATH']}",
+               "AIA_SKILLS_REPO_ROOT": str(repo), "AIA_SKILLS_RELEASES": "http://invalid.local"}
+        old = skill / "bin/demo"
+        old.parent.mkdir()
+        old.write_bytes(b"old")
+        result = self.run_script(FETCH, "demo", env={**env, "AIA_SKILLS_REQUIRE_VERIFIED": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("本机构建，未经发布校验", result.stderr)
+        self.assertEqual(old.read_bytes(), b"old")
+        result = self.run_script(FETCH, "demo", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(old.read_bytes(), b"local-build")
+        self.assertTrue((skill / "bin/.demo.installed").read_text().startswith("source-unverified "))
+
+    def test_fetch_binary_matching_local_build_is_marked_verified(self):
+        repo, skill, _, _, asset = self.binary_fixture("fetch-verified")
+        checksum = hashlib.sha256(b"local-build").hexdigest()
+        (skill / "bin.sha256").write_text(f"{checksum}  {asset}\n")
+        fake = self.work / "fake-verified"
+        fake.mkdir()
+        cargo = fake / "cargo"
+        cargo.write_text("#!/bin/sh\nmkdir -p target/release\nprintf local-build > target/release/demo\n")
+        cargo.chmod(0o755)
+        env = {**os.environ, "PATH": f"{fake}:{os.environ['PATH']}",
+               "AIA_SKILLS_REPO_ROOT": str(repo), "AIA_SKILLS_REQUIRE_VERIFIED": "1"}
+        result = self.run_script(FETCH, "--build", "demo", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((skill / "bin/.demo.installed").read_text(), f"source-verified 1.2.3 {checksum}\n")
 
     def test_bootstrap_clones_with_fallback_then_updates(self):
         upstream = self.work / "upstream"
@@ -228,9 +364,13 @@ class ScriptTests(unittest.TestCase):
         (repository / "evals/example.md").write_text("# example\n")
         (repository / "README.md").write_text("| **`example`** | `skills/example/` | example |\n")
         skill_file = skill / "SKILL.md"
-        skill_file.write_text("---\nname: example\ndescription: Use when testing.\nmetadata:\n  version: \"1.0.0\"\n---\n\n# Example\n")
+        skill_file.write_text("---\nname: example\ndescription: 测试时使用。Use when testing.\nmetadata:\n  version: \"1.0.0\"\n---\n\n# Example\n")
         check = repository / "scripts/check.sh"
         self.assertEqual(self.run_script(check).returncode, 0)
+        skill_file.write_text("---\nname: example\ndescription: 测试时使用\nmetadata:\n  version: \"1.0.0\"\n---\n")
+        result = self.run_script(check)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Chinese and English", result.stderr)
         skill_file.write_text("---\nname: example\ndescription: usable\n---\n\nrun ./skills/example/x.sh\n")
         result = self.run_script(check)
         self.assertIn("say when to use", result.stderr)
@@ -250,6 +390,50 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("invalid YAML", self.run_script(check).stderr)
         (repository / "README.md").write_text("# Empty index\n")
         self.assertIn("missing skill index", self.run_script(check).stderr)
+
+    def test_verify_runs_gates_in_order_and_stops_on_failure(self):
+        repo = self.work / "gate"
+        (repo / "scripts").mkdir(parents=True)
+        (repo / "crates/delegate").mkdir(parents=True)
+        shutil.copy2(VERIFY, repo / "scripts/verify.sh")
+        check = repo / "scripts/check.sh"
+        check.write_text('#!/bin/sh\necho check >> "$GATE_LOG"\n[ "$FAIL_GATE" != check ]\n')
+        check.chmod(0o755)
+        fake = self.work / "gate-bin"
+        fake.mkdir()
+        for name in ("python3", "cargo"):
+            script = fake / name
+            script.write_text(f'#!/bin/sh\necho {name} >> "$GATE_LOG"\n[ "$FAIL_GATE" != {name} ]\n')
+            script.chmod(0o755)
+        log = self.work / "gate.log"
+        env = {**os.environ, "PATH": f"{fake}:{os.environ['PATH']}", "GATE_LOG": str(log)}
+        for failure, expected in (("check", ["check"]), ("python3", ["check", "python3"]),
+                                  ("cargo", ["check", "python3", "cargo"]),
+                                  ("none", ["check", "python3", "cargo"])):
+            with self.subTest(failure=failure):
+                log.unlink(missing_ok=True)
+                result = self.run_script(repo / "scripts/verify.sh", env={**env, "FAIL_GATE": failure})
+                self.assertEqual(result.returncode == 0, failure == "none", result.stderr)
+                self.assertEqual(log.read_text().splitlines(), expected)
+
+    def test_install_git_hooks_is_local_idempotent_and_pre_push_runs_verify(self):
+        repo = self.git_repo()
+        (repo / "scripts").mkdir()
+        (repo / ".githooks").mkdir()
+        shutil.copy2(INSTALL_HOOKS, repo / "scripts/install-git-hooks.sh")
+        shutil.copy2(ROOT / ".githooks/pre-push", repo / ".githooks/pre-push")
+        verify = repo / "scripts/verify.sh"
+        verify.write_text('#!/bin/sh\nprintf called > "$HOOK_LOG"\n')
+        verify.chmod(0o755)
+        for _ in range(2):
+            self.assertEqual(self.run_script(repo / "scripts/install-git-hooks.sh").returncode, 0)
+        config = subprocess.run(["git", "-C", str(repo), "config", "--local", "--get", "core.hooksPath"],
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(config.stdout.strip(), ".githooks")
+        log = self.work / "hook.log"
+        result = self.run_script(repo / ".githooks/pre-push", env={**os.environ, "HOOK_LOG": str(log)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(log.read_text(), "called")
 
     def git_repo(self):
         repo = self.work / "repo"
@@ -295,6 +479,19 @@ class ScriptTests(unittest.TestCase):
             (run / "meta.json").write_text(json.dumps(meta, separators=separators))
         (run / ".applied").touch()
         self.assertNotIn("review", self.run_script(SNAPSHOT, "--repo", repo).stdout)
+
+    def test_handoff_snapshot_decodes_escaped_worktree_path(self):
+        repo = self.git_repo()
+        tree = self.work / 'tree-"quote"-\\backslash'
+        tree.mkdir()
+        run = repo / ".local/run/delegate/escaped"
+        run.mkdir(parents=True)
+        (run / "meta.json").write_text(json.dumps({"mode": "write", "worktree": {"path": str(tree)}}))
+        (run / "exit_code").write_text("0")
+        (run / ".delivered").touch()
+        result = self.run_script(SNAPSHOT, "--repo", repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"escaped 的 worktree 改动未合并：{tree}", result.stdout)
 
     def test_audit_context_reports_drift(self):
         repo = self.git_repo()

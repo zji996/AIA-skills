@@ -257,6 +257,13 @@ fn escalate(
     }
     meta["escalatedFrom"] = meta["agent"].clone();
     meta["agent"] = json!(strong);
+    let (agent_bin, agent_version) = agents::agent_identity(s(meta, "agent"))?;
+    meta["agentBin"] = json!(agent_bin);
+    if let Some(version) = agent_version {
+        meta["agentVersion"] = json!(version);
+    } else {
+        meta.as_object_mut().unwrap().remove("agentVersion");
+    }
     meta["tier"] = json!("strong");
     meta["fork"] = Value::Null;
     write_json(run.join("meta.json"), meta)?;
@@ -568,6 +575,13 @@ fn admit_waiting(run: &Path, meta: &Value, stop_waiter: &StopWaiter) -> Res<()> 
     }
 }
 pub fn supervise(run: &Path) -> Res<()> {
+    if cfg!(debug_assertions) {
+        if let Ok(delay) = std::env::var("DELEGATE_TEST_SUPERVISOR_DELAY") {
+            let delay = seconds(&delay)?;
+            write(run.join("startup.pid"), std::process::id().to_string())?;
+            std::thread::sleep(Duration::from_secs_f64(delay));
+        }
+    }
     crate::cleanup::probe_systemd();
     let _life = locked_file(
         &run.join("supervisor.lock"),

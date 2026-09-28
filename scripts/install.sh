@@ -188,16 +188,37 @@ for skill in "${SELECTED_SKILLS[@]}"; do
   done
 done
 
-install_copy() {
-  local skill=$1 src=$2 dest=$3 tmp
-  tmp="$(dirname "$dest")/.$skill.tmp.$$"
-  rm -rf -- "$tmp"
-  cp -R -- "$src" "$tmp"
-  find "$tmp" -name __pycache__ -type d -prune -exec rm -rf {} +
-  printf 'source=%s\nversion=%s\ncommit=%s\n' "$SKILLS_SRC" \
-    "$(frontmatter_value "$src/SKILL.md" version | xargs)" "$(source_commit "$skill")" > "$tmp/$MARKER"
-  if [ -L "$dest" ] || [ -e "$dest" ]; then remove_entry "$dest"; fi
-  mv -- "$tmp" "$dest"
+replace_entry() {
+  local skill=$1 src=$2 dest=$3 mode=$4 staging
+  staging="$(mktemp -d "$(dirname "$dest")/.$skill.stage.XXXXXX")" || return 1
+  if [ "$mode" = copy ]; then
+    if ! cp -R -- "$src" "$staging/new" ||
+       ! find "$staging/new" -name __pycache__ -type d -prune -exec rm -rf {} + ||
+       ! printf 'source=%s\nversion=%s\ncommit=%s\n' "$SKILLS_SRC" \
+         "$(frontmatter_value "$src/SKILL.md" version | xargs)" "$(source_commit "$skill")" > "$staging/new/$MARKER"; then
+      rm -rf -- "$staging"
+      return 1
+    fi
+  elif ! ln -s -- "$src" "$staging/new"; then
+    rm -rf -- "$staging"
+    return 1
+  fi
+  if [ -L "$dest" ] || [ -e "$dest" ]; then
+    if ! mv -- "$dest" "$staging/old"; then
+      rm -rf -- "$staging"
+      return 1
+    fi
+  fi
+  # Test-only fault injection checks the rollback after the old entry is moved.
+  if { [ "${AIA_SKILLS_TEST_FAIL_REPLACE:-}" != after_backup ] && mv -- "$staging/new" "$dest"; }; then
+    rm -rf -- "$staging"
+    return 0
+  fi
+  if [ -L "$staging/old" ] || [ -e "$staging/old" ]; then
+    mv -- "$staging/old" "$dest" || { echo "Restore failed: $staging/old -> $dest" >&2; return 1; }
+  fi
+  rm -rf -- "$staging"
+  return 1
 }
 
 echo "=== Installing AIA-skills ($MODE) ==="
@@ -226,11 +247,10 @@ for skill in "${SELECTED_SKILLS[@]}"; do
         echo "  [Already linked] $dest"
         continue
       fi
-      if [ -e "$dest" ] && [ ! -L "$dest" ]; then remove_entry "$dest"; fi
-      ln -sfnT "$src" "$dest"
+      replace_entry "$skill" "$src" "$dest" link
       echo "  [Linked] $dest"
     else
-      install_copy "$skill" "$src" "$dest"
+      replace_entry "$skill" "$src" "$dest" copy
       echo "  [Copied] $dest"
     fi
   done

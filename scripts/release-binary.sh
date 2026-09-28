@@ -14,7 +14,8 @@
 # so the token is never stored on the releasing machine.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Test fixtures may override the checkout; normal releases use this script's repository.
+REPO_ROOT="${AIA_SKILLS_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 TARGETS=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl)
 FORGEJO_API="${FORGEJO_API:-https://git.aiatechco.com:31443/api/v1/repos/zji996/AIA-skills}"
 GITHUB_REPO="${GITHUB_REPO:-zji996/AIA-skills}"
@@ -37,7 +38,7 @@ forgejo_token_over_ssh() {
     || { FORGEJO_TOKEN=""; echo "  [Forgejo] could not read the token from $FORGEJO_TOKEN_SSH" >&2; }
 }
 
-usage() { echo "usage: release-binary.sh build|publish <skill>" >&2; exit 2; }
+usage() { echo "usage: release-binary.sh build|verify|publish <skill>" >&2; exit 2; }
 (( $# == 2 )) || usage
 ACTION=$1 SKILL=$2
 DIR="$REPO_ROOT/skills/$SKILL"
@@ -67,12 +68,42 @@ build() {
   echo "Next: commit skills/$SKILL/bin.sha256 with the version bump, push, then: $0 publish $SKILL"
 }
 
+verify() {
+  local crate="$REPO_ROOT/crates/$NAME" cargo_version head tag_commit
+  [ -f "$crate/Cargo.toml" ] && [ -f "$crate/Cargo.lock" ] || {
+    echo "Missing crates/$NAME/Cargo.toml or Cargo.lock" >&2; return 1;
+  }
+  cargo_version="$(python3 - "$crate/Cargo.toml" <<'PY'
+import sys
+import tomllib
+with open(sys.argv[1], 'rb') as source:
+    print(tomllib.load(source)['package']['version'])
+PY
+)" || return 1
+  [ "$VERSION" = "$cargo_version" ] || {
+    echo "SKILL.md version $VERSION differs from crates/$NAME/Cargo.toml $cargo_version" >&2; return 1;
+  }
+  [ -z "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all -- "skills/$SKILL" "crates/$NAME")" ] || {
+    echo "Commit all changes in skills/$SKILL and crates/$NAME before publishing" >&2; return 1;
+  }
+  git -C "$REPO_ROOT" ls-files --error-unmatch -- "skills/$SKILL/bin.sha256" "crates/$NAME/Cargo.lock" >/dev/null || {
+    echo "Commit bin.sha256 and Cargo.lock before publishing" >&2; return 1;
+  }
+  [ -d "$DIST" ] || { echo "Nothing built for $TAG: run $0 build $SKILL first" >&2; return 1; }
+  (cd "$DIST" && sha256sum -c --quiet "$DIR/bin.sha256") || {
+    echo "dist/ does not match committed bin.sha256" >&2; return 1;
+  }
+  head="$(git -C "$REPO_ROOT" rev-parse HEAD)" || return 1
+  if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/tags/$TAG"; then
+    tag_commit="$(git -C "$REPO_ROOT" rev-parse "refs/tags/$TAG^{}")" || return 1
+    [ "$tag_commit" = "$head" ] || { echo "Tag $TAG does not point to HEAD" >&2; return 1; }
+  fi
+  echo "Verified $TAG at $head"
+}
+
 publish() {
   local file notes
-  [ -d "$DIST" ] || { echo "Nothing built for $TAG: run $0 build $SKILL first" >&2; exit 1; }
-  (cd "$DIST" && sha256sum -c --quiet "$DIR/bin.sha256") || { echo "dist/ does not match bin.sha256" >&2; exit 1; }
-  git -C "$REPO_ROOT" diff --quiet HEAD -- "$DIR/bin.sha256" \
-    || { echo "Commit skills/$SKILL/bin.sha256 before publishing" >&2; exit 1; }
+  verify
   if ! git -C "$REPO_ROOT" rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
     git -C "$REPO_ROOT" tag -a "$TAG" -m "$NAME $VERSION"
   fi
@@ -123,6 +154,7 @@ publish() {
 
 case "$ACTION" in
   build) build ;;
+  verify) verify ;;
   publish) publish ;;
   *) usage ;;
 esac

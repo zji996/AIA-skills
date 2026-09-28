@@ -20,7 +20,8 @@ skills = root / "skills"
 readme = root / "README.md"
 errors = []
 skill_names = set()
-TRIGGER = re.compile(r"时使用|\buse (when|to|for)\b", re.I)
+CHINESE_TRIGGER = re.compile(r"时(?:主动)?使用")
+ENGLISH_TRIGGER = re.compile(r"\buse (when|to|for)\b", re.I)
 KNOWN_AGENTS = {"pi", "codex", "cursor", "claude", "kilo"}
 
 for directory in sorted(skills.iterdir()):
@@ -50,8 +51,8 @@ for directory in sorted(skills.iterdir()):
     else:
         if len(description) > 1024:
             errors.append(f"{name}: description exceeds 1024 characters")
-        if not TRIGGER.search(description):
-            errors.append(f"{name}: description must say when to use the skill (e.g. '…时使用' or 'Use when/to/for')")
+        if not CHINESE_TRIGGER.search(description) or not ENGLISH_TRIGGER.search(description):
+            errors.append(f"{name}: description must say when to use the skill in Chinese and English (e.g. '…时使用' and 'Use when/to/for')")
     extra = metadata.get("metadata") if isinstance(metadata, dict) else None
     version = str((extra or {}).get("version", "")) if isinstance(extra, dict) else ""
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):

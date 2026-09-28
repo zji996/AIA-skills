@@ -1,4 +1,4 @@
-use crate::agents::{agent_available, missing_tools, nesting_error, session_file};
+use crate::agents::{agent_available, agent_identity, missing_tools, nesting_error, session_file};
 use crate::changes::snapshot;
 use crate::common::*;
 use crate::runs::{self, active, agent_alive, all_runs, state};
@@ -946,7 +946,12 @@ pub fn launch(
     } else {
         Value::Null
     };
-    let meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":seconds(o.timeout.as_deref().unwrap_or("15m"))?,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
+    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":seconds(o.timeout.as_deref().unwrap_or("15m"))?,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
+    let (agent_bin, agent_version) = agent_identity(s(&meta, "agent"))?;
+    meta["agentBin"] = json!(agent_bin);
+    if let Some(version) = agent_version {
+        meta["agentVersion"] = json!(version);
+    }
     write_json(run.join("meta.json"), &meta)?;
     if !extra["sync"].is_null() {
         write_json(run.join("sync.json"), &extra["sync"])?;
@@ -971,13 +976,24 @@ pub fn launch(
         .stderr(Stdio::from(log))
         .env_remove("DELEGATE_LANE_HELD");
     group(&mut c);
-    c.spawn().map_err(|e| e.to_string())?;
-    for _ in 0..50 {
+    let mut child = c.spawn().map_err(|e| e.to_string())?;
+    let startup_timeout = if cfg!(debug_assertions) {
+        std::env::var("DELEGATE_TEST_STARTUP_TIMEOUT")
+            .ok()
+            .and_then(|value| seconds(&value).ok())
+            .unwrap_or(5.0)
+    } else {
+        5.0
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs_f64(startup_timeout);
+    while std::time::Instant::now() < deadline {
         if run.join("pid").is_file() {
             return Ok(run);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    end_group(child.id() as i32, 2.0);
+    child.wait().map_err(|e| e.to_string())?;
     write_json(
         run.join("summary.json"),
         &json!({"state":"crashed","error":"supervisor did not start"}),

@@ -2,12 +2,21 @@
 
 ## 未发布
 
+## 3.0.0 - 2026-09-29
+
 ### 仓库脚本
 
+- `release-binary.sh verify` 在发布前本地核对技能与 crate 版本、提交状态、dist 校验和及 tag 指向；`publish` 自动执行。
+- `install.sh` 的复制和链接切换可回滚；`fetch-binary.sh` 对本机构建校验并标记来源，严格模式拒绝不匹配产物。
+- 新增 `verify.sh` 一键门禁与可选的仓库级 pre-push hook；`check.sh` 要求中英文触发词同时出现。
 - `release-binary.sh publish`：本机没有 Forgejo token 时，可用 `FORGEJO_TOKEN_SSH=<user@host>`（或 `~/.config/aia-skills/forgejo-token-ssh` 中的同样内容）在发布时经 SSH 读取那台主机上 `FORGEJO_TOKEN_FILE` 同路径的 token，token 只保存在一台主机上；构建不访问网络取 token。
 
 ### 技能
 
+- `delegate` 5.8.1：修复失败路径。`apply` 的删除、复制、写入失败会写明文件与原因并以非 0 退出，不再写 `.applied`，`clean --finished` 保留未合入的写入 worktree（此前删除失败被吞掉，仍标记为完整合入）；supervisor 启动超时时先回收其进程组再写 `crashed`；`generated.command` 走限时执行与进程组回收（`DELEGATE_GENERATE_TIMEOUT`，默认 10m），超时即失败并释放重任务名额；`wait --help` 改正无参与 `--all` 的范围说明；meta 与状态行记录同事可执行文件的实际路径 `agentBin` 与 `agentVersion`（某机器非交互 shell 解析到旧版 snap codex 时，失败原因此前看不出来）。
+- `agent-handoff` 2.1.3：正确解析含转义字符的 worktree 路径，并说明新旧委派目录与未合并 worktree。
+- `repo-governance` 3.0.2：description 增补 token 预算和上下文健康度触发词。
+- `delegate` 参考文档补充 `.delegate.json` 的 `generated` 配置与 §6.4 行为，技能版本不变。
 - `delegate`（文档与 hook，版本不变）：新增 `hooks/claude-code-background.py`，作为 Claude Code 的 PreToolUse hook 拒绝前台执行的 `wait`、`run`、`reply --wait`，提示改用 Bash 的 `run_in_background`；只匹配真实调用（`…/bin/delegate` 或 `$D`），跳过 heredoc 正文与 `--help`。SKILL.md“等待”一节写明 Claude Code 下默认后台运行，`--max` 只用于没有后台通知的主控。
 - `repo-governance` 3.0.1：预算配置中精确路径总是优先于 glob，与书写顺序无关；此前写在通配之前的单文件上限会被通配覆盖。
 - `repo-governance` 3.0.0：审计体积改按估算 token 预算，阈值由被审计仓库的 `.repo-governance.json` 管理；新增 glob 预算、`--report` 与 `--only`，保留旧行数和 KB 参数并提示弃用。aia-skills 的 `check.sh` 改用同一预算机制检查 SKILL.md，超预算仍只警告。
