@@ -22,7 +22,7 @@ $D wait                                                                         
 #                                                                                        # 3. 按结论行的 next 处理
 ```
 
-- **等待**：能后台运行并在结束时收到通知的环境，把一个 `wait`（或 `run`）放后台，不要用 `status` 轮询；单次调用有时长上限的环境加 `--max 4m`，返回 75 就稍后再 `wait`。无参 `wait` 只收本会话派出的任务；无会话标识时沿用收取全部的行为，`--all` 可收本仓库全部。
+- **等待**：`wait`、`run`、`reply --wait` 会一直阻塞到同事结束，默认放后台：Claude Code 里给 Bash 工具加 `run_in_background: true`，结束时会收到通知，期间继续干别的，不要用 `status` 轮询（`hooks/claude-code-background.py` 可作为 PreToolUse hook 拒绝前台调用）。只有没有后台通知、单次调用又有时长上限的主控才用 `--max 4m`，返回 75 就稍后再 `wait`。无参 `wait` 只收本会话派出的任务；无会话标识时沿用收取全部的行为，`--all` 可收本仓库全部。
 - **结论**：每个任务一行 JSON，随后是改动清单与答复。`next` 字段给出下一步（含可复制的命令），没有 `next` 就是答复本身即交付物。答复超过 6000 字（`DELEGATE_RESULT_CHARS`）显示开头和结尾，全文用 `$D result <name>`；只看过截断答复的任务 `clean --finished` 会保留，读过全文或加 `--force` 才删。`cleanup` 报告已终止的后台进程与端口，`warnings` 报告 worktree 源问题。
 
 ## 场景速查

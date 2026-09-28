@@ -5,6 +5,7 @@ import re
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -19,6 +20,7 @@ BOOTSTRAP = ROOT / "scripts/bootstrap.sh"
 IMAGE = ROOT / "skills/openai-image-gen/scripts/generate-image.sh"
 SNAPSHOT = ROOT / "skills/agent-handoff/scripts/handoff-snapshot.sh"
 AUDIT = ROOT / "skills/repo-governance/scripts/audit-context.py"
+BACKGROUND_HOOK = ROOT / "skills/delegate/hooks/claude-code-background.py"
 ADR_INDEX = ROOT / "skills/repo-governance/scripts/adr-index.py"
 
 
@@ -373,6 +375,27 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertLess(result.stdout.index("skills/demo/SKILL.md"), result.stdout.index("AGENTS.md"))
         self.assertIn("every-session baseline: ~12 tokens", result.stdout)
+
+    def test_background_hook_denies_only_foreground_blocking_delegate_calls(self):
+        def decision(command, background=False, tool="Bash"):
+            payload = json.dumps({"tool_name": tool, "tool_input": {"command": command, "run_in_background": background}})
+            result = subprocess.run([sys.executable, str(BACKGROUND_HOOK)], input=payload, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] if result.stdout else "allow"
+
+        d = "$" + "D"  # keeps this file's own text from looking like an invocation
+        deny = [f"~/.claude/skills/delegate/bin/delegate wait --max 9m", f'{d} run --accept "make check" "x"',
+                f'${{D}} reply impl --wait "fix"', 'ssh h "~/s/bin/delegate wait r1"', f"{d} run --help; {d} wait",
+                f"{d} run --prompt-file - <<'EOF'\nfix it\nEOF"]
+        allow = [f'{d} start --read-only "x"', f'{d} reply impl "more"', f"{d} status; {d} result r", f"{d} wait --help",
+                 'git commit -m "a bare delegate wait now collects only this session"',
+                 f"python3 - <<'EOF'\ncases = ['{d} wait', '{d} run x']\nEOF\necho done"]
+        for command in deny:
+            self.assertEqual(decision(command), "deny", command)
+        for command in allow:
+            self.assertEqual(decision(command), "allow", command)
+        self.assertEqual(decision(f"{d} wait", background=True), "allow")
+        self.assertEqual(decision(f"{d} wait", tool="Read"), "allow")
 
     def test_audit_exact_budget_overrides_a_glob_written_after_it(self):
         repo = self.git_repo()
