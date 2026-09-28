@@ -9,6 +9,9 @@
 # publish needs `gh` logged in for GitHub (the primary download source). FORGEJO_TOKEN (write:repository)
 # also publishes to the Forgejo instance, which fetch-binary.sh tries second; without it that is skipped.
 # Agent shells often do not inherit it from ~/.bashrc, so it is read from FORGEJO_TOKEN_FILE when unset.
+# Keep the token on one host: elsewhere, FORGEJO_TOKEN_SSH=<user@host> (or the same text in
+# ~/.config/aia-skills/forgejo-token-ssh) reads that host's FORGEJO_TOKEN_FILE path over SSH at publish time,
+# so the token is never stored on the releasing machine.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,6 +22,20 @@ FORGEJO_TOKEN_FILE="${FORGEJO_TOKEN_FILE:-$HOME/.config/edge-gateway/forgejo-rep
 if [ -z "${FORGEJO_TOKEN:-}" ] && [ -r "$FORGEJO_TOKEN_FILE" ]; then
   FORGEJO_TOKEN="$(tr -d '\r\n' < "$FORGEJO_TOKEN_FILE")"
 fi
+FORGEJO_TOKEN_SSH_FILE="$HOME/.config/aia-skills/forgejo-token-ssh"
+if [ -z "${FORGEJO_TOKEN_SSH:-}" ] && [ -r "$FORGEJO_TOKEN_SSH_FILE" ]; then
+  FORGEJO_TOKEN_SSH="$(tr -d '\r\n' < "$FORGEJO_TOKEN_SSH_FILE")"
+fi
+
+# Called only by publish: builds never touch the network for the token.
+forgejo_token_over_ssh() {
+  [ -z "${FORGEJO_TOKEN:-}" ] && [ -n "${FORGEJO_TOKEN_SSH:-}" ] || return 0
+  local remote_file="${FORGEJO_TOKEN_FILE#"$HOME"/}"
+  # The remote shell expands ~; the path is the same default location relative to that host's home.
+  # shellcheck disable=SC2029
+  FORGEJO_TOKEN="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$FORGEJO_TOKEN_SSH" "tr -d '\r\n' < ~/$remote_file" 2>/dev/null)" \
+    || { FORGEJO_TOKEN=""; echo "  [Forgejo] could not read the token from $FORGEJO_TOKEN_SSH" >&2; }
+}
 
 usage() { echo "usage: release-binary.sh build|publish <skill>" >&2; exit 2; }
 (( $# == 2 )) || usage
@@ -76,6 +93,7 @@ publish() {
   else
     echo "  [GitHub] skipped: gh is not logged in"
   fi
+  forgejo_token_over_ssh
   if [ -n "${FORGEJO_TOKEN:-}" ]; then
     local auth=(-H "Authorization: token $FORGEJO_TOKEN") id
     id="$(curl -fsS "${auth[@]}" "$FORGEJO_API/releases/tags/$TAG" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' 2>/dev/null)" || true
@@ -99,7 +117,7 @@ publish() {
     done
     echo "  [Forgejo] ${FORGEJO_API%/api/v1/repos/*}/zji996/AIA-skills/releases/tag/$TAG"
   else
-    echo "  [Forgejo] skipped: set FORGEJO_TOKEN or FORGEJO_TOKEN_FILE to publish there too (optional; GitHub is the primary source)"
+    echo "  [Forgejo] skipped: set FORGEJO_TOKEN, FORGEJO_TOKEN_FILE or FORGEJO_TOKEN_SSH to publish there too (optional; GitHub is the primary source)"
   fi
 }
 

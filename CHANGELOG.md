@@ -2,6 +2,10 @@
 
 ## 未发布
 
+### 仓库脚本
+
+- `release-binary.sh publish`：本机没有 Forgejo token 时，可用 `FORGEJO_TOKEN_SSH=<user@host>`（或 `~/.config/aia-skills/forgejo-token-ssh` 中的同样内容）在发布时经 SSH 读取那台主机上 `FORGEJO_TOKEN_FILE` 同路径的 token，token 只保存在一台主机上；构建不访问网络取 token。
+
 ### 技能
 
 - `repo-governance` 3.0.0：审计体积改按估算 token 预算，阈值由被审计仓库的 `.repo-governance.json` 管理；新增 glob 预算、`--report` 与 `--only`，保留旧行数和 KB 参数并提示弃用。aia-skills 的 `check.sh` 改用同一预算机制检查 SKILL.md，超预算仍只警告。
