@@ -4,6 +4,7 @@
 
 ### 技能
 
+- `repo-governance` 3.0.0：审计体积改按估算 token 预算，阈值由被审计仓库的 `.repo-governance.json` 管理；新增 glob 预算、`--report` 与 `--only`，保留旧行数和 KB 参数并提示弃用。aia-skills 的 `check.sh` 改用同一预算机制检查 SKILL.md，超预算仍只警告。
 - `delegate` 5.8.0：派发时记录主控 caller，无参 `wait` 只收本会话任务，其他未收任务汇总提示且不影响退出码；`start` / `run` / `reply` 提示其他会话遗留的已结束任务，`status` 增加任务年龄。未识别主控会话时，无参 `wait` 沿用收取全部任务的行为。
 - `delegate` 5.7.0：`.delegate.json` 新增 `worktree.writeSetup`，只在写入任务里、`setup` 之后执行，给慢且只有构建测试才用得上的环境（如含 torch 的 venv）；只读任务跳过，侦察不必等。
 - `delegate` 5.6.0：用户 systemd 可用时为同事、worktree setup 与验收各建独立 scope，结束时按 cgroup 回收并报告脱离进程组、清掉环境标记的后台进程；不可用或 `DELEGATE_CGROUP=0` 时沿用进程组与环境标记清理；回收先 SIGTERM 宽限 3 秒再 `cgroup.kill`，给同事留出写完会话的时间。`wait`/`status` 等按 run id 查找时，本仓库找不到会退到整机正在运行的任务，从别的目录执行 `next` 提示也能找到。

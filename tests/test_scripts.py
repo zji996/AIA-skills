@@ -1,4 +1,5 @@
 import base64
+import importlib.util
 import json
 import re
 import os
@@ -304,8 +305,8 @@ class ScriptTests(unittest.TestCase):
         (repo / "docs").mkdir()
         (repo / "docs/current.md").write_text("# 下一步\n" + "".join(f"{i}. item\n" for i in range(1, 8)) +
                                                "# Notes\n- not counted\n")
-        result = self.run_script(AUDIT, "--repo", repo, "--max-agents-lines", "3")
-        self.assertIn("6 lines", result.stdout)
+        result = self.run_script(AUDIT, "--repo", repo, "--max-entry-tokens", "3")
+        self.assertRegex(result.stdout, r"AGENTS.md: ~\d+ tokens \(> 3\)")
         self.assertIn("broken link: docs/missing.md", result.stdout)
         self.assertIn("7 next actions", result.stdout)
         (repo / "AGENTS.md").write_text("# ok\n")
@@ -328,15 +329,106 @@ class ScriptTests(unittest.TestCase):
             "```bash\nmake vanished\n```\n")
         (repo / "docs/current.md").write_text(
             "# Now\nRead `decision/0001-a.md`.\n" + "".join(f"- 2026-01-0{i} shipped\n" for i in range(1, 8))
-            + "x" * 9 * 1024 + "\n")
+            + "x" * 11 * 1024 + "\n")
         out = self.run_script(AUDIT, "--repo", repo).stdout
-        self.assertIn("docs/current.md: 9 KB (> 8)", out)
+        self.assertRegex(out, r"docs/current.md: ~\d+ tokens \(> 2500\)")
         self.assertIn("docs/current.md: 7 dated entries (> 5)", out)
         missing = sorted(re.findall(r"names `([^`]+)`", out))
         self.assertEqual(missing, ["make gone", "make vanished", "src/missing/", "src/pkg/old.py"])
         out = self.run_script(AUDIT, "--repo", repo, "--max-current-kb", "16", "--max-dated-items", "10").stdout
         self.assertNotIn("KB (>", out)
         self.assertNotIn("dated entries", out)
+
+    def test_audit_token_estimate_counts_cjk_ascii_and_mixed_text(self):
+        spec = importlib.util.spec_from_file_location("audit_context", AUDIT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.estimate_tokens("中文かな한글，。"), 8)
+        self.assertEqual(module.estimate_tokens("abcde"), 2)
+        self.assertEqual(module.estimate_tokens("中abcde文"), 4)
+
+    def test_audit_config_glob_cli_override_and_report(self):
+        repo = self.git_repo()
+        (repo / "AGENTS.md").write_text("abcd" * 8)
+        (repo / "docs").mkdir()
+        (repo / "docs/current.md").write_text("abcd" * 4)
+        (repo / "skills/demo").mkdir(parents=True)
+        (repo / "skills/demo/SKILL.md").write_text("中文" * 6)
+        (repo / ".repo-governance.json").write_text(json.dumps({
+            "budgets": {"AGENTS.md": 7, "docs/current.md": 3, "skills/*/SKILL.md": 10},
+            "maxNextActions": 1,
+        }))
+        result = self.run_script(AUDIT, "--repo", repo, "--only", "entry,current,budget")
+        self.assertIn("AGENTS.md: ~8 tokens (> 7)", result.stdout)
+        self.assertIn("docs/current.md: ~4 tokens (> 3)", result.stdout)
+        self.assertIn("skills/demo/SKILL.md: ~12 tokens (> 10)", result.stdout)
+        result = self.run_script(AUDIT, "--repo", repo, "--only", "entry,current,budget",
+                                 "--max-entry-tokens", "9", "--max-current-tokens", "5",
+                                 "--fail-on", "budget")
+        self.assertNotIn("AGENTS.md: ~", result.stdout)
+        self.assertNotIn("docs/current.md: ~", result.stdout)
+        self.assertIn("skills/demo/SKILL.md: ~12 tokens", result.stdout)
+        self.assertEqual(result.returncode, 1)
+        result = self.run_script(AUDIT, "--repo", repo, "--report")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(result.stdout.index("skills/demo/SKILL.md"), result.stdout.index("AGENTS.md"))
+        self.assertIn("every-session baseline: ~12 tokens", result.stdout)
+
+    def test_audit_counts_a_symlinked_entry_file_once(self):
+        repo = self.git_repo()
+        (repo / "AGENTS.md").write_text("abcd" * 8)
+        (repo / "CLAUDE.md").symlink_to("AGENTS.md")
+        result = self.run_script(AUDIT, "--repo", repo, "--report")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("every-session baseline: ~8 tokens", result.stdout)
+        self.assertNotIn("CLAUDE.md", result.stdout)
+
+    def test_audit_only_and_configured_current_limits(self):
+        repo = self.git_repo()
+        (repo / "AGENTS.md").write_text("ok")
+        (repo / "docs").mkdir()
+        (repo / "docs/current.md").write_text("# Next steps\n- one\n- two\n- 2026-01-01 done\n")
+        (repo / ".repo-governance.json").write_text(json.dumps({
+            "maxNextActions": 1, "maxDatedItems": 0, "staleDays": 0,
+        }))
+        result = self.run_script(AUDIT, "--repo", repo, "--only", "current")
+        self.assertIn("3 next actions (> 1)", result.stdout)
+        self.assertIn("1 dated entries (> 0)", result.stdout)
+        result = self.run_script(AUDIT, "--repo", repo, "--only", "budget")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("next actions", result.stdout)
+        result = self.run_script(AUDIT, "--repo", repo, "--only", "current",
+                                 "--max-dated-items", "2", "--stale-days", "99999")
+        self.assertNotIn("dated entries", result.stdout)
+        self.assertNotIn("last changed", result.stdout)
+
+    def test_audit_legacy_limits_warn_and_still_apply(self):
+        repo = self.git_repo()
+        (repo / "AGENTS.md").write_text("line\n" * 3)
+        (repo / "docs").mkdir()
+        (repo / "docs/current.md").write_text("x" * 2048)
+        result = self.run_script(AUDIT, "--repo", repo, "--max-agents-lines", "2",
+                                 "--max-current-kb", "1", "--only", "entry,current")
+        self.assertIn("3 lines (> 2)", result.stdout)
+        self.assertIn("2 KB (> 1)", result.stdout)
+        self.assertIn("DEPRECATED --max-agents-lines", result.stderr)
+        self.assertIn("DEPRECATED --max-current-kb", result.stderr)
+
+    def test_audit_rejects_invalid_config_with_exit_two(self):
+        repo = self.git_repo()
+        config = repo / ".repo-governance.json"
+        for value in ('{', '{"budgets":{"AGENTS.md":true}}', '{"maxNextActions":"5"}'):
+            config.write_text(value)
+            result = self.run_script(AUDIT, "--repo", repo)
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(len(result.stderr.splitlines()), 1)
+            self.assertIn(".repo-governance.json", result.stderr)
+
+    def test_check_uses_token_budget_without_line_warning(self):
+        text = CHECK.read_text()
+        self.assertNotIn("MAX_SKILL_LINES", text)
+        self.assertIn("--only budget", text)
+        self.assertNotIn("SKILL.md has", text)
 
     def test_adr_index_is_generated_from_each_adr_status_line(self):
         repo = self.git_repo()

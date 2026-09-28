@@ -1,0 +1,5 @@
+{
+  "budgets": {
+    "skills/*/SKILL.md": 4000
+  }
+}

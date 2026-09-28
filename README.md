@@ -18,7 +18,7 @@
 
 | 技能名称 | 目录 | 能力与适用场景 |
 | --- | --- | --- |
-| **`repo-governance`** | `skills/repo-governance/` | **上下文治理与审计**：定义 `AGENTS.md`、`docs/current.md`、决策记录的信息分层；`audit-context.py` 只读检查入口文件过长、下一步堆积、`.local/` 未忽略、文档断链等漂移问题。 |
+| **`repo-governance`** | `skills/repo-governance/` | **上下文治理与审计**：定义 `AGENTS.md`、`docs/current.md`、决策记录的信息分层；`audit-context.py` 按仓库配置估算 token 预算，支持 `--report`、`--only`，并检查下一步堆积、`.local/` 未忽略、文档断链等漂移问题。 |
 | **`agent-handoff`** | `skills/agent-handoff/` | **会话交接**：`handoff-snapshot.sh` 自动采集分支、HEAD、未提交文件、最近提交、未读取的委派任务与未合并的 worktree，生成交接账本草稿，模型只需补充判断部分。 |
 | **`delegate`** | `skills/delegate/` | **同事 Agent 委派**：后台运行 Pi/Codex，只收结论与下一步；无参 `wait` 按派发会话收取，遗留任务提示年龄。只读默认便宜档、写入默认强档；写入可用 `--worktree` 隔离后 `apply` 合并，并用 `--protect` 划分并行文件所有权。`.delegate.json` 支持 `worktree.copy/link/setup`、`env` 与写入任务默认 `accept`；工具运行验收，用户 systemd 可用时按 cgroup 清理同事及其后台进程，报告端口与空源警告。长答复显示头尾，全文保存在 run 中。整机并发与重检查队列由 Rust 实现（`crates/delegate`）管理。 |
 | **`openai-image-gen`** | `skills/openai-image-gen/` | **图像生成落盘**：调用 OpenAI Image API 生成配图、Banner、图标等素材，直接写入本地文件并只返回一行 JSON；附提示词、尺寸与费用选择要点。 |

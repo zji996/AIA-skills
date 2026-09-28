@@ -5,6 +5,7 @@
 - 帮这个新项目写一份 AGENTS.md。
 - `docs/current.md` 好像和代码对不上了，查一下哪些文档过期了。
 - Audit this repo's agent context docs for drift.
+- 看看 AGENTS.md 和各技能 SKILL.md 的 token 预算还剩多少，是否需要调整仓库阈值。
 
 ## 不应触发
 

@@ -22,7 +22,6 @@ errors = []
 skill_names = set()
 TRIGGER = re.compile(r"时使用|\buse (when|to|for)\b", re.I)
 KNOWN_AGENTS = {"pi", "codex", "cursor", "claude", "kilo"}
-MAX_SKILL_LINES = 80
 
 for directory in sorted(skills.iterdir()):
     if not directory.is_dir():
@@ -65,9 +64,6 @@ for directory in sorted(skills.iterdir()):
         errors.append(f"{name}: SKILL.md uses a repo-relative './skills/' path; use <本技能目录>/... instead")
     if not (root / "evals" / f"{name}.md").is_file():
         errors.append(f"{name}: missing evals/{name}.md trigger examples")
-    lines = content.count("\n") + 1
-    if lines > MAX_SKILL_LINES:
-        print(f"  [WARN] {name}: SKILL.md has {lines} lines (> {MAX_SKILL_LINES}); consider moving details to references/")
     if not any(error.startswith(f"{name}:") for error in errors):
         print(f"  [PASS] Skill metadata: {name}")
 
@@ -98,6 +94,16 @@ sys.exit(bool(errors))
 PY
 then
   exit 1
+fi
+
+audit="$REPO_ROOT/skills/repo-governance/scripts/audit-context.py"
+if [ -f "$audit" ]; then
+  if python3 "$audit" --repo "$REPO_ROOT" --only budget; then
+    :
+  else
+    status=$?
+    [ "$status" -eq 1 ] || exit "$status"
+  fi
 fi
 
 errors=0
