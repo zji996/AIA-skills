@@ -60,6 +60,8 @@ def answer(text, stop="stop"):
                                                "content": content}}
 
 
+# Session variables delegate reads as the caller id; host sessions must not leak into tests.
+CALLER_ENV = ("DELEGATE_CALLER", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "PI_SESSION_ID")
 SETTLED = {"type": "agent_settled"}
 # Verbatim shape of a real failure: the model printed its tool call as text and stopped.
 LEAKED = "Let's read `trainingStyles.ts` as well.call:default_api:read{limit:120,offset:1,path:src/trainingStyles.ts}"
@@ -96,7 +98,7 @@ class DelegateTests(unittest.TestCase):
         self.bin = self.work / "bin"
         self.bin.mkdir()
         self.env = {k: v for k, v in os.environ.items()
-                    if not k.startswith(("DELEGATE_", "PI_DELEGATE_")) and k != "CLAUDE_CODE_SESSION_ID"}
+                    if not k.startswith(("DELEGATE_", "PI_DELEGATE_")) and k not in CALLER_ENV}
         self.env.update(PATH=f"{self.bin}:{os.environ['PATH']}", DELEGATE_POLL="0.1",
                         DELEGATE_RUNS=str(self.work / "runs"), XDG_STATE_HOME=str(self.work / "state"),
                         XDG_CACHE_HOME=str(self.work / "cache"),
@@ -960,6 +962,37 @@ class DelegateTests(unittest.TestCase):
         self.env.pop("CLAUDE_CODE_SESSION_ID")
         unknown = self.outcome(self.cli("run", "--read-only", "unknown"))
         self.assertIsNone(json.loads((Path(unknown["dir"]) / "meta.json").read_text())["caller"])
+        # Other harnesses: Codex and Pi export their session to the commands they run.
+        self.env.update(PI_SESSION_ID="pi-session", CODEX_THREAD_ID="codex-thread")
+        for expected, source in (("codex-thread", "CODEX_THREAD_ID"), ("pi-session", "PI_SESSION_ID")):
+            meta = json.loads((Path(self.outcome(self.cli("run", "--read-only", source))["dir"])
+                               / "meta.json").read_text())
+            self.assertEqual((meta["caller"], meta["callerSource"]), (expected, source))
+            self.env.pop(source)
+
+    def test_protocol_reports_caller_agents_and_shadowed_binaries(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        shadow = self.work / "shadow"
+        shadow.mkdir()
+        shutil.copy(self.bin / "pi", shadow / "pi")
+        self.env.update(PATH=f"{self.bin}:{shadow}:/usr/bin:/bin", CODEX_THREAD_ID="thread-7")
+        result = self.cli("protocol")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = json.loads(result.stdout)
+        self.assertEqual((line["protocol"], line["caller"]), (1, {"id": "thread-7", "source": "CODEX_THREAD_ID"}))
+        agents = {agent["name"]: agent for agent in line["agents"]}
+        self.assertEqual(agents["pi"]["tiers"], ["cheap", "strong"])  # setUp maps strong to the fake Pi
+        self.assertEqual(agents["pi"]["bin"], str((self.bin / "pi").resolve()))
+        self.assertEqual(agents["pi"]["version"], "fake-pi 1.0")
+        self.assertEqual(agents["pi"]["shadowed"], [str((shadow / "pi").resolve())])
+        self.assertEqual((agents["codex"]["tiers"], agents["codex"]["available"], agents["codex"]["bin"]),
+                         ([], False, None))
+        self.env.pop("DELEGATE_STRONG_AGENT")
+        self.env.pop("CODEX_THREAD_ID")
+        line = json.loads(self.cli("protocol").stdout)
+        self.assertIsNone(line["caller"])
+        self.assertEqual({a["name"]: a["tiers"] for a in line["agents"]}, {"pi": ["cheap"], "codex": ["strong"]})
+        self.assertEqual(self.cli("protocol", "extra").returncode, 2)
 
     def test_wait_collects_only_current_caller_and_reports_other_failure(self):
         self.fake_pi([answer("ok"), SETTLED])

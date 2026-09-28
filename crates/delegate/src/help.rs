@@ -3,7 +3,7 @@ const LAUNCH: &[(&str, &str)] = &[
     ("--prompt TEXT", "Prompt text."),
     ("--prompt-file FILE", "Read the prompt from FILE, or - for stdin."),
     ("--tier cheap|strong", "Cheap: Pi for reading, summaries, copy, images; strong: Codex for code and rigorous review. Default: cheap for read-only, strong for writes. Eligible failed cheap runs escalate once to strong."),
-    ("--agent pi|codex", "Choose an agent directly; disables tier escalation."),
+    ("--agent", "Choose an agent directly; disables tier escalation."),
     ("--name NAME", "Short label in the run id."),
     ("--workdir DIR", "Agent working directory (default: cwd)."),
     ("--image PATH", "Attach an image; repeatable, supported by both agents."),
@@ -31,7 +31,10 @@ const COLLECT: &[(&str, &str)] = &[
         "Stop waiting after this long; exit 75 if still running.",
     ),
     ("--progress", "Also print writes, errors, and retries."),
-    ("--full", "Print the whole answer instead of the abbreviated head and tail."),
+    (
+        "--full",
+        "Print the whole answer instead of the abbreviated head and tail.",
+    ),
 ];
 
 const REPLY: &[(&str, &str)] = &[
@@ -50,7 +53,7 @@ const REPLY: &[(&str, &str)] = &[
     ("--fresh", "Start a new session in the same workdir/worktree and conversation; message must stand alone."),
     ("--sync", "Merge the caller's later changes into the conversation worktree before replying; conflicts stop the reply."),
     ("--wait", "Wait for the reply's outcome and answer instead of returning after launch."),
-    ("--agent pi|codex", "Hand the conversation to this agent; a change of agent starts a fresh session."),
+    ("--agent", "Hand the conversation to this agent; a change of agent starts a fresh session."),
     ("--tier cheap|strong", "Hand the conversation to this tier; a change of agent starts a fresh session."),
 ];
 
@@ -73,10 +76,19 @@ const COMMANDS: &[(&str, &str)] = &[
     ("lane", "Queue a heavy command with other machine checks."),
     ("stop", "Terminate runs."),
     ("clean", "Delete finished runs."),
+    (
+        "protocol",
+        "Print the harness protocol version, caller and agents as JSON.",
+    ),
 ];
 
 fn options(rows: &[(&str, &str)]) {
     for (name, description) in rows {
+        let name = if *name == "--agent" {
+            format!("--agent {}", crate::agents::choices("|"))
+        } else {
+            (*name).to_string()
+        };
         let mut line = format!("  {name:<26} ");
         let indent = " ".repeat(29);
         for word in description.split_whitespace() {
@@ -149,6 +161,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("--finished", "Select all finished runs that have been reported in full (answers shown truncated are kept until read with result)."),
             ("--force", "With --finished, also select unreported or truncated finished runs."),
         ]),
+        "protocol" => ("", "Print one JSON line for harness adapters: protocol version, delegate version, the caller session and its source variable, and each agent's tier, resolved binary, version and PATH entries it shadows.", &[]),
         _ => return false,
     };
     println!("Usage: delegate {command} {usage}\n");

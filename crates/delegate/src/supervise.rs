@@ -246,7 +246,8 @@ fn escalate(
         );
         return Ok(false);
     }
-    if s(meta, "mode") == "read-only" && strong == "codex" {
+    if s(meta, "mode") == "read-only" && agents::spec(&strong).is_some_and(|a| a.read_only_contract)
+    {
         let prompt = read(run.join("prompt.md"));
         if !launch::has_read_only_contract(&prompt) {
             write(

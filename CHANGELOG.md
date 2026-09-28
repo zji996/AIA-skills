@@ -2,6 +2,10 @@
 
 ## 未发布
 
+### 技能
+
+- `delegate` 5.9.0：与宿主解耦。新增 `docs/delegate-protocol.md`（宿主接入协议 protocol 1）：宿主只需提供后台执行与通知、会话标识和技能加载，可依赖的状态行字段、state 与退出码在其中承诺。会话标识在 `DELEGATE_CALLER`、`CLAUDE_CODE_SESSION_ID` 之后依次读取 `CODEX_THREAD_ID`、`PI_SESSION_ID`（Codex 与 Pi 给所执行命令导出的会话 id），meta 新增 `callerSource`。新增 `delegate protocol`：一行 JSON 输出协议版本、caller 及来源、各同事担任的档位、实际执行文件、版本与 PATH 中被遮住的同名文件。同事差异（命令行、事件解析、会话续接、只读契约、默认超时、是否占强档名额、安装提示）收拢到 `agents.rs` 的 `AGENTS` 适配表，行为不变。
+
 ## 3.0.0 - 2026-09-29
 
 ### 仓库脚本

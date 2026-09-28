@@ -1,4 +1,4 @@
-# delegate 规格（v5.8.1）
+# delegate 规格（v5.9.0）
 
 > 本文是 `skills/delegate` 的**实现契约**：命令行、输出、run 目录、锁与状态机。它是 Rust 重写与 harness 原生接入的依据。
 > 本文不在技能目录内，技能加载时不会读取；模型使用技能只需 `SKILL.md`。行为以本文为准，实现与本文不一致时按缺陷处理。
@@ -49,6 +49,7 @@
 | `lane [--label 文字] [--] [命令...]` | | §8；无命令时列出队列，每行 `running\|queued  <since>  <label>` |
 | `stop <run>...` | | §9.4 |
 | `clean <run>...\|--finished [--force]` | | §10 |
+| `protocol` | | 输出一行 JSON：`protocol`（宿主接入协议版本，当前 1）、`version`、`caller{id,source}`（未知时为 `null`）、`agents[]{name,tiers,available,bin,version,shadowed}`；`tiers` 是按当前配置（`DELEGATE_{CHEAP,STRONG}_AGENT`）该同事担任默认的档位列表，可为空，`bin` 为 PATH 上首个可执行文件的真实路径（不可用时为 `null`），`shadowed` 为 PATH 中更靠后、真实路径不同的同名可执行文件；退出码 0。供宿主适配器探测，见 [delegate-protocol.md](delegate-protocol.md) |
 
 缺少同事 CLI 时退出码 2：Codex 提示安装并登录；Pi 提示 `sh <仓库>/third_party/pi-kit/install.sh --additive`，其中 `<仓库>` 为从可执行文件真实路径逐级向上、首个包含该安装脚本的目录，找不到时给出远程安装命令。
 
@@ -333,7 +334,7 @@ run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git �
 
 | 文件 | 写入者 | 内容 |
 |---|---|---|
-| `meta.json` | 启动方（升档时 supervisor 更新） | run、dir、workdir、mode、agent、agentBin（实际解析的绝对执行路径）、agentVersion（该执行文件 `--version` 输出最后一行；取不到则省略）、tier、escalatedFrom、name、caller、provider、model、thinking、timeout(Seconds)、accept、acceptTimeoutSeconds、retries、images、top、base、snapshotExclude、worktree{source,sourceWorkdir,config,path}、env、chainBase、sessionDir、parent、fork、startedAt/Epoch/Ns |
+| `meta.json` | 启动方（升档时 supervisor 更新） | run、dir、workdir、mode、agent、agentBin（实际解析的绝对执行路径）、agentVersion（该执行文件 `--version` 输出最后一行；取不到则省略）、tier、escalatedFrom、name、caller、callerSource、provider、model、thinking、timeout(Seconds)、accept、acceptTimeoutSeconds、retries、images、top、base、snapshotExclude、worktree{source,sourceWorkdir,config,path}、env、chainBase、sessionDir、parent、fork、startedAt/Epoch/Ns |
 | `prompt.md` | 启动方 | 同事收到的全文 |
 | `supervisor.lock` / `pid` / `agent.pid` | supervisor | 生命周期锁 / supervisor pid / 同事进程组 |
 | `events.jsonl` `stderr.log` `supervisor.log` | supervisor | §7.2 / 同事 stderr / supervisor 输出 |
@@ -350,7 +351,7 @@ run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git �
 
 `agent-handoff` 依赖 `meta.json`、`exit_code`、`.delivered`、`.applied` 与 `meta.json` 中的 `worktree.path`、`mode`；改变其含义须同步修改。
 
-`caller` 是派发该轮 run 的主控会话标识，`start` / `run` / `reply`（包括 `--after` 的 waiting run）创建时写入；依次取非空 `DELEGATE_CALLER`、`CLAUDE_CODE_SESSION_ID`，均无则写 `null`。`session` 属于同事会话，不表示 caller。成功创建 run 后，若本仓库有已结束、未送达、caller 不等于当前 caller 的 run（当前 caller 未知时视全部旧 run 为其他），stderr 用一行报告数量、最多三个名称与年龄，并提示 `wait --all` / `clean <run>`；不影响 JSON stdout 与退出码。
+`caller` 是派发该轮 run 的主控会话标识，`start` / `run` / `reply`（包括 `--after` 的 waiting run）创建时写入；依次取非空 `DELEGATE_CALLER`、`CLAUDE_CODE_SESSION_ID`、`CODEX_THREAD_ID`、`PI_SESSION_ID`，均无则写 `null`；`callerSource` 记录取值来自哪个变量（caller 为 `null` 时也为 `null`）。宿主如何提供 caller 见 [delegate-protocol.md](delegate-protocol.md)。`session` 属于同事会话，不表示 caller。成功创建 run 后，若本仓库有已结束、未送达、caller 不等于当前 caller 的 run（当前 caller 未知时视全部旧 run 为其他），stderr 用一行报告数量、最多三个名称与年龄，并提示 `wait --all` / `clean <run>`；不影响 JSON stdout 与退出码。
 
 ## 12. 配置与环境变量
 

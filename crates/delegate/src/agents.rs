@@ -19,10 +19,94 @@ struct WatchState {
     commands: i32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SessionSource {
+    DelegateFile,
+    EventStream,
+}
+
+/// Harness-facing protocol version; bump when docs/delegate-protocol.md §2 breaks.
+pub const PROTOCOL: u32 = 1;
+
+pub struct AgentSpec {
+    pub name: &'static str,
+    pub default_tier: Option<&'static str>,
+    pub default_timeout: &'static str,
+    pub heavy: bool,
+    pub session: SessionSource,
+    pub read_only_contract: bool,
+    active_env: Option<&'static str>,
+    install_hint: fn() -> String,
+    build_command: fn(&Value, Option<&str>) -> Vec<String>,
+    filter_events: fn(&Value) -> Vec<Value>,
+    turn_model: Option<fn(&Value) -> Value>,
+    settles_on_turn: bool,
+    clears_answer_on_turn: bool,
+}
+
+pub static AGENTS: &[AgentSpec] = &[
+    AgentSpec {
+        name: "pi",
+        default_tier: Some("cheap"),
+        default_timeout: "15m",
+        heavy: false,
+        session: SessionSource::DelegateFile,
+        read_only_contract: false,
+        active_env: Some("PI_DELEGATE_ACTIVE"),
+        install_hint: pi_install_hint,
+        build_command: command_pi,
+        filter_events: filter_pi,
+        turn_model: None,
+        settles_on_turn: false,
+        clears_answer_on_turn: true,
+    },
+    AgentSpec {
+        name: "codex",
+        default_tier: Some("strong"),
+        default_timeout: "30m",
+        heavy: true,
+        session: SessionSource::EventStream,
+        read_only_contract: true,
+        active_env: None,
+        install_hint: codex_install_hint,
+        build_command: command_codex,
+        filter_events: filter_codex,
+        turn_model: Some(codex_turn_model),
+        settles_on_turn: true,
+        clears_answer_on_turn: false,
+    },
+];
+
+pub fn spec(name: &str) -> Option<&'static AgentSpec> {
+    AGENTS.iter().find(|agent| agent.name == name)
+}
+
+pub fn default_for_tier(tier: &str) -> &'static AgentSpec {
+    AGENTS
+        .iter()
+        .find(|agent| agent.default_tier == Some(tier))
+        .expect("configured tier")
+}
+
+pub fn choices(separator: &str) -> String {
+    AGENTS
+        .iter()
+        .map(|agent| agent.name)
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
 pub fn nesting_error() -> Option<String> {
     let caller = setting("AGENT", "");
-    let caller = if caller.is_empty() && env::var_os("PI_DELEGATE_ACTIVE").is_some() {
-        "pi"
+    let caller = if caller.is_empty() {
+        AGENTS
+            .iter()
+            .find(|agent| {
+                agent
+                    .active_env
+                    .is_some_and(|key| env::var_os(key).is_some())
+            })
+            .map_or("", |agent| agent.name)
     } else {
         &caller
     };
@@ -38,13 +122,65 @@ pub fn agent_available(agent: &str) -> bool {
 pub fn agent_bin(agent: &str) -> Option<PathBuf> {
     env::split_paths(&env::var_os("PATH")?).find_map(|dir| {
         let path = dir.join(agent);
-        if fs::metadata(&path)
-            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        {
+        if fs::metadata(&path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0) {
             path.canonicalize().ok()
         } else {
             None
         }
+    })
+}
+/// Every executable named `agent` on PATH, resolved and in PATH order; the first one runs.
+fn agent_bins(agent: &str) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = vec![];
+    for dir in env::var_os("PATH")
+        .map(|p| env::split_paths(&p).collect::<Vec<_>>())
+        .unwrap_or_default()
+    {
+        let path = dir.join(agent);
+        if fs::metadata(&path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0) {
+            if let Ok(real) = path.canonicalize() {
+                if !found.contains(&real) {
+                    found.push(real);
+                }
+            }
+        }
+    }
+    found
+}
+/// The harness-facing capability line (`delegate protocol`, docs/delegate-protocol.md).
+pub fn protocol() -> Value {
+    let tiers_of = |name: &str| {
+        ["cheap", "strong"]
+            .into_iter()
+            .filter(|tier| {
+                setting(
+                    &format!("{}_AGENT", tier.to_uppercase()),
+                    default_for_tier(tier).name,
+                ) == name
+            })
+            .collect::<Vec<_>>()
+    };
+    let agents = AGENTS
+        .iter()
+        .map(|agent| {
+            let bins = agent_bins(agent.name);
+            let version = agent_identity(agent.name).ok().and_then(|(_, v)| v);
+            json!({
+                "name": agent.name,
+                "tiers": tiers_of(agent.name),
+                "available": !bins.is_empty(),
+                "bin": bins.first(),
+                "version": version,
+                "shadowed": bins.iter().skip(1).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let caller = caller_source().map(|(id, source)| json!({"id": id, "source": source}));
+    json!({
+        "protocol": PROTOCOL,
+        "version": env!("CARGO_PKG_VERSION"),
+        "caller": caller,
+        "agents": agents,
     })
 }
 pub fn agent_identity(agent: &str) -> Res<(PathBuf, Option<String>)> {
@@ -86,9 +222,20 @@ pub fn missing_tools(agent: &str) -> Res<()> {
     if agent_available(agent) {
         return Ok(());
     }
-    if agent == "codex" {
-        return Err("missing required tools: codex\n  codex: see https://github.com/openai/codex (npm i -g @openai/codex), then log in".into());
-    }
+    let agent = spec(agent).ok_or_else(|| format!("missing required tools: {agent}"))?;
+    Err(format!(
+        "missing required tools: {}\n  {}: {}",
+        agent.name,
+        agent.name,
+        (agent.install_hint)()
+    ))
+}
+
+fn codex_install_hint() -> String {
+    "see https://github.com/openai/codex (npm i -g @openai/codex), then log in".into()
+}
+
+fn pi_install_hint() -> String {
     let mut here = script();
     let mut kit = None;
     while let Some(parent) = here.parent() {
@@ -100,7 +247,7 @@ pub fn missing_tools(agent: &str) -> Res<()> {
         here = parent.to_path_buf();
     }
     let hint=kit.map(|p|format!("sh {} --additive",p.display())).unwrap_or_else(||"curl -fsSL https://git.aiatechco.com:31443/zji996/pi-kit/raw/branch/main/install.sh | sh -s -- --additive\n    (GitHub: https://raw.githubusercontent.com/zji996/pi-kit/main/install.sh)".into());
-    Err(format!("missing required tools: pi\n  pi: {hint}"))
+    hint
 }
 fn usage(v: &Value, k: &str) -> Value {
     v.get(k).cloned().unwrap_or(Value::Null)
@@ -235,62 +382,72 @@ fn codex_model() -> Option<String> {
     }
     None
 }
-fn command(meta: &Value, session: Option<&str>) -> Vec<String> {
+fn codex_turn_model(meta: &Value) -> Value {
+    if !s(meta, "model").is_empty() {
+        json!(s(meta, "model"))
+    } else {
+        json!(codex_model())
+    }
+}
+
+fn command_codex(meta: &Value, _session: Option<&str>) -> Vec<String> {
     let fork = s(meta, "fork");
     let images = meta["images"].as_array().cloned().unwrap_or_default();
-    if s(meta, "agent") == "codex" {
-        let mut a = vec!["codex".into(), "exec".into()];
-        if !fork.is_empty() {
-            a.extend(["fork".into(), fork.into()]);
-        }
-        a.extend(["--json".into(), "--skip-git-repo-check".into()]);
-        if fork.is_empty() {
-            a.extend(["-C".into(), s(meta, "workdir").into()]);
-        }
-        a.push("--dangerously-bypass-approvals-and-sandbox".into());
-        if !s(meta, "model").is_empty() {
-            a.extend(["-m".into(), s(meta, "model").into()]);
-        }
-        for (key, label) in [
-            ("thinking", "model_reasoning_effort"),
-            ("provider", "model_provider"),
-        ] {
-            if !s(meta, key).is_empty() {
-                a.extend(["-c".into(), format!("{label}=\"{}\"", s(meta, key))]);
-            }
-        }
-        for image in images {
-            a.push(format!("--image={}", image.as_str().unwrap_or("")));
-        }
-        a.push("-".into());
-        a
-    } else {
-        let mut a = vec!["pi".into()];
-        if !fork.is_empty() {
-            a.extend(["--fork".into(), fork.into()]);
-        } else {
-            a.extend(["--session-id".into(), session.unwrap_or("").into()]);
-        }
-        a.extend([
-            "--session-dir".into(),
-            s(meta, "sessionDir").into(),
-            "--mode".into(),
-            "json".into(),
-        ]);
-        for key in ["provider", "model", "thinking"] {
-            if !s(meta, key).is_empty() {
-                a.extend([format!("--{key}"), s(meta, key).into()]);
-            }
-        }
-        if s(meta, "mode") == "read-only" && !meta["worktree"].is_object() {
-            a.extend(["--tools".into(), "read,grep,find,ls".into()]);
-        }
-        a.push("-p".into());
-        for image in images {
-            a.push(format!("@{}", image.as_str().unwrap_or("")));
-        }
-        a
+    let mut a = vec!["codex".into(), "exec".into()];
+    if !fork.is_empty() {
+        a.extend(["fork".into(), fork.into()]);
     }
+    a.extend(["--json".into(), "--skip-git-repo-check".into()]);
+    if fork.is_empty() {
+        a.extend(["-C".into(), s(meta, "workdir").into()]);
+    }
+    a.push("--dangerously-bypass-approvals-and-sandbox".into());
+    if !s(meta, "model").is_empty() {
+        a.extend(["-m".into(), s(meta, "model").into()]);
+    }
+    for (key, label) in [
+        ("thinking", "model_reasoning_effort"),
+        ("provider", "model_provider"),
+    ] {
+        if !s(meta, key).is_empty() {
+            a.extend(["-c".into(), format!("{label}=\"{}\"", s(meta, key))]);
+        }
+    }
+    for image in images {
+        a.push(format!("--image={}", image.as_str().unwrap_or("")));
+    }
+    a.push("-".into());
+    a
+}
+
+fn command_pi(meta: &Value, session: Option<&str>) -> Vec<String> {
+    let fork = s(meta, "fork");
+    let images = meta["images"].as_array().cloned().unwrap_or_default();
+    let mut a = vec!["pi".into()];
+    if !fork.is_empty() {
+        a.extend(["--fork".into(), fork.into()]);
+    } else {
+        a.extend(["--session-id".into(), session.unwrap_or("").into()]);
+    }
+    a.extend([
+        "--session-dir".into(),
+        s(meta, "sessionDir").into(),
+        "--mode".into(),
+        "json".into(),
+    ]);
+    for key in ["provider", "model", "thinking"] {
+        if !s(meta, key).is_empty() {
+            a.extend([format!("--{key}"), s(meta, key).into()]);
+        }
+    }
+    if s(meta, "mode") == "read-only" && !meta["worktree"].is_object() {
+        a.extend(["--tools".into(), "read,grep,find,ls".into()]);
+    }
+    a.push("-p".into());
+    for image in images {
+        a.push(format!("@{}", image.as_str().unwrap_or("")));
+    }
+    a
 }
 pub fn session_file(dir: &str, id: &str) -> Option<PathBuf> {
     let entries = fs::read_dir(dir).ok()?;
@@ -362,7 +519,7 @@ pub fn run_agent(
     holder: Arc<AtomicI32>,
     grace_out: Arc<std::sync::Mutex<Option<f64>>>,
 ) -> Res<(String, String)> {
-    let codex = s(meta, "agent") == "codex";
+    let agent = spec(s(meta, "agent")).ok_or_else(|| "unknown agent".to_string())?;
     let uuid = format!(
         "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
         now_ns() as u32,
@@ -371,7 +528,7 @@ pub fn run_agent(
         0u16,
         (now_ns() >> 8) as u64 & 0xffffffffffff
     );
-    let session = if codex || !s(meta, "fork").is_empty() {
+    let session = if agent.session == SessionSource::EventStream || !s(meta, "fork").is_empty() {
         None
     } else {
         Some(uuid)
@@ -381,7 +538,7 @@ pub fn run_agent(
         .ok()
         .map(|e| e.flatten().map(|x| x.path()).collect::<Vec<_>>())
         .unwrap_or_default();
-    let mut args = command(meta, session.as_deref());
+    let mut args = (agent.build_command)(meta, session.as_deref());
     if !s(meta, "agentBin").is_empty() {
         args[0] = s(meta, "agentBin").to_string();
     }
@@ -416,8 +573,8 @@ pub fn run_agent(
     clean_env(&mut c, &meta["env"]);
     c.env("DELEGATE_AGENT", s(meta, "agent"))
         .env("DELEGATE_RUN_DIR", s(meta, "dir"));
-    if !codex {
-        c.env("PI_DELEGATE_ACTIVE", "1");
+    if let Some(env_name) = agent.active_env {
+        c.env(env_name, "1");
     }
     group(&mut c);
     let mut child = c.spawn().map_err(|e| e.to_string())?;
@@ -490,18 +647,12 @@ pub fn run_agent(
             let Ok(event) = serde_json::from_slice::<Value>(&raw) else {
                 continue;
             };
-            for mut item in if codex {
-                filter_codex(&event)
-            } else {
-                filter_pi(&event)
-            } {
+            for mut item in (agent.filter_events)(&event) {
                 let kind = s(&item, "e").to_string();
-                if codex && kind == "turn" {
-                    item["model"] = if !s(meta, "model").is_empty() {
-                        json!(s(meta, "model"))
-                    } else {
-                        json!(codex_model())
-                    };
+                if kind == "turn" {
+                    if let Some(turn_model) = agent.turn_model {
+                        item["model"] = turn_model(meta);
+                    }
                 }
                 item["attempt"] = json!(attempt);
                 item["at"] = json!(iso());
@@ -521,8 +672,8 @@ pub fn run_agent(
                 match kind.as_str() {
                     "turn" => {
                         turn = item;
-                        settled |= codex;
-                        if !codex {
+                        settled |= agent.settles_on_turn;
+                        if agent.clears_answer_on_turn {
                             answer.clear();
                         }
                     }
@@ -560,7 +711,7 @@ pub fn run_agent(
     let _ = watcher.join();
     holder.store(0, Ordering::SeqCst);
     let status = child.wait().map_err(|e| e.to_string())?;
-    if !codex {
+    if agent.session == SessionSource::DelegateFile {
         let mut created = fs::read_dir(session_dir)
             .ok()
             .map(|e| {
@@ -602,4 +753,114 @@ pub fn run_agent(
         "failed"
     };
     Ok((verdict.into(), answer))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn args(agent: &str, meta: &Value, session: Option<&str>) -> Vec<String> {
+        (spec(agent).unwrap().build_command)(meta, session)
+    }
+
+    #[test]
+    fn agent_names_and_tier_defaults_are_unique() {
+        let mut names = HashSet::new();
+        for agent in AGENTS {
+            assert!(names.insert(agent.name), "duplicate agent: {}", agent.name);
+        }
+        for tier in ["cheap", "strong"] {
+            assert_eq!(
+                AGENTS
+                    .iter()
+                    .filter(|agent| agent.default_tier == Some(tier))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn pi_command_preserves_argument_order() {
+        let meta = json!({"workdir":"/repo","sessionDir":"/runs/session","mode":"read-only","images":["/a.png","/b.png"],"provider":"p","model":"m","thinking":"high"});
+        assert_eq!(
+            args("pi", &meta, Some("session-1")),
+            [
+                "pi",
+                "--session-id",
+                "session-1",
+                "--session-dir",
+                "/runs/session",
+                "--mode",
+                "json",
+                "--provider",
+                "p",
+                "--model",
+                "m",
+                "--thinking",
+                "high",
+                "--tools",
+                "read,grep,find,ls",
+                "-p",
+                "@/a.png",
+                "@/b.png"
+            ]
+        );
+        let fork = json!({"fork":"/runs/parent.jsonl","sessionDir":"/runs/session","mode":"read-only","worktree":{},"images":["/a.png"]});
+        assert_eq!(
+            args("pi", &fork, None),
+            [
+                "pi",
+                "--fork",
+                "/runs/parent.jsonl",
+                "--session-dir",
+                "/runs/session",
+                "--mode",
+                "json",
+                "-p",
+                "@/a.png"
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_command_preserves_argument_order() {
+        let meta = json!({"workdir":"/repo","images":["/a.png","/b.png"],"provider":"p","model":"m","thinking":"high"});
+        assert_eq!(
+            args("codex", &meta, None),
+            [
+                "codex",
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "-C",
+                "/repo",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-m",
+                "m",
+                "-c",
+                "model_reasoning_effort=\"high\"",
+                "-c",
+                "model_provider=\"p\"",
+                "--image=/a.png",
+                "--image=/b.png",
+                "-"
+            ]
+        );
+        let fork = json!({"fork":"thread-1","workdir":"/repo"});
+        assert_eq!(
+            args("codex", &fork, None),
+            [
+                "codex",
+                "exec",
+                "fork",
+                "thread-1",
+                "--json",
+                "--skip-git-repo-check",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-"
+            ]
+        );
+    }
 }

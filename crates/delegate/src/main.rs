@@ -670,6 +670,13 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "lane" => lane::lane_command(rest),
         "stop" => stop(rest),
         "clean" => clean(rest),
+        "protocol" => {
+            if let Some(arg) = rest.first() {
+                return Err(format!("unrecognized arguments: {arg}"));
+            }
+            println!("{}", crate::agents::protocol());
+            Ok(0)
+        }
         _ => Err(format!("invalid choice: {command}")),
     }
 }

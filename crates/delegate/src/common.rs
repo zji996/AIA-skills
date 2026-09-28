@@ -18,10 +18,24 @@ pub const GUARDS: [&str; 7] = [
     "PI_DELEGATE_AGENT",
     "PI_DELEGATE_PARENT_RUN",
 ];
+/// Where the caller's session id comes from, in order: an explicit id from any harness,
+/// then the session variables Claude Code, Codex and Pi export to the commands they run.
+pub const CALLER_ENV: [&str; 4] = [
+    "DELEGATE_CALLER",
+    "CLAUDE_CODE_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "PI_SESSION_ID",
+];
+pub fn caller_source() -> Option<(String, &'static str)> {
+    CALLER_ENV.iter().find_map(|name| {
+        env::var(name)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(|value| (value, *name))
+    })
+}
 pub fn caller() -> Option<String> {
-    ["DELEGATE_CALLER", "CLAUDE_CODE_SESSION_ID"]
-        .iter()
-        .find_map(|name| env::var(name).ok().filter(|value| !value.is_empty()))
+    caller_source().map(|(id, _)| id)
 }
 pub fn setting(name: &str, default: &str) -> String {
     env::var(format!("DELEGATE_{name}"))

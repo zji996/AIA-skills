@@ -1,4 +1,7 @@
-use crate::agents::{agent_available, agent_identity, missing_tools, nesting_error, session_file};
+use crate::agents::{
+    self, agent_available, agent_identity, missing_tools, nesting_error, session_file,
+    SessionSource,
+};
 use crate::changes::snapshot;
 use crate::common::*;
 use crate::runs::{self, active, agent_alive, all_runs, state};
@@ -208,7 +211,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
     if (!collect || (reply && !o.wait)) && (o.max.is_some() || o.progress || o.full) {
         return Err("unrecognized collecting option".into());
     }
-    if !o.agent.is_empty() && o.agent != "pi" && o.agent != "codex" {
+    if !o.agent.is_empty() && agents::spec(&o.agent).is_none() {
         return Err("argument --agent: invalid choice".into());
     }
     if o.tier
@@ -233,12 +236,13 @@ fn tier_agent(tier: &str) -> Res<String> {
         } else {
             "STRONG_AGENT"
         },
-        if tier == "cheap" { "pi" } else { "codex" },
+        agents::default_for_tier(tier).name,
     );
-    if agent != "pi" && agent != "codex" {
+    if agents::spec(&agent).is_none() {
         return Err(format!(
-            "DELEGATE_{}_AGENT must be one of pi, codex, got {agent:?}",
-            tier.to_uppercase()
+            "DELEGATE_{}_AGENT must be one of {}, got {agent:?}",
+            tier.to_uppercase(),
+            agents::choices(", ")
         ));
     }
     Ok(agent)
@@ -385,10 +389,12 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         return Err(e);
     }
     choose_agent(&mut o)?;
-    let timeout = o
-        .timeout
-        .clone()
-        .unwrap_or_else(|| if o.agent == "pi" { "15m" } else { "30m" }.into());
+    let timeout = o.timeout.clone().unwrap_or_else(|| {
+        agents::spec(&o.agent)
+            .expect("validated agent")
+            .default_timeout
+            .into()
+    });
     o.timeout = Some(timeout);
     let prompt = read_prompt(&mut o)?;
     let after = o.after.as_deref().map(runs::resolve).transpose()?;
@@ -505,7 +511,8 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     };
     if !o.fresh
         && (session.is_none()
-            || (s(&meta, "agent") == "pi"
+            || (agents::spec(s(&meta, "agent"))
+                .is_some_and(|a| a.session == SessionSource::DelegateFile)
                 && session_file(s(&meta, "sessionDir"), session.as_deref().unwrap_or(""))
                     .is_none()))
     {
@@ -637,14 +644,17 @@ pub fn capacity(agent: &str, active_runs: &[PathBuf]) -> Res<()> {
     let codex = number("MAX_CODEX", 4)?;
     let codex_count = active_runs
         .iter()
-        .filter(|r| s(&json(r.join("meta.json")), "agent") == "codex")
+        .filter(|r| agents::spec(s(&json(r.join("meta.json")), "agent")).is_some_and(|a| a.heavy))
         .count();
     let reason = if total > 0 && active_runs.len() >= total as usize {
         format!(
             "{} runs are active on this machine (DELEGATE_MAX_ACTIVE={total})",
             active_runs.len()
         )
-    } else if agent == "codex" && codex > 0 && codex_count >= codex as usize {
+    } else if agents::spec(agent).is_some_and(|a| a.heavy)
+        && codex > 0
+        && codex_count >= codex as usize
+    {
         format!("{codex_count} Codex runs are active on this machine (DELEGATE_MAX_CODEX={codex})")
     } else {
         String::new()
@@ -841,7 +851,11 @@ pub fn launch(
             } else {
                 o.accept.as_deref()
             },
-            mode == "read-only" && (o.agent == "codex" || extra["worktree"].is_object()),
+            mode == "read-only"
+                && (agents::spec(&o.agent)
+                    .expect("validated agent")
+                    .read_only_contract
+                    || extra["worktree"].is_object()),
             false,
             &o.protect,
         )
@@ -855,7 +869,11 @@ pub fn launch(
         },
     )?;
     let mut fork_value = fork.map(str::to_string);
-    if let (true, Some(fork_id), "pi") = (parent.is_object(), fork, o.agent.as_str()) {
+    if let (true, Some(fork_id), SessionSource::DelegateFile) = (
+        parent.is_object(),
+        fork,
+        agents::spec(&o.agent).expect("validated agent").session,
+    ) {
         let source = session_file(s(parent, "sessionDir"), fork_id)
             .ok_or_else(|| "missing parent session".to_string())?;
         fs::create_dir(run.join("fork")).map_err(|e| e.to_string())?;
@@ -946,7 +964,7 @@ pub fn launch(
     } else {
         Value::Null
     };
-    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":seconds(o.timeout.as_deref().unwrap_or("15m"))?,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
+    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":seconds(o.timeout.as_deref().unwrap_or("15m"))?,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
     let (agent_bin, agent_version) = agent_identity(s(&meta, "agent"))?;
     meta["agentBin"] = json!(agent_bin);
     if let Some(version) = agent_version {

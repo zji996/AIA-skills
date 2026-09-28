@@ -114,7 +114,8 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 | `DELEGATE_CHEAP_AGENT` / `DELEGATE_STRONG_AGENT` | 档位对应的同事，默认 `pi` / `codex` |
 | `DELEGATE_AGENT` | 由脚本导出给同事（`pi`/`codex`）；设有它的进程不能再委派 |
 | `PI_DELEGATE_ACTIVE` | 旧版标记，仍导出给 Pi；存在时视为 Pi 调用者 |
+| `DELEGATE_CALLER` | 主控会话标识，无参 `wait` 据此只收本会话的任务；未设时依次取 `CLAUDE_CODE_SESSION_ID`、`CODEX_THREAD_ID`、`PI_SESSION_ID`。`$D protocol` 显示当前取到的值与来源 |
 
 ## 代码结构
 
-`bin/delegate` 是安装时按 `bin.sha256` 校验下载的静态二进制（Linux x86_64 / aarch64，musl），源码在仓库的 `crates/delegate/`，行为契约见仓库的 `docs/delegate-spec.md`。接入新的同事只需改 `agents.rs`（启动命令、续接方式、事件解析）。
+`bin/delegate` 是安装时按 `bin.sha256` 校验下载的静态二进制（Linux x86_64 / aarch64，musl），源码在仓库的 `crates/delegate/`，行为契约见仓库的 `docs/delegate-spec.md`。接入新的同事只需在 `agents.rs` 的 `AGENTS` 适配表加一项（启动命令、续接方式、事件解析、默认超时、是否占强档名额）。接入新的主控宿主见仓库的 `docs/delegate-protocol.md`；`$D protocol` 输出协议版本、会话标识与各同事实际执行的文件、版本及被遮住的同名文件。
