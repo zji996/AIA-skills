@@ -28,6 +28,7 @@ fn status_line(run: &Path) -> String {
         "parent",
         "after",
         "worktree",
+        "ageSeconds",
         "elapsedSeconds",
         "attempts",
         "model",
@@ -68,6 +69,22 @@ fn status_line(run: &Path) -> String {
         }
     }
     format!("{{{}}}", fields.join(","))
+}
+fn hint_undelivered_other_runs(created: &Path) {
+    let current = caller();
+    let others = runs::all_runs()
+        .into_iter()
+        .filter(|run| {
+            run != created && !runs::active(&runs::state(run)) && !run.join(".delivered").exists()
+        })
+        .filter(|run| {
+            let meta = json(run.join("meta.json"));
+            current
+                .as_deref()
+                .is_none_or(|id| meta["caller"].as_str() != Some(id))
+        })
+        .collect::<Vec<_>>();
+    runs::other_runs_hint(&others);
 }
 
 type Parsed = (Vec<String>, Vec<String>, Vec<(String, String)>);
@@ -497,6 +514,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
             let prog = o.progress;
             let full = o.full;
             let run = launch::start(o)?;
+            hint_undelivered_other_runs(&run);
             if command == "start" {
                 println!("{}", status_line(&run));
                 eprintln!(
@@ -522,6 +540,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
             let wait = o.wait;
             let parent = o.run.clone().unwrap_or_default();
             let run = launch::reply(o)?;
+            hint_undelivered_other_runs(&run);
             let name = run.file_name().unwrap_or_default().to_string_lossy();
             if wait {
                 eprintln!("delegate: started {name} (reply to {parent})");
@@ -555,10 +574,22 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 }
                 v
             } else if has(&flags, "--all") || pos.is_empty() {
-                let v = runs::all_runs()
+                let mut v = runs::all_runs()
                     .into_iter()
                     .filter(|r| runs::active(&runs::state(r)) || !r.join(".delivered").exists())
                     .collect::<Vec<_>>();
+                if pos.is_empty() && !has(&flags, "--all") {
+                    if let Some(caller) = caller() {
+                        let (own, other): (Vec<_>, Vec<_>) = v.into_iter().partition(|run| {
+                            json(run.join("meta.json"))["caller"].as_str() == Some(&caller)
+                        });
+                        runs::other_runs_hint(&other);
+                        v = own;
+                        if v.is_empty() && !other.is_empty() {
+                            return Ok(0);
+                        }
+                    }
+                }
                 if v.is_empty() {
                     eprintln!("delegate: no active or undelivered runs");
                     return Ok(0);

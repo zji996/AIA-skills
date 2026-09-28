@@ -120,6 +120,45 @@ pub fn state(run: &Path) -> String {
 pub fn active(s: &str) -> bool {
     s == "running" || s == "starting" || s == "waiting"
 }
+pub fn age_seconds(meta: &Value) -> Option<i64> {
+    meta["startedEpoch"]
+        .as_f64()
+        .map(|started| (epoch() - started).max(0.0) as i64)
+}
+pub fn other_runs_hint(runs: &[PathBuf]) {
+    if runs.is_empty() {
+        return;
+    }
+    let names = runs
+        .iter()
+        .take(3)
+        .map(|run| {
+            let meta = json(run.join("meta.json"));
+            let name = meta["name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| {
+                    run.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("?")
+                });
+            let age = age_seconds(&meta).unwrap_or(0);
+            let age = if age >= 86400 {
+                format!("{}d", age / 86400)
+            } else if age >= 3600 {
+                format!("{}h", age / 3600)
+            } else if age >= 60 {
+                format!("{}m", age / 60)
+            } else {
+                format!("{age}s")
+            };
+            format!("{} {age}", name.replace(['\n', '\r'], " "))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = if runs.len() > 3 { ", ..." } else { "" };
+    eprintln!("delegate: {} other runs not started by this session ({names}{more}); collect with wait --all or remove with clean <run>", runs.len());
+}
 pub fn events(run: &Path) -> Vec<Value> {
     read(run.join("events.jsonl"))
         .lines()
@@ -172,6 +211,9 @@ pub fn status(run: &Path) -> Value {
     let st = state(run);
     let sum = json(run.join("summary.json"));
     let mut out = json!({"run":meta.get("run").and_then(Value::as_str).unwrap_or_else(||run.file_name().and_then(|x|x.to_str()).unwrap_or("")),"name":meta.get("name"),"state":st,"agent":meta.get("agent").and_then(Value::as_str).unwrap_or("pi"),"mode":meta.get("mode")});
+    if let Some(age) = age_seconds(&meta) {
+        out["ageSeconds"] = json!(age);
+    }
     if !s(&meta, "tier").is_empty() {
         out["tier"] = meta["tier"].clone();
     }

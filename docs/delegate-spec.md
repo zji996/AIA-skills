@@ -41,7 +41,7 @@
 | `start` | 启动选项（§2.3）＋任务说明 | 创建 run 并启动 supervisor，立即输出一行状态（§3.1）；stderr 提示收取命令 |
 | `run` | 启动选项＋`--max`/`--progress`/`--full` | `start` 后等待，按 §3.2 输出 |
 | `reply <run> [消息]` | `--fresh` `--sync` `--accept` `--hide-accept` `--accept-timeout` `--timeout` `--image` `--name` `--prompt(-file)`；`--wait` 时可用等待选项 | 续接对话并立即返回启动状态；`--wait` 等结论（§7） |
-| `wait [<run>...\|--all]` | `--max` `--no-result` `--full` `--progress` | 等待并输出；无参数（或 `--all`）取所有运行中或结果未读取的 run，没有时提示并以 0 退出 |
+| `wait [<run>...\|--all]` | `--max` `--no-result` `--full` `--progress` | 等待并输出；无参数按派发会话收取（§9.5），`--all` 取本仓库所有运行中或结果未读取的 run；没有时以 0 退出 |
 | `status [<run>...]`（别名 `list`） | | 每个 run 一行状态；无参数列出全部 |
 | `result [<run>] [--path]` | | 输出完整答复（或其路径）；非运行中时标记已读取 |
 | `diff [<run>] [--stat] [--total] [路径...]` | | `git diff` 该 run 前后快照；`--total` 自对话起点；终端下带颜色；对象被清理时回退输出 `changes.patch` |
@@ -93,6 +93,7 @@
 | `parent` | reply | 上一轮 run id |
 | `after` | 使用 `--after` | 上游 run id |
 | `worktree` | 在 worktree 中运行 | worktree 路径 |
+| `ageSeconds` | meta 有 `startedEpoch` | 从启动到当前的非负整秒；`status` 每行均按此计算 |
 | `elapsedSeconds` `turns` | 总是 | 运行中为实时值 |
 | `last` `idleSeconds` | 运行中 | 最近一个动作及其距今秒数 |
 | `attempts` `model` `tokens{input,output,cacheRead}` | 已结束 | |
@@ -311,7 +312,7 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 
 ### 9.5 等待（`wait`/`run`）
 
-阻塞在各 run 的 `supervisor.lock` 共享锁上（每个一个线程），`--max` 到期即返回。`wait --machine` 在调用开始时从 `<state>` 的 slot 读取整机运行中或等待中的 run 目录并固定该列表（之后 slot 被清理不影响本次收取），跨仓库收取；不带 `--machine` 时只收取当前仓库的 run。仅在 `--progress`、supervisor 尚未加锁（刚启动）或 4.4 之前的 run 时按 `DELEGATE_POLL`（默认 1 秒）轮询。
+阻塞在各 run 的 `supervisor.lock` 共享锁上（每个一个线程），`--max` 到期即返回。`wait --machine` 在调用开始时从 `<state>` 的 slot 读取整机运行中或等待中的 run 目录并固定该列表（之后 slot 被清理不影响本次收取），跨仓库收取；不带 `--machine` 时只收取当前仓库的 run。无参 `wait` 在 caller 已知时只选 caller 相同且运行中或未送达的 run；其他运行中或未送达的 run（含没有 caller 的旧 run）不收取、不输出结论块，只在 stderr 用一行报告数量、最多三个名称及年龄，并提示 `wait --all` / `clean <run>`。本会话没有可收取的 run 而有其他 run 时，提示后以 0 退出；都没有时沿用 `no active or undelivered runs`。caller 未知时无参 `wait` 与旧行为相同，收取全部。`wait --all`、`wait <run...>` 和 `wait --machine` 不受 caller 过滤；退出码只由实际收取的 run 决定。仅在 `--progress`、supervisor 尚未加锁（刚启动）或 4.4 之前的 run 时按 `DELEGATE_POLL`（默认 1 秒）轮询。
 
 ## 10. 并发、准入与清理
 
@@ -329,7 +330,7 @@ run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git �
 
 | 文件 | 写入者 | 内容 |
 |---|---|---|
-| `meta.json` | 启动方（升档时 supervisor 更新） | run、dir、workdir、mode、agent、tier、escalatedFrom、name、provider、model、thinking、timeout(Seconds)、accept、acceptTimeoutSeconds、retries、images、top、base、snapshotExclude、worktree{source,sourceWorkdir,config,path}、env、chainBase、sessionDir、parent、fork、startedAt/Epoch/Ns |
+| `meta.json` | 启动方（升档时 supervisor 更新） | run、dir、workdir、mode、agent、tier、escalatedFrom、name、caller、provider、model、thinking、timeout(Seconds)、accept、acceptTimeoutSeconds、retries、images、top、base、snapshotExclude、worktree{source,sourceWorkdir,config,path}、env、chainBase、sessionDir、parent、fork、startedAt/Epoch/Ns |
 | `prompt.md` | 启动方 | 同事收到的全文 |
 | `supervisor.lock` / `pid` / `agent.pid` | supervisor | 生命周期锁 / supervisor pid / 同事进程组 |
 | `events.jsonl` `stderr.log` `supervisor.log` | supervisor | §7.2 / 同事 stderr / supervisor 输出 |
@@ -346,6 +347,8 @@ run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git �
 
 `agent-handoff` 依赖 `meta.json`、`exit_code`、`.delivered`、`.applied` 与 `meta.json` 中的 `worktree.path`、`mode`；改变其含义须同步修改。
 
+`caller` 是派发该轮 run 的主控会话标识，`start` / `run` / `reply`（包括 `--after` 的 waiting run）创建时写入；依次取非空 `DELEGATE_CALLER`、`CLAUDE_CODE_SESSION_ID`，均无则写 `null`。`session` 属于同事会话，不表示 caller。成功创建 run 后，若本仓库有已结束、未送达、caller 不等于当前 caller 的 run（当前 caller 未知时视全部旧 run 为其他），stderr 用一行报告数量、最多三个名称与年龄，并提示 `wait --all` / `clean <run>`；不影响 JSON stdout 与退出码。
+
 ## 12. 配置与环境变量
 
 `.delegate.json`（仓库根）：
@@ -357,7 +360,7 @@ run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git �
 
 `env` 为字符串到字符串的映射，注入同事、验收与 setup（原地与 worktree 均生效，reply 沿用）；`copy`/`link` 必须是仓库内相对路径，缺源跳过并在启动命令与 supervisor 的 stderr 提示。
 
-环境变量均先读 `DELEGATE_<名>`，再读 `PI_DELEGATE_<名>`：`RUNS`、`CHEAP_AGENT`（pi）、`STRONG_AGENT`（codex）、`MAX_ACTIVE`、`MAX_CODEX`、`MAX_HEAVY`、`MIN_AVAILABLE_MB`、`TIMEOUT_GRACE`、`RESULT_CHARS`（6000）、`KEEP_DAYS`、`POLL`、`SNAPSHOT_MAX_BYTES`、`SETUP_TIMEOUT`（10m）。由实现导出、调用方不应设置的保护变量：`DELEGATE_AGENT`、`DELEGATE_RUN_DIR`、`DELEGATE_LANE_HELD`、`PI_DELEGATE_ACTIVE`、`PI_DELEGATE_AGENT`、`PI_DELEGATE_PARENT_RUN`。
+环境变量均先读 `DELEGATE_<名>`，再读 `PI_DELEGATE_<名>`：`RUNS`、`CHEAP_AGENT`（pi）、`STRONG_AGENT`（codex）、`MAX_ACTIVE`、`MAX_CODEX`、`MAX_HEAVY`、`MIN_AVAILABLE_MB`、`TIMEOUT_GRACE`、`RESULT_CHARS`（6000）、`KEEP_DAYS`、`POLL`、`SNAPSHOT_MAX_BYTES`、`SETUP_TIMEOUT`（10m）。`DELEGATE_CALLER` 单独按上述优先级取值，不读取 `PI_DELEGATE_CALLER`。由实现导出、调用方不应设置的保护变量：`DELEGATE_AGENT`、`DELEGATE_RUN_DIR`、`DELEGATE_LANE_HELD`、`PI_DELEGATE_ACTIVE`、`PI_DELEGATE_AGENT`、`PI_DELEGATE_PARENT_RUN`。
 
 ## 13. 一致性验收
 

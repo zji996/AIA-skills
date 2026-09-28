@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "5.7.0"
+  version: "5.8.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -22,7 +22,7 @@ $D wait                                                                         
 #                                                                                        # 3. 按结论行的 next 处理
 ```
 
-- **等待**：能后台运行并在结束时收到通知的环境，把一个 `wait`（或 `run`）放后台，不要用 `status` 轮询；单次调用有时长上限的环境加 `--max 4m`，返回 75 就稍后再 `wait`。`wait` 不带参数时等所有未结束、未读取的任务。
+- **等待**：能后台运行并在结束时收到通知的环境，把一个 `wait`（或 `run`）放后台，不要用 `status` 轮询；单次调用有时长上限的环境加 `--max 4m`，返回 75 就稍后再 `wait`。无参 `wait` 只收本会话派出的任务；无会话标识时沿用收取全部的行为，`--all` 可收本仓库全部。
 - **结论**：每个任务一行 JSON，随后是改动清单与答复。`next` 字段给出下一步（含可复制的命令），没有 `next` 就是答复本身即交付物。答复超过 6000 字（`DELEGATE_RESULT_CHARS`）显示开头和结尾，全文用 `$D result <name>`；只看过截断答复的任务 `clean --finished` 会保留，读过全文或加 `--force` 才删。`cleanup` 报告已终止的后台进程与端口，`warnings` 报告 worktree 源问题。
 
 ## 场景速查

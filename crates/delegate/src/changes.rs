@@ -193,7 +193,7 @@ pub fn tree_changes(top: &Path, before: &Value, after: &Value, worktree: bool) -
         &["diff", "--name-status", "-z", "--no-renames", a, b],
     )?);
     let mut changes = vec![];
-    for pair in names.chunks_exact(2) {
+    for pair in names.as_chunks::<2>().0 {
         let (added, deleted) = counts
             .get(&pair[1])
             .cloned()

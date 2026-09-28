@@ -95,7 +95,8 @@ class DelegateTests(unittest.TestCase):
         self.work = Path(self.temp.name)
         self.bin = self.work / "bin"
         self.bin.mkdir()
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("DELEGATE_", "PI_DELEGATE_"))}
+        self.env = {k: v for k, v in os.environ.items()
+                    if not k.startswith(("DELEGATE_", "PI_DELEGATE_")) and k != "CLAUDE_CODE_SESSION_ID"}
         self.env.update(PATH=f"{self.bin}:{os.environ['PATH']}", DELEGATE_POLL="0.1",
                         DELEGATE_RUNS=str(self.work / "runs"), XDG_STATE_HOME=str(self.work / "state"),
                         XDG_CACHE_HOME=str(self.work / "cache"),
@@ -908,6 +909,84 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(sorted(json.loads(line)["name"] for line in result.stdout.splitlines()
                                 if line.startswith('{"run"')), ["one", "two"])
         self.assertIn("no active or undelivered runs", self.cli("wait").stderr)
+
+    def test_caller_is_written_for_start_run_reply_and_waiting_run(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        self.env["CLAUDE_CODE_SESSION_ID"] = "claude-session"
+        first = self.outcome(self.cli("start", "--read-only", "task"))
+        self.assertEqual(json.loads((Path(first["dir"]) / "meta.json").read_text())["caller"], "claude-session")
+        self.env["DELEGATE_CALLER"] = "explicit-session"
+        waiting = self.outcome(self.cli("start", "--read-only", "--after", first["run"], "later"))
+        self.assertEqual(json.loads((Path(waiting["dir"]) / "meta.json").read_text())["caller"],
+                         "explicit-session")
+        synchronous = self.outcome(self.cli("run", "--read-only", "another"))
+        self.assertEqual(json.loads((Path(synchronous["dir"]) / "meta.json").read_text())["caller"],
+                         "explicit-session")
+        self.assertEqual(self.cli("wait", first["run"]).returncode, 0)
+        replied = self.outcome(self.cli("reply", first["run"], "more"))
+        self.assertEqual(json.loads((Path(replied["dir"]) / "meta.json").read_text())["caller"],
+                         "explicit-session")
+        self.assertEqual(self.cli("wait", "--all").returncode, 0)
+        self.env.pop("DELEGATE_CALLER")
+        self.env.pop("CLAUDE_CODE_SESSION_ID")
+        unknown = self.outcome(self.cli("run", "--read-only", "unknown"))
+        self.assertIsNone(json.loads((Path(unknown["dir"]) / "meta.json").read_text())["caller"])
+
+    def test_wait_collects_only_current_caller_and_reports_other_failure(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        self.env["DELEGATE_CALLER"] = "other"
+        failed = self.outcome(self.cli("start", "--name", "old-failure", "--accept", "false", "task"))
+        self.until(lambda: (Path(failed["dir"]) / "exit_code").exists(), "failed run")
+        self.assertEqual(json.loads(self.cli("status", failed["run"]).stdout)["state"], "rejected")
+        self.env["DELEGATE_CALLER"] = "mine"
+        started = self.cli("start", "--read-only", "--name", "new-success", "task")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.assertIn("old-failure", started.stderr)
+        self.assertIn("wait --all", started.stderr)
+        self.assertRegex(started.stderr, r"old-failure \d+[smhd]")
+        own = self.outcome(started)
+        result = self.cli("wait")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(own["run"], result.stdout)
+        self.assertNotIn(failed["run"], result.stdout)
+        self.assertIn("1 other runs", result.stderr)
+        self.assertFalse((Path(failed["dir"]) / ".delivered").exists())
+        old_meta_path = Path(failed["dir"]) / "meta.json"
+        old_meta = json.loads(old_meta_path.read_text())
+        del old_meta["caller"]  # pre-5.8 records also belong to the other-run summary
+        old_meta["name"] = "old\nfailure"
+        old_meta_path.write_text(json.dumps(old_meta))
+        run_hint = self.cli("run", "--read-only", "quick").stderr
+        self.assertIn("old failure", run_hint)
+        self.assertEqual(sum("other runs" in line for line in run_hint.splitlines()), 1)
+        replied = self.cli("reply", own["run"], "more")
+        self.assertIn("old failure", replied.stderr)
+        self.assertEqual(self.cli("wait", self.outcome(replied)["run"]).returncode, 0)
+        self.assertEqual(self.cli("wait").returncode, 0)
+        self.assertEqual(self.cli("wait", "--all").returncode, 1)
+
+    def test_unknown_caller_wait_collects_all_and_status_reports_age(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        self.env["DELEGATE_CALLER"] = "old"
+        old = self.outcome(self.cli("start", "--read-only", "--name", "older", "task"))
+        meta_path = Path(old["dir"]) / "meta.json"
+        meta = json.loads(meta_path.read_text())
+        meta["startedEpoch"] = int(time.time()) - 2 * 86400
+        meta_path.write_text(json.dumps(meta))
+        self.env.pop("DELEGATE_CALLER")
+        launched = self.cli("start", "--read-only", "--name", "newer", "task")
+        self.assertIn("older 2d", launched.stderr)
+        new = self.outcome(launched)
+        status = json.loads(self.cli("status", old["run"]).stdout)
+        self.assertGreaterEqual(status["ageSeconds"], 2 * 86400)
+        result = self.cli("wait")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(old["run"], result.stdout)
+        self.assertIn(new["run"], result.stdout)
+        self.assertNotIn("other runs", result.stderr)
+        del meta["startedEpoch"]
+        meta_path.write_text(json.dumps(meta))
+        self.assertNotIn("ageSeconds", json.loads(self.cli("status", old["run"]).stdout))
 
     def test_images_are_attached_for_both_agents(self):
         image = self.work / "shot.png"

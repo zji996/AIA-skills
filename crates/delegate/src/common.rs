@@ -18,6 +18,11 @@ pub const GUARDS: [&str; 7] = [
     "PI_DELEGATE_AGENT",
     "PI_DELEGATE_PARENT_RUN",
 ];
+pub fn caller() -> Option<String> {
+    ["DELEGATE_CALLER", "CLAUDE_CODE_SESSION_ID"]
+        .iter()
+        .find_map(|name| env::var(name).ok().filter(|value| !value.is_empty()))
+}
 pub fn setting(name: &str, default: &str) -> String {
     env::var(format!("DELEGATE_{name}"))
         .ok()
