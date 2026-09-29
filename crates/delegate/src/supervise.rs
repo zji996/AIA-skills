@@ -55,6 +55,7 @@ fn accept(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
     };
     let _ = writeln!(log, "$ {}", s(meta, "accept"));
     let _ = log.flush();
+    let before = changes::repository_snapshot(Path::new(s(meta, "top")), run);
     let (code, timed) = run_shell(
         (s(meta, "accept"), "accept"),
         Path::new(s(meta, "workdir")),
@@ -65,6 +66,21 @@ fn accept(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
         Some(&holder),
     )
     .unwrap_or((1, false));
+    let after = changes::repository_snapshot(Path::new(s(meta, "top")), run);
+    if let (Some(before), Some(after)) = (&before, &after) {
+        result["tree"] = before["tree"].clone();
+        result["treeAfter"] = after["tree"].clone();
+        result["snapshotComplete"] = json!(b(before, "complete") && b(after, "complete"));
+        if !b(&result, "snapshotComplete") {
+            result["snapshotReason"] = before
+                .get("incompleteReason")
+                .or_else(|| after.get("incompleteReason"))
+                .cloned()
+                .unwrap_or(json!("incomplete repository snapshot"));
+        }
+    } else {
+        result["snapshotReason"] = json!("acceptance repository snapshot failed");
+    }
     let _ = writeln!(
         log,
         "{}\n[exit {code}]",
@@ -178,6 +194,9 @@ fn settle(
         .collect::<Vec<_>>();
     if let Some((changes, totals)) = &rec {
         sum["changes"] = totals.clone();
+        if let Some(pending) = worktree::pending_changes(run, meta) {
+            sum["pendingChanges"] = pending;
+        }
         if let Ok(Some(shape)) = changes::shape(meta, run, changes) {
             sum["shape"] = shape;
         }
@@ -197,6 +216,24 @@ fn settle(
         state = "rejected".into();
         sum["state"] = json!(state);
         sum["protectViolation"] = json!(violations);
+        let reasons = meta["protectReasons"]
+            .as_object()
+            .map(|reasons| {
+                reasons
+                    .iter()
+                    .filter(|(rule, _)| {
+                        violations.iter().any(|path| {
+                            path == *rule
+                                || (rule.ends_with('/') && path.starts_with(rule.as_str()))
+                        })
+                    })
+                    .map(|(path, reason)| (path.clone(), reason.clone()))
+                    .collect::<serde_json::Map<String, Value>>()
+            })
+            .unwrap_or_default();
+        if !reasons.is_empty() {
+            sum["protectViolationReasons"] = json!(reasons);
+        }
         sum["error"] = json!("protected paths were changed; review protectViolation and remove those changes before retrying");
     }
     if violations.is_empty() && verdict == "ok" && !s(meta, "accept").is_empty() && !lane::stopped()
@@ -252,7 +289,7 @@ fn escalate(
         if !launch::has_read_only_contract(&prompt) {
             write(
                 run.join("prompt.md"),
-                launch::contract(&prompt, None, true, false, &[]),
+                launch::contract(&prompt, None, true, false, &[], &Default::default()),
             )?;
         }
     }
@@ -476,13 +513,13 @@ fn inner(
     if warnings.is_array() && !warnings.as_array().unwrap().is_empty() {
         sum["warnings"] = warnings;
     }
-    write_json(run.join("summary.json"), &sum)?;
-    write(
-        run.join("exit_code"),
+    finish_run(
+        run,
+        sum,
         if ["delivered", "answered"].contains(&state.as_str()) {
-            "0\n"
+            0
         } else {
-            "1\n"
+            1
         },
     )?;
     Ok(())
@@ -497,8 +534,7 @@ fn finish_skipped(run: &Path, reason: &str) -> Res<()> {
     if warnings.as_array().is_some_and(|items| !items.is_empty()) {
         summary["warnings"] = warnings;
     }
-    write_json(run.join("summary.json"), &summary)?;
-    write(run.join("exit_code"), "1\n")
+    finish_run(run, summary, 1)
 }
 fn wait_for_run(run: &Path) {
     let poll = setting("POLL", "1").parse::<f64>().unwrap_or(1.0).max(0.01);
@@ -628,8 +664,7 @@ pub fn supervise(run: &Path) -> Res<()> {
             if warnings.as_array().is_some_and(|items| !items.is_empty()) {
                 summary["warnings"] = warnings;
             }
-            let _ = write_json(run.join("summary.json"), &summary);
-            let _ = write(run.join("exit_code"), "1\n");
+            let _ = finish_run(run, summary, 1);
         }
     }
     Ok(())

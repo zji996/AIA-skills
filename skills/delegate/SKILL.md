@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "5.11.0"
+  version: "5.12.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -23,7 +23,7 @@ $D wait                                                                         
 ```
 
 - **等待**：`wait`、`run`、`reply --wait` 会一直阻塞到同事结束，默认放后台：Claude Code 里给 Bash 工具加 `run_in_background: true`，结束时会收到通知，期间继续干别的，不要用 `status` 轮询（`hooks/claude-code-background.py` 可作为 PreToolUse hook 拒绝前台调用）。只有没有后台通知、单次调用又有时长上限的主控才用 `--max 4m`，返回 75 就稍后再 `wait`。无参 `wait` 只收本会话派出的任务；无会话标识时沿用收取全部的行为，`--all` 可收本仓库全部。
-- **逐个处理**：多路并行时不必等最慢的一个。宿主能把每行输出变成通知（Claude Code 的 Monitor）就放一个 `$D wait --stream`，每完工一个来一行结论，按行里的 `report` 读答复、按 `next` 合并；只有结束通知时后台跑 `$D wait --any`，处理完再放同一条。结论行带 `sourceDrift` 表示快照后你也改过源码，`overlap` 非空时先看 `next` 再决定 `apply` 还是 `reply --sync`。
+- **逐个处理**：宿主能逐行通知就后台跑 `$D wait --stream`，按 `report` 读答复、按 `next` 合并；只有结束通知就重复后台跑 `$D wait --any`。一次会交付当前所有已结束任务，顺序不变；`completionTiming: already-finished` 表示首次检查时已经结束，通知可能只是在交付旧结果，`finished-during-wait` 表示等待期间完成；新记录有 `finishedAt`。`sourceDrift.overlap` 非空时先按 `next` 选择 `apply` 或 `reply --sync`。
 - **结论**：每个任务一行 JSON，随后是改动清单与答复。`next` 字段给出下一步（含可复制的命令），没有 `next` 就是答复本身即交付物。答复超过 6000 字（`DELEGATE_RESULT_CHARS`）显示开头和结尾，全文用 `$D result <name>`；只看过截断答复的任务 `clean --finished` 会保留，读过全文或加 `--force` 才删。`cleanup` 报告已终止的后台进程与端口，`warnings` 报告 worktree 源问题。
 
 ## 场景速查
@@ -38,7 +38,7 @@ $D wait                                                                         
 | 先 A 后 B | `$D start --after <A> …`；审 A 的结果加 `--in <A> --read-only` |
 | 自己跑重检查 | `$D lane make check`（与同事的验收排队，一次一个） |
 | 同时在几个仓库派了任务 | 放一个后台 `$D wait --machine`，整机的都会收到 |
-| 多路并行，谁先完工先处理谁 | `$D wait --stream`（流式通知）或后台 `$D wait --any`（每次一个，重复即可） |
+| 多路并行，谁先完工先处理谁 | `$D wait --stream`（流式通知）或重复后台 `$D wait --any`（收当前已结束的） |
 | 看改了什么 / 停掉 / 清理 | `$D diff <name>` / `$D stop <name>` / `$D clean --finished` |
 
 多行说明用 `--prompt-file -` 加 heredoc；总加 `--name`，之后用它指代整段对话（各命令都落到最新一轮回复）。更多完整示例、任务说明模板与常见坑见 [references/recipes.md](references/recipes.md)。
@@ -65,7 +65,7 @@ $D wait                                                                         
 - **两档怎么搭配**：Pi 找到的代码事实更多、偶有把现状说混；Codex 更准确、风险意识更强。分量重的审查两路并行、由你合并，通常好于任一方。界面类实现在强档名额紧张时可 `--tier cheap`；便宜档近乎免费，侦察不必压缩范围。
 - **让错误当场暴露**：审查说明给重点并注明不限于此，给待证伪的假设而不是结论；要求现状断言附 `文件:行号`、仓库外事实（配置键、CLI 参数、API 字段、版本号）附一手出处——便宜档会编出看似合理的名字。看图审查把影响判断的真实数据写进说明，并要求写明从图上哪里读出。
 - **开几路**：写入 3–4 路最划算（整机强档上限 4），瓶颈是主控审 diff 和跨路一致性，不是名额；先把各路共用的基础（公共组件、约定）提交好再放出，说明里写清它的误用方式；单路一个子系统、约 15 个文件以内。只读侦察可以再并行几路。同事在跑测试时，主控自己的重检查也走 `lane`，否则 CPU 超卖会把测试拖过超时。
-- **并行写入**：同仓库多个 `--worktree` 写入任务用 `--protect` 划清文件所有权；重写、迁移类任务把测试也保护起来，免得“改测试”成为最省事的通过方式。`--accept` 覆盖仓库级门禁，worktree 跑不了全量时至少跑相关 gate，合并后你再跑全量。
+- **并行写入**：用 `--protect-reason model_loop.rs '另一任务负责；恢复逻辑必须留在这里'` 划清所有权（原 `--protect` 仍可用）；同事需要改受保护路径时须停下报告，不得搬逻辑或削弱测试绕路。同仓库串行 `apply`；新增 `NNNN_` 文件的编号冲突会警告，由你审查和改号。重写、迁移类任务把测试也保护起来，免得“改测试”成为最省事的通过方式；`--accept` 覆盖仓库级门禁，worktree 跑不了全量时至少跑相关 gate，合并后你再跑全量。
 - **编排**：常用两种——强档实现后接 `--after impl --in impl --read-only` 的便宜档预审（你拿着预审看 diff）；便宜档侦察后接 `--after scout --worktree` 的强档按清单实现。链条不宜太长，每多一步误差叠加一次，需要判断的节点你插进来看。
 
 ## 读结论并把关
@@ -80,6 +80,8 @@ $D wait                                                                         
 state 只描述答复。只读任务改了文件时仍是 `answered`，另带 `readOnlyViolation`（留在它自己的 worktree，不会合并）或 `workspaceChanged`（`--in-place` 时无法归属）。改动清单按运行前后的工作区快照计算：shell 改的也算，运行前已有的改动与验收副产物不算。退出码：`0` delivered/answered，`1` 其他结局，`2` 用法错误或被拒绝，`75` 仍在运行。
 
 写入任务有改动时，结论的 `shape` 来自快照 diff：`dirs` 是目录增删行分布，`largest` 是改后文本文件总行数，`config` 是改动过的依赖/构建/CI 配置路径，`removed` 是删除路径；`*More` 是各列表未显示数量。`changes` 保留整体总数，完整逐文件信息在 `changes.json`。只读或无改动时无 `shape`。
+
+`changes` 是本轮差异；`pendingChanges` 是累计待合入量，零改动 reply 仍可能需要 `diff --total` / `apply`。慢 `apply` 可后台执行，stderr 提示检查、生成排队和日志路径，失败后再次 apply 会重试生成。末尾 `operation: apply` 结论保留退出码；`acceptStillValid: true` 仅证明本轮验收成功且未改树、最终源树相同，可按 `repository-snapshot` 范围复用。`false` 需重验；缺字段按原因判断未知。忽略文件、环境、数据库、Git 历史不在范围内，后续改动或 reply 必须重新判断。
 
 ## 边界
 

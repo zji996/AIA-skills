@@ -177,7 +177,12 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
         return Some(format!("{script} wait {name}"));
     }
     if state == "delivered" || state == "answered" {
-        if s(meta, "mode") != "write" || n(&sum["changes"], "files") == 0 {
+        if s(meta, "mode") != "write"
+            || n(
+                sum.get("pendingChanges").unwrap_or(&sum["changes"]),
+                "files",
+            ) == 0
+        {
             return None;
         }
         if meta["worktree"].is_null() {
@@ -237,16 +242,19 @@ pub fn status(run: &Path) -> Value {
     }
     if sum.is_object() {
         for key in [
+            "finishedAt",
             "elapsedSeconds",
             "attempts",
             "model",
             "turns",
             "files",
             "changes",
+            "pendingChanges",
             "shape",
             "accept",
             "readOnlyViolation",
             "protectViolation",
+            "protectViolationReasons",
             "workspaceChanged",
             "escalatedFrom",
             "queuedSeconds",
@@ -321,7 +329,7 @@ pub fn unmerged(run: &Path) -> bool {
     s(&m, "mode") == "write"
         && m["worktree"].is_object()
         && Path::new(s(&m["worktree"], "path")).exists()
-        && !run.join(".applied").exists()
+        && (!run.join(".applied").exists() || run.join(".generate-pending").exists())
 }
 pub fn remove(run: &Path) {
     let meta = json(run.join("meta.json"));

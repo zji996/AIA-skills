@@ -430,6 +430,21 @@ fn applied_state(run: &Path, meta: &Value) -> Value {
     }
     meta["appliedBase"].clone()
 }
+pub fn pending_changes(run: &Path, meta: &Value) -> Option<Value> {
+    if !meta["worktree"].is_object() || s(meta, "mode") != "write" {
+        return None;
+    }
+    let rec = json(run.join("changes.json"));
+    let mut base = applied_state(run, meta);
+    if s(&base, "tree").is_empty() {
+        base = json!({"tree":s(meta,"chainBase"),"large":{}});
+    }
+    let after = json!({"tree":rec["after"],"large":rec["afterLarge"]});
+    let changes = tree_changes(Path::new(s(&rec, "top")), &base, &after, true).ok()?;
+    Some(
+        json!({"files":changes.len(),"added":changes.iter().map(|c| n(c,"added")).sum::<i64>(),"deleted":changes.iter().map(|c| n(c,"deleted")).sum::<i64>()}),
+    )
+}
 fn file_hash(path: &Path) -> Res<String> {
     let mut file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut hash = sha1_smol::Sha1::new();
@@ -448,7 +463,8 @@ fn file_hash(path: &Path) -> Res<String> {
 /// the number of changed files, and which of them the run changed too.
 pub fn source_drift(run: &Path) -> Option<Value> {
     let meta = json(run.join("meta.json"));
-    if !meta["worktree"].is_object() || s(&meta, "mode") != "write" || run.join(".applied").exists() {
+    if !meta["worktree"].is_object() || s(&meta, "mode") != "write" || run.join(".applied").exists()
+    {
         return None;
     }
     let (_, top, _, after) = chain_changes(run).ok()?;
@@ -473,7 +489,8 @@ pub fn source_drift(run: &Path) -> Option<Value> {
         .map(|c| s(c, "path"))
         .filter(|p| ours.iter().any(|c| s(c, "path") == *p))
         .collect::<Vec<_>>();
-    let mut drift = json!({"files":moved.len(),"overlap":overlap.iter().take(10).collect::<Vec<_>>()});
+    let mut drift =
+        json!({"files":moved.len(),"overlap":overlap.iter().take(10).collect::<Vec<_>>()});
     if overlap.len() > 10 {
         drift["overlapMore"] = json!(overlap.len() - 10);
     }
@@ -563,8 +580,7 @@ pub fn sync(run: &Path, meta: &Value) -> Res<Vec<String>> {
                 continue;
             }
             let scratch = run.join(format!(".sync-merge-{}", std::process::id()));
-            fs::create_dir_all(&scratch)
-                .map_err(|e| format!("{}: {e}", scratch.display()))?;
+            fs::create_dir_all(&scratch).map_err(|e| format!("{}: {e}", scratch.display()))?;
             let minefile = scratch.join("mine");
             write(&minefile, mine)?;
             let basefile = scratch.join("base");
@@ -631,7 +647,169 @@ pub fn sync(run: &Path, meta: &Value) -> Res<Vec<String>> {
     }
     Ok(paths)
 }
-pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
+pub struct ApplyOutcome {
+    pub code: i32,
+    pub conclusion: Value,
+}
+fn apply_progress(message: impl std::fmt::Display) {
+    eprintln!("delegate: {message}");
+    let _ = std::io::stderr().flush();
+}
+fn generation_markers(run: &Path, meta: &Value) -> Vec<PathBuf> {
+    let mut markers = vec![run.join(".generate-pending")];
+    let path = s(&meta["worktree"], "path");
+    markers.extend(
+        crate::runs::all_runs()
+            .into_iter()
+            .filter(|other| s(&json(other.join("meta.json"))["worktree"], "path") == path)
+            .map(|other| other.join(".generate-pending")),
+    );
+    markers.sort();
+    markers.dedup();
+    markers
+}
+pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<ApplyOutcome> {
+    apply_progress("checking merge / 正在检查合并");
+    let mut conclusion = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),
+        "operation":"apply","apply":{"ok":false,"dryRun":dry}});
+    let code = apply_inner(run, merge, dry, &mut conclusion)?;
+    conclusion["apply"]["ok"] = json!(code == 0);
+    accept_validity(run, dry, &mut conclusion);
+    apply_progress(if code == 0 {
+        "apply complete / 应用完成"
+    } else {
+        "apply failed / 应用失败"
+    });
+    Ok(ApplyOutcome { code, conclusion })
+}
+fn accept_validity(run: &Path, dry: bool, conclusion: &mut Value) {
+    let meta = json(run.join("meta.json"));
+    let sum = json(run.join("summary.json"));
+    let accept = &sum["accept"];
+    conclusion["acceptValidityScope"] = json!("repository-snapshot");
+    let mut valid = None;
+    let reason = if dry {
+        "dry run does not establish the final repository snapshot".to_string()
+    } else if s(&meta, "accept").is_empty() || !accept.is_object() {
+        "no recorded acceptance for this run".into()
+    } else if accept["ok"] == json!(false) {
+        valid = Some(false);
+        "acceptance failed".into()
+    } else if accept["ok"] != json!(true)
+        || s(accept, "tree").is_empty()
+        || s(accept, "treeAfter").is_empty()
+        || !b(accept, "snapshotComplete")
+    {
+        format!(
+            "incomplete acceptance evidence: {}",
+            accept["snapshotReason"]
+                .as_str()
+                .unwrap_or("missing historical snapshots (including old runs)")
+        )
+    } else if s(accept, "tree") != s(accept, "treeAfter") {
+        valid = Some(false);
+        "acceptance changed the repository tree".into()
+    } else if let Some(source) =
+        crate::changes::repository_snapshot(Path::new(s(&meta["worktree"], "source")), run)
+    {
+        if !b(&source, "complete") {
+            format!(
+                "incomplete source evidence: {}",
+                s(&source, "incompleteReason")
+            )
+        } else if s(&source, "tree") != s(accept, "tree") {
+            valid = Some(false);
+            "source repository tree differs from the accepted tree".into()
+        } else if generation_markers(run, &meta)
+            .iter()
+            .any(|marker| marker.exists())
+        {
+            "regeneration is still pending".into()
+        } else {
+            valid = Some(true);
+            "acceptance passed without changing its tree; final source tree matches (ignored files, environment, databases and Git history are outside this scope)".into()
+        }
+    } else {
+        "source repository snapshot failed".into()
+    };
+    if let Some(valid) = valid {
+        conclusion["acceptStillValid"] = json!(valid);
+    }
+    conclusion["acceptValidityReason"] = json!(reason);
+}
+fn numbered_prefix(path: &str) -> Option<(String, String)> {
+    let path = Path::new(path);
+    let name = path.file_name()?.to_str()?;
+    let (prefix, _) = name.split_once('_')?;
+    if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_string_lossy()
+            .into(),
+        prefix.into(),
+    ))
+}
+fn numbered_conflicts(
+    source: &Path,
+    additions: &[String],
+    actions: &[Action],
+    generated: &[String],
+) -> Res<Vec<Value>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let deleted = actions
+        .iter()
+        .filter(|a| a.kind == "deleted")
+        .map(|a| a.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut groups = BTreeMap::<(String, String), BTreeSet<String>>::new();
+    for path in additions {
+        if let Some(key) = numbered_prefix(path) {
+            groups.entry(key).or_default().insert(path.clone());
+        }
+    }
+    for ((directory, prefix), paths) in &mut groups {
+        let parent = source.join(directory);
+        if through_symlink(source, &parent) || parent.is_symlink() {
+            continue;
+        }
+        if parent.is_dir() {
+            for entry in fs::read_dir(&parent).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+                    continue;
+                }
+                let path = entry
+                    .path()
+                    .strip_prefix(source)
+                    .map_err(|e| e.to_string())?
+                    .to_string_lossy()
+                    .into_owned();
+                if deleted.contains(path.as_str()) || matches_rule(&path, generated) {
+                    continue;
+                }
+                if numbered_prefix(&path).as_ref() == Some(&(directory.clone(), prefix.clone())) {
+                    paths.insert(path);
+                }
+            }
+        }
+    }
+    Ok(groups
+        .into_iter()
+        .filter(|(_, paths)| paths.len() > 1)
+        .map(|((directory, prefix), paths)| {
+            apply_progress(format!(
+                "numbered prefix warning / 编号前缀冲突: {directory} [{prefix}]: {}",
+                paths.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+            json!({"directory":directory,"prefix":prefix,"paths":paths})
+        })
+        .collect())
+}
+fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Res<i32> {
     let (meta, mut top, _, mut after) = chain_changes(run)?;
     if meta["worktree"].is_null() {
         return Err(format!(
@@ -677,6 +855,7 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
     }
     let mut actions = vec![];
     let mut conflicts = vec![];
+    let mut additions = vec![];
     for c in changes {
         if b(&c, "large") {
             continue;
@@ -688,6 +867,9 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
         let target = source.join(&path);
         let (old_mode, old) = blob(&top, &before, &path)?;
         let (mode, new) = blob(&top, &after, &path)?;
+        if old_mode.is_none() && mode.is_some() {
+            additions.push(path.clone());
+        }
         let now = current(&target);
         let now_mode = entry_mode(&target);
         let valid = |x: &Option<String>| {
@@ -740,10 +922,8 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
                 .args([&minefile, &basefile, &theirfile])
                 .status()
                 .map_err(|e| e.to_string())?;
-            let merged = fs::read(&minefile)
-                .map_err(|e| format!("{}: {e}", minefile.display()))?;
-            fs::remove_dir_all(&scratch)
-                .map_err(|e| format!("{}: {e}", scratch.display()))?;
+            let merged = fs::read(&minefile).map_err(|e| format!("{}: {e}", minefile.display()))?;
+            fs::remove_dir_all(&scratch).map_err(|e| format!("{}: {e}", scratch.display()))?;
             if status.success() {
                 actions.push(Action {
                     kind: "merged".into(),
@@ -773,6 +953,9 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
                 continue;
             }
             let origin = worktree.join(path);
+            if applied["large"].get(path).is_none() && blob(&top, &before, path)?.0.is_none() {
+                additions.push(path.clone());
+            }
             let target = source.join(path);
             if !origin.is_file()
                 || through_symlink(&source, &target)
@@ -796,8 +979,7 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
                     path: path.clone(),
                     target,
                     mode: Some("large".into()),
-                    content: fs::read(&origin)
-                        .map_err(|e| format!("{}: {e}", origin.display()))?,
+                    content: fs::read(&origin).map_err(|e| format!("{}: {e}", origin.display()))?,
                 });
             } else if current(&target)
                 != Some(fs::read(&origin).map_err(|e| format!("{}: {e}", origin.display()))?)
@@ -806,7 +988,21 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
             }
         }
     }
-    if actions.is_empty() && conflicts.is_empty() {
+    additions.retain(|path| {
+        actions
+            .iter()
+            .any(|a| &a.path == path && a.kind != "deleted")
+    });
+    let warnings = numbered_conflicts(&source, &additions, &actions, &generated_paths)?;
+    if !warnings.is_empty() {
+        conclusion["numberedPrefixConflicts"] = json!(warnings);
+    }
+    let markers = generation_markers(run, &meta);
+    let pending_generation = markers.iter().any(|marker| marker.exists());
+    if pending_generation && (generated_paths.is_empty() || generate_command.is_empty()) {
+        return Err("pending regeneration requires generated.paths and generated.command".into());
+    }
+    if actions.is_empty() && conflicts.is_empty() && !pending_generation {
         eprintln!("delegate: no changes to apply");
         return Ok(0);
     }
@@ -818,14 +1014,16 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
         return Ok(1);
     }
     let marked = actions.iter().any(|x| x.kind == "conflict-markers");
-    let regenerate =
-        !actions.is_empty() && !generated_paths.is_empty() && !generate_command.is_empty();
+    let regenerate = (!actions.is_empty() || pending_generation)
+        && !generated_paths.is_empty()
+        && !generate_command.is_empty();
+    if regenerate && !dry {
+        write(run.join(".generate-pending"), "pending\n")?;
+    }
     for a in actions {
         if !dry {
             let operation = match a.kind.as_str() {
-                "deleted" => {
-                    fs::remove_file(&a.target).map_err(|e| e.to_string())
-                }
+                "deleted" => fs::remove_file(&a.target).map_err(|e| e.to_string()),
                 "copied" => {
                     fs::create_dir_all(a.target.parent().unwrap_or(&source))
                         .map_err(|e| format!("apply {}: {e}", a.target.display()))?;
@@ -862,12 +1060,21 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
                 run.file_name().unwrap_or_default().to_string_lossy()
             ),
             None,
-            |_, _| {},
+            |ahead, labels| {
+                apply_progress(format!(
+                    "generator queued / 生成器排队: {ahead} ahead; {}",
+                    labels.join(", ")
+                ))
+            },
         )?;
-        let log = run.join("generate.log");
-        let mut file = fs::File::create(&log)
-            .map_err(|e| format!("apply {}: {e}", log.display()))?;
+        let log = std::path::absolute(run.join("generate.log")).map_err(|e| e.to_string())?;
+        let mut file =
+            fs::File::create(&log).map_err(|e| format!("apply {}: {e}", log.display()))?;
         let timeout = seconds(&setting("GENERATE_TIMEOUT", "10m"))?;
+        apply_progress(format!(
+            "generating / 正在生成; log: {}; execution timeout: {timeout}s (queue excluded)",
+            log.display()
+        ));
         let (code, timed) = run_shell(
             (&generate_command, "generate"),
             &source,
@@ -878,8 +1085,7 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
             None,
         )
         .map_err(|e| format!("apply generated.command: {e}"))?;
-        writeln!(file, "\n[exit {code}]")
-            .map_err(|e| format!("apply {}: {e}", log.display()))?;
+        writeln!(file, "\n[exit {code}]").map_err(|e| format!("apply {}: {e}", log.display()))?;
         if code != 0 {
             let body = fs::read(&log).map_err(|e| format!("apply {}: {e}", log.display()))?;
             let tail = String::from_utf8_lossy(&body)
@@ -898,6 +1104,13 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<i32> {
             );
             return Ok(1);
         }
+        for marker in markers.iter().filter(|marker| marker.exists()) {
+            fs::remove_file(marker).map_err(|e| e.to_string())?;
+        }
+        apply_progress(format!(
+            "generation complete / 生成完成; log: {}",
+            log.display()
+        ));
         println!(" regenerated      {}", generated_paths.join(", "));
     }
     // Conflict markers still land every change, so record it; only skipped files keep the run unapplied.

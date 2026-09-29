@@ -26,6 +26,8 @@ delegate 负责一切与宿主无关的事：隔离（worktree、快照）、验
 - **诊断**：写 stderr，以 `delegate: ` 开头；只供人和模型读，宿主不解析。
 - **`next`**：可直接复制执行的下一条命令；没有 `next` 表示答复本身就是交付物。
 - **逐个收取**（5.11 起，可选）：`wait --stream` 每个 run 结束输出一行状态行（`report` 字段是读答复的命令），全部结束后退出；`wait --any` 在任一 run 结束时返回，只输出已结束的，重复同一命令收下一个。`sourceDrift` 字段提示 worktree 快照之后源工作区的变化与重叠文件，帮助在 `apply`、`apply --merge` 与 `reply --sync` 之间选择。
+- **5.12 可选字段**：`finishedAt` 为已写入的终态 UTC 时间，旧记录/推断 crashed 省略；`completionTiming` 是首次检查边界的 `already-finished` / `finished-during-wait`，保持收取顺序，一次可交付多个旧结果。`pendingChanges` 是累计待合入量（`changes` 仍是本轮差异）；`protectViolationReasons` 是可选保护原因映射，原违规路径数组不变。
+- **apply 结论**：文件清单后追加 `run`、`operation: "apply"`、`apply{ok,dryRun}`，可选 `numberedPrefixConflicts[{directory,prefix,paths}]`（仅警告、不改退出码），及 `acceptValidityScope: "repository-snapshot"`、`acceptValidityReason`、可选 `acceptStillValid`。仅本轮成功且未改树的验收与最终源全树相同才为 true；失败或已知树不同为 false，dry-run、旧记录、快照失败、无验收/不完整证据省略布尔值。忽略文件、环境、数据库与 Git 历史不在范围内；后续改动与 reply 不得沿用此前 true。任务 state 不变，protocol 保持 1。
 
 新增字段、新增 state 以外的变化（删除或改名上述字段、改变退出码含义）要升 protocol 版本。
 
@@ -47,7 +49,7 @@ delegate 负责一切与宿主无关的事：隔离（worktree、快照）、验
 `delegate protocol` 输出一行 JSON，供宿主适配器在启动时检查兼容性、给用户做诊断：
 
 ```json
-{"protocol":1,"version":"5.9.0","caller":{"id":"…","source":"CLAUDE_CODE_SESSION_ID"},
+{"protocol":1,"version":"5.12.0","caller":{"id":"…","source":"CLAUDE_CODE_SESSION_ID"},
  "agents":[{"name":"pi","tiers":["cheap"],"available":true,"bin":"/…/pi","version":"0.87.1","shadowed":[]},
            {"name":"codex","tiers":["strong"],"available":true,"bin":"/…/codex","version":"codex-cli 0.158.0",
             "shadowed":["/snap/bin/codex"]}]}
@@ -66,6 +68,7 @@ delegate 负责一切与宿主无关的事：隔离（worktree、快照）、验
    - 能把后台命令的每行输出变成通知（Claude Code 的 Monitor）：`$D wait --stream`，一个同事完工就通知一次，读完那一行再按 `report` / `next` 处理，不影响其他同事。
    - 只有“后台命令结束时通知”（Claude Code 的 `run_in_background`、其他宿主的后台任务）：后台跑 `$D wait --any`，每次通知处理完已结束的，再放一个同样的命令。
    - 都没有（普通脚本、只能同步调用的宿主）：循环 `$D wait --any --max 4m`，退出码 75 表示这段时间内没人完工，stderr 为 `no active or undelivered runs` 时收完。
+   收到结束通知先读 `completionTiming`，它可能在交付首次检查时已结束的旧结果；缺 `finishedAt` 不应推算完成时刻。慢 `apply` 也可后台执行，stderr 会实时提示检查、生成排队与日志位置，宿主不要解析这些人读提示。同仓库串行 apply；读末尾结论决定验收复用及编号预警的后续处理。
 4. **不要嵌套**：宿主自身被 delegate 派出时（环境里有 `DELEGATE_AGENT`），不要再向模型提供 delegate；delegate 也会以退出码 2 拒绝嵌套派发。
 5. **验证**：在新宿主里跑一次 `$D run --read-only --name smoke "回答 ok"`，确认结论行的 `caller` 正确、无参 `wait` 只收本会话的任务。
 

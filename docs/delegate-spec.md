@@ -1,4 +1,4 @@
-# delegate 规格（v5.9.1）
+# delegate 规格（v5.12.0）
 
 > 本文是 `skills/delegate` 的**实现契约**：命令行、输出、run 目录、锁与状态机。它是 Rust 重写与 harness 原生接入的依据。
 > 本文不在技能目录内，技能加载时不会读取；模型使用技能只需 `SKILL.md`。行为以本文为准，实现与本文不一致时按缺陷处理。
@@ -79,6 +79,7 @@
 | `--after <run>` | — | 立即创建 run（state `waiting`），上游以 delivered/answered 结束后才执行；其他结局使本 run 以 `skipped` 结束，`error` 写明上游名称与结局，exit_code 为 1 |
 | `--in <run>` | — | 仅与 `--read-only` 同用；在上游 worktree 当前状态的快照中运行（§6.3）；未给 `--after` 时上游必须已结束 |
 | `--protect <路径>` | — | 可重复；路径相对仓库根，末尾 `/` 表示目录前缀，否则精确匹配文件；需要 git 仓库。reply 继承上一轮设置，不可覆盖 |
+| `--protect-reason <路径> <原因>` | — | 可重复，两个独立参数，同时保护路径并附原因；同一归一化路径的完全重复去重、不同原因或空白原因拒绝。reply 不可覆盖 |
 
 时长格式：`^\d+(\.\d+)?[smhd]?$`，无单位为秒，必须 > 0。
 
@@ -91,6 +92,8 @@
 | 字段 | 出现条件 | 含义 |
 |---|---|---|
 | `run` `name` `state` `agent` `mode` `dir` | 总是 | `mode` 为 `write` 或 `read-only`；`state` 见 §4 |
+| `finishedAt` | 已写终态的新 run | UTC 结束时刻，紧邻 `state` 输出；旧 summary 缺失或运行时推断 `crashed` 时省略，不能以启动/读取时间代替 |
+| `completionTiming` | `wait --any/--stream` 的结束结论 | `already-finished`：首次状态检查时已结束；`finished-during-wait`：等待期间完成（stream 后加入的任务也用此值）。不是 shell 调用开始时刻边界，不改变收取顺序 |
 | `agentBin` | 已解析同事程序 | 当前同事实际执行文件的绝对路径；升档后更新 |
 | `parent` | reply | 上一轮 run id |
 | `after` | 使用 `--after` | 上游 run id |
@@ -101,13 +104,15 @@
 | `attempts` `model` `tokens{input,output,cacheRead}` | 已结束 | |
 | `files` | 有改动 | 相对路径列表 |
 | `changes{files,added,deleted,after}` | 快照成功 | `after` 为结束快照 tree |
+| `pendingChanges{files,added,deleted}` | worktree 写入、累计 diff 成功 | 自最近 apply/sync 基准（无则 chainBase）至本轮记录的累计待合入量；`changes` 仍是本轮语义，零改动 reply 仍据此给 diff --total / apply 建议 |
 | `shape{dirs,largest,config,removed,*More?}` | 写入任务、快照有改动 | `dirs` 按前两级目录汇总增删行；`largest` 为改后文本文件总行数；`config` 为依赖清单、锁文件、构建与 CI 配置路径；`removed` 为删除路径。各列表默认最多 5 项，`DELEGATE_SHAPE_LIMIT` 可调（1–20），`dirsMore` 等字段为未显示项数。`changes` 仍表示整体总数，完整逐文件 diff 见 `changes.json` |
-| `accept{command,ok,exitCode,tail?,queuedSeconds?}` | 执行过验收 | `tail` 为失败输出末 1500 字符 |
+| `accept{command,ok,exitCode,tail?,queuedSeconds?,tree?,treeAfter?,snapshotComplete?,snapshotReason?}` | 执行过验收 | `tail` 为失败输出末 1500 字符；取得 lane 后、执行前记录 tree，命令及进程清理后记录 treeAfter，完整证据条件见 §6.4 |
 | `cleanup{terminated,ports,commands}` | 结束时清理过后台进程 | 结束时仍存活且被终止的进程数、监听 TCP 端口及带 PID 的截短命令；PID 去重 |
 | `warnings` | worktree 的 link/copy 源缺失或为空 | 警告字符串数组；`wait` 也显示 |
 | `readOnlyViolation` | 只读 run 在自己的 worktree 中改了文件 | 文件列表 |
 | `workspaceChanged` | `--in-place` 只读 run 期间工作区有变化 | 文件列表；无法归属 |
 | `protectViolation` | 改动命中受保护路径 | 排序后的仓库相对路径列表 |
+| `protectViolationReasons` | 违规且设置了原因 | 命中的保护规则路径到原因的映射，不改变 protectViolation 字符串数组 |
 | `tier` | 按档位选的同事 | `cheap` / `strong`；升档后为 `strong` |
 | `escalatedFrom` | 升过档 | 原先的同事 |
 | `queuedSeconds` | 同事在 lane 中排队 ≥1 秒 | |
@@ -117,6 +122,8 @@
 | `sourceDrift{files,overlap,overlapMore?}` | 结论块或 `wait --stream` 中已结束、未 apply、有改动的 worktree 写入 run，且源工作区自快照（或上次 apply / `--sync`）以来有变化 | `files` 为源工作区变化的文件数；`overlap` 为其中同事也改过的文件（最多 10 项）。`status` 不计算，保持轻量 |
 | `report` | `wait --stream` 行、有答复且未送达 | 读答复的命令 `wait <run>` |
 | `next` | 有建议动作 | 下一步（含可复制的命令），§3.3 |
+
+`apply` 保留逐文件清单，在末尾追加一行以 `{"run"` 开头的 JSON：`run`、`operation: "apply"`、`apply{ok,dryRun}`、可选 `acceptStillValid`、`acceptValidityScope: "repository-snapshot"`、`acceptValidityReason`、可选 `numberedPrefixConflicts[{directory,prefix,paths}]`。不修改任务 state 或将应用成功变为 delivered。
 
 ### 3.2 结论块（`run` / `wait` / `reply`）
 
@@ -214,7 +221,7 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 
 子模块指纹保留原有 SHA-1 摘要，并记录检出的 `HEAD` 与是否干净。**仅在 worktree run 中**，起始快照没有该子模块的指纹、结束时子模块干净且 `HEAD` 等于结束快照 tree 中的 gitlink，视为仅初始化（同事为跑测试补齐了子模块）：不计入 `changes`/`files`，`apply` 不处理它。子模块内已跟踪或未跟踪文件有改动、或检出提交不同，照常计为改动。
 
-**受保护路径**：`--protect` 归一化、排序并去重后记入 `meta.json` 的 `protect`，任务说明末尾按说明语言附受保护路径约定。结束快照后若改动命中受保护路径，state 为 `rejected`，带 `protectViolation`，`error` 与 `next` 提示受保护路径被改动，不执行 `--accept`。这样的便宜档 run 有改动，不升档；只读核对照常记录。
+**受保护路径**：`--protect` / `--protect-reason` 使用相同归一化规则，路径排序去重后记入 `meta.json` 的 `protect` 字符串数组，原因另存 `protectReasons` 映射，任务说明末尾逐项附原因与约定（§7.3）。结束快照后若改动命中受保护路径，state 为 `rejected`，带 `protectViolation` 与可选的 `protectViolationReasons`，`error` 与 `next` 提示受保护路径被改动，不执行 `--accept`。这样的便宜档 run 有改动，不升档；只读核对照常记录。语义绕路只能靠模型遵守约定，脚本只核对路径。
 
 起始快照在创建 run 时取，结束快照在同事结束后、验收之前取（验收副产物不计）。改动 = 两个 tree 的 `diff --numstat/--name-status --no-renames`，加上 `large` 与子模块指纹的差异（子模块列为 `submodule contents`）。写入 `changes.json`（`base`、`after`、`top`、`afterLarge`、`changes[{path,status A|M|D,added,deleted,large?,submodule?}]`）与 `changes.patch`（`git diff --binary`）。非 git 目录退回到编辑事件中的路径。
 
@@ -240,11 +247,17 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 
 有冲突且无 `--merge` 时**什么都不写**，退出码 1。
 
-**分轮合并**：完整成功的 `apply` 在各 run 的 `.applied` 中记录本次合入的 worktree tree、大文件指纹与内容摘要；之后的 reply 在 `meta.json` 的 `appliedBase` 中继承它。再次 `apply` 以最近一次完整合入的状态为基准，没有记录时用 `chainBase`。有跳过项、写了冲突标记或 `--dry-run` 时不推进基准。`diff --total` 仍展示整段对话；没有待合入的改动时输出 `no changes to apply`，退出码 0。
+**分轮合并**：完整合入的 `apply` 在各 run 的 `.applied` 中记录本次合入的 worktree tree、大文件指纹与内容摘要；之后的 reply 在 `meta.json` 的 `appliedBase` 中继承它。再次 `apply` 以最近一次完整合入的状态为基准，没有记录时用 `chainBase`。写了冲突标记也推进基准并记为已合并（仍退出 1）；有跳过项或 `--dry-run` 时不推进。`diff --total` 仍展示整段对话；没有待合入的改动且没有待生成标记时输出 `no changes to apply`，退出码 0。
 
 删除、复制、写入或重新生成期间任何文件操作失败，`apply` 在 stderr 报告文件路径和原因，以非 0 退出，不写新的 `.applied` 或 `.sync-base`。此前已成功写入的文件保留，worktree 保留；下一次 `apply` 仍从最近一次完整成功的基准重试。冲突且未指定 `--merge` 时保持上述预检语义，源工作区不写入。
 
 **生成文件**：`.delegate.json` 的 `"generated": {"paths": [...], "command": "..."}` 声明的路径（语义同 `--protect`）不做三方合并、也不覆盖；改动清单与 diff 仍如实列出。合并写入了文件后，通过 lane 在源仓库根以 `sh -c` 运行 `command` 重新生成，输出写入 run 目录的 `generate.log`；命令使用 §9.1 的限时执行和进程组回收机制，超时由 `DELEGATE_GENERATE_TIMEOUT` 控制（默认 10m）。`--dry-run` 只报告将会重新生成；命令失败或超时时退出码 1、显示日志末尾，已合并的文件保留，lane 名额释放。完全成功时对话内所有 run 及共用该 worktree 的旁支 run 写 `.applied`。只读 run 与原地 run 拒绝 `apply`（退出码 2）。
+
+5.12 起，入口、排队回调、执行开始与结果写 stderr 并 flush：检查合并、生成器排队人数及前序名称、正在生成（日志绝对路径、执行超时，排队不计入）、完成/失败。慢 apply 可以后台执行。写普通文件前记录 `.generate-pending`，只有生成成功才清除；同 worktree 的后续 apply/reply 即使零文件动作也重试生成，失败不推进基准。待生成而配置被删除时拒绝假成功。
+
+**编号预检**：写文件前，仅对本次基准的新增、实际计划写入文件，检查 ASCII 数字前缀加 `_`；按父目录＋原样数字前缀分组。比较源中已跟踪/未跟踪的同目录文件和本批其他新增文件，扣除计划删除，忽略同完整路径、修改项和生成路径，不跟随符号链接目录；不同目录互不冲突，`32` 与 `0032` 不合并。冲突写 stderr 警告并输出 `numberedPrefixConflicts`，dry-run 也报告；不改号、不改退出码，不扫描其他未合入 worktree。通用命名可能不是迁移编号，由主控判断；无源仓库应用锁，同仓库必须串行 apply，防止预检竞态。
+
+**验收复用**：取得 lane 后、验收前及命令/进程清理后保存完整仓库快照证据（不沿用验收前 changes.after 或读取当前 worktree 代替历史）。apply 结束时对源工作区全树重新快照，含未提交改动与生成文件；HEAD 相同不足以证明有效。仅本轮 accept.ok 为 true、历史快照完整且 tree == treeAfter == 最终源 tree 时为 true。已知验收失败、验收改树或源 tree 不同为 false。dry-run、无验收、旧记录/缺字段、快照失败或证据不全时省略布尔值并说明原因；大型未跟踪文件、脏/缺失子模块属 tree 外输入，不能用 size/mtime 证明有效。索引 assume-unchanged / skip-worktree 标志使证据不完整；干净子模块递归核对快照和索引标志。忽略文件、环境、数据库、Git 历史仍由主控判断。apply 不重跑验收，结果仅表示此次 `repository-snapshot` 范围，后续源码改动或 reply 必须重新判断，不向 reply 链永久传播。
 
 ## 7. 会话与任务说明
 
@@ -272,6 +285,7 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 - 验收命令（未隐藏时）：说明"结束后委派方在工作目录运行此命令，退出码 0 视为完成"，附代码块，并提示自检时用 `<入口> lane <命令>` 排队、排队时间不计时。
 - 只读约定（Codex 的一切只读 run，以及在 worktree 中的只读 Pi）：不得创建、修改、删除文件；改动会被报告且不被采纳；委派记录不算改动。升档时若 `prompt.md` 尚无这段约定才追加，不得重复。
 - reply 更改或取消验收命令时，说明旧标准不再适用。
+- 受保护路径：逐项列路径与可选原因；中文约定为“若正确完成任务必须修改受保护路径，停止该实现路线，报告路径、必要修改和原因，等待主控处理；不得为避开保护而迁移、复制逻辑或削弱测试。”英文约定为“If completing the task correctly requires changing a protected path, stop that implementation route, report the path, necessary changes and reason, and wait for the delegator. Do not move or copy logic or weaken tests to bypass protection.”
 
 `prompt.md` 保存同事实际收到的全文。
 
@@ -280,6 +294,8 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 接在对话**最新一轮**之后（结局为 `malformed` 的轮次跳过）；可用 `--agent`/`--tier` 换一位同事（agent 改变即隐含 `--fresh`，新消息须自足），否则同一 agent、workdir、worktree、mode、env、provider/model/thinking、retries。每次尝试都从上一轮会话**分叉**（Pi 用会话文件副本 `--fork`，Codex `exec fork`），上一轮会话永不改动。`--fresh` 开新会话但留在同一对话与 worktree。同一轮已有进行中的 reply 时拒绝。
 
 默认像 `start` 一样立即输出启动状态；`--wait` 像 `run` 一样收取结论与答复，`--max`/`--progress`/`--full` 仅可与 `--wait` 同用。`--sync` 在返回启动状态前完成，冲突时不启动。
+
+`protect` 与可选 `protectReasons` 在普通 reply / fresh 中继承；`--protect` 与 `--protect-reason` 均禁止覆盖。旧 meta 无原因仍正常继承路径。
 
 ### 7.5 reply --sync（必须）
 
@@ -327,6 +343,8 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 - `wait --stream`：每个 run 结束时输出一行状态行（含 `sourceDrift`，有未读答复时带 `report`），不输出改动清单与答复、不标记 `.delivered`；全部输出后 stderr 写 `all <N> runs reported` 并退出。不带 run 参数时每 5 秒按同一规则（caller、`--all`、`--machine`）重新选取，把期间新派出的 run 也纳入；全部结束即退出，之后派出的 run 需要新的 `wait`。退出码：有非 delivered/answered 结局为 1，`--max` 到期仍有未结束的为 75，否则 0。
 - `--any` 与 `--stream` 互斥（退出码 2）。两者都与宿主无关：`--stream` 适合能把命令的每行输出变成通知的宿主，`--any` 适合只有“后台命令结束时通知”或只能分段调用的宿主（配合 `--max`）。
 
+5.12 起，两者按首次检查记录已结束集合，结论附 `completionTiming`（§3.1）；原收取顺序不变，多个旧结果一起交付，不按完成时间排序。后台命令结束通知可能是在交付旧结果；旧 summary 没有 `finishedAt` 时省略，不推算。
+
 ## 10. 并发、准入与清理
 
 - 整机并发：`<state>/<sha1(run 路径)[:16]>.slot` 记录运行中的 run；`DELEGATE_MAX_ACTIVE`（默认 8）、`DELEGATE_MAX_CODEX`（默认 4），0 不限。超出即拒绝并列出运行中的任务。
@@ -349,10 +367,13 @@ run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git �
 | `events.jsonl` `stderr.log` `supervisor.log` | supervisor | §7.2 / 同事 stderr / supervisor 输出 |
 | `result.md` | supervisor | 最后一轮完整答复 |
 | `summary.json` | supervisor | §3.1 中结束后的字段 |
+| `finishedAt`（summary 字段） | 统一终态写入函数 | 正常结束、skipped、supervisor 错误、启动失败和 stop 强制结束时的 UTC 时间；summary 先写，exit_code 最后写；运行时推断 crashed 不伪造时间 |
+| `protect` / `protectReasons`（meta 字段） | 启动方 | 保留保护路径字符串数组，可选原因映射，reply 继承 |
 | `cleanup.json` | supervisor | 已清理进程的 PID、命令与监听 TCP 端口 |
 | `scopes` / `scopes.lock` | supervisor | 本轮启动的唯一 systemd scope 单元名 / 并发读写锁 |
 | `changes.json` `changes.patch` | supervisor | §6.2 |
 | `accept.log` `setup.log` | supervisor | 命令、输出、`[exit N]` |
+| `generate.log` / `.generate-pending` | apply | 生成日志 / 失败后仍须重试的标记（同 worktree 后续 apply 可接续） |
 | `lane-wait` `lane-waiting-<pid>` | lane | §8 |
 | `session/` `fork/` | 同事 / 启动方 | Pi 会话；reply 所用的上一轮会话副本 |
 | `exit_code` | supervisor | 结束标记，**最后写** |

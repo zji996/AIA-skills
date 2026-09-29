@@ -20,10 +20,13 @@ fn status_line(run: &Path) -> String {
     format_status(runs::status(run))
 }
 /// A finished run's status, plus how far the source moved since its worktree snapshot.
-fn outcome_line(run: &Path) -> String {
+fn outcome_line(run: &Path, timing: Option<&str>) -> String {
     let mut status = runs::status(run);
     if runs::active(&runs::state(run)) {
         return format_status(status);
+    }
+    if let Some(timing) = timing {
+        status["completionTiming"] = json!(timing);
     }
     if let Some(drift) = worktree::source_drift(run) {
         let overlap = drift["overlap"].as_array().map_or(0, Vec::len)
@@ -44,6 +47,8 @@ fn format_status(status: serde_json::Value) -> String {
         "run",
         "name",
         "state",
+        "finishedAt",
+        "completionTiming",
         "agent",
         "agentBin",
         "tier",
@@ -58,10 +63,12 @@ fn format_status(status: serde_json::Value) -> String {
         "turns",
         "files",
         "changes",
+        "pendingChanges",
         "shape",
         "accept",
         "readOnlyViolation",
         "protectViolation",
+        "protectViolationReasons",
         "workspaceChanged",
         "escalatedFrom",
         "queuedSeconds",
@@ -246,6 +253,16 @@ fn collect(
     full: bool,
     show_result: bool,
 ) -> i32 {
+    collect_timed(runs, max, show_progress, full, show_result, None)
+}
+fn collect_timed(
+    runs: &[PathBuf],
+    max: Option<f64>,
+    show_progress: bool,
+    full: bool,
+    show_result: bool,
+    already: Option<&std::collections::HashSet<PathBuf>>,
+) -> i32 {
     let begin = Instant::now();
     let poll = setting("POLL", "1").parse::<f64>().unwrap_or(1.0).max(0.01);
     loop {
@@ -274,7 +291,10 @@ fn collect(
     let mut code = 0;
     for run in runs {
         let state = runs::state(run);
-        println!("{}", outcome_line(run));
+        println!(
+            "{}",
+            outcome_line(run, already.map(|a| completion_timing(a, run)))
+        );
         if runs::active(&state) {
             code = 75;
             continue;
@@ -388,6 +408,11 @@ fn wait_each(
     show_result: bool,
 ) -> i32 {
     let begin = Instant::now();
+    let already = list
+        .iter()
+        .filter(|run| !runs::active(&runs::state(run)))
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
     let poll = setting("POLL", "1").parse::<f64>().unwrap_or(1.0).max(0.01);
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let mut watched = std::collections::HashSet::new();
@@ -396,7 +421,10 @@ fn wait_each(
     loop {
         if show_progress {
             for run in &list {
-                progress(run, run.file_name().unwrap_or_default().to_str().unwrap_or(""));
+                progress(
+                    run,
+                    run.file_name().unwrap_or_default().to_str().unwrap_or(""),
+                );
             }
         }
         let done = list
@@ -408,7 +436,7 @@ fn wait_each(
             if stream {
                 for run in &done {
                     let state = runs::state(run);
-                    let mut line = outcome_line(run);
+                    let mut line = outcome_line(run, Some(completion_timing(&already, run)));
                     if run.join("result.md").is_file() && !run.join(".delivered").exists() {
                         // The answer is not printed here; name the command that reports it.
                         line.pop();
@@ -427,7 +455,7 @@ fn wait_each(
                     }
                 }
             } else {
-                code = collect(&done, None, false, full, show_result);
+                code = collect_timed(&done, None, false, full, show_result, Some(&already));
             }
             reported.extend(done);
             if !stream {
@@ -486,7 +514,12 @@ fn wait_each(
     let left = list
         .iter()
         .filter(|r| !reported.contains(*r))
-        .map(|r| r.file_name().unwrap_or_default().to_string_lossy().into_owned())
+        .map(|r| {
+            r.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect::<Vec<_>>();
     if !left.is_empty() {
         eprintln!(
@@ -505,6 +538,13 @@ fn wait_each(
         eprintln!("delegate: all {} runs reported", reported.len());
     }
     code
+}
+fn completion_timing(already: &std::collections::HashSet<PathBuf>, run: &Path) -> &'static str {
+    if already.contains(run) {
+        "already-finished"
+    } else {
+        "finished-during-wait"
+    }
 }
 fn clean(args: &[String]) -> Res<i32> {
     let (pos, flags, _) = parse_simple(args, &["--finished", "--force"], &[])?;
@@ -605,8 +645,7 @@ fn stop(args: &[String]) -> Res<i32> {
                 if let Some(cleanup) = cleanup::summary(&run) {
                     sum["cleanup"] = cleanup;
                 }
-                write_json(run.join("summary.json"), &sum)?;
-                write(run.join("exit_code"), "1\n")?;
+                finish_run(&run, sum, 1)?;
             } else {
                 let mut sum = json(run.join("summary.json"));
                 if s(&sum, "state") != "stopped" {
@@ -670,7 +709,7 @@ fn apply(args: &[String]) -> Res<i32> {
             run.file_name().unwrap_or_default().to_string_lossy()
         ));
     }
-    let code = worktree::apply(&run, has(&flags, "--merge"), has(&flags, "--dry-run"))?;
+    let outcome = worktree::apply(&run, has(&flags, "--merge"), has(&flags, "--dry-run"))?;
     if run.join(".applied").exists() {
         let path = s(&json(run.join("meta.json"))["worktree"], "path").to_string();
         for other in runs::all_runs() {
@@ -682,7 +721,8 @@ fn apply(args: &[String]) -> Res<i32> {
             }
         }
     }
-    Ok(code)
+    println!("{}", format_status(outcome.conclusion));
+    Ok(outcome.code)
 }
 fn main_inner(args: &[String]) -> Res<i32> {
     let Some((command, rest)) = args.split_first() else {

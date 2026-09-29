@@ -20,7 +20,7 @@
 | --- | --- | --- |
 | **`repo-governance`** | `skills/repo-governance/` | **上下文治理与审计**：定义 `AGENTS.md`、`docs/current.md`、决策记录的信息分层；`audit-context.py` 按仓库配置估算 token 预算与上下文健康度，支持 `--report`、`--only`，并检查下一步堆积、`.local/` 未忽略、文档断链等漂移问题。 |
 | **`agent-handoff`** | `skills/agent-handoff/` | **会话交接**：`handoff-snapshot.sh` 自动采集分支、HEAD、未提交文件、最近提交、`.local/run/delegate/` 与旧 `.local/run/pi/` 的未读取委派任务和未合并 worktree，生成交接账本草稿。 |
-| **`delegate`** | `skills/delegate/` | **同事 Agent 委派**：后台运行 Pi/Codex，只收结论与下一步；无参 `wait` 按派发会话收取，遗留任务提示年龄。只读默认便宜档、写入默认强档；写入可用 `--worktree` 隔离后 `apply` 合并，并用 `--protect` 划分并行文件所有权。`.delegate.json` 支持 `worktree.copy/link/setup`、`env`、`generated` 与写入任务默认 `accept`；工具运行验收，用户 systemd 可用时按 cgroup 清理同事及其后台进程，报告端口与空源警告。长答复显示头尾，全文保存在 run 中。整机并发与重检查队列由 Rust 实现（`crates/delegate`）管理。 |
+| **`delegate`** | `skills/delegate/` | **同事 Agent 委派**：后台运行 Pi/Codex，按会话逐个收取；`completionTiming` 区分旧结果与等待中新完成，`finishedAt` 记录终态时间。写入用 `--worktree` 隔离、`--protect-reason` 划分所有权并要求报告阻碍；`pendingChanges` 提示累计待合入量。`apply` 报告生成排队进度、失败重试、编号前缀预警及保守的源码快照验收复用结论（`acceptStillValid`）。`.delegate.json` 支持依赖准备、环境、生成与默认验收；Rust 管理整机容量、lane 和后台进程回收。长答复全文保存在 run 中。 |
 | **`openai-image-gen`** | `skills/openai-image-gen/` | **图像生成落盘**：先用便宜模型打草稿定构图，再以草稿为参考出一次正式图；每个输出文件限定草稿 3、正式 1、编辑 1 次，超出需用户同意；只返回一行 JSON；附示意图提示词结构与审查要点。 |
 
 ---

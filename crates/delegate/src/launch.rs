@@ -26,6 +26,7 @@ pub struct Options {
     pub workdir: Option<String>,
     pub images: Vec<String>,
     pub protect: Vec<String>,
+    pub protect_reasons: std::collections::BTreeMap<String, String>,
     pub read_only: bool,
     pub in_place: bool,
     pub worktree: bool,
@@ -76,6 +77,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--in-place",
                 "--worktree",
                 "--protect",
+                "--protect-reason",
                 "--retries",
                 "--provider",
                 "--model",
@@ -85,6 +87,28 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             .contains(&key)
         {
             return Err(format!("unrecognized arguments: {a}"));
+        }
+        if key == "--protect-reason" {
+            if inline.is_some() || i + 2 >= args.len() {
+                return Err("--protect-reason expects PATH REASON as two arguments".into());
+            }
+            let mut paths = vec![args[i + 1].clone()];
+            normalize_protect(&mut paths)?;
+            let path = paths.remove(0);
+            let reason = args[i + 2].clone();
+            if reason.trim().is_empty() {
+                return Err("--protect-reason requires a non-empty reason".into());
+            }
+            if o.protect_reasons
+                .get(&path)
+                .is_some_and(|old| old != &reason)
+            {
+                return Err(format!("conflicting protection reasons for {path}"));
+            }
+            o.protect.push(path.clone());
+            o.protect_reasons.insert(path, reason);
+            i += 3;
+            continue;
         }
         let takes = [
             "--prompt",
@@ -324,6 +348,7 @@ pub fn contract(
     read_only: bool,
     revoked: bool,
     protect: &[String],
+    reasons: &std::collections::BTreeMap<String, String>,
 ) -> String {
     let zh = prompt.chars().any(|c| {
         (0x3040..=0x30ff).contains(&(c as u32)) || (0x4e00..=0x9fff).contains(&(c as u32))
@@ -340,12 +365,25 @@ pub fn contract(
         notes.push(if zh{format!("完成标准：你结束后，委派方会在工作目录中运行下面的命令，退出码为 0 即视为完成。\n\n```sh\n{a}\n```\n\n自己跑这条命令或其他耗时的检查时，前面加 `{cmd} lane`（如 `{cmd} lane {}`）：它与本机其他检查排队、一次只跑一个，排队时间不计入你的时限。",shell_quote(a))}else{format!("Definition of done: after you finish, the delegator runs this command in the working directory; exit code 0 counts as complete.\n\n```sh\n{a}\n```\n\nWhen you run this or another heavy check yourself, prefix it with `{cmd} lane` (e.g. `{cmd} lane {}`): it queues with the other checks on this machine, one at a time, and time spent queued does not count against your time limit.",shell_quote(a))});
     }
     if !protect.is_empty() {
-        let paths = protect.join(", ");
+        let paths = protect
+            .iter()
+            .map(|path| {
+                reasons
+                    .get(path)
+                    .map_or_else(|| path.clone(), |reason| format!("{path}: {reason}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         notes.push(if zh {
             format!("受保护路径：{paths}。不要创建、修改或删除这些路径；结束后会核对改动，触及受保护路径的任务会被拒绝。")
         } else {
             format!("Protected paths: {paths}. Do not create, modify, or delete these paths; changes to protected paths will reject the run.")
         });
+        notes.push(if zh {
+            "若正确完成任务必须修改受保护路径，停止该实现路线，报告路径、必要修改和原因，等待主控处理；不得为避开保护而迁移、复制逻辑或削弱测试。"
+        } else {
+            "If completing the task correctly requires changing a protected path, stop that implementation route, report the path, necessary changes and reason, and wait for the delegator. Do not move or copy logic or weaken tests to bypass protection."
+        }.to_string());
     }
     if notes.is_empty() {
         prompt.into()
@@ -550,6 +588,19 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
                 .iter()
                 .filter_map(Value::as_str)
                 .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    o.protect_reasons = meta["protectReasons"]
+        .as_object()
+        .map(|reasons| {
+            reasons
+                .iter()
+                .filter_map(|(path, reason)| {
+                    reason
+                        .as_str()
+                        .map(|reason| (path.clone(), reason.to_string()))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -842,6 +893,7 @@ pub fn launch(
             false,
             changed && (o.hide_accept || o.accept.is_none()),
             &o.protect,
+            &o.protect_reasons,
         )
     } else {
         contract(
@@ -858,6 +910,7 @@ pub fn launch(
                     || extra["worktree"].is_object()),
             false,
             &o.protect,
+            &o.protect_reasons,
         )
     };
     write(
@@ -970,6 +1023,9 @@ pub fn launch(
     if let Some(version) = agent_version {
         meta["agentVersion"] = json!(version);
     }
+    if !o.protect_reasons.is_empty() {
+        meta["protectReasons"] = json!(o.protect_reasons);
+    }
     write_json(run.join("meta.json"), &meta)?;
     if !extra["sync"].is_null() {
         write_json(run.join("sync.json"), &extra["sync"])?;
@@ -994,7 +1050,17 @@ pub fn launch(
         .stderr(Stdio::from(log))
         .env_remove("DELEGATE_LANE_HELD");
     group(&mut c);
-    let mut child = c.spawn().map_err(|e| e.to_string())?;
+    let mut child = match c.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            finish_run(
+                &run,
+                json!({"state":"crashed","error":error.to_string()}),
+                1,
+            )?;
+            return Err(error.to_string());
+        }
+    };
     let startup_timeout = if cfg!(debug_assertions) {
         std::env::var("DELEGATE_TEST_STARTUP_TIMEOUT")
             .ok()
@@ -1012,11 +1078,11 @@ pub fn launch(
     }
     end_group(child.id() as i32, 2.0);
     child.wait().map_err(|e| e.to_string())?;
-    write_json(
-        run.join("summary.json"),
-        &json!({"state":"crashed","error":"supervisor did not start"}),
+    finish_run(
+        &run,
+        json!({"state":"crashed","error":"supervisor did not start"}),
+        1,
     )?;
-    write(run.join("exit_code"), "1\n")?;
     Err(format!(
         "supervisor did not start; see {}",
         run.join("supervisor.log").display()

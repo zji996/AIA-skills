@@ -54,6 +54,8 @@
 
 worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 `git worktree remove`，过期清理同理；`agent-handoff` 会列出尚未 `apply` 的写入型 worktree。
 
+同仓库串行 `apply`；慢合并可后台执行。stderr 实时报告检查、生成器排队（人数与前序任务）、生成日志绝对路径和执行超时；排队不算生成超时。生成失败留 `.generate-pending`，再次 apply 即使普通文件已合入也重跑生成。编号前缀冲突只警告，不改号或退出码；末尾 `operation: apply` JSON 带 `numberedPrefixConflicts` 和验收复用的原因。`acceptStillValid` 只在验收前后历史全树与最终源全树有完整相同证据时为 true，不完整时省略；忽略文件、环境、数据库、Git 历史另行判断，后续改动/reply 不沿用旧 true。
+
 ## 会话
 
 每轮的会话都属于自己的 run：Pi 保存在 run 目录的 `session/` 下，Codex 使用自己的会话存储，`summary.json` 的 `session` 记下会话 id。`reply` 在每次尝试时从上一轮的会话**分叉**（Pi `--fork` 上一轮会话文件的副本，Codex `exec fork`），上一轮的会话从不被改动：答复畸形重跑时从同一处重新开始，清理早先的轮次也不影响后续追问。结局为 `malformed` 的轮次不算对话的延续，之后的 `reply` 与 `apply` 都从它的上一轮接着。4.1 之前的 run 使用 `--no-session`，不能 `reply`。
@@ -70,7 +72,7 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 
 | 文件 | 内容 |
 |---|---|
-| `meta.json` | 启动参数、同事（`agent`）、workdir、模式、验收命令、启动时间 |
+| `meta.json` | 启动参数、同事（`agent`）、workdir、模式、验收命令、启动时间；`protect` 字符串数组与可选 `protectReasons` 原因映射（reply/fresh 继承） |
 | `prompt.md` | 同事实际收到的任务说明；末尾可能附完成标准（`--accept`）与只读边界（Codex 只读任务） |
 | `events.jsonl` | 过滤后的全过程：读取、命令、编辑路径、错误、每轮模型与用量、重跑；不含编辑全文 |
 | `result.md` | 最后一轮的完整答复 |
@@ -79,6 +81,7 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 | `changes.json` / `changes.patch` | 前后快照的 tree、逐文件状态与行数；可直接 `git apply` 的补丁 |
 | `setup.log` | `--worktree` 的 `setup` 命令输出 |
 | `generate.log` | `apply` 执行 `.delegate.json` 的 `generated.command` 时的输出 |
+| `.generate-pending` | 生成未成功，后续 apply 仍须重试；成功后清除 |
 | `session/` / `fork/` | Pi 本轮的会话；`reply` 分叉所用的上一轮会话副本 |
 | `.applied` | `--worktree` 的改动已由 `apply` 合并 |
 | `accept.log` | 验收命令的完整输出与退出码；`summary.json` 的 `accept.queuedSeconds` 是它在 lane 中排队的秒数 |
@@ -87,6 +90,8 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 | `stderr.log` | 同事 CLI 的标准错误 |
 | `exit_code` | 结束标记：`0` 为 delivered/answered，`1` 为其他结局；运行中不存在 |
 | `.delivered` | 结果已被 `run`/`wait`/`result` 读取过 |
+
+5.12 新 summary 带 `finishedAt`；旧记录缺失时不补造。`wait --any/--stream` 的 `completionTiming` 以首次检查分类，通知可能只交付旧结果。`changes` 是本轮差异，`pendingChanges` 是累计待合入量。`accept.tree` / `treeAfter` 保存验收前后历史 tree，`snapshotComplete` / `snapshotReason` 记录证据是否完整。受保护文件有原因时违规诊断另带 `protectViolationReasons`。
 
 `agent-handoff` 的快照脚本依赖 `meta.json`、`exit_code` 与 `.delivered` 判断未完成或未读取的委派；修改这三者的名字或含义时要同步修改它。
 

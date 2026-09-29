@@ -106,12 +106,63 @@ pub fn snapshot(top: &Path, scratch: &Path, exclude: &[String]) -> Option<Value>
         let tree = String::from_utf8_lossy(&git_index(top, &["write-tree".into()], &index)?)
             .trim()
             .to_string();
-        Ok(
-            json!({"tree":tree,"large":large,"submodules":submodule_fingerprints(top,exclude).unwrap_or_default()}),
-        )
+        let submodules = submodule_fingerprints(top, exclude);
+        let mut out = json!({"tree":tree,"large":large,"submodules":submodules.as_ref().cloned().unwrap_or_default()});
+        if let Err(error) = submodules {
+            out["snapshotError"] = json!(error);
+        }
+        Ok(out)
     })();
     let _ = fs::remove_file(index);
     result.ok()
+}
+/// Full repository evidence for reuse; metadata for out-of-tree content cannot prove equality.
+pub fn repository_snapshot(top: &Path, scratch: &Path) -> Option<Value> {
+    let mut snap = snapshot(top, scratch, &[])?;
+    let entries = git(top, &["ls-tree", "-r", "-z", s(&snap, "tree")]).ok()?;
+    let flags = git(top, &["ls-files", "-v", "-z"]).ok()?;
+    let submodules_complete = zstrings(&entries)
+        .iter()
+        .filter(|entry| entry.starts_with("160000 "))
+        .all(|entry| {
+            let Some((_, path)) = entry.split_once('\t') else {
+                return false;
+            };
+            if !b(&snap["submodules"][path], "clean") {
+                return false;
+            }
+            let checkout = top.join(path);
+            let Some(nested) = repository_snapshot(&checkout, scratch) else {
+                return false;
+            };
+            b(&nested, "complete")
+                && git_text(&checkout, &["rev-parse", "HEAD^{tree}"])
+                    .is_ok_and(|head| head == s(&nested, "tree"))
+        });
+    let reason = if !snap["snapshotError"].is_null() {
+        Some("submodule snapshot failed")
+    } else if zstrings(&flags).iter().any(|entry| {
+        entry
+            .as_bytes()
+            .first()
+            .is_some_and(|flag| flag.is_ascii_lowercase() || *flag == b'S')
+    }) {
+        Some("index assume-unchanged or skip-worktree flags prevent complete repository evidence")
+    } else if snap["large"]
+        .as_object()
+        .is_none_or(|large| !large.is_empty())
+    {
+        Some("large untracked files are outside the repository tree")
+    } else if !submodules_complete {
+        Some("dirty or unavailable submodules are outside the repository tree")
+    } else {
+        None
+    };
+    snap["complete"] = json!(reason.is_none());
+    if let Some(reason) = reason {
+        snap["incompleteReason"] = json!(reason);
+    }
+    Some(snap)
 }
 fn submodule_fingerprints(top: &Path, exclude: &[String]) -> Res<BTreeMap<String, Value>> {
     let mut prints = BTreeMap::new();

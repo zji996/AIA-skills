@@ -1,5 +1,14 @@
 # delegate
 
+## 5.12 收取与合并触发
+
+- 后台 `wait --any` 通知到了，但可能是早先结束的审查：读 `completionTiming` 与 `finishedAt`，继续收尚未完成的任务。
+- 合并看起来卡住，生成器排在全量检查后面：后台 `apply`，看 stderr 的排队人数、任务名、生成日志与超时；失败后再次 apply，即使普通文件已全部合入也要重试生成。
+- 两路各新增同目录 `0032_*.sql`：串行 apply，读 `numberedPrefixConflicts`，人工审查编号，dry-run 也应预警。
+- 恢复逻辑必须留在另一任务负责的 `model_loop.rs`：用 `--protect-reason model_loop.rs '另一任务负责；恢复逻辑必须留在这里'`，要求遇到必要修改停下报告。
+- 首轮改动还没 apply，reply 只跑验收：用 `pendingChanges` 与 `next` 查看累计 `diff --total` 后合入。
+- apply 后能否复用验收：只在 `acceptStillValid: true` 的 `repository-snapshot` 范围内判断；无字段看原因，主控改了无关源码、验收改树、生成结果不同均不当作有效，环境与忽略文件仍由主控把关。
+
 ## 应触发
 
 - 同一个仓库里上次会话还有未收的任务；这次派出的两项完成后只用无参 `wait` 收本会话的结果，并提示旧任务。

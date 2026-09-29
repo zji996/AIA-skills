@@ -405,3 +405,8 @@ pub fn run_shell(
     }
     Ok((code, timed))
 }
+pub fn finish_run(run: &std::path::Path, mut summary: serde_json::Value, code: i32) -> Res<()> {
+    summary["finishedAt"] = serde_json::json!(iso());
+    write_json(run.join("summary.json"), &summary)?;
+    write(run.join("exit_code"), format!("{code}\n"))
+}

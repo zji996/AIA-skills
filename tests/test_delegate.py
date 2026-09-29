@@ -184,6 +184,7 @@ class DelegateTests(unittest.TestCase):
         run, = (self.work / "runs").glob("*/meta.json")
         run = run.parent
         self.assertEqual(self.outcome(self.cli("status", str(run)))["state"], "crashed")
+        self.assertIn("finishedAt", self.outcome(self.cli("status", str(run))))
         self.assertTrue(process_gone(run / "startup.pid"))
         before = {p.name: p.stat().st_mtime_ns for p in run.iterdir()}
         time.sleep(2.1)
@@ -298,7 +299,9 @@ class DelegateTests(unittest.TestCase):
         holder = self.hold_lane(30)
         run = self.outcome(self.cli("start", "--accept", "touch accepted", "task"))
         self.until(lambda: f"accept {run['run']}" in self.cli("lane").stdout, "the acceptance to queue")
-        self.assertEqual(self.outcome(self.cli("stop", run["run"]))["state"], "stopped")
+        stopped = self.outcome(self.cli("stop", run["run"]))
+        self.assertEqual(stopped["state"], "stopped")
+        self.assertIn("finishedAt", stopped)
         holder.kill()
         self.until(lambda: process_gone(Path(run["dir"]) / "pid"), "the supervisor to exit")
         self.assertFalse((self.work / "accepted").exists())
@@ -969,6 +972,33 @@ class DelegateTests(unittest.TestCase):
         self.assertIn("call wait --any again", result.stderr)
         self.cli("stop", "slow")
 
+    def test_wait_completion_timing_and_legacy_finished_at(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        for name in ("old-a", "old-b"):
+            started = self.outcome(self.cli("start", "--read-only", "--name", name, "task"))
+            self.until(lambda: (Path(started["dir"]) / "exit_code").exists(), name)
+        old_run = Path(started["dir"])
+        summary = json.loads((old_run / "summary.json").read_text())
+        self.assertRegex(summary.pop("finishedAt"), r"^\d{4}-\d{2}-\d{2}T")
+        (old_run / "summary.json").write_text(json.dumps(summary))
+        gate = self.work / "release"
+        self.fake_pi([answer("new"), SETTLED], pre=f"while [ ! -f {gate} ]; do sleep .05; done")
+        self.cli("start", "--read-only", "--name", "new", "task")
+        old = self.cli("wait", "--any")
+        lines = [json.loads(line) for line in old.stdout.splitlines() if line.startswith('{"run"')]
+        self.assertEqual([line["name"] for line in lines], ["old-a", "old-b"])
+        self.assertTrue(all(line["completionTiming"] == "already-finished" for line in lines))
+        self.assertIn("finishedAt", lines[0])
+        self.assertNotIn("finishedAt", lines[1])
+        waiter = subprocess.Popen([str(DELEGATE), "wait", "--any"], env=self.env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(waiter.kill)
+        threading.Timer(.5, gate.touch).start()
+        out, err = waiter.communicate(timeout=10)
+        self.assertEqual(waiter.returncode, 0, err)
+        self.assertEqual(json.loads(out.splitlines()[0])["completionTiming"], "finished-during-wait")
+        self.assertIn("no active or undelivered", self.cli("wait", "--any", "old-a", "old-b", "new").stderr)
+
     def test_wait_stream_prints_one_line_per_run_and_picks_up_new_runs(self):
         self.env["DELEGATE_CALLER"] = "streamer"
         self.fake_pi([answer("streamed answer"), SETTLED], pre='case "$*" in *slow*) sleep 4;; esac')
@@ -1539,6 +1569,7 @@ class DelegateTests(unittest.TestCase):
         calls = len((self.work / "pi.log").read_text().splitlines())
         skipped = self.outcome(self.cli("run", "--read-only", "--after", "bad", "--name", "next", "y"))
         self.assertEqual(skipped["state"], "skipped")
+        self.assertIn("finishedAt", skipped)
         self.assertIn("malformed", skipped["error"])
         self.assertEqual(len((self.work / "pi.log").read_text().splitlines()), calls)
         self.assertEqual(self.cli("start", "--after", "no-such-run", "x").returncode, 2)
@@ -1753,6 +1784,273 @@ class DelegateTests(unittest.TestCase):
         lane = self.cli("lane", "true", timeout=5)
         self.assertEqual(lane.returncode, 0, lane.stderr)
         self.assertLess(time.monotonic() - started, 3)
+        self.assertTrue((run / ".generate-pending").exists())
+        # Zero file actions must still retry generation and advance the merge marker.
+        (repo / ".delegate.json").write_text(json.dumps({"generated": {
+            "paths": ["gen/"], "command": "cp src.txt gen/out.txt; echo retried > retry.txt"}}))
+        retried = self.cli("apply", state["run"])
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual((repo / "retry.txt").read_text(), "retried\n")
+        self.assertTrue((run / ".applied").exists())
+        self.assertFalse((run / ".generate-pending").exists())
+
+    def test_apply_progress_is_visible_while_queueing_and_generating(self):
+        repo = self.repo({"src.txt": "old\n", "gen/out.txt": "old\n"})
+        gate = self.work / "generate-release"
+        (repo / ".delegate.json").write_text(json.dumps({"generated": {
+            "paths": ["gen/"], "command": f"while [ ! -f {gate} ]; do sleep .05; done; cp src.txt gen/out.txt"}}))
+        self.fake_pi([answer("done"), SETTLED], pre="echo new > src.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        holder = self.hold_lane(30)
+        process = subprocess.Popen([str(DELEGATE), "apply", state["run"]], env=self.env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(process.kill)
+        self.addCleanup(process.stdout.close)
+        self.addCleanup(process.stderr.close)
+        lines = []
+        thread = threading.Thread(target=lambda: lines.extend(process.stderr), daemon=True)
+        thread.start()
+        self.until(lambda: any("generator queued" in line for line in lines), "queue progress")
+        self.assertIsNone(process.poll())
+        self.assertIn("caller check", "".join(lines))
+        holder.terminate()
+        holder.wait(timeout=10)
+        self.until(lambda: any("generating /" in line for line in lines), "generation progress")
+        self.assertIsNone(process.poll())
+        self.assertIn(str(Path(state["dir"]) / "generate.log"), "".join(lines))
+        gate.touch()
+        out = process.stdout.read()
+        process.wait(timeout=10)
+        thread.join(timeout=2)
+        self.assertEqual(process.returncode, 0, "".join(lines) + out)
+
+    def test_protect_reasons_normalize_validate_and_inherit(self):
+        repo = self.repo({"tests/t.txt": "old\n"})
+        self.fake_pi([answer("done"), SETTLED])
+        reason = "owned elsewhere = keep logic here"
+        first = self.outcome(self.cli("run", "--worktree", "--workdir", repo,
+                                     "--protect-reason", "tests//", reason,
+                                     "--protect-reason", "tests/", reason, "task"))
+        meta = json.loads((Path(first["dir"]) / "meta.json").read_text())
+        self.assertEqual(meta["protect"], ["tests/"])
+        self.assertEqual(meta["protectReasons"], {"tests/": reason})
+        for fresh, prompt in ((False, "more"), (True, "继续")):
+            args = ["reply", "--wait", first["run"], prompt] + (["--fresh"] if fresh else [])
+            result = self.outcome(self.cli(*args))
+            text = (Path(result["dir"]) / "prompt.md").read_text()
+            self.assertIn(reason, text)
+            self.assertIn("不得为避开保护" if fresh else "Do not move or copy logic", text)
+            self.assertEqual(json.loads((Path(result["dir"]) / "meta.json").read_text())["protectReasons"], meta["protectReasons"])
+            first = result
+        for args in (("tests/", ""), ("../tests", "why")):
+            self.assertEqual(self.cli("start", "--workdir", repo, "--protect-reason", *args, "task").returncode, 2)
+        self.assertEqual(self.cli("start", "--workdir", repo, "--protect-reason", "tests//", "a",
+                                 "--protect-reason", "tests/", "b", "task").returncode, 2)
+        self.assertEqual(self.cli("reply", first["run"], "--protect-reason", "tests/", "new", "task").returncode, 2)
+        self.fake_pi([answer("done"), SETTLED], pre="echo bad >> tests/t.txt")
+        rejected = self.outcome(self.cli("reply", "--wait", first["run"], "--accept", "echo ran > accepted", "fix"))
+        self.assertEqual(rejected["state"], "rejected")
+        self.assertEqual(rejected["protectViolationReasons"], {"tests/": reason})
+        self.assertNotIn("accept", rejected)
+        self.assertFalse((Path(rejected["worktree"]) / "accepted").exists())
+        # Old meta has only the existing protect array; reply must still inherit it.
+        meta_path = Path(rejected["dir"]) / "meta.json"
+        legacy = json.loads(meta_path.read_text())
+        legacy.pop("protectReasons")
+        meta_path.write_text(json.dumps(legacy))
+        self.fake_pi([answer("legacy"), SETTLED], pre="echo old > tests/t.txt")
+        inherited = self.outcome(self.cli("reply", "--wait", rejected["run"], "--no-accept", "restore"))
+        inherited_meta = json.loads((Path(inherited["dir"]) / "meta.json").read_text())
+        self.assertEqual(inherited_meta["protect"], ["tests/"])
+        self.assertNotIn("protectReasons", inherited_meta)
+        self.fake_pi([answer("equal name"), SETTLED])
+        equals = self.outcome(self.cli("run", "--worktree", "--workdir", repo,
+                                      "--protect", "name=literal", "--protect-reason", "name=literal", reason, "task"))
+        equals_meta = json.loads((Path(equals["dir"]) / "meta.json").read_text())
+        self.assertEqual(equals_meta["protect"], ["name=literal"])
+        self.assertEqual(equals_meta["protectReasons"], {"name=literal": reason})
+
+    def test_zero_change_reply_reports_pending_total_changes(self):
+        repo = self.repo({"a.txt": "old\n"})
+        self.fake_pi([answer("first"), SETTLED], pre="echo new > a.txt")
+        first = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        self.fake_pi([answer("checked"), SETTLED])
+        second = self.outcome(self.cli("reply", "--wait", first["run"], "--accept", "true", "check"))
+        self.assertEqual(second["changes"]["files"], 0)
+        self.assertEqual(second["pendingChanges"]["files"], 1)
+        self.assertIn("--total", second["next"])
+        self.assertIn("apply", second["next"])
+
+    def test_numbered_prefix_conflicts_across_runs_and_dry_run(self):
+        repo = self.repo({"migrations/base.sql": "base\n"})
+        runs = []
+        for suffix in ("a", "b"):
+            self.fake_pi([answer("done"), SETTLED], pre=f"echo sql > migrations/0032_{suffix}.sql")
+            runs.append(self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task")))
+        self.assertNotIn("numberedPrefixConflicts", self.outcome(self.cli("apply", runs[0]["run"])))
+        dry = self.cli("apply", runs[1]["run"], "--dry-run")
+        expected = [{"directory": "migrations", "prefix": "0032",
+                     "paths": ["migrations/0032_a.sql", "migrations/0032_b.sql"]}]
+        self.assertEqual(self.outcome(dry)["numberedPrefixConflicts"], expected)
+        self.assertIn("numbered prefix warning", dry.stderr)
+        self.assertFalse((repo / "migrations/0032_b.sql").exists())
+        applied = self.cli("apply", runs[1]["run"])
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertEqual(self.outcome(applied)["numberedPrefixConflicts"], expected)
+        self.assertTrue((repo / "migrations/0032_a.sql").exists())
+        self.assertTrue((repo / "migrations/0032_b.sql").exists())
+        self.assertNotIn("numberedPrefixConflicts", self.outcome(self.cli("apply", runs[1]["run"])))
+
+    def test_numbered_prefix_final_plan_excludes_deleted_and_generated(self):
+        repo = self.repo({"m/001_old.sql": "old\n", "m/base": "base\n", "gen/001_old": "old\n"})
+        (repo / ".delegate.json").write_text(json.dumps({"generated": {"paths": ["gen/"], "command": "true"}}))
+        self.fake_pi([answer("done"), SETTLED], pre="rm m/001_old.sql; echo new > m/001_new.sql; "
+                     "echo a > m/002_a.sql; echo b > m/002_b.sql; echo c > m/003_new.sql; "
+                     "mkdir elsewhere; echo d > elsewhere/002_other.sql; echo z > m/2_short.sql; "
+                     "echo normal > m/plain; echo generated > gen/001_new")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        (repo / "m/003_untracked.sql").write_text("untracked\n")
+        result = self.outcome(self.cli("apply", state["run"]))
+        self.assertEqual([item["prefix"] for item in result["numberedPrefixConflicts"]], ["002", "003"])
+        self.assertEqual(result["numberedPrefixConflicts"][1]["paths"], ["m/003_new.sql", "m/003_untracked.sql"])
+        self.assertFalse((repo / "m/001_old.sql").exists())
+        self.assertFalse((repo / "gen/001_new").exists())
+
+    def test_apply_acceptance_reuse_checks_full_tree_without_rerunning(self):
+        repo = self.repo({"a.txt": "old\n", "unrelated.txt": "original\n"})
+        # The baseline includes uncommitted files and is deliberately different from HEAD.
+        (repo / "dirty.txt").write_text("dirty\n")
+        counter = self.work / "accept-count"
+        self.fake_pi([answer("done"), SETTLED], pre="echo new > a.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo,
+                                     "--accept", f"echo checked >> {counter}", "task"))
+        result = self.outcome(self.cli("apply", state["run"]))
+        self.assertIs(result["acceptStillValid"], True)
+        self.assertEqual(result["acceptValidityScope"], "repository-snapshot")
+        self.assertEqual(result["apply"], {"ok": True, "dryRun": False})
+        self.assertIs(self.outcome(self.cli("apply", state["run"]))["acceptStillValid"], True)
+        (repo / "unrelated.txt").write_text("caller edit\n")
+        self.assertIs(self.outcome(self.cli("apply", state["run"]))["acceptStillValid"], False)
+        self.assertEqual(counter.read_text(), "checked\n")
+        dry = self.outcome(self.cli("apply", state["run"], "--dry-run"))
+        self.assertNotIn("acceptStillValid", dry)
+        self.assertIn("dry run", dry["acceptValidityReason"])
+
+    def test_apply_acceptance_reuse_rejects_post_accept_and_accept_edits(self):
+        repo = self.repo({"a.txt": "old\n"})
+        self.fake_pi([answer("done"), SETTLED], pre="echo new > a.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "task"))
+        (Path(state["worktree"]) / "a.txt").write_text("manual\n")
+        self.assertIs(self.outcome(self.cli("apply", state["run"]))["acceptStillValid"], False)
+        self.fake_pi([answer("done"), SETTLED], pre="echo again > a.txt")
+        changed = self.outcome(self.cli("run", "--worktree", "--workdir", repo,
+                                       "--accept", "echo accept-edit >> a.txt", "task"))
+        result = self.outcome(self.cli("apply", changed["run"]))
+        self.assertIs(result["acceptStillValid"], False)
+        self.assertIn("acceptance changed", result["acceptValidityReason"])
+
+    def test_apply_acceptance_reuse_generated_result_and_conflict_markers(self):
+        repo = self.repo({"a.txt": "old\n", "gen/out.txt": "old\n"})
+        config = {"generated": {"paths": ["gen/"], "command": "cp a.txt gen/out.txt"}}
+        (repo / ".delegate.json").write_text(json.dumps(config))
+        self.fake_pi([answer("done"), SETTLED], pre="echo new > a.txt; cp a.txt gen/out.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "task"))
+        self.assertIs(self.outcome(self.cli("apply", state["run"]))["acceptStillValid"], True)
+        self.fake_pi([answer("done"), SETTLED], pre="echo next > a.txt; echo different > gen/out.txt")
+        different = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "task"))
+        self.assertIs(self.outcome(self.cli("apply", different["run"]))["acceptStillValid"], False)
+        self.fake_pi([answer("done"), SETTLED], pre="echo theirs > a.txt")
+        conflict = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "task"))
+        (repo / "a.txt").write_text("mine\n")
+        marked = self.cli("apply", conflict["run"], "--merge")
+        self.assertEqual(marked.returncode, 1, marked.stderr)
+        self.assertIs(self.outcome(marked)["acceptStillValid"], False)
+        self.assertTrue((Path(conflict["dir"]) / ".applied").exists())
+
+    def test_apply_acceptance_reuse_omits_incomplete_legacy_and_failed_snapshots(self):
+        repo = self.repo({"a.txt": "old\n"})
+        self.fake_pi([answer("done"), SETTLED], pre="echo new > a.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "task"))
+        run = Path(state["dir"])
+        summary = json.loads((run / "summary.json").read_text())
+        legacy = dict(summary)
+        legacy["accept"] = {"ok": True, "exitCode": 0, "command": "true"}
+        (run / "summary.json").write_text(json.dumps(legacy))
+        result = self.outcome(self.cli("apply", state["run"]))
+        self.assertNotIn("acceptStillValid", result)
+        self.assertIn("incomplete acceptance", result["acceptValidityReason"])
+        (run / "summary.json").write_text(json.dumps(summary))
+        (repo / "large-untracked").write_bytes(b"x" * 2097153)
+        result = self.outcome(self.cli("apply", state["run"]))
+        self.assertNotIn("acceptStillValid", result)
+        self.assertIn("large untracked", result["acceptValidityReason"])
+        (repo / "large-untracked").unlink()
+        wrapper = self.bin / "git"
+        real_git = shutil.which("git", path=os.environ["PATH"])
+        wrapper.write_text(f'#!/bin/sh\ncase "$*" in *"write-tree"*) exit 1;; esac\nexec {shlex.quote(real_git)} "$@"\n')
+        wrapper.chmod(0o755)
+        result = self.outcome(self.cli("apply", state["run"]))
+        self.assertNotIn("acceptStillValid", result)
+        self.assertIn("snapshot failed", result["acceptValidityReason"])
+
+    def test_apply_acceptance_reuse_failed_and_absent_acceptance(self):
+        repo = self.repo({"a.txt": "old\n"})
+        self.fake_pi([answer("done"), SETTLED], pre="echo new > a.txt")
+        no_accept = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        self.assertNotIn("acceptStillValid", self.outcome(self.cli("apply", no_accept["run"])))
+        self.fake_pi([answer("done"), SETTLED], pre="echo rejected > a.txt")
+        failed = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "false", "task"))
+        result = self.outcome(self.cli("apply", failed["run"]))
+        self.assertIs(result["acceptStillValid"], False)
+        self.assertTrue(result["apply"]["ok"])
+        self.assertEqual(self.outcome(self.cli("status", failed["run"]))["state"], "rejected")
+
+    def test_apply_acceptance_reuse_omits_failed_historical_snapshot(self):
+        repo = self.repo({"a.txt": "old\n"})
+        marker = self.work / "break-snapshot"
+        real_git = shutil.which("git", path=os.environ["PATH"])
+        wrapper = self.bin / "git"
+        wrapper.write_text(f'#!/bin/sh\ncase "$*" in *"write-tree"*) [ -f {shlex.quote(str(marker))} ] && exit 1;; esac\nexec {shlex.quote(real_git)} "$@"\n')
+        wrapper.chmod(0o755)
+        self.fake_pi([answer("done"), SETTLED], pre="echo new > a.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo,
+                                     "--accept", f"touch {shlex.quote(str(marker))}", "task"))
+        self.assertTrue(state["accept"]["ok"])
+        self.assertIn("snapshot failed", state["accept"]["snapshotReason"])
+        marker.unlink()
+        result = self.outcome(self.cli("apply", state["run"]))
+        self.assertNotIn("acceptStillValid", result)
+        self.assertIn("snapshot failed", result["acceptValidityReason"])
+
+    def test_apply_acceptance_reuse_omits_dirty_submodule_and_index_flags(self):
+        repo = self.repo({"a.txt": "old\n"})
+        sub = self.work / "lib"
+        git = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always"]
+        subprocess.run(["git", "init", "-q", str(sub)], check=True)
+        (sub / "lib.txt").write_text("lib\n")
+        subprocess.run(["git", "-C", str(sub), *git, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(sub), *git, "commit", "-qm", "lib"], check=True)
+        subprocess.run(["git", "-C", str(repo), *git, "submodule", "add", "-q", str(sub), "vendor"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), *git, "commit", "-qm", "sub"], check=True)
+        self.fake_pi([answer("done"), SETTLED], pre="git -c protocol.file.allow=always submodule update --init -q; echo new > a.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "task"))
+        self.assertIs(self.outcome(self.cli("apply", state["run"]))["acceptStillValid"], True)
+        (repo / "vendor/lib.txt").write_text("dirty\n")
+        result = self.outcome(self.cli("apply", state["run"]))
+        self.assertNotIn("acceptStillValid", result)
+        self.assertIn("submodules", result["acceptValidityReason"])
+        (repo / "vendor/lib.txt").write_text("lib\n")
+        subprocess.run(["git", "-C", str(repo), "update-index", "--assume-unchanged", "a.txt"], check=True)
+        result = self.outcome(self.cli("apply", state["run"]))
+        self.assertNotIn("acceptStillValid", result)
+        self.assertIn("index", result["acceptValidityReason"])
+        subprocess.run(["git", "-C", str(repo), "update-index", "--no-assume-unchanged", "a.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo / "vendor"), "update-index", "--assume-unchanged", "lib.txt"], check=True)
+        (repo / "vendor/lib.txt").write_text("hidden dirty\n")
+        result = self.outcome(self.cli("apply", state["run"]))
+        self.assertNotIn("acceptStillValid", result)
+        self.assertIn("submodules", result["acceptValidityReason"])
 
     def test_worktree_in_a_repository_without_commits(self):
         repo = self.work / "fresh"
