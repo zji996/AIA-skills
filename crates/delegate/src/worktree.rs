@@ -459,6 +459,82 @@ fn file_hash(path: &Path) -> Res<String> {
         hash.update(&buffer[..size]);
     }
 }
+/// Running write tasks on the same source (field notes 16): what each has
+/// changed so far, and which of those paths the new task's prompt names, so
+/// the caller can choose to serialize before the overlap becomes a conflict.
+pub fn concurrent_writes(created: &Path) -> Vec<Value> {
+    let meta = json(created.join("meta.json"));
+    if s(&meta, "mode") != "write" {
+        return vec![];
+    }
+    let source_of = |m: &Value| {
+        Some(s(&m["worktree"], "source"))
+            .filter(|x| !x.is_empty())
+            .unwrap_or(s(m, "top"))
+            .to_string()
+    };
+    let ours = source_of(&meta);
+    if ours.is_empty() {
+        return vec![];
+    }
+    let prompt = read(created.join("prompt.md"));
+    let generic = [
+        "mod.rs",
+        "lib.rs",
+        "main.rs",
+        "index.ts",
+        "index.tsx",
+        "README.md",
+        "Cargo.toml",
+        "package.json",
+    ];
+    let named = |path: &str| {
+        let base = path.rsplit('/').next().unwrap_or(path);
+        prompt.contains(path)
+            || (base.len() >= 8
+                && base.contains('.')
+                && !generic.contains(&base)
+                && prompt.contains(base))
+    };
+    let mut found = vec![];
+    for other in crate::runs::all_runs() {
+        if other == created || !crate::runs::active(&crate::runs::state(&other)) {
+            continue;
+        }
+        let theirs = json(other.join("meta.json"));
+        if s(&theirs, "mode") != "write" || source_of(&theirs) != ours {
+            continue;
+        }
+        let top = Some(s(&theirs["worktree"], "path"))
+            .filter(|x| !x.is_empty())
+            .unwrap_or(s(&theirs, "top"));
+        let base = s(&theirs, "chainBase");
+        let changed = if base.is_empty() {
+            vec![]
+        } else {
+            snapshot(Path::new(top), &other, &strings(&theirs["snapshotExclude"]))
+                .and_then(|now| {
+                    tree_changes(Path::new(top), &json!({"tree":base}), &now, false).ok()
+                })
+                .unwrap_or_default()
+                .iter()
+                .map(|c| s(c, "path").to_string())
+                .collect::<Vec<_>>()
+        };
+        let mentioned = changed
+            .iter()
+            .filter(|p| named(p))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut entry = json!({"name":s(&theirs,"name"),"run":other.file_name().unwrap_or_default().to_string_lossy(),
+            "changed":changed.len(),"sample":changed.iter().take(5).collect::<Vec<_>>(),"named":mentioned});
+        if theirs["protect"].as_array().is_some_and(|p| !p.is_empty()) {
+            entry["protect"] = theirs["protect"].clone();
+        }
+        found.push(entry);
+    }
+    found
+}
 /// How far the source moved since a finished, unapplied worktree run took its snapshot:
 /// the number of changed files, and which of them the run changed too.
 pub fn source_drift(run: &Path) -> Option<Value> {
@@ -736,6 +812,115 @@ fn accept_validity(run: &Path, dry: bool, conclusion: &mut Value) {
         conclusion["acceptStillValid"] = json!(valid);
     }
     conclusion["acceptValidityReason"] = json!(reason);
+}
+/// Post-merge acceptance on the source tree (field notes 16): parallel routes
+/// each pass in their own worktree, yet type drift between them only shows
+/// once merged. Opt-in through `.delegate.json` `applyVerify` (true runs the
+/// top-level `accept`; a string is its own command) or `apply --verify`.
+/// Returns false only when the verification ran and failed.
+pub fn verify_after_apply(run: &Path, forced: Option<bool>, conclusion: &mut Value) -> Res<bool> {
+    if conclusion["apply"]["ok"] != json!(true) || conclusion["apply"]["dryRun"] == json!(true) {
+        return Ok(true);
+    }
+    let meta = json(run.join("meta.json"));
+    let tree = &meta["worktree"];
+    let source = s(tree, "source");
+    if source.is_empty() {
+        return Ok(true);
+    }
+    let file = Path::new(source).join(".delegate.json");
+    let raw = if file.is_file() {
+        serde_json::from_str::<Value>(&read(&file))
+            .map_err(|e| format!("cannot read {}: {e}", file.display()))?
+    } else {
+        json!({})
+    };
+    let configured = match raw.get("applyVerify") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => None,
+        Some(Value::Bool(true)) => Some(None),
+        Some(Value::String(command)) if !command.trim().is_empty() => Some(Some(command.clone())),
+        _ => {
+            return Err(format!(
+                "{}: applyVerify must be true, false or a command",
+                file.display()
+            ))
+        }
+    };
+    if !forced.unwrap_or(configured.is_some()) {
+        return Ok(true);
+    }
+    if forced != Some(true) && conclusion["acceptStillValid"] == json!(true) {
+        conclusion["verify"] = json!({"skipped":"acceptStillValid"});
+        return Ok(true);
+    }
+    let command = configured
+        .flatten()
+        .or_else(|| {
+            raw.get("accept")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| Some(s(&meta, "accept").to_string()).filter(|c| !c.is_empty()));
+    let Some(command) = command else {
+        conclusion["verify"] = json!({"skipped":"no acceptance command"});
+        return Ok(true);
+    };
+    let cwd = Some(s(tree, "sourceWorkdir"))
+        .filter(|w| !w.is_empty())
+        .unwrap_or(source)
+        .to_string();
+    let label = format!(
+        "verify {}",
+        run.file_name().unwrap_or_default().to_string_lossy()
+    );
+    apply_progress("verifying merged tree / 正在验收合并结果");
+    let slot = lane::acquire(&label, None, |ahead, _| {
+        apply_progress(format!("verify queued / 排队中: {ahead} ahead"))
+    });
+    let mut result = json!({"command":command});
+    let Ok(slot) = slot else {
+        result["ok"] = json!(false);
+        result["tail"] = json!("stopped while queued for the heavy lane");
+        conclusion["verify"] = result;
+        return Ok(false);
+    };
+    let path = run.join("verify.log");
+    let mut log = fs::File::create(&path).map_err(|e| e.to_string())?;
+    let _ = writeln!(log, "$ {command}");
+    let (code, timed) = crate::common::run_shell(
+        (&command, "verify"),
+        Path::new(&cwd),
+        run,
+        &meta["env"],
+        meta["acceptTimeoutSeconds"].as_f64().unwrap_or(600.0),
+        &mut log,
+        None,
+    )
+    .unwrap_or((1, false));
+    drop(slot);
+    let _ = writeln!(
+        log,
+        "{}\n[exit {code}]",
+        if timed { "\n[verify timed out]" } else { "" }
+    );
+    result["ok"] = json!(code == 0);
+    result["exitCode"] = json!(code);
+    result["log"] = json!(path);
+    if code != 0 {
+        let text = read(&path);
+        let chars: Vec<char> = text.trim().chars().collect();
+        result["tail"] = json!(chars[chars.len().saturating_sub(1500)..]
+            .iter()
+            .collect::<String>());
+        result["next"] = json!("the merge is already in the source tree: fix it there, or reply to the task with the failure");
+    }
+    apply_progress(if code == 0 {
+        "verify passed / 验收通过"
+    } else {
+        "verify failed / 验收失败"
+    });
+    conclusion["verify"] = result;
+    Ok(code == 0)
 }
 fn numbered_prefix(path: &str) -> Option<(String, String)> {
     let path = Path::new(path);

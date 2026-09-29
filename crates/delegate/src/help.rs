@@ -147,10 +147,12 @@ pub fn print(command: Option<&str>) -> bool {
             ("--stat", "Show diff statistics."),
             ("--total", "Show the whole conversation, not only this run."),
         ]),
-        "apply" => ("[--merge] [--dry-run] [run]", "Merge a worktree conversation into the source working tree.", &[
+        "apply" => ("[--merge] [--dry-run] [--verify|--no-verify] [run]", "Merge a worktree conversation into the source working tree.", &[
             ("run", "Run id or directory (default: last)."),
             ("--merge", "Write conflict markers instead of stopping."),
             ("--dry-run", "Check the merge without writing it."),
+            ("--verify", "After merging, run the repository acceptance on the merged tree unless acceptStillValid is true (default from .delegate.json applyVerify)."),
+            ("--no-verify", "Skip the post-merge acceptance even when .delegate.json enables it."),
         ]),
         "lane" => ("[--label TEXT] [command ...]", "Queue a heavy command with acceptance checks, worktree setup, and other machine checks. DELEGATE_MAX_HEAVY run at once (default: 1). One argument is a shell command; no command lists the lane.", &[
             ("--label TEXT", "Label shown in the lane listing."),

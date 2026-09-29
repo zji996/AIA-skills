@@ -118,6 +118,47 @@ fn hint_undelivered_other_runs(created: &Path) {
     runs::other_runs_hint(&others);
 }
 
+fn hint_concurrent_writes(created: &Path) {
+    for other in worktree::concurrent_writes(created) {
+        let named = other["named"].as_array().map_or(0, Vec::len);
+        let files = other["sample"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        eprintln!(
+            "delegate: {} write task {} is running on this source ({} files changed so far{}){}",
+            if named > 0 { "overlap:" } else { "note:" },
+            s(&other, "name"),
+            other["changed"],
+            if files.is_empty() {
+                String::new()
+            } else {
+                format!(": {files}")
+            },
+            if named > 0 {
+                format!(
+                    "; this prompt names {named} of them ({}): consider --after {} or --protect",
+                    other["named"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    s(&other, "name")
+                )
+            } else {
+                String::new()
+            }
+        );
+    }
+}
+
 type Parsed = (Vec<String>, Vec<String>, Vec<(String, String)>);
 fn parse_simple(args: &[String], flags: &[&str], values: &[&str]) -> Res<Parsed> {
     let mut pos = vec![];
@@ -696,7 +737,14 @@ fn diff(args: &[String]) -> Res<i32> {
     Ok(status.code().unwrap_or(1))
 }
 fn apply(args: &[String]) -> Res<i32> {
-    let (pos, flags, _) = parse_simple(args, &["--dry-run", "--merge"], &[])?;
+    let (pos, flags, _) = parse_simple(
+        args,
+        &["--dry-run", "--merge", "--verify", "--no-verify"],
+        &[],
+    )?;
+    if has(&flags, "--verify") && has(&flags, "--no-verify") {
+        return Err("--verify and --no-verify are exclusive".into());
+    }
     if pos.len() > 1 {
         return Err("apply takes one run".into());
     }
@@ -709,7 +757,7 @@ fn apply(args: &[String]) -> Res<i32> {
             run.file_name().unwrap_or_default().to_string_lossy()
         ));
     }
-    let outcome = worktree::apply(&run, has(&flags, "--merge"), has(&flags, "--dry-run"))?;
+    let mut outcome = worktree::apply(&run, has(&flags, "--merge"), has(&flags, "--dry-run"))?;
     if run.join(".applied").exists() {
         let path = s(&json(run.join("meta.json"))["worktree"], "path").to_string();
         for other in runs::all_runs() {
@@ -720,6 +768,16 @@ fn apply(args: &[String]) -> Res<i32> {
                 }
             }
         }
+    }
+    let forced = if has(&flags, "--verify") {
+        Some(true)
+    } else if has(&flags, "--no-verify") {
+        Some(false)
+    } else {
+        None
+    };
+    if !worktree::verify_after_apply(&run, forced, &mut outcome.conclusion)? && outcome.code == 0 {
+        outcome.code = 1;
     }
     println!("{}", format_status(outcome.conclusion));
     Ok(outcome.code)
@@ -764,6 +822,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
             let full = o.full;
             let run = launch::start(o)?;
             hint_undelivered_other_runs(&run);
+            hint_concurrent_writes(&run);
             if command == "start" {
                 println!("{}", status_line(&run));
                 eprintln!(

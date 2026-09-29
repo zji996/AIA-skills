@@ -206,5 +206,5 @@
 14. ~~保护路径附原因，需要改时停下报告而非绕路~~（已完成 5.12.0：`--protect-reason <路径> <原因>`，见十五）。
 15. ~~`apply` 检测新增文件的编号前缀冲突~~（已完成 5.12.0：警告与 `numberedPrefixConflicts`，见十五）。
 16. 并行 worktree 验收共用外部基础设施（数据库、Redis）：按任务隔离库名/schema，或在结论中提示验收改过共享状态（见十五）。
-17. `apply` 后自动在主干跑仓库默认验收（`acceptStillValid` 不为 true 时），`.delegate.json` 可选开启；多路合并的类型漂移只在合并后暴露（见十六）。
-18. `start` 时提示与运行中写入任务的改动文件重叠（按其 worktree 当前改动与 `--protect` 声明），让主控决定串行还是并行（见十六）。
+17. ~~`apply` 后自动在主干跑仓库默认验收（`acceptStillValid` 不为 true 时），`.delegate.json` 可选开启~~（5.13.0：`applyVerify`、`apply --verify/--no-verify`，见十六）。
+18. ~~`start` 时提示与运行中写入任务的改动文件重叠~~（5.13.0：列出同源运行中写入任务的已改文件，说明点名其路径时 `overlap:`；只提示不拒绝，见十六）。

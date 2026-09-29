@@ -1993,6 +1993,69 @@ class DelegateTests(unittest.TestCase):
         self.assertNotIn("acceptStillValid", result)
         self.assertIn("snapshot failed", result["acceptValidityReason"])
 
+    def test_apply_verify_runs_repository_acceptance_on_merged_tree(self):
+        repo = self.repo({"a.txt": "old\n", "b.txt": "old\n"})
+        counter = self.work / "verify-count"
+        (repo / ".delegate.json").write_text(json.dumps(
+            {"accept": f"echo checked >> {counter}; ! grep -q broken b.txt", "applyVerify": True}))
+        self.fake_pi([answer("done"), SETTLED], pre="echo new > a.txt")
+        still = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        result = self.outcome(self.cli("apply", still["run"]))
+        self.assertIs(result["acceptStillValid"], True)
+        self.assertEqual(result["verify"], {"skipped": "acceptStillValid"})
+        self.assertEqual(counter.read_text(), "checked\n")
+        self.fake_pi([answer("done"), SETTLED], pre="echo next > a.txt")
+        drifted = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        (repo / "b.txt").write_text("broken\n")
+        failed = self.cli("apply", drifted["run"])
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        outcome = self.outcome(failed)
+        self.assertTrue(outcome["apply"]["ok"])
+        self.assertIs(outcome["verify"]["ok"], False)
+        self.assertEqual((repo / "a.txt").read_text(), "next\n")
+        self.assertIn("verify failed", failed.stderr)
+        (repo / "b.txt").write_text("fixed\n")
+        skipped = self.outcome(self.cli("apply", drifted["run"], "--no-verify"))
+        self.assertNotIn("verify", skipped)
+        forced = self.cli("apply", drifted["run"], "--verify")
+        self.assertEqual(forced.returncode, 0, forced.stderr)
+        self.assertIs(self.outcome(forced)["verify"]["ok"], True)
+        self.assertNotIn("verify", self.outcome(self.cli("apply", drifted["run"], "--dry-run", "--verify")))
+
+    def test_apply_verify_is_opt_in_and_validates_config(self):
+        repo = self.repo({"a.txt": "old\n"})
+        self.fake_pi([answer("done"), SETTLED], pre="echo new > a.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        self.assertNotIn("verify", self.outcome(self.cli("apply", state["run"])))
+        (repo / ".delegate.json").write_text(json.dumps({"applyVerify": "echo own-command"}))
+        result = self.outcome(self.cli("apply", state["run"]))
+        self.assertEqual(result["verify"]["command"], "echo own-command")
+        self.assertIs(result["verify"]["ok"], True)
+        (repo / ".delegate.json").write_text(json.dumps({"applyVerify": 3}))
+        self.assertIn("applyVerify must be", self.cli("apply", state["run"]).stderr)
+        self.assertEqual(self.cli("apply", state["run"], "--verify", "--no-verify").returncode, 2)
+
+    def test_start_reports_running_write_tasks_and_named_overlap(self):
+        repo = self.repo({"src/hot_file.rs": "old\n", "other.txt": "old\n"})
+        self.fake_pi([answer("done"), SETTLED], pre="echo new > src/hot_file.rs", sleep=20)
+        first = self.outcome(self.cli("start", "--worktree", "--workdir", repo, "--name", "hotwork", "task"))
+        edited = Path(first["worktree"]) / "src/hot_file.rs"
+        deadline = time.time() + 10
+        while edited.read_text() != "new\n" and time.time() < deadline:
+            time.sleep(0.05)
+        try:
+            named = self.cli("start", "--worktree", "--workdir", repo, "--name", "second", "fix src/hot_file.rs")
+            self.assertIn("overlap: write task hotwork is running on this source (1 files changed so far: src/hot_file.rs)",
+                          named.stderr)
+            self.assertIn("--after hotwork", named.stderr)
+            unrelated = self.cli("start", "--worktree", "--workdir", repo, "--name", "third", "edit other.txt")
+            self.assertIn("note: write task hotwork", unrelated.stderr)
+            self.assertNotIn("overlap:", unrelated.stderr)
+            reader = self.cli("start", "--read-only", "--workdir", repo, "look at hot_file.rs")
+            self.assertNotIn("hotwork", reader.stderr)
+        finally:
+            self.cli("stop", "hotwork", "second", "third")
+
     def test_apply_acceptance_reuse_failed_and_absent_acceptance(self):
         repo = self.repo({"a.txt": "old\n"})
         self.fake_pi([answer("done"), SETTLED], pre="echo new > a.txt")

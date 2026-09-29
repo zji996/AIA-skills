@@ -54,7 +54,7 @@
 
 worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 `git worktree remove`，过期清理同理；`agent-handoff` 会列出尚未 `apply` 的写入型 worktree。
 
-同仓库串行 `apply`；慢合并可后台执行。stderr 实时报告检查、生成器排队（人数与前序任务）、生成日志绝对路径和执行超时；排队不算生成超时。生成失败留 `.generate-pending`，再次 apply 即使普通文件已合入也重跑生成。编号前缀冲突只警告，不改号或退出码；末尾 `operation: apply` JSON 带 `numberedPrefixConflicts` 和验收复用的原因。`acceptStillValid` 只在验收前后历史全树与最终源全树有完整相同证据时为 true，不完整时省略；忽略文件、环境、数据库、Git 历史另行判断，后续改动/reply 不沿用旧 true。
+同仓库串行 `apply`；慢合并可后台执行。stderr 实时报告检查、生成器排队（人数与前序任务）、生成日志绝对路径和执行超时；排队不算生成超时。生成失败留 `.generate-pending`，再次 apply 即使普通文件已合入也重跑生成。编号前缀冲突只警告，不改号或退出码；末尾 `operation: apply` JSON 带 `numberedPrefixConflicts` 和验收复用的原因。`acceptStillValid` 只在验收前后历史全树与最终源全树有完整相同证据时为 true，不完整时省略；忽略文件、环境、数据库、Git 历史另行判断，后续改动/reply 不沿用旧 true。`.delegate.json` 的 `applyVerify`（`true` 用顶层 `accept`，或直接写命令）开启合并后验收：`acceptStillValid` 不为 true 时经 lane 在源工作目录运行，结论带 `verify`，失败退出 1（合并已写入）；`--verify` 强制、`--no-verify` 跳过。
 
 ## 会话
 
@@ -80,6 +80,7 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 | `scopes` / `scopes.lock` | 本轮的 systemd scope 单元名 / 并发读写锁；仅在用户 systemd 可用时出现 |
 | `changes.json` / `changes.patch` | 前后快照的 tree、逐文件状态与行数；可直接 `git apply` 的补丁 |
 | `setup.log` | `--worktree` 的 `setup` 命令输出 |
+| `verify.log` | `apply` 合并后验收（`applyVerify` / `--verify`）的输出 |
 | `generate.log` | `apply` 执行 `.delegate.json` 的 `generated.command` 时的输出 |
 | `.generate-pending` | 生成未成功，后续 apply 仍须重试；成功后清除 |
 | `session/` / `fork/` | Pi 本轮的会话；`reply` 分叉所用的上一轮会话副本 |

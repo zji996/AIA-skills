@@ -233,6 +233,10 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 - 准备：`copy`（递归复制仓库根相对的文件或目录，包括被 git 忽略的路径，如 `.local/scan`）、`link`（符号链接，替换空目录，适合子模块）、`setup`（在 lane 中依次执行，§8）、`writeSetup`（仅写入任务，在 `setup` 之后执行，适合只有构建和测试才需要的重环境）。`copy`/`link` 源不存在时跳过并向 stderr 提示；其余失败 → `failed`，`error` 说明。
 - 一个对话共享一个 worktree；`clean` 删除最后一个引用它的 run 时，在 worktree 自身 `git-common-dir` 所属的仓库执行 `git worktree remove --force`（失败则删目录后 `worktree prune`）；不依赖记录的来源路径，`--in` 的上游可能已先被清理。
 
+### 6.3.1 并行写入提示（5.13）
+
+`start`/`run` 创建写入任务后，对同一源仓库（worktree 的 `source` 或原地 `top`）上仍在运行的其他写入任务各输出一行 stderr：其当前 worktree 相对 `chainBase` 的改动文件数与前 5 个路径。本任务说明原文包含其中某个路径（完整相对路径，或长度 ≥ 8、含 `.` 且非 `mod.rs`/`index.ts` 等通用名的文件名）时该行以 `overlap:` 开头并建议 `--after` 或 `--protect`，否则以 `note:` 开头。只提示，不拒绝、不改退出码；只读任务不提示。
+
 ### 6.4 apply（必须）
 
 把对话起点快照（`chainBase`）到 **worktree 当前状态**（重新快照；worktree 已删除时用最后一轮记录）的改动合并回源工作区，不动 index：
@@ -258,6 +262,8 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 **编号预检**：写文件前，仅对本次基准的新增、实际计划写入文件，检查 ASCII 数字前缀加 `_`；按父目录＋原样数字前缀分组。比较源中已跟踪/未跟踪的同目录文件和本批其他新增文件，扣除计划删除，忽略同完整路径、修改项和生成路径，不跟随符号链接目录；不同目录互不冲突，`32` 与 `0032` 不合并。冲突写 stderr 警告并输出 `numberedPrefixConflicts`，dry-run 也报告；不改号、不改退出码，不扫描其他未合入 worktree。通用命名可能不是迁移编号，由主控判断；无源仓库应用锁，同仓库必须串行 apply，防止预检竞态。
 
 **验收复用**：取得 lane 后、验收前及命令/进程清理后保存完整仓库快照证据（不沿用验收前 changes.after 或读取当前 worktree 代替历史）。apply 结束时对源工作区全树重新快照，含未提交改动与生成文件；HEAD 相同不足以证明有效。仅本轮 accept.ok 为 true、历史快照完整且 tree == treeAfter == 最终源 tree 时为 true。已知验收失败、验收改树或源 tree 不同为 false。dry-run、无验收、旧记录/缺字段、快照失败或证据不全时省略布尔值并说明原因；大型未跟踪文件、脏/缺失子模块属 tree 外输入，不能用 size/mtime 证明有效。索引 assume-unchanged / skip-worktree 标志使证据不完整；干净子模块递归核对快照和索引标志。忽略文件、环境、数据库、Git 历史仍由主控判断。apply 不重跑验收，结果仅表示此次 `repository-snapshot` 范围，后续源码改动或 reply 必须重新判断，不向 reply 链永久传播。
+
+**合并后验收**（5.13）：`.delegate.json` 的 `applyVerify` 为 `true`（用顶层 `accept`，缺省时用本任务的 accept）或命令字符串时，合入成功且非 dry-run 的 `apply` 在 `acceptStillValid` 不为 true 时，经 lane 在源工作目录（`sourceWorkdir`）以 `sh -c` 运行该命令，限时同任务 `acceptTimeoutSeconds`，输出写 `verify.log`。`apply --verify` 强制运行（即使 `acceptStillValid: true`），`--no-verify` 跳过，二者互斥（退出码 2）。结论追加 `verify{command,ok,exitCode,log,tail?,next?}`，或 `verify{skipped}`（`acceptStillValid`、无命令）。验收失败时合并已在源树中、基准照常推进，apply 退出码 1。`applyVerify` 为其他类型时报错。
 
 ## 7. 会话与任务说明
 
