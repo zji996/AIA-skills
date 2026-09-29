@@ -173,6 +173,7 @@
 | 任务基线等于当前 HEAD 时，合并后的树与验收过的树完全相同，主控仍重跑全量门禁 | 结论行不告诉主控“合并后树是否等于验收树” | 主控凭记忆判断，有时照跑 | **待改进**：`apply` 后比较工作区树与验收时的树，相同则输出 `acceptStillValid: true` |
 | 两路并行 `--worktree` 写入各自新建 `0032_*.sql` migration | 编号在各自快照里都是“下一个空号” | 合并后一路手工改号 | **待改进**：`apply` 检测新增文件与主仓已有文件的编号前缀（`NNNN_`）冲突时警告 |
 | paste-stub 任务中，同事因 `--protect model_loop.rs` 把逻辑挪进 `operations.rs`（每次 append 都 recover） | 同事不知道为何受保护，只把它当成“不能改”并绕路 | 主控回滚并自己放到正确位置 | **待改进**：`--protect` 支持附原因（如 `--protect path=原因`），说明末尾写明“需要改受保护文件时停下报告，不要绕路” |
+| 两路 worktree 的 migration 撞号后，主干改号为 0033，`infra-test` 仍失败 17 个用例（`relation "thread_sessions" already exists`） | 各 worktree 的验收共用同一个 Docker Compose PostgreSQL；未合并分支的 migration 已按旧编号写进共享库 | 主控在测试库把迁移记录改名对齐 | 验收用的外部状态（数据库、Redis、端口）也是共享资源：并行写入任务应各用独立库名/schema，或 `apply` 时提示“该任务的验收修改过共享基础设施” |
 | 两路强档加固靠 `--protect` 划分文件所有权，合并零冲突；返工用 `reply` 在同一 worktree 追加 commit 顺利 | —— | —— | 大块写入按子系统拆路并互相 protect，效果好；返工续接比新开便宜 |
 | 同一份审查题 Pi 与 Codex 并行：Codex 13 条深层缺陷、全部带出处与“待证实”；Pi 另找到 6 条独有问题，但把“连续同角色消息”夸大为“100% 400” | 与第七节一致 | 主控合并两路、先核实 Pi 的结论再派修 | 重要审查继续两路并行；Pi 结论派修前必须核实 |
 
