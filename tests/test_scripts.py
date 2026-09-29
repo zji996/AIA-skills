@@ -39,7 +39,9 @@ class ImageHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         type(self).request_path = self.path
         type(self).request_auth = self.headers.get("Authorization")
-        type(self).request_data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        multipart = self.headers.get("Content-Type", "").startswith("multipart/")
+        type(self).request_data = {"multipart": body} if multipart else json.loads(body)
         payload = json.dumps(self.response_data).encode()
         self.send_response(self.response_status)
         self.send_header("Content-Type", "application/json")
@@ -748,6 +750,36 @@ class ScriptTests(unittest.TestCase):
                                 cwd=self.work, env=self.image_env(), capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(output.stat().st_mode & 0o777, 0o644)
+
+    def test_image_format_follows_extension_and_validates_compression(self):
+        server, handler = self.image_server()
+        result = self.run_script(IMAGE, "-p", "demo", "-o", self.work / "poster.webp", "--compression", "80",
+                                 "-b", f"http://127.0.0.1:{server.server_port}", env=self.image_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(handler.request_data["output_format"], "webp")
+        self.assertEqual(handler.request_data["output_compression"], 80)
+        for args in (("--compression", "80"), ("--format", "gif")):
+            with self.subTest(args=args):
+                bad = self.run_script(IMAGE, "-p", "demo", "-o", "x.png", *args, env=self.image_env())
+                self.assertEqual(bad.returncode, 2)
+
+    def test_image_edit_posts_multipart_with_prompt_file(self):
+        server, handler = self.image_server()
+        source = self.work / "source.png"
+        source.write_bytes(b"source-bytes")
+        prompt = 'Keep everything; fix "Anthropic".\nSecond line.'
+        result = self.run_script(IMAGE, "-f", "-", "-i", source, "-o", self.work / "fixed.png", "-b",
+                                 f"http://127.0.0.1:{server.server_port}", env=self.image_env(), input=prompt)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(handler.request_path, "/v1/images/edits")
+        body = handler.request_data["multipart"]
+        self.assertIn(prompt.encode(), body)
+        self.assertIn(b"source-bytes", body)
+        self.assertIn(b'name="image[]"', body)
+        self.assertEqual(json.loads(result.stdout)["mode"], "edit")
+        missing = self.run_script(IMAGE, "-p", "demo", "-i", self.work / "none.png", "-o", "x.png",
+                                  env=self.image_env())
+        self.assertEqual(missing.returncode, 1)
 
     def test_image_failure_preserves_existing_output(self):
         for status, data in [(500, {"error": {"message": "rejected"}}),

@@ -14,6 +14,9 @@ Options:
   -m, --model <name>       Model name (default: "gpt-image-2.5-sunburst")
   -s, --size <dims>        Image dimensions (e.g. "1024x1024", "1536x1024", "1024x1536"; default: "1024x1024")
   -q, --quality <level>    Quality setting (default: "high"; GPT Image: auto/low/medium/high/xhigh/max)
+  -i, --image <file>       Edit this image instead of generating from scratch (repeatable; uses /v1/images/edits)
+      --format <fmt>       png/webp/jpeg (default: from the output extension, else png)
+      --compression <0-100> Compression for webp/jpeg
   -b, --base-url <url>     Override OpenAI API base URL
   -k, --api-key <key>      Override API Key
   -h, --help               Show this help message
@@ -36,6 +39,9 @@ SIZE="1024x1024"
 QUALITY="high"
 CLI_BASE_URL=""
 CLI_API_KEY=""
+FORMAT=""
+COMPRESSION=""
+INPUT_IMAGES=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -67,6 +73,21 @@ while [[ $# -gt 0 ]]; do
     -q|--quality)
       [[ $# -ge 2 && -n "$2" ]] || usage
       QUALITY="$2"
+      shift 2
+      ;;
+    -i|--image)
+      [[ $# -ge 2 && -n "$2" ]] || usage
+      INPUT_IMAGES+=("$2")
+      shift 2
+      ;;
+    --format)
+      [[ $# -ge 2 && -n "$2" ]] || usage
+      FORMAT="$2"
+      shift 2
+      ;;
+    --compression)
+      [[ $# -ge 2 && -n "$2" ]] || usage
+      COMPRESSION="$2"
       shift 2
       ;;
     -b|--base-url)
@@ -113,6 +134,25 @@ if [[ -z "$OUTPUT" ]]; then
   echo "Error: --output is required." >&2
   exit 1
 fi
+
+if [[ -z "$FORMAT" ]]; then
+  case "${OUTPUT,,}" in
+    *.webp) FORMAT="webp" ;;
+    *.jpg|*.jpeg) FORMAT="jpeg" ;;
+    *) FORMAT="png" ;;
+  esac
+fi
+case "$FORMAT" in
+  png|webp|jpeg) ;;
+  *) echo "Error: --format must be png, webp or jpeg." >&2; exit 2 ;;
+esac
+if [[ -n "$COMPRESSION" ]] && { [[ ! "$COMPRESSION" =~ ^[0-9]+$ ]] || (( COMPRESSION > 100 )) || [[ "$FORMAT" = "png" ]]; }; then
+  echo "Error: --compression takes 0-100 and only applies to webp or jpeg." >&2
+  exit 2
+fi
+for image in "${INPUT_IMAGES[@]}"; do
+  [[ -f "$image" ]] || { echo "Error: input image not found: $image" >&2; exit 1; }
+done
 
 command -v curl >/dev/null || { echo "Error: 'curl' is required but not installed." >&2; exit 2; }
 command -v jq >/dev/null || { echo "Error: 'jq' is required but not installed." >&2; exit 2; }
@@ -178,6 +218,7 @@ BASE_URL="${BASE_URL:-https://api.openai.com}"
 BASE_URL="${BASE_URL%/}"
 BASE_URL="${BASE_URL%/v1}"
 ENDPOINT="$BASE_URL/v1/images/generations"
+(( ${#INPUT_IMAGES[@]} == 0 )) || ENDPOINT="$BASE_URL/v1/images/edits"
 OUT_DIR="$(dirname "$OUTPUT")"
 mkdir -p "$OUT_DIR"
 
@@ -186,24 +227,41 @@ PAYLOAD=$(jq -n \
   --arg model "$MODEL" \
   --arg size "$SIZE" \
   --arg quality "$QUALITY" \
+  --arg format "$FORMAT" \
+  --arg compression "$COMPRESSION" \
   '{
     model: $model,
     prompt: $prompt,
     size: $size,
     quality: $quality,
+    output_format: $format,
     n: 1
-  }')
+  } + (if $compression == "" then {} else {output_compression: ($compression | tonumber)} end)')
 
 TMP_RESPONSE="$(mktemp /tmp/openai_img_XXXXXX.json)"
 TMP_IMAGE=""
 trap 'rm -f "$TMP_RESPONSE" "$TMP_IMAGE"' EXIT
 TMP_IMAGE="$(mktemp "$OUT_DIR/.image.XXXXXXXX")"
 
+if (( ${#INPUT_IMAGES[@]} == 0 )); then
+  BODY=(-H "Content-Type: application/json" -d "$PAYLOAD")
+else
+  # Edits are multipart; the prompt goes through a file so quotes and newlines survive.
+  TMP_PROMPT="$(mktemp /tmp/openai_img_prompt_XXXXXX.txt)"
+  trap 'rm -f "$TMP_RESPONSE" "$TMP_IMAGE" "$TMP_PROMPT"' EXIT
+  printf '%s' "$PROMPT" > "$TMP_PROMPT"
+  BODY=(-F "model=$MODEL" -F "prompt=<$TMP_PROMPT" -F "size=$SIZE" -F "quality=$QUALITY"
+        -F "output_format=$FORMAT" -F "n=1")
+  [[ -z "$COMPRESSION" ]] || BODY+=(-F "output_compression=$COMPRESSION")
+  for image in "${INPUT_IMAGES[@]}"; do
+    BODY+=(-F "image[]=@$image")
+  done
+fi
+
 if ! HTTP_CODE=$(curl -sS --connect-timeout 10 --max-time 600 -w "%{http_code}" -o "$TMP_RESPONSE" \
   -X POST "$ENDPOINT" \
   -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d "$PAYLOAD"); then
+  "${BODY[@]}"); then
   echo "Error: Image generation request failed." >&2
   exit 1
 fi
@@ -248,4 +306,7 @@ jq -n \
   --arg file "$OUTPUT" \
   --arg model "$MODEL" \
   --arg size "$SIZE" \
-  '{status: $status, file: $file, model: $model, size: $size}'
+  --arg quality "$QUALITY" \
+  --arg mode "$([[ ${#INPUT_IMAGES[@]} -eq 0 ]] && echo generate || echo edit)" \
+  --argjson seconds "$SECONDS" \
+  '{status: $status, file: $file, model: $model, size: $size, quality: $quality, mode: $mode, seconds: $seconds}'

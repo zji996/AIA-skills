@@ -4,6 +4,7 @@
 
 ### 技能
 
+- `openai-image-gen` 1.3.0：新增 `-i/--image` 走 edits 接口在已有图上局部修改（multipart，提示词经文件传，引号与换行不丢）；`--format` 与 `--compression`，输出扩展名为 `.webp`/`.jpg` 时自动请求对应格式；结果 JSON 增加 `quality`、`mode` 与 `seconds`。SKILL.md 按 gpt-image-2.5 更新：sunburst 与 flare 的取舍、`xhigh`/`max` 何时用（实测 2560x1440 下 `xhigh` 与 `high` 耗时相当）、任意尺寸的约束、文档配图用 webp、连续编辑会让别处走样、箭头方向跟随元素位置、费用意识与“差不多就行”时停手。
 - `openai-image-gen` 1.2.0：新增 `--prompt-file <文件|->`，长提示词从文件或 stdin 读取，不再受 shell 引号限制；与 `--prompt` 互斥，空提示词报错。输出图片的权限改按调用者 umask（此前沿用 mktemp 的 0600，别人和 Web 服务读不到）。SKILL.md 补充示意图与带文字画面的写法：按 LAYOUT / STYLE / TEXT RULES / AVOID 分节，箭头写明起止元素，列全文字串并禁止其它文字；提示词一律用英文，画面文字保留原语言；提示词存成输出旁的 `.prompt.txt`；逐字核对后再迭代；`high` 质量单次约 45 秒，超时不低于 300 秒。起因：一次中文架构图请求只用了一句中文提示词、90 秒超时。
 - `repo-governance` 3.0.3：信息分层表新增 `docs/explainers/*.html`，放给人看的设计与原理图解，是 ADR 与代码的派生说明，Agent 不必读取。
 - `delegate` 5.11.0：逐个收取。`wait --stream` 每个任务结束时输出一行结论（`report` 字段给出读答复的命令，不标记已送达），全部结束后退出；不带任务参数时每 5 秒按同一规则重选，期间新派出的任务也纳入。`wait --any` 在任一任务结束时返回，只输出已结束的，其余在 stderr 列出；已送达的具名任务会跳过，重复同一条命令即可收完。两者与宿主无关：能把每行输出变成通知的宿主用 `--stream`，只有结束通知或只能分段调用的宿主用 `--any`（配合 `--max`）。结论块与流式行新增 `sourceDrift{files,overlap}`：worktree 写入任务未 apply 时，报告源工作区自快照以来变化的文件数及与同事改动重叠的文件；有重叠时 `next` 改为提示 `apply` / `--merge` / `reply --sync` 的取舍（`status` 不计算）。协议文档写明三种宿主能力下的收取方式，Claude Code hook 的拒绝提示补充 Monitor + `wait --stream` 与 `wait --any`。
