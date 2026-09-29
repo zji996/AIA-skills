@@ -49,6 +49,9 @@ pub struct Options {
     pub run: Option<String>,
     pub after: Option<String>,
     pub in_run: Option<String>,
+    pub minor: bool,
+    pub over_limit: Option<String>,
+    pub rework: Option<Value>,
 }
 impl Options {
     pub fn new() -> Self {
@@ -129,6 +132,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             "--max",
             "--after",
             "--in",
+            "--over-limit",
         ]
         .contains(&key);
         if takes {
@@ -165,6 +169,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--max" => o.max = Some(seconds(&v)?),
                 "--after" => o.after = Some(v),
                 "--in" => o.in_run = Some(v),
+                "--over-limit" if reply => o.over_limit = Some(v),
                 _ => {}
             }
         } else {
@@ -181,6 +186,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--fresh" => o.fresh = true,
                 "--sync" if reply => o.sync = true,
                 "--wait" if reply => o.wait = true,
+                "--minor" if reply => o.minor = true,
                 "--progress" => o.progress = true,
                 "--full" => o.full = true,
                 "--" => {
@@ -503,6 +509,92 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     }
     launch(o, &prompt, &workdir, mode, &extra, None)
 }
+/// Lines a `--minor` round may change before it counts as a rework after all.
+const MINOR_LINES: u64 = 60;
+/// Characters a `--minor` instruction may have.
+const MINOR_CHARS: usize = 600;
+
+/// Rework rounds already spent in the write conversation ending at `run`: every
+/// rework reply that changed files, plus minor replies that grew past [`MINOR_LINES`].
+/// Also returns the conversation's name (its first run's).
+fn rework_used(run: &Path) -> (u64, String) {
+    let mut used = 0;
+    let mut current = run.to_path_buf();
+    loop {
+        let meta = json(current.join("meta.json"));
+        let changes = &json(current.join("summary.json"))["changes"];
+        let lines =
+            changes["added"].as_u64().unwrap_or(0) + changes["deleted"].as_u64().unwrap_or(0);
+        match s(&meta["rework"], "kind") {
+            // A round that changed nothing (a question, a failed start) is not rework.
+            "rework" if changes["files"].as_u64().unwrap_or(0) > 0 => used += 1,
+            "minor" if lines > MINOR_LINES => used += 1,
+            _ => {}
+        }
+        let parent = s(&meta, "parent");
+        if parent.is_empty() {
+            return (used, s(&meta, "name").to_string());
+        }
+        current = current.with_file_name(parent);
+    }
+}
+
+/// Rework budget for write conversations (`.delegate.json` `maxRework`, default 1):
+/// past it, the caller finishes the work; `--minor` covers short fixes and
+/// `--over-limit REASON` is an explicit, recorded exception.
+fn rework_gate(parent: &Path, meta: &Value, o: &Options, prompt: &str) -> Res<Option<Value>> {
+    if s(meta, "mode") != "write" {
+        if o.minor || o.over_limit.is_some() {
+            return Err("--minor and --over-limit apply to write conversations".into());
+        }
+        return Ok(None);
+    }
+    let top = Some(s(&meta["worktree"], "source"))
+        .filter(|x| !x.is_empty())
+        .unwrap_or(s(meta, "top"));
+    let file = Path::new(top).join(".delegate.json");
+    let limit = if file.is_file() {
+        match serde_json::from_str::<Value>(&read(&file))
+            .map_err(|e| format!("cannot read {}: {e}", file.display()))?
+            .get("maxRework")
+        {
+            None => Some(1),
+            Some(Value::Null) => None,
+            Some(Value::Number(n)) if n.as_u64().is_some() => n.as_u64(),
+            Some(_) => {
+                return Err(format!(
+                    "{}: maxRework must be a non-negative integer or null",
+                    file.display()
+                ))
+            }
+        }
+    } else {
+        Some(1)
+    };
+    let (used, name) = rework_used(parent);
+    if o.minor {
+        let chars = prompt.chars().count();
+        if chars > MINOR_CHARS {
+            return Err(format!(
+                "--minor is for short fixes: the instruction has {chars} characters (limit {MINOR_CHARS}); drop --minor to spend a rework round"
+            ));
+        }
+        return Ok(Some(json!({"kind":"minor","used":used,"limit":limit})));
+    }
+    if let (Some(limit), None) = (limit, &o.over_limit) {
+        if used >= limit {
+            return Err(format!(
+                "rework limit reached ({used}/{limit}) for {name}: finish it yourself (diff {name} --total, apply {name}, then fix in your tree), use reply --minor for a fix under {MINOR_CHARS} characters, or --over-limit '<reason>' to record an exception\n返工次数已用完（{used}/{limit}）：请主控接手（diff/apply 后自己改）；短修正用 --minor（说明不超过 {MINOR_CHARS} 字，改动超过 {MINOR_LINES} 行会补记一次返工）"
+            ));
+        }
+    }
+    let mut record = json!({"kind":"rework","used":used + 1,"limit":limit});
+    if let Some(reason) = &o.over_limit {
+        record["overLimit"] = json!(reason);
+    }
+    Ok(Some(record))
+}
+
 pub fn reply(mut o: Options) -> Res<PathBuf> {
     let parent = runs::latest(runs::resolve(o.run.as_deref().unwrap_or("last"))?);
     let meta = json(parent.join("meta.json"));
@@ -605,7 +697,11 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         })
         .unwrap_or_default();
     if o.timeout.is_none() {
-        o.timeout = Some(s(&meta, "timeout").into());
+        o.timeout = Some(if o.minor {
+            "10m".into()
+        } else {
+            s(&meta, "timeout").into()
+        });
     }
     if !o.accept_set {
         o.accept = meta["accept"].as_str().map(str::to_string);
@@ -614,6 +710,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         o.accept = None;
     }
     let prompt = read_prompt(&mut o)?;
+    o.rework = rework_gate(&parent, &meta, &o, &prompt)?;
     if o.sync && !meta["worktree"].is_object() {
         return Err("--sync requires a worktree conversation".into());
     }
@@ -1025,6 +1122,9 @@ pub fn launch(
     }
     if !o.protect_reasons.is_empty() {
         meta["protectReasons"] = json!(o.protect_reasons);
+    }
+    if let Some(rework) = &o.rework {
+        meta["rework"] = rework.clone();
     }
     write_json(run.join("meta.json"), &meta)?;
     if !extra["sync"].is_null() {

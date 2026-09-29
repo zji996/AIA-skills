@@ -40,7 +40,7 @@
 |---|---|---|
 | `start` | 启动选项（§2.3）＋任务说明 | 创建 run 并启动 supervisor，立即输出一行状态（§3.1）；stderr 提示收取命令 |
 | `run` | 启动选项＋`--max`/`--progress`/`--full` | `start` 后等待，按 §3.2 输出 |
-| `reply <run> [消息]` | `--fresh` `--sync` `--accept` `--hide-accept` `--accept-timeout` `--timeout` `--image` `--name` `--prompt(-file)`；`--wait` 时可用等待选项 | 续接对话并立即返回启动状态；`--wait` 等结论（§7） |
+| `reply <run> [消息]` | `--fresh` `--sync` `--minor` `--over-limit` `--accept` `--hide-accept` `--accept-timeout` `--timeout` `--image` `--name` `--prompt(-file)`；`--wait` 时可用等待选项 | 续接对话并立即返回启动状态；`--wait` 等结论（§7） |
 | `wait [<run>...\|--all]` | `--max` `--no-result` `--full` `--progress` `--any` `--stream` | 等待并输出；无参数按派发会话收取（§9.5），`--all` 取本仓库所有运行中或结果未读取的 run；没有时以 0 退出。`--any` 与 `--stream` 见 §9.5 |
 | `status [<run>...]`（别名 `list`） | | 每个 run 一行状态；无参数列出全部 |
 | `result [<run>] [--path]` | | 输出完整答复（或其路径）；非运行中时标记已读取 |
@@ -302,6 +302,15 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 默认像 `start` 一样立即输出启动状态；`--wait` 像 `run` 一样收取结论与答复，`--max`/`--progress`/`--full` 仅可与 `--wait` 同用。`--sync` 在返回启动状态前完成，冲突时不启动。
 
 `protect` 与可选 `protectReasons` 在普通 reply / fresh 中继承；`--protect` 与 `--protect-reason` 均禁止覆盖。旧 meta 无原因仍正常继承路径。
+
+### 7.4.1 返工预算（5.14，必须）
+
+写入对话的 reply 受仓库 `.delegate.json` 的 `maxRework` 约束（非负整数，缺省 1；`null` 不限；其他类型报错）。沿 `parent` 链统计已用返工：`rework.kind` 为 `rework` 且该轮 `changes.files > 0` 的轮次（提问或零改动的轮次不计），加上 `rework.kind` 为 `minor` 但该轮 `changes.added + deleted > 60` 的轮次（事后补记）。已用 ≥ 上限时 reply 退出码 2，stderr 给出对话名、`diff --total`/`apply` 接手路径与 `--minor` / `--over-limit` 说明，不创建 run。
+
+- `--minor`：短修正，说明不超过 600 字符（超出退出码 2），未指定 `--timeout` 时默认 10m；不计入预算，除非本轮改动超过 60 行。
+- `--over-limit <原因>`：越过预算并把原因记入 meta。
+- 两者只适用于写入对话；只读对话的 reply 不计数，使用这两个选项为用法错误。
+- 写入对话的每个 reply 在 `meta.json` 记 `rework{kind: rework|minor, used, limit, overLimit?}`；`used` 为 `rework` 时含本轮。换 agent/tier 的 reply 同样计数。
 
 ### 7.5 reply --sync（必须）
 

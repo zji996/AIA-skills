@@ -56,6 +56,8 @@ const REPLY: &[(&str, &str)] = &[
     ("--wait", "Wait for the reply's outcome and answer instead of returning after launch."),
     ("--agent", "Hand the conversation to this agent; a change of agent starts a fresh session."),
     ("--tier cheap|strong", "Hand the conversation to this tier; a change of agent starts a fresh session."),
+    ("--minor", "Write conversations: a short fix (message up to 600 characters, default timeout 10m) outside the rework budget; a round that changes more than 60 lines counts after all."),
+    ("--over-limit REASON", "Write conversations: reply past the .delegate.json maxRework budget (default 1) and record why."),
 ];
 
 const COMMANDS: &[(&str, &str)] = &[
