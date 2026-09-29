@@ -5,6 +5,7 @@
 - 给落地页生成一张横版 hero 配图，存到 `public/hero.png`。
 - 做一组 1024 的游戏道具图标素材。
 - Generate a cover image for this blog post and save it under assets/.
+- 给这份设计文档生成一张带中文标签的架构总览图，放到 `docs/explainers/` 下。
 
 ## 不应触发
 

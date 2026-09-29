@@ -57,10 +57,10 @@ class ScriptTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.work = Path(self.temp.name)
 
-    def run_script(self, script, *args, env=None):
+    def run_script(self, script, *args, env=None, input=None):
         # The installer's own tests must not reach the network or a compiler for delegate's binary.
         env = {**(env if env is not None else os.environ), "AIA_SKILLS_SKIP_BINARIES": "1"}
-        return subprocess.run([str(script), *map(str, args)], cwd=self.work, env=env,
+        return subprocess.run([str(script), *map(str, args)], cwd=self.work, env=env, input=input,
                               capture_output=True, text=True, timeout=15)
 
     def test_install_rejects_traversal_without_touching_existing_data(self):
@@ -715,6 +715,39 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(output.read_bytes(), b"image-bytes")
         self.assertEqual(handler.request_path, "/v1/images/generations")
         self.assertEqual(handler.request_data["model"], "gpt-image-2.5-sunburst")
+
+    def test_image_prompt_file_and_stdin(self):
+        prompt = 'Infographic.\nTEXT RULES: only "长期记忆" and "会话 1"; quotes stay intact.'
+        prompt_file = self.work / "hero.prompt.txt"
+        prompt_file.write_text(prompt)
+        for args, stdin in [(("-f", prompt_file), None), (("--prompt-file", "-"), prompt)]:
+            with self.subTest(args=args):
+                server, handler = self.image_server()
+                result = self.run_script(IMAGE, *args, "-o", self.work / "image.png", "-b",
+                                         f"http://127.0.0.1:{server.server_port}", env=self.image_env(),
+                                         input=stdin)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(handler.request_data["prompt"], prompt)
+
+    def test_image_prompt_sources_are_exclusive_and_non_empty(self):
+        both = self.run_script(IMAGE, "-p", "demo", "-f", "-", "-o", "image.png", env=self.image_env())
+        self.assertEqual(both.returncode, 2)
+        blank = self.work / "blank.txt"
+        blank.write_text("  \n")
+        empty = self.run_script(IMAGE, "-f", blank, "-o", "image.png", env=self.image_env())
+        self.assertEqual(empty.returncode, 1)
+        missing = self.run_script(IMAGE, "-f", self.work / "none.txt", "-o", "image.png", env=self.image_env())
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("not found", missing.stderr)
+
+    def test_image_output_mode_follows_umask(self):
+        server, _ = self.image_server()
+        output = self.work / "image.png"
+        result = subprocess.run(["bash", "-c", 'umask 022 && exec "$@"', "_", str(IMAGE), "-p", "demo",
+                                 "-o", str(output), "-b", f"http://127.0.0.1:{server.server_port}"],
+                                cwd=self.work, env=self.image_env(), capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output.stat().st_mode & 0o777, 0o644)
 
     def test_image_failure_preserves_existing_output(self):
         for status, data in [(500, {"error": {"message": "rejected"}}),

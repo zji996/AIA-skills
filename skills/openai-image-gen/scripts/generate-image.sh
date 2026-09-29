@@ -5,9 +5,11 @@ usage() {
   cat <<'EOF' >&2
 Usage:
   generate-image.sh --prompt "<prompt>" --output "<path>" [options]
+  generate-image.sh --prompt-file <file|-> --output "<path>" [options]
 
 Options:
-  -p, --prompt <text>      Image description prompt (Required)
+  -p, --prompt <text>      Image description prompt (this or --prompt-file is required)
+  -f, --prompt-file <path> Read the prompt from a file, or from stdin with "-"
   -o, --output <file>      Local file path to save image (e.g. assets/hero.png) (Required)
   -m, --model <name>       Model name (default: "gpt-image-2.5-sunburst")
   -s, --size <dims>        Image dimensions (e.g. "1024x1024", "1536x1024", "1024x1536"; default: "1024x1024")
@@ -27,6 +29,7 @@ EOF
 }
 
 PROMPT=""
+PROMPT_FILE=""
 OUTPUT=""
 MODEL="gpt-image-2.5-sunburst"
 SIZE="1024x1024"
@@ -39,6 +42,11 @@ while [[ $# -gt 0 ]]; do
     -p|--prompt)
       [[ $# -ge 2 && -n "$2" ]] || usage
       PROMPT="$2"
+      shift 2
+      ;;
+    -f|--prompt-file)
+      [[ $# -ge 2 && -n "$2" ]] || usage
+      PROMPT_FILE="$2"
       shift 2
       ;;
     -o|--output)
@@ -81,8 +89,23 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$PROMPT" ]]; then
-  echo "Error: --prompt is required." >&2
+if [[ -n "$PROMPT" && -n "$PROMPT_FILE" ]]; then
+  echo "Error: use either --prompt or --prompt-file, not both." >&2
+  exit 2
+fi
+if [[ -n "$PROMPT_FILE" ]]; then
+  if [[ "$PROMPT_FILE" = "-" ]]; then
+    PROMPT="$(cat)"
+  elif [[ -f "$PROMPT_FILE" ]]; then
+    PROMPT="$(cat -- "$PROMPT_FILE")"
+  else
+    echo "Error: prompt file not found: $PROMPT_FILE" >&2
+    exit 1
+  fi
+fi
+
+if [[ -z "${PROMPT//[[:space:]]/}" ]]; then
+  echo "Error: --prompt or --prompt-file is required and must not be empty." >&2
   exit 1
 fi
 
@@ -215,6 +238,8 @@ if [[ ! -s "$TMP_IMAGE" ]]; then
   echo "Error: Image response was empty." >&2
   exit 1
 fi
+# mktemp creates 0600; give the image the same mode as any file created under the caller's umask.
+chmod "$(printf '%o' $(( 0666 & ~$(umask) )))" "$TMP_IMAGE"
 mv -f -- "$TMP_IMAGE" "$OUTPUT"
 
 # Output a clean JSON status line for high signal-to-noise ratio in agent context
