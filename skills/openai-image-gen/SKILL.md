@@ -16,7 +16,7 @@ $G edit  -o docs/img/arch.webp -f fix.txt                         # 局部修正
 $G status -o docs/img/arch.webp
 ```
 
-每次调用都收费。草稿用快速模型、low 质量和小尺寸，比正式图便宜得多，所以构图靠草稿来定，正式图只出一次。
+每次调用都收费。草稿用快速模型和 low 质量，网关支持时还会缩小尺寸，比正式图便宜得多，所以构图靠草稿来定，正式图只出一次。
 
 ## 流程
 
@@ -33,6 +33,7 @@ $G status -o docs/img/arch.webp
 - **超出上限**：退出码为 3，输出 `"status":"refused"`，不会请求接口。只有用户明确同意多花钱，才加 `--allow-extra`。
 - **`reset`**：只在同一路径要做一张新图时使用，不能用来绕过上限。
 - **结果**：一行 JSON，包含 `file`、`budget`，以及给出下一步的 `next`。草稿和状态存放在 `$XDG_STATE_HOME/openai-image-gen/` 下，不进项目目录。
+- **实际尺寸与格式**：`returned` 是图片的实际格式和尺寸。有的网关会忽略 `size` 和格式，这时结果带 `warning`：HTML 里的 width/height 要按实际尺寸写，需要特定格式时自行转换。
 - **失败**：退出码为 1，错误写在 stderr，已有的目标文件保持不动，也不计次数。
 
 ## 要点

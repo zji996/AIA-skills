@@ -120,6 +120,17 @@ class ImagegenTests(unittest.TestCase):
         self.assertEqual(handler.requests[2]["path"], "/v1/images/generations")
         self.assertEqual(handler.requests[2]["data"]["prompt"], self.prompt)
 
+    def test_reports_what_the_gateway_really_returned(self):
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + (1672).to_bytes(4, "big") + (941).to_bytes(4, "big")
+        handler = self.server(data={"data": [{"b64_json": base64.b64encode(png).decode()}]})
+        draft = self.draft("-s", "2560x1440")
+        self.assertEqual(draft["returned"], "png 1672x941")
+        self.assertIn("requested webp 1536x864", draft["warning"])
+        self.assertTrue(draft["file"].endswith("draft-1.png"))
+        final = self.ok("final", "-o", self.output, "-b", self.base)
+        self.assertIn("requested webp 2560x1440", final["warning"])
+        self.assertIn(b"Content-Type: image/png", handler.requests[1]["data"]["_raw"])
+
     def test_final_needs_a_draft_and_takes_a_corrected_prompt(self):
         handler = self.server()
         refused = self.run_cmd("final", "-o", self.output, "-b", self.base)

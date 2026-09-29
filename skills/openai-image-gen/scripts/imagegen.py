@@ -25,6 +25,10 @@ LAYOUT_LOCK = ("\n\nThe attached image is the approved draft. Use it only as the
                "exactly spelled text as listed above.")
 
 
+# The edits endpoint rejects parts without an image MIME type.
+IMAGE_TYPES = {"png": "image/png", "webp": "image/webp", "jpeg": "image/jpeg", "unknown": "image/png"}
+
+
 class Refusal(Exception):
     """A request the budget or workflow does not allow; exit code 3."""
 
@@ -149,7 +153,7 @@ def multipart(fields, files):
         parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
     for name, path in files:
         head = (f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; filename="{Path(path).name}"\r\n'
-                f"Content-Type: application/octet-stream\r\n\r\n")
+                f"Content-Type: {IMAGE_TYPES[sniff(Path(path).read_bytes())[0]]}\r\n\r\n")
         parts.append(head.encode() + Path(path).read_bytes() + b"\r\n")
     parts.append(f"--{boundary}--\r\n".encode())
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"
@@ -205,6 +209,39 @@ def write_atomic(path, data):
     os.replace(tmp, path)
 
 
+def sniff(data):
+    """(format, width, height) read from the image header; gateways may ignore size and format."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
+        return "png", int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP" and len(data) >= 30:
+        chunk = data[12:16]
+        if chunk == b"VP8X":
+            return "webp", int.from_bytes(data[24:27], "little") + 1, int.from_bytes(data[27:30], "little") + 1
+        if chunk == b"VP8L":
+            bits = int.from_bytes(data[21:25], "little")
+            return "webp", (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        return "webp", int.from_bytes(data[26:28], "little") & 0x3FFF, int.from_bytes(data[28:30], "little") & 0x3FFF
+    if data[:2] == b"\xff\xd8":
+        index = 2
+        while index + 9 < len(data) and data[index] == 0xFF:
+            marker, length = data[index + 1], int.from_bytes(data[index + 2:index + 4], "big")
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                return "jpeg", int.from_bytes(data[index + 7:index + 9], "big"), int.from_bytes(data[index + 5:index + 7], "big")
+            index += 2 + length
+        return "jpeg", 0, 0
+    return "unknown", 0, 0
+
+
+def returned(data, fmt, size):
+    """What the API actually sent back, with a warning when it ignored the request."""
+    got, width, height = sniff(data)
+    info = {"returned": f"{got} {width}x{height}"}
+    if got != fmt or f"{width}x{height}" != size:
+        info["warning"] = (f"requested {fmt} {size} but got {got} {width}x{height}; the gateway ignored it. "
+                           "Use the real size in HTML width/height and convert the format if it matters.")
+    return info
+
+
 # --- commands ---------------------------------------------------------------------------
 
 def cmd_draft(args, state):
@@ -217,15 +254,17 @@ def cmd_draft(args, state):
     number = len(state["drafts"]) + 1
     directory = state_dir(args.output)
     started = time.monotonic()
+    size = draft_size(width, height)
     data = request_image(args, model=args.model or DRAFT_MODEL, quality=args.quality or DRAFT_QUALITY,
-                         size=draft_size(width, height), prompt=prompt, fmt="webp")
-    file = directory / f"draft-{number}.webp"
+                         size=size, prompt=prompt, fmt="webp")
+    got = sniff(data)[0]
+    file = directory / f"draft-{number}.{'jpg' if got == 'jpeg' else got}"
     write_atomic(file, data)
     (directory / f"draft-{number}.prompt.txt").write_text(prompt, encoding="utf-8")
     state["drafts"].append({"n": number, "file": str(file)})
     save_state(args.output, state)
     emit(status="ok", step="draft", draft=number, file=str(file), seconds=round(time.monotonic() - started),
-         budget=budget_view(state),
+         **returned(data, "webp", size), budget=budget_view(state),
          next=f"Review the draft for layout, arrows and text placement. If it works: final -o {args.output}"
               f" [--draft {number}]; otherwise fix the prompt and draft again.")
 
@@ -242,8 +281,9 @@ def cmd_final(args, state):
     spend(state, "finals", args.allow_extra)
     fmt = image_format(args.output, args.format)
     started = time.monotonic()
+    size = checked_size(args.size) or state["size"]
     data = request_image(args, model=args.model or FINAL_MODEL, quality=args.quality or FINAL_QUALITY,
-                         size=checked_size(args.size) or state["size"], fmt=fmt,
+                         size=size, fmt=fmt,
                          prompt=prompt if args.fresh else prompt + LAYOUT_LOCK,
                          reference=None if args.fresh else chosen["file"])
     write_atomic(args.output, data)
@@ -252,7 +292,7 @@ def cmd_final(args, state):
     state["finals"] += 1
     save_state(args.output, state)
     emit(status="ok", step="final", file=args.output, from_draft=pick, seconds=round(time.monotonic() - started),
-         budget=budget_view(state),
+         **returned(data, fmt, size), budget=budget_view(state),
          next="Check every text string at full size and the arrows. For one local defect: edit -o "
               f"{args.output} -f fix.txt (one edit allowed). Otherwise report the remaining flaws.")
 
@@ -269,14 +309,14 @@ def cmd_edit(args, state):
     before = directory / f"before-edit-{state['edits'] + 1}{Path(args.output).suffix}"
     before.write_bytes(Path(args.output).read_bytes())
     started = time.monotonic()
+    size, fmt = checked_size(args.size) or state["size"], image_format(args.output, args.format)
     data = request_image(args, model=args.model or FINAL_MODEL, quality=args.quality or FINAL_QUALITY,
-                         size=checked_size(args.size) or state["size"], prompt=prompt,
-                         fmt=image_format(args.output, args.format), reference=str(before))
+                         size=size, prompt=prompt, fmt=fmt, reference=str(before))
     write_atomic(args.output, data)
     state["edits"] += 1
     save_state(args.output, state)
     emit(status="ok", step="edit", file=args.output, previous=str(before),
-         seconds=round(time.monotonic() - started), budget=budget_view(state),
+         seconds=round(time.monotonic() - started), **returned(data, fmt, size), budget=budget_view(state),
          next="Compare with the previous version; keep whichever is better. No further edits without approval.")
 
 
