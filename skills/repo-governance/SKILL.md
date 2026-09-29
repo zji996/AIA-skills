@@ -3,7 +3,7 @@ name: repo-governance
 description: 仓库上下文治理。当需要搭建或整理 AGENTS.md、docs/current.md、决策记录，或检查 token 预算、上下文健康度、文档漂移时使用；附带只读审计脚本。Use for repo context governance, token budget, context health, docs drift audit.
 license: MIT
 metadata:
-  version: "3.0.2"
+  version: "3.0.3"
 ---
 
 # Repo Governance (仓库上下文治理)
@@ -44,6 +44,7 @@ metadata:
 | `docs/current.md` | 当前焦点、阻塞项、≤5 条下一步，以及尚未收口的状态（未验证、已提交未生效、已知风险） | 长任务的断点，每个会话都读；已完成、已上线的记录在提交信息里，完成即清理 |
 | `docs/reference/` | 已验证的稳定架构事实 | 与规划混在一起会误导接手者，规划内容需标注 *Proposed* |
 | `docs/decision/` | 影响深远的选型、备选方案与理由 | 代码能说明"是什么"，说明不了"为什么没选别的" |
+| `docs/explainers/*.html` | 给人看的设计与原理图解：图示、流程、界面示意 | Markdown 画不好图，人读 HTML 更快；它是 ADR 与代码的派生说明，Agent 不必读取，随 ADR 修订同步 |
 | `docs/roadmap.md` | 长期方向与里程碑 | 与当前任务解耦，避免 `current.md` 膨胀 |
 | `.local/`（整体 gitignore） | 运行产物、任务草稿 `.local/plan/` | 临时内容不进版本库；稳定结论在任务结束前回填到上面几层 |
 
