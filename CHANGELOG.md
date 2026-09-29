@@ -4,6 +4,7 @@
 
 ### 技能
 
+- `openai-image-gen` 2.0.0（不兼容）：`generate-image.sh` 换成标准库 Python 脚本 `imagegen.py`，不再依赖 curl/jq，分为 `draft`/`final`/`edit`/`status`/`reset` 子命令。`draft` 用 `gpt-image-2.5-flare`、`low`、同比例缩到长边 1536 出草稿，存在 `$XDG_STATE_HOME/openai-image-gen/` 下；`final` 默认用 `gpt-image-2.5-sunburst`、`high`，以选中的草稿作 edits 参考并追加保持构图的指令，可用 `-f` 换修正后的提示词，`--fresh` 从头生成；`edit` 只能在正式图之后，原图留作 `previous`。每个输出路径限定草稿 3、正式 1、编辑 1 次（只计成功调用），超出以退出码 3 拒绝且不请求接口，`--allow-extra` 仅在用户同意时使用。结果 JSON 带 `budget` 与 `next`。SKILL.md 精简为流程与预算，提示词写法、模型与尺寸细节移到 `references/prompting.md`。起因：一张架构海报用了约 8 次正式档调用。
 - `openai-image-gen` 1.3.0：新增 `-i/--image` 走 edits 接口在已有图上局部修改（multipart，提示词经文件传，引号与换行不丢）；`--format` 与 `--compression`，输出扩展名为 `.webp`/`.jpg` 时自动请求对应格式；结果 JSON 增加 `quality`、`mode` 与 `seconds`。SKILL.md 按 gpt-image-2.5 更新：sunburst 与 flare 的取舍、`xhigh`/`max` 何时用（实测 2560x1440 下 `xhigh` 与 `high` 耗时相当）、任意尺寸的约束、文档配图用 webp、连续编辑会让别处走样、箭头方向跟随元素位置、费用意识与“差不多就行”时停手。
 - `openai-image-gen` 1.2.0：新增 `--prompt-file <文件|->`，长提示词从文件或 stdin 读取，不再受 shell 引号限制；与 `--prompt` 互斥，空提示词报错。输出图片的权限改按调用者 umask（此前沿用 mktemp 的 0600，别人和 Web 服务读不到）。SKILL.md 补充示意图与带文字画面的写法：按 LAYOUT / STYLE / TEXT RULES / AVOID 分节，箭头写明起止元素，列全文字串并禁止其它文字；提示词一律用英文，画面文字保留原语言；提示词存成输出旁的 `.prompt.txt`；逐字核对后再迭代；`high` 质量单次约 45 秒，超时不低于 300 秒。起因：一次中文架构图请求只用了一句中文提示词、90 秒超时。
 - `repo-governance` 3.0.3：信息分层表新增 `docs/explainers/*.html`，放给人看的设计与原理图解，是 ADR 与代码的派生说明，Agent 不必读取。

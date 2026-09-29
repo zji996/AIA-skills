@@ -1,4 +1,3 @@
-import base64
 import hashlib
 import importlib.util
 import json
@@ -8,9 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import unittest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -22,35 +19,10 @@ RELEASE = ROOT / "scripts/release-binary.sh"
 VERIFY = ROOT / "scripts/verify.sh"
 INSTALL_HOOKS = ROOT / "scripts/install-git-hooks.sh"
 BOOTSTRAP = ROOT / "scripts/bootstrap.sh"
-IMAGE = ROOT / "skills/openai-image-gen/scripts/generate-image.sh"
 SNAPSHOT = ROOT / "skills/agent-handoff/scripts/handoff-snapshot.sh"
 AUDIT = ROOT / "skills/repo-governance/scripts/audit-context.py"
 BACKGROUND_HOOK = ROOT / "skills/delegate/hooks/claude-code-background.py"
 ADR_INDEX = ROOT / "skills/repo-governance/scripts/adr-index.py"
-
-
-class ImageHandler(BaseHTTPRequestHandler):
-    response_status = 200
-    response_data = {"data": [{"b64_json": base64.b64encode(b"image-bytes").decode()}]}
-    request_path = None
-    request_data = None
-    request_auth = None
-
-    def do_POST(self):
-        type(self).request_path = self.path
-        type(self).request_auth = self.headers.get("Authorization")
-        body = self.rfile.read(int(self.headers["Content-Length"]))
-        multipart = self.headers.get("Content-Type", "").startswith("multipart/")
-        type(self).request_data = {"multipart": body} if multipart else json.loads(body)
-        payload = json.dumps(self.response_data).encode()
-        self.send_response(self.response_status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def log_message(self, *_args):
-        pass
 
 
 class ScriptTests(unittest.TestCase):
@@ -691,160 +663,6 @@ class ScriptTests(unittest.TestCase):
         self.assertTrue(text.startswith("# Index\n\nintro\n") and text.endswith("\ntail\n"))
         self.assertEqual(self.run_script(ADR_INDEX, "--repo", repo).returncode, 0)
         self.assertEqual(self.run_script(AUDIT, "--repo", repo).returncode, 0)
-
-    def image_server(self, status=200, data=None):
-        handler = type("Response", (ImageHandler,), {
-            "response_status": status,
-            "response_data": data if data is not None else ImageHandler.response_data,
-        })
-        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        self.addCleanup(server.server_close)
-        self.addCleanup(server.shutdown)
-        return server, handler
-
-    def image_env(self):
-        return {**os.environ, "OPENAI_API_KEY": "test-only", "CODEX_HOME": str(self.work / "no-codex")}
-
-    def test_image_success_uses_valid_model_and_one_v1(self):
-        server, handler = self.image_server()
-        output = self.work / "image.png"
-        output.write_bytes(b"original")
-        result = self.run_script(IMAGE, "-p", "demo", "-o", output, "-b",
-                                 f"http://127.0.0.1:{server.server_port}/v1", env=self.image_env())
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(output.read_bytes(), b"image-bytes")
-        self.assertEqual(handler.request_path, "/v1/images/generations")
-        self.assertEqual(handler.request_data["model"], "gpt-image-2.5-sunburst")
-
-    def test_image_prompt_file_and_stdin(self):
-        prompt = 'Infographic.\nTEXT RULES: only "长期记忆" and "会话 1"; quotes stay intact.'
-        prompt_file = self.work / "hero.prompt.txt"
-        prompt_file.write_text(prompt)
-        for args, stdin in [(("-f", prompt_file), None), (("--prompt-file", "-"), prompt)]:
-            with self.subTest(args=args):
-                server, handler = self.image_server()
-                result = self.run_script(IMAGE, *args, "-o", self.work / "image.png", "-b",
-                                         f"http://127.0.0.1:{server.server_port}", env=self.image_env(),
-                                         input=stdin)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(handler.request_data["prompt"], prompt)
-
-    def test_image_prompt_sources_are_exclusive_and_non_empty(self):
-        both = self.run_script(IMAGE, "-p", "demo", "-f", "-", "-o", "image.png", env=self.image_env())
-        self.assertEqual(both.returncode, 2)
-        blank = self.work / "blank.txt"
-        blank.write_text("  \n")
-        empty = self.run_script(IMAGE, "-f", blank, "-o", "image.png", env=self.image_env())
-        self.assertEqual(empty.returncode, 1)
-        missing = self.run_script(IMAGE, "-f", self.work / "none.txt", "-o", "image.png", env=self.image_env())
-        self.assertEqual(missing.returncode, 1)
-        self.assertIn("not found", missing.stderr)
-
-    def test_image_output_mode_follows_umask(self):
-        server, _ = self.image_server()
-        output = self.work / "image.png"
-        result = subprocess.run(["bash", "-c", 'umask 022 && exec "$@"', "_", str(IMAGE), "-p", "demo",
-                                 "-o", str(output), "-b", f"http://127.0.0.1:{server.server_port}"],
-                                cwd=self.work, env=self.image_env(), capture_output=True, text=True, timeout=15)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(output.stat().st_mode & 0o777, 0o644)
-
-    def test_image_format_follows_extension_and_validates_compression(self):
-        server, handler = self.image_server()
-        result = self.run_script(IMAGE, "-p", "demo", "-o", self.work / "poster.webp", "--compression", "80",
-                                 "-b", f"http://127.0.0.1:{server.server_port}", env=self.image_env())
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(handler.request_data["output_format"], "webp")
-        self.assertEqual(handler.request_data["output_compression"], 80)
-        for args in (("--compression", "80"), ("--format", "gif")):
-            with self.subTest(args=args):
-                bad = self.run_script(IMAGE, "-p", "demo", "-o", "x.png", *args, env=self.image_env())
-                self.assertEqual(bad.returncode, 2)
-
-    def test_image_edit_posts_multipart_with_prompt_file(self):
-        server, handler = self.image_server()
-        source = self.work / "source.png"
-        source.write_bytes(b"source-bytes")
-        prompt = 'Keep everything; fix "Anthropic".\nSecond line.'
-        result = self.run_script(IMAGE, "-f", "-", "-i", source, "-o", self.work / "fixed.png", "-b",
-                                 f"http://127.0.0.1:{server.server_port}", env=self.image_env(), input=prompt)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(handler.request_path, "/v1/images/edits")
-        body = handler.request_data["multipart"]
-        self.assertIn(prompt.encode(), body)
-        self.assertIn(b"source-bytes", body)
-        self.assertIn(b'name="image[]"', body)
-        self.assertEqual(json.loads(result.stdout)["mode"], "edit")
-        missing = self.run_script(IMAGE, "-p", "demo", "-i", self.work / "none.png", "-o", "x.png",
-                                  env=self.image_env())
-        self.assertEqual(missing.returncode, 1)
-
-    def test_image_failure_preserves_existing_output(self):
-        for status, data in [(500, {"error": {"message": "rejected"}}),
-                             (200, {"data": [{"b64_json": "invalid!"}]}),
-                             (200, {"data": [{"url": "http://example.com/image.png"}]})]:
-            with self.subTest(status=status, data=data):
-                server, _ = self.image_server(status, data)
-                output = self.work / "image.png"
-                output.write_bytes(b"original")
-                result = self.run_script(IMAGE, "-p", "demo", "-o", output, "-b",
-                                         f"http://127.0.0.1:{server.server_port}", env=self.image_env())
-                self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(output.read_bytes(), b"original")
-
-    def test_image_config_uses_selected_provider(self):
-        server, handler = self.image_server()
-        config = self.work / "codex"
-        config.mkdir()
-        (config / "config.toml").write_text(
-            'model_provider = "selected"\n'
-            '[model_providers.decoy]\nbase_url = "http://invalid.example/v1"\n'
-            '[model_providers.selected]\n'
-            f'base_url = "http://127.0.0.1:{server.server_port}/v1"\n'
-            '[model_providers.selected.http_headers]\nAuthorization = "Bearer selected-key"\n'
-        )
-        env = {key: value for key, value in os.environ.items()
-               if key not in ("OPENAI_API_KEY", "OPENAI_BASE_URL")}
-        env["CODEX_HOME"] = str(config)
-        result = self.run_script(IMAGE, "-p", "demo", "-o", self.work / "image.png", env=env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(handler.request_path, "/v1/images/generations")
-
-    def codex_home(self, provider_lines, auth_key=None):
-        config = self.work / "codex"
-        config.mkdir(exist_ok=True)
-        (config / "config.toml").write_text('model_provider = "selected"\n[model_providers.selected]\n' + provider_lines)
-        if auth_key:
-            (config / "auth.json").write_text(json.dumps({"OPENAI_API_KEY": auth_key}))
-        env = {key: value for key, value in os.environ.items()
-               if key not in ("OPENAI_API_KEY", "OPENAI_BASE_URL")}
-        env["CODEX_HOME"] = str(config)
-        return env
-
-    def test_image_selected_provider_wins_over_auth_json(self):
-        server, handler = self.image_server()
-        env = self.codex_home(
-            f'base_url = "http://127.0.0.1:{server.server_port}"\n'
-            'http_headers = { "Authorization" = "Bearer provider-key" }\n', auth_key="auth-key")
-        result = self.run_script(IMAGE, "-p", "demo", "-o", self.work / "image.png", env=env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(handler.request_auth, "Bearer provider-key")
-
-    def test_image_auth_json_follows_provider_that_requires_openai_auth(self):
-        server, handler = self.image_server()
-        env = self.codex_home(
-            f'base_url = "http://127.0.0.1:{server.server_port}/v1"\nrequires_openai_auth = true\n',
-            auth_key="auth-key")
-        result = self.run_script(IMAGE, "-p", "demo", "-o", self.work / "image.png", env=env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(handler.request_auth, "Bearer auth-key")
-
-    def test_image_missing_value_shows_usage(self):
-        result = self.run_script(IMAGE, "--prompt", "demo", "--output")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("Usage:", result.stderr)
 
 
 if __name__ == "__main__":
