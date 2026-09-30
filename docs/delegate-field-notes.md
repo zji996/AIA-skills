@@ -221,6 +221,13 @@
 - 处理：删掉 `./manage.sh` 规则，只保留 `make check/verify/build`；仓库脚本的全量入口靠 `make` 目标与 hint 引导。
 - 启示：可以提供 `delegate config check`（或 `start --dry-run`）在提交 `.delegate.json` 前校验；文档里注明“仓库内脚本不能作为 agentDeny 目标，拦它的 make 包装”。
 
+## 二十、上下文压缩后旧的后台 `wait --any` 仍占着任务（image-shard-studio，2026-10-01）
+
+- 现象：主控上下文压缩后再放一个后台 `wait --any`，它对三个运行中任务报“已由 pid N 等待，结束时会通知那一个 (exit 76)”，只等剩下的一个；那三个任务完工后结论落到压缩前的后台任务里，新会话收不到通知，靠 `status` 才发现它们早已 delivered/rejected。
+- 原因：压缩前放的 `wait --any` 仍在运行并按设计持有 `waiter.lock`；完成通知属于旧上下文。delegate 行为正确，是主控续接时没意识到还有旧等待者。
+- 处理：看到 exit 76 行时先 `status --json` 列出全部结局，直接 `result`/`apply` 已结束的任务。
+- 启示：可在 76 提示后附“若该 pid 属于已压缩/已结束的会话，用 `delegate status` 查看结局”；续接会话的第一步用 `status` 而不是再放一个 `wait`。
+
 ## 待改进（按收益排序）
 
 1. ~~`apply` 默认忽略"仅初始化"的子模块变化~~（5.1.0 已完成）
