@@ -1,0 +1,37 @@
+A clean architecture poster explaining "delegate", a command-line tool that lets a lead coding agent hand bounded tasks to worker agents and read back only the results. It should read like the hero slide of an engineering talk: precise, calm, premium, readable from a distance. Landscape 16:9.
+
+STYLE ("black liquid glass"): near-black canvas #050508, flat and fully opaque edge to edge. Every block is a liquid-glass card: dark translucent fill #0A0A0F, 16 px rounded corners, a hairline white border at 8 % opacity, a thin bright highlight along the top edge, a soft black drop shadow. Only light effect: thin light-streaks along a few card edges; no bloom, no haze, no glow clouds. Accent colors used sparingly: gold #FFC600 only for the lead agent card, the return arrow and the result card outline; sapphire blue #2F6FED for the main flow arrows and the "强档 · Codex" card; teal green #3FAE7F for the "便宜档 · Pi" card and the acceptance check; neutral grey #8B93A3 for secondary lines and the bottom strip. Main text #F2F3F5. No purple, no neon, no cyberpunk. All text crisp with single clean edges, never ghosted or doubled.
+
+LAYOUT. A title at the top-left, one main flow row across the middle (about 60 % of the height) running left to right, and a slim infrastructure strip along the bottom. Generous empty space between elements.
+
+TITLE, top-left: "delegate 委派结构" in large bold type. Directly below it in smaller grey type: "按结果委派，主控只看结论".
+
+MAIN FLOW, five columns from left to right:
+
+1. Far left: a tall card with a gold border titled "主控". Under the title a small grey caption "Claude Code · Codex · Pi". Inside, three stacked pill buttons labeled "start", "wait", "apply".
+
+2. Second column: a card titled "delegate CLI" containing two stacked inner chips: "supervisor" and "worktree 快照".
+
+3. Third column: two cards stacked vertically with a gap between them:
+   - top card, teal border: title "便宜档 · Pi", caption "只读侦察 · 界面 · 看图";
+   - bottom card, sapphire border: title "强档 · Codex", caption "写代码 · 严密审查".
+   A short dashed teal arrow goes straight down from the bottom edge of the "便宜档 · Pi" card to the top edge of the "强档 · Codex" card, with a small label beside it: "失败自动升档".
+
+4. Fourth column: a card with a teal border titled "验收", containing two chips: "--accept" and "lane 队列".
+
+5. Far right: a card with a gold outline titled "结论", with the caption "一行 JSON". Inside, three small key chips in a row: "state", "changes", "next"; below them three small status tags in a row: "delivered" (green text), "answered" (blue text), "rejected" (orange text).
+
+CONNECTIONS. Each arrow is listed with its exact start and end; draw no other arrows.
+   - A thin sapphire arrow from the right edge of "主控" to the left edge of "delegate CLI".
+   - From the right edge of "delegate CLI", two thin sapphire arrows fan out: one ends at the left edge of "便宜档 · Pi", the other at the left edge of "强档 · Codex".
+   - From the right edges of "便宜档 · Pi" and "强档 · Codex", two thin sapphire arrows converge on the left edge of "验收".
+   - A thin sapphire arrow from the right edge of "验收" to the left edge of "结论".
+   - A thick gold line rises from the top edge of "结论" with NO arrowhead at that end, arcs high over the whole flow row, and ends with a single arrowhead pointing down into the top edge of "主控". It is one-directional: results flow back to the lead agent only. Small gold label on its highest point: "wait · 后台通知".
+
+BOTTOM STRIP: one long, low glass bar across the full width, containing four evenly spaced grey chips with small line icons: "容量 8 · 强档 4", "cgroup 回收", "lane 一次一个", ".local/run/delegate/".
+
+TEXT RULES: The poster contains only the following strings, each written exactly as given, horizontally, in a clean bold sans-serif similar to Source Han Sans / PingFang SC for Chinese and a clean monospace-like sans for code words:
+"delegate 委派结构", "按结果委派，主控只看结论", "主控", "Claude Code · Codex · Pi", "start", "wait", "apply", "delegate CLI", "supervisor", "worktree 快照", "便宜档 · Pi", "只读侦察 · 界面 · 看图", "强档 · Codex", "写代码 · 严密审查", "失败自动升档", "验收", "--accept", "lane 队列", "结论", "一行 JSON", "state", "changes", "next", "delivered", "answered", "rejected", "wait · 后台通知", "容量 8 · 强档 4", "cgroup 回收", "lane 一次一个", ".local/run/delegate/".
+Card titles are the largest labels after the main title; captions and chips are smaller but clearly legible. No other words, numbers, code, logos, watermarks or pseudo-text anywhere.
+
+AVOID: 3D or isometric perspective, people, robots, faces, brains, circuit-board textures, starfields, particles, lens flares, purple or neon light, cluttered icons, overlapping labels, text running off the edge. Keep at least 48 px of empty margin around the whole composition.

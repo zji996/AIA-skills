@@ -22,6 +22,9 @@
 | **`agent-handoff`** | `skills/agent-handoff/` | **会话交接**：`handoff-snapshot.sh` 自动采集分支、HEAD、未提交文件、最近提交、`.local/run/delegate/` 与旧 `.local/run/pi/` 的未读取委派任务和未合并 worktree，生成交接账本草稿。 |
 | **`delegate`** | `skills/delegate/` | **同事 Agent 委派**：后台运行 Pi/Codex，按会话逐个收取；`completionTiming` 区分旧结果与等待中新完成，`finishedAt` 记录终态时间。写入用 `--worktree` 隔离、`--protect-reason` 划分所有权并要求报告阻碍；`pendingChanges` 提示累计待合入量。`apply` 报告生成排队进度、失败重试、编号前缀预警及保守的源码快照验收复用结论（`acceptStillValid`），可按 `applyVerify` 在合并后复验；`start` 提示与运行中写入任务的文件重叠。`.delegate.json` 支持依赖准备、环境、生成与默认验收；Rust 管理整机容量、lane 和后台进程回收。长答复全文保存在 run 中。 |
 | **`openai-image-gen`** | `skills/openai-image-gen/` | **图像生成落盘**：先用便宜模型打草稿定构图，再以草稿为参考出一次正式图；每个输出文件限定草稿 3、正式 1、编辑 1 次，超出需用户同意；只返回一行 JSON；附示意图提示词结构与审查要点。 |
+| **`scroll-gesture`** | `skills/scroll-gesture/` | **滚动手势**：`input-probe.html` 在目标环境（Windows 鼠标、远程桌面、触屏）实测滚轮与触摸事件的频率、间隔、增量与鼠标格占比，一键复制 JSON；附过界翻页等自定义手势的判断点：时间只区分惯性、结果交给位置、动画可打断、鼠标格缓动。 |
+
+`delegate` 架构总览：[docs/assets/delegate-architecture.webp](docs/assets/delegate-architecture.webp)（提示词同目录）。
 
 ---
 

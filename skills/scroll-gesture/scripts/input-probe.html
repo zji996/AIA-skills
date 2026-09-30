@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>输入探针</title>
+<style>
+  :root { --bg: #fff; --ink: #1b1d22; --muted: #666c78; --line: #d9dce3; --pad: #f3f4f7; --accent: #2f6fed; color-scheme: light dark; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #0c0d11; --ink: #eceef2; --muted: #9aa0ab; --line: #2a2d35; --pad: #16181e; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 system-ui, sans-serif; }
+  main { max-width: 960px; margin: 0 auto; padding: 16px; display: grid; gap: 12px; }
+  h1 { font-size: 18px; margin: 0; }
+  p { margin: 0; color: var(--muted); }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+  button { font: inherit; padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--pad); color: var(--ink); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+  #zone { height: 360px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--pad); overscroll-behavior: contain; touch-action: pan-y; }
+  #zone.captured { touch-action: none; }
+  #zone div { height: 48px; border-bottom: 1px solid var(--line); padding: 12px; color: var(--muted); }
+  pre { margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; overflow: auto; font: 12px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<main>
+  <h1>输入探针</h1>
+  <p>在目标环境里打开（远控就在远端浏览器里开），在左侧区域按平时习惯滚动或拖动十几秒，再点“复制”。</p>
+  <div class="bar">
+    <label><input type="checkbox" id="capture"> 拦截（preventDefault，模拟自定义手势）</label>
+    <button id="reset">清空</button>
+    <button id="copy" class="primary">复制</button>
+    <span id="copied" role="status"></span>
+  </div>
+  <div class="grid">
+    <div id="zone" aria-label="测量区"></div>
+    <pre id="out" aria-live="polite"></pre>
+  </div>
+</main>
+<script>
+const zone = document.getElementById("zone");
+for (let i = 1; i <= 120; i += 1) zone.insertAdjacentHTML("beforeend", `<div>第 ${i} 行</div>`);
+// Each record: [t ms, kind, deltaY px-as-sent, deltaMode, deltaX]; kind w=wheel t=touch p=pointer drag.
+let events = [];
+let pointerTypes = new Set();
+const STREAM_GAP = 160;
+const q = (list, p) => { if (!list.length) return null; const s = [...list].sort((a, b) => a - b); return +s[Math.min(s.length - 1, Math.floor(p * s.length))].toFixed(1); };
+const round = (n) => +n.toFixed(1);
+
+function summary() {
+  const wheel = events.filter((e) => e[1] === "w");
+  const gaps = wheel.slice(1).map((e, i) => e[0] - wheel[i][0]);
+  const sizes = wheel.map((e) => Math.abs(e[2]));
+  const streams = [];
+  for (const [i, e] of wheel.entries()) {
+    if (!i || e[0] - wheel[i - 1][0] >= STREAM_GAP) streams.push(0);
+    streams[streams.length - 1] += 1;
+  }
+  const span = wheel.length > 1 ? wheel.at(-1)[0] - wheel[0][0] : 0;
+  const modes = {};
+  for (const e of wheel) modes[e[3]] = (modes[e[3]] ?? 0) + 1;
+  return {
+    env: { ua: navigator.userAgent, dpr: devicePixelRatio, coarse: matchMedia("(pointer: coarse)").matches, hover: matchMedia("(hover: hover)").matches, reducedMotion: matchMedia("(prefers-reduced-motion: reduce)").matches, pointerTypes: [...pointerTypes] },
+    captured: zone.classList.contains("captured"),
+    wheel: {
+      events: wheel.length,
+      rateHz: span ? round(wheel.length / (span / 1000)) : null,
+      gapMs: { p50: q(gaps, 0.5), p90: q(gaps, 0.9), max: gaps.length ? round(Math.max(...gaps)) : null },
+      absDeltaY: { p50: q(sizes, 0.5), p90: q(sizes, 0.9), max: sizes.length ? Math.max(...sizes) : null },
+      deltaModes: modes,
+      notchShare: wheel.length ? round(wheel.filter((e) => e[3] !== 0 || Math.abs(e[2]) >= 40).length / wheel.length) : null,
+      streams: { count: streams.length, gapMs: STREAM_GAP, medianEvents: q(streams, 0.5) },
+      horizontal: wheel.filter((e) => Math.abs(e[4]) > Math.abs(e[2])).length,
+    },
+    touchMoves: events.filter((e) => e[1] === "t").length,
+    pointerDrags: events.filter((e) => e[1] === "p").length,
+  };
+}
+function render() { document.getElementById("out").textContent = JSON.stringify(summary(), null, 2); }
+
+zone.addEventListener("wheel", (event) => {
+  events.push([round(performance.now()), "w", event.deltaY, event.deltaMode, event.deltaX]);
+  if (zone.classList.contains("captured")) event.preventDefault();
+  render();
+}, { passive: false });
+zone.addEventListener("touchmove", (event) => {
+  events.push([round(performance.now()), "t", event.touches[0]?.clientY ?? 0, 0, 0]);
+  if (zone.classList.contains("captured")) event.preventDefault();
+  render();
+}, { passive: false });
+zone.addEventListener("pointerdown", (event) => pointerTypes.add(event.pointerType));
+zone.addEventListener("pointermove", (event) => {
+  pointerTypes.add(event.pointerType);
+  if (event.buttons && event.pointerType !== "touch") { events.push([round(performance.now()), "p", event.clientY, 0, 0]); render(); }
+});
+document.getElementById("capture").addEventListener("change", (event) => { zone.classList.toggle("captured", event.target.checked); render(); });
+document.getElementById("reset").addEventListener("click", () => { events = []; pointerTypes = new Set(); render(); });
+document.getElementById("copy").addEventListener("click", async () => {
+  const text = JSON.stringify({ summary: summary(), events: events.slice(0, 600) });
+  const status = document.getElementById("copied");
+  try { await navigator.clipboard.writeText(text); status.textContent = "已复制"; }
+  catch { document.getElementById("out").textContent = text; status.textContent = "无法写剪贴板，已显示全文，请手动复制"; }
+});
+render();
+</script>
+</body>
+</html>
