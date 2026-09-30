@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+die() { printf '%s\n' "$*" >&2; exit 2; }
+usage() {
+    printf '%s\n' 'Usage: iteration-speed detect | time -- COMMAND [ARG...] | history | rust-setup --print|--write'
+}
+
+# This scanner reports literal settings, never evaluates project code or invokes installers.
+scan_files() {
+    find . -type d \( -name .git -o -name target -o -name node_modules -o -name .venv \
+        -o -name venv -o -name vendor -o -name third_party -o -name .local \
+        -o -name .kilo -o -name .cache \) -prune -o \
+        -type f \( -name Cargo.toml -o -name package.json -o -name 'tsconfig*.json' \
+        -o -name pyproject.toml -o -name 'requirements*.txt' -o -name go.mod \
+        -o -name Dockerfile -o -name 'Dockerfile.*' \) -print
+}
+
+toml_values() {
+    awk '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*\[/ { section=$0; sub(/[[:space:]]*#.*/, "", section) }
+        /^[[:space:]]*(rustc-wrapper|rustc-workspace-wrapper|linker|rustflags|debug|incremental)[[:space:]]*=/ {
+            print "  " section " " $0
+        }
+    ' "$1"
+}
+
+rust_report() {
+    local root_manifest=$1 dir cfg values pattern member excluded file count
+    dir=$(dirname "$root_manifest")
+    printf 'Rust：发现 %s；sccache 缓存可缓存依赖，workspace 增量/链接及不同路径不能保证命中。\n' "$root_manifest"
+    # Cargo walks ancestors from cwd, not from each workspace member.
+    cfg=$PWD
+    while :; do
+        for file in "$cfg/.cargo/config" "$cfg/.cargo/config.toml"; do
+            if [ "$file" = "${CARGO_HOME:-$HOME/.cargo}/config" ] || [ "$file" = "${CARGO_HOME:-$HOME/.cargo}/config.toml" ]; then continue; fi
+            if [ -f "$file" ]; then
+                values=$(toml_values "$file")
+                printf 'Rust 配置 %s：\n%s\n' "$file" "${values:-  未见 wrapper/链接器/profile 显式设置。}"
+            fi
+        done
+        [ "$cfg" != / ] || break
+        cfg=$(dirname "$cfg")
+    done
+    for file in "${CARGO_HOME:-$HOME/.cargo}/config" "${CARGO_HOME:-$HOME/.cargo}/config.toml"; do
+        if [ -f "$file" ]; then
+            values=$(toml_values "$file")
+            printf 'Rust 用户配置 %s：\n%s\n' "$file" "${values:-  未见 wrapper/链接器/profile 显式设置。}"
+        fi
+    done
+    for cfg in RUSTC_WRAPPER CARGO_BUILD_RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_INCREMENTAL CARGO_TARGET_DIR; do
+        if [ "${!cfg+x}" = x ]; then printf 'Rust 环境覆盖 %s=%s\n' "$cfg" "${!cfg}"; fi
+    done
+    printf 'Rust 工具：sccache=%s；mold=%s；请核对配置覆盖与实际命中，未配置时先用 rust-setup --print。\n' \
+        "$(command -v sccache || printf '未安装')" "$(command -v mold || printf '未安装')"
+    file=${SCCACHE_CONF:-$HOME/.config/sccache/config}
+    if [ -f "$file" ]; then
+        values=$(awk '/^[[:space:]]*\[/ {section=$0} /^[[:space:]]*(size|dir)[[:space:]]*=/ {print "  " section " " $0}' "$file")
+        printf 'Rust sccache 缓存配置 %s：\n%s\n' "$file" "${values:-  未见磁盘缓存容量/位置。}"
+    else
+        printf '%s\n' 'Rust sccache：未见用户缓存配置；默认值或环境覆盖需确认，可按磁盘预算设置缓存上限。'
+    fi
+    values=$(toml_values "$root_manifest")
+    printf 'Rust profile（%s）：\n%s\n' "$root_manifest" "${values:-  未显式设置 debug/incremental；评估 line-tables-only，保留自有代码增量。}"
+
+    local manifests=("$root_manifest") excludes=()
+    while IFS= read -r pattern; do excludes+=("$pattern"); done < <(
+        awk -v key=exclude -f "$SCRIPT_DIR/workspace-members.awk" "$root_manifest")
+    while IFS= read -r pattern; do
+        while IFS= read -r member; do
+            excluded=0
+            for cfg in "${excludes[@]}"; do
+                if [[ ${member#"$dir/"} == $cfg ]]; then excluded=1; fi
+            done
+            if [ "$excluded" -eq 0 ] && [ -f "$member/Cargo.toml" ] && [ "$member/Cargo.toml" != "$root_manifest" ]; then
+                manifests+=("$member/Cargo.toml")
+            fi
+        done < <(compgen -G "$dir/$pattern" | LC_ALL=C sort || :)
+    done < <(awk -v key=members -f "$SCRIPT_DIR/workspace-members.awk" "$root_manifest")
+    # Count source lines, including blank/comment lines, rather than pretending this is SLOC.
+    for file in "${manifests[@]}"; do
+        if ! grep -qE '^[[:space:]]*\[package\][[:space:]]*(#.*)?$' "$file"; then continue; fi
+        member=$(dirname "$file")
+        local source_dirs=()
+        for cfg in src tests examples benches; do
+            if [ -d "$member/$cfg" ]; then source_dirs+=("$member/$cfg"); fi
+        done
+        if [ -f "$member/build.rs" ]; then source_dirs+=("$member/build.rs"); fi
+        count=0
+        if [ "${#source_dirs[@]}" -gt 0 ]; then
+            count=$(find "${source_dirs[@]}" -type f -name '*.rs' -exec wc -l {} + | awk '$NF != "total" {n+=$1} END {print n+0}')
+        fi
+        printf 'Rust 成员 %s：%s 行 Rust 源文件（含空行/注释）。\n' "$member" "$count"
+    done
+    awk -f "$SCRIPT_DIR/cargo-graph.awk" "${manifests[@]}"
+    printf '%s\n' 'Rust 静态边界：仅普通 TOML 表/字面成员（含 glob）与本地依赖；不解析全部 TOML、隐式成员、features/cfg。建议按包 cargo test -p 迭代，测过再拆最长链。'
+}
+
+filesystem() {
+    local path=$1
+    while [ ! -e "$path" ] && [ "$path" != / ]; do path=$(dirname "$path"); done
+    LC_ALL=C df -P "$path" 2>/dev/null | awk 'NR==2 {print $1}'
+}
+
+node_report() {
+    local manifest=$1 dir manager lock store='' rootfs storefs
+    dir=$(dirname "$manifest")
+    manager=未知
+    for lock in pnpm-lock.yaml yarn.lock package-lock.json npm-shrinkwrap.json bun.lock bun.lockb; do
+        if [ -f "$dir/$lock" ]; then
+            case $lock in pnpm*) manager=pnpm;; yarn*) manager=yarn;; package*|npm*) manager=npm;; bun*) manager=bun;; esac
+            printf 'Node：%s，包管理器 %s（%s）。\n' "$manifest" "$manager" "$lock"
+        fi
+    done
+    if [ "$manager" = 未知 ]; then printf 'Node：%s，未见相邻锁文件；确认 workspace 根的包管理器。\n' "$manifest"; fi
+    if [ -f "$dir/.npmrc" ]; then
+        store=$(sed -n 's/^[[:space:]]*store-dir[[:space:]]*=[[:space:]]*//p' "$dir/.npmrc" | tail -n 1)
+    fi
+    if [ -z "$store" ] && [ -f "$HOME/.npmrc" ]; then
+        store=$(sed -n 's/^[[:space:]]*store-dir[[:space:]]*=[[:space:]]*//p' "$HOME/.npmrc" | tail -n 1)
+    fi
+    # Corepack shims can download their manager even for a query. Never run them in detect.
+    if [ -z "$store" ] && command -v pnpm >/dev/null 2>&1; then
+        if ! grep -qi corepack "$(command -v pnpm)" 2>/dev/null; then
+            store=$(cd "$dir" && COREPACK_ENABLE_NETWORK=0 pnpm store path 2>/dev/null) || store=''
+        fi
+    fi
+    case $store in '~/'*) store="$HOME/${store#\~/}";; esac
+    if [ -n "$store" ] && [[ "$store" != *'${'* ]]; then
+        [[ $store = /* ]] || store="$PWD/$dir/$store"
+        rootfs=$(filesystem "$PWD/$dir"); storefs=$(filesystem "$store")
+        if [ -n "$rootfs" ] && [ "$rootfs" = "$storefs" ]; then
+            printf 'Node pnpm store：%s；与仓库同一文件系统，可硬链接/克隆（探测最近已存在父目录）。\n' "$store"
+        else
+            printf 'Node pnpm store：%s；不同或未知文件系统，可能复制而非硬链接。\n' "$store"
+        fi
+    else
+        printf '%s\n' 'Node pnpm store：未能只读确定；用已安装 pnpm 的 pnpm store path 确认，并比较文件系统。'
+    fi
+}
+
+detect() {
+    local files=() file rust='' node='' python='' go='' docker='' values
+    while IFS= read -r file; do files+=("$file"); done < <(scan_files | LC_ALL=C sort)
+    printf '仓库：%s（只读探测；跳过生成目录、vendor/third_party）。\n' "$PWD"
+    for file in "${files[@]}"; do
+        case $file in
+            */Cargo.toml) [ -n "$rust" ] || rust=$file;;
+            */package.json) [ -n "$node" ] || node=$file;;
+            */pyproject.toml|*/requirements*.txt) [ -n "$python" ] || python=$file;;
+            */go.mod) [ -n "$go" ] || go=$file;;
+            */Dockerfile|*/Dockerfile.*) [ -n "$docker" ] || docker=$file;;
+        esac
+    done
+    if [ -f Cargo.toml ]; then rust=./Cargo.toml; fi
+    if [ -f package.json ]; then node=./package.json; fi
+    if [ -f pyproject.toml ]; then python=./pyproject.toml; fi
+    if [ -f go.mod ]; then go=./go.mod; fi
+    if [ -f Dockerfile ]; then docker=./Dockerfile; fi
+    if [ -n "$rust" ]; then rust_report "$rust"; fi
+    if [ -n "$node" ]; then
+        node_report "$node"
+        for file in "${files[@]}"; do
+            case $file in */tsconfig*.json)
+                values=$(grep -E '"(incremental|composite|tsBuildInfoFile|noEmit|extends)"[[:space:]]*:' "$file" || :)
+                printf 'Node TS %s（字面设置，不展开 extends）：%s\n' "$file" "${values:-未见增量设置；评估 tsc -b/incremental。}"
+            ;; esac
+        done
+        printf '%s\n' 'Node TS 建议：核对继承配置后评估 tsc -b/incremental；noEmit/emit 使用各自的 tsBuildInfoFile，避免覆盖增量状态。'
+        printf '%s\n' 'Node 建议：store 共享依赖内容；Vite node_modules/.vite、TS .tsbuildinfo 不保证跨目录复用。迭代按文件/--changed 跑 Vitest，Playwright 全量按批合入后跑，避免 CPU 超卖。'
+    fi
+    if [ -n "$python" ]; then
+        printf 'Python：发现 %s；uv=%s；venv=%s。\n' "$python" "$(command -v uv || printf '未安装')" \
+            "${VIRTUAL_ENV:-$(if [ -d "$(dirname "$python")/.venv" ]; then printf '%s/.venv' "$(dirname "$python")"; else printf '未发现'; fi)}"
+        values=${UV_CACHE_DIR:-}
+        if [ -z "$values" ] && command -v uv >/dev/null 2>&1; then values=$(uv cache dir 2>/dev/null) || values=''; fi
+        printf 'Python uv 缓存：%s；共享依赖缓存，各 worktree 复用自己的 venv；pytest 按文件/-k/--lf 迭代，量 importtime 后决定并行。\n' "${values:-未知（可用 uv cache dir 查询）}"
+    fi
+    if [ -n "$go" ]; then printf 'Go：发现 %s；使用自带构建缓存，go env GOCACHE 查询；-count=1 禁测试结果缓存但仍复用构建缓存。\n' "$go"; fi
+    if [ -n "$docker" ]; then
+        values=$(grep -E -- '--mount=type=cache' "$docker" || :)
+        printf 'Docker：发现 %s；缓存挂载：%s；先复制锁文件安装，再复制源码，注意 builder 缓存边界。\n' "$docker" "${values:-未见显式 BuildKit cache mount}"
+    fi
+    if [ "${#files[@]}" -eq 0 ]; then printf '%s\n' '未发现支持的生态清单。'; fi
+}
+
+history_path() {
+    local root name
+    root=$(git rev-parse --show-toplevel 2>/dev/null) || root=$PWD
+    name=$(basename "$root" | LC_ALL=C tr -c '[:alnum:]._\n-' '_')
+    printf '%s/iteration-speed/%s.tsv' "${XDG_STATE_HOME:-$HOME/.local/state}" "$name"
+}
+
+measure() {
+    [ "${1:-}" = -- ] || die 'time requires -- COMMAND'
+    shift
+    [ "$#" -gt 0 ] || die 'time requires a command'
+    local log timer status elapsed command_text row cwd_text
+    log=$(history_path)
+    mkdir -p "$(dirname "$log")"
+    timer=$(mktemp "$(dirname "$log")/.timing.XXXXXX")
+    trap 'rm -f "$timer"' EXIT
+    TIMEFORMAT='%R'
+    # Only the timing goes to the file; preserve the command stdout and stderr.
+    if { time ( "$@" 2>&3 ); } 3>&2 2>"$timer"; then status=0; else status=$?; fi
+    elapsed=$(tail -n 1 "$timer")
+    printf -v command_text '%q ' "$@"
+    printf -v cwd_text '%q' "$PWD"
+    printf -v row '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$elapsed" "$status" "$cwd_text" "$command_text"
+    printf '%s' "$row" >> "$log"
+    printf '耗时 %s s，退出码 %s；记录 %s\n' "$elapsed" "$status" "$log" >&2
+    exit "$status"
+}
+
+# Merge a single owned setting in a conventional TOML table; reject ambiguous syntax.
+merge_setting() {
+    local content=$1 section=$2 key=$3 value=$4
+    printf '%s\n' "$content" | awk -v wanted="$section" -v key="$key" -v value="$value" '
+        function flush() { if (section==wanted && !done) {print key " = " value; done=1} }
+        /^[[:space:]]*\[/ {
+            flush(); section=$0; sub(/^[[:space:]]*\[/,"",section); sub(/\][[:space:]]*(#.*)?$/,"",section)
+            if (section==wanted) { if (seen++) exit 2 }
+        }
+        {
+            text=$0
+            if (text ~ /^[[:space:]]*#/) { print; next }
+            if (text ~ /^[[:space:]]*[A-Za-z0-9_-]+\.[^=]*=/ || text ~ /^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=[[:space:]]*\{/) exit 2
+            if (section==wanted && text ~ "^[[:space:]]*" key "[[:space:]]*=") {
+                if (done++) exit 2
+                if (key=="rustflags") {
+                    sub(/[[:space:]]*#.*/, "", text)
+                    if (text !~ /\][[:space:]]*$/) exit 2
+                    if (text ~ /-fuse-ld=/ && text !~ /-fuse-ld=mold/) exit 2
+                    if (text ~ /-fuse-ld=mold/) {print $0; next}
+                    sub(/\][[:space:]]*$/, "", text)
+                    if (text !~ /\[[[:space:]]*$/) text=text ", "
+                    print text "\"-C\", \"link-arg=-fuse-ld=mold\"]"
+                } else print key " = " value
+                next
+            }
+            print
+        }
+        END { if (!done) {flush(); if (!done) print "\n[" wanted "]\n" key " = " value} }
+    '
+}
+
+rust_setup() {
+    local mode=${1:-} cargo_file="$HOME/.cargo/config.toml" cache_file="$HOME/.config/sccache/config"
+    local cargo='' cache='' triple='' os arch file stamp temp
+    [[ $mode = --print || $mode = --write ]] || die 'rust-setup requires --print or --write'
+    os=$(uname -s); arch=$(uname -m)
+    if [ "$os" = Linux ]; then
+        case $arch in x86_64|aarch64) triple="$arch-unknown-linux-gnu";; *) die "Unsupported Linux architecture: $arch";; esac
+    elif [ "$os" != Darwin ]; then die "Unsupported platform: $os"; fi
+    if [ -f "$cargo_file" ]; then cargo=$(<"$cargo_file"); fi
+    if [ -f "$cache_file" ]; then cache=$(<"$cache_file"); fi
+    if [ -f "$HOME/.cargo/config" ]; then die 'Legacy ~/.cargo/config exists; consolidate it into config.toml before setup.'; fi
+    cargo=$(merge_setting "$cargo" build rustc-wrapper '"sccache"') || die 'Cannot safely merge Cargo TOML; use conventional tables or adjust manually.'
+    if [ -n "$triple" ]; then
+        cargo=$(merge_setting "$cargo" "target.$triple" rustflags '["-C", "link-arg=-fuse-ld=mold"]') || die 'Cannot safely merge rustflags (multiline/conflicting linker); adjust manually.'
+    fi
+    cache=$(merge_setting "$cache" cache.disk size 10737418240) || die 'Cannot safely merge sccache TOML; adjust manually.'
+    printf '# %s\n%s\n\n# %s\n%s\n' "$cargo_file" "$cargo" "$cache_file" "$cache"
+    printf '%s\n' '# 安装建议（只打印，不执行）：cargo install sccache --locked'
+    if [ "$os" = Linux ]; then
+        printf '%s\n' '# Debian/Ubuntu：apt-get install mold（自行按发行版安装，脚本不调用 sudo）'
+    else
+        printf '%s\n' '# macOS：保留默认 ld-prime；此缓存文件可用 SCCACHE_CONF=$HOME/.config/sccache/config 指定。'
+    fi
+    printf '%s\n' '# 配置要求工具已安装；Linux 仅 GNU host target，其他 target/linker 按实际工具链调整。'
+    if [ "$mode" = --print ]; then return; fi
+    # Refuse links so an apparent user path can never redirect a write into a repository.
+    for file in "$HOME/.cargo" "$HOME/.config" "$HOME/.config/sccache" "$cargo_file" "$cache_file"; do
+        [ ! -L "$file" ] || die "Refusing symlink: $file"
+    done
+    for file in "$cargo_file" "$cache_file"; do
+        temp=$(dirname "$file")
+        while [ ! -d "$temp" ]; do temp=$(dirname "$temp"); done
+        if git -C "$temp" rev-parse --show-toplevel >/dev/null 2>&1; then
+            die "Refusing user configuration inside a repository: $file"
+        fi
+    done
+    stamp=$(date -u +%Y%m%dT%H%M%S).$$
+    for file in "$cargo_file" "$cache_file"; do
+        mkdir -p "$(dirname "$file")"
+        if [ -e "$file" ]; then cp -p "$file" "$file.bak.$stamp"; fi
+        temp=$(mktemp "$(dirname "$file")/.iteration-speed.XXXXXX")
+        if [ "$file" = "$cargo_file" ]; then printf '%s\n' "$cargo" > "$temp"; else printf '%s\n' "$cache" > "$temp"; fi
+        mv "$temp" "$file"
+        printf '写入 %s（原文件如存在已备份为 .bak.%s）。\n' "$file" "$stamp"
+    done
+}
+
+action=${1:-}
+if [ "$#" -gt 0 ]; then shift; fi
+case $action in
+    detect) [ "$#" -eq 0 ] || die 'detect accepts no arguments'; detect;;
+    time) measure "$@";;
+    history)
+        [ "$#" -eq 0 ] || die 'history accepts no arguments'
+        log=$(history_path)
+        printf 'UTC\tseconds\texit\tcwd\tcommand\n'
+        if [ -f "$log" ]; then tail -n 20 "$log"; fi
+        ;;
+    rust-setup) [ "$#" -eq 1 ] || die 'rust-setup requires one mode'; rust_setup "$1";;
+    -h|--help|'') usage;;
+    *) usage >&2; exit 2;;
+esac
