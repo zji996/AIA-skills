@@ -4,6 +4,7 @@
 
 ### 技能
 
+- `delegate` 5.17.1：自然语言短行不再显示“范围外：…”。这些路径只可能是托管 copy/link 或未初始化的参考 gitlink，都是按设计排除，每条结论都重复它们只是噪音；`--json` 的 `excluded` 不变。
 - `delegate` 5.17.0：新增用户级 `${XDG_CONFIG_HOME:-~/.config}/delegate/config.json`，与仓库 `.delegate.json` 按标量仓库优先、env 按键覆盖、agentDeny 按 argv 合并去重；仓库 `allow: true` 可撤销精确用户规则。用户级默认验收、返工预算与机器容量跨仓库生效，容量环境变量仍最高。worktree/generated/applyVerify 只认仓库，用户出现时启动 stderr 提示一次；独立校验两份文件，错误指出文件与字段并退出 2。meta、summary 与 JSON 结论记录 configSources，自然语言短行不变；新增用户/仓库/合并/撤销/容量优先级/忽略提示/错误的黑盒回归。二进制和校验和留待主控审后构建。
 
 - `delegate` 5.16.0：`.delegate.json` 新增 `agentDeny` argv 前缀规则，启动时解析真实程序绝对路径并生成同事专用 PATH shim；命中打印 hint、退出 77，同事 lane 同样受限，环境变量无放行开关。未命中 exec 透传参数、stdin/stdout 与退出码；验收、setup、apply 生成与复验、主控 lane 保持原 PATH。结论统计 `denied: N`，自然语言提示“拦下 N 次全量检查”。写入 timeout 的下一次 reply 记 `continuation: timeout`，不耗 maxRework，超限与连续超时也能续做；next 给可复制命令，其他失败仍按原规则。防护针对误用，不是同 UID 恶意绕过的沙箱。补黑盒回归并纳入现有验证入口；二进制与校验和留待主控审后构建。

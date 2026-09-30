@@ -145,22 +145,8 @@ pub fn human(run: &Path, status: &Value) -> String {
             }
             .into(),
         );
-        if let Some(excluded) = status["accept"]["excluded"].as_array() {
-            parts.push(format!(
-                "范围外：{}{}",
-                excluded
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                if excluded.len() > 3 {
-                    format!(" 等 {} 项", excluded.len())
-                } else {
-                    String::new()
-                }
-            ));
-        }
+        // Excluded roots are managed links and unfetched reference submodules by
+        // design; `--json` keeps them.
     } else if state == "answered" {
         parts.push("未设验收".into());
     }
