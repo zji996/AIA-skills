@@ -39,7 +39,7 @@ const COLLECT: &[(&str, &str)] = &[
 ];
 
 const REPLY: &[(&str, &str)] = &[
-    ("run", "Finished parent run to continue."),
+    ("run", "Finished parent run to continue. A write timeout continuation does not consume maxRework."),
     ("words", "Follow-up message (or use --prompt / --prompt-file)."),
     ("--prompt TEXT", "Follow-up message text."),
     ("--prompt-file FILE", "Read the message from FILE, or - for stdin."),
@@ -122,8 +122,9 @@ pub fn print(command: Option<&str>) -> bool {
         ]);
         println!("\nStates: waiting | running | delivered (accept passed) | answered (no --accept) | skipped (upstream failed) | rejected (accept failed or protected path changed) | malformed (empty or leaked tool call after reruns) | failed | timeout | killed | stopped | crashed.");
         println!(
-            "Exit: 0 delivered/answered, 1 other finished, 2 usage, 75 still running at --max, 76 already covered by another waiter."
+            "Exit: 0 delivered/answered, 1 other finished, 2 usage, 75 still running at --max, 76 already covered by another waiter, 77 agentDeny shim refusal."
         );
+        println!(".delegate.json agentDeny: exact argv prefixes for agent PATH shims; no global-option normalization. Acceptance/setup/apply and caller lane keep the original PATH. Shims have no environment bypass.");
         println!("Runs: $DELEGATE_RUNS or <git root of cwd>/.local/run/delegate (old .local/run/pi runs remain readable).");
         return true;
     };

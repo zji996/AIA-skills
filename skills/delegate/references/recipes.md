@@ -86,6 +86,7 @@ $D wait
 ```json
 {
   "env": {"CUDA_VISIBLE_DEVICES": ""},
+  "agentDeny": [{"argv": ["cargo", "xtask", "check"], "hint": "全量由主控合入后跑；改跑 cargo test -p <crate> 与 cargo clippy -p <crate>"}],
   "accept": "./scripts/check.sh && python3 -m unittest discover -s tests",
   "generated": {"paths": ["src/generated/"], "command": "./scripts/generate.sh"},
   "worktree": {
@@ -102,6 +103,7 @@ $D wait
 - `setup` 在重任务队列里执行；先在一个临时 worktree 里手动跑一遍，确认离线能装齐。
 - `writeSetup` 只在写入任务里、`setup` 之后执行：装起来慢、只有跑测试才用得上的环境（如含 torch 的 venv）放这里，只读侦察不必等。
 - `env` 在原地运行时同样生效。
+- `agentDeny` 按 argv 前缀拦截同事的全量检查（退出 77，打印 hint），同事通过 lane 调用也拒绝；验收与主控 lane 保持可用。同事跑相关包检查，主控合入一批后统一全量检查。
 - 顶层 `accept` 只作用于写入任务；显式 `--accept` 覆盖，`--no-accept` 关闭。并行写入用 `--protect` 划分文件所有权；验收覆盖相关 ratchet、contracts、docs 门禁，合并后再跑全量。
 - `generated.paths` 的匹配语义同 `--protect`（目录以 `/` 结尾）。这些生成文件仍出现在改动清单和 diff 中，但 `apply` 不合并或覆盖它们；合并其他文件后，在源仓库根通过 lane 运行 `sh -c` 执行 `generated.command`，输出写入 run 目录的 `generate.log`。`--dry-run` 只报告动作；生成失败时已合并文件保留，需查看日志后重试。见 `docs/delegate-spec.md` §6.4。
 - 界面实现默认 `--tier cheap`（Pi 前端审美与交互明显好于 Codex），说明里要截图路径；强档只接状态、数据与接口逻辑。
@@ -123,6 +125,8 @@ $D wait
 | 几路写入任务并行改同一个 app | 各开 `--worktree`，并用 `--protect` 把别路负责的文件划出去，冲突在 `apply` 前就暴露；合并后跑一次仓库级全量检查 |
 | 验收通过，合并后仓库级检查失败 | 验收只覆盖了单个 app，漏了仓库级门禁（ratchet、contracts、docs 审计）：验收命令带上这些 gate，或在 `.delegate.json` 顶层 `accept` 声明默认验收 |
 | 验收在高负载时超时 | 重检查已整机排队且排队不计时；仍超时说明命令本身慢，调大 `--accept-timeout` |
+| 同事写到一半 timeout，返工预算已用完 | 复制结论的 `next` 续做，上一轮 timeout 的 reply 不计返工次数；其他失败仍按原规则 |
+| 同事全量检查被拒绝（77） | 按 hint 改跑相关检查；结论的 denied 统计拦截次数，主控合入一批后统一跑全量 |
 | 同事读到的代码和你当前的不一样 | 只读任务读的是启动时的快照；你之后的修改它看不到，需要时重新放一个 |
 | 清理后找不到长报告的全文 | `wait` 显示答复头尾共 6000 字；只看过截断答复的任务 `clean --finished` 默认保留。要留存就先 `result <name> > 文件`，或调大 `DELEGATE_RESULT_CHARS` |
 | 便宜档给的配置键、参数名不存在 | 仓库外知识会被编造：要求附出处，并对照 schema、源码或 `--help` 核实后再采纳 |

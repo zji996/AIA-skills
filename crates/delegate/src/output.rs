@@ -177,11 +177,16 @@ pub fn human(run: &Path, status: &Value) -> String {
     if !status["readOnlyViolation"].is_null() || !status["workspaceChanged"].is_null() {
         parts.push("只读工作区有改动".into());
     }
+    if n(status, "denied") > 0 {
+        parts.push(format!("拦下 {} 次全量检查", n(status, "denied")));
+    }
     let id = s(status, "run");
     let next = if runs::active(state) {
         format!("等待交付：delegate wait {id}")
     } else if !s(status, "next").is_empty() {
-        if matches!(state, "delivered" | "answered") {
+        if state == "timeout" && s(status, "mode") == "write" {
+            format!("改动保留，续做不计返工次数：{}", s(status, "next"))
+        } else if matches!(state, "delivered" | "answered") {
             if meta["worktree"].is_object() {
                 if status["sourceDrift"]["overlap"]
                     .as_array()

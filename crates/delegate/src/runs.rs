@@ -210,7 +210,19 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
             "{script} reply {name} 'answer with what you found so far' or split the question"
         )),
         "timeout" => Some(format!(
-            "its changes are kept; {script} reply {name} 'continue from your diff, then finish' or split what remains"
+            "{} reply {} {}{}",
+            shell_quote(&script.to_string()),
+            shell_quote(&name),
+            if sum["session"].as_str().is_none_or(str::is_empty)
+                || (crate::agents::spec(s(meta, "agent")).is_some_and(|agent| {
+                    agent.session == crate::agents::SessionSource::DelegateFile
+                }) && crate::agents::session_file(s(meta, "sessionDir"), s(sum, "session")).is_none())
+            {
+                "--fresh "
+            } else {
+                ""
+            },
+            shell_quote("continue from your diff, then finish"),
         )),
         "killed" | "crashed" => Some("take it over or start it again".into()),
         _ => None,
@@ -259,6 +271,7 @@ pub fn status(run: &Path) -> Value {
             "escalatedFrom",
             "queuedSeconds",
             "graceSeconds",
+            "denied",
             "tokens",
             "cleanup",
             "warnings",
@@ -323,6 +336,9 @@ pub fn status(run: &Path) -> Value {
         }
     }
     let result = run.join("result.md");
+    if run.join("agent-shims").is_dir() {
+        out["denied"] = json!(crate::deny::count(run));
+    }
     if result.is_file() && fs::metadata(&result).is_ok_and(|m| m.len() > 0) {
         out["result"] = json!(result.to_string_lossy());
         out["resultChars"] = json!(read(&result).chars().count());

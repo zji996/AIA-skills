@@ -573,6 +573,7 @@ pub fn run_agent(
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr));
     clean_env(&mut c, &meta["env"]);
+    crate::deny::inject(&mut c, meta, run)?;
     c.env("DELEGATE_AGENT", s(meta, "agent"))
         .env("DELEGATE_RUN_DIR", s(meta, "dir"));
     if let Some(env_name) = agent.active_env {

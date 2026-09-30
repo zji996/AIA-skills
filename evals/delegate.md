@@ -1,5 +1,13 @@
 # delegate
 
+## 5.16 相关检查与超时续做
+
+- 三路同事都打算跑 `cargo xtask check`：配置 `agentDeny` 的 argv 前缀与相关 crate 检查提示，直接调用和 lane 调用均退出 77；主控合入一批后通过自己的 lane 统一跑全量。Agent full-suite checks are denied; the caller runs the batch check.
+- 同事设 `DELEGATE_ALLOW_HEAVY=1` 再跑全量：仍拒绝，结论 denied 增加；脚本的 --accept、setup、apply 生成与 applyVerify 保持原 PATH，照常执行。
+- `cargo test -p api` 没命中 deny：argv、退出码与 stdin/stdout 原样透传；`cargo --locked xtask check` 不匹配 `cargo xtask check`，配置按需要覆盖该精确前缀。
+- 写入任务 timeout 但返工次数用完：复制 next 的 reply 续做，meta.continuation 为 timeout，不耗 maxRework；连续 timeout 连续续做，后续 rejected 再 reply 仍遵守预算。Timeout continuation is not rework.
+- 没有 agentDeny 的仓库：沿用原行为，不生成 shim 或 denied 字段。
+
 ## 5.15 精简输出与边界
 
 - 默认收结论只读短行与答复：名字、状态、档位、耗时、文件数与增删行、前三目录、验收、下一步；需要完整字段时显式 `status --json`/`wait --json`，不要展开全过程。

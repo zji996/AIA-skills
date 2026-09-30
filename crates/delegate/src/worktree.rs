@@ -8,7 +8,7 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub fn config(top: &Path) -> Res<(Value, Value, Option<String>)> {
+pub fn config(top: &Path) -> Res<(Value, Value, Option<String>, Value)> {
     let path = top.join(".delegate.json");
     let val = if path.is_file() {
         let v: Value = serde_json::from_str(&read(&path))
@@ -85,7 +85,9 @@ pub fn config(top: &Path) -> Res<(Value, Value, Option<String>)> {
             })
             .collect::<Vec<_>>());
     }
-    Ok((env, out, accept))
+    let deny = crate::deny::validate(val.get("agentDeny"))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok((env, out, accept, deny))
 }
 fn strings(v: &Value) -> Vec<String> {
     v.as_array()

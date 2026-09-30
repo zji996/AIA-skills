@@ -30,6 +30,23 @@
 
 同事的超时：到 `--timeout`（不含排队）时若有命令正在执行，或 120 秒内有事件，继续运行，最多到 `--timeout` 的 `1 + DELEGATE_TIMEOUT_GRACE/100` 倍（默认 1.1 倍）；结论里 `graceSeconds` 记下超出的秒数。
 
+## 同事全量检查拦截（agentDeny）
+
+仓库根 `.delegate.json` 可配置：
+
+```json
+{"agentDeny": [
+  {"argv": ["cargo", "xtask", "check"], "hint": "全量检查由主控合入后跑；改跑 cargo test -p <crate> 与 cargo clippy -p <crate>"},
+  {"argv": ["pnpm", "check"], "hint": "全量检查由主控合入后跑；改跑 pnpm --filter <package> test"}
+]}
+```
+
+按完整 argv 的逐项、大小写敏感前缀匹配；尾部可以有更多参数。`cargo xtask check --all` 命中，`cargo --locked xtask check` 不命中，不忽略或重排 `+toolchain`、`--locked` 等全局参数。每条规则的 `argv` 非空，首项是程序名（字母、数字、`._-`，不能是路径或 `.`/`..`），其他项为字符串，`hint` 非空；字符串不能含 NUL。同程序多条规则按配置顺序匹配首条。
+
+启动时在 run 的 `agent-shims/` 为每个程序生成 shell shim，按原 PATH（含顶层 env.PATH）与同事工作目录解析真实程序的绝对路径，保留 cargo/rustup 等多调用符号链接的名称；真实程序缺失时，未命中的调用退出 127。只在同事进程的 PATH 最前面插入该目录，reply 继承规则。命中打印 hint 到 stderr，退出 77；未命中直接 exec，参数、stdin/stdout 与退出码透传。同事的 `lane` 继承 shim PATH，即使自己设置 `DELEGATE_ALLOW_HEAVY=1` 或 `DELEGATE_LANE_HELD=1` 仍会拒绝。`denied.log` 累计本轮各尝试的次数，结论 `denied: N`，短行显示“拦下 N 次全量检查”；未配置或空列表不生成 shim，不增加字段。
+
+验收、setup、收尾生成核对、apply 的生成与 applyVerify 都由未注入 shim 的执行环境运行，主控自己的 lane 同理。没有环境放行开关或可交给同事的令牌。威胁模型是防误用，不是防恶意：同 UID 进程可以改 PATH、用绝对路径或改 shim/记录，这不是安全沙箱。
+
 ## 改动清单
 
 在 git 仓库中，启动时和同事结束后（验收命令之前）各把整个工作区记为一个 tree 对象：借用真实 index 的副本执行 `git add -A` 与 `write-tree`，真实 index、分支和 stash 都不动；被忽略的文件不计，大于 `DELEGATE_SNAPSHOT_MAX_BYTES`（默认 2 MiB）的未跟踪文件只比较大小与修改时间。两次快照之差就是 `files`、`changes`（文件数与 +/- 行数）、`changes.json` 与 `changes.patch`，因此 shell 或脚本改的文件也会列出，改了又改回的不列，运行前已有的脏改动不算。原地运行时，别人在同一时间对仓库的改动也会被计入；需要干净归属时用 `--worktree`。子模块只作为一个条目出现：其检出中的已跟踪改动、未跟踪文件或提交变化都记为 `submodule contents`。快照失败时（例如 git 出错），结论带 `warning`，改动清单显示 unknown，只读任务也因此无法核验。非 git 目录只能根据编辑事件列出 `files`。
@@ -66,6 +83,8 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 
 每轮的会话都属于自己的 run：Pi 保存在 run 目录的 `session/` 下，Codex 使用自己的会话存储，`summary.json` 的 `session` 记下会话 id。`reply` 在每次尝试时从上一轮的会话**分叉**（Pi `--fork` 上一轮会话文件的副本，Codex `exec fork`），上一轮的会话从不被改动：答复畸形重跑时从同一处重新开始，清理早先的轮次也不影响后续追问。结局为 `malformed` 的轮次不算对话的延续，之后的 `reply` 与 `apply` 都从它的上一轮接着。4.1 之前的 run 使用 `--no-session`，不能 `reply`。
 
+写入任务上一轮为 `timeout` 时，下一次 reply 记 `meta.continuation: "timeout"`、`rework.kind: "continuation"`，不消耗 maxRework，超限也允许续做，改动超过 minor 的 60 行仍不补计。连续超时可以连续续做；rejected 等结局后仍按原返工规则。超时结论的 `next` 是可直接复制的续做命令，无会话 id 或 Pi 会话文件缺失时自动带 `--fresh`，自然语言结论注明“不计返工次数”。
+
 图片以绝对路径交给同事：Pi 作为 `@<路径>` 附件，Codex 作为 `--image`。
 
 ## 位置
@@ -95,6 +114,7 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 | `supervisor.lock` | supervisor 在世期间持有的 flock，`wait` 阻塞在它上面 |
 | `waiter.lock` | 收取进程持有的排他 flock，内容为 PID；进程死亡锁自动释放 |
 | `protect-generate.log` | 收尾复跑受保护生成物命令的输出 |
+| `agent-shims/` / `denied.log` | 同事专用程序 shim / 每次拒绝追加一行 `1`，结论统计为 `denied` |
 | `lane-wait` / `lane-waiting-*` | 同事在 lane 中已排队的秒数 / 正在排队的标记 |
 | `stderr.log` | 同事 CLI 的标准错误 |
 | `exit_code` | 结束标记：`0` 为 delivered/answered，`1` 为其他结局；运行中不存在 |

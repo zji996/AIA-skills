@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "5.15.0"
+  version: "5.16.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -64,7 +64,7 @@ $D wait                                                                         
 
 - **续接还是新开**：返工建立在它已有理解上（审查意见、补测试）时用 `reply`；会话很长、答复开始畸形或方向已变时 `--fresh` 更好。worktree 是启动时的快照，之后你在自己工作区的改动它看不到，用 `reply --sync` 同步进去。
 - **什么时候自己改**：根因已定位、改动小、你清楚怎么改时，自己改常常更快——派发、等待、审查、合并有固定开销。需要只有你知道的背景时也自己接手。
-- **返工预算**：写入对话默认只给同事 1 次返工（`.delegate.json` 的 `maxRework`，`null` 不限），第二次 `reply` 会被拒绝（退出码 2）——这时 `diff --total` / `apply` 后自己改。短修正（改名、补一处断言，说明 ≤600 字）用 `reply --minor`，不计次数，但该轮改动超过 60 行会补记一次；确需越限用 `--over-limit '<原因>'`，原因记在 meta。零改动的追问不计次。
+- **返工预算**：写入对话默认只给同事 1 次返工（`.delegate.json` 的 `maxRework`，`null` 不限），第二次 `reply` 会被拒绝（退出码 2）——这时 `diff --total` / `apply` 后自己改。上一轮为 `timeout` 的 `reply` 是续做，不计返工次数，即使预算已用完也可继续，meta 记 `continuation: timeout`；其他失败仍按原规则计数。短修正（改名、补一处断言，说明 ≤600 字）用 `reply --minor`，不计次数，但该轮改动超过 60 行会补记一次；确需越限用 `--over-limit '<原因>'`，原因记在 meta。零改动的追问不计次。
 - **两档怎么搭配**：Pi 找到的代码事实更多、偶有把现状说混；Codex 更准确、风险意识更强。分量重的审查两路并行、由你合并，通常好于任一方。界面实现默认 `--tier cheap` 并要求截图，强档只接界面里的状态与数据逻辑；Pi 的实现要单独扫一遍静默吞错（空 `catch`）和答复里的夸大。便宜档近乎免费，侦察不必压缩范围。
 - **让错误当场暴露**：审查说明给重点并注明不限于此，给待证伪的假设而不是结论；要求现状断言附 `文件:行号`、仓库外事实（配置键、CLI 参数、API 字段、版本号）附一手出处——便宜档会编出看似合理的名字。看图审查把影响判断的真实数据写进说明，并要求写明从图上哪里读出。
 - **开几路**：写入 3–4 路最划算（整机强档上限 4），瓶颈是主控审 diff 和跨路一致性，不是名额；先把各路共用的基础（公共组件、约定）提交好再放出，说明里写清它的误用方式；单路一个子系统、约 15 个文件以内。只读侦察可以再并行几路。同事在跑测试时，主控自己的重检查也走 `lane`，否则 CPU 超卖会把测试拖过超时。
@@ -83,6 +83,8 @@ $D wait                                                                         
 | `malformed` / `failed` / `timeout` / `killed` / `crashed` / `stopped` | 答复畸形 / 出错 / 超时 / 进程异常 / 被终止 |
 
 state 只描述答复。只读任务写文件仍是 `answered`，短行提示，JSON 带 `readOnlyViolation`（隔离未合并）或 `workspaceChanged`（原地无法归属）。改动来自前后快照：含 shell 改动，排除原有脏改动与验收副产物。退出码：`0` 成功，`1` 其他结局，`2` 用法错误/拒绝，`75` 仍运行，`76` 已有等待者。
+
+`.delegate.json` 的 `agentDeny` 用 argv 前缀拦截同事误跑全量检查，shim 拒绝退出 `77` 并打印替代检查提示，同事的 `lane` 同样受限。JSON 结论带 `denied: N`，短行提示“拦下 N 次全量检查”。同事只跑相关检查；主控合入一批后统一跑全量。验收、setup、apply 生成与复验、主控 lane 保持原 PATH；未配置时行为不变。配置与误用防护边界见 [references/output-and-files.md](references/output-and-files.md)。
 
 `--json` 保留原完整结构：`shape` 含目录增删行、改后最大文件、配置与删除路径；`*More` 是省略数量，逐文件在 `changes.json`。`changes` 是本轮，`pendingChanges` 是累计待合入量，零改动 reply 仍可能需 `diff --total`/`apply`。
 

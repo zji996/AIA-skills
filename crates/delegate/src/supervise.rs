@@ -559,6 +559,9 @@ fn inner(
             Err(e) => Some(clip(&format!("worktree setup failed: {e}"), 300)),
         };
     }
+    if setup_error.is_none() {
+        crate::deny::prepare(&meta, run)?;
+    }
     let (mut verdict, mut answer, mut attempts) = if setup_error.is_none() {
         attempts_from(&meta, run, 1, holder.clone(), grace.clone())
     } else {

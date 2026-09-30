@@ -486,8 +486,9 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     normalize_protect(&mut o.protect)?;
     let mut extra = json!({"env":{}});
     if let Some(top) = &repo {
-        let (env, cfg, default_accept) = worktree::config(top)?;
+        let (env, cfg, default_accept, deny) = worktree::config(top)?;
         extra["env"] = env;
+        extra["agentDeny"] = deny;
         if !o.read_only && !o.protect.is_empty() {
             let (paths, command) = worktree::generated(top)?;
             let overlap = paths
@@ -548,10 +549,11 @@ fn rework_used(run: &Path) -> (u64, String) {
         let changes = &json(current.join("summary.json"))["changes"];
         let lines =
             changes["added"].as_u64().unwrap_or(0) + changes["deleted"].as_u64().unwrap_or(0);
-        match s(&meta["rework"], "kind") {
+        match (s(&meta, "continuation"), s(&meta["rework"], "kind")) {
+            ("timeout", _) => {}
             // A round that changed nothing (a question, a failed start) is not rework.
-            "rework" if changes["files"].as_u64().unwrap_or(0) > 0 => used += 1,
-            "minor" if lines > MINOR_LINES => used += 1,
+            (_, "rework") if changes["files"].as_u64().unwrap_or(0) > 0 => used += 1,
+            (_, "minor") if lines > MINOR_LINES => used += 1,
             _ => {}
         }
         let parent = s(&meta, "parent");
@@ -595,6 +597,11 @@ fn rework_gate(parent: &Path, meta: &Value, o: &Options, prompt: &str) -> Res<Op
         Some(1)
     };
     let (used, name) = rework_used(parent);
+    if runs::state(parent) == "timeout" {
+        return Ok(Some(
+            json!({"kind":"continuation","used":used,"limit":limit}),
+        ));
+    }
     if o.minor {
         let chars = prompt.chars().count();
         if chars > MINOR_CHARS {
@@ -765,6 +772,10 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     let mut extra =
         json!({"parent":meta,"session":session,"env":meta["env"],"worktree":meta["worktree"]});
     extra["protectGenerated"] = meta["protectGenerated"].clone();
+    extra["agentDeny"] = meta["agentDeny"].clone();
+    if s(&summary, "state") == "timeout" && s(&meta, "mode") == "write" {
+        extra["continuation"] = json!("timeout");
+    }
     if let Some(paths) = synced {
         extra["sync"] = json!({"files":paths});
     }
@@ -1144,6 +1155,12 @@ pub fn launch(
     let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":seconds(o.timeout.as_deref().unwrap_or("15m"))?,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
     let (agent_bin, agent_version) = agent_identity(s(&meta, "agent"))?;
     meta["agentBin"] = json!(agent_bin);
+    if let Some(rules) = extra.get("agentDeny").filter(|rules| !rules.is_null()) {
+        meta["agentDeny"] = rules.clone();
+    }
+    if !extra["continuation"].is_null() {
+        meta["continuation"] = extra["continuation"].clone();
+    }
     if extra["protectGenerated"].is_object() {
         meta["protectGenerated"] = extra["protectGenerated"].clone();
     }
