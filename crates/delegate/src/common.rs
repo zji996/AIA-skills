@@ -428,6 +428,9 @@ pub fn run_shell(
     Ok((code, timed))
 }
 pub fn finish_run(run: &std::path::Path, mut summary: serde_json::Value, code: i32) -> Res<()> {
+    if let Some(sources) = json(run.join("meta.json")).get("configSources") {
+        summary["configSources"] = sources.clone();
+    }
     if run.join("agent-shims").is_dir() {
         summary["denied"] = serde_json::json!(crate::deny::count(run));
     }

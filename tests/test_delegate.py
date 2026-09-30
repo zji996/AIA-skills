@@ -2113,6 +2113,8 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(self.cli("reply", "--wait", "job", "unlimited").returncode, 0)
         (repo / ".delegate.json").write_text(json.dumps({"maxRework": "one"}))
         self.assertIn("maxRework must be", self.cli("reply", "job", "bad").stderr)
+        # Invalid configuration refuses every start; restore it before the read-only run.
+        (repo / ".delegate.json").write_text(json.dumps({"maxRework": 1}))
         self.fake_pi([answer("look"), SETTLED])
         reader = self.outcome(self.cli("run", "--read-only", "--workdir", repo, "--name", "look", "read"))
         for _ in range(3):

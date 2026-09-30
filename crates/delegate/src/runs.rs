@@ -236,6 +236,9 @@ pub fn status(run: &Path) -> Value {
     if !s(&meta, "agentBin").is_empty() {
         out["agentBin"] = meta["agentBin"].clone();
     }
+    if let Some(sources) = meta.get("configSources") {
+        out["configSources"] = sources.clone();
+    }
     if let Some(age) = age_seconds(&meta) {
         out["ageSeconds"] = json!(age);
     }

@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "5.16.0"
+  version: "5.17.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -85,6 +85,8 @@ $D wait                                                                         
 state 只描述答复。只读任务写文件仍是 `answered`，短行提示，JSON 带 `readOnlyViolation`（隔离未合并）或 `workspaceChanged`（原地无法归属）。改动来自前后快照：含 shell 改动，排除原有脏改动与验收副产物。退出码：`0` 成功，`1` 其他结局，`2` 用法错误/拒绝，`75` 仍运行，`76` 已有等待者。
 
 `.delegate.json` 的 `agentDeny` 用 argv 前缀拦截同事误跑全量检查，shim 拒绝退出 `77` 并打印替代检查提示，同事的 `lane` 同样受限。JSON 结论带 `denied: N`，短行提示“拦下 N 次全量检查”。同事只跑相关检查；主控合入一批后统一跑全量。验收、setup、apply 生成与复验、主控 lane 保持原 PATH；未配置时行为不变。配置与误用防护边界见 [references/output-and-files.md](references/output-and-files.md)。
+
+跨仓库通用的 `agentDeny`、`env`、`maxRework`、默认 `accept` 与机器容量可写到 `${XDG_CONFIG_HOME:-~/.config}/delegate/config.json`；仓库 `.delegate.json` 合并覆盖，仓库事实仍留在仓库。JSON 结论的 `configSources` 记录来源，配置错误指出文件与字段并拒绝启动（退出 2）。合并与撤销规则见 [references/output-and-files.md](references/output-and-files.md#用户与仓库配置)。
 
 `--json` 保留原完整结构：`shape` 含目录增删行、改后最大文件、配置与删除路径；`*More` 是省略数量，逐文件在 `changes.json`。`changes` 是本轮，`pendingChanges` 是累计待合入量，零改动 reply 仍可能需 `diff --total`/`apply`。
 

@@ -4,6 +4,8 @@
 
 ### 技能
 
+- `delegate` 5.17.0：新增用户级 `${XDG_CONFIG_HOME:-~/.config}/delegate/config.json`，与仓库 `.delegate.json` 按标量仓库优先、env 按键覆盖、agentDeny 按 argv 合并去重；仓库 `allow: true` 可撤销精确用户规则。用户级默认验收、返工预算与机器容量跨仓库生效，容量环境变量仍最高。worktree/generated/applyVerify 只认仓库，用户出现时启动 stderr 提示一次；独立校验两份文件，错误指出文件与字段并退出 2。meta、summary 与 JSON 结论记录 configSources，自然语言短行不变；新增用户/仓库/合并/撤销/容量优先级/忽略提示/错误的黑盒回归。二进制和校验和留待主控审后构建。
+
 - `delegate` 5.16.0：`.delegate.json` 新增 `agentDeny` argv 前缀规则，启动时解析真实程序绝对路径并生成同事专用 PATH shim；命中打印 hint、退出 77，同事 lane 同样受限，环境变量无放行开关。未命中 exec 透传参数、stdin/stdout 与退出码；验收、setup、apply 生成与复验、主控 lane 保持原 PATH。结论统计 `denied: N`，自然语言提示“拦下 N 次全量检查”。写入 timeout 的下一次 reply 记 `continuation: timeout`，不耗 maxRework，超限与连续超时也能续做；next 给可复制命令，其他失败仍按原规则。防护针对误用，不是同 UID 恶意绕过的沙箱。补黑盒回归并纳入现有验证入口；二进制与校验和留待主控审后构建。
 - `iteration-speed` 1.0.0（新增）：先测无改动、上下游修改与完整门禁反馈，再选择分层验收、跨 worktree 缓存和模块拆分；bash 工具只读探测 Rust/Node/Python/Go/Docker，记录用户级耗时历史，预览或备份后写入用户级 sccache/mold 配置；附生态实践、Polaris 测量基线、触发示例与临时目录测试。
 - `delegate` 5.15.0：托管 copy/link 路径从验收证据排除，结论用 `excluded` 标明；未初始化且目录空/缺失、指针未改的 gitlink 内容也列为范围外，指针仍参与树比较，源初始化后重新核验，非托管索引标记和脏子模块仍判不完整；保护路径与 `generated.paths` 重叠时允许生成命令改动，收尾经 lane 复跑并核对产出，漂移报“生成物被手改”；每任务等待者 flock 记录 PID，重复等待退出 76，死亡自动释放，逐个/流式/整机收取均避开覆盖；默认状态与结论改为自然语言短行，文件数、增删行及前三目录用仓库相对路径，运行中显示最近命令，完整原字段留在 `--json`，答复仍随后附上。旧测试显式加 `--json`，默认短行与子模块边界补回归，5.15 用例纳入仓库门禁。二进制与校验和留待主控审后构建。

@@ -28,7 +28,7 @@ fn accept(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
         "accept {}",
         run.file_name().unwrap_or_default().to_string_lossy()
     );
-    let slot = lane::acquire(&label, None, |ahead, _| {
+    let slot = lane::acquire(&label, None, Some(run), |ahead, _| {
         log_event(run, json!({"e":"queue","ahead":ahead}))
     });
     let Ok(slot) = slot else {
@@ -373,7 +373,7 @@ fn check_generated(
             .filter_map(Value::as_str)
             .map(str::to_string)
             .collect::<Vec<_>>();
-        let _slot = lane::acquire("check protected generation", None, |ahead, _| {
+        let _slot = lane::acquire("check protected generation", None, Some(run), |ahead, _| {
             log_event(run, json!({"e":"queue","ahead":ahead}));
         })?;
         if lane::stopped() {
@@ -437,7 +437,7 @@ fn escalate(
         .into_iter()
         .filter(|r| r != run)
         .collect();
-    if launch::capacity(&strong, &others).is_err() {
+    if launch::capacity(&strong, &others, &meta["configCapacity"]).is_err() {
         log_event(
             run,
             json!({"e":"escalate_skipped","reason":format!("no room for {strong}")}),
@@ -743,7 +743,7 @@ fn admit_waiting(run: &Path, meta: &Value, stop_waiter: &StopWaiter) -> Res<()> 
         let machine = lock(&slots.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
         let local = lock(&root.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
         let others = launch::active_machine(&slots);
-        let full = launch::capacity(s(meta, "agent"), &others);
+        let full = launch::capacity(s(meta, "agent"), &others, &meta["configCapacity"]);
         if let Err(reason) = &full {
             if !reason.contains("runs are active") && !reason.contains("Codex runs are active") {
                 return full;

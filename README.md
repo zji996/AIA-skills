@@ -27,6 +27,8 @@
 
 `delegate` 架构总览：[docs/assets/delegate-architecture.webp](docs/assets/delegate-architecture.webp)（提示词同目录）。
 
+`delegate` 5.17.0 配置能力：用户级 `${XDG_CONFIG_HOME:-~/.config}/delegate/config.json` 与仓库 `.delegate.json` 合并，通用 deny/env/返工预算/默认验收只写一次；仓库可按 argv 撤销用户 deny，机器容量支持配置且环境变量优先。仓库专属事实只读仓库，JSON 的 `configSources` 可追溯来源。规则见 [用户与仓库配置](skills/delegate/references/output-and-files.md#用户与仓库配置)。
+
 ---
 
 ## 🚀 安装与使用

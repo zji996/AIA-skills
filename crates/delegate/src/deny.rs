@@ -10,6 +10,10 @@ use std::process::Command;
 pub const EXIT_DENIED: i32 = 77;
 
 pub fn validate(value: Option<&Value>) -> Res<Value> {
+    validate_config(value, false)
+}
+
+pub fn validate_config(value: Option<&Value>, repo: bool) -> Res<Value> {
     let Some(value) = value else {
         return Ok(json!([]));
     };
@@ -35,9 +39,18 @@ pub fn validate(value: Option<&Value>) -> Res<Value> {
         {
             return Err("agentDeny.argv[0] must be a program name (no path)".into());
         }
-        if !rule["hint"]
-            .as_str()
-            .is_some_and(|s| !s.trim().is_empty() && !s.contains('\0'))
+        if let Some(allow) = rule.get("allow") {
+            if !allow.is_boolean() || (allow == &json!(true) && !repo) {
+                return Err(
+                    "agentDeny.allow must be a boolean; true is only allowed in repository config"
+                        .into(),
+                );
+            }
+        }
+        if rule["allow"] != json!(true)
+            && !rule["hint"]
+                .as_str()
+                .is_some_and(|s| !s.trim().is_empty() && !s.contains('\0'))
         {
             return Err("agentDeny.hint must be a non-empty string without NUL".into());
         }

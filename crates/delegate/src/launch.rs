@@ -484,11 +484,21 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         return Err("--protect needs a git repository".into());
     }
     normalize_protect(&mut o.protect)?;
-    let mut extra = json!({"env":{}});
+    let config = crate::config::load(repo.as_deref())?;
+    let capacities = crate::config::capacities(&config.value)?;
+    if !config.ignored.is_empty() {
+        eprintln!(
+            "delegate: {}: ignoring repository-only fields: {}",
+            crate::config::user_path().display(),
+            config.ignored.join(", ")
+        );
+    }
+    let mut extra = json!({"env":config.value["env"],"agentDeny":config.value["agentDeny"],"configSources":config.sources,"configCapacity":capacities});
+    if !o.read_only && !o.accept_set {
+        o.accept = config.value["accept"].as_str().map(str::to_string);
+    }
     if let Some(top) = &repo {
-        let (env, cfg, default_accept, deny) = worktree::config(top)?;
-        extra["env"] = env;
-        extra["agentDeny"] = deny;
+        let cfg = worktree::work_config(&config.value, &top.join(".delegate.json"))?;
         if !o.read_only && !o.protect.is_empty() {
             let (paths, command) = worktree::generated(top)?;
             let overlap = paths
@@ -510,9 +520,6 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
                 eprintln!("delegate: protected generated paths {} may only be changed by generated.command", overlap.join(", "));
                 extra["protectGenerated"] = json!({"paths":overlap,"command":command});
             }
-        }
-        if !o.read_only && !o.accept_set {
-            o.accept = default_accept;
         }
         if let Some(upstream) = &in_run {
             let prior = json(upstream.join("meta.json"));
@@ -567,34 +574,23 @@ fn rework_used(run: &Path) -> (u64, String) {
 /// Rework budget for write conversations (`.delegate.json` `maxRework`, default 1):
 /// past it, the caller finishes the work; `--minor` covers short fixes and
 /// `--over-limit REASON` is an explicit, recorded exception.
-fn rework_gate(parent: &Path, meta: &Value, o: &Options, prompt: &str) -> Res<Option<Value>> {
+fn rework_gate(
+    parent: &Path,
+    meta: &Value,
+    o: &Options,
+    prompt: &str,
+    config: &Value,
+) -> Res<Option<Value>> {
     if s(meta, "mode") != "write" {
         if o.minor || o.over_limit.is_some() {
             return Err("--minor and --over-limit apply to write conversations".into());
         }
         return Ok(None);
     }
-    let top = Some(s(&meta["worktree"], "source"))
-        .filter(|x| !x.is_empty())
-        .unwrap_or(s(meta, "top"));
-    let file = Path::new(top).join(".delegate.json");
-    let limit = if file.is_file() {
-        match serde_json::from_str::<Value>(&read(&file))
-            .map_err(|e| format!("cannot read {}: {e}", file.display()))?
-            .get("maxRework")
-        {
-            None => Some(1),
-            Some(Value::Null) => None,
-            Some(Value::Number(n)) if n.as_u64().is_some() => n.as_u64(),
-            Some(_) => {
-                return Err(format!(
-                    "{}: maxRework must be a non-negative integer or null",
-                    file.display()
-                ))
-            }
-        }
-    } else {
-        Some(1)
+    let limit = match config.get("maxRework") {
+        Some(Value::Null) => None,
+        Some(value) => value.as_u64(),
+        None => Some(1),
     };
     let (used, name) = rework_used(parent);
     if runs::state(parent) == "timeout" {
@@ -740,7 +736,12 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         o.accept = None;
     }
     let prompt = read_prompt(&mut o)?;
-    o.rework = rework_gate(&parent, &meta, &o, &prompt)?;
+    let top = Some(s(&meta["worktree"], "source"))
+        .filter(|x| !x.is_empty())
+        .unwrap_or(s(&meta, "top"));
+    let config = crate::config::load(Some(Path::new(top)))?;
+    let capacities = crate::config::capacities(&config.value)?;
+    o.rework = rework_gate(&parent, &meta, &o, &prompt, &config.value)?;
     if o.sync && !meta["worktree"].is_object() {
         return Err("--sync requires a worktree conversation".into());
     }
@@ -773,6 +774,17 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         json!({"parent":meta,"session":session,"env":meta["env"],"worktree":meta["worktree"]});
     extra["protectGenerated"] = meta["protectGenerated"].clone();
     extra["agentDeny"] = meta["agentDeny"].clone();
+    let sources = ["user", "repo"]
+        .into_iter()
+        .filter(|source| {
+            config.sources.contains(source)
+                || meta["configSources"]
+                    .as_array()
+                    .is_some_and(|sources| sources.iter().any(|s| s.as_str() == Some(source)))
+        })
+        .collect::<Vec<_>>();
+    extra["configSources"] = json!(sources);
+    extra["configCapacity"] = capacities;
     if s(&summary, "state") == "timeout" && s(&meta, "mode") == "write" {
         extra["continuation"] = json!("timeout");
     }
@@ -822,9 +834,9 @@ pub fn machine_runs(slots: &Path) -> Vec<PathBuf> {
         .filter(|run| run.join("meta.json").is_file() && active(&state(run)))
         .collect()
 }
-pub fn capacity(agent: &str, active_runs: &[PathBuf]) -> Res<()> {
-    let total = number("MAX_ACTIVE", 8)?;
-    let codex = number("MAX_CODEX", 4)?;
+pub fn capacity(agent: &str, active_runs: &[PathBuf], config: &Value) -> Res<()> {
+    let total = crate::config::capacity(config, "maxActive", "MAX_ACTIVE", 8)?;
+    let codex = crate::config::capacity(config, "maxCodex", "MAX_CODEX", 4)?;
     let codex_count = active_runs
         .iter()
         .filter(|r| agents::spec(s(&json(r.join("meta.json")), "agent")).is_some_and(|a| a.heavy))
@@ -932,7 +944,7 @@ pub fn launch(
     let active_runs = active_machine(&slots);
     let deferred = extra["after"].is_string();
     if !deferred {
-        capacity(&o.agent, &active_runs)?;
+        capacity(&o.agent, &active_runs, &extra["configCapacity"])?;
     }
     if !deferred && mode == "write" && !o.parallel && !extra["worktree"].is_object() {
         for run in all_runs() {
@@ -1155,6 +1167,8 @@ pub fn launch(
     let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":seconds(o.timeout.as_deref().unwrap_or("15m"))?,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
     let (agent_bin, agent_version) = agent_identity(s(&meta, "agent"))?;
     meta["agentBin"] = json!(agent_bin);
+    meta["configSources"] = extra.get("configSources").cloned().unwrap_or(json!([]));
+    meta["configCapacity"] = extra["configCapacity"].clone();
     if let Some(rules) = extra.get("agentDeny").filter(|rules| !rules.is_null()) {
         meta["agentDeny"] = rules.clone();
     }

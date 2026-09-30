@@ -8,31 +8,7 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub fn config(top: &Path) -> Res<(Value, Value, Option<String>, Value)> {
-    let path = top.join(".delegate.json");
-    let val = if path.is_file() {
-        let v: Value = serde_json::from_str(&read(&path))
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        if !v.is_object() {
-            return Err(format!("{}: expected a JSON object", path.display()));
-        }
-        v
-    } else {
-        json!({})
-    };
-    let env = val
-        .get("env")
-        .filter(|x| !x.is_null())
-        .cloned()
-        .unwrap_or(json!({}));
-    if !env.is_object() || !env.as_object().unwrap().iter().all(|(_, v)| v.is_string()) {
-        return Err(format!("{}: env must map names to strings", path.display()));
-    }
-    let accept = match val.get("accept") {
-        None => None,
-        Some(Value::String(command)) => Some(command.clone()),
-        _ => return Err(format!("{}: accept must be a string", path.display())),
-    };
+pub fn work_config(val: &Value, path: &Path) -> Res<Value> {
     let work = val
         .get("worktree")
         .filter(|x| !x.is_null())
@@ -57,7 +33,9 @@ pub fn config(top: &Path) -> Res<(Value, Value, Option<String>, Value)> {
                 path.display()
             ));
         };
-        if items.iter().any(|x| x.trim().is_empty())
+        if items
+            .iter()
+            .any(|x| x.trim().is_empty() || x.contains('\0'))
             || value.as_array().is_some_and(|a| a.len() != items.len())
         {
             return Err(format!(
@@ -85,9 +63,7 @@ pub fn config(top: &Path) -> Res<(Value, Value, Option<String>, Value)> {
             })
             .collect::<Vec<_>>());
     }
-    let deny = crate::deny::validate(val.get("agentDeny"))
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok((env, out, accept, deny))
+    Ok(out)
 }
 fn strings(v: &Value) -> Vec<String> {
     v.as_array()
@@ -101,7 +77,10 @@ fn strings(v: &Value) -> Vec<String> {
 }
 pub fn generated(source: &Path) -> Res<(Vec<String>, String)> {
     let file = source.join(".delegate.json");
-    let cfg = json(&file);
+    let cfg = crate::config::read_file(&file)?.unwrap_or(json!({}));
+    generated_config(&cfg, &file)
+}
+pub fn generated_config(cfg: &Value, file: &Path) -> Res<(Vec<String>, String)> {
     let Some(spec) = cfg.get("generated") else {
         return Ok((vec![], String::new()));
     };
@@ -110,16 +89,23 @@ pub fn generated(source: &Path) -> Res<(Vec<String>, String)> {
         .ok_or_else(|| format!("{}: generated.paths must be a list", file.display()))?;
     let mut rules = vec![];
     for item in paths {
-        let path = item
-            .as_str()
-            .ok_or("generated.paths entries must be strings")?;
+        let path = item.as_str().ok_or_else(|| {
+            format!(
+                "{}: generated.paths entries must be strings",
+                file.display()
+            )
+        })?;
         let core = path.trim_end_matches('/');
         if core.is_empty()
+            || core.contains('\0')
             || Path::new(core)
                 .components()
                 .any(|c| !matches!(c, std::path::Component::Normal(_)))
         {
-            return Err(format!("invalid generated path: {path}"));
+            return Err(format!(
+                "{}: invalid generated.paths entry: {path}",
+                file.display()
+            ));
         }
         let mut normalized = Path::new(core)
             .components()
@@ -133,7 +119,13 @@ pub fn generated(source: &Path) -> Res<(Vec<String>, String)> {
     }
     let command = spec["command"]
         .as_str()
-        .ok_or("generated.command must be a string")?;
+        .filter(|s| !s.contains('\0'))
+        .ok_or_else(|| {
+            format!(
+                "{}: generated.command must be a string without NUL",
+                file.display()
+            )
+        })?;
     Ok((rules, command.to_string()))
 }
 pub fn matches_rule(path: &str, rules: &[String]) -> bool {
@@ -258,6 +250,7 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<Option<String>> {
             run.file_name().unwrap_or_default().to_string_lossy()
         ),
         None,
+        Some(run),
         |_, _| {},
     )?;
     let log = run.join("setup.log");
@@ -750,6 +743,9 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<ApplyOutcome> {
     apply_progress("checking merge / 正在检查合并");
     let mut conclusion = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),
         "operation":"apply","apply":{"ok":false,"dryRun":dry}});
+    if let Some(sources) = json(run.join("meta.json")).get("configSources") {
+        conclusion["configSources"] = sources.clone();
+    }
     let code = apply_inner(run, merge, dry, &mut conclusion)?;
     conclusion["apply"]["ok"] = json!(code == 0);
     accept_validity(run, dry, &mut conclusion);
@@ -882,7 +878,7 @@ pub fn verify_after_apply(run: &Path, forced: Option<bool>, conclusion: &mut Val
         run.file_name().unwrap_or_default().to_string_lossy()
     );
     apply_progress("verifying merged tree / 正在验收合并结果");
-    let slot = lane::acquire(&label, None, |ahead, _| {
+    let slot = lane::acquire(&label, None, Some(run), |ahead, _| {
         apply_progress(format!("verify queued / 排队中: {ahead} ahead"))
     });
     let mut result = json!({"command":command});
@@ -1253,6 +1249,7 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
                 run.file_name().unwrap_or_default().to_string_lossy()
             ),
             None,
+            Some(run),
             |ahead, labels| {
                 apply_progress(format!(
                     "generator queued / 生成器排队: {ahead} ahead; {}",

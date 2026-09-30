@@ -2,6 +2,7 @@ mod agents;
 mod changes;
 mod cleanup;
 mod common;
+mod config;
 mod deny;
 mod help;
 mod lane;

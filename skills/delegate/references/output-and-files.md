@@ -30,6 +30,23 @@
 
 同事的超时：到 `--timeout`（不含排队）时若有命令正在执行，或 120 秒内有事件，继续运行，最多到 `--timeout` 的 `1 + DELEGATE_TIMEOUT_GRACE/100` 倍（默认 1.1 倍）；结论里 `graceSeconds` 记下超出的秒数。
 
+## 用户与仓库配置
+
+用户配置 `${XDG_CONFIG_HOME:-~/.config}/delegate/config.json` 支持 `agentDeny`、`env`、`maxRework`、默认 `accept`、`maxActive`、`maxCodex`、`maxHeavy`。仓库根 `.delegate.json` 使用相同字段并保存仓库事实。
+
+- 标量：仓库 > 用户 > 内置默认；容量的 `DELEGATE_MAX_ACTIVE` / `DELEGATE_MAX_CODEX` / `DELEGATE_MAX_HEAVY` 最高，仍兼容 `PI_DELEGATE_*`，`0` 不限（默认 8 / 4 / 1）。写入默认 `accept` 在仓库未提供该字段时用用户值，`--accept` 覆盖、`--no-accept` 关闭；只读不用默认验收。
+- `env` 按键合并，仓库优先；`agentDeny` 合并，两份按精确 argv 去重，仓库同 argv 的 hint 覆盖用户值，保留原顺序。仓库 `{"argv":["cargo","xtask","check"],"allow":true}` 可撤销一条用户规则，无需 hint；只撤销完全相同的 argv，不撤销其他前缀规则，用户配置不能声明 `allow: true`。
+- `worktree`、`generated`、`applyVerify` 只认仓库：用户级出现时忽略，`start`（含 `run`）在 stderr 汇总提示一次。
+- 两份文件独立校验，覆盖不能隐藏错误；错误指出文件与字段，启动退出 2。JSON 语法错误指出文件与行列。meta、summary 与 `--json` 记 `configSources: ["user","repo"]`（启动时只有存在的配置文件，没有时 `[]`），自然语言短行不变。reply 沿用启动时的 env、deny、验收，返工预算和容量按当前两级配置读取；来源包含继承配置与当前配置两部分。
+
+用户级示例：
+
+```json
+{"maxActive":8,"maxCodex":4,"maxHeavy":1,"maxRework":1,
+ "env":{"CUDA_VISIBLE_DEVICES":""},
+ "agentDeny":[{"argv":["cargo","xtask","check"],"hint":"主控合入后跑全量；同事改跑 cargo test -p <crate>"}]}
+```
+
 ## 同事全量检查拦截（agentDeny）
 
 仓库根 `.delegate.json` 可配置：

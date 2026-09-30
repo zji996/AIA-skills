@@ -72,7 +72,11 @@ pub fn stopped() -> bool {
     SIGNAL.load(Ordering::SeqCst) != 0
 }
 pub fn max_heavy() -> Res<usize> {
-    Ok(number("MAX_HEAVY", 1)? as usize)
+    heavy_limit(None)
+}
+fn heavy_limit(run: Option<&Path>) -> Res<usize> {
+    let config = crate::config::context_capacity(run)?;
+    Ok(crate::config::capacity(&config, "maxHeavy", "MAX_HEAVY", 1)? as usize)
 }
 fn lane_dir() -> PathBuf {
     state_dir().join("lane")
@@ -135,9 +139,10 @@ fn block_on(p: &Path) {
 pub fn acquire(
     label: &str,
     account: Option<&Path>,
+    context: Option<&Path>,
     mut waiting: impl FnMut(usize, &[String]),
 ) -> Res<Slot> {
-    let limit = max_heavy()?;
+    let limit = heavy_limit(context)?;
     if limit == 0 || std::env::var_os("DELEGATE_LANE_HELD").is_some() {
         return Ok(Slot {
             ticket: None,
@@ -277,15 +282,20 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
     install_signals();
     let mut shown = false;
     let account = std::env::var_os("DELEGATE_RUN_DIR").map(PathBuf::from);
-    let slot = acquire(&label, account.as_deref(), |ahead, labels| {
-        if !shown {
-            eprintln!(
-                "delegate lane: queued behind {ahead}: {}",
-                labels.join("; ")
-            );
-            shown = true;
-        }
-    })?;
+    let slot = acquire(
+        &label,
+        account.as_deref(),
+        account.as_deref(),
+        |ahead, labels| {
+            if !shown {
+                eprintln!(
+                    "delegate lane: queued behind {ahead}: {}",
+                    labels.join("; ")
+                );
+                shown = true;
+            }
+        },
+    )?;
     if shown {
         eprintln!(
             "delegate lane: started after {:.0}s in the queue",

@@ -1,0 +1,178 @@
+use crate::common::*;
+use serde_json::{json, Value};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+pub struct Config {
+    pub value: Value,
+    pub sources: Vec<&'static str>,
+    pub ignored: Vec<&'static str>,
+}
+
+pub fn user_path() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".config"))
+        .join("delegate/config.json")
+}
+
+pub fn read_file(path: &Path) -> Res<Option<Value>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: config: {e}", path.display())),
+    };
+    let value: Value =
+        serde_json::from_str(&text).map_err(|e| format!("{}: config JSON: {e}", path.display()))?;
+    if !value.is_object() {
+        return Err(format!("{}: config must be a JSON object", path.display()));
+    }
+    Ok(Some(value))
+}
+
+fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
+    let check = || -> Res<()> {
+        if let Some(env) = value.get("env").filter(|v| !v.is_null()) {
+            let map = env.as_object().ok_or("env must map names to strings")?;
+            for (key, val) in map {
+                if key.is_empty()
+                    || key.contains(['=', '\0'])
+                    || !val.as_str().is_some_and(|v| !v.contains('\0'))
+                {
+                    return Err(format!(
+                        "env must map names to strings: env.{key} must have a valid name and string without NUL"
+                    ));
+                }
+            }
+        }
+        if value
+            .get("accept")
+            .is_some_and(|v| !v.as_str().is_some_and(|s| !s.contains('\0')))
+        {
+            return Err("accept must be a string without NUL".into());
+        }
+        if value
+            .get("maxRework")
+            .is_some_and(|v| !v.is_null() && v.as_u64().is_none())
+        {
+            return Err("maxRework must be a non-negative integer or null".into());
+        }
+        for key in ["maxActive", "maxCodex", "maxHeavy"] {
+            if value.get(key).is_some_and(|v| v.as_u64().is_none()) {
+                return Err(format!(
+                    "{key} must be a non-negative integer (0 = unlimited)"
+                ));
+            }
+        }
+        crate::deny::validate_config(value.get("agentDeny"), repo)?;
+        Ok(())
+    };
+    check().map_err(|e| format!("{}: {e}", path.display()))?;
+    if repo {
+        crate::worktree::work_config(value, path)?;
+        crate::worktree::generated_config(value, path)?;
+        match value.get("applyVerify") {
+            None | Some(Value::Null) | Some(Value::Bool(_)) => {}
+            Some(Value::String(s)) if !s.trim().is_empty() && !s.contains('\0') => {}
+            _ => {
+                return Err(format!(
+                    "{}: applyVerify must be true, false or a command",
+                    path.display()
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn load(top: Option<&Path>) -> Res<Config> {
+    let user_file = user_path();
+    let user = read_file(&user_file)?;
+    let repo_file = top
+        .filter(|top| !top.as_os_str().is_empty())
+        .map(|top| top.join(".delegate.json"));
+    let repo = repo_file.as_deref().map(read_file).transpose()?.flatten();
+    let mut sources = vec![];
+    let mut ignored = vec![];
+    if let Some(user) = &user {
+        validate(user, &user_file, false)?;
+        sources.push("user");
+        for key in ["worktree", "generated", "applyVerify"] {
+            if user.get(key).is_some() {
+                ignored.push(key);
+            }
+        }
+    }
+    if let Some(repo) = &repo {
+        validate(repo, repo_file.as_deref().unwrap(), true)?;
+        sources.push("repo");
+    }
+    let mut value = repo.clone().unwrap_or(json!({}));
+    for key in ["accept", "maxRework", "maxActive", "maxCodex", "maxHeavy"] {
+        if value.get(key).is_none() {
+            if let Some(v) = user.as_ref().and_then(|u| u.get(key)) {
+                value[key] = v.clone();
+            }
+        }
+    }
+    let mut env = json!({});
+    let mut rules: Vec<Value> = vec![];
+    for layer in [&user, &repo].into_iter().flatten() {
+        if let Some(map) = layer["env"].as_object() {
+            env.as_object_mut().unwrap().extend(map.clone());
+        }
+        for rule in layer["agentDeny"].as_array().into_iter().flatten() {
+            let position = rules.iter().position(|r| r["argv"] == rule["argv"]);
+            if rule["allow"] == json!(true) {
+                if let Some(pos) = position {
+                    rules.remove(pos);
+                }
+            } else if let Some(pos) = position {
+                rules[pos] = rule.clone();
+            } else {
+                rules.push(rule.clone());
+            }
+        }
+    }
+    value["env"] = env;
+    value["agentDeny"] = json!(rules);
+    Ok(Config {
+        value,
+        sources,
+        ignored,
+    })
+}
+
+pub fn capacity(value: &Value, key: &str, name: &str, default: u64) -> Res<u64> {
+    number(name, value[key].as_u64().unwrap_or(default))
+}
+
+pub fn capacities(value: &Value) -> Res<Value> {
+    Ok(json!({
+        "maxActive": capacity(value, "maxActive", "MAX_ACTIVE", 8)?,
+        "maxCodex": capacity(value, "maxCodex", "MAX_CODEX", 4)?,
+        "maxHeavy": capacity(value, "maxHeavy", "MAX_HEAVY", 1)?,
+    }))
+}
+
+pub fn context_capacity(run: Option<&Path>) -> Res<Value> {
+    let run = run
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("DELEGATE_RUN_DIR").map(PathBuf::from));
+    if let Some(run) = run {
+        let meta = json(run.join("meta.json"));
+        if meta["configCapacity"].is_object() {
+            return Ok(meta["configCapacity"].clone());
+        }
+        let source = s(&meta["worktree"], "source");
+        let top = if source.is_empty() {
+            s(&meta, "top")
+        } else {
+            source
+        };
+        return Ok(load(Some(Path::new(top)))?.value);
+    }
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    Ok(load(git_top(&cwd).as_deref())?.value)
+}
