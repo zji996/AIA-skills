@@ -214,6 +214,13 @@
 
 **结论**：强档已能承担含样式的前端实现，速度约为便宜档 2.5–3.5 倍；便宜档长写入接近超时，价值在只读看图挑毛病。前端流程改为“强档实现 → 便宜档只读看截图 → 主控取舍，最多一次返工”，返工预算见 5.14.0 `maxRework`。同题双派只用于这类明确的基准对比。
 
+## 十九、agentDeny 写成 `./manage.sh` 时六路派发全部被拒（image-shard-studio，2026-10-01）
+
+- 现象：`.delegate.json` 的 agentDeny 加了 `{"argv":["./manage.sh","check"]}`，随后一次性派发 6 路写入任务，全部在启动时以 `agentDeny.argv[0] must be a program name (no path)` 退出 2。
+- 原因：shim 按 PATH 上的程序名拦截，按路径调用的仓库脚本本来就拦不住，校验按设计拒绝；但配置只在 `start` 时校验，写配置时没有反馈。
+- 处理：删掉 `./manage.sh` 规则，只保留 `make check/verify/build`；仓库脚本的全量入口靠 `make` 目标与 hint 引导。
+- 启示：可以提供 `delegate config check`（或 `start --dry-run`）在提交 `.delegate.json` 前校验；文档里注明“仓库内脚本不能作为 agentDeny 目标，拦它的 make 包装”。
+
 ## 待改进（按收益排序）
 
 1. ~~`apply` 默认忽略"仅初始化"的子模块变化~~（5.1.0 已完成）
