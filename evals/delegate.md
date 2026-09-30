@@ -1,5 +1,13 @@
 # delegate
 
+## 5.15 精简输出与边界
+
+- 默认收结论只读短行与答复：名字、状态、档位、耗时、文件数与增删行、前三目录、验收、下一步；需要完整字段时显式 `status --json`/`wait --json`，不要展开全过程。
+- `.delegate.json` 将只读 gitlink `third_party/pi` 放进 worktree.link：验收证据的 `excluded` 列出该路径，skip-worktree 不再导致 incomplete；手工给普通文件加标记仍不可复用。
+- `third_party/pi-kit` 未初始化、目录空且指针未改：内容列为 `excluded`，不判 incomplete；指针继续参与树比较。源子模块随后初始化并改脏时，必须重新判不完整，不能沿用旧内容排除。
+- DTO 改动需要重生成，但 `gen/` 受保护：按启动提示允许运行 `generated.command`，收尾复跑核对；产出漂移时看 `protectViolation` 的“生成物被手改”。
+- 同一任务已有后台 wait：第二个 wait 立即退出 76，通知仍给原 pid；`--any`/`--stream`/`--machine` 跳过已覆盖任务，等待者死亡后可以重新接收。
+
 ## 5.12 收取与合并触发
 
 - 后台 `wait --any` 通知到了，但可能是早先结束的审查：读 `completionTiming` 与 `finishedAt`，继续收尚未完成的任务。

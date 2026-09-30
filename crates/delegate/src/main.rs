@@ -5,8 +5,10 @@ mod common;
 mod help;
 mod lane;
 mod launch;
+mod output;
 mod runs;
 mod supervise;
+mod waiting;
 mod worktree;
 use common::*;
 use serde_json::json;
@@ -17,13 +19,20 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 fn status_line(run: &Path) -> String {
-    format_status(runs::status(run))
+    output_line(run, runs::status(run))
+}
+fn output_line(run: &Path, status: serde_json::Value) -> String {
+    if output::json_enabled() {
+        format_status(status)
+    } else {
+        output::human(run, &status)
+    }
 }
 /// A finished run's status, plus how far the source moved since its worktree snapshot.
 fn outcome_line(run: &Path, timing: Option<&str>) -> String {
     let mut status = runs::status(run);
     if runs::active(&runs::state(run)) {
-        return format_status(status);
+        return output_line(run, status);
     }
     if let Some(timing) = timing {
         status["completionTiming"] = json!(timing);
@@ -40,7 +49,7 @@ fn outcome_line(run: &Path, timing: Option<&str>) -> String {
         }
         status["sourceDrift"] = drift;
     }
-    format_status(status)
+    output_line(run, status)
 }
 fn format_status(status: serde_json::Value) -> String {
     let keys = [
@@ -219,7 +228,14 @@ fn print_answer(run: &Path, full: bool) -> bool {
             "{}\n[… 省略 {} 字符；完整答复: {}]\n{}",
             head.trim_end_matches('\n'),
             result.chars().count() - limit,
-            run.join("result.md").display(),
+            if output::json_enabled() {
+                run.join("result.md").display().to_string()
+            } else {
+                format!(
+                    "delegate result {}",
+                    run.file_name().unwrap_or_default().to_string_lossy()
+                )
+            },
             tail.trim_end_matches('\n')
         );
     }
@@ -294,7 +310,13 @@ fn collect(
     full: bool,
     show_result: bool,
 ) -> i32 {
-    collect_timed(runs, max, show_progress, full, show_result, None)
+    let Ok((runs, _claims)) = waiting::claim(runs) else {
+        return 2;
+    };
+    if runs.is_empty() {
+        return waiting::COVERED;
+    }
+    collect_timed(&runs, max, show_progress, full, show_result, None)
 }
 fn collect_timed(
     runs: &[PathBuf],
@@ -343,8 +365,10 @@ fn collect_timed(
         if !["delivered", "answered"].contains(&state.as_str()) && code == 0 {
             code = 1;
         }
-        changes::print_changes(run);
-        changes::print_shape(run);
+        if output::json_enabled() {
+            changes::print_changes(run);
+            changes::print_shape(run);
+        }
         let summary = json(run.join("summary.json"));
         if let Some(cleanup) = summary.get("cleanup") {
             let ports = cleanup["ports"]
@@ -367,8 +391,16 @@ fn collect_timed(
             );
         }
         if let Some(warnings) = summary["warnings"].as_array() {
-            for warning in warnings {
-                println!("warning: {}", warning.as_str().unwrap_or(""));
+            if output::json_enabled() {
+                for warning in warnings {
+                    println!("warning: {}", warning.as_str().unwrap_or(""));
+                }
+            } else if !warnings.is_empty() {
+                println!(
+                    "提示：{} 个 worktree 参考路径问题；详情：delegate status {} --json",
+                    warnings.len(),
+                    run.file_name().unwrap_or_default().to_string_lossy()
+                );
             }
         }
         let has_result = run.join("result.md").is_file();
@@ -448,6 +480,18 @@ fn wait_each(
     full: bool,
     show_result: bool,
 ) -> i32 {
+    let initial = list.clone();
+    let Ok((claimed, mut claims)) = waiting::claim(&list) else {
+        return 2;
+    };
+    list = claimed;
+    let mut covered = initial
+        .into_iter()
+        .filter(|run| !list.contains(run))
+        .collect::<std::collections::HashSet<_>>();
+    if list.is_empty() {
+        return waiting::COVERED;
+    }
     let begin = Instant::now();
     let already = list
         .iter()
@@ -480,15 +524,22 @@ fn wait_each(
                     let mut line = outcome_line(run, Some(completion_timing(&already, run)));
                     if run.join("result.md").is_file() && !run.join(".delivered").exists() {
                         // The answer is not printed here; name the command that reports it.
-                        line.pop();
-                        line.push_str(&format!(
-                            ",\"report\":{}}}",
-                            json!(format!(
-                                "{} wait {}",
-                                script().display(),
+                        if output::json_enabled() {
+                            line.pop();
+                            line.push_str(&format!(
+                                ",\"report\":{}}}",
+                                json!(format!(
+                                    "{} wait {}",
+                                    script().display(),
+                                    run.file_name().unwrap_or_default().to_string_lossy()
+                                ))
+                            ));
+                        } else {
+                            line.push_str(&format!(
+                                " · 答复：delegate result {}",
                                 run.file_name().unwrap_or_default().to_string_lossy()
-                            ))
-                        ));
+                            ));
+                        }
                     }
                     println!("{line}");
                     if !["delivered", "answered"].contains(&state.as_str()) {
@@ -545,8 +596,14 @@ fn wait_each(
         if let Some((pos, flags)) = rescan {
             if let Ok((fresh, _)) = wait_list(pos, flags, true) {
                 for run in fresh {
-                    if !list.contains(&run) {
-                        list.push(run);
+                    if !list.contains(&run) && !covered.contains(&run) {
+                        if let Ok((fresh, held)) = waiting::claim(std::slice::from_ref(&run)) {
+                            if fresh.is_empty() {
+                                covered.insert(run);
+                            }
+                            list.extend(fresh);
+                            claims.extend(held);
+                        }
                     }
                 }
             }
@@ -646,11 +703,15 @@ fn clean(args: &[String]) -> Res<i32> {
     Ok(0)
 }
 fn stop(args: &[String]) -> Res<i32> {
+    let (args, flags, _) = parse_simple(args, &["--json"], &[])?;
+    if has(&flags, "--json") {
+        output::enable_json();
+    }
     if args.is_empty() {
         return Err("stop requires at least one run".into());
     }
     for reference in args {
-        let run = runs::resolve_head(reference)?;
+        let run = runs::resolve_head(&reference)?;
         let old = runs::state(&run);
         if !runs::active(&old) && runs::agent_alive(&run) {
             let pid = read(run.join("agent.pid"))
@@ -873,9 +934,13 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     "--progress",
                     "--any",
                     "--stream",
+                    "--json",
                 ],
                 &["--max"],
             )?;
+            if has(&flags, "--json") {
+                output::enable_json();
+            }
             let max = value(&kv, "--max").map(seconds).transpose()?;
             if has(&flags, "--machine") && !pos.is_empty() {
                 return Err("--machine does not take run arguments".into());
@@ -916,7 +981,10 @@ fn main_inner(args: &[String]) -> Res<i32> {
             ))
         }
         "status" | "list" => {
-            let (pos, _, _) = parse_simple(rest, &[], &[])?;
+            let (pos, flags, _) = parse_simple(rest, &["--json"], &[])?;
+            if has(&flags, "--json") {
+                output::enable_json();
+            }
             let list = if pos.is_empty() {
                 runs::all_runs()
             } else {

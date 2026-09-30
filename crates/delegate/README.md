@@ -23,6 +23,8 @@ The musl build was verified as a stripped, statically linked PIE (about 1.2 MB).
 | Module | Responsibility |
 | --- | --- |
 | `main.rs` | CLI, output, collection, stop and cleanup |
+| `output.rs` | Concise human status lines; full JSON remains opt-in |
+| `waiting.rs` | Per-run waiter ownership, PID and duplicate-wait exit 76 |
 | `common.rs` | Settings, files, processes and Git helpers |
 | `launch.rs` | Prompt, admission and run creation |
 | `runs.rs` | Run lookup, status and retention |

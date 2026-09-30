@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "5.14.0"
+  version: "5.15.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -19,12 +19,12 @@ metadata:
 D=<本技能目录>/bin/delegate
 $D start --read-only --name review-api "审查 apps/api 的错误处理，只列真实缺陷，写明文件:行号"   # 1. 放出（可连放多个）
 $D wait                                                                                  # 2. 等：放后台，结束时会返回
-#                                                                                        # 3. 按结论行的 next 处理
+#                                                                                        # 3. 按结论行的下一步处理
 ```
 
 - **等待**：`wait`、`run`、`reply --wait` 会一直阻塞到同事结束，默认放后台：Claude Code 里给 Bash 工具加 `run_in_background: true`，结束时会收到通知，期间继续干别的，不要用 `status` 轮询（`hooks/claude-code-background.py` 可作为 PreToolUse hook 拒绝前台调用）。只有没有后台通知、单次调用又有时长上限的主控才用 `--max 4m`，返回 75 就稍后再 `wait`。无参 `wait` 只收本会话派出的任务；无会话标识时沿用收取全部的行为，`--all` 可收本仓库全部。
-- **逐个处理**：宿主能逐行通知就后台跑 `$D wait --stream`，按 `report` 读答复、按 `next` 合并；只有结束通知就重复后台跑 `$D wait --any`。一次会交付当前所有已结束任务，顺序不变；`completionTiming: already-finished` 表示首次检查时已经结束，通知可能只是在交付旧结果，`finished-during-wait` 表示等待期间完成；新记录有 `finishedAt`。`sourceDrift.overlap` 非空时先按 `next` 选择 `apply` 或 `reply --sync`。
-- **结论**：每个任务一行 JSON，随后是改动清单与答复。`next` 字段给出下一步（含可复制的命令），没有 `next` 就是答复本身即交付物。答复超过 6000 字（`DELEGATE_RESULT_CHARS`）显示开头和结尾，全文用 `$D result <name>`；只看过截断答复的任务 `clean --finished` 会保留，读过全文或加 `--force` 才删。`cleanup` 报告已终止的后台进程与端口，`warnings` 报告 worktree 源问题。
+- **逐个处理**：宿主能逐行通知就后台跑 `$D wait --stream`，按“答复”命令读正文、按“下一步”合并；只有结束通知就重复后台跑 `$D wait --any`，一次交付当前所有已结束任务，顺序不变。每任务只允许一个等待者；已有活等待者时跳过，全被覆盖则退出 `76`，通知送给原等待者。脚本需字段时加 `--json`，`completionTiming` 区分旧结果与等待中新完成，`sourceDrift.overlap` 提示源改动重叠。
+- **结论**：每任务一条短行，随后附答复；细节用 `status --json`、`diff` 按需读取。答复超过 6000 字（`DELEGATE_RESULT_CHARS`）显示头尾，全文用 `$D result <name>`；只看过截断答复的任务 `clean --finished` 会保留，读过全文或加 `--force` 才删。后台进程回收与 worktree 源问题会提示。
 
 ## 场景速查
 
@@ -42,6 +42,8 @@ $D wait                                                                         
 | 看改了什么 / 停掉 / 清理 | `$D diff <name>` / `$D stop <name>` / `$D clean --finished` |
 
 多行说明用 `--prompt-file -` 加 heredoc；总加 `--name`，之后用它指代整段对话（各命令都落到最新一轮回复）。更多完整示例、任务说明模板与常见坑见 [references/recipes.md](references/recipes.md)。
+
+`--protect`/`--protect-reason` 与 `generated.paths` 重叠时只允许生成命令改动，收尾复跑核对，产出不一致报“生成物被手改”。
 
 ## 选档位
 
@@ -71,18 +73,20 @@ $D wait                                                                         
 
 ## 读结论并把关
 
-| state | 含义 |
+默认 `status`/`wait` 短行只给名字、状态、同事/档位、耗时、文件数与增删行、前三个目录、最近命令（运行中最多 100 字符）、验收和下一步；路径相对仓库。答复仍附在结论后，逐文件与完整诊断按需取 `--json`、`diff`、`result`。
+
+| 状态（JSON state） | 含义 |
 |---|---|
-| `delivered` | 已答复且验收命令通过——只说明命令过了，改法是否合适仍要看 `diff` |
-| `answered` | 已答复，未设验收；关键结论去代码里核实 |
-| `rejected` | 验收命令失败，`accept.tail` 有输出末尾 |
-| `malformed` / `failed` / `timeout` / `killed` / `crashed` / `stopped` | 答复畸形 / 出错（见 `error`） / 超时 / 进程异常 / 被终止 |
+| 已交付（`delivered`） | 验收通过；改法仍要看 `diff` |
+| 已答复（`answered`） | 未设验收；关键结论去代码核实 |
+| 未通过（`rejected`） | 验收失败或保护违规，`--json` 查看 `accept.tail`/`protectViolation` |
+| `malformed` / `failed` / `timeout` / `killed` / `crashed` / `stopped` | 答复畸形 / 出错 / 超时 / 进程异常 / 被终止 |
 
-state 只描述答复。只读任务改了文件时仍是 `answered`，另带 `readOnlyViolation`（留在它自己的 worktree，不会合并）或 `workspaceChanged`（`--in-place` 时无法归属）。改动清单按运行前后的工作区快照计算：shell 改的也算，运行前已有的改动与验收副产物不算。退出码：`0` delivered/answered，`1` 其他结局，`2` 用法错误或被拒绝，`75` 仍在运行。
+state 只描述答复。只读任务写文件仍是 `answered`，短行提示，JSON 带 `readOnlyViolation`（隔离未合并）或 `workspaceChanged`（原地无法归属）。改动来自前后快照：含 shell 改动，排除原有脏改动与验收副产物。退出码：`0` 成功，`1` 其他结局，`2` 用法错误/拒绝，`75` 仍运行，`76` 已有等待者。
 
-写入任务有改动时，结论的 `shape` 来自快照 diff：`dirs` 是目录增删行分布，`largest` 是改后文本文件总行数，`config` 是改动过的依赖/构建/CI 配置路径，`removed` 是删除路径；`*More` 是各列表未显示数量。`changes` 保留整体总数，完整逐文件信息在 `changes.json`。只读或无改动时无 `shape`。
+`--json` 保留原完整结构：`shape` 含目录增删行、改后最大文件、配置与删除路径；`*More` 是省略数量，逐文件在 `changes.json`。`changes` 是本轮，`pendingChanges` 是累计待合入量，零改动 reply 仍可能需 `diff --total`/`apply`。
 
-`changes` 是本轮差异；`pendingChanges` 是累计待合入量，零改动 reply 仍可能需要 `diff --total` / `apply`。慢 `apply` 可后台执行，stderr 提示检查、生成排队和日志路径，失败后再次 apply 会重试生成。末尾 `operation: apply` 结论保留退出码；`acceptStillValid: true` 仅证明本轮验收成功且未改树、最终源树相同，可按 `repository-snapshot` 范围复用。`false` 需重验；缺字段按原因判断未知。忽略文件、环境、数据库、Git 历史不在范围内，后续改动或 reply 必须重新判断。
+慢 `apply` 可后台执行；失败后重试生成。JSON 的 `acceptStillValid: true` 证明验收成功且未改树、最终源树相同，可按 `repository-snapshot` 复用；`false` 重验，缺字段看原因。托管 copy/link、未初始化且未改动的 gitlink 内容列在 `excluded`；指针、其他索引标记及脏子模块仍核验。忽略文件、环境、数据库、Git 历史在范围外，改动/reply 后重判。
 
 ## 边界
 

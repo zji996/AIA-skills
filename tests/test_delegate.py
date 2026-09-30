@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import os
 import re
 import shlex
@@ -131,7 +132,10 @@ class DelegateTests(unittest.TestCase):
         codex.write_text("\n".join(lines) + "\n")
         codex.chmod(0o755)
 
-    def cli(self, *args, stdin=None, cwd=None, timeout=30):
+    def cli(self, *args, stdin=None, cwd=None, timeout=30, human=False):
+        if not human and args and args[0] in {"start", "run", "reply", "wait", "status", "list", "stop"} \
+                and "--json" not in args:
+            args = (args[0], "--json", *args[1:])
         return subprocess.run([str(DELEGATE), *map(str, args)], cwd=cwd or self.work, env=self.env,
                               input=stdin, capture_output=True, text=True, timeout=timeout)
 
@@ -165,6 +169,52 @@ class DelegateTests(unittest.TestCase):
         self.fake_pi([answer("ok"), SETTLED])
         line = next(l for l in self.cli("run", "--read-only", "task").stdout.splitlines() if l.startswith('{"run"'))
         self.assertEqual(list(json.loads(line))[:3], ["run", "name", "state"])  # read at a glance, not alphabetically
+
+    def test_default_output_is_short_relative_and_keeps_report(self):
+        repo = self.repo({"a.txt": "old\n"})
+        self.fake_pi([answer("report body"), SETTLED],
+                     pre="mkdir -p crates/protocol; echo new > crates/protocol/new; echo new > a.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "compact",
+                                     "--accept", "true", "task"))
+        for command in ("status", "wait"):
+            out = self.cli(command, "compact", human=True)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            line = out.stdout.splitlines()[0]
+            self.assertTrue(line.startswith("compact · 已交付"), line)
+            for text in ("pi/strong", "验收通过", "改 2 个文件 +2/-1", "crates/protocol 1", "delegate diff"):
+                self.assertIn(text, line)
+            self.assertNotIn(str(self.work), line)
+            self.assertNotIn(state["worktree"], line)
+            self.assertNotIn("===== changes", out.stdout)
+            if command == "wait":
+                self.assertIn("report body", out.stdout)
+        complete = self.outcome(self.cli("status", "compact"))
+        self.assertEqual(complete["changes"], state["changes"])
+        self.assertEqual(complete["files"], ["a.txt", "crates/protocol/new"])
+        self.assertIn("shape", complete)
+
+    def test_running_default_output_has_relative_changes_and_truncated_command(self):
+        repo = self.repo({"a.txt": "old\n"})
+        gate = self.work / "gate"
+        command = "cargo test " + "x" * 120
+        event = {"type": "tool_execution_start", "toolName": "bash", "args": {"command": command}}
+        self.fake_pi([answer("done"), SETTLED],
+                     pre=f"echo new > a.txt; printf '%s\\n' {shlex.quote(json.dumps(event))}; "
+                         f"while [ ! -f {gate} ]; do sleep .02; done")
+        state = self.outcome(self.cli("start", "--worktree", "--workdir", repo, "--name", "running", "task"))
+        self.addCleanup(self.cli, "stop", state["run"])
+        run = Path(state["dir"])
+        self.until(lambda: "cargo test" in (run / "events.jsonl").read_text(), "command event")
+        out = self.cli("status", "running", human=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        for field in ("running · 运行中", "pi/strong", "改 1 个文件 +1/-1", "最近：cargo test", "下一步："):
+            self.assertIn(field, out.stdout)
+        recent = out.stdout.split("最近：", 1)[1].split(" · ", 1)[0]
+        self.assertLessEqual(len(recent), 100)
+        self.assertTrue(recent.endswith("..."))
+        self.assertNotIn(str(self.work), out.stdout)
+        gate.touch()
+        self.assertEqual(self.cli("wait", state["run"]).returncode, 0)
 
     def test_agent_executable_and_version_are_recorded_in_meta_and_status(self):
         self.fake_pi([answer("ok"), SETTLED])
@@ -925,7 +975,7 @@ class DelegateTests(unittest.TestCase):
         self.fake_pi([answer(LEAKED), SETTLED])
         self.fake_codex(codex_events("ok"), pre='[ -n "$SLOW" ] && sleep 30')
         env = {**self.env, "SLOW": "1"}
-        started = subprocess.run([str(DELEGATE), "start", "--agent", "codex", "--read-only", "busy"], cwd=self.work,
+        started = subprocess.run([str(DELEGATE), "start", "--json", "--agent", "codex", "--read-only", "busy"], cwd=self.work,
                                  env=env, capture_output=True, text=True, timeout=30)
         busy = json.loads(started.stdout.splitlines()[0])
         self.env["DELEGATE_MAX_CODEX"] = "1"
@@ -990,7 +1040,7 @@ class DelegateTests(unittest.TestCase):
         self.assertTrue(all(line["completionTiming"] == "already-finished" for line in lines))
         self.assertIn("finishedAt", lines[0])
         self.assertNotIn("finishedAt", lines[1])
-        waiter = subprocess.Popen([str(DELEGATE), "wait", "--any"], env=self.env,
+        waiter = subprocess.Popen([str(DELEGATE), "wait", "--json", "--any"], env=self.env,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(waiter.kill)
         threading.Timer(.5, gate.touch).start()
@@ -1004,7 +1054,7 @@ class DelegateTests(unittest.TestCase):
         self.fake_pi([answer("streamed answer"), SETTLED], pre='case "$*" in *slow*) sleep 4;; esac')
         for name in ("slow", "fast"):
             self.assertEqual(self.cli("start", "--read-only", "--name", name, "task").returncode, 0)
-        stream = subprocess.Popen([str(DELEGATE), "wait", "--stream"], cwd=self.work, env=self.env,
+        stream = subprocess.Popen([str(DELEGATE), "wait", "--json", "--stream"], cwd=self.work, env=self.env,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(stream.kill)
         first = json.loads(stream.stdout.readline())
@@ -2150,6 +2200,48 @@ class DelegateTests(unittest.TestCase):
         self.assertNotIn("acceptStillValid", result)
         self.assertIn("submodules", result["acceptValidityReason"])
 
+    def test_uninitialized_reference_is_excluded_without_masking_later_dirty_contents(self):
+        repo = self.sub_repo()
+        subprocess.run(["git", "-C", str(repo), "submodule", "deinit", "-f", "vendor"],
+                       check=True, capture_output=True)
+        self.fake_pi([answer("done"), SETTLED], pre="echo new > a.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "task"))
+        self.assertIs(state["accept"]["snapshotComplete"], True)
+        self.assertNotIn("snapshotReason", state["accept"])
+        self.assertEqual(state["accept"]["excluded"], ["vendor"])
+        applied = self.outcome(self.cli("apply", state["run"]))
+        self.assertIs(applied["acceptStillValid"], True)
+        self.assertEqual(applied["excluded"], ["vendor"])
+        subprocess.run(["git", "-C", str(repo), "-c", "protocol.file.allow=always",
+                        "submodule", "update", "--init", "-q", "vendor"], check=True)
+        self.assertIs(self.outcome(self.cli("apply", state["run"]))["acceptStillValid"], True)
+        (repo / "vendor/lib.txt").write_text("dirty\n")
+        dirty = self.outcome(self.cli("apply", state["run"]))
+        self.assertNotIn("acceptStillValid", dirty)
+        self.assertIn("submodules", dirty["acceptValidityReason"])
+        (repo / "vendor/lib.txt").write_text("v1\n")
+        subprocess.run(["git", "-C", str(repo / "vendor"), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "--allow-empty", "-qm", "moved pointer"], check=True)
+        moved = self.outcome(self.cli("apply", state["run"]))
+        self.assertIs(moved["acceptStillValid"], False)
+        self.assertIn("differs", moved["acceptValidityReason"])
+
+    def test_uninitialized_reference_with_contents_or_changed_pointer_is_incomplete(self):
+        repo = self.sub_repo()
+        subprocess.run(["git", "-C", str(repo), "submodule", "deinit", "-f", "vendor"],
+                       check=True, capture_output=True)
+        self.fake_pi([answer("done"), SETTLED])
+        (repo / "vendor/manual.txt").write_text("untracked contents\n")
+        nonempty = self.outcome(self.cli("run", "--workdir", repo, "--accept", "true", "task"))
+        self.assertFalse(nonempty["accept"].get("snapshotComplete", False))
+        self.assertIn("snapshotReason", nonempty["accept"])
+        (repo / "vendor/manual.txt").unlink()
+        subprocess.run(["git", "-C", str(repo), "update-index", "--cacheinfo",
+                        "160000," + "1" * 40 + ",vendor"], check=True)
+        moved = self.outcome(self.cli("run", "--workdir", repo, "--accept", "true", "task"))
+        self.assertIs(moved["accept"]["snapshotComplete"], False)
+        self.assertIn("submodules", moved["accept"]["snapshotReason"])
+
     def test_worktree_in_a_repository_without_commits(self):
         repo = self.work / "fresh"
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
@@ -2225,6 +2317,16 @@ def delegate_pid_alive(pid):
         return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
     except OSError:  # gone between the two checks
         return False
+
+
+def load_tests(loader, suite, pattern):
+    regression_file = ROOT / "crates/delegate/tests/test_v515.py"
+    if regression_file.is_file():
+        spec = importlib.util.spec_from_file_location("delegate_v515_tests", regression_file)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        suite.addTests(loader.loadTestsFromTestCase(module.V515Tests))
+    return suite
 
 
 if __name__ == "__main__":

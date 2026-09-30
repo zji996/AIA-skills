@@ -10,7 +10,7 @@
 | `diff [<run>] [--stat] [--total] [路径...]` | 以 `git diff` 输出该轮的改动；`--total` 为整段对话；终端下带颜色 |
 | `apply [<run>] [--dry-run] [--merge]` | 把 `--worktree` 的现状（含最后一轮之后在 worktree 里的手工修改）相对对话起点的全部改动合并回原工作区（只写文件，不碰 index）：你没动过的文件直接写入（含权限位），双方都改过的文本做三方合并，大文件从 worktree 复制；经符号链接目录、文件与目录互换、二进制与符号链接冲突一律算冲突；有合并不了的冲突时什么都不写，`--merge` 则写入其余文件并在冲突处留冲突标记（其余冲突跳过）。没有跳过项时，共用该 worktree 的所有 run（含畸形的旁支）标记 `.applied` |
 | `wait [<run>...\|--all] [--max <时长>] [--no-result] [--full] [--progress]` | 等待并输出结论；不指定任务时（或 `--all`）等所有仍在运行和尚未读取结果的任务 |
-| `status [<run>...]` | 每个任务一行 JSON；运行中带 `last` 与 `idleSeconds` |
+| `status [<run>...] [--json]` | 默认每任务一条自然语言短行；`--json` 保留完整原字段 |
 | `result [<run>] [--path]` | 输出完整答复 |
 | `stop <run>...` | 终止任务及其 scope、进程组 |
 | `clean <run>...\|--finished [--force]` | 删除已结束的任务；`--finished` 默认保留结果未读取的 |
@@ -19,6 +19,10 @@
 启动选项：`--tier cheap|strong`（默认只读 cheap、写入 strong；便宜档失败且未改动时自动升档一次）、`--agent pi|codex`（直接指定，与 `--tier` 互斥，不升档）、`--image <路径>`（可重复）、`--accept <命令>` / `--no-accept`（覆盖或关闭仓库默认验收）、`--hide-accept`、`--accept-timeout`（默认 10m）、`--read-only`、`--in-place`（只读任务读实时工作区而非快照）、`--workdir`、`--timeout`（每次尝试，pi 默认 25m，codex 默认 50m）、`--retries`（答复畸形时重跑次数，默认 1）、`--model`/`--thinking`/`--provider`（不指定时用各 CLI 自己的默认设置；Codex 的 `--thinking` 对应推理强度）、`--allow-parallel-writes`、`--worktree`、`--after <run>`（等上游以 delivered/answered 结束再执行，否则 `skipped`；等待期间 state 为 `waiting`、不占名额）、`--in <run>`（只读，在上游 worktree 的快照里审它的改动）、`--protect <路径>`（可重复；末尾 `/` 为目录；被改动即判 `rejected` 并带 `protectViolation`，不跑验收；reply 沿用）。`<run>` 可以是完整 id、唯一片段、`last` 或 run 目录。
 
 ## 重任务队列（lane）
+
+`status`/`wait` 默认只展示决策所需的状态、同事与档位、耗时、文件数与增删行、前三个目录、最近命令（运行中，最多 100 字符）、验收与下一步，文件路径相对仓库；`wait` 仍随后附答复。脚本用 `--json` 读取原有完整结构，`start`/`run`/`reply`/`stop` 也支持此选项；`result`、`diff`、`apply` 输出不变。JSON 的运行目录、worktree、结果位置仍保留可直接访问的绝对路径。
+
+每任务有 `waiter.lock`，持有排他 flock 并记录等待者 PID；重复 `wait` 跳过已有活等待者覆盖的任务，全被覆盖时退出 `76`，通知仍给原等待者。`--any`、`--stream`（含后续加入的任务）、`--machine` 同样处理；等待者退出或死亡时内核释放锁，旧 PID 不阻止后续等待。
 
 整机一条先进先出队列，同时放行 `DELEGATE_MAX_HEAVY` 个（默认 1，`0` 不限）：验收命令、worktree `setup`、同事与主控用 `lane` 跑的检查都在这里排队。每个排队者在 `${XDG_STATE_HOME:-~/.local/state}/delegate/lane/` 下有一张按到达时间命名的票，持有其排他 flock 直到结束；等待者阻塞在前一张票的锁上，由内核在其结束或进程死亡时唤醒，不轮询，崩溃不留死锁。已在队列内的命令（带 `DELEGATE_LANE_HELD`）再调用 `lane` 直接执行，不会等自己。
 
@@ -30,7 +34,7 @@
 
 在 git 仓库中，启动时和同事结束后（验收命令之前）各把整个工作区记为一个 tree 对象：借用真实 index 的副本执行 `git add -A` 与 `write-tree`，真实 index、分支和 stash 都不动；被忽略的文件不计，大于 `DELEGATE_SNAPSHOT_MAX_BYTES`（默认 2 MiB）的未跟踪文件只比较大小与修改时间。两次快照之差就是 `files`、`changes`（文件数与 +/- 行数）、`changes.json` 与 `changes.patch`，因此 shell 或脚本改的文件也会列出，改了又改回的不列，运行前已有的脏改动不算。原地运行时，别人在同一时间对仓库的改动也会被计入；需要干净归属时用 `--worktree`。子模块只作为一个条目出现：其检出中的已跟踪改动、未跟踪文件或提交变化都记为 `submodule contents`。快照失败时（例如 git 出错），结论带 `warning`，改动清单显示 unknown，只读任务也因此无法核验。非 git 目录只能根据编辑事件列出 `files`。
 
-写入任务有快照改动时，结论行的 `shape` 补充改动形状：`dirs` 按路径前两级目录汇总增删行；`largest` 列出改后总行数最多的文本文件；`config` 列出被改动的依赖清单、锁文件、构建与 CI 配置；`removed` 列出删除文件。列表默认各最多 5 项，`DELEGATE_SHAPE_LIMIT` 可设为 1–20；超出时 `dirsMore`、`largestMore`、`configMore`、`removedMore` 记录未显示数量。`changes` 仍是整体文件数与增删行数，完整逐文件信息在 `changes.json`。改动清单后另有简短的 `shape` 小节；只读或无改动任务省略。
+写入任务有快照改动时，`--json` 的 `shape` 补充改动形状：`dirs` 按路径前两级目录汇总增删行；`largest` 列出改后总行数最多的文本文件；`config` 列出被改动的依赖清单、锁文件、构建与 CI 配置；`removed` 列出删除文件。列表默认各最多 5 项，`DELEGATE_SHAPE_LIMIT` 可设为 1–20；超出时 `dirsMore`、`largestMore`、`configMore`、`removedMore` 记录未显示数量。`changes` 仍是整体文件数与增删行数，完整逐文件信息在 `changes.json`。JSON 模式沿用改动清单与 `shape` 小节；只读或无改动任务省略。
 
 ## worktree
 
@@ -49,6 +53,8 @@
 - 这三类路径不计入改动。子模块在新 worktree 里是空目录：只读使用时写进 `link`（会替换空目录），需要独立修改时在 `setup` 里初始化。
 - 顶层 `accept` 是写入任务的默认验收命令；`--accept` 覆盖，`--no-accept` 关闭，只读任务不使用。
 - `generated.paths` 的匹配语义同 `--protect`；改动清单与 diff 仍列出这些文件，`apply` 跳过其合并，在合并其他文件后由 lane 在源仓库根执行 `sh -c` 的 `command`，日志写入 `generate.log`；`--dry-run` 只报告动作。生成命令失败时退出 1，已合并文件保留（§6.4）。
+- `--protect`/`--protect-reason` 与生成路径重叠时，启动 stderr 提示生成命令例外并附在同事的任务说明里；该命令与路径保存到 meta，reply/fresh 沿用。收尾在 lane 中于 worktree 根复跑，比较生成路径的内容、权限和符号链接（含忽略文件）；一致则允许，漂移报 `protectViolation` 与“生成物被手改”，生成失败判 rejected，日志在 `protect-generate.log`。
+- 验收证据将托管 copy/link 路径明确排除，`accept.excluded` 与 apply 结论的 `excluded` 列出仓库相对路径；这些路径上的 skip-worktree 不算缺口。未托管 gitlink 的目录缺失或为空、且指针等于 HEAD 时，其未初始化内容也列为范围外，但指针仍保留在证据树中。源子模块初始化后重新核验：干净且同指针可复用，脏内容、索引标记、非空未初始化目录、变更的未初始化指针或读取失败仍判证据不完整。
 
 `--read-only` 在 git 仓库里默认也用这样的 worktree（`--in-place` 除外），只作为供阅读的快照：主控同时的编辑既不影响它读到的内容，也不会被算成它的改动；它违规写入的文件留在 worktree 里，记为 `readOnlyViolation`，不能 `apply`。两位同事在其中都有全部工具，`setup` 照常执行（它们可能跑测试）；只有无法隔离时（非 git 或 `--in-place`），只读 Pi 才只保留读文件、搜索、列目录。
 
@@ -87,6 +93,8 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 | `.applied` | `--worktree` 的改动已由 `apply` 合并 |
 | `accept.log` | 验收命令的完整输出与退出码；`summary.json` 的 `accept.queuedSeconds` 是它在 lane 中排队的秒数 |
 | `supervisor.lock` | supervisor 在世期间持有的 flock，`wait` 阻塞在它上面 |
+| `waiter.lock` | 收取进程持有的排他 flock，内容为 PID；进程死亡锁自动释放 |
+| `protect-generate.log` | 收尾复跑受保护生成物命令的输出 |
 | `lane-wait` / `lane-waiting-*` | 同事在 lane 中已排队的秒数 / 正在排队的标记 |
 | `stderr.log` | 同事 CLI 的标准错误 |
 | `exit_code` | 结束标记：`0` 为 delivered/answered，`1` 为其他结局；运行中不存在 |

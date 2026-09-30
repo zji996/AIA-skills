@@ -203,6 +203,28 @@ pub fn clip(s: &str, max: usize) -> String {
         x
     }
 }
+pub fn repository_relative(path: &str, top: &str) -> String {
+    let path = Path::new(path);
+    let top = Path::new(top);
+    if !path.is_absolute() || !top.is_absolute() {
+        return path.to_string_lossy().into_owned();
+    }
+    let path_parts = path.components().collect::<Vec<_>>();
+    let top_parts = top.components().collect::<Vec<_>>();
+    let shared = path_parts
+        .iter()
+        .zip(&top_parts)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut relative = PathBuf::new();
+    for _ in shared..top_parts.len() {
+        relative.push("..");
+    }
+    for component in &path_parts[shared..] {
+        relative.push(component.as_os_str());
+    }
+    relative.to_string_lossy().into_owned()
+}
 pub fn lock(path: &Path, exclusive: bool, nonblock: bool) -> io::Result<File> {
     let f = OpenOptions::new()
         .create(true)

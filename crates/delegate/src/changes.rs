@@ -118,9 +118,69 @@ pub fn snapshot(top: &Path, scratch: &Path, exclude: &[String]) -> Option<Value>
 }
 /// Full repository evidence for reuse; metadata for out-of-tree content cannot prove equality.
 pub fn repository_snapshot(top: &Path, scratch: &Path) -> Option<Value> {
-    let mut snap = snapshot(top, scratch, &[])?;
+    repository_snapshot_excluding(top, scratch, &[])
+}
+pub fn managed_paths(meta: &Value) -> Vec<String> {
+    let mut paths = ["copy", "link"]
+        .iter()
+        .flat_map(|key| {
+            meta["worktree"]["config"][key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+pub fn under_path(path: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+pub fn repository_snapshot_excluding(
+    top: &Path,
+    scratch: &Path,
+    exclude: &[String],
+) -> Option<Value> {
+    let mut snap = snapshot(top, scratch, exclude)?;
+    // Remove managed entries from both sides of the evidence comparison, including gitlinks.
+    if !exclude.is_empty() {
+        let index = scratch.join(format!(".evidence-index-{}", std::process::id()));
+        let result = (|| -> Res<String> {
+            git_index(top, &["read-tree".into(), s(&snap, "tree").into()], &index)?;
+            let mut args = vec![
+                "--literal-pathspecs".into(),
+                "rm".into(),
+                "-r".into(),
+                "-f".into(),
+                "--cached".into(),
+                "--ignore-unmatch".into(),
+                "--".into(),
+            ];
+            args.extend(exclude.iter().cloned());
+            git_index(top, &args, &index)?;
+            Ok(
+                String::from_utf8_lossy(&git_index(top, &["write-tree".into()], &index)?)
+                    .trim()
+                    .into(),
+            )
+        })();
+        let _ = fs::remove_file(index);
+        snap["tree"] = json!(result.ok()?);
+        snap["excluded"] = json!(exclude);
+        if let Some(large) = snap["large"].as_object_mut() {
+            large.retain(|path, _| !exclude.iter().any(|root| under_path(path, root)));
+        }
+    }
     let entries = git(top, &["ls-tree", "-r", "-z", s(&snap, "tree")]).ok()?;
     let flags = git(top, &["ls-files", "-v", "-z"]).ok()?;
+    let mut excluded = exclude.to_vec();
     let submodules_complete = zstrings(&entries)
         .iter()
         .filter(|entry| entry.starts_with("160000 "))
@@ -129,6 +189,10 @@ pub fn repository_snapshot(top: &Path, scratch: &Path) -> Option<Value> {
                 return false;
             };
             if !b(&snap["submodules"][path], "clean") {
+                if uninitialized_reference(top, path, s(&snap, "tree")) {
+                    excluded.push(path.to_string());
+                    return true;
+                }
                 return false;
             }
             let checkout = top.join(path);
@@ -139,9 +203,17 @@ pub fn repository_snapshot(top: &Path, scratch: &Path) -> Option<Value> {
                 && git_text(&checkout, &["rev-parse", "HEAD^{tree}"])
                     .is_ok_and(|head| head == s(&nested, "tree"))
         });
+    excluded.sort();
+    excluded.dedup();
+    if !excluded.is_empty() {
+        snap["excluded"] = json!(excluded);
+    }
     let reason = if !snap["snapshotError"].is_null() {
         Some("submodule snapshot failed")
     } else if zstrings(&flags).iter().any(|entry| {
+        if entry.starts_with("S ") && exclude.iter().any(|root| under_path(&entry[2..], root)) {
+            return false;
+        }
         entry
             .as_bytes()
             .first()
@@ -164,6 +236,21 @@ pub fn repository_snapshot(top: &Path, scratch: &Path) -> Option<Value> {
     }
     Some(snap)
 }
+fn uninitialized_reference(top: &Path, path: &str, tree: &str) -> bool {
+    let checkout = top.join(path);
+    let empty = match fs::symlink_metadata(&checkout) {
+        Ok(info) if info.is_dir() && !info.file_type().is_symlink() => {
+            fs::read_dir(&checkout).is_ok_and(|mut entries| entries.next().is_none())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        _ => false,
+    };
+    // Keep the gitlink in the evidence tree so pointer changes still invalidate reuse.
+    empty
+        && gitlink(top, "HEAD", path).is_ok_and(|head| {
+            head.is_some() && gitlink(top, tree, path).is_ok_and(|current| head == current)
+        })
+}
 fn submodule_fingerprints(top: &Path, exclude: &[String]) -> Res<BTreeMap<String, Value>> {
     let mut prints = BTreeMap::new();
     for entry in zstrings(&git(top, &["ls-files", "-s", "-z"])?) {
@@ -174,7 +261,7 @@ fn submodule_fingerprints(top: &Path, exclude: &[String]) -> Res<BTreeMap<String
             continue;
         };
         let checkout = top.join(path);
-        if exclude.iter().any(|x| x == path)
+        if exclude.iter().any(|x| under_path(path, x))
             || checkout.is_symlink()
             || !checkout.join(".git").exists()
         {

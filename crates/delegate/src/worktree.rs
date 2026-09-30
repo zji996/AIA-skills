@@ -97,7 +97,7 @@ fn strings(v: &Value) -> Vec<String> {
         })
         .unwrap_or_default()
 }
-fn generated(source: &Path) -> Res<(Vec<String>, String)> {
+pub fn generated(source: &Path) -> Res<(Vec<String>, String)> {
     let file = source.join(".delegate.json");
     let cfg = json(&file);
     let Some(spec) = cfg.get("generated") else {
@@ -134,7 +134,7 @@ fn generated(source: &Path) -> Res<(Vec<String>, String)> {
         .ok_or("generated.command must be a string")?;
     Ok((rules, command.to_string()))
 }
-fn matches_rule(path: &str, rules: &[String]) -> bool {
+pub fn matches_rule(path: &str, rules: &[String]) -> bool {
     rules.iter().any(|rule| {
         if rule.ends_with('/') {
             path.starts_with(rule)
@@ -762,6 +762,10 @@ fn accept_validity(run: &Path, dry: bool, conclusion: &mut Value) {
     let meta = json(run.join("meta.json"));
     let sum = json(run.join("summary.json"));
     let accept = &sum["accept"];
+    let excluded = strings(&accept["excluded"]);
+    if !excluded.is_empty() {
+        conclusion["excluded"] = json!(excluded);
+    }
     conclusion["acceptValidityScope"] = json!("repository-snapshot");
     let mut valid = None;
     let reason = if dry {
@@ -785,9 +789,11 @@ fn accept_validity(run: &Path, dry: bool, conclusion: &mut Value) {
     } else if s(accept, "tree") != s(accept, "treeAfter") {
         valid = Some(false);
         "acceptance changed the repository tree".into()
-    } else if let Some(source) =
-        crate::changes::repository_snapshot(Path::new(s(&meta["worktree"], "source")), run)
-    {
+    } else if let Some(source) = crate::changes::repository_snapshot_excluding(
+        Path::new(s(&meta["worktree"], "source")),
+        run,
+        &crate::changes::managed_paths(&meta),
+    ) {
         if !b(&source, "complete") {
             format!(
                 "incomplete source evidence: {}",

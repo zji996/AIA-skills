@@ -55,7 +55,11 @@ fn accept(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
     };
     let _ = writeln!(log, "$ {}", s(meta, "accept"));
     let _ = log.flush();
-    let before = changes::repository_snapshot(Path::new(s(meta, "top")), run);
+    let excluded = changes::managed_paths(meta);
+    if !excluded.is_empty() {
+        result["excluded"] = json!(excluded);
+    }
+    let before = changes::repository_snapshot_excluding(Path::new(s(meta, "top")), run, &excluded);
     let (code, timed) = run_shell(
         (s(meta, "accept"), "accept"),
         Path::new(s(meta, "workdir")),
@@ -66,8 +70,24 @@ fn accept(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
         Some(&holder),
     )
     .unwrap_or((1, false));
-    let after = changes::repository_snapshot(Path::new(s(meta, "top")), run);
+    let after = changes::repository_snapshot_excluding(Path::new(s(meta, "top")), run, &excluded);
     if let (Some(before), Some(after)) = (&before, &after) {
+        let mut excluded = excluded
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        for evidence in [before, after] {
+            excluded.extend(
+                evidence["excluded"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string),
+            );
+        }
+        if !excluded.is_empty() {
+            result["excluded"] = json!(excluded);
+        }
         result["tree"] = before["tree"].clone();
         result["treeAfter"] = after["tree"].clone();
         result["snapshotComplete"] = json!(b(before, "complete") && b(after, "complete"));
@@ -106,16 +126,6 @@ fn accept(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
             .collect::<String>());
     }
     result
-}
-fn relative(path: &str, workdir: &str) -> String {
-    let p = Path::new(path);
-    if p.is_absolute() {
-        p.strip_prefix(workdir)
-            .map(|x| x.to_string_lossy().into())
-            .unwrap_or_else(|_| path.into())
-    } else {
-        path.into()
-    }
 }
 fn attempts_from(
     meta: &Value,
@@ -162,6 +172,12 @@ fn settle(
         verdict.into()
     };
     let mut sum = json!({"state":state});
+    let generated_checked = setup_error.is_none() && !lane::stopped();
+    let (generated_violations, generation_error) = if generated_checked {
+        check_generated(meta, run, holder.clone())
+    } else {
+        (vec![], None)
+    };
     let rec = if setup_error.is_none() {
         changes::record(meta, run)
     } else {
@@ -179,9 +195,22 @@ fn settle(
         .as_array()
         .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
         .unwrap_or_default();
-    let violations = changed
+    let generated_paths = meta["protectGenerated"]["paths"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut violations = changed
         .iter()
         .filter(|path| {
+            if generated_checked
+                && generation_error.is_none()
+                && worktree::matches_rule(path, &generated_paths)
+            {
+                return false;
+            }
             protected.iter().any(|rule| {
                 if rule.ends_with('/') {
                     path.starts_with(rule)
@@ -192,6 +221,18 @@ fn settle(
         })
         .cloned()
         .collect::<Vec<_>>();
+    violations.extend(
+        generated_violations
+            .iter()
+            .filter(|path| {
+                protected
+                    .iter()
+                    .any(|rule| worktree::matches_rule(path, &[rule.to_string()]))
+            })
+            .cloned(),
+    );
+    violations.sort();
+    violations.dedup();
     if let Some((changes, totals)) = &rec {
         sum["changes"] = totals.clone();
         if let Some(pending) = worktree::pending_changes(run, meta) {
@@ -235,8 +276,20 @@ fn settle(
             sum["protectViolationReasons"] = json!(reasons);
         }
         sum["error"] = json!("protected paths were changed; review protectViolation and remove those changes before retrying");
+        if !generated_violations.is_empty() {
+            sum["error"] = json!("生成物被手改 / generated output was manually edited; it differs from generated.command output");
+        }
     }
-    if violations.is_empty() && verdict == "ok" && !s(meta, "accept").is_empty() && !lane::stopped()
+    if let Some(error) = &generation_error {
+        state = "rejected".into();
+        sum["state"] = json!(state);
+        sum["error"] = json!(error);
+    }
+    if violations.is_empty()
+        && generation_error.is_none()
+        && verdict == "ok"
+        && !s(meta, "accept").is_empty()
+        && !lane::stopped()
     {
         sum["accept"] = accept(meta, run, holder);
         state = if b(&sum["accept"], "ok") {
@@ -248,6 +301,114 @@ fn settle(
         sum["state"] = json!(state);
     }
     (state, sum, rec, changed)
+}
+fn generated_manifest(
+    top: &Path,
+    rules: &[String],
+) -> Res<std::collections::BTreeMap<String, String>> {
+    fn visit(
+        top: &Path,
+        path: &Path,
+        out: &mut std::collections::BTreeMap<String, String>,
+    ) -> Res<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let info = match fs::symlink_metadata(path) {
+            Ok(info) => info,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.to_string()),
+        };
+        if info.is_dir() {
+            for item in fs::read_dir(path).map_err(|e| e.to_string())? {
+                visit(top, &item.map_err(|e| e.to_string())?.path(), out)?;
+            }
+        } else {
+            let bytes = if info.file_type().is_symlink() {
+                use std::os::unix::ffi::OsStrExt;
+                fs::read_link(path)
+                    .map_err(|e| e.to_string())?
+                    .as_os_str()
+                    .as_bytes()
+                    .to_vec()
+            } else if info.is_file() {
+                fs::read(path).map_err(|e| e.to_string())?
+            } else {
+                return Err(format!("unsupported generated file: {}", path.display()));
+            };
+            let digest = sha1_smol::Sha1::from(&bytes).digest();
+            out.insert(
+                path.strip_prefix(top)
+                    .map_err(|e| e.to_string())?
+                    .to_string_lossy()
+                    .into(),
+                format!(
+                    "{}:{}:{digest}",
+                    info.file_type().is_symlink(),
+                    info.permissions().mode()
+                ),
+            );
+        }
+        Ok(())
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for rule in rules {
+        visit(top, &top.join(rule.trim_end_matches('/')), &mut out)?;
+    }
+    Ok(out)
+}
+fn check_generated(
+    meta: &Value,
+    run: &Path,
+    holder: Arc<AtomicI32>,
+) -> (Vec<String>, Option<String>) {
+    let spec = &meta["protectGenerated"];
+    if !spec.is_object() || s(meta, "mode") != "write" {
+        return (vec![], None);
+    }
+    let result = (|| -> Res<Vec<String>> {
+        let top = Path::new(s(meta, "top"));
+        let rules = spec["paths"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let _slot = lane::acquire("check protected generation", None, |ahead, _| {
+            log_event(run, json!({"e":"queue","ahead":ahead}));
+        })?;
+        if lane::stopped() {
+            return Err("stopped before generation check".into());
+        }
+        let before = generated_manifest(top, &rules)?;
+        let mut log = File::create(run.join("protect-generate.log")).map_err(|e| e.to_string())?;
+        let (code, _) = run_shell(
+            (s(spec, "command"), "generate"),
+            top,
+            run,
+            &meta["env"],
+            seconds(&setting("GENERATE_TIMEOUT", "10m"))?,
+            &mut log,
+            Some(&holder),
+        )?;
+        if code != 0 {
+            return Err(format!(
+                "generated.command failed (exit {code}); see protect-generate.log"
+            ));
+        }
+        let after = generated_manifest(top, &rules)?;
+        Ok(before
+            .keys()
+            .chain(after.keys())
+            .filter(|path| before.get(*path) != after.get(*path))
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect())
+    })();
+    match result {
+        Ok(paths) => (paths, None),
+        Err(error) => (vec![], Some(error)),
+    }
 }
 fn escalate(
     meta: &mut Value,
@@ -434,7 +595,16 @@ fn inner(
     } else {
         evs.iter()
             .filter(|e| ["edit", "write"].contains(&s(e, "e")) && !s(e, "path").is_empty())
-            .map(|e| relative(s(e, "path"), s(&meta, "workdir")))
+            .map(|e| {
+                repository_relative(
+                    s(e, "path"),
+                    if s(&meta, "top").is_empty() {
+                        s(&meta, "workdir")
+                    } else {
+                        s(&meta, "top")
+                    },
+                )
+            })
             .collect::<Vec<_>>()
     };
     files.sort();

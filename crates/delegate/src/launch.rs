@@ -186,6 +186,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--fresh" => o.fresh = true,
                 "--sync" if reply => o.sync = true,
                 "--wait" if reply => o.wait = true,
+                "--json" => crate::output::enable_json(),
                 "--minor" if reply => o.minor = true,
                 "--progress" => o.progress = true,
                 "--full" => o.full = true,
@@ -487,6 +488,28 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     if let Some(top) = &repo {
         let (env, cfg, default_accept) = worktree::config(top)?;
         extra["env"] = env;
+        if !o.read_only && !o.protect.is_empty() {
+            let (paths, command) = worktree::generated(top)?;
+            let overlap = paths
+                .iter()
+                .filter(|path| {
+                    o.protect.iter().any(|rule| {
+                        worktree::matches_rule(
+                            path.trim_end_matches('/'),
+                            std::slice::from_ref(rule),
+                        ) || worktree::matches_rule(
+                            rule.trim_end_matches('/'),
+                            std::slice::from_ref(*path),
+                        ) || rule == *path
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !overlap.is_empty() && !command.trim().is_empty() {
+                eprintln!("delegate: protected generated paths {} may only be changed by generated.command", overlap.join(", "));
+                extra["protectGenerated"] = json!({"paths":overlap,"command":command});
+            }
+        }
         if !o.read_only && !o.accept_set {
             o.accept = default_accept;
         }
@@ -741,6 +764,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     };
     let mut extra =
         json!({"parent":meta,"session":session,"env":meta["env"],"worktree":meta["worktree"]});
+    extra["protectGenerated"] = meta["protectGenerated"].clone();
     if let Some(paths) = synced {
         extra["sync"] = json!({"files":paths});
     }
@@ -979,7 +1003,7 @@ pub fn launch(
         .filter(|x| !x.is_empty());
     let changed =
         parent.is_object() && fork.is_some() && o.accept.as_deref() != parent["accept"].as_str();
-    let actual = if parent.is_object() && fork.is_some() {
+    let mut actual = if parent.is_object() && fork.is_some() {
         contract(
             prompt,
             if changed && !o.hide_accept {
@@ -1010,6 +1034,9 @@ pub fn launch(
             &o.protect_reasons,
         )
     };
+    if extra["protectGenerated"].is_object() {
+        actual.push_str(&format!("\n\n生成物保护例外 / Generated protection exception: {} 只允许通过生成命令改动 / may only be changed by the generator: `{}`. You may run this command; completion reruns it and rejects manually edited generated output. This exception overrides the protected-path restriction only for these generated paths.\n", extra["protectGenerated"]["paths"], s(&extra["protectGenerated"], "command")));
+    }
     write(
         run.join("prompt.md"),
         if actual.ends_with('\n') {
@@ -1117,6 +1144,9 @@ pub fn launch(
     let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":seconds(o.timeout.as_deref().unwrap_or("15m"))?,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
     let (agent_bin, agent_version) = agent_identity(s(&meta, "agent"))?;
     meta["agentBin"] = json!(agent_bin);
+    if extra["protectGenerated"].is_object() {
+        meta["protectGenerated"] = extra["protectGenerated"].clone();
+    }
     if let Some(version) = agent_version {
         meta["agentVersion"] = json!(version);
     }

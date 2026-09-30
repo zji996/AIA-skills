@@ -11,7 +11,7 @@ const LAUNCH: &[(&str, &str)] = &[
     ("--in-place", "Read-only: read the working tree instead of a snapshot."),
     ("--accept COMMAND", "Shell command run after a write task; overrides .delegate.json accept."),
     ("--no-accept", "Disable the repository's default acceptance command."),
-    ("--protect PATH", "Protect a repository-relative file or directory prefix (trailing /); repeatable. Changes reject the run before acceptance."),
+    ("--protect PATH", "Protect a repository-relative file or directory prefix (trailing /); repeatable. Changes reject before acceptance; generated.paths overlaps allow only generator output, checked on completion."),
     ("--protect-reason PATH REASON", "Protect a path with its reason; repeatable. Report necessary protected changes instead of bypassing protection."),
     ("--hide-accept", "Keep the acceptance command from the agent for blind verification."),
     ("--accept-timeout DURATION", "Acceptance command limit (default: 10m)."),
@@ -68,7 +68,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "Continue a finished run's conversation in the background.",
     ),
     ("wait", "Wait for runs; print outcomes and answers."),
-    ("status", "Print one JSON status line per run."),
+    (
+        "status",
+        "Print one concise status line per run; --json keeps complete fields.",
+    ),
     ("list", "Alias of status."),
     ("result", "Print a run's full answer."),
     ("diff", "Show a run's changes as a git diff."),
@@ -119,7 +122,7 @@ pub fn print(command: Option<&str>) -> bool {
         ]);
         println!("\nStates: waiting | running | delivered (accept passed) | answered (no --accept) | skipped (upstream failed) | rejected (accept failed or protected path changed) | malformed (empty or leaked tool call after reruns) | failed | timeout | killed | stopped | crashed.");
         println!(
-            "Exit: 0 delivered/answered, 1 other finished, 2 usage, 75 still running at --max."
+            "Exit: 0 delivered/answered, 1 other finished, 2 usage, 75 still running at --max, 76 already covered by another waiter."
         );
         println!("Runs: $DELEGATE_RUNS or <git root of cwd>/.local/run/delegate (old .local/run/pi runs remain readable).");
         return true;
@@ -132,12 +135,14 @@ pub fn print(command: Option<&str>) -> bool {
             ("runs", "Run ids or directories. With no arguments, collect active and undelivered runs from this caller when known; otherwise collect all in this repository."),
             ("--all", "Collect all active and undelivered runs in this repository, regardless of caller."),
             ("--machine", "Collect active and waiting runs registered across all repositories on this machine."),
+            ("--json", "Print complete JSON fields instead of concise status lines. Tasks covered by another live waiter are skipped; exit 76 when all are covered."),
             ("--no-result", "Print only the outcome line."),
             ("--any", "Return once any run has finished: report the finished runs and name the rest on stderr. Repeat the same command for the next one."),
             ("--stream", "Print one outcome line per run as each finishes (answers are read with wait <run>) and exit when none is left; without run arguments it also picks up runs this caller starts meanwhile. For hosts that turn each output line into a notification."),
         ]),
-        "status" | "list" => ("[runs ...]", "Print one JSON status line per run.", &[
+        "status" | "list" => ("[runs ...]", "Print one concise status line per run.", &[
             ("runs", "Run ids or directories (default: all runs)."),
+            ("--json", "Print the existing complete JSON status structure."),
         ]),
         "result" => ("[--path] [run]", "Print a run's full answer.", &[
             ("run", "Run id or directory (default: last)."),
@@ -176,6 +181,12 @@ pub fn print(command: Option<&str>) -> bool {
     println!("Options:");
     options(&[("-h, --help", "Show this help.")]);
     options(rows);
+    if matches!(command, "start" | "run" | "reply" | "stop") {
+        options(&[(
+            "--json",
+            "Print complete JSON fields instead of concise status lines.",
+        )]);
+    }
     if matches!(command, "run" | "reply" | "wait") {
         options(COLLECT);
     }

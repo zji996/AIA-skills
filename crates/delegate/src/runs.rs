@@ -282,7 +282,16 @@ pub fn status(run: &Path) -> Value {
         let mut files = evs
             .iter()
             .filter(|x| ["edit", "write"].contains(&s(x, "e")) && !s(x, "path").is_empty())
-            .map(|x| s(x, "path").to_string())
+            .map(|x| {
+                repository_relative(
+                    s(x, "path"),
+                    if s(&meta, "top").is_empty() {
+                        s(&meta, "workdir")
+                    } else {
+                        s(&meta, "top")
+                    },
+                )
+            })
             .collect::<Vec<_>>();
         files.sort();
         files.dedup();
