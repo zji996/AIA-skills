@@ -1,5 +1,9 @@
 {
   "budgets": {
-    "skills/*/SKILL.md": 4000
+    "skills/*/SKILL.md": 4000,
+    "skills/*/references/*.md": 3000,
+    "docs/*-field-notes.md": 5500,
+    "docs/delegate-spec.md": 15000,
+    "docs/delegate-protocol.md": 3500
   }
 }

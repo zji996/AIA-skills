@@ -99,12 +99,7 @@ fi
 
 audit="$REPO_ROOT/skills/repo-governance/scripts/audit-context.py"
 if [ -f "$audit" ]; then
-  if python3 "$audit" --repo "$REPO_ROOT" --only budget; then
-    :
-  else
-    status=$?
-    [ "$status" -eq 1 ] || exit "$status"
-  fi
+  python3 "$audit" --repo "$REPO_ROOT" --only budget --fail-on budget
 fi
 
 errors=0

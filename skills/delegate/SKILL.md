@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "5.21.0"
+  version: "5.21.1"
   binary: delegate
   exclude-agents: pi
 ---
@@ -62,14 +62,11 @@ $D wait                                                                         
 
 以下来自实际使用，是建议而非规则，按具体情况取舍。
 
-- **续接还是新开**：返工建立在它已有理解上（审查意见、补测试）时用 `reply`；会话很长、答复开始畸形或方向已变时 `--fresh` 更好。worktree 是启动时的快照，之后你在自己工作区的改动它看不到，用 `reply --sync` 同步进去。
-- **什么时候自己改**：根因已定位、改动小、你清楚怎么改时，自己改常常更快——派发、等待、审查、合并有固定开销。需要只有你知道的背景时也自己接手。
-- **返工预算**：写入对话默认只给同事 1 次返工（`.delegate.json` 的 `maxRework`，`null` 不限），第二次 `reply` 会被拒绝（退出码 2）——这时 `diff --total` / `apply` 后自己改。上一轮为 `timeout` 的 `reply` 是续做，不计返工次数，即使预算已用完也可继续，meta 记 `continuation: timeout`；其他失败仍按原规则计数。短修正（改名、补一处断言，说明 ≤600 字）用 `reply --minor`，不计次数，但该轮改动超过 60 行会补记一次；确需越限用 `--over-limit '<原因>'`，原因记在 meta。零改动的追问不计次。
-- **两档怎么搭配**：Pi 找到的代码事实更多、偶有把现状说混；Codex 更准确、风险意识更强。分量重的审查两路并行、由你合并，通常好于任一方。界面实现默认 `--tier cheap` 并要求截图，强档只接界面里的状态与数据逻辑；Pi 的实现要单独扫一遍静默吞错（空 `catch`）和答复里的夸大。便宜档近乎免费，侦察不必压缩范围。
-- **让错误当场暴露**：审查说明给重点并注明不限于此，给待证伪的假设而不是结论；要求现状断言附 `文件:行号`、仓库外事实（配置键、CLI 参数、API 字段、版本号）附一手出处——便宜档会编出看似合理的名字。看图审查把影响判断的真实数据写进说明，并要求写明从图上哪里读出。
-- **开几路**：写入 3–4 路最划算，瓶颈是主控审 diff 和跨路一致性；先提交共用基础（公共组件、约定），说明其误用方式；单路一个子系统、约 15 个文件以内。只读侦察可再并行几路。主控重检查也走 `lane`，避免 CPU 超卖拖过超时。
-- **并行写入**：用 `--protect-reason model_loop.rs '另一任务负责；恢复逻辑必须留在这里'` 划清所有权（原 `--protect` 仍可用）；同事需要改受保护路径时须停下报告，不得搬逻辑或削弱测试绕路。同仓库串行 `apply`；新增 `NNNN_` 文件的编号冲突会警告，由你审查和改号。重写、迁移类任务把测试也保护起来，免得“改测试”成为最省事的通过方式；`--accept` 覆盖仓库级门禁，worktree 跑不了全量时至少跑相关 gate；合并后要跑全量（除非结论给出 `acceptStillValid: true`），多路合并的类型漂移只会在这里暴露：`.delegate.json` 设 `"applyVerify": true` 让 `apply` 自动在主干跑默认验收（结论 `verify`，失败退出 1；需要时加 `--verify` / `--no-verify`），开启后慢 apply 放后台。`start` 发现同仓库仍在运行的写入任务会在 stderr 列出其已改文件，任务说明点名其中路径时以 `overlap:` 提示，考虑 `--after` 或 `--protect`。
-- **编排**：常用两种——强档实现后接 `--after impl --in impl --read-only` 的便宜档预审（你拿着预审看 diff）；便宜档侦察后接 `--after scout --worktree` 的强档按清单实现。链条不宜太长，每多一步误差叠加一次，需要判断的节点你插进来看。
+续接与返工预算、两档配合、审查证据、并行粒度和编排建议见 [references/practice.md](references/practice.md)。
+
+同事需要改受保护路径时须停下报告，不得搬逻辑或削弱测试绕路；同仓库串行 `apply`，合并后跑全量（除非 `acceptStillValid: true`）。
+
+主控长时间自主推进一批工作时，按需读取 [references/long-run.md](references/long-run.md)。
 
 ## 读结论并把关
 
@@ -88,7 +85,7 @@ state 只描述答复。只读任务写文件仍是 `answered`，短行提示，
 
 `--evidence <命令>` 收集模型评测等旁路证据，验收通过后（无验收则答复后）经 lane 运行；`--evidence-timeout` 默认 30m，排队不计时。失败/超时只记 `evidence`，永不改 state 或退出码；验收失败或保护违规跳过。reply 继承，`--no-evidence` 关闭。手动合入后，`status`/`wait`/`clean` 检查源工作树是否包含全部最终内容、删除与执行位；全含则显示“已合入（主干已含改动）”，JSON `appliedBy: "detected"`，可清理；部分包含或读取失败仍提示 apply。
 
-通用 deny/env/返工预算/默认 accept 与 evidence/容量写到 `${XDG_CONFIG_HOME:-~/.config}/delegate/config.json`，仓库 `.delegate.json` 合并覆盖。`configSources` 记来源；配置错误指出文件与字段，退出 2。合并与撤销见 [references/output-and-files.md](references/output-and-files.md#用户与仓库配置)。
+通用 deny/env/返工预算/默认 accept 与 evidence/容量写到 `${XDG_CONFIG_HOME}/delegate/config.json`（未设变量时使用系统约定的用户配置目录），仓库 `.delegate.json` 合并覆盖。`configSources` 记来源；配置错误指出文件与字段，退出 2。合并与撤销见 [references/configuration.md](references/configuration.md)。
 
 `--json` 保留原完整结构：`shape` 含目录增删行、改后最大文件、配置与删除路径；`*More` 是省略数量，逐文件在 `changes.json`。`changes` 是本轮，`pendingChanges` 是累计待合入量，零改动 reply 仍可能需 `diff --total`/`apply`。
 

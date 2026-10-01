@@ -8,6 +8,7 @@
 
 ### 技能
 
+- `delegate` 5.21.1：经验分层沉淀，入口与参考文档按需读取，已解决实战问题压成版本表，新增主控长时间自主推进流程。本仓库将技能入口、references 与实战记录的 token 上限接入失败门禁，repo-governance 默认行为不变。
 - `delegate` 5.21.0：同源已有写入任务在运行时，不带 `--worktree` 的写入任务自动改用 worktree，并在 stderr 说明一行；没有其他写入任务时仍原地写入。`apply` 时如果有原地写入任务正在改源工作区，警告它的提交可能把刚应用的改动一并带走。起因：polaris-os 一个忘加 `--worktree` 的写入任务在主控 apply 时原地改同一工作区，两边改动混在一个文件里。
 - `delegate` 5.20.1：`apply` 合并删除后，顺带删掉因此变空的父目录（止于仓库根）。此前整包删除或改名后源仓库会留下一串空目录。
 - `delegate` 5.20.0：`.delegate.json` 的 `generated` 新增可选 `inputs`（匹配语义同 `paths`）。设了它时，`apply` 只有合并路径命中 `inputs` 才排队重新生成，否则输出一行 `not regenerated` 跳过；此前纯文档改动也要在 lane 后面等生成器。未设时行为不变。

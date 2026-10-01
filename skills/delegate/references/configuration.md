@@ -1,0 +1,38 @@
+# 用户与仓库配置、检查拦截
+
+`XDG_CONFIG_HOME` 未设时使用系统约定的用户配置目录。
+
+## 用户与仓库配置
+
+用户配置 `${XDG_CONFIG_HOME}/delegate/config.json` 支持 `agentDeny`、`env`、`maxRework`、默认 `accept`/`evidence`、`maxActive`、`maxCodex`、`maxHeavy`、`repoMaxActive`、`repoMaxCodex`。仓库根 `.delegate.json` 使用相同字段并保存仓库事实。
+
+- 标量：仓库 > 用户 > 内置默认；容量的 `DELEGATE_MAX_ACTIVE` / `DELEGATE_MAX_CODEX` / `DELEGATE_MAX_HEAVY` / `DELEGATE_REPO_MAX_ACTIVE` / `DELEGATE_REPO_MAX_CODEX` 最高，仍兼容 `PI_DELEGATE_*`，`0` 不限。整机默认 12 / 6 / 2，每仓库默认 8 / 4。写入默认 `accept`/`evidence` 在仓库未提供字段时用用户值，对应 CLI 覆盖或关闭；只读不用两项默认。
+- `env` 按键合并，仓库优先；`agentDeny` 按 `(argv, exact)` 去重，省略 `exact` 等于 `false`；仓库同键 hint 覆盖用户值，保留原顺序。仓库 `{"argv":["cargo","xtask","check"],"exact":true,"allow":true}` 撤销完全相同 argv 且 exact 相同的一条用户规则，无需 hint；不撤销不同 exact 或其他前缀规则，用户配置不能声明 `allow: true`。
+- `worktree`、`generated`、`applyVerify` 只认仓库：用户级出现时忽略，`start`（含 `run`）在 stderr 汇总提示一次。
+- 两份文件独立校验，覆盖不能隐藏错误；错误指出文件与字段，启动退出 2。JSON 语法错误指出文件与行列。meta、summary 与 `--json` 记 `configSources: ["user","repo"]`（启动时只有存在的配置文件，没有时 `[]`）。reply 沿用启动时的 env、deny、验收与证据，返工预算和容量按当前两级配置读取；来源包含继承配置与当前配置两部分。
+
+用户级示例：
+
+```json
+{"maxActive":12,"maxCodex":6,"maxHeavy":2,"repoMaxActive":8,"repoMaxCodex":4,"maxRework":1,
+ "env":{"CUDA_VISIBLE_DEVICES":""},
+ "agentDeny":[{"argv":["cargo","xtask","check"],"hint":"主控合入后跑全量；同事改跑 cargo test -p <crate>"}]}
+```
+
+## 同事全量检查拦截（agentDeny）
+
+仓库根 `.delegate.json` 可配置：
+
+```json
+{"agentDeny": [
+  {"argv": ["cargo", "xtask", "check"], "hint": "全量检查由主控合入后跑；改跑 cargo test -p <crate> 与 cargo clippy -p <crate>"},
+  {"argv": ["cargo", "xtask", "infra-test"], "exact": true, "hint": "请带过滤参数只测相关用例"},
+  {"argv": ["pnpm", "check"], "hint": "全量检查由主控合入后跑；改跑 pnpm --filter <package> test"}
+]}
+```
+
+默认按完整 argv 的逐项、大小写敏感前缀匹配；尾部可以有更多参数。`exact: true` 必须 argv 完全相等且无多余参数：上述 `cargo xtask infra-test` 命中，`cargo xtask infra-test --filter db` 放行。`cargo xtask check --all` 命中前缀规则，`cargo --locked xtask check` 不命中，不忽略或重排 `+toolchain`、`--locked` 等全局参数。每条规则的 `argv` 非空，首项是程序名（字母、数字、`._-`，不能是路径或 `.`/`..`），其他项为字符串，`hint` 非空，`exact` 可选且为布尔值；字符串不能含 NUL。同程序多条规则按配置顺序匹配首条。
+
+启动时在 run 的 `agent-shims/` 为每个程序生成 shell shim，按原 PATH（含顶层 env.PATH）与同事工作目录解析真实程序的绝对路径，保留 cargo/rustup 等多调用符号链接的名称；真实程序缺失时，未命中的调用退出 127。只在同事进程的 PATH 最前面插入该目录，reply 继承规则。命中打印 hint 到 stderr，退出 77；未命中直接 exec，参数、stdin/stdout 与退出码透传。同事的 `lane` 继承 shim PATH，即使自己设置 `DELEGATE_ALLOW_HEAVY=1` 或 `DELEGATE_LANE_HELD=1` 仍会拒绝。`denied.log` 累计本轮各尝试的次数，结论 `denied: N`，短行显示“拦下 N 次全量检查”；未配置或空列表不生成 shim，不增加字段。
+
+验收、证据、setup、收尾生成核对、apply 的生成与 applyVerify 都由未注入 shim 的执行环境运行，主控自己的 lane 同理。没有环境放行开关或可交给同事的令牌。威胁模型是防误用，不是防恶意：同 UID 进程可以改 PATH、用绝对路径或改 shim/记录，这不是安全沙箱。

@@ -1,5 +1,13 @@
 # delegate
 
+## 5.21.1 长时间自主推进与经验分层
+
+- 主控持续推进一批已授权的任务：按需读 long-run.md，用忽略目录里的“进行中 / 待做 / 待确认”待办接续，每轮取最上面一项；写入一律 worktree，apply 后按任务提交。Use for an authorized long-running batch with a resumable backlog.
+- 上下文压缩或 Monitor 到期：核对原等待者，保留有效后台 wait；退出 76 只表示已有等待者，不代表完成，Monitor 过期后重挂。
+- 同事只跑定向验收，主控每批全量门禁；墙钟断言单独重跑，基准与门禁数据库隔离；只读审计留请求、id、代码行，优先修阻塞再复走。
+- 连续两轮无有效进展、只剩待确认或门禁失败无法定位：更新待办并汇报验证与待确认；未授权不 push、不发布。
+- 新经验先改脚本或默认值；入口只留 Agent 必须知道的规则，长流程进 references，已解决的实战条目压成版本表一行。入口 4000、参考 3000、实战 8000 token 超限时本仓库门禁失败。
+
 ## 5.18 证据、精确拦截与两层容量
 
 - 修复已通过确定门禁，还想跑真实模型评测：`--accept` 决定交付，`--evidence` 收评测；默认 30m 且 lane 排队不计时，证据失败/超时只记 evidence，不改 state 或退出码。Evidence commands collect diagnostics without rejecting valid changes.
