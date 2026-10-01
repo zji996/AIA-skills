@@ -634,6 +634,26 @@ pub fn detect_applied(run: &Path, meta: &Value) -> bool {
     }
     write_json(run.join(".applied"), &json!({"at":iso(),"tree":rec["after"],"large":rec["afterLarge"],"largeHashes":large_hashes,"appliedBy":"detected"})).is_ok()
 }
+/// Active write runs whose source tree is `top`, as (name, in place). Used to
+/// keep the source free for `apply` (field notes 22).
+pub fn active_writes_on(top: &str, except: Option<&Path>) -> Vec<(String, bool)> {
+    crate::runs::all_runs()
+        .into_iter()
+        .filter(|run| Some(run.as_path()) != except)
+        .filter(|run| crate::runs::active(&crate::runs::state(run)))
+        .filter_map(|run| {
+            let meta = json(run.join("meta.json"));
+            if s(&meta, "mode") != "write" {
+                return None;
+            }
+            let in_place = s(&meta["worktree"], "path").is_empty();
+            let source = Some(s(&meta["worktree"], "source"))
+                .filter(|x| !x.is_empty())
+                .unwrap_or(s(&meta, "top"));
+            (!top.is_empty() && source == top).then(|| (s(&meta, "name").to_string(), in_place))
+        })
+        .collect()
+}
 /// Running write tasks on the same source (field notes 16): what each has
 /// changed so far, and which of those paths the new task's prompt names, so
 /// the caller can choose to serialize before the overlap becomes a conflict.
@@ -921,6 +941,15 @@ fn generation_markers(run: &Path, meta: &Value) -> Vec<PathBuf> {
 }
 pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<ApplyOutcome> {
     apply_progress("checking merge / 正在检查合并");
+    let source = s(&json(run.join("meta.json"))["worktree"], "source").to_string();
+    for (name, _) in active_writes_on(&source, Some(run))
+        .into_iter()
+        .filter(|(_, in_place)| *in_place)
+    {
+        eprintln!(
+            "delegate: warning: in-place write task {name} is editing this tree; its commits may sweep up what apply writes. Wait for it, or commit the applied paths by path / 警告：原地写入任务 {name} 正在改这个工作区，应用的改动可能被它一并提交"
+        );
+    }
     let mut conclusion = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),
         "operation":"apply","apply":{"ok":false,"dryRun":dry}});
     if let Some(sources) = json(run.join("meta.json")).get("configSources") {

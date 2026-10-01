@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "5.20.1"
+  version: "5.21.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -98,7 +98,7 @@ state 只描述答复。只读任务写文件仍是 `answered`，短行提示，
 
 1. **容量**：整机默认任务 12/Codex 6、重命令 2；每仓库任务 8/Codex 4（git worktree 算同仓库）。可用内存低于 4 GB 拒绝启动；命中上限说明层级、计数并列该层任务，先 `wait` 收一批；`--after` 等容量时两层都检查。验收、证据、setup、`lane` 排队不计时。上限由用户设定，同事不要自行调整。
 2. **只读**：git 仓库里默认读启动时的工作区快照（独立 worktree，含未提交改动），你可以同时改代码；要读实时工作区加 `--in-place`。在快照里两位同事都有全部工具（能看 git 历史、跑测试），只读靠约定与事后核对，写了也只留在它自己的 worktree；非 git 目录或 `--in-place` 时 Pi 只剩读文件、搜索和列目录。
-3. **写入**：原地写入同一目录同时只能有一个，且你同时改的文件会算进它的改动；要并行或不想被打扰就加 `--worktree`。
+3. **写入**：原地写入同一目录同时只能有一个，且你同时改的文件会算进它的改动；要并行或不想被打扰就加 `--worktree`。同源已有写入任务在运行时，不带 `--worktree` 的写入任务会自动改用 worktree，把源工作区留给你 apply；`apply` 时如果有原地写入任务正在改源工作区，会警告。
 4. **worktree 依赖与验收**：`worktree.copy` 复制忽略材料，或用 `link`/`setup`（`writeSetup` 仅写入）；缺源/空源带 `warnings`。`env` 注入同事、验收、证据和 setup；`accept`/`evidence` 是写入默认，只读不用；CLI 覆盖或关闭。`applyVerify` 合并后主干复验。别 link `node_modules`/`.venv`。
 5. **超时**：`--timeout` 默认 Pi 25 分钟、Codex 50 分钟（不含排队），到时若仍在执行命令再宽限最多 10%，最坏约 55 分钟，落在主控 1 小时提示缓存内。超时的写入任务改动保留，先 `reply` 续做；任务太大就拆小。默认值有意偏宽：被截断后的返工（续接、重读上下文、重跑验收）比多等几分钟更贵，不要为求快把 `--timeout` 压短。
 

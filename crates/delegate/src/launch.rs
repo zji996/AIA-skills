@@ -551,6 +551,18 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
             extra["worktree"] = json!({"source":s(&prior["worktree"],"path"),"sourceWorkdir":s(&prior,"workdir"),"config":cfg,"in":upstream});
         } else if o.worktree || (o.read_only && !o.in_place) {
             extra["worktree"] = json!({"source":top,"sourceWorkdir":workdir,"config":cfg});
+        } else if !o.read_only {
+            // In place, this run would edit the tree other runs are applied into.
+            let busy = worktree::active_writes_on(&top.to_string_lossy(), None);
+            if !busy.is_empty() {
+                let names = busy.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>();
+                eprintln!(
+                    "delegate: write task {} running on this source; this run uses a worktree so the source stays free for apply / 同源已有写入任务，本任务改用 worktree",
+                    names.join(", ")
+                );
+                o.worktree = true;
+                extra["worktree"] = json!({"source":top,"sourceWorkdir":workdir,"config":cfg});
+            }
         }
     }
     if o.worktree && repo.is_none() {

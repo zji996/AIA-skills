@@ -235,7 +235,7 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 
 ### 6.3.1 并行写入提示（5.13）
 
-`start`/`run` 创建写入任务后，对同一源仓库（worktree 的 `source` 或原地 `top`）上仍在运行的其他写入任务各输出一行 stderr：其当前 worktree 相对 `chainBase` 的改动文件数与前 5 个路径。本任务说明原文包含其中某个路径（完整相对路径，或长度 ≥ 8、含 `.` 且非 `mod.rs`/`index.ts` 等通用名的文件名）时该行以 `overlap:` 开头并建议 `--after` 或 `--protect`，否则以 `note:` 开头。只提示，不拒绝、不改退出码；只读任务不提示。
+`start`/`run` 创建写入任务后，对同一源仓库（worktree 的 `source` 或原地 `top`）上仍在运行的其他写入任务各输出一行 stderr：其当前 worktree 相对 `chainBase` 的改动文件数与前 5 个路径。本任务说明原文包含其中某个路径（完整相对路径，或长度 ≥ 8、含 `.` 且非 `mod.rs`/`index.ts` 等通用名的文件名）时该行以 `overlap:` 开头并建议 `--after` 或 `--protect`，否则以 `note:` 开头。只提示，不拒绝、不改退出码；只读任务不提示。不带 `--worktree` 的写入任务创建时，如果同一源上已有运行中的写入任务（原地或 worktree），自动改用 worktree，并输出一行 stderr 说明；没有其他写入任务时仍原地写入。`apply` 开始时，如果同一源上有运行中的原地写入任务，对每个任务输出一行警告（不拒绝、不改退出码）。
 
 ### 6.4 apply（必须）
 

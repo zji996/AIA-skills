@@ -2444,6 +2444,39 @@ db.write_text(json.dumps(units))
         finally:
             self.cli("stop", "hotwork", "second", "third")
 
+    def test_in_place_write_moves_to_worktree_while_another_write_runs(self):
+        repo = self.repo({"a.txt": "old\n", "b.txt": "old\n"})
+        self.fake_pi([answer("done"), SETTLED], pre="echo new > a.txt", sleep=20)
+        first = self.outcome(self.cli("start", "--worktree", "--workdir", repo, "--name", "busy", "task"))
+        try:
+            moved = self.cli("start", "--workdir", repo, "--name", "later", "edit b.txt")
+            self.assertIn("write task busy running on this source; this run uses a worktree", moved.stderr)
+            self.assertTrue(self.outcome(moved)["worktree"])
+            self.assertNotEqual(self.outcome(moved)["worktree"], str(repo))
+        finally:
+            self.cli("stop", "busy", "later")
+        alone = self.cli("start", "--workdir", repo, "--name", "alone", "edit b.txt")
+        try:
+            self.assertNotIn("uses a worktree", alone.stderr)
+            self.assertFalse(self.outcome(alone).get("worktree"))
+        finally:
+            self.cli("stop", "alone")
+
+    def test_apply_warns_while_an_in_place_write_edits_the_source(self):
+        repo = self.repo({"a.txt": "old\n", "b.txt": "old\n"})
+        self.fake_pi([answer("done"), SETTLED], pre="echo new > a.txt")
+        done = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        self.fake_pi([answer("done"), SETTLED], pre="echo new > b.txt", sleep=20)
+        self.cli("start", "--workdir", repo, "--name", "inplace", "edit b.txt")
+        try:
+            applied = self.cli("apply", done["run"])
+            self.assertIn("in-place write task inplace is editing this tree", applied.stderr)
+            self.assertTrue(self.outcome(applied)["apply"]["ok"])
+        finally:
+            self.cli("stop", "inplace")
+        quiet = self.cli("apply", "--dry-run", done["run"])
+        self.assertNotIn("is editing this tree", quiet.stderr)
+
     def test_apply_acceptance_reuse_failed_and_absent_acceptance(self):
         repo = self.repo({"a.txt": "old\n"})
         self.fake_pi([answer("done"), SETTLED], pre="echo new > a.txt")

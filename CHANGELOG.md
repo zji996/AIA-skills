@@ -8,6 +8,7 @@
 
 ### 技能
 
+- `delegate` 5.21.0：同源已有写入任务在运行时，不带 `--worktree` 的写入任务自动改用 worktree，并在 stderr 说明一行；没有其他写入任务时仍原地写入。`apply` 时如果有原地写入任务正在改源工作区，警告它的提交可能把刚应用的改动一并带走。起因：polaris-os 一个忘加 `--worktree` 的写入任务在主控 apply 时原地改同一工作区，两边改动混在一个文件里。
 - `delegate` 5.20.1：`apply` 合并删除后，顺带删掉因此变空的父目录（止于仓库根）。此前整包删除或改名后源仓库会留下一串空目录。
 - `delegate` 5.20.0：`.delegate.json` 的 `generated` 新增可选 `inputs`（匹配语义同 `paths`）。设了它时，`apply` 只有合并路径命中 `inputs` 才排队重新生成，否则输出一行 `not regenerated` 跳过；此前纯文档改动也要在 lane 后面等生成器。未设时行为不变。
 - `delegate` 5.19.0：既有同事/setup/验收后台回收阶段补查项目脚本经 `systemd-run --user` 启动的 service/scope，按完整 `DELEGATE_RUN_DIR` 环境标记或隔离 worktree 内的 WorkingDirectory/ExecStart 路径归属；in-place 只用标记，不按 unit 名前缀匹配。stop 超时后 SIGKILL，查询与停止均限时；缺 systemctl、无 user bus、回收失败仅记 cleanup 诊断，不改 state/退出码。`clean` 与过期清理删除前回收历史遗留，结论追加已停 unit 数与详情。补假 systemctl 黑盒回归与起因记录；二进制与校验和留待主控构建。
