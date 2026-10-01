@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 ENTRY_FILES = ("AGENTS.md", "CLAUDE.md")
-KINDS = ("entry", "current", "budget", "names", "links", "gitignore", "adr-index")
+KINDS = ("entry", "current", "budget", "names", "links", "gitignore", "adr-index", "provisional")
 DEFAULTS = {"maxDatedItems": 5, "maxNextActions": 5, "staleDays": 30}
 CJK_RANGES = ((0x2E80, 0x9FFF), (0xAC00, 0xD7AF), (0xF900, 0xFAFF),
               (0xFF00, 0xFFEF), (0x3000, 0x303F))
@@ -25,6 +25,8 @@ FENCE = re.compile(r"^\s*(```|~~~)")
 INLINE_CODE = re.compile(r"`([^`\n]+)`")
 PATHLIKE = re.compile(r"^\.?[\w.-]+(?:/[\w.@-]+)+/?$")  # bare file names often live outside the repo
 MAKE_CALL = re.compile(r"\bmake\s+((?:[A-Z_]+=\S+\s+)*)([a-z][\w.-]*)(\*?)")
+PROVISIONAL_ROW = re.compile(r"^\|\s*(C\d+)\s*\|", re.M)
+CONVERGENCE = "docs/convergence.md"
 MAKE_TARGET = re.compile(r"^([A-Za-z0-9_.-]+(?:\s+[A-Za-z0-9_.-]+)*)\s*:(?!=)", re.M)
 
 
@@ -156,6 +158,14 @@ def make_targets(repo):
     for names in MAKE_TARGET.findall(makefile.read_text(encoding="utf-8", errors="replace")):
         targets.update(names.split())
     return targets
+
+
+def provisional_markers(repo):
+    """(path, line, id) for each PROVISIONAL(Cnn) marker in tracked files."""
+    out = git(repo, "grep", "-n", "-I", "-o", "-E", r"PROVISIONAL\(C[0-9]+\)", "--", ".", f":!{CONVERGENCE}")
+    for row in (out or "").splitlines():
+        path, line, marker = row.split(":", 2)
+        yield path, line, marker[len("PROVISIONAL("):-1]
 
 
 def load_adr_index():
@@ -293,6 +303,15 @@ def main():
         stale_index = load_adr_index().check(repo)
         if stale_index:
             warn("adr-index", stale_index[0].relative_to(repo), "out of date with the ADR status lines; run adr-index.py --write")
+
+    if "provisional" in only and in_git:
+        register = repo / CONVERGENCE
+        known = set(PROVISIONAL_ROW.findall(register.read_text(encoding="utf-8", errors="replace"))) \
+            if register.is_file() else set()
+        for path, line, marker in provisional_markers(repo):
+            if marker not in known:
+                warn("provisional", f"{path}:{line}", f"PROVISIONAL({marker}) has no row in {CONVERGENCE}; "
+                     "register it or drop the marker once converged")
 
     for _, line in findings:
         print(line)

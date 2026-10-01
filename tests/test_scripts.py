@@ -606,6 +606,22 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("dated entries", result.stdout)
         self.assertNotIn("last changed", result.stdout)
 
+    def test_audit_provisional_markers_must_have_a_register_row(self):
+        repo = self.git_repo()
+        (repo / "AGENTS.md").write_text("ok")
+        (repo / "docs").mkdir()
+        (repo / "docs/convergence.md").write_text(
+            "| 编号 | 现状 |\n| --- | --- |\n| C01 | 包名误导 |\n")
+        (repo / "src.rs").write_text("// PROVISIONAL(C01): keep\nfn a() {}\n// PROVISIONAL(C09): gone\n")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        result = self.run_script(AUDIT, "--repo", repo, "--only", "provisional")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("WARN src.rs:3: PROVISIONAL(C09) has no row", result.stdout)
+        self.assertNotIn("C01", result.stdout)
+        (repo / "src.rs").write_text("// PROVISIONAL(C01): keep\n")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        self.assertEqual(self.run_script(AUDIT, "--repo", repo, "--only", "provisional").returncode, 0)
+
     def test_audit_legacy_limits_warn_and_still_apply(self):
         repo = self.git_repo()
         (repo / "AGENTS.md").write_text("line\n" * 3)

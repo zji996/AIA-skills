@@ -4,6 +4,7 @@
 
 ### 技能
 
+- `repo-governance` 3.1.0：新增待收敛清单约定。早期为跑通而凑出来的命名、规则与实现登记在 `docs/convergence.md`（编号 `Cnn`：现状、问题、收敛方向、时机），代码落点标 `PROVISIONAL(Cnn)`，入口文件一行指向清单；信息分层表加一行。`audit-context.py` 新增 `provisional` 类别：git 跟踪文件里的标记在清单中找不到编号时报 WARN，可纳入 `--fail-on`。起因：polaris-os 的 processor 包叫 `harness-v3.0.0`，所有者以为是新一版提示词，并指出不少早期决定是 Agent 为完成任务凑的。
 - `delegate` 5.17.1：自然语言短行不再显示“范围外：…”。这些路径只可能是托管 copy/link 或未初始化的参考 gitlink，都是按设计排除，每条结论都重复它们只是噪音；`--json` 的 `excluded` 不变。
 - `delegate` 5.17.0：新增用户级 `${XDG_CONFIG_HOME:-~/.config}/delegate/config.json`，与仓库 `.delegate.json` 按标量仓库优先、env 按键覆盖、agentDeny 按 argv 合并去重；仓库 `allow: true` 可撤销精确用户规则。用户级默认验收、返工预算与机器容量跨仓库生效，容量环境变量仍最高。worktree/generated/applyVerify 只认仓库，用户出现时启动 stderr 提示一次；独立校验两份文件，错误指出文件与字段并退出 2。meta、summary 与 JSON 结论记录 configSources，自然语言短行不变；新增用户/仓库/合并/撤销/容量优先级/忽略提示/错误的黑盒回归。二进制和校验和留待主控审后构建。
 
