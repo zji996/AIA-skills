@@ -76,7 +76,7 @@ pub fn max_heavy() -> Res<usize> {
 }
 fn heavy_limit(run: Option<&Path>) -> Res<usize> {
     let config = crate::config::context_capacity(run)?;
-    Ok(crate::config::capacity(&config, "maxHeavy", "MAX_HEAVY", 1)? as usize)
+    Ok(crate::config::capacity(&config, "maxHeavy", "MAX_HEAVY", 2)? as usize)
 }
 fn lane_dir() -> PathBuf {
     state_dir().join("lane")

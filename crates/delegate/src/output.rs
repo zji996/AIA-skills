@@ -150,6 +150,28 @@ pub fn human(run: &Path, status: &Value) -> String {
     } else if state == "answered" {
         parts.push("未设验收".into());
     }
+    if status["evidence"].is_object() {
+        parts.push(format!(
+            "证据 {}",
+            if b(&status["evidence"], "timedOut") {
+                "超时"
+            } else if status["evidence"]["exit"].as_i64() == Some(0) {
+                "通过"
+            } else {
+                "失败"
+            }
+        ));
+    }
+    if b(status, "applied") {
+        parts.push(
+            if s(status, "appliedBy") == "detected" {
+                "已合入（主干已含改动）"
+            } else {
+                "已合入"
+            }
+            .into(),
+        );
+    }
     if !status["protectViolation"].is_null() {
         parts.push(
             if s(status, "error").contains("generated output") {
@@ -169,6 +191,8 @@ pub fn human(run: &Path, status: &Value) -> String {
     let id = s(status, "run");
     let next = if runs::active(state) {
         format!("等待交付：delegate wait {id}")
+    } else if b(status, "applied") && s(status, "appliedBy") == "detected" {
+        format!("清理：delegate clean {id}")
     } else if !s(status, "next").is_empty() {
         if state == "timeout" && s(status, "mode") == "write" {
             format!("改动保留，续做不计返工次数：{}", s(status, "next"))

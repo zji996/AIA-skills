@@ -15,6 +15,9 @@ const LAUNCH: &[(&str, &str)] = &[
     ("--protect-reason PATH REASON", "Protect a path with its reason; repeatable. Report necessary protected changes instead of bypassing protection."),
     ("--hide-accept", "Keep the acceptance command from the agent for blind verification."),
     ("--accept-timeout DURATION", "Acceptance command limit (default: 10m)."),
+    ("--evidence COMMAND", "Run after successful acceptance or answer; records evidence without changing state or exit code."),
+    ("--no-evidence", "Disable the default evidence command."),
+    ("--evidence-timeout DURATION", "Evidence command limit excluding queue time (default: 30m)."),
     ("--timeout DURATION", "Limit for each attempt (default: 25m Pi, 50m Codex)."),
     ("--retries N", "Malformed-answer reruns, 0-3 (default: 1)."),
     ("--provider NAME", "Agent provider override."),
@@ -50,6 +53,9 @@ const REPLY: &[(&str, &str)] = &[
     ("--protect / --protect-reason", "Protected paths and reasons are inherited from the previous run and cannot be changed in reply."),
     ("--hide-accept", "Keep the acceptance command from the agent."),
     ("--accept-timeout DURATION", "Acceptance command limit (default: 10m)."),
+    ("--evidence COMMAND", "Replace the inherited evidence command; failure never changes state or exit code."),
+    ("--no-evidence", "Remove the inherited evidence command."),
+    ("--evidence-timeout DURATION", "Evidence command limit (inherited; default: 30m)."),
     ("--timeout DURATION", "Limit for the attempt (default: 25m Pi, 50m Codex)."),
     ("--fresh", "Start a new session in the same workdir/worktree and conversation; message must stand alone."),
     ("--sync", "Merge the caller's later changes into the conversation worktree before replying; conflicts stop the reply."),
@@ -124,7 +130,7 @@ pub fn print(command: Option<&str>) -> bool {
         println!(
             "Exit: 0 delivered/answered, 1 other finished, 2 usage, 75 still running at --max, 76 already covered by another waiter, 77 agentDeny shim refusal."
         );
-        println!(".delegate.json agentDeny: exact argv prefixes for agent PATH shims; no global-option normalization. Acceptance/setup/apply and caller lane keep the original PATH. Shims have no environment bypass.");
+        println!(".delegate.json agentDeny: argv prefixes by default; exact: true matches the whole argv. No global-option normalization. Acceptance/evidence/setup/apply and caller lane keep the original PATH. Shims have no environment bypass.");
         println!("Runs: $DELEGATE_RUNS or <git root of cwd>/.local/run/delegate (old .local/run/pi runs remain readable).");
         return true;
     };
@@ -162,7 +168,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("--verify", "After merging, run the repository acceptance on the merged tree unless acceptStillValid is true (default from .delegate.json applyVerify)."),
             ("--no-verify", "Skip the post-merge acceptance even when .delegate.json enables it."),
         ]),
-        "lane" => ("[--label TEXT] [command ...]", "Queue a heavy command with acceptance checks, worktree setup, and other machine checks. DELEGATE_MAX_HEAVY run at once (default: 1). One argument is a shell command; no command lists the lane.", &[
+        "lane" => ("[--label TEXT] [command ...]", "Queue a heavy command with acceptance, evidence, worktree setup, and other machine checks. DELEGATE_MAX_HEAVY run at once (default: 2). One argument is a shell command; no command lists the lane.", &[
             ("--label TEXT", "Label shown in the lane listing."),
             ("command", "Command and arguments to run; omit to list the lane."),
         ]),

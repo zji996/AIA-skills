@@ -18,6 +18,53 @@ use std::time::Duration;
 type Recorded = Option<(Vec<Value>, Value)>;
 type StopWaiter = Arc<Mutex<Option<mpsc::Sender<()>>>>;
 
+fn evidence(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
+    let path = run.join("evidence.log");
+    let mut result = json!({"exit":null,"timedOut":false,"seconds":0,"tail":"","log":path});
+    let execute = || -> Res<(i32, bool, f64)> {
+        let _slot = lane::acquire("evidence", Some(run), Some(run), |ahead, _| {
+            log_event(run, json!({"e":"queue","role":"evidence","ahead":ahead}));
+        })?;
+        if lane::stopped() {
+            return Err("stopped while queued for the heavy lane".into());
+        }
+        let mut log = File::create(&path).map_err(|e| e.to_string())?;
+        let started = epoch();
+        let outcome = run_shell(
+            (s(meta, "evidenceCommand"), "evidence"),
+            Path::new(s(meta, "workdir")),
+            run,
+            &meta["env"],
+            meta["evidenceTimeoutSeconds"].as_f64().unwrap_or(1800.0),
+            &mut log,
+            Some(&holder),
+        );
+        let elapsed = epoch() - started;
+        outcome.map(|(code, timed)| (code, timed, elapsed))
+    };
+    match execute() {
+        Ok((code, timed, elapsed)) => {
+            result["exit"] = json!(code);
+            result["timedOut"] = json!(timed);
+            // Milliseconds: serde_json does not round-trip every f64, so meta and --json could differ.
+            result["seconds"] = json!((elapsed * 1000.0).round() / 1000.0);
+            result["tail"] = json!(read(&path)
+                .chars()
+                .rev()
+                .take(1500)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+                .trim());
+        }
+        Err(error) => {
+            result["tail"] = json!(error);
+        }
+    }
+    result
+}
+
 pub fn log_event(run: &Path, mut event: Value) {
     event["at"] = json!(iso());
     let _ = append(run.join("events.jsonl"), &format!("{event}\n"));
@@ -419,6 +466,7 @@ fn escalate(
     protected: bool,
 ) -> Res<bool> {
     if s(meta, "tier") != "cheap"
+        || runs::agent_pinned(meta)
         || protected
         || !["malformed", "failed", "timeout", "rejected"].contains(&state)
     {
@@ -437,7 +485,14 @@ fn escalate(
         .into_iter()
         .filter(|r| r != run)
         .collect();
-    if launch::capacity(&strong, &others, &meta["configCapacity"]).is_err() {
+    if launch::capacity(
+        &strong,
+        &others,
+        &meta["configCapacity"],
+        &launch::repo_key_for_meta(meta),
+    )
+    .is_err()
+    {
         log_event(
             run,
             json!({"e":"escalate_skipped","reason":format!("no room for {strong}")}),
@@ -588,6 +643,14 @@ fn inner(
             format!("{}\n", answer.trim_end_matches('\n')),
         )?;
     }
+    if ["delivered", "answered"].contains(&state.as_str())
+        && !s(&meta, "evidenceCommand").is_empty()
+    {
+        let result = evidence(&meta, run, holder.clone());
+        sum["evidence"] = result.clone();
+        meta["evidence"] = result;
+        let _ = write_json(run.join("meta.json"), &meta);
+    }
     let evs = runs::events(run);
     let turns = evs
         .iter()
@@ -686,6 +749,7 @@ fn inner(
     if warnings.is_array() && !warnings.as_array().unwrap().is_empty() {
         sum["warnings"] = warnings;
     }
+    worktree::capture_final_entries(&meta, run);
     finish_run(
         run,
         sum,
@@ -743,7 +807,12 @@ fn admit_waiting(run: &Path, meta: &Value, stop_waiter: &StopWaiter) -> Res<()> 
         let machine = lock(&slots.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
         let local = lock(&root.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
         let others = launch::active_machine(&slots);
-        let full = launch::capacity(s(meta, "agent"), &others, &meta["configCapacity"]);
+        let full = launch::capacity(
+            s(meta, "agent"),
+            &others,
+            &meta["configCapacity"],
+            &launch::repo_key_for_meta(meta),
+        );
         if let Err(reason) = &full {
             if !reason.contains("runs are active") && !reason.contains("Codex runs are active") {
                 return full;

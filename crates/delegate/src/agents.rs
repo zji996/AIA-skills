@@ -183,6 +183,10 @@ pub fn protocol() -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "caller": caller,
         "agents": agents,
+        "capacityDefaults": {
+            "maxActive": 12, "maxCodex": 6, "maxHeavy": 2,
+            "repoMaxActive": 8, "repoMaxCodex": 4,
+        },
     })
 }
 pub fn agent_identity(agent: &str) -> Res<(PathBuf, Option<String>)> {

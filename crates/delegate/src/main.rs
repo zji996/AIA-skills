@@ -42,7 +42,7 @@ fn outcome_line(run: &Path, timing: Option<&str>) -> String {
     if let Some(drift) = worktree::source_drift(run) {
         let overlap = drift["overlap"].as_array().map_or(0, Vec::len)
             + drift["overlapMore"].as_u64().unwrap_or(0) as usize;
-        if overlap > 0 && s(&status, "state") != "timeout" {
+        if overlap > 0 && s(&status, "state") != "timeout" && !b(&status, "applied") {
             let name = run.file_name().unwrap_or_default().to_string_lossy();
             status["next"] = json!(format!(
                 "the source changed {overlap} of its files since the snapshot; review {script} diff {name} --total, then {script} apply {name} (stops on conflicts; --merge writes markers), or {script} reply {name} --sync '<rebase onto the current source>' first",

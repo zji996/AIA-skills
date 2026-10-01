@@ -145,6 +145,96 @@ class DelegateTests(unittest.TestCase):
         self.assertTrue(lines, result.stdout + result.stderr)
         return json.loads(lines[0])
 
+    def test_evidence_records_failure_without_rejecting_and_inherits(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        repo = self.repo({"a.txt": "old\n"})
+        (repo / ".delegate.json").write_text(json.dumps({"evidence": "echo proof; exit 9"}))
+        result = self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "task")
+        state = self.outcome(result)
+        self.assertEqual((result.returncode, state["state"], state["evidence"]["exit"]), (0, "delivered", 9))
+        self.assertFalse(state["evidence"]["timedOut"])
+        self.assertIn("proof", state["evidence"]["tail"])
+        self.assertTrue(Path(state["evidence"]["log"]).is_file())
+        self.assertEqual(json.loads((Path(state["dir"]) / "meta.json").read_text())["evidence"], state["evidence"])
+        self.assertIn("证据 失败", self.cli("status", state["run"], human=True).stdout)
+        reply = self.outcome(self.cli("reply", "--wait", state["run"], "more"))
+        self.assertEqual(reply["evidence"]["exit"], 9)
+        disabled = self.outcome(self.cli("reply", "--wait", reply["run"], "--no-evidence", "more"))
+        self.assertNotIn("evidence", disabled)
+        read = self.outcome(self.cli("run", "--read-only", "--workdir", repo, "task"))
+        self.assertNotIn("evidence", read)
+        off = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--no-evidence", "task"))
+        self.assertNotIn("evidence", off)
+
+    def test_evidence_timeout_and_success_use_original_path_and_environment(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        repo = self.repo({"a.txt": "old\n"})
+        (self.bin / "proof").write_text('#!/bin/sh\necho "$PROOF_ENV:$PWD"\n')
+        (self.bin / "proof").chmod(0o755)
+        (repo / ".delegate.json").write_text(json.dumps({"env": {"PROOF_ENV": "injected"},
+            "agentDeny": [{"argv": ["proof"], "hint": "no full proof"}]}))
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--evidence", "proof", "task"))
+        self.assertEqual((state["state"], state["evidence"]["exit"]), ("answered", 0))
+        self.assertIn("injected:" + state["worktree"], state["evidence"]["tail"])
+        self.assertIn("证据 通过", self.cli("status", state["run"], human=True).stdout)
+        result = self.cli("reply", "--wait", state["run"], "--evidence", "echo slow; sleep 10",
+                          "--evidence-timeout", "0.1s", "more")
+        timed = self.outcome(result)
+        self.assertEqual((result.returncode, timed["state"], timed["evidence"]["exit"]), (0, "answered", 124))
+        self.assertTrue(timed["evidence"]["timedOut"])
+        self.assertGreaterEqual(timed["evidence"]["seconds"], 0.1)
+        self.assertIn("证据 超时", self.cli("status", timed["run"], human=True).stdout)
+
+    def test_evidence_log_error_is_only_diagnostic(self):
+        self.fake_pi([answer("ok"), SETTLED], pre='mkdir "$DELEGATE_RUN_DIR/evidence.log"')
+        result = self.cli("run", "--evidence", "false", "task")
+        state = self.outcome(result)
+        self.assertEqual((result.returncode, state["state"]), (0, "answered"))
+        self.assertIsNone(state["evidence"]["exit"])
+        self.assertFalse(state["evidence"]["timedOut"])
+        self.assertIn("directory", state["evidence"]["tail"])
+
+    def test_evidence_queue_excludes_timeout_and_reclaims_children(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        self.hold_lane(2)
+        state = self.outcome(self.cli("run", "--evidence",
+            "sleep 30 & echo $! > evidence-bg.pid; echo proof", "--evidence-timeout", "0.5s", "task"))
+        self.assertEqual((state["state"], state["evidence"]["exit"]), ("answered", 0))
+        self.assertGreaterEqual(state["queuedSeconds"], 1)
+        self.assertFalse(state["evidence"]["timedOut"])
+        self.assertGreaterEqual(state["cleanup"]["terminated"], 1)
+        pid = int((self.work / "evidence-bg.pid").read_text())
+        self.until(lambda: not Path(f"/proc/{pid}").exists(), "the evidence child to go")
+        meta = json.loads((Path(state["dir"]) / "meta.json").read_text())
+        self.assertEqual(meta["evidenceTimeoutSeconds"], 0.5)
+        inherited = self.outcome(self.cli("reply", "--wait", state["run"], "--evidence", "sleep 10", "more"))
+        self.assertTrue(inherited["evidence"]["timedOut"])
+        self.assertEqual(inherited["state"], "answered")
+
+    def test_evidence_skipped_on_rejection_and_user_default_overridden(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        self.env["XDG_CONFIG_HOME"] = str(self.work / "config")
+        config = self.work / "config/delegate/config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({"evidence": "echo user-proof"}))
+        repo = self.repo({"a.txt": "old\n"})
+        user = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        self.assertIn("user-proof", user["evidence"]["tail"])
+        (repo / ".delegate.json").write_text(json.dumps({"evidence": "echo repo-proof"}))
+        override = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--evidence", "echo cli-proof", "task"))
+        self.assertIn("cli-proof", override["evidence"]["tail"])
+        rejected = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "false", "task"))
+        self.assertEqual(rejected["state"], "rejected")
+        self.assertNotIn("evidence", rejected)
+        self.fake_pi([answer("ok"), SETTLED], pre="echo changed > a.txt")
+        protected = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--protect", "a.txt", "task"))
+        self.assertEqual(protected["state"], "rejected")
+        self.assertNotIn("evidence", protected)
+        config.write_text(json.dumps({"evidence": 1}))
+        bad = self.cli("start", "task")
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("evidence", bad.stderr)
+
     def test_help_and_version_are_there_for_humans(self):
         top = self.cli("--help")
         self.assertEqual(top.returncode, 0, top.stderr)
@@ -158,6 +248,7 @@ class DelegateTests(unittest.TestCase):
             for option in options:
                 self.assertIn(option, result.stdout, command)
         self.assertEqual(self.cli("-h").returncode, 0)
+        self.assertIn("default: 2", self.cli("lane", "--help").stdout)
         wait_help = self.cli("wait", "--help").stdout
         self.assertIn("regardless of caller", " ".join(wait_help.split()))
         self.assertNotIn("(the default)", wait_help)
@@ -302,12 +393,14 @@ class DelegateTests(unittest.TestCase):
 
     def hold_lane(self, seconds):
         """Occupy the heavy lane from another process, as a caller's own check would."""
+        self.env["DELEGATE_MAX_HEAVY"] = "1"
         holder = subprocess.Popen([str(DELEGATE), "lane", "--label", "caller check", f"sleep {seconds}"], env=self.env)
         self.addCleanup(holder.kill)
         self.until(lambda: "caller check" in self.cli("lane").stdout, "the lane holder")
         return holder
 
     def test_lane_runs_heavy_commands_one_at_a_time(self):
+        self.env["DELEGATE_MAX_HEAVY"] = "1"
         # mkdir fails if another command still holds the directory: overlap would show as a failure.
         command = "mkdir held && sleep 0.6 && rmdir held"
         runs = [subprocess.Popen([str(DELEGATE), "lane", command], cwd=self.work, env=self.env,
@@ -922,7 +1015,7 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(state["agent"], "codex")
         state = self.outcome(self.cli("run", "--agent", "pi", "task"))
         self.assertEqual(state["agent"], "pi")
-        self.assertNotIn("tier", state)  # named outright: no tier, no escalation
+        self.assertEqual((state["tier"], state["agentPinned"]), ("cheap", True))  # named outright: display only
         self.assertEqual(self.cli("run", "--agent", "pi", "--tier", "cheap", "task").returncode, 2)
         self.env["DELEGATE_CHEAP_AGENT"] = "gemini"
         self.assertIn("DELEGATE_CHEAP_AGENT", self.cli("run", "--read-only", "task").stderr)
@@ -1364,6 +1457,8 @@ class DelegateTests(unittest.TestCase):
         merged = self.cli("apply", "--merge", state["run"])
         self.assertEqual(merged.returncode, 1)
         self.assertIn("<<<<<<< current", (repo / "a.txt").read_text())
+        self.assertIn("1 个文件有冲突标记待解决: a.txt", merged.stderr)
+        self.assertNotIn("apply failed", merged.stderr)
         self.assertTrue((repo / "seen.txt").exists())
         self.assertTrue((Path(state["dir"]) / ".applied").exists())  # markers landed every change
         self.assertNotIn("never applied", self.cli("clean", state["run"]).stdout)
@@ -1836,6 +1931,9 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(lane.returncode, 0, lane.stderr)
         self.assertLess(time.monotonic() - started, 3)
         self.assertTrue((run / ".generate-pending").exists())
+        pending = self.outcome(self.cli("status", state["run"]))
+        self.assertNotIn("applied", pending)
+        self.assertIn("apply", pending["next"])
         # Zero file actions must still retry generation and advance the merge marker.
         (repo / ".delegate.json").write_text(json.dumps({"generated": {
             "paths": ["gen/"], "command": "cp src.txt gen/out.txt; echo retried > retry.txt"}}))
@@ -2309,6 +2407,281 @@ class DelegateTests(unittest.TestCase):
             touch_up.write("three\n")
         self.assertEqual(self.cli("apply", first["run"]).returncode, 0)
         self.assertEqual((repo / "a.txt").read_text(), "a\none\ntwo\nthree\n")
+
+
+    def test_v518_exact_deny_filtered_arguments_and_original_accept_path(self):
+        repo = self.repo({"a.txt": "old\n"})
+        rules = [{"argv": ["cargo", "xtask", "infra-test"], "exact": True, "hint": "use a filter"},
+                 {"argv": ["cargo", "check"], "hint": "related checks only"}]
+        (repo / ".delegate.json").write_text(json.dumps({"agentDeny": rules}))
+        tool = self.bin / "cargo"
+        tool.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+        tool.chmod(0o755)
+        delegate = shlex.quote(str(DELEGATE))
+        self.fake_pi([answer("done"), SETTLED], pre=f'''
+cargo xtask infra-test; echo $? > "$DELEGATE_RUN_DIR/exact-code"
+cargo xtask infra-test --filter database > "$DELEGATE_RUN_DIR/filtered"
+echo $? > "$DELEGATE_RUN_DIR/filtered-code"
+{delegate} lane cargo xtask infra-test --filter database
+echo $? > "$DELEGATE_RUN_DIR/lane-code"
+cargo check --package small; echo $? > "$DELEGATE_RUN_DIR/prefix-code"
+''')
+        state = self.outcome(self.cli("run", "--agent", "pi", "--workdir", repo,
+                                      "--accept", "cargo xtask infra-test", "task"))
+        self.assertEqual((state["state"], state["denied"]), ("delivered", 2))
+        run = Path(state["dir"])
+        for name, code in (("exact", 77), ("filtered", 0), ("lane", 0), ("prefix", 77)):
+            self.assertEqual((run / f"{name}-code").read_text().strip(), str(code))
+        self.assertIn("database", (run / "filtered").read_text())
+        self.assertIn("infra-test", (run / "accept.log").read_text())
+
+    def test_v518_deny_merge_and_allow_distinguish_exact_from_prefix(self):
+        repo = self.repo({"a.txt": "old\n"})
+        self.env["XDG_CONFIG_HOME"] = str(self.work / "config")
+        user_file = self.work / "config/delegate/config.json"
+        user_file.parent.mkdir(parents=True)
+        prefix = {"argv": ["cargo", "check"], "hint": "prefix"}
+        exact = {"argv": ["cargo", "check"], "exact": True, "hint": "exact"}
+        user_file.write_text(json.dumps({"agentDeny": [prefix, exact]}))
+        tool = self.bin / "cargo"
+        tool.write_text("#!/bin/sh\nexit 0\n")
+        tool.chmod(0o755)
+        self.fake_pi([answer("done"), SETTLED], pre='cargo check; cargo check --package small')
+        config = repo / ".delegate.json"
+        for revoke, remaining, denied in ((False, exact, 1), (True, prefix, 2)):
+            config.write_text(json.dumps({"agentDeny": [{"argv": ["cargo", "check"],
+                                                         "exact": revoke, "allow": True}]}))
+            state = self.outcome(self.cli("run", "--agent", "pi", "--workdir", repo, "task"))
+            meta = json.loads((Path(state["dir"]) / "meta.json").read_text())
+            self.assertEqual(meta["agentDeny"], [remaining])
+            self.assertEqual(state["denied"], denied)
+        config.write_text(json.dumps({"agentDeny": [{**exact, "exact": "yes"}]}))
+        rejected = self.cli("start", "--agent", "pi", "--workdir", repo, "task")
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("agentDeny.exact must be a boolean", rejected.stderr)
+
+    def test_v518_repository_capacity_normalizes_worktrees_and_legacy_meta(self):
+        repo = self.repo({"a.txt": "old\n"})
+        linked = self.work / "linked"
+        subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "--detach", str(linked)], check=True)
+        other = self.work / "other"
+        other.mkdir()
+        self.fake_pi([answer("done"), SETTLED], sleep=30)
+        self.env.update(DELEGATE_REPO_MAX_ACTIVE="1", DELEGATE_MAX_ACTIVE="3")
+        first = self.outcome(self.cli("start", "--agent", "pi", "--read-only", "--in-place",
+                                      "--workdir", repo, "first"))
+        self.addCleanup(self.cli, "stop", first["dir"])
+        meta_file = Path(first["dir"]) / "meta.json"
+        meta = json.loads(meta_file.read_text())
+        self.assertEqual(meta["repoKey"], str((repo / ".git").resolve()))
+        del meta["repoKey"]  # Old task records and single-line slots still count.
+        meta_file.write_text(json.dumps(meta))
+        self.env["DELEGATE_RUNS"] = str(self.work / "runs2")
+        second = self.outcome(self.cli("start", "--agent", "pi", "--read-only", "--workdir", other, "second"))
+        self.addCleanup(self.cli, "stop", second["dir"])
+        blocked = self.cli("start", "--agent", "pi", "--read-only", "--in-place", "--workdir", linked, "third")
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("1 runs are active in this repository", blocked.stderr)
+        self.assertIn("DELEGATE_REPO_MAX_ACTIVE=1", blocked.stderr)
+        self.assertIn(first["dir"], blocked.stderr)
+        self.assertNotIn(second["dir"], blocked.stderr)
+        self.env["DELEGATE_REPO_MAX_ACTIVE"] = "0"
+        third = self.outcome(self.cli("start", "--agent", "pi", "--read-only", "--in-place", "--workdir", linked, "third"))
+        self.addCleanup(self.cli, "stop", third["dir"])
+        blocked = self.cli("start", "--agent", "pi", "--read-only", "task")
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("3 runs are active on this machine", blocked.stderr)
+        for state in (first, second, third):
+            self.assertIn(state["dir"], blocked.stderr)
+
+    def test_v518_repository_codex_limits_and_non_git_normalization(self):
+        self.fake_codex(codex_events("done"), pre="sleep 30")
+        alias = self.work / "alias"
+        alias.symlink_to(self.work, target_is_directory=True)
+        self.env.update(DELEGATE_REPO_MAX_CODEX="1", DELEGATE_MAX_CODEX="3")
+        first = self.outcome(self.cli("start", "--agent", "codex", "--read-only", "first"))
+        self.addCleanup(self.cli, "stop", first["dir"])
+        blocked = self.cli("start", "--agent", "codex", "--read-only", "--workdir", alias, "second")
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("1 Codex runs are active in this repository", blocked.stderr)
+        self.assertIn("DELEGATE_REPO_MAX_CODEX=1", blocked.stderr)
+        self.env["DELEGATE_REPO_MAX_CODEX"] = "0"
+        second = self.outcome(self.cli("start", "--agent", "codex", "--read-only", "--workdir", alias, "second"))
+        self.addCleanup(self.cli, "stop", second["dir"])
+        self.env["DELEGATE_REPO_MAX_CODEX"] = "bad"
+        blocked = self.cli("start", "--agent", "codex", "--read-only", "task")
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("DELEGATE_REPO_MAX_CODEX", blocked.stderr)
+
+    def test_v518_capacity_defaults_config_precedence_and_protocol(self):
+        defaults = {"maxActive": 12, "maxCodex": 6, "maxHeavy": 2, "repoMaxActive": 8, "repoMaxCodex": 4}
+        self.fake_pi([answer("done"), SETTLED])
+        state = self.outcome(self.cli("run", "--agent", "pi", "--read-only", "task"))
+        self.assertEqual(json.loads((Path(state["dir"]) / "meta.json").read_text())["configCapacity"], defaults)
+        self.assertEqual(json.loads(self.cli("protocol").stdout)["capacityDefaults"], defaults)
+        repo = self.repo({"a.txt": "old\n"})
+        self.env["XDG_CONFIG_HOME"] = str(self.work / "config")
+        path = self.work / "config/delegate/config.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"repoMaxActive": 3, "repoMaxCodex": 2}))
+        (repo / ".delegate.json").write_text('{"repoMaxActive":5}')
+        self.env["DELEGATE_REPO_MAX_CODEX"] = "0"
+        state = self.outcome(self.cli("run", "--agent", "pi", "--read-only", "--workdir", repo, "task"))
+        capacity = json.loads((Path(state["dir"]) / "meta.json").read_text())["configCapacity"]
+        self.assertEqual((capacity["repoMaxActive"], capacity["repoMaxCodex"]), (5, 0))
+        (repo / ".delegate.json").write_text('{"repoMaxActive":-1}')
+        self.assertIn("repoMaxActive must be", self.cli("start", "--agent", "pi", "--workdir", repo, "task").stderr)
+
+    def test_v518_default_heavy_lane_runs_two_commands(self):
+        gate = self.work / "release-lane"
+        command = f'while [ ! -f {shlex.quote(str(gate))} ]; do sleep .02; done'
+        runners = []
+        for index in range(3):
+            process = subprocess.Popen([str(DELEGATE), "lane", "--label", f"default-{index}", command],
+                                       cwd=self.work, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.addCleanup(process.kill)
+            runners.append(process)
+        self.until(lambda: self.cli("lane").stdout.count("\n") == 3, "three default lane tickets")
+        listing = self.cli("lane").stdout
+        self.assertEqual((listing.count("running"), listing.count("queued")), (2, 1), listing)
+        gate.touch()
+        for process in runners:
+            process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 0)
+
+    def test_v518_repository_codex_capacity_blocks_cheap_escalation(self):
+        self.env.pop("DELEGATE_STRONG_AGENT")
+        self.env.update(DELEGATE_REPO_MAX_CODEX="1", DELEGATE_MAX_CODEX="3")
+        self.fake_pi([answer(LEAKED), SETTLED])
+        self.fake_codex(codex_events("done"), pre="sleep 30")
+        busy = self.outcome(self.cli("start", "--agent", "codex", "--read-only", "busy"))
+        self.addCleanup(self.cli, "stop", busy["dir"])
+        state = self.outcome(self.cli("run", "--tier", "cheap", "--read-only", "--retries", "0", "task"))
+        self.assertEqual((state["state"], state["agent"]), ("malformed", "pi"))
+        self.assertNotIn("escalatedFrom", state)
+        self.assertIn("escalate_skipped", (Path(state["dir"]) / "events.jsonl").read_text())
+
+    def test_v518_after_waits_for_repository_capacity(self):
+        repo = self.repo({"a.txt": "old\n"})
+        gate = self.work / "gate"
+        self.fake_pi([answer("done"), SETTLED], pre=f'''
+if [ "$PWD" = {shlex.quote(str(repo))} ]; then
+  while [ ! -f {shlex.quote(str(gate))} ]; do sleep .02; done
+fi
+''')
+        self.env["DELEGATE_REPO_MAX_ACTIVE"] = "1"
+        first = self.outcome(self.cli("start", "--agent", "pi", "--read-only", "--in-place", "--workdir", repo, "blocker"))
+        self.addCleanup(self.cli, "stop", first["dir"])
+        upstream = self.outcome(self.cli("run", "--agent", "pi", "--read-only", "upstream"))
+        waiting = self.outcome(self.cli("start", "--agent", "pi", "--read-only", "--in-place", "--workdir", repo,
+                                        "--after", upstream["run"], "queued"))
+        self.addCleanup(self.cli, "stop", waiting["dir"])
+        self.assertEqual(waiting["state"], "waiting")
+        time.sleep(.2)
+        self.assertEqual(self.outcome(self.cli("status", waiting["run"]))["state"], "waiting")
+        gate.touch()
+        finished = self.outcome(self.cli("wait", waiting["run"]))
+        self.assertEqual(finished["state"], "answered")
+
+
+    def test_detect_manual_merge_from_working_tree_contents_and_clean(self):
+        repo = self.repo({"a.txt": "old\n", "gone.txt": "delete\n", "run.sh": "echo old\n",
+                          "unrelated.txt": "untouched\n"})
+        self.fake_pi([answer("done"), SETTLED], pre="echo new > a.txt; rm gone.txt; chmod +x run.sh; "
+                     "echo added > new.txt; ln -s new.txt link")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        tree = Path(state["worktree"])
+        (repo / "a.txt").write_bytes((tree / "a.txt").read_bytes())
+        partial = self.outcome(self.cli("status", state["run"]))
+        self.assertNotIn("applied", partial)
+        self.assertIn("apply", partial["next"])
+        (repo / "gone.txt").unlink()
+        (repo / "new.txt").write_bytes((tree / "new.txt").read_bytes())
+        (repo / "link").symlink_to("new.txt")
+        self.assertNotIn("applied", self.outcome(self.cli("status", state["run"])))  # executable mode differs
+        (repo / "run.sh").chmod(0o755)
+        (repo / "unrelated.txt").write_text("caller edit\n")
+        detected = self.outcome(self.cli("wait", state["run"]))
+        self.assertEqual((detected["applied"], detected["appliedBy"]), (True, "detected"))
+        self.assertIn("clean", detected["next"])
+        self.assertEqual(json.loads((Path(state["dir"]) / ".applied").read_text())["appliedBy"], "detected")
+        human = self.cli("status", state["run"], human=True).stdout
+        self.assertIn("已合入（主干已含改动）", human)
+        self.assertIn("下一步：清理", human)
+        self.assertNotIn("delegate apply", human)
+        self.assertEqual(self.cli("clean", "--finished").returncode, 0)
+        self.assertFalse(tree.exists())
+        self.assertFalse(Path(state["dir"]).exists())
+
+    def test_detect_manual_merge_freezes_final_files_and_handles_old_records(self):
+        repo = self.repo({"a.txt": "old\n"})
+        self.fake_pi([answer("done"), SETTLED], pre="echo task > a.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        (Path(state["worktree"]) / "a.txt").write_text("later\n")
+        (repo / "a.txt").write_text("later\n")
+        self.assertNotIn("applied", self.outcome(self.cli("status", state["run"])))
+        (repo / "a.txt").write_text("task\n")
+        run = Path(state["dir"])
+        rec = json.loads((run / "changes.json").read_text())
+        del rec["finalEntries"]
+        (run / "changes.json").write_text(json.dumps(rec))
+        detected = self.outcome(self.cli("status", state["run"]))
+        self.assertEqual(detected["appliedBy"], "detected")
+
+    def test_clean_detects_manual_merge_without_status_and_large_files(self):
+        repo = self.repo({"a.txt": "old\n"})
+        self.env["DELEGATE_SNAPSHOT_MAX_BYTES"] = "8"
+        self.fake_pi([answer("done"), SETTLED], pre="echo changed > a.txt; head -c 100 /dev/zero > big.dat")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        tree = Path(state["worktree"])
+        (repo / "a.txt").write_bytes((tree / "a.txt").read_bytes())
+        (repo / "big.dat").write_bytes(b"x" * 100)
+        self.assertNotIn("applied", self.outcome(self.cli("status", state["run"])))  # same size, different hash
+        (repo / "big.dat").write_bytes((tree / "big.dat").read_bytes())
+        self.assertEqual(self.cli("clean", "--finished").returncode, 0)
+        self.assertFalse(tree.exists())
+
+    def test_detect_manual_merge_requires_every_cumulative_reply_change(self):
+        repo = self.repo({"a.txt": "old\n", "b.txt": "old\n"})
+        self.fake_pi([answer("first"), SETTLED], pre="echo first > a.txt")
+        first = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        self.fake_pi([answer("second"), SETTLED], pre="echo second > b.txt")
+        second = self.outcome(self.cli("reply", "--wait", first["run"], "continue"))
+        (repo / "b.txt").write_text("second\n")
+        self.assertNotIn("applied", self.outcome(self.cli("status", second["run"])))
+        (repo / "a.txt").write_text("first\n")
+        self.assertEqual(self.outcome(self.cli("status", second["run"]))["appliedBy"], "detected")
+
+    def test_pinned_agent_displays_default_tier_and_never_escalates(self):
+        self.env.pop("DELEGATE_STRONG_AGENT")
+        self.fake_pi([answer(LEAKED), SETTLED])
+        self.fake_codex(codex_events("fallback"))
+        pinned = self.outcome(self.cli("run", "--read-only", "--agent", "pi", "task"))
+        self.assertEqual((pinned["agent"], pinned["tier"], pinned["agentPinned"], pinned["state"]),
+                         ("pi", "cheap", True, "malformed"))
+        self.assertFalse((self.work / "pi.log.codex").exists())
+        self.assertIn("pi/cheap", self.cli("status", pinned["run"], human=True).stdout)
+        codex = self.outcome(self.cli("run", "--read-only", "--agent", "codex", "task"))
+        self.assertEqual((codex["tier"], codex["agentPinned"]), ("strong", True))
+        self.assertIn("codex/strong", self.cli("status", codex["run"], human=True).stdout)
+
+    def test_pinned_reply_and_legacy_tier_display_do_not_rewrite_meta(self):
+        self.fake_pi([answer("first"), SETTLED])
+        first = self.outcome(self.cli("run", "--read-only", "--agent", "pi", "task"))
+        path = Path(first["dir"]) / "meta.json"
+        legacy = json.loads(path.read_text())
+        legacy["tier"] = None
+        del legacy["agentPinned"]
+        original = json.dumps(legacy)
+        path.write_text(original)
+        shown = self.outcome(self.cli("status", first["run"]))
+        self.assertEqual((shown["tier"], shown["agentPinned"]), ("cheap", True))
+        self.assertEqual(path.read_text(), original)
+        reply = self.outcome(self.cli("reply", "--wait", first["run"], "continue"))
+        self.assertEqual((reply["tier"], reply["agentPinned"]), ("cheap", True))
+        self.fake_codex(codex_events("switched"))
+        switched = self.outcome(self.cli("reply", "--wait", "--agent", "codex", reply["run"], "continue"))
+        self.assertEqual((switched["tier"], switched["agentPinned"]), ("strong", True))
 
 
 def delegate_pid_alive(pid):

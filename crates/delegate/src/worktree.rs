@@ -454,6 +454,155 @@ fn file_hash(path: &Path) -> Res<String> {
         hash.update(&buffer[..size]);
     }
 }
+fn final_entry(root: &Path, path: &str) -> Option<Value> {
+    use std::os::unix::ffi::OsStrExt;
+    let target = root.join(path);
+    if through_symlink(root, &target) {
+        return None;
+    }
+    let info = match fs::symlink_metadata(&target) {
+        Ok(info) => info,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some(json!({"mode":"absent"}));
+        }
+        Err(_) => return None,
+    };
+    if info.file_type().is_symlink() {
+        let link = fs::read_link(&target).ok()?;
+        let bytes = link.as_os_str().as_bytes();
+        return Some(
+            json!({"mode":"120000","size":bytes.len(),"hash":sha1_smol::Sha1::from(bytes).digest().to_string()}),
+        );
+    }
+    if !info.is_file() {
+        return None;
+    }
+    Some(
+        json!({"mode":if info.permissions().mode() & 0o111 != 0 {"100755"} else {"100644"},"size":info.len(),"hash":file_hash(&target).ok()?}),
+    )
+}
+/// Freeze only changed paths; status compares these against the source working tree.
+pub fn capture_final_entries(meta: &Value, run: &Path) {
+    if s(meta, "mode") != "write" || !meta["worktree"].is_object() {
+        return;
+    }
+    let mut rec = json(run.join("changes.json"));
+    if s(&rec, "after").is_empty() {
+        return;
+    }
+    let Some(changes) = final_changes(run, meta, &rec) else {
+        return;
+    };
+    let root = Path::new(s(&meta["worktree"], "path"));
+    let entries = changes
+        .iter()
+        .map(|change| {
+            let path = s(change, "path");
+            (
+                path.to_string(),
+                final_entry(root, path).unwrap_or(Value::Null),
+            )
+        })
+        .collect::<serde_json::Map<String, Value>>();
+    rec["finalEntries"] = json!(entries);
+    let _ = write_json(run.join("changes.json"), &rec);
+}
+fn final_changes(run: &Path, meta: &Value, rec: &Value) -> Option<Vec<Value>> {
+    let mut baseline = applied_state(run, meta);
+    if s(&baseline, "tree").is_empty() {
+        let mut first = meta.clone();
+        while !s(&first, "parent").is_empty() {
+            let parent = run.parent()?.join(s(&first, "parent"));
+            let older = json(parent.join("meta.json"));
+            if !older.is_object() {
+                return None;
+            }
+            first = older;
+        }
+        baseline = json!({"tree":if s(meta,"chainBase").is_empty() {s(rec,"base")} else {s(meta,"chainBase")},"large":first["base"]["large"]});
+    }
+    tree_changes(
+        Path::new(s(rec, "top")),
+        &baseline,
+        &json!({"tree":rec["after"],"large":rec["afterLarge"]}),
+        true,
+    )
+    .ok()
+}
+/// Old records retain their Git snapshot; large files without frozen hashes cannot prove equality.
+fn recorded_entries(
+    run: &Path,
+    meta: &Value,
+    rec: &Value,
+) -> Option<serde_json::Map<String, Value>> {
+    if let Some(entries) = rec["finalEntries"].as_object() {
+        return Some(entries.clone());
+    }
+    let top = Path::new(s(rec, "top"));
+    final_changes(run, meta, rec)?.iter().map(|change| {
+        let path = s(change, "path");
+        if b(change, "large") || b(change, "submodule") {
+            return None;
+        }
+        let (mode, content) = blob(top, s(rec, "after"), path).ok()?;
+        let entry = if let (Some(mode), Some(bytes)) = (mode, content) {
+            json!({"mode":mode,"size":bytes.len(),"hash":sha1_smol::Sha1::from(&bytes).digest().to_string()})
+        } else {
+            json!({"mode":"absent"})
+        };
+        Some((path.to_string(), entry))
+    }).collect()
+}
+pub fn detect_applied(run: &Path, meta: &Value) -> bool {
+    if run.join(".applied").exists() {
+        return true;
+    }
+    if s(meta, "mode") != "write"
+        || !meta["worktree"].is_object()
+        || !run.join("exit_code").is_file()
+        || run.join(".generate-pending").exists()
+    {
+        return false;
+    }
+    let rec = json(run.join("changes.json"));
+    let Some(entries) = recorded_entries(run, meta, &rec) else {
+        return false;
+    };
+    if entries.is_empty() {
+        return false;
+    }
+    let root = Path::new(s(&meta["worktree"], "source"));
+    if !root.is_dir()
+        || !entries.iter().all(|(path, expected)| {
+            if !expected.is_object() {
+                return false;
+            }
+            // Check cheap metadata before reading and hashing the file.
+            let target = root.join(path);
+            if s(expected, "mode") != "absent"
+                && s(expected, "mode") != "120000"
+                && !fs::symlink_metadata(&target).is_ok_and(|info| {
+                    info.is_file()
+                        && !info.file_type().is_symlink()
+                        && Some(info.len()) == expected["size"].as_u64()
+                        && entry_mode(&target).as_deref() == Some(s(expected, "mode"))
+                })
+            {
+                return false;
+            }
+            final_entry(root, path).is_some_and(|actual| actual == *expected)
+        })
+    {
+        return false;
+    }
+    let mut large_hashes = serde_json::Map::new();
+    for (path, entry) in &entries {
+        if rec["afterLarge"].get(path).is_some() {
+            large_hashes.insert(path.clone(), entry["hash"].clone());
+        }
+    }
+    write_json(run.join(".applied"), &json!({"at":iso(),"tree":rec["after"],"large":rec["afterLarge"],"largeHashes":large_hashes,"appliedBy":"detected"})).is_ok()
+}
 /// Running write tasks on the same source (field notes 16): what each has
 /// changed so far, and which of those paths the new task's prompt names, so
 /// the caller can choose to serialize before the overlap becomes a conflict.
@@ -749,10 +898,17 @@ pub fn apply(run: &Path, merge: bool, dry: bool) -> Res<ApplyOutcome> {
     let code = apply_inner(run, merge, dry, &mut conclusion)?;
     conclusion["apply"]["ok"] = json!(code == 0);
     accept_validity(run, dry, &mut conclusion);
+    let marked = strings(&conclusion["apply"]["conflictMarkers"]);
     apply_progress(if code == 0 {
-        "apply complete / 应用完成"
+        "apply complete / 应用完成".to_string()
+    } else if !marked.is_empty() {
+        format!(
+            "applied with conflict markers / 已应用，{} 个文件有冲突标记待解决: {}",
+            marked.len(),
+            marked.join(", ")
+        )
     } else {
-        "apply failed / 应用失败"
+        "apply failed / 应用失败".to_string()
     });
     Ok(ApplyOutcome { code, conclusion })
 }
@@ -1202,7 +1358,15 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
         eprintln!("delegate: nothing applied; {} file(s) were also changed in {} since the run started. Rerun with --merge to apply the rest and write conflict markers into text files, or inspect with: {} diff {} --total",conflicts.len(),source.display(),script().display(),run.file_name().unwrap_or_default().to_string_lossy());
         return Ok(1);
     }
-    let marked = actions.iter().any(|x| x.kind == "conflict-markers");
+    let marked_paths = actions
+        .iter()
+        .filter(|x| x.kind == "conflict-markers")
+        .map(|x| x.path.clone())
+        .collect::<Vec<_>>();
+    let marked = !marked_paths.is_empty();
+    if marked && !dry {
+        conclusion["apply"]["conflictMarkers"] = json!(marked_paths);
+    }
     let regenerate = (!actions.is_empty() || pending_generation)
         && !generated_paths.is_empty()
         && !generate_command.is_empty();

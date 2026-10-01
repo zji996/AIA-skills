@@ -61,7 +61,8 @@ class V515Tests(unittest.TestCase):
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
         first = self.outcome(self.cli("run", "--agent", "pi", "--workdir", repo, "task"))
         self.assertEqual(first["configSources"], [])
-        self.assertEqual(self.meta(first)["configCapacity"], {"maxActive": 8, "maxCodex": 4, "maxHeavy": 1})
+        self.assertEqual(self.meta(first)["configCapacity"], {"maxActive": 12, "maxCodex": 6, "maxHeavy": 2,
+                                                             "repoMaxActive": 8, "repoMaxCodex": 4})
         (repo / ".delegate.json").write_text(json.dumps({"accept": "true", "env": {"LOCAL": "repo"},
                                                         "maxRework": 0}))
         state = self.outcome(self.cli("run", "--agent", "pi", "--workdir", repo, "task"))
@@ -147,11 +148,13 @@ cargo test; echo $? > "$DELEGATE_RUN_DIR/denied-code"
         (repo / ".delegate.json").write_text(json.dumps({"maxActive": 2, "maxCodex": 3, "maxHeavy": 4}))
         second = self.outcome(self.cli("start", "--agent", "pi", "--read-only", "--in-place", "--workdir", repo, "task"))
         self.addCleanup(self.cli, "stop", second["run"])
-        self.assertEqual(self.meta(second)["configCapacity"], {"maxActive": 2, "maxCodex": 3, "maxHeavy": 4})
+        self.assertEqual(self.meta(second)["configCapacity"], {"maxActive": 2, "maxCodex": 3, "maxHeavy": 4,
+                                                              "repoMaxActive": 8, "repoMaxCodex": 4})
         self.env.update(DELEGATE_MAX_ACTIVE="0", DELEGATE_MAX_CODEX="0", DELEGATE_MAX_HEAVY="0")
         third = self.outcome(self.cli("start", "--agent", "pi", "--read-only", "--in-place", "--workdir", repo, "task"))
         self.addCleanup(self.cli, "stop", third["run"])
-        self.assertEqual(self.meta(third)["configCapacity"], {"maxActive": 0, "maxCodex": 0, "maxHeavy": 0})
+        self.assertEqual(self.meta(third)["configCapacity"], {"maxActive": 0, "maxCodex": 0, "maxHeavy": 0,
+                                                             "repoMaxActive": 8, "repoMaxCodex": 4})
         gate.touch()
         self.assertEqual(self.cli("wait", first["run"], second["run"], third["run"]).returncode, 0)
 

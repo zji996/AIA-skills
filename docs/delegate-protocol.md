@@ -5,7 +5,7 @@
 
 ## 1. 分工
 
-delegate 负责一切与宿主无关的事：隔离（worktree、快照）、验收命令、整机容量与重任务排队、升档、合并（`apply`）、清理、结论格式。宿主不内置子代理逻辑，只做一层很薄的适配：
+delegate 负责一切与宿主无关的事：隔离（worktree、快照）、验收与证据命令、整机/仓库容量与重任务排队、升档、合并（`apply`）、清理、结论格式。宿主不内置子代理逻辑，只做一层很薄的适配：
 
 | 宿主必须提供 | 用途 |
 |---|---|
@@ -19,7 +19,7 @@ delegate 负责一切与宿主无关的事：隔离（worktree、快照）、验
 
 ## 2. 宿主可以依赖的输出（必须保持）
 
-- **状态行 / 结论行**：单行 JSON，以 `{"run"` 开头，UTF-8。字段顺序和空白不属于契约，按 JSON 解析。
+- **`--json` 状态行 / 结论行**：单行 JSON，以 `{"run"` 开头，UTF-8。默认是人读短行，宿主解析时须加 `--json`；字段顺序和空白不属于契约，按 JSON 解析。
 - **稳定字段**：`run`、`name`、`state`、`agent`、`mode`、`caller`、`next`、`dir`、`error`、`accept`、`changes`、`escalatedFrom`。其他字段可能增加，宿主须忽略不认识的字段。
 - **state**：`running` / `waiting` / `delivered` / `answered` / `rejected` / `malformed` / `failed` / `timeout` / `killed` / `crashed` / `stopped`（spec §4）。
 - **退出码**：`0` delivered/answered 或命令成功；`1` 其他结局；`2` 用法错误或被拒绝（容量满、嵌套委派等）；`75` `--max` 到期仍在运行。
@@ -28,8 +28,9 @@ delegate 负责一切与宿主无关的事：隔离（worktree、快照）、验
 - **逐个收取**（5.11 起，可选）：`wait --stream` 每个 run 结束输出一行状态行（`report` 字段是读答复的命令），全部结束后退出；`wait --any` 在任一 run 结束时返回，只输出已结束的，重复同一命令收下一个。`sourceDrift` 字段提示 worktree 快照之后源工作区的变化与重叠文件，帮助在 `apply`、`apply --merge` 与 `reply --sync` 之间选择。
 - **5.12 可选字段**：`finishedAt` 为已写入的终态 UTC 时间，旧记录/推断 crashed 省略；`completionTiming` 是首次检查边界的 `already-finished` / `finished-during-wait`，保持收取顺序，一次可交付多个旧结果。`pendingChanges` 是累计待合入量（`changes` 仍是本轮差异）；`protectViolationReasons` 是可选保护原因映射，原违规路径数组不变。
 - **apply 结论**：文件清单后追加 `run`、`operation: "apply"`、`apply{ok,dryRun}`，可选 `numberedPrefixConflicts[{directory,prefix,paths}]`（仅警告、不改退出码），及 `acceptValidityScope: "repository-snapshot"`、`acceptValidityReason`、可选 `acceptStillValid`。仅本轮成功且未改树的验收与最终源全树相同才为 true；失败或已知树不同为 false，dry-run、旧记录、快照失败、无验收/不完整证据省略布尔值。忽略文件、环境、数据库与 Git 历史不在范围内；后续改动与 reply 不得沿用此前 true。任务 state 不变，protocol 保持 1。
+- **5.18 可选字段**：`evidence{exit,timedOut,seconds,tail,log}` 记录验收通过后（无验收则答复后）运行的旁路命令，失败/超时永不改 state 或退出码；验收失败或保护违规跳过。`agentPinned: true` 表示 `--agent` 固定同事，`tier` 显示适配表默认档位（Pi cheap、Codex strong），不自动升档；旧记录缺字段时仅推断显示。`applied: true` 表示已合入，`appliedBy: "detected"` 表示 `status`/`wait`/`clean` 已确认源工作树包含该任务全部最终改动（含删除与执行位，允许未提交），`"delegate"` 表示 apply 合入；state 不变，`next` 转为清理建议，部分包含或读取失败仍按未合入处理。
 
-新增字段、新增 state 以外的变化（删除或改名上述字段、改变退出码含义）要升 protocol 版本。
+新增可选字段、新增 state 无须升级；删除或改名上述字段、改变退出码含义等不兼容变化要升 protocol 版本。5.18 的证据、固定档位、检测合入与容量探测均为可选扩展，既有 state 与退出码语义未改，因此保持 **protocol 1**。旧 run/meta/slot 仍可读，宿主必须容忍这些字段缺失。
 
 ## 3. 会话标识（caller）
 
@@ -49,7 +50,8 @@ delegate 负责一切与宿主无关的事：隔离（worktree、快照）、验
 `delegate protocol` 输出一行 JSON，供宿主适配器在启动时检查兼容性、给用户做诊断：
 
 ```json
-{"protocol":1,"version":"5.12.0","caller":{"id":"…","source":"CLAUDE_CODE_SESSION_ID"},
+{"protocol":1,"version":"5.18.0","caller":{"id":"…","source":"CLAUDE_CODE_SESSION_ID"},
+ "capacityDefaults":{"maxActive":12,"maxCodex":6,"maxHeavy":2,"repoMaxActive":8,"repoMaxCodex":4},
  "agents":[{"name":"pi","tiers":["cheap"],"available":true,"bin":"/…/pi","version":"0.87.1","shadowed":[]},
            {"name":"codex","tiers":["strong"],"available":true,"bin":"/…/codex","version":"codex-cli 0.158.0",
             "shadowed":["/snap/bin/codex"]}]}
@@ -58,6 +60,7 @@ delegate 负责一切与宿主无关的事：隔离（worktree、快照）、验
 - `protocol` 不同于宿主预期时，适配器应提示升级而不是继续调用。
 - `agents[].bin` 是 PATH 上实际会执行的文件；`shadowed` 按 PATH 中的原路径列出更靠后、被它遮住的同名可执行文件（例如旧的 snap 版本），用于排查“同事用错了版本”。
 - `caller` 为 `null` 说明宿主没有导出会话标识。
+- 可选 `capacityDefaults` 给出内置默认值，不代表当前配置值。整机资源默认任务 12/Codex 6/lane 重命令 2，仓库审查带宽默认任务 8/Codex 4；对应配置 `maxActive`/`maxCodex`/`maxHeavy`/`repoMaxActive`/`repoMaxCodex`，`DELEGATE_MAX_*` 与 `DELEGATE_REPO_MAX_ACTIVE`/`DELEGATE_REPO_MAX_CODEX` 优先，`0` 不限。git common dir 归一后主仓库与 worktree 共用仓库计数，非 git 用规范化路径；拒绝只列命中层级相关任务，`--after` 等待同时遵守两层。验收与证据的 lane 排队不计超时。
 
 ## 5. 适配一个新宿主（清单）
 

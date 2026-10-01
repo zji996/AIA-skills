@@ -1,5 +1,15 @@
 # delegate
 
+## 5.18 证据、精确拦截与两层容量
+
+- 修复已通过确定门禁，还想跑真实模型评测：`--accept` 决定交付，`--evidence` 收评测；默认 30m 且 lane 排队不计时，证据失败/超时只记 evidence，不改 state 或退出码。Evidence commands collect diagnostics without rejecting valid changes.
+- 用户或仓库默认 evidence 自动用于写入，read-only 不继承默认；reply 沿用上一轮命令和超时，`--no-evidence` 关闭。验收失败或 protect 违规跳过证据，原 PATH 不受 agentDeny shim 影响。
+- 只禁不带过滤参数的 `cargo xtask infra-test`：agentDeny 设 `exact: true`，额外参数放行；用户/仓库去重与 allow 撤销按 `(argv, exact)` 匹配。
+- 主控已用 git 手动合入完整改动（尚未 commit）：status/wait/clean 比较源工作树最终内容、删除与执行位，全部包含显示“已合入（主干已含改动）”、appliedBy detected，clean --finished 可清；部分合入或读取失败仍建议 apply。Detect manual integration from working tree contents.
+- 显式 `--agent pi` 未指定 tier：短行 pi/cheap，JSON tier cheap、agentPinned true；codex 默认 strong；旧记录只推断显示，固定同事仍不自动升档。
+- 多项目同时委派：整机默认 12/6/2，每仓库默认 repoMaxActive 8/repoMaxCodex 4；git worktree 与主仓库同计，非 git 按规范化路径；命中上限说明层级、计数并只列该层任务，--after 等容量遵守两层。
+- Claude Code Monitor 能将后台逐行输出变事件：优先后台 wait --stream；只有结束通知则重复后台 wait --any。新字段可选，protocol 保持 1。
+
 ## 5.17 用户配置与仓库事实
 
 - 多个仓库共用禁止同事全量检查的规则：把 agentDeny、通用 env 与 maxRework 写入用户级 delegate/config.json，仓库只补自己的字段。Shared user config applies across repositories.

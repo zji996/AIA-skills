@@ -6,7 +6,7 @@
 |---|---|
 | `start [选项] [任务说明]` | 后台启动，立即返回一行状态 |
 | `run [选项] [--max <时长>]` | 启动并等到结论 |
-| `reply <run> [消息] [--wait] [--fresh] [--sync]` | 接着最新一轮会话在后台启动并立即返回；`--wait` 等到结论（此时可用 `--max`/`--progress`/`--full`）。`--fresh` 开新会话，消息须自足；`--sync` 先同步主控后来改动，冲突时直接拒绝。验收命令默认沿用，`--no-accept` 或 `--accept ''` 取消；取消或隐藏已变更的命令时会告诉同事旧标准不再适用 |
+| `reply <run> [消息] [--wait] [--fresh] [--sync]` | 接着最新一轮会话在后台启动并立即返回；`--wait` 等到结论（此时可用 `--max`/`--progress`/`--full`）。`--fresh` 开新会话，消息须自足；`--sync` 先同步主控后来改动，冲突时直接拒绝。验收与证据命令默认沿用，可分别覆盖或关闭；取消或隐藏已变更的验收命令时会告诉同事旧标准不再适用 |
 | `diff [<run>] [--stat] [--total] [路径...]` | 以 `git diff` 输出该轮的改动；`--total` 为整段对话；终端下带颜色 |
 | `apply [<run>] [--dry-run] [--merge]` | 把 `--worktree` 的现状（含最后一轮之后在 worktree 里的手工修改）相对对话起点的全部改动合并回原工作区（只写文件，不碰 index）：你没动过的文件直接写入（含权限位），双方都改过的文本做三方合并，大文件从 worktree 复制；经符号链接目录、文件与目录互换、二进制与符号链接冲突一律算冲突；有合并不了的冲突时什么都不写，`--merge` 则写入其余文件并在冲突处留冲突标记（其余冲突跳过）。没有跳过项时，共用该 worktree 的所有 run（含畸形的旁支）标记 `.applied` |
 | `wait [<run>...\|--all] [--max <时长>] [--no-result] [--full] [--progress]` | 等待并输出结论；不指定任务时（或 `--all`）等所有仍在运行和尚未读取结果的任务 |
@@ -18,13 +18,21 @@
 
 启动选项：`--tier cheap|strong`（默认只读 cheap、写入 strong；便宜档失败且未改动时自动升档一次）、`--agent pi|codex`（直接指定，与 `--tier` 互斥，不升档）、`--image <路径>`（可重复）、`--accept <命令>` / `--no-accept`（覆盖或关闭仓库默认验收）、`--hide-accept`、`--accept-timeout`（默认 10m）、`--read-only`、`--in-place`（只读任务读实时工作区而非快照）、`--workdir`、`--timeout`（每次尝试，pi 默认 25m，codex 默认 50m）、`--retries`（答复畸形时重跑次数，默认 1）、`--model`/`--thinking`/`--provider`（不指定时用各 CLI 自己的默认设置；Codex 的 `--thinking` 对应推理强度）、`--allow-parallel-writes`、`--worktree`、`--after <run>`（等上游以 delivered/answered 结束再执行，否则 `skipped`；等待期间 state 为 `waiting`、不占名额）、`--in <run>`（只读，在上游 worktree 的快照里审它的改动）、`--protect <路径>`（可重复；末尾 `/` 为目录；被改动即判 `rejected` 并带 `protectViolation`，不跑验收；reply 沿用）。`<run>` 可以是完整 id、唯一片段、`last` 或 run 目录。
 
+`start`/`run`/`reply` 另支持 `--evidence <命令>`、`--no-evidence` 与 `--evidence-timeout`（默认 30m）。reply 沿用上一轮证据命令与超时，可覆盖或关闭。`--agent` 固定同事时仍显示适配表默认档位（Pi cheap、Codex strong），JSON `agentPinned: true`；旧 meta 缺字段时按同一规则推断显示，不改写旧 meta，不自动升档。
+
+## 证据命令
+
+证据用于真实模型评测等慢且不确定的检查。验收通过后执行；未设验收时在正常答复后执行；验收失败或 protect 违规时跳过。在同事工作目录（隔离任务为其 worktree）通过 lane 排队，用验收相同的 env、原 PATH、独立进程组及 cgroup 回收，deny shim 不影响证据。拿到 lane 名额才开始计算 `--evidence-timeout`。
+
+证据命令默认未设置。结果写入 meta 与 JSON 结论的可选 `evidence{exit,timedOut,seconds,tail,log}`：退出码、是否超时、执行秒数、日志末尾和完整日志位置。短行加“证据 通过/失败/超时”。任何证据失败只记诊断，永不改变任务 state、升档判断或命令退出码；它也不替代 `acceptStillValid` 的验收快照依据。
+
 ## 重任务队列（lane）
 
 `status`/`wait` 默认只展示决策所需的状态、同事与档位、耗时、文件数与增删行、前三个目录、最近命令（运行中，最多 100 字符）、验收与下一步，文件路径相对仓库；`wait` 仍随后附答复。脚本用 `--json` 读取原有完整结构，`start`/`run`/`reply`/`stop` 也支持此选项；`result`、`diff`、`apply` 输出不变。JSON 的运行目录、worktree、结果位置仍保留可直接访问的绝对路径。
 
 每任务有 `waiter.lock`，持有排他 flock 并记录等待者 PID；重复 `wait` 跳过已有活等待者覆盖的任务，全被覆盖时退出 `76`，通知仍给原等待者。`--any`、`--stream`（含后续加入的任务）、`--machine` 同样处理；等待者退出或死亡时内核释放锁，旧 PID 不阻止后续等待。
 
-整机一条先进先出队列，同时放行 `DELEGATE_MAX_HEAVY` 个（默认 1，`0` 不限）：验收命令、worktree `setup`、同事与主控用 `lane` 跑的检查都在这里排队。每个排队者在 `${XDG_STATE_HOME:-~/.local/state}/delegate/lane/` 下有一张按到达时间命名的票，持有其排他 flock 直到结束；等待者阻塞在前一张票的锁上，由内核在其结束或进程死亡时唤醒，不轮询，崩溃不留死锁。已在队列内的命令（带 `DELEGATE_LANE_HELD`）再调用 `lane` 直接执行，不会等自己。
+整机一条先进先出队列，同时放行 `DELEGATE_MAX_HEAVY` 个（默认 2，`0` 不限）：验收、证据、worktree `setup`、同事与主控用 `lane` 跑的检查都在这里排队。每个排队者在 `${XDG_STATE_HOME:-~/.local/state}/delegate/lane/` 下有一张按到达时间命名的票，持有其排他 flock 直到结束；等待者阻塞在前一张票的锁上，由内核在其结束或进程死亡时唤醒，不轮询，崩溃不留死锁。已在队列内的命令（带 `DELEGATE_LANE_HELD`）再调用 `lane` 直接执行，不会等自己。
 
 排队时间不计时：验收的 `--accept-timeout` 与 `setup` 的超时从拿到名额开始算；同事自己用 `lane` 排队的时间记在 run 目录的 `lane-wait`，从它的 `--timeout` 中扣除。同事、每条 setup 与验收命令在独立进程组中运行；用户 systemd 可用时各自再进入独立 scope，结束或超时时按 cgroup 回收其派生进程（包括 `env -i`、`setsid` 后的进程）。无用户实例时自动沿用进程组与环境标记清理；`DELEGATE_CGROUP=0` 或 `PI_DELEGATE_CGROUP=0` 强制关闭 scope。supervisor 与主控的 `wait`、排队中的其他任务不进入这些 scope。
 
@@ -32,17 +40,17 @@
 
 ## 用户与仓库配置
 
-用户配置 `${XDG_CONFIG_HOME:-~/.config}/delegate/config.json` 支持 `agentDeny`、`env`、`maxRework`、默认 `accept`、`maxActive`、`maxCodex`、`maxHeavy`。仓库根 `.delegate.json` 使用相同字段并保存仓库事实。
+用户配置 `${XDG_CONFIG_HOME:-~/.config}/delegate/config.json` 支持 `agentDeny`、`env`、`maxRework`、默认 `accept`/`evidence`、`maxActive`、`maxCodex`、`maxHeavy`、`repoMaxActive`、`repoMaxCodex`。仓库根 `.delegate.json` 使用相同字段并保存仓库事实。
 
-- 标量：仓库 > 用户 > 内置默认；容量的 `DELEGATE_MAX_ACTIVE` / `DELEGATE_MAX_CODEX` / `DELEGATE_MAX_HEAVY` 最高，仍兼容 `PI_DELEGATE_*`，`0` 不限（默认 8 / 4 / 1）。写入默认 `accept` 在仓库未提供该字段时用用户值，`--accept` 覆盖、`--no-accept` 关闭；只读不用默认验收。
-- `env` 按键合并，仓库优先；`agentDeny` 合并，两份按精确 argv 去重，仓库同 argv 的 hint 覆盖用户值，保留原顺序。仓库 `{"argv":["cargo","xtask","check"],"allow":true}` 可撤销一条用户规则，无需 hint；只撤销完全相同的 argv，不撤销其他前缀规则，用户配置不能声明 `allow: true`。
+- 标量：仓库 > 用户 > 内置默认；容量的 `DELEGATE_MAX_ACTIVE` / `DELEGATE_MAX_CODEX` / `DELEGATE_MAX_HEAVY` / `DELEGATE_REPO_MAX_ACTIVE` / `DELEGATE_REPO_MAX_CODEX` 最高，仍兼容 `PI_DELEGATE_*`，`0` 不限。整机默认 12 / 6 / 2，每仓库默认 8 / 4。写入默认 `accept`/`evidence` 在仓库未提供字段时用用户值，对应 CLI 覆盖或关闭；只读不用两项默认。
+- `env` 按键合并，仓库优先；`agentDeny` 按 `(argv, exact)` 去重，省略 `exact` 等于 `false`；仓库同键 hint 覆盖用户值，保留原顺序。仓库 `{"argv":["cargo","xtask","check"],"exact":true,"allow":true}` 撤销完全相同 argv 且 exact 相同的一条用户规则，无需 hint；不撤销不同 exact 或其他前缀规则，用户配置不能声明 `allow: true`。
 - `worktree`、`generated`、`applyVerify` 只认仓库：用户级出现时忽略，`start`（含 `run`）在 stderr 汇总提示一次。
-- 两份文件独立校验，覆盖不能隐藏错误；错误指出文件与字段，启动退出 2。JSON 语法错误指出文件与行列。meta、summary 与 `--json` 记 `configSources: ["user","repo"]`（启动时只有存在的配置文件，没有时 `[]`），自然语言短行不变。reply 沿用启动时的 env、deny、验收，返工预算和容量按当前两级配置读取；来源包含继承配置与当前配置两部分。
+- 两份文件独立校验，覆盖不能隐藏错误；错误指出文件与字段，启动退出 2。JSON 语法错误指出文件与行列。meta、summary 与 `--json` 记 `configSources: ["user","repo"]`（启动时只有存在的配置文件，没有时 `[]`）。reply 沿用启动时的 env、deny、验收与证据，返工预算和容量按当前两级配置读取；来源包含继承配置与当前配置两部分。
 
 用户级示例：
 
 ```json
-{"maxActive":8,"maxCodex":4,"maxHeavy":1,"maxRework":1,
+{"maxActive":12,"maxCodex":6,"maxHeavy":2,"repoMaxActive":8,"repoMaxCodex":4,"maxRework":1,
  "env":{"CUDA_VISIBLE_DEVICES":""},
  "agentDeny":[{"argv":["cargo","xtask","check"],"hint":"主控合入后跑全量；同事改跑 cargo test -p <crate>"}]}
 ```
@@ -54,15 +62,16 @@
 ```json
 {"agentDeny": [
   {"argv": ["cargo", "xtask", "check"], "hint": "全量检查由主控合入后跑；改跑 cargo test -p <crate> 与 cargo clippy -p <crate>"},
+  {"argv": ["cargo", "xtask", "infra-test"], "exact": true, "hint": "请带过滤参数只测相关用例"},
   {"argv": ["pnpm", "check"], "hint": "全量检查由主控合入后跑；改跑 pnpm --filter <package> test"}
 ]}
 ```
 
-按完整 argv 的逐项、大小写敏感前缀匹配；尾部可以有更多参数。`cargo xtask check --all` 命中，`cargo --locked xtask check` 不命中，不忽略或重排 `+toolchain`、`--locked` 等全局参数。每条规则的 `argv` 非空，首项是程序名（字母、数字、`._-`，不能是路径或 `.`/`..`），其他项为字符串，`hint` 非空；字符串不能含 NUL。同程序多条规则按配置顺序匹配首条。
+默认按完整 argv 的逐项、大小写敏感前缀匹配；尾部可以有更多参数。`exact: true` 必须 argv 完全相等且无多余参数：上述 `cargo xtask infra-test` 命中，`cargo xtask infra-test --filter db` 放行。`cargo xtask check --all` 命中前缀规则，`cargo --locked xtask check` 不命中，不忽略或重排 `+toolchain`、`--locked` 等全局参数。每条规则的 `argv` 非空，首项是程序名（字母、数字、`._-`，不能是路径或 `.`/`..`），其他项为字符串，`hint` 非空，`exact` 可选且为布尔值；字符串不能含 NUL。同程序多条规则按配置顺序匹配首条。
 
 启动时在 run 的 `agent-shims/` 为每个程序生成 shell shim，按原 PATH（含顶层 env.PATH）与同事工作目录解析真实程序的绝对路径，保留 cargo/rustup 等多调用符号链接的名称；真实程序缺失时，未命中的调用退出 127。只在同事进程的 PATH 最前面插入该目录，reply 继承规则。命中打印 hint 到 stderr，退出 77；未命中直接 exec，参数、stdin/stdout 与退出码透传。同事的 `lane` 继承 shim PATH，即使自己设置 `DELEGATE_ALLOW_HEAVY=1` 或 `DELEGATE_LANE_HELD=1` 仍会拒绝。`denied.log` 累计本轮各尝试的次数，结论 `denied: N`，短行显示“拦下 N 次全量检查”；未配置或空列表不生成 shim，不增加字段。
 
-验收、setup、收尾生成核对、apply 的生成与 applyVerify 都由未注入 shim 的执行环境运行，主控自己的 lane 同理。没有环境放行开关或可交给同事的令牌。威胁模型是防误用，不是防恶意：同 UID 进程可以改 PATH、用绝对路径或改 shim/记录，这不是安全沙箱。
+验收、证据、setup、收尾生成核对、apply 的生成与 applyVerify 都由未注入 shim 的执行环境运行，主控自己的 lane 同理。没有环境放行开关或可交给同事的令牌。威胁模型是防误用，不是防恶意：同 UID 进程可以改 PATH、用绝对路径或改 shim/记录，这不是安全沙箱。
 
 ## 改动清单
 
@@ -94,6 +103,8 @@
 
 worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 `git worktree remove`，过期清理同理；`agent-handoff` 会列出尚未 `apply` 的写入型 worktree。
 
+写入任务未 apply 时，`status`/`wait`/`clean` 仅检查累计改动清单中的路径，按类型、大小和哈希比较源工作树与同事结束时的最终内容，执行位也须一致，删除路径须在源中不存在；不要求提交进 HEAD。全部包含时写 `.applied` 并记 `appliedBy: "detected"`，短行“已合入（主干已含改动）”，`next` 改为清理建议，`clean --finished` 按已合入处理。仅部分包含或读取失败时视为未检测到，沿用原 apply 建议；检测不代表验收已在源中复跑。
+
 同仓库串行 `apply`；慢合并可后台执行。stderr 实时报告检查、生成器排队（人数与前序任务）、生成日志绝对路径和执行超时；排队不算生成超时。生成失败留 `.generate-pending`，再次 apply 即使普通文件已合入也重跑生成。编号前缀冲突只警告，不改号或退出码；末尾 `operation: apply` JSON 带 `numberedPrefixConflicts` 和验收复用的原因。`acceptStillValid` 只在验收前后历史全树与最终源全树有完整相同证据时为 true，不完整时省略；忽略文件、环境、数据库、Git 历史另行判断，后续改动/reply 不沿用旧 true。`.delegate.json` 的 `applyVerify`（`true` 用顶层 `accept`，或直接写命令）开启合并后验收：`acceptStillValid` 不为 true 时经 lane 在源工作目录运行，结论带 `verify`，失败退出 1（合并已写入）；`--verify` 强制、`--no-verify` 跳过。
 
 ## 会话
@@ -110,24 +121,27 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 - 根目录首次创建时写入只含 `*` 的 `.gitignore`，不污染 `git status`；run 目录权限为 `700`。
 - 整机并发登记放在 `${XDG_STATE_HOME:-~/.local/state}/delegate/`：每个运行中的任务一个 `*.slot` 文件，内容是其 run 目录；任务结束或目录被删后，下一次 `start` 自动清掉对应登记。这个位置刻意不提供 `DELEGATE_*` 覆盖，被委派的同事无法另起一个计数池。
 
+容量同时检查整机资源与仓库审查带宽：整机 `maxActive`/`maxCodex` 默认 12/6，仓库 `repoMaxActive`/`repoMaxCodex` 默认 8/4。仓库键按规范化 git common dir（主仓库与其 worktree 共用），非 git 目录按规范化路径。仓库计数仍来自整机 slot，不另建池；旧 slot 只有 run 目录时从 meta 反查仓库，新 slot 可附仓库键，读 slot 失败沿用原处理。拒绝说明命中的层级、当前计数与上限，只列该层相关运行任务；`--after` 等待容量时两层都生效。
+
 ## 文件
 
 | 文件 | 内容 |
 |---|---|
-| `meta.json` | 启动参数、同事（`agent`）、workdir、模式、验收命令、启动时间；`protect` 字符串数组与可选 `protectReasons` 原因映射（reply/fresh 继承） |
+| `meta.json` | 启动参数、同事（`agent`）、workdir、模式、验收命令、启动时间；可选 `agentPinned`、仓库键 `repoKey`、证据命令 `evidenceCommand`、超时 `evidenceTimeoutSeconds` 和结果 `evidence`；`protect` 字符串数组与可选 `protectReasons` 原因映射（reply/fresh 继承） |
 | `prompt.md` | 同事实际收到的任务说明；末尾可能附完成标准（`--accept`）与只读边界（Codex 只读任务） |
 | `events.jsonl` | 过滤后的全过程：读取、命令、编辑路径、错误、每轮模型与用量、重跑；不含编辑全文 |
 | `result.md` | 最后一轮的完整答复 |
-| `summary.json` | 结论：`state`、`attempts`、`files`、`changes`、`shape`、`accept`、`cleanup`（已终止进程数、端口、命令）、`warnings`（空/缺失 worktree 源）、`readOnlyViolation` / `workspaceChanged`、`protectViolation`、`queuedSeconds`、`graceSeconds`、`warning`、`tokens`、`session`、`error`（`next` 由 `status` 现算） |
+| `summary.json` | 结论：`state`、`attempts`、`files`、`changes`、`shape`、`accept`、可选 `evidence`、`cleanup`（已终止进程数、端口、命令）、`warnings`（空/缺失 worktree 源）、`readOnlyViolation` / `workspaceChanged`、`protectViolation`、`queuedSeconds`、`graceSeconds`、`warning`、`tokens`、`session`、`error`（`next` 由 `status` 现算） |
 | `scopes` / `scopes.lock` | 本轮的 systemd scope 单元名 / 并发读写锁；仅在用户 systemd 可用时出现 |
-| `changes.json` / `changes.patch` | 前后快照的 tree、逐文件状态与行数；可直接 `git apply` 的补丁 |
+| `changes.json` / `changes.patch` | 前后快照的 tree、逐文件状态与行数；可选 `finalEntries` 冻结结束时改动路径的最终指纹，供手动合入检测；可直接 `git apply` 的补丁 |
 | `setup.log` | `--worktree` 的 `setup` 命令输出 |
 | `verify.log` | `apply` 合并后验收（`applyVerify` / `--verify`）的输出 |
 | `generate.log` | `apply` 执行 `.delegate.json` 的 `generated.command` 时的输出 |
 | `.generate-pending` | 生成未成功，后续 apply 仍须重试；成功后清除 |
 | `session/` / `fork/` | Pi 本轮的会话；`reply` 分叉所用的上一轮会话副本 |
-| `.applied` | `--worktree` 的改动已由 `apply` 合并 |
+| `.applied` | `--worktree` 改动已合入；`appliedBy: "detected"` 区分源工作树检测到的手动合入 |
 | `accept.log` | 验收命令的完整输出与退出码；`summary.json` 的 `accept.queuedSeconds` 是它在 lane 中排队的秒数 |
+| `evidence.log` | 证据命令完整输出；结果在 meta 和 JSON 的可选 `evidence` 中，不决定状态 |
 | `supervisor.lock` | supervisor 在世期间持有的 flock，`wait` 阻塞在它上面 |
 | `waiter.lock` | 收取进程持有的排他 flock，内容为 PID；进程死亡锁自动释放 |
 | `protect-generate.log` | 收尾复跑受保护生成物命令的输出 |
@@ -138,6 +152,8 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 | `.delivered` | 结果已被 `run`/`wait`/`result` 读取过 |
 
 5.12 新 summary 带 `finishedAt`；旧记录缺失时不补造。`wait --any/--stream` 的 `completionTiming` 以首次检查分类，通知可能只交付旧结果。`changes` 是本轮差异，`pendingChanges` 是累计待合入量。`accept.tree` / `treeAfter` 保存验收前后历史 tree，`snapshotComplete` / `snapshotReason` 记录证据是否完整。受保护文件有原因时违规诊断另带 `protectViolationReasons`。
+
+5.18 状态 JSON 可选 `applied: true` 与 `appliedBy: "detected"` / `"delegate"`，分别表示源工作树检测合入或通过 apply 合入。`evidence` 为旁路证据结果；旧记录缺少这些字段仍可读。
 
 `agent-handoff` 的快照脚本依赖 `meta.json`、`exit_code` 与 `.delivered` 判断未完成或未读取的委派；修改这三者的名字或含义时要同步修改它。
 
@@ -152,9 +168,11 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 | 变量 | 作用 |
 |---|---|
 | `DELEGATE_RUNS` | run 根目录 |
-| `DELEGATE_MAX_ACTIVE` | 整机同时运行的任务上限，默认 8；`0` 不限 |
-| `DELEGATE_MAX_CODEX` | 其中 Codex 任务上限，默认 4；`0` 不限 |
-| `DELEGATE_MAX_HEAVY` | lane 同时放行的重命令数，默认 1；`0` 不限 |
+| `DELEGATE_MAX_ACTIVE` | 整机同时运行的任务上限，默认 12；`0` 不限 |
+| `DELEGATE_MAX_CODEX` | 整机 Codex 任务上限，默认 6；`0` 不限 |
+| `DELEGATE_MAX_HEAVY` | lane 同时放行的重命令数，默认 2；`0` 不限 |
+| `DELEGATE_REPO_MAX_ACTIVE` | 同仓库同时运行的任务上限，默认 8；`0` 不限 |
+| `DELEGATE_REPO_MAX_CODEX` | 同仓库 Codex 任务上限，默认 4；`0` 不限 |
 | `DELEGATE_MIN_AVAILABLE_MB` | 可用内存低于该值（MB）时拒绝启动，默认 4096；`0` 不检查 |
 | `DELEGATE_CGROUP` | `0` 关闭用户 systemd scope 回收；默认自动探测 |
 | `DELEGATE_TIMEOUT_GRACE` | 同事超时后仍在工作时的宽限百分比，默认 10 |

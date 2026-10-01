@@ -20,14 +20,14 @@
 | --- | --- | --- |
 | **`repo-governance`** | `skills/repo-governance/` | **上下文治理与审计**：定义 `AGENTS.md`、`docs/current.md`、决策记录的信息分层；`audit-context.py` 按仓库配置估算 token 预算与上下文健康度，支持 `--report`、`--only`，并检查下一步堆积、`.local/` 未忽略、文档断链、`PROVISIONAL(Cnn)` 标记缺少待收敛清单条目等漂移问题。 |
 | **`agent-handoff`** | `skills/agent-handoff/` | **会话交接**：`handoff-snapshot.sh` 自动采集分支、HEAD、未提交文件、最近提交、`.local/run/delegate/` 与旧 `.local/run/pi/` 的未读取委派任务和未合并 worktree，生成交接账本草稿。 |
-| **`delegate`** | `skills/delegate/` | **同事 Agent 委派**：拆分任务、后台运行 Pi/Codex，按会话收取自然语言短结论与答复，完整字段按需 `--json`；每任务只留一个等待者，重复等待退出 76。`agentDeny` 用 PATH shim 拦截同事全量检查（含 lane），结论统计 `denied`，主控合入一批后统一全量；timeout 后 reply 续做不耗返工次数。写入用 `--worktree` 隔离、`--protect-reason` 划分所有权；生成路径允许生成命令改动并在收尾核对。托管 copy/link 路径、未初始化且未改动的 gitlink 内容列为 `excluded`；非托管指针与脏内容仍核验。`apply` 支持生成重试、编号预警、`acceptStillValid` 与合并后复验；`pendingChanges` 保留累计待合入量。Rust 管理整机容量、lane、后台进程回收，长答复全文落文件。 |
+| **`delegate`** | `skills/delegate/` | **同事 Agent 委派**：拆分任务、后台运行 Pi/Codex，按会话收取短结论与答复，完整字段按需 `--json`；每任务一个等待者，重复等待退出 76。`agentDeny` 用前缀或精确 argv 拦截同事全量检查（含 lane），`evidence` 收集评测且不改交付状态；timeout 后 reply 续做不耗返工次数。写入用 `--worktree` 隔离、`--protect-reason` 划分所有权，生成路径收尾核对；托管 copy/link 与未初始化参考 gitlink 的内容列为 `excluded`。`apply` 支持生成重试、编号预警、`acceptStillValid` 与合并后复验；手动合入自动识别，`pendingChanges` 保留累计待合入量。Rust 管理整机与仓库两层容量、lane、后台进程回收，固定同事显示默认档位，长答复全文落文件。 |
 | **`openai-image-gen`** | `skills/openai-image-gen/` | **图像生成落盘**：先用便宜模型打草稿定构图，再以草稿为参考出一次正式图；每个输出文件限定草稿 3、正式 1、编辑 1 次，超出需用户同意；只返回一行 JSON；附示意图提示词结构与审查要点。 |
 | **`scroll-gesture`** | `skills/scroll-gesture/` | **滚动手势**：`input-probe.html` 在目标环境（Windows 鼠标、远程桌面、触屏）实测滚轮与触摸事件的频率、间隔、增量与鼠标格占比，一键复制 JSON；附过界翻页等自定义手势的判断点：时间只区分惯性、结果交给位置、动画可打断、鼠标格缓动。 |
 | **`iteration-speed`** | `skills/iteration-speed/` | **仓库迭代速度**：新机器/仓库初始化、构建测试门禁变慢、多 worktree/Agent 并行或验收分层与模块拆分前使用；`iteration-speed detect` 只读探测生态与缓存配置，`time`/`history` 记录反馈时间，`rust-setup` 预览或备份后写入用户级 sccache/mold 配置；附 Rust、Node、Python、Go、Docker 的缓存边界与实践。 |
 
 `delegate` 架构总览：[docs/assets/delegate-architecture.webp](docs/assets/delegate-architecture.webp)（提示词同目录）。
 
-`delegate` 5.17.0 配置能力：用户级 `${XDG_CONFIG_HOME:-~/.config}/delegate/config.json` 与仓库 `.delegate.json` 合并，通用 deny/env/返工预算/默认验收只写一次；仓库可按 argv 撤销用户 deny，机器容量支持配置且环境变量优先。仓库专属事实只读仓库，JSON 的 `configSources` 可追溯来源。规则见 [用户与仓库配置](skills/delegate/references/output-and-files.md#用户与仓库配置)。
+`delegate` 5.18.0 配置能力：用户级 `${XDG_CONFIG_HOME:-~/.config}/delegate/config.json` 与仓库 `.delegate.json` 合并，通用 deny/env/返工预算/默认验收与证据只写一次；`--evidence` 失败不改状态，deny 支持精确 argv，手动合入自动检测，固定同事仍显示默认档位。整机容量默认 12/6/2、每仓库 8/4（worktree 同计），环境变量优先；仓库可按 `(argv, exact)` 撤销用户 deny，`configSources` 可追溯来源。规则见 [用户与仓库配置](skills/delegate/references/output-and-files.md#用户与仓库配置)。
 
 ---
 

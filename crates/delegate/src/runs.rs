@@ -165,6 +165,11 @@ pub fn events(run: &Path) -> Vec<Value> {
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect()
 }
+pub fn agent_pinned(meta: &Value) -> bool {
+    meta["agentPinned"].as_bool().unwrap_or_else(|| {
+        s(meta, "tier").is_empty() && crate::agents::spec(s(meta, "agent")).is_some()
+    })
+}
 pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<String> {
     let name = if !s(meta, "run").is_empty() {
         s(meta, "run").to_string()
@@ -175,6 +180,13 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
     let script = script.display();
     if active(state) {
         return Some(format!("{script} wait {name}"));
+    }
+    if run.join(".applied").exists()
+        && !run.join(".generate-pending").exists()
+        && s(meta, "mode") == "write"
+        && s(&json(run.join(".applied")), "appliedBy") == "detected"
+    {
+        return Some(format!("{script} clean {name}"));
     }
     if state == "delivered" || state == "answered" {
         if s(meta, "mode") != "write"
@@ -190,7 +202,7 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
                 "review {script} diff {name}; the changes are already in the working tree"
             ));
         }
-        if !run.join(".applied").exists() {
+        if !run.join(".applied").exists() || run.join(".generate-pending").exists() {
             return Some(format!(
                 "review {script} diff {name} --total, then merge with {script} apply {name}"
             ));
@@ -231,6 +243,9 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
 pub fn status(run: &Path) -> Value {
     let meta = json(run.join("meta.json"));
     let st = state(run);
+    if !active(&st) {
+        worktree::detect_applied(run, &meta);
+    }
     let sum = json(run.join("summary.json"));
     let mut out = json!({"run":meta.get("run").and_then(Value::as_str).unwrap_or_else(||run.file_name().and_then(|x|x.to_str()).unwrap_or("")),"name":meta.get("name"),"state":st,"agent":meta.get("agent").and_then(Value::as_str).unwrap_or(crate::agents::default_for_tier("cheap").name),"mode":meta.get("mode")});
     if !s(&meta, "agentBin").is_empty() {
@@ -244,6 +259,19 @@ pub fn status(run: &Path) -> Value {
     }
     if !s(&meta, "tier").is_empty() {
         out["tier"] = meta["tier"].clone();
+    } else if let Some(tier) =
+        crate::agents::spec(s(&meta, "agent")).and_then(|agent| agent.default_tier)
+    {
+        out["tier"] = json!(tier);
+    }
+    if agent_pinned(&meta) || meta.get("agentPinned").is_some() {
+        out["agentPinned"] = json!(agent_pinned(&meta));
+    }
+    if run.join(".applied").exists() && !run.join(".generate-pending").exists() {
+        out["applied"] = json!(true);
+        out["appliedBy"] = json!(json(run.join(".applied"))["appliedBy"]
+            .as_str()
+            .unwrap_or("delegate"));
     }
     if !s(&meta, "parent").is_empty() {
         out["parent"] = meta["parent"].clone();
@@ -267,6 +295,7 @@ pub fn status(run: &Path) -> Value {
             "pendingChanges",
             "shape",
             "accept",
+            "evidence",
             "readOnlyViolation",
             "protectViolation",
             "protectViolationReasons",
@@ -354,6 +383,9 @@ pub fn status(run: &Path) -> Value {
 }
 pub fn unmerged(run: &Path) -> bool {
     let m = json(run.join("meta.json"));
+    if !active(&state(run)) {
+        worktree::detect_applied(run, &m);
+    }
     s(&m, "mode") == "write"
         && m["worktree"].is_object()
         && Path::new(s(&m["worktree"], "path")).exists()

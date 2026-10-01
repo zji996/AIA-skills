@@ -47,6 +47,9 @@ pub fn validate_config(value: Option<&Value>, repo: bool) -> Res<Value> {
                 );
             }
         }
+        if rule.get("exact").is_some_and(|exact| !exact.is_boolean()) {
+            return Err("agentDeny.exact must be a boolean".into());
+        }
         if rule["allow"] != json!(true)
             && !rule["hint"]
                 .as_str()
@@ -96,7 +99,11 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<()> {
         let mut body = "#!/bin/sh\n".to_string();
         for rule in rules {
             let args = rule["argv"].as_array().unwrap();
-            body.push_str(&format!("if [ \"$#\" -ge {} ]", args.len() - 1));
+            body.push_str(&format!(
+                "if [ \"$#\" {} {} ]",
+                if b(rule, "exact") { "-eq" } else { "-ge" },
+                args.len() - 1
+            ));
             for (i, arg) in args.iter().enumerate().skip(1) {
                 body.push_str(&format!(
                     " && [ \"${{{i}}}\" = {} ]",

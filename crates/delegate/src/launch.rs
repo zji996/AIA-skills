@@ -22,6 +22,7 @@ pub struct Options {
     pub prompt_file: Option<String>,
     pub agent: String,
     pub tier: Option<String>,
+    pub agent_pinned: bool,
     pub name: Option<String>,
     pub workdir: Option<String>,
     pub images: Vec<String>,
@@ -34,6 +35,9 @@ pub struct Options {
     pub accept_set: bool,
     pub hide_accept: bool,
     pub accept_timeout: String,
+    pub evidence: Option<String>,
+    pub evidence_set: bool,
+    pub evidence_timeout: Option<String>,
     pub timeout: Option<String>,
     pub retries: i64,
     pub provider: Option<String>,
@@ -124,6 +128,8 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             "--protect",
             "--accept",
             "--accept-timeout",
+            "--evidence",
+            "--evidence-timeout",
             "--timeout",
             "--retries",
             "--provider",
@@ -159,6 +165,11 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                     o.accept = Some(v)
                 }
                 "--accept-timeout" => o.accept_timeout = v,
+                "--evidence" => {
+                    o.evidence_set = true;
+                    o.evidence = Some(v);
+                }
+                "--evidence-timeout" => o.evidence_timeout = Some(v),
                 "--timeout" => o.timeout = Some(v),
                 "--retries" => {
                     o.retries = v.parse().map_err(|_| "invalid --retries".to_string())?
@@ -181,6 +192,10 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--no-accept" => {
                     o.accept_set = true;
                     o.accept = None;
+                }
+                "--no-evidence" => {
+                    o.evidence_set = true;
+                    o.evidence = None;
                 }
                 "--allow-parallel-writes" => o.parallel = true,
                 "--fresh" => o.fresh = true,
@@ -255,6 +270,9 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
         return Err("argument --retries: invalid choice".into());
     }
     seconds(&o.accept_timeout)?;
+    if let Some(t) = &o.evidence_timeout {
+        seconds(t)?;
+    }
     if let Some(t) = &o.timeout {
         seconds(t)?;
     }
@@ -286,6 +304,10 @@ fn choose_agent(o: &mut Options) -> Res<()> {
         if o.tier.is_some() {
             return Err("--agent and --tier contradict each other; give one".into());
         }
+        o.agent_pinned = true;
+        o.tier = agents::spec(&o.agent)
+            .and_then(|agent| agent.default_tier)
+            .map(str::to_string);
         return Ok(());
     }
     let tier = o
@@ -497,6 +519,9 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     if !o.read_only && !o.accept_set {
         o.accept = config.value["accept"].as_str().map(str::to_string);
     }
+    if !o.read_only && !o.evidence_set {
+        o.evidence = config.value["evidence"].as_str().map(str::to_string);
+    }
     if let Some(top) = &repo {
         let cfg = worktree::work_config(&config.value, &top.join(".delegate.json"))?;
         if !o.read_only && !o.protect.is_empty() {
@@ -643,6 +668,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         }
     }
     let requested = o.agent.clone();
+    let explicitly_pinned = !requested.is_empty();
     let requested_tier = o.tier.clone();
     if !requested.is_empty() && requested_tier.is_some() {
         return Err("--agent and --tier contradict each other; give one".into());
@@ -686,13 +712,20 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     }
     missing_tools(&agent)?;
     o.agent = agent;
-    o.tier = requested_tier.or_else(|| {
-        if o.agent == s(&meta, "agent") {
-            meta["tier"].as_str().map(str::to_string)
-        } else {
-            None
-        }
-    });
+    o.agent_pinned = explicitly_pinned || (requested_tier.is_none() && runs::agent_pinned(&meta));
+    o.tier = requested_tier
+        .or_else(|| {
+            if !explicitly_pinned && o.agent == s(&meta, "agent") {
+                meta["tier"].as_str().map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            agents::spec(&o.agent)
+                .and_then(|agent| agent.default_tier)
+                .map(str::to_string)
+        });
     if o.agent == s(&meta, "agent") {
         o.provider = meta["provider"].as_str().map(str::to_string);
         o.model = meta["model"].as_str().map(str::to_string);
@@ -734,6 +767,14 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     }
     if o.accept.as_deref() == Some("") {
         o.accept = None;
+    }
+    if !o.evidence_set {
+        o.evidence = meta["evidenceCommand"].as_str().map(str::to_string);
+    }
+    if o.evidence_timeout.is_none() {
+        o.evidence_timeout = meta["evidenceTimeoutSeconds"]
+            .as_f64()
+            .map(|seconds| format!("{seconds}s"));
     }
     let prompt = read_prompt(&mut o)?;
     let top = Some(s(&meta["worktree"], "source"))
@@ -834,28 +875,77 @@ pub fn machine_runs(slots: &Path) -> Vec<PathBuf> {
         .filter(|run| run.join("meta.json").is_file() && active(&state(run)))
         .collect()
 }
-pub fn capacity(agent: &str, active_runs: &[PathBuf], config: &Value) -> Res<()> {
-    let total = crate::config::capacity(config, "maxActive", "MAX_ACTIVE", 8)?;
-    let codex = crate::config::capacity(config, "maxCodex", "MAX_CODEX", 4)?;
-    let codex_count = active_runs
-        .iter()
-        .filter(|r| agents::spec(s(&json(r.join("meta.json")), "agent")).is_some_and(|a| a.heavy))
-        .count();
-    let reason = if total > 0 && active_runs.len() >= total as usize {
-        format!(
-            "{} runs are active on this machine (DELEGATE_MAX_ACTIVE={total})",
-            active_runs.len()
-        )
-    } else if agents::spec(agent).is_some_and(|a| a.heavy)
-        && codex > 0
-        && codex_count >= codex as usize
-    {
-        format!("{codex_count} Codex runs are active on this machine (DELEGATE_MAX_CODEX={codex})")
+pub fn repo_key(path: &Path) -> String {
+    let common = git_text(
+        path,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .ok()
+    .map(PathBuf::from)
+    .unwrap_or_else(|| path.to_path_buf());
+    fs::canonicalize(&common)
+        .or_else(|_| std::path::absolute(&common))
+        .unwrap_or(common)
+        .to_string_lossy()
+        .into_owned()
+}
+pub fn repo_key_for_meta(meta: &Value) -> String {
+    if let Some(key) = meta["repoKey"].as_str().filter(|key| !key.is_empty()) {
+        return key.to_string();
+    }
+    let source = s(&meta["worktree"], "source");
+    repo_key(Path::new(if source.is_empty() {
+        s(meta, "workdir")
     } else {
-        String::new()
+        source
+    }))
+}
+pub fn capacity(agent: &str, active_runs: &[PathBuf], config: &Value, repo: &str) -> Res<()> {
+    let total = crate::config::capacity(config, "maxActive", "MAX_ACTIVE", 12)?;
+    let codex = crate::config::capacity(config, "maxCodex", "MAX_CODEX", 6)?;
+    let repo_total = crate::config::capacity(config, "repoMaxActive", "REPO_MAX_ACTIVE", 8)?;
+    let repo_codex = crate::config::capacity(config, "repoMaxCodex", "REPO_MAX_CODEX", 4)?;
+    let repo_runs: Vec<PathBuf> = active_runs
+        .iter()
+        .filter(|run| repo_key_for_meta(&json(run.join("meta.json"))) == repo)
+        .cloned()
+        .collect();
+    let is_codex = |run: &&PathBuf| {
+        agents::spec(s(&json(run.join("meta.json")), "agent")).is_some_and(|a| a.heavy)
+    };
+    let codex_count = active_runs.iter().filter(is_codex).count();
+    let repo_codex_count = repo_runs.iter().filter(is_codex).count();
+    let heavy = agents::spec(agent).is_some_and(|a| a.heavy);
+    let (reason, related) = if total > 0 && active_runs.len() >= total as usize {
+        (
+            format!(
+                "{} runs are active on this machine (DELEGATE_MAX_ACTIVE={total})",
+                active_runs.len()
+            ),
+            active_runs,
+        )
+    } else if heavy && codex > 0 && codex_count >= codex as usize {
+        (
+            format!(
+                "{codex_count} Codex runs are active on this machine (DELEGATE_MAX_CODEX={codex})"
+            ),
+            active_runs,
+        )
+    } else if repo_total > 0 && repo_runs.len() >= repo_total as usize {
+        (
+            format!(
+                "{} runs are active in this repository (DELEGATE_REPO_MAX_ACTIVE={repo_total})",
+                repo_runs.len()
+            ),
+            repo_runs.as_slice(),
+        )
+    } else if heavy && repo_codex > 0 && repo_codex_count >= repo_codex as usize {
+        (format!("{repo_codex_count} Codex runs are active in this repository (DELEGATE_REPO_MAX_CODEX={repo_codex})"), repo_runs.as_slice())
+    } else {
+        (String::new(), active_runs)
     };
     if !reason.is_empty() {
-        let listing = active_runs
+        let listing = related
             .iter()
             .map(|r| {
                 format!(
@@ -943,8 +1033,14 @@ pub fn launch(
     let _local = lock(&root.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
     let active_runs = active_machine(&slots);
     let deferred = extra["after"].is_string();
+    let source = s(&extra["worktree"], "source");
+    let repo = repo_key(if source.is_empty() {
+        workdir
+    } else {
+        Path::new(source)
+    });
     if !deferred {
-        capacity(&o.agent, &active_runs, &extra["configCapacity"])?;
+        capacity(&o.agent, &active_runs, &extra["configCapacity"], &repo)?;
     }
     if !deferred && mode == "write" && !o.parallel && !extra["worktree"].is_object() {
         for run in all_runs() {
@@ -1166,9 +1262,16 @@ pub fn launch(
     };
     let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":seconds(o.timeout.as_deref().unwrap_or("15m"))?,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
     let (agent_bin, agent_version) = agent_identity(s(&meta, "agent"))?;
+    meta["agentPinned"] = json!(o.agent_pinned);
+    if let Some(command) = o.evidence.filter(|command| !command.is_empty()) {
+        meta["evidenceCommand"] = json!(command);
+        meta["evidenceTimeoutSeconds"] =
+            json!(seconds(o.evidence_timeout.as_deref().unwrap_or("30m"))?);
+    }
     meta["agentBin"] = json!(agent_bin);
     meta["configSources"] = extra.get("configSources").cloned().unwrap_or(json!([]));
     meta["configCapacity"] = extra["configCapacity"].clone();
+    meta["repoKey"] = json!(repo);
     if let Some(rules) = extra.get("agentDeny").filter(|rules| !rules.is_null()) {
         meta["agentDeny"] = rules.clone();
     }
