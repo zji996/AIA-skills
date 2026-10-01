@@ -23,7 +23,7 @@
 | **`delegate`** | `skills/delegate/` | **同事 Agent 委派**：拆分任务、后台运行 Pi/Codex，按会话收取短结论与答复，完整字段按需 `--json`；每任务一个等待者，重复等待退出 76。`agentDeny` 用前缀或精确 argv 拦截同事全量检查（含 lane），`evidence` 收集评测且不改交付状态；timeout 后 reply 续做不耗返工次数。写入用 `--worktree` 隔离、`--protect-reason` 划分所有权，生成路径收尾核对；托管 copy/link 与未初始化参考 gitlink 的内容列为 `excluded`。`apply` 支持生成重试、编号预警、`acceptStillValid` 与合并后复验；手动合入自动识别，`pendingChanges` 保留累计待合入量。Rust 管理整机与仓库两层容量、lane、后台进程回收，固定同事显示默认档位，长答复全文落文件；[长时间自主推进](skills/delegate/references/long-run.md) 按需读取，实战经验按版本压缩沉淀。 |
 | **`openai-image-gen`** | `skills/openai-image-gen/` | **图像生成落盘**：先用便宜模型打草稿定构图，再以草稿为参考出一次正式图；每个输出文件限定草稿 3、正式 1、编辑 1 次，超出需用户同意；只返回一行 JSON；附示意图提示词结构与审查要点。 |
 | **`scroll-gesture`** | `skills/scroll-gesture/` | **滚动手势**：`input-probe.html` 在目标环境（Windows 鼠标、远程桌面、触屏）实测滚轮与触摸事件的频率、间隔、增量与鼠标格占比，一键复制 JSON；附过界翻页等自定义手势的判断点：时间只区分惯性、结果交给位置、动画可打断、鼠标格缓动。 |
-| **`iteration-speed`** | `skills/iteration-speed/` | **仓库迭代速度**：新机器/仓库初始化、构建测试门禁变慢、多 worktree/Agent 并行或验收分层与模块拆分前使用；`iteration-speed detect` 只读探测生态与缓存配置，`time`/`history` 记录反馈时间，`rust-setup` 预览或备份后写入用户级 sccache/mold 配置；附 Rust、Node、Python、Go、Docker 的缓存边界与实践。 |
+| **`iteration-speed`** | `skills/iteration-speed/` | **仓库迭代速度**：新机器/仓库初始化、构建测试门禁变慢、多 worktree/Agent 并行或验收分层与模块拆分前使用；`iteration-speed detect` 只读探测生态与缓存配置，`time`/`history` 记录反馈时间，`gate` 监测门禁预算与耗时回退、汇总最慢 Cargo 测试，`rust-setup` 预览或备份后写入用户级 sccache/mold 配置；附 Rust、Node、Python、Go、Docker 的缓存边界与实践。 |
 
 `delegate` 架构总览：[docs/assets/delegate-architecture.webp](docs/assets/delegate-architecture.webp)（提示词同目录）。
 

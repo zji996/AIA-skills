@@ -8,6 +8,8 @@
 - Decide which checks each parallel agent should run and batch the full gate after integration.
 - Our pnpm installs and TypeScript tests got slower; inspect stores and incremental outputs.
 - Python 测试启动很慢，量一下导入时间、上次失败用例和并行测试的耗时。
+- 热缓存全量门禁涨到 25 分钟才发现；设预算并定位最慢的测试，量依赖优化与增量编译后再改 profile。
+- Enforce a ten-minute full gate budget and warn when its duration regresses against recent successful runs.
 
 ## 不应触发
 
@@ -19,4 +21,6 @@
 
 - 假混合仓库运行 `detect`，报告 Rust/Node/Python/Go/Docker 且仓库快照不变。
 - `time -- sh -c 'exit 7'` 返回 7，用户状态目录记录耗时、退出码和命令；`history` 可读取。
+- `gate --name full --budget 1ms -- <命令>` 成功但超预算返回 3，失败返回原码；仓库预算可被参数覆盖，同名最近 5 次成功中位数回退只提示。
+- 固定 Cargo 输出样例配对 `Running` 与 `finished in Ns`，排序前 5 个二进制和 `--report-time` 测试；凭据与测试名称不写入门禁历史。
 - 指定临时 HOME 后 `rust-setup --write` 只写用户配置，保留无关配置且二次写入生成备份；`--print` 不写文件。

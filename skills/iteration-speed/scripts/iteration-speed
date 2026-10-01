@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 die() { printf '%s\n' "$*" >&2; exit 2; }
 usage() {
-    printf '%s\n' 'Usage: iteration-speed detect | time -- COMMAND [ARG...] | history | rust-setup --print|--write'
+    printf '%s\n' 'Usage: iteration-speed detect | time -- COMMAND [ARG...] | gate [--budget DURATION] [--name NAME] -- COMMAND [ARG...] | history | rust-setup --print|--write'
 }
 
 # This scanner reports literal settings, never evaluates project code or invokes installers.
@@ -298,10 +298,14 @@ if [ "$#" -gt 0 ]; then shift; fi
 case $action in
     detect) [ "$#" -eq 0 ] || die 'detect accepts no arguments'; detect;;
     time) measure "$@";;
+    gate)
+        root=$(git rev-parse --show-toplevel 2>/dev/null) || root=$PWD
+        exec python3 "$SCRIPT_DIR/gate.py" "$(history_path)" "$root" "$@"
+        ;;
     history)
         [ "$#" -eq 0 ] || die 'history accepts no arguments'
         log=$(history_path)
-        printf 'UTC\tseconds\texit\tcwd\tcommand\n'
+        printf 'UTC\tseconds\texit\tcwd/kind\tcommand/name\tsummary (gate only)\n'
         if [ -f "$log" ]; then tail -n 20 "$log"; fi
         ;;
     rust-setup) [ "$#" -eq 1 ] || die 'rust-setup requires one mode'; rust_setup "$1";;

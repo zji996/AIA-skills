@@ -47,6 +47,14 @@ debug = "line-tables-only"
 `tests/*.rs` 通常各自生成二进制；链接占主导时用单一入口加子模块组织测试。
 文件夹模块避免被自动识别为额外入口；合并前检查隔离和共享状态。
 
+dev/test profile 中依赖未优化时，测试 CPU 常被哈希、JSON Schema、regex 等依赖吃掉；先给依赖设置：
+```toml
+[profile.dev.package."*"]
+opt-level = 2
+```
+再实测自有 crate 在 `[profile.dev]` 下调到 `opt-level = 1` 时的增量编译与测试耗时，再决定；test 默认继承 dev，显式覆盖时须核对。这些 opt-level 设置不改变 debug assertions 与溢出检查，release 不变。
+带 feature 的门禁不要整套重跑同一批单元测试，只跑需要该 feature 的测试。
+
 ## Polaris 基线（任务提供的实测，非通用承诺）
 
 12 核、8 万行 / 5 个 crate 直线依赖，约 470 个第三方依赖：

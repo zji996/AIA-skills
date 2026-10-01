@@ -1,3 +1,6 @@
+import csv
+import importlib.util
+import json
 import os
 import subprocess
 import tempfile
@@ -6,6 +9,34 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "skills/iteration-speed/scripts/iteration-speed"
+SPEC = importlib.util.spec_from_file_location("iteration_gate", SCRIPT.with_name("gate.py"))
+GATE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(GATE)
+
+CARGO_OUTPUT = """    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.00s
+     Running unittests src/lib.rs (target/debug/deps/runtime-123)
+test runtime::SECRET_TOKEN ... ok <12.30s>
+test runtime::fast ... ok <0.01s>
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.00s
+     Running tests/schema.rs (target/debug/deps/schema-123)
+test schema::validate ... ok <5.00s>
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.00s
+     Running tests/hash.rs (target/debug/deps/hash-123)
+test hash::calculate ... FAILED <6.00s>
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.00s
+     Running tests/regex.rs (target/debug/deps/regex-123)
+test regex::match ... ok <4.00s>
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.00s
+     Running tests/json.rs (target/debug/deps/json-123)
+test json::decode ... ok <3.00s>
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.00s
+     Running tests/tiny.rs (target/debug/deps/tiny-123)
+test tiny::quick ... ok <0.02s>
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+   Doc-tests sample
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.00s
+unrecognized credentials: SECRET_PASSWORD
+"""
 
 
 class IterationSpeedTests(unittest.TestCase):
@@ -33,6 +64,135 @@ class IterationSpeedTests(unittest.TestCase):
     def snapshot(self, path):
         return {str(file.relative_to(path)): file.read_bytes()
                 for file in path.rglob("*") if file.is_file()}
+
+    def gate_rows(self):
+        log = self.root / "state/iteration-speed/fake-repo.tsv"
+        with log.open() as file:
+            return list(csv.reader(file, delimiter="\t"))
+
+    def test_gate_budget_exit_codes_and_history_privacy(self):
+        result = self.run_script("gate", "--name", "full", "--budget", "1m30s", "--",
+                                 "sh", "-c", "printf SECRET_TOKEN; printf SECRET_ERROR >&2; exit 7")
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.stdout, "SECRET_TOKEN")
+        self.assertIn("SECRET_ERROR", result.stderr)
+        row = self.gate_rows()[-1]
+        self.assertEqual(row[2:5], ["7", "gate", "full"])
+        self.assertNotIn("SECRET", "".join(row))
+        self.assertNotIn(str(self.repo), "".join(row))
+        for command_status, expected in ((0, 3), (7, 7), (3, 3)):
+            with self.subTest(command_status=command_status):
+                result = self.run_script("gate", "--budget", "0.000001s", "--",
+                                         "sh", "-c", f"exit {command_status}")
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual(self.gate_rows()[-1][2], str(command_status))
+                if command_status == 0:
+                    for text in ("over budget", "exceeded by", "slowest steps/tests", "SKILL.md"):
+                        self.assertIn(text, result.stderr)
+                else:
+                    self.assertNotIn("over budget", result.stderr)
+        result = self.run_script("gate", "--", "sh", "-c", "exit 0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("over budget", result.stderr)
+        self.assertIn("\tgate\tdefault\t", self.run_script("history").stdout)
+
+    def test_gate_repository_budget_and_explicit_override_from_subdirectory(self):
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        self.write(".iteration-speed.json", '{"gates":{"full":"0.000001s"}}')
+        self.write("nested/marker", "")
+        self.repo = self.repo / "nested"
+        result = self.run_script("gate", "--name", "full", "--", "sh", "-c", "exit 0")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        result = self.run_script("gate", "--name", "full", "--budget", "1h", "--", "sh", "-c", "exit 0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_script("gate", "--name", "unconfigured", "--", "sh", "-c", "exit 0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_gate_invalid_budget_and_arguments_do_not_run(self):
+        for options in (("--budget", "bogus"), ("--budget", "0s"),
+                        ("--budget", "-1m"), ("--budget", "NaN"), ("--name", "bad\tname")):
+            with self.subTest(options=options):
+                result = self.run_script("gate", *options, "--", "sh", "-c", "touch marker")
+                self.assertEqual(result.returncode, 2)
+                self.assertFalse((self.repo / "marker").exists())
+        for args in (("gate",), ("gate", "--")):
+            self.assertEqual(self.run_script(*args).returncode, 2)
+        self.write(".iteration-speed.json", '{"gates":{"default":12}}')
+        self.assertEqual(self.run_script("gate", "--", "sh", "-c", "touch marker").returncode, 2)
+        self.assertFalse((self.repo / "marker").exists())
+        self.assertFalse((self.root / "state").exists())
+
+    def test_gate_missing_command_and_signal_status(self):
+        self.assertEqual(self.run_script("gate", "--", "./missing").returncode, 127)
+        self.assertEqual(self.gate_rows()[-1][2], "127")
+        result = self.run_script("gate", "--", "sh", "-c", "kill -TERM $$")
+        self.assertEqual(result.returncode, 143)
+        self.assertEqual(self.gate_rows()[-1][2], "143")
+
+    def test_gate_recent_five_successful_median_and_regression(self):
+        log = self.root / "state/iteration-speed/fake-repo.tsv"
+        log.parent.mkdir(parents=True)
+        rows = [["UTC", str(seconds), "0", "gate", "full", "{}"]
+                for seconds in (100, .000001, .000002, .000003, .000004, .000005)]
+        rows += [["UTC", "100", "7", "gate", "full", "{}"],
+                 ["UTC", "100", "0", "gate", "other", "{}"],
+                 ["UTC", "100", "0", "cwd", "full"],
+                 ["UTC", "invalid", "0", "gate", "full", "{}"]]
+        with log.open("w", newline="") as file:
+            csv.writer(file, delimiter="\t", lineterminator="\n").writerows(rows)
+        self.assertEqual(GATE.recent_median(log, "full"), .000003)
+        result = self.run_script("gate", "--name", "full", "--", "sh", "-c", "exit 0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Gate regression", result.stderr)
+        self.assertNotIn("Gate regression", self.run_script("gate", "--name", "other", "--",
+                                                          "sh", "-c", "exit 0").stderr)
+
+    def test_gate_budget_and_regression_boundaries(self):
+        self.assertEqual(GATE.conclusion(10, 10, 0, None), (0, []))
+        self.assertEqual(GATE.conclusion(13, None, 0, 10), (0, []))
+        code, messages = GATE.conclusion(13.01, 20, 0, 10)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("regression", messages[0])
+        code, messages = GATE.conclusion(12, 10, 0, None)
+        self.assertEqual(code, 3)
+        self.assertIn("20.0%", messages[0])
+
+    def test_gate_cargo_fixture_top_five_and_numeric_history(self):
+        self.write("cargo-output.txt", CARGO_OUTPUT)
+        result = self.run_script("gate", "--", "cat", "cargo-output.txt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, CARGO_OUTPUT)
+        binaries = result.stderr.split("Slowest test binaries: ")[1].splitlines()[0]
+        tests = result.stderr.split("Slowest tests: ")[1].splitlines()[0]
+        self.assertEqual(binaries.split("; "), ["runtime-123 20.000s", "schema-123 10.000s",
+                                               "hash-123 8.000s", "regex-123 7.000s", "json-123 6.000s"])
+        self.assertEqual(tests.split("; "), ["runtime::SECRET_TOKEN 12.300s", "hash::calculate 6.000s",
+                                            "schema::validate 5.000s", "regex::match 4.000s", "json::decode 3.000s"])
+        row = self.gate_rows()[-1]
+        self.assertEqual(json.loads(row[5]), {"binary_seconds": [20, 10, 8, 7, 6],
+                                            "test_seconds": [12.3, 6, 5, 4, 3]})
+        self.assertNotIn("SECRET", "".join(row))
+        self.assertNotIn("runtime", "".join(row))
+
+    def test_cargo_parser_handles_split_streams_ansi_and_unknown_output(self):
+        summary = GATE.CargoSummary()
+        stderr = GATE.OutputLines(summary)
+        stdout = GATE.OutputLines(summary)
+        stderr.feed(b"\x1b[32m     Running unittests src/lib.rs (target/debug/deps/sample-123)\x1b[0m\n")
+        stdout.feed(b"test sample::slow ... ok <1.")
+        stdout.feed(b"23s>\ntest result: ok. 1 passed; 0 failed; finished in 2.34s", final=True)
+        self.assertEqual(summary.slowest(), ([(2.34, "sample-123")], [(1.23, "sample::slow")]))
+        unknown = GATE.CargoSummary()
+        for line in ("ordinary output", "finished in 100s", "test malformed ... ok <oops>",
+                     "Running custom (target/debug/custom)"):
+            unknown.feed(line)
+        self.assertEqual(unknown.slowest(), ([], []))
+        parser = GATE.OutputLines(unknown)
+        parser.feed(b"x" * 70000)
+        self.assertLessEqual(len(parser.pending), 65536)
+        parser.feed(b"\n", final=True)
+        self.assertEqual(unknown.slowest(), ([], []))
 
     def test_detect_mixed_repo_read_only_and_workspace_chain(self):
         self.write("Cargo.toml", '[workspace]\nmembers = ["packages/*"]\n'
