@@ -52,7 +52,8 @@ pub fn human(run: &Path, status: &Value) -> String {
         .filter_map(Value::as_str)
         .map(str::to_string)
         .collect::<Vec<_>>();
-    if runs::active(state) && !meta["base"].is_null() {
+    // A worktree is still being checked out until the agent starts; counting it then shows mass deletions.
+    if runs::active(state) && !meta["base"].is_null() && run.join("agent.pid").exists() {
         let top = Path::new(s(&meta, "top"));
         if let Some(after) = changes::snapshot(top, run, &changes::managed_paths(&meta)) {
             if let Ok(diff) =
