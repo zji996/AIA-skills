@@ -102,6 +102,12 @@ if [ -f "$audit" ]; then
   python3 "$audit" --repo "$REPO_ROOT" --only budget --fail-on budget
 fi
 
+# Unresolved merge conflict markers (apply --merge leaves them in any text file).
+if git -C "$REPO_ROOT" grep -n -I -E '^(<<<<<<< |>>>>>>> |\|\|\|\|\|\|\| )' -- . >/dev/null 2>&1; then
+  git -C "$REPO_ROOT" grep -n -I -E '^(<<<<<<< |>>>>>>> |\|\|\|\|\|\|\| )' -- . | sed 's/^/  [FAIL] conflict marker: /' >&2
+  exit 1
+fi
+
 errors=0
 for script in "$REPO_ROOT/scripts"/*.sh "$REPO_ROOT/skills"/*/scripts/*.sh; do
   [ -f "$script" ] || continue

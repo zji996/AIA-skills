@@ -4,6 +4,7 @@
 
 ### 仓库脚本
 
+- `check.sh` 拦截已跟踪文件中的合并冲突标记；起因：`apply --merge` 留下的标记曾随 CHANGELOG 一起提交。
 - 新增 `scripts/sync-hosts.sh`：经 SSH 并行更新其他机器上的 AIA-skills（`git pull --ff-only` 后重跑 `install.sh`，顺带取与新校验和匹配的二进制），每台一行汇报提交与 delegate 版本，任一失败退出 1 并附日志尾部。主机从参数或 `~/.config/aia-skills/hosts` 读取，`--` 之后的参数传给远端 `install.sh`；远端需已有检出（首次用 bootstrap.sh）。
 
 ### 技能
