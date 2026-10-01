@@ -79,6 +79,7 @@ cd AIA-skills
 ./scripts/install.sh --uninstall [<skill>...]         # 只删除本仓库安装的条目
 ./scripts/install.sh repo-governance --force          # 替换指向其他来源的同名符号链接
 ./scripts/install-git-hooks.sh                         # 本仓库启用 pre-push 门禁
+./scripts/sync-hosts.sh                               # 经 SSH 并行更新其他机器（列表在 ~/.config/aia-skills/hosts）
 ```
 
 **安装模式**：开发机用默认的符号链接，只存一份源码，保存即生效，`git pull` 就是更新。服务器、容器或其他机器用 `--copy`，每份拷贝带 `.aia-skills-install` 标记，记录来源、版本和提交号，`--status` 据此判断是否过期；更新时重新运行 `--copy` 即可。两种模式可以互相切换。

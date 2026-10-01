@@ -13,6 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALL = ROOT / "scripts/install.sh"
+SYNC_HOSTS = ROOT / "scripts/sync-hosts.sh"
 CHECK = ROOT / "scripts/check.sh"
 FETCH = ROOT / "scripts/fetch-binary.sh"
 RELEASE = ROOT / "scripts/release-binary.sh"
@@ -36,6 +37,31 @@ class ScriptTests(unittest.TestCase):
         env = {**(env if env is not None else os.environ), "AIA_SKILLS_SKIP_BINARIES": "1"}
         return subprocess.run([str(script), *map(str, args)], cwd=self.work, env=env, input=input,
                               capture_output=True, text=True, timeout=15)
+
+    def test_sync_hosts_runs_each_host_and_reports_failures(self):
+        bin_dir = self.work / "bin"
+        bin_dir.mkdir()
+        ssh = bin_dir / "ssh"
+        # Fake ssh: the host is the argument before the remote command; "bad" fails.
+        ssh.write_text('#!/bin/sh\nfor a; do host=$prev; prev=$a; done\n'
+                       'case $host in *bad*) echo "pull failed" >&2; exit 1;; esac\n'
+                       'case $a in *"install.sh --copy"*) echo "abc1234 delegate 9.9.9 copy";; *) echo "abc1234 delegate 9.9.9";; esac\n')
+        ssh.chmod(0o755)
+        env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
+               "AIA_SKILLS_HOSTS_FILE": str(self.work / "none")}
+        none = self.run_script(SYNC_HOSTS, env=env)
+        self.assertEqual(none.returncode, 2)
+        self.assertIn("no hosts", none.stderr)
+        result = self.run_script(SYNC_HOSTS, "u@good", "u@bad", env=env)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertRegex(result.stdout, r"ok    u@good  abc1234 delegate 9\.9\.9")
+        self.assertIn("FAIL  u@bad", result.stdout)
+        self.assertIn("pull failed", result.stdout)
+        hosts = self.work / "hosts"
+        hosts.write_text("# targets\nu@good  # main box\n\n")
+        listed = self.run_script(SYNC_HOSTS, "--", "--copy", env={**env, "AIA_SKILLS_HOSTS_FILE": str(hosts)})
+        self.assertEqual(listed.returncode, 0, listed.stdout)
+        self.assertIn("delegate 9.9.9 copy", listed.stdout)
 
     def test_install_rejects_traversal_without_touching_existing_data(self):
         home = self.work / "home"

@@ -2,6 +2,10 @@
 
 ## 未发布
 
+### 仓库脚本
+
+- 新增 `scripts/sync-hosts.sh`：经 SSH 并行更新其他机器上的 AIA-skills（`git pull --ff-only` 后重跑 `install.sh`，顺带取与新校验和匹配的二进制），每台一行汇报提交与 delegate 版本，任一失败退出 1 并附日志尾部。主机从参数或 `~/.config/aia-skills/hosts` 读取，`--` 之后的参数传给远端 `install.sh`；远端需已有检出（首次用 bootstrap.sh）。
+
 ### 技能
 
 - `delegate` 5.18.1：运行中任务的短行只在同事进程启动后（`agent.pid` 已写）才实时统计改动。此前 `start` 刚返回时 worktree 还在检出，短行会显示“改 127 个文件 +0/-11052”这类假删除。
