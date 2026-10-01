@@ -813,6 +813,120 @@ db.write_text(json.dumps(units))
         self.assertEqual(json.loads((Path(state["dir"]) / "summary.json").read_text())["warnings"], warnings)
         self.assertTrue((repo / "module").is_dir())
 
+    def test_accept_also_composes_in_order_and_records_final_command(self):
+        self.env["XDG_CONFIG_HOME"] = str(self.work / "config")
+        self.fake_pi([answer("done"), SETTLED])
+        repo = self.repo({"a.txt": "a\n"})
+        default = "echo default >> accept-order"
+        explicit = "echo explicit >> accept-order"
+        first = "echo first >> accept-order"
+        second = "echo second >> accept-order"
+        cases = [
+            (default, ["--accept-also", first], [default, first], ["default", "first"]),
+            (default, ["--accept-also", first, "--accept-also=" + second],
+             [default, first, second], ["default", "first", "second"]),
+            (default, ["--accept-also", first, "--accept", explicit, "--accept-also", second],
+             [explicit, first, second], ["explicit", "first", "second"]),
+            (None, ["--accept", explicit, "--accept-also", first],
+             [explicit, first], ["explicit", "first"]),
+            (None, ["--accept-also", first], [first], ["first"]),
+            (None, ["--accept-also", first, "--accept-also", second],
+             [first, second], ["first", "second"]),
+            ("", ["--accept-also", first], [first], ["first"]),
+            (default, ["--accept", "", "--accept-also", first], [first], ["first"]),
+        ]
+        for configured, args, commands, order in cases:
+            with self.subTest(configured=configured, args=args):
+                (repo / ".delegate.json").write_text(json.dumps(
+                    {} if configured is None else {"accept": configured}))
+                (repo / "accept-order").unlink(missing_ok=True)
+                result = self.cli("run", "--workdir", repo, *args, "task")
+                state = self.outcome(result)
+                self.assertEqual((result.returncode, state["state"]), (0, "delivered"), result.stderr)
+                command = " && ".join(commands)
+                run = Path(state["dir"])
+                self.assertEqual(state["accept"]["command"], command)
+                self.assertEqual(json.loads((run / "meta.json").read_text())["accept"], command)
+                self.assertEqual(json.loads((run / "summary.json").read_text())["accept"]["command"], command)
+                self.assertIn(command, (run / "prompt.md").read_text())
+                self.assertEqual((repo / "accept-order").read_text().splitlines(), order)
+
+    def test_accept_also_short_circuits_and_reply_inherits_composed_command(self):
+        self.env["XDG_CONFIG_HOME"] = str(self.work / "config")
+        self.fake_pi([answer("done"), SETTLED])
+        repo = self.repo({"a.txt": "a\n"})
+        (repo / ".delegate.json").write_text(json.dumps({"accept": "false"}))
+        result = self.cli("run", "--workdir", repo, "--accept-also", "touch unexpected", "task")
+        state = self.outcome(result)
+        self.assertEqual((result.returncode, state["state"]), (1, "rejected"))
+        self.assertFalse((repo / "unexpected").exists())
+        result = self.cli("run", "--workdir", repo, "--accept", "true", "--accept-also", "false",
+                          "--accept-also", "touch unexpected", "task")
+        self.assertEqual((result.returncode, self.outcome(result)["state"]), (1, "rejected"))
+        self.assertFalse((repo / "unexpected").exists())
+        parent = self.outcome(self.cli("run", "--workdir", repo, "--accept", "true",
+                                      "--accept-also", "echo first", "task"))
+        reply = self.outcome(self.cli("reply", "--wait", parent["run"], "--accept-also", "echo second", "more"))
+        self.assertEqual(reply["accept"]["command"], "true && echo first && echo second")
+        inherited = self.outcome(self.cli("reply", "--wait", reply["run"], "more"))
+        self.assertEqual(inherited["accept"]["command"], reply["accept"]["command"])
+        replaced = self.outcome(self.cli("reply", "--wait", inherited["run"], "--accept", "echo new",
+                                        "--accept-also", "true", "more"))
+        self.assertEqual(replaced["accept"]["command"], "echo new && true")
+        disabled = self.outcome(self.cli("reply", "--wait", replaced["run"], "--no-accept", "more"))
+        standalone = self.outcome(self.cli("reply", "--wait", disabled["run"], "--accept-also", "true", "more"))
+        self.assertEqual(standalone["accept"]["command"], "true")
+
+    def test_accept_also_conflicts_with_no_accept_in_any_order(self):
+        for command in ("start", "run", "reply"):
+            for args in (["--no-accept", "--accept-also", "true"],
+                         ["--accept-also=true", "--no-accept"],
+                         ["--no-accept", "--accept", "true", "--accept-also", "true"]):
+                with self.subTest(command=command, args=args):
+                    result = self.cli(command, *(["parent"] if command == "reply" else []), *args, "task")
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("--no-accept and --accept-also", result.stderr)
+        self.assertFalse((self.work / "runs").exists())
+
+    def test_accept_override_warns_only_when_replacing_nonempty_default(self):
+        self.env["XDG_CONFIG_HOME"] = str(self.work / "config")
+        self.fake_pi([answer("done"), SETTLED])
+        repo = self.repo({"a.txt": "a\n"})
+        default = "echo configured-default"
+        cases = [
+            (default, ["--accept", "true"], True),
+            (default, ["--accept", "", "--accept-also", "true"], True),
+            (default, ["--accept", "true", "--accept-also", "true"], True),
+            (default, ["--accept", default, "--accept-also", "true"], False),
+            (default, ["--accept", default], False),
+            (default, ["--accept-also", "true"], False),
+            (default, ["--no-accept"], False),
+            ("", ["--accept", "true"], False),
+            (None, ["--accept", "true"], False),
+            (default, ["--read-only", "--accept", "true"], False),
+        ]
+        for configured, args, warn in cases:
+            with self.subTest(configured=configured, args=args):
+                (repo / ".delegate.json").write_text(json.dumps(
+                    {} if configured is None else {"accept": configured}))
+                result = self.cli("start", "--workdir", repo, *args, "task")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                warnings = [line for line in result.stderr.splitlines() if "replaces default accept" in line]
+                self.assertEqual(len(warnings), int(warn), result.stderr)
+                if warn:
+                    self.assertIn(default, warnings[0])
+                    self.assertIn("--accept-also COMMAND", warnings[0])
+                    self.assertIn("替换了默认验收", warnings[0])
+                self.assertEqual(self.cli("wait", self.outcome(result)["run"]).returncode, 0)
+        user_config = self.work / "config" / "delegate" / "config.json"
+        user_config.parent.mkdir(parents=True)
+        user_config.write_text(json.dumps({"accept": default}))
+        (repo / ".delegate.json").write_text("{}")
+        appended = self.outcome(self.cli("run", "--workdir", repo, "--accept-also", "true", "task"))
+        self.assertEqual(appended["accept"]["command"], default + " && true")
+        result = self.cli("run", "--workdir", repo, "--accept", "true", "task")
+        self.assertIn('replaces default accept "' + default + '"', result.stderr)
+
     def test_repository_default_accept_applies_only_to_writes(self):
         repo = self.repo({"a.txt": "a\n"})
         (repo / ".delegate.json").write_text(json.dumps({"accept": "test -n \"$DELEGATE_RUN_DIR\" && touch accepted"}))

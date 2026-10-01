@@ -33,6 +33,7 @@ pub struct Options {
     pub worktree: bool,
     pub accept: Option<String>,
     pub accept_set: bool,
+    pub accept_also: Vec<String>,
     pub hide_accept: bool,
     pub accept_timeout: String,
     pub evidence: Option<String>,
@@ -65,9 +66,23 @@ impl Options {
             ..Default::default()
         }
     }
+
+    fn append_accept(&mut self) {
+        if !self.accept_also.is_empty() {
+            let commands = self
+                .accept
+                .iter()
+                .chain(self.accept_also.iter())
+                .filter(|command| !command.is_empty())
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            self.accept = Some(commands.join(" && ")).filter(|command| !command.is_empty());
+        }
+    }
 }
 pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options> {
     let mut o = Options::new();
+    let mut no_accept = false;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -127,6 +142,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             "--image",
             "--protect",
             "--accept",
+            "--accept-also",
             "--accept-timeout",
             "--evidence",
             "--evidence-timeout",
@@ -164,6 +180,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                     o.accept_set = true;
                     o.accept = Some(v)
                 }
+                "--accept-also" => o.accept_also.push(v),
                 "--accept-timeout" => o.accept_timeout = v,
                 "--evidence" => {
                     o.evidence_set = true;
@@ -190,6 +207,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--worktree" => o.worktree = true,
                 "--hide-accept" => o.hide_accept = true,
                 "--no-accept" => {
+                    no_accept = true;
                     o.accept_set = true;
                     o.accept = None;
                 }
@@ -227,6 +245,9 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             }
         }
         i += 1;
+    }
+    if no_accept && !o.accept_also.is_empty() {
+        return Err("--no-accept and --accept-also contradict each other".into());
     }
     if reply {
         if o.run.is_none() {
@@ -516,9 +537,20 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         );
     }
     let mut extra = json!({"env":config.value["env"],"agentDeny":config.value["agentDeny"],"configSources":config.sources,"configCapacity":capacities});
-    if !o.read_only && !o.accept_set {
-        o.accept = config.value["accept"].as_str().map(str::to_string);
+    if !o.read_only {
+        let default_accept = config.value["accept"].as_str().filter(|c| !c.is_empty());
+        if !o.accept_set {
+            o.accept = config.value["accept"].as_str().map(str::to_string);
+        } else if let Some(default) = default_accept {
+            if o.accept
+                .as_deref()
+                .is_some_and(|command| command != default)
+            {
+                eprintln!("delegate: --accept replaces default accept {default:?}; use --accept-also COMMAND to keep it and append task tests / --accept 替换了默认验收；任务测试用 --accept-also 追加并保留默认验收");
+            }
+        }
     }
+    o.append_accept();
     if !o.read_only && !o.evidence_set {
         o.evidence = config.value["evidence"].as_str().map(str::to_string);
     }
@@ -777,6 +809,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     if !o.accept_set {
         o.accept = meta["accept"].as_str().map(str::to_string);
     }
+    o.append_accept();
     if o.accept.as_deref() == Some("") {
         o.accept = None;
     }

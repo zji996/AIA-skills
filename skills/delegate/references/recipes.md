@@ -8,7 +8,7 @@
 目标：<要什么结果；一句话能说清>
 背景与已定事实：<同事不该重新猜的东西：已排除的原因、已做的决定、相关文件>
 范围：<能改哪些目录/文件；不能碰什么>
-完成标准：<--accept 命令会自动附上；只读任务写清答复要包含什么，如"每条写 文件:行号、触发场景、后果，按严重程度排序">
+完成标准：<验收命令会自动附上；只读任务写清答复要包含什么，如"每条写 文件:行号、触发场景、后果，按严重程度排序">
 约束：<风格、依赖、不要重构无关代码、有疑问写在答复里而不是自作主张>
 失败语义：<新增旁路能力时写：哪些失败中止主路径，哪些只记诊断、在下个边界重试；取消必须向上传递。仓库入口文件已写明分级时可省略>
 证据：<审查/调研类：每条关于现状的断言附 文件:行号；区分"现状事实"与"建议"；不用形容词，给表格加结论>
@@ -40,7 +40,7 @@ Claude Code 的 Monitor 能把后台输出逐行转事件，优先 `wait --strea
 根因你已经定位、改法需要细心实现时：
 
 ```bash
-$D run --worktree --tier strong --name fix-lock --accept "go test ./internal/queue/..." --prompt-file - <<'EOF'
+$D run --worktree --tier strong --name fix-lock --accept-also "go test ./internal/queue/..." --prompt-file - <<'EOF'
 目标：修复并发取消时重复释放锁。
 已定事实：根因是 cancel() 与 worker 退出路径都调用 release()，两者之间没有同步（queue.go:210、worker.go:88）。
 要求：release 幂等且不引入新锁；补一个并发取消的回归测试。不要改公开接口。
@@ -53,7 +53,7 @@ $D apply fix-lock
 真实模型评测作为证据单独收集，确定的检查仍作验收：
 
 ```bash
-$D run --worktree --name model-fix --accept 'cargo test -p engine' \
+$D run --worktree --name model-fix --accept-also 'cargo test -p engine' \
   --evidence 'cargo xtask model-eval' --evidence-timeout 30m '修复模型调用的取消传递'
 $D reply model-fix '补上并发取消路径'   # 沿用验收和证据
 $D reply model-fix --no-evidence '只补文档中的说明'
@@ -68,7 +68,7 @@ $D reply model-fix --no-evidence '只补文档中的说明'
 ```bash
 $D run --worktree --tier strong --name port --timeout 3h --accept-timeout 30m \
   --protect tests/ --protect docs/spec.md \      # 改了测试或规格直接判 rejected，验收都不跑
-  --accept 'make build && make test' --prompt-file task.md
+  --accept-also 'make build && make test' --prompt-file task.md
 ```
 
 交付后仍要看 diff：测试没覆盖到的问题，验收也拦不住。发现漏洞时先补一条测试，再让同事修。
@@ -119,7 +119,7 @@ $D wait
 - `env` 在原地运行时同样生效。
 - `agentDeny` 按 argv 前缀拦截同事的全量检查（退出 77，打印 hint），同事通过 lane 调用也拒绝；验收与主控 lane 保持可用。同事跑相关包检查，主控合入一批后统一全量检查。
 - 只禁无过滤的数据库全量检查时用 `{"argv":["cargo","xtask","infra-test"],"exact":true,"hint":"带过滤参数跑相关用例"}`；额外参数放行。用户/仓库去重和 `allow: true` 撤销都按 `(argv, exact)`，撤销时保留同样的 exact。
-- 顶层 `accept` 只作用于写入任务；显式 `--accept` 覆盖，`--no-accept` 关闭。并行写入用 `--protect` 划分文件所有权；验收覆盖相关 ratchet、contracts、docs 门禁，合并后再跑全量。
+- 顶层 `accept` 只作用于写入任务；任务测试用 `--accept-also` 追加，`--accept` 覆盖，`--no-accept` 关闭（不能与追加同用）。并行写入用 `--protect` 划分文件所有权；验收覆盖相关 ratchet、contracts、docs 门禁，合并后再跑全量。
 - `generated.paths` 的匹配语义同 `--protect`（目录以 `/` 结尾）。这些生成文件仍出现在改动清单和 diff 中，但 `apply` 不合并或覆盖它们；合并其他文件后，在源仓库根通过 lane 运行 `sh -c` 执行 `generated.command`（设了 `generated.inputs` 时只在合并路径命中它时运行），输出写入 run 目录的 `generate.log`。`--dry-run` 只报告动作；生成失败时已合并文件保留，需查看日志后重试。见 `docs/delegate-spec.md` §6.4。
 - 界面实现默认 `--tier cheap`（Pi 前端审美与交互明显好于 Codex），说明里要截图路径；强档只接状态、数据与接口逻辑。
 

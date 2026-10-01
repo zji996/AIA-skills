@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "5.21.1"
+  version: "5.22.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -33,7 +33,7 @@ $D wait                                                                         
 | 读材料、只要结论 | `$D start --read-only "…"` |
 | 独立审查、第二意见 | `$D start --read-only --tier strong "…"`（多路并行时各起一个，按子系统拆开） |
 | 看截图或设计图 | `$D start --read-only --image shot.png "…"` |
-| 改代码，测试通过才算完 | `$D run --worktree --accept "make check" "…"`，满意后 `$D apply <name>`；不许同事碰的路径加 `--protect tests/ --protect docs/spec.md` |
+| 改代码，测试通过才算完 | `$D run --worktree --accept-also "make test" "…"`，满意后 `$D apply <name>`；不许同事碰的路径加 `--protect tests/ --protect docs/spec.md` |
 | 接着上一轮追问或返工 | `$D reply <name> "…"`（后台启动，同一会话、同一 worktree；需当场收结果加 `--wait`）；开新会话加 `--fresh`；换同事加 `--agent codex`；你之后又改了代码想让它看到，加 `--sync` |
 | 先 A 后 B | `$D start --after <A> …`；审 A 的结果加 `--in <A> --read-only` |
 | 自己跑重检查 | `$D lane make check`（与同事验收、证据共用队列） |
@@ -56,7 +56,7 @@ $D wait                                                                         
 
 ## 写好任务说明
 
-同事不知道你的会话，说明需要自足：**目标**（要什么结果）、**边界**（能改哪、不能改哪）、**完成标准**（`--accept` 命令，或答复要包含什么）、**已知事实与决定**（别让它重新猜）。新增旁路能力（投影、索引、记忆、缓存、通知）时再写一句**失败语义**：哪些失败必须中止主路径，哪些只记诊断、稍后重试；不写时强档倾向于处处失败关闭。验收命令会自动附在说明末尾，并教同事用 `lane` 自检。
+同事不知道你的会话，说明需要自足：**目标**（要什么结果）、**边界**（能改哪、不能改哪）、**完成标准**（验收命令，或答复要包含什么）、**已知事实与决定**（别让它重新猜）。新增旁路能力（投影、索引、记忆、缓存、通知）时再写一句**失败语义**：哪些失败必须中止主路径，哪些只记诊断、稍后重试；不写时强档倾向于处处失败关闭。任务测试用 `--accept-also`，保留仓库默认验收。
 
 ## 经验建议
 

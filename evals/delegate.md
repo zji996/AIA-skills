@@ -1,5 +1,11 @@
 # delegate
 
+## 5.22 追加任务验收
+
+- 仓库默认 accept 是 fmt 与 clippy，任务还需相关测试：用 `--accept-also 'cargo test -p api'` 保留默认门禁；可重复，按参数顺序以 `&&` 追加，没有基础命令时独立运行。Append task tests while preserving configured acceptance gates.
+- 显式 `--accept` 替换非空且不同的默认命令：start 显示原默认与 `--accept-also` 提示；相同命令不提示，meta 与 summary 记录最终合成命令。
+- `--no-accept` 与 `--accept-also` 同用是用法错误（2）；reply 的追加跟在上一轮最终命令后，显式 `--accept` 则先替换继承命令。
+
 ## 5.21.1 长时间自主推进与经验分层
 
 - 主控持续推进一批已授权的任务：按需读 long-run.md，用忽略目录里的“进行中 / 待做 / 待确认”待办接续，每轮取最上面一项；写入一律 worktree，apply 后按任务提交。Use for an authorized long-running batch with a resumable backlog.

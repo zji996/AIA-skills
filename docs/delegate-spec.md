@@ -40,7 +40,7 @@
 |---|---|---|
 | `start` | 启动选项（§2.3）＋任务说明 | 创建 run 并启动 supervisor，立即输出一行状态（§3.1）；stderr 提示收取命令 |
 | `run` | 启动选项＋`--max`/`--progress`/`--full` | `start` 后等待，按 §3.2 输出 |
-| `reply <run> [消息]` | `--fresh` `--sync` `--minor` `--over-limit` `--accept` `--hide-accept` `--accept-timeout` `--timeout` `--image` `--name` `--prompt(-file)`；`--wait` 时可用等待选项 | 续接对话并立即返回启动状态；`--wait` 等结论（§7） |
+| `reply <run> [消息]` | `--fresh` `--sync` `--minor` `--over-limit` `--accept` `--accept-also` `--no-accept` `--hide-accept` `--accept-timeout` `--timeout` `--image` `--name` `--prompt(-file)`；`--wait` 时可用等待选项 | 续接对话并立即返回启动状态；`--wait` 等结论（§7） |
 | `wait [<run>...\|--all]` | `--max` `--no-result` `--full` `--progress` `--any` `--stream` | 等待并输出；无参数按派发会话收取（§9.5），`--all` 取本仓库所有运行中或结果未读取的 run；没有时以 0 退出。`--any` 与 `--stream` 见 §9.5 |
 | `status [<run>...]`（别名 `list`） | | 每个 run 一行状态；无参数列出全部 |
 | `result [<run>] [--path]` | | 输出完整答复（或其路径）；非运行中时标记已读取 |
@@ -69,6 +69,7 @@
 | `--in-place` | 否 | 仅与 `--read-only` 同用，与 `--worktree` 互斥 |
 | `--worktree` | 否 | 需要 git 仓库 |
 | `--accept <命令>` | `.delegate.json` 顶层 `accept`（仅写入） | shell 命令；显式参数覆盖默认 |
+| `--accept-also <命令>` | 无 | 可重复，按顺序以 `&&` 追加到显式 `--accept` 或配置默认；无基础命令时单独运行，reply 追加到继承命令；与 `--no-accept` 同用退出 2 |
 | `--no-accept` | 否 | 禁用仓库默认验收；reply 中取消继承的验收 |
 | `--hide-accept` | 否 | 不在说明中附验收命令 |
 | `--accept-timeout` | `10m` | 自取得 lane 名额起计 |

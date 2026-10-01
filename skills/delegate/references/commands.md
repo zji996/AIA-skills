@@ -24,4 +24,6 @@
 
 证据用于真实模型评测等慢且不确定的检查。验收通过后执行；未设验收时在正常答复后执行；验收失败或 protect 违规时跳过。在同事工作目录（隔离任务为其 worktree）通过 lane 排队，用验收相同的 env、原 PATH、独立进程组及 cgroup 回收，deny shim 不影响证据。拿到 lane 名额才开始计算 `--evidence-timeout`。
 
+`start`/`run`/`reply` 可重复使用 `--accept-also <命令>`，按顺序以 `&&` 追加到生效验收；无基础命令则独立运行，与 `--no-accept` 冲突退出 2。
+
 证据命令默认未设置。结果写入 meta 与 JSON 结论的可选 `evidence{exit,timedOut,seconds,tail,log}`：退出码、是否超时、执行秒数、日志末尾和完整日志位置。短行加“证据 通过/失败/超时”。任何证据失败只记诊断，永不改变任务 state、升档判断或命令退出码；它也不替代 `acceptStillValid` 的验收快照依据。

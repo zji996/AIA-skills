@@ -7,6 +7,7 @@
 用户配置 `${XDG_CONFIG_HOME}/delegate/config.json` 支持 `agentDeny`、`env`、`maxRework`、默认 `accept`/`evidence`、`maxActive`、`maxCodex`、`maxHeavy`、`repoMaxActive`、`repoMaxCodex`。仓库根 `.delegate.json` 使用相同字段并保存仓库事实。
 
 - 标量：仓库 > 用户 > 内置默认；容量的 `DELEGATE_MAX_ACTIVE` / `DELEGATE_MAX_CODEX` / `DELEGATE_MAX_HEAVY` / `DELEGATE_REPO_MAX_ACTIVE` / `DELEGATE_REPO_MAX_CODEX` 最高，仍兼容 `PI_DELEGATE_*`，`0` 不限。整机默认 12 / 6 / 2，每仓库默认 8 / 4。写入默认 `accept`/`evidence` 在仓库未提供字段时用用户值，对应 CLI 覆盖或关闭；只读不用两项默认。
+- 任务测试用可重复的 `--accept-also COMMAND`，按顺序以 `&&` 追加到生效的 `--accept` 或配置默认（无基础命令则单独运行）；与 `--no-accept` 冲突退出 2。`--accept` 替换非空且不同的默认命令时，start 提示原命令与追加用法；meta 的 `accept` 与 summary 的 `accept.command` 记录最终命令。
 - `env` 按键合并，仓库优先；`agentDeny` 按 `(argv, exact)` 去重，省略 `exact` 等于 `false`；仓库同键 hint 覆盖用户值，保留原顺序。仓库 `{"argv":["cargo","xtask","check"],"exact":true,"allow":true}` 撤销完全相同 argv 且 exact 相同的一条用户规则，无需 hint；不撤销不同 exact 或其他前缀规则，用户配置不能声明 `allow: true`。
 - `worktree`、`generated`、`applyVerify` 只认仓库：用户级出现时忽略，`start`（含 `run`）在 stderr 汇总提示一次。
 - 两份文件独立校验，覆盖不能隐藏错误；错误指出文件与字段，启动退出 2。JSON 语法错误指出文件与行列。meta、summary 与 `--json` 记 `configSources: ["user","repo"]`（启动时只有存在的配置文件，没有时 `[]`）。reply 沿用启动时的 env、deny、验收与证据，返工预算和容量按当前两级配置读取；来源包含继承配置与当前配置两部分。
