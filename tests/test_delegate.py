@@ -2084,6 +2084,15 @@ db.write_text(json.dumps(units))
         self.assertTrue((repo / "ran").exists())
         self.assertEqual((repo / "gen/out.txt").read_text(), "2\n")
 
+    def test_apply_removes_directories_left_empty_by_deletions(self):
+        repo = self.repo({"old/pkg/a.txt": "a\n", "old/keep.txt": "k\n", "src.txt": "1\n"})
+        self.fake_pi([answer("done"), SETTLED], pre="rm -r old/pkg")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        applied = self.cli("apply", state["run"])
+        self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+        self.assertFalse((repo / "old/pkg").exists())
+        self.assertTrue((repo / "old/keep.txt").exists())
+
     def test_apply_delete_failure_keeps_worktree_unapplied(self):
         repo = self.repo({"locked/old.txt": "old\n"})
         self.fake_pi([answer("done"), SETTLED], pre="rm locked/old.txt")

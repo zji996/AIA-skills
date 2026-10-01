@@ -149,6 +149,16 @@ fn rule_list(spec: &Value, key: &str, file: &Path) -> Res<Option<Vec<String>>> {
     }
     Ok(Some(rules))
 }
+/// After a merged deletion, drop directories it left empty, stopping at the repository root.
+fn remove_empty_parents(file: &Path, root: &Path) {
+    let mut dir = file.parent();
+    while let Some(d) = dir {
+        if d == root || !d.starts_with(root) || fs::remove_dir(d).is_err() {
+            break;
+        }
+        dir = d.parent();
+    }
+}
 pub fn matches_rule(path: &str, rules: &[String]) -> bool {
     rules.iter().any(|rule| {
         if rule.ends_with('/') {
@@ -1406,7 +1416,9 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
     for a in actions {
         if !dry {
             let operation = match a.kind.as_str() {
-                "deleted" => fs::remove_file(&a.target).map_err(|e| e.to_string()),
+                "deleted" => fs::remove_file(&a.target)
+                    .map_err(|e| e.to_string())
+                    .map(|()| remove_empty_parents(&a.target, &source)),
                 "copied" => {
                     fs::create_dir_all(a.target.parent().unwrap_or(&source))
                         .map_err(|e| format!("apply {}: {e}", a.target.display()))?;
