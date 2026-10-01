@@ -84,14 +84,44 @@ pub fn generated_config(cfg: &Value, file: &Path) -> Res<(Vec<String>, String)> 
     let Some(spec) = cfg.get("generated") else {
         return Ok((vec![], String::new()));
     };
-    let paths = spec["paths"]
+    let rules = rule_list(spec, "paths", file)?.unwrap_or_default();
+    rule_list(spec, "inputs", file)?;
+    let command = spec["command"]
+        .as_str()
+        .filter(|s| !s.contains('\0'))
+        .ok_or_else(|| {
+            format!(
+                "{}: generated.command must be a string without NUL",
+                file.display()
+            )
+        })?;
+    Ok((rules, command.to_string()))
+}
+/// Optional `generated.inputs`: when set, `apply` regenerates only if a merged path matches.
+pub fn generated_inputs(source: &Path) -> Res<Vec<String>> {
+    let file = source.join(".delegate.json");
+    let cfg = crate::config::read_file(&file)?.unwrap_or(json!({}));
+    match cfg.get("generated") {
+        Some(spec) => Ok(rule_list(spec, "inputs", &file)?.unwrap_or_default()),
+        None => Ok(vec![]),
+    }
+}
+fn rule_list(spec: &Value, key: &str, file: &Path) -> Res<Option<Vec<String>>> {
+    let Some(value) = spec.get(key) else {
+        return if key == "paths" {
+            Err(format!("{}: generated.paths must be a list", file.display()))
+        } else {
+            Ok(None)
+        };
+    };
+    let items = value
         .as_array()
-        .ok_or_else(|| format!("{}: generated.paths must be a list", file.display()))?;
+        .ok_or_else(|| format!("{}: generated.{key} must be a list", file.display()))?;
     let mut rules = vec![];
-    for item in paths {
+    for item in items {
         let path = item.as_str().ok_or_else(|| {
             format!(
-                "{}: generated.paths entries must be strings",
+                "{}: generated.{key} entries must be strings",
                 file.display()
             )
         })?;
@@ -103,7 +133,7 @@ pub fn generated_config(cfg: &Value, file: &Path) -> Res<(Vec<String>, String)> 
                 .any(|c| !matches!(c, std::path::Component::Normal(_)))
         {
             return Err(format!(
-                "{}: invalid generated.paths entry: {path}",
+                "{}: invalid generated.{key} entry: {path}",
                 file.display()
             ));
         }
@@ -117,16 +147,7 @@ pub fn generated_config(cfg: &Value, file: &Path) -> Res<(Vec<String>, String)> 
         }
         rules.push(normalized);
     }
-    let command = spec["command"]
-        .as_str()
-        .filter(|s| !s.contains('\0'))
-        .ok_or_else(|| {
-            format!(
-                "{}: generated.command must be a string without NUL",
-                file.display()
-            )
-        })?;
-    Ok((rules, command.to_string()))
+    Ok(Some(rules))
 }
 pub fn matches_rule(path: &str, rules: &[String]) -> bool {
     rules.iter().any(|rule| {
@@ -1367,9 +1388,18 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
     if marked && !dry {
         conclusion["apply"]["conflictMarkers"] = json!(marked_paths);
     }
-    let regenerate = (!actions.is_empty() || pending_generation)
+    let generated_inputs = generated_inputs(&source)?;
+    let touches_inputs = generated_inputs.is_empty()
+        || actions
+            .iter()
+            .any(|a| matches_rule(&a.path, &generated_inputs));
+    let regenerate = ((!actions.is_empty() && touches_inputs) || pending_generation)
         && !generated_paths.is_empty()
         && !generate_command.is_empty();
+    let skipped_generation = !actions.is_empty()
+        && !touches_inputs
+        && !pending_generation
+        && !generated_paths.is_empty();
     if regenerate && !dry {
         write(run.join(".generate-pending"), "pending\n")?;
     }
@@ -1400,6 +1430,9 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
             "skipped",
             worktree.display()
         );
+    }
+    if skipped_generation {
+        println!(" {:<16} no merged path under generated.inputs", "not regenerated");
     }
     if dry {
         eprintln!("delegate: dry run; nothing written");

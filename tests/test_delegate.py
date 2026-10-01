@@ -2065,6 +2065,25 @@ db.write_text(json.dumps(units))
         self.assertEqual((repo / "gen/out.txt").read_text(), "one\n2\nthree\n")  # regenerated from the merge
         self.assertIn("regenerated", applied.stdout + applied.stderr)
 
+    def test_generated_inputs_skip_regeneration_for_unrelated_changes(self):
+        repo = self.repo({"src.txt": "1\n", "docs/a.md": "a\n", "gen/out.txt": "1\n"})
+        (repo / ".delegate.json").write_text(json.dumps({"generated": {
+            "paths": ["gen/"], "inputs": ["src.txt"], "command": "cp src.txt gen/out.txt; touch ran"}}))
+        self.fake_pi([answer("done"), SETTLED], pre="echo b > docs/a.md")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        applied = self.cli("apply", state["run"])
+        self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+        self.assertEqual((repo / "docs/a.md").read_text(), "b\n")
+        self.assertFalse((repo / "ran").exists())
+        self.assertIn("not regenerated", applied.stdout)
+        self.assertFalse((Path(state["dir"]) / ".generate-pending").exists())
+        self.fake_pi([answer("done"), SETTLED], pre="echo 2 > src.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        applied = self.cli("apply", state["run"])
+        self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+        self.assertTrue((repo / "ran").exists())
+        self.assertEqual((repo / "gen/out.txt").read_text(), "2\n")
+
     def test_apply_delete_failure_keeps_worktree_unapplied(self):
         repo = self.repo({"locked/old.txt": "old\n"})
         self.fake_pi([answer("done"), SETTLED], pre="rm locked/old.txt")

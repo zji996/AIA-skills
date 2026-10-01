@@ -255,7 +255,7 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 
 删除、复制、写入或重新生成期间任何文件操作失败，`apply` 在 stderr 报告文件路径和原因，以非 0 退出，不写新的 `.applied` 或 `.sync-base`。此前已成功写入的文件保留，worktree 保留；下一次 `apply` 仍从最近一次完整成功的基准重试。冲突且未指定 `--merge` 时保持上述预检语义，源工作区不写入。
 
-**生成文件**：`.delegate.json` 的 `"generated": {"paths": [...], "command": "..."}` 声明的路径（语义同 `--protect`）不做三方合并、也不覆盖；改动清单与 diff 仍如实列出。合并写入了文件后，通过 lane 在源仓库根以 `sh -c` 运行 `command` 重新生成，输出写入 run 目录的 `generate.log`；命令使用 §9.1 的限时执行和进程组回收机制，超时由 `DELEGATE_GENERATE_TIMEOUT` 控制（默认 10m）。`--dry-run` 只报告将会重新生成；命令失败或超时时退出码 1、显示日志末尾，已合并的文件保留，lane 名额释放。完全成功时对话内所有 run 及共用该 worktree 的旁支 run 写 `.applied`。只读 run 与原地 run 拒绝 `apply`（退出码 2）。
+**生成文件**：`.delegate.json` 的 `"generated": {"paths": [...], "command": "..."}` 声明的路径（语义同 `--protect`）不做三方合并、也不覆盖；改动清单与 diff 仍如实列出。合并写入了文件后（若设了可选的 `inputs` 规则列表，只有合并路径命中它时；否则输出 `not regenerated` 一行并跳过），通过 lane 在源仓库根以 `sh -c` 运行 `command` 重新生成，输出写入 run 目录的 `generate.log`；命令使用 §9.1 的限时执行和进程组回收机制，超时由 `DELEGATE_GENERATE_TIMEOUT` 控制（默认 10m）。`--dry-run` 只报告将会重新生成；命令失败或超时时退出码 1、显示日志末尾，已合并的文件保留，lane 名额释放。完全成功时对话内所有 run 及共用该 worktree 的旁支 run 写 `.applied`。只读 run 与原地 run 拒绝 `apply`（退出码 2）。
 
 5.12 起，入口、排队回调、执行开始与结果写 stderr 并 flush：检查合并、生成器排队人数及前序名称、正在生成（日志绝对路径、执行超时，排队不计入）、完成/失败。慢 apply 可以后台执行。写普通文件前记录 `.generate-pending`，只有生成成功才清除；同 worktree 的后续 apply/reply 即使零文件动作也重试生成，失败不推进基准。待生成而配置被删除时拒绝假成功。
 

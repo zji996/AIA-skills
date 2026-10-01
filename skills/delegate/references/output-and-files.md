@@ -108,7 +108,7 @@ in-place 只使用环境标记；没有标记的 unit 保留，并在 `cleanup.d
 - `writeSetup`：同 `setup`，只在写入任务里、`setup` 之后执行；只读任务跳过。
 - 这三类路径不计入改动。子模块在新 worktree 里是空目录：只读使用时写进 `link`（会替换空目录），需要独立修改时在 `setup` 里初始化。
 - 顶层 `accept` 是写入任务的默认验收命令；`--accept` 覆盖，`--no-accept` 关闭，只读任务不使用。
-- `generated.paths` 的匹配语义同 `--protect`；改动清单与 diff 仍列出这些文件，`apply` 跳过其合并，在合并其他文件后由 lane 在源仓库根执行 `sh -c` 的 `command`，日志写入 `generate.log`；`--dry-run` 只报告动作。生成命令失败时退出 1，已合并文件保留（§6.4）。
+- `generated.paths` 的匹配语义同 `--protect`；改动清单与 diff 仍列出这些文件，`apply` 跳过其合并，在合并其他文件后由 lane 在源仓库根执行 `sh -c` 的 `command`，日志写入 `generate.log`；可选 `inputs`（同样的匹配语义）限定只有合并路径命中时才生成，省掉纯文档改动的排队；`--dry-run` 只报告动作。生成命令失败时退出 1，已合并文件保留（§6.4）。
 - `--protect`/`--protect-reason` 与生成路径重叠时，启动 stderr 提示生成命令例外并附在同事的任务说明里；该命令与路径保存到 meta，reply/fresh 沿用。收尾在 lane 中于 worktree 根复跑，比较生成路径的内容、权限和符号链接（含忽略文件）；一致则允许，漂移报 `protectViolation` 与“生成物被手改”，生成失败判 rejected，日志在 `protect-generate.log`。
 - 验收证据将托管 copy/link 路径明确排除，`accept.excluded` 与 apply 结论的 `excluded` 列出仓库相对路径；这些路径上的 skip-worktree 不算缺口。未托管 gitlink 的目录缺失或为空、且指针等于 HEAD 时，其未初始化内容也列为范围外，但指针仍保留在证据树中。源子模块初始化后重新核验：干净且同指针可复用，脏内容、索引标记、非空未初始化目录、变更的未初始化指针或读取失败仍判证据不完整。
 
