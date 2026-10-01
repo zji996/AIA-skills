@@ -372,7 +372,10 @@ fn collect_timed(
             changes::print_shape(run);
         }
         let summary = json(run.join("summary.json"));
-        if let Some(cleanup) = summary.get("cleanup") {
+        if let Some(cleanup) = summary
+            .get("cleanup")
+            .filter(|c| c["terminated"].as_u64().unwrap_or(0) > 0)
+        {
             let ports = cleanup["ports"]
                 .as_array()
                 .map(|v| {
@@ -390,6 +393,14 @@ fn collect_timed(
                 } else {
                     format!("（端口 {ports}）")
                 }
+            );
+        }
+        if let Some(count) = summary["cleanup"]["systemdStopped"]
+            .as_u64()
+            .filter(|n| *n > 0)
+        {
+            println!(
+                "note: 任务结束时停止了 {count} 个 systemd 服务；答复中提到的服务/地址已不可用"
             );
         }
         if let Some(warnings) = summary["warnings"].as_array() {
@@ -699,8 +710,13 @@ fn clean(args: &[String]) -> Res<i32> {
         } else {
             ""
         };
-        runs::remove(&run);
-        println!("removed {name} ({st}{note})");
+        let units = runs::remove(&run);
+        let cleanup_note = if units > 0 {
+            format!("；停止了 {units} 个 systemd 服务")
+        } else {
+            String::new()
+        };
+        println!("removed {name} ({st}{note}{cleanup_note})");
     }
     Ok(0)
 }

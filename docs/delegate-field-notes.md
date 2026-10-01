@@ -242,6 +242,14 @@
 
 **结论**：模型评测结果是采纳改动的证据，确定的验收命令决定交付状态。并发控制同时表达机器资源与每个项目的审查容量，手动合入也应以源工作树的实际内容更新账本。
 
+## 二十二、任务结束后遗留 user systemd 服务（2026-10-01）
+
+一台机器上发现 4 个来自已结束任务 worktree 的 `aiaxiom-local-dev-*.service` 仍在运行，最早已运行两天，占用端口并持有文件锁。同事运行项目的开发/委派脚本后，脚本经 `systemd-run --user --unit=...` 把进程交给用户 manager；服务脱离同事的进程组与 delegate 自建 scope，5.6.0 的 cgroup/进程组/进程环境标记回收无法覆盖。
+
+5.19.0 在既有回收阶段补查 user service/scope，按完整 `DELEGATE_RUN_DIR` 环境标记或隔离 worktree 内的 WorkingDirectory/ExecStart 路径确认归属。路径比较检查组件与符号链接；不按服务名前缀停止，保留主控在源仓库启动的同名服务。in-place 只能依赖标记，项目脚本应显式 `--setenv=DELEGATE_RUN_DIR="$DELEGATE_RUN_DIR"` 传给用户 manager；没有标记就保留并写诊断。
+
+正常结束、setup/验收回收，以及 `clean`/过期删除前都检查；先 stop，超时发 SIGKILL。查询和停止均限时；缺命令、无 bus、停止失败仅写 `cleanup.diagnostics`，不改交付状态。用 PATH 前置假的 systemctl 覆盖路径、转义、标记、无关服务、停止超时、失败跳过及历史清理，不依赖测试机的真实用户实例。
+
 ## 待改进（按收益排序）
 
 1. ~~`apply` 默认忽略"仅初始化"的子模块变化~~（5.1.0 已完成）

@@ -391,9 +391,10 @@ pub fn unmerged(run: &Path) -> bool {
         && Path::new(s(&m["worktree"], "path")).exists()
         && (!run.join(".applied").exists() || run.join(".generate-pending").exists())
 }
-pub fn remove(run: &Path) {
+pub fn remove(run: &Path) -> usize {
     let meta = json(run.join("meta.json"));
     let path = s(&meta["worktree"], "path").to_string();
+    let stopped = crate::cleanup::record(run, 0);
     let _ = fs::remove_dir_all(run);
     if !path.is_empty()
         && !all_runs()
@@ -402,6 +403,7 @@ pub fn remove(run: &Path) {
     {
         worktree::remove(&meta);
     }
+    stopped
 }
 pub fn prune() {
     let Ok(days) = setting("KEEP_DAYS", "7").parse::<u64>() else {

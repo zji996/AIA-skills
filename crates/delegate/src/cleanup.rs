@@ -1,7 +1,8 @@
-use crate::common::{append, json, lock, read, setting, write_json};
+use crate::common::{append, json, lock, read, s, setting, write_json};
 use serde_json::{json as value, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -9,6 +10,318 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 static SYSTEMD: OnceLock<bool> = OnceLock::new();
+
+// Bound every bus request, including discovery: a wedged user manager must not hold up delivery.
+fn systemctl(args: &[&str]) -> Result<String, String> {
+    let mut command = Command::new("systemctl");
+    command
+        .args(["--user", "--no-pager", "--no-ask-password"])
+        .args(args)
+        .env("LC_ALL", "C")
+        .env("SYSTEMD_COLORS", "0")
+        .env("SYSTEMD_URLIFY", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    crate::common::group(&mut command);
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut data = String::new();
+        let _ = stdout.read_to_string(&mut data);
+        data
+    });
+    let start = Instant::now();
+    let result = loop {
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if rc == 0 && unsafe { info.si_pid() } != 0 {
+            break Ok(());
+        }
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                break Err(error.to_string());
+            }
+        }
+        if start.elapsed() >= Duration::from_secs(3) {
+            break Err("timed out".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // Keep the child unreaped until signalling its group, preventing PGID reuse.
+    crate::common::killpg(child.id() as i32, libc::SIGKILL);
+    let status = child.wait().map_err(|e| e.to_string());
+    let data = reader.join().unwrap_or_default();
+    result?;
+    let status = status?;
+    if status.success() {
+        Ok(data)
+    } else {
+        Err(format!("exit {status}"))
+    }
+}
+
+// systemctl show uses C-escaped, optionally quoted words for Environment and ExecStart argv.
+fn tokens(input: &str) -> Option<Vec<(String, bool)>> {
+    let mut words = Vec::new();
+    let mut word = Vec::new();
+    let mut quote = None;
+    let mut literal = false;
+    let mut chars = input.bytes().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            b'\\' => {
+                literal = true;
+                let escaped = match chars.next()? {
+                    b'x' => {
+                        let a = (chars.next()? as char).to_digit(16)?;
+                        let b = (chars.next()? as char).to_digit(16)?;
+                        (a * 16 + b) as u8
+                    }
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b's' => b' ',
+                    b'\\' => b'\\',
+                    b'\'' => b'\'',
+                    b'"' => b'"',
+                    _ => return None,
+                };
+                word.push(escaped);
+            }
+            b'\'' | b'"' if quote == Some(ch) => quote = None,
+            b'\'' | b'"' if quote.is_none() => {
+                quote = Some(ch);
+                literal = true;
+            }
+            ch if ch.is_ascii_whitespace() && quote.is_none() => {
+                if !word.is_empty() {
+                    words.push((String::from_utf8(std::mem::take(&mut word)).ok()?, literal));
+                }
+                literal = false;
+            }
+            _ => word.push(ch),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !word.is_empty() {
+        words.push((String::from_utf8(word).ok()?, literal));
+    }
+    Some(words)
+}
+
+fn words(input: &str) -> Option<Vec<String>> {
+    Some(tokens(input)?.into_iter().map(|(word, _)| word).collect())
+}
+
+fn below(path: &str, root: &Path) -> bool {
+    let path = Path::new(path);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+        || !path.starts_with(root)
+    {
+        return false;
+    }
+    // Resolve the nearest existing ancestor too, so missing scripts cannot hide a source link.
+    let mut ancestor = path;
+    while !ancestor.exists() && !ancestor.is_symlink() {
+        let Some(parent) = ancestor.parent() else {
+            return false;
+        };
+        ancestor = parent;
+    }
+    ancestor
+        .canonicalize()
+        .is_ok_and(|path| path.starts_with(root))
+}
+
+fn unit_match(
+    properties: &BTreeMap<&str, &str>,
+    run: &Path,
+    root: Option<&Path>,
+) -> Option<&'static str> {
+    let marker = format!("DELEGATE_RUN_DIR={}", run.display());
+    if words(properties.get("Environment").copied().unwrap_or(""))
+        .is_some_and(|env| env.iter().any(|item| item == &marker))
+    {
+        return Some("environment");
+    }
+    let root = root?;
+    let directory = properties.get("WorkingDirectory").copied().unwrap_or("");
+    // WorkingDirectory is a single property, and may contain literal spaces.
+    if below(directory, root) {
+        return Some("working-directory");
+    }
+    if words(directory).is_some_and(|items| items.len() == 1 && below(&items[0], root)) {
+        return Some("working-directory");
+    }
+    let exec = properties.get("ExecStart").copied().unwrap_or("");
+    let mut field_start = true;
+    let mut argv = false;
+    for (item, literal) in tokens(exec).unwrap_or_default() {
+        if !literal && matches!(item.as_str(), "{" | "}" | ";") {
+            field_start = true;
+            argv = false;
+            continue;
+        }
+        let path = if field_start {
+            field_start = false;
+            argv = item.starts_with("argv[]=");
+            item.strip_prefix("path=")
+                .or_else(|| item.strip_prefix("argv[]="))
+        } else if argv {
+            Some(item.as_str())
+        } else {
+            None
+        };
+        if path.is_some_and(|path| below(path, root)) {
+            return Some("exec-start");
+        }
+    }
+    None
+}
+
+fn stop_unit(unit: &str) -> Result<bool, String> {
+    let stop = systemctl(&["stop", "--no-block", "--", unit]);
+    let mut killed = false;
+    if stop.as_ref().is_err_and(|e| e == "timed out") {
+        systemctl(&["kill", "--signal=SIGKILL", "--", unit])?;
+        killed = true;
+    } else {
+        stop?;
+    }
+    let mut start = Instant::now();
+    loop {
+        let state = systemctl(&["show", "-p", "ActiveState", "--value", "--", unit])?;
+        if matches!(state.trim(), "inactive" | "failed" | "") {
+            return Ok(killed);
+        }
+        if start.elapsed() >= Duration::from_secs(3) {
+            if killed {
+                return Err("still active after SIGKILL".into());
+            }
+            systemctl(&["kill", "--signal=SIGKILL", "--", unit])?;
+            killed = true;
+            start = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn user_units(run: &Path, saved: &mut Value) -> usize {
+    let mut stopped = 0;
+    let mut diagnostics = BTreeSet::new();
+    if let Some(items) = saved["diagnostics"].as_array() {
+        diagnostics.extend(items.iter().filter_map(Value::as_str).map(str::to_string));
+    }
+    let mut collect = || -> Result<(), String> {
+        let listed = systemctl(&[
+            "list-units",
+            "--type=service,scope",
+            "--all",
+            "--plain",
+            "--no-legend",
+        ])?;
+        let meta = json(run.join("meta.json"));
+        let root = Path::new(s(&meta["worktree"], "path"));
+        let root = if root.is_absolute()
+            && root != Path::new(s(&meta["worktree"], "source"))
+            && !crate::runs::all_runs().iter().any(|other| {
+                other != run
+                    && crate::runs::active(&crate::runs::state(other))
+                    && s(&json(other.join("meta.json"))["worktree"], "path")
+                        == root.to_string_lossy()
+            }) {
+            root.canonicalize().ok()
+        } else {
+            None
+        };
+        if root.is_none() {
+            diagnostics.insert("systemd: path matching disabled (in-place, missing or shared active worktree); units without DELEGATE_RUN_DIR are skipped".to_string());
+        }
+        let owned: BTreeSet<_> = read(run.join("scopes"))
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let units: BTreeSet<_> = listed
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        for unit in units {
+            if owned.contains(unit)
+                || !(unit.ends_with(".service") || unit.ends_with(".scope"))
+                || unit.starts_with('-')
+                || !unit
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.@:\\".contains(&b))
+            {
+                continue;
+            }
+            let data = match systemctl(&[
+                "show",
+                "-p",
+                "WorkingDirectory",
+                "-p",
+                "ExecStart",
+                "-p",
+                "Environment",
+                "-p",
+                "ActiveState",
+                "--",
+                unit,
+            ]) {
+                Ok(data) => data,
+                Err(e) => {
+                    diagnostics.insert(format!("systemd: show {unit}: {e}"));
+                    continue;
+                }
+            };
+            let properties: BTreeMap<_, _> = data
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .collect();
+            if matches!(
+                properties.get("ActiveState").copied(),
+                Some("inactive" | "failed")
+            ) {
+                continue;
+            }
+            let Some(reason) = unit_match(&properties, run, root.as_deref()) else {
+                continue;
+            };
+            match stop_unit(unit) {
+                Ok(killed) => {
+                    stopped += 1;
+                    if !saved["units"].is_object() {
+                        saved["units"] = value!({});
+                    }
+                    saved["units"][unit] = value!({"matchedBy":reason,"killed":killed});
+                }
+                Err(e) => {
+                    diagnostics.insert(format!("systemd: stop {unit}: {e}"));
+                }
+            }
+        }
+        Ok(())
+    };
+    if let Err(e) = collect() {
+        diagnostics.insert(format!("systemd: user unit discovery skipped: {e}"));
+    }
+    saved["diagnostics"] = value!(diagnostics);
+    stopped
+}
 
 pub fn probe_systemd() {
     SYSTEMD.get_or_init(|| {
@@ -247,9 +560,9 @@ fn members(
     found
 }
 
-pub fn record(run: &Path, pgid: i32) {
+pub fn record(run: &Path, pgid: i32) -> usize {
     let Ok(_guard) = lock(&run.join("cleanup.lock"), true, false) else {
-        return;
+        return 0;
     };
     let scopes = scopes(run);
     let scope_pids = scopes
@@ -263,13 +576,13 @@ pub fn record(run: &Path, pgid: i32) {
             kill_scope(unit, root, pids);
         }
     }
-    if found.is_empty() {
-        return;
-    }
     let file = run.join("cleanup.json");
     let mut previous = json(&file);
     if !previous.is_object() {
         previous = value!({"processes":{}});
+    }
+    if !previous["processes"].is_object() {
+        previous["processes"] = value!({});
     }
     for (pid, command, ports, escaped) in &found {
         previous["processes"][pid.to_string()] = value!({"command":command,"ports":ports});
@@ -294,15 +607,14 @@ pub fn record(run: &Path, pgid: i32) {
             }
         }
     }
+    let stopped = user_units(run, &mut previous);
     let _ = write_json(file, &previous);
+    stopped
 }
 
 pub fn summary(run: &Path) -> Option<Value> {
     let saved = json(run.join("cleanup.json"));
     let processes = saved["processes"].as_object()?;
-    if processes.is_empty() {
-        return None;
-    }
     let mut ports = BTreeSet::new();
     let mut commands = Vec::new();
     for (pid, item) in processes {
@@ -311,5 +623,12 @@ pub fn summary(run: &Path) -> Option<Value> {
             ports.extend(items.iter().filter_map(Value::as_u64));
         }
     }
-    Some(value!({"terminated":processes.len(),"ports":ports,"commands":commands}))
+    let units = saved["units"]
+        .as_object()
+        .map(|items| items.len())
+        .unwrap_or(0);
+    Some(
+        value!({"terminated":processes.len(),"ports":ports,"commands":commands,
+        "systemdStopped":units,"units":saved["units"],"diagnostics":saved["diagnostics"]}),
+    )
 }

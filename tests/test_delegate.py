@@ -621,6 +621,179 @@ class DelegateTests(unittest.TestCase):
                       json.loads((Path(state["dir"]) / "cleanup.json").read_text())["processes"])
         self.assertTrue(process_gone(self.work / "opt-out-server.pid"))
 
+    def fake_systemctl(self):
+        self.env.update(DELEGATE_CGROUP="0", TEST_SYSTEMD_DB=str(self.work / "units.json"),
+                        TEST_SYSTEMD_LOG=str(self.work / "systemctl.jsonl"))
+        (self.work / "units.json").write_text("{}")
+        script = self.bin / "systemctl"
+        script.write_text(f"#!{sys.executable}\n" + '''import json, os, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+assert args[0] == "--user", args
+with open(os.environ["TEST_SYSTEMD_LOG"], "a") as log:
+    log.write(json.dumps(args) + "\\n")
+if os.environ.get("TEST_SYSTEMD_NO_BUS"):
+    print("Failed to connect to bus", file=sys.stderr)
+    sys.exit(1)
+db = Path(os.environ["TEST_SYSTEMD_DB"])
+units = json.loads(db.read_text())
+if "list-units" in args:
+    for unit, props in units.items():
+        print(unit, "loaded", props.get("ActiveState", "active"), "running", "test unit")
+    sys.exit(0)
+unit = args[-1]
+props = units.get(unit, {"ActiveState": "inactive"})
+if "show" in args:
+    keys = [args[i + 1] for i, arg in enumerate(args) if arg == "-p"]
+    for key in keys:
+        print(props.get(key, "") if "--value" in args else key + "=" + props.get(key, ""))
+elif "stop" in args:
+    # Prove clean invokes stop before deleting the worktree or run marker.
+    assert Path(props["existingPath"]).exists(), props
+    if props.get("stopFail"):
+        sys.exit(1)
+    if props.get("hang"):
+        time.sleep(30)
+    if not props.get("stubborn"):
+        props["ActiveState"] = "inactive"
+    db.write_text(json.dumps(units))
+elif "kill" in args:
+    assert "--signal=SIGKILL" in args
+    props["ActiveState"] = "inactive"
+    db.write_text(json.dumps(units))
+else:
+    sys.exit(1)
+''')
+        script.chmod(0o755)
+        register = self.bin / "register-unit"
+        register.write_text(f"#!{sys.executable}\n" + '''import json, os, sys
+from pathlib import Path
+unit, mode = sys.argv[1:]
+cwd, marker = os.getcwd(), os.environ["DELEGATE_RUN_DIR"]
+props = {"ActiveState": "active", "existingPath": cwd}
+if mode in ("cwd", "stubborn", "hang", "fail"):
+    props["WorkingDirectory"] = cwd
+elif mode == "exec":
+    props["ExecStart"] = "{ path=/usr/bin/sh ; argv[]=/usr/bin/sh " + json.dumps(cwd + "/script.sh") + " ; ignore_errors=no ; }"
+elif mode == "escaped-exec":
+    props["ExecStart"] = "{ path=" + (cwd + "/script.sh").replace(" ", r"\\x20") + " ; argv[]=script ; ignore_errors=no ; }"
+elif mode == "source":
+    props["WorkingDirectory"] = os.environ["TEST_SYSTEMD_SOURCE"]
+elif mode == "quoted-command":
+    props["ExecStart"] = "{ path=/usr/bin/sh ; argv[]=/usr/bin/sh -c " + json.dumps("echo ; path=" + cwd + "/script.sh ; echo") + " ; ignore_errors=no ; }"
+elif mode == "quoted-fields":
+    props["ExecStart"] = '{ path=/usr/bin/printf ; argv[]=/usr/bin/printf "%s" ";" ' + json.dumps("path=" + cwd + "/script.sh") + " ; ignore_errors=no ; }"
+elif mode == "near":
+    props["WorkingDirectory"] = cwd + "-other"
+elif mode == "parent":
+    props["WorkingDirectory"] = cwd + "/../source"
+elif mode == "symlink":
+    (Path(cwd) / "source-link").symlink_to(os.environ["TEST_SYSTEMD_SOURCE"])
+    props["ExecStart"] = "{ path=" + cwd + "/source-link/script.sh ; argv[]=script ; }"
+elif mode in ("marker", "wrong-marker"):
+    props["Environment"] = 'OTHER="contains DELEGATE_RUN_DIR=' + marker + '" ' + json.dumps("DELEGATE_RUN_DIR=" + marker + ("-other" if mode == "wrong-marker" else ""))
+    props["existingPath"] = marker
+props.update(stubborn=mode == "stubborn", hang=mode == "hang", stopFail=mode == "fail")
+db = Path(os.environ["TEST_SYSTEMD_DB"])
+units = json.loads(db.read_text())
+units[unit] = props
+db.write_text(json.dumps(units))
+''')
+        register.chmod(0o755)
+
+    def stopped_units(self):
+        log = self.work / "systemctl.jsonl"
+        return [args[-1] for args in map(json.loads, log.read_text().splitlines()) if "stop" in args]
+
+    def test_user_units_match_worktree_paths_and_preserve_unrelated_units(self):
+        self.fake_systemctl()
+        self.env["XDG_CACHE_HOME"] = str(self.work / "cache with spaces")
+        repo = self.repo({"a.txt": "a\n"})
+        self.env["TEST_SYSTEMD_SOURCE"] = str(repo)
+        modes = ("cwd", "exec", "escaped-exec", "source", "near", "parent", "symlink", "wrong-marker", "quoted-command", "quoted-fields")
+        self.fake_pi([answer("done"), SETTLED], pre="\n".join(
+            f"register-unit local-dev-{mode}.service {mode}" for mode in modes)
+            + "\nregister-unit matching.timer cwd\nregister-unit task.scope marker")
+        result = self.cli("run", "--worktree", "--workdir", repo, "task")
+        state = self.outcome(result)
+        self.assertEqual((result.returncode, state["state"]), (0, "answered"), result.stderr)
+        expected = {"local-dev-cwd.service", "local-dev-exec.service", "local-dev-escaped-exec.service", "task.scope"}
+        self.assertEqual(set(self.stopped_units()), expected)
+        self.assertEqual(state["cleanup"]["systemdStopped"], len(expected))
+        self.assertEqual(state["cleanup"]["units"]["local-dev-exec.service"]["matchedBy"], "exec-start")
+        self.assertIn("任务结束时停止了 4 个 systemd 服务", result.stdout)
+
+    def test_user_units_in_place_require_exact_marker(self):
+        self.fake_systemctl()
+        self.env["DELEGATE_RUNS"] = str(self.work / "runs with spaces")
+        self.fake_pi([answer("done"), SETTLED], pre="register-unit tagged.service marker\n"
+                     "register-unit untagged.service cwd\nregister-unit other.service wrong-marker")
+        state = self.outcome(self.cli("run", "task"))
+        self.assertEqual(self.stopped_units(), ["tagged.service"])
+        self.assertTrue(any("without DELEGATE_RUN_DIR" in d for d in state["cleanup"]["diagnostics"]))
+
+    def test_user_units_setup_and_accept_are_reclaimed_at_each_stage(self):
+        self.fake_systemctl()
+        repo = self.repo({"a.txt": "a\n"})
+        (repo / ".delegate.json").write_text(json.dumps({"worktree": {"setup": [
+            "register-unit setup.service cwd"]}}))
+        self.fake_pi([answer("done"), SETTLED], pre="register-unit agent.service cwd")
+        result = self.cli("run", "--worktree", "--workdir", repo,
+                          "--accept", "register-unit acceptance.service cwd", "task")
+        state = self.outcome(result)
+        self.assertEqual((result.returncode, state["state"]), (0, "delivered"))
+        self.assertEqual(self.stopped_units()[0], "setup.service")
+        self.assertEqual(set(self.stopped_units()), {"setup.service", "agent.service", "acceptance.service"})
+        self.assertEqual(state["cleanup"]["systemdStopped"], 3)
+
+    def test_user_units_stop_timeout_kills_and_failures_are_only_diagnostic(self):
+        self.fake_systemctl()
+        repo = self.repo({"a.txt": "a\n"})
+        self.fake_pi([answer("done"), SETTLED], pre="register-unit stubborn.service stubborn\n"
+                     "register-unit hanging.service hang\nregister-unit failure.service fail")
+        result = self.cli("run", "--worktree", "--workdir", repo, "task")
+        state = self.outcome(result)
+        self.assertEqual((result.returncode, state["state"]), (0, "answered"))
+        self.assertEqual(state["cleanup"]["systemdStopped"], 2)
+        self.assertTrue(all(unit["killed"] for unit in state["cleanup"]["units"].values()))
+        self.assertTrue(any("stop failure.service" in d for d in state["cleanup"]["diagnostics"]))
+
+    def test_user_units_missing_systemctl_or_bus_skip_without_changing_outcome(self):
+        self.fake_systemctl()
+        self.fake_pi([answer("done"), SETTLED])
+        self.env["TEST_SYSTEMD_NO_BUS"] = "1"
+        result = self.cli("run", "task")
+        state = self.outcome(result)
+        self.assertEqual((result.returncode, state["state"]), (0, "answered"))
+        self.assertIn("discovery skipped", " ".join(state["cleanup"]["diagnostics"]))
+        self.assertNotIn("Failed to connect", result.stdout + result.stderr)
+        (self.bin / "systemctl").unlink()
+        # Limit PATH so a host-installed systemctl cannot satisfy the missing-command case.
+        for command in ("cat", "wc", "mkdir", "touch", "sleep", "sh", "git"):
+            (self.bin / command).symlink_to(shutil.which(command))
+        self.env["PATH"] = str(self.bin)
+        result = self.cli("run", "task")
+        state = self.outcome(result)
+        self.assertEqual((result.returncode, state["state"]), (0, "answered"), result.stderr)
+        self.assertIn("No such file", " ".join(state["cleanup"]["diagnostics"]))
+
+    def test_clean_reclaims_historical_user_units_before_removing_worktree(self):
+        self.fake_systemctl()
+        repo = self.repo({"a.txt": "a\n"})
+        self.env["TEST_SYSTEMD_SOURCE"] = str(repo)
+        self.fake_pi([answer("done"), SETTLED])
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        db = self.work / "units.json"
+        db.write_text(json.dumps({"leftover.service": {"WorkingDirectory": state["worktree"],
+            "ActiveState": "active", "existingPath": state["worktree"]}, "source.service": {
+            "WorkingDirectory": str(repo), "ActiveState": "active", "existingPath": str(repo)}}))
+        result = self.cli("clean", state["run"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.stopped_units(), ["leftover.service"])
+        self.assertIn("停止了 1 个 systemd 服务", result.stdout)
+        self.assertFalse(Path(state["worktree"]).exists())
+        self.assertFalse(Path(state["dir"]).exists())
+
     def test_empty_copy_and_uninitialized_gitlink_report_warnings(self):
         repo = self.repo({"a.txt": "a\n"})
         (repo / "empty").mkdir()
@@ -1275,6 +1448,7 @@ class DelegateTests(unittest.TestCase):
         self.fake_pi([answer("ok"), SETTLED])
         self.env["DELEGATE_CALLER"] = "old"
         old = self.outcome(self.cli("start", "--read-only", "--name", "older", "task"))
+        self.until(lambda: (Path(old["dir"]) / "exit_code").exists(), "older run to finish")
         meta_path = Path(old["dir"]) / "meta.json"
         meta = json.loads(meta_path.read_text())
         meta["startedEpoch"] = int(time.time()) - 2 * 86400

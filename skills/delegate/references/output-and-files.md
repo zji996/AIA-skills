@@ -36,6 +36,19 @@
 
 排队时间不计时：验收的 `--accept-timeout` 与 `setup` 的超时从拿到名额开始算；同事自己用 `lane` 排队的时间记在 run 目录的 `lane-wait`，从它的 `--timeout` 中扣除。同事、每条 setup 与验收命令在独立进程组中运行；用户 systemd 可用时各自再进入独立 scope，结束或超时时按 cgroup 回收其派生进程（包括 `env -i`、`setsid` 后的进程）。无用户实例时自动沿用进程组与环境标记清理；`DELEGATE_CGROUP=0` 或 `PI_DELEGATE_CGROUP=0` 强制关闭 scope。supervisor 与主控的 `wait`、排队中的其他任务不进入这些 scope。
 
+### 后台服务回收
+
+5.19.0 起，以上回收阶段还检查项目脚本通过 `systemd-run --user` 启动、脱离任务进程组和 scope 的 service/scope；`clean` 和过期清理在删除 run/worktree 前也检查历史遗留。只查询用户实例，不按 unit 名前缀归属任务。以下任一条件足够：
+
+- `Environment` 包含完整且相等的 `DELEGATE_RUN_DIR=<本轮 run 目录>`；复用进程回收的标记，支持 systemctl 的引号与 C 转义。项目脚本需用 `systemd-run --user --setenv=DELEGATE_RUN_DIR="$DELEGATE_RUN_DIR" ...` 显式传入；用户 manager 不会自动继承调用者环境。
+- 隔离 worktree 中，`WorkingDirectory` 或 `ExecStart` 的可执行文件/argv 绝对路径落在本任务 worktree 内；按路径组件判断，拒绝 `..` 和指向树外的符号链接，不解析 `sh -c` 字符串里的路径。源仓库的同名前缀服务不会命中。
+
+in-place 只使用环境标记；没有标记的 unit 保留，并在 `cleanup.diagnostics` 说明。worktree 缺失或被另一活任务共用时也只按标记判断。delegate 自建的 scope 继续走原 cgroup 回收，不重复停止/计数。
+
+先提交 `systemctl --user stop --no-block`，等待最多 3 秒；超时后 `systemctl --user kill --signal=SIGKILL`，再确认停止。每次 systemctl 调用最多 3 秒。缺少 systemctl、无 user bus 或回收失败只记诊断，不改任务 state 和退出码。
+
+`cleanup` 保留 `terminated`（进程数）、`ports`、`commands`，另含 `systemdStopped`（本轮停止的不同 unit 数）、`units`（unit 名及 `matchedBy`/`killed`）、`diagnostics`。回收详情存于 `cleanup.json`，累计多阶段结果；短提示例如 `note: 任务结束时停止了 2 个 systemd 服务；答复中提到的服务/地址已不可用`。`clean` 的 removed 行仅计此次清理新停止的 unit。
+
 同事的超时：到 `--timeout`（不含排队）时若有命令正在执行，或 120 秒内有事件，继续运行，最多到 `--timeout` 的 `1 + DELEGATE_TIMEOUT_GRACE/100` 倍（默认 1.1 倍）；结论里 `graceSeconds` 记下超出的秒数。
 
 ## 用户与仓库配置
@@ -131,7 +144,8 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 | `prompt.md` | 同事实际收到的任务说明；末尾可能附完成标准（`--accept`）与只读边界（Codex 只读任务） |
 | `events.jsonl` | 过滤后的全过程：读取、命令、编辑路径、错误、每轮模型与用量、重跑；不含编辑全文 |
 | `result.md` | 最后一轮的完整答复 |
-| `summary.json` | 结论：`state`、`attempts`、`files`、`changes`、`shape`、`accept`、可选 `evidence`、`cleanup`（已终止进程数、端口、命令）、`warnings`（空/缺失 worktree 源）、`readOnlyViolation` / `workspaceChanged`、`protectViolation`、`queuedSeconds`、`graceSeconds`、`warning`、`tokens`、`session`、`error`（`next` 由 `status` 现算） |
+| `summary.json` | 结论：`state`、`attempts`、`files`、`changes`、`shape`、`accept`、可选 `evidence`、`cleanup`（已终止进程数、端口、命令、已停 user unit 与诊断）、`warnings`（空/缺失 worktree 源）、`readOnlyViolation` / `workspaceChanged`、`protectViolation`、`queuedSeconds`、`graceSeconds`、`warning`、`tokens`、`session`、`error`（`next` 由 `status` 现算） |
+| `cleanup.json` / `cleanup.lock` | 多阶段后台进程与 user unit 回收记录 / 并发回收锁；systemctl 缺失、bus 不可用、无标记与回收失败只记诊断 |
 | `scopes` / `scopes.lock` | 本轮的 systemd scope 单元名 / 并发读写锁；仅在用户 systemd 可用时出现 |
 | `changes.json` / `changes.patch` | 前后快照的 tree、逐文件状态与行数；可选 `finalEntries` 冻结结束时改动路径的最终指纹，供手动合入检测；可直接 `git apply` 的补丁 |
 | `setup.log` | `--worktree` 的 `setup` 命令输出 |
@@ -174,7 +188,7 @@ worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 
 | `DELEGATE_REPO_MAX_ACTIVE` | 同仓库同时运行的任务上限，默认 8；`0` 不限 |
 | `DELEGATE_REPO_MAX_CODEX` | 同仓库 Codex 任务上限，默认 4；`0` 不限 |
 | `DELEGATE_MIN_AVAILABLE_MB` | 可用内存低于该值（MB）时拒绝启动，默认 4096；`0` 不检查 |
-| `DELEGATE_CGROUP` | `0` 关闭用户 systemd scope 回收；默认自动探测 |
+| `DELEGATE_CGROUP` | `0` 关闭 delegate 自建用户 systemd scope；默认自动探测。项目脚本自行启动的 user unit 仍按任务归属回收 |
 | `DELEGATE_TIMEOUT_GRACE` | 同事超时后仍在工作时的宽限百分比，默认 10 |
 | `DELEGATE_RUN_DIR` / `DELEGATE_LANE_HELD` | 由脚本导出：同事所在 run 目录（用于扣除排队时间）/ 已在 lane 名额内 |
 | `DELEGATE_RESULT_CHARS` | 答复超过该长度显示开头约 2/3 与结尾约 1/3，默认 6000 |
