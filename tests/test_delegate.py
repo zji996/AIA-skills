@@ -137,7 +137,8 @@ class DelegateTests(unittest.TestCase):
                 and "--json" not in args:
             args = (args[0], "--json", *args[1:])
         return subprocess.run([str(DELEGATE), *map(str, args)], cwd=cwd or self.work, env=self.env,
-                              input=stdin, capture_output=True, text=True, timeout=timeout)
+                              capture_output=True, text=True, timeout=timeout,
+                              **({"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}))
 
     def outcome(self, result):
         lines = [line for line in result.stdout.splitlines() if line.startswith('{"run"')]
