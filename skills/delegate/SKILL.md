@@ -22,8 +22,8 @@ $D wait                                                                         
 #                                                                                        # 3. 按结论行的下一步处理
 ```
 
-- **等待**：`wait`、`run`、`reply --wait` 阻塞到结束，默认放后台，不用 `status` 轮询。宿主能把后台进程的每行输出变成事件时（Claude Code 的 Monitor）优先 `$D wait --stream`；只有结束通知时重复后台 `$D wait --any`，处理当前已结束任务后再放同一命令。Claude Code 的 Bash 用 `run_in_background: true`（`hooks/claude-code-background.py` 可拒绝前台等待）。没有后台通知且调用限时时用 `--max 4m`，返回 75 后再等。无参 `wait` 只收本会话，无会话标识时收全部，`--all` 收本仓库全部。
-- **逐个处理**：按“答复”命令读正文、按“下一步”合并。每任务只允许一个等待者；已有活等待者时跳过，全被覆盖退出 `76`，通知给原等待者。脚本加 `--json`，`completionTiming` 区分旧结果与等待中新完成，`sourceDrift.overlap` 提示源改动重叠。
+- **等待**：`wait`、`run`、`reply --wait` 阻塞到结束，默认放后台，不用 `status` 轮询。宿主能把后台进程的每行输出变成事件时（Claude Code 的 Monitor）优先 `$D wait --stream`；只有结束通知时重复后台 `$D wait --any`，处理当前已结束任务后再放同一命令。Claude Code 的 Bash 用 `run_in_background: true`（`hooks/claude-code-background.py` 可拒绝前台等待）。宿主没有完成唤醒（如 Codex）时不会自动收到结果：在自己的步骤之间用 `$D wait --any --max 4m` 主动收取，返回 75 后再等。无参 `wait` 只收本会话，无会话标识时收全部，`--all` 收本仓库全部。
+- **逐个处理**：按“答复”命令读正文、按“下一步”合并。每任务只允许一个等待者；已有活等待者时跳过，全被覆盖退出 `76`，通知给原等待者；上下文压缩后旧等待者可能仍占着，此时用 `status` 看结局、`result <name>` 读答复，不必再等。脚本加 `--json`，`completionTiming` 区分旧结果与等待中新完成，`sourceDrift.overlap` 提示源改动重叠。
 - **结论**：每任务一条短行，随后附答复；细节用 `status --json`、`diff` 按需读取。答复超过 6000 字（`DELEGATE_RESULT_CHARS`）显示头尾，全文用 `$D result <name>`；只看过截断答复的任务 `clean --finished` 会保留，读过全文或加 `--force` 才删。后台进程回收与 worktree 源问题会提示。
 
 ## 场景速查
