@@ -658,7 +658,10 @@ fn completion_timing(already: &std::collections::HashSet<PathBuf>, run: &Path) -
     }
 }
 fn clean(args: &[String]) -> Res<i32> {
-    let (pos, flags, _) = parse_simple(args, &["--finished", "--force"], &[])?;
+    let (pos, flags, _) = parse_simple(args, &["--finished", "--force", "--json"], &[])?;
+    if has(&flags, "--json") {
+        output::enable_json();
+    }
     if pos.is_empty() && !has(&flags, "--finished") {
         return Err("clean requires runs or --finished".into());
     }
@@ -710,13 +713,34 @@ fn clean(args: &[String]) -> Res<i32> {
         } else {
             ""
         };
-        let units = runs::remove(&run);
+        let (units, containers) = runs::remove(&run);
         let cleanup_note = if units > 0 {
             format!("；停止了 {units} 个 systemd 服务")
         } else {
             String::new()
         };
-        println!("removed {name} ({st}{note}{cleanup_note})");
+        if output::json_enabled() {
+            println!(
+                "{}",
+                json!({"run":name,"state":st,"removed":true,"systemdStopped":units,"containersRemoved":containers.removed,"diagnostic":containers.diagnostic})
+            );
+        } else {
+            let container_note = if containers.removed > 0 {
+                format!("；删除了 {} 个容器", containers.removed)
+            } else {
+                String::new()
+            };
+            println!("removed {name} ({st}{note}{cleanup_note}{container_note})");
+        }
+    }
+    let orphans = cleanup::containers(&cache_dir().join("worktrees"), true);
+    if output::json_enabled() {
+        println!("{}", json!({"orphanCleanup":orphans.json()}));
+    } else if orphans.removed > 0 {
+        println!(
+            "清理：删除了 {} 个孤儿容器（worktree 目录已不存在）",
+            orphans.removed
+        );
     }
     Ok(0)
 }
@@ -1066,6 +1090,13 @@ fn main_inner(args: &[String]) -> Res<i32> {
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let result = main_inner(&args);
+    if result.is_ok()
+        && args
+            .first()
+            .is_some_and(|command| matches!(command.as_str(), "status" | "list" | "wait"))
+    {
+        output::worktree_disk();
+    }
     match result {
         Ok(code) => std::process::exit(code),
         Err(e) => {

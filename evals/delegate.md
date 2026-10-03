@@ -1,5 +1,11 @@
 # delegate
 
+## 5.23 清理容器与磁盘提示
+
+- 十几个已结束的 Rust 写入任务手动改写后合入，worktree 的 target 共占 126 GiB：结束时只测一次并记录 `worktreeBytes`，status/wait 按本仓库汇总，达到 20 GiB 时提示总量、最大三项与 `clean <name> --force`；`DELEGATE_WORKTREE_WARN_GIB=0` 关闭。Warn about retained worktree disk usage without repeatedly running du.
+- clean 删除 worktree 前回收 working_dir label 等于或位于该路径下的 compose 容器，前缀相同的兄弟目录不匹配；目录已删仍按记录路径回收，另扫 delegate worktree 根下的旧孤儿。Docker 不存在、无权限或超时只记一行提示；JSON 报告容器数量，匿名卷删除、具名卷保留。Reclaim compose containers and orphaned worktrees safely without requiring Docker.
+- 改写后手动合入并提交：立即 `clean <run> --force`，检测只认完全包含；等门禁直接后台跑命令本身或 lane，不写会匹配自身 shell 的 `until ! pgrep -f` 轮询。
+
 ## 5.22 追加任务验收
 
 - 仓库默认 accept 是 fmt 与 clippy，任务还需相关测试：用 `--accept-also 'cargo test -p api'` 保留默认门禁；可重复，按参数顺序以 `&&` 追加，没有基础命令时独立运行。Append task tests while preserving configured acceptance gates.

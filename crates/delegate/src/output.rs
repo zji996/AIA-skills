@@ -14,6 +14,78 @@ pub fn json_enabled() -> bool {
     JSON.load(Ordering::Relaxed)
 }
 
+pub fn worktree_disk() {
+    let threshold = setting("WORKTREE_WARN_GIB", "20")
+        .parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .unwrap_or(20.0);
+    if threshold == 0.0 {
+        return;
+    }
+    let threshold_bytes = (threshold * 1024.0_f64.powi(3)) as u64;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let repo = crate::launch::repo_key(&cwd);
+    let all = runs::all_runs();
+    let active_paths: std::collections::BTreeSet<_> = all
+        .iter()
+        .filter(|run| runs::active(&runs::state(run)))
+        .map(|run| s(&json(run.join("meta.json"))["worktree"], "path").to_string())
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut items = Vec::new();
+    for run in all.iter().rev() {
+        let meta = json(run.join("meta.json"));
+        let path = s(&meta["worktree"], "path");
+        if s(&meta, "mode") != "write"
+            || runs::active(&runs::state(run))
+            || crate::launch::repo_key_for_meta(&meta) != repo
+            || path.is_empty()
+            || !Path::new(path).is_dir()
+            || active_paths.contains(path)
+            || !seen.insert(path.to_string())
+        {
+            continue;
+        }
+        let Some(bytes) = meta["worktreeBytes"].as_u64() else {
+            continue;
+        };
+        items.push(json!({"run":meta["run"], "name":meta["name"], "bytes":bytes}));
+    }
+    let total = items
+        .iter()
+        .map(|item| item["bytes"].as_u64().unwrap_or(0))
+        .fold(0u64, u64::saturating_add);
+    if total < threshold_bytes || items.is_empty() {
+        return;
+    }
+    items.sort_by_key(|item| std::cmp::Reverse(item["bytes"].as_u64().unwrap_or(0)));
+    items.truncate(3);
+    let next = "已确认合入后：delegate clean <name> --force";
+    if json_enabled() {
+        println!(
+            "{}",
+            json!({"worktreeDisk":{"totalBytes":total,"thresholdBytes":threshold_bytes,"largest":items,"next":next}})
+        );
+    } else {
+        let largest = items
+            .iter()
+            .map(|item| {
+                format!(
+                    "{} {:.1} GiB",
+                    s(item, "name").replace(['\n', '\r'], " "),
+                    item["bytes"].as_u64().unwrap_or(0) as f64 / 1024.0_f64.powi(3)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("、");
+        println!(
+            "提示：已结束未清理 worktree 共 {:.1} GiB；最大：{largest}；{next}",
+            total as f64 / 1024.0_f64.powi(3)
+        );
+    }
+}
+
 pub fn human(run: &Path, status: &Value) -> String {
     let meta = json(run.join("meta.json"));
     let state = s(status, "state");

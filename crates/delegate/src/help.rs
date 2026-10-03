@@ -177,10 +177,11 @@ pub fn print(command: Option<&str>) -> bool {
         "stop" => ("runs ...", "Terminate one or more runs.", &[
             ("runs", "One or more run ids or directories."),
         ]),
-        "clean" => ("[--finished] [--force] [runs ...]", "Delete finished runs.", &[
+        "clean" => ("[--finished] [--force] [--json] [runs ...]", "Delete finished runs and their compose containers; reclaim containers whose delegate worktree directory is missing.", &[
             ("runs", "Run ids or directories to remove."),
             ("--finished", "Select all finished runs that have been reported in full (answers shown truncated are kept until read with result)."),
             ("--force", "With --finished, also select unreported or truncated finished runs."),
+            ("--json", "Print deletion counts and orphan container cleanup as JSON lines."),
         ]),
         "protocol" => ("", "Print one JSON line for harness adapters: protocol version, delegate version, the caller session and its source variable, and each agent's tier, resolved binary, version and PATH entries it shadows.", &[]),
         _ => return false,

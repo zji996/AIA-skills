@@ -27,6 +27,8 @@
 
 `delegate` 架构总览：[docs/assets/delegate-architecture.webp](docs/assets/delegate-architecture.webp)（提示词同目录）。
 
+`delegate` 5.23.0 清理能力：移除 worktree 连带回收 compose 容器和匿名卷，`clean` 同时回收目录已消失的旧孤儿，Docker 失败只提示；写入任务结束时缓存磁盘占用，`status`/`wait` 达默认 20 GiB 时提示总量、最大三项与清理命令（`DELEGATE_WORKTREE_WARN_GIB` 可调、0 关闭）。改写后手动合入并提交立即 `clean <run> --force`；门禁直接后台跑命令本身或 `lane`，避免 `pgrep -f` 轮询匹配自身。
+
 `delegate` 5.18.0 配置能力：用户级 `${XDG_CONFIG_HOME}/delegate/config.json`（未设变量时使用系统约定的用户配置目录）与仓库 `.delegate.json` 合并，通用 deny/env/返工预算/默认验收与证据只写一次；`--evidence` 失败不改状态，deny 支持精确 argv，手动合入自动检测，固定同事仍显示默认档位。整机容量默认 12/6/2、每仓库 8/4（worktree 同计），环境变量优先；仓库可按 `(argv, exact)` 撤销用户 deny，`configSources` 可追溯来源。规则见 [用户与仓库配置](skills/delegate/references/configuration.md)。
 
 ---

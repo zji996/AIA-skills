@@ -371,6 +371,10 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 - 自动清理：每次启动删除结束超过 `DELEGATE_KEEP_DAYS`（默认 7，0 关闭）天、已读取（不含只显示过截断答复的）、且没有未 apply 写入 worktree 的 run。
 - `clean`：跳过运行中的与同事进程仍存活的；`--finished` 默认保留未读取的、只显示过截断答复的（`wait` 截断打印时写 `.truncated`，完整打印或 `result` 读全文后删除），以及未完整 apply 的 worktree run；`--force` 可覆盖这些保留条件。显式列出的 run 照常删除；提示未 apply 的 worktree。
 
+5.23 起，worktree 移除前（路径缺失时也适用）查询 compose working_dir label，按绝对路径组件匹配本目录及其子目录，以 `docker rm -f -v` 回收容器和匿名卷；具名卷保留。每次查询与删除共用 20 秒限时，失败只诊断；clean 另回收 delegate worktree 缓存根下 label 目录已不存在的孤儿。`clean --json` 的删除行含 `containersRemoved`、`diagnostic`，末尾 `orphanCleanup` 同样报告数量和诊断。
+
+写入 run 收尾、验收后限时测量 worktree 字节并缓存 `meta.worktreeBytes`（已有值复用，失败省略）；status/wait 只读取缓存，旧任务不补测。本仓库已结束、目录仍在且无运行中续接的 worktree 按路径去重，达到 `DELEGATE_WORKTREE_WARN_GIB`（默认 20、0 关闭）时末尾输出总量、前三名称与大小、确认合入后 `clean <name> --force`；JSON 追加 `worktreeDisk{totalBytes,thresholdBytes,largest:[{run,name,bytes}],next}` 行。
+
 ## 11. 文件与目录
 
 run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git 根下的 `.local/run/delegate/`（不在仓库中则为当前目录下）；按名字/ID 也查找旧 `.local/run/pi/`。首次创建时写入内容为 `*` 的 `.gitignore`；run 目录 `<YYYYmmdd-HHMMSS>-<slug>[-<4 hex>]`，权限 700。`<state>` 为 `${XDG_STATE_HOME:-~/.local/state}/delegate`，**不得**提供环境变量覆盖。

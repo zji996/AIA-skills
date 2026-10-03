@@ -312,11 +312,15 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<Option<String>> {
     }
     Ok(None)
 }
-pub fn remove(meta: &Value) {
+pub fn remove(meta: &Value) -> crate::cleanup::Containers {
     let tree = &meta["worktree"];
     let path = Path::new(s(tree, "path"));
+    if !path.is_absolute() || path == Path::new(s(tree, "source")) {
+        return crate::cleanup::Containers::default();
+    }
+    let containers = crate::cleanup::containers(path, false);
     if !path.exists() {
-        return;
+        return containers;
     }
     // Ask the worktree which repository owns it: the recorded source may be an upstream worktree
     // (--in) that has already been cleaned, and pruning from there would leave this entry registered.
@@ -335,6 +339,7 @@ pub fn remove(meta: &Value) {
         let _ = fs::remove_dir_all(path);
         let _ = git(&owner, &["worktree", "prune"]);
     }
+    containers
 }
 fn blob(top: &Path, tree: &str, path: &str) -> Res<(Option<String>, Option<Vec<u8>>)> {
     let entry = git(top, &["ls-tree", "-z", tree, "--", path])?;

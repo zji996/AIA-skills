@@ -61,6 +61,8 @@
 
 每次 `start` 会删除结束超过 7 天且结果已读取的记录（只显示过截断答复的不算已读取）；`DELEGATE_KEEP_DAYS` 调整天数，设为 `0` 关闭。
 
+5.23 起移除 worktree 连带回收 compose 容器，`status`/`wait` 根据收尾缓存的 `worktreeBytes` 提示磁盘占用；匹配边界、失败语义与 JSON 字段见 [清理与磁盘占用](cleanup.md)。
+
 ## 环境变量
 
 均先读 `DELEGATE_<名称>`，未设置时回退到 4.0 前的 `PI_DELEGATE_<名称>`。
@@ -79,6 +81,7 @@
 | `DELEGATE_RUN_DIR` / `DELEGATE_LANE_HELD` | 由脚本导出：同事所在 run 目录（用于扣除排队时间）/ 已在 lane 名额内 |
 | `DELEGATE_RESULT_CHARS` | 答复超过该长度显示开头约 2/3 与结尾约 1/3，默认 6000 |
 | `DELEGATE_KEEP_DAYS` | 自动清理天数，默认 7 |
+| `DELEGATE_WORKTREE_WARN_GIB` | 本仓库已结束 worktree 占用提示阈值，默认 20 GiB；`0` 关闭 |
 | `DELEGATE_POLL` | `wait --progress`、4.4 之前的 run 与刚启动的 supervisor 的检查间隔秒数，默认 1；其余等待不轮询 |
 | `DELEGATE_CHEAP_AGENT` / `DELEGATE_STRONG_AGENT` | 档位对应的同事，默认 `pi` / `codex` |
 | `DELEGATE_AGENT` | 由脚本导出给同事（`pi`/`codex`）；设有它的进程不能再委派 |

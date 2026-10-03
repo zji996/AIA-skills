@@ -283,6 +283,9 @@ pub fn status(run: &Path) -> Value {
     if meta["worktree"].is_object() {
         out["worktree"] = json!(s(&meta["worktree"], "path"));
     }
+    if let Some(bytes) = meta["worktreeBytes"].as_u64() {
+        out["worktreeBytes"] = json!(bytes);
+    }
     if sum.is_object() {
         for key in [
             "finishedAt",
@@ -391,19 +394,45 @@ pub fn unmerged(run: &Path) -> bool {
         && Path::new(s(&m["worktree"], "path")).exists()
         && (!run.join(".applied").exists() || run.join(".generate-pending").exists())
 }
-pub fn remove(run: &Path) -> usize {
+pub fn remove(run: &Path) -> (usize, crate::cleanup::Containers) {
     let meta = json(run.join("meta.json"));
     let path = s(&meta["worktree"], "path").to_string();
     let stopped = crate::cleanup::record(run, 0);
     let _ = fs::remove_dir_all(run);
-    if !path.is_empty()
+    let containers = if !path.is_empty()
         && !all_runs()
             .iter()
             .any(|r| s(&json(r.join("meta.json"))["worktree"], "path") == path)
     {
-        worktree::remove(&meta);
+        worktree::remove(&meta)
+    } else {
+        crate::cleanup::Containers::default()
+    };
+    (stopped, containers)
+}
+
+pub fn record_worktree_bytes(run: &Path) {
+    let mut meta = json(run.join("meta.json"));
+    if s(&meta, "mode") != "write" || meta["worktreeBytes"].as_u64().is_some() {
+        return;
     }
-    stopped
+    let path = Path::new(s(&meta["worktree"], "path"));
+    if !path.is_absolute() || !path.is_dir() || path == Path::new(s(&meta["worktree"], "source")) {
+        return;
+    }
+    let mut command = std::process::Command::new("du");
+    command.args(["-sb", "--"]).arg(path);
+    if let Ok(output) = crate::cleanup::bounded_output(command, std::time::Duration::from_secs(20))
+    {
+        if let Some(bytes) = output
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse::<u64>().ok())
+        {
+            meta["worktreeBytes"] = json!(bytes);
+            let _ = write_json(run.join("meta.json"), &meta);
+        }
+    }
 }
 pub fn prune() {
     let Ok(days) = setting("KEEP_DAYS", "7").parse::<u64>() else {

@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 static SYSTEMD: OnceLock<bool> = OnceLock::new();
+static DOCKER_FAILURE: OnceLock<String> = OnceLock::new();
 
 // Bound every bus request, including discovery: a wedged user manager must not hold up delivery.
 fn systemctl(args: &[&str]) -> Result<String, String> {
@@ -19,7 +20,12 @@ fn systemctl(args: &[&str]) -> Result<String, String> {
         .args(args)
         .env("LC_ALL", "C")
         .env("SYSTEMD_COLORS", "0")
-        .env("SYSTEMD_URLIFY", "0")
+        .env("SYSTEMD_URLIFY", "0");
+    bounded_output(command, Duration::from_secs(3))
+}
+
+pub fn bounded_output(mut command: Command, timeout: Duration) -> Result<String, String> {
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -51,7 +57,7 @@ fn systemctl(args: &[&str]) -> Result<String, String> {
                 break Err(error.to_string());
             }
         }
-        if start.elapsed() >= Duration::from_secs(3) {
+        if start.elapsed() >= timeout {
             break Err("timed out".into());
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -67,6 +73,90 @@ fn systemctl(args: &[&str]) -> Result<String, String> {
     } else {
         Err(format!("exit {status}"))
     }
+}
+
+#[derive(Default)]
+pub struct Containers {
+    pub removed: usize,
+    pub diagnostic: Option<String>,
+}
+
+impl Containers {
+    pub fn json(&self) -> Value {
+        value!({"containersRemoved": self.removed, "diagnostic": self.diagnostic})
+    }
+}
+
+fn label_below(path: &Path, root: &Path) -> bool {
+    path.is_absolute()
+        && root.is_absolute()
+        && !path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+        && path.starts_with(root)
+}
+
+// Match recorded paths lexically: compose's working directory may already have been deleted.
+pub fn containers(root: &Path, missing_only: bool) -> Containers {
+    if let Some(message) = DOCKER_FAILURE.get() {
+        return Containers {
+            removed: 0,
+            diagnostic: Some(message.clone()),
+        };
+    }
+    let mut report = Containers::default();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let docker = |args: &[&str]| -> Result<String, String> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("timed out".into());
+        }
+        let mut command = Command::new("docker");
+        command.args(args);
+        bounded_output(command, remaining)
+    };
+    let mut collect = || -> Result<(), String> {
+        let listed = docker(&[
+            "ps",
+            "-aq",
+            "--filter",
+            "label=com.docker.compose.project.working_dir",
+        ])?;
+        let ids: Vec<_> = listed.split_whitespace().collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec!["inspect"];
+        args.extend(ids);
+        let inspected: Value = serde_json::from_str(&docker(&args)?).map_err(|e| e.to_string())?;
+        let items = inspected
+            .as_array()
+            .ok_or("invalid docker inspect response")?;
+        for item in items {
+            let path = Path::new(s(
+                &item["Config"]["Labels"],
+                "com.docker.compose.project.working_dir",
+            ));
+            if !label_below(path, root) || (missing_only && path.try_exists().ok() != Some(false)) {
+                continue;
+            }
+            let id = s(item, "Id");
+            if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            docker(&["rm", "-f", "-v", id])?;
+            report.removed += 1;
+        }
+        Ok(())
+    };
+    if let Err(e) = collect() {
+        let message = format!("docker: container cleanup skipped: {e}");
+        if DOCKER_FAILURE.set(message.clone()).is_ok() {
+            eprintln!("delegate: {message}");
+        }
+        report.diagnostic = Some(message);
+    }
+    report
 }
 
 // systemctl show uses C-escaped, optionally quoted words for Environment and ExecStart argv.

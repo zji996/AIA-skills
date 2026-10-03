@@ -106,6 +106,205 @@ class DelegateTests(unittest.TestCase):
                         PI_LOG=str(self.work / "pi.log"),
                         # Both tiers map to the fake Pi unless a test says otherwise (see the tier tests).
                         DELEGATE_STRONG_AGENT="pi")
+        # Cleanup tests must never contact the host's Docker daemon.
+        docker = self.bin / "docker"
+        docker.write_text("#!/bin/sh\nexit 0\n")
+        docker.chmod(0o755)
+
+    def fake_docker(self, containers):
+        db = self.work / "containers.json"
+        db.write_text(json.dumps(containers))
+        self.env["TEST_DOCKER_DB"] = str(db)
+        self.env["TEST_DOCKER_LOG"] = str(self.work / "docker.log")
+        script = self.bin / "docker"
+        script.write_text(f"#!{sys.executable}\n" + '''import json, os, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+with open(os.environ["TEST_DOCKER_LOG"], "a") as log:
+    log.write(json.dumps(args) + "\\n")
+if os.environ.get("TEST_DOCKER_FAIL"):
+    sys.exit(1)
+if os.environ.get("TEST_DOCKER_HANG"):
+    time.sleep(60)
+db = Path(os.environ["TEST_DOCKER_DB"])
+items = json.loads(db.read_text())
+if args[0] == "ps":
+    assert args == ["ps", "-aq", "--filter", "label=com.docker.compose.project.working_dir"]
+    print("\\n".join(items))
+elif args[0] == "inspect":
+    print(json.dumps([{"Id": key, "Config": {"Labels": {
+        "com.docker.compose.project.working_dir": items[key]["path"]}}} for key in args[1:]]))
+elif args[:3] == ["rm", "-f", "-v"]:
+    key = args[3]
+    if items[key].get("mustExist"):
+        assert Path(items[key]["path"]).exists()
+    if items[key].get("fail"):
+        sys.exit(1)
+    del items[key]
+    db.write_text(json.dumps(items))
+    print(key)
+else:
+    sys.exit(2)
+''')
+        script.chmod(0o755)
+        return db
+
+    def test_clean_removes_compose_containers_and_old_orphans(self):
+        self.fake_pi([answer("done"), SETTLED])
+        repo = self.repo({"a.txt": "a\n"})
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        tree = Path(state["worktree"])
+        (tree / "nested").mkdir()
+        sibling = Path(str(tree) + "-sibling")
+        sibling.mkdir()
+        root = tree.parent
+        live = root / "live"
+        live.mkdir()
+        db = self.fake_docker({
+            "a1": {"path": str(tree), "mustExist": True},
+            "a2": {"path": str(tree / "nested"), "mustExist": True},
+            "a3": {"path": str(sibling)},
+            "a4": {"path": str(root / "old-deleted")},
+            "a5": {"path": str(live)},
+            "a6": {"path": str(root) + "-sibling/deleted"},
+            "a7": {"path": str(root / "../source/deleted")},
+            "a8": {"path": str(repo / "missing")},
+        })
+        result = self.cli("clean", "--json", state["run"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(rows[0]["containersRemoved"], 2)
+        self.assertEqual(rows[1]["orphanCleanup"]["containersRemoved"], 1)
+        self.assertEqual(set(json.loads(db.read_text())), {"a3", "a5", "a6", "a7", "a8"})
+        self.assertFalse(tree.exists())
+
+    def test_clean_uses_recorded_path_when_worktree_is_already_missing(self):
+        self.fake_pi([answer("done"), SETTLED])
+        repo = self.repo({"a.txt": "a\n"})
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        shutil.rmtree(state["worktree"])
+        db = self.fake_docker({"b1": {"path": state["worktree"]}})
+        result = self.cli("clean", "--json", state["run"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout.splitlines()[0])["containersRemoved"], 1)
+        self.assertEqual(json.loads(db.read_text()), {})
+
+    def test_docker_failures_do_not_block_clean(self):
+        self.fake_pi([answer("done"), SETTLED])
+        repo = self.repo({"a.txt": "a\n"})
+        for failure in ("missing", "permission", "partial"):
+            with self.subTest(failure=failure):
+                state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, failure))
+                self.env.pop("TEST_DOCKER_FAIL", None)
+                self.fake_docker({"c1": {"path": state["worktree"]},
+                                  "c2": {"path": state["worktree"], "fail": True}})
+                original_path = self.env["PATH"]
+                if failure == "missing":
+                    (self.bin / "docker").unlink()
+                    (self.bin / "git").symlink_to(shutil.which("git"))
+                    self.env["PATH"] = str(self.bin)
+                elif failure == "permission":
+                    self.env["TEST_DOCKER_FAIL"] = "1"
+                try:
+                    result = self.cli("clean", "--json", state["run"])
+                finally:
+                    self.env["PATH"] = original_path
+                self.assertEqual(result.returncode, 0, result.stderr)
+                report = json.loads(result.stdout.splitlines()[0])
+                self.assertEqual(report["containersRemoved"], 1 if failure == "partial" else 0)
+                self.assertIn("docker:", report["diagnostic"])
+                self.assertEqual(result.stderr.count("docker: container cleanup skipped:"), 1)
+                self.assertFalse(Path(state["worktree"]).exists())
+                self.assertFalse(Path(state["dir"]).exists())
+
+    def test_docker_timeout_is_nonfatal(self):
+        self.fake_docker({})
+        self.env["TEST_DOCKER_HANG"] = "1"
+        started = time.monotonic()
+        result = self.cli("clean", "--finished", "--json", timeout=25)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(time.monotonic() - started, 24)
+        self.assertIn("timed out", json.loads(result.stdout)["orphanCleanup"]["diagnostic"])
+
+    def test_worktree_usage_measured_once_after_acceptance_and_warns(self):
+        self.fake_pi([answer("done"), SETTLED])
+        repo = self.repo({"a.txt": "a\n"})
+        du = self.bin / "du"
+        du.write_text(f"#!{sys.executable}\n" + '''import json, os, sys
+from pathlib import Path
+run = Path(os.environ["DELEGATE_RUNS"])
+meta = next(json.loads(p.read_text()) for p in run.glob("*/meta.json")
+            if p.is_file() and json.loads(p.read_text()).get("worktree", {}).get("path") == sys.argv[-1])
+assert (Path(meta["worktree"]["path"]) / "accepted").exists()
+with open(Path(os.environ["PI_LOG"]).with_suffix(".du"), "a") as log:
+    log.write(meta["name"] + "\\n")
+sizes = {"one": 12, "two": 8, "three": 7, "four": 6}
+print(str(sizes[meta["name"]] * 1024**3) + "\\t" + sys.argv[-1])
+''')
+        du.chmod(0o755)
+        states = [self.outcome(self.cli("run", "--worktree", "--workdir", repo,
+                    "--name", name, "--accept", "touch accepted", "task"))
+                  for name in ("one", "two", "three", "four")]
+        self.assertEqual(states[0]["worktreeBytes"], 12 * 1024**3)
+        meta = json.loads((Path(states[0]["dir"]) / "meta.json").read_text())
+        self.assertEqual(meta["worktreeBytes"], states[0]["worktreeBytes"])
+        def disk(result):
+            return next(json.loads(line)["worktreeDisk"] for line in result.stdout.splitlines()
+                        if line.startswith('{"worktreeDisk"'))
+        report = disk(self.cli("status", cwd=repo))
+        self.assertEqual(report["totalBytes"], 33 * 1024**3)
+        self.assertEqual(report["thresholdBytes"], 20 * 1024**3)
+        self.assertEqual([item["name"] for item in report["largest"]], ["one", "two", "three"])
+        self.assertIn("clean <name> --force", report["next"])
+        self.assertEqual(disk(self.cli("wait", "--no-result", states[0]["run"], cwd=repo)), report)
+        human = self.cli("status", human=True, cwd=repo).stdout
+        self.assertIn("共 33.0 GiB", human)
+        self.assertIn("one 12.0 GiB", human)
+        self.assertNotIn("worktreeDisk", self.cli("status").stdout)  # another repository
+        self.env["DELEGATE_WORKTREE_WARN_GIB"] = "34"
+        self.assertNotIn("worktreeDisk", self.cli("status", cwd=repo).stdout)
+        self.env["DELEGATE_WORKTREE_WARN_GIB"] = "33"
+        self.assertEqual(disk(self.cli("status", cwd=repo))["totalBytes"], 33 * 1024**3)
+        self.env["DELEGATE_WORKTREE_WARN_GIB"] = "0"
+        self.assertNotIn("worktreeDisk", self.cli("wait", "--no-result", states[0]["run"], cwd=repo).stdout)
+        self.assertNotIn("共 33.0 GiB", self.cli("status", human=True, cwd=repo).stdout)
+        self.assertEqual((self.work / "pi.du").read_text().splitlines(), ["one", "two", "three", "four"])
+
+    def test_failed_du_is_omitted_and_status_does_not_retry(self):
+        self.fake_pi([answer("done"), SETTLED])
+        repo = self.repo({"a.txt": "a\n"})
+        du = self.bin / "du"
+        du.write_text("#!/bin/sh\nexit 1\n")
+        du.chmod(0o755)
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        self.assertNotIn("worktreeBytes", state)
+        du.write_text("#!/bin/sh\nprintf '999999999999\\t%s\\n' \"$3\"\n")
+        self.assertNotIn("worktreeBytes", self.outcome(self.cli("status", state["run"])))
+
+    def test_worktree_disk_deduplicates_shared_paths_and_skips_active_reply(self):
+        self.fake_pi([answer("done"), SETTLED])
+        repo = self.repo({"a.txt": "a\n"})
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "original", "task"))
+        run = Path(state["dir"])
+        meta = json.loads((run / "meta.json").read_text())
+        meta["worktreeBytes"] = 20 * 1024**3
+        (run / "meta.json").write_text(json.dumps(meta))
+        other = run.parent / "newer-reply"
+        other.mkdir()
+        meta.update(run=other.name, name="latest", startedNs=meta["startedNs"] + 1)
+        (other / "meta.json").write_text(json.dumps(meta))
+        (other / "exit_code").write_text("0\n")
+        (other / "summary.json").write_text(json.dumps({"state": "answered"}))
+        result = self.cli("status", cwd=repo)
+        disk = next(json.loads(line)["worktreeDisk"] for line in result.stdout.splitlines()
+                    if line.startswith('{"worktreeDisk"'))
+        self.assertEqual(disk["totalBytes"], 20 * 1024**3)
+        self.assertEqual(disk["largest"][0]["name"], "latest")
+        (other / "exit_code").unlink()
+        (other / "summary.json").unlink()
+        meta["startedEpoch"] = time.time()
+        (other / "meta.json").write_text(json.dumps(meta))
+        self.assertNotIn("worktreeDisk", self.cli("status", cwd=repo).stdout)
 
     def fake_pi(self, *attempts, pre="", sleep=0, code=0):
         """Each attempt is a list of events; later calls reuse the last attempt."""
