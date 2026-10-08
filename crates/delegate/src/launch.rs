@@ -482,16 +482,40 @@ pub(crate) fn normalize_protect(paths: &mut Vec<String>) -> Res<()> {
     paths.dedup();
     Ok(())
 }
+/// A name is typed again in later commands: stop at the first clause, not at 40 characters of prose.
 fn prompt_name(prompt: &str) -> String {
-    let name = prompt
+    let line = prompt
         .lines()
         .find(|s| !s.trim().is_empty())
         .unwrap_or("task")
         .trim()
-        .trim_start_matches(['#', '*', '-', ' '])
-        .chars()
-        .take(40)
-        .collect::<String>();
+        .trim_start_matches(['#', '*', '-', ' ']);
+    let clause = line
+        .split([
+            '：', '，', '。', '；', '（', '(', ':', ',', ';', '、', '—', '`', '！', '？', '!', '?',
+        ])
+        .map(str::trim)
+        // "目标：…" and "Goal: …" label the sentence; the name is what follows.
+        .find(|part| {
+            !part.is_empty()
+                && !["目标", "任务", "背景", "goal", "task", "objective"]
+                    .contains(&part.to_lowercase().as_str())
+        })
+        .unwrap_or(line);
+    let mut name = String::new();
+    for word in clause.split_whitespace() {
+        let next = name.chars().count() + word.chars().count() + usize::from(!name.is_empty());
+        if next > 24 {
+            break;
+        }
+        if !name.is_empty() {
+            name.push(' ');
+        }
+        name.push_str(word);
+    }
+    if name.is_empty() {
+        name = clause.chars().take(24).collect();
+    }
     if name.is_empty() {
         "task".into()
     } else {

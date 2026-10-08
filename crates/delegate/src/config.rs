@@ -114,8 +114,13 @@ fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
                     return Err(format!("invalid defaults.{k}"));
                 }
                 if k == "protect" {
-                    let mut paths = v.as_array().unwrap().iter().filter_map(Value::as_str)
-                        .map(str::to_string).collect();
+                    let mut paths = v
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect();
                     crate::launch::normalize_protect(&mut paths)
                         .map_err(|e| format!("invalid defaults.protect: {e}"))?;
                 }
@@ -281,8 +286,10 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
     }
     value["env"] = env;
     value["agentDeny"] = json!(rules);
-    origins["agentDeny"] = json!(["user", "repo"].into_iter()
-        .filter(|source| rule_sources.contains(source)).collect::<Vec<_>>());
+    origins["agentDeny"] = json!(["user", "repo"]
+        .into_iter()
+        .filter(|source| rule_sources.contains(source))
+        .collect::<Vec<_>>());
     value["defaults"] = defaults;
     value["standing"] = standing;
     value["cleanupKeepExecutables"] = json!(keep);

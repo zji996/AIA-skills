@@ -109,7 +109,10 @@ pub fn generated_inputs(source: &Path) -> Res<Vec<String>> {
 fn rule_list(spec: &Value, key: &str, file: &Path) -> Res<Option<Vec<String>>> {
     let Some(value) = spec.get(key) else {
         return if key == "paths" {
-            Err(format!("{}: generated.paths must be a list", file.display()))
+            Err(format!(
+                "{}: generated.paths must be a list",
+                file.display()
+            ))
         } else {
             Ok(None)
         };
@@ -1478,7 +1481,10 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
         );
     }
     if skipped_generation {
-        println!(" {:<16} no merged path under generated.inputs", "not regenerated");
+        println!(
+            " {:<16} no merged path under generated.inputs",
+            "not regenerated"
+        );
     }
     if dry {
         eprintln!("delegate: dry run; nothing written");

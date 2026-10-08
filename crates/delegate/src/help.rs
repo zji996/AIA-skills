@@ -4,7 +4,7 @@ const LAUNCH: &[(&str, &str)] = &[
     ("--prompt-file FILE", "Read the prompt from FILE, or - for stdin."),
     ("--tier cheap|strong", "Cheap: Pi for reading, summaries, copy, images; strong: Codex for code and rigorous review. Default: cheap for read-only, strong for writes. Eligible failed cheap runs escalate once to strong."),
     ("--agent", "Choose an agent directly; disables tier escalation."),
-    ("--name NAME", "Short label in the run id (default: prompt first line, up to 40 characters)."),
+    ("--name NAME", "Short label in the run id (default: first clause of the prompt, up to 24 characters)."),
     ("--workdir DIR", "Agent working directory (default: cwd)."),
     ("--image PATH", "Attach an image; repeatable, supported by both agents."),
     ("--read-only", "No writes: isolated agents are instructed and checked; Pi uses read-only tools without isolation. In git, reads a worktree snapshot by default."),

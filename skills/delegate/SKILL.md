@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "5.25.0"
+  version: "5.25.1"
   binary: delegate
   exclude-agents: pi
 ---
@@ -22,7 +22,7 @@ $D wait                                                                    # 2. 
 #                                                                          # 3. 按结论行的“下一步”处理
 ```
 
-- **放出**：`start` 回显任务名、同事与档位，以及本次自动生效的东西（仓库固定说明几行、默认 worktree / 保护路径 / 附加验收及其来源）。名字省略时取说明首行；之后用它指代整段对话。
+- **放出**：`start` 回显任务名、同事与档位，以及本次自动生效的东西（仓库固定说明几行、默认 worktree / 保护路径 / 附加验收及其来源）。名字省略时取说明的第一个分句；之后用它指代整段对话。
 - **等**：`wait` 放后台（Claude Code 的 Bash 用 `run_in_background: true`），不用 `status` 轮询。它交付下一个结束的任务就返回，末行写明本会话还剩几个、原样再跑哪条命令——照做即可，直到末行说没有在跑的任务。
 - **处理**：每个任务一条短行（状态、改动、验收、下一步），随后是答复。只读任务去代码核实关键结论；写入任务看 `$D diff <name>`，满意后 `$D apply <name>`——它合入、清理该任务，并在末行说明验收是否仍有效、无效时要在主干重跑哪些命令。
 

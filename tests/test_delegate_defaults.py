@@ -113,6 +113,18 @@ class DelegateDefaultsTests(unittest.TestCase):
         reply = self.outcome(self.cli('reply', '--wait', first['run'], 'next'))
         self.assertEqual(reply['name'], 'reply to 审查接口')
 
+    def test_generated_name_stops_at_the_first_clause(self):
+        for prompt, name in (
+            ('对话文件夹补充（ADR 0085 第 3、5 节）：前两段已在主干', '对话文件夹补充'),
+            ('目标：实现上传，只做后端', '实现上传'),
+            ('Goal: fix the flaky wait test', 'fix the flaky wait test'),
+            ('Review the error handling in apps/api, list real defects only', 'Review the error'),
+            ('一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十', '一二三四五六七八九十一二三四五六七八九十一二三四'),
+        ):
+            with self.subTest(prompt=prompt):
+                self.fake_pi([fixtures.answer('ok'), fixtures.SETTLED])
+                self.assertEqual(self.outcome(self.cli('run', '--read-only', '--prompt', prompt))['name'], name)
+
     def test_display_limit_tolerance_and_environment_priority(self):
         self.user_config({'resultChars': 100})
         # result.md adds one newline, so use 124 answer characters for the exact boundary.
