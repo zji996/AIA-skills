@@ -1,5 +1,14 @@
 # delegate
 
+## 5.25 少写少选
+
+- 主控在三份任务说明里手抄同一段仓库规矩：仓库 `.delegate.json` 设 `standing` 后，start 回显“附加 N 行（repo）”，`prompt.md` 末尾含该文字与生效的 deny 命令及 hint；普通 reply 不重复，`--fresh` 重附。Standing instructions from config are appended to every task prompt and echoed at start.
+- 主控连放三个任务后只跑 `delegate wait`：交付第一个结束的并返回，末行写“还剩 2 个…再跑 delegate wait”；全部收完末行写没有在跑的任务。`--until-all` 才等到全部结束。
+- 侦察答复 6817 字：默认上限 20000 时全文显示；上限 6000 时 6817 ≤ 7500 仍全文显示；`--max-answer 900` 且答复超过 1350 字时同一会话追问压缩一次，`result.md` 为压缩后答复，原文在 `result-original.md`，不耗返工预算，失败保留原答复。
+- 仓库设 `defaults: {"worktree": true, "protect": ["docs/decision/"], "acceptAlso": ["make lint"]}`：不带选项的写入任务进 worktree、带保护与附加验收，启动回显各项来源；`--in-place` 退回原地；CLI 的 `--protect` 覆盖整项。未配置时行为与 5.24 相同。
+- `apply` 成功后该任务的 worktree 与 run 目录已清理（`--keep` 保留），末行写明验收是否仍有效及需在主干重跑的命令；清理失败只提示、退出码仍为 0。
+- 任务结束时构建拉起的 sccache 服务端不被终止、不出现“终止了后台进程”的提示；其他被终止的进程提示里带可执行名。
+
 ## 5.24 源仓库构建目录提示
 
 - Rust 源仓库 target 涨到 155 GiB，worktree 汇总覆盖不到：写入收尾后在 20 秒内量源根 target，status/wait 用最近缓存提示总量、各路径大小和先量再删的参考，绝不自动删除。Warn about source repository build disk usage using the latest cached measurement, without deleting build artifacts.

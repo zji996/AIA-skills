@@ -254,6 +254,21 @@ pub fn status(run: &Path) -> Value {
     if let Some(sources) = meta.get("configSources") {
         out["configSources"] = sources.clone();
     }
+    for key in [
+        "standing",
+        "standingSources",
+        "defaults",
+        "maxAnswer",
+        "resultDisplayChars",
+    ] {
+        if let Some(value) = meta.get(key).filter(|v| !v.is_null()) {
+            out[key] = value.clone();
+        }
+    }
+    let compression = json(run.join("compression.json"));
+    if compression.is_object() {
+        out["compression"] = compression;
+    }
     if let Some(age) = age_seconds(&meta) {
         out["ageSeconds"] = json!(age);
     }
@@ -409,6 +424,32 @@ pub fn remove(run: &Path) -> (usize, crate::cleanup::Containers) {
         crate::cleanup::Containers::default()
     };
     (stopped, containers)
+}
+
+/// Apply cleanup has the same scope as explicit clean, but cannot change apply's exit status.
+pub fn remove_after_apply(run: &Path) -> Vec<String> {
+    if active(&state(run)) || agent_alive(run) {
+        return vec![format!("kept active run {}", run.display())];
+    }
+    let meta = json(run.join("meta.json"));
+    let path = s(&meta["worktree"], "path");
+    let shared = !path.is_empty()
+        && all_runs().iter().any(|other| {
+            other != run && s(&json(other.join("meta.json"))["worktree"], "path") == path
+        });
+    let (_, containers) = remove(run);
+    let mut diagnostics = containers.diagnostic.into_iter().collect::<Vec<_>>();
+    if run.exists() {
+        diagnostics.push(format!("could not remove run {}", run.display()));
+    }
+    if !shared
+        && Path::new(path).is_absolute()
+        && path != s(&meta["worktree"], "source")
+        && Path::new(path).exists()
+    {
+        diagnostics.push(format!("could not remove worktree {path}"));
+    }
+    diagnostics
 }
 
 pub fn record_worktree_bytes(run: &Path) {

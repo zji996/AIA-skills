@@ -167,7 +167,7 @@ cargo test; echo $? > "$DELEGATE_RUN_DIR/denied-code"
         self.assertEqual(state["state"], "delivered")
         self.assertEqual(result.stderr.count("ignoring repository-only fields:"), 1)
         self.assertIn("worktree, generated, applyVerify", result.stderr)
-        self.assertEqual(self.cli("apply", state["run"]).returncode, 0)
+        self.assertEqual(self.cli("apply", "--json", "--keep", state["run"]).returncode, 0)
         for flags in (("--no-accept",), ("--read-only",)):
             state = self.outcome(self.cli("run", "--agent", "pi", "--workdir", repo, *flags, "task"))
             self.assertEqual(state["state"], "answered")
@@ -275,7 +275,7 @@ cargo test; echo $? > "$DELEGATE_RUN_DIR/denied-code"
         state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "task"))
         self.assertIs(state["accept"]["snapshotComplete"], True)
         self.assertEqual(state["accept"]["excluded"], ["third_party/pi"])
-        applied = self.outcome(self.cli("apply", state["run"]))
+        applied = self.outcome(self.cli("apply", "--json", "--keep", state["run"]))
         self.assertIs(applied["acceptStillValid"], True)
         self.assertEqual(applied["excluded"], ["third_party/pi"])
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED],
@@ -428,7 +428,7 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
         self.assertEqual(state["state"], "delivered")
         self.assertEqual(state["denied"], 1)
         self.assertIn("[exit 0]", (Path(state["dir"]) / "setup.log").read_text())
-        result = self.cli("apply", state["run"], "--verify")
+        result = self.cli("apply", "--json", "--keep", state["run"], "--verify")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIs(self.outcome(result)["verify"]["ok"], True)
         self.assertEqual((repo / "gen/out").read_text(), "new\n")

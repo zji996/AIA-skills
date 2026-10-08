@@ -27,6 +27,8 @@
 
 `delegate` 架构总览：[docs/assets/delegate-architecture.webp](docs/assets/delegate-architecture.webp)（提示词同目录）。
 
+`delegate` 5.25.0 少写少选：仓库 `standing` 固定说明与 `agentDeny` 提示自动附到每份任务说明，`defaults` 给 worktree/protect/acceptAlso/timeout/evidence 默认值并在启动时回显来源；省略 `--name` 取说明首行；无参 `wait` 交付下一个结束的任务并在末行写明还剩几个、再跑哪条命令；答复显示上限默认 20000（`resultChars`），`--max-answer` 超长时自动压缩一次；`apply` 合入后自动清理并说明验收是否仍有效；任务收尾不再终止 sccache 这类共享守护进程。入口 `SKILL.md` 精简为三步、场景表与档位，状态与边界细节移到 `references/reading-results.md`。
+
 `delegate` 5.24.0 源构建目录提示：写入收尾在 worktree 测量后限时测源仓库的现存 target（根有 Cargo.toml），用户/仓库 `sourceBuild.paths` 可替换、空数组关闭；status/wait 取同源最近缓存，默认 60 GiB 提示总量、各路径大小及[先量再删的参考](skills/delegate/references/cleanup.md)，`DELEGATE_SOURCE_BUILD_WARN_GIB` 可调、0 关闭，JSON 独立追加 `sourceBuildDisk`；失败不改结论，只提示不删。
 
 `delegate` 5.23.0 清理能力：移除 worktree 连带回收 compose 容器和匿名卷，`clean` 同时回收目录已消失的旧孤儿，Docker 失败只提示；写入任务结束时缓存磁盘占用，`status`/`wait` 达默认 20 GiB 时提示总量、最大三项与清理命令（`DELEGATE_WORKTREE_WARN_GIB` 可调、0 关闭）。改写后手动合入并提交立即 `clean <run> --force`；门禁直接后台跑命令本身或 `lane`，避免 `pgrep -f` 轮询匹配自身。

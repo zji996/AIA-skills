@@ -550,7 +550,12 @@ pub fn run_agent(
     }
     let prompt = OpenOptions::new()
         .read(true)
-        .open(run.join("prompt.md"))
+        .open(
+            meta["agentPromptFile"]
+                .as_str()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| run.join("prompt.md")),
+        )
         .map_err(|e| e.to_string())?;
     let stderr = OpenOptions::new()
         .create(true)

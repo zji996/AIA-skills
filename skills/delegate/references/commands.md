@@ -8,17 +8,19 @@
 | `run [选项] [--max <时长>]` | 启动并等到结论 |
 | `reply <run> [消息] [--wait] [--fresh] [--sync]` | 接着最新一轮会话在后台启动并立即返回；`--wait` 等到结论（此时可用 `--max`/`--progress`/`--full`）。`--fresh` 开新会话，消息须自足；`--sync` 先同步主控后来改动，冲突时直接拒绝。验收与证据命令默认沿用，可分别覆盖或关闭；取消或隐藏已变更的验收命令时会告诉同事旧标准不再适用 |
 | `diff [<run>] [--stat] [--total] [路径...]` | 以 `git diff` 输出该轮的改动；`--total` 为整段对话；终端下带颜色 |
-| `apply [<run>] [--dry-run] [--merge]` | 把 `--worktree` 的现状（含最后一轮之后在 worktree 里的手工修改）相对对话起点的全部改动合并回原工作区（只写文件，不碰 index）：你没动过的文件直接写入（含权限位），双方都改过的文本做三方合并，大文件从 worktree 复制；经符号链接目录、文件与目录互换、二进制与符号链接冲突一律算冲突；有合并不了的冲突时什么都不写，`--merge` 则写入其余文件并在冲突处留冲突标记（其余冲突跳过）。没有跳过项时，共用该 worktree 的所有 run（含畸形的旁支）标记 `.applied` |
-| `wait [<run>...\|--all] [--max <时长>] [--no-result] [--full] [--progress]` | 等待并输出结论；不指定任务时（或 `--all`）等所有仍在运行和尚未读取结果的任务 |
+| `apply [<run>] [--dry-run] [--merge] [--keep] [--json]` | 把 `--worktree` 的现状（含最后一轮之后在 worktree 里的手工修改）相对对话起点的全部改动合并回原工作区（只写文件，不碰 index）：你没动过的文件直接写入（含权限位），双方都改过的文本做三方合并，大文件从 worktree 复制；经符号链接目录、文件与目录互换、二进制与符号链接冲突一律算冲突；有合并不了的冲突时什么都不写，`--merge` 则写入其余文件并在冲突处留冲突标记（其余冲突跳过）。没有跳过项时，共用该 worktree 的所有 run（含畸形的旁支）标记 `.applied`；成功自动清理本轮 run 与不再共享的 worktree，`--keep` 保留，清理失败仅提示。人读末行给验收有效性与需在主干重跑的完整验收命令，`--json` 保持既有结论字段 |
+| `wait [<run>...\|--all] [--max <时长>] [--no-result] [--full] [--progress]` | 无参默认同 `--any`：交付已结束未读取的，否则等下一批结束即返回；`--until-all` 等全部，`--all` 仅控制范围。人读末行给本会话剩余数和原样重跑命令，无运行任务时明确说明 |
 | `status [<run>...] [--json]` | 默认每任务一条自然语言短行；`--json` 保留完整原字段 |
 | `result [<run>] [--path]` | 输出完整答复 |
 | `stop <run>...` | 终止任务及其 scope、进程组 |
 | `clean <run>...\|--finished [--force]` | 删除已结束的任务；`--finished` 默认保留结果未读取的 |
 | `lane [--label <文字>] [--] <命令>` | 在整机重任务队列里执行命令（一个参数按 shell 命令执行），退出码原样返回；不带命令时列出正在跑与排队的项 |
 
-启动选项：`--tier cheap|strong`（默认只读 cheap、写入 strong；便宜档失败且未改动时自动升档一次）、`--agent pi|codex`（直接指定，与 `--tier` 互斥，不升档）、`--image <路径>`（可重复）、`--accept <命令>` / `--no-accept`（覆盖或关闭仓库默认验收）、`--hide-accept`、`--accept-timeout`（默认 10m）、`--read-only`、`--in-place`（只读任务读实时工作区而非快照）、`--workdir`、`--timeout`（每次尝试，pi 默认 25m，codex 默认 50m）、`--retries`（答复畸形时重跑次数，默认 1）、`--model`/`--thinking`/`--provider`（不指定时用各 CLI 自己的默认设置；Codex 的 `--thinking` 对应推理强度）、`--allow-parallel-writes`、`--worktree`、`--after <run>`（等上游以 delivered/answered 结束再执行，否则 `skipped`；等待期间 state 为 `waiting`、不占名额）、`--in <run>`（只读，在上游 worktree 的快照里审它的改动）、`--protect <路径>`（可重复；末尾 `/` 为目录；被改动即判 `rejected` 并带 `protectViolation`，不跑验收；reply 沿用）。`<run>` 可以是完整 id、唯一片段、`last` 或 run 目录。
+启动选项：`--tier cheap|strong`（默认只读 cheap、写入 strong；便宜档失败且未改动时自动升档一次）、`--agent pi|codex`（直接指定，与 `--tier` 互斥，不升档）、`--image <路径>`（可重复）、`--accept <命令>` / `--no-accept`（覆盖或关闭仓库默认验收）、`--hide-accept`、`--accept-timeout`（默认 10m）、`--read-only`、`--in-place`（只读读实时工作区；写入覆盖 worktree 默认并原地写入）、`--workdir`、`--timeout`（每次尝试，pi 默认 25m，codex 默认 50m）、`--retries`（答复畸形时重跑次数，默认 1）、`--model`/`--thinking`/`--provider`（不指定时用各 CLI 自己的默认设置；Codex 的 `--thinking` 对应推理强度）、`--allow-parallel-writes`、`--worktree`、`--after <run>`（等上游以 delivered/answered 结束再执行，否则 `skipped`；等待期间 state 为 `waiting`、不占名额）、`--in <run>`（只读，在上游 worktree 的快照里审它的改动）、`--protect <路径>`（可重复；末尾 `/` 为目录；被改动即判 `rejected` 并带 `protectViolation`，不跑验收；reply 沿用）。`--name` 省略时取说明首个非空行生成最多 40 字的可读名称，唯一 ID 规则不变；reply 轮次命名不变。`<run>` 可以是完整 id、唯一片段、`last` 或 run 目录。
 
 `start`/`run`/`reply` 另支持 `--evidence <命令>`、`--no-evidence` 与 `--evidence-timeout`（默认 30m）。reply 沿用上一轮证据命令与超时，可覆盖或关闭。`--agent` 固定同事时仍显示适配表默认档位（Pi cheap、Codex strong），JSON `agentPinned: true`；旧 meta 缺字段时按同一规则推断显示，不改写旧 meta，不自动升档。
+
+`start`/`run`/`reply` 支持 `--max-answer N`（正整数，reply 继承）：附“答复不超过 N 字”，超出 1.5 倍时从当前会话续接一次“压缩到 N 字以内，保留结论与证据”。只有成功且符合 N 字上限才采用，失败保留原答复并提示；不耗返工预算，原文另存 `result-original.md`。固定说明与常用默认参数见 [配置](configuration.md)。
 
 ## 证据命令
 

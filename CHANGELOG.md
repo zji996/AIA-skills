@@ -9,6 +9,13 @@
 
 ### 技能
 
+- `delegate` 5.25.0：默认答复显示上限升至 20000，新增 `resultChars` 与 1.25 倍全文容差；`--max-answer` 超长时会话内追问压缩一次，原文另存，失败保留、不耗返工预算。
+- `delegate` 5.25.0：`defaults` 提供 worktree/protect/acceptAlso/timeout/evidence，CLI 覆盖、`--in-place` 原地写入；省略 name 自动取说明首行，启动显示生效默认值与来源。
+- `delegate` 5.25.0：`standing` 按 all/write/readOnly 附固定说明及 deny 命令和 hint，启动显示行数与来源，JSON 保存实际文字；普通 reply 不重复，fresh 更新附加。
+- `delegate` 5.25.0：无参 wait 默认交付下一批结束结果，`--until-all` 显式全等；人读末行给本会话剩余数和原样重跑命令。
+- `delegate` 5.25.0：成功 apply 自动 clean，`--keep` 保留，清理失败仅提示；人读末行报告验收有效性及主干需重跑的完整命令，JSON 字段不变。
+- `delegate` 5.25.0：进程组、任务标记与 systemd 回收豁免 sccache，`cleanupKeepExecutables` 可追加共享守护进程；其他被终止进程提示可执行名，二进制与入口版本留待主控更新。
+
 - `delegate` 5.24.0：写入收尾限时缓存源仓库构建目录大小，用户/仓库 `sourceBuild.paths` 可覆盖或关闭；status/wait 按最近测量独立提示 `sourceBuildDisk`，默认 60 GiB、环境变量可调，失败不改结论，只提示不删。二进制留待主控发版。
 
 - `delegate` 文档（沿用 5.23.0 二进制）：清理参考新增“源仓库的构建缓存”，说明 delegate 回收不到的增量编译目录与自有包旧产物怎么量、删哪些、哪些不动，以及按访问时间或固定天数筛选为什么不对；常见坑与长时间推进各加一行指向。

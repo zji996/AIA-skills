@@ -208,15 +208,32 @@ fn value<'a>(kv: &'a [(String, String)], key: &str) -> Option<&'a str> {
 /// Returns true when the answer was abbreviated.
 fn print_answer(run: &Path, full: bool) -> bool {
     let result = read(run.join("result.md"));
-    let limit = setting("RESULT_CHARS", "6000")
+    let configured = json(run.join("meta.json"))["resultDisplayChars"]
+        .as_u64()
+        .unwrap_or(20000);
+    let limit = setting("RESULT_CHARS", &configured.to_string())
         .parse::<usize>()
-        .unwrap_or(6000);
+        .ok()
+        .filter(|n| *n > 0)
+        .unwrap_or(20000);
     println!(
         "\n===== result: {} ({} chars) =====",
         run.file_name().unwrap_or_default().to_string_lossy(),
         result.chars().count()
     );
-    let truncated = !full && result.chars().count() > limit;
+    let truncated = !full && result.chars().count() > limit.saturating_add(limit / 4);
+    let compression = json(run.join("compression.json"));
+    if compression.is_object() {
+        println!(
+            "答复压缩{}；原文：{}",
+            if b(&compression, "ok") {
+                "完成"
+            } else {
+                "失败，保留原答复"
+            },
+            s(&compression, "original")
+        );
+    }
     if !truncated {
         println!("{}", result.trim_end_matches('\n'));
     } else {
@@ -386,13 +403,30 @@ fn collect_timed(
                         .join(", ")
                 })
                 .unwrap_or_default();
+            let executables = cleanup["executables"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let mut details = Vec::new();
+            if !executables.is_empty() {
+                details.push(format!("进程 {executables}"));
+            }
+            if !ports.is_empty() {
+                details.push(format!("端口 {ports}"));
+            }
             println!(
                 "note: 任务结束时终止了 {} 个后台进程{}；答复中提到的服务/地址已不可用",
                 cleanup["terminated"],
-                if ports.is_empty() {
+                if details.is_empty() {
                     String::new()
                 } else {
-                    format!("（端口 {ports}）")
+                    format!("（{}）", details.join("；"))
                 }
             );
         }
@@ -469,6 +503,37 @@ fn wait_list(pos: &[String], flags: &[String], quiet: bool) -> Res<(Vec<PathBuf>
         }
     }
     Ok((v, hinted))
+}
+/// End every human-readable wait with the same command to collect the next result.
+fn wait_remaining_hint(args: &[String]) {
+    if output::json_enabled() {
+        return;
+    }
+    let list = if has(args, "--machine") {
+        launch::machine_runs(&state_dir())
+    } else {
+        runs::all_runs()
+    };
+    let session = caller();
+    let left = list
+        .iter()
+        .filter(|run| runs::active(&runs::state(run)))
+        .filter(|run| {
+            session.as_ref().is_none_or(|id| {
+                json(run.join("meta.json"))["caller"].as_str() == Some(id.as_str())
+            })
+        })
+        .count();
+    if left == 0 {
+        println!("本会话没有在跑的任务");
+    } else {
+        let command = std::iter::once(script().to_string_lossy().into_owned())
+            .chain(args.iter().cloned())
+            .map(|arg| shell_quote(&arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("本会话还剩 {left} 个任务在跑；原样再跑：{command}");
+    }
 }
 /// Blocks until the run leaves its active states: on its supervisor lock, else by polling.
 fn until_finished(run: &Path, poll: f64) {
@@ -843,9 +908,19 @@ fn diff(args: &[String]) -> Res<i32> {
 fn apply(args: &[String]) -> Res<i32> {
     let (pos, flags, _) = parse_simple(
         args,
-        &["--dry-run", "--merge", "--verify", "--no-verify"],
+        &[
+            "--dry-run",
+            "--merge",
+            "--verify",
+            "--no-verify",
+            "--keep",
+            "--json",
+        ],
         &[],
     )?;
+    if has(&flags, "--json") {
+        output::enable_json();
+    }
     if has(&flags, "--verify") && has(&flags, "--no-verify") {
         return Err("--verify and --no-verify are exclusive".into());
     }
@@ -883,7 +958,46 @@ fn apply(args: &[String]) -> Res<i32> {
     if !worktree::verify_after_apply(&run, forced, &mut outcome.conclusion)? && outcome.code == 0 {
         outcome.code = 1;
     }
+    // Capture acceptance before cleaning, since clean removes the recorded task metadata.
+    let meta = json(run.join("meta.json"));
+    let final_line = if outcome.conclusion["acceptStillValid"] == json!(true) {
+        "验收仍然有效（仓库快照范围）".to_string()
+    } else {
+        let mut commands = Vec::new();
+        let accept = s(&meta, "accept").trim();
+        if !accept.is_empty() {
+            commands.push(accept.to_string());
+        }
+        for command in meta["acceptAlso"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+        {
+            if !command.trim().is_empty() && !commands.iter().any(|item| item == command) {
+                commands.push(command.to_string());
+            }
+        }
+        let validity = if outcome.conclusion["acceptStillValid"] == json!(false) {
+            "验收无效"
+        } else {
+            "验收有效性未确认"
+        };
+        if commands.is_empty() {
+            format!("{validity}；任务没有验收命令")
+        } else {
+            format!("{validity}；需要在主干重跑：{}", commands.join("；"))
+        }
+    };
     println!("{}", format_status(outcome.conclusion));
+    if outcome.code == 0 && !has(&flags, "--dry-run") && !has(&flags, "--keep") {
+        for diagnostic in runs::remove_after_apply(&run) {
+            eprintln!("delegate: apply cleanup: {diagnostic}");
+        }
+    }
+    if !output::json_enabled() {
+        println!("{final_line}");
+    }
     Ok(outcome.code)
 }
 fn main_inner(args: &[String]) -> Res<i32> {
@@ -976,6 +1090,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     "--full",
                     "--progress",
                     "--any",
+                    "--until-all",
                     "--stream",
                     "--json",
                 ],
@@ -988,10 +1103,18 @@ fn main_inner(args: &[String]) -> Res<i32> {
             if has(&flags, "--machine") && !pos.is_empty() {
                 return Err("--machine does not take run arguments".into());
             }
-            let (any, stream) = (has(&flags, "--any"), has(&flags, "--stream"));
-            if any && stream {
+            let (explicit_any, stream, until_all) = (
+                has(&flags, "--any"),
+                has(&flags, "--stream"),
+                has(&flags, "--until-all"),
+            );
+            if explicit_any && stream {
                 return Err("--any and --stream cannot be combined".into());
             }
+            if until_all && (explicit_any || stream) {
+                return Err("--until-all cannot be combined with --any or --stream".into());
+            }
+            let any = explicit_any || (pos.is_empty() && !stream && !until_all);
             let (mut list, hinted) = wait_list(&pos, &flags, false)?;
             if any {
                 // A named run that was already reported in full is not waited for again, so
@@ -1098,6 +1221,9 @@ fn main() {
     {
         output::worktree_disk();
         output::source_build_disk();
+        if args.first().is_some_and(|command| command == "wait") {
+            wait_remaining_hint(&args);
+        }
     }
     match result {
         Ok(code) => std::process::exit(code),

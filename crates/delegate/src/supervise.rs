@@ -204,7 +204,83 @@ fn attempts_from(
         }
         log_event(run, json!({"e":"rerun","reason":"malformed answer"}));
     }
+    if verdict == "ok" {
+        (answer, attempt) = compress_answer(meta, run, answer, attempt, holder, grace);
+    }
     (verdict, answer, attempt)
+}
+
+fn compress_answer(
+    meta: &Value,
+    run: &Path,
+    answer: String,
+    attempt: i64,
+    holder: Arc<AtomicI32>,
+    grace: Arc<std::sync::Mutex<Option<f64>>>,
+) -> (String, i64) {
+    let Some(limit) = meta["maxAnswer"].as_u64() else {
+        return (answer, attempt);
+    };
+    if answer.chars().count() as u64 <= limit.saturating_add(limit / 2)
+        || run.join("compression.json").exists()
+        || lane::stopped()
+    {
+        return (answer, attempt);
+    }
+    let original = run.join("result-original.md");
+    let mut record = json!({"ok":false,"original":original,"maxAnswer":limit});
+    let execute = || -> Res<(String, String)> {
+        write(&original, &answer)?;
+        let session = runs::events(run)
+            .into_iter()
+            .rev()
+            .find(|e| s(e, "e") == "session" && !s(e, "id").is_empty())
+            .ok_or("no saved session for answer compression")?;
+        let mut continuation = meta.clone();
+        continuation["fork"] = if agents::spec(s(meta, "agent"))
+            .is_some_and(|a| a.session == agents::SessionSource::DelegateFile)
+        {
+            json!(
+                agents::session_file(s(meta, "sessionDir"), s(&session, "id"))
+                    .ok_or("missing session file for answer compression")?
+            )
+        } else {
+            session["id"].clone()
+        };
+        let prompt = run.join("compression-prompt.md");
+        write(&prompt, format!("压缩到 {limit} 字以内，保留结论与证据。只答复文字，不执行命令或修改文件。 / Compress your previous answer to at most {limit} characters, preserving conclusions and evidence. Respond with text only.\n"))?;
+        continuation["agentPromptFile"] = json!(prompt);
+        log_event(run, json!({"e":"answer_compression","maxAnswer":limit}));
+        agents::run_agent(&continuation, run, attempt + 1, holder, grace)
+    };
+    let mut used_attempt = attempt;
+    let result = match execute() {
+        Ok((verdict, compressed)) => {
+            used_attempt += 1;
+            // Same tolerance as the trigger: a shorter answer slightly over the limit beats the original.
+            let length = compressed.chars().count() as u64;
+            if verdict == "ok"
+                && !compressed.trim().is_empty()
+                && length <= limit.saturating_add(limit / 2)
+                && length < answer.chars().count() as u64
+            {
+                record["ok"] = json!(true);
+                Some(compressed)
+            } else {
+                record["error"] = json!(format!(
+                    "compression returned {verdict}, {} characters",
+                    compressed.chars().count()
+                ));
+                None
+            }
+        }
+        Err(error) => {
+            record["error"] = json!(error);
+            None
+        }
+    };
+    let _ = write_json(run.join("compression.json"), &record);
+    (result.unwrap_or(answer), used_attempt)
 }
 fn settle(
     meta: &Value,

@@ -332,24 +332,26 @@ pub fn group_members(pgid: i32) -> bool {
 }
 pub fn end_group(pid: i32, grace: f64) {
     for sig in [libc::SIGTERM, libc::SIGKILL] {
-        killpg(pid, sig);
+        crate::cleanup::signal_group(pid, sig);
         let start = std::time::Instant::now();
-        while group_members(pid) && start.elapsed().as_secs_f64() < grace {
+        while crate::cleanup::group_has_cleanup_members(pid)
+            && start.elapsed().as_secs_f64() < grace
+        {
             std::thread::sleep(Duration::from_millis(50));
         }
-        if !group_members(pid) {
+        if !crate::cleanup::group_has_cleanup_members(pid) {
             break;
         }
     }
 }
 pub fn kill_group(pid: i32, grace: f64) {
-    killpg(pid, libc::SIGTERM);
+    crate::cleanup::signal_group(pid, libc::SIGTERM);
     let start = std::time::Instant::now();
-    while group_members(pid) && start.elapsed().as_secs_f64() < grace {
+    while crate::cleanup::group_has_cleanup_members(pid) && start.elapsed().as_secs_f64() < grace {
         std::thread::sleep(Duration::from_millis(100));
     }
-    if group_members(pid) {
-        killpg(pid, libc::SIGKILL);
+    if crate::cleanup::group_has_cleanup_members(pid) {
+        crate::cleanup::signal_group(pid, libc::SIGKILL);
     }
 }
 pub fn shell_quote(s: &str) -> String {

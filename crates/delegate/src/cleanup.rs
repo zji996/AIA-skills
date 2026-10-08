@@ -6,11 +6,99 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 static SYSTEMD: OnceLock<bool> = OnceLock::new();
 static DOCKER_FAILURE: OnceLock<String> = OnceLock::new();
+static GROUP_KEEP: OnceLock<Mutex<BTreeMap<i32, BTreeSet<String>>>> = OnceLock::new();
+
+// These build services deliberately outlive a task; socket ports are not an identity.
+const SHARED_EXECUTABLES: &[&str] = &["sccache"];
+
+fn keep_executables(run: &Path) -> BTreeSet<String> {
+    let meta = json(run.join("meta.json"));
+    SHARED_EXECUTABLES
+        .iter()
+        .copied()
+        .chain(
+            meta["cleanupKeepExecutables"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str),
+        )
+        .map(str::to_string)
+        .collect()
+}
+
+fn executable(pid: i32) -> String {
+    fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .map(|name| name.strip_suffix(" (deleted)").unwrap_or(&name).to_string())
+        .unwrap_or_else(|| read(format!("/proc/{pid}/comm")).trim().to_string())
+}
+
+fn group_candidates(pgid: i32) -> Vec<i32> {
+    fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<i32>().ok())
+        .filter(|pid| alive(*pid) && unsafe { libc::getpgid(*pid) } == pgid)
+        .collect()
+}
+
+fn group_keep(pgid: i32, pids: &[i32]) -> BTreeSet<String> {
+    let mut keep: BTreeSet<_> = SHARED_EXECUTABLES
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+    if let Some(saved) = GROUP_KEEP.get().and_then(|groups| groups.lock().ok()) {
+        if let Some(names) = saved.get(&pgid) {
+            keep.extend(names.iter().cloned());
+        }
+    }
+    // Stop may execute in another delegate process, so recover the task's config from its marker.
+    for pid in pids {
+        if let Ok(env) = fs::read(format!("/proc/{pid}/environ")) {
+            for entry in env.split(|byte| *byte == 0) {
+                if let Some(run) = entry.strip_prefix(b"DELEGATE_RUN_DIR=") {
+                    if let Ok(run) = std::str::from_utf8(run) {
+                        keep.extend(keep_executables(Path::new(run)));
+                    }
+                }
+            }
+        }
+    }
+    keep
+}
+
+pub fn group_has_cleanup_members(pgid: i32) -> bool {
+    let pids = group_candidates(pgid);
+    let keep = group_keep(pgid, &pids);
+    pids.into_iter().any(|pid| !keep.contains(&executable(pid)))
+}
+
+pub fn signal_group(pgid: i32, signal: i32) {
+    let pids = group_candidates(pgid);
+    let keep = group_keep(pgid, &pids);
+    if pids.iter().any(|pid| keep.contains(&executable(*pid))) {
+        for pid in pids {
+            if !keep.contains(&executable(pid)) {
+                unsafe {
+                    libc::kill(pid, signal);
+                }
+            }
+        }
+    } else {
+        crate::common::killpg(pgid, signal);
+    }
+}
 
 // Bound every bus request, including discovery: a wedged user manager must not hold up delivery.
 fn systemctl(args: &[&str]) -> Result<String, String> {
@@ -312,6 +400,7 @@ fn stop_unit(unit: &str) -> Result<bool, String> {
 
 fn user_units(run: &Path, saved: &mut Value) -> usize {
     let mut stopped = 0;
+    let keep = keep_executables(run);
     let mut diagnostics = BTreeSet::new();
     if let Some(items) = saved["diagnostics"].as_array() {
         diagnostics.extend(items.iter().filter_map(Value::as_str).map(str::to_string));
@@ -366,6 +455,8 @@ fn user_units(run: &Path, saved: &mut Value) -> usize {
                 "-p",
                 "ExecStart",
                 "-p",
+                "ControlGroup",
+                "-p",
                 "Environment",
                 "-p",
                 "ActiveState",
@@ -391,6 +482,10 @@ fn user_units(run: &Path, saved: &mut Value) -> usize {
             let Some(reason) = unit_match(&properties, run, root.as_deref()) else {
                 continue;
             };
+            // A service matching the task marker may itself be a shared build daemon.
+            if unit_kept(&properties, &keep) || unit_contains_kept(&properties, &keep) {
+                continue;
+            }
             match stop_unit(unit) {
                 Ok(killed) => {
                     stopped += 1;
@@ -411,6 +506,49 @@ fn user_units(run: &Path, saved: &mut Value) -> usize {
     }
     saved["diagnostics"] = value!(diagnostics);
     stopped
+}
+
+fn unit_kept(properties: &BTreeMap<&str, &str>, keep: &BTreeSet<String>) -> bool {
+    let mut field_start = true;
+    for (token, literal) in
+        tokens(properties.get("ExecStart").copied().unwrap_or("")).unwrap_or_default()
+    {
+        if !literal && matches!(token.as_str(), "{" | "}" | ";") {
+            field_start = true;
+            continue;
+        }
+        if field_start {
+            field_start = false;
+            if token.strip_prefix("path=").is_some_and(|path| {
+                Path::new(path)
+                    .file_name()
+                    .is_some_and(|name| keep.contains(name.to_string_lossy().as_ref()))
+            }) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn unit_contains_kept(properties: &BTreeMap<&str, &str>, keep: &BTreeSet<String>) -> bool {
+    let group = properties.get("ControlGroup").copied().unwrap_or("");
+    let path = Path::new(group);
+    if group == "/"
+        || !path.is_absolute()
+        || !path
+            .components()
+            .skip(1)
+            .all(|part| matches!(part, Component::Normal(_)))
+    {
+        return false;
+    }
+    let mut pids = BTreeSet::new();
+    scope_dirs(
+        &Path::new("/sys/fs/cgroup").join(group.trim_start_matches('/')),
+        &mut pids,
+    );
+    pids.iter().any(|pid| keep.contains(&executable(*pid)))
 }
 
 pub fn probe_systemd() {
@@ -535,8 +673,33 @@ fn scopes(run: &Path) -> Vec<(String, PathBuf, BTreeSet<i32>)> {
     found
 }
 
-fn kill_scope(unit: &str, root: &Path, pids: &BTreeSet<i32>) {
+fn kill_scope(unit: &str, root: &Path, pids: &BTreeSet<i32>, keep: &BTreeSet<String>) {
     if pids.is_empty() {
+        return;
+    }
+    if pids.iter().any(|pid| keep.contains(&executable(*pid))) {
+        // Never signal the whole unit/cgroup if a shared daemon remains inside it.
+        let owned: Vec<_> = pids
+            .iter()
+            .copied()
+            .filter(|pid| !keep.contains(&executable(*pid)))
+            .collect();
+        for pid in &owned {
+            unsafe {
+                libc::kill(*pid, libc::SIGTERM);
+            }
+        }
+        let start = Instant::now();
+        while owned.iter().any(|pid| alive(*pid)) && start.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for pid in owned {
+            if alive(pid) && !keep.contains(&executable(pid)) {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
         return;
     }
     let signal = |name| {
@@ -588,6 +751,7 @@ fn members(
     run: &Path,
     pgid: i32,
     scope_pids: &BTreeSet<i32>,
+    keep: &BTreeSet<String>,
 ) -> Vec<(i32, String, Vec<u16>, bool)> {
     let uid = unsafe { libc::geteuid() };
     let ports = listening();
@@ -614,6 +778,9 @@ fn members(
             .ok()
             .is_some_and(|env| env.split(|b| *b == 0).any(|v| v == marker.as_bytes()));
         if !in_group && !tagged && !scope_pids.contains(&pid) {
+            continue;
+        }
+        if keep.contains(&executable(pid)) {
             continue;
         }
         let command = fs::read(path.join("cmdline")).unwrap_or_default();
@@ -654,16 +821,29 @@ pub fn record(run: &Path, pgid: i32) -> usize {
     let Ok(_guard) = lock(&run.join("cleanup.lock"), true, false) else {
         return 0;
     };
+    let keep = keep_executables(run);
+    if pgid > 0 {
+        if let Ok(mut groups) = GROUP_KEEP
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+        {
+            groups.insert(pgid, keep.clone());
+        }
+    }
     let scopes = scopes(run);
     let scope_pids = scopes
         .iter()
         .flat_map(|(_, _, pids)| pids.iter().copied())
         .collect();
-    let found = members(run, pgid, &scope_pids);
+    let found = members(run, pgid, &scope_pids, &keep);
+    let executables: BTreeMap<_, _> = found
+        .iter()
+        .map(|(pid, _, _, _)| (*pid, executable(*pid)))
+        .collect();
     let supervisor = read(run.join("pid")).trim().parse::<i32>().unwrap_or(0);
     for (unit, root, pids) in &scopes {
         if !pids.contains(&(std::process::id() as i32)) && !pids.contains(&supervisor) {
-            kill_scope(unit, root, pids);
+            kill_scope(unit, root, pids, &keep);
         }
     }
     let file = run.join("cleanup.json");
@@ -675,7 +855,8 @@ pub fn record(run: &Path, pgid: i32) -> usize {
         previous["processes"] = value!({});
     }
     for (pid, command, ports, escaped) in &found {
-        previous["processes"][pid.to_string()] = value!({"command":command,"ports":ports});
+        previous["processes"][pid.to_string()] =
+            value!({"command":command,"ports":ports,"executable":executables[pid]});
         if *escaped {
             unsafe {
                 libc::kill(*pid, libc::SIGTERM);
@@ -707,7 +888,11 @@ pub fn summary(run: &Path) -> Option<Value> {
     let processes = saved["processes"].as_object()?;
     let mut ports = BTreeSet::new();
     let mut commands = Vec::new();
+    let mut executables = BTreeSet::new();
     for (pid, item) in processes {
+        if let Some(name) = item["executable"].as_str().filter(|name| !name.is_empty()) {
+            executables.insert(name.to_string());
+        }
         commands.push(format!("{pid}: {}", item["command"].as_str().unwrap_or("")));
         if let Some(items) = item["ports"].as_array() {
             ports.extend(items.iter().filter_map(Value::as_u64));
@@ -718,7 +903,168 @@ pub fn summary(run: &Path) -> Option<Value> {
         .map(|items| items.len())
         .unwrap_or(0);
     Some(
-        value!({"terminated":processes.len(),"ports":ports,"commands":commands,
+        value!({"terminated":processes.len(),"ports":ports,"commands":commands,"executables":executables,
         "systemdStopped":units,"units":saved["units"],"diagnostics":saved["diagnostics"]}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Child;
+
+    struct Fixture {
+        root: PathBuf,
+        children: Vec<Child>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "delegate-cleanup-{}-{}",
+                std::process::id(),
+                crate::common::now_ns()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            Self {
+                root,
+                children: Vec::new(),
+            }
+        }
+
+        fn sleeper(&mut self, name: &str, tagged: bool) -> i32 {
+            let binary = self.root.join(name);
+            fs::copy("/bin/sleep", &binary).unwrap();
+            let mut command = Command::new(binary);
+            command
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if tagged {
+                command.env("DELEGATE_RUN_DIR", &self.root);
+            }
+            crate::common::group(&mut command);
+            let child = command.spawn().unwrap();
+            let pid = child.id() as i32;
+            self.children.push(child);
+            pid
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            for child in &mut self.children {
+                crate::common::killpg(child.id() as i32, libc::SIGKILL);
+                let _ = child.wait();
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn shared_daemons_survive_marker_and_group_cleanup() {
+        let mut fixture = Fixture::new();
+        write_json(
+            fixture.root.join("meta.json"),
+            &value!({"cleanupKeepExecutables":["custom-cache"]}),
+        )
+        .unwrap();
+        let cache = fixture.sleeper("sccache", true);
+        let custom = fixture.sleeper("custom-cache", true);
+        let server = fixture.sleeper("preview-server", true);
+        record(&fixture.root, cache);
+        crate::common::end_group(cache, 0.01);
+        crate::common::kill_group(custom, 0.01);
+        assert!(alive(cache));
+        assert!(alive(custom));
+        assert!(!alive(server));
+        let summary = summary(&fixture.root).unwrap();
+        assert_eq!(summary["terminated"], 1);
+        assert_eq!(summary["executables"], value!(["preview-server"]));
+        let saved = json(fixture.root.join("cleanup.json"));
+        assert_eq!(
+            saved["processes"][server.to_string()]["executable"],
+            "preview-server"
+        );
+        assert!(saved["processes"].get(cache.to_string()).is_none());
+    }
+
+    #[test]
+    fn scopes_with_shared_daemons_kill_only_other_members() {
+        let mut fixture = Fixture::new();
+        let cache = fixture.sleeper("sccache", false);
+        let server = fixture.sleeper("preview-server", false);
+        kill_scope(
+            "not-a-real-unit.scope",
+            &fixture.root,
+            &BTreeSet::from([cache, server]),
+            &keep_executables(&fixture.root),
+        );
+        assert!(alive(cache));
+        assert!(!alive(server));
+        assert!(!fixture.root.join("cgroup.kill").exists());
+    }
+
+    #[test]
+    fn mixed_process_group_keeps_daemon_and_terminates_other_members() {
+        let mut fixture = Fixture::new();
+        fs::copy("/bin/sleep", fixture.root.join("sccache")).unwrap();
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!(
+            "{}/sccache 60 & echo $! > {}/cache.pid; /bin/sleep 60 & echo $! > {}/server.pid; wait",
+            fixture.root.display(), fixture.root.display(), fixture.root.display()
+        ))
+            .env("DELEGATE_RUN_DIR", &fixture.root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        crate::common::group(&mut command);
+        let child = command.spawn().unwrap();
+        let pgid = child.id() as i32;
+        fixture.children.push(child);
+        let start = Instant::now();
+        while read(fixture.root.join("server.pid"))
+            .trim()
+            .parse::<i32>()
+            .is_err()
+            && start.elapsed() < Duration::from_secs(3)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let cache: i32 = read(fixture.root.join("cache.pid")).trim().parse().unwrap();
+        let server: i32 = read(fixture.root.join("server.pid"))
+            .trim()
+            .parse()
+            .unwrap();
+        // Wait until both forked children have executed; the shell writes PID files before exec.
+        while executable(cache) != "sccache" && start.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        record(&fixture.root, pgid);
+        crate::common::end_group(pgid, 0.1);
+        assert!(alive(cache));
+        assert!(!alive(server));
+        assert!(!group_has_cleanup_members(pgid));
+    }
+
+    #[test]
+    fn systemd_shared_executable_matches_only_the_program() {
+        let keep = BTreeSet::from(["sccache".to_string(), "custom-cache".to_string()]);
+        for exec in [
+            "{ path=/usr/bin/sccache ; argv[]=/usr/bin/sccache ; }",
+            "{ path=\"/path with spaces/custom-cache\" ; argv[]=custom-cache ; }",
+        ] {
+            assert!(unit_kept(&BTreeMap::from([("ExecStart", exec)]), &keep));
+        }
+        assert!(!unit_kept(
+            &BTreeMap::from([(
+                "ExecStart",
+                "{ path=/usr/bin/sh ; argv[]=/usr/bin/sh -c \"echo ; path=/usr/bin/sccache\" ; }"
+            )]),
+            &keep
+        ));
+    }
 }

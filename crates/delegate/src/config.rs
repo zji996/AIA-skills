@@ -7,6 +7,37 @@ pub struct Config {
     pub value: Value,
     pub sources: Vec<&'static str>,
     pub ignored: Vec<&'static str>,
+    pub origins: Value,
+}
+
+fn text_value(value: &Value) -> bool {
+    value.as_str().is_some_and(|s| !s.contains('\0'))
+        || value.as_array().is_some_and(|a| {
+            a.iter()
+                .all(|v| v.as_str().is_some_and(|s| !s.contains('\0')))
+        })
+}
+
+fn standing_object(value: &Value) -> Value {
+    if value.is_object() {
+        value.clone()
+    } else {
+        json!({"all": value})
+    }
+}
+
+pub fn text_lines(value: &Value) -> String {
+    if let Some(text) = value.as_str() {
+        text.to_string()
+    } else {
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 pub fn user_path() -> PathBuf {
@@ -33,6 +64,63 @@ pub fn read_file(path: &Path) -> Res<Option<Value>> {
 
 fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
     let check = || -> Res<()> {
+        if let Some(v) = value.get("standing") {
+            let valid = if let Some(map) = v.as_object() {
+                map.iter().all(|(k, v)| {
+                    ["all", "write", "readOnly"].contains(&k.as_str()) && text_value(v)
+                })
+            } else {
+                text_value(v)
+            };
+            if !valid {
+                return Err(
+                    "standing must be text, text array, or {all, write, readOnly} text fields"
+                        .into(),
+                );
+            }
+        }
+        if value.get("resultChars").is_some_and(|v| {
+            !v.as_u64()
+                .is_some_and(|n| n > 0 && usize::try_from(n).is_ok())
+        }) {
+            return Err("resultChars must be a positive integer".into());
+        }
+        if let Some(v) = value.get("cleanupKeepExecutables") {
+            if !v.as_array().is_some_and(|a| {
+                a.iter().all(|v| {
+                    v.as_str()
+                        .is_some_and(|s| !s.is_empty() && !s.contains(['/', '\0']))
+                })
+            }) {
+                return Err("cleanupKeepExecutables must be an array of executable names".into());
+            }
+        }
+        if let Some(v) = value.get("defaults") {
+            let map = v.as_object().ok_or("defaults must be an object")?;
+            for (k, v) in map {
+                let valid = match k.as_str() {
+                    "worktree" => v.is_boolean(),
+                    "protect" | "acceptAlso" => v.as_array().is_some_and(|a| {
+                        a.iter().all(|v| {
+                            v.as_str()
+                                .is_some_and(|s| !s.trim().is_empty() && !s.contains('\0'))
+                        })
+                    }),
+                    "timeout" => v.as_str().is_some_and(|s| seconds(s).is_ok()),
+                    "evidence" => v.as_str().is_some_and(|s| !s.contains('\0')),
+                    _ => false,
+                };
+                if !valid {
+                    return Err(format!("invalid defaults.{k}"));
+                }
+                if k == "protect" {
+                    let mut paths = v.as_array().unwrap().iter().filter_map(Value::as_str)
+                        .map(str::to_string).collect();
+                    crate::launch::normalize_protect(&mut paths)
+                        .map_err(|e| format!("invalid defaults.protect: {e}"))?;
+                }
+            }
+        }
         if let Some(env) = value.get("env").filter(|v| !v.is_null()) {
             let map = env.as_object().ok_or("env must map names to strings")?;
             for (key, val) in map {
@@ -129,6 +217,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         "maxHeavy",
         "repoMaxActive",
         "repoMaxCodex",
+        "resultChars",
     ] {
         if value.get(key).is_none() {
             if let Some(v) = user.as_ref().and_then(|u| u.get(key)) {
@@ -137,8 +226,38 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         }
     }
     let mut env = json!({});
+    let mut defaults = json!({});
+    let mut standing = json!({});
+    let mut origins = json!({"defaults":{},"standing":{}});
+    let mut keep = Vec::<Value>::new();
     let mut rules: Vec<Value> = vec![];
-    for layer in [&user, &repo].into_iter().flatten() {
+    let mut rule_sources = Vec::new();
+    for (source, layer) in [("user", &user), ("repo", &repo)] {
+        let Some(layer) = layer else { continue };
+        if layer.get("resultChars").is_some() {
+            origins["resultChars"] = json!(source);
+        }
+        if let Some(map) = layer["defaults"].as_object() {
+            for (key, val) in map {
+                defaults[key] = val.clone();
+                origins["defaults"][key] = json!(source);
+            }
+        }
+        if let Some(v) = layer.get("standing") {
+            for (key, val) in standing_object(v).as_object().unwrap() {
+                standing[key] = val.clone();
+                origins["standing"][key] = json!(source);
+            }
+        }
+        for v in layer["cleanupKeepExecutables"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if !keep.contains(v) {
+                keep.push(v.clone());
+            }
+        }
         if let Some(map) = layer["env"].as_object() {
             env.as_object_mut().unwrap().extend(map.clone());
         }
@@ -149,20 +268,29 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
             if rule["allow"] == json!(true) {
                 if let Some(pos) = position {
                     rules.remove(pos);
+                    rule_sources.remove(pos);
                 }
             } else if let Some(pos) = position {
                 rules[pos] = rule.clone();
+                rule_sources[pos] = source;
             } else {
                 rules.push(rule.clone());
+                rule_sources.push(source);
             }
         }
     }
     value["env"] = env;
     value["agentDeny"] = json!(rules);
+    origins["agentDeny"] = json!(["user", "repo"].into_iter()
+        .filter(|source| rule_sources.contains(source)).collect::<Vec<_>>());
+    value["defaults"] = defaults;
+    value["standing"] = standing;
+    value["cleanupKeepExecutables"] = json!(keep);
     Ok(Config {
         value,
         sources,
         ignored,
+        origins,
     })
 }
 

@@ -57,6 +57,7 @@ pub struct Options {
     pub minor: bool,
     pub over_limit: Option<String>,
     pub rework: Option<Value>,
+    pub max_answer: Option<u64>,
 }
 impl Options {
     pub fn new() -> Self {
@@ -147,6 +148,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             "--evidence",
             "--evidence-timeout",
             "--timeout",
+            "--max-answer",
             "--retries",
             "--provider",
             "--model",
@@ -188,6 +190,14 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 }
                 "--evidence-timeout" => o.evidence_timeout = Some(v),
                 "--timeout" => o.timeout = Some(v),
+                "--max-answer" => {
+                    o.max_answer = Some(
+                        v.parse::<u64>()
+                            .ok()
+                            .filter(|n| *n > 0)
+                            .ok_or("--max-answer must be a positive integer")?,
+                    )
+                }
                 "--retries" => {
                     o.retries = v.parse().map_err(|_| "invalid --retries".to_string())?
                 }
@@ -445,7 +455,7 @@ pub fn contract(
         )
     }
 }
-fn normalize_protect(paths: &mut Vec<String>) -> Res<()> {
+pub(crate) fn normalize_protect(paths: &mut Vec<String>) -> Res<()> {
     for path in paths.iter_mut() {
         let directory = path.ends_with('/');
         let components = Path::new(path.as_str()).components().collect::<Vec<_>>();
@@ -472,18 +482,120 @@ fn normalize_protect(paths: &mut Vec<String>) -> Res<()> {
     paths.dedup();
     Ok(())
 }
+fn prompt_name(prompt: &str) -> String {
+    let name = prompt
+        .lines()
+        .find(|s| !s.trim().is_empty())
+        .unwrap_or("task")
+        .trim()
+        .trim_start_matches(['#', '*', '-', ' '])
+        .chars()
+        .take(40)
+        .collect::<String>();
+    if name.is_empty() {
+        "task".into()
+    } else {
+        name
+    }
+}
+
+fn effective_defaults(o: &mut Options, config: &crate::config::Config) -> Value {
+    let mut applied = json!({});
+    let defaults = &config.value["defaults"];
+    for key in ["worktree", "protect", "acceptAlso", "timeout", "evidence"] {
+        let Some(v) = defaults.get(key) else { continue };
+        let used = match key {
+            "worktree" if !o.read_only && !o.in_place && !o.worktree => {
+                o.worktree = v.as_bool().unwrap();
+                true
+            }
+            "protect" if o.protect.is_empty() && !o.read_only => {
+                o.protect = v
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect();
+                true
+            }
+            "acceptAlso"
+                if !o.read_only
+                    && o.accept_also.is_empty()
+                    && !(o.accept_set && o.accept.is_none()) =>
+            {
+                o.accept_also = v
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect();
+                true
+            }
+            "timeout" if o.timeout.is_none() => {
+                o.timeout = v.as_str().map(str::to_string);
+                true
+            }
+            "evidence" if !o.read_only && !o.evidence_set => {
+                o.evidence = v.as_str().map(str::to_string);
+                true
+            }
+            _ => false,
+        };
+        if used {
+            applied[key] = json!({"value":v,"source":config.origins["defaults"][key]});
+        }
+    }
+    applied
+}
+
+fn standing_text(config: &crate::config::Config, read_only: bool, deny: &Value) -> (String, Value) {
+    let mut text = Vec::new();
+    let mut sources = json!({});
+    for key in ["all", if read_only { "readOnly" } else { "write" }] {
+        let line = crate::config::text_lines(&config.value["standing"][key]);
+        if !line.trim().is_empty() {
+            text.push(line);
+            sources[key] = config.origins["standing"][key].clone();
+        }
+    }
+    let rules = deny
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|r| {
+            let cmd = r["argv"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(shell_quote)
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!(
+                "{cmd}{}（{}）",
+                if b(r, "exact") {
+                    " [exact]"
+                } else {
+                    " [prefix]"
+                },
+                s(r, "hint").replace(['\n', '\r'], " ")
+            )
+        })
+        .collect::<Vec<_>>();
+    if !rules.is_empty() {
+        text.push(format!("这些命令被拦截：{}", rules.join("；")));
+        sources["agentDeny"] = config.origins["agentDeny"].clone();
+    }
+    (text.join("\n"), sources)
+}
+
 pub fn start(mut o: Options) -> Res<PathBuf> {
     if let Some(e) = nesting_error() {
         return Err(e);
     }
     choose_agent(&mut o)?;
-    let timeout = o.timeout.clone().unwrap_or_else(|| {
-        agents::spec(&o.agent)
-            .expect("validated agent")
-            .default_timeout
-            .into()
-    });
-    o.timeout = Some(timeout);
     let prompt = read_prompt(&mut o)?;
     let after = o.after.as_deref().map(runs::resolve).transpose()?;
     let in_run = o.in_run.as_deref().map(runs::resolve).transpose()?;
@@ -516,18 +628,24 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     }
     let workdir = workdir.canonicalize().map_err(|e| e.to_string())?;
     missing_tools(&o.agent)?;
-    if o.in_place && !o.read_only {
-        return Err("--in-place is for --read-only runs; write runs work in place unless --worktree is given".into());
-    }
     if o.in_place && o.worktree {
         return Err("--in-place and --worktree contradict each other".into());
     }
     let repo = git_top(&workdir);
+    let config = crate::config::load(repo.as_deref())?;
+    let defaults = effective_defaults(&mut o, &config);
     if !o.protect.is_empty() && repo.is_none() {
         return Err("--protect needs a git repository".into());
     }
     normalize_protect(&mut o.protect)?;
-    let config = crate::config::load(repo.as_deref())?;
+    if o.timeout.is_none() {
+        o.timeout = Some(
+            agents::spec(&o.agent)
+                .expect("validated agent")
+                .default_timeout
+                .into(),
+        );
+    }
     let capacities = crate::config::capacities(&config.value)?;
     if !config.ignored.is_empty() {
         eprintln!(
@@ -539,6 +657,12 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     let mut extra = json!({"env":config.value["env"],"agentDeny":config.value["agentDeny"],"configSources":config.sources,"configCapacity":capacities});
     extra["sourceBuild"] = config.value["sourceBuild"].clone();
     extra["sourceBuildRoot"] = json!(repo);
+    extra["defaults"] = defaults;
+    extra["resultChars"] = json!(config.value["resultChars"].as_u64().unwrap_or(20000));
+    extra["cleanupKeepExecutables"] = config.value["cleanupKeepExecutables"].clone();
+    let (standing, sources) = standing_text(&config, o.read_only, &extra["agentDeny"]);
+    extra["standing"] = json!(standing);
+    extra["standingSources"] = sources;
     if !o.read_only {
         let default_accept = config.value["accept"].as_str().filter(|c| !c.is_empty());
         if !o.accept_set {
@@ -553,7 +677,7 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         }
     }
     o.append_accept();
-    if !o.read_only && !o.evidence_set {
+    if !o.read_only && !o.evidence_set && o.evidence.is_none() {
         o.evidence = config.value["evidence"].as_str().map(str::to_string);
     }
     if let Some(top) = &repo {
@@ -585,7 +709,7 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
             extra["worktree"] = json!({"source":s(&prior["worktree"],"path"),"sourceWorkdir":s(&prior,"workdir"),"config":cfg,"in":upstream});
         } else if o.worktree || (o.read_only && !o.in_place) {
             extra["worktree"] = json!({"source":top,"sourceWorkdir":workdir,"config":cfg});
-        } else if !o.read_only {
+        } else if !o.read_only && !o.in_place {
             // In place, this run would edit the tree other runs are applied into.
             let busy = worktree::active_writes_on(&top.to_string_lossy(), None);
             if !busy.is_empty() {
@@ -696,6 +820,9 @@ fn rework_gate(
 }
 
 pub fn reply(mut o: Options) -> Res<PathBuf> {
+    let timeout_overridden = o.timeout.is_some() || o.minor;
+    let evidence_overridden = o.evidence_set;
+    let accept_overridden = o.accept_set;
     let parent = runs::latest(runs::resolve(o.run.as_deref().unwrap_or("last"))?);
     let meta = json(parent.join("meta.json"));
     let summary = json(parent.join("summary.json"));
@@ -826,6 +953,9 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
             .as_f64()
             .map(|seconds| format!("{seconds}s"));
     }
+    if o.max_answer.is_none() {
+        o.max_answer = meta["maxAnswer"].as_u64();
+    }
     let prompt = read_prompt(&mut o)?;
     let top = Some(s(&meta["worktree"], "source"))
         .filter(|x| !x.is_empty())
@@ -865,6 +995,34 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         json!({"parent":meta,"session":session,"env":meta["env"],"worktree":meta["worktree"]});
     extra["protectGenerated"] = meta["protectGenerated"].clone();
     extra["agentDeny"] = meta["agentDeny"].clone();
+    extra["defaults"] = meta["defaults"].clone();
+    if let Some(defaults) = extra["defaults"].as_object_mut() {
+        if timeout_overridden {
+            defaults.remove("timeout");
+        }
+        if evidence_overridden {
+            defaults.remove("evidence");
+        }
+        if accept_overridden {
+            defaults.remove("acceptAlso");
+        }
+    }
+    extra["resultChars"] = json!(config.value["resultChars"].as_u64().unwrap_or(20000));
+    extra["cleanupKeepExecutables"] = config.value["cleanupKeepExecutables"].clone();
+    if o.fresh {
+        extra["agentDeny"] = config.value["agentDeny"].clone();
+        let (text, sources) = standing_text(
+            &config,
+            s(&meta, "mode") == "read-only",
+            &extra["agentDeny"],
+        );
+        extra["standing"] = json!(text);
+        extra["standingSources"] = sources;
+    } else {
+        extra["standing"] = meta["standing"].clone();
+        extra["standingSources"] = meta["standingSources"].clone();
+        extra["standingInherited"] = json!(true);
+    }
     let sources = ["user", "repo"]
         .into_iter()
         .filter(|source| {
@@ -1077,6 +1235,9 @@ pub fn launch(
     if o.name.as_deref() == Some("") {
         o.name = None;
     }
+    if o.name.is_none() && parent_path.is_none() {
+        o.name = Some(prompt_name(prompt));
+    }
     let root = runs_root();
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let slots = state_dir();
@@ -1137,7 +1298,7 @@ pub fn launch(
         .unwrap_or("")
         .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || "._-".contains(c) {
+            if c.is_alphanumeric() || "._-".contains(c) {
                 c
             } else {
                 '-'
@@ -1207,6 +1368,29 @@ pub fn launch(
     };
     if extra["protectGenerated"].is_object() {
         actual.push_str(&format!("\n\n生成物保护例外 / Generated protection exception: {} 只允许通过生成命令改动 / may only be changed by the generator: `{}`. You may run this command; completion reruns it and rejects manually edited generated output. This exception overrides the protected-path restriction only for these generated paths.\n", extra["protectGenerated"]["paths"], s(&extra["protectGenerated"], "command")));
+    }
+    if let Some(limit) = o.max_answer {
+        actual.push_str(&format!(
+            "\n\n答复不超过 {limit} 字 / Answer in no more than {limit} characters.\n"
+        ));
+    }
+    let standing = s(extra, "standing");
+    let inherited = b(extra, "standingInherited");
+    if !inherited && !standing.is_empty() {
+        actual.push_str(&format!("\n\n{standing}\n"));
+    }
+    eprintln!(
+        "delegate: standing 附加 {} 行，来源 {}{}",
+        if inherited {
+            0
+        } else {
+            standing.lines().count()
+        },
+        extra["standingSources"],
+        if inherited { "（已有会话）" } else { "" }
+    );
+    if extra["defaults"].as_object().is_some_and(|d| !d.is_empty()) {
+        eprintln!("delegate: 生效默认值及来源 {}", extra["defaults"]);
     }
     write(
         run.join("prompt.md"),
@@ -1323,6 +1507,18 @@ pub fn launch(
     meta["agentBin"] = json!(agent_bin);
     meta["configSources"] = extra.get("configSources").cloned().unwrap_or(json!([]));
     meta["configCapacity"] = extra["configCapacity"].clone();
+    for key in [
+        "standing",
+        "standingSources",
+        "defaults",
+        "cleanupKeepExecutables",
+    ] {
+        meta[key] = extra[key].clone();
+    }
+    meta["resultDisplayChars"] = extra["resultChars"].clone();
+    if let Some(limit) = o.max_answer {
+        meta["maxAnswer"] = json!(limit);
+    }
     meta["sourceBuild"] = extra["sourceBuild"].clone();
     meta["sourceBuildRoot"] = extra["sourceBuildRoot"].clone();
     meta["repoKey"] = json!(repo);

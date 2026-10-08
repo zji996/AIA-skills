@@ -12,8 +12,6 @@
 
 写入任务上一轮为 `timeout` 时，下一次 reply 记 `meta.continuation: "timeout"`、`rework.kind: "continuation"`，不消耗 maxRework，超限也允许续做，改动超过 minor 的 60 行仍不补计。连续超时可以连续续做；rejected 等结局后仍按原返工规则。超时结论的 `next` 是可直接复制的续做命令，无会话 id 或 Pi 会话文件缺失时自动带 `--fresh`，自然语言结论注明“不计返工次数”。
 
-图片以绝对路径交给同事：Pi 作为 `@<路径>` 附件，Codex 作为 `--image`。
-
 ## 位置
 
 - 默认放在**执行命令时当前目录所在的 git 根**下的 `.local/run/delegate/<run_id>/`；不在仓库中则放在当前目录的 `.local/run/delegate/`，与 `--workdir` 无关。按名字/ID 查找时也读取旧 `.local/run/pi/`，不迁移旧记录；显式 `DELEGATE_RUNS` / `PI_DELEGATE_RUNS` 保持单根目录。换项目时传 run 目录路径。
@@ -26,11 +24,12 @@
 
 | 文件 | 内容 |
 |---|---|
-| `meta.json` | 启动参数、同事（`agent`）、workdir、模式、验收命令、启动时间；可选 `agentPinned`、仓库键 `repoKey`、证据命令 `evidenceCommand`、超时 `evidenceTimeoutSeconds` 和结果 `evidence`；`protect` 字符串数组与可选 `protectReasons` 原因映射（reply/fresh 继承） |
+| `meta.json` | 启动参数、同事（`agent`）、workdir、模式、验收命令、启动时间；`standing`/`standingSources`、生效 `defaults`、`resultDisplayChars`（配置显示上限）、`maxAnswer`（答复约定）；可选 `agentPinned`、仓库键 `repoKey`、证据命令 `evidenceCommand`、超时 `evidenceTimeoutSeconds` 和结果 `evidence`；`protect` 字符串数组与可选 `protectReasons` 原因映射（reply/fresh 继承） |
 | `prompt.md` | 同事实际收到的任务说明；末尾可能附完成标准（`--accept`）与只读边界（Codex 只读任务） |
 | `events.jsonl` | 过滤后的全过程：读取、命令、编辑路径、错误、每轮模型与用量、重跑；不含编辑全文 |
-| `result.md` | 最后一轮的完整答复 |
-| `summary.json` | 结论：`state`、`attempts`、`files`、`changes`、`shape`、`accept`、可选 `evidence`、`cleanup`（已终止进程数、端口、命令、已停 user unit 与诊断）、`warnings`（空/缺失 worktree 源）、`readOnlyViolation` / `workspaceChanged`、`protectViolation`、`queuedSeconds`、`graceSeconds`、`warning`、`tokens`、`session`、`error`（`next` 由 `status` 现算） |
+| `result.md` | 完整答复；自动压缩成功时为压缩后的答复 |
+| `result-original.md` / `compression.json` / `compression-prompt.md` | 自动压缩前的原文 / 是否成功、原文路径、失败原因 / 压缩追问 |
+| `summary.json` | 结论：`state`、`attempts`、`files`、`changes`、`shape`、`accept`、可选 `evidence`、`cleanup`（已终止进程数、可执行名、端口、命令、已停 user unit 与诊断）、`warnings`（空/缺失 worktree 源）、`readOnlyViolation` / `workspaceChanged`、`protectViolation`、`queuedSeconds`、`graceSeconds`、`warning`、`tokens`、`session`、`error`（`next` 由 `status` 现算） |
 | `cleanup.json` / `cleanup.lock` | 多阶段后台进程与 user unit 回收记录 / 并发回收锁；systemctl 缺失、bus 不可用、无标记与回收失败只记诊断 |
 | `scopes` / `scopes.lock` | 本轮的 systemd scope 单元名 / 并发读写锁；仅在用户 systemd 可用时出现 |
 | `changes.json` / `changes.patch` | 前后快照的 tree、逐文件状态与行数；可选 `finalEntries` 冻结结束时改动路径的最终指纹，供手动合入检测；可直接 `git apply` 的补丁 |
@@ -51,13 +50,11 @@
 | `exit_code` | 结束标记：`0` 为 delivered/answered，`1` 为其他结局；运行中不存在 |
 | `.delivered` | 结果已被 `run`/`wait`/`result` 读取过 |
 
-5.12 新 summary 带 `finishedAt`；旧记录缺失时不补造。`wait --any/--stream` 的 `completionTiming` 以首次检查分类，通知可能只交付旧结果。`changes` 是本轮差异，`pendingChanges` 是累计待合入量。`accept.tree` / `treeAfter` 保存验收前后历史 tree，`snapshotComplete` / `snapshotReason` 记录证据是否完整。受保护文件有原因时违规诊断另带 `protectViolationReasons`。
-
-5.18 状态 JSON 可选 `applied: true` 与 `appliedBy: "detected"` / `"delegate"`，分别表示源工作树检测合入或通过 apply 合入。`evidence` 为旁路证据结果；旧记录缺少这些字段仍可读。
-
-`agent-handoff` 的快照脚本依赖 `meta.json`、`exit_code` 与 `.delivered` 判断未完成或未读取的委派；修改这三者的名字或含义时要同步修改它。
+`finishedAt` 在旧记录缺失时省略；无参 wait、any/stream 的 `completionTiming` 区分首次检查已结束与等待中结束。`changes` 是本轮，`pendingChanges` 是累计待合入量。验收历史证据在 `accept.tree`/`treeAfter`，完整性在 `snapshotComplete`/`snapshotReason`。`appliedBy` 区分检测合入与 apply 合入。`agent-handoff` 依赖 meta、exit_code、.delivered 的名字与含义。
 
 ## 清理
+
+成功的 `apply` 默认等同对本轮执行 `clean`，`--keep` 保留；dry-run 或失败不清理，清理失败仅提示。共享 worktree 仍有其他 run 引用时保留。人读最后一行说明验收是否仍有效，无效或未确认时列出任务完整验收命令；`--json` 不加这行。回收豁免内置 `sccache` 与配置 `cleanupKeepExecutables` 的共享守护进程。
 
 每次 `start` 会删除结束超过 7 天且结果已读取的记录（只显示过截断答复的不算已读取）；`DELEGATE_KEEP_DAYS` 调整天数，设为 `0` 关闭。
 
@@ -79,7 +76,7 @@ worktree 移除回收 compose 容器。5.24 meta 新增 `sourceBuildBytes`、`so
 | `DELEGATE_CGROUP` | `0` 关闭 delegate 自建用户 systemd scope；默认自动探测。项目脚本自行启动的 user unit 仍按任务归属回收 |
 | `DELEGATE_TIMEOUT_GRACE` | 同事超时后仍在工作时的宽限百分比，默认 10 |
 | `DELEGATE_RUN_DIR` / `DELEGATE_LANE_HELD` | 由脚本导出：同事所在 run 目录（用于扣除排队时间）/ 已在 lane 名额内 |
-| `DELEGATE_RESULT_CHARS` | 答复超过该长度显示开头约 2/3 与结尾约 1/3，默认 6000 |
+| `DELEGATE_RESULT_CHARS` | 覆盖配置 `resultChars`（默认 20000）；答复超过上限 1.25 倍才显示头尾（约 2/3、1/3） |
 | `DELEGATE_KEEP_DAYS` | 自动清理天数，默认 7 |
 | `DELEGATE_SOURCE_BUILD_WARN_GIB` | 源仓库构建目录缓存占用提示阈值，默认 60 GiB；`0` 关闭，支持小数 |
 | `DELEGATE_WORKTREE_WARN_GIB` | 本仓库已结束 worktree 占用提示阈值，默认 20 GiB；`0` 关闭 |
@@ -91,4 +88,4 @@ worktree 移除回收 compose 容器。5.24 meta 新增 `sourceBuildBytes`、`so
 
 ## 代码结构
 
-`bin/delegate` 是安装时按 `bin.sha256` 校验下载的静态二进制（Linux x86_64 / aarch64，musl），源码在仓库的 `crates/delegate/`，行为契约见仓库的 `docs/delegate-spec.md`。接入新的同事只需在 `agents.rs` 的 `AGENTS` 适配表加一项（启动命令、续接方式、事件解析、默认超时、是否占强档名额）。接入新的主控宿主见仓库的 `docs/delegate-protocol.md`；`$D protocol` 输出协议版本、会话标识与各同事实际执行的文件、版本及被遮住的同名文件。
+`bin/delegate` 是按 `bin.sha256` 下载的静态二进制；源码在 `crates/delegate/`。同事适配表在 `agents.rs`，行为契约见 `docs/delegate-spec.md`，主控宿主接入见 `docs/delegate-protocol.md`。`protocol` 显示会话标识、CLI 文件与版本。

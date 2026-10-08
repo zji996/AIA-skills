@@ -1,4 +1,4 @@
-# delegate 规格（v5.12.0）
+# delegate 规格（v5.25.0）
 
 > 本文是 `skills/delegate` 的**实现契约**：命令行、输出、run 目录、锁与状态机。它是 Rust 重写与 harness 原生接入的依据。
 > 本文不在技能目录内，技能加载时不会读取；模型使用技能只需 `SKILL.md`。行为以本文为准，实现与本文不一致时按缺陷处理。
@@ -41,11 +41,11 @@
 | `start` | 启动选项（§2.3）＋任务说明 | 创建 run 并启动 supervisor，立即输出一行状态（§3.1）；stderr 提示收取命令 |
 | `run` | 启动选项＋`--max`/`--progress`/`--full` | `start` 后等待，按 §3.2 输出 |
 | `reply <run> [消息]` | `--fresh` `--sync` `--minor` `--over-limit` `--accept` `--accept-also` `--no-accept` `--hide-accept` `--accept-timeout` `--timeout` `--image` `--name` `--prompt(-file)`；`--wait` 时可用等待选项 | 续接对话并立即返回启动状态；`--wait` 等结论（§7） |
-| `wait [<run>...\|--all]` | `--max` `--no-result` `--full` `--progress` `--any` `--stream` | 等待并输出；无参数按派发会话收取（§9.5），`--all` 取本仓库所有运行中或结果未读取的 run；没有时以 0 退出。`--any` 与 `--stream` 见 §9.5 |
+| `wait [<run>...\|--all]` | `--max` `--no-result` `--full` `--progress` `--any` `--stream` `--until-all` | 等待并输出；无参数按派发会话收取（§9.5），`--all` 取本仓库所有运行中或结果未读取的 run；没有时以 0 退出。`--any` 与 `--stream` 见 §9.5 |
 | `status [<run>...]`（别名 `list`） | | 每个 run 一行状态；无参数列出全部 |
 | `result [<run>] [--path]` | | 输出完整答复（或其路径）；非运行中时标记已读取 |
 | `diff [<run>] [--stat] [--total] [路径...]` | | `git diff` 该 run 前后快照；`--total` 自对话起点；终端下带颜色；对象被清理时回退输出 `changes.patch` |
-| `apply [<run>] [--dry-run] [--merge]` | | §6.4 |
+| `apply [<run>] [--dry-run] [--merge] [--keep] [--json]` | | §6.4 |
 | `lane [--label 文字] [--] [命令...]` | | §8；无命令时列出队列，每行 `running\|queued  <since>  <label>` |
 | `stop <run>...` | | §9.4 |
 | `clean <run>...\|--finished [--force]` | | §10 |
@@ -62,11 +62,11 @@
 | 任务说明 | — | 位置参数拼接、`--prompt`、或 `--prompt-file`（`-` 为 stdin）；为空即退出码 2 |
 | `--tier cheap\|strong` | 只读 `cheap`，写入 `strong` | 按档位选同事，映射见 §12；与 `--agent` 互斥（退出码 2） |
 | `--agent pi\|codex` | — | 直接指定同事，不属于任何档位，不升档 |
-| `--name` | 说明首行 | 用于 run id 与显示；run id 取其 `[A-Za-z0-9._-]` 片段，最长 40 |
+| `--name` | 说明首行 | 用于 run id 与显示；省略时取首个非空行生成短名，run id 保留字母、数字与 `._-`，最长 40 |
 | `--workdir` | 当前目录 | 必须存在 |
 | `--image <路径>` | — | 可重复；解析为绝对路径 |
 | `--read-only` | 否 | §5 |
-| `--in-place` | 否 | 仅与 `--read-only` 同用，与 `--worktree` 互斥 |
+| `--in-place` | 否 | 只读用实时工作区；写入覆盖 worktree 默认并原地写入，与 `--worktree` 互斥 |
 | `--worktree` | 否 | 需要 git 仓库 |
 | `--accept <命令>` | `.delegate.json` 顶层 `accept`（仅写入） | shell 命令；显式参数覆盖默认 |
 | `--accept-also <命令>` | 无 | 可重复，按顺序以 `&&` 追加到显式 `--accept` 或配置默认；无基础命令时单独运行，reply 追加到继承命令；与 `--no-accept` 同用退出 2 |
@@ -262,7 +262,7 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 
 **编号预检**：写文件前，仅对本次基准的新增、实际计划写入文件，检查 ASCII 数字前缀加 `_`；按父目录＋原样数字前缀分组。比较源中已跟踪/未跟踪的同目录文件和本批其他新增文件，扣除计划删除，忽略同完整路径、修改项和生成路径，不跟随符号链接目录；不同目录互不冲突，`32` 与 `0032` 不合并。冲突写 stderr 警告并输出 `numberedPrefixConflicts`，dry-run 也报告；不改号、不改退出码，不扫描其他未合入 worktree。通用命名可能不是迁移编号，由主控判断；无源仓库应用锁，同仓库必须串行 apply，防止预检竞态。
 
-**验收复用**：取得 lane 后、验收前及命令/进程清理后保存完整仓库快照证据（不沿用验收前 changes.after 或读取当前 worktree 代替历史）。apply 结束时对源工作区全树重新快照，含未提交改动与生成文件；HEAD 相同不足以证明有效。仅本轮 accept.ok 为 true、历史快照完整且 tree == treeAfter == 最终源 tree 时为 true。已知验收失败、验收改树或源 tree 不同为 false。dry-run、无验收、旧记录/缺字段、快照失败或证据不全时省略布尔值并说明原因；大型未跟踪文件、脏/缺失子模块属 tree 外输入，不能用 size/mtime 证明有效。索引 assume-unchanged / skip-worktree 标志使证据不完整；干净子模块递归核对快照和索引标志。忽略文件、环境、数据库、Git 历史仍由主控判断。apply 不重跑验收，结果仅表示此次 `repository-snapshot` 范围，后续源码改动或 reply 必须重新判断，不向 reply 链永久传播。
+**验收复用**：取得 lane 后、验收前及命令/进程清理后保存完整仓库快照证据（不沿用验收前 changes.after 或读取当前 worktree 代替历史）。apply 结束时对源工作区全树重新快照，含未提交改动与生成文件；HEAD 相同不足以证明有效。仅本轮 accept.ok 为 true、历史快照完整且 tree == treeAfter == 最终源 tree 时为 true。已知验收失败、验收改树或源 tree 不同为 false。dry-run、无验收、旧记录/缺字段、快照失败或证据不全时省略布尔值并说明原因；大型未跟踪文件、脏/缺失子模块属 tree 外输入，不能用 size/mtime 证明有效。索引 assume-unchanged / skip-worktree 标志使证据不完整；干净子模块递归核对快照和索引标志。忽略文件、环境、数据库、Git 历史仍由主控判断。验收复用只涵盖此次仓库快照；源码改动或 reply 后须重新判断。
 
 **合并后验收**（5.13）：`.delegate.json` 的 `applyVerify` 为 `true`（用顶层 `accept`，缺省时用本任务的 accept）或命令字符串时，合入成功且非 dry-run 的 `apply` 在 `acceptStillValid` 不为 true 时，经 lane 在源工作目录（`sourceWorkdir`）以 `sh -c` 运行该命令，限时同任务 `acceptTimeoutSeconds`，输出写 `verify.log`。`apply --verify` 强制运行（即使 `acceptStillValid: true`），`--no-verify` 跳过，二者互斥（退出码 2）。结论追加 `verify{command,ok,exitCode,log,tail?,next?}`，或 `verify{skipped}`（`acceptStillValid`、无命令）。验收失败时合并已在源树中、基准照常推进，apply 退出码 1。`applyVerify` 为其他类型时报错。
 
@@ -351,15 +351,18 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 
 ### 9.5 等待（`wait`/`run`）
 
-阻塞在各 run 的 `supervisor.lock` 共享锁上（每个一个线程），`--max` 到期即返回。`wait --machine` 在调用开始时从 `<state>` 的 slot 读取整机运行中或等待中的 run 目录并固定该列表（之后 slot 被清理不影响本次收取），跨仓库收取；不带 `--machine` 时只收取当前仓库的 run。无参 `wait` 在 caller 已知时只选 caller 相同且运行中或未送达的 run；其他运行中或未送达的 run（含没有 caller 的旧 run）不收取、不输出结论块，只在 stderr 用一行报告数量、最多三个名称及年龄，并提示 `wait --all` / `clean <run>`。本会话没有可收取的 run 而有其他 run 时，提示后以 0 退出；都没有时沿用 `no active or undelivered runs`。caller 未知时无参 `wait` 与旧行为相同，收取全部。`wait --all`、`wait <run...>` 和 `wait --machine` 不受 caller 过滤；退出码只由实际收取的 run 决定。仅在 `--progress`、supervisor 尚未加锁（刚启动）或 4.4 之前的 run 时按 `DELEGATE_POLL`（默认 1 秒）轮询。
+等待每个 run 的 `supervisor.lock` 共享锁（每个一个线程），`--max` 到期即返回。`--machine` 从整机 slot 固定选取运行/等待任务；其余读取当前仓库。无参且 caller 已知时仅选本会话运行中或未送达的；其他任务只在 stderr 提示数量、最多三个名称与年龄、wait --all / clean 命令。caller 未知则选全部；`--all`、具名与 `--machine` 不受 caller 过滤。无可选任务退出 0，退出码只由实际收取任务决定。仅 progress、刚启动未加锁或 4.4 前旧任务按 DELEGATE_POLL 轮询。
 
 逐个收取（5.11）：
 
-- `wait --any`：选出的 run 中已结束的立即输出结论块（§3.2）；都未结束时等到任一结束。只输出已结束的 run，其余在 stderr 列出名称并提示再次 `wait --any`。显式列出的 run 中已送达的跳过，因此重复同一条命令即可依次收完；全部已送达时同无参 `wait` 输出 `no active or undelivered runs` 并以 0 退出。退出码由本次输出的 run 决定；`--max` 到期仍无结束时退出码 75。
+- 无参 `wait`（含范围选项）默认同 `--any`：交付已结束未读任务，否则等下一批结束；其他任务提示继续等待。显式 `--any` 跳过已交付具名任务，具名 wait 保留重读行为；退出码由本批结果决定，max 到期无结果为 75。
 - `wait --stream`：每个 run 结束时输出一行状态行（含 `sourceDrift`，有未读答复时带 `report`），不输出改动清单与答复、不标记 `.delivered`；全部输出后 stderr 写 `all <N> runs reported` 并退出。不带 run 参数时每 5 秒按同一规则（caller、`--all`、`--machine`）重新选取，把期间新派出的 run 也纳入；全部结束即退出，之后派出的 run 需要新的 `wait`。退出码：有非 delivered/answered 结局为 1，`--max` 到期仍有未结束的为 75，否则 0。
-- `--any` 与 `--stream` 互斥（退出码 2）。两者都与宿主无关：`--stream` 适合能把命令的每行输出变成通知的宿主，`--any` 适合只有“后台命令结束时通知”或只能分段调用的宿主（配合 `--max`）。
+- `--until-all` 显式等选出的全部任务结束；`--all` 只控制范围。人读 wait 的最后一行显示本会话还有几项在跑与原样重跑命令，全部结束写“本会话没有在跑的任务”；JSON 不附该文本。
+- `--until-all`、`--any` 与 `--stream` 互斥（退出码 2）。两者都与宿主无关：`--stream` 适合能把命令的每行输出变成通知的宿主，`--any` 适合只有“后台命令结束时通知”或只能分段调用的宿主（配合 `--max`）。
 
 5.12 起，两者按首次检查记录已结束集合，结论附 `completionTiming`（§3.1）；原收取顺序不变，多个旧结果一起交付，不按完成时间排序。后台命令结束通知可能是在交付旧结果；旧 summary 没有 `finishedAt` 时省略，不推算。
+
+5.25 配置 standing/defaults/resultChars/cleanupKeepExecutables、答复 --max-answer 与 apply 默认清理/--keep/验收提醒的契约见技能 references/{configuration,commands,output-and-files}.md。
 
 ## 10. 并发、准入与清理
 
@@ -369,6 +372,7 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 - 写入互斥：同一 workdir 同时只允许一个原地写入 run（`--allow-parallel-writes` 与 worktree run 除外）。
 - **只有一层委派**：调用者本身是同事（设有 `DELEGATE_AGENT`、`PI_DELEGATE_AGENT` 或 `PI_DELEGATE_ACTIVE`）时，`start`/`run`/`reply` 一律以退出码 2 拒绝；`lane` 等其他命令不受影响。所有结果都回到主控。
 - 自动清理：每次启动删除结束超过 `DELEGATE_KEEP_DAYS`（默认 7，0 关闭）天、已读取（不含只显示过截断答复的）、且没有未 apply 写入 worktree 的 run。
+- 后台回收按可执行文件名豁免内置 sccache 与两级追加的 cleanupKeepExecutables；含豁免进程的组/scope 不整体杀，其他回收进程提示可执行名和端口。
 - `clean`：跳过运行中的与同事进程仍存活的；`--finished` 默认保留未读取的、只显示过截断答复的（`wait` 截断打印时写 `.truncated`，完整打印或 `result` 读全文后删除），以及未完整 apply 的 worktree run；`--force` 可覆盖这些保留条件。显式列出的 run 照常删除；提示未 apply 的 worktree。
 
 5.23 起，worktree 移除前（路径缺失时也适用）查询 compose working_dir label，按绝对路径组件匹配本目录及其子目录，以 `docker rm -f -v` 回收容器和匿名卷；具名卷保留。每次查询与删除共用 20 秒限时，失败只诊断；clean 另回收 delegate worktree 缓存根下 label 目录已不存在的孤儿。`clean --json` 的删除行含 `containersRemoved`、`diagnostic`，末尾 `orphanCleanup` 同样报告数量和诊断。
@@ -418,7 +422,7 @@ run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git �
 
 `env` 为字符串到字符串的映射，注入同事、验收与 setup（原地与 worktree 均生效，reply 沿用）；`copy`/`link` 必须是仓库内相对路径，缺源跳过并在启动命令与 supervisor 的 stderr 提示。
 
-环境变量均先读 `DELEGATE_<名>`，再读 `PI_DELEGATE_<名>`：`RUNS`、`CHEAP_AGENT`（pi）、`STRONG_AGENT`（codex）、`MAX_ACTIVE`、`MAX_CODEX`、`MAX_HEAVY`、`MIN_AVAILABLE_MB`、`TIMEOUT_GRACE`、`RESULT_CHARS`（6000）、`KEEP_DAYS`、`POLL`、`SNAPSHOT_MAX_BYTES`、`SETUP_TIMEOUT`（10m）、`GENERATE_TIMEOUT`（10m）。`DELEGATE_CALLER` 单独按上述优先级取值，不读取 `PI_DELEGATE_CALLER`。由实现导出、调用方不应设置的保护变量：`DELEGATE_AGENT`、`DELEGATE_RUN_DIR`、`DELEGATE_LANE_HELD`、`PI_DELEGATE_ACTIVE`、`PI_DELEGATE_AGENT`、`PI_DELEGATE_PARENT_RUN`。
+环境变量均先读 `DELEGATE_<名>`，再读 `PI_DELEGATE_<名>`：`RUNS`、`CHEAP_AGENT`（pi）、`STRONG_AGENT`（codex）、`MAX_ACTIVE`、`MAX_CODEX`、`MAX_HEAVY`、`MIN_AVAILABLE_MB`、`TIMEOUT_GRACE`、`RESULT_CHARS`（20000）、`KEEP_DAYS`、`POLL`、`SNAPSHOT_MAX_BYTES`、`SETUP_TIMEOUT`（10m）、`GENERATE_TIMEOUT`（10m）。`DELEGATE_CALLER` 单独按上述优先级取值，不读取 `PI_DELEGATE_CALLER`。由实现导出、调用方不应设置的保护变量：`DELEGATE_AGENT`、`DELEGATE_RUN_DIR`、`DELEGATE_LANE_HELD`、`PI_DELEGATE_ACTIVE`、`PI_DELEGATE_AGENT`、`PI_DELEGATE_PARENT_RUN`。
 
 仅测试构建（debug）可用且默认关闭的环境变量：`DELEGATE_TEST_SUPERVISOR_DELAY` 使 supervisor 在写 `pid` 前延迟指定时长，`DELEGATE_TEST_STARTUP_TIMEOUT` 缩短启动方等待 `pid` 的时限；用于黑盒验证超时回收，正式发布构建忽略它们。
 
