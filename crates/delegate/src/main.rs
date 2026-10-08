@@ -9,6 +9,7 @@ mod lane;
 mod launch;
 mod output;
 mod runs;
+mod source_build;
 mod supervise;
 mod waiting;
 mod worktree;
@@ -1096,6 +1097,7 @@ fn main() {
             .is_some_and(|command| matches!(command.as_str(), "status" | "list" | "wait"))
     {
         output::worktree_disk();
+        output::source_build_disk();
     }
     match result {
         Ok(code) => std::process::exit(code),

@@ -24,7 +24,15 @@ JSON 对应追加独立 `worktreeDisk` 行，含 `totalBytes`、`thresholdBytes`
 
 ## 源仓库的构建缓存
 
-delegate 只回收自己的 worktree。验收、门禁和主控自己的构建写进源仓库的构建目录，没有工具回收它，长批次后它通常比全部 worktree 加起来还大。达到自定阈值（或磁盘告警）时按下面做，先量再删：
+5.24 起，写入 run 收尾在 worktree 测量之后限时测一次源仓库构建目录（各路径共用 20 秒），默认根有 `Cargo.toml` 时量现存的 `target`。用户 config.json 与仓库 `.delegate.json` 可用 `sourceBuild.paths` 替换默认探测，`[]` 关闭；路径和合并规则见 [配置](configuration.md)。原地写入也测，只读不测；不存在的目录跳过，同一实际目录去重。空列表或无现存目录缓存零值，测量或缓存失败省略且不改 run 结论。
+
+meta 缓存 `sourceBuildBytes`、`sourceBuildPaths:[{path,bytes}]`、`sourceBuildMeasuredAt`（UTC）、`sourceBuildMeasuredNs`（排序用纳秒字符串）；另有启动配置 `sourceBuild` 与源根 `sourceBuildRoot`。status/wait 不现量，同源仓库取最近一次成功缓存，不累加各 run；达到 `DELEGATE_SOURCE_BUILD_WARN_GIB`（默认 60 GiB，0 关闭，支持小数）时末尾自动提示，与 worktreeDisk 独立，可同时出现。例：
+
+```text
+提示：源仓库构建目录共 60.0 GiB；各路径：target 60.0 GiB；先量再删：见 references/cleanup.md 的“源仓库的构建缓存”
+```
+
+JSON 追加独立 `sourceBuildDisk` 行，含 `totalBytes`、`thresholdBytes`、`paths`（每项 `path/bytes`）、`measuredAt`、`next`；未达阈值或关闭时省略。提示只基于缓存，不代表当前大小；delegate 只回收自己的 worktree，不删除源构建目录。验收、门禁和主控的构建缓存达到阈值（或磁盘告警）时按下面做，先量再删：
 
 ```bash
 du -sh target/debug/* | sort -rh | head     # Rust 示例；其他工具链换成各自的构建目录

@@ -306,6 +306,192 @@ print(str(sizes[meta["name"]] * 1024**3) + "\\t" + sys.argv[-1])
         (other / "meta.json").write_text(json.dumps(meta))
         self.assertNotIn("worktreeDisk", self.cli("status", cwd=repo).stdout)
 
+    def fake_source_du(self):
+        script = self.bin / "du"
+        script.write_text(f"#!{sys.executable}\n" + '''import json, os, sys
+from pathlib import Path
+path = Path(sys.argv[-1])
+with open(Path(os.environ["PI_LOG"]).with_suffix(".source-du"), "a") as log:
+    log.write(str(path) + "\\n")
+if path.name == "target":
+    assert (path.parent / "accepted").exists(), "source measurement before acceptance"
+print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) + "\\t" + str(path))
+''')
+        script.chmod(0o755)
+        self.env["TEST_DU_SIZES"] = json.dumps({"target": 60, "build": 8, "cache": 4})
+
+    def source_disk(self, result):
+        return next(json.loads(line)["sourceBuildDisk"] for line in result.stdout.splitlines()
+                    if line.startswith('{"sourceBuildDisk"'))
+
+    def test_source_build_default_warns_once_latest_cache_and_independent_worktree(self):
+        self.fake_pi([answer("done"), SETTLED])
+        repo = self.repo({"Cargo.toml": "# fixture\n", "a.txt": "a\n"})
+        (repo / "target").mkdir()
+        self.fake_source_du()
+        def run(name, isolated=False):
+            result = self.cli("run", *(["--worktree"] if isolated else []), "--workdir", repo,
+                              "--name", name, "--accept", f"touch {shlex.quote(str(repo / 'accepted'))}", "task")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return self.outcome(result)
+        first = run("first", isolated=True)
+        report = self.source_disk(self.cli("status", cwd=repo))
+        self.assertEqual(report["totalBytes"], 60 * 1024**3)
+        self.assertEqual(report["thresholdBytes"], 60 * 1024**3)
+        self.assertEqual(report["paths"], [{"path": "target", "bytes": 60 * 1024**3}])
+        meta = json.loads((Path(first["dir"]) / "meta.json").read_text())
+        self.assertEqual(meta["sourceBuildBytes"], report["totalBytes"])
+        self.assertEqual(meta["sourceBuildMeasuredAt"], report["measuredAt"])
+        self.assertIn("先量再删", report["next"])
+        self.assertNotIn("rm -rf", report["next"])
+        self.assertIn("worktreeDisk", self.cli("status", cwd=repo).stdout)
+        self.assertEqual(self.source_disk(self.cli("wait", "--no-result", first["run"], cwd=repo)), report)
+        human = self.cli("status", human=True, cwd=repo).stdout
+        self.assertIn("提示：源仓库构建目录共 60.0 GiB；各路径：target 60.0 GiB；先量再删", human)
+        self.assertNotIn("sourceBuildDisk", self.cli("status").stdout)
+        self.env["DELEGATE_SOURCE_BUILD_WARN_GIB"] = "61"
+        self.assertNotIn("sourceBuildDisk", self.cli("status", cwd=repo).stdout)
+        self.env["DELEGATE_SOURCE_BUILD_WARN_GIB"] = "0"
+        self.assertNotIn("sourceBuildDisk", self.cli("wait", "--no-result", first["run"], cwd=repo).stdout)
+        self.assertNotIn("源仓库构建目录", self.cli("status", human=True, cwd=repo).stdout)
+        self.env.pop("DELEGATE_SOURCE_BUILD_WARN_GIB")
+        self.env["TEST_DU_SIZES"] = json.dumps({"target": 70})
+        second = run("second")
+        # Measurement time wins even when run start ordering is reversed.
+        meta["startedNs"] = json.loads((Path(second["dir"]) / "meta.json").read_text())["startedNs"] + 1
+        (Path(first["dir"]) / "meta.json").write_text(json.dumps(meta))
+        self.assertEqual(self.source_disk(self.cli("status", cwd=repo))["totalBytes"], 70 * 1024**3)
+        self.env["TEST_DU_SIZES"] = json.dumps({"target": 1})
+        run("third")
+        self.assertNotIn("sourceBuildDisk", self.cli("status", cwd=repo).stdout)
+        self.assertEqual((self.work / "pi.source-du").read_text().splitlines().count(str(repo / "target")), 3)
+
+    def test_source_build_timeout_is_nonfatal_and_status_does_not_retry(self):
+        self.fake_pi([answer("done"), SETTLED])
+        repo = self.repo({"Cargo.toml": "# fixture\n"})
+        (repo / "target").mkdir()
+        du = self.bin / "du"
+        du.write_text("#!/bin/sh\nsleep 60\n")
+        du.chmod(0o755)
+        started = time.monotonic()
+        result = self.cli("run", "--workdir", repo, "--accept", "true", "task", timeout=30)
+        state = self.outcome(result)
+        self.assertEqual((result.returncode, state["state"], state["accept"]["ok"]), (0, "delivered", True))
+        self.assertLess(time.monotonic() - started, 27)
+        self.assertNotIn("sourceBuildBytes", json.loads((Path(state["dir"]) / "meta.json").read_text()))
+        du.write_text("#!/bin/sh\necho '999999999999 target'\n")
+        self.assertNotIn("sourceBuildDisk", self.cli("status", cwd=repo).stdout)
+        self.assertEqual(self.cli("wait", "--no-result", state["run"], cwd=repo).returncode, 0)
+
+    def test_source_build_default_skips_non_rust_and_missing_target(self):
+        self.fake_pi([answer("done"), SETTLED])
+        repo = self.repo({"a.txt": "a\n"})
+        (repo / "target").mkdir()
+        self.fake_source_du()
+        self.cli("run", "--workdir", repo, "non rust")
+        (repo / "Cargo.toml").write_text("# fixture\n")
+        # Preserve the directory while making the default target path absent.
+        (repo / "target").rename(repo / "saved-target")
+        state = self.outcome(self.cli("run", "--workdir", repo, "missing target"))
+        self.assertEqual(json.loads((Path(state["dir"]) / "meta.json").read_text())["sourceBuildBytes"], 0)
+        self.assertNotIn("sourceBuildDisk", self.cli("status", cwd=repo).stdout)
+        self.assertFalse((self.work / "pi.source-du").exists())
+
+    def test_source_build_paths_user_repo_override_empty_and_read_only(self):
+        self.fake_pi([answer("done"), SETTLED])
+        repo = self.repo({"Cargo.toml": "# fixture\n"})
+        for name in ("target", "build", "cache"):
+            (repo / name).mkdir()
+        self.fake_source_du()
+        self.env["DELEGATE_SOURCE_BUILD_WARN_GIB"] = "0.1"
+        self.env["XDG_CONFIG_HOME"] = str(self.work / "config")
+        user = self.work / "config/delegate/config.json"
+        user.parent.mkdir(parents=True)
+        user.write_text(json.dumps({"sourceBuild": {"paths": ["build"]}}))
+        self.cli("run", "--workdir", repo, "--accept", "true", "user paths")
+        self.assertEqual(self.source_disk(self.cli("status", cwd=repo))["paths"], [{"path": "build", "bytes": 8 * 1024**3}])
+        cfg = repo / ".delegate.json"
+        cfg.write_text(json.dumps({"sourceBuild": {"paths": ["cache", "build", "missing"]}}))
+        state = self.outcome(self.cli("run", "--workdir", repo, "--accept", "true", "repo paths"))
+        self.assertEqual(self.source_disk(self.cli("status", cwd=repo))["totalBytes"], 12 * 1024**3)
+        meta = json.loads((Path(state["dir"]) / "meta.json").read_text())
+        self.assertEqual([item["path"] for item in meta["sourceBuildPaths"]], ["cache", "build"])
+        cfg.write_text('{"sourceBuild":{"paths":[]}}')
+        state = self.outcome(self.cli("run", "--workdir", repo, "task"))
+        self.assertEqual(json.loads((Path(state["dir"]) / "meta.json").read_text())["sourceBuildBytes"], 0)
+        self.assertNotIn("sourceBuildDisk", self.cli("status", cwd=repo).stdout)
+        cfg.write_text('{"sourceBuild":{"paths":["build"]}}')
+        state = self.outcome(self.cli("run", "--read-only", "--workdir", repo, "task"))
+        self.assertNotIn("sourceBuildBytes", json.loads((Path(state["dir"]) / "meta.json").read_text()))
+        self.assertEqual(len((self.work / "pi.source-du").read_text().splitlines()), 3)
+
+    def test_source_build_invalid_paths_report_file_field_and_exit_two(self):
+        self.fake_pi([answer("done"), SETTLED])
+        repo = self.repo({"a.txt": "a\n"})
+        (repo / "external").symlink_to(self.work)
+        self.env["XDG_CONFIG_HOME"] = str(self.work / "config")
+        user = self.work / "config/delegate/config.json"
+        user.parent.mkdir(parents=True)
+        for file in (user, repo / ".delegate.json"):
+            for path in ("../outside", "/tmp/build", "build/../../outside", "external/missing", 7):
+                with self.subTest(file=file, path=path):
+                    file.write_text(json.dumps({"sourceBuild": {"paths": [path]}}))
+                    result = self.cli("start", "--workdir", repo, "task")
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(str(file), result.stderr)
+                    self.assertIn("sourceBuild.paths[0]", result.stderr)
+            file.unlink()
+        self.assertFalse((self.work / "pi.log").exists())
+
+    def test_source_build_measurement_and_cache_failures_do_not_change_conclusion(self):
+        repo = self.repo({"Cargo.toml": "# fixture\n"})
+        (repo / "target").mkdir()
+        self.env["DELEGATE_SOURCE_BUILD_WARN_GIB"] = "0.000001"
+        for failure in ("exit", "malformed", "cache", "escape"):
+            with self.subTest(failure=failure):
+                pre = 'mkdir "$DELEGATE_RUN_DIR/meta.json.tmp"' if failure == "cache" else ""
+                self.fake_pi([answer("done"), SETTLED], pre=pre)
+                du = self.bin / "du"
+                du.write_text("#!/bin/sh\n" + ("exit 1\n" if failure == "exit" else
+                              "echo invalid\n" if failure == "malformed" else "echo '999999999999 target'\n"))
+                du.chmod(0o755)
+                accept = "true"
+                if failure == "escape":
+                    accept = f"mv {shlex.quote(str(repo / 'target'))} {shlex.quote(str(repo / 'saved-target'))}; ln -s {shlex.quote(str(self.work))} {shlex.quote(str(repo / 'target'))}"
+                result = self.cli("run", "--workdir", repo, "--accept", accept, "task")
+                state = self.outcome(result)
+                self.assertEqual((result.returncode, state["state"], state["accept"]["ok"]), (0, "delivered", True))
+                meta = json.loads((Path(state["dir"]) / "meta.json").read_text())
+                self.assertNotIn("sourceBuildBytes", meta)
+                du.write_text("#!/bin/sh\necho '999999999999 target'\n")
+                self.assertNotIn("sourceBuildDisk", self.cli("status", cwd=repo).stdout)
+                self.assertEqual(self.cli("wait", "--no-result", state["run"], cwd=repo).returncode, 0)
+                if failure == "escape":
+                    (repo / "target").unlink()
+                    (repo / "saved-target").rename(repo / "target")
+
+    def test_source_build_invalid_cached_fields_do_not_change_status_or_wait(self):
+        self.fake_pi([answer("done"), SETTLED])
+        repo = self.repo({"Cargo.toml": "# fixture\n"})
+        (repo / "target").mkdir()
+        self.fake_source_du()
+        state = self.outcome(self.cli("run", "--workdir", repo, "--accept", "touch accepted", "task"))
+        file = Path(state["dir"]) / "meta.json"
+        original = json.loads(file.read_text())
+        self.assertIn("sourceBuildDisk", self.cli("status", cwd=repo).stdout)
+        for field, value in (("sourceBuildBytes", "invalid"), ("sourceBuildPaths", [None]),
+                             ("sourceBuildMeasuredAt", None), ("sourceBuildMeasuredNs", "invalid")):
+            with self.subTest(field=field):
+                meta = dict(original)
+                meta[field] = value
+                file.write_text(json.dumps(meta))
+                result = self.cli("status", state["run"], cwd=repo)
+                self.assertEqual((result.returncode, self.outcome(result)["state"]), (0, "delivered"))
+                self.assertNotIn("sourceBuildDisk", result.stdout)
+                result = self.cli("wait", "--no-result", state["run"], cwd=repo)
+                self.assertEqual(result.returncode, 0)
+                self.assertNotIn("sourceBuildDisk", result.stdout)
+
     def fake_pi(self, *attempts, pre="", sleep=0, code=0):
         """Each attempt is a list of events; later calls reuse the last attempt."""
         lines = ["#!/bin/sh", '[ "$1" = --version ] && { echo "fake-pi 1.0"; exit 0; }',

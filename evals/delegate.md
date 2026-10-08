@@ -1,5 +1,10 @@
 # delegate
 
+## 5.24 源仓库构建目录提示
+
+- Rust 源仓库 target 涨到 155 GiB，worktree 汇总覆盖不到：写入收尾后在 20 秒内量源根 target，status/wait 用最近缓存提示总量、各路径大小和先量再删的参考，绝不自动删除。Warn about source repository build disk usage using the latest cached measurement, without deleting build artifacts.
+- 用户设 `sourceBuild.paths: ["build"]`，仓库设 `["target","cache"]` 时替换；`[]` 关闭，绝对/越界/外部符号链接报配置文件和字段、退出 2。阈值默认 60 GiB，`DELEGATE_SOURCE_BUILD_WARN_GIB=0` 关闭；两种磁盘 JSON 行可并存，du 超时或缓存失败不改验收结论。
+
 ## 5.23 清理容器与磁盘提示
 
 - 十几个已结束的 Rust 写入任务手动改写后合入，worktree 的 target 共占 126 GiB：结束时只测一次并记录 `worktreeBytes`，status/wait 按本仓库汇总，达到 20 GiB 时提示总量、最大三项与 `clean <name> --force`；`DELEGATE_WORKTREE_WARN_GIB=0` 关闭。Warn about retained worktree disk usage without repeatedly running du.

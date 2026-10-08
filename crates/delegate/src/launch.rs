@@ -537,6 +537,8 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         );
     }
     let mut extra = json!({"env":config.value["env"],"agentDeny":config.value["agentDeny"],"configSources":config.sources,"configCapacity":capacities});
+    extra["sourceBuild"] = config.value["sourceBuild"].clone();
+    extra["sourceBuildRoot"] = json!(repo);
     if !o.read_only {
         let default_accept = config.value["accept"].as_str().filter(|c| !c.is_empty());
         if !o.accept_set {
@@ -587,7 +589,10 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
             // In place, this run would edit the tree other runs are applied into.
             let busy = worktree::active_writes_on(&top.to_string_lossy(), None);
             if !busy.is_empty() {
-                let names = busy.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>();
+                let names = busy
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>();
                 eprintln!(
                     "delegate: write task {} running on this source; this run uses a worktree so the source stays free for apply / 同源已有写入任务，本任务改用 worktree",
                     names.join(", ")
@@ -871,6 +876,8 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         .collect::<Vec<_>>();
     extra["configSources"] = json!(sources);
     extra["configCapacity"] = capacities;
+    extra["sourceBuild"] = config.value["sourceBuild"].clone();
+    extra["sourceBuildRoot"] = meta.get("sourceBuildRoot").cloned().unwrap_or(json!(top));
     if s(&summary, "state") == "timeout" && s(&meta, "mode") == "write" {
         extra["continuation"] = json!("timeout");
     }
@@ -1316,6 +1323,8 @@ pub fn launch(
     meta["agentBin"] = json!(agent_bin);
     meta["configSources"] = extra.get("configSources").cloned().unwrap_or(json!([]));
     meta["configCapacity"] = extra["configCapacity"].clone();
+    meta["sourceBuild"] = extra["sourceBuild"].clone();
+    meta["sourceBuildRoot"] = extra["sourceBuildRoot"].clone();
     meta["repoKey"] = json!(repo);
     if let Some(rules) = extra.get("agentDeny").filter(|rules| !rules.is_null()) {
         meta["agentDeny"] = rules.clone();

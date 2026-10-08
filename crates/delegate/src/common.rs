@@ -429,6 +429,7 @@ pub fn run_shell(
 }
 pub fn finish_run(run: &std::path::Path, mut summary: serde_json::Value, code: i32) -> Res<()> {
     crate::runs::record_worktree_bytes(run);
+    crate::source_build::record(run);
     if let Some(sources) = json(run.join("meta.json")).get("configSources") {
         summary["configSources"] = sources.clone();
     }

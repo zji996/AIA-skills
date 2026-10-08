@@ -105,6 +105,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
     let mut ignored = vec![];
     if let Some(user) = &user {
         validate(user, &user_file, false)?;
+        crate::source_build::validate(user, &user_file, top)?;
         sources.push("user");
         for key in ["worktree", "generated", "applyVerify"] {
             if user.get(key).is_some() {
@@ -114,6 +115,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
     }
     if let Some(repo) = &repo {
         validate(repo, repo_file.as_deref().unwrap(), true)?;
+        crate::source_build::validate(repo, repo_file.as_deref().unwrap(), top)?;
         sources.push("repo");
     }
     let mut value = repo.clone().unwrap_or(json!({}));
@@ -121,6 +123,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         "accept",
         "evidence",
         "maxRework",
+        "sourceBuild",
         "maxActive",
         "maxCodex",
         "maxHeavy",

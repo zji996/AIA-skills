@@ -375,6 +375,10 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 
 写入 run 收尾、验收后限时测量 worktree 字节并缓存 `meta.worktreeBytes`（已有值复用，失败省略）；status/wait 只读取缓存，旧任务不补测。本仓库已结束、目录仍在且无运行中续接的 worktree 按路径去重，达到 `DELEGATE_WORKTREE_WARN_GIB`（默认 20、0 关闭）时末尾输出总量、前三名称与大小、确认合入后 `clean <name> --force`；JSON 追加 `worktreeDisk{totalBytes,thresholdBytes,largest:[{run,name,bytes}],next}` 行。
 
+5.24 起，写入收尾在 worktree 测量后量源根构建目录，多路径共用 20 秒；原地也测，只读不测。默认 Cargo.toml → 现存 target；两级配置 `sourceBuild.paths` 替换默认，整个对象仓库覆盖用户，`[]` 关闭。越界与绝对路径报配置错误（2）；缺失目录跳过，空列表/无目录缓存零值。测量与缓存失败不改 state、退出码或验收。
+
+meta 缓存 `sourceBuildBytes`、`sourceBuildPaths:[{path,bytes}]`、`sourceBuildMeasuredAt`、`sourceBuildMeasuredNs`；status/wait/list 只读缓存，取同源最近测量、不累加 run。`DELEGATE_SOURCE_BUILD_WARN_GIB` 默认 60 GiB、0 关闭；达阈值提示总量、各路径大小与先量再删的参考。JSON 独立行 `sourceBuildDisk{totalBytes,thresholdBytes,paths:[{path,bytes}],measuredAt,next}` 可与 worktreeDisk 同现，未达或关闭省略；只提示不删。边界与字段见 [cleanup.md](../skills/delegate/references/cleanup.md)。
+
 ## 11. 文件与目录
 
 run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git 根下的 `.local/run/delegate/`（不在仓库中则为当前目录下）；按名字/ID 也查找旧 `.local/run/pi/`。首次创建时写入内容为 `*` 的 `.gitignore`；run 目录 `<YYYYmmdd-HHMMSS>-<slug>[-<4 hex>]`，权限 700。`<state>` 为 `${XDG_STATE_HOME:-~/.local/state}/delegate`，**不得**提供环境变量覆盖。

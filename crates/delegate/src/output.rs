@@ -86,6 +86,77 @@ pub fn worktree_disk() {
     }
 }
 
+pub fn source_build_disk() {
+    let threshold = setting("SOURCE_BUILD_WARN_GIB", "60")
+        .parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .unwrap_or(60.0);
+    if threshold == 0.0 {
+        return;
+    }
+    let threshold_bytes = (threshold * 1024.0_f64.powi(3)) as u64;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let repo = crate::launch::repo_key(&cwd);
+    let latest = runs::all_runs()
+        .iter()
+        .map(|run| json(run.join("meta.json")))
+        .filter(|meta| {
+            s(meta, "mode") == "write"
+                && crate::launch::repo_key_for_meta(meta) == repo
+                && meta["sourceBuildBytes"].as_u64().is_some()
+                && meta["sourceBuildPaths"].as_array().is_some_and(|paths| {
+                    paths.iter().all(|item| {
+                        item["path"].as_str().is_some_and(|path| !path.is_empty())
+                            && item["bytes"].as_u64().is_some()
+                    })
+                })
+                && meta["sourceBuildMeasuredAt"]
+                    .as_str()
+                    .is_some_and(|time| !time.is_empty())
+        })
+        .filter_map(|meta| {
+            let time = s(&meta, "sourceBuildMeasuredNs").parse::<u128>().ok()?;
+            Some((time, meta))
+        })
+        .max_by_key(|(time, _)| *time);
+    let Some((_, meta)) = latest else {
+        return;
+    };
+    let total = meta["sourceBuildBytes"].as_u64().unwrap_or(0);
+    if total == 0 || total < threshold_bytes {
+        return;
+    }
+    let next = "先量再删：见 references/cleanup.md 的“源仓库的构建缓存”";
+    if json_enabled() {
+        println!(
+            "{}",
+            json!({"sourceBuildDisk":{
+                "totalBytes":total,"thresholdBytes":threshold_bytes,
+                "paths":meta["sourceBuildPaths"],"measuredAt":meta["sourceBuildMeasuredAt"],"next":next
+            }})
+        );
+    } else {
+        let paths = meta["sourceBuildPaths"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|item| {
+                format!(
+                    "{} {:.1} GiB",
+                    s(item, "path").replace(['\n', '\r'], " "),
+                    item["bytes"].as_u64().unwrap_or(0) as f64 / 1024.0_f64.powi(3)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("、");
+        println!(
+            "提示：源仓库构建目录共 {:.1} GiB；各路径：{paths}；{next}",
+            total as f64 / 1024.0_f64.powi(3)
+        );
+    }
+}
+
 pub fn human(run: &Path, status: &Value) -> String {
     let meta = json(run.join("meta.json"));
     let state = s(status, "state");
