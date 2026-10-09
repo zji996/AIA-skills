@@ -27,6 +27,8 @@
 
 `delegate` 架构总览：[docs/assets/delegate-architecture.webp](docs/assets/delegate-architecture.webp)（提示词同目录）。
 
+`delegate` 5.26.0：apply 后保留七天轻量记录，reply 自动从当前 HEAD 续做；apply 列提交并可 `--keep-commits`。`start --share` 共享按次输入，`resources`/`busy` 查询实际占用，`acceptBlind` 提醒验收盲区；压缩失败按上限显示，wait 钩子给混合命令拆分步骤，续跑命令沿用调用路径。
+
 `delegate` 5.25.0 少写少选：仓库 `standing` 固定说明与 `agentDeny` 提示自动附到每份任务说明，`defaults` 给 worktree/protect/acceptAlso/timeout/evidence 默认值并在启动时回显来源；省略 `--name` 取说明首行；无参 `wait` 交付下一个结束的任务并在末行写明还剩几个、再跑哪条命令；答复显示上限默认 20000（`resultChars`），`--max-answer` 超长时自动压缩一次；`apply` 合入后自动清理并说明验收是否仍有效；任务收尾不再终止 sccache 这类共享守护进程。入口 `SKILL.md` 精简为三步、场景表与档位，状态与边界细节移到 `references/reading-results.md`。
 
 `delegate` 5.24.0 源构建目录提示：写入收尾在 worktree 测量后限时测源仓库的现存 target（根有 Cargo.toml），用户/仓库 `sourceBuild.paths` 可替换、空数组关闭；status/wait 取同源最近缓存，默认 60 GiB 提示总量、各路径大小及[先量再删的参考](skills/delegate/references/cleanup.md)，`DELEGATE_SOURCE_BUILD_WARN_GIB` 可调、0 关闭，JSON 独立追加 `sourceBuildDisk`；失败不改结论，只提示不删。

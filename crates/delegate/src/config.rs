@@ -99,7 +99,7 @@ fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
             let map = v.as_object().ok_or("defaults must be an object")?;
             for (k, v) in map {
                 let valid = match k.as_str() {
-                    "worktree" => v.is_boolean(),
+                    "worktree" | "keepCommits" => v.is_boolean(),
                     "protect" | "acceptAlso" => v.as_array().is_some_and(|a| {
                         a.iter().all(|v| {
                             v.as_str()
@@ -167,6 +167,24 @@ fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
             }
         }
         crate::deny::validate_config(value.get("agentDeny"), repo)?;
+        if let Some(resources) = value.get("resources") {
+            let resources = resources.as_object().ok_or("resources must be an object")?;
+            for (name, spec) in resources {
+                if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
+                    return Err(format!("resources.{name}: invalid resource name"));
+                }
+                let commands = spec["commands"].as_array().ok_or_else(|| format!("resources.{name}.commands must be a list"))?;
+                for argv in commands {
+                    let rule = json!({"argv":argv,"hint":"resource"});
+                    crate::deny::validate(Some(&json!([rule])))?;
+                }
+            }
+        }
+        if let Some(v) = value.get("acceptBlind") {
+            if !v.as_array().is_some_and(|a| a.iter().all(|v| v.as_str().is_some_and(|s| !s.is_empty() && !s.contains('\0')))) {
+                return Err("acceptBlind must be a list of non-empty globs".into());
+            }
+        }
         Ok(())
     };
     check().map_err(|e| format!("{}: {e}", path.display()))?;
@@ -223,6 +241,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         "repoMaxActive",
         "repoMaxCodex",
         "resultChars",
+        "acceptBlind",
     ] {
         if value.get(key).is_none() {
             if let Some(v) = user.as_ref().and_then(|u| u.get(key)) {
@@ -231,6 +250,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         }
     }
     let mut env = json!({});
+    let mut resources = json!({});
     let mut defaults = json!({});
     let mut standing = json!({});
     let mut origins = json!({"defaults":{},"standing":{}});
@@ -266,6 +286,9 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         if let Some(map) = layer["env"].as_object() {
             env.as_object_mut().unwrap().extend(map.clone());
         }
+        if let Some(map) = layer["resources"].as_object() {
+            resources.as_object_mut().unwrap().extend(map.clone());
+        }
         for rule in layer["agentDeny"].as_array().into_iter().flatten() {
             let position = rules
                 .iter()
@@ -285,6 +308,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         }
     }
     value["env"] = env;
+    value["resources"] = resources;
     value["agentDeny"] = json!(rules);
     origins["agentDeny"] = json!(["user", "repo"]
         .into_iter()

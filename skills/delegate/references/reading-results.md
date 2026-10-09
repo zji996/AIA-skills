@@ -15,6 +15,8 @@
 
 state 只描述答复。只读任务写文件仍是 `answered`，短行提示，JSON 带 `readOnlyViolation`（隔离未合并）或 `workspaceChanged`（原地无法归属）。改动来自前后快照：含 shell 改动，排除原有脏改动与验收副产物。退出码：`0` 成功，`1` 其他结局，`2` 用法错误/拒绝，`75` 仍运行，`76` 已有等待者。
 
+`busy <资源>` 是独立查询：占用时退出 0 并打印占用者，空闲退出 1 且不输出；它不改变任务验收判定。`acceptBlind` 命中只提示验收盲区，不改变 `delivered`。
+
 `agentDeny` 默认按 argv 前缀拦截，`exact: true` 仅拦完全相等的参数；同事及其 `lane` 命中退出 `77` 并给替代提示，结论带 `denied`。同事跑相关检查，主控合入一批后跑全量；验收、证据、setup、apply 生成与复验、主控 lane 用原 PATH。
 
 `--evidence <命令>` 收集模型评测等旁路证据，验收通过后（无验收则答复后）经 lane 运行；`--evidence-timeout` 默认 30m，排队不计时。失败/超时只记 `evidence`，永不改 state 或退出码；验收失败或保护违规跳过。reply 继承，`--no-evidence` 关闭。手动合入后，`status`/`wait`/`clean` 检查源工作树是否包含全部最终内容、删除与执行位；全含则显示“已合入（主干已含改动）”，JSON `appliedBy: "detected"`，可清理；部分包含或读取失败仍提示 apply。

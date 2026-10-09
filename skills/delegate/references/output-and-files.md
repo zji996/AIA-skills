@@ -8,9 +8,9 @@
 
 ## 会话
 
-每轮的会话都属于自己的 run：Pi 保存在 run 目录的 `session/` 下，Codex 使用自己的会话存储，`summary.json` 的 `session` 记下会话 id。`reply` 在每次尝试时从上一轮的会话**分叉**（Pi `--fork` 上一轮会话文件的副本，Codex `exec fork`），上一轮的会话从不被改动：答复畸形重跑时从同一处重新开始，清理早先的轮次也不影响后续追问。结局为 `malformed` 的轮次不算对话的延续，之后的 `reply` 与 `apply` 都从它的上一轮接着。4.1 之前的 run 使用 `--no-session`，不能 `reply`。
+每轮的会话都属于自己的 run：Pi 保存在 run 目录的 `session/` 下，Codex 使用自己的会话存储，`summary.json` 的 `session` 记下会话 id。`reply` 在每次尝试时从上一轮的会话**分叉**（Pi `--fork` 上一轮会话文件的副本，Codex `exec fork`），会话不被改动：答复畸形重跑时从同一处重新开始，清理早先的轮次也不影响后续追问。apply 后 worktree 删除，记录移到 `.applied/<run_id>/`，保留 7 天供 `reply` 续做。结局为 `malformed` 的轮次不算对话的延续，之后的 `reply` 与 `apply` 都从它的上一轮接着。4.1 之前的 run 使用 `--no-session`，不能 `reply`。
 
-写入任务上一轮为 `timeout` 时，下一次 reply 记 `meta.continuation: "timeout"`、`rework.kind: "continuation"`，不消耗 maxRework，超限也允许续做，改动超过 minor 的 60 行仍不补计。连续超时可以连续续做；rejected 等结局后仍按原返工规则。超时结论的 `next` 是可直接复制的续做命令，无会话 id 或 Pi 会话文件缺失时自动带 `--fresh`，自然语言结论注明“不计返工次数”。
+写入任务上一轮为 `timeout` 时，下一次 reply 记 `meta.continuation: "timeout"`、`rework.kind: "continuation"`，不消耗 maxRework，超限也允许续做，改动超过 minor 的 60 行仍不补计。连续超时可以连续续做；rejected 等结局后仍按原返工规则。超时结论的 `next` 是可直接复制的续做命令，缺失会话自动带 `--fresh`，自然语言结论注明“不计返工次数”。
 
 ## 位置
 
@@ -24,7 +24,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| `meta.json` | 启动参数、同事（`agent`）、workdir、模式、验收命令、启动时间；`standing`/`standingSources`、生效 `defaults`、`resultDisplayChars`（配置显示上限）、`maxAnswer`（答复约定）；可选 `agentPinned`、仓库键 `repoKey`、证据命令 `evidenceCommand`、超时 `evidenceTimeoutSeconds` 和结果 `evidence`；`protect` 字符串数组与可选 `protectReasons` 原因映射（reply/fresh 继承） |
+| `meta.json` | 启动参数、同事（`agent`）、workdir、模式、验收命令、启动时间；`standing`/`standingSources`、`defaults`、`share`、`resources`、`acceptBlind`、`resultDisplayChars`、`maxAnswer`；可选 `agentPinned`、仓库键 `repoKey`、证据命令 `evidenceCommand`、超时 `evidenceTimeoutSeconds` 和结果 `evidence`；`protect` 字符串数组与可选 `protectReasons` 原因映射（reply/fresh 继承） |
 | `prompt.md` | 同事实际收到的任务说明；末尾可能附完成标准（`--accept`）与只读边界（Codex 只读任务） |
 | `events.jsonl` | 过滤后的全过程：读取、命令、编辑路径、错误、每轮模型与用量、重跑；不含编辑全文 |
 | `result.md` | 完整答复；自动压缩成功时为压缩后的答复 |

@@ -9,6 +9,9 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub type Res<T> = Result<T, String>;
+pub fn strings(value: &Value) -> Vec<String> {
+    value.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect()
+}
 pub const GUARDS: [&str; 7] = [
     "DELEGATE_AGENT",
     "DELEGATE_PARENT_RUN",
@@ -123,10 +126,26 @@ pub fn iso_epoch(value: &str) -> Option<i64> {
     Some(unsafe { libc::timegm(&mut tm) })
 }
 pub fn script() -> PathBuf {
-    env::current_exe()
-        .unwrap_or_else(|_| PathBuf::from("delegate"))
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from("delegate"))
+    if let Some(arg) = env::args_os().next() {
+        let path = PathBuf::from(arg);
+        if path.is_absolute() {
+            return path;
+        }
+        if path.components().count() > 1 {
+            if let Ok(path) = std::path::absolute(path) {
+                return path;
+            }
+        } else if let Some(path) = env::var_os("PATH").and_then(|paths| {
+            env::split_paths(&paths)
+                .map(|dir| dir.join(&path))
+                .find(|candidate| candidate.is_file())
+        }) {
+            if let Ok(path) = std::path::absolute(path) {
+                return path;
+            }
+        }
+    }
+    env::current_exe().unwrap_or_else(|_| PathBuf::from("delegate"))
 }
 pub fn home() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
@@ -382,6 +401,8 @@ pub fn run_shell(
         .stdout(log.try_clone().map_err(|e| e.to_string())?)
         .stderr(Stdio::from(log.try_clone().map_err(|e| e.to_string())?));
     clean_env(&mut c, extra);
+    let meta = json(run.join("meta.json"));
+    if let Some(path) = crate::deny::resource_path(&meta, run)? { c.env("PATH", path); }
     c.env("DELEGATE_LANE_HELD", "1")
         .env("DELEGATE_RUN_DIR", run);
     group(&mut c);

@@ -41,21 +41,28 @@ def main() -> int:
         return 0
     command = strip_heredocs(str(tool_input.get("command", "")))
     # Asking for help does not block.
-    if not any(not HELP.search(command[m.start():].split("\n", 1)[0]) for m in BLOCKING.finditer(command)):
+    matches = [m for m in BLOCKING.finditer(command)
+               if not HELP.search(command[m.start():].split("\n", 1)[0])]
+    if not matches:
         return 0
+    wait_command = command[matches[0].start():].split("\n", 1)[0]
+    wait_command = re.split(r"\s*(?:&&|\|\||[;&|])\s*", wait_command, maxsplit=1)[0].strip()
+    rest = command[:matches[0].start()] + command[matches[0].start() + len(wait_command):]
+    mixed = bool(rest.strip(" \t\r\n;&|"))
+    reason = (f"把 wait 单独作为一条后台命令发出：{wait_command}；其余部分另发一条。"
+              if mixed else
+              "delegate wait/run/reply --wait blocks until colleagues finish. Rerun the same "
+              "command with the Bash tool's run_in_background: true; you are notified when it "
+              "exits, so keep working meanwhile and do not poll. Use start (or reply without "
+              "--wait) to launch, then one background wait. To look at each run as it finishes, "
+              "run `wait --stream` under the Monitor tool (one notification per run), or run "
+              "`wait --any` in the background and repeat it after each notification.")
     json.dump(
         {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": (
-                    "delegate wait/run/reply --wait blocks until colleagues finish. Rerun the same "
-                    "command with the Bash tool's run_in_background: true; you are notified when it "
-                    "exits, so keep working meanwhile and do not poll. Use start (or reply without "
-                    "--wait) to launch, then one background wait. To look at each run as it finishes, "
-                    "run `wait --stream` under the Monitor tool (one notification per run), or run "
-                    "`wait --any` in the background and repeat it after each notification."
-                ),
+                "permissionDecisionReason": reason,
             }
         },
         sys.stdout,

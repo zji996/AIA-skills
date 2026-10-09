@@ -9,6 +9,9 @@
 
 ### 技能
 
+- `delegate` 5.26.0：apply 保留七天轻量记录供合入后 reply 新会话续做；列出提交并支持按序 cherry-pick。共享输入、资源占用查询与验收盲区提示加入配置和输出。
+- `delegate` 5.26.0：压缩失败按上限截断，wait 混合命令钩子给拆分提示，续跑命令沿用调用路径；二进制留待主控发版。
+
 - `delegate` 5.25.1：省略 `--name` 时取说明第一个分句（跳过“目标：”“Goal:”这类标签），最多 24 字；此前取整行前 40 字，中文说明连标点拼成很长的名字，之后每条命令都要带着它。
 - `delegate` 5.25.0：默认答复显示上限升至 20000，新增 `resultChars` 与 1.25 倍全文容差；`--max-answer` 超长时会话内追问压缩一次，原文另存，失败保留、不耗返工预算。
 - `delegate` 5.25.0：`defaults` 提供 worktree/protect/acceptAlso/timeout/evidence，CLI 覆盖、`--in-place` 原地写入；省略 name 自动取说明首行，启动显示生效默认值与来源。

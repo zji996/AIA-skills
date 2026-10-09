@@ -303,6 +303,18 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
         );
     }
     let mut c = Command::new("sh");
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let temporary = if account.is_none() {
+        let dir = state_dir().join(format!("lane-resource-{}-{}", std::process::id(), now_ns()));
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        Some(dir)
+    } else { None };
+    if let Some(dir) = &temporary {
+        let config = crate::config::load(git_top(&cwd).as_deref())?;
+        let meta = json!({"resources":config.value["resources"],"agentDeny":[],"workdir":cwd,"env":config.value["env"]});
+        crate::deny::prepare(&meta, dir)?;
+        if let Some(path) = crate::deny::resource_path(&meta, dir)? { c.env("PATH", path); }
+    }
     c.arg("-c")
         .arg(command)
         .stdin(Stdio::inherit())
@@ -315,6 +327,7 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
     loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             let sig = SIGNAL.load(Ordering::SeqCst);
+            if let Some(dir) = &temporary { let _ = fs::remove_dir_all(dir); }
             return Ok(if sig != 0 {
                 128 + sig
             } else {
@@ -328,6 +341,7 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
         if sig != 0 {
             end_group(pid, 3.0);
             let _ = child.wait();
+            if let Some(dir) = &temporary { let _ = fs::remove_dir_all(dir); }
             return Ok(128 + sig);
         }
         std::thread::sleep(Duration::from_millis(20));

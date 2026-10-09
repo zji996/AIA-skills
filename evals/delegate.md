@@ -1,5 +1,16 @@
 # delegate
 
+## 5.26 真实主控使用回归
+
+- apply 后 `reply`：轻量记录仍能读原说明与答复，自动从当前 HEAD 新建写入 worktree；`--fresh` 只用新消息。Continue an applied run with its original context.
+- 同事 worktree 有两个提交：apply 总是逐个列短哈希、标题和文件数；`--keep-commits` 与 `defaults.keepCommits` 按序 cherry-pick，冲突停下。
+- `--max-answer 1800` 压缩失败：交付显示不超过 1800 字答复，末行有原文路径、字数和失败原因，`result` 可读全文。
+- `start --share .local/reference --share /tmp/reference`：repo 内同位置建链接，外部只附可读输入行；reply 沿用，目标已存在时报错。
+- `resources.pg.commands` 命中同事、验收或 lane 的 `cargo xtask infra-test`：执行中 `busy pg` 退出 0 并列占用，结束/进程消失后退出 1；status 加“占用 pg”。
+- `acceptBlind` 命中 Dockerfile、compose 文件：已交付状态不变，短行、JSON 与 apply 末行标出最多五个盲区路径。
+- Claude Code 钩子拒绝 `delegate wait &` 与分析脚本混发：给出原 wait 子命令及两条命令的拆分步骤；纯 wait 原提示不变。
+- 通过符号链接调用 delegate：wait 的“原样再跑”与结论 `next` 采用该链接的绝对路径，不解析到安装目录。
+
 ## 5.25 少写少选
 
 - 主控在三份任务说明里手抄同一段仓库规矩：仓库 `.delegate.json` 设 `standing` 后，start 回显“附加 N 行（repo）”，`prompt.md` 末尾含该文字与生效的 deny 命令及 hint；普通 reply 不重复，`--fresh` 重附。Standing instructions from config are appended to every task prompt and echoed at start.

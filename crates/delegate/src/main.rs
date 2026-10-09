@@ -9,6 +9,7 @@ mod lane;
 mod launch;
 mod output;
 mod runs;
+mod resources;
 mod source_build;
 mod supervise;
 mod waiting;
@@ -221,16 +222,16 @@ fn print_answer(run: &Path, full: bool) -> bool {
         run.file_name().unwrap_or_default().to_string_lossy(),
         result.chars().count()
     );
-    let truncated = !full && result.chars().count() > limit.saturating_add(limit / 4);
     let compression = json(run.join("compression.json"));
-    if compression.is_object() {
+    let failed_compression = compression.is_object() && !b(&compression, "ok");
+    let limit = if failed_compression && !full {
+        limit.min(json(run.join("meta.json"))["maxAnswer"].as_u64().unwrap_or(limit as u64) as usize)
+    } else { limit };
+    let truncated = !full && (failed_compression && result.chars().count() > limit
+        || result.chars().count() > limit.saturating_add(limit / 4));
+    if compression.is_object() && !failed_compression {
         println!(
-            "答复压缩{}；原文：{}",
-            if b(&compression, "ok") {
-                "完成"
-            } else {
-                "失败，保留原答复"
-            },
+            "答复压缩完成；原文：{}",
             s(&compression, "original")
         );
     }
@@ -263,6 +264,11 @@ fn print_answer(run: &Path, full: bool) -> bool {
         "===== end: {} =====",
         run.file_name().unwrap_or_default().to_string_lossy()
     );
+    if failed_compression && !full {
+        println!("答复压缩失败，保留原答复；原文：{}；原文字数：{}；压缩失败：{}",
+            s(&compression, "original"), result.trim_end_matches('\n').chars().count(),
+            s(&compression, "error").lines().next().unwrap_or("unknown"));
+    }
     truncated
 }
 fn progress(run: &Path, tag: &str) {
@@ -914,6 +920,7 @@ fn apply(args: &[String]) -> Res<i32> {
             "--verify",
             "--no-verify",
             "--keep",
+            "--keep-commits",
             "--json",
         ],
         &[],
@@ -936,7 +943,9 @@ fn apply(args: &[String]) -> Res<i32> {
             run.file_name().unwrap_or_default().to_string_lossy()
         ));
     }
-    let mut outcome = worktree::apply(&run, has(&flags, "--merge"), has(&flags, "--dry-run"))?;
+    let meta = json(run.join("meta.json"));
+    let keep_commits = has(&flags, "--keep-commits") || b(&meta["defaults"], "keepCommits");
+    let mut outcome = worktree::apply(&run, has(&flags, "--merge"), has(&flags, "--dry-run"), keep_commits)?;
     if run.join(".applied").exists() {
         let path = s(&json(run.join("meta.json"))["worktree"], "path").to_string();
         for other in runs::all_runs() {
@@ -959,7 +968,6 @@ fn apply(args: &[String]) -> Res<i32> {
         outcome.code = 1;
     }
     // Capture acceptance before cleaning, since clean removes the recorded task metadata.
-    let meta = json(run.join("meta.json"));
     let final_line = if outcome.conclusion["acceptStillValid"] == json!(true) {
         "验收仍然有效（仓库快照范围）".to_string()
     } else {
@@ -989,6 +997,7 @@ fn apply(args: &[String]) -> Res<i32> {
             format!("{validity}；需要在主干重跑：{}", commands.join("；"))
         }
     };
+    let blind_note = output::blind_note(&outcome.conclusion["acceptBlind"]);
     println!("{}", format_status(outcome.conclusion));
     if outcome.code == 0 && !has(&flags, "--dry-run") && !has(&flags, "--keep") {
         for diagnostic in runs::remove_after_apply(&run) {
@@ -996,7 +1005,7 @@ fn apply(args: &[String]) -> Res<i32> {
         }
     }
     if !output::json_enabled() {
-        println!("{final_line}");
+        println!("{final_line}{}", if blind_note.is_empty() { String::new() } else { format!("；{blind_note}") });
     }
     Ok(outcome.code)
 }
@@ -1032,6 +1041,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         supervise::supervise(Path::new(run))?;
         return Ok(0);
     }
+    if command == "_resource" { return resources::command(rest); }
     match command.as_str() {
         "start" | "run" => {
             let o = launch::parse_launch(rest, false, command == "run")?;
@@ -1199,6 +1209,10 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "diff" => diff(rest),
         "apply" => apply(rest),
         "lane" => lane::lane_command(rest),
+        "busy" => {
+            if rest.len() != 1 { return Err("busy requires one resource name".into()); }
+            Ok(resources::busy(&rest[0]))
+        }
         "stop" => stop(rest),
         "clean" => clean(rest),
         "protocol" => {

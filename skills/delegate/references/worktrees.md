@@ -32,6 +32,8 @@
 
 worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 `git worktree remove`，过期清理同理；`agent-handoff` 会列出尚未 `apply` 的写入型 worktree。
 
+成功 `apply` 默认回收 worktree，轻量保留 run 的 `meta.json`、任务说明、最终答复与摘要 7 天（`DELEGATE_KEEP_DAYS`，0 禁止自动过期）；`clean <run>` 与 `clean --finished` 可提前删除。普通 `reply` 会从当前源分支新建 worktree，将原任务说明、上次答复和追加说明交给新会话；`reply --fresh` 仍只使用本轮说明。共享输入沿用原路径；repo 内路径必须在新 worktree 同位置不存在，否则报错。共享链接只是协作约定，并非文件系统写保护。
+
 写入任务未 apply 时，`status`/`wait`/`clean` 仅检查累计改动清单中的路径，按类型、大小和哈希比较源工作树与同事结束时的最终内容，执行位也须一致，删除路径须在源中不存在；不要求提交进 HEAD。全部包含时写 `.applied` 并记 `appliedBy: "detected"`，短行“已合入（主干已含改动）”，`next` 改为清理建议，`clean --finished` 按已合入处理。仅部分包含或读取失败时视为未检测到，沿用原 apply 建议；检测不代表验收已在源中复跑。
 
 同仓库串行 `apply`；慢合并可后台执行。stderr 实时报告检查、生成器排队（人数与前序任务）、生成日志绝对路径和执行超时；排队不算生成超时。生成失败留 `.generate-pending`，再次 apply 即使普通文件已合入也重跑生成。编号前缀冲突只警告，不改号或退出码；末尾 `operation: apply` JSON 带 `numberedPrefixConflicts` 和验收复用的原因。`acceptStillValid` 只在验收前后历史全树与最终源全树有完整相同证据时为 true，不完整时省略；忽略文件、环境、数据库、Git 历史另行判断，后续改动/reply 不沿用旧 true。`.delegate.json` 的 `applyVerify`（`true` 用顶层 `accept`，或直接写命令）开启合并后验收：`acceptStillValid` 不为 true 时经 lane 在源工作目录运行，结论带 `verify`，失败退出 1（合并已写入）；`--verify` 强制、`--no-verify` 跳过。

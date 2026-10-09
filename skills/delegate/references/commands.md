@@ -8,7 +8,8 @@
 | `run [选项] [--max <时长>]` | 启动并等到结论 |
 | `reply <run> [消息] [--wait] [--fresh] [--sync]` | 接着最新一轮会话在后台启动并立即返回；`--wait` 等到结论（此时可用 `--max`/`--progress`/`--full`）。`--fresh` 开新会话，消息须自足；`--sync` 先同步主控后来改动，冲突时直接拒绝。验收与证据命令默认沿用，可分别覆盖或关闭；取消或隐藏已变更的验收命令时会告诉同事旧标准不再适用 |
 | `diff [<run>] [--stat] [--total] [路径...]` | 以 `git diff` 输出该轮的改动；`--total` 为整段对话；终端下带颜色 |
-| `apply [<run>] [--dry-run] [--merge] [--keep] [--json]` | 把 `--worktree` 的现状（含最后一轮之后在 worktree 里的手工修改）相对对话起点的全部改动合并回原工作区（只写文件，不碰 index）：你没动过的文件直接写入（含权限位），双方都改过的文本做三方合并，大文件从 worktree 复制；经符号链接目录、文件与目录互换、二进制与符号链接冲突一律算冲突；有合并不了的冲突时什么都不写，`--merge` 则写入其余文件并在冲突处留冲突标记（其余冲突跳过）。没有跳过项时，共用该 worktree 的所有 run（含畸形的旁支）标记 `.applied`；成功自动清理本轮 run 与不再共享的 worktree，`--keep` 保留，清理失败仅提示。人读末行给验收有效性与需在主干重跑的完整验收命令，`--json` 保持既有结论字段 |
+| `apply [<run>] [--dry-run] [--merge] [--keep] [--keep-commits] [--json]` | 默认将 worktree 改动合入源工作区，不提交；始终列同事提交。`--keep-commits` 按序 cherry-pick，要求同事工作树改动已提交，冲突停在 git cherry-pick 状态。成功后删除 worktree，保留轻量 run 记录；`--keep` 保留完整记录。合入末行报告验收有效性与盲区。 |
+| `busy <资源名>` | 有实际运行的匹配命令时逐行列 run、命令和持续秒数，退出 0；空闲无输出、退出 1 |
 | `wait [<run>...\|--all] [--max <时长>] [--no-result] [--full] [--progress]` | 无参默认同 `--any`：交付已结束未读取的，否则等下一批结束即返回；`--until-all` 等全部，`--all` 仅控制范围。人读末行给本会话剩余数和原样重跑命令，无运行任务时明确说明 |
 | `status [<run>...] [--json]` | 默认每任务一条自然语言短行；`--json` 保留完整原字段 |
 | `result [<run>] [--path]` | 输出完整答复 |
@@ -20,7 +21,7 @@
 
 `start`/`run`/`reply` 另支持 `--evidence <命令>`、`--no-evidence` 与 `--evidence-timeout`（默认 30m）。reply 沿用上一轮证据命令与超时，可覆盖或关闭。`--agent` 固定同事时仍显示适配表默认档位（Pi cheap、Codex strong），JSON `agentPinned: true`；旧 meta 缺字段时按同一规则推断显示，不改写旧 meta，不自动升档。
 
-`start`/`run`/`reply` 支持 `--max-answer N`（正整数，reply 继承）：附“答复不超过 N 字”，超出 1.5 倍时从当前会话续接一次“压缩到 N 字以内，保留结论与证据”。只有成功且符合 N 字上限才采用，失败保留原答复并提示；不耗返工预算，原文另存 `result-original.md`。固定说明与常用默认参数见 [配置](configuration.md)。
+`start`/`run`/`reply` 支持 `--max-answer N`（正整数，reply 继承）：超出 1.5 倍时续接压缩一次；失败时只显示前后截断的 N 字及原文路径、字数、原因，`result` 仍读全文。原文另存 `result-original.md`，不耗返工预算。`start --share PATH` 可重复，repo 内在 worktree 同位置建链接，repo 外只写入任务说明，reply 继承。固定说明与默认参数见 [配置](configuration.md)。
 
 ## 证据命令
 

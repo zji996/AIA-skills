@@ -11,7 +11,9 @@
 - `env` 按键合并，仓库优先；`agentDeny` 按 `(argv, exact)` 去重，省略 `exact` 等于 `false`；仓库同键 hint 覆盖用户值，保留原顺序。仓库 `{"argv":["cargo","xtask","check"],"exact":true,"allow":true}` 撤销完全相同 argv 且 exact 相同的一条用户规则，无需 hint；不撤销不同 exact 或其他前缀规则，用户配置不能声明 `allow: true`。
 - `sourceBuild` 整个对象按仓库 > 用户 > 内置默认覆盖；`{"sourceBuild":{"paths":["target","build"]}}` 指定相对源仓库根的构建目录，替换默认的 Cargo.toml → target 探测，`paths: []` 关闭。两份配置的绝对路径、越界路径及外部符号链接独立报错（文件与 `sourceBuild.paths[index]`，退出 2），不存在的目录可配置。启动保存设置，reply 用当前配置；仅写入收尾测一次，提示阈值只用 `DELEGATE_SOURCE_BUILD_WARN_GIB`（默认 60 GiB，0 关闭），不从 config.env 读取提示阈值，与 worktree 阈值来源一致。缓存与输出见 [清理](cleanup.md)。
 - `standing` 是固定说明：字符串、字符串数组，或 `{"all":"通用规矩","write":["写入规矩"],"readOnly":"只读规矩"}`；前两种等价于 `all`。按字段仓库覆盖用户，任务末尾附 `all` 与模式字段，再列生效的 deny 命令、匹配方式与 hint。启动回显附加行数及配置层，JSON 的 `standing`/`standingSources` 保存实际文字与来源；普通 reply 沿用会话，回显零行，`--fresh` 读取当前配置并附加。
-- `defaults` 按字段仓库覆盖用户，支持 `worktree`（布尔）、`protect`/`acceptAlso`（字符串数组）、`timeout`（时长字符串）、`evidence`（命令字符串）；start/run 的 CLI 显式值覆盖整项数组（reply 的 accept-also 追加到继承验收），`--no-accept`/`--no-evidence` 关闭相应默认。除 timeout 外只用于写入；`--in-place` 显式原地写入，覆盖 `defaults.worktree: true`。未配置时行为不变；启动回显生效值和来源，JSON `defaults` 记录；reply 沿用已有设置。
+- `defaults` 按字段仓库覆盖用户，支持 `worktree`、`keepCommits`（布尔）、`protect`/`acceptAlso`（字符串数组）、`timeout`（时长字符串）、`evidence`（命令字符串）；`keepCommits` 默认 false，CLI `apply --keep-commits` 可按次开启。启动选项的 CLI 显式值覆盖默认；reply 沿用已有设置。
+- `resources` 按资源名仓库覆盖用户，例如 `{"pg":{"commands":[["cargo","xtask","infra-test"]]}}`；argv 逐项前缀匹配同 `agentDeny`。匹配命令开始执行时登记，结束删除；`busy` 也按 `/proc` 进程身份剔除已消失记录。只查询占用，不排队、不加锁；同事、验收和 lane 均登记。
+- `acceptBlind` 是 glob 数组，例如 `["**/Dockerfile*","**/compose*.y*ml","manage.sh"]`，仓库值覆盖用户值。写入交付时命中路径仍可交付，但短行、JSON `acceptBlind` 与 apply 末行提示最多五个文件及其余数量。
 - `resultChars` 是答复显示上限（正整数，默认 20000），环境变量 `DELEGATE_RESULT_CHARS` 优先；答复不超过上限的 1.25 倍时全文显示，超出才显示头尾。每任务 `--max-answer N` 是另一项答复约定，超过 N 的 1.5 倍时自动续接一次压缩，不计返工预算。
 - `cleanupKeepExecutables` 是共享守护进程的可执行文件名数组，用户与仓库追加去重，内置 `sccache`；按实际可执行文件名识别，不能配置路径。回收不终止这些进程，普通进程提示名字和端口。
 - `worktree`、`generated`、`applyVerify` 只认仓库：用户级出现时忽略，`start`（含 `run`）在 stderr 汇总提示一次。

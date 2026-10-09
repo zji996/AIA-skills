@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "5.25.1"
+  version: "5.26.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -35,6 +35,10 @@ $D wait                                                                    # 2. 
 | 看截图或设计图 | `$D start --read-only --image shot.png "…"` |
 | 改代码，测试通过才算完 | `$D start --worktree --accept-also "make test" "…"`；不许同事碰的路径加 `--protect tests/` |
 | 接着上一轮追问或返工 | `$D reply <name> "…"`（同一会话、同一 worktree）；开新会话加 `--fresh`；你之后改了代码想让它看到加 `--sync` |
+| 合入后继续返工 | `$D reply <name> "…"` 自动从当前 HEAD 新开会话，带原说明与上次答复；`--fresh` 仍只用新消息 |
+| 保留同事提交 | `$D apply --keep-commits <name>`；也可设 `defaults.keepCommits: true` |
+| 提供按次只读材料 | `$D start --share <路径> "…"`（可重复，reply 沿用） |
+| 查询共享资源 | `$D busy pg`（占用返回 0，空闲返回 1）；`resources` 按 argv 前缀登记 |
 | 先 A 后 B | `$D start --after <A> …`；审 A 的结果加 `--in <A> --read-only` |
 | 自己跑重检查 | `$D lane make check`（与同事验收、证据共用队列） |
 | 同时在几个仓库派了任务 | 后台 `$D wait --machine`，整机的都会收到 |
@@ -44,7 +48,7 @@ $D wait                                                                    # 2. 
 
 ## 让仓库替你记住
 
-每次都要写的东西放进配置，不要手抄进说明：仓库根 `.delegate.json`（或用户级 `config.json`）的 `standing` 是自动附在每份任务说明末尾的固定规矩（可分 `all` / `write` / `readOnly`），`agentDeny` 拦下的命令及其替代提示会一并告诉同事；`defaults` 给 `worktree`、`protect`、`acceptAlso`、`timeout`、`evidence` 默认值，命令行显式选项覆盖，`--in-place` 退回原地写入。`resultChars`（默认 20000）是答复显示上限。字段与合并规则见 [references/configuration.md](references/configuration.md)。
+每次都要写的东西放进配置：仓库根 `.delegate.json`（或用户级 `config.json`）的 `standing` 自动附固定说明，`agentDeny` 附禁止命令提示；`defaults` 给常用启动选项及 `keepCommits` 默认值。`resources` 登记占用，`acceptBlind` 标出验收未覆盖路径；`resultChars`（默认 20000）限制显示长度。字段与合并规则见 [references/configuration.md](references/configuration.md)。
 
 ## 选档位
 

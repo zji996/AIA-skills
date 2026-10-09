@@ -13,6 +13,33 @@ pub fn enable_json() {
 pub fn json_enabled() -> bool {
     JSON.load(Ordering::Relaxed)
 }
+fn glob_match(pattern: &[u8], path: &[u8]) -> bool {
+    if pattern.is_empty() { return path.is_empty(); }
+    if pattern.starts_with(b"**/") {
+        return glob_match(&pattern[3..], path) || path.iter().enumerate()
+            .filter(|(_, byte)| **byte == b'/')
+            .any(|(i, _)| glob_match(&pattern[3..], &path[i + 1..]));
+    }
+    if pattern[0] == b'*' {
+        return glob_match(&pattern[1..], path) || (!path.is_empty() && path[0] != b'/' && glob_match(pattern, &path[1..]));
+    }
+    if pattern[0] == b'?' {
+        return !path.is_empty() && path[0] != b'/' && glob_match(&pattern[1..], &path[1..]);
+    }
+    !path.is_empty() && pattern[0] == path[0] && glob_match(&pattern[1..], &path[1..])
+}
+pub fn blind_files(files: &Value, patterns: &Value) -> Vec<String> {
+    let rules = strings(patterns);
+    files.as_array().into_iter().flatten().filter_map(Value::as_str)
+        .filter(|path| rules.iter().any(|rule| glob_match(rule.as_bytes(), path.as_bytes())))
+        .map(str::to_string).collect()
+}
+pub fn blind_note(files: &Value) -> String {
+    let Some(items) = files.as_array() else { return String::new() };
+    if items.is_empty() { return String::new(); }
+    let shown = items.iter().take(5).filter_map(Value::as_str).collect::<Vec<_>>().join("、");
+    format!("验收未覆盖：{shown}{}", if items.len() > 5 { format!(" 等另 {} 个", items.len()-5) } else { String::new() })
+}
 
 pub fn worktree_disk() {
     let threshold = setting("WORKTREE_WARN_GIB", "20")
@@ -332,6 +359,10 @@ pub fn human(run: &Path, status: &Value) -> String {
     if n(status, "denied") > 0 {
         parts.push(format!("拦下 {} 次全量检查", n(status, "denied")));
     }
+    let occupied = crate::resources::occupied_for_run(s(status, "run"));
+    if !occupied.is_empty() { parts.push(format!("占用 {}", occupied.join("、"))); }
+    let blind = blind_note(&status["acceptBlind"]);
+    if !blind.is_empty() { parts.push(blind); }
     let id = s(status, "run");
     let next = if runs::active(state) {
         format!("等待交付：delegate wait {id}")

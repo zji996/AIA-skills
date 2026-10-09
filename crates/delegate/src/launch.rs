@@ -26,6 +26,7 @@ pub struct Options {
     pub name: Option<String>,
     pub workdir: Option<String>,
     pub images: Vec<String>,
+    pub share: Vec<String>,
     pub protect: Vec<String>,
     pub protect_reasons: std::collections::BTreeMap<String, String>,
     pub read_only: bool,
@@ -141,6 +142,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             "--name",
             "--workdir",
             "--image",
+            "--share",
             "--protect",
             "--accept",
             "--accept-also",
@@ -177,6 +179,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--name" => o.name = Some(v),
                 "--workdir" => o.workdir = Some(v),
                 "--image" => o.images.push(v),
+                "--share" if !reply => o.share.push(v),
                 "--protect" => o.protect.push(v),
                 "--accept" => {
                     o.accept_set = true;
@@ -526,7 +529,7 @@ fn prompt_name(prompt: &str) -> String {
 fn effective_defaults(o: &mut Options, config: &crate::config::Config) -> Value {
     let mut applied = json!({});
     let defaults = &config.value["defaults"];
-    for key in ["worktree", "protect", "acceptAlso", "timeout", "evidence"] {
+    for key in ["worktree", "protect", "acceptAlso", "timeout", "evidence", "keepCommits"] {
         let Some(v) = defaults.get(key) else { continue };
         let used = match key {
             "worktree" if !o.read_only && !o.in_place && !o.worktree => {
@@ -656,8 +659,21 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         return Err("--in-place and --worktree contradict each other".into());
     }
     let repo = git_top(&workdir);
+    for item in &mut o.share {
+        let path = std::path::absolute(&*item).map_err(|e| e.to_string())?;
+        if !path.exists() {
+            return Err(format!("--share path does not exist: {}", path.display()));
+        }
+        *item = path.to_string_lossy().into_owned();
+    }
+    o.share.sort();
+    o.share.dedup();
     let config = crate::config::load(repo.as_deref())?;
     let defaults = effective_defaults(&mut o, &config);
+    let mut defaults = defaults;
+    if let Some(value) = config.value["defaults"].get("keepCommits") {
+        defaults["keepCommits"] = value.clone();
+    }
     if !o.protect.is_empty() && repo.is_none() {
         return Err("--protect needs a git repository".into());
     }
@@ -684,6 +700,9 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     extra["defaults"] = defaults;
     extra["resultChars"] = json!(config.value["resultChars"].as_u64().unwrap_or(20000));
     extra["cleanupKeepExecutables"] = config.value["cleanupKeepExecutables"].clone();
+    extra["share"] = json!(o.share);
+    extra["acceptBlind"] = config.value["acceptBlind"].clone();
+    extra["resources"] = config.value["resources"].clone();
     let (standing, sources) = standing_text(&config, o.read_only, &extra["agentDeny"]);
     extra["standing"] = json!(standing);
     extra["standingSources"] = sources;
@@ -849,12 +868,19 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     let accept_overridden = o.accept_set;
     let parent = runs::latest(runs::resolve(o.run.as_deref().unwrap_or("last"))?);
     let meta = json(parent.join("meta.json"));
+    o.share = strings(&meta["share"]);
     let summary = json(parent.join("summary.json"));
     if active(&state(&parent)) {
         return Err(format!(
             "{} is still running; wait for it before replying",
             parent.file_name().unwrap_or_default().to_string_lossy()
         ));
+    }
+    let after_apply = parent.join(".applied-cleaned").exists();
+    let compose_after_apply = after_apply && !o.fresh;
+    if after_apply {
+        o.fresh = true;
+        eprintln!("delegate: 原会话已合入，已开新会话续做");
     }
     if o.sync {
         let parent_name = parent.file_name().unwrap_or_default().to_string_lossy();
@@ -900,7 +926,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     {
         return Err(format!("{} has no saved session to continue (runs before delegate 4.1 kept none); use --fresh to start a new session in the same place",parent.file_name().unwrap_or_default().to_string_lossy()));
     }
-    if meta["worktree"].is_object() && !Path::new(s(&meta["worktree"], "path")).exists() {
+    if !after_apply && meta["worktree"].is_object() && !Path::new(s(&meta["worktree"], "path")).exists() {
         return Err(format!(
             "the worktree of {} no longer exists: {}",
             parent.file_name().unwrap_or_default().to_string_lossy(),
@@ -981,12 +1007,16 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         o.max_answer = meta["maxAnswer"].as_u64();
     }
     let prompt = read_prompt(&mut o)?;
+    let prompt = if compose_after_apply {
+        format!("原任务说明：\n{}\n\n上次答复：\n{}\n\n这次的追加说明：\n{}",
+            read(parent.join("prompt.md")).trim(), read(parent.join("result.md")).trim(), prompt)
+    } else { prompt };
     let top = Some(s(&meta["worktree"], "source"))
         .filter(|x| !x.is_empty())
         .unwrap_or(s(&meta, "top"));
     let config = crate::config::load(Some(Path::new(top)))?;
     let capacities = crate::config::capacities(&config.value)?;
-    o.rework = rework_gate(&parent, &meta, &o, &prompt, &config.value)?;
+    o.rework = if after_apply { None } else { rework_gate(&parent, &meta, &o, &prompt, &config.value)? };
     if o.sync && !meta["worktree"].is_object() {
         return Err("--sync requires a worktree conversation".into());
     }
@@ -1017,6 +1047,13 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     };
     let mut extra =
         json!({"parent":meta,"session":session,"env":meta["env"],"worktree":meta["worktree"]});
+    if after_apply {
+        extra["newAfterApply"] = json!(true);
+        if meta["worktree"].is_object() {
+            extra["worktree"] = json!({"source":top,"sourceWorkdir":s(&meta["worktree"],"sourceWorkdir"),
+                "config":worktree::work_config(&config.value, &Path::new(top).join(".delegate.json"))?});
+        }
+    }
     extra["protectGenerated"] = meta["protectGenerated"].clone();
     extra["agentDeny"] = meta["agentDeny"].clone();
     extra["defaults"] = meta["defaults"].clone();
@@ -1033,6 +1070,9 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     }
     extra["resultChars"] = json!(config.value["resultChars"].as_u64().unwrap_or(20000));
     extra["cleanupKeepExecutables"] = config.value["cleanupKeepExecutables"].clone();
+    extra["share"] = meta["share"].clone();
+    extra["acceptBlind"] = meta["acceptBlind"].clone();
+    extra["resources"] = meta["resources"].clone();
     if o.fresh {
         extra["agentDeny"] = config.value["agentDeny"].clone();
         let (text, sources) = standing_text(
@@ -1398,6 +1438,9 @@ pub fn launch(
             "\n\n答复不超过 {limit} 字 / Answer in no more than {limit} characters.\n"
         ));
     }
+    if !o.share.is_empty() {
+        actual.push_str(&format!("\n\n可读输入：{}（只读）\n", o.share.join("、")));
+    }
     let standing = s(extra, "standing");
     let inherited = b(extra, "standingInherited");
     if !inherited && !standing.is_empty() {
@@ -1479,6 +1522,14 @@ pub fn launch(
                 exclude.extend(a.iter().filter_map(Value::as_str).map(str::to_string));
             }
         }
+        let source = Path::new(s(&tree, "source"));
+        for item in &o.share {
+            if let Ok(relative) = Path::new(item).strip_prefix(source) {
+                if !relative.as_os_str().is_empty() {
+                    exclude.push(relative.to_string_lossy().into_owned());
+                }
+            }
+        }
     }
     let mut base = if tree["in"].is_string() {
         None
@@ -1504,7 +1555,7 @@ pub fn launch(
     } else {
         top.unwrap_or_default()
     };
-    let applied_base = if parent.is_object() {
+    let applied_base = if parent.is_object() && !b(extra, "newAfterApply") {
         let parent_dir = Path::new(s(parent, "dir"));
         let synced = json(parent_dir.join(".sync-base"));
         let state = if !s(&synced, "tree").is_empty() {
@@ -1520,7 +1571,7 @@ pub fn launch(
     } else {
         Value::Null
     };
-    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":seconds(o.timeout.as_deref().unwrap_or("15m"))?,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
+    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":seconds(o.timeout.as_deref().unwrap_or("15m"))?,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !b(extra,"newAfterApply") && !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
     let (agent_bin, agent_version) = agent_identity(s(&meta, "agent"))?;
     meta["agentPinned"] = json!(o.agent_pinned);
     if let Some(command) = o.evidence.filter(|command| !command.is_empty()) {
@@ -1536,6 +1587,9 @@ pub fn launch(
         "standingSources",
         "defaults",
         "cleanupKeepExecutables",
+        "share",
+        "acceptBlind",
+        "resources",
     ] {
         meta[key] = extra[key].clone();
     }
