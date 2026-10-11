@@ -339,6 +339,9 @@ pub fn human(run: &Path, status: &Value) -> String {
             parts.push(format!("最近：{}", clip(&cmd, 97)));
         }
     }
+    if let Some(ahead) = status["measureWaitingAhead"].as_u64() {
+        parts.push(format!("等待测量预约，前面 {ahead} 个"));
+    }
     if status["accept"].is_object() {
         parts.push(
             if b(&status["accept"], "ok") {

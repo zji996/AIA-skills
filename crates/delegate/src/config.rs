@@ -194,6 +194,16 @@ fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
             }
         }
         crate::deny::validate_config(value.get("agentDeny"), repo)?;
+        if let Some(v) = value.get("measure") {
+            let rules = v.as_array().ok_or("measure must be a list")?;
+            for argv in rules {
+                crate::measure::validate_argv(argv).map_err(|e| format!("measure: {e}"))?;
+            }
+        }
+        if let Some(v) = value.get("measureCpus") {
+            let cpus = v.as_str().ok_or("measureCpus must be a CPU list string")?;
+            crate::measure::parse_cpus(cpus).map_err(|e| format!("measureCpus: {e}"))?;
+        }
         if let Some(resources) = value.get("resources") {
             let resources = resources.as_object().ok_or("resources must be an object")?;
             for (name, spec) in resources {
@@ -282,6 +292,8 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         "acceptBlind",
         "stall",
         "checkIn",
+        "measure",
+        "measureCpus",
     ] {
         if value.get(key).is_none() {
             if let Some(v) = user.as_ref().and_then(|u| u.get(key)) {

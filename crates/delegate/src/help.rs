@@ -180,8 +180,9 @@ pub fn print(command: Option<&str>) -> bool {
             ("--verify", "After merging, run the repository acceptance on the merged tree unless acceptStillValid is true (default from .delegate.json applyVerify)."),
             ("--no-verify", "Skip the post-merge acceptance even when .delegate.json enables it."),
         ]),
-        "lane" => ("[--label TEXT] [command ...]", "Queue a heavy command with acceptance, evidence, worktree setup, and other machine checks. DELEGATE_MAX_HEAVY run at once (default: 2). One argument is a shell command; no command lists the lane.", &[
+        "lane" => ("[--label TEXT] [--measure] [command ...]", "Queue a heavy command with acceptance, evidence, worktree setup, and other machine checks. --measure uses the FIFO measurement reservation and reserved CPUs. DELEGATE_MAX_HEAVY run at once (default: 2). One argument is a shell command; no command lists the lane.", &[
             ("--label TEXT", "Label shown in the lane listing."),
+            ("--measure", "Run through the machine measurement reservation."),
             ("command", "Command and arguments to run; omit to list the lane."),
         ]),
         "stop" => ("runs ...", "Terminate one or more runs.", &[

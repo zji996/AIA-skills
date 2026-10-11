@@ -702,6 +702,8 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     extra["share"] = json!(o.share);
     extra["acceptBlind"] = config.value["acceptBlind"].clone();
     extra["resources"] = config.value["resources"].clone();
+    extra["measure"] = config.value["measure"].clone();
+    extra["measureCpus"] = config.value["measureCpus"].clone();
     extra["stall"] = config.value["stall"].clone();
     extra["checkIn"] = config.value["checkIn"].clone();
     let (standing, sources) = standing_text(&config, o.read_only, &extra["agentDeny"]);
@@ -721,6 +723,12 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         }
     }
     o.append_accept();
+    let deny_accept_conflicts =
+        crate::deny::conflicts(o.accept.as_deref(), &prompt, &extra["agentDeny"]);
+    for command in &deny_accept_conflicts {
+        eprintln!("验收命令 {command} 会被 agentDeny 拦下，同事无法运行；改为主控合入后自己跑，或换成单包命令");
+    }
+    extra["denyAcceptConflicts"] = json!(deny_accept_conflicts);
     if !o.read_only && !o.evidence_set && o.evidence.is_none() {
         o.evidence = config.value["evidence"].as_str().map(str::to_string);
     }
@@ -1025,6 +1033,11 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         .filter(|x| !x.is_empty())
         .unwrap_or(s(&meta, "top"));
     let config = crate::config::load(Some(Path::new(top)))?;
+    let deny_accept_conflicts =
+        crate::deny::conflicts(o.accept.as_deref(), &prompt, &meta["agentDeny"]);
+    for command in &deny_accept_conflicts {
+        eprintln!("验收命令 {command} 会被 agentDeny 拦下，同事无法运行；改为主控合入后自己跑，或换成单包命令");
+    }
     let capacities = crate::config::capacities(&config.value)?;
     o.rework = if after_apply {
         None
@@ -1061,6 +1074,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     };
     let mut extra =
         json!({"parent":meta,"session":session,"env":meta["env"],"worktree":meta["worktree"]});
+    extra["denyAcceptConflicts"] = json!(deny_accept_conflicts);
     if after_apply {
         extra["newAfterApply"] = json!(true);
         if meta["worktree"].is_object() {
@@ -1087,6 +1101,8 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     extra["share"] = meta["share"].clone();
     extra["acceptBlind"] = meta["acceptBlind"].clone();
     extra["resources"] = meta["resources"].clone();
+    extra["measure"] = meta["measure"].clone();
+    extra["measureCpus"] = meta["measureCpus"].clone();
     extra["stall"] = meta["stall"].clone();
     extra["checkIn"] = meta["checkIn"].clone();
     if o.fresh {
@@ -1457,6 +1473,17 @@ pub fn launch(
     if !o.share.is_empty() {
         actual.push_str(&format!("\n\n可读输入：{}（只读）\n", o.share.join("、")));
     }
+    if let Some(conflicts) = extra["denyAcceptConflicts"]
+        .as_array()
+        .filter(|x| !x.is_empty())
+    {
+        let commands = conflicts
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("；");
+        actual.push_str(&format!("\n\n验收命令冲突说明：以下命令命中 agentDeny，由主控负责运行：{commands}。同事无需运行这些命令。\n"));
+    }
     let standing = s(extra, "standing");
     let inherited = b(extra, "standingInherited");
     if !inherited && !standing.is_empty() {
@@ -1612,6 +1639,8 @@ pub fn launch(
         "share",
         "acceptBlind",
         "resources",
+        "measure",
+        "measureCpus",
         "stall",
         "checkIn",
     ] {

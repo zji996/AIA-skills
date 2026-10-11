@@ -9,6 +9,8 @@
 
 ### 技能
 
+- `delegate` 5.28.0：新增机器级测量预约（`measure`/`measureCpus`、`lane --measure`、自动命令 shim、预约核亲和性与 `measure.jsonl` 记录），并在验收或说明命中 `agentDeny` 时警告主控且保留启动。
+
 - `delegate` 文档：SKILL.md 的完成标准要求把指标与“做了真事”的断言写进验收脚本、不放被 agentDeny 拦下的命令；practice.md 补充验收管住实质、根因不明先诊断、审代价、测量任务独占机器，以及同事时间多半花在等模型、路数不必压低，均来自一次长时间实战。
 - `delegate` 5.27.1：Claude Code 下 wait 的默认进度检查从 55 分钟改为 50 分钟，给 1 小时缓存留出余量；Pi 与 Codex 相同。
 - `delegate` 5.27.0：去掉 Pi/Codex 默认 timeout，改为卡死保护（30 分钟无动作，或单条命令 90 分钟，排队不计；可配置，0 关闭），卡住的任务状态为 `stalled`，续做不耗返工；Claude Code 下 wait 默认 55 分钟返回一次进度（同事继续运行），让主控在 1 小时缓存内醒来，末行给原样重跑命令；点名的 wait 也在任一结束时返回，`--until-all` 保留全等。

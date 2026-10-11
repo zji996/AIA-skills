@@ -150,6 +150,9 @@ pub fn state(run: &Path) -> String {
             .into();
     }
     if supervisor_alive(run) {
+        if crate::measure::waiting_ahead(run).is_some() {
+            return "waiting".into();
+        }
         if run.join(".waiting").exists() {
             return "waiting".into();
         }
@@ -437,6 +440,9 @@ pub fn status(run: &Path) -> Value {
                 }
             }
         }
+    }
+    if let Some(ahead) = crate::measure::waiting_ahead(run) {
+        out["measureWaitingAhead"] = json!(ahead);
     }
     let blind = crate::output::blind_files(&out["files"], &meta["acceptBlind"]);
     if !blind.is_empty() {

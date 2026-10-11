@@ -7,6 +7,7 @@ mod deny;
 mod help;
 mod lane;
 mod launch;
+mod measure;
 mod output;
 mod resources;
 mod runs;
@@ -1233,6 +1234,11 @@ fn main_inner(args: &[String]) -> Res<i32> {
     }
     if command == "_resource" {
         return resources::command(rest);
+    }
+    if command == "_measure" {
+        let run = rest.first().ok_or("missing measurement run")?;
+        let real = rest.get(1).ok_or("missing measured executable")?;
+        return measure::execute_argv(Path::new(run), real, &rest[2..]);
     }
     match command.as_str() {
         "start" | "run" => {

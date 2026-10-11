@@ -214,6 +214,7 @@ pub fn queued_seconds(run: &Path) -> f64 {
         .split_whitespace()
         .filter_map(|x| x.parse::<f64>().ok())
         .sum();
+    total += crate::measure::queued_seconds(run);
     if let Ok(entries) = fs::read_dir(run) {
         for e in entries.flatten() {
             let p = e.path();
@@ -233,6 +234,7 @@ pub fn queued_seconds(run: &Path) -> f64 {
 pub fn lane_command(args: &[String]) -> Res<i32> {
     let mut i = 0;
     let mut label = None;
+    let mut measure = false;
     while i < args.len() {
         if args[i] == "--label" {
             i += 1;
@@ -240,6 +242,9 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
                 return Err("argument --label: expected one argument".into());
             }
             label = Some(args[i].clone());
+            i += 1;
+        } else if args[i] == "--measure" {
+            measure = true;
             i += 1;
         } else {
             break;
@@ -282,6 +287,12 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
     install_signals();
     let mut shown = false;
     let account = std::env::var_os("DELEGATE_RUN_DIR").map(PathBuf::from);
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    if measure {
+        let config = crate::config::load(git_top(&cwd).as_deref())?;
+        let meta = json!({"measure":config.value["measure"],"measureCpus":config.value["measureCpus"],"workdir":cwd});
+        return crate::measure::run_lane(&command, &cwd, account.as_deref(), &meta);
+    }
     let slot = acquire(
         &label,
         account.as_deref(),
@@ -302,8 +313,15 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
             slot.queued
         );
     }
-    let mut c = Command::new("sh");
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let mut c = if let Some(cpus) = crate::measure::remaining_cpus() {
+        let mut c = Command::new("taskset");
+        c.args(["-c", &cpus, "sh", "-c", &command]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(&command);
+        c
+    };
     let temporary = if account.is_none() {
         let dir = state_dir().join(format!("lane-resource-{}-{}", std::process::id(), now_ns()));
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -313,15 +331,14 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
     };
     if let Some(dir) = &temporary {
         let config = crate::config::load(git_top(&cwd).as_deref())?;
-        let meta = json!({"resources":config.value["resources"],"agentDeny":[],"workdir":cwd,"env":config.value["env"]});
+        let meta = json!({"resources":config.value["resources"],"measure":config.value["measure"],"measureCpus":config.value["measureCpus"],"agentDeny":[],"workdir":cwd,"env":config.value["env"]});
+        write_json(dir.join("meta.json"), &meta)?;
         crate::deny::prepare(&meta, dir)?;
         if let Some(path) = crate::deny::resource_path(&meta, dir)? {
             c.env("PATH", path);
         }
     }
-    c.arg("-c")
-        .arg(command)
-        .stdin(Stdio::inherit())
+    c.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .env("DELEGATE_LANE_HELD", "1");

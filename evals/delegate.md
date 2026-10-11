@@ -1,5 +1,10 @@
 # delegate
 
+## 5.28 测量预约与验收冲突
+
+- `measure`/`measureCpus` 配置和 `lane --measure` 让压测、计时、编译耗时命令按预约核 FIFO 排队；排队时间不计 stall/timeout，命令可读取 `DELEGATE_MEASURE_CPUS` 与 `DELEGATE_MEASURE_CORES`。
+- 验收或说明正文命中 `agentDeny` 时，start/reply 在 stderr 警告并把命令列为主控负责，启动仍成功。
+
 ## 5.27 stall 与 check-in
 
 - 未给 `--timeout` 的任务不会继承 Pi/Codex 默认上限；idle 30m、command 90m stall 可由环境或配置缩短，停滞状态保留改动且 reply 不耗返工。

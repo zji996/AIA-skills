@@ -4,7 +4,9 @@
 
 ## 用户与仓库配置
 
-用户配置 `${XDG_CONFIG_HOME}/delegate/config.json` 支持 `agentDeny`、`env`、`maxRework`、默认 `accept`/`evidence`、`maxActive`、`maxCodex`、`maxHeavy`、`repoMaxActive`、`repoMaxCodex`、`sourceBuild.paths`、`standing`、`defaults`、`resultChars`、`cleanupKeepExecutables`。仓库根 `.delegate.json` 使用相同字段并保存仓库事实。
+用户配置 `${XDG_CONFIG_HOME}/delegate/config.json` 支持 `agentDeny`、`measure`、`measureCpus`、`env`、`maxRework`、默认 `accept`/`evidence`、`maxActive`、`maxCodex`、`maxHeavy`、`repoMaxActive`、`repoMaxCodex`、`sourceBuild.paths`、`standing`、`defaults`、`resultChars`、`cleanupKeepExecutables`。仓库根 `.delegate.json` 使用相同字段并保存仓库事实。
+
+`measure` 是 argv 前缀数组，例如 `{"measure":[["cargo","xtask","bench-concurrency"]]}`；仓库配置覆盖用户配置。`measureCpus` 是预约核列表（如 `"8-11"`），未设置时取最后 `max(2, nproc/3)` 个在线逻辑核。匹配的同事、验收、证据和 lane 命令自动排队到机器级测量预约；预约期间普通 lane 命令使用其余核。
 
 - 标量：仓库 > 用户 > 内置默认；容量的 `DELEGATE_MAX_ACTIVE` / `DELEGATE_MAX_CODEX` / `DELEGATE_MAX_HEAVY` / `DELEGATE_REPO_MAX_ACTIVE` / `DELEGATE_REPO_MAX_CODEX` 最高，仍兼容 `PI_DELEGATE_*`，`0` 不限。整机默认 12 / 6 / 2，每仓库默认 8 / 4。写入默认 `accept`/`evidence` 在仓库未提供字段时用用户值，对应 CLI 覆盖或关闭；只读不用两项默认。
 - 任务测试用可重复的 `--accept-also COMMAND`，按顺序以 `&&` 追加到生效的 `--accept` 或配置默认（无基础命令则单独运行）；与 `--no-accept` 冲突退出 2。`--accept` 替换非空且不同的默认命令时，start 提示原命令与追加用法；meta 的 `accept` 与 summary 的 `accept.command` 记录最终命令。
