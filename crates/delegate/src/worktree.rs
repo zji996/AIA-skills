@@ -267,11 +267,18 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<Option<String>> {
         let _ = git(&path, &["update-index", "--skip-worktree", "--", item]);
     }
     for item in strings(&meta["share"]) {
-        let Ok(relative) = Path::new(&item).strip_prefix(&source) else { continue };
-        if relative.as_os_str().is_empty() { continue; }
+        let Ok(relative) = Path::new(&item).strip_prefix(&source) else {
+            continue;
+        };
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
         let target = path.join(relative);
         if target.exists() || target.is_symlink() {
-            return Err(format!("--share target already exists: {}", target.display()));
+            return Err(format!(
+                "--share target already exists: {}",
+                target.display()
+            ));
         }
         fs::create_dir_all(target.parent().unwrap_or(&path)).map_err(|e| e.to_string())?;
         symlink(&item, &target).map_err(|e| e.to_string())?;
@@ -979,30 +986,72 @@ pub fn apply(run: &Path, merge: bool, dry: bool, keep_commits: bool) -> Res<Appl
     let worktree = Path::new(s(&meta["worktree"], "path"));
     let base = read(run.join("worktree-base-commit")).trim().to_string();
     let commits = if !base.is_empty() && worktree.is_dir() {
-        let log = git_text(worktree, &["log", "--reverse", "--format=%H%x09%s", &format!("{base}..HEAD")])?;
-        log.lines().filter_map(|line| line.split_once('\t')).map(|(hash, title)| {
-            let files = git_text(worktree, &["diff-tree", "--no-commit-id", "--name-only", "-r", hash])
-                .unwrap_or_default().lines().count();
-            json!({"hash":hash,"title":title,"files":files})
-        }).collect::<Vec<_>>()
-    } else { Vec::new() };
+        let log = git_text(
+            worktree,
+            &[
+                "log",
+                "--reverse",
+                "--format=%H%x09%s",
+                &format!("{base}..HEAD"),
+            ],
+        )?;
+        log.lines()
+            .filter_map(|line| line.split_once('\t'))
+            .map(|(hash, title)| {
+                let files = git_text(
+                    worktree,
+                    &["diff-tree", "--no-commit-id", "--name-only", "-r", hash],
+                )
+                .unwrap_or_default()
+                .lines()
+                .count();
+                json!({"hash":hash,"title":title,"files":files})
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     conclusion["commits"] = json!(commits);
-    let blind = crate::output::blind_files(&json(run.join("summary.json"))["files"], &meta["acceptBlind"]);
-    if !blind.is_empty() { conclusion["acceptBlind"] = json!(blind); }
+    let blind = crate::output::blind_files(
+        &json(run.join("summary.json"))["files"],
+        &meta["acceptBlind"],
+    );
+    if !blind.is_empty() {
+        conclusion["acceptBlind"] = json!(blind);
+    }
     if !crate::output::json_enabled() {
         for item in &commits {
-            println!(" commit {} {} ({} files)", &s(item,"hash")[..7], s(item,"title"), n(item,"files"));
+            println!(
+                " commit {} {} ({} files)",
+                &s(item, "hash")[..7],
+                s(item, "title"),
+                n(item, "files")
+            );
         }
     }
     let code = if keep_commits && !commits.is_empty() {
-        if !git_text(worktree, &["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
-            return Err("--keep-commits requires committed worktree changes; commit remaining edits first".into());
+        if !git_text(
+            worktree,
+            &["status", "--porcelain", "--untracked-files=all"],
+        )?
+        .is_empty()
+        {
+            return Err(
+                "--keep-commits requires committed worktree changes; commit remaining edits first"
+                    .into(),
+            );
         }
-        if dry { 0 } else {
+        if dry {
+            0
+        } else {
             let mut code = 0;
             for item in &commits {
-                let status = Command::new("git").arg("-C").arg(source).args(["cherry-pick", "--no-edit", s(item,"hash")])
-                    .status().map_err(|e| e.to_string())?;
+                let status = Command::new("git")
+                    .arg("-C")
+                    .arg(source)
+                    .args(["cherry-pick", "--no-edit", s(item, "hash")])
+                    .status()
+                    .map_err(|e| e.to_string())?;
                 if !status.success() {
                     eprintln!("delegate: cherry-pick stopped at {}; resolve conflicts in {}, then continue with git cherry-pick --continue", s(item,"hash"), source.display());
                     code = 1;
@@ -1015,8 +1064,12 @@ pub fn apply(run: &Path, merge: bool, dry: bool, keep_commits: bool) -> Res<Appl
             }
             code
         }
-    } else { apply_inner(run, merge, dry, &mut conclusion)? };
-    if keep_commits { conclusion["apply"]["keepCommits"] = json!(true); }
+    } else {
+        apply_inner(run, merge, dry, &mut conclusion)?
+    };
+    if keep_commits {
+        conclusion["apply"]["keepCommits"] = json!(true);
+    }
     conclusion["apply"]["ok"] = json!(code == 0);
     accept_validity(run, dry, &mut conclusion);
     let marked = strings(&conclusion["apply"]["conflictMarkers"]);

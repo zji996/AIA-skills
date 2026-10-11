@@ -10,7 +10,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub type Res<T> = Result<T, String>;
 pub fn strings(value: &Value) -> Vec<String> {
-    value.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect()
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
 }
 pub const GUARDS: [&str; 7] = [
     "DELEGATE_AGENT",
@@ -376,7 +382,7 @@ pub fn kill_group(pid: i32, grace: f64) {
 pub fn shell_quote(s: &str) -> String {
     if !s.is_empty()
         && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c))
+            .all(|c| c.is_alphanumeric() || "_@%+=:,./-".contains(c))
     {
         s.into()
     } else {
@@ -402,7 +408,9 @@ pub fn run_shell(
         .stderr(Stdio::from(log.try_clone().map_err(|e| e.to_string())?));
     clean_env(&mut c, extra);
     let meta = json(run.join("meta.json"));
-    if let Some(path) = crate::deny::resource_path(&meta, run)? { c.env("PATH", path); }
+    if let Some(path) = crate::deny::resource_path(&meta, run)? {
+        c.env("PATH", path);
+    }
     c.env("DELEGATE_LANE_HELD", "1")
         .env("DELEGATE_RUN_DIR", run);
     group(&mut c);

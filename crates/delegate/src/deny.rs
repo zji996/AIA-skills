@@ -99,7 +99,9 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<()> {
             }
         }
     }
-    for program in resources.keys() { programs.entry(program).or_default(); }
+    for program in resources.keys() {
+        programs.entry(program).or_default();
+    }
     if programs.is_empty() {
         return Ok(());
     }
@@ -134,12 +136,19 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<()> {
         for (name, argv) in resources.get(program).into_iter().flatten() {
             let mut condition = format!("[ \"$#\" -ge {} ]", argv.as_array().unwrap().len() - 1);
             for (i, arg) in argv.as_array().unwrap().iter().enumerate().skip(1) {
-                condition.push_str(&format!(" && [ \"${{{i}}}\" = {} ]", shell_quote(arg.as_str().unwrap())));
+                condition.push_str(&format!(
+                    " && [ \"${{{i}}}\" = {} ]",
+                    shell_quote(arg.as_str().unwrap())
+                ));
             }
             if let Some(real) = &real {
-                let invoke = format!("if {condition}; then\n  exec {} _resource {} {} {} \"$@\"\nfi\n",
-                    shell_quote(&script().to_string_lossy()), shell_quote(&run.to_string_lossy()),
-                    shell_quote(name), shell_quote(&real.to_string_lossy()));
+                let invoke = format!(
+                    "if {condition}; then\n  exec {} _resource {} {} {} \"$@\"\nfi\n",
+                    shell_quote(&script().to_string_lossy()),
+                    shell_quote(&run.to_string_lossy()),
+                    shell_quote(name),
+                    shell_quote(&real.to_string_lossy())
+                );
                 body.push_str(&invoke);
                 resource_body.push_str(&invoke);
             }
@@ -149,7 +158,10 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<()> {
                 "exec {} \"$@\"\n",
                 shell_quote(&real.to_string_lossy())
             ));
-            resource_body.push_str(&format!("exec {} \"$@\"\n", shell_quote(&real.to_string_lossy())));
+            resource_body.push_str(&format!(
+                "exec {} \"$@\"\n",
+                shell_quote(&real.to_string_lossy())
+            ));
         } else {
             body.push_str(&format!(
                 "printf '%s\\n' {} >&2\nexit 127\n",
@@ -162,14 +174,17 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<()> {
         if resources.contains_key(program) {
             let shim = resource_dir.join(program);
             write(&shim, resource_body)?;
-            fs::set_permissions(shim, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+            fs::set_permissions(shim, fs::Permissions::from_mode(0o700))
+                .map_err(|e| e.to_string())?;
         }
     }
     Ok(())
 }
 pub fn resource_path(meta: &Value, run: &Path) -> Res<Option<std::ffi::OsString>> {
     let dir = run.join("resource-shims");
-    if !dir.is_dir() { return Ok(None); }
+    if !dir.is_dir() {
+        return Ok(None);
+    }
     let mut paths = vec![dir];
     paths.extend(env::split_paths(&original_path(meta)));
     Ok(Some(env::join_paths(paths).map_err(|e| e.to_string())?))
@@ -180,8 +195,12 @@ pub fn inject(command: &mut Command, meta: &Value, run: &Path) -> Res<()> {
     let resource = run.join("resource-shims");
     if dir.is_dir() || resource.is_dir() {
         let mut paths = Vec::new();
-        if dir.is_dir() { paths.push(dir); }
-        if resource.is_dir() { paths.push(resource); }
+        if dir.is_dir() {
+            paths.push(dir);
+        }
+        if resource.is_dir() {
+            paths.push(resource);
+        }
         paths.extend(env::split_paths(&original_path(meta)));
         command.env("PATH", env::join_paths(paths).map_err(|e| e.to_string())?);
     }

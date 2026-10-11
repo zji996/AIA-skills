@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要所选同事的 CLI：pi 或 codex。
 metadata:
-  version: "5.26.0"
+  version: "5.27.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -23,7 +23,7 @@ $D wait                                                                    # 2. 
 ```
 
 - **放出**：`start` 回显任务名、同事与档位，以及本次自动生效的东西（仓库固定说明几行、默认 worktree / 保护路径 / 附加验收及其来源）。名字省略时取说明的第一个分句；之后用它指代整段对话。
-- **等**：`wait` 放后台（Claude Code 的 Bash 用 `run_in_background: true`），不用 `status` 轮询。它交付下一个结束的任务就返回，末行写明本会话还剩几个、原样再跑哪条命令——照做即可，直到末行说没有在跑的任务。
+- **等**：`wait` 放后台（Claude Code 的 Bash 用 `run_in_background: true`），Claude Code 每约 55 分钟收到一次进度 glance；控制器只需重跑打印的 `delegate wait` 命令。它交付下一个结束的任务就返回，末行写明本会话还剩几个、原样再跑哪条命令——照做即可，直到末行说没有在跑的任务。
 - **处理**：每个任务一条短行（状态、改动、验收、下一步），随后是答复。只读任务去代码核实关键结论；写入任务看 `$D diff <name>`，满意后 `$D apply <name>`——它合入、清理该任务，并在末行说明验收是否仍有效、无效时要在主干重跑哪些命令。
 
 ## 场景速查
@@ -68,7 +68,7 @@ $D wait                                                                    # 2. 
 - **已交付**只说明验收通过，改法仍要看 `diff`；**已答复**没有验收，关键结论去代码核实；其余状态按短行的下一步处理。
 - 同一仓库的写入任务串行 `apply`；合入一批后自己跑全量检查。同事只跑相关检查，被 `agentDeny` 拦下的全量检查归你。
 - 写入任务加 `--worktree`（或配置 `defaults.worktree`）就在独立 worktree 里做，可以并行；原地写入同一目录同时只能有一个。
-- 超时的写入任务改动保留，先 `reply` 续做；任务太大就拆小，不要为求快压短 `--timeout`。
+- 显式 `--timeout` 超时或 stall guard 停滞时改动保留，`reply` 续做不耗返工次数；没有默认 agent timeout。
 - 机器与仓库有并发上限，命中时先 `wait` 收一批；上限由用户设定，不要自行调整。
 
 状态含义、退出码、JSON 字段、等待的细节与完整边界见 [references/reading-results.md](references/reading-results.md)；续接与返工、两档配合、并行粒度见 [references/practice.md](references/practice.md)；长时间自主推进一批工作见 [references/long-run.md](references/long-run.md)；命令与全部选项见 `$D --help`，run 目录与文件见 [references/output-and-files.md](references/output-and-files.md)。

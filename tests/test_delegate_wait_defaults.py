@@ -12,6 +12,7 @@ class DelegateWaitDefaultsTests(unittest.TestCase):
     cli = fixtures.DelegateTests.cli
     outcome = fixtures.DelegateTests.outcome
     until = fixtures.DelegateTests.until
+    repo = fixtures.DelegateTests.repo
 
     def start_pair(self):
         gate = self.work / "release"
@@ -40,6 +41,15 @@ class DelegateWaitDefaultsTests(unittest.TestCase):
         self.assertIn("slow", second.stdout)
         self.assertEqual(second.stdout.splitlines()[-1], "本会话没有在跑的任务")
         self.assertEqual(self.cli("wait", human=True).stdout.splitlines()[-1], "本会话没有在跑的任务")
+
+    def test_named_wait_returns_on_first_selected_completion(self):
+        gate, states = self.start_pair()
+        result = self.cli("wait", states["slow"]["run"], states["fast"]["run"], human=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("fast", result.stdout)
+        self.assertNotIn("slow ·", result.stdout)
+        self.assertFalse((Path(states["slow"]["dir"]) / ".delivered").exists())
+        gate.touch()
 
     def test_until_all_waits_for_every_run_and_conflicting_modes_fail(self):
         gate, states = self.start_pair()
@@ -77,6 +87,60 @@ class DelegateWaitDefaultsTests(unittest.TestCase):
         result = self.cli("wait", states["fast"]["run"], human=True)
         self.assertIn("本会话还剩 1 个任务在跑", result.stdout.splitlines()[-1])
         gate.touch()
+
+    def test_claude_check_in_prints_glance_and_leaves_agent_running(self):
+        self.env["CLAUDE_CODE_SESSION_ID"] = "claude-check-in"
+        self.env["DELEGATE_CHECK_IN"] = ".1s"
+        self.env["DELEGATE_STALL_IDLE"] = "0"
+        self.env["DELEGATE_STALL_COMMAND"] = "0"
+        self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED], sleep=.5)
+        state = self.outcome(self.cli("start", "--read-only", "task"))
+        self.addCleanup(lambda: self.cli("stop", state["run"]))
+        result = self.cli("wait", human=True)
+        self.assertEqual(result.returncode, 75)
+        self.assertIn("正常推进", result.stdout)
+        self.assertIn("继续等：", result.stdout)
+        self.assertTrue((Path(state["dir"]) / "agent.pid").exists())
+
+    def test_check_in_reports_an_in_flight_command_as_progress(self):
+        self.env["CLAUDE_CODE_SESSION_ID"] = "claude-check-in"
+        self.env["DELEGATE_CHECK_IN"] = ".3s"
+        self.env["DELEGATE_STALL_IDLE"] = "0"
+        self.env["DELEGATE_STALL_COMMAND"] = "0"
+        event = {"type": "tool_execution_start", "toolName": "bash", "args": {"command": "cargo test --long"}}
+        self.fake_pi([], pre=f"printf '%s\\n' {shlex.quote(__import__('json').dumps(event))}; sleep 5")
+        state = self.outcome(self.cli("start", "--read-only", "task"))
+        self.addCleanup(lambda: self.cli("stop", state["run"]))
+        result = self.cli("wait", human=True)
+        self.assertEqual(result.returncode, 75)
+        self.assertIn("正在执行 cargo test --long", result.stdout)
+        self.assertEqual(result.stdout.count("继续等："), 1)
+
+    def test_omitted_timeout_has_no_agent_cap(self):
+        self.env["DELEGATE_STALL_IDLE"] = "0"
+        self.env["DELEGATE_STALL_COMMAND"] = "0"
+        self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED], sleep=.3)
+        result = self.cli("run", "task")
+        self.assertEqual((result.returncode, self.outcome(result)["state"]), (0, "answered"))
+
+    def test_idle_stall_is_terminal_but_keeps_worktree_changes(self):
+        self.env["DELEGATE_STALL_IDLE"] = ".1s"
+        self.env["DELEGATE_STALL_COMMAND"] = "0"
+        repo = self.repo({"seed.txt": "seed\n"})
+        self.fake_pi([], pre="echo kept > kept.txt", sleep=.5)
+        state = self.outcome(self.cli("run", "--workdir", repo, "--worktree", "task"))
+        self.assertEqual(state["state"], "stalled")
+        self.assertTrue((Path(state["dir"]) / "stall.json").exists())
+
+    def test_command_stall_records_the_in_flight_command(self):
+        self.env["DELEGATE_STALL_IDLE"] = "0"
+        self.env["DELEGATE_STALL_COMMAND"] = ".1s"
+        event = {"type": "tool_execution_start", "toolName": "bash", "args": {"command": "sleep 2"}}
+        self.fake_pi([], pre=f"printf '%s\\n' {shlex.quote(__import__('json').dumps(event))}; sleep 2")
+        state = self.outcome(self.cli("run", "task"))
+        self.assertEqual(state["state"], "stalled")
+        self.assertEqual(state["stall"]["kind"], "command")
+        self.assertIn("sleep 2", state["stall"]["cmd"])
 
 
 if __name__ == "__main__":

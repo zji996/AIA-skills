@@ -21,13 +21,23 @@ pub fn all_runs() -> Vec<PathBuf> {
     v
 }
 fn archived_runs() -> Vec<PathBuf> {
-    all_runs_roots().into_iter().flat_map(|root| {
-        fs::read_dir(root.join(".applied")).into_iter().flatten().flatten().map(|e| e.path())
-    }).filter(|p| p.join("meta.json").is_file()).collect()
+    all_runs_roots()
+        .into_iter()
+        .flat_map(|root| {
+            fs::read_dir(root.join(".applied"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+        })
+        .filter(|p| p.join("meta.json").is_file())
+        .collect()
 }
 fn all_runs_roots() -> Vec<PathBuf> {
     let mut roots = vec![runs_root()];
-    if let Some(old) = legacy_runs_root() { roots.push(old); }
+    if let Some(old) = legacy_runs_root() {
+        roots.push(old);
+    }
     roots
 }
 pub fn resolve(reference: &str) -> Res<PathBuf> {
@@ -38,8 +48,15 @@ pub fn resolve(reference: &str) -> Res<PathBuf> {
     let root = runs_root();
     let runs = all_runs();
     if reference == "last" {
-        if let Some(run) = runs.last().cloned() { return Ok(run); }
-        if let Some(run) = archived_runs().into_iter().max_by_key(|p| json(p.join("meta.json"))["startedNs"].as_u64().unwrap_or(0)) { return Ok(run); }
+        if let Some(run) = runs.last().cloned() {
+            return Ok(run);
+        }
+        if let Some(run) = archived_runs()
+            .into_iter()
+            .max_by_key(|p| json(p.join("meta.json"))["startedNs"].as_u64().unwrap_or(0))
+        {
+            return Ok(run);
+        }
         return Err(format!("no runs under {}", root.display()));
     }
     if let Some(exact) = runs
@@ -49,13 +66,30 @@ pub fn resolve(reference: &str) -> Res<PathBuf> {
         return Ok(exact.clone());
     }
     let archive = runs_root().join(".applied").join(reference);
-    if archive.join("meta.json").is_file() { return Ok(archive); }
+    if archive.join("meta.json").is_file() {
+        return Ok(archive);
+    }
     let archived = archived_runs();
     if reference != "last" {
-        let named = archived.iter().filter(|p| s(&json(p.join("meta.json")), "name") == reference).collect::<Vec<_>>();
-        if named.len() == 1 { return Ok(named[0].clone()); }
-        let matches = archived.iter().filter(|p| p.file_name().unwrap_or_default().to_string_lossy().contains(reference)).collect::<Vec<_>>();
-        if matches.len() == 1 { return Ok(matches[0].clone()); }
+        let named = archived
+            .iter()
+            .filter(|p| s(&json(p.join("meta.json")), "name") == reference)
+            .collect::<Vec<_>>();
+        if named.len() == 1 {
+            return Ok(named[0].clone());
+        }
+        let matches = archived
+            .iter()
+            .filter(|p| {
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .contains(reference)
+            })
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            return Ok(matches[0].clone());
+        }
     }
     // An active run started from another repository is still reachable by its id.
     if let Some(active) = crate::launch::machine_runs(&crate::common::state_dir())
@@ -239,7 +273,7 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
         "timeout" if s(meta, "mode") == "read-only" => Some(format!(
             "{script} reply {name} 'answer with what you found so far' or split the question"
         )),
-        "timeout" => Some(format!(
+        "timeout" | "stalled" => Some(format!(
             "{} reply {} {}{}",
             shell_quote(&script.to_string()),
             shell_quote(&name),
@@ -339,6 +373,7 @@ pub fn status(run: &Path) -> Value {
             "escalatedFrom",
             "queuedSeconds",
             "graceSeconds",
+            "stall",
             "denied",
             "tokens",
             "cleanup",
@@ -404,7 +439,9 @@ pub fn status(run: &Path) -> Value {
         }
     }
     let blind = crate::output::blind_files(&out["files"], &meta["acceptBlind"]);
-    if !blind.is_empty() { out["acceptBlind"] = json!(blind); }
+    if !blind.is_empty() {
+        out["acceptBlind"] = json!(blind);
+    }
     let result = run.join("result.md");
     if run.join("agent-shims").is_dir() {
         out["denied"] = json!(crate::deny::count(run));
@@ -458,19 +495,43 @@ pub fn remove_after_apply(run: &Path) -> Vec<String> {
             other != run && s(&json(other.join("meta.json"))["worktree"], "path") == path
         });
     let _ = crate::cleanup::record(run, 0);
-    let containers = if !shared { worktree::remove(&meta) } else { crate::cleanup::Containers::default() };
-    let keep = ["meta.json", "prompt.md", "result.md", "result-original.md", "summary.json",
-        "compression.json", "exit_code", ".applied", ".delivered", ".truncated"];
-    let archive = runs_root().join(".applied").join(run.file_name().unwrap_or_default());
+    let containers = if !shared {
+        worktree::remove(&meta)
+    } else {
+        crate::cleanup::Containers::default()
+    };
+    let keep = [
+        "meta.json",
+        "prompt.md",
+        "result.md",
+        "result-original.md",
+        "summary.json",
+        "compression.json",
+        "exit_code",
+        ".applied",
+        ".delivered",
+        ".truncated",
+    ];
+    let archive = runs_root()
+        .join(".applied")
+        .join(run.file_name().unwrap_or_default());
     let _ = fs::create_dir_all(archive.parent().unwrap());
-    if archive.exists() { let _ = fs::remove_dir_all(&archive); }
+    if archive.exists() {
+        let _ = fs::remove_dir_all(&archive);
+    }
     let _ = fs::rename(run, &archive);
     let run = archive.as_path();
     if let Ok(entries) = fs::read_dir(run) {
         for entry in entries.flatten() {
-            if keep.contains(&entry.file_name().to_string_lossy().as_ref()) { continue; }
+            if keep.contains(&entry.file_name().to_string_lossy().as_ref()) {
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() { let _ = fs::remove_dir_all(path); } else { let _ = fs::remove_file(path); }
+            if path.is_dir() {
+                let _ = fs::remove_dir_all(path);
+            } else {
+                let _ = fs::remove_file(path);
+            }
         }
     }
     let _ = write(run.join(".applied-cleaned"), "1\n");
@@ -526,7 +587,11 @@ pub fn prune() {
             && !unmerged(&run)
         {
             use std::time::UNIX_EPOCH;
-            let age_file = if run.join(".applied-cleaned").exists() { run.join(".applied-cleaned") } else { done.clone() };
+            let age_file = if run.join(".applied-cleaned").exists() {
+                run.join(".applied-cleaned")
+            } else {
+                done.clone()
+            };
             let age = fs::metadata(&age_file)
                 .and_then(|x| x.modified())
                 .ok()

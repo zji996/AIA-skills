@@ -21,7 +21,7 @@ const LAUNCH: &[(&str, &str)] = &[
     ("--no-evidence", "Disable the default evidence command."),
     ("--evidence-timeout DURATION", "Evidence command limit excluding queue time (default: 30m)."),
     ("--max-answer CHARS", "Ask for this answer length; failed compression displays a bounded excerpt and preserves the full result."),
-    ("--timeout DURATION", "Limit for each attempt (default: 25m Pi, 50m Codex)."),
+    ("--timeout DURATION", "Optional limit for each attempt; no default. Stall guards remain active."),
     ("--retries N", "Malformed-answer reruns, 0-3 (default: 1)."),
     ("--provider NAME", "Agent provider override."),
     ("--model NAME", "Agent model override."),
@@ -35,7 +35,7 @@ const LAUNCH: &[(&str, &str)] = &[
 const COLLECT: &[(&str, &str)] = &[
     (
         "--max DURATION",
-        "Stop waiting after this long; exit 75 if still running.",
+        "Stop waiting after this long; exit 75 if still running. Claude Code defaults to a 55m check-in when omitted.",
     ),
     ("--progress", "Also print writes, errors, and retries."),
     (
@@ -61,7 +61,7 @@ const REPLY: &[(&str, &str)] = &[
     ("--no-evidence", "Remove the inherited evidence command."),
     ("--evidence-timeout DURATION", "Evidence command limit (inherited; default: 30m)."),
     ("--max-answer CHARS", "Ask for this answer length; above 1.5 times the limit, continue the session once to compress. Keep the original on failure."),
-    ("--timeout DURATION", "Limit for the attempt (default: 25m Pi, 50m Codex)."),
+    ("--timeout DURATION", "Optional limit for the attempt; no default. Stall guards remain active."),
     ("--fresh", "Start a new session with only this message; after apply, a new worktree starts from current HEAD."),
     ("--sync", "Merge the caller's later changes into the conversation worktree before replying; conflicts stop the reply."),
     ("--wait", "Wait for the reply's outcome and answer instead of returning after launch."),
@@ -90,7 +90,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "apply",
         "Merge a worktree conversation into the source tree.",
     ),
-    ("busy", "Query live resource occupants (exit 0 busy, 1 idle)."),
+    (
+        "busy",
+        "Query live resource occupants (exit 0 busy, 1 idle).",
+    ),
     ("lane", "Queue a heavy command with other machine checks."),
     ("stop", "Terminate runs."),
     ("clean", "Delete finished runs."),
@@ -132,7 +135,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("-h, --help", "Show this help."),
             ("--version", "Show the Cargo package version."),
         ]);
-        println!("\nStates: waiting | running | delivered (accept passed) | answered (no --accept) | skipped (upstream failed) | rejected (accept failed or protected path changed) | malformed (empty or leaked tool call after reruns) | failed | timeout | killed | stopped | crashed.");
+        println!("\nStates: waiting | running | delivered (accept passed) | answered (no --accept) | skipped (upstream failed) | rejected (accept failed or protected path changed) | malformed (empty or leaked tool call after reruns) | failed | timeout | stalled | killed | stopped | crashed.");
         println!(
             "Exit: 0 delivered/answered, 1 other finished, 2 usage, 75 still running at --max, 76 already covered by another waiter, 77 agentDeny shim refusal."
         );
@@ -150,7 +153,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("--machine", "Collect active and waiting runs registered across all repositories on this machine."),
             ("--json", "Print complete JSON fields instead of concise status lines. Tasks covered by another live waiter are skipped; exit 76 when all are covered."),
             ("--no-result", "Print only the outcome line."),
-            ("--any", "Alias for the default without run arguments: return once any run finishes. With named runs, skip answers already reported."),
+            ("--any", "Return once any selected run finishes (the default for no arguments and named runs); skip answers already reported."),
             ("--until-all", "Wait until every selected run finishes before returning; --all controls caller scope only."),
             ("--stream", "Print one outcome line per run as each finishes (answers are read with wait <run>) and exit when none is left; without run arguments it also picks up runs this caller starts meanwhile. For hosts that turn each output line into a notification."),
         ]),

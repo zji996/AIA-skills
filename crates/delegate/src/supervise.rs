@@ -295,6 +295,12 @@ fn settle(
         verdict.into()
     };
     let mut sum = json!({"state":state});
+    if verdict == "stalled" {
+        let reason = json(run.join("stall.json"));
+        if reason.is_object() {
+            sum["stall"] = reason;
+        }
+    }
     let generated_checked = setup_error.is_none() && !lane::stopped();
     let (generated_violations, generation_error) = if generated_checked {
         check_generated(meta, run, holder.clone())
@@ -798,6 +804,18 @@ fn inner(
         let hint = match state.as_str() {
             "malformed" => "answer was empty or a leaked tool call".into(),
             "timeout" => format!("{} exceeded {}", s(&meta, "agent"), s(&meta, "timeout")),
+            "stalled" => {
+                let reason = json(run.join("stall.json"));
+                if s(&reason, "kind") == "command" {
+                    format!(
+                        "命令 {} 连续 {} 秒无新动作而停滞",
+                        s(&reason, "cmd"),
+                        n(&reason, "seconds")
+                    )
+                } else {
+                    format!("idle：已 {} 秒无新动作而停滞", n(&reason, "seconds"))
+                }
+            }
             _ => String::new(),
         };
         let message = [

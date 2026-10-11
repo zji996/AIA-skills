@@ -44,3 +44,6 @@
 启动时在 run 的 `agent-shims/` 为每个程序生成 shell shim，按原 PATH（含顶层 env.PATH）与同事工作目录解析真实程序的绝对路径，保留 cargo/rustup 等多调用符号链接的名称；真实程序缺失时，未命中的调用退出 127。只在同事进程的 PATH 最前面插入该目录，reply 继承规则。命中打印 hint 到 stderr，退出 77；未命中直接 exec，参数、stdin/stdout 与退出码透传。同事的 `lane` 继承 shim PATH，即使自己设置 `DELEGATE_ALLOW_HEAVY=1` 或 `DELEGATE_LANE_HELD=1` 仍会拒绝。`denied.log` 累计本轮各尝试的次数，结论 `denied: N`，短行显示“拦下 N 次全量检查”；未配置或空列表不生成 shim，不增加字段。
 
 验收、证据、setup、收尾生成核对、apply 的生成与 applyVerify 都由未注入 shim 的执行环境运行，主控自己的 lane 同理。没有环境放行开关或可交给同事的令牌。威胁模型是防误用，不是防恶意：同 UID 进程可以改 PATH、用绝对路径或改 shim/记录，这不是安全沙箱。
+
+- `stall`：`{"idle":"30m","command":"90m"}`，单项 `"0"` 关闭；环境变量 `DELEGATE_STALL_IDLE` / `DELEGATE_STALL_COMMAND` 优先。
+- `checkIn`：wait 检查线时长，`"0"` 关闭；`DELEGATE_CHECK_IN` 优先。未设置时 Claude Code 使用 55m，其它调用方不设默认。

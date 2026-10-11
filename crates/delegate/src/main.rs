@@ -8,14 +8,15 @@ mod help;
 mod lane;
 mod launch;
 mod output;
-mod runs;
 mod resources;
+mod runs;
 mod source_build;
 mod supervise;
 mod waiting;
 mod worktree;
 use common::*;
 use serde_json::json;
+use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -32,6 +33,148 @@ fn output_line(run: &Path, status: serde_json::Value) -> String {
         output::human(run, &status)
     }
 }
+
+fn check_in(max: Option<f64>, runs: &[PathBuf]) -> Option<f64> {
+    if max.is_some() {
+        return max;
+    }
+    let configured = setting("CHECK_IN", "");
+    let configured = if configured.is_empty() {
+        runs.iter()
+            .find_map(|run| {
+                json(run.join("meta.json"))["checkIn"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                config::load(git_top(&env::current_dir().unwrap_or_default()).as_deref())
+                    .ok()
+                    .and_then(|c| c.value["checkIn"].as_str().map(str::to_string))
+            })
+    } else {
+        Some(configured)
+    };
+    if let Some(value) = configured {
+        return if value.trim() == "0" {
+            None
+        } else {
+            seconds(&value).ok()
+        };
+    }
+    if env::var_os("CLAUDE_CODE_SESSION_ID").is_some_and(|v| !v.is_empty()) {
+        Some(55.0 * 60.0)
+    } else {
+        None
+    }
+}
+
+fn minutes_text(seconds: i64) -> String {
+    let minutes = seconds.max(0) / 60;
+    if minutes >= 60 {
+        format!("{} 小时 {} 分钟", minutes / 60, minutes % 60)
+    } else {
+        format!("{minutes} 分钟")
+    }
+}
+
+fn health_verdict(run: &Path) -> (String, bool) {
+    let events = runs::events(run);
+    let now = epoch() as i64;
+    // A long command in flight (a test suite, a lane-queued gate) is progress, not silence.
+    let mut in_flight: Vec<&serde_json::Value> = Vec::new();
+    for e in &events {
+        match s(e, "e") {
+            "bash" => in_flight.push(e),
+            "bash_done" => {
+                in_flight.pop();
+            }
+            _ => {}
+        }
+    }
+    if let Some(command) = in_flight.last() {
+        let age = iso_epoch(s(command, "at")).map_or(0, |at| now - at);
+        let mut cmd: String = s(command, "cmd").chars().take(60).collect();
+        if s(command, "cmd").chars().count() > 60 {
+            cmd.push('…');
+        }
+        return (format!("正在执行 {cmd}（{}）", minutes_text(age)), false);
+    }
+    let last_at = events.iter().rev().find_map(|e| iso_epoch(s(e, "at")));
+    let idle = last_at.map(|at| (now - at).max(0)).unwrap_or(0);
+    if idle >= 15 * 60 {
+        return (
+            format!("可能卡住：已 {} 无新动作", minutes_text(idle)),
+            true,
+        );
+    }
+    let mut failures: Vec<(String, usize)> = Vec::new();
+    for e in events
+        .iter()
+        .rev()
+        .filter(|e| s(e, "e") == "bash_done" && !b(e, "ok"))
+    {
+        let cmd = s(e, "cmd").to_string();
+        if let Some((last, count)) = failures.last_mut() {
+            if *last == cmd {
+                *count += 1;
+                continue;
+            }
+        }
+        failures.push((cmd, 1));
+        if failures.len() > 1 {
+            break;
+        }
+    }
+    if let Some((_, count)) = failures.first().filter(|(_, n)| *n >= 3) {
+        return (
+            format!("可能在原地打转：同一命令连续失败 {} 次", count),
+            true,
+        );
+    }
+    ("正常推进".into(), false)
+}
+
+/// One check-in line for a still-running run: its status line plus a health verdict.
+/// Callers print `继续等：<next>` once after all lines.
+fn glance_line(run: &Path, next: &str) -> String {
+    let status = runs::status(run);
+    let (verdict, warn) = health_verdict(run);
+    if output::json_enabled() {
+        let mut status = status;
+        status["health"] = json!(verdict);
+        status["glance"] = json!(true);
+        status["next"] = json!(next);
+        if warn {
+            status["suggestion"] = json!(format!(
+                "delegate stop {} then delegate reply {} \"纠正\"",
+                s(&status, "run"),
+                s(&status, "run")
+            ));
+        }
+        return format_status(status);
+    }
+    let suggestion = if warn {
+        format!(
+            "；建议：{} stop {}，再 {} reply {} \"纠正\"",
+            script().display(),
+            s(&status, "run"),
+            script().display(),
+            s(&status, "run")
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "{} · {verdict}{suggestion}",
+        output_line(run, status.clone())
+    )
+}
+
+fn print_continue(next: &str) {
+    if !output::json_enabled() {
+        println!("继续等：{next}");
+    }
+}
 /// A finished run's status, plus how far the source moved since its worktree snapshot.
 fn outcome_line(run: &Path, timing: Option<&str>) -> String {
     let mut status = runs::status(run);
@@ -44,7 +187,10 @@ fn outcome_line(run: &Path, timing: Option<&str>) -> String {
     if let Some(drift) = worktree::source_drift(run) {
         let overlap = drift["overlap"].as_array().map_or(0, Vec::len)
             + drift["overlapMore"].as_u64().unwrap_or(0) as usize;
-        if overlap > 0 && s(&status, "state") != "timeout" && !b(&status, "applied") {
+        if overlap > 0
+            && !["timeout", "stalled"].contains(&s(&status, "state"))
+            && !b(&status, "applied")
+        {
             let name = run.file_name().unwrap_or_default().to_string_lossy();
             status["next"] = json!(format!(
                 "the source changed {overlap} of its files since the snapshot; review {script} diff {name} --total, then {script} apply {name} (stops on conflicts; --merge writes markers), or {script} reply {name} --sync '<rebase onto the current source>' first",
@@ -225,15 +371,19 @@ fn print_answer(run: &Path, full: bool) -> bool {
     let compression = json(run.join("compression.json"));
     let failed_compression = compression.is_object() && !b(&compression, "ok");
     let limit = if failed_compression && !full {
-        limit.min(json(run.join("meta.json"))["maxAnswer"].as_u64().unwrap_or(limit as u64) as usize)
-    } else { limit };
-    let truncated = !full && (failed_compression && result.chars().count() > limit
-        || result.chars().count() > limit.saturating_add(limit / 4));
+        limit.min(
+            json(run.join("meta.json"))["maxAnswer"]
+                .as_u64()
+                .unwrap_or(limit as u64) as usize,
+        )
+    } else {
+        limit
+    };
+    let truncated = !full
+        && (failed_compression && result.chars().count() > limit
+            || result.chars().count() > limit.saturating_add(limit / 4));
     if compression.is_object() && !failed_compression {
-        println!(
-            "答复压缩完成；原文：{}",
-            s(&compression, "original")
-        );
+        println!("答复压缩完成；原文：{}", s(&compression, "original"));
     }
     if !truncated {
         println!("{}", result.trim_end_matches('\n'));
@@ -265,9 +415,12 @@ fn print_answer(run: &Path, full: bool) -> bool {
         run.file_name().unwrap_or_default().to_string_lossy()
     );
     if failed_compression && !full {
-        println!("答复压缩失败，保留原答复；原文：{}；原文字数：{}；压缩失败：{}",
-            s(&compression, "original"), result.trim_end_matches('\n').chars().count(),
-            s(&compression, "error").lines().next().unwrap_or("unknown"));
+        println!(
+            "答复压缩失败，保留原答复；原文：{}；原文字数：{}；压缩失败：{}",
+            s(&compression, "original"),
+            result.trim_end_matches('\n').chars().count(),
+            s(&compression, "error").lines().next().unwrap_or("unknown")
+        );
     }
     truncated
 }
@@ -335,6 +488,7 @@ fn collect(
     show_progress: bool,
     full: bool,
     show_result: bool,
+    next: &str,
 ) -> i32 {
     let Ok((runs, _claims)) = waiting::claim(runs) else {
         return 2;
@@ -342,7 +496,7 @@ fn collect(
     if runs.is_empty() {
         return waiting::COVERED;
     }
-    collect_timed(&runs, max, show_progress, full, show_result, None)
+    collect_timed(&runs, max, show_progress, full, show_result, None, next)
 }
 fn collect_timed(
     runs: &[PathBuf],
@@ -351,6 +505,7 @@ fn collect_timed(
     full: bool,
     show_result: bool,
     already: Option<&std::collections::HashSet<PathBuf>>,
+    next: &str,
 ) -> i32 {
     let begin = Instant::now();
     let poll = setting("POLL", "1").parse::<f64>().unwrap_or(1.0).max(0.01);
@@ -377,13 +532,20 @@ fn collect_timed(
             std::thread::sleep(Duration::from_secs_f64(left.unwrap_or(poll).min(poll)));
         }
     }
+    let timed_out = max.is_some_and(|m| begin.elapsed().as_secs_f64() >= m);
     let mut code = 0;
+    let mut glanced = false;
     for run in runs {
         let state = runs::state(run);
-        println!(
-            "{}",
-            outcome_line(run, already.map(|a| completion_timing(a, run)))
-        );
+        if timed_out && runs::active(&state) {
+            glanced = true;
+            println!("{}", glance_line(run, next));
+        } else {
+            println!(
+                "{}",
+                outcome_line(run, already.map(|a| completion_timing(a, run)))
+            );
+        }
         if runs::active(&state) {
             code = 75;
             continue;
@@ -469,6 +631,9 @@ fn collect_timed(
         if show_result || !has_result {
             touch(run.join(".delivered"));
         }
+    }
+    if glanced {
+        print_continue(next);
     }
     if code == 75 {
         eprintln!("delegate: still running; call wait again (exit 75)");
@@ -556,6 +721,7 @@ fn until_finished(run: &Path, poll: f64) {
 /// `wait --any` reports the runs finished when the first one ends; `wait --stream` prints one
 /// outcome line per run as each ends and exits once none is left. A stream started without
 /// run arguments also picks up runs this caller starts while it waits.
+#[allow(clippy::too_many_arguments)]
 fn wait_each(
     mut list: Vec<PathBuf>,
     rescan: Option<(&[String], &[String])>,
@@ -564,6 +730,7 @@ fn wait_each(
     show_progress: bool,
     full: bool,
     show_result: bool,
+    next: &str,
 ) -> i32 {
     let initial = list.clone();
     let Ok((claimed, mut claims)) = waiting::claim(&list) else {
@@ -577,7 +744,7 @@ fn wait_each(
     if list.is_empty() {
         return waiting::COVERED;
     }
-    let begin = Instant::now();
+    let mut begin = Instant::now();
     let already = list
         .iter()
         .filter(|run| !runs::active(&runs::state(run)))
@@ -632,7 +799,7 @@ fn wait_each(
                     }
                 }
             } else {
-                code = collect_timed(&done, None, false, full, show_result, Some(&already));
+                code = collect_timed(&done, None, false, full, show_result, Some(&already), next);
             }
             reported.extend(done);
             if !stream {
@@ -649,6 +816,17 @@ fn wait_each(
         }
         let left = max.map(|m| m - begin.elapsed().as_secs_f64());
         if left.is_some_and(|l| l <= 0.0) {
+            for run in list
+                .iter()
+                .filter(|r| !reported.contains(*r) && runs::active(&runs::state(r)))
+            {
+                println!("{}", glance_line(run, next));
+            }
+            print_continue(next);
+            if stream {
+                begin = Instant::now();
+                continue;
+            }
             if stream || reported.is_empty() {
                 code = 75;
             }
@@ -945,7 +1123,12 @@ fn apply(args: &[String]) -> Res<i32> {
     }
     let meta = json(run.join("meta.json"));
     let keep_commits = has(&flags, "--keep-commits") || b(&meta["defaults"], "keepCommits");
-    let mut outcome = worktree::apply(&run, has(&flags, "--merge"), has(&flags, "--dry-run"), keep_commits)?;
+    let mut outcome = worktree::apply(
+        &run,
+        has(&flags, "--merge"),
+        has(&flags, "--dry-run"),
+        keep_commits,
+    )?;
     if run.join(".applied").exists() {
         let path = s(&json(run.join("meta.json"))["worktree"], "path").to_string();
         for other in runs::all_runs() {
@@ -1005,7 +1188,14 @@ fn apply(args: &[String]) -> Res<i32> {
         }
     }
     if !output::json_enabled() {
-        println!("{final_line}{}", if blind_note.is_empty() { String::new() } else { format!("；{blind_note}") });
+        println!(
+            "{final_line}{}",
+            if blind_note.is_empty() {
+                String::new()
+            } else {
+                format!("；{blind_note}")
+            }
+        );
     }
     Ok(outcome.code)
 }
@@ -1041,7 +1231,9 @@ fn main_inner(args: &[String]) -> Res<i32> {
         supervise::supervise(Path::new(run))?;
         return Ok(0);
     }
-    if command == "_resource" { return resources::command(rest); }
+    if command == "_resource" {
+        return resources::command(rest);
+    }
     match command.as_str() {
         "start" | "run" => {
             let o = launch::parse_launch(rest, false, command == "run")?;
@@ -1065,7 +1257,19 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     "delegate: started {}",
                     run.file_name().unwrap_or_default().to_string_lossy()
                 );
-                Ok(collect(&[run], max, prog, full, true))
+                let max = check_in(max, std::slice::from_ref(&run));
+                Ok(collect(
+                    std::slice::from_ref(&run),
+                    max,
+                    prog,
+                    full,
+                    true,
+                    &format!(
+                        "{} wait {}",
+                        script().display(),
+                        run.file_name().unwrap_or_default().to_string_lossy()
+                    ),
+                ))
             }
         }
         "reply" => {
@@ -1077,10 +1281,22 @@ fn main_inner(args: &[String]) -> Res<i32> {
             let parent = o.run.clone().unwrap_or_default();
             let run = launch::reply(o)?;
             hint_undelivered_other_runs(&run);
-            let name = run.file_name().unwrap_or_default().to_string_lossy();
+            let name = run
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
             if wait {
                 eprintln!("delegate: started {name} (reply to {parent})");
-                Ok(collect(&[run], max, prog, full, true))
+                let max = check_in(max, std::slice::from_ref(&run));
+                Ok(collect(
+                    std::slice::from_ref(&run),
+                    max,
+                    prog,
+                    full,
+                    true,
+                    &format!("{} wait {}", script().display(), name),
+                ))
             } else {
                 println!("{}", status_line(&run));
                 eprintln!(
@@ -1109,7 +1325,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
             if has(&flags, "--json") {
                 output::enable_json();
             }
-            let max = value(&kv, "--max").map(seconds).transpose()?;
+            let mut max = value(&kv, "--max").map(seconds).transpose()?;
             if has(&flags, "--machine") && !pos.is_empty() {
                 return Err("--machine does not take run arguments".into());
             }
@@ -1124,9 +1340,11 @@ fn main_inner(args: &[String]) -> Res<i32> {
             if until_all && (explicit_any || stream) {
                 return Err("--until-all cannot be combined with --any or --stream".into());
             }
-            let any = explicit_any || (pos.is_empty() && !stream && !until_all);
+            // Named waits have the same first-completion semantics as the default wait;
+            // use --until-all when the caller needs every selected run.
+            let any = !until_all && (explicit_any || !stream);
             let (mut list, hinted) = wait_list(&pos, &flags, false)?;
-            if any {
+            if any && (pos.is_empty() || explicit_any) {
                 // A named run that was already reported in full is not waited for again, so
                 // repeating the same `wait --any` walks through the rest.
                 list.retain(|r| runs::active(&runs::state(r)) || !r.join(".delivered").exists());
@@ -1137,6 +1355,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 }
                 return Ok(0);
             }
+            max = check_in(max, &list);
             if any || stream {
                 return Ok(wait_each(
                     list,
@@ -1146,6 +1365,12 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     has(&flags, "--progress"),
                     has(&flags, "--full"),
                     !has(&flags, "--no-result"),
+                    &std::iter::once(script().to_string_lossy().into_owned())
+                        .chain(std::iter::once("wait".into()))
+                        .chain(rest.iter().cloned())
+                        .map(|arg| shell_quote(&arg))
+                        .collect::<Vec<_>>()
+                        .join(" "),
                 ));
             }
             Ok(collect(
@@ -1154,6 +1379,12 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 has(&flags, "--progress"),
                 has(&flags, "--full"),
                 !has(&flags, "--no-result"),
+                &std::iter::once(script().to_string_lossy().into_owned())
+                    .chain(std::iter::once("wait".into()))
+                    .chain(rest.iter().cloned())
+                    .map(|arg| shell_quote(&arg))
+                    .collect::<Vec<_>>()
+                    .join(" "),
             ))
         }
         "status" | "list" => {
@@ -1210,7 +1441,9 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "apply" => apply(rest),
         "lane" => lane::lane_command(rest),
         "busy" => {
-            if rest.len() != 1 { return Err("busy requires one resource name".into()); }
+            if rest.len() != 1 {
+                return Err("busy requires one resource name".into());
+            }
             Ok(resources::busy(&rest[0]))
         }
         "stop" => stop(rest),

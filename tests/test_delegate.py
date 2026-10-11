@@ -1788,7 +1788,8 @@ db.write_text(json.dumps(units))
         self.fake_pi([answer("ok"), SETTLED], sleep=30)
         self.assertEqual(self.cli("start", "--read-only", "--name", "slow", "task").returncode, 0)
         result = self.cli("wait", "--any", "--max", "0.3")
-        self.assertEqual((result.returncode, self.names(result)), (75, []))
+        # A check-in/max glance includes each still-running run.
+        self.assertEqual((result.returncode, self.names(result)), (75, ["slow"]))
         self.assertIn("call wait --any again", result.stderr)
         self.cli("stop", "slow")
 

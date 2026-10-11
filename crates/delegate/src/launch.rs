@@ -529,7 +529,14 @@ fn prompt_name(prompt: &str) -> String {
 fn effective_defaults(o: &mut Options, config: &crate::config::Config) -> Value {
     let mut applied = json!({});
     let defaults = &config.value["defaults"];
-    for key in ["worktree", "protect", "acceptAlso", "timeout", "evidence", "keepCommits"] {
+    for key in [
+        "worktree",
+        "protect",
+        "acceptAlso",
+        "timeout",
+        "evidence",
+        "keepCommits",
+    ] {
         let Some(v) = defaults.get(key) else { continue };
         let used = match key {
             "worktree" if !o.read_only && !o.in_place && !o.worktree => {
@@ -678,14 +685,6 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         return Err("--protect needs a git repository".into());
     }
     normalize_protect(&mut o.protect)?;
-    if o.timeout.is_none() {
-        o.timeout = Some(
-            agents::spec(&o.agent)
-                .expect("validated agent")
-                .default_timeout
-                .into(),
-        );
-    }
     let capacities = crate::config::capacities(&config.value)?;
     if !config.ignored.is_empty() {
         eprintln!(
@@ -703,6 +702,8 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     extra["share"] = json!(o.share);
     extra["acceptBlind"] = config.value["acceptBlind"].clone();
     extra["resources"] = config.value["resources"].clone();
+    extra["stall"] = config.value["stall"].clone();
+    extra["checkIn"] = config.value["checkIn"].clone();
     let (standing, sources) = standing_text(&config, o.read_only, &extra["agentDeny"]);
     extra["standing"] = json!(standing);
     extra["standingSources"] = sources;
@@ -798,7 +799,7 @@ fn rework_used(run: &Path) -> (u64, String) {
         let lines =
             changes["added"].as_u64().unwrap_or(0) + changes["deleted"].as_u64().unwrap_or(0);
         match (s(&meta, "continuation"), s(&meta["rework"], "kind")) {
-            ("timeout", _) => {}
+            ("timeout" | "stalled", _) => {}
             // A round that changed nothing (a question, a failed start) is not rework.
             (_, "rework") if changes["files"].as_u64().unwrap_or(0) > 0 => used += 1,
             (_, "minor") if lines > MINOR_LINES => used += 1,
@@ -834,7 +835,7 @@ fn rework_gate(
         None => Some(1),
     };
     let (used, name) = rework_used(parent);
-    if runs::state(parent) == "timeout" {
+    if ["timeout", "stalled"].contains(&runs::state(parent).as_str()) {
         return Ok(Some(
             json!({"kind":"continuation","used":used,"limit":limit}),
         ));
@@ -926,7 +927,10 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     {
         return Err(format!("{} has no saved session to continue (runs before delegate 4.1 kept none); use --fresh to start a new session in the same place",parent.file_name().unwrap_or_default().to_string_lossy()));
     }
-    if !after_apply && meta["worktree"].is_object() && !Path::new(s(&meta["worktree"], "path")).exists() {
+    if !after_apply
+        && meta["worktree"].is_object()
+        && !Path::new(s(&meta["worktree"], "path")).exists()
+    {
         return Err(format!(
             "the worktree of {} no longer exists: {}",
             parent.file_name().unwrap_or_default().to_string_lossy(),
@@ -982,11 +986,11 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         })
         .unwrap_or_default();
     if o.timeout.is_none() {
-        o.timeout = Some(if o.minor {
-            "10m".into()
-        } else {
-            s(&meta, "timeout").into()
-        });
+        if o.minor {
+            o.timeout = Some("10m".into());
+        } else if !s(&meta, "timeout").is_empty() {
+            o.timeout = Some(s(&meta, "timeout").into());
+        }
     }
     if !o.accept_set {
         o.accept = meta["accept"].as_str().map(str::to_string);
@@ -1008,15 +1012,25 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     }
     let prompt = read_prompt(&mut o)?;
     let prompt = if compose_after_apply {
-        format!("原任务说明：\n{}\n\n上次答复：\n{}\n\n这次的追加说明：\n{}",
-            read(parent.join("prompt.md")).trim(), read(parent.join("result.md")).trim(), prompt)
-    } else { prompt };
+        format!(
+            "原任务说明：\n{}\n\n上次答复：\n{}\n\n这次的追加说明：\n{}",
+            read(parent.join("prompt.md")).trim(),
+            read(parent.join("result.md")).trim(),
+            prompt
+        )
+    } else {
+        prompt
+    };
     let top = Some(s(&meta["worktree"], "source"))
         .filter(|x| !x.is_empty())
         .unwrap_or(s(&meta, "top"));
     let config = crate::config::load(Some(Path::new(top)))?;
     let capacities = crate::config::capacities(&config.value)?;
-    o.rework = if after_apply { None } else { rework_gate(&parent, &meta, &o, &prompt, &config.value)? };
+    o.rework = if after_apply {
+        None
+    } else {
+        rework_gate(&parent, &meta, &o, &prompt, &config.value)?
+    };
     if o.sync && !meta["worktree"].is_object() {
         return Err("--sync requires a worktree conversation".into());
     }
@@ -1073,6 +1087,8 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     extra["share"] = meta["share"].clone();
     extra["acceptBlind"] = meta["acceptBlind"].clone();
     extra["resources"] = meta["resources"].clone();
+    extra["stall"] = meta["stall"].clone();
+    extra["checkIn"] = meta["checkIn"].clone();
     if o.fresh {
         extra["agentDeny"] = config.value["agentDeny"].clone();
         let (text, sources) = standing_text(
@@ -1100,8 +1116,8 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     extra["configCapacity"] = capacities;
     extra["sourceBuild"] = config.value["sourceBuild"].clone();
     extra["sourceBuildRoot"] = meta.get("sourceBuildRoot").cloned().unwrap_or(json!(top));
-    if s(&summary, "state") == "timeout" && s(&meta, "mode") == "write" {
-        extra["continuation"] = json!("timeout");
+    if ["timeout", "stalled"].contains(&s(&summary, "state")) && s(&meta, "mode") == "write" {
+        extra["continuation"] = json!(s(&summary, "state"));
     }
     if let Some(paths) = synced {
         extra["sync"] = json!({"files":paths});
@@ -1571,7 +1587,13 @@ pub fn launch(
     } else {
         Value::Null
     };
-    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":seconds(o.timeout.as_deref().unwrap_or("15m"))?,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !b(extra,"newAfterApply") && !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
+    let timeout_seconds = o
+        .timeout
+        .as_deref()
+        .map(seconds)
+        .transpose()?
+        .unwrap_or(0.0);
+    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":timeout_seconds,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !b(extra,"newAfterApply") && !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
     let (agent_bin, agent_version) = agent_identity(s(&meta, "agent"))?;
     meta["agentPinned"] = json!(o.agent_pinned);
     if let Some(command) = o.evidence.filter(|command| !command.is_empty()) {
@@ -1590,6 +1612,8 @@ pub fn launch(
         "share",
         "acceptBlind",
         "resources",
+        "stall",
+        "checkIn",
     ] {
         meta[key] = extra[key].clone();
     }

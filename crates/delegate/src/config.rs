@@ -26,6 +26,12 @@ fn standing_object(value: &Value) -> Value {
     }
 }
 
+fn valid_duration(value: &Value, allow_zero: bool) -> bool {
+    value
+        .as_str()
+        .is_some_and(|s| (allow_zero && s == "0") || seconds(s).is_ok())
+}
+
 pub fn text_lines(value: &Value) -> String {
     if let Some(text) = value.as_str() {
         text.to_string()
@@ -64,6 +70,27 @@ pub fn read_file(path: &Path) -> Res<Option<Value>> {
 
 fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
     let check = || -> Res<()> {
+        if let Some(v) = value.get("stall") {
+            let map = v.as_object().ok_or("stall must be an object")?;
+            for key in ["idle", "command"] {
+                if let Some(item) = map.get(key) {
+                    if !valid_duration(item, true) {
+                        return Err(format!("stall.{key} must be a duration or \"0\""));
+                    }
+                }
+            }
+            if map
+                .keys()
+                .any(|key| !["idle", "command"].contains(&key.as_str()))
+            {
+                return Err("stall has unknown fields".into());
+            }
+        }
+        if let Some(v) = value.get("checkIn") {
+            if !valid_duration(v, true) {
+                return Err("checkIn must be a duration or \"0\"".into());
+            }
+        }
         if let Some(v) = value.get("standing") {
             let valid = if let Some(map) = v.as_object() {
                 map.iter().all(|(k, v)| {
@@ -170,10 +197,16 @@ fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
         if let Some(resources) = value.get("resources") {
             let resources = resources.as_object().ok_or("resources must be an object")?;
             for (name, spec) in resources {
-                if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
+                if name.is_empty()
+                    || !name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                {
                     return Err(format!("resources.{name}: invalid resource name"));
                 }
-                let commands = spec["commands"].as_array().ok_or_else(|| format!("resources.{name}.commands must be a list"))?;
+                let commands = spec["commands"]
+                    .as_array()
+                    .ok_or_else(|| format!("resources.{name}.commands must be a list"))?;
                 for argv in commands {
                     let rule = json!({"argv":argv,"hint":"resource"});
                     crate::deny::validate(Some(&json!([rule])))?;
@@ -181,7 +214,12 @@ fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
             }
         }
         if let Some(v) = value.get("acceptBlind") {
-            if !v.as_array().is_some_and(|a| a.iter().all(|v| v.as_str().is_some_and(|s| !s.is_empty() && !s.contains('\0')))) {
+            if !v.as_array().is_some_and(|a| {
+                a.iter().all(|v| {
+                    v.as_str()
+                        .is_some_and(|s| !s.is_empty() && !s.contains('\0'))
+                })
+            }) {
                 return Err("acceptBlind must be a list of non-empty globs".into());
             }
         }
@@ -242,6 +280,8 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         "repoMaxCodex",
         "resultChars",
         "acceptBlind",
+        "stall",
+        "checkIn",
     ] {
         if value.get(key).is_none() {
             if let Some(v) = user.as_ref().and_then(|u| u.get(key)) {

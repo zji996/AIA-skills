@@ -1,5 +1,10 @@
 # delegate
 
+## 5.27 stall 与 check-in
+
+- 未给 `--timeout` 的任务不会继承 Pi/Codex 默认上限；idle 30m、command 90m stall 可由环境或配置缩短，停滞状态保留改动且 reply 不耗返工。
+- Claude Code 无 `--max` 的 wait 在 55m 输出进度 glance 并退出 75；`wait --stream` 按同一间隔输出 glance 后继续，行尾给出原命令供重跑。
+
 ## 5.26 真实主控使用回归
 
 - apply 后 `reply`：轻量记录仍能读原说明与答复，自动从当前 HEAD 新建写入 worktree；`--fresh` 只用新消息。Continue an applied run with its original context.

@@ -17,6 +17,11 @@ struct WatchState {
     finished: bool,
     last: Instant,
     commands: i32,
+    command_started: Option<Instant>,
+    // Lane queue seconds already counted when the command started; queueing
+    // for the heavy lane is not the command being stuck.
+    command_queued: f64,
+    command: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -31,7 +36,6 @@ pub const PROTOCOL: u32 = 1;
 pub struct AgentSpec {
     pub name: &'static str,
     pub default_tier: Option<&'static str>,
-    pub default_timeout: &'static str,
     pub heavy: bool,
     pub session: SessionSource,
     pub read_only_contract: bool,
@@ -48,7 +52,6 @@ pub static AGENTS: &[AgentSpec] = &[
     AgentSpec {
         name: "pi",
         default_tier: Some("cheap"),
-        default_timeout: "25m",
         heavy: false,
         session: SessionSource::DelegateFile,
         read_only_contract: false,
@@ -63,7 +66,6 @@ pub static AGENTS: &[AgentSpec] = &[
     AgentSpec {
         name: "codex",
         default_tier: Some("strong"),
-        default_timeout: "50m",
         heavy: true,
         session: SessionSource::EventStream,
         read_only_contract: true,
@@ -396,6 +398,20 @@ fn codex_turn_model(meta: &Value) -> Value {
     }
 }
 
+fn stall_seconds(meta: &Value, key: &str) -> Option<f64> {
+    let env_name = format!("STALL_{}", key.to_uppercase());
+    let default = if key == "idle" { "30m" } else { "90m" };
+    let configured = meta["stall"]
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or(default);
+    let value = setting(&env_name, configured);
+    if value.trim() == "0" {
+        return None;
+    }
+    seconds(&value).ok().filter(|n| *n > 0.0)
+}
+
 fn command_codex(meta: &Value, _session: Option<&str>) -> Vec<String> {
     let fork = s(meta, "fork");
     let images = meta["images"].as_array().cloned().unwrap_or_default();
@@ -599,16 +615,27 @@ pub fn run_agent(
             finished: false,
             last: Instant::now(),
             commands: 0,
+            command_started: None,
+            command_queued: 0.0,
+            command: String::new(),
         }),
         Condvar::new(),
     ));
     let start = Instant::now();
-    let soft = meta["timeoutSeconds"].as_f64().unwrap_or(900.0);
+    let soft = meta["timeoutSeconds"].as_f64().filter(|x| *x > 0.0);
     let g = setting("TIMEOUT_GRACE", "10")
         .parse::<f64>()
         .unwrap_or(10.0);
-    let hard = soft * (1.0 + g / 100.0);
-    let (watcher_state, t, go) = (watch.clone(), timed.clone(), grace_out.clone());
+    let hard = soft.map(|x| x * (1.0 + g / 100.0));
+    let stall_idle = stall_seconds(meta, "idle");
+    let stall_command = stall_seconds(meta, "command");
+    let stalled = Arc::new(Mutex::new(None::<Value>));
+    let (watcher_state, t, go, stalled_out) = (
+        watch.clone(),
+        timed.clone(),
+        grace_out.clone(),
+        stalled.clone(),
+    );
     let runpath = run.to_path_buf();
     let watcher = std::thread::spawn(move || {
         let (mutex, changed) = &*watcher_state;
@@ -617,25 +644,93 @@ pub fn run_agent(
             if state.finished {
                 break;
             }
-            let spent = start.elapsed().as_secs_f64() - lane::queued_seconds(&runpath);
+            let queued = lane::queued_seconds(&runpath);
+            let spent = start.elapsed().as_secs_f64() - queued;
             let idle = state.last.elapsed().as_secs_f64();
-            let delay = if spent < soft {
-                soft - spent
-            } else if spent < hard && (state.commands > 0 || idle < 120.0) {
-                if let Ok(mut x) = go.lock() {
-                    *x = Some(((spent - soft) * 10.0).round() / 10.0);
+            let command_idle = idle - (queued - state.command_queued).max(0.0);
+            let command_age = state
+                .command_started
+                .map(|at| at.elapsed().as_secs_f64() - (queued - state.command_queued).max(0.0));
+            if stall_idle.is_some_and(|limit| state.commands == 0 && idle >= limit) {
+                let elapsed = idle.round() as u64;
+                let reason = json!({"kind":"idle","seconds":elapsed,"limitSeconds":stall_idle.unwrap_or(0.0)});
+                if let Ok(mut out) = stalled_out.lock() {
+                    *out = Some(reason.clone());
                 }
-                if state.commands > 0 {
-                    hard - spent
-                } else {
-                    (hard - spent).min(120.0 - idle)
+                if let Ok(mut log) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(runpath.join("events.jsonl"))
+                {
+                    let _ = writeln!(
+                        log,
+                        "{}",
+                        json!({"e":"stalled","kind":"idle","seconds":elapsed,"at":iso()})
+                    );
                 }
-            } else {
-                t.store(true, Ordering::SeqCst);
+                t.store(false, Ordering::SeqCst);
                 crate::cleanup::record(&runpath, pid);
                 kill_group(pid, 5.0);
                 break;
-            };
+            }
+            if stall_command
+                .is_some_and(|limit| state.command_started.is_some() && command_idle >= limit)
+            {
+                let elapsed = command_age.unwrap_or(0.0).round() as u64;
+                let reason = json!({"kind":"command","cmd":state.command,"seconds":elapsed,"limitSeconds":stall_command.unwrap_or(0.0)});
+                if let Ok(mut out) = stalled_out.lock() {
+                    *out = Some(reason.clone());
+                }
+                if let Ok(mut log) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(runpath.join("events.jsonl"))
+                {
+                    let _ = writeln!(
+                        log,
+                        "{}",
+                        json!({"e":"stalled","kind":"command","cmd":state.command,"seconds":elapsed,"at":iso()})
+                    );
+                }
+                t.store(false, Ordering::SeqCst);
+                crate::cleanup::record(&runpath, pid);
+                kill_group(pid, 5.0);
+                break;
+            }
+            if let Some(soft) = soft {
+                if spent >= soft {
+                    if spent < hard.unwrap_or(soft) && (state.commands > 0 || idle < 120.0) {
+                        if let Ok(mut x) = go.lock() {
+                            *x = Some(((spent - soft) * 10.0).round() / 10.0);
+                        }
+                    } else {
+                        t.store(true, Ordering::SeqCst);
+                        crate::cleanup::record(&runpath, pid);
+                        kill_group(pid, 5.0);
+                        break;
+                    }
+                }
+            }
+            let mut delay: f64 = 60.0;
+            if let Some(soft) = soft {
+                // Wake at the soft limit to record grace, then at the hard limit.
+                let next = if spent < soft {
+                    soft
+                } else {
+                    hard.unwrap_or(soft)
+                };
+                delay = delay.min((next - spent).max(0.01));
+            }
+            if let Some(limit) = stall_idle {
+                if state.commands == 0 {
+                    delay = delay.min((limit - idle).max(0.01));
+                }
+            }
+            if let Some(limit) = stall_command {
+                if state.command_started.is_some() {
+                    delay = delay.min((limit - command_idle).max(0.01));
+                }
+            }
             state = changed
                 .wait_timeout(state, Duration::from_secs_f64(delay.max(0.001)))
                 .unwrap()
@@ -674,8 +769,17 @@ pub fn run_agent(
                     state.last = Instant::now();
                     if kind == "bash" {
                         state.commands += 1;
+                        state.command_started = Some(Instant::now());
+                        state.command_queued = lane::queued_seconds(run);
+                        state.command = s(&item, "cmd").to_string();
                     } else if kind == "bash_done" {
                         state.commands = (state.commands - 1).max(0);
+                        if state.commands == 0 {
+                            state.command_started = None;
+                        }
+                        if !state.command.is_empty() {
+                            item["cmd"] = json!(state.command.clone());
+                        }
                     }
                     changed.notify_one();
                 }
@@ -744,8 +848,14 @@ pub fn run_agent(
             );
         }
     }
+    let stalled_reason = stalled.lock().ok().and_then(|x| x.clone());
+    if let Some(reason) = &stalled_reason {
+        let _ = write_json(run.join("stall.json"), reason);
+    }
     let verdict = if lane::stopped() {
         "stopped"
+    } else if stalled_reason.is_some() {
+        "stalled"
     } else if timed.load(Ordering::SeqCst) {
         "timeout"
     } else if !status.success() {
@@ -791,6 +901,18 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn stall_settings_have_defaults_and_zero_disables() {
+        std::env::remove_var("DELEGATE_STALL_IDLE");
+        std::env::remove_var("PI_DELEGATE_STALL_IDLE");
+        assert_eq!(stall_seconds(&json!({}), "idle"), Some(1800.0));
+        assert_eq!(stall_seconds(&json!({"stall":{"idle":"0"}}), "idle"), None);
+        assert_eq!(
+            stall_seconds(&json!({"stall":{"command":"2m"}}), "command"),
+            Some(120.0)
+        );
     }
 
     #[test]
