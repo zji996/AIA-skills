@@ -9,6 +9,8 @@
 
 ### 技能
 
+- `delegate` 5.28.1：测量预约开始时迁移既有 lane 进程树到其余核，释放时恢复亲和性；`measure.jsonl` 记录迁移持有者与进程数。
+
 - `delegate` 5.28.0：新增机器级测量预约（`measure`/`measureCpus`、`lane --measure`、自动命令 shim、预约核亲和性与 `measure.jsonl` 记录），并在验收或说明命中 `agentDeny` 时警告主控且保留启动。
 
 - `delegate` 文档：SKILL.md 的完成标准要求把指标与“做了真事”的断言写进验收脚本、不放被 agentDeny 拦下的命令；practice.md 补充验收管住实质、根因不明先诊断、审代价、测量任务独占机器，以及同事时间多半花在等模型、路数不必压低，均来自一次长时间实战。

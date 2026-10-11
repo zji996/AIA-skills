@@ -119,6 +119,26 @@ pub fn holders() -> Res<Vec<(String, String, bool)>> {
         })
         .collect())
 }
+
+/// Return the processes that currently hold a running heavy-lane slot.
+///
+/// The public lane listing intentionally keeps its small, human-facing tuple.
+/// Measurement reservations need the ticket PID as well so they can move the
+/// holder process tree without changing that listing's semantics.
+pub fn holder_processes() -> Res<Vec<(String, i32)>> {
+    let lim = max_heavy()?;
+    Ok(tickets()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (_, value))| {
+            if lim != 0 && i >= lim {
+                return None;
+            }
+            let pid = value["pid"].as_i64()?.try_into().ok()?;
+            Some((s(value, "label").to_string(), pid))
+        })
+        .collect())
+}
 pub struct Slot {
     ticket: Option<PathBuf>,
     _file: Option<File>,

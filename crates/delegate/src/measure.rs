@@ -1,5 +1,6 @@
 use crate::common::*;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Seek;
 use std::io::Write;
@@ -129,12 +130,42 @@ pub struct Slot {
     _file: Option<File>,
     pub queued: f64,
     pub cpus: String,
+    run: Option<PathBuf>,
+    holders: Vec<TrackedHolder>,
+}
+
+#[derive(Clone)]
+struct TrackedHolder {
+    label: String,
+    pid: i32,
+}
+
+struct MovedHolder {
+    label: String,
+    process_count: usize,
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
         if let Some(path) = self.ticket.take() {
-            let _ = fs::remove_file(path);
+            // Serialize release with the next reservation's acquisition.  This
+            // prevents a new reservation from moving a holder and then having
+            // the old slot restore it to all CPUs afterward.
+            let guard = path
+                .parent()
+                .and_then(|dir| lock(&dir.join(".lock"), true, false).ok());
+            let _ = fs::remove_file(&path);
+            let target = remaining_cpus().unwrap_or_else(|| format_cpus(&online_cpus()));
+            // Lane commands started during the reservation were pinned to the
+            // remaining CPUs at spawn; give them the freed cores back too.
+            let mut holders = self.holders.clone();
+            for (label, pid) in crate::lane::holder_processes().unwrap_or_default() {
+                if !holders.iter().any(|holder| holder.pid == pid) {
+                    holders.push(TrackedHolder { label, pid });
+                }
+            }
+            restore_holders(&self.run, &holders, &target, self.queued, &self.cpus);
+            drop(guard);
         }
     }
 }
@@ -186,19 +217,189 @@ fn record(
     cpus: &str,
     queued: f64,
     diagnostic: Option<&str>,
+    moved: &[MovedHolder],
 ) {
     let holders = crate::lane::holders()
         .unwrap_or_default()
         .into_iter()
         .map(|(label, _, _)| label)
         .collect::<Vec<_>>();
-    let value = json!({"event":event,"at":iso(),"label":label,"cpus":cpus,"loadavg":loadavg(),"queuedSeconds":(queued*1000.0).round()/1000.0,"heavyHolders":holders,"diagnostic":diagnostic});
+    let moved_values = moved
+        .iter()
+        .map(|holder| json!({"label":holder.label,"processCount":holder.process_count}))
+        .collect::<Vec<_>>();
+    let moved_count = moved
+        .iter()
+        .map(|holder| holder.process_count)
+        .sum::<usize>();
+    let value = json!({"event":event,"at":iso(),"label":label,"cpus":cpus,"loadavg":loadavg(),"queuedSeconds":(queued*1000.0).round()/1000.0,"heavyHolders":holders,"movedHolders":moved_values,"movedProcessCount":moved_count,"diagnostic":diagnostic});
     eprintln!(
         "delegate measure: {event} {label} cpus={cpus} loadavg={}",
         value["loadavg"]
     );
     if let Some(run) = run {
         let _ = append(run.join("measure.jsonl"), &format!("{value}\n"));
+    }
+}
+
+fn process_parent(pid: i32) -> Option<i32> {
+    let stat = read(format!("/proc/{pid}/stat"));
+    let (_, tail) = stat.rsplit_once(") ")?;
+    tail.split_whitespace().nth(1)?.parse().ok()
+}
+
+fn process_tree(roots: &[i32]) -> Vec<i32> {
+    let mut tree = roots
+        .iter()
+        .copied()
+        .filter(|pid| *pid > 0)
+        .collect::<Vec<_>>();
+    let mut seen = tree.iter().copied().collect::<HashSet<_>>();
+    let processes = fs::read_dir("/proc")
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .ok()?
+                .file_name()
+                .to_string_lossy()
+                .parse::<i32>()
+                .ok()
+        })
+        .collect::<Vec<_>>();
+    loop {
+        let mut added = false;
+        for pid in &processes {
+            if seen.contains(pid) {
+                continue;
+            }
+            if process_parent(*pid).is_some_and(|parent| seen.contains(&parent)) {
+                seen.insert(*pid);
+                tree.push(*pid);
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    tree
+}
+
+fn set_affinity(pid: i32, cpus: &str) -> Result<(), String> {
+    let output = Command::new("taskset")
+        .args(["-a", "-p", "-c", cpus, &pid.to_string()])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if detail.is_empty() {
+            format!("taskset exited with {}", output.status)
+        } else {
+            detail
+        })
+    }
+}
+
+fn affinity_diagnostic(
+    run: Option<&Path>,
+    label: &str,
+    cpus: &str,
+    queued: f64,
+    diagnostic: String,
+) {
+    record(
+        run,
+        "diagnostic",
+        label,
+        cpus,
+        queued,
+        Some(&diagnostic),
+        &[],
+    );
+}
+
+fn move_holders(
+    run: Option<&Path>,
+    cpus: &str,
+    queued: f64,
+) -> (Vec<TrackedHolder>, Vec<MovedHolder>) {
+    let holders = match crate::lane::holder_processes() {
+        Ok(holders) => holders,
+        Err(error) => {
+            affinity_diagnostic(
+                run,
+                "lane holders",
+                cpus,
+                queued,
+                format!("cannot list lane holders: {error}"),
+            );
+            return (Vec::new(), Vec::new());
+        }
+    };
+    let tracked = holders
+        .iter()
+        .map(|(label, pid)| TrackedHolder {
+            label: label.clone(),
+            pid: *pid,
+        })
+        .collect::<Vec<_>>();
+    let mut moved = Vec::new();
+    for (label, root) in holders {
+        let tree = process_tree(&[root]);
+        let mut process_count = 0;
+        if tree.is_empty() {
+            affinity_diagnostic(
+                run,
+                &label,
+                cpus,
+                queued,
+                format!("lane holder process {root} exited before affinity update"),
+            );
+        }
+        for pid in tree {
+            match set_affinity(pid, cpus) {
+                Ok(()) => process_count += 1,
+                Err(error) => affinity_diagnostic(
+                    run,
+                    &label,
+                    cpus,
+                    queued,
+                    format!("cannot set affinity for lane holder process {pid}: {error}"),
+                ),
+            }
+        }
+        moved.push(MovedHolder {
+            label,
+            process_count,
+        });
+    }
+    (tracked, moved)
+}
+
+fn restore_holders(
+    run: &Option<PathBuf>,
+    holders: &[TrackedHolder],
+    cpus: &str,
+    queued: f64,
+    reservation_cpus: &str,
+) {
+    for holder in holders {
+        let tree = process_tree(&[holder.pid]);
+        for pid in tree {
+            if let Err(error) = set_affinity(pid, cpus) {
+                affinity_diagnostic(
+                    run.as_deref(),
+                    &holder.label,
+                    reservation_cpus,
+                    queued,
+                    format!("cannot restore affinity for lane holder process {pid}: {error}"),
+                );
+            }
+        }
     }
 }
 
@@ -301,12 +502,21 @@ pub fn acquire(
     if let Some(run) = run {
         let _ = append(run.join("measure-wait"), &format!("{queued:.3}\n"));
     }
-    record(run, "start", label, &cpus, queued, None);
+    // Hold the measurement lock while changing existing lane holders.  A
+    // concurrent Slot::drop uses the same lock, so a successor reservation
+    // cannot be undone by the predecessor's restore step.
+    let guard = lock(&dir.join(".lock"), true, false).ok();
+    let holder_cpus = remaining_cpus().unwrap_or_else(|| format_cpus(&online_cpus()));
+    let (holders, moved) = move_holders(run, &holder_cpus, queued);
+    record(run, "start", label, &cpus, queued, None, &moved);
+    drop(guard);
     Ok(Slot {
         ticket: Some(ticket),
         _file: Some(file),
         queued,
         cpus,
+        run: run.map(Path::to_path_buf),
+        holders,
     })
 }
 
@@ -383,6 +593,7 @@ pub fn execute_argv(run: &Path, real: &str, args: &[String]) -> Res<i32> {
             &slot.cpus,
             slot.queued,
             diagnostic,
+            &[],
         );
     }
     let status = child.wait().map_err(|e| e.to_string())?;
@@ -393,6 +604,7 @@ pub fn execute_argv(run: &Path, real: &str, args: &[String]) -> Res<i32> {
         &slot.cpus,
         slot.queued,
         diagnostic,
+        &[],
     );
     Ok(status.code().unwrap_or(1))
 }
@@ -456,9 +668,130 @@ pub fn run_lane(command: &str, cwd: &Path, run: Option<&Path>, meta: &Value) -> 
             &slot.cpus,
             slot.queued,
             Some("systemd-run unavailable; direct execution"),
+            &[],
         );
         c.status().map_err(|e| e.to_string())?
     };
-    record(run, "end", command, &slot.cpus, slot.queued, None);
+    record(run, "end", command, &slot.cpus, slot.queued, None, &[]);
     Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Child;
+
+    fn affinity(pid: u32) -> Option<Vec<usize>> {
+        let output = Command::new("taskset")
+            .args(["-pc", &pid.to_string()])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let list = text.rsplit_once(':')?.1.trim();
+        parse_cpus(list).ok()
+    }
+
+    fn finish_child(child: &mut Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn lane_holder_affinity_yields_reserved_cpu_and_restores() {
+        let all = online_cpus();
+        if all.len() < 2 {
+            eprintln!("skipping affinity reservation test: fewer than two online CPUs");
+            return;
+        }
+        if Command::new("taskset").arg("--version").output().is_err() {
+            eprintln!("skipping affinity reservation test: taskset unavailable");
+            return;
+        }
+        let state = std::env::temp_dir().join(format!(
+            "delegate-measure-test-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir_all(&state).unwrap();
+        let old_state = std::env::var_os("XDG_STATE_HOME");
+        let old_max_heavy = std::env::var_os("DELEGATE_MAX_HEAVY");
+        std::env::set_var("XDG_STATE_HOME", &state);
+        std::env::set_var("DELEGATE_MAX_HEAVY", "1");
+
+        let result = (|| -> Res<()> {
+            let lane_dir = state.join("delegate/lane");
+            fs::create_dir_all(&lane_dir).map_err(|e| e.to_string())?;
+            let mut child = Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            let pid = child.id();
+            let before = match affinity(pid) {
+                Some(affinity) if affinity.len() >= 2 => affinity,
+                _ => {
+                    eprintln!("skipping affinity reservation test: cannot inspect child affinity");
+                    finish_child(&mut child);
+                    return Ok(());
+                }
+            };
+            if all.iter().any(|cpu| !before.contains(cpu)) {
+                eprintln!("skipping affinity reservation test: process cannot use all online CPUs");
+                finish_child(&mut child);
+                return Ok(());
+            }
+            let reserved = before[0];
+            let rest = before
+                .iter()
+                .copied()
+                .filter(|cpu| *cpu != reserved)
+                .collect::<Vec<_>>();
+            if let Err(error) = set_affinity(pid as i32, &format_cpus(&rest)) {
+                eprintln!(
+                    "skipping affinity reservation test: cannot set child affinity ({error})"
+                );
+                finish_child(&mut child);
+                return Ok(());
+            }
+            let _ = set_affinity(pid as i32, &format_cpus(&before));
+            let ticket = lane_dir.join(format!("{:020}-{}.ticket", now_ns(), pid));
+            let ticket_file = locked_file(
+                &ticket,
+                &json!({"pid":pid,"label":"fake sleep holder","since":iso()}).to_string(),
+            )?;
+            let meta = json!({"measureCpus":reserved.to_string()});
+            let slot = acquire("affinity test", None, &meta, |_, _| {})?;
+            let during = affinity(pid).ok_or("cannot inspect reserved child affinity")?;
+            if during.contains(&reserved) {
+                finish_child(&mut child);
+                drop(ticket_file);
+                return Err("lane holder still includes reserved CPU".into());
+            }
+            drop(slot);
+            let after = affinity(pid).ok_or("cannot inspect restored child affinity")?;
+            if all.iter().any(|cpu| !after.contains(cpu)) {
+                finish_child(&mut child);
+                drop(ticket_file);
+                return Err("lane holder did not regain all online CPUs".into());
+            }
+            finish_child(&mut child);
+            drop(ticket_file);
+            Ok(())
+        })();
+
+        if let Some(value) = old_state {
+            std::env::set_var("XDG_STATE_HOME", value);
+        } else {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
+        if let Some(value) = old_max_heavy {
+            std::env::set_var("DELEGATE_MAX_HEAVY", value);
+        } else {
+            std::env::remove_var("DELEGATE_MAX_HEAVY");
+        }
+        let _ = fs::remove_dir_all(&state);
+        result.unwrap();
+    }
 }
