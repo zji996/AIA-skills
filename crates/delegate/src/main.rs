@@ -62,7 +62,7 @@ fn check_in(max: Option<f64>, runs: &[PathBuf]) -> Option<f64> {
         };
     }
     if env::var_os("CLAUDE_CODE_SESSION_ID").is_some_and(|v| !v.is_empty()) {
-        Some(55.0 * 60.0)
+        Some(50.0 * 60.0)
     } else {
         None
     }

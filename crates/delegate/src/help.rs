@@ -35,7 +35,7 @@ const LAUNCH: &[(&str, &str)] = &[
 const COLLECT: &[(&str, &str)] = &[
     (
         "--max DURATION",
-        "Stop waiting after this long; exit 75 if still running. Claude Code defaults to a 55m check-in when omitted.",
+        "Stop waiting after this long; exit 75 if still running. Claude Code defaults to a 50m check-in when omitted.",
     ),
     ("--progress", "Also print writes, errors, and retries."),
     (

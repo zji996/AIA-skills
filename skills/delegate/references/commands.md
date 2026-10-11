@@ -31,4 +31,4 @@
 
 证据命令默认未设置。结果写入 meta 与 JSON 结论的可选 `evidence{exit,timedOut,seconds,tail,log}`：退出码、是否超时、执行秒数、日志末尾和完整日志位置。短行加“证据 通过/失败/超时”。任何证据失败只记诊断，永不改变任务 state、升档判断或命令退出码；它也不替代 `acceptStillValid` 的验收快照依据。
 
-等待检查线：Claude Code 在未给 `--max` 时默认 55m 后打印每个运行任务的进度 glance 并退出 75；`--stream` 每 55m 打印一次并继续。`checkIn`、`DELEGATE_CHECK_IN` 可改时长，`0` 关闭。
+等待检查线：Claude Code 在未给 `--max` 时默认 50m 后打印每个运行任务的进度 glance 并退出 75；`--stream` 每 50m 打印一次并继续。`checkIn`、`DELEGATE_CHECK_IN` 可改时长，`0` 关闭。

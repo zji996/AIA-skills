@@ -46,4 +46,4 @@
 验收、证据、setup、收尾生成核对、apply 的生成与 applyVerify 都由未注入 shim 的执行环境运行，主控自己的 lane 同理。没有环境放行开关或可交给同事的令牌。威胁模型是防误用，不是防恶意：同 UID 进程可以改 PATH、用绝对路径或改 shim/记录，这不是安全沙箱。
 
 - `stall`：`{"idle":"30m","command":"90m"}`，单项 `"0"` 关闭；环境变量 `DELEGATE_STALL_IDLE` / `DELEGATE_STALL_COMMAND` 优先。
-- `checkIn`：wait 检查线时长，`"0"` 关闭；`DELEGATE_CHECK_IN` 优先。未设置时 Claude Code 使用 55m，其它调用方不设默认。
+- `checkIn`：wait 检查线时长，`"0"` 关闭；`DELEGATE_CHECK_IN` 优先。未设置时 Claude Code 使用 50m，其它调用方不设默认。
