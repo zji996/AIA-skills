@@ -20,7 +20,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-DRAFT_MODEL, DRAFT_QUALITY, DRAFT_LONG_EDGE = "gpt-image-2.5-flare", "low", 1536
+DRAFT_MODEL, DRAFT_QUALITY, DRAFT_LONG_EDGE = "gpt-image-2.5-sunburst", "medium", 1536
 FINAL_MODEL, FINAL_QUALITY = "gpt-image-2.5-sunburst", "high"
 BUDGET = {"drafts": 3, "finals": 1, "edits": 1}
 MAX_REFS, MAX_REF_BYTES = 8, 20 * 2**20
@@ -528,7 +528,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
     commands = {"draft": cmd_draft, "keep": cmd_keep, "final": cmd_final, "edit": cmd_edit,
                 "status": cmd_status, "reset": cmd_reset}
-    helps = {"draft": f"cheap draft ({DRAFT_MODEL}, {DRAFT_QUALITY}, long edge {DRAFT_LONG_EDGE})",
+    helps = {"draft": f"draft ({DRAFT_MODEL}, {DRAFT_QUALITY}, long edge {DRAFT_LONG_EDGE})",
              "keep": "deliver a reviewed draft as the image; no call, no cost",
              "final": f"one final render ({FINAL_MODEL}, {FINAL_QUALITY}) locked to a reviewed draft",
              "edit": "one local fix on the final image", "status": "show drafts and budgets",

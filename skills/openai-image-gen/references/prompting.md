@@ -55,7 +55,7 @@ Keep the whole image exactly as it is. Only change: the tag "Anthropic/" becomes
 
 ## 模型与参数
 
-- **模型**：`gpt-image-2.5-sunburst` 是 2.5 代的高质量模型，也是正式图的默认；`gpt-image-2.5-flare` 更快也更便宜，质量约等于 gpt-image-2，用于草稿。
+- **模型**：`gpt-image-2.5-sunburst` 是 2.5 代的高质量模型，也是正式图的默认；`gpt-image-2.5-flare` 更快也更便宜，质量约等于 gpt-image-2；草稿默认也用 sunburst（medium），只在需要省钱时用 `-m` 切到 flare。
 - **质量档**：`low`/`medium`/`high`/`xhigh`/`max`。
   - 官方建议 `xhigh`/`max` 只在 `high` 达不到要求时用，更高档不保证更好。
   - 实测 2560x1440 下，`xhigh` 与 `high` 都要 40–60 秒。

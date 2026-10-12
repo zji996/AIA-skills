@@ -82,13 +82,13 @@ class ImagegenTests(unittest.TestCase):
     def draft(self, *extra, prompt=None):
         return self.ok("draft", "-o", self.output, "-f", "-", "-b", self.base, *extra, input=prompt or self.prompt)
 
-    def test_draft_is_cheap_scaled_webp_outside_the_project(self):
+    def test_draft_is_scaled_webp_outside_the_project(self):
         handler = self.server()
         result = self.draft("-s", "2560x1440")
         request = handler.requests[0]
         self.assertEqual(request["path"], "/v1/images/generations")
         self.assertEqual({k: request["data"][k] for k in ("model", "quality", "size", "output_format", "prompt")},
-                         {"model": "gpt-image-2.5-flare", "quality": "low", "size": "1536x864",
+                         {"model": "gpt-image-2.5-sunburst", "quality": "medium", "size": "1536x864",
                           "output_format": "webp",
                           "prompt": self.prompt + "\n\nLandscape orientation, 16:9 aspect ratio, wider than tall."})
         self.assertTrue(result["file"].startswith(str(self.work / "state/openai-image-gen")))
@@ -230,7 +230,7 @@ class ImagegenTests(unittest.TestCase):
     def test_a_gateway_that_ignores_quality_gets_no_copy_final(self):
         echo = {"data": [{"b64_json": base64.b64encode(b"image-bytes").decode()}], "quality": "low"}
         handler = self.server(data=echo)
-        self.draft()
+        self.draft("-q", "low")
         first = self.ok("final", "-o", self.output, "-b", self.base)
         self.assertIn("rendered low", first["warning"])
         self.assertEqual(first["quality"], "low")

@@ -1,16 +1,16 @@
 ---
 name: openai-image-gen
-description: 需要生成配图、Banner、图标、架构总览、产品插图、分镜画面或 UI/游戏素材并保存为本地文件时使用；可传参考图（角色设定图等）让多张图里的人物保持一致；先用便宜模型打草稿，草稿满意就直接采用，否则出一次正式图，按输出文件限定次数控制费用，只输出一行结果 JSON。Use to generate image assets, diagrams, illustrations, storyboard frames, banners or icons to disk, optionally with reference images for consistent characters.
+description: 需要生成配图、Banner、图标、架构总览、产品插图、分镜画面或 UI/游戏素材并保存为本地文件时使用；可传参考图（角色设定图等）让多张图里的人物保持一致；先打草稿定构图，草稿满意就直接采用，否则出一次正式图，按输出文件限定次数控制费用，只输出一行结果 JSON。Use to generate image assets, diagrams, illustrations, storyboard frames, banners or icons to disk, optionally with reference images for consistent characters.
 license: MIT
 metadata:
-  version: "2.3.0"
+  version: "2.4.0"
 ---
 
 # OpenAI Image Generation (本地图像生成)
 
 ```bash
 G=<本技能目录>/scripts/imagegen.py
-$G draft -o docs/img/arch.webp -f arch.prompt.txt -s 2560x1440   # 草稿：flare · low · 长边 1536
+$G draft -o docs/img/arch.webp -f arch.prompt.txt -s 2560x1440   # 草稿：sunburst · medium · 长边 1536
 $G keep  -o docs/img/arch.webp --draft 1                          # 草稿满意：直接采用，不调用、不花钱
 $G final -o docs/img/arch.webp --keep-prompt                      # 正式图：sunburst · high，沿用草稿构图
 $G edit  -o docs/img/arch.webp -f fix.txt                         # 局部修正
@@ -18,7 +18,7 @@ $G draft -o art/scene.webp -f scene.txt -s 2560x1440 -r cast/he/sheet.webp -r ca
 $G status -o docs/img/arch.webp
 ```
 
-每次调用都收费。草稿用快速模型和 low 质量，比正式图便宜得多，所以构图靠草稿来定。草稿已经够好就 `keep`；正式图只在画质确实不够时出一次。
+每次调用都收费。草稿默认用 sunburst、medium 质量（比正式图的 high 便宜；要更省用 `-m gpt-image-2.5-flare -q low`），构图靠草稿来定。草稿已经够好就 `keep`；正式图只在画质确实不够时出一次。
 
 ## 流程
 
