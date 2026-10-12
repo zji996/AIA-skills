@@ -3,7 +3,7 @@ name: repo-governance
 description: 仓库上下文治理。当需要搭建或整理 AGENTS.md、docs/current.md、决策记录、待收敛清单，或检查 token 预算、上下文健康度、文档漂移时使用；附带只读审计脚本。Use for repo context governance, token budget, context health, docs drift audit, provisional/convergence register.
 license: MIT
 metadata:
-  version: "3.1.0"
+  version: "3.2.0"
 ---
 
 # Repo Governance (仓库上下文治理)
@@ -58,3 +58,7 @@ metadata:
 | `.local/`（整体 gitignore） | 运行产物、任务草稿 `.local/plan/` | 临时内容不进版本库；稳定结论在任务结束前回填到上面几层 |
 
 小项目只需要 `AGENTS.md`；出现跨会话的长任务再加 `docs/current.md`；其余层按需出现。
+
+## 经验不膨胀
+
+经验先改成脚本或默认值，改不成的才写文档。经验手册（如导演手册、运维手册）只写跨任务可复用、需要判断的规则，每条最多一个短例子；新经验并入或替换旧条目，不按时间追加，并在 `.repo-governance.json` 里设预算。内容生产类仓库（MV、视频、文章）的单个作品构思与取舍放在作品目录里，和作品一起，不进全局文档。
