@@ -5,6 +5,8 @@
 - **语言**：提示词一律用英文，即使用户用中文交流。只有画面里要出现的文字保留原语言，逐字写出并加引号。
 - **顺序**：主体 → 风格与媒介 → 构图与视角 → 色彩与光线 → 用途约束。用途约束例如“左侧留白放标题”“纯色背景便于抠图”。
 - **篇幅**：一两句话的提示词只适合氛围图。
+- **不要的字**：不写明时，模型常会自己加标题、书名、标语。画面不要文字就写 "no text, letters or logos anywhere"。
+- **画幅**：脚本会按尺寸自动在末尾追加画幅句，不必自己写；有的网关只认这句话，不认 `size` 参数。
 
 ## 示意图、信息图与带文字的画面
 
@@ -36,7 +38,7 @@ AVOID: 3D/isometric, people, robots, circuit textures, lens flares, neon/purple,
 
 ## 编辑提示词
 
-编辑会重绘整张图，并参考原图保持布局。提示词只写要改的地方，例如：
+编辑会重绘整张图，并高保真保留原图：写明的改动会被精确执行，其余基本原样；提示词没写改动时，返回的几乎就是原图。所以提示词只写要改的地方，例如：
 
 ```text
 Keep the whole image exactly as it is. Only change: the tag "Anthropic/" becomes "Anthropic" (no slash).
@@ -50,6 +52,7 @@ Keep the whole image exactly as it is. Only change: the tag "Anthropic/" becomes
 - **质量档**：`low`/`medium`/`high`/`xhigh`/`max`。
   - 官方建议 `xhigh`/`max` 只在 `high` 达不到要求时用，更高档不保证更好。
   - 实测 2560x1440 下，`xhigh` 与 `high` 都要 40–60 秒。
+- **网关差异**：经 ChatGPT 账号转发的网关（如 Sub2API 的 Codex 通道）忽略 `size`、`quality` 与 `output_format`：一律按 low 出图、返回 PNG，横竖只看提示词。这类网关上草稿就是成品画质，满意就 `keep`。
 - **尺寸**：
   - 两边都须是 16 的倍数，长短边比不超过 3:1，最大 `3840x2160`；
   - 像素数超过 2560x1440 属实验性。

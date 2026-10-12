@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Draft cheaply, then render one final image; budgets are enforced per output file.
+"""Draft cheaply, keep a good draft or render one final image; budgets are enforced per output file.
 
 Every command prints one JSON line. State (drafts, counts, prompt) lives outside the
 project in $XDG_STATE_HOME/openai-image-gen/<hash of the output path>/.
@@ -8,7 +8,10 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import os
+import shutil
+import subprocess
 import sys
 import time
 import tomllib
@@ -37,9 +40,35 @@ def emit(**fields):
     print(json.dumps(fields, ensure_ascii=False))
 
 
+def state_root():
+    return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "openai-image-gen"
+
+
 def state_dir(output):
-    root = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "openai-image-gen"
-    return root / hashlib.sha256(str(Path(output).resolve()).encode()).hexdigest()[:16]
+    return state_root() / hashlib.sha256(str(Path(output).resolve()).encode()).hexdigest()[:16]
+
+
+def same_prompt(left, right):
+    return bool(left) and bool(right) and " ".join(left.split()) == " ".join(right.split())
+
+
+# Gateways that relay ChatGPT accounts render every request at low quality; what one
+# echoed back is remembered so a final that could only copy its draft is not paid for.
+def gateway_notes():
+    path = state_root() / "gateways.json"
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def note_gateway(base_url, **facts):
+    notes = gateway_notes()
+    notes[base_url] = {**notes.get(base_url, {}), **facts}
+    state_root().mkdir(parents=True, exist_ok=True)
+    tmp = state_root() / "gateways.json.tmp"
+    tmp.write_text(json.dumps(notes, indent=2))
+    os.replace(tmp, state_root() / "gateways.json")
 
 
 def load_state(output):
@@ -94,6 +123,21 @@ def parse_size(value):
 
 def checked_size(value):
     return value and "x".join(map(str, parse_size(value)))
+
+
+def orientation(size):
+    """Some gateways ignore `size` and take the shape from the prompt, so the prompt says it too."""
+    width, height = parse_size(size)
+    if width == height:
+        return "Square 1:1 composition."
+    divisor = math.gcd(width, height)
+    w, h = width // divisor, height // divisor
+    if max(w, h) > 32:
+        long = f"{max(width, height) / min(width, height):.2f}".rstrip("0").rstrip(".")
+        w, h = (long, 1) if width > height else (1, long)
+    if width > height:
+        return f"Landscape orientation, {w}:{h} aspect ratio, wider than tall."
+    return f"Portrait orientation, {w}:{h} aspect ratio, taller than wide."
 
 
 def draft_size(width, height):
@@ -159,9 +203,14 @@ def multipart(fields, files):
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
-def request_image(args, *, model, quality, size, prompt, fmt, reference=None):
+def request_image(args, *, model, quality, size, prompt, fmt, reference=None, shape=None):
+    """The image bytes and what the gateway says it rendered (quality, size, format).
+
+    `shape` is the requested final size, whose orientation the prompt states; a draft's
+    scaled size may round off its ratio."""
     base_url, api_key = credentials(args)
-    fields = {"model": model, "prompt": prompt, "size": size, "quality": quality, "output_format": fmt, "n": 1}
+    fields = {"model": model, "prompt": f"{prompt.rstrip()}\n\n{orientation(shape or size)}", "size": size,
+              "quality": quality, "output_format": fmt, "n": 1}
     if getattr(args, "compression", None) is not None:
         fields["output_compression"] = args.compression
     if reference:
@@ -188,16 +237,20 @@ def request_image(args, *, model, quality, size, prompt, fmt, reference=None):
         raise SystemExit(f"error: image request failed (HTTP {exc.code}): {message or exc.reason}")
     except (urllib.error.URLError, TimeoutError, ValueError) as exc:
         raise SystemExit(f"error: image request failed: {exc}")
+    echo = {key: payload[key] for key in ("quality", "size", "output_format") if payload.get(key)}
+    # A low request echoed as low says nothing about whether higher tiers are honoured.
+    if echo.get("quality") and quality not in ("auto", "low"):
+        note_gateway(base_url, ignores_quality=echo["quality"] != quality)
     item = (payload.get("data") or [{}])[0]
     if item.get("b64_json"):
         try:
-            return base64.b64decode(item["b64_json"], validate=True)
+            return base64.b64decode(item["b64_json"], validate=True), echo
         except ValueError:
             raise SystemExit("error: invalid base64 image data")
     if str(item.get("url", "")).startswith("https://"):
         try:
             with urllib.request.urlopen(item["url"], timeout=120) as response:
-                return response.read()
+                return response.read(), echo
         except (urllib.error.URLError, TimeoutError) as exc:
             raise SystemExit(f"error: image download failed: {exc}")
     raise SystemExit("error: no image data in the API response")
@@ -236,14 +289,50 @@ def sniff(data):
     return "unknown", 0, 0
 
 
-def returned(data, fmt, size):
+def returned(data, fmt, size, echo, quality):
     """What the API actually sent back, with a warning when it ignored the request."""
     got, width, height = sniff(data)
     info = {"returned": f"{got} {width}x{height}"}
+    warnings = []
     if got != fmt or f"{width}x{height}" != size:
-        info["warning"] = (f"requested {fmt} {size} but got {got} {width}x{height}; the gateway ignored it. "
-                           "Use the real size in HTML width/height and convert the format if it matters.")
+        warnings.append(f"requested {fmt} {size} but got {got} {width}x{height}; the gateway ignored it. "
+                        "Use the real size in HTML width/height and convert the format if it matters.")
+    if echo.get("quality") and quality != "auto" and echo["quality"] != quality:
+        info["quality"] = echo["quality"]
+        warnings.append(f"requested quality {quality} but the gateway rendered {echo['quality']}; "
+                        "a final from a draft adds nothing here, so keep good drafts instead.")
+    if warnings:
+        info["warning"] = " ".join(warnings)
     return info
+
+
+def convert(source, target, fmt):
+    """Write `source` as `fmt` at `target` with ffmpeg; False when no converter is installed."""
+    if not shutil.which("ffmpeg"):
+        return False
+    codec = {"webp": ["-c:v", "libwebp", "-quality", "90"], "jpeg": ["-q:v", "2"], "png": []}[fmt]
+    tmp = Path(target).with_name(f".{Path(target).name}.{uuid.uuid4().hex[:8]}.{'jpg' if fmt == 'jpeg' else fmt}")
+    done = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(source), *codec, "-frames:v", "1", str(tmp)],
+                          capture_output=True)
+    if done.returncode != 0 or not tmp.is_file():
+        tmp.unlink(missing_ok=True)
+        raise SystemExit(f"error: converting the draft to {fmt} failed: {done.stderr.decode(errors='replace')[:300]}")
+    os.replace(tmp, target)
+    return True
+
+
+def draft_prompt(entry):
+    return Path(entry["file"]).with_name(f"draft-{entry['n']}.prompt.txt").read_text(encoding="utf-8")
+
+
+def pick_draft(state, number):
+    if not state["drafts"]:
+        raise Refusal("no draft yet; run draft first and review it")
+    pick = number or state["drafts"][-1]["n"]
+    chosen = next((d for d in state["drafts"] if d["n"] == pick), None)
+    if chosen is None:
+        raise Refusal(f"draft {pick} does not exist")
+    return pick, chosen
 
 
 # --- commands ---------------------------------------------------------------------------
@@ -252,61 +341,94 @@ def cmd_draft(args, state):
     prompt = read_prompt(args)
     if not prompt:
         raise SystemExit("error: draft needs a non-empty --prompt or --prompt-file")
-    spend(state, "drafts", args.allow_extra)
     width, height = parse_size(args.size or state["size"] or "1536x1024")
+    for earlier in state["drafts"]:
+        if earlier.get("size", state["size"]) == f"{width}x{height}" and same_prompt(draft_prompt(earlier), prompt):
+            raise Refusal(f"draft {earlier['n']} already used this prompt and size ({earlier['file']}); nothing was "
+                          f"sent. Change the prompt, or keep or final draft {earlier['n']}.")
+    spend(state, "drafts", args.allow_extra)
     state["size"] = f"{width}x{height}"
     number = len(state["drafts"]) + 1
     directory = state_dir(args.output)
     started = time.monotonic()
     size = draft_size(width, height)
-    data = request_image(args, model=args.model or DRAFT_MODEL, quality=args.quality or DRAFT_QUALITY,
-                         size=size, prompt=prompt, fmt="webp")
+    quality = args.quality or DRAFT_QUALITY
+    data, echo = request_image(args, model=args.model or DRAFT_MODEL, quality=quality,
+                               size=size, prompt=prompt, fmt="webp", shape=state["size"])
     got = sniff(data)[0]
     file = directory / f"draft-{number}.{'jpg' if got == 'jpeg' else got}"
     write_atomic(file, data)
     (directory / f"draft-{number}.prompt.txt").write_text(prompt, encoding="utf-8")
-    state["drafts"].append({"n": number, "file": str(file)})
+    state["drafts"].append({"n": number, "file": str(file), "size": state["size"]})
     save_state(args.output, state)
     emit(status="ok", step="draft", draft=number, file=str(file), seconds=round(time.monotonic() - started),
-         **returned(data, "webp", size), budget=budget_view(state),
-         next=f"Review the draft for layout, arrows and text placement. If it works: final -o {args.output}"
-              f" [--draft {number}]; otherwise fix the prompt and draft again.")
+         **returned(data, "webp", size, echo, quality), budget=budget_view(state),
+         next=f"Review the draft for layout, arrows and text. If it already looks finished, keep it for free: "
+              f"keep -o {args.output} --draft {number}. If only the render quality falls short: final -o "
+              f"{args.output} --draft {number}. If the layout is wrong, fix the prompt and draft again.")
 
 
 def cmd_final(args, state):
-    if not state["drafts"]:
-        raise Refusal("no draft yet; run draft first and review it")
-    pick = args.draft or state["drafts"][-1]["n"]
-    chosen = next((d for d in state["drafts"] if d["n"] == pick), None)
-    if chosen is None:
-        raise Refusal(f"draft {pick} does not exist")
+    pick, chosen = pick_draft(state, args.draft)
     # A corrected prompt may replace the draft's, e.g. to fix a label the draft got wrong.
-    prompt = read_prompt(args) or Path(chosen["file"]).with_name(f"draft-{pick}.prompt.txt").read_text(encoding="utf-8")
+    prompt = read_prompt(args) or draft_prompt(chosen)
+    base_url = credentials(args)[0]
+    if (not args.fresh and same_prompt(prompt, draft_prompt(chosen))
+            and gateway_notes().get(base_url, {}).get("ignores_quality")):
+        raise Refusal(f"this gateway renders every request at low quality, so a final with draft {pick}'s own prompt "
+                      f"would return a copy of it; nothing was sent. Keep it: keep -o {args.output} --draft {pick}; "
+                      "or pass a changed prompt, or --fresh for a new composition.")
     spend(state, "finals", args.allow_extra)
     fmt = image_format(args.output, args.format)
     started = time.monotonic()
     size = checked_size(args.size) or state["size"]
-    data = request_image(args, model=args.model or FINAL_MODEL, quality=args.quality or FINAL_QUALITY,
-                         size=size, fmt=fmt,
-                         prompt=prompt if args.fresh else prompt + LAYOUT_LOCK,
-                         reference=None if args.fresh else chosen["file"])
+    quality = args.quality or FINAL_QUALITY
+    data, echo = request_image(args, model=args.model or FINAL_MODEL, quality=quality,
+                               size=size, fmt=fmt,
+                               prompt=prompt if args.fresh else prompt + LAYOUT_LOCK,
+                               reference=None if args.fresh else chosen["file"])
     write_atomic(args.output, data)
     if args.keep_prompt:
         Path(args.output).with_suffix(".prompt.txt").write_text(prompt, encoding="utf-8")
     state["finals"] += 1
+    state["prompt"] = prompt
     save_state(args.output, state)
     emit(status="ok", step="final", file=args.output, from_draft=pick, seconds=round(time.monotonic() - started),
-         **returned(data, fmt, size), budget=budget_view(state),
+         **returned(data, fmt, size, echo, quality), budget=budget_view(state),
+         next="Check every text string at full size and the arrows. For one local defect: edit -o "
+              f"{args.output} -f fix.txt (one edit allowed). Otherwise report the remaining flaws.")
+
+
+def cmd_keep(args, state):
+    pick, chosen = pick_draft(state, args.draft)
+    fmt = image_format(args.output, args.format)
+    got = sniff(Path(chosen["file"]).read_bytes())[0]
+    if got in (fmt, "unknown"):
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        write_atomic(args.output, Path(chosen["file"]).read_bytes())
+    elif not convert(chosen["file"], args.output, fmt):
+        raise Refusal(f"draft {pick} is {got}, and converting it to {fmt} needs ffmpeg, which is not installed; "
+                      f"pass --format {got} to keep it as {got} bytes")
+    prompt = draft_prompt(chosen)
+    if args.keep_prompt:
+        Path(args.output).with_suffix(".prompt.txt").write_text(prompt, encoding="utf-8")
+    state["kept"], state["prompt"] = pick, prompt
+    save_state(args.output, state)
+    emit(status="ok", step="keep", file=args.output, from_draft=pick, **returned(Path(args.output).read_bytes(),
+         fmt, state["size"], {}, "auto"), budget=budget_view(state),
          next="Check every text string at full size and the arrows. For one local defect: edit -o "
               f"{args.output} -f fix.txt (one edit allowed). Otherwise report the remaining flaws.")
 
 
 def cmd_edit(args, state):
-    if not Path(args.output).is_file() or not state["finals"]:
-        raise Refusal("edit fixes a final image; run final first")
+    if not Path(args.output).is_file() or not (state["finals"] or state.get("kept")):
+        raise Refusal("edit fixes the delivered image; keep a draft or run final first")
     prompt = read_prompt(args)
     if not prompt:
         raise SystemExit("error: edit needs a non-empty --prompt or --prompt-file")
+    if same_prompt(prompt, state.get("prompt")):
+        raise Refusal("an edit must say what to change; this is the prompt the image was made from, "
+                      "and the gateway would return a copy. Nothing was sent.")
     spend(state, "edits", args.allow_extra)
     directory = state_dir(args.output)
     directory.mkdir(parents=True, exist_ok=True)
@@ -314,13 +436,14 @@ def cmd_edit(args, state):
     before.write_bytes(Path(args.output).read_bytes())
     started = time.monotonic()
     size, fmt = checked_size(args.size) or state["size"], image_format(args.output, args.format)
-    data = request_image(args, model=args.model or FINAL_MODEL, quality=args.quality or FINAL_QUALITY,
-                         size=size, prompt=prompt, fmt=fmt, reference=str(before))
+    quality = args.quality or FINAL_QUALITY
+    data, echo = request_image(args, model=args.model or FINAL_MODEL, quality=quality,
+                               size=size, prompt=prompt, fmt=fmt, reference=str(before))
     write_atomic(args.output, data)
     state["edits"] += 1
     save_state(args.output, state)
     emit(status="ok", step="edit", file=args.output, previous=str(before),
-         seconds=round(time.monotonic() - started), **returned(data, fmt, size), budget=budget_view(state),
+         seconds=round(time.monotonic() - started), **returned(data, fmt, size, echo, quality), budget=budget_view(state),
          next="Compare with the previous version; keep whichever is better. No further edits without approval.")
 
 
@@ -339,8 +462,10 @@ def cmd_reset(args, state):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
-    commands = {"draft": cmd_draft, "final": cmd_final, "edit": cmd_edit, "status": cmd_status, "reset": cmd_reset}
+    commands = {"draft": cmd_draft, "keep": cmd_keep, "final": cmd_final, "edit": cmd_edit,
+                "status": cmd_status, "reset": cmd_reset}
     helps = {"draft": f"cheap draft ({DRAFT_MODEL}, {DRAFT_QUALITY}, long edge {DRAFT_LONG_EDGE})",
+             "keep": "deliver a reviewed draft as the image; no call, no cost",
              "final": f"one final render ({FINAL_MODEL}, {FINAL_QUALITY}) locked to a reviewed draft",
              "edit": "one local fix on the final image", "status": "show drafts and budgets",
              "reset": "start a new image at the same path (only for a new image or with user approval)"}
@@ -348,6 +473,12 @@ def main(argv=None):
         command = sub.add_parser(name, help=helps[name])
         command.add_argument("-o", "--output", required=True, help="final image path; its extension picks the format")
         if name in ("status", "reset"):
+            continue
+        if name == "keep":
+            command.add_argument("--draft", type=int, help="draft number to keep (default: latest)")
+            command.add_argument("--format", choices=["png", "webp", "jpeg"],
+                                 help="default: from the output extension, else png")
+            command.add_argument("--keep-prompt", action="store_true", help="save <output>.prompt.txt next to it")
             continue
         command.add_argument("-p", "--prompt", help="final: defaults to the draft's prompt")
         command.add_argument("-f", "--prompt-file", help='prompt file, or "-" for stdin')

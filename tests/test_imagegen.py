@@ -2,9 +2,11 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
+import zlib
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -77,8 +79,8 @@ class ImagegenTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
-    def draft(self, *extra):
-        return self.ok("draft", "-o", self.output, "-f", "-", "-b", self.base, *extra, input=self.prompt)
+    def draft(self, *extra, prompt=None):
+        return self.ok("draft", "-o", self.output, "-f", "-", "-b", self.base, *extra, input=prompt or self.prompt)
 
     def test_draft_is_cheap_scaled_webp_outside_the_project(self):
         handler = self.server()
@@ -87,7 +89,8 @@ class ImagegenTests(unittest.TestCase):
         self.assertEqual(request["path"], "/v1/images/generations")
         self.assertEqual({k: request["data"][k] for k in ("model", "quality", "size", "output_format", "prompt")},
                          {"model": "gpt-image-2.5-flare", "quality": "low", "size": "1536x864",
-                          "output_format": "webp", "prompt": self.prompt})
+                          "output_format": "webp",
+                          "prompt": self.prompt + "\n\nLandscape orientation, 16:9 aspect ratio, wider than tall."})
         self.assertTrue(result["file"].startswith(str(self.work / "state/openai-image-gen")))
         self.assertEqual(Path(result["file"]).read_bytes(), b"image-bytes")
         self.assertFalse(self.output.exists())
@@ -118,7 +121,8 @@ class ImagegenTests(unittest.TestCase):
         self.assertEqual(len(handler.requests), 2)
         self.ok("final", "-o", self.output, "--allow-extra", "--fresh", "-b", self.base)
         self.assertEqual(handler.requests[2]["path"], "/v1/images/generations")
-        self.assertEqual(handler.requests[2]["data"]["prompt"], self.prompt)
+        self.assertEqual(handler.requests[2]["data"]["prompt"],
+                         self.prompt + "\n\nLandscape orientation, 16:9 aspect ratio, wider than tall.")
 
     def test_reports_what_the_gateway_really_returned(self):
         png = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + (1672).to_bytes(4, "big") + (941).to_bytes(4, "big")
@@ -137,15 +141,15 @@ class ImagegenTests(unittest.TestCase):
         self.assertEqual(refused.returncode, 3)
         self.assertEqual(handler.requests, [])
         self.draft()
-        self.draft()
+        self.draft(prompt="Second layout.")
         self.ok("final", "-o", self.output, "--draft", "1", "-p", "Corrected label.", "-b", self.base)
         self.assertTrue(handler.requests[2]["data"]["prompt"].startswith("Corrected label."))
         self.assertEqual(handler.requests[2]["data"]["size"], "1536x1024")
 
     def test_budgets_cap_drafts_and_edits(self):
         handler = self.server()
-        for _ in range(3):
-            self.draft()
+        for number in range(3):
+            self.draft(prompt=f"Layout {number}.")
         over = self.run_cmd("draft", "-o", self.output, "-p", "x", "-b", self.base)
         self.assertEqual(over.returncode, 3)
         self.assertIn("--allow-extra", json.loads(over.stdout)["reason"])
@@ -157,7 +161,7 @@ class ImagegenTests(unittest.TestCase):
         edit = self.ok("edit", "-o", self.output, "-p", 'Fix "Anthropic".', "-b", self.base)
         self.assertEqual(Path(edit["previous"]).read_bytes(), b"final-bytes")
         self.assertIn(b"final-bytes", handler.requests[-1]["data"]["_raw"])
-        self.assertEqual(handler.requests[-1]["data"]["prompt"], 'Fix "Anthropic".')
+        self.assertTrue(handler.requests[-1]["data"]["prompt"].startswith('Fix "Anthropic".\n\n'))
         second = self.run_cmd("edit", "-o", self.output, "-p", "again", "-b", self.base)
         self.assertEqual(second.returncode, 3)
         self.assertEqual(len(handler.requests), 5)
@@ -166,6 +170,78 @@ class ImagegenTests(unittest.TestCase):
         self.assertEqual(status["budget"], {"drafts": "3/3", "finals": "1/1", "edits": "1/1"})
         self.ok("reset", "-o", self.output)
         self.assertEqual(self.ok("status", "-o", self.output)["budget"]["drafts"], "0/3")
+
+    def test_prompt_states_the_shape_because_gateways_ignore_size(self):
+        handler = self.server()
+        for size, line in [("1024x1024", "Square 1:1 composition."),
+                           ("1024x1536", "Portrait orientation, 2:3 aspect ratio, taller than wide."),
+                           ("1600x1008", "Landscape orientation, 1.59:1 aspect ratio, wider than tall.")]:
+            with self.subTest(size=size):
+                self.ok("draft", "-o", self.work / f"{size}.webp", "-p", "Cat.", "-s", size, "-b", self.base)
+                self.assertTrue(handler.requests[-1]["data"]["prompt"].endswith("\n\n" + line))
+
+    def test_a_good_draft_is_kept_without_a_call(self):
+        handler = self.server()
+        self.draft()
+        self.draft(prompt="Second layout.")
+        kept = self.ok("keep", "-o", self.output, "--draft", "1")
+        self.assertEqual(len(handler.requests), 2)
+        self.assertEqual((kept["step"], kept["from_draft"]), ("keep", 1))
+        self.assertEqual(self.output.read_bytes(), b"image-bytes")
+        self.assertEqual(kept["budget"]["finals"], "0/1")
+        unchanged = self.run_cmd("edit", "-o", self.output, "-f", "-", "-b", self.base, input=self.prompt)
+        self.assertEqual(unchanged.returncode, 3)
+        self.assertIn("must say what to change", json.loads(unchanged.stdout)["reason"])
+        self.ok("edit", "-o", self.output, "-p", "Only change: add a red scarf.", "-b", self.base)
+        self.assertEqual(handler.requests[-1]["path"], "/v1/images/edits")
+
+    def test_keep_converts_or_refuses_another_format(self):
+        # A real 16x16 PNG: gateways that ignore output_format send PNG drafts.
+        row = b"\x00" + b"\xff\x80\x00" * 16
+        chunk = lambda kind, data: (len(data).to_bytes(4, "big") + kind + data
+                                    + zlib.crc32(kind + data).to_bytes(4, "big"))
+        png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", (16).to_bytes(4, "big") * 2 + bytes([8, 2, 0, 0, 0]))
+               + chunk(b"IDAT", zlib.compress(row * 16)) + chunk(b"IEND", b""))
+        self.server(data={"data": [{"b64_json": base64.b64encode(png).decode()}]})
+        self.draft()
+        bin_dir = self.work / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "python3").symlink_to(shutil.which("python3"))
+        refused = self.run_cmd("keep", "-o", self.output, env=self.env(PATH=str(bin_dir)))
+        self.assertEqual(refused.returncode, 3)
+        self.assertIn("--format png", json.loads(refused.stdout)["reason"])
+        self.assertFalse(self.output.exists())
+        as_png = self.ok("keep", "-o", self.output, "--format", "png", env=self.env(PATH=str(bin_dir)))
+        self.assertEqual(as_png["returned"], "png 16x16")
+        if shutil.which("ffmpeg"):
+            converted = self.ok("keep", "-o", self.output)
+            self.assertEqual(converted["returned"], "webp 16x16")
+
+    def test_the_same_draft_is_not_paid_for_twice(self):
+        handler = self.server()
+        self.draft()
+        again = self.run_cmd("draft", "-o", self.output, "-f", "-", "-b", self.base, input=" " + self.prompt + "\n")
+        self.assertEqual(again.returncode, 3)
+        self.assertIn("draft 1 already used this prompt", json.loads(again.stdout)["reason"])
+        self.assertEqual(len(handler.requests), 1)
+        self.draft("-s", "1024x1536")
+        self.assertEqual(len(handler.requests), 2)
+
+    def test_a_gateway_that_ignores_quality_gets_no_copy_final(self):
+        echo = {"data": [{"b64_json": base64.b64encode(b"image-bytes").decode()}], "quality": "low"}
+        handler = self.server(data=echo)
+        self.draft()
+        first = self.ok("final", "-o", self.output, "-b", self.base)
+        self.assertIn("rendered low", first["warning"])
+        self.assertEqual(first["quality"], "low")
+        other = self.work / "other.webp"
+        self.ok("draft", "-o", other, "-p", "Other.", "-b", self.base)
+        refused = self.run_cmd("final", "-o", other, "-b", self.base)
+        self.assertEqual(refused.returncode, 3)
+        self.assertIn("keep -o", json.loads(refused.stdout)["reason"])
+        self.assertEqual(len(handler.requests), 3)
+        self.ok("final", "-o", other, "-p", "Other, with crisp labels.", "-b", self.base)
+        self.assertEqual(len(handler.requests), 4)
 
     def test_budgets_are_per_output_path(self):
         self.server()
