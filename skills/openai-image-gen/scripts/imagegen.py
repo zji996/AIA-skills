@@ -178,8 +178,12 @@ def request_image(args, *, model, quality, size, prompt, fmt, reference=None):
     except urllib.error.HTTPError as exc:
         try:
             detail = json.load(exc)
-            message = (detail.get("error") or {}).get("message") or detail.get("message")
-        except ValueError:
+            error = detail.get("error") if isinstance(detail.get("error"), dict) else detail
+            code = error.get("code") or error.get("type")
+            message = error.get("message")
+            # The code tells a content-policy refusal (moderation_blocked) from a bad request.
+            message = ": ".join(str(part) for part in (code, message) if part) or None
+        except (ValueError, AttributeError):
             message = None
         raise SystemExit(f"error: image request failed (HTTP {exc.code}): {message or exc.reason}")
     except (urllib.error.URLError, TimeoutError, ValueError) as exc:

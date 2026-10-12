@@ -9,6 +9,9 @@
 
 ### 技能
 
+- `scroll-gesture` 1.1.0：过界翻页只停原位、接缝、邻页三处，第二段按带衰减的力度阈值确认，轻滑弹回接缝；替换“停在哪就留在哪”的旧规则，它会让短滑卡在两页之间。测试补“轻而慢的输入不翻页”。
+- `openai-image-gen` 2.1.0：HTTP 错误带上网关的错误码（如 `moderation_blocked`）；被内容规则拒绝时如实告知用户，改写重试要说明改了什么。
+
 - `delegate` 5.28.1：测量预约开始时迁移既有 lane 进程树到其余核，释放时恢复亲和性；`measure.jsonl` 记录迁移持有者与进程数。
 
 - `delegate` 5.28.0：新增机器级测量预约（`measure`/`measureCpus`、`lane --measure`、自动命令 shim、预约核亲和性与 `measure.jsonl` 记录），并在验收或说明命中 `agentDeny` 时警告主控且保留启动。

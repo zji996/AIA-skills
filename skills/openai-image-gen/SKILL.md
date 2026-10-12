@@ -3,7 +3,7 @@ name: openai-image-gen
 description: 需要生成配图、Banner、图标、架构总览、产品插图或 UI/游戏素材并保存为本地文件时使用；先用便宜模型打草稿，确认构图后出一次正式图，按输出文件限定次数控制费用，只输出一行结果 JSON。Use to generate image assets, diagrams, illustrations, banners or icons to disk.
 license: MIT
 metadata:
-  version: "2.0.0"
+  version: "2.1.0"
 ---
 
 # OpenAI Image Generation (本地图像生成)
@@ -34,7 +34,7 @@ $G status -o docs/img/arch.webp
 - **`reset`**：只在同一路径要做一张新图时使用，不能用来绕过上限。
 - **结果**：一行 JSON，包含 `file`、`budget`，以及给出下一步的 `next`。草稿和状态存放在 `$XDG_STATE_HOME/openai-image-gen/` 下，不进项目目录。
 - **实际尺寸与格式**：`returned` 是图片的实际格式和尺寸。有的网关会忽略 `size` 和格式，这时结果带 `warning`：HTML 里的 width/height 要按实际尺寸写，需要特定格式时自行转换。
-- **失败**：退出码为 1，错误写在 stderr，已有的目标文件保持不动，也不计次数。
+- **失败**：退出码为 1，错误写在 stderr，已有的目标文件保持不动，也不计次数。`moderation_blocked` 是内容规则拒绝：告诉用户被拒了；改写得更含蓄再试时，说明改了哪些要求，不要悄悄降级。
 
 ## 要点
 

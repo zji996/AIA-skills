@@ -190,6 +190,9 @@ class ImagegenTests(unittest.TestCase):
         failed = self.run_cmd("final", "-o", self.output, "-b", self.base)
         self.assertIn("rejected", failed.stderr)
         self.assertEqual(self.output.read_bytes(), b"original")
+        self.server(400, {"error": {"code": "moderation_blocked", "message": "Your request was rejected by the safety system."}})
+        refused = self.run_cmd("final", "-o", self.output, "-b", self.base)
+        self.assertIn("(HTTP 400): moderation_blocked: Your request was rejected", refused.stderr)
         self.assertEqual(self.ok("status", "-o", self.output)["budget"]["finals"], "0/1")
 
     def test_prompt_and_option_validation(self):
