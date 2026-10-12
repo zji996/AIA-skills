@@ -243,6 +243,80 @@ class ImagegenTests(unittest.TestCase):
         self.ok("final", "-o", other, "-p", "Other, with crisp labels.", "-b", self.base)
         self.assertEqual(len(handler.requests), 4)
 
+    def ref(self, name, color=b"\xff\x80\x00"):
+        row = b"\x00" + color * 16
+        chunk = lambda kind, data: (len(data).to_bytes(4, "big") + kind + data
+                                    + zlib.crc32(kind + data).to_bytes(4, "big"))
+        path = self.work / "cast" / name / "sheet.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", (16).to_bytes(4, "big") * 2 + bytes([8, 2, 0, 0, 0]))
+                         + chunk(b"IDAT", zlib.compress(row * 16)) + chunk(b"IEND", b""))
+        return path
+
+    def images_sent(self, request):
+        return re.findall(rb'name="image\[\]"; filename="([^"]+)"', request["data"]["_raw"])
+
+    def test_reference_images_keep_characters_from_draft_to_final_and_edit(self):
+        handler = self.server()
+        he, she = self.ref("he"), self.ref("she", b"\x00\x40\xff")
+        draft = self.draft("-s", "2560x1440", "--ref", he, "-r", she)
+        request = handler.requests[0]
+        self.assertEqual(request["path"], "/v1/images/edits")
+        self.assertEqual(self.images_sent(request), [b"sheet.png", b"sheet.png"])
+        self.assertIn(he.read_bytes(), request["data"]["_raw"])
+        self.assertIn("image 1 (he/sheet.png), image 2 (she/sheet.png)", request["data"]["prompt"])
+        self.assertTrue(request["data"]["prompt"].rstrip().endswith("wider than tall."))
+        self.assertEqual(draft["references"], [str(he), str(she)])
+
+        final = self.ok("final", "-o", self.output, "-b", self.base)
+        request = handler.requests[1]
+        self.assertEqual([name.split(b".")[0] for name in self.images_sent(request)], [b"draft-1", b"sheet", b"sheet"])
+        self.assertIn("first attached image is the approved draft", request["data"]["prompt"])
+        self.assertIn("image 2 (he/sheet.png), image 3 (she/sheet.png)", request["data"]["prompt"])
+        self.assertEqual(final["references"], [str(he), str(she)])
+        self.assertNotIn("changed since", final.get("warning", ""))
+
+        he.write_bytes(self.ref("other").read_bytes() + b"\x00")
+        edited = self.ok("edit", "-o", self.output, "-p", "Only change: add a red scarf.", "-b", self.base)
+        self.assertEqual(self.images_sent(handler.requests[2]), [b"before-edit-1.webp", b"sheet.png", b"sheet.png"])
+        self.assertIn("changed since", edited["warning"])
+
+    def test_references_change_what_counts_as_the_same_draft(self):
+        handler = self.server()
+        self.draft()
+        self.draft("--ref", self.ref("he"))
+        self.assertEqual(len(handler.requests), 2)
+        again = self.run_cmd("draft", "-o", self.output, "-f", "-", "-r", self.ref("he"), "-b", self.base,
+                             input=self.prompt)
+        self.assertEqual(again.returncode, 3)
+        self.assertIn("prompt, size and references", json.loads(again.stdout)["reason"])
+
+    def test_final_refuses_when_a_drafts_reference_is_gone_and_accepts_a_new_one(self):
+        handler = self.server()
+        he = self.ref("he")
+        self.draft("--ref", he)
+        he.unlink()
+        gone = self.run_cmd("final", "-o", self.output, "-b", self.base)
+        self.assertEqual(gone.returncode, 3)
+        self.assertIn("pass --ref again", json.loads(gone.stdout)["reason"])
+        self.assertEqual(self.ok("status", "-o", self.output)["budget"]["finals"], "0/1")
+        self.ok("final", "-o", self.output, "--fresh", "--ref", self.ref("she"), "-b", self.base)
+        self.assertEqual(self.images_sent(handler.requests[-1]), [b"sheet.png"])
+        self.assertIn("image 1 (she/sheet.png)", handler.requests[-1]["data"]["prompt"])
+
+    def test_reference_validation(self):
+        self.server()
+        not_image = self.work / "notes.txt"
+        not_image.write_text("hello")
+        for refs, message in [(["missing.png"], "not found"), ([not_image], "png, webp or jpeg"),
+                              ([self.ref("he")] * 9, "at most 8")]:
+            with self.subTest(message=message):
+                args = [arg for ref in refs for arg in ("--ref", ref)]
+                result = self.run_cmd("draft", "-o", self.output, "-p", "x", *args, "-b", self.base)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(message, result.stderr)
+        self.assertEqual(self.ok("status", "-o", self.output)["budget"]["drafts"], "0/3")
+
     def test_budgets_are_per_output_path(self):
         self.server()
         self.draft()

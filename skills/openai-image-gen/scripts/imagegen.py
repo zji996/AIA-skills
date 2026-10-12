@@ -23,7 +23,8 @@ from pathlib import Path
 DRAFT_MODEL, DRAFT_QUALITY, DRAFT_LONG_EDGE = "gpt-image-2.5-flare", "low", 1536
 FINAL_MODEL, FINAL_QUALITY = "gpt-image-2.5-sunburst", "high"
 BUDGET = {"drafts": 3, "finals": 1, "edits": 1}
-LAYOUT_LOCK = ("\n\nThe attached image is the approved draft. Use it only as the layout reference: keep its "
+MAX_REFS, MAX_REF_BYTES = 8, 20 * 2**20
+LAYOUT_LOCK = ("\n\nThe first attached image is the approved draft. Use it only as the layout reference: keep its "
                "composition, element positions and arrows. Render everything at full quality, with crisp, "
                "exactly spelled text as listed above.")
 
@@ -203,7 +204,7 @@ def multipart(fields, files):
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
-def request_image(args, *, model, quality, size, prompt, fmt, reference=None, shape=None):
+def request_image(args, *, model, quality, size, prompt, fmt, references=(), shape=None):
     """The image bytes and what the gateway says it rendered (quality, size, format).
 
     `shape` is the requested final size, whose orientation the prompt states; a draft's
@@ -213,8 +214,8 @@ def request_image(args, *, model, quality, size, prompt, fmt, reference=None, sh
               "quality": quality, "output_format": fmt, "n": 1}
     if getattr(args, "compression", None) is not None:
         fields["output_compression"] = args.compression
-    if reference:
-        body, content_type = multipart(fields, [("image[]", reference)])
+    if references:
+        body, content_type = multipart(fields, [("image[]", path) for path in references])
         url = f"{base_url}/v1/images/edits"
     else:
         body, content_type = json.dumps(fields).encode(), "application/json"
@@ -335,6 +336,51 @@ def pick_draft(state, number):
     return pick, chosen
 
 
+def reference_entries(paths):
+    """Validated --ref images with their digests, so a changed file is noticed later."""
+    if len(paths) > MAX_REFS:
+        raise SystemExit(f"error: at most {MAX_REFS} reference images")
+    entries = []
+    for value in paths:
+        path = Path(value)
+        if not path.is_file():
+            raise SystemExit(f"error: reference image not found: {value}")
+        data = path.read_bytes()
+        if sniff(data)[0] == "unknown":
+            raise SystemExit(f"error: reference must be a png, webp or jpeg image: {value}")
+        if len(data) > MAX_REF_BYTES:
+            raise SystemExit(f"error: reference image over {MAX_REF_BYTES >> 20} MB: {value}")
+        entries.append({"file": str(path.resolve()), "sha256": hashlib.sha256(data).hexdigest()})
+    return entries
+
+
+def inherited_references(entries):
+    """References recorded with a draft or image, plus a warning for any that changed on disk since."""
+    changed = [e["file"] for e in entries
+               if not Path(e["file"]).is_file() or hashlib.sha256(Path(e["file"]).read_bytes()).hexdigest() != e["sha256"]]
+    missing = [f for f in changed if not Path(f).is_file()]
+    if missing:
+        raise Refusal(f"reference images used before are gone: {', '.join(missing)}; pass --ref again")
+    note = f"reference images changed since they were used: {', '.join(changed)}" if changed else None
+    return entries, note
+
+
+def reference_note(entries, first):
+    """Prompt text that tells the model what the attached reference images are for."""
+    if not entries:
+        return ""
+    names = ", ".join(f"image {first + i} ({Path(e['file']).parent.name}/{Path(e['file']).name})"
+                      for i, e in enumerate(entries))
+    return (f"\n\nReference images: {names}. They show subjects that must stay consistent: keep each one's "
+            "identity exactly as shown (face, hairstyle, body shape, outfit, colours and signature items). Take "
+            "composition, pose, camera, lighting and background only from the description above; do not copy "
+            "a reference's layout, plain background, labels or multiple views.")
+
+
+def reference_view(entries):
+    return [e["file"] for e in entries]
+
+
 # --- commands ---------------------------------------------------------------------------
 
 def cmd_draft(args, state):
@@ -342,10 +388,13 @@ def cmd_draft(args, state):
     if not prompt:
         raise SystemExit("error: draft needs a non-empty --prompt or --prompt-file")
     width, height = parse_size(args.size or state["size"] or "1536x1024")
+    refs = reference_entries(args.ref or [])
+    digests = [e["sha256"] for e in refs]
     for earlier in state["drafts"]:
-        if earlier.get("size", state["size"]) == f"{width}x{height}" and same_prompt(draft_prompt(earlier), prompt):
-            raise Refusal(f"draft {earlier['n']} already used this prompt and size ({earlier['file']}); nothing was "
-                          f"sent. Change the prompt, or keep or final draft {earlier['n']}.")
+        if (earlier.get("size", state["size"]) == f"{width}x{height}" and same_prompt(draft_prompt(earlier), prompt)
+                and [e["sha256"] for e in earlier.get("refs", [])] == digests):
+            raise Refusal(f"draft {earlier['n']} already used this prompt, size and references ({earlier['file']}); "
+                          f"nothing was sent. Change the prompt, or keep or final draft {earlier['n']}.")
     spend(state, "drafts", args.allow_extra)
     state["size"] = f"{width}x{height}"
     number = len(state["drafts"]) + 1
@@ -353,15 +402,17 @@ def cmd_draft(args, state):
     started = time.monotonic()
     size = draft_size(width, height)
     quality = args.quality or DRAFT_QUALITY
-    data, echo = request_image(args, model=args.model or DRAFT_MODEL, quality=quality,
-                               size=size, prompt=prompt, fmt="webp", shape=state["size"])
+    data, echo = request_image(args, model=args.model or DRAFT_MODEL, quality=quality, size=size,
+                               prompt=prompt + reference_note(refs, 1), fmt="webp", shape=state["size"],
+                               references=reference_view(refs))
     got = sniff(data)[0]
     file = directory / f"draft-{number}.{'jpg' if got == 'jpeg' else got}"
     write_atomic(file, data)
     (directory / f"draft-{number}.prompt.txt").write_text(prompt, encoding="utf-8")
-    state["drafts"].append({"n": number, "file": str(file), "size": state["size"]})
+    state["drafts"].append({"n": number, "file": str(file), "size": state["size"], "refs": refs})
     save_state(args.output, state)
-    emit(status="ok", step="draft", draft=number, file=str(file), seconds=round(time.monotonic() - started),
+    extra = {"references": reference_view(refs)} if refs else {}
+    emit(status="ok", step="draft", draft=number, file=str(file), seconds=round(time.monotonic() - started), **extra,
          **returned(data, "webp", size, echo, quality), budget=budget_view(state),
          next=f"Review the draft for layout, arrows and text. If it already looks finished, keep it for free: "
               f"keep -o {args.output} --draft {number}. If only the render quality falls short: final -o "
@@ -378,23 +429,31 @@ def cmd_final(args, state):
         raise Refusal(f"this gateway renders every request at low quality, so a final with draft {pick}'s own prompt "
                       f"would return a copy of it; nothing was sent. Keep it: keep -o {args.output} --draft {pick}; "
                       "or pass a changed prompt, or --fresh for a new composition.")
+    # The draft's references carry over, so the final keeps the same characters.
+    refs, note = (reference_entries(args.ref), None) if args.ref else inherited_references(chosen.get("refs", []))
     spend(state, "finals", args.allow_extra)
     fmt = image_format(args.output, args.format)
     started = time.monotonic()
     size = checked_size(args.size) or state["size"]
     quality = args.quality or FINAL_QUALITY
+    layout = [] if args.fresh else [chosen["file"]]
     data, echo = request_image(args, model=args.model or FINAL_MODEL, quality=quality,
                                size=size, fmt=fmt,
-                               prompt=prompt if args.fresh else prompt + LAYOUT_LOCK,
-                               reference=None if args.fresh else chosen["file"])
+                               prompt=(prompt if args.fresh else prompt + LAYOUT_LOCK) + reference_note(refs, len(layout) + 1),
+                               references=layout + reference_view(refs))
     write_atomic(args.output, data)
     if args.keep_prompt:
         Path(args.output).with_suffix(".prompt.txt").write_text(prompt, encoding="utf-8")
     state["finals"] += 1
-    state["prompt"] = prompt
+    state["prompt"], state["refs"] = prompt, refs
     save_state(args.output, state)
+    info = returned(data, fmt, size, echo, quality)
+    if note:
+        info["warning"] = " ".join(filter(None, [info.get("warning"), note]))
+    if refs:
+        info["references"] = reference_view(refs)
     emit(status="ok", step="final", file=args.output, from_draft=pick, seconds=round(time.monotonic() - started),
-         **returned(data, fmt, size, echo, quality), budget=budget_view(state),
+         **info, budget=budget_view(state),
          next="Check every text string at full size and the arrows. For one local defect: edit -o "
               f"{args.output} -f fix.txt (one edit allowed). Otherwise report the remaining flaws.")
 
@@ -412,7 +471,7 @@ def cmd_keep(args, state):
     prompt = draft_prompt(chosen)
     if args.keep_prompt:
         Path(args.output).with_suffix(".prompt.txt").write_text(prompt, encoding="utf-8")
-    state["kept"], state["prompt"] = pick, prompt
+    state["kept"], state["prompt"], state["refs"] = pick, prompt, chosen.get("refs", [])
     save_state(args.output, state)
     emit(status="ok", step="keep", file=args.output, from_draft=pick, **returned(Path(args.output).read_bytes(),
          fmt, state["size"], {}, "auto"), budget=budget_view(state),
@@ -429,6 +488,7 @@ def cmd_edit(args, state):
     if same_prompt(prompt, state.get("prompt")):
         raise Refusal("an edit must say what to change; this is the prompt the image was made from, "
                       "and the gateway would return a copy. Nothing was sent.")
+    refs, note = (reference_entries(args.ref), None) if args.ref else inherited_references(state.get("refs", []))
     spend(state, "edits", args.allow_extra)
     directory = state_dir(args.output)
     directory.mkdir(parents=True, exist_ok=True)
@@ -437,13 +497,17 @@ def cmd_edit(args, state):
     started = time.monotonic()
     size, fmt = checked_size(args.size) or state["size"], image_format(args.output, args.format)
     quality = args.quality or FINAL_QUALITY
-    data, echo = request_image(args, model=args.model or FINAL_MODEL, quality=quality,
-                               size=size, prompt=prompt, fmt=fmt, reference=str(before))
+    data, echo = request_image(args, model=args.model or FINAL_MODEL, quality=quality, size=size,
+                               prompt=prompt + reference_note(refs, 2), fmt=fmt,
+                               references=[str(before)] + reference_view(refs))
     write_atomic(args.output, data)
     state["edits"] += 1
     save_state(args.output, state)
+    info = returned(data, fmt, size, echo, quality)
+    if note:
+        info["warning"] = " ".join(filter(None, [info.get("warning"), note]))
     emit(status="ok", step="edit", file=args.output, previous=str(before),
-         seconds=round(time.monotonic() - started), **returned(data, fmt, size, echo, quality), budget=budget_view(state),
+         seconds=round(time.monotonic() - started), **info, budget=budget_view(state),
          next="Compare with the previous version; keep whichever is better. No further edits without approval.")
 
 
@@ -486,6 +550,9 @@ def main(argv=None):
             command.add_argument("--draft", type=int, help="draft number to render (default: latest)")
             command.add_argument("--fresh", action="store_true", help="do not use the draft as layout reference")
             command.add_argument("--keep-prompt", action="store_true", help="save <output>.prompt.txt next to it")
+        command.add_argument("-r", "--ref", action="append", metavar="IMAGE",
+                             help=f"reference image of a subject to keep consistent, e.g. a character sheet "
+                                  f"(repeatable, at most {MAX_REFS}); final and edit default to the draft's")
         command.add_argument("-s", "--size", help="final WxH (default 1536x1024); drafts are scaled down")
         command.add_argument("-q", "--quality", choices=["low", "medium", "high", "xhigh", "max"])
         command.add_argument("-m", "--model")

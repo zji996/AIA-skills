@@ -6,6 +6,7 @@
 - 做一组 1024 的游戏道具图标素材。
 - Generate a cover image for this blog post and save it under assets/.
 - 给这份设计文档生成一张带中文标签的架构总览图，放到 `docs/explainers/` 下。
+- 按这张角色设定图，生成 MV 第三个分镜的场景画面，人物要和设定图一致。
 
 ## 不应触发
 
