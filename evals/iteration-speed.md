@@ -10,6 +10,8 @@
 - Python 测试启动很慢，量一下导入时间、上次失败用例和并行测试的耗时。
 - 热缓存全量门禁涨到 25 分钟才发现；设预算并定位最慢的测试，量依赖优化与增量编译后再改 profile。
 - Enforce a ten-minute full gate budget and warn when its duration regresses against recent successful runs.
+- 门禁只记了总时间，看不出哪一步慢；改了文档也要把数据库测试重跑一遍，能不能复用上次的结果。
+- Record each gate step and skip steps whose inputs did not change since they last passed.
 
 ## 不应触发
 

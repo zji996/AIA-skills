@@ -2,7 +2,7 @@
 name: iteration-speed
 description: 新机器或新仓库初始化、构建/测试/门禁变慢、设置门禁预算、多个 worktree 或 Agent 并行开发、决定验收分层或模块拆分时使用；测量反馈回路、监测门禁预算、探测缓存并配置用户级 Rust 加速。Use when initializing a machine/repository, diagnosing slow build/test gates, enforcing gate budgets, sharing caches across worktrees or parallel agents, or choosing validation layers and module boundaries.
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
 ---
 
 # 仓库迭代速度
@@ -18,11 +18,13 @@ metadata:
 5. **缩小重编/重测范围**：依赖链上游的大模块改一处会带动下游；结合最长链、各段时间和实际修改频率，测过有收益再拆，不为“解耦”预先拆分。
 6. **测试本身**：只跑受影响的测试，慢测试分组；并行度按整机容量设置。链接或启动占主导时合并碎测试二进制/入口；共享状态与隔离损失可能抵消收益，须复测。
 7. **门禁预算**：完整门禁设耗时预算，用 `gate` 跑；超预算即排优化，先量最慢的步骤或测试，再按上述判断点改动并复测。
+8. **能读就不重跑**：门禁的每一步都用 `step` 包起来，耗时逐步留档；输入与上次通过时相同的步骤直接复用结果。只有总时间、没有分步记录时，无法判断慢在哪。
 
 ## 工具与按需参考
 
 在目标仓库运行 `<本技能目录>/scripts/iteration-speed detect`，只读报告现状；静态探测的未解析项需人工确认。
 用 `time -- <命令>` 记录耗时，`history` 查看最近 20 条；日志不应包含凭据。
+用 `step --name <步骤> [--include 路径] [--exclude 路径] [--key "rustc -V"] [--force] -- <命令>` 跑门禁里的一步：输入摘要取自 git（跟踪文件的 blob、改动与未跟踪文件的内容哈希，按路径范围），`--key` 的命令输出（工具版本、宿主事实）也进键；同仓库同名步骤上次以相同输入与键通过就打印 `reused` 并跳过，失败从不复用，`ITERATION_SPEED_FORCE=1` 全部重跑。记录在用户级 `steps.jsonl`，按仓库根提交识别，跨 clone 与 worktree 共用，只存步骤名、摘要、退出码与秒数；`steps` 列出每步最近一次与近 5 次通过的中位数。
 用 `gate --name full --budget 10m -- <命令>` 运行门禁（需 Python 3），预算支持秒数或 `ms/s/m/h/d`，可组合如 `1m30s`。
 省略 `--budget` 时读取仓库根 `.iteration-speed.json`，例如 `{"gates":{"full":"10m"}}`；名称默认 `default`，无预算只记录。
 命令退出码透传；命令成功但超预算返回 3。相较同名门禁最近最多 5 次命令成功记录的中位数慢超过 30% 时提示回退，不另改退出码。

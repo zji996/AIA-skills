@@ -303,6 +303,50 @@ class IterationSpeedTests(unittest.TestCase):
         self.assertNotEqual(self.run_script("time", "--").returncode, 0)
         self.assertFalse((self.root / "state").exists())
 
+    def git_init(self):
+        for args in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "first"]):
+            subprocess.run(["git", *args], cwd=self.repo, env=self.env, check=True, capture_output=True)
+
+    def test_step_reuses_a_pass_only_for_identical_scoped_inputs(self):
+        self.write("src/lib.rs", "fn a() {}\n")
+        self.write("docs/a.md", "doc\n")
+        self.write(".gitignore", "target/\n")
+        self.git_init()
+        counter = self.root / "runs"
+        run = ["step", "--name", "rust", "--exclude", "docs/", "--key", "echo v1", "--",
+               "sh", "-c", f"echo x >> {counter}; printf SECRET_OUTPUT"]
+        first = self.run_script(*run)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("rust exit=0", first.stderr)
+        self.assertIn("reused", self.run_script(*run).stderr)
+        self.write("docs/a.md", "changed doc\n")          # out of scope: still reused
+        self.assertIn("reused", self.run_script(*run).stderr)
+        self.write("target/out", "ignored build output\n")  # ignored: still reused
+        self.assertIn("reused", self.run_script(*run).stderr)
+        self.write("src/lib.rs", "fn b() {}\n")            # dirty edit in scope: rerun
+        self.assertNotIn("reused", self.run_script(*run).stderr)
+        self.write("src/new.rs", "fn c() {}\n")            # untracked file in scope: rerun
+        self.assertNotIn("reused", self.run_script(*run).stderr)
+        self.assertIn("reused", self.run_script(*run).stderr)
+        changed_key = [*run[:6], "echo v2", *run[7:]]
+        self.assertNotIn("reused", self.run_script(*changed_key).stderr)
+        self.assertNotIn("reused", self.run_script(*changed_key[:7], "--force", *changed_key[7:]).stderr)
+        self.assertEqual(len(counter.read_text().splitlines()), 5)
+        failing = ["step", "--name", "flaky", "--", "sh", "-c", "exit 4"]
+        self.assertEqual(self.run_script(*failing).returncode, 4)
+        self.assertEqual(self.run_script(*failing).returncode, 4)   # failures are never reused
+        log = self.root / "state/iteration-speed/steps.jsonl"
+        text = log.read_text()
+        self.assertNotIn("SECRET_OUTPUT", text)
+        self.assertNotIn("sh -c", text)
+        self.assertNotIn("lib.rs", text)
+        with log.open("a") as file:
+            file.write("not json\n")
+        report = self.run_script("steps")
+        self.assertEqual(report.returncode, 0, report.stderr)
+        self.assertIn("rust\t", report.stdout)
+        self.assertIn("flaky\t", report.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
