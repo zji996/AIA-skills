@@ -42,6 +42,7 @@ debug = "line-tables-only"
 该字符串值要求 Rust 1.71+；应遵守项目 MSRV。
 `cargo test -p <包>` 用于迭代，跨包契约改变时补下游测试。
 固定 build/test 或 check 模式；不同模式、profile/features 可能重编依赖。
+`-p` 选的包不同，依赖的 feature 合并结果就不同：门禁里分开调用 `cargo test -p A --features x`、`cargo test -p B …` 会把共享 crate 和下游各编一份（实测一个仓库每次改动把核心 crate 编三遍，数据库测试预构建 307 s）。同一门禁的各次调用保持相同的包选择与 feature 组合，空的标记 feature 也要一致。`resolver.feature-unification = "workspace"` 到 Cargo 1.97 仍需 `-Z`（配置文件里会提示被忽略，环境变量则静默无效），稳定前别指望它。
 必要时用户级设置独立 `CARGO_TARGET_DIR`，再比较空间和时间成本。
 依赖链最长路径标出传播范围；实际编译成本决定时间，长度不是耗时。
 `tests/*.rs` 通常各自生成二进制；链接占主导时用单一入口加子模块组织测试。

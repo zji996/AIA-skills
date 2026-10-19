@@ -2,7 +2,7 @@
 name: iteration-speed
 description: 新机器或新仓库初始化、构建/测试/门禁变慢、设置门禁预算、多个 worktree 或 Agent 并行开发、决定验收分层或模块拆分时使用；测量反馈回路、监测门禁预算、探测缓存并配置用户级 Rust 加速。Use when initializing a machine/repository, diagnosing slow build/test gates, enforcing gate budgets, sharing caches across worktrees or parallel agents, or choosing validation layers and module boundaries.
 metadata:
-  version: "1.2.0"
+  version: "1.2.1"
 ---
 
 # 仓库迭代速度
