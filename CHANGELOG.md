@@ -9,6 +9,7 @@
 
 ### 技能
 
+- `repo-governance` 3.3.0：新增“合并 ADR”一节与 `adr-archive.py`：被并入的修订移进 `history/`，状态改为 Superseded 并链接主 ADR，按真实位置重算全仓 Markdown/HTML 相对链接，追加历史索引行；默认只打印计划。起因：一次把 17 份修订并入 9 份主 ADR，手工改链接容易漏。
 - `openai-image-gen` 2.4.0：草稿默认改用 `gpt-image-2.5-sunburst`、medium 质量（原为 flare、low），正式图仍是 sunburst、high；要省钱时 `-m gpt-image-2.5-flare -q low`。起因：做 MV 分镜时草稿通常直接采用，画质比单价重要。
 - `repo-governance` 3.2.0：新增“经验不膨胀”一节：经验先改成脚本或默认值；经验手册只写可复用的判断规则、新条目替换旧条目并设预算；内容生产类仓库的单个作品构思放作品目录。起因：VAE-MV 的导演手册按踩坑顺序追加，案例越写越长。
 - `openai-image-gen` 2.3.0：`draft`/`final`/`edit` 支持可重复的 `-r/--ref` 参考图（最多 8 张），走 edits 接口并在提示词末尾注明每张图的编号、文件名和“只保持身份、构图按文字”；草稿记录参考图摘要，正式图、`keep` 与编辑默认沿用，文件变动给警告、缺失则拒绝；相同提示词但参考图不同的草稿不再算重复。起因：做 MV 分镜需要同一角色在十几张图里保持一致。

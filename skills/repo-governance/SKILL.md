@@ -3,7 +3,7 @@ name: repo-governance
 description: 仓库上下文治理。当需要搭建或整理 AGENTS.md、docs/current.md、决策记录、待收敛清单，或检查 token 预算、上下文健康度、文档漂移时使用；附带只读审计脚本。Use for repo context governance, token budget, context health, docs drift audit, provisional/convergence register.
 license: MIT
 metadata:
-  version: "3.2.0"
+  version: "3.3.0"
 ---
 
 # Repo Governance (仓库上下文治理)
@@ -30,6 +30,20 @@ metadata:
 ```
 
 决策目录（`docs/decision`、`docs/decisions` 或 `docs/adr`）的 `INDEX.md` 里用 `<!-- adr-index:start -->` 与 `<!-- adr-index:end -->` 包住表格后，表格由各 ADR 的一级标题与第一条"状态/Status"行生成：不带参数只核对（过期退出 1），`--write` 重写标记之间的内容，标记外的文字保持不变。改状态改 ADR 文件本身，索引不再手写，也就不会两处不一致。
+
+## 合并 ADR
+
+修订一份接一份叠在主 ADR 上，读者要拼好几份才知道现行规则。按领域原地并入、保留主编号：
+
+1. 先把修订的现行内容写进主 ADR，**以代码与运行配置为准**逐条核对（顺序、路径、默认值），各条原批准日期保留；主文开头加一行“某日第二轮合并：并入 X、Y”。
+2. 机械部分交给脚本：
+
+   ```bash
+   <本技能目录>/scripts/adr-archive.py [--write] 0088=0079,0080 0092=0081
+   ```
+
+   默认只打印计划；`--write` 把被并入的 ADR 移进 `history/`，状态行改为 Superseded 并链接到吸收它的主 ADR，按真实位置重算被移动文件内和全仓 Markdown/HTML 里指向它们的相对链接，`history/INDEX.md` 有表格时追加行。
+3. 再跑 `adr-index.py --write` 与审计，`rg 'ADR <编号>'` 把入口文件、`docs/current.md` 与参考文档里的纯文本引用改指主 ADR；代码注释里的旧编号仍能在 history 查到，可以不动。
 
 ## 待收敛清单
 

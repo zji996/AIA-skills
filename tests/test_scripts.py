@@ -24,6 +24,7 @@ SNAPSHOT = ROOT / "skills/agent-handoff/scripts/handoff-snapshot.sh"
 AUDIT = ROOT / "skills/repo-governance/scripts/audit-context.py"
 BACKGROUND_HOOK = ROOT / "skills/delegate/hooks/claude-code-background.py"
 ADR_INDEX = ROOT / "skills/repo-governance/scripts/adr-index.py"
+ADR_ARCHIVE = ROOT / "skills/repo-governance/scripts/adr-archive.py"
 
 
 class ScriptTests(unittest.TestCase):
@@ -705,6 +706,40 @@ class ScriptTests(unittest.TestCase):
         self.assertTrue(text.startswith("# Index\n\nintro\n") and text.endswith("\ntail\n"))
         self.assertEqual(self.run_script(ADR_INDEX, "--repo", repo).returncode, 0)
         self.assertEqual(self.run_script(AUDIT, "--repo", repo).returncode, 0)
+
+    def test_adr_archive_moves_marks_and_relinks(self):
+        repo = self.git_repo()
+        adr = repo / "docs/decision"
+        (adr / "history").mkdir(parents=True)
+        (repo / "docs/reference").mkdir()
+        (adr / "0010-main.md").write_text("# 0010：主\n\n状态：Accepted\n\n见 [0011](0011-amend.md#决策)。\n")
+        (adr / "0012-other.md").write_text("# 0012：另一\n\n状态：Accepted\n")
+        (adr / "0011-amend.md").write_text(
+            "# 0011：修订\n\n状态：Accepted（2026-10-01）\n\n修订 [0010](0010-main.md)，"
+            "参考 [x](../reference/x.md)、[web](https://example.com/a.md)。\n")
+        (adr / "history/0001-old.md").write_text("# 0001：旧\n\n状态：Superseded\n")
+        (adr / "history/INDEX.md").write_text("| 旧 ADR | 原状态 | Superseded by |\n| --- | --- | --- |\n| 0001 旧 | Accepted | 0010 |\n\n尾注\n")
+        (repo / "docs/reference/x.md").write_text("[a](../decision/0011-amend.md) [b](../decision/0010-main.md)\n")
+        (repo / "docs/page.html").write_text('<a href="decision/0011-amend.md#k">k</a>\n')
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+        dry = self.run_script(ADR_ARCHIVE, "--repo", repo, "11=10,12")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn("dry run", dry.stdout)
+        self.assertTrue((adr / "0011-amend.md").exists())
+        self.assertEqual(self.run_script(ADR_ARCHIVE, "--repo", repo, "11=11").returncode != 0, True)
+        done = self.run_script(ADR_ARCHIVE, "--repo", repo, "--write", "11=10,12")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        moved = (adr / "history/0011-amend.md").read_text()
+        self.assertIn("状态：Superseded（原状态：Accepted（2026-10-01）；并入 [ADR 0010](../0010-main.md)、[ADR 0012](../0012-other.md)）", moved)
+        self.assertIn("修订 [0010](../0010-main.md)", moved)
+        self.assertIn("[x](../../reference/x.md)", moved)
+        self.assertIn("(https://example.com/a.md)", moved)
+        self.assertIn("[0011](history/0011-amend.md#决策)", (adr / "0010-main.md").read_text())
+        self.assertEqual((repo / "docs/reference/x.md").read_text(),
+                         "[a](../decision/history/0011-amend.md) [b](../decision/0010-main.md)\n")
+        self.assertIn('href="decision/history/0011-amend.md#k"', (repo / "docs/page.html").read_text())
+        index = (adr / "history/INDEX.md").read_text()
+        self.assertIn("| 0001 旧 | Accepted | 0010 |\n| 0011 修订 | Accepted（2026-10-01） | 0010、0012 |\n\n尾注", index)
 
 
 if __name__ == "__main__":

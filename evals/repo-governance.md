@@ -9,6 +9,8 @@
 - 之前很多命名和规则是 Agent 凑合写的，给它们打个标，之后统一收敛。
 - Flag the provisional hacks in this repo so we can converge them later.
 - 这个视频制作仓库的经验文档越写越长，怎么沉淀才不会无限膨胀？
+- 决策记录一份修订接一份，帮我把修订并进主 ADR 并归档。
+- Merge these amendment ADRs into the main ones and archive them.
 
 ## 不应触发
 
