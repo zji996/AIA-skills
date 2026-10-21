@@ -10,7 +10,7 @@
 
 每轮的会话都属于自己的 run：Pi 保存在 run 目录的 `session/` 下，Codex 使用自己的会话存储，`summary.json` 的 `session` 记下会话 id。`reply` 在每次尝试时从上一轮的会话**分叉**（Pi `--fork` 上一轮会话文件的副本，Codex `exec fork`），会话不被改动：答复畸形重跑时从同一处重新开始，清理早先的轮次也不影响后续追问。apply 后 worktree 删除，记录移到 `.applied/<run_id>/`，保留 7 天供 `reply` 续做。结局为 `malformed` 的轮次不算对话的延续，之后的 `reply` 与 `apply` 都从它的上一轮接着。4.1 之前的 run 使用 `--no-session`，不能 `reply`。
 
-写入任务上一轮为 `timeout` 时，下一次 reply 记 `meta.continuation: "timeout"`、`rework.kind: "continuation"`，不消耗 maxRework，超限也允许续做，改动超过 minor 的 60 行仍不补计。连续超时可以连续续做；rejected 等结局后仍按原返工规则。超时结论的 `next` 是可直接复制的续做命令，缺失会话自动带 `--fresh`，自然语言结论注明“不计返工次数”。
+写入任务上一轮为 `timeout`、`stalled` 或 `stopped` 时，下一次 reply 记 `meta.continuation`（上一轮状态）与 `rework.kind: "continuation"`，不消耗 maxRework，超限也可续做，改动超过 60 行也不补计。连续超时可以连续续做；rejected 等结局后仍按原返工规则。超时结论的 `next` 是可直接复制的续做命令，缺失会话自动带 `--fresh`，自然语言结论注明“不计返工次数”。
 
 ## 位置
 

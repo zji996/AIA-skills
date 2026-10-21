@@ -27,7 +27,7 @@
 
 `delegate` 架构总览：[docs/assets/delegate-architecture.webp](docs/assets/delegate-architecture.webp)（提示词同目录）。
 
-`delegate` 5.28.1：测量预约开始时迁移既有 lane 进程树到其余核，释放时恢复亲和性，并在 `measure.jsonl` 记录迁移持有者与进程数。
+`delegate` 5.28.2：被主控 `stop` 中断的写入任务与超时、停滞一样，`reply` 续做不计返工次数。
 
 `delegate` 5.27.1：取消 agent 默认 timeout，加入 idle/command stall guard 与 Claude Code 50 分钟 check-in（Pi 与 Codex 相同）；配置支持 `stall`/`checkIn`。
 

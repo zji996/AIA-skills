@@ -20,7 +20,7 @@
 | 几路写入任务并行改同一个 app | 各开 `--worktree`，并用 `--protect` 把别路负责的文件划出去，冲突在 `apply` 前就暴露；合并后跑一次仓库级全量检查 |
 | 验收通过，合并后仓库级检查失败 | 验收只覆盖单个 app，漏了仓库级门禁：在 `.delegate.json` 顶层 `accept` 声明默认验收，任务测试用 `--accept-also` 追加以保留默认门禁 |
 | 验收在高负载时超时 | 重检查已整机排队且排队不计时；仍超时说明命令本身慢，调大 `--accept-timeout` |
-| 同事写到一半 timeout，返工预算已用完 | 复制结论的 `next` 续做，上一轮 timeout 的 reply 不计返工次数；其他失败仍按原规则 |
+| 同事写到一半 timeout 或被 stop，返工预算已用完 | 直接 `reply` 续做，上一轮 timeout/stalled/stopped 的 reply 不计返工次数；其他失败仍按原规则 |
 | 同事全量检查被拒绝（77） | 按 hint 改跑相关检查；结论的 denied 统计拦截次数，主控合入一批后统一跑全量 |
 | 带过滤参数的 infra-test 也被拒绝 | 前缀规则包含所有后缀；只禁无参数版本应设 `exact: true` |
 | 模型评测超时导致 rejected | 将不确定的评测放进 `--evidence`，让确定的门禁作 `--accept`；证据超时只记诊断 |

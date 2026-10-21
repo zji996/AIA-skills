@@ -172,6 +172,11 @@ pub fn state(run: &Path) -> String {
         "crashed".into()
     }
 }
+/// Write rounds cut short by a timeout, a stall or the caller's `stop`: continuing
+/// one finishes the same work, so it spends no rework round.
+pub fn interrupted(state: &str) -> bool {
+    matches!(state, "timeout" | "stalled" | "stopped")
+}
 pub fn active(s: &str) -> bool {
     s == "running" || s == "starting" || s == "waiting"
 }

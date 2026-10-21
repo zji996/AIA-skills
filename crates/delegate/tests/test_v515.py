@@ -516,6 +516,24 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
         self.assertEqual(result.returncode, 2)
         self.assertIn("rework limit reached (1/1)", result.stderr)
 
+    def test_stopped_continuation_allowed_after_rework_budget_is_spent(self):
+        repo = self.repo({"a.txt": "old\n"})
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo first >> a.txt")
+        self.outcome(self.cli("run", "--agent", "pi", "--worktree", "--workdir", repo,
+                             "--name", "job", "--accept", "false", "task"))
+        self.fake_pi([fixtures.answer("later"), fixtures.SETTLED], pre="echo fix >> a.txt", sleep=30)
+        started = self.outcome(self.cli("reply", "job", "fix"))
+        self.assertEqual(self.cli("stop", started["run"]).returncode, 0)
+        self.assertEqual(self.outcome(self.cli("status", started["run"]))["state"], "stopped")
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo done >> a.txt")
+        continued = self.outcome(self.cli("reply", "--wait", "job", "continue"))
+        meta = json.loads((Path(continued["dir"]) / "meta.json").read_text())
+        self.assertEqual(meta["continuation"], "stopped")
+        self.assertEqual(meta["rework"], {"kind": "continuation", "used": 1, "limit": 1})
+        result = self.cli("reply", "job", "fix rejection")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("rework limit reached (1/1)", result.stderr)
+
     def test_timeout_next_handles_missing_session_and_zero_budget(self):
         repo = self.repo({"a.txt": "old\n"})
         (repo / ".delegate.json").write_text(json.dumps({"maxRework": 0}))

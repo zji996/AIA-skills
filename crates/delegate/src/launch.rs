@@ -807,7 +807,7 @@ fn rework_used(run: &Path) -> (u64, String) {
         let lines =
             changes["added"].as_u64().unwrap_or(0) + changes["deleted"].as_u64().unwrap_or(0);
         match (s(&meta, "continuation"), s(&meta["rework"], "kind")) {
-            ("timeout" | "stalled", _) => {}
+            (continuation, _) if runs::interrupted(continuation) => {}
             // A round that changed nothing (a question, a failed start) is not rework.
             (_, "rework") if changes["files"].as_u64().unwrap_or(0) > 0 => used += 1,
             (_, "minor") if lines > MINOR_LINES => used += 1,
@@ -843,7 +843,7 @@ fn rework_gate(
         None => Some(1),
     };
     let (used, name) = rework_used(parent);
-    if ["timeout", "stalled"].contains(&runs::state(parent).as_str()) {
+    if runs::interrupted(&runs::state(parent)) {
         return Ok(Some(
             json!({"kind":"continuation","used":used,"limit":limit}),
         ));
@@ -1132,7 +1132,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     extra["configCapacity"] = capacities;
     extra["sourceBuild"] = config.value["sourceBuild"].clone();
     extra["sourceBuildRoot"] = meta.get("sourceBuildRoot").cloned().unwrap_or(json!(top));
-    if ["timeout", "stalled"].contains(&s(&summary, "state")) && s(&meta, "mode") == "write" {
+    if runs::interrupted(s(&summary, "state")) && s(&meta, "mode") == "write" {
         extra["continuation"] = json!(s(&summary, "state"));
     }
     if let Some(paths) = synced {
