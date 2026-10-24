@@ -29,7 +29,10 @@ pub const PROTOCOL: u32 = 1;
 
 /// The one colleague. Tiers choose its model, not another agent.
 pub const AGENT: &str = "pi";
+/// Tiers that must name a model; `default` is optional and, when set, runs
+/// whatever the caller did not give a tier.
 pub const TIERS: [&str; 2] = ["cheap", "strong"];
+pub const ALL_TIERS: [&str; 3] = ["default", "cheap", "strong"];
 
 /// The Pi `--model` pattern a tier runs (`provider/id[:thinking]`); empty means
 /// Pi's own default from its settings.json.
@@ -94,10 +97,11 @@ pub fn tiers_guide() -> String {
             .join("\n")
     };
     format!(
-        "两档都要配置：cheap 给读材料、侦察、文案、看图（快、便宜），strong 给写代码与严密审查（最强）。\n\
+        "两档都要配置：cheap 给读材料、侦察、文案、看图（快、便宜），strong 给写代码与严密审查（最强）；\
+         可选 default：不写 --tier 时用它，不配则只读走 cheap、写入走 strong。\n\
          用户指定过模型就照用户的；否则从下面 Pi 的可用模型中选，配置后在答复里告诉用户选了什么。\n\
          Pi models:\n{list}\n\
-         配置 / configure: {} tiers --cheap <provider/model[:thinking]> --strong <provider/model[:thinking]>\n\
+         配置 / configure: {} tiers --cheap <provider/model[:thinking]> --strong <provider/model[:thinking]> [--default <…>]\n\
          thinking: {}",
         script().display(),
         THINKING.join("|")
@@ -183,7 +187,7 @@ pub fn protocol() -> Value {
         .unwrap_or_else(|_| json!({}));
     let bins = agent_bins(AGENT);
     let version = agent_identity(AGENT).ok().and_then(|(_, v)| v);
-    let models: serde_json::Map<String, Value> = TIERS
+    let models: serde_json::Map<String, Value> = ALL_TIERS
         .iter()
         .map(|tier| (tier.to_string(), json!(tier_model(&config, tier))))
         .collect();

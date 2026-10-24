@@ -1652,6 +1652,28 @@ db.write_text(json.dumps(units))
         self.assertEqual(result.returncode, 2)
         self.assertIn("missing required tools: pi", result.stderr)
 
+    def test_default_tier_runs_tasks_given_no_tier_and_escalates_to_strong(self):
+        self.user_config({"tiers": {"default": "p/m", "cheap": "p/cheap-m", "strong": "p/strong-m"}})
+        log = self.work / "pi.log"
+        self.fake_pi([answer("ok"), SETTLED])
+        for args in (("--read-only",), ()):
+            state = self.outcome(self.cli("run", *args, "task"))
+            self.assertEqual(state["tier"], "default")
+            self.assertIn("--model p/m", log.read_text().splitlines()[-1])
+        self.assertEqual(self.outcome(self.cli("run", "--read-only", "--tier", "cheap", "task"))["tier"], "cheap")
+        self.assertIn("--model p/cheap-m", log.read_text().splitlines()[-1])
+        log.unlink()
+        self.fake_pi([answer(LEAKED), SETTLED], [answer("found it"), SETTLED])
+        state = self.outcome(self.cli("run", "--read-only", "--retries", "0", "task"))
+        self.assertEqual((state["state"], state["tier"], state["escalatedFrom"]), ("answered", "strong", "p/m"))
+        self.assertIn("--model p/strong-m", log.read_text().splitlines()[-1])
+        self.assertIn("default: p/m", self.cli("tiers").stdout)
+        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/strong-m"}})
+        self.assertIn("default: (not set", self.cli("tiers").stdout)
+        self.assertEqual(self.cli("tiers", "--default", "p/m").returncode, 0)
+        config = json.loads((self.work / "config/delegate/config.json").read_text())
+        self.assertEqual(config["tiers"]["default"], "p/m")
+
     def test_both_tiers_must_be_set_and_tiers_sets_them(self):
         self.fake_pi([answer("ok"), SETTLED])
         self.user_config({"tiers": {"cheap": "p/cheap-m"}})
@@ -1863,7 +1885,7 @@ db.write_text(json.dumps(units))
         self.assertEqual((line["protocol"], line["caller"]), (1, {"id": "thread-7", "source": "CODEX_THREAD_ID"}))
         [pi] = line["agents"]
         self.assertEqual((pi["name"], pi["tiers"], pi["models"]),
-                         ("pi", ["cheap", "strong"], {"cheap": "p/m", "strong": "p/m"}))
+                         ("pi", ["cheap", "strong"], {"default": "", "cheap": "p/m", "strong": "p/m"}))
         self.assertEqual(pi["bin"], str((self.bin / "pi").resolve()))
         self.assertEqual(pi["version"], "fake-pi 1.0")
         self.assertEqual(pi["shadowed"], [str(shadow / "pi")])  # as found on PATH, not resolved
@@ -1871,7 +1893,7 @@ db.write_text(json.dumps(units))
         self.env.pop("CODEX_THREAD_ID")
         line = json.loads(self.cli("protocol").stdout)
         self.assertIsNone(line["caller"])
-        self.assertEqual(line["agents"][0]["models"], {"cheap": "", "strong": "p/strong-m"})  # unset shows empty
+        self.assertEqual(line["agents"][0]["models"], {"default": "", "cheap": "", "strong": "p/strong-m"})  # unset shows empty
         self.assertEqual(self.cli("protocol", "extra").returncode, 2)
 
     def test_wait_collects_only_current_caller_and_reports_other_failure(self):

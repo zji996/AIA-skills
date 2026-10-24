@@ -190,8 +190,10 @@ fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
         if let Some(tiers) = value.get("tiers") {
             let tiers = tiers.as_object().ok_or("tiers must be an object")?;
             for (tier, model) in tiers {
-                if !crate::agents::TIERS.contains(&tier.as_str()) {
-                    return Err(format!("tiers.{tier}: unknown tier (cheap or strong)"));
+                if !crate::agents::ALL_TIERS.contains(&tier.as_str()) {
+                    return Err(format!(
+                        "tiers.{tier}: unknown tier (default, cheap or strong)"
+                    ));
                 }
                 if !model.as_str().is_some_and(|m| !m.contains('\0')) {
                     return Err(format!(

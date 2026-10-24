@@ -2,7 +2,7 @@ const LAUNCH: &[(&str, &str)] = &[
     ("words", "Prompt text (or use --prompt / --prompt-file)."),
     ("--prompt TEXT", "Prompt text."),
     ("--prompt-file FILE", "Read the prompt from FILE, or - for stdin."),
-    ("--tier cheap|strong", "Pick Pi's model from config tiers.cheap / tiers.strong (DELEGATE_CHEAP_MODEL / DELEGATE_STRONG_MODEL); an unset tier uses Pi's default model. Default: cheap for read-only, strong for writes. Eligible failed cheap runs escalate once to a different strong model."),
+    ("--tier default|cheap|strong", "Pick Pi's model from config tiers (DELEGATE_{DEFAULT,CHEAP,STRONG}_MODEL); cheap and strong must be set. Without --tier: the default model if set, else cheap for read-only and strong for writes. Eligible failed default or cheap runs escalate once to a different strong model."),
     ("--name NAME", "Short label in the run id (default: first clause of the prompt, up to 24 characters)."),
     ("--workdir DIR", "Agent working directory (default: cwd)."),
     ("--image PATH", "Attach an image; repeatable."),
@@ -64,7 +64,7 @@ const REPLY: &[(&str, &str)] = &[
     ("--fresh", "Start a new session with only this message; after apply, a new worktree starts from current HEAD."),
     ("--sync", "Merge the caller's later changes into the conversation worktree before replying; conflicts stop the reply."),
     ("--wait", "Wait for the reply's outcome and answer instead of returning after launch."),
-    ("--tier cheap|strong", "Continue the conversation on this tier's model; records from removed agents start a fresh Pi session."),
+    ("--tier default|cheap|strong", "Continue the conversation on this tier's model; records from removed agents start a fresh Pi session."),
     ("--minor", "Write conversations: a short fix (message up to 600 characters, default timeout 10m) outside the rework budget; a round that changes more than 60 lines counts after all."),
     ("--over-limit REASON", "Write conversations: reply past the .delegate.json maxRework budget (default 1) and record why."),
 ];
@@ -97,7 +97,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("clean", "Delete finished runs."),
     (
         "tiers",
-        "Show the Pi model of each tier, or set them with --cheap/--strong.",
+        "Show the Pi model of each tier, or set them with --default/--cheap/--strong.",
     ),
     (
         "protocol",
@@ -192,7 +192,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("--force", "With --finished, also select unreported or truncated finished runs."),
             ("--json", "Print deletion counts and orphan container cleanup as JSON lines."),
         ]),
-        "tiers" => ("[--cheap MODEL] [--strong MODEL]", "Without options, print each tier's Pi model; exit 1 with the available Pi models when a tier is unset. With options, check each provider/id[:thinking] against `pi --list-models` and write it to the user config. start, run and reply refuse to run until both tiers are set.", &[]),
+        "tiers" => ("[--default MODEL] [--cheap MODEL] [--strong MODEL]", "Without options, print each tier's Pi model (default is optional and runs tasks given no --tier); exit 1 with the available Pi models when a tier is unset. With options, check each provider/id[:thinking] against `pi --list-models` and write it to the user config. start, run and reply refuse to run until both tiers are set.", &[]),
         "protocol" => ("", "Print one JSON line for harness adapters: protocol version, delegate version, the caller session and its source variable, and each agent's tier, resolved binary, version and PATH entries it shadows.", &[]),
         _ => return false,
     };

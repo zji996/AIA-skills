@@ -549,7 +549,7 @@ fn escalate(
     changed: &[String],
     protected: bool,
 ) -> Res<bool> {
-    if s(meta, "tier") != "cheap"
+    if !["cheap", "default"].contains(&s(meta, "tier"))
         || runs::agent_pinned(meta)
         || protected
         || !["malformed", "failed", "timeout", "rejected"].contains(&state)

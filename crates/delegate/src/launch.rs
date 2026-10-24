@@ -294,7 +294,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
     }
     if o.tier
         .as_deref()
-        .is_some_and(|t| t != "cheap" && t != "strong")
+        .is_some_and(|t| !agents::ALL_TIERS.contains(&t))
     {
         return Err("argument --tier: invalid choice".into());
     }
@@ -312,23 +312,28 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
 }
 fn choose_tier(o: &mut Options) {
     o.agent = agents::AGENT.into();
-    let tier = o
-        .tier
-        .clone()
-        .unwrap_or_else(|| if o.read_only { "cheap" } else { "strong" }.into());
-    o.tier = Some(tier);
 }
-/// An explicit --model pins the run (no escalation); otherwise the tier's model
-/// applies, and an empty one leaves Pi on its own default.
 fn tier_models(config: &Value) -> Value {
-    agents::TIERS
+    agents::ALL_TIERS
         .iter()
         .map(|tier| (tier.to_string(), json!(agents::tier_model(config, tier))))
         .collect::<serde_json::Map<_, _>>()
         .into()
 }
+/// Without --tier, the configured default model runs, else read-only goes
+/// cheap and writes strong. An explicit --model pins the run (no escalation).
 fn apply_tier_model(o: &mut Options, config: &Value) -> Value {
     let models = tier_models(config);
+    if o.tier.is_none() {
+        let tier = if !s(&models, "default").is_empty() {
+            "default"
+        } else if o.read_only {
+            "cheap"
+        } else {
+            "strong"
+        };
+        o.tier = Some(tier.into());
+    }
     if o.model.is_some() {
         o.agent_pinned = true;
     } else {

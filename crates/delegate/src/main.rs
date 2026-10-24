@@ -1475,7 +1475,7 @@ fn tiers(args: &[String]) -> Res<i32> {
             .map_or((args[i].as_str(), None), |(k, v)| (k, Some(v.to_string())));
         let tier = key
             .strip_prefix("--")
-            .filter(|t| agents::TIERS.contains(t))
+            .filter(|t| agents::ALL_TIERS.contains(t))
             .ok_or_else(|| format!("unrecognized arguments: {}", args[i]))?;
         let value = match inline {
             Some(v) => v,
@@ -1513,17 +1513,16 @@ fn tiers(args: &[String]) -> Res<i32> {
     let top = git_top(&env::current_dir().unwrap_or_default());
     let config = config::load(top.as_deref())?;
     let mut missing = false;
-    for tier in agents::TIERS {
+    for tier in agents::ALL_TIERS {
         let model = agents::tier_model(&config.value, tier);
-        missing |= model.is_empty();
-        println!(
-            "{tier}: {}",
-            if model.is_empty() {
-                "(not set)"
-            } else {
-                &model
-            }
-        );
+        let required = agents::TIERS.contains(&tier);
+        missing |= required && model.is_empty();
+        let shown = match (model.is_empty(), required) {
+            (false, _) => model.as_str(),
+            (true, true) => "(not set)",
+            (true, false) => "(not set: read-only uses cheap, writes use strong)",
+        };
+        println!("{tier}: {shown}");
     }
     if missing {
         eprintln!("{}", agents::tiers_guide());

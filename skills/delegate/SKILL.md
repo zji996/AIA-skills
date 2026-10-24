@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI。
 metadata:
-  version: "6.1.0"
+  version: "6.2.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -54,14 +54,14 @@ $D wait                                                                    # 2. 
 
 ## 选档位
 
-同事都是 Pi；档位只决定它用哪个模型。两档都配置后才能派任务：没配时 `start` 拒绝并列出 Pi 的可用模型，照提示运行 `$D tiers --cheap <provider/model[:thinking]> --strong <…>`（用户指定过就照用户的，否则自己选好并告诉用户）；`$D tiers` 查看当前配置。
+同事都是 Pi；档位只决定它用哪个模型。两档都配置后才能派任务：没配时 `start` 拒绝并列出 Pi 的可用模型，照提示运行 `$D tiers --cheap <provider/model[:thinking]> --strong <…>`（用户指定过就照用户的，否则自己选好并告诉用户）；`$D tiers` 查看当前配置。可选 `--default <模型>`：不写 `--tier` 的任务都用它；不配时只读走便宜档、写入走强档。
 
-| `--tier` | 默认给 | 适合 | 不适合 |
+| `--tier` | 未配 default 时默认给 | 适合 | 不适合 |
 |---|---|---|---|
 | `cheap` | 只读任务 | 广度侦察（在代码里找事实、列清单）、界面与前端实现和审查、文案、看图；重要审查时作为另一路视角 | 需要严密判断与风险评估的逻辑（量化边界、并发、事务、迁移） |
 | `strong` | 写入任务 | 后端与协议代码、疑难 bug、严密审查与风险评估、核实便宜档的结论 | 只图省事的批量杂活 |
 
-便宜档答复畸形、出错、超时或验收失败且未改文件时，换强档模型重跑一次（两档同一模型时不升档）。`--model provider/id` 直接指定模型，不升档；`reply --tier strong` 在同一会话里换成强档模型续做。
+便宜档或默认档答复畸形、出错、超时或验收失败且未改文件时，换强档模型重跑一次（同一模型时不升档）。`--model provider/id` 直接指定模型，不升档；`reply --tier strong` 在同一会话里换成强档模型续做。
 
 ## 写好任务说明
 
