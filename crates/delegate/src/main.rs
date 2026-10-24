@@ -1454,6 +1454,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         }
         "stop" => stop(rest),
         "clean" => clean(rest),
+        "tiers" => tiers(rest),
         "protocol" => {
             if let Some(arg) = rest.first() {
                 return Err(format!("unrecognized arguments: {arg}"));
@@ -1463,6 +1464,73 @@ fn main_inner(args: &[String]) -> Res<i32> {
         }
         _ => Err(format!("invalid choice: {command}")),
     }
+}
+/// Show the model tiers, or write them to the user config.
+fn tiers(args: &[String]) -> Res<i32> {
+    let mut set = serde_json::Map::new();
+    let mut i = 0;
+    while i < args.len() {
+        let (key, inline) = args[i]
+            .split_once('=')
+            .map_or((args[i].as_str(), None), |(k, v)| (k, Some(v.to_string())));
+        let tier = key
+            .strip_prefix("--")
+            .filter(|t| agents::TIERS.contains(t))
+            .ok_or_else(|| format!("unrecognized arguments: {}", args[i]))?;
+        let value = match inline {
+            Some(v) => v,
+            None => {
+                i += 1;
+                args.get(i)
+                    .cloned()
+                    .ok_or_else(|| format!("argument --{tier}: expected one argument"))?
+            }
+        };
+        set.insert(tier.to_string(), json!(value));
+        i += 1;
+    }
+    let path = config::user_path();
+    if !set.is_empty() {
+        let models = agents::pi_models();
+        for value in set.values() {
+            agents::check_tier_model(value.as_str().unwrap_or(""), &models)?;
+        }
+        let mut user = config::read_file(&path)?.unwrap_or_else(|| json!({}));
+        if !user["tiers"].is_object() {
+            user["tiers"] = json!({});
+        }
+        for (tier, value) in set {
+            user["tiers"][tier] = value;
+        }
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&user).unwrap()),
+        )?;
+    }
+    let top = git_top(&env::current_dir().unwrap_or_default());
+    let config = config::load(top.as_deref())?;
+    let mut missing = false;
+    for tier in agents::TIERS {
+        let model = agents::tier_model(&config.value, tier);
+        missing |= model.is_empty();
+        println!(
+            "{tier}: {}",
+            if model.is_empty() {
+                "(not set)"
+            } else {
+                &model
+            }
+        );
+    }
+    if missing {
+        eprintln!("{}", agents::tiers_guide());
+        return Ok(1);
+    }
+    println!("config: {}", path.display());
+    Ok(0)
 }
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();

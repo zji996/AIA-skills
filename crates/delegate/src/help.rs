@@ -96,6 +96,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("stop", "Terminate runs."),
     ("clean", "Delete finished runs."),
     (
+        "tiers",
+        "Show the Pi model of each tier, or set them with --cheap/--strong.",
+    ),
+    (
         "protocol",
         "Print the harness protocol version, caller and agents as JSON.",
     ),
@@ -188,6 +192,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("--force", "With --finished, also select unreported or truncated finished runs."),
             ("--json", "Print deletion counts and orphan container cleanup as JSON lines."),
         ]),
+        "tiers" => ("[--cheap MODEL] [--strong MODEL]", "Without options, print each tier's Pi model; exit 1 with the available Pi models when a tier is unset. With options, check each provider/id[:thinking] against `pi --list-models` and write it to the user config. start, run and reply refuse to run until both tiers are set.", &[]),
         "protocol" => ("", "Print one JSON line for harness adapters: protocol version, delegate version, the caller session and its source variable, and each agent's tier, resolved binary, version and PATH entries it shadows.", &[]),
         _ => return false,
     };

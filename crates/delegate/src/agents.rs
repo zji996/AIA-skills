@@ -38,6 +38,94 @@ pub fn tier_model(config: &Value, tier: &str) -> String {
     setting(&format!("{}_MODEL", tier.to_uppercase()), configured)
 }
 
+pub const THINKING: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// Pi's models as (`provider/id`, supports thinking), from `pi --list-models`;
+/// empty when Pi is missing or prints nothing usable.
+pub fn pi_models() -> Vec<(String, bool)> {
+    let Some(bin) = agent_bin(AGENT) else {
+        return vec![];
+    };
+    let out = std::process::Command::new(bin)
+        .args(["--offline", "--list-models"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    let Ok(out) = out else { return vec![] };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .skip_while(|line| !line.starts_with("provider"))
+        .skip(1)
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            (cols.len() >= 5).then(|| (format!("{}/{}", cols[0], cols[1]), cols[4] == "yes"))
+        })
+        .collect()
+}
+
+/// Both tiers must name a model: the caller is usually a model itself, and an
+/// unset tier would quietly run everything on Pi's default with no escalation.
+pub fn require_tiers(models: &Value) -> Res<()> {
+    let missing: Vec<&str> = TIERS
+        .iter()
+        .copied()
+        .filter(|tier| models[*tier].as_str().unwrap_or("").is_empty())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "model tiers not configured: {}\n{}",
+        missing.join(", "),
+        tiers_guide()
+    ))
+}
+
+/// What a caller needs to configure the tiers itself in one step.
+pub fn tiers_guide() -> String {
+    let models = pi_models();
+    let list = if models.is_empty() {
+        "  (pi --list-models printed nothing; check that Pi is installed and has models)".into()
+    } else {
+        models
+            .iter()
+            .map(|(m, thinking)| format!("  {m}{}", if *thinking { "  [thinking]" } else { "" }))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "两档都要配置：cheap 给读材料、侦察、文案、看图（快、便宜），strong 给写代码与严密审查（最强）。\n\
+         用户指定过模型就照用户的；否则从下面 Pi 的可用模型中选，配置后在答复里告诉用户选了什么。\n\
+         Pi models:\n{list}\n\
+         配置 / configure: {} tiers --cheap <provider/model[:thinking]> --strong <provider/model[:thinking]>\n\
+         thinking: {}",
+        script().display(),
+        THINKING.join("|")
+    )
+}
+
+/// Check a tier value against Pi's model list (skipped when the list is empty).
+pub fn check_tier_model(pattern: &str, models: &[(String, bool)]) -> Res<()> {
+    let (model, thinking) = pattern.split_once(':').unwrap_or((pattern, ""));
+    if !model.contains('/') {
+        return Err(format!(
+            "{pattern}: write the model as provider/id[:thinking]"
+        ));
+    }
+    if !thinking.is_empty() && !THINKING.contains(&thinking) {
+        return Err(format!(
+            "{pattern}: thinking must be one of {}",
+            THINKING.join("|")
+        ));
+    }
+    if !models.is_empty() && !models.iter().any(|(m, _)| m == model) {
+        return Err(format!(
+            "{model} is not among Pi's models (pi --list-models)"
+        ));
+    }
+    Ok(())
+}
+
 pub fn nesting_error() -> Option<String> {
     let caller = setting("AGENT", "");
     let caller = if caller.is_empty() {

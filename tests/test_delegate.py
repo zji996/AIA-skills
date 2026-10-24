@@ -81,7 +81,9 @@ class DelegateTests(unittest.TestCase):
                         DELEGATE_RUNS=str(self.work / "runs"), XDG_STATE_HOME=str(self.work / "state"),
                         XDG_CACHE_HOME=str(self.work / "cache"),
                         XDG_CONFIG_HOME=str(self.work / "config"),
-                        PI_LOG=str(self.work / "pi.log"))
+                        PI_LOG=str(self.work / "pi.log"),
+                        # Both tiers set and equal, so nothing escalates unless a test configures it.
+                        DELEGATE_CHEAP_MODEL="p/m", DELEGATE_STRONG_MODEL="p/m")
         # Cleanup tests must never contact the host's Docker daemon.
         docker = self.bin / "docker"
         docker.write_text("#!/bin/sh\nexit 0\n")
@@ -471,6 +473,8 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
     def fake_pi(self, *attempts, pre="", sleep=0, code=0):
         """Each attempt is a list of events; later calls reuse the last attempt."""
         lines = ["#!/bin/sh", '[ "$1" = --version ] && { echo "fake-pi 1.0"; exit 0; }',
+                 '[ "$2" = --list-models ] && { printf "provider model context max-out thinking images\\n'
+                 'p m 1M 1K yes yes\\np cheap-m 1M 1K yes yes\\np strong-m 1M 1K yes yes\\n"; exit 0; }',
                  "cat > /dev/null", 'echo "$$ $PI_DELEGATE_ACTIVE $*" >> "$PI_LOG"',
                  # Like Pi, keep the session as <dir>/<time>_<id>.jsonl.
                  'dir=; id=; prev=; for a in "$@"; do case "$prev" in --session-dir) dir=$a;; --session-id) id=$a;; '
@@ -485,6 +489,9 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         pi.chmod(0o755)
 
     def user_config(self, value):
+        if "tiers" in value:
+            self.env.pop("DELEGATE_CHEAP_MODEL", None)
+            self.env.pop("DELEGATE_STRONG_MODEL", None)
         path = Path(self.env["XDG_CONFIG_HOME"]) / "delegate/config.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(value))
@@ -1619,7 +1626,6 @@ db.write_text(json.dumps(units))
         calls = lambda: (self.work / "pi.log").read_text().splitlines()
         state = self.outcome(self.cli("run", "--read-only", "task"))
         self.assertEqual((state["agent"], state["tier"]), ("pi", "cheap"))  # reading defaults to cheap
-        self.assertNotIn("--model", calls()[-1])  # no tier models configured: Pi's own default
         self.assertEqual(self.outcome(self.cli("run", "task"))["tier"], "strong")  # writing defaults to strong
         self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/strong-m:high"}})
         self.outcome(self.cli("run", "--read-only", "task"))
@@ -1639,12 +1645,33 @@ db.write_text(json.dumps(units))
         self.assertIn("removed in 6.0", removed.stderr)
         self.user_config({"tiers": {"fast": "p/m"}})
         self.assertIn("tiers.fast", self.cli("run", "--read-only", "task").stderr)
-        self.user_config({})
         (self.bin / "pi").unlink()
+        self.user_config({"tiers": {"cheap": "p/m", "strong": "p/m"}})
         self.env["PATH"] = f"{self.bin}:/usr/bin:/bin"
         result = self.cli("run", "--read-only", "task")
         self.assertEqual(result.returncode, 2)
         self.assertIn("missing required tools: pi", result.stderr)
+
+    def test_both_tiers_must_be_set_and_tiers_sets_them(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        self.user_config({"tiers": {"cheap": "p/cheap-m"}})
+        refused = self.cli("start", "--read-only", "task")
+        self.assertEqual(refused.returncode, 2)
+        # The refusal carries everything a calling model needs to configure it in one step.
+        for text in ("model tiers not configured: strong", "p/strong-m  [thinking]", "tiers --cheap"):
+            self.assertIn(text, refused.stderr)
+        self.assertFalse((self.work / "pi.log").exists())
+        shown = self.cli("tiers")
+        self.assertEqual(shown.returncode, 1)
+        self.assertIn("strong: (not set)", shown.stdout)
+        for bad in ("p/nope", "nope", "p/strong-m:huge"):
+            self.assertEqual(self.cli("tiers", "--strong", bad).returncode, 2, bad)
+        done = self.cli("tiers", "--strong", "p/strong-m:high")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("strong: p/strong-m:high", done.stdout)
+        config = json.loads((self.work / "config/delegate/config.json").read_text())
+        self.assertEqual(config["tiers"], {"cheap": "p/cheap-m", "strong": "p/strong-m:high"})
+        self.assertEqual(self.outcome(self.cli("run", "--read-only", "task"))["state"], "answered")
 
     def test_failed_cheap_run_escalates_once_to_the_strong_model(self):
         self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/strong-m"}})
@@ -1682,11 +1709,10 @@ db.write_text(json.dumps(units))
         state = self.outcome(self.cli("run", "--read-only", "--retries", "0", "--model", "p/cheap-m", "task"))
         self.assertEqual(state["state"], "malformed")
         self.assertNotIn("escalatedFrom", state)
-        # ...nor when the strong tier runs the same model or none is configured.
-        for tiers in ({"cheap": "p/m", "strong": "p/m"}, {"cheap": "p/m"}):
-            self.user_config({"tiers": tiers})
-            state = self.outcome(self.cli("run", "--read-only", "--retries", "0", "task"))
-            self.assertEqual((state["state"], state["tier"]), ("malformed", "cheap"), tiers)
+        # ...nor when the strong tier runs the same model.
+        self.user_config({"tiers": {"cheap": "p/m", "strong": "p/m"}})
+        state = self.outcome(self.cli("run", "--read-only", "--retries", "0", "task"))
+        self.assertEqual((state["state"], state["tier"]), ("malformed", "cheap"))
 
     def test_wait_until_all_without_runs_collects_everything_pending(self):
         self.fake_pi([answer("ok"), SETTLED])
@@ -1837,7 +1863,7 @@ db.write_text(json.dumps(units))
         self.assertEqual((line["protocol"], line["caller"]), (1, {"id": "thread-7", "source": "CODEX_THREAD_ID"}))
         [pi] = line["agents"]
         self.assertEqual((pi["name"], pi["tiers"], pi["models"]),
-                         ("pi", ["cheap", "strong"], {"cheap": "", "strong": ""}))
+                         ("pi", ["cheap", "strong"], {"cheap": "p/m", "strong": "p/m"}))
         self.assertEqual(pi["bin"], str((self.bin / "pi").resolve()))
         self.assertEqual(pi["version"], "fake-pi 1.0")
         self.assertEqual(pi["shadowed"], [str(shadow / "pi")])  # as found on PATH, not resolved
@@ -1845,7 +1871,7 @@ db.write_text(json.dumps(units))
         self.env.pop("CODEX_THREAD_ID")
         line = json.loads(self.cli("protocol").stdout)
         self.assertIsNone(line["caller"])
-        self.assertEqual(line["agents"][0]["models"], {"cheap": "", "strong": "p/strong-m"})
+        self.assertEqual(line["agents"][0]["models"], {"cheap": "", "strong": "p/strong-m"})  # unset shows empty
         self.assertEqual(self.cli("protocol", "extra").returncode, 2)
 
     def test_wait_collects_only_current_caller_and_reports_other_failure(self):

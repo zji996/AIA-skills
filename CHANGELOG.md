@@ -19,6 +19,7 @@
 - `openai-image-gen` 2.2.0：新增 `keep`，草稿满意就直接作为成品交付，不调用接口、不计次（格式不同时用 ffmpeg 转换）；提示词末尾自动追加画幅句（如 "Portrait orientation, 2:3 aspect ratio"），因为经 ChatGPT 账号转发的网关忽略 `size`，横竖只看提示词；结果 JSON 报告网关回显的实际 quality，网关把 high 按 low 出图时记住它，之后拒绝拿草稿原提示词出的正式图（那只会是一张复制）；与已有草稿提示词和尺寸相同的草稿、与出图提示词相同的编辑都拒绝且不请求接口。起因：实测内网网关 quality 一律被压成 low、size 与格式被忽略，edits 以同提示词重出的正式图与草稿 SSIM 0.93。
 - `openai-image-gen` 2.1.0：HTTP 错误带上网关的错误码（如 `moderation_blocked`）；被内容规则拒绝时如实告知用户，改写重试要说明改了什么。
 
+- `delegate` 6.1.0（不兼容）：两档模型必须都配置，否则 `start`/`run`/`reply` 退出 2，报错列出 `pi --list-models` 的可用模型、两档用途与配置命令；新增 `delegate tiers [--cheap M] [--strong M]` 查看或写入用户配置，写入前按 Pi 模型列表与 thinking 级别校验。起因：调用方多是模型，档位没配时会悄悄全用 Pi 默认模型、也不升档，没人发现；报错里给全信息，模型自己就能配好。6.0.0 未单独发布二进制。
 - `delegate` 6.0.0（不兼容）：同事只用 Pi。`--tier cheap|strong` 改为选 Pi 模型：配置 `tiers.{cheap,strong}` 写 Pi 的 `provider/id[:thinking]`，`DELEGATE_{CHEAP,STRONG}_MODEL` 优先，未配置的档用 Pi 自己的默认模型；便宜档失败且未改动时换强档模型在同一 run 重跑（`escalatedFrom` 记原模型），`--model` 固定模型不升档，`reply --tier` 在同一会话换模型。删除 Codex 同事、`--agent`、`maxCodex`/`repoMaxCodex` 与 `DELEGATE_{CHEAP,STRONG}_AGENT`；旧 Codex 记录 reply 时由 Pi 开新会话续做。起因：Codex 的启动提示词约 2.2 万字且不受控制，GPT 也涨价了，维护两套同事不划算。
 - `delegate` 5.28.3：启动 Codex 同事时传 `-c features.multi_agent=false`，并用 `skills.config` 从技能目录隐去 delegate；`DELEGATE_AGENT` 只拦得住 delegate 脚本，拦不住 Codex 原生 `spawn_agent`。起因：10 月 442 次委派的 Codex 会话里有 23 次自行派了子代理，不受 lane 上限约束；关掉后开头也少了两段 multi_agent 提示（约 2700 字符）。
 - `delegate` 5.28.2：被主控 `stop` 中断的写入任务续做与超时、停滞一样不计返工次数；起因：为换 `agentDeny` 规则停下 5 个任务续做，其中一个被返工预算拒绝。

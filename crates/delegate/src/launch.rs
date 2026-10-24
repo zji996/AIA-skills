@@ -650,6 +650,7 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     o.share.dedup();
     let config = crate::config::load(repo.as_deref())?;
     let tier_models = apply_tier_model(&mut o, &config.value);
+    agents::require_tiers(&tier_models)?;
     let defaults = effective_defaults(&mut o, &config);
     let mut defaults = defaults;
     if let Some(value) = config.value["defaults"].get("keepCommits") {
@@ -998,6 +999,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     } else {
         tier_models(&config.value)
     };
+    agents::require_tiers(&tier_models)?;
     let deny_accept_conflicts =
         crate::deny::conflicts(o.accept.as_deref(), &prompt, &meta["agentDeny"]);
     for command in &deny_accept_conflicts {

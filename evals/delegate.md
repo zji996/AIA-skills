@@ -70,6 +70,7 @@
 - 多个仓库共用禁止同事全量检查的规则：把 agentDeny、通用 env 与 maxRework 写入用户级 delegate/config.json，仓库只补自己的字段。Shared user config applies across repositories.
 - 某仓库需要同事运行用户级禁止的一条命令：仓库 agentDeny 用完全相同 argv 和 allow: true 撤销，其他用户规则仍生效。
 - 用户 env 与仓库 env 同键：仓库覆盖，其他键合并；仓库未声明 accept 时用用户默认，显式 --accept / --no-accept 优先。
+- 新机器首次派任务未配置两档模型：start 退出 2 并列出 Pi 可用模型；主控照用户指定或自行选好后运行 `delegate tiers --cheap … --strong …`，并告诉用户选了什么，再重新派发。
 - 换机器时设置 maxActive/maxHeavy 与 tiers 模型：用户配置提供容量，仓库可覆盖，DELEGATE_MAX_* 最高；同事不得自行放宽容量。
 - 用户配置误写 worktree、generated 或 applyVerify：start 在 stderr 提示一次并忽略，仓库事实留在 .delegate.json；错误字段和损坏 JSON 必须指出文件并退出 2。
 - 查看规则来自哪里：status --json 与 summary 的 configSources 区分 user/repo，自然语言结论保持简短。

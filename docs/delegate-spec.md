@@ -179,7 +179,7 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 
 ### 4.1 选模型与升档（必须）
 
-- 同事恒为 `pi`。档位选模型：`DELEGATE_{CHEAP,STRONG}_MODEL` > 配置 `tiers.{cheap,strong}`（Pi `--model` 模式 `provider/id[:thinking]`）；为空时不传 `--model`，用 Pi 自己的默认模型。给了 `--model` 时用它并记 `agentPinned: true`。`meta.json` 记 `tier`、`model` 与启动时解析的 `tierModels`。`--agent` 已删除（退出码 2）。
+- 同事恒为 `pi`。档位选模型：`DELEGATE_{CHEAP,STRONG}_MODEL` > 配置 `tiers.{cheap,strong}`（Pi `--model` 模式 `provider/id[:thinking]`）；两档都必须非空，否则 `start`/`run`/`reply` 退出码 2，stderr 列出 `pi --list-models` 的模型与配置命令；`delegate tiers [--cheap M] [--strong M]` 显示或写入用户配置（按 Pi 模型列表与 thinking 级别校验，有档未配时退出 1）。给了 `--model` 时用它并记 `agentPinned: true`。`meta.json` 记 `tier`、`model` 与启动时解析的 `tierModels`。`--agent` 已删除（退出码 2）。
 - **升档**：`tier == "cheap"` 的 run 结局为 `malformed`/`failed`/`timeout`/`rejected`、未被 stop、且（只读，或快照成功且没有任何改动）时，若 `tierModels.strong` 非空且与本轮模型不同，在同一 run 中换强档模型再跑一轮（不另占名额）：事件 `escalate{from,to,after}`（模型名，未指定为 `default`），`meta.json` 的 `model` 改为强档模型、`tier` 改为 `strong`、`fork` 清空、记 `escalatedFrom`（原模型）。新一轮沿用重跑次数，`attempts` 接续计数；快照、只读核对与验收按新一轮重新进行，结论带 `escalatedFrom`。固定模型（`agentPinned`）不升档。每个 run 至多升档一次。
 - reply 沿用上一轮的 `tier` 与模型；`--tier` 换成该档模型并在同一会话续做。旧版 Codex 记录由 Pi 开新会话续做（隐含 `--fresh`）。
 
