@@ -1,7 +1,4 @@
-use crate::agents::{
-    self, agent_available, agent_identity, missing_tools, nesting_error, session_file,
-    SessionSource,
-};
+use crate::agents::{self, agent_identity, missing_tools, nesting_error, session_file};
 use crate::changes::snapshot;
 use crate::common::*;
 use crate::runs::{self, active, agent_alive, all_runs, state};
@@ -174,7 +171,11 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             match key {
                 "--prompt" => o.prompt = Some(v),
                 "--prompt-file" => o.prompt_file = Some(v),
-                "--agent" => o.agent = v,
+                "--agent" => {
+                    return Err(format!(
+                        "--agent was removed in 6.0: delegate runs Pi only; pick its model with --tier or --model (got --agent {v})"
+                    ))
+                }
                 "--tier" => o.tier = Some(v),
                 "--name" => o.name = Some(v),
                 "--workdir" => o.workdir = Some(v),
@@ -291,9 +292,6 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
     if (!collect || (reply && !o.wait)) && (o.max.is_some() || o.progress || o.full) {
         return Err("unrecognized collecting option".into());
     }
-    if !o.agent.is_empty() && agents::spec(&o.agent).is_none() {
-        return Err("argument --agent: invalid choice".into());
-    }
     if o.tier
         .as_deref()
         .is_some_and(|t| t != "cheap" && t != "strong")
@@ -312,56 +310,35 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
     }
     Ok(o)
 }
-fn tier_agent(tier: &str) -> Res<String> {
-    let agent = setting(
-        if tier == "cheap" {
-            "CHEAP_AGENT"
-        } else {
-            "STRONG_AGENT"
-        },
-        agents::default_for_tier(tier).name,
-    );
-    if agents::spec(&agent).is_none() {
-        return Err(format!(
-            "DELEGATE_{}_AGENT must be one of {}, got {agent:?}",
-            tier.to_uppercase(),
-            agents::choices(", ")
-        ));
-    }
-    Ok(agent)
-}
-pub fn strong_agent() -> Res<String> {
-    tier_agent("strong")
-}
-fn choose_agent(o: &mut Options) -> Res<()> {
-    if !o.agent.is_empty() {
-        if o.tier.is_some() {
-            return Err("--agent and --tier contradict each other; give one".into());
-        }
-        o.agent_pinned = true;
-        o.tier = agents::spec(&o.agent)
-            .and_then(|agent| agent.default_tier)
-            .map(str::to_string);
-        return Ok(());
-    }
+fn choose_tier(o: &mut Options) {
+    o.agent = agents::AGENT.into();
     let tier = o
         .tier
         .clone()
         .unwrap_or_else(|| if o.read_only { "cheap" } else { "strong" }.into());
-    o.agent = tier_agent(&tier)?;
-    o.tier = Some(tier.clone());
-    if tier == "cheap" {
-        let strong = strong_agent()?;
-        if !agent_available(&o.agent) && agent_available(&strong) {
-            eprintln!(
-                "delegate: {} is not installed; using the strong tier ({strong})",
-                o.agent
-            );
-            o.agent = strong;
-            o.tier = Some("strong".into());
-        }
+    o.tier = Some(tier);
+}
+/// An explicit --model pins the run (no escalation); otherwise the tier's model
+/// applies, and an empty one leaves Pi on its own default.
+fn tier_models(config: &Value) -> Value {
+    agents::TIERS
+        .iter()
+        .map(|tier| (tier.to_string(), json!(agents::tier_model(config, tier))))
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+}
+fn apply_tier_model(o: &mut Options, config: &Value) -> Value {
+    let models = tier_models(config);
+    if o.model.is_some() {
+        o.agent_pinned = true;
+    } else {
+        let tier = o.tier.as_deref().unwrap_or("cheap");
+        o.model = models[tier]
+            .as_str()
+            .map(str::to_string)
+            .filter(|m| !m.is_empty());
     }
-    Ok(())
+    models
 }
 pub fn read_prompt(o: &mut Options) -> Res<String> {
     let prompt = if let Some(f) = &o.prompt_file {
@@ -400,10 +377,6 @@ pub fn read_prompt(o: &mut Options) -> Res<String> {
 }
 const READ_ONLY_ZH: &str = "只读任务：不要创建、修改或删除任何文件；结束后会核对工作目录，改动不会被采纳，并会报告给委派方。用 delegate 委派子任务产生的记录在 git 忽略的目录里，不算改动，无需改动其存放位置。";
 const READ_ONLY_EN: &str = "Read-only task: do not create, modify or delete files; the working directory is checked afterwards, and any change is reported to the delegator and never adopted. Records of subtasks delegated with delegate live in git-ignored directories and do not count; leave their location as it is.";
-
-pub fn has_read_only_contract(prompt: &str) -> bool {
-    prompt.contains(READ_ONLY_ZH) || prompt.contains(READ_ONLY_EN)
-}
 
 pub fn contract(
     prompt: &str,
@@ -629,7 +602,7 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     if let Some(e) = nesting_error() {
         return Err(e);
     }
-    choose_agent(&mut o)?;
+    choose_tier(&mut o);
     let prompt = read_prompt(&mut o)?;
     let after = o.after.as_deref().map(runs::resolve).transpose()?;
     let in_run = o.in_run.as_deref().map(runs::resolve).transpose()?;
@@ -676,6 +649,7 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     o.share.sort();
     o.share.dedup();
     let config = crate::config::load(repo.as_deref())?;
+    let tier_models = apply_tier_model(&mut o, &config.value);
     let defaults = effective_defaults(&mut o, &config);
     let mut defaults = defaults;
     if let Some(value) = config.value["defaults"].get("keepCommits") {
@@ -693,7 +667,7 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
             config.ignored.join(", ")
         );
     }
-    let mut extra = json!({"env":config.value["env"],"agentDeny":config.value["agentDeny"],"configSources":config.sources,"configCapacity":capacities});
+    let mut extra = json!({"env":config.value["env"],"agentDeny":config.value["agentDeny"],"configSources":config.sources,"configCapacity":capacities,"tierModels":tier_models});
     extra["sourceBuild"] = config.value["sourceBuild"].clone();
     extra["sourceBuildRoot"] = json!(repo);
     extra["defaults"] = defaults;
@@ -902,21 +876,14 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
             ));
         }
     }
-    let requested = o.agent.clone();
-    let explicitly_pinned = !requested.is_empty();
     let requested_tier = o.tier.clone();
-    if !requested.is_empty() && requested_tier.is_some() {
-        return Err("--agent and --tier contradict each other; give one".into());
-    }
-    let agent = if let Some(tier) = requested_tier.as_deref() {
-        tier_agent(tier)?
-    } else if !requested.is_empty() {
-        requested
-    } else {
-        s(&meta, "agent").to_string()
-    };
-    if agent != s(&meta, "agent") {
+    let legacy = s(&meta, "agent") != agents::AGENT;
+    if legacy && !o.fresh {
         o.fresh = true;
+        eprintln!(
+            "delegate: {} 的会话无法由 Pi 续接，已开新会话",
+            s(&meta, "agent")
+        );
     }
     let session = if o.fresh {
         None
@@ -928,10 +895,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     };
     if !o.fresh
         && (session.is_none()
-            || (agents::spec(s(&meta, "agent"))
-                .is_some_and(|a| a.session == SessionSource::DelegateFile)
-                && session_file(s(&meta, "sessionDir"), session.as_deref().unwrap_or(""))
-                    .is_none()))
+            || session_file(s(&meta, "sessionDir"), session.as_deref().unwrap_or("")).is_none())
     {
         return Err(format!("{} has no saved session to continue (runs before delegate 4.1 kept none); use --fresh to start a new session in the same place",parent.file_name().unwrap_or_default().to_string_lossy()));
     }
@@ -948,23 +912,19 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     if let Some(e) = nesting_error() {
         return Err(e);
     }
-    missing_tools(&agent)?;
-    o.agent = agent;
-    o.agent_pinned = explicitly_pinned || (requested_tier.is_none() && runs::agent_pinned(&meta));
-    o.tier = requested_tier
-        .or_else(|| {
-            if !explicitly_pinned && o.agent == s(&meta, "agent") {
-                meta["tier"].as_str().map(str::to_string)
-            } else {
-                None
-            }
-        })
-        .or_else(|| {
-            agents::spec(&o.agent)
-                .and_then(|agent| agent.default_tier)
-                .map(str::to_string)
-        });
-    if o.agent == s(&meta, "agent") {
+    o.agent = agents::AGENT.into();
+    missing_tools(&o.agent)?;
+    o.agent_pinned = requested_tier.is_none() && !legacy && runs::agent_pinned(&meta);
+    let default_tier = if s(&meta, "mode") == "read-only" {
+        "cheap"
+    } else {
+        "strong"
+    };
+    o.tier = requested_tier.clone().or_else(|| {
+        let tier = meta["tier"].as_str().filter(|t| !t.is_empty());
+        Some(tier.unwrap_or(default_tier).to_string())
+    });
+    if requested_tier.is_none() && !legacy {
         o.provider = meta["provider"].as_str().map(str::to_string);
         o.model = meta["model"].as_str().map(str::to_string);
         o.thinking = meta["thinking"].as_str().map(str::to_string);
@@ -1033,6 +993,11 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         .filter(|x| !x.is_empty())
         .unwrap_or(s(&meta, "top"));
     let config = crate::config::load(Some(Path::new(top)))?;
+    let tier_models = if requested_tier.is_some() || legacy {
+        apply_tier_model(&mut o, &config.value)
+    } else {
+        tier_models(&config.value)
+    };
     let deny_accept_conflicts =
         crate::deny::conflicts(o.accept.as_deref(), &prompt, &meta["agentDeny"]);
     for command in &deny_accept_conflicts {
@@ -1130,6 +1095,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         .collect::<Vec<_>>();
     extra["configSources"] = json!(sources);
     extra["configCapacity"] = capacities;
+    extra["tierModels"] = tier_models;
     extra["sourceBuild"] = config.value["sourceBuild"].clone();
     extra["sourceBuildRoot"] = meta.get("sourceBuildRoot").cloned().unwrap_or(json!(top));
     if runs::interrupted(s(&summary, "state")) && s(&meta, "mode") == "write" {
@@ -1206,34 +1172,19 @@ pub fn repo_key_for_meta(meta: &Value) -> String {
         source
     }))
 }
-pub fn capacity(agent: &str, active_runs: &[PathBuf], config: &Value, repo: &str) -> Res<()> {
+pub fn capacity(active_runs: &[PathBuf], config: &Value, repo: &str) -> Res<()> {
     let total = crate::config::capacity(config, "maxActive", "MAX_ACTIVE", 12)?;
-    let codex = crate::config::capacity(config, "maxCodex", "MAX_CODEX", 6)?;
     let repo_total = crate::config::capacity(config, "repoMaxActive", "REPO_MAX_ACTIVE", 8)?;
-    let repo_codex = crate::config::capacity(config, "repoMaxCodex", "REPO_MAX_CODEX", 4)?;
     let repo_runs: Vec<PathBuf> = active_runs
         .iter()
         .filter(|run| repo_key_for_meta(&json(run.join("meta.json"))) == repo)
         .cloned()
         .collect();
-    let is_codex = |run: &&PathBuf| {
-        agents::spec(s(&json(run.join("meta.json")), "agent")).is_some_and(|a| a.heavy)
-    };
-    let codex_count = active_runs.iter().filter(is_codex).count();
-    let repo_codex_count = repo_runs.iter().filter(is_codex).count();
-    let heavy = agents::spec(agent).is_some_and(|a| a.heavy);
     let (reason, related) = if total > 0 && active_runs.len() >= total as usize {
         (
             format!(
                 "{} runs are active on this machine (DELEGATE_MAX_ACTIVE={total})",
                 active_runs.len()
-            ),
-            active_runs,
-        )
-    } else if heavy && codex > 0 && codex_count >= codex as usize {
-        (
-            format!(
-                "{codex_count} Codex runs are active on this machine (DELEGATE_MAX_CODEX={codex})"
             ),
             active_runs,
         )
@@ -1245,8 +1196,6 @@ pub fn capacity(agent: &str, active_runs: &[PathBuf], config: &Value, repo: &str
             ),
             repo_runs.as_slice(),
         )
-    } else if heavy && repo_codex > 0 && repo_codex_count >= repo_codex as usize {
-        (format!("{repo_codex_count} Codex runs are active in this repository (DELEGATE_REPO_MAX_CODEX={repo_codex})"), repo_runs.as_slice())
     } else {
         (String::new(), active_runs)
     };
@@ -1349,7 +1298,7 @@ pub fn launch(
         Path::new(source)
     });
     if !deferred {
-        capacity(&o.agent, &active_runs, &extra["configCapacity"], &repo)?;
+        capacity(&active_runs, &extra["configCapacity"], &repo)?;
     }
     if !deferred && mode == "write" && !o.parallel && !extra["worktree"].is_object() {
         for run in all_runs() {
@@ -1452,11 +1401,7 @@ pub fn launch(
             } else {
                 o.accept.as_deref()
             },
-            mode == "read-only"
-                && (agents::spec(&o.agent)
-                    .expect("validated agent")
-                    .read_only_contract
-                    || extra["worktree"].is_object()),
+            mode == "read-only" && extra["worktree"].is_object(),
             false,
             &o.protect,
             &o.protect_reasons,
@@ -1511,11 +1456,7 @@ pub fn launch(
         },
     )?;
     let mut fork_value = fork.map(str::to_string);
-    if let (true, Some(fork_id), SessionSource::DelegateFile) = (
-        parent.is_object(),
-        fork,
-        agents::spec(&o.agent).expect("validated agent").session,
-    ) {
+    if let (true, Some(fork_id)) = (parent.is_object(), fork) {
         let source = session_file(s(parent, "sessionDir"), fork_id)
             .ok_or_else(|| "missing parent session".to_string())?;
         fs::create_dir(run.join("fork")).map_err(|e| e.to_string())?;
@@ -1631,6 +1572,7 @@ pub fn launch(
     meta["agentBin"] = json!(agent_bin);
     meta["configSources"] = extra.get("configSources").cloned().unwrap_or(json!([]));
     meta["configCapacity"] = extra["configCapacity"].clone();
+    meta["tierModels"] = extra["tierModels"].clone();
     for key in [
         "standing",
         "standingSources",

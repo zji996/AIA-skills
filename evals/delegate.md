@@ -7,7 +7,7 @@
 
 ## 5.27 stall 与 check-in
 
-- 未给 `--timeout` 的任务不会继承 Pi/Codex 默认上限；idle 30m、command 90m stall 可由环境或配置缩短，停滞状态保留改动且 reply 不耗返工。
+- 未给 `--timeout` 的任务不会继承 Pi 默认上限；idle 30m、command 90m stall 可由环境或配置缩短，停滞状态保留改动且 reply 不耗返工。
 - Claude Code 无 `--max` 的 wait 在 55m 输出进度 glance 并退出 75；`wait --stream` 按同一间隔输出 glance 后继续，行尾给出原命令供重跑。
 
 ## 5.26 真实主控使用回归
@@ -61,8 +61,8 @@
 - 用户或仓库默认 evidence 自动用于写入，read-only 不继承默认；reply 沿用上一轮命令和超时，`--no-evidence` 关闭。验收失败或 protect 违规跳过证据，原 PATH 不受 agentDeny shim 影响。
 - 只禁不带过滤参数的 `cargo xtask infra-test`：agentDeny 设 `exact: true`，额外参数放行；用户/仓库去重与 allow 撤销按 `(argv, exact)` 匹配。
 - 主控已用 git 手动合入完整改动（尚未 commit）：status/wait/clean 比较源工作树最终内容、删除与执行位，全部包含显示“已合入（主干已含改动）”、appliedBy detected，clean --finished 可清；部分合入或读取失败仍建议 apply。Detect manual integration from working tree contents.
-- 显式 `--agent pi` 未指定 tier：短行 pi/cheap，JSON tier cheap、agentPinned true；codex 默认 strong；旧记录只推断显示，固定同事仍不自动升档。
-- 多项目同时委派：整机默认 12/6/2，每仓库默认 repoMaxActive 8/repoMaxCodex 4；git worktree 与主仓库同计，非 git 按规范化路径；命中上限说明层级、计数并只列该层任务，--after 等容量遵守两层。
+- 显式 `--model` 固定模型：短行仍显示所在档位（如 pi/cheap），JSON agentPinned true，不自动升档；`--agent` 已删除并退出 2；旧 Codex 记录 reply 时由 Pi 开新会话续做。
+- 多项目同时委派：整机默认任务 12、重命令 2，每仓库默认 repoMaxActive 8；git worktree 与主仓库同计，非 git 按规范化路径；命中上限说明层级、计数并只列该层任务，--after 等容量遵守两层。
 - Claude Code Monitor 能将后台逐行输出变事件：优先后台 wait --stream；只有结束通知则重复后台 wait --any。新字段可选，protocol 保持 1。
 
 ## 5.17 用户配置与仓库事实
@@ -70,7 +70,7 @@
 - 多个仓库共用禁止同事全量检查的规则：把 agentDeny、通用 env 与 maxRework 写入用户级 delegate/config.json，仓库只补自己的字段。Shared user config applies across repositories.
 - 某仓库需要同事运行用户级禁止的一条命令：仓库 agentDeny 用完全相同 argv 和 allow: true 撤销，其他用户规则仍生效。
 - 用户 env 与仓库 env 同键：仓库覆盖，其他键合并；仓库未声明 accept 时用用户默认，显式 --accept / --no-accept 优先。
-- 换机器时设置 maxActive/maxCodex/maxHeavy：用户配置提供容量，仓库可覆盖，DELEGATE_MAX_* 最高；同事不得自行放宽容量。
+- 换机器时设置 maxActive/maxHeavy 与 tiers 模型：用户配置提供容量，仓库可覆盖，DELEGATE_MAX_* 最高；同事不得自行放宽容量。
 - 用户配置误写 worktree、generated 或 applyVerify：start 在 stderr 提示一次并忽略，仓库事实留在 .delegate.json；错误字段和损坏 JSON 必须指出文件并退出 2。
 - 查看规则来自哪里：status --json 与 summary 的 configSources 区分 user/repo，自然语言结论保持简短。
 
@@ -108,14 +108,14 @@
 - Delegate the migration of these three config files to a background agent and review the diff afterwards.
 - 让 Pi 只读审查存储布局，控制台别刷读取步骤，只给我最终结论和错误。
 - 把这个 bug 交给 Pi 修，跑 `npm test` 通过才算完成，我先去做别的。
-- 让 GPT 用 Codex 独立审一下这个迁移方案，和 Gemini 的意见对照看看。
-- （主控自发）我继续改代码，同时让 Codex 分运行时、API/调度、前端三路只读审查这批提交。
+- 让强档模型独立审一下这个迁移方案，和便宜档的意见对照看看。
+- （主控自发）我继续改代码，同时让同事分运行时、API/调度、前端三路只读审查这批提交。
 - 这十几篇文档让便宜的模型各自概括一下要点，我汇总。
 - 这个修复交给强一点的模型做，测试过了再给我看 diff。
 - 这是移动端设置页的截图，找个同事看看布局哪里别扭。
-- 这个锁释放的并发 bug 交给 GPT 修，`go test ./...` 通过为准。
+- 这个锁释放的并发 bug 交给强档同事修，`go test ./...` 通过为准。
 - （主控自发）要审 api、worker、web 三块的错误处理，各自独立，分给同事并行做。
-- 让 Codex 在单独的 worktree 里改上传接口，别碰我现在的工作区，改完给我看改了哪些文件再合并。
+- 让同事在单独的 worktree 里改上传接口，别碰我现在的工作区，改完给我看改了哪些文件再合并。
 - 刚才那个任务让 Pi 接着把测试补上，就在它原来的会话里继续。
 - 把 `.local/scan` 里准备好的忽略材料复制进同事的 worktree，让它接着审查；我先去忙，回头再收 reply 结果。
 - 继续上轮任务，并把我后来补的测试同步给同事；这次等它答完再返回。

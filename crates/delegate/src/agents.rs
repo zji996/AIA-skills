@@ -24,91 +24,28 @@ struct WatchState {
     command: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SessionSource {
-    DelegateFile,
-    EventStream,
-}
-
 /// Harness-facing protocol version; bump when docs/delegate-protocol.md §2 breaks.
 pub const PROTOCOL: u32 = 1;
 
-pub struct AgentSpec {
-    pub name: &'static str,
-    pub default_tier: Option<&'static str>,
-    pub heavy: bool,
-    pub session: SessionSource,
-    pub read_only_contract: bool,
-    active_env: Option<&'static str>,
-    install_hint: fn() -> String,
-    build_command: fn(&Value, Option<&str>) -> Vec<String>,
-    filter_events: fn(&Value) -> Vec<Value>,
-    turn_model: Option<fn(&Value) -> Value>,
-    settles_on_turn: bool,
-    clears_answer_on_turn: bool,
-}
+/// The one colleague. Tiers choose its model, not another agent.
+pub const AGENT: &str = "pi";
+pub const TIERS: [&str; 2] = ["cheap", "strong"];
 
-pub static AGENTS: &[AgentSpec] = &[
-    AgentSpec {
-        name: "pi",
-        default_tier: Some("cheap"),
-        heavy: false,
-        session: SessionSource::DelegateFile,
-        read_only_contract: false,
-        active_env: Some("PI_DELEGATE_ACTIVE"),
-        install_hint: pi_install_hint,
-        build_command: command_pi,
-        filter_events: filter_pi,
-        turn_model: None,
-        settles_on_turn: false,
-        clears_answer_on_turn: true,
-    },
-    AgentSpec {
-        name: "codex",
-        default_tier: Some("strong"),
-        heavy: true,
-        session: SessionSource::EventStream,
-        read_only_contract: true,
-        active_env: None,
-        install_hint: codex_install_hint,
-        build_command: command_codex,
-        filter_events: filter_codex,
-        turn_model: Some(codex_turn_model),
-        settles_on_turn: true,
-        clears_answer_on_turn: false,
-    },
-];
-
-pub fn spec(name: &str) -> Option<&'static AgentSpec> {
-    AGENTS.iter().find(|agent| agent.name == name)
-}
-
-pub fn default_for_tier(tier: &str) -> &'static AgentSpec {
-    AGENTS
-        .iter()
-        .find(|agent| agent.default_tier == Some(tier))
-        .expect("configured tier")
-}
-
-pub fn choices(separator: &str) -> String {
-    AGENTS
-        .iter()
-        .map(|agent| agent.name)
-        .collect::<Vec<_>>()
-        .join(separator)
+/// The Pi `--model` pattern a tier runs (`provider/id[:thinking]`); empty means
+/// Pi's own default from its settings.json.
+pub fn tier_model(config: &Value, tier: &str) -> String {
+    let configured = config["tiers"][tier].as_str().unwrap_or("");
+    setting(&format!("{}_MODEL", tier.to_uppercase()), configured)
 }
 
 pub fn nesting_error() -> Option<String> {
     let caller = setting("AGENT", "");
     let caller = if caller.is_empty() {
-        AGENTS
-            .iter()
-            .find(|agent| {
-                agent
-                    .active_env
-                    .is_some_and(|key| env::var_os(key).is_some())
-            })
-            .map_or("", |agent| agent.name)
+        if env::var_os("PI_DELEGATE_ACTIVE").is_some() {
+            AGENT
+        } else {
+            ""
+        }
     } else {
         &caller
     };
@@ -153,42 +90,30 @@ fn agent_bins(agent: &str) -> Vec<(PathBuf, PathBuf)> {
 }
 /// The harness-facing capability line (`delegate protocol`, docs/delegate-protocol.md).
 pub fn protocol() -> Value {
-    let tiers_of = |name: &str| {
-        ["cheap", "strong"]
-            .into_iter()
-            .filter(|tier| {
-                setting(
-                    &format!("{}_AGENT", tier.to_uppercase()),
-                    default_for_tier(tier).name,
-                ) == name
-            })
-            .collect::<Vec<_>>()
-    };
-    let agents = AGENTS
+    let config = crate::config::load(git_top(&env::current_dir().unwrap_or_default()).as_deref())
+        .map(|c| c.value)
+        .unwrap_or_else(|_| json!({}));
+    let bins = agent_bins(AGENT);
+    let version = agent_identity(AGENT).ok().and_then(|(_, v)| v);
+    let models: serde_json::Map<String, Value> = TIERS
         .iter()
-        .map(|agent| {
-            let bins = agent_bins(agent.name);
-            let version = agent_identity(agent.name).ok().and_then(|(_, v)| v);
-            json!({
-                "name": agent.name,
-                "tiers": tiers_of(agent.name),
-                "available": !bins.is_empty(),
-                "bin": bins.first().map(|(_, real)| real),
-                "version": version,
-                "shadowed": bins.iter().skip(1).map(|(path, _)| path).collect::<Vec<_>>(),
-            })
-        })
-        .collect::<Vec<_>>();
+        .map(|tier| (tier.to_string(), json!(tier_model(&config, tier))))
+        .collect();
     let caller = caller_source().map(|(id, source)| json!({"id": id, "source": source}));
     json!({
         "protocol": PROTOCOL,
         "version": env!("CARGO_PKG_VERSION"),
         "caller": caller,
-        "agents": agents,
-        "capacityDefaults": {
-            "maxActive": 12, "maxCodex": 6, "maxHeavy": 2,
-            "repoMaxActive": 8, "repoMaxCodex": 4,
-        },
+        "agents": [{
+            "name": AGENT,
+            "tiers": TIERS,
+            "models": models,
+            "available": !bins.is_empty(),
+            "bin": bins.first().map(|(_, real)| real),
+            "version": version,
+            "shadowed": bins.iter().skip(1).map(|(path, _)| path).collect::<Vec<_>>(),
+        }],
+        "capacityDefaults": {"maxActive": 12, "maxHeavy": 2, "repoMaxActive": 8},
     })
 }
 pub fn agent_identity(agent: &str) -> Res<(PathBuf, Option<String>)> {
@@ -230,17 +155,13 @@ pub fn missing_tools(agent: &str) -> Res<()> {
     if agent_available(agent) {
         return Ok(());
     }
-    let agent = spec(agent).ok_or_else(|| format!("missing required tools: {agent}"))?;
+    if agent != AGENT {
+        return Err(format!("missing required tools: {agent}"));
+    }
     Err(format!(
-        "missing required tools: {}\n  {}: {}",
-        agent.name,
-        agent.name,
-        (agent.install_hint)()
+        "missing required tools: {AGENT}\n  {AGENT}: {}",
+        pi_install_hint()
     ))
-}
-
-fn codex_install_hint() -> String {
-    "see https://github.com/openai/codex (npm i -g @openai/codex), then log in".into()
 }
 
 fn pi_install_hint() -> String {
@@ -331,75 +252,6 @@ fn filter_pi(v: &Value) -> Vec<Value> {
         _ => vec![],
     }
 }
-fn filter_codex(v: &Value) -> Vec<Value> {
-    let kind = s(v, "type");
-    let item = &v["item"];
-    let ty = s(item, "type");
-    match kind {
-        "thread.started" if !s(v, "thread_id").is_empty() => {
-            vec![json!({"e":"session","id":s(v,"thread_id")})]
-        }
-        "item.started" if ty == "command_execution" => {
-            vec![json!({"e":"bash","cmd":clip(s(item,"command"),180)})]
-        }
-        "item.completed" => match ty {
-            "command_execution" => vec![json!({"e":"bash_done","ok":n(item,"exit_code")==0})],
-            "file_change" => item["changes"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .map(|x| json!({"e":"edit","path":s(x,"path")}))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            "agent_message" => vec![json!({"e":"message","text":s(item,"text")})],
-            "error" => vec![json!({"e":"warning","detail":clip(s(item,"message"),240)})],
-            "mcp_tool_call" | "web_search" | "todo_list" => vec![
-                json!({"e":"tool","tool":ty,"arg":clip(if !s(item,"query").is_empty(){s(item,"query")}else{s(item,"tool")},160)}),
-            ],
-            _ => vec![],
-        },
-        "turn.completed" => {
-            let u = &v["usage"];
-            vec![
-                json!({"e":"turn","stopReason":"stop","usage":{"input":usage(u,"input_tokens"),"output":usage(u,"output_tokens"),"cacheRead":usage(u,"cached_input_tokens")}}),
-            ]
-        }
-        "turn.failed" | "error" => vec![
-            json!({"e":"turn_error","detail":clip(if !s(&v["error"],"message").is_empty(){s(&v["error"],"message")}else if !s(v,"message").is_empty(){s(v,"message")}else{kind},300)}),
-        ],
-        _ => vec![],
-    }
-}
-fn codex_home() -> PathBuf {
-    env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".codex"))
-}
-fn codex_model() -> Option<String> {
-    let path = codex_home().join("config.toml");
-    for line in read(path).lines() {
-        let line = line.trim();
-        if let Some(v) = line.strip_prefix("model") {
-            let v = v.trim_start();
-            if let Some(v) = v.strip_prefix('=') {
-                let v = v.trim();
-                if v.starts_with('"') && v.ends_with('"') {
-                    return Some(v.trim_matches('"').into());
-                }
-            }
-        }
-    }
-    None
-}
-fn codex_turn_model(meta: &Value) -> Value {
-    if !s(meta, "model").is_empty() {
-        json!(s(meta, "model"))
-    } else {
-        json!(codex_model())
-    }
-}
-
 fn stall_seconds(meta: &Value, key: &str) -> Option<f64> {
     let env_name = format!("STALL_{}", key.to_uppercase());
     let default = if key == "idle" { "30m" } else { "90m" };
@@ -412,53 +264,6 @@ fn stall_seconds(meta: &Value, key: &str) -> Option<f64> {
         return None;
     }
     seconds(&value).ok().filter(|n| *n > 0.0)
-}
-
-fn command_codex(meta: &Value, _session: Option<&str>) -> Vec<String> {
-    let fork = s(meta, "fork");
-    let images = meta["images"].as_array().cloned().unwrap_or_default();
-    let mut a = vec!["codex".into(), "exec".into()];
-    if !fork.is_empty() {
-        a.extend(["fork".into(), fork.into()]);
-    }
-    a.extend(["--json".into(), "--skip-git-repo-check".into()]);
-    if fork.is_empty() {
-        a.extend(["-C".into(), s(meta, "workdir").into()]);
-    }
-    a.push("--dangerously-bypass-approvals-and-sandbox".into());
-    a.extend(codex_colleague_config());
-    if !s(meta, "model").is_empty() {
-        a.extend(["-m".into(), s(meta, "model").into()]);
-    }
-    for (key, label) in [
-        ("thinking", "model_reasoning_effort"),
-        ("provider", "model_provider"),
-    ] {
-        if !s(meta, key).is_empty() {
-            a.extend(["-c".into(), format!("{label}=\"{}\"", s(meta, key))]);
-        }
-    }
-    for image in images {
-        a.push(format!("--image={}", image.as_str().unwrap_or("")));
-    }
-    a.push("-".into());
-    a
-}
-
-// Colleagues never delegate: Codex's own sub-agents (and their prompt layers)
-// are switched off, and the delegate skill is hidden from the skill list.
-fn codex_colleague_config() -> Vec<String> {
-    let mut a = vec!["-c".into(), "features.multi_agent=false".into()];
-    let skills: Vec<String> = [codex_home().join("skills"), home().join(".agents/skills")]
-        .iter()
-        .map(|dir| dir.join("delegate/SKILL.md"))
-        .filter(|path| path.is_file())
-        .map(|path| format!("{{path={},enabled=false}}", json!(path.to_string_lossy())))
-        .collect();
-    if !skills.is_empty() {
-        a.extend(["-c".into(), format!("skills.config=[{}]", skills.join(","))]);
-    }
-    a
 }
 
 fn command_pi(meta: &Value, session: Option<&str>) -> Vec<String> {
@@ -560,7 +365,12 @@ pub fn run_agent(
     holder: Arc<AtomicI32>,
     grace_out: Arc<std::sync::Mutex<Option<f64>>>,
 ) -> Res<(String, String)> {
-    let agent = spec(s(meta, "agent")).ok_or_else(|| "unknown agent".to_string())?;
+    if s(meta, "agent") != AGENT {
+        return Err(format!(
+            "{} runs are no longer supported; delegate runs Pi only",
+            s(meta, "agent")
+        ));
+    }
     let uuid = format!(
         "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
         now_ns() as u32,
@@ -569,7 +379,7 @@ pub fn run_agent(
         0u16,
         (now_ns() >> 8) as u64 & 0xffffffffffff
     );
-    let session = if agent.session == SessionSource::EventStream || !s(meta, "fork").is_empty() {
+    let session = if !s(meta, "fork").is_empty() {
         None
     } else {
         Some(uuid)
@@ -579,7 +389,7 @@ pub fn run_agent(
         .ok()
         .map(|e| e.flatten().map(|x| x.path()).collect::<Vec<_>>())
         .unwrap_or_default();
-    let mut args = (agent.build_command)(meta, session.as_deref());
+    let mut args = command_pi(meta, session.as_deref());
     if !s(meta, "agentBin").is_empty() {
         args[0] = s(meta, "agentBin").to_string();
     }
@@ -620,9 +430,7 @@ pub fn run_agent(
     crate::deny::inject(&mut c, meta, run)?;
     c.env("DELEGATE_AGENT", s(meta, "agent"))
         .env("DELEGATE_RUN_DIR", s(meta, "dir"));
-    if let Some(env_name) = agent.active_env {
-        c.env(env_name, "1");
-    }
+    c.env("PI_DELEGATE_ACTIVE", "1");
     group(&mut c);
     let mut child = c.spawn().map_err(|e| e.to_string())?;
     let pid = child.id() as i32;
@@ -773,13 +581,8 @@ pub fn run_agent(
             let Ok(event) = serde_json::from_slice::<Value>(&raw) else {
                 continue;
             };
-            for mut item in (agent.filter_events)(&event) {
+            for mut item in filter_pi(&event) {
                 let kind = s(&item, "e").to_string();
-                if kind == "turn" {
-                    if let Some(turn_model) = agent.turn_model {
-                        item["model"] = turn_model(meta);
-                    }
-                }
                 item["attempt"] = json!(attempt);
                 item["at"] = json!(iso());
                 {
@@ -807,10 +610,7 @@ pub fn run_agent(
                 match kind.as_str() {
                     "turn" => {
                         turn = item;
-                        settled |= agent.settles_on_turn;
-                        if agent.clears_answer_on_turn {
-                            answer.clear();
-                        }
+                        answer.clear();
                     }
                     "result" | "message" => answer = s(&item, "text").into(),
                     "settled" => settled = true,
@@ -846,7 +646,7 @@ pub fn run_agent(
     let _ = watcher.join();
     holder.store(0, Ordering::SeqCst);
     let status = child.wait().map_err(|e| e.to_string())?;
-    if agent.session == SessionSource::DelegateFile {
+    {
         let mut created = fs::read_dir(session_dir)
             .ok()
             .map(|e| {
@@ -899,27 +699,9 @@ pub fn run_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
-    fn args(agent: &str, meta: &Value, session: Option<&str>) -> Vec<String> {
-        (spec(agent).unwrap().build_command)(meta, session)
-    }
-
-    #[test]
-    fn agent_names_and_tier_defaults_are_unique() {
-        let mut names = HashSet::new();
-        for agent in AGENTS {
-            assert!(names.insert(agent.name), "duplicate agent: {}", agent.name);
-        }
-        for tier in ["cheap", "strong"] {
-            assert_eq!(
-                AGENTS
-                    .iter()
-                    .filter(|agent| agent.default_tier == Some(tier))
-                    .count(),
-                1
-            );
-        }
+    fn args(_agent: &str, meta: &Value, session: Option<&str>) -> Vec<String> {
+        command_pi(meta, session)
     }
 
     #[test]
@@ -974,59 +756,6 @@ mod tests {
                 "-p",
                 "@/a.png"
             ]
-        );
-    }
-
-    #[test]
-    fn codex_command_preserves_argument_order() {
-        let meta = json!({"workdir":"/repo","images":["/a.png","/b.png"],"provider":"p","model":"m","thinking":"high"});
-        let colleague = codex_colleague_config();
-        assert_eq!(colleague[..2], ["-c", "features.multi_agent=false"]);
-        let expected = |head: &[&str], tail: &[&str]| -> Vec<String> {
-            let head = head.iter().map(|s| s.to_string());
-            let tail = tail.iter().map(|s| s.to_string());
-            head.chain(colleague.iter().cloned()).chain(tail).collect()
-        };
-        assert_eq!(
-            args("codex", &meta, None),
-            expected(
-                &[
-                    "codex",
-                    "exec",
-                    "--json",
-                    "--skip-git-repo-check",
-                    "-C",
-                    "/repo",
-                    "--dangerously-bypass-approvals-and-sandbox",
-                ],
-                &[
-                    "-m",
-                    "m",
-                    "-c",
-                    "model_reasoning_effort=\"high\"",
-                    "-c",
-                    "model_provider=\"p\"",
-                    "--image=/a.png",
-                    "--image=/b.png",
-                    "-",
-                ]
-            )
-        );
-        let fork = json!({"fork":"thread-1","workdir":"/repo"});
-        assert_eq!(
-            args("codex", &fork, None),
-            expected(
-                &[
-                    "codex",
-                    "exec",
-                    "fork",
-                    "thread-1",
-                    "--json",
-                    "--skip-git-repo-check",
-                    "--dangerously-bypass-approvals-and-sandbox",
-                ],
-                &["-"]
-            )
         );
     }
 }

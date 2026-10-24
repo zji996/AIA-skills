@@ -8,7 +8,7 @@
 
 ## 会话
 
-每轮的会话都属于自己的 run：Pi 保存在 run 目录的 `session/` 下，Codex 使用自己的会话存储，`summary.json` 的 `session` 记下会话 id。`reply` 在每次尝试时从上一轮的会话**分叉**（Pi `--fork` 上一轮会话文件的副本，Codex `exec fork`），会话不被改动：答复畸形重跑时从同一处重新开始，清理早先的轮次也不影响后续追问。apply 后 worktree 删除，记录移到 `.applied/<run_id>/`，保留 7 天供 `reply` 续做。结局为 `malformed` 的轮次不算对话的延续，之后的 `reply` 与 `apply` 都从它的上一轮接着。4.1 之前的 run 使用 `--no-session`，不能 `reply`。
+每轮的会话都属于自己的 run：Pi 保存在 run 目录的 `session/` 下，`summary.json` 的 `session` 记下会话 id。`reply` 在每次尝试时从上一轮的会话**分叉**（Pi `--fork` 上一轮会话文件的副本），会话不被改动：答复畸形重跑时从同一处重新开始，清理早先的轮次也不影响后续追问。apply 后 worktree 删除，记录移到 `.applied/<run_id>/`，保留 7 天供 `reply` 续做。结局为 `malformed` 的轮次不算对话的延续，之后的 `reply` 与 `apply` 都从它的上一轮接着。4.1 之前的 run 使用 `--no-session`，不能 `reply`。
 
 写入任务上一轮为 `timeout`、`stalled` 或 `stopped` 时，下一次 reply 记 `meta.continuation`（上一轮状态）与 `rework.kind: "continuation"`，不消耗 maxRework，超限也可续做，改动超过 60 行也不补计。连续超时可以连续续做；rejected 等结局后仍按原返工规则。超时结论的 `next` 是可直接复制的续做命令，缺失会话自动带 `--fresh`，自然语言结论注明“不计返工次数”。
 
@@ -18,14 +18,14 @@
 - 根目录首次创建时写入只含 `*` 的 `.gitignore`，不污染 `git status`；run 目录权限为 `700`。
 - 整机并发登记放在 `${XDG_STATE_HOME}/delegate/`（未设变量时使用系统约定的用户状态目录）：每个运行中的任务一个 `*.slot` 文件，内容是其 run 目录；任务结束或目录被删后，下一次 `start` 自动清掉对应登记。这个位置刻意不提供 `DELEGATE_*` 覆盖，被委派的同事无法另起一个计数池。
 
-容量同时检查整机资源与仓库审查带宽：整机 `maxActive`/`maxCodex` 默认 12/6，仓库 `repoMaxActive`/`repoMaxCodex` 默认 8/4。仓库键按规范化 git common dir（主仓库与其 worktree 共用），非 git 目录按规范化路径。仓库计数仍来自整机 slot，不另建池；旧 slot 只有 run 目录时从 meta 反查仓库，新 slot 可附仓库键，读 slot 失败沿用原处理。拒绝说明命中的层级、当前计数与上限，只列该层相关运行任务；`--after` 等待容量时两层都生效。
+容量同时检查整机资源与仓库审查带宽：整机 `maxActive` 默认 12，仓库 `repoMaxActive` 默认 8。仓库键按规范化 git common dir（主仓库与其 worktree 共用），非 git 目录按规范化路径。仓库计数仍来自整机 slot，不另建池；旧 slot 只有 run 目录时从 meta 反查仓库，新 slot 可附仓库键，读 slot 失败沿用原处理。拒绝说明命中的层级、当前计数与上限，只列该层相关运行任务；`--after` 等待容量时两层都生效。
 
 ## 文件
 
 | 文件 | 内容 |
 |---|---|
 | `meta.json` | 启动参数、同事（`agent`）、workdir、模式、验收命令、启动时间；`standing`/`standingSources`、`defaults`、`share`、`resources`、`acceptBlind`、`resultDisplayChars`、`maxAnswer`；可选 `agentPinned`、仓库键 `repoKey`、证据命令 `evidenceCommand`、超时 `evidenceTimeoutSeconds` 和结果 `evidence`；`protect` 字符串数组与可选 `protectReasons` 原因映射（reply/fresh 继承） |
-| `prompt.md` | 同事实际收到的任务说明；末尾可能附完成标准（`--accept`）与只读边界（Codex 只读任务） |
+| `prompt.md` | 同事实际收到的任务说明；末尾可能附完成标准（`--accept`）与只读边界（worktree 里的只读任务） |
 | `events.jsonl` | 过滤后的全过程：读取、命令、编辑路径、错误、每轮模型与用量、重跑；不含编辑全文 |
 | `result.md` | 完整答复；自动压缩成功时为压缩后的答复 |
 | `result-original.md` / `compression.json` / `compression-prompt.md` | 自动压缩前的原文 / 是否成功、原文路径、失败原因 / 压缩追问 |
@@ -68,10 +68,8 @@ worktree 移除回收 compose 容器。5.24 meta 新增 `sourceBuildBytes`、`so
 |---|---|
 | `DELEGATE_RUNS` | run 根目录 |
 | `DELEGATE_MAX_ACTIVE` | 整机同时运行的任务上限，默认 12；`0` 不限 |
-| `DELEGATE_MAX_CODEX` | 整机 Codex 任务上限，默认 6；`0` 不限 |
 | `DELEGATE_MAX_HEAVY` | lane 同时放行的重命令数，默认 2；`0` 不限 |
 | `DELEGATE_REPO_MAX_ACTIVE` | 同仓库同时运行的任务上限，默认 8；`0` 不限 |
-| `DELEGATE_REPO_MAX_CODEX` | 同仓库 Codex 任务上限，默认 4；`0` 不限 |
 | `DELEGATE_MIN_AVAILABLE_MB` | 可用内存低于该值（MB）时拒绝启动，默认 4096；`0` 不检查 |
 | `DELEGATE_CGROUP` | `0` 关闭 delegate 自建用户 systemd scope；默认自动探测。项目脚本自行启动的 user unit 仍按任务归属回收 |
 | `DELEGATE_TIMEOUT_GRACE` | 同事超时后仍在工作时的宽限百分比，默认 10 |
@@ -81,8 +79,8 @@ worktree 移除回收 compose 容器。5.24 meta 新增 `sourceBuildBytes`、`so
 | `DELEGATE_SOURCE_BUILD_WARN_GIB` | 源仓库构建目录缓存占用提示阈值，默认 60 GiB；`0` 关闭，支持小数 |
 | `DELEGATE_WORKTREE_WARN_GIB` | 本仓库已结束 worktree 占用提示阈值，默认 20 GiB；`0` 关闭 |
 | `DELEGATE_POLL` | `wait --progress`、4.4 之前的 run 与刚启动的 supervisor 的检查间隔秒数，默认 1；其余等待不轮询 |
-| `DELEGATE_CHEAP_AGENT` / `DELEGATE_STRONG_AGENT` | 档位对应的同事，默认 `pi` / `codex` |
-| `DELEGATE_AGENT` | 由脚本导出给同事（`pi`/`codex`）；设有它的进程不能再委派 |
+| `DELEGATE_CHEAP_MODEL` / `DELEGATE_STRONG_MODEL` | 档位对应的 Pi 模型，覆盖配置 `tiers`；空则用 Pi 默认模型 |
+| `DELEGATE_AGENT` | 由脚本导出给同事（`pi`）；设有它的进程不能再委派 |
 | `PI_DELEGATE_ACTIVE` | 旧版标记，仍导出给 Pi；存在时视为 Pi 调用者 |
 | `DELEGATE_CALLER` | 主控会话标识，无参 `wait` 据此只收本会话的任务；未设时依次取 `CLAUDE_CODE_SESSION_ID`、`CODEX_THREAD_ID`、`PI_SESSION_ID`。`$D protocol` 显示当前取到的值与来源 |
 

@@ -68,29 +68,6 @@ SETTLED = {"type": "agent_settled"}
 LEAKED = "Let's read `trainingStyles.ts` as well.call:default_api:read{limit:120,offset:1,path:src/trainingStyles.ts}"
 
 
-def codex_events(answer_text="final answer", files=(), fail=None):
-    """Shape of real `codex exec --json` output (codex-cli 0.156), incl. its config-warning items."""
-    events = [{"type": "thread.started", "thread_id": "t1"},
-              {"type": "item.completed", "item": {"id": "item_0", "type": "error",
-                                                  "message": "Codex is ignoring 3 unrecognized configuration settings."}},
-              {"type": "turn.started"},
-              {"type": "item.completed", "item": {"id": "item_1", "type": "agent_message", "text": "Let me look first."}},
-              {"type": "item.started", "item": {"id": "item_2", "type": "command_execution", "command": "cat calc.py"}},
-              {"type": "item.completed", "item": {"id": "item_2", "type": "command_execution", "command": "cat calc.py",
-                                                  "exit_code": 0, "status": "completed"}}]
-    if files:
-        events.append({"type": "item.completed", "item": {"id": "item_3", "type": "file_change",
-                                                          "changes": [{"path": f, "kind": "update"} for f in files]}})
-    if fail:
-        events.append({"type": "turn.failed", "error": {"message": fail}})
-        return events
-    if answer_text is not None:
-        events.append({"type": "item.completed", "item": {"id": "item_4", "type": "agent_message", "text": answer_text}})
-    events.append({"type": "turn.completed", "usage": {"input_tokens": 52618, "cached_input_tokens": 38784,
-                                                       "output_tokens": 430}})
-    return events
-
-
 class DelegateTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="delegate-")
@@ -104,9 +81,7 @@ class DelegateTests(unittest.TestCase):
                         DELEGATE_RUNS=str(self.work / "runs"), XDG_STATE_HOME=str(self.work / "state"),
                         XDG_CACHE_HOME=str(self.work / "cache"),
                         XDG_CONFIG_HOME=str(self.work / "config"),
-                        PI_LOG=str(self.work / "pi.log"),
-                        # Both tiers map to the fake Pi unless a test says otherwise (see the tier tests).
-                        DELEGATE_STRONG_AGENT="pi")
+                        PI_LOG=str(self.work / "pi.log"))
         # Cleanup tests must never contact the host's Docker daemon.
         docker = self.bin / "docker"
         docker.write_text("#!/bin/sh\nexit 0\n")
@@ -509,14 +484,11 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         pi.write_text("\n".join(lines) + "\n")
         pi.chmod(0o755)
 
-    def fake_codex(self, events, pre=""):
-        lines = ["#!/bin/sh", '[ "$1" = --version ] && { echo "fake-codex 1.0"; exit 0; }',
-                 'cat > "$PI_LOG.codex-prompt"',
-                 'echo "$$ ${DELEGATE_AGENT:-} ${PI_DELEGATE_ACTIVE:-} $*" >> "$PI_LOG.codex"', pre,
-                 "printf '%s\\n' " + " ".join(shlex.quote(json.dumps(e)) for e in events)]
-        codex = self.bin / "codex"
-        codex.write_text("\n".join(lines) + "\n")
-        codex.chmod(0o755)
+    def user_config(self, value):
+        path = Path(self.env["XDG_CONFIG_HOME"]) / "delegate/config.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(value))
+        return path
 
     def cli(self, *args, stdin=None, cwd=None, timeout=30, human=False):
         if not human and args and args[0] in {"start", "run", "reply", "wait", "status", "list", "stop"} \
@@ -626,7 +598,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         self.assertEqual(top.returncode, 0, top.stderr)
         for command in ("start", "run", "reply", "wait", "status", "result", "diff", "apply", "lane", "stop", "clean"):
             self.assertIn(command, top.stdout)
-        for command, options in (("start", ("--tier", "--agent", "--read-only", "--accept", "--worktree", "--in-place")),
+        for command, options in (("start", ("--tier", "--model", "--read-only", "--accept", "--worktree", "--in-place")),
                                  ("reply", ("--fresh", "--accept", "--wait")), ("wait", ("--max", "--no-result")),
                                  ("lane", ("--label",)), ("apply", ("--merge", "--dry-run"))):
             result = self.cli(command, "--help")
@@ -696,7 +668,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
 
     def test_agent_executable_and_version_are_recorded_in_meta_and_status(self):
         self.fake_pi([answer("ok"), SETTLED])
-        state = self.outcome(self.cli("run", "--agent", "pi", "task"))
+        state = self.outcome(self.cli("run", "task"))
         meta = json.loads((Path(state["dir"]) / "meta.json").read_text())
         self.assertEqual(meta["agentBin"], str((self.bin / "pi").resolve()))
         self.assertTrue(Path(meta["agentBin"]).is_absolute())
@@ -707,7 +679,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
     def test_supervisor_startup_timeout_reaps_process_before_crashed_result(self):
         self.fake_pi([answer("late"), SETTLED])
         self.env.update(DELEGATE_TEST_SUPERVISOR_DELAY="2s", DELEGATE_TEST_STARTUP_TIMEOUT="0.2s")
-        result = self.cli("start", "--agent", "pi", "task")
+        result = self.cli("start", "task")
         self.assertNotEqual(result.returncode, 0)
         run, = (self.work / "runs").glob("*/meta.json")
         run = run.parent
@@ -1550,66 +1522,31 @@ db.write_text(json.dumps(units))
         self.assertEqual(self.cli("start", "   ").returncode, 2)
         self.assertEqual(self.cli("start", "--workdir", self.work / "missing", "task").returncode, 2)
 
-    def test_codex_backend_delivers_through_the_same_contract(self):
-        self.fake_codex(codex_events("fixed add()", files=[str(self.work / "calc.py")]), pre="touch made.txt")
-        result = self.cli("run", "--agent", "codex", "--model", "gpt-test", "--thinking", "low",
-                          "--accept", "test -f made.txt", "修复 add")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        state = self.outcome(result)
-        self.assertEqual((state["state"], state["agent"], state["model"], state["turns"]),
-                         ("delivered", "codex", "gpt-test", 1))
-        self.assertEqual(state["files"], ["calc.py"])
-        self.assertEqual(state["tokens"], {"input": 52618, "output": 430, "cacheRead": 38784})
-        self.assertIn("fixed add()", result.stdout)
-        self.assertNotIn("Let me look first", result.stdout)
-        call = (self.work / "pi.log.codex").read_text().split()
-        self.assertEqual(call[1], "codex")  # the agent knows who it is, for nesting rules
-        args = " ".join(call[2:])
-        for flag in ("exec --json", "--skip-git-repo-check", "-m gpt-test", 'model_reasoning_effort="low"',
-                     "--dangerously-bypass-approvals-and-sandbox"):
-            self.assertIn(flag, args)  # full access regardless of the host's config.toml
-        self.assertNotIn("--sandbox", args)
-        self.assertIn("```sh\ntest -f made.txt\n```", (self.work / "pi.log.codex-prompt").read_text())
-
-    def test_codex_failures_and_empty_answers(self):
-        self.fake_codex(codex_events(fail="stream disconnected"))
-        state = self.outcome(self.cli("run", "--agent", "codex", "task"))
-        self.assertEqual(state["state"], "failed")
-        self.assertIn("stream disconnected", state["error"])
-        self.fake_codex(codex_events(answer_text=None))
-        state = self.outcome(self.cli("run", "--agent", "codex", "--retries", "0", "task"))
-        self.assertEqual(state["state"], "answered")  # the earlier progress message is its last word
-        events = codex_events(answer_text=None)
-        events = [e for e in events if (e.get("item") or {}).get("type") != "agent_message"]
-        self.fake_codex(events)
-        self.assertEqual(self.outcome(self.cli("run", "--agent", "codex", "--retries", "0", "task"))["state"], "malformed")
-
-    def test_codex_read_only_is_stated_and_checked_by_outcome(self):
+    def test_read_only_is_stated_and_checked_by_outcome(self):
         repo = self.work / "repo"
         repo.mkdir()
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
-        self.fake_codex(codex_events("looked"), pre="echo oops > stray.txt")
-        state = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "--workdir", repo, "审查一下"))
+        self.fake_pi([answer("looked"), SETTLED], pre="echo oops > stray.txt")
+        state = self.outcome(self.cli("run", "--read-only", "--workdir", repo, "审查一下"))
         # The answer stands; the stray write stayed in the run's own worktree and is only reported.
         self.assertEqual((state["state"], state["readOnlyViolation"]), ("answered", ["stray.txt"]))
         self.assertIn("never applied", state["warning"])
         self.assertNotIn("error", state)
         self.assertFalse((repo / "stray.txt").exists())
         self.assertTrue((Path(state["worktree"]) / "stray.txt").exists())
-        self.assertIn("只读任务", (self.work / "pi.log.codex-prompt").read_text())
+        self.assertIn("只读任务", (Path(state["dir"]) / "prompt.md").read_text())
         self.assertIn("nothing to apply", self.cli("apply", "--json", "--keep", state["run"]).stderr)
-        self.fake_codex(codex_events("looked"))
-        clean = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "--workdir", repo, "review"))
+        self.fake_pi([answer("looked"), SETTLED])
+        clean = self.outcome(self.cli("run", "--read-only", "--workdir", repo, "review"))
         self.assertEqual(clean["state"], "answered")
         self.assertNotIn("readOnlyViolation", clean)
         self.assertNotIn("next", clean)
         # In place, a change cannot be told apart from the caller's own; it is reported, not judged.
-        self.fake_codex(codex_events("looked"), pre="echo oops > stray.txt")
-        state = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "--in-place", "--workdir", repo,
-                                      "review"))
+        self.fake_pi([answer("looked"), SETTLED], pre="echo oops > stray.txt")
+        state = self.outcome(self.cli("run", "--read-only", "--in-place", "--workdir", repo, "review"))
         self.assertEqual((state["state"], state["workspaceChanged"]), ("answered", ["stray.txt"]))
         self.assertNotIn("worktree", state)
-        written = self.outcome(self.cli("run", "--agent", "codex", "--in-place", "--workdir", repo, "task"))
+        written = self.outcome(self.cli("run", "--in-place", "--workdir", repo, "task"))
         self.assertEqual((written["mode"], written["state"]), ("write", "answered"))
         self.assertNotIn("worktree", written)
 
@@ -1621,8 +1558,7 @@ db.write_text(json.dumps(units))
         read = self.outcome(self.cli("run", "--read-only", "--workdir", repo, "review"))
         self.assertTrue((Path(read["worktree"]) / "setup-ran").exists())
         self.assertFalse((Path(read["worktree"]) / "write-setup-ran").exists())
-        self.fake_codex(codex_events("done"))
-        write = self.outcome(self.cli("run", "--agent", "codex", "--worktree", "--workdir", repo, "task"))
+        write = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
         self.assertTrue((Path(write["worktree"]) / "write-setup-ran").exists())  # after setup, in order
         (repo / ".delegate.json").write_text(json.dumps({"worktree": {"writeSetup": "  "}}))
         self.assertEqual(self.cli("run", "--worktree", "--workdir", repo, "task").returncode, 2)
@@ -1631,9 +1567,10 @@ db.write_text(json.dumps(units))
         repo = self.repo({"a.txt": "a\n", ".gitignore": "setup-ran\n"})
         (repo / ".delegate.json").write_text(json.dumps({"worktree": {"setup": ["touch setup-ran"]}}))
         # While the reviewer reads, the caller keeps editing the real working tree.
-        self.fake_codex(codex_events("found a bug"), pre=f"echo caller >> {repo}/a.txt; echo new > {repo}/new.txt")
+        self.fake_pi([answer("found a bug"), SETTLED],
+                     pre=f"echo caller >> {repo}/a.txt; echo new > {repo}/new.txt")
         (repo / "a.txt").write_text("a\nuncommitted\n")
-        result = self.cli("run", "--agent", "codex", "--read-only", "--workdir", repo, "review")
+        result = self.cli("run", "--read-only", "--workdir", repo, "review")
         state = self.outcome(result)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(state["state"], "answered")
@@ -1644,11 +1581,10 @@ db.write_text(json.dumps(units))
         # ...and sees it as the caller does: uncommitted, on top of the caller's HEAD.
         self.assertIn("+uncommitted", subprocess.run(["git", "-C", str(worktree), "diff", "HEAD"],
                                                      capture_output=True, text=True).stdout)
-        self.assertTrue((worktree / "setup-ran").exists())  # Codex may run commands, so setup runs
         self.assertEqual((repo / "a.txt").read_text(), "a\nuncommitted\ncaller\n")
         self.fake_pi([answer("ok"), SETTLED])
         pi = self.outcome(self.cli("run", "--read-only", "--workdir", repo, "review"))
-        # In its own worktree a read-only Pi is isolated and checked like Codex: full tools (git log/diff, tests),
+        # In its own worktree a read-only Pi is isolated and checked: full tools (git log/diff, tests),
         # the boundary in writing, and the worktree set up for commands.
         self.assertNotIn("--tools", (self.work / "pi.log").read_text().splitlines()[-1])
         self.assertIn("Read-only task", (Path(pi["dir"]) / "prompt.md").read_text())
@@ -1664,13 +1600,12 @@ db.write_text(json.dumps(units))
 
     def test_delegated_agents_cannot_delegate_at_all(self):
         self.fake_pi([answer("ok"), SETTLED])
-        self.fake_codex(codex_events("ok"))
-        self.assertEqual(self.outcome(self.cli("run", "--agent", "codex", "task"))["state"], "answered")
-        self.assertIn(" codex ", (self.work / "pi.log.codex").read_text())  # its agent carries DELEGATE_AGENT
+        self.assertEqual(self.outcome(self.cli("run", "--read-only", "task"))["state"], "answered")
         # One level only, whoever the caller is and whatever it asks for: results come back to the caller.
-        for marker in ({"DELEGATE_AGENT": "codex"}, {"DELEGATE_AGENT": "pi"}, {"PI_DELEGATE_AGENT": "codex"}):
+        for marker in ({"DELEGATE_AGENT": "codex"}, {"DELEGATE_AGENT": "pi"}, {"PI_DELEGATE_AGENT": "pi"},
+                       {"PI_DELEGATE_ACTIVE": "1"}):
             env = {**self.env, **marker}
-            for args in (["start", "--agent", "pi", "task"], ["run", "--tier", "cheap", "--read-only", "task"],
+            for args in (["start", "task"], ["run", "--tier", "cheap", "--read-only", "task"],
                          ["reply", "last", "more"]):
                 result = subprocess.run([str(DELEGATE), *args], cwd=self.work, env=env, capture_output=True,
                                         text=True, timeout=30)
@@ -1679,80 +1614,79 @@ db.write_text(json.dumps(units))
             lane = subprocess.run([str(DELEGATE), "lane", "true"], cwd=self.work, env=env, timeout=30)
             self.assertEqual(lane.returncode, 0)  # heavy checks still queue
 
-    def test_tier_picks_the_colleague(self):
-        del self.env["DELEGATE_STRONG_AGENT"]  # the real mapping: cheap = pi, strong = codex
-        self.fake_pi([answer("read it"), SETTLED])
-        self.fake_codex(codex_events("wrote it"))
+    def test_tier_picks_the_model(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        calls = lambda: (self.work / "pi.log").read_text().splitlines()
         state = self.outcome(self.cli("run", "--read-only", "task"))
         self.assertEqual((state["agent"], state["tier"]), ("pi", "cheap"))  # reading defaults to cheap
-        state = self.outcome(self.cli("run", "task"))
-        self.assertEqual((state["agent"], state["tier"]), ("codex", "strong"))  # writing defaults to strong
-        state = self.outcome(self.cli("run", "--read-only", "--tier", "strong", "task"))
-        self.assertEqual(state["agent"], "codex")
-        state = self.outcome(self.cli("run", "--agent", "pi", "task"))
-        self.assertEqual(state["agent"], "pi")
-        self.assertEqual((state["tier"], state["agentPinned"]), ("cheap", True))  # named outright: display only
-        self.assertEqual(self.cli("run", "--agent", "pi", "--tier", "cheap", "task").returncode, 2)
-        self.env["DELEGATE_CHEAP_AGENT"] = "gemini"
-        self.assertIn("DELEGATE_CHEAP_AGENT", self.cli("run", "--read-only", "task").stderr)
-        del self.env["DELEGATE_CHEAP_AGENT"]
-        (self.bin / "pi").unlink()  # a host without Pi still works: the cheap tier gives way
+        self.assertNotIn("--model", calls()[-1])  # no tier models configured: Pi's own default
+        self.assertEqual(self.outcome(self.cli("run", "task"))["tier"], "strong")  # writing defaults to strong
+        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/strong-m:high"}})
+        self.outcome(self.cli("run", "--read-only", "task"))
+        self.assertIn("--model p/cheap-m", calls()[-1])
+        self.outcome(self.cli("run", "task"))
+        self.assertIn("--model p/strong-m:high", calls()[-1])
+        self.outcome(self.cli("run", "--read-only", "--tier", "strong", "task"))
+        self.assertIn("--model p/strong-m:high", calls()[-1])
+        self.env["DELEGATE_CHEAP_MODEL"] = "q/env-m"
+        self.outcome(self.cli("run", "--read-only", "task"))
+        self.assertIn("--model q/env-m", calls()[-1])
+        state = self.outcome(self.cli("run", "--read-only", "--model", "x/named", "task"))
+        self.assertIn("--model x/named", calls()[-1])
+        self.assertEqual((state["tier"], state["agentPinned"]), ("cheap", True))  # named outright: no escalation
+        removed = self.cli("run", "--agent", "codex", "task")
+        self.assertEqual(removed.returncode, 2)
+        self.assertIn("removed in 6.0", removed.stderr)
+        self.user_config({"tiers": {"fast": "p/m"}})
+        self.assertIn("tiers.fast", self.cli("run", "--read-only", "task").stderr)
+        self.user_config({})
+        (self.bin / "pi").unlink()
         self.env["PATH"] = f"{self.bin}:/usr/bin:/bin"
         result = self.cli("run", "--read-only", "task")
-        self.assertEqual((self.outcome(result)["agent"], self.outcome(result)["tier"]), ("codex", "strong"))
-        self.assertIn("using the strong tier", result.stderr)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("missing required tools: pi", result.stderr)
 
-    def test_failed_cheap_run_escalates_once_when_nothing_changed(self):
-        del self.env["DELEGATE_STRONG_AGENT"]
-        self.fake_pi([answer(LEAKED), SETTLED])
-        self.fake_codex(codex_events("found it"))
-        result = self.cli("run", "--read-only", "--retries", "0", "审查一下")
+    def test_failed_cheap_run_escalates_once_to_the_strong_model(self):
+        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/strong-m"}})
+        log = self.work / "pi.log"
+        self.fake_pi([answer(LEAKED), SETTLED], [answer("found it"), SETTLED])
+        repo = self.repo({"a.txt": "a\n"})
+        result = self.cli("run", "--read-only", "--retries", "0", "--workdir", repo, "审查一下")
         state = self.outcome(result)
         self.assertEqual(result.returncode, 0)
         self.assertEqual((state["state"], state["agent"], state["tier"], state["escalatedFrom"], state["attempts"]),
-                         ("answered", "codex", "strong", "pi", 2))
-        self.assertIn("只读任务", (self.work / "pi.log.codex-prompt").read_text())  # Codex is told; Pi needed no words
-        self.assertEqual((self.work / "pi.log.codex-prompt").read_text().count("只读任务"), 1)
+                         ("answered", "pi", "strong", "p/cheap-m", 2))
+        calls = log.read_text().splitlines()
+        self.assertIn("--model p/cheap-m", calls[0])
+        self.assertIn("--model p/strong-m", calls[1])
+        self.assertEqual((Path(state["dir"]) / "prompt.md").read_text().count("只读任务"), 1)
         self.assertIn("found it", (Path(state["dir"]) / "result.md").read_text())
-        self.fake_codex(codex_events("more"))
-        self.assertEqual(self.outcome(self.cli("reply", "--wait", state["run"], "and?"))["agent"], "codex")
+        self.fake_pi([answer("more"), SETTLED])
+        reply = self.outcome(self.cli("reply", "--wait", state["run"], "and?"))
+        self.assertEqual(reply["tier"], "strong")
+        self.assertIn("--model p/strong-m", log.read_text().splitlines()[-1])
         # A write run that changed nothing and failed its check is handed over too...
-        repo = self.repo({"a.txt": "a\n"})
-        self.fake_pi([answer("done"), SETTLED])
-        self.fake_codex(codex_events("fixed"), pre="touch made.txt")
-        state = self.outcome(self.cli("run", "--tier", "cheap", "--workdir", repo, "--accept", "test -f made.txt",
-                                      "task"))
-        self.assertEqual((state["state"], state["escalatedFrom"], state["files"]), ("delivered", "pi", ["made.txt"]))
-        # ...but not one that left changes behind, nor one whose colleague was named outright.
+        log.unlink()
+        self.fake_pi([answer("done"), SETTLED], [answer("fixed"), SETTLED], pre='[ "$n" -eq 2 ] && touch made.txt')
+        state = self.outcome(self.cli("run", "--tier", "cheap", "--workdir", repo, "--in-place",
+                                      "--accept", "test -f made.txt", "task"))
+        self.assertEqual((state["state"], state["escalatedFrom"], state["files"]), ("delivered", "p/cheap-m", ["made.txt"]))
+        # ...but not one that left changes behind, nor one whose model was named outright,
         (repo / "made.txt").unlink()
         self.fake_pi([answer("done"), SETTLED], pre="echo half > partial.txt")
-        state = self.outcome(self.cli("run", "--tier", "cheap", "--workdir", repo, "--accept", "test -f made.txt",
-                                      "task"))
-        self.assertEqual((state["state"], state["agent"]), ("rejected", "pi"))
+        state = self.outcome(self.cli("run", "--tier", "cheap", "--workdir", repo, "--in-place",
+                                      "--accept", "test -f made.txt", "task"))
+        self.assertEqual(state["state"], "rejected")
         self.assertNotIn("escalatedFrom", state)
         self.fake_pi([answer(LEAKED), SETTLED])
-        state = self.outcome(self.cli("run", "--agent", "pi", "--read-only", "--retries", "0", "task"))
-        self.assertEqual((state["state"], state["agent"]), ("malformed", "pi"))
-        # In git the isolated Pi was told already; escalating must not say it twice.
-        self.fake_pi([answer(LEAKED), SETTLED])
-        self.fake_codex(codex_events("found it"))
-        state = self.outcome(self.cli("run", "--read-only", "--retries", "0", "--workdir", repo, "审查一下"))
-        self.assertEqual(state["escalatedFrom"], "pi")
-        self.assertEqual((self.work / "pi.log.codex-prompt").read_text().count("只读任务"), 1)
-
-    def test_escalation_waits_for_room_in_the_strong_tier(self):
-        del self.env["DELEGATE_STRONG_AGENT"]
-        self.fake_pi([answer(LEAKED), SETTLED])
-        self.fake_codex(codex_events("ok"), pre='[ -n "$SLOW" ] && sleep 30')
-        env = {**self.env, "SLOW": "1"}
-        started = subprocess.run([str(DELEGATE), "start", "--json", "--agent", "codex", "--read-only", "busy"], cwd=self.work,
-                                 env=env, capture_output=True, text=True, timeout=30)
-        busy = json.loads(started.stdout.splitlines()[0])
-        self.env["DELEGATE_MAX_CODEX"] = "1"
-        state = self.outcome(self.cli("run", "--read-only", "--retries", "0", "task"))
-        self.assertEqual((state["state"], state["agent"]), ("malformed", "pi"))  # no room: not escalated
-        self.assertIn("escalate_skipped", (Path(state["dir"]) / "events.jsonl").read_text())
-        self.cli("stop", busy["run"])
+        state = self.outcome(self.cli("run", "--read-only", "--retries", "0", "--model", "p/cheap-m", "task"))
+        self.assertEqual(state["state"], "malformed")
+        self.assertNotIn("escalatedFrom", state)
+        # ...nor when the strong tier runs the same model or none is configured.
+        for tiers in ({"cheap": "p/m", "strong": "p/m"}, {"cheap": "p/m"}):
+            self.user_config({"tiers": tiers})
+            state = self.outcome(self.cli("run", "--read-only", "--retries", "0", "task"))
+            self.assertEqual((state["state"], state["tier"]), ("malformed", "cheap"), tiers)
 
     def test_wait_until_all_without_runs_collects_everything_pending(self):
         self.fake_pi([answer("ok"), SETTLED])
@@ -1891,7 +1825,7 @@ db.write_text(json.dumps(units))
             self.assertEqual((meta["caller"], meta["callerSource"]), (expected, source))
             self.env.pop(source)
 
-    def test_protocol_reports_caller_agents_and_shadowed_binaries(self):
+    def test_protocol_reports_caller_agent_models_and_shadowed_binaries(self):
         self.fake_pi([answer("ok"), SETTLED])
         shadow = self.work / "shadow"
         shadow.mkdir()
@@ -1901,18 +1835,17 @@ db.write_text(json.dumps(units))
         self.assertEqual(result.returncode, 0, result.stderr)
         line = json.loads(result.stdout)
         self.assertEqual((line["protocol"], line["caller"]), (1, {"id": "thread-7", "source": "CODEX_THREAD_ID"}))
-        agents = {agent["name"]: agent for agent in line["agents"]}
-        self.assertEqual(agents["pi"]["tiers"], ["cheap", "strong"])  # setUp maps strong to the fake Pi
-        self.assertEqual(agents["pi"]["bin"], str((self.bin / "pi").resolve()))
-        self.assertEqual(agents["pi"]["version"], "fake-pi 1.0")
-        self.assertEqual(agents["pi"]["shadowed"], [str(shadow / "pi")])  # as found on PATH, not resolved
-        self.assertEqual((agents["codex"]["tiers"], agents["codex"]["available"], agents["codex"]["bin"]),
-                         ([], False, None))
-        self.env.pop("DELEGATE_STRONG_AGENT")
+        [pi] = line["agents"]
+        self.assertEqual((pi["name"], pi["tiers"], pi["models"]),
+                         ("pi", ["cheap", "strong"], {"cheap": "", "strong": ""}))
+        self.assertEqual(pi["bin"], str((self.bin / "pi").resolve()))
+        self.assertEqual(pi["version"], "fake-pi 1.0")
+        self.assertEqual(pi["shadowed"], [str(shadow / "pi")])  # as found on PATH, not resolved
+        self.user_config({"tiers": {"strong": "p/strong-m"}})
         self.env.pop("CODEX_THREAD_ID")
         line = json.loads(self.cli("protocol").stdout)
         self.assertIsNone(line["caller"])
-        self.assertEqual({a["name"]: a["tiers"] for a in line["agents"]}, {"pi": ["cheap"], "codex": ["strong"]})
+        self.assertEqual(line["agents"][0]["models"], {"cheap": "", "strong": "p/strong-m"})
         self.assertEqual(self.cli("protocol", "extra").returncode, 2)
 
     def test_wait_collects_only_current_caller_and_reports_other_failure(self):
@@ -1972,33 +1905,23 @@ db.write_text(json.dumps(units))
         meta_path.write_text(json.dumps(meta))
         self.assertNotIn("ageSeconds", json.loads(self.cli("status", old["run"]).stdout))
 
-    def test_images_are_attached_for_both_agents(self):
+    def test_images_are_attached(self):
         image = self.work / "shot.png"
         image.write_bytes(b"png")
         self.fake_pi([answer("blue"), SETTLED])
         self.assertEqual(self.cli("run", "--image", "shot.png", "what color?").returncode, 0)
         self.assertTrue((self.work / "pi.log").read_text().split()[-1] == f"@{image}")
-        self.fake_codex(codex_events("blue"))
-        self.assertEqual(self.cli("run", "--agent", "codex", "--image", image, "what color?").returncode, 0)
-        args = (self.work / "pi.log.codex").read_text().split()
-        self.assertEqual(args[-2:], [f"--image={image}", "-"])
         result = self.cli("start", "--image", "missing.png", "task")
         self.assertEqual(result.returncode, 2)
         self.assertIn("image does not exist", result.stderr)
 
     def test_machine_wide_limits_refuse_extra_runs(self):
         self.fake_pi([answer("slow"), SETTLED], sleep=30)
-        self.fake_codex(codex_events("ok"), pre="sleep 30")
-        self.env.update(DELEGATE_MAX_ACTIVE="2", DELEGATE_MAX_CODEX="1")
-        other = self.work / "other"
-        other.mkdir()
-        first = json.loads(self.cli("start", "--agent", "codex", "--name", "gpt", "task").stdout)["run"]
-        result = self.cli("start", "--agent", "codex", "--workdir", other, "task")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("DELEGATE_MAX_CODEX=1", result.stderr)
+        self.env.update(DELEGATE_MAX_ACTIVE="2")
+        first = json.loads(self.cli("start", "--read-only", "--name", "one", "task").stdout)["run"]
         # Runs from another project (another runs root) share the machine's pool.
         self.env["DELEGATE_RUNS"] = str(self.work / "runs2")
-        self.assertEqual(self.cli("start", "--read-only", "--name", "pi", "task").returncode, 0)
+        self.assertEqual(self.cli("start", "--read-only", "--name", "two", "task").returncode, 0)
         result = self.cli("start", "--read-only", "task")
         self.assertEqual(result.returncode, 2)
         self.assertIn("DELEGATE_MAX_ACTIVE=2", result.stderr)
@@ -2201,12 +2124,6 @@ db.write_text(json.dumps(units))
         self.assertEqual(self.cli("apply", "--json", "--keep", first["run"]).returncode, 0)
         self.assertEqual((repo / "a.txt").read_text(), "a\nmore\nagain\nlast\n")
         self.assertTrue(all((Path(r["dir"]) / ".applied").exists() for r in (first, second, third)))
-        self.fake_codex(codex_events("ok"))
-        codex = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "look"))
-        self.assertEqual(self.outcome(self.cli("reply", "--wait", codex["run"], "and?"))["state"], "answered")
-        call = (self.work / "pi.log.codex").read_text().splitlines()[-1]
-        self.assertIn("exec fork t1 --json", call)
-        self.assertNotIn(" -C ", call)
 
     def test_reply_returns_immediately_unless_wait_is_requested(self):
         self.fake_pi([answer("first"), SETTLED])
@@ -2283,8 +2200,8 @@ db.write_text(json.dumps(units))
     def test_snapshot_survives_undecodable_names_and_sees_submodules(self):
         repo = self.repo({"a.txt": "a\n"})
         (repo / os.fsdecode(b"caf\xe9.txt")).write_text("x")
-        self.fake_codex(codex_events("looked"), pre="echo oops > stray.txt")
-        state = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "--workdir", repo, "review"))
+        self.fake_pi([answer("looked"), SETTLED], pre="echo oops > stray.txt")
+        state = self.outcome(self.cli("run", "--read-only", "--workdir", repo, "review"))
         self.assertEqual(state["readOnlyViolation"], ["stray.txt"])
         sub = self.work / "lib"
         subprocess.run(["git", "init", "-q", str(sub)], check=True)
@@ -2295,9 +2212,9 @@ db.write_text(json.dumps(units))
         subprocess.run(["git", "-C", str(repo), *git, "submodule", "add", "-q", str(sub), "vendor"], check=True,
                        capture_output=True)
         subprocess.run(["git", "-C", str(repo), *git, "commit", "-qm", "sub"], check=True)
-        self.fake_codex(codex_events("looked"), pre="echo edit >> vendor/lib.txt")
+        self.fake_pi([answer("looked"), SETTLED], pre="echo edit >> vendor/lib.txt")
         # In place: a new worktree leaves submodules empty.
-        state = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "--in-place", "--workdir", repo,
+        state = self.outcome(self.cli("run", "--read-only", "--in-place", "--workdir", repo,
                                       "review"))
         self.assertEqual(state["workspaceChanged"], ["vendor"])
         self.assertIn(" M vendor  submodule contents", self.cli("wait", state["run"]).stdout)
@@ -2317,8 +2234,8 @@ db.write_text(json.dumps(units))
         subprocess.run(["git", "-C", str(repo), *git, "commit", "-qm", "vendor"], check=True)
         (repo / "vendor/lib.txt").write_text("v2\n")
         subprocess.run(["git", "-C", str(repo / "vendor"), *git, "commit", "-qam", "v2"], check=True)
-        self.fake_codex(codex_events("looked"))
-        state = self.outcome(self.cli("run", "--agent", "codex", "--read-only", "--workdir", repo, "review"))
+        self.fake_pi([answer("looked"), SETTLED])
+        state = self.outcome(self.cli("run", "--read-only", "--workdir", repo, "review"))
         self.assertEqual(state["state"], "answered")
         for key in ("readOnlyViolation", "workspaceChanged", "warning"):
             self.assertNotIn(key, state)
@@ -2388,7 +2305,7 @@ db.write_text(json.dumps(units))
         # An upstream that did not deliver skips the step without starting a colleague.
         del self.env["DELEGATE_MAX_ACTIVE"]
         self.fake_pi([answer(LEAKED), SETTLED])
-        bad = self.outcome(self.cli("run", "--agent", "pi", "--read-only", "--retries", "0", "--name", "bad", "x"))
+        bad = self.outcome(self.cli("run", "--read-only", "--retries", "0", "--name", "bad", "x"))
         self.assertEqual(bad["state"], "malformed")
         calls = len((self.work / "pi.log").read_text().splitlines())
         skipped = self.outcome(self.cli("run", "--read-only", "--after", "bad", "--name", "next", "y"))
@@ -2439,15 +2356,18 @@ db.write_text(json.dumps(units))
         for key in ("readOnlyViolation", "warning"):
             self.assertNotIn(key, review)
 
-    def test_reply_can_hand_the_worktree_to_the_other_colleague(self):
+    def test_reply_can_move_the_conversation_to_the_strong_model(self):
+        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/strong-m"}})
         repo = self.repo({"a.txt": "a\n"})
         self.fake_pi([answer("draft"), SETTLED], pre="echo draft >> a.txt")
-        draft = self.outcome(self.cli("run", "--worktree", "--agent", "pi", "--workdir", repo, "--name", "d", "draft"))
-        self.fake_codex(codex_events("polished"), pre="echo polish >> a.txt")
-        polished = self.outcome(self.cli("reply", "--wait", "d", "--agent", "codex", "polish the draft"))
-        self.assertEqual((polished["state"], polished["agent"], polished["worktree"]),
-                         ("answered", "codex", draft["worktree"]))
-        self.assertNotIn(" fork ", (self.work / "pi.log.codex").read_text())  # another model: a fresh session
+        draft = self.outcome(self.cli("run", "--tier", "cheap", "--worktree", "--workdir", repo, "--name", "d", "draft"))
+        self.fake_pi([answer("polished"), SETTLED], pre="echo polish >> a.txt")
+        polished = self.outcome(self.cli("reply", "--wait", "d", "--tier", "strong", "polish the draft"))
+        self.assertEqual((polished["state"], polished["tier"], polished["worktree"]),
+                         ("answered", "strong", draft["worktree"]))
+        call = (self.work / "pi.log").read_text().splitlines()[-1]
+        self.assertIn("--model p/strong-m", call)
+        self.assertIn("--fork", call)  # same colleague, same session, another model
         self.assertEqual(self.cli("apply", "--json", "--keep", "d").returncode, 0)
         self.assertEqual((repo / "a.txt").read_text(), "a\ndraft\npolish\n")
 
@@ -3165,7 +3085,7 @@ echo $? > "$DELEGATE_RUN_DIR/filtered-code"
 echo $? > "$DELEGATE_RUN_DIR/lane-code"
 cargo check --package small; echo $? > "$DELEGATE_RUN_DIR/prefix-code"
 ''')
-        state = self.outcome(self.cli("run", "--agent", "pi", "--workdir", repo,
+        state = self.outcome(self.cli("run", "--workdir", repo,
                                       "--accept", "cargo xtask infra-test", "task"))
         self.assertEqual((state["state"], state["denied"]), ("delivered", 2))
         run = Path(state["dir"])
@@ -3190,12 +3110,12 @@ cargo check --package small; echo $? > "$DELEGATE_RUN_DIR/prefix-code"
         for revoke, remaining, denied in ((False, exact, 1), (True, prefix, 2)):
             config.write_text(json.dumps({"agentDeny": [{"argv": ["cargo", "check"],
                                                          "exact": revoke, "allow": True}]}))
-            state = self.outcome(self.cli("run", "--agent", "pi", "--workdir", repo, "task"))
+            state = self.outcome(self.cli("run", "--workdir", repo, "task"))
             meta = json.loads((Path(state["dir"]) / "meta.json").read_text())
             self.assertEqual(meta["agentDeny"], [remaining])
             self.assertEqual(state["denied"], denied)
         config.write_text(json.dumps({"agentDeny": [{**exact, "exact": "yes"}]}))
-        rejected = self.cli("start", "--agent", "pi", "--workdir", repo, "task")
+        rejected = self.cli("start", "--workdir", repo, "task")
         self.assertEqual(rejected.returncode, 2)
         self.assertIn("agentDeny.exact must be a boolean", rejected.stderr)
 
@@ -3207,7 +3127,7 @@ cargo check --package small; echo $? > "$DELEGATE_RUN_DIR/prefix-code"
         other.mkdir()
         self.fake_pi([answer("done"), SETTLED], sleep=30)
         self.env.update(DELEGATE_REPO_MAX_ACTIVE="1", DELEGATE_MAX_ACTIVE="3")
-        first = self.outcome(self.cli("start", "--agent", "pi", "--read-only", "--in-place",
+        first = self.outcome(self.cli("start", "--read-only", "--in-place",
                                       "--workdir", repo, "first"))
         self.addCleanup(self.cli, "stop", first["dir"])
         meta_file = Path(first["dir"]) / "meta.json"
@@ -3216,60 +3136,60 @@ cargo check --package small; echo $? > "$DELEGATE_RUN_DIR/prefix-code"
         del meta["repoKey"]  # Old task records and single-line slots still count.
         meta_file.write_text(json.dumps(meta))
         self.env["DELEGATE_RUNS"] = str(self.work / "runs2")
-        second = self.outcome(self.cli("start", "--agent", "pi", "--read-only", "--workdir", other, "second"))
+        second = self.outcome(self.cli("start", "--read-only", "--workdir", other, "second"))
         self.addCleanup(self.cli, "stop", second["dir"])
-        blocked = self.cli("start", "--agent", "pi", "--read-only", "--in-place", "--workdir", linked, "third")
+        blocked = self.cli("start", "--read-only", "--in-place", "--workdir", linked, "third")
         self.assertEqual(blocked.returncode, 2)
         self.assertIn("1 runs are active in this repository", blocked.stderr)
         self.assertIn("DELEGATE_REPO_MAX_ACTIVE=1", blocked.stderr)
         self.assertIn(first["dir"], blocked.stderr)
         self.assertNotIn(second["dir"], blocked.stderr)
         self.env["DELEGATE_REPO_MAX_ACTIVE"] = "0"
-        third = self.outcome(self.cli("start", "--agent", "pi", "--read-only", "--in-place", "--workdir", linked, "third"))
+        third = self.outcome(self.cli("start", "--read-only", "--in-place", "--workdir", linked, "third"))
         self.addCleanup(self.cli, "stop", third["dir"])
-        blocked = self.cli("start", "--agent", "pi", "--read-only", "task")
+        blocked = self.cli("start", "--read-only", "task")
         self.assertEqual(blocked.returncode, 2)
         self.assertIn("3 runs are active on this machine", blocked.stderr)
         for state in (first, second, third):
             self.assertIn(state["dir"], blocked.stderr)
 
-    def test_v518_repository_codex_limits_and_non_git_normalization(self):
-        self.fake_codex(codex_events("done"), pre="sleep 30")
+    def test_v518_repository_limits_and_non_git_normalization(self):
+        self.fake_pi([answer("done"), SETTLED], sleep=30)
         alias = self.work / "alias"
         alias.symlink_to(self.work, target_is_directory=True)
-        self.env.update(DELEGATE_REPO_MAX_CODEX="1", DELEGATE_MAX_CODEX="3")
-        first = self.outcome(self.cli("start", "--agent", "codex", "--read-only", "first"))
+        self.env.update(DELEGATE_REPO_MAX_ACTIVE="1", DELEGATE_MAX_ACTIVE="3")
+        first = self.outcome(self.cli("start", "--read-only", "first"))
         self.addCleanup(self.cli, "stop", first["dir"])
-        blocked = self.cli("start", "--agent", "codex", "--read-only", "--workdir", alias, "second")
+        blocked = self.cli("start", "--read-only", "--workdir", alias, "second")
         self.assertEqual(blocked.returncode, 2)
-        self.assertIn("1 Codex runs are active in this repository", blocked.stderr)
-        self.assertIn("DELEGATE_REPO_MAX_CODEX=1", blocked.stderr)
-        self.env["DELEGATE_REPO_MAX_CODEX"] = "0"
-        second = self.outcome(self.cli("start", "--agent", "codex", "--read-only", "--workdir", alias, "second"))
+        self.assertIn("1 runs are active in this repository", blocked.stderr)
+        self.assertIn("DELEGATE_REPO_MAX_ACTIVE=1", blocked.stderr)
+        self.env["DELEGATE_REPO_MAX_ACTIVE"] = "0"
+        second = self.outcome(self.cli("start", "--read-only", "--workdir", alias, "second"))
         self.addCleanup(self.cli, "stop", second["dir"])
-        self.env["DELEGATE_REPO_MAX_CODEX"] = "bad"
-        blocked = self.cli("start", "--agent", "codex", "--read-only", "task")
+        self.env["DELEGATE_REPO_MAX_ACTIVE"] = "bad"
+        blocked = self.cli("start", "--read-only", "task")
         self.assertEqual(blocked.returncode, 2)
-        self.assertIn("DELEGATE_REPO_MAX_CODEX", blocked.stderr)
+        self.assertIn("DELEGATE_REPO_MAX_ACTIVE", blocked.stderr)
 
     def test_v518_capacity_defaults_config_precedence_and_protocol(self):
-        defaults = {"maxActive": 12, "maxCodex": 6, "maxHeavy": 2, "repoMaxActive": 8, "repoMaxCodex": 4}
+        defaults = {"maxActive": 12, "maxHeavy": 2, "repoMaxActive": 8}
         self.fake_pi([answer("done"), SETTLED])
-        state = self.outcome(self.cli("run", "--agent", "pi", "--read-only", "task"))
+        state = self.outcome(self.cli("run", "--read-only", "task"))
         self.assertEqual(json.loads((Path(state["dir"]) / "meta.json").read_text())["configCapacity"], defaults)
         self.assertEqual(json.loads(self.cli("protocol").stdout)["capacityDefaults"], defaults)
         repo = self.repo({"a.txt": "old\n"})
         self.env["XDG_CONFIG_HOME"] = str(self.work / "config")
         path = self.work / "config/delegate/config.json"
         path.parent.mkdir(parents=True)
-        path.write_text(json.dumps({"repoMaxActive": 3, "repoMaxCodex": 2}))
+        path.write_text(json.dumps({"repoMaxActive": 3, "maxActive": 7}))
         (repo / ".delegate.json").write_text('{"repoMaxActive":5}')
-        self.env["DELEGATE_REPO_MAX_CODEX"] = "0"
-        state = self.outcome(self.cli("run", "--agent", "pi", "--read-only", "--workdir", repo, "task"))
+        self.env["DELEGATE_MAX_ACTIVE"] = "0"
+        state = self.outcome(self.cli("run", "--read-only", "--workdir", repo, "task"))
         capacity = json.loads((Path(state["dir"]) / "meta.json").read_text())["configCapacity"]
-        self.assertEqual((capacity["repoMaxActive"], capacity["repoMaxCodex"]), (5, 0))
+        self.assertEqual((capacity["repoMaxActive"], capacity["maxActive"]), (5, 0))
         (repo / ".delegate.json").write_text('{"repoMaxActive":-1}')
-        self.assertIn("repoMaxActive must be", self.cli("start", "--agent", "pi", "--workdir", repo, "task").stderr)
+        self.assertIn("repoMaxActive must be", self.cli("start", "--workdir", repo, "task").stderr)
 
     def test_v518_default_heavy_lane_runs_two_commands(self):
         gate = self.work / "release-lane"
@@ -3288,18 +3208,6 @@ cargo check --package small; echo $? > "$DELEGATE_RUN_DIR/prefix-code"
             process.communicate(timeout=10)
             self.assertEqual(process.returncode, 0)
 
-    def test_v518_repository_codex_capacity_blocks_cheap_escalation(self):
-        self.env.pop("DELEGATE_STRONG_AGENT")
-        self.env.update(DELEGATE_REPO_MAX_CODEX="1", DELEGATE_MAX_CODEX="3")
-        self.fake_pi([answer(LEAKED), SETTLED])
-        self.fake_codex(codex_events("done"), pre="sleep 30")
-        busy = self.outcome(self.cli("start", "--agent", "codex", "--read-only", "busy"))
-        self.addCleanup(self.cli, "stop", busy["dir"])
-        state = self.outcome(self.cli("run", "--tier", "cheap", "--read-only", "--retries", "0", "task"))
-        self.assertEqual((state["state"], state["agent"]), ("malformed", "pi"))
-        self.assertNotIn("escalatedFrom", state)
-        self.assertIn("escalate_skipped", (Path(state["dir"]) / "events.jsonl").read_text())
-
     def test_v518_after_waits_for_repository_capacity(self):
         repo = self.repo({"a.txt": "old\n"})
         gate = self.work / "gate"
@@ -3309,10 +3217,10 @@ if [ "$PWD" = {shlex.quote(str(repo))} ]; then
 fi
 ''')
         self.env["DELEGATE_REPO_MAX_ACTIVE"] = "1"
-        first = self.outcome(self.cli("start", "--agent", "pi", "--read-only", "--in-place", "--workdir", repo, "blocker"))
+        first = self.outcome(self.cli("start", "--read-only", "--in-place", "--workdir", repo, "blocker"))
         self.addCleanup(self.cli, "stop", first["dir"])
-        upstream = self.outcome(self.cli("run", "--agent", "pi", "--read-only", "upstream"))
-        waiting = self.outcome(self.cli("start", "--agent", "pi", "--read-only", "--in-place", "--workdir", repo,
+        upstream = self.outcome(self.cli("run", "--read-only", "upstream"))
+        waiting = self.outcome(self.cli("start", "--read-only", "--in-place", "--workdir", repo,
                                         "--after", upstream["run"], "queued"))
         self.addCleanup(self.cli, "stop", waiting["dir"])
         self.assertEqual(waiting["state"], "waiting")
@@ -3391,22 +3299,18 @@ fi
         (repo / "a.txt").write_text("first\n")
         self.assertEqual(self.outcome(self.cli("status", second["run"]))["appliedBy"], "detected")
 
-    def test_pinned_agent_displays_default_tier_and_never_escalates(self):
-        self.env.pop("DELEGATE_STRONG_AGENT")
+    def test_pinned_model_displays_its_tier_and_never_escalates(self):
+        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/strong-m"}})
         self.fake_pi([answer(LEAKED), SETTLED])
-        self.fake_codex(codex_events("fallback"))
-        pinned = self.outcome(self.cli("run", "--read-only", "--agent", "pi", "task"))
+        pinned = self.outcome(self.cli("run", "--read-only", "--model", "x/named", "--retries", "0", "task"))
         self.assertEqual((pinned["agent"], pinned["tier"], pinned["agentPinned"], pinned["state"]),
                          ("pi", "cheap", True, "malformed"))
-        self.assertFalse((self.work / "pi.log.codex").exists())
+        self.assertEqual(len((self.work / "pi.log").read_text().splitlines()), 1)
         self.assertIn("pi/cheap", self.cli("status", pinned["run"], human=True).stdout)
-        codex = self.outcome(self.cli("run", "--read-only", "--agent", "codex", "task"))
-        self.assertEqual((codex["tier"], codex["agentPinned"]), ("strong", True))
-        self.assertIn("codex/strong", self.cli("status", codex["run"], human=True).stdout)
 
     def test_pinned_reply_and_legacy_tier_display_do_not_rewrite_meta(self):
         self.fake_pi([answer("first"), SETTLED])
-        first = self.outcome(self.cli("run", "--read-only", "--agent", "pi", "task"))
+        first = self.outcome(self.cli("run", "--read-only", "task"))
         path = Path(first["dir"]) / "meta.json"
         legacy = json.loads(path.read_text())
         legacy["tier"] = None
@@ -3418,9 +3322,18 @@ fi
         self.assertEqual(path.read_text(), original)
         reply = self.outcome(self.cli("reply", "--wait", first["run"], "continue"))
         self.assertEqual((reply["tier"], reply["agentPinned"]), ("cheap", True))
-        self.fake_codex(codex_events("switched"))
-        switched = self.outcome(self.cli("reply", "--wait", "--agent", "codex", reply["run"], "continue"))
-        self.assertEqual((switched["tier"], switched["agentPinned"]), ("strong", True))
+        switched = self.outcome(self.cli("reply", "--wait", "--tier", "strong", reply["run"], "continue"))
+        self.assertEqual((switched["tier"], switched["agentPinned"]), ("strong", False))
+        # A record left by a removed agent is continued by Pi in a fresh session.
+        path = Path(switched["dir"]) / "meta.json"
+        legacy = json.loads(path.read_text())
+        legacy["agent"] = "codex"
+        path.write_text(json.dumps(legacy))
+        result = self.cli("reply", "--wait", switched["run"], "continue")
+        moved = self.outcome(result)
+        self.assertEqual((moved["agent"], moved["state"]), ("pi", "answered"))
+        self.assertIn("已开新会话", result.stderr)
+        self.assertNotIn("--fork", (self.work / "pi.log").read_text().splitlines()[-1])
 
 
 def delegate_pid_alive(pid):

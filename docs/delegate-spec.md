@@ -13,7 +13,7 @@
 | 术语 | 含义 |
 |---|---|
 | 主控（caller） | 调用 CLI 的一方：人、主模型或另一个同事 |
-| 同事（agent） | 被委派执行任务的 CLI：`pi` 或 `codex` |
+| 同事（agent） | 被委派执行任务的 CLI：`pi`（6.0 起唯一同事；档位只选它的模型） |
 | run | 一次委派的一轮执行，一个目录；`reply` 产生新的 run |
 | 对话（conversation） | 由 `parent` 链起来的一串 run，以第一个 run 命名 |
 | supervisor | 每个 run 一个的后台进程：启动同事、重跑、验收、写结论 |
@@ -49,9 +49,9 @@
 | `lane [--label 文字] [--] [命令...]` | | §8；无命令时列出队列，每行 `running\|queued  <since>  <label>` |
 | `stop <run>...` | | §9.4 |
 | `clean <run>...\|--finished [--force]` | | §10 |
-| `protocol` | | 输出一行 JSON：`protocol`（宿主接入协议版本，当前 1）、`version`、`caller{id,source}`（未知时为 `null`）、`agents[]{name,tiers,available,bin,version,shadowed}`；`tiers` 是按当前配置（`DELEGATE_{CHEAP,STRONG}_AGENT`）该同事担任默认的档位列表，可为空，`bin` 为 PATH 上首个可执行文件的真实路径（不可用时为 `null`），`shadowed` 为 PATH 中更靠后、真实路径不同的同名可执行文件，按其在 PATH 中的路径列出（snap 等启动器都解析到同一文件，解析后看不出是谁）；退出码 0。供宿主适配器探测，见 [delegate-protocol.md](delegate-protocol.md) |
+| `protocol` | | 输出一行 JSON：`protocol`（宿主接入协议版本，当前 1）、`version`、`caller{id,source}`（未知时为 `null`）、`agents[]{name,tiers,models,available,bin,version,shadowed}`（只有 `pi` 一项）；`tiers` 恒为 `["cheap","strong"]`，`models` 是按当前配置各档的 Pi 模型（空串表示 Pi 默认），`bin` 为 PATH 上首个可执行文件的真实路径（不可用时为 `null`），`shadowed` 为 PATH 中更靠后、真实路径不同的同名可执行文件，按其在 PATH 中的路径列出（snap 等启动器都解析到同一文件，解析后看不出是谁）；退出码 0。供宿主适配器探测，见 [delegate-protocol.md](delegate-protocol.md) |
 
-缺少同事 CLI 时退出码 2：Codex 提示安装并登录；Pi 提示 `sh <仓库>/third_party/pi-kit/install.sh --additive`，其中 `<仓库>` 为从可执行文件真实路径逐级向上、首个包含该安装脚本的目录，找不到时给出远程安装命令。
+缺少同事 CLI 时退出码 2：Pi 提示 `sh <仓库>/third_party/pi-kit/install.sh --additive`，其中 `<仓库>` 为从可执行文件真实路径逐级向上、首个包含该安装脚本的目录，找不到时给出远程安装命令。
 
 `<run>` 解析顺序（必须）：含 `meta.json` 的目录路径 → `last`（最近启动的）→ 完整 id → 唯一完全匹配的名称（`--name`）→ 唯一 id 子串；匹配数不为 1 即退出码 2。
 
@@ -60,8 +60,7 @@
 | 选项 | 默认 | 说明 |
 |---|---|---|
 | 任务说明 | — | 位置参数拼接、`--prompt`、或 `--prompt-file`（`-` 为 stdin）；为空即退出码 2 |
-| `--tier cheap\|strong` | 只读 `cheap`，写入 `strong` | 按档位选同事，映射见 §12；与 `--agent` 互斥（退出码 2） |
-| `--agent pi\|codex` | — | 直接指定同事，不属于任何档位，不升档 |
+| `--tier cheap\|strong` | 只读 `cheap`，写入 `strong` | 按档位选 Pi 模型，§4.1 |
 | `--name` | 说明首行 | 用于 run id 与显示；省略时取首个非空行生成短名，run id 保留字母、数字与 `._-`，最长 40 |
 | `--workdir` | 当前目录 | 必须存在 |
 | `--image <路径>` | — | 可重复；解析为绝对路径 |
@@ -73,9 +72,9 @@
 | `--no-accept` | 否 | 禁用仓库默认验收；reply 中取消继承的验收 |
 | `--hide-accept` | 否 | 不在说明中附验收命令 |
 | `--accept-timeout` | `10m` | 自取得 lane 名额起计 |
-| `--timeout` | pi `25m`，codex `50m` | 每次尝试；§9.2 |
+| `--timeout` | 无 | 每次尝试；§9.2 |
 | `--retries N` | 1 | 0–3，答复畸形时的重跑次数 |
-| `--provider` `--model` `--thinking` | — | 透传给同事 CLI |
+| `--provider` `--model` `--thinking` | — | 透传给 Pi；`--model` 覆盖档位模型并固定（不升档） |
 | `--allow-parallel-writes` | 否 | 跳过写入互斥 |
 | `--after <run>` | — | 立即创建 run（state `waiting`），上游以 delivered/answered 结束后才执行；其他结局使本 run 以 `skipped` 结束，`error` 写明上游名称与结局，exit_code 为 1 |
 | `--in <run>` | — | 仅与 `--read-only` 同用；在上游 worktree 当前状态的快照中运行（§6.3）；未给 `--after` 时上游必须已结束 |
@@ -178,11 +177,11 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 | `crashed` | 无 `exit_code`，且上述均不满足 |
 | 结束态 | 有 `exit_code`，取 `summary.json` 的 `state` |
 
-### 4.1 选同事与升档（必须）
+### 4.1 选模型与升档（必须）
 
-- 未给 `--agent` 时按档位选：`cheap` → `DELEGATE_CHEAP_AGENT`（默认 `pi`），`strong` → `DELEGATE_STRONG_AGENT`（默认 `codex`），值必须是 `pi`/`codex`。隐式的 `cheap` 档同事未安装、而强档已安装时，改用强档并在 stderr 说明。`meta.json` 与状态行记 `tier`（直接指定时无此字段）。
-- **升档**：`tier == "cheap"` 的 run 结局为 `malformed`/`failed`/`timeout`/`rejected`、未被 stop、且（只读，或快照成功且没有任何改动）时，若强档已安装并在整机容量内（在 `<state>/.start.lock` 下检查），在同一 run 中换强档再跑一轮：事件 `escalate{from,to,after}`，`meta.json` 的 `agent` 改为强档、`tier` 改为 `strong`、`fork` 清空、记 `escalatedFrom`；只读 run 升到 Codex 时在 `prompt.md` 末尾补只读约定（§7.3）。新一轮沿用重跑次数，`attempts` 接续计数；快照、只读核对与验收按新一轮重新进行，结论带 `escalatedFrom`。容量不足时记事件 `escalate_skipped`，不升档。每个 run 至多升档一次。
-- reply 沿用上一轮的 `agent` 与 `tier`。
+- 同事恒为 `pi`。档位选模型：`DELEGATE_{CHEAP,STRONG}_MODEL` > 配置 `tiers.{cheap,strong}`（Pi `--model` 模式 `provider/id[:thinking]`）；为空时不传 `--model`，用 Pi 自己的默认模型。给了 `--model` 时用它并记 `agentPinned: true`。`meta.json` 记 `tier`、`model` 与启动时解析的 `tierModels`。`--agent` 已删除（退出码 2）。
+- **升档**：`tier == "cheap"` 的 run 结局为 `malformed`/`failed`/`timeout`/`rejected`、未被 stop、且（只读，或快照成功且没有任何改动）时，若 `tierModels.strong` 非空且与本轮模型不同，在同一 run 中换强档模型再跑一轮（不另占名额）：事件 `escalate{from,to,after}`（模型名，未指定为 `default`），`meta.json` 的 `model` 改为强档模型、`tier` 改为 `strong`、`fork` 清空、记 `escalatedFrom`（原模型）。新一轮沿用重跑次数，`attempts` 接续计数；快照、只读核对与验收按新一轮重新进行，结论带 `escalatedFrom`。固定模型（`agentPinned`）不升档。每个 run 至多升档一次。
+- reply 沿用上一轮的 `tier` 与模型；`--tier` 换成该档模型并在同一会话续做。旧版 Codex 记录由 Pi 开新会话续做（隐含 `--fresh`）。
 
 ### 4.1.1 编排（`--after`、`--in`，必须）
 
@@ -199,9 +198,8 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 
 ## 5. 只读
 
-- **能隔离时**（在自己的 worktree 中，git 仓库的默认情况）：Pi 与 Codex 同等对待——全部工具（可运行 `git log`/`git diff` 与测试），任务说明末尾附只读约定（§7.3），结束后按快照核对。隔离与核对已兜底，工具限制不再必要。
-- **无法隔离时**（非 git 目录或 `--in-place`）：Pi 以 `--tools read,grep,find,ls` 启动（没有写工具，也没有 shell），不附约定；Codex 仍靠约定与（git 中的）事后核对。
-- Codex：以 full access 启动；任务说明末尾附只读约定（§7.3），结束后按快照核对。
+- **能隔离时**（在自己的 worktree 中，git 仓库的默认情况）：全部工具（可运行 `git log`/`git diff` 与测试），任务说明末尾附只读约定（§7.3），结束后按快照核对。隔离与核对已兜底，工具限制不再必要。
+- **无法隔离时**（非 git 目录或 `--in-place`）：Pi 以 `--tools read,grep,find,ls` 启动（没有写工具，也没有 shell），不附约定。
 - 在 git 仓库中，只读 run **默认在 worktree 中运行**（§6.3），`--in-place` 除外。只读 worktree 的 HEAD 移到主控的 HEAD，**index 保持快照内容**（`git reset --soft`）：主控的未提交改动（含子模块指针）以已暂存的形式在 `git diff HEAD` / `git status` 中可见，又不影响结束时的快照比对。只读 worktree 与写入 worktree 一样执行 `setup`。
 - 核对：结束快照与起始快照有差异时，worktree 中记 `readOnlyViolation`（改动留在 worktree，不可 `apply`），原地记 `workspaceChanged`；两者都附 `warning`，state 仍为 `answered`/`delivered`。
 - 非 git 目录无法隔离与核对。
@@ -275,22 +273,17 @@ Pi：
 pi (--session-id <uuid> | --fork <上一轮会话副本>) --session-dir <run>/session --mode json
    [--provider P] [--model M] [--thinking T] [--tools read,grep,find,ls（仅无法隔离的只读）] -p [@<图片>...]   # stdin: prompt.md
 ```
-Codex：
-```
-codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dangerously-bypass-approvals-and-sandbox
-   [-m M] [-c model_reasoning_effort="T"] [-c model_provider="P"] [--image=<图片>...] -     # stdin: prompt.md
-```
-进程工作目录为 workdir，独立进程组。用户 systemd 可用时，同事、每条 setup 与验收命令分别在 `systemd-run --user --scope --quiet --collect` 创建的 scope 内运行；supervisor 不在 scope 内。启动时探测一次，失败或 `DELEGATE_CGROUP=0`（也接受 `PI_DELEGATE_CGROUP=0`）则沿用进程组及环境标记回收。环境：去掉 §12 的保护变量，叠加 `.delegate.json` 的 `env`，再设 `DELEGATE_AGENT`、`DELEGATE_RUN_DIR`（Pi 另设 `PI_DELEGATE_ACTIVE=1`）。
+进程工作目录为 workdir，独立进程组。用户 systemd 可用时，同事、每条 setup 与验收命令分别在 `systemd-run --user --scope --quiet --collect` 创建的 scope 内运行；supervisor 不在 scope 内。启动时探测一次，失败或 `DELEGATE_CGROUP=0`（也接受 `PI_DELEGATE_CGROUP=0`）则沿用进程组及环境标记回收。环境：去掉 §12 的保护变量，叠加 `.delegate.json` 的 `env`，再设 `DELEGATE_AGENT`、`DELEGATE_RUN_DIR` 与 `PI_DELEGATE_ACTIVE=1`。
 
 ### 7.2 事件
 
-同事的 JSON 流被过滤为 `events.jsonl` 的紧凑事件，每条带 `attempt` 与 `at`（UTC，`%Y-%m-%dT%H:%M:%SZ`）：`session{id}`、`bash{cmd}`、`bash_done{ok}`、`read|edit|write{path}`、`tool{tool,arg}`、`tool_error{tool,detail}`、`turn{provider,model,stopReason,usage}`、`result{text}`（Pi）、`message{text}`（Codex）、`turn_error{detail}`、`warning{detail}`、`retry`、`rerun`、`compaction_start|end`、`settled`、`queue{ahead}`（验收排队）。不记录编辑全文。
+同事的 JSON 流被过滤为 `events.jsonl` 的紧凑事件，每条带 `attempt` 与 `at`（UTC，`%Y-%m-%dT%H:%M:%SZ`）：`session{id}`、`bash{cmd}`、`bash_done{ok}`、`read|edit|write{path}`、`tool{tool,arg}`、`tool_error{tool,detail}`、`turn{provider,model,stopReason,usage}`、`result{text}`、`turn_error{detail}`、`warning{detail}`、`retry`、`rerun`、`compaction_start|end`、`settled`、`queue{ahead}`（验收排队）。不记录编辑全文。
 
 ### 7.3 附加约定（必须保持语义）
 
 任务说明为中文（含 CJK 字符）时用中文附言，否则英文。以 `\n\n---\n` 与原文分隔：
 - 验收命令（未隐藏时）：说明"结束后委派方在工作目录运行此命令，退出码 0 视为完成"，附代码块，并提示自检时用 `<入口> lane <命令>` 排队、排队时间不计时。
-- 只读约定（Codex 的一切只读 run，以及在 worktree 中的只读 Pi）：不得创建、修改、删除文件；改动会被报告且不被采纳；委派记录不算改动。升档时若 `prompt.md` 尚无这段约定才追加，不得重复。
+- 只读约定（在 worktree 中的只读 run）：不得创建、修改、删除文件；改动会被报告且不被采纳；委派记录不算改动。
 - reply 更改或取消验收命令时，说明旧标准不再适用。
 - 受保护路径：逐项列路径与可选原因；中文约定为“若正确完成任务必须修改受保护路径，停止该实现路线，报告路径、必要修改和原因，等待主控处理；不得为避开保护而迁移、复制逻辑或削弱测试。”英文约定为“If completing the task correctly requires changing a protected path, stop that implementation route, report the path, necessary changes and reason, and wait for the delegator. Do not move or copy logic or weaken tests to bypass protection.”
 
@@ -298,7 +291,7 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 
 ### 7.4 reply（必须）
 
-接在对话**最新一轮**之后（结局为 `malformed` 的轮次跳过）；可用 `--agent`/`--tier` 换一位同事（agent 改变即隐含 `--fresh`，新消息须自足），否则同一 agent、workdir、worktree、mode、env、provider/model/thinking、retries。每次尝试都从上一轮会话**分叉**（Pi 用会话文件副本 `--fork`，Codex `exec fork`），上一轮会话永不改动。`--fresh` 开新会话但留在同一对话与 worktree。同一轮已有进行中的 reply 时拒绝。
+接在对话**最新一轮**之后（结局为 `malformed` 的轮次跳过）；可用 `--tier` 换成该档模型（同一会话），否则同一模型、workdir、worktree、mode、env、provider/thinking、retries。每次尝试都从上一轮会话**分叉**（会话文件副本 `--fork`），上一轮会话永不改动。`--fresh` 开新会话但留在同一对话与 worktree。同一轮已有进行中的 reply 时拒绝。
 
 默认像 `start` 一样立即输出启动状态；`--wait` 像 `run` 一样收取结论与答复，`--max`/`--progress`/`--full` 仅可与 `--wait` 同用。`--sync` 在返回启动状态前完成，冲突时不启动。
 
@@ -366,7 +359,7 @@ codex exec [fork <会话 id>] --json --skip-git-repo-check [-C <workdir>] --dang
 
 ## 10. 并发、准入与清理
 
-- 整机并发：`<state>/<sha1(run 路径)[:16]>.slot` 记录运行中的 run；`DELEGATE_MAX_ACTIVE`（默认 8）、`DELEGATE_MAX_CODEX`（默认 4），0 不限。超出即拒绝并列出运行中的任务。
+- 整机并发：`<state>/<sha1(run 路径)[:16]>.slot` 记录运行中的 run；`DELEGATE_MAX_ACTIVE`（默认 12）、每仓库 `DELEGATE_REPO_MAX_ACTIVE`（默认 8），0 不限。超出即拒绝并列出运行中的任务。
 - 内存准入：`/proc/meminfo` 的 `MemAvailable` 低于 `DELEGATE_MIN_AVAILABLE_MB`（默认 4096，0 不查）时拒绝。
 - 启动在 `<state>/.start.lock` 与 `<runs>/.start.lock` 两把锁下进行，检查与登记不可交错。
 - 写入互斥：同一 workdir 同时只允许一个原地写入 run（`--allow-parallel-writes` 与 worktree run 除外）。
@@ -422,13 +415,13 @@ run 根目录：`DELEGATE_RUNS`，否则为**调用时当前目录**所在 git �
 
 `env` 为字符串到字符串的映射，注入同事、验收与 setup（原地与 worktree 均生效，reply 沿用）；`copy`/`link` 必须是仓库内相对路径，缺源跳过并在启动命令与 supervisor 的 stderr 提示。
 
-环境变量均先读 `DELEGATE_<名>`，再读 `PI_DELEGATE_<名>`：`RUNS`、`CHEAP_AGENT`（pi）、`STRONG_AGENT`（codex）、`MAX_ACTIVE`、`MAX_CODEX`、`MAX_HEAVY`、`MIN_AVAILABLE_MB`、`TIMEOUT_GRACE`、`RESULT_CHARS`（20000）、`KEEP_DAYS`、`POLL`、`SNAPSHOT_MAX_BYTES`、`SETUP_TIMEOUT`（10m）、`GENERATE_TIMEOUT`（10m）。`DELEGATE_CALLER` 单独按上述优先级取值，不读取 `PI_DELEGATE_CALLER`。由实现导出、调用方不应设置的保护变量：`DELEGATE_AGENT`、`DELEGATE_RUN_DIR`、`DELEGATE_LANE_HELD`、`PI_DELEGATE_ACTIVE`、`PI_DELEGATE_AGENT`、`PI_DELEGATE_PARENT_RUN`。
+环境变量均先读 `DELEGATE_<名>`，再读 `PI_DELEGATE_<名>`：`RUNS`、`CHEAP_MODEL`、`STRONG_MODEL`、`MAX_ACTIVE`、`REPO_MAX_ACTIVE`、`MAX_HEAVY`、`MIN_AVAILABLE_MB`、`TIMEOUT_GRACE`、`RESULT_CHARS`（20000）、`KEEP_DAYS`、`POLL`、`SNAPSHOT_MAX_BYTES`、`SETUP_TIMEOUT`（10m）、`GENERATE_TIMEOUT`（10m）。`DELEGATE_CALLER` 单独按上述优先级取值，不读取 `PI_DELEGATE_CALLER`。由实现导出、调用方不应设置的保护变量：`DELEGATE_AGENT`、`DELEGATE_RUN_DIR`、`DELEGATE_LANE_HELD`、`PI_DELEGATE_ACTIVE`、`PI_DELEGATE_AGENT`、`PI_DELEGATE_PARENT_RUN`。
 
 仅测试构建（debug）可用且默认关闭的环境变量：`DELEGATE_TEST_SUPERVISOR_DELAY` 使 supervisor 在写 `pid` 前延迟指定时长，`DELEGATE_TEST_STARTUP_TIMEOUT` 缩短启动方等待 `pid` 的时限；用于黑盒验证超时回收，正式发布构建忽略它们。
 
 ## 13. 一致性验收
 
-`tests/test_delegate.py` 是纯黑盒套件：通过伪造的 `pi`/`codex`（写在临时 `PATH` 中的 shell 脚本）以子进程驱动 CLI，只观察输出、退出码与 run 目录中的文件，覆盖本文全部必须项。被测入口由 `DELEGATE_BIN` 指定；未指定时套件先 `cargo build` `crates/delegate` 并测试产物，保证通过即覆盖当前源码；没有源码或 cargo 时才测已安装的 `skills/delegate/bin/delegate`，并在 stderr 提示：
+`tests/test_delegate.py` 是纯黑盒套件：通过伪造的 `pi`（写在临时 `PATH` 中的 shell 脚本）以子进程驱动 CLI，只观察输出、退出码与 run 目录中的文件，覆盖本文全部必须项。被测入口由 `DELEGATE_BIN` 指定；未指定时套件先 `cargo build` `crates/delegate` 并测试产物，保证通过即覆盖当前源码；没有源码或 cargo 时才测已安装的 `skills/delegate/bin/delegate`，并在 stderr 提示：
 
 ```bash
 DELEGATE_BIN=<被测可执行文件> python3 -m unittest tests.test_delegate

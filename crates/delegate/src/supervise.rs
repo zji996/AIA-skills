@@ -237,16 +237,11 @@ fn compress_answer(
             .find(|e| s(e, "e") == "session" && !s(e, "id").is_empty())
             .ok_or("no saved session for answer compression")?;
         let mut continuation = meta.clone();
-        continuation["fork"] = if agents::spec(s(meta, "agent"))
-            .is_some_and(|a| a.session == agents::SessionSource::DelegateFile)
-        {
-            json!(
-                agents::session_file(s(meta, "sessionDir"), s(&session, "id"))
-                    .ok_or("missing session file for answer compression")?
-            )
-        } else {
-            session["id"].clone()
-        };
+        continuation["fork"] = json!(agents::session_file(
+            s(meta, "sessionDir"),
+            s(&session, "id")
+        )
+        .ok_or("missing session file for answer compression")?);
         let prompt = run.join("compression-prompt.md");
         write(&prompt, format!("压缩到 {limit} 字以内，保留结论与证据。只答复文字，不执行命令或修改文件。 / Compress your previous answer to at most {limit} characters, preserving conclusions and evidence. Respond with text only.\n"))?;
         continuation["agentPromptFile"] = json!(prompt);
@@ -539,6 +534,13 @@ fn check_generated(
         Err(error) => (vec![], Some(error)),
     }
 }
+/// The model a run asked Pi for; "default" when it left the choice to Pi.
+fn model_label(meta: &Value) -> String {
+    Some(s(meta, "model"))
+        .filter(|m| !m.is_empty())
+        .unwrap_or("default")
+        .to_string()
+}
 fn escalate(
     meta: &mut Value,
     run: &Path,
@@ -557,49 +559,12 @@ fn escalate(
     if s(meta, "mode") != "read-only" && (!recorded || !changed.is_empty()) {
         return Ok(false);
     }
-    let strong = launch::strong_agent()?;
-    if strong == s(meta, "agent") || !agents::agent_available(&strong) {
+    let strong = s(&meta["tierModels"], "strong").to_string();
+    if strong.is_empty() || strong == s(meta, "model") {
         return Ok(false);
     }
-    let slots = state_dir();
-    let _guard = lock(&slots.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
-    let others: Vec<PathBuf> = launch::active_machine(&slots)
-        .into_iter()
-        .filter(|r| r != run)
-        .collect();
-    if launch::capacity(
-        &strong,
-        &others,
-        &meta["configCapacity"],
-        &launch::repo_key_for_meta(meta),
-    )
-    .is_err()
-    {
-        log_event(
-            run,
-            json!({"e":"escalate_skipped","reason":format!("no room for {strong}")}),
-        );
-        return Ok(false);
-    }
-    if s(meta, "mode") == "read-only" && agents::spec(&strong).is_some_and(|a| a.read_only_contract)
-    {
-        let prompt = read(run.join("prompt.md"));
-        if !launch::has_read_only_contract(&prompt) {
-            write(
-                run.join("prompt.md"),
-                launch::contract(&prompt, None, true, false, &[], &Default::default()),
-            )?;
-        }
-    }
-    meta["escalatedFrom"] = meta["agent"].clone();
-    meta["agent"] = json!(strong);
-    let (agent_bin, agent_version) = agents::agent_identity(s(meta, "agent"))?;
-    meta["agentBin"] = json!(agent_bin);
-    if let Some(version) = agent_version {
-        meta["agentVersion"] = json!(version);
-    } else {
-        meta.as_object_mut().unwrap().remove("agentVersion");
-    }
+    meta["escalatedFrom"] = json!(model_label(meta));
+    meta["model"] = json!(strong);
     meta["tier"] = json!("strong");
     meta["fork"] = Value::Null;
     write_json(run.join("meta.json"), meta)?;
@@ -706,12 +671,12 @@ fn inner(
     };
     let (mut state, mut sum, mut rec, mut changed) =
         settle(&meta, run, &verdict, &setup_error, holder.clone());
-    let cheap = s(&meta, "agent").to_string();
+    let cheap = model_label(&meta);
     let protected = !sum["protectViolation"].is_null();
     if !lane::stopped() && escalate(&mut meta, run, &state, rec.is_some(), &changed, protected)? {
         log_event(
             run,
-            json!({"e":"escalate","from":cheap,"to":s(&meta,"agent"),"after":state}),
+            json!({"e":"escalate","from":cheap,"to":model_label(&meta),"after":state}),
         );
         (verdict, answer, attempts) =
             attempts_from(&meta, run, attempts + 1, holder.clone(), grace.clone());
@@ -902,13 +867,12 @@ fn admit_waiting(run: &Path, meta: &Value, stop_waiter: &StopWaiter) -> Res<()> 
         let local = lock(&root.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
         let others = launch::active_machine(&slots);
         let full = launch::capacity(
-            s(meta, "agent"),
             &others,
             &meta["configCapacity"],
             &launch::repo_key_for_meta(meta),
         );
         if let Err(reason) = &full {
-            if !reason.contains("runs are active") && !reason.contains("Codex runs are active") {
+            if !reason.contains("runs are active") {
                 return full;
             }
         } else {

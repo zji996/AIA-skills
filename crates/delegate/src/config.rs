@@ -180,17 +180,24 @@ fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
         {
             return Err("maxRework must be a non-negative integer or null".into());
         }
-        for key in [
-            "maxActive",
-            "maxCodex",
-            "maxHeavy",
-            "repoMaxActive",
-            "repoMaxCodex",
-        ] {
+        for key in ["maxActive", "maxHeavy", "repoMaxActive"] {
             if value.get(key).is_some_and(|v| v.as_u64().is_none()) {
                 return Err(format!(
                     "{key} must be a non-negative integer (0 = unlimited)"
                 ));
+            }
+        }
+        if let Some(tiers) = value.get("tiers") {
+            let tiers = tiers.as_object().ok_or("tiers must be an object")?;
+            for (tier, model) in tiers {
+                if !crate::agents::TIERS.contains(&tier.as_str()) {
+                    return Err(format!("tiers.{tier}: unknown tier (cheap or strong)"));
+                }
+                if !model.as_str().is_some_and(|m| !m.contains('\0')) {
+                    return Err(format!(
+                        "tiers.{tier} must be a Pi model pattern string (provider/id[:thinking])"
+                    ));
+                }
             }
         }
         crate::deny::validate_config(value.get("agentDeny"), repo)?;
@@ -284,11 +291,10 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         "maxRework",
         "sourceBuild",
         "maxActive",
-        "maxCodex",
         "maxHeavy",
         "repoMaxActive",
-        "repoMaxCodex",
         "resultChars",
+        "tiers",
         "acceptBlind",
         "stall",
         "checkIn",
@@ -384,10 +390,8 @@ pub fn capacity(value: &Value, key: &str, name: &str, default: u64) -> Res<u64> 
 pub fn capacities(value: &Value) -> Res<Value> {
     Ok(json!({
         "maxActive": capacity(value, "maxActive", "MAX_ACTIVE", 12)?,
-        "maxCodex": capacity(value, "maxCodex", "MAX_CODEX", 6)?,
         "maxHeavy": capacity(value, "maxHeavy", "MAX_HEAVY", 2)?,
         "repoMaxActive": capacity(value, "repoMaxActive", "REPO_MAX_ACTIVE", 8)?,
-        "repoMaxCodex": capacity(value, "repoMaxCodex", "REPO_MAX_CODEX", 4)?,
     }))
 }
 

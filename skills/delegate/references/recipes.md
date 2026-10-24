@@ -31,9 +31,9 @@ $D wait            # 放后台；三路都结束才返回
 
 想边收边看就改成逐个收取：`$D wait --stream`（宿主能把每行输出变成通知时，每路完工一行）或后台 `$D wait --any`（先完工的先返回，处理完再放同一条）。写入任务边收边合时，结论行的 `sourceDrift.overlap` 列出你合入别的结果后与它重叠的文件。
 
-Claude Code 的 Monitor 能把后台输出逐行转事件，优先 `wait --stream`；只有进程结束通知时重复后台 `wait --any`。直接 `--agent pi` 的结论显示 `pi/cheap`、`agentPinned: true`，固定同事不自动升档。
+Claude Code 的 Monitor 能把后台输出逐行转事件，优先 `wait --stream`；只有进程结束通知时重复后台 `wait --any`。直接 `--model` 的结论仍显示所在档位（如 `pi/cheap`）、`agentPinned: true`，固定模型不自动升档。
 
-审自己刚写的代码时优先用另一家模型（`--tier strong` 即 Codex）：作者自测再多也难看到自己的盲点。拿到结论后逐条去代码里核实，别整段转述。
+审自己刚写的代码时优先用另一家模型（主控之外的 Pi 模型，必要时 `--model` 指定）：作者自测再多也难看到自己的盲点。拿到结论后逐条去代码里核实，别整段转述。
 
 ## 2. 同事修，主控审方向
 
@@ -90,7 +90,7 @@ done
 $D wait
 ```
 
-容量有两层：整机默认 12 个任务/Codex 6，每仓库 8/Codex 4；git worktree 与主仓库同计。超出时提示层级、计数和相关任务，先 `wait` 收一批再放。
+容量有两层：整机默认 12 个任务，每仓库 8；git worktree 与主仓库同计。超出时提示层级、计数和相关任务，先 `wait` 收一批再放。
 
 ## 6. monorepo 的 worktree 配置
 
@@ -121,6 +121,6 @@ $D wait
 - 只禁无过滤的数据库全量检查时用 `{"argv":["cargo","xtask","infra-test"],"exact":true,"hint":"带过滤参数跑相关用例"}`；额外参数放行。用户/仓库去重和 `allow: true` 撤销都按 `(argv, exact)`，撤销时保留同样的 exact。
 - 顶层 `accept` 只作用于写入任务；任务测试用 `--accept-also` 追加，`--accept` 覆盖，`--no-accept` 关闭（不能与追加同用）。并行写入用 `--protect` 划分文件所有权；验收覆盖相关 ratchet、contracts、docs 门禁，合并后再跑全量。
 - `generated.paths` 的匹配语义同 `--protect`（目录以 `/` 结尾）。这些生成文件仍出现在改动清单和 diff 中，但 `apply` 不合并或覆盖它们；合并其他文件后，在源仓库根通过 lane 运行 `sh -c` 执行 `generated.command`（设了 `generated.inputs` 时只在合并路径命中它时运行），输出写入 run 目录的 `generate.log`。`--dry-run` 只报告动作；生成失败时已合并文件保留，需查看日志后重试。见 `docs/delegate-spec.md` §6.4。
-- 界面实现默认 `--tier cheap`（Pi 前端审美与交互明显好于 Codex），说明里要截图路径；强档只接状态、数据与接口逻辑。
+- 界面实现默认 `--tier cheap`，说明里要截图路径；强档只接状态、数据与接口逻辑。
 
 常见问题与不适合委派的情况见 [pitfalls.md](pitfalls.md)。

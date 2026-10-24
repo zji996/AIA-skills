@@ -9,7 +9,6 @@ import test_delegate as fixtures
 class DelegateDefaultsTests(unittest.TestCase):
     setUp = fixtures.DelegateTests.setUp
     fake_pi = fixtures.DelegateTests.fake_pi
-    fake_codex = fixtures.DelegateTests.fake_codex
     cli = fixtures.DelegateTests.cli
     outcome = fixtures.DelegateTests.outcome
     repo = fixtures.DelegateTests.repo
@@ -178,22 +177,13 @@ class DelegateDefaultsTests(unittest.TestCase):
         self.assertIn('失败，保留原答复', result.stdout)
 
     def test_compression_failure_to_execute_keeps_original(self):
-        # No thread.started event: there is no session to continue.
-        events = fixtures.codex_events('x' * 40)[1:]
-        self.fake_codex(events)
-        state = self.outcome(self.cli('run', '--agent', 'codex', '--read-only', '--max-answer', '10', 'task'))
+        # The session file is gone: there is nothing to continue.
+        self.fake_pi([fixtures.answer('x' * 40), fixtures.SETTLED], pre='rm -f "$dir"/*.jsonl')
+        state = self.outcome(self.cli('run', '--read-only', '--max-answer', '10', 'task'))
         self.assertFalse(state['compression']['ok'])
-        self.assertIn('no saved session', state['compression']['error'])
+        self.assertIn('session', state['compression']['error'])
         self.assertEqual((Path(state['dir']) / 'result.md').read_text().strip(), 'x' * 40)
-        self.assertEqual(len((self.work / 'pi.log.codex').read_text().splitlines()), 1)
-
-    def test_compression_codex_continues_latest_session(self):
-        compact = ' '.join(shlex.quote(json.dumps(e)) for e in fixtures.codex_events('short'))
-        self.fake_codex(fixtures.codex_events('x' * 40),
-                        pre=f'if [ "$(wc -l < "$PI_LOG.codex")" -gt 1 ]; then printf "%s\\n" {compact}; exit 0; fi')
-        state = self.outcome(self.cli('run', '--agent', 'codex', '--read-only', '--max-answer', '10', 'task'))
-        self.assertTrue(state['compression']['ok'])
-        self.assertIn('exec fork t1', (self.work / 'pi.log.codex').read_text())
+        self.assertEqual(len((self.work / 'pi.log').read_text().splitlines()), 1)
 
     def test_compression_only_above_one_and_half(self):
         self.fake_pi([fixtures.answer('x' * 15), fixtures.SETTLED])

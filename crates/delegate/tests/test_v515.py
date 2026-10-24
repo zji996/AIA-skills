@@ -42,7 +42,7 @@ class V515Tests(unittest.TestCase):
                      pre='printf "%s" "$SHARED" > "$DELEGATE_RUN_DIR/injected"; echo changed > a.txt')
         self.user_config({"env": {"SHARED": "user"}, "accept": 'test "$SHARED" = user',
                           "maxRework": 0, "agentDeny": [{"argv": ["cargo", "check"], "hint": "related only"}]})
-        first = self.outcome(self.cli("run", "--agent", "pi", "task"))
+        first = self.outcome(self.cli("run", "task"))
         self.assertEqual((first["state"], first["configSources"]), ("delivered", ["user"]))
         run = Path(first["dir"])
         self.assertEqual((run / "injected").read_text(), "user")
@@ -53,19 +53,19 @@ class V515Tests(unittest.TestCase):
         self.env["XDG_CONFIG_HOME"] = str(self.work / "home/.config")
         self.user_config({"env": {"SHARED": "user"}, "accept": "true"})
         self.env["XDG_CONFIG_HOME"] = ""
-        fallback = self.outcome(self.cli("run", "--agent", "pi", "task"))
+        fallback = self.outcome(self.cli("run", "task"))
         self.assertEqual(fallback["configSources"], ["user"])
 
     def test_v517_repo_only_and_builtin_defaults(self):
         repo = self.repo({"a.txt": "old\n"})
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
-        first = self.outcome(self.cli("run", "--agent", "pi", "--workdir", repo, "task"))
+        first = self.outcome(self.cli("run", "--workdir", repo, "task"))
         self.assertEqual(first["configSources"], [])
-        self.assertEqual(self.meta(first)["configCapacity"], {"maxActive": 12, "maxCodex": 6, "maxHeavy": 2,
-                                                             "repoMaxActive": 8, "repoMaxCodex": 4})
+        self.assertEqual(self.meta(first)["configCapacity"], {"maxActive": 12, "maxHeavy": 2,
+                                                             "repoMaxActive": 8})
         (repo / ".delegate.json").write_text(json.dumps({"accept": "true", "env": {"LOCAL": "repo"},
                                                         "maxRework": 0}))
-        state = self.outcome(self.cli("run", "--agent", "pi", "--workdir", repo, "task"))
+        state = self.outcome(self.cli("run", "--workdir", repo, "task"))
         self.assertEqual((state["state"], state["configSources"]), ("delivered", ["repo"]))
         self.assertEqual(self.meta(state)["env"], {"LOCAL": "repo"})
         rejected = self.cli("reply", state["run"], "fix")
@@ -88,7 +88,7 @@ class V515Tests(unittest.TestCase):
                           {"argv": ["cargo", "test"], "hint": "repo test"}]}))
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED],
                      pre='cargo check; cargo test; pnpm check; echo changed >> a.txt')
-        state = self.outcome(self.cli("run", "--agent", "pi", "--workdir", repo, "task"))
+        state = self.outcome(self.cli("run", "--workdir", repo, "task"))
         self.assertEqual((state["state"], state["configSources"], state["denied"]),
                          ("delivered", ["user", "repo"], 3))
         meta = self.meta(state)
@@ -109,7 +109,7 @@ class V515Tests(unittest.TestCase):
         path = self.user_config({"accept": [], "maxActive": "bad"})
         (repo / ".delegate.json").write_text('{"accept":"true","maxActive":8}')
         self.env["DELEGATE_MAX_ACTIVE"] = "8"
-        result = self.cli("start", "--agent", "pi", "--workdir", repo, "task")
+        result = self.cli("start", "--workdir", repo, "task")
         self.assertEqual(result.returncode, 2)
         self.assertIn(str(path), result.stderr)
         self.assertIn("accept", result.stderr)
@@ -127,7 +127,7 @@ cargo check --all > "$DELEGATE_RUN_DIR/allowed"
 echo $? > "$DELEGATE_RUN_DIR/allowed-code"
 cargo test; echo $? > "$DELEGATE_RUN_DIR/denied-code"
 ''')
-        state = self.outcome(self.cli("run", "--agent", "pi", "--workdir", repo, "task"))
+        state = self.outcome(self.cli("run", "--workdir", repo, "task"))
         self.assertEqual(state["denied"], 1)
         run = Path(state["dir"])
         self.assertEqual((run / "allowed-code").read_text(), "0\n")
@@ -136,25 +136,25 @@ cargo test; echo $? > "$DELEGATE_RUN_DIR/denied-code"
 
     def test_v517_capacity_precedence_and_admission(self):
         repo = self.repo({"a.txt": "old\n"})
-        self.user_config({"maxActive": 1, "maxCodex": 2, "maxHeavy": 3})
+        self.user_config({"maxActive": 1, "maxHeavy": 3})
         gate = self.work / "gate"
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED],
                      pre=f'while [ ! -f {gate} ]; do sleep .02; done')
-        first = self.outcome(self.cli("start", "--agent", "pi", "--read-only", "--in-place", "--workdir", repo, "task"))
+        first = self.outcome(self.cli("start", "--read-only", "--in-place", "--workdir", repo, "task"))
         self.addCleanup(self.cli, "stop", first["run"])
-        full = self.cli("start", "--agent", "pi", "--read-only", "task")
+        full = self.cli("start", "--read-only", "task")
         self.assertEqual(full.returncode, 2)
         self.assertIn("MAX_ACTIVE=1", full.stderr)
-        (repo / ".delegate.json").write_text(json.dumps({"maxActive": 2, "maxCodex": 3, "maxHeavy": 4}))
-        second = self.outcome(self.cli("start", "--agent", "pi", "--read-only", "--in-place", "--workdir", repo, "task"))
+        (repo / ".delegate.json").write_text(json.dumps({"maxActive": 2, "maxHeavy": 4}))
+        second = self.outcome(self.cli("start", "--read-only", "--in-place", "--workdir", repo, "task"))
         self.addCleanup(self.cli, "stop", second["run"])
-        self.assertEqual(self.meta(second)["configCapacity"], {"maxActive": 2, "maxCodex": 3, "maxHeavy": 4,
-                                                              "repoMaxActive": 8, "repoMaxCodex": 4})
-        self.env.update(DELEGATE_MAX_ACTIVE="0", DELEGATE_MAX_CODEX="0", DELEGATE_MAX_HEAVY="0")
-        third = self.outcome(self.cli("start", "--agent", "pi", "--read-only", "--in-place", "--workdir", repo, "task"))
+        self.assertEqual(self.meta(second)["configCapacity"], {"maxActive": 2, "maxHeavy": 4,
+                                                              "repoMaxActive": 8})
+        self.env.update(DELEGATE_MAX_ACTIVE="0", PI_DELEGATE_MAX_HEAVY="0")
+        third = self.outcome(self.cli("start", "--read-only", "--in-place", "--workdir", repo, "task"))
         self.addCleanup(self.cli, "stop", third["run"])
-        self.assertEqual(self.meta(third)["configCapacity"], {"maxActive": 0, "maxCodex": 0, "maxHeavy": 0,
-                                                             "repoMaxActive": 8, "repoMaxCodex": 4})
+        self.assertEqual(self.meta(third)["configCapacity"], {"maxActive": 0, "maxHeavy": 0,
+                                                             "repoMaxActive": 8})
         gate.touch()
         self.assertEqual(self.cli("wait", first["run"], second["run"], third["run"]).returncode, 0)
 
@@ -162,34 +162,15 @@ cargo test; echo $? > "$DELEGATE_RUN_DIR/denied-code"
         repo = self.repo({"a.txt": "old\n"})
         self.user_config({"worktree": 123, "generated": "invalid", "applyVerify": [], "accept": "false"})
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
-        result = self.cli("run", "--agent", "pi", "--worktree", "--workdir", repo, "--accept", "true", "task")
+        result = self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "task")
         state = self.outcome(result)
         self.assertEqual(state["state"], "delivered")
         self.assertEqual(result.stderr.count("ignoring repository-only fields:"), 1)
         self.assertIn("worktree, generated, applyVerify", result.stderr)
         self.assertEqual(self.cli("apply", "--json", "--keep", state["run"]).returncode, 0)
         for flags in (("--no-accept",), ("--read-only",)):
-            state = self.outcome(self.cli("run", "--agent", "pi", "--workdir", repo, *flags, "task"))
+            state = self.outcome(self.cli("run", "--workdir", repo, *flags, "task"))
             self.assertEqual(state["state"], "answered")
-
-    def test_v517_codex_capacity_and_legacy_env_override(self):
-        self.user_config({"maxCodex": 1})
-        gate = self.work / "gate"
-        fixtures.DelegateTests.fake_codex(self, fixtures.codex_events(),
-                                         pre=f'while [ ! -f {gate} ]; do sleep .02; done')
-        first = self.outcome(self.cli("start", "--agent", "codex", "--read-only", "task"))
-        self.addCleanup(self.cli, "stop", first["run"])
-        full = self.cli("start", "--agent", "codex", "--read-only", "task")
-        self.assertEqual(full.returncode, 2)
-        self.assertIn("MAX_CODEX=1", full.stderr)
-        self.env["PI_DELEGATE_MAX_CODEX"] = "0"
-        second = self.outcome(self.cli("start", "--agent", "codex", "--read-only", "task"))
-        self.addCleanup(self.cli, "stop", second["run"])
-        self.assertEqual(self.meta(second)["configCapacity"]["maxCodex"], 0)
-        self.env["DELEGATE_MAX_CODEX"] = "1"
-        self.assertEqual(self.cli("start", "--agent", "codex", "--read-only", "task").returncode, 2)
-        gate.touch()
-        self.assertEqual(self.cli("wait", first["run"], second["run"]).returncode, 0)
 
     def test_v517_lane_capacity_uses_user_repo_and_environment(self):
         repo = self.repo({"a.txt": "old\n"})
@@ -215,7 +196,7 @@ cargo test; echo $? > "$DELEGATE_RUN_DIR/denied-code"
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED],
                      pre=f'{shlex.quote(str(fixtures.DELEGATE))} lane > "$DELEGATE_RUN_DIR/holders"')
         self.env.pop("DELEGATE_MAX_HEAVY")
-        state = self.outcome(self.cli("run", "--agent", "pi", "--worktree", "--workdir", repo, "task"))
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
         self.assertEqual((Path(state["dir"]) / "holders").read_text().count("running"), 2)
         gate.touch()
         for proc in processes:
@@ -226,18 +207,18 @@ cargo test; echo $? > "$DELEGATE_RUN_DIR/denied-code"
         repo = self.repo({"a.txt": "old\n"})
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
         bad = [("env", {"BAD": 1}), ("accept", []), ("maxRework", -1), ("maxActive", "1"),
-               ("maxCodex", None), ("maxHeavy", 1.5), ("agentDeny", [{"argv": ["cargo"], "hint": ""}]),
+               ("repoMaxActive", None), ("tiers", {"strong": 1}), ("maxHeavy", 1.5), ("agentDeny", [{"argv": ["cargo"], "hint": ""}]),
                ("agentDeny", [{"argv": ["cargo"], "allow": "yes"}])]
         for user in (True, False):
             for field, value in bad:
                 with self.subTest(user=user, field=field, value=value):
                     path = self.user_config({field: value}) if user else repo / ".delegate.json"
                     path.write_text(json.dumps({field: value}))
-                    result = self.cli("start", "--agent", "pi", "--workdir", repo, "task")
+                    result = self.cli("start", "--workdir", repo, "task")
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertIn(str(path), result.stderr)
                     self.assertIn(field, result.stderr)
-                    result = self.cli("start", "--agent", "pi", "--read-only", "--workdir", repo, "task")
+                    result = self.cli("start", "--read-only", "--workdir", repo, "task")
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertIn(str(path), result.stderr)
                     self.assertIn(field, result.stderr)
@@ -245,7 +226,7 @@ cargo test; echo $? > "$DELEGATE_RUN_DIR/denied-code"
             for text in ("{", "[]"):
                 path = self.user_config({}) if user else repo / ".delegate.json"
                 path.write_text(text)
-                result = self.cli("start", "--agent", "pi", "--workdir", repo, "task")
+                result = self.cli("start", "--workdir", repo, "task")
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(str(path), result.stderr)
                 self.assertIn("config", result.stderr)
@@ -253,7 +234,7 @@ cargo test; echo $? > "$DELEGATE_RUN_DIR/denied-code"
         for field, value in (("worktree", {"copy": [1]}), ("generated", {"paths": [1]}), ("applyVerify", [])):
             path = repo / ".delegate.json"
             path.write_text(json.dumps({field: value}))
-            result = self.cli("start", "--agent", "pi", "--workdir", repo, "task")
+            result = self.cli("start", "--workdir", repo, "task")
             self.assertEqual(result.returncode, 2)
             self.assertIn(str(path), result.stderr)
             self.assertIn(field, result.stderr)
@@ -381,7 +362,7 @@ echo $? > "$DELEGATE_RUN_DIR/shell-lane-code"
 DELEGATE_LANE_HELD=1 {delegate} lane cargo xtask check
 echo $? > "$DELEGATE_RUN_DIR/held-code"
 ''')
-        state = self.outcome(self.cli("run", "--agent", "pi", "--workdir", repo,
+        state = self.outcome(self.cli("run", "--workdir", repo,
                                      "--accept", "cargo xtask check", "task"))
         self.assertEqual(state["state"], "delivered")
         self.assertEqual(state["denied"], 5)
@@ -408,7 +389,7 @@ printf 'input\\n' | TOOL_EXIT=23 cargo {command} > "$DELEGATE_RUN_DIR/output"
 echo $? > "$DELEGATE_RUN_DIR/code"
 cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
 ''')
-        state = self.outcome(self.cli("run", "--agent", "pi", "--worktree", "--workdir", repo, "task"))
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
         run = Path(state["dir"])
         self.assertEqual((run / "output").read_text(), "\n".join(args) + "\ninput\n")
         self.assertEqual((run / "code").read_text(), "23\n")
@@ -423,7 +404,7 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
                                "generated": {"paths": ["gen/"], "command": "cargo xtask generate"},
                                "applyVerify": "cargo xtask check"})
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo new > a.txt; cargo xtask generate")
-        state = self.outcome(self.cli("run", "--agent", "pi", "--worktree", "--workdir", repo,
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo,
                                      "--accept", "cargo xtask check", "task"))
         self.assertEqual(state["state"], "delivered")
         self.assertEqual(state["denied"], 1)
@@ -434,11 +415,11 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
         self.assertEqual((repo / "gen/out").read_text(), "new\n")
         self.assertEqual(self.outcome(self.cli("status", state["run"]))["denied"], 1)
 
-    def test_agent_deny_uses_configured_path_and_both_agents(self):
+    def test_agent_deny_uses_configured_path(self):
         repo = self.deny_repo({"env": {"PATH": self.env["PATH"]}})
-        fixtures.DelegateTests.fake_codex(self, fixtures.codex_events(),
-                                         pre='cargo xtask check; echo $? > "$DELEGATE_RUN_DIR/code"')
-        state = self.outcome(self.cli("run", "--agent", "codex", "--workdir", repo, "task"))
+        self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED],
+                     pre='cargo xtask check; echo $? > "$DELEGATE_RUN_DIR/code"')
+        state = self.outcome(self.cli("run", "--workdir", repo, "task"))
         self.assertEqual(state["denied"], 1)
         self.assertEqual((Path(state["dir"]) / "code").read_text(), "77\n")
 
@@ -446,7 +427,7 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
         repo = self.deny_repo()
         (repo / ".delegate.json").write_text("{}")
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="cargo xtask check")
-        state = self.outcome(self.cli("run", "--agent", "pi", "--workdir", repo, "task"))
+        state = self.outcome(self.cli("run", "--workdir", repo, "task"))
         self.assertNotIn("denied", state)
         self.assertFalse((Path(state["dir"]) / "agent-shims").exists())
         for rules in ({}, [{"argv": [], "hint": "no"}],
@@ -455,7 +436,7 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
                       [{"argv": ["cargo"], "hint": ""}]):
             with self.subTest(rules=rules):
                 (repo / ".delegate.json").write_text(json.dumps({"agentDeny": rules}))
-                result = self.cli("start", "--agent", "pi", "--workdir", repo, "task")
+                result = self.cli("start", "--workdir", repo, "task")
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("agentDeny", result.stderr)
 
@@ -466,7 +447,7 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
         })
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED],
                      pre='cargo test > "$DELEGATE_RUN_DIR/output"')
-        state = self.outcome(self.cli("run", "--agent", "pi", "--worktree", "--workdir", repo, "task"))
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
         self.assertEqual(state["state"], "answered")
         self.assertEqual((Path(state["dir"]) / "output").read_text(), "setup-tool\n")
 
@@ -474,7 +455,7 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
         repo = self.repo({"a.txt": "old\n"})
         self.env["DELEGATE_TIMEOUT_GRACE"] = "0"
         self.fake_pi([fixtures.answer("later"), fixtures.SETTLED], pre="echo partial >> a.txt", sleep=10)
-        first = self.outcome(self.cli("run", "--agent", "pi", "--worktree", "--workdir", repo,
+        first = self.outcome(self.cli("run", "--worktree", "--workdir", repo,
                                      "--name", "job", "--timeout", ".2s", "task"))
         self.assertEqual(first["state"], "timeout")
         self.assertTrue(first["next"].startswith(str(fixtures.DELEGATE) + " reply "))
@@ -501,7 +482,7 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
         repo = self.repo({"a.txt": "old\n"})
         self.env["DELEGATE_TIMEOUT_GRACE"] = "0"
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo first >> a.txt")
-        self.outcome(self.cli("run", "--agent", "pi", "--worktree", "--workdir", repo,
+        self.outcome(self.cli("run", "--worktree", "--workdir", repo,
                              "--name", "job", "--accept", "false", "task"))
         self.fake_pi([fixtures.answer("later"), fixtures.SETTLED], pre="echo fix >> a.txt", sleep=10)
         timed = self.outcome(self.cli("reply", "--wait", "--timeout", ".2s", "job", "fix"))
@@ -519,7 +500,7 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
     def test_stopped_continuation_allowed_after_rework_budget_is_spent(self):
         repo = self.repo({"a.txt": "old\n"})
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo first >> a.txt")
-        self.outcome(self.cli("run", "--agent", "pi", "--worktree", "--workdir", repo,
+        self.outcome(self.cli("run", "--worktree", "--workdir", repo,
                              "--name", "job", "--accept", "false", "task"))
         self.fake_pi([fixtures.answer("later"), fixtures.SETTLED], pre="echo fix >> a.txt", sleep=30)
         started = self.outcome(self.cli("reply", "job", "fix"))
@@ -539,7 +520,7 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
         (repo / ".delegate.json").write_text(json.dumps({"maxRework": 0}))
         self.env["DELEGATE_TIMEOUT_GRACE"] = "0"
         self.fake_pi([fixtures.answer("later"), fixtures.SETTLED], pre="echo partial >> a.txt", sleep=10)
-        first = self.outcome(self.cli("run", "--agent", "pi", "--worktree", "--workdir", repo,
+        first = self.outcome(self.cli("run", "--worktree", "--workdir", repo,
                                      "--timeout", ".2s", "task"))
         session = Path(first["dir"]) / "session"
         for file in session.iterdir():

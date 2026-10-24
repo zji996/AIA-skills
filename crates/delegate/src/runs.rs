@@ -226,9 +226,9 @@ pub fn events(run: &Path) -> Vec<Value> {
         .collect()
 }
 pub fn agent_pinned(meta: &Value) -> bool {
-    meta["agentPinned"].as_bool().unwrap_or_else(|| {
-        s(meta, "tier").is_empty() && crate::agents::spec(s(meta, "agent")).is_some()
-    })
+    meta["agentPinned"]
+        .as_bool()
+        .unwrap_or_else(|| s(meta, "tier").is_empty() && !s(meta, "agent").is_empty())
 }
 pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<String> {
     let name = if !s(meta, "run").is_empty() {
@@ -276,7 +276,7 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
         "rejected" => Some(format!(
             "read accept.tail; {script} reply {name} '<what to fix>' or take it over"
         )),
-        "malformed" => Some("hand it to the other agent or do it yourself".into()),
+        "malformed" => Some(format!("{script} reply {name} --tier strong '<what to fix>' or do it yourself")),
         "failed" => Some("read error; fix the cause or take it over".into()),
         "timeout" if s(meta, "mode") == "read-only" => Some(format!(
             "{script} reply {name} 'answer with what you found so far' or split the question"
@@ -286,9 +286,8 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
             shell_quote(&script.to_string()),
             shell_quote(&name),
             if sum["session"].as_str().is_none_or(str::is_empty)
-                || (crate::agents::spec(s(meta, "agent")).is_some_and(|agent| {
-                    agent.session == crate::agents::SessionSource::DelegateFile
-                }) && crate::agents::session_file(s(meta, "sessionDir"), s(sum, "session")).is_none())
+                || (s(meta, "agent") == crate::agents::AGENT
+                    && crate::agents::session_file(s(meta, "sessionDir"), s(sum, "session")).is_none())
             {
                 "--fresh "
             } else {
@@ -307,7 +306,7 @@ pub fn status(run: &Path) -> Value {
         worktree::detect_applied(run, &meta);
     }
     let sum = json(run.join("summary.json"));
-    let mut out = json!({"run":meta.get("run").and_then(Value::as_str).unwrap_or_else(||run.file_name().and_then(|x|x.to_str()).unwrap_or("")),"name":meta.get("name"),"state":st,"agent":meta.get("agent").and_then(Value::as_str).unwrap_or(crate::agents::default_for_tier("cheap").name),"mode":meta.get("mode")});
+    let mut out = json!({"run":meta.get("run").and_then(Value::as_str).unwrap_or_else(||run.file_name().and_then(|x|x.to_str()).unwrap_or("")),"name":meta.get("name"),"state":st,"agent":meta.get("agent").and_then(Value::as_str).unwrap_or(crate::agents::AGENT),"mode":meta.get("mode")});
     if !s(&meta, "agentBin").is_empty() {
         out["agentBin"] = meta["agentBin"].clone();
     }
@@ -334,10 +333,10 @@ pub fn status(run: &Path) -> Value {
     }
     if !s(&meta, "tier").is_empty() {
         out["tier"] = meta["tier"].clone();
-    } else if let Some(tier) =
-        crate::agents::spec(s(&meta, "agent")).and_then(|agent| agent.default_tier)
-    {
-        out["tier"] = json!(tier);
+    } else if s(&meta, "agent") == "codex" {
+        out["tier"] = json!("strong");
+    } else if !s(&meta, "agent").is_empty() {
+        out["tier"] = json!("cheap");
     }
     if agent_pinned(&meta) || meta.get("agentPinned").is_some() {
         out["agentPinned"] = json!(agent_pinned(&meta));

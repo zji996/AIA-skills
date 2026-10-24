@@ -2,11 +2,10 @@ const LAUNCH: &[(&str, &str)] = &[
     ("words", "Prompt text (or use --prompt / --prompt-file)."),
     ("--prompt TEXT", "Prompt text."),
     ("--prompt-file FILE", "Read the prompt from FILE, or - for stdin."),
-    ("--tier cheap|strong", "Cheap: Pi for reading, summaries, copy, images; strong: Codex for code and rigorous review. Default: cheap for read-only, strong for writes. Eligible failed cheap runs escalate once to strong."),
-    ("--agent", "Choose an agent directly; disables tier escalation."),
+    ("--tier cheap|strong", "Pick Pi's model from config tiers.cheap / tiers.strong (DELEGATE_CHEAP_MODEL / DELEGATE_STRONG_MODEL); an unset tier uses Pi's default model. Default: cheap for read-only, strong for writes. Eligible failed cheap runs escalate once to a different strong model."),
     ("--name NAME", "Short label in the run id (default: first clause of the prompt, up to 24 characters)."),
     ("--workdir DIR", "Agent working directory (default: cwd)."),
-    ("--image PATH", "Attach an image; repeatable, supported by both agents."),
+    ("--image PATH", "Attach an image; repeatable."),
     ("--share PATH", "Share a read-only input path; repeatable. Inside the repository, link at the same relative worktree path."),
     ("--read-only", "No writes: isolated agents are instructed and checked; Pi uses read-only tools without isolation. In git, reads a worktree snapshot by default."),
     ("--in-place", "Read-only: read the live working tree. Writes: override defaults.worktree and write in place."),
@@ -23,9 +22,9 @@ const LAUNCH: &[(&str, &str)] = &[
     ("--max-answer CHARS", "Ask for this answer length; failed compression displays a bounded excerpt and preserves the full result."),
     ("--timeout DURATION", "Optional limit for each attempt; no default. Stall guards remain active."),
     ("--retries N", "Malformed-answer reruns, 0-3 (default: 1)."),
-    ("--provider NAME", "Agent provider override."),
-    ("--model NAME", "Agent model override."),
-    ("--thinking LEVEL", "Agent thinking level override."),
+    ("--provider NAME", "Pi provider for --model."),
+    ("--model PATTERN", "Pi model (provider/id[:thinking]); overrides the tier and disables escalation."),
+    ("--thinking LEVEL", "Pi thinking level override."),
     ("--allow-parallel-writes", "Allow concurrent write runs in one workdir."),
     ("--worktree", "Write in a detached git worktree seeded from the current tree; merge with apply."),
     ("--after RUN", "Wait for RUN to finish successfully before starting this step; waiting uses no active slot."),
@@ -65,8 +64,7 @@ const REPLY: &[(&str, &str)] = &[
     ("--fresh", "Start a new session with only this message; after apply, a new worktree starts from current HEAD."),
     ("--sync", "Merge the caller's later changes into the conversation worktree before replying; conflicts stop the reply."),
     ("--wait", "Wait for the reply's outcome and answer instead of returning after launch."),
-    ("--agent", "Hand the conversation to this agent; a change of agent starts a fresh session."),
-    ("--tier cheap|strong", "Hand the conversation to this tier; a change of agent starts a fresh session."),
+    ("--tier cheap|strong", "Continue the conversation on this tier's model; records from removed agents start a fresh Pi session."),
     ("--minor", "Write conversations: a short fix (message up to 600 characters, default timeout 10m) outside the rework budget; a round that changes more than 60 lines counts after all."),
     ("--over-limit REASON", "Write conversations: reply past the .delegate.json maxRework budget (default 1) and record why."),
 ];
@@ -105,11 +103,7 @@ const COMMANDS: &[(&str, &str)] = &[
 
 fn options(rows: &[(&str, &str)]) {
     for (name, description) in rows {
-        let name = if *name == "--agent" {
-            format!("--agent {}", crate::agents::choices("|"))
-        } else {
-            (*name).to_string()
-        };
+        let name = (*name).to_string();
         let mut line = format!("  {name:<26} ");
         let indent = " ".repeat(29);
         for word in description.split_whitespace() {
@@ -127,7 +121,7 @@ fn options(rows: &[(&str, &str)]) {
 pub fn print(command: Option<&str>) -> bool {
     let Some(command) = command else {
         println!("Usage: delegate [-h] [--version] <command> [options]\n");
-        println!("Delegate atomic tasks to Pi (Gemini) or Codex (GPT); judge them by results.\n");
+        println!("Delegate atomic tasks to Pi colleagues; judge them by results.\n");
         println!("Commands:");
         options(COMMANDS);
         println!("\nOptions:");
