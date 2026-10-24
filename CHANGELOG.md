@@ -4,6 +4,7 @@
 
 ### 仓库脚本
 
+- `verify.sh` 用 `scripts/run-tests.py` 并行跑单元测试（按测试方法分给多个进程，结束列出最慢用例），每步经 `iteration-speed step` 记录、输入未变即复用；本机完整 verify 从约 7 分钟降到 1.5 分钟，紧接着的 pre-push 与发版 tag 推送直接复用。
 - `check.sh` 拦截已跟踪文件中的合并冲突标记；起因：`apply --merge` 留下的标记曾随 CHANGELOG 一起提交。
 - 新增 `scripts/sync-hosts.sh`：经 SSH 并行更新其他机器上的 AIA-skills（`git pull --ff-only` 后重跑 `install.sh`，顺带取与新校验和匹配的二进制），每台一行汇报提交与 delegate 版本，任一失败退出 1 并附日志尾部。主机从参数或 `~/.config/aia-skills/hosts` 读取，`--` 之后的参数传给远端 `install.sh`；远端需已有检出（首次用 bootstrap.sh）。
 
@@ -19,6 +20,7 @@
 - `openai-image-gen` 2.2.0：新增 `keep`，草稿满意就直接作为成品交付，不调用接口、不计次（格式不同时用 ffmpeg 转换）；提示词末尾自动追加画幅句（如 "Portrait orientation, 2:3 aspect ratio"），因为经 ChatGPT 账号转发的网关忽略 `size`，横竖只看提示词；结果 JSON 报告网关回显的实际 quality，网关把 high 按 low 出图时记住它，之后拒绝拿草稿原提示词出的正式图（那只会是一张复制）；与已有草稿提示词和尺寸相同的草稿、与出图提示词相同的编辑都拒绝且不请求接口。起因：实测内网网关 quality 一律被压成 low、size 与格式被忽略，edits 以同提示词重出的正式图与草稿 SSIM 0.93。
 - `openai-image-gen` 2.1.0：HTTP 错误带上网关的错误码（如 `moderation_blocked`）；被内容规则拒绝时如实告知用户，改写重试要说明改了什么。
 
+- `delegate` 6.2.0：新增可选的默认档 `tiers.default`（`delegate tiers --default <模型>`，`DELEGATE_DEFAULT_MODEL` 优先）：不写 `--tier` 的任务都用它，失败且未改动时同样换强档模型重跑；未配置时仍是只读走便宜档、写入走强档。delegate 的三档与 Pi 自己的默认模型（settings.json）互不影响。
 - `delegate` 6.1.0（不兼容）：两档模型必须都配置，否则 `start`/`run`/`reply` 退出 2，报错列出 `pi --list-models` 的可用模型、两档用途与配置命令；新增 `delegate tiers [--cheap M] [--strong M]` 查看或写入用户配置，写入前按 Pi 模型列表与 thinking 级别校验。起因：调用方多是模型，档位没配时会悄悄全用 Pi 默认模型、也不升档，没人发现；报错里给全信息，模型自己就能配好。6.0.0 未单独发布二进制。
 - `delegate` 6.0.0（不兼容）：同事只用 Pi。`--tier cheap|strong` 改为选 Pi 模型：配置 `tiers.{cheap,strong}` 写 Pi 的 `provider/id[:thinking]`，`DELEGATE_{CHEAP,STRONG}_MODEL` 优先，未配置的档用 Pi 自己的默认模型；便宜档失败且未改动时换强档模型在同一 run 重跑（`escalatedFrom` 记原模型），`--model` 固定模型不升档，`reply --tier` 在同一会话换模型。删除 Codex 同事、`--agent`、`maxCodex`/`repoMaxCodex` 与 `DELEGATE_{CHEAP,STRONG}_AGENT`；旧 Codex 记录 reply 时由 Pi 开新会话续做。起因：Codex 的启动提示词约 2.2 万字且不受控制，GPT 也涨价了，维护两套同事不划算。
 - `delegate` 5.28.3：启动 Codex 同事时传 `-c features.multi_agent=false`，并用 `skills.config` 从技能目录隐去 delegate；`DELEGATE_AGENT` 只拦得住 delegate 脚本，拦不住 Codex 原生 `spawn_agent`。起因：10 月 442 次委派的 Codex 会话里有 23 次自行派了子代理，不受 lane 上限约束；关掉后开头也少了两段 multi_agent 提示（约 2700 字符）。

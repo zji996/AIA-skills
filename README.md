@@ -27,7 +27,7 @@
 
 `delegate` 架构总览：[docs/assets/delegate-architecture.webp](docs/assets/delegate-architecture.webp)（提示词同目录）。
 
-`delegate` 6.1.0：两档模型都配置后才能派任务，未配置时报错列出 Pi 可用模型，`delegate tiers` 一步配置。6.0.0：同事只用 Pi，`--tier cheap|strong` 改为选配置 `tiers` 里的 Pi 模型，便宜档失败换强档模型重跑；删除 Codex 同事、`--agent` 与 Codex 容量项。
+`delegate` 6.2.0：可选默认档 `tiers.default`，不写 `--tier` 的任务都用它。6.1.0：两档模型都配置后才能派任务，未配置时报错列出 Pi 可用模型，`delegate tiers` 一步配置。6.0.0：同事只用 Pi，`--tier cheap|strong` 改为选配置 `tiers` 里的 Pi 模型，便宜档失败换强档模型重跑；删除 Codex 同事、`--agent` 与 Codex 容量项。
 
 `delegate` 5.27.1：取消 agent 默认 timeout，加入 idle/command stall guard 与 Claude Code 50 分钟 check-in；配置支持 `stall`/`checkIn`。
 
@@ -120,7 +120,7 @@ cd AIA-skills
 ### 验证
 
 ```bash
-./scripts/verify.sh   # check.sh、单元测试；有 cargo 时运行 crates/delegate 的 clippy
+./scripts/verify.sh   # check.sh、并行单元测试（scripts/run-tests.py）；有 cargo 时运行 crates/delegate 的 clippy；输入未变的步骤复用上次通过
 ```
 
 `check.sh` 检查 frontmatter、`description` 是否含中英文触发场景、README 索引、`evals/` 触发示例、断链与脚本语法。`install-git-hooks.sh` 只设置本仓库的 `core.hooksPath`，pre-push 会调用 `verify.sh`。依赖 Python 3.11+ 和 PyYAML；图像生成脚本另需 `curl`、`jq` 和有效的 OpenAI API key，调用会产生 API 费用。
