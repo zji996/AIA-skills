@@ -70,6 +70,18 @@ pub fn validate(value: &Value, file: &Path, root: Option<&Path>) -> Res<()> {
     check().map_err(|e| format!("{}: {e}", file.display()))
 }
 
+// Test builds only: shorten the shared measurement budget so the black-box timeout path is verifiable.
+fn measurement_timeout() -> f64 {
+    if cfg!(debug_assertions) {
+        if let Ok(value) = std::env::var("DELEGATE_TEST_SOURCE_BUILD_TIMEOUT") {
+            if let Ok(seconds) = seconds(&value) {
+                return seconds;
+            }
+        }
+    }
+    20.0
+}
+
 pub fn record(run: &Path) {
     let mut meta = json(run.join("meta.json"));
     if s(&meta, "mode") != "write" || meta["sourceBuildBytes"].as_u64().is_some() {
@@ -94,7 +106,7 @@ pub fn record(run: &Path) {
     else {
         return;
     };
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs_f64(measurement_timeout());
     let mut sizes = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     let mut total = 0u64;

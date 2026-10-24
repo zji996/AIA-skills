@@ -175,6 +175,18 @@ impl Containers {
     }
 }
 
+// Test builds only: shorten the shared container budget so the black-box timeout path is verifiable.
+fn cleanup_timeout() -> f64 {
+    if cfg!(debug_assertions) {
+        if let Ok(value) = crate::common::seconds(
+            &std::env::var("DELEGATE_TEST_CLEANUP_TIMEOUT").unwrap_or_default(),
+        ) {
+            return value;
+        }
+    }
+    20.0
+}
+
 fn label_below(path: &Path, root: &Path) -> bool {
     path.is_absolute()
         && root.is_absolute()
@@ -193,7 +205,7 @@ pub fn containers(root: &Path, missing_only: bool) -> Containers {
         };
     }
     let mut report = Containers::default();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs_f64(cleanup_timeout());
     let docker = |args: &[&str]| -> Result<String, String> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {

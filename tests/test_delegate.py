@@ -84,10 +84,12 @@ class DelegateTests(unittest.TestCase):
                         PI_LOG=str(self.work / "pi.log"),
                         # Both tiers set and equal, so nothing escalates unless a test configures it.
                         DELEGATE_CHEAP_MODEL="p/m", DELEGATE_STRONG_MODEL="p/m")
-        # Cleanup tests must never contact the host's Docker daemon.
-        docker = self.bin / "docker"
-        docker.write_text("#!/bin/sh\nexit 0\n")
-        docker.chmod(0o755)
+        # Cleanup tests must never contact the host's Docker daemon or user systemd manager; the stubs
+        # report nothing, so leftover-cleanup stays hermetic and does not enumerate host units.
+        for stub in ("docker", "systemctl"):
+            script = self.bin / stub
+            script.write_text("#!/bin/sh\nexit 0\n")
+            script.chmod(0o755)
 
     def fake_docker(self, containers):
         db = self.work / "containers.json"
@@ -196,12 +198,13 @@ else:
                 self.assertFalse(Path(state["dir"]).exists())
 
     def test_docker_timeout_is_nonfatal(self):
+        self.env["DELEGATE_TEST_CLEANUP_TIMEOUT"] = "1"
         self.fake_docker({})
         self.env["TEST_DOCKER_HANG"] = "1"
         started = time.monotonic()
         result = self.cli("clean", "--finished", "--json", timeout=25)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertLess(time.monotonic() - started, 24)
+        self.assertLess(time.monotonic() - started, 8)
         self.assertIn("timed out", json.loads(result.stdout)["orphanCleanup"]["diagnostic"])
 
     def test_worktree_usage_measured_once_after_acceptance_and_warns(self):
@@ -345,6 +348,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         self.assertEqual((self.work / "pi.source-du").read_text().splitlines().count(str(repo / "target")), 3)
 
     def test_source_build_timeout_is_nonfatal_and_status_does_not_retry(self):
+        self.env["DELEGATE_TEST_SOURCE_BUILD_TIMEOUT"] = "1"
         self.fake_pi([answer("done"), SETTLED])
         repo = self.repo({"Cargo.toml": "# fixture\n"})
         (repo / "target").mkdir()
@@ -355,7 +359,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         result = self.cli("run", "--workdir", repo, "--accept", "true", "task", timeout=30)
         state = self.outcome(result)
         self.assertEqual((result.returncode, state["state"], state["accept"]["ok"]), (0, "delivered", True))
-        self.assertLess(time.monotonic() - started, 27)
+        self.assertLess(time.monotonic() - started, 8)
         self.assertNotIn("sourceBuildBytes", json.loads((Path(state["dir"]) / "meta.json").read_text()))
         du.write_text("#!/bin/sh\necho '999999999999 target'\n")
         self.assertNotIn("sourceBuildDisk", self.cli("status", cwd=repo).stdout)
@@ -835,7 +839,9 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
     def test_timeout_grace_while_at_work_and_queue_time_is_free(self):
         start = {"type": "tool_execution_start", "toolName": "bash", "args": {"command": "make check"}}
         end = {"type": "tool_execution_end", "toolName": "bash"}
-        lines = ["#!/bin/sh", "cat > /dev/null", f"printf '%s\\n' {shlex.quote(json.dumps(start))}", "sleep 1.8",
+        # With --timeout 1 the work must still be running past 1s but finish before the 100% grace limit (2s).
+        lines = ["#!/bin/sh", '[ "$1" = --version ] && { echo "fake-pi 1.0"; exit 0; }', "cat > /dev/null",
+                 f"printf '%s\\n' {shlex.quote(json.dumps(start))}", "sleep 1.5",
                  f"printf '%s\\n' {' '.join(shlex.quote(json.dumps(e)) for e in (end, answer('checked'), SETTLED))}"]
         (self.bin / "pi").write_text("\n".join(lines) + "\n")
         (self.bin / "pi").chmod(0o755)
@@ -848,7 +854,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         self.assertEqual(self.outcome(self.cli("run", "--timeout", "1", "task"))["state"], "timeout")
         # Waiting in the lane for its own check does not use up the agent's time.
         self.fake_pi([answer("checked"), SETTLED], pre=f"{DELEGATE} lane true")
-        self.hold_lane(2.5)
+        self.hold_lane(2)
         state = self.outcome(self.cli("run", "--timeout", "1", "task"))
         self.assertEqual(state["state"], "answered")
         self.assertGreaterEqual(state["queuedSeconds"], 1)
@@ -944,6 +950,9 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
                                env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if probe.returncode:
             self.skipTest("systemd user scope unavailable")
+        # Untagged leftovers are only reclaimed through the cgroup recorded in a real unit, so this test
+        # needs the host manager instead of the stub that the other tests use.
+        (self.bin / "systemctl").unlink()
         for role in ("agent", "accept"):
             with self.subTest(role=role):
                 pid_file = self.work / f"{role}-untagged.pid"
@@ -1111,15 +1120,27 @@ db.write_text(json.dumps(units))
         self.assertEqual(set(self.stopped_units()), {"setup.service", "agent.service", "acceptance.service"})
         self.assertEqual(state["cleanup"]["systemdStopped"], 3)
 
-    def test_user_units_stop_timeout_kills_and_failures_are_only_diagnostic(self):
+    # The fake manager hangs on stop and keeps a stubborn unit active; each case spends the whole 3s stop
+    # window, so they are separate tests rather than one slow serial cleanup.
+    def test_user_units_stop_timeout_kills_the_unit(self):
         self.fake_systemctl()
         repo = self.repo({"a.txt": "a\n"})
-        self.fake_pi([answer("done"), SETTLED], pre="register-unit stubborn.service stubborn\n"
-                     "register-unit hanging.service hang\nregister-unit failure.service fail")
+        self.fake_pi([answer("done"), SETTLED], pre="register-unit hanging.service hang")
         result = self.cli("run", "--worktree", "--workdir", repo, "task")
         state = self.outcome(result)
         self.assertEqual((result.returncode, state["state"]), (0, "answered"))
-        self.assertEqual(state["cleanup"]["systemdStopped"], 2)
+        self.assertEqual(state["cleanup"]["systemdStopped"], 1)
+        self.assertTrue(all(unit["killed"] for unit in state["cleanup"]["units"].values()))
+
+    def test_user_units_still_active_after_stop_are_killed_and_failures_stay_diagnostic(self):
+        self.fake_systemctl()
+        repo = self.repo({"a.txt": "a\n"})
+        self.fake_pi([answer("done"), SETTLED], pre="register-unit stubborn.service stubborn\n"
+                     "register-unit failure.service fail")
+        result = self.cli("run", "--worktree", "--workdir", repo, "task")
+        state = self.outcome(result)
+        self.assertEqual((result.returncode, state["state"]), (0, "answered"))
+        self.assertEqual(state["cleanup"]["systemdStopped"], 1)
         self.assertTrue(all(unit["killed"] for unit in state["cleanup"]["units"].values()))
         self.assertTrue(any("stop failure.service" in d for d in state["cleanup"]["diagnostics"]))
 
