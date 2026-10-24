@@ -4,76 +4,48 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI。
 metadata:
-  version: "6.3.0"
+  version: "6.3.1"
   binary: delegate
   exclude-agents: pi
 ---
 
 # Delegate（按结果委派）
 
-你是主控：把边界清楚的任务交给同事，自己继续推进，回来只看结果。**是否采纳、如何整合始终由你决定。** 同事不能再委派，所有结果都回到你这里。
+你是主控：把边界清楚的任务交给同事（Pi），自己继续推进，回来看结果、决定是否采纳。同事不能再委派。
 
-## 三步用法
+## 用法
 
 ```bash
 D=<本技能目录>/bin/delegate
-$D start --read-only "审查 apps/api 的错误处理，只列真实缺陷，写明文件:行号"   # 1. 放出（可连放多个）
-$D wait                                                                    # 2. 等：放后台，下一个结束就返回
-#                                                                          # 3. 按结论行的“下一步”处理
+$D start --read-only "审查 apps/api 的错误处理，列真实缺陷并写文件:行号"   # 放出，可连放多个
+$D wait                                                                  # 放后台；下一个结束就返回，末行给出继续等的命令
 ```
 
-- **放出**：`start` 回显任务名、同事与档位，以及本次自动生效的东西（仓库固定说明几行、默认 worktree / 保护路径 / 附加验收及其来源）。名字省略时取说明的第一个分句；之后用它指代整段对话。
-- **等**：`wait` 放后台（Claude Code 的 Bash 用 `run_in_background: true`），Claude Code 每约 50 分钟收到一次进度 glance；控制器只需重跑打印的 `delegate wait` 命令。它交付下一个结束的任务就返回，末行写明本会话还剩几个、原样再跑哪条命令——照做即可，直到末行说没有在跑的任务。
-- **处理**：每个任务一条短行（状态、改动、验收、下一步），随后是答复。只读任务去代码核实关键结论；写入任务看 `$D diff <name>`，满意后 `$D apply <name>`——它合入、清理该任务，并在末行说明验收是否仍有效、无效时要在主干重跑哪些命令。
-
-性能测试、压测和编译耗时走测量预约（`lane --measure` 或配置的 `measure` 前缀），避免并行编译污染数据。
-
-## 场景速查
+每个任务回一条短行（状态、改动、验收、下一步）和答复。写入任务看 `$D diff <name>`，满意后 `$D apply <name>`。
 
 | 想要 | 命令 |
 |---|---|
-| 读材料、只要结论 | `$D start --read-only "…"`；要限制篇幅加 `--max-answer 800`（明显超长时自动让同事压缩一次） |
-| 独立审查、第二意见 | `$D start --read-only --tier strong "…"`（多路并行时各起一个，按子系统拆开） |
+| 读材料、审查、第二意见 | `$D start --read-only "…"`；限篇幅加 `--max-answer 800` |
 | 看截图或设计图 | `$D start --read-only --image shot.png "…"` |
-| 改代码，测试通过才算完 | `$D start --worktree --accept-also "make test" "…"`；不许同事碰的路径加 `--protect tests/` |
-| 接着上一轮追问或返工 | `$D reply <name> "…"`（同一会话、同一 worktree）；开新会话加 `--fresh`；你之后改了代码想让它看到加 `--sync` |
-| 合入后继续返工 | `$D reply <name> "…"` 自动从当前 HEAD 新开会话，带原说明与上次答复；`--fresh` 仍只用新消息 |
-| 保留同事提交 | `$D apply --keep-commits <name>`；也可设 `defaults.keepCommits: true` |
-| 提供按次只读材料 | `$D start --share <路径> "…"`（可重复，reply 沿用） |
-| 查询共享资源 | `$D busy pg`（占用返回 0，空闲返回 1）；`resources` 按 argv 前缀登记 |
-| 先 A 后 B | `$D start --after <A> …`；审 A 的结果加 `--in <A> --read-only` |
-| 自己跑重检查 | `$D lane make check`（与同事验收、证据共用队列） |
-| 同时在几个仓库派了任务 | 后台 `$D wait --machine`，整机的都会收到 |
-| 答复被截断 / 看改了什么 / 停掉 / 清理 | `$D result <name>` / `$D diff <name>` / `$D stop <name>` / `$D clean --finished` |
+| 改代码，测试通过才算完 | `$D start --worktree --accept "make test" "…"`；不许碰的路径加 `--protect tests/` |
+| 追问或返工 | `$D reply <name> "…"`；开新会话加 `--fresh`，带上你后来的改动加 `--sync` |
+| 先 A 后 B | `$D start --after <A> …` |
+| 自己跑重检查、测性能 | `$D lane make check`；测量用 `lane --measure` |
+| 看全文 / 改动 / 停掉 / 清理 | `$D result` / `$D diff` / `$D stop` / `$D clean --finished` |
 
-多行说明用 `--prompt-file -` 加 heredoc。更多示例与任务说明模板见 [references/recipes.md](references/recipes.md)。
+多行说明用 `--prompt-file -` 加 heredoc；示例见 [references/recipes.md](references/recipes.md)，全部选项见 `$D --help`。
 
-## 让仓库替你记住
+## 档位
 
-每次都要写的东西放进配置：仓库根 `.delegate.json`（或用户级 `config.json`）的 `standing` 自动附固定说明，`agentDeny` 附禁止命令提示；`defaults` 给常用启动选项及 `keepCommits` 默认值。`resources` 登记占用，`acceptBlind` 标出验收未覆盖路径；`resultChars`（默认 20000）限制显示长度。字段与合并规则见 [references/configuration.md](references/configuration.md)。
+同事都是 Pi，档位只选模型：不写 `--tier` 用 default（未配置则 strong）；`--tier strong` 用于写代码和严密审查；`--tier cheap` 只读，用于侦察、文案、看图。失败且没改文件时自动换强档重跑一次；`--model` 可直接指定模型。首次使用没配模型时，`start` 会列出可选模型和配置命令，照做即可（用户指定过就用用户的）。
 
-## 选档位
+## 任务说明
 
-同事都是 Pi；档位只决定它用哪个模型。`cheap` 与 `strong` 两档都配置后才能派任务：没配时 `start` 拒绝并列出 Pi 的可用模型，照提示运行 `$D tiers --cheap <provider/model[:thinking]> --strong <…>`（用户指定过就照用户的，否则自己选好并告诉用户）；`$D tiers` 查看当前配置。可选 `--default <模型>`：不写 `--tier` 的任务都用它；没配 default 时不写 `--tier` 就走强档。
+同事看不到你的会话：写清目标、能改的范围、完成标准（最好是验收命令，复杂的写成脚本）和已知事实。仓库每次都要说的话放进 `.delegate.json` 的 `standing`，见 [references/configuration.md](references/configuration.md)。
 
-| `--tier` | 用途 | 限制 |
-|---|---|---|
-| 不写（default，未配则 strong） | 日常读写任务 | 无 |
-| `strong` | 后端与协议代码、疑难 bug、严密审查与风险评估 | 无 |
-| `cheap` | 广度侦察（在代码里找事实、列清单）、文案、看图；重要审查时作为另一路视角 | 只读：自动按 `--read-only` 运行，带写入参数（`--accept`、`--worktree`、`--protect` 等）直接拒绝 |
+## 收结果
 
-便宜档或默认档答复畸形、出错、超时或验收失败且未改文件时，换强档模型重跑一次（模型串含 thinking 完全相同时不升档）。`--model provider/id` 直接指定模型，不升档；`reply --tier strong` 在同一会话里换成强档模型续做。
+- 已交付表示验收通过，改法仍要看 diff；已答复没有验收，关键结论自己核实。
+- 同一仓库的写入串行 `apply`，合入一批后自己跑全量检查。
 
-## 写好任务说明
-
-同事不知道你的会话，说明需要自足：**目标**（要什么结果）、**边界**（能改哪、不能改哪）、**完成标准**（验收命令，或答复要包含什么；同事朝验收命令优化，指标与“做了真事”的断言要写进验收脚本、不达标就非 0 退出，说明里的“达标前继续”管不住它；验收里不要放被 `agentDeny` 拦下的命令，那些归你跑；超过一条简单命令就写成脚本文件，用 `--accept "bash <脚本>"`，命令行里拼管道和引号容易写错）、**已知事实与决定**（别让它重新猜）。新增旁路能力（投影、索引、记忆、缓存、通知）时再写一句**失败语义**：哪些失败必须中止主路径，哪些只记诊断、稍后重试；不写时同事倾向于处处失败关闭。给模型或用户读的文字（提示词、文案）自己写好交给同事接线，不要让它代拟。
-
-## 把关时记住
-
-- **已交付**只说明验收通过，改法仍要看 `diff`；**已答复**没有验收，关键结论去代码核实；其余状态按短行的下一步处理。
-- 同一仓库的写入任务串行 `apply`；合入一批后自己跑全量检查。同事只跑相关检查，被 `agentDeny` 拦下的全量检查归你。
-- 写入任务加 `--worktree`（或配置 `defaults.worktree`）就在独立 worktree 里做，可以并行；原地写入同一目录同时只能有一个。
-- 显式 `--timeout` 超时、stall guard 停滞或主控 `stop` 时改动保留，`reply` 续做不耗返工次数；没有默认 agent timeout。
-- 机器与仓库有并发上限，命中时先 `wait` 收一批；上限由用户设定，不要自行调整。
-
-状态含义、退出码、JSON 字段、等待的细节与完整边界见 [references/reading-results.md](references/reading-results.md)；续接与返工、两档配合、并行粒度见 [references/practice.md](references/practice.md)；长时间自主推进一批工作见 [references/long-run.md](references/long-run.md)；命令与全部选项见 `$D --help`，run 目录与文件见 [references/output-and-files.md](references/output-and-files.md)。
+状态、退出码与等待细节见 [references/reading-results.md](references/reading-results.md)；续接、并行与长时间推进见 [references/practice.md](references/practice.md)、[references/long-run.md](references/long-run.md)；run 目录见 [references/output-and-files.md](references/output-and-files.md)。
