@@ -65,6 +65,7 @@ class V515Tests(unittest.TestCase):
                                                              "repoMaxActive": 8})
         (repo / ".delegate.json").write_text(json.dumps({"accept": "true", "env": {"LOCAL": "repo"},
                                                         "maxRework": 0}))
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo new >> a.txt")
         state = self.outcome(self.cli("run", "--workdir", repo, "task"))
         self.assertEqual((state["state"], state["configSources"]), ("delivered", ["repo"]))
         self.assertEqual(self.meta(state)["env"], {"LOCAL": "repo"})

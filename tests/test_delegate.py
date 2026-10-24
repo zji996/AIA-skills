@@ -2896,6 +2896,23 @@ db.write_text(json.dumps(units))
         self.assertIn("applyVerify must be", self.cli("apply", "--json", "--keep", state["run"]).stderr)
         self.assertEqual(self.cli("apply", "--json", "--keep", state["run"], "--verify", "--no-verify").returncode, 2)
 
+    def test_a_colleague_question_waits_for_the_caller_and_its_answer_is_not_rework(self):
+        repo = self.repo({"a.txt": "a\n"})
+        (repo / ".delegate.json").write_text(json.dumps({"accept": "false", "maxRework": 0}))
+        self.fake_pi([answer("**需要主控决定**\n用 A 还是 B？倾向 A。"), SETTLED], pre="echo one >> a.txt")
+        asked = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "job", "task"))
+        self.assertEqual((asked["state"], asked["question"]), ("answered", True))
+        self.assertNotIn("accept", json.loads((Path(asked["dir"]) / "summary.json").read_text()))
+        self.assertIn("(not rework)", asked["next"])
+        self.assertIn("--append-system-prompt", (self.work / "pi.log").read_text())
+        self.assertIn("需要主控决定", (Path(asked["dir"]) / "colleague.md").read_text())
+        self.assertIn("提问", self.cli("status", "job", human=True).stdout)
+        self.fake_pi([answer("done with A"), SETTLED], pre="echo two >> a.txt")
+        reply = self.outcome(self.cli("reply", "--wait", "job", "A"))
+        self.assertEqual(json.loads((Path(reply["dir"]) / "meta.json").read_text())["rework"]["kind"], "answer")
+        self.assertNotIn("question", reply)
+        self.assertIn("rework limit reached (0/0)", self.cli("reply", "job", "redo").stderr)
+
     def test_write_conversations_get_one_rework_before_the_caller_takes_over(self):
         repo = self.repo({"a.txt": "a\n"})
         self.fake_pi([answer("first"), SETTLED], pre="echo one >> a.txt")
@@ -2903,6 +2920,9 @@ db.write_text(json.dumps(units))
         self.fake_pi([answer("asked"), SETTLED])
         question = self.outcome(self.cli("reply", "--wait", "job", "why?"))  # no changes: not rework
         self.assertEqual(json.loads((Path(question["dir"]) / "meta.json").read_text())["rework"]["kind"], "rework")
+        self.fake_pi([answer("built"), SETTLED], pre="echo two >> a.txt")
+        built = self.outcome(self.cli("reply", "--wait", "job", "now build it"))  # after no changes: not rework
+        self.assertEqual(json.loads((Path(built["dir"]) / "meta.json").read_text())["rework"]["kind"], "answer")
         self.fake_pi([answer("fixed"), SETTLED], pre="echo two >> a.txt")
         self.outcome(self.cli("reply", "--wait", "job", "fix it"))
         self.fake_pi([answer("tweak"), SETTLED], pre="echo three >> a.txt")

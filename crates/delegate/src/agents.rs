@@ -41,6 +41,25 @@ pub fn tier_model(config: &Value, tier: &str) -> String {
     setting(&format!("{}_MODEL", tier.to_uppercase()), configured)
 }
 
+/// Fixed system-prompt addendum for every colleague: the same text each run, so
+/// it stays in the cached prefix. Asking first is cheaper than a wrong build.
+pub const COLLEAGUE: &str = "You are a delegated colleague: a delegator gave you this task and reviews your answer; nobody watches while you work.
+- When the way forward is unclear, the brief contradicts the code, or the task would need a large change the brief did not ask for, stop and ask instead of guessing: start the answer with the line `需要主控决定` (`Needs a decision` if the brief is in English), then the question, the option you lean to and why. The delegator replies, and answering you does not count as rework.
+- Otherwise finish the work yourself; do not stop at a plan.
+- After a context compaction, continue from the summary; do not restart or redo finished work.
+- Answer in the brief's language: the conclusion first, then evidence (file:line) and what you did not verify.
+";
+pub const QUESTION_MARKERS: [&str; 2] = ["需要主控决定", "Needs a decision"];
+
+/// The colleague stopped to ask: its answer opens with a question marker.
+pub fn is_question(answer: &str) -> bool {
+    answer
+        .lines()
+        .map(|line| line.trim().trim_start_matches(['#', '*', '>', ' ']))
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| QUESTION_MARKERS.iter().any(|m| line.starts_with(m)))
+}
+
 pub const THINKING: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// Pi's models as (`provider/id`, supports thinking), from `pi --list-models`;
@@ -380,6 +399,13 @@ fn command_pi(meta: &Value, session: Option<&str>) -> Vec<String> {
     if s(meta, "mode") == "read-only" && !meta["worktree"].is_object() {
         a.extend(["--tools".into(), "read,grep,find,ls".into()]);
     }
+    if !s(meta, "dir").is_empty() {
+        let role = Path::new(s(meta, "dir")).join("colleague.md");
+        a.extend([
+            "--append-system-prompt".into(),
+            role.to_string_lossy().into(),
+        ]);
+    }
     a.push("-p".into());
     for image in images {
         a.push(format!("@{}", image.as_str().unwrap_or("")));
@@ -480,6 +506,7 @@ pub fn run_agent(
         .ok()
         .map(|e| e.flatten().map(|x| x.path()).collect::<Vec<_>>())
         .unwrap_or_default();
+    write(Path::new(s(meta, "dir")).join("colleague.md"), COLLEAGUE)?;
     let mut args = command_pi(meta, session.as_deref());
     if !s(meta, "agentBin").is_empty() {
         args[0] = s(meta, "agentBin").to_string();

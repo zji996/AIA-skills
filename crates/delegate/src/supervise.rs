@@ -283,6 +283,7 @@ fn settle(
     verdict: &str,
     setup_error: &Option<String>,
     holder: Arc<AtomicI32>,
+    question: bool,
 ) -> (String, Value, Recorded, Vec<String>) {
     let mut state = if verdict == "ok" {
         "answered".to_string()
@@ -290,6 +291,10 @@ fn settle(
         verdict.into()
     };
     let mut sum = json!({"state":state});
+    if question {
+        // A question waits for the delegator; acceptance and escalation do not apply.
+        sum["question"] = json!(true);
+    }
     if verdict == "stalled" {
         let reason = json(run.join("stall.json"));
         if reason.is_object() {
@@ -412,6 +417,7 @@ fn settle(
     if violations.is_empty()
         && generation_error.is_none()
         && verdict == "ok"
+        && !question
         && !s(meta, "accept").is_empty()
         && !lane::stopped()
     {
@@ -669,18 +675,34 @@ fn inner(
     } else {
         ("failed".into(), String::new(), 0)
     };
-    let (mut state, mut sum, mut rec, mut changed) =
-        settle(&meta, run, &verdict, &setup_error, holder.clone());
+    let (mut state, mut sum, mut rec, mut changed) = settle(
+        &meta,
+        run,
+        &verdict,
+        &setup_error,
+        holder.clone(),
+        verdict == "ok" && agents::is_question(&answer),
+    );
     let cheap = model_label(&meta);
     let protected = !sum["protectViolation"].is_null();
-    if !lane::stopped() && escalate(&mut meta, run, &state, rec.is_some(), &changed, protected)? {
+    if !lane::stopped()
+        && sum["question"].is_null()
+        && escalate(&mut meta, run, &state, rec.is_some(), &changed, protected)?
+    {
         log_event(
             run,
             json!({"e":"escalate","from":cheap,"to":model_label(&meta),"after":state}),
         );
         (verdict, answer, attempts) =
             attempts_from(&meta, run, attempts + 1, holder.clone(), grace.clone());
-        (state, sum, rec, changed) = settle(&meta, run, &verdict, &setup_error, holder.clone());
+        (state, sum, rec, changed) = settle(
+            &meta,
+            run,
+            &verdict,
+            &setup_error,
+            holder.clone(),
+            verdict == "ok" && agents::is_question(&answer),
+        );
         sum["escalatedFrom"] = json!(cheap);
     }
     sum["attempts"] = json!(attempts);

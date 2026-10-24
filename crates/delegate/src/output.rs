@@ -235,6 +235,11 @@ pub fn human(run: &Path, status: &Value) -> String {
         "killed" => "已终止",
         _ => state,
     };
+    let label = if b(status, "question") {
+        "提问"
+    } else {
+        label
+    };
     let seconds = n(status, "elapsedSeconds");
     let elapsed = if seconds < 60 {
         format!("{seconds} 秒")

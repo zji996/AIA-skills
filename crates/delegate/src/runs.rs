@@ -248,6 +248,11 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
     {
         return Some(format!("{script} clean {name}"));
     }
+    if b(sum, "question") {
+        return Some(format!(
+            "the colleague asks for a decision; answer with {script} reply {name} '<decision>' (not rework)"
+        ));
+    }
     if state == "delivered" || state == "answered" {
         if s(meta, "mode") != "write"
             || n(
@@ -378,6 +383,7 @@ pub fn status(run: &Path) -> Value {
             "protectViolationReasons",
             "workspaceChanged",
             "escalatedFrom",
+            "question",
             "queuedSeconds",
             "graceSeconds",
             "stall",

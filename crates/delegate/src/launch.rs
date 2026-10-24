@@ -784,8 +784,10 @@ const MINOR_LINES: u64 = 60;
 const MINOR_CHARS: usize = 600;
 
 /// Rework rounds already spent in the write conversation ending at `run`: every
-/// rework reply that changed files, plus minor replies that grew past [`MINOR_LINES`].
-/// Also returns the conversation's name (its first run's).
+/// rework reply that changed files after a round that had delivered changes, plus
+/// minor replies that grew past [`MINOR_LINES`]. Answering a question, or a first
+/// build after a round that changed nothing, is not rework. Also returns the
+/// conversation's name (its first run's).
 fn rework_used(run: &Path) -> (u64, String) {
     let mut used = 0;
     let mut current = run.to_path_buf();
@@ -796,8 +798,13 @@ fn rework_used(run: &Path) -> (u64, String) {
             changes["added"].as_u64().unwrap_or(0) + changes["deleted"].as_u64().unwrap_or(0);
         match (s(&meta, "continuation"), s(&meta["rework"], "kind")) {
             (continuation, _) if runs::interrupted(continuation) => {}
-            // A round that changed nothing (a question, a failed start) is not rework.
-            (_, "rework") if changes["files"].as_u64().unwrap_or(0) > 0 => used += 1,
+            // A round that changed nothing (a question, a failed start) is not rework,
+            // and neither is the round after one: that is the first build.
+            (_, "rework")
+                if changes["files"].as_u64().unwrap_or(0) > 0 && delivered(&meta, &current) =>
+            {
+                used += 1
+            }
             (_, "minor") if lines > MINOR_LINES => used += 1,
             _ => {}
         }
@@ -807,6 +814,17 @@ fn rework_used(run: &Path) -> (u64, String) {
         }
         current = current.with_file_name(parent);
     }
+}
+
+/// Whether the round this reply answered had delivered work: it changed files
+/// and did not stop to ask.
+fn delivered(meta: &Value, run: &Path) -> bool {
+    let parent = s(meta, "parent");
+    if parent.is_empty() {
+        return false;
+    }
+    let sum = json(run.with_file_name(parent).join("summary.json"));
+    sum["changes"]["files"].as_u64().unwrap_or(0) > 0 && !b(&sum, "question")
 }
 
 /// Rework budget for write conversations (`.delegate.json` `maxRework`, default 1):
@@ -844,6 +862,11 @@ fn rework_gate(
             ));
         }
         return Ok(Some(json!({"kind":"minor","used":used,"limit":limit})));
+    }
+    let parent_sum = json(parent.join("summary.json"));
+    if b(&parent_sum, "question") || parent_sum["changes"]["files"].as_u64().unwrap_or(0) == 0 {
+        // Answering a question or starting the build after a round with no changes.
+        return Ok(Some(json!({"kind":"answer","used":used,"limit":limit})));
     }
     if let (Some(limit), None) = (limit, &o.over_limit) {
         if used >= limit {

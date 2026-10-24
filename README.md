@@ -27,7 +27,7 @@
 
 `delegate` 架构总览：[docs/assets/delegate-architecture.webp](docs/assets/delegate-architecture.webp)（提示词同目录）。
 
-`delegate` 6.3.0：未配默认档时走强档，便宜档只读。6.2.0：可选默认档 `tiers.default`，不写 `--tier` 的任务都用它。6.1.0：两档模型都配置后才能派任务，未配置时报错列出 Pi 可用模型，`delegate tiers` 一步配置。6.0.0：同事只用 Pi，`--tier cheap|strong` 改为选配置 `tiers` 里的 Pi 模型，便宜档失败换强档模型重跑；删除 Codex 同事、`--agent` 与 Codex 容量项。
+`delegate` 6.4.0：同事不清楚时先提问（状态「提问」），回答提问不算返工。6.3.0：未配默认档时走强档，便宜档只读。6.2.0：可选默认档 `tiers.default`，不写 `--tier` 的任务都用它。6.1.0：两档模型都配置后才能派任务，未配置时报错列出 Pi 可用模型，`delegate tiers` 一步配置。6.0.0：同事只用 Pi，`--tier cheap|strong` 改为选配置 `tiers` 里的 Pi 模型，便宜档失败换强档模型重跑；删除 Codex 同事、`--agent` 与 Codex 容量项。
 
 `delegate` 5.27.1：取消 agent 默认 timeout，加入 idle/command stall guard 与 Claude Code 50 分钟 check-in；配置支持 `stall`/`checkIn`。
 

@@ -1,4 +1,4 @@
-# delegate 规格（v5.25.0）
+# delegate 规格（v6.4）
 
 > 本文是 `skills/delegate` 的**实现契约**：命令行、输出、run 目录、锁与状态机。它是 Rust 重写与 harness 原生接入的依据。
 > 本文不在技能目录内，技能加载时不会读取；模型使用技能只需 `SKILL.md`。行为以本文为准，实现与本文不一致时按缺陷处理。
@@ -116,6 +116,7 @@
 | `protectViolationReasons` | 违规且设置了原因 | 命中的保护规则路径到原因的映射，不改变 protectViolation 字符串数组 |
 | `tier` | 按档位选模型 | `default` / `cheap` / `strong`；升档后为 `strong` |
 | `escalatedFrom` | 升过档 | 升档前的模型（未指定为 `default`） |
+| `question` | 同事提问 | 答复首个非空行以 `需要主控决定` / `Needs a decision` 开头；不验收、不升档 |
 | `queuedSeconds` | 同事在 lane 中排队 ≥1 秒 | |
 | `graceSeconds` | 同事用了超时宽限 | 超出 `--timeout` 的秒数 |
 | `warning` `error` | | 人读文本 |
@@ -178,6 +179,10 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 | `crashed` | 无 `exit_code`，且上述均不满足 |
 | 结束态 | 有 `exit_code`，取 `summary.json` 的 `state` |
 
+### 4.0 同事角色（必须）
+
+固定文本 `agents::COLLEAGUE` 写入 `<run>/colleague.md`，经 `--append-system-prompt` 交给 Pi（各 run 相同）：拿不准先带倾向提问，否则做完。
+
 ### 4.1 选模型与升档（必须）
 
 - 同事恒为 `pi`。档位选模型（Pi `--model` 串 `provider/id[:thinking]`，只有最后一个 `:` 后是 thinking 级别才算后缀）：`DELEGATE_<档>_MODEL` > 配置 `tiers.<档>`，仓库与用户按档合并。`cheap`、`strong` 必填，缺一时 `start`/`run`/`reply` 退出 2 并列出 `pi --list-models`；`default` 可选，未给 `--tier` 时用它，未配置（含显式 `--tier default`）用 `strong`。`cheap` 只读，接写入参数或写入对话退出 2。`delegate tiers [--default M] [--cheap M] [--strong M]` 显示或校验后写入用户配置。`--model` 固定模型（`agentPinned: true`）。meta 记 `tier`、`model`、`tierModels`。
@@ -233,9 +238,9 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 - 准备：`copy`（递归复制仓库根相对的文件或目录，包括被 git 忽略的路径，如 `.local/scan`）、`link`（符号链接，替换空目录，适合子模块）、`setup`（在 lane 中依次执行，§8）、`writeSetup`（仅写入任务，在 `setup` 之后执行，适合只有构建和测试才需要的重环境）。`copy`/`link` 源不存在时跳过并向 stderr 提示；其余失败 → `failed`，`error` 说明。
 - 一个对话共享一个 worktree；`clean` 删除最后一个引用它的 run 时，在 worktree 自身 `git-common-dir` 所属的仓库执行 `git worktree remove --force`（失败则删目录后 `worktree prune`）；不依赖记录的来源路径，`--in` 的上游可能已先被清理。
 
-### 6.3.1 并行写入提示（5.13）
+### 6.3.1 并行写入提示
 
-`start`/`run` 创建写入任务后，对同一源仓库（worktree 的 `source` 或原地 `top`）上仍在运行的其他写入任务各输出一行 stderr：其当前 worktree 相对 `chainBase` 的改动文件数与前 5 个路径。本任务说明原文包含其中某个路径（完整相对路径，或长度 ≥ 8、含 `.` 且非 `mod.rs`/`index.ts` 等通用名的文件名）时该行以 `overlap:` 开头并建议 `--after` 或 `--protect`，否则以 `note:` 开头。只提示，不拒绝、不改退出码；只读任务不提示。不带 `--worktree` 的写入任务创建时，如果同一源上已有运行中的写入任务（原地或 worktree），自动改用 worktree，并输出一行 stderr 说明；没有其他写入任务时仍原地写入。`apply` 开始时，如果同一源上有运行中的原地写入任务，对每个任务输出一行警告（不拒绝、不改退出码）。
+`start`/`run` 创建写入任务后，对同一源仓库（worktree 的 `source` 或原地 `top`）上仍在运行的其他写入任务各输出一行 stderr：其当前 worktree 相对 `chainBase` 的改动文件数与前 5 个路径。说明原文含其中路径（完整相对路径，或长度 ≥ 8、含 `.` 的非通用文件名）时以 `overlap:` 开头并建议 `--after`/`--protect`，否则以 `note:` 开头；只提示，只读任务不提示。同一源上已有运行中的写入任务时，不带 `--worktree` 的写入自动改用 worktree 并说明。`apply` 时同一源上每个运行中的原地写入任务各警告一行。
 
 ### 6.4 apply（必须）
 
@@ -263,7 +268,7 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 
 **验收复用**：取得 lane 后、验收前及命令/进程清理后保存完整仓库快照证据（不沿用验收前 changes.after 或读取当前 worktree 代替历史）。apply 结束时对源工作区全树重新快照，含未提交改动与生成文件；HEAD 相同不足以证明有效。仅本轮 accept.ok 为 true、历史快照完整且 tree == treeAfter == 最终源 tree 时为 true。已知验收失败、验收改树或源 tree 不同为 false。dry-run、无验收、旧记录/缺字段、快照失败或证据不全时省略布尔值并说明原因；大型未跟踪文件、脏/缺失子模块属 tree 外输入，不能用 size/mtime 证明有效。索引 assume-unchanged / skip-worktree 标志使证据不完整；干净子模块递归核对快照和索引标志。忽略文件、环境、数据库、Git 历史仍由主控判断。验收复用只涵盖此次仓库快照；源码改动或 reply 后须重新判断。
 
-**合并后验收**（5.13）：`.delegate.json` 的 `applyVerify` 为 `true`（用顶层 `accept`，缺省时用本任务的 accept）或命令字符串时，合入成功且非 dry-run 的 `apply` 在 `acceptStillValid` 不为 true 时，经 lane 在源工作目录（`sourceWorkdir`）以 `sh -c` 运行该命令，限时同任务 `acceptTimeoutSeconds`，输出写 `verify.log`。`apply --verify` 强制运行（即使 `acceptStillValid: true`），`--no-verify` 跳过，二者互斥（退出码 2）。结论追加 `verify{command,ok,exitCode,log,tail?,next?}`，或 `verify{skipped}`（`acceptStillValid`、无命令）。验收失败时合并已在源树中、基准照常推进，apply 退出码 1。`applyVerify` 为其他类型时报错。
+**合并后验收**：`.delegate.json` 的 `applyVerify` 为 `true`（用顶层 `accept`，缺省时用本任务的 accept）或命令字符串时，合入成功且非 dry-run 的 `apply` 在 `acceptStillValid` 不为 true 时，经 lane 在源工作目录（`sourceWorkdir`）以 `sh -c` 运行该命令，限时同任务 `acceptTimeoutSeconds`，输出写 `verify.log`。`apply --verify` 强制运行（即使 `acceptStillValid: true`），`--no-verify` 跳过，二者互斥（退出码 2）。结论追加 `verify{command,ok,exitCode,log,tail?,next?}`，或 `verify{skipped}`（`acceptStillValid`、无命令）。验收失败时合并已在源树中、基准照常推进，apply 退出码 1。`applyVerify` 为其他类型时报错。
 
 ## 7. 会话与任务说明
 
@@ -298,18 +303,19 @@ pi (--session-id <uuid> | --fork <上一轮会话副本>) --session-dir <run>/se
 
 `protect` 与可选 `protectReasons` 在普通 reply / fresh 中继承；`--protect` 与 `--protect-reason` 均禁止覆盖。旧 meta 无原因仍正常继承路径。
 
-### 7.4.1 返工预算（5.14，必须）
+### 7.4.1 返工预算（必须）
 
-写入对话的 reply 受仓库 `.delegate.json` 的 `maxRework` 约束（非负整数，缺省 1；`null` 不限；其他类型报错）。沿 `parent` 链统计已用返工：`rework.kind` 为 `rework` 且该轮 `changes.files > 0` 的轮次（提问或零改动的轮次不计），加上 `rework.kind` 为 `minor` 但该轮 `changes.added + deleted > 60` 的轮次（事后补记）。已用 ≥ 上限时 reply 退出码 2，stderr 给出对话名、`diff --total`/`apply` 接手路径与 `--minor` / `--over-limit` 说明，不创建 run。
+写入对话的 reply 受仓库 `.delegate.json` 的 `maxRework` 约束（非负整数，缺省 1；`null` 不限；其他类型报错）。沿 `parent` 链统计已用返工：`rework.kind` 为 `rework`、该轮 `changes.files > 0` 且上一轮也交付了改动（`changes.files > 0` 且非 `question`）的轮次，加上 `rework.kind` 为 `minor` 但该轮 `changes.added + deleted > 60` 的轮次（事后补记）。已用 ≥ 上限时 reply 退出码 2，stderr 给出对话名、`diff --total`/`apply` 接手路径与 `--minor` / `--over-limit` 说明，不创建 run。
 
 - `--minor`：短修正，说明不超过 600 字符（超出退出码 2），未指定 `--timeout` 时默认 10m；不计入预算，除非本轮改动超过 60 行。
 - `--over-limit <原因>`：越过预算并把原因记入 meta。
 - 两者只适用于写入对话；只读对话的 reply 不计数，使用这两个选项为用法错误。
-- 写入对话的每个 reply 在 `meta.json` 记 `rework{kind: rework|minor, used, limit, overLimit?}`；`used` 为 `rework` 时含本轮。换 agent/tier 的 reply 同样计数。
+- 上一轮提问或无改动时记 `kind: answer`，不计数。
+- 写入对话的每个 reply 在 `meta.json` 记 `rework{kind: rework|minor|answer|continuation, used, limit, overLimit?}`；`used` 含本轮 rework。
 
 ### 7.5 reply --sync（必须）
 
-`reply <run> --sync` 仅适用于 worktree 对话。启动下一轮前，以对话起点快照（有最近一次完整 apply 或同步基准时用该基准）、源工作区当前快照与 worktree 当前状态做三方合并，只同步主控后来产生、尚未进入对话的改动。未改变指针的 gitlink 不视作冲突，即使源与 worktree 的子模块指纹不同；主控改变 gitlink 指针则冲突。任一文件冲突时不写入 worktree、不启动同事，退出码 2，stderr 列出冲突路径。成功时新一轮的起始快照取同步后的 worktree，同步文件不计入该轮同事的 `files`；run 目录的 `sync.json` 记录同步文件列表，任务说明末尾按说明语言附同步提示；`.sync-base` 记录后续 apply 使用的合并基准，同步不创建 `.applied`，完整 apply 后同时推进两者。原地对话使用 `--sync` 为用法错误。
+`reply <run> --sync` 仅适用于 worktree 对话。启动下一轮前，以对话起点快照（有最近一次完整 apply 或同步基准时用该基准）、源工作区当前快照与 worktree 当前状态做三方合并，只同步主控后来产生、尚未进入对话的改动。未改变指针的 gitlink 不视作冲突；主控改变 gitlink 指针则冲突。任一文件冲突时不写入 worktree、不启动同事，退出码 2，stderr 列出冲突路径。成功时新一轮的起始快照取同步后的 worktree，同步文件不计入该轮同事的 `files`；run 目录的 `sync.json` 记录同步文件列表，任务说明末尾按说明语言附同步提示；`.sync-base` 记录后续 apply 使用的合并基准，同步不创建 `.applied`，完整 apply 后同时推进两者。原地对话使用 `--sync` 为用法错误。
 
 ## 8. lane：整机重任务队列（必须）
 
@@ -347,7 +353,7 @@ pi (--session-id <uuid> | --fork <上一轮会话副本>) --session-dir <run>/se
 
 等待每个 run 的 `supervisor.lock` 共享锁（每个一个线程），`--max` 到期即返回。`--machine` 从整机 slot 固定选取运行/等待任务；其余读取当前仓库。无参且 caller 已知时仅选本会话运行中或未送达的；其他任务只在 stderr 提示数量、最多三个名称与年龄、wait --all / clean 命令。caller 未知则选全部；`--all`、具名与 `--machine` 不受 caller 过滤。无可选任务退出 0，退出码只由实际收取任务决定。仅 progress、刚启动未加锁或 4.4 前旧任务按 DELEGATE_POLL 轮询。
 
-逐个收取（5.11）：
+逐个收取：
 
 - 无参 `wait`（含范围选项）默认同 `--any`：交付已结束未读任务，否则等下一批结束；其他任务提示继续等待。显式 `--any` 跳过已交付具名任务，具名 wait 保留重读行为；退出码由本批结果决定，max 到期无结果为 75。
 - `wait --stream`：每个 run 结束时输出一行状态行（含 `sourceDrift`，有未读答复时带 `report`），不输出改动清单与答复、不标记 `.delivered`；全部输出后 stderr 写 `all <N> runs reported` 并退出。不带 run 参数时每 5 秒按同一规则（caller、`--all`、`--machine`）重新选取，把期间新派出的 run 也纳入；全部结束即退出，之后派出的 run 需要新的 `wait`。退出码：有非 delivered/answered 结局为 1，`--max` 到期仍有未结束的为 75，否则 0。
