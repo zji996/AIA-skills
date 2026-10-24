@@ -19,6 +19,7 @@
 - `openai-image-gen` 2.2.0：新增 `keep`，草稿满意就直接作为成品交付，不调用接口、不计次（格式不同时用 ffmpeg 转换）；提示词末尾自动追加画幅句（如 "Portrait orientation, 2:3 aspect ratio"），因为经 ChatGPT 账号转发的网关忽略 `size`，横竖只看提示词；结果 JSON 报告网关回显的实际 quality，网关把 high 按 low 出图时记住它，之后拒绝拿草稿原提示词出的正式图（那只会是一张复制）；与已有草稿提示词和尺寸相同的草稿、与出图提示词相同的编辑都拒绝且不请求接口。起因：实测内网网关 quality 一律被压成 low、size 与格式被忽略，edits 以同提示词重出的正式图与草稿 SSIM 0.93。
 - `openai-image-gen` 2.1.0：HTTP 错误带上网关的错误码（如 `moderation_blocked`）；被内容规则拒绝时如实告知用户，改写重试要说明改了什么。
 
+- `delegate` 5.28.3：启动 Codex 同事时传 `-c features.multi_agent=false`，并用 `skills.config` 从技能目录隐去 delegate；`DELEGATE_AGENT` 只拦得住 delegate 脚本，拦不住 Codex 原生 `spawn_agent`。起因：10 月 442 次委派的 Codex 会话里有 23 次自行派了子代理，不受 lane 上限约束；关掉后开头也少了两段 multi_agent 提示（约 2700 字符）。
 - `delegate` 5.28.2：被主控 `stop` 中断的写入任务续做与超时、停滞一样不计返工次数；起因：为换 `agentDeny` 规则停下 5 个任务续做，其中一个被返工预算拒绝。
 - `delegate` 5.28.1：测量预约开始时迁移既有 lane 进程树到其余核，释放时恢复亲和性；`measure.jsonl` 记录迁移持有者与进程数。
 

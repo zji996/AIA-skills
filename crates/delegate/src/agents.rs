@@ -371,11 +371,13 @@ fn filter_codex(v: &Value) -> Vec<Value> {
         _ => vec![],
     }
 }
-fn codex_model() -> Option<String> {
-    let path = env::var_os("CODEX_HOME")
+fn codex_home() -> PathBuf {
+    env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".codex"))
-        .join("config.toml");
+}
+fn codex_model() -> Option<String> {
+    let path = codex_home().join("config.toml");
     for line in read(path).lines() {
         let line = line.trim();
         if let Some(v) = line.strip_prefix("model") {
@@ -424,6 +426,7 @@ fn command_codex(meta: &Value, _session: Option<&str>) -> Vec<String> {
         a.extend(["-C".into(), s(meta, "workdir").into()]);
     }
     a.push("--dangerously-bypass-approvals-and-sandbox".into());
+    a.extend(codex_colleague_config());
     if !s(meta, "model").is_empty() {
         a.extend(["-m".into(), s(meta, "model").into()]);
     }
@@ -439,6 +442,22 @@ fn command_codex(meta: &Value, _session: Option<&str>) -> Vec<String> {
         a.push(format!("--image={}", image.as_str().unwrap_or("")));
     }
     a.push("-".into());
+    a
+}
+
+// Colleagues never delegate: Codex's own sub-agents (and their prompt layers)
+// are switched off, and the delegate skill is hidden from the skill list.
+fn codex_colleague_config() -> Vec<String> {
+    let mut a = vec!["-c".into(), "features.multi_agent=false".into()];
+    let skills: Vec<String> = [codex_home().join("skills"), home().join(".agents/skills")]
+        .iter()
+        .map(|dir| dir.join("delegate/SKILL.md"))
+        .filter(|path| path.is_file())
+        .map(|path| format!("{{path={},enabled=false}}", json!(path.to_string_lossy())))
+        .collect();
+    if !skills.is_empty() {
+        a.extend(["-c".into(), format!("skills.config=[{}]", skills.join(","))]);
+    }
     a
 }
 
@@ -961,40 +980,53 @@ mod tests {
     #[test]
     fn codex_command_preserves_argument_order() {
         let meta = json!({"workdir":"/repo","images":["/a.png","/b.png"],"provider":"p","model":"m","thinking":"high"});
+        let colleague = codex_colleague_config();
+        assert_eq!(colleague[..2], ["-c", "features.multi_agent=false"]);
+        let expected = |head: &[&str], tail: &[&str]| -> Vec<String> {
+            let head = head.iter().map(|s| s.to_string());
+            let tail = tail.iter().map(|s| s.to_string());
+            head.chain(colleague.iter().cloned()).chain(tail).collect()
+        };
         assert_eq!(
             args("codex", &meta, None),
-            [
-                "codex",
-                "exec",
-                "--json",
-                "--skip-git-repo-check",
-                "-C",
-                "/repo",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "-m",
-                "m",
-                "-c",
-                "model_reasoning_effort=\"high\"",
-                "-c",
-                "model_provider=\"p\"",
-                "--image=/a.png",
-                "--image=/b.png",
-                "-"
-            ]
+            expected(
+                &[
+                    "codex",
+                    "exec",
+                    "--json",
+                    "--skip-git-repo-check",
+                    "-C",
+                    "/repo",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                ],
+                &[
+                    "-m",
+                    "m",
+                    "-c",
+                    "model_reasoning_effort=\"high\"",
+                    "-c",
+                    "model_provider=\"p\"",
+                    "--image=/a.png",
+                    "--image=/b.png",
+                    "-",
+                ]
+            )
         );
         let fork = json!({"fork":"thread-1","workdir":"/repo"});
         assert_eq!(
             args("codex", &fork, None),
-            [
-                "codex",
-                "exec",
-                "fork",
-                "thread-1",
-                "--json",
-                "--skip-git-repo-check",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "-"
-            ]
+            expected(
+                &[
+                    "codex",
+                    "exec",
+                    "fork",
+                    "thread-1",
+                    "--json",
+                    "--skip-git-repo-check",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                ],
+                &["-"]
+            )
         );
     }
 }
