@@ -49,6 +49,7 @@
 | `lane [--label 文字] [--] [命令...]` | | §8；无命令时列出队列，每行 `running\|queued  <since>  <label>` |
 | `stop <run>...` | | §9.4 |
 | `clean <run>...\|--finished [--force]` | | §10 |
+| `tiers [--default M] [--cheap M] [--strong M]` | | 显示或写入用户配置的档位模型，§4.1 |
 | `protocol` | | 输出一行 JSON：`protocol`（宿主接入协议版本，当前 1）、`version`、`caller{id,source}`（未知时为 `null`）、`agents[]{name,tiers,models,available,bin,version,shadowed}`（只有 `pi` 一项）；`tiers` 恒为 `["cheap","strong"]`，`models` 是按当前配置各档的 Pi 模型（空串表示 Pi 默认），`bin` 为 PATH 上首个可执行文件的真实路径（不可用时为 `null`），`shadowed` 为 PATH 中更靠后、真实路径不同的同名可执行文件，按其在 PATH 中的路径列出（snap 等启动器都解析到同一文件，解析后看不出是谁）；退出码 0。供宿主适配器探测，见 [delegate-protocol.md](delegate-protocol.md) |
 
 缺少同事 CLI 时退出码 2：Pi 提示 `sh <仓库>/third_party/pi-kit/install.sh --additive`，其中 `<仓库>` 为从可执行文件真实路径逐级向上、首个包含该安装脚本的目录，找不到时给出远程安装命令。
@@ -60,7 +61,7 @@
 | 选项 | 默认 | 说明 |
 |---|---|---|
 | 任务说明 | — | 位置参数拼接、`--prompt`、或 `--prompt-file`（`-` 为 stdin）；为空即退出码 2 |
-| `--tier cheap\|strong` | 只读 `cheap`，写入 `strong` | 按档位选 Pi 模型，§4.1 |
+| `--tier default\|cheap\|strong` | 配了 `default` 用它，否则 `strong` | 按档位选 Pi 模型，§4.1；`cheap` 只读：未写 `--read-only` 时自动只读，带 `--accept`/`--accept-also`/`--worktree`/`--protect`/`--allow-parallel-writes` 退出 2 |
 | `--name` | 说明首行 | 用于 run id 与显示；省略时取首个非空行生成短名，run id 保留字母、数字与 `._-`，最长 40 |
 | `--workdir` | 当前目录 | 必须存在 |
 | `--image <路径>` | — | 可重复；解析为绝对路径 |
@@ -113,8 +114,8 @@
 | `workspaceChanged` | `--in-place` 只读 run 期间工作区有变化 | 文件列表；无法归属 |
 | `protectViolation` | 改动命中受保护路径 | 排序后的仓库相对路径列表 |
 | `protectViolationReasons` | 违规且设置了原因 | 命中的保护规则路径到原因的映射，不改变 protectViolation 字符串数组 |
-| `tier` | 按档位选的同事 | `cheap` / `strong`；升档后为 `strong` |
-| `escalatedFrom` | 升过档 | 原先的同事 |
+| `tier` | 按档位选模型 | `default` / `cheap` / `strong`；升档后为 `strong` |
+| `escalatedFrom` | 升过档 | 升档前的模型（未指定为 `default`） |
 | `queuedSeconds` | 同事在 lane 中排队 ≥1 秒 | |
 | `graceSeconds` | 同事用了超时宽限 | 超出 `--timeout` 的秒数 |
 | `warning` `error` | | 人读文本 |
@@ -179,8 +180,8 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 
 ### 4.1 选模型与升档（必须）
 
-- 同事恒为 `pi`。档位选模型：`DELEGATE_{CHEAP,STRONG}_MODEL` > 配置 `tiers.{cheap,strong}`（Pi `--model` 模式 `provider/id[:thinking]`）；可选 `tiers.default`：未给 `--tier` 时用它（tier 记 `default`），未配置时只读用 `cheap`、写入用 `strong`。`cheap`、`strong` 两档必须非空，否则 `start`/`run`/`reply` 退出码 2，stderr 列出 `pi --list-models` 的模型与配置命令；`delegate tiers [--default M] [--cheap M] [--strong M]` 显示或写入用户配置（按 Pi 模型列表与 thinking 级别校验，有档未配时退出 1）。给了 `--model` 时用它并记 `agentPinned: true`。`meta.json` 记 `tier`、`model` 与启动时解析的 `tierModels`。`--agent` 已删除（退出码 2）。
-- **升档**：`tier` 为 `cheap` 或 `default` 的 run 结局为 `malformed`/`failed`/`timeout`/`rejected`、未被 stop、且（只读，或快照成功且没有任何改动）时，若 `tierModels.strong` 非空且与本轮模型不同，在同一 run 中换强档模型再跑一轮（不另占名额）：事件 `escalate{from,to,after}`（模型名，未指定为 `default`），`meta.json` 的 `model` 改为强档模型、`tier` 改为 `strong`、`fork` 清空、记 `escalatedFrom`（原模型）。新一轮沿用重跑次数，`attempts` 接续计数；快照、只读核对与验收按新一轮重新进行，结论带 `escalatedFrom`。固定模型（`agentPinned`）不升档。每个 run 至多升档一次。
+- 同事恒为 `pi`。档位选模型（Pi `--model` 串 `provider/id[:thinking]`，只有最后一个 `:` 后是 thinking 级别才算后缀）：`DELEGATE_<档>_MODEL` > 配置 `tiers.<档>`，仓库与用户按档合并。`cheap`、`strong` 必填，缺一时 `start`/`run`/`reply` 退出 2 并列出 `pi --list-models`；`default` 可选，未给 `--tier` 时用它，未配置（含显式 `--tier default`）用 `strong`。`cheap` 只读，接写入参数或写入对话退出 2。`delegate tiers [--default M] [--cheap M] [--strong M]` 显示或校验后写入用户配置。`--model` 固定模型（`agentPinned: true`）。meta 记 `tier`、`model`、`tierModels`。
+- **升档**：`tier` 为 `cheap` 或 `default` 的 run 结局为 `malformed`/`failed`/`timeout`/`rejected`、未被 stop、且（只读，或快照成功且没有任何改动）时，若 `tierModels.strong` 非空且与本轮模型串（含 thinking 后缀）不同，在同一 run 中换强档模型再跑一轮：事件 `escalate{from,to,after}`，meta 的 `model` 改为强档、`tier` 改 `strong`、`fork` 清空、记 `escalatedFrom`（原模型，未指定为 `default`）。重跑次数沿用，`attempts` 接续；快照、只读核对与验收重新进行。固定模型不升档；每个 run 至多升档一次。
 - reply 沿用上一轮的 `tier` 与模型；`--tier` 换成该档模型并在同一会话续做。旧版 Codex 记录由 Pi 开新会话续做（隐含 `--fresh`）。
 
 ### 4.1.1 编排（`--after`、`--in`，必须）

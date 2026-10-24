@@ -1621,25 +1621,28 @@ db.write_text(json.dumps(units))
             lane = subprocess.run([str(DELEGATE), "lane", "true"], cwd=self.work, env=env, timeout=30)
             self.assertEqual(lane.returncode, 0)  # heavy checks still queue
 
-    def test_tier_picks_the_model(self):
+    def test_tier_picks_the_model_and_cheap_only_reads(self):
         self.fake_pi([answer("ok"), SETTLED])
         calls = lambda: (self.work / "pi.log").read_text().splitlines()
-        state = self.outcome(self.cli("run", "--read-only", "task"))
-        self.assertEqual((state["agent"], state["tier"]), ("pi", "cheap"))  # reading defaults to cheap
-        self.assertEqual(self.outcome(self.cli("run", "task"))["tier"], "strong")  # writing defaults to strong
         self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/strong-m:high"}})
-        self.outcome(self.cli("run", "--read-only", "task"))
+        for args in (("--read-only",), ()):  # no default configured: everything goes strong
+            state = self.outcome(self.cli("run", *args, "task"))
+            self.assertEqual((state["agent"], state["tier"]), ("pi", "strong"))
+            self.assertIn("--model p/strong-m:high", calls()[-1])
+        state = self.outcome(self.cli("run", "--tier", "cheap", "task"))
+        self.assertEqual((state["tier"], state["mode"]), ("cheap", "read-only"))  # cheap implies read-only
         self.assertIn("--model p/cheap-m", calls()[-1])
-        self.outcome(self.cli("run", "task"))
-        self.assertIn("--model p/strong-m:high", calls()[-1])
-        self.outcome(self.cli("run", "--read-only", "--tier", "strong", "task"))
-        self.assertIn("--model p/strong-m:high", calls()[-1])
+        for flags in (("--accept", "true"), ("--worktree",), ("--protect", "a/")):
+            refused = self.cli("run", "--tier", "cheap", *flags, "task")
+            self.assertEqual(refused.returncode, 2, flags)
+            self.assertIn("cheap tier only reads", refused.stderr)
+        self.assertEqual(self.outcome(self.cli("run", "--tier", "default", "task"))["tier"], "strong")
         self.env["DELEGATE_CHEAP_MODEL"] = "q/env-m"
-        self.outcome(self.cli("run", "--read-only", "task"))
+        self.outcome(self.cli("run", "--tier", "cheap", "task"))
         self.assertIn("--model q/env-m", calls()[-1])
         state = self.outcome(self.cli("run", "--read-only", "--model", "x/named", "task"))
         self.assertIn("--model x/named", calls()[-1])
-        self.assertEqual((state["tier"], state["agentPinned"]), ("cheap", True))  # named outright: no escalation
+        self.assertEqual((state["tier"], state["agentPinned"]), ("strong", True))  # named outright: no escalation
         removed = self.cli("run", "--agent", "codex", "task")
         self.assertEqual(removed.returncode, 2)
         self.assertIn("removed in 6.0", removed.stderr)
@@ -1674,6 +1677,20 @@ db.write_text(json.dumps(units))
         config = json.loads((self.work / "config/delegate/config.json").read_text())
         self.assertEqual(config["tiers"]["default"], "p/m")
 
+    def test_repository_tiers_override_per_tier_and_unset_default_falls_back(self):
+        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/m"}})
+        repo = self.repo({"a.txt": "a\n"})
+        (repo / ".delegate.json").write_text(json.dumps({"tiers": {"strong": "p/strong-m"}}))
+        self.fake_pi([answer("ok"), SETTLED])
+        calls = lambda: (self.work / "pi.log").read_text().splitlines()
+        self.outcome(self.cli("run", "--tier", "cheap", "--workdir", repo, "task"))
+        self.assertIn("--model p/cheap-m", calls()[-1])  # the user's cheap tier survives
+        self.outcome(self.cli("run", "--workdir", repo, "--in-place", "task"))
+        self.assertIn("--model p/strong-m", calls()[-1])  # the repository's strong tier wins
+        state = self.outcome(self.cli("run", "--read-only", "--tier", "default", "--workdir", repo, "task"))
+        self.assertEqual(state["tier"], "strong")  # no default configured: strong
+        self.assertIn("--model p/strong-m", calls()[-1])
+
     def test_both_tiers_must_be_set_and_tiers_sets_them(self):
         self.fake_pi([answer("ok"), SETTLED])
         self.user_config({"tiers": {"cheap": "p/cheap-m"}})
@@ -1700,7 +1717,7 @@ db.write_text(json.dumps(units))
         log = self.work / "pi.log"
         self.fake_pi([answer(LEAKED), SETTLED], [answer("found it"), SETTLED])
         repo = self.repo({"a.txt": "a\n"})
-        result = self.cli("run", "--read-only", "--retries", "0", "--workdir", repo, "审查一下")
+        result = self.cli("run", "--tier", "cheap", "--retries", "0", "--workdir", repo, "审查一下")
         state = self.outcome(result)
         self.assertEqual(result.returncode, 0)
         self.assertEqual((state["state"], state["agent"], state["tier"], state["escalatedFrom"], state["attempts"]),
@@ -1714,26 +1731,25 @@ db.write_text(json.dumps(units))
         reply = self.outcome(self.cli("reply", "--wait", state["run"], "and?"))
         self.assertEqual(reply["tier"], "strong")
         self.assertIn("--model p/strong-m", log.read_text().splitlines()[-1])
-        # A write run that changed nothing and failed its check is handed over too...
+        # A default-tier write that changed nothing and failed its check is handed over too...
+        self.user_config({"tiers": {"default": "p/m", "cheap": "p/cheap-m", "strong": "p/strong-m"}})
         log.unlink()
         self.fake_pi([answer("done"), SETTLED], [answer("fixed"), SETTLED], pre='[ "$n" -eq 2 ] && touch made.txt')
-        state = self.outcome(self.cli("run", "--tier", "cheap", "--workdir", repo, "--in-place",
-                                      "--accept", "test -f made.txt", "task"))
-        self.assertEqual((state["state"], state["escalatedFrom"], state["files"]), ("delivered", "p/cheap-m", ["made.txt"]))
+        state = self.outcome(self.cli("run", "--workdir", repo, "--in-place", "--accept", "test -f made.txt", "task"))
+        self.assertEqual((state["state"], state["escalatedFrom"], state["files"]), ("delivered", "p/m", ["made.txt"]))
         # ...but not one that left changes behind, nor one whose model was named outright,
         (repo / "made.txt").unlink()
         self.fake_pi([answer("done"), SETTLED], pre="echo half > partial.txt")
-        state = self.outcome(self.cli("run", "--tier", "cheap", "--workdir", repo, "--in-place",
-                                      "--accept", "test -f made.txt", "task"))
+        state = self.outcome(self.cli("run", "--workdir", repo, "--in-place", "--accept", "test -f made.txt", "task"))
         self.assertEqual(state["state"], "rejected")
         self.assertNotIn("escalatedFrom", state)
         self.fake_pi([answer(LEAKED), SETTLED])
-        state = self.outcome(self.cli("run", "--read-only", "--retries", "0", "--model", "p/cheap-m", "task"))
+        state = self.outcome(self.cli("run", "--tier", "cheap", "--retries", "0", "--model", "p/cheap-m", "task"))
         self.assertEqual(state["state"], "malformed")
         self.assertNotIn("escalatedFrom", state)
         # ...nor when the strong tier runs the same model.
         self.user_config({"tiers": {"cheap": "p/m", "strong": "p/m"}})
-        state = self.outcome(self.cli("run", "--read-only", "--retries", "0", "task"))
+        state = self.outcome(self.cli("run", "--tier", "cheap", "--retries", "0", "task"))
         self.assertEqual((state["state"], state["tier"]), ("malformed", "cheap"))
 
     def test_wait_until_all_without_runs_collects_everything_pending(self):
@@ -2405,10 +2421,10 @@ db.write_text(json.dumps(units))
             self.assertNotIn(key, review)
 
     def test_reply_can_move_the_conversation_to_the_strong_model(self):
-        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/strong-m"}})
+        self.user_config({"tiers": {"default": "p/m", "cheap": "p/cheap-m", "strong": "p/strong-m"}})
         repo = self.repo({"a.txt": "a\n"})
         self.fake_pi([answer("draft"), SETTLED], pre="echo draft >> a.txt")
-        draft = self.outcome(self.cli("run", "--tier", "cheap", "--worktree", "--workdir", repo, "--name", "d", "draft"))
+        draft = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "d", "draft"))
         self.fake_pi([answer("polished"), SETTLED], pre="echo polish >> a.txt")
         polished = self.outcome(self.cli("reply", "--wait", "d", "--tier", "strong", "polish the draft"))
         self.assertEqual((polished["state"], polished["tier"], polished["worktree"]),
@@ -2416,6 +2432,7 @@ db.write_text(json.dumps(units))
         call = (self.work / "pi.log").read_text().splitlines()[-1]
         self.assertIn("--model p/strong-m", call)
         self.assertIn("--fork", call)  # same colleague, same session, another model
+        self.assertIn("this conversation writes", self.cli("reply", "d", "--tier", "cheap", "more").stderr)
         self.assertEqual(self.cli("apply", "--json", "--keep", "d").returncode, 0)
         self.assertEqual((repo / "a.txt").read_text(), "a\ndraft\npolish\n")
 
@@ -3350,7 +3367,7 @@ fi
     def test_pinned_model_displays_its_tier_and_never_escalates(self):
         self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/strong-m"}})
         self.fake_pi([answer(LEAKED), SETTLED])
-        pinned = self.outcome(self.cli("run", "--read-only", "--model", "x/named", "--retries", "0", "task"))
+        pinned = self.outcome(self.cli("run", "--tier", "cheap", "--model", "x/named", "--retries", "0", "task"))
         self.assertEqual((pinned["agent"], pinned["tier"], pinned["agentPinned"], pinned["state"]),
                          ("pi", "cheap", True, "malformed"))
         self.assertEqual(len((self.work / "pi.log").read_text().splitlines()), 1)
@@ -3358,7 +3375,7 @@ fi
 
     def test_pinned_reply_and_legacy_tier_display_do_not_rewrite_meta(self):
         self.fake_pi([answer("first"), SETTLED])
-        first = self.outcome(self.cli("run", "--read-only", "task"))
+        first = self.outcome(self.cli("run", "--tier", "cheap", "task"))
         path = Path(first["dir"]) / "meta.json"
         legacy = json.loads(path.read_text())
         legacy["tier"] = None

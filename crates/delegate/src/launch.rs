@@ -310,8 +310,22 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
     }
     Ok(o)
 }
-fn choose_tier(o: &mut Options) {
+const CHEAP_READS_ONLY: &str = "the cheap tier only reads (reading, exploring, images); give writes to the default or strong tier";
+/// The cheap tier reads and explores; a write on it is refused, not run.
+fn choose_tier(o: &mut Options) -> Res<()> {
     o.agent = agents::AGENT.into();
+    if o.tier.as_deref() == Some("cheap") && !o.read_only {
+        if o.accept.is_some()
+            || !o.accept_also.is_empty()
+            || o.worktree
+            || !o.protect.is_empty()
+            || o.parallel
+        {
+            return Err(CHEAP_READS_ONLY.into());
+        }
+        o.read_only = true;
+    }
+    Ok(())
 }
 fn tier_models(config: &Value) -> Value {
     agents::ALL_TIERS
@@ -320,19 +334,13 @@ fn tier_models(config: &Value) -> Value {
         .collect::<serde_json::Map<_, _>>()
         .into()
 }
-/// Without --tier, the configured default model runs, else read-only goes
-/// cheap and writes strong. An explicit --model pins the run (no escalation).
+/// Without --tier (or with --tier default and none configured), the default
+/// model runs, else the strong one. An explicit --model pins the run.
 fn apply_tier_model(o: &mut Options, config: &Value) -> Value {
     let models = tier_models(config);
-    if o.tier.is_none() {
-        let tier = if !s(&models, "default").is_empty() {
-            "default"
-        } else if o.read_only {
-            "cheap"
-        } else {
-            "strong"
-        };
-        o.tier = Some(tier.into());
+    let no_default = s(&models, "default").is_empty();
+    if o.tier.is_none() || (o.tier.as_deref() == Some("default") && no_default) {
+        o.tier = Some(if no_default { "strong" } else { "default" }.into());
     }
     if o.model.is_some() {
         o.agent_pinned = true;
@@ -607,7 +615,7 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     if let Some(e) = nesting_error() {
         return Err(e);
     }
-    choose_tier(&mut o);
+    choose_tier(&mut o)?;
     let prompt = read_prompt(&mut o)?;
     let after = o.after.as_deref().map(runs::resolve).transpose()?;
     let in_run = o.in_run.as_deref().map(runs::resolve).transpose()?;
@@ -883,6 +891,9 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         }
     }
     let requested_tier = o.tier.clone();
+    if requested_tier.as_deref() == Some("cheap") && s(&meta, "mode") == "write" {
+        return Err(format!("{CHEAP_READS_ONLY}; this conversation writes"));
+    }
     let legacy = s(&meta, "agent") != agents::AGENT;
     if legacy && !o.fresh {
         o.fresh = true;
@@ -921,14 +932,11 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     o.agent = agents::AGENT.into();
     missing_tools(&o.agent)?;
     o.agent_pinned = requested_tier.is_none() && !legacy && runs::agent_pinned(&meta);
-    let default_tier = if s(&meta, "mode") == "read-only" {
-        "cheap"
-    } else {
-        "strong"
-    };
+    // A record without a tier: a legacy one picks again below; others keep their model.
     o.tier = requested_tier.clone().or_else(|| {
         let tier = meta["tier"].as_str().filter(|t| !t.is_empty());
-        Some(tier.unwrap_or(default_tier).to_string())
+        tier.map(str::to_string)
+            .or_else(|| (!legacy).then(|| "cheap".to_string()))
     });
     if requested_tier.is_none() && !legacy {
         o.provider = meta["provider"].as_str().map(str::to_string);
@@ -1450,6 +1458,11 @@ pub fn launch(
         },
         extra["standingSources"],
         if inherited { "（已有会话）" } else { "" }
+    );
+    eprintln!(
+        "delegate: {} 档，模型 {}",
+        o.tier.as_deref().unwrap_or(""),
+        o.model.as_deref().unwrap_or("（Pi 默认）")
     );
     if extra["defaults"].as_object().is_some_and(|d| !d.is_empty()) {
         eprintln!("delegate: 生效默认值及来源 {}", extra["defaults"]);

@@ -287,6 +287,17 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         sources.push("repo");
     }
     let mut value = repo.clone().unwrap_or(json!({}));
+    // Tiers merge per tier: a repository naming one model keeps the user's others.
+    let mut tiers = user
+        .as_ref()
+        .and_then(|u| u["tiers"].as_object().cloned())
+        .unwrap_or_default();
+    if let Some(repo_tiers) = value["tiers"].as_object() {
+        tiers.extend(repo_tiers.clone());
+    }
+    if !tiers.is_empty() {
+        value["tiers"] = Value::Object(tiers);
+    }
     for key in [
         "accept",
         "evidence",
@@ -296,7 +307,6 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         "maxHeavy",
         "repoMaxActive",
         "resultChars",
-        "tiers",
         "acceptBlind",
         "stall",
         "checkIn",

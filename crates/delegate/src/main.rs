@@ -1505,10 +1505,13 @@ fn tiers(args: &[String]) -> Res<i32> {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
+        // Replace the file whole: a cut-off write must not truncate the user's other settings.
+        let tmp = path.with_extension("json.tmp");
         write(
-            &path,
+            &tmp,
             format!("{}\n", serde_json::to_string_pretty(&user).unwrap()),
         )?;
+        fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
     }
     let top = git_top(&env::current_dir().unwrap_or_default());
     let config = config::load(top.as_deref())?;

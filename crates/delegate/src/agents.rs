@@ -110,16 +110,15 @@ pub fn tiers_guide() -> String {
 
 /// Check a tier value against Pi's model list (skipped when the list is empty).
 pub fn check_tier_model(pattern: &str, models: &[(String, bool)]) -> Res<()> {
-    let (model, thinking) = pattern.split_once(':').unwrap_or((pattern, ""));
+    // Like Pi: only a last `:level` naming a thinking level is a suffix, so ids
+    // such as `ollama/qwen2.5-coder:7b` stay whole.
+    let model = pattern
+        .rsplit_once(':')
+        .filter(|(_, level)| THINKING.contains(level))
+        .map_or(pattern, |(model, _)| model);
     if !model.contains('/') {
         return Err(format!(
             "{pattern}: write the model as provider/id[:thinking]"
-        ));
-    }
-    if !thinking.is_empty() && !THINKING.contains(&thinking) {
-        return Err(format!(
-            "{pattern}: thinking must be one of {}",
-            THINKING.join("|")
         ));
     }
     if !models.is_empty() && !models.iter().any(|(m, _)| m == model) {
@@ -794,6 +793,18 @@ mod tests {
 
     fn args(_agent: &str, meta: &Value, session: Option<&str>) -> Vec<String> {
         command_pi(meta, session)
+    }
+
+    #[test]
+    fn tier_models_keep_ids_with_colons_and_strip_only_thinking() {
+        let models = vec![
+            ("ollama/qwen2.5-coder:7b".to_string(), false),
+            ("p/m".to_string(), true),
+        ];
+        assert!(check_tier_model("ollama/qwen2.5-coder:7b", &models).is_ok());
+        assert!(check_tier_model("p/m:high", &models).is_ok());
+        assert!(check_tier_model("p/m:huge", &models).is_err());
+        assert!(check_tier_model("m", &[]).is_err());
     }
 
     #[test]
