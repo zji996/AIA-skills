@@ -595,6 +595,26 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(decision(f"{d} wait", background=True), "allow")
         self.assertEqual(decision(f"{d} wait", tool="Read"), "allow")
 
+    def test_background_hook_denies_pgrep_patterns_that_match_their_own_shell(self):
+        def decision(command, background=False):
+            payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command, "run_in_background": background}})
+            result = subprocess.run([sys.executable, str(BACKGROUND_HOOK)], input=payload, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] if result.stdout else "allow"
+
+        p = "pg" + "rep"  # keeps this file's own text from looking like an invocation
+        deny = [f'until [ -x out/bench ] || ! {p} -f "bench" >/dev/null; do sleep 3; done',
+                f"while {p} -af cargo; do sleep 5; done", f"n=$({p} -fc serve.py)",
+                f"/usr/bin/pkill -f 'until \\[ -x /tmp'", f"{p} --full -u zji worker",
+                f"{p} -f '[w]orker'", f"sleep 1\n{p} -f worker"]
+        allow = [f"{p} -f '^python3 .*serve.py'", f"{p} -x cargo", f"{p} cargo", f'{p} -fx "python3 a.py"',
+                 "pkill -9 -f ^node", f'git commit -m "{p} -f loops never end"', f"rg -n '{p} -f' docs",
+                 f"echo {p} -f x", f"cat > notes.md <<'EOF'\n{p} -f x\nEOF"]
+        for command in deny:
+            self.assertEqual(decision(command, background=True), "deny", command)
+        for command in allow:
+            self.assertEqual(decision(command, background=True), "allow", command)
+
     def test_audit_exact_budget_overrides_a_glob_written_after_it(self):
         repo = self.git_repo()
         (repo / "AGENTS.md").write_text("ok")
