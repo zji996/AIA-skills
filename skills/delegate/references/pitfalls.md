@@ -23,7 +23,7 @@
 | 同事全量检查被拒绝（77） | 按 hint 改跑相关检查；结论的 denied 统计拦截次数，主控合入一批后统一跑全量 |
 | 带过滤参数的 infra-test 也被拒绝 | 前缀规则包含所有后缀；只禁无参数版本应设 `exact: true` |
 | 允许的仓库命令（如 `cargo xtask infra-test -p x`）也退出 77 | shim 拦截同事进程树里的所有调用，仓库工具内部调用的命令（xtask 先跑 `cargo test --workspace --no-run`）同样命中。只拦仓库工具不会在内部调用的命令；“别跑全量测试”写进 `standing` |
-| 想给同事开 Rust 增量编译，`CARGO_INCREMENTAL=1` 下编译立即失败（`sccache: increment compilation is prohibited`） | sccache 拒绝这个环境变量。改用 `CARGO_PROFILE_DEV_INCREMENTAL=true` 与 `CARGO_PROFILE_TEST_INCREMENTAL=false`：依赖仍走 sccache，只有工作区 crate 增量。实测一个大 crate 的 clippy 改一行后从约 46 秒降到约 17 秒，增量目录约 1.2 GiB，可放 tmpfs 免写盘 |
+| 想给同事开 Rust 增量编译，`CARGO_INCREMENTAL=1` 下编译立即失败（`sccache: increment compilation is prohibited`） | sccache 拒绝这个环境变量。改用 `CARGO_PROFILE_DEV_INCREMENTAL=true` 与 `CARGO_PROFILE_TEST_INCREMENTAL=false`：依赖仍走 sccache，只有工作区 crate 增量。实测一个大 crate 的 clippy 改一行后从约 46 秒降到约 17 秒，增量目录约 1.2 GiB。放 tmpfs 免写盘时要设总预算：`worktree.setup` 里建符号链接，先清 worktree 已不在的条目，不清活的（构建可能正在用），超预算的新 worktree 留在磁盘 |
 | 模型评测超时导致 rejected | 将不确定的评测放进 `--evidence`，让确定的门禁作 `--accept`；证据超时只记诊断 |
 | 同事读到的代码和你当前的不一样 | 只读任务读的是启动时的快照；你之后的修改它看不到，需要时重新放一个 |
 | 清理后找不到长报告的全文 | `wait` 显示答复头尾共 6000 字；只看过截断答复的任务 `clean --finished` 默认保留。要留存就先 `result <name> > 文件`，或调大 `DELEGATE_RESULT_CHARS` |
