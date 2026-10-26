@@ -10,6 +10,7 @@
 
 ### 技能
 
+- 新增 `agent-interface-design` 1.0.0：设计或评审模型可见界面（工具说明、结果与错误文字、Skill、系统段、读取方式）的七条原则与评审清单。起因：一个仓库里读图分层、头像结果附预览、CAD 图纸按页读取反复用到同一套判断，所有者要求抽成原则，跨仓库复用。
 - `iteration-speed` 1.2.1：Rust 参考补“`-p` 选包改变 feature 合并”：同一门禁里分开的 `cargo test -p` 调用会把共享 crate 各编一份；`resolver.feature-unification` 在 Cargo 1.97 仍未稳定。起因：一个仓库的数据库测试预构建 307 s，大半是同一 crate 编三遍。
 - `iteration-speed` 1.2.0：新增 `step` 与 `steps`：门禁逐步记录耗时；输入摘要取自 git 并可按路径缩小范围，`--key` 纳入工具版本等事实，同仓库同名步骤以相同输入通过过就复用，失败从不复用；记录跨 clone 与 worktree 共用，不存命令与输出。起因：一个仓库的完整门禁只有一条 869 秒的总时间，看不出慢在哪，只改文档也要全部重跑。
 - `repo-governance` 3.3.0：新增“合并 ADR”一节与 `adr-archive.py`：被并入的修订移进 `history/`，状态改为 Superseded 并链接主 ADR，按真实位置重算全仓 Markdown/HTML 相对链接，追加历史索引行；默认只打印计划。起因：一次把 17 份修订并入 9 份主 ADR，手工改链接容易漏。
