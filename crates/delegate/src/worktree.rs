@@ -1147,20 +1147,35 @@ fn accept_validity(run: &Path, dry: bool, conclusion: &mut Value) {
     }
     conclusion["acceptValidityReason"] = json!(reason);
 }
-/// Post-merge acceptance on the source tree (field notes 16): parallel routes
-/// each pass in their own worktree, yet type drift between them only shows
-/// once merged. Opt-in through `.delegate.json` `applyVerify` (true runs the
-/// top-level `accept`; a string is its own command) or `apply --verify`.
-/// Returns false only when the verification ran and failed.
-pub fn verify_after_apply(run: &Path, forced: Option<bool>, conclusion: &mut Value) -> Res<bool> {
+/// The acceptance a run recorded: its `accept` (with `--accept-also` folded in) and any
+/// `acceptAlso` kept apart, without repeats.
+pub fn acceptance(meta: &Value) -> Vec<String> {
+    let mut commands = Vec::new();
+    let accept = s(meta, "accept").trim();
+    if !accept.is_empty() {
+        commands.push(accept.to_string());
+    }
+    for command in strings(&meta["acceptAlso"]) {
+        if !command.trim().is_empty() && !commands.contains(&command) {
+            commands.push(command);
+        }
+    }
+    commands
+}
+/// Post-merge acceptance on the source tree (field notes 16): parallel routes each pass in
+/// their own worktree, yet type drift between them only shows once merged. When a run's
+/// acceptance does not carry over, `apply` reruns it there: `applyVerify` in
+/// `.delegate.json` as a command replaces it, `false` turns it off (`--verify` /
+/// `--no-verify` override). Returns the commands to run; `apply` runs the union of a
+/// batch once, after its last merge.
+pub fn verify_plan(run: &Path, forced: Option<bool>, conclusion: &mut Value) -> Res<Vec<String>> {
     if conclusion["apply"]["ok"] != json!(true) || conclusion["apply"]["dryRun"] == json!(true) {
-        return Ok(true);
+        return Ok(vec![]);
     }
     let meta = json(run.join("meta.json"));
-    let tree = &meta["worktree"];
-    let source = s(tree, "source");
+    let source = s(&meta["worktree"], "source");
     if source.is_empty() {
-        return Ok(true);
+        return Ok(vec![]);
     }
     let file = Path::new(source).join(".delegate.json");
     let raw = if file.is_file() {
@@ -1170,8 +1185,8 @@ pub fn verify_after_apply(run: &Path, forced: Option<bool>, conclusion: &mut Val
         json!({})
     };
     let configured = match raw.get("applyVerify") {
-        None | Some(Value::Null) | Some(Value::Bool(false)) => None,
-        Some(Value::Bool(true)) => Some(None),
+        None | Some(Value::Null) | Some(Value::Bool(true)) => Some(None),
+        Some(Value::Bool(false)) => None,
         Some(Value::String(command)) if !command.trim().is_empty() => Some(Some(command.clone())),
         _ => {
             return Err(format!(
@@ -1181,27 +1196,34 @@ pub fn verify_after_apply(run: &Path, forced: Option<bool>, conclusion: &mut Val
         }
     };
     if !forced.unwrap_or(configured.is_some()) {
-        return Ok(true);
+        return Ok(vec![]);
     }
     if forced != Some(true) && conclusion["acceptStillValid"] == json!(true) {
         conclusion["verify"] = json!({"skipped":"acceptStillValid"});
-        return Ok(true);
+        return Ok(vec![]);
     }
-    let command = configured
-        .flatten()
-        .or_else(|| {
-            raw.get("accept")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .or_else(|| Some(s(&meta, "accept").to_string()).filter(|c| !c.is_empty()));
-    let Some(command) = command else {
-        conclusion["verify"] = json!({"skipped":"no acceptance command"});
-        return Ok(true);
+    let mut commands = match configured.flatten() {
+        Some(command) => vec![command],
+        None => acceptance(&meta),
     };
+    if commands.is_empty() {
+        if let Some(command) = raw.get("accept").and_then(Value::as_str) {
+            commands.push(command.to_string());
+        }
+    }
+    if commands.is_empty() {
+        conclusion["verify"] = json!({"skipped":"no acceptance command"});
+    }
+    Ok(commands)
+}
+/// Runs `commands` in order on the merged source tree through the heavy lane, stopping
+/// at the first failure; `run` holds the log and supplies the environment.
+pub fn run_verify(run: &Path, commands: &[String]) -> Value {
+    let meta = json(run.join("meta.json"));
+    let tree = &meta["worktree"];
     let cwd = Some(s(tree, "sourceWorkdir"))
         .filter(|w| !w.is_empty())
-        .unwrap_or(source)
+        .unwrap_or(s(tree, "source"))
         .to_string();
     let label = format!(
         "verify {}",
@@ -1211,35 +1233,46 @@ pub fn verify_after_apply(run: &Path, forced: Option<bool>, conclusion: &mut Val
     let slot = lane::acquire(&label, None, Some(run), |ahead, _| {
         apply_progress(format!("verify queued / 排队中: {ahead} ahead"))
     });
-    let mut result = json!({"command":command});
+    let mut result = json!({"commands":commands});
     let Ok(slot) = slot else {
         result["ok"] = json!(false);
         result["tail"] = json!("stopped while queued for the heavy lane");
-        conclusion["verify"] = result;
-        return Ok(false);
+        return result;
     };
     let path = run.join("verify.log");
-    let mut log = fs::File::create(&path).map_err(|e| e.to_string())?;
-    let _ = writeln!(log, "$ {command}");
-    let (code, timed) = crate::common::run_shell(
-        (&command, "verify"),
-        Path::new(&cwd),
-        run,
-        &meta["env"],
-        meta["acceptTimeoutSeconds"].as_f64().unwrap_or(600.0),
-        &mut log,
-        None,
-    )
-    .unwrap_or((1, false));
+    result["log"] = json!(path);
+    let Ok(mut log) = fs::File::create(&path) else {
+        result["ok"] = json!(false);
+        result["tail"] = json!(format!("cannot create {}", path.display()));
+        return result;
+    };
+    let mut code = 0;
+    for command in commands {
+        let _ = writeln!(log, "$ {command}");
+        let (exit, timed) = crate::common::run_shell(
+            (command, "verify"),
+            Path::new(&cwd),
+            run,
+            &meta["env"],
+            meta["acceptTimeoutSeconds"].as_f64().unwrap_or(600.0),
+            &mut log,
+            None,
+        )
+        .unwrap_or((1, false));
+        let _ = writeln!(
+            log,
+            "{}\n[exit {exit}]",
+            if timed { "\n[verify timed out]" } else { "" }
+        );
+        if exit != 0 {
+            code = exit;
+            result["command"] = json!(command);
+            break;
+        }
+    }
     drop(slot);
-    let _ = writeln!(
-        log,
-        "{}\n[exit {code}]",
-        if timed { "\n[verify timed out]" } else { "" }
-    );
     result["ok"] = json!(code == 0);
     result["exitCode"] = json!(code);
-    result["log"] = json!(path);
     if code != 0 {
         let text = read(&path);
         let chars: Vec<char> = text.trim().chars().collect();
@@ -1253,8 +1286,7 @@ pub fn verify_after_apply(run: &Path, forced: Option<bool>, conclusion: &mut Val
     } else {
         "verify failed / 验收失败"
     });
-    conclusion["verify"] = result;
-    Ok(code == 0)
+    result
 }
 fn numbered_prefix(path: &str) -> Option<(String, String)> {
     let path = Path::new(path);
@@ -1340,6 +1372,18 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
     if s(&meta, "mode") == "read-only" {
         return Err(format!(
             "{} is read-only; its worktree is a snapshot to read, with nothing to apply",
+            run.file_name().unwrap_or_default().to_string_lossy()
+        ));
+    }
+    let upstream = Path::new(s(&meta, "stackedOn"));
+    if !merge
+        && upstream.is_dir()
+        && !upstream.join(".applied").exists()
+        && !detect_applied(upstream, &json(upstream.join("meta.json")))
+    {
+        let id = upstream.file_name().unwrap_or_default().to_string_lossy();
+        return Err(format!(
+            "{} is built on {id}'s changes, which are not applied yet: apply {id} first, or pass --merge to apply this one alone / 本任务叠在 {id} 的改动上：先 apply {id}",
             run.file_name().unwrap_or_default().to_string_lossy()
         ));
     }

@@ -1110,35 +1110,22 @@ fn apply(args: &[String]) -> Res<i32> {
     if has(&flags, "--verify") && has(&flags, "--no-verify") {
         return Err("--verify and --no-verify are exclusive".into());
     }
-    if pos.len() > 1 {
-        return Err("apply takes one run".into());
-    }
-    let run = runs::latest(runs::resolve(
-        pos.first().map(String::as_str).unwrap_or("last"),
-    )?);
-    if runs::active(&runs::state(&run)) {
-        return Err(format!(
-            "{} is still running",
-            run.file_name().unwrap_or_default().to_string_lossy()
-        ));
-    }
-    let meta = json(run.join("meta.json"));
-    let keep_commits = has(&flags, "--keep-commits") || b(&meta["defaults"], "keepCommits");
-    let mut outcome = worktree::apply(
-        &run,
-        has(&flags, "--merge"),
-        has(&flags, "--dry-run"),
-        keep_commits,
-    )?;
-    if run.join(".applied").exists() {
-        let path = s(&json(run.join("meta.json"))["worktree"], "path").to_string();
-        for other in runs::all_runs() {
-            if s(&json(other.join("meta.json"))["worktree"], "path") == path {
-                let _ = write(other.join(".applied"), read(run.join(".applied")));
-                if run.join(".sync-base").is_file() {
-                    let _ = write(other.join(".sync-base"), read(run.join(".sync-base")));
-                }
-            }
+    let names = if pos.is_empty() {
+        vec!["last".to_string()]
+    } else {
+        pos.clone()
+    };
+    let mut targets = Vec::new();
+    for name in &names {
+        let run = runs::latest(runs::resolve(name)?);
+        if runs::active(&runs::state(&run)) {
+            return Err(format!(
+                "{} is still running",
+                run.file_name().unwrap_or_default().to_string_lossy()
+            ));
+        }
+        if !targets.contains(&run) {
+            targets.push(run);
         }
     }
     let forced = if has(&flags, "--verify") {
@@ -1148,57 +1135,108 @@ fn apply(args: &[String]) -> Res<i32> {
     } else {
         None
     };
-    if !worktree::verify_after_apply(&run, forced, &mut outcome.conclusion)? && outcome.code == 0 {
-        outcome.code = 1;
-    }
-    // Capture acceptance before cleaning, since clean removes the recorded task metadata.
-    let final_line = if outcome.conclusion["acceptStillValid"] == json!(true) {
-        "验收仍然有效（仓库快照范围）".to_string()
-    } else {
-        let mut commands = Vec::new();
-        let accept = s(&meta, "accept").trim();
-        if !accept.is_empty() {
-            commands.push(accept.to_string());
-        }
-        for command in meta["acceptAlso"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(serde_json::Value::as_str)
-        {
-            if !command.trim().is_empty() && !commands.iter().any(|item| item == command) {
-                commands.push(command.to_string());
+    let dry = has(&flags, "--dry-run");
+    // Runs apply in the order given and stop at the first that fails; their acceptance
+    // reruns once on the merged tree, after the last merge (field notes 16).
+    let mut done = Vec::new();
+    let mut code = 0;
+    let mut plan = Vec::<String>::new();
+    for run in &targets {
+        let meta = json(run.join("meta.json"));
+        let keep_commits = has(&flags, "--keep-commits") || b(&meta["defaults"], "keepCommits");
+        let mut outcome = worktree::apply(run, has(&flags, "--merge"), dry, keep_commits)?;
+        if run.join(".applied").exists() {
+            let path = s(&json(run.join("meta.json"))["worktree"], "path").to_string();
+            for other in runs::all_runs() {
+                if s(&json(other.join("meta.json"))["worktree"], "path") == path {
+                    let _ = write(other.join(".applied"), read(run.join(".applied")));
+                    if run.join(".sync-base").is_file() {
+                        let _ = write(other.join(".sync-base"), read(run.join(".sync-base")));
+                    }
+                }
             }
         }
-        let validity = if outcome.conclusion["acceptStillValid"] == json!(false) {
-            "验收无效"
-        } else {
-            "验收有效性未确认"
-        };
-        if commands.is_empty() {
-            format!("{validity}；任务没有验收命令")
-        } else {
-            format!("{validity}；需要在主干重跑：{}", commands.join("；"))
+        if outcome.code == 0 {
+            for command in worktree::verify_plan(run, forced, &mut outcome.conclusion)? {
+                if !plan.contains(&command) {
+                    plan.push(command);
+                }
+            }
         }
-    };
-    let blind_note = output::blind_note(&outcome.conclusion["acceptBlind"]);
-    println!("{}", format_status(outcome.conclusion));
-    if outcome.code == 0 && !has(&flags, "--dry-run") && !has(&flags, "--keep") {
-        for diagnostic in runs::remove_after_apply(&run) {
-            eprintln!("delegate: apply cleanup: {diagnostic}");
+        code = outcome.code;
+        // Capture acceptance before cleaning, since clean removes the recorded task metadata.
+        let commands = worktree::acceptance(&meta);
+        done.push((run.clone(), outcome.conclusion, commands));
+        if code != 0 {
+            break;
         }
     }
-    if !output::json_enabled() {
-        println!(
-            "{final_line}{}",
-            if blind_note.is_empty() {
-                String::new()
+    let mut verify = serde_json::Value::Null;
+    if code == 0 && !plan.is_empty() {
+        if let Some((run, conclusion, _)) = done.last_mut() {
+            verify = worktree::run_verify(run, &plan);
+            if verify["ok"] != json!(true) {
+                code = 1;
+            }
+            conclusion["verify"] = verify.clone();
+        }
+    }
+    for (_, conclusion, commands) in &done {
+        let final_line = if conclusion["acceptStillValid"] == json!(true) {
+            "验收仍然有效（仓库快照范围）".to_string()
+        } else if conclusion["apply"]["ok"] == json!(true)
+            && !dry
+            && !verify.is_null()
+            && conclusion["verify"].get("skipped").is_none()
+        {
+            String::new()
+        } else {
+            let validity = if conclusion["acceptStillValid"] == json!(false) {
+                "验收无效"
             } else {
-                format!("；{blind_note}")
+                "验收有效性未确认"
+            };
+            if commands.is_empty() {
+                format!("{validity}；任务没有验收命令")
+            } else {
+                format!("{validity}；需要在主干重跑：{}", commands.join("；"))
+            }
+        };
+        let blind_note = output::blind_note(&conclusion["acceptBlind"]);
+        println!("{}", format_status(conclusion.clone()));
+        if !output::json_enabled() && !(final_line.is_empty() && blind_note.is_empty()) {
+            println!(
+                "{final_line}{}",
+                if blind_note.is_empty() || final_line.is_empty() {
+                    blind_note.clone()
+                } else {
+                    format!("；{blind_note}")
+                }
+            );
+        }
+    }
+    if !output::json_enabled() && !verify.is_null() {
+        println!(
+            "{}",
+            if verify["ok"] == json!(true) {
+                format!("合并后验收通过：{}", plan.join("；"))
+            } else {
+                format!(
+                    "合并后验收失败：{}；合并已写入主干，在主干修或 reply 同事；日志 {}",
+                    s(&verify, "command"),
+                    s(&verify, "log")
+                )
             }
         );
     }
-    Ok(outcome.code)
+    if code == 0 && !dry && !has(&flags, "--keep") {
+        for (run, _, _) in &done {
+            for diagnostic in runs::remove_after_apply(run) {
+                eprintln!("delegate: apply cleanup: {diagnostic}");
+            }
+        }
+    }
+    Ok(code)
 }
 fn main_inner(args: &[String]) -> Res<i32> {
     let Some((command, rest)) = args.split_first() else {

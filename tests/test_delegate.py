@@ -2791,7 +2791,8 @@ db.write_text(json.dumps(units))
         self.assertEqual(result["apply"], {"ok": True, "dryRun": False})
         self.assertIs(self.outcome(self.cli("apply", "--json", "--keep", state["run"]))["acceptStillValid"], True)
         (repo / "unrelated.txt").write_text("caller edit\n")
-        self.assertIs(self.outcome(self.cli("apply", "--json", "--keep", state["run"]))["acceptStillValid"], False)
+        stale = self.outcome(self.cli("apply", "--json", "--keep", "--no-verify", state["run"]))
+        self.assertIs(stale["acceptStillValid"], False)
         self.assertEqual(counter.read_text(), "checked\n")
         dry = self.outcome(self.cli("apply", "--json", "--keep", state["run"], "--dry-run"))
         self.assertNotIn("acceptStillValid", dry)
@@ -2883,18 +2884,58 @@ db.write_text(json.dumps(units))
         self.assertIs(self.outcome(forced)["verify"]["ok"], True)
         self.assertNotIn("verify", self.outcome(self.cli("apply", "--json", "--keep", drifted["run"], "--dry-run", "--verify")))
 
-    def test_apply_verify_is_opt_in_and_validates_config(self):
+    def test_apply_verify_reruns_task_acceptance_by_default_and_validates_config(self):
         repo = self.repo({"a.txt": "old\n"})
         self.fake_pi([answer("done"), SETTLED], pre="echo new > a.txt")
-        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "echo task-check", "task"))
+        (repo / "other.txt").write_text("caller\n")  # the source moved, so acceptance does not carry over
+        result = self.outcome(self.cli("apply", "--json", "--keep", state["run"]))
+        self.assertEqual(result["verify"]["commands"], ["echo task-check"])
+        self.assertIs(result["verify"]["ok"], True)
+        (repo / ".delegate.json").write_text(json.dumps({"applyVerify": False}))
         self.assertNotIn("verify", self.outcome(self.cli("apply", "--json", "--keep", state["run"])))
         (repo / ".delegate.json").write_text(json.dumps({"applyVerify": "echo own-command"}))
         result = self.outcome(self.cli("apply", "--json", "--keep", state["run"]))
-        self.assertEqual(result["verify"]["command"], "echo own-command")
+        self.assertEqual(result["verify"]["commands"], ["echo own-command"])
         self.assertIs(result["verify"]["ok"], True)
         (repo / ".delegate.json").write_text(json.dumps({"applyVerify": 3}))
         self.assertIn("applyVerify must be", self.cli("apply", "--json", "--keep", state["run"]).stderr)
         self.assertEqual(self.cli("apply", "--json", "--keep", state["run"], "--verify", "--no-verify").returncode, 2)
+
+    def test_apply_several_runs_merges_in_order_and_verifies_once(self):
+        repo = self.repo({"a.txt": "a\n", "b.txt": "b\n"})
+        counter = self.work / "verify-count"
+        accept = f"echo x >> {counter}"
+        self.fake_pi([answer("done"), SETTLED], pre="echo A > a.txt")
+        first = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", accept, "--name", "one", "x"))
+        self.fake_pi([answer("done"), SETTLED], pre="echo B > b.txt")
+        second = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", accept, "--name", "two", "y"))
+        counter.unlink()
+        result = self.cli("apply", "one", "two", human=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(((repo / "a.txt").read_text(), (repo / "b.txt").read_text()), ("A\n", "B\n"))
+        self.assertEqual(counter.read_text(), "x\n")  # the shared acceptance ran once, on the merged tree
+        self.assertIn("合并后验收通过", result.stdout.splitlines()[-1])
+        self.assertFalse(Path(first["worktree"]).exists())
+        self.assertFalse(Path(second["worktree"]).exists())
+
+    def test_write_step_after_a_write_run_starts_from_its_changes(self):
+        repo = self.repo({"a.txt": "a\n"})
+        self.fake_pi([answer("done"), SETTLED], pre="echo A >> a.txt")
+        self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "impl", "x"))
+        self.fake_pi([answer("done"), SETTLED], pre='cat a.txt > "$PI_LOG.seen"; echo B >> a.txt')
+        step = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--after", "impl", "--name", "next", "y"))
+        self.assertEqual(step["state"], "answered")
+        self.assertEqual((self.work / "pi.log.seen").read_text(), "a\nA\n")  # impl's change was already there
+        self.assertIn("starts from the upstream", (Path(step["dir"]) / "prompt.md").read_text())
+        refused = self.cli("apply", "--json", "--keep", "next")
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn("apply", refused.stderr)
+        self.assertEqual((repo / "a.txt").read_text(), "a\n")
+        self.assertEqual(self.cli("apply", "--json", "impl").returncode, 0)
+        applied = self.cli("apply", "--json", "next")
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertEqual((repo / "a.txt").read_text(), "a\nA\nB\n")  # only next's own line on top of impl
 
     def test_a_colleague_question_waits_for_the_caller_and_its_answer_is_not_rework(self):
         repo = self.repo({"a.txt": "a\n"})

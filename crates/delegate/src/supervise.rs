@@ -576,6 +576,41 @@ fn escalate(
     write_json(run.join("meta.json"), meta)?;
     Ok(true)
 }
+/// A write step `--after` a write run starts from what that run delivered rather than
+/// from the source as it was at `start`: its base is a snapshot of the upstream worktree
+/// (or of the source, once the upstream is applied there), so its own diff and apply hold
+/// only its own changes. Returns whether the base came from the upstream worktree.
+fn stack_on_upstream(run: &Path, meta: &mut Value, upstream: &Path, prior: &Value) -> Res<bool> {
+    let tree = &meta["worktree"];
+    let up = &prior["worktree"];
+    if s(meta, "mode") != "write"
+        || !tree.is_object()
+        || tree["in"].is_string()
+        || s(prior, "mode") != "write"
+        || !up.is_object()
+        || s(up, "source") != s(tree, "source")
+    {
+        return Ok(false);
+    }
+    let path = Path::new(s(up, "path"));
+    let changed = json(upstream.join("changes.json"))["changes"]
+        .as_array()
+        .is_some_and(|c| !c.is_empty());
+    let stacked = changed && !upstream.join(".applied").exists() && path.is_dir();
+    let (source, exclude) = if stacked {
+        (path, strings(&prior["snapshotExclude"]))
+    } else {
+        (Path::new(s(tree, "source")), strings(&meta["snapshotExclude"]))
+    };
+    let base = changes::snapshot(source, run, &exclude).ok_or("cannot snapshot upstream changes")?;
+    meta["chainBase"] = base["tree"].clone();
+    meta["base"] = base;
+    if stacked {
+        meta["stackedOn"] = json!(upstream);
+    }
+    write_json(run.join("meta.json"), meta)?;
+    Ok(stacked)
+}
 fn inner(
     run: &Path,
     holder: Arc<AtomicI32>,
@@ -601,9 +636,15 @@ fn inner(
             .any(|c| (0x4e00..=0x9fff).contains(&(c as u32)));
         let patch = upstream.join("changes.patch");
         let prior = json(upstream.join("meta.json"));
+        let stacked = stack_on_upstream(run, &mut meta, &upstream, &prior)?;
         let note = if zh {
             format!(
-                "\n\n上游任务：{name}\n结局：{outcome}\n答复全文：{}{}{}\n",
+                "\n\n上游任务：{name}\n结局：{outcome}{}\n答复全文：{}{}{}\n",
+                if stacked {
+                    "\n你的工作区从上游交付的改动开始，这些改动不算你的"
+                } else {
+                    ""
+                },
                 upstream.join("result.md").display(),
                 if patch.is_file() {
                     format!("\n改动补丁：{}", patch.display())
@@ -618,7 +659,12 @@ fn inner(
             )
         } else {
             format!(
-                "\n\nUpstream task: {name}\nOutcome: {outcome}\nFull answer: {}{}{}\n",
+                "\n\nUpstream task: {name}\nOutcome: {outcome}{}\nFull answer: {}{}{}\n",
+                if stacked {
+                    "\nYour worktree starts from the upstream's delivered changes; they are not yours"
+                } else {
+                    ""
+                },
                 upstream.join("result.md").display(),
                 if patch.is_file() {
                     format!("\nChanges patch: {}", patch.display())

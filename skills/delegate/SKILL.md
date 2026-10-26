@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI。
 metadata:
-  version: "6.4.0"
+  version: "6.5.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -29,7 +29,7 @@ $D wait                                                                  # 放�
 | 看截图或设计图 | `$D start --read-only --image shot.png "…"` |
 | 改代码，测试通过才算完 | `$D start --worktree --accept "make test" "…"`；不许碰的路径加 `--protect tests/` |
 | 追问或返工 | `$D reply <name> "…"`；开新会话加 `--fresh`，带上你后来的改动加 `--sync` |
-| 先 A 后 B | `$D start --after <A> …` |
+| 先 A 后 B | `$D start --after <A> …`；写入 B 从 A 交付的改动起步，`apply A B` 按序合入 |
 | 自己跑重检查、测性能 | `$D lane make check`；测量用 `lane --measure` |
 | 看全文 / 改动 / 停掉 / 清理 | `$D result` / `$D diff` / `$D stop` / `$D clean --finished` |
 
@@ -47,6 +47,6 @@ $D wait                                                                  # 放�
 
 - 已交付表示验收通过，改法仍要看 diff；已答复没有验收，关键结论自己核实。
 - 状态为「提问」时同事卡在需要你定的点上：`$D reply <name> "<决定>"` 回答，不算返工；只有改过文件后再要求改才算。
-- 同一仓库的写入串行 `apply`，合入一批后自己跑全量检查。
+- 同一仓库的写入一次 `apply A B …` 按序合入；验收没法沿用的任务在合并后的主干重跑一次各自的验收，全量检查仍由你按批跑。
 
 状态、退出码与等待细节见 [references/reading-results.md](references/reading-results.md)；续接、并行与长时间推进见 [references/practice.md](references/practice.md)、[references/long-run.md](references/long-run.md)；run 目录见 [references/output-and-files.md](references/output-and-files.md)。

@@ -27,7 +27,7 @@ const LAUNCH: &[(&str, &str)] = &[
     ("--thinking LEVEL", "Pi thinking level override."),
     ("--allow-parallel-writes", "Allow concurrent write runs in one workdir."),
     ("--worktree", "Write in a detached git worktree seeded from the current tree; merge with apply."),
-    ("--after RUN", "Wait for RUN to finish successfully before starting this step; waiting uses no active slot."),
+    ("--after RUN", "Wait for RUN to finish successfully before starting this step; waiting uses no active slot. A write step after a write run starts from RUN's changes; apply RUN first."),
     ("--in RUN", "Read-only: review a separate snapshot of RUN's worktree after it finishes."),
 ];
 
@@ -169,14 +169,14 @@ pub fn print(command: Option<&str>) -> bool {
             ("--stat", "Show diff statistics."),
             ("--total", "Show the whole conversation, not only this run."),
         ]),
-        "apply" => ("[--merge] [--dry-run] [--verify|--no-verify] [--keep] [--json] [run]", "Merge a worktree conversation into the source working tree.", &[
-            ("run", "Run id or directory (default: last)."),
+        "apply" => ("[--merge] [--dry-run] [--verify|--no-verify] [--keep] [--json] [run ...]", "Merge worktree conversations into the source working tree, in the order given; stops at the first that fails.", &[
+            ("run", "Run ids or directories (default: last)."),
             ("--keep", "Keep the run and worktree after successful apply (default: clean this run)."),
             ("--json", "Keep the existing JSON conclusion without the human acceptance reminder."),
             ("--merge", "Write conflict markers instead of stopping."),
             ("--dry-run", "Check the merge without writing it."),
-            ("--verify", "After merging, run the repository acceptance on the merged tree unless acceptStillValid is true (default from .delegate.json applyVerify)."),
-            ("--no-verify", "Skip the post-merge acceptance even when .delegate.json enables it."),
+            ("--verify", "Rerun acceptance on the merged tree even when acceptStillValid is true. Without it, runs whose acceptance does not carry over rerun their own acceptance once, after the last merge (.delegate.json applyVerify: false turns this off, a command replaces it)."),
+            ("--no-verify", "Skip the post-merge acceptance."),
         ]),
         "lane" => ("[--label TEXT] [--measure] [command ...]", "Queue a heavy command with acceptance, evidence, worktree setup, and other machine checks. --measure uses the FIFO measurement reservation and reserved CPUs. DELEGATE_MAX_HEAVY run at once (default: 2). One argument is a shell command; no command lists the lane.", &[
             ("--label TEXT", "Label shown in the lane listing."),

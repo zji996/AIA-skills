@@ -43,6 +43,7 @@ class DelegateApplyFinishTests(unittest.TestCase):
     def test_invalid_acceptance_lists_primary_and_additional_checks(self):
         repo, state = self.task("--accept", "test -f a.txt", "--accept-also", "test -f other.txt")
         (repo / "other.txt").write_text("caller changed\n")
+        (repo / ".delegate.json").write_text('{"applyVerify": false}')
         result = self.cli("apply", state["run"], human=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         last = result.stdout.splitlines()[-1]
