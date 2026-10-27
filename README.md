@@ -24,7 +24,7 @@
 | **`openai-image-gen`** | `skills/openai-image-gen/` | **图像生成落盘**：先打草稿定构图（默认 sunburst · medium），草稿满意就直接采用，画质不够才以草稿为参考出一次正式图；相同请求与没写改动的编辑不发请求；可用 `-r` 传角色设定图等参考图（最多 8 张），草稿用过的参考图在正式图、keep 与编辑时自动沿用，文件变动会警告；每个输出文件限定草稿 3、正式 1、编辑 1 次，超出需用户同意；只返回一行 JSON；报错带错误码，内容规则拒绝要如实告知；附示意图提示词结构与审查要点。 |
 | **`scroll-gesture`** | `skills/scroll-gesture/` | **滚动手势**：`input-probe.html` 在目标环境（Windows 鼠标、远程桌面、触屏）实测滚轮与触摸事件的频率、间隔、增量与鼠标格占比，一键复制 JSON；附过界翻页等自定义手势的判断点：只停原位/接缝/邻页、两段确认防误触、按力度（带衰减的阈值）而非距离确认、弹回等待长于远控间隔、动画可打断、鼠标格缓动。 |
 | **`agent-interface-design`** | `skills/agent-interface-design/` | **模型界面设计原则**：设计或评审工具说明、工具结果与错误文字、Skill、系统段、读取方式时用：渐进式披露（分层且末行给下一层）、结果带下一步、给事实不规定顺序、前缀冻结只在尾部追加、失败分类与错误文字、顺着模型习惯、改文字先测（基线→复盘→同 seed 对照），附评审清单。 |
-| **`iteration-speed`** | `skills/iteration-speed/` | **仓库迭代速度**：新机器/仓库初始化、构建测试门禁变慢、多 worktree/Agent 并行或验收分层与模块拆分前使用；`iteration-speed detect` 只读探测生态与缓存配置，`time`/`history` 记录反馈时间，`gate` 监测门禁预算与耗时回退、汇总最慢 Cargo 测试，`step`/`steps` 逐步记录门禁耗时并在输入未变时复用通过结果，`rust-setup` 预览或备份后写入用户级 sccache/mold 配置；附 Rust、Node、Python、Go、Docker 的缓存边界与实践。 |
+| **`iteration-speed`** | `skills/iteration-speed/` | **仓库迭代速度**：新机器/仓库初始化、构建测试门禁变慢、多 worktree/Agent 并行、验收分层与模块拆分前或估算规模与压力时使用（小样本量单位成本再外推）；`iteration-speed detect` 只读探测生态与缓存配置，`time`/`history` 记录反馈时间，`gate` 监测门禁预算与耗时回退、汇总最慢 Cargo 测试，`step`/`steps` 逐步记录门禁耗时并在输入未变时复用通过结果，`rust-setup` 预览或备份后写入用户级 sccache/mold 配置；附 Rust、Node、Python、Go、Docker 的缓存边界与实践。 |
 
 `delegate` 架构总览：[docs/assets/delegate-architecture.webp](docs/assets/delegate-architecture.webp)（提示词同目录）。
 

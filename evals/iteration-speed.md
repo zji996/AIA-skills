@@ -12,6 +12,8 @@
 - Enforce a ten-minute full gate budget and warn when its duration regresses against recent successful runs.
 - 门禁只记了总时间，看不出哪一步慢；改了文档也要把数据库测试重跑一遍，能不能复用上次的结果。
 - Record each gate step and skip steps whose inputs did not change since they last passed.
+- 多用户同时处理大图纸会不会爆内存？不想造 30 MB 夹具，从几张小图换算。
+- Estimate peak memory for ten concurrent runs from per-run measurements instead of a load test.
 
 ## 不应触发
 
