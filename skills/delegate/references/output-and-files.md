@@ -79,6 +79,7 @@ worktree 移除回收 compose 容器。5.24 meta 新增 `sourceBuildBytes`、`so
 | `DELEGATE_SOURCE_BUILD_WARN_GIB` | 源仓库构建目录缓存占用提示阈值，默认 60 GiB；`0` 关闭，支持小数 |
 | `DELEGATE_WORKTREE_WARN_GIB` | 本仓库已结束 worktree 占用提示阈值，默认 20 GiB；`0` 关闭 |
 | `DELEGATE_POLL` | `wait --progress`、4.4 之前的 run 与刚启动的 supervisor 的检查间隔秒数，默认 1；其余等待不轮询 |
+| `DELEGATE_PI_BIN` | 临时指定同事可执行文件；默认 PATH 上的 `pi`（Pi 或 rpi 由 pi-kit 通道定），续做沿用上一轮的 |
 | `DELEGATE_DEFAULT_MODEL` / `DELEGATE_CHEAP_MODEL` / `DELEGATE_STRONG_MODEL` | 档位对应的 Pi 模型，覆盖配置 `tiers`；空值视为未设，回落到配置 |
 | `DELEGATE_AGENT` | 由脚本导出给同事（`pi`）；设有它的进程不能再委派 |
 | `PI_DELEGATE_ACTIVE` | 旧版标记，仍导出给 Pi；存在时视为 Pi 调用者 |

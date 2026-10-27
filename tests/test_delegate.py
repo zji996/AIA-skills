@@ -687,6 +687,47 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         self.assertEqual(state["agentBin"], meta["agentBin"])
         self.assertEqual(self.outcome(self.cli("status", state["run"]))["agentBin"], meta["agentBin"])
 
+    def test_configured_rpi_runs_and_its_reply_stays_on_rpi(self):
+        # rpi's print mode settles with a `result` line, not Pi's agent_settled.
+        self.fake_pi([answer("ok"), {"type": "result", "outcome": "completed", "finalText": "ok"}])
+        pi = self.bin / "pi"
+        # rpi takes Pi's arguments but keeps sessions one directory deeper.
+        rpi = self.work / "tools" / "rpi"
+        rpi.parent.mkdir()
+        rpi.write_text(pi.read_text().replace("fake-pi 1.0", "rpi 0.9.4")
+                       .replace('mkdir -p "$dir" && touch "$dir/t_', 'mkdir -p "$dir/--w--" && touch "$dir/--w--/t_'))
+        rpi.chmod(0o755)
+        pi.unlink()
+        self.env["DELEGATE_PI_BIN"] = str(rpi)
+        state = self.outcome(self.cli("run", "task"))
+        self.assertEqual(state["state"], "answered", state)
+        meta = json.loads((Path(state["dir"]) / "meta.json").read_text())
+        self.assertEqual(meta["agentBin"], str(rpi.resolve()))
+        self.assertEqual(meta["agentVersion"], "rpi 0.9.4")
+        # The channel changes back, yet the conversation continues on rpi.
+        del self.env["DELEGATE_PI_BIN"]
+        reply = self.outcome(self.cli("reply", "--wait", state["run"], "more"))
+        self.assertEqual(reply["state"], "answered", reply)
+        reply_meta = json.loads((Path(reply["dir"]) / "meta.json").read_text())
+        self.assertEqual(reply_meta["agentBin"], str(rpi.resolve()))
+        self.assertTrue(reply_meta["fork"].endswith(".jsonl"), reply_meta["fork"])
+        self.assertIn("--fork", Path(self.env["PI_LOG"]).read_text().splitlines()[-1])
+
+    def test_reply_after_a_round_that_saved_no_session_continues_the_one_before(self):
+        # The second call fails before it saves a session; the third continues the first.
+        self.fake_pi([answer("first"), SETTLED], [answer("broken"), SETTLED], [answer("third"), SETTLED],
+                     pre='[ "$n" -eq 2 ] && { rm -f "$dir"/t_*.jsonl; exit 1; }')
+        first = self.outcome(self.cli("run", "task"))
+        self.assertEqual(first["state"], "answered", first)
+        broken = self.outcome(self.cli("reply", "--wait", first["run"], "more"))
+        self.assertNotEqual(broken["state"], "answered", broken)
+        third = self.outcome(self.cli("reply", "--wait", broken["run"], "again"))
+        self.assertEqual(third["state"], "answered", third)
+        meta = json.loads((Path(third["dir"]) / "meta.json").read_text())
+        self.assertEqual(meta["parent"], first["run"])
+        session = json.loads((Path(first["dir"]) / "summary.json").read_text())["session"]
+        self.assertTrue(meta["fork"].endswith(f"_{session}.jsonl"), meta["fork"])
+
     def test_supervisor_startup_timeout_reaps_process_before_crashed_result(self):
         self.fake_pi([answer("late"), SETTLED])
         self.env.update(DELEGATE_TEST_SUPERVISOR_DELAY="2s", DELEGATE_TEST_STARTUP_TIMEOUT="0.2s")

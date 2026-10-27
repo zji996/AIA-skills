@@ -168,27 +168,51 @@ pub fn nesting_error() -> Option<String> {
 pub fn agent_available(agent: &str) -> bool {
     agent_bin(agent).is_some()
 }
+/// The executable the colleague runs: `pi` on PATH. pi-kit's channel decides
+/// whether that is Pi or rpi (Rust Pi, same arguments and JSON events);
+/// `DELEGATE_PI_BIN` overrides it with another name or a path (absolute or `~/`).
+pub fn pi_bin() -> String {
+    setting("PI_BIN", AGENT)
+}
+fn executable(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+/// The colleague's executable name for `agent` (the configured Pi for `pi`).
+fn bin_name(agent: &str) -> String {
+    if agent == AGENT {
+        pi_bin()
+    } else {
+        agent.to_string()
+    }
+}
 pub fn agent_bin(agent: &str) -> Option<PathBuf> {
-    env::split_paths(&env::var_os("PATH")?).find_map(|dir| {
-        let path = dir.join(agent);
-        if fs::metadata(&path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0) {
-            path.canonicalize().ok()
-        } else {
-            None
-        }
-    })
+    agent_bins(agent).into_iter().next().map(|(_, real)| real)
 }
 /// Every distinct executable named `agent` on PATH, in PATH order, as (PATH entry, real
 /// path); the first one runs. Entries are compared by real path, but reported as found,
-/// since launchers such as snap resolve to one shared binary.
+/// since launchers such as snap resolve to one shared binary. A configured path is the
+/// only candidate.
 fn agent_bins(agent: &str) -> Vec<(PathBuf, PathBuf)> {
+    let name = bin_name(agent);
+    if name.contains('/') {
+        let path = match name.strip_prefix("~/") {
+            Some(rest) => home().join(rest),
+            None => PathBuf::from(&name),
+        };
+        return path
+            .canonicalize()
+            .ok()
+            .filter(|real| executable(real))
+            .map(|real| vec![(path, real)])
+            .unwrap_or_default();
+    }
     let mut found: Vec<(PathBuf, PathBuf)> = vec![];
     let dirs = env::var_os("PATH")
         .map(|p| env::split_paths(&p).collect::<Vec<_>>())
         .unwrap_or_default();
     for dir in dirs {
-        let path = dir.join(agent);
-        if fs::metadata(&path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0) {
+        let path = dir.join(&name);
+        if executable(&path) {
             if let Ok(real) = path.canonicalize() {
                 if !found.iter().any(|(_, seen)| *seen == real) {
                     found.push((path, real));
@@ -358,7 +382,9 @@ fn filter_pi(v: &Value) -> Vec<Value> {
             json!({"e":"retry","attempt":usage(v,"attempt"),"maxAttempts":usage(v,"maxAttempts"),"errorMessage":clip(s(v,"errorMessage"),300)}),
         ],
         "compaction_start" | "compaction_end" => vec![json!({"e":kind,"reason":usage(v,"reason")})],
+        // rpi's print mode ends with `result` instead of Pi's `agent_settled`.
         "agent_settled" => vec![json!({"e":"settled"})],
+        "result" if s(v, "outcome") == "completed" => vec![json!({"e":"settled"})],
         _ => vec![],
     }
 }
@@ -412,18 +438,33 @@ fn command_pi(meta: &Value, session: Option<&str>) -> Vec<String> {
     }
     a
 }
-pub fn session_file(dir: &str, id: &str) -> Option<PathBuf> {
-    let entries = fs::read_dir(dir).ok()?;
-    let mut files = entries
-        .flatten()
-        .map(|x| x.path())
-        .filter(|x| {
-            x.file_name()
-                .is_some_and(|n| n.to_string_lossy().ends_with(&format!("_{id}.jsonl")))
-        })
-        .collect::<Vec<_>>();
+/// Session files under a run's session directory: Pi writes them there, rpi in
+/// one subdirectory per working directory.
+pub fn session_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = vec![];
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(
+                fs::read_dir(&path)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|x| x.path())
+                    .filter(|x| x.extension().is_some_and(|e| e == "jsonl")),
+            );
+        } else if path.extension().is_some_and(|e| e == "jsonl") {
+            files.push(path);
+        }
+    }
     files.sort();
-    files.pop()
+    files
+}
+pub fn session_file(dir: &str, id: &str) -> Option<PathBuf> {
+    session_files(Path::new(dir)).into_iter().rfind(|x| {
+        x.file_name()
+            .is_some_and(|n| n.to_string_lossy().ends_with(&format!("_{id}.jsonl")))
+    })
 }
 pub fn leaked(answer: &str) -> bool {
     let tail = answer
@@ -502,10 +543,7 @@ pub fn run_agent(
         Some(uuid)
     };
     let session_dir = Path::new(s(meta, "sessionDir"));
-    let known = fs::read_dir(session_dir)
-        .ok()
-        .map(|e| e.flatten().map(|x| x.path()).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let known = session_files(session_dir);
     write(Path::new(s(meta, "dir")).join("colleague.md"), COLLEAGUE)?;
     let mut args = command_pi(meta, session.as_deref());
     if !s(meta, "agentBin").is_empty() {
@@ -765,16 +803,10 @@ pub fn run_agent(
     holder.store(0, Ordering::SeqCst);
     let status = child.wait().map_err(|e| e.to_string())?;
     {
-        let mut created = fs::read_dir(session_dir)
-            .ok()
-            .map(|e| {
-                e.flatten()
-                    .map(|x| x.path())
-                    .filter(|x| !known.contains(x))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        created.sort();
+        let created = session_files(session_dir)
+            .into_iter()
+            .filter(|x| !known.contains(x))
+            .collect::<Vec<_>>();
         if let Some(p) = created.last() {
             let stem = p.file_stem().unwrap_or_default().to_string_lossy();
             let id = stem.split_once('_').map(|(_, x)| x).unwrap_or(&stem);

@@ -10,6 +10,8 @@
 
 ### 技能
 
+- `delegate` 6.6.0：同事仍是 Pi，可执行文件跟 pi-kit 通道走（`pi` 可以是 rpi），`DELEGATE_PI_BIN` 临时指定；续做沿用上一轮实际运行的可执行文件（Pi 与 rpi 会话格式不同）。会话文件也在会话目录下一层查找，rpi 打印模式的 `result` 行算作结束。结束时没留下会话的轮次不再挡住续做，续做退回它的上一轮。起因：迁往 rpi 的对比实测里，rpi 答复正确却被判失败，续做接在失败轮次上被拒。
+- pi-kit 1.6.0（`third_party/pi-kit`）：`--channel pi|rpi` 选择 `pi` 运行 Node Pi 还是 rpi；rpi 按 tag 与压缩包 SHA-256 钉住版本，与 Pi 经链接共用凭据、模型与 skills。
 - 新增 `agent-interface-design` 1.0.0：设计或评审模型可见界面（工具说明、结果与错误文字、Skill、系统段、读取方式）的七条原则与评审清单。起因：一个仓库里读图分层、头像结果附预览、CAD 图纸按页读取反复用到同一套判断，所有者要求抽成原则，跨仓库复用。
 - `iteration-speed` 1.2.1：Rust 参考补“`-p` 选包改变 feature 合并”：同一门禁里分开的 `cargo test -p` 调用会把共享 crate 各编一份；`resolver.feature-unification` 在 Cargo 1.97 仍未稳定。起因：一个仓库的数据库测试预构建 307 s，大半是同一 crate 编三遍。
 - `iteration-speed` 1.2.0：新增 `step` 与 `steps`：门禁逐步记录耗时；输入摘要取自 git 并可按路径缩小范围，`--key` 纳入工具版本等事实，同仓库同名步骤以相同输入通过过就复用，失败从不复用；记录跨 clone 与 worktree 共用，不存命令与输出。起因：一个仓库的完整门禁只有一条 869 秒的总时间，看不出慢在哪，只改文档也要全部重跑。

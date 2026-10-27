@@ -905,7 +905,8 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     if o.sync {
         let parent_name = parent.file_name().unwrap_or_default().to_string_lossy();
         if let Some(existing) = all_runs().into_iter().find(|run| {
-            s(&json(run.join("meta.json")), "parent") == parent_name && state(run) != "malformed"
+            s(&json(run.join("meta.json")), "parent") == parent_name
+                && runs::continues_conversation(run)
         }) {
             return Err(format!(
                 "{parent_name} already has a reply ({}); wait for it and reply to that",
@@ -1353,7 +1354,9 @@ pub fn launch(
         let p = parent.file_name().unwrap_or_default().to_string_lossy();
         let replies = all_runs()
             .into_iter()
-            .filter(|r| s(&json(r.join("meta.json")), "parent") == p && state(r) != "malformed")
+            .filter(|r| {
+                s(&json(r.join("meta.json")), "parent") == p && runs::continues_conversation(r)
+            })
             .collect::<Vec<_>>();
         if let Some(last) = replies.last() {
             return Err(format!(
@@ -1605,7 +1608,22 @@ pub fn launch(
         .transpose()?
         .unwrap_or(0.0);
     let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":timeout_seconds,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !b(extra,"newAfterApply") && !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
-    let (agent_bin, agent_version) = agent_identity(s(&meta, "agent"))?;
+    // A forked session continues on the executable that wrote it: Pi and rpi
+    // keep different session formats.
+    let parent_bin = s(parent, "agentBin");
+    let (agent_bin, agent_version) = if !meta["fork"].is_null() && !parent_bin.is_empty() {
+        if !Path::new(parent_bin).is_file() {
+            return Err(format!(
+                "this conversation ran on {parent_bin}, which is gone; continue with --fresh"
+            ));
+        }
+        (
+            PathBuf::from(parent_bin),
+            parent["agentVersion"].as_str().map(str::to_string),
+        )
+    } else {
+        agent_identity(s(&meta, "agent"))?
+    };
     meta["agentPinned"] = json!(o.agent_pinned);
     if let Some(command) = o.evidence.filter(|command| !command.is_empty()) {
         meta["evidenceCommand"] = json!(command);

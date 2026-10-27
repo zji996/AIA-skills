@@ -620,6 +620,23 @@ pub fn prune() {
         }
     }
 }
+/// A reply round carries the conversation on unless it was malformed or
+/// ended without saving a session (the agent failed before it wrote one);
+/// the next reply then continues from the round before it.
+pub fn continues_conversation(run: &Path) -> bool {
+    let st = state(run);
+    if st == "malformed" {
+        return false;
+    }
+    if active(&st) {
+        return true;
+    }
+    let session = s(&json(run.join("summary.json")), "session").to_string();
+    !session.is_empty()
+        && crate::agents::session_file(s(&json(run.join("meta.json")), "sessionDir"), &session)
+            .is_some()
+}
+
 pub fn latest(mut run: PathBuf) -> PathBuf {
     loop {
         let mut replies = all_runs()
@@ -627,13 +644,24 @@ pub fn latest(mut run: PathBuf) -> PathBuf {
             .filter(|r| {
                 s(&json(r.join("meta.json")), "parent")
                     == run.file_name().unwrap_or_default().to_string_lossy()
-                    && state(r) != "malformed"
+                    && continues_conversation(r)
             })
             .collect::<Vec<_>>();
         if let Some(next) = replies.pop() {
             run = next;
-        } else {
-            return run;
+            continue;
         }
+        // Naming a round that saved no session continues the round before it.
+        while !continues_conversation(&run) {
+            let parent = s(&json(run.join("meta.json")), "parent").to_string();
+            match (!parent.is_empty())
+                .then(|| resolve(&parent).ok())
+                .flatten()
+            {
+                Some(previous) => run = previous,
+                None => break,
+            }
+        }
+        return run;
     }
 }

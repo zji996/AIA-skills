@@ -2,9 +2,9 @@
 name: delegate
 description: 把可独立验收的任务交给同事 Agent 在后台并行完成，你只收结果并把关。遇到这些情况时主动使用，不必等用户开口：要读很多文件但只需结论；改动前想要第二意见或独立审查；有两个以上互不依赖、能用命令验收的子任务；需要有人看截图或设计图给意见。同事都是 Pi，按档位选模型：默认档（未配则强档）接日常读写，强档写代码与严密审查，便宜档只读（侦察、摘要、文案、看图）；失败自动换强档模型重跑。脚本代跑验收命令，只给一行结论与下一步，过程不进主控上下文；整机与仓库容量、重检查有上限。Use to delegate or parallelize work proactively to Pi colleagues, and to get a second opinion, code review or image review from another model, judged by results.
 license: MIT
-compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI。
+compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI（pi-kit 的 rpi 通道下 `pi` 即 rpi）。
 metadata:
-  version: "6.5.0"
+  version: "6.6.0"
   binary: delegate
   exclude-agents: pi
 ---

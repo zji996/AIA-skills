@@ -279,11 +279,11 @@ Pi：
 pi (--session-id <uuid> | --fork <上一轮会话副本>) --session-dir <run>/session --mode json
    [--provider P] [--model M] [--thinking T] [--tools read,grep,find,ls（仅无法隔离的只读）] -p [@<图片>...]   # stdin: prompt.md
 ```
-进程工作目录为 workdir，独立进程组。用户 systemd 可用时，同事、每条 setup 与验收命令分别在 `systemd-run --user --scope --quiet --collect` 创建的 scope 内运行；supervisor 不在 scope 内。启动时探测一次，失败或 `DELEGATE_CGROUP=0`（也接受 `PI_DELEGATE_CGROUP=0`）则沿用进程组及环境标记回收。环境：去掉 §12 的保护变量，叠加 `.delegate.json` 的 `env`，再设 `DELEGATE_AGENT`、`DELEGATE_RUN_DIR` 与 `PI_DELEGATE_ACTIVE=1`。
+进程工作目录为 workdir，独立进程组。用户 systemd 可用时，同事、每条 setup 与验收命令分别在 `systemd-run --user --scope --quiet --collect` 创建的 scope 内运行；supervisor 不在 scope 内。启动时探测一次，失败或 `DELEGATE_CGROUP=0`则沿用进程组及环境标记回收。环境：去掉 §12 的保护变量，叠加 `.delegate.json` 的 `env`，再设 `DELEGATE_AGENT`、`DELEGATE_RUN_DIR` 与 `PI_DELEGATE_ACTIVE=1`。
 
 ### 7.2 事件
 
-同事的 JSON 流被过滤为 `events.jsonl` 的紧凑事件，每条带 `attempt` 与 `at`（UTC，`%Y-%m-%dT%H:%M:%SZ`）：`session{id}`、`bash{cmd}`、`bash_done{ok}`、`read|edit|write{path}`、`tool{tool,arg}`、`tool_error{tool,detail}`、`turn{provider,model,stopReason,usage}`、`result{text}`、`turn_error{detail}`、`warning{detail}`、`retry`、`rerun`、`compaction_start|end`、`settled`、`queue{ahead}`（验收排队）。不记录编辑全文。
+同事的 JSON 流被过滤为 `events.jsonl` 的紧凑事件，每条带 `attempt` 与 `at`（UTC，`%Y-%m-%dT%H:%M:%SZ`）：`session{id}`、`bash{cmd}`、`bash_done{ok}`、`read|edit|write{path}`、`tool{tool,arg}`、`tool_error{tool,detail}`、`turn{provider,model,stopReason,usage}`、`result{text}`、`turn_error{detail}`、`warning{detail}`、`retry`、`rerun`、`compaction_start|end`、`settled`（rpi 为 `result{outcome:"completed"}`）、`queue{ahead}`（验收排队）。不记录编辑全文。
 
 ### 7.3 附加约定（必须保持语义）
 
@@ -297,7 +297,7 @@ pi (--session-id <uuid> | --fork <上一轮会话副本>) --session-dir <run>/se
 
 ### 7.4 reply（必须）
 
-接在对话**最新一轮**之后（结局为 `malformed` 的轮次跳过）；可用 `--tier` 换成该档模型（同一会话），否则同一模型、workdir、worktree、mode、env、provider/thinking、retries。每次尝试都从上一轮会话**分叉**（会话文件副本 `--fork`），上一轮会话永不改动。`--fresh` 开新会话但留在同一对话与 worktree。同一轮已有进行中的 reply 时拒绝。
+接在对话**最新一轮**之后（跳过 `malformed` 与无会话的轮次）；可用 `--tier` 换成该档模型（同一会话），否则同一模型、workdir、worktree、mode、env、provider/thinking、retries。每次尝试都从上一轮会话**分叉**（会话文件副本 `--fork`），上一轮会话永不改动。`--fresh` 开新会话但留在同一对话与 worktree。同一轮已有进行中的 reply 时拒绝。
 
 默认像 `start` 一样立即输出启动状态；`--wait` 像 `run` 一样收取结论与答复，`--max`/`--progress`/`--full` 仅可与 `--wait` 同用。`--sync` 在返回启动状态前完成，冲突时不启动。
 
