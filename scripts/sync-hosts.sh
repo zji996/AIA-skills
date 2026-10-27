@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Update AIA-skills on other machines over SSH: fast-forward their checkout and rerun install.sh,
-# which also fetches the binaries matching the new bin.sha256. Hosts run in parallel; one line each.
+# Update AIA-skills on other machines over SSH: fast-forward their checkout and submodules, rerun
+# install.sh (which also fetches the binaries matching the new bin.sha256) and, on rpi-channel hosts,
+# pi-kit's pinned rpi. Hosts run in parallel; one line each.
 #
 #   sync-hosts.sh [--dir <remote path>] [<user@host>...] [-- <install.sh args>]
 #
@@ -33,7 +34,10 @@ expected=$(git -C "$(dirname "$0")/.." rev-parse --short origin/main 2>/dev/null
 quoted_args=""
 ((${#install_args[@]})) && quoted_args=$(printf ' %q' "${install_args[@]}")
 # The remote side prints its HEAD and the delegate version last, so the summary can show them.
-remote="set -e; cd $remote_dir; git pull --ff-only -q; ./scripts/install.sh$quoted_args >/dev/null;
+# Submodules follow the pull; an rpi-channel host also installs pi-kit's newly pinned rpi.
+remote="set -e; cd $remote_dir; git pull --ff-only -q; git submodule update --init -q;
+./scripts/install.sh$quoted_args >/dev/null;
+if [ \"\$(cat ~/.config/pi-kit/channel 2>/dev/null)\" = rpi ]; then sh third_party/pi-kit/install.sh --channel rpi >/dev/null; fi;
 echo \"\$(git rev-parse --short HEAD) \$(skills/delegate/bin/delegate --version 2>/dev/null || echo 'delegate missing')\""
 
 logs=$(mktemp -d)
