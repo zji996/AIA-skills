@@ -1,8 +1,8 @@
 ---
 name: iteration-speed
-description: 新机器或新仓库初始化、构建/测试/门禁变慢、设置门禁预算、多个 worktree 或 Agent 并行开发、决定验收分层或模块拆分、估算规模与压力时使用；测量反馈回路、监测门禁预算、探测缓存并配置用户级 Rust 加速。Use when initializing a machine/repository, diagnosing slow build/test gates, enforcing gate budgets, sharing caches across worktrees or parallel agents, choosing validation layers and module boundaries, or estimating scale and load from small varied samples.
+description: 新机器或新仓库初始化、构建/测试/门禁变慢、设置门禁预算、多个 worktree 或 Agent 并行开发、决定验收分层或模块拆分、估算规模与压力或设代码量预算时使用；测量反馈回路、监测门禁预算、探测缓存并配置用户级 Rust 加速。Use when initializing a machine/repository, diagnosing slow build/test gates, enforcing gate budgets, sharing caches across worktrees or parallel agents, choosing validation layers and module boundaries, estimating scale and load from small varied samples, or setting a code-size budget.
 metadata:
-  version: "1.3.0"
+  version: "1.4.0"
 ---
 
 # 仓库迭代速度
@@ -20,6 +20,7 @@ metadata:
 7. **门禁预算**：完整门禁设耗时预算，用 `gate` 跑；超预算即排优化，先量最慢的步骤或测试，再按上述判断点改动并复测。
 8. **能读就不重跑**：门禁的每一步都用 `step` 包起来，耗时逐步留档；输入与上次通过时相同的步骤直接复用结果。只有总时间、没有分步记录时，无法判断慢在哪。
 9. **规模靠外推**：容量与压力先在少量、多样的小样本上量单位成本（每 MB、每实体、每请求、每个并发），样本标明自身规模，从几个规模点看出增长形状后换算到目标规模与并发。换算会跨过已知阈值（内存上限、缓存容量、锁或队列饱和、超线性算法）时，只在阈值附近验证一次；不为压测造巨型夹具或常驻 N 路并发测试。
+10. **代码量按增量清理**：代码预算设成「上次清理后的行数 + 增量」，不设固定总量也不按日增（AI 开发快，日增只反映速度）。超出时在下批功能前清理一轮（先只读侦察核实零引用、重复测试与旧兼容层，再按文件互斥改），合入后把基线改成清理后的行数；清不出多少也照样重设基线，增长本身是要的就不硬压。
 
 ## 工具与按需参考
 

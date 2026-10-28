@@ -14,6 +14,8 @@
 - Record each gate step and skip steps whose inputs did not change since they last passed.
 - 多用户同时处理大图纸会不会爆内存？不想造 30 MB 夹具，从几张小图换算。
 - Estimate peak memory for ten concurrent runs from per-run measurements instead of a load test.
+- 代码行数超了预算，清理一轮只减几百行，预算该怎么定才不每次都卡住？
+- Set a code-size budget that triggers a cleanup after each 20k lines of growth and rebases afterwards.
 
 ## 不应触发
 
