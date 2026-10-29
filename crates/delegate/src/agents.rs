@@ -38,17 +38,28 @@ pub const ALL_TIERS: [&str; 3] = ["default", "cheap", "strong"];
 /// Pi's own default from its settings.json. A tier may be a rule list, resolved
 /// at the local time of the call (start, reply, `tiers`).
 pub fn tier_model(config: &Value, tier: &str) -> String {
-    let configured = resolve_tier(&config["tiers"][tier], local_minute());
+    let configured = resolve_tier(&config["tiers"][tier], local_clock());
     setting(&format!("{}_MODEL", tier.to_uppercase()), &configured)
 }
 
-/// Minutes since local midnight, the clock tier rules read.
-pub fn local_minute() -> u32 {
-    let (h, m) = format_time(true, "%H:%M")
+/// The local weekday (1 = Monday … 7 = Sunday) and minutes since midnight, the clock tier rules read.
+#[derive(Clone, Copy)]
+pub struct Clock {
+    pub weekday: u32,
+    pub minute: u32,
+}
+
+pub fn local_clock() -> Clock {
+    let now = format_time(true, "%u %H:%M");
+    let (day, time) = now.split_once(' ').unwrap_or(("1", "00:00"));
+    let (h, m) = time
         .split_once(':')
         .map(|(h, m)| (h.parse().unwrap_or(0), m.parse().unwrap_or(0)))
         .unwrap_or((0, 0));
-    h * 60 + m
+    Clock {
+        weekday: day.parse().unwrap_or(1),
+        minute: h * 60 + m,
+    }
 }
 
 /// `"HH:MM-HH:MM"` as minutes; the end is exclusive and may wrap past midnight.
@@ -63,20 +74,60 @@ pub fn parse_hours(hours: &str) -> Option<(u32, u32)> {
     (start != end).then_some((start, end))
 }
 
-/// A tier is a model string, or rules tried in order: `{"model", "hours"}`
-/// matches inside its local window, a plain string always matches.
-pub fn resolve_tier(value: &Value, minute: u32) -> String {
+/// One or more windows joined by commas, e.g. `"09:00-12:00,14:00-18:00"`.
+pub fn parse_windows(hours: &str) -> Option<Vec<(u32, u32)>> {
+    hours.split(',').map(parse_hours).collect()
+}
+
+const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
+/// Weekdays as a set of 1 (Monday) … 7: `"mon-fri"`, `"sat,sun"`, or both mixed.
+pub fn parse_days(days: &str) -> Option<Vec<u32>> {
+    let day = |d: &str| {
+        DAYS.iter()
+            .position(|name| *name == d.trim())
+            .map(|i| i as u32 + 1)
+    };
+    let mut set = Vec::new();
+    for part in days.split(',') {
+        match part.split_once('-') {
+            Some((from, to)) => {
+                let (from, to) = (day(from)?, day(to)?);
+                if from > to {
+                    return None;
+                }
+                set.extend(from..=to);
+            }
+            None => set.push(day(part)?),
+        }
+    }
+    Some(set)
+}
+
+/// A tier is a model string, or rules tried in order: `{"model", "days"?, "hours"?}`
+/// matches when the local day and time fall inside it, a plain string always matches.
+/// A window that wraps midnight counts against the day it started on only for its first part.
+pub fn resolve_tier(value: &Value, now: Clock) -> String {
     if let Some(model) = value.as_str() {
         return model.to_string();
     }
     let within = |hours: &str| {
-        parse_hours(hours).is_some_and(|(start, end)| {
-            if start < end {
-                (start..end).contains(&minute)
-            } else {
-                minute >= start || minute < end
-            }
+        parse_windows(hours).is_some_and(|windows| {
+            windows.iter().any(|&(start, end)| {
+                if start < end {
+                    (start..end).contains(&now.minute)
+                } else {
+                    now.minute >= start || now.minute < end
+                }
+            })
         })
+    };
+    let matches = |rule: &Value| {
+        let day = rule["days"]
+            .as_str()
+            .is_none_or(|days| parse_days(days).is_some_and(|set| set.contains(&now.weekday)));
+        let time = rule["hours"].as_str().is_none_or(within);
+        day && time
     };
     value
         .as_array()
@@ -84,13 +135,12 @@ pub fn resolve_tier(value: &Value, minute: u32) -> String {
         .flatten()
         .find_map(|rule| match rule {
             Value::String(model) => Some(model.clone()),
-            _ => within(rule["hours"].as_str().unwrap_or(""))
-                .then(|| rule["model"].as_str().unwrap_or("").to_string()),
+            _ => matches(rule).then(|| rule["model"].as_str().unwrap_or("").to_string()),
         })
         .unwrap_or_default()
 }
 
-/// A rule list as one line for `delegate tiers`, e.g. `00:30-08:30 a, else b`.
+/// A rule list as one line for `delegate tiers`, e.g. `mon-fri 09:00-12:00 a, else b`.
 pub fn describe_tier(value: &Value) -> Option<String> {
     let rules = value.as_array()?;
     Some(
@@ -98,7 +148,13 @@ pub fn describe_tier(value: &Value) -> Option<String> {
             .iter()
             .map(|rule| match rule.as_str() {
                 Some(model) => format!("else {model}"),
-                None => format!("{} {}", s(rule, "hours"), s(rule, "model")),
+                None => {
+                    let when = [rule["days"].as_str(), rule["hours"].as_str()]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>();
+                    format!("{} {}", when.join(" "), s(rule, "model"))
+                }
             })
             .collect::<Vec<_>>()
             .join(", "),
@@ -920,16 +976,48 @@ mod tests {
 
     #[test]
     fn tier_rules_pick_the_first_window_that_holds_the_minute() {
+        let at = |weekday, minute| Clock { weekday, minute };
         let rules = json!([{"model": "ds", "hours": "00:30-08:30"}, {"model": "night", "hours": "22:00-00:30"}, "gpt"]);
-        assert_eq!(resolve_tier(&rules, 30), "ds");
-        assert_eq!(resolve_tier(&rules, 8 * 60 + 29), "ds");
-        assert_eq!(resolve_tier(&rules, 8 * 60 + 30), "gpt");
-        assert_eq!(resolve_tier(&rules, 23 * 60), "night");
-        assert_eq!(resolve_tier(&rules, 0), "night");
-        assert_eq!(resolve_tier(&json!("plain"), 0), "plain");
+        assert_eq!(resolve_tier(&rules, at(1, 30)), "ds");
+        assert_eq!(resolve_tier(&rules, at(1, 8 * 60 + 29)), "ds");
+        assert_eq!(resolve_tier(&rules, at(1, 8 * 60 + 30)), "gpt");
+        assert_eq!(resolve_tier(&rules, at(1, 23 * 60)), "night");
+        assert_eq!(resolve_tier(&rules, at(1, 0)), "night");
+        assert_eq!(resolve_tier(&json!("plain"), at(1, 0)), "plain");
         assert_eq!(parse_hours("8:30-09:00"), None);
         assert_eq!(parse_hours("09:00-09:00"), None);
-        assert_eq!(describe_tier(&rules).unwrap(), "00:30-08:30 ds, 22:00-00:30 night, else gpt");
+        assert_eq!(
+            describe_tier(&rules).unwrap(),
+            "00:30-08:30 ds, 22:00-00:30 night, else gpt"
+        );
+    }
+
+    #[test]
+    fn tier_rules_read_weekdays_and_several_windows() {
+        let at = |weekday, minute| Clock { weekday, minute };
+        // DeepSeek's peak: weekdays 09:00-12:00 and 14:00-18:00 Beijing time.
+        let rules =
+            json!([{"model": "gpt", "days": "mon-fri", "hours": "09:00-12:00,14:00-18:00"}, "ds"]);
+        assert_eq!(resolve_tier(&rules, at(1, 9 * 60)), "gpt");
+        assert_eq!(resolve_tier(&rules, at(5, 17 * 60 + 59)), "gpt");
+        assert_eq!(resolve_tier(&rules, at(3, 12 * 60 + 30)), "ds");
+        assert_eq!(resolve_tier(&rules, at(5, 18 * 60)), "ds");
+        assert_eq!(resolve_tier(&rules, at(6, 10 * 60)), "ds");
+        assert_eq!(resolve_tier(&rules, at(7, 15 * 60)), "ds");
+        assert_eq!(
+            resolve_tier(
+                &json!([{"model": "weekend", "days": "sat,sun"}, "x"]),
+                at(7, 0)
+            ),
+            "weekend"
+        );
+        assert_eq!(parse_days("fri-mon"), None);
+        assert_eq!(parse_days("mon,fri-sun"), Some(vec![1, 5, 6, 7]));
+        assert_eq!(parse_windows("09:00-12:00,9-10"), None);
+        assert_eq!(
+            describe_tier(&rules).unwrap(),
+            "mon-fri 09:00-12:00,14:00-18:00 gpt, else ds"
+        );
     }
 
     #[test]

@@ -425,19 +425,24 @@ pub fn context_capacity(run: Option<&Path>) -> Res<Value> {
 }
 
 /// A tier is a model pattern, or rules ending in a plain model that always matches:
-/// `[{"model": "...", "hours": "00:30-08:30"}, "fallback"]` (local time).
+/// `[{"model": "...", "days": "mon-fri", "hours": "09:00-12:00,14:00-18:00"}, "fallback"]` (local time).
 fn validate_tier(tier: &str, value: &Value) -> Result<(), String> {
-    let model = |m: &Value| m.as_str().is_some_and(|m| !m.is_empty() && !m.contains('\0'));
+    let model = |m: &Value| {
+        m.as_str()
+            .is_some_and(|m| !m.is_empty() && !m.contains('\0'))
+    };
     if value.is_string() {
         return if model(value) || value.as_str() == Some("") {
             Ok(())
         } else {
-            Err(format!("tiers.{tier} must be a Pi model pattern string (provider/id[:thinking])"))
+            Err(format!(
+                "tiers.{tier} must be a Pi model pattern string (provider/id[:thinking])"
+            ))
         };
     }
-    let rules = value.as_array().ok_or_else(|| {
-        format!("tiers.{tier} must be a Pi model pattern string or a rule list")
-    })?;
+    let rules = value
+        .as_array()
+        .ok_or_else(|| format!("tiers.{tier} must be a Pi model pattern string or a rule list"))?;
     if !rules.last().is_some_and(model) {
         return Err(format!(
             "tiers.{tier}: a rule list ends with a plain model string used outside every window"
@@ -446,16 +451,27 @@ fn validate_tier(tier: &str, value: &Value) -> Result<(), String> {
     for (index, rule) in rules.iter().enumerate() {
         if rule.is_string() {
             if !model(rule) || index + 1 != rules.len() {
-                return Err(format!("tiers.{tier}[{index}]: only the last rule may be a plain model string"));
+                return Err(format!(
+                    "tiers.{tier}[{index}]: only the last rule may be a plain model string"
+                ));
             }
             continue;
         }
+        let field = |key: &str, valid: &dyn Fn(&str) -> bool| match &rule[key] {
+            Value::Null => true,
+            value => value.as_str().is_some_and(valid),
+        };
         if !model(&rule["model"])
-            || rule.as_object().is_none_or(|o| o.keys().any(|k| k != "model" && k != "hours"))
-            || crate::agents::parse_hours(rule["hours"].as_str().unwrap_or("")).is_none()
+            || rule.as_object().is_none_or(|o| {
+                o.keys()
+                    .any(|k| !["model", "days", "hours"].contains(&k.as_str()))
+            })
+            || (rule["days"].is_null() && rule["hours"].is_null())
+            || !field("days", &|d| crate::agents::parse_days(d).is_some())
+            || !field("hours", &|h| crate::agents::parse_windows(h).is_some())
         {
             return Err(format!(
-                "tiers.{tier}[{index}] must be {{\"model\": \"provider/id[:thinking]\", \"hours\": \"HH:MM-HH:MM\"}} (local time, end exclusive, may wrap midnight)"
+                "tiers.{tier}[{index}] must be {{\"model\": \"provider/id[:thinking]\", \"days\": \"mon-fri\", \"hours\": \"09:00-12:00,14:00-18:00\"}} with days, hours or both (local time; hours end exclusive and may wrap midnight)"
             ));
         }
     }

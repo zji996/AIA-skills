@@ -1752,6 +1752,9 @@ db.write_text(json.dumps(units))
         self.assertIn("ends with a plain model", self.cli("run", "--read-only", "task").stderr)
         self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": [{"model": "p/m", "hours": "8:30-9:00"}, "p/m"]}})
         self.assertIn("tiers.strong[0]", self.cli("run", "--read-only", "task").stderr)
+        for rule in ({"model": "p/m"}, {"model": "p/m", "days": "fri-mon"}):
+            self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": [rule, "p/m"]}})
+            self.assertIn("tiers.strong[0]", self.cli("run", "--read-only", "task").stderr)
 
     def test_repository_tiers_override_per_tier_and_unset_default_falls_back(self):
         self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/m"}})
