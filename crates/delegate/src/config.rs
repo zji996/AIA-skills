@@ -425,7 +425,8 @@ pub fn context_capacity(run: Option<&Path>) -> Res<Value> {
 }
 
 /// A tier is a model pattern, or rules ending in a plain model that always matches:
-/// `[{"model": "...", "days": "mon-fri", "hours": "09:00-12:00,14:00-18:00"}, "fallback"]` (local time).
+/// `[{"model": "...", "days": "mon-fri", "hours": "09:00-12:00,14:00-18:00"}, "fallback"]` (local time);
+/// a rule's `maxActive` caps how many runs on this machine use its model before later rules take over.
 fn validate_tier(tier: &str, value: &Value) -> Result<(), String> {
     let model = |m: &Value| {
         m.as_str()
@@ -464,14 +465,15 @@ fn validate_tier(tier: &str, value: &Value) -> Result<(), String> {
         if !model(&rule["model"])
             || rule.as_object().is_none_or(|o| {
                 o.keys()
-                    .any(|k| !["model", "days", "hours"].contains(&k.as_str()))
+                    .any(|k| !["model", "days", "hours", "maxActive"].contains(&k.as_str()))
             })
-            || (rule["days"].is_null() && rule["hours"].is_null())
+            || (rule["days"].is_null() && rule["hours"].is_null() && rule["maxActive"].is_null())
+            || !(rule["maxActive"].is_null() || rule["maxActive"].as_u64().is_some_and(|n| n > 0))
             || !field("days", &|d| crate::agents::parse_days(d).is_some())
             || !field("hours", &|h| crate::agents::parse_windows(h).is_some())
         {
             return Err(format!(
-                "tiers.{tier}[{index}] must be {{\"model\": \"provider/id[:thinking]\", \"days\": \"mon-fri\", \"hours\": \"09:00-12:00,14:00-18:00\"}} with days, hours or both (local time; hours end exclusive and may wrap midnight)"
+                "tiers.{tier}[{index}] must be {{\"model\": \"provider/id[:thinking]\", \"days\": \"mon-fri\", \"hours\": \"09:00-12:00,14:00-18:00\", \"maxActive\": 5}} with at least one of days, hours, maxActive (local time; hours end exclusive and may wrap midnight; maxActive a positive integer counting runs on this machine)"
             ));
         }
     }

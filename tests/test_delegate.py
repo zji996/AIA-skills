@@ -1752,9 +1752,26 @@ db.write_text(json.dumps(units))
         self.assertIn("ends with a plain model", self.cli("run", "--read-only", "task").stderr)
         self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": [{"model": "p/m", "hours": "8:30-9:00"}, "p/m"]}})
         self.assertIn("tiers.strong[0]", self.cli("run", "--read-only", "task").stderr)
-        for rule in ({"model": "p/m"}, {"model": "p/m", "days": "fri-mon"}):
+        for rule in ({"model": "p/m"}, {"model": "p/m", "days": "fri-mon"}, {"model": "p/m", "maxActive": 0}):
             self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": [rule, "p/m"]}})
             self.assertIn("tiers.strong[0]", self.cli("run", "--read-only", "task").stderr)
+
+    def test_tier_rule_max_active_sends_later_starts_to_the_next_model(self):
+        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": [{"model": "p/m", "maxActive": 2}, "p/strong-m"]}})
+        gate = self.work / "gate"
+        self.fake_pi([answer("ok"), SETTLED], pre=f"while [ ! -f {gate} ]; do sleep .02; done")
+        models = []
+        for index in range(3):
+            state = self.outcome(self.cli("start", "--read-only", "--name", f"cap{index}", "task"))
+            self.addCleanup(self.cli, "stop", state["run"])
+            models.append(json.loads((Path(state["dir"]) / "meta.json").read_text())["model"])
+        self.assertEqual(models, ["p/m", "p/m", "p/strong-m"])
+        self.assertIn("rules: <2 running p/m, else p/strong-m", self.cli("tiers").stdout)
+        gate.touch()
+        for index in range(3):
+            self.assertEqual(self.cli("wait", f"cap{index}").returncode, 0)
+        state = self.outcome(self.cli("run", "--read-only", "task"))  # the places are free again
+        self.assertIn("--model p/m", (self.work / "pi.log").read_text().splitlines()[-1])
 
     def test_repository_tiers_override_per_tier_and_unset_default_falls_back(self):
         self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/m"}})

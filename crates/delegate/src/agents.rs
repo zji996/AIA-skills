@@ -38,7 +38,13 @@ pub const ALL_TIERS: [&str; 3] = ["default", "cheap", "strong"];
 /// Pi's own default from its settings.json. A tier may be a rule list, resolved
 /// at the local time of the call (start, reply, `tiers`).
 pub fn tier_model(config: &Value, tier: &str) -> String {
-    let configured = resolve_tier(&config["tiers"][tier], local_clock());
+    tier_model_with(config, tier, &|_| 0)
+}
+
+/// `tier_model` given how many runs on this machine already use each model, which
+/// rules with `maxActive` read; `start` asks under the machine start lock.
+pub fn tier_model_with(config: &Value, tier: &str, running: &dyn Fn(&str) -> usize) -> String {
+    let configured = resolve_tier(&config["tiers"][tier], local_clock(), running);
     setting(&format!("{}_MODEL", tier.to_uppercase()), &configured)
 }
 
@@ -104,10 +110,11 @@ pub fn parse_days(days: &str) -> Option<Vec<u32>> {
     Some(set)
 }
 
-/// A tier is a model string, or rules tried in order: `{"model", "days"?, "hours"?}`
-/// matches when the local day and time fall inside it, a plain string always matches.
+/// A tier is a model string, or rules tried in order: `{"model", "days"?, "hours"?, "maxActive"?}`
+/// matches when the local day and time fall inside it and fewer than `maxActive` runs on this
+/// machine use its model; a plain string always matches.
 /// A window that wraps midnight counts against the day it started on only for its first part.
-pub fn resolve_tier(value: &Value, now: Clock) -> String {
+pub fn resolve_tier(value: &Value, now: Clock, running: &dyn Fn(&str) -> usize) -> String {
     if let Some(model) = value.as_str() {
         return model.to_string();
     }
@@ -127,7 +134,10 @@ pub fn resolve_tier(value: &Value, now: Clock) -> String {
             .as_str()
             .is_none_or(|days| parse_days(days).is_some_and(|set| set.contains(&now.weekday)));
         let time = rule["hours"].as_str().is_none_or(within);
-        day && time
+        let room = rule["maxActive"]
+            .as_u64()
+            .is_none_or(|cap| (running(s(rule, "model")) as u64) < cap);
+        day && time && room
     };
     value
         .as_array()
@@ -149,10 +159,15 @@ pub fn describe_tier(value: &Value) -> Option<String> {
             .map(|rule| match rule.as_str() {
                 Some(model) => format!("else {model}"),
                 None => {
-                    let when = [rule["days"].as_str(), rule["hours"].as_str()]
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>();
+                    let cap = rule["maxActive"].as_u64().map(|n| format!("<{n} running"));
+                    let when = [
+                        rule["days"].as_str(),
+                        rule["hours"].as_str(),
+                        cap.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
                     format!("{} {}", when.join(" "), s(rule, "model"))
                 }
             })
@@ -978,12 +993,12 @@ mod tests {
     fn tier_rules_pick_the_first_window_that_holds_the_minute() {
         let at = |weekday, minute| Clock { weekday, minute };
         let rules = json!([{"model": "ds", "hours": "00:30-08:30"}, {"model": "night", "hours": "22:00-00:30"}, "gpt"]);
-        assert_eq!(resolve_tier(&rules, at(1, 30)), "ds");
-        assert_eq!(resolve_tier(&rules, at(1, 8 * 60 + 29)), "ds");
-        assert_eq!(resolve_tier(&rules, at(1, 8 * 60 + 30)), "gpt");
-        assert_eq!(resolve_tier(&rules, at(1, 23 * 60)), "night");
-        assert_eq!(resolve_tier(&rules, at(1, 0)), "night");
-        assert_eq!(resolve_tier(&json!("plain"), at(1, 0)), "plain");
+        assert_eq!(resolve_tier(&rules, at(1, 30), &|_| 0), "ds");
+        assert_eq!(resolve_tier(&rules, at(1, 8 * 60 + 29), &|_| 0), "ds");
+        assert_eq!(resolve_tier(&rules, at(1, 8 * 60 + 30), &|_| 0), "gpt");
+        assert_eq!(resolve_tier(&rules, at(1, 23 * 60), &|_| 0), "night");
+        assert_eq!(resolve_tier(&rules, at(1, 0), &|_| 0), "night");
+        assert_eq!(resolve_tier(&json!("plain"), at(1, 0), &|_| 0), "plain");
         assert_eq!(parse_hours("8:30-09:00"), None);
         assert_eq!(parse_hours("09:00-09:00"), None);
         assert_eq!(
@@ -998,16 +1013,17 @@ mod tests {
         // DeepSeek's peak: weekdays 09:00-12:00 and 14:00-18:00 Beijing time.
         let rules =
             json!([{"model": "gpt", "days": "mon-fri", "hours": "09:00-12:00,14:00-18:00"}, "ds"]);
-        assert_eq!(resolve_tier(&rules, at(1, 9 * 60)), "gpt");
-        assert_eq!(resolve_tier(&rules, at(5, 17 * 60 + 59)), "gpt");
-        assert_eq!(resolve_tier(&rules, at(3, 12 * 60 + 30)), "ds");
-        assert_eq!(resolve_tier(&rules, at(5, 18 * 60)), "ds");
-        assert_eq!(resolve_tier(&rules, at(6, 10 * 60)), "ds");
-        assert_eq!(resolve_tier(&rules, at(7, 15 * 60)), "ds");
+        assert_eq!(resolve_tier(&rules, at(1, 9 * 60), &|_| 0), "gpt");
+        assert_eq!(resolve_tier(&rules, at(5, 17 * 60 + 59), &|_| 0), "gpt");
+        assert_eq!(resolve_tier(&rules, at(3, 12 * 60 + 30), &|_| 0), "ds");
+        assert_eq!(resolve_tier(&rules, at(5, 18 * 60), &|_| 0), "ds");
+        assert_eq!(resolve_tier(&rules, at(6, 10 * 60), &|_| 0), "ds");
+        assert_eq!(resolve_tier(&rules, at(7, 15 * 60), &|_| 0), "ds");
         assert_eq!(
             resolve_tier(
                 &json!([{"model": "weekend", "days": "sat,sun"}, "x"]),
-                at(7, 0)
+                at(7, 0),
+                &|_| 0
             ),
             "weekend"
         );
@@ -1017,6 +1033,28 @@ mod tests {
         assert_eq!(
             describe_tier(&rules).unwrap(),
             "mon-fri 09:00-12:00,14:00-18:00 gpt, else ds"
+        );
+    }
+
+    #[test]
+    fn tier_rules_skip_a_model_at_its_max_active() {
+        let at = |weekday, minute| Clock { weekday, minute };
+        let rules = json!([
+            {"model": "spot", "maxActive": 5},
+            {"model": "gpt", "days": "mon-fri", "hours": "09:00-12:00,14:00-18:00"},
+            "ds"
+        ]);
+        let running = |busy: usize| move |model: &str| if model == "spot" { busy } else { 9 };
+        assert_eq!(resolve_tier(&rules, at(1, 10 * 60), &running(4)), "spot");
+        assert_eq!(resolve_tier(&rules, at(1, 10 * 60), &running(5)), "gpt");
+        assert_eq!(resolve_tier(&rules, at(6, 10 * 60), &running(5)), "ds");
+        // A capped rule may also carry a window; both must hold.
+        let night = json!([{"model": "spot", "hours": "20:00-08:00", "maxActive": 2}, "ds"]);
+        assert_eq!(resolve_tier(&night, at(1, 21 * 60), &running(1)), "spot");
+        assert_eq!(resolve_tier(&night, at(1, 12 * 60), &running(0)), "ds");
+        assert_eq!(
+            describe_tier(&rules).unwrap(),
+            "<5 running spot, mon-fri 09:00-12:00,14:00-18:00 gpt, else ds"
         );
     }
 

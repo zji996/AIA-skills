@@ -20,6 +20,9 @@ pub struct Options {
     pub agent: String,
     pub tier: Option<String>,
     pub agent_pinned: bool,
+    /// The model came from a tier rather than `--model` or the run being continued,
+    /// so `launch` may pick again once it counts the machine's runs (`maxActive`).
+    pub tier_picked: bool,
     pub name: Option<String>,
     pub workdir: Option<String>,
     pub images: Vec<String>,
@@ -350,8 +353,36 @@ fn apply_tier_model(o: &mut Options, config: &Value) -> Value {
             .as_str()
             .map(str::to_string)
             .filter(|m| !m.is_empty());
+        o.tier_picked = true;
     }
     models
+}
+/// Tier rules with `maxActive` skip a model already running that many times on this
+/// machine. Runs under the machine start lock, so two starts cannot take the last place.
+fn pick_tier_under_cap(o: &mut Options, extra: &mut Value, active_runs: &[PathBuf]) {
+    let models = active_runs
+        .iter()
+        .map(|run| s(&json(run.join("meta.json")), "model").to_string())
+        .collect::<Vec<_>>();
+    let running = |model: &str| models.iter().filter(|m| *m == model).count();
+    let picked: Value = agents::ALL_TIERS
+        .iter()
+        .map(|tier| {
+            let model = agents::tier_model_with(&extra["tierConfig"], tier, &running);
+            (tier.to_string(), json!(model))
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into();
+    let tier = o.tier.as_deref().unwrap_or("cheap");
+    let model = s(&picked, tier);
+    if !model.is_empty() && o.model.as_deref() != Some(model) {
+        eprintln!(
+            "delegate: {tier} 档的 {} 已到本机 maxActive 上限，改用 {model}",
+            o.model.as_deref().unwrap_or("（Pi 默认）")
+        );
+        o.model = Some(model.to_string());
+    }
+    extra["tierModels"] = picked;
 }
 pub fn read_prompt(o: &mut Options) -> Res<String> {
     let prompt = if let Some(f) = &o.prompt_file {
@@ -681,7 +712,7 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
             config.ignored.join(", ")
         );
     }
-    let mut extra = json!({"env":config.value["env"],"agentDeny":config.value["agentDeny"],"configSources":config.sources,"configCapacity":capacities,"tierModels":tier_models});
+    let mut extra = json!({"env":config.value["env"],"agentDeny":config.value["agentDeny"],"configSources":config.sources,"configCapacity":capacities,"tierModels":tier_models,"tierConfig":{"tiers":config.value["tiers"]}});
     extra["sourceBuild"] = config.value["sourceBuild"].clone();
     extra["sourceBuildRoot"] = json!(repo);
     extra["defaults"] = defaults;
@@ -1135,6 +1166,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     extra["configSources"] = json!(sources);
     extra["configCapacity"] = capacities;
     extra["tierModels"] = tier_models;
+    extra["tierConfig"] = json!({"tiers": config.value["tiers"]});
     extra["sourceBuild"] = config.value["sourceBuild"].clone();
     extra["sourceBuildRoot"] = meta.get("sourceBuildRoot").cloned().unwrap_or(json!(top));
     if runs::interrupted(s(&summary, "state")) && s(&meta, "mode") == "write" {
@@ -1339,6 +1371,11 @@ pub fn launch(
     if !deferred {
         capacity(&active_runs, &extra["configCapacity"], &repo)?;
     }
+    let mut extra = extra.clone();
+    if o.tier_picked && !o.agent_pinned {
+        pick_tier_under_cap(&mut o, &mut extra, &active_runs);
+    }
+    let extra = &extra;
     if !deferred && mode == "write" && !o.parallel && !extra["worktree"].is_object() {
         for run in all_runs() {
             let m = json(run.join("meta.json"));
