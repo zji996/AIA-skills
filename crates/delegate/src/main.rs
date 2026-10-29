@@ -1563,7 +1563,10 @@ fn tiers(args: &[String]) -> Res<i32> {
             (true, true) => "(not set)",
             (true, false) => "(not set: read-only uses cheap, writes use strong)",
         };
-        println!("{tier}: {shown}");
+        match agents::describe_tier(&config.value["tiers"][tier]) {
+            Some(rules) if !model.is_empty() => println!("{tier}: {shown} (now; rules: {rules})"),
+            _ => println!("{tier}: {shown}"),
+        }
     }
     if missing {
         eprintln!("{}", agents::tiers_guide());

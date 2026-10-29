@@ -195,11 +195,7 @@ fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
                         "tiers.{tier}: unknown tier (default, cheap or strong)"
                     ));
                 }
-                if !model.as_str().is_some_and(|m| !m.contains('\0')) {
-                    return Err(format!(
-                        "tiers.{tier} must be a Pi model pattern string (provider/id[:thinking])"
-                    ));
-                }
+                validate_tier(tier, model)?;
             }
         }
         crate::deny::validate_config(value.get("agentDeny"), repo)?;
@@ -426,4 +422,42 @@ pub fn context_capacity(run: Option<&Path>) -> Res<Value> {
     }
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     Ok(load(git_top(&cwd).as_deref())?.value)
+}
+
+/// A tier is a model pattern, or rules ending in a plain model that always matches:
+/// `[{"model": "...", "hours": "00:30-08:30"}, "fallback"]` (local time).
+fn validate_tier(tier: &str, value: &Value) -> Result<(), String> {
+    let model = |m: &Value| m.as_str().is_some_and(|m| !m.is_empty() && !m.contains('\0'));
+    if value.is_string() {
+        return if model(value) || value.as_str() == Some("") {
+            Ok(())
+        } else {
+            Err(format!("tiers.{tier} must be a Pi model pattern string (provider/id[:thinking])"))
+        };
+    }
+    let rules = value.as_array().ok_or_else(|| {
+        format!("tiers.{tier} must be a Pi model pattern string or a rule list")
+    })?;
+    if !rules.last().is_some_and(model) {
+        return Err(format!(
+            "tiers.{tier}: a rule list ends with a plain model string used outside every window"
+        ));
+    }
+    for (index, rule) in rules.iter().enumerate() {
+        if rule.is_string() {
+            if !model(rule) || index + 1 != rules.len() {
+                return Err(format!("tiers.{tier}[{index}]: only the last rule may be a plain model string"));
+            }
+            continue;
+        }
+        if !model(&rule["model"])
+            || rule.as_object().is_none_or(|o| o.keys().any(|k| k != "model" && k != "hours"))
+            || crate::agents::parse_hours(rule["hours"].as_str().unwrap_or("")).is_none()
+        {
+            return Err(format!(
+                "tiers.{tier}[{index}] must be {{\"model\": \"provider/id[:thinking]\", \"hours\": \"HH:MM-HH:MM\"}} (local time, end exclusive, may wrap midnight)"
+            ));
+        }
+    }
+    Ok(())
 }

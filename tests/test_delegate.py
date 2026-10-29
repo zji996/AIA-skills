@@ -1739,6 +1739,20 @@ db.write_text(json.dumps(units))
         config = json.loads((self.work / "config/delegate/config.json").read_text())
         self.assertEqual(config["tiers"]["default"], "p/m")
 
+    def test_tier_rules_pick_by_local_hours_and_reject_a_list_without_fallback(self):
+        always = {"model": "p/ds-m", "hours": "00:00-23:59"}
+        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": [always, "p/gpt-m"]}})
+        self.env["TZ"] = "UTC"
+        log = self.work / "pi.log"
+        self.fake_pi([answer("ok"), SETTLED])
+        self.outcome(self.cli("run", "--read-only", "task"))
+        self.assertIn("--model p/ds-m", log.read_text().splitlines()[-1])
+        self.assertIn("rules: 00:00-23:59 p/ds-m, else p/gpt-m", self.cli("tiers").stdout)
+        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": [always]}})
+        self.assertIn("ends with a plain model", self.cli("run", "--read-only", "task").stderr)
+        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": [{"model": "p/m", "hours": "8:30-9:00"}, "p/m"]}})
+        self.assertIn("tiers.strong[0]", self.cli("run", "--read-only", "task").stderr)
+
     def test_repository_tiers_override_per_tier_and_unset_default_falls_back(self):
         self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/m"}})
         repo = self.repo({"a.txt": "a\n"})

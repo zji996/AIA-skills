@@ -35,10 +35,74 @@ pub const TIERS: [&str; 2] = ["cheap", "strong"];
 pub const ALL_TIERS: [&str; 3] = ["default", "cheap", "strong"];
 
 /// The Pi `--model` pattern a tier runs (`provider/id[:thinking]`); empty means
-/// Pi's own default from its settings.json.
+/// Pi's own default from its settings.json. A tier may be a rule list, resolved
+/// at the local time of the call (start, reply, `tiers`).
 pub fn tier_model(config: &Value, tier: &str) -> String {
-    let configured = config["tiers"][tier].as_str().unwrap_or("");
-    setting(&format!("{}_MODEL", tier.to_uppercase()), configured)
+    let configured = resolve_tier(&config["tiers"][tier], local_minute());
+    setting(&format!("{}_MODEL", tier.to_uppercase()), &configured)
+}
+
+/// Minutes since local midnight, the clock tier rules read.
+pub fn local_minute() -> u32 {
+    let (h, m) = format_time(true, "%H:%M")
+        .split_once(':')
+        .map(|(h, m)| (h.parse().unwrap_or(0), m.parse().unwrap_or(0)))
+        .unwrap_or((0, 0));
+    h * 60 + m
+}
+
+/// `"HH:MM-HH:MM"` as minutes; the end is exclusive and may wrap past midnight.
+pub fn parse_hours(hours: &str) -> Option<(u32, u32)> {
+    let clock = |t: &str| {
+        let (h, m) = t.trim().split_once(':')?;
+        let (h, m) = (h.parse::<u32>().ok()?, m.parse::<u32>().ok()?);
+        (h < 24 && m < 60 && t.trim().len() == 5).then_some(h * 60 + m)
+    };
+    let (start, end) = hours.split_once('-')?;
+    let (start, end) = (clock(start)?, clock(end)?);
+    (start != end).then_some((start, end))
+}
+
+/// A tier is a model string, or rules tried in order: `{"model", "hours"}`
+/// matches inside its local window, a plain string always matches.
+pub fn resolve_tier(value: &Value, minute: u32) -> String {
+    if let Some(model) = value.as_str() {
+        return model.to_string();
+    }
+    let within = |hours: &str| {
+        parse_hours(hours).is_some_and(|(start, end)| {
+            if start < end {
+                (start..end).contains(&minute)
+            } else {
+                minute >= start || minute < end
+            }
+        })
+    };
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|rule| match rule {
+            Value::String(model) => Some(model.clone()),
+            _ => within(rule["hours"].as_str().unwrap_or(""))
+                .then(|| rule["model"].as_str().unwrap_or("").to_string()),
+        })
+        .unwrap_or_default()
+}
+
+/// A rule list as one line for `delegate tiers`, e.g. `00:30-08:30 a, else b`.
+pub fn describe_tier(value: &Value) -> Option<String> {
+    let rules = value.as_array()?;
+    Some(
+        rules
+            .iter()
+            .map(|rule| match rule.as_str() {
+                Some(model) => format!("else {model}"),
+                None => format!("{} {}", s(rule, "hours"), s(rule, "model")),
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 /// Fixed system-prompt addendum for every colleague: the same text each run, so
@@ -852,6 +916,20 @@ mod tests {
 
     fn args(_agent: &str, meta: &Value, session: Option<&str>) -> Vec<String> {
         command_pi(meta, session)
+    }
+
+    #[test]
+    fn tier_rules_pick_the_first_window_that_holds_the_minute() {
+        let rules = json!([{"model": "ds", "hours": "00:30-08:30"}, {"model": "night", "hours": "22:00-00:30"}, "gpt"]);
+        assert_eq!(resolve_tier(&rules, 30), "ds");
+        assert_eq!(resolve_tier(&rules, 8 * 60 + 29), "ds");
+        assert_eq!(resolve_tier(&rules, 8 * 60 + 30), "gpt");
+        assert_eq!(resolve_tier(&rules, 23 * 60), "night");
+        assert_eq!(resolve_tier(&rules, 0), "night");
+        assert_eq!(resolve_tier(&json!("plain"), 0), "plain");
+        assert_eq!(parse_hours("8:30-09:00"), None);
+        assert_eq!(parse_hours("09:00-09:00"), None);
+        assert_eq!(describe_tier(&rules).unwrap(), "00:30-08:30 ds, 22:00-00:30 night, else gpt");
     }
 
     #[test]
