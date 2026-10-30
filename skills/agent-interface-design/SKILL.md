@@ -3,7 +3,7 @@ name: agent-interface-design
 description: 设计或修改模型能看到的东西时使用：工具与参数说明、工具结果与错误文字、Skill、系统段与 kit/插件说明、文件或图片的读取方式；也用于评审这类改动和设计对应评测。给出渐进式披露、结果带下一步、给事实不规定顺序、前缀冻结、失败分类、顺着模型习惯、改文字先测等原则与检查方法。Use when designing or reviewing model-facing surfaces — tool schemas and descriptions, tool results and error text, skills, system sections, file/image read paths — and their evals, covering progressive disclosure, affordances in results, facts over procedures, cache-stable prefixes, failure classes, measuring prompt changes.
 license: MIT
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
 # 模型界面设计
@@ -60,6 +60,7 @@ metadata:
 2. 只改一类东西，同 seed 对照；结构改动与文字改动分开测，才能知道效果来自哪里。
 3. 评测只判结果，不发明产品没有的上限；步数、输入 token、无效步数照常报告。
 4. 多个不同场景各跑一次，胜过同一场景重复多次；客户数据不进仓库，夹具用脚本生成。
+5. 基线已通过的用例不加规则。让模型「先问」「先确认」的句子，同时用一个需求已说清的用例测，防止它在不该问时也问。
 
 ## 评审清单
 
