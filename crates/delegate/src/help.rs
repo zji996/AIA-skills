@@ -100,6 +100,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "Show the Pi model of each tier, or set them with --default/--cheap/--strong.",
     ),
     (
+        "probe",
+        "Check each tier model's connectivity through Pi itself before dispatching.",
+    ),
+    (
         "protocol",
         "Print the harness protocol version, caller and agents as JSON.",
     ),
@@ -134,6 +138,9 @@ pub fn print(command: Option<&str>) -> bool {
             ("--version", "Show the Cargo package version."),
         ]);
         println!("\nStates: waiting | running | delivered (accept passed) | answered (no --accept) | skipped (upstream failed) | rejected (accept failed or protected path changed) | malformed (empty or leaked tool call after reruns) | failed | timeout | stalled | killed | stopped | crashed.");
+        println!(
+            "An interrupted upstream (cut stream, reset or timed-out connection, 502/503/504, a 429 Pi did not retry) is not the task failing: the run waits 15s/45s/120s, checks the model through `probe`'s path, and continues the same session up to 3 times (DELEGATE_RESUME_BACKOFF, `0` off); `status --json` reports `resumes` and `transientError`. Auth failures, 400s and missing models are not retried."
+        );
         println!(
             "Exit: 0 delivered/answered, 1 other finished, 2 usage, 75 still running at --max, 76 already covered by another waiter, 77 agentDeny shim refusal."
         );
@@ -193,6 +200,11 @@ pub fn print(command: Option<&str>) -> bool {
             ("--json", "Print deletion counts and orphan container cleanup as JSON lines."),
         ]),
         "tiers" => ("[--default MODEL] [--cheap MODEL] [--strong MODEL]", "Without options, print each tier's Pi model (default is optional and runs tasks given no --tier); exit 1 with the available Pi models when a tier is unset. With options, check each provider/id[:thinking] against `pi --list-models` and write it to the user config. start, run and reply refuse to run until both tiers are set.", &[]),
+        "probe" => ("[--tier default|cheap|strong] [--model PATTERN] [--timeout SECONDS]", "Send one short prompt to each model the tiers name, through the same Pi binary, environment and provider configuration start uses, and print one line per model: ok or FAIL, elapsed and first-token time, the tiers it is in with its rule's window and maxActive state now, and Pi's first error line. Two-way check is Pi's own request, so a gateway that rejects bare HTTP probes still answers here. No worktree, no run directory, no capacity slot. Exit 1 when the model start would pick without --tier fails, 0 when all pass, 2 for usage.", &[
+            ("--tier default|cheap|strong", "Probe only this tier's models, its rules included."),
+            ("--model PATTERN", "Probe one Pi model (provider/id[:thinking]) instead of the tiers'."),
+            ("--timeout SECONDS", "Limit per model (default: 60). The model the bare start would pick decides the exit code."),
+        ]),
         "protocol" => ("", "Print one JSON line for harness adapters: protocol version, delegate version, the caller session and its source variable, and each agent's tier, resolved binary, version and PATH entries it shadows.", &[]),
         _ => return false,
     };

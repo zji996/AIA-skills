@@ -282,7 +282,16 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
             "read accept.tail; {script} reply {name} '<what to fix>' or take it over"
         )),
         "malformed" => Some(format!("{script} reply {name} --tier strong '<what to fix>' or do it yourself")),
-        "failed" => Some("read error; fix the cause or take it over".into()),
+        "failed" => Some(if s(sum, "transientError").is_empty() {
+            "read error; fix the cause or take it over".into()
+        } else if n(sum, "resumes") > 0 {
+            format!(
+                "上游中断（已续做 {} 次）仍未恢复；等节点恢复后再接：{script} reply {name} '接着继续'",
+                n(sum, "resumes")
+            )
+        } else {
+            format!("上游中断，续做前的探测未通过；等节点恢复后再接：{script} reply {name} '接着继续'")
+        }),
         "timeout" if s(meta, "mode") == "read-only" => Some(format!(
             "{script} reply {name} 'answer with what you found so far' or split the question"
         )),
@@ -370,6 +379,8 @@ pub fn status(run: &Path) -> Value {
             "finishedAt",
             "elapsedSeconds",
             "attempts",
+            "resumes",
+            "transientError",
             "model",
             "turns",
             "files",

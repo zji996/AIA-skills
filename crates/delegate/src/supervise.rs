@@ -3,7 +3,9 @@ use crate::changes;
 use crate::common::*;
 use crate::lane;
 use crate::launch;
+use crate::probe;
 use crate::runs;
+use crate::transient;
 use crate::worktree;
 use serde_json::{json, Value};
 use std::fs::{self, File};
@@ -547,6 +549,122 @@ fn model_label(meta: &Value) -> String {
         .unwrap_or("default")
         .to_string()
 }
+
+/// An attempt on the session this run already has: Pi copies the saved session with `--fork`, so
+/// the colleague keeps what it read and changed and only has to carry on. `None` when the attempt
+/// saved no session (the agent failed before writing one) — there is nothing to continue.
+fn continuation(meta: &Value, run: &Path) -> Option<Value> {
+    let id = runs::events(run)
+        .into_iter()
+        .rev()
+        .find(|event| s(event, "e") == "session" && !s(event, "id").is_empty())
+        .map(|event| s(&event, "id").to_string())?;
+    let session = agents::session_file(s(meta, "sessionDir"), &id)?;
+    let prompt = run.join("resume-prompt.md");
+    write(&prompt, format!("{}\n", transient::PROMPT)).ok()?;
+    let mut next = meta.clone();
+    next["fork"] = json!(session.to_string_lossy());
+    next["agentPromptFile"] = json!(prompt);
+    // The images went out with the first message and stay in the session; attaching them to a
+    // continuation would send them a second time for no reason.
+    next["images"] = json!([]);
+    Some(next)
+}
+
+/// What a run did after waiting out an upstream outage.
+struct Resumed {
+    verdict: String,
+    answer: String,
+    attempts: i64,
+    resumes: i64,
+    error: String,
+}
+
+/// A provider outage is not the task failing: wait for it to pass, check through Pi that the
+/// model answers again, then let the same session carry on in this run — same model, same
+/// worktree, changes kept. Only when the tries run out does the run fail (and escalate) as before.
+fn resume_transient(
+    meta: &Value,
+    run: &Path,
+    first: (String, String, i64),
+    holder: Arc<AtomicI32>,
+    grace: Arc<Mutex<Option<f64>>>,
+) -> Resumed {
+    let (mut verdict, mut answer, mut attempts) = first;
+    let waits = transient::waits();
+    let (mut tried, mut resumes, mut error) = (0usize, 0i64, String::new());
+    while verdict == "failed" && tried < waits.len() && !lane::stopped() {
+        let Some(found) = transient::ended_by(run, attempts) else {
+            break;
+        };
+        error = found;
+        let wait = waits[tried];
+        tried += 1;
+        let waiting = format!(
+            "上游中断，第 {tried} 次续做，等待 {}s",
+            (wait * 10.0).round() / 10.0
+        );
+        log_event(
+            run,
+            json!({"e":"resume","n":tried,"waitSeconds":wait,"error":error,"detail":waiting}),
+        );
+        if !transient::wait(wait) {
+            break;
+        }
+        // Ask the same executable the attempt ran on: Pi and rpi keep different sessions.
+        let bin = Some(s(meta, "agentBin"))
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| agents::agent_bin(agents::AGENT));
+        let down = match bin {
+            Some(bin) => probe::recovered(
+                &bin,
+                s(meta, "model"),
+                &meta["env"],
+                transient::probe_timeout(),
+            ),
+            None => Err("missing required tools: pi".to_string()),
+        };
+        if let Err(down) = down {
+            // Still down: sending the task would fail again, so spend no attempt on it.
+            log_event(run, json!({"e":"resume_skipped","n":tried,"error":down}));
+            continue;
+        }
+        let Some(next) = continuation(meta, run) else {
+            log_event(
+                run,
+                json!({"e":"resume_skipped","n":tried,"error":"no saved session to continue"}),
+            );
+            break;
+        };
+        resumes += 1;
+        attempts += 1;
+        match agents::run_agent(&next, run, attempts, holder.clone(), grace.clone()) {
+            Ok((outcome, text)) => {
+                verdict = outcome;
+                answer = text;
+            }
+            Err(failure) => {
+                error = failure.clone();
+                let _ = append(
+                    run.join("stderr.log"),
+                    &format!("supervisor error: {failure}\n"),
+                );
+                break;
+            }
+        }
+    }
+    if lane::stopped() {
+        verdict = "stopped".into();
+    }
+    Resumed {
+        verdict,
+        answer,
+        attempts,
+        resumes,
+        error,
+    }
+}
 fn escalate(
     meta: &mut Value,
     run: &Path,
@@ -721,6 +839,18 @@ fn inner(
     } else {
         ("failed".into(), String::new(), 0)
     };
+    let (mut resumes, mut transient_error) = (0i64, String::new());
+    if setup_error.is_none() {
+        let resumed = resume_transient(
+            &meta,
+            run,
+            (verdict, answer, attempts),
+            holder.clone(),
+            grace.clone(),
+        );
+        (verdict, answer, attempts) = (resumed.verdict, resumed.answer, resumed.attempts);
+        (resumes, transient_error) = (resumed.resumes, resumed.error);
+    }
     let (mut state, mut sum, mut rec, mut changed) = settle(
         &meta,
         run,
@@ -752,6 +882,12 @@ fn inner(
         sum["escalatedFrom"] = json!(cheap);
     }
     sum["attempts"] = json!(attempts);
+    if resumes > 0 {
+        sum["resumes"] = json!(resumes);
+    }
+    if !transient_error.is_empty() {
+        sum["transientError"] = json!(clip(&transient_error, 300));
+    }
     if !answer.trim().is_empty() {
         write(
             run.join("result.md"),

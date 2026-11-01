@@ -61,6 +61,13 @@ def answer(text, stop="stop"):
                                                "content": content}}
 
 
+def interrupted(text="Upstream response stream was interrupted"):
+    """A turn that died because the provider dropped the answer stream."""
+    event = answer(None, stop="error")
+    event["message"]["errorMessage"] = text
+    return event
+
+
 # Session variables delegate reads as the caller id; host sessions must not leak into tests.
 CALLER_ENV = ("DELEGATE_CALLER", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "PI_SESSION_ID")
 SETTLED = {"type": "agent_settled"}
@@ -474,12 +481,22 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
                 self.assertEqual(result.returncode, 0)
                 self.assertNotIn("sourceBuildDisk", result.stdout)
 
-    def fake_pi(self, *attempts, pre="", sleep=0, code=0):
-        """Each attempt is a list of events; later calls reuse the last attempt."""
+    def fake_pi(self, *attempts, pre="", sleep=0, code=0, probe=None):
+        """Each attempt is a list of events; later calls reuse the last attempt.
+
+        probe: events a connectivity check (`probe`, and the check a run does before resuming
+        after an interrupted upstream) prints. Such a call has neither --session-id nor --fork,
+        so it is answered before the attempt counter advances: checks spend no attempt.
+        """
         lines = ["#!/bin/sh", '[ "$1" = --version ] && { echo "fake-pi 1.0"; exit 0; }',
                  '[ "$2" = --list-models ] && { printf "provider model context max-out thinking images\\n'
                  'p m 1M 1K yes yes\\np cheap-m 1M 1K yes yes\\np strong-m 1M 1K yes yes\\n"; exit 0; }',
-                 "cat > /dev/null", 'echo "$$ $PI_DELEGATE_ACTIVE $*" >> "$PI_LOG"',
+                 "cat > /dev/null"]
+        if probe is not None:
+            body = " ".join(shlex.quote(json.dumps(e)) for e in probe)
+            lines.append('case " $* " in *" --session-id "*|*" --fork "*) ;; *) '
+                         f"printf '%s\\n' {body}; exit 0;; esac")
+        lines += ['echo "$$ $PI_DELEGATE_ACTIVE $*" >> "$PI_LOG"',
                  # Like Pi, keep the session as <dir>/<time>_<id>.jsonl.
                  'dir=; id=; prev=; for a in "$@"; do case "$prev" in --session-dir) dir=$a;; --session-id) id=$a;; '
                  'esac; prev=$a; done; [ -n "$dir" ] && mkdir -p "$dir" && touch "$dir/t_${id:-f$$}.jsonl"',
@@ -1411,6 +1428,78 @@ db.write_text(json.dumps(units))
         self.assertEqual((state["state"], state["attempts"]), ("timeout", 1))
         self.fake_pi([answer("x"), SETTLED], code=137)
         self.assertEqual(self.outcome(self.cli("run", "task"))["state"], "killed")
+
+    def test_interrupted_upstream_resumes_the_same_session(self):
+        self.env["DELEGATE_RESUME_BACKOFF"] = "0.1"
+        self.fake_pi([interrupted(), SETTLED], [answer("continued"), SETTLED], probe=[answer("ok"), SETTLED])
+        result = self.cli("run", "task")
+        state = self.outcome(result)
+        self.assertEqual((state["state"], state["resumes"], state["attempts"]), ("answered", 1, 2))
+        self.assertIn("Upstream response stream was interrupted", state["transientError"])
+        self.assertIn("continued", result.stdout)
+        run = Path(state["dir"])
+        calls = (self.work / "pi.log").read_text().splitlines()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--session-id", calls[0])
+        # The retry continues the saved session instead of starting a fresh one from the prompt.
+        self.assertIn("--fork", calls[1])
+        self.assertIn("接着中断前的进度继续", (run / "resume-prompt.md").read_text())
+        self.assertIn('"resume"', (run / "events.jsonl").read_text())
+        self.assertEqual((run / "result.md").read_text().strip(), "continued")
+
+    def test_write_worktree_keeps_its_changes_across_a_resume(self):
+        self.env["DELEGATE_RESUME_BACKOFF"] = "0.1"
+        # Each attempt appends to the same file in the worktree: the second sees the first's work.
+        self.fake_pi([interrupted(), SETTLED], [answer("done"), SETTLED], probe=[answer("ok"), SETTLED],
+                     pre='[ "$n" -eq 1 ] && printf "step1\\n" > half.txt; [ "$n" -eq 2 ] && printf "step2\\n" >> half.txt')
+        repo = self.repo({"a.txt": "a\n"})
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        self.assertEqual((state["state"], state["resumes"], state["files"]), ("answered", 1, ["half.txt"]))
+        self.assertEqual((Path(state["worktree"]) / "half.txt").read_text(), "step1\nstep2\n")
+
+    def test_repeated_interruptions_fail_after_three_resumes(self):
+        self.env["DELEGATE_RESUME_BACKOFF"] = "0.1,0.1,0.1"
+        self.fake_pi([interrupted(), SETTLED], probe=[answer("ok"), SETTLED])
+        state = self.outcome(self.cli("run", "task"))
+        self.assertEqual((state["state"], state["resumes"], state["attempts"]), ("failed", 3, 4))
+        self.assertIn("Upstream response stream was interrupted", state["error"])
+        self.assertEqual(len((self.work / "pi.log").read_text().splitlines()), 4)
+        self.assertIn("reply", state["next"])
+
+    def test_authentication_error_is_not_resumed(self):
+        self.env["DELEGATE_RESUME_BACKOFF"] = "0.1,0.1,0.1"
+        self.fake_pi([interrupted("401 Unauthorized: invalid api key"), SETTLED],
+                     probe=[answer("ok"), SETTLED])
+        state = self.outcome(self.cli("run", "task"))
+        self.assertEqual(state["state"], "failed")
+        self.assertIn("invalid api key", state["error"])
+        self.assertNotIn("resumes", state)
+        self.assertEqual(len((self.work / "pi.log").read_text().splitlines()), 1)
+
+    def test_resume_waits_for_a_probe_that_still_fails(self):
+        self.env["DELEGATE_RESUME_BACKOFF"] = "0.1,0.1,0.1"
+        self.fake_pi([interrupted(), SETTLED], probe=[interrupted("connect ECONNREFUSED"), SETTLED])
+        state = self.outcome(self.cli("run", "task"))
+        self.assertEqual(state["state"], "failed")
+        self.assertNotIn("resumes", state)
+        self.assertIn("探测", state["next"])
+        events = (Path(state["dir"]) / "events.jsonl").read_text()
+        self.assertEqual(events.count('"resume_skipped"'), 3)
+        # Nothing was sent to the model while it was unreachable.
+        self.assertEqual(len((self.work / "pi.log").read_text().splitlines()), 1)
+
+    def test_stop_during_the_wait_never_resumes(self):
+        self.env["DELEGATE_RESUME_BACKOFF"] = "60"
+        self.fake_pi([interrupted(), SETTLED], probe=[answer("ok"), SETTLED])
+        started = self.outcome(self.cli("start", "--name", "broken", "task"))
+        run = Path(started["dir"])
+        self.until(lambda: '"resume"' in (run / "events.jsonl").read_text(), "the resume wait")
+        self.assertIn("第 1 次续做", self.cli("status", "broken", human=True).stdout)
+        self.assertEqual(self.cli("stop", "broken").returncode, 0)
+        state = self.outcome(self.cli("status", "broken"))
+        self.assertEqual(state["state"], "stopped")
+        self.assertNotIn("resumes", state)
+        self.assertEqual(len((self.work / "pi.log").read_text().splitlines()), 1)
 
     def test_leak_detector_ignores_normal_prose(self):
         for text, state in ((LEAKED, "malformed"), ("Use `call:default_api:read{...}` carefully.\nDone.", "answered"),

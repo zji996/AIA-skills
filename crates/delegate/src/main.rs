@@ -9,10 +9,12 @@ mod lane;
 mod launch;
 mod measure;
 mod output;
+mod probe;
 mod resources;
 mod runs;
 mod source_build;
 mod supervise;
+mod transient;
 mod waiting;
 mod worktree;
 use common::*;
@@ -1493,6 +1495,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "stop" => stop(rest),
         "clean" => clean(rest),
         "tiers" => tiers(rest),
+        "probe" => probe::command(rest),
         "protocol" => {
             if let Some(arg) = rest.first() {
                 return Err(format!("unrecognized arguments: {arg}"));

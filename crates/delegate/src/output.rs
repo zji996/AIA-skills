@@ -326,22 +326,31 @@ pub fn human(run: &Path, status: &Value) -> String {
         ));
     }
     if state == "running" {
-        if let Some(command) = runs::events(run)
-            .iter()
-            .rev()
-            .find(|e| !s(e, "cmd").is_empty())
+        // Waiting out an upstream outage is what the run is doing now; its last command is old news.
+        match status["last"]
+            .as_str()
+            .and_then(|last| last.strip_prefix("resume: "))
         {
-            let mut cmd = s(command, "cmd").replace(['\n', '\r'], " ");
-            for root in [
-                s(&meta, "top"),
-                s(&meta, "workdir"),
-                s(&meta["worktree"], "source"),
-            ] {
-                if !root.is_empty() {
-                    cmd = cmd.replace(&format!("{root}/"), "").replace(root, ".");
+            Some(waiting) => parts.push(waiting.to_string()),
+            None => {
+                if let Some(command) = runs::events(run)
+                    .iter()
+                    .rev()
+                    .find(|e| !s(e, "cmd").is_empty())
+                {
+                    let mut cmd = s(command, "cmd").replace(['\n', '\r'], " ");
+                    for root in [
+                        s(&meta, "top"),
+                        s(&meta, "workdir"),
+                        s(&meta["worktree"], "source"),
+                    ] {
+                        if !root.is_empty() {
+                            cmd = cmd.replace(&format!("{root}/"), "").replace(root, ".");
+                        }
+                    }
+                    parts.push(format!("最近：{}", clip(&cmd, 97)));
                 }
             }
-            parts.push(format!("最近：{}", clip(&cmd, 97)));
         }
     }
     if let Some(ahead) = status["measureWaitingAhead"].as_u64() {
@@ -398,6 +407,13 @@ pub fn human(run: &Path, status: &Value) -> String {
     }
     if n(status, "denied") > 0 {
         parts.push(format!("拦下 {} 次全量检查", n(status, "denied")));
+    }
+    if n(status, "resumes") > 0 {
+        parts.push(format!(
+            "上游中断后续做 {} 次（{}）",
+            n(status, "resumes"),
+            clip(&s(status, "transientError").replace(['\n', '\r'], " "), 60)
+        ));
     }
     let occupied = crate::resources::occupied_for_run(s(status, "run"));
     if !occupied.is_empty() {

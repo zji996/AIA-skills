@@ -1,5 +1,11 @@
 # delegate
 
+## 6.9 派发前探连通
+
+- 某个自部署节点今晚回 502，换档前先看哪几档不通：`delegate probe` 走 Pi 本身并行测各档模型，每行 ok/FAIL 与耗时，失败附 Pi 报错第一行；末行给出不带 `--tier` 时 start 会选的模型。Probe tier models through Pi before dispatching.
+- 只想确认某个模型现在能不能用：`delegate probe --model provider/id[:thinking]`，参数错误退出 2。
+- 峰时换档的规则模型现在会不会被选中：`delegate probe --tier strong`，行里带 hours 命中与 maxActive 当前占用；窗口外的模型通了也不算默认档失败。
+
 ## 5.28 测量预约与验收冲突
 
 - `measure`/`measureCpus` 配置和 `lane --measure` 让压测、计时、编译耗时命令按预约核 FIFO 排队；排队时间不计 stall/timeout，命令可读取 `DELEGATE_MEASURE_CPUS` 与 `DELEGATE_MEASURE_CORES`。

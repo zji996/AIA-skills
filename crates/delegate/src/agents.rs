@@ -114,10 +114,9 @@ pub fn parse_days(days: &str) -> Option<Vec<u32>> {
 /// matches when the local day and time fall inside it and fewer than `maxActive` runs on this
 /// machine use its model; a plain string always matches.
 /// A window that wraps midnight counts against the day it started on only for its first part.
-pub fn resolve_tier(value: &Value, now: Clock, running: &dyn Fn(&str) -> usize) -> String {
-    if let Some(model) = value.as_str() {
-        return model.to_string();
-    }
+/// Does one rule list entry match now? `days`/`hours` read the local clock, `maxActive`
+/// counts this machine's runs on the rule's model; a plain string always matches.
+pub fn rule_matches(rule: &Value, now: Clock, running: &dyn Fn(&str) -> usize) -> bool {
     let within = |hours: &str| {
         parse_windows(hours).is_some_and(|windows| {
             windows.iter().any(|&(start, end)| {
@@ -129,25 +128,51 @@ pub fn resolve_tier(value: &Value, now: Clock, running: &dyn Fn(&str) -> usize) 
             })
         })
     };
-    let matches = |rule: &Value| {
-        let day = rule["days"]
-            .as_str()
-            .is_none_or(|days| parse_days(days).is_some_and(|set| set.contains(&now.weekday)));
-        let time = rule["hours"].as_str().is_none_or(within);
-        let room = rule["maxActive"]
-            .as_u64()
-            .is_none_or(|cap| (running(s(rule, "model")) as u64) < cap);
-        day && time && room
-    };
+    let day = rule["days"]
+        .as_str()
+        .is_none_or(|days| parse_days(days).is_some_and(|set| set.contains(&now.weekday)));
+    let time = rule["hours"].as_str().is_none_or(within);
+    let room = rule["maxActive"]
+        .as_u64()
+        .is_none_or(|cap| (running(s(rule, "model")) as u64) < cap);
+    day && time && room
+}
+
+pub fn resolve_tier(value: &Value, now: Clock, running: &dyn Fn(&str) -> usize) -> String {
+    if let Some(model) = value.as_str() {
+        return model.to_string();
+    }
     value
         .as_array()
         .into_iter()
         .flatten()
         .find_map(|rule| match rule {
             Value::String(model) => Some(model.clone()),
-            _ => matches(rule).then(|| rule["model"].as_str().unwrap_or("").to_string()),
+            _ => rule_matches(rule, now, running)
+                .then(|| rule["model"].as_str().unwrap_or("").to_string()),
         })
         .unwrap_or_default()
+}
+
+/// Every model a tier can run, in rule order: a rule list expands, and the
+/// `DELEGATE_<TIER>_MODEL` override replaces the whole list (`probe` checks them all).
+pub fn tier_candidates(config: &Value, tier: &str) -> Vec<String> {
+    let overridden = setting(&format!("{}_MODEL", tier.to_uppercase()), "");
+    let listed = |model: String| (!model.is_empty()).then_some(model);
+    if !overridden.is_empty() {
+        return vec![overridden];
+    }
+    match &config["tiers"][tier] {
+        Value::String(model) => listed(model.clone()).into_iter().collect(),
+        Value::Array(rules) => rules
+            .iter()
+            .filter_map(|rule| match rule.as_str() {
+                Some(model) => listed(model.to_string()),
+                None => listed(s(rule, "model").to_string()),
+            })
+            .collect(),
+        _ => vec![],
+    }
 }
 
 /// A rule list as one line for `delegate tiers`, e.g. `mon-fri 09:00-12:00 a, else b`.
@@ -1056,6 +1081,21 @@ mod tests {
             describe_tier(&rules).unwrap(),
             "<5 running spot, mon-fri 09:00-12:00,14:00-18:00 gpt, else ds"
         );
+    }
+
+    #[test]
+    fn tier_candidates_expand_rules_and_prefer_the_environment() {
+        let config = json!({"tiers": {"cheap": "p/one", "strong": [{"model": "p/two", "maxActive": 2}, "p/one"], "default": ""}});
+        std::env::remove_var("DELEGATE_CHEAP_MODEL");
+        std::env::remove_var("DELEGATE_STRONG_MODEL");
+        std::env::remove_var("DELEGATE_DEFAULT_MODEL");
+        assert_eq!(tier_candidates(&config, "cheap"), ["p/one"]);
+        assert_eq!(tier_candidates(&config, "strong"), ["p/two", "p/one"]);
+        assert!(tier_candidates(&config, "default").is_empty());
+        assert!(tier_candidates(&json!({}), "cheap").is_empty());
+        std::env::set_var("DELEGATE_CHEAP_MODEL", "p/env");
+        assert_eq!(tier_candidates(&config, "cheap"), ["p/env"]);
+        std::env::remove_var("DELEGATE_CHEAP_MODEL");
     }
 
     #[test]

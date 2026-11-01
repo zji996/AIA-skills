@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI（pi-kit 的 rpi 通道下 `pi` 即 rpi）。
 metadata:
-  version: "6.8.0"
+  version: "6.9.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -31,13 +31,14 @@ $D wait                                                                  # 放�
 | 追问或返工 | `$D reply <name> "…"`；开新会话加 `--fresh`，带上你后来的改动加 `--sync` |
 | 先 A 后 B | `$D start --after <A> …`；写入 B 从 A 交付的改动起步，`apply A B` 按序合入 |
 | 自己跑重检查、测性能 | `$D lane make check`；测量用 `lane --measure` |
+| 节点不稳、换档前先测连通 | `$D probe`：走 Pi 本身（不是裸 HTTP）测各档模型，不建任务、不占名额 |
 | 看全文 / 改动 / 停掉 / 清理 | `$D result` / `$D diff` / `$D stop` / `$D clean --finished` |
 
 多行说明用 `--prompt-file -` 加 heredoc；示例见 [references/recipes.md](references/recipes.md)，全部选项见 `$D --help`。
 
 ## 档位
 
-同事都是 Pi，档位只选模型：不写 `--tier` 用 default（未配置则 strong）；`--tier strong` 用于写代码和严密审查；`--tier cheap` 只读，用于侦察、文案、看图。失败且没改文件时自动换强档重跑一次；`--model` 可直接指定模型。首次使用没配模型时，`start` 会列出可选模型和配置命令，照做即可（用户指定过就用用户的）。
+同事都是 Pi，档位只选模型：不写 `--tier` 用 default（未配置则 strong）；`--tier strong` 用于写代码和严密审查；`--tier cheap` 只读，用于侦察、文案、看图。上游瞬时中断（流中断、连接重置、502/503/504、429）先同模型同会话续做，最多 3 次；仍失败且没改文件时自动换强档重跑一次；`--model` 可直接指定模型。首次使用没配模型时，`start` 会列出可选模型和配置命令，照做即可（用户指定过就用用户的）。
 
 ## 任务说明
 
