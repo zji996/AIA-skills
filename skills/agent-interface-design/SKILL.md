@@ -1,9 +1,9 @@
 ---
 name: agent-interface-design
-description: 设计或修改模型能看到的东西时使用：工具与参数说明、工具结果与错误文字、Skill、系统段与 kit/插件说明、文件或图片的读取方式；也用于评审这类改动和设计对应评测。给出渐进式披露、结果带下一步、给事实不规定顺序、前缀冻结、失败分类、顺着模型习惯、改文字先测等原则与检查方法。Use when designing or reviewing model-facing surfaces — tool schemas and descriptions, tool results and error text, skills, system sections, file/image read paths — and their evals, covering progressive disclosure, affordances in results, facts over procedures, cache-stable prefixes, failure classes, measuring prompt changes.
+description: 设计或修改模型能看到的东西时使用：工具与参数说明、工具结果与错误文字、Skill、系统段与 kit/插件说明、文件或图片的读取方式；也用于评审这类改动和设计对应评测。给出渐进式披露、结果带下一步、给事实不规定顺序、前缀冻结、失败分类、顺着模型习惯、改文字先测、压缩即索引等原则与检查方法。Use when designing or reviewing model-facing surfaces — tool schemas and descriptions, tool results and error text, skills, system sections, file/image read paths — and their evals, covering progressive disclosure, affordances in results, facts over procedures, cache-stable prefixes, failure classes, measuring prompt changes, and compression as an index back to the original.
 license: MIT
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
 ---
 
 # 模型界面设计
@@ -62,6 +62,15 @@ metadata:
 4. 多个不同场景各跑一次，胜过同一场景重复多次；客户数据不进仓库，夹具用脚本生成。
 5. 基线已通过的用例不加规则。让模型「先问」「先确认」的句子，同时用一个需求已说清的用例测，防止它在不该问时也问。
 
+## 8. 压缩即索引
+
+一条早期信息值不值得保留，往往要等后面的事出现才知道。交接摘要、步骤摘要、记忆笔记、裁剪过的工具结果，都是写入时的取舍，注定会漏掉“后来才变得重要”的细节。
+
+- 压缩只当索引：原文保持无损、可搜索，遗漏靠读取时回看补救。
+- 原文位置由宿主确定性写出，紧挨着摘要放；不让模型自己写路径或编号，它看不到这些，只能猜。
+- 只说明原文在哪、可以搜索，不写“先读全文”，否则会引出整份回读。
+- 新增任何压缩都要回答“漏掉的东西从哪里找回”；评测时用“细节当时看起来无关、后来变得关键”的用例，再配一个信息就在摘要里的对照组，衡量是否过度回读。
+
 ## 评审清单
 
 - 典型任务的步数表（现在 / 改后）与每步重发量。
@@ -70,3 +79,4 @@ metadata:
 - 前缀是否变化；变化的缓存代价。
 - 失败属于哪一类，错误文字是否给出下一步。
 - 对照评测的数字：结果、步数、输入 token、无效步。
+- 每处压缩旁边是否有宿主写的原文位置，漏掉的细节能否找回。
