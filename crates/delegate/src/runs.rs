@@ -352,8 +352,11 @@ pub fn status(run: &Path) -> Value {
     if agent_pinned(&meta) || meta.get("agentPinned").is_some() {
         out["agentPinned"] = json!(agent_pinned(&meta));
     }
-    if agent_pinned(&meta) && !s(&meta, "model").is_empty() {
+    if !s(&meta, "model").is_empty() {
         out["model"] = meta["model"].clone();
+    }
+    if !s(&meta, "modelName").is_empty() {
+        out["modelName"] = meta["modelName"].clone();
     }
     if run.join(".applied").exists() && !run.join(".generate-pending").exists() {
         out["applied"] = json!(true);

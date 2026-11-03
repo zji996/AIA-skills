@@ -458,21 +458,24 @@ pub fn human(run: &Path, status: &Value) -> String {
 
 /// `pi/<tier>` for a tier's pick; `pi/<model>` for a pinned model, which no tier chose.
 fn agent_label(status: &Value) -> String {
+    // Name the model on every line: a caller should see what it is talking to, and the tier
+    // (with "推断" when the caller gave none) says why that model was picked.
     let model = s(status, "model");
-    if status["agentPinned"].as_bool() == Some(true) && !model.is_empty() {
-        let short = model.rsplit_once('/').map_or(model, |(_, name)| name);
-        format!("{}/{short}", s(status, "agent"))
-    } else {
-        format!(
-            "{}/{}{}",
-            s(status, "agent"),
-            s(status, "tier"),
-            if b(status, "tierInferred") {
-                "（推断）"
-            } else {
-                ""
-            }
-        )
+    // An alias names the model; a full provider/id shows only its id.
+    let name = match s(status, "modelName") {
+        alias if !alias.is_empty() && !alias.contains('/') => alias,
+        _ => model.rsplit_once('/').map_or(model, |(_, name)| name),
+    };
+    let agent = s(status, "agent");
+    let tier = s(status, "tier");
+    let pinned = status["agentPinned"].as_bool() == Some(true);
+    match (name.is_empty(), pinned || tier.is_empty()) {
+        (true, _) => format!("{agent}/{tier}"),
+        (false, true) => format!("{agent}/{name}"),
+        (false, false) => format!(
+            "{agent}/{name} · {tier}{}",
+            if b(status, "tierInferred") { "（推断）" } else { "" }
+        ),
     }
 }
 
@@ -485,6 +488,9 @@ mod tests {
     fn a_pinned_model_is_named_instead_of_the_tier() {
         let tier = json!({"agent":"pi","tier":"review"});
         assert_eq!(agent_label(&tier), "pi/review");
+        let picked = json!({"agent":"pi","tier":"review","tierInferred":true,
+            "model":"provider/gpt-sol","modelName":"sol"});
+        assert_eq!(agent_label(&picked), "pi/sol · review（推断）");
         let pinned = json!({"agent":"pi","tier":"review","agentPinned":true,
             "model":"provider/deepseek-flash"});
         assert_eq!(agent_label(&pinned), "pi/deepseek-flash");

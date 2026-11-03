@@ -665,7 +665,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
             self.assertEqual(out.returncode, 0, out.stderr)
             line = out.stdout.splitlines()[0]
             self.assertTrue(line.startswith("compact · 已交付"), line)
-            for text in ("pi/write", "验收通过", "改 2 个文件 +2/-1", "crates/protocol 1", "delegate diff"):
+            for text in ("· write（推断）", "验收通过", "改 2 个文件 +2/-1", "crates/protocol 1", "delegate diff"):
                 self.assertIn(text, line)
             self.assertNotIn(str(self.work), line)
             self.assertNotIn(state["worktree"], line)
@@ -691,7 +691,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         self.until(lambda: "cargo test" in (run / "events.jsonl").read_text(), "command event")
         out = self.cli("status", "running", human=True)
         self.assertEqual(out.returncode, 0, out.stderr)
-        for field in ("running · 运行中", "pi/write", "改 1 个文件 +1/-1", "最近：cargo test", "下一步："):
+        for field in ("running · 运行中", "pi/m · write（推断）", "改 1 个文件 +1/-1", "最近：cargo test", "下一步："):
             self.assertIn(field, out.stdout)
         recent = out.stdout.split("最近：", 1)[1].split(" · ", 1)[0]
         self.assertLessEqual(len(recent), 100)
