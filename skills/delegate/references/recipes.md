@@ -31,7 +31,7 @@ $D wait            # 放后台；三路都结束才返回
 
 想边收边看就改成逐个收取：`$D wait --stream`（宿主能把每行输出变成通知时，每路完工一行）或后台 `$D wait --any`（先完工的先返回，处理完再放同一条）。写入任务边收边合时，结论行的 `sourceDrift.overlap` 列出你合入别的结果后与它重叠的文件。
 
-Claude Code 的 Monitor 能把后台输出逐行转事件，优先 `wait --stream`；只有进程结束通知时重复后台 `wait --any`。直接 `--model` 的结论仍显示所在档位（如 `pi/cheap`）、`agentPinned: true`，固定模型不自动升档。
+Claude Code 的 Monitor 能把后台输出逐行转事件，优先 `wait --stream`；只有进程结束通知时重复后台 `wait --any`。直接 `--model` 的结论显示模型名（如 `pi/gemini-3.8-flash:high`）、`agentPinned: true`，固定模型不自动升档；`reply` 不带 `--tier` 沿用原模型，开跑时回显「沿用原会话的模型 …」。
 
 审自己刚写的代码时优先用另一家模型（主控之外的 Pi 模型，必要时 `--model` 指定）：作者自测再多也难看到自己的盲点。拿到结论后逐条去代码里核实，别整段转述。
 

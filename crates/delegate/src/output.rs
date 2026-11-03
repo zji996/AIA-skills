@@ -249,7 +249,7 @@ pub fn human(run: &Path, status: &Value) -> String {
     let mut parts = vec![
         s(status, "name").replace(['\n', '\r'], " "),
         format!("{label} {elapsed}"),
-        format!("{}/{}", s(status, "agent"), s(status, "tier")),
+        agent_label(status),
     ];
     let mut totals = status["changes"].clone();
     let mut paths = status["files"]
@@ -454,4 +454,30 @@ pub fn human(run: &Path, status: &Value) -> String {
         parts.push(format!("下一步：{next}"));
     }
     parts.join(" · ")
+}
+
+/// `pi/<tier>` for a tier's pick; `pi/<model>` for a pinned model, which no tier chose.
+fn agent_label(status: &Value) -> String {
+    let model = s(status, "model");
+    if status["agentPinned"].as_bool() == Some(true) && !model.is_empty() {
+        let short = model.rsplit_once('/').map_or(model, |(_, name)| name);
+        format!("{}/{short}", s(status, "agent"))
+    } else {
+        format!("{}/{}", s(status, "agent"), s(status, "tier"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::agent_label;
+    use serde_json::json;
+
+    #[test]
+    fn a_pinned_model_is_named_instead_of_the_tier() {
+        let tier = json!({"agent":"pi","tier":"default"});
+        assert_eq!(agent_label(&tier), "pi/default");
+        let pinned = json!({"agent":"pi","tier":"default","agentPinned":true,
+            "model":"aiatech-deepseek/deepseek/deepseek-v4.1-flash-fast:high"});
+        assert_eq!(agent_label(&pinned), "pi/deepseek-v4.1-flash-fast:high");
+    }
 }

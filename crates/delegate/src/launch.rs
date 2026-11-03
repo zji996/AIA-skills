@@ -1522,11 +1522,19 @@ pub fn launch(
         extra["standingSources"],
         if inherited { "（已有会话）" } else { "" }
     );
-    eprintln!(
-        "delegate: {} 档，模型 {}",
-        o.tier.as_deref().unwrap_or(""),
-        o.model.as_deref().unwrap_or("（Pi 默认）")
-    );
+    let model = o.model.as_deref().unwrap_or("（Pi 默认）");
+    // A pinned model is not the tier's pick: say so, or a reply that kept a --model run's
+    // model reads as if the default tier had replaced it.
+    if o.agent_pinned && parent_path.is_some() {
+        eprintln!("delegate: 沿用原会话的模型 {model}");
+    } else if o.agent_pinned {
+        eprintln!("delegate: 固定模型 {model}（--model）");
+    } else {
+        eprintln!(
+            "delegate: {} 档，模型 {model}",
+            o.tier.as_deref().unwrap_or("")
+        );
+    }
     if extra["defaults"].as_object().is_some_and(|d| !d.is_empty()) {
         eprintln!("delegate: 生效默认值及来源 {}", extra["defaults"]);
     }
