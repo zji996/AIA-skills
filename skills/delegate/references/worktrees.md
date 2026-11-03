@@ -22,6 +22,7 @@
 - `link`：大而只读的被忽略目录，建符号链接，写入会落到原仓库。
 - `setup`：依次在 worktree 根执行，输出写入 `setup.log`，任一失败即判 `failed`（`DELEGATE_SETUP_TIMEOUT`，默认 10m）。依赖用包管理器从本机缓存重建：pnpm 与 uv 以硬链接安装，几乎不额外占盘，但文件多时仍慢（含 torch 的数 GB venv 约 1 分钟）；不要 link `node_modules`、`.venv`，其中的可编辑安装指向原仓库源码。
 - `writeSetup`：同 `setup`，只在写入任务里、`setup` 之后执行；只读任务跳过。
+- `pool`：写入任务复用的固定 worktree 个数（0–16，默认 0 不用池）。槽位在 `${XDG_CACHE_HOME}/delegate/pool/<仓库名>-<n>`，路径不变、换任务时只 `git checkout` 有差异的文件，`target/` 与其他构建缓存保留，Cargo 等按绝对路径与修改时间判新鲜度的构建只重编改动部分。复用前先刷新索引再 `reset --hard`，删掉除 `target/` 外的未跟踪与忽略文件（托管 copy/link 重建）；`target/` 超过 `DELEGATE_POOL_TARGET_GIB`（默认 60）时清空一次。槽位属于在用它的 run（含续做），`clean` 或合入后释放、不删除；全部占用时退回独立 worktree。只读任务与 `--after` 叠加的写入不用池。
 - 这三类路径不计入改动。子模块在新 worktree 里是空目录：只读使用时写进 `link`（会替换空目录），需要独立修改时在 `setup` 里初始化。
 - 顶层 `accept` 是写入任务的默认验收命令；`--accept-also` 追加任务测试，`--accept` 覆盖，`--no-accept` 关闭，只读任务不使用默认。
 - `generated.paths` 的匹配语义同 `--protect`；改动清单与 diff 仍列出这些文件，`apply` 跳过其合并，在合并其他文件后由 lane 在源仓库根执行 `sh -c` 的 `command`，日志写入 `generate.log`；可选 `inputs`（同样的匹配语义）限定只有合并路径命中时才生成，省掉纯文档改动的排队；`--dry-run` 只报告动作。生成命令失败时退出 1，已合并文件保留（§6.4）。
@@ -30,7 +31,7 @@
 
 `--read-only` 在 git 仓库里默认也用这样的 worktree（`--in-place` 除外），只作为供阅读的快照：主控同时的编辑既不影响它读到的内容，也不会被算成它的改动；它违规写入的文件留在 worktree 里，记为 `readOnlyViolation`，不能 `apply`。两位同事在其中都有全部工具，`setup` 照常执行（它们可能跑测试）；只有无法隔离时（非 git 或 `--in-place`），只读 Pi 才只保留读文件、搜索、列目录。
 
-worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 `git worktree remove`，过期清理同理；`agent-handoff` 会列出尚未 `apply` 的写入型 worktree。
+worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 `git worktree remove`（池槽位只释放、不删除），过期清理同理；`agent-handoff` 会列出尚未 `apply` 的写入型 worktree。
 
 成功 `apply` 默认回收 worktree，轻量保留 run 的 `meta.json`、任务说明、最终答复与摘要 7 天（`DELEGATE_KEEP_DAYS`，0 禁止自动过期）；`clean <run>` 与 `clean --finished` 可提前删除。普通 `reply` 会从当前源分支新建 worktree，将原任务说明、上次答复和追加说明交给新会话；`reply --fresh` 仍只使用本轮说明。共享输入沿用原路径；repo 内路径必须在新 worktree 同位置不存在，否则报错。共享链接只是协作约定，并非文件系统写保护。
 

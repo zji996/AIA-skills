@@ -63,6 +63,19 @@ pub fn work_config(val: &Value, path: &Path) -> Res<Value> {
             })
             .collect::<Vec<_>>());
     }
+    match work.get("pool") {
+        None | Some(Value::Null) => {}
+        Some(value) => match value.as_u64() {
+            Some(n) if n <= crate::pool::MAX_SLOTS => out["pool"] = json!(n),
+            _ => {
+                return Err(format!(
+                    "{}: worktree.pool must be a number of slots from 0 to {}",
+                    path.display(),
+                    crate::pool::MAX_SLOTS
+                ))
+            }
+        },
+    }
     Ok(out)
 }
 fn strings(v: &Value) -> Vec<String> {
@@ -219,17 +232,39 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<Option<String>> {
     }
     let commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
     write(run.join("worktree-base-commit"), &commit)?;
-    if let Err(e) = git(
-        &source,
-        &[
-            "worktree",
-            "add",
-            "--detach",
-            &path.to_string_lossy(),
-            &commit,
-        ],
-    ) {
-        return Ok(Some(format!("worktree setup failed: {}", clip(&e, 300))));
+    let managed: Vec<String> = strings(&cfg["copy"])
+        .into_iter()
+        .chain(strings(&cfg["link"]))
+        .collect();
+    let reused = if b(tree, "pooled")
+        && tree["claimedBy"].as_str() == run.file_name().and_then(|n| n.to_str())
+    {
+        match crate::pool::reset(&path, &commit, &managed) {
+            Ok(reused) => reused,
+            Err(e) => return Ok(Some(format!("worktree setup failed: {}", clip(&e, 300)))),
+        }
+    } else {
+        false
+    };
+    if reused {
+        eprintln!("delegate: reused pool slot {}", path.display());
+    } else {
+        if b(tree, "pooled") {
+            // A slot removed by hand may still be registered; prune so add can take the path.
+            let _ = git(&source, &["worktree", "prune"]);
+        }
+        if let Err(e) = git(
+            &source,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                &path.to_string_lossy(),
+                &commit,
+            ],
+        ) {
+            return Ok(Some(format!("worktree setup failed: {}", clip(&e, 300))));
+        }
     }
     if s(meta, "mode") == "read-only" && !head.is_empty() {
         let _ = git(&path, &["reset", "-q", "--soft", &head]);
@@ -340,6 +375,11 @@ pub fn remove(meta: &Value) -> crate::cleanup::Containers {
         return crate::cleanup::Containers::default();
     }
     let containers = crate::cleanup::containers(path, false);
+    if crate::pool::is_slot(path) {
+        // The slot keeps its files and build cache; the next claim resets it.
+        crate::pool::release(path, Path::new(s(meta, "dir")));
+        return containers;
+    }
     if !path.exists() {
         return containers;
     }

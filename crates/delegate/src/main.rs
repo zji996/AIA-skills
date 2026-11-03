@@ -9,6 +9,7 @@ mod lane;
 mod launch;
 mod measure;
 mod output;
+mod pool;
 mod probe;
 mod resources;
 mod runs;

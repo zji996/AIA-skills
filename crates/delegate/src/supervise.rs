@@ -718,9 +718,13 @@ fn stack_on_upstream(run: &Path, meta: &mut Value, upstream: &Path, prior: &Valu
     let (source, exclude) = if stacked {
         (path, strings(&prior["snapshotExclude"]))
     } else {
-        (Path::new(s(tree, "source")), strings(&meta["snapshotExclude"]))
+        (
+            Path::new(s(tree, "source")),
+            strings(&meta["snapshotExclude"]),
+        )
     };
-    let base = changes::snapshot(source, run, &exclude).ok_or("cannot snapshot upstream changes")?;
+    let base =
+        changes::snapshot(source, run, &exclude).ok_or("cannot snapshot upstream changes")?;
     meta["chainBase"] = base["tree"].clone();
     meta["base"] = base;
     if stacked {
@@ -825,7 +829,12 @@ fn inner(
         admit_waiting(run, &meta, stop_waiter)?;
     }
     let mut setup_error = None;
-    if meta["worktree"].is_object() && !Path::new(s(&meta["worktree"], "path")).exists() {
+    let claimed_slot = b(&meta["worktree"], "pooled")
+        && s(&meta["worktree"], "claimedBy")
+            == run.file_name().unwrap_or_default().to_string_lossy();
+    if meta["worktree"].is_object()
+        && (claimed_slot || !Path::new(s(&meta["worktree"], "path")).exists())
+    {
         setup_error = match worktree::prepare(&meta, run) {
             Ok(error) => error,
             Err(e) => Some(clip(&format!("worktree setup failed: {e}"), 300)),

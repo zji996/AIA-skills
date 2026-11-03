@@ -1457,6 +1457,29 @@ db.write_text(json.dumps(units))
         self.assertEqual((state["state"], state["resumes"], state["files"]), ("answered", 1, ["half.txt"]))
         self.assertEqual((Path(state["worktree"]) / "half.txt").read_text(), "step1\nstep2\n")
 
+    def test_pool_slot_is_reused_after_clean_and_keeps_only_target(self):
+        repo = self.repo({"a.txt": "a\n", ".gitignore": "target/\n"})
+        (repo / ".delegate.json").write_text(json.dumps({"worktree": {"pool": 1}}))
+        self.fake_pi([answer("one"), SETTLED], pre='echo left > left.txt; mkdir -p target; echo built > target/keep')
+        first = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        slot = Path(first["worktree"])
+        self.assertEqual(slot.parent.name, "pool")
+        # While the first run holds the only slot, another task gets its own worktree.
+        self.fake_pi([answer("two"), SETTLED])
+        other = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        self.assertNotEqual(Path(other["worktree"]), slot)
+        self.cli("clean", first["run"], "--force")
+        self.assertTrue(slot.exists(), "a released slot keeps its files")
+        self.fake_pi([answer("three"), SETTLED],
+                     pre='test ! -e left.txt && test -e target/keep && echo clean > seen.txt')
+        third = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        self.assertEqual(Path(third["worktree"]), slot)
+        self.assertEqual(third["files"], ["seen.txt"])
+        # A reply continues in the slot without resetting it.
+        self.fake_pi([answer("four"), SETTLED], pre='test -e seen.txt && echo kept > reply.txt')
+        self.outcome(self.cli("reply", "--wait", third["run"], "more"))
+        self.assertEqual((slot / "reply.txt").read_text(), "kept\n")
+
     def test_repeated_interruptions_fail_after_three_resumes(self):
         self.env["DELEGATE_RESUME_BACKOFF"] = "0.1,0.1,0.1"
         self.fake_pi([interrupted(), SETTLED], probe=[answer("ok"), SETTLED])
@@ -3610,14 +3633,17 @@ fi
         (repo / "a.txt").write_text("first\n")
         self.assertEqual(self.outcome(self.cli("status", second["run"]))["appliedBy"], "detected")
 
-    def test_pinned_model_displays_its_tier_and_never_escalates(self):
+    def test_pinned_model_displays_its_model_and_never_escalates(self):
         self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/strong-m"}})
         self.fake_pi([answer(LEAKED), SETTLED])
         pinned = self.outcome(self.cli("run", "--tier", "cheap", "--model", "x/named", "--retries", "0", "task"))
         self.assertEqual((pinned["agent"], pinned["tier"], pinned["agentPinned"], pinned["state"]),
                          ("pi", "cheap", True, "malformed"))
         self.assertEqual(len((self.work / "pi.log").read_text().splitlines()), 1)
-        self.assertIn("pi/cheap", self.cli("status", pinned["run"], human=True).stdout)
+        # 6.10.0: a pinned run names the model it ran (from the summary), not the tier.
+        line = self.cli("status", pinned["run"], human=True).stdout
+        self.assertNotIn("pi/cheap", line)
+        self.assertIn("pi/fake-model", line)
 
     def test_pinned_reply_and_legacy_tier_display_do_not_rewrite_meta(self):
         self.fake_pi([answer("first"), SETTLED])

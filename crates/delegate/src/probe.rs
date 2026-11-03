@@ -477,14 +477,12 @@ pub fn command(args: &[String]) -> Res<i32> {
         handles
             .into_iter()
             .map(|handle| {
-                handle
-                    .join()
-                    .unwrap_or(Outcome {
-                        ok: false,
-                        seconds: 0.0,
-                        first: None,
-                        error: "probe thread panicked".into(),
-                    })
+                handle.join().unwrap_or(Outcome {
+                    ok: false,
+                    seconds: 0.0,
+                    first: None,
+                    error: "probe thread panicked".into(),
+                })
             })
             .collect()
     });
@@ -543,7 +541,14 @@ pub fn command(args: &[String]) -> Res<i32> {
                 }
             };
             let who = if candidates.len() > 1 {
-                format!("{} {model}", if *tier == "cheap" { "只读 cheap" } else { "写入 strong" })
+                format!(
+                    "{} {model}",
+                    if *tier == "cheap" {
+                        "只读 cheap"
+                    } else {
+                        "写入 strong"
+                    }
+                )
             } else {
                 model.clone()
             };
@@ -570,7 +575,16 @@ mod tests {
         let fallback = json!({"cheap": "p/fast", "strong": "p/fast"});
         // Wednesday 10:00: the peak rule holds, so it is also what the tier picks.
         assert_eq!(
-            tier_notes(&config, &peak, "p/peak", agents::Clock { weekday: 3, minute: 600 }, &idle),
+            tier_notes(
+                &config,
+                &peak,
+                "p/peak",
+                agents::Clock {
+                    weekday: 3,
+                    minute: 600
+                },
+                &idle
+            ),
             ["strong[mon-fri 09:00-12:00 maxActive 0/3 hit]=now"]
         );
         // Wednesday 13:00: outside the window the fallback model runs.
@@ -579,7 +593,10 @@ mod tests {
                 &config,
                 &fallback,
                 "p/fast",
-                agents::Clock { weekday: 3, minute: 780 },
+                agents::Clock {
+                    weekday: 3,
+                    minute: 780
+                },
                 &idle
             ),
             ["cheap=now", "strong[else]=now"]
@@ -591,7 +608,10 @@ mod tests {
                 &config,
                 &fallback,
                 "p/peak",
-                agents::Clock { weekday: 3, minute: 600 },
+                agents::Clock {
+                    weekday: 3,
+                    minute: 600
+                },
                 &busy
             ),
             ["strong[mon-fri 09:00-12:00 maxActive 3/3 miss]"]
@@ -601,7 +621,10 @@ mod tests {
     #[test]
     fn models_dedupe_by_id_and_arguments_reject_usage_errors() {
         assert_eq!(model_id("p/m:high"), "p/m");
-        assert_eq!(model_id("ollama/qwen2.5-coder:7b"), "ollama/qwen2.5-coder:7b");
+        assert_eq!(
+            model_id("ollama/qwen2.5-coder:7b"),
+            "ollama/qwen2.5-coder:7b"
+        );
         let parse_ok = |args: &[&str]| {
             let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
             parse(&args)

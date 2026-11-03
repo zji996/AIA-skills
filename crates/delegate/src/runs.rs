@@ -530,6 +530,15 @@ pub fn remove_after_apply(run: &Path) -> Vec<String> {
     } else {
         crate::cleanup::Containers::default()
     };
+    if crate::pool::is_slot(Path::new(path)) {
+        // The kept record must stop pointing at the slot, or it would hold it forever.
+        let mut released = meta.clone();
+        released["worktree"]["path"] = json!(format!("{path}#released"));
+        let _ = fs::write(
+            run.join("meta.json"),
+            serde_json::to_string_pretty(&released).unwrap_or_default(),
+        );
+    }
     let keep = [
         "meta.json",
         "prompt.md",

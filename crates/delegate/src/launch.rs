@@ -1560,14 +1560,29 @@ pub fn launch(
     let mut tree = extra["worktree"].clone();
     let mut wd = workdir.to_path_buf();
     if tree.is_object() && s(&tree, "path").is_empty() {
-        let path = cache_dir().join("worktrees").join(format!(
-            "{}-{}",
-            Path::new(s(&tree, "source"))
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy(),
-            run.file_name().unwrap_or_default().to_string_lossy()
-        ));
+        let slots = tree["config"]["pool"].as_u64().unwrap_or(0);
+        let slot = (mode == "write" && slots > 0 && tree["in"].is_null())
+            .then(|| crate::pool::claim(Path::new(s(&tree, "source")), &run, slots))
+            .flatten();
+        if mode == "write" && slots > 0 && tree["in"].is_null() && slot.is_none() {
+            eprintln!("delegate: all {slots} pool slots are held; this task gets its own worktree");
+        }
+        let path = slot.clone().unwrap_or_else(|| {
+            cache_dir().join("worktrees").join(format!(
+                "{}-{}",
+                Path::new(s(&tree, "source"))
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+                run.file_name().unwrap_or_default().to_string_lossy()
+            ))
+        });
+        if slot.is_some() {
+            tree["pooled"] = json!(true);
+            // Only the run that claimed the slot resets it; a reply continuing in the slot
+            // copies this record and must find its conversation's files untouched.
+            tree["claimedBy"] = json!(run.file_name().unwrap_or_default().to_string_lossy());
+        }
         tree["path"] = json!(path);
         let origin = if tree["in"].is_string() {
             Path::new(s(&tree, "sourceWorkdir"))
@@ -1582,7 +1597,8 @@ pub fn launch(
     }
     let top = if tree.is_object() {
         let p = PathBuf::from(s(&tree, "path"));
-        if p.exists() {
+        // A reused pool slot still holds an earlier task's files: snapshot the source.
+        if p.exists() && !b(&tree, "pooled") {
             Some(p)
         } else {
             Some(PathBuf::from(s(&tree, "source")))
@@ -1618,7 +1634,8 @@ pub fn launch(
             s(&tree, "source")
         ));
     }
-    let new_tree = tree.is_object() && !Path::new(s(&tree, "path")).exists();
+    let new_tree =
+        tree.is_object() && (b(&tree, "pooled") || !Path::new(s(&tree, "path")).exists());
     if new_tree {
         if let Some(v) = &mut base {
             v["large"] = json!({});

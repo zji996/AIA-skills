@@ -957,7 +957,17 @@ mod tests {
                 command.env("DELEGATE_RUN_DIR", &self.root);
             }
             crate::common::group(&mut command);
-            let child = command.spawn().unwrap();
+            // Another test thread forking while the copy's write handle is open makes exec
+            // fail with ETXTBSY until that child execs or exits; retry briefly.
+            let child = (0..100)
+                .find_map(|_| match command.spawn() {
+                    Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        None
+                    }
+                    other => Some(other.unwrap()),
+                })
+                .expect("sleeper still busy after 1 s");
             let pid = child.id() as i32;
             self.children.push(child);
             pid
