@@ -2,7 +2,7 @@
 name: iteration-speed
 description: 新机器或新仓库初始化、构建/测试/门禁变慢、设置门禁预算、多个 worktree 或 Agent 并行开发、决定验收分层或模块拆分、估算规模与压力或设代码量预算时使用；测量反馈回路、监测门禁预算、探测缓存并配置用户级 Rust 加速。Use when initializing a machine/repository, diagnosing slow build/test gates, enforcing gate budgets, sharing caches across worktrees or parallel agents, choosing validation layers and module boundaries, estimating scale and load from small varied samples, or setting a code-size budget.
 metadata:
-  version: "1.5.0"
+  version: "1.6.0"
 ---
 
 # 仓库迭代速度
@@ -22,6 +22,7 @@ metadata:
 9. **规模靠外推**：容量与压力先在少量、多样的小样本上量单位成本（每 MB、每实体、每请求、每个并发），样本标明自身规模，从几个规模点看出增长形状后换算到目标规模与并发。换算会跨过已知阈值（内存上限、缓存容量、锁或队列饱和、超线性算法）时，只在阈值附近验证一次；不为压测造巨型夹具或常驻 N 路并发测试。
 10. **性能对照看 CPU 而非墙钟**：机器有并行编译时，帧时与长任务可在同一构建上差几十倍。两版各起一份生产构建，同机交替跑，比较主线程 CPU 时间（如 Chrome trace 的 `tdur`）。dev 模式的热点（如 React 开发版 JSX）在生产构建里可能不存在；采样间隔不同的 profile 不可比。热点消失时先找它是否只是转移了：强制布局换个调用点仍要算一次。测不出收益的改动撤回。
 11. **代码量按增量清理**：代码预算设成「上次清理后的行数 + 增量」，不设固定总量也不按日增（AI 开发快，日增只反映速度）。超出时在下批功能前清理一轮（先只读侦察核实零引用、重复测试与旧兼容层，再按文件互斥改），合入后把基线改成清理后的行数；清不出多少也照样重设基线，增长本身是要的就不硬压。
+12. **回归按工作量结算**：判断门禁或测试变慢、验收「提速」改动时，用与机器无关的工作量，不用秒数（负载高时同一份代码能慢一倍）。数据库测试读 `pg_stat_database` 的读行（`tup_returned+tup_fetched`）、页访问、写行与事务增量：每次运行用独立的临时库，测试进程退出、删库之前读取；CPU 任务用 `perf stat` 的指令数或 user+sys 时间。工作量做成基线棘轮，容差取多次实测波动的约 2 倍，超出即失败，秒数只作参考。计数随执行顺序变化，本身就说明测试隔离有缺陷；修好隔离再纳入检查。
 
 ## 工具与按需参考
 
