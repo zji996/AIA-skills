@@ -75,6 +75,10 @@ SETTLED = {"type": "agent_settled"}
 LEAKED = "Let's read `trainingStyles.ts` as well.call:default_api:read{limit:120,offset:1,path:src/trainingStyles.ts}"
 
 
+REGISTERED_MODELS = {"main": "p/m", "scout": "p/scout-m", "review": "p/review-m", "write": "p/write-m",
+                     "ds": "p/ds-m", "gpt": "p/gpt-m", "named": "x/named", "env": "q/env-m"}
+
+
 class DelegateTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="delegate-")
@@ -89,8 +93,9 @@ class DelegateTests(unittest.TestCase):
                         XDG_CACHE_HOME=str(self.work / "cache"),
                         XDG_CONFIG_HOME=str(self.work / "config"),
                         PI_LOG=str(self.work / "pi.log"),
-                        # Both tiers set and equal, so nothing escalates unless a test configures it.
-                        DELEGATE_CHEAP_MODEL="p/m", DELEGATE_STRONG_MODEL="p/m")
+                        # All tiers equal: tests opt into per-purpose routing.
+                        DELEGATE_SCOUT_MODEL="p/m", DELEGATE_REVIEW_MODEL="p/m", DELEGATE_WRITE_MODEL="p/m")
+        DelegateTests.user_config(self, {"models": REGISTERED_MODELS})
         # Cleanup tests must never contact the host's Docker daemon or user systemd manager; the stubs
         # report nothing, so leftover-cleanup stays hermetic and does not enumerate host units.
         for stub in ("docker", "systemctl"):
@@ -395,8 +400,8 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         self.env["DELEGATE_SOURCE_BUILD_WARN_GIB"] = "0.1"
         self.env["XDG_CONFIG_HOME"] = str(self.work / "config")
         user = self.work / "config/delegate/config.json"
-        user.parent.mkdir(parents=True)
-        user.write_text(json.dumps({"sourceBuild": {"paths": ["build"]}}))
+        user.parent.mkdir(parents=True, exist_ok=True)
+        user.write_text(json.dumps({"models": REGISTERED_MODELS, "sourceBuild": {"paths": ["build"]}}))
         self.cli("run", "--workdir", repo, "--accept", "true", "user paths")
         self.assertEqual(self.source_disk(self.cli("status", cwd=repo))["paths"], [{"path": "build", "bytes": 8 * 1024**3}])
         cfg = repo / ".delegate.json"
@@ -420,7 +425,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         (repo / "external").symlink_to(self.work)
         self.env["XDG_CONFIG_HOME"] = str(self.work / "config")
         user = self.work / "config/delegate/config.json"
-        user.parent.mkdir(parents=True)
+        user.parent.mkdir(parents=True, exist_ok=True)
         for file in (user, repo / ".delegate.json"):
             for path in ("../outside", "/tmp/build", "build/../../outside", "external/missing", 7):
                 with self.subTest(file=file, path=path):
@@ -490,7 +495,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         """
         lines = ["#!/bin/sh", '[ "$1" = --version ] && { echo "fake-pi 1.0"; exit 0; }',
                  '[ "$2" = --list-models ] && { printf "provider model context max-out thinking images\\n'
-                 'p m 1M 1K yes yes\\np cheap-m 1M 1K yes yes\\np strong-m 1M 1K yes yes\\n"; exit 0; }',
+                 'p m 1M 1K yes yes\\np scout-m 64k 1K no no\\np review-m 1M 1K yes yes\\np write-m 1M 1K yes yes\\np ds-m 64k 1K yes no\\np gpt-m 1M 1K yes yes\\nx named 1M 1K yes yes\\nq env-m 1M 1K yes yes\\n"; exit 0; }',
                  "cat > /dev/null"]
         if probe is not None:
             body = " ".join(shlex.quote(json.dumps(e)) for e in probe)
@@ -510,9 +515,10 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         pi.chmod(0o755)
 
     def user_config(self, value):
+        value = {"models": REGISTERED_MODELS, **value}
         if "tiers" in value:
-            self.env.pop("DELEGATE_CHEAP_MODEL", None)
-            self.env.pop("DELEGATE_STRONG_MODEL", None)
+            for tier in ("SCOUT", "REVIEW", "WRITE"):
+                self.env.pop(f"DELEGATE_{tier}_MODEL", None)
         path = Path(self.env["XDG_CONFIG_HOME"]) / "delegate/config.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(value))
@@ -601,8 +607,8 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         self.fake_pi([answer("ok"), SETTLED])
         self.env["XDG_CONFIG_HOME"] = str(self.work / "config")
         config = self.work / "config/delegate/config.json"
-        config.parent.mkdir(parents=True)
-        config.write_text(json.dumps({"evidence": "echo user-proof"}))
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps({"models": REGISTERED_MODELS, "evidence": "echo user-proof"}))
         repo = self.repo({"a.txt": "old\n"})
         user = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
         self.assertIn("user-proof", user["evidence"]["tail"])
@@ -616,7 +622,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         protected = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--protect", "a.txt", "task"))
         self.assertEqual(protected["state"], "rejected")
         self.assertNotIn("evidence", protected)
-        config.write_text(json.dumps({"evidence": 1}))
+        config.write_text(json.dumps({"models": REGISTERED_MODELS, "evidence": 1}))
         bad = self.cli("start", "task")
         self.assertEqual(bad.returncode, 2)
         self.assertIn("evidence", bad.stderr)
@@ -659,7 +665,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
             self.assertEqual(out.returncode, 0, out.stderr)
             line = out.stdout.splitlines()[0]
             self.assertTrue(line.startswith("compact · 已交付"), line)
-            for text in ("pi/strong", "验收通过", "改 2 个文件 +2/-1", "crates/protocol 1", "delegate diff"):
+            for text in ("pi/write", "验收通过", "改 2 个文件 +2/-1", "crates/protocol 1", "delegate diff"):
                 self.assertIn(text, line)
             self.assertNotIn(str(self.work), line)
             self.assertNotIn(state["worktree"], line)
@@ -685,7 +691,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         self.until(lambda: "cargo test" in (run / "events.jsonl").read_text(), "command event")
         out = self.cli("status", "running", human=True)
         self.assertEqual(out.returncode, 0, out.stderr)
-        for field in ("running · 运行中", "pi/strong", "改 1 个文件 +1/-1", "最近：cargo test", "下一步："):
+        for field in ("running · 运行中", "pi/write", "改 1 个文件 +1/-1", "最近：cargo test", "下一步："):
             self.assertIn(field, out.stdout)
         recent = out.stdout.split("最近：", 1)[1].split(" · ", 1)[0]
         self.assertLessEqual(len(recent), 100)
@@ -1363,8 +1369,8 @@ db.write_text(json.dumps(units))
                     self.assertIn("替换了默认验收", warnings[0])
                 self.assertEqual(self.cli("wait", self.outcome(result)["run"]).returncode, 0)
         user_config = self.work / "config" / "delegate" / "config.json"
-        user_config.parent.mkdir(parents=True)
-        user_config.write_text(json.dumps({"accept": default}))
+        user_config.parent.mkdir(parents=True, exist_ok=True)
+        user_config.write_text(json.dumps({"models": REGISTERED_MODELS, "models": REGISTERED_MODELS, "accept": default}))
         (repo / ".delegate.json").write_text("{}")
         appended = self.outcome(self.cli("run", "--workdir", repo, "--accept-also", "true", "task"))
         self.assertEqual(appended["accept"]["command"], default + " && true")
@@ -1595,7 +1601,7 @@ db.write_text(json.dumps(units))
 
     def test_stale_starting_run_does_not_block_writer(self):
         stale = self.work / "runs/stale"
-        stale.mkdir(parents=True)
+        stale.mkdir(parents=True, exist_ok=True)
         (stale / "meta.json").write_text(json.dumps({"run": "stale", "dir": str(stale), "workdir": str(self.work),
                                                      "mode": "write", "name": "stale",
                                                      "startedEpoch": int(time.time()) - 60, "startedNs": 1}))
@@ -1659,7 +1665,7 @@ db.write_text(json.dumps(units))
 
     def test_runs_default_to_git_root_of_caller_with_gitignore(self):
         repo = self.work / "repo"
-        (repo / "sub").mkdir(parents=True)
+        (repo / "sub").mkdir(parents=True, exist_ok=True)
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
         del self.env["DELEGATE_RUNS"]
         self.fake_pi([answer("ok"), SETTLED])
@@ -1674,7 +1680,7 @@ db.write_text(json.dumps(units))
         self.fake_pi([answer("old answer"), SETTLED])
         state = self.outcome(self.cli("run", "--read-only", "--name", "legacy", "task", cwd=repo))
         old = repo / ".local/run/pi" / state["run"]
-        old.parent.mkdir(parents=True)
+        old.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(state["dir"], old)
         meta = json.loads((old / "meta.json").read_text())
         meta["dir"] = str(old)
@@ -1786,7 +1792,7 @@ db.write_text(json.dumps(units))
         for marker in ({"DELEGATE_AGENT": "codex"}, {"DELEGATE_AGENT": "pi"}, {"PI_DELEGATE_AGENT": "pi"},
                        {"PI_DELEGATE_ACTIVE": "1"}):
             env = {**self.env, **marker}
-            for args in (["start", "task"], ["run", "--tier", "cheap", "--read-only", "task"],
+            for args in (["start", "task"], ["run", "--tier", "scout", "--read-only", "task"],
                          ["reply", "last", "more"]):
                 result = subprocess.run([str(DELEGATE), *args], cwd=self.work, env=env, capture_output=True,
                                         text=True, timeout=30)
@@ -1795,81 +1801,110 @@ db.write_text(json.dumps(units))
             lane = subprocess.run([str(DELEGATE), "lane", "true"], cwd=self.work, env=env, timeout=30)
             self.assertEqual(lane.returncode, 0)  # heavy checks still queue
 
-    def test_tier_picks_the_model_and_cheap_only_reads(self):
-        self.fake_pi([answer("ok"), SETTLED])
-        calls = lambda: (self.work / "pi.log").read_text().splitlines()
-        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/strong-m:high"}})
-        for args in (("--read-only",), ()):  # no default configured: everything goes strong
-            state = self.outcome(self.cli("run", *args, "task"))
-            self.assertEqual((state["agent"], state["tier"]), ("pi", "strong"))
-            self.assertIn("--model p/strong-m:high", calls()[-1])
-        state = self.outcome(self.cli("run", "--tier", "cheap", "task"))
-        self.assertEqual((state["tier"], state["mode"]), ("cheap", "read-only"))  # cheap implies read-only
-        self.assertIn("--model p/cheap-m", calls()[-1])
-        for flags in (("--accept", "true"), ("--worktree",), ("--protect", "a/")):
-            refused = self.cli("run", "--tier", "cheap", *flags, "task")
-            self.assertEqual(refused.returncode, 2, flags)
-            self.assertIn("cheap tier only reads", refused.stderr)
-        self.assertEqual(self.outcome(self.cli("run", "--tier", "default", "task"))["tier"], "strong")
-        self.env["DELEGATE_CHEAP_MODEL"] = "q/env-m"
-        self.outcome(self.cli("run", "--tier", "cheap", "task"))
-        self.assertIn("--model q/env-m", calls()[-1])
-        state = self.outcome(self.cli("run", "--read-only", "--model", "x/named", "task"))
-        self.assertIn("--model x/named", calls()[-1])
-        self.assertEqual((state["tier"], state["agentPinned"]), ("strong", True))  # named outright: no escalation
-        removed = self.cli("run", "--agent", "codex", "task")
-        self.assertEqual(removed.returncode, 2)
-        self.assertIn("removed in 6.0", removed.stderr)
-        self.user_config({"tiers": {"fast": "p/m"}})
-        self.assertIn("tiers.fast", self.cli("run", "--read-only", "task").stderr)
-        (self.bin / "pi").unlink()
-        self.user_config({"tiers": {"cheap": "p/m", "strong": "p/m"}})
-        self.env["PATH"] = f"{self.bin}:/usr/bin:/bin"
-        result = self.cli("run", "--read-only", "task")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("missing required tools: pi", result.stderr)
+    def purpose_config(self, **tiers):
+        config = {"models": {"sol": "p/review-m", "ds": "p/scout-m", "coder": "p/write-m", "slow": "p/ds-m", "gpt": "p/gpt-m", "main": "p/m", "env": "q/env-m"},
+                  "thinking": "high", "tiers": {"scout": "ds", "review": "sol", "write": "coder"}}
+        config["tiers"].update(tiers)
+        return config
 
-    def test_default_tier_runs_tasks_given_no_tier_and_escalates_to_strong(self):
-        self.user_config({"tiers": {"default": "p/m", "cheap": "p/cheap-m", "strong": "p/strong-m"}})
-        log = self.work / "pi.log"
+    def test_purpose_inference_alias_thinking_and_write_refusal(self):
         self.fake_pi([answer("ok"), SETTLED])
-        for args in (("--read-only",), ()):
-            state = self.outcome(self.cli("run", *args, "task"))
-            self.assertEqual(state["tier"], "default")
-            self.assertIn("--model p/m", log.read_text().splitlines()[-1])
-        self.assertEqual(self.outcome(self.cli("run", "--read-only", "--tier", "cheap", "task"))["tier"], "cheap")
-        self.assertIn("--model p/cheap-m", log.read_text().splitlines()[-1])
-        log.unlink()
-        self.fake_pi([answer(LEAKED), SETTLED], [answer("found it"), SETTLED])
-        state = self.outcome(self.cli("run", "--read-only", "--retries", "0", "task"))
-        self.assertEqual((state["state"], state["tier"], state["escalatedFrom"]), ("answered", "strong", "p/m"))
-        self.assertIn("--model p/strong-m", log.read_text().splitlines()[-1])
-        self.assertIn("default: p/m", self.cli("tiers").stdout)
-        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/strong-m"}})
-        self.assertIn("default: (not set", self.cli("tiers").stdout)
-        self.assertEqual(self.cli("tiers", "--default", "p/m").returncode, 0)
-        config = json.loads((self.work / "config/delegate/config.json").read_text())
-        self.assertEqual(config["tiers"]["default"], "p/m")
+        self.user_config(self.purpose_config())
+        result = self.cli("run", "--read-only", "task")
+        state = self.outcome(result)
+        self.assertEqual((state["tier"], state["tierInferred"]), ("review", True))
+        self.assertIn("未指定 --tier，按只读推断为 review 档 → sol（p/review-m，thinking high）", result.stderr)
+        self.assertIn("推断", self.cli("status", state["run"], human=True).stdout)
+        explicit = self.cli("run", "--read-only", "--model", "sol", "--thinking", "low", "task")
+        named = self.outcome(explicit)
+        self.assertTrue(named["agentPinned"])
+        self.assertFalse(named["tierInferred"])
+        self.assertIn("固定模型 p/review-m，thinking low", explicit.stderr)
+        self.assertNotIn("未指定", explicit.stderr)
+        self.assertIn("--model p/review-m --thinking low", (self.work / "pi.log").read_text().splitlines()[-1])
+        reply = self.cli("reply", "--wait", named["run"], "more")
+        self.assertEqual(reply.returncode, 0, reply.stderr)
+        self.assertIn("--thinking low", (self.work / "pi.log").read_text().splitlines()[-1])
+        changed = self.cli("reply", "--wait", self.outcome(reply)["run"], "--model", "coder", "--thinking", "medium", "more")
+        self.assertIn("p/write-m，thinking medium", changed.stderr)
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        for tier in ("scout", "review"):
+            refused = self.cli("start", "--tier", tier, "write task")
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("--tier write or --model", refused.stderr)
+        for args in (("--tier", "review", "--model", "sol"), ("--model", "sol:high"), ("--tier", "cheap"), ("--tier", "vision")):
+            refused = self.cli("start", "--read-only", *args, "task")
+            self.assertEqual(refused.returncode, 2, refused.stderr)
+        write = self.cli("run", "task")
+        self.assertIn("按写入推断为 write", write.stderr)
+        self.assertEqual(self.outcome(write)["tier"], "write")
+
+    def test_alias_substring_ambiguity_and_thinking_suffix_errors(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        self.user_config(self.purpose_config())
+        unique = self.cli("run", "--read-only", "--model", "SO", "task")
+        self.assertEqual(unique.returncode, 0, unique.stderr)
+        self.assertIn("p/review-m", unique.stderr)
+        ambiguous = self.cli("run", "--read-only", "--model", "-m", "task")
+        self.assertEqual(ambiguous.returncode, 2)
+        for text in ("ambiguous model", "p/review-m", "p/write-m"):
+            self.assertIn(text, ambiguous.stderr)
+        bad = self.cli("run", "--read-only", "--model", "sol:high", "task")
+        self.assertIn("--thinking", bad.stderr)
+        config = self.purpose_config()
+        config["models"]["sol"] += ":high"
+        self.user_config(config)
+        self.assertIn("thinking field", self.cli("start", "--read-only", "task").stderr)
+        self.user_config({"tiers": {"cheap": "p/m", "strong": "p/m"}})
+        self.assertIn("unknown tier", self.cli("start", "--read-only", "task").stderr)
+
+    def test_model_universe_is_registry_not_pis_builtins(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        self.user_config({"models": {"sol": "p/review-m", "ds": "p/scout-m", "coder": "p/write-m"},
+                          "tiers": {"scout": "ds", "review": "sol", "write": "coder"}})
+        for name in ("x/named", "named"):
+            refused = self.cli("run", "--read-only", "--model", name, "task")
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("not registered", refused.stderr)
+            self.assertIn("tiers --alias name=provider/id", refused.stderr)
+        shown = self.cli("tiers")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertEqual(shown.stdout.splitlines()[-1], "Pi 里还有 5 个模型未登记")
+        self.assertNotIn("x/named", shown.stdout)
+        self.assertIn("sol → p/review-m | 1M | true | true", shown.stdout)
+
+    def test_images_guard_never_changes_the_chosen_model(self):
+        self.fake_pi([answer("ok"), SETTLED])
+        self.user_config(self.purpose_config(scout=[{"model": "ds", "maxActive": 10}, "sol"]))
+        image = self.work / "shot.png"
+        image.write_bytes(b"image fixture")
+        for flags in (("--tier", "scout"), ("--model", "ds")):
+            result = self.cli("run", "--read-only", *flags, "--image", image, "look")
+            self.assertEqual(result.returncode, 2, result.stderr)
+            for text in ("p/scout-m", "images=no", "models.json", "input", "image", "--model"):
+                self.assertIn(text, result.stderr)
+        self.assertFalse((self.work / "pi.log").exists())
+        result = self.cli("run", "--read-only", "--tier", "review", "--image", image, "look")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("p/review-m", result.stderr)
 
     def test_tier_rules_pick_by_local_hours_and_reject_a_list_without_fallback(self):
-        always = {"model": "p/ds-m", "hours": "00:00-23:59"}
-        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": [always, "p/gpt-m"]}})
+        always = {"model": "p/ds-m", "hours": "00:00-23:59", "thinking": "low"}
+        self.user_config(self.purpose_config(review=[always, "p/gpt-m"]))
         self.env["TZ"] = "UTC"
-        log = self.work / "pi.log"
         self.fake_pi([answer("ok"), SETTLED])
-        self.outcome(self.cli("run", "--read-only", "task"))
-        self.assertIn("--model p/ds-m", log.read_text().splitlines()[-1])
-        self.assertIn("rules: 00:00-23:59 p/ds-m, else p/gpt-m", self.cli("tiers").stdout)
-        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": [always]}})
+        result = self.cli("run", "--read-only", "task")
+        self.assertIn("--model p/ds-m --thinking low", (self.work / "pi.log").read_text().splitlines()[-1])
+        self.assertIn("00:00-23:59 p/ds-m", self.cli("tiers").stdout)
+        self.user_config(self.purpose_config(review=[always]))
         self.assertIn("ends with a plain model", self.cli("run", "--read-only", "task").stderr)
-        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": [{"model": "p/m", "hours": "8:30-9:00"}, "p/m"]}})
-        self.assertIn("tiers.strong[0]", self.cli("run", "--read-only", "task").stderr)
-        for rule in ({"model": "p/m"}, {"model": "p/m", "days": "fri-mon"}, {"model": "p/m", "maxActive": 0}):
-            self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": [rule, "p/m"]}})
-            self.assertIn("tiers.strong[0]", self.cli("run", "--read-only", "task").stderr)
+        for rule in ({"model": "p/m"}, {"model": "p/m", "hours": "8:30-9:00"},
+                     {"model": "p/m", "days": "fri-mon"}, {"model": "p/m", "maxActive": 0}):
+            self.user_config(self.purpose_config(review=[rule, "p/m"]))
+            self.assertIn("tiers.review[0]", self.cli("run", "--read-only", "task").stderr)
 
-    def test_tier_rule_max_active_sends_later_starts_to_the_next_model(self):
-        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": [{"model": "p/m", "maxActive": 2}, "p/strong-m"]}})
+    def test_tier_rule_max_active_counts_resolved_alias_models(self):
+        self.user_config(self.purpose_config(review=[{"model": "sol", "maxActive": 2}, "coder"]))
         gate = self.work / "gate"
         self.fake_pi([answer("ok"), SETTLED], pre=f"while [ ! -f {gate} ]; do sleep .02; done")
         models = []
@@ -1877,88 +1912,56 @@ db.write_text(json.dumps(units))
             state = self.outcome(self.cli("start", "--read-only", "--name", f"cap{index}", "task"))
             self.addCleanup(self.cli, "stop", state["run"])
             models.append(json.loads((Path(state["dir"]) / "meta.json").read_text())["model"])
-        self.assertEqual(models, ["p/m", "p/m", "p/strong-m"])
-        self.assertIn("rules: <2 running p/m, else p/strong-m", self.cli("tiers").stdout)
+        self.assertEqual(models, ["p/review-m", "p/review-m", "p/write-m"])
         gate.touch()
         for index in range(3):
             self.assertEqual(self.cli("wait", f"cap{index}").returncode, 0)
-        state = self.outcome(self.cli("run", "--read-only", "task"))  # the places are free again
-        self.assertIn("--model p/m", (self.work / "pi.log").read_text().splitlines()[-1])
 
-    def test_repository_tiers_override_per_tier_and_unset_default_falls_back(self):
-        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/m"}})
+    def test_repository_models_tiers_and_thinking_merge_per_key(self):
+        self.user_config(self.purpose_config())
         repo = self.repo({"a.txt": "a\n"})
-        (repo / ".delegate.json").write_text(json.dumps({"tiers": {"strong": "p/strong-m"}}))
+        (repo / ".delegate.json").write_text(json.dumps({"models": {"sol": "p/m"}, "tiers": {"write": "sol"}, "thinking": "low"}))
         self.fake_pi([answer("ok"), SETTLED])
-        calls = lambda: (self.work / "pi.log").read_text().splitlines()
-        self.outcome(self.cli("run", "--tier", "cheap", "--workdir", repo, "task"))
-        self.assertIn("--model p/cheap-m", calls()[-1])  # the user's cheap tier survives
-        self.outcome(self.cli("run", "--workdir", repo, "--in-place", "task"))
-        self.assertIn("--model p/strong-m", calls()[-1])  # the repository's strong tier wins
-        state = self.outcome(self.cli("run", "--read-only", "--tier", "default", "--workdir", repo, "task"))
-        self.assertEqual(state["tier"], "strong")  # no default configured: strong
-        self.assertIn("--model p/strong-m", calls()[-1])
+        result = self.cli("run", "--workdir", repo, "--in-place", "task")
+        self.assertIn("p/m，thinking low", result.stderr)
+        read = self.cli("run", "--read-only", "--tier", "scout", "--workdir", repo, "task")
+        self.assertIn("p/scout-m，thinking low", read.stderr)
+        self.env["DELEGATE_SCOUT_MODEL"] = "q/env-m"
+        self.env["DELEGATE_THINKING"] = "medium"
+        override = self.cli("run", "--read-only", "--tier", "scout", "--thinking", "off", "--workdir", repo, "task")
+        self.assertIn("q/env-m，thinking medium", override.stderr)
 
-    def test_both_tiers_must_be_set_and_tiers_sets_them(self):
+    def test_all_three_tiers_required_and_tiers_sets_aliases(self):
         self.fake_pi([answer("ok"), SETTLED])
-        self.user_config({"tiers": {"cheap": "p/cheap-m"}})
+        self.user_config({"tiers": {"scout": "p/scout-m"}})
         refused = self.cli("start", "--read-only", "task")
         self.assertEqual(refused.returncode, 2)
-        # The refusal carries everything a calling model needs to configure it in one step.
-        for text in ("model tiers not configured: strong", "p/strong-m  [thinking]", "tiers --cheap"):
+        for text in ("model tiers not configured", "review", "context 1M", "images true", "--scout"):
             self.assertIn(text, refused.stderr)
-        self.assertFalse((self.work / "pi.log").exists())
-        shown = self.cli("tiers")
-        self.assertEqual(shown.returncode, 1)
-        self.assertIn("strong: (not set)", shown.stdout)
-        for bad in ("p/nope", "nope", "p/strong-m:huge"):
-            self.assertEqual(self.cli("tiers", "--strong", bad).returncode, 2, bad)
-        done = self.cli("tiers", "--strong", "p/strong-m:high")
+        self.assertEqual(self.cli("tiers").returncode, 1)
+        for option in ("--cheap", "--strong", "--default"):
+            self.assertEqual(self.cli("tiers", option, "p/m").returncode, 2)
+        for bad in ("p/nope", "nope", "p/write-m:high"):
+            self.assertEqual(self.cli("tiers", "--write", bad).returncode, 2, bad)
+        done = self.cli("tiers", "--alias", "sol=p/review-m", "--alias", "code=p/write-m",
+                        "--review", "sol", "--write", "code", "--thinking", "high")
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("strong: p/strong-m:high", done.stdout)
-        config = json.loads((self.work / "config/delegate/config.json").read_text())
-        self.assertEqual(config["tiers"], {"cheap": "p/cheap-m", "strong": "p/strong-m:high"})
+        for text in ("review: sol → p/review-m", "thinking high", "context | images | thinking"):
+            self.assertIn(text, done.stdout)
         self.assertEqual(self.outcome(self.cli("run", "--read-only", "task"))["state"], "answered")
 
-    def test_failed_cheap_run_escalates_once_to_the_strong_model(self):
-        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/strong-m"}})
-        log = self.work / "pi.log"
-        self.fake_pi([answer(LEAKED), SETTLED], [answer("found it"), SETTLED])
-        repo = self.repo({"a.txt": "a\n"})
-        result = self.cli("run", "--tier", "cheap", "--retries", "0", "--workdir", repo, "审查一下")
+    def test_transient_failure_changes_to_next_model_in_same_tier(self):
+        self.user_config(self.purpose_config(review=[{"model": "sol", "maxActive": 10}, "coder"]))
+        self.env["DELEGATE_RESUME_BACKOFF"] = "0.1"
+        self.fake_pi([interrupted(), SETTLED], [interrupted(), SETTLED], [answer("found it"), SETTLED], probe=[answer("ok"), SETTLED])
+        result = self.cli("run", "--read-only", "--tier", "review", "--retries", "0", "task")
         state = self.outcome(result)
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual((state["state"], state["agent"], state["tier"], state["escalatedFrom"], state["attempts"]),
-                         ("answered", "pi", "strong", "p/cheap-m", 2))
-        calls = log.read_text().splitlines()
-        self.assertIn("--model p/cheap-m", calls[0])
-        self.assertIn("--model p/strong-m", calls[1])
-        self.assertEqual((Path(state["dir"]) / "prompt.md").read_text().count("只读任务"), 1)
-        self.assertIn("found it", (Path(state["dir"]) / "result.md").read_text())
-        self.fake_pi([answer("more"), SETTLED])
-        reply = self.outcome(self.cli("reply", "--wait", state["run"], "and?"))
-        self.assertEqual(reply["tier"], "strong")
-        self.assertIn("--model p/strong-m", log.read_text().splitlines()[-1])
-        # A default-tier write that changed nothing and failed its check is handed over too...
-        self.user_config({"tiers": {"default": "p/m", "cheap": "p/cheap-m", "strong": "p/strong-m"}})
-        log.unlink()
-        self.fake_pi([answer("done"), SETTLED], [answer("fixed"), SETTLED], pre='[ "$n" -eq 2 ] && touch made.txt')
-        state = self.outcome(self.cli("run", "--workdir", repo, "--in-place", "--accept", "test -f made.txt", "task"))
-        self.assertEqual((state["state"], state["escalatedFrom"], state["files"]), ("delivered", "p/m", ["made.txt"]))
-        # ...but not one that left changes behind, nor one whose model was named outright,
-        (repo / "made.txt").unlink()
-        self.fake_pi([answer("done"), SETTLED], pre="echo half > partial.txt")
-        state = self.outcome(self.cli("run", "--workdir", repo, "--in-place", "--accept", "test -f made.txt", "task"))
-        self.assertEqual(state["state"], "rejected")
-        self.assertNotIn("escalatedFrom", state)
+        self.assertEqual((state["state"], state["tier"], state["escalatedFrom"]), ("answered", "review", "p/review-m"))
+        self.assertIn("--model p/write-m", (self.work / "pi.log").read_text().splitlines()[-1])
         self.fake_pi([answer(LEAKED), SETTLED])
-        state = self.outcome(self.cli("run", "--tier", "cheap", "--retries", "0", "--model", "p/cheap-m", "task"))
-        self.assertEqual(state["state"], "malformed")
-        self.assertNotIn("escalatedFrom", state)
-        # ...nor when the strong tier runs the same model.
-        self.user_config({"tiers": {"cheap": "p/m", "strong": "p/m"}})
-        state = self.outcome(self.cli("run", "--tier", "cheap", "--retries", "0", "task"))
-        self.assertEqual((state["state"], state["tier"]), ("malformed", "cheap"))
+        malformed = self.outcome(self.cli("run", "--read-only", "--tier", "review", "--retries", "0", "task"))
+        self.assertEqual(malformed["state"], "malformed")
+        self.assertNotIn("escalatedFrom", malformed)
 
     def test_wait_until_all_without_runs_collects_everything_pending(self):
         self.fake_pi([answer("ok"), SETTLED])
@@ -2109,15 +2112,15 @@ db.write_text(json.dumps(units))
         self.assertEqual((line["protocol"], line["caller"]), (1, {"id": "thread-7", "source": "CODEX_THREAD_ID"}))
         [pi] = line["agents"]
         self.assertEqual((pi["name"], pi["tiers"], pi["models"]),
-                         ("pi", ["cheap", "strong"], {"default": "", "cheap": "p/m", "strong": "p/m"}))
+                         ("pi", ["scout", "review", "write"], {"scout": "p/m", "review": "p/m", "write": "p/m"}))
         self.assertEqual(pi["bin"], str((self.bin / "pi").resolve()))
         self.assertEqual(pi["version"], "fake-pi 1.0")
         self.assertEqual(pi["shadowed"], [str(shadow / "pi")])  # as found on PATH, not resolved
-        self.user_config({"tiers": {"strong": "p/strong-m"}})
+        self.user_config({"tiers": {"write": "p/write-m"}})
         self.env.pop("CODEX_THREAD_ID")
         line = json.loads(self.cli("protocol").stdout)
         self.assertIsNone(line["caller"])
-        self.assertEqual(line["agents"][0]["models"], {"default": "", "cheap": "", "strong": "p/strong-m"})  # unset shows empty
+        self.assertEqual(line["agents"][0]["models"], {"scout": "", "review": "", "write": "p/write-m"})  # unset shows empty
         self.assertEqual(self.cli("protocol", "extra").returncode, 2)
 
     def test_wait_collects_only_current_caller_and_reports_other_failure(self):
@@ -2341,7 +2344,7 @@ db.write_text(json.dumps(units))
 
     def test_worktree_copy_includes_ignored_files_and_directories_and_skips_missing(self):
         repo = self.repo({"a.txt": "a\n", ".gitignore": ".local/\n.env\n"})
-        (repo / ".local/scan").mkdir(parents=True)
+        (repo / ".local/scan").mkdir(parents=True, exist_ok=True)
         (repo / ".local/scan/material.txt").write_text("prepared\n")
         (repo / ".env").write_text("TOKEN=local\n")
         (repo / ".delegate.json").write_text(json.dumps({"worktree": {
@@ -2629,18 +2632,18 @@ db.write_text(json.dumps(units))
             self.assertNotIn(key, review)
 
     def test_reply_can_move_the_conversation_to_the_strong_model(self):
-        self.user_config({"tiers": {"default": "p/m", "cheap": "p/cheap-m", "strong": "p/strong-m"}})
+        self.user_config({"tiers": {"review": "p/m", "scout": "p/scout-m", "write": "p/write-m"}})
         repo = self.repo({"a.txt": "a\n"})
         self.fake_pi([answer("draft"), SETTLED], pre="echo draft >> a.txt")
         draft = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "d", "draft"))
         self.fake_pi([answer("polished"), SETTLED], pre="echo polish >> a.txt")
-        polished = self.outcome(self.cli("reply", "--wait", "d", "--tier", "strong", "polish the draft"))
+        polished = self.outcome(self.cli("reply", "--wait", "d", "--tier", "write", "polish the draft"))
         self.assertEqual((polished["state"], polished["tier"], polished["worktree"]),
-                         ("answered", "strong", draft["worktree"]))
+                         ("answered", "write", draft["worktree"]))
         call = (self.work / "pi.log").read_text().splitlines()[-1]
-        self.assertIn("--model p/strong-m", call)
+        self.assertIn("--model p/write-m", call)
         self.assertIn("--fork", call)  # same colleague, same session, another model
-        self.assertIn("this conversation writes", self.cli("reply", "d", "--tier", "cheap", "more").stderr)
+        self.assertIn("this conversation writes", self.cli("reply", "d", "--tier", "scout", "more").stderr)
         self.assertEqual(self.cli("apply", "--json", "--keep", "d").returncode, 0)
         self.assertEqual((repo / "a.txt").read_text(), "a\ndraft\npolish\n")
 
@@ -3432,23 +3435,23 @@ cargo check --package small; echo $? > "$DELEGATE_RUN_DIR/prefix-code"
         repo = self.repo({"a.txt": "old\n"})
         self.env["XDG_CONFIG_HOME"] = str(self.work / "config")
         user_file = self.work / "config/delegate/config.json"
-        user_file.parent.mkdir(parents=True)
+        user_file.parent.mkdir(parents=True, exist_ok=True)
         prefix = {"argv": ["cargo", "check"], "hint": "prefix"}
         exact = {"argv": ["cargo", "check"], "exact": True, "hint": "exact"}
-        user_file.write_text(json.dumps({"agentDeny": [prefix, exact]}))
+        user_file.write_text(json.dumps({"models": REGISTERED_MODELS, "agentDeny": [prefix, exact]}))
         tool = self.bin / "cargo"
         tool.write_text("#!/bin/sh\nexit 0\n")
         tool.chmod(0o755)
         self.fake_pi([answer("done"), SETTLED], pre='cargo check; cargo check --package small')
         config = repo / ".delegate.json"
         for revoke, remaining, denied in ((False, exact, 1), (True, prefix, 2)):
-            config.write_text(json.dumps({"agentDeny": [{"argv": ["cargo", "check"],
+            config.write_text(json.dumps({"models": REGISTERED_MODELS, "agentDeny": [{"argv": ["cargo", "check"],
                                                          "exact": revoke, "allow": True}]}))
             state = self.outcome(self.cli("run", "--workdir", repo, "task"))
             meta = json.loads((Path(state["dir"]) / "meta.json").read_text())
             self.assertEqual(meta["agentDeny"], [remaining])
             self.assertEqual(state["denied"], denied)
-        config.write_text(json.dumps({"agentDeny": [{**exact, "exact": "yes"}]}))
+        config.write_text(json.dumps({"models": REGISTERED_MODELS, "agentDeny": [{**exact, "exact": "yes"}]}))
         rejected = self.cli("start", "--workdir", repo, "task")
         self.assertEqual(rejected.returncode, 2)
         self.assertIn("agentDeny.exact must be a boolean", rejected.stderr)
@@ -3515,8 +3518,8 @@ cargo check --package small; echo $? > "$DELEGATE_RUN_DIR/prefix-code"
         repo = self.repo({"a.txt": "old\n"})
         self.env["XDG_CONFIG_HOME"] = str(self.work / "config")
         path = self.work / "config/delegate/config.json"
-        path.parent.mkdir(parents=True)
-        path.write_text(json.dumps({"repoMaxActive": 3, "maxActive": 7}))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"models": REGISTERED_MODELS, "repoMaxActive": 3, "maxActive": 7}))
         (repo / ".delegate.json").write_text('{"repoMaxActive":5}')
         self.env["DELEGATE_MAX_ACTIVE"] = "0"
         state = self.outcome(self.cli("run", "--read-only", "--workdir", repo, "task"))
@@ -3634,33 +3637,33 @@ fi
         self.assertEqual(self.outcome(self.cli("status", second["run"]))["appliedBy"], "detected")
 
     def test_pinned_model_displays_its_model_and_never_escalates(self):
-        self.user_config({"tiers": {"cheap": "p/cheap-m", "strong": "p/strong-m"}})
+        self.user_config({"tiers": {"scout": "p/scout-m", "review": "p/review-m", "write": "p/write-m"}})
         self.fake_pi([answer(LEAKED), SETTLED])
-        pinned = self.outcome(self.cli("run", "--tier", "cheap", "--model", "x/named", "--retries", "0", "task"))
-        self.assertEqual((pinned["agent"], pinned["tier"], pinned["agentPinned"], pinned["state"]),
-                         ("pi", "cheap", True, "malformed"))
+        pinned = self.outcome(self.cli("run", "--read-only", "--model", "x/named", "--retries", "0", "task"))
+        self.assertEqual((pinned["agent"], pinned.get("tier"), pinned["agentPinned"], pinned["state"]),
+                         ("pi", None, True, "malformed"))
         self.assertEqual(len((self.work / "pi.log").read_text().splitlines()), 1)
         # 6.10.0: a pinned run names the model it ran (from the summary), not the tier.
         line = self.cli("status", pinned["run"], human=True).stdout
-        self.assertNotIn("pi/cheap", line)
+        self.assertNotIn("pi/scout", line)
         self.assertIn("pi/fake-model", line)
 
     def test_pinned_reply_and_legacy_tier_display_do_not_rewrite_meta(self):
         self.fake_pi([answer("first"), SETTLED])
-        first = self.outcome(self.cli("run", "--tier", "cheap", "task"))
+        first = self.outcome(self.cli("run", "--read-only", "--tier", "scout", "task"))
         path = Path(first["dir"]) / "meta.json"
         legacy = json.loads(path.read_text())
-        legacy["tier"] = None
-        del legacy["agentPinned"]
+        legacy["tier"] = "scout"
+        legacy["agentPinned"] = True
         original = json.dumps(legacy)
         path.write_text(original)
         shown = self.outcome(self.cli("status", first["run"]))
-        self.assertEqual((shown["tier"], shown["agentPinned"]), ("cheap", True))
+        self.assertEqual((shown["tier"], shown["agentPinned"]), ("scout", True))
         self.assertEqual(path.read_text(), original)
         reply = self.outcome(self.cli("reply", "--wait", first["run"], "continue"))
-        self.assertEqual((reply["tier"], reply["agentPinned"]), ("cheap", True))
-        switched = self.outcome(self.cli("reply", "--wait", "--tier", "strong", reply["run"], "continue"))
-        self.assertEqual((switched["tier"], switched["agentPinned"]), ("strong", False))
+        self.assertEqual((reply["tier"], reply["agentPinned"]), ("scout", True))
+        switched = self.outcome(self.cli("reply", "--wait", "--tier", "write", reply["run"], "continue"))
+        self.assertEqual((switched["tier"], switched["agentPinned"]), ("write", False))
         # A record left by a removed agent is continued by Pi in a fresh session.
         path = Path(switched["dir"]) / "meta.json"
         legacy = json.loads(path.read_text())

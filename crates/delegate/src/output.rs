@@ -463,7 +463,16 @@ fn agent_label(status: &Value) -> String {
         let short = model.rsplit_once('/').map_or(model, |(_, name)| name);
         format!("{}/{short}", s(status, "agent"))
     } else {
-        format!("{}/{}", s(status, "agent"), s(status, "tier"))
+        format!(
+            "{}/{}{}",
+            s(status, "agent"),
+            s(status, "tier"),
+            if b(status, "tierInferred") {
+                "（推断）"
+            } else {
+                ""
+            }
+        )
     }
 }
 
@@ -474,10 +483,10 @@ mod tests {
 
     #[test]
     fn a_pinned_model_is_named_instead_of_the_tier() {
-        let tier = json!({"agent":"pi","tier":"default"});
-        assert_eq!(agent_label(&tier), "pi/default");
-        let pinned = json!({"agent":"pi","tier":"default","agentPinned":true,
-            "model":"aiatech-deepseek/deepseek/deepseek-v4.1-flash-fast:high"});
-        assert_eq!(agent_label(&pinned), "pi/deepseek-v4.1-flash-fast:high");
+        let tier = json!({"agent":"pi","tier":"review"});
+        assert_eq!(agent_label(&tier), "pi/review");
+        let pinned = json!({"agent":"pi","tier":"review","agentPinned":true,
+            "model":"provider/deepseek-flash"});
+        assert_eq!(agent_label(&pinned), "pi/deepseek-flash");
     }
 }

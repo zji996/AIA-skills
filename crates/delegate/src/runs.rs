@@ -281,7 +281,7 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
         "rejected" => Some(format!(
             "read accept.tail; {script} reply {name} '<what to fix>' or take it over"
         )),
-        "malformed" => Some(format!("{script} reply {name} --tier strong '<what to fix>' or do it yourself")),
+        "malformed" => Some(format!("{script} reply {name} --tier review '<what to fix>' or do it yourself")),
         "failed" => Some(if s(sum, "transientError").is_empty() {
             "read error; fix the cause or take it over".into()
         } else if n(sum, "resumes") > 0 {
@@ -347,11 +347,8 @@ pub fn status(run: &Path) -> Value {
     }
     if !s(&meta, "tier").is_empty() {
         out["tier"] = meta["tier"].clone();
-    } else if s(&meta, "agent") == "codex" {
-        out["tier"] = json!("strong");
-    } else if !s(&meta, "agent").is_empty() {
-        out["tier"] = json!("cheap");
     }
+    out["tierInferred"] = json!(b(&meta, "tierInferred"));
     if agent_pinned(&meta) || meta.get("agentPinned").is_some() {
         out["agentPinned"] = json!(agent_pinned(&meta));
     }

@@ -49,8 +49,8 @@
 | `lane [--label 文字] [--] [命令...]` | | §8；无命令时列出队列，每行 `running\|queued  <since>  <label>` |
 | `stop <run>...` | | §9.4 |
 | `clean <run>...\|--finished [--force]` | | §10 |
-| `tiers [--default M] [--cheap M] [--strong M]` | | 显示或写入用户配置的档位模型，§4.1 |
-| `protocol` | | 输出一行 JSON：`protocol`（宿主接入协议版本，当前 1）、`version`、`caller{id,source}`（未知时为 `null`）、`agents[]{name,tiers,models,available,bin,version,shadowed}`（只有 `pi` 一项）；`tiers` 恒为 `["cheap","strong"]`，`models` 是按当前配置各档的 Pi 模型（空串表示 Pi 默认），`bin` 为 PATH 上首个可执行文件的真实路径（不可用时为 `null`），`shadowed` 为 PATH 中更靠后、真实路径不同的同名可执行文件，按其在 PATH 中的路径列出（snap 等启动器都解析到同一文件，解析后看不出是谁）；退出码 0。供宿主适配器探测，见 [delegate-protocol.md](delegate-protocol.md) |
+| `tiers [--alias name=provider/id] [--scout M] [--review M] [--write M] [--thinking LEVEL]` | | 显示或写入用户配置的档位模型，§4.1 |
+| `protocol` | | 输出一行 JSON：`protocol`（宿主接入协议版本，当前 1）、`version`、`caller{id,source}`（未知时为 `null`）、`agents[]{name,tiers,models,available,bin,version,shadowed}`（只有 `pi` 一项）；`tiers` 恒为 `["scout","review","write"]`，`models` 是按当前配置各档的 Pi 模型（空串表示未配置或无法解析），`bin` 为 PATH 上首个可执行文件的真实路径（不可用时为 `null`），`shadowed` 为 PATH 中更靠后、真实路径不同的同名可执行文件，按其在 PATH 中的路径列出（snap 等启动器都解析到同一文件，解析后看不出是谁）；退出码 0。供宿主适配器探测，见 [delegate-protocol.md](delegate-protocol.md) |
 
 缺少同事 CLI 时退出码 2：Pi 提示 `sh <仓库>/third_party/pi-kit/install.sh --additive`，其中 `<仓库>` 为从可执行文件真实路径逐级向上、首个包含该安装脚本的目录，找不到时给出远程安装命令。
 
@@ -61,7 +61,7 @@
 | 选项 | 默认 | 说明 |
 |---|---|---|
 | 任务说明 | — | 位置参数拼接、`--prompt`、或 `--prompt-file`（`-` 为 stdin）；为空即退出码 2 |
-| `--tier default\|cheap\|strong` | 配了 `default` 用它，否则 `strong` | 按档位选 Pi 模型，§4.1；`cheap` 只读：未写 `--read-only` 时自动只读，带 `--accept`/`--accept-also`/`--worktree`/`--protect`/`--allow-parallel-writes` 退出 2 |
+| `--tier scout\|review\|write` | 写入推断 write、只读推断 review，并明确提醒 | 按用途选登记模型，§4.1；scout/review 不接写入，--tier 与 --model 互斥 |
 | `--name` | 说明首行 | 用于 run id 与显示；省略时取首个非空行生成短名，run id 保留字母、数字与 `._-`，最长 40 |
 | `--workdir` | 当前目录 | 必须存在 |
 | `--image <路径>` | — | 可重复；解析为绝对路径 |
@@ -75,7 +75,7 @@
 | `--accept-timeout` | `10m` | 自取得 lane 名额起计 |
 | `--timeout` | 无 | 每次尝试；§9.2 |
 | `--retries N` | 1 | 0–3，答复畸形时的重跑次数 |
-| `--provider` `--model` `--thinking` | — | 透传给 Pi；`--model` 覆盖档位模型并固定（不升档） |
+| `--provider` `--model` `--thinking` | — | --model 仅选已登记别名或完整名，与 --tier 互斥；thinking 独立；普通 reply 保留二者 |
 | `--allow-parallel-writes` | 否 | 跳过写入互斥 |
 | `--after <run>` | — | 立即创建 run（state `waiting`），上游以 delivered/answered 结束后才执行；其他结局使本 run 以 `skipped` 结束，`error` 写明上游名称与结局，exit_code 为 1 |
 | `--in <run>` | — | 仅与 `--read-only` 同用；在上游 worktree 当前状态的快照中运行（§6.3）；未给 `--after` 时上游必须已结束 |
@@ -114,7 +114,7 @@
 | `workspaceChanged` | `--in-place` 只读 run 期间工作区有变化 | 文件列表；无法归属 |
 | `protectViolation` | 改动命中受保护路径 | 排序后的仓库相对路径列表 |
 | `protectViolationReasons` | 违规且设置了原因 | 命中的保护规则路径到原因的映射，不改变 protectViolation 字符串数组 |
-| `tier` | 按档位选模型 | `default` / `cheap` / `strong`；升档后为 `strong` |
+| `tier` | 按档位选模型 | `scout` / `review` / `write`，或固定模型时为空；tierInferred 记录推断用途 |
 | `escalatedFrom` | 升过档 | 升档前的模型（未指定为 `default`） |
 | `question` | 同事提问 | 答复首个非空行以 `需要主控决定` / `Needs a decision` 开头；不验收、不升档 |
 | `queuedSeconds` | 同事在 lane 中排队 ≥1 秒 | |
@@ -185,9 +185,8 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 
 ### 4.1 选模型与升档（必须）
 
-- 同事恒为 `pi`。档位选模型（Pi `--model` 串 `provider/id[:thinking]`，只有最后一个 `:` 后是 thinking 级别才算后缀）：`DELEGATE_<档>_MODEL` > 配置 `tiers.<档>`，仓库与用户按档合并。`cheap`、`strong` 必填，缺一时 `start`/`run`/`reply` 退出 2 并列出 `pi --list-models`；`default` 可选，未给 `--tier` 时用它，未配置（含显式 `--tier default`）用 `strong`。`cheap` 只读，接写入参数或写入对话退出 2。`delegate tiers [--default M] [--cheap M] [--strong M]` 显示或校验后写入用户配置。`--model` 固定模型（`agentPinned: true`）。meta 记 `tier`、`model`、`tierModels`。
-- **升档**：`tier` 为 `cheap` 或 `default` 的 run 结局为 `malformed`/`failed`/`timeout`/`rejected`、未被 stop、且（只读，或快照成功且没有任何改动）时，若 `tierModels.strong` 非空且与本轮模型串（含 thinking 后缀）不同，在同一 run 中换强档模型再跑一轮：事件 `escalate{from,to,after}`，meta 的 `model` 改为强档、`tier` 改 `strong`、`fork` 清空、记 `escalatedFrom`（原模型，未指定为 `default`）。重跑次数沿用，`attempts` 接续；快照、只读核对与验收重新进行。固定模型不升档；每个 run 至多升档一次。
-- reply 沿用上一轮的 `tier` 与模型；`--tier` 换成该档模型并在同一会话续做。旧版 Codex 记录由 Pi 开新会话续做（隐含 `--fresh`）。
+- 同事恒为 `pi`。用途 scout/review/write，models 是唯一模型全集；--model 精确别名/完整名优先，否则唯一子串匹配（不分大小写）；Pi 仅校验与提供能力。三档必须可解析，start/run/reply 否则退出 2 给引导。models/tiers 按键合并，仓库覆盖用户；DELEGATE_<TIER>_MODEL 覆盖整档。--tier 与 --model 互斥，scout/review 写入拒绝。无二者时只读推断 review、写入推断 write，stderr 提醒，meta tierInferred=true，短行标「推断」。thinking 独立，优先级环境 > CLI > 规则 > 顶层 > Pi 默认。reply 可换模型/用途/长度，省略则沿用。不兼容旧档与 thinking 后缀。细节见 [模型路由](../skills/delegate/references/model-routing.md)。
+- **换模型重跑**：上游瞬时失败经同会话续做仍失败，且未 stop/无保护违规/没改文件时，在启动捕获的本档 tierCandidates 中换到当前模型之后第一个不同模型，没有则不换；每 run 最多一次，固定 --model 不换。用途不变，更新模型与 thinking、escalatedFrom，清空 fork；重新快照/验收。带 --image 时最终模型 images=no 退出 2，提示 Pi models.json 的 input 加 image 或 --model 换模型；列表为空跳过，不因图片自动换模型。
 
 ### 4.1.1 编排（`--after`、`--in`，必须）
 
@@ -226,7 +225,7 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 
 子模块指纹保留原有 SHA-1 摘要，并记录检出的 `HEAD` 与是否干净。**仅在 worktree run 中**，起始快照没有该子模块的指纹、结束时子模块干净且 `HEAD` 等于结束快照 tree 中的 gitlink，视为仅初始化（同事为跑测试补齐了子模块）：不计入 `changes`/`files`，`apply` 不处理它。子模块内已跟踪或未跟踪文件有改动、或检出提交不同，照常计为改动。
 
-**受保护路径**：`--protect` / `--protect-reason` 使用相同归一化规则，路径排序去重后记入 `meta.json` 的 `protect` 字符串数组，原因另存 `protectReasons` 映射，任务说明末尾逐项附原因与约定（§7.3）。结束快照后若改动命中受保护路径，state 为 `rejected`，带 `protectViolation` 与可选的 `protectViolationReasons`，`error` 与 `next` 提示受保护路径被改动，不执行 `--accept`。这样的便宜档 run 有改动，不升档；只读核对照常记录。语义绕路只能靠模型遵守约定，脚本只核对路径。
+**受保护路径**：`--protect` / `--protect-reason` 使用相同归一化规则，路径排序去重后记入 `meta.json` 的 `protect` 字符串数组，原因另存 `protectReasons` 映射，任务说明末尾逐项附原因与约定（§7.3）。结束快照后若改动命中受保护路径，state 为 `rejected`，带 `protectViolation` 与可选的 `protectViolationReasons`，`error` 与 `next` 提示受保护路径被改动，不执行 `--accept`。这样的 run 有改动，不升档；只读核对照常记录。语义绕路只能靠模型遵守约定，脚本只核对路径。
 
 起始快照在创建 run 时取，结束快照在同事结束后、验收之前取（验收副产物不计）。改动 = 两个 tree 的 `diff --numstat/--name-status --no-renames`，加上 `large` 与子模块指纹的差异（子模块列为 `submodule contents`）。写入 `changes.json`（`base`、`after`、`top`、`afterLarge`、`changes[{path,status A|M|D,added,deleted,large?,submodule?}]`）与 `changes.patch`（`git diff --binary`）。非 git 目录退回到编辑事件中的路径。
 
@@ -297,7 +296,7 @@ pi (--session-id <uuid> | --fork <上一轮会话副本>) --session-dir <run>/se
 
 ### 7.4 reply（必须）
 
-接在对话**最新一轮**之后（跳过 `malformed` 与无会话的轮次）；可用 `--tier` 换成该档模型（同一会话），否则同一模型、workdir、worktree、mode、env、provider/thinking、retries。每次尝试都从上一轮会话**分叉**（会话文件副本 `--fork`），上一轮会话永不改动。`--fresh` 开新会话但留在同一对话与 worktree。同一轮已有进行中的 reply 时拒绝。
+接在对话**最新一轮**之后（跳过 `malformed` 与无会话的轮次）；可用 `--tier` 或 `--model` 换模型（同一会话），用 `--thinking` 独立改长度，否则同一模型、workdir、worktree、mode、env、provider/thinking、retries。每次尝试都从上一轮会话**分叉**（会话文件副本 `--fork`），上一轮会话永不改动。`--fresh` 开新会话但留在同一对话与 worktree。同一轮已有进行中的 reply 时拒绝。
 
 默认像 `start` 一样立即输出启动状态；`--wait` 像 `run` 一样收取结论与答复，`--max`/`--progress`/`--full` 仅可与 `--wait` 同用。`--sync` 在返回启动状态前完成，冲突时不启动。
 

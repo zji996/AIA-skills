@@ -24,7 +24,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| `meta.json` | 启动参数、同事（`agent`）、workdir、模式、验收命令、启动时间；`standing`/`standingSources`、`defaults`、`share`、`resources`、`acceptBlind`、`resultDisplayChars`、`maxAnswer`；可选 `agentPinned`、仓库键 `repoKey`、证据命令 `evidenceCommand`、超时 `evidenceTimeoutSeconds` 和结果 `evidence`；`protect` 字符串数组与可选 `protectReasons` 原因映射（reply/fresh 继承） |
+| `meta.json` | 用途 `tier`/`tierInferred`、模型 `model`/`modelName`、`thinking`、`tierModels`/`tierCandidates`；同事与启动/验收参数；`standing`/`standingSources`、`defaults`、`share`、`resources`、`acceptBlind`、`resultDisplayChars`、`maxAnswer`；可选 `agentPinned`、`repoKey`、`evidenceCommand`/`evidenceTimeoutSeconds`/`evidence`；`protect` 字符串数组与可选 `protectReasons` 原因映射（reply/fresh 继承） |
 | `prompt.md` | 同事实际收到的任务说明；末尾可能附完成标准（`--accept`）与只读边界（worktree 里的只读任务） |
 | `events.jsonl` | 过滤后的全过程：读取、命令、编辑路径、错误、每轮模型与用量、重跑；不含编辑全文 |
 | `result.md` | 完整答复；自动压缩成功时为压缩后的答复 |

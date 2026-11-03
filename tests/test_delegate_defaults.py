@@ -18,7 +18,7 @@ class DelegateDefaultsTests(unittest.TestCase):
         self.env['XDG_CONFIG_HOME'] = str(directory)
         path = directory / 'delegate/config.json'
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(value))
+        path.write_text(json.dumps({"models": fixtures.REGISTERED_MODELS, **value}))
 
     def meta(self, state):
         return json.loads((Path(state['dir']) / 'meta.json').read_text())

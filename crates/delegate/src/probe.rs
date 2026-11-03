@@ -65,7 +65,7 @@ fn parse(args: &[String]) -> Res<Args> {
             "--tier" => {
                 if !agents::ALL_TIERS.contains(&value.as_str()) {
                     return Err(format!(
-                        "--tier: unknown tier {value} (default, cheap or strong)"
+                        "--tier: unknown tier {value} (scout, review or write)"
                     ));
                 }
                 out.tier = Some(value);
@@ -84,9 +84,6 @@ fn parse(args: &[String]) -> Res<Args> {
 /// The model id without its `:thinking` suffix; like Pi, only a last level counts as one.
 fn model_id(pattern: &str) -> &str {
     pattern
-        .rsplit_once(':')
-        .filter(|(_, level)| agents::THINKING.contains(level))
-        .map_or(pattern, |(model, _)| model)
 }
 
 fn note_line(rule: &Value, now: agents::Clock, running: &dyn Fn(&str) -> usize) -> String {
@@ -111,7 +108,7 @@ fn note_line(rule: &Value, now: agents::Clock, running: &dyn Fn(&str) -> usize) 
     parts.join(" ")
 }
 
-/// Where this model sits in each tier: `cheap[mon-fri 09:00-12:00 hit]` or `default`, plus
+/// Where this model sits in each tier: `review[mon-fri 09:00-12:00 hit]` or `scout`, plus
 /// `=now` for the model the tier picks at this minute (`picks` is one snapshot of that).
 fn tier_notes(
     config: &Value,
@@ -130,10 +127,21 @@ fn tier_notes(
         if let Some(rules) = value.as_array() {
             for rule in rules {
                 match rule.as_str() {
-                    Some(m) if model_id(m) == model_id(model) => parts.push("else".to_string()),
+                    Some(m)
+                        if crate::models::resolve_model(m, config, &[])
+                            .is_ok_and(|m| m == model) =>
+                    {
+                        parts.push("else".to_string())
+                    }
                     Some(_) => {}
-                    None if model_id(s(rule, "model")) == model_id(model) => {
-                        parts.push(note_line(rule, now, running))
+                    None if crate::models::resolve_model(s(rule, "model"), config, &[])
+                        .is_ok_and(|m| m == model) =>
+                    {
+                        parts.push(note_line(rule, now, &|name| {
+                            crate::models::resolve_model(name, config, &[])
+                                .map(|id| running(&id))
+                                .unwrap_or(0)
+                        }))
                     }
                     None => {}
                 }
@@ -386,7 +394,7 @@ pub fn recovered(bin: &Path, model: &str, env: &Value, timeout: f64) -> Result<(
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let thinking = !agents::pi_models()
         .iter()
-        .any(|(name, thinking)| name == model_id(model) && !*thinking);
+        .any(|m| m.name == model_id(model) && !m.thinking);
     let outcome = probe_one(bin, model, 0, &root, timeout, env, thinking);
     fs::remove_dir_all(&root).ok();
     if outcome.ok {
@@ -422,35 +430,26 @@ pub fn command(args: &[String]) -> Res<i32> {
         })
         .collect::<serde_json::Map<_, _>>()
         .into();
-    let tiers: Vec<&str> = match &o.tier {
-        Some(tier) => vec![tier.as_str()],
-        None => agents::ALL_TIERS.to_vec(),
-    };
-    let mut jobs: Vec<String> = vec![];
-    for tier in &tiers {
-        let models = agents::tier_candidates(&config.value, tier);
-        if o.tier.is_some() && models.is_empty() {
-            return Err(format!(
-                "tier {tier} has no model; set it with: {} tiers --{tier} <provider/model[:thinking]>",
-                script().display()
-            ));
-        }
-        for model in models {
-            // Either way the same request goes out (`--thinking off` is added), so a model
-            // named in two tiers is probed once.
-            if !jobs.iter().any(|job| model_id(job) == model_id(&model)) {
-                jobs.push(model);
-            }
-        }
-    }
     let listed = agents::pi_models();
-    if let Some(model) = &o.model {
-        agents::check_tier_model(model, &listed)?;
-        jobs = vec![model.clone()];
-    }
+    let mut jobs: Vec<String> = match (&o.tier, &o.model) {
+        (_, Some(model)) => vec![crate::models::resolve_model(model, &config.value, &listed)?],
+        (Some(tier), _) => crate::models::candidates(&config.value, tier, None, &listed)?
+            .into_iter()
+            .map(|p| p.model)
+            .collect(),
+        _ => config.value["models"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(name, _)| crate::models::resolve_model(name, &config.value, &listed))
+            .collect::<Res<Vec<_>>>()?,
+    };
+    // Keep first occurrence order, aliases for one id make one request.
+    let mut seen = std::collections::HashSet::new();
+    jobs.retain(|m| seen.insert(m.clone()));
     if jobs.is_empty() {
         return Err(format!(
-            "no model to probe: set the tiers first: {} tiers --cheap <provider/model[:thinking]> --strong <provider/model[:thinking]>",
+            "no model to probe: register aliases with delegate tiers --alias name=provider/id; configure tiers: {} tiers --scout <alias|provider/id> --review <alias|provider/id> --write <alias|provider/id>",
             script().display()
         ));
     }
@@ -460,7 +459,7 @@ pub fn command(args: &[String]) -> Res<i32> {
     let off = |model: &str| {
         !listed
             .iter()
-            .any(|(name, thinking)| name == model_id(model) && !*thinking)
+            .any(|m| m.name == model_id(model) && !m.thinking)
     };
     let root = std::env::temp_dir().join(format!("delegate-probe-{}", now_ns()));
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
@@ -515,15 +514,10 @@ pub fn command(args: &[String]) -> Res<i32> {
             outcome.seconds
         );
     }
-    let default = s(&picks, "default").to_string();
-    let candidates: Vec<(&str, String)> = if default.is_empty() {
-        ["cheap", "strong"]
-            .into_iter()
-            .map(|tier| (tier, s(&picks, tier).to_string()))
-            .collect()
-    } else {
-        vec![("default", default)]
-    };
+    let candidates: Vec<(&str, String)> = ["review", "write"]
+        .into_iter()
+        .map(|tier| (tier, s(&picks, tier).to_string()))
+        .collect();
     let mut failed = false;
     let picked = candidates
         .iter()
@@ -540,18 +534,7 @@ pub fn command(args: &[String]) -> Res<i32> {
                     "FAIL"
                 }
             };
-            let who = if candidates.len() > 1 {
-                format!(
-                    "{} {model}",
-                    if *tier == "cheap" {
-                        "只读 cheap"
-                    } else {
-                        "写入 strong"
-                    }
-                )
-            } else {
-                model.clone()
-            };
+            let who = format!("{tier} {model}");
             format!("{who}（{state}）")
         })
         .collect::<Vec<_>>()
@@ -567,12 +550,12 @@ mod tests {
 
     #[test]
     fn notes_describe_rule_windows_and_the_current_pick() {
-        let config = json!({"tiers": {"cheap": "p/fast", "strong": [
+        let config = json!({"models":{"peak":"p/peak","fast":"p/fast"},"tiers": {"scout": "p/fast", "review": [
             {"model": "p/peak", "days": "mon-fri", "hours": "09:00-12:00", "maxActive": 3},
             "p/fast"]}});
         let idle = |_: &str| 0;
-        let peak = json!({"cheap": "p/fast", "strong": "p/peak"});
-        let fallback = json!({"cheap": "p/fast", "strong": "p/fast"});
+        let peak = json!({"scout": "p/fast", "review": "p/peak"});
+        let fallback = json!({"scout": "p/fast", "review": "p/fast"});
         // Wednesday 10:00: the peak rule holds, so it is also what the tier picks.
         assert_eq!(
             tier_notes(
@@ -585,7 +568,7 @@ mod tests {
                 },
                 &idle
             ),
-            ["strong[mon-fri 09:00-12:00 maxActive 0/3 hit]=now"]
+            ["review[mon-fri 09:00-12:00 maxActive 0/3 hit]=now"]
         );
         // Wednesday 13:00: outside the window the fallback model runs.
         assert_eq!(
@@ -599,7 +582,7 @@ mod tests {
                 },
                 &idle
             ),
-            ["cheap=now", "strong[else]=now"]
+            ["scout=now", "review[else]=now"]
         );
         // At its cap the peak rule steps aside even inside its window.
         let busy = |model: &str| if model == "p/peak" { 3 } else { 0 };
@@ -614,13 +597,13 @@ mod tests {
                 },
                 &busy
             ),
-            ["strong[mon-fri 09:00-12:00 maxActive 3/3 miss]"]
+            ["review[mon-fri 09:00-12:00 maxActive 3/3 miss]"]
         );
     }
 
     #[test]
     fn models_dedupe_by_id_and_arguments_reject_usage_errors() {
-        assert_eq!(model_id("p/m:high"), "p/m");
+        assert_eq!(model_id("p/m"), "p/m");
         assert_eq!(
             model_id("ollama/qwen2.5-coder:7b"),
             "ollama/qwen2.5-coder:7b"
@@ -631,9 +614,9 @@ mod tests {
         };
         let o = parse_ok(&["--timeout", "1m"]).unwrap();
         assert_eq!(o.timeout, 60.0);
-        assert!(parse_ok(&["--tier", "cheap"]).is_ok());
+        assert!(parse_ok(&["--tier", "scout"]).is_ok());
         assert!(parse_ok(&["--tier", "huge"]).is_err());
-        assert!(parse_ok(&["--tier", "cheap", "--model", "p/m"]).is_err());
+        assert!(parse_ok(&["--tier", "scout", "--model", "p/m"]).is_err());
         assert!(parse_ok(&["surprise"]).is_err());
     }
 }

@@ -10,6 +10,8 @@
 
 ### 技能
 
+- `delegate` 6.11.0：用途 scout/review/write、已登记模型别名、thinking 三维分离，推断用途显式提醒，图片仅做能力守卫，瞬时失败换本档下一候选，tiers/probe 只展示或调用登记模型。**不兼容旧配置**：将 cheap/strong/default 改成三个用途档、模型登记到 models，并将模型后缀拆为 thinking 字段。
+
 - `delegate` 6.10.0：worktree 池。`.delegate.json` 的 `worktree.pool` 设为 N 后，写入任务复用 N 个固定路径的 worktree，换任务只 `git checkout` 有差异的文件（先刷新索引，修改时间变了但内容没变的文件不重写），`target/` 等构建缓存保留，Cargo 只重编改动的 crate；槽位随 run 的 `clean`/合入释放、不删除，被续做共用时不释放，全部占用时退回独立 worktree，`target/` 超过 60 GiB（`DELEGATE_POOL_TARGET_GIB`）清空一次。同时修了清理测试的偶发 ETXTBSY（复制可执行文件时别的线程 fork 继承了写句柄，spawn 改为短暂重试）。起因：三个模型同时做一个改两个 crate 的小任务，每个新 worktree 都要冷编 12 万行 runtime、9 万行 control-plane、5 万行 Server，单编译加数据库测试就 15–20 分钟；sccache 只缓存第三方依赖，本仓库 crate 因路径不同与增量编译都不命中。
 - `delegate` 6.10.0 还包括：用 `--model` 固定的模型不再显示成档位：开跑回显「固定模型 …（--model）」，`reply` 沿用原模型时回显「沿用原会话的模型 …」，状态行由 `pi/default` 改为 `pi/<模型名>`。行为未变（续做本来就沿用原模型），只改显示。起因：三模型对比时 gemini、sol 的任务回显「default 档，模型 …」，主控误以为续做会被换成默认档的模型，绕道去设环境变量。
 - `agent-interface-design` 1.2.0：新增第 8 条「压缩即索引」与一条评审项：写入时取舍的压缩（交接摘要、步骤摘要、记忆、裁剪结果）只当索引，原文位置由宿主写在摘要旁，原文保持可搜索，评测配“后来才变得关键的细节”用例与对照组。起因：一次段交接后摘要只留了结论，用户追问被压缩掉的表格时，模型不知道原文在哪，先满盘搜索才找到。

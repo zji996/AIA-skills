@@ -2,7 +2,7 @@ use crate::agents::{self, agent_identity, missing_tools, nesting_error, session_
 use crate::changes::snapshot;
 use crate::common::*;
 use crate::runs::{self, active, agent_alive, all_runs, state};
-use crate::worktree;
+use crate::{models, worktree};
 use serde_json::{json, Value};
 use std::env;
 use std::fs::{self, File};
@@ -19,6 +19,9 @@ pub struct Options {
     pub prompt_file: Option<String>,
     pub agent: String,
     pub tier: Option<String>,
+    pub tier_inferred: bool,
+    pub model_name: Option<String>,
+    pub thinking_cli: Option<String>,
     pub agent_pinned: bool,
     /// The model came from a tier rather than `--model` or the run being continued,
     /// so `launch` may pick again once it counts the machine's runs (`maxActive`).
@@ -104,8 +107,6 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--protect-reason",
                 "--retries",
                 "--provider",
-                "--model",
-                "--thinking",
                 "--allow-parallel-writes",
             ]
             .contains(&key)
@@ -210,7 +211,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 }
                 "--provider" => o.provider = Some(v),
                 "--model" => o.model = Some(v),
-                "--thinking" => o.thinking = Some(v),
+                "--thinking" => { models::validate_thinking(&v)?; o.thinking = Some(v.clone()); o.thinking_cli = Some(v); },
                 "--max" => o.max = Some(seconds(&v)?),
                 "--after" => o.after = Some(v),
                 "--in" => o.in_run = Some(v),
@@ -276,8 +277,6 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             || o.worktree
             || o.parallel
             || o.provider.is_some()
-            || o.model.is_some()
-            || o.thinking.is_some()
             || o.after.is_some()
             || o.in_run.is_some()
         {
@@ -301,6 +300,12 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
     {
         return Err("argument --tier: invalid choice".into());
     }
+    if o.tier.is_some() && o.model.is_some() {
+        return Err("--tier and --model are exclusive".into());
+    }
+    if let Some(model) = &o.model {
+        models::validate_model(model)?;
+    }
     if !(0..=3).contains(&o.retries) {
         return Err("argument --retries: invalid choice".into());
     }
@@ -313,76 +318,118 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
     }
     Ok(o)
 }
-const CHEAP_READS_ONLY: &str = "the cheap tier only reads (reading, exploring, images); give writes to the default or strong tier";
-/// The cheap tier reads and explores; a write on it is refused, not run.
+const READS_ONLY: &str = "scout and review tiers only read; writes require --tier write or --model";
 fn choose_tier(o: &mut Options) -> Res<()> {
     o.agent = agents::AGENT.into();
-    if o.tier.as_deref() == Some("cheap") && !o.read_only {
-        if o.accept.is_some()
-            || !o.accept_also.is_empty()
-            || o.worktree
-            || !o.protect.is_empty()
-            || o.parallel
-        {
-            return Err(CHEAP_READS_ONLY.into());
-        }
-        o.read_only = true;
+    if o.model.is_some() {
+        o.agent_pinned = true;
+        return Ok(());
+    }
+    if o.tier.is_none() {
+        o.tier = Some(models::infer(o.read_only).into());
+        o.tier_inferred = true;
+    }
+    if !o.read_only
+        && o.tier
+            .as_deref()
+            .is_some_and(|t| ["scout", "review"].contains(&t))
+    {
+        return Err(READS_ONLY.into());
     }
     Ok(())
 }
-fn tier_models(config: &Value) -> Value {
-    agents::ALL_TIERS
-        .iter()
-        .map(|tier| (tier.to_string(), json!(agents::tier_model(config, tier))))
-        .collect::<serde_json::Map<_, _>>()
-        .into()
-}
-/// Without --tier (or with --tier default and none configured), the default
-/// model runs, else the strong one. An explicit --model pins the run.
-fn apply_tier_model(o: &mut Options, config: &Value) -> Value {
-    let models = tier_models(config);
-    let no_default = s(&models, "default").is_empty();
-    if o.tier.is_none() || (o.tier.as_deref() == Some("default") && no_default) {
-        o.tier = Some(if no_default { "strong" } else { "default" }.into());
+
+fn require_models(config: &Value, listed: &[models::PiModel]) -> Res<Value> {
+    let mut result = json!({});
+    for tier in agents::TIERS {
+        match models::pick(config, tier, None, listed, agents::local_clock(), &|_| 0) {
+            Ok(pick) => result[tier] = json!(pick.model),
+            Err(error) => {
+                return Err(format!(
+                    "model tiers not configured or invalid: {tier}: {error}\n{}",
+                    agents::tiers_guide(config)
+                ))
+            }
+        }
     }
-    if o.model.is_some() {
-        o.agent_pinned = true;
+    Ok(result)
+}
+
+/// Resolve explicit identity independently of purpose, then choose thinking.
+fn apply_tier_model(o: &mut Options, config: &Value) -> Res<Value> {
+    let listed = agents::pi_models();
+    let models = require_models(config, &listed)?;
+    if o.agent_pinned {
+        let name = o.model.as_deref().unwrap_or("");
+        let model = models::resolve_model(name, config, &listed)?;
+        o.model_name = Some(name.into());
+        o.model = Some(model);
+        o.thinking = models::thinking(o.thinking_cli.as_deref(), &Value::Null, config)?;
     } else {
-        let tier = o.tier.as_deref().unwrap_or("cheap");
-        o.model = models[tier]
-            .as_str()
-            .map(str::to_string)
-            .filter(|m| !m.is_empty());
+        let pick = models::pick(
+            config,
+            o.tier.as_deref().unwrap_or("review"),
+            o.thinking_cli.as_deref(),
+            &listed,
+            agents::local_clock(),
+            &|_| 0,
+        )?;
+        o.model_name = Some(pick.name);
+        o.model = Some(pick.model);
+        o.thinking = pick.thinking;
         o.tier_picked = true;
     }
-    models
+    Ok(models)
 }
-/// Tier rules with `maxActive` skip a model already running that many times on this
-/// machine. Runs under the machine start lock, so two starts cannot take the last place.
-fn pick_tier_under_cap(o: &mut Options, extra: &mut Value, active_runs: &[PathBuf]) {
-    let models = active_runs
+
+/// Under the start lock, count maxActive by resolved id and snapshot candidates for retry.
+fn pick_tier_under_cap(o: &mut Options, extra: &mut Value, active_runs: &[PathBuf]) -> Res<()> {
+    let busy = active_runs
         .iter()
         .map(|run| s(&json(run.join("meta.json")), "model").to_string())
         .collect::<Vec<_>>();
-    let running = |model: &str| models.iter().filter(|m| *m == model).count();
-    let picked: Value = agents::ALL_TIERS
+    let running = |model: &str| busy.iter().filter(|m| *m == model).count();
+    let config = &extra["tierConfig"];
+    let listed = agents::pi_models();
+    let tier = o.tier.as_deref().unwrap_or("review");
+    let pick = models::pick(
+        config,
+        tier,
+        o.thinking_cli.as_deref(),
+        &listed,
+        agents::local_clock(),
+        &running,
+    )?;
+    if o.model.as_deref() != Some(&pick.model) {
+        eprintln!(
+            "delegate: {tier} 档首选已到本机 maxActive 上限，改用 {}",
+            pick.model
+        );
+    }
+    o.model_name = Some(pick.name);
+    o.model = Some(pick.model.clone());
+    o.thinking = pick.thinking;
+    extra["tierModels"] = agents::ALL_TIERS
         .iter()
-        .map(|tier| {
-            let model = agents::tier_model_with(&extra["tierConfig"], tier, &running);
-            (tier.to_string(), json!(model))
+        .map(|t| {
+            let model = models::pick(config, t, None, &listed, agents::local_clock(), &running)
+                .map(|p| p.model)
+                .unwrap_or_default();
+            (t.to_string(), json!(model))
         })
         .collect::<serde_json::Map<_, _>>()
         .into();
-    let tier = o.tier.as_deref().unwrap_or("cheap");
-    let model = s(&picked, tier);
-    if !model.is_empty() && o.model.as_deref() != Some(model) {
-        eprintln!(
-            "delegate: {tier} 档的 {} 已到本机 maxActive 上限，改用 {model}",
-            o.model.as_deref().unwrap_or("（Pi 默认）")
-        );
-        o.model = Some(model.to_string());
-    }
-    extra["tierModels"] = picked;
+    extra["tierCandidateIndex"] = json!(pick.index);
+    extra["tierCandidates"] = json!(models::candidates(
+        &extra["tierConfig"],
+        tier,
+        o.thinking_cli.as_deref(),
+        &listed
+    )?
+    .iter()
+    .map(models::Pick::value)
+    .collect::<Vec<_>>());
+    Ok(())
 }
 pub fn read_prompt(o: &mut Options) -> Res<String> {
     let prompt = if let Some(f) = &o.prompt_file {
@@ -693,8 +740,7 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     o.share.sort();
     o.share.dedup();
     let config = crate::config::load(repo.as_deref())?;
-    let tier_models = apply_tier_model(&mut o, &config.value);
-    agents::require_tiers(&tier_models)?;
+    let tier_models = apply_tier_model(&mut o, &config.value)?;
     let defaults = effective_defaults(&mut o, &config);
     let mut defaults = defaults;
     if let Some(value) = config.value["defaults"].get("keepCommits") {
@@ -712,7 +758,7 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
             config.ignored.join(", ")
         );
     }
-    let mut extra = json!({"env":config.value["env"],"agentDeny":config.value["agentDeny"],"configSources":config.sources,"configCapacity":capacities,"tierModels":tier_models,"tierConfig":{"tiers":config.value["tiers"]}});
+    let mut extra = json!({"env":config.value["env"],"agentDeny":config.value["agentDeny"],"configSources":config.sources,"configCapacity":capacities,"tierModels":tier_models,"tierConfig":{"tiers":config.value["tiers"],"models":config.value["models"],"thinking":config.value["thinking"]}});
     extra["sourceBuild"] = config.value["sourceBuild"].clone();
     extra["sourceBuildRoot"] = json!(repo);
     extra["defaults"] = defaults;
@@ -946,8 +992,15 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         }
     }
     let requested_tier = o.tier.clone();
-    if requested_tier.as_deref() == Some("cheap") && s(&meta, "mode") == "write" {
-        return Err(format!("{CHEAP_READS_ONLY}; this conversation writes"));
+    let requested_model = o.model.clone();
+    let requested_thinking = o.thinking_cli.clone();
+    o.read_only = s(&meta, "mode") == "read-only";
+    if !o.read_only
+        && requested_tier
+            .as_deref()
+            .is_some_and(|t| ["scout", "review"].contains(&t))
+    {
+        return Err(format!("{READS_ONLY}; this conversation writes"));
     }
     let legacy = s(&meta, "agent") != agents::AGENT;
     if legacy && !o.fresh {
@@ -986,17 +1039,19 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     }
     o.agent = agents::AGENT.into();
     missing_tools(&o.agent)?;
-    o.agent_pinned = requested_tier.is_none() && !legacy && runs::agent_pinned(&meta);
-    // A record without a tier: a legacy one picks again below; others keep their model.
-    o.tier = requested_tier.clone().or_else(|| {
-        let tier = meta["tier"].as_str().filter(|t| !t.is_empty());
-        tier.map(str::to_string)
-            .or_else(|| (!legacy).then(|| "cheap".to_string()))
-    });
-    if requested_tier.is_none() && !legacy {
+    let switching = requested_tier.is_some() || requested_model.is_some();
+    o.agent_pinned = requested_model.is_some() || (!switching && runs::agent_pinned(&meta));
+    if requested_model.is_none() {
+        o.tier = requested_tier
+            .clone()
+            .or_else(|| meta["tier"].as_str().map(str::to_string));
+    }
+    if !switching && !legacy {
         o.provider = meta["provider"].as_str().map(str::to_string);
         o.model = meta["model"].as_str().map(str::to_string);
+        o.model_name = meta["modelName"].as_str().map(str::to_string);
         o.thinking = meta["thinking"].as_str().map(str::to_string);
+        o.tier_inferred = b(&meta, "tierInferred");
     }
     o.retries = n(&meta, "retries");
     o.protect = meta["protect"]
@@ -1062,12 +1117,30 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         .filter(|x| !x.is_empty())
         .unwrap_or(s(&meta, "top"));
     let config = crate::config::load(Some(Path::new(top)))?;
-    let tier_models = if requested_tier.is_some() || legacy {
-        apply_tier_model(&mut o, &config.value)
+    let tier_models = if switching || legacy {
+        if requested_model.is_none() {
+            o.model = None;
+        }
+        choose_tier(&mut o)?;
+        apply_tier_model(&mut o, &config.value)?
     } else {
-        tier_models(&config.value)
+        let listed = if s(&meta, "agentBin").is_empty() {
+            agents::pi_models()
+        } else {
+            agents::pi_models_for(Path::new(s(&meta, "agentBin")))
+        };
+        require_models(&config.value, &listed)?
     };
-    agents::require_tiers(&tier_models)?;
+    if !switching {
+        // Ordinary reply keeps the captured level; only env/CLI may override it.
+        let env = setting("THINKING", "");
+        if !env.is_empty() {
+            models::validate_thinking(&env)?;
+            o.thinking = Some(env);
+        } else if requested_thinking.is_some() {
+            o.thinking = requested_thinking;
+        }
+    }
     let deny_accept_conflicts =
         crate::deny::conflicts(o.accept.as_deref(), &prompt, &meta["agentDeny"]);
     for command in &deny_accept_conflicts {
@@ -1166,7 +1239,22 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     extra["configSources"] = json!(sources);
     extra["configCapacity"] = capacities;
     extra["tierModels"] = tier_models;
-    extra["tierConfig"] = json!({"tiers": config.value["tiers"]});
+    extra["tierConfig"] = json!({"tiers": config.value["tiers"],"models":config.value["models"],"thinking":config.value["thinking"]});
+    extra["tierCandidates"] = meta["tierCandidates"].clone();
+    extra["tierCandidateIndex"] = meta["tierCandidateIndex"].clone();
+    let thinking_env = setting("THINKING", "");
+    let override_level = if thinking_env.is_empty() {
+        o.thinking_cli.as_deref()
+    } else {
+        Some(thinking_env.as_str())
+    };
+    if let (Some(level), Some(candidates)) =
+        (override_level, extra["tierCandidates"].as_array_mut())
+    {
+        for candidate in candidates {
+            candidate["thinking"] = json!(level);
+        }
+    }
     extra["sourceBuild"] = config.value["sourceBuild"].clone();
     extra["sourceBuildRoot"] = meta.get("sourceBuildRoot").cloned().unwrap_or(json!(top));
     if runs::interrupted(s(&summary, "state")) && s(&meta, "mode") == "write" {
@@ -1373,7 +1461,12 @@ pub fn launch(
     }
     let mut extra = extra.clone();
     if o.tier_picked && !o.agent_pinned {
-        pick_tier_under_cap(&mut o, &mut extra, &active_runs);
+        pick_tier_under_cap(&mut o, &mut extra, &active_runs)?;
+    }
+    if !o.images.is_empty() {
+        let listed = agents::pi_models();
+        let model = o.model.as_deref().unwrap_or("");
+        models::guard_images(model, &listed)?;
     }
     let extra = &extra;
     if !deferred && mode == "write" && !o.parallel && !extra["worktree"].is_object() {
@@ -1523,18 +1616,28 @@ pub fn launch(
         if inherited { "（已有会话）" } else { "" }
     );
     let model = o.model.as_deref().unwrap_or("（Pi 默认）");
-    // A pinned model is not the tier's pick: say so, or a reply that kept a --model run's
-    // model reads as if the default tier had replaced it.
-    if o.agent_pinned && parent_path.is_some() {
-        eprintln!("delegate: 沿用原会话的模型 {model}");
+    let level = o.thinking.as_deref().unwrap_or("Pi 默认");
+    if o.tier_inferred && o.tier_picked {
+        eprintln!(
+            "{}",
+            models::inference_notice(
+                o.tier.as_deref().unwrap_or("review"),
+                o.model_name.as_deref().unwrap_or(model),
+                model,
+                o.thinking.as_deref()
+            )
+        );
+    } else if parent_path.is_some() && !o.tier_picked && !o.agent_pinned {
+        eprintln!("delegate: 沿用原会话的模型 {model}，thinking {level}");
     } else if o.agent_pinned {
-        eprintln!("delegate: 固定模型 {model}（--model）");
+        eprintln!("delegate: 固定模型 {model}，thinking {level}（--model）");
     } else {
         eprintln!(
-            "delegate: {} 档，模型 {model}",
+            "delegate: {} 档，模型 {model}，thinking {level}",
             o.tier.as_deref().unwrap_or("")
         );
     }
+
     if extra["defaults"].as_object().is_some_and(|d| !d.is_empty()) {
         eprintln!("delegate: 生效默认值及来源 {}", extra["defaults"]);
     }
@@ -1696,6 +1799,10 @@ pub fn launch(
     meta["configSources"] = extra.get("configSources").cloned().unwrap_or(json!([]));
     meta["configCapacity"] = extra["configCapacity"].clone();
     meta["tierModels"] = extra["tierModels"].clone();
+    meta["tierCandidates"] = extra["tierCandidates"].clone();
+    meta["tierCandidateIndex"] = extra["tierCandidateIndex"].clone();
+    meta["tierInferred"] = json!(o.tier_inferred);
+    meta["modelName"] = json!(o.model_name);
     for key in [
         "standing",
         "standingSources",
@@ -1797,4 +1904,50 @@ pub fn launch(
         "supervisor did not start; see {}",
         run.join("supervisor.log").display()
     ))
+}
+
+#[cfg(test)]
+mod purpose_tests {
+    use super::*;
+    #[test]
+    fn inference_is_explicit_and_model_tier_are_independent() {
+        let mut o = Options::new();
+        o.read_only = true;
+        choose_tier(&mut o).unwrap();
+        assert_eq!(o.tier.as_deref(), Some("review"));
+        assert!(o.tier_inferred);
+        let mut o = Options::new();
+        choose_tier(&mut o).unwrap();
+        assert_eq!(o.tier.as_deref(), Some("write"));
+        for tier in ["scout", "review"] {
+            let mut o = Options::new();
+            o.tier = Some(tier.into());
+            assert!(choose_tier(&mut o)
+                .unwrap_err()
+                .contains("--tier write or --model"));
+        }
+        let mut o = Options::new();
+        o.model = Some("sol".into());
+        choose_tier(&mut o).unwrap();
+        assert!(o.agent_pinned);
+        assert!(!o.tier_inferred);
+        assert!(o.tier.is_none());
+        let parse = |args: &[&str], reply| {
+            parse_launch(
+                &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                reply,
+                false,
+            )
+        };
+        assert!(parse(&["--tier", "review", "--model", "sol", "task"], false).is_err());
+        assert!(parse(&["--model", "sol:high", "task"], false).is_err());
+        assert!(parse(
+            &["last", "--model", "sol", "--thinking", "low", "more"],
+            true
+        )
+        .is_ok());
+        for tier in ["cheap", "strong", "default", "vision"] {
+            assert!(parse(&["--tier", tier, "task"], false).is_err());
+        }
+    }
 }

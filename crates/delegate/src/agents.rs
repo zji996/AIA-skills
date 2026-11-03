@@ -29,23 +29,16 @@ pub const PROTOCOL: u32 = 1;
 
 /// The one colleague. Tiers choose its model, not another agent.
 pub const AGENT: &str = "pi";
-/// Tiers that must name a model; `default` is optional and, when set, runs
-/// whatever the caller did not give a tier.
-pub const TIERS: [&str; 2] = ["cheap", "strong"];
-pub const ALL_TIERS: [&str; 3] = ["default", "cheap", "strong"];
+pub use crate::models::{THINKING, TIERS};
+pub const ALL_TIERS: [&str; 3] = TIERS;
 
-/// The Pi `--model` pattern a tier runs (`provider/id[:thinking]`); empty means
-/// Pi's own default from its settings.json. A tier may be a rule list, resolved
-/// at the local time of the call (start, reply, `tiers`).
 pub fn tier_model(config: &Value, tier: &str) -> String {
     tier_model_with(config, tier, &|_| 0)
 }
-
-/// `tier_model` given how many runs on this machine already use each model, which
-/// rules with `maxActive` read; `start` asks under the machine start lock.
 pub fn tier_model_with(config: &Value, tier: &str, running: &dyn Fn(&str) -> usize) -> String {
-    let configured = resolve_tier(&config["tiers"][tier], local_clock(), running);
-    setting(&format!("{}_MODEL", tier.to_uppercase()), &configured)
+    crate::models::pick(config, tier, None, &[], local_clock(), running)
+        .map(|p| p.model)
+        .unwrap_or_default()
 }
 
 /// The local weekday (1 = Monday … 7 = Sunday) and minutes since midnight, the clock tier rules read.
@@ -138,6 +131,7 @@ pub fn rule_matches(rule: &Value, now: Clock, running: &dyn Fn(&str) -> usize) -
     day && time && room
 }
 
+#[cfg(test)]
 pub fn resolve_tier(value: &Value, now: Clock, running: &dyn Fn(&str) -> usize) -> String {
     if let Some(model) = value.as_str() {
         return model.to_string();
@@ -152,27 +146,6 @@ pub fn resolve_tier(value: &Value, now: Clock, running: &dyn Fn(&str) -> usize) 
                 .then(|| rule["model"].as_str().unwrap_or("").to_string()),
         })
         .unwrap_or_default()
-}
-
-/// Every model a tier can run, in rule order: a rule list expands, and the
-/// `DELEGATE_<TIER>_MODEL` override replaces the whole list (`probe` checks them all).
-pub fn tier_candidates(config: &Value, tier: &str) -> Vec<String> {
-    let overridden = setting(&format!("{}_MODEL", tier.to_uppercase()), "");
-    let listed = |model: String| (!model.is_empty()).then_some(model);
-    if !overridden.is_empty() {
-        return vec![overridden];
-    }
-    match &config["tiers"][tier] {
-        Value::String(model) => listed(model.clone()).into_iter().collect(),
-        Value::Array(rules) => rules
-            .iter()
-            .filter_map(|rule| match rule.as_str() {
-                Some(model) => listed(model.to_string()),
-                None => listed(s(rule, "model").to_string()),
-            })
-            .collect(),
-        _ => vec![],
-    }
 }
 
 /// A rule list as one line for `delegate tiers`, e.g. `mon-fri 09:00-12:00 a, else b`.
@@ -220,92 +193,54 @@ pub fn is_question(answer: &str) -> bool {
         .is_some_and(|line| QUESTION_MARKERS.iter().any(|m| line.starts_with(m)))
 }
 
-pub const THINKING: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-
-/// Pi's models as (`provider/id`, supports thinking), from `pi --list-models`;
+/// Pi capability metadata (not the selectable universe), from the offline model table;
 /// empty when Pi is missing or prints nothing usable.
-pub fn pi_models() -> Vec<(String, bool)> {
+pub fn pi_models() -> Vec<crate::models::PiModel> {
     let Some(bin) = agent_bin(AGENT) else {
         return vec![];
     };
+    pi_models_for(&bin)
+}
+pub fn pi_models_for(bin: &Path) -> Vec<crate::models::PiModel> {
     let out = std::process::Command::new(bin)
         .args(["--offline", "--list-models"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output();
     let Ok(out) = out else { return vec![] };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .skip_while(|line| !line.starts_with("provider"))
-        .skip(1)
-        .filter_map(|line| {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            (cols.len() >= 5).then(|| (format!("{}/{}", cols[0], cols[1]), cols[4] == "yes"))
-        })
-        .collect()
-}
-
-/// Both tiers must name a model: the caller is usually a model itself, and an
-/// unset tier would quietly run everything on Pi's default with no escalation.
-pub fn require_tiers(models: &Value) -> Res<()> {
-    let missing: Vec<&str> = TIERS
-        .iter()
-        .copied()
-        .filter(|tier| models[*tier].as_str().unwrap_or("").is_empty())
-        .collect();
-    if missing.is_empty() {
-        return Ok(());
-    }
-    Err(format!(
-        "model tiers not configured: {}\n{}",
-        missing.join(", "),
-        tiers_guide()
-    ))
+    crate::models::parse_pi_models(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// What a caller needs to configure the tiers itself in one step.
-pub fn tiers_guide() -> String {
+pub fn tiers_guide(config: &Value) -> String {
     let models = pi_models();
-    let list = if models.is_empty() {
-        "  (pi --list-models printed nothing; check that Pi is installed and has models)".into()
-    } else {
-        models
-            .iter()
-            .map(|(m, thinking)| format!("  {m}{}", if *thinking { "  [thinking]" } else { "" }))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    let list = config["models"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(alias, id)| {
+            let id = id.as_str().unwrap_or("");
+            if let Some(m) = models.iter().find(|m| m.name == id) {
+                format!(
+                    "  {alias} → {id}  context {}  images {}  thinking {}",
+                    m.context, m.images, m.thinking
+                )
+            } else {
+                format!("  {alias} → {id}  capabilities unknown")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let unregistered = crate::models::unregistered_count(config, &models);
     format!(
-        "两档都要配置：cheap 给读材料、侦察、文案、看图（快、便宜），strong 给写代码与严密审查（最强）；\
-         可选 default：不写 --tier 时用它，不配则只读走 cheap、写入走 strong。\n\
-         用户指定过模型就照用户的；否则从下面 Pi 的可用模型中选，配置后在答复里告诉用户选了什么。\n\
-         Pi models:\n{list}\n\
-         配置 / configure: {} tiers --cheap <provider/model[:thinking]> --strong <provider/model[:thinking]> [--default <…>]\n\
+        "三个用途档都要配置：scout 只读侦察/摘要/文案，review 只读严密审查/根因/第二意见，write 改代码带验收。\n\
+         配置 models 别名表，tiers 里用别名或 provider/id，thinking 是独立字段（旧配置不兼容，请迁移旧档到三个用途档并拆出 thinking）。\n\
+         Registered models / 已登记模型:\n{list}\nPi 里还有 {unregistered} 个模型未登记。\n\
+         配置 / configure: {} tiers --alias fast=provider/fast --alias coder=provider/coder --scout fast --review coder --write coder --thinking high\n\
          thinking: {}",
         script().display(),
         THINKING.join("|")
     )
-}
-
-/// Check a tier value against Pi's model list (skipped when the list is empty).
-pub fn check_tier_model(pattern: &str, models: &[(String, bool)]) -> Res<()> {
-    // Like Pi: only a last `:level` naming a thinking level is a suffix, so ids
-    // such as `ollama/qwen2.5-coder:7b` stay whole.
-    let model = pattern
-        .rsplit_once(':')
-        .filter(|(_, level)| THINKING.contains(level))
-        .map_or(pattern, |(model, _)| model);
-    if !model.contains('/') {
-        return Err(format!(
-            "{pattern}: write the model as provider/id[:thinking]"
-        ));
-    }
-    if !models.is_empty() && !models.iter().any(|(m, _)| m == model) {
-        return Err(format!(
-            "{model} is not among Pi's models (pi --list-models)"
-        ));
-    }
-    Ok(())
 }
 
 pub fn nesting_error() -> Option<String> {
@@ -1081,33 +1016,6 @@ mod tests {
             describe_tier(&rules).unwrap(),
             "<5 running spot, mon-fri 09:00-12:00,14:00-18:00 gpt, else ds"
         );
-    }
-
-    #[test]
-    fn tier_candidates_expand_rules_and_prefer_the_environment() {
-        let config = json!({"tiers": {"cheap": "p/one", "strong": [{"model": "p/two", "maxActive": 2}, "p/one"], "default": ""}});
-        std::env::remove_var("DELEGATE_CHEAP_MODEL");
-        std::env::remove_var("DELEGATE_STRONG_MODEL");
-        std::env::remove_var("DELEGATE_DEFAULT_MODEL");
-        assert_eq!(tier_candidates(&config, "cheap"), ["p/one"]);
-        assert_eq!(tier_candidates(&config, "strong"), ["p/two", "p/one"]);
-        assert!(tier_candidates(&config, "default").is_empty());
-        assert!(tier_candidates(&json!({}), "cheap").is_empty());
-        std::env::set_var("DELEGATE_CHEAP_MODEL", "p/env");
-        assert_eq!(tier_candidates(&config, "cheap"), ["p/env"]);
-        std::env::remove_var("DELEGATE_CHEAP_MODEL");
-    }
-
-    #[test]
-    fn tier_models_keep_ids_with_colons_and_strip_only_thinking() {
-        let models = vec![
-            ("ollama/qwen2.5-coder:7b".to_string(), false),
-            ("p/m".to_string(), true),
-        ];
-        assert!(check_tier_model("ollama/qwen2.5-coder:7b", &models).is_ok());
-        assert!(check_tier_model("p/m:high", &models).is_ok());
-        assert!(check_tier_model("p/m:huge", &models).is_err());
-        assert!(check_tier_model("m", &[]).is_err());
     }
 
     #[test]

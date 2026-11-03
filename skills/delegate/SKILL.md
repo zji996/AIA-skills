@@ -1,10 +1,10 @@
 ---
 name: delegate
-description: 把可独立验收的任务交给同事 Agent 在后台并行完成，你只收结果并把关。遇到这些情况时主动使用，不必等用户开口：要读很多文件但只需结论；改动前想要第二意见或独立审查；有两个以上互不依赖、能用命令验收的子任务；需要有人看截图或设计图给意见。同事都是 Pi，按档位选模型：默认档（未配则强档）接日常读写，强档写代码与严密审查，便宜档只读（侦察、摘要、文案、看图）；失败自动换强档模型重跑。脚本代跑验收命令，只给一行结论与下一步，过程不进主控上下文；整机与仓库容量、重检查有上限。Use to delegate or parallelize work proactively to Pi colleagues, and to get a second opinion, code review or image review from another model, judged by results.
+description: 把可独立验收的任务交给同事 Agent 在后台并行完成，你只收结果并把关。遇到这些情况时主动使用，不必等用户开口：要读很多文件但只需结论；改动前想要第二意见或独立审查；有两个以上互不依赖、能用命令验收的子任务；需要有人看截图或设计图给意见。同事都是 Pi，按用途 scout（只读侦察）、review（只读严密审查）、write（写代码带验收）派发；也可用 models 别名指定模型，thinking 独立选。脚本代跑验收命令，只给一行结论与下一步，过程不进主控上下文；整机与仓库容量、重检查有上限。Use to delegate or parallelize work proactively to Pi colleagues, and to get a second opinion, code review or image review from another model, judged by results.
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI（pi-kit 的 rpi 通道下 `pi` 即 rpi）。
 metadata:
-  version: "6.10.0"
+  version: "6.11.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -38,7 +38,7 @@ $D wait                                                                  # 放�
 
 ## 档位
 
-同事都是 Pi，档位只选模型：不写 `--tier` 用 default（未配置则 strong）；`--tier strong` 用于写代码和严密审查；`--tier cheap` 只读，用于侦察、文案、看图。上游瞬时中断（流中断、连接重置、502/503/504、429）先同模型同会话续做，最多 3 次；仍失败且没改文件时自动换强档重跑一次；`--model` 可直接指定模型。首次使用没配模型时，`start` 会列出可选模型和配置命令，照做即可（用户指定过就用用户的）。
+三个独立维度：`--tier scout|review|write` 选用途（scout 侦察/摘要/找文件/文案，review 严密审查/根因/第二意见，write 改代码带验收）；`--model <别名>` 从配置 `models` 指定模型，与 `--tier` 互斥；`--thinking off|minimal|low|medium|high|xhigh` 选思维长度，不再写进模型名。省略用途与模型时，写入推断 write、只读推断 review，回显提醒且状态标「推断」；scout/review 不接写入。图片只检查最终模型的 Pi images 声明，不改选模型。上游瞬时失败先同会话续做，仍失败且未改文件才换本档下一个模型；固定模型不换。首次使用用 `$D tiers --alias name=provider/id --scout name --review name --write name --thinking high` 登记并配齐三档；只选已登记的模型，细节见 [references/configuration.md](references/configuration.md)。
 
 ## 任务说明
 

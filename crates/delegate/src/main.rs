@@ -8,6 +8,7 @@ mod help;
 mod lane;
 mod launch;
 mod measure;
+mod models;
 mod output;
 mod pool;
 mod probe;
@@ -19,7 +20,7 @@ mod transient;
 mod waiting;
 mod worktree;
 use common::*;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -1509,15 +1510,17 @@ fn main_inner(args: &[String]) -> Res<i32> {
 }
 /// Show the model tiers, or write them to the user config.
 fn tiers(args: &[String]) -> Res<i32> {
-    let mut set = serde_json::Map::new();
+    let path = config::user_path();
+    let mut user = config::read_file(&path)?.unwrap_or_else(|| json!({}));
+    let mut changed = false;
     let mut i = 0;
     while i < args.len() {
         let (key, inline) = args[i]
             .split_once('=')
             .map_or((args[i].as_str(), None), |(k, v)| (k, Some(v.to_string())));
-        let tier = key
+        let name = key
             .strip_prefix("--")
-            .filter(|t| agents::ALL_TIERS.contains(t))
+            .filter(|n| models::TIERS.contains(n) || ["alias", "thinking"].contains(n))
             .ok_or_else(|| format!("unrecognized arguments: {}", args[i]))?;
         let value = match inline {
             Some(v) => v,
@@ -1525,29 +1528,59 @@ fn tiers(args: &[String]) -> Res<i32> {
                 i += 1;
                 args.get(i)
                     .cloned()
-                    .ok_or_else(|| format!("argument --{tier}: expected one argument"))?
+                    .ok_or_else(|| format!("{key}: expected one argument"))?
             }
         };
-        set.insert(tier.to_string(), json!(value));
+        match name {
+            "alias" => {
+                let (alias, id) = value
+                    .split_once('=')
+                    .ok_or("--alias expects name=provider/id")?;
+                if !user["models"].is_object() {
+                    user["models"] = json!({});
+                }
+                user["models"][alias] = json!(id);
+            }
+            "thinking" => {
+                models::validate_thinking(&value)?;
+                user["thinking"] = json!(value);
+            }
+            tier => {
+                models::validate_model(&value)?;
+                if !user["tiers"].is_object() {
+                    user["tiers"] = json!({});
+                }
+                user["tiers"][tier] = json!(value);
+            }
+        }
+        changed = true;
         i += 1;
     }
-    let path = config::user_path();
-    if !set.is_empty() {
-        let models = agents::pi_models();
-        for value in set.values() {
-            agents::check_tier_model(value.as_str().unwrap_or(""), &models)?;
+    let listed = agents::pi_models();
+    if changed {
+        config::validate(&user, &path, false)?;
+        // Validate before the atomic write, including every alias and inactive rule.
+        if let Some(aliases) = user["models"].as_object() {
+            for id in aliases.values().filter_map(Value::as_str) {
+                models::resolve_model(id, &user, &listed)?;
+            }
         }
-        let mut user = config::read_file(&path)?.unwrap_or_else(|| json!({}));
-        if !user["tiers"].is_object() {
-            user["tiers"] = json!({});
-        }
-        for (tier, value) in set {
-            user["tiers"][tier] = value;
+        for tier in models::TIERS {
+            match &user["tiers"][tier] {
+                Value::String(_) => {
+                    models::candidate(&user["tiers"][tier], &user, None, &listed)?;
+                }
+                Value::Array(rules) => {
+                    for rule in rules {
+                        models::candidate(rule, &user, None, &listed)?;
+                    }
+                }
+                _ => {}
+            }
         }
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
-        // Replace the file whole: a cut-off write must not truncate the user's other settings.
         let tmp = path.with_extension("json.tmp");
         write(
             &tmp,
@@ -1558,27 +1591,57 @@ fn tiers(args: &[String]) -> Res<i32> {
     let top = git_top(&env::current_dir().unwrap_or_default());
     let config = config::load(top.as_deref())?;
     let mut missing = false;
-    for tier in agents::ALL_TIERS {
-        let model = agents::tier_model(&config.value, tier);
-        let required = agents::TIERS.contains(&tier);
-        missing |= required && model.is_empty();
-        let shown = match (model.is_empty(), required) {
-            (false, _) => model.as_str(),
-            (true, true) => "(not set)",
-            (true, false) => "(not set: read-only uses cheap, writes use strong)",
-        };
-        match agents::describe_tier(&config.value["tiers"][tier]) {
-            Some(rules) if !model.is_empty() => println!("{tier}: {shown} (now; rules: {rules})"),
-            _ => println!("{tier}: {shown}"),
+    for tier in models::TIERS {
+        let rules = models::tier_rules(&config.value, tier);
+        if rules.is_empty() {
+            println!("{tier}: (not set)");
+            missing = true;
+            continue;
+        }
+        let mut descriptions = Vec::new();
+        for rule in rules {
+            let pick = models::candidate(&rule, &config.value, None, &listed)?;
+            let conditions = agents::describe_tier(&json!([rule.clone()])).unwrap_or_default();
+            descriptions.push(format!(
+                "{} → {} (thinking {}; {})",
+                pick.name,
+                pick.model,
+                pick.thinking.as_deref().unwrap_or("Pi default"),
+                conditions
+            ));
+        }
+        println!("{tier}: {}", descriptions.join(", "));
+    }
+    println!("aliases: name → model | context | images | thinking");
+    if let Some(aliases) = config.value["models"].as_object() {
+        for (name, id) in aliases {
+            let id = id.as_str().unwrap_or("");
+            if let Some(model) = listed.iter().find(|m| m.name == id) {
+                println!(
+                    "  {name} → {id} | {} | {} | {}",
+                    model.context, model.images, model.thinking
+                );
+            } else {
+                println!("  {name} → {id} | unknown | unknown | unknown");
+            }
         }
     }
     if missing {
-        eprintln!("{}", agents::tiers_guide());
+        println!(
+            "Pi 里还有 {} 个模型未登记",
+            models::unregistered_count(&config.value, &listed)
+        );
+        eprintln!("{}", agents::tiers_guide(&config.value));
         return Ok(1);
     }
     println!("config: {}", path.display());
+    println!(
+        "Pi 里还有 {} 个模型未登记",
+        models::unregistered_count(&config.value, &listed)
+    );
     Ok(0)
 }
+
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let result = main_inner(&args);

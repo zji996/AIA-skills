@@ -4,7 +4,7 @@
 
 - 某个自部署节点今晚回 502，换档前先看哪几档不通：`delegate probe` 走 Pi 本身并行测各档模型，每行 ok/FAIL 与耗时，失败附 Pi 报错第一行；末行给出不带 `--tier` 时 start 会选的模型。Probe tier models through Pi before dispatching.
 - 只想确认某个模型现在能不能用：`delegate probe --model provider/id[:thinking]`，参数错误退出 2。
-- 峰时换档的规则模型现在会不会被选中：`delegate probe --tier strong`，行里带 hours 命中与 maxActive 当前占用；窗口外的模型通了也不算默认档失败。
+- 峰时换档的规则模型现在会不会被选中：`delegate probe --tier review`，行里带 hours 命中与 maxActive 当前占用；窗口外的模型通了也不算推断用途首选失败。
 
 ## 5.28 测量预约与验收冲突
 
@@ -67,7 +67,7 @@
 - 用户或仓库默认 evidence 自动用于写入，read-only 不继承默认；reply 沿用上一轮命令和超时，`--no-evidence` 关闭。验收失败或 protect 违规跳过证据，原 PATH 不受 agentDeny shim 影响。
 - 只禁不带过滤参数的 `cargo xtask infra-test`：agentDeny 设 `exact: true`，额外参数放行；用户/仓库去重与 allow 撤销按 `(argv, exact)` 匹配。
 - 主控已用 git 手动合入完整改动（尚未 commit）：status/wait/clean 比较源工作树最终内容、删除与执行位，全部包含显示“已合入（主干已含改动）”、appliedBy detected，clean --finished 可清；部分合入或读取失败仍建议 apply。Detect manual integration from working tree contents.
-- 显式 `--model` 固定模型：短行仍显示所在档位（如 pi/cheap），JSON agentPinned true，不自动升档；`--agent` 已删除并退出 2；旧 Codex 记录 reply 时由 Pi 开新会话续做。
+- 显式 `--model` 固定模型：短行显示模型名，JSON agentPinned true，不自动升档；`--agent` 已删除并退出 2；旧 Codex 记录 reply 时由 Pi 开新会话续做。
 - 多项目同时委派：整机默认任务 12、重命令 2，每仓库默认 repoMaxActive 8；git worktree 与主仓库同计，非 git 按规范化路径；命中上限说明层级、计数并只列该层任务，--after 等容量遵守两层。
 - Claude Code Monitor 能将后台逐行输出变事件：优先后台 wait --stream；只有结束通知则重复后台 wait --any。新字段可选，protocol 保持 1。
 
@@ -76,7 +76,7 @@
 - 多个仓库共用禁止同事全量检查的规则：把 agentDeny、通用 env 与 maxRework 写入用户级 delegate/config.json，仓库只补自己的字段。Shared user config applies across repositories.
 - 某仓库需要同事运行用户级禁止的一条命令：仓库 agentDeny 用完全相同 argv 和 allow: true 撤销，其他用户规则仍生效。
 - 用户 env 与仓库 env 同键：仓库覆盖，其他键合并；仓库未声明 accept 时用用户默认，显式 --accept / --no-accept 优先。
-- 新机器首次派任务未配置两档模型：start 退出 2 并列出 Pi 可用模型；主控照用户指定或自行选好后运行 `delegate tiers --cheap … --strong …`，并告诉用户选了什么，再重新派发。
+- 新机器首次派任务未配置三个用途档或 models 别名表：start 退出 2 并列出 Pi 可用模型；主控照用户指定或自行选好后运行 `delegate tiers --alias sol=provider/code --scout sol --review sol --write sol --thinking high`，并告诉用户选了什么，再重新派发。
 - 换机器时设置 maxActive/maxHeavy 与 tiers 模型：用户配置提供容量，仓库可覆盖，DELEGATE_MAX_* 最高；同事不得自行放宽容量。
 - 用户配置误写 worktree、generated 或 applyVerify：start 在 stderr 提示一次并忽略，仓库事实留在 .delegate.json；错误字段和损坏 JSON 必须指出文件并退出 2。
 - 查看规则来自哪里：status --json 与 summary 的 configSources 区分 user/repo，自然语言结论保持简短。
@@ -134,3 +134,8 @@
 
 - 把这个函数的变量名改成驼峰。（委派与验收的开销高于直接修改）
 - 帮我配置 Pi 的默认模型。（是 Pi 配置问题，不是委派任务）
+
+- 只读任务没写用途：推断 review、stderr 明确提醒且 status 标「推断」；显式 `--tier scout` 写入退出 2。Infer purpose with a visible notice, not silent routing.
+- 用 `--model sol --thinking low` 或 reply 换模型：别名解析完整名，thinking 独立回显；模型后缀和 --tier/--model 同用报错。
+- rpi 列出了没凭据的内置模型：不能因此选到它，只从 models 登记表匹配；未登记提示 --alias，歧义列已登记候选。
+- 图片带给 images=no 的模型：不改选模型，退出 2，给出 models.json input 加 image 或 --model 换模型两条出路。

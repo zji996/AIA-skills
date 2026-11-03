@@ -29,10 +29,7 @@ class V515Tests(unittest.TestCase):
         return fixtures.DelegateTests.cli(self, *args, human=human, **kwargs)
 
     def user_config(self, value):
-        path = Path(self.env["XDG_CONFIG_HOME"]) / "delegate/config.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(value))
-        return path
+        return fixtures.DelegateTests.user_config(self, value)
 
     def meta(self, state):
         return json.loads((Path(state["dir"]) / "meta.json").read_text())
@@ -60,14 +57,14 @@ class V515Tests(unittest.TestCase):
         repo = self.repo({"a.txt": "old\n"})
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
         first = self.outcome(self.cli("run", "--workdir", repo, "task"))
-        self.assertEqual(first["configSources"], [])
+        self.assertEqual(first["configSources"], ["user"])
         self.assertEqual(self.meta(first)["configCapacity"], {"maxActive": 12, "maxHeavy": 2,
                                                              "repoMaxActive": 8})
         (repo / ".delegate.json").write_text(json.dumps({"accept": "true", "env": {"LOCAL": "repo"},
                                                         "maxRework": 0}))
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo new >> a.txt")
         state = self.outcome(self.cli("run", "--workdir", repo, "task"))
-        self.assertEqual((state["state"], state["configSources"]), ("delivered", ["repo"]))
+        self.assertEqual((state["state"], state["configSources"]), ("delivered", ["user", "repo"]))
         self.assertEqual(self.meta(state)["env"], {"LOCAL": "repo"})
         rejected = self.cli("reply", state["run"], "fix")
         self.assertEqual(rejected.returncode, 2)

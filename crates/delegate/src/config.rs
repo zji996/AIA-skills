@@ -68,7 +68,7 @@ pub fn read_file(path: &Path) -> Res<Option<Value>> {
     Ok(Some(value))
 }
 
-fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
+pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
     let check = || -> Res<()> {
         if let Some(v) = value.get("stall") {
             let map = v.as_object().ok_or("stall must be an object")?;
@@ -187,12 +187,32 @@ fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
                 ));
             }
         }
+        if let Some(level) = value.get("thinking") {
+            crate::models::validate_thinking(level.as_str().ok_or("thinking must be a string")?)?;
+        }
+        if let Some(aliases) = value.get("models") {
+            for (name, id) in aliases
+                .as_object()
+                .ok_or("models must be an alias object")?
+            {
+                if name.is_empty() || name.contains(['/', ':', ' ', '\0']) {
+                    return Err(format!("invalid model alias {name}"));
+                }
+                let id = id
+                    .as_str()
+                    .ok_or("models aliases must map to provider/id strings")?;
+                crate::models::validate_model(id)?;
+                if !id.contains('/') {
+                    return Err(format!("models.{name}: expected provider/id"));
+                }
+            }
+        }
         if let Some(tiers) = value.get("tiers") {
             let tiers = tiers.as_object().ok_or("tiers must be an object")?;
             for (tier, model) in tiers {
                 if !crate::agents::ALL_TIERS.contains(&tier.as_str()) {
                     return Err(format!(
-                        "tiers.{tier}: unknown tier (default, cheap or strong)"
+                        "tiers.{tier}: unknown tier (scout, review or write)"
                     ));
                 }
                 validate_tier(tier, model)?;
@@ -283,18 +303,21 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         sources.push("repo");
     }
     let mut value = repo.clone().unwrap_or(json!({}));
-    // Tiers merge per tier: a repository naming one model keeps the user's others.
-    let mut tiers = user
-        .as_ref()
-        .and_then(|u| u["tiers"].as_object().cloned())
-        .unwrap_or_default();
-    if let Some(repo_tiers) = value["tiers"].as_object() {
-        tiers.extend(repo_tiers.clone());
-    }
-    if !tiers.is_empty() {
-        value["tiers"] = Value::Object(tiers);
+    // Independent maps merge per key, repository overrides user.
+    for key in ["tiers", "models"] {
+        let mut merged = user
+            .as_ref()
+            .and_then(|u| u[key].as_object().cloned())
+            .unwrap_or_default();
+        if let Some(repo_map) = value[key].as_object() {
+            merged.extend(repo_map.clone());
+        }
+        if !merged.is_empty() {
+            value[key] = Value::Object(merged);
+        }
     }
     for key in [
+        "thinking",
         "accept",
         "evidence",
         "maxRework",
@@ -432,12 +455,17 @@ fn validate_tier(tier: &str, value: &Value) -> Result<(), String> {
         m.as_str()
             .is_some_and(|m| !m.is_empty() && !m.contains('\0'))
     };
+    if let Some(m) = value.as_str() {
+        if !m.is_empty() {
+            crate::models::validate_model(m)?;
+        }
+    }
     if value.is_string() {
         return if model(value) || value.as_str() == Some("") {
             Ok(())
         } else {
             Err(format!(
-                "tiers.{tier} must be a Pi model pattern string (provider/id[:thinking])"
+                "tiers.{tier} must be a Pi model pattern string (alias or provider/id)"
             ))
         };
     }
@@ -450,6 +478,13 @@ fn validate_tier(tier: &str, value: &Value) -> Result<(), String> {
         ));
     }
     for (index, rule) in rules.iter().enumerate() {
+        let id = rule.as_str().unwrap_or_else(|| s(rule, "model"));
+        crate::models::validate_model(id)?;
+        if let Some(level) = rule.get("thinking") {
+            crate::models::validate_thinking(
+                level.as_str().ok_or("rule thinking must be a string")?,
+            )?;
+        }
         if rule.is_string() {
             if !model(rule) || index + 1 != rules.len() {
                 return Err(format!(
@@ -464,16 +499,20 @@ fn validate_tier(tier: &str, value: &Value) -> Result<(), String> {
         };
         if !model(&rule["model"])
             || rule.as_object().is_none_or(|o| {
-                o.keys()
-                    .any(|k| !["model", "days", "hours", "maxActive"].contains(&k.as_str()))
+                o.keys().any(|k| {
+                    !["model", "thinking", "days", "hours", "maxActive"].contains(&k.as_str())
+                })
             })
-            || (rule["days"].is_null() && rule["hours"].is_null() && rule["maxActive"].is_null())
+            || (rule["days"].is_null()
+                && rule["hours"].is_null()
+                && rule["maxActive"].is_null()
+                && rule["thinking"].is_null())
             || !(rule["maxActive"].is_null() || rule["maxActive"].as_u64().is_some_and(|n| n > 0))
             || !field("days", &|d| crate::agents::parse_days(d).is_some())
             || !field("hours", &|h| crate::agents::parse_windows(h).is_some())
         {
             return Err(format!(
-                "tiers.{tier}[{index}] must be {{\"model\": \"provider/id[:thinking]\", \"days\": \"mon-fri\", \"hours\": \"09:00-12:00,14:00-18:00\", \"maxActive\": 5}} with at least one of days, hours, maxActive (local time; hours end exclusive and may wrap midnight; maxActive a positive integer counting runs on this machine)"
+                "tiers.{tier}[{index}] must be {{\"model\": \"alias or provider/id\", \"days\": \"mon-fri\", \"hours\": \"09:00-12:00,14:00-18:00\", \"maxActive\": 5}} with at least one of thinking, days, hours, maxActive (local time; hours end exclusive and may wrap midnight; maxActive a positive integer counting runs on this machine)"
             ));
         }
     }

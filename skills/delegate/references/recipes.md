@@ -21,10 +21,10 @@
 大范围审查按子系统拆开，各起一个只读任务，范围写清，一个后台 `wait` 收齐：
 
 ```bash
-$D start --read-only --tier strong --name rv-runtime --prompt-file - <<'EOF'
+$D start --read-only --tier review --name rv-runtime --prompt-file - <<'EOF'
 审查 packages/runtime 最近 4 个提交（git log -4 --stat 可看范围）引入的改动，只列真实缺陷……
 EOF
-$D start --read-only --tier strong --name rv-api "审查 apps/api 里同一批提交的调度与重试逻辑……"
+$D start --read-only --tier review --name rv-api "审查 apps/api 里同一批提交的调度与重试逻辑……"
 $D start --read-only --name rv-web "审查 apps/web 同一批提交的交互与文案，列最影响使用的问题"
 $D wait            # 放后台；三路都结束才返回
 ```
@@ -40,7 +40,7 @@ Claude Code 的 Monitor 能把后台输出逐行转事件，优先 `wait --strea
 根因你已经定位、改法需要细心实现时：
 
 ```bash
-$D run --worktree --tier strong --name fix-lock --accept-also "go test ./internal/queue/..." --prompt-file - <<'EOF'
+$D run --worktree --tier write --name fix-lock --accept-also "go test ./internal/queue/..." --prompt-file - <<'EOF'
 目标：修复并发取消时重复释放锁。
 已定事实：根因是 cancel() 与 worker 退出路径都调用 release()，两者之间没有同步（queue.go:210、worker.go:88）。
 要求：release 幂等且不引入新锁；补一个并发取消的回归测试。不要改公开接口。
@@ -66,7 +66,7 @@ $D reply model-fix --no-evidence '只补文档中的说明'
 迁移、重写这类任务，先把行为写成规格与黑盒测试，再委派；验收命令里禁止改动测试与规格，否则最省事的"通过"就是改测试：
 
 ```bash
-$D run --worktree --tier strong --name port --timeout 3h --accept-timeout 30m \
+$D run --worktree --tier write --name port --timeout 3h --accept-timeout 30m \
   --protect tests/ --protect docs/spec.md \      # 改了测试或规格直接判 rejected，验收都不跑
   --accept-also 'make build && make test' --prompt-file task.md
 ```
@@ -81,7 +81,7 @@ $D start --read-only --image before.png --image after.png "对比两张截图，
 
 ## 5. 批量文案与摘要
 
-便宜档适合量大、可粗筛的活，多路并行，结果由你汇总：
+scout 档适合量大、可粗筛的只读任务，多路并行，结果由你汇总：
 
 ```bash
 for f in docs/guide/*.md; do
@@ -121,6 +121,6 @@ $D wait
 - 只禁无过滤的数据库全量检查时用 `{"argv":["cargo","xtask","infra-test"],"exact":true,"hint":"带过滤参数跑相关用例"}`；额外参数放行。用户/仓库去重和 `allow: true` 撤销都按 `(argv, exact)`，撤销时保留同样的 exact。
 - 顶层 `accept` 只作用于写入任务；任务测试用 `--accept-also` 追加，`--accept` 覆盖，`--no-accept` 关闭（不能与追加同用）。并行写入用 `--protect` 划分文件所有权；验收覆盖相关 ratchet、contracts、docs 门禁，合并后再跑全量。
 - `generated.paths` 的匹配语义同 `--protect`（目录以 `/` 结尾）。这些生成文件仍出现在改动清单和 diff 中，但 `apply` 不合并或覆盖它们；合并其他文件后，在源仓库根通过 lane 运行 `sh -c` 执行 `generated.command`（设了 `generated.inputs` 时只在合并路径命中它时运行），输出写入 run 目录的 `generate.log`。`--dry-run` 只报告动作；生成失败时已合并文件保留，需查看日志后重试。见 `docs/delegate-spec.md` §6.4。
-- 界面实现默认 `--tier cheap`，说明里要截图路径；强档只接状态、数据与接口逻辑。
+- 界面实现用 `--tier write` 并给验收；截图意见用 `--read-only --tier review --image shot.png`，图片不会自动换模型。
 
 常见问题与不适合委派的情况见 [pitfalls.md](pitfalls.md)。

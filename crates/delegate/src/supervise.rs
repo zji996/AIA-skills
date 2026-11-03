@@ -673,23 +673,35 @@ fn escalate(
     changed: &[String],
     protected: bool,
 ) -> Res<bool> {
-    if !["cheap", "default"].contains(&s(meta, "tier"))
-        || runs::agent_pinned(meta)
+    if runs::agent_pinned(meta)
         || protected
         || !["malformed", "failed", "timeout", "rejected"].contains(&state)
     {
         return Ok(false);
     }
-    if s(meta, "mode") != "read-only" && (!recorded || !changed.is_empty()) {
+    if !changed.is_empty() || (s(meta, "mode") != "read-only" && !recorded) {
         return Ok(false);
     }
-    let strong = s(&meta["tierModels"], "strong").to_string();
-    if strong.is_empty() || strong == s(meta, "model") {
+    let candidates = meta["tierCandidates"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let Some(next) = crate::models::next_candidate(
+        s(meta, "model"),
+        &candidates,
+        meta["tierCandidateIndex"].as_u64().unwrap_or(0) as usize,
+    ) else {
         return Ok(false);
+    };
+    if meta["images"].as_array().is_some_and(|a| !a.is_empty()) {
+        let listed = agents::pi_models();
+        crate::models::guard_images(s(&next, "model"), &listed)?;
     }
     meta["escalatedFrom"] = json!(model_label(meta));
-    meta["model"] = json!(strong);
-    meta["tier"] = json!("strong");
+    meta["model"] = next["model"].clone();
+    meta["modelName"] = next["name"].clone();
+    meta["tierCandidateIndex"] = next["index"].clone();
+    meta["thinking"] = next["thinking"].clone();
     meta["fork"] = Value::Null;
     write_json(run.join("meta.json"), meta)?;
     Ok(true)
@@ -868,15 +880,19 @@ fn inner(
         holder.clone(),
         verdict == "ok" && agents::is_question(&answer),
     );
-    let cheap = model_label(&meta);
+    if transient_error.is_empty() && verdict == "failed" {
+        transient_error = transient::ended_by(run, attempts).unwrap_or_default();
+    }
+    let original_model = model_label(&meta);
     let protected = !sum["protectViolation"].is_null();
     if !lane::stopped()
         && sum["question"].is_null()
+        && !transient_error.is_empty()
         && escalate(&mut meta, run, &state, rec.is_some(), &changed, protected)?
     {
         log_event(
             run,
-            json!({"e":"escalate","from":cheap,"to":model_label(&meta),"after":state}),
+            json!({"e":"escalate","from":original_model,"to":model_label(&meta),"after":state}),
         );
         (verdict, answer, attempts) =
             attempts_from(&meta, run, attempts + 1, holder.clone(), grace.clone());
@@ -888,7 +904,7 @@ fn inner(
             holder.clone(),
             verdict == "ok" && agents::is_question(&answer),
         );
-        sum["escalatedFrom"] = json!(cheap);
+        sum["escalatedFrom"] = json!(original_model);
     }
     sum["attempts"] = json!(attempts);
     if resumes > 0 {
