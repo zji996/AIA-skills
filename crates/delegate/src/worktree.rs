@@ -265,6 +265,11 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<Option<String>> {
         ) {
             return Ok(Some(format!("worktree setup failed: {}", clip(&e, 300))));
         }
+        if b(tree, "pooled") {
+            if let Err(e) = crate::pool::attach_target(&path) {
+                return Ok(Some(format!("worktree setup failed: {}", clip(&e, 300))));
+            }
+        }
     }
     if s(meta, "mode") == "read-only" && !head.is_empty() {
         let _ = git(&path, &["reset", "-q", "--soft", &head]);

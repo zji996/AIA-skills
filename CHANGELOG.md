@@ -11,6 +11,7 @@
 ### 技能
 
 - `iteration-speed` 1.6.0：新增判断点「回归按工作量结算」——门禁变慢与提速验收用数据库读行/页访问、指令数等与机器无关的工作量做棘轮，秒数只作参考。
+- `delegate` 6.12.0：池槽位 `target/` 超限时不再整盘清空，改为按最近使用淘汰构建单元（同一 `<名>-<哈希>` 的产物、指纹与构建脚本目录一起，或一个增量目录），降到上限的 3/4；新增 `DELEGATE_POOL_TARGET_ROOT`，把各槽 `target` 链到专用构建盘，槽位重建后仍接上原缓存。起因：4 个槽共 167 GiB，单槽 70% 是增量状态，旧分支与特性组合的变体与常用变体一起只能整盘丢弃。
 - `delegate` 6.11.0：用途 scout/review/write、已登记模型别名、thinking 三维分离，推断用途显式提醒，图片仅做能力守卫，瞬时失败换本档下一候选，tiers/probe 只展示或调用登记模型。**不兼容旧配置**：将 cheap/strong/default 改成三个用途档、模型登记到 models，并将模型后缀拆为 thinking 字段。
 
 - `delegate` 6.10.0：worktree 池。`.delegate.json` 的 `worktree.pool` 设为 N 后，写入任务复用 N 个固定路径的 worktree，换任务只 `git checkout` 有差异的文件（先刷新索引，修改时间变了但内容没变的文件不重写），`target/` 等构建缓存保留，Cargo 只重编改动的 crate；槽位随 run 的 `clean`/合入释放、不删除，被续做共用时不释放，全部占用时退回独立 worktree，`target/` 超过 60 GiB（`DELEGATE_POOL_TARGET_GIB`）清空一次。同时修了清理测试的偶发 ETXTBSY（复制可执行文件时别的线程 fork 继承了写句柄，spawn 改为短暂重试）。起因：三个模型同时做一个改两个 crate 的小任务，每个新 worktree 都要冷编 12 万行 runtime、9 万行 control-plane、5 万行 Server，单编译加数据库测试就 15–20 分钟；sccache 只缓存第三方依赖，本仓库 crate 因路径不同与增量编译都不命中。

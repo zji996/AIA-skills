@@ -474,7 +474,11 @@ fn agent_label(status: &Value) -> String {
         (false, true) => format!("{agent}/{name}"),
         (false, false) => format!(
             "{agent}/{name} · {tier}{}",
-            if b(status, "tierInferred") { "（推断）" } else { "" }
+            if b(status, "tierInferred") {
+                "（推断）"
+            } else {
+                ""
+            }
         ),
     }
 }

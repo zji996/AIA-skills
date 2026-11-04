@@ -115,6 +115,7 @@ pub fn reset(slot: &Path, commit: &str, managed: &[String]) -> Result<bool, Stri
         .and_then(|()| git_in(slot, &["checkout", "-q", "--detach", commit]));
     match step {
         Ok(()) => {
+            attach_target(slot)?;
             trim_target(slot);
             Ok(true)
         }
@@ -130,32 +131,159 @@ pub fn reset(slot: &Path, commit: &str, managed: &[String]) -> Result<bool, Stri
     }
 }
 
-/// A slot's `target/` only grows (old artifacts stay beside new ones); past the limit
-/// (`DELEGATE_POOL_TARGET_GIB`, default 60) it is emptied once and rebuilt cold.
+/// Put a slot's `target/` where `DELEGATE_POOL_TARGET_ROOT` says, e.g. a disk kept for
+/// builds: `target` becomes a link to `<root>/<slot>/target`. The link survives `git clean`
+/// (`/target` is excluded) and a recreated slot finds its build cache again, because the
+/// slot path, which Cargo keys path packages by, does not change. Unset, a link left by an
+/// earlier setting is dropped and the next build starts a local `target/` cold.
+pub fn attach_target(slot: &Path) -> Result<(), String> {
+    attach_target_to(slot, &setting("POOL_TARGET_ROOT", ""))
+}
+
+fn attach_target_to(slot: &Path, root: &str) -> Result<(), String> {
+    let link = slot.join("target");
+    if root.is_empty() {
+        if link.is_symlink() {
+            fs::remove_file(&link).map_err(|e| e.to_string())?;
+        }
+        return Ok(());
+    }
+    let name = slot.file_name().unwrap_or_default();
+    let dest = Path::new(root).join(name).join("target");
+    if link.is_symlink() && fs::read_link(&link).is_ok_and(|to| to == dest) {
+        return Ok(());
+    }
+    fs::create_dir_all(&dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    if link.is_symlink() || link.is_file() {
+        fs::remove_file(&link).map_err(|e| e.to_string())?;
+    } else if link.is_dir() {
+        // Builds moved off this disk: the old local cache is not carried over.
+        fs::remove_dir_all(&link).map_err(|e| e.to_string())?;
+    }
+    std::os::unix::fs::symlink(&dest, &link).map_err(|e| e.to_string())
+}
+
+/// A slot's `target/` only grows: old commits, feature sets and package-scoped builds each
+/// leave their own artifacts beside the current ones. Past the limit
+/// (`DELEGATE_POOL_TARGET_GIB`, default 60) the least recently used build units are
+/// evicted until it is back under three quarters of it, so the variants tasks keep using
+/// stay warm instead of the whole cache going cold at once.
 fn trim_target(slot: &Path) {
-    let target = slot.join("target");
     let limit_gib: u64 = setting("POOL_TARGET_GIB", "60").parse().unwrap_or(60);
-    let Ok(out) = Command::new("du").arg("-sb").arg(&target).output() else {
+    let limit = limit_gib << 30;
+    let (used, freed) = evict_lru(&slot.join("target"), limit, limit / 4 * 3);
+    if freed > 0 {
+        eprintln!(
+            "delegate: pool slot {} target was {} GiB (limit {limit_gib}); evicted {} GiB of least recently used build units",
+            slot.display(),
+            used >> 30,
+            freed >> 30
+        );
+    }
+}
+
+/// One evictable piece of a Cargo target: every file of a compiled unit (`deps/`,
+/// `.fingerprint/`, `build/`, `examples/` entries sharing `<name>-<hash>`) or one crate's
+/// incremental directory. Cargo rebuilds a unit whose output or fingerprint is missing,
+/// so evicting any of them costs a rebuild, never a wrong build.
+#[derive(Default)]
+struct Unit {
+    paths: Vec<PathBuf>,
+    bytes: u64,
+    /// Latest modification, or file access; `relatime` refreshes access times about
+    /// daily, which is fine-grained enough to tell this week's variants from last week's.
+    used: i64,
+}
+
+fn unit_key(dir: &str, name: &str) -> String {
+    if dir == "incremental" {
+        return name.to_string();
+    }
+    let (stem, ext) = name.split_once('.').unwrap_or((name, ""));
+    let library =
+        ["rlib", "rmeta", "so", "a", "dylib"].contains(&ext.rsplit('.').next().unwrap_or(""));
+    match stem.strip_prefix("lib") {
+        Some(rest) if library => rest.to_string(),
+        _ => stem.to_string(),
+    }
+}
+
+fn tree_usage(path: &Path, unit: &mut Unit) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = fs::symlink_metadata(path) else {
         return;
     };
-    let used: u64 = String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .next()
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0);
-    if used > limit_gib << 30 {
-        eprintln!(
-            "delegate: pool slot {} target is {} GiB (limit {limit_gib}); emptying it",
-            slot.display(),
-            used >> 30
-        );
-        let _ = fs::remove_dir_all(&target);
+    unit.bytes += meta.blocks() * 512;
+    unit.used = unit.used.max(meta.mtime());
+    // A file's access time records Cargo reading it (linking, checking freshness); a
+    // directory's would record this very scan listing it.
+    if !meta.is_dir() {
+        unit.used = unit.used.max(meta.atime());
     }
+    if meta.is_dir() {
+        for entry in fs::read_dir(path).into_iter().flatten().flatten() {
+            tree_usage(&entry.path(), unit);
+        }
+    }
+}
+
+/// Group a target's build units, then delete the oldest until `used <= low`; returns the
+/// size before and the bytes freed. Nothing is touched while the target is under `limit`.
+fn evict_lru(target: &Path, limit: u64, low: u64) -> (u64, u64) {
+    let mut units: std::collections::BTreeMap<(PathBuf, String), Unit> = Default::default();
+    let mut other = Unit::default();
+    let mut stack = vec![(target.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            if is_dir
+                && ["deps", ".fingerprint", "build", "examples", "incremental"]
+                    .contains(&name.as_str())
+            {
+                for item in fs::read_dir(&path).into_iter().flatten().flatten() {
+                    let item_name = item.file_name().to_string_lossy().into_owned();
+                    let unit = units
+                        .entry((dir.clone(), unit_key(&name, &item_name)))
+                        .or_default();
+                    unit.paths.push(item.path());
+                    tree_usage(&item.path(), unit);
+                }
+            } else if is_dir && depth < 2 {
+                // `target/<profile>/` or `target/<triple>/<profile>/`.
+                stack.push((path, depth + 1));
+            } else {
+                tree_usage(&path, &mut other);
+            }
+        }
+    }
+    let used = other.bytes + units.values().map(|u| u.bytes).sum::<u64>();
+    if used <= limit {
+        return (used, 0);
+    }
+    let mut order: Vec<Unit> = units.into_values().collect();
+    order.sort_by_key(|u| u.used);
+    let mut left = used;
+    for unit in order {
+        if left <= low {
+            break;
+        }
+        for path in &unit.paths {
+            let _ = if path.is_dir() && !path.is_symlink() {
+                fs::remove_dir_all(path)
+            } else {
+                fs::remove_file(path)
+            };
+        }
+        left = left.saturating_sub(unit.bytes);
+    }
+    (used, used - left)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::reset;
+    use super::{attach_target_to, evict_lru, reset};
     use std::fs;
     use std::path::Path;
     use std::process::Command;
@@ -242,6 +370,84 @@ mod tests {
             .modified()
             .unwrap();
         assert_eq!(kept, old, "an unchanged file must keep its mtime");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Over the limit, whole units go oldest first (a unit's rlib, fingerprint and
+    /// incremental state together) and recently used units stay.
+    #[test]
+    fn an_oversized_target_evicts_least_recently_used_units() {
+        let target = std::env::temp_dir().join(format!("delegate-lru-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&target);
+        let debug = target.join("debug");
+        let old = SystemTime::now() - Duration::from_secs(7 * 86400);
+        let put = |rel: &str, when: Option<SystemTime>| {
+            let path = debug.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, vec![1u8; 100 << 10]).unwrap();
+            if let Some(when) = when {
+                let times = fs::FileTimes::new().set_accessed(when).set_modified(when);
+                fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(times)
+                    .unwrap();
+                // A unit's directories age with it, as they do when nothing rebuilds it.
+                for dir in path
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|d| d.starts_with(&debug))
+                {
+                    let _ = fs::File::open(dir).and_then(|d| d.set_times(times));
+                }
+            }
+        };
+        put("deps/libold-1111.rlib", Some(old));
+        put(".fingerprint/old-1111/lib-old", Some(old));
+        put("incremental/old-x/s-1/query-cache.bin", Some(old));
+        put("deps/libnew-2222.rlib", None);
+        put("deps/new-2222.d", None);
+
+        assert_eq!(
+            evict_lru(&target, u64::MAX, 0).1,
+            0,
+            "under the limit nothing goes"
+        );
+        let (_, freed) = evict_lru(&target, 0, 250 << 10);
+        assert!(freed >= 300 << 10);
+        for gone in [
+            "deps/libold-1111.rlib",
+            ".fingerprint/old-1111",
+            "incremental/old-x",
+        ] {
+            assert!(!debug.join(gone).exists(), "{gone} should be evicted");
+        }
+        assert!(debug.join("deps/libnew-2222.rlib").exists());
+        assert!(debug.join("deps/new-2222.d").exists());
+        let _ = fs::remove_dir_all(&target);
+    }
+
+    /// With a target root the slot's `target` links to `<root>/<slot>/target`, replacing a
+    /// local directory; without one the link is dropped.
+    #[test]
+    fn a_target_root_links_the_slot_target_and_unset_drops_the_link() {
+        let base = std::env::temp_dir().join(format!("delegate-troot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let slot = base.join("repo-1");
+        fs::create_dir_all(slot.join("target/debug")).unwrap();
+        let root = base.join("optane");
+
+        attach_target_to(&slot, &root.to_string_lossy()).unwrap();
+        attach_target_to(&slot, &root.to_string_lossy()).unwrap();
+        assert_eq!(
+            fs::read_link(slot.join("target")).unwrap(),
+            root.join("repo-1/target")
+        );
+        assert!(root.join("repo-1/target").is_dir());
+
+        attach_target_to(&slot, "").unwrap();
+        assert!(!slot.join("target").exists() && !slot.join("target").is_symlink());
         let _ = fs::remove_dir_all(&base);
     }
 }
