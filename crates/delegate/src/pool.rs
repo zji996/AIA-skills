@@ -171,6 +171,14 @@ fn attach_target_to(slot: &Path, root: &str) -> Result<(), String> {
 fn trim_target(slot: &Path) {
     let limit_gib: u64 = setting("POOL_TARGET_GIB", "60").parse().unwrap_or(60);
     let limit = limit_gib << 30;
+    let pruned = prune_sessions(&slot.join("target"));
+    if pruned >= 1 << 30 {
+        eprintln!(
+            "delegate: pool slot {} dropped {} GiB of superseded incremental sessions",
+            slot.display(),
+            pruned >> 30
+        );
+    }
     let (used, freed) = evict_lru(&slot.join("target"), limit, limit / 4 * 3);
     if freed > 0 {
         eprintln!(
@@ -180,6 +188,80 @@ fn trim_target(slot: &Path) {
             freed >> 30
         );
     }
+}
+
+/// Drop every incremental session but the newest of each crate. rustc keeps the previous
+/// session beside the current one until that crate compiles again, and the dependency graph
+/// and query cache in it are rewritten, not hard-linked, so each edit-and-rebuild left about
+/// a third of the incremental state behind as garbage (7 of 28 GiB in one measured slot).
+/// rustc only ever reads the newest finalized session; unfinished `-working` ones are left
+/// alone. Runs while the slot is being claimed, so no compiler holds a session.
+fn prune_sessions(target: &Path) -> u64 {
+    let mut freed = 0;
+    let mut stack = vec![(target.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            if entry.file_name() == "incremental" {
+                for krate in fs::read_dir(entry.path()).into_iter().flatten().flatten() {
+                    freed += prune_crate_sessions(&krate.path());
+                }
+            } else if depth < 2 {
+                stack.push((entry.path(), depth + 1));
+            }
+        }
+    }
+    freed
+}
+
+fn prune_crate_sessions(krate: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    // `s-<timestamp>-<random>-<svh>`; the timestamp is base-36 microseconds, so the longer
+    // or, at equal length, larger one is newer.
+    let mut finished: Vec<(String, String)> = fs::read_dir(krate)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let mut parts = name.splitn(4, '-');
+            let (Some("s"), Some(stamp), Some(random), Some(tail)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return None;
+            };
+            (tail != "working").then(|| (stamp.to_string(), format!("s-{stamp}-{random}")))
+        })
+        .collect();
+    finished.sort_by(|a, b| (a.0.len(), &a.0).cmp(&(b.0.len(), &b.0)));
+    finished.pop();
+    let mut freed = 0;
+    for (_, prefix) in finished {
+        for entry in fs::read_dir(krate).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name != format!("{prefix}.lock") && !name.starts_with(&format!("{prefix}-")) {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                for file in fs::read_dir(&path).into_iter().flatten().flatten() {
+                    // Files shared with the newest session by hard link free nothing.
+                    if let Ok(meta) = file.metadata() {
+                        if meta.nlink() == 1 {
+                            freed += meta.blocks() * 512;
+                        }
+                    }
+                }
+                let _ = fs::remove_dir_all(&path);
+            } else {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+    freed
 }
 
 /// One evictable piece of a Cargo target: every file of a compiled unit (`deps/`,
@@ -283,7 +365,7 @@ fn evict_lru(target: &Path, limit: u64, low: u64) -> (u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_target_to, evict_lru, reset};
+    use super::{attach_target_to, evict_lru, prune_sessions, reset};
     use std::fs;
     use std::path::Path;
     use std::process::Command;
@@ -449,5 +531,37 @@ mod tests {
         attach_target_to(&slot, "").unwrap();
         assert!(!slot.join("target").exists() && !slot.join("target").is_symlink());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Only each crate's newest finished session survives; an unfinished one is kept.
+    #[test]
+    fn older_incremental_sessions_are_pruned() {
+        let target = std::env::temp_dir().join(format!("delegate-sess-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&target);
+        let krate = target.join("debug/incremental/foo-abc");
+        for dir in ["s-hnu2a-1x-svh", "s-hnu2b-2y-svh", "s-hnu2c-3z-working"] {
+            fs::create_dir_all(krate.join(dir)).unwrap();
+            fs::write(krate.join(dir).join("query-cache.bin"), vec![0u8; 8192]).unwrap();
+        }
+        for lock in ["s-hnu2a-1x.lock", "s-hnu2b-2y.lock", "s-hnu2c-3z.lock"] {
+            fs::write(krate.join(lock), "").unwrap();
+        }
+
+        assert!(prune_sessions(&target) >= 8192);
+        let mut left: Vec<String> = fs::read_dir(&krate)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "s-hnu2b-2y-svh",
+                "s-hnu2b-2y.lock",
+                "s-hnu2c-3z-working",
+                "s-hnu2c-3z.lock"
+            ]
+        );
+        let _ = fs::remove_dir_all(&target);
     }
 }
