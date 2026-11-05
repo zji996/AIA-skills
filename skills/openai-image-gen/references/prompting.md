@@ -34,11 +34,11 @@ AVOID: 3D/isometric, people, robots, circuit textures, lens flares, neon/purple,
 - **易拼错的词**：拆成字母写，例如 `spelled A-N-T-H-R-O-P-I-C`，并写明不带哪些标点。标点也会被模型带偏，例如 `history/` 的斜杠会传到相邻的标签上。
 - **文字数量**：标签越少越准，超过约 40 个字符串时，小字出错的概率明显上升。空的气泡、色块要写 "no text inside"，否则模型会补上伪文字。
 - **层级**：标题 > 卡片标题 > 芯片或条带标签，分别写清相对字号。
-- **提示词存档**：正式图用 `--keep-prompt`，提示词存为输出旁的 `<名字>.prompt.txt`，便于日后复现。
+- **提示词存档**：`--keep-prompt` 把提示词存为输出旁的 `<名字>.prompt.txt`，便于日后复现。
 
 ## 参考图与角色一致性
 
-- **设定图**：一张图里画同一角色的正面、四分之三侧面、侧面、背面全身，再加几个表情特写和标志物细节；纯浅色背景，不要文字标注。设定图本身不带 `-r`，正式图满意后才拿来当参考。
+- **设定图**：一张图里画同一角色的正面、四分之三侧面、侧面、背面全身，再加几个表情特写和标志物细节；纯浅色背景，不要文字标注。设定图本身不带 `-r`，满意后才拿来当参考。
 - **文字描述也要固定**：外貌、服装、标志物写成固定段落，每张场景图原样带上。参考图和文字互相印证，比只靠其中一个更稳。
 - **少露脸更稳**：背影、侧影、剪影、局部特写（手、标志物）最不容易走样；正脸留给少数关键镜头。
 - **多角色**：每个角色一张设定图，按 `-r` 的顺序在提示词里点名，例如 "the boy from image 1 and the girl from image 2"。
@@ -51,16 +51,15 @@ AVOID: 3D/isometric, people, robots, circuit textures, lens flares, neon/purple,
 Keep the whole image exactly as it is. Only change: the tag "Anthropic/" becomes "Anthropic" (no slash).
 ```
 
-连续编辑会让别处的字慢慢走样，所以预算只给 1 次编辑。同一个错误改不掉时，就去修提示词，再走一轮草稿和正式图。
+连续编辑会让别处的字慢慢走样，所以预算只给 1 次编辑。同一个错误改不掉时，修提示词重新出图更可靠。
 
 ## 模型与参数
 
-- **模型**：默认 GPT Image 2.6。`gpt-image-2.6-flare` 快（实测 11–28 秒），是草稿默认；`gpt-image-2.6-sunburst` 细节更多、可能更慢（medium 实测 18–45 秒），是正式图与编辑的默认。2026-11-06 同提示词对照，两者的文字、箭头都正确，成图差别不大；按 token 计价，两者同价。旧的 `gpt-image-2.5-*` 仍可用 `-m` 指定，部分网关会把它自动升级到 2.6。
+- **模型**：默认 GPT Image 2.6。`gpt-image-2.6-sunburst` 是默认，细节更多、可能更慢（medium 实测 18–45 秒）；`gpt-image-2.6-flare` 快（实测 11–28 秒）。2026-11-06 同提示词对照，两者的文字、箭头都正确，成图差别不大；按 token 计价，两者同价。旧的 `gpt-image-2.5-*` 仍可用 `-m` 指定，部分网关会把它自动升级到 2.6。
 - **质量档**：`low`/`medium`/`high`/`xhigh`/`max`。
   - 官方建议 `xhigh`/`max` 只在 `high` 达不到要求时用，更高档不保证更好。
   - 实测 2560x1440 下，`xhigh` 与 `high` 都要 40–60 秒。
-- **网关差异**：经 ChatGPT 账号转发的网关（如 Sub2API 的 Codex 通道）由服务端决定画质与尺寸：实测请求 low 回报 medium，请求 high 回报 low（输出 token 比 medium 还少），`size` 只作参考、横竖看提示词，`output_format` 一律返回 PNG（SVG 会被拒绝），GIF 与 `markup` 不可用。这类网关上草稿就是成品画质，满意就 `keep`；脚本会在 high 被降级后自动改请求 medium。
+- **网关差异**：经 ChatGPT 账号转发的网关（如 Sub2API 的 Codex 通道）由服务端决定画质与尺寸：实测请求 low 回报 medium，请求 high 回报 low（输出 token 比 medium 还少），`size` 只作参考、横竖看提示词，`output_format` 一律返回 PNG（SVG 会被拒绝），GIF 与 `markup` 不可用。这类网关上请求更高档不会更好，结果 JSON 的 `warning` 会写出实际画质。
 - **尺寸**：
   - 两边都须是 16 的倍数，长短边比不超过 3:1，最大 `3840x2160`；
   - 像素数超过 2560x1440 属实验性。
-  - 草稿按同一比例缩到长边 1536。
