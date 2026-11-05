@@ -110,6 +110,10 @@ pub fn kind(text: &str) -> Option<Kind> {
             "unexpected end of stream",
             "premature close",
             "socket hang up",
+            // rpi (reqwest): the chunked body ends before the answer does.
+            "error reading sse body",
+            "error decoding response body",
+            "unexpected eof",
         ],
     ) {
         return Some(Kind::Stream);
@@ -224,6 +228,10 @@ mod tests {
         assert_eq!(kind("504 Gateway Timeout"), Some(Kind::Gateway));
         assert_eq!(kind("429 Too Many Requests"), Some(Kind::RateLimit));
         assert_eq!(kind("request timed out"), Some(Kind::Connection));
+        assert_eq!(
+            kind("sse error: error reading sse body: error decoding response body (caused by: request or response body error; error reading a body from connection; unexpected EOF during chunk size line)"),
+            Some(Kind::Stream)
+        );
         // The caller has to fix these; retrying the same session would just repeat the error.
         assert_eq!(kind("401 Unauthorized: invalid api key"), None);
         assert_eq!(kind("403 Forbidden"), None);
