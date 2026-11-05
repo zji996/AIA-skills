@@ -3,22 +3,22 @@ name: openai-image-gen
 description: 需要生成配图、Banner、图标、架构总览、产品插图、分镜画面或 UI/游戏素材并保存为本地文件时使用；可传参考图（角色设定图等）让多张图里的人物保持一致；先打草稿定构图，草稿满意就直接采用，否则出一次正式图，按输出文件限定次数控制费用，只输出一行结果 JSON。Use to generate image assets, diagrams, illustrations, storyboard frames, banners or icons to disk, optionally with reference images for consistent characters.
 license: MIT
 metadata:
-  version: "2.4.0"
+  version: "2.5.0"
 ---
 
 # OpenAI Image Generation (本地图像生成)
 
 ```bash
 G=<本技能目录>/scripts/imagegen.py
-$G draft -o docs/img/arch.webp -f arch.prompt.txt -s 2560x1440   # 草稿：sunburst · medium · 长边 1536
+$G draft -o docs/img/arch.webp -f arch.prompt.txt -s 2560x1440   # 草稿：2.6-flare · medium · 长边 1536
 $G keep  -o docs/img/arch.webp --draft 1                          # 草稿满意：直接采用，不调用、不花钱
-$G final -o docs/img/arch.webp --keep-prompt                      # 正式图：sunburst · high，沿用草稿构图
+$G final -o docs/img/arch.webp --keep-prompt                      # 正式图：2.6-sunburst · high，沿用草稿构图
 $G edit  -o docs/img/arch.webp -f fix.txt                         # 局部修正
 $G draft -o art/scene.webp -f scene.txt -s 2560x1440 -r cast/he/sheet.webp -r cast/she/sheet.webp  # 带参考图
 $G status -o docs/img/arch.webp
 ```
 
-每次调用都收费。草稿默认用 sunburst、medium 质量（比正式图的 high 便宜；要更省用 `-m gpt-image-2.5-flare -q low`），构图靠草稿来定。草稿已经够好就 `keep`；正式图只在画质确实不够时出一次。
+每次调用都收费。默认用 GPT Image 2.6：草稿 `gpt-image-2.6-flare`、medium（快，成图通常可直接采用；要更省用 `-q low`），正式图与编辑用 `gpt-image-2.6-sunburst`、high，构图靠草稿来定。草稿已经够好就 `keep`；正式图只在画质确实不够时出一次。
 
 ## 流程
 
@@ -27,7 +27,7 @@ $G status -o docs/img/arch.webp
 3. **采用或出正式图**：
    - 草稿看起来已经是成品，就 `keep` 交付，不调用接口。草稿格式与输出扩展名不同时用 ffmpeg 转换。
    - 只有画质不够（细节糊、小字发虚）时才出 `final`：默认以最新一张草稿作构图参考，并自动追加“保持构图、全质量渲染”的指令。`--draft N` 选指定草稿；某个标签写错了，用 `-f` 传修正后的提示词；`--fresh` 不参考草稿，从头生成。
-   - 有的网关不管请求什么 quality 都按 low 出图（结果 JSON 的 `warning` 会说明），这时拿草稿原提示词出的正式图只是一张复制。脚本记住这类网关，之后直接拒绝这种正式图，提示改用 `keep`。
+   - 有的网关不按请求的 quality 出图（结果 JSON 的 `warning` 会说明），脚本按网关记住每档的实际回报：high 被降级而 medium 照办时，之后的正式图和编辑自动改请求 medium；所有档都不照办时，拿草稿原提示词出的正式图只是一张复制，脚本直接拒绝并提示改用 `keep`。
 4. **审查**：裁剪放大后逐字核对文字，并核对每个箭头的起点和终点。
 5. **编辑**：只修局部缺陷，提示词写清改什么，并注明其余保持不变。编辑会高保真保留原图，提示词没写改动时返回的就是原图，所以脚本拒绝与出图提示词相同的编辑。编辑会重绘整张图；结果不如原图时，用 JSON 里 `previous` 指向的原图恢复。
 6. **交付**：给出文件路径和剩余瑕疵。用户说“差不多就行”时就停下。

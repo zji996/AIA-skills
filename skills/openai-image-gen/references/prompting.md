@@ -55,11 +55,11 @@ Keep the whole image exactly as it is. Only change: the tag "Anthropic/" becomes
 
 ## 模型与参数
 
-- **模型**：`gpt-image-2.5-sunburst` 是 2.5 代的高质量模型，也是正式图的默认；`gpt-image-2.5-flare` 更快也更便宜，质量约等于 gpt-image-2；草稿默认也用 sunburst（medium），只在需要省钱时用 `-m` 切到 flare。
+- **模型**：默认 GPT Image 2.6。`gpt-image-2.6-flare` 快（实测 11–28 秒），是草稿默认；`gpt-image-2.6-sunburst` 细节更多、可能更慢（medium 实测 18–45 秒），是正式图与编辑的默认。2026-11-06 同提示词对照，两者的文字、箭头都正确，成图差别不大；按 token 计价，两者同价。旧的 `gpt-image-2.5-*` 仍可用 `-m` 指定，部分网关会把它自动升级到 2.6。
 - **质量档**：`low`/`medium`/`high`/`xhigh`/`max`。
   - 官方建议 `xhigh`/`max` 只在 `high` 达不到要求时用，更高档不保证更好。
   - 实测 2560x1440 下，`xhigh` 与 `high` 都要 40–60 秒。
-- **网关差异**：经 ChatGPT 账号转发的网关（如 Sub2API 的 Codex 通道）忽略 `size`、`quality` 与 `output_format`：一律按 low 出图、返回 PNG，横竖只看提示词。这类网关上草稿就是成品画质，满意就 `keep`。
+- **网关差异**：经 ChatGPT 账号转发的网关（如 Sub2API 的 Codex 通道）由服务端决定画质与尺寸：实测请求 low 回报 medium，请求 high 回报 low（输出 token 比 medium 还少），`size` 只作参考、横竖看提示词，`output_format` 一律返回 PNG（SVG 会被拒绝），GIF 与 `markup` 不可用。这类网关上草稿就是成品画质，满意就 `keep`；脚本会在 high 被降级后自动改请求 medium。
 - **尺寸**：
   - 两边都须是 16 的倍数，长短边比不超过 3:1，最大 `3840x2160`；
   - 像素数超过 2560x1440 属实验性。

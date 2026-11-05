@@ -20,8 +20,10 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-DRAFT_MODEL, DRAFT_QUALITY, DRAFT_LONG_EDGE = "gpt-image-2.5-sunburst", "medium", 1536
-FINAL_MODEL, FINAL_QUALITY = "gpt-image-2.5-sunburst", "high"
+DRAFT_MODEL, DRAFT_QUALITY, DRAFT_LONG_EDGE = "gpt-image-2.6-flare", "medium", 1536
+FINAL_MODEL, FINAL_QUALITY = "gpt-image-2.6-sunburst", "high"
+# Used for finals and edits once a gateway rendered FINAL_QUALITY lower but honoured this.
+FALLBACK_QUALITY = "medium"
 BUDGET = {"drafts": 3, "finals": 1, "edits": 1}
 MAX_REFS, MAX_REF_BYTES = 8, 20 * 2**20
 LAYOUT_LOCK = ("\n\nThe first attached image is the approved draft. Use it only as the layout reference: keep its "
@@ -241,7 +243,8 @@ def request_image(args, *, model, quality, size, prompt, fmt, references=(), sha
     echo = {key: payload[key] for key in ("quality", "size", "output_format") if payload.get(key)}
     # A low request echoed as low says nothing about whether higher tiers are honoured.
     if echo.get("quality") and quality not in ("auto", "low"):
-        note_gateway(base_url, ignores_quality=echo["quality"] != quality)
+        echoes = {**gateway_notes().get(base_url, {}).get("quality_echo", {}), quality: echo["quality"]}
+        note_gateway(base_url, ignores_quality=echo["quality"] != quality, quality_echo=echoes)
     item = (payload.get("data") or [{}])[0]
     if item.get("b64_json"):
         try:
@@ -419,13 +422,33 @@ def cmd_draft(args, state):
               f"{args.output} --draft {number}. If the layout is wrong, fix the prompt and draft again.")
 
 
+def final_quality(args, base_url):
+    """The quality a final or edit asks for, and a note when it was lowered for this gateway.
+
+    ChatGPT-relay gateways may honour medium yet answer high with a low render; asking
+    for high there pays for an image worse than the draft."""
+    if args.quality:
+        return args.quality, None
+    echoes = gateway_notes().get(base_url, {}).get("quality_echo", {})
+    if echoes.get(FINAL_QUALITY, FINAL_QUALITY) != FINAL_QUALITY and echoes.get(FALLBACK_QUALITY) == FALLBACK_QUALITY:
+        return FALLBACK_QUALITY, (f"this gateway rendered {FINAL_QUALITY} as {echoes[FINAL_QUALITY]} but honours "
+                                  f"{FALLBACK_QUALITY}, so {FALLBACK_QUALITY} was requested")
+    return FINAL_QUALITY, None
+
+
+def honoured(base_url, quality):
+    echo = gateway_notes().get(base_url, {}).get("quality_echo", {}).get(quality)
+    return echo is None or echo == quality
+
+
 def cmd_final(args, state):
     pick, chosen = pick_draft(state, args.draft)
     # A corrected prompt may replace the draft's, e.g. to fix a label the draft got wrong.
     prompt = read_prompt(args) or draft_prompt(chosen)
     base_url = credentials(args)[0]
+    quality, lowered = final_quality(args, base_url)
     if (not args.fresh and same_prompt(prompt, draft_prompt(chosen))
-            and gateway_notes().get(base_url, {}).get("ignores_quality")):
+            and gateway_notes().get(base_url, {}).get("ignores_quality") and not honoured(base_url, quality)):
         raise Refusal(f"this gateway renders every request at low quality, so a final with draft {pick}'s own prompt "
                       f"would return a copy of it; nothing was sent. Keep it: keep -o {args.output} --draft {pick}; "
                       "or pass a changed prompt, or --fresh for a new composition.")
@@ -435,7 +458,6 @@ def cmd_final(args, state):
     fmt = image_format(args.output, args.format)
     started = time.monotonic()
     size = checked_size(args.size) or state["size"]
-    quality = args.quality or FINAL_QUALITY
     layout = [] if args.fresh else [chosen["file"]]
     data, echo = request_image(args, model=args.model or FINAL_MODEL, quality=quality,
                                size=size, fmt=fmt,
@@ -448,8 +470,8 @@ def cmd_final(args, state):
     state["prompt"], state["refs"] = prompt, refs
     save_state(args.output, state)
     info = returned(data, fmt, size, echo, quality)
-    if note:
-        info["warning"] = " ".join(filter(None, [info.get("warning"), note]))
+    if note or lowered:
+        info["warning"] = " ".join(filter(None, [info.get("warning"), lowered, note]))
     if refs:
         info["references"] = reference_view(refs)
     emit(status="ok", step="final", file=args.output, from_draft=pick, seconds=round(time.monotonic() - started),
@@ -496,7 +518,7 @@ def cmd_edit(args, state):
     before.write_bytes(Path(args.output).read_bytes())
     started = time.monotonic()
     size, fmt = checked_size(args.size) or state["size"], image_format(args.output, args.format)
-    quality = args.quality or FINAL_QUALITY
+    quality, lowered = final_quality(args, credentials(args)[0])
     data, echo = request_image(args, model=args.model or FINAL_MODEL, quality=quality, size=size,
                                prompt=prompt + reference_note(refs, 2), fmt=fmt,
                                references=[str(before)] + reference_view(refs))
@@ -504,8 +526,8 @@ def cmd_edit(args, state):
     state["edits"] += 1
     save_state(args.output, state)
     info = returned(data, fmt, size, echo, quality)
-    if note:
-        info["warning"] = " ".join(filter(None, [info.get("warning"), note]))
+    if note or lowered:
+        info["warning"] = " ".join(filter(None, [info.get("warning"), lowered, note]))
     emit(status="ok", step="edit", file=args.output, previous=str(before),
          seconds=round(time.monotonic() - started), **info, budget=budget_view(state),
          next="Compare with the previous version; keep whichever is better. No further edits without approval.")

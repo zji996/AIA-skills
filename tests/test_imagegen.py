@@ -88,7 +88,7 @@ class ImagegenTests(unittest.TestCase):
         request = handler.requests[0]
         self.assertEqual(request["path"], "/v1/images/generations")
         self.assertEqual({k: request["data"][k] for k in ("model", "quality", "size", "output_format", "prompt")},
-                         {"model": "gpt-image-2.5-sunburst", "quality": "medium", "size": "1536x864",
+                         {"model": "gpt-image-2.6-flare", "quality": "medium", "size": "1536x864",
                           "output_format": "webp",
                           "prompt": self.prompt + "\n\nLandscape orientation, 16:9 aspect ratio, wider than tall."})
         self.assertTrue(result["file"].startswith(str(self.work / "state/openai-image-gen")))
@@ -103,7 +103,7 @@ class ImagegenTests(unittest.TestCase):
         result = self.ok("final", "-o", self.output, "--keep-prompt", "-b", self.base, umask="022")
         request = handler.requests[1]
         self.assertEqual(request["path"], "/v1/images/edits")
-        self.assertEqual(request["data"]["model"], "gpt-image-2.5-sunburst")
+        self.assertEqual(request["data"]["model"], "gpt-image-2.6-sunburst")
         self.assertEqual(request["data"]["quality"], "high")
         self.assertEqual(request["data"]["size"], "2560x1440")
         self.assertEqual(request["data"]["output_format"], "webp")
@@ -242,6 +242,27 @@ class ImagegenTests(unittest.TestCase):
         self.assertEqual(len(handler.requests), 3)
         self.ok("final", "-o", other, "-p", "Other, with crisp labels.", "-b", self.base)
         self.assertEqual(len(handler.requests), 4)
+
+    def test_a_gateway_that_lowers_high_gets_medium_finals(self):
+        echo = lambda quality: {"data": [{"b64_json": base64.b64encode(b"image-bytes").decode()}], "quality": quality}
+        handler = self.server(data=echo("medium"))
+        self.draft()
+        handler.response_data = echo("low")
+        first = self.ok("final", "-o", self.output, "-b", self.base)
+        self.assertEqual(handler.requests[1]["data"]["quality"], "high")
+        self.assertIn("rendered low", first["warning"])
+        handler.response_data = echo("medium")
+        other = self.work / "other.webp"
+        self.ok("draft", "-o", other, "-p", "Other.", "-b", self.base)
+        second = self.ok("final", "-o", other, "-b", self.base)
+        self.assertEqual(handler.requests[3]["data"]["quality"], "medium")
+        self.assertIn("honours medium", second["warning"])
+        self.ok("edit", "-o", other, "-p", "Make the sky bluer; keep the rest.", "-b", self.base)
+        self.assertEqual(handler.requests[4]["data"]["quality"], "medium")
+        explicit = self.work / "third.webp"
+        self.ok("draft", "-o", explicit, "-p", "Third.", "-b", self.base)
+        self.ok("final", "-o", explicit, "-q", "high", "-b", self.base)
+        self.assertEqual(handler.requests[6]["data"]["quality"], "high")
 
     def ref(self, name, color=b"\xff\x80\x00"):
         row = b"\x00" + color * 16
