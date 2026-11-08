@@ -534,7 +534,14 @@ fn command_pi(meta: &Value, session: Option<&str>) -> Vec<String> {
     a
 }
 /// Session files under a run's session directory: Pi writes them there, rpi in
-/// one subdirectory per working directory.
+/// one subdirectory per working directory. Sidecars such as rpi's
+/// `<session>.jsonl.progress.jsonl` are not sessions.
+fn is_session(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "jsonl")
+        && path
+            .file_stem()
+            .is_some_and(|s| !s.to_string_lossy().contains(".jsonl"))
+}
 pub fn session_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = vec![];
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -546,9 +553,9 @@ pub fn session_files(dir: &Path) -> Vec<PathBuf> {
                     .flatten()
                     .flatten()
                     .map(|x| x.path())
-                    .filter(|x| x.extension().is_some_and(|e| e == "jsonl")),
+                    .filter(|x| is_session(x)),
             );
-        } else if path.extension().is_some_and(|e| e == "jsonl") {
+        } else if is_session(&path) {
             files.push(path);
         }
     }
@@ -947,6 +954,19 @@ mod tests {
 
     fn args(_agent: &str, meta: &Value, session: Option<&str>) -> Vec<String> {
         command_pi(meta, session)
+    }
+
+    #[test]
+    fn a_progress_sidecar_is_not_a_session() {
+        let dir = std::env::temp_dir().join(format!("delegate-sessions-{}", std::process::id()));
+        let cwd = dir.join("--work--");
+        fs::create_dir_all(&cwd).unwrap();
+        let main = cwd.join("2026-11-08T06-13-05Z_abc.jsonl");
+        fs::write(&main, "").unwrap();
+        fs::write(cwd.join("2026-11-08T06-13-05Z_abc.jsonl.progress.jsonl"), "").unwrap();
+        assert_eq!(session_files(&dir), [main.clone()]);
+        assert_eq!(session_file(dir.to_str().unwrap(), "abc"), Some(main));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
