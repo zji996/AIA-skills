@@ -12,6 +12,8 @@
 
 - `openai-image-gen` 3.0.0：去掉草稿/正式图，`image` 一次调用直接写出成图（默认 `gpt-image-2.6-sunburst`、medium，格式不符时用 ffmpeg 转换），明显不对时 `edit` 或改提示词重出；每个输出路径出图 3 次、编辑 1 次。**不兼容**：`draft`/`keep`/`final` 移除，2.x 的状态按新图处理。起因：ChatGPT 转发网关由服务端决定画质，正式图不比草稿好，两轮流程只是多花一次钱。
 - `iteration-speed` 1.6.0：新增判断点「回归按工作量结算」——门禁变慢与提速验收用数据库读行/页访问、指令数等与机器无关的工作量做棘轮，秒数只作参考。
+- `delegate` 6.12.3：续做（`reply`）找父会话时忽略 rpi 写在会话旁的 `<会话>.jsonl.progress.jsonl` 进度文件；此前它被当成会话传给 `--fork`，续做直接失败（`No session found for --fork`）。
+- `repo-governance` 3.3.1：`audit-context.py` 不再把行内代码里的链接写法当成链接检查；起因：ADR 里示范 `![说明](路径)` 的语法被报为断链。
 - `delegate` 6.12.2：rpi（reqwest）回答中途响应体被截断时报 `error reading sse body` / `error decoding response body` / `unexpected EOF`，现按流中断判为瞬时失败，原地续做，不再直接判失败。
 - `delegate` 6.12.1：复用池槽位时删掉各 crate 被取代的增量会话，只留最新一份。rustc 在该 crate 下次编译前一直保留上一会话，其依赖图与查询缓存是重写而非硬链接，实测一轮改动-重编让 target 从 21 GiB 涨到 28 GiB，其中 7.3 GiB 是这类旧会话；清掉后下一轮重编 CPU 不变（187 s 对 193 s）。
 - `delegate` 6.12.0：池槽位 `target/` 超限时不再整盘清空，改为按最近使用淘汰构建单元（同一 `<名>-<哈希>` 的产物、指纹与构建脚本目录一起，或一个增量目录），降到上限的 3/4；新增 `DELEGATE_POOL_TARGET_ROOT`，把各槽 `target` 链到专用构建盘，槽位重建后仍接上原缓存。起因：4 个槽共 167 GiB，单槽 70% 是增量状态，旧分支与特性组合的变体与常用变体一起只能整盘丢弃。

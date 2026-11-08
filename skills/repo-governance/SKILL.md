@@ -3,7 +3,7 @@ name: repo-governance
 description: 仓库上下文治理。当需要搭建或整理 AGENTS.md、docs/current.md、决策记录、待收敛清单，或检查 token 预算、上下文健康度、文档漂移时使用；附带只读审计脚本。Use for repo context governance, token budget, context health, docs drift audit, provisional/convergence register.
 license: MIT
 metadata:
-  version: "3.3.0"
+  version: "3.3.1"
 ---
 
 # Repo Governance (仓库上下文治理)
