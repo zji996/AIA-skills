@@ -563,6 +563,9 @@ pub fn session_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 pub fn session_file(dir: &str, id: &str) -> Option<PathBuf> {
+    // 6.12.2 and earlier recorded a sidecar's id (`<uuid>.jsonl.progress`); the uuid
+    // has no dot, so its first segment names the real session.
+    let id = id.split('.').next().unwrap_or(id);
     session_files(Path::new(dir)).into_iter().rfind(|x| {
         x.file_name()
             .is_some_and(|n| n.to_string_lossy().ends_with(&format!("_{id}.jsonl")))
@@ -963,9 +966,20 @@ mod tests {
         fs::create_dir_all(&cwd).unwrap();
         let main = cwd.join("2026-11-08T06-13-05Z_abc.jsonl");
         fs::write(&main, "").unwrap();
-        fs::write(cwd.join("2026-11-08T06-13-05Z_abc.jsonl.progress.jsonl"), "").unwrap();
-        assert_eq!(session_files(&dir), [main.clone()]);
-        assert_eq!(session_file(dir.to_str().unwrap(), "abc"), Some(main));
+        fs::write(
+            cwd.join("2026-11-08T06-13-05Z_abc.jsonl.progress.jsonl"),
+            "",
+        )
+        .unwrap();
+        assert_eq!(session_files(&dir), std::slice::from_ref(&main));
+        assert_eq!(
+            session_file(dir.to_str().unwrap(), "abc"),
+            Some(main.clone())
+        );
+        assert_eq!(
+            session_file(dir.to_str().unwrap(), "abc.jsonl.progress"),
+            Some(main)
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

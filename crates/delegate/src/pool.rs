@@ -92,6 +92,15 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<(), String> {
 /// path except `target/` goes, and the checkout is detached. `Ok(false)` means the
 /// slot holds no usable worktree and the caller must add one.
 pub fn reset(slot: &Path, commit: &str, managed: &[String]) -> Result<bool, String> {
+    reset_with_target_root(slot, commit, managed, &setting("POOL_TARGET_ROOT", ""))
+}
+
+fn reset_with_target_root(
+    slot: &Path,
+    commit: &str,
+    managed: &[String],
+    target_root: &str,
+) -> Result<bool, String> {
     if !slot.join(".git").exists() {
         if slot.exists() {
             fs::remove_dir_all(slot).map_err(|e| e.to_string())?;
@@ -115,7 +124,7 @@ pub fn reset(slot: &Path, commit: &str, managed: &[String]) -> Result<bool, Stri
         .and_then(|()| git_in(slot, &["checkout", "-q", "--detach", commit]));
     match step {
         Ok(()) => {
-            attach_target(slot)?;
+            attach_target_to(slot, target_root)?;
             trim_target(slot);
             Ok(true)
         }
@@ -365,7 +374,7 @@ fn evict_lru(target: &Path, limit: u64, low: u64) -> (u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_target_to, evict_lru, prune_sessions, reset};
+    use super::{attach_target_to, evict_lru, prune_sessions, reset_with_target_root};
     use std::fs;
     use std::path::Path;
     use std::process::Command;
@@ -435,7 +444,8 @@ mod tests {
         fs::write(slot.join("same.rs"), "fn edited_by_last_task() {}").unwrap();
         same.set_modified(old).unwrap();
 
-        assert!(reset(&slot, &second, &[]).unwrap());
+        // A local target/, whatever DELEGATE_POOL_TARGET_ROOT says on this machine.
+        assert!(reset_with_target_root(&slot, &second, &[], "").unwrap());
         assert_eq!(
             fs::read_to_string(slot.join("changed.rs")).unwrap(),
             "fn new() {}"
