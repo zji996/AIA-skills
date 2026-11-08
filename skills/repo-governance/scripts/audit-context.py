@@ -292,7 +292,8 @@ def main():
     if "links" in only:
         for doc in markdown_files(repo):
             text = doc.read_text(encoding="utf-8", errors="replace")
-            for target in LINK.findall(text):
+            # Link syntax quoted as code (`![alt](path)` in a spec) is an example, not a link.
+            for target in LINK.findall(INLINE_CODE.sub("", text)):
                 if target.startswith(("http://", "https://", "mailto:", "#")):
                     continue
                 path = unquote(target.split("#", 1)[0])
