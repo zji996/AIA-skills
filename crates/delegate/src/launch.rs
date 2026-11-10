@@ -34,6 +34,7 @@ pub struct Options {
     pub protect: Vec<String>,
     pub protect_reasons: std::collections::BTreeMap<String, String>,
     pub read_only: bool,
+    pub shell: bool,
     pub in_place: bool,
     pub worktree: bool,
     pub accept: Option<String>,
@@ -229,6 +230,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
         } else {
             match a.as_str() {
                 "--read-only" => o.read_only = true,
+                "--shell" => o.shell = true,
                 "--in-place" => o.in_place = true,
                 "--worktree" => o.worktree = true,
                 "--hide-accept" => o.hide_accept = true,
@@ -308,9 +310,6 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
     {
         return Err("argument --tier: invalid choice".into());
     }
-    if o.tier.is_some() && o.model.is_some() {
-        return Err("--tier and --model are exclusive".into());
-    }
     if let Some(model) = &o.model {
         models::validate_model(model)?;
     }
@@ -326,9 +325,19 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
     }
     Ok(o)
 }
+pub const WRITE_BOUNDARY: &str = "只在当前工作目录内改文件；提示里出现的其他绝对路径只读";
 const READS_ONLY: &str = "scout and review tiers only read; writes require --tier write or --model";
 fn choose_tier(o: &mut Options) -> Res<()> {
     o.agent = agents::AGENT.into();
+    if o.tier
+        .as_deref()
+        .is_some_and(|t| ["scout", "review"].contains(&t))
+    {
+        o.read_only = true;
+    }
+    if o.shell && !o.read_only {
+        return Err("--shell requires --read-only or --tier scout|review".into());
+    }
     if o.model.is_some() {
         o.agent_pinned = true;
         return Ok(());
@@ -738,6 +747,9 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         return Err("--in-place and --worktree contradict each other".into());
     }
     let repo = git_top(&workdir);
+    if o.shell && (repo.is_none() || o.in_place) {
+        return Err("--shell requires a git worktree snapshot (not --in-place)".into());
+    }
     for item in &mut o.share {
         let path = std::path::absolute(&*item).map_err(|e| e.to_string())?;
         if !path.exists() {
@@ -826,7 +838,7 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
                 .collect::<Vec<_>>();
             if !overlap.is_empty() && !command.trim().is_empty() {
                 eprintln!("delegate: protected generated paths {} may only be changed by generated.command", overlap.join(", "));
-                extra["protectGenerated"] = json!({"paths":overlap,"command":command});
+                extra["protectGenerated"] = json!({"paths":overlap,"command":command,"inputs":worktree::generated_inputs(top)?});
             }
         }
         if let Some(upstream) = &in_run {
@@ -1003,6 +1015,10 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     let requested_model = o.model.clone();
     let requested_thinking = o.thinking_cli.clone();
     o.read_only = s(&meta, "mode") == "read-only";
+    o.shell |= b(&meta, "shell");
+    if o.shell && (!o.read_only || !meta["worktree"].is_object()) {
+        return Err("--shell requires a read-only worktree snapshot".into());
+    }
     if !o.read_only
         && requested_tier
             .as_deref()
@@ -1618,6 +1634,18 @@ pub fn launch(
             &o.protect_reasons,
         )
     };
+    if mode == "write" {
+        actual = format!("{}\n\n{WRITE_BOUNDARY}\n", actual.trim_end_matches('\n'));
+        let source = s(&extra["worktree"], "source");
+        let source = if source.is_empty() {
+            s(extra, "sourceBuildRoot")
+        } else {
+            source
+        };
+        if !source.is_empty() && prompt.contains(source) {
+            eprintln!("delegate: note: prompt contains the source repository absolute path; other absolute paths are read-only / 提示包含源仓库绝对路径，勿在该路径写入");
+        }
+    }
     if extra["protectGenerated"].is_object() {
         actual.push_str(&format!("\n\n生成物保护例外 / Generated protection exception: {} 只允许通过生成命令改动 / may only be changed by the generator: `{}`. You may run this command; completion reruns it and rejects manually edited generated output. This exception overrides the protected-path restriction only for these generated paths.\n", extra["protectGenerated"]["paths"], s(&extra["protectGenerated"], "command")));
     }
@@ -1831,6 +1859,11 @@ pub fn launch(
         meta["evidenceTimeoutSeconds"] =
             json!(seconds(o.evidence_timeout.as_deref().unwrap_or("30m"))?);
     }
+    meta["shell"] = json!(o.shell);
+    if meta["worktree"].is_object() {
+        meta["sourceStatusBaseline"] =
+            crate::source_watch::baseline(Path::new(s(&meta["worktree"], "source")))?;
+    }
     meta["agentBin"] = json!(agent_bin);
     meta["configSources"] = extra.get("configSources").cloned().unwrap_or(json!([]));
     meta["configCapacity"] = extra["configCapacity"].clone();
@@ -1962,9 +1995,8 @@ mod purpose_tests {
         for tier in ["scout", "review"] {
             let mut o = Options::new();
             o.tier = Some(tier.into());
-            assert!(choose_tier(&mut o)
-                .unwrap_err()
-                .contains("--tier write or --model"));
+            choose_tier(&mut o).unwrap();
+            assert!(o.read_only);
         }
         let mut o = Options::new();
         o.model = Some("sol".into());
@@ -1979,7 +2011,7 @@ mod purpose_tests {
                 false,
             )
         };
-        assert!(parse(&["--tier", "review", "--model", "sol", "task"], false).is_err());
+        assert!(parse(&["--tier", "review", "--model", "sol", "task"], false).is_ok());
         assert!(parse(&["--model", "sol:high", "task"], false).is_err());
         assert!(parse(
             &["last", "--model", "sol", "--thinking", "low", "more"],

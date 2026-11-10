@@ -41,9 +41,10 @@
 | `start` | 启动选项（§2.3）＋任务说明 | 创建 run 并启动 supervisor，立即输出一行状态（§3.1）；stderr 提示收取命令 |
 | `run` | 启动选项＋`--max`/`--progress`/`--full` | `start` 后等待，按 §3.2 输出 |
 | `reply <run> [消息]` | `--fresh` `--sync` `--minor` `--over-limit` `--accept` `--accept-also` `--no-accept` `--hide-accept` `--accept-timeout` `--timeout` `--image` `--name` `--prompt(-file)`；`--wait` 时可用等待选项 | 续接对话并立即返回启动状态；`--wait` 等结论（§7） |
-| `wait [<run>...\|--all]` | `--max` `--no-result` `--full` `--progress` `--any` `--stream` `--until-all` | 等待并输出；无参数按派发会话收取（§9.5），`--all` 取本仓库所有运行中或结果未读取的 run；没有时以 0 退出。`--any` 与 `--stream` 见 §9.5 |
+| `wait [<run>...\|--all]` | `--max` `--no-result` `--full` `--progress` `--any` `--stream` `--until-all` | 等待并输出；无参数按派发会话收取（§9.5），`--all` 等全部结束，无名字时取本仓库所有运行中或结果未读取的 run；没有时以 0 退出。`--any` 与 `--stream` 见 §9.5 |
 | `status [<run>...]`（别名 `list`） | | 每个 run 一行状态；无参数列出全部 |
 | `result [<run>] [--path]` | | 输出完整答复（或其路径）；非运行中时标记已读取 |
+| `patch <run> [-- <path>…]` | | 打印保留的 applied.patch，可按精确路径或目录前缀过滤，独立于 worktree 和 Git 对象 |
 | `diff [<run>] [--stat] [--total] [路径...]` | | `git diff` 该 run 前后快照；`--total` 自对话起点；终端下带颜色；对象被清理时回退输出 `changes.patch` |
 | `apply [<run>] [--dry-run] [--merge] [--keep] [--json]` | | §6.4 |
 | `lane [--label 文字] [--] [命令...]` | | §8；无命令时列出队列，每行 `running\|queued  <since>  <label>` |
@@ -61,7 +62,7 @@
 | 选项 | 默认 | 说明 |
 |---|---|---|
 | 任务说明 | — | 位置参数拼接、`--prompt`、或 `--prompt-file`（`-` 为 stdin）；为空即退出码 2 |
-| `--tier scout\|review\|write` | 写入推断 write、只读推断 review，并明确提醒 | 按用途选登记模型，§4.1；scout/review 不接写入，--tier 与 --model 互斥 |
+| `--tier scout\|review\|write` | 写入推断 write、只读推断 review，并明确提醒 | 按用途选登记模型，§4.1；scout/review 自动只读，--tier 可与 --model 同用 |
 | `--name` | 说明首行 | 用于 run id 与显示；省略时取首个非空行生成短名，run id 保留字母、数字与 `._-`，最长 40 |
 | `--workdir` | 当前目录 | 必须存在 |
 | `--image <路径>` | — | 可重复；解析为绝对路径 |
@@ -75,7 +76,7 @@
 | `--accept-timeout` | `10m` | 自取得 lane 名额起计 |
 | `--timeout` | 无 | 每次尝试；§9.2 |
 | `--retries N` | 1 | 0–3，答复畸形时的重跑次数 |
-| `--provider` `--model` `--thinking` | — | --model 仅选已登记别名或完整名，与 --tier 互斥；thinking 独立；普通 reply 保留二者 |
+| `--provider` `--model` `--thinking` | — | --model 仅选已登记别名或完整名，可与 --tier 同用；thinking 独立；普通 reply 保留二者 |
 | `--overflow next\|queue` | queue | 模型满时排队或允许下一候选；reply 可用，--model 不换 |
 | `--allow-parallel-writes` | 否 | 跳过写入互斥 |
 | `--after <run>` | — | 立即创建 run（state `waiting`），上游以 delivered/answered 结束后才执行；其他结局使本 run 以 `skipped` 结束，`error` 写明上游名称与结局，exit_code 为 1 |
@@ -186,7 +187,7 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 
 ### 4.1 选模型与升档（必须）
 
-- 同事恒为 `pi`。用途 scout/review/write，models 是唯一模型全集；--model 精确别名/完整名优先，否则唯一子串匹配（不分大小写）；Pi 仅校验与提供能力。三档必须可解析，start/run/reply 否则退出 2 给引导。models/tiers 按键合并，仓库覆盖用户；DELEGATE_<TIER>_MODEL 覆盖整档。--tier 与 --model 互斥，scout/review 写入拒绝。无二者时只读推断 review、写入推断 write，stderr 提醒，meta tierInferred=true，短行标「推断」。thinking 独立，优先级环境 > CLI > 规则 > 顶层 > Pi 默认。reply 可换模型/用途/长度，省略则沿用。不兼容旧档与 thinking 后缀。细节见 [模型路由](../skills/delegate/references/model-routing.md)。
+- 同事恒为 `pi`。用途 scout/review/write，models 是唯一模型全集；--model 精确别名/完整名优先，否则唯一子串匹配（不分大小写）；Pi 仅校验与提供能力。三档必须可解析，start/run/reply 否则退出 2 给引导。models/tiers 按键合并，仓库覆盖用户；DELEGATE_<TIER>_MODEL 覆盖整档。--tier 决定模式、可与固定 --model 同用，scout/review 自动只读。无二者时只读推断 review、写入推断 write，stderr 提醒，meta tierInferred=true，短行标「推断」。thinking 独立，优先级环境 > CLI > 规则 > 顶层 > Pi 默认。reply 可换模型/用途/长度，省略则沿用。不兼容旧档与 thinking 后缀。细节见 [模型路由](../skills/delegate/references/model-routing.md)。
 - **换模型重跑**：上游瞬时失败经同会话续做仍失败，且未 stop/无保护违规/没改文件时，在启动捕获的本档 tierCandidates 中换到当前模型之后第一个不同模型，没有则不换；每 run 最多一次，固定 --model 不换。用途不变，更新模型与 thinking、escalatedFrom，清空 fork；重新快照/验收。带 --image 时最终模型 images=no 退出 2，提示 Pi models.json 的 input 加 image 或 --model 换模型；列表为空跳过，不因图片自动换模型。
 
 ### 4.1.1 编排（`--after`、`--in`，必须）
@@ -200,11 +201,11 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 
 同事一次尝试的判定（必须）：被 stop → `stopped`；超时 → `timeout`；非零退出 → 退出码为 -9/137 时 `killed`，否则 `failed`；最后一轮 `stopReason == "stop"` 且已 settled 时，答复为空或末尾是泄漏的工具调用（正则 `\bcall:[\w.-]+(?::[\w-]+)?\{`，且以 `}` 结尾）→ `malformed`，否则 `ok`；其余 → `failed`。`malformed` 最多重跑 `--retries` 次。
 
-`ok` 之后：`--accept` 存在时执行验收，退出码 0 → `delivered`，否则 `rejected`；无验收 → `answered`。**只读 run 改了文件不改变 state**（§5）。`exit_code` 文件内容为 `0`（delivered/answered）或 `1`。
+`ok` 之后：`--accept` 存在时执行验收，退出码 0 → `delivered`，否则 `rejected`；无验收 → `answered`。普通只读写文件不改 state，`--shell` 则拒收（§5）。`exit_code` 文件内容为 `0`（delivered/answered）或 `1`。
 
 ## 5. 只读
 
-- **能隔离时**（在自己的 worktree 中，git 仓库的默认情况）：全部工具（可运行 `git log`/`git diff` 与测试），任务说明末尾附只读约定（§7.3），结束后按快照核对。隔离与核对已兜底，工具限制不再必要。
+- Pi 只读默认仅读取/搜索工具；`--shell` 在 git 快照中增加 bash（日志、只读查询），结束时源或工作树有差异则 rejected，禁止 apply。
 - **无法隔离时**（非 git 目录或 `--in-place`）：Pi 以 `--tools read,grep,find,ls` 启动（没有写工具，也没有 shell），不附约定。
 - 在 git 仓库中，只读 run **默认在 worktree 中运行**（§6.3），`--in-place` 除外。只读 worktree 的 HEAD 移到主控的 HEAD，**index 保持快照内容**（`git reset --soft`）：主控的未提交改动（含子模块指针）以已暂存的形式在 `git diff HEAD` / `git status` 中可见，又不影响结束时的快照比对。只读 worktree 与写入 worktree 一样执行 `setup`。
 - 核对：结束快照与起始快照有差异时，worktree 中记 `readOnlyViolation`（改动留在 worktree，不可 `apply`），原地记 `workspaceChanged`；两者都附 `warning`，state 仍为 `answered`/`delivered`。
@@ -277,7 +278,7 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 Pi：
 ```
 pi (--session-id <uuid> | --fork <上一轮会话副本>) --session-dir <run>/session --mode json
-   [--provider P] [--model M] [--thinking T] [--tools read,grep,find,ls（仅无法隔离的只读）] -p [@<图片>...]   # stdin: prompt.md
+   [--provider P] [--model M] [--thinking T] [--tools read,grep,find,ls[,bash]（只读，shell 时加 bash）] -p [@<图片>...]   # stdin: prompt.md
 ```
 进程工作目录为 workdir，独立进程组。用户 systemd 可用时，同事、每条 setup 与验收命令分别在 `systemd-run --user --scope --quiet --collect` 创建的 scope 内运行；supervisor 不在 scope 内。启动时探测一次，失败或 `DELEGATE_CGROUP=0`则沿用进程组及环境标记回收。环境：去掉 §12 的保护变量，叠加 `.delegate.json` 的 `env`，再设 `DELEGATE_AGENT`、`DELEGATE_RUN_DIR` 与 `PI_DELEGATE_ACTIVE=1`。
 
@@ -357,8 +358,8 @@ pi (--session-id <uuid> | --fork <上一轮会话副本>) --session-dir <run>/se
 
 - 无参 `wait`（含范围选项）默认同 `--any`：交付已结束未读任务，否则等下一批结束；其他任务提示继续等待。显式 `--any` 跳过已交付具名任务，具名 wait 保留重读行为；退出码由本批结果决定，max 到期无结果为 75。
 - `wait --stream`：每个 run 结束时输出一行状态行（含 `sourceDrift`，有未读答复时带 `report`），不输出改动清单与答复、不标记 `.delivered`；全部输出后 stderr 写 `all <N> runs reported` 并退出。不带 run 参数时每 5 秒按同一规则（caller、`--all`、`--machine`）重新选取，把期间新派出的 run 也纳入；全部结束即退出，之后派出的 run 需要新的 `wait`。退出码：有非 delivered/answered 结局为 1，`--max` 到期仍有未结束的为 75，否则 0。
-- `--until-all` 显式等选出的全部任务结束；`--all` 只控制范围。人读 wait 的最后一行显示本会话还有几项在跑与原样重跑命令，全部结束写“本会话没有在跑的任务”；JSON 不附该文本。
-- `--until-all`、`--any` 与 `--stream` 互斥（退出码 2）。两者都与宿主无关：`--stream` 适合能把命令的每行输出变成通知的宿主，`--any` 适合只有“后台命令结束时通知”或只能分段调用的宿主（配合 `--max`）。
+- `--until-all` / `--all` 显式等选出的全部任务结束（单次最多 50 分钟，超时列运行中的名字）；无名字的 `--all` 也控制跨会话范围。人读 wait 的最后一行显示本会话还有几项在跑与原样重跑命令，全部结束写“本会话没有在跑的任务”；JSON 不附该文本。
+- `--until-all` / `--all` 与 `--any`、`--stream` 互斥（退出码 2）。两者都与宿主无关：`--stream` 适合能把命令的每行输出变成通知的宿主，`--any` 适合只有“后台命令结束时通知”或只能分段调用的宿主（配合 `--max`）。
 
 5.12 起，两者按首次检查记录已结束集合，结论附 `completionTiming`（§3.1）；原收取顺序不变，多个旧结果一起交付，不按完成时间排序。后台命令结束通知可能是在交付旧结果；旧 summary 没有 `finishedAt` 时省略，不推算。
 
@@ -378,9 +379,7 @@ pi (--session-id <uuid> | --fork <上一轮会话副本>) --session-dir <run>/se
 
 写入 run 收尾、验收后限时测量 worktree 字节并缓存 `meta.worktreeBytes`（已有值复用，失败省略）；status/wait 只读取缓存，旧任务不补测。本仓库已结束、目录仍在且无运行中续接的 worktree 按路径去重，达到 `DELEGATE_WORKTREE_WARN_GIB`（默认 20、0 关闭）时末尾输出总量、前三名称与大小、确认合入后 `clean <name> --force`；JSON 追加 `worktreeDisk{totalBytes,thresholdBytes,largest:[{run,name,bytes}],next}` 行。
 
-5.24 起，写入收尾在 worktree 测量后量源根构建目录，多路径共用 20 秒；原地也测，只读不测。默认 Cargo.toml → 现存 target；两级配置 `sourceBuild.paths` 替换默认，整个对象仓库覆盖用户，`[]` 关闭。越界与绝对路径报配置错误（2）；缺失目录跳过，空列表/无目录缓存零值。测量与缓存失败不改 state、退出码或验收。
-
-meta 缓存 `sourceBuildBytes`、`sourceBuildPaths:[{path,bytes}]`、`sourceBuildMeasuredAt`、`sourceBuildMeasuredNs`；status/wait/list 只读缓存，取同源最近测量、不累加 run。`DELEGATE_SOURCE_BUILD_WARN_GIB` 默认 60 GiB、0 关闭；达阈值提示总量、各路径大小与先量再删的参考。JSON 独立行 `sourceBuildDisk{totalBytes,thresholdBytes,paths:[{path,bytes}],measuredAt,next}` 可与 worktreeDisk 同现，未达或关闭省略；只提示不删。边界与字段见 [cleanup.md](../skills/delegate/references/cleanup.md)。
+5.24 起，写入收尾限时缓存源构建目录占用；status/wait/list 只读最近缓存，达到阈值独立提示，只提示不删。两级 `sourceBuild.paths`、缓存字段及失败语义见 [cleanup.md](../skills/delegate/references/cleanup.md)。
 
 ## 11. 文件与目录
 
@@ -434,3 +433,5 @@ DELEGATE_BIN=<被测可执行文件> python3 -m unittest tests.test_delegate
 ```
 
 任何实现都必须在不修改该套件的前提下全部通过。
+
+6.15 并行合入约束（冲突前检与 summary、补丁保留、源工作区指纹排除 apply、只读 `--shell` 及生成输入门控）见 [并行安全](../skills/delegate/references/parallel-safety.md)。

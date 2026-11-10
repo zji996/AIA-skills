@@ -1025,7 +1025,215 @@ fn generation_markers(run: &Path, meta: &Value) -> Vec<PathBuf> {
     markers.dedup();
     markers
 }
+/// Marker labels include the originating run, so diagnostics survive old/cleaned runs.
+pub fn conflict_labels(path: &Path) -> Vec<String> {
+    if path.is_symlink() {
+        return vec![];
+    }
+    fs::read(path)
+        .ok()
+        .into_iter()
+        .flat_map(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .filter_map(|line| {
+                    line.strip_prefix("<<<<<<< ")
+                        .or_else(|| line.strip_prefix(">>>>>>> "))
+                        .map(str::to_string)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+fn marked_files(source: &Path, rules: &[String]) -> Res<Vec<String>> {
+    let mut paths = rules
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if rules.iter().any(|p| p.ends_with('/')) {
+        paths.extend(
+            git(
+                source,
+                &[
+                    "ls-files",
+                    "-z",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                ],
+            )?
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .filter(|p| matches_rule(p, rules)),
+        );
+    }
+    Ok(paths
+        .into_iter()
+        .filter(|p| !conflict_labels(&source.join(p)).is_empty())
+        .collect())
+}
+fn reject_existing_markers(run: &Path, meta: &Value, keep_commits: bool) -> Res<Vec<String>> {
+    let (_, top, _, after) = chain_changes(run)?;
+    let applied = applied_state(run, meta);
+    let rec = json(run.join("changes.json"));
+    let before = if !keep_commits && !s(&applied, "tree").is_empty() {
+        s(&applied, "tree")
+    } else {
+        s(meta, "chainBase")
+    };
+    let mut changes = tree_changes(
+        &top,
+        &json!({"tree":before,"large":applied["large"]}),
+        &json!({"tree":after,"large":rec["afterLarge"]}),
+        false,
+    )?;
+    if changes.is_empty() && !keep_commits && !s(&applied, "tree").is_empty() {
+        // Match apply_inner's repeated-apply drift check, but not unrelated earlier rounds.
+        changes = tree_changes(
+            &top,
+            &json!({"tree":meta["chainBase"]}),
+            &json!({"tree":after}),
+            false,
+        )?;
+    }
+    let source = Path::new(s(&meta["worktree"], "source"));
+    let mut paths = changes
+        .iter()
+        .map(|c| s(c, "path").to_string())
+        .collect::<Vec<_>>();
+    if let Some(large) = rec["afterLarge"].as_object() {
+        paths.extend(large.keys().cloned());
+    }
+    if keep_commits {
+        let worktree = Path::new(s(&meta["worktree"], "path"));
+        let base = read(run.join("worktree-base-commit"));
+        if worktree.is_dir() && !base.trim().is_empty() {
+            for hash in git_text(
+                worktree,
+                &["log", "--format=%H", &format!("{}..HEAD", base.trim())],
+            )?
+            .lines()
+            {
+                paths.extend(
+                    git(
+                        worktree,
+                        &[
+                            "diff-tree",
+                            "--no-commit-id",
+                            "--name-only",
+                            "--no-renames",
+                            "-r",
+                            "-z",
+                            hash,
+                        ],
+                    )?
+                    .split(|b| *b == 0)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| String::from_utf8_lossy(p).into_owned()),
+                );
+            }
+        }
+    }
+    let (generated_paths, _) = generated(source)?;
+    let inputs = generated_inputs(source)?;
+    let regenerating = generation_markers(run, meta).iter().any(|p| p.exists())
+        || paths.iter().any(|p| {
+            !matches_rule(p, &generated_paths) && (inputs.is_empty() || matches_rule(p, &inputs))
+        });
+    let mut checked = paths
+        .iter()
+        .filter(|p| keep_commits || regenerating || !matches_rule(p, &generated_paths))
+        .cloned()
+        .collect::<Vec<_>>();
+    if regenerating && !keep_commits {
+        checked.extend(generated_paths);
+    }
+    let blocked = marked_files(source, &checked)?
+        .iter()
+        .map(|path| {
+            format!(
+                "{path} (markers: {})",
+                conflict_labels(&source.join(path)).join(", ")
+            )
+        })
+        .collect::<Vec<_>>();
+    if !blocked.is_empty() {
+        return Err(format!(
+            "nothing applied: unresolved conflict markers / 冲突标记未解决: {}",
+            blocked.join("; ")
+        ));
+    }
+    Ok(checked)
+}
 pub fn apply(run: &Path, merge: bool, dry: bool, keep_commits: bool) -> Res<ApplyOutcome> {
+    let meta = json(run.join("meta.json"));
+    if s(&meta, "mode") == "read-only" {
+        return Err("read-only snapshot: nothing to apply / 只读任务禁止 apply".into());
+    }
+    let source = Path::new(s(&meta["worktree"], "source"));
+    if !source.is_absolute() {
+        return apply_checked(run, merge, dry, keep_commits, &[]);
+    }
+    let _guard = crate::source_watch::guard(source, true)?;
+    // Refresh the delivered diff before releasing its worktree (also captures later edits).
+    if Path::new(s(&meta["worktree"], "path")).is_dir() {
+        crate::changes::record(&meta, run);
+    }
+    let written_paths = reject_existing_markers(run, &meta, keep_commits)?;
+    if !dry && run.join("changes.patch").is_file() {
+        let mut patch = fs::read(run.join("changes.patch"))
+            .map_err(|e| format!("retain applied.patch: {e}"))?;
+        if let Some(large) = json(run.join("changes.json"))["afterLarge"].as_object() {
+            for path in large.keys() {
+                let worktree = Path::new(s(&meta["worktree"], "path"));
+                let mut file = fs::File::open(worktree.join(path)).map_err(|e| e.to_string())?;
+                let mut buffer = [0; 8192];
+                let binary = loop {
+                    let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
+                    if count == 0 {
+                        break false;
+                    }
+                    if buffer[..count].contains(&0) {
+                        break true;
+                    }
+                };
+                if binary {
+                    patch.extend_from_slice(
+                        format!("\n# binary/large file omitted: {}\n", json!(path)).as_bytes(),
+                    );
+                } else {
+                    // Large untracked text is outside the snapshot tree, but must
+                    // still be recoverable without its soon-to-be-released worktree.
+                    let diff = Command::new("git")
+                        .arg("-C")
+                        .arg(worktree)
+                        .args(["diff", "--no-index", "--binary", "--", "/dev/null", path])
+                        .output()
+                        .map_err(|e| e.to_string())?;
+                    if !diff.status.success() && diff.status.code() != Some(1) {
+                        return Err(String::from_utf8_lossy(&diff.stderr).into());
+                    }
+                    patch.extend(diff.stdout);
+                }
+            }
+        }
+        write(run.join("applied.patch"), patch)?;
+    }
+    let before = crate::source_watch::fingerprint(source)?;
+    let result = apply_checked(run, merge, dry, keep_commits, &written_paths);
+    if !dry {
+        crate::source_watch::register(source, &before, &written_paths)?;
+    }
+    result
+}
+fn apply_checked(
+    run: &Path,
+    merge: bool,
+    dry: bool,
+    keep_commits: bool,
+    written_paths: &[String],
+) -> Res<ApplyOutcome> {
     apply_progress("checking merge / 正在检查合并");
     let source = s(&json(run.join("meta.json"))["worktree"], "source").to_string();
     for (name, _) in active_writes_on(&source, Some(run))
@@ -1089,7 +1297,7 @@ pub fn apply(run: &Path, merge: bool, dry: bool, keep_commits: bool) -> Res<Appl
             );
         }
     }
-    let code = if keep_commits && !commits.is_empty() {
+    let mut code = if keep_commits && !commits.is_empty() {
         if !git_text(
             worktree,
             &["status", "--porcelain", "--untracked-files=all"],
@@ -1129,6 +1337,16 @@ pub fn apply(run: &Path, merge: bool, dry: bool, keep_commits: bool) -> Res<Appl
     };
     if keep_commits {
         conclusion["apply"]["keepCommits"] = json!(true);
+    }
+    if !dry {
+        let marked = marked_files(source, written_paths)?;
+        if !marked.is_empty() {
+            conclusion["apply"]["conflictMarkers"] = json!(marked);
+            let mut summary = json(run.join("summary.json"));
+            summary["conflictMarkers"] = json!(marked);
+            write_json(run.join("summary.json"), &summary)?;
+            code = 1;
+        }
     }
     conclusion["apply"]["ok"] = json!(code == 0);
     accept_validity(run, dry, &mut conclusion);
@@ -1694,14 +1912,34 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
         eprintln!("delegate: nothing applied; {} file(s) were also changed in {} since the run started. Rerun with --merge to apply the rest and write conflict markers into text files, or inspect with: {} diff {} --total",conflicts.len(),source.display(),script().display(),run.file_name().unwrap_or_default().to_string_lossy());
         return Ok(1);
     }
+    for action in &mut actions {
+        if action
+            .content
+            .split(|b| *b == b'\n')
+            .any(|line| line.starts_with(b"<<<<<<< ") || line.starts_with(b">>>>>>> "))
+            && action.kind != "copied"
+        {
+            action.kind = "conflict-markers".into();
+        }
+    }
     let marked_paths = actions
         .iter()
-        .filter(|x| x.kind == "conflict-markers")
+        .filter(|x| {
+            x.kind == "conflict-markers"
+                || x.content
+                    .split(|b| *b == b'\n')
+                    .any(|line| line.starts_with(b"<<<<<<< ") || line.starts_with(b">>>>>>> "))
+        })
         .map(|x| x.path.clone())
         .collect::<Vec<_>>();
     let marked = !marked_paths.is_empty();
-    if marked && !dry {
+    if marked {
         conclusion["apply"]["conflictMarkers"] = json!(marked_paths);
+        if !dry {
+            let mut summary = json(run.join("summary.json"));
+            summary["conflictMarkers"] = json!(marked_paths);
+            write_json(run.join("summary.json"), &summary)?;
+        }
     }
     let generated_inputs = generated_inputs(&source)?;
     let touches_inputs = generated_inputs.is_empty()

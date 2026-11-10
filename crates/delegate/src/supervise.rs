@@ -302,16 +302,31 @@ fn settle(
             sum["stall"] = reason;
         }
     }
-    let generated_checked = setup_error.is_none() && !lane::stopped();
+    let initial = if setup_error.is_none() {
+        changes::record(meta, run)
+    } else {
+        None
+    };
+    let inputs = strings(&meta["protectGenerated"]["inputs"]);
+    let needs_generation = inputs.is_empty()
+        || initial.as_ref().is_some_and(|rec| {
+            rec.0
+                .iter()
+                .any(|c| worktree::matches_rule(s(c, "path"), &inputs))
+        });
+    let generated_checked = meta["protectGenerated"].is_object()
+        && setup_error.is_none()
+        && !lane::stopped()
+        && needs_generation;
     let (generated_violations, generation_error) = if generated_checked {
         check_generated(meta, run, holder.clone())
     } else {
         (vec![], None)
     };
-    let rec = if setup_error.is_none() {
+    let rec = if generated_checked {
         changes::record(meta, run)
     } else {
-        None
+        initial
     };
     let changed = rec
         .as_ref()
@@ -321,6 +336,9 @@ fn settle(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let source_changed = crate::source_watch::changed(meta);
+    let outside_write =
+        s(meta, "mode") == "write" && changed.is_empty() && !source_changed.is_empty();
     let protected = meta["protect"]
         .as_array()
         .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
@@ -416,6 +434,7 @@ fn settle(
         sum["error"] = json!(error);
     }
     if violations.is_empty()
+        && !outside_write
         && generation_error.is_none()
         && verdict == "ok"
         && !question
@@ -430,6 +449,24 @@ fn settle(
         }
         .into();
         sum["state"] = json!(state);
+    }
+    if !source_changed.is_empty() {
+        sum["sourceWorkspaceChanges"] = json!(source_changed);
+    }
+    if outside_write {
+        state = "rejected".into();
+        sum["state"] = json!(state);
+        sum["sourceWriteViolation"] = json!(source_changed);
+        sum.as_object_mut().unwrap().remove("question");
+    }
+    if b(meta, "shell") && (!changed.is_empty() || !source_changed.is_empty()) {
+        state = "rejected".into();
+        sum["state"] = json!(state);
+        let mut paths = changed.clone();
+        paths.extend(source_changed.iter().map(|p| format!("source:{p}")));
+        sum["readOnlyViolation"] = json!(paths);
+        sum["error"] = json!("只读任务产生了写入 / read-only shell task wrote files");
+        sum.as_object_mut().unwrap().remove("question");
     }
     (state, sum, rec, changed)
 }
@@ -759,6 +796,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         }
         let prompt = read(run.join("prompt.md"));
         let zh = prompt
+            .replace(crate::launch::WRITE_BOUNDARY, "")
             .chars()
             .any(|c| (0x4e00..=0x9fff).contains(&(c as u32)));
         let patch = upstream.join("changes.patch");

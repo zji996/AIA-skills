@@ -8,7 +8,7 @@
 
 ## 会话
 
-每轮的会话都属于自己的 run：Pi 保存在 run 目录的 `session/` 下，`summary.json` 的 `session` 记下会话 id。`reply` 在每次尝试时从上一轮的会话**分叉**（Pi `--fork` 上一轮会话文件的副本），会话不被改动：答复畸形重跑时从同一处重新开始，清理早先的轮次也不影响后续追问。apply 后 worktree 删除，记录移到 `.applied/<run_id>/`，保留 7 天供 `reply` 续做。结局为 `malformed` 的轮次不算对话的延续，之后的 `reply` 与 `apply` 都从它的上一轮接着。4.1 之前的 run 使用 `--no-session`，不能 `reply`。
+每轮的会话都属于自己的 run：Pi 保存在 run 目录的 `session/` 下，`summary.json` 的 `session` 记下会话 id。`reply` 在每次尝试时从上一轮的会话**分叉**（Pi `--fork` 上一轮会话文件的副本），会话不被改动：答复畸形重跑时从同一处重新开始，清理早先的轮次也不影响后续追问。apply 后 worktree 删除，原 run 目录轻量记录及补丁保留 7 天供恢复和 `reply` 续做（旧归档仍可读取）。结局为 `malformed` 的轮次不算对话的延续，之后的 `reply` 与 `apply` 都从它的上一轮接着。4.1 之前的 run 使用 `--no-session`，不能 `reply`。
 
 写入任务上一轮为 `timeout`、`stalled` 或 `stopped` 时，下一次 reply 记 `meta.continuation`（上一轮状态）与 `rework.kind: "continuation"`，不消耗 maxRework，超限也可续做，改动超过 60 行也不补计。连续超时可以连续续做；rejected 等结局后仍按原返工规则。超时结论的 `next` 是可直接复制的续做命令，缺失会话自动带 `--fresh`，自然语言结论注明“不计返工次数”。
 
@@ -34,6 +34,7 @@
 | `cleanup.json` / `cleanup.lock` | 多阶段后台进程与 user unit 回收记录 / 并发回收锁；systemctl 缺失、bus 不可用、无标记与回收失败只记诊断 |
 | `scopes` / `scopes.lock` | 本轮的 systemd scope 单元名 / 并发读写锁；仅在用户 systemd 可用时出现 |
 | `changes.json` / `changes.patch` | 前后快照的 tree、逐文件状态与行数；可选 `finalEntries` 冻结结束时改动路径的最终指纹，供手动合入检测；可直接 `git apply` 的补丁 |
+| `applied.patch` | apply 时冻结该轮相对基线的完整补丁，释放工作树后保留；`patch <run> -- <path>…` 按路径打印 |
 | `setup.log` | `--worktree` 的 `setup` 命令输出 |
 | `verify.log` | `apply` 合并后验收（`applyVerify` / `--verify`）的输出 |
 | `generate.log` | `apply` 执行 `.delegate.json` 的 `generated.command` 时的输出 |
@@ -55,7 +56,7 @@
 
 ## 清理
 
-成功的 `apply` 默认等同对本轮执行 `clean`，`--keep` 保留；dry-run 或失败不清理，清理失败仅提示。共享 worktree 仍有其他 run 引用时保留。人读最后一行说明验收是否仍有效，无效或未确认时列出任务完整验收命令；`--json` 不加这行。回收豁免内置 `sccache` 与配置 `cleanupKeepExecutables` 的共享守护进程。
+成功 `apply` 释放 worktree、保留轻量 run 与补丁 7 天，`clean` 可提前删；`--keep` 另保留 worktree。dry-run/失败不清理；清理失败只提示。共享 worktree 仍有未合入或运行中的 run 引用时保留。人读最后一行说明验收是否仍有效，无效或未确认时列出任务完整验收命令；`--json` 不加这行。回收豁免内置 `sccache` 与配置 `cleanupKeepExecutables` 的共享守护进程。
 
 每次 `start` 会删除结束超过 7 天且结果已读取的记录（只显示过截断答复的不算已读取）；`DELEGATE_KEEP_DAYS` 调整天数，设为 `0` 关闭。
 

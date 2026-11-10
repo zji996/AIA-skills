@@ -26,7 +26,7 @@ $D start --read-only --tier review --name rv-runtime --prompt-file - <<'EOF'
 EOF
 $D start --read-only --tier review --name rv-api "审查 apps/api 里同一批提交的调度与重试逻辑……"
 $D start --read-only --name rv-web "审查 apps/web 同一批提交的交互与文案，列最影响使用的问题"
-$D wait            # 放后台；三路都结束才返回
+$D wait --all      # 放后台；三路都结束才返回
 ```
 
 想边收边看就改成逐个收取：`$D wait --stream`（宿主能把每行输出变成通知时，每路完工一行）或后台 `$D wait --any`（先完工的先返回，处理完再放同一条）。写入任务边收边合时，结论行的 `sourceDrift.overlap` 列出你合入别的结果后与它重叠的文件。

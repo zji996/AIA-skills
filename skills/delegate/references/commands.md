@@ -7,17 +7,18 @@
 | `start [选项] [任务说明]` | 后台启动，立即返回一行状态 |
 | `run [选项] [--max <时长>]` | 启动并等到结论 |
 | `reply <run> [消息] [--wait] [--fresh] [--sync]` | 接着最新一轮会话在后台启动并立即返回；`--wait` 等到结论（此时可用 `--max`/`--progress`/`--full`）。`--fresh` 开新会话，消息须自足；`--sync` 先同步主控后来改动，冲突时直接拒绝。验收与证据命令默认沿用，可分别覆盖或关闭；取消或隐藏已变更的验收命令时会告诉同事旧标准不再适用 |
+| `patch <run> [-- <path>…]` | 打印保留的完整补丁，可按精确路径/目录前缀过滤，供 `git apply --3way` 恢复 |
 | `diff [<run>] [--stat] [--total] [路径...]` | 以 `git diff` 输出该轮的改动；`--total` 为整段对话；终端下带颜色 |
-| `apply [<run> …] [--dry-run] [--merge] [--verify\|--no-verify] [--keep] [--keep-commits] [--json]` | 按给出的顺序将 worktree 改动合入源工作区，不提交，遇到失败即停；验收没法沿用（`acceptStillValid` 不为 true）的任务在最后一次合并后、经 lane 重跑一次各自的验收（去重），`applyVerify: false` 关闭、写命令则替换；始终列同事提交。`--keep-commits` 按序 cherry-pick，要求同事工作树改动已提交，冲突停在 git cherry-pick 状态。成功后删除 worktree，保留轻量 run 记录；`--keep` 保留完整记录。合入末行报告验收有效性与盲区。 |
+| `apply [<run> …] [--dry-run] [--merge] [--verify\|--no-verify] [--keep] [--keep-commits] [--json]` | 按给出的顺序将 worktree 改动合入源工作区，不提交，遇到失败即停；验收没法沿用（`acceptStillValid` 不为 true）的任务在最后一次合并后、经 lane 重跑一次各自的验收（去重），`applyVerify: false` 关闭、写命令则替换；始终列同事提交。`--keep-commits` 按序 cherry-pick，要求同事工作树改动已提交，冲突停在 git cherry-pick 状态。成功后删除 worktree，保留原 run 轻量记录与 applied.patch；`--keep` 保留完整记录。合入末行报告验收有效性与盲区。 |
 | `busy <资源名>` | 有实际运行的匹配命令时逐行列 run、命令和持续秒数，退出 0；空闲无输出、退出 1 |
-| `wait [<run>...\|--all] [--max <时长>] [--no-result] [--full] [--progress]` | 无参和带名字的 `wait <run>...` 默认同 `--any`：交付已结束未读取的，否则任一选中任务结束即返回；`--until-all` 等全部，`--all` 仅控制范围。人读末行给本会话剩余数和原样重跑命令，无运行任务时明确说明 |
+| `wait [<run>...\|--all] [--max <时长>] [--no-result] [--full] [--progress]` | 无参和带名字的 `wait <run>...` 默认同 `--any`：交付已结束未读取的，否则任一选中任务结束即返回；`--all` / `--until-all` 等全部（单次最多 50 分钟，超时列仍在跑的 run）。人读末行给本会话剩余数和原样重跑命令，无运行任务时明确说明 |
 | `status [<run>...] [--json]` | 默认每任务一条自然语言短行；`--json` 保留完整原字段 |
 | `result [<run>] [--path]` | 输出完整答复 |
 | `stop <run>...` | 终止任务及其 scope、进程组 |
 | `clean <run>...\|--finished [--force]` | 删除已结束的任务；`--finished` 默认保留结果未读取的 |
 | `lane [--label <文字>] [--measure] [--] <命令>` | 在整机重任务队列里执行命令；`--measure` 使用测量预约核并串行排队（一个参数按 shell 命令执行），退出码原样返回；不带命令时列出正在跑与排队的项 |
 
-启动选项：`--tier scout|review|write`（用途，不写时只读推断 review、写入推断 write，明确提醒并标记；scout/review 写入拒绝；三档须配齐）、`--image <路径>`（可重复）、`--accept <命令>` / `--no-accept`（覆盖或关闭仓库默认验收）、`--hide-accept`、`--accept-timeout`（默认 10m）、`--read-only`、`--in-place`（只读读实时工作区；写入覆盖 worktree 默认并原地写入）、`--workdir`、`--timeout`（每次尝试，可选；没有默认值）、`--retries`（答复畸形时重跑次数，默认 1）、`--model <别名或已登记完整名>`（与 --tier 互斥，只在 models 别名表内精确/唯一子串匹配，固定模型不自动换）、`--thinking off|minimal|low|medium|high|xhigh`（独立长度，模型名不带后缀；reply 也可换模型、档位或长度）、`--allow-parallel-writes`、`--worktree`、`--after <run>`（等上游以 delivered/answered 结束再执行，否则 `skipped`；等待期间 state 为 `waiting`、不占名额；写入步骤接在有改动的写入任务后时，worktree 从上游 worktree 的快照起步，diff 只含自己的改动，上游合入前 `apply` 拒绝，`--merge` 可单独合入）、`--in <run>`（只读，在上游 worktree 的快照里审它的改动）、`--protect <路径>`（可重复；末尾 `/` 为目录；被改动即判 `rejected` 并带 `protectViolation`，不跑验收；reply 沿用）。`--name` 省略时取说明首个非空行生成最多 40 字的可读名称，唯一 ID 规则不变；reply 轮次命名不变。`<run>` 可以是完整 id、唯一片段、`last` 或 run 目录。
+启动选项：`--tier scout|review|write`（用途，不写时只读推断 review、写入推断 write，明确提醒并标记；scout/review 自动只读；三档须配齐）、`--image <路径>`（可重复）、`--accept <命令>` / `--no-accept`（覆盖或关闭仓库默认验收）、`--hide-accept`、`--accept-timeout`（默认 10m）、`--read-only`、`--shell`（仅 git 快照内只读调查，写文件拒收）、`--in-place`（只读读实时工作区；写入覆盖 worktree 默认并原地写入）、`--workdir`、`--timeout`（每次尝试，可选；没有默认值）、`--retries`（答复畸形时重跑次数，默认 1）、`--model <别名或已登记完整名>`（可与 --tier 同用，只在 models 别名表内精确/唯一子串匹配，固定模型不自动换）、`--thinking off|minimal|low|medium|high|xhigh`（独立长度，模型名不带后缀；reply 也可换模型、档位或长度）、`--allow-parallel-writes`、`--worktree`、`--after <run>`（等上游以 delivered/answered 结束再执行，否则 `skipped`；等待期间 state 为 `waiting`、不占名额；写入步骤接在有改动的写入任务后时，worktree 从上游 worktree 的快照起步，diff 只含自己的改动，上游合入前 `apply` 拒绝，`--merge` 可单独合入）、`--in <run>`（只读，在上游 worktree 的快照里审它的改动）、`--protect <路径>`（可重复；末尾 `/` 为目录；被改动即判 `rejected` 并带 `protectViolation`，不跑验收；reply 沿用）。`--name` 省略时取说明首个非空行生成最多 40 字的可读名称，唯一 ID 规则不变；reply 轮次命名不变。`<run>` 可以是完整 id、唯一片段、`last` 或 run 目录。
 
 `start`/`run`/`reply` 另支持 `--evidence <命令>`、`--no-evidence` 与 `--evidence-timeout`（默认 30m）。reply 沿用上一轮证据命令与超时，可覆盖或关闭。`--model` 固定模型时仍显示所在档位，JSON `agentPinned: true`，不自动升档；旧 meta 缺字段时推断显示，不改写旧 meta。6.0 删除了 `--agent`；Codex 留下的旧记录 `reply` 时由 Pi 开新会话续做。
 

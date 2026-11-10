@@ -1,5 +1,14 @@
 # delegate
 
+## 6.15 并行合入不丢改动
+
+- 九路写入先合一路留下标记，再合重叠路径：apply/dry-run 整体拒绝，列文件与原 run；无交集照常，status 在解决前显示「已合入·有冲突待解决」。Reject nested conflict markers before writing any target file.
+- 合入后发现单个文件要重来：`patch <run> -- <path>` 输出保留补丁供 `git apply --3way`，原 run 记录仍在、池槽已释放。
+- 提示含源目录绝对路径：write 提示提醒仅在 cwd 写，启动给 note；自己的树零改动而源有新差异时显示「写到了源仓库」，其他路 delegate apply 不算误写。
+- `wait --all r1 r2` 中 r1 已交付、r2 排队：仍等 r2；超时列 r2，默认 wait 的首行解释旧交付。
+- protect 与 generated 路径重叠但仅改文档：收尾与 apply 都不跑无关生成器，保留 not regenerated 诊断。
+- 强模型只读查日志 / SELECT：`--tier review --model <别名> --shell` 在快照执行，文件变化判「只读任务产生了写入」，任何只读任务禁止 apply。
+
 ## 6.14 容量排队与模型预算
 
 - 整机或仓库到上限、内存不足：`start` 成功返回 run id，`status` 显示排队分钟数、原因与前方人数，JSON 含 `queue`；不用手动重派。Queue automatically at capacity; wait for queued tasks normally.
@@ -39,7 +48,7 @@
 - 主控连放三个任务后只跑 `delegate wait`：交付第一个结束的并返回，末行写“还剩 2 个…再跑 delegate wait”；全部收完末行写没有在跑的任务。`--until-all` 才等到全部结束。
 - 侦察答复 6817 字：默认上限 20000 时全文显示；上限 6000 时 6817 ≤ 7500 仍全文显示；`--max-answer 900` 且答复超过 1350 字时同一会话追问压缩一次，`result.md` 为压缩后答复，原文在 `result-original.md`，不耗返工预算，失败保留原答复。
 - 仓库设 `defaults: {"worktree": true, "protect": ["docs/decision/"], "acceptAlso": ["make lint"]}`：不带选项的写入任务进 worktree、带保护与附加验收，启动回显各项来源；`--in-place` 退回原地；CLI 的 `--protect` 覆盖整项。未配置时行为与 5.24 相同。
-- `apply` 成功后该任务的 worktree 与 run 目录已清理（`--keep` 保留），末行写明验收是否仍有效及需在主干重跑的命令；清理失败只提示、退出码仍为 0。
+- `apply` 成功后该任务的 worktree 已释放、run 轻量记录和补丁保留（`--keep` 另保留 worktree），末行写明验收是否仍有效及需在主干重跑的命令；清理失败只提示、退出码仍为 0。
 - 任务结束时构建拉起的 sccache 服务端不被终止、不出现“终止了后台进程”的提示；其他被终止的进程提示里带可执行名。
 
 ## 5.24 源仓库构建目录提示

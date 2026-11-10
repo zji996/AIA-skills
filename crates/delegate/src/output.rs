@@ -390,7 +390,12 @@ pub fn human(run: &Path, status: &Value) -> String {
             }
         ));
     }
-    if b(status, "applied") {
+    if status["conflictMarkers"]
+        .as_array()
+        .is_some_and(|a| !a.is_empty())
+    {
+        parts.push("已合入·有冲突待解决".into());
+    } else if b(status, "applied") {
         parts.push(
             if s(status, "appliedBy") == "detected" {
                 "已合入（主干已含改动）"
@@ -411,7 +416,34 @@ pub fn human(run: &Path, status: &Value) -> String {
         );
     }
     if !status["readOnlyViolation"].is_null() || !status["workspaceChanged"].is_null() {
-        parts.push("只读工作区有改动".into());
+        parts.push(
+            if b(&meta, "shell") {
+                "只读任务产生了写入"
+            } else {
+                "只读工作区有改动"
+            }
+            .into(),
+        );
+    }
+    for (key, label) in [
+        ("sourceWriteViolation", "写到了源仓库"),
+        ("sourceWorkspaceChanges", "源仓库工作区有新改动"),
+    ] {
+        if key == "sourceWorkspaceChanges" && !status["sourceWriteViolation"].is_null() {
+            continue;
+        }
+        if let Some(paths) = status[key].as_array().filter(|p| !p.is_empty()) {
+            parts.push(format!(
+                "{label}：{} 个文件（{}）",
+                paths.len(),
+                paths
+                    .iter()
+                    .take(5)
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
     }
     if n(status, "denied") > 0 {
         parts.push(format!("拦下 {} 次全量检查", n(status, "denied")));

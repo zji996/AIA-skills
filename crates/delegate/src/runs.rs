@@ -20,7 +20,7 @@ pub fn all_runs() -> Vec<PathBuf> {
     v.sort_by_key(|p| json(p.join("meta.json"))["startedNs"].as_u64().unwrap_or(0));
     v
 }
-fn archived_runs() -> Vec<PathBuf> {
+pub fn archived_runs() -> Vec<PathBuf> {
     all_runs_roots()
         .into_iter()
         .flat_map(|root| {
@@ -377,6 +377,25 @@ pub fn status(run: &Path) -> Value {
     if let Some(bytes) = meta["worktreeBytes"].as_u64() {
         out["worktreeBytes"] = json!(bytes);
     }
+    let unresolved = sum["conflictMarkers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|path| {
+            !worktree::conflict_labels(&Path::new(s(&meta["worktree"], "source")).join(path))
+                .is_empty()
+        })
+        .collect::<Vec<_>>();
+    if !unresolved.is_empty() {
+        out["conflictMarkers"] = json!(unresolved);
+    }
+    if active(&st) {
+        let source_changes = crate::source_watch::changed(&meta);
+        if !source_changes.is_empty() {
+            out["sourceWorkspaceChanges"] = json!(source_changes);
+        }
+    }
     if sum.is_object() {
         for key in [
             "finishedAt",
@@ -393,6 +412,8 @@ pub fn status(run: &Path) -> Value {
             "accept",
             "evidence",
             "readOnlyViolation",
+            "sourceWriteViolation",
+            "sourceWorkspaceChanges",
             "protectViolation",
             "protectViolationReasons",
             "workspaceChanged",
@@ -530,7 +551,9 @@ pub fn remove_after_apply(run: &Path) -> Vec<String> {
     let path = s(&meta["worktree"], "path");
     let shared = !path.is_empty()
         && all_runs().iter().any(|other| {
-            other != run && s(&json(other.join("meta.json"))["worktree"], "path") == path
+            other != run
+                && s(&json(other.join("meta.json"))["worktree"], "path") == path
+                && (active(&state(other)) || !other.join(".applied").exists())
         });
     let _ = crate::cleanup::record(run, 0);
     let containers = if !shared {
@@ -539,16 +562,22 @@ pub fn remove_after_apply(run: &Path) -> Vec<String> {
         crate::cleanup::Containers::default()
     };
     if crate::pool::is_slot(Path::new(path)) {
-        // The kept record must stop pointing at the slot, or it would hold it forever.
-        let mut released = meta.clone();
-        released["worktree"]["path"] = json!(format!("{path}#released"));
-        let _ = fs::write(
-            run.join("meta.json"),
-            serde_json::to_string_pretty(&released).unwrap_or_default(),
-        );
+        // Every applied round sharing the slot must stop holding it, not just the
+        // latest reply. Active/unapplied sharers are still protected by `shared`.
+        for other in all_runs()
+            .into_iter()
+            .filter(|other| other == run || !shared)
+        {
+            let mut released = json(other.join("meta.json"));
+            if s(&released["worktree"], "path") == path && !active(&state(&other)) {
+                released["worktree"]["path"] = json!(format!("{path}#released"));
+                let _ = write_json(other.join("meta.json"), &released);
+            }
+        }
     }
     let keep = [
         "meta.json",
+        "applied.patch",
         "prompt.md",
         "result.md",
         "result-original.md",
@@ -559,15 +588,6 @@ pub fn remove_after_apply(run: &Path) -> Vec<String> {
         ".delivered",
         ".truncated",
     ];
-    let archive = runs_root()
-        .join(".applied")
-        .join(run.file_name().unwrap_or_default());
-    let _ = fs::create_dir_all(archive.parent().unwrap());
-    if archive.exists() {
-        let _ = fs::remove_dir_all(&archive);
-    }
-    let _ = fs::rename(run, &archive);
-    let run = archive.as_path();
     if let Ok(entries) = fs::read_dir(run) {
         for entry in entries.flatten() {
             if keep.contains(&entry.file_name().to_string_lossy().as_ref()) {
@@ -655,6 +675,11 @@ pub fn prune() {
 /// ended without saving a session (the agent failed before it wrote one);
 /// the next reply then continues from the round before it.
 pub fn continues_conversation(run: &Path) -> bool {
+    // A lightweight applied round deliberately has no session. It still owns
+    // the conversation head: reply will reopen it from current source context.
+    if run.join(".applied-cleaned").exists() {
+        return true;
+    }
     let st = state(run);
     if st == "malformed" {
         return false;

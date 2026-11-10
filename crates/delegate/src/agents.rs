@@ -517,8 +517,15 @@ fn command_pi(meta: &Value, session: Option<&str>) -> Vec<String> {
             a.extend([format!("--{key}"), s(meta, key).into()]);
         }
     }
-    if s(meta, "mode") == "read-only" && !meta["worktree"].is_object() {
-        a.extend(["--tools".into(), "read,grep,find,ls".into()]);
+    if s(meta, "mode") == "read-only" {
+        a.extend([
+            "--tools".into(),
+            if b(meta, "shell") {
+                "read,grep,find,ls,bash".into()
+            } else {
+                "read,grep,find,ls".into()
+            },
+        ]);
     }
     if !s(meta, "dir").is_empty() {
         let role = Path::new(s(meta, "dir")).join("colleague.md");
@@ -725,6 +732,7 @@ pub fn run_agent(
         stalled.clone(),
     );
     let runpath = run.to_path_buf();
+    let source_meta = meta.clone();
     let watcher = std::thread::spawn(move || {
         let (mutex, changed) = &*watcher_state;
         let mut state = mutex.lock().unwrap();
@@ -732,6 +740,7 @@ pub fn run_agent(
             if state.finished {
                 break;
             }
+            crate::source_watch::observe(&source_meta, &runpath);
             let queued = lane::queued_seconds(&runpath);
             let spent = start.elapsed().as_secs_f64() - queued;
             let idle = state.last.elapsed().as_secs_f64();
@@ -799,7 +808,11 @@ pub fn run_agent(
                     }
                 }
             }
-            let mut delay: f64 = 60.0;
+            let mut delay: f64 = if source_meta["sourceStatusBaseline"].is_object() {
+                2.0
+            } else {
+                60.0
+            };
             if let Some(soft) = soft {
                 // Wake at the soft limit to record grace, then at the hard limit.
                 let next = if spent < soft {
@@ -1101,6 +1114,8 @@ mod tests {
                 "/runs/session",
                 "--mode",
                 "json",
+                "--tools",
+                "read,grep,find,ls",
                 "-p",
                 "@/a.png"
             ]

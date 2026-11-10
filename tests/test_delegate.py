@@ -663,7 +663,11 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         for command in ("status", "wait"):
             out = self.cli(command, "compact", human=True)
             self.assertEqual(out.returncode, 0, out.stderr)
-            line = out.stdout.splitlines()[0]
+            lines = out.stdout.splitlines()
+            if command == "wait":
+                self.assertTrue(lines[0].startswith("以下 run 已交付，未等待："), out.stdout)
+                lines = lines[1:]
+            line = lines[0]
             self.assertTrue(line.startswith("compact · 已交付"), line)
             for text in ("· write（推断）", "验收通过", "改 2 个文件 +2/-1", "crates/protocol 1", "delegate diff"):
                 self.assertIn(text, line)
@@ -809,7 +813,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         self.assertIn("Definition of done", prompt)
         self.assertEqual(state["name"], "Fix the parser")
         state = self.outcome(self.cli("run", "--accept", "true", "--hide-accept", "Fix it"))
-        self.assertEqual((Path(state["dir"]) / "prompt.md").read_text(), "Fix it\n")
+        self.assertEqual((Path(state["dir"]) / "prompt.md").read_text(), "Fix it\n\n只在当前工作目录内改文件；提示里出现的其他绝对路径只读\n")
         self.assertEqual(state["state"], "delivered")
 
     def test_accept_timeout_is_rejected(self):
@@ -1633,7 +1637,7 @@ db.write_text(json.dumps(units))
         result = self.cli("start", "--name", "old", "--prompt-file", "-", stdin="multi\nline\n")
         self.assertEqual(result.returncode, 0, result.stderr)
         old = Path(json.loads(result.stdout)["dir"])
-        self.assertEqual((old / "prompt.md").read_text(), "multi\nline\n")
+        self.assertEqual((old / "prompt.md").read_text(), "multi\nline\n\n只在当前工作目录内改文件；提示里出现的其他绝对路径只读\n")
         self.assertEqual(self.cli("wait", "old", "--no-result").returncode, 0)
         self.assertIn("keep unreported run", self.cli("clean", "--finished").stderr)
         self.assertTrue(old.exists())
@@ -1776,9 +1780,8 @@ db.write_text(json.dumps(units))
         self.assertEqual((repo / "a.txt").read_text(), "a\nuncommitted\ncaller\n")
         self.fake_pi([answer("ok"), SETTLED])
         pi = self.outcome(self.cli("run", "--read-only", "--workdir", repo, "review"))
-        # In its own worktree a read-only Pi is isolated and checked: full tools (git log/diff, tests),
-        # the boundary in writing, and the worktree set up for commands.
-        self.assertNotIn("--tools", (self.work / "pi.log").read_text().splitlines()[-1])
+        # Read-only Pi keeps reading tools by default; --shell opts into commands in the snapshot.
+        self.assertIn("--tools read,grep,find,ls", (self.work / "pi.log").read_text().splitlines()[-1])
         self.assertIn("Read-only task", (Path(pi["dir"]) / "prompt.md").read_text())
         self.assertTrue((Path(pi["worktree"]) / "setup-ran").exists())
         # Reading the live tree (--in-place) there is no isolation, so the tool limit comes back.
@@ -1834,10 +1837,9 @@ db.write_text(json.dumps(units))
         self.assertIn("p/write-m，thinking medium", changed.stderr)
         self.assertEqual(changed.returncode, 0, changed.stderr)
         for tier in ("scout", "review"):
-            refused = self.cli("start", "--tier", tier, "write task")
-            self.assertEqual(refused.returncode, 2)
-            self.assertIn("--tier write or --model", refused.stderr)
-        for args in (("--tier", "review", "--model", "sol"), ("--model", "sol:high"), ("--tier", "cheap"), ("--tier", "vision")):
+            read = self.outcome(self.cli("run", "--tier", tier, "read task"))
+            self.assertEqual(read["mode"], "read-only")
+        for args in (("--model", "sol:high"), ("--tier", "cheap"), ("--tier", "vision")):
             refused = self.cli("start", "--read-only", *args, "task")
             self.assertEqual(refused.returncode, 2, refused.stderr)
         write = self.cli("run", "task")
@@ -2394,7 +2396,7 @@ db.write_text(json.dumps(units))
         fork = Path(calls[1][calls[1].index("--fork") + 1])  # a copy of the first run's session
         self.assertEqual(fork.name, f"t_{calls[0][calls[0].index('--session-id') + 1]}.jsonl")
         self.assertEqual(fork.parent, Path(second["dir"]) / "fork")
-        self.assertEqual((Path(second["dir"]) / "prompt.md").read_text(), "one more thing\n")
+        self.assertEqual((Path(second["dir"]) / "prompt.md").read_text(), "one more thing\n\n只在当前工作目录内改文件；提示里出现的其他绝对路径只读\n")
         self.assertIn("+again", self.cli("diff", second["run"]).stdout)
         self.assertNotIn("+more", self.cli("diff", second["run"]).stdout)
         self.assertIn("+more", self.cli("diff", "--total", second["run"]).stdout)
@@ -3399,7 +3401,7 @@ db.write_text(json.dumps(units))
         self.assertNotIn("accept", second)
         self.assertIn("no longer applies", (Path(second["dir"]) / "prompt.md").read_text())
         third = self.outcome(self.cli("reply", "--wait", second["run"], "--prompt", "and more"))
-        self.assertEqual((Path(third["dir"]) / "prompt.md").read_text(), "and more\n")
+        self.assertEqual((Path(third["dir"]) / "prompt.md").read_text(), "and more\n\n只在当前工作目录内改文件；提示里出现的其他绝对路径只读\n")
 
     def test_reply_keeps_the_session_when_its_parent_is_pruned(self):
         self.fake_pi([answer("ok"), SETTLED])

@@ -18,7 +18,7 @@ class DelegateApplyFinishTests(unittest.TestCase):
         state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, *options, "task"))
         return repo, state
 
-    def test_success_cleans_run_and_worktree_and_keeps_json_fields(self):
+    def test_success_retains_run_and_releases_worktree_and_keeps_json_fields(self):
         repo, state = self.task("--accept", "test -f a.txt")
         result = self.cli("apply", "--json", state["run"])
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -27,7 +27,7 @@ class DelegateApplyFinishTests(unittest.TestCase):
         self.assertEqual(outcome["apply"], {"ok": True, "dryRun": False})
         self.assertTrue(outcome["acceptStillValid"])
         self.assertNotIn("cleanup", outcome)
-        self.assertFalse(Path(state["dir"]).exists())
+        self.assertTrue(Path(state["dir"]).exists())
         self.assertFalse(Path(state["worktree"]).exists())
         self.assertEqual((repo / "a.txt").read_text(), "new\n")
 
@@ -65,7 +65,7 @@ class DelegateApplyFinishTests(unittest.TestCase):
         result = self.cli("apply", state["run"], human=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("apply cleanup:", result.stderr)
-        self.assertFalse(Path(state["dir"]).exists())
+        self.assertTrue(Path(state["dir"]).exists())
         self.assertFalse(Path(state["worktree"]).exists())
         self.assertIn("任务没有验收命令", result.stdout.splitlines()[-1])
 

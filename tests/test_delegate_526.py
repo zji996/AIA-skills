@@ -32,7 +32,7 @@ class Delegate526Tests(unittest.TestCase):
         first = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "original task"))
         self.assertEqual(self.cli("apply", first["run"]).returncode, 0)
         run = Path(first["dir"])
-        archive = run.parent / ".applied" / run.name
+        archive = run
         self.assertTrue((archive / "prompt.md").exists())
         self.assertTrue((archive / "result.md").exists())
         self.assertFalse(Path(first["worktree"]).exists())

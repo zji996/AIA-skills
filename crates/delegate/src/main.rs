@@ -16,6 +16,7 @@ mod queue;
 mod resources;
 mod runs;
 mod source_build;
+mod source_watch;
 mod supervise;
 mod transient;
 mod waiting;
@@ -496,10 +497,15 @@ fn collect(
     show_result: bool,
     next: &str,
 ) -> i32 {
+    let requested = runs;
     let Ok((runs, _claims)) = waiting::claim(runs) else {
         return 2;
     };
-    if runs.is_empty() {
+    if runs.is_empty()
+        || requested
+            .iter()
+            .any(|r| !runs.contains(r) && runs::active(&runs::state(r)))
+    {
         return waiting::COVERED;
     }
     collect_timed(&runs, max, show_progress, full, show_result, None, next)
@@ -642,7 +648,20 @@ fn collect_timed(
         print_continue(next);
     }
     if code == 75 {
-        eprintln!("delegate: still running; call wait again (exit 75)");
+        let pending = runs
+            .iter()
+            .filter(|r| runs::active(&runs::state(r)))
+            .map(|r| {
+                r.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "delegate: still running ({}); call wait again (exit 75)",
+            pending.join(", ")
+        );
     }
     code
 }
@@ -926,7 +945,7 @@ fn clean(args: &[String]) -> Res<i32> {
         .map(|p| runs::resolve(p))
         .collect::<Res<Vec<_>>>()?;
     if has(&flags, "--finished") {
-        for run in runs::all_runs() {
+        for run in runs::all_runs().into_iter().chain(runs::archived_runs()) {
             if has(&flags, "--force")
                 || (run.join(".delivered").exists()
                     && !run.join(".truncated").exists()
@@ -1095,6 +1114,75 @@ fn diff(args: &[String]) -> Res<i32> {
     }
     Ok(status.code().unwrap_or(1))
 }
+fn patch(args: &[String]) -> Res<i32> {
+    let split = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    if split != 1 {
+        return Err("patch requires one run, followed by optional -- paths".into());
+    }
+    let run = runs::resolve(&args[0])?;
+    let file = if run.join("applied.patch").is_file() {
+        run.join("applied.patch")
+    } else {
+        run.join("changes.patch")
+    };
+    let data = fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let paths = args.get(split + 1..).unwrap_or_default();
+    if paths.is_empty() {
+        io::stdout().write_all(&data).map_err(|e| e.to_string())?;
+    } else {
+        // Parse names using Git's own patch parser (including quoted/space paths),
+        // then print whole diff sections, never partial hunks.
+        let mut blocks = Vec::<Vec<u8>>::new();
+        for line in data.split_inclusive(|b| *b == b'\n') {
+            if let Some(name) = line.strip_prefix(b"# binary/large file omitted: ") {
+                if let Ok(name) = serde_json::from_slice::<String>(name) {
+                    if paths.iter().any(|p| crate::changes::under_path(&name, p)) {
+                        io::stdout().write_all(line).map_err(|e| e.to_string())?;
+                    }
+                }
+                continue;
+            }
+            if line.starts_with(b"diff --git ") || blocks.is_empty() {
+                blocks.push(Vec::new());
+            }
+            blocks.last_mut().unwrap().extend_from_slice(line);
+        }
+        for block in blocks {
+            if !block.starts_with(b"diff --git ") {
+                continue;
+            }
+            let mut child = Command::new("git")
+                .args(["apply", "--numstat", "-z"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&block)
+                .map_err(|e| e.to_string())?;
+            let out = child.wait_with_output().map_err(|e| e.to_string())?;
+            if !out.status.success() {
+                return Err(String::from_utf8_lossy(&out.stderr).into());
+            }
+            let name = out
+                .stdout
+                .splitn(3, |b| *b == b'\t')
+                .nth(2)
+                .unwrap_or_default();
+            let name = String::from_utf8_lossy(name)
+                .trim_end_matches('\0')
+                .to_string();
+            if paths.iter().any(|p| crate::changes::under_path(&name, p)) {
+                io::stdout().write_all(&block).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(0)
+}
 fn apply(args: &[String]) -> Res<i32> {
     let (pos, flags, _) = parse_simple(
         args,
@@ -1233,6 +1321,23 @@ fn apply(args: &[String]) -> Res<i32> {
                 )
             }
         );
+    }
+    if !output::json_enabled() && !dry {
+        for (_, conclusion, _) in &done {
+            if let Some(paths) = conclusion["apply"]["conflictMarkers"]
+                .as_array()
+                .filter(|p| !p.is_empty())
+            {
+                println!(
+                    "!!! applied with conflict markers / 有冲突待解决: {}",
+                    paths
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
     }
     if code == 0 && !dry && !has(&flags, "--keep") {
         for (run, _, _) in &done {
@@ -1383,7 +1488,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
             let (explicit_any, stream, until_all) = (
                 has(&flags, "--any"),
                 has(&flags, "--stream"),
-                has(&flags, "--until-all"),
+                has(&flags, "--until-all") || has(&flags, "--all"),
             );
             if explicit_any && stream {
                 return Err("--any and --stream cannot be combined".into());
@@ -1395,6 +1500,22 @@ fn main_inner(args: &[String]) -> Res<i32> {
             // use --until-all when the caller needs every selected run.
             let any = !until_all && (explicit_any || !stream);
             let (mut list, hinted) = wait_list(&pos, &flags, false)?;
+            if !until_all && !output::json_enabled() {
+                let delivered = list
+                    .iter()
+                    .filter(|r| r.join(".delivered").exists())
+                    .map(|r| {
+                        r.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect::<Vec<_>>();
+                if !delivered.is_empty() {
+                    println!("以下 run 已交付，未等待：{}", delivered.join(", "));
+                }
+            }
+
             if any && (pos.is_empty() || explicit_any) {
                 // A named run that was already reported in full is not waited for again, so
                 // repeating the same `wait --any` walks through the rest.
@@ -1407,6 +1528,9 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 return Ok(0);
             }
             max = check_in(max, &list);
+            if until_all {
+                max = Some(max.unwrap_or(3000.0).min(3000.0));
+            }
             if any || stream {
                 return Ok(wait_each(
                     list,
@@ -1489,6 +1613,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
             Ok(0)
         }
         "diff" => diff(rest),
+        "patch" => patch(rest),
         "apply" => apply(rest),
         "lane" => lane::lane_command(rest),
         "busy" => {

@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI（pi-kit 的 rpi 通道下 `pi` 即 rpi）。
 metadata:
-  version: "6.14.0"
+  version: "6.15.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -23,7 +23,7 @@ $D wait                                                                  # 放�
 
 总路数、仓库路数、模型并发或内存不足时自动排队、不换模型；`status` 看排队原因与前方人数，`--json` 看 `queue`。只有愿意模型满时改用下一候选才加 `--overflow next`。
 
-每个任务回一条短行（状态、改动、验收、下一步）和答复。写入任务看 `$D diff <name>`，满意后 `$D apply <name>`。
+每个任务回一条短行（状态、改动、验收、下一步）和答复。写入任务看 `$D diff <name>`，满意后 `$D apply <name>`；冲突未解拒绝重叠合入，补丁保留可用 `patch` 恢复；等齐用 `wait --all`，见 [并行合入与只读 shell](references/parallel-safety.md)。
 
 | 想要 | 命令 |
 |---|---|
@@ -40,7 +40,7 @@ $D wait                                                                  # 放�
 
 ## 档位
 
-三个独立维度：`--tier scout|review|write` 选用途（scout 侦察/摘要/找文件/文案，review 严密审查/根因/第二意见，write 改代码带验收）；`--model <别名>` 从配置 `models` 指定模型，与 `--tier` 互斥；`--thinking off|minimal|low|medium|high|xhigh` 选思维长度，不再写进模型名。省略用途与模型时，写入推断 write、只读推断 review，回显提醒且状态标「推断」；scout/review 不接写入。图片只检查最终模型的 Pi images 声明，不改选模型。上游瞬时失败先同会话续做，仍失败且未改文件才换本档下一个模型；固定模型不换。首次使用用 `$D tiers --alias name=provider/id --scout name --review name --write name --thinking high` 登记并配齐三档；只选已登记的模型，细节见 [references/configuration.md](references/configuration.md)。
+三个独立维度：`--tier scout|review|write` 选用途（scout 侦察/摘要/找文件/文案，review 严密审查/根因/第二意见，write 改代码带验收）；`--model <别名>` 从配置 `models` 指定模型，可与 `--tier` 同用；`--thinking off|minimal|low|medium|high|xhigh` 选思维长度，不再写进模型名。省略用途与模型时，写入推断 write、只读推断 review，回显提醒且状态标「推断」；scout/review 只读，`--shell` 可查日志/跑只读查询。图片只检查最终模型的 Pi images 声明，不改选模型。上游瞬时失败先同会话续做，仍失败且未改文件才换本档下一个模型；固定模型不换。首次使用用 `$D tiers --alias name=provider/id --scout name --review name --write name --thinking high` 登记并配齐三档；只选已登记的模型，细节见 [references/configuration.md](references/configuration.md)。
 
 ## 任务说明
 

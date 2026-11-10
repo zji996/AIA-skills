@@ -26,14 +26,14 @@
 - 这三类路径不计入改动。子模块在新 worktree 里是空目录：只读使用时写进 `link`（会替换空目录），需要独立修改时在 `setup` 里初始化。
 - 顶层 `accept` 是写入任务的默认验收命令；`--accept-also` 追加任务测试，`--accept` 覆盖，`--no-accept` 关闭，只读任务不使用默认。
 - `generated.paths` 的匹配语义同 `--protect`；改动清单与 diff 仍列出这些文件，`apply` 跳过其合并，在合并其他文件后由 lane 在源仓库根执行 `sh -c` 的 `command`，日志写入 `generate.log`；可选 `inputs`（同样的匹配语义）限定只有合并路径命中时才生成，省掉纯文档改动的排队；`--dry-run` 只报告动作。生成命令失败时退出 1，已合并文件保留（§6.4）。
-- `--protect`/`--protect-reason` 与生成路径重叠时，启动 stderr 提示生成命令例外并附在同事的任务说明里；该命令与路径保存到 meta，reply/fresh 沿用。收尾在 lane 中于 worktree 根复跑，比较生成路径的内容、权限和符号链接（含忽略文件）；一致则允许，漂移报 `protectViolation` 与“生成物被手改”，生成失败判 rejected，日志在 `protect-generate.log`。
+- `--protect`/`--protect-reason` 与生成路径重叠时，启动 stderr 提示生成命令例外并附在同事的任务说明里；该命令与路径保存到 meta，reply/fresh 沿用。仅改动命中 `generated.inputs`（未配置则不限定）时，收尾在 lane 中于 worktree 根复跑，比较生成路径的内容、权限和符号链接（含忽略文件）；一致则允许，漂移报 `protectViolation` 与“生成物被手改”，生成失败判 rejected，日志在 `protect-generate.log`。
 - 验收证据将托管 copy/link 路径明确排除，`accept.excluded` 与 apply 结论的 `excluded` 列出仓库相对路径；这些路径上的 skip-worktree 不算缺口。未托管 gitlink 的目录缺失或为空、且指针等于 HEAD 时，其未初始化内容也列为范围外，但指针仍保留在证据树中。源子模块初始化后重新核验：干净且同指针可复用，脏内容、索引标记、非空未初始化目录、变更的未初始化指针或读取失败仍判证据不完整。
 
-`--read-only` 在 git 仓库里默认也用这样的 worktree（`--in-place` 除外），只作为供阅读的快照：主控同时的编辑既不影响它读到的内容，也不会被算成它的改动；它违规写入的文件留在 worktree 里，记为 `readOnlyViolation`，不能 `apply`。两位同事在其中都有全部工具，`setup` 照常执行（它们可能跑测试）；只有无法隔离时（非 git 或 `--in-place`），只读 Pi 才只保留读文件、搜索、列目录。
+`--read-only` 在 git 仓库里默认也用这样的 worktree（`--in-place` 除外），只作为供阅读的快照：主控同时的编辑既不影响它读到的内容，也不会被算成它的改动；它违规写入的文件留在 worktree 里，记为 `readOnlyViolation`，不能 `apply`。Pi 默认只给读取/搜索工具；`--shell` 在快照中增加 bash，适合查日志、只读查询，任何文件差异都拒收（非 git / `--in-place` 不支持）；`setup` 照常执行。详见 [并行安全](parallel-safety.md)。
 
-worktree 由对话共享，`clean` 删除最后一个使用它的 run 时执行 `git worktree remove`（池槽位只释放、不删除），过期清理同理；`agent-handoff` 会列出尚未 `apply` 的写入型 worktree。
+worktree 按对话共享，最后一个引用被 `clean`/过期清理时移除（池槽仅释放）；`agent-handoff` 列未合入 worktree。
 
-成功 `apply` 默认回收 worktree，轻量保留 run 的 `meta.json`、任务说明、最终答复与摘要 7 天（`DELEGATE_KEEP_DAYS`，0 禁止自动过期）；`clean <run>` 与 `clean --finished` 可提前删除。普通 `reply` 会从当前源分支新建 worktree，将原任务说明、上次答复和追加说明交给新会话；`reply --fresh` 仍只使用本轮说明。共享输入沿用原路径；repo 内路径必须在新 worktree 同位置不存在，否则报错。共享链接只是协作约定，并非文件系统写保护。
+成功 `apply` 默认回收 worktree，轻量保留 run 的 `meta.json`、任务说明、最终答复、摘要与 `applied.patch` 7 天（`DELEGATE_KEEP_DAYS`，0 禁止自动过期）；`clean <run>` 与 `clean --finished` 可提前删除。普通 `reply` 会从当前源分支新建 worktree，将原任务说明、上次答复和追加说明交给新会话；`reply --fresh` 仍只使用本轮说明。共享输入沿用原路径，repo 内同位置已有文件则报错；链接并非写保护。
 
 写入任务未 apply 时，`status`/`wait`/`clean` 仅检查累计改动清单中的路径，按类型、大小和哈希比较源工作树与同事结束时的最终内容，执行位也须一致，删除路径须在源中不存在；不要求提交进 HEAD。全部包含时写 `.applied` 并记 `appliedBy: "detected"`，短行“已合入（主干已含改动）”，`next` 改为清理建议，`clean --finished` 按已合入处理。仅部分包含或读取失败时视为未检测到，沿用原 apply 建议；检测不代表验收已在源中复跑。
 
