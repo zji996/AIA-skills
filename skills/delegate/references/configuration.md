@@ -47,7 +47,7 @@
 
 默认按完整 argv 的逐项、大小写敏感前缀匹配；尾部可以有更多参数。`exact: true` 必须 argv 完全相等且无多余参数：上述 `cargo xtask infra-test` 命中，`cargo xtask infra-test --filter db` 放行。`cargo xtask check --all` 命中前缀规则，`cargo --locked xtask check` 不命中，不忽略或重排 `+toolchain`、`--locked` 等全局参数。每条规则的 `argv` 非空，首项是程序名（字母、数字、`._-`，不能是路径或 `.`/`..`），其他项为字符串，`hint` 非空，`exact` 可选且为布尔值；字符串不能含 NUL。同程序多条规则按配置顺序匹配首条。
 
-启动时在 run 的 `agent-shims/` 为每个程序生成 shell shim，按原 PATH（含顶层 env.PATH）与同事工作目录解析真实程序的绝对路径，保留 cargo/rustup 等多调用符号链接的名称；真实程序缺失时，未命中的调用退出 127。只在同事进程的 PATH 最前面插入该目录，reply 继承规则。命中打印 hint 到 stderr，退出 77；未命中直接 exec，参数、stdin/stdout 与退出码透传。同事的 `lane` 继承 shim PATH，即使自己设置 `DELEGATE_ALLOW_HEAVY=1` 或 `DELEGATE_LANE_HELD=1` 仍会拒绝。`denied.log` 累计本轮各尝试的次数，结论 `denied: N`，短行显示“拦下 N 次全量检查”；未配置或空列表不生成 shim，不增加字段。
+启动时在 run 的 `agent-shims/` 为每个程序生成 shell shim，按原 PATH（含顶层 env.PATH）与同事工作目录解析真实程序的绝对路径，保留 cargo/rustup 等多调用符号链接的名称；真实程序缺失时，未命中的调用退出 127。只在同事进程的 PATH 最前面插入该目录，reply 继承规则。命中打印 hint 到 stderr，退出 77；未命中直接 exec，参数、stdin/stdout 与退出码透传。同事的 `lane` 继承 shim PATH，即使自己设置 `DELEGATE_ALLOW_HEAVY=1` 或 `DELEGATE_LANE_HELD=1` 仍会拒绝。`denied.log` 累计本轮各尝试的次数，结论 `denied: N`，短行显示“拦下 N 次全量检查”；未配置或空列表不生成 deny 规则，不增加 denied 字段；进程匹配的三个 shim 始终生成。
 
 验收、证据、setup、收尾生成核对、apply 的生成与 applyVerify 都由未注入 shim 的执行环境运行，主控自己的 lane 同理。没有环境放行开关或可交给同事的令牌。威胁模型是防误用，不是防恶意：同 UID 进程可以改 PATH、用绝对路径或改 shim/记录，这不是安全沙箱。
 

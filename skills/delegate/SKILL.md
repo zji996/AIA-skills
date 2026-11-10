@@ -1,10 +1,10 @@
 ---
 name: delegate
-description: 把可独立验收的任务交给同事 Agent 在后台并行完成，你只收结果并把关。遇到这些情况时主动使用，不必等用户开口：要读很多文件但只需结论；改动前想要第二意见或独立审查；有两个以上互不依赖、能用命令验收的子任务；需要有人看截图或设计图给意见。同事都是 Pi，按用途 scout（只读侦察）、review（只读严密审查）、write（写代码带验收）派发；也可用 models 别名指定模型，thinking 独立选。脚本代跑验收命令，只给一行结论与下一步，过程不进主控上下文；容量满会排队，重检查也限流。Use to delegate or parallelize work proactively to Pi colleagues, and to get a second opinion, code review or image review from another model, judged by results.
+description: 把可独立验收的任务交给同事 Agent 在后台并行完成，你只收结果并把关。遇到这些情况时主动使用，不必等用户开口：要读很多文件但只需结论；改动前想要第二意见或独立审查；有两个以上互不依赖、能用命令验收的子任务；需要有人看截图或设计图给意见。同事都是 Pi，按用途 scout（只读侦察）、review（只读严密审查）、write（写代码带验收）派发；也可用 models 别名指定模型与默认 thinking；fit 适配卡记录四类任务的首选，新模型按同题重评。脚本代跑验收命令，只给一行结论与下一步，过程不进主控上下文；容量满会排队，重检查也限流。Use to delegate or parallelize work proactively to Pi colleagues, and to get a second opinion, code review or image review from another model, judged by results.
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI（pi-kit 的 rpi 通道下 `pi` 即 rpi）。
 metadata:
-  version: "6.15.0"
+  version: "6.16.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -42,7 +42,23 @@ $D wait                                                                  # 放�
 
 三个独立维度：`--tier scout|review|write` 选用途（scout 侦察/摘要/找文件/文案，review 严密审查/根因/第二意见，write 改代码带验收）；`--model <别名>` 从配置 `models` 指定模型，可与 `--tier` 同用；`--thinking off|minimal|low|medium|high|xhigh` 选思维长度，不再写进模型名。省略用途与模型时，写入推断 write、只读推断 review，回显提醒且状态标「推断」；scout/review 只读，`--shell` 可查日志/跑只读查询。图片只检查最终模型的 Pi images 声明，不改选模型。上游瞬时失败先同会话续做，仍失败且未改文件才换本档下一个模型；固定模型不换。首次使用用 `$D tiers --alias name=provider/id --scout name --review name --write name --thinking high` 登记并配齐三档；只选已登记的模型，细节见 [references/configuration.md](references/configuration.md)。
 
+强模型按任务性质选思考档，不是一律 high；别名可配 `{"model":"provider/id","thinking":"medium"}` 作为默认。
+规格写死的实现（前端、逐项改批量、修测试、只读查代码）用 medium；内核/账本、并发时序、沙箱安全、迁移、找根因用 high。
+便宜模型保持配置默认；拿不准先 medium，返工一次就升 high。
+优先级：环境变量 > `--thinking` > 档位规则 > 别名默认 > 顶层 thinking > Pi 默认，启动回显生效档及来源。
+
+### 模型适配卡
+
+四类固定：`scout` 侦察（只读代码/数据/根因/审查）；`build` 按规格实现（后端/测试/批量化/机械前端）。
+`hard` 疑难改动（内核账本/并发时序/沙箱安全/迁移）；`design` 界面实现（照主控定稿把界面做进产品）。
+设计归主控：界面的结构、取舍、文案与观感由主控自己画成设计稿，不委派；`design` 类的说明里给设计稿源码路径，观感仍由主控看截图收尾。
+同类任务首次把同份规格各派一路对比 → `$D fit set <类别> <别名> first|ok|avoid "一句话" --sample <规格文件>` 记结论 → 之后直接派首选。
+`$D fit` 查看四类卡与未评项，`--json` 看完整 note/sample；记录在用户配置目录的 `fit.json`，每格仅留最新一句（上限 80 字符）。
+配置新增别名会列为未评，用各类别记录的 sample 重跑即可；`start --class <类别>` 提示避用、首选与未评，不拦派发。
+
 ## 任务说明
+
+同事的 `pkill`/`killall`/`pgrep` 仅匹配本次 run 的全部已记录 scope；无可用 cgroup 时提示改用启动时保存的 `kill <pid>`，只读 `--shell` 同样生效。
 
 同事看不到你的会话：写清目标、能改的范围、完成标准（最好是验收命令，复杂的写成脚本）和已知事实。仓库每次都要说的话放进 `.delegate.json` 的 `standing`，见 [references/configuration.md](references/configuration.md)。
 

@@ -26,7 +26,8 @@ const LAUNCH: &[(&str, &str)] = &[
     ("--provider NAME", "Pi provider for --model."),
     ("--model ALIAS", "Exact registered alias or full id, else unique case-insensitive substring of aliases/full ids in config models. Unregistered Pi models are never candidates. May combine with --tier; pins the model and disables automatic model changes. Do not append :thinking."),
     ("--overflow next|queue", "At model capacity: queue for the selected model (default), or explicitly allow the next tier candidate. Overrides rule overflow for this launch; pinned --model still queues."),
-    ("--thinking LEVEL", "off|minimal|low|medium|high|xhigh. Environment > CLI > tier rule > config thinking > Pi default; independent of the model name."),
+    ("--class scout|build|hard|design", "Show user-local fit card advice for this task class; advisory only (delegate fit)."),
+    ("--thinking LEVEL", "off|minimal|low|medium|high|xhigh. Environment > CLI > tier rule > alias thinking > config thinking > Pi default; independent of the model name."),
     ("--allow-parallel-writes", "Allow concurrent write runs in one workdir."),
     ("--worktree", "Write in a detached git worktree seeded from the current tree; merge with apply."),
     ("--after RUN", "Wait for RUN to finish successfully before starting this step; waiting uses no active slot. A write step after a write run starts from RUN's changes; apply RUN first."),
@@ -101,6 +102,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("lane", "Queue a heavy command with other machine checks."),
     ("stop", "Terminate runs."),
     ("clean", "Delete finished runs."),
+    ("fit", "Show or update the four-class model suitability card (fit set; fit --json)."),
     (
         "tiers",
         "Show purpose rules and registered aliases with Pi capabilities; configure --scout/--review/--write, --alias, --thinking.",
@@ -208,6 +210,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("--json", "Print deletion counts and orphan container cleanup as JSON lines."),
         ]),
         "tiers" => ("[--scout ALIAS] [--review ALIAS] [--write ALIAS] [--alias NAME=provider/id] [--thinking LEVEL]", "Print each purpose's rules (alias, full id, thinking) and registered aliases with Pi context/images/thinking capabilities. The final line counts unregistered Pi models without listing them. Settings validate and atomically update user config; --alias is repeatable. All three tiers must resolve for start/run/reply. Old tiers and model :thinking suffixes are unsupported: register aliases, configure the three purposes and move suffixes into thinking.", &[]),
+        "fit" => ("[--json] | set CLASS ALIAS first|ok|avoid NOTE [--sample FILE]", "Four fixed classes (scout/build/hard/design); user-local fit.json stores only the latest verdict per alias/class, with an 80-character one-line note. Setting first demotes the previous first to ok. Missing evaluations are listed; --json shows full notes and samples.", &[]),
         "probe" => ("[--tier scout|review|write] [--model ALIAS] [--timeout SECONDS]", "Probe only registered models, deduplicated by full id, through the same Pi binary/environment/providers as start. Show ok/FAIL, elapsed/first-token time, matching tier rules and Pi's first error. No worktree, run directory or capacity slot. Exit 1 if an inferred-purpose pick fails, 0 otherwise, 2 for usage.", &[
             ("--tier scout|review|write", "Probe only this tier's registered candidates, including inactive rules."),
             ("--model ALIAS", "Probe one registered model instead; exclusive with --tier."),

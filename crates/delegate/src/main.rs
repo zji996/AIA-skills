@@ -4,6 +4,7 @@ mod cleanup;
 mod common;
 mod config;
 mod deny;
+mod fit;
 mod help;
 mod lane;
 mod launch;
@@ -12,6 +13,7 @@ mod models;
 mod output;
 mod pool;
 mod probe;
+mod process_match;
 mod queue;
 mod resources;
 mod runs;
@@ -1625,6 +1627,8 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "stop" => stop(rest),
         "clean" => clean(rest),
         "tiers" => tiers(rest),
+        "fit" => fit::command(rest),
+        "_process-match" => process_match::command(rest),
         "probe" => probe::command(rest),
         "protocol" => {
             if let Some(arg) = rest.first() {
@@ -1689,7 +1693,7 @@ fn tiers(args: &[String]) -> Res<i32> {
         config::validate(&user, &path, false)?;
         // Validate before the atomic write, including every alias and inactive rule.
         if let Some(aliases) = user["models"].as_object() {
-            for id in aliases.values().filter_map(Value::as_str) {
+            for id in aliases.values().filter_map(models::alias_model) {
                 models::resolve_model(id, &user, &listed)?;
             }
         }
@@ -1743,7 +1747,7 @@ fn tiers(args: &[String]) -> Res<i32> {
     println!("aliases: name → model | context | images | thinking");
     if let Some(aliases) = config.value["models"].as_object() {
         for (name, id) in aliases {
-            let id = id.as_str().unwrap_or("");
+            let id = crate::models::alias_model(id).unwrap_or("");
             if let Some(model) = listed.iter().find(|m| m.name == id) {
                 println!(
                     "  {name} → {id} | {} | {} | {}",

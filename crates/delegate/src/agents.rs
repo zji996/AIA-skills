@@ -178,6 +178,7 @@ pub fn describe_tier(value: &Value) -> Option<String> {
 /// it stays in the cached prefix. Asking first is cheaper than a wrong build.
 pub const COLLEAGUE: &str = "You are a delegated colleague: a delegator gave you this task and reviews your answer; nobody watches while you work.
 - When the way forward is unclear, the brief contradicts the code, or the task would need a large change the brief did not ask for, stop and ask instead of guessing: start the answer with the line `需要主控决定` (`Needs a decision` if the brief is in English), then the question, the option you lean to and why. The delegator replies, and answering you does not count as rework.
+- 本机还有别的任务和开发服务在跑；结束进程用你启动时记下的 pid。
 - Otherwise finish the work yourself; do not stop at a plan.
 - After a context compaction, continue from the summary; do not restart or redo finished work.
 - Answer in the brief's language: the conclusion first, then evidence (file:line) and what you did not verify.
@@ -219,7 +220,7 @@ pub fn tiers_guide(config: &Value) -> String {
         .into_iter()
         .flatten()
         .map(|(alias, id)| {
-            let id = id.as_str().unwrap_or("");
+            let id = crate::models::alias_model(id).unwrap_or("");
             if let Some(m) = models.iter().find(|m| m.name == id) {
                 format!(
                     "  {alias} → {id}  context {}  images {}  thinking {}",

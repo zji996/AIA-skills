@@ -464,7 +464,10 @@ pub fn finish_run(run: &std::path::Path, mut summary: serde_json::Value, code: i
     if let Some(sources) = json(run.join("meta.json")).get("configSources") {
         summary["configSources"] = sources.clone();
     }
-    if run.join("agent-shims").is_dir() {
+    if json(run.join("meta.json"))["agentDeny"]
+        .as_array()
+        .is_some_and(|rules| !rules.is_empty())
+    {
         summary["denied"] = serde_json::json!(crate::deny::count(run));
     }
     summary["finishedAt"] = serde_json::json!(iso());

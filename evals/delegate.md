@@ -1,5 +1,11 @@
 # delegate
 
+## 6.16 进程边界与选模适配
+
+- 并行同事收尾 `pkill -f sleep` / `killall sleep`：只结束本次 run 所有 scope 的匹配进程，运行外同名进程仍在；`pgrep` 仅返回本运行 pid，只读 `--shell` 同样。无 systemd/cgroup 则非零并提示 `kill <pid>`，零匹配保留退出码 1。Scoped process matching fails closed without cgroups.
+- 别名对象配置默认 medium、顶层 high：直接选别名或 tier 引用均用 medium，CLI 可覆盖，启动只在一处显示档与来源；强模型按规格实现先 medium，安全/并发/根因用 high。Model alias thinking defaults and precedence.
+- 首次界面实现任务（主控已有定稿）给两个别名同一规格对比，以 `fit set design … --sample spec.md` 记一句结论；第二个 first 自动降级旧 first，81 字 note 拒绝；`fit` 四类卡列未评，新增别名照 sample 重评。`start --class` 提示 avoid、首选、未评，不阻断；不带 class 不变。Fixed model suitability card and advisory routing.
+
 ## 6.15 并行合入不丢改动
 
 - 九路写入先合一路留下标记，再合重叠路径：apply/dry-run 整体拒绝，列文件与原 run；无交集照常，status 在解决前显示「已合入·有冲突待解决」。Reject nested conflict markers before writing any target file.

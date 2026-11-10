@@ -639,7 +639,7 @@ fn scope_dirs(root: &Path, pids: &mut BTreeSet<i32>) {
     }
 }
 
-fn scopes(run: &Path) -> Vec<(String, PathBuf, BTreeSet<i32>)> {
+pub(crate) fn scopes(run: &Path) -> Vec<(String, PathBuf, BTreeSet<i32>)> {
     if !run.join("scopes").is_file() {
         return Vec::new();
     }

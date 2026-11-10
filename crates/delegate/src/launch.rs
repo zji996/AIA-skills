@@ -23,6 +23,7 @@ pub struct Options {
     pub model_name: Option<String>,
     pub overflow: Option<String>,
     pub thinking_cli: Option<String>,
+    pub class: Option<String>,
     pub agent_pinned: bool,
     /// The model came from a tier rather than `--model` or the run being continued,
     /// so `launch` may pick again once it counts the machine's runs (`maxActive`).
@@ -158,6 +159,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             "--provider",
             "--model",
             "--thinking",
+            "--class",
             "--overflow",
             "--max",
             "--after",
@@ -220,6 +222,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 }
                 "--provider" => o.provider = Some(v),
                 "--model" => o.model = Some(v),
+                "--class" => { crate::fit::validate_class(&v)?; o.class = Some(v); },
                 "--thinking" => { models::validate_thinking(&v)?; o.thinking = Some(v.clone()); o.thinking_cli = Some(v); },
                 "--max" => o.max = Some(seconds(&v)?),
                 "--after" => o.after = Some(v),
@@ -380,8 +383,8 @@ fn apply_tier_model(o: &mut Options, config: &Value) -> Res<Value> {
         let name = o.model.as_deref().unwrap_or("");
         let model = models::resolve_model(name, config, &listed)?;
         o.model_name = Some(name.into());
+        o.thinking = models::thinking(o.thinking_cli.as_deref(), &json!(name), config)?;
         o.model = Some(model);
-        o.thinking = models::thinking(o.thinking_cli.as_deref(), &Value::Null, config)?;
     } else {
         let pick = models::pick(
             config,
@@ -1701,7 +1704,29 @@ pub fn launch(
         if inherited { "（已有会话）" } else { "" }
     );
     let model = o.model.as_deref().unwrap_or("（Pi 默认）");
-    let level = o.thinking.as_deref().unwrap_or("Pi 默认");
+    let rule = if o.tier_picked {
+        models::tier_rules(&extra["tierConfig"], o.tier.as_deref().unwrap_or("review"))
+            .into_iter()
+            .nth(extra["tierCandidateIndex"].as_u64().unwrap_or(0) as usize)
+            .unwrap_or(Value::Null)
+    } else {
+        json!(o.model_name)
+    };
+    let source = if parent_path.is_some()
+        && !o.tier_picked
+        && !o.agent_pinned
+        && o.thinking_cli.is_none()
+        && setting("THINKING", "").is_empty()
+    {
+        "原会话"
+    } else {
+        models::thinking_source(o.thinking_cli.as_deref(), &rule, &extra["tierConfig"])
+    };
+    let level = format!(
+        "{}〔{}〕",
+        o.thinking.as_deref().unwrap_or("Pi 默认"),
+        source
+    );
     if o.tier_inferred && o.tier_picked {
         eprintln!(
             "{}",
@@ -1710,7 +1735,7 @@ pub fn launch(
                 o.model_name.as_deref().unwrap_or(model),
                 model,
                 o.thinking.as_deref()
-            )
+            ) + &format!("〔{source}〕")
         );
     } else if parent_path.is_some() && !o.tier_picked && !o.agent_pinned {
         eprintln!("delegate: 沿用原会话的模型 {model}，thinking {level}");
@@ -1723,6 +1748,22 @@ pub fn launch(
         );
     }
 
+    if let Some(class) = &o.class {
+        match crate::fit::notices(
+            class,
+            o.model_name.as_deref().unwrap_or(model),
+            &extra["tierConfig"],
+        ) {
+            Ok(notices) => {
+                for notice in notices {
+                    eprintln!("delegate: {notice}");
+                }
+            }
+            Err(error) => {
+                eprintln!("delegate: 适配卡未读取（{error}）；请检查 delegate fit --json")
+            }
+        }
+    }
     if extra["defaults"].as_object().is_some_and(|d| !d.is_empty()) {
         eprintln!("delegate: 生效默认值及来源 {}", extra["defaults"]);
     }

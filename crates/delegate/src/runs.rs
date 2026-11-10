@@ -502,7 +502,10 @@ pub fn status(run: &Path) -> Value {
         out["acceptBlind"] = json!(blind);
     }
     let result = run.join("result.md");
-    if run.join("agent-shims").is_dir() {
+    if meta["agentDeny"]
+        .as_array()
+        .is_some_and(|rules| !rules.is_empty())
+    {
         out["denied"] = json!(crate::deny::count(run));
     }
     if result.is_file() && fs::metadata(&result).is_ok_and(|m| m.len() > 0) {

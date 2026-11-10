@@ -430,7 +430,7 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="cargo xtask check")
         state = self.outcome(self.cli("run", "--workdir", repo, "task"))
         self.assertNotIn("denied", state)
-        self.assertFalse((Path(state["dir"]) / "agent-shims").exists())
+        self.assertTrue((Path(state["dir"]) / "agent-shims/pkill").exists())
         for rules in ({}, [{"argv": [], "hint": "no"}],
                       [{"argv": ["../cargo"], "hint": "no"}],
                       [{"argv": ["cargo", 1], "hint": "no"}],
@@ -535,6 +535,192 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
         meta = json.loads((Path(continued["dir"]) / "meta.json").read_text())
         self.assertEqual(meta["continuation"], "timeout")
         self.assertEqual(meta["rework"]["used"], 0)
+
+    def process_match_fixture(self, command, cgroup=True, shell=False):
+        import shutil
+        if cgroup:
+            if not shutil.which("systemd-run"):
+                self.skipTest("systemd-run unavailable")
+            probe = subprocess.run(["systemd-run", "--user", "--scope", "--quiet", "--", "true"],
+                                   env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if probe.returncode:
+                self.skipTest("systemd user scope unavailable")
+            if "--cgroup" not in subprocess.run(["pkill", "--help"], capture_output=True, text=True).stdout:
+                self.skipTest("procps --cgroup unavailable")
+            (self.bin / "systemctl").unlink()
+        else:
+            self.env["DELEGATE_CGROUP"] = "0"
+        outside = subprocess.Popen(["sleep", "300"], env=self.env)
+        self.addCleanup(lambda: (outside.terminate(), outside.wait()) if outside.poll() is None else None)
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre='''
+sleep 300 & inside=$!
+printf '%s' "$inside" > "$DELEGATE_RUN_DIR/inside"
+''' + '{ ' + command + '; }' + ''' > "$DELEGATE_RUN_DIR/matched" 2> "$DELEGATE_RUN_DIR/match-error"
+printf '%s' "$?" > "$DELEGATE_RUN_DIR/match-code"
+sleep .05
+if kill -0 "$inside" 2>/dev/null; then echo alive; else echo gone; fi > "$DELEGATE_RUN_DIR/inside-state"
+kill "$inside" 2>/dev/null || :
+wait "$inside" 2>/dev/null || :
+''')
+        args = ["--read-only", "--shell", "--workdir", self.repo({"a.txt": "a\n"})] if shell else []
+        state = self.outcome(self.cli("run", *args, "task"))
+        self.assertEqual(state["state"], "answered")
+        self.assertIsNone(outside.poll(), "outside sleep must survive")
+        return Path(state["dir"])
+
+    def test_scoped_pkill_kills_only_run_sleep(self):
+        run = self.process_match_fixture("pkill -f sleep")
+        self.assertEqual((run / "inside-state").read_text().strip(), "gone")
+        self.assertEqual((run / "match-error").read_text(), "")
+
+    def test_scoped_killall_kills_only_run_sleep(self):
+        run = self.process_match_fixture("killall sleep")
+        self.assertEqual((run / "inside-state").read_text().strip(), "gone")
+        self.assertEqual((run / "match-error").read_text(), "")
+
+    def test_scoped_pgrep_lists_only_run_sleep(self):
+        run = self.process_match_fixture("pgrep -f sleep")
+        self.assertEqual((run / "matched").read_text().split(), [(run / "inside").read_text()])
+        self.assertEqual((run / "match-code").read_text(), "0")
+
+    def test_process_match_without_cgroup_fails_closed(self):
+        for tool in ("pkill -f sleep", "killall sleep", "pgrep -f sleep"):
+            with self.subTest(tool=tool):
+                run = self.process_match_fixture(tool, cgroup=False)
+                self.assertNotEqual((run / "match-code").read_text(), "0")
+                self.assertIn("kill <pid>", (run / "match-error").read_text())
+                self.assertEqual((run / "inside-state").read_text().strip(), "alive")
+
+    def test_read_only_shell_has_process_shims(self):
+        run = self.process_match_fixture("pgrep -f sleep", shell=True)
+        self.assertEqual((run / "matched").read_text().split(), [(run / "inside").read_text()])
+
+    def test_alias_object_parses_and_tier_uses_default(self):
+        self.user_config({"models": {"main": {"model": "p/m", "thinking": "medium"}},
+                          "tiers": {"scout": "main", "review": "main", "write": "main"}})
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
+        state = self.outcome(self.cli("run", "--tier", "write", "task"))
+        self.assertEqual((self.meta(state)["model"], self.meta(state)["thinking"]), ("p/m", "medium"))
+
+    def alias_thinking_run(self, *args):
+        self.user_config({"models": {"main": {"model": "p/m", "thinking": "medium"}}, "thinking": "high"})
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
+        return self.cli("run", "--model", "main", *args, "task")
+
+    def test_cli_thinking_beats_alias_default(self):
+        self.assertEqual(self.meta(self.outcome(self.alias_thinking_run("--thinking", "low")))["thinking"], "low")
+
+    def test_alias_thinking_beats_config_default(self):
+        self.assertEqual(self.meta(self.outcome(self.alias_thinking_run()))["thinking"], "medium")
+
+    def test_start_echo_has_effective_thinking_and_source(self):
+        result = self.alias_thinking_run()
+        self.assertIn("thinking medium〔别名〕", result.stderr)
+
+    def fit_set(self, category="build", alias="main", verdict="ok", note="good", *args):
+        return self.cli("fit", "set", category, alias, verdict, note, *args)
+
+    def fit_card(self):
+        result = self.cli("fit", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_fit_rejects_long_note(self):
+        result = self.fit_set(note="字" * 81)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("80", result.stderr)
+
+    def test_fit_overwrites_record(self):
+        self.assertEqual(self.fit_set().returncode, 0)
+        self.assertEqual(self.fit_set(verdict="avoid", note="new").returncode, 0)
+        self.assertEqual(self.fit_card()["build"]["main"]["note"], "new")
+        self.assertEqual(len(self.fit_card()["build"]), 1)
+
+    def test_fit_first_auto_demotes(self):
+        self.assertEqual(self.fit_set(verdict="first").returncode, 0)
+        result = self.fit_set(alias="ds", verdict="first")
+        self.assertIn("main 自动降为 ok", result.stdout)
+        self.assertEqual(self.fit_card()["build"]["main"]["verdict"], "ok")
+
+    def test_fit_table_lists_unreviewed(self):
+        self.fit_set()
+        result = self.cli("fit")
+        for text in ("scout", "build", "hard", "design", "ok · good", "—", "还没评过的", "build × ds"):
+            self.assertIn(text, result.stdout)
+        self.assertEqual(len(result.stdout.splitlines()), 6)
+
+    def fit_start(self, verdict):
+        self.fit_set(verdict=verdict, note="too risky")
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
+        return self.cli("run", "--model", "main", "--class", "build", "task")
+
+    def test_start_class_warns_avoid(self):
+        result = self.fit_start("avoid")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("avoid：too risky", result.stderr)
+
+    def test_start_class_names_first(self):
+        self.fit_set(alias="ds", verdict="first")
+        self.assertIn("该类首选是 ds", self.fit_start("ok").stderr)
+
+    def test_start_class_suggests_comparison(self):
+        self.assertIn("首次遇到这类任务可各派一路对比：delegate fit", self.fit_start("ok").stderr)
+
+    def test_missing_fit_file_does_not_change_start(self):
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
+        result = self.cli("run", "--model", "main", "task")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("delegate fit", result.stderr)
+        self.assertEqual(self.fit_card(), {})
+
+    def test_scoped_zero_matches_keeps_exit_one_and_silence(self):
+        run = self.process_match_fixture("pgrep -f delegate-no-such-process-unique")
+        self.assertEqual((run / "match-code").read_text(), "1")
+        self.assertEqual((run / "matched").read_text(), "")
+        self.assertEqual((run / "match-error").read_text(), "")
+
+    def test_scoped_pgrep_preserves_explicit_filters(self):
+        run = self.process_match_fixture('pgrep --cgroup "$(head -1 "$DELEGATE_RUN_DIR/scopes")" --ns $$ -P $$ -s 0 -f sleep')
+        self.assertEqual((run / "match-code").read_text(), "0")
+        self.assertEqual((run / "matched").read_text().split(), [(run / "inside").read_text()])
+
+    def test_scoped_killall_signal_option(self):
+        run = self.process_match_fixture("killall -s TERM sleep")
+        self.assertEqual((run / "match-code").read_text(), "0")
+        self.assertEqual((run / "inside-state").read_text().strip(), "gone")
+
+    def test_fit_sample_record(self):
+        result = self.fit_set("design", "main", "first", "good", "--sample", "page-spec.md")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.fit_card()["design"]["main"]
+        self.assertEqual(entry["sample"], "page-spec.md")
+        self.assertRegex(entry["date"], r"^\d{4}-\d{2}-\d{2}$")
+
+    def test_fit_rejects_unknown_alias(self):
+        result = self.fit_set(alias="unregistered")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown alias", result.stderr)
+
+    def test_missing_fit_file_with_class_is_only_advisory(self):
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
+        result = self.cli("run", "--model", "main", "--class", "hard", "task")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("delegate fit", result.stderr)
+
+    def test_scoped_match_includes_other_recorded_run_scope(self):
+        command = r'''unit=$(head -1 "$DELEGATE_RUN_DIR/scopes" | sed 's/\.scope$/-peer.scope/');
+printf '%s\n' "$unit" >> "$DELEGATE_RUN_DIR/scopes";
+systemd-run --user --scope --quiet --collect --unit="$unit" -- sh -c 'echo $$ > "$DELEGATE_RUN_DIR/peer-pid"; exec sleep 300' >/dev/null 2>&1 & peer=$!;
+n=0; while [ ! -f "$DELEGATE_RUN_DIR/peer-pid" ] && [ "$n" -lt 100 ]; do sleep .05; n=$((n+1)); done;
+test -s "$DELEGATE_RUN_DIR/peer-pid" || exit 7;
+pkill -x sleep;
+sleep .05;
+if kill -0 "$(cat "$DELEGATE_RUN_DIR/peer-pid")" 2>/dev/null; then echo alive; kill "$(cat "$DELEGATE_RUN_DIR/peer-pid")"; else echo gone; fi;
+wait "$peer" 2>/dev/null || :'''
+        run = self.process_match_fixture(command)
+        self.assertEqual((run / "inside-state").read_text().strip(), "gone")
+        self.assertEqual((run / "matched").read_text().strip(), "gone")
+
 
 if __name__ == "__main__":
     unittest.main()

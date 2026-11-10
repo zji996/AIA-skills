@@ -56,16 +56,44 @@ pub fn validate_thinking(level: &str) -> Res<()> {
 
 /// The configured alias table is the whole selectable universe. Pi contributes
 /// validation and capability metadata only, never unregistered candidates.
+pub fn alias_model(value: &Value) -> Option<&str> {
+    value.as_str().or_else(|| value["model"].as_str())
+}
+
+/// Preserve exact aliases (including distinct defaults for the same model),
+/// otherwise map the resolved identity back to a registered alias.
+pub fn selected_alias<'a>(input: &'a str, config: &'a Value) -> &'a str {
+    let Some(aliases) = config["models"].as_object() else {
+        return input;
+    };
+    if aliases.contains_key(input) {
+        return input;
+    }
+    if let Some((name, _)) = aliases
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(input))
+    {
+        return name;
+    }
+    let Ok(id) = resolve_model(input, config, &[]) else {
+        return input;
+    };
+    aliases
+        .iter()
+        .find(|(_, v)| alias_model(v) == Some(id.as_str()))
+        .map_or(input, |(name, _)| name)
+}
+
 pub fn resolve_model(input: &str, config: &Value, listed: &[PiModel]) -> Res<String> {
     validate_model(input)?;
     let aliases = config["models"].as_object();
-    if let Some(id) = aliases.and_then(|a| a.get(input)).and_then(Value::as_str) {
+    if let Some(id) = aliases.and_then(|a| a.get(input)).and_then(alias_model) {
         return check_full(id, listed);
     }
     let entries = aliases
         .into_iter()
         .flatten()
-        .filter_map(|(name, id)| id.as_str().map(|id| (name.as_str(), id)))
+        .filter_map(|(name, id)| alias_model(id).map(|id| (name.as_str(), id)))
         .collect::<Vec<_>>();
     if entries.iter().any(|(_, id)| *id == input) {
         return check_full(input, listed);
@@ -103,7 +131,7 @@ pub fn unregistered_count(config: &Value, listed: &[PiModel]) -> usize {
                 .as_object()
                 .into_iter()
                 .flatten()
-                .any(|(_, id)| id.as_str() == Some(&m.name))
+                .any(|(_, id)| alias_model(id) == Some(&m.name))
         })
         .count()
 }
@@ -149,18 +177,37 @@ impl Pick {
     }
 }
 
-/// Environment > command line > rule > top-level config > Pi's default.
+/// Environment > command line > rule > alias default > config > Pi's default.
 pub fn thinking(cli: Option<&str>, rule: &Value, config: &Value) -> Res<Option<String>> {
     let env = setting("THINKING", "");
+    let alias = selected_alias(rule.as_str().unwrap_or_else(|| s(rule, "model")), config);
     let value = (!env.is_empty())
         .then_some(env.as_str())
         .or(cli)
         .or_else(|| rule["thinking"].as_str())
+        .or_else(|| config["models"][alias]["thinking"].as_str())
         .or_else(|| config["thinking"].as_str());
     if let Some(level) = value {
         validate_thinking(level)?;
     }
     Ok(value.map(str::to_string))
+}
+
+pub fn thinking_source(cli: Option<&str>, rule: &Value, config: &Value) -> &'static str {
+    let alias = selected_alias(rule.as_str().unwrap_or_else(|| s(rule, "model")), config);
+    if !setting("THINKING", "").is_empty() {
+        "环境"
+    } else if cli.is_some() {
+        "CLI"
+    } else if rule["thinking"].is_string() {
+        "档位规则"
+    } else if config["models"][alias]["thinking"].is_string() {
+        "别名"
+    } else if config["thinking"].is_string() {
+        "配置"
+    } else {
+        "Pi 默认"
+    }
 }
 
 pub fn candidate(rule: &Value, config: &Value, cli: Option<&str>, listed: &[PiModel]) -> Res<Pick> {
@@ -388,6 +435,39 @@ mod tests {
             "spot/deepseek"
         );
         std::env::remove_var("DELEGATE_REVIEW_MODEL");
+    }
+    #[test]
+    fn alias_object_validation_and_resolution() {
+        let _guard = ENV.lock().unwrap();
+        let c = json!({"models":{"sol":{"model":"provider/gpt-sol","thinking":"medium"}}});
+        crate::config::validate(&c, std::path::Path::new("config.json"), false).unwrap();
+        assert_eq!(
+            resolve_model("sol", &c, &listed()).unwrap(),
+            "provider/gpt-sol"
+        );
+        assert_eq!(
+            resolve_model("gpt-", &c, &listed()).unwrap(),
+            "provider/gpt-sol"
+        );
+        assert_eq!(unregistered_count(&c, &listed()), 3);
+    }
+    #[test]
+    fn alias_default_precedence() {
+        let _guard = ENV.lock().unwrap();
+        std::env::remove_var("DELEGATE_THINKING");
+        let c = json!({"models":{"sol":{"model":"provider/gpt-sol","thinking":"medium"}},"thinking":"high"});
+        let rule = json!("sol");
+        assert_eq!(
+            thinking(None, &rule, &c).unwrap().as_deref(),
+            Some("medium")
+        );
+        assert_eq!(thinking_source(None, &rule, &c), "别名");
+        assert_eq!(
+            thinking(Some("low"), &rule, &c).unwrap().as_deref(),
+            Some("low")
+        );
+        let rule = json!({"model":"sol","thinking":"off"});
+        assert_eq!(thinking(None, &rule, &c).unwrap().as_deref(), Some("off"));
     }
     #[test]
     fn inference_notice_and_same_tier_next_candidate() {

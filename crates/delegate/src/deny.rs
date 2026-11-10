@@ -113,9 +113,6 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<()> {
     for program in measures.keys() {
         programs.entry(program).or_default();
     }
-    if programs.is_empty() {
-        return Ok(());
-    }
     let dir = run.join("agent-shims");
     fs::create_dir(&dir).map_err(|e| e.to_string())?;
     let resource_dir = run.join("resource-shims");
@@ -123,6 +120,7 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<()> {
     let measure_dir = run.join("measure-shims");
     fs::create_dir(&measure_dir).map_err(|e| e.to_string())?;
     let path = original_path(meta);
+    crate::process_match::prepare(run, &path)?;
     for (program, rules) in programs {
         let mut body = "#!/bin/sh\n".to_string();
         for rule in &rules {
@@ -144,7 +142,11 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<()> {
                 shell_quote(s(rule, "hint")),
             ));
         }
-        let real = resolve(program, &path, Path::new(s(meta, "workdir")));
+        let real = if ["pkill", "killall", "pgrep"].contains(&program) {
+            Some(dir.join(format!(".process-{program}")))
+        } else {
+            resolve(program, &path, Path::new(s(meta, "workdir")))
+        };
         let mut resource_body = "#!/bin/sh\n".to_string();
         for (name, argv) in resources.get(program).into_iter().flatten() {
             let mut condition = format!("[ \"$#\" -ge {} ]", argv.as_array().unwrap().len() - 1);
