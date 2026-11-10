@@ -18,12 +18,13 @@
 - 根目录首次创建时写入只含 `*` 的 `.gitignore`，不污染 `git status`；run 目录权限为 `700`。
 - 整机并发登记放在 `${XDG_STATE_HOME}/delegate/`（未设变量时使用系统约定的用户状态目录）：每个运行中的任务一个 `*.slot` 文件，内容是其 run 目录；任务结束或目录被删后，下一次 `start` 自动清掉对应登记。这个位置刻意不提供 `DELEGATE_*` 覆盖，被委派的同事无法另起一个计数池。
 
-容量同时检查整机资源与仓库审查带宽：整机 `maxActive` 默认 12，仓库 `repoMaxActive` 默认 8。仓库键按规范化 git common dir（主仓库与其 worktree 共用），非 git 目录按规范化路径。仓库计数仍来自整机 slot，不另建池；旧 slot 只有 run 目录时从 meta 反查仓库，新 slot 可附仓库键，读 slot 失败沿用原处理。拒绝说明命中的层级、当前计数与上限，只列该层相关运行任务；`--after` 等待容量时两层都生效。
+整机/仓库防失控默认 32/0（不限），模型并发与内存不足自动排队；优先级、状态、重启语义见 [容量排队](capacity.md)。
 
 ## 文件
 
 | 文件 | 内容 |
 |---|---|
+| `.waiting` / `queue.json` | 延后启动标记 / 容量队原因、前方人数与入队时间；放行后 .waiting 移除 |
 | `meta.json` | 用途 `tier`/`tierInferred`、模型 `model`/`modelName`、`thinking`、`tierModels`/`tierCandidates`；同事与启动/验收参数；`standing`/`standingSources`、`defaults`、`share`、`resources`、`acceptBlind`、`resultDisplayChars`、`maxAnswer`；可选 `agentPinned`、`repoKey`、`evidenceCommand`/`evidenceTimeoutSeconds`/`evidence`；`protect` 字符串数组与可选 `protectReasons` 原因映射（reply/fresh 继承） |
 | `prompt.md` | 同事实际收到的任务说明；末尾可能附完成标准（`--accept`）与只读边界（worktree 里的只读任务） |
 | `events.jsonl` | 过滤后的全过程：读取、命令、编辑路径、错误、每轮模型与用量、重跑；不含编辑全文 |
@@ -67,10 +68,10 @@ worktree 移除回收 compose 容器。5.24 meta 新增 `sourceBuildBytes`、`so
 | 变量 | 作用 |
 |---|---|
 | `DELEGATE_RUNS` | run 根目录 |
-| `DELEGATE_MAX_ACTIVE` | 整机同时运行的任务上限，默认 12；`0` 不限 |
+| `DELEGATE_MAX_ACTIVE` | 整机防失控任务上限，默认 32；`0` 不限 |
 | `DELEGATE_MAX_HEAVY` | lane 同时放行的重命令数，默认 2；`0` 不限 |
-| `DELEGATE_REPO_MAX_ACTIVE` | 同仓库同时运行的任务上限，默认 8；`0` 不限 |
-| `DELEGATE_MIN_AVAILABLE_MB` | 可用内存低于该值（MB）时拒绝启动，默认 4096；`0` 不检查 |
+| `DELEGATE_REPO_MAX_ACTIVE` | 同仓库防失控任务上限，默认 0；`0` 不限 |
+| `DELEGATE_MIN_AVAILABLE_MB` | 可用内存低于该值（MB）时排队，默认 4096；`0` 不检查 |
 | `DELEGATE_CGROUP` | `0` 关闭 delegate 自建用户 systemd scope；默认自动探测。项目脚本自行启动的 user unit 仍按任务归属回收 |
 | `DELEGATE_TIMEOUT_GRACE` | 同事超时后仍在工作时的宽限百分比，默认 10 |
 | `DELEGATE_RUN_DIR` / `DELEGATE_LANE_HELD` | 由脚本导出：同事所在 run 目录（用于扣除排队时间）/ 已在 lane 名额内 |
@@ -78,9 +79,9 @@ worktree 移除回收 compose 容器。5.24 meta 新增 `sourceBuildBytes`、`so
 | `DELEGATE_KEEP_DAYS` | 自动清理天数，默认 7 |
 | `DELEGATE_SOURCE_BUILD_WARN_GIB` | 源仓库构建目录缓存占用提示阈值，默认 60 GiB；`0` 关闭，支持小数 |
 | `DELEGATE_WORKTREE_WARN_GIB` | 本仓库已结束 worktree 占用提示阈值，默认 20 GiB；`0` 关闭 |
-| `DELEGATE_POLL` | `wait --progress`、4.4 之前的 run 与刚启动的 supervisor 的检查间隔秒数，默认 1；其余等待不轮询 |
+| `DELEGATE_POLL` | `wait --progress`、4.4 之前的 run 与刚启动的 supervisor 的检查间隔秒数，默认 1；容量队每 100ms 复查，其余等待不轮询 |
 | `DELEGATE_PI_BIN` | 临时指定同事可执行文件；默认 PATH 上的 `pi`（Pi 或 rpi 由 pi-kit 通道定），续做沿用上一轮的 |
-| `DELEGATE_DEFAULT_MODEL` / `DELEGATE_CHEAP_MODEL` / `DELEGATE_STRONG_MODEL` | 档位对应的 Pi 模型，覆盖配置 `tiers`；空值视为未设，回落到配置 |
+| `DELEGATE_SCOUT_MODEL` / `DELEGATE_REVIEW_MODEL` / `DELEGATE_WRITE_MODEL` | 档位对应的 Pi 模型，覆盖配置 `tiers`；空值视为未设，回落到配置 |
 | `DELEGATE_AGENT` | 由脚本导出给同事（`pi`）；设有它的进程不能再委派 |
 | `PI_DELEGATE_ACTIVE` | 旧版标记，仍导出给 Pi；存在时视为 Pi 调用者 |
 | `DELEGATE_CALLER` | 主控会话标识，无参 `wait` 据此只收本会话的任务；未设时依次取 `CLAUDE_CODE_SESSION_ID`、`CODEX_THREAD_ID`、`PI_SESSION_ID`。`$D protocol` 显示当前取到的值与来源 |

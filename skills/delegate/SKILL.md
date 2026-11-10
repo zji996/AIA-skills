@@ -1,10 +1,10 @@
 ---
 name: delegate
-description: 把可独立验收的任务交给同事 Agent 在后台并行完成，你只收结果并把关。遇到这些情况时主动使用，不必等用户开口：要读很多文件但只需结论；改动前想要第二意见或独立审查；有两个以上互不依赖、能用命令验收的子任务；需要有人看截图或设计图给意见。同事都是 Pi，按用途 scout（只读侦察）、review（只读严密审查）、write（写代码带验收）派发；也可用 models 别名指定模型，thinking 独立选。脚本代跑验收命令，只给一行结论与下一步，过程不进主控上下文；整机与仓库容量、重检查有上限。Use to delegate or parallelize work proactively to Pi colleagues, and to get a second opinion, code review or image review from another model, judged by results.
+description: 把可独立验收的任务交给同事 Agent 在后台并行完成，你只收结果并把关。遇到这些情况时主动使用，不必等用户开口：要读很多文件但只需结论；改动前想要第二意见或独立审查；有两个以上互不依赖、能用命令验收的子任务；需要有人看截图或设计图给意见。同事都是 Pi，按用途 scout（只读侦察）、review（只读严密审查）、write（写代码带验收）派发；也可用 models 别名指定模型，thinking 独立选。脚本代跑验收命令，只给一行结论与下一步，过程不进主控上下文；容量满会排队，重检查也限流。Use to delegate or parallelize work proactively to Pi colleagues, and to get a second opinion, code review or image review from another model, judged by results.
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI（pi-kit 的 rpi 通道下 `pi` 即 rpi）。
 metadata:
-  version: "6.13.0"
+  version: "6.14.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -20,6 +20,8 @@ D=<本技能目录>/bin/delegate
 $D start --read-only "审查 apps/api 的错误处理，列真实缺陷并写文件:行号"   # 放出，可连放多个
 $D wait                                                                  # 放后台；下一个结束就返回，末行给出继续等的命令
 ```
+
+总路数、仓库路数、模型并发或内存不足时自动排队、不换模型；`status` 看排队原因与前方人数，`--json` 看 `queue`。只有愿意模型满时改用下一候选才加 `--overflow next`。
 
 每个任务回一条短行（状态、改动、验收、下一步）和答复。写入任务看 `$D diff <name>`，满意后 `$D apply <name>`。
 

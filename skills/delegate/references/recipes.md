@@ -90,7 +90,7 @@ done
 $D wait
 ```
 
-容量有两层：整机默认 12 个任务，每仓库 8；git worktree 与主仓库同计。超出时提示层级、计数和相关任务，先 `wait` 收一批再放。
+整机/仓库防失控上限默认 32/0（不限），git worktree 与主仓库同计；真正限流靠按模型并发、maxHeavy 与内存水位。满了照常返回 run id 自动排队，`status` 看原因和前方人数，不必重派；模型满默认等原模型，愿意溢出下一候选才加 `--overflow next`。
 
 ## 6. monorepo 的 worktree 配置
 

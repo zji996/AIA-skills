@@ -465,6 +465,14 @@ pub fn status(run: &Path) -> Value {
             }
         }
     }
+    if active(&st) {
+        if let Some(queue) = crate::queue::status(run) {
+            out["queue"] = queue;
+            out.as_object_mut().unwrap().remove("elapsedSeconds");
+        } else if run.join(".waiting").exists() {
+            out.as_object_mut().unwrap().remove("elapsedSeconds");
+        }
+    }
     if let Some(ahead) = crate::measure::waiting_ahead(run) {
         out["measureWaitingAhead"] = json!(ahead);
     }

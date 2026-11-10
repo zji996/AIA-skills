@@ -58,8 +58,8 @@ class V515Tests(unittest.TestCase):
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
         first = self.outcome(self.cli("run", "--workdir", repo, "task"))
         self.assertEqual(first["configSources"], ["user"])
-        self.assertEqual(self.meta(first)["configCapacity"], {"maxActive": 12, "maxHeavy": 2,
-                                                             "repoMaxActive": 8})
+        self.assertEqual(self.meta(first)["configCapacity"], {"maxActive": 32, "maxHeavy": 2,
+                                                             "repoMaxActive": 0})
         (repo / ".delegate.json").write_text(json.dumps({"accept": "true", "env": {"LOCAL": "repo"},
                                                         "maxRework": 0}))
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo new >> a.txt")
@@ -141,18 +141,21 @@ cargo test; echo $? > "$DELEGATE_RUN_DIR/denied-code"
         first = self.outcome(self.cli("start", "--read-only", "--in-place", "--workdir", repo, "task"))
         self.addCleanup(self.cli, "stop", first["run"])
         full = self.cli("start", "--read-only", "task")
-        self.assertEqual(full.returncode, 2)
+        self.assertEqual(full.returncode, 0, full.stderr)
+        queued = self.outcome(full)
+        self.addCleanup(self.cli, "stop", queued["dir"])
+        self.assertEqual(queued["state"], "waiting")
         self.assertIn("MAX_ACTIVE=1", full.stderr)
         (repo / ".delegate.json").write_text(json.dumps({"maxActive": 2, "maxHeavy": 4}))
         second = self.outcome(self.cli("start", "--read-only", "--in-place", "--workdir", repo, "task"))
         self.addCleanup(self.cli, "stop", second["run"])
         self.assertEqual(self.meta(second)["configCapacity"], {"maxActive": 2, "maxHeavy": 4,
-                                                              "repoMaxActive": 8})
+                                                              "repoMaxActive": 0})
         self.env.update(DELEGATE_MAX_ACTIVE="0", PI_DELEGATE_MAX_HEAVY="0")
         third = self.outcome(self.cli("start", "--read-only", "--in-place", "--workdir", repo, "task"))
         self.addCleanup(self.cli, "stop", third["run"])
         self.assertEqual(self.meta(third)["configCapacity"], {"maxActive": 0, "maxHeavy": 0,
-                                                             "repoMaxActive": 8})
+                                                             "repoMaxActive": 0})
         gate.touch()
         self.assertEqual(self.cli("wait", first["run"], second["run"], third["run"]).returncode, 0)
 

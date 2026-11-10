@@ -13,12 +13,11 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicI32, Ordering},
-    mpsc, Arc, Mutex,
+    Arc, Mutex,
 };
 use std::time::Duration;
 
 type Recorded = Option<(Vec<Value>, Value)>;
-type StopWaiter = Arc<Mutex<Option<mpsc::Sender<()>>>>;
 
 fn evidence(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
     let path = run.join("evidence.log");
@@ -745,14 +744,8 @@ fn stack_on_upstream(run: &Path, meta: &mut Value, upstream: &Path, prior: &Valu
     write_json(run.join("meta.json"), meta)?;
     Ok(stacked)
 }
-fn inner(
-    run: &Path,
-    holder: Arc<AtomicI32>,
-    grace: Arc<Mutex<Option<f64>>>,
-    stop_waiter: &StopWaiter,
-) -> Res<()> {
+fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> Res<()> {
     let mut meta = json(run.join("meta.json"));
-    let started = epoch();
     if !s(&meta, "after").is_empty() {
         let upstream = PathBuf::from(s(&meta, "after"));
         wait_for_run(&upstream);
@@ -837,9 +830,15 @@ fn inner(
         meta["base"] = base;
         write_json(run.join("meta.json"), &meta)?;
     }
-    if !s(&meta, "after").is_empty() {
-        admit_waiting(run, &meta, stop_waiter)?;
+    if run.join(".waiting").exists() {
+        if !run.join("queue.json").is_file() {
+            crate::queue::enter(run, &mut meta)?;
+        }
+        if !admit_waiting(run, &mut meta)? {
+            return finish_run(run, json!({"state":"stopped"}), 1);
+        }
     }
+    let started = epoch();
     let mut setup_error = None;
     let claimed_slot = b(&meta["worktree"], "pooled")
         && s(&meta["worktree"], "claimedBy")
@@ -1072,48 +1071,23 @@ fn wait_for_run(run: &Path) {
         }
     }
 }
-fn wait_any(runs: Vec<PathBuf>, stop_waiter: &StopWaiter) {
-    let (tx, rx) = mpsc::channel();
-    *stop_waiter.lock().unwrap() = Some(tx.clone());
-    for run in runs {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            wait_for_run(&run);
-            let _ = tx.send(());
-        });
-    }
-    drop(tx);
-    if !lane::stopped() {
-        let _ = rx.recv();
-    }
-    *stop_waiter.lock().unwrap() = None;
-}
-fn admit_waiting(run: &Path, meta: &Value, stop_waiter: &StopWaiter) -> Res<()> {
+fn admit_waiting(run: &Path, meta: &mut Value) -> Res<bool> {
     let slots = state_dir();
     let root = runs_root();
     loop {
         let machine = lock(&slots.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
         let local = lock(&root.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
+        if lane::stopped() {
+            return Ok(false);
+        }
         let others = launch::active_machine(&slots);
-        let full = launch::capacity(
-            &others,
-            &meta["configCapacity"],
-            &launch::repo_key_for_meta(meta),
-        );
-        if let Err(reason) = &full {
-            if !reason.contains("runs are active") {
-                return full;
-            }
+        if let Some(reason) = crate::queue::reason(meta, &others)? {
+            crate::queue::update(run, &reason, 0)?;
         } else {
             if s(meta, "mode") == "write" && !b(meta, "parallel") && !meta["worktree"].is_object() {
-                for other in runs::all_runs() {
+                for other in &others {
                     let m = json(other.join("meta.json"));
-                    if other != run
-                        && s(&m, "mode") == "write"
-                        && s(&m, "workdir") == s(meta, "workdir")
-                        && !other.join(".waiting").exists()
-                        && (runs::active(&runs::state(&other)) || runs::agent_alive(&other))
-                    {
+                    if s(&m, "mode") == "write" && s(&m, "workdir") == s(meta, "workdir") {
                         return Err(format!(
                             "write run {} is still active in {}",
                             other.display(),
@@ -1122,22 +1096,25 @@ fn admit_waiting(run: &Path, meta: &Value, stop_waiter: &StopWaiter) -> Res<()> 
                     }
                 }
             }
-            let hash = sha1_smol::Sha1::from(run.to_string_lossy().as_bytes())
-                .digest()
-                .to_string();
-            write(
-                slots.join(format!("{}.slot", &hash[..16])),
-                format!("{}\n", run.display()),
-            )?;
+            let origin = PathBuf::from(s(meta, "workdir"));
+            let mut wd = origin.clone();
+            let mut tree = meta["worktree"].clone();
+            launch::allocate_tree(&mut tree, &mut wd, &origin, run, s(meta, "mode"));
+            if tree.is_object() && s(&meta["worktree"], "path").is_empty() {
+                meta["top"] = tree["path"].clone();
+            }
+            meta["workdir"] = json!(wd);
+            meta["worktree"] = tree;
+            meta["startedEpoch"] = json!(epoch() as i64);
+            meta["startedAt"] = json!(iso());
+            write_json(run.join("meta.json"), meta)?;
             fs::remove_file(run.join(".waiting")).map_err(|e| e.to_string())?;
-            return Ok(());
+            return Ok(true);
         }
         drop(local);
         drop(machine);
-        wait_any(others, stop_waiter);
-        if lane::stopped() {
-            return Err("stopped while waiting for capacity".into());
-        }
+        // Poll also when memory is the only blocker, or no run is active.
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 pub fn supervise(run: &Path) -> Res<()> {
@@ -1157,18 +1134,11 @@ pub fn supervise(run: &Path) -> Res<()> {
     let mut signals = lane::supervisor_signal_pipe().map_err(|e| e.to_string())?;
     let holder = Arc::new(AtomicI32::new(0));
     let grace = Arc::new(Mutex::new(None));
-    let stop_waiter: StopWaiter = Arc::new(Mutex::new(None));
     let h = holder.clone();
-    let waiter = stop_waiter.clone();
     let runpath = run.to_path_buf();
     std::thread::spawn(move || {
         let mut byte = [0];
         if signals.read_exact(&mut byte).is_ok() {
-            if let Ok(waiter) = waiter.lock() {
-                if let Some(tx) = waiter.as_ref() {
-                    let _ = tx.send(());
-                }
-            }
             lane::wake_lane_waiter_after_stop();
             let pid = h.load(Ordering::SeqCst);
             if pid > 0 {
@@ -1177,7 +1147,7 @@ pub fn supervise(run: &Path) -> Res<()> {
             }
         }
     });
-    if let Err(e) = inner(run, holder, grace, &stop_waiter) {
+    if let Err(e) = inner(run, holder, grace) {
         let _ = append(run.join("stderr.log"), &format!("supervisor error: {e}\n"));
         if !run.join("exit_code").exists() {
             let pgid = read(run.join("agent.pid")).trim().parse().unwrap_or(0);

@@ -206,11 +206,37 @@ pub fn pick(
         .iter()
         .enumerate()
         .find(|(i, rule)| {
-            rule.is_string() || agents::rule_matches(rule, now, &|_| running(&all[*i].model))
+            rule.is_string()
+                || agents::rule_matches(rule, now, &|_| {
+                    if s(rule, "overflow") == "next" {
+                        running(&all[*i].model)
+                    } else {
+                        0
+                    }
+                })
         })
         .map(|(i, _)| i)
         .ok_or_else(|| format!("tier {tier} has no model"))?;
     Ok(all[index].clone())
+}
+
+/// A resolved model has one machine-wide ceiling, including pinned starts and replies.
+/// If several tiers declare it, the strictest cap wins; aliases cannot bypass it.
+pub fn model_cap(config: &Value, model: &str) -> Res<Value> {
+    let mut found = Value::Null;
+    for tier in TIERS {
+        for rule in config["tiers"][tier].as_array().into_iter().flatten() {
+            if let Some(cap) = rule["maxActive"].as_u64() {
+                let name = s(rule, "model");
+                if resolve_model(name, config, &[])? == model
+                    && found["limit"].as_u64().is_none_or(|n| cap < n)
+                {
+                    found = json!({"name":name,"limit":cap});
+                }
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// Guard only explicitly unsupported images; no fallback, and no Pi list means no check.
@@ -317,7 +343,8 @@ mod tests {
     #[test]
     fn rules_resolve_aliases_count_full_models_and_images_never_reroute() {
         let _guard = ENV.lock().unwrap();
-        let c = config();
+        let mut c = config();
+        c["tiers"]["review"][0]["overflow"] = json!("next");
         let pi = listed();
         let now = Clock {
             weekday: 1,

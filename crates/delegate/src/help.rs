@@ -24,6 +24,7 @@ const LAUNCH: &[(&str, &str)] = &[
     ("--retries N", "Malformed-answer reruns, 0-3 (default: 1)."),
     ("--provider NAME", "Pi provider for --model."),
     ("--model ALIAS", "Exact registered alias or full id, else unique case-insensitive substring of aliases/full ids in config models. Unregistered Pi models are never candidates. Exclusive with --tier; pins the model and disables automatic model changes. Do not append :thinking."),
+    ("--overflow next|queue", "At model capacity: queue for the selected model (default), or explicitly allow the next tier candidate. Overrides rule overflow for this launch; pinned --model still queues."),
     ("--thinking LEVEL", "off|minimal|low|medium|high|xhigh. Environment > CLI > tier rule > config thinking > Pi default; independent of the model name."),
     ("--allow-parallel-writes", "Allow concurrent write runs in one workdir."),
     ("--worktree", "Write in a detached git worktree seeded from the current tree; merge with apply."),
@@ -66,13 +67,14 @@ const REPLY: &[(&str, &str)] = &[
     ("--wait", "Wait for the reply's outcome and answer instead of returning after launch."),
     ("--tier scout|review|write", "Continue on this purpose tier; exclusive with --model. Ordinary replies keep the saved model and thinking."),
     ("--model ALIAS", "Continue on a registered model alias or full id; unique registry substring accepted."),
+    ("--overflow next|queue", "Override model-capacity behavior when selecting a tier; default queue. Ordinary replies keep their model and queue. Replies have priority over new starts."),
     ("--thinking LEVEL", "Change thinking independently: off|minimal|low|medium|high|xhigh."),
     ("--minor", "Write conversations: a short fix (message up to 600 characters, default timeout 10m) outside the rework budget; a round that changes more than 60 lines counts after all."),
     ("--over-limit REASON", "Write conversations: reply past the .delegate.json maxRework budget (default 1) and record why."),
 ];
 
 const COMMANDS: &[(&str, &str)] = &[
-    ("start", "Launch in the background and return at once."),
+    ("start", "Create a background run and return at once; capacity shortages queue automatically."),
     ("run", "Start, then wait for the outcome and answer."),
     (
         "reply",
@@ -139,6 +141,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("-h, --help", "Show this help."),
             ("--version", "Show the Cargo package version."),
         ]);
+        println!("Capacity: maxActive=32 and repoMaxActive=0 (unlimited) are runaway guards; model maxActive, maxHeavy=2 and available memory are the actual throttles. Shortages queue without a timeout or new worktree/pool claim. status shows queue reason/ahead/since; queued runs have no runtime elapsed. --after waits upstream before joining; stop cancels. Lost supervisors/reboots leave crashed runs, like deferred runs; no automatic recovery.");
         println!("\nStates: waiting | running | delivered (accept passed) | answered (no --accept) | skipped (upstream failed) | rejected (accept failed or protected path changed) | malformed (empty or leaked tool call after reruns) | failed | timeout | stalled | killed | stopped | crashed.");
         println!(
             "An interrupted upstream (cut stream, reset or timed-out connection, 502/503/504, a 429 Pi did not retry) is not the task failing: the run waits 15s/45s/120s, checks the model through `probe`'s path, and continues the same session up to 3 times (DELEGATE_RESUME_BACKOFF, `0` off); `status --json` reports `resumes` and `transientError`. Auth failures, 400s and missing models are not retried."

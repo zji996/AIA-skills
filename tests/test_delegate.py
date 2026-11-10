@@ -688,7 +688,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         state = self.outcome(self.cli("start", "--worktree", "--workdir", repo, "--name", "running", "task"))
         self.addCleanup(self.cli, "stop", state["run"])
         run = Path(state["dir"])
-        self.until(lambda: "cargo test" in (run / "events.jsonl").read_text(), "command event")
+        self.until(lambda: (run / "events.jsonl").exists() and "cargo test" in (run / "events.jsonl").read_text(), "command event")
         out = self.cli("status", "running", human=True)
         self.assertEqual(out.returncode, 0, out.stderr)
         for field in ("running · 运行中", "pi/m · write（推断）", "改 1 个文件 +1/-1", "最近：cargo test", "下一步："):
@@ -923,12 +923,17 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         self.assertEqual(state["state"], "answered")
         self.assertGreaterEqual(state["queuedSeconds"], 1)
 
-    def test_low_memory_refuses_to_start(self):
+    def test_low_memory_queues_start(self):
         self.fake_pi([answer("ok"), SETTLED])
         self.env["DELEGATE_MIN_AVAILABLE_MB"] = str(1 << 40)
         result = self.cli("start", "--read-only", "task")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("MB of memory available", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        queued = self.outcome(result)
+        self.addCleanup(self.cli, "stop", queued["dir"])
+        self.assertEqual(queued["state"], "waiting")
+        self.assertIn("可用内存", queued["queue"]["reason"])
+        self.assertIn("queued:", result.stderr)
+        self.assertIn("starts automatically", result.stderr)
         self.env["DELEGATE_MIN_AVAILABLE_MB"] = "0"
         self.assertEqual(self.outcome(self.cli("run", "--read-only", "task"))["state"], "answered")
 
@@ -1904,7 +1909,7 @@ db.write_text(json.dumps(units))
             self.assertIn("tiers.review[0]", self.cli("run", "--read-only", "task").stderr)
 
     def test_tier_rule_max_active_counts_resolved_alias_models(self):
-        self.user_config(self.purpose_config(review=[{"model": "sol", "maxActive": 2}, "coder"]))
+        self.user_config(self.purpose_config(review=[{"model": "sol", "maxActive": 2, "overflow": "next"}, "coder"]))
         gate = self.work / "gate"
         self.fake_pi([answer("ok"), SETTLED], pre=f"while [ ! -f {gate} ]; do sleep .02; done")
         models = []
@@ -2190,7 +2195,7 @@ db.write_text(json.dumps(units))
         self.assertEqual(result.returncode, 2)
         self.assertIn("image does not exist", result.stderr)
 
-    def test_machine_wide_limits_refuse_extra_runs(self):
+    def test_machine_wide_limits_queue_extra_runs(self):
         self.fake_pi([answer("slow"), SETTLED], sleep=30)
         self.env.update(DELEGATE_MAX_ACTIVE="2")
         first = json.loads(self.cli("start", "--read-only", "--name", "one", "task").stdout)["run"]
@@ -2198,9 +2203,9 @@ db.write_text(json.dumps(units))
         self.env["DELEGATE_RUNS"] = str(self.work / "runs2")
         self.assertEqual(self.cli("start", "--read-only", "--name", "two", "task").returncode, 0)
         result = self.cli("start", "--read-only", "task")
-        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("DELEGATE_MAX_ACTIVE=2", result.stderr)
-        self.assertIn(str(self.work / "runs"), result.stderr)
+        self.assertEqual(self.outcome(result)["state"], "waiting")
         self.env["DELEGATE_RUNS"] = str(self.work / "runs")
         self.cli("stop", first)
         self.assertEqual(self.cli("start", "--read-only", "--name", "freed", "task").returncode, 0)
@@ -3514,19 +3519,20 @@ cargo check --package small; echo $? > "$DELEGATE_RUN_DIR/prefix-code"
         second = self.outcome(self.cli("start", "--read-only", "--workdir", other, "second"))
         self.addCleanup(self.cli, "stop", second["dir"])
         blocked = self.cli("start", "--read-only", "--in-place", "--workdir", linked, "third")
-        self.assertEqual(blocked.returncode, 2)
-        self.assertIn("1 runs are active in this repository", blocked.stderr)
-        self.assertIn("DELEGATE_REPO_MAX_ACTIVE=1", blocked.stderr)
-        self.assertIn(first["dir"], blocked.stderr)
-        self.assertNotIn(second["dir"], blocked.stderr)
+        self.assertEqual(blocked.returncode, 0, blocked.stderr)
+        queued = self.outcome(blocked)
+        self.addCleanup(self.cli, "stop", queued["dir"])
+        self.assertEqual(queued["state"], "waiting")
+        self.assertIn("DELEGATE_REPO_MAX_ACTIVE=1", queued["queue"]["reason"])
         self.env["DELEGATE_REPO_MAX_ACTIVE"] = "0"
         third = self.outcome(self.cli("start", "--read-only", "--in-place", "--workdir", linked, "third"))
         self.addCleanup(self.cli, "stop", third["dir"])
         blocked = self.cli("start", "--read-only", "task")
-        self.assertEqual(blocked.returncode, 2)
-        self.assertIn("3 runs are active on this machine", blocked.stderr)
-        for state in (first, second, third):
-            self.assertIn(state["dir"], blocked.stderr)
+        self.assertEqual(blocked.returncode, 0, blocked.stderr)
+        queued = self.outcome(blocked)
+        self.addCleanup(self.cli, "stop", queued["dir"])
+        self.assertEqual(queued["state"], "waiting")
+        self.assertIn("DELEGATE_MAX_ACTIVE=3", queued["queue"]["reason"])
 
     def test_v518_repository_limits_and_non_git_normalization(self):
         self.fake_pi([answer("done"), SETTLED], sleep=30)
@@ -3536,9 +3542,11 @@ cargo check --package small; echo $? > "$DELEGATE_RUN_DIR/prefix-code"
         first = self.outcome(self.cli("start", "--read-only", "first"))
         self.addCleanup(self.cli, "stop", first["dir"])
         blocked = self.cli("start", "--read-only", "--workdir", alias, "second")
-        self.assertEqual(blocked.returncode, 2)
-        self.assertIn("1 runs are active in this repository", blocked.stderr)
-        self.assertIn("DELEGATE_REPO_MAX_ACTIVE=1", blocked.stderr)
+        self.assertEqual(blocked.returncode, 0, blocked.stderr)
+        queued = self.outcome(blocked)
+        self.addCleanup(self.cli, "stop", queued["dir"])
+        self.assertEqual(queued["state"], "waiting")
+        self.assertIn("DELEGATE_REPO_MAX_ACTIVE=1", queued["queue"]["reason"])
         self.env["DELEGATE_REPO_MAX_ACTIVE"] = "0"
         second = self.outcome(self.cli("start", "--read-only", "--workdir", alias, "second"))
         self.addCleanup(self.cli, "stop", second["dir"])
@@ -3548,7 +3556,7 @@ cargo check --package small; echo $? > "$DELEGATE_RUN_DIR/prefix-code"
         self.assertIn("DELEGATE_REPO_MAX_ACTIVE", blocked.stderr)
 
     def test_v518_capacity_defaults_config_precedence_and_protocol(self):
-        defaults = {"maxActive": 12, "maxHeavy": 2, "repoMaxActive": 8}
+        defaults = {"maxActive": 32, "maxHeavy": 2, "repoMaxActive": 0}
         self.fake_pi([answer("done"), SETTLED])
         state = self.outcome(self.cli("run", "--read-only", "task"))
         self.assertEqual(json.loads((Path(state["dir"]) / "meta.json").read_text())["configCapacity"], defaults)

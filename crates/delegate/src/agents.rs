@@ -342,7 +342,7 @@ pub fn protocol() -> Value {
             "version": version,
             "shadowed": bins.iter().skip(1).map(|(path, _)| path).collect::<Vec<_>>(),
         }],
-        "capacityDefaults": {"maxActive": 12, "maxHeavy": 2, "repoMaxActive": 8},
+        "capacityDefaults": {"maxActive": 32, "maxHeavy": 2, "repoMaxActive": 0},
     })
 }
 pub fn agent_identity(agent: &str) -> Res<(PathBuf, Option<String>)> {

@@ -52,7 +52,7 @@
 | `tiers [--alias name=provider/id] [--scout M] [--review M] [--write M] [--thinking LEVEL]` | | 显示或写入用户配置的档位模型，§4.1 |
 | `protocol` | | 输出一行 JSON：`protocol`（宿主接入协议版本，当前 1）、`version`、`caller{id,source}`（未知时为 `null`）、`agents[]{name,tiers,models,available,bin,version,shadowed}`（只有 `pi` 一项）；`tiers` 恒为 `["scout","review","write"]`，`models` 是按当前配置各档的 Pi 模型（空串表示未配置或无法解析），`bin` 为 PATH 上首个可执行文件的真实路径（不可用时为 `null`），`shadowed` 为 PATH 中更靠后、真实路径不同的同名可执行文件，按其在 PATH 中的路径列出（snap 等启动器都解析到同一文件，解析后看不出是谁）；退出码 0。供宿主适配器探测，见 [delegate-protocol.md](delegate-protocol.md) |
 
-缺少同事 CLI 时退出码 2：Pi 提示 `sh <仓库>/third_party/pi-kit/install.sh --additive`，其中 `<仓库>` 为从可执行文件真实路径逐级向上、首个包含该安装脚本的目录，找不到时给出远程安装命令。
+缺少同事 CLI 退出 2，提示 Pi 安装命令（从可执行文件向上查找 third_party/pi-kit，找不到用远程安装）。
 
 `<run>` 解析顺序（必须）：含 `meta.json` 的目录路径 → `last`（最近启动的）→ 完整 id → 唯一完全匹配的名称（`--name`）→ 唯一 id 子串；匹配数不为 1 即退出码 2。
 
@@ -76,6 +76,7 @@
 | `--timeout` | 无 | 每次尝试；§9.2 |
 | `--retries N` | 1 | 0–3，答复畸形时的重跑次数 |
 | `--provider` `--model` `--thinking` | — | --model 仅选已登记别名或完整名，与 --tier 互斥；thinking 独立；普通 reply 保留二者 |
+| `--overflow next\|queue` | queue | 模型满时排队或允许下一候选；reply 可用，--model 不换 |
 | `--allow-parallel-writes` | 否 | 跳过写入互斥 |
 | `--after <run>` | — | 立即创建 run（state `waiting`），上游以 delivered/answered 结束后才执行；其他结局使本 run 以 `skipped` 结束，`error` 写明上游名称与结局，exit_code 为 1 |
 | `--in <run>` | — | 仅与 `--read-only` 同用；在上游 worktree 当前状态的快照中运行（§6.3）；未给 `--after` 时上游必须已结束 |
@@ -361,12 +362,11 @@ pi (--session-id <uuid> | --fork <上一轮会话副本>) --session-dir <run>/se
 
 5.12 起，两者按首次检查记录已结束集合，结论附 `completionTiming`（§3.1）；原收取顺序不变，多个旧结果一起交付，不按完成时间排序。后台命令结束通知可能是在交付旧结果；旧 summary 没有 `finishedAt` 时省略，不推算。
 
-5.25 配置 standing/defaults/resultChars/cleanupKeepExecutables、答复 --max-answer 与 apply 默认清理/--keep/验收提醒的契约见技能 references/{configuration,commands,output-and-files}.md。
+其他配置与结果契约见技能 [配置](../skills/delegate/references/configuration.md)、[命令](../skills/delegate/references/commands.md) 与 [输出](../skills/delegate/references/output-and-files.md)。
 
 ## 10. 并发、准入与清理
 
-- 整机并发：`<state>/<sha1(run 路径)[:16]>.slot` 记录运行中的 run；`DELEGATE_MAX_ACTIVE`（默认 12）、每仓库 `DELEGATE_REPO_MAX_ACTIVE`（默认 8），0 不限。超出即拒绝并列出运行中的任务。
-- 内存准入：`/proc/meminfo` 的 `MemAvailable` 低于 `DELEGATE_MIN_AVAILABLE_MB`（默认 4096，0 不查）时拒绝。
+- 防失控默认 maxActive=32、repoMaxActive=0（不限）；真正限流靠模型并发、maxHeavy、内存水位。满了自动排队、不拒绝或擅自换模型；reply 优先、同级 FIFO，放行锁内复查。完整规则、JSON queue、--overflow、--after 与重启语义见 [容量排队](../skills/delegate/references/capacity.md)。
 - 启动在 `<state>/.start.lock` 与 `<runs>/.start.lock` 两把锁下进行，检查与登记不可交错。
 - 写入互斥：同一 workdir 同时只允许一个原地写入 run（`--allow-parallel-writes` 与 worktree run 除外）。
 - **只有一层委派**：调用者本身是同事（设有 `DELEGATE_AGENT`、`PI_DELEGATE_AGENT` 或 `PI_DELEGATE_ACTIVE`）时，`start`/`run`/`reply` 一律以退出码 2 拒绝；`lane` 等其他命令不受影响。所有结果都回到主控。

@@ -21,6 +21,7 @@ pub struct Options {
     pub tier: Option<String>,
     pub tier_inferred: bool,
     pub model_name: Option<String>,
+    pub overflow: Option<String>,
     pub thinking_cli: Option<String>,
     pub agent_pinned: bool,
     /// The model came from a tier rather than `--model` or the run being continued,
@@ -156,6 +157,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             "--provider",
             "--model",
             "--thinking",
+            "--overflow",
             "--max",
             "--after",
             "--in",
@@ -181,6 +183,12 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                     ))
                 }
                 "--tier" => o.tier = Some(v),
+                "--overflow" => {
+                    if !["queue", "next"].contains(&v.as_str()) {
+                        return Err("--overflow must be next|queue".into());
+                    }
+                    o.overflow = Some(v);
+                },
                 "--name" => o.name = Some(v),
                 "--workdir" => o.workdir = Some(v),
                 "--image" => o.images.push(v),
@@ -1331,66 +1339,45 @@ pub fn repo_key_for_meta(meta: &Value) -> String {
         source
     }))
 }
-pub fn capacity(active_runs: &[PathBuf], config: &Value, repo: &str) -> Res<()> {
-    let total = crate::config::capacity(config, "maxActive", "MAX_ACTIVE", 12)?;
-    let repo_total = crate::config::capacity(config, "repoMaxActive", "REPO_MAX_ACTIVE", 8)?;
-    let repo_runs: Vec<PathBuf> = active_runs
-        .iter()
-        .filter(|run| repo_key_for_meta(&json(run.join("meta.json"))) == repo)
-        .cloned()
-        .collect();
-    let (reason, related) = if total > 0 && active_runs.len() >= total as usize {
-        (
-            format!(
-                "{} runs are active on this machine (DELEGATE_MAX_ACTIVE={total})",
-                active_runs.len()
-            ),
-            active_runs,
-        )
-    } else if repo_total > 0 && repo_runs.len() >= repo_total as usize {
-        (
-            format!(
-                "{} runs are active in this repository (DELEGATE_REPO_MAX_ACTIVE={repo_total})",
-                repo_runs.len()
-            ),
-            repo_runs.as_slice(),
-        )
-    } else {
-        (String::new(), active_runs)
-    };
-    if !reason.is_empty() {
-        let listing = related
-            .iter()
-            .map(|r| {
-                format!(
-                    "\n  {:>5}s {:<5} {}",
-                    n(&runs::status(r), "elapsedSeconds"),
-                    s(&json(r.join("meta.json")), "agent"),
-                    r.display()
-                )
-            })
-            .collect::<String>();
-        return Err(format!("refusing to start: {reason}; collect results with wait before starting more, or stop runs no longer needed{listing}"));
-    }
+/// Invalid settings are errors; exhausted capacity is a queue reason.
+pub fn capacity(active_runs: &[PathBuf], config: &Value, repo: &str) -> Res<Option<String>> {
+    let total = crate::config::capacity(config, "maxActive", "MAX_ACTIVE", 32)?;
+    let repo_total = crate::config::capacity(config, "repoMaxActive", "REPO_MAX_ACTIVE", 0)?;
     let floor_setting = setting("MIN_AVAILABLE_MB", "4096");
     if floor_setting.is_empty() || !floor_setting.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(format!(
-            "DELEGATE_MIN_AVAILABLE_MB must be a non-negative integer (0 = no check), got {floor_setting:?}"
-        ));
+        return Err(format!("DELEGATE_MIN_AVAILABLE_MB must be a non-negative integer (0 = no check), got {floor_setting:?}"));
     }
     let floor = floor_setting.parse::<u64>().map_err(|e| e.to_string())?;
+    let repo_count = active_runs
+        .iter()
+        .filter(|run| repo_key_for_meta(&json(run.join("meta.json"))) == repo)
+        .count();
+    if total > 0 && active_runs.len() >= total as usize {
+        return Ok(Some(format!(
+            "总路数 / machine capacity (DELEGATE_MAX_ACTIVE={total})"
+        )));
+    }
+    if repo_total > 0 && repo_count >= repo_total as usize {
+        return Ok(Some(format!(
+            "仓库路数 / repository capacity (DELEGATE_REPO_MAX_ACTIVE={repo_total})"
+        )));
+    }
     let available = read("/proc/meminfo")
         .lines()
-        .find_map(|x| {
-            x.strip_prefix("MemAvailable:")
-                .and_then(|x| x.split_whitespace().next())
-                .and_then(|x| x.parse::<u64>().ok())
+        .find_map(|line| {
+            line.strip_prefix("MemAvailable:")?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
         })
-        .map(|x| x / 1024);
-    if floor > 0 && available.is_some_and(|x| x < floor) {
-        return Err(format!("refusing to start: only {} MB of memory available (DELEGATE_MIN_AVAILABLE_MB={floor}); collect results with wait, or stop runs no longer needed",available.unwrap_or(0)));
+        .map(|kb| kb / 1024);
+    if floor > 0 && available.is_some_and(|mb| mb < floor) {
+        return Ok(Some(format!(
+            "可用内存 / available memory (DELEGATE_MIN_AVAILABLE_MB={floor})"
+        )));
     }
-    Ok(())
+    Ok(None)
 }
 fn tree_source_warnings(extra: &Value) -> Vec<String> {
     let tree = &extra["worktree"];
@@ -1428,6 +1415,45 @@ fn tree_source_warnings(extra: &Value) -> Vec<String> {
     }
     warnings
 }
+/// Queued tasks claim pool slots only after admission, under the start lock.
+pub fn allocate_tree(tree: &mut Value, wd: &mut PathBuf, workdir: &Path, run: &Path, mode: &str) {
+    if tree.is_object() && s(tree, "path").is_empty() {
+        let slots = tree["config"]["pool"].as_u64().unwrap_or(0);
+        let slot = (mode == "write" && slots > 0 && tree["in"].is_null())
+            .then(|| crate::pool::claim(Path::new(s(tree, "source")), run, slots))
+            .flatten();
+        if mode == "write" && slots > 0 && tree["in"].is_null() && slot.is_none() {
+            eprintln!("delegate: all {slots} pool slots are held; this task gets its own worktree");
+        }
+        let path = slot.clone().unwrap_or_else(|| {
+            cache_dir().join("worktrees").join(format!(
+                "{}-{}",
+                Path::new(s(tree, "source"))
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+                run.file_name().unwrap_or_default().to_string_lossy()
+            ))
+        });
+        if slot.is_some() {
+            tree["pooled"] = json!(true);
+            // Only the run that claimed the slot resets it; a reply continuing in the slot
+            // copies this record and must find its conversation's files untouched.
+            tree["claimedBy"] = json!(run.file_name().unwrap_or_default().to_string_lossy());
+        }
+        tree["path"] = json!(path);
+        let origin = if tree["in"].is_string() {
+            Path::new(s(tree, "sourceWorkdir"))
+        } else {
+            workdir
+        };
+        *wd = path.join(
+            origin
+                .strip_prefix(s(tree, "source"))
+                .unwrap_or(Path::new("")),
+        );
+    }
+}
 pub fn launch(
     mut o: Options,
     prompt: &str,
@@ -1449,17 +1475,25 @@ pub fn launch(
     let _machine = lock(&slots.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
     let _local = lock(&root.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
     let active_runs = active_machine(&slots);
-    let deferred = extra["after"].is_string();
+    let after = extra["after"].is_string();
     let source = s(&extra["worktree"], "source");
     let repo = repo_key(if source.is_empty() {
         workdir
     } else {
         Path::new(source)
     });
-    if !deferred {
-        capacity(&active_runs, &extra["configCapacity"], &repo)?;
-    }
+    // Validate settings even when waiting on an upstream.
+    capacity(&active_runs, &extra["configCapacity"], &repo)?;
     let mut extra = extra.clone();
+    if let Some(overflow) = &o.overflow {
+        if let Some(tiers) = extra["tierConfig"]["tiers"].as_object_mut() {
+            for rules in tiers.values_mut().filter_map(Value::as_array_mut) {
+                for rule in rules.iter_mut().filter(|rule| rule.is_object()) {
+                    rule["overflow"] = json!(overflow);
+                }
+            }
+        }
+    }
     if o.tier_picked && !o.agent_pinned {
         pick_tier_under_cap(&mut o, &mut extra, &active_runs)?;
     }
@@ -1468,6 +1502,12 @@ pub fn launch(
         let model = o.model.as_deref().unwrap_or("");
         models::guard_images(model, &listed)?;
     }
+    let model_cap = models::model_cap(&extra["tierConfig"], o.model.as_deref().unwrap_or(""))?;
+    let admission = json!({"configCapacity":extra["configCapacity"],"repoKey":repo,
+        "model":o.model,"modelCap":model_cap,"parent":extra["parent"]["run"],
+        "queuedNs":now_ns() as u64});
+    let reason = crate::queue::reason(&admission, &active_runs)?;
+    let deferred = after || reason.is_some();
     let extra = &extra;
     if !deferred && mode == "write" && !o.parallel && !extra["worktree"].is_object() {
         for run in all_runs() {
@@ -1689,41 +1729,8 @@ pub fn launch(
     }
     let mut tree = extra["worktree"].clone();
     let mut wd = workdir.to_path_buf();
-    if tree.is_object() && s(&tree, "path").is_empty() {
-        let slots = tree["config"]["pool"].as_u64().unwrap_or(0);
-        let slot = (mode == "write" && slots > 0 && tree["in"].is_null())
-            .then(|| crate::pool::claim(Path::new(s(&tree, "source")), &run, slots))
-            .flatten();
-        if mode == "write" && slots > 0 && tree["in"].is_null() && slot.is_none() {
-            eprintln!("delegate: all {slots} pool slots are held; this task gets its own worktree");
-        }
-        let path = slot.clone().unwrap_or_else(|| {
-            cache_dir().join("worktrees").join(format!(
-                "{}-{}",
-                Path::new(s(&tree, "source"))
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy(),
-                run.file_name().unwrap_or_default().to_string_lossy()
-            ))
-        });
-        if slot.is_some() {
-            tree["pooled"] = json!(true);
-            // Only the run that claimed the slot resets it; a reply continuing in the slot
-            // copies this record and must find its conversation's files untouched.
-            tree["claimedBy"] = json!(run.file_name().unwrap_or_default().to_string_lossy());
-        }
-        tree["path"] = json!(path);
-        let origin = if tree["in"].is_string() {
-            Path::new(s(&tree, "sourceWorkdir"))
-        } else {
-            workdir
-        };
-        wd = path.join(
-            origin
-                .strip_prefix(s(&tree, "source"))
-                .unwrap_or(Path::new("")),
-        );
+    if !deferred {
+        allocate_tree(&mut tree, &mut wd, workdir, &run, mode);
     }
     let top = if tree.is_object() {
         let p = PathBuf::from(s(&tree, "path"));
@@ -1816,6 +1823,8 @@ pub fn launch(
     } else {
         agent_identity(s(&meta, "agent"))?
     };
+    meta["modelCap"] = model_cap;
+    meta["queuedNs"] = admission["queuedNs"].clone();
     meta["agentPinned"] = json!(o.agent_pinned);
     if let Some(command) = o.evidence.filter(|command| !command.is_empty()) {
         meta["evidenceCommand"] = json!(command);
@@ -1876,6 +1885,10 @@ pub fn launch(
     }
     if deferred {
         touch(run.join(".waiting"));
+        if !after {
+            crate::queue::enter(&run, &mut meta)?;
+            crate::queue::update(&run, reason.as_deref().unwrap_or("总路数"), 0)?;
+        }
     }
     runs::prune();
     let hash = sha1_smol::Sha1::from(run.to_string_lossy().as_bytes())

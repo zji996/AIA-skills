@@ -1,5 +1,11 @@
 # delegate
 
+## 6.14 容量排队与模型预算
+
+- 整机或仓库到上限、内存不足：`start` 成功返回 run id，`status` 显示排队分钟数、原因与前方人数，JSON 含 `queue`；不用手动重派。Queue automatically at capacity; wait for queued tasks normally.
+- 便宜模型 maxActive 满了，没同意改用更贵模型：默认等原模型；只有明确接受下一候选时才用 `--overflow next` 或条目 `overflow: "next"`，`--overflow queue` 可覆盖配置。Pinned --model obeys the same resolved-model cap.
+- 先排的新任务与后排的 reply 抢名额：reply 先，同级 FIFO；模型 A 满不挡模型 B，排队不占工作树池位，`stop` 可取消、`clean` 可清理。`--after` 上游完成后才入容量队。
+
 ## 6.9 派发前探连通
 
 - 某个自部署节点今晚回 502，换档前先看哪几档不通：`delegate probe` 走 Pi 本身并行测各档模型，每行 ok/FAIL 与耗时，失败附 Pi 报错第一行；末行给出不带 `--tier` 时 start 会选的模型。Probe tier models through Pi before dispatching.

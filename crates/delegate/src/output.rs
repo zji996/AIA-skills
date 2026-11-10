@@ -251,6 +251,14 @@ pub fn human(run: &Path, status: &Value) -> String {
         format!("{label} {elapsed}"),
         agent_label(status),
     ];
+    if status["queue"].is_object() {
+        let queue = &status["queue"];
+        let minutes =
+            ((epoch() as i64 - iso_epoch(s(queue, "since")).unwrap_or(epoch() as i64)) / 60).max(0);
+        parts[1] = format!("排队中 {minutes} 分钟");
+        parts.push(s(queue, "reason").into());
+        parts.push(format!("前面还有 {} 个", n(queue, "ahead")));
+    }
     let mut totals = status["changes"].clone();
     let mut paths = status["files"]
         .as_array()

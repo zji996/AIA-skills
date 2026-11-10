@@ -12,6 +12,7 @@ mod models;
 mod output;
 mod pool;
 mod probe;
+mod queue;
 mod resources;
 mod runs;
 mod source_build;
@@ -1293,6 +1294,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
             hint_concurrent_writes(&run);
             if command == "start" {
                 println!("{}", status_line(&run));
+                queue::notice(&run);
                 eprintln!(
                     "delegate: started {}; collect with: {} wait {}",
                     run.file_name().unwrap_or_default().to_string_lossy(),
@@ -1347,6 +1349,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 ))
             } else {
                 println!("{}", status_line(&run));
+                queue::notice(&run);
                 eprintln!(
                     "delegate: started {name} (reply to {parent}); collect with: {} wait {name}",
                     script().display()

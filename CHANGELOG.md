@@ -10,6 +10,8 @@
 
 ### 技能
 
+- `delegate` 6.14.0：**不兼容**：到上限从拒绝改为排队，模型满了从换模型改为排队，需要旧行为加 `overflow: next`（单次 `--overflow next|queue`）；续做优先、同级 FIFO，排队不占运行与 worktree 池名额，状态显示原因与前方人数。整机/仓库防失控默认改为 32/0，实际限流用模型并发、maxHeavy 与内存水位。
+
 - `openai-image-gen` 3.0.0：去掉草稿/正式图，`image` 一次调用直接写出成图（默认 `gpt-image-2.6-sunburst`、medium，格式不符时用 ffmpeg 转换），明显不对时 `edit` 或改提示词重出；每个输出路径出图 3 次、编辑 1 次。**不兼容**：`draft`/`keep`/`final` 移除，2.x 的状态按新图处理。起因：ChatGPT 转发网关由服务端决定画质，正式图不比草稿好，两轮流程只是多花一次钱。
 - `iteration-speed` 1.6.0：新增判断点「回归按工作量结算」——门禁变慢与提速验收用数据库读行/页访问、指令数等与机器无关的工作量做棘轮，秒数只作参考。
 - `delegate` 6.13.0：仓库配置 `appendOnly` 列出各任务只追加段落的文件，`apply` 遇到两边都加了内容的冲突时两段都保留，不写冲突标记；派出带 worktree 的写入任务时，把源仓库与其他任务 worktree 里未提交的编号文件（如 `0148_x.sql`）占用的编号写进说明。起因：同一批两个任务各建了 0148 号迁移并各往同一份评测记录加了一节，合入时都要手工改。续做复制父会话时带上 rpi 的进度伴随文件（`<会话>.jsonl.progress.jsonl`）；此前 rpi 0.20 的续做一律报 `required progress companion is missing`。

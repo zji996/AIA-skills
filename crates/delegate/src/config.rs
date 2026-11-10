@@ -421,9 +421,9 @@ pub fn capacity(value: &Value, key: &str, name: &str, default: u64) -> Res<u64> 
 
 pub fn capacities(value: &Value) -> Res<Value> {
     Ok(json!({
-        "maxActive": capacity(value, "maxActive", "MAX_ACTIVE", 12)?,
+        "maxActive": capacity(value, "maxActive", "MAX_ACTIVE", 32)?,
         "maxHeavy": capacity(value, "maxHeavy", "MAX_HEAVY", 2)?,
-        "repoMaxActive": capacity(value, "repoMaxActive", "REPO_MAX_ACTIVE", 8)?,
+        "repoMaxActive": capacity(value, "repoMaxActive", "REPO_MAX_ACTIVE", 0)?,
     }))
 }
 
@@ -450,7 +450,7 @@ pub fn context_capacity(run: Option<&Path>) -> Res<Value> {
 
 /// A tier is a model pattern, or rules ending in a plain model that always matches:
 /// `[{"model": "...", "days": "mon-fri", "hours": "09:00-12:00,14:00-18:00"}, "fallback"]` (local time);
-/// a rule's `maxActive` caps how many runs on this machine use its model before later rules take over.
+/// A rule's `maxActive` queues at its model ceiling; only overflow=next tries later rules.
 fn validate_tier(tier: &str, value: &Value) -> Result<(), String> {
     let model = |m: &Value| {
         m.as_str()
@@ -501,7 +501,15 @@ fn validate_tier(tier: &str, value: &Value) -> Result<(), String> {
         if !model(&rule["model"])
             || rule.as_object().is_none_or(|o| {
                 o.keys().any(|k| {
-                    !["model", "thinking", "days", "hours", "maxActive"].contains(&k.as_str())
+                    ![
+                        "model",
+                        "thinking",
+                        "days",
+                        "hours",
+                        "maxActive",
+                        "overflow",
+                    ]
+                    .contains(&k.as_str())
                 })
             })
             || (rule["days"].is_null()
@@ -509,11 +517,16 @@ fn validate_tier(tier: &str, value: &Value) -> Result<(), String> {
                 && rule["maxActive"].is_null()
                 && rule["thinking"].is_null())
             || !(rule["maxActive"].is_null() || rule["maxActive"].as_u64().is_some_and(|n| n > 0))
+            || rule.get("overflow").is_some_and(|value| {
+                value
+                    .as_str()
+                    .is_none_or(|v| !["next", "queue"].contains(&v))
+            })
             || !field("days", &|d| crate::agents::parse_days(d).is_some())
             || !field("hours", &|h| crate::agents::parse_windows(h).is_some())
         {
             return Err(format!(
-                "tiers.{tier}[{index}] must be {{\"model\": \"alias or provider/id\", \"days\": \"mon-fri\", \"hours\": \"09:00-12:00,14:00-18:00\", \"maxActive\": 5}} with at least one of thinking, days, hours, maxActive (local time; hours end exclusive and may wrap midnight; maxActive a positive integer counting runs on this machine)"
+                "tiers.{tier}[{index}] must be {{\"model\": \"alias or provider/id\", \"days\": \"mon-fri\", \"hours\": \"09:00-12:00,14:00-18:00\", \"maxActive\": 5}} with at least one of thinking, days, hours, maxActive (local time; hours end exclusive and may wrap midnight; maxActive a positive integer counting runs on this machine; overflow next|queue, default queue)"
             ));
         }
     }

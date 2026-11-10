@@ -8,7 +8,7 @@
 
 `measure` 是 argv 前缀数组，例如 `{"measure":[["cargo","xtask","bench-concurrency"]]}`；仓库配置覆盖用户配置。`measureCpus` 是预约核列表（如 `"8-11"`），未设置时取最后 `max(2, nproc/3)` 个在线逻辑核。匹配的同事、验收、证据和 lane 命令自动排队到机器级测量预约；预约开始时在跑的 lane 命令会让出预约核，预约期间普通 lane 命令使用其余核。
 
-- 标量：仓库 > 用户 > 内置默认；容量的 `DELEGATE_MAX_ACTIVE` / `DELEGATE_MAX_HEAVY` / `DELEGATE_REPO_MAX_ACTIVE` 最高，`0` 不限。整机默认任务 12、重命令 2，每仓库默认 8。写入默认 `accept`/`evidence` 在仓库未提供字段时用用户值，CLI 可覆盖或关闭；只读不用这两项默认。
+- 标量：仓库 > 用户 > 内置默认；容量的 `DELEGATE_MAX_ACTIVE` / `DELEGATE_MAX_HEAVY` / `DELEGATE_REPO_MAX_ACTIVE` 最高，`0` 不限。整机/仓库防失控上限默认 32/0（仓库不限）、重命令 2；实际限流靠 tier 按模型 `maxActive`、`maxHeavy` 与内存水位。容量不足自动排队，不需手动重派。写入默认 `accept`/`evidence` 在仓库未提供字段时用用户值，CLI 可覆盖或关闭；只读不用这两项默认。
 - 模型选择独立为 `tiers.scout/review/write` 用途、`models` 登记别名与 `thinking` 长度；models/tiers 按键合并。模型全集只来自登记表，Pi 仅校验与提供能力；旧档与模型 thinking 后缀不兼容。匹配、规则、优先级、图片守卫与迁移见 [用途、模型与思维长度](model-routing.md)。
 - 任务测试用可重复的 `--accept-also COMMAND`，按顺序以 `&&` 追加到生效的 `--accept` 或配置默认（无基础命令则单独运行）；与 `--no-accept` 冲突退出 2。`--accept` 替换非空且不同的默认命令时，start 提示原命令与追加用法；meta 的 `accept` 与 summary 的 `accept.command` 记录最终命令。
 - `env` 按键合并，仓库优先；`agentDeny` 按 `(argv, exact)` 去重，省略 `exact` 等于 `false`；仓库同键 hint 覆盖用户值，保留原顺序。仓库 `{"argv":["cargo","xtask","check"],"exact":true,"allow":true}` 撤销完全相同 argv 且 exact 相同的一条用户规则，无需 hint；不撤销不同 exact 或其他前缀规则，用户配置不能声明 `allow: true`。
@@ -25,7 +25,7 @@
 用户级示例：
 
 ```json
-{"maxActive":12,"maxHeavy":2,"repoMaxActive":8,"maxRework":1,
+{"maxActive":32,"maxHeavy":2,"repoMaxActive":0,"maxRework":1,
  "models":{"sol":"provider/code-model","ds":"provider/fast-model"},
  "thinking":"high",
  "tiers":{"scout":"ds","review":"sol","write":[{"model":"sol","maxActive":10},"ds"]},
