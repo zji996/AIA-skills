@@ -2965,6 +2965,18 @@ db.write_text(json.dumps(units))
         self.assertTrue((repo / "migrations/0032_b.sql").exists())
         self.assertNotIn("numberedPrefixConflicts", self.outcome(self.cli("apply", "--json", "--keep", runs[1]["run"])))
 
+    def test_reply_carries_the_sessions_progress_companion(self):
+        repo = self.repo({"a.txt": "old\n"})
+        self.fake_pi([answer("first"), SETTLED])
+        state = self.outcome(self.cli("run", "--read-only", "--workdir", repo, "look"))
+        session = next(p for p in Path(state["dir"], "session").rglob("*.jsonl"))
+        Path(f"{session}.progress.jsonl").write_text("{}\n")
+        self.fake_pi([answer("more"), SETTLED])
+        reply = self.outcome(self.cli("reply", "--wait", state["run"], "more"))
+        fork = Path(reply["dir"], "fork")
+        self.assertEqual(sorted(p.name for p in fork.iterdir()),
+                         [session.name, f"{session.name}.progress.jsonl"])
+
     def test_new_write_task_is_told_numbers_held_by_uncommitted_files(self):
         repo = self.repo({"migrations/0031_base.sql": "base\n"})
         self.fake_pi([answer("done"), SETTLED], pre="echo sql > migrations/0032_a.sql")

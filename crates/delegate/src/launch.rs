@@ -1674,7 +1674,17 @@ pub fn launch(
         let target = run
             .join("fork")
             .join(source.file_name().unwrap_or_default());
-        fs::copy(source, &target).map_err(|e| e.to_string())?;
+        fs::copy(&source, &target).map_err(|e| e.to_string())?;
+        // rpi keeps a progress companion beside the session and refuses to open a
+        // session without it, so the copy carries it along.
+        let beside = |path: &Path| {
+            let mut name = path.as_os_str().to_owned();
+            name.push(".progress.jsonl");
+            PathBuf::from(name)
+        };
+        if beside(&source).is_file() {
+            fs::copy(beside(&source), beside(&target)).map_err(|e| e.to_string())?;
+        }
         fork_value = Some(target.to_string_lossy().into());
     }
     let mut tree = extra["worktree"].clone();
