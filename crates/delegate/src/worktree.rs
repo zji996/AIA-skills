@@ -110,6 +110,21 @@ pub fn generated_config(cfg: &Value, file: &Path) -> Res<(Vec<String>, String)> 
         })?;
     Ok((rules, command.to_string()))
 }
+/// Optional `appendOnly` paths: files both sides only add sections to (benchmark logs,
+/// changelogs). A conflict there keeps both sides, current first, instead of stopping.
+pub fn append_only(source: &Path) -> Res<Vec<String>> {
+    let file = source.join(".delegate.json");
+    let cfg = crate::config::read_file(&file)?.unwrap_or(json!({}));
+    append_only_config(&cfg, &file)
+}
+pub fn append_only_config(cfg: &Value, file: &Path) -> Res<Vec<String>> {
+    if cfg.get("appendOnly").is_none() {
+        return Ok(vec![]);
+    }
+    rule_list(cfg, "appendOnly", file)
+        .map(Option::unwrap_or_default)
+        .map_err(|e| e.replace("generated.appendOnly", "appendOnly"))
+}
 /// Optional `generated.inputs`: when set, `apply` regenerates only if a merged path matches.
 pub fn generated_inputs(source: &Path) -> Res<Vec<String>> {
     let file = source.join(".delegate.json");
@@ -1349,6 +1364,48 @@ fn numbered_prefix(path: &str) -> Option<(String, String)> {
         prefix.into(),
     ))
 }
+/// Numbered files (`0148_name.sql`) that exist only as uncommitted work: in the source
+/// checkout or in another run's worktree. A new task's worktree starts from the last commit
+/// and cannot see them, so its prompt names the numbers to stay clear of.
+pub fn numbers_taken(source: &Path, own: &Path) -> Vec<(String, String, String)> {
+    use std::collections::BTreeSet;
+    let mut places = vec![(source.to_path_buf(), "source checkout".to_string())];
+    for run in crate::runs::all_runs() {
+        let meta = json(run.join("meta.json"));
+        let path = PathBuf::from(s(&meta["worktree"], "path"));
+        if Path::new(s(&meta["worktree"], "source")) == source
+            && path != own
+            && path.is_dir()
+            && !places.iter().any(|(seen, _)| seen == &path)
+        {
+            places.push((path, s(&meta, "name").to_string()));
+        }
+    }
+    let mut taken = BTreeSet::new();
+    for (place, label) in places {
+        let Ok(out) = Command::new("git")
+            .arg("-C")
+            .arg(&place)
+            .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+            .output()
+        else {
+            continue;
+        };
+        for entry in out.stdout.split(|b| *b == 0) {
+            let entry = String::from_utf8_lossy(entry);
+            let Some((status, path)) = entry.split_at_checked(3) else {
+                continue;
+            };
+            if !(status.starts_with("??") || status.starts_with('A')) {
+                continue;
+            }
+            if let Some((directory, prefix)) = numbered_prefix(path) {
+                taken.insert((directory, prefix, label.clone()));
+            }
+        }
+    }
+    taken.into_iter().collect()
+}
 fn numbered_conflicts(
     source: &Path,
     additions: &[String],
@@ -1440,6 +1497,7 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
     let mut before = before.to_string();
     let source = PathBuf::from(s(&meta["worktree"], "source"));
     let (generated_paths, generate_command) = generated(&source)?;
+    let append_only = append_only(&source)?;
     let worktree = PathBuf::from(s(&meta["worktree"], "path"));
     let mut large = json(run.join("changes.json"))["afterLarge"].clone();
     let exclude = strings(&meta["snapshotExclude"]);
@@ -1530,9 +1588,24 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
                 .args([&minefile, &basefile, &theirfile])
                 .status()
                 .map_err(|e| e.to_string())?;
+            let mut clean = status.success();
+            if !clean && matches_rule(&path, &append_only) {
+                write(&minefile, mine).map_err(|e| format!("{}: {e}", minefile.display()))?;
+                clean = Command::new("git")
+                    .args(["merge-file", "--union"])
+                    .args([&minefile, &basefile, &theirfile])
+                    .status()
+                    .map_err(|e| e.to_string())?
+                    .success();
+                if clean {
+                    apply_progress(format!(
+                        "kept both sides / 两边都保留（appendOnly）: {path}"
+                    ));
+                }
+            }
             let merged = fs::read(&minefile).map_err(|e| format!("{}: {e}", minefile.display()))?;
             fs::remove_dir_all(&scratch).map_err(|e| format!("{}: {e}", scratch.display()))?;
-            if status.success() {
+            if clean {
                 actions.push(Action {
                     kind: "merged".into(),
                     path,

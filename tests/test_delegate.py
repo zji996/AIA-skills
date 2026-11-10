@@ -2765,6 +2765,19 @@ db.write_text(json.dumps(units))
         self.assertEqual((repo / "gen/out.txt").read_text(), "one\n2\nthree\n")  # regenerated from the merge
         self.assertIn("regenerated", applied.stdout + applied.stderr)
 
+    def test_append_only_conflict_keeps_both_sides(self):
+        repo = self.repo({"log.md": "# log\n", "code.txt": "old\n"})
+        (repo / ".delegate.json").write_text(json.dumps({"appendOnly": ["log.md"]}))
+        self.fake_pi([answer("done"), SETTLED], pre="echo theirs >> log.md; echo theirs > code.txt")
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        (repo / "log.md").write_text("# log\nmine\n")
+        (repo / "code.txt").write_text("mine\n")
+        applied = self.cli("apply", "--json", "--keep", state["run"], "--merge")
+        # The log keeps both additions, current first; an ordinary file still gets markers.
+        self.assertEqual((repo / "log.md").read_text(), "# log\nmine\ntheirs\n")
+        self.assertIn("appendOnly", applied.stderr)
+        self.assertIn("<<<<<<<", (repo / "code.txt").read_text())
+
     def test_generated_inputs_skip_regeneration_for_unrelated_changes(self):
         repo = self.repo({"src.txt": "1\n", "docs/a.md": "a\n", "gen/out.txt": "1\n"})
         (repo / ".delegate.json").write_text(json.dumps({"generated": {
@@ -2951,6 +2964,19 @@ db.write_text(json.dumps(units))
         self.assertTrue((repo / "migrations/0032_a.sql").exists())
         self.assertTrue((repo / "migrations/0032_b.sql").exists())
         self.assertNotIn("numberedPrefixConflicts", self.outcome(self.cli("apply", "--json", "--keep", runs[1]["run"])))
+
+    def test_new_write_task_is_told_numbers_held_by_uncommitted_files(self):
+        repo = self.repo({"migrations/0031_base.sql": "base\n"})
+        self.fake_pi([answer("done"), SETTLED], pre="echo sql > migrations/0032_a.sql")
+        self.cli("run", "--worktree", "--workdir", repo, "--name", "first", "task")
+        (repo / "migrations/0033_local.sql").write_text("sql\n")
+        self.fake_pi([answer("done"), SETTLED])
+        second = self.cli("run", "--worktree", "--workdir", repo, "task")
+        self.assertIn("migrations 0032 (first)", second.stderr)
+        self.assertIn("migrations 0033 (source checkout)", second.stderr)
+        self.assertNotIn("0031", second.stderr)
+        read_only = self.cli("run", "--read-only", "--workdir", repo, "task")
+        self.assertNotIn("已占用编号", read_only.stderr)
 
     def test_numbered_prefix_final_plan_excludes_deleted_and_generated(self):
         repo = self.repo({"m/001_old.sql": "old\n", "m/base": "base\n", "gen/001_old": "old\n"})
@@ -3190,7 +3216,7 @@ db.write_text(json.dumps(units))
         first = self.outcome(self.cli("start", "--worktree", "--workdir", repo, "--name", "hotwork", "task"))
         edited = Path(first["worktree"]) / "src/hot_file.rs"
         deadline = time.time() + 10
-        while edited.read_text() != "new\n" and time.time() < deadline:
+        while not (edited.is_file() and edited.read_text() == "new\n") and time.time() < deadline:
             time.sleep(0.05)
         try:
             named = self.cli("start", "--worktree", "--workdir", repo, "--name", "second", "fix src/hot_file.rs")

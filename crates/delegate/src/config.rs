@@ -264,6 +264,7 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
     if repo {
         crate::worktree::work_config(value, path)?;
         crate::worktree::generated_config(value, path)?;
+        crate::worktree::append_only_config(value, path)?;
         match value.get("applyVerify") {
             None | Some(Value::Null) | Some(Value::Bool(_)) => {}
             Some(Value::String(s)) if !s.trim().is_empty() && !s.contains('\0') => {}
@@ -291,7 +292,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         validate(user, &user_file, false)?;
         crate::source_build::validate(user, &user_file, top)?;
         sources.push("user");
-        for key in ["worktree", "generated", "applyVerify"] {
+        for key in ["worktree", "generated", "appendOnly", "applyVerify"] {
             if user.get(key).is_some() {
                 ignored.push(key);
             }

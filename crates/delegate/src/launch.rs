@@ -1581,6 +1581,23 @@ pub fn launch(
     if extra["protectGenerated"].is_object() {
         actual.push_str(&format!("\n\n生成物保护例外 / Generated protection exception: {} 只允许通过生成命令改动 / may only be changed by the generator: `{}`. You may run this command; completion reruns it and rejects manually edited generated output. This exception overrides the protected-path restriction only for these generated paths.\n", extra["protectGenerated"]["paths"], s(&extra["protectGenerated"], "command")));
     }
+    if mode != "read-only" && extra["worktree"].is_object() {
+        let taken = crate::worktree::numbers_taken(
+            Path::new(s(&extra["worktree"], "source")),
+            Path::new(s(&extra["worktree"], "path")),
+        );
+        if !taken.is_empty() {
+            let list = taken
+                .iter()
+                .map(|(directory, prefix, owner)| format!("{directory} {prefix} ({owner})"))
+                .collect::<Vec<_>>()
+                .join("、");
+            actual.push_str(&format!(
+                "\n\n未提交的编号文件已占用这些编号，你的工作区里看不到；在同目录新增编号文件时用更大的编号 / Numbered files not yet committed hold these numbers and are not in your worktree; number new files in those directories above them: {list}\n"
+            ));
+            eprintln!("delegate: 已占用编号 {list}");
+        }
+    }
     if let Some(limit) = o.max_answer {
         actual.push_str(&format!(
             "\n\n答复不超过 {limit} 字 / Answer in no more than {limit} characters.\n"

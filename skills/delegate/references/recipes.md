@@ -121,6 +121,7 @@ $D wait
 - 只禁无过滤的数据库全量检查时用 `{"argv":["cargo","xtask","infra-test"],"exact":true,"hint":"带过滤参数跑相关用例"}`；额外参数放行。用户/仓库去重和 `allow: true` 撤销都按 `(argv, exact)`，撤销时保留同样的 exact。
 - 顶层 `accept` 只作用于写入任务；任务测试用 `--accept-also` 追加，`--accept` 覆盖，`--no-accept` 关闭（不能与追加同用）。并行写入用 `--protect` 划分文件所有权；验收覆盖相关 ratchet、contracts、docs 门禁，合并后再跑全量。
 - `generated.paths` 的匹配语义同 `--protect`（目录以 `/` 结尾）。这些生成文件仍出现在改动清单和 diff 中，但 `apply` 不合并或覆盖它们；合并其他文件后，在源仓库根通过 lane 运行 `sh -c` 执行 `generated.command`（设了 `generated.inputs` 时只在合并路径命中它时运行），输出写入 run 目录的 `generate.log`。`--dry-run` 只报告动作；生成失败时已合并文件保留，需查看日志后重试。见 `docs/delegate-spec.md` §6.4。
+- `appendOnly`（仓库配置，匹配语义同 `--protect`）列出各任务只往里追加段落的文件（评测记录、CHANGELOG）：两边都加了内容而冲突时，`apply` 两段都保留（源仓库的在前）并在 stderr 报一行，不写冲突标记；其余文件照常。
 - 界面实现用 `--tier write` 并给验收；截图意见用 `--read-only --tier review --image shot.png`，图片不会自动换模型。
 
 常见问题与不适合委派的情况见 [pitfalls.md](pitfalls.md)。
