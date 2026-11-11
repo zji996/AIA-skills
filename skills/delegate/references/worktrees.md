@@ -31,9 +31,9 @@
 
 `--read-only` 在 git 仓库里默认也用这样的 worktree（`--in-place` 除外），只作为供阅读的快照：主控同时的编辑既不影响它读到的内容，也不会被算成它的改动；它违规写入的文件留在 worktree 里，记为 `readOnlyViolation`，不能 `apply`。Pi 默认只给读取/搜索工具；`--shell` 在快照中增加 bash，适合查日志、只读查询，任何文件差异都拒收（非 git / `--in-place` 不支持）；`setup` 照常执行。详见 [并行安全](parallel-safety.md)。
 
-worktree 按对话共享，最后一个引用被 `clean`/过期清理时移除（池槽仅释放）；`agent-handoff` 列未合入 worktree。
+worktree 按对话共享，最后一个引用被 `clean`/过期清理时移除（池槽仅释放且不报移除失败）；`agent-handoff` 列未合入 worktree。
 
-成功 `apply` 默认回收 worktree，轻量保留 run 的 `meta.json`、任务说明、最终答复、摘要与 `applied.patch` 7 天（`DELEGATE_KEEP_DAYS`，0 禁止自动过期）；`clean <run>` 与 `clean --finished` 可提前删除。普通 `reply` 会从当前源分支新建 worktree，将原任务说明、上次答复和追加说明交给新会话；`reply --fresh` 仍只使用本轮说明。共享输入沿用原路径，repo 内同位置已有文件则报错；链接并非写保护。
+成功 `apply`（含 merge/零改动/reply）登记共享轮次 `.applied`，显示「已合入」；回收 worktree，轻量记录与补丁保留 7 天（`DELEGATE_KEEP_DAYS`，0 禁用）；`clean` 可提前删。普通 `reply` 会从当前源分支新建 worktree，将原任务说明、上次答复和追加说明交给新会话；`reply --fresh` 仍只使用本轮说明。共享输入沿用原路径，repo 内同位置已有文件则报错；链接并非写保护。
 
 写入任务未 apply 时，`status`/`wait`/`clean` 仅检查累计改动清单中的路径，按类型、大小和哈希比较源工作树与同事结束时的最终内容，执行位也须一致，删除路径须在源中不存在；不要求提交进 HEAD。全部包含时写 `.applied` 并记 `appliedBy: "detected"`，短行“已合入（主干已含改动）”，`next` 改为清理建议，`clean --finished` 按已合入处理。仅部分包含或读取失败时视为未检测到，沿用原 apply 建议；检测不代表验收已在源中复跑。
 

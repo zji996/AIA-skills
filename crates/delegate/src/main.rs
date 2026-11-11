@@ -14,6 +14,8 @@ mod output;
 mod pool;
 mod probe;
 mod process_match;
+mod pending_reply;
+mod source_guard;
 mod queue;
 mod resources;
 mod runs;
@@ -186,6 +188,9 @@ fn print_continue(next: &str) {
 }
 /// A finished run's status, plus how far the source moved since its worktree snapshot.
 fn outcome_line(run: &Path, timing: Option<&str>) -> String {
+    if !runs::active(&runs::state(run)) {
+        worktree::detect_applied(run, &json(run.join("meta.json")));
+    }
     let mut status = runs::status(run);
     if runs::active(&runs::state(run)) {
         return output_line(run, status);
@@ -782,6 +787,7 @@ fn wait_each(
     let mut watched = std::collections::HashSet::new();
     let mut reported = std::collections::HashSet::new();
     let mut code = 0;
+    let mut delivered = false;
     loop {
         if show_progress {
             for run in &list {
@@ -791,6 +797,10 @@ fn wait_each(
                 );
             }
         }
+        // Explicit controller cancellation and dependency skips are not deliveries.
+        reported.extend(list.iter().filter(|r| {
+            r.join(".stopped").exists() || matches!(runs::state(r).as_str(), "stopped" | "skipped")
+        }).cloned());
         let done = list
             .iter()
             .filter(|r| !reported.contains(*r) && !runs::active(&runs::state(r)))
@@ -828,6 +838,7 @@ fn wait_each(
             } else {
                 code = collect_timed(&done, None, false, full, show_result, Some(&already), next);
             }
+            delivered = true;
             reported.extend(done);
             if !stream {
                 break;
@@ -854,7 +865,7 @@ fn wait_each(
                 begin = Instant::now();
                 continue;
             }
-            if stream || reported.is_empty() {
+            if stream || !delivered {
                 code = 75;
             }
             break;
@@ -977,6 +988,10 @@ fn clean(args: &[String]) -> Res<i32> {
     for run in targets {
         let st = runs::state(&run);
         let name = run.file_name().unwrap_or_default().to_string_lossy();
+        if pending_reply::status(&run).is_some() && !has(&flags, "--force") {
+            eprintln!("delegate: keep run {name}; pending reply (stop cancels it)");
+            continue;
+        }
         if runs::active(&st) || runs::agent_alive(&run) {
             if runs::active(&st) {
                 eprintln!("delegate: skip active run {name}");
@@ -1031,6 +1046,9 @@ fn stop(args: &[String]) -> Res<i32> {
     }
     for reference in args {
         let run = runs::resolve_head(&reference)?;
+        crate::pending_reply::cancel(&run)?;
+        let run = runs::resolve_head(&reference)?;
+        crate::pending_reply::cancel(&run)?;
         let old = runs::state(&run);
         if !runs::active(&old) && runs::agent_alive(&run) {
             let pid = read(run.join("agent.pid"))
@@ -1377,6 +1395,11 @@ fn main_inner(args: &[String]) -> Res<i32> {
     if help_requested && help::print(Some(command)) {
         return Ok(0);
     }
+    if command == "_reply-pending" {
+        pending_reply::deliver(Path::new(rest.first().ok_or("missing run")?))?;
+        return Ok(0);
+    }
+    if command == "_source-check" { return source_guard::command(rest); }
     if command == "_supervise" {
         let run = rest.first().ok_or("missing run")?;
         supervise::supervise(Path::new(run))?;
@@ -1430,7 +1453,13 @@ fn main_inner(args: &[String]) -> Res<i32> {
             }
         }
         "reply" => {
-            let o = launch::parse_launch(rest, true, true)?;
+            let mut o = launch::parse_launch(rest, true, true)?;
+            if o.when_done && pending_reply::enqueue(rest, &mut o)? {
+                let run = runs::resolve_head(o.run.as_deref().unwrap_or("last"))?;
+                println!("{}", status_line(&run));
+                eprintln!("delegate: pending reply recorded; stop cancels it");
+                return Ok(0);
+            }
             let max = o.max;
             let prog = o.progress;
             let full = o.full;

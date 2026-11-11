@@ -316,7 +316,7 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
 pub fn status(run: &Path) -> Value {
     let meta = json(run.join("meta.json"));
     let st = state(run);
-    if !active(&st) {
+    if !active(&st) && json(run.join("changes.json"))["finalEntries"].is_object() {
         worktree::detect_applied(run, &meta);
     }
     let sum = json(run.join("summary.json"));
@@ -391,7 +391,10 @@ pub fn status(run: &Path) -> Value {
         out["conflictMarkers"] = json!(unresolved);
     }
     if active(&st) {
-        let source_changes = crate::source_watch::changed(&meta);
+        let source_changes = strings(&json(run.join("source-observed.json")));
+        if crate::source_watch::busy(&meta) {
+            out["busy"] = json!("source workspace; showing cached observation");
+        }
         if !source_changes.is_empty() {
             out["sourceWorkspaceChanges"] = json!(source_changes);
         }
@@ -501,6 +504,7 @@ pub fn status(run: &Path) -> Value {
     if !blind.is_empty() {
         out["acceptBlind"] = json!(blind);
     }
+    if let Some(pending) = crate::pending_reply::status(run) { out["pendingReply"] = pending; }
     let result = run.join("result.md");
     if meta["agentDeny"]
         .as_array()
@@ -580,6 +584,9 @@ pub fn remove_after_apply(run: &Path) -> Vec<String> {
     }
     let keep = [
         "meta.json",
+        "pending-reply.json",
+        "reply.lock",
+        "reply-delivered.json",
         "applied.patch",
         "prompt.md",
         "result.md",
@@ -609,6 +616,7 @@ pub fn remove_after_apply(run: &Path) -> Vec<String> {
     let _ = write(run.join("exit_code"), "0\n");
     let mut diagnostics = containers.diagnostic.into_iter().collect::<Vec<_>>();
     if !shared
+        && !crate::pool::is_slot(Path::new(path))
         && Path::new(path).is_absolute()
         && path != s(&meta["worktree"], "source")
         && Path::new(path).exists()
@@ -652,6 +660,7 @@ pub fn prune() {
         let done = run.join("exit_code");
         // 只显示过截断答复的 run 不自动清理，全文仍待读取。
         if run.join(".delivered").is_file()
+            && crate::pending_reply::status(&run).is_none()
             && !run.join(".truncated").exists()
             && done.is_file()
             && !unmerged(&run)

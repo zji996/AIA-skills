@@ -25,7 +25,7 @@
 | 文件 | 内容 |
 |---|---|
 | `.waiting` / `queue.json` | 延后启动标记 / 容量队原因、前方人数与入队时间；放行后 .waiting 移除 |
-| `meta.json` | 用途 `tier`/`tierInferred`、模型 `model`/`modelName`、`thinking`、`tierModels`/`tierCandidates`；同事与启动/验收参数；`standing`/`standingSources`、`defaults`、`share`、`resources`、`acceptBlind`、`resultDisplayChars`、`maxAnswer`；可选 `agentPinned`、`repoKey`、`evidenceCommand`/`evidenceTimeoutSeconds`/`evidence`；`protect` 字符串数组与可选 `protectReasons` 原因映射（reply/fresh 继承） |
+| `meta.json` | 用途 `tier`/`tierInferred`、模型 `model`/`modelName`、`thinking`、`tierModels`/`tierCandidates`；同事与启动/验收参数；`standing`/`standingSources`、`defaults`、`share`、`resources`、`acceptBlind`、`resultDisplayChars`、`maxAnswer`；可选 `agentPinned`、`repoKey`、`evidenceCommand`/`evidenceTimeoutSeconds`/`evidence`；`protect` 字符串数组、`allow` 本次开放路径与可选 `protectReasons` 原因映射（reply/fresh 继承） |
 | `prompt.md` | 同事实际收到的任务说明；末尾可能附完成标准（`--accept`）与只读边界（worktree 里的只读任务） |
 | `events.jsonl` | 过滤后的全过程：读取、命令、编辑路径、错误、每轮模型与用量、重跑；不含编辑全文 |
 | `result.md` | 完整答复；自动压缩成功时为压缩后的答复 |
@@ -40,6 +40,10 @@
 | `generate.log` | `apply` 执行 `.delegate.json` 的 `generated.command` 时的输出 |
 | `.generate-pending` | 生成未成功，后续 apply 仍须重试；成功后清除 |
 | `session/` / `fork/` | Pi 本轮的会话；`reply` 分叉所用的上一轮会话副本 |
+| `pending-reply.json` / `reply.lock` | 待续答正文/选项与投递取消锁；行为见 [续接](practice.md) |
+| `reply-delivered.json` | 后台待续答成功启动后的子 run 与时间 |
+| `.stopped` | 主控 stop 的标记，避免 wait --any 将取消当作交付 |
+| `bash-env` | 仅同事 Bash 继承的源树误写 DEBUG 检查（见并行安全），验收等主控命令不注入 |
 | `.applied` | `--worktree` 改动已合入；`appliedBy: "detected"` 区分源工作树检测到的手动合入 |
 | `accept.log` | 验收命令的完整输出与退出码；`summary.json` 的 `accept.queuedSeconds` 是它在 lane 中排队的秒数 |
 | `evidence.log` | 证据命令完整输出；结果在 meta 和 JSON 的可选 `evidence` 中，不决定状态 |
@@ -52,7 +56,7 @@
 | `exit_code` | 结束标记：`0` 为 delivered/answered，`1` 为其他结局；运行中不存在 |
 | `.delivered` | 结果已被 `run`/`wait`/`result` 读取过 |
 
-`finishedAt` 在旧记录缺失时省略；无参 wait、any/stream 的 `completionTiming` 区分首次检查已结束与等待中结束。`changes` 是本轮，`pendingChanges` 是累计待合入量。验收历史证据在 `accept.tree`/`treeAfter`，完整性在 `snapshotComplete`/`snapshotReason`。`appliedBy` 区分检测合入与 apply 合入。`agent-handoff` 依赖 meta、exit_code、.delivered 的名字与含义。
+`completionTiming` 区分旧结局与等待中新完成，`changes` 本轮、`pendingChanges` 累计。验收证据见 `accept.tree`/`treeAfter`、`snapshotComplete`/`snapshotReason`；`agent-handoff` 依赖 meta、exit_code、.delivered 的名字与含义。
 
 ## 清理
 
@@ -60,7 +64,7 @@
 
 每次 `start` 会删除结束超过 7 天且结果已读取的记录（只显示过截断答复的不算已读取）；`DELEGATE_KEEP_DAYS` 调整天数，设为 `0` 关闭。
 
-worktree 移除回收 compose 容器。5.24 meta 新增 `sourceBuildBytes`、`sourceBuildPaths`、`sourceBuildMeasuredAt`、`sourceBuildMeasuredNs`；status/wait 独立追加 `sourceBuildDisk`。磁盘提示的字段与失败语义见 [清理](cleanup.md)。
+容器回收、磁盘字段与失败语义见 [清理](cleanup.md)。
 
 ## 环境变量
 
@@ -89,4 +93,4 @@ worktree 移除回收 compose 容器。5.24 meta 新增 `sourceBuildBytes`、`so
 
 ## 代码结构
 
-`bin/delegate` 是按 `bin.sha256` 下载的静态二进制；源码在 `crates/delegate/`。同事适配表在 `agents.rs`，行为契约见 `docs/delegate-spec.md`，主控宿主接入见 `docs/delegate-protocol.md`。`protocol` 显示会话标识、CLI 文件与版本。
+`bin/delegate` 按 `bin.sha256` 下载；源码 `crates/delegate/`，行为契约 `docs/delegate-spec.md`，主控接入 `docs/delegate-protocol.md`；`protocol` 显示会话标识、CLI 与版本。

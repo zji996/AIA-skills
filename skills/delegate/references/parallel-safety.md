@@ -19,9 +19,13 @@ $D clean impl                                   # 确认不再需要后删除
 
 ## 工作目录与只读调查
 
-写入提示固定附「只在当前工作目录内改文件；提示里出现的其他绝对路径只读」。正文含源仓库绝对路径时启动给 note，不拦截。`meta.sourceStatusBaseline` 保存启动时 porcelain 路径/内容/索引指纹；运行中定期观察，`status` 实时显示 `sourceWorkspaceChanges`。结束时若自己的工作树零改动而源出现新增差异，判 `rejected`，显示「写到了源仓库」及数量/路径，JSON `sourceWriteViolation`，不再算提问。
+写入提示固定附「只在当前工作目录内改文件；提示里出现的其他绝对路径只读」。正文含源仓库绝对路径时启动给 note，不拦截。`meta.sourceStatusBaseline` 保存启动时 porcelain 路径/内容/索引指纹；运行中定期观察，`status` 显示 supervisor 定期缓存的 `sourceWorkspaceChanges`（非实时刷新）。结束时若自己的工作树零改动而源出现新增差异，判 `rejected`，显示「写到了源仓库」及数量/路径，JSON `sourceWriteViolation`，不再算提问。
 
-delegate 自己的 apply 登记已写路径的最终指纹，排除其他路合入带来的差异；同路径后来再次被编辑仍能发现。它不能区分主控手改与 Agent 越界写入，属于误操作检测而非权限沙箱；比较范围遵循 Git status（不含忽略文件），改后恢复原样不算最终差异。
+delegate 自己的 apply 登记已写路径的最终指纹，排除其他路合入带来的差异；同路径后来再次被编辑仍能发现。它不能区分主控手改与 Agent 越界写入，属于误操作检测而非权限沙箱；比较范围遵循 Git status（不含忽略文件，也排除允许存日志的源 `.local/`），改后恢复原样不算最终差异。
+
+同事的非交互 Bash 通过 `BASH_ENV`/DEBUG 在命令执行前检查：cd 进入源树不拦，cat/rg/grep/head/tail/ls、普通 sed/find、git status/diff/log 等读取放行；常见直接输出重定向到源树、在源树执行写命令或可能写入的未知 helper 则退出 77，仅一行指出拒绝的写入路径与本轮 worktree。`cp`/`rsync`/`install`/`ln` 只按目标判定（末个非选项参数，或 `-t`/`--target-directory` 指定目录；rsync 的 `-t` 仍是保留时间），允许从源树复制/链接到 worktree，反向或源树内复制仍拒绝。源 `.local/` 的明确日志输出与简单文件操作允许；本轮 worktree 的读写不受影响。拒绝发生在 shell 执行重定向之前；验收、生成器、主控 lane 不注入。
+
+这是防误操作的字面启发式，不是 shell 解析器或权限沙箱：不可靠识别变量/命令替换形成的输出路径、复杂引号/空格、嵌套解释器、脚本内部写入、外部服务写入；非 Bash、`bash -p`/移除 BASH_ENV/重置 trap 可绕开，读取命令的特殊写入选项也不穷举。未知 helper 在源目录保守拒绝，应转到 worktree 执行；不能保证所有读取变体都不误报。事后源差异检查仍保留。
 
 `start --tier scout|review --model <别名> --shell "查日志 / 跑只读 SELECT"`：tier 决定只读用途，model 只换模型（write 档也可同时指定）；只读默认仅文件读取/搜索工具，`--shell` 增加 Pi `bash`。也可 `--read-only --shell`。shell 调查必须在 git worktree 快照内（拒绝非 git 或 `--in-place`），不是源目录；结束时工作树或源有差异就判 `rejected`、显示「只读任务产生了写入」，始终禁止 apply。普通 reply 继承 shell；外部服务/数据库写入不在文件核对范围，查询必须自行保证只读。
 

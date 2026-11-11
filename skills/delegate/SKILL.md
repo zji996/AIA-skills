@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI（pi-kit 的 rpi 通道下 `pi` 即 rpi）。
 metadata:
-  version: "6.16.0"
+  version: "6.17.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -29,8 +29,8 @@ $D wait                                                                  # 放�
 |---|---|
 | 读材料、审查、第二意见 | `$D start --read-only "…"`；限篇幅加 `--max-answer 800` |
 | 看截图或设计图 | `$D start --read-only --image shot.png "…"` |
-| 改代码，测试通过才算完 | `$D start --worktree --accept "make test" "…"`；不许碰的路径加 `--protect tests/` |
-| 追问或返工 | `$D reply <name> "…"`；开新会话加 `--fresh`，带上你后来的改动加 `--sync` |
+| 改代码，测试通过才算完 | `$D start --worktree --accept "make test" "…"`；不许碰加 `--protect tests/`，本次放开加 `--allow tests/unit/` |
+| 追问或返工 | `$D reply <name> "…"`；开新会话加 `--fresh`，带上后来的改动加 `--sync`，运行中先记追问加 `--when-done` |
 | 先 A 后 B | `$D start --after <A> …`；写入 B 从 A 交付的改动起步，`apply A B` 按序合入 |
 | 自己跑重检查、测性能 | `$D lane make check`；测量用 `lane --measure` |
 | 节点不稳、换档前先测连通 | `$D probe`：走 Pi 本身（不是裸 HTTP）测各档模型，不建任务、不占名额 |

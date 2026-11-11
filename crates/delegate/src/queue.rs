@@ -88,20 +88,14 @@ pub fn status(run: &Path) -> Option<Value> {
     if !run.join(".waiting").exists() || !run.join("queue.json").is_file() {
         return None;
     }
-    let _guard = lock(&state_dir().join(".start.lock"), true, false).ok()?;
-    if !run.join(".waiting").exists() {
-        return None;
-    }
-    let meta = json(run.join("meta.json"));
-    let active = launch::active_machine(&state_dir());
     let mut out = json(run.join("queue.json"));
-    if let Ok(Some(reason)) = reason(&meta, &active) {
-        out["reason"] = json!(reason);
+    // Admission owns the live view. Listings never scan processes or wait for it.
+    if let Ok(_guard) = lock(&state_dir().join(".start.lock"), false, true) {
+        let meta = json(run.join("meta.json"));
+        out["ahead"] = json!(waiting().iter().filter(|(_, other)| key(other) < key(&meta)).count());
+    } else {
+        out["busy"] = json!(true);
     }
-    out["ahead"] = json!(waiting()
-        .iter()
-        .filter(|(_, other)| key(other) < key(&meta))
-        .count());
     Some(out)
 }
 pub fn notice(run: &Path) {

@@ -697,6 +697,7 @@ pub fn run_agent(
         .stderr(Stdio::from(stderr));
     clean_env(&mut c, &meta["env"]);
     crate::deny::inject(&mut c, meta, run)?;
+    crate::source_guard::inject(&mut c, meta, run)?;
     c.env("DELEGATE_AGENT", s(meta, "agent"))
         .env("DELEGATE_RUN_DIR", s(meta, "dir"));
     c.env("PI_DELEGATE_ACTIVE", "1");

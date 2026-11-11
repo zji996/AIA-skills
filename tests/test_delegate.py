@@ -681,7 +681,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         self.assertEqual(complete["files"], ["a.txt", "crates/protocol/new"])
         self.assertIn("shape", complete)
 
-    def test_running_default_output_has_relative_changes_and_truncated_command(self):
+    def test_running_default_output_uses_events_and_truncated_command(self):
         repo = self.repo({"a.txt": "old\n"})
         gate = self.work / "gate"
         command = "cargo test " + "x" * 120
@@ -695,14 +695,16 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         self.until(lambda: (run / "events.jsonl").exists() and "cargo test" in (run / "events.jsonl").read_text(), "command event")
         out = self.cli("status", "running", human=True)
         self.assertEqual(out.returncode, 0, out.stderr)
-        for field in ("running · 运行中", "pi/m · write（推断）", "改 1 个文件 +1/-1", "最近：cargo test", "下一步："):
+        for field in ("running · 运行中", "pi/m · write（推断）", "最近：cargo test", "下一步："):
             self.assertIn(field, out.stdout)
         recent = out.stdout.split("最近：", 1)[1].split(" · ", 1)[0]
         self.assertLessEqual(len(recent), 100)
         self.assertTrue(recent.endswith("..."))
         self.assertNotIn(str(self.work), out.stdout)
         gate.touch()
-        self.assertEqual(self.cli("wait", state["run"]).returncode, 0)
+        settled = self.cli("wait", state["run"])
+        self.assertEqual(settled.returncode, 0)
+        self.assertIn("改 1 个文件 +1/-1", self.cli("status", state["run"], human=True).stdout)
 
     def test_agent_executable_and_version_are_recorded_in_meta_and_status(self):
         self.fake_pi([answer("ok"), SETTLED])
@@ -3657,7 +3659,8 @@ fi
         rec = json.loads((run / "changes.json").read_text())
         del rec["finalEntries"]
         (run / "changes.json").write_text(json.dumps(rec))
-        detected = self.outcome(self.cli("status", state["run"]))
+        self.assertNotIn("applied", self.outcome(self.cli("status", state["run"])))
+        detected = self.outcome(self.cli("wait", state["run"]))
         self.assertEqual(detected["appliedBy"], "detected")
 
     def test_clean_detects_manual_merge_without_status_and_large_files(self):

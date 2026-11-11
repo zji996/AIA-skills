@@ -1,5 +1,14 @@
 # delegate
 
+## 6.17 长会话控制摩擦
+
+- 仓库默认保护 apps/，本轮授权前端：`start --allow apps/web/` 回显开放、提示仍保护其他路径，修改 web 不拒收，reply/fresh 继承；仓库配置不变。Per-run protection lift.
+- 同事仍在跑但主控已有补充：`reply --when-done impl --prompt-file -` 即时保存说明，主控 shell 退出后交付一次，status 显示待续答，stop 取消；普通 reply 拒绝时指明该选项。Deferred reply mailbox.
+- 停掉尚未开始的 after 任务与另一路正在跑的任务同时 wait：any 不收停止/跳过，只收自主结束，all 仍等全部离开活跃态。Ignore controller stop/skip in any-wait.
+- 池槽 apply 与无改动 reply 的重复 apply/merge：槽目录保留、不误报移除失败，相关轮次显示已合入，clean 不报 never applied。Applied round bookkeeping.
+- 编译中锁住源观察锁与容量锁：status 仍及时返回缓存，显示 busy、不重新快照/diff 已结束任务。Cached nonblocking status.
+- Bash 在源目录 cat/rg/sed 查询放行，cd 后写文件或直接重定向到源树拒绝一行并指出 worktree；源 .local 日志允许；cp/rsync/install/ln 从源树到 worktree 放行，反向、源树内复制与目标目录命中源树拒绝，单行指出写入路径。变量/脚本/非 Bash 的检测边界必须说明，不声称权限隔离。Source checkout write accident guard.
+
 ## 6.16 进程边界与选模适配
 
 - 并行同事收尾 `pkill -f sleep` / `killall sleep`：只结束本次 run 所有 scope 的匹配进程，运行外同名进程仍在；`pgrep` 仅返回本运行 pid，只读 `--shell` 同样。无 systemd/cgroup 则非零并提示 `kill <pid>`，零匹配保留退出码 1。Scoped process matching fails closed without cgroups.

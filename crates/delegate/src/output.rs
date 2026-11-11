@@ -1,4 +1,3 @@
-use crate::changes;
 use crate::common::*;
 use crate::runs;
 use serde_json::{json, Value};
@@ -251,6 +250,9 @@ pub fn human(run: &Path, status: &Value) -> String {
         format!("{label} {elapsed}"),
         agent_label(status),
     ];
+    if status["pendingReply"].is_object() { parts.push("待续答 / pending reply".into()); }
+    if !s(status, "busy").is_empty() { parts.push(format!("busy: {}", s(status, "busy"))); }
+    if status["queue"]["busy"] == json!(true) { parts.push("busy: capacity; showing cached queue".into()); }
     if status["queue"].is_object() {
         let queue = &status["queue"];
         let minutes =
@@ -259,26 +261,14 @@ pub fn human(run: &Path, status: &Value) -> String {
         parts.push(s(queue, "reason").into());
         parts.push(format!("前面还有 {} 个", n(queue, "ahead")));
     }
-    let mut totals = status["changes"].clone();
-    let mut paths = status["files"]
+    let totals = status["changes"].clone();
+    let paths = status["files"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
         .map(str::to_string)
         .collect::<Vec<_>>();
-    // A worktree is still being checked out until the agent starts; counting it then shows mass deletions.
-    if runs::active(state) && !meta["base"].is_null() && run.join("agent.pid").exists() {
-        let top = Path::new(s(&meta, "top"));
-        if let Some(after) = changes::snapshot(top, run, &changes::managed_paths(&meta)) {
-            if let Ok(diff) =
-                changes::tree_changes(top, &meta["base"], &after, meta["worktree"].is_object())
-            {
-                paths = diff.iter().map(|c| s(c, "path").to_string()).collect();
-                totals = json!({"files":diff.len(),"added":diff.iter().map(|c|n(c,"added")).sum::<i64>(),"deleted":diff.iter().map(|c|n(c,"deleted")).sum::<i64>()});
-            }
-        }
-    }
     let mut dirs = BTreeMap::<String, usize>::new();
     for path in &paths {
         let relative = repository_relative(path, s(&meta, "top"));

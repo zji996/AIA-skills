@@ -1903,7 +1903,8 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
     }
     if actions.is_empty() && conflicts.is_empty() && !pending_generation {
         eprintln!("delegate: no changes to apply");
-        return Ok(0);
+        // Still record this round (including zero-change replies) as applied.
+
     }
     if !conflicts.is_empty() && !merge {
         for p in &conflicts {

@@ -40,6 +40,7 @@ pub fn fingerprint(source: &Path) -> Res<Value> {
     let mut out = json!({});
     for row in data.split(|b| *b == 0).filter(|r| r.len() > 3) {
         let path = String::from_utf8_lossy(&row[3..]).into_owned();
+        if path == ".local" || path.starts_with(".local/") { continue; }
         let target = source.join(&path);
         let content = if target.is_symlink() {
             fs::read_link(&target)
@@ -97,14 +98,17 @@ pub fn register(source: &Path, before: &Value, paths: &[String]) -> Res<()> {
     }
     write_json(file, &records)
 }
+pub fn busy(meta: &Value) -> bool {
+    let source = Path::new(s(&meta["worktree"], "source"));
+    meta["sourceStatusBaseline"].is_object() && lock(&journal(source).join("lock"), false, true).is_err()
+}
 pub fn changed(meta: &Value) -> Vec<String> {
     changes_now(meta, false)
 }
 pub fn observe(meta: &Value, run: &Path) {
+    if !meta["sourceStatusBaseline"].is_object() || busy(meta) { return; }
     let paths = changes_now(meta, true);
-    if !paths.is_empty() {
-        let _ = write_json(run.join("source-observed.json"), &json!(paths));
-    }
+    let _ = write_json(run.join("source-observed.json"), &json!(paths));
 }
 fn changes_now(meta: &Value, nonblocking: bool) -> Vec<String> {
     let baseline = &meta["sourceStatusBaseline"];

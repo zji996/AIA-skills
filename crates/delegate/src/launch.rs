@@ -33,6 +33,8 @@ pub struct Options {
     pub images: Vec<String>,
     pub share: Vec<String>,
     pub protect: Vec<String>,
+    pub allow: Vec<String>,
+    pub when_done: bool,
     pub protect_reasons: std::collections::BTreeMap<String, String>,
     pub read_only: bool,
     pub shell: bool,
@@ -107,6 +109,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--in-place",
                 "--worktree",
                 "--protect",
+                "--allow",
                 "--protect-reason",
                 "--retries",
                 "--provider",
@@ -148,6 +151,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             "--image",
             "--share",
             "--protect",
+            "--allow",
             "--accept",
             "--accept-also",
             "--accept-timeout",
@@ -197,6 +201,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--image" => o.images.push(v),
                 "--share" if !reply => o.share.push(v),
                 "--protect" => o.protect.push(v),
+                "--allow" => o.allow.push(v),
                 "--accept" => {
                     o.accept_set = true;
                     o.accept = Some(v)
@@ -250,6 +255,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--fresh" => o.fresh = true,
                 "--sync" if reply => o.sync = true,
                 "--wait" if reply => o.wait = true,
+                "--when-done" if reply => o.when_done = true,
                 "--json" => crate::output::enable_json(),
                 "--minor" if reply => o.minor = true,
                 "--progress" => o.progress = true,
@@ -773,6 +779,18 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         return Err("--protect needs a git repository".into());
     }
     normalize_protect(&mut o.protect)?;
+    for path in &mut o.allow {
+        if repo.as_ref().is_some_and(|top| top.join(&*path).is_dir()) && !path.ends_with('/') { path.push('/'); }
+    }
+    normalize_protect(&mut o.allow)?;
+    for path in &o.allow {
+        if !worktree::matches_rule(path, &o.protect) {
+            return Err(format!("--allow must be inside a protected path: {path}"));
+        }
+    }
+    if !o.allow.is_empty() {
+        eprintln!("delegate: open for this task / 本次开放：{}", o.allow.join(", "));
+    }
     let capacities = crate::config::capacities(&config.value)?;
     if !config.ignored.is_empty() {
         eprintln!(
@@ -827,7 +845,7 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
             let overlap = paths
                 .iter()
                 .filter(|path| {
-                    o.protect.iter().any(|rule| {
+                    !worktree::matches_rule(path, &o.allow) && o.protect.iter().any(|rule| {
                         worktree::matches_rule(
                             path.trim_end_matches('/'),
                             std::slice::from_ref(rule),
@@ -992,7 +1010,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     let summary = json(parent.join("summary.json"));
     if active(&state(&parent)) {
         return Err(format!(
-            "{} is still running; wait for it before replying",
+            "{} is still running; use reply --when-done to deliver after it settles, or wait before replying",
             parent.file_name().unwrap_or_default().to_string_lossy()
         ));
     }
@@ -1081,6 +1099,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         o.tier_inferred = b(&meta, "tierInferred");
     }
     o.retries = n(&meta, "retries");
+    o.allow = strings(&meta["allow"]);
     o.protect = meta["protect"]
         .as_array()
         .map(|paths| {
@@ -1610,6 +1629,7 @@ pub fn launch(
         .filter(|x| !x.is_empty());
     let changed =
         parent.is_object() && fork.is_some() && o.accept.as_deref() != parent["accept"].as_str();
+    let remaining = o.protect.iter().filter(|rule| !worktree::matches_rule(rule, &o.allow)).cloned().collect::<Vec<_>>();
     let mut actual = if parent.is_object() && fork.is_some() {
         contract(
             prompt,
@@ -1620,7 +1640,7 @@ pub fn launch(
             },
             false,
             changed && (o.hide_accept || o.accept.is_none()),
-            &o.protect,
+            &remaining,
             &o.protect_reasons,
         )
     } else {
@@ -1633,10 +1653,13 @@ pub fn launch(
             },
             mode == "read-only" && extra["worktree"].is_object(),
             false,
-            &o.protect,
+            &remaining,
             &o.protect_reasons,
         )
     };
+    if !o.allow.is_empty() {
+        actual.push_str(&format!("\n本次开放 / Open for this task only: {}. These paths are removed from the protected set for this task; this overrides any broader protection above. Other protected paths remain closed.\n", o.allow.join(", ")));
+    }
     if mode == "write" {
         actual = format!("{}\n\n{WRITE_BOUNDARY}\n", actual.trim_end_matches('\n'));
         let source = s(&extra["worktree"], "source");
@@ -1900,6 +1923,7 @@ pub fn launch(
         meta["evidenceTimeoutSeconds"] =
             json!(seconds(o.evidence_timeout.as_deref().unwrap_or("30m"))?);
     }
+    meta["allow"] = json!(o.allow);
     meta["shell"] = json!(o.shell);
     if meta["worktree"].is_object() {
         meta["sourceStatusBaseline"] =

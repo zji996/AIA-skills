@@ -343,6 +343,7 @@ fn settle(
         .as_array()
         .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
         .unwrap_or_default();
+    let allowed = strings(&meta["allow"]);
     let generated_paths = meta["protectGenerated"]["paths"]
         .as_array()
         .into_iter()
@@ -353,6 +354,7 @@ fn settle(
     let mut violations = changed
         .iter()
         .filter(|path| {
+            if worktree::matches_rule(path, &allowed) { return false; }
             if generated_checked
                 && generation_error.is_none()
                 && worktree::matches_rule(path, &generated_paths)
@@ -373,7 +375,7 @@ fn settle(
         generated_violations
             .iter()
             .filter(|path| {
-                protected
+                !worktree::matches_rule(path, &allowed) && protected
                     .iter()
                     .any(|rule| worktree::matches_rule(path, &[rule.to_string()]))
             })
