@@ -11,7 +11,6 @@
 use crate::common::*;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Upper bound for `worktree.pool`; more slots than heavy lanes buy nothing.
 pub const MAX_SLOTS: u64 = 16;
@@ -74,7 +73,7 @@ pub fn release(slot: &Path, run: &Path) {
 }
 
 fn git_in(dir: &Path, args: &[&str]) -> Result<(), String> {
-    let out = Command::new("git")
+    let out = git_command()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -375,13 +374,13 @@ fn evict_lru(target: &Path, limit: u64, low: u64) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::{attach_target_to, evict_lru, prune_sessions, reset_with_target_root};
+    use crate::common::git_command;
     use std::fs;
     use std::path::Path;
-    use std::process::Command;
     use std::time::{Duration, SystemTime};
 
     fn git(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = git_command()
             .arg("-C")
             .arg(dir)
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])

@@ -312,6 +312,16 @@ pub fn human(run: &Path, status: &Value) -> String {
             }
         ));
     }
+    let uncommitted = strings(&status["commitsDiffer"]);
+    if !uncommitted.is_empty() {
+        parts.push(format!(
+            "commits differ from the final tree: {}",
+            uncommitted.join(", ")
+        ));
+    }
+    if !s(status, "archive").is_empty() {
+        parts.push(format!("archive: {}", s(status, "archive")));
+    }
     if s(status, "warning").contains("could not snapshot") {
         parts.push("改动未知".into());
     }
@@ -454,7 +464,9 @@ pub fn human(run: &Path, status: &Value) -> String {
         parts.push(blind);
     }
     let id = s(status, "run");
-    let next = if runs::active(state) {
+    let next = if b(status, "cleaned") {
+        format!("证据归档：{}", s(status, "archive"))
+    } else if runs::active(state) {
         format!("等待交付：delegate wait {id}")
     } else if b(status, "applied") && s(status, "appliedBy") == "detected" {
         format!("清理：delegate clean {id}")

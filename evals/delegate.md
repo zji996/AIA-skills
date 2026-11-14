@@ -1,5 +1,12 @@
 # delegate
 
+## 6.18 证据与最终树
+
+- 测量答复引用 `.local/report` 和原始轨迹后 clean：默认归档非构建忽略输出，status/result 指向 archive；target/node_modules/cache 不收，明确引用例外，200 MiB 超限列跳过大文件，`--no-archive` 放弃；按最近使用/年龄淘汰。Evidence survives clean.
+- 源工作区并行 commit，status/wait 的所有 Git 命令仍带 `GIT_OPTIONAL_LOCKS=0`，不打开可选索引锁。No optional source index locks.
+- 同事已提交实现却留函数/新文件未提交：一行状态和 apply 显示 “commits differ from the final tree” 与文件列表；默认 apply 取最终树，`--keep-commits` 拒绝不完整提交。Final tree versus commits.
+- 普通 `reply --sync` 冲突不改树；`--sync=agent` 留文本标记，说明首行列文件要求先解，标记残留即使 accept true 仍拒收，普通续答继承检查；二进制/结构冲突失败不部分同步。Agent resolves sync conflicts.
+
 ## 6.17 长会话控制摩擦
 
 - 仓库默认保护 apps/，本轮授权前端：`start --allow apps/web/` 回显开放、提示仍保护其他路径，修改 web 不拒收，reply/fresh 继承；仓库配置不变。Per-run protection lift.

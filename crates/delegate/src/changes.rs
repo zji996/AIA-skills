@@ -5,10 +5,10 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 fn git_index(top: &Path, args: &[String], index: &Path) -> Res<Vec<u8>> {
-    let o = Command::new("git")
+    let o = git_command()
         .arg("-C")
         .arg(top)
         .args(args)
@@ -78,7 +78,7 @@ pub fn snapshot(top: &Path, scratch: &Path, exclude: &[String]) -> Option<Value>
             .collect();
         let mut ignored = BTreeSet::new();
         if !present.is_empty() {
-            let mut child = Command::new("git")
+            let mut child = git_command()
                 .arg("-C")
                 .arg(top)
                 .args(["check-ignore", "-z", "--stdin"])
@@ -663,4 +663,20 @@ pub fn chain_changes(run: &Path) -> Res<(Value, PathBuf, String, String)> {
         top = PathBuf::from(s(&meta["worktree"], "source"));
     }
     Ok((meta, top, s(&rec, "base").into(), s(&rec, "after").into()))
+}
+
+/// Differences from HEAD, not from the initial snapshot (which may itself be dirty).
+pub fn uncommitted(meta: &Value) -> Res<Vec<String>> {
+    let path = Path::new(s(&meta["worktree"], "path"));
+    if !meta["worktree"].is_object() || !path.is_dir() {
+        return Ok(vec![]);
+    }
+    let mut paths = zstrings(&git(path, &["diff", "HEAD", "--name-only", "-z"])?);
+    paths.extend(zstrings(&git(
+        path,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )?));
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
 }

@@ -21,8 +21,9 @@ pub fn all_runs() -> Vec<PathBuf> {
     v
 }
 pub fn archived_runs() -> Vec<PathBuf> {
-    all_runs_roots()
-        .into_iter()
+    let roots = all_runs_roots();
+    let mut runs = roots.iter()
+        .cloned()
         .flat_map(|root| {
             fs::read_dir(root.join(".applied"))
                 .into_iter()
@@ -31,7 +32,26 @@ pub fn archived_runs() -> Vec<PathBuf> {
                 .map(|e| e.path())
         })
         .filter(|p| p.join("meta.json").is_file())
-        .collect()
+        .collect::<Vec<_>>();
+    let existing = all_runs()
+        .into_iter()
+        .chain(runs.iter().cloned())
+        .map(|p| s(&json(p.join("meta.json")), "run").to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    runs.extend(
+        fs::read_dir(cache_dir().join("archive"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path().join("record"))
+            .filter(|p| {
+                let meta = json(p.join("meta.json"));
+                p.join("meta.json").is_file()
+                    && Path::new(s(&meta, "dir")).parent().is_some_and(|root| roots.iter().any(|r| r == root))
+                    && !existing.contains(s(&meta, "run"))
+            }),
+    );
+    runs
 }
 fn all_runs_roots() -> Vec<PathBuf> {
     let mut roots = vec![runs_root()];
@@ -68,6 +88,10 @@ pub fn resolve(reference: &str) -> Res<PathBuf> {
     let archive = runs_root().join(".applied").join(reference);
     if archive.join("meta.json").is_file() {
         return Ok(archive);
+    }
+    let evidence = cache_dir().join("archive").join(reference).join("record");
+    if evidence.join("meta.json").is_file() {
+        return Ok(evidence);
     }
     let archived = archived_runs();
     if reference != "last" {
@@ -321,6 +345,10 @@ pub fn status(run: &Path) -> Value {
     }
     let sum = json(run.join("summary.json"));
     let mut out = json!({"run":meta.get("run").and_then(Value::as_str).unwrap_or_else(||run.file_name().and_then(|x|x.to_str()).unwrap_or("")),"name":meta.get("name"),"state":st,"agent":meta.get("agent").and_then(Value::as_str).unwrap_or(crate::agents::AGENT),"mode":meta.get("mode")});
+    if let Some(archive) = crate::archive::status(run) {
+        out["archive"] = archive["path"].clone();
+        out["cleaned"] = json!(run == Path::new(s(&archive, "path")).join("record"));
+    }
     if !s(&meta, "agentBin").is_empty() {
         out["agentBin"] = meta["agentBin"].clone();
     }
@@ -411,6 +439,8 @@ pub fn status(run: &Path) -> Value {
             "files",
             "changes",
             "pendingChanges",
+            "commitsDiffer",
+            "syncConflictMarkers",
             "shape",
             "accept",
             "evidence",
@@ -562,6 +592,13 @@ pub fn remove_after_apply(run: &Path) -> Vec<String> {
                 && s(&json(other.join("meta.json"))["worktree"], "path") == path
                 && (active(&state(other)) || !other.join(".applied").exists())
         });
+    if !shared {
+        match crate::archive::preserve(run) {
+            Ok(Some(path)) => eprintln!("delegate: archive: {}", path.display()),
+            Ok(None) => {}
+            Err(error) => return vec![format!("kept worktree: archive failed: {error}")],
+        }
+    }
     let _ = crate::cleanup::record(run, 0);
     let containers = if !shared {
         worktree::remove(&meta)
@@ -584,6 +621,7 @@ pub fn remove_after_apply(run: &Path) -> Vec<String> {
     }
     let keep = [
         "meta.json",
+        "archive.json",
         "pending-reply.json",
         "reply.lock",
         "reply-delivered.json",
@@ -657,6 +695,8 @@ pub fn prune() {
         return;
     }
     for run in all_runs().into_iter().chain(archived_runs()) {
+        // Archive history follows the archive's own age/LRU policy, not KEEP_DAYS.
+        if crate::archive::is_record(&run) { continue; }
         let done = run.join("exit_code");
         // 只显示过截断答复的 run 不自动清理，全文仍待读取。
         if run.join(".delivered").is_file()
@@ -678,7 +718,14 @@ pub fn prune() {
                 .map(|x| epoch() - x.as_secs_f64())
                 .unwrap_or(0.0);
             if age > days as f64 * 86400.0 {
-                remove(&run);
+                match crate::archive::preserve(&run) {
+                    Ok(_) => {
+                        remove(&run);
+                    }
+                    Err(error) => {
+                        eprintln!("delegate: keep {}: archive failed: {error}", run.display())
+                    }
+                }
             }
         }
     }

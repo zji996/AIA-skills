@@ -6,10 +6,10 @@
 |---|---|
 | `start [选项] [任务说明]` | 后台启动，立即返回一行状态 |
 | `run [选项] [--max <时长>]` | 启动并等到结论 |
-| `reply <run> [消息] [--wait] [--fresh] [--sync]` | 接着最新一轮会话在后台启动并立即返回；`--wait` 等到结论（此时可用 `--max`/`--progress`/`--full`）。`--fresh` 开新会话，消息须自足；`--sync` 先同步主控后来改动，冲突时直接拒绝。验收与证据命令默认沿用，可分别覆盖或关闭；取消或隐藏已变更的验收命令时会告诉同事旧标准不再适用 |
+| `reply <run> [消息] [--wait] [--fresh] [--sync|--sync=agent]` | 接着最新一轮会话在后台启动并立即返回；`--wait` 等到结论（此时可用 `--max`/`--progress`/`--full`）。`--fresh` 开新会话，消息须自足；`--sync` 先同步主控后来改动，冲突时直接拒绝；`--sync=agent` 留文本标记并在说明首行列冲突要求先解决，未清标记拒收（后续普通 reply 仍检查），二进制/符号链接/结构冲突仍拒绝。验收与证据命令默认沿用，可分别覆盖或关闭；取消或隐藏已变更的验收命令时会告诉同事旧标准不再适用 |
 | `patch <run> [-- <path>…]` | 打印保留的完整补丁，可按精确路径/目录前缀过滤，供 `git apply --3way` 恢复 |
 | `diff [<run>] [--stat] [--total] [路径...]` | 以 `git diff` 输出该轮的改动；`--total` 为整段对话；终端下带颜色 |
-| `apply [<run> …] [--dry-run] [--merge] [--verify\|--no-verify] [--keep] [--keep-commits] [--json]` | 按给出的顺序将 worktree 改动合入源工作区，不提交，遇到失败即停；验收没法沿用（`acceptStillValid` 不为 true）的任务在最后一次合并后、经 lane 重跑一次各自的验收（去重），`applyVerify: false` 关闭、写命令则替换；始终列同事提交。`--keep-commits` 按序 cherry-pick，要求同事工作树改动已提交，冲突停在 git cherry-pick 状态。成功后删除 worktree，保留原 run 轻量记录与 applied.patch；`--keep` 保留完整记录。合入末行报告验收有效性与盲区。 |
+| `apply [<run> …] [--dry-run] [--merge] [--verify\|--no-verify] [--keep] [--keep-commits] [--json]` | 按给出的顺序将 worktree 改动合入源工作区，不提交，遇到失败即停；验收没法沿用（`acceptStillValid` 不为 true）的任务在最后一次合并后、经 lane 重跑一次各自的验收（去重），`applyVerify: false` 关闭、写命令则替换；始终列同事提交。`--keep-commits` 按序 cherry-pick，要求同事工作树改动已提交；收尾与 apply 的 `commitsDiffer` 列提交以外文件，默认 apply 始终取最终树，冲突停在 git cherry-pick 状态。成功后删除 worktree，保留原 run 轻量记录与 applied.patch；`--keep` 保留完整记录。合入末行报告验收有效性与盲区。 |
 | `busy <资源名>` | 有实际运行的匹配命令时逐行列 run、命令和持续秒数，退出 0；空闲无输出、退出 1 |
 | `wait [<run>...\|--all] [--max <时长>] [--no-result] [--full] [--progress]` | 无参和带名字的 `wait <run>...` 默认同 `--any`：交付已结束未读取的，否则任一选中任务结束即返回；`--all` / `--until-all` 等全部（单次最多 50 分钟，超时列仍在跑的 run）。人读末行给本会话剩余数和原样重跑命令，无运行任务时明确说明 |
 | `status [<run>...] [--json]` | 默认每任务一条自然语言短行；`--json` 保留完整原字段 |

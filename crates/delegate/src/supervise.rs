@@ -452,6 +452,32 @@ fn settle(
         .into();
         sum["state"] = json!(state);
     }
+    // Acceptance commands may edit files too: inspect the actual delivered tree.
+    if let Ok(paths) = changes::uncommitted(meta) {
+        if !paths.is_empty() {
+            sum["commitsDiffer"] = json!(paths);
+        }
+    }
+    let sync = json(run.join("sync.json"));
+    if b(&sync, "agent") {
+        let top = Path::new(s(&meta["worktree"], "path"));
+        let mut paths = changed.clone();
+        paths.extend(strings(&sync["conflicts"]));
+        paths.extend(changes::uncommitted(meta).unwrap_or_default());
+        paths.sort();
+        paths.dedup();
+        let markers = paths
+            .into_iter()
+            .filter(|p| worktree::has_conflict_markers(&top.join(p)))
+            .collect::<Vec<_>>();
+        if !markers.is_empty() {
+            state = "rejected".into();
+            sum["state"] = json!(state);
+            sum["syncConflictMarkers"] = json!(markers);
+            sum["accept"] = json!({"ok":false,"error":"unresolved sync conflict markers"});
+            sum["error"] = json!("resolve sync conflict markers before delivery");
+        }
+    }
     if !source_changed.is_empty() {
         sum["sourceWorkspaceChanges"] = json!(source_changed);
     }

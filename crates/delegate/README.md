@@ -28,6 +28,7 @@ The musl build was verified as a stripped, statically linked PIE (about 1.2 MB).
 | `common.rs` | Settings, files, processes and Git helpers |
 | `launch.rs` | Prompt, admission and run creation |
 | `runs.rs` | Run lookup, status and retention |
+| `archive.rs` | Capped evidence preservation before worktree removal and LRU/age retention |
 | `agents.rs` | Pi/Codex commands, events and attempt verdicts |
 | `transient.rs` | Upstream-outage rules and the wait/probe before resuming the same session |
 | `probe.rs` | Pre-dispatch connectivity check of the tier models through Pi |

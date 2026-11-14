@@ -281,9 +281,15 @@ pub fn locked_file(path: &Path, content: &str) -> Res<File> {
 pub fn cmd_output(mut c: Command) -> Res<Output> {
     c.output().map_err(|e| e.to_string())
 }
+/// All Git invocations, including source probes, must avoid optional index writes.
+pub fn git_command() -> Command {
+    let mut command = Command::new("git");
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+    command
+}
 pub fn git(top: &Path, args: &[&str]) -> Res<Vec<u8>> {
     let o = cmd_output({
-        let mut c = Command::new("git");
+        let mut c = git_command();
         c.arg("-C").arg(top).args(args);
         c
     })?;
@@ -473,4 +479,17 @@ pub fn finish_run(run: &std::path::Path, mut summary: serde_json::Value, code: i
     summary["finishedAt"] = serde_json::json!(iso());
     write_json(run.join("summary.json"), &summary)?;
     write(run.join("exit_code"), format!("{code}\n"))
+}
+
+#[cfg(test)]
+mod git_lock_tests {
+    use super::*;
+    #[test]
+    fn every_git_command_disables_optional_index_locks() {
+        let command = git_command();
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == "GIT_OPTIONAL_LOCKS"
+                && value == Some(std::ffi::OsStr::new("0"))));
+    }
 }

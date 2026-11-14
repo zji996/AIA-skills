@@ -56,6 +56,7 @@ pub struct Options {
     pub parallel: bool,
     pub fresh: bool,
     pub sync: bool,
+    pub sync_agent: bool,
     pub wait: bool,
     pub max: Option<f64>,
     pub progress: bool,
@@ -254,6 +255,10 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--allow-parallel-writes" => o.parallel = true,
                 "--fresh" => o.fresh = true,
                 "--sync" if reply => o.sync = true,
+                "--sync=agent" if reply => {
+                    o.sync = true;
+                    o.sync_agent = true;
+                }
                 "--wait" if reply => o.wait = true,
                 "--when-done" if reply => o.when_done = true,
                 "--json" => crate::output::enable_json(),
@@ -1202,11 +1207,11 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         return Err("--sync requires a worktree conversation".into());
     }
     let synced = if o.sync {
-        Some(worktree::sync(&parent, &meta)?)
+        Some(worktree::sync(&parent, &meta, o.sync_agent)?)
     } else {
         None
     };
-    let prompt = if let Some(paths) = &synced {
+    let prompt = if let Some((paths, _)) = &synced {
         if prompt
             .chars()
             .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
@@ -1222,6 +1227,15 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
             )
         } else {
             format!("{}\n\nThe caller's changes since the previous round have been synced into the workdir: {}", prompt.trim_end(), if paths.is_empty() { "(none)".to_string() } else { paths.join(", ") })
+        }
+    } else {
+        prompt
+    };
+    let prompt = if let Some((_, conflicts)) = &synced {
+        if conflicts.is_empty() {
+            prompt
+        } else {
+            format!("Resolve these sync conflicts FIRST before any other work: {}. Remove all conflict markers; acceptance fails while any remain.\n\n{}", conflicts.join(", "), prompt)
         }
     } else {
         prompt
@@ -1306,8 +1320,13 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     if runs::interrupted(s(&summary, "state")) && s(&meta, "mode") == "write" {
         extra["continuation"] = json!(s(&summary, "state"));
     }
-    if let Some(paths) = synced {
-        extra["sync"] = json!({"files":paths});
+    if let Some((paths, conflicts)) = synced {
+        extra["sync"] = json!({"files":paths,"conflicts":conflicts,"agent":o.sync_agent});
+    } else {
+        let previous = json(parent.join("sync.json"));
+        if b(&previous, "agent") {
+            extra["sync"] = previous;
+        }
     }
     if extra["worktree"].is_null() {
         extra.as_object_mut().unwrap().remove("worktree");
@@ -1610,7 +1629,12 @@ pub fn launch(
     };
     let stamp = format_time(true, "%Y%m%d-%H%M%S");
     let mut run = root.join(format!("{stamp}-{slug}"));
-    while run.exists() {
+    while run.exists()
+        || cache_dir()
+            .join("archive")
+            .join(run.file_name().unwrap_or_default())
+            .exists()
+    {
         run = root.join(format!("{stamp}-{slug}-{:04x}", now_ns() as u16));
     }
     fs::create_dir(&run).map_err(|e| e.to_string())?;

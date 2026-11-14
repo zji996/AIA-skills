@@ -1,4 +1,5 @@
 mod agents;
+mod archive;
 mod changes;
 mod cleanup;
 mod common;
@@ -31,7 +32,6 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 fn status_line(run: &Path) -> String {
@@ -946,7 +946,11 @@ fn completion_timing(already: &std::collections::HashSet<PathBuf>, run: &Path) -
     }
 }
 fn clean(args: &[String]) -> Res<i32> {
-    let (pos, flags, _) = parse_simple(args, &["--finished", "--force", "--json"], &[])?;
+    let (pos, flags, _) = parse_simple(
+        args,
+        &["--finished", "--force", "--json", "--no-archive"],
+        &[],
+    )?;
     if has(&flags, "--json") {
         output::enable_json();
     }
@@ -1005,6 +1009,11 @@ fn clean(args: &[String]) -> Res<i32> {
         } else {
             ""
         };
+        let archived = if has(&flags, "--no-archive") {
+            None
+        } else {
+            archive::preserve(&run)?
+        };
         let (units, containers) = runs::remove(&run);
         let cleanup_note = if units > 0 {
             format!("；停止了 {units} 个 systemd 服务")
@@ -1014,7 +1023,7 @@ fn clean(args: &[String]) -> Res<i32> {
         if output::json_enabled() {
             println!(
                 "{}",
-                json!({"run":name,"state":st,"removed":true,"systemdStopped":units,"containersRemoved":containers.removed,"diagnostic":containers.diagnostic})
+                json!({"run":name,"state":st,"removed":true,"archive":archived,"systemdStopped":units,"containersRemoved":containers.removed,"diagnostic":containers.diagnostic})
             );
         } else {
             let container_note = if containers.removed > 0 {
@@ -1023,6 +1032,9 @@ fn clean(args: &[String]) -> Res<i32> {
                 String::new()
             };
             println!("removed {name} ({st}{note}{cleanup_note}{container_note})");
+            if let Some(path) = archived {
+                println!("archive: {}", path.display());
+            }
         }
     }
     let orphans = cleanup::containers(&cache_dir().join("worktrees"), true);
@@ -1111,7 +1123,7 @@ fn diff(args: &[String]) -> Res<i32> {
     if has(&flags, "--total") {
         before = s(&meta, "chainBase").into();
     }
-    let mut cmd = Command::new("git");
+    let mut cmd = git_command();
     cmd.arg("-C").arg(&top).args([
         "diff",
         "--no-renames",
@@ -1171,7 +1183,7 @@ fn patch(args: &[String]) -> Res<i32> {
             if !block.starts_with(b"diff --git ") {
                 continue;
             }
-            let mut child = Command::new("git")
+            let mut child = git_command()
                 .args(["apply", "--numstat", "-z"])
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
@@ -1624,6 +1636,9 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     runs::state(&run)
                 );
                 return Ok(1);
+            }
+            if let Some(archive) = archive::status(&run) {
+                eprintln!("archive: {}", s(&archive, "path"));
             }
             if has(&flags, "--path") {
                 println!("{}", result.display());

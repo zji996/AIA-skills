@@ -10,6 +10,8 @@
 
 ### 技能
 
+- `delegate` 6.18.0：清理与 apply 释放工作树前限额归档忽略的非构建输出及答复引用，清理后 status/result 可找回；Git 统一关闭可选索引锁。收尾与 apply 列未提交文件、提醒提交不等于最终树；`reply --sync=agent` 把文本冲突交同事先解，标记未清拒收。
+
 - `delegate` 6.17.0：`start --allow` 按次开放受保护路径、reply 继承；`reply --when-done` 后台记追问且可由 stop 取消，wait 忽略停止/跳过。修复 apply 零改动续轮的合入登记与池槽清理误报，status 改缓存/非阻塞锁，Bash 增加源树误写拒绝（非沙箱），cp/rsync/install/ln 只按目标判断、允许读出源树，拒绝行指出写入路径。
 
 - `delegate` 6.16.0：同事进程匹配垫片限本次 run 全部 scope，无 cgroup 时失败关闭（含只读 shell）；模型别名支持默认 thinking，回显生效来源，按任务性质选思考档。新增用户级四类 `fit` 适配卡与 `start --class` 提示，用同题比较、覆盖记结论和新模型重评。

@@ -6,7 +6,6 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 pub fn work_config(val: &Value, path: &Path) -> Res<Value> {
     let work = val
@@ -221,7 +220,7 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<Option<String>> {
     fs::create_dir_all(path.parent().unwrap_or(Path::new("/"))).map_err(|e| e.to_string())?;
     let head =
         git_text(&source, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]).unwrap_or_default();
-    let mut c = Command::new("git");
+    let mut c = git_command();
     c.arg("-C")
         .arg(&source)
         .arg("commit-tree")
@@ -853,7 +852,7 @@ pub fn source_drift(run: &Path) -> Option<Value> {
     }
     Some(drift)
 }
-pub fn sync(run: &Path, meta: &Value) -> Res<Vec<String>> {
+pub fn sync(run: &Path, meta: &Value, agent: bool) -> Res<(Vec<String>, Vec<String>)> {
     let source = PathBuf::from(s(&meta["worktree"], "source"));
     let worktree = PathBuf::from(s(&meta["worktree"], "path"));
     let exclude = strings(&meta["snapshotExclude"]);
@@ -927,7 +926,10 @@ pub fn sync(run: &Path, meta: &Value) -> Res<Vec<String>> {
                 mode,
                 content: new.unwrap_or_default(),
             });
-        } else if let (Some(base), Some(theirs), Some(mine)) = (&old, &new, &now) {
+        } else if agent || (old.is_some() && new.is_some() && now.is_some()) {
+            let base = old.as_deref().unwrap_or_default();
+            let theirs = new.as_deref().unwrap_or_default();
+            let mine = now.as_deref().unwrap_or_default();
             if [old_mode.as_deref(), mode.as_deref(), now_mode.as_deref()].contains(&Some("120000"))
                 || base.contains(&0)
                 || theirs.contains(&0)
@@ -944,7 +946,7 @@ pub fn sync(run: &Path, meta: &Value) -> Res<Vec<String>> {
             write(&basefile, base)?;
             let theirfile = scratch.join("theirs");
             write(&theirfile, theirs)?;
-            let output = Command::new("git")
+            let output = git_command()
                 .arg("merge-file")
                 .args(["-L", "worktree", "-L", "base", "-L", "caller"])
                 .args([&minefile, &basefile, &theirfile])
@@ -952,13 +954,26 @@ pub fn sync(run: &Path, meta: &Value) -> Res<Vec<String>> {
                 .map_err(|e| e.to_string())?;
             let merged = fs::read(&minefile).map_err(|e| e.to_string())?;
             let _ = fs::remove_dir_all(scratch);
-            if output.status.success() {
+            if output.status.success()
+                || (agent
+                    && output
+                        .status
+                        .code()
+                        .is_some_and(|code| (1..=127).contains(&code)))
+            {
+                if !output.status.success() {
+                    conflicts.push(path.clone());
+                }
                 paths.push(path.clone());
                 actions.push(Action {
                     kind: "merged".into(),
                     path,
                     target,
-                    mode: if old_mode != mode { mode } else { None },
+                    mode: if old_mode != mode {
+                        mode.or(now_mode).or(Some("100644".into()))
+                    } else {
+                        None
+                    },
                     content: merged,
                 });
             } else {
@@ -968,7 +983,9 @@ pub fn sync(run: &Path, meta: &Value) -> Res<Vec<String>> {
             conflicts.push(path);
         }
     }
-    if !conflicts.is_empty() {
+    // Binary, symlink, gitlink and structural conflicts cannot safely be represented
+    // by text markers. Fail atomically rather than silently dropping caller changes.
+    if !conflicts.is_empty() && (!agent || conflicts.iter().any(|p| !paths.contains(p))) {
         return Err(format!("--sync conflict in: {}", conflicts.join(", ")));
     }
     for action in actions {
@@ -1002,7 +1019,7 @@ pub fn sync(run: &Path, meta: &Value) -> Res<Vec<String>> {
         }
         chain = chain.parent().unwrap().join(parent);
     }
-    Ok(paths)
+    Ok((paths, conflicts))
 }
 pub struct ApplyOutcome {
     pub code: i32,
@@ -1044,6 +1061,20 @@ pub fn conflict_labels(path: &Path) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+/// Sync handoffs also reject a half-removed marker block (e.g. only the divider).
+pub fn has_conflict_markers(path: &Path) -> bool {
+    if path.is_symlink() {
+        return false;
+    }
+    fs::read(path).is_ok_and(|bytes| {
+        String::from_utf8_lossy(&bytes).lines().any(|line| {
+            line.starts_with("<<<<<<< ")
+                || line.starts_with(">>>>>>> ")
+                || line.starts_with("||||||| ")
+                || line == "======="
+        })
+    })
 }
 fn marked_files(source: &Path, rules: &[String]) -> Res<Vec<String>> {
     let mut paths = rules
@@ -1205,7 +1236,7 @@ pub fn apply(run: &Path, merge: bool, dry: bool, keep_commits: bool) -> Res<Appl
                 } else {
                     // Large untracked text is outside the snapshot tree, but must
                     // still be recoverable without its soon-to-be-released worktree.
-                    let diff = Command::new("git")
+                    let diff = git_command()
                         .arg("-C")
                         .arg(worktree)
                         .args(["diff", "--no-index", "--binary", "--", "/dev/null", path])
@@ -1280,6 +1311,14 @@ fn apply_checked(
         Vec::new()
     };
     conclusion["commits"] = json!(commits);
+    let uncommitted = crate::changes::uncommitted(&meta)?;
+    if !uncommitted.is_empty() {
+        conclusion["commitsDiffer"] = json!(uncommitted);
+        eprintln!(
+            "delegate: commits differ from the final tree: {}",
+            uncommitted.join(", ")
+        );
+    }
     let blind = crate::output::blind_files(
         &json(run.join("summary.json"))["files"],
         &meta["acceptBlind"],
@@ -1297,24 +1336,16 @@ fn apply_checked(
             );
         }
     }
+    if keep_commits && !uncommitted.is_empty() {
+        return Err(format!("--keep-commits requires committed worktree changes; commits differ from the final tree: {}", uncommitted.join(", ")));
+    }
     let mut code = if keep_commits && !commits.is_empty() {
-        if !git_text(
-            worktree,
-            &["status", "--porcelain", "--untracked-files=all"],
-        )?
-        .is_empty()
-        {
-            return Err(
-                "--keep-commits requires committed worktree changes; commit remaining edits first"
-                    .into(),
-            );
-        }
         if dry {
             0
         } else {
             let mut code = 0;
             for item in &commits {
-                let status = Command::new("git")
+                let status = git_command()
                     .arg("-C")
                     .arg(source)
                     .args(["cherry-pick", "--no-edit", s(item, "hash")])
@@ -1601,7 +1632,7 @@ pub fn numbers_taken(source: &Path, own: &Path) -> Vec<(String, String, String)>
     }
     let mut taken = BTreeSet::new();
     for (place, label) in places {
-        let Ok(out) = Command::new("git")
+        let Ok(out) = git_command()
             .arg("-C")
             .arg(&place)
             .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
@@ -1793,7 +1824,7 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
             write(&minefile, mine).map_err(|e| format!("{}: {e}", minefile.display()))?;
             write(&basefile, base).map_err(|e| format!("{}: {e}", basefile.display()))?;
             write(&theirfile, theirs).map_err(|e| format!("{}: {e}", theirfile.display()))?;
-            let status = Command::new("git")
+            let status = git_command()
                 .arg("merge-file")
                 .args([
                     "-L",
@@ -1809,7 +1840,7 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
             let mut clean = status.success();
             if !clean && matches_rule(&path, &append_only) {
                 write(&minefile, mine).map_err(|e| format!("{}: {e}", minefile.display()))?;
-                clean = Command::new("git")
+                clean = git_command()
                     .args(["merge-file", "--union"])
                     .args([&minefile, &basefile, &theirfile])
                     .status()
@@ -1904,7 +1935,6 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
     if actions.is_empty() && conflicts.is_empty() && !pending_generation {
         eprintln!("delegate: no changes to apply");
         // Still record this round (including zero-change replies) as applied.
-
     }
     if !conflicts.is_empty() && !merge {
         for p in &conflicts {

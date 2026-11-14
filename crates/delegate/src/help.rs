@@ -67,6 +67,7 @@ const REPLY: &[(&str, &str)] = &[
     ("--timeout DURATION", "Optional limit for the attempt; no default. Stall guards remain active."),
     ("--fresh", "Start a new session with only this message; after apply, a new worktree starts from current HEAD."),
     ("--sync", "Merge the caller's later changes into the conversation worktree before replying; conflicts stop the reply."),
+    ("--sync=agent", "Hand text conflicts to the colleague to resolve first; remaining markers fail acceptance. Binary/structural conflicts still stop the reply."),
     ("--when-done", "Record one pending reply while the run is active; detached delivery survives shell exit. Visible in status; stop cancels it. Cannot combine with --wait."),
     ("--wait", "Wait for the reply's outcome and answer instead of returning after launch."),
     ("--tier scout|review|write", "Continue on this purpose tier; may combine with --model. Ordinary replies keep the saved model and thinking."),
@@ -196,6 +197,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("--dry-run", "Check the merge without writing it."),
             ("--verify", "Rerun acceptance on the merged tree even when acceptStillValid is true. Without it, runs whose acceptance does not carry over rerun their own acceptance once, after the last merge (.delegate.json applyVerify: false turns this off, a command replaces it)."),
             ("--no-verify", "Skip the post-merge acceptance."),
+            ("--keep-commits", "Cherry-pick the colleague's commits instead of applying the final tree; refuses uncommitted files (listed in commitsDiffer)."),
         ]),
         "lane" => ("[--label TEXT] [--measure] [command ...]", "Queue a heavy command with acceptance, evidence, worktree setup, and other machine checks. --measure uses the FIFO measurement reservation and reserved CPUs. DELEGATE_MAX_HEAVY run at once (default: 2). One argument is a shell command; no command lists the lane.", &[
             ("--label TEXT", "Label shown in the lane listing."),
@@ -205,8 +207,9 @@ pub fn print(command: Option<&str>) -> bool {
         "stop" => ("runs ...", "Terminate one or more runs.", &[
             ("runs", "One or more run ids or directories."),
         ]),
-        "clean" => ("[--finished] [--force] [--json] [runs ...]", "Delete finished runs and their compose containers; reclaim containers whose delegate worktree directory is missing.", &[
+        "clean" => ("[--finished] [--force] [--no-archive] [--json] [runs ...]", "Delete finished runs and their compose containers; reclaim containers whose delegate worktree directory is missing.", &[
             ("runs", "Run ids or directories to remove."),
+            ("--no-archive", "Skip evidence archiving; by default keep ignored non-build outputs and final-answer references under cache/archive/<run>/ (200 MiB/run)."),
             ("--finished", "Select all finished runs that have been reported in full (answers shown truncated are kept until read with result)."),
             ("--force", "With --finished, also select unreported or truncated finished runs."),
             ("--json", "Print deletion counts and orphan container cleanup as JSON lines."),
