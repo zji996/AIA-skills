@@ -23,7 +23,7 @@ fn evidence(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
     let path = run.join("evidence.log");
     let mut result = json!({"exit":null,"timedOut":false,"seconds":0,"tail":"","log":path});
     let execute = || -> Res<(i32, bool, f64)> {
-        let _slot = lane::acquire("evidence", Some(run), Some(run), |ahead, _| {
+        let _slot = lane::acquire_shell("evidence", Some(run), Some(run), |ahead, _| {
             log_event(run, json!({"e":"queue","role":"evidence","ahead":ahead}));
         })?;
         if lane::stopped() {
@@ -76,7 +76,7 @@ fn accept(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
         "accept {}",
         run.file_name().unwrap_or_default().to_string_lossy()
     );
-    let slot = lane::acquire(&label, None, Some(run), |ahead, _| {
+    let slot = lane::acquire_shell(&label, None, Some(run), |ahead, _| {
         log_event(run, json!({"e":"queue","ahead":ahead}))
     });
     let Ok(slot) = slot else {
@@ -159,6 +159,7 @@ fn accept(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
     }
     result["ok"] = json!(code == 0);
     result["exitCode"] = json!(code);
+    result["infrastructureFailure"] = json!(code == 75);
     if code != 0 {
         let text = read(&path);
         let body = text.split_once('\n').map(|(_, x)| x).unwrap_or("");
@@ -444,6 +445,10 @@ fn settle(
         && !lane::stopped()
     {
         sum["accept"] = accept(meta, run, holder);
+        if b(&sum["accept"], "infrastructureFailure") {
+            sum["infrastructureFailure"] = json!(true);
+            sum["error"] = json!("remote infrastructure failure; retry does not spend a rework round");
+        }
         state = if b(&sum["accept"], "ok") {
             "delivered"
         } else {
@@ -569,7 +574,7 @@ fn check_generated(
             .filter_map(Value::as_str)
             .map(str::to_string)
             .collect::<Vec<_>>();
-        let _slot = lane::acquire("check protected generation", None, Some(run), |ahead, _| {
+        let _slot = lane::acquire_shell("check protected generation", None, Some(run), |ahead, _| {
             log_event(run, json!({"e":"queue","ahead":ahead}));
         })?;
         if lane::stopped() {

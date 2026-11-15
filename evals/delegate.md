@@ -1,5 +1,12 @@
 # delegate
 
+## 6.19 Remote 构建
+
+- 本机 Agent 中途 cargo fmt/check：默认远端独立 lane、回传改动/删除和原始退出码，诊断路径可点开本机；measure 留本机、agentDeny 先拒绝，resources 不登记本机。Remote heavy-command routing and sync.
+- 仓库写 remote.host 即使关闭 remote 仍拒绝；用户别名 ci、仓库逐字段覆盖或 false、DELEGATE_REMOTE=0、config/help 显示有效值。Private host configuration.
+- SSH/rsync 离线退出 75，绝不调用本机 cargo；验收显示基础设施失败，预算为零也能续做。Fail closed, no rework charge.
+- stop/timeout 终止远端组及子进程；非池槽 clean 删除、池槽温热缓存保留；lane/status 列持有者和排队，排队计入 lane 等待；setup/evidence/verify 同样转发，remote check 一行连通结论。Cancellation and visibility.
+
 ## 6.18 证据与最终树
 
 - 测量答复引用 `.local/report` 和原始轨迹后 clean：默认归档非构建忽略输出，status/result 指向 archive；target/node_modules/cache 不收，明确引用例外，200 MiB 超限列跳过大文件，`--no-archive` 放弃；按最近使用/年龄淘汰。Evidence survives clean.

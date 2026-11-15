@@ -350,7 +350,7 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<Option<String>> {
         env = json!({});
     }
     let timeout = seconds(&setting("SETUP_TIMEOUT", "10m"))?;
-    let _slot = lane::acquire(
+    let _slot = lane::acquire_shell(
         &format!(
             "setup {}",
             run.file_name().unwrap_or_default().to_string_lossy()
@@ -1539,7 +1539,7 @@ pub fn run_verify(run: &Path, commands: &[String]) -> Value {
         run.file_name().unwrap_or_default().to_string_lossy()
     );
     apply_progress("verifying merged tree / 正在验收合并结果");
-    let slot = lane::acquire(&label, None, Some(run), |ahead, _| {
+    let slot = lane::acquire_shell(&label, None, Some(run), |ahead, _| {
         apply_progress(format!("verify queued / 排队中: {ahead} ahead"))
     });
     let mut result = json!({"commands":commands});
@@ -1582,6 +1582,7 @@ pub fn run_verify(run: &Path, commands: &[String]) -> Value {
     drop(slot);
     result["ok"] = json!(code == 0);
     result["exitCode"] = json!(code);
+    result["infrastructureFailure"] = json!(code == 75);
     if code != 0 {
         let text = read(&path);
         let chars: Vec<char> = text.trim().chars().collect();
@@ -2029,7 +2030,7 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
             println!(" regenerated      {} (dry run)", generated_paths.join(", "));
         }
     } else if regenerate {
-        let _slot = lane::acquire(
+        let _slot = lane::acquire_shell(
             &format!(
                 "regenerate {}",
                 run.file_name().unwrap_or_default().to_string_lossy()

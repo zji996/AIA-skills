@@ -70,6 +70,7 @@ pub fn read_file(path: &Path) -> Res<Option<Value>> {
 
 pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
     let check = || -> Res<()> {
+        crate::remote::validate(value.get("remote"), repo)?;
         if let Some(v) = value.get("stall") {
             let map = v.as_object().ok_or("stall must be an object")?;
             for key in ["idle", "command"] {
@@ -411,6 +412,24 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
             }
         }
     }
+    let mut remote = user
+        .as_ref()
+        .map(|u| u["remote"].clone())
+        .unwrap_or(Value::Null);
+    if let Some(v) = repo.as_ref().and_then(|r| r.get("remote")) {
+        if v == &json!(false) {
+            remote = json!(false);
+        } else {
+            if !remote.is_object() {
+                remote = json!({});
+            }
+            remote
+                .as_object_mut()
+                .unwrap()
+                .extend(v.as_object().unwrap().clone());
+        }
+    }
+    value["remote"] = crate::remote::effective(&remote);
     value["env"] = env;
     value["resources"] = resources;
     value["agentDeny"] = json!(rules);

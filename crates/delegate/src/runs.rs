@@ -298,6 +298,9 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
         }
         return None;
     }
+    if b(sum, "infrastructureFailure") {
+        return Some(format!("remote infrastructure failure; fix connectivity then {script} reply {name} '<retry>' (no rework round)"));
+    }
     match state {
         "rejected" if !sum["protectViolation"].is_null() => Some(format!(
             "protected paths were changed; review protectViolation, restore them, then {script} reply {name} '<what to fix>'"
@@ -443,6 +446,7 @@ pub fn status(run: &Path) -> Value {
             "syncConflictMarkers",
             "shape",
             "accept",
+            "infrastructureFailure",
             "evidence",
             "readOnlyViolation",
             "sourceWriteViolation",
@@ -527,6 +531,12 @@ pub fn status(run: &Path) -> Value {
             out.as_object_mut().unwrap().remove("elapsedSeconds");
         }
     }
+    if crate::remote::enabled(&meta["remote"]) {
+        out["remote"] = meta["remote"].clone();
+        if let Ok(holders) = crate::lane::remote_holders() {
+            out["remoteLane"] = json!({"holders":holders.iter().filter(|h| h.2).map(|h| &h.0).collect::<Vec<_>>(), "queued":holders.iter().filter(|h| !h.2).count()});
+        }
+    }
     if let Some(ahead) = crate::measure::waiting_ahead(run) {
         out["measureWaitingAhead"] = json!(ahead);
     }
@@ -572,6 +582,7 @@ pub fn remove(run: &Path) -> (usize, crate::cleanup::Containers) {
             .iter()
             .any(|r| s(&json(r.join("meta.json"))["worktree"], "path") == path)
     {
+        crate::remote::clean(&meta);
         worktree::remove(&meta)
     } else {
         crate::cleanup::Containers::default()
@@ -601,6 +612,7 @@ pub fn remove_after_apply(run: &Path) -> Vec<String> {
     }
     let _ = crate::cleanup::record(run, 0);
     let containers = if !shared {
+        crate::remote::clean(&meta);
         worktree::remove(&meta)
     } else {
         crate::cleanup::Containers::default()

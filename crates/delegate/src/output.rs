@@ -366,7 +366,9 @@ pub fn human(run: &Path, status: &Value) -> String {
     }
     if status["accept"].is_object() {
         parts.push(
-            if b(&status["accept"], "ok") {
+            if b(status, "infrastructureFailure") {
+                "验收基础设施失败"
+            } else if b(&status["accept"], "ok") {
                 "验收通过"
             } else {
                 "验收失败"

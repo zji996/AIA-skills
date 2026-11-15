@@ -19,6 +19,7 @@ mod pending_reply;
 mod source_guard;
 mod queue;
 mod resources;
+mod remote;
 mod runs;
 mod source_build;
 mod source_watch;
@@ -1417,6 +1418,8 @@ fn main_inner(args: &[String]) -> Res<i32> {
         supervise::supervise(Path::new(run))?;
         return Ok(0);
     }
+    if command == "_remote" { return remote::command(rest); }
+    if command == "remote" { return remote::check(rest); }
     if command == "_resource" {
         return resources::command(rest);
     }
@@ -1605,6 +1608,13 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     .join(" "),
             ))
         }
+        "config" => {
+            if !rest.is_empty() { return Err("usage: delegate config".into()); }
+            let cwd = env::current_dir().map_err(|e| e.to_string())?;
+            let cfg = config::load(git_top(&cwd).as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&cfg.value).map_err(|e| e.to_string())?);
+            Ok(0)
+        }
         "status" | "list" => {
             let (pos, flags, _) = parse_simple(rest, &["--json"], &[])?;
             if has(&flags, "--json") {
@@ -1619,6 +1629,11 @@ fn main_inner(args: &[String]) -> Res<i32> {
             };
             for run in list {
                 println!("{}", status_line(&run));
+            }
+            if !output::json_enabled() {
+                for (label, since, running) in lane::remote_holders()? {
+                    println!("remote {:<8} {since}  {label}", if running { "running" } else { "queued" });
+                }
             }
             Ok(0)
         }

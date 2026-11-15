@@ -87,8 +87,8 @@ fn held(p: &Path) -> bool {
     };
     unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) != 0 }
 }
-fn tickets() -> Vec<(PathBuf, Value)> {
-    let Ok(entries) = fs::read_dir(lane_dir()) else {
+fn tickets_in(dir: &Path) -> Vec<(PathBuf, Value)> {
+    let Ok(entries) = fs::read_dir(dir) else {
         return vec![];
     };
     let mut out = vec![];
@@ -104,6 +104,25 @@ fn tickets() -> Vec<(PathBuf, Value)> {
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
+}
+fn tickets() -> Vec<(PathBuf, Value)> {
+    tickets_in(&lane_dir())
+}
+pub fn remote_holders() -> Res<Vec<(String, String, bool)>> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let cfg = crate::config::load(git_top(&cwd).as_deref())?;
+    let lim = cfg.value["remote"]["maxHeavy"].as_u64().unwrap_or(4) as usize;
+    Ok(tickets_in(&state_dir().join("lane-remote"))
+        .iter()
+        .enumerate()
+        .map(|(i, (_, v))| {
+            (
+                s(v, "label").into(),
+                s(v, "since").into(),
+                lim == 0 || i < lim,
+            )
+        })
+        .collect())
 }
 pub fn holders() -> Res<Vec<(String, String, bool)>> {
     let lim = max_heavy()?;
@@ -160,9 +179,47 @@ pub fn acquire(
     label: &str,
     account: Option<&Path>,
     context: Option<&Path>,
+    waiting: impl FnMut(usize, &[String]),
+) -> Res<Slot> {
+    acquire_in(&lane_dir(), heavy_limit(context)?, label, account, waiting)
+}
+pub fn acquire_remote(
+    label: &str,
+    account: Option<&Path>,
+    remote: &Value,
+    waiting: impl FnMut(usize, &[String]),
+) -> Res<Slot> {
+    acquire_in(
+        &state_dir().join("lane-remote"),
+        remote["maxHeavy"].as_u64().unwrap_or(4) as usize,
+        label,
+        account,
+        waiting,
+    )
+}
+/// Shell steps use the remote lane, while the public `lane` command stays local.
+pub fn acquire_shell(
+    label: &str,
+    account: Option<&Path>,
+    context: Option<&Path>,
+    waiting: impl FnMut(usize, &[String]),
+) -> Res<Slot> {
+    let meta = context
+        .map(|r| json(r.join("meta.json")))
+        .unwrap_or(Value::Null);
+    if crate::remote::enabled(&meta["remote"]) {
+        acquire_remote(label, account.or(context), &meta["remote"], waiting)
+    } else {
+        acquire(label, account, context, waiting)
+    }
+}
+fn acquire_in(
+    dir: &Path,
+    limit: usize,
+    label: &str,
+    account: Option<&Path>,
     mut waiting: impl FnMut(usize, &[String]),
 ) -> Res<Slot> {
-    let limit = heavy_limit(context)?;
     if limit == 0 || std::env::var_os("DELEGATE_LANE_HELD").is_some() {
         return Ok(Slot {
             ticket: None,
@@ -170,8 +227,7 @@ pub fn acquire(
             queued: 0.0,
         });
     }
-    let dir = lane_dir();
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let me = json!({"pid":std::process::id(),"label":label,"since":iso(),"epoch":epoch()});
     let ticket;
     let file;
@@ -188,7 +244,7 @@ pub fn acquire(
     let started = Instant::now();
     let outcome = (|| {
         loop {
-            let live = tickets();
+            let live = tickets_in(dir);
             let pos = live.iter().position(|(p, _)| p == &ticket).unwrap_or(0);
             if pos < limit {
                 break;
@@ -276,6 +332,12 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
         &args[i..]
     };
     if words.is_empty() {
+        for (label, since, running) in remote_holders()? {
+            println!(
+                "remote {:<8} {since}  {label}",
+                if running { "running" } else { "queued" }
+            );
+        }
         for (label, since, running) in holders()? {
             println!(
                 "{:<8} {since}  {label}",

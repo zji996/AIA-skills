@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI（pi-kit 的 rpi 通道下 `pi` 即 rpi）。
 metadata:
-  version: "6.18.0"
+  version: "6.19.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -35,6 +35,8 @@ $D wait                                                                  # 放�
 | 自己跑重检查、测性能 | `$D lane make check`；测量用 `lane --measure` |
 | 节点不稳、换档前先测连通 | `$D probe`：走 Pi 本身（不是裸 HTTP）测各档模型，不建任务、不占名额 |
 | 看全文 / 改动 / 停掉 / 清理 | `$D result` / `$D diff` / `$D stop` / `$D clean --finished` |
+
+重编译可用用户配置 remote 转到 SSH 构建机、独立排队且传回改动，见 [配置](references/configuration.md) 与 [运行](references/runtime.md)。
 
 多行说明用 `--prompt-file -` 加 heredoc；示例见 [references/recipes.md](references/recipes.md)，全部选项见 `$D --help`。
 

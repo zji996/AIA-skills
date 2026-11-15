@@ -12,6 +12,22 @@
 
 排队时间不计时：验收的 `--accept-timeout` 与 `setup` 的超时从拿到名额开始算；同事自己用 `lane` 排队的时间记在 run 目录的 `lane-wait`，从它的 `--timeout` 中扣除。同事、每条 setup 与验收命令在独立进程组中运行；用户 systemd 可用时各自再进入独立 scope，结束或超时时按 cgroup 回收其派生进程（包括 `env -i`、`setsid` 后的进程）。无用户实例时自动沿用进程组与环境标记清理；`DELEGATE_CGROUP=0` 或 `PI_DELEGATE_CGROUP=0` 强制关闭 scope。supervisor 与主控的 `wait`、排队中的其他任务不进入这些 scope。
 
+## Remote 执行与远端 lane
+
+start/reply 保存当次生效配置；默认 root 是远端 HOME 下 `delegate`、programs 是 `["cargo"]`、maxHeavy 为 4（0 不限）。root/profile 为不越界的相对路径，profile 相对 root，slice 可省。
+
+本机与远端需 SSH、rsync，远端需 Linux 的 setsid、程序及其工具链；免交互认证与 profile 由用户准备。meta.env 与 forwardEnv 的本机现值透传，PATH/HOME/PWD/SHELL/TMPDIR、XDG 路径及 DELEGATE 内部标记不透传；远端工具链搜索路径在 profile 配置。profile 在执行程序的 shell 中 source；有 slice 时在 systemd service 的 payload shell 中 source，避免丢掉 profile 的导出变量。
+
+remote 生效时，同事的 argv0 命中 programs 就转给 `_remote`；按名称的 PATH shim 路由，不拦截显式 `/path/to/cargo` 或自行重置 PATH。匹配 measure 的同事命令仍在本机测量，已有 agentDeny 仍可拒绝；其他命令先 agentDeny、再 remote、最后 resources，远端命令不登记本机资源。验收、evidence、setup、生成与合并后 verify 使用只含 remote 规则的 PATH（不应用同事 deny/measure/resources），整个 shell 步骤改占远端 lane；嵌套 `_remote` 通过 `DELEGATE_LANE_HELD` 不重复排队。主控 `lane <cmd>` 不变，仍本机；未实现 `lane --remote`。
+
+`${XDG_STATE_HOME}/delegate/lane-remote/` 复用票 + flock 的 FIFO，宽度独立取 remote.maxHeavy；同事中途编译也排队，stderr 一行提示，等待记入 run 的 lane-wait，排队不计运行超时。`lane`/人读 `status` 列远端 running/queued 持有者；run JSON 的 remoteLane 含 holders 与 queued 人数。每个远端槽的上传/执行/下载再用本机 flock 串行，避免同事并行 bash 互删文件。
+
+槽路径是 `<root>/<repo-key SHA1 前12位>/<worktree目录名>`，repo key 沿用本地 Git common-dir 身份，同仓库池槽保持固定目录与温热缓存。每次从工作树根双向 `rsync -a --delete --filter=':- .gitignore' --exclude=/.git --exclude=/target`，保留被忽略的 target/node_modules 等；额外使用 protect-args 并排除本工具瞬时 PID/取消文件。不做 dereference，worktree.link 符号链接原样传；远端目标缺失由 profile 处理。**不传 .git**（worktree 的 .git 指向本机）：需要 git 的构建命令会失败，这是已知限制。cwd 保持相对工作树根的位置；stdout/stderr 逐行把远端槽绝对路径改成本机路径，参数/环境逐项 shell quote，stdin 转给 SSH，完成后即使命令非零也回传源改动，原样返回程序退出码（包括 255）。
+
+有 slice 时 `systemd-run --user --unit=delegate-<id> --slice=… --wait --pipe --collect --quiet --working-directory=… -E …` 包住命令；无 slice 用 setsid 进程组与唯一 PID 文件。SIGTERM/INT/HUP 写远端取消标记、停止进程组，有 slice 再 `systemctl --user stop`，随后结束本机 SSH；标记防止取消恰好早于远端启动的竞态。远端连接断开时也尝试清理。传输失败 stderr 一行 `delegate remote: ci unreachable (<原因>); remote mode does not fall back to local`，退出 75，**绝不回退本机**；网络完全断开时不能确认远端回收，恢复连通后须检查。
+
+验收退出 75 在 summary/status 标为 infrastructureFailure，重试不占返工预算（即使原预算用完）；实际编译失败照常拒收。clean/apply 清理非池化独占工作树时顺带删远端槽；池槽保留。远端不可达只诊断，不阻止本机清理。
+
 ### 后台服务回收
 
 5.19.0 起，以上回收阶段还检查项目脚本通过 `systemd-run --user` 启动、脱离任务进程组和 scope 的 service/scope；`clean` 和过期清理在删除 run/worktree 前也检查历史遗留。只查询用户实例，不按 unit 名前缀归属任务。以下任一条件足够：

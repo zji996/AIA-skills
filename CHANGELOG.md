@@ -10,6 +10,8 @@
 
 ### 技能
 
+- `delegate` 6.19.0：用户级 remote 经 SSH/rsync 转发重命令，远端独立 lane 与温热 worktree 槽、回传改动/退出码、取消回收；连接失败退出 75、不回退本机，验收基础设施失败不计返工。
+
 - `delegate` 6.18.0：清理与 apply 释放工作树前限额归档忽略的非构建输出及答复引用，清理后 status/result 可找回；Git 统一关闭可选索引锁。收尾与 apply 列未提交文件、提醒提交不等于最终树；`reply --sync=agent` 把文本冲突交同事先解，标记未清拒收。
 
 - `delegate` 6.17.0：`start --allow` 按次开放受保护路径、reply 继承；`reply --when-done` 后台记追问且可由 stop 取消，wait 忽略停止/跳过。修复 apply 零改动续轮的合入登记与池槽清理误报，status 改缓存/非阻塞锁，Bash 增加源树误写拒绝（非沙箱），cp/rsync/install/ln 只按目标判断、允许读出源树，拒绝行指出写入路径。

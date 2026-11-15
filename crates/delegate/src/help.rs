@@ -103,6 +103,8 @@ const COMMANDS: &[(&str, &str)] = &[
         "Query live resource occupants (exit 0 busy, 1 idle).",
     ),
     ("lane", "Queue a heavy command with other machine checks."),
+    ("remote", "Check SSH remote heavy-command execution (remote check)."),
+    ("config", "Show merged effective configuration, including remote."),
     ("stop", "Terminate runs."),
     ("clean", "Delete finished runs."),
     ("fit", "Show or update the four-class model suitability card (fit set; fit --json)."),
@@ -156,7 +158,12 @@ pub fn print(command: Option<&str>) -> bool {
         println!(
             "Exit: 0 delivered/answered, 1 other finished, 2 usage, 75 still running at --max, 76 already covered by another waiter, 77 agentDeny shim refusal."
         );
-        println!(".delegate.json agentDeny: argv prefixes by default; exact: true matches the whole argv. No global-option normalization. Acceptance/evidence/setup/apply and caller lane keep the original PATH. Shims have no environment bypass.");
+        println!(".delegate.json agentDeny: argv prefixes by default; exact: true matches the whole argv. No global-option normalization. Acceptance/evidence/setup/apply use remote-only shims when enabled; caller lane stays local. Shims have no environment bypass.");
+        let cwd = std::env::current_dir().unwrap_or_default();
+        match crate::config::load(crate::common::git_top(&cwd).as_deref()) {
+            Ok(config) => println!("Remote: {} (user remote.host; DELEGATE_REMOTE=0 disables; remote check probes)", config.value["remote"]),
+            Err(error) => eprintln!("delegate config: {error}"),
+        }
         println!("Runs: $DELEGATE_RUNS or <git root of cwd>/.local/run/delegate (old .local/run/pi runs remain readable).");
         return true;
     };
@@ -199,6 +206,8 @@ pub fn print(command: Option<&str>) -> bool {
             ("--no-verify", "Skip the post-merge acceptance."),
             ("--keep-commits", "Cherry-pick the colleague's commits instead of applying the final tree; refuses uncommitted files (listed in commitsDiffer)."),
         ]),
+        "config" => ("", "Show merged effective configuration (including the remote host).", &[]),
+        "remote" => ("check", "Test SSH, rsync and remote program versions; never falls back locally.", &[]),
         "lane" => ("[--label TEXT] [--measure] [command ...]", "Queue a heavy command with acceptance, evidence, worktree setup, and other machine checks. --measure uses the FIFO measurement reservation and reserved CPUs. DELEGATE_MAX_HEAVY run at once (default: 2). One argument is a shell command; no command lists the lane.", &[
             ("--label TEXT", "Label shown in the lane listing."),
             ("--measure", "Run through the machine measurement reservation."),

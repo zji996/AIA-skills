@@ -88,7 +88,10 @@ class DelegateTests(unittest.TestCase):
         self.bin.mkdir()
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(("DELEGATE_", "PI_DELEGATE_")) and k not in CALLER_ENV}
-        self.env.update(PATH=f"{self.bin}:{os.environ['PATH']}", DELEGATE_POLL="0.1",
+        # Nested test runs must resolve real tools, not another run's private shims.
+        path = os.pathsep.join(p for p in os.environ["PATH"].split(os.pathsep)
+                               if Path(p).name not in {"agent-shims", "measure-shims", "resource-shims", "remote-shims"})
+        self.env.update(PATH=f"{self.bin}:{path}", DELEGATE_POLL="0.1",
                         DELEGATE_RUNS=str(self.work / "runs"), XDG_STATE_HOME=str(self.work / "state"),
                         XDG_CACHE_HOME=str(self.work / "cache"),
                         XDG_CONFIG_HOME=str(self.work / "config"),

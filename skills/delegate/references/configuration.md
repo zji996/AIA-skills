@@ -2,9 +2,22 @@
 
 `XDG_CONFIG_HOME` 未设时使用系统约定的用户配置目录。
 
+## Remote：重命令转到构建机
+
+SSH host 只认用户配置；仓库 `remote.host` 始终报错。
+
+```json
+{"remote":{"host":"ci","root":"build/delegate","programs":["cargo"],"maxHeavy":4,
+ "profile":"env.sh","slice":"build.slice","forwardEnv":["RUST_LOG"]}}
+```
+
+无 host 即关闭。仓库可逐字段覆盖（如 `{"remote":{"programs":["cargo","browser-contracts"],"profile":"env.sh","forwardEnv":["RUST_LOG"]}}`，数组整体替换），但不能设置 host；`remote: false` 关闭本仓库，环境变量 `DELEGATE_REMOTE=0` 整体关闭。`config`/`--help` 展示生效值（含主机），`remote check` 一行检测 SSH/rsync/程序版本，失败 75。
+
+环境、profile、依赖与限制见 [runtime.md](runtime.md)。
+
 ## 用户与仓库配置
 
-用户配置 `${XDG_CONFIG_HOME}/delegate/config.json` 支持 `agentDeny`、`measure`、`measureCpus`、`env`、`maxRework`、默认 `accept`/`evidence`、`maxActive`、`maxHeavy`、`repoMaxActive`、`models`/`tiers`/`thinking`、`sourceBuild.paths`、`standing`、`defaults`、`resultChars`、`cleanupKeepExecutables`。仓库根 `.delegate.json` 使用相同字段并保存仓库事实。
+用户配置 `${XDG_CONFIG_HOME}/delegate/config.json` 支持 `remote`、`agentDeny`、`measure`、`measureCpus`、`env`、`maxRework`、默认 `accept`/`evidence`、`maxActive`、`maxHeavy`、`repoMaxActive`、`models`/`tiers`/`thinking`、`sourceBuild.paths`、`standing`、`defaults`、`resultChars`、`cleanupKeepExecutables`。仓库根 `.delegate.json` 使用相同字段并保存仓库事实。
 
 `measure` 是 argv 前缀数组，例如 `{"measure":[["cargo","xtask","bench-concurrency"]]}`；仓库配置覆盖用户配置。`measureCpus` 是预约核列表（如 `"8-11"`），未设置时取最后 `max(2, nproc/3)` 个在线逻辑核。匹配的同事、验收、证据和 lane 命令自动排队到机器级测量预约；预约开始时在跑的 lane 命令会让出预约核，预约期间普通 lane 命令使用其余核。
 

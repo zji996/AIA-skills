@@ -812,6 +812,7 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     extra["cleanupKeepExecutables"] = config.value["cleanupKeepExecutables"].clone();
     extra["share"] = json!(o.share);
     extra["acceptBlind"] = config.value["acceptBlind"].clone();
+    extra["remote"] = config.value["remote"].clone();
     extra["resources"] = config.value["resources"].clone();
     extra["measure"] = config.value["measure"].clone();
     extra["measureCpus"] = config.value["measureCpus"].clone();
@@ -920,6 +921,7 @@ fn rework_used(run: &Path) -> (u64, String) {
         let lines =
             changes["added"].as_u64().unwrap_or(0) + changes["deleted"].as_u64().unwrap_or(0);
         match (s(&meta, "continuation"), s(&meta["rework"], "kind")) {
+            _ if b(&json(current.join("summary.json")), "infrastructureFailure") => {}
             (continuation, _) if runs::interrupted(continuation) => {}
             // A round that changed nothing (a question, a failed start) is not rework,
             // and neither is the round after one: that is the first build.
@@ -947,7 +949,7 @@ fn delivered(meta: &Value, run: &Path) -> bool {
         return false;
     }
     let sum = json(run.with_file_name(parent).join("summary.json"));
-    sum["changes"]["files"].as_u64().unwrap_or(0) > 0 && !b(&sum, "question")
+    sum["changes"]["files"].as_u64().unwrap_or(0) > 0 && !b(&sum, "question") && !b(&sum, "infrastructureFailure")
 }
 
 /// Rework budget for write conversations (`.delegate.json` `maxRework`, default 1):
@@ -972,7 +974,7 @@ fn rework_gate(
         None => Some(1),
     };
     let (used, name) = rework_used(parent);
-    if runs::interrupted(&runs::state(parent)) {
+    if runs::interrupted(&runs::state(parent)) || b(&json(parent.join("summary.json")), "infrastructureFailure") {
         return Ok(Some(
             json!({"kind":"continuation","used":used,"limit":limit}),
         ));
@@ -1268,6 +1270,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     extra["cleanupKeepExecutables"] = config.value["cleanupKeepExecutables"].clone();
     extra["share"] = meta["share"].clone();
     extra["acceptBlind"] = meta["acceptBlind"].clone();
+    extra["remote"] = config.value["remote"].clone();
     extra["resources"] = meta["resources"].clone();
     extra["measure"] = meta["measure"].clone();
     extra["measureCpus"] = meta["measureCpus"].clone();
@@ -1969,6 +1972,7 @@ pub fn launch(
         "share",
         "acceptBlind",
         "resources",
+        "remote",
         "measure",
         "measureCpus",
         "stall",

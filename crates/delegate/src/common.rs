@@ -414,7 +414,7 @@ pub fn run_shell(
         .stderr(Stdio::from(log.try_clone().map_err(|e| e.to_string())?));
     clean_env(&mut c, extra);
     let meta = json(run.join("meta.json"));
-    if let Some(path) = crate::deny::resource_path(&meta, run)? {
+    if let Some(path) = crate::deny::shell_path(&meta, run)? {
         c.env("PATH", path);
     }
     c.env("DELEGATE_LANE_HELD", "1")

@@ -107,6 +107,10 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<()> {
             }
         }
     }
+    let remote_programs = crate::remote::programs(&meta["remote"]);
+    for program in &remote_programs {
+        programs.entry(program).or_default();
+    }
     for program in resources.keys() {
         programs.entry(program).or_default();
     }
@@ -119,6 +123,8 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<()> {
     fs::create_dir(&resource_dir).map_err(|e| e.to_string())?;
     let measure_dir = run.join("measure-shims");
     fs::create_dir(&measure_dir).map_err(|e| e.to_string())?;
+    let remote_dir = run.join("remote-shims");
+    fs::create_dir_all(&remote_dir).map_err(|e| e.to_string())?;
     let path = original_path(meta);
     crate::process_match::prepare(run, &path)?;
     for (program, rules) in programs {
@@ -147,6 +153,21 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<()> {
         } else {
             resolve(program, &path, Path::new(s(meta, "workdir")))
         };
+        let remote_invoke = remote_programs.contains(&program).then(|| {
+            format!(
+                "exec {} _remote {} {} \"$@\"\n",
+                shell_quote(&script().to_string_lossy()),
+                shell_quote(&run.to_string_lossy()),
+                shell_quote(program)
+            )
+        });
+        if let Some(invoke) = &remote_invoke {
+            body.push_str(invoke);
+            let shim = remote_dir.join(program);
+            write(&shim, format!("#!/bin/sh\n{invoke}"))?;
+            fs::set_permissions(shim, fs::Permissions::from_mode(0o700))
+                .map_err(|e| e.to_string())?;
+        }
         let mut resource_body = "#!/bin/sh\n".to_string();
         for (name, argv) in resources.get(program).into_iter().flatten() {
             let mut condition = format!("[ \"$#\" -ge {} ]", argv.as_array().unwrap().len() - 1);
@@ -235,11 +256,7 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<()> {
         if measures.contains_key(program) {
             measure_body.push_str(&format!(
                 "exec {} \"$@\"\n",
-                shell_quote(
-                    &real
-                        .as_ref()
-                        .map_or_else(|| program.to_string(), |x| x.to_string_lossy().into_owned())
-                )
+                shell_quote(&dir.join(program).to_string_lossy())
             ));
             let shim = measure_dir.join(program);
             write(&shim, measure_body)?;
@@ -248,6 +265,30 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<()> {
         }
     }
     Ok(())
+}
+pub fn shell_path(meta: &Value, run: &Path) -> Res<Option<std::ffi::OsString>> {
+    if crate::remote::enabled(&meta["remote"]) {
+        let dir = run.join("remote-shims");
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        for program in crate::remote::programs(&meta["remote"]) {
+            let shim = dir.join(program);
+            write(
+                &shim,
+                format!(
+                    "#!/bin/sh\nexec {} _remote {} {} \"$@\"\n",
+                    shell_quote(&script().to_string_lossy()),
+                    shell_quote(&run.to_string_lossy()),
+                    shell_quote(program)
+                ),
+            )?;
+            fs::set_permissions(shim, fs::Permissions::from_mode(0o700))
+                .map_err(|e| e.to_string())?;
+        }
+        let mut paths = vec![dir];
+        paths.extend(env::split_paths(&original_path(meta)));
+        return Ok(Some(env::join_paths(paths).map_err(|e| e.to_string())?));
+    }
+    resource_path(meta, run)
 }
 pub fn resource_path(meta: &Value, run: &Path) -> Res<Option<std::ffi::OsString>> {
     let dir = run.join("resource-shims");
