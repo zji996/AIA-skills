@@ -798,9 +798,9 @@ fn wait_each(
                 );
             }
         }
-        // Explicit controller cancellation and dependency skips are not deliveries.
+        // Controller cancellation is not a delivery; dependency skips must be reported.
         reported.extend(list.iter().filter(|r| {
-            r.join(".stopped").exists() || matches!(runs::state(r).as_str(), "stopped" | "skipped")
+            r.join(".stopped").exists() || runs::state(r) == "stopped"
         }).cloned());
         let done = list
             .iter()
@@ -1307,7 +1307,7 @@ fn apply(args: &[String]) -> Res<i32> {
             conclusion["verify"] = verify.clone();
         }
     }
-    for (_, conclusion, commands) in &done {
+    for (run, conclusion, commands) in &done {
         let final_line = if conclusion["acceptStillValid"] == json!(true) {
             "验收仍然有效（仓库快照范围）".to_string()
         } else if conclusion["apply"]["ok"] == json!(true)
@@ -1317,13 +1317,19 @@ fn apply(args: &[String]) -> Res<i32> {
         {
             String::new()
         } else {
-            let validity = if conclusion["acceptStillValid"] == json!(false) {
+            let validity = if b(conclusion, "acceptPending") {
+                "验收未完成（排队/基础设施）"
+            } else if conclusion["acceptStillValid"] == json!(false) {
                 "验收无效"
             } else {
                 "验收有效性未确认"
             };
             if commands.is_empty() {
                 format!("{validity}；任务没有验收命令")
+            } else if b(conclusion, "acceptPending") {
+                format!("{validity}；重排：{} apply --verify --keep {}；或本地：DELEGATE_REMOTE=0 {} lane {}",
+                    shell_quote(&script().to_string_lossy()), run.file_name().unwrap_or_default().to_string_lossy(),
+                    shell_quote(&script().to_string_lossy()), shell_quote(&commands.join(" && ")))
             } else {
                 format!("{validity}；需要在主干重跑：{}", commands.join("；"))
             }
@@ -1346,6 +1352,8 @@ fn apply(args: &[String]) -> Res<i32> {
             "{}",
             if verify["ok"] == json!(true) {
                 format!("合并后验收通过：{}", plan.join("；"))
+            } else if b(&verify, "notExecuted") || b(&verify, "infrastructureFailure") {
+                format!("合并已写入；{}；日志 {}", s(&verify, "next"), s(&verify, "log"))
             } else {
                 format!(
                     "合并后验收失败：{}；合并已写入主干，在主干修或 reply 同事；日志 {}",

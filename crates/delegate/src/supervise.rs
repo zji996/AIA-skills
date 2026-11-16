@@ -71,7 +71,7 @@ pub fn log_event(run: &Path, mut event: Value) {
     let _ = append(run.join("events.jsonl"), &format!("{event}\n"));
 }
 fn accept(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
-    let mut result = json!({"command":s(meta,"accept")});
+    let mut result = json!({"command":s(meta,"accept"),"notExecuted":true,"infrastructureFailure":true});
     let label = format!(
         "accept {}",
         run.file_name().unwrap_or_default().to_string_lossy()
@@ -159,7 +159,7 @@ fn accept(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
     }
     result["ok"] = json!(code == 0);
     result["exitCode"] = json!(code);
-    result["infrastructureFailure"] = json!(code == 75);
+    result.as_object_mut().unwrap().extend(shell_outcome(run, "accept", code, timed).as_object().unwrap().clone());
     if code != 0 {
         let text = read(&path);
         let body = text.split_once('\n').map(|(_, x)| x).unwrap_or("");
@@ -817,8 +817,23 @@ fn stack_on_upstream(run: &Path, meta: &mut Value, upstream: &Path, prior: &Valu
 fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> Res<()> {
     let mut meta = json(run.join("meta.json"));
     if !s(&meta, "after").is_empty() {
-        let upstream = PathBuf::from(s(&meta, "after"));
-        wait_for_run(&upstream);
+        let mut upstream = PathBuf::from(s(&meta, "after"));
+        loop {
+            wait_for_run(&upstream);
+            let summary = json(upstream.join("summary.json"));
+            if lane::stopped() || !b(&summary["accept"], "notExecuted") {
+                break;
+            }
+            // No failed execution to skip on: wait for the controller's retry.
+            log_event(run, json!({"e":"upstream_unverified","run":upstream}));
+            crate::queue::update(run, &format!("上游验收未执行，等待重排 / upstream unverified: {}", upstream.display()), 0)?;
+            while runs::latest(upstream.clone()) == upstream && !lane::stopped() {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            upstream = runs::latest(upstream);
+            meta["after"] = json!(upstream);
+            write_json(run.join("meta.json"), &meta)?;
+        }
         if lane::stopped() {
             return finish_skipped(run, "stopped while waiting for upstream");
         }
@@ -1096,6 +1111,9 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         }
     }
     let pgid = read(run.join("agent.pid")).trim().parse().unwrap_or(0);
+    if b(&sum, "question") {
+        crate::lane::save_priority(run)?;
+    }
     crate::cleanup::record(run, pgid);
     if pgid > 0 && group_members(pgid) {
         end_group(pgid, 2.0);

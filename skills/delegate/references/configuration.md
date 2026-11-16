@@ -11,7 +11,7 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
  "profile":"env.sh","slice":"build.slice","forwardEnv":["RUST_LOG"]}}
 ```
 
-无 host 即关闭。仓库可逐字段覆盖（如 `{"remote":{"programs":["cargo","browser-contracts"],"profile":"env.sh","forwardEnv":["RUST_LOG"]}}`，数组整体替换），但不能设置 host；`remote: false` 关闭本仓库，环境变量 `DELEGATE_REMOTE=0` 整体关闭。`config`/`--help` 展示生效值（含主机），`remote check` 一行检测 SSH/rsync/程序版本，失败 75。
+无 host 即关闭。仓库可逐字段覆盖（如 `{"remote":{"programs":["cargo","browser-contracts"],"profile":"env.sh","forwardEnv":["RUST_LOG"]}}`，数组整体替换），但不能设置 host；`remote: false` 关闭本仓库，`DELEGATE_REMOTE=0` 关闭且随 reply 继承，显式变量可覆盖。`config`/`--help` 展示生效值（含主机），`remote check` 一行检测 SSH/rsync/程序版本，失败 75。
 
 环境、profile、依赖与限制见 [runtime.md](runtime.md)。
 

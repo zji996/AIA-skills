@@ -812,6 +812,7 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     extra["cleanupKeepExecutables"] = config.value["cleanupKeepExecutables"].clone();
     extra["share"] = json!(o.share);
     extra["acceptBlind"] = config.value["acceptBlind"].clone();
+    extra["remoteOff"] = json!(std::env::var("DELEGATE_REMOTE").ok().as_deref() == Some("0"));
     extra["remote"] = config.value["remote"].clone();
     extra["resources"] = config.value["resources"].clone();
     extra["measure"] = config.value["measure"].clone();
@@ -1270,7 +1271,12 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     extra["cleanupKeepExecutables"] = config.value["cleanupKeepExecutables"].clone();
     extra["share"] = meta["share"].clone();
     extra["acceptBlind"] = meta["acceptBlind"].clone();
-    extra["remote"] = config.value["remote"].clone();
+    extra["remoteOff"] = json!(match std::env::var("DELEGATE_REMOTE") {
+        Ok(value) => value == "0",
+        Err(_) => b(&meta, "remoteOff"),
+    });
+    extra["remote"] = if b(&extra, "remoteOff") { json!(false) } else { config.value["remote"].clone() };
+    extra["lanePriority"] = json(parent.join("lane-priority.json"));
     extra["resources"] = meta["resources"].clone();
     extra["measure"] = meta["measure"].clone();
     extra["measureCpus"] = meta["measureCpus"].clone();
@@ -1973,6 +1979,8 @@ pub fn launch(
         "acceptBlind",
         "resources",
         "remote",
+        "remoteOff",
+        "lanePriority",
         "measure",
         "measureCpus",
         "stall",

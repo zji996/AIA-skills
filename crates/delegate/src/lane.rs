@@ -102,7 +102,8 @@ fn tickets_in(dir: &Path) -> Vec<(PathBuf, Value)> {
             }
         }
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
+    // A resumed ticket may have an older timestamp, but must never displace a holder.
+    out.sort_by(|a, z| b(&z.1, "running").cmp(&b(&a.1, "running")).then(a.0.cmp(&z.0)));
     out
 }
 fn tickets() -> Vec<(PathBuf, Value)> {
@@ -148,9 +149,8 @@ pub fn holder_processes() -> Res<Vec<(String, i32)>> {
     let lim = max_heavy()?;
     Ok(tickets()
         .iter()
-        .enumerate()
-        .filter_map(|(i, (_, value))| {
-            if lim != 0 && i >= lim {
+        .filter_map(|(_, value)| {
+            if lim != 0 && !b(value, "running") {
                 return None;
             }
             let pid = value["pid"].as_i64()?.try_into().ok()?;
@@ -228,12 +228,14 @@ fn acquire_in(
         });
     }
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let me = json!({"pid":std::process::id(),"label":label,"since":iso(),"epoch":epoch()});
+    let priority = account.map(|r| json(r.join("meta.json"))["lanePriority"][label].as_u64().unwrap_or(0)).unwrap_or(0);
+    let stamp = if priority == 0 { now_ns() as u64 } else { priority };
+    let mut me = json!({"pid":std::process::id(),"label":label,"since":iso(),"epoch":epoch(),"queuedNs":stamp,"run":account,"running":false});
     let ticket;
     let file;
     {
         let _guard = lock(&dir.join(".lock"), true, false).map_err(|e| e.to_string())?;
-        ticket = dir.join(format!("{:020}-{}.ticket", now_ns(), std::process::id()));
+        ticket = dir.join(format!("{stamp:020}-{}.ticket", std::process::id()));
         file = locked_file(&ticket, &me.to_string())?;
     }
     let marker = account.map(|p| p.join(format!("lane-waiting-{}", std::process::id())));
@@ -244,11 +246,15 @@ fn acquire_in(
     let started = Instant::now();
     let outcome = (|| {
         loop {
+            let guard = lock(&dir.join(".lock"), true, false).map_err(|e| e.to_string())?;
             let live = tickets_in(dir);
             let pos = live.iter().position(|(p, _)| p == &ticket).unwrap_or(0);
             if pos < limit {
+                me["running"] = json!(true);
+                write(&ticket, me.to_string())?;
                 break;
             }
+            drop(guard);
             let labels: Vec<String> = live[..pos]
                 .iter()
                 .map(|(_, v)| s(v, "label").to_string())
@@ -268,13 +274,14 @@ fn acquire_in(
         Ok(())
     })();
     let queued = started.elapsed().as_secs_f64();
+    // Persist before removing the live marker, so timeout readers never see a gap.
+    if let Some(a) = account {
+        let _ = append(a.join("lane-wait"), &format!("{queued:.3}\n"));
+    }
     if let Some(p) = marker {
         let _ = fs::remove_file(p);
     }
     drop(markfile);
-    if let Some(a) = account {
-        let _ = append(a.join("lane-wait"), &format!("{queued:.1}\n"));
-    }
     if let Err(e) = outcome {
         let _ = fs::remove_file(ticket);
         return Err(e);
@@ -284,6 +291,23 @@ fn acquire_in(
         _file: Some(file),
         queued,
     })
+}
+/// Keep only queued jobs, not processes: question cleanup still reclaims every child.
+pub fn save_priority(run: &Path) -> Res<()> {
+    let mut priority = json!({});
+    for dir in [lane_dir(), state_dir().join("lane-remote")] {
+        if !dir.is_dir() { continue; }
+        let _guard = lock(&dir.join(".lock"), true, false).map_err(|e| e.to_string())?;
+        for (_, ticket) in tickets_in(&dir) {
+            if ticket["run"] == json!(run) && !b(&ticket, "running") {
+                let label = s(&ticket, "label");
+                let stamp = ticket["queuedNs"].as_u64().unwrap_or(0);
+                let old = priority[label].as_u64().unwrap_or(u64::MAX);
+                priority[label] = json!(old.min(stamp));
+            }
+        }
+    }
+    write_json(run.join("lane-priority.json"), &priority)
 }
 pub fn queued_seconds(run: &Path) -> f64 {
     let mut total = read(run.join("lane-wait"))

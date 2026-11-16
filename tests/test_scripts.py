@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import shlex
 import re
 import os
 import shutil
@@ -594,6 +595,24 @@ class ScriptTests(unittest.TestCase):
             self.assertEqual(decision(command), "allow", command)
         self.assertEqual(decision(f"{d} wait", background=True), "allow")
         self.assertEqual(decision(f"{d} wait", tool="Read"), "allow")
+
+    def test_background_hook_reply_message_is_not_command_or_option(self):
+        def denied(command):
+            result = subprocess.run([sys.executable, str(BACKGROUND_HOOK)], input=json.dumps({
+                "tool_name": "Bash", "tool_input": {"command": command}}), capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return bool(result.stdout)
+        for invocation in ("$D", "${D}", "/skills/delegate/bin/delegate"):
+            for message in ("compose up -d --wait please", "example: /skills/delegate/bin/delegate wait",
+                            "$D wait --all; reply without --wait", "use --help then retry"):
+                self.assertFalse(denied(f"{invocation} reply job {shlex.quote(message)}"), message)
+                self.assertTrue(denied(f"{invocation} reply --wait job {shlex.quote(message)}"), message)
+            self.assertTrue(denied(f'{invocation} reply job "message"; {invocation} wait'))
+        self.assertFalse(denied('echo "/skills/delegate/bin/delegate wait"'))
+        # Environment prefixes do not hide the command word.
+        self.assertTrue(denied("DELEGATE_REMOTE=0 /skills/delegate/bin/delegate wait --any"))
+        self.assertTrue(denied("cd /repo && env A=1 B=2 $D wait job"))
+        self.assertFalse(denied("DELEGATE_REMOTE=0 $D reply job 'compose up --wait'"))
 
     def test_background_hook_denies_pgrep_patterns_that_match_their_own_shell(self):
         def decision(command, background=False):

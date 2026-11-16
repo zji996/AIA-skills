@@ -99,6 +99,75 @@ class DelegateSessionFrictionsTests(unittest.TestCase):
         self.assertNotIn("已跳过", result.stdout)
         self.assertNotIn("已停止", result.stdout)
 
+    def test_wait_reports_dependency_skip_reason_and_restart_for_any_and_stream(self):
+        self.fake_pi([fixtures.answer("broken")], code=1)
+        bad = self.outcome(self.cli("run", "--read-only", "--name", "bad", "task"))
+        self.fake_pi([fixtures.answer("unused"), fixtures.SETTLED])
+        child = self.outcome(self.cli("run", "--read-only", "--after", bad["run"], "dependent"))
+        self.assertEqual(child["state"], "skipped")
+        for options in (("--any",), ("--stream",), ("--all",)):
+            # Each wait normally delivers once; re-arm to check all output modes.
+            (Path(child["dir"]) / ".delivered").unlink(missing_ok=True)
+            result = self.cli("wait", *options, child["run"], human=True)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("已跳过", result.stdout)
+            self.assertIn("upstream bad ended failed", result.stdout)
+            self.assertIn("reply --fresh", result.stdout)
+            self.assertIn(child["run"], result.stdout)
+
+    def test_question_reply_restores_lane_age_without_preempting_running_jobs(self):
+        for already_running in (False, True):
+            with self.subTest(already_running=already_running):
+                self.env["DELEGATE_MAX_HEAVY"] = "1"
+                suffix = str(already_running)
+                gate = self.work / ("blocker-" + suffix)
+                order = self.work / ("order-" + suffix)
+                later_gate = self.work / ("later-" + suffix)
+                lane_dir = self.work / "state/delegate/lane"
+                def spawn(label, command):
+                    proc = subprocess.Popen([str(fixtures.DELEGATE), "lane", "--label", label, command],
+                                            cwd=self.work, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    self.addCleanup(lambda: proc.poll() is None and proc.terminate())
+                    return proc
+                blocker = spawn("blocker", f"while [ ! -f {gate} ]; do sleep .02; done")
+                self.until(lambda: lane_dir.exists() and any(json.loads(p.read_text()).get("running")
+                           for p in lane_dir.glob("*.ticket")), "blocker holds lane")
+                command = f"echo resumed >> {order}"
+                label = "browser-recheck-" + suffix
+                log = self.work / ("queue-" + suffix)
+                queued_pre = (f"{fixtures.DELEGATE} lane --label {label} {shlex.quote(command)} > {log} 2>&1 &\n"
+                              f"while ! grep -q 'queued behind' {log}; do sleep .02; done")
+                self.fake_pi([fixtures.answer("需要主控决定\n选择哪种模式？"), fixtures.SETTLED], pre=queued_pre)
+                state = self.outcome(self.cli("run", "--read-only", "--in-place", "task"))
+                self.assertTrue(state["question"])
+                priority = json.loads((Path(state["dir"]) / "lane-priority.json").read_text())
+                self.assertGreater(priority[label], 0)
+                self.assertFalse(order.exists(), "paused job must still be queued")
+                later = spawn("later", f"echo later >> {order}; while [ ! -f {later_gate} ]; do sleep .02; done")
+                self.until(lambda: len(list(lane_dir.glob("*.ticket"))) == 2, "later queues")
+                if already_running:
+                    gate.touch()
+                    blocker.communicate(timeout=10)
+                    self.until(order.exists, "later starts before reply")
+                self.fake_pi([fixtures.answer("done"), fixtures.SETTLED],
+                             pre=f"{fixtures.DELEGATE} lane --label {label} {shlex.quote(command)}")
+                reply = self.outcome(self.cli("reply", state["run"], "use the first option"))
+                self.addCleanup(lambda: self.cli("stop", reply["run"]))
+                self.until(lambda: any(json.loads(p.read_text()).get("label") == label
+                           for p in lane_dir.glob("*.ticket")), "reply rejoins lane")
+                if already_running:
+                    self.assertEqual(order.read_text().splitlines(), ["later"], "old age must not steal a running slot")
+                    later_gate.touch()
+                else:
+                    gate.touch()
+                    later_gate.touch()
+                result = self.cli("wait", "--all", reply["run"])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                later.communicate(timeout=10)
+                blocker.communicate(timeout=10)
+                self.assertEqual(order.read_text().splitlines(),
+                                 ["later", "resumed"] if already_running else ["resumed", "later"])
+
     def test_pending_reply_survives_apply_cleanup(self):
         repo = self.repo({"a": "old\n"})
         gate, state = self.gated(repo)

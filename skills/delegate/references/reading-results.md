@@ -10,7 +10,7 @@
 |---|---|
 | 已交付（`delivered`） | 验收通过；改法仍要看 `diff` |
 | 已答复（`answered`） | 未设验收；关键结论去代码核实 |
-| 未通过（`rejected`） | 验收失败或保护违规，`--json` 查看 `accept.tail`/`protectViolation` |
+| 未通过（`rejected`） | 验收失败、未执行或保护违规（`accept.notExecuted` 区分未执行，按提示重排/本地跑），`--json` 查看 `accept.tail`/`protectViolation` |
 | `malformed` / `failed` / `timeout` / `stalled` / `killed` / `crashed` / `stopped` | 答复畸形 / 出错 / 超时 / 进程异常 / 被终止 |
 
 state 通常描述答复。普通只读任务写文件仍是 `answered`（`--shell` 写入则 `rejected`，见 [并行安全](parallel-safety.md)），短行提示，JSON 带 `readOnlyViolation`（隔离未合并）或 `workspaceChanged`（原地无法归属）。改动来自前后快照：含 shell 改动，排除原有脏改动与验收副产物。退出码：`0` 成功，`1` 其他结局，`2` 用法错误/拒绝，`75` 仍运行，`76` 已有等待者。
@@ -34,7 +34,7 @@ state 通常描述答复。普通只读任务写文件仍是 `answered`（`--she
 ## 等待的细节
 
 - 每任务只允许一个等待者；已有活等待者时跳过，全被覆盖退出 `76`，通知给原等待者。上下文压缩后旧等待者可能仍占着，此时用 `status` 看结局、`result <name>` 读答复，不必再等。
-- 无参 `wait` 只收本会话，无会话标识时收全部；`--all` 收本仓库全部并等齐，`--machine` 收整机；带名字的 `wait <run>...` 默认也在任一任务自主结束时返回（delivered/answered/提问/failed 等；不以主控 stop 或 skipped 唤醒，全部被取消时无交付可收），旧交付首行说明；`--all` 或 `--until-all` 等范围内全部结束（单次最多 50 分钟，超时列仍在跑的 run）。
+- 无参 `wait` 只收本会话，无会话标识时收全部；`--all` 收本仓库全部并等齐，`--machine` 收整机；带名字的 `wait <run>...` 默认也在任一任务自主结束时返回（delivered/answered/提问/failed 等；不以主控 stop 唤醒；依赖 skipped 明报原因与重启命令，全部被取消时无交付可收），旧交付首行说明；`--all` 或 `--until-all` 等范围内全部结束（单次最多 50 分钟，超时列仍在跑的 run）。
 - 宿主能把后台进程的每行输出变成事件时（Claude Code 的 Monitor）可用 `wait --stream`。宿主没有完成唤醒时不会自动收到结果：在自己的步骤之间用 `wait --max 4m` 主动收取，返回 `75` 后再等。Claude Code 的 `hooks/claude-code-background.py` 可拒绝前台等待。
 - 脚本加 `--json`：`completionTiming` 区分旧结果与等待中新完成，`sourceDrift.overlap` 提示源改动重叠。
 - 只看过截断答复的任务 `clean --finished` 会保留，读过全文（`result <name>`）或加 `--force` 才删。

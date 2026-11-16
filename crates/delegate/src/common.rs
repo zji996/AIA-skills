@@ -417,9 +417,14 @@ pub fn run_shell(
     if let Some(path) = crate::deny::shell_path(&meta, run)? {
         c.env("PATH", path);
     }
+    let remote_status = run.join(format!("{role}.remote.json"));
+    let _ = fs::remove_file(&remote_status);
+    c.env("DELEGATE_SHELL_STATUS", &remote_status);
     c.env("DELEGATE_LANE_HELD", "1")
         .env("DELEGATE_RUN_DIR", run);
     group(&mut c);
+    let started = std::time::Instant::now();
+    let queued_before = crate::lane::queued_seconds(run);
     let mut child = c.spawn().map_err(|e| e.to_string())?;
     let pid = child.id() as i32;
     if let Some(h) = holder {
@@ -443,7 +448,16 @@ pub fn run_shell(
         }
         let _ = tx.send(());
     });
-    let timed = rx.recv_timeout(Duration::from_secs_f64(timeout)).is_err();
+    let timed = loop {
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break false,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        let queued = (crate::lane::queued_seconds(run) - queued_before).max(0.0);
+        if started.elapsed().as_secs_f64() - queued >= timeout {
+            break true;
+        }
+    };
     crate::cleanup::record(run, pid);
     end_group(pid, if timed { 5.0 } else { 2.0 });
     if let Some(h) = holder {
@@ -463,6 +477,14 @@ pub fn run_shell(
         let _ = child.wait();
     }
     Ok((code, timed))
+}
+/// A queue/transport interruption is not evidence that the acceptance command failed.
+pub fn shell_outcome(run: &Path, role: &str, code: i32, timed: bool) -> Value {
+    let status = json(run.join(format!("{role}.remote.json")));
+    let infrastructure = code == 75 && s(&status, "stage") == "infrastructure";
+    serde_json::json!({"infrastructureFailure": infrastructure,
+        "notExecuted": (infrastructure || timed) && status.is_object() && !b(&status, "executed"),
+        "timedOut": timed, "remoteStage": status["stage"]})
 }
 pub fn finish_run(run: &std::path::Path, mut summary: serde_json::Value, code: i32) -> Res<()> {
     crate::runs::record_worktree_bytes(run);

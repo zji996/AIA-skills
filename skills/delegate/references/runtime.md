@@ -6,6 +6,8 @@
 
 `status`/`wait` 默认只展示决策所需的状态、同事与档位、耗时、文件数与增删行、前三个目录、最近命令（运行中，最多 100 字符）、验收与下一步，文件路径相对仓库；默认 status 不做工作树快照或 diff（已结束任务用 summary，老记录缺 finalEntries 不补算），运行中的源差异用 supervisor 定期缓存；容量/源观察锁只非阻塞尝试，繁忙显示 busy 与缓存，不等待编译/apply。队列人数在锁空闲时轻量更新，不扫描整机进程。`wait` 仍随后附答复。脚本用 `--json` 读取原有完整结构，`start`/`run`/`reply`/`stop` 也支持此选项；`result`、`diff` 输出不变；apply 人读末行给验收提醒，`--json` 保留既有结论。JSON 的运行目录、worktree、结果位置仍保留可直接访问的绝对路径。
 
+提问收尾仍回收进程，但把尚未开始的 lane 票按 label 保存原排队时间；回答后重跑同一 label 的作业先于较晚的排队者，已运行者不被抢占。浏览器测试不自动另开轻量 lane：浏览器、服务夹具与编译都可能吃内存，另开槽会隐性突破 maxHeavy/测量隔离；仍共用 heavy lane，由用户决定容量。
+
 每任务有 `waiter.lock`，持有排他 flock 并记录等待者 PID；重复 `wait` 跳过已有活等待者覆盖的任务，全被覆盖时退出 `76`，通知仍给原等待者。`--any`、`--stream`（含后续加入的任务）、`--machine` 同样处理；等待者退出或死亡时内核释放锁，旧 PID 不阻止后续等待。
 
 整机一条先进先出队列，同时放行 `DELEGATE_MAX_HEAVY` 个（默认 2，`0` 不限）：验收、证据、worktree `setup`、同事与主控用 `lane` 跑的检查都在这里排队。每个排队者在 `${XDG_STATE_HOME}/delegate/lane/` 下有一张按到达时间命名的票，持有其排他 flock 直到结束；等待者阻塞在前一张票的锁上，由内核在其结束或进程死亡时唤醒，不轮询，崩溃不留死锁。已在队列内的命令（带 `DELEGATE_LANE_HELD`）再调用 `lane` 直接执行，不会等自己。
@@ -14,7 +16,7 @@
 
 ## Remote 执行与远端 lane
 
-start/reply 保存当次生效配置；默认 root 是远端 HOME 下 `delegate`、programs 是 `["cargo"]`、maxHeavy 为 4（0 不限）。root/profile 为不越界的相对路径，profile 相对 root，slice 可省。
+start/reply 保存当次生效配置（remoteOff 随 reply 继承，显式 DELEGATE_REMOTE 可覆盖）；默认 root 是远端 HOME 下 `delegate`、programs 是 `["cargo"]`、maxHeavy 为 4（0 不限）。root/profile 为不越界的相对路径，profile 相对 root，slice 可省。
 
 本机与远端需 SSH、rsync，远端需 Linux 的 setsid、程序及其工具链；免交互认证与 profile 由用户准备。meta.env 与 forwardEnv 的本机现值透传，PATH/HOME/PWD/SHELL/TMPDIR、XDG 路径及 DELEGATE 内部标记不透传；远端工具链搜索路径在 profile 配置。profile 在执行程序的 shell 中 source；有 slice 时在 systemd service 的 payload shell 中 source，避免丢掉 profile 的导出变量。
 
@@ -26,7 +28,7 @@ remote 生效时，同事的 argv0 命中 programs 就转给 `_remote`；按名�
 
 有 slice 时 `systemd-run --user --unit=delegate-<id> --slice=… --wait --pipe --collect --quiet --working-directory=… -E …` 包住命令；无 slice 用 setsid 进程组与唯一 PID 文件。SIGTERM/INT/HUP 写远端取消标记、停止进程组，有 slice 再 `systemctl --user stop`，随后结束本机 SSH；标记防止取消恰好早于远端启动的竞态。远端连接断开时也尝试清理。传输失败 stderr 一行 `delegate remote: ci unreachable (<原因>); remote mode does not fall back to local`，退出 75，**绝不回退本机**；网络完全断开时不能确认远端回收，恢复连通后须检查。
 
-验收退出 75 在 summary/status 标为 infrastructureFailure，重试不占返工预算（即使原预算用完）；实际编译失败照常拒收。clean/apply 清理非池化独占工作树时顺带删远端槽；池槽保留。远端不可达只诊断，不阻止本机清理。
+验收的传输故障在 summary/status 标为 infrastructureFailure，命令未执行另标 accept.notExecuted；程序自身退出 75 仍是执行失败。远端槽锁排队也从 shell 执行超时中扣除；未执行不产生 acceptStillValid=false（apply 记 acceptPending），apply 给重排与本地跑命令，重试不占返工预算。`--after` 等未执行的上游 reply 重试，不静默跳过；确实失败才 skipped，由 wait 报原因与 reply --fresh 重启命令。clean/apply 清理非池化独占工作树时顺带删远端槽；池槽保留。远端不可达只诊断，不阻止本机清理。
 
 ### 后台服务回收
 

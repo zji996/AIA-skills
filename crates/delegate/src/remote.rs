@@ -293,7 +293,13 @@ fn stop(host: &str, unit: &str, pidfile: &str, slice: bool) {
     }
     let _ = capture(ssh(host, &script), 4.0, false);
 }
+fn shell_status(stage: &str, executed: bool) {
+    if let Some(path) = std::env::var_os("DELEGATE_SHELL_STATUS") {
+        let _ = write_json(PathBuf::from(path), &json!({"stage":stage,"executed":executed}));
+    }
+}
 fn execute(run: &Path, meta: &Value, program: &str, args: &[String]) -> Res<i32> {
+    shell_status("queued", false);
     let remote = &meta["remote"];
     let host = s(remote, "host");
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
@@ -336,12 +342,12 @@ fn execute(run: &Path, meta: &Value, program: &str, args: &[String]) -> Res<i32>
         }
     };
     if waiting.is_some() {
-        let _ = fs::remove_file(marker);
-        drop(waiting);
         let _ = append(
             run.join("lane-wait"),
-            &format!("{:.1}\n", wait_started.elapsed().as_secs_f64()),
+            &format!("{:.3}\n", wait_started.elapsed().as_secs_f64()),
         );
+        let _ = fs::remove_file(marker);
+        drop(waiting);
     }
     if crate::lane::stopped() {
         return Ok(128 + crate::lane::SIGNAL.load(Ordering::SeqCst));
@@ -443,6 +449,7 @@ fn execute(run: &Path, meta: &Value, program: &str, args: &[String]) -> Res<i32>
         .stderr(Stdio::piped());
     group(&mut c);
     let mut child = c.spawn().map_err(|e| e.to_string())?;
+    shell_status("executing", true);
     let code = Arc::new(AtomicI32::new(-1));
     let out = child.stdout.take().unwrap();
     let err = child.stderr.take().unwrap();
@@ -487,6 +494,7 @@ fn execute(run: &Path, meta: &Value, program: &str, args: &[String]) -> Res<i32>
         ));
     }
     sync(host, &top, &absolute, true)?;
+    shell_status("completed", true);
     Ok(code)
 }
 pub fn command(args: &[String]) -> Res<i32> {
@@ -503,6 +511,9 @@ pub fn command(args: &[String]) -> Res<i32> {
             if crate::lane::stopped() {
                 return Ok(128 + crate::lane::SIGNAL.load(Ordering::SeqCst));
             }
+            let executed = std::env::var_os("DELEGATE_SHELL_STATUS")
+                .map(|p| b(&json(PathBuf::from(p)), "executed")).unwrap_or(false);
+            shell_status("infrastructure", executed);
             unreachable(s(&meta["remote"], "host"), &reason);
             Ok(75)
         }

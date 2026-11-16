@@ -10,6 +10,8 @@
 
 ### 技能
 
+- `delegate` 6.20.0：remote=off 随 reply/续做继承，hook 按 argv 位置识别等待（`NAME=value`、`env` 前缀不遮挡命令词）；验收区分未执行与执行失败、远端槽排队不耗执行超时，`--after` 等上游重试且 wait 明报真实跳过。提问后的 lane 重跑沿用原排队时间、不抢占运行者；浏览器仍共用 heavy lane，避免隐性突破机器容量。
+
 - `delegate` 6.19.0：用户级 remote 经 SSH/rsync 转发重命令，远端独立 lane 与温热 worktree 槽、回传改动/退出码、取消回收；连接失败退出 75、不回退本机，验收基础设施失败不计返工。
 
 - `delegate` 6.18.0：清理与 apply 释放工作树前限额归档忽略的非构建输出及答复引用，清理后 status/result 可找回；Git 统一关闭可选索引锁。收尾与 apply 列未提交文件、提醒提交不等于最终树；`reply --sync=agent` 把文本冲突交同事先解，标记未清拒收。

@@ -79,7 +79,7 @@
 | `--provider` `--model` `--thinking` | — | --model 仅选已登记别名或完整名，可与 --tier 同用；thinking 独立；普通 reply 保留二者 |
 | `--overflow next\|queue` | queue | 模型满时排队或允许下一候选；reply 可用，--model 不换 |
 | `--allow-parallel-writes` | 否 | 跳过写入互斥 |
-| `--after <run>` | — | 立即创建 run（state `waiting`），上游以 delivered/answered 结束后才执行；其他结局使本 run 以 `skipped` 结束，`error` 写明上游名称与结局，exit_code 为 1 |
+| `--after <run>` | — | 立即创建 run（state `waiting`），上游以 delivered/answered 结束后才执行；验收未执行（accept.notExecuted）等上游 reply 重试，其他结局使本 run 以 `skipped` 结束，`error` 写明上游名称与结局，exit_code 为 1 |
 | `--in <run>` | — | 仅与 `--read-only` 同用；在上游 worktree 当前状态的快照中运行（§6.3）；未给 `--after` 时上游必须已结束 |
 | `--protect <路径>` | — | 可重复；路径相对仓库根，末尾 `/` 表示目录前缀，否则精确匹配文件；需要 git 仓库。reply 继承上一轮设置，不可覆盖 |
 | `--protect-reason <路径> <原因>` | — | 可重复，两个独立参数，同时保护路径并附原因；同一归一化路径的完全重复去重、不同原因或空白原因拒绝。reply 不可覆盖 |
@@ -193,6 +193,7 @@ starting ──supervisor 写 pid──▶ running ──▶ delivered | answere
 ### 4.1.1 编排（`--after`、`--in`，必须）
 
 - 带 `--after` 的 supervisor 阻塞在上游的 `supervisor.lock` 上（上游无生命周期锁时按 `DELEGATE_POLL` 兜底），等待期间不启动同事。上游成功后，任务说明末尾按说明语言追加上游名称、结局、`result.md` 路径，以及存在时的 `changes.patch` 与 worktree 路径。
+- 上游 `accept.notExecuted` 不算执行失败：保持 waiting，跟随其最新 reply，成功后再继续；真正 skipped 在 wait 输出中带原因与 reply --fresh 重启命令，不能静默忽略。
 - `waiting` 是未结束状态，`skipped` 是结束状态。waiting run 不占整机并发名额、也不参加写入互斥检查；离开等待时在 `<state>/.start.lock` 下重新检查容量，满额时等到任一运行中的 run 结束再检查。
 - `--in` 在被审查 run 结束后，对其 worktree 当前状态做快照（排除上游的 `snapshotExclude`，即 link/copy 路径，它们保留起点 tree 中的原始条目）并新建独立 worktree：HEAD 设为上游 worktree 的 HEAD，index 保持快照，使 `git diff HEAD` 显示上游的改动；workdir 映射到新 worktree 的对应目录，copy/link/setup 照常。只读违规只记在本 run，绝不改动上游 worktree。
 - 这不是嵌套：每一步都由主控声明，结果都回到主控。

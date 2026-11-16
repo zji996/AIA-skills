@@ -272,6 +272,9 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
     {
         return Some(format!("{script} clean {name}"));
     }
+    if state == "skipped" {
+        return Some(format!("已跳过：{}；修复上游后重启：{script} reply --fresh {name} '<restart>'", s(sum, "error")));
+    }
     if b(sum, "question") {
         return Some(format!(
             "the colleague asks for a decision; answer with {script} reply {name} '<decision>' (not rework)"
@@ -299,7 +302,7 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
         return None;
     }
     if b(sum, "infrastructureFailure") {
-        return Some(format!("remote infrastructure failure; fix connectivity then {script} reply {name} '<retry>' (no rework round)"));
+        return Some(format!("验收未完成（排队/基础设施）；重排：{script} reply {name} '<retry>' (no rework round)；或本地：DELEGATE_REMOTE=0 {script} reply {name} '<retry locally>'"));
     }
     match state {
         "rejected" if !sum["protectViolation"].is_null() => Some(format!(

@@ -183,3 +183,11 @@
 - 用 `--model sol --thinking low` 或 reply 换模型：别名解析完整名，thinking 独立回显；模型后缀和 --tier/--model 同用报错。
 - rpi 列出了没凭据的内置模型：不能因此选到它，只从 models 登记表匹配；未登记提示 --alias，歧义列已登记候选。
 - 图片带给 images=no 的模型：不改选模型，退出 2，给出 models.json input 加 image 或 --model 换模型两条出路。
+
+## 6.20 使用摩擦回归 / Usage friction
+
+- DELEGATE_REMOTE=0 启动后普通 reply、fresh 及续做保持本机，显式 1 恢复当前 remote 配置；explicit environment override.
+- reply 正文含 `up -d --wait`、`delegate wait` 或 `--help` 不触发 hook；真正子命令 wait/run 或 reply --wait 仍拦前台，quoted message is data.
+- apply 的远端槽锁排队不耗执行时限；传输未执行给重排/本地跑，程序自身 exit 75 仍判执行失败，queue versus execution.
+- --after 遇上游 accept.notExecuted 等 reply 重试；真正依赖失败在 wait any/stream/all 列跳过原因及 reply --fresh，dependency visibility.
+- 提问回收未执行作业但保留队龄，回答后重跑同 label 优先于后来排队者、不能抢占已运行者；browser tests 仍共用 heavy lane，避免隐性超配。

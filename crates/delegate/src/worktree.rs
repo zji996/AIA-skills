@@ -1409,6 +1409,9 @@ fn accept_validity(run: &Path, dry: bool, conclusion: &mut Value) {
         "dry run does not establish the final repository snapshot".to_string()
     } else if s(&meta, "accept").is_empty() || !accept.is_object() {
         "no recorded acceptance for this run".into()
+    } else if b(accept, "notExecuted") || b(accept, "infrastructureFailure") {
+        conclusion["acceptPending"] = json!(true);
+        "acceptance not established: queue/transport interrupted; retry or run locally".into()
     } else if accept["ok"] == json!(false) {
         valid = Some(false);
         "acceptance failed".into()
@@ -1542,7 +1545,9 @@ pub fn run_verify(run: &Path, commands: &[String]) -> Value {
     let slot = lane::acquire_shell(&label, None, Some(run), |ahead, _| {
         apply_progress(format!("verify queued / 排队中: {ahead} ahead"))
     });
-    let mut result = json!({"commands":commands});
+    let retry = format!("验收未完成（排队/基础设施）；重排：{} apply --verify --keep {}；或本地：DELEGATE_REMOTE=0 {} lane {}",
+        shell_quote(&script().to_string_lossy()), s(&meta, "run"), shell_quote(&script().to_string_lossy()), shell_quote(&commands.join(" && ")));
+    let mut result = json!({"commands":commands,"notExecuted":true,"next":retry});
     let Ok(slot) = slot else {
         result["ok"] = json!(false);
         result["tail"] = json!("stopped while queued for the heavy lane");
@@ -1555,6 +1560,8 @@ pub fn run_verify(run: &Path, commands: &[String]) -> Value {
         result["tail"] = json!(format!("cannot create {}", path.display()));
         return result;
     };
+    result.as_object_mut().unwrap().remove("notExecuted");
+    result.as_object_mut().unwrap().remove("next");
     let mut code = 0;
     for command in commands {
         let _ = writeln!(log, "$ {command}");
@@ -1574,6 +1581,7 @@ pub fn run_verify(run: &Path, commands: &[String]) -> Value {
             if timed { "\n[verify timed out]" } else { "" }
         );
         if exit != 0 {
+            result.as_object_mut().unwrap().extend(shell_outcome(run, "verify", exit, timed).as_object().unwrap().clone());
             code = exit;
             result["command"] = json!(command);
             break;
@@ -1582,14 +1590,17 @@ pub fn run_verify(run: &Path, commands: &[String]) -> Value {
     drop(slot);
     result["ok"] = json!(code == 0);
     result["exitCode"] = json!(code);
-    result["infrastructureFailure"] = json!(code == 75);
     if code != 0 {
         let text = read(&path);
         let chars: Vec<char> = text.trim().chars().collect();
         result["tail"] = json!(chars[chars.len().saturating_sub(1500)..]
             .iter()
             .collect::<String>());
-        result["next"] = json!("the merge is already in the source tree: fix it there, or reply to the task with the failure");
+        result["next"] = if b(&result, "notExecuted") || b(&result, "infrastructureFailure") {
+            json!(retry)
+        } else {
+            json!("the merge is already in the source tree: fix it there, or reply to the task with the failure")
+        };
     }
     apply_progress(if code == 0 {
         "verify passed / 验收通过"

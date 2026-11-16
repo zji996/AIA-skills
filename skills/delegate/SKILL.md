@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI（pi-kit 的 rpi 通道下 `pi` 即 rpi）。
 metadata:
-  version: "6.19.0"
+  version: "6.20.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -36,7 +36,7 @@ $D wait                                                                  # 放�
 | 节点不稳、换档前先测连通 | `$D probe`：走 Pi 本身（不是裸 HTTP）测各档模型，不建任务、不占名额 |
 | 看全文 / 改动 / 停掉 / 清理 | `$D result` / `$D diff` / `$D stop` / `$D clean --finished` |
 
-重编译可用用户配置 remote 转到 SSH 构建机、独立排队且传回改动，见 [配置](references/configuration.md) 与 [运行](references/runtime.md)。
+重编译可用用户配置 remote 转到 SSH 构建机、独立排队且传回改动；`DELEGATE_REMOTE=0` 随 reply 继承、显式环境变量可覆盖，见 [配置](references/configuration.md) 与 [运行](references/runtime.md)。
 
 多行说明用 `--prompt-file -` 加 heredoc；示例见 [references/recipes.md](references/recipes.md)，全部选项见 `$D --help`。
 
@@ -67,7 +67,8 @@ $D wait                                                                  # 放�
 ## 收结果
 
 - 已交付表示验收通过，改法仍要看 diff；已答复没有验收，关键结论自己核实。
-- 状态为「提问」时同事卡在需要你定的点上：`$D reply <name> "<决定>"` 回答，不算返工；只有改过文件后再要求改才算。
+- 状态为「提问」时保留未执行 lane 作业的原排队时间（不抢占运行者）；同事等你决定：`$D reply <name> "<决定>"` 回答，不算返工；只有改过文件后再要求改才算。
+- 验收未执行不算执行失败：按提示重排或本地跑，`--after` 等上游重试；真正跳过时 `wait` 列原因与重启命令。
 - 同一仓库的写入一次 `apply A B …` 按序合入；验收没法沿用的任务在合并后的主干重跑一次各自的验收，全量检查仍由你按批跑。
 
 状态、退出码与等待细节见 [references/reading-results.md](references/reading-results.md)；续接、并行与长时间推进见 [references/practice.md](references/practice.md)、[references/long-run.md](references/long-run.md)；run 目录见 [references/output-and-files.md](references/output-and-files.md)。

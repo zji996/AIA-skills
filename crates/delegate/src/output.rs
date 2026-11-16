@@ -366,7 +366,9 @@ pub fn human(run: &Path, status: &Value) -> String {
     }
     if status["accept"].is_object() {
         parts.push(
-            if b(status, "infrastructureFailure") {
+            if b(&status["accept"], "notExecuted") {
+                "验收未执行（排队/基础设施）"
+            } else if b(status, "infrastructureFailure") {
                 "验收基础设施失败"
             } else if b(&status["accept"], "ok") {
                 "验收通过"
@@ -473,7 +475,9 @@ pub fn human(run: &Path, status: &Value) -> String {
     } else if b(status, "applied") && s(status, "appliedBy") == "detected" {
         format!("清理：delegate clean {id}")
     } else if !s(status, "next").is_empty() {
-        if ["timeout", "stalled"].contains(&state) && s(status, "mode") == "write" {
+        if state == "skipped" || b(status, "infrastructureFailure") {
+            s(status, "next").to_string()
+        } else if ["timeout", "stalled"].contains(&state) && s(status, "mode") == "write" {
             format!("改动保留，续做不计返工次数：{}", s(status, "next"))
         } else if matches!(state, "delivered" | "answered") {
             if meta["worktree"].is_object() {

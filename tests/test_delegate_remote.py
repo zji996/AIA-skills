@@ -1,5 +1,8 @@
 """Remote commands use fake SSH/rsync transports, not a reachable SSH daemon."""
 import json
+import fcntl
+import hashlib
+import threading
 import os
 import shlex
 import shutil
@@ -18,6 +21,7 @@ class DelegateRemoteTests(unittest.TestCase):
     cli = fixtures.DelegateTests.cli
     outcome = fixtures.DelegateTests.outcome
     repo = fixtures.DelegateTests.repo
+    until = fixtures.DelegateTests.until
     user_config = fixtures.DelegateTests.user_config
 
     def setUp(self):
@@ -106,6 +110,112 @@ if sys.argv[1:2] == ["exit"]:
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre=pre)
         result = self.cli("run", "--worktree", "--workdir", repo, "--accept", accept, "task")
         return repo, self.outcome(result)
+
+    def test_remote_off_survives_reply_fresh_and_explicit_environment_overrides(self):
+        self.env["DELEGATE_REMOTE"] = "0"
+        _, state = self.run_remote(accept="cargo check")
+        self.assertEqual(self.records(), [])
+        for options, override, expected in (((), None, False), (("--fresh",), None, False),
+                                            ((), "1", True), ((), "0", False)):
+            if override is None:
+                self.env.pop("DELEGATE_REMOTE", None)
+            else:
+                self.env["DELEGATE_REMOTE"] = override
+            before = len(self.records())
+            self.fake_pi([fixtures.answer("continued"), fixtures.SETTLED])
+            reply = self.cli("reply", "--wait", *options, state["run"], "continue")
+            self.assertEqual(reply.returncode, 0, reply.stdout + reply.stderr)
+            state = self.outcome(reply)
+            meta = json.loads((Path(state["dir"]) / "meta.json").read_text())
+            self.assertEqual(meta["remoteOff"], not expected)
+            self.assertEqual(len(self.records()) > before, expected)
+
+    def test_verify_transport_not_executed_is_distinct_from_program_failure(self):
+        repo, state = self.run_remote(pre="echo changed > a.txt", accept="cargo check")
+        (self.work / "offline").touch()
+        failed = self.cli("apply", "--verify", "--keep", state["run"], human=True)
+        self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+        self.assertIn("验收未完成", failed.stdout)
+        self.assertIn("重排", failed.stdout)
+        self.assertIn("DELEGATE_REMOTE=0", failed.stdout)
+        self.assertNotIn("合并后验收失败", failed.stdout)
+        self.assertEqual((repo / "a.txt").read_text(), "changed\n")
+        (self.work / "offline").unlink()
+        # Exit 75 from a program is a real failure, not a broken transport.
+        cfg = repo / ".delegate.json"
+        cfg.write_text(json.dumps({"applyVerify": "cargo exit 75"}))
+        failed = self.outcome(self.cli("apply", "--json", "--verify", "--keep", state["run"]))
+        self.assertFalse(failed["verify"]["notExecuted"])
+        self.assertFalse(failed["verify"]["infrastructureFailure"])
+        self.assertEqual(failed["verify"]["exitCode"], 75)
+
+    def test_unexecuted_acceptance_does_not_mark_apply_invalid(self):
+        (self.work / "offline").touch()
+        _, state = self.run_remote(pre="echo changed > a.txt", accept="cargo check")
+        result = self.cli("apply", "--no-verify", "--keep", state["run"], human=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("验收未完成", result.stdout)
+        self.assertNotIn("验收无效", result.stdout)
+        self.assertIn("重排", result.stdout)
+        self.assertIn("DELEGATE_REMOTE=0", result.stdout)
+        result = self.outcome(self.cli("apply", "--json", "--no-verify", "--keep", state["run"]))
+        self.assertNotIn("acceptStillValid", result)
+        self.assertTrue(result["acceptPending"])
+        self.assertIn("not established", result["acceptValidityReason"])
+
+    def test_remote_execution_timeout_remains_failure_not_unexecuted(self):
+        repo, state = self.run_remote(accept="true")
+        run = Path(state["dir"])
+        meta = json.loads((run / "meta.json").read_text())
+        meta["acceptTimeoutSeconds"] = 2
+        (run / "meta.json").write_text(json.dumps(meta))
+        (repo / ".delegate.json").write_text(json.dumps({"applyVerify": "cargo sleep"}))
+        result = self.cli("apply", "--json", "--verify", "--keep", state["run"], timeout=20)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        verify = self.outcome(result)["verify"]
+        self.assertTrue(verify["timedOut"])
+        self.assertFalse(verify["notExecuted"])
+        self.assertFalse(verify["infrastructureFailure"])
+        self.assertTrue((self.work / "remote-pids").exists(), "command really executed")
+
+    def test_remote_slot_queue_does_not_consume_verify_execution_timeout(self):
+        repo, state = self.run_remote(pre="echo changed > a.txt", accept="cargo check")
+        run = Path(state["dir"])
+        meta = json.loads((run / "meta.json").read_text())
+        meta["acceptTimeoutSeconds"] = 3
+        (run / "meta.json").write_text(json.dumps(meta))
+        # apply uses the source directory's remote slot. Hold that transaction lock,
+        # not a heavy lane: this is the second queue inside run_shell.
+        dest = "build/" + Path(self.records()[0]["cwd"]).parent.name + "/" + repo.name
+        slot = self.work / "state/delegate/lane-remote/slots" / hashlib.sha1(("ci:" + dest).encode()).hexdigest()
+        slot.parent.mkdir(parents=True, exist_ok=True)
+        with slot.open("a+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            proc = subprocess.Popen([str(fixtures.DELEGATE), "apply", "--json", "--verify", "--keep", state["run"]],
+                                    cwd=repo, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.addCleanup(lambda: proc.poll() is None and proc.terminate())
+            self.until(lambda: bool(list(run.glob("lane-waiting-*"))), "remote slot queued")
+            time.sleep(4)
+            self.assertIsNone(proc.poll(), "queue must not spend the 3s execution timeout")
+        stdout, stderr = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 0, stdout + stderr)
+        self.assertTrue(self.outcome(subprocess.CompletedProcess([], proc.returncode, stdout, stderr))["verify"]["ok"])
+
+    def test_after_unexecuted_acceptance_waits_for_retry_instead_of_skipping(self):
+        (self.work / "offline").touch()
+        _, parent = self.run_remote(pre="echo changed > a.txt", accept="cargo check")
+        self.assertTrue(parent["accept"]["notExecuted"])
+        child = self.outcome(self.cli("start", "--read-only", "--after", parent["run"], "dependent"))
+        self.addCleanup(lambda: self.cli("stop", child["run"]))
+        time.sleep(.3)
+        self.assertIn(self.outcome(self.cli("status", child["run"]))["state"], ("waiting", "queued", "running"))
+        (self.work / "offline").unlink()
+        self.fake_pi([fixtures.answer("retry passed"), fixtures.SETTLED])
+        retry = self.cli("reply", "--wait", parent["run"], "retry")
+        self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+        result = self.cli("wait", "--all", child["run"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.outcome(result)["state"], "answered")
 
     def test_forwarding_upload_download_paths_arguments_and_exit_codes(self):
         _, state = self.run_remote(pre='cargo fmt; cargo exit 23 "a b" "x\'y"; echo $? > "$DELEGATE_RUN_DIR/code"', accept="cargo exit 255")

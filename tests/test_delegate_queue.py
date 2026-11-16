@@ -163,7 +163,8 @@ class QueueTests(unittest.TestCase):
         second = self.start("second", "--timeout", "0.1")
         third = self.start("third")
         status = self.status(third)
-        self.assertEqual(set(status["queue"]), {"reason", "ahead", "since"})
+        # status deliberately uses the cached queue if the admission lock is busy.
+        self.assertEqual(set(status["queue"]) - {"busy"}, {"reason", "ahead", "since"})
         self.assertEqual(status["queue"]["ahead"], 1)
         self.assertNotIn("elapsedSeconds", status)
         human = self.cli("status", third["dir"], human=True).stdout

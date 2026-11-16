@@ -21,8 +21,6 @@ import shlex
 import sys
 
 INVOKE = r"(?:\S*/bin/delegate|\$\{?D\}?)"
-BLOCKING = re.compile(rf"{INVOKE}\s+(?:wait|run)\b|{INVOKE}\s+reply\b[^\n;&|]*--wait\b")
-HELP = re.compile(r"^[^;&|]*\s(?:--help|-h)\b")
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
 SEPARATORS = {";", "&&", "||", "|", "&", "(", ")", "|&", ";;"}
 COMMAND_START = SEPARATORS | {"!", "do", "then", "else", "elif", "if", "until", "while", "{",
@@ -90,6 +88,79 @@ def self_matching_pgrep(command: str) -> str | None:
     return None
 
 
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+
+
+def at_command_start(tokens: list[str], i: int) -> bool:
+    """True when tokens[i] is the command word: `NAME=value` prefixes and `env` don't count."""
+    j = i - 1
+    while j >= 0 and (tokens[j] == "env" or ASSIGNMENT.fullmatch(tokens[j])):
+        j -= 1
+    return j < 0 or tokens[j] in COMMAND_START or tokens[j].endswith("$(")
+
+
+def blocking_calls(command: str) -> tuple[list[str], bool]:
+    """Read command/argv positions, never search the reply's message body."""
+    try:
+        lexer = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return [], False
+    calls = []
+    spans = []
+    for i, token in enumerate(tokens):
+        if token.rsplit("/", 1)[-1] == "ssh" and (not i or tokens[i - 1] in COMMAND_START):
+            end = i + 1
+            while end < len(tokens) and tokens[end] not in SEPARATORS:
+                end += 1
+            if end > i + 2:
+                nested, _ = blocking_calls(tokens[end - 1])
+                if nested:
+                    calls.extend(nested)
+                    spans.append((i, end))
+        if not re.fullmatch(INVOKE, token):
+            continue
+        if not at_command_start(tokens, i):
+            continue
+        end = i + 1
+        while end < len(tokens) and tokens[end] not in SEPARATORS:
+            end += 1
+        argv = tokens[i + 1:end]
+        if not argv:
+            continue
+        subcommand, args = argv[0], argv[1:]
+        # The second positional of reply begins the message; it is opaque data,
+        # including quoted --wait/--help or other delegate command examples.
+        if subcommand == "reply":
+            positional = 0
+            options = []
+            takes_value = {"--prompt-file", "--tier", "--model", "--thinking", "--timeout",
+                           "--accept", "--accept-also", "--accept-timeout", "--over-limit",
+                           "--max-answer", "--evidence", "--evidence-timeout", "--sync"}
+            skip = False
+            for arg in args:
+                if skip:
+                    skip = False
+                    continue
+                if arg.startswith("-") and positional < 2:
+                    options.append(arg)
+                    skip = arg in takes_value - {"--sync"}
+                else:
+                    positional += 1
+                    if positional == 2:
+                        break
+            args = options
+        if "--help" in args or "-h" in args:
+            continue
+        if subcommand not in {"wait", "run"} and not (subcommand == "reply" and "--wait" in args):
+            continue
+        calls.append(token + " " + shlex.join(argv))
+        spans.append((i, end))
+    mixed = bool(spans and any(t not in SEPARATORS for t in tokens[:spans[0][0]] + tokens[spans[0][1]:]))
+    return calls, mixed
+
+
 def deny(reason: str) -> int:
     json.dump(
         {
@@ -118,15 +189,10 @@ def main() -> int:
         return deny(SELF_MATCH_REASON.format(call=call))
     if tool_input.get("run_in_background"):
         return 0
-    # Asking for help does not block.
-    matches = [m for m in BLOCKING.finditer(command)
-               if not HELP.search(command[m.start():].split("\n", 1)[0])]
-    if not matches:
+    calls, mixed = blocking_calls(command)
+    if not calls:
         return 0
-    wait_command = command[matches[0].start():].split("\n", 1)[0]
-    wait_command = re.split(r"\s*(?:&&|\|\||[;&|])\s*", wait_command, maxsplit=1)[0].strip()
-    rest = command[:matches[0].start()] + command[matches[0].start() + len(wait_command):]
-    mixed = bool(rest.strip(" \t\r\n;&|"))
+    wait_command = calls[0]
     reason = (f"把 wait 单独作为一条后台命令发出：{wait_command}；其余部分另发一条。"
               if mixed else
               "delegate wait/run/reply --wait blocks until colleagues finish. Rerun the same "
