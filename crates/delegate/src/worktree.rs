@@ -7,6 +7,9 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+pub fn has_node_modules(path: &Path) -> bool {
+    path.components().any(|c| c.as_os_str() == "node_modules")
+}
 pub fn work_config(val: &Value, path: &Path) -> Res<Value> {
     let work = val
         .get("worktree")
@@ -53,14 +56,23 @@ pub fn work_config(val: &Value, path: &Path) -> Res<Value> {
                 path.display()
             ));
         }
-        out[key] = json!(items
+        let normalized: Vec<String> = items
             .iter()
             .map(|x| if key.ends_with("etup") {
                 x.clone()
             } else {
                 x.trim().trim_end_matches('/').to_string()
             })
-            .collect::<Vec<_>>());
+            .collect();
+        if key == "link" {
+            if let Some(bad) = normalized.iter().find(|x| has_node_modules(Path::new(x))) {
+                return Err(format!(
+                    "{}: worktree.link must not link node_modules ({bad}); package managers follow the symlink and overwrite the source checkout; use worktree.setup instead",
+                    path.display()
+                ));
+            }
+        }
+        out[key] = json!(normalized);
     }
     match work.get("pool") {
         None | Some(Value::Null) => {}
@@ -2134,4 +2146,20 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
     } else {
         0
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn work_config_rejects_node_modules_links() {
+        let cfg = json!({"worktree": {"link": ["apps/web/node_modules"]}});
+        let err = work_config(&cfg, Path::new(".delegate.json")).unwrap_err();
+        assert!(err.contains("node_modules"), "{err}");
+        let root_nm = json!({"worktree": {"link": ["node_modules/"]}});
+        assert!(work_config(&root_nm, Path::new(".delegate.json")).is_err());
+        let ok = json!({"worktree": {"link": ["third_party/pi"]}});
+        assert!(work_config(&ok, Path::new(".delegate.json")).is_ok());
+    }
 }

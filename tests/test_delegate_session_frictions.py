@@ -279,7 +279,7 @@ class DelegateSessionFrictionsTests(unittest.TestCase):
                     (f"cp copied {source}/a", 77), (f"cd {source} && cp a b", 77),
                     (f"cp -r {source}/fixtures imported", 0),
                     (f"install -m 644 {source}/a installed", 0),
-                    (f"ln -s {source}/fixtures linked", 0),
+                    (f"ln -s {source}/fixtures linked", 77),
                     (f"cp -t . {source}/a", 0), (f"cp -t {source} copied", 77)]
         codes = self.work / "codes"
         # Fake Pi, like the real bash tool, launches a noninteractive Bash for each call.

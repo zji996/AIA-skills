@@ -20,7 +20,7 @@
 
 - `copy`：仓库根相对路径；被 git 忽略的文件或目录（如 `.local/scan`）也会递归复制，改动不影响原仓库。源不存在或为空时在 stderr 和 `warnings` 提示。
 - `link`：大而只读的被忽略目录，建符号链接，写入会落到原仓库。
-- `setup`：依次在 worktree 根执行，输出写入 `setup.log`，任一失败即判 `failed`（`DELEGATE_SETUP_TIMEOUT`，默认 10m）。依赖用包管理器从本机缓存重建：pnpm 与 uv 以硬链接安装，几乎不额外占盘，但文件多时仍慢（含 torch 的数 GB venv 约 1 分钟）；不要 link `node_modules`、`.venv`，其中的可编辑安装指向原仓库源码。
+- `setup`：依次在 worktree 根执行，输出写入 `setup.log`，任一失败即判 `failed`（`DELEGATE_SETUP_TIMEOUT`，默认 10m）。依赖用包管理器从本机缓存重建：pnpm 与 uv 以硬链接安装，几乎不额外占盘，但文件多时仍慢（含 torch 的数 GB venv 约 1 分钟）；`link`/`--share` 拒绝仓内 `node_modules`，也不要 link `.venv`（可编辑安装指回原仓）。
 - `writeSetup`：同 `setup`，只在写入任务里、`setup` 之后执行；只读任务跳过。
 - `pool`：写入任务复用的固定 worktree 个数（0–16，默认 0 不用池）。槽位在 `${XDG_CACHE_HOME}/delegate/pool/<仓库名>-<n>`，路径不变、换任务时只 `git checkout` 有差异的文件，`target/` 与其他构建缓存保留，Cargo 等按绝对路径与修改时间判新鲜度的构建只重编改动部分。复用前先刷新索引再 `reset --hard`，删掉除 `target/` 外的未跟踪与忽略文件（托管 copy/link 重建）；复用时先删掉各 crate 被新会话取代的增量会话（rustc 只读最新一份），`target/` 仍超过 `DELEGATE_POOL_TARGET_GIB`（默认 60）时再按最近使用淘汰构建单元（`deps`/`.fingerprint`/`build` 里同名同哈希的一组，或一个 crate 的增量目录），降到上限的四分之三，常用的变体保持热缓存；设 `DELEGATE_POOL_TARGET_ROOT` 时槽位的 `target` 链到 `<目录>/<槽名>/target`，构建缓存放到专用盘（如傲腾），槽位重建后仍接上原缓存。槽位属于在用它的 run（含续做），`clean` 或合入后释放、不删除；全部占用时退回独立 worktree。只读不用池；排队放行才分配工作树/池位。
 - 这三类路径不计入改动。子模块在新 worktree 里是空目录：只读使用时写进 `link`（会替换空目录），需要独立修改时在 `setup` 里初始化。

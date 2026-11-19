@@ -61,6 +61,117 @@ fn destination<'a>(program: &str, words: &[&'a str]) -> Option<&'a str> {
     target.or(last).filter(|path| !path.is_empty())
 }
 
+fn refused_ln(words: &[&str], cwd: &Path, source: &Path) -> Option<PathBuf> {
+    let mut target_dir: Option<&str> = None;
+    let mut symbolic = false;
+    let mut operands: Vec<&str> = Vec::new();
+    let mut positional = false;
+    let mut i = 0;
+    while i < words.len() {
+        let word = words[i];
+        if word == ">"
+            || (word.bytes().all(|b| b.is_ascii_digit()) && words.get(i + 1) == Some(&">"))
+        {
+            while i < words.len()
+                && (words[i] == ">" || words[i].bytes().all(|b| b.is_ascii_digit()))
+            {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if !positional && word == "--" {
+            positional = true;
+        } else if !positional && (word == "-t" || word == "--target-directory") {
+            i += 1;
+            target_dir = words.get(i).copied();
+        } else if !positional && word.starts_with("--target-directory=") {
+            target_dir = word.strip_prefix("--target-directory=");
+        } else if !positional && (word == "-S" || word == "--suffix") {
+            i += 1;
+        } else if !positional && word.starts_with("--suffix=") {
+        } else if !positional && word.starts_with("--") {
+            if word == "--symbolic" {
+                symbolic = true;
+            }
+        } else if !positional && word.starts_with('-') && word.len() > 1 {
+            let flags = &word[1..];
+            for (idx, ch) in flags.chars().enumerate() {
+                match ch {
+                    's' => symbolic = true,
+                    't' => {
+                        let rest = &flags[idx + 1..];
+                        if rest.is_empty() {
+                            i += 1;
+                            target_dir = words.get(i).copied();
+                        } else {
+                            target_dir = Some(rest);
+                        }
+                        break;
+                    }
+                    'S' => {
+                        if flags[idx + 1..].is_empty() {
+                            i += 1;
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            operands.push(word);
+        }
+        i += 1;
+    }
+    if let Some(dir) = target_dir {
+        let path = absolute(cwd, dir);
+        if inside(&path, source) {
+            return Some(path);
+        }
+    }
+    let link_dir = if let Some(dir) = target_dir {
+        absolute(cwd, dir)
+    } else if operands.len() >= 2 {
+        let dest = absolute(cwd, operands[operands.len() - 1]);
+        if inside(&dest, source) {
+            return Some(dest);
+        }
+        if operands.len() > 2 || dest.is_dir() {
+            dest
+        } else {
+            dest.parent().unwrap_or(cwd).to_path_buf()
+        }
+    } else {
+        if inside(cwd, source) {
+            return Some(cwd.to_path_buf());
+        }
+        cwd.to_path_buf()
+    };
+    // Both hard links and symlinks into the source checkout create a writable alias
+    // that later tools (e.g. pnpm following apps/web/node_modules) mutate in place.
+    let targets = if target_dir.is_some() || operands.len() <= 1 {
+        &operands[..]
+    } else {
+        &operands[..operands.len() - 1]
+    };
+    for target in targets {
+        let from_cwd = absolute(cwd, target);
+        if inside(&from_cwd, source) {
+            return Some(from_cwd);
+        }
+        if symbolic {
+            let from_link = absolute(&link_dir, target);
+            if inside(&from_link, source) {
+                return Some(from_link);
+            }
+        }
+    }
+    if operands.is_empty() && inside(cwd, source) {
+        return Some(cwd.to_path_buf());
+    }
+    None
+}
+
 pub fn refused(command: &str, cwd: &Path, source: &Path) -> Option<PathBuf> {
     // Only literal words and redirections; expansions, scripts and nested shells
     // cannot be classified reliably without executing/parsing them.
@@ -87,12 +198,15 @@ pub fn refused(command: &str, cwd: &Path, source: &Path) -> Option<PathBuf> {
     if name == "cd" {
         return None;
     } // Reads after cd remain usable.
-    if matches!(name, "cp" | "rsync" | "install" | "ln") {
+    if matches!(name, "cp" | "rsync" | "install") {
         if let Some(destination) = destination(name, &words[1..]) {
             let path = absolute(cwd, destination);
             return inside(&path, source).then_some(path);
         }
         // An unrecognized/missing destination keeps the conservative fallback.
+    }
+    if name == "ln" {
+        return refused_ln(&words[1..], cwd, source);
     }
     let read = matches!(
         name,
@@ -211,7 +325,7 @@ pub fn inject(command: &mut Command, meta: &Value, run: &Path) -> Res<()> {
         body.push_str(&format!("[ ! -f {0} ] || . {0}\n", shell_quote(&previous)));
     }
     body.push_str(&format!(
-        "__delegate_source_check() {{\n case \"$PWD/\" in {source}/*) ;; *) case \"$1\" in *{source}*) ;; *) return 0;; esac;; esac\n {binary} _source-check {run} \"$1\" \"$PWD\" || exit 77\n}}\ntrap '__delegate_source_check \"$BASH_COMMAND\"' DEBUG\n",
+        "__delegate_source_check() {{\n case \"$PWD/\" in {source}/*) ;; *) case \"$1\" in *{source}*|ln\\ *|*/ln\\ *|*\\ ln\\ *) ;; *) return 0;; esac;; esac\n {binary} _source-check {run} \"$1\" \"$PWD\" || exit 77\n}}\ntrap '__delegate_source_check \"$BASH_COMMAND\"' DEBUG\n",
         source=shell_quote(source), binary=shell_quote(&script().to_string_lossy()), run=shell_quote(&run.to_string_lossy())
     ));
     write(&env, body)?;
@@ -228,7 +342,7 @@ mod tests {
         let root = std::env::current_dir().unwrap();
         let source = root.join("guard-source");
         let tree = root.join("guard-worktree");
-        for program in ["cp", "rsync", "install", "ln"] {
+        for program in ["cp", "rsync", "install"] {
             let from_source = format!("{program} {}/a copied", source.display());
             assert_eq!(refused(&from_source, &tree, &source), None, "{from_source}");
             let to_source = format!("{program} a {}/b", source.display());
@@ -261,5 +375,40 @@ mod tests {
         }
         let redirected = format!("cp a {}/b 2>/dev/null", source.display());
         assert_eq!(refused(&redirected, &tree, &source), Some(source.join("b")));
+    }
+
+    #[test]
+    fn ln_into_source_is_refused_in_both_directions() {
+        let root = std::env::current_dir().unwrap();
+        let source = root.join("guard-source");
+        let tree = root.join("guard-worktree");
+        for cmd in [
+            format!("ln {}/a copied", source.display()),
+            format!("ln -s {}/apps/web/node_modules apps/web/node_modules", source.display()),
+            format!("ln -sfn {}/apps/web/node_modules apps/web/node_modules", source.display()),
+            format!("ln -s -t . {}/apps/web/node_modules", source.display()),
+            format!("ln -st. {}/apps/web/node_modules", source.display()),
+            "ln -s ../guard-source/apps/web/node_modules linked".to_string(),
+            "ln -s ../../../guard-source/apps/web/node_modules apps/web/node_modules".to_string(),
+        ] {
+            assert!(refused(&cmd, &tree, &source).is_some(), "{cmd}");
+        }
+        assert_eq!(
+            refused(&format!("ln -s a {}/b", source.display()), &tree, &source),
+            Some(source.join("b"))
+        );
+        assert_eq!(
+            refused("ln -s a b", &source, &source),
+            Some(source.join("b"))
+        );
+        // Links confined to the worktree or source/.local remain allowed.
+        for cmd in [
+            "ln -s report .local/report-link".to_string(),
+            "ln -s /dev/null .local/external".to_string(),
+            format!("ln -s {}/.local/log log", source.display()),
+            format!("ln -s a {}/.local/log", source.display()),
+        ] {
+            assert_eq!(refused(&cmd, &tree, &source), None, "{cmd}");
+        }
     }
 }

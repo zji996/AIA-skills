@@ -769,6 +769,17 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         if !path.exists() {
             return Err(format!("--share path does not exist: {}", path.display()));
         }
+        let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if repo.as_ref().is_some_and(|top| {
+            let top_canon = top.canonicalize().unwrap_or_else(|_| top.clone());
+            path.starts_with(top) || canon.starts_with(&top_canon)
+        }) && (worktree::has_node_modules(&path) || worktree::has_node_modules(&canon))
+        {
+            return Err(format!(
+                "--share must not link node_modules inside the repository ({}); package managers follow the symlink and overwrite the source checkout",
+                path.display()
+            ));
+        }
         *item = path.to_string_lossy().into_owned();
     }
     o.share.sort();

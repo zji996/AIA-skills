@@ -334,9 +334,14 @@ fn settle(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let source_changed = crate::source_watch::changed(meta);
-    let outside_write =
-        s(meta, "mode") == "write" && changed.is_empty() && !source_changed.is_empty();
+    let mut source_changed = crate::source_watch::changed(meta);
+    let mut source_leaks = crate::source_watch::worktree_leaks(meta);
+    let worktree_nm_links = crate::source_watch::worktree_source_node_modules_links(meta);
+    let mut outside_write = (s(meta, "mode") == "write"
+        && changed.is_empty()
+        && !source_changed.is_empty())
+        || !source_leaks.is_empty()
+        || !worktree_nm_links.is_empty();
     let protected = meta["protect"]
         .as_array()
         .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
@@ -453,6 +458,12 @@ fn settle(
         }
         .into();
         sum["state"] = json!(state);
+        let post_leaks = crate::source_watch::worktree_leaks(meta);
+        if !post_leaks.is_empty() {
+            source_leaks = post_leaks;
+            source_changed = crate::source_watch::changed(meta);
+            outside_write = true;
+        }
     }
     // Acceptance commands may edit files too: inspect the actual delivered tree.
     if let Ok(paths) = changes::uncommitted(meta) {
@@ -486,7 +497,30 @@ fn settle(
     if outside_write {
         state = "rejected".into();
         sum["state"] = json!(state);
-        sum["sourceWriteViolation"] = json!(source_changed);
+        let mut violation = if !source_leaks.is_empty() {
+            source_leaks.clone()
+        } else if !worktree_nm_links.is_empty() {
+            worktree_nm_links.clone()
+        } else {
+            source_changed.clone()
+        };
+        if !source_leaks.is_empty() && !source_changed.is_empty() && changed.is_empty() {
+            violation.extend(source_changed.iter().cloned());
+            violation.sort();
+            violation.dedup();
+        }
+        sum["sourceWriteViolation"] = json!(violation);
+        if !source_leaks.is_empty() {
+            sum["error"] = json!(format!(
+                "source node_modules points into this worktree ({}); restore source dependencies before cleaning the worktree / 源仓库的 node_modules 指向了本工作树，清理工作树前请先恢复源仓库依赖",
+                source_leaks.join(", ")
+            ));
+        } else if !worktree_nm_links.is_empty() {
+            sum["error"] = json!(format!(
+                "worktree node_modules symlinks into the source checkout ({}); package managers would follow it and overwrite the source checkout / 工作树的 node_modules 软链指向了源仓库，包管理器会顺着软链改写源仓库",
+                worktree_nm_links.join(", ")
+            ));
+        }
         sum.as_object_mut().unwrap().remove("question");
     }
     if b(meta, "shell") && (!changed.is_empty() || !source_changed.is_empty()) {

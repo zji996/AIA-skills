@@ -10,6 +10,8 @@
 
 ### 技能
 
+- `delegate` 6.21.2：同事不能再把工作树的 `node_modules` 链回源检出（起因：pnpm 顺着这种链接改写了源仓库 25 个依赖链接）：bash 守卫拒绝指向源检出的 `ln`，`worktree.link`/`--share` 拒绝 `node_modules`，观察器检查各包 `node_modules` 链接，收尾发现泄漏就拒收。
+
 - `delegate` 6.21.1：`status` 显示没发出去的 `--when-done` 续答及原因（如返工上限），不再一直标「待续答」。
 
 - `delegate` 6.21.0：新增 agy（Antigravity CLI）同事：`agy/<模型>` 别名由 agy 执行，全权限、stdin 传 stream-json、`--conversation` 续接、`--effort` 对应 thinking，事件与验收、续做、换档、probe 与 Pi 同一套；换同事时开新会话。
