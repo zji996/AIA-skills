@@ -214,6 +214,20 @@ pub fn source_build_disk() {
     }
 }
 
+/// A delivery that failed (rework limit, launch error) stays in the mailbox with its error;
+/// say so instead of looking like it is still waiting.
+fn pending_label(pending: &Value) -> Option<String> {
+    if !pending.is_object() {
+        return None;
+    }
+    let error = s(pending, "error");
+    Some(if error.is_empty() {
+        "待续答 / pending reply".into()
+    } else {
+        format!("续答未发出 / pending reply failed: {}（stop 清除后重发）", clip(error, 160))
+    })
+}
+
 pub fn human(run: &Path, status: &Value) -> String {
     let meta = json(run.join("meta.json"));
     let state = s(status, "state");
@@ -250,7 +264,9 @@ pub fn human(run: &Path, status: &Value) -> String {
         format!("{label} {elapsed}"),
         agent_label(status),
     ];
-    if status["pendingReply"].is_object() { parts.push("待续答 / pending reply".into()); }
+    if let Some(label) = pending_label(&status["pendingReply"]) {
+        parts.push(label);
+    }
     if !s(status, "busy").is_empty() { parts.push(format!("busy: {}", s(status, "busy"))); }
     if status["queue"]["busy"] == json!(true) { parts.push("busy: capacity; showing cached queue".into()); }
     if status["queue"].is_object() {
@@ -533,7 +549,7 @@ fn agent_label(status: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::agent_label;
+    use super::{agent_label, pending_label};
     use serde_json::json;
 
     #[test]
@@ -546,5 +562,14 @@ mod tests {
         let pinned = json!({"agent":"pi","tier":"review","agentPinned":true,
             "model":"provider/deepseek-flash"});
         assert_eq!(agent_label(&pinned), "pi/deepseek-flash");
+    }
+
+    #[test]
+    fn a_failed_pending_reply_shows_its_error() {
+        assert_eq!(pending_label(&json!(null)), None);
+        assert_eq!(pending_label(&json!({"message":"m"})).unwrap(), "待续答 / pending reply");
+        assert!(pending_label(&json!({"error":"rework limit reached"}))
+            .unwrap()
+            .contains("pending reply failed: rework limit reached"));
     }
 }
