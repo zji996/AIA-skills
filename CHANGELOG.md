@@ -10,6 +10,8 @@
 
 ### 技能
 
+- `delegate` 6.21.3：apply 写完文件立即登记、生成器随 apply 中止一起结束，中途被杀也不会把主控的合入算成别的同事写了源仓库；apply 后主控提交的文件按「已登记且 HEAD 前进」豁免。
+
 - `delegate` 6.21.2：同事不能再把工作树的 `node_modules` 链回源检出（起因：pnpm 顺着这种链接改写了源仓库 25 个依赖链接）：bash 守卫拒绝指向源检出的 `ln`，`worktree.link`/`--share` 拒绝 `node_modules`，观察器检查各包 `node_modules` 链接，收尾发现泄漏就拒收。
 
 - `delegate` 6.21.1：`status` 显示没发出去的 `--when-done` 续答及原因（如返工上限），不再一直标「待续答」。

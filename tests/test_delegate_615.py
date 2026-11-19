@@ -1,6 +1,8 @@
 """6.15 parallel-write safety regressions, through the source CLI only."""
 import json
+import os
 import shlex
+import signal
 import subprocess
 import threading
 import unittest
@@ -298,6 +300,178 @@ class Delegate615Tests(unittest.TestCase):
             self.assertIn("readOnlyViolation", state)
             self.assertNotIn("question", state)
             self.assertNotEqual(self.cli("apply", "--keep-commits", state["run"]).returncode, 0)
+
+    def start_gated_question(self, repo, name="slow", *options):
+        gate = self.work / f"release-{name}"
+        ready = self.work / f"ready-{name}"
+        self.fake_pi([fixtures.answer("需要主控决定\nWhich option?"), fixtures.SETTLED],
+                     pre=f"touch {ready}; while [ ! -f {gate} ]; do sleep .05; done")
+        state = self.outcome(self.cli("start", "--workdir", repo, "--name", name, "--worktree", *options, "task"))
+        self.addCleanup(lambda: self.cli("stop", state["run"]))
+        self.until(ready.exists, f"agent {name} started")
+        return gate, state
+
+    def test_three_round_sync_apply_interrupted_during_generate_registers_written_paths(self):
+        gen_started = self.work / "gen-started"
+        gen_gate = self.work / "gen-gate"
+        gen_pid = self.work / "gen-pid"
+        gen_cmd = (
+            f"echo $$ > {shlex.quote(str(gen_pid))}; "
+            f"touch {shlex.quote(str(gen_started))}; "
+            f"while [ ! -f {shlex.quote(str(gen_gate))} ]; do sleep .05; done; "
+            f"cp c.txt gen/out.txt"
+        )
+        cfg = {"generated": {"paths": ["gen/"], "inputs": ["c.txt"], "command": gen_cmd}}
+        repo = self.repo({
+            "a.txt": "a0\n",
+            "b.txt": "b0\n",
+            "c.txt": "c0\n",
+            "other.txt": "o0\n",
+            "gen/out.txt": "gen0\n",
+            ".delegate.json": json.dumps(cfg),
+        })
+        first = self.run_write(repo, "echo a1 > a.txt; echo n1 > new1.txt", "round1")
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo b2 > b.txt")
+        reply1 = self.outcome(self.cli("reply", "--wait", first["run"], "round2"))
+        (repo / "other.txt").write_text("o1\n")
+        subprocess.run(["git", "-C", str(repo), "add", "other.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-qm", "caller update"], check=True)
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED],
+                     pre="echo a3 > a.txt; echo c3 > c.txt")
+        reply2 = self.outcome(self.cli("reply", "--wait", "--sync=agent", "--over-limit", "third round",
+                                       reply1["run"], "round3"))
+
+        gate, slow = self.start_gated_question(repo, "question-neon")
+        proc = subprocess.Popen(
+            [str(fixtures.DELEGATE), "apply", reply2["run"]],
+            env=self.env, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        def kill_gen():
+            if gen_pid.is_file():
+                try:
+                    os.killpg(int(gen_pid.read_text().strip()), signal.SIGKILL)
+                except OSError:
+                    pass
+        self.addCleanup(kill_gen)
+        self.until(gen_started.exists, "generator started")
+        proc.send_signal(signal.SIGTERM)
+        proc.communicate(timeout=10)
+        self.assertNotEqual(proc.returncode, 0)
+        # Generator child group must be stopped cleanly rather than mutating source as an orphan.
+        self.until(lambda: fixtures.process_gone(gen_pid), "generator child terminated on SIGTERM")
+        self.assertEqual((repo / "a.txt").read_text(), "a3\n")
+        self.assertEqual((repo / "new1.txt").read_text(), "n1\n")
+        self.assertEqual((repo / "b.txt").read_text(), "b2\n")
+        self.assertEqual((repo / "c.txt").read_text(), "c3\n")
+        self.assertEqual((repo / "gen/out.txt").read_text(), "gen0\n")
+
+        gate.touch()
+        finished = self.cli("wait", "--all", slow["run"])
+        self.assertEqual(finished.returncode, 0, finished.stdout + finished.stderr)
+        state = self.outcome(finished)
+        self.assertEqual(state["state"], "answered")
+        self.assertTrue(state.get("question"))
+        self.assertNotIn("sourceWriteViolation", state)
+        self.assertNotIn("sourceWorkspaceChanges", state)
+
+        # Retrying apply finishes pending generation and registers generated outputs too.
+        gate2, slow2 = self.start_gated_question(repo, "question-retry")
+        gen_gate.touch()
+        retried = self.cli("apply", reply2["run"])
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        self.assertEqual((repo / "gen/out.txt").read_text(), "c3\n")
+        gate2.touch()
+        finished2 = self.cli("wait", "--all", slow2["run"])
+        self.assertEqual(finished2.returncode, 0, finished2.stdout + finished2.stderr)
+        self.assertNotIn("sourceWriteViolation", self.outcome(finished2))
+
+    def test_apply_sigkill_during_generate_still_registers_already_written_paths(self):
+        gen_started = self.work / "kill-gen-started"
+        gen_gate = self.work / "kill-gen-gate"
+        gen_cmd = (
+            f"touch {shlex.quote(str(gen_started))}; "
+            f"if [ ! -f {shlex.quote(str(gen_gate))} ]; then sleep 2; exit 1; fi; "
+            f"cp a.txt gen/out.txt"
+        )
+        cfg = {"generated": {"paths": ["gen/"], "inputs": ["a.txt"], "command": gen_cmd}}
+        repo = self.repo({"a.txt": "a0\n", "b.txt": "b0\n", "gen/out.txt": "gen0\n",
+                          ".delegate.json": json.dumps(cfg)})
+        first = self.run_write(repo, "echo a1 > a.txt; echo b1 > b.txt", "first")
+        gate, slow = self.start_gated_question(repo, "question-kill")
+        proc = subprocess.Popen(
+            [str(fixtures.DELEGATE), "apply", first["run"]],
+            env=self.env, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        self.until(gen_started.exists, "generator started before SIGKILL")
+        proc.send_signal(signal.SIGKILL)
+        proc.communicate(timeout=10)
+
+        gate.touch()
+        finished = self.cli("wait", "--all", slow["run"])
+        self.assertEqual(finished.returncode, 0, finished.stdout + finished.stderr)
+        self.assertNotIn("sourceWriteViolation", self.outcome(finished))
+
+        gen_gate.touch()
+        retried = self.cli("apply", first["run"])
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        self.assertEqual((repo / "gen/out.txt").read_text(), "a1\n")
+
+    def test_commit_after_apply_exempts_baseline_dirty_files_only_when_committed_and_logged(self):
+        repo = self.repo({"a.txt": "a0\n", "other.txt": "o0\n", "manual.txt": "m0\n"})
+        first = self.run_write(repo, "echo a1 > a.txt; echo new > added.txt", "first")
+        self.assertEqual(self.cli("apply", first["run"]).returncode, 0)
+
+        # Case 1: applied before slow started (baseline sees dirty a.txt & added.txt), then committed during slow.
+        gate1, slow1 = self.start_gated_question(repo, "commit-applied")
+        subprocess.run(["git", "-C", str(repo), "add", "a.txt", "added.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-qm", "land applied"], check=True)
+        gate1.touch()
+        res1 = self.cli("wait", "--all", slow1["run"])
+        self.assertEqual(res1.returncode, 0, res1.stdout + res1.stderr)
+        self.assertNotIn("sourceWriteViolation", self.outcome(res1))
+        self.assertNotIn("sourceWorkspaceChanges", self.outcome(res1))
+
+        # Case 2: dirty at baseline, updated by apply during slow, then committed during slow.
+        (repo / "a.txt").write_text("a1\nextra-line\n")
+        second = self.run_write(repo, "echo a2 > a.txt", "second")
+        gate2, slow2 = self.start_gated_question(repo, "apply-then-commit")
+        self.assertEqual(self.cli("apply", "--merge", second["run"]).returncode, 0)
+        subprocess.run(["git", "-C", str(repo), "add", "a.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-qm", "land second"], check=True)
+        gate2.touch()
+        res2 = self.cli("wait", "--all", slow2["run"])
+        self.assertEqual(res2.returncode, 0, res2.stdout + res2.stderr)
+        self.assertNotIn("sourceWriteViolation", self.outcome(res2))
+
+        # Case 3 (guardrail): reverting an applied file while committing an UNRELATED file must NOT be exempted.
+        third = self.run_write(repo, "echo a3 > a.txt", "third")
+        self.assertEqual(self.cli("apply", third["run"]).returncode, 0)
+        gate3, slow3 = self.start_gated_question(repo, "revert-not-committed")
+        (repo / "other.txt").write_text("o1\n")
+        subprocess.run(["git", "-C", str(repo), "add", "other.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-qm", "unrelated commit"], check=True)
+        subprocess.run(["git", "-C", str(repo), "checkout", "--", "a.txt"], check=True)
+        gate3.touch()
+        res3 = self.cli("wait", "--all", slow3["run"])
+        self.assertEqual(res3.returncode, 1)
+        self.assertEqual(self.outcome(res3)["sourceWriteViolation"], ["a.txt"])
+
+        # Case 4 (guardrail): committing a manually-dirty file NOT in applied.json must NOT be exempted.
+        (repo / "manual.txt").write_text("m1\n")
+        gate4, slow4 = self.start_gated_question(repo, "manual-not-logged")
+        subprocess.run(["git", "-C", str(repo), "add", "manual.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-qm", "commit manual"], check=True)
+        gate4.touch()
+        res4 = self.cli("wait", "--all", slow4["run"])
+        self.assertEqual(res4.returncode, 1)
+        self.assertEqual(self.outcome(res4)["sourceWriteViolation"], ["manual.txt"])
 
 
 if __name__ == "__main__":

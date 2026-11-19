@@ -310,7 +310,9 @@ pub fn fingerprint(source: &Path) -> Res<Value> {
 }
 pub fn baseline(source: &Path) -> Res<Value> {
     let _guard = guard(source, false)?;
-    Ok(json!({"files":fingerprint(source)?, "at":now_ns().to_string()}))
+    let head =
+        git_text(source, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]).unwrap_or_default();
+    Ok(json!({"files":fingerprint(source)?, "head":head, "at":now_ns().to_string()}))
 }
 fn different(before: &Value, after: &Value) -> Vec<String> {
     before
@@ -327,17 +329,38 @@ fn different(before: &Value, after: &Value) -> Vec<String> {
 }
 /// Caller holds the exclusive source guard, including on partially failed apply.
 pub fn register(source: &Path, before: &Value, paths: &[String]) -> Res<()> {
+    register_matching(source, before, paths, &[])
+}
+/// Also records dirty paths already matching the applied target (e.g. retry after an interrupted apply).
+pub fn register_matching(
+    source: &Path,
+    before: &Value,
+    changed_rules: &[String],
+    dirty_rules: &[String],
+) -> Res<()> {
     let after = fingerprint(source)?;
     let file = journal(source).join("applied.json");
     let mut records = json(&file);
     if !records.is_object() {
         records = json!({});
     }
-    for path in different(before, &after)
+    let mut paths = different(before, &after)
         .into_iter()
-        .filter(|p| crate::worktree::matches_rule(p, paths))
-    {
-        records[&path] = json!({"fingerprint":after[&path],"at":now_ns().to_string()});
+        .filter(|p| crate::worktree::matches_rule(p, changed_rules))
+        .collect::<BTreeSet<_>>();
+    if !dirty_rules.is_empty() {
+        for path in after.as_object().into_iter().flatten().map(|(p, _)| p) {
+            if crate::worktree::matches_rule(path, dirty_rules) {
+                paths.insert(path.clone());
+            }
+        }
+    }
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let at = now_ns().to_string();
+    for path in paths {
+        records[&path] = json!({"fingerprint":after[&path],"at":at});
     }
     write_json(file, &records)
 }
@@ -352,6 +375,46 @@ pub fn observe(meta: &Value, run: &Path) {
     if !meta["sourceStatusBaseline"].is_object() || busy(meta) { return; }
     let paths = changes_now(meta, true);
     let _ = write_json(run.join("source-observed.json"), &json!(paths));
+}
+fn committed_since(source: &Path, baseline: &Value) -> BTreeSet<String> {
+    let Some(base_head) = baseline.get("head").and_then(Value::as_str) else {
+        return BTreeSet::new();
+    };
+    let Ok(current_head) = git_text(source, &["rev-parse", "-q", "--verify", "HEAD^{commit}"])
+    else {
+        return BTreeSet::new();
+    };
+    if current_head.is_empty() || current_head == base_head {
+        return BTreeSet::new();
+    }
+    let data = if base_head.is_empty() {
+        git(source, &["ls-tree", "-r", "--name-only", "-z", &current_head])
+    } else {
+        if git(
+            source,
+            &["merge-base", "--is-ancestor", base_head, &current_head],
+        )
+        .is_err()
+        {
+            return BTreeSet::new();
+        }
+        git(
+            source,
+            &[
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                base_head,
+                &current_head,
+            ],
+        )
+    };
+    data.unwrap_or_default()
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect()
 }
 fn changes_now(meta: &Value, nonblocking: bool) -> Vec<String> {
     let baseline = &meta["sourceStatusBaseline"];
@@ -368,12 +431,23 @@ fn changes_now(meta: &Value, nonblocking: bool) -> Vec<String> {
     };
     let applied = json(journal(source).join("applied.json"));
     let started = s(baseline, "at").parse::<u128>().unwrap_or(0);
+    let mut committed: Option<BTreeSet<String>> = None;
     different(&baseline["files"], &now)
         .into_iter()
         .filter(|path| {
             let record = &applied[path];
-            !(s(record, "at").parse::<u128>().unwrap_or(0) >= started
-                && record["fingerprint"] == now[path])
+            if s(record, "at").parse::<u128>().unwrap_or(0) >= started
+                && record["fingerprint"] == now[path]
+            {
+                return false;
+            }
+            if now[path].is_null() && record.is_object() {
+                let paths = committed.get_or_insert_with(|| committed_since(source, baseline));
+                if paths.contains(path) {
+                    return false;
+                }
+            }
+            true
         })
         .collect()
 }

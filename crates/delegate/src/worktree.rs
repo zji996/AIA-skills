@@ -1218,6 +1218,9 @@ pub fn apply(run: &Path, merge: bool, dry: bool, keep_commits: bool) -> Res<Appl
     if !source.is_absolute() {
         return apply_checked(run, merge, dry, keep_commits, &[]);
     }
+    if !dry {
+        lane::install_signals();
+    }
     let _guard = crate::source_watch::guard(source, true)?;
     // Refresh the delivered diff before releasing its worktree (also captures later edits).
     if Path::new(s(&meta["worktree"], "path")).is_dir() {
@@ -1263,12 +1266,7 @@ pub fn apply(run: &Path, merge: bool, dry: bool, keep_commits: bool) -> Res<Appl
         }
         write(run.join("applied.patch"), patch)?;
     }
-    let before = crate::source_watch::fingerprint(source)?;
-    let result = apply_checked(run, merge, dry, keep_commits, &written_paths);
-    if !dry {
-        crate::source_watch::register(source, &before, &written_paths)?;
-    }
-    result
+    apply_checked(run, merge, dry, keep_commits, &written_paths)
 }
 fn apply_checked(
     run: &Path,
@@ -1355,6 +1353,7 @@ fn apply_checked(
         if dry {
             0
         } else {
+            let before = crate::source_watch::fingerprint(source)?;
             let mut code = 0;
             for item in &commits {
                 let status = git_command()
@@ -1369,6 +1368,7 @@ fn apply_checked(
                     break;
                 }
             }
+            crate::source_watch::register(source, &before, written_paths)?;
             if code == 0 {
                 let state = json!({"at":iso(),"tree":s(&meta["base"],"tree")});
                 write_json(run.join(".applied"), &state)?;
@@ -1793,6 +1793,7 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
         changes = tree_changes(&top, &json!({"tree":before}), &json!({"tree":after}), false)?;
     }
     let mut actions = vec![];
+    let mut matched = vec![];
     let mut conflicts = vec![];
     let mut additions = vec![];
     for c in changes {
@@ -1822,6 +1823,7 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
         {
             conflicts.push(path);
         } else if now == new && now_mode == mode {
+            matched.push(path);
             continue;
         } else if now == old && (now_mode == old_mode || now_mode == mode) {
             actions.push(Action {
@@ -1939,6 +1941,8 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
                 != Some(fs::read(&origin).map_err(|e| format!("{}: {e}", origin.display()))?)
             {
                 conflicts.push(path.clone());
+            } else {
+                matched.push(path.clone());
             }
         }
     }
@@ -2011,8 +2015,15 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
     if regenerate && !dry {
         write(run.join(".generate-pending"), "pending\n")?;
     }
+    let before_actions = if !dry && (!actions.is_empty() || !matched.is_empty()) {
+        Some(crate::source_watch::fingerprint(&source)?)
+    } else {
+        None
+    };
+    let mut written = Vec::with_capacity(actions.len());
     for a in actions {
         if !dry {
+            written.push(a.path.clone());
             let operation = match a.kind.as_str() {
                 "deleted" => fs::remove_file(&a.target)
                     .map_err(|e| e.to_string())
@@ -2030,9 +2041,17 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
                     }
                 }
             };
-            operation.map_err(|e| format!("apply {}: {e}", a.target.display()))?;
+            if let Err(e) = operation {
+                if let Some(before) = &before_actions {
+                    let _ = crate::source_watch::register_matching(&source, before, &written, &[]);
+                }
+                return Err(format!("apply {}: {e}", a.target.display()));
+            }
         }
         println!(" {:<16} {}", a.kind, a.path);
+    }
+    if let Some(before) = &before_actions {
+        crate::source_watch::register_matching(&source, before, &written, &matched)?;
     }
     for p in &conflicts {
         println!(
@@ -2053,7 +2072,16 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
             println!(" regenerated      {} (dry run)", generated_paths.join(", "));
         }
     } else if regenerate {
-        let _slot = lane::acquire_shell(
+        let interrupted = || -> Option<i32> {
+            lane::stopped().then(|| {
+                128 + lane::SIGNAL.load(std::sync::atomic::Ordering::SeqCst)
+            })
+        };
+        if let Some(code) = interrupted() {
+            eprintln!("delegate: regeneration interrupted before start");
+            return Ok(code);
+        }
+        let _slot = match lane::acquire_shell(
             &format!(
                 "regenerate {}",
                 run.file_name().unwrap_or_default().to_string_lossy()
@@ -2066,7 +2094,15 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
                     labels.join(", ")
                 ))
             },
-        )?;
+        ) {
+            Ok(slot) => slot,
+            Err(_) if lane::stopped() => {
+                let code = 128 + lane::SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+                eprintln!("delegate: regeneration interrupted while queued");
+                return Ok(code);
+            }
+            Err(error) => return Err(error),
+        };
         let log = std::path::absolute(run.join("generate.log")).map_err(|e| e.to_string())?;
         let mut file =
             fs::File::create(&log).map_err(|e| format!("apply {}: {e}", log.display()))?;
@@ -2075,7 +2111,8 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
             "generating / 正在生成; log: {}; execution timeout: {timeout}s (queue excluded)",
             log.display()
         ));
-        let (code, timed) = run_shell(
+        let before_gen = crate::source_watch::fingerprint(&source)?;
+        let shell = run_shell(
             (&generate_command, "generate"),
             &source,
             run,
@@ -2083,8 +2120,22 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
             timeout,
             &mut file,
             None,
-        )
-        .map_err(|e| format!("apply generated.command: {e}"))?;
+        );
+        let stopped = interrupted();
+        let succeeded = stopped.is_none() && matches!(shell, Ok((0, false)));
+        let reg = crate::source_watch::register_matching(
+            &source,
+            &before_gen,
+            &generated_paths,
+            if succeeded { &generated_paths } else { &[] },
+        );
+        let (code, timed) = shell.map_err(|e| format!("apply generated.command: {e}"))?;
+        reg?;
+        if let Some(signal_code) = stopped {
+            let _ = writeln!(file, "\n[interrupted]");
+            eprintln!("delegate: regeneration interrupted; {}", log.display());
+            return Ok(signal_code);
+        }
         writeln!(file, "\n[exit {code}]").map_err(|e| format!("apply {}: {e}", log.display()))?;
         if code != 0 {
             let body = fs::read(&log).map_err(|e| format!("apply {}: {e}", log.display()))?;

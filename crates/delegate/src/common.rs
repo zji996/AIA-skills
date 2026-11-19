@@ -453,6 +453,9 @@ pub fn run_shell(
             Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break false,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
+        if holder.is_none() && crate::lane::stopped() {
+            break false;
+        }
         let queued = (crate::lane::queued_seconds(run) - queued_before).max(0.0);
         if started.elapsed().as_secs_f64() - queued >= timeout {
             break true;
