@@ -141,7 +141,8 @@ fn check_full(id: &str, listed: &[PiModel]) -> Res<String> {
     if !id.contains('/') {
         return Err(format!("{id}: alias must map to provider/id"));
     }
-    if !listed.is_empty() && !listed.iter().any(|m| m.name == id) {
+    // agy models are not in Pi's table; agy itself refuses an unknown one.
+    if !crate::agy::is_agy(id) && !listed.is_empty() && !listed.iter().any(|m| m.name == id) {
         return Err(format!(
             "{id} is not among Pi's models (pi --offline --list-models)"
         ));

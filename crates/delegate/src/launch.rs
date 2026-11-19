@@ -1055,11 +1055,11 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     {
         return Err(format!("{READS_ONLY}; this conversation writes"));
     }
-    let legacy = s(&meta, "agent") != agents::AGENT;
+    let legacy = ![agents::AGENT, crate::agy::BIN].contains(&s(&meta, "agent"));
     if legacy && !o.fresh {
         o.fresh = true;
         eprintln!(
-            "delegate: {} 的会话无法由 Pi 续接，已开新会话",
+            "delegate: {} 的会话无法由 Pi 或 agy 续接，已开新会话",
             s(&meta, "agent")
         );
     }
@@ -1073,7 +1073,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     };
     if !o.fresh
         && (session.is_none()
-            || session_file(s(&meta, "sessionDir"), session.as_deref().unwrap_or("")).is_none())
+            || agents::continuation_target(&meta, session.as_deref().unwrap_or("")).is_none())
     {
         return Err(format!("{} has no saved session to continue (runs before delegate 4.1 kept none); use --fresh to start a new session in the same place",parent.file_name().unwrap_or_default().to_string_lossy()));
     }
@@ -1242,6 +1242,17 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         }
     } else {
         prompt
+    };
+    // A conversation continues only on the colleague that holds it (Pi or agy).
+    let session = match session {
+        Some(_)
+            if crate::agy::colleague(o.model.as_deref().unwrap_or(""))
+                != crate::agy::colleague(s(&meta, "model")) =>
+        {
+            eprintln!("delegate: 换到另一个同事（Pi / agy），会话无法续接，已开新会话");
+            None
+        }
+        other => other,
     };
     let mut extra =
         json!({"parent":meta,"session":session,"env":meta["env"],"worktree":meta["worktree"]});
@@ -1832,7 +1843,14 @@ pub fn launch(
         },
     )?;
     let mut fork_value = fork.map(str::to_string);
-    if let (true, Some(fork_id)) = (parent.is_object(), fork) {
+    if let (true, Some(fork_id), true) = (
+        parent.is_object(),
+        fork,
+        crate::agy::is_agy(s(parent, "model")),
+    ) {
+        // agy keeps the conversation itself; the reply continues it by id.
+        fork_value = Some(fork_id.to_string());
+    } else if let (true, Some(fork_id)) = (parent.is_object(), fork) {
         let source = session_file(s(parent, "sessionDir"), fork_id)
             .ok_or_else(|| "missing parent session".to_string())?;
         fs::create_dir(run.join("fork")).map_err(|e| e.to_string())?;
@@ -1931,7 +1949,7 @@ pub fn launch(
         .map(seconds)
         .transpose()?
         .unwrap_or(0.0);
-    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":o.agent,"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":timeout_seconds,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !b(extra,"newAfterApply") && !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
+    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":crate::agy::colleague(o.model.as_deref().unwrap_or("")),"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":timeout_seconds,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !b(extra,"newAfterApply") && !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
     // A forked session continues on the executable that wrote it: Pi and rpi
     // keep different session formats.
     let parent_bin = s(parent, "agentBin");

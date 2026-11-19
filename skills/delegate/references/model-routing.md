@@ -9,3 +9,7 @@
 - `--image` 从不影响选模型：最终模型在 Pi 列表里 images=no 时退出 2，提示在 Pi models.json 给该模型 input 加 image，或用 `--model` 换能看图的模型；Pi 列表为空时跳过此守卫。
 
 用户级与仓库级配置示例见 [configuration.md](configuration.md)。
+
+## agy 同事
+
+别名映射到 `agy/<agy 模型 id>`（如 `{"neon":{"model":"agy/gemini-4-neon","thinking":"high"}}`，id 见 `agy models`）的任务由 Antigravity CLI 执行，其余仍是 Pi。和 Pi 一样全权限（`--dangerously-skip-permissions`，只读任务照旧在快照工作树里）；提示经 stdin 以 stream-json 传入，固定附言放在首条消息开头；`--thinking` 映射为 `--effort`，off/minimal 取 low（每次调用都思考）。reply 用 `--conversation` 续接同一会话；换到另一个同事（Pi↔agy）时开新会话。agy 的命令是它自己的子进程，进程范围、按 pid 结束和 bash 守卫不变；`probe` 也走 agy。

@@ -579,6 +579,14 @@ pub fn session_file(dir: &str, id: &str) -> Option<PathBuf> {
             .is_some_and(|n| n.to_string_lossy().ends_with(&format!("_{id}.jsonl")))
     })
 }
+/// What a reply or resume continues: Pi's saved session file, or agy's conversation id.
+pub fn continuation_target(meta: &Value, id: &str) -> Option<String> {
+    if crate::agy::is_agy(s(meta, "model")) {
+        Some(id.to_string()).filter(|id| !id.is_empty())
+    } else {
+        session_file(s(meta, "sessionDir"), id).map(|p| p.to_string_lossy().into())
+    }
+}
 pub fn leaked(answer: &str) -> bool {
     let tail = answer
         .trim()
@@ -636,12 +644,13 @@ pub fn run_agent(
     holder: Arc<AtomicI32>,
     grace_out: Arc<std::sync::Mutex<Option<f64>>>,
 ) -> Res<(String, String)> {
-    if s(meta, "agent") != AGENT {
+    if ![AGENT, crate::agy::BIN].contains(&s(meta, "agent")) {
         return Err(format!(
-            "{} runs are no longer supported; delegate runs Pi only",
+            "{} runs are no longer supported; delegate runs Pi or agy",
             s(meta, "agent")
         ));
     }
+    let on_agy = crate::agy::is_agy(s(meta, "model"));
     let uuid = format!(
         "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
         now_ns() as u32,
@@ -650,7 +659,9 @@ pub fn run_agent(
         0u16,
         (now_ns() >> 8) as u64 & 0xffffffffffff
     );
-    let session = if !s(meta, "fork").is_empty() {
+    // agy names its own conversation (reported in its first event); a fork there is the
+    // conversation id to continue.
+    let session = if !s(meta, "fork").is_empty() || on_agy {
         None
     } else {
         Some(uuid)
@@ -658,18 +669,33 @@ pub fn run_agent(
     let session_dir = Path::new(s(meta, "sessionDir"));
     let known = session_files(session_dir);
     write(Path::new(s(meta, "dir")).join("colleague.md"), COLLEAGUE)?;
-    let mut args = command_pi(meta, session.as_deref());
+    let mut args = if on_agy {
+        crate::agy::command(meta, Some(s(meta, "fork")))
+    } else {
+        command_pi(meta, session.as_deref())
+    };
     if !s(meta, "agentBin").is_empty() {
         args[0] = s(meta, "agentBin").to_string();
     }
+    let prompt_path = meta["agentPromptFile"]
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| run.join("prompt.md"));
+    let prompt_path = if on_agy {
+        // agy takes the prompt as one stream-json message; the addendum Pi gets as a
+        // system-prompt append opens a new conversation's first message.
+        let task = fs::read_to_string(&prompt_path).map_err(|e| e.to_string())?;
+        let addendum = if s(meta, "fork").is_empty() { COLLEAGUE } else { "" };
+        let images = meta["images"].as_array().cloned().unwrap_or_default();
+        let input = run.join(format!("agy-input-{attempt}.jsonl"));
+        write(&input, crate::agy::input(addendum, &task, &images))?;
+        input
+    } else {
+        prompt_path
+    };
     let prompt = OpenOptions::new()
         .read(true)
-        .open(
-            meta["agentPromptFile"]
-                .as_str()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| run.join("prompt.md")),
-        )
+        .open(prompt_path)
         .map_err(|e| e.to_string())?;
     let stderr = OpenOptions::new()
         .create(true)
@@ -843,6 +869,8 @@ pub fn run_agent(
     let mut turn = Value::Null;
     let mut answer = String::new();
     let mut settled = false;
+    let mut agy_filter = crate::agy::Filter::default();
+    let mut agy_session = String::new();
     if let Some(stdout) = child.stdout.take() {
         let mut reader = BufReader::new(stdout);
         let mut raw = Vec::new();
@@ -857,7 +885,22 @@ pub fn run_agent(
             let Ok(event) = serde_json::from_slice::<Value>(&raw) else {
                 continue;
             };
-            for mut item in filter_pi(&event) {
+            let items = if on_agy {
+                if agy_session.is_empty() {
+                    if let Some(id) = crate::agy::conversation(&event) {
+                        agy_session = id.to_string();
+                        let _ = writeln!(
+                            log,
+                            "{}",
+                            json!({"e":"session","id":id,"attempt":attempt,"at":iso()})
+                        );
+                    }
+                }
+                agy_filter.events(&event)
+            } else {
+                filter_pi(&event)
+            };
+            for mut item in items {
                 let kind = s(&item, "e").to_string();
                 item["attempt"] = json!(attempt);
                 item["at"] = json!(iso());
@@ -922,7 +965,7 @@ pub fn run_agent(
     let _ = watcher.join();
     holder.store(0, Ordering::SeqCst);
     let status = child.wait().map_err(|e| e.to_string())?;
-    {
+    if !on_agy {
         let created = session_files(session_dir)
             .into_iter()
             .filter(|x| !known.contains(x))

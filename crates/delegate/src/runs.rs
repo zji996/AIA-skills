@@ -330,8 +330,8 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
             shell_quote(&script.to_string()),
             shell_quote(&name),
             if sum["session"].as_str().is_none_or(str::is_empty)
-                || (s(meta, "agent") == crate::agents::AGENT
-                    && crate::agents::session_file(s(meta, "sessionDir"), s(sum, "session")).is_none())
+                || ([crate::agents::AGENT, crate::agy::BIN].contains(&s(meta, "agent"))
+                    && crate::agents::continuation_target(meta, s(sum, "session")).is_none())
             {
                 "--fresh "
             } else {

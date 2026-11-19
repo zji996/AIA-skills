@@ -10,6 +10,8 @@
 
 ### 技能
 
+- `delegate` 6.21.0：新增 agy（Antigravity CLI）同事：`agy/<模型>` 别名由 agy 执行，全权限、stdin 传 stream-json、`--conversation` 续接、`--effort` 对应 thinking，事件与验收、续做、换档、probe 与 Pi 同一套；换同事时开新会话。
+
 - `delegate` 6.20.0：remote=off 随 reply/续做继承，hook 按 argv 位置识别等待（`NAME=value`、`env` 前缀不遮挡命令词）；验收区分未执行与执行失败、远端槽排队不耗执行超时，`--after` 等上游重试且 wait 明报真实跳过。提问后的 lane 重跑沿用原排队时间、不抢占运行者；浏览器仍共用 heavy lane，避免隐性突破机器容量。
 
 - `delegate` 6.19.0：用户级 remote 经 SSH/rsync 转发重命令，远端独立 lane 与温热 worktree 槽、回传改动/退出码、取消回收；连接失败退出 75、不回退本机，验收基础设施失败不计返工。

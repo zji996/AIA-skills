@@ -239,11 +239,8 @@ fn compress_answer(
             .find(|e| s(e, "e") == "session" && !s(e, "id").is_empty())
             .ok_or("no saved session for answer compression")?;
         let mut continuation = meta.clone();
-        continuation["fork"] = json!(agents::session_file(
-            s(meta, "sessionDir"),
-            s(&session, "id")
-        )
-        .ok_or("missing session file for answer compression")?);
+        continuation["fork"] = json!(agents::continuation_target(meta, s(&session, "id"))
+            .ok_or("missing session file for answer compression")?);
         let prompt = run.join("compression-prompt.md");
         write(&prompt, format!("压缩到 {limit} 字以内，保留结论与证据。只答复文字，不执行命令或修改文件。 / Compress your previous answer to at most {limit} characters, preserving conclusions and evidence. Respond with text only.\n"))?;
         continuation["agentPromptFile"] = json!(prompt);
@@ -628,11 +625,11 @@ fn continuation(meta: &Value, run: &Path) -> Option<Value> {
         .rev()
         .find(|event| s(event, "e") == "session" && !s(event, "id").is_empty())
         .map(|event| s(&event, "id").to_string())?;
-    let session = agents::session_file(s(meta, "sessionDir"), &id)?;
+    let session = agents::continuation_target(meta, &id)?;
     let prompt = run.join("resume-prompt.md");
     write(&prompt, format!("{}\n", transient::PROMPT)).ok()?;
     let mut next = meta.clone();
-    next["fork"] = json!(session.to_string_lossy());
+    next["fork"] = json!(session);
     next["agentPromptFile"] = json!(prompt);
     // The images went out with the first message and stay in the session; attaching them to a
     // continuation would send them a second time for no reason.
@@ -684,7 +681,7 @@ fn resume_transient(
         let bin = Some(s(meta, "agentBin"))
             .filter(|path| !path.is_empty())
             .map(PathBuf::from)
-            .or_else(|| agents::agent_bin(agents::AGENT));
+            .or_else(|| agents::agent_bin(crate::agy::colleague(s(meta, "model"))));
         let down = match bin {
             Some(bin) => probe::recovered(
                 &bin,
@@ -772,6 +769,14 @@ fn escalate(
     meta["tierCandidateIndex"] = next["index"].clone();
     meta["thinking"] = next["thinking"].clone();
     meta["fork"] = Value::Null;
+    // The next model may run on the other colleague (Pi or agy); a fresh session there.
+    let colleague = crate::agy::colleague(s(meta, "model"));
+    if s(meta, "agent") != colleague {
+        let (bin, version) = agents::agent_identity(colleague)?;
+        meta["agent"] = json!(colleague);
+        meta["agentBin"] = json!(bin);
+        meta["agentVersion"] = json!(version);
+    }
     write_json(run.join("meta.json"), meta)?;
     Ok(true)
 }

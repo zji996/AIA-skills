@@ -1,17 +1,17 @@
 ---
 name: delegate
-description: 把可独立验收的任务交给同事 Agent 在后台并行完成，你只收结果并把关。遇到这些情况时主动使用，不必等用户开口：要读很多文件但只需结论；改动前想要第二意见或独立审查；有两个以上互不依赖、能用命令验收的子任务；需要有人看截图或设计图给意见。同事都是 Pi，按用途 scout（只读侦察）、review（只读严密审查）、write（写代码带验收）派发；也可用 models 别名指定模型与默认 thinking；fit 适配卡记录四类任务的首选，新模型按同题重评。脚本代跑验收命令，只给一行结论与下一步，过程不进主控上下文；容量满会排队，重检查也限流。Use to delegate or parallelize work proactively to Pi colleagues, and to get a second opinion, code review or image review from another model, judged by results.
+description: 把可独立验收的任务交给同事 Agent 在后台并行完成，你只收结果并把关。遇到这些情况时主动使用，不必等用户开口：要读很多文件但只需结论；改动前想要第二意见或独立审查；有两个以上互不依赖、能用命令验收的子任务；需要有人看截图或设计图给意见。同事是 Pi 或 Antigravity CLI（agy，登记为 agy/<模型> 的别名走它），按用途 scout（只读侦察）、review（只读严密审查）、write（写代码带验收）派发；也可用 models 别名指定模型与默认 thinking；fit 适配卡记录四类任务的首选，新模型按同题重评。脚本代跑验收命令，只给一行结论与下一步，过程不进主控上下文；容量满会排队，重检查也限流。Use to delegate or parallelize work proactively to Pi or agy (Antigravity CLI) colleagues, and to get a second opinion, code review or image review from another model, judged by results.
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI（pi-kit 的 rpi 通道下 `pi` 即 rpi）。
 metadata:
-  version: "6.20.0"
+  version: "6.21.0"
   binary: delegate
   exclude-agents: pi
 ---
 
 # Delegate（按结果委派）
 
-你是主控：把边界清楚的任务交给同事（Pi），自己继续推进，回来看结果、决定是否采纳。同事不能再委派。
+你是主控：把边界清楚的任务交给同事（Pi 或 agy），自己继续推进，回来看结果、决定是否采纳。同事不能再委派。
 
 ## 用法
 

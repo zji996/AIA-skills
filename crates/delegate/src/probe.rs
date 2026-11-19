@@ -162,7 +162,34 @@ fn tier_notes(
     notes
 }
 
+/// agy's stream-json: text arrives in step updates, the outcome in `result`.
+fn push_agy_event(seen: &mut Seen, value: &Value, at: f64) {
+    match s(value, "event") {
+        "step_update" if !s(&value["step_update"], "text_delta").is_empty() => {
+            seen.first.get_or_insert(at);
+        }
+        "result" => {
+            seen.first.get_or_insert(at);
+            let r = &value["result"];
+            if s(r, "status") == "SUCCESS" {
+                seen.ok = true;
+            } else {
+                seen.ok = false;
+                let detail = [s(r, "error"), s(r, "status")]
+                    .into_iter()
+                    .find(|x| !x.is_empty())
+                    .unwrap_or("error");
+                seen.error = detail.lines().next().unwrap_or("").trim().to_string();
+            }
+        }
+        _ => {}
+    }
+}
+
 fn push_event(seen: &mut Seen, value: &Value, at: f64) {
+    if !s(value, "event").is_empty() {
+        return push_agy_event(seen, value, at);
+    }
     let kind = s(value, "type").to_string();
     if seen.first.is_none() && (kind.contains("delta") || kind == "message_start") {
         seen.first = Some(at);
@@ -256,22 +283,34 @@ fn probe_one(
     let Ok(stderr) = fs::File::create(&stderr_path) else {
         return result(false, "cannot create stderr log".into(), None);
     };
+    let agy = crate::agy::is_agy(model_id(pattern));
+    if agy {
+        if let Err(e) = write(&prompt, crate::agy::input("", PROMPT, &[])) {
+            return result(false, e.to_string(), None);
+        }
+    }
     let Ok(stdin) = fs::File::open(&prompt) else {
         return result(false, "cannot read the probe prompt".into(), None);
     };
     let mut command = Command::new(bin);
-    command
-        .arg("--session-dir")
-        .arg(dir.join("session"))
-        .arg("--mode")
-        .arg("json")
-        .arg("--model")
-        .arg(model_id(pattern));
-    if thinking_off {
-        command.args(["--thinking", "off"]);
+    if agy {
+        // Lowest effort keeps the probe cheap; agy always thinks.
+        let meta = serde_json::json!({"model": model_id(pattern), "thinking": "low"});
+        command.args(&crate::agy::command(&meta, None)[1..]);
+    } else {
+        command
+            .arg("--session-dir")
+            .arg(dir.join("session"))
+            .arg("--mode")
+            .arg("json")
+            .arg("--model")
+            .arg(model_id(pattern));
+        if thinking_off {
+            command.args(["--thinking", "off"]);
+        }
+        command.arg("-p");
     }
     command
-        .arg("-p")
         .current_dir(&dir)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::piped())
@@ -408,7 +447,6 @@ pub fn recovered(bin: &Path, model: &str, env: &Value, timeout: f64) -> Result<(
 /// provider configuration as `start`; no worktree, no run directory, no capacity slot.
 pub fn command(args: &[String]) -> Res<i32> {
     let o = parse(args)?;
-    agents::missing_tools(agents::AGENT)?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let config = config::load(git_top(&cwd).as_deref())?;
     let active = crate::launch::active_machine(&state_dir());
@@ -453,7 +491,16 @@ pub fn command(args: &[String]) -> Res<i32> {
             script().display()
         ));
     }
-    let bin = agents::agent_bin(agents::AGENT).ok_or("missing required tools: pi")?;
+    let pi = agents::agent_bin(agents::AGENT);
+    let agy = agents::agent_bin(crate::agy::BIN);
+    let bin_for = |model: &str| -> Res<std::path::PathBuf> {
+        let name = crate::agy::colleague(model_id(model));
+        let found = if name == crate::agy::BIN { agy.clone() } else { pi.clone() };
+        found.ok_or_else(|| format!("missing required tools: {name}"))
+    };
+    for model in &jobs {
+        bin_for(model)?;
+    }
     // `off` keeps the probe cheap: the lowest thinking level Pi offers. A model that Pi
     // says has no thinking keeps its own default rather than an unsupported flag.
     let off = |model: &str| {
@@ -468,7 +515,7 @@ pub fn command(args: &[String]) -> Res<i32> {
             .iter()
             .enumerate()
             .map(|(index, model)| {
-                let (bin, root, env) = (bin.clone(), root.clone(), config.value["env"].clone());
+                let (bin, root, env) = (bin_for(model).unwrap_or_default(), root.clone(), config.value["env"].clone());
                 let thinking = off(model);
                 scope.spawn(move || probe_one(&bin, model, index, &root, o.timeout, &env, thinking))
             })
