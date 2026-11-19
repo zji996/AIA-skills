@@ -761,10 +761,10 @@ pub fn continues_conversation(run: &Path) -> bool {
     if active(&st) {
         return true;
     }
+    // agy keeps its conversation itself: the recorded id is what a reply continues.
     let session = s(&json(run.join("summary.json")), "session").to_string();
     !session.is_empty()
-        && crate::agents::session_file(s(&json(run.join("meta.json")), "sessionDir"), &session)
-            .is_some()
+        && crate::agents::continuation_target(&json(run.join("meta.json")), &session).is_some()
 }
 
 pub fn latest(mut run: PathBuf) -> PathBuf {
@@ -793,5 +793,24 @@ pub fn latest(mut run: PathBuf) -> PathBuf {
             }
         }
         return run;
+    }
+}
+
+#[cfg(test)]
+mod agy_conversation_tests {
+    use super::continues_conversation;
+    use std::fs;
+
+    #[test]
+    fn a_finished_agy_round_continues_its_conversation() {
+        let run = std::env::temp_dir().join(format!("delegate-agy-run-{}", std::process::id()));
+        fs::create_dir_all(&run).unwrap();
+        fs::write(run.join("meta.json"), r#"{"model":"agy/gemini-4-neon","sessionDir":"/nonexistent"}"#).unwrap();
+        fs::write(run.join("summary.json"), r#"{"state":"delivered","session":"c-1"}"#).unwrap();
+        fs::write(run.join("exit_code"), "0").unwrap();
+        assert!(continues_conversation(&run));
+        fs::write(run.join("summary.json"), r#"{"state":"delivered","session":""}"#).unwrap();
+        assert!(!continues_conversation(&run));
+        fs::remove_dir_all(&run).unwrap();
     }
 }

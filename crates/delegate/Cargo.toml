@@ -1,6 +1,6 @@
 [package]
 name = "delegate"
-version = "6.21.4"
+version = "6.21.5"
 edition = "2021"
 rust-version = "1.93"
 
