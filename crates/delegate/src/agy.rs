@@ -67,8 +67,12 @@ pub fn command(meta: &Value, conversation: Option<&str>) -> Vec<String> {
     a
 }
 
-/// One stream-json user message carrying the colleague addendum, the task and any
-/// images (agy reads them from disk by path).
+/// agy can push a long command into a background task and end its turn before the
+/// result arrives; the run then settles on "waiting for …". Every message says so.
+const FOREGROUND: &str = "Run commands in the foreground and wait for their results; do not end your reply while a background task is still running.";
+
+/// One stream-json user message carrying the colleague addendum, the task, any
+/// images (agy reads them from disk by path) and the foreground rule.
 pub fn input(colleague: &str, prompt: &str, images: &[Value]) -> String {
     let mut text = String::new();
     if !colleague.is_empty() {
@@ -88,6 +92,8 @@ pub fn input(colleague: &str, prompt: &str, images: &[Value]) -> String {
             text.push('\n');
         }
     }
+    text.push_str("\n\n");
+    text.push_str(FOREGROUND);
     format!(
         "{}\n",
         json!({"event":"user","message":{"role":"user","content":text}})
@@ -264,6 +270,7 @@ mod tests {
         let text = s(&v["message"], "content");
         assert!(text.starts_with("rules\n\n---\n\ndo it"));
         assert!(text.contains("- /a.png"));
+        assert!(text.ends_with(FOREGROUND));
     }
 
     #[test]
