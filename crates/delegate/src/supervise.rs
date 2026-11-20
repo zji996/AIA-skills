@@ -654,6 +654,10 @@ fn model_label(meta: &Value) -> String {
 /// the colleague keeps what it read and changed and only has to carry on. `None` when the attempt
 /// saved no session (the agent failed before writing one) — there is nothing to continue.
 fn continuation(meta: &Value, run: &Path) -> Option<Value> {
+    continuation_with(meta, run, transient::PROMPT)
+}
+
+fn continuation_with(meta: &Value, run: &Path, message: &str) -> Option<Value> {
     let id = runs::events(run)
         .into_iter()
         .rev()
@@ -661,7 +665,7 @@ fn continuation(meta: &Value, run: &Path) -> Option<Value> {
         .map(|event| s(&event, "id").to_string())?;
     let session = agents::continuation_target(meta, &id)?;
     let prompt = run.join("resume-prompt.md");
-    write(&prompt, format!("{}\n", transient::PROMPT)).ok()?;
+    write(&prompt, format!("{message}\n")).ok()?;
     let mut next = meta.clone();
     next["fork"] = json!(session);
     next["agentPromptFile"] = json!(prompt);
@@ -669,6 +673,49 @@ fn continuation(meta: &Value, run: &Path) -> Option<Value> {
     // continuation would send them a second time for no reason.
     next["images"] = json!([]);
     Some(next)
+}
+
+/// A command that hangs (a test waiting forever, a server that never exits) is killed at the
+/// command stall limit. Killing the whole colleague then left no answer at all; instead the same
+/// session gets one more turn that names the command, so the colleague can find what hung.
+fn resume_stalled(
+    meta: &Value,
+    run: &Path,
+    first: (String, String, i64),
+    holder: Arc<AtomicI32>,
+    grace: Arc<Mutex<Option<f64>>>,
+) -> (String, String, i64) {
+    let (verdict, answer, attempts) = first;
+    let reason = json(run.join("stall.json"));
+    if verdict != "stalled" || s(&reason, "kind") != "command" || lane::stopped() {
+        return (verdict, answer, attempts);
+    }
+    let minutes = (n(&reason, "seconds") + 30) / 60;
+    let message = format!(
+        "Delegate stopped your command after {minutes} minutes without it finishing: `{}`. \
+         Do not rerun it as is. Find what hung — run the narrower parts on their own, with a \
+         timeout and per-test output — fix it if your change caused it, otherwise name it in \
+         your answer, then finish the task.",
+        s(&reason, "cmd")
+    );
+    let Some(next) = continuation_with(meta, run, &message) else {
+        return (verdict, answer, attempts);
+    };
+    log_event(
+        run,
+        json!({"e":"resume","n":1,"error":"command stalled","detail":format!("命令停滞，续做一次：{}", s(&reason, "cmd"))}),
+    );
+    let attempts = attempts + 1;
+    match agents::run_agent(&next, run, attempts, holder, grace) {
+        Ok((outcome, text)) => (outcome, text, attempts),
+        Err(failure) => {
+            let _ = append(
+                run.join("stderr.log"),
+                &format!("supervisor error: {failure}\n"),
+            );
+            (verdict, answer, attempts)
+        }
+    }
 }
 
 /// What a run did after waiting out an upstream outage.
@@ -995,6 +1042,13 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         );
         (verdict, answer, attempts) = (resumed.verdict, resumed.answer, resumed.attempts);
         (resumes, transient_error) = (resumed.resumes, resumed.error);
+        (verdict, answer, attempts) = resume_stalled(
+            &meta,
+            run,
+            (verdict, answer, attempts),
+            holder.clone(),
+            grace.clone(),
+        );
     }
     let (mut state, mut sum, mut rec, mut changed) = settle(
         &meta,

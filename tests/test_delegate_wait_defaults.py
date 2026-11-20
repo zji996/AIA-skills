@@ -142,6 +142,18 @@ class DelegateWaitDefaultsTests(unittest.TestCase):
         self.assertEqual(state["stall"]["kind"], "command")
         self.assertIn("sleep 2", state["stall"]["cmd"])
 
+    def test_command_stall_continues_the_session_once_naming_the_command(self):
+        self.env["DELEGATE_STALL_IDLE"] = "0"
+        self.env["DELEGATE_STALL_COMMAND"] = ".5s"
+        event = {"type": "tool_execution_start", "toolName": "bash", "args": {"command": "cargo test --hangs"}}
+        self.fake_pi([], [fixtures.answer("found the hang"), fixtures.SETTLED],
+                     pre=f'if [ "$n" -eq 1 ]; then printf \'%s\\n\' {shlex.quote(__import__("json").dumps(event))}; sleep 5; fi')
+        state = self.outcome(self.cli("run", "task"))
+        self.assertEqual((state["state"], state["attempts"]), ("answered", 2))
+        run = Path(state["dir"])
+        self.assertIn("cargo test --hangs", (run / "resume-prompt.md").read_text())
+        self.assertEqual((run / "result.md").read_text().strip(), "found the hang")
+
 
 if __name__ == "__main__":
     unittest.main()
