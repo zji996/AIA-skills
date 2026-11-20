@@ -175,6 +175,11 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
                 return Err(format!("{key} must be a string without NUL"));
             }
         }
+        if let Some(v) = value.get("acceptTimeout") {
+            if !valid_duration(v, false) {
+                return Err("acceptTimeout must be a positive duration".into());
+            }
+        }
         if value
             .get("maxRework")
             .is_some_and(|v| !v.is_null() && v.as_u64().is_none())
@@ -335,6 +340,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
     for key in [
         "thinking",
         "accept",
+        "acceptTimeout",
         "evidence",
         "maxRework",
         "sourceBuild",
@@ -366,6 +372,9 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         let Some(layer) = layer else { continue };
         if layer.get("resultChars").is_some() {
             origins["resultChars"] = json!(source);
+        }
+        if layer.get("acceptTimeout").is_some() {
+            origins["acceptTimeout"] = json!(source);
         }
         if let Some(map) = layer["defaults"].as_object() {
             for (key, val) in map {

@@ -900,6 +900,19 @@ pub fn run_agent(
             } else {
                 filter_pi(&event)
             };
+            if items.iter().any(|item| s(item, "e") == "bash") {
+                let raw_cmd = if on_agy {
+                    crate::agy::raw_bash_command(&event)
+                } else {
+                    let cmd = s(&event["args"], "command");
+                    (!cmd.is_empty()).then_some(cmd)
+                };
+                if let Some(cmd) = raw_cmd {
+                    if cmd.chars().count() > 180 || cmd.trim_start().starts_with("node -e") {
+                        crate::source_watch::record_bash_if_source(meta, run, cmd);
+                    }
+                }
+            }
             for mut item in items {
                 let kind = s(&item, "e").to_string();
                 item["attempt"] = json!(attempt);

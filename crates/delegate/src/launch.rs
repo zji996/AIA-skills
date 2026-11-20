@@ -44,7 +44,7 @@ pub struct Options {
     pub accept_set: bool,
     pub accept_also: Vec<String>,
     pub hide_accept: bool,
-    pub accept_timeout: String,
+    pub accept_timeout: Option<String>,
     pub evidence: Option<String>,
     pub evidence_set: bool,
     pub evidence_timeout: Option<String>,
@@ -72,7 +72,6 @@ pub struct Options {
 impl Options {
     pub fn new() -> Self {
         Self {
-            accept_timeout: "10m".into(),
             retries: 1,
             ..Default::default()
         }
@@ -208,7 +207,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                     o.accept = Some(v)
                 }
                 "--accept-also" => o.accept_also.push(v),
-                "--accept-timeout" => o.accept_timeout = v,
+                "--accept-timeout" => o.accept_timeout = Some(v),
                 "--evidence" => {
                     o.evidence_set = true;
                     o.evidence = Some(v);
@@ -330,7 +329,9 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
     if !(0..=3).contains(&o.retries) {
         return Err("argument --retries: invalid choice".into());
     }
-    seconds(&o.accept_timeout)?;
+    if let Some(t) = &o.accept_timeout {
+        seconds(t)?;
+    }
     if let Some(t) = &o.evidence_timeout {
         seconds(t)?;
     }
@@ -674,6 +675,13 @@ fn effective_defaults(o: &mut Options, config: &crate::config::Config) -> Value 
         };
         if used {
             applied[key] = json!({"value":v,"source":config.origins["defaults"][key]});
+        }
+    }
+    if !o.read_only && o.accept_timeout.is_none() {
+        if let Some(v) = config.value.get("acceptTimeout") {
+            o.accept_timeout = v.as_str().map(str::to_string);
+            applied["acceptTimeout"] =
+                json!({"value": v, "source": config.origins["acceptTimeout"]});
         }
     }
     applied
@@ -1023,6 +1031,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     let timeout_overridden = o.timeout.is_some() || o.minor;
     let evidence_overridden = o.evidence_set;
     let accept_overridden = o.accept_set;
+    let accept_timeout_overridden = o.accept_timeout.is_some();
     let parent = runs::latest(runs::resolve(o.run.as_deref().unwrap_or("last"))?);
     let meta = json(parent.join("meta.json"));
     o.share = strings(&meta["share"]);
@@ -1156,6 +1165,11 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     if o.accept.as_deref() == Some("") {
         o.accept = None;
     }
+    if o.accept_timeout.is_none() {
+        o.accept_timeout = meta["acceptTimeoutSeconds"]
+            .as_f64()
+            .map(|seconds| format!("{seconds}s"));
+    }
     if !o.evidence_set {
         o.evidence = meta["evidenceCommand"].as_str().map(str::to_string);
     }
@@ -1287,6 +1301,9 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         }
         if accept_overridden {
             defaults.remove("acceptAlso");
+        }
+        if accept_timeout_overridden {
+            defaults.remove("acceptTimeout");
         }
     }
     extra["resultChars"] = json!(config.value["resultChars"].as_u64().unwrap_or(20000));
@@ -1960,7 +1977,7 @@ pub fn launch(
         .map(seconds)
         .transpose()?
         .unwrap_or(0.0);
-    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":crate::agy::colleague(o.model.as_deref().unwrap_or("")),"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":timeout_seconds,"accept":o.accept,"acceptTimeoutSeconds":seconds(&o.accept_timeout)? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !b(extra,"newAfterApply") && !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
+    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":crate::agy::colleague(o.model.as_deref().unwrap_or("")),"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":timeout_seconds,"accept":o.accept,"acceptTimeoutSeconds":seconds(o.accept_timeout.as_deref().unwrap_or("10m"))? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !b(extra,"newAfterApply") && !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
     // A forked session continues on the executable that wrote it: Pi and rpi
     // keep different session formats.
     let parent_bin = s(parent, "agentBin");

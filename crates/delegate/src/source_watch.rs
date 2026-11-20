@@ -452,6 +452,375 @@ fn changes_now(meta: &Value, nonblocking: bool) -> Vec<String> {
         .collect()
 }
 
+fn source_roots(meta: &Value) -> Option<(PathBuf, PathBuf)> {
+    let source = Path::new(s(&meta["worktree"], "source"));
+    let worktree = Path::new(s(&meta["worktree"], "path"));
+    if !source.is_absolute() || !worktree.is_absolute() || source == worktree {
+        return None;
+    }
+    let canon = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
+    Some((source.to_path_buf(), canon))
+}
+
+/// Record unclipped bash commands that reference the source checkout (when events.jsonl clipped or hid them).
+pub fn record_bash_if_source(meta: &Value, run: &Path, cmd: &str) {
+    let Some((source, canon)) = source_roots(meta) else {
+        return;
+    };
+    let s1 = source.to_string_lossy();
+    let s2 = canon.to_string_lossy();
+    let r1 = s1.trim_end_matches('/');
+    let r2 = s2.trim_end_matches('/');
+    if (!r1.is_empty() && cmd.contains(r1)) || (!r2.is_empty() && cmd.contains(r2)) {
+        let _ = append(
+            run.join("source-bash.jsonl"),
+            &format!("{}\n", json!({"cmd": cmd})),
+        );
+    }
+}
+
+fn relative_to_source(
+    path_str: &str,
+    workdir: &Path,
+    source: &Path,
+    source_canon: &Path,
+) -> Option<String> {
+    if path_str.is_empty() {
+        return None;
+    }
+    let raw = Path::new(path_str);
+    let joined = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        workdir.join(raw)
+    };
+    let norm = normalize_path(&joined);
+    for base in [source, source_canon] {
+        if let Ok(rel) = norm.strip_prefix(base) {
+            return Some(rel.to_string_lossy().into_owned());
+        }
+    }
+    let canon = joined.canonicalize().ok().or_else(|| {
+        let name = joined.file_name()?;
+        Some(joined.parent()?.canonicalize().ok()?.join(name))
+    });
+    if let Some(canon) = canon {
+        for base in [source, source_canon] {
+            if let Ok(rel) = canon.strip_prefix(base) {
+                return Some(rel.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+fn git_subcommand<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        if matches!(
+            arg,
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env"
+        ) {
+            i += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return Some(arg);
+    }
+    None
+}
+
+fn is_readonly_segment(seg: &str, workdir: &Path, source: &Path) -> bool {
+    let words = seg
+        .split_whitespace()
+        .map(|w| w.trim_matches(['\'', '"', '(', ')']))
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>();
+    let mut idx = 0;
+    while idx < words.len() && words[idx].contains('=') && !words[idx].starts_with('-') {
+        idx += 1;
+    }
+    let Some(&program) = words.get(idx) else {
+        return true;
+    };
+    let rest = &words[idx + 1..];
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program);
+    if matches!(
+        name,
+        "cd" | "cat"
+            | "head"
+            | "tail"
+            | "less"
+            | "more"
+            | "ls"
+            | "pwd"
+            | "rg"
+            | "grep"
+            | "wc"
+            | "stat"
+            | "du"
+            | "file"
+            | "diff"
+            | "test"
+            | "["
+            | "echo"
+            | "printf"
+            | "true"
+            | "false"
+    ) {
+        return true;
+    }
+    if name == "sed" && !rest.iter().any(|w| w.starts_with("-i")) {
+        return true;
+    }
+    if name == "find"
+        && !rest.iter().any(|w| {
+            matches!(
+                *w,
+                "-delete"
+                    | "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-okdir"
+                    | "-fprint"
+                    | "-fprint0"
+                    | "-fprintf"
+                    | "-fls"
+            )
+        })
+    {
+        return true;
+    }
+    if name == "git"
+        && git_subcommand(rest).is_some_and(|sub| {
+            matches!(
+                sub,
+                "status" | "diff" | "log" | "show" | "ls-files" | "rev-parse" | "grep"
+            )
+        })
+    {
+        return true;
+    }
+    if matches!(name, "cp" | "rsync" | "install") {
+        return crate::source_guard::refused(seg, workdir, source).is_none();
+    }
+    false
+}
+
+fn is_readonly_bash(cmd: &str, workdir: &Path, source: &Path) -> bool {
+    if cmd.contains('>')
+        || cmd.contains('`')
+        || cmd.contains("$(")
+        || cmd.contains('\n')
+        || cmd.contains('\r')
+    {
+        return false;
+    }
+    let mut saw_any = false;
+    for part in cmd.split("&&") {
+        for part in part.split("||") {
+            for part in part.split(';') {
+                for seg in part.split('|') {
+                    let seg = seg.trim();
+                    if seg.is_empty() {
+                        continue;
+                    }
+                    saw_any = true;
+                    if !is_readonly_segment(seg, workdir, source) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    saw_any
+}
+
+fn is_left_boundary(b: u8) -> bool {
+    !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'))
+}
+
+fn is_delim(b: u8) -> bool {
+    matches!(
+        b,
+        b' ' | b'\t'
+            | b'\n'
+            | b'\r'
+            | b'\''
+            | b'"'
+            | b';'
+            | b'&'
+            | b'|'
+            | b')'
+            | b'>'
+            | b'<'
+            | b'`'
+            | b','
+            | b':'
+    )
+}
+
+fn normalize_rel(raw: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for comp in raw.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+fn extract_source_rels(cmd: &str, roots: &[&str]) -> Vec<(String, Option<String>)> {
+    let bytes = cmd.as_bytes();
+    let mut out = Vec::new();
+    for &root in roots {
+        if root.is_empty() {
+            continue;
+        }
+        let mut pos = 0;
+        while let Some(found) = cmd[pos..].find(root) {
+            let idx = pos + found;
+            pos = idx + root.len();
+            if idx > 0 && !is_left_boundary(bytes[idx - 1]) {
+                continue;
+            }
+            let quote = (idx > 0 && matches!(bytes[idx - 1], b'\'' | b'"'))
+                .then_some(bytes[idx - 1]);
+            let after = idx + root.len();
+            if after == bytes.len() || is_delim(bytes[after]) {
+                out.push((String::new(), None));
+                continue;
+            }
+            if bytes[after] != b'/' {
+                continue;
+            }
+            let start = after + 1;
+            if let Some(q) = quote {
+                let end_q = bytes[start..]
+                    .iter()
+                    .position(|&b| b == q || b == b'\n' || b == b'\r')
+                    .map_or(bytes.len(), |p| start + p);
+                let end_d = bytes[start..]
+                    .iter()
+                    .position(|&b| is_delim(b))
+                    .map_or(bytes.len(), |p| start + p);
+                let primary = normalize_rel(&cmd[start..end_q]);
+                let fallback = if end_d < end_q {
+                    normalize_rel(&cmd[start..end_d])
+                } else {
+                    None
+                };
+                if let Some(primary) = primary {
+                    out.push((primary, fallback));
+                } else if let Some(fallback) = fallback {
+                    out.push((fallback, None));
+                }
+            } else {
+                let end = bytes[start..]
+                    .iter()
+                    .position(|&b| is_delim(b))
+                    .map_or(bytes.len(), |p| start + p);
+                if let Some(rel) = normalize_rel(&cmd[start..end]) {
+                    out.push((rel, None));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn mark_rel(rel: &str, source_changed: &[String], matched: &mut BTreeSet<String>) -> bool {
+    let rel = rel.trim_matches('/');
+    if rel.is_empty() {
+        for path in source_changed {
+            matched.insert(path.clone());
+        }
+        return !source_changed.is_empty();
+    }
+    if rel == ".local" || rel.starts_with(".local/") {
+        return false;
+    }
+    let mut hit = false;
+    for path in source_changed {
+        if path == rel
+            || path.starts_with(&format!("{rel}/"))
+            || rel.starts_with(&format!("{path}/"))
+        {
+            matched.insert(path.clone());
+            hit = true;
+        }
+    }
+    hit
+}
+
+/// Subset of `source_changed` attributable to this run's own tool calls in worktree mode:
+/// `write`/`edit` paths landing in the source checkout, or non-read-only bash commands
+/// referencing the source checkout's absolute path prefix.
+pub fn attributed(meta: &Value, run: &Path, source_changed: &[String]) -> Vec<String> {
+    if source_changed.is_empty() {
+        return vec![];
+    }
+    let Some((source, source_canon)) = source_roots(meta) else {
+        return vec![];
+    };
+    let workdir = Path::new(s(meta, "workdir"));
+    let s1 = source.to_string_lossy().into_owned();
+    let s2 = source_canon.to_string_lossy().into_owned();
+    let r1 = s1.trim_end_matches('/');
+    let r2 = s2.trim_end_matches('/');
+    let mut roots = vec![r1];
+    if r2 != r1 {
+        roots.push(r2);
+    }
+
+    let mut matched = BTreeSet::<String>::new();
+    let check_bash = |cmd: &str, matched: &mut BTreeSet<String>| {
+        if cmd.is_empty() || is_readonly_bash(cmd, workdir, &source) {
+            return;
+        }
+        for (primary, fallback) in extract_source_rels(cmd, &roots) {
+            if !mark_rel(&primary, source_changed, matched) {
+                if let Some(fb) = fallback {
+                    mark_rel(&fb, source_changed, matched);
+                }
+            }
+        }
+    };
+
+    for ev in crate::runs::events(run) {
+        match s(&ev, "e") {
+            "write" | "edit" => {
+                if let Some(rel) =
+                    relative_to_source(s(&ev, "path"), workdir, &source, &source_canon)
+                {
+                    mark_rel(&rel, source_changed, &mut matched);
+                }
+            }
+            "bash" => check_bash(s(&ev, "cmd"), &mut matched),
+            _ => {}
+        }
+    }
+    for line in read(run.join("source-bash.jsonl")).lines() {
+        if let Ok(entry) = serde_json::from_str::<Value>(line) {
+            check_bash(s(&entry, "cmd"), &mut matched);
+        }
+    }
+    matched.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,6 +889,90 @@ mod tests {
 
         let meta = json!({"worktree": {"source": src, "path": wt}});
         assert_eq!(worktree_leaks(&meta), vec!["apps/web/node_modules"]);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn attribution_matches_colleague_tool_calls_and_ignores_unrelated_or_reads() {
+        let tmp = std::env::temp_dir().join(format!("delegate-attr-{}", now_ns()));
+        let src = tmp.join("source");
+        let wt = tmp.join("worktree");
+        let run = tmp.join("run");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::create_dir_all(&wt).unwrap();
+        fs::create_dir_all(&run).unwrap();
+        let meta = json!({"workdir": wt, "worktree": {"source": src, "path": wt}});
+        let changed = vec![
+            "a.txt".to_string(),
+            "docs/adr.md".to_string(),
+            "sub/b.txt".to_string(),
+        ];
+
+        // No tool calls touching source: nothing attributed.
+        write(
+            run.join("events.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({"e":"bash","cmd":"cargo test"}),
+                json!({"e":"read","path":src.join("a.txt")})
+            ),
+        )
+        .unwrap();
+        assert!(attributed(&meta, &run, &changed).is_empty());
+
+        // Read-only bash referencing source or sibling prefix: still nothing attributed.
+        write(
+            run.join("events.jsonl"),
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                json!({"e":"bash","cmd":format!("cat {}", src.join("a.txt").display())}),
+                json!({"e":"bash","cmd":format!("git -C {} status", src.display())}),
+                json!({"e":"bash","cmd":format!("cp {} local.txt", src.join("a.txt").display())}),
+                json!({"e":"bash","cmd":format!("echo x > {}-other/a.txt", src.display())}),
+            ),
+        )
+        .unwrap();
+        assert!(attributed(&meta, &run, &changed).is_empty());
+
+        // Write/edit tool call and bash redirection attribute only the hit files.
+        write(
+            run.join("events.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({"e":"edit","path":src.join("a.txt")}),
+                json!({"e":"bash","cmd":format!("cp foo {}/sub/", src.display())}),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            attributed(&meta, &run, &changed),
+            vec!["a.txt".to_string(), "sub/b.txt".to_string()]
+        );
+
+        // Unclipped sidecar bash command (e.g. >180 chars or node -e) attributes properly.
+        write(run.join("events.jsonl"), "").unwrap();
+        record_bash_if_source(
+            &meta,
+            &run,
+            &format!("node -e \"fs.writeFileSync('{}/docs/adr.md', 'x')\"", src.display()),
+        );
+        assert_eq!(
+            attributed(&meta, &run, &changed),
+            vec!["docs/adr.md".to_string()]
+        );
+
+        // Path escaping above source is ignored.
+        let _ = fs::remove_file(run.join("source-bash.jsonl"));
+        write(
+            run.join("events.jsonl"),
+            format!(
+                "{}\n",
+                json!({"e":"bash","cmd":format!("echo x > {}/../worktree/a.txt", src.display())}),
+            ),
+        )
+        .unwrap();
+        assert!(attributed(&meta, &run, &changed).is_empty());
+
         let _ = fs::remove_dir_all(&tmp);
     }
 }

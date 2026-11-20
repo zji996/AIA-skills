@@ -17,11 +17,11 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 
 ## 用户与仓库配置
 
-用户配置 `${XDG_CONFIG_HOME}/delegate/config.json` 支持 `remote`、`agentDeny`、`measure`、`measureCpus`、`env`、`maxRework`、默认 `accept`/`evidence`、`maxActive`、`maxHeavy`、`repoMaxActive`、`models`/`tiers`/`thinking`、`sourceBuild.paths`、`standing`、`defaults`、`resultChars`、`cleanupKeepExecutables`。仓库根 `.delegate.json` 使用相同字段并保存仓库事实。
+用户配置 `${XDG_CONFIG_HOME}/delegate/config.json` 支持 `remote`、`agentDeny`、`measure`、`measureCpus`、`env`、`maxRework`、默认 `accept`/`acceptTimeout`/`evidence`、`maxActive`、`maxHeavy`、`repoMaxActive`、`models`/`tiers`/`thinking`、`sourceBuild.paths`、`standing`、`defaults`、`resultChars`、`cleanupKeepExecutables`。仓库根 `.delegate.json` 使用相同字段并保存仓库事实。
 
 `measure` 是 argv 前缀数组，例如 `{"measure":[["cargo","xtask","bench-concurrency"]]}`；仓库配置覆盖用户配置。`measureCpus` 是预约核列表（如 `"8-11"`），未设置时取最后 `max(2, nproc/3)` 个在线逻辑核。匹配的同事、验收、证据和 lane 命令自动排队到机器级测量预约；预约开始时在跑的 lane 命令会让出预约核，预约期间普通 lane 命令使用其余核。
 
-- 标量：仓库 > 用户 > 内置默认；容量的 `DELEGATE_MAX_ACTIVE` / `DELEGATE_MAX_HEAVY` / `DELEGATE_REPO_MAX_ACTIVE` 最高，`0` 不限。整机/仓库防失控上限默认 32/0（仓库不限）、重命令 2；实际限流靠 tier 按模型 `maxActive`、`maxHeavy` 与内存水位。容量不足自动排队，不需手动重派。写入默认 `accept`/`evidence` 在仓库未提供字段时用用户值，CLI 可覆盖或关闭；只读不用这两项默认。
+- 标量：仓库 > 用户 > 内置默认；容量的 `DELEGATE_MAX_ACTIVE` / `DELEGATE_MAX_HEAVY` / `DELEGATE_REPO_MAX_ACTIVE` 最高，`0` 不限。整机/仓库上限默认 32/0、重命令 2；实际限流靠模型 `maxActive`、`maxHeavy` 与内存水位，不足自动排队。写入默认 `accept`/`acceptTimeout`/`evidence` 仓库优先于用户、CLI 覆盖或关闭（`acceptTimeout` 如 `"40m"`，默认 `10m`，回显来源，`reply` 继承）；只读不继承。
 - 模型选择独立为 `tiers.scout/review/write` 用途、`models` 登记别名与 `thinking` 长度；models/tiers 按键合并。模型全集只来自登记表，Pi 仅校验与提供能力；旧档与模型 thinking 后缀不兼容。匹配、规则、优先级、图片守卫、agy 同事与迁移见 [用途、模型与思维长度](model-routing.md)。
 - 任务测试用可重复的 `--accept-also COMMAND`，按顺序以 `&&` 追加到生效的 `--accept` 或配置默认（无基础命令则单独运行）；与 `--no-accept` 冲突退出 2。`--accept` 替换非空且不同的默认命令时，start 提示原命令与追加用法；meta 的 `accept` 与 summary 的 `accept.command` 记录最终命令。
 - `env` 按键合并，仓库优先；`agentDeny` 按 `(argv, exact)` 去重，省略 `exact` 等于 `false`；仓库同键 hint 覆盖用户值，保留原顺序。仓库 `{"argv":["cargo","xtask","check"],"exact":true,"allow":true}` 撤销完全相同 argv 且 exact 相同的一条用户规则，无需 hint；不撤销不同 exact 或其他前缀规则，用户配置不能声明 `allow: true`。
@@ -33,7 +33,7 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 - `resultChars` 是答复显示上限（正整数，默认 20000），环境变量 `DELEGATE_RESULT_CHARS` 优先；答复不超过上限的 1.25 倍时全文显示，超出才显示头尾。每任务 `--max-answer N` 是另一项答复约定，超过 N 的 1.5 倍时自动续接一次压缩，不计返工预算。
 - `cleanupKeepExecutables` 是共享守护进程的可执行文件名数组，用户与仓库追加去重，内置 `sccache`；按实际可执行文件名识别，不能配置路径。回收不终止这些进程，普通进程提示名字和端口。
 - `worktree`、`generated`、`applyVerify` 只认仓库：用户级出现时忽略，`start`（含 `run`）在 stderr 汇总提示一次。
-- 两份文件独立校验，覆盖不能隐藏错误；错误指出文件与字段，启动退出 2。JSON 语法错误指出文件与行列。meta、summary 与 `--json` 记 `configSources: ["user","repo"]`（启动时只有存在的配置文件，没有时 `[]`）。普通 reply 沿用启动时的 env、deny、验收与证据，fresh 更新 deny 与固定说明，返工预算和容量按当前两级配置读取；来源包含继承配置与当前配置两部分。
+- 两份文件独立校验，错误指出文件与字段并退出 2。meta、summary 与 `--json` 记 `configSources`（实际存在的 `user`/`repo`）。普通 reply 沿用启动时的 env、deny、验收与证据，fresh 更新 deny 与固定说明，返工预算和容量读当前配置。
 
 用户级示例：
 

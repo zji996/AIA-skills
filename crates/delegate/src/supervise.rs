@@ -335,11 +335,14 @@ fn settle(
         })
         .unwrap_or_default();
     let mut source_changed = crate::source_watch::changed(meta);
+    let attributed_source = if s(meta, "mode") == "write" {
+        crate::source_watch::attributed(meta, run, &source_changed)
+    } else {
+        vec![]
+    };
     let mut source_leaks = crate::source_watch::worktree_leaks(meta);
     let worktree_nm_links = crate::source_watch::worktree_source_node_modules_links(meta);
-    let mut outside_write = (s(meta, "mode") == "write"
-        && changed.is_empty()
-        && !source_changed.is_empty())
+    let mut outside_write = !attributed_source.is_empty()
         || !source_leaks.is_empty()
         || !worktree_nm_links.is_empty();
     let protected = meta["protect"]
@@ -502,10 +505,10 @@ fn settle(
         } else if !worktree_nm_links.is_empty() {
             worktree_nm_links.clone()
         } else {
-            source_changed.clone()
+            attributed_source.clone()
         };
-        if !source_leaks.is_empty() && !source_changed.is_empty() && changed.is_empty() {
-            violation.extend(source_changed.iter().cloned());
+        if !source_leaks.is_empty() && !attributed_source.is_empty() {
+            violation.extend(attributed_source.iter().cloned());
             violation.sort();
             violation.dedup();
         }

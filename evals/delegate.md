@@ -184,6 +184,11 @@
 - rpi 列出了没凭据的内置模型：不能因此选到它，只从 models 登记表匹配；未登记提示 --alias，歧义列已登记候选。
 - 图片带给 images=no 的模型：不改选模型，退出 2，给出 models.json input 加 image 或 --model 换模型两条出路。
 
+## 6.21.8 验收时限配置与源仓库越界归属
+
+- 远程冷编译验收需要 40 分钟：`.delegate.json` 配 `"acceptTimeout": "40m"`，启动在「生效默认值及来源」回显来源 `repo`，`reply` 继承、`--accept-timeout` 覆盖。Repo-level acceptance timeout with CLI > repo > default precedence.
+- 同事在 worktree 里只跑验收（工作树零改动），主控同时改源仓库文件：不判 `sourceWriteViolation`、正常验收交付，只报 `sourceWorkspaceChanges`；同事通过 `write`/`edit` 或 bash 绝对路径写了源文件时仍拒收，非 worktree 与 `node_modules` 软链检查不变。Worktree outside-write requires tool-call attribution to the colleague.
+
 ## 6.20 使用摩擦回归 / Usage friction
 
 - DELEGATE_REMOTE=0 启动后普通 reply、fresh 及续做保持本机，显式 1 恢复当前 remote 配置；explicit environment override.

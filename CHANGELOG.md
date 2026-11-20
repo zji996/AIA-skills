@@ -4,6 +4,7 @@
 
 ### 仓库脚本
 
+- 本仓库根新增 `.delegate.json`（`{"remote": false}`）：`tests/test_delegate*.py` 固定在本地构建并执行 `crates/delegate/target/debug/delegate`，关闭远端转发以避免产物留在远端导致测试失败。
 - `verify.sh` 用 `scripts/run-tests.py` 并行跑单元测试（按测试方法分给多个进程，结束列出最慢用例），每步经 `iteration-speed step` 记录、输入未变即复用；本机完整 verify 从约 7 分钟降到 1.5 分钟，紧接着的 pre-push 与发版 tag 推送直接复用。
 - `check.sh` 拦截已跟踪文件中的合并冲突标记；起因：`apply --merge` 留下的标记曾随 CHANGELOG 一起提交。
 - 新增 `scripts/sync-hosts.sh`：经 SSH 并行更新其他机器上的 AIA-skills（`git pull --ff-only` 后重跑 `install.sh`，顺带取与新校验和匹配的二进制），每台一行汇报提交与 delegate 版本，任一失败退出 1 并附日志尾部。主机从参数或 `~/.config/aia-skills/hosts` 读取，`--` 之后的参数传给远端 `install.sh`；远端需已有检出（首次用 bootstrap.sh）。
@@ -12,6 +13,7 @@
 
 - `agent-interface-design`「顺着模型习惯」：拿不准习惯时先问用它的模型本人（从真实请求分叉追问、复用缓存、不写回），回答只当线索、回到记录核实。
 
+- `delegate` 6.21.8：`.delegate.json` 支持顶层 `acceptTimeout`（优先级 CLI > 仓库 > 默认 10m，`reply` 继承、启动回显来源）；worktree 写入收尾仅在同事本轮 `write`/`edit` 或 bash 源路径前缀命中变化文件（或 `node_modules` 软链越界）时判 `sourceWriteViolation`，主控修改源仓库只记 `sourceWorkspaceChanges`、不拒收。
 - `delegate` 6.21.7：命令停滞（默认 90 分钟没跑完）被停掉后，同一会话自动续做一次，告诉同事是哪条命令、让它缩小范围加超时找出挂住的地方，能修就修、修不了写进答复；原来整个同事被杀、不留答复（起因：一条主干上本来就挂住的 runtime 测试让验收等满 90 分钟后白白结束）。
 - `delegate` 6.21.6：agy 同事的答复只取最后一条命令之后的回复（agy 的 `response` 会把整轮命令间的进度旁白一起拼进去，答复开头曾出现成串的「正在等待 clippy…」）；答复里指向 worktree 的 `file://` 链接改写为仓库相对路径（worktree 合入后即删除，链接失效）。
 - `delegate` 6.21.5：reply 认得 agy 的对话：结束的 agy 轮次按记录的对话 id 续接，不再被当成「没存会话」退回上一轮 Pi 会话（起因：一次 reply 因此在 sol 上续做）。

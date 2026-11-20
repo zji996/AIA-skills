@@ -138,8 +138,11 @@ class Delegate615Tests(unittest.TestCase):
     def test_source_write_is_rejected_instead_of_question_and_warns_prompt(self):
         repo = self.repo({"a.txt": "old\n", ".delegate.json": '{"worktree":{"pool":1}}'})
         (repo / "already.txt").write_text("existing dirty\n")
-        self.fake_pi([fixtures.answer("需要主控决定\nWhat next?"), fixtures.SETTLED],
-                     pre=f"echo rogue > {shlex.quote(str(repo / 'a.txt'))}")
+        self.fake_pi([
+            {"type": "tool_execution_start", "toolName": "write", "args": {"path": str(repo / "a.txt")}},
+            fixtures.answer("需要主控决定\nWhat next?"),
+            fixtures.SETTLED,
+        ], pre=f"echo rogue > {shlex.quote(str(repo / 'a.txt'))}")
         result = self.cli("run", "--worktree", "--workdir", repo, f"inspect {repo}", human=True)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("note: prompt contains", result.stderr)
@@ -171,8 +174,10 @@ class Delegate615Tests(unittest.TestCase):
         self.until(lambda: self.outcome(self.cli("status", state["run"])).get("sourceWorkspaceChanges") == ["a.txt"], "cached periodic source observation")
         gate.touch()
         result = self.cli("wait", "--all", state["run"])
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(self.outcome(result)["sourceWriteViolation"], ["a.txt"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        done = self.outcome(result)
+        self.assertEqual(done["sourceWorkspaceChanges"], ["a.txt"])
+        self.assertNotIn("sourceWriteViolation", done)
 
     def test_cumulative_reply_apply_registers_parent_paths(self):
         repo = self.repo({"a.txt": "old\n", "side.txt": "side\n"})
@@ -459,8 +464,10 @@ class Delegate615Tests(unittest.TestCase):
         subprocess.run(["git", "-C", str(repo), "checkout", "--", "a.txt"], check=True)
         gate3.touch()
         res3 = self.cli("wait", "--all", slow3["run"])
-        self.assertEqual(res3.returncode, 1)
-        self.assertEqual(self.outcome(res3)["sourceWriteViolation"], ["a.txt"])
+        self.assertEqual(res3.returncode, 0, res3.stdout + res3.stderr)
+        out3 = self.outcome(res3)
+        self.assertEqual(out3["sourceWorkspaceChanges"], ["a.txt"])
+        self.assertNotIn("sourceWriteViolation", out3)
 
         # Case 4 (guardrail): committing a manually-dirty file NOT in applied.json must NOT be exempted.
         (repo / "manual.txt").write_text("m1\n")
@@ -470,8 +477,10 @@ class Delegate615Tests(unittest.TestCase):
                         "commit", "-qm", "commit manual"], check=True)
         gate4.touch()
         res4 = self.cli("wait", "--all", slow4["run"])
-        self.assertEqual(res4.returncode, 1)
-        self.assertEqual(self.outcome(res4)["sourceWriteViolation"], ["manual.txt"])
+        self.assertEqual(res4.returncode, 0, res4.stdout + res4.stderr)
+        out4 = self.outcome(res4)
+        self.assertEqual(out4["sourceWorkspaceChanges"], ["manual.txt"])
+        self.assertNotIn("sourceWriteViolation", out4)
 
 
 if __name__ == "__main__":

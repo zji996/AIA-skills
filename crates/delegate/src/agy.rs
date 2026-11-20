@@ -214,6 +214,18 @@ impl Filter {
     }
 }
 
+pub fn raw_bash_command(v: &Value) -> Option<&str> {
+    if s(v, "event") != "step_update" {
+        return None;
+    }
+    let u = &v["step_update"];
+    if s(u, "step_type") != "tool" || s(u, "tool_name") != "run_command" {
+        return None;
+    }
+    let cmd = param(&u["tool_info"]["parameters"], &["CommandLine", "Command", "command"]);
+    (!cmd.is_empty()).then_some(cmd)
+}
+
 fn param<'a>(params: &'a Value, keys: &[&str]) -> &'a str {
     keys.iter()
         .map(|k| s(params, k))
@@ -235,7 +247,7 @@ fn start_event(tool: &str, params: &Value) -> Value {
             json!({"e":"bash","cmd":clip(cmd,180)})
         }
         "view_file" | "read_file" => json!({"e":"read","path":path()}),
-        "write_to_file" | "create_file" => json!({"e":"write","path":path()}),
+        "write_to_file" | "write_file" | "create_file" => json!({"e":"write","path":path()}),
         "replace_file_content" | "multi_replace_file_content" | "edit_file" => {
             json!({"e":"edit","path":path()})
         }

@@ -19,9 +19,9 @@ $D clean impl                                   # 确认不再需要后删除
 
 ## 工作目录与只读调查
 
-写入提示固定附「只在当前工作目录内改文件；提示里出现的其他绝对路径只读」。正文含源仓库绝对路径时启动给 note，不拦截。`meta.sourceStatusBaseline` 保存启动时 porcelain 路径/内容/索引指纹；运行中定期观察，`status` 显示 supervisor 定期缓存的 `sourceWorkspaceChanges`（非实时刷新）。结束时若自己的工作树零改动而源出现新增差异，判 `rejected`，显示「写到了源仓库」及数量/路径，JSON `sourceWriteViolation`，不再算提问。
+写入提示固定附「只在当前工作目录内改文件；提示里出现的其他绝对路径只读」。正文含源仓库绝对路径时启动给 note，不拦截。`meta.sourceStatusBaseline` 保存启动时 porcelain 路径/内容/索引指纹；运行中定期观察，`status` 显示 supervisor 定期缓存的 `sourceWorkspaceChanges`（非实时刷新）。worktree 写入任务结束时，仅当本轮工具调用（`write`/`edit` 路径或非只读 bash 命令中的源仓库绝对路径前缀）命中变化的源文件，或触发 `node_modules` 软链检查，才判 `rejected`、显示「写到了源仓库」及 JSON `sourceWriteViolation` 并取消提问；归不到同事身上的源仓库变化（如主控手改）只报告 `sourceWorkspaceChanges`，不改状态。
 
-delegate 自己的 apply 登记已写路径的最终指纹，排除其他路合入带来的差异；同路径后来再次被编辑仍能发现。它不能区分主控手改与 Agent 越界写入，属于误操作检测而非权限沙箱；比较范围遵循 Git status（不含忽略文件，也排除允许存日志的源 `.local/`）外加各包 `node_modules` 顶层/scoped/`.bin` 软链与 pnpm 元数据（忽略 `.vite` 与校验时间戳），改后恢复原样不算最终差异。源 `node_modules` 指向本工作树或工作树留有指向源的 `node_modules` 软链时，即使工作树有改动也拒收并跳过验收。
+delegate 自己的 apply 登记已写路径的最终指纹，排除其他路合入带来的差异；同路径后来再次被编辑仍能发现。比较范围遵循 Git status（不含忽略文件，也排除允许存日志的源 `.local/`）外加各包 `node_modules` 顶层/scoped/`.bin` 软链与 pnpm 元数据（忽略 `.vite` 与校验时间戳），改后恢复原样不算最终差异。源 `node_modules` 指向本工作树或工作树留有指向源的 `node_modules` 软链时，即使工作树有改动也拒收并跳过验收。
 
 同事的非交互 Bash 通过 `BASH_ENV`/DEBUG 在命令执行前检查：cd 进入源树不拦，cat/rg/grep/head/tail/ls、普通 sed/find、git status/diff/log 等读取放行；常见直接输出重定向到源树、在源树执行写命令或可能写入的未知 helper 则退出 77，仅一行指出拒绝的写入路径与本轮 worktree。`cp`/`rsync`/`install` 只按目标判定（末个非选项参数，或 `-t`/`--target-directory` 指定目录；rsync 的 `-t` 仍是保留时间），允许从源树复制到 worktree，反向或源树内复制仍拒绝；`ln` 指向源树（含硬链与相对软链）双向均拒，避免后续工具顺着链接写进源树。源 `.local/` 的明确日志输出与简单文件操作允许；本轮 worktree 的读写不受影响。拒绝发生在 shell 执行重定向之前；验收、生成器、主控 lane 不注入。
 
