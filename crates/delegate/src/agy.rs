@@ -112,12 +112,27 @@ pub fn conversation(v: &Value) -> Option<&str> {
     .filter(|id| !id.is_empty())
 }
 
+/// agy links files as `file://<worktree>/path#L1`; the worktree is gone after
+/// apply, so answers keep the repo-relative path.
+pub fn relative_links(text: &str, workdir: &str) -> String {
+    let root = workdir.trim_end_matches('/');
+    if root.is_empty() {
+        return text.to_string();
+    }
+    text.replace(&format!("file://{root}/"), "")
+        .replace(&format!("file://{root}"), ".")
+}
+
 /// Maps agy's stream-json events onto delegate's event log, the same shape Pi's
 /// filter writes. Stateful: one tool step is reported ACTIVE more than once.
 #[derive(Default)]
 pub struct Filter {
     started: HashSet<i64>,
     commands: HashSet<i64>,
+    /// Reply text since the last tool step. agy's `result.response` joins every
+    /// agent_response of the turn, so progress notes ("waiting for clippy…")
+    /// written between commands would open the answer.
+    tail: String,
 }
 
 impl Filter {
@@ -139,7 +154,11 @@ impl Filter {
                         "cacheRead": u["cache_read_tokens"].clone(),
                     },
                 })];
-                let text = s(r, "response");
+                let text = if self.tail.trim().is_empty() {
+                    s(r, "response")
+                } else {
+                    self.tail.as_str()
+                };
                 if ok && !text.trim().is_empty() {
                     out.push(json!({"e":"result","text":text}));
                 } else if !ok {
@@ -157,8 +176,13 @@ impl Filter {
     }
 
     fn step(&mut self, u: &Value) -> Vec<Value> {
-        if s(u, "step_type") != "tool" {
-            return vec![];
+        match s(u, "step_type") {
+            "agent_response" => {
+                self.tail.push_str(s(u, "text_delta"));
+                return vec![];
+            }
+            "tool" => self.tail.clear(),
+            _ => return vec![],
         }
         let index = u["step_index"].as_i64().unwrap_or(-1);
         let tool = s(u, "tool_name");
@@ -288,6 +312,26 @@ mod tests {
         assert_eq!(end[0]["usage"]["cacheRead"], json!(1));
         assert_eq!(end[1], json!({"e":"result","text":"hello\n"}));
         assert_eq!(end[2], json!({"e":"settled"}));
+    }
+
+    #[test]
+    fn the_answer_is_the_reply_after_the_last_command() {
+        let mut f = Filter::default();
+        let say = |i: i64, t: &str| json!({"event":"step_update","step_update":{"step_index":i,"step_type":"agent_response","state":"ACTIVE","text_delta":t}});
+        f.events(&say(1, "waiting for clippy.\n"));
+        f.events(&json!({"event":"step_update","step_update":{"step_index":2,"step_type":"tool","state":"DONE","tool_name":"run_command","tool_info":{"parameters":{"CommandLine":"x"}}}}));
+        f.events(&say(3, "Fixed. "));
+        f.events(&json!({"event":"step_update","step_update":{"step_index":4,"step_type":"system_message","state":"DONE"}}));
+        f.events(&say(5, "All green.\n"));
+        let end = f.events(&json!({"event":"result","result":{"status":"SUCCESS","response":"waiting for clippy.\nFixed. All green.\n","usage":{}}}));
+        assert_eq!(end[1]["text"], "Fixed. All green.\n");
+    }
+
+    #[test]
+    fn worktree_links_become_repo_relative() {
+        let text = "[a.rs](file:///w/run/src/a.rs#L3) and [root](file:///w/run)";
+        assert_eq!(relative_links(text, "/w/run/"), "[a.rs](src/a.rs#L3) and [root](.)");
+        assert_eq!(relative_links(text, ""), text);
     }
 
     #[test]

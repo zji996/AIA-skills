@@ -931,6 +931,9 @@ pub fn run_agent(
                         turn = item;
                         answer.clear();
                     }
+                    "result" | "message" if on_agy => {
+                        answer = crate::agy::relative_links(s(&item, "text"), s(meta, "workdir"))
+                    }
                     "result" | "message" => answer = s(&item, "text").into(),
                     "settled" => settled = true,
                     "turn_error" => turn = json!({"stopReason":"error"}),
