@@ -941,6 +941,7 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     extra["measureCpus"] = config.value["measureCpus"].clone();
     extra["stall"] = config.value["stall"].clone();
     extra["checkIn"] = config.value["checkIn"].clone();
+    extra["agy"] = config.value["agy"].clone();
     let (standing, sources) = standing_text(&config, o.read_only, &extra["agentDeny"]);
     extra["standing"] = json!(standing);
     extra["standingSources"] = sources;
@@ -1457,6 +1458,11 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     extra["measureCpus"] = meta["measureCpus"].clone();
     extra["stall"] = meta["stall"].clone();
     extra["checkIn"] = meta["checkIn"].clone();
+    extra["agy"] = if !o.fresh && meta["agy"].is_object() {
+        meta["agy"].clone()
+    } else {
+        config.value["agy"].clone()
+    };
     if o.fresh {
         extra["agentDeny"] = config.value["agentDeny"].clone();
         let (text, sources) = standing_text(
@@ -2165,6 +2171,7 @@ pub fn launch(
         "measureCpus",
         "stall",
         "checkIn",
+        "agy",
     ] {
         meta[key] = extra[key].clone();
     }

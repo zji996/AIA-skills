@@ -42,6 +42,16 @@ pub fn effort(thinking: &str) -> Option<&'static str> {
     }
 }
 
+/// Validates an `agy.agent` name: non-empty, no whitespace or control characters.
+pub fn validate_agent(name: &str) -> Res<()> {
+    if name.is_empty() || name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(
+            "agy.agent must be a non-empty name without whitespace or control characters".into(),
+        );
+    }
+    Ok(())
+}
+
 /// The command line. The prompt goes on stdin as one stream-json message
 /// (see `input`), so its size is not bound by argv.
 pub fn command(meta: &Value, conversation: Option<&str>) -> Vec<String> {
@@ -54,6 +64,10 @@ pub fn command(meta: &Value, conversation: Option<&str>) -> Vec<String> {
         "--dangerously-skip-permissions".into(),
         "--disable-slash-commands".into(),
     ];
+    let agent = s(&meta["agy"], "agent");
+    if !agent.is_empty() {
+        a.extend(["--agent".into(), agent.into()]);
+    }
     let model = model_id(s(meta, "model"));
     if !model.is_empty() {
         a.extend(["--model".into(), model.into()]);
@@ -288,6 +302,30 @@ mod tests {
             ]
         );
         assert!(!command(&json!({"model":"agy/m"}), None).contains(&"--conversation".into()));
+    }
+
+    #[test]
+    fn command_passes_configured_agent_for_new_and_continued_runs() {
+        let plain = command(&json!({"model":"agy/m"}), None);
+        assert!(!plain.contains(&"--agent".into()));
+
+        let meta = json!({"model":"agy/m","agy":{"agent":"aia"}});
+        let fresh = command(&meta, None);
+        assert!(fresh.windows(2).any(|w| w == ["--agent", "aia"]));
+        assert!(!fresh.contains(&"--conversation".into()));
+
+        let continued = command(&meta, Some("c-2"));
+        assert!(continued.windows(2).any(|w| w == ["--agent", "aia"]));
+        assert!(continued.windows(2).any(|w| w == ["--conversation", "c-2"]));
+    }
+
+    #[test]
+    fn validate_agent_rejects_empty_whitespace_and_control_chars() {
+        assert!(validate_agent("aia").is_ok());
+        assert!(validate_agent("my-agent_1").is_ok());
+        for bad in ["", " ", "a b", "a\tb", "a\nb", "a\0b"] {
+            assert!(validate_agent(bad).is_err(), "expected error for {bad:?}");
+        }
     }
 
     #[test]

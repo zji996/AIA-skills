@@ -258,10 +258,10 @@ fn push_event(seen: &mut Seen, value: &Value, at: f64) {
 fn probe_one(
     bin: &Path,
     pattern: &str,
-    index: usize,
-    root: &Path,
+    dir: &Path,
     timeout: f64,
     extra_env: &Value,
+    agy_cfg: &Value,
     thinking_off: bool,
 ) -> Outcome {
     let started = Instant::now();
@@ -271,7 +271,6 @@ fn probe_one(
         first,
         error,
     };
-    let dir = root.join(format!("m{index}"));
     if let Err(e) = fs::create_dir_all(dir.join("session")) {
         return result(false, e.to_string(), None);
     }
@@ -295,7 +294,7 @@ fn probe_one(
     let mut command = Command::new(bin);
     if agy {
         // Lowest effort keeps the probe cheap; agy always thinks.
-        let meta = serde_json::json!({"model": model_id(pattern), "thinking": "low"});
+        let meta = serde_json::json!({"model": model_id(pattern), "thinking": "low", "agy": agy_cfg});
         command.args(&crate::agy::command(&meta, None)[1..]);
     } else {
         command
@@ -311,7 +310,7 @@ fn probe_one(
         command.arg("-p");
     }
     command
-        .current_dir(&dir)
+        .current_dir(dir)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr));
@@ -424,7 +423,7 @@ fn probe_one(
 /// Whether `model` answers right now, asked exactly the way `probe` asks (same binary,
 /// environment and thinking level). A run resuming after an interrupted upstream waits for this
 /// instead of sending the task into a provider that is still down.
-pub fn recovered(bin: &Path, model: &str, env: &Value, timeout: f64) -> Result<(), String> {
+pub fn recovered(bin: &Path, model: &str, env: &Value, agy_cfg: &Value, timeout: f64) -> Result<(), String> {
     // Pi's own default model has no id to probe; nothing to check, so let the resume go out.
     if model.trim().is_empty() {
         return Ok(());
@@ -434,7 +433,7 @@ pub fn recovered(bin: &Path, model: &str, env: &Value, timeout: f64) -> Result<(
     let thinking = !agents::pi_models()
         .iter()
         .any(|m| m.name == model_id(model) && !m.thinking);
-    let outcome = probe_one(bin, model, 0, &root, timeout, env, thinking);
+    let outcome = probe_one(bin, model, &root.join("m0"), timeout, env, agy_cfg, thinking);
     fs::remove_dir_all(&root).ok();
     if outcome.ok {
         Ok(())
@@ -515,9 +514,14 @@ pub fn command(args: &[String]) -> Res<i32> {
             .iter()
             .enumerate()
             .map(|(index, model)| {
-                let (bin, root, env) = (bin_for(model).unwrap_or_default(), root.clone(), config.value["env"].clone());
+                let (bin, dir, env, agy_cfg) = (
+                    bin_for(model).unwrap_or_default(),
+                    root.join(format!("m{index}")),
+                    config.value["env"].clone(),
+                    config.value["agy"].clone(),
+                );
                 let thinking = off(model);
-                scope.spawn(move || probe_one(&bin, model, index, &root, o.timeout, &env, thinking))
+                scope.spawn(move || probe_one(&bin, model, &dir, o.timeout, &env, &agy_cfg, thinking))
             })
             .collect();
         handles

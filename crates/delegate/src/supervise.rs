@@ -799,6 +799,7 @@ fn resume_transient(
                 &bin,
                 s(meta, "model"),
                 &meta["env"],
+                &meta["agy"],
                 transient::probe_timeout(),
             ),
             None => Err("missing required tools: pi".to_string()),

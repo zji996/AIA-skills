@@ -11,13 +11,13 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
  "profile":"env.sh","slice":"build.slice","forwardEnv":["RUST_LOG"]}}
 ```
 
-无 host 即关闭。仓库可逐字段覆盖（如 `{"remote":{"programs":["cargo","browser-contracts"],"profile":"env.sh","forwardEnv":["RUST_LOG"]}}`，数组整体替换），但不能设置 host；`remote: false` 关闭本仓库，`DELEGATE_REMOTE=0` 关闭且随 reply 继承，显式变量可覆盖。`config`/`--help` 展示生效值（含主机），`remote check` 一行检测 SSH/rsync/程序版本，失败 75。
+无 host 即关闭。仓库可逐字段覆盖（数组整体替换），但不能设置 host；`remote: false` 关闭本仓库，`DELEGATE_REMOTE=0` 关闭且随 reply 继承，显式变量可覆盖。`config`/`--help` 展示生效值（含主机），`remote check` 一行检测 SSH/rsync/程序版本，失败 75。
 
 环境、profile、依赖与限制见 [runtime.md](runtime.md)。
 
 ## 用户与仓库配置
 
-用户配置 `${XDG_CONFIG_HOME}/delegate/config.json` 支持 `remote`、`agentDeny`、`measure`、`measureCpus`、`env`、`maxRework`、默认 `accept`/`acceptTimeout`/`evidence`、`maxActive`、`maxHeavy`、`repoMaxActive`、`models`/`tiers`/`thinking`、`sourceBuild.paths`、`standing`、`defaults`、`resultChars`、`cleanupKeepExecutables`。仓库根 `.delegate.json` 使用相同字段并保存仓库事实。
+用户配置 `${XDG_CONFIG_HOME}/delegate/config.json` 支持 `remote`、`agentDeny`、`measure`、`measureCpus`、`env`、`maxRework`、默认 `accept`/`acceptTimeout`/`evidence`、`maxActive`、`maxHeavy`、`repoMaxActive`、`models`/`tiers`/`thinking`、`sourceBuild.paths`、`standing`、`defaults`、`resultChars`、`cleanupKeepExecutables`、`agy`。仓库根 `.delegate.json` 使用相同字段并保存仓库事实。
 
 `measure` 是 argv 前缀数组，例如 `{"measure":[["cargo","xtask","bench-concurrency"]]}`；仓库配置覆盖用户配置。`measureCpus` 是预约核列表（如 `"8-11"`），未设置时取最后 `max(2, nproc/3)` 个在线逻辑核。匹配的同事、验收、证据和 lane 命令自动排队到机器级测量预约；预约开始时在跑的 lane 命令会让出预约核，预约期间普通 lane 命令使用其余核。
 
@@ -25,7 +25,7 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 - 模型选择独立为 `tiers.scout/review/write` 用途、`models` 登记别名与 `thinking` 长度；models/tiers 按键合并。模型全集只来自登记表，Pi 仅校验与提供能力；旧档与模型 thinking 后缀不兼容。匹配、规则、优先级、图片守卫、agy 同事与迁移见 [用途、模型与思维长度](model-routing.md)。
 - 任务测试用可重复的 `--accept-also COMMAND`，按顺序以 `&&` 追加到生效的 `--accept` 或配置默认（无基础命令则单独运行）；与 `--no-accept` 冲突退出 2。`--accept` 替换非空且不同的默认命令时，start 提示原命令与追加用法；meta 的 `accept` 与 summary 的 `accept.command` 记录最终命令。
 - `env` 按键合并，仓库优先；`agentDeny` 按 `(argv, exact)` 去重，省略 `exact` 等于 `false`；仓库同键 hint 覆盖用户值，保留原顺序。仓库 `{"argv":["cargo","xtask","check"],"exact":true,"allow":true}` 撤销完全相同 argv 且 exact 相同的一条用户规则，无需 hint；不撤销不同 exact 或其他前缀规则，用户配置不能声明 `allow: true`。
-- `sourceBuild` 整个对象按仓库 > 用户 > 内置默认覆盖；`{"sourceBuild":{"paths":["target","build"]}}` 指定相对源仓库根的构建目录，替换默认的 Cargo.toml → target 探测，`paths: []` 关闭。两份配置的绝对路径、越界路径及外部符号链接独立报错（文件与 `sourceBuild.paths[index]`，退出 2），不存在的目录可配置。启动保存设置，reply 用当前配置；仅写入收尾测一次，提示阈值只用 `DELEGATE_SOURCE_BUILD_WARN_GIB`（默认 60 GiB，0 关闭），不从 config.env 读取提示阈值，与 worktree 阈值来源一致。缓存与输出见 [清理](cleanup.md)。
+- `sourceBuild` 整个对象按仓库 > 用户 > 内置默认覆盖；`{"sourceBuild":{"paths":["target","build"]}}` 指定相对源仓库根的构建目录，替换默认的 Cargo.toml → target 探测，`paths: []` 关闭。两份配置的绝对路径、越界路径及外部符号链接独立报错（文件与 `sourceBuild.paths[index]`，退出 2），不存在的目录可配置。启动保存设置，reply 用当前配置；仅写入收尾测一次，提示阈值只用 `DELEGATE_SOURCE_BUILD_WARN_GIB`（默认 60 GiB，0 关闭）。缓存与输出见 [清理](cleanup.md)。
 - `standing` 是固定说明：字符串、字符串数组，或 `{"all":"通用规矩","write":["写入规矩"],"readOnly":"只读规矩"}`；前两种等价于 `all`。按字段仓库覆盖用户，任务末尾附 `all` 与模式字段，再列生效的 deny 命令、匹配方式与 hint。启动回显附加行数及配置层，JSON 的 `standing`/`standingSources` 保存实际文字与来源；普通 reply 沿用会话，回显零行，`--fresh` 读取当前配置并附加。
 - `defaults` 按字段仓库覆盖用户，支持 `worktree`、`keepCommits`（布尔）、`protect`/`acceptAlso`（字符串数组）、`timeout`（时长字符串）、`evidence`（命令字符串）；`keepCommits` 默认 false，CLI `apply --keep-commits` 可按次开启。启动选项的 CLI 显式值覆盖默认；`start`/`reply` 的 `--allow <path>` 可重复，只能在生效保护范围内按次开放文件/子目录（目录以 `/` 结尾，现存目录可省略），启动回显，任务说明列剩余保护与本次例外，收尾不将开放路径判违规；不改配置，后续 reply/fresh 继承。正文提及未开放的受保护路径时仅提示补 `--allow` 并在 `status`/`wait` 标记，不拦截。`worktree.cleanOnApply`（默认 true）控制 `apply` 成功后是否归档并删除 worktree。
 - `resources` 按资源名仓库覆盖用户，例如 `{"pg":{"commands":[["cargo","xtask","infra-test"]]}}`；argv 逐项前缀匹配同 `agentDeny`。匹配命令开始执行时登记，结束删除；`busy` 也按 `/proc` 进程身份剔除已消失记录。只查询占用，不排队、不加锁；同事、验收和 lane 均登记。
@@ -66,3 +66,4 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 
 - `stall`：`{"idle":"30m","command":"90m"}`，单项 `"0"` 关闭；环境变量 `DELEGATE_STALL_IDLE` / `DELEGATE_STALL_COMMAND` 优先。
 - `checkIn`：wait 检查线时长，`"0"` 关闭；`DELEGATE_CHECK_IN` 优先。未设置时 Claude Code 使用 50m，其它调用方不设默认。
+- `agy`：`{"agent":"aia"}` 为 agy 同事附加 `--agent <名>`（新会话、续做与 `probe` 生效），名称非空且无空白/控制字符，未设不变。

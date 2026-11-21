@@ -71,6 +71,16 @@ pub fn read_file(path: &Path) -> Res<Option<Value>> {
 pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
     let check = || -> Res<()> {
         crate::remote::validate(value.get("remote"), repo)?;
+        if let Some(v) = value.get("agy") {
+            let map = v.as_object().ok_or("agy must be an object")?;
+            if map.keys().any(|key| key != "agent") {
+                return Err("agy has unknown fields".into());
+            }
+            if let Some(agent) = map.get("agent") {
+                let name = agent.as_str().ok_or("agy.agent must be a string")?;
+                crate::agy::validate_agent(name)?;
+            }
+        }
         if let Some(v) = value.get("stall") {
             let map = v.as_object().ok_or("stall must be an object")?;
             for key in ["idle", "command"] {
@@ -351,6 +361,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         "acceptBlind",
         "stall",
         "checkIn",
+        "agy",
         "measure",
         "measureCpus",
     ] {
@@ -573,4 +584,28 @@ fn validate_tier(tier: &str, value: &Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_agy_agent_accepts_valid_and_rejects_bad_values() {
+        let p = Path::new("config.json");
+        assert!(validate(&json!({}), p, false).is_ok());
+        assert!(validate(&json!({"agy": {}}), p, false).is_ok());
+        assert!(validate(&json!({"agy": {"agent": "aia"}}), p, false).is_ok());
+        for bad in [
+            json!({"agy": "aia"}),
+            json!({"agy": {"extra": "x"}}),
+            json!({"agy": {"agent": 1}}),
+            json!({"agy": {"agent": ""}}),
+            json!({"agy": {"agent": "a b"}}),
+            json!({"agy": {"agent": "a\nb"}}),
+        ] {
+            let err = validate(&bad, p, false).unwrap_err();
+            assert!(err.contains("agy"), "expected agy error, got {err}");
+        }
+    }
 }
