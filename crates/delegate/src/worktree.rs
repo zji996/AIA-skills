@@ -283,6 +283,7 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<Option<String>> {
     }
     let commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
     write(run.join("worktree-base-commit"), &commit)?;
+    crate::refs::pin_slot(run, meta, "worktree-base", &commit);
     let managed: Vec<String> = strings(&cfg["copy"])
         .into_iter()
         .chain(strings(&cfg["link"]))
@@ -754,7 +755,11 @@ pub fn detect_applied(run: &Path, meta: &Value) -> bool {
             large_hashes.insert(path.clone(), entry["hash"].clone());
         }
     }
-    write_json(run.join(".applied"), &json!({"at":iso(),"tree":rec["after"],"large":rec["afterLarge"],"largeHashes":large_hashes,"appliedBy":"detected"})).is_ok()
+    let ok = write_json(run.join(".applied"), &json!({"at":iso(),"tree":rec["after"],"large":rec["afterLarge"],"largeHashes":large_hashes,"appliedBy":"detected"})).is_ok();
+    if ok {
+        crate::refs::pin_slot(run, meta, "applied", s(&rec, "after"));
+    }
+    ok
 }
 /// Active write runs whose source tree is `top`, as (name, in place). Used to
 /// keep the source free for `apply` (field notes 22).
@@ -1044,7 +1049,9 @@ pub fn sync(run: &Path, meta: &Value, agent: bool) -> Res<(Vec<String>, Vec<Stri
     let mut chain = run.to_path_buf();
     loop {
         write_json(chain.join(".sync-base"), &state)?;
-        let parent = s(&json(chain.join("meta.json")), "parent").to_string();
+        let chain_meta = json(chain.join("meta.json"));
+        crate::refs::pin_slot(&chain, &chain_meta, "sync-base", s(&current_source, "tree"));
+        let parent = s(&chain_meta, "parent").to_string();
         if parent.is_empty()
             || !chain
                 .parent()
@@ -1150,6 +1157,15 @@ fn reject_existing_markers(run: &Path, meta: &Value, keep_commits: bool) -> Res<
     } else {
         s(meta, "chainBase")
     };
+    let missing = crate::refs::missing_in_top(
+        &top,
+        run,
+        meta,
+        &[("base", before), ("after", &after)],
+    );
+    if !missing.is_empty() {
+        return Err(crate::refs::recovery_message(run, meta, &missing));
+    }
     let mut changes = tree_changes(
         &top,
         &json!({"tree":before,"large":applied["large"]}),
@@ -1176,10 +1192,16 @@ fn reject_existing_markers(run: &Path, meta: &Value, keep_commits: bool) -> Res<
     if keep_commits {
         let worktree = Path::new(s(&meta["worktree"], "path"));
         let base = read(run.join("worktree-base-commit"));
-        if worktree.is_dir() && !base.trim().is_empty() {
+        let base = base.trim();
+        if worktree.is_dir() && !base.is_empty() {
+            let missing =
+                crate::refs::missing_in_top(worktree, run, meta, &[("worktree-base", base)]);
+            if !missing.is_empty() {
+                return Err(crate::refs::recovery_message(run, meta, &missing));
+            }
             for hash in git_text(
                 worktree,
-                &["log", "--format=%H", &format!("{}..HEAD", base.trim())],
+                &["log", "--format=%H", &format!("{base}..HEAD")],
             )?
             .lines()
             {
@@ -1320,6 +1342,11 @@ fn apply_checked(
     let worktree = Path::new(s(&meta["worktree"], "path"));
     let base = read(run.join("worktree-base-commit")).trim().to_string();
     let commits = if !base.is_empty() && worktree.is_dir() {
+        let missing =
+            crate::refs::missing_in_top(worktree, run, &meta, &[("worktree-base", &base)]);
+        if !missing.is_empty() {
+            return Err(crate::refs::recovery_message(run, &meta, &missing));
+        }
         let log = git_text(
             worktree,
             &[
@@ -1397,6 +1424,7 @@ fn apply_checked(
             if code == 0 {
                 let state = json!({"at":iso(),"tree":s(&meta["base"],"tree")});
                 write_json(run.join(".applied"), &state)?;
+                crate::refs::pin_slot(run, &meta, "applied", s(&meta["base"], "tree"));
             }
             code
         }
@@ -1818,6 +1846,15 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
             large = now["large"].clone();
         }
     }
+    let missing = crate::refs::missing_in_top(
+        &top,
+        run,
+        &meta,
+        &[("base", &before), ("after", &after)],
+    );
+    if !missing.is_empty() {
+        return Err(crate::refs::recovery_message(run, &meta, &missing));
+    }
     let mut changes = tree_changes(
         &top,
         &json!({"tree":before,"large":applied["large"]}),
@@ -2216,7 +2253,13 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
         loop {
             write_json(chain.join(".applied"), &state)?;
             write_json(chain.join(".sync-base"), &state)?;
-            let parent = s(&json(chain.join("meta.json")), "parent").to_string();
+            let chain_meta = json(chain.join("meta.json"));
+            crate::refs::pin_slots(
+                &chain,
+                &chain_meta,
+                &[("applied", &after), ("sync-base", &after)],
+            );
+            let parent = s(&chain_meta, "parent").to_string();
             if parent.is_empty()
                 || !chain
                     .parent()

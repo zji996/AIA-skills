@@ -504,9 +504,33 @@ pub fn human(run: &Path, status: &Value) -> String {
     if !blind.is_empty() {
         parts.push(blind);
     }
+    if let Some(missing) = status["missingObjects"]
+        .as_array()
+        .filter(|items| !items.is_empty())
+    {
+        let list = missing
+            .iter()
+            .map(|item| {
+                let sha = s(item, "sha");
+                format!("{}={}", s(item, "ref"), &sha[..sha.len().min(12)])
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("快照对象已丢失（{list}，可能被 git prune 清理）"));
+    }
     let id = s(status, "run");
     let next = if b(status, "cleaned") {
         format!("证据归档：{}", s(status, "archive"))
+    } else if status["missingObjects"]
+        .as_array()
+        .is_some_and(|items| !items.is_empty())
+    {
+        let recovery = s(status, "recovery");
+        if recovery.is_empty() {
+            s(status, "next").to_string()
+        } else {
+            recovery.to_string()
+        }
     } else if runs::active(state) {
         format!("等待交付：delegate wait {id}")
     } else if b(status, "applied") && s(status, "appliedBy") == "detected" {

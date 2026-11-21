@@ -19,6 +19,7 @@ mod process_match;
 mod pending_reply;
 mod source_guard;
 mod queue;
+mod refs;
 mod resources;
 mod remote;
 mod runs;
@@ -254,6 +255,8 @@ fn format_status(status: serde_json::Value) -> String {
         "warnings",
         "warning",
         "error",
+        "missingObjects",
+        "recovery",
         "last",
         "idleSeconds",
         "result",
@@ -1227,6 +1230,16 @@ fn diff(args: &[String]) -> Res<i32> {
     if has(&flags, "--total") {
         before = s(&meta, "chainBase").into();
     }
+    let before_label = if has(&flags, "--total") { "chain-base" } else { "base" };
+    let missing = refs::missing_in_top(
+        &top,
+        &run,
+        &meta,
+        &[(before_label, &before), ("after", &after)],
+    );
+    if !missing.is_empty() {
+        return Err(refs::recovery_message(&run, &meta, &missing));
+    }
     let mut cmd = git_command();
     cmd.arg("-C").arg(&top).args([
         "diff",
@@ -1397,6 +1410,7 @@ fn apply(args: &[String]) -> Res<i32> {
                     if run.join(".sync-base").is_file() {
                         let _ = write(other.join(".sync-base"), read(run.join(".sync-base")));
                     }
+                    refs::pin_run(&other, &other_meta);
                 }
             }
         }
@@ -1556,6 +1570,10 @@ fn main_inner(args: &[String]) -> Res<i32> {
         let real = rest.get(1).ok_or("missing measured executable")?;
         return measure::execute_argv(Path::new(run), real, &rest[2..]);
     }
+    if command == "_process-match" {
+        return process_match::command(rest);
+    }
+    refs::backfill_all();
     match command.as_str() {
         "start" | "run" => {
             let o = launch::parse_launch(rest, false, command == "run")?;
@@ -1878,7 +1896,6 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "clean" => clean(rest),
         "tiers" => tiers(rest),
         "fit" => fit::command(rest),
-        "_process-match" => process_match::command(rest),
         "probe" => probe::command(rest),
         "protocol" => {
             if let Some(arg) = rest.first() {

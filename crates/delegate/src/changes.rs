@@ -396,6 +396,7 @@ pub fn record(meta: &Value, run: &Path) -> Option<(Vec<Value>, Value)> {
     let changes = tree_changes(top, base, &after, meta["worktree"].is_object()).ok()?;
     let recorded = json!({"base":s(base,"tree"),"after":s(&after,"tree"),"top":top,"afterLarge":after["large"],"changes":changes});
     write_json(run.join("changes.json"), &recorded).ok()?;
+    crate::refs::pin_slot(run, meta, "after", s(&after, "tree"));
     let patch = git(
         top,
         &[

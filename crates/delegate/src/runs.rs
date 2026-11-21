@@ -63,7 +63,9 @@ fn all_runs_roots() -> Vec<PathBuf> {
 pub fn resolve(reference: &str) -> Res<PathBuf> {
     let path = Path::new(reference);
     if path.join("meta.json").is_file() {
-        return path.canonicalize().map_err(|e| e.to_string());
+        let resolved = path.canonicalize().map_err(|e| e.to_string())?;
+        crate::refs::backfill_one(&resolved);
+        return Ok(resolved);
     }
     let root = runs_root();
     let runs = all_runs();
@@ -678,6 +680,17 @@ pub fn status(run: &Path) -> Value {
     if let Some(step) = next_step(run, &meta, &st, &sum) {
         out["next"] = json!(step);
     }
+    if !run.join(".applied-cleaned").exists() && !crate::archive::is_record(run) {
+        let missing = crate::refs::missing_objects(run, &meta);
+        if !missing.is_empty() {
+            out["missingObjects"] = json!(missing
+                .iter()
+                .map(|(slot, sha)| json!({"ref": slot, "sha": sha}))
+                .collect::<Vec<_>>());
+            out["recovery"] = json!(crate::refs::recovery_hint(run, &meta));
+            out["next"] = json!(crate::refs::recovery_message(run, &meta, &missing));
+        }
+    }
     out["dir"] = json!(run.to_string_lossy());
     out
 }
@@ -694,6 +707,7 @@ pub fn unmerged(run: &Path) -> bool {
 pub fn remove(run: &Path) -> (usize, crate::cleanup::Containers) {
     let meta = json(run.join("meta.json"));
     let path = s(&meta["worktree"], "path").to_string();
+    crate::refs::delete_run(run, &meta);
     let stopped = crate::cleanup::record(run, 0);
     let _ = fs::remove_dir_all(run);
     let containers = if !path.is_empty()
@@ -766,6 +780,7 @@ pub fn remove_after_apply(run: &Path) -> Vec<String> {
         ".applied",
         ".delivered",
         ".truncated",
+        ".refs-pinned",
     ];
     if let Ok(entries) = fs::read_dir(run) {
         for entry in entries.flatten() {

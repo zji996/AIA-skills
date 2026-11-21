@@ -198,6 +198,7 @@
 - 不带参 `status` 只列未结束、24 小时内结束未清理与本会话起的 run，更早未清理汇总一行（个数、空间、清理命令），`--all` 列全部。Default scoped status with older uncleaned summary and `--all`.
 - `apply` 成功且归档写好后按 `worktree.cleanOnApply`（默认 true）自动删除 worktree 并保留归档，reply 续做链等整条链都合入后再清。Auto-clean worktree on apply controlled by `worktree.cleanOnApply`.
 - 远程验收同步托管 `worktree.copy` 与 `worktree.link`（远端同路径直接链接，小目录同步），超限且远端缺失时验收自动回退本地并写明原因；SSH 断线仍失败关闭。Remote/local acceptance equivalence for managed copy and link paths.
+- 源仓库执行 `git prune --expire=now` 后 `diff`/`apply` 仍可用：run 依赖对象钉在 `refs/delegate/<run-id>/*` 下，`clean` 时移除、`cleanOnApply` 仅清 worktree 时保留；旧 run 升级自动补写 ref，对象已丢时 `status`/`diff` 给 `git -C <worktree> diff HEAD`（未跟踪文件先 `add -N`）救回命令；hook 拦截危险 prune/gc/reflog/repack 并放行普通 `git gc`。Pin run Git objects under `refs/delegate/` and guard against immediate git prune.
 
 ## 6.20 使用摩擦回归 / Usage friction
 

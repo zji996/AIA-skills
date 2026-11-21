@@ -536,6 +536,7 @@ pub fn finish_run(run: &std::path::Path, mut summary: serde_json::Value, code: i
     }
     summary["finishedAt"] = serde_json::json!(iso());
     write_json(run.join("summary.json"), &summary)?;
+    crate::refs::mark_finished(run);
     write(run.join("exit_code"), format!("{code}\n"))
 }
 

@@ -919,6 +919,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         meta["chainBase"] = base["tree"].clone();
         meta["base"] = base;
         write_json(run.join("meta.json"), &meta)?;
+        crate::refs::pin_run(run, &meta);
     }
     if run.join(".waiting").exists() {
         if !run.join("queue.json").is_file() {

@@ -16,9 +16,12 @@ Anchored (`^`) and exact (`-x`) patterns are allowed. This rule covers backgroun
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
+import subprocess
 import sys
+from pathlib import Path
 
 INVOKE = r"(?:\S*/bin/delegate|\$\{?D\}?)"
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
@@ -35,6 +38,17 @@ SELF_MATCH_REASON = (
     "(`pgrep -x cargo`). To wait for a background command, do not poll: its completion "
     "notification arrives by itself; otherwise wait on a PID (`tail --pid=$pid -f /dev/null`) "
     "or a marker line in a log file.")
+PRUNE_REASON = (
+    "`{call}` immediately deletes unreachable Git objects that uncleaned delegate runs depend on "
+    "(needed by diff/apply); pinned refs under `refs/delegate/` make plain `git gc` safe, and "
+    "to clear git's `run 'git prune'` notice you can just remove `.git/gc.log` instead.")
+GIT_GLOBAL_ARG_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace",
+                       "--super-prefix", "--exec-path", "--config-env", "--list-cmds"}
+REPACK_ARG_OPTS = {"--window", "--window-memory", "--depth", "--threads", "--max-pack-size",
+                   "--max-cruft-size", "--filter", "--keep-pack", "--geometric", "-g",
+                   "--expire-to", "--filter-to"}
+PREFIX_KEYWORDS = {"!", "do", "then", "else", "elif", "if", "until", "while", "{",
+                   "time", "exec", "command", "sudo"}
 
 
 def strip_heredocs(command: str) -> str:
@@ -175,6 +189,293 @@ def deny(reason: str) -> int:
     return 0
 
 
+def _is_immediate_expire(value: str) -> bool:
+    return value.strip().lower() in {"now", "all", "0", "0.seconds.ago", "0 seconds ago"}
+
+
+def _repo_has_delegate(repo_dir: str, git_dir: str | None) -> bool:
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    top: Path | None = None
+    common: Path | None = None
+    try:
+        if git_dir:
+            gd = os.path.normpath(os.path.join(repo_dir, os.path.expanduser(git_dir)))
+            res = subprocess.run(
+                ["git", "--git-dir", gd, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                capture_output=True, text=True, env=env, timeout=2,
+            )
+            if res.returncode != 0 or not res.stdout.strip():
+                return False
+            common = Path(res.stdout.strip())
+            top_res = subprocess.run(
+                ["git", "--git-dir", gd, "rev-parse", "--path-format=absolute", "--show-toplevel"],
+                capture_output=True, text=True, env=env, timeout=2,
+            )
+            if top_res.returncode == 0 and top_res.stdout.strip():
+                top = Path(top_res.stdout.strip())
+        else:
+            d = os.path.normpath(os.path.expanduser(repo_dir))
+            if not os.path.isdir(d):
+                return False
+            res = subprocess.run(
+                ["git", "-C", d, "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"],
+                capture_output=True, text=True, env=env, timeout=2,
+            )
+            if res.returncode == 0 and len(res.stdout.splitlines()) >= 2:
+                lines = res.stdout.splitlines()
+                top, common = Path(lines[0]), Path(lines[1])
+            else:
+                res2 = subprocess.run(
+                    ["git", "-C", d, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                    capture_output=True, text=True, env=env, timeout=2,
+                )
+                if res2.returncode != 0 or not res2.stdout.strip():
+                    return False
+                common = Path(res2.stdout.strip())
+        if top is not None and (top / ".local/run/delegate").exists():
+            return True
+        if common.name == ".git" and (common.parent / ".local/run/delegate").exists():
+            return True
+        refs = subprocess.run(
+            ["git", "--git-dir", str(common), "for-each-ref", "--count=1", "refs/delegate/"],
+            capture_output=True, text=True, env=env, timeout=2,
+        )
+        return refs.returncode == 0 and bool(refs.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _is_dangerous_git(subcmd: str, args: list[str], configs: dict[str, str]) -> bool:
+    if subcmd == "help":
+        return False
+    # Check help flags before "--".
+    before_dd = args[:args.index("--")] if "--" in args else args
+    if "-h" in before_dd or "--help" in before_dd:
+        return False
+    if subcmd == "prune":
+        for arg in before_dd:
+            if arg == "--dry-run" or (arg.startswith("-") and not arg.startswith("--") and "n" in arg[1:]):
+                return False
+        return True
+    if subcmd == "gc":
+        prune_mode: str | None = configs.get("gc.pruneexpire")
+        i = 0
+        while i < len(before_dd):
+            arg = before_dd[i]
+            if arg == "--no-prune":
+                prune_mode = "no"
+            elif arg == "--prune":
+                if i + 1 < len(before_dd) and _is_immediate_expire(before_dd[i + 1]):
+                    prune_mode = before_dd[i + 1]
+                    i += 1
+                else:
+                    prune_mode = "default"
+            elif arg.startswith("--prune="):
+                prune_mode = arg.split("=", 1)[1]
+            i += 1
+        return prune_mode is not None and prune_mode != "no" and _is_immediate_expire(prune_mode)
+    if subcmd == "reflog":
+        if not args:
+            return False
+        action = None
+        rest_start = 0
+        for idx, arg in enumerate(args):
+            if not arg.startswith("-"):
+                action = arg
+                rest_start = idx + 1
+                break
+        if action != "expire":
+            return False
+        rest = args[rest_start:]
+        rest_dd = rest[:rest.index("--")] if "--" in rest else rest
+        if "-h" in rest_dd or "--help" in rest_dd:
+            return False
+        dry_run = False
+        expire_unreachable: str | None = configs.get("gc.reflogexpireunreachable")
+        i = 0
+        while i < len(rest_dd):
+            arg = rest_dd[i]
+            if arg == "--dry-run" or (arg.startswith("-") and not arg.startswith("--") and "n" in arg[1:]):
+                dry_run = True
+            elif arg == "--no-dry-run":
+                dry_run = False
+            elif arg == "--expire-unreachable" and i + 1 < len(rest_dd):
+                expire_unreachable = rest_dd[i + 1]
+                i += 1
+            elif arg.startswith("--expire-unreachable="):
+                expire_unreachable = arg.split("=", 1)[1]
+            elif arg == "--expire" and i + 1 < len(rest_dd):
+                i += 1
+            i += 1
+        return not dry_run and expire_unreachable is not None and _is_immediate_expire(expire_unreachable)
+    if subcmd == "repack":
+        pack_all = False
+        pack_loosen = False
+        delete_redundant = False
+        keep_unreachable = False
+        cruft = False
+        unpack_unreachable: str | None = None
+        cruft_expiration: str | None = None
+        explicit_prune = False
+        i = 0
+        while i < len(before_dd):
+            arg = before_dd[i]
+            if arg == "--keep-unreachable":
+                keep_unreachable = True
+            elif arg == "--no-keep-unreachable":
+                keep_unreachable = False
+            elif arg == "--cruft":
+                cruft = True
+            elif arg == "--no-cruft":
+                cruft = False
+            elif arg == "--unpack-unreachable" and i + 1 < len(before_dd):
+                unpack_unreachable = before_dd[i + 1]
+                i += 1
+            elif arg.startswith("--unpack-unreachable="):
+                unpack_unreachable = arg.split("=", 1)[1]
+            elif arg == "--no-unpack-unreachable":
+                unpack_unreachable = None
+            elif arg == "--cruft-expiration" and i + 1 < len(before_dd):
+                cruft_expiration = before_dd[i + 1]
+                i += 1
+            elif arg.startswith("--cruft-expiration="):
+                cruft_expiration = arg.split("=", 1)[1]
+            elif arg == "--no-cruft-expiration":
+                cruft_expiration = None
+            elif arg == "--prune" or arg.startswith("--prune="):
+                explicit_prune = True
+            elif arg in REPACK_ARG_OPTS and i + 1 < len(before_dd):
+                i += 1
+            elif arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
+                flags = arg[1:]
+                if "a" in flags:
+                    pack_all = True
+                if "A" in flags:
+                    pack_loosen = True
+                if "d" in flags:
+                    delete_redundant = True
+                if "k" in flags:
+                    keep_unreachable = True
+            i += 1
+        if explicit_prune:
+            return True
+        if not delete_redundant:
+            return False
+        if pack_all and not keep_unreachable and not cruft:
+            return True
+        if pack_loosen and unpack_unreachable is not None and _is_immediate_expire(unpack_unreachable):
+            return True
+        if cruft and cruft_expiration is not None and _is_immediate_expire(cruft_expiration):
+            return True
+        return False
+    return False
+
+
+def dangerous_git_prune(command: str, base_cwd: str) -> str | None:
+    """Return the first Git command that immediately drops unreachable objects in a delegate repo."""
+    try:
+        lexer = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in SEPARATORS:
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(token)
+    if current:
+        segments.append(current)
+    current_dir = base_cwd
+    for seg in segments:
+        idx = 0
+        env_git_dir: str | None = None
+        while idx < len(seg):
+            tok = seg[idx]
+            if tok in PREFIX_KEYWORDS:
+                idx += 1
+                continue
+            if tok == "env":
+                idx += 1
+                while idx < len(seg):
+                    if seg[idx] in ("-u", "--unset", "-C", "--chdir") and idx + 1 < len(seg):
+                        idx += 2
+                    elif seg[idx] == "--":
+                        idx += 1
+                        break
+                    elif seg[idx].startswith("-"):
+                        idx += 1
+                    elif ASSIGNMENT.fullmatch(seg[idx]):
+                        if seg[idx].startswith("GIT_DIR="):
+                            env_git_dir = seg[idx].split("=", 1)[1]
+                        idx += 1
+                    else:
+                        break
+                continue
+            if ASSIGNMENT.fullmatch(tok):
+                if tok.startswith("GIT_DIR="):
+                    env_git_dir = tok.split("=", 1)[1]
+                idx += 1
+                continue
+            break
+        if idx >= len(seg):
+            continue
+        cmd = seg[idx].rsplit("/", 1)[-1]
+        if cmd == "cd":
+            for arg in seg[idx + 1:]:
+                if arg in ("-L", "-P", "--"):
+                    continue
+                if arg and arg != "-" and not arg.startswith("$"):
+                    current_dir = os.path.normpath(os.path.join(current_dir, os.path.expanduser(arg)))
+                break
+            continue
+        if cmd in ("sh", "bash"):
+            for k in range(idx + 1, len(seg) - 1):
+                if seg[k] in ("-c", "-lc", "-ec", "-xc"):
+                    nested = dangerous_git_prune(seg[k + 1], current_dir)
+                    if nested:
+                        return nested
+                    break
+            continue
+        if cmd != "git":
+            continue
+        repo_dir = current_dir
+        git_dir = env_git_dir
+        configs: dict[str, str] = {}
+        j = idx + 1
+        while j < len(seg) and seg[j].startswith("-"):
+            opt = seg[j]
+            if opt == "-C" and j + 1 < len(seg):
+                repo_dir = os.path.normpath(os.path.join(repo_dir, os.path.expanduser(seg[j + 1])))
+                j += 2
+            elif opt == "-c" and j + 1 < len(seg):
+                if "=" in seg[j + 1]:
+                    k, v = seg[j + 1].split("=", 1)
+                    configs[k.strip().lower()] = v
+                j += 2
+            elif opt == "--git-dir" and j + 1 < len(seg):
+                git_dir = seg[j + 1]
+                j += 2
+            elif opt.startswith("--git-dir="):
+                git_dir = opt.split("=", 1)[1]
+                j += 1
+            elif opt in GIT_GLOBAL_ARG_OPTS and j + 1 < len(seg):
+                j += 2
+            else:
+                j += 1
+        if j >= len(seg):
+            continue
+        subcmd = seg[j]
+        subargs = seg[j + 1:]
+        if _is_dangerous_git(subcmd, subargs, configs) and _repo_has_delegate(repo_dir, git_dir):
+            return " ".join(seg[idx:])
+    return None
+
+
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
@@ -187,6 +488,9 @@ def main() -> int:
     call = self_matching_pgrep(command)
     if call:
         return deny(SELF_MATCH_REASON.format(call=call))
+    prune_call = dangerous_git_prune(command, str(payload.get("cwd") or os.getcwd()))
+    if prune_call:
+        return deny(PRUNE_REASON.format(call=prune_call))
     if tool_input.get("run_in_background"):
         return 0
     calls, mixed = blocking_calls(command)

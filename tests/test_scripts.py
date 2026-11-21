@@ -634,6 +634,113 @@ class ScriptTests(unittest.TestCase):
         for command in allow:
             self.assertEqual(decision(command, background=True), "allow", command)
 
+    def test_background_hook_denies_git_prune_in_delegate_repos_and_allows_safe_gc(self):
+        def init_repo(name):
+            repo = self.work / name
+            repo.mkdir()
+            subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+            (repo / "a.txt").write_text("v1\n")
+            subprocess.run(["git", "-C", str(repo), "add", "a.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "init"], check=True)
+            return repo
+
+        repo_runs = init_repo("repo-runs")
+        (repo_runs / ".local/run/delegate").mkdir(parents=True)
+
+        repo_refs = init_repo("repo-refs")
+        tree = subprocess.check_output(
+            ["git", "-C", str(repo_refs), "rev-parse", "HEAD^{tree}"], text=True
+        ).strip()
+        subprocess.run(
+            ["git", "-C", str(repo_refs), "update-ref", "refs/delegate/r1/base", tree],
+            check=True,
+        )
+
+        repo_plain = init_repo("repo-plain")
+
+        def run_hook(command, cwd, background=False):
+            payload = json.dumps({
+                "cwd": str(cwd),
+                "tool_name": "Bash",
+                "tool_input": {"command": command, "run_in_background": background},
+            })
+            result = subprocess.run(
+                [sys.executable, str(BACKGROUND_HOOK)],
+                input=payload, cwd=str(cwd), capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if not result.stdout:
+                return "allow", ""
+            out = json.loads(result.stdout)["hookSpecificOutput"]
+            return out["permissionDecision"], out["permissionDecisionReason"]
+
+        deny_cmds = [
+            "git prune",
+            "git prune --expire=now",
+            "git prune -v",
+            "git gc --prune=now",
+            "git gc --prune=all",
+            "git -c gc.pruneExpire=now gc",
+            "git reflog expire --expire-unreachable=now --all",
+            "git reflog expire --expire-unreachable=all HEAD",
+            "git reflog expire --expire-unreachable now --all",
+            "git repack -a -d",
+            "git repack -ad",
+            "git repack -a -d --prune",
+            "git repack -A -d --unpack-unreachable=now",
+            "git repack --cruft -d --cruft-expiration=all",
+            "bash -c 'git prune'",
+        ]
+        allow_cmds = [
+            "git gc",
+            "git gc --auto",
+            "git gc --aggressive",
+            "git gc --no-prune",
+            "git gc --prune=2.weeks.ago",
+            "git prune -n",
+            "git prune --dry-run",
+            "git prune --help",
+            "git worktree prune",
+            "git remote prune origin",
+            "git prune-packed",
+            "git reflog expire --expire=90.days.ago --all",
+            "git reflog expire --dry-run --expire-unreachable=now --all",
+            "git repack -d",
+            "git repack -a",
+            "git repack -A -d",
+            "git repack -a -d -k",
+            "git repack -ad --keep-unreachable",
+            "git repack --cruft -d",
+            'git commit -m "never run git prune or git gc --prune=now"',
+            "cat > note.md <<'EOF'\ngit prune\nEOF",
+        ]
+
+        for repo in (repo_runs, repo_refs):
+            for cmd in deny_cmds:
+                dec, reason = run_hook(cmd, repo, background=True)
+                self.assertEqual(dec, "deny", f"{repo.name}: {cmd}")
+                self.assertIn("refs/delegate/", reason)
+                self.assertIn("git gc", reason)
+                self.assertIn(".git/gc.log", reason)
+            for cmd in allow_cmds:
+                dec, _ = run_hook(cmd, repo)
+                self.assertEqual(dec, "allow", f"{repo.name}: {cmd}")
+
+        # Packed refs/delegate/ (after pack-refs --all) is still detected.
+        subprocess.run(["git", "-C", str(repo_refs), "pack-refs", "--all"], check=True)
+        self.assertEqual(run_hook("git prune", repo_refs)[0], "deny")
+
+        # Targeting a delegate repo from outside via -C, cd, or --git-dir is denied.
+        self.assertEqual(run_hook(f"git -C {shlex.quote(str(repo_runs))} prune", repo_plain)[0], "deny")
+        self.assertEqual(run_hook(f"cd {shlex.quote(str(repo_refs))} && git gc --prune=now", repo_plain)[0], "deny")
+        self.assertEqual(run_hook(f"git --git-dir={shlex.quote(str(repo_refs / '.git'))} prune", repo_plain)[0], "deny")
+
+        # Plain repo without .local/run/delegate or refs/delegate/ allows all prune commands.
+        for cmd in ("git prune", "git gc --prune=now", "git repack -a -d"):
+            self.assertEqual(run_hook(cmd, repo_plain)[0], "allow", cmd)
+
     def test_audit_exact_budget_overrides_a_glob_written_after_it(self):
         repo = self.git_repo()
         (repo / "AGENTS.md").write_text("ok")
