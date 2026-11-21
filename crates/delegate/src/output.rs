@@ -241,7 +241,7 @@ pub fn human(run: &Path, status: &Value) -> String {
         "timeout" => "超时",
         "stalled" => "卡住",
         "stopped" => "已停止",
-        "skipped" => "已跳过",
+        "needs-redispatch" => "需要重派",
         "malformed" => "答复畸形",
         "failed" => "失败",
         "crashed" => "进程异常",
@@ -381,18 +381,20 @@ pub fn human(run: &Path, status: &Value) -> String {
         parts.push(format!("等待测量预约，前面 {ahead} 个"));
     }
     if status["accept"].is_object() {
-        parts.push(
-            if b(&status["accept"], "notExecuted") {
-                "验收未执行（排队/基础设施）"
-            } else if b(status, "infrastructureFailure") {
-                "验收基础设施失败"
-            } else if b(&status["accept"], "ok") {
-                "验收通过"
-            } else {
-                "验收失败"
-            }
-            .into(),
-        );
+        let mut label = if b(&status["accept"], "notExecuted") {
+            "验收未执行（排队/基础设施）".to_string()
+        } else if b(status, "infrastructureFailure") {
+            "验收基础设施失败".to_string()
+        } else if b(&status["accept"], "ok") {
+            "验收通过".to_string()
+        } else {
+            "验收失败".to_string()
+        };
+        if status["accept"]["localFallback"].is_object() {
+            let reason = s(&status["accept"]["localFallback"], "reason");
+            label.push_str(&format!("（本地回退：{}）", clip(reason, 80)));
+        }
+        parts.push(label);
         // Excluded roots are managed links and unfetched reference submodules by
         // design; `--json` keeps them.
     } else if state == "answered" {
@@ -434,6 +436,25 @@ pub fn human(run: &Path, status: &Value) -> String {
             }
             .into(),
         );
+    }
+    if let Some(paths) = status["promptProtectedPaths"]
+        .as_array()
+        .filter(|p| !p.is_empty())
+    {
+        let list = paths
+            .iter()
+            .take(5)
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("、");
+        let flags = paths
+            .iter()
+            .take(5)
+            .filter_map(Value::as_str)
+            .map(|p| format!("--allow {}", shell_quote(p)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        parts.push(format!("正文提及保护路径：{list}（如需修改：{flags}）"));
     }
     if !status["readOnlyViolation"].is_null() || !status["workspaceChanged"].is_null() {
         parts.push(
@@ -491,7 +512,9 @@ pub fn human(run: &Path, status: &Value) -> String {
     } else if b(status, "applied") && s(status, "appliedBy") == "detected" {
         format!("清理：delegate clean {id}")
     } else if !s(status, "next").is_empty() {
-        if state == "skipped" || b(status, "infrastructureFailure") {
+        if b(status, "question") {
+            format!("回答提问：delegate reply {id} '<决定>'（不计返工）")
+        } else if state == "needs-redispatch" || b(status, "infrastructureFailure") {
             s(status, "next").to_string()
         } else if ["timeout", "stalled"].contains(&state) && s(status, "mode") == "write" {
             format!("改动保留，续做不计返工次数：{}", s(status, "next"))

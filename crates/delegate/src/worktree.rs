@@ -87,7 +87,32 @@ pub fn work_config(val: &Value, path: &Path) -> Res<Value> {
             }
         },
     }
+    match work.get("cleanOnApply") {
+        None | Some(Value::Null) => out["cleanOnApply"] = json!(true),
+        Some(Value::Bool(flag)) => out["cleanOnApply"] = json!(*flag),
+        Some(_) => {
+            return Err(format!(
+                "{}: worktree.cleanOnApply must be a boolean",
+                path.display()
+            ))
+        }
+    }
     Ok(out)
+}
+pub fn clean_on_apply(run: &Path) -> bool {
+    let meta = json(run.join("meta.json"));
+    let source = s(&meta["worktree"], "source");
+    if !source.is_empty() {
+        let file = Path::new(source).join(".delegate.json");
+        if let Ok(Some(cfg)) = crate::config::read_file(&file) {
+            if let Some(flag) = cfg["worktree"]["cleanOnApply"].as_bool() {
+                return flag;
+            }
+        }
+    }
+    meta["worktree"]["config"]["cleanOnApply"]
+        .as_bool()
+        .unwrap_or(true)
 }
 fn strings(v: &Value) -> Vec<String> {
     v.as_array()
@@ -1577,7 +1602,7 @@ pub fn run_verify(run: &Path, commands: &[String]) -> Value {
     let mut code = 0;
     for command in commands {
         let _ = writeln!(log, "$ {command}");
-        let (exit, timed) = crate::common::run_shell(
+        let (mut exit, mut timed) = crate::common::run_shell(
             (command, "verify"),
             Path::new(&cwd),
             run,
@@ -1587,6 +1612,30 @@ pub fn run_verify(run: &Path, commands: &[String]) -> Value {
             None,
         )
         .unwrap_or((1, false));
+        if exit == 75 {
+            let remote_status = json(run.join("verify.remote.json"));
+            if s(&remote_status, "stage") == "missing_managed" {
+                let reason = s(&remote_status, "reason").to_string();
+                let paths = remote_status["paths"].clone();
+                let _ = writeln!(
+                    log,
+                    "\n[remote missing managed paths: {reason}; rerunning verify locally]"
+                );
+                let _ = log.flush();
+                (exit, timed) = crate::common::run_shell_with(
+                    (command, "verify"),
+                    Path::new(&cwd),
+                    run,
+                    &meta["env"],
+                    meta["acceptTimeoutSeconds"].as_f64().unwrap_or(600.0),
+                    &mut log,
+                    None,
+                    true,
+                )
+                .unwrap_or((1, false));
+                result["localFallback"] = json!({"reason": reason, "paths": paths});
+            }
+        }
         let _ = writeln!(
             log,
             "{}\n[exit {exit}]",
@@ -1747,18 +1796,6 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
     if s(&meta, "mode") == "read-only" {
         return Err(format!(
             "{} is read-only; its worktree is a snapshot to read, with nothing to apply",
-            run.file_name().unwrap_or_default().to_string_lossy()
-        ));
-    }
-    let upstream = Path::new(s(&meta, "stackedOn"));
-    if !merge
-        && upstream.is_dir()
-        && !upstream.join(".applied").exists()
-        && !detect_applied(upstream, &json(upstream.join("meta.json")))
-    {
-        let id = upstream.file_name().unwrap_or_default().to_string_lossy();
-        return Err(format!(
-            "{} is built on {id}'s changes, which are not applied yet: apply {id} first, or pass --merge to apply this one alone / 本任务叠在 {id} 的改动上：先 apply {id}",
             run.file_name().unwrap_or_default().to_string_lossy()
         ));
     }

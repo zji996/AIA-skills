@@ -2084,14 +2084,26 @@ db.write_text(json.dumps(units))
         self.assertNotIn("--sync", calm["next"])
 
     def test_caller_is_written_for_start_run_reply_and_waiting_run(self):
-        self.fake_pi([answer("ok"), SETTLED])
+        self.fake_pi([answer("ok"), SETTLED],
+                     pre='if [ -f "$DELEGATE_RUN_DIR/block" ]; then while [ ! -f "$DELEGATE_RUN_DIR/go" ]; do sleep .02; done; fi')
         self.env["CLAUDE_CODE_SESSION_ID"] = "claude-session"
         first = self.outcome(self.cli("start", "--read-only", "task"))
         self.assertEqual(json.loads((Path(first["dir"]) / "meta.json").read_text())["caller"], "claude-session")
         self.env["DELEGATE_CALLER"] = "explicit-session"
-        waiting = self.outcome(self.cli("start", "--read-only", "--after", first["run"], "later"))
+        gate = self.work / "caller-gate"
+        self.fake_pi([answer("ok"), SETTLED], pre=f"while [ ! -f {gate} ]; do sleep .02; done")
+        self.env["DELEGATE_MAX_ACTIVE"] = "1"
+        blocker = self.outcome(self.cli("start", "--read-only", "blocker"))
+        self.addCleanup(self.cli, "stop", blocker["dir"])
+        waiting = self.outcome(self.cli("start", "--read-only", "later"))
+        self.addCleanup(self.cli, "stop", waiting["dir"])
         self.assertEqual(json.loads((Path(waiting["dir"]) / "meta.json").read_text())["caller"],
                          "explicit-session")
+        gate.touch()
+        self.assertEqual(self.cli("wait", blocker["run"]).returncode, 0)
+        self.assertEqual(self.cli("wait", waiting["run"]).returncode, 0)
+        del self.env["DELEGATE_MAX_ACTIVE"]
+        self.fake_pi([answer("ok"), SETTLED])
         synchronous = self.outcome(self.cli("run", "--read-only", "another"))
         self.assertEqual(json.loads((Path(synchronous["dir"]) / "meta.json").read_text())["caller"],
                          "explicit-session")
@@ -2572,36 +2584,6 @@ db.write_text(json.dumps(units))
         self.assertEqual(state["state"], "delivered")
         self.assertNotIn("protectViolation", state)
 
-    def test_after_runs_a_step_when_its_upstream_is_done(self):
-        # A pipeline the caller declares: B starts when A ends, knows where A's answer is, and every result
-        # still comes back to the caller. B waits in the kernel on A's lifetime lock, not in a polling loop.
-        self.fake_pi([answer("scout: the callers are x.py and y.py"), SETTLED], sleep=1.5)
-        a = self.outcome(self.cli("start", "--read-only", "--name", "scout", "list the callers"))
-        self.env["DELEGATE_MAX_ACTIVE"] = "1"  # a step that is only waiting takes no slot
-        started = self.cli("start", "--read-only", "--after", "scout", "--name", "impl", "use the list")
-        self.assertEqual(started.returncode, 0, started.stderr)
-        b = self.outcome(started)
-        self.assertEqual(b["state"], "waiting")
-        self.assertEqual(b["after"], a["run"])
-        done = self.cli("wait", "impl", timeout=60)
-        b = self.outcome(done)
-        self.assertEqual(b["state"], "answered")
-        prompt = (Path(b["dir"]) / "prompt.md").read_text()
-        self.assertIn(str(Path(a["dir"]) / "result.md"), prompt)  # where the upstream answer is
-        self.assertIn("scout", prompt)
-        # An upstream that did not deliver skips the step without starting a colleague.
-        del self.env["DELEGATE_MAX_ACTIVE"]
-        self.fake_pi([answer(LEAKED), SETTLED])
-        bad = self.outcome(self.cli("run", "--read-only", "--retries", "0", "--name", "bad", "x"))
-        self.assertEqual(bad["state"], "malformed")
-        calls = len((self.work / "pi.log").read_text().splitlines())
-        skipped = self.outcome(self.cli("run", "--read-only", "--after", "bad", "--name", "next", "y"))
-        self.assertEqual(skipped["state"], "skipped")
-        self.assertIn("finishedAt", skipped)
-        self.assertIn("malformed", skipped["error"])
-        self.assertEqual(len((self.work / "pi.log").read_text().splitlines()), calls)
-        self.assertEqual(self.cli("start", "--after", "no-such-run", "x").returncode, 2)
-
     def test_in_reviews_an_upstream_worktree_without_touching_it(self):
         repo = self.repo({"a.txt": "a\n"})
         self.fake_pi([answer("changed"), SETTLED], pre="echo impl >> a.txt")
@@ -2609,7 +2591,7 @@ db.write_text(json.dumps(units))
         # The reviewer reads what impl produced, in a snapshot of its worktree, with impl's changes against HEAD.
         self.fake_pi([answer("reviewed"), SETTLED], pre='pwd > "$PI_LOG.cwd"; git diff HEAD > "$PI_LOG.diff"; '
                                                         'echo stray > stray.txt')
-        review = self.outcome(self.cli("run", "--read-only", "--after", "impl", "--in", "impl", "--name", "rv",
+        review = self.outcome(self.cli("run", "--read-only", "--in", "impl", "--name", "rv",
                                        "review impl"))
         self.assertEqual(review["state"], "answered")
         self.assertNotEqual(review["worktree"], impl["worktree"])
@@ -3159,24 +3141,6 @@ db.write_text(json.dumps(units))
         self.assertFalse(Path(first["worktree"]).exists())
         self.assertFalse(Path(second["worktree"]).exists())
 
-    def test_write_step_after_a_write_run_starts_from_its_changes(self):
-        repo = self.repo({"a.txt": "a\n"})
-        self.fake_pi([answer("done"), SETTLED], pre="echo A >> a.txt")
-        self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "impl", "x"))
-        self.fake_pi([answer("done"), SETTLED], pre='cat a.txt > "$PI_LOG.seen"; echo B >> a.txt')
-        step = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--after", "impl", "--name", "next", "y"))
-        self.assertEqual(step["state"], "answered")
-        self.assertEqual((self.work / "pi.log.seen").read_text(), "a\nA\n")  # impl's change was already there
-        self.assertIn("starts from the upstream", (Path(step["dir"]) / "prompt.md").read_text())
-        refused = self.cli("apply", "--json", "--keep", "next")
-        self.assertEqual(refused.returncode, 2, refused.stderr)
-        self.assertIn("apply", refused.stderr)
-        self.assertEqual((repo / "a.txt").read_text(), "a\n")
-        self.assertEqual(self.cli("apply", "--json", "impl").returncode, 0)
-        applied = self.cli("apply", "--json", "next")
-        self.assertEqual(applied.returncode, 0, applied.stderr)
-        self.assertEqual((repo / "a.txt").read_text(), "a\nA\nB\n")  # only next's own line on top of impl
-
     def test_a_colleague_question_waits_for_the_caller_and_its_answer_is_not_rework(self):
         repo = self.repo({"a.txt": "a\n"})
         (repo / ".delegate.json").write_text(json.dumps({"accept": "false", "maxRework": 0}))
@@ -3246,7 +3210,7 @@ db.write_text(json.dumps(units))
             named = self.cli("start", "--worktree", "--workdir", repo, "--name", "second", "fix src/hot_file.rs")
             self.assertIn("overlap: write task hotwork is running on this source (1 files changed so far: src/hot_file.rs)",
                           named.stderr)
-            self.assertIn("--after hotwork", named.stderr)
+            self.assertIn("waiting for hotwork", named.stderr)
             unrelated = self.cli("start", "--worktree", "--workdir", repo, "--name", "third", "edit other.txt")
             self.assertIn("note: write task hotwork", unrelated.stderr)
             self.assertNotIn("overlap:", unrelated.stderr)
@@ -3597,29 +3561,6 @@ cargo check --package small; echo $? > "$DELEGATE_RUN_DIR/prefix-code"
         for process in runners:
             process.communicate(timeout=10)
             self.assertEqual(process.returncode, 0)
-
-    def test_v518_after_waits_for_repository_capacity(self):
-        repo = self.repo({"a.txt": "old\n"})
-        gate = self.work / "gate"
-        self.fake_pi([answer("done"), SETTLED], pre=f'''
-if [ "$PWD" = {shlex.quote(str(repo))} ]; then
-  while [ ! -f {shlex.quote(str(gate))} ]; do sleep .02; done
-fi
-''')
-        self.env["DELEGATE_REPO_MAX_ACTIVE"] = "1"
-        first = self.outcome(self.cli("start", "--read-only", "--in-place", "--workdir", repo, "blocker"))
-        self.addCleanup(self.cli, "stop", first["dir"])
-        upstream = self.outcome(self.cli("run", "--read-only", "upstream"))
-        waiting = self.outcome(self.cli("start", "--read-only", "--in-place", "--workdir", repo,
-                                        "--after", upstream["run"], "queued"))
-        self.addCleanup(self.cli, "stop", waiting["dir"])
-        self.assertEqual(waiting["state"], "waiting")
-        time.sleep(.2)
-        self.assertEqual(self.outcome(self.cli("status", waiting["run"]))["state"], "waiting")
-        gate.touch()
-        finished = self.outcome(self.cli("wait", waiting["run"]))
-        self.assertEqual(finished["state"], "answered")
-
 
     def test_detect_manual_merge_from_working_tree_contents_and_clean(self):
         repo = self.repo({"a.txt": "old\n", "gone.txt": "delete\n", "run.sh": "echo old\n",

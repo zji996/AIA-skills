@@ -45,7 +45,10 @@ if Path({str(self.work / 'offline')!r}).exists():
 assert sys.argv[-2] == "ci", sys.argv
 os.environ["HOME"] = {str(self.remote)!r}
 os.environ["PATH"] = {str(self.remote / 'bin')!r} + ":/usr/bin:/bin"
-os.execv("/bin/sh", ["sh", "-c", sys.argv[-1]])
+script = sys.argv[-1]
+if Path({str(self.work / 'no-remote-link')!r}).exists() and "LINKED:" in script:
+    script = script.replace("if [ -e ", "if false && [ -e ")
+os.execv("/bin/sh", ["sh", "-c", script])
 ''')
         ssh.chmod(0o755)
         real_rsync = shutil.which("rsync")
@@ -92,10 +95,23 @@ print(os.getcwd() + "/a.txt:1: diagnostic")
 print("stderr: " + os.getcwd(), file=sys.stderr)
 if sys.argv[1:2] == ["exit"]:
     sys.exit(int(sys.argv[2]))
+if sys.argv[1:2] == ["check-managed"]:
+    assert Path(".local/providers/model.json").read_text().strip() == "ok", "missing .local/providers"
+    assert Path("third_party/pi/spec.md").read_text().strip() == "pi-spec", "missing third_party/pi"
+    print("managed-ok")
+    sys.exit(0)
 ''')
         cargo.chmod(0o755)
         local = self.bin / "cargo"
-        local.write_text('#!/bin/sh\nprintf "local:%s\\n" "$*"\n')
+        local.write_text(f"#!{sys.executable}\n" + '''
+import sys
+from pathlib import Path
+if sys.argv[1:2] == ["check-managed-local"]:
+    assert Path(".local/providers/big.bin").is_file(), "missing local big.bin"
+    print("local-managed-ok")
+    sys.exit(0)
+print("local:" + " ".join(sys.argv[1:]))
+''')
         local.chmod(0o755)
 
     def records(self):
@@ -200,22 +216,6 @@ if sys.argv[1:2] == ["exit"]:
         stdout, stderr = proc.communicate(timeout=15)
         self.assertEqual(proc.returncode, 0, stdout + stderr)
         self.assertTrue(self.outcome(subprocess.CompletedProcess([], proc.returncode, stdout, stderr))["verify"]["ok"])
-
-    def test_after_unexecuted_acceptance_waits_for_retry_instead_of_skipping(self):
-        (self.work / "offline").touch()
-        _, parent = self.run_remote(pre="echo changed > a.txt", accept="cargo check")
-        self.assertTrue(parent["accept"]["notExecuted"])
-        child = self.outcome(self.cli("start", "--read-only", "--after", parent["run"], "dependent"))
-        self.addCleanup(lambda: self.cli("stop", child["run"]))
-        time.sleep(.3)
-        self.assertIn(self.outcome(self.cli("status", child["run"]))["state"], ("waiting", "queued", "running"))
-        (self.work / "offline").unlink()
-        self.fake_pi([fixtures.answer("retry passed"), fixtures.SETTLED])
-        retry = self.cli("reply", "--wait", parent["run"], "retry")
-        self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
-        result = self.cli("wait", "--all", child["run"])
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.outcome(result)["state"], "answered")
 
     def test_forwarding_upload_download_paths_arguments_and_exit_codes(self):
         _, state = self.run_remote(pre='cargo fmt; cargo exit 23 "a b" "x\'y"; echo $? > "$DELEGATE_RUN_DIR/code"', accept="cargo exit 255")
@@ -464,6 +464,66 @@ os.execvp(a[0],a)
         self.assertEqual(lane.returncode, 0, lane.stderr)
         self.assertIn("local:check", lane.stdout)
         self.assertEqual(len(self.records()), 1)
+
+    def test_remote_syncs_worktree_copy_and_link_for_acceptance_equivalence(self):
+        repo = self.repo({
+            "a.txt": "old\n",
+            ".gitignore": "target/\nnode_modules/\n.local/\n",
+            ".delegate.json": json.dumps({
+                "worktree": {"copy": [".local/providers"], "link": ["third_party/pi"]}
+            }),
+        })
+        (repo / ".local/providers").mkdir(parents=True)
+        (repo / ".local/providers/model.json").write_text("ok\n")
+        (repo / "third_party/pi").mkdir(parents=True)
+        (repo / "third_party/pi/spec.md").write_text("pi-spec\n")
+        # Case 1: remote host has the same path for worktree.link (symlinked on remote) + copy synced.
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "cargo check-managed", "task"))
+        self.assertEqual(state["state"], "delivered", state)
+        self.assertEqual(self.records()[-1]["argv"], ["check-managed"])
+        remote_slot = Path(self.records()[-1]["cwd"])
+        self.assertTrue((remote_slot / "third_party/pi").is_symlink())
+        self.assertEqual((remote_slot / ".local/providers/model.json").read_text(), "ok\n")
+        # Local worktree managed paths remain intact after download sync.
+        tree = Path(state["worktree"])
+        self.assertTrue((tree / "third_party/pi").is_symlink())
+        self.assertEqual((tree / ".local/providers/model.json").read_text(), "ok\n")
+        # Case 2: remote host does NOT have worktree.link at the same path; small target is synced directly.
+        (self.work / "no-remote-link").touch()
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
+        state2 = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "cargo check-managed", "task2"))
+        self.assertEqual(state2["state"], "delivered", state2)
+        remote_slot2 = Path(self.records()[-1]["cwd"])
+        self.assertFalse((remote_slot2 / "third_party/pi").is_symlink())
+        self.assertEqual((remote_slot2 / "third_party/pi/spec.md").read_text(), "pi-spec\n")
+
+    def test_remote_acceptance_falls_back_locally_when_managed_path_exceeds_limit(self):
+        repo = self.repo({
+            "a.txt": "old\n",
+            ".gitignore": "target/\n.local/\n",
+            ".delegate.json": json.dumps({
+                "worktree": {"copy": [".local/providers"]}
+            }),
+        })
+        (repo / ".local/providers").mkdir(parents=True)
+        (repo / ".local/providers/big.bin").write_bytes(b"x" * 128)
+        self.env["DELEGATE_REMOTE_COPY_MAX_BYTES"] = "16"
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo,
+                                      "--accept", "cargo check-managed-local", "task"))
+        self.assertEqual(state["state"], "delivered", state)
+        self.assertEqual(self.records(), [], "remote cargo should not run when managed path is missing")
+        self.assertEqual(state["accept"]["localFallback"]["paths"], [".local/providers"])
+        self.assertIn("本地回退", self.cli("status", state["run"], human=True).stdout)
+        # SSH offline still fails closed and never falls back locally.
+        (self.work / "offline").touch()
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
+        failed = self.outcome(self.cli("run", "--worktree", "--workdir", repo,
+                                       "--accept", "cargo check-managed-local", "offline-task"))
+        self.assertEqual(failed["state"], "rejected")
+        self.assertTrue(failed["infrastructureFailure"])
+        self.assertNotIn("localFallback", failed["accept"])
 
 
 if __name__ == "__main__":

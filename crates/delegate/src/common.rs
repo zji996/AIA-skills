@@ -228,6 +228,21 @@ pub fn clip(s: &str, max: usize) -> String {
         x
     }
 }
+pub fn format_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const KIB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.1} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
 pub fn repository_relative(path: &str, top: &str) -> String {
     let path = Path::new(path);
     let top = Path::new(top);
@@ -404,6 +419,19 @@ pub fn run_shell(
     log: &mut File,
     holder: Option<&std::sync::atomic::AtomicI32>,
 ) -> Res<(i32, bool)> {
+    run_shell_with(command, cwd, run, extra, timeout, log, holder, false)
+}
+#[allow(clippy::too_many_arguments)]
+pub fn run_shell_with(
+    command: (&str, &str),
+    cwd: &Path,
+    run: &Path,
+    extra: &Value,
+    timeout: f64,
+    log: &mut File,
+    holder: Option<&std::sync::atomic::AtomicI32>,
+    force_local: bool,
+) -> Res<(i32, bool)> {
     let (command, role) = command;
     let mut c = crate::cleanup::scoped_command(run, role, "sh", &[]);
     c.arg("-c")
@@ -414,12 +442,17 @@ pub fn run_shell(
         .stderr(Stdio::from(log.try_clone().map_err(|e| e.to_string())?));
     clean_env(&mut c, extra);
     let meta = json(run.join("meta.json"));
-    if let Some(path) = crate::deny::shell_path(&meta, run)? {
+    if let Some(path) = crate::deny::shell_path_with(&meta, run, force_local)? {
         c.env("PATH", path);
     }
     let remote_status = run.join(format!("{role}.remote.json"));
     let _ = fs::remove_file(&remote_status);
     c.env("DELEGATE_SHELL_STATUS", &remote_status);
+    if !force_local && matches!(role, "accept" | "verify") {
+        c.env("DELEGATE_REMOTE_FALLBACK_ON_MISSING", "1");
+    } else {
+        c.env_remove("DELEGATE_REMOTE_FALLBACK_ON_MISSING");
+    }
     c.env("DELEGATE_LANE_HELD", "1")
         .env("DELEGATE_RUN_DIR", run);
     group(&mut c);

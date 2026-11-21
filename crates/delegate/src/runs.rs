@@ -164,6 +164,111 @@ pub fn agent_alive(run: &Path) -> bool {
         .unwrap_or(0);
     pid_alive(pid) && unsafe { libc::getpgid(pid) == pid }
 }
+pub fn legacy_after_waiting(run: &Path) -> bool {
+    if run.join("exit_code").is_file() || !run.join(".waiting").exists() {
+        return false;
+    }
+    let meta = json(run.join("meta.json"));
+    if s(&meta, "after").is_empty() {
+        return false;
+    }
+    !run.join("queue.json").is_file()
+        || s(&json(run.join("queue.json")), "reason").contains("upstream")
+}
+
+pub fn redispatch_command(run: &Path, meta: &Value) -> String {
+    let mut parts = vec![script().to_string_lossy().into_owned(), "start".into()];
+    let mode = s(meta, "mode");
+    if mode == "read-only" {
+        parts.push("--read-only".into());
+        if b(meta, "shell") {
+            parts.push("--shell".into());
+        }
+        if meta["worktree"].is_null() {
+            parts.push("--in-place".into());
+        }
+    } else if meta["worktree"].is_object() {
+        parts.push("--worktree".into());
+    } else {
+        parts.push("--in-place".into());
+    }
+    let in_run = s(&meta["worktree"], "in");
+    if !in_run.is_empty() {
+        parts.push("--in".into());
+        parts.push(
+            Path::new(in_run)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| in_run.into()),
+        );
+    }
+    let workdir = Some(s(&meta["worktree"], "sourceWorkdir"))
+        .filter(|w| !w.is_empty())
+        .unwrap_or_else(|| s(meta, "workdir"));
+    if !workdir.is_empty() {
+        parts.push("--workdir".into());
+        parts.push(workdir.into());
+    }
+    if agent_pinned(meta) {
+        let model = Some(s(meta, "modelName"))
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| s(meta, "model"));
+        if !model.is_empty() {
+            parts.push("--model".into());
+            parts.push(model.into());
+        }
+    } else if !s(meta, "tier").is_empty() {
+        parts.push("--tier".into());
+        parts.push(s(meta, "tier").into());
+    }
+    if !s(meta, "thinking").is_empty() {
+        parts.push("--thinking".into());
+        parts.push(s(meta, "thinking").into());
+    }
+    if !s(meta, "accept").is_empty() {
+        parts.push("--accept".into());
+        parts.push(s(meta, "accept").into());
+    }
+    for p in strings(&meta["protect"]) {
+        parts.push("--protect".into());
+        parts.push(p);
+    }
+    for a in strings(&meta["allow"]) {
+        parts.push("--allow".into());
+        parts.push(a);
+    }
+    if !s(meta, "name").is_empty() {
+        parts.push("--name".into());
+        parts.push(s(meta, "name").into());
+    }
+    parts.push("--prompt-file".into());
+    parts.push(run.join("prompt.md").to_string_lossy().into_owned());
+    parts
+        .iter()
+        .map(|a| shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn finished_within(run: &Path, window_seconds: f64) -> bool {
+    let now = epoch();
+    let sum = json(run.join("summary.json"));
+    if let Some(ts) = iso_epoch(s(&sum, "finishedAt")) {
+        return (now - ts as f64) <= window_seconds;
+    }
+    let done = run.join("exit_code");
+    if let Ok(modified) = fs::metadata(&done)
+        .and_then(|m| m.modified())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).map_err(std::io::Error::other))
+    {
+        return (now - modified.as_secs_f64()) <= window_seconds;
+    }
+    let meta = json(run.join("meta.json"));
+    meta["startedEpoch"]
+        .as_f64()
+        .is_some_and(|started| (now - started) <= window_seconds)
+}
+
 pub fn state(run: &Path) -> String {
     if run.join("exit_code").is_file() {
         let sum = json(run.join("summary.json"));
@@ -172,6 +277,9 @@ pub fn state(run: &Path) -> String {
             .and_then(Value::as_str)
             .unwrap_or("crashed")
             .into();
+    }
+    if legacy_after_waiting(run) {
+        return "needs-redispatch".into();
     }
     if supervisor_alive(run) {
         if crate::measure::waiting_ahead(run).is_some() {
@@ -272,8 +380,11 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
     {
         return Some(format!("{script} clean {name}"));
     }
-    if state == "skipped" {
-        return Some(format!("已跳过：{}；修复上游后重启：{script} reply --fresh {name} '<restart>'", s(sum, "error")));
+    if state == "needs-redispatch" {
+        return Some(format!(
+            "原 --after 已在 6.22.0 移除，需要重派：{}",
+            redispatch_command(run, meta)
+        ));
     }
     if b(sum, "question") {
         return Some(format!(
@@ -401,9 +512,14 @@ pub fn status(run: &Path) -> Value {
     if !s(&meta, "parent").is_empty() {
         out["parent"] = meta["parent"].clone();
     }
-    if !s(&meta, "after").is_empty() {
-        let upstream = Path::new(s(&meta, "after"));
-        out["after"] = json!(upstream.file_name().unwrap_or_default().to_string_lossy());
+    if st == "needs-redispatch" {
+        out["redispatch"] = json!(redispatch_command(run, &meta));
+    }
+    if meta["promptProtectedPaths"]
+        .as_array()
+        .is_some_and(|items| !items.is_empty())
+    {
+        out["promptProtectedPaths"] = meta["promptProtectedPaths"].clone();
     }
     if meta["worktree"].is_object() {
         out["worktree"] = json!(s(&meta["worktree"], "path"));

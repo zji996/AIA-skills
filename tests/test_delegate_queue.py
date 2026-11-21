@@ -190,20 +190,6 @@ class QueueTests(unittest.TestCase):
         self.release(holder)
         self.until(lambda: self.started(third), "second free slot admits next waiter")
 
-    def test_after_enters_capacity_queue_only_after_upstream(self):
-        self.gates()
-        self.env["DELEGATE_MAX_ACTIVE"] = "1"
-        first = self.start("first")
-        after = self.start("after", "--after", first["dir"])
-        other = self.start("other")
-        self.assertNotIn("queue", after)
-        self.assertEqual(self.status(other)["queue"]["ahead"], 0)
-        self.release(first)
-        self.until(lambda: self.started(other), "older ready waiter precedes after")
-        self.until(lambda: "queue" in self.status(after), "after joins capacity queue")
-        self.release(other)
-        self.until(lambda: self.started(after), "after admitted")
-
     def test_unknown_overflow_rejected_at_config_load(self):
         self.gates()
         for value in ("typo", 1, None):

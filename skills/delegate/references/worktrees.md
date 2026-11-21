@@ -33,7 +33,7 @@
 
 worktree 按对话共享，最后一个引用被 `clean`/过期清理时移除（池槽仅释放且不报移除失败）；`agent-handoff` 列未合入 worktree。
 
-成功 `apply`（含 merge/零改动/reply）登记共享轮次 `.applied`，显示「已合入」；回收 worktree，轻量记录与补丁保留 7 天（`DELEGATE_KEEP_DAYS`，0 禁用）；`clean` 可提前删。普通 `reply` 会从当前源分支新建 worktree，将原任务说明、上次答复和追加说明交给新会话；`reply --fresh` 仍只使用本轮说明。共享输入沿用原路径，repo 内同位置已有文件则报错；链接并非写保护。
+成功 `apply`（含 merge/零改动/reply）登记 `.applied` 显示「已合入」；按 `worktree.cleanOnApply`（默认 `true`，设 `false` 或 `--keep` 保留）归档后删 worktree（reply 续做链整链合入后再清），归档/轻量记录/补丁保留 7 天（`DELEGATE_KEEP_DAYS`，0 禁用）。普通 `reply` 从源分支新建 worktree 带原说明与上次答复；`--fresh` 仅用本轮说明。共享输入同位置冲突报错。
 
 写入任务未 apply 时，`status`/`wait`/`clean` 仅检查累计改动清单中的路径，按类型、大小和哈希比较源工作树与同事结束时的最终内容，执行位也须一致，删除路径须在源中不存在；不要求提交进 HEAD。全部包含时写 `.applied` 并记 `appliedBy: "detected"`，短行“已合入（主干已含改动）”，`next` 改为清理建议，`clean --finished` 按已合入处理。仅部分包含或读取失败时视为未检测到，沿用原 apply 建议；检测不代表验收已在源中复跑。
 

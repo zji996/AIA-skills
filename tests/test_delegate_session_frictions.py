@@ -83,37 +83,19 @@ class DelegateSessionFrictionsTests(unittest.TestCase):
         self.assertFalse((Path(state["dir"]) / "pending-reply.json").exists())
         self.assertEqual(len((self.work / "pi.log").read_text().splitlines()), 2)
 
-    def test_any_wait_ignores_stopped_and_skipped_runs(self):
+    def test_any_wait_ignores_stopped_runs(self):
         gate, state = self.gated()
-        skipped = self.outcome(self.cli("start", "--read-only", "--after", state["run"], "--name", "queued", "task"))
         stopped = self.outcome(self.cli("start", "--read-only", "--name", "stopped", "task"))
-        timer = threading.Timer(.1, lambda: self.cli("stop", skipped["run"], stopped["run"]))
+        timer = threading.Timer(.1, lambda: self.cli("stop", stopped["run"]))
         timer.start()
         self.addCleanup(timer.join)
-        result = self.cli("wait", "--any", "--max", "1.5", skipped["run"], stopped["run"], state["run"])
+        result = self.cli("wait", "--any", "--max", "1.5", stopped["run"], state["run"])
         timer.join()
         self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
         gate.touch()
-        result = self.cli("wait", "--any", skipped["run"], stopped["run"], state["run"])
+        result = self.cli("wait", "--any", stopped["run"], state["run"])
         self.assertEqual(self.outcome(result)["run"], state["run"])
-        self.assertNotIn("已跳过", result.stdout)
         self.assertNotIn("已停止", result.stdout)
-
-    def test_wait_reports_dependency_skip_reason_and_restart_for_any_and_stream(self):
-        self.fake_pi([fixtures.answer("broken")], code=1)
-        bad = self.outcome(self.cli("run", "--read-only", "--name", "bad", "task"))
-        self.fake_pi([fixtures.answer("unused"), fixtures.SETTLED])
-        child = self.outcome(self.cli("run", "--read-only", "--after", bad["run"], "dependent"))
-        self.assertEqual(child["state"], "skipped")
-        for options in (("--any",), ("--stream",), ("--all",)):
-            # Each wait normally delivers once; re-arm to check all output modes.
-            (Path(child["dir"]) / ".delivered").unlink(missing_ok=True)
-            result = self.cli("wait", *options, child["run"], human=True)
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertIn("已跳过", result.stdout)
-            self.assertIn("upstream bad ended failed", result.stdout)
-            self.assertIn("reply --fresh", result.stdout)
-            self.assertIn(child["run"], result.stdout)
 
     def test_question_reply_restores_lane_age_without_preempting_running_jobs(self):
         for already_running in (False, True):

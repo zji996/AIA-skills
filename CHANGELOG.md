@@ -13,6 +13,7 @@
 
 - `agent-interface-design`「顺着模型习惯」：拿不准习惯时先问用它的模型本人（从真实请求分叉追问、复用缓存、不写回），回答只当线索、回到记录核实。
 
+- `delegate` 6.22.0：**不兼容**：移除 `start --after` 及串联跳过状态（保留只读 `--in`），升级时已在等上游的 6.21.x run 在 `status`/`wait` 立即显示「需要重派」并给出原样重派命令（不静默挂住）。同版修复五处日常摩擦：`reply --allow PATH` 在原会话放开受保护路径并回显；`start` 检测正文提及的未放开受保护路径（仅提示补 `--allow` 并在 `status`/`wait` 标 `promptProtectedPaths`）；`wait --any` 每次列出上次 wait 之后所有终态与提问态 run（首个给全文、其余一行摘要加 `result` 查看命令）；`status` 默认只列未结束/24 小时内未清理/本会话起的 run 并一行汇总更早未清理（`--all` 列全部）；`worktree.cleanOnApply`（默认 `true`）控制合入归档后自动删 worktree（续做链整链合入后再清）；远程执行同步托管 `worktree.copy` 与 `worktree.link`（远端同路径直接链接、小目录同步），超限且远端缺失时验收/verify 自动回退本地并记入 `localFallback`。
 - `delegate` 6.21.8：`.delegate.json` 支持顶层 `acceptTimeout`（优先级 CLI > 仓库 > 默认 10m，`reply` 继承、启动回显来源）；worktree 写入收尾仅在同事本轮 `write`/`edit` 或 bash 源路径前缀命中变化文件（或 `node_modules` 软链越界）时判 `sourceWriteViolation`，主控修改源仓库只记 `sourceWorkspaceChanges`、不拒收。
 - `delegate` 6.21.7：命令停滞（默认 90 分钟没跑完）被停掉后，同一会话自动续做一次，告诉同事是哪条命令、让它缩小范围加超时找出挂住的地方，能修就修、修不了写进答复；原来整个同事被杀、不留答复（起因：一条主干上本来就挂住的 runtime 测试让验收等满 90 分钟后白白结束）。
 - `delegate` 6.21.6：agy 同事的答复只取最后一条命令之后的回复（agy 的 `response` 会把整轮命令间的进度旁白一起拼进去，答复开头曾出现成串的「正在等待 clippy…」）；答复里指向 worktree 的 `file://` 链接改写为仓库相对路径（worktree 合入后即删除，链接失效）。

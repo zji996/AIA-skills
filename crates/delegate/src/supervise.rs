@@ -108,7 +108,7 @@ fn accept(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
         result["excluded"] = json!(excluded);
     }
     let before = changes::repository_snapshot_excluding(Path::new(s(meta, "top")), run, &excluded);
-    let (code, timed) = run_shell(
+    let (mut code, mut timed) = run_shell(
         (s(meta, "accept"), "accept"),
         Path::new(s(meta, "workdir")),
         run,
@@ -118,6 +118,31 @@ fn accept(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
         Some(&holder),
     )
     .unwrap_or((1, false));
+    let mut local_fallback = Value::Null;
+    if code == 75 {
+        let remote_status = json(run.join("accept.remote.json"));
+        if s(&remote_status, "stage") == "missing_managed" {
+            let reason = s(&remote_status, "reason").to_string();
+            let paths = remote_status["paths"].clone();
+            let _ = writeln!(
+                log,
+                "\n[remote missing managed paths: {reason}; rerunning acceptance locally]"
+            );
+            let _ = log.flush();
+            (code, timed) = run_shell_with(
+                (s(meta, "accept"), "accept"),
+                Path::new(s(meta, "workdir")),
+                run,
+                &meta["env"],
+                meta["acceptTimeoutSeconds"].as_f64().unwrap_or(600.0),
+                &mut log,
+                Some(&holder),
+                true,
+            )
+            .unwrap_or((1, false));
+            local_fallback = json!({"reason": reason, "paths": paths});
+        }
+    }
     let after = changes::repository_snapshot_excluding(Path::new(s(meta, "top")), run, &excluded);
     if let (Some(before), Some(after)) = (&before, &after) {
         let mut excluded = excluded
@@ -160,6 +185,9 @@ fn accept(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
     result["ok"] = json!(code == 0);
     result["exitCode"] = json!(code);
     result.as_object_mut().unwrap().extend(shell_outcome(run, "accept", code, timed).as_object().unwrap().clone());
+    if local_fallback.is_object() {
+        result["localFallback"] = local_fallback;
+    }
     if code != 0 {
         let text = read(&path);
         let body = text.split_once('\n').map(|(_, x)| x).unwrap_or("");
@@ -864,130 +892,17 @@ fn escalate(
     write_json(run.join("meta.json"), meta)?;
     Ok(true)
 }
-/// A write step `--after` a write run starts from what that run delivered rather than
-/// from the source as it was at `start`: its base is a snapshot of the upstream worktree
-/// (or of the source, once the upstream is applied there), so its own diff and apply hold
-/// only its own changes. Returns whether the base came from the upstream worktree.
-fn stack_on_upstream(run: &Path, meta: &mut Value, upstream: &Path, prior: &Value) -> Res<bool> {
-    let tree = &meta["worktree"];
-    let up = &prior["worktree"];
-    if s(meta, "mode") != "write"
-        || !tree.is_object()
-        || tree["in"].is_string()
-        || s(prior, "mode") != "write"
-        || !up.is_object()
-        || s(up, "source") != s(tree, "source")
-    {
-        return Ok(false);
-    }
-    let path = Path::new(s(up, "path"));
-    let changed = json(upstream.join("changes.json"))["changes"]
-        .as_array()
-        .is_some_and(|c| !c.is_empty());
-    let stacked = changed && !upstream.join(".applied").exists() && path.is_dir();
-    let (source, exclude) = if stacked {
-        (path, strings(&prior["snapshotExclude"]))
-    } else {
-        (
-            Path::new(s(tree, "source")),
-            strings(&meta["snapshotExclude"]),
-        )
-    };
-    let base =
-        changes::snapshot(source, run, &exclude).ok_or("cannot snapshot upstream changes")?;
-    meta["chainBase"] = base["tree"].clone();
-    meta["base"] = base;
-    if stacked {
-        meta["stackedOn"] = json!(upstream);
-    }
-    write_json(run.join("meta.json"), meta)?;
-    Ok(stacked)
-}
 fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> Res<()> {
     let mut meta = json(run.join("meta.json"));
     if !s(&meta, "after").is_empty() {
-        let mut upstream = PathBuf::from(s(&meta, "after"));
-        loop {
-            wait_for_run(&upstream);
-            let summary = json(upstream.join("summary.json"));
-            if lane::stopped() || !b(&summary["accept"], "notExecuted") {
-                break;
-            }
-            // No failed execution to skip on: wait for the controller's retry.
-            log_event(run, json!({"e":"upstream_unverified","run":upstream}));
-            crate::queue::update(run, &format!("上游验收未执行，等待重排 / upstream unverified: {}", upstream.display()), 0)?;
-            while runs::latest(upstream.clone()) == upstream && !lane::stopped() {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            upstream = runs::latest(upstream);
-            meta["after"] = json!(upstream);
-            write_json(run.join("meta.json"), &meta)?;
-        }
-        if lane::stopped() {
-            return finish_skipped(run, "stopped while waiting for upstream");
-        }
-        let outcome = runs::state(&upstream);
-        let name = s(&json(upstream.join("meta.json")), "name").to_string();
-        if !["delivered", "answered"].contains(&outcome.as_str()) {
-            return finish_skipped(run, &format!("upstream {name} ended {outcome}"));
-        }
-        let prompt = read(run.join("prompt.md"));
-        let zh = prompt
-            .replace(crate::launch::WRITE_BOUNDARY, "")
-            .chars()
-            .any(|c| (0x4e00..=0x9fff).contains(&(c as u32)));
-        let patch = upstream.join("changes.patch");
-        let prior = json(upstream.join("meta.json"));
-        let stacked = stack_on_upstream(run, &mut meta, &upstream, &prior)?;
-        let note = if zh {
-            format!(
-                "\n\n上游任务：{name}\n结局：{outcome}{}\n答复全文：{}{}{}\n",
-                if stacked {
-                    "\n你的工作区从上游交付的改动开始，这些改动不算你的"
-                } else {
-                    ""
-                },
-                upstream.join("result.md").display(),
-                if patch.is_file() {
-                    format!("\n改动补丁：{}", patch.display())
-                } else {
-                    String::new()
-                },
-                if prior["worktree"].is_object() {
-                    format!("\n上游 worktree：{}", s(&prior["worktree"], "path"))
-                } else {
-                    String::new()
-                }
-            )
-        } else {
-            format!(
-                "\n\nUpstream task: {name}\nOutcome: {outcome}{}\nFull answer: {}{}{}\n",
-                if stacked {
-                    "\nYour worktree starts from the upstream's delivered changes; they are not yours"
-                } else {
-                    ""
-                },
-                upstream.join("result.md").display(),
-                if patch.is_file() {
-                    format!("\nChanges patch: {}", patch.display())
-                } else {
-                    String::new()
-                },
-                if prior["worktree"].is_object() {
-                    format!("\nUpstream worktree: {}", s(&prior["worktree"], "path"))
-                } else {
-                    String::new()
-                }
-            )
-        };
-        append(run.join("prompt.md"), &note)?;
+        return finish_run(
+            run,
+            json!({"state":"needs-redispatch","error":"--after was removed in 6.22.0; re-dispatch this run"}),
+            1,
+        );
     }
     if meta["worktree"]["in"].is_string() {
         let in_run = Path::new(s(&meta["worktree"], "in"));
-        wait_for_run(in_run);
-        if lane::stopped() {
-            return finish_skipped(run, "stopped while waiting for review source");
-        }
         let source = Path::new(s(&meta["worktree"], "source"));
         let upstream = json(in_run.join("meta.json"));
         let exclude = upstream["snapshotExclude"]
@@ -1233,29 +1148,6 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
     )?;
     Ok(())
 }
-fn finish_skipped(run: &Path, reason: &str) -> Res<()> {
-    crate::cleanup::record(run, 0);
-    let mut summary = json!({"state":"skipped","error":reason});
-    if let Some(cleanup) = crate::cleanup::summary(run) {
-        summary["cleanup"] = cleanup;
-    }
-    let warnings = json(run.join("warnings.json"));
-    if warnings.as_array().is_some_and(|items| !items.is_empty()) {
-        summary["warnings"] = warnings;
-    }
-    finish_run(run, summary, 1)
-}
-fn wait_for_run(run: &Path) {
-    let poll = setting("POLL", "1").parse::<f64>().unwrap_or(1.0).max(0.01);
-    while runs::active(&runs::state(run)) && !lane::stopped() {
-        let path = run.join("supervisor.lock");
-        if path.is_file() {
-            let _ = lock(&path, false, false);
-        } else {
-            std::thread::sleep(Duration::from_secs_f64(poll));
-        }
-    }
-}
 fn admit_waiting(run: &Path, meta: &mut Value) -> Res<bool> {
     let slots = state_dir();
     let root = runs_root();
@@ -1267,7 +1159,7 @@ fn admit_waiting(run: &Path, meta: &mut Value) -> Res<bool> {
         }
         let others = launch::active_machine(&slots);
         if let Some(reason) = crate::queue::reason(meta, &others)? {
-            crate::queue::update(run, &reason, 0)?;
+            crate::queue::update(run, &reason, crate::queue::ahead(meta))?;
         } else {
             if s(meta, "mode") == "write" && !b(meta, "parallel") && !meta["worktree"].is_object() {
                 for other in &others {

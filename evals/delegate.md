@@ -42,7 +42,7 @@
 
 - 整机或仓库到上限、内存不足：`start` 成功返回 run id，`status` 显示排队分钟数、原因与前方人数，JSON 含 `queue`；不用手动重派。Queue automatically at capacity; wait for queued tasks normally.
 - 便宜模型 maxActive 满了，没同意改用更贵模型：默认等原模型；只有明确接受下一候选时才用 `--overflow next` 或条目 `overflow: "next"`，`--overflow queue` 可覆盖配置。Pinned --model obeys the same resolved-model cap.
-- 先排的新任务与后排的 reply 抢名额：reply 先，同级 FIFO；模型 A 满不挡模型 B，排队不占工作树池位，`stop` 可取消、`clean` 可清理。`--after` 上游完成后才入容量队。
+- 先排的新任务与后排的 reply 抢名额：reply 先，同级 FIFO；模型 A 满不挡模型 B，排队不占工作树池位，`stop` 可取消、`clean` 可清理。
 
 ## 6.9 派发前探连通
 
@@ -112,7 +112,7 @@
 - 只禁不带过滤参数的 `cargo xtask infra-test`：agentDeny 设 `exact: true`，额外参数放行；用户/仓库去重与 allow 撤销按 `(argv, exact)` 匹配。
 - 主控已用 git 手动合入完整改动（尚未 commit）：status/wait/clean 比较源工作树最终内容、删除与执行位，全部包含显示“已合入（主干已含改动）”、appliedBy detected，clean --finished 可清；部分合入或读取失败仍建议 apply。Detect manual integration from working tree contents.
 - 显式 `--model` 固定模型：短行显示模型名，JSON agentPinned true，不自动升档；`--agent` 已删除并退出 2；旧 Codex 记录 reply 时由 Pi 开新会话续做。
-- 多项目同时委派：整机默认任务 12、重命令 2，每仓库默认 repoMaxActive 8；git worktree 与主仓库同计，非 git 按规范化路径；命中上限说明层级、计数并只列该层任务，--after 等容量遵守两层。
+- 多项目同时委派：整机默认任务 12、重命令 2，每仓库默认 repoMaxActive 8；git worktree 与主仓库同计，非 git 按规范化路径；命中上限说明层级、计数并只列该层任务。
 - Claude Code Monitor 能将后台逐行输出变事件：优先后台 wait --stream；只有结束通知则重复后台 wait --any。新字段可选，protocol 保持 1。
 
 ## 5.17 用户配置与仓库事实
@@ -189,10 +189,19 @@
 - 远程冷编译验收需要 40 分钟：`.delegate.json` 配 `"acceptTimeout": "40m"`，启动在「生效默认值及来源」回显来源 `repo`，`reply` 继承、`--accept-timeout` 覆盖。Repo-level acceptance timeout with CLI > repo > default precedence.
 - 同事在 worktree 里只跑验收（工作树零改动），主控同时改源仓库文件：不判 `sourceWriteViolation`、正常验收交付，只报 `sourceWorkspaceChanges`；同事通过 `write`/`edit` 或 bash 绝对路径写了源文件时仍拒收，非 worktree 与 `node_modules` 软链检查不变。Worktree outside-write requires tool-call attribution to the colleague.
 
+## 6.22 去串联与日常摩擦
+
+- 去掉 `--after`：主控手动 `wait` 把关后再派下一步，`start --after` 退出 2，`--in RUN` 只读审已完成快照保留；6.21.x 遗留等待任务在 `status`/`wait` 标「需要重派」并给原样重派命令。Remove `--after` chaining and surface legacy waiting runs as needs-redispatch.
+- 同事提问要不要放开受保护路径：`reply --allow PATH` 在原会话内放开并回显，后续续做继承，不丢上下文。Per-reply protection lift without losing session context.
+- `start` 正文提到受保护前缀下的未放开路径：启动回显列路径和 `--allow` 参数，只提示不拦截，`status`/`wait` 带 `promptProtectedPaths` 标记。Advisory protected-path prompt check echoed at start, status and wait.
+- 两次 `wait --any` 之间多个 run 进入终态或提问态：一次返回全部列出，首个给全文，其余一行摘要加 `result` 查看命令，不漏提问。Report all settled and questioning runs in one `wait --any`.
+- 不带参 `status` 只列未结束、24 小时内结束未清理与本会话起的 run，更早未清理汇总一行（个数、空间、清理命令），`--all` 列全部。Default scoped status with older uncleaned summary and `--all`.
+- `apply` 成功且归档写好后按 `worktree.cleanOnApply`（默认 true）自动删除 worktree 并保留归档，reply 续做链等整条链都合入后再清。Auto-clean worktree on apply controlled by `worktree.cleanOnApply`.
+- 远程验收同步托管 `worktree.copy` 与 `worktree.link`（远端同路径直接链接，小目录同步），超限且远端缺失时验收自动回退本地并写明原因；SSH 断线仍失败关闭。Remote/local acceptance equivalence for managed copy and link paths.
+
 ## 6.20 使用摩擦回归 / Usage friction
 
 - DELEGATE_REMOTE=0 启动后普通 reply、fresh 及续做保持本机，显式 1 恢复当前 remote 配置；explicit environment override.
 - reply 正文含 `up -d --wait`、`delegate wait` 或 `--help` 不触发 hook；真正子命令 wait/run 或 reply --wait 仍拦前台，quoted message is data.
 - apply 的远端槽锁排队不耗执行时限；传输未执行给重排/本地跑，程序自身 exit 75 仍判执行失败，queue versus execution.
-- --after 遇上游 accept.notExecuted 等 reply 重试；真正依赖失败在 wait any/stream/all 列跳过原因及 reply --fresh，dependency visibility.
 - 提问回收未执行作业但保留队龄，回答后重跑同 label 优先于后来排队者、不能抢占已运行者；browser tests 仍共用 heavy lane，避免隐性超配。

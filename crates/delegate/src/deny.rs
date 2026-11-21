@@ -266,8 +266,8 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<()> {
     }
     Ok(())
 }
-pub fn shell_path(meta: &Value, run: &Path) -> Res<Option<std::ffi::OsString>> {
-    if crate::remote::enabled(&meta["remote"]) {
+pub fn shell_path_with(meta: &Value, run: &Path, force_local: bool) -> Res<Option<std::ffi::OsString>> {
+    if !force_local && crate::remote::enabled(&meta["remote"]) {
         let dir = run.join("remote-shims");
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         for program in crate::remote::programs(&meta["remote"]) {

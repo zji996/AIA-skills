@@ -68,11 +68,17 @@ pub fn reason(meta: &Value, active: &[PathBuf]) -> Res<Option<String>> {
     }
     blocked(meta, &reserved)
 }
+pub fn ahead(meta: &Value) -> usize {
+    waiting()
+        .iter()
+        .filter(|(_, other)| key(other) < key(meta))
+        .count()
+}
 pub fn enter(run: &Path, meta: &mut Value) -> Res<()> {
     meta["queuedNs"] = json!(now_ns() as u64);
     meta["queuedAt"] = json!(iso());
     write_json(run.join("meta.json"), meta)?;
-    update(run, "总路数 / machine capacity", 0)
+    update(run, "总路数 / machine capacity", ahead(meta))
 }
 pub fn update(run: &Path, reason: &str, ahead: usize) -> Res<()> {
     let meta = json(run.join("meta.json"));

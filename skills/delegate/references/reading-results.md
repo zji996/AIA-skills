@@ -34,18 +34,18 @@ state 通常描述答复。普通只读任务写文件仍是 `answered`（`--she
 ## 等待的细节
 
 - 每任务只允许一个等待者；已有活等待者时跳过，全被覆盖退出 `76`，通知给原等待者。上下文压缩后旧等待者可能仍占着，此时用 `status` 看结局、`result <name>` 读答复，不必再等。
-- 无参 `wait` 只收本会话，无会话标识时收全部；`--all` 收本仓库全部并等齐，`--machine` 收整机；带名字的 `wait <run>...` 默认也在任一任务自主结束时返回（delivered/answered/提问/failed 等；不以主控 stop 唤醒；依赖 skipped 明报原因与重启命令，全部被取消时无交付可收），旧交付首行说明；`--all` 或 `--until-all` 等范围内全部结束（单次最多 50 分钟，超时列仍在跑的 run）。
+- 无参 `wait` 只收本会话，无会话标识时收全部；`--all` 收本仓库全部并等齐，`--machine` 收整机；无参及带名字的 `wait`/`wait --any` 在任一任务进入终态或提问态时返回（不以主控 stop 唤醒），列出上次 wait 之后所有已结束与提问的 run（首个给全文，其余给一行摘要加 `result` 查看命令），旧交付首行说明；`--all` 或 `--until-all` 等范围内全部结束（单次最多 50 分钟，超时列仍在跑的 run）。6.21.x 遗留的 `--after` 等待任务会标为「需要重派」并给出重派命令，不会静默挂住。
 - 宿主能把后台进程的每行输出变成事件时（Claude Code 的 Monitor）可用 `wait --stream`。宿主没有完成唤醒时不会自动收到结果：在自己的步骤之间用 `wait --max 4m` 主动收取，返回 `75` 后再等。Claude Code 的 `hooks/claude-code-background.py` 可拒绝前台等待。
 - 脚本加 `--json`：`completionTiming` 区分旧结果与等待中新完成，`sourceDrift.overlap` 提示源改动重叠。
 - 只看过截断答复的任务 `clean --finished` 会保留，读过全文（`result <name>`）或加 `--force` 才删。
 
 ## 保护路径与生成物
 
-`start --allow <path>` 在保护范围内按次开放，reply/fresh 继承，其他路径仍保护。`--protect`/`--protect-reason` 与 `generated.paths` 重叠时只允许生成命令改动，收尾复跑核对，产出不一致报“生成物被手改”。同事需要改受保护路径时须停下报告，不得搬逻辑或削弱测试绕路。
+`start`/`reply` 的 `--allow <path>` 在保护范围内按次开放，后续 reply/fresh 继承，其他路径仍保护；任务正文提及受保护前缀下未放开的路径时，启动回显提示补 `--allow`，并在 `status`/`wait` 标出 `promptProtectedPaths`（仅提示不拦截）。`--protect`/`--protect-reason` 与 `generated.paths` 重叠时只允许生成命令改动，收尾复跑核对，产出不一致报“生成物被手改”。同事需要改受保护路径时须停下报告，不得搬逻辑或削弱测试绕路。
 
 ## 边界
 
-1. **容量**：整机/仓库防失控默认 32/0（不限），git worktree 算同仓库；实际限流靠模型并发、重命令 `maxHeavy`（默认 2）和可用内存水位（默认 4096 MB）。不足时创建 run 并自动排队，`status` 看原因与前方人数，JSON 看 `queue`；不需重派，也不擅自换模型。`--after` 先等上游，再排容量。验收、证据、setup、`lane` 排队不计时。上限由用户设定，同事不要自行调整。
+1. **容量**：整机/仓库防失控默认 32/0（不限），git worktree 算同仓库；实际限流靠模型并发、重命令 `maxHeavy`（默认 2）和可用内存水位（默认 4096 MB）。不足时创建 run 并自动排队，`status` 看原因与前方人数，JSON 看 `queue`；不需重派，也不擅自换模型。验收、证据、setup、`lane` 排队不计时。上限由用户设定，同事不要自行调整。
 2. **只读**：git 仓库里默认读启动时的工作区快照（独立 worktree，含未提交改动），你可以同时改代码；要读实时工作区加 `--in-place`。Pi 默认只给读取/搜索工具；加 `--shell` 才能在快照里查日志/跑只读查询，产生文件改动会拒收；非 git 或 `--in-place` 不支持 shell。只读靠约定与事后核对，不是权限沙箱。
 3. **写入**：原地写入同一目录同时只能有一个，且你同时改的文件会算进它的改动；要并行或不想被打扰就加 `--worktree`。同源已有写入任务在运行时，不带 `--worktree` 的写入任务会自动改用 worktree，把源工作区留给你 apply；`apply` 时如果有原地写入任务正在改源工作区，会警告。
 4. **worktree 依赖与验收**：`worktree.copy` 复制忽略材料，或用 `link`/`setup`（`writeSetup` 仅写入）；缺源/空源带 `warnings`。`env` 注入同事、验收、证据和 setup；`accept`/`evidence` 是写入默认，只读不用；CLI 覆盖或关闭。合并后主干默认复验验收没法沿用的任务，`applyVerify: false` 关闭。别 link `node_modules`/`.venv`。

@@ -31,8 +31,7 @@ const LAUNCH: &[(&str, &str)] = &[
     ("--thinking LEVEL", "off|minimal|low|medium|high|xhigh. Environment > CLI > tier rule > alias thinking > config thinking > Pi default; independent of the model name."),
     ("--allow-parallel-writes", "Allow concurrent write runs in one workdir."),
     ("--worktree", "Write in a detached git worktree seeded from the current tree; merge with apply."),
-    ("--after RUN", "Wait for RUN to finish successfully before starting this step; waiting uses no active slot. A write step after a write run starts from RUN's changes; apply RUN first."),
-    ("--in RUN", "Read-only: review a separate snapshot of RUN's worktree after it finishes."),
+    ("--in RUN", "Read-only: review a separate snapshot of a finished RUN's worktree."),
 ];
 
 const COLLECT: &[(&str, &str)] = &[
@@ -58,6 +57,7 @@ const REPLY: &[(&str, &str)] = &[
     ("--accept-also COMMAND", "Append with && after --accept or the inherited acceptance command; repeatable, ordered. Runs alone if no base command exists."),
     ("--no-accept", "Remove the parent's acceptance command; conflicts with --accept-also."),
     ("--protect / --protect-reason", "Protected paths and reasons are inherited from the previous run and cannot be changed in reply."),
+    ("--allow PATH", "Open a protected path for this reply and its follow-up replies only; repeatable, inside a protected path. Directories may use a trailing /. Echoed at start."),
     ("--hide-accept", "Keep the acceptance command from the agent."),
     ("--accept-timeout DURATION", "Acceptance command limit (inherited; default: .delegate.json acceptTimeout, else 10m)."),
     ("--evidence COMMAND", "Replace the inherited evidence command; failure never changes state or exit code."),
@@ -150,8 +150,8 @@ pub fn print(command: Option<&str>) -> bool {
             ("-h, --help", "Show this help."),
             ("--version", "Show the Cargo package version."),
         ]);
-        println!("Capacity: maxActive=32 and repoMaxActive=0 (unlimited) are runaway guards; model maxActive, maxHeavy=2 and available memory are the actual throttles. Shortages queue without a timeout or new worktree/pool claim. status shows queue reason/ahead/since; queued runs have no runtime elapsed. --after waits upstream before joining; stop cancels. Lost supervisors/reboots leave crashed runs, like deferred runs; no automatic recovery.");
-        println!("\nStates: waiting | running | delivered (accept passed) | answered (no --accept) | skipped (upstream failed) | rejected (accept failed or protected path changed) | malformed (empty or leaked tool call after reruns) | failed | timeout | stalled | killed | stopped | crashed.");
+        println!("Capacity: maxActive=32 and repoMaxActive=0 (unlimited) are runaway guards; model maxActive, maxHeavy=2 and available memory are the actual throttles. Shortages queue without a timeout or new worktree/pool claim. status shows queue reason/ahead/since; queued runs have no runtime elapsed. stop cancels. Lost supervisors/reboots leave crashed runs, like deferred runs; no automatic recovery.");
+        println!("\nStates: waiting | running | delivered (accept passed) | answered (no --accept) | rejected (accept failed or protected path changed) | malformed (empty or leaked tool call after reruns) | failed | timeout | stalled | killed | stopped | crashed | needs-redispatch (legacy --after run from 6.21.x).");
         println!(
             "An interrupted upstream (cut stream, reset or timed-out connection, 502/503/504, a 429 Pi did not retry) is not the task failing: the run waits 15s/45s/120s, checks the model through `probe`'s path, and continues the same session up to 3 times (DELEGATE_RESUME_BACKOFF, `0` off); `status --json` reports `resumes` and `transientError`. Auth failures, 400s and missing models are not retried."
         );
@@ -177,12 +177,13 @@ pub fn print(command: Option<&str>) -> bool {
             ("--machine", "Collect active and waiting runs registered across all repositories on this machine."),
             ("--json", "Print complete JSON fields instead of concise status lines. Tasks covered by another live waiter are skipped; exit 76 when all are covered."),
             ("--no-result", "Print only the outcome line."),
-            ("--any", "Return once any selected run finishes (the default for no arguments and named runs); skip answers already reported."),
+            ("--any", "Return once any selected run finishes or asks a question (the default for no arguments and named runs); lists every run settled since the previous wait (full answer for the first, one-line summary + result command for the rest)."),
             ("--until-all", "Wait until every selected run finishes before returning; Alias of --all for waiting semantics."),
             ("--stream", "Print one outcome line per run as each finishes (answers are read with wait <run>) and exit when none is left; without run arguments it also picks up runs this caller starts meanwhile. For hosts that turn each output line into a notification."),
         ]),
-        "status" | "list" => ("[runs ...]", "Print one concise status line per run.", &[
-            ("runs", "Run ids or directories (default: all runs)."),
+        "status" | "list" => ("[--all] [--json] [runs ...]", "Print one concise status line per run. With no runs, shows active runs, runs finished within 24h and not cleaned, and runs started by this session; summarizes older uncleaned runs in one line.", &[
+            ("runs", "Run ids or directories (default: active, uncleaned within 24h, and current session)."),
+            ("--all", "List all runs regardless of age or cleanup state."),
             ("--json", "Print the existing complete JSON status structure."),
         ]),
         "result" => ("[--path] [run]", "Print a run's full answer.", &[

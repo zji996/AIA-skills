@@ -229,7 +229,7 @@ fn format_status(status: serde_json::Value) -> String {
         "tier",
         "mode",
         "parent",
-        "after",
+        "redispatch",
         "worktree",
         "ageSeconds",
         "elapsedSeconds",
@@ -244,6 +244,7 @@ fn format_status(status: serde_json::Value) -> String {
         "readOnlyViolation",
         "protectViolation",
         "protectViolationReasons",
+        "promptProtectedPaths",
         "workspaceChanged",
         "escalatedFrom",
         "queuedSeconds",
@@ -317,7 +318,7 @@ fn hint_concurrent_writes(created: &Path) {
             },
             if named > 0 {
                 format!(
-                    "; this prompt names {named} of them ({}): consider --after {} or --protect",
+                    "; this prompt names {named} of them ({}): consider waiting for {} or using --protect",
                     other["named"]
                         .as_array()
                         .unwrap()
@@ -729,6 +730,27 @@ fn wait_remaining_hint(args: &[String]) {
             })
         })
         .count();
+    let undelivered = list
+        .iter()
+        .filter(|run| {
+            let st = runs::state(run);
+            !runs::active(&st)
+                && !run.join(".delivered").exists()
+                && !run.join(".stopped").exists()
+                && st != "stopped"
+        })
+        .filter(|run| {
+            session.as_ref().is_none_or(|id| {
+                json(run.join("meta.json"))["caller"].as_str() == Some(id.as_str())
+            })
+        })
+        .count();
+    if undelivered > 0 {
+        println!(
+            "另有 {undelivered} 个本会话已结束未收取，运行 {} wait 收取",
+            script().display()
+        );
+    }
     if left == 0 {
         println!("本会话没有在跑的任务");
     } else {
@@ -803,6 +825,27 @@ fn wait_each(
         reported.extend(list.iter().filter(|r| {
             r.join(".stopped").exists() || runs::state(r) == "stopped"
         }).cloned());
+        let rescan_into =
+            |list: &mut Vec<PathBuf>,
+             covered: &mut std::collections::HashSet<PathBuf>,
+             claims: &mut Vec<std::fs::File>| {
+                if let Some((pos, flags)) = rescan {
+                    if let Ok((fresh, _)) = wait_list(pos, flags, true) {
+                        for run in fresh {
+                            if !list.contains(&run) && !covered.contains(&run) {
+                                if let Ok((fresh, held)) = waiting::claim(std::slice::from_ref(&run))
+                                {
+                                    if fresh.is_empty() {
+                                        covered.insert(run);
+                                    }
+                                    list.extend(fresh);
+                                    claims.extend(held);
+                                }
+                            }
+                        }
+                    }
+                }
+            };
         let done = list
             .iter()
             .filter(|r| !reported.contains(*r) && !runs::active(&runs::state(r)))
@@ -837,11 +880,70 @@ fn wait_each(
                         code = 1;
                     }
                 }
+                reported.extend(done);
             } else {
-                code = collect_timed(&done, None, false, full, show_result, Some(&already), next);
+                // Report every run that settled since the previous wait:
+                // full answer for the first, one-line summary + view command for the rest.
+                rescan_into(&mut list, &mut covered, &mut claims);
+                reported.extend(
+                    list.iter()
+                        .filter(|r| r.join(".stopped").exists() || runs::state(r) == "stopped")
+                        .cloned(),
+                );
+                let mut settled = list
+                    .iter()
+                    .filter(|r| !reported.contains(*r) && !runs::active(&runs::state(r)))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                code = collect_timed(&settled[..1], None, false, full, show_result, Some(&already), next);
+                reported.insert(settled[0].clone());
+                // Pick up any sibling run that settled while the first answer was printed.
+                rescan_into(&mut list, &mut covered, &mut claims);
+                reported.extend(
+                    list.iter()
+                        .filter(|r| r.join(".stopped").exists() || runs::state(r) == "stopped")
+                        .cloned(),
+                );
+                for run in &list {
+                    if !reported.contains(run)
+                        && !runs::active(&runs::state(run))
+                        && !settled.contains(run)
+                    {
+                        settled.push(run.clone());
+                    }
+                }
+                for run in settled.iter().skip(1) {
+                    let state = runs::state(run);
+                    let id = run
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    let has_result = run.join("result.md").is_file();
+                    let mut line = outcome_line(run, Some(completion_timing(&already, run)));
+                    if has_result && show_result {
+                        if output::json_enabled() {
+                            line.pop();
+                            line.push_str(&format!(
+                                ",\"summaryOnly\":true,\"view\":{}}}",
+                                json!(format!("{} result {id}", script().display()))
+                            ));
+                        } else {
+                            line.push_str(&format!(" · 查看全文：{} result {id}", script().display()));
+                        }
+                        touch(run.join(".truncated"));
+                        touch(run.join(".delivered"));
+                    } else if !has_result {
+                        touch(run.join(".delivered"));
+                    }
+                    println!("{line}");
+                    if !["delivered", "answered"].contains(&state.as_str()) && code == 0 {
+                        code = 1;
+                    }
+                    reported.insert(run.clone());
+                }
             }
             delivered = true;
-            reported.extend(done);
             if !stream {
                 break;
             }
@@ -914,7 +1016,7 @@ fn wait_each(
     }
     let left = list
         .iter()
-        .filter(|r| !reported.contains(*r))
+        .filter(|r| !reported.contains(*r) && runs::active(&runs::state(r)))
         .map(|r| {
             r.file_name()
                 .unwrap_or_default()
@@ -1072,7 +1174,7 @@ fn stop(args: &[String]) -> Res<i32> {
             cleanup::record(&run, pid);
             kill_group(pid, 1.0);
         }
-        if runs::active(&old) {
+        if runs::active(&old) || runs::supervisor_alive(&run) {
             let pid = read(run.join("pid")).trim().parse::<i32>().unwrap_or(0);
             if pid > 0 {
                 unsafe {
@@ -1244,7 +1346,12 @@ fn apply(args: &[String]) -> Res<i32> {
     };
     let mut targets = Vec::new();
     for name in &names {
-        let run = runs::latest(runs::resolve(name)?);
+        let resolved = runs::resolve(name)?;
+        let run = if runs::continues_conversation(&resolved) {
+            runs::latest(resolved)
+        } else {
+            resolved
+        };
         if runs::active(&runs::state(&run)) {
             return Err(format!(
                 "{} is still running",
@@ -1273,9 +1380,19 @@ fn apply(args: &[String]) -> Res<i32> {
         let keep_commits = has(&flags, "--keep-commits") || b(&meta["defaults"], "keepCommits");
         let mut outcome = worktree::apply(run, has(&flags, "--merge"), dry, keep_commits)?;
         if run.join(".applied").exists() {
-            let path = s(&json(run.join("meta.json"))["worktree"], "path").to_string();
+            let run_meta = json(run.join("meta.json"));
+            let path = s(&run_meta["worktree"], "path").to_string();
+            let run_ns = run_meta["startedNs"].as_u64().unwrap_or(0);
             for other in runs::all_runs() {
-                if s(&json(other.join("meta.json"))["worktree"], "path") == path {
+                if other == *run {
+                    continue;
+                }
+                let other_meta = json(other.join("meta.json"));
+                let other_ns = other_meta["startedNs"].as_u64().unwrap_or(0);
+                if s(&other_meta["worktree"], "path") == path
+                    && !runs::active(&runs::state(&other))
+                    && (other_ns <= run_ns || !runs::continues_conversation(&other))
+                {
                     let _ = write(other.join(".applied"), read(run.join(".applied")));
                     if run.join(".sync-base").is_file() {
                         let _ = write(other.join(".sync-base"), read(run.join(".sync-base")));
@@ -1383,8 +1500,10 @@ fn apply(args: &[String]) -> Res<i32> {
     }
     if code == 0 && !dry && !has(&flags, "--keep") {
         for (run, _, _) in &done {
-            for diagnostic in runs::remove_after_apply(run) {
-                eprintln!("delegate: apply cleanup: {diagnostic}");
+            if worktree::clean_on_apply(run) {
+                for diagnostic in runs::remove_after_apply(run) {
+                    eprintln!("delegate: apply cleanup: {diagnostic}");
+                }
             }
         }
     }
@@ -1589,7 +1708,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
             if any || stream {
                 return Ok(wait_each(
                     list,
-                    (stream && pos.is_empty()).then_some((pos.as_slice(), flags.as_slice())),
+                    pos.is_empty().then_some((pos.as_slice(), flags.as_slice())),
                     max,
                     stream,
                     has(&flags, "--progress"),
@@ -1625,19 +1744,82 @@ fn main_inner(args: &[String]) -> Res<i32> {
             Ok(0)
         }
         "status" | "list" => {
-            let (pos, flags, _) = parse_simple(rest, &["--json"], &[])?;
+            let (pos, flags, _) = parse_simple(rest, &["--json", "--all"], &[])?;
             if has(&flags, "--json") {
                 output::enable_json();
             }
-            let list = if pos.is_empty() {
+            let show_all = has(&flags, "--all") || !pos.is_empty();
+            let all = if pos.is_empty() {
                 runs::all_runs()
             } else {
                 pos.iter()
                     .map(|x| runs::resolve_head(x))
                     .collect::<Res<Vec<_>>>()?
             };
-            for run in list {
+            let current_caller = caller();
+            let mut shown = Vec::new();
+            let mut older_uncleaned = Vec::new();
+            for run in &all {
+                if show_all {
+                    shown.push(run.clone());
+                    continue;
+                }
+                let st = runs::state(run);
+                let meta = json(run.join("meta.json"));
+                let is_active = runs::active(&st) || st == "needs-redispatch";
+                let is_session = current_caller
+                    .as_deref()
+                    .is_some_and(|id| meta["caller"].as_str() == Some(id));
+                let cleaned = run.join(".applied-cleaned").exists();
+                let is_recent_uncleaned = !cleaned && runs::finished_within(run, 86400.0);
+                if is_active || is_session || is_recent_uncleaned {
+                    shown.push(run.clone());
+                } else if !cleaned {
+                    older_uncleaned.push(run.clone());
+                }
+            }
+            for run in shown {
                 println!("{}", status_line(&run));
+            }
+            if !older_uncleaned.is_empty() {
+                let active_paths: std::collections::BTreeSet<_> = all
+                    .iter()
+                    .filter(|run| runs::active(&runs::state(run)))
+                    .map(|run| s(&json(run.join("meta.json"))["worktree"], "path").to_string())
+                    .collect();
+                let mut seen = std::collections::BTreeSet::new();
+                let mut total_bytes = 0u64;
+                for run in &older_uncleaned {
+                    let meta = json(run.join("meta.json"));
+                    let path = s(&meta["worktree"], "path");
+                    if !path.is_empty()
+                        && Path::new(path).is_dir()
+                        && !active_paths.contains(path)
+                        && seen.insert(path.to_string())
+                    {
+                        total_bytes = total_bytes
+                            .saturating_add(meta["worktreeBytes"].as_u64().unwrap_or(0));
+                    }
+                }
+                let all_cmd = format!("{} status --all", script().display());
+                let clean_cmd = format!("{} clean --finished", script().display());
+                if output::json_enabled() {
+                    println!(
+                        "{}",
+                        json!({"olderUncleaned":{
+                            "count": older_uncleaned.len(),
+                            "bytes": total_bytes,
+                            "all": all_cmd,
+                            "clean": clean_cmd
+                        }})
+                    );
+                } else {
+                    println!(
+                        "更早未清理：{} 个，占 {}；查看全部：{all_cmd}；清理：{clean_cmd}（含未读/未合入加 --force）",
+                        older_uncleaned.len(),
+                        format_bytes(total_bytes)
+                    );
+                }
             }
             if !output::json_enabled() {
                 for (label, since, running) in lane::remote_holders()? {

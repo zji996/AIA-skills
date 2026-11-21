@@ -24,11 +24,11 @@ remote 生效时，同事的 argv0 命中 programs 就转给 `_remote`；按名�
 
 `${XDG_STATE_HOME}/delegate/lane-remote/` 复用票 + flock 的 FIFO，宽度独立取 remote.maxHeavy；同事中途编译也排队，stderr 一行提示，等待记入 run 的 lane-wait，排队不计运行超时。`lane`/人读 `status` 列远端 running/queued 持有者；run JSON 的 remoteLane 含 holders 与 queued 人数。每个远端槽的上传/执行/下载再用本机 flock 串行，避免同事并行 bash 互删文件。
 
-槽路径是 `<root>/<repo-key SHA1 前12位>/<worktree目录名>`，repo key 沿用本地 Git common-dir 身份，同仓库池槽保持固定目录与温热缓存。每次从工作树根双向 `rsync -a --delete --filter=':- .gitignore' --exclude=/.git --exclude=/target`，保留被忽略的 target/node_modules 等；额外使用 protect-args 并排除本工具瞬时 PID/取消文件。不做 dereference，worktree.link 符号链接原样传；远端目标缺失由 profile 处理。**不传 .git**（worktree 的 .git 指向本机）：需要 git 的构建命令会失败，这是已知限制。cwd 保持相对工作树根的位置；stdout/stderr 逐行把远端槽绝对路径改成本机路径，参数/环境逐项 shell quote，stdin 转给 SSH，完成后即使命令非零也回传源改动，原样返回程序退出码（包括 255）。
+槽路径是 `<root>/<repo-key SHA1 前12位>/<worktree目录名>`，repo key 沿用本地 Git common-dir 身份，同仓库池槽保持固定目录与温热缓存。主同步从工作树根双向 `rsync -a --delete --filter=':- .gitignore' --exclude=/.git --exclude=/target` 并排除托管路径；随后处理托管路径以保证远程验收与本地等价：`worktree.copy` 在上限内（默认 50 MiB，`DELEGATE_REMOTE_COPY_MAX_BYTES`）直接无 `.gitignore` 过滤同步；`worktree.link`（含仓内 `--share`）若远端存在同绝对路径则建符号链接，否则体积在上限内时排除 `.git`/`target`/`node_modules` 同步。超过上限且远端缺失时，验收/verify 自动回退到本地执行并在结果 `localFallback` 与状态行写明原因（SSH/rsync 传输故障仍失败关闭、绝不回退）。**不传 .git**（worktree 的 .git 指向本机）：需要 git 的构建命令会失败，这是已知限制。cwd 保持相对工作树根的位置；stdout/stderr 逐行把远端槽绝对路径改成本机路径，参数/环境逐项 shell quote，stdin 转给 SSH，完成后即使命令非零也回传源改动，原样返回程序退出码（包括 255）。
 
 有 slice 时 `systemd-run --user --unit=delegate-<id> --slice=… --wait --pipe --collect --quiet --working-directory=… -E …` 包住命令；无 slice 用 setsid 进程组与唯一 PID 文件。SIGTERM/INT/HUP 写远端取消标记、停止进程组，有 slice 再 `systemctl --user stop`，随后结束本机 SSH；标记防止取消恰好早于远端启动的竞态。远端连接断开时也尝试清理。传输失败 stderr 一行 `delegate remote: ci unreachable (<原因>); remote mode does not fall back to local`，退出 75，**绝不回退本机**；网络完全断开时不能确认远端回收，恢复连通后须检查。
 
-验收的传输故障在 summary/status 标为 infrastructureFailure，命令未执行另标 accept.notExecuted；程序自身退出 75 仍是执行失败。远端槽锁排队也从 shell 执行超时中扣除；未执行不产生 acceptStillValid=false（apply 记 acceptPending），apply 给重排与本地跑命令，重试不占返工预算。`--after` 等未执行的上游 reply 重试，不静默跳过；确实失败才 skipped，由 wait 报原因与 reply --fresh 重启命令。clean/apply 清理非池化独占工作树时顺带删远端槽；池槽保留。远端不可达只诊断，不阻止本机清理。
+验收的传输故障在 summary/status 标为 infrastructureFailure，命令未执行另标 accept.notExecuted；程序自身退出 75 仍是执行失败。远端槽锁排队也从 shell 执行超时中扣除；未执行不产生 acceptStillValid=false（apply 记 acceptPending），apply 给重排与本地跑命令，重试不占返工预算。clean/apply 清理非池化独占工作树时顺带删远端槽；池槽保留。远端不可达只诊断，不阻止本机清理。
 
 ### 后台服务回收
 

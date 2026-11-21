@@ -62,7 +62,6 @@ pub struct Options {
     pub progress: bool,
     pub full: bool,
     pub run: Option<String>,
-    pub after: Option<String>,
     pub in_run: Option<String>,
     pub minor: bool,
     pub over_limit: Option<String>,
@@ -109,7 +108,6 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--in-place",
                 "--worktree",
                 "--protect",
-                "--allow",
                 "--protect-reason",
                 "--retries",
                 "--provider",
@@ -230,7 +228,9 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 "--class" => { crate::fit::validate_class(&v)?; o.class = Some(v); },
                 "--thinking" => { models::validate_thinking(&v)?; o.thinking = Some(v.clone()); o.thinking_cli = Some(v); },
                 "--max" => o.max = Some(seconds(&v)?),
-                "--after" => o.after = Some(v),
+                "--after" => {
+                    return Err("--after was removed in 6.22.0: wait for the upstream run and start the next step directly".into())
+                }
                 "--in" => o.in_run = Some(v),
                 "--over-limit" if reply => o.over_limit = Some(v),
                 _ => {}
@@ -300,7 +300,6 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             || o.worktree
             || o.parallel
             || o.provider.is_some()
-            || o.after.is_some()
             || o.in_run.is_some()
         {
             return Err("unrecognized reply option".into());
@@ -728,17 +727,123 @@ fn standing_text(config: &crate::config::Config, read_only: bool, deny: &Value) 
     (text.join("\n"), sources)
 }
 
+pub(crate) fn protected_paths_in_prompt(
+    prompt: &str,
+    repo: Option<&Path>,
+    protect: &[String],
+    allow: &[String],
+) -> Vec<String> {
+    if protect.is_empty() {
+        return Vec::new();
+    }
+    let repo_prefix = repo
+        .map(|p| p.to_string_lossy().trim_end_matches('/').to_string())
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("{p}/"));
+    let mut found = std::collections::BTreeSet::new();
+    let bytes = prompt.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !(b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'.' | b'+')) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric()
+                || matches!(bytes[i], b'/' | b'_' | b'-' | b'.' | b'+'))
+        {
+            i += 1;
+        }
+        // Skip URLs such as https://example.com/apps/foo.
+        if start >= 1 && bytes[start - 1] == b':' && bytes[start..i].starts_with(b"//") {
+            continue;
+        }
+        let mut token = &prompt[start..i];
+        while let Some(stripped) = token.strip_prefix("./") {
+            token = stripped;
+        }
+        token = token.trim_end_matches('.');
+        if token.is_empty() {
+            continue;
+        }
+        if token.starts_with('/') {
+            if let Some(prefix) = &repo_prefix {
+                if let Some(rel) = token.strip_prefix(prefix.as_str()) {
+                    token = rel;
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        }
+        let dir = token.ends_with('/');
+        let parts = Path::new(token).components().collect::<Vec<_>>();
+        if parts.is_empty()
+            || parts
+                .iter()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            continue;
+        }
+        let mut norm = parts
+            .iter()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        if dir {
+            norm.push('/');
+        }
+        if worktree::matches_rule(&norm, protect) && !worktree::matches_rule(&norm, allow) {
+            found.insert(norm);
+        }
+    }
+    found.into_iter().collect()
+}
+
+fn note_prompt_protected_paths(paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
+    let flags = paths
+        .iter()
+        .map(|p| format!("--allow {}", shell_quote(p)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!(
+        "delegate: note: prompt mentions protected path(s) without --allow: {} (if edits are intended, add: {flags}) / 提示：正文提到受保护路径 {}（如需修改请加：{flags}）",
+        paths.join(", "),
+        paths.join("、"),
+    );
+}
+
+fn validate_allow(allow: &mut Vec<String>, repo: Option<&Path>, protect: &[String]) -> Res<()> {
+    for path in allow.iter_mut() {
+        if repo.is_some_and(|top| top.join(&*path).is_dir()) && !path.ends_with('/') {
+            path.push('/');
+        }
+    }
+    normalize_protect(allow)?;
+    for path in allow.iter() {
+        if !worktree::matches_rule(path, protect) {
+            return Err(format!("--allow must be inside a protected path: {path}"));
+        }
+    }
+    Ok(())
+}
+
 pub fn start(mut o: Options) -> Res<PathBuf> {
     if let Some(e) = nesting_error() {
         return Err(e);
     }
     choose_tier(&mut o)?;
     let prompt = read_prompt(&mut o)?;
-    let after = o.after.as_deref().map(runs::resolve).transpose()?;
     let in_run = o.in_run.as_deref().map(runs::resolve).transpose()?;
     if let Some(upstream) = &in_run {
-        if after.is_none() && active(&state(upstream)) {
-            return Err("--in requires a finished run unless --after is given".into());
+        if active(&state(upstream)) {
+            return Err("--in requires a finished run".into());
         }
         let prior = json(upstream.join("meta.json"));
         if !prior["worktree"].is_object() || s(&prior["worktree"], "path").is_empty() {
@@ -803,18 +908,16 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         return Err("--protect needs a git repository".into());
     }
     normalize_protect(&mut o.protect)?;
-    for path in &mut o.allow {
-        if repo.as_ref().is_some_and(|top| top.join(&*path).is_dir()) && !path.ends_with('/') { path.push('/'); }
-    }
-    normalize_protect(&mut o.allow)?;
-    for path in &o.allow {
-        if !worktree::matches_rule(path, &o.protect) {
-            return Err(format!("--allow must be inside a protected path: {path}"));
-        }
-    }
+    validate_allow(&mut o.allow, repo.as_deref(), &o.protect)?;
     if !o.allow.is_empty() {
         eprintln!("delegate: open for this task / 本次开放：{}", o.allow.join(", "));
     }
+    let prompt_protected = if o.read_only {
+        Vec::new()
+    } else {
+        protected_paths_in_prompt(&prompt, repo.as_deref(), &o.protect, &o.allow)
+    };
+    note_prompt_protected_paths(&prompt_protected);
     let capacities = crate::config::capacities(&config.value)?;
     if !config.ignored.is_empty() {
         eprintln!(
@@ -917,8 +1020,8 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         ));
     }
     let mode = if o.read_only { "read-only" } else { "write" };
-    if let Some(upstream) = &after {
-        extra["after"] = json!(upstream);
+    if !prompt_protected.is_empty() {
+        extra["promptProtectedPaths"] = json!(prompt_protected);
     }
     launch(o, &prompt, &workdir, mode, &extra, None)
 }
@@ -1127,7 +1230,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         o.tier_inferred = b(&meta, "tierInferred");
     }
     o.retries = n(&meta, "retries");
-    o.allow = strings(&meta["allow"]);
+    let mut added_allow = std::mem::take(&mut o.allow);
     o.protect = meta["protect"]
         .as_array()
         .map(|paths| {
@@ -1151,6 +1254,19 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
                 .collect()
         })
         .unwrap_or_default();
+    let allow_top = Some(s(&meta["worktree"], "source"))
+        .filter(|x| !x.is_empty())
+        .or_else(|| Some(s(&meta, "top")).filter(|x| !x.is_empty()))
+        .map(Path::new);
+    validate_allow(&mut added_allow, allow_top, &o.protect)?;
+    let mut merged_allow = strings(&meta["allow"]);
+    merged_allow.extend(added_allow.iter().cloned());
+    merged_allow.sort();
+    merged_allow.dedup();
+    o.allow = merged_allow;
+    if !added_allow.is_empty() {
+        eprintln!("delegate: open for this task / 本次开放：{}", o.allow.join(", "));
+    }
     if o.timeout.is_none() {
         if o.minor {
             o.timeout = Some("10m".into());
@@ -1182,6 +1298,12 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         o.max_answer = meta["maxAnswer"].as_u64();
     }
     let prompt = read_prompt(&mut o)?;
+    let prompt_protected = if o.read_only {
+        Vec::new()
+    } else {
+        protected_paths_in_prompt(&prompt, allow_top, &o.protect, &o.allow)
+    };
+    note_prompt_protected_paths(&prompt_protected);
     let prompt = if compose_after_apply {
         format!(
             "原任务说明：\n{}\n\n上次答复：\n{}\n\n这次的追加说明：\n{}",
@@ -1290,6 +1412,20 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         }
     }
     extra["protectGenerated"] = meta["protectGenerated"].clone();
+    if !added_allow.is_empty() && extra["protectGenerated"].is_object() {
+        let kept: Vec<String> = strings(&extra["protectGenerated"]["paths"])
+            .into_iter()
+            .filter(|path| !worktree::matches_rule(path, &o.allow))
+            .collect();
+        if kept.is_empty() {
+            extra.as_object_mut().unwrap().remove("protectGenerated");
+        } else {
+            extra["protectGenerated"]["paths"] = json!(kept);
+        }
+    }
+    if !prompt_protected.is_empty() {
+        extra["promptProtectedPaths"] = json!(prompt_protected);
+    }
     extra["agentDeny"] = meta["agentDeny"].clone();
     extra["defaults"] = meta["defaults"].clone();
     if let Some(defaults) = extra["defaults"].as_object_mut() {
@@ -1580,14 +1716,12 @@ pub fn launch(
     let _machine = lock(&slots.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
     let _local = lock(&root.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
     let active_runs = active_machine(&slots);
-    let after = extra["after"].is_string();
     let source = s(&extra["worktree"], "source");
     let repo = repo_key(if source.is_empty() {
         workdir
     } else {
         Path::new(source)
     });
-    // Validate settings even when waiting on an upstream.
     capacity(&active_runs, &extra["configCapacity"], &repo)?;
     let mut extra = extra.clone();
     if let Some(overflow) = &o.overflow {
@@ -1612,7 +1746,7 @@ pub fn launch(
         "model":o.model,"modelCap":model_cap,"parent":extra["parent"]["run"],
         "queuedNs":now_ns() as u64});
     let reason = crate::queue::reason(&admission, &active_runs)?;
-    let deferred = after || reason.is_some();
+    let deferred = reason.is_some();
     let extra = &extra;
     if !deferred && mode == "write" && !o.parallel && !extra["worktree"].is_object() {
         for run in all_runs() {
@@ -1977,7 +2111,7 @@ pub fn launch(
         .map(seconds)
         .transpose()?
         .unwrap_or(0.0);
-    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":crate::agy::colleague(o.model.as_deref().unwrap_or("")),"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":timeout_seconds,"accept":o.accept,"acceptTimeoutSeconds":seconds(o.accept_timeout.as_deref().unwrap_or("10m"))? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !b(extra,"newAfterApply") && !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"after":extra["after"],"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
+    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":crate::agy::colleague(o.model.as_deref().unwrap_or("")),"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":timeout_seconds,"accept":o.accept,"acceptTimeoutSeconds":seconds(o.accept_timeout.as_deref().unwrap_or("10m"))? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !b(extra,"newAfterApply") && !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
     // A forked session continues on the executable that wrote it: Pi and rpi
     // keep different session formats.
     let parent_bin = s(parent, "agentBin");
@@ -2056,6 +2190,12 @@ pub fn launch(
     if !o.protect_reasons.is_empty() {
         meta["protectReasons"] = json!(o.protect_reasons);
     }
+    if extra["promptProtectedPaths"]
+        .as_array()
+        .is_some_and(|items| !items.is_empty())
+    {
+        meta["promptProtectedPaths"] = extra["promptProtectedPaths"].clone();
+    }
     if let Some(rework) = &o.rework {
         meta["rework"] = rework.clone();
     }
@@ -2065,10 +2205,12 @@ pub fn launch(
     }
     if deferred {
         touch(run.join(".waiting"));
-        if !after {
-            crate::queue::enter(&run, &mut meta)?;
-            crate::queue::update(&run, reason.as_deref().unwrap_or("总路数"), 0)?;
-        }
+        crate::queue::enter(&run, &mut meta)?;
+        crate::queue::update(
+            &run,
+            reason.as_deref().unwrap_or("总路数"),
+            crate::queue::ahead(&meta),
+        )?;
     }
     runs::prune();
     let hash = sha1_smol::Sha1::from(run.to_string_lossy().as_bytes())
@@ -2168,5 +2310,19 @@ mod purpose_tests {
         for tier in ["cheap", "strong", "default", "vision"] {
             assert!(parse(&["--tier", tier, "task"], false).is_err());
         }
+        assert!(parse(&["--after", "prev", "task"], false).is_err());
+        assert!(parse(&["last", "--allow", "apps/web/", "go"], true).is_ok());
+    }
+
+    #[test]
+    fn prompt_protected_path_extraction_handles_prose_and_allow() {
+        let protect = vec!["apps/".to_string(), "Cargo.toml".to_string()];
+        let found = protected_paths_in_prompt(
+            "请修改apps/web/src/App.tsx:42和 `apps/api/`，参考 https://example.com/apps/x 与 Cargo.toml。",
+            None,
+            &protect,
+            &["apps/api/".to_string()],
+        );
+        assert_eq!(found, vec!["Cargo.toml", "apps/web/src/App.tsx"]);
     }
 }

@@ -180,7 +180,216 @@ fn top_for(meta: &Value, cwd: &Path) -> Res<PathBuf> {
         })
         .ok_or("remote: cwd must be inside a worktree".into())
 }
-fn sync(host: &str, local: &Path, remote: &str, down: bool) -> Res<()> {
+fn copy_max_bytes() -> u64 {
+    setting("REMOTE_COPY_MAX_BYTES", "52428800")
+        .parse::<u64>()
+        .unwrap_or(52_428_800)
+}
+fn managed_lists(meta: &Value, top: &Path) -> (Vec<String>, Vec<String>) {
+    let copies = strings(&meta["worktree"]["config"]["copy"]);
+    let mut links = strings(&meta["worktree"]["config"]["link"]);
+    let source = Path::new(s(&meta["worktree"], "source"));
+    if !source.as_os_str().is_empty() {
+        for item in strings(&meta["share"]) {
+            if let Ok(rel) = Path::new(&item).strip_prefix(source) {
+                let rel = rel.to_string_lossy().trim_end_matches('/').to_string();
+                if !rel.is_empty() && !copies.contains(&rel) && !links.contains(&rel) {
+                    links.push(rel);
+                }
+            }
+        }
+    }
+    let _ = top;
+    (copies, links)
+}
+fn bounded_size(path: &Path, limit: u64, skip_build: bool) -> Option<u64> {
+    fn walk(path: &Path, limit: u64, skip_build: bool, total: &mut u64) -> bool {
+        let Ok(info) = fs::symlink_metadata(path) else {
+            return true;
+        };
+        if info.file_type().is_symlink() {
+            return true;
+        }
+        if info.is_file() {
+            *total = total.saturating_add(info.len());
+            return *total <= limit;
+        }
+        if info.is_dir() {
+            let Ok(entries) = fs::read_dir(path) else {
+                return false;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if skip_build
+                    && matches!(
+                        name.to_str(),
+                        Some(".git" | "target" | "node_modules")
+                    )
+                {
+                    continue;
+                }
+                if !walk(&entry.path(), limit, skip_build, total) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+    let mut total = 0u64;
+    walk(path, limit, skip_build, &mut total).then_some(total)
+}
+fn sync_path(host: &str, src: &Path, remote_dst: &str, skip_build: bool) -> Res<()> {
+    let mut c = Command::new("rsync");
+    c.args(["-a", "--protect-args"]);
+    if src.is_dir() {
+        c.arg("--delete");
+        if skip_build {
+            c.args([
+                "--exclude=/.git",
+                "--exclude=/target",
+                "--exclude=/node_modules",
+            ]);
+        }
+        c.args(["-e", "ssh -o BatchMode=yes -o ConnectTimeout=10"])
+            .arg(format!("{}/", src.display()))
+            .arg(format!("{host}:{remote_dst}/"));
+    } else {
+        c.args(["-e", "ssh -o BatchMode=yes -o ConnectTimeout=10"])
+            .arg(src)
+            .arg(format!("{host}:{remote_dst}"));
+    }
+    capture(c, 1800.0, true).map(|_| ())
+}
+/// Materialize `worktree.copy` and `worktree.link` (plus in-repo `--share`) on remote
+/// so remote acceptance sees the same workspace paths as the local worktree.
+/// Returns `(path, reason)` entries that could not be materialized on remote.
+fn sync_managed(
+    host: &str,
+    top: &Path,
+    remote: &str,
+    meta: &Value,
+) -> Res<Vec<(String, String)>> {
+    let (copies, links) = managed_lists(meta, top);
+    if copies.is_empty() && links.is_empty() {
+        return Ok(vec![]);
+    }
+    let limit = copy_max_bytes();
+    let mut missing = Vec::new();
+    let mut to_rsync: Vec<(String, PathBuf, bool)> = Vec::new();
+
+    // 1. Probe and symlink worktree.link targets in one SSH round-trip when the remote
+    //    host already has the same path; otherwise fall back to syncing if small.
+    let mut link_entries: Vec<(String, PathBuf)> = Vec::new();
+    let source = Path::new(s(&meta["worktree"], "source"));
+    for item in &links {
+        let local_path = top.join(item);
+        if !local_path.exists() && !local_path.is_symlink() {
+            continue;
+        }
+        let origin = if local_path.is_symlink() {
+            fs::read_link(&local_path)
+                .map(|target| {
+                    if target.is_absolute() {
+                        target
+                    } else {
+                        local_path.parent().unwrap_or(top).join(target)
+                    }
+                })
+                .unwrap_or_else(|_| source.join(item))
+        } else {
+            local_path.clone()
+        };
+        if !origin.exists() {
+            continue;
+        }
+        link_entries.push((item.clone(), origin));
+    }
+    if !link_entries.is_empty() {
+        let mut script = String::new();
+        for (idx, (item, origin)) in link_entries.iter().enumerate() {
+            let dst = format!("{remote}/{item}");
+            let parent = Path::new(&dst)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| remote.to_string());
+            let q_origin = shell_quote(&origin.to_string_lossy());
+            let q_dst = shell_quote(&dst);
+            let q_parent = shell_quote(&parent);
+            script.push_str(&format!(
+                "if [ -e {q_origin} ]; then mkdir -p {q_parent} && ( [ \"$(readlink {q_dst} 2>/dev/null)\" = {q_origin} ] || ( rm -rf -- {q_dst} && ln -s {q_origin} {q_dst} ) ) && printf 'LINKED:%d\\n' {idx}; else printf 'MISSING:%d\\n' {idx}; fi\n"
+            ));
+        }
+        let probe_out = output(ssh(host, &script))?;
+        for line in probe_out.lines() {
+            if let Some(rest) = line.strip_prefix("MISSING:") {
+                if let Ok(idx) = rest.trim().parse::<usize>() {
+                    if let Some((item, origin)) = link_entries.get(idx) {
+                        if bounded_size(origin, limit, true).is_some() {
+                            to_rsync.push((item.clone(), origin.clone(), true));
+                        } else {
+                            missing.push((
+                                item.clone(),
+                                format!(
+                                    "worktree.link not found on remote host and exceeds {} MiB sync limit",
+                                    limit / (1024 * 1024)
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Check worktree.copy paths: sync directly if within the size limit.
+    for item in &copies {
+        let local_path = top.join(item);
+        if !local_path.exists() && !local_path.is_symlink() {
+            continue;
+        }
+        if bounded_size(&local_path, limit, false).is_some() {
+            to_rsync.push((item.clone(), local_path, false));
+        } else {
+            missing.push((
+                item.clone(),
+                format!(
+                    "worktree.copy exceeds {} MiB remote sync limit",
+                    limit / (1024 * 1024)
+                ),
+            ));
+        }
+    }
+
+    // 3. Prepare remote parent dirs and rsync all small copy/link items.
+    if !to_rsync.is_empty() {
+        let mut prep = String::new();
+        for (item, src, _) in &to_rsync {
+            let dst = format!("{remote}/{item}");
+            let parent = Path::new(&dst)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| remote.to_string());
+            let q_dst = shell_quote(&dst);
+            let q_parent = shell_quote(&parent);
+            if src.is_dir() {
+                prep.push_str(&format!(
+                    "if [ -L {q_dst} ] || [ -f {q_dst} ]; then rm -f -- {q_dst}; fi; mkdir -p {q_dst}\n"
+                ));
+            } else {
+                prep.push_str(&format!(
+                    "mkdir -p {q_parent} && if [ -L {q_dst} ] || [ -d {q_dst} ]; then rm -rf -- {q_dst}; fi\n"
+                ));
+            }
+        }
+        output(ssh(host, &prep))?;
+        for (item, src, skip_build) in &to_rsync {
+            let dst = format!("{remote}/{item}");
+            sync_path(host, src, &dst, *skip_build)?;
+        }
+    }
+    Ok(missing)
+}
+fn sync(host: &str, local: &Path, remote: &str, down: bool, excludes: &[String]) -> Res<()> {
     let local = format!("{}/", local.display());
     let remote = format!("{host}:{remote}/");
     let mut c = Command::new("rsync");
@@ -192,9 +401,11 @@ fn sync(host: &str, local: &Path, remote: &str, down: bool) -> Res<()> {
         "--exclude=/.git",
         "--exclude=/target",
         "--exclude=/.delegate-*.pid*",
-        "-e",
-        "ssh -o BatchMode=yes -o ConnectTimeout=10",
     ]);
+    for item in excludes {
+        c.arg(format!("--exclude=/{item}"));
+    }
+    c.args(["-e", "ssh -o BatchMode=yes -o ConnectTimeout=10"]);
     if down {
         c.arg(remote).arg(local);
     } else {
@@ -298,6 +509,14 @@ fn shell_status(stage: &str, executed: bool) {
         let _ = write_json(PathBuf::from(path), &json!({"stage":stage,"executed":executed}));
     }
 }
+fn shell_status_missing(paths: &[String], reason: &str) {
+    if let Some(path) = std::env::var_os("DELEGATE_SHELL_STATUS") {
+        let _ = write_json(
+            PathBuf::from(path),
+            &json!({"stage":"missing_managed","executed":false,"paths":paths,"reason":reason}),
+        );
+    }
+}
 fn execute(run: &Path, meta: &Value, program: &str, args: &[String]) -> Res<i32> {
     shell_status("queued", false);
     let remote = &meta["remote"];
@@ -363,7 +582,25 @@ fn execute(run: &Path, meta: &Value, program: &str, args: &[String]) -> Res<i32>
     if !absolute.starts_with('/') || absolute.contains('\n') {
         return Err("invalid remote slot path".into());
     }
-    sync(host, &top, &absolute, false)?;
+    let (copies, links) = managed_lists(meta, &top);
+    let mut managed_excludes = copies;
+    managed_excludes.extend(links);
+    sync(host, &top, &absolute, false, &managed_excludes)?;
+    let missing_managed = sync_managed(host, &top, &absolute, meta)?;
+    if !missing_managed.is_empty() {
+        let paths: Vec<String> = missing_managed.iter().map(|(p, _)| p.clone()).collect();
+        let reason = missing_managed
+            .iter()
+            .map(|(p, r)| format!("{p} ({r})"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        if std::env::var_os("DELEGATE_REMOTE_FALLBACK_ON_MISSING").is_some() {
+            shell_status_missing(&paths, &reason);
+            eprintln!("delegate remote: managed path(s) unavailable on {host}: {reason}; falling back to local acceptance");
+            return Ok(75);
+        }
+        eprintln!("delegate remote: warning: managed path(s) unavailable on {host}: {reason}");
+    }
     if crate::lane::stopped() {
         return Ok(128 + crate::lane::SIGNAL.load(Ordering::SeqCst));
     }
@@ -475,7 +712,7 @@ fn execute(run: &Path, meta: &Value, program: &str, args: &[String]) -> Res<i32>
             let _ = stdout.join();
             let _ = stderr.join();
             // Interrupted commands may still have made useful source edits.
-            let _ = sync(host, &top, &absolute, true);
+            let _ = sync(host, &top, &absolute, true, &managed_excludes);
             return Ok(128 + crate::lane::SIGNAL.load(Ordering::SeqCst));
         }
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
@@ -493,7 +730,7 @@ fn execute(run: &Path, meta: &Value, program: &str, args: &[String]) -> Res<i32>
             status.code().unwrap_or(255)
         ));
     }
-    sync(host, &top, &absolute, true)?;
+    sync(host, &top, &absolute, true, &managed_excludes)?;
     shell_status("completed", true);
     Ok(code)
 }
@@ -573,7 +810,7 @@ pub fn check(args: &[String]) -> Res<i32> {
                 shell_quote(&dest)
             ),
         ))?;
-        sync(s(remote, "host"), &dir, &absolute, false)?;
+        sync(s(remote, "host"), &dir, &absolute, false, &[])?;
         let root = Path::new(&absolute).parent().ok_or("invalid remote root")?;
         let profile = if s(remote, "profile").is_empty() {
             String::new()
@@ -598,7 +835,7 @@ pub fn check(args: &[String]) -> Res<i32> {
                 ),
             ))?;
         }
-        sync(s(remote, "host"), &dir, &absolute, true)?;
+        sync(s(remote, "host"), &dir, &absolute, true, &[])?;
         Ok(())
     })();
     let _ = output(ssh(
