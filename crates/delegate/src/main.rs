@@ -31,6 +31,7 @@ mod source_build;
 mod source_watch;
 mod supervise;
 mod transient;
+mod tui;
 mod waiting;
 mod worktree;
 use common::*;
@@ -1868,6 +1869,9 @@ fn main_inner(args: &[String]) -> Res<i32> {
     if command == "_process-match" {
         return process_match::command(rest);
     }
+    if command == "tui" {
+        return tui::command(rest);
+    }
     refs::backfill_all();
     history::ensure_backfilled();
     match command.as_str() {
@@ -2365,10 +2369,11 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "show" => history::show_command(rest),
         "board" => board::command(rest),
         "result" => {
-            let (pos, flags, _) = parse_simple(rest, &["--path"], &[])?;
+            let (pos, flags, _) = parse_simple(rest, &["--path", "--no-mark"], &[])?;
             if pos.len() > 1 {
                 return Err("result takes one run".into());
             }
+            let no_mark = has(&flags, "--no-mark");
             let run = runs::resolve_head(pos.first().map(String::as_str).unwrap_or("last"))?;
             let result = run.join("result.md");
             if !result.exists() {
@@ -2384,7 +2389,8 @@ fn main_inner(args: &[String]) -> Res<i32> {
             }
             if has(&flags, "--path") {
                 println!("{}", result.display());
-                if !runs::active(&runs::state(&run)) && !run.join(".truncated").exists() {
+                if !no_mark && !runs::active(&runs::state(&run)) && !run.join(".truncated").exists()
+                {
                     mark_result_read(&run);
                 }
             } else {
@@ -2394,6 +2400,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     .write_all(read(&result).as_bytes())
                     .and_then(|()| out.flush())
                     .is_ok()
+                    && !no_mark
                 {
                     fs::remove_file(run.join(".truncated")).ok();
                     if !runs::active(&runs::state(&run)) {
@@ -2401,7 +2408,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     }
                 }
             }
-            if !runs::active(&runs::state(&run)) {
+            if !no_mark && !runs::active(&runs::state(&run)) {
                 touch(run.join(".delivered"));
                 board::refresh_for_run(&run);
             }

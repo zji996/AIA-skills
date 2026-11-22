@@ -1,0 +1,18 @@
+[package]
+name = "delegate-tui"
+version = "6.27.0"
+edition = "2021"
+rust-version = "1.93"
+
+[dependencies]
+crossterm = "0.29"
+libc = "0.2"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
+serde_json = "1"
+unicode-width = "0.2"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

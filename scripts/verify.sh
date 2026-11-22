@@ -21,4 +21,7 @@ step check scripts/check.sh
 step tests python3 scripts/run-tests.py
 if command -v cargo >/dev/null 2>&1; then
   step clippy bash -c 'cd crates/delegate && cargo clippy -- -D warnings'
+  if [ -d "$REPO_ROOT/crates/delegate-tui" ]; then
+    step tui bash -c 'cd crates/delegate-tui && cargo test && cargo clippy --all-targets -- -D warnings'
+  fi
 fi

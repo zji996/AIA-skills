@@ -61,15 +61,12 @@ build_from_source() {
   install -m 755 "$crate/target/release/$name" "$dest"
 }
 
-fetch_skill() {
-  local skill=$1 dir="$REPO_ROOT/skills/$1" name version target asset expected tmp bin marker url actual
-  name="$(frontmatter_value "$dir/SKILL.md" binary)"
-  [ -n "$name" ] || return 0
-  version="$(frontmatter_value "$dir/SKILL.md" version)"
+fetch_one_binary() {
+  local skill=$1 dir=$2 primary=$3 name=$4 version=$5 target=$6
+  local asset expected tmp bin marker url
   bin="$dir/bin/$name"
   marker="$dir/bin/.$name.installed"
   mkdir -p "$dir/bin"
-  target="$(target_triple)"
   asset="$name-$target"
   expected="$(awk -v a="$asset" '$2 == a { print $1 }' "$dir/bin.sha256" 2>/dev/null)"
   if (( BUILD )); then
@@ -88,7 +85,7 @@ fetch_skill() {
   fi
   if [ -n "$expected" ]; then
     tmp="$(mktemp "$dir/bin/.$name.XXXXXX")"
-    for url in "$PRIMARY_RELEASES/$name-v$version/$asset" "$MIRROR_RELEASES/$name-v$version/$asset"; do
+    for url in "$PRIMARY_RELEASES/$primary-v$version/$asset" "$MIRROR_RELEASES/$primary-v$version/$asset"; do
       if download "$url" "$tmp" 2>/dev/null; then
         if [ "$(sha256_of "$tmp")" = "$expected" ]; then
           chmod 755 "$tmp"
@@ -110,6 +107,23 @@ fetch_skill() {
   echo "Cannot install $name $version for $target: download failed and local build is unavailable or unverified." >&2
   echo "  Retry later, or install Rust (https://rustup.rs) and run: $0 --build $skill" >&2
   return 1
+}
+
+fetch_skill() {
+  local skill=$1 dir="$REPO_ROOT/skills/$1" primary extra extras version target name rc=0
+  primary="$(frontmatter_value "$dir/SKILL.md" binary)"
+  [ -n "$primary" ] || return 0
+  version="$(frontmatter_value "$dir/SKILL.md" version)"
+  target="$(target_triple)"
+  extras="$(frontmatter_value "$dir/SKILL.md" extra-binaries | tr ',[]' '   ')"
+  local binaries=("$primary")
+  for extra in $extras; do
+    binaries+=("$extra")
+  done
+  for name in "${binaries[@]}"; do
+    fetch_one_binary "$skill" "$dir" "$primary" "$name" "$version" "$target" || rc=1
+  done
+  return "$rc"
 }
 
 install_source() {

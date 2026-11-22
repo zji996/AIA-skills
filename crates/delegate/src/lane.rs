@@ -335,6 +335,7 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
     let mut i = 0;
     let mut label = None;
     let mut measure = false;
+    let mut json_mode = false;
     while i < args.len() {
         if args[i] == "--label" {
             i += 1;
@@ -346,6 +347,9 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
         } else if args[i] == "--measure" {
             measure = true;
             i += 1;
+        } else if args[i] == "--json" {
+            json_mode = true;
+            i += 1;
         } else {
             break;
         }
@@ -356,19 +360,47 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
         &args[i..]
     };
     if words.is_empty() {
-        for (label, since, running) in remote_holders()? {
+        let remote = remote_holders()?;
+        let local = holders()?;
+        if json_mode {
+            let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+            let cfg = crate::config::load(git_top(&cwd).as_deref())?;
+            let remote_limit = cfg.value["remote"]["maxHeavy"].as_u64().unwrap_or(4) as usize;
+            let to_items = |entries: Vec<(String, String, bool)>| -> Vec<Value> {
+                entries
+                    .into_iter()
+                    .map(|(label, since, running)| {
+                        json!({"label": label, "since": since, "running": running})
+                    })
+                    .collect()
+            };
+            println!(
+                "{}",
+                json!({
+                    "maxHeavy": max_heavy()?,
+                    "local": to_items(local),
+                    "remoteMaxHeavy": remote_limit,
+                    "remote": to_items(remote),
+                })
+            );
+            return Ok(0);
+        }
+        for (label, since, running) in remote {
             println!(
                 "remote {:<8} {since}  {label}",
                 if running { "running" } else { "queued" }
             );
         }
-        for (label, since, running) in holders()? {
+        for (label, since, running) in local {
             println!(
                 "{:<8} {since}  {label}",
                 if running { "running" } else { "queued" }
             );
         }
         return Ok(0);
+    }
+    if json_mode {
+        return Err("--json only applies when listing the lane".into());
     }
     let command = if words.len() == 1 {
         words[0].clone()

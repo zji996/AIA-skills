@@ -1,0 +1,630 @@
+use crossterm::cursor::{Hide, Show};
+use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use delegate_tui::app::{copy_to_clipboard, App, AppAction, Overlay};
+use delegate_tui::data::{discover_repos, home_dir, local_hms, DelegateClient};
+use delegate_tui::model::AppSnapshot;
+use delegate_tui::ui;
+use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
+use std::collections::HashSet;
+use std::env;
+use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+struct CliArgs {
+    repos: Vec<PathBuf>,
+    root: Option<PathBuf>,
+    delegate: Option<PathBuf>,
+    interval: u64,
+}
+
+fn print_help() {
+    println!(
+        "delegate-tui {}\n\n\
+         Interactive read-only TUI dashboard for delegate runs.\n\n\
+         Usage:\n\
+         \x20 delegate-tui [OPTIONS]\n\n\
+         Options:\n\
+         \x20 --repo <PATH>       Monitor specific repository (repeatable)\n\
+         \x20 --root <DIR>        Scan root directory for repos (default: $HOME)\n\
+         \x20 --delegate <PATH>   Path to delegate binary\n\
+         \x20 --interval <SECS>   Auto-refresh interval in seconds (default: 5)\n\
+         \x20 --version           Print version\n\
+         \x20 -h, --help          Show this help\n\n\
+         Keys:\n\
+         \x20 ↑↓/jk select/scroll  Tab switch pane  Enter full result  d diff --stat\n\
+         \x20 / filter  r refresh  a/c/s/p show write command  y copy  ? help  q quit",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+fn parse_args() -> Result<Option<CliArgs>, String> {
+    let mut repos = Vec::new();
+    let mut root = None;
+    let mut delegate = None;
+    let mut interval: u64 = 5;
+
+    let args: Vec<String> = env::args().skip(1).collect();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                print_help();
+                return Ok(None);
+            }
+            "--version" => {
+                println!("delegate-tui {}", env!("CARGO_PKG_VERSION"));
+                return Ok(None);
+            }
+            "--repo" => {
+                i += 1;
+                let val = args.get(i).ok_or("--repo expects a directory path")?;
+                repos.push(PathBuf::from(val));
+            }
+            "--root" => {
+                i += 1;
+                let val = args.get(i).ok_or("--root expects a directory path")?;
+                root = Some(PathBuf::from(val));
+            }
+            "--delegate" => {
+                i += 1;
+                let val = args.get(i).ok_or("--delegate expects a binary path")?;
+                delegate = Some(PathBuf::from(val));
+            }
+            "--interval" => {
+                i += 1;
+                let val = args.get(i).ok_or("--interval expects seconds")?;
+                let secs: u64 = val
+                    .parse()
+                    .map_err(|_| format!("invalid --interval: {val}"))?;
+                interval = secs.max(1);
+            }
+            other => {
+                return Err(format!("unrecognized argument: {other} (try --help)"));
+            }
+        }
+        i += 1;
+    }
+
+    Ok(Some(CliArgs {
+        repos,
+        root,
+        delegate,
+        interval,
+    }))
+}
+
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, Hide)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, Show, LeaveAlternateScreen);
+    }
+}
+
+enum WorkerCmd {
+    Refresh {
+        force: bool,
+    },
+    FetchResult {
+        cache_key: String,
+        repo: PathBuf,
+        run_id: String,
+        title: String,
+        open_overlay: bool,
+    },
+    FetchDiffStat {
+        cache_key: String,
+        repo: PathBuf,
+        run_id: String,
+        title: String,
+    },
+    Shutdown,
+}
+
+enum WorkerEvent {
+    Snapshot {
+        snapshot: AppSnapshot,
+        force: bool,
+    },
+    ResultLoaded {
+        cache_key: String,
+        run_id: String,
+        title: String,
+        result: Result<String, String>,
+        open_overlay: bool,
+    },
+    DiffStatLoaded {
+        cache_key: String,
+        run_id: String,
+        title: String,
+        result: Result<String, String>,
+    },
+}
+
+fn resolve_repos(
+    explicit_repos: &[PathBuf],
+    explicit_root: Option<&PathBuf>,
+    home: Option<&PathBuf>,
+    cwd: &std::path::Path,
+) -> Vec<PathBuf> {
+    if !explicit_repos.is_empty() {
+        return explicit_repos.to_vec();
+    }
+    let root = explicit_root
+        .or(home)
+        .cloned()
+        .unwrap_or_else(|| cwd.to_path_buf());
+    discover_repos(&root, Some(cwd))
+}
+
+fn spawn_worker(
+    client: DelegateClient,
+    explicit_repos: Vec<PathBuf>,
+    explicit_root: Option<PathBuf>,
+    home: Option<PathBuf>,
+    cwd: PathBuf,
+) -> (
+    mpsc::Sender<WorkerCmd>,
+    mpsc::Receiver<WorkerEvent>,
+    thread::JoinHandle<()>,
+) {
+    let (tx_cmd, rx_cmd) = mpsc::channel::<WorkerCmd>();
+    let (tx_ev, rx_ev) = mpsc::channel::<WorkerEvent>();
+
+    let handle = thread::spawn(move || {
+        while let Ok(cmd) = rx_cmd.recv() {
+            match cmd {
+                WorkerCmd::Refresh { force } => {
+                    let repos = resolve_repos(
+                        &explicit_repos,
+                        explicit_root.as_ref(),
+                        home.as_ref(),
+                        &cwd,
+                    );
+                    let snapshot =
+                        client.collect_snapshot(&repos, home.as_deref(), Some(&cwd));
+                    if tx_ev
+                        .send(WorkerEvent::Snapshot { snapshot, force })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                WorkerCmd::FetchResult {
+                    cache_key,
+                    repo,
+                    run_id,
+                    title,
+                    open_overlay,
+                } => {
+                    let result = client.fetch_result(&repo, &run_id);
+                    if tx_ev
+                        .send(WorkerEvent::ResultLoaded {
+                            cache_key,
+                            run_id,
+                            title,
+                            result,
+                            open_overlay,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                WorkerCmd::FetchDiffStat {
+                    cache_key,
+                    repo,
+                    run_id,
+                    title,
+                } => {
+                    let result = client.fetch_diff_stat(&repo, &run_id);
+                    if tx_ev
+                        .send(WorkerEvent::DiffStatLoaded {
+                            cache_key,
+                            run_id,
+                            title,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                WorkerCmd::Shutdown => break,
+            }
+        }
+    });
+
+    (tx_cmd, rx_ev, handle)
+}
+
+fn request_selected_result(
+    app: &App,
+    tx: &mpsc::Sender<WorkerCmd>,
+    inflight_results: &mut HashSet<String>,
+    open_overlay: bool,
+) {
+    let Some(run) = app.selected_run() else {
+        return;
+    };
+    let key = run.cache_key();
+    if app.result_cache.contains_key(&key) {
+        return;
+    }
+    if !run.has_result && !open_overlay {
+        return;
+    }
+    if !open_overlay && !inflight_results.insert(key.clone()) {
+        return;
+    }
+    inflight_results.insert(key.clone());
+    let _ = tx.send(WorkerCmd::FetchResult {
+        cache_key: key,
+        repo: run.repo_path.clone(),
+        run_id: run.run.clone(),
+        title: run.display_name.clone(),
+        open_overlay,
+    });
+}
+
+fn request_diff_stat(
+    app: &mut App,
+    tx: &mpsc::Sender<WorkerCmd>,
+    inflight_diffs: &mut HashSet<String>,
+) {
+    let Some(run) = app.selected_run().cloned() else {
+        return;
+    };
+    let key = run.cache_key();
+    if let Some(res) = app.diff_cache.get(&key).cloned() {
+        open_diff_overlay_from_result(app, &run.run, &run.display_name, res);
+        return;
+    }
+    app.overlay = Overlay::DiffStat {
+        run_id: run.run.clone(),
+        title: run.display_name.clone(),
+        content: "加载中…".to_string(),
+        scroll: 0,
+    };
+    app.dirty = true;
+    if inflight_diffs.insert(key.clone()) {
+        let _ = tx.send(WorkerCmd::FetchDiffStat {
+            cache_key: key,
+            repo: run.repo_path,
+            run_id: run.run,
+            title: run.display_name,
+        });
+    }
+}
+
+fn open_result_overlay_from_result(
+    app: &mut App,
+    run_id: &str,
+    title: &str,
+    res: Result<String, String>,
+) {
+    let content = match res {
+        Ok(text) if !text.trim().is_empty() => text,
+        Ok(_) => "结论为空".to_string(),
+        Err(err) => format!("无法读取结论：\n{err}"),
+    };
+    app.overlay = Overlay::FullResult {
+        run_id: run_id.to_string(),
+        title: title.to_string(),
+        content,
+        scroll: 0,
+    };
+    app.dirty = true;
+}
+
+fn open_diff_overlay_from_result(
+    app: &mut App,
+    run_id: &str,
+    title: &str,
+    res: Result<String, String>,
+) {
+    let content = match res {
+        Ok(text) if !text.trim().is_empty() => text,
+        Ok(_) => "无 diff 改动".to_string(),
+        Err(err) => format!("无法获取 diff --stat：\n{err}"),
+    };
+    app.overlay = Overlay::DiffStat {
+        run_id: run_id.to_string(),
+        title: title.to_string(),
+        content,
+        scroll: 0,
+    };
+    app.dirty = true;
+}
+
+/// Draw with DEC Synchronized Update (mode 2026) + ratatui cell-level diffing to avoid flicker.
+fn draw_synced(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> io::Result<()> {
+    let _ = terminal.backend_mut().write_all(b"\x1b[?2026h");
+    let res = terminal.draw(|frame| ui::render(frame, app)).map(|_| ());
+    let _ = terminal.backend_mut().write_all(b"\x1b[?2026l");
+    let _ = terminal.backend_mut().flush();
+    res
+}
+
+fn open_in_pager(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    content: &str,
+) -> io::Result<()> {
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), Show, LeaveAlternateScreen);
+
+    let pager = env::var("PAGER")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "less -R".to_string());
+    let mut parts = pager.split_whitespace();
+    if let Some(prog) = parts.next() {
+        let args: Vec<&str> = parts.collect();
+        if let Ok(mut child) = Command::new(prog)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(content.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    }
+
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen, Hide)?;
+    terminal.clear()?;
+    Ok(())
+}
+
+fn main() {
+    let cli = match parse_args() {
+        Ok(Some(c)) => c,
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!("delegate-tui: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    if !io::stdout().is_terminal() {
+        eprintln!("delegate-tui: stdout is not a TTY; run interactively in a terminal.");
+        std::process::exit(1);
+    }
+
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, Show, LeaveAlternateScreen);
+        prev_hook(info);
+    }));
+
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let home = home_dir();
+    let client = DelegateClient::discover(cli.delegate.clone());
+    let delegate_bin = client.bin.clone();
+
+    let (tx_worker, rx_worker, worker_handle) = spawn_worker(
+        client,
+        cli.repos.clone(),
+        cli.root.clone(),
+        home,
+        cwd.clone(),
+    );
+
+    let initial = AppSnapshot {
+        refreshed_at: local_hms(),
+        ..AppSnapshot::default()
+    };
+    let mut app = App::new(initial, delegate_bin, cwd, cli.interval);
+    app.loading = true;
+
+    let mut refresh_in_flight = true;
+    let _ = tx_worker.send(WorkerCmd::Refresh { force: true });
+
+    let _guard = match TerminalGuard::enter() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("delegate-tui: 无法初始化终端: {e}");
+            std::process::exit(1);
+        }
+    };
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = match Terminal::new(backend) {
+        Ok(t) => t,
+        Err(e) => {
+            drop(_guard);
+            eprintln!("delegate-tui: 终端初始化失败: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let refresh_every = Duration::from_secs(cli.interval);
+    let mut last_refresh = Instant::now();
+    let mut print_on_exit: Option<String> = None;
+    let mut inflight_results: HashSet<String> = HashSet::new();
+    let mut inflight_diffs: HashSet<String> = HashSet::new();
+
+    loop {
+        // Drain completed background worker responses without blocking UI.
+        while let Ok(ev) = rx_worker.try_recv() {
+            match ev {
+                WorkerEvent::Snapshot { snapshot, force } => {
+                    refresh_in_flight = false;
+                    last_refresh = Instant::now();
+                    if app.apply_snapshot(snapshot, force) {
+                        request_selected_result(&app, &tx_worker, &mut inflight_results, false);
+                    }
+                }
+                WorkerEvent::ResultLoaded {
+                    cache_key,
+                    run_id,
+                    title,
+                    result,
+                    open_overlay,
+                } => {
+                    inflight_results.remove(&cache_key);
+                    app.result_cache.insert(cache_key.clone(), result.clone());
+                    let is_current = app
+                        .selected_run()
+                        .is_some_and(|r| r.cache_key() == cache_key);
+                    if open_overlay && matches!(app.overlay, Overlay::FullResult { run_id: ref rid, .. } if rid == &run_id) {
+                        open_result_overlay_from_result(&mut app, &run_id, &title, result);
+                    } else if is_current {
+                        app.dirty = true;
+                    }
+                }
+                WorkerEvent::DiffStatLoaded {
+                    cache_key,
+                    run_id,
+                    title,
+                    result,
+                } => {
+                    inflight_diffs.remove(&cache_key);
+                    app.diff_cache.insert(cache_key, result.clone());
+                    if matches!(app.overlay, Overlay::DiffStat { run_id: ref rid, .. } if rid == &run_id) {
+                        open_diff_overlay_from_result(&mut app, &run_id, &title, result);
+                    }
+                }
+            }
+        }
+
+        if app.expire_toast() {
+            app.dirty = true;
+        }
+
+        if app.dirty {
+            if let Err(e) = draw_synced(&mut terminal, &mut app) {
+                drop(_guard);
+                eprintln!("delegate-tui: 绘制失败: {e}");
+                std::process::exit(1);
+            }
+            app.dirty = false;
+        }
+
+        let until_refresh = refresh_every.saturating_sub(last_refresh.elapsed());
+        let poll_timeout = until_refresh.min(Duration::from_millis(40));
+
+        if event::poll(poll_timeout).unwrap_or(false) {
+            if let Ok(ev) = event::read() {
+                match ev {
+                    Event::Resize(_, _) => {
+                        app.dirty = true;
+                    }
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        match app.handle_key(key) {
+                            AppAction::None => {}
+                            AppAction::Redraw => {
+                                app.dirty = true;
+                            }
+                            AppAction::Refresh => {
+                                app.result_cache.clear();
+                                app.diff_cache.clear();
+                                inflight_results.clear();
+                                inflight_diffs.clear();
+                                if !refresh_in_flight {
+                                    refresh_in_flight = true;
+                                    let _ = tx_worker.send(WorkerCmd::Refresh { force: true });
+                                }
+                                app.set_toast("刷新中…");
+                                last_refresh = Instant::now();
+                            }
+                            AppAction::LoadSelectedResult => {
+                                request_selected_result(
+                                    &app,
+                                    &tx_worker,
+                                    &mut inflight_results,
+                                    false,
+                                );
+                                app.dirty = true;
+                            }
+                            AppAction::OpenFullResult => {
+                                if let Some(run) = app.selected_run().cloned() {
+                                    let key = run.cache_key();
+                                    if let Some(res) = app.result_cache.get(&key).cloned() {
+                                        open_result_overlay_from_result(
+                                            &mut app,
+                                            &run.run,
+                                            &run.display_name,
+                                            res,
+                                        );
+                                    } else {
+                                        app.overlay = Overlay::FullResult {
+                                            run_id: run.run.clone(),
+                                            title: run.display_name.clone(),
+                                            content: "加载中…".to_string(),
+                                            scroll: 0,
+                                        };
+                                        app.dirty = true;
+                                        request_selected_result(
+                                            &app,
+                                            &tx_worker,
+                                            &mut inflight_results,
+                                            true,
+                                        );
+                                    }
+                                }
+                            }
+                            AppAction::OpenDiffStat => {
+                                request_diff_stat(&mut app, &tx_worker, &mut inflight_diffs);
+                            }
+                            AppAction::CopyClipboard(cmd) => {
+                                let msg = copy_to_clipboard(&cmd);
+                                app.set_toast(msg);
+                            }
+                            AppAction::OpenPager(content) => {
+                                let _ = open_in_pager(&mut terminal, &content);
+                                app.dirty = true;
+                            }
+                            AppAction::Quit => break,
+                            AppAction::QuitAndPrint(cmd) => {
+                                print_on_exit = Some(cmd);
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if !refresh_in_flight && last_refresh.elapsed() >= refresh_every {
+            refresh_in_flight = true;
+            let _ = tx_worker.send(WorkerCmd::Refresh { force: false });
+            last_refresh = Instant::now();
+        }
+    }
+
+    let _ = tx_worker.send(WorkerCmd::Shutdown);
+    drop(_guard);
+    // Avoid blocking exit if a slow subprocess is mid-flight; detach cleanly if needed.
+    drop(worker_handle);
+    if let Some(cmd) = print_on_exit {
+        println!("{cmd}");
+    }
+}

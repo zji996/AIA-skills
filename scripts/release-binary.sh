@@ -47,46 +47,61 @@ frontmatter_value() {
   sed -n '/^---$/,/^---$/p' "$1" | sed -n "s/^[[:space:]]*$2:[[:space:]]*//p" | head -1 | tr -d '"'
 }
 NAME="$(frontmatter_value "$DIR/SKILL.md" binary)"
+EXTRA_BINARIES="$(frontmatter_value "$DIR/SKILL.md" extra-binaries | tr ',[]' '   ')"
 VERSION="$(frontmatter_value "$DIR/SKILL.md" version)"
 [ -n "$NAME" ] || { echo "skills/$SKILL declares no binary" >&2; exit 2; }
+BINARIES=("$NAME")
+for extra in $EXTRA_BINARIES; do
+  BINARIES+=("$extra")
+done
 TAG="$NAME-v$VERSION"
 DIST="$REPO_ROOT/dist/$TAG"
 
 build() {
-  local crate="$REPO_ROOT/crates/$NAME" target
+  local bin crate target
   rm -rf "$DIST" && mkdir -p "$DIST"
-  for target in "${TARGETS[@]}"; do
-    rustup target add "$target" >/dev/null
-    # Pure Rust with no C dependencies: rust-lld links a static musl binary for any target.
-    (cd "$crate" && env "CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER=rust-lld" \
-      cargo build --release --locked -q --target "$target")
-    install -m 755 "$crate/target/$target/release/$NAME" "$DIST/$NAME-$target"
+  for bin in "${BINARIES[@]}"; do
+    crate="$REPO_ROOT/crates/$bin"
+    for target in "${TARGETS[@]}"; do
+      rustup target add "$target" >/dev/null
+      # Pure Rust with no C dependencies: rust-lld links a static musl binary for any target.
+      (cd "$crate" && env "CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER=rust-lld" \
+        cargo build --release --locked -q --target "$target")
+      install -m 755 "$crate/target/$target/release/$bin" "$DIST/$bin-$target"
+    done
   done
-  (cd "$DIST" && sha256sum "$NAME"-*) > "$DIR/bin.sha256"
+  (cd "$DIST" && LC_ALL=C sha256sum ./* | sed 's| \./| |') > "$DIR/bin.sha256"
   echo "Built $TAG into ${DIST#"$REPO_ROOT"/}:"
   cat "$DIR/bin.sha256"
   echo "Next: commit skills/$SKILL/bin.sha256 with the version bump, push, then: $0 publish $SKILL"
 }
 
 verify() {
-  local crate="$REPO_ROOT/crates/$NAME" cargo_version head tag_commit
-  [ -f "$crate/Cargo.toml" ] && [ -f "$crate/Cargo.lock" ] || {
-    echo "Missing crates/$NAME/Cargo.toml or Cargo.lock" >&2; return 1;
-  }
-  cargo_version="$(python3 - "$crate/Cargo.toml" <<'PY'
+  local bin crate cargo_version head tag_commit
+  local dirty_paths=("skills/$SKILL")
+  local tracked_files=("skills/$SKILL/bin.sha256")
+  for bin in "${BINARIES[@]}"; do
+    crate="$REPO_ROOT/crates/$bin"
+    [ -f "$crate/Cargo.toml" ] && [ -f "$crate/Cargo.lock" ] || {
+      echo "Missing crates/$bin/Cargo.toml or Cargo.lock" >&2; return 1;
+    }
+    cargo_version="$(python3 - "$crate/Cargo.toml" <<'PY'
 import sys
 import tomllib
 with open(sys.argv[1], 'rb') as source:
     print(tomllib.load(source)['package']['version'])
 PY
 )" || return 1
-  [ "$VERSION" = "$cargo_version" ] || {
-    echo "SKILL.md version $VERSION differs from crates/$NAME/Cargo.toml $cargo_version" >&2; return 1;
+    [ "$VERSION" = "$cargo_version" ] || {
+      echo "SKILL.md version $VERSION differs from crates/$bin/Cargo.toml $cargo_version" >&2; return 1;
+    }
+    dirty_paths+=("crates/$bin")
+    tracked_files+=("crates/$bin/Cargo.lock")
+  done
+  [ -z "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all -- "${dirty_paths[@]}")" ] || {
+    echo "Commit all changes in ${dirty_paths[*]} before publishing" >&2; return 1;
   }
-  [ -z "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all -- "skills/$SKILL" "crates/$NAME")" ] || {
-    echo "Commit all changes in skills/$SKILL and crates/$NAME before publishing" >&2; return 1;
-  }
-  git -C "$REPO_ROOT" ls-files --error-unmatch -- "skills/$SKILL/bin.sha256" "crates/$NAME/Cargo.lock" >/dev/null || {
+  git -C "$REPO_ROOT" ls-files --error-unmatch -- "${tracked_files[@]}" >/dev/null || {
     echo "Commit bin.sha256 and Cargo.lock before publishing" >&2; return 1;
   }
   [ -d "$DIST" ] || { echo "Nothing built for $TAG: run $0 build $SKILL first" >&2; return 1; }

@@ -6,6 +6,7 @@ compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二�
 metadata:
   version: "6.27.0"
   binary: delegate
+  extra-binaries: delegate-tui
   exclude-agents: pi
 ---
 
@@ -37,6 +38,7 @@ $D wait                                                                  # 放�
 | 看全文 / 改动 / 停掉 / 清理 | `$D result` / `$D diff` / `$D stop` / `$D clean --finished`；`status` 首行计数并只列待处理任务与未完成待办（续做链折成末环一行，详情看 `status <run>`，`--all` 列全部，`--json` 加 `--files` 才带文件数组），末行指向 `history` |
 | 给任务挂合入后待办 | `$D note <run> "…"` / `$D note <run>` / `$D note <run> --done [<序号>\|--all]`；随续做链共享，`clean` 后保留直到 `--done` |
 | `/clear` 前交接 / 查历史与看板 | `$D handoff` 写一页交接索引（含待办）；`$D history [关键词…]` 查永久索引；`$D show <run>` 看摘要、合入后同文件提交与归档；`$D board` 打印/刷新自动看板（`.delegate.json` `board` 配路径） |
+| 交互式终端看板（只读 TUI） | `$D tui`（自动 exec 同目录或 PATH 中的 `delegate-tui`，随 `install.sh` / `fetch-binary.sh` 安装）：跨仓库按状态分组展示与续做链折叠，`↑↓`/`jk` 选择、`Tab` 切栏、`Enter` 完整结论、`d` diff 统计、`/` 过滤、`r` 刷新（默认每 5 秒无变化不重绘）、`a/c/s/p` 仅生成写命令并可复制到剪贴板、`q` 退出 |
 
 `start`/`run` 派发前比对在跑与近 14 天 `history`，相似时在 stderr 提示最多 3 条（只提示不拦截）。
 

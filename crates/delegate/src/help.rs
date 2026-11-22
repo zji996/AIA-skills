@@ -112,6 +112,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "board",
         "Print (and refresh) the automatically maintained workspace delegation board Markdown.",
     ),
+    (
+        "tui",
+        "Launch the interactive terminal dashboard (execs delegate-tui if installed).",
+    ),
     ("result", "Print a run's full answer."),
     ("diff", "Show a run's changes as a git diff."),
     ("patch", "Print retained patch, optionally filtered by path."),
@@ -232,9 +236,13 @@ pub fn print(command: Option<&str>) -> bool {
         "board" => ("[--path]", "Refresh and print the per-workspace delegation board Markdown (configured by .delegate.json `board`, default BOARD.md next to history.jsonl).", &[
             ("--path", "Print the resolved board file path instead of its contents."),
         ]),
-        "result" => ("[--path] [run]", "Print a run's full answer.", &[
+        "tui" => ("[delegate-tui options ...]", "Launch the interactive read-only TUI dashboard by exec'ing `delegate-tui`.", &[
+            ("options", "Forwarded directly to delegate-tui (run `delegate-tui --help` for flags)."),
+        ]),
+        "result" => ("[--path] [--no-mark] [run]", "Print a run's full answer.", &[
             ("run", "Run id or directory (default: last)."),
             ("--path", "Print the result file path instead of its contents."),
+            ("--no-mark", "Read without marking resultReadAt or .delivered (used by read-only viewers)."),
         ]),
         "diff" => ("[--stat] [--total] [run] [--] [paths...]", "Show a run's changes as a git diff.", &[
             ("run", "Run id or directory (default: last)."),
@@ -256,9 +264,10 @@ pub fn print(command: Option<&str>) -> bool {
         ]),
         "config" => ("", "Show merged effective configuration (including the remote host).", &[]),
         "remote" => ("check", "Test SSH, rsync and remote program versions; never falls back locally.", &[]),
-        "lane" => ("[--label TEXT] [--measure] [command ...]", "Queue a heavy command with acceptance, evidence, worktree setup, and other machine checks. --measure uses the FIFO measurement reservation and reserved CPUs. DELEGATE_MAX_HEAVY run at once (default: 2). One argument is a shell command; no command lists the lane.", &[
+        "lane" => ("[--label TEXT] [--measure] [--json] [command ...]", "Queue a heavy command with acceptance, evidence, worktree setup, and other machine checks. --measure uses the FIFO measurement reservation and reserved CPUs. DELEGATE_MAX_HEAVY run at once (default: 2). One argument is a shell command; no command lists the lane.", &[
             ("--label TEXT", "Label shown in the lane listing."),
             ("--measure", "Run through the machine measurement reservation."),
+            ("--json", "With no command, print lane occupancy and limits as JSON."),
             ("command", "Command and arguments to run; omit to list the lane."),
         ]),
         "stop" => ("runs ...", "Terminate one or more runs.", &[
