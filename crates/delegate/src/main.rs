@@ -231,7 +231,13 @@ fn outcome_line(run: &Path, timing: Option<&str>) -> String {
         }
         status["sourceDrift"] = drift;
     }
-    output_line(run, status)
+    let mut rendered = output_line(run, status.clone());
+    if !output::json_enabled() {
+        if let Some(drift_line) = output::format_source_drift(&status["sourceDrift"]) {
+            rendered.push_str(&format!("\n  {drift_line}"));
+        }
+    }
+    rendered
 }
 fn format_status(status: serde_json::Value) -> String {
     let keys = [
@@ -892,10 +898,15 @@ fn wait_each(
                                 ))
                             ));
                         } else {
-                            line.push_str(&format!(
+                            let suffix = format!(
                                 " · 答复：delegate result {}",
                                 run.file_name().unwrap_or_default().to_string_lossy()
-                            ));
+                            );
+                            if let Some(pos) = line.find('\n') {
+                                line.insert_str(pos, &suffix);
+                            } else {
+                                line.push_str(&suffix);
+                            }
                         }
                     }
                     println!("{line}");
@@ -1390,6 +1401,7 @@ fn apply(args: &[String]) -> Res<i32> {
             "--no-verify",
             "--keep",
             "--keep-commits",
+            "--commit",
             "--json",
         ],
         &[],
@@ -1399,6 +1411,10 @@ fn apply(args: &[String]) -> Res<i32> {
     }
     if has(&flags, "--verify") && has(&flags, "--no-verify") {
         return Err("--verify and --no-verify are exclusive".into());
+    }
+    let commit_mode = has(&flags, "--commit");
+    if commit_mode && has(&flags, "--keep-commits") {
+        return Err("--commit and --keep-commits are exclusive".into());
     }
     let names = if pos.is_empty() {
         vec!["last".to_string()]
@@ -1433,14 +1449,26 @@ fn apply(args: &[String]) -> Res<i32> {
     let dry = has(&flags, "--dry-run");
     // Runs apply in the order given and stop at the first that fails; their acceptance
     // reruns once on the merged tree, after the last merge (field notes 16).
-    let mut done = Vec::new();
+    struct DoneApply {
+        run: PathBuf,
+        name: String,
+        source: String,
+        conclusion: serde_json::Value,
+        commands: Vec<String>,
+        written_files: Vec<String>,
+        regenerated_files: Vec<String>,
+        had_dirty_merge: bool,
+    }
+    let mut done: Vec<DoneApply> = Vec::new();
     let mut applied_runs = Vec::new();
     let mut code = 0;
     let mut plan = Vec::<String>::new();
     for run in &targets {
         let meta = json(run.join("meta.json"));
-        let keep_commits = has(&flags, "--keep-commits") || b(&meta["defaults"], "keepCommits");
-        let mut outcome = worktree::apply(run, has(&flags, "--merge"), dry, keep_commits)?;
+        let keep_commits =
+            !commit_mode && (has(&flags, "--keep-commits") || b(&meta["defaults"], "keepCommits"));
+        let mut outcome =
+            worktree::apply(run, has(&flags, "--merge"), dry, keep_commits, commit_mode)?;
         if !dry && run.join(".applied").exists() {
             if !applied_runs.contains(run) {
                 applied_runs.push(run.clone());
@@ -1487,22 +1515,110 @@ fn apply(args: &[String]) -> Res<i32> {
         code = outcome.code;
         // Capture acceptance before cleaning, since clean removes the recorded task metadata.
         let commands = worktree::acceptance(&meta);
-        done.push((run.clone(), outcome.conclusion, commands));
+        done.push(DoneApply {
+            run: run.clone(),
+            name: s(&meta, "name").to_string(),
+            source: s(&meta["worktree"], "source").to_string(),
+            conclusion: outcome.conclusion,
+            commands,
+            written_files: outcome.written_files,
+            regenerated_files: outcome.regenerated_files,
+            had_dirty_merge: outcome.had_dirty_merge,
+        });
         if code != 0 {
             break;
         }
     }
     let mut verify = serde_json::Value::Null;
     if code == 0 && !plan.is_empty() {
-        if let Some((run, conclusion, _)) = done.last_mut() {
-            verify = worktree::run_verify(run, &plan);
+        if let Some(last) = done.last_mut() {
+            verify = worktree::run_verify(&last.run, &plan);
             if verify["ok"] != json!(true) {
                 code = 1;
             }
-            conclusion["verify"] = verify.clone();
+            last.conclusion["verify"] = verify.clone();
         }
     }
-    for (run, conclusion, commands) in &done {
+    if code == 0 && !dry && commit_mode {
+        let mut sources = Vec::<String>::new();
+        for item in &done {
+            if !item.source.is_empty() && !sources.contains(&item.source) {
+                sources.push(item.source.clone());
+            }
+        }
+        for src in sources {
+            let mut paths_set = std::collections::BTreeSet::<String>::new();
+            let mut titles = Vec::<String>::new();
+            let mut run_names = Vec::<String>::new();
+            let mut dirty_merge = false;
+            let mut indices = Vec::new();
+            for (idx, item) in done.iter().enumerate() {
+                if item.source != src {
+                    continue;
+                }
+                indices.push(idx);
+                for p in &item.written_files {
+                    paths_set.insert(p.clone());
+                }
+                for p in &item.regenerated_files {
+                    paths_set.insert(p.clone());
+                }
+                if let Some(arr) = item.conclusion["commits"].as_array() {
+                    for c in arr {
+                        let t = s(c, "title");
+                        if !t.is_empty() {
+                            titles.push(t.to_string());
+                        }
+                    }
+                }
+                if !item.name.is_empty() {
+                    run_names.push(item.name.clone());
+                }
+                dirty_merge |= item.had_dirty_merge;
+            }
+            let paths: Vec<String> = paths_set.into_iter().collect();
+            if paths.is_empty() {
+                continue;
+            }
+            let src_runs: Vec<PathBuf> = applied_runs
+                .iter()
+                .filter(|r| s(&json(r.join("meta.json"))["worktree"], "source") == src)
+                .cloned()
+                .collect();
+            match worktree::commit_applied(
+                Path::new(&src),
+                &src_runs,
+                &paths,
+                &titles,
+                &run_names,
+                dirty_merge,
+            ) {
+                Ok((head, subject)) => {
+                    for idx in indices {
+                        done[idx].conclusion["apply"]["committed"] = json!(true);
+                        if !head.is_empty() {
+                            done[idx].conclusion["apply"]["commit"] = json!(&head);
+                        }
+                        done[idx].conclusion["apply"]["commitSubject"] = json!(&subject);
+                    }
+                }
+                Err(err) => {
+                    code = 1;
+                    if let Some(&last_idx) = indices.last() {
+                        done[last_idx].conclusion["apply"]["ok"] = json!(false);
+                        done[last_idx].conclusion["apply"]["failedStep"] = json!("commit");
+                        done[last_idx].conclusion["apply"]["failureDetail"] = json!(err);
+                        done[last_idx].conclusion["apply"]["writtenFiles"] = json!(&paths);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    for item in &done {
+        let run = &item.run;
+        let conclusion = &item.conclusion;
+        let commands = &item.commands;
         let final_line = if conclusion["acceptStillValid"] == json!(true) {
             "验收仍然有效（仓库快照范围）".to_string()
         } else if conclusion["apply"]["ok"] == json!(true)
@@ -1511,6 +1627,22 @@ fn apply(args: &[String]) -> Res<i32> {
             && conclusion["verify"].get("skipped").is_none()
         {
             String::new()
+        } else if conclusion["apply"]["ok"] == json!(true)
+            && !dry
+            && b(conclusion, "applyVerifyDisabled")
+            && conclusion["acceptStillValid"] == json!(false)
+            && !b(conclusion, "acceptPending")
+            && s(conclusion, "acceptValidityReason") != "acceptance failed"
+        {
+            if commands.is_empty() {
+                "主干已前进，验收快照失效；本仓库配置合入后不自动验收（任务没有验收命令）"
+                    .to_string()
+            } else {
+                format!(
+                    "主干已前进，验收快照失效；本仓库配置合入后不自动验收，批量门禁时跑：{}",
+                    commands.join("；")
+                )
+            }
         } else {
             let validity = if b(conclusion, "acceptPending") {
                 "验收未完成（排队/基础设施）"
@@ -1531,6 +1663,40 @@ fn apply(args: &[String]) -> Res<i32> {
         };
         let blind_note = output::blind_note(&conclusion["acceptBlind"]);
         println!("{}", format_status(conclusion.clone()));
+        if !output::json_enabled() && !dry && conclusion["apply"]["ok"] == json!(true) {
+            let mut touched = std::collections::BTreeSet::<&str>::new();
+            for p in &item.written_files {
+                touched.insert(p.as_str());
+            }
+            for p in &item.regenerated_files {
+                touched.insert(p.as_str());
+            }
+            let count = touched.len();
+            if b(&conclusion["apply"], "committed") {
+                let hash = s(&conclusion["apply"], "commit");
+                let short = &hash[..7.min(hash.len())];
+                let subject = s(&conclusion["apply"], "commitSubject");
+                println!("已提交 {short} {subject}（{count} 个文件）");
+            } else if !b(&conclusion["apply"], "keepCommits") && count > 0 {
+                let titles: Vec<&str> = conclusion["commits"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|c| s(c, "title"))
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                if titles.is_empty() {
+                    println!("改动未提交：{count} 个文件");
+                } else if titles.len() == 1 {
+                    println!("改动未提交：{count} 个文件；同事原提交标题：{}", titles[0]);
+                } else {
+                    println!("改动未提交：{count} 个文件；同事原提交标题：");
+                    for title in titles {
+                        println!("  - {title}");
+                    }
+                }
+            }
+        }
         if !output::json_enabled() && !(final_line.is_empty() && blind_note.is_empty()) {
             println!(
                 "{final_line}{}",
@@ -1558,8 +1724,54 @@ fn apply(args: &[String]) -> Res<i32> {
             }
         );
     }
+    if !output::json_enabled() {
+        for item in &done {
+            let conclusion = &item.conclusion;
+            if conclusion["apply"]["ok"] == json!(false) {
+                let step = s(&conclusion["apply"], "failedStep");
+                let step_zh = match step {
+                    "conflicts" => "文件冲突",
+                    "skipped-conflicts" => "跳过无法合并的文件",
+                    "conflict-markers" => "存在冲突标记",
+                    "regeneration" => "重新生成生成物",
+                    "cherry-pick" => "cherry-pick 保留提交",
+                    "commit" => "自动提交",
+                    _ => "应用",
+                };
+                let detail = s(&conclusion["apply"], "failureDetail");
+                let written = strings(&conclusion["apply"]["writtenFiles"]);
+                let written_note = if written.is_empty() {
+                    "未写入源工作区".to_string()
+                } else {
+                    let shown: Vec<_> = written.iter().take(10).cloned().collect();
+                    if written.len() > 10 {
+                        format!(
+                            "以下 {} 个文件已写入源工作区：{} 等",
+                            written.len(),
+                            shown.join("、")
+                        )
+                    } else {
+                        format!(
+                            "以下 {} 个文件已写入源工作区：{}",
+                            written.len(),
+                            shown.join("、")
+                        )
+                    }
+                };
+                println!(
+                    "!!! apply 失败（阶段：{step_zh} / {step}{}）；{written_note}",
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!("；{detail}")
+                    }
+                );
+            }
+        }
+    }
     if !output::json_enabled() && !dry {
-        for (_, conclusion, _) in &done {
+        for item in &done {
+            let conclusion = &item.conclusion;
             if let Some(paths) = conclusion["apply"]["conflictMarkers"]
                 .as_array()
                 .filter(|p| !p.is_empty())
@@ -1576,9 +1788,9 @@ fn apply(args: &[String]) -> Res<i32> {
         }
     }
     if code == 0 && !dry && !has(&flags, "--keep") {
-        for (run, _, _) in &done {
-            if worktree::clean_on_apply(run) {
-                for diagnostic in runs::remove_after_apply(run) {
+        for item in &done {
+            if worktree::clean_on_apply(&item.run) {
+                for diagnostic in runs::remove_after_apply(&item.run) {
                     eprintln!("delegate: apply cleanup: {diagnostic}");
                 }
             }
@@ -1872,7 +2084,15 @@ fn main_inner(args: &[String]) -> Res<i32> {
                             if output::json_enabled() {
                                 emit_run_json(&run);
                             } else {
-                                let status = runs::status(&run);
+                                let mut status = runs::status(&run);
+                                let run_meta = json(run.join("meta.json"));
+                                if !runs::active(&runs::state(&run))
+                                    && !crate::source_watch::busy(&run_meta)
+                                {
+                                    if let Some(drift) = worktree::source_drift(&run) {
+                                        status["sourceDrift"] = drift;
+                                    }
+                                }
                                 println!("{}", output::human_detail(&run, &status));
                             }
                         }

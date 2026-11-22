@@ -5,6 +5,7 @@ use crate::common::*;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -264,6 +265,13 @@ pub fn guard(source: &Path, exclusive: bool) -> Res<fs::File> {
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     lock(&dir.join("lock"), exclusive, false).map_err(|e| e.to_string())
 }
+/// Serializes concurrent `apply` operations on the same source repository without
+/// holding the source-watch observation/baseline lock across slow non-write phases.
+pub fn apply_guard(source: &Path) -> Res<fs::File> {
+    let dir = journal(source);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    lock(&dir.join("apply.lock"), true, false).map_err(|e| e.to_string())
+}
 fn fingerprint_pair(source: &Path) -> Res<(Value, Value)> {
     let data = git(
         source,
@@ -317,7 +325,18 @@ pub fn fingerprint(source: &Path) -> Res<Value> {
     Ok(fingerprint_pair(source)?.0)
 }
 pub fn baseline(source: &Path) -> Res<Value> {
-    let _guard = guard(source, false)?;
+    let dir = journal(source);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let lock_path = dir.join("lock");
+    let _guard = match lock(&lock_path, false, true) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            eprintln!("delegate: waiting for apply to finish writing source workspace / 等待 apply 完成写盘...");
+            let _ = std::io::stderr().flush();
+            lock(&lock_path, false, false).map_err(|e| e.to_string())?
+        }
+        Err(err) => return Err(err.to_string()),
+    };
     let head =
         git_text(source, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]).unwrap_or_default();
     let (files, worktree) = fingerprint_pair(source)?;
@@ -338,15 +357,16 @@ fn different(before: &Value, after: &Value) -> Vec<String> {
 }
 /// Caller holds the exclusive source guard, including on partially failed apply.
 pub fn register(source: &Path, before: &Value, paths: &[String]) -> Res<()> {
-    register_matching(source, before, paths, &[])
+    register_matching(source, before, paths, &[]).map(|_| ())
 }
 /// Also records dirty paths already matching the applied target (e.g. retry after an interrupted apply).
+/// Returns the recorded paths.
 pub fn register_matching(
     source: &Path,
     before: &Value,
     changed_rules: &[String],
     dirty_rules: &[String],
-) -> Res<()> {
+) -> Res<Vec<String>> {
     let after = fingerprint(source)?;
     let file = journal(source).join("applied.json");
     let mut records = json(&file);
@@ -365,13 +385,15 @@ pub fn register_matching(
         }
     }
     if paths.is_empty() {
-        return Ok(());
+        return Ok(vec![]);
     }
     let at = now_ns().to_string();
+    let recorded: Vec<String> = paths.iter().cloned().collect();
     for path in paths {
         records[&path] = json!({"fingerprint":after[&path],"at":at});
     }
-    write_json(file, &records)
+    write_json(file, &records)?;
+    Ok(recorded)
 }
 pub fn busy(meta: &Value) -> bool {
     let source = Path::new(s(&meta["worktree"], "source"));

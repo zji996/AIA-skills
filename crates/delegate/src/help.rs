@@ -66,8 +66,9 @@ const REPLY: &[(&str, &str)] = &[
     ("--max-answer CHARS", "Ask for this answer length; above 1.5 times the limit, continue the session once to compress. Keep the original on failure."),
     ("--timeout DURATION", "Optional limit for the attempt; no default. Stall guards remain active."),
     ("--fresh", "Start a new session with only this message; after apply, a new worktree starts from current HEAD."),
-    ("--sync", "Merge the caller's later changes into the conversation worktree before replying; conflicts stop the reply."),
+    ("--sync", "Force-merge the caller's later changes into the conversation worktree before replying; conflicts stop the reply (default auto-sync keeps the old baseline on conflict)."),
     ("--sync=agent", "Hand text conflicts to the colleague to resolve first; remaining markers fail acceptance. Binary/structural conflicts still stop the reply."),
+    ("--no-sync", "Skip automatic baseline sync on reply and keep the worktree's existing baseline."),
     ("--when-done", "Record one pending reply while the run is active; detached delivery survives shell exit. Visible in status; stop cancels it. Cannot combine with --wait."),
     ("--wait", "Wait for the reply's outcome and answer instead of returning after launch."),
     ("--tier scout|review|write", "Continue on this purpose tier; may combine with --model. Ordinary replies keep the saved model and thinking."),
@@ -242,7 +243,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("--total", "Show the whole conversation, not only this run."),
         ]),
         "patch" => ("run [-- paths...]", "Print retained applied.patch (or delivered changes.patch before apply), optionally limited to exact paths/directory prefixes. Suitable for git apply --3way.", &[]),
-        "apply" => ("[--merge] [--dry-run] [--verify|--no-verify] [--keep] [--json] [run ...]", "Merge worktree conversations into the source working tree, in the order given; stops at the first that fails.", &[
+        "apply" => ("[--merge] [--dry-run] [--verify|--no-verify] [--keep] [--keep-commits|--commit] [--json] [run ...]", "Merge worktree conversations into the source working tree, in the order given; stops at the first that fails.", &[
             ("run", "Run ids or directories (default: last)."),
             ("--keep", "Keep the run and worktree after successful apply (default: retain lightweight run and patch, release worktree)."),
             ("--json", "Keep the existing JSON conclusion without the human acceptance reminder."),
@@ -251,6 +252,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("--verify", "Rerun acceptance on the merged tree even when acceptStillValid is true. Without it, runs whose acceptance does not carry over rerun their own acceptance once, after the last merge (.delegate.json applyVerify: false turns this off, a command replaces it)."),
             ("--no-verify", "Skip the post-merge acceptance."),
             ("--keep-commits", "Cherry-pick the colleague's commits instead of applying the final tree; refuses uncommitted files (listed in commitsDiffer)."),
+            ("--commit", "Stage only the applied paths and create one squash commit using the colleague's commit title(s); refuses when the source index already has staged changes or a 3-way merged file had local uncommitted edits."),
         ]),
         "config" => ("", "Show merged effective configuration (including the remote host).", &[]),
         "remote" => ("check", "Test SSH, rsync and remote program versions; never falls back locally.", &[]),

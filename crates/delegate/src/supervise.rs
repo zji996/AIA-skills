@@ -385,7 +385,12 @@ fn settle(
         .filter_map(Value::as_str)
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let mut violations = changed
+    let protect_paths = if meta["worktree"].is_object() && s(meta, "mode") == "write" {
+        worktree::pending_changed_paths(run, meta).unwrap_or_else(|| changed.clone())
+    } else {
+        changed.clone()
+    };
+    let mut violations = protect_paths
         .iter()
         .filter(|path| {
             if worktree::matches_rule(path, &allowed) { return false; }

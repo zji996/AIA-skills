@@ -57,6 +57,7 @@ pub struct Options {
     pub fresh: bool,
     pub sync: bool,
     pub sync_agent: bool,
+    pub no_sync: bool,
     pub wait: bool,
     pub max: Option<f64>,
     pub progress: bool,
@@ -258,6 +259,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                     o.sync = true;
                     o.sync_agent = true;
                 }
+                "--no-sync" if reply => o.no_sync = true,
                 "--wait" if reply => o.wait = true,
                 "--when-done" if reply => o.when_done = true,
                 "--json" => crate::output::enable_json(),
@@ -290,6 +292,9 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
     if no_accept && !o.accept_also.is_empty() {
         return Err("--no-accept and --accept-also contradict each other".into());
     }
+    if o.sync && o.no_sync {
+        return Err("--sync and --no-sync are exclusive".into());
+    }
     if reply {
         if o.run.is_none() {
             return Err("reply requires run".into());
@@ -304,8 +309,8 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
         {
             return Err("unrecognized reply option".into());
         }
-    } else if o.fresh || o.sync || o.wait {
-        return Err("--fresh, --sync and --wait are only for reply".into());
+    } else if o.fresh || o.sync || o.no_sync || o.wait {
+        return Err("--fresh, --sync, --no-sync and --wait are only for reply".into());
     }
     if o.in_run.is_some() && !o.read_only {
         return Err("--in requires --read-only".into());
@@ -1159,12 +1164,13 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         o.fresh = true;
         eprintln!("delegate: 原会话已合入，已开新会话续做");
     }
+    let parent_name = parent.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let existing_child = all_runs().into_iter().find(|run| {
+        s(&json(run.join("meta.json")), "parent") == parent_name
+            && runs::continues_conversation(run)
+    });
     if o.sync {
-        let parent_name = parent.file_name().unwrap_or_default().to_string_lossy();
-        if let Some(existing) = all_runs().into_iter().find(|run| {
-            s(&json(run.join("meta.json")), "parent") == parent_name
-                && runs::continues_conversation(run)
-        }) {
+        if let Some(existing) = &existing_child {
             return Err(format!(
                 "{parent_name} already has a reply ({}); wait for it and reply to that",
                 existing.file_name().unwrap_or_default().to_string_lossy()
@@ -1364,40 +1370,118 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     if o.sync && !meta["worktree"].is_object() {
         return Err("--sync requires a worktree conversation".into());
     }
-    let synced = if o.sync {
-        Some(worktree::sync(&parent, &meta, o.sync_agent)?)
+    let sync_mode = if o.sync_agent {
+        Some(worktree::SyncMode::Agent)
+    } else if o.sync {
+        Some(worktree::SyncMode::Strict)
+    } else if !o.no_sync
+        && !after_apply
+        && existing_child.is_none()
+        && meta["worktree"].is_object()
+        && s(&meta, "mode") == "write"
+        && Path::new(s(&meta["worktree"], "path")).is_dir()
+    {
+        Some(worktree::SyncMode::Auto)
     } else {
         None
     };
-    let prompt = if let Some((paths, _)) = &synced {
-        if prompt
+    let synced = match sync_mode {
+        Some(mode) => Some((mode, worktree::sync_with_mode(&parent, &meta, mode)?)),
+        None => None,
+    };
+    let mut prompt = prompt;
+    if let Some((mode, report)) = &synced {
+        let is_zh = prompt
             .chars()
-            .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
-        {
-            format!(
-                "{}\n\n主控在上一轮之后的改动已同步进工作目录：{}",
-                prompt.trim_end(),
-                if paths.is_empty() {
-                    "（无）".to_string()
-                } else {
-                    paths.join("、")
-                }
-            )
+            .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+        let short_head = if !report.source_dirty && !report.base_head.is_empty() {
+            Some(&report.base_head[..report.base_head.len().min(7)])
         } else {
-            format!("{}\n\nThe caller's changes since the previous round have been synced into the workdir: {}", prompt.trim_end(), if paths.is_empty() { "(none)".to_string() } else { paths.join(", ") })
+            None
+        };
+        if report.synced {
+            if let Some(short) = short_head {
+                eprintln!(
+                    "delegate: 基线已同步到主干 {short}（同步 {} 个文件）",
+                    report.paths.len()
+                );
+            } else {
+                eprintln!(
+                    "delegate: 基线已同步到当前源快照（同步 {} 个文件）",
+                    report.paths.len()
+                );
+            }
+            if *mode == worktree::SyncMode::Auto {
+                let fact = match (is_zh, short_head) {
+                    (true, Some(short)) => {
+                        format!("基线已同步到主干 {short}（同步 {} 个文件）。", report.paths.len())
+                    }
+                    (true, None) => {
+                        format!("基线已同步到当前源快照（同步 {} 个文件）。", report.paths.len())
+                    }
+                    (false, Some(short)) => format!(
+                        "Baseline synced to main {short} ({} file(s) updated).",
+                        report.paths.len()
+                    ),
+                    (false, None) => format!(
+                        "Baseline synced to current source snapshot ({} file(s) updated).",
+                        report.paths.len()
+                    ),
+                };
+                prompt = format!("{}\n\n{fact}", prompt.trim_end());
+            } else if is_zh {
+                let base_note = short_head
+                    .map(|short| format!("；基线已同步到主干 {short}"))
+                    .unwrap_or_default();
+                prompt = format!(
+                    "{}\n\n主控在上一轮之后的改动已同步进工作目录：{}{base_note}",
+                    prompt.trim_end(),
+                    if report.paths.is_empty() {
+                        "（无）".to_string()
+                    } else {
+                        report.paths.join("、")
+                    }
+                );
+            } else {
+                let base_note = short_head
+                    .map(|short| format!(" (baseline synced to main {short})"))
+                    .unwrap_or_default();
+                prompt = format!(
+                    "{}\n\nThe caller's changes since the previous round have been synced into the workdir: {}{base_note}",
+                    prompt.trim_end(),
+                    if report.paths.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        report.paths.join(", ")
+                    }
+                );
+            }
+            if !report.conflicts.is_empty() {
+                prompt = format!(
+                    "Resolve these sync conflicts FIRST before any other work: {}. Remove all conflict markers; acceptance fails while any remain.\n\n{}",
+                    report.conflicts.join(", "),
+                    prompt
+                );
+            }
+        } else if *mode == worktree::SyncMode::Auto && !report.conflicts.is_empty() {
+            eprintln!(
+                "delegate: 主干改动与本链存在冲突，保持旧基线继续；重叠文件：{}（可用 --no-sync 跳过同步，或用 --sync=agent 写入冲突标记交同事解决）",
+                report.conflicts.join("、")
+            );
+        } else if *mode != worktree::SyncMode::Auto {
+            if is_zh {
+                prompt = format!(
+                    "{}\n\n主控在上一轮之后的改动已同步进工作目录：（无）",
+                    prompt.trim_end()
+                );
+            } else {
+                prompt = format!(
+                    "{}\n\nThe caller's changes since the previous round have been synced into the workdir: (none)",
+                    prompt.trim_end()
+                );
+            }
         }
-    } else {
-        prompt
-    };
-    let prompt = if let Some((_, conflicts)) = &synced {
-        if conflicts.is_empty() {
-            prompt
-        } else {
-            format!("Resolve these sync conflicts FIRST before any other work: {}. Remove all conflict markers; acceptance fails while any remain.\n\n{}", conflicts.join(", "), prompt)
-        }
-    } else {
-        prompt
-    };
+    }
     // A conversation continues only on the colleague that holds it (Pi or agy).
     let session = match session {
         Some(_)
@@ -1517,8 +1601,32 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     if runs::interrupted(s(&summary, "state")) && s(&meta, "mode") == "write" {
         extra["continuation"] = json!(s(&summary, "state"));
     }
-    if let Some((paths, conflicts)) = synced {
-        extra["sync"] = json!({"files":paths,"conflicts":conflicts,"agent":o.sync_agent});
+    if let Some((mode, report)) = synced {
+        if report.synced {
+            extra["syncedBase"] = json!({
+                "tree": report.base_tree,
+                "head": report.base_head,
+                "commit": report.base_commit,
+                "dirty": report.source_dirty,
+            });
+            extra["sync"] = json!({
+                "files": report.paths,
+                "conflicts": report.conflicts,
+                "agent": o.sync_agent,
+                "auto": mode == worktree::SyncMode::Auto,
+            });
+        } else if mode != worktree::SyncMode::Auto {
+            extra["sync"] = json!({
+                "files": report.paths,
+                "conflicts": report.conflicts,
+                "agent": o.sync_agent,
+            });
+        } else {
+            let previous = json(parent.join("sync.json"));
+            if b(&previous, "agent") {
+                extra["sync"] = previous;
+            }
+        }
     } else {
         let previous = json(parent.join("sync.json"));
         if b(&previous, "agent") {
@@ -2059,10 +2167,13 @@ pub fn launch(
     if !deferred {
         allocate_tree(&mut tree, &mut wd, workdir, &run, mode);
     }
+    let run_id = run.file_name().unwrap_or_default().to_string_lossy();
+    let claimed_slot = b(&tree, "pooled") && s(&tree, "claimedBy") == run_id;
     let top = if tree.is_object() {
         let p = PathBuf::from(s(&tree, "path"));
-        // A reused pool slot still holds an earlier task's files: snapshot the source.
-        if p.exists() && !b(&tree, "pooled") {
+        // Only a newly claimed pool slot holds an earlier unrelated task's files: snapshot the source.
+        // A reply continuing in the same pool slot must snapshot the worktree itself.
+        if p.exists() && !claimed_slot {
             Some(p)
         } else {
             Some(PathBuf::from(s(&tree, "source")))
@@ -2099,7 +2210,7 @@ pub fn launch(
         ));
     }
     let new_tree =
-        tree.is_object() && (b(&tree, "pooled") || !Path::new(s(&tree, "path")).exists());
+        tree.is_object() && (claimed_slot || !Path::new(s(&tree, "path")).exists());
     if new_tree {
         if let Some(v) = &mut base {
             v["large"] = json!({});
@@ -2133,7 +2244,16 @@ pub fn launch(
         .map(seconds)
         .transpose()?
         .unwrap_or(0.0);
-    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":crate::agy::colleague(o.model.as_deref().unwrap_or("")),"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":timeout_seconds,"accept":o.accept,"acceptTimeoutSeconds":seconds(o.accept_timeout.as_deref().unwrap_or("10m"))? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":if !b(extra,"newAfterApply") && !s(parent,"chainBase").is_empty(){s(parent,"chainBase").to_string()}else{base.as_ref().map(|x|s(x,"tree").to_string()).unwrap_or_default()},"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
+    let chain_base = if !s(&extra["syncedBase"], "tree").is_empty() {
+        s(&extra["syncedBase"], "tree").to_string()
+    } else if !b(extra, "newAfterApply") && !s(parent, "chainBase").is_empty() {
+        s(parent, "chainBase").to_string()
+    } else {
+        base.as_ref()
+            .map(|x| s(x, "tree").to_string())
+            .unwrap_or_default()
+    };
+    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":crate::agy::colleague(o.model.as_deref().unwrap_or("")),"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":timeout_seconds,"accept":o.accept,"acceptTimeoutSeconds":seconds(o.accept_timeout.as_deref().unwrap_or("10m"))? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":chain_base,"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
     // A forked session continues on the executable that wrote it: Pi and rpi
     // keep different session formats.
     let parent_bin = s(parent, "agentBin");
@@ -2163,7 +2283,9 @@ pub fn launch(
     if meta["worktree"].is_object() {
         let source = PathBuf::from(s(&meta["worktree"], "source"));
         meta["sourceStatusBaseline"] = crate::source_watch::baseline(&source)?;
-        if !b(extra, "newAfterApply") && parent.is_object() && !s(parent, "netBase").is_empty() {
+        if !s(&extra["syncedBase"], "head").is_empty() {
+            meta["netBase"] = extra["syncedBase"]["head"].clone();
+        } else if !b(extra, "newAfterApply") && parent.is_object() && !s(parent, "netBase").is_empty() {
             meta["netBase"] = parent["netBase"].clone();
             if b(parent, "netBaseRebased") {
                 meta["netBaseRebased"] = json!(true);
@@ -2237,6 +2359,11 @@ pub fn launch(
     }
     meta["userPromptLen"] = json!(prompt.len());
     write_json(run.join("meta.json"), &meta)?;
+    if !s(&extra["syncedBase"], "commit").is_empty() {
+        let commit = s(&extra["syncedBase"], "commit");
+        write(run.join("worktree-base-commit"), commit)?;
+        crate::refs::pin_slot(&run, &meta, "worktree-base", commit);
+    }
     crate::notes::register_repo();
     crate::refs::pin_run(&run, &meta);
     if !extra["sync"].is_null() {

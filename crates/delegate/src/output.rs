@@ -324,23 +324,39 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
         .map(|(dir, count)| format!("{dir} {count}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let count = if totals.is_object() {
-        n(&totals, "files") as usize
+    let use_pending = meta["worktree"].is_object()
+        && s(&meta, "mode") == "write"
+        && status["pendingChanges"].is_object();
+    let display_totals = if use_pending {
+        status["pendingChanges"].clone()
+    } else {
+        totals.clone()
+    };
+    let count = if display_totals.is_object() {
+        n(&display_totals, "files") as usize
     } else {
         paths.len()
     };
+    let show_dirs = !dirs.is_empty()
+        && (!use_pending
+            || !totals.is_object()
+            || n(&totals, "files") == n(&display_totals, "files"));
     if count > 0 {
         parts.push(format!(
             "改 {count} 个文件{}{}",
-            if totals.is_object() {
-                format!(" +{}/-{}", n(&totals, "added"), n(&totals, "deleted"))
+            if display_totals.is_object() {
+                format!(
+                    " +{}/-{}",
+                    n(&display_totals, "added"),
+                    n(&display_totals, "deleted")
+                )
             } else {
                 String::new()
             },
-            if dirs.is_empty() {
-                String::new()
-            } else {
+            if show_dirs {
                 format!("（{dirs}）")
+            } else {
+                String::new()
             }
         ));
     }
@@ -354,7 +370,7 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
     if s(status, "warning").contains("could not snapshot") {
         parts.push("改动未知".into());
     }
-    if n(&status["pendingChanges"], "files") > count as i64 {
+    if !use_pending && n(&status["pendingChanges"], "files") > count as i64 {
         parts.push(format!(
             "累计待合入 {} 个文件 +{}/-{}",
             n(&status["pendingChanges"], "files"),
@@ -592,11 +608,43 @@ fn format_path_list(paths: &[String], limit: usize, summary_path: &Path) -> Stri
     }
 }
 
+pub fn format_source_drift(drift: &Value) -> Option<String> {
+    if !drift.is_object() {
+        return None;
+    }
+    let commits = n(drift, "commits");
+    let files = n(drift, "files");
+    if commits == 0 && files == 0 {
+        return None;
+    }
+    let overlap = strings(&drift["overlap"]);
+    let more = n(drift, "overlapMore");
+    let overlap_count = overlap.len() as i64 + more;
+    if overlap_count > 0 {
+        let listed = overlap.join("、");
+        let suffix = if more > 0 {
+            format!("{listed} 等")
+        } else {
+            listed
+        };
+        Some(format!(
+            "!!! 主干已前进 {commits} 个提交 / {files} 个文件，与本链改动重叠 {overlap_count} 个：{suffix}"
+        ))
+    } else {
+        Some(format!(
+            "主干已前进 {commits} 个提交 / {files} 个文件，与本链改动重叠 0 个"
+        ))
+    }
+}
+
 /// Concise summary line followed by indented path details for `delegate status <run>`.
 pub fn human_detail(run: &Path, status: &Value) -> String {
     let mut lines = vec![human(run, status)];
     let summary_path = run.join("summary.json");
     let meta = json(run.join("meta.json"));
+    if let Some(drift_line) = format_source_drift(&status["sourceDrift"]) {
+        lines.push(format!("  {drift_line}"));
+    }
     if b(&meta, "netBaseRebased") && !s(&meta, "netBase").is_empty() {
         let sha = s(&meta, "netBase");
         lines.push(format!("  netBase: {}", &sha[..sha.len().min(7)]));

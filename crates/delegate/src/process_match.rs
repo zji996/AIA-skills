@@ -147,7 +147,7 @@ pub fn command(args: &[String]) -> Res<i32> {
 
 pub fn prepare(run: &Path, path: &std::ffi::OsStr) -> Res<()> {
     use std::os::unix::fs::PermissionsExt;
-    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    let executable = crate::common::script();
     for tool in ["pkill", "killall", "pgrep"] {
         let actual = if tool == "killall" { "pkill" } else { tool };
         let binary = std::env::split_paths(path)

@@ -47,8 +47,8 @@ class DelegateApplyFinishTests(unittest.TestCase):
         result = self.cli("apply", state["run"], human=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         last = result.stdout.splitlines()[-1]
-        self.assertIn("验收无效", last)
-        self.assertIn("需要在主干重跑", last)
+        self.assertIn("主干已前进，验收快照失效；本仓库配置合入后不自动验收，批量门禁时跑：", last)
+        self.assertNotIn("验收无效", last)
         self.assertIn("test -f a.txt && test -f other.txt", last)
 
     def test_failed_apply_preserves_task(self):

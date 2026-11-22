@@ -639,6 +639,19 @@ pub fn pending_changes(run: &Path, meta: &Value) -> Option<Value> {
         json!({"files":changes.len(),"added":changes.iter().map(|c| n(c,"added")).sum::<i64>(),"deleted":changes.iter().map(|c| n(c,"deleted")).sum::<i64>()}),
     )
 }
+/// Net changed paths of this worktree chain relative to its effective chain baseline
+/// (`chainBase` / `.sync-base` / `netBase`), excluding unrelated source-branch advances.
+pub fn pending_changed_paths(run: &Path, meta: &Value) -> Option<Vec<String>> {
+    if !meta["worktree"].is_object() || s(meta, "mode") != "write" {
+        return None;
+    }
+    let rec = json(run.join("changes.json"));
+    let top = Path::new(s(&rec, "top"));
+    let base = effective_chain_base(run, meta, top);
+    let after = json!({"tree":rec["after"],"large":rec["afterLarge"]});
+    let changes = tree_changes(top, &base, &after, true).ok()?;
+    Some(changes.iter().map(|c| s(c, "path").to_string()).collect())
+}
 fn file_hash(path: &Path) -> Res<String> {
     let mut file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut hash = sha1_smol::Sha1::new();
@@ -919,7 +932,7 @@ pub fn concurrent_writes(created: &Path) -> Vec<Value> {
     found
 }
 /// How far the source moved since a finished, unapplied worktree run took its snapshot:
-/// the number of changed files, and which of them the run changed too.
+/// commits advanced, changed files, and which of them overlap with this chain's own changes.
 pub fn source_drift(run: &Path) -> Option<Value> {
     let meta = json(run.join("meta.json"));
     if !meta["worktree"].is_object() || s(&meta, "mode") != "write" || run.join(".applied").exists()
@@ -928,19 +941,33 @@ pub fn source_drift(run: &Path) -> Option<Value> {
     }
     let (_, top, _, after) = chain_changes(run).ok()?;
     let source = PathBuf::from(s(&meta["worktree"], "source"));
-    let applied = applied_state(run, &meta);
-    let baseline = if !s(&applied, "tree").is_empty() {
-        applied
-    } else {
-        json!({"tree":s(&meta,"chainBase"),"large":{}})
-    };
-    let ours = tree_changes(&top, &baseline, &json!({"tree":after}), false).ok()?;
-    if ours.is_empty() || !source.is_dir() {
+    if !source.is_dir() {
         return None;
     }
+    let applied = applied_state(run, &meta);
+    let baseline = if !s(&applied, "tree").is_empty() {
+        applied.clone()
+    } else {
+        let (tree, _) = effective_total_base(&top, &meta);
+        json!({"tree":tree,"large":{}})
+    };
+    let ours = tree_changes(&top, &baseline, &json!({"tree":after}), false).ok()?;
+    let base_head = if !s(&applied, "head").is_empty() {
+        s(&applied, "head").to_string()
+    } else {
+        s(&meta, "netBase").to_string()
+    };
+    let commits = if !base_head.is_empty() {
+        git_text(&source, &["rev-list", "--count", &format!("{base_head}..HEAD")])
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let now = snapshot(&source, run, &strings(&meta["snapshotExclude"]))?;
     let moved = tree_changes(&source, &baseline, &now, false).ok()?;
-    if moved.is_empty() {
+    if moved.is_empty() && commits == 0 {
         return None;
     }
     let overlap = moved
@@ -950,30 +977,167 @@ pub fn source_drift(run: &Path) -> Option<Value> {
         .collect::<Vec<_>>();
     let mut drift =
         json!({"files":moved.len(),"overlap":overlap.iter().take(10).collect::<Vec<_>>()});
+    if commits > 0 {
+        drift["commits"] = json!(commits);
+    }
     if overlap.len() > 10 {
         drift["overlapMore"] = json!(overlap.len() - 10);
     }
     Some(drift)
 }
-pub fn sync(run: &Path, meta: &Value, agent: bool) -> Res<(Vec<String>, Vec<String>)> {
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    /// Default on `reply`: sync cleanly when possible, keep old baseline on conflict.
+    Auto,
+    /// Explicit `--sync`: fail with an error on any conflict.
+    Strict,
+    /// Explicit `--sync=agent`: write text conflict markers for the agent; fail on non-text conflict.
+    Agent,
+}
+
+pub struct SyncReport {
+    pub synced: bool,
+    pub paths: Vec<String>,
+    pub conflicts: Vec<String>,
+    pub base_tree: String,
+    pub base_head: String,
+    pub base_commit: Option<String>,
+    pub source_dirty: bool,
+}
+
+fn replay_commits_onto_base(
+    worktree: &Path,
+    old_base_commit: &str,
+    new_base_commit: &str,
+) -> Res<Option<String>> {
+    let old_head = git_text(worktree, &["rev-parse", "-q", "--verify", "HEAD^{commit}"])
+        .unwrap_or_default();
+    if old_head.is_empty() || old_head == old_base_commit {
+        return Ok(Some(new_base_commit.to_string()));
+    }
+    let list = git_text(
+        worktree,
+        &[
+            "rev-list",
+            "--reverse",
+            &format!("{old_base_commit}..{old_head}"),
+        ],
+    )?;
+    let commits: Vec<&str> = list.lines().filter(|l| !l.is_empty()).collect();
+    let mut cur_parent = new_base_commit.to_string();
+    for commit in commits {
+        let parents_line = git_text(worktree, &["rev-list", "--parents", "-n", "1", commit])?;
+        let parents: Vec<&str> = parents_line.split_whitespace().collect();
+        // Skip replaying merge commits or root commits cleanly.
+        if parents.len() != 2 {
+            return Ok(None);
+        }
+        let c_parent = parents[1];
+        let merge = git_command()
+            .arg("-C")
+            .arg(worktree)
+            .args([
+                "merge-tree",
+                "--write-tree",
+                &format!("--merge-base={c_parent}"),
+                &cur_parent,
+                commit,
+            ])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !merge.status.success() {
+            return Ok(None);
+        }
+        let tree = String::from_utf8_lossy(&merge.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if tree.is_empty() {
+            return Ok(None);
+        }
+        let meta_raw = git(
+            worktree,
+            &["show", "-s", "--format=%an%x00%ae%x00%aI%x00%B", commit],
+        )?;
+        let mut fields = meta_raw.splitn(4, |b| *b == 0);
+        let author_name = String::from_utf8_lossy(fields.next().unwrap_or_default()).into_owned();
+        let author_email = String::from_utf8_lossy(fields.next().unwrap_or_default()).into_owned();
+        let author_date = String::from_utf8_lossy(fields.next().unwrap_or_default()).into_owned();
+        let body = fields.next().unwrap_or_default();
+        let mut ct = git_command();
+        ct.arg("-C")
+            .arg(worktree)
+            .args(["commit-tree", &tree, "-p", &cur_parent, "-F", "-"])
+            .env("GIT_AUTHOR_NAME", &author_name)
+            .env("GIT_AUTHOR_EMAIL", &author_email)
+            .env("GIT_AUTHOR_DATE", &author_date)
+            .env("GIT_COMMITTER_NAME", &author_name)
+            .env("GIT_COMMITTER_EMAIL", &author_email)
+            .env("GIT_COMMITTER_DATE", &author_date)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = ct.spawn().map_err(|e| e.to_string())?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(body);
+        }
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        cur_parent = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    }
+    Ok(Some(cur_parent))
+}
+
+pub fn sync_with_mode(run: &Path, meta: &Value, mode: SyncMode) -> Res<SyncReport> {
+    let agent = mode == SyncMode::Agent;
     let source = PathBuf::from(s(&meta["worktree"], "source"));
     let worktree = PathBuf::from(s(&meta["worktree"], "path"));
     let exclude = strings(&meta["snapshotExclude"]);
     let current_source = snapshot(&source, run, &exclude)
         .ok_or_else(|| format!("cannot snapshot {} for --sync", source.display()))?;
+    let source_head =
+        git_text(&source, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]).unwrap_or_default();
+    let source_head_tree = if !source_head.is_empty() {
+        git_text(&source, &["rev-parse", "-q", "--verify", "HEAD^{tree}"]).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let source_dirty = source_head_tree != s(&current_source, "tree");
     let applied = applied_state(run, meta);
     let baseline = if !s(&applied, "tree").is_empty() {
         applied
     } else {
-        json!({"tree":s(meta,"chainBase"),"large":{}})
+        let (tree, _) = effective_total_base(&worktree, meta);
+        json!({"tree":tree,"large":{}})
     };
     let changes = tree_changes(&source, &baseline, &current_source, false)?;
+    if changes.is_empty() {
+        return Ok(SyncReport {
+            synced: false,
+            paths: vec![],
+            conflicts: vec![],
+            base_tree: s(&current_source, "tree").to_string(),
+            base_head: source_head,
+            base_commit: None,
+            source_dirty,
+        });
+    }
     let mut actions = vec![];
     let mut conflicts = vec![];
     let mut paths = vec![];
     for change in changes {
         let path = s(&change, "path").to_string();
         let target = worktree.join(&path);
+        // Auto-sync never pulls unresolved conflict markers from the source workspace into a worktree.
+        if mode == SyncMode::Auto && !conflict_labels(&source.join(&path)).is_empty() {
+            conflicts.push(path);
+            continue;
+        }
         if b(&change, "submodule") {
             if gitlink(&source, s(&baseline, "tree"), &path)?
                 != gitlink(&source, s(&current_source, "tree"), &path)?
@@ -1009,31 +1173,32 @@ pub fn sync(run: &Path, meta: &Value, agent: bool) -> Res<(Vec<String>, Vec<Stri
             continue;
         }
         let (old_mode, old) = blob(&source, s(&baseline, "tree"), &path)?;
-        let (mode, new) = blob(&source, s(&current_source, "tree"), &path)?;
+        let (mode_str, new) = blob(&source, s(&current_source, "tree"), &path)?;
         let now = current(&target);
         let now_mode = entry_mode(&target);
         let valid = |x: &Option<String>| {
             x.as_deref()
                 .is_none_or(|v| ["100644", "100755", "120000"].contains(&v))
         };
-        if !valid(&old_mode) || !valid(&mode) {
+        if !valid(&old_mode) || !valid(&mode_str) {
             conflicts.push(path);
-        } else if now == new && now_mode == mode {
+        } else if now == new && now_mode == mode_str {
             continue;
-        } else if now == old && (now_mode == old_mode || now_mode == mode) {
+        } else if now == old && (now_mode == old_mode || now_mode == mode_str) {
             paths.push(path.clone());
             actions.push(Action {
                 kind: if new.is_none() { "deleted" } else { "applied" }.into(),
                 path,
                 target,
-                mode,
+                mode: mode_str,
                 content: new.unwrap_or_default(),
             });
         } else if agent || (old.is_some() && new.is_some() && now.is_some()) {
             let base = old.as_deref().unwrap_or_default();
             let theirs = new.as_deref().unwrap_or_default();
             let mine = now.as_deref().unwrap_or_default();
-            if [old_mode.as_deref(), mode.as_deref(), now_mode.as_deref()].contains(&Some("120000"))
+            if [old_mode.as_deref(), mode_str.as_deref(), now_mode.as_deref()]
+                .contains(&Some("120000"))
                 || base.contains(&0)
                 || theirs.contains(&0)
                 || mine.contains(&0)
@@ -1072,8 +1237,8 @@ pub fn sync(run: &Path, meta: &Value, agent: bool) -> Res<(Vec<String>, Vec<Stri
                     kind: "merged".into(),
                     path,
                     target,
-                    mode: if old_mode != mode {
-                        mode.or(now_mode).or(Some("100644".into()))
+                    mode: if old_mode != mode_str {
+                        mode_str.or(now_mode).or(Some("100644".into()))
                     } else {
                         None
                     },
@@ -1086,19 +1251,106 @@ pub fn sync(run: &Path, meta: &Value, agent: bool) -> Res<(Vec<String>, Vec<Stri
             conflicts.push(path);
         }
     }
-    // Binary, symlink, gitlink and structural conflicts cannot safely be represented
-    // by text markers. Fail atomically rather than silently dropping caller changes.
-    if !conflicts.is_empty() && (!agent || conflicts.iter().any(|p| !paths.contains(p))) {
-        return Err(format!("--sync conflict in: {}", conflicts.join(", ")));
+    if !conflicts.is_empty() {
+        match mode {
+            SyncMode::Auto => {
+                return Ok(SyncReport {
+                    synced: false,
+                    paths: vec![],
+                    conflicts,
+                    base_tree: s(&current_source, "tree").to_string(),
+                    base_head: source_head,
+                    base_commit: None,
+                    source_dirty,
+                });
+            }
+            SyncMode::Strict => {
+                return Err(format!("--sync conflict in: {}", conflicts.join(", ")));
+            }
+            SyncMode::Agent => {
+                // Binary, symlink, gitlink and structural conflicts cannot safely be represented
+                // by text markers. Fail atomically rather than silently dropping caller changes.
+                if conflicts.iter().any(|p| !paths.contains(p)) {
+                    return Err(format!("--sync conflict in: {}", conflicts.join(", ")));
+                }
+            }
+        }
+    }
+    // Prepare the new Git baseline commit & replay colleague commits purely in Git's object store
+    // BEFORE mutating worktree files, so Auto mode stays atomic and `target/` is never touched.
+    let mut synced_base_commit: Option<String> = None;
+    let mut new_wt_head: Option<String> = None;
+    if conflicts.is_empty() {
+        let new_base = if !source_dirty && !source_head.is_empty() {
+            Some(source_head.clone())
+        } else {
+            let mut c = git_command();
+            c.arg("-C")
+                .arg(&source)
+                .arg("commit-tree")
+                .arg(s(&current_source, "tree"));
+            if !source_head.is_empty() {
+                c.args(["-p", &source_head]);
+            }
+            c.arg("-m").arg(format!(
+                "delegate: synced baseline of {} for {}",
+                source.display(),
+                run.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            for who in ["AUTHOR", "COMMITTER"] {
+                c.env(format!("GIT_{who}_NAME"), "delegate")
+                    .env(format!("GIT_{who}_EMAIL"), "delegate@localhost");
+            }
+            c.output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|sha| !sha.is_empty())
+        };
+        if let Some(base_commit) = new_base {
+            let old_base = if b(meta, "netBaseRebased") && !s(meta, "netBase").is_empty() {
+                Some(s(meta, "netBase").to_string())
+            } else {
+                crate::changes::worktree_base_commit(run, meta)
+            };
+            if let Some(old_base) = old_base {
+                match replay_commits_onto_base(&worktree, &old_base, &base_commit)? {
+                    Some(head) => {
+                        synced_base_commit = Some(base_commit);
+                        new_wt_head = Some(head);
+                    }
+                    None if mode == SyncMode::Auto => {
+                        return Ok(SyncReport {
+                            synced: false,
+                            paths: vec![],
+                            conflicts: paths,
+                            base_tree: s(&current_source, "tree").to_string(),
+                            base_head: source_head,
+                            base_commit: None,
+                            source_dirty,
+                        });
+                    }
+                    None => {}
+                }
+            }
+        }
     }
     for action in actions {
         if action.kind == "deleted" {
-            fs::remove_file(&action.target).map_err(|e| e.to_string())?;
-        } else if let Some(mode) = action.mode.as_deref() {
-            write_entry(&action.target, mode, &action.content)?;
+            match fs::remove_file(&action.target) {
+                Ok(()) => remove_empty_parents(&action.target, &worktree),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        } else if let Some(mode_str) = action.mode.as_deref() {
+            write_entry(&action.target, mode_str, &action.content)?;
         } else {
             write(&action.target, &action.content)?;
         }
+    }
+    if let Some(head) = &new_wt_head {
+        // Mixed reset updates HEAD and index without touching working-tree files or `target/`.
+        let _ = git(&worktree, &["reset", "--mixed", "-q", head]);
     }
     let mut large_hashes = serde_json::Map::new();
     if let Some(large) = current_source["large"].as_object() {
@@ -1106,7 +1358,10 @@ pub fn sync(run: &Path, meta: &Value, agent: bool) -> Res<(Vec<String>, Vec<Stri
             large_hashes.insert(path.clone(), json!(file_hash(&source.join(path))?));
         }
     }
-    let state = json!({"at":iso(),"tree":current_source["tree"],"large":current_source["large"],"largeHashes":large_hashes});
+    let mut state = json!({"at":iso(),"tree":current_source["tree"],"large":current_source["large"],"largeHashes":large_hashes});
+    if !source_head.is_empty() {
+        state["head"] = json!(&source_head);
+    }
     let mut chain = run.to_path_buf();
     loop {
         write_json(chain.join(".sync-base"), &state)?;
@@ -1124,11 +1379,28 @@ pub fn sync(run: &Path, meta: &Value, agent: bool) -> Res<(Vec<String>, Vec<Stri
         }
         chain = chain.parent().unwrap().join(parent);
     }
-    Ok((paths, conflicts))
+    Ok(SyncReport {
+        synced: true,
+        paths,
+        conflicts,
+        base_tree: s(&current_source, "tree").to_string(),
+        base_head: source_head,
+        base_commit: synced_base_commit,
+        source_dirty,
+    })
 }
 pub struct ApplyOutcome {
     pub code: i32,
     pub conclusion: Value,
+    pub written_files: Vec<String>,
+    pub regenerated_files: Vec<String>,
+    pub had_dirty_merge: bool,
+}
+struct ApplyInnerResult {
+    code: i32,
+    written: Vec<String>,
+    regenerated: Vec<String>,
+    had_dirty_merge: bool,
 }
 fn apply_progress(message: impl std::fmt::Display) {
     eprintln!("delegate: {message}");
@@ -1147,6 +1419,80 @@ fn generation_markers(run: &Path, meta: &Value) -> Vec<PathBuf> {
     markers.dedup();
     markers
 }
+fn is_markdown(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+}
+fn fence_marker(line: &str) -> Option<(u8, usize, &str)> {
+    let bytes = line.as_bytes();
+    let indent = bytes.iter().take_while(|&&b| b == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &bytes[indent..];
+    let ch = *rest.first()?;
+    if ch != b'`' && ch != b'~' {
+        return None;
+    }
+    let count = rest.iter().take_while(|&&b| b == ch).count();
+    if count < 3 {
+        return None;
+    }
+    let tail = &line[indent + count..];
+    Some((ch, count, tail))
+}
+fn conflict_labels_in_bytes(path: &Path, bytes: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let markdown = is_markdown(path);
+    let mut labels = Vec::new();
+    let mut fence: Option<(u8, usize)> = None;
+    // Inside Markdown code fences, require a full <<<<<<< ... ======= ... >>>>>>> block
+    // so prose/examples mentioning conflict markers do not false-positive.
+    let mut fenced_open: Option<String> = None;
+    let mut fenced_divider = false;
+    for line in text.lines() {
+        if markdown {
+            if let Some((fch, fcount)) = fence {
+                if let Some((ch, count, tail)) = fence_marker(line) {
+                    if ch == fch && count >= fcount && tail.trim().is_empty() {
+                        fence = None;
+                        fenced_open = None;
+                        fenced_divider = false;
+                        continue;
+                    }
+                }
+                if let Some(label) = line.strip_prefix("<<<<<<< ") {
+                    fenced_open = Some(label.to_string());
+                    fenced_divider = false;
+                } else if line == "=======" && fenced_open.is_some() {
+                    fenced_divider = true;
+                } else if let Some(label) = line.strip_prefix(">>>>>>> ") {
+                    if let (Some(open), true) = (fenced_open.take(), fenced_divider) {
+                        labels.push(open);
+                        labels.push(label.to_string());
+                    }
+                    fenced_divider = false;
+                }
+                continue;
+            } else if let Some((ch, count, tail)) = fence_marker(line) {
+                if ch == b'~' || !tail.contains('`') {
+                    fence = Some((ch, count));
+                    fenced_open = None;
+                    fenced_divider = false;
+                    continue;
+                }
+            }
+        }
+        if let Some(label) = line
+            .strip_prefix("<<<<<<< ")
+            .or_else(|| line.strip_prefix(">>>>>>> "))
+        {
+            labels.push(label.to_string());
+        }
+    }
+    labels
+}
 /// Marker labels include the originating run, so diagnostics survive old/cleaned runs.
 pub fn conflict_labels(path: &Path) -> Vec<String> {
     if path.is_symlink() {
@@ -1154,18 +1500,8 @@ pub fn conflict_labels(path: &Path) -> Vec<String> {
     }
     fs::read(path)
         .ok()
-        .into_iter()
-        .flat_map(|bytes| {
-            String::from_utf8_lossy(&bytes)
-                .lines()
-                .filter_map(|line| {
-                    line.strip_prefix("<<<<<<< ")
-                        .or_else(|| line.strip_prefix(">>>>>>> "))
-                        .map(str::to_string)
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
+        .map(|bytes| conflict_labels_in_bytes(path, &bytes))
+        .unwrap_or_default()
 }
 /// Sync handoffs also reject a half-removed marker block (e.g. only the divider).
 pub fn has_conflict_markers(path: &Path) -> bool {
@@ -1173,12 +1509,40 @@ pub fn has_conflict_markers(path: &Path) -> bool {
         return false;
     }
     fs::read(path).is_ok_and(|bytes| {
-        String::from_utf8_lossy(&bytes).lines().any(|line| {
-            line.starts_with("<<<<<<< ")
-                || line.starts_with(">>>>>>> ")
-                || line.starts_with("||||||| ")
-                || line == "======="
-        })
+        if !conflict_labels_in_bytes(path, &bytes).is_empty() {
+            return true;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let markdown = is_markdown(path);
+        let mut fence: Option<(u8, usize)> = None;
+        let mut prev_nonempty = false;
+        for line in text.lines() {
+            if markdown {
+                if let Some((fch, fcount)) = fence {
+                    if let Some((ch, count, tail)) = fence_marker(line) {
+                        if ch == fch && count >= fcount && tail.trim().is_empty() {
+                            fence = None;
+                        }
+                    }
+                    prev_nonempty = false;
+                    continue;
+                } else if let Some((ch, count, tail)) = fence_marker(line) {
+                    if ch == b'~' || !tail.contains('`') {
+                        fence = Some((ch, count));
+                        prev_nonempty = false;
+                        continue;
+                    }
+                }
+            }
+            if line.starts_with("||||||| ") {
+                return true;
+            }
+            if line == "=======" && !(markdown && prev_nonempty) {
+                return true;
+            }
+            prev_nonempty = !line.trim().is_empty();
+        }
+        false
     })
 }
 fn marked_files(source: &Path, rules: &[String]) -> Res<Vec<String>> {
@@ -1324,19 +1688,25 @@ fn reject_existing_markers(run: &Path, meta: &Value, keep_commits: bool) -> Res<
     }
     Ok(checked)
 }
-pub fn apply(run: &Path, merge: bool, dry: bool, keep_commits: bool) -> Res<ApplyOutcome> {
+pub fn apply(
+    run: &Path,
+    merge: bool,
+    dry: bool,
+    keep_commits: bool,
+    commit_mode: bool,
+) -> Res<ApplyOutcome> {
     let mut meta = json(run.join("meta.json"));
     if s(&meta, "mode") == "read-only" {
         return Err("read-only snapshot: nothing to apply / 只读任务禁止 apply".into());
     }
     let source = PathBuf::from(s(&meta["worktree"], "source"));
     if !source.is_absolute() {
-        return apply_checked(run, merge, dry, keep_commits, &[]);
+        return apply_checked(run, merge, dry, keep_commits, commit_mode, &[]);
     }
     if !dry {
         lane::install_signals();
     }
-    let _guard = crate::source_watch::guard(&source, true)?;
+    let _apply_guard = crate::source_watch::apply_guard(&source)?;
     // Refresh the delivered diff before releasing its worktree (also captures later edits).
     if Path::new(s(&meta["worktree"], "path")).is_dir() {
         crate::changes::record(&mut meta, run);
@@ -1381,13 +1751,14 @@ pub fn apply(run: &Path, merge: bool, dry: bool, keep_commits: bool) -> Res<Appl
         }
         write(run.join("applied.patch"), patch)?;
     }
-    apply_checked(run, merge, dry, keep_commits, &written_paths)
+    apply_checked(run, merge, dry, keep_commits, commit_mode, &written_paths)
 }
 fn apply_checked(
     run: &Path,
     merge: bool,
     dry: bool,
     keep_commits: bool,
+    commit_mode: bool,
     written_paths: &[String],
 ) -> Res<ApplyOutcome> {
     apply_progress("checking merge / 正在检查合并");
@@ -1476,26 +1847,59 @@ fn apply_checked(
     if keep_commits && !uncommitted.is_empty() {
         return Err(format!("--keep-commits requires committed worktree changes; commits differ from the final tree: {}", uncommitted.join(", ")));
     }
-    let mut code = if keep_commits && !commits.is_empty() {
+    let inner = if keep_commits && !commits.is_empty() {
         if dry {
-            0
-        } else {
-            let before = crate::source_watch::fingerprint(source)?;
-            let mut code = 0;
-            for item in &commits {
-                let status = git_command()
-                    .arg("-C")
-                    .arg(source)
-                    .args(["cherry-pick", "--no-edit", s(item, "hash")])
-                    .status()
-                    .map_err(|e| e.to_string())?;
-                if !status.success() {
-                    eprintln!("delegate: cherry-pick stopped at {}; resolve conflicts in {}, then continue with git cherry-pick --continue", s(item,"hash"), source.display());
-                    code = 1;
-                    break;
-                }
+            ApplyInnerResult {
+                code: 0,
+                written: vec![],
+                regenerated: vec![],
+                had_dirty_merge: false,
             }
-            crate::source_watch::register(source, &before, written_paths)?;
+        } else {
+            let mut written_set = std::collections::BTreeSet::new();
+            let mut applied_commits = Vec::new();
+            let mut failed_commit: Option<(String, String)> = None;
+            let code = {
+                let _guard = crate::source_watch::guard(source, true)?;
+                let before = crate::source_watch::fingerprint(source)?;
+                let mut code = 0;
+                for item in &commits {
+                    let hash = s(item, "hash");
+                    let title = s(item, "title");
+                    let touched = git(
+                        worktree,
+                        &[
+                            "diff-tree",
+                            "--no-commit-id",
+                            "--name-only",
+                            "--no-renames",
+                            "-r",
+                            "-z",
+                            hash,
+                        ],
+                    )
+                    .unwrap_or_default();
+                    for path in touched.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+                        written_set.insert(String::from_utf8_lossy(path).into_owned());
+                    }
+                    let status = git_command()
+                        .arg("-C")
+                        .arg(source)
+                        .args(["cherry-pick", "--no-edit", hash])
+                        .status()
+                        .map_err(|e| e.to_string())?;
+                    if !status.success() {
+                        eprintln!("delegate: cherry-pick stopped at {hash}; resolve conflicts in {}, then continue with git cherry-pick --continue", source.display());
+                        failed_commit = Some((hash.to_string(), title.to_string()));
+                        code = 1;
+                        break;
+                    }
+                    applied_commits.push(hash.to_string());
+                }
+                crate::source_watch::register(source, &before, written_paths)?;
+                code
+            };
+            let written: Vec<String> = written_set.into_iter().collect();
             if code == 0 {
                 let at = iso();
                 let head = git_text(source, &["rev-parse", "HEAD"])
@@ -1510,12 +1914,28 @@ fn apply_checked(
                 }
                 let _ = write_json(run.join("meta.json"), &updated);
                 crate::refs::pin_slot(run, &meta, "applied", s(&meta["base"], "tree"));
+            } else if let Some((hash, title)) = failed_commit {
+                let short = &hash[..7.min(hash.len())];
+                conclusion["apply"]["failedStep"] = json!("cherry-pick");
+                conclusion["apply"]["failureDetail"] = json!(format!(
+                    "cherry-pick stopped at {short} {title} ({} commit(s) already applied)",
+                    applied_commits.len()
+                ));
+                conclusion["apply"]["writtenFiles"] = json!(&written);
             }
-            code
+            ApplyInnerResult {
+                code,
+                written,
+                regenerated: vec![],
+                had_dirty_merge: false,
+            }
         }
     } else {
         apply_inner(run, merge, dry, &mut conclusion)?
     };
+    let mut code = inner.code;
+    let written_files = inner.written;
+    let regenerated_files = inner.regenerated;
     if keep_commits {
         conclusion["apply"]["keepCommits"] = json!(true);
     }
@@ -1523,17 +1943,57 @@ fn apply_checked(
         let marked = marked_files(source, written_paths)?;
         if !marked.is_empty() {
             conclusion["apply"]["conflictMarkers"] = json!(marked);
+            if s(&conclusion["apply"], "failedStep").is_empty() {
+                conclusion["apply"]["failedStep"] = json!("conflict-markers");
+                conclusion["apply"]["failureDetail"] = json!(format!(
+                    "{} file(s) contain conflict markers: {}",
+                    marked.len(),
+                    marked.join(", ")
+                ));
+            }
+            if conclusion["apply"].get("writtenFiles").is_none() {
+                conclusion["apply"]["writtenFiles"] = json!(&written_files);
+            }
             let mut summary = json(run.join("summary.json"));
             summary["conflictMarkers"] = json!(marked);
             write_json(run.join("summary.json"), &summary)?;
             code = 1;
         }
     }
+    if code != 0 {
+        if s(&conclusion["apply"], "failedStep").is_empty() {
+            conclusion["apply"]["failedStep"] = json!("apply");
+            conclusion["apply"]["failureDetail"] = json!("apply returned non-zero");
+        }
+        if conclusion["apply"].get("writtenFiles").is_none() {
+            conclusion["apply"]["writtenFiles"] = json!(&written_files);
+        }
+    }
     conclusion["apply"]["ok"] = json!(code == 0);
     accept_validity(run, dry, &mut conclusion);
     let marked = strings(&conclusion["apply"]["conflictMarkers"]);
+    let mut total_uncommitted: std::collections::BTreeSet<&str> =
+        written_files.iter().map(String::as_str).collect();
+    total_uncommitted.extend(regenerated_files.iter().map(String::as_str));
+    let uncommitted_count = total_uncommitted.len();
+    let commit_titles: Vec<&str> = commits
+        .iter()
+        .map(|c| s(c, "title"))
+        .filter(|t| !t.is_empty())
+        .collect();
     apply_progress(if code == 0 {
-        "apply complete / 应用完成".to_string()
+        if !dry && !keep_commits && !commit_mode && uncommitted_count > 0 {
+            if commit_titles.is_empty() {
+                format!("apply complete / 应用完成 · 改动未提交：{uncommitted_count} 个文件")
+            } else {
+                format!(
+                    "apply complete / 应用完成 · 改动未提交：{uncommitted_count} 个文件；同事原提交：{}",
+                    commit_titles.join(" / ")
+                )
+            }
+        } else {
+            "apply complete / 应用完成".to_string()
+        }
     } else if !marked.is_empty() {
         format!(
             "applied with conflict markers / 已应用，{} 个文件有冲突标记待解决: {}",
@@ -1541,9 +2001,20 @@ fn apply_checked(
             marked.join(", ")
         )
     } else {
-        "apply failed / 应用失败".to_string()
+        let step = s(&conclusion["apply"], "failedStep");
+        let detail = s(&conclusion["apply"], "failureDetail");
+        let written_n = strings(&conclusion["apply"]["writtenFiles"]).len();
+        format!(
+            "apply failed at {step} / 应用失败（{detail}；已写入源工作区 {written_n} 个文件）"
+        )
     });
-    Ok(ApplyOutcome { code, conclusion })
+    Ok(ApplyOutcome {
+        code,
+        conclusion,
+        written_files,
+        regenerated_files,
+        had_dirty_merge: inner.had_dirty_merge,
+    })
 }
 fn accept_validity(run: &Path, dry: bool, conclusion: &mut Value) {
     let meta = json(run.join("meta.json"));
@@ -1658,6 +2129,9 @@ pub fn verify_plan(run: &Path, forced: Option<bool>, conclusion: &mut Value) -> 
         }
     };
     if !forced.unwrap_or(configured.is_some()) {
+        if configured.is_none() && forced != Some(true) {
+            conclusion["applyVerifyDisabled"] = json!(true);
+        }
         return Ok(vec![]);
     }
     if forced != Some(true) && conclusion["acceptStillValid"] == json!(true) {
@@ -1897,7 +2371,112 @@ fn numbered_conflicts(
         })
         .collect())
 }
-fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Res<i32> {
+/// Stage only the applied paths and create one squash commit on the source checkout.
+/// Fails closed if the source index already has staged changes or a 3-way merged file
+/// contained pre-existing local uncommitted edits.
+pub fn commit_applied(
+    source: &Path,
+    runs: &[PathBuf],
+    paths: &[String],
+    titles: &[String],
+    run_names: &[String],
+    had_dirty_merge: bool,
+) -> Res<(String, String)> {
+    if paths.is_empty() {
+        return Err("no written files to commit".into());
+    }
+    if had_dirty_merge {
+        return Err(
+            "refusing --commit: a 3-way merged file already had uncommitted local edits in the source workspace; review and commit manually"
+                .into(),
+        );
+    }
+    let cached = git_command()
+        .arg("-C")
+        .arg(source)
+        .args(["diff", "--cached", "--quiet"])
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !cached.success() {
+        return Err(
+            "refusing --commit: source index already has staged changes; commit or unstage them first"
+                .into(),
+        );
+    }
+    let (subject, message) = if titles.len() == 1 {
+        (titles[0].clone(), titles[0].clone())
+    } else if titles.len() > 1 {
+        let body = titles
+            .iter()
+            .map(|t| format!("- {t}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (titles[0].clone(), format!("{}\n\n{body}", titles[0]))
+    } else {
+        let fallback = format!("delegate: apply {}", run_names.join(", "));
+        (fallback.clone(), fallback)
+    };
+    let head = {
+        let _guard = crate::source_watch::guard(source, true)?;
+        let add = git_command()
+            .arg("-C")
+            .arg(source)
+            .args(["add", "-A", "--"])
+            .args(paths)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !add.status.success() {
+            return Err(format!(
+                "git add failed: {}",
+                String::from_utf8_lossy(&add.stderr).trim()
+            ));
+        }
+        let commit = git_command()
+            .arg("-C")
+            .arg(source)
+            .args(["commit", "-m", &message])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !commit.status.success() {
+            let _ = git_command()
+                .arg("-C")
+                .arg(source)
+                .args(["reset", "-q", "--"])
+                .args(paths)
+                .status();
+            let detail = String::from_utf8_lossy(&commit.stderr);
+            let detail = if detail.trim().is_empty() {
+                String::from_utf8_lossy(&commit.stdout).trim().to_string()
+            } else {
+                detail.trim().to_string()
+            };
+            return Err(format!("git commit failed: {detail}"));
+        }
+        git_text(source, &["rev-parse", "HEAD"]).unwrap_or_default()
+    };
+    if !head.is_empty() {
+        for run in runs {
+            let applied_path = run.join(".applied");
+            if applied_path.is_file() {
+                let mut state = json(&applied_path);
+                if state.is_object() {
+                    state["head"] = json!(&head);
+                    let _ = write_json(&applied_path, &state);
+                }
+            }
+            let meta_path = run.join("meta.json");
+            if meta_path.is_file() {
+                let mut m = json(&meta_path);
+                if m.is_object() {
+                    m["appliedHead"] = json!(&head);
+                    let _ = write_json(&meta_path, &m);
+                }
+            }
+        }
+    }
+    Ok((head, subject))
+}
+fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Res<ApplyInnerResult> {
     let (meta, mut top, _, mut after) = chain_changes(run)?;
     if meta["worktree"].is_null() {
         return Err(format!(
@@ -2129,14 +2708,24 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
             println!(" conflict         {p}");
         }
         eprintln!("delegate: nothing applied; {} file(s) were also changed in {} since the run started. Rerun with --merge to apply the rest and write conflict markers into text files, or inspect with: {} diff {} --total",conflicts.len(),source.display(),script().display(),run.file_name().unwrap_or_default().to_string_lossy());
-        return Ok(1);
+        conclusion["apply"]["failedStep"] = json!("conflicts");
+        conclusion["apply"]["failureDetail"] = json!(format!(
+            "{} file(s) also changed in source: {}",
+            conflicts.len(),
+            conflicts.join(", ")
+        ));
+        conclusion["apply"]["conflicts"] = json!(conflicts);
+        conclusion["apply"]["writtenFiles"] = json!([]);
+        return Ok(ApplyInnerResult {
+            code: 1,
+            written: vec![],
+            regenerated: vec![],
+            had_dirty_merge: false,
+        });
     }
     for action in &mut actions {
-        if action
-            .content
-            .split(|b| *b == b'\n')
-            .any(|line| line.starts_with(b"<<<<<<< ") || line.starts_with(b">>>>>>> "))
-            && action.kind != "copied"
+        if action.kind != "copied"
+            && !conflict_labels_in_bytes(Path::new(&action.path), &action.content).is_empty()
         {
             action.kind = "conflict-markers".into();
         }
@@ -2145,9 +2734,7 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
         .iter()
         .filter(|x| {
             x.kind == "conflict-markers"
-                || x.content
-                    .split(|b| *b == b'\n')
-                    .any(|line| line.starts_with(b"<<<<<<< ") || line.starts_with(b">>>>>>> "))
+                || !conflict_labels_in_bytes(Path::new(&x.path), &x.content).is_empty()
         })
         .map(|x| x.path.clone())
         .collect::<Vec<_>>();
@@ -2175,43 +2762,58 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
     if regenerate && !dry {
         write(run.join(".generate-pending"), "pending\n")?;
     }
-    let before_actions = if !dry && (!actions.is_empty() || !matched.is_empty()) {
-        Some(crate::source_watch::fingerprint(&source)?)
-    } else {
-        None
-    };
     let mut written = Vec::with_capacity(actions.len());
-    for a in actions {
-        if !dry {
-            written.push(a.path.clone());
-            let operation = match a.kind.as_str() {
-                "deleted" => fs::remove_file(&a.target)
-                    .map_err(|e| e.to_string())
-                    .map(|()| remove_empty_parents(&a.target, &source)),
-                "copied" => {
-                    fs::create_dir_all(a.target.parent().unwrap_or(&source))
-                        .map_err(|e| format!("apply {}: {e}", a.target.display()))?;
-                    write(&a.target, &a.content)
-                }
-                _ => {
-                    if let Some(mode) = a.mode.as_deref() {
-                        write_entry(&a.target, mode, &a.content)
-                    } else {
+    let mut had_dirty_merge = false;
+    {
+        // Hold the source-watch lock ONLY for the brief write-to-disk + fingerprint-register window
+        // so concurrent `delegate start` snapshots are never blocked by regeneration or diffing.
+        let _write_guard = if !dry && (!actions.is_empty() || !matched.is_empty()) {
+            Some(crate::source_watch::guard(&source, true)?)
+        } else {
+            None
+        };
+        let before_actions = if _write_guard.is_some() {
+            Some(crate::source_watch::fingerprint(&source)?)
+        } else {
+            None
+        };
+        if let Some(before) = &before_actions {
+            had_dirty_merge = actions
+                .iter()
+                .any(|a| a.kind == "merged" && !before[&a.path].is_null());
+        }
+        for a in actions {
+            if !dry {
+                written.push(a.path.clone());
+                let operation = match a.kind.as_str() {
+                    "deleted" => fs::remove_file(&a.target)
+                        .map_err(|e| e.to_string())
+                        .map(|()| remove_empty_parents(&a.target, &source)),
+                    "copied" => {
+                        fs::create_dir_all(a.target.parent().unwrap_or(&source))
+                            .map_err(|e| format!("apply {}: {e}", a.target.display()))?;
                         write(&a.target, &a.content)
                     }
+                    _ => {
+                        if let Some(mode) = a.mode.as_deref() {
+                            write_entry(&a.target, mode, &a.content)
+                        } else {
+                            write(&a.target, &a.content)
+                        }
+                    }
+                };
+                if let Err(e) = operation {
+                    if let Some(before) = &before_actions {
+                        let _ = crate::source_watch::register_matching(&source, before, &written, &[]);
+                    }
+                    return Err(format!("apply {}: {e}", a.target.display()));
                 }
-            };
-            if let Err(e) = operation {
-                if let Some(before) = &before_actions {
-                    let _ = crate::source_watch::register_matching(&source, before, &written, &[]);
-                }
-                return Err(format!("apply {}: {e}", a.target.display()));
             }
+            println!(" {:<16} {}", a.kind, a.path);
         }
-        println!(" {:<16} {}", a.kind, a.path);
-    }
-    if let Some(before) = &before_actions {
-        crate::source_watch::register_matching(&source, before, &written, &matched)?;
+        if let Some(before) = &before_actions {
+            crate::source_watch::register_matching(&source, before, &written, &matched)?;
+        }
     }
     for p in &conflicts {
         println!(
@@ -2226,6 +2828,7 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
             "not regenerated"
         );
     }
+    let mut regenerated = Vec::new();
     if dry {
         eprintln!("delegate: dry run; nothing written");
         if regenerate {
@@ -2239,7 +2842,15 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
         };
         if let Some(code) = interrupted() {
             eprintln!("delegate: regeneration interrupted before start");
-            return Ok(code);
+            conclusion["apply"]["failedStep"] = json!("regeneration");
+            conclusion["apply"]["failureDetail"] = json!("regeneration interrupted before start");
+            conclusion["apply"]["writtenFiles"] = json!(&written);
+            return Ok(ApplyInnerResult {
+                code,
+                written,
+                regenerated,
+                had_dirty_merge,
+            });
         }
         let _slot = match lane::acquire_shell(
             &format!(
@@ -2259,7 +2870,15 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
             Err(_) if lane::stopped() => {
                 let code = 128 + lane::SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
                 eprintln!("delegate: regeneration interrupted while queued");
-                return Ok(code);
+                conclusion["apply"]["failedStep"] = json!("regeneration");
+                conclusion["apply"]["failureDetail"] = json!("regeneration interrupted while queued");
+                conclusion["apply"]["writtenFiles"] = json!(&written);
+                return Ok(ApplyInnerResult {
+                    code,
+                    written,
+                    regenerated,
+                    had_dirty_merge,
+                });
             }
             Err(error) => return Err(error),
         };
@@ -2271,7 +2890,10 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
             "generating / 正在生成; log: {}; execution timeout: {timeout}s (queue excluded)",
             log.display()
         ));
-        let before_gen = crate::source_watch::fingerprint(&source)?;
+        let before_gen = {
+            let _g = crate::source_watch::guard(&source, false)?;
+            crate::source_watch::fingerprint(&source)?
+        };
         let shell = run_shell(
             (&generate_command, "generate"),
             &source,
@@ -2283,18 +2905,31 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
         );
         let stopped = interrupted();
         let succeeded = stopped.is_none() && matches!(shell, Ok((0, false)));
-        let reg = crate::source_watch::register_matching(
-            &source,
-            &before_gen,
-            &generated_paths,
-            if succeeded { &generated_paths } else { &[] },
-        );
+        let reg = {
+            let _g = crate::source_watch::guard(&source, true)?;
+            crate::source_watch::register_matching(
+                &source,
+                &before_gen,
+                &generated_paths,
+                if succeeded { &generated_paths } else { &[] },
+            )
+        };
         let (code, timed) = shell.map_err(|e| format!("apply generated.command: {e}"))?;
-        reg?;
+        regenerated = reg?;
         if let Some(signal_code) = stopped {
             let _ = writeln!(file, "\n[interrupted]");
             eprintln!("delegate: regeneration interrupted; {}", log.display());
-            return Ok(signal_code);
+            conclusion["apply"]["failedStep"] = json!("regeneration");
+            conclusion["apply"]["failureDetail"] =
+                json!(format!("regeneration interrupted; log: {}", log.display()));
+            conclusion["apply"]["generateLog"] = json!(log.display().to_string());
+            conclusion["apply"]["writtenFiles"] = json!(&written);
+            return Ok(ApplyInnerResult {
+                code: signal_code,
+                written,
+                regenerated,
+                had_dirty_merge,
+            });
         }
         writeln!(file, "\n[exit {code}]").map_err(|e| format!("apply {}: {e}", log.display()))?;
         if code != 0 {
@@ -2313,7 +2948,21 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
                 log.display(),
                 tail
             );
-            return Ok(1);
+            conclusion["apply"]["failedStep"] = json!("regeneration");
+            conclusion["apply"]["failureDetail"] = json!(format!(
+                "regeneration {} (exit {code}); log: {}",
+                if timed { "timed out" } else { "failed" },
+                log.display()
+            ));
+            conclusion["apply"]["generateExitCode"] = json!(code);
+            conclusion["apply"]["generateLog"] = json!(log.display().to_string());
+            conclusion["apply"]["writtenFiles"] = json!(&written);
+            return Ok(ApplyInnerResult {
+                code: 1,
+                written,
+                regenerated,
+                had_dirty_merge,
+            });
         }
         for marker in markers.iter().filter(|marker| marker.exists()) {
             fs::remove_file(marker).map_err(|e| e.to_string())?;
@@ -2367,10 +3016,33 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
             chain = chain.parent().unwrap().join(parent);
         }
     }
-    Ok(if !conflicts.is_empty() || marked {
+    let final_code = if !conflicts.is_empty() {
+        conclusion["apply"]["failedStep"] = json!("skipped-conflicts");
+        conclusion["apply"]["failureDetail"] = json!(format!(
+            "{} binary/symlink/large file(s) skipped: {}",
+            conflicts.len(),
+            conflicts.join(", ")
+        ));
+        conclusion["apply"]["skippedFiles"] = json!(conflicts);
+        conclusion["apply"]["writtenFiles"] = json!(&written);
+        1
+    } else if marked {
+        conclusion["apply"]["failedStep"] = json!("conflict-markers");
+        conclusion["apply"]["failureDetail"] = json!(format!(
+            "{} file(s) contain conflict markers: {}",
+            marked_paths.len(),
+            marked_paths.join(", ")
+        ));
+        conclusion["apply"]["writtenFiles"] = json!(&written);
         1
     } else {
         0
+    };
+    Ok(ApplyInnerResult {
+        code: final_code,
+        written,
+        regenerated,
+        had_dirty_merge,
     })
 }
 
@@ -2387,5 +3059,36 @@ mod tests {
         assert!(work_config(&root_nm, Path::new(".delegate.json")).is_err());
         let ok = json!({"worktree": {"link": ["third_party/pi"]}});
         assert!(work_config(&ok, Path::new(".delegate.json")).is_ok());
+    }
+
+    #[test]
+    fn markdown_fenced_examples_and_setext_headings_do_not_false_positive() {
+        let dir = std::env::temp_dir().join(format!("delegate-md-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let doc = dir.join("guide.md");
+        fs::write(
+            &doc,
+            "Title\n=======\n\n```text\n>>>>>>> example-label\n=======\n```\n",
+        )
+        .unwrap();
+        assert!(conflict_labels(&doc).is_empty());
+        assert!(!has_conflict_markers(&doc));
+
+        // A real full conflict block inside a Markdown code fence IS still detected.
+        let real = dir.join("real.md");
+        fs::write(
+            &real,
+            "```text\n<<<<<<< current\na\n=======\nb\n>>>>>>> run-1\n```\n",
+        )
+        .unwrap();
+        assert_eq!(conflict_labels(&real), vec!["current", "run-1"]);
+        assert!(has_conflict_markers(&real));
+
+        // Non-Markdown files still catch half-removed markers.
+        let plain = dir.join("a.txt");
+        fs::write(&plain, ">>>>>>> old-run\n").unwrap();
+        assert_eq!(conflict_labels(&plain), vec!["old-run"]);
+        assert!(has_conflict_markers(&plain));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -1,5 +1,17 @@
 # delegate
 
+## 6.27 续做链净改动口径、主干漂移单列与默认基线同步
+
+- pool slot 续做链进行中，主干推进若干提交（含受保护路径）：`status` 只报本链自身改动数、`diff --total` 不含主干变更、不误报 `protectViolation`、不产生无关 `commitsDiffer`；`status <run>` / `wait` 单列一行「主干已前进 N 个提交 / M 个文件，与本链改动重叠 K 个」，仅重叠非零时加 `!!!` 醒目提示。Chain-net diff accounting in pooled replies with separate drift line highlighted only on overlap.
+- 写入任务续做（默认开启基线同步）：无冲突时自动把本链净改动合到当前源快照、重放同事提交、保留 pool slot `target/` 增量缓存，并在续做提示附「基线已同步到主干 `<短 hash>`」；遇冲突则原子保持旧基线，在 stderr 列出重叠文件并提示 `--no-sync` / `--sync=agent`。Default reply baseline sync preserving incremental build cache with conflict fallback.
+
+## 6.26 apply 透明化与 start 不阻塞
+
+- `apply` 写完文件后生成器失败（或冲突、cherry-pick 中断）：`apply.ok` 为 false 时 JSON 与人读输出均写明 `failedStep`、`failureDetail` 与已写入源工作区的 `writtenFiles`；Markdown 围栏代码示例与 Setext 标题 `=======` 不再误判冲突标记。Actionable apply failure diagnostics with failedStep, writtenFiles, and Markdown conflict-marker accuracy.
+- 仓库配置 `applyVerify: false` 且主干前进后执行 `apply`：末行说明「主干已前进，验收快照失效；本仓库配置合入后不自动验收，批量门禁时跑：…」，不再误导为「验收无效」；真正失败仍醒目输出。Factual wording for applyVerify=false while keeping real failures prominent.
+- 不带 `--keep-commits` 合入同事的多条提交：`apply` 提示「改动未提交：N 个文件」并列出同事原提交标题供复用；加 `--commit` 仅暂存本次写入路径并压成一条提交，暂存区脏或三方合并含本地未提交改动时失败关闭。Uncommitted apply reminder with commit titles and fail-closed --commit squash option.
+- `apply` 正在跑耗时生成器时前台执行 `delegate start`：立即拍照返回不被阻塞；若撞上 `apply` 短暂写盘锁，stderr 打一行等待进度并在写盘结束立即继续。Non-blocking start during apply regeneration with brief write-lock progress notice.
+
 ## 6.25 委派留痕、分层可查与查重
 
 - 280+ 历史 run 的仓库执行 `status`：首行计数（运行中/待合入/待回答/排队），只列待处理项，末行「另有 N 条已结束：delegate history」；读过 `result` 或 `apply` 过不再淹没列表，`--all` 保持全量。Actionable default status with counts and history pointer.

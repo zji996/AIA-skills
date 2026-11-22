@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI（pi-kit 的 rpi 通道下 `pi` 即 rpi）。
 metadata:
-  version: "6.25.0"
+  version: "6.27.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -23,14 +23,14 @@ $D wait                                                                  # 放�
 
 总路数、仓库路数、模型并发或内存不足时自动排队、不换模型；`status` 看排队原因与前方人数，`--json` 看 `queue`。只有愿意模型满时改用下一候选才加 `--overflow next`。
 
-每个任务回一条短行（状态、改动、验收、下一步）和答复。写入任务看 `$D diff <name>`，满意后 `$D apply <name>`；冲突未解拒绝重叠合入，补丁保留可用 `patch` 恢复；等齐用 `wait --all`，见 [并行合入与只读 shell](references/parallel-safety.md)。清理默认归档忽略的证据文件，细节与上限见 [清理](references/cleanup.md)。
+每个任务回一条短行（状态、改动、验收、下一步）和答复。写入任务看 `$D diff <name>`，满意后 `$D apply <name>`（默认落为未提交改动并列同事提交标题，`--commit` 仅暂存本批文件压成一条提交，`ok: false` 明报失败阶段与已写入文件）；冲突未解拒绝重叠合入，补丁保留可用 `patch` 恢复；等齐用 `wait --all`，见 [并行合入与只读 shell](references/parallel-safety.md)。清理默认归档忽略的证据文件，细节与上限见 [清理](references/cleanup.md)。
 
 | 想要 | 命令 |
 |---|---|
 | 读材料、审查、第二意见 | `$D start --read-only "…"`；限篇幅加 `--max-answer 800` |
 | 看截图或设计图 | `$D start --read-only --image shot.png "…"` |
 | 改代码，测试通过才算完 | `$D start --worktree --accept "make test" "…"`；不许碰加 `--protect tests/`，本次放开加 `--allow tests/unit/`（正文提及未放开的保护路径会提示）；验收时限可加 `--accept-timeout` 或在 `.delegate.json` 设 `acceptTimeout` |
-| 追问或返工 | `$D reply <name> "…"`；放开受保护路径加 `--allow PATH`；开新会话加 `--fresh`，带上后来的改动加 `--sync`（文本冲突交同事解用 `--sync=agent`），运行中先记追问加 `--when-done` |
+| 追问或返工 | `$D reply <name> "…"`（默认自动把本链同步到当前源基线且保留 slot 缓存，冲突时保旧基线并提示；跳过加 `--no-sync`，冲突交同事解用 `--sync=agent`）；放开受保护路径加 `--allow PATH`；开新会话加 `--fresh`，运行中先记追问加 `--when-done` |
 | 审某个已完成任务的工作树 | `$D start --read-only --in <name> "…"`；先 `wait` 确认上游结果再派下一步 |
 | 自己跑重检查、测性能 | `$D lane make check`；测量用 `lane --measure` |
 | 节点不稳、换档前先测连通 | `$D probe`：走 Pi 本身（不是裸 HTTP）测各档模型，不建任务、不占名额 |
