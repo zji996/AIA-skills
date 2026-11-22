@@ -49,7 +49,7 @@ class IterationSpeedTests(unittest.TestCase):
         self.repo.mkdir()
         self.home.mkdir()
         self.env = {key: value for key, value in os.environ.items()
-                    if not key.startswith(("CARGO_", "RUST", "UV_", "XDG_"))}
+                    if not key.startswith(("CARGO_", "RUST", "UV_", "XDG_", "ITERATION_SPEED_"))}
         self.env.update(HOME=str(self.home), XDG_STATE_HOME=str(self.root / "state"))
 
     def write(self, relative, text):

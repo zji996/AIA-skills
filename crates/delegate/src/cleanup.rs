@@ -1008,11 +1008,14 @@ mod tests {
 
         fn sleeper(&mut self, name: &str, tagged: bool) -> i32 {
             let binary = self.root.join(name);
-            fs::copy("/bin/sleep", &binary).unwrap();
-            let mut command = Command::new(binary);
+            // Copy /bin/sh (standalone dash/sh, not multicall coreutils like Ubuntu 26.04's
+            // /bin/sleep) and block in builtin `read` on a held pipe so /proc/<pid>/exe is
+            // `<root>/<name>` with zero child processes.
+            fs::copy("/bin/sh", &binary).unwrap();
+            let mut command = Command::new(&binary);
             command
-                .arg("60")
-                .stdin(Stdio::null())
+                .args(["-c", "read _"])
+                .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
             if tagged {
@@ -1093,13 +1096,16 @@ mod tests {
     #[test]
     fn mixed_process_group_keeps_daemon_and_terminates_other_members() {
         let mut fixture = Fixture::new();
-        fs::copy("/bin/sleep", fixture.root.join("sccache")).unwrap();
+        fs::copy("/bin/sh", fixture.root.join("sccache")).unwrap();
+        let fifo = fixture.root.join("hold.fifo");
+        let fifo_c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
         let mut command = Command::new("sh");
         command
             .arg("-c")
             .arg(format!(
-            "{}/sccache 60 & echo $! > {}/cache.pid; /bin/sleep 60 & echo $! > {}/server.pid; wait",
-            fixture.root.display(), fixture.root.display(), fixture.root.display()
+            "{r}/sccache -c 'exec 3<>{f}; read _ <&3' & echo $! > {r}/cache.pid; /bin/sleep 60 & echo $! > {r}/server.pid; wait",
+            r = fixture.root.display(), f = fifo.display()
         ))
             .env("DELEGATE_RUN_DIR", &fixture.root)
             .stdin(Stdio::null())

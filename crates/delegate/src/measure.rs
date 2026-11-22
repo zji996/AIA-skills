@@ -770,7 +770,7 @@ mod tests {
             let ticket = lane_dir.join(format!("{:020}-{}.ticket", now_ns(), pid));
             let ticket_file = locked_file(
                 &ticket,
-                &json!({"pid":pid,"label":"fake sleep holder","since":iso()}).to_string(),
+                &json!({"pid":pid,"label":"fake sleep holder","since":iso(),"running":true}).to_string(),
             )?;
             let meta = json!({"measureCpus":reserved.to_string()});
             let slot = acquire("affinity test", None, &meta, |_, _| {})?;
