@@ -99,8 +99,8 @@ pub fn now_ns() -> u128 {
 pub fn epoch() -> f64 {
     now_ns() as f64 / 1e9
 }
-pub fn format_time(local: bool, pattern: &str) -> String {
-    let t = unsafe { libc::time(std::ptr::null_mut()) };
+pub fn format_epoch(ts: i64, local: bool, pattern: &str) -> String {
+    let t = ts as libc::time_t;
     let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
     unsafe {
         if local {
@@ -113,6 +113,10 @@ pub fn format_time(local: bool, pattern: &str) -> String {
     let mut buf = [0u8; 64];
     let n = unsafe { libc::strftime(buf.as_mut_ptr().cast(), buf.len(), p.as_ptr(), &tm) };
     String::from_utf8_lossy(&buf[..n]).into_owned()
+}
+pub fn format_time(local: bool, pattern: &str) -> String {
+    let t = unsafe { libc::time(std::ptr::null_mut()) };
+    format_epoch(t as i64, local, pattern)
 }
 pub fn iso() -> String {
     format_time(false, "%Y-%m-%dT%H:%M:%SZ")
@@ -537,7 +541,10 @@ pub fn finish_run(run: &std::path::Path, mut summary: serde_json::Value, code: i
     summary["finishedAt"] = serde_json::json!(iso());
     write_json(run.join("summary.json"), &summary)?;
     crate::refs::mark_finished(run);
-    write(run.join("exit_code"), format!("{code}\n"))
+    write(run.join("exit_code"), format!("{code}\n"))?;
+    crate::history::record_finish(run);
+    crate::board::refresh_for_run(run);
+    Ok(())
 }
 
 #[cfg(test)]

@@ -74,20 +74,37 @@ class Delegate618Tests(unittest.TestCase):
         self.assertNotIn("archive:", result.stdout)
 
     def test_archives_prune_lru_and_age(self):
-        self.env["DELEGATE_ARCHIVE_TOTAL_BYTES"] = "12"
+        # 6.24+: no total-bytes hard cap; normal clean keeps all archives.
+        # Only when archive filesystem hits critical free-space watermark are LRU events/files trimmed,
+        # while prompt/result/meta/summary/patch are always preserved.
         repo = self.repo({"a.txt": "old\n", ".gitignore": ".local/\n"})
         archives = []
         for i in range(3):
             state = self.run_tree(repo, "mkdir .local; printf 123456 > .local/proof")
-            archives.append(Path(self.clean_outcome(self.cli("clean", "--json", state["run"]))["archive"]))
-            if i == 1:
-                self.cli("status", json.loads((archives[0] / "record/meta.json").read_text())["run"])
-        self.assertTrue(archives[0].exists())
-        self.assertFalse(archives[1].exists())
-        (archives[0] / ".access").write_text("1")
+            arch = Path(self.clean_outcome(self.cli("clean", "--json", state["run"]))["archive"])
+            archives.append(arch)
+        # Normal operation keeps every archive intact.
+        for arch in archives:
+            self.assertTrue((arch / "record/meta.json").is_file())
+            self.assertTrue((arch / "record/events.jsonl.gz").is_file())
+            self.assertTrue((arch / "files/.local/proof").is_file())
+
+        # Refresh LRU on archives[0], make archives[1] oldest, then trigger critical FS watermark.
+        (archives[1] / ".access").write_text("1")
+        (archives[2] / ".access").write_text("2")
+        self.cli("status", json.loads((archives[0] / "record/meta.json").read_text())["run"])
+        ev_size = (archives[1] / "record/events.jsonl.gz").stat().st_size
+        self.env["DELEGATE_FS_CRITICAL_FREE_BYTES"] = str(ev_size + 100)
+        self.env["DELEGATE_FS_CRITICAL_FREE_PCT"] = "0"
+        self.env["DELEGATE_ARCHIVE_FS_AVAIL_BYTES"] = "100"
         state = self.run_tree(repo, "mkdir .local; printf 123456 > .local/proof")
         self.cli("clean", state["run"])
-        self.assertFalse(archives[0].exists())
+        # Oldest unread (archives[1]) had its events.jsonl.gz trimmed, while archives[0] kept it;
+        # core files (prompt/result/meta/summary/patch) survived on every archive.
+        self.assertFalse((archives[1] / "record/events.jsonl.gz").exists())
+        self.assertTrue((archives[0] / "record/events.jsonl.gz").is_file())
+        for name in ("prompt.md", "result.md", "meta.json", "summary.json"):
+            self.assertTrue((archives[1] / "record" / name).is_file(), f"must never delete {name}")
 
     def test_source_git_commands_disable_optional_locks_even_during_status(self):
         real_git = shutil.which("git")

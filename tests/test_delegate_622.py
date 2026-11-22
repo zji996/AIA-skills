@@ -214,26 +214,25 @@ class Delegate622Tests(unittest.TestCase):
                 (d / "meta.json").write_text(json.dumps(meta))
         (Path(old_cleaned["dir"]) / ".applied-cleaned").write_text("1\n")
 
-        # Default human status: shows live, recent, own-old; summarizes old-a + old-b in one line.
+        # Default human status (6.24): shows counts header, actionable runs only (live),
+        # and summarizes the 5 finished/handled runs with `delegate history`.
         default_human = self.cli("status", human=True)
         self.assertEqual(default_human.returncode, 0, default_human.stderr)
-        for name in ("live", "recent", "own-old"):
-            self.assertIn(name, default_human.stdout)
-        for name in ("old-a", "old-b", "old-cleaned"):
+        self.assertIn("运行中 1 · 待合入 0 · 待回答 0 · 排队 0", default_human.stdout)
+        self.assertIn("live", default_human.stdout)
+        for name in ("recent", "own-old", "old-a", "old-b", "old-cleaned"):
             self.assertNotIn(name, default_human.stdout)
-        self.assertIn("更早未清理：2 个，占 3.0 GiB", default_human.stdout)
-        self.assertIn("status --all", default_human.stdout)
-        self.assertIn("clean --finished", default_human.stdout)
+        self.assertIn("另有 5 条已结束：delegate history", default_human.stdout)
 
-        # Default JSON status: 3 runs + 1 olderUncleaned summary line.
+        # Default JSON status: 1 active run + 1 statusSummary line.
         default_json = self.cli("status")
         objs = [json.loads(line) for line in default_json.stdout.splitlines() if line.strip()]
         run_names = [o["name"] for o in objs if "run" in o]
-        self.assertEqual(set(run_names), {"live", "recent", "own-old"})
-        summary_lines = [o["olderUncleaned"] for o in objs if "olderUncleaned" in o]
+        self.assertEqual(set(run_names), {"live"})
+        summary_lines = [o["statusSummary"] for o in objs if "statusSummary" in o]
         self.assertEqual(len(summary_lines), 1)
-        self.assertEqual(summary_lines[0]["count"], 2)
-        self.assertEqual(summary_lines[0]["bytes"], 3 * 1024 ** 3)
+        self.assertEqual(summary_lines[0]["running"], 1)
+        self.assertEqual(summary_lines[0]["finished"], 5)
 
         # --all lists every run and omits the summary line.
         all_json = self.cli("status", "--all")
@@ -242,7 +241,7 @@ class Delegate622Tests(unittest.TestCase):
             {o["name"] for o in all_objs if "run" in o},
             {"live", "recent", "old-a", "old-b", "old-cleaned", "own-old"},
         )
-        self.assertFalse(any("olderUncleaned" in o for o in all_objs))
+        self.assertFalse(any("statusSummary" in o for o in all_objs))
         gate.touch()
         self.cli("wait", live["run"])
 

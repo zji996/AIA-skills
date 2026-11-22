@@ -12,9 +12,12 @@
 | `apply [<run> …] [--dry-run] [--merge] [--verify\|--no-verify] [--keep] [--keep-commits] [--json]` | 按给出的顺序将 worktree 改动合入源工作区，不提交，遇到失败即停；验收没法沿用（`acceptStillValid` 不为 true）的任务在最后一次合并后、经 lane 重跑一次各自的验收（去重），`applyVerify: false` 关闭、写命令则替换；始终列同事提交。`--keep-commits` 按序 cherry-pick，要求同事工作树改动已提交；收尾与 apply 的 `commitsDiffer` 列提交以外文件，默认 apply 始终取最终树，冲突停在 git cherry-pick 状态。成功后按 `worktree.cleanOnApply`（默认 true）归档并删除 worktree（续做链等整条链都合入后再清），保留原 run 轻量记录与 applied.patch；`--keep` 或 `cleanOnApply: false` 保留 worktree。合入末行报告验收有效性与盲区。 |
 | `busy <资源名>` | 有实际运行的匹配命令时逐行列 run、命令和持续秒数，退出 0；空闲无输出、退出 1 |
 | `wait [<run>...\|--all] [--max <时长>] [--no-result] [--full] [--progress]` | 无参和带名字的 `wait <run>...` 默认同 `--any`：返回时列出上次 wait 之后所有进入终态或提问态的 run（首个给全文，其余给一行摘要加 `result` 查看命令）；`--all` / `--until-all` 等全部（单次最多 50 分钟，超时列仍在跑的 run）。人读末行给本会话剩余数和原样重跑命令，无运行任务时明确说明 |
-| `status [<run>...] [--all] [--json] [--files]` | 默认每任务/每条续做链折叠成末环一行（例如 `合入员（第 3 轮）`）且路径清单只留计数，带未完成待办数（`待办 N`）；指定 `<run>` 展开路径与待办全文。不带参数列未结束、24 小时内未清理、本会话起及仍有未完成待办的任务（含已清理待办），更早未清理汇总一行；`--all` 与 `--json` 仍列每一环，`--json` 加 `--files` 才带 `files` 数组 |
+| `status [<run>...] [--all] [--json] [--files]` | 默认首行计数（运行中/待合入/待回答/排队/待办等），只列待处理任务与仍有未完成待办的任务/已清理链（续做链折成末环一行如 `合入员（第 3 轮）`，路径清单只留计数），末行指向 `delegate history` 与归档占用；指定 `<run>` 展开路径与待办全文；读过 `result` 或 `apply` 记入 `meta`；`--all` 列全部轮次，`--json` 默认省去 `files`（加 `--files` 才带） |
 | `note [<run> ["<文字>"\|--done [<序号>\|--all]]] [--all] [--json]` | 在 run 上追加带时间的合入后待办、查看或标完成；备注随整条续做链走，存在 `<runs>/notes.json`，`clean` 时有未完成待办仍保留直到 `--done` |
 | `handoff [--out <路径>]` | 生成未清理、未合入任务的一页 Markdown 交接索引（默认写入 `.local/run/delegate/HANDOFF.md` 并打印路径）：名字、状态、`netBase` 短 sha、净改动、净 patch 新增 `TODO(master)` 计数、`migrations/` 文件名、下一步、每个 run 下的未完成待办、重叠修改文件及「合入后待办」汇总 |
+| `history [关键词…] [--since <时长>] [--state <状态>] [--limit N] [--json]` | 查本仓库永久追加索引 `history.jsonl`（老的在上新的在下，每条一行指向 `show`）；关键词匹配名字、提示词与结论，中文支持单字加二元组 |
+| `show [<run>] [--json]` | 第二层单 run 摘要：提示词前几行、确定性结论段、验收行、合入后源仓库同文件提交（现查 `git log`）、续做链与归档路径，末行指向 `result`/`patch`/归档原文；clean 后从归档读，归档过期说明「原文已过期，仅剩索引」 |
+| `board [--path]` | 刷新并打印本工作区的自动委派看板（默认放在 history 目录旁 `BOARD.md`，可用仓库 `.delegate.json` 的 `board` 配置路径）；每次状态变化自动原子重写，顶行含整机在途与各节计数，写失败只记诊断不阻断委派 |
 | `result [<run>] [--path]` | 输出完整答复 |
 | `stop <run>...` | 终止任务及其 scope、进程组 |
 | `clean <run>...\|--finished [--force]` | 删除已结束的任务；`--finished` 默认保留结果未读取的 |

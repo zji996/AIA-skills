@@ -1,5 +1,12 @@
 # delegate
 
+## 6.25 委派留痕、分层可查与查重
+
+- 280+ 历史 run 的仓库执行 `status`：首行计数（运行中/待合入/待回答/排队），只列待处理项，末行「另有 N 条已结束：delegate history」；读过 `result` 或 `apply` 过不再淹没列表，`--all` 保持全量。Actionable default status with counts and history pointer.
+- 查以前派过什么任务：`delegate history 头像 --since 14d` 按老到新每条一行指向 `delegate show <run>`，支持中文单字+二元组匹配；`delegate show <run>` 展示提示词、确定性结论段、验收行、现查 apply 后同文件 `git log`、续做链与 `result`/`patch`/归档原文入口，归档 LRU 过期后说明「原文已过期，仅剩索引」。Progressive disclosure history index and Layer-2 show.
+- 派新任务时同一件事换个说法：`start`/`run` 与在跑及近 14 天 history 做词重叠比对，stderr 提示最多 3 条「相似：… · delegate show <run>」，只提示不拦截。Advisory pre-dispatch deduplication.
+- 自动委派看板与无硬上限归档：每次 start/排队转运行/finish/reply/result/apply/clean/stop/crash 自动原子重写仓库配置的 `board`（默认 `history` 旁 `BOARD.md`），`delegate board` 输出同份内容，顶行含整机在途与各节计数；归档不设总量硬上限，仅文件系统临满时淘汰最久未读 `events.jsonl.gz`，核心文件与 `history.jsonl` 永不删。Auto-maintained delegation board and capless archive with critical-FS trace trimming.
+
 ## 6.19 Remote 构建
 
 - 本机 Agent 中途 cargo fmt/check：默认远端独立 lane、回传改动/删除和原始退出码，诊断路径可点开本机；measure 留本机、agentDeny 先拒绝，resources 不登记本机。Remote heavy-command routing and sync.

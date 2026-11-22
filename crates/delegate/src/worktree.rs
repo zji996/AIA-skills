@@ -800,9 +800,25 @@ pub fn detect_applied(run: &Path, meta: &Value) -> bool {
             large_hashes.insert(path.clone(), entry["hash"].clone());
         }
     }
-    let ok = write_json(run.join(".applied"), &json!({"at":iso(),"tree":rec["after"],"large":rec["afterLarge"],"largeHashes":large_hashes,"appliedBy":"detected"})).is_ok();
+    let at = iso();
+    let head = git_text(root, &["rev-parse", "HEAD"]).ok().unwrap_or_default();
+    let ok = write_json(
+        run.join(".applied"),
+        &json!({"at":at,"head":head,"tree":rec["after"],"large":rec["afterLarge"],"largeHashes":large_hashes,"appliedBy":"detected"}),
+    )
+    .is_ok();
     if ok {
+        if run.join("meta.json").is_file() && !crate::archive::is_record(run) {
+            let mut updated = json(run.join("meta.json"));
+            updated["appliedAt"] = json!(at);
+            if !head.is_empty() {
+                updated["appliedHead"] = json!(head);
+            }
+            let _ = write_json(run.join("meta.json"), &updated);
+        }
         crate::refs::pin_slot(run, meta, "applied", s(&rec, "after"));
+        crate::history::record_apply(run, meta, &at, &head, "detected", None);
+        crate::board::refresh_for_run(run);
     }
     ok
 }
@@ -1481,8 +1497,18 @@ fn apply_checked(
             }
             crate::source_watch::register(source, &before, written_paths)?;
             if code == 0 {
-                let state = json!({"at":iso(),"tree":s(&meta["base"],"tree")});
+                let at = iso();
+                let head = git_text(source, &["rev-parse", "HEAD"])
+                    .ok()
+                    .unwrap_or_default();
+                let state = json!({"at":at,"head":head,"tree":s(&meta["base"],"tree")});
                 write_json(run.join(".applied"), &state)?;
+                let mut updated = json(run.join("meta.json"));
+                updated["appliedAt"] = json!(at);
+                if !head.is_empty() {
+                    updated["appliedHead"] = json!(head);
+                }
+                let _ = write_json(run.join("meta.json"), &updated);
                 crate::refs::pin_slot(run, &meta, "applied", s(&meta["base"], "tree"));
             }
             code
@@ -2308,12 +2334,21 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
                 }
             }
         }
-        let state = json!({"at":iso(),"tree":after,"large":large,"largeHashes":large_hashes});
+        let at = iso();
+        let head = git_text(&source, &["rev-parse", "HEAD"])
+            .ok()
+            .unwrap_or_default();
+        let state = json!({"at":at,"head":head,"tree":after,"large":large,"largeHashes":large_hashes});
         let mut chain = run.to_path_buf();
         loop {
             write_json(chain.join(".applied"), &state)?;
             write_json(chain.join(".sync-base"), &state)?;
-            let chain_meta = json(chain.join("meta.json"));
+            let mut chain_meta = json(chain.join("meta.json"));
+            chain_meta["appliedAt"] = json!(at);
+            if !head.is_empty() {
+                chain_meta["appliedHead"] = json!(head);
+            }
+            let _ = write_json(chain.join("meta.json"), &chain_meta);
             crate::refs::pin_slots(
                 &chain,
                 &chain_meta,

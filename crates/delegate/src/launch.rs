@@ -1065,6 +1065,13 @@ fn rework_used(run: &Path) -> (u64, String) {
     }
 }
 
+pub fn rework_count(run: &Path) -> u64 {
+    let meta = json(run.join("meta.json"));
+    let walked = rework_used(run).0;
+    let recorded = meta["rework"]["used"].as_u64().unwrap_or(0);
+    walked.max(recorded)
+}
+
 /// Whether the round this reply answered had delivered work: it changed files
 /// and did not stop to ask.
 fn delivered(meta: &Value, run: &Path) -> bool {
@@ -1521,14 +1528,23 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     if extra["worktree"].is_null() {
         extra.as_object_mut().unwrap().remove("worktree");
     }
-    launch(
+    let child = launch(
         o,
         &prompt,
         Path::new(s(&meta, "workdir")),
         s(&meta, "mode"),
         &extra,
         Some(&parent),
-    )
+    )?;
+    if parent.join("meta.json").is_file() && !crate::archive::is_record(&parent) {
+        let mut parent_meta = json(parent.join("meta.json"));
+        parent_meta["repliedAt"] = json!(iso());
+        let _ = write_json(parent.join("meta.json"), &parent_meta);
+    }
+    let rc = rework_count(&child);
+    crate::history::record_reply(&meta, &child, rc);
+    crate::board::refresh_for_run(&child);
+    Ok(child)
 }
 pub fn active_machine(slots: &Path) -> Vec<PathBuf> {
     let mut out = vec![];
@@ -2219,6 +2235,7 @@ pub fn launch(
     if let Some(rework) = &o.rework {
         meta["rework"] = rework.clone();
     }
+    meta["userPromptLen"] = json!(prompt.len());
     write_json(run.join("meta.json"), &meta)?;
     crate::notes::register_repo();
     crate::refs::pin_run(&run, &meta);
@@ -2273,6 +2290,7 @@ pub fn launch(
     let deadline = std::time::Instant::now() + Duration::from_secs_f64(startup_timeout);
     while std::time::Instant::now() < deadline {
         if run.join("pid").is_file() {
+            crate::board::refresh_for_run(&run);
             return Ok(run);
         }
         std::thread::sleep(Duration::from_millis(100));

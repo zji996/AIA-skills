@@ -1188,6 +1188,9 @@ fn admit_waiting(run: &Path, meta: &mut Value) -> Res<bool> {
             meta["startedAt"] = json!(iso());
             write_json(run.join("meta.json"), meta)?;
             fs::remove_file(run.join(".waiting")).map_err(|e| e.to_string())?;
+            drop(local);
+            drop(machine);
+            crate::board::refresh_for_run(run);
             return Ok(true);
         }
         drop(local);

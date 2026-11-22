@@ -88,7 +88,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("wait", "Wait for runs; print outcomes and answers."),
     (
         "status",
-        "Print one concise status line per run or reply chain (status <run> adds path and note details); --all/--json keep every round.",
+        "Show counts and concise one-line status for runs/chains needing action (status <run> adds path and note details); --all lists every round.",
     ),
     ("list", "Alias of status."),
     (
@@ -98,6 +98,18 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "handoff",
         "Write one-page Markdown handoff (.local/run/delegate/HANDOFF.md) for uncleaned, unmerged runs and pending todos.",
+    ),
+    (
+        "history",
+        "Search per-repository finished run index (oldest first) by keywords, --since, or --state.",
+    ),
+    (
+        "show",
+        "Print a run's Layer-2 summary (prompt, conclusion, acceptance, post-apply commits, chain, archive).",
+    ),
+    (
+        "board",
+        "Print (and refresh) the automatically maintained workspace delegation board Markdown.",
     ),
     ("result", "Print a run's full answer."),
     ("diff", "Show a run's changes as a git diff."),
@@ -189,10 +201,10 @@ pub fn print(command: Option<&str>) -> bool {
             ("--until-all", "Wait until every selected run finishes before returning; Alias of --all for waiting semantics."),
             ("--stream", "Print one outcome line per run as each finishes (answers are read with wait <run>) and exit when none is left; without run arguments it also picks up runs this caller starts meanwhile. For hosts that turn each output line into a notification."),
         ]),
-        "status" | "list" => ("[--all] [--json] [--files] [runs ...]", "Print one concise status line per run (counts only for path lists, collapsing reply chains to their latest round). Passing run names appends indented path and todo details. With no runs, shows active runs, runs finished within 24h and not cleaned, runs started by this session, and runs/cleaned chains with pending todos; summarizes older uncleaned runs in one line.", &[
-            ("runs", "Run ids or directories (default: active, uncleaned within 24h, current session, and pending todos)."),
-            ("--all", "List every run and every round regardless of age or cleanup state."),
-            ("--json", "Print JSON status for every round without the files array (pass --files to include files)."),
+        "status" | "list" => ("[--all] [--json] [--files] [runs ...]", "Show a counts line plus concise one-line status for runs needing action (running/queued, questions, unapplied or unread results, unhandled rejections, and pending todos; collapsing reply chains to their latest round) and a footer pointing to delegate history. Passing run names appends indented path and todo details.", &[
+            ("runs", "Run ids or directories (default: actionable runs and pending todos)."),
+            ("--all", "List every run and every round regardless of handled or cleanup state."),
+            ("--json", "Print JSON status without the files array (pass --files to include files)."),
             ("--files", "With --json, include the full files array."),
         ]),
         "note" => ("[<run> [text ... | --done [<index> ... | --all]]] [--all] [--json]", "Attach, list, or complete post-merge todos on a run. Notes follow the entire reply chain and survive clean under <runs>/notes.json until marked --done.", &[
@@ -204,6 +216,20 @@ pub fn print(command: Option<&str>) -> bool {
         ]),
         "handoff" => ("[--out PATH]", "Write a one-page Markdown summary of uncleaned, unmerged runs and post-merge todos (default: <runs>/HANDOFF.md) and print both the page and its path.", &[
             ("-o, --out PATH", "Write the Markdown handoff to PATH instead of <runs>/HANDOFF.md."),
+        ]),
+        "history" => ("[keywords ...] [--since DURATION] [--state STATE] [--limit N] [--json]", "Query this repository's permanent history.jsonl index, oldest first. Keywords match name, prompt and conclusion (Chinese unigrams + bigrams).", &[
+            ("keywords", "Filter terms matched against run id, name, prompt and conclusion."),
+            ("--since DURATION", "Only include runs finished within DURATION (e.g. 14d, 24h)."),
+            ("--state STATE", "Filter by state (e.g. delivered, applied, answered, rejected; comma-separated)."),
+            ("--limit N", "Show at most the last N matching entries."),
+            ("--json", "Print folded JSON lines instead of human summaries."),
+        ]),
+        "show" => ("[--json] [run]", "Print Layer-2 summary for an active, finished, cleaned/archived, or archive-expired run.", &[
+            ("run", "Run id, name, or directory (default: last)."),
+            ("--json", "Print structured JSON summary."),
+        ]),
+        "board" => ("[--path]", "Refresh and print the per-workspace delegation board Markdown (configured by .delegate.json `board`, default BOARD.md next to history.jsonl).", &[
+            ("--path", "Print the resolved board file path instead of its contents."),
         ]),
         "result" => ("[--path] [run]", "Print a run's full answer.", &[
             ("run", "Run id or directory (default: last)."),

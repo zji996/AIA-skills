@@ -231,14 +231,16 @@ class Delegate625Tests(unittest.TestCase):
         r3 = self.outcome(self.cli("reply", "--wait", r2["run"], "补上 ok.txt"))
         self.assertEqual(r3["state"], "delivered", r3)
 
-        # Default human `status`: collapsed to 1 line showing latest round & chain round count.
+        # Default human `status`: counts header + 1 collapsed line showing latest round & chain round count + history footer.
         default_out = self.cli("status", human=True)
         self.assertEqual(default_out.returncode, 0, default_out.stderr)
         lines = [ln for ln in default_out.stdout.splitlines() if ln.strip()]
-        self.assertEqual(len(lines), 1, default_out.stdout)
-        self.assertTrue(lines[0].startswith("合入员（第 3 轮） · 已交付"), lines[0])
-        self.assertNotIn("提问", lines[0])
-        self.assertNotIn("未通过", lines[0])
+        self.assertIn("运行中 0 · 待合入 1", lines[0])
+        run_lines = [ln for ln in lines[1:] if not ln.startswith("另有 ") and not ln.startswith("归档占用 ")]
+        self.assertEqual(len(run_lines), 1, default_out.stdout)
+        self.assertTrue(run_lines[0].startswith("合入员（第 3 轮） · 已交付"), run_lines[0])
+        self.assertNotIn("提问", run_lines[0])
+        self.assertNotIn("未通过", run_lines[0])
 
         # `status --all` (human): shows every round individually.
         all_out = self.cli("status", "--all", human=True)
@@ -249,11 +251,17 @@ class Delegate625Tests(unittest.TestCase):
         self.assertIn("未通过", all_out.stdout)
         self.assertIn("已交付", all_out.stdout)
 
-        # `status --json`: returns all 3 rounds.
+        # `status --json` returns actionable leaf + statusSummary; `status --all --json` returns all 3 rounds.
         json_out = self.cli("status")
         objs = [json.loads(ln) for ln in json_out.stdout.splitlines() if ln.strip()]
         run_ids = [o["run"] for o in objs if "run" in o]
-        self.assertEqual(set(run_ids), {r1["run"], r2["run"], r3["run"]})
+        self.assertEqual(set(run_ids), {r3["run"]})
+        self.assertTrue(any("statusSummary" in o for o in objs))
+
+        all_json_out = self.cli("status", "--all")
+        all_objs = [json.loads(ln) for ln in all_json_out.stdout.splitlines() if ln.strip()]
+        all_run_ids = [o["run"] for o in all_objs if "run" in o]
+        self.assertEqual(set(all_run_ids), {r1["run"], r2["run"], r3["run"]})
 
     def test_stop_hook_notes_unmerged_deferred_waiter_and_cross_repo(self):
         # Set up two separate git repositories with default `<repo>/.local/run/delegate` dirs

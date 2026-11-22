@@ -2256,8 +2256,10 @@ db.write_text(json.dumps(units))
         self.assertIn("non-negative integer", self.cli("start", "--read-only", "task").stderr)
         for root in ("runs", "runs2"):
             self.env["DELEGATE_RUNS"] = str(self.work / root)
-            for line in self.cli("status").stdout.splitlines():
-                self.cli("stop", json.loads(line)["dir"])
+            for line in self.cli("status", "--all").stdout.splitlines():
+                obj = json.loads(line)
+                if "dir" in obj:
+                    self.cli("stop", obj["dir"])
 
     def repo(self, files):
         repo = self.work / "repo"

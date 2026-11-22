@@ -87,36 +87,6 @@ pub fn resolve(reference: &str) -> Res<PathBuf> {
     {
         return Ok(exact.clone());
     }
-    let archive = runs_root().join(".applied").join(reference);
-    if archive.join("meta.json").is_file() {
-        return Ok(archive);
-    }
-    let evidence = cache_dir().join("archive").join(reference).join("record");
-    if evidence.join("meta.json").is_file() {
-        return Ok(evidence);
-    }
-    let archived = archived_runs();
-    if reference != "last" {
-        let named = archived
-            .iter()
-            .filter(|p| s(&json(p.join("meta.json")), "name") == reference)
-            .collect::<Vec<_>>();
-        if named.len() == 1 {
-            return Ok(named[0].clone());
-        }
-        let matches = archived
-            .iter()
-            .filter(|p| {
-                p.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .contains(reference)
-            })
-            .collect::<Vec<_>>();
-        if matches.len() == 1 {
-            return Ok(matches[0].clone());
-        }
-    }
     // An active run started from another repository is still reachable by its id.
     if let Some(active) = crate::launch::machine_runs(&crate::common::state_dir())
         .into_iter()
@@ -140,10 +110,42 @@ pub fn resolve(reference: &str) -> Res<PathBuf> {
                 .contains(reference)
         })
         .collect::<Vec<_>>();
-    if matches.len() != 1 {
-        return Err(format!("run '{reference}' matched {} runs under {} (runs live under the git root of the directory where start ran; pass a run directory or set DELEGATE_RUNS)",matches.len(),root.display()));
+    if matches.len() == 1 {
+        return Ok(matches[0].clone());
     }
-    Ok(matches[0].clone())
+    let archive = runs_root().join(".applied").join(reference);
+    if archive.join("meta.json").is_file() {
+        return Ok(archive);
+    }
+    let evidence = cache_dir().join("archive").join(reference).join("record");
+    if evidence.join("meta.json").is_file() {
+        return Ok(evidence);
+    }
+    if matches.is_empty() && named.is_empty() {
+        let archived = archived_runs();
+        let named_arch = archived
+            .iter()
+            .filter(|p| s(&json(p.join("meta.json")), "name") == reference)
+            .collect::<Vec<_>>();
+        if named_arch.len() == 1 {
+            return Ok(named_arch[0].clone());
+        }
+        let matches_arch = archived
+            .iter()
+            .filter(|p| {
+                let meta = json(p.join("meta.json"));
+                s(&meta, "run").contains(reference)
+                    || p.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .contains(reference)
+            })
+            .collect::<Vec<_>>();
+        if matches_arch.len() == 1 {
+            return Ok(matches_arch[0].clone());
+        }
+    }
+    Err(format!("run '{reference}' matched {} runs under {} (runs live under the git root of the directory where start ran; pass a run directory or set DELEGATE_RUNS)",matches.len(),root.display()))
 }
 /// Like `resolve`, but a conversation name follows its reply chain to the newest run.
 pub fn resolve_head(reference: &str) -> Res<PathBuf> {
@@ -250,25 +252,6 @@ pub fn redispatch_command(run: &Path, meta: &Value) -> String {
         .map(|a| shell_quote(a))
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-pub fn finished_within(run: &Path, window_seconds: f64) -> bool {
-    let now = epoch();
-    let sum = json(run.join("summary.json"));
-    if let Some(ts) = iso_epoch(s(&sum, "finishedAt")) {
-        return (now - ts as f64) <= window_seconds;
-    }
-    let done = run.join("exit_code");
-    if let Ok(modified) = fs::metadata(&done)
-        .and_then(|m| m.modified())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).map_err(std::io::Error::other))
-    {
-        return (now - modified.as_secs_f64()) <= window_seconds;
-    }
-    let meta = json(run.join("meta.json"));
-    meta["startedEpoch"]
-        .as_f64()
-        .is_some_and(|started| (now - started) <= window_seconds)
 }
 
 pub fn state(run: &Path) -> String {
@@ -883,9 +866,12 @@ pub fn prune() {
                 .map(|x| epoch() - x.as_secs_f64())
                 .unwrap_or(0.0);
             if age > days as f64 * 86400.0 {
+                let meta = json(run.join("meta.json"));
                 match crate::archive::preserve(&run) {
-                    Ok(_) => {
+                    Ok(archived) => {
                         remove(&run);
+                        crate::history::record_clean(&run, &meta, archived.as_deref());
+                        crate::board::refresh_for_meta(&meta);
                     }
                     Err(error) => {
                         eprintln!("delegate: keep {}: archive failed: {error}", run.display())

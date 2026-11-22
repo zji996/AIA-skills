@@ -1,6 +1,7 @@
 mod agents;
 mod agy;
 mod archive;
+mod board;
 mod changes;
 mod cleanup;
 mod common;
@@ -9,6 +10,7 @@ mod deny;
 mod fit;
 mod handoff;
 mod help;
+mod history;
 mod lane;
 mod launch;
 mod measure;
@@ -38,6 +40,17 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+fn mark_result_read(run: &Path) {
+    let meta_path = run.join("meta.json");
+    if meta_path.is_file() {
+        let mut meta = json(&meta_path);
+        if meta.is_object() {
+            meta["resultReadAt"] = json!(iso());
+            let _ = write_json(&meta_path, &meta);
+        }
+    }
+}
 
 fn status_line(run: &Path) -> String {
     output_line(run, runs::status(run))
@@ -654,10 +667,14 @@ fn collect_timed(
                 touch(run.join(".truncated"));
             } else {
                 fs::remove_file(run.join(".truncated")).ok();
+                if matches!(state.as_str(), "delivered" | "answered") && !b(&summary, "question") {
+                    mark_result_read(run);
+                }
             }
         }
         if show_result || !has_result {
             touch(run.join(".delivered"));
+            board::refresh_for_run(run);
         }
     }
     if glanced {
@@ -1073,6 +1090,10 @@ fn clean(args: &[String]) -> Res<i32> {
         .collect::<Res<Vec<_>>>()?;
     if has(&flags, "--finished") {
         for run in runs::all_runs().into_iter().chain(runs::archived_runs()) {
+            // Archived records follow archive LRU policy, not `clean --finished`.
+            if archive::is_record(&run) {
+                continue;
+            }
             if has(&flags, "--force")
                 || (run.join(".delivered").exists()
                     && !run.join(".truncated").exists()
@@ -1119,6 +1140,7 @@ fn clean(args: &[String]) -> Res<i32> {
         } else {
             ""
         };
+        let run_meta = json(run.join("meta.json"));
         let archived = if has(&flags, "--no-archive") {
             None
         } else {
@@ -1126,6 +1148,8 @@ fn clean(args: &[String]) -> Res<i32> {
         };
         let pending_notes = notes::pending_count_for_run(&run);
         let (units, containers) = runs::remove(&run);
+        history::record_clean(&run, &run_meta, archived.as_deref());
+        board::refresh_for_meta(&run_meta);
         let cleanup_note = if units > 0 {
             format!("；停止了 {units} 个 systemd 服务")
         } else {
@@ -1221,12 +1245,14 @@ fn stop(args: &[String]) -> Res<i32> {
                 if s(&sum, "state") != "stopped" {
                     sum["state"] = json!("stopped");
                     write_json(run.join("summary.json"), &sum)?;
+                    history::record_finish(&run);
                 }
             }
         }
         if !run.join("result.md").exists() {
             touch(run.join(".delivered"));
         }
+        board::refresh_for_run(&run);
         println!("{}", status_line(&run));
     }
     Ok(0)
@@ -1408,13 +1434,18 @@ fn apply(args: &[String]) -> Res<i32> {
     // Runs apply in the order given and stop at the first that fails; their acceptance
     // reruns once on the merged tree, after the last merge (field notes 16).
     let mut done = Vec::new();
+    let mut applied_runs = Vec::new();
     let mut code = 0;
     let mut plan = Vec::<String>::new();
     for run in &targets {
         let meta = json(run.join("meta.json"));
         let keep_commits = has(&flags, "--keep-commits") || b(&meta["defaults"], "keepCommits");
         let mut outcome = worktree::apply(run, has(&flags, "--merge"), dry, keep_commits)?;
-        if run.join(".applied").exists() {
+        if !dry && run.join(".applied").exists() {
+            if !applied_runs.contains(run) {
+                applied_runs.push(run.clone());
+            }
+            let applied_json = json(run.join(".applied"));
             let run_meta = json(run.join("meta.json"));
             let path = s(&run_meta["worktree"], "path").to_string();
             let run_ns = run_meta["startedNs"].as_u64().unwrap_or(0);
@@ -1422,17 +1453,27 @@ fn apply(args: &[String]) -> Res<i32> {
                 if other == *run {
                     continue;
                 }
-                let other_meta = json(other.join("meta.json"));
+                let mut other_meta = json(other.join("meta.json"));
                 let other_ns = other_meta["startedNs"].as_u64().unwrap_or(0);
                 if s(&other_meta["worktree"], "path") == path
                     && !runs::active(&runs::state(&other))
                     && (other_ns <= run_ns || !runs::continues_conversation(&other))
                 {
                     let _ = write(other.join(".applied"), read(run.join(".applied")));
+                    if !s(&applied_json, "at").is_empty() {
+                        other_meta["appliedAt"] = applied_json["at"].clone();
+                    }
+                    if !s(&applied_json, "head").is_empty() {
+                        other_meta["appliedHead"] = applied_json["head"].clone();
+                    }
+                    let _ = write_json(other.join("meta.json"), &other_meta);
                     if run.join(".sync-base").is_file() {
                         let _ = write(other.join(".sync-base"), read(run.join(".sync-base")));
                     }
                     refs::pin_run(&other, &other_meta);
+                    if !applied_runs.contains(&other) {
+                        applied_runs.push(other);
+                    }
                 }
             }
         }
@@ -1543,6 +1584,26 @@ fn apply(args: &[String]) -> Res<i32> {
             }
         }
     }
+    if !dry {
+        for run in &applied_runs {
+            let applied = json(run.join(".applied"));
+            if !applied.is_object() {
+                continue;
+            }
+            let meta = json(run.join("meta.json"));
+            let arch = archive::status(run).map(|m| PathBuf::from(s(&m, "path")));
+            let by = s(&applied, "appliedBy");
+            history::record_apply(
+                run,
+                &meta,
+                s(&applied, "at"),
+                s(&applied, "head"),
+                if by.is_empty() { "delegate" } else { by },
+                arch.as_deref(),
+            );
+            board::refresh_for_run(run);
+        }
+    }
     Ok(code)
 }
 fn main_inner(args: &[String]) -> Res<i32> {
@@ -1596,6 +1657,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         return process_match::command(rest);
     }
     refs::backfill_all();
+    history::ensure_backfilled();
     match command.as_str() {
         "start" | "run" => {
             let o = launch::parse_launch(rest, false, command == "run")?;
@@ -1603,6 +1665,9 @@ fn main_inner(args: &[String]) -> Res<i32> {
             let prog = o.progress;
             let full = o.full;
             let run = launch::start(o)?;
+            let created_meta = json(run.join("meta.json"));
+            let created_prompt = history::extract_user_prompt(&run, &created_meta);
+            history::warn_similar_runs(&run, s(&created_meta, "name"), &created_prompt);
             hint_undelivered_other_runs(&run);
             hint_concurrent_writes(&run);
             if command == "start" {
@@ -1790,20 +1855,24 @@ fn main_inner(args: &[String]) -> Res<i32> {
             }
             let include_files = has(&flags, "--files");
             let detail = !pos.is_empty();
-            let show_all = has(&flags, "--all") || !pos.is_empty();
+            let show_all = has(&flags, "--all");
+            let emit_run_json = |run: &Path| {
+                let mut status = runs::status(run);
+                if !include_files {
+                    if let Some(obj) = status.as_object_mut() {
+                        obj.remove("files");
+                    }
+                }
+                println!("{}", format_status(status));
+            };
             if detail {
                 for x in &pos {
                     match runs::resolve_head(x) {
                         Ok(run) => {
-                            let mut status = runs::status(&run);
                             if output::json_enabled() {
-                                if !include_files {
-                                    if let Some(obj) = status.as_object_mut() {
-                                        obj.remove("files");
-                                    }
-                                }
-                                println!("{}", format_status(status));
+                                emit_run_json(&run);
                             } else {
+                                let status = runs::status(&run);
                                 println!("{}", output::human_detail(&run, &status));
                             }
                         }
@@ -1828,110 +1897,253 @@ fn main_inner(args: &[String]) -> Res<i32> {
             if !all.is_empty() || !cleaned_notes.is_empty() {
                 notes::register_repo();
             }
-            let collapse_chains = !show_all && !output::json_enabled();
-            let superseded: std::collections::BTreeSet<String> = all
-                .iter()
-                .filter_map(|run| {
-                    let meta = json(run.join("meta.json"));
-                    let parent = s(&meta, "parent");
-                    (!parent.is_empty()).then(|| parent.to_string())
-                })
-                .collect();
-            let current_caller = caller();
-            let mut shown = Vec::new();
-            let mut older_uncleaned = Vec::new();
+            if show_all {
+                for run in &all {
+                    if output::json_enabled() {
+                        emit_run_json(run);
+                    } else {
+                        let status = runs::status(run);
+                        println!("{}", output::human_line(run, &status, false));
+                    }
+                }
+                for chain in &cleaned_notes {
+                    if output::json_enabled() {
+                        println!("{}", format_status(output::cleaned_note_json(chain)));
+                    } else {
+                        println!("{}", output::human_cleaned_note(chain, false));
+                    }
+                }
+                if !output::json_enabled() {
+                    for (label, since, running) in lane::remote_holders()? {
+                        println!(
+                            "remote {:<8} {since}  {label}",
+                            if running { "running" } else { "queued" }
+                        );
+                    }
+                }
+                return Ok(0);
+            }
+
+            let hist_entries = history::load_entries(&history::current_history_key());
+            let mut replied_ids = std::collections::HashSet::<String>::new();
+            for e in &hist_entries {
+                if !e.parent.is_empty() {
+                    replied_ids.insert(e.parent.clone());
+                }
+            }
             for run in &all {
                 let meta = json(run.join("meta.json"));
-                let id = notes::run_id(run, &meta);
-                if collapse_chains && superseded.contains(&id) {
-                    continue;
+                let parent = s(&meta, "parent");
+                if !parent.is_empty() {
+                    replied_ids.insert(parent.to_string());
                 }
-                if show_all {
-                    shown.push(run.clone());
-                    continue;
+                if !s(&meta, "repliedAt").is_empty() {
+                    replied_ids.insert(notes::run_id(run, &meta));
                 }
+            }
+
+            let mut running = 0usize;
+            let mut pending_apply = 0usize;
+            let mut pending_question = 0usize;
+            let mut queued = 0usize;
+            let mut unread = 0usize;
+            let mut rejected = 0usize;
+            let mut other_actionable = 0usize;
+            let mut pending_todo = 0usize;
+            let mut shown = Vec::new();
+            let mut shown_ids = std::collections::HashSet::<String>::new();
+            let mut hidden_ids = std::collections::HashSet::<String>::new();
+
+            for run in &all {
+                let meta = json(run.join("meta.json"));
                 let st = runs::state(run);
-                let is_active = runs::active(&st) || st == "needs-redispatch";
-                let is_session = current_caller
-                    .as_deref()
-                    .is_some_and(|cid| meta["caller"].as_str() == Some(cid));
-                let cleaned = run.join(".applied-cleaned").exists();
-                let is_recent_uncleaned = !cleaned && runs::finished_within(run, 86400.0);
-                let has_pending_notes =
-                    notes::for_run(run, &all).is_some_and(|c| c.pending_count() > 0);
-                if is_active || is_session || is_recent_uncleaned || has_pending_notes {
-                    shown.push(run.clone());
-                } else if !cleaned {
-                    older_uncleaned.push(run.clone());
+                if !runs::active(&st) && json(run.join("changes.json"))["finalEntries"].is_object() {
+                    worktree::detect_applied(run, &meta);
                 }
-            }
-            for run in shown {
-                let mut status = runs::status(&run);
-                if output::json_enabled() {
-                    if !include_files {
-                        if let Some(obj) = status.as_object_mut() {
-                            obj.remove("files");
-                        }
+                let meta = json(run.join("meta.json"));
+                let sum = json(run.join("summary.json"));
+                let id = notes::run_id(run, &meta);
+                let is_replied = replied_ids.contains(&id);
+                let is_applied = (run.join(".applied").exists()
+                    && !run.join(".generate-pending").exists())
+                    || !s(&meta, "appliedAt").is_empty();
+                let has_explicit_read = !s(&meta, "resultReadAt").is_empty();
+                let is_delivered_read = has_explicit_read
+                    || (run.join(".delivered").exists() && !run.join(".truncated").exists());
+                let unresolved_conflicts = sum["conflictMarkers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .any(|path| {
+                        !worktree::conflict_labels(
+                            &Path::new(s(&meta["worktree"], "source")).join(path),
+                        )
+                        .is_empty()
+                    });
+                let note_pending = notes::for_run(run, &all).map_or(0, |c| c.pending_count());
+
+                let mut keep = if matches!(st.as_str(), "running" | "starting") {
+                    running += 1;
+                    true
+                } else if st == "waiting" {
+                    queued += 1;
+                    true
+                } else if st == "needs-redispatch" {
+                    other_actionable += 1;
+                    true
+                } else if b(&sum, "question") {
+                    if is_replied {
+                        false
+                    } else {
+                        pending_question += 1;
+                        true
                     }
-                    println!("{}", format_status(status));
+                } else if matches!(st.as_str(), "delivered" | "answered") {
+                    let has_worktree_changes = s(&meta, "mode") == "write"
+                        && meta["worktree"].is_object()
+                        && n(sum.get("pendingChanges").unwrap_or(&sum["changes"]), "files") > 0;
+                    if unresolved_conflicts || (has_worktree_changes && !is_applied && !is_replied)
+                    {
+                        pending_apply += 1;
+                        true
+                    } else if is_applied || is_replied || is_delivered_read {
+                        false
+                    } else {
+                        unread += 1;
+                        true
+                    }
+                } else if st == "rejected" {
+                    if is_replied
+                        || has_explicit_read
+                        || is_applied
+                        || run.join(".applied-cleaned").exists()
+                    {
+                        false
+                    } else {
+                        rejected += 1;
+                        true
+                    }
+                } else if st == "stopped" || is_replied || is_delivered_read {
+                    false
                 } else {
-                    println!("{}", output::human_line(&run, &status, collapse_chains));
+                    other_actionable += 1;
+                    true
+                };
+
+                if !keep && !is_replied && note_pending > 0 {
+                    keep = true;
+                }
+
+                if keep {
+                    if !is_replied {
+                        pending_todo += note_pending;
+                    }
+                    shown_ids.insert(id);
+                    shown.push(run.clone());
+                } else {
+                    hidden_ids.insert(id);
                 }
             }
-            for chain in &cleaned_notes {
-                if output::json_enabled() {
+            pending_todo += cleaned_notes
+                .iter()
+                .map(|c| c.pending_count())
+                .sum::<usize>();
+
+            let mut finished_ids = hidden_ids;
+            for e in &hist_entries {
+                if !shown_ids.contains(&e.run) {
+                    finished_ids.insert(e.run.clone());
+                }
+            }
+            let finished_count = finished_ids.len();
+
+            let arch_usage = archive::usage();
+
+            if output::json_enabled() {
+                for run in &shown {
+                    emit_run_json(run);
+                }
+                for chain in &cleaned_notes {
                     println!("{}", format_status(output::cleaned_note_json(chain)));
-                } else {
+                }
+                println!(
+                    "{}",
+                    json!({"statusSummary": {
+                        "running": running,
+                        "pendingApply": pending_apply,
+                        "pendingQuestion": pending_question,
+                        "queued": queued,
+                        "unread": unread,
+                        "rejected": rejected,
+                        "pendingNotes": pending_todo,
+                        "otherActionable": other_actionable,
+                        "finished": finished_count,
+                        "archiveBytes": arch_usage.bytes,
+                        "archiveCount": arch_usage.count,
+                        "archiveFsCritical": arch_usage.fs_critical,
+                        "history": "delegate history"
+                    }})
+                );
+            } else {
+                let mut counts = format!(
+                    "运行中 {running} · 待合入 {pending_apply} · 待回答 {pending_question} · 排队 {queued}"
+                );
+                if unread > 0 {
+                    counts.push_str(&format!(" · 待读 {unread}"));
+                }
+                if rejected > 0 {
+                    counts.push_str(&format!(" · 未通过 {rejected}"));
+                }
+                if pending_todo > 0 {
+                    counts.push_str(&format!(" · 待办 {pending_todo}"));
+                }
+                if other_actionable > 0 {
+                    counts.push_str(&format!(" · 异常 {other_actionable}"));
+                }
+                println!("{counts}");
+                for run in &shown {
+                    let status = runs::status(run);
+                    println!("{}", output::human_line(run, &status, true));
+                }
+                for chain in &cleaned_notes {
                     println!("{}", output::human_cleaned_note(chain, false));
                 }
-            }
-            if !older_uncleaned.is_empty() {
-                let active_paths: std::collections::BTreeSet<_> = all
-                    .iter()
-                    .filter(|run| runs::active(&runs::state(run)))
-                    .map(|run| s(&json(run.join("meta.json"))["worktree"], "path").to_string())
-                    .collect();
-                let mut seen = std::collections::BTreeSet::new();
-                let mut total_bytes = 0u64;
-                for run in &older_uncleaned {
-                    let meta = json(run.join("meta.json"));
-                    let path = s(&meta["worktree"], "path");
-                    if !path.is_empty()
-                        && Path::new(path).is_dir()
-                        && !active_paths.contains(path)
-                        && seen.insert(path.to_string())
-                    {
-                        total_bytes = total_bytes
-                            .saturating_add(meta["worktreeBytes"].as_u64().unwrap_or(0));
+                let mut footer_parts = Vec::new();
+                if finished_count > 0 {
+                    footer_parts.push(format!("另有 {finished_count} 条已结束：delegate history"));
+                }
+                if arch_usage.count > 0 {
+                    let mut arch_text = format!(
+                        "归档占用 {}（{} 份）",
+                        format_bytes(arch_usage.bytes),
+                        arch_usage.count
+                    );
+                    if arch_usage.fs_critical {
+                        if let Some(avail) = arch_usage.fs_avail_bytes {
+                            arch_text.push_str(&format!(
+                                "（文件系统剩余仅 {}，将按最久未读清理事件日志）",
+                                format_bytes(avail)
+                            ));
+                        }
                     }
+                    footer_parts.push(arch_text);
                 }
-                let all_cmd = format!("{} status --all", script().display());
-                let clean_cmd = format!("{} clean --finished", script().display());
-                if output::json_enabled() {
-                    println!(
-                        "{}",
-                        json!({"olderUncleaned":{
-                            "count": older_uncleaned.len(),
-                            "bytes": total_bytes,
-                            "all": all_cmd,
-                            "clean": clean_cmd
-                        }})
-                    );
-                } else {
-                    println!(
-                        "更早未清理：{} 个，占 {}；查看全部：{all_cmd}；清理：{clean_cmd}（含未读/未合入加 --force）",
-                        older_uncleaned.len(),
-                        format_bytes(total_bytes)
-                    );
+                if !footer_parts.is_empty() {
+                    println!("{}", footer_parts.join(" · "));
                 }
-            }
-            if !output::json_enabled() {
                 for (label, since, running) in lane::remote_holders()? {
-                    println!("remote {:<8} {since}  {label}", if running { "running" } else { "queued" });
+                    println!(
+                        "remote {:<8} {since}  {label}",
+                        if running { "running" } else { "queued" }
+                    );
                 }
             }
             Ok(0)
         }
+        "history" => history::history_command(rest),
+        "show" => history::show_command(rest),
+        "board" => board::command(rest),
         "result" => {
             let (pos, flags, _) = parse_simple(rest, &["--path"], &[])?;
             if pos.len() > 1 {
@@ -1952,6 +2164,9 @@ fn main_inner(args: &[String]) -> Res<i32> {
             }
             if has(&flags, "--path") {
                 println!("{}", result.display());
+                if !runs::active(&runs::state(&run)) && !run.join(".truncated").exists() {
+                    mark_result_read(&run);
+                }
             } else {
                 let mut out = io::stdout().lock();
                 // 全文确实写出后才解除保留，写入失败时 clean 仍会保留它。
@@ -1961,10 +2176,14 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     .is_ok()
                 {
                     fs::remove_file(run.join(".truncated")).ok();
+                    if !runs::active(&runs::state(&run)) {
+                        mark_result_read(&run);
+                    }
                 }
             }
             if !runs::active(&runs::state(&run)) {
                 touch(run.join(".delivered"));
+                board::refresh_for_run(&run);
             }
             Ok(0)
         }

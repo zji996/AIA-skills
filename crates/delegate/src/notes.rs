@@ -432,12 +432,32 @@ pub fn for_run_in(root: &Path, run: &Path, all: &[PathBuf]) -> Option<ChainNotes
     chains.into_iter().find(|entry| entry.matches_any(&members))
 }
 
-pub fn for_run(run: &Path, all: &[PathBuf]) -> Option<ChainNotes> {
-    let root = run
-        .parent()
-        .filter(|p| notes_path(p).is_file())
+fn is_archived_path(run: &Path) -> bool {
+    run.starts_with(cache_dir().join("archive"))
+        || run
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n == ".applied")
+}
+
+fn notes_root_for_run(run: &Path) -> PathBuf {
+    if is_archived_path(run) {
+        return runs_root();
+    }
+    run.parent()
         .map(Path::to_path_buf)
-        .unwrap_or_else(runs_root);
+        .unwrap_or_else(runs_root)
+}
+
+pub fn for_run(run: &Path, all: &[PathBuf]) -> Option<ChainNotes> {
+    let root = if is_archived_path(run) {
+        runs_root()
+    } else {
+        run.parent()
+            .filter(|p| notes_path(p).is_file())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(runs_root)
+    };
     if !notes_path(&root).is_file() {
         return None;
     }
@@ -445,11 +465,14 @@ pub fn for_run(run: &Path, all: &[PathBuf]) -> Option<ChainNotes> {
 }
 
 pub fn for_run_lazy(run: &Path) -> Option<ChainNotes> {
-    let root = run
-        .parent()
-        .filter(|p| notes_path(p).is_file())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(runs_root);
+    let root = if is_archived_path(run) {
+        runs_root()
+    } else {
+        run.parent()
+            .filter(|p| notes_path(p).is_file())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(runs_root)
+    };
     if !notes_path(&root).is_file() {
         return None;
     }
@@ -692,7 +715,14 @@ enum Target {
 }
 
 fn resolve_target(reference: &str) -> Res<Target> {
-    if let Ok(run) = runs::resolve_head(reference) {
+    let resolved = runs::resolve_head(reference).ok();
+    if let Some(run) = resolved.as_ref().filter(|p| !is_archived_path(p)) {
+        return Ok(Target::Live(run.clone()));
+    }
+    if let Ok(cleaned) = resolve_cleaned(reference) {
+        return Ok(Target::Cleaned(cleaned.latest_run));
+    }
+    if let Some(run) = resolved {
         return Ok(Target::Live(run));
     }
     let cleaned = resolve_cleaned(reference)?;
@@ -734,10 +764,7 @@ pub fn command(args: &[String]) -> Res<i32> {
         }
         let target = resolve_target(reference)?;
         let root = match &target {
-            Target::Live(run) => run
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(runs_root),
+            Target::Live(run) => notes_root_for_run(run),
             Target::Cleaned(_) => runs_root(),
         };
         fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
@@ -921,10 +948,7 @@ pub fn command(args: &[String]) -> Res<i32> {
     }
     let target = resolve_target(reference)?;
     let root = match &target {
-        Target::Live(run) => run
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(runs_root),
+        Target::Live(run) => notes_root_for_run(run),
         Target::Cleaned(_) => runs_root(),
     };
     fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;

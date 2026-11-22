@@ -2,9 +2,9 @@
 
 ## 证据归档（6.18）
 
-`clean`、自动过期清理和 apply 自动释放工作树前，把 Git 忽略的非构建输出存到工具缓存 `archive/<run>/files/`；`manifest.json` 记录保留/超限跳过的路径、字节数。答复 `result.md` / 原始长答复提及的现存文件或目录优先（含 tracked/untracked，明确引用也可保留构建路径），再按文件从小到大装入上限，相当于先跳过最大的；超限打印说明。默认不收 target、node_modules、build/dist 与常见缓存目录，内部普通文件符号链接按内容保存，不跟随目录链接或工作树外链接（托管链接可能指回源仓库），不会复制工作树外内容。
+`clean`、自动过期清理和 apply 自动释放工作树前，将任务记录（提示词、完整答复、meta、summary、patch 与 gzip 压缩后的 `events.jsonl.gz`）和 Git 忽略的非构建输出存到工具缓存 `archive/<run>/`（`record/` + `files/`），丢弃 worktree、shims、会话与 agent 输入流；`manifest.json` 记录保留/超限跳过的路径及 `bytes`/`recordBytes`/`totalBytes`。答复 `result.md` / 原始长答复提及的现存文件或目录优先（含 tracked/untracked，明确引用也可保留构建路径），再按文件从小到大装入上限，相当于先跳过最大的；超限打印说明。默认不收 target、node_modules、build/dist 与常见缓存目录，内部普通文件符号链接按内容保存，不跟随目录链接或工作树外链接（托管链接可能指回源仓库），不会复制工作树外内容。
 
-默认每 run 200 MiB（`DELEGATE_ARCHIVE_MAX_BYTES`），所有归档 2 GiB（`DELEGATE_ARCHIVE_TOTAL_BYTES`）、30 天未访问（`DELEGATE_ARCHIVE_KEEP_DAYS`）；新归档时按最近访问淘汰，保留本次归档。status/result 访问刷新 LRU；清理后仍可按 run id/名字查答复和归档路径。归档失败时 clean 不删工作树，apply 合入成功后也保留工作树并报诊断。`clean --no-archive` 明确放弃本次证据保护；`--force` 不绕过归档。归档也会过期，不替代长期保存需要的交付物。
+默认每 run 证据 200 MiB（`DELEGATE_ARCHIVE_MAX_BYTES`）；归档不设总量硬上限，平时不自动删除，只在 `status` 与看板末行显示归档占用与份数。只有归档所在文件系统达到临界低空间水位（默认剩余不足 10 GiB 或 5%，可用 `DELEGATE_FS_CRITICAL_FREE_GIB` / `DELEGATE_FS_CRITICAL_FREE_PCT` 调整）时，才按最久未读顺序淘汰可重建/不再读的 `events.jsonl.gz`（仍不足再淘汰复制的 `files/`）；`prompt.md`、`result.md`、`meta.json`、`summary.json`、`applied.patch`/`changes.patch` 永不删除。`status`/`show`/`result` 访问刷新 `.access`；清理后仍可按 run id/名字查摘要、答复、补丁与归档路径。每仓库独立的 `history.jsonl` 存在状态目录、永久保留（单条 <2 KB），不随 `clean` 或归档清理删除；若归档目录被手动移除，`show` 说明「原文已过期，仅剩索引」。归档失败时 clean 不删工作树，apply 合入成功后也保留工作树并报诊断。`clean --no-archive` 明确放弃本次证据保护；`--force` 不绕过归档。
 
 ## 容器回收
 

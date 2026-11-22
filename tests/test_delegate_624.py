@@ -53,12 +53,14 @@ class Delegate624Tests(unittest.TestCase):
         summary["sourceWorkspaceChanges"] = ["src/dirty_one.rs", "src/dirty_two.rs"]
         summary_path.write_text(json.dumps(summary))
 
-        # 1) `delegate status` (list mode): strictly one line for this run, counts only, no path lists.
+        # 1) `delegate status` (list mode): counts header + strictly one line for this run, counts only, no path lists.
         list_out = self.cli("status", human=True)
         self.assertEqual(list_out.returncode, 0, list_out.stderr)
         lines = [ln for ln in list_out.stdout.splitlines() if ln.strip()]
-        self.assertEqual(len(lines), 1, list_out.stdout)
-        line = lines[0]
+        self.assertIn("运行中 0 · 待合入 1", lines[0])
+        run_lines = [ln for ln in lines[1:] if not ln.startswith("另有 ") and not ln.startswith("归档占用 ")]
+        self.assertEqual(len(run_lines), 1, list_out.stdout)
+        line = run_lines[0]
         self.assertIn("commits differ 12 个文件", line)
         self.assertIn("正文提及保护路径 1 处", line)
         self.assertIn("源仓库工作区有新改动：2 个文件", line)

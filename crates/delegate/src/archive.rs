@@ -1,9 +1,31 @@
-//! Evidence preservation is deliberately separate from build-cache retention.
+//! Evidence and run-record archival is separate from build-cache retention and history index.
+//! Archives have no total-size hard cap: usage is surfaced in `status` and `board`.
+//! Only when the archive filesystem approaches exhaustion (critical free-space watermark)
+//! are least-recently-read reconstructible/unneeded trace bytes (`events.jsonl.gz`, then `files/`)
+//! trimmed; `prompt.md`, `result.md`, `meta.json`, `summary.json`, patches, and `history.jsonl`
+//! are never deleted.
 use crate::common::*;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use std::fs;
+use std::ffi::CString;
+use std::fs::{self, File};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+
+pub const DEFAULT_ARCHIVE_MAX_BYTES: u64 = 200 * 1024 * 1024;
+/// Filesystem critical-space watermark (aligned with disk-pressure warning policy):
+/// free space below 10 GiB or below 5% of total filesystem capacity.
+pub const ARCHIVE_FS_CRITICAL_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+pub const ARCHIVE_FS_CRITICAL_FREE_PCT: u64 = 5;
+
+#[derive(Clone, Debug, Default)]
+pub struct ArchiveUsage {
+    pub bytes: u64,
+    pub count: usize,
+    pub fs_avail_bytes: Option<u64>,
+    pub fs_critical: bool,
+}
 
 fn build_path(path: &str) -> bool {
     path.split('/').any(|part| {
@@ -83,99 +105,243 @@ fn names(bytes: Vec<u8>) -> BTreeSet<String> {
         .collect()
 }
 
+fn dir_bytes(root: &Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = fs::read_dir(root) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if meta.is_dir() {
+                total = total.saturating_add(dir_bytes(&path));
+            } else if meta.is_file() {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
+}
+
+fn critical_watermarks() -> (u64, u64) {
+    let free_bytes = if let Ok(v) = setting("FS_CRITICAL_FREE_BYTES", "").parse::<u64>() {
+        v
+    } else if let Ok(gib) = setting("FS_CRITICAL_FREE_GIB", "").parse::<u64>() {
+        gib.saturating_mul(1024 * 1024 * 1024)
+    } else {
+        ARCHIVE_FS_CRITICAL_FREE_BYTES
+    };
+    let free_pct = setting("FS_CRITICAL_FREE_PCT", &ARCHIVE_FS_CRITICAL_FREE_PCT.to_string())
+        .parse::<u64>()
+        .unwrap_or(ARCHIVE_FS_CRITICAL_FREE_PCT);
+    (free_bytes, free_pct)
+}
+
+fn statvfs_space(path: &Path) -> Option<(u64, u64)> {
+    let mut probe = path;
+    while !probe.exists() {
+        probe = probe.parent()?;
+    }
+    let cpath = CString::new(probe.as_os_str().as_bytes()).ok()?;
+    let mut st = unsafe { std::mem::zeroed::<libc::statvfs>() };
+    if unsafe { libc::statvfs(cpath.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    let frsize = if st.f_frsize > 0 {
+        st.f_frsize as u64
+    } else {
+        st.f_bsize as u64
+    };
+    let avail = (st.f_bavail as u64).saturating_mul(frsize);
+    let total = (st.f_blocks as u64).saturating_mul(frsize);
+    Some((avail, total))
+}
+
+fn fs_space(path: &Path) -> Option<(u64, u64)> {
+    let real = statvfs_space(path);
+    if let Ok(simulated) = setting("ARCHIVE_FS_AVAIL_BYTES", "").parse::<u64>() {
+        let total = real
+            .map(|(_, t)| t.max(simulated))
+            .unwrap_or(simulated.saturating_mul(20).max(1));
+        return Some((simulated, total));
+    }
+    real
+}
+
+fn is_fs_critical(avail: u64, total: u64, min_free_bytes: u64, min_free_pct: u64) -> bool {
+    (min_free_bytes > 0 && avail < min_free_bytes)
+        || (min_free_pct > 0 && total > 0 && avail.saturating_mul(100) < total.saturating_mul(min_free_pct))
+}
+
+pub fn usage() -> ArchiveUsage {
+    let root = cache_dir().join("archive");
+    let mut bytes = 0u64;
+    let mut count = 0usize;
+    for entry in fs::read_dir(&root).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        count += 1;
+        let manifest = json(path.join("manifest.json"));
+        let size = manifest["totalBytes"]
+            .as_u64()
+            .or_else(|| manifest["bytes"].as_u64())
+            .unwrap_or_else(|| dir_bytes(&path));
+        bytes = bytes.saturating_add(size);
+    }
+    let (min_bytes, min_pct) = critical_watermarks();
+    let (fs_avail_bytes, fs_critical) = match fs_space(&root) {
+        Some((avail, total)) => (
+            Some(avail),
+            is_fs_critical(avail, total, min_bytes, min_pct),
+        ),
+        None => (None, false),
+    };
+    ArchiveUsage {
+        bytes,
+        count,
+        fs_avail_bytes,
+        fs_critical,
+    }
+}
+
+fn archive_events(src: &Path, record: &Path) -> Res<()> {
+    if !src.is_file() {
+        return Ok(());
+    }
+    let gz = record.join("events.jsonl.gz");
+    let tmp = record.join("events.jsonl.gz.tmp");
+    let compressed = (|| -> std::io::Result<bool> {
+        let input = File::open(src)?;
+        let output = File::create(&tmp)?;
+        let status = Command::new("gzip")
+            .arg("-c")
+            .stdin(Stdio::from(input))
+            .stdout(Stdio::from(output))
+            .stderr(Stdio::null())
+            .status()?;
+        Ok(status.success())
+    })();
+    match compressed {
+        Ok(true) => {
+            fs::rename(&tmp, &gz).map_err(|e| e.to_string())?;
+            let _ = fs::remove_file(record.join("events.jsonl"));
+            Ok(())
+        }
+        _ => {
+            let _ = fs::remove_file(&tmp);
+            fs::copy(src, record.join("events.jsonl")).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+    }
+}
+
 /// A failed archive aborts explicit clean: never delete evidence after a copy error.
 pub fn preserve(run: &Path) -> Res<Option<PathBuf>> {
     if is_record(run) {
         return Ok(status(run).map(|m| PathBuf::from(s(&m, "path"))));
     }
     let meta = json(run.join("meta.json"));
+    let run_name = run.file_name().ok_or("run has no name")?;
+    let archive = cache_dir().join("archive").join(run_name);
+    let existing = json(archive.join("manifest.json"));
+    let mut kept = strings(&existing["files"]);
+    let mut skipped = existing["skipped"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut bytes: u64 = existing["bytes"].as_u64().unwrap_or(0);
+    let created_at = if !s(&existing, "createdAt").is_empty() {
+        s(&existing, "createdAt").to_string()
+    } else {
+        iso()
+    };
+
     let top = Path::new(s(&meta["worktree"], "path"));
-    if !meta["worktree"].is_object() || !top.is_dir() {
-        return Ok(None);
-    }
-    let ignored = names(git(
-        top,
-        &[
-            "ls-files",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "-z",
-        ],
-    )?);
-    let mut all = ignored.clone();
-    all.extend(names(git(
-        top,
-        &[
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "-z",
-        ],
-    )?));
-    let result = format!(
-        "{}\n{}",
-        read(run.join("result.md")),
-        read(run.join("result-original.md"))
-    );
-    let mut candidates = vec![];
-    for name in all {
-        let priority = mentioned(&result, &name);
-        if (priority || (ignored.contains(&name) && !build_path(&name))) && safe_file(top, &name) {
-            let size = fs::metadata(top.join(&name))
-                .map_err(|e| e.to_string())?
-                .len();
-            candidates.push((!priority, size, name));
-        }
-    }
-    if candidates.is_empty() {
-        return Ok(None);
-    }
-    // Retain referenced evidence first; within each class drop largest files first.
-    candidates.sort();
-    let cap = setting("ARCHIVE_MAX_BYTES", "209715200")
-        .parse::<u64>()
-        .unwrap_or(209715200);
-    let archive = cache_dir()
-        .join("archive")
-        .join(run.file_name().ok_or("run has no name")?);
-    let mut kept = vec![];
-    let mut skipped = vec![];
-    let mut bytes: u64 = 0;
-    for (_, size, name) in candidates {
-        if size > cap.saturating_sub(bytes) {
-            skipped.push(json!({"path":name,"bytes":size,"reason":"per-run size cap"}));
-            continue;
-        }
-        let dest = archive.join("files").join(&name);
-        fs::create_dir_all(dest.parent().ok_or("archive path has no parent")?)
-            .map_err(|e| e.to_string())?;
-        fs::copy(top.join(&name), dest).map_err(|e| format!("archive {name}: {e}"))?;
-        bytes += size;
-        kept.push(name);
-    }
-    if !skipped.is_empty() {
-        eprintln!(
-            "delegate: archive size cap: skipped {} file(s); see {}/manifest.json",
-            skipped.len(),
-            archive.display()
+    if meta["worktree"].is_object() && top.is_dir() {
+        let ignored = names(git(
+            top,
+            &[
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+            ],
+        )?);
+        let mut all = ignored.clone();
+        all.extend(names(git(
+            top,
+            &[
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ],
+        )?));
+        let result = format!(
+            "{}\n{}",
+            read(run.join("result.md")),
+            read(run.join("result-original.md"))
         );
+        let mut candidates = vec![];
+        for name in all {
+            let priority = mentioned(&result, &name);
+            if (priority || (ignored.contains(&name) && !build_path(&name))) && safe_file(top, &name)
+            {
+                let size = fs::metadata(top.join(&name))
+                    .map_err(|e| e.to_string())?
+                    .len();
+                candidates.push((!priority, size, name));
+            }
+        }
+        if !candidates.is_empty() {
+            // Retain referenced evidence first; within each class drop largest files first.
+            candidates.sort();
+            let cap = setting("ARCHIVE_MAX_BYTES", &DEFAULT_ARCHIVE_MAX_BYTES.to_string())
+                .parse::<u64>()
+                .unwrap_or(DEFAULT_ARCHIVE_MAX_BYTES);
+            kept.clear();
+            skipped.clear();
+            bytes = 0;
+            for (_, size, name) in candidates {
+                if size > cap.saturating_sub(bytes) {
+                    skipped.push(json!({"path":name,"bytes":size,"reason":"per-run size cap"}));
+                    continue;
+                }
+                let dest = archive.join("files").join(&name);
+                fs::create_dir_all(dest.parent().ok_or("archive path has no parent")?)
+                    .map_err(|e| e.to_string())?;
+                fs::copy(top.join(&name), dest).map_err(|e| format!("archive {name}: {e}"))?;
+                bytes += size;
+                kept.push(name);
+            }
+            if !skipped.is_empty() {
+                eprintln!(
+                    "delegate: archive size cap: skipped {} file(s); see {}/manifest.json",
+                    skipped.len(),
+                    archive.display()
+                );
+            }
+        }
     }
-    let manifest =
-        json!({"path":archive,"bytes":bytes,"files":kept,"skipped":skipped,"createdAt":iso()});
-    write_json(archive.join("manifest.json"), &manifest)?;
-    write_json(run.join("archive.json"), &manifest)?;
-    // Keep enough history to route status/result after explicit clean removes the run.
+
+    // Keep prompt, full answer, meta, patches, and compressed events so show/result/patch
+    // work after clean while discarding worktree, shims, sessions, and agent input streams.
     let record = archive.join("record");
     fs::create_dir_all(&record).map_err(|e| e.to_string())?;
     for name in [
         "meta.json",
         "summary.json",
+        "prompt.md",
         "result.md",
         "result-original.md",
+        "changes.json",
+        "changes.patch",
+        "applied.patch",
         "exit_code",
-        "archive.json",
         ".delivered",
         ".applied",
         "compression.json",
@@ -184,44 +350,132 @@ pub fn preserve(run: &Path) -> Res<Option<PathBuf>> {
             fs::copy(run.join(name), record.join(name)).map_err(|e| e.to_string())?;
         }
     }
+    archive_events(&run.join("events.jsonl"), &record)?;
+
+    let record_bytes = dir_bytes(&record);
+    let total_bytes = bytes.saturating_add(record_bytes);
+    let manifest = json!({
+        "path": archive,
+        "bytes": bytes,
+        "recordBytes": record_bytes,
+        "totalBytes": total_bytes,
+        "files": kept,
+        "skipped": skipped,
+        "createdAt": created_at
+    });
+    write_json(archive.join("manifest.json"), &manifest)?;
+    write_json(record.join("archive.json"), &manifest)?;
+    if run.is_dir() {
+        write_json(run.join("archive.json"), &manifest)?;
+    }
     touch(&archive)?;
-    prune(&archive);
+    prune_if_fs_critical(&archive);
     Ok(Some(archive))
 }
 
 pub fn touch(archive: &Path) -> Res<()> {
     write(archive.join(".access"), epoch().to_string())
 }
-fn prune(keep: &Path) {
+
+fn update_manifest_sizes(archive: &Path, evicted_events: bool, evicted_files: bool) {
+    let manifest_path = archive.join("manifest.json");
+    let mut manifest = json(&manifest_path);
+    if !manifest.is_object() {
+        return;
+    }
+    let files_bytes = dir_bytes(&archive.join("files"));
+    let record_bytes = dir_bytes(&archive.join("record"));
+    manifest["bytes"] = json!(files_bytes);
+    manifest["recordBytes"] = json!(record_bytes);
+    manifest["totalBytes"] = json!(files_bytes.saturating_add(record_bytes));
+    if evicted_events {
+        manifest["eventsEvicted"] = json!(true);
+    }
+    if evicted_files {
+        manifest["files"] = json!([]);
+        manifest["filesEvicted"] = json!(true);
+    }
+    let _ = write_json(&manifest_path, &manifest);
+    let rec_arch = archive.join("record/archive.json");
+    if rec_arch.is_file() {
+        let _ = write_json(&rec_arch, &manifest);
+    }
+}
+
+/// Only when the archive filesystem hits its critical free-space watermark do we trim
+/// least-recently-read trace bytes (`events.jsonl.gz` / `events.jsonl`, then `files/`).
+/// `prompt.md`, `result.md`, `meta.json`, `summary.json`, patches, and `history.jsonl` are never deleted.
+fn prune_if_fs_critical(keep: &Path) {
     let root = cache_dir().join("archive");
-    let days = setting("ARCHIVE_KEEP_DAYS", "30")
-        .parse::<f64>()
-        .unwrap_or(30.0);
-    let limit = setting("ARCHIVE_TOTAL_BYTES", "2147483648")
-        .parse::<u64>()
-        .unwrap_or(2147483648);
-    let mut entries = fs::read_dir(root)
+    let Some((mut avail, total)) = fs_space(&root) else {
+        return;
+    };
+    let (min_free_bytes, min_free_pct) = critical_watermarks();
+    if !is_fs_critical(avail, total, min_free_bytes, min_free_pct) {
+        return;
+    }
+    let mut entries: Vec<(f64, PathBuf)> = fs::read_dir(&root)
         .into_iter()
         .flatten()
         .flatten()
+        .filter(|e| e.path().is_dir() && e.path() != keep)
         .map(|e| {
             let path = e.path();
             let accessed = read(path.join(".access")).parse::<f64>().unwrap_or(0.0);
-            let bytes = json(path.join("manifest.json"))["bytes"]
-                .as_u64()
-                .unwrap_or(0);
-            (accessed, path, bytes)
+            (accessed, path)
         })
-        .collect::<Vec<_>>();
+        .collect();
     entries.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut total = entries.iter().map(|e| e.2).sum::<u64>();
-    for (accessed, path, bytes) in entries {
-        if path != keep
-            && ((days > 0.0 && epoch() - accessed > days * 86400.0) || total > limit)
-            && fs::remove_dir_all(path).is_ok()
-        {
-            total = total.saturating_sub(bytes);
+
+    let mut freed_total = 0u64;
+    let mut trimmed_events = 0usize;
+    let mut trimmed_files = 0usize;
+
+    // Pass 1: drop least-recently-read events.jsonl.gz / events.jsonl first.
+    for (_, path) in &entries {
+        if !is_fs_critical(avail, total, min_free_bytes, min_free_pct) {
+            break;
         }
+        let mut freed_here = 0u64;
+        for name in ["events.jsonl.gz", "events.jsonl"] {
+            let f = path.join("record").join(name);
+            if let Ok(meta) = fs::metadata(&f) {
+                let sz = meta.len();
+                if fs::remove_file(&f).is_ok() {
+                    freed_here = freed_here.saturating_add(sz);
+                }
+            }
+        }
+        if freed_here > 0 {
+            avail = avail.saturating_add(freed_here);
+            freed_total = freed_total.saturating_add(freed_here);
+            trimmed_events += 1;
+            update_manifest_sizes(path, true, false);
+        }
+    }
+
+    // Pass 2: only if filesystem is STILL critically full, drop copied evidence `files/`.
+    for (_, path) in &entries {
+        if !is_fs_critical(avail, total, min_free_bytes, min_free_pct) {
+            break;
+        }
+        let files_dir = path.join("files");
+        if files_dir.is_dir() {
+            let sz = dir_bytes(&files_dir);
+            if fs::remove_dir_all(&files_dir).is_ok() {
+                avail = avail.saturating_add(sz);
+                freed_total = freed_total.saturating_add(sz);
+                trimmed_files += 1;
+                update_manifest_sizes(path, false, true);
+            }
+        }
+    }
+
+    if freed_total > 0 {
+        eprintln!(
+            "delegate: archive filesystem critically low; trimmed {} ({trimmed_events} event log(s), {trimmed_files} evidence dir(s)); prompt/result/meta/summary/patch kept",
+            format_bytes(freed_total)
+        );
     }
 }
 

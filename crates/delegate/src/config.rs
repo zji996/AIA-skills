@@ -305,6 +305,16 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
                 ))
             }
         }
+        match value.get("board") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(s)) if !s.trim().is_empty() && !s.contains('\0') => {}
+            _ => {
+                return Err(format!(
+                    "{}: board must be a non-empty file path string or null",
+                    path.display()
+                ))
+            }
+        }
     }
     Ok(())
 }
@@ -322,7 +332,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         validate(user, &user_file, false)?;
         crate::source_build::validate(user, &user_file, top)?;
         sources.push("user");
-        for key in ["worktree", "generated", "appendOnly", "applyVerify"] {
+        for key in ["worktree", "generated", "appendOnly", "applyVerify", "board"] {
             if user.get(key).is_some() {
                 ignored.push(key);
             }
