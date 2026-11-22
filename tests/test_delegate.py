@@ -681,8 +681,10 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
                 self.assertIn("report body", out.stdout)
         complete = self.outcome(self.cli("status", "compact"))
         self.assertEqual(complete["changes"], state["changes"])
-        self.assertEqual(complete["files"], ["a.txt", "crates/protocol/new"])
+        self.assertNotIn("files", complete)
         self.assertIn("shape", complete)
+        with_files = self.outcome(self.cli("status", "compact", "--files"))
+        self.assertEqual(with_files["files"], ["a.txt", "crates/protocol/new"])
 
     def test_running_default_output_uses_events_and_truncated_command(self):
         repo = self.repo({"a.txt": "old\n"})

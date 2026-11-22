@@ -135,6 +135,7 @@ pub fn collect_slots(run: &Path, meta: &Value) -> Vec<(&'static str, String)> {
     }
     let worktree_base = read(run.join("worktree-base-commit"));
     push("worktree-base", worktree_base.trim());
+    push("net-base", s(meta, "netBase"));
     let rec = json(run.join("changes.json"));
     let rec_base = s(&rec, "base");
     if base.is_empty() && !rec_base.is_empty() {

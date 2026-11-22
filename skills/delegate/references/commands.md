@@ -12,7 +12,8 @@
 | `apply [<run> …] [--dry-run] [--merge] [--verify\|--no-verify] [--keep] [--keep-commits] [--json]` | 按给出的顺序将 worktree 改动合入源工作区，不提交，遇到失败即停；验收没法沿用（`acceptStillValid` 不为 true）的任务在最后一次合并后、经 lane 重跑一次各自的验收（去重），`applyVerify: false` 关闭、写命令则替换；始终列同事提交。`--keep-commits` 按序 cherry-pick，要求同事工作树改动已提交；收尾与 apply 的 `commitsDiffer` 列提交以外文件，默认 apply 始终取最终树，冲突停在 git cherry-pick 状态。成功后按 `worktree.cleanOnApply`（默认 true）归档并删除 worktree（续做链等整条链都合入后再清），保留原 run 轻量记录与 applied.patch；`--keep` 或 `cleanOnApply: false` 保留 worktree。合入末行报告验收有效性与盲区。 |
 | `busy <资源名>` | 有实际运行的匹配命令时逐行列 run、命令和持续秒数，退出 0；空闲无输出、退出 1 |
 | `wait [<run>...\|--all] [--max <时长>] [--no-result] [--full] [--progress]` | 无参和带名字的 `wait <run>...` 默认同 `--any`：返回时列出上次 wait 之后所有进入终态或提问态的 run（首个给全文，其余给一行摘要加 `result` 查看命令）；`--all` / `--until-all` 等全部（单次最多 50 分钟，超时列仍在跑的 run）。人读末行给本会话剩余数和原样重跑命令，无运行任务时明确说明 |
-| `status [<run>...] [--all] [--json]` | 默认每任务一条自然语言短行；不带参数只列未结束、24 小时内结束未清理与本会话起的任务，更早未清理汇总成一行（个数、空间与清理命令）；`--all` 列全部，`--json` 保留完整原字段 |
+| `status [<run>...] [--all] [--json] [--files]` | 默认每任务一行短摘要，路径清单只留计数；指定 `<run>` 展开缩进路径详情。不带参数只列未结束、24 小时内结束未清理与本会话起的任务，更早未清理汇总成一行；`--all` 列全部，`--json` 默认省去 `files` 数组（加 `--files` 才带） |
+| `handoff [--out <路径>]` | 生成未清理、未合入任务的一页 Markdown 交接索引（默认写入 `.local/run/delegate/HANDOFF.md` 并打印路径）：名字、状态、`netBase` 短 sha、净改动、净 patch 新增 `TODO(master)` 计数、`migrations/` 文件名、下一步与重叠修改文件 |
 | `result [<run>] [--path]` | 输出完整答复 |
 | `stop <run>...` | 终止任务及其 scope、进程组 |
 | `clean <run>...\|--finished [--force]` | 删除已结束的任务；`--finished` 默认保留结果未读取的 |

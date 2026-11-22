@@ -526,6 +526,9 @@ pub fn status(run: &Path) -> Value {
     if meta["worktree"].is_object() {
         out["worktree"] = json!(s(&meta["worktree"], "path"));
     }
+    if !s(&meta, "netBase").is_empty() {
+        out["netBase"] = meta["netBase"].clone();
+    }
     if let Some(bytes) = meta["worktreeBytes"].as_u64() {
         out["worktreeBytes"] = json!(bytes);
     }

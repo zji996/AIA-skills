@@ -2145,8 +2145,21 @@ pub fn launch(
     meta["allow"] = json!(o.allow);
     meta["shell"] = json!(o.shell);
     if meta["worktree"].is_object() {
-        meta["sourceStatusBaseline"] =
-            crate::source_watch::baseline(Path::new(s(&meta["worktree"], "source")))?;
+        let source = PathBuf::from(s(&meta["worktree"], "source"));
+        meta["sourceStatusBaseline"] = crate::source_watch::baseline(&source)?;
+        if !b(extra, "newAfterApply") && parent.is_object() && !s(parent, "netBase").is_empty() {
+            meta["netBase"] = parent["netBase"].clone();
+            if b(parent, "netBaseRebased") {
+                meta["netBaseRebased"] = json!(true);
+                if !s(parent, "netBaseTree").is_empty() {
+                    meta["netBaseTree"] = parent["netBaseTree"].clone();
+                }
+            }
+        } else if let Ok(head) = git_text(&source, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]) {
+            if !head.is_empty() {
+                meta["netBase"] = json!(head);
+            }
+        }
     }
     meta["agentBin"] = json!(agent_bin);
     meta["configSources"] = extra.get("configSources").cloned().unwrap_or(json!([]));

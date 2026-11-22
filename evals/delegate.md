@@ -189,6 +189,13 @@
 - 远程冷编译验收需要 40 分钟：`.delegate.json` 配 `"acceptTimeout": "40m"`，启动在「生效默认值及来源」回显来源 `repo`，`reply` 继承、`--accept-timeout` 覆盖。Repo-level acceptance timeout with CLI > repo > default precedence.
 - 同事在 worktree 里只跑验收（工作树零改动），主控同时改源仓库文件：不判 `sourceWriteViolation`、正常验收交付，只报 `sourceWorkspaceChanges`；同事通过 `write`/`edit` 或 bash 绝对路径写了源文件时仍拒收，非 worktree 与 `node_modules` 软链检查不变。Worktree outside-write requires tool-call attribution to the colleague.
 
+## 6.24 上下文瘦身、净基准与交接
+
+- 多路未合入任务跑 `delegate status`：每 run 一行只留计数，`commitsDiffer`/保护提示/源改动路径清单移到 `status <run>` 详情，`--json` 默认不内联 `files`（加 `--files` 才带）。Compact one-line status and opt-in JSON files array.
+- 同事在 worktree 里 rebase 或 merge 了改过保护路径的新主干：收尾不报 `protectViolation`，`changes`/`pendingChanges`/`changes.patch`/`diff`/`apply` 均按 merge-base（`meta.netBase`）只算同事自己的净改动。Net diff after rebase or merge avoids false protectViolation.
+- 主控准备 `/clear`：`delegate handoff` 写出 `.local/run/delegate/HANDOFF.md` 并打印路径，列出未清理未合入任务的 `netBase`、净改动、`TODO(master)` 新增计数、`migrations/` 文件、下一步与重叠修改路径。One-page Markdown handoff for resuming after `/clear`.
+- 主控前台执行 `until [ -f .local/run/delegate/.../exit_code ]; do sleep 5; done` 或 `while $D status …; do sleep …; done`：Claude Code hook 拒绝并提示改用后台 `delegate wait --any`，普通有限重试放行。Block foreground delegate polling loops while allowing bounded retries.
+
 ## 6.22 去串联与日常摩擦
 
 - 去掉 `--after`：主控手动 `wait` 把关后再派下一步，`start --after` 退出 2，`--in RUN` 只读审已完成快照保留；6.21.x 遗留等待任务在 `status`/`wait` 标「需要重派」并给原样重派命令。Remove `--after` chaining and surface legacy waiting runs as needs-redispatch.

@@ -330,10 +330,7 @@ pub fn human(run: &Path, status: &Value) -> String {
     }
     let uncommitted = strings(&status["commitsDiffer"]);
     if !uncommitted.is_empty() {
-        parts.push(format!(
-            "commits differ from the final tree: {}",
-            uncommitted.join(", ")
-        ));
+        parts.push(format!("commits differ {} 个文件", uncommitted.len()));
     }
     if !s(status, "archive").is_empty() {
         parts.push(format!("archive: {}", s(status, "archive")));
@@ -427,7 +424,17 @@ pub fn human(run: &Path, status: &Value) -> String {
             .into(),
         );
     }
-    if !status["protectViolation"].is_null() {
+    if let Some(paths) = status["protectViolation"]
+        .as_array()
+        .filter(|p| !p.is_empty())
+    {
+        let label = if s(status, "error").contains("generated output") {
+            "生成物被手改"
+        } else {
+            "触及保护路径"
+        };
+        parts.push(format!("{label} {} 个", paths.len()));
+    } else if !status["protectViolation"].is_null() {
         parts.push(
             if s(status, "error").contains("generated output") {
                 "生成物被手改"
@@ -441,20 +448,7 @@ pub fn human(run: &Path, status: &Value) -> String {
         .as_array()
         .filter(|p| !p.is_empty())
     {
-        let list = paths
-            .iter()
-            .take(5)
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>()
-            .join("、");
-        let flags = paths
-            .iter()
-            .take(5)
-            .filter_map(Value::as_str)
-            .map(|p| format!("--allow {}", shell_quote(p)))
-            .collect::<Vec<_>>()
-            .join(" ");
-        parts.push(format!("正文提及保护路径：{list}（如需修改：{flags}）"));
+        parts.push(format!("正文提及保护路径 {} 处", paths.len()));
     }
     if !status["readOnlyViolation"].is_null() || !status["workspaceChanged"].is_null() {
         parts.push(
@@ -474,16 +468,7 @@ pub fn human(run: &Path, status: &Value) -> String {
             continue;
         }
         if let Some(paths) = status[key].as_array().filter(|p| !p.is_empty()) {
-            parts.push(format!(
-                "{label}：{} 个文件（{}）",
-                paths.len(),
-                paths
-                    .iter()
-                    .take(5)
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+            parts.push(format!("{label}：{} 个文件", paths.len()));
         }
     }
     if n(status, "denied") > 0 {
@@ -500,9 +485,11 @@ pub fn human(run: &Path, status: &Value) -> String {
     if !occupied.is_empty() {
         parts.push(format!("占用 {}", occupied.join("、")));
     }
-    let blind = blind_note(&status["acceptBlind"]);
-    if !blind.is_empty() {
-        parts.push(blind);
+    if let Some(blind) = status["acceptBlind"]
+        .as_array()
+        .filter(|items| !items.is_empty())
+    {
+        parts.push(format!("验收未覆盖 {} 个文件", blind.len()));
     }
     if let Some(missing) = status["missingObjects"]
         .as_array()
@@ -565,6 +552,96 @@ pub fn human(run: &Path, status: &Value) -> String {
         parts.push(format!("下一步：{next}"));
     }
     parts.join(" · ")
+}
+
+fn format_path_list(paths: &[String], limit: usize, summary_path: &Path) -> String {
+    let shown = paths
+        .iter()
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if paths.len() > limit {
+        format!(
+            "{shown} … 共 {} 个（完整见 {}）",
+            paths.len(),
+            summary_path.display()
+        )
+    } else {
+        shown
+    }
+}
+
+/// Concise summary line followed by indented path details for `delegate status <run>`.
+pub fn human_detail(run: &Path, status: &Value) -> String {
+    let mut lines = vec![human(run, status)];
+    let summary_path = run.join("summary.json");
+    let meta = json(run.join("meta.json"));
+    if b(&meta, "netBaseRebased") && !s(&meta, "netBase").is_empty() {
+        let sha = s(&meta, "netBase");
+        lines.push(format!("  netBase: {}", &sha[..sha.len().min(7)]));
+    }
+    let uncommitted = strings(&status["commitsDiffer"]);
+    if !uncommitted.is_empty() {
+        lines.push(format!(
+            "  commits differ from the final tree: {}",
+            format_path_list(&uncommitted, 20, &summary_path)
+        ));
+    }
+    let violated = strings(&status["protectViolation"]);
+    if !violated.is_empty() {
+        let label = if s(status, "error").contains("generated output") {
+            "生成物被手改"
+        } else {
+            "触及保护路径"
+        };
+        lines.push(format!(
+            "  {label}：{}",
+            format_path_list(&violated, 20, &summary_path)
+        ));
+    }
+    let prompt_protected = strings(&status["promptProtectedPaths"]);
+    if !prompt_protected.is_empty() {
+        let list = prompt_protected
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("、");
+        let flags = prompt_protected
+            .iter()
+            .take(10)
+            .map(|p| format!("--allow {}", shell_quote(p)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let more = if prompt_protected.len() > 10 {
+            format!(" 等共 {} 处", prompt_protected.len())
+        } else {
+            String::new()
+        };
+        lines.push(format!("  正文提及保护路径：{list}{more}（如需修改：{flags}）"));
+    }
+    for (key, label) in [
+        ("sourceWriteViolation", "写到了源仓库"),
+        ("sourceWorkspaceChanges", "源仓库工作区有新改动"),
+    ] {
+        if key == "sourceWorkspaceChanges" && !status["sourceWriteViolation"].is_null() {
+            continue;
+        }
+        let paths = strings(&status[key]);
+        if !paths.is_empty() {
+            lines.push(format!(
+                "  {label}：{} 个文件（{}）",
+                paths.len(),
+                format_path_list(&paths, 20, &summary_path)
+            ));
+        }
+    }
+    let blind = blind_note(&status["acceptBlind"]);
+    if !blind.is_empty() {
+        lines.push(format!("  {blind}"));
+    }
+    lines.join("\n")
 }
 
 /// `pi/<tier>` for a tier's pick; `pi/<model>` for a pinned model, which no tier chose.

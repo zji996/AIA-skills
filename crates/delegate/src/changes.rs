@@ -377,12 +377,154 @@ pub fn tree_changes(top: &Path, before: &Value, after: &Value, worktree: bool) -
     changes.sort_by(|a, b| s(a, "path").cmp(s(b, "path")));
     Ok(changes)
 }
-pub fn record(meta: &Value, run: &Path) -> Option<(Vec<Value>, Value)> {
-    let base = meta.get("base")?;
+pub struct NetBase {
+    pub commit: String,
+    pub tree: String,
+    pub rebased: bool,
+}
+
+pub fn worktree_base_commit(run: &Path, meta: &Value) -> Option<String> {
+    let direct = read(run.join("worktree-base-commit")).trim().to_string();
+    if !direct.is_empty() {
+        return Some(direct);
+    }
+    let wt_path = s(&meta["worktree"], "path");
+    if wt_path.is_empty() {
+        return None;
+    }
+    let mut parent = s(meta, "parent").to_string();
+    let mut visited = BTreeSet::new();
+    while !parent.is_empty() && visited.insert(parent.clone()) {
+        let Some(parent_dir) = run.parent().map(|p| p.join(&parent)) else {
+            break;
+        };
+        let parent_meta = json(parent_dir.join("meta.json"));
+        if s(&parent_meta["worktree"], "path") != wt_path {
+            break;
+        }
+        let commit = read(parent_dir.join("worktree-base-commit"))
+            .trim()
+            .to_string();
+        if !commit.is_empty() {
+            return Some(commit);
+        }
+        parent = s(&parent_meta, "parent").to_string();
+    }
+    None
+}
+
+fn default_branch_commits(source: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let push = |out: &mut Vec<String>, rev: &str| {
+        if let Ok(sha) = git_text(source, &["rev-parse", "-q", "--verify", &format!("{rev}^{{commit}}")]) {
+            if !sha.is_empty() && !out.contains(&sha) {
+                out.push(sha);
+            }
+        }
+    };
+    if let Ok(sym) = git_text(source, &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"]) {
+        if let Some(branch) = sym.strip_prefix("refs/remotes/origin/") {
+            push(&mut out, &format!("refs/heads/{branch}"));
+            push(&mut out, &format!("refs/remotes/origin/{branch}"));
+        }
+    }
+    if out.is_empty() {
+        for branch in ["main", "master"] {
+            push(&mut out, &format!("refs/heads/{branch}"));
+            push(&mut out, &format!("refs/remotes/origin/{branch}"));
+            if !out.is_empty() {
+                break;
+            }
+        }
+    }
+    push(&mut out, "HEAD");
+    out
+}
+
+fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
+    git_command()
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+pub fn resolve_net_base(run: &Path, meta: &Value) -> Option<NetBase> {
+    if !meta["worktree"].is_object() {
+        return None;
+    }
+    let wt = Path::new(s(&meta["worktree"], "path"));
+    let source = Path::new(s(&meta["worktree"], "source"));
+    if !wt.is_dir() || !source.is_dir() {
+        return None;
+    }
+    let wt_head = git_text(wt, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]).ok()?;
+    if wt_head.is_empty() {
+        return None;
+    }
+    let mut best: Option<String> = None;
+    for candidate in default_branch_commits(source) {
+        let Ok(mb) = git_text(wt, &["merge-base", &wt_head, &candidate]) else {
+            continue;
+        };
+        if mb.is_empty() {
+            continue;
+        }
+        match &best {
+            None => best = Some(mb),
+            Some(current) if *current != mb && is_ancestor(wt, current, &mb) => {
+                best = Some(mb);
+            }
+            _ => {}
+        }
+    }
+    let commit = best?;
+    let tree = git_text(
+        wt,
+        &["rev-parse", "-q", "--verify", &format!("{commit}^{{tree}}")],
+    )
+    .ok()?;
+    if tree.is_empty() {
+        return None;
+    }
+    let rebased = worktree_base_commit(run, meta).is_some_and(|c0| {
+        git_text(wt, &["cat-file", "-t", &c0]).ok().as_deref() == Some("commit")
+            && !is_ancestor(wt, &commit, &c0)
+    });
+    Some(NetBase {
+        commit,
+        tree,
+        rebased,
+    })
+}
+
+pub fn net_base_tree(top: &Path, meta: &Value) -> Option<String> {
+    if !b(meta, "netBaseRebased") {
+        return None;
+    }
+    let commit = s(meta, "netBase");
+    if !commit.is_empty() && top.is_dir() {
+        if let Ok(tree) = git_text(
+            top,
+            &["rev-parse", "-q", "--verify", &format!("{commit}^{{tree}}")],
+        ) {
+            if !tree.is_empty() {
+                return Some(tree);
+            }
+        }
+    }
+    let cached = s(meta, "netBaseTree");
+    (!cached.is_empty()).then(|| cached.to_string())
+}
+
+pub fn record(meta: &mut Value, run: &Path) -> Option<(Vec<Value>, Value)> {
+    let base = meta.get("base")?.clone();
     if base.is_null() {
         return None;
     }
-    let top = Path::new(s(meta, "top"));
+    let top = PathBuf::from(s(meta, "top"));
     let excludes = meta["snapshotExclude"]
         .as_array()
         .map(|v| {
@@ -392,18 +534,62 @@ pub fn record(meta: &Value, run: &Path) -> Option<(Vec<Value>, Value)> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let after = snapshot(top, run, &excludes)?;
-    let changes = tree_changes(top, base, &after, meta["worktree"].is_object()).ok()?;
-    let recorded = json!({"base":s(base,"tree"),"after":s(&after,"tree"),"top":top,"afterLarge":after["large"],"changes":changes});
+    let after = snapshot(&top, run, &excludes)?;
+    let nb = resolve_net_base(run, meta);
+    let mut effective_base = base.clone();
+    if let Some(nb) = &nb {
+        let parent_meta = (!s(meta, "parent").is_empty())
+            .then(|| run.parent().map(|p| json(p.join(s(meta, "parent")).join("meta.json"))))
+            .flatten();
+        let prev_commit = parent_meta
+            .as_ref()
+            .map(|p| s(p, "netBase").to_string())
+            .unwrap_or_default();
+        let prev_rebased = parent_meta
+            .as_ref()
+            .is_some_and(|p| b(p, "netBaseRebased"));
+        let advanced = nb.rebased && (!prev_rebased || prev_commit != nb.commit);
+        let mut meta_changed = false;
+        if s(meta, "netBase") != nb.commit {
+            meta["netBase"] = json!(nb.commit);
+            meta_changed = true;
+        }
+        if nb.rebased {
+            if s(meta, "netBaseTree") != nb.tree {
+                meta["netBaseTree"] = json!(nb.tree);
+                meta_changed = true;
+            }
+            if !b(meta, "netBaseRebased") {
+                meta["netBaseRebased"] = json!(true);
+                meta_changed = true;
+            }
+            if advanced && !b(meta, "netBaseAdvanced") {
+                meta["netBaseAdvanced"] = json!(true);
+                meta_changed = true;
+            }
+        }
+        if meta_changed {
+            let _ = write_json(run.join("meta.json"), meta);
+        }
+        crate::refs::pin_slot(run, meta, "net-base", &nb.commit);
+        if advanced {
+            effective_base = json!({"tree": nb.tree, "large": {}, "submodules": {}});
+        }
+    }
+    let changes = tree_changes(&top, &effective_base, &after, meta["worktree"].is_object()).ok()?;
+    let mut recorded = json!({"base":s(&effective_base,"tree"),"after":s(&after,"tree"),"top":top,"afterLarge":after["large"],"changes":changes});
+    if !s(meta, "netBase").is_empty() {
+        recorded["netBase"] = meta["netBase"].clone();
+    }
     write_json(run.join("changes.json"), &recorded).ok()?;
     crate::refs::pin_slot(run, meta, "after", s(&after, "tree"));
     let patch = git(
-        top,
+        &top,
         &[
             "diff",
             "--binary",
             "--no-renames",
-            s(base, "tree"),
+            s(&effective_base, "tree"),
             s(&after, "tree"),
         ],
     )

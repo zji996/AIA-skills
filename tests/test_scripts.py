@@ -741,6 +741,59 @@ class ScriptTests(unittest.TestCase):
         for cmd in ("git prune", "git gc --prune=now", "git repack -a -d"):
             self.assertEqual(run_hook(cmd, repo_plain)[0], "allow", cmd)
 
+    def test_background_hook_denies_foreground_delegate_polling_and_allows_bounded_retries(self):
+        def run_hook(command, background=False):
+            payload = json.dumps({
+                "tool_name": "Bash",
+                "tool_input": {"command": command, "run_in_background": background},
+            })
+            result = subprocess.run(
+                [sys.executable, str(BACKGROUND_HOOK)],
+                input=payload, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if not result.stdout:
+                return "allow", ""
+            out = json.loads(result.stdout)["hookSpecificOutput"]
+            return out["permissionDecision"], out["permissionDecisionReason"]
+
+        d = "$" + "D"
+        deny_cmds = [
+            "until [ -f .local/run/delegate/20261122-112300-task/exit_code ]; do sleep 5; done",
+            "while [ ! -s .local/run/delegate/r1/result.md ]; do sleep 10; done",
+            f"while {d} status | grep -q 运行中; do sleep 5; done",
+            "until ~/.claude/skills/delegate/bin/delegate status r1 | grep -q delivered; do sleep 5; done",
+            "while delegate status r1 | grep -q running; do sleep 3; done",
+            f"while sleep 5; do {d} status | grep -q running || break; done",
+            "RUN=.local/run/delegate/r1; until [ -f \"$RUN/exit_code\" ]; do sleep 5; done",
+            "until [ -f \"$DELEGATE_RUNS/r1/summary.json\" ]; do sleep 5; done",
+            "while [ ! -f /tmp/runs/20261122-112300-job/exit_code ]; do sleep 2; done",
+            "bash -c 'until [ -f .local/run/delegate/r1/exit_code ]; do sleep 5; done'",
+        ]
+        allow_cmds = [
+            # Ordinary bounded retries are allowed.
+            f"i=0; while [ $i -lt 5 ]; do {d} status | grep -q delivered && break; i=$((i+1)); sleep 1; done",
+            "n=0; while ((n < 3)); do delegate status r1 && break; ((n++)); sleep 1; done",
+            f"for i in 1 2 3; do {d} status; sleep 1; done",
+            "for i in $(seq 1 5); do [ -f .local/run/delegate/r1/exit_code ] && break; sleep 1; done",
+            # Non-delegate loops are allowed.
+            "until curl -sf http://127.0.0.1:8080/health; do sleep 1; done",
+            "while ! pg_isready -q; do sleep 1; done",
+            "while [ -f /tmp/build.lock ]; do sleep 2; done",
+            # No sleep / not a real loop command.
+            "while [ -f .local/run/delegate/r1/exit_code ]; do cat .local/run/delegate/r1/result.md; break; done",
+            'git commit -m "until [ -f .local/run/delegate/r1/exit_code ]; do sleep 5; done"',
+            "cat > note.sh <<'EOF'\nuntil [ -f .local/run/delegate/r1/exit_code ]; do sleep 5; done\nEOF",
+        ]
+        for cmd in deny_cmds:
+            dec, reason = run_hook(cmd, background=False)
+            self.assertEqual(dec, "deny", cmd)
+            self.assertIn("delegate wait --any", reason)
+            # Same command in background is not blocked by the foreground polling rule.
+            self.assertEqual(run_hook(cmd, background=True)[0], "allow", f"bg: {cmd}")
+        for cmd in allow_cmds:
+            self.assertEqual(run_hook(cmd, background=False)[0], "allow", cmd)
+
     def test_audit_exact_budget_overrides_a_glob_written_after_it(self):
         repo = self.git_repo()
         (repo / "AGENTS.md").write_text("ok")

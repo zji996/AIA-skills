@@ -134,8 +134,7 @@ class Delegate622Tests(unittest.TestCase):
         self.assertIn("--allow apps/web/App.tsx", status_human)
         waited = self.cli("wait", run["run"], human=True)
         self.assertEqual(waited.returncode, 0, waited.stderr)
-        self.assertIn("正文提及保护路径：apps/web/App.tsx", waited.stdout)
-        self.assertIn("--allow apps/web/App.tsx", waited.stdout)
+        self.assertIn("正文提及保护路径 1 处", waited.stdout)
         # Read-only tasks do not emit the protected-path edit hint.
         ro = self.cli("start", "--read-only", "--workdir", repo, "read apps/web/App.tsx")
         self.assertEqual(ro.returncode, 0, ro.stderr)

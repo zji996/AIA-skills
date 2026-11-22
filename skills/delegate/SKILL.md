@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI（pi-kit 的 rpi 通道下 `pi` 即 rpi）。
 metadata:
-  version: "6.23.0"
+  version: "6.24.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -34,7 +34,8 @@ $D wait                                                                  # 放�
 | 审某个已完成任务的工作树 | `$D start --read-only --in <name> "…"`；先 `wait` 确认上游结果再派下一步 |
 | 自己跑重检查、测性能 | `$D lane make check`；测量用 `lane --measure` |
 | 节点不稳、换档前先测连通 | `$D probe`：走 Pi 本身（不是裸 HTTP）测各档模型，不建任务、不占名额 |
-| 看全文 / 改动 / 停掉 / 清理 | `$D result` / `$D diff` / `$D stop` / `$D clean --finished`；`status` 默认只列眼前任务，全量加 `--all` |
+| 看全文 / 改动 / 停掉 / 清理 | `$D result` / `$D diff` / `$D stop` / `$D clean --finished`；`status` 默认一行只留计数（路径详情看 `status <run>`，`--json` 加 `--files` 才带文件数组，全量加 `--all`） |
+| `/clear` 前交接未合入任务 | `$D handoff`：写出 `.local/run/delegate/HANDOFF.md` 一页索引（状态、netBase、净改动、`TODO(master)`、迁移与重叠文件） |
 
 重编译可用用户配置 remote 转到 SSH 构建机、独立排队且传回改动；`DELEGATE_REMOTE=0` 随 reply 继承、显式环境变量可覆盖，见 [配置](references/configuration.md) 与 [运行](references/runtime.md)。
 
@@ -69,7 +70,7 @@ $D wait                                                                  # 放�
 - 已交付表示验收通过，改法仍要看 diff；已答复没有验收，关键结论自己核实。
 - 状态为「提问」时保留未执行 lane 作业的原排队时间（不抢占运行者）；同事等你决定：`$D reply <name> "<决定>"` 回答，不算返工；只有改过文件后再要求改才算。`wait --any` 每次列出上次 wait 之后所有终态与提问态 run（首个给全文，其余一行摘要加查看命令）。
 - 验收未执行不算执行失败：按提示重排或本地跑。
-- 同一仓库的写入一次 `apply A B …` 按序合入，成功后默认归档并清理 worktree（`worktree.cleanOnApply`，续做链等整条链合入后再清）；验收没法沿用的任务在合并后的主干重跑一次各自的验收，全量检查仍由你按批跑。
+- 同一仓库的写入一次 `apply A B …` 按序合入，成功后默认归档并清理 worktree（`worktree.cleanOnApply`，续做链等整条链合入后再清）；同事在 worktree 里 rebase/merge 源主干后，改动、保护检查、`diff`/`apply` 均按 merge-base（`meta.netBase`）算净改动。验收没法沿用的任务在合并后的主干重跑一次各自的验收，全量检查仍由你按批跑。
 - 每个 run 依赖的快照对象钉在源仓库 `refs/delegate/<run-id>/*` 下（`clean` 时一并移除，仅 `cleanOnApply` 删 worktree 时保留），普通 `git gc` 安全；切勿在有 delegate 记录的仓库执行 `git prune`、`git gc --prune=now|all` 等立即删不可达对象的命令（若 git 提示 `run 'git prune'`，删除 `.git/gc.log` 即可）。旧 run 对象已丢时，`status`/`diff` 会提示并给出 `git -C <worktree> diff HEAD`（未跟踪文件先 `add -N`）救回命令。
 
 状态、退出码与等待细节见 [references/reading-results.md](references/reading-results.md)；续接、并行与长时间推进见 [references/practice.md](references/practice.md)、[references/long-run.md](references/long-run.md)；run 目录见 [references/output-and-files.md](references/output-and-files.md)。

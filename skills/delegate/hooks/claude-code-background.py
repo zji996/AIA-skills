@@ -42,6 +42,17 @@ PRUNE_REASON = (
     "`{call}` immediately deletes unreachable Git objects that uncleaned delegate runs depend on "
     "(needed by diff/apply); pinned refs under `refs/delegate/` make plain `git gc` safe, and "
     "to clear git's `run 'git prune'` notice you can just remove `.git/gc.log` instead.")
+POLL_REASON = (
+    "不要在前台用 while/until + sleep 轮询 delegate 输出或 run 目录；请改用 "
+    "`delegate wait --any` 配合 Bash 工具的 `run_in_background: true` 放后台等完成通知。"
+    " Do not poll delegate output or run directories in a foreground while/until sleep loop; "
+    "run `delegate wait --any` with `run_in_background: true` to be notified on completion.")
+DELEGATE_RUN_ARTIFACTS = (
+    "exit_code", "result.md", "summary.json", "events.jsonl",
+    "meta.json", "changes.json", ".waiting", ".delivered", "accept.log",
+)
+RUN_ID_RE = re.compile(r"(?:^|/)20\d{6}-\d{6}-")
+VAR_REF_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
 GIT_GLOBAL_ARG_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace",
                        "--super-prefix", "--exec-path", "--config-env", "--list-cmds"}
 REPACK_ARG_OPTS = {"--window", "--window-memory", "--depth", "--threads", "--max-pack-size",
@@ -476,6 +487,140 @@ def dangerous_git_prune(command: str, base_cwd: str) -> str | None:
     return None
 
 
+def _is_separator_end(token: str) -> bool:
+    return token in COMMAND_START or token.endswith("$(") or token.endswith(";")
+
+
+def _token_at_start(tokens: list[str], i: int) -> bool:
+    j = i - 1
+    while j >= 0 and (tokens[j] == "env" or ASSIGNMENT.fullmatch(tokens[j])):
+        j -= 1
+    return j < 0 or _is_separator_end(tokens[j])
+
+
+def _is_bounded_retry_loop(loop_tokens: list[str]) -> bool:
+    """True when a while/until loop has both a counter update and a numeric bound."""
+    has_bound = any(tok in {"-lt", "-le", "-gt", "-ge"} for tok in loop_tokens)
+    has_update = False
+    in_arith = False
+    for idx, tok in enumerate(loop_tokens):
+        if tok in ("((", "$((") or tok.endswith("(("):
+            in_arith = True
+            continue
+        if in_arith:
+            if any(op in tok for op in ("<", ">", "<=", ">=")):
+                has_bound = True
+            if any(op in tok for op in ("++", "--", "+=", "-=", "+", "-")):
+                has_update = True
+            if tok.startswith("))") or "))" in tok:
+                in_arith = False
+            continue
+        if tok.rsplit("/", 1)[-1] in ("let", "expr") and _token_at_start(loop_tokens, idx):
+            has_update = True
+        if any(op in tok for op in ("++", "--", "+=", "-=")):
+            has_update = True
+        if tok.endswith("=$") and idx + 1 < len(loop_tokens) and loop_tokens[idx + 1] == "((":
+            has_update = True
+    return has_bound and has_update
+
+
+def _targets_delegate(loop_tokens: list[str], env_vars: dict[str, str]) -> bool:
+    """True when the loop inspects delegate output or a delegate run directory."""
+    expanded = list(loop_tokens)
+    for tok in loop_tokens:
+        for var in VAR_REF_RE.findall(tok):
+            if var in env_vars:
+                expanded.append(env_vars[var])
+    for idx, tok in enumerate(loop_tokens):
+        if _token_at_start(loop_tokens, idx) and (
+            re.fullmatch(INVOKE, tok) or tok == "delegate"
+        ):
+            return True
+    has_run_id = False
+    has_delegate_word = False
+    has_artifact = False
+    for tok in expanded:
+        if any(marker in tok for marker in (
+            ".local/run/delegate",
+            ".local/run/pi",
+            "DELEGATE_RUNS",
+            ".cache/delegate",
+            "supervisor.lock",
+            "HANDOFF.md",
+            "/delegate/",
+        )):
+            return True
+        if RUN_ID_RE.search(tok):
+            has_run_id = True
+        if "delegate" in tok.lower():
+            has_delegate_word = True
+        if any(tok == art or tok.endswith("/" + art) or art in tok for art in DELEGATE_RUN_ARTIFACTS):
+            has_artifact = True
+    return has_artifact and (has_run_id or has_delegate_word)
+
+
+def foreground_delegate_poll(command: str) -> str | None:
+    """Return the first foreground while/until + sleep loop polling delegate output or run dirs."""
+    try:
+        lexer = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    env_vars: dict[str, str] = {}
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if _token_at_start(tokens, i) and ASSIGNMENT.fullmatch(tok):
+            k, v = tok.split("=", 1)
+            env_vars[k] = v
+            i += 1
+            continue
+        if _token_at_start(tokens, i) and tok.rsplit("/", 1)[-1] in ("sh", "bash"):
+            j = i + 1
+            while j < len(tokens) and tokens[j] not in SEPARATORS:
+                if tokens[j] in ("-c", "-lc", "-ec", "-xc") and j + 1 < len(tokens):
+                    nested = foreground_delegate_poll(tokens[j + 1])
+                    if nested:
+                        return nested
+                    break
+                j += 1
+            i += 1
+            continue
+        if tok in ("while", "until") and _token_at_start(tokens, i):
+            depth = 1
+            do_idx = None
+            done_idx = None
+            j = i + 1
+            while j < len(tokens):
+                t = tokens[j]
+                if t in ("while", "until", "for", "select") and _token_at_start(tokens, j):
+                    depth += 1
+                elif t == "do" and depth == 1 and do_idx is None and _token_at_start(tokens, j):
+                    do_idx = j
+                elif t == "done" and _token_at_start(tokens, j):
+                    depth -= 1
+                    if depth == 0:
+                        done_idx = j
+                        break
+                j += 1
+            if do_idx is not None and done_idx is not None:
+                loop_tokens = tokens[i:done_idx + 1]
+                inner_tokens = tokens[i + 1:done_idx]
+                has_sleep = any(
+                    bt.rsplit("/", 1)[-1] == "sleep" and _token_at_start(inner_tokens, k)
+                    for k, bt in enumerate(inner_tokens)
+                )
+                if (
+                    has_sleep
+                    and not _is_bounded_retry_loop(loop_tokens)
+                    and _targets_delegate(loop_tokens, env_vars)
+                ):
+                    return " ".join(loop_tokens[:12])
+        i += 1
+    return None
+
+
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
@@ -493,6 +638,9 @@ def main() -> int:
         return deny(PRUNE_REASON.format(call=prune_call))
     if tool_input.get("run_in_background"):
         return 0
+    poll_call = foreground_delegate_poll(command)
+    if poll_call:
+        return deny(POLL_REASON)
     calls, mixed = blocking_calls(command)
     if not calls:
         return 0

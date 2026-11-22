@@ -555,6 +555,25 @@ struct Action {
     mode: Option<String>,
     content: Vec<u8>,
 }
+pub fn effective_total_base(top: &Path, meta: &Value) -> (String, &'static str) {
+    if let Some(tree) = crate::changes::net_base_tree(top, meta) {
+        return (tree, "net-base");
+    }
+    (s(meta, "chainBase").to_string(), "chain-base")
+}
+
+fn net_base_state(meta: &Value) -> Option<Value> {
+    let top_str = Some(s(&meta["worktree"], "path"))
+        .filter(|p| !p.is_empty() && Path::new(p).is_dir())
+        .or_else(|| {
+            Some(s(&meta["worktree"], "source"))
+                .filter(|p| !p.is_empty() && Path::new(p).is_dir())
+        })
+        .unwrap_or_else(|| s(meta, "top"));
+    crate::changes::net_base_tree(Path::new(top_str), meta)
+        .map(|tree| json!({"tree": tree, "large": {}}))
+}
+
 fn applied_state(run: &Path, meta: &Value) -> Value {
     let state = json(run.join(".sync-base"));
     if !s(&state, "tree").is_empty() {
@@ -564,8 +583,14 @@ fn applied_state(run: &Path, meta: &Value) -> Value {
     if !s(&state, "tree").is_empty() {
         return state;
     }
+    if b(meta, "netBaseAdvanced") {
+        if let Some(state) = net_base_state(meta) {
+            return state;
+        }
+    }
     let mut parent = s(meta, "parent").to_string();
-    while !parent.is_empty() {
+    let mut visited = std::collections::BTreeSet::new();
+    while !parent.is_empty() && visited.insert(parent.clone()) {
         let path = run.parent().unwrap_or(Path::new("/")).join(&parent);
         let state = json(path.join(".sync-base"));
         if !s(&state, "tree").is_empty() {
@@ -575,21 +600,41 @@ fn applied_state(run: &Path, meta: &Value) -> Value {
         if !s(&state, "tree").is_empty() {
             return state;
         }
-        parent = s(&json(path.join("meta.json")), "parent").to_string();
+        let parent_meta = json(path.join("meta.json"));
+        if b(&parent_meta, "netBaseAdvanced") {
+            if let Some(state) = net_base_state(&parent_meta) {
+                return state;
+            }
+        }
+        parent = s(&parent_meta, "parent").to_string();
     }
-    meta["appliedBase"].clone()
+    if !s(&meta["appliedBase"], "tree").is_empty() {
+        return meta["appliedBase"].clone();
+    }
+    if let Some(state) = net_base_state(meta) {
+        return state;
+    }
+    Value::Null
 }
+
+pub fn effective_chain_base(run: &Path, meta: &Value, top: &Path) -> Value {
+    let base = applied_state(run, meta);
+    if !s(&base, "tree").is_empty() {
+        return base;
+    }
+    let (tree, _) = effective_total_base(top, meta);
+    json!({"tree": tree, "large": {}})
+}
+
 pub fn pending_changes(run: &Path, meta: &Value) -> Option<Value> {
     if !meta["worktree"].is_object() || s(meta, "mode") != "write" {
         return None;
     }
     let rec = json(run.join("changes.json"));
-    let mut base = applied_state(run, meta);
-    if s(&base, "tree").is_empty() {
-        base = json!({"tree":s(meta,"chainBase"),"large":{}});
-    }
+    let top = Path::new(s(&rec, "top"));
+    let base = effective_chain_base(run, meta, top);
     let after = json!({"tree":rec["after"],"large":rec["afterLarge"]});
-    let changes = tree_changes(Path::new(s(&rec, "top")), &base, &after, true).ok()?;
+    let changes = tree_changes(top, &base, &after, true).ok()?;
     Some(
         json!({"files":changes.len(),"added":changes.iter().map(|c| n(c,"added")).sum::<i64>(),"deleted":changes.iter().map(|c| n(c,"deleted")).sum::<i64>()}),
     )
@@ -1152,16 +1197,17 @@ fn reject_existing_markers(run: &Path, meta: &Value, keep_commits: bool) -> Res<
     let (_, top, _, after) = chain_changes(run)?;
     let applied = applied_state(run, meta);
     let rec = json(run.join("changes.json"));
+    let (total_base, _) = effective_total_base(&top, meta);
     let before = if !keep_commits && !s(&applied, "tree").is_empty() {
-        s(&applied, "tree")
+        s(&applied, "tree").to_string()
     } else {
-        s(meta, "chainBase")
+        total_base.clone()
     };
     let missing = crate::refs::missing_in_top(
         &top,
         run,
         meta,
-        &[("base", before), ("after", &after)],
+        &[("base", &before), ("after", &after)],
     );
     if !missing.is_empty() {
         return Err(crate::refs::recovery_message(run, meta, &missing));
@@ -1176,7 +1222,7 @@ fn reject_existing_markers(run: &Path, meta: &Value, keep_commits: bool) -> Res<
         // Match apply_inner's repeated-apply drift check, but not unrelated earlier rounds.
         changes = tree_changes(
             &top,
-            &json!({"tree":meta["chainBase"]}),
+            &json!({"tree":total_base}),
             &json!({"tree":after}),
             false,
         )?;
@@ -1191,11 +1237,17 @@ fn reject_existing_markers(run: &Path, meta: &Value, keep_commits: bool) -> Res<
     }
     if keep_commits {
         let worktree = Path::new(s(&meta["worktree"], "path"));
-        let base = read(run.join("worktree-base-commit"));
-        let base = base.trim();
+        let (base_slot, base) = if b(meta, "netBaseRebased") && !s(meta, "netBase").is_empty() {
+            ("net-base", s(meta, "netBase").to_string())
+        } else {
+            (
+                "worktree-base",
+                crate::changes::worktree_base_commit(run, meta).unwrap_or_default(),
+            )
+        };
         if worktree.is_dir() && !base.is_empty() {
             let missing =
-                crate::refs::missing_in_top(worktree, run, meta, &[("worktree-base", base)]);
+                crate::refs::missing_in_top(worktree, run, meta, &[(base_slot, &base)]);
             if !missing.is_empty() {
                 return Err(crate::refs::recovery_message(run, meta, &missing));
             }
@@ -1257,21 +1309,21 @@ fn reject_existing_markers(run: &Path, meta: &Value, keep_commits: bool) -> Res<
     Ok(checked)
 }
 pub fn apply(run: &Path, merge: bool, dry: bool, keep_commits: bool) -> Res<ApplyOutcome> {
-    let meta = json(run.join("meta.json"));
+    let mut meta = json(run.join("meta.json"));
     if s(&meta, "mode") == "read-only" {
         return Err("read-only snapshot: nothing to apply / 只读任务禁止 apply".into());
     }
-    let source = Path::new(s(&meta["worktree"], "source"));
+    let source = PathBuf::from(s(&meta["worktree"], "source"));
     if !source.is_absolute() {
         return apply_checked(run, merge, dry, keep_commits, &[]);
     }
     if !dry {
         lane::install_signals();
     }
-    let _guard = crate::source_watch::guard(source, true)?;
+    let _guard = crate::source_watch::guard(&source, true)?;
     // Refresh the delivered diff before releasing its worktree (also captures later edits).
     if Path::new(s(&meta["worktree"], "path")).is_dir() {
-        crate::changes::record(&meta, run);
+        crate::changes::record(&mut meta, run);
     }
     let written_paths = reject_existing_markers(run, &meta, keep_commits)?;
     if !dry && run.join("changes.patch").is_file() {
@@ -1340,10 +1392,17 @@ fn apply_checked(
     let meta = json(run.join("meta.json"));
     let source = Path::new(s(&meta["worktree"], "source"));
     let worktree = Path::new(s(&meta["worktree"], "path"));
-    let base = read(run.join("worktree-base-commit")).trim().to_string();
+    let (base_slot, base) = if b(&meta, "netBaseRebased") && !s(&meta, "netBase").is_empty() {
+        ("net-base", s(&meta, "netBase").to_string())
+    } else {
+        (
+            "worktree-base",
+            crate::changes::worktree_base_commit(run, &meta).unwrap_or_default(),
+        )
+    };
     let commits = if !base.is_empty() && worktree.is_dir() {
         let missing =
-            crate::refs::missing_in_top(worktree, run, &meta, &[("worktree-base", &base)]);
+            crate::refs::missing_in_top(worktree, run, &meta, &[(base_slot, &base)]);
         if !missing.is_empty() {
             return Err(crate::refs::recovery_message(run, &meta, &missing));
         }
@@ -1828,11 +1887,12 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
         ));
     }
     let applied = applied_state(run, &meta);
-    let mut before = s(&applied, "tree");
-    if before.is_empty() {
-        before = s(&meta, "chainBase");
-    }
-    let mut before = before.to_string();
+    let (total_base, _) = effective_total_base(&top, &meta);
+    let mut before = if !s(&applied, "tree").is_empty() {
+        s(&applied, "tree").to_string()
+    } else {
+        total_base.clone()
+    };
     let source = PathBuf::from(s(&meta["worktree"], "source"));
     let (generated_paths, generate_command) = generated(&source)?;
     let append_only = append_only(&source)?;
@@ -1863,7 +1923,7 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
     )?;
     if changes.is_empty() && !s(&applied, "tree").is_empty() {
         // A repeated apply still detects drift in files merged in an earlier round.
-        before = s(&meta, "chainBase").to_string();
+        before = total_base.clone();
         changes = tree_changes(&top, &json!({"tree":before}), &json!({"tree":after}), false)?;
     }
     let mut actions = vec![];
@@ -1994,7 +2054,7 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
             {
                 conflicts.push(path.clone());
             } else if !s(&applied, "tree").is_empty()
-                && before != s(&meta, "chainBase")
+                && before != total_base
                 && applied["large"].get(path) == obj.get(path)
                 && applied["largeHashes"].get(path).and_then(Value::as_str)
                     == Some(file_hash(&origin)?.as_str())

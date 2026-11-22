@@ -88,9 +88,13 @@ const COMMANDS: &[(&str, &str)] = &[
     ("wait", "Wait for runs; print outcomes and answers."),
     (
         "status",
-        "Print one concise status line per run; --json keeps complete fields.",
+        "Print one concise status line per run (status <run> adds path details); --json omits files unless --files.",
     ),
     ("list", "Alias of status."),
+    (
+        "handoff",
+        "Write one-page Markdown handoff (.local/run/delegate/HANDOFF.md) for uncleaned, unmerged runs.",
+    ),
     ("result", "Print a run's full answer."),
     ("diff", "Show a run's changes as a git diff."),
     ("patch", "Print retained patch, optionally filtered by path."),
@@ -181,10 +185,14 @@ pub fn print(command: Option<&str>) -> bool {
             ("--until-all", "Wait until every selected run finishes before returning; Alias of --all for waiting semantics."),
             ("--stream", "Print one outcome line per run as each finishes (answers are read with wait <run>) and exit when none is left; without run arguments it also picks up runs this caller starts meanwhile. For hosts that turn each output line into a notification."),
         ]),
-        "status" | "list" => ("[--all] [--json] [runs ...]", "Print one concise status line per run. With no runs, shows active runs, runs finished within 24h and not cleaned, and runs started by this session; summarizes older uncleaned runs in one line.", &[
+        "status" | "list" => ("[--all] [--json] [--files] [runs ...]", "Print one concise status line per run (counts only for path lists). Passing run names appends indented path details. With no runs, shows active runs, runs finished within 24h and not cleaned, and runs started by this session; summarizes older uncleaned runs in one line.", &[
             ("runs", "Run ids or directories (default: active, uncleaned within 24h, and current session)."),
             ("--all", "List all runs regardless of age or cleanup state."),
-            ("--json", "Print the existing complete JSON status structure."),
+            ("--json", "Print JSON status without the files array (pass --files to include files)."),
+            ("--files", "With --json, include the full files array."),
+        ]),
+        "handoff" => ("[--out PATH]", "Write a one-page Markdown summary of uncleaned, unmerged runs (default: <runs>/HANDOFF.md) and print both the page and its path.", &[
+            ("-o, --out PATH", "Write the Markdown handoff to PATH instead of <runs>/HANDOFF.md."),
         ]),
         "result" => ("[--path] [run]", "Print a run's full answer.", &[
             ("run", "Run id or directory (default: last)."),

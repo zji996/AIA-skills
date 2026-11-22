@@ -7,6 +7,7 @@ mod common;
 mod config;
 mod deny;
 mod fit;
+mod handoff;
 mod help;
 mod lane;
 mod launch;
@@ -232,6 +233,7 @@ fn format_status(status: serde_json::Value) -> String {
         "parent",
         "redispatch",
         "worktree",
+        "netBase",
         "ageSeconds",
         "elapsedSeconds",
         "attempts",
@@ -1227,10 +1229,20 @@ fn diff(args: &[String]) -> Res<i32> {
     let (pos, flags, _) = parse_simple(options, &["--stat", "--total"], &[])?;
     let run = runs::resolve_head(pos.first().map(String::as_str).unwrap_or("last"))?;
     let (meta, top, mut before, after) = changes::chain_changes(&run)?;
-    if has(&flags, "--total") {
-        before = s(&meta, "chainBase").into();
-    }
-    let before_label = if has(&flags, "--total") { "chain-base" } else { "base" };
+    let before_label = if has(&flags, "--total") {
+        let (total_before, label) = worktree::effective_total_base(&top, &meta);
+        before = total_before;
+        label
+    } else if b(&meta, "netBaseAdvanced") {
+        if let Some(tree) = changes::net_base_tree(&top, &meta) {
+            before = tree;
+            "net-base"
+        } else {
+            "base"
+        }
+    } else {
+        "base"
+    };
     let missing = refs::missing_in_top(
         &top,
         &run,
@@ -1762,10 +1774,12 @@ fn main_inner(args: &[String]) -> Res<i32> {
             Ok(0)
         }
         "status" | "list" => {
-            let (pos, flags, _) = parse_simple(rest, &["--json", "--all"], &[])?;
+            let (pos, flags, _) = parse_simple(rest, &["--json", "--all", "--files"], &[])?;
             if has(&flags, "--json") {
                 output::enable_json();
             }
+            let include_files = has(&flags, "--files");
+            let detail = !pos.is_empty();
             let show_all = has(&flags, "--all") || !pos.is_empty();
             let all = if pos.is_empty() {
                 runs::all_runs()
@@ -1797,7 +1811,19 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 }
             }
             for run in shown {
-                println!("{}", status_line(&run));
+                let mut status = runs::status(&run);
+                if output::json_enabled() {
+                    if !include_files {
+                        if let Some(obj) = status.as_object_mut() {
+                            obj.remove("files");
+                        }
+                    }
+                    println!("{}", format_status(status));
+                } else if detail {
+                    println!("{}", output::human_detail(&run, &status));
+                } else {
+                    println!("{}", output::human(&run, &status));
+                }
             }
             if !older_uncleaned.is_empty() {
                 let active_paths: std::collections::BTreeSet<_> = all
@@ -1896,6 +1922,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "clean" => clean(rest),
         "tiers" => tiers(rest),
         "fit" => fit::command(rest),
+        "handoff" => handoff::command(rest),
         "probe" => probe::command(rest),
         "protocol" => {
             if let Some(arg) = rest.first() {

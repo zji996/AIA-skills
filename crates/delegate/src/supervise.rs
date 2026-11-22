@@ -305,7 +305,7 @@ fn compress_answer(
     (result.unwrap_or(answer), used_attempt)
 }
 fn settle(
-    meta: &Value,
+    meta: &mut Value,
     run: &Path,
     verdict: &str,
     setup_error: &Option<String>,
@@ -971,7 +971,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         );
     }
     let (mut state, mut sum, mut rec, mut changed) = settle(
-        &meta,
+        &mut meta,
         run,
         &verdict,
         &setup_error,
@@ -995,7 +995,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         (verdict, answer, attempts) =
             attempts_from(&meta, run, attempts + 1, holder.clone(), grace.clone());
         (state, sum, rec, changed) = settle(
-            &meta,
+            &mut meta,
             run,
             &verdict,
             &setup_error,
