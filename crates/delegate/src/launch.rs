@@ -2220,6 +2220,7 @@ pub fn launch(
         meta["rework"] = rework.clone();
     }
     write_json(run.join("meta.json"), &meta)?;
+    crate::notes::register_repo();
     crate::refs::pin_run(&run, &meta);
     if !extra["sync"].is_null() {
         write_json(run.join("sync.json"), &extra["sync"])?;

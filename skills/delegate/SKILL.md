@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI（pi-kit 的 rpi 通道下 `pi` 即 rpi）。
 metadata:
-  version: "6.24.2"
+  version: "6.25.0"
   binary: delegate
   exclude-agents: pi
 ---
@@ -34,8 +34,9 @@ $D wait                                                                  # 放�
 | 审某个已完成任务的工作树 | `$D start --read-only --in <name> "…"`；先 `wait` 确认上游结果再派下一步 |
 | 自己跑重检查、测性能 | `$D lane make check`；测量用 `lane --measure` |
 | 节点不稳、换档前先测连通 | `$D probe`：走 Pi 本身（不是裸 HTTP）测各档模型，不建任务、不占名额 |
-| 看全文 / 改动 / 停掉 / 清理 | `$D result` / `$D diff` / `$D stop` / `$D clean --finished`；`status` 默认一行只留计数（路径详情看 `status <run>`，`--json` 加 `--files` 才带文件数组，全量加 `--all`） |
-| `/clear` 前交接未合入任务 | `$D handoff`：写出 `.local/run/delegate/HANDOFF.md` 一页索引（状态、netBase、净改动、`TODO(master)`、迁移与重叠文件） |
+| 看全文 / 改动 / 停掉 / 清理 | `$D result` / `$D diff` / `$D stop` / `$D clean --finished`；`status` 默认每条续做链折叠成末环一行且只留计数（详情看 `status <run>`，`--all`/`--json` 仍列每环，`--json` 加 `--files` 才带文件数组） |
+| 给任务挂合入后待办 | `$D note <run> "…"` 追加、`$D note <run>` 查看、`$D note <run> --done [<序号>\|--all]` 标完成；跟着整条续做链并在 `clean` 后保留直到标完成 |
+| `/clear` 前交接未合入任务 | `$D handoff`：写出 `.local/run/delegate/HANDOFF.md` 一页索引（状态、netBase、净改动、`TODO(master)`、迁移、重叠文件与「合入后待办」） |
 
 重编译可用用户配置 remote 转到 SSH 构建机、独立排队且传回改动；`DELEGATE_REMOTE=0` 随 reply 继承、显式环境变量可覆盖，见 [配置](references/configuration.md) 与 [运行](references/runtime.md)。
 

@@ -189,6 +189,12 @@
 - 远程冷编译验收需要 40 分钟：`.delegate.json` 配 `"acceptTimeout": "40m"`，启动在「生效默认值及来源」回显来源 `repo`，`reply` 继承、`--accept-timeout` 覆盖。Repo-level acceptance timeout with CLI > repo > default precedence.
 - 同事在 worktree 里只跑验收（工作树零改动），主控同时改源仓库文件：不判 `sourceWriteViolation`、正常验收交付，只报 `sourceWorkspaceChanges`；同事通过 `write`/`edit` 或 bash 绝对路径写了源文件时仍拒收，非 worktree 与 `node_modules` 软链检查不变。Worktree outside-write requires tool-call attribution to the colleague.
 
+## 6.25 合入后待办、续做链折叠与跨仓库 Stop hook
+
+- 合入前后要记上线替换/补数据/真机验证：`delegate note <run> "换线上服务"` 追加待办，`delegate note <run>` 列出，`delegate note <run> --done [<序号>|--all]` 标完成；挂在续做链任一环全链共享，`clean` 时保留在 `<runs>/notes.json` 直到 `--done`，`status`/`handoff` 持续展示。Post-merge todos attached to runs and reply chains, surviving `clean` until `--done`.
+- 多轮 reply 续做链跑 `delegate status`：默认折叠成一行显示末环状态与轮次（如 `合入员（第 3 轮） · 运行中 …`），旧环提问/未通过不再刷屏；`--all` 与 `--json` 仍可看到每一环。Collapse reply chains in default human `status` while keeping every round in `--all` and `--json`.
+- Claude Code 回合结束：`hooks/claude-code-stop.py` 跨本机所有有 delegate 记录的仓库检查提问、无 waiter 在跑、未合入（支持 `.local/delegate/deferred.tsv` 与 `DEFER_HOURS`）及未完成待办，写明仓库名并返回 `{"decision":"block","reason":...}`，`stop_hook_active` 为 true 时放行。Unified cross-repo Claude Code Stop hook covering questions, missing waiters, unmerged runs, and pending notes.
+
 ## 6.24 上下文瘦身、净基准与交接
 
 - 多路未合入任务跑 `delegate status`：每 run 一行只留计数，`commitsDiffer`/保护提示/源改动路径清单移到 `status <run>` 详情，`--json` 默认不内联 `files`（加 `--files` 才带）。Compact one-line status and opt-in JSON files array.

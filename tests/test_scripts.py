@@ -20,6 +20,7 @@ FETCH = ROOT / "scripts/fetch-binary.sh"
 RELEASE = ROOT / "scripts/release-binary.sh"
 VERIFY = ROOT / "scripts/verify.sh"
 INSTALL_HOOKS = ROOT / "scripts/install-git-hooks.sh"
+INSTALL_CLAUDE_HOOKS = ROOT / "scripts/install-claude-hooks.sh"
 BOOTSTRAP = ROOT / "scripts/bootstrap.sh"
 SNAPSHOT = ROOT / "skills/agent-handoff/scripts/handoff-snapshot.sh"
 AUDIT = ROOT / "skills/repo-governance/scripts/audit-context.py"
@@ -939,6 +940,53 @@ class ScriptTests(unittest.TestCase):
         self.assertIn('href="decision/history/0011-amend.md#k"', (repo / "docs/page.html").read_text())
         index = (adr / "history/INDEX.md").read_text()
         self.assertIn("| 0001 旧 | Accepted | 0010 |\n| 0011 修订 | Accepted（2026-10-01） | 0010、0012 |\n\n尾注", index)
+
+    def test_install_claude_hooks_replaces_legacy_stop_hooks_and_is_idempotent(self):
+        settings = self.work / "claude-settings.json"
+        settings.write_text(json.dumps({
+            "model": "keep-me",
+            "hooks": {
+                "Stop": [
+                    {"hooks": [{"type": "command", "command": "bash ~/.claude/hooks/delegate-unmerged.sh"}]},
+                    {"hooks": [{"type": "command", "command": "bash ~/.claude/hooks/delegate-waiter.sh"}]},
+                    {"hooks": [{"type": "command", "command": "echo unrelated-stop"}]},
+                ],
+                "PreToolUse": [
+                    {"matcher": "Write", "hooks": [{"type": "command", "command": "echo unrelated-pre"}]},
+                ],
+            },
+        }, indent=2))
+
+        first = self.run_script(INSTALL_CLAUDE_HOOKS, "--settings", settings)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        data = json.loads(settings.read_text())
+        self.assertEqual(data["model"], "keep-me")
+        stop_cmds = [h["command"] for entry in data["hooks"]["Stop"] for h in entry.get("hooks", [])]
+        self.assertIn("echo unrelated-stop", stop_cmds)
+        self.assertFalse(any("delegate-unmerged.sh" in c or "delegate-waiter.sh" in c for c in stop_cmds), stop_cmds)
+        self.assertEqual(sum("claude-code-stop.py" in c for c in stop_cmds), 1, stop_cmds)
+        pre_cmds = [h["command"] for entry in data["hooks"]["PreToolUse"] for h in entry.get("hooks", [])]
+        self.assertIn("echo unrelated-pre", pre_cmds)
+        self.assertEqual(sum("claude-code-background.py" in c for c in pre_cmds), 1, pre_cmds)
+
+        # Running again is idempotent (no duplicate entries).
+        second = self.run_script(INSTALL_CLAUDE_HOOKS, "--settings", settings)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        data2 = json.loads(settings.read_text())
+        stop_cmds2 = [h["command"] for entry in data2["hooks"]["Stop"] for h in entry.get("hooks", [])]
+        self.assertEqual(sum("claude-code-stop.py" in c for c in stop_cmds2), 1, stop_cmds2)
+        pre_cmds2 = [h["command"] for entry in data2["hooks"]["PreToolUse"] for h in entry.get("hooks", [])]
+        self.assertEqual(sum("claude-code-background.py" in c for c in pre_cmds2), 1, pre_cmds2)
+
+        # Uninstall removes only delegate hooks and keeps unrelated hooks + other settings.
+        removed = self.run_script(INSTALL_CLAUDE_HOOKS, "--settings", settings, "--uninstall")
+        self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
+        data3 = json.loads(settings.read_text())
+        self.assertEqual(data3["model"], "keep-me")
+        stop_cmds3 = [h["command"] for entry in data3["hooks"]["Stop"] for h in entry.get("hooks", [])]
+        self.assertEqual(stop_cmds3, ["echo unrelated-stop"])
+        pre_cmds3 = [h["command"] for entry in data3["hooks"]["PreToolUse"] for h in entry.get("hooks", [])]
+        self.assertEqual(pre_cmds3, ["echo unrelated-pre"])
 
 
 if __name__ == "__main__":

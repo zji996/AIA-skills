@@ -88,12 +88,16 @@ const COMMANDS: &[(&str, &str)] = &[
     ("wait", "Wait for runs; print outcomes and answers."),
     (
         "status",
-        "Print one concise status line per run (status <run> adds path details); --json omits files unless --files.",
+        "Print one concise status line per run or reply chain (status <run> adds path and note details); --all/--json keep every round.",
     ),
     ("list", "Alias of status."),
     (
+        "note",
+        "Attach, list, or complete post-merge todos on a run or reply chain (survives clean until --done).",
+    ),
+    (
         "handoff",
-        "Write one-page Markdown handoff (.local/run/delegate/HANDOFF.md) for uncleaned, unmerged runs.",
+        "Write one-page Markdown handoff (.local/run/delegate/HANDOFF.md) for uncleaned, unmerged runs and pending todos.",
     ),
     ("result", "Print a run's full answer."),
     ("diff", "Show a run's changes as a git diff."),
@@ -185,13 +189,20 @@ pub fn print(command: Option<&str>) -> bool {
             ("--until-all", "Wait until every selected run finishes before returning; Alias of --all for waiting semantics."),
             ("--stream", "Print one outcome line per run as each finishes (answers are read with wait <run>) and exit when none is left; without run arguments it also picks up runs this caller starts meanwhile. For hosts that turn each output line into a notification."),
         ]),
-        "status" | "list" => ("[--all] [--json] [--files] [runs ...]", "Print one concise status line per run (counts only for path lists). Passing run names appends indented path details. With no runs, shows active runs, runs finished within 24h and not cleaned, and runs started by this session; summarizes older uncleaned runs in one line.", &[
-            ("runs", "Run ids or directories (default: active, uncleaned within 24h, and current session)."),
-            ("--all", "List all runs regardless of age or cleanup state."),
-            ("--json", "Print JSON status without the files array (pass --files to include files)."),
+        "status" | "list" => ("[--all] [--json] [--files] [runs ...]", "Print one concise status line per run (counts only for path lists, collapsing reply chains to their latest round). Passing run names appends indented path and todo details. With no runs, shows active runs, runs finished within 24h and not cleaned, runs started by this session, and runs/cleaned chains with pending todos; summarizes older uncleaned runs in one line.", &[
+            ("runs", "Run ids or directories (default: active, uncleaned within 24h, current session, and pending todos)."),
+            ("--all", "List every run and every round regardless of age or cleanup state."),
+            ("--json", "Print JSON status for every round without the files array (pass --files to include files)."),
             ("--files", "With --json, include the full files array."),
         ]),
-        "handoff" => ("[--out PATH]", "Write a one-page Markdown summary of uncleaned, unmerged runs (default: <runs>/HANDOFF.md) and print both the page and its path.", &[
+        "note" => ("[<run> [text ... | --done [<index> ... | --all]]] [--all] [--json]", "Attach, list, or complete post-merge todos on a run. Notes follow the entire reply chain and survive clean under <runs>/notes.json until marked --done.", &[
+            ("run", "Run id, name, or unique fragment (works after clean while pending todos remain). Omit to list all chains with pending todos."),
+            ("text", "Todo text to append (timestamped). Omit to list notes on this chain."),
+            ("--done", "Mark note(s) done: specify 1-based index(es), --all, or omit when only one pending todo remains."),
+            ("--all", "With --done, complete every pending todo on the chain; with no run, include completed chains."),
+            ("--json", "Print structured JSON output."),
+        ]),
+        "handoff" => ("[--out PATH]", "Write a one-page Markdown summary of uncleaned, unmerged runs and post-merge todos (default: <runs>/HANDOFF.md) and print both the page and its path.", &[
             ("-o, --out PATH", "Write the Markdown handoff to PATH instead of <runs>/HANDOFF.md."),
         ]),
         "result" => ("[--path] [run]", "Print a run's full answer.", &[

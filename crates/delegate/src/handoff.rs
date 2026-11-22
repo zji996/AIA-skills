@@ -1,5 +1,6 @@
 use crate::changes;
 use crate::common::*;
+use crate::notes;
 use crate::runs;
 use crate::worktree;
 use serde_json::{json, Value};
@@ -181,6 +182,8 @@ pub fn render() -> String {
 
     let mut rows = Vec::new();
     let mut overlaps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut unmerged_notes: Vec<(String, String, notes::ChainNotes)> = Vec::new();
+    let mut shown_note_roots: BTreeSet<String> = BTreeSet::new();
 
     for run in &all {
         if run.join(".applied-cleaned").exists() {
@@ -211,11 +214,16 @@ pub fn render() -> String {
 
         let status = runs::status(run);
         let display_name = {
-            let n = s(&meta, "name");
-            if n.is_empty() {
-                run_id.clone()
+            let (chain_name, round) = notes::chain_display_info(run);
+            if round > 1 {
+                format!("{chain_name}（第 {round} 轮）")
             } else {
-                n.to_string()
+                let n = s(&meta, "name");
+                if n.is_empty() {
+                    run_id.clone()
+                } else {
+                    n.to_string()
+                }
             }
         };
         let label = state_label(&status);
@@ -245,6 +253,13 @@ pub fn render() -> String {
             let entry = overlaps.entry(path.clone()).or_default();
             if !entry.contains(&display_name) {
                 entry.push(display_name.clone());
+            }
+        }
+
+        if let Some(chain_notes) = notes::for_run(run, &all) {
+            if chain_notes.pending_count() > 0 {
+                shown_note_roots.insert(chain_notes.root.clone());
+                unmerged_notes.push((display_name.clone(), run_id.clone(), chain_notes));
             }
         }
 
@@ -286,6 +301,25 @@ pub fn render() -> String {
             out.push_str(row);
             out.push('\n');
         }
+        if !unmerged_notes.is_empty() {
+            out.push_str("\n### 未合入任务的待办\n\n");
+            for (display_name, run_id, chain) in &unmerged_notes {
+                out.push_str(&format!(
+                    "- **{}**（`{}`）— `delegate note {} --done`\n",
+                    display_name, run_id, run_id
+                ));
+                for (i, item) in chain.items.iter().enumerate() {
+                    if !item.done {
+                        out.push_str(&format!(
+                            "  {}. [ ] {} ({})\n",
+                            i + 1,
+                            item.text,
+                            item.created_at
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     out.push_str("\n## 重叠修改文件\n\n");
@@ -298,6 +332,60 @@ pub fn render() -> String {
     } else {
         for (path, names) in shared {
             out.push_str(&format!("- `{path}`: {}\n", names.join(", ")));
+        }
+    }
+
+    // Post-merge / post-clean pending todos (runs already applied or cleaned whose notes remain open).
+    let mut post_notes: Vec<(notes::ChainNotes, &'static str)> = Vec::new();
+    for chain in notes::load() {
+        if chain.pending_count() == 0 || shown_note_roots.contains(&chain.root) {
+            continue;
+        }
+        let matching_runs: Vec<&PathBuf> = all
+            .iter()
+            .filter(|p| {
+                let id = notes::run_id(p, &json(p.join("meta.json")));
+                chain.matches_any(&[id])
+            })
+            .collect();
+        let status_label = if matching_runs.is_empty() {
+            if chain.applied {
+                "已合入·已清理"
+            } else {
+                "已清理"
+            }
+        } else if matching_runs.iter().any(|p| p.join(".applied-cleaned").exists()) {
+            "已合入·已清理"
+        } else if matching_runs
+            .iter()
+            .any(|p| p.join(".applied").exists() && !p.join(".generate-pending").exists())
+        {
+            "已合入"
+        } else {
+            continue;
+        };
+        post_notes.push((chain, status_label));
+    }
+
+    out.push_str("\n## 合入后待办\n\n");
+    if post_notes.is_empty() {
+        out.push_str("（无）\n");
+    } else {
+        for (chain, status_label) in &post_notes {
+            out.push_str(&format!(
+                "- **{}**（`{}`，{}）— `delegate note {} --done`\n",
+                chain.name, chain.latest_run, status_label, chain.latest_run
+            ));
+            for (i, item) in chain.items.iter().enumerate() {
+                if !item.done {
+                    out.push_str(&format!(
+                        "  {}. [ ] {} ({})\n",
+                        i + 1,
+                        item.text,
+                        item.created_at
+                    ));
+                }
+            }
         }
     }
     out.push_str("\n详情：`delegate status <run>` · 完整改动：`delegate diff <run> --total`\n");

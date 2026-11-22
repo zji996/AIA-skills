@@ -694,6 +694,17 @@ pub fn status(run: &Path) -> Value {
             out["next"] = json!(crate::refs::recovery_message(run, &meta, &missing));
         }
     }
+    let (chain_name, chain_round) = crate::notes::chain_display_info(run);
+    if chain_round > 1 {
+        out["chainName"] = json!(chain_name);
+        out["chainRound"] = json!(chain_round);
+    }
+    if let Some(chain_notes) = crate::notes::for_run_lazy(run) {
+        if !chain_notes.items.is_empty() {
+            out["notes"] = chain_notes.items_json();
+            out["pendingNotes"] = json!(chain_notes.pending_count());
+        }
+    }
     out["dir"] = json!(run.to_string_lossy());
     out
 }
@@ -710,6 +721,7 @@ pub fn unmerged(run: &Path) -> bool {
 pub fn remove(run: &Path) -> (usize, crate::cleanup::Containers) {
     let meta = json(run.join("meta.json"));
     let path = s(&meta["worktree"], "path").to_string();
+    crate::notes::on_run_removed(run, &meta);
     crate::refs::delete_run(run, &meta);
     let stopped = crate::cleanup::record(run, 0);
     let _ = fs::remove_dir_all(run);

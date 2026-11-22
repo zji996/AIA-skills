@@ -13,6 +13,7 @@ mod lane;
 mod launch;
 mod measure;
 mod models;
+mod notes;
 mod output;
 mod pool;
 mod probe;
@@ -1123,24 +1124,31 @@ fn clean(args: &[String]) -> Res<i32> {
         } else {
             archive::preserve(&run)?
         };
+        let pending_notes = notes::pending_count_for_run(&run);
         let (units, containers) = runs::remove(&run);
         let cleanup_note = if units > 0 {
             format!("；停止了 {units} 个 systemd 服务")
         } else {
             String::new()
         };
+        let todo_note = if pending_notes > 0 {
+            format!("；保留 {pending_notes} 条未完成待办")
+        } else {
+            String::new()
+        };
         if output::json_enabled() {
-            println!(
-                "{}",
-                json!({"run":name,"state":st,"removed":true,"archive":archived,"systemdStopped":units,"containersRemoved":containers.removed,"containersRemovedNames":containers.removed_names,"containersKeptServing":containers.kept_serving,"diagnostic":containers.diagnostic})
-            );
+            let mut obj = json!({"run":name,"state":st,"removed":true,"archive":archived,"systemdStopped":units,"containersRemoved":containers.removed,"containersRemovedNames":containers.removed_names,"containersKeptServing":containers.kept_serving,"diagnostic":containers.diagnostic});
+            if pending_notes > 0 {
+                obj["pendingNotes"] = json!(pending_notes);
+            }
+            println!("{obj}");
         } else {
             let container_note = if containers.removed > 0 {
                 format!("；删除了容器 {}", containers.removed_names.join("、"))
             } else {
                 String::new()
             };
-            println!("removed {name} ({st}{note}{cleanup_note}{container_note})");
+            println!("removed {name} ({st}{note}{cleanup_note}{container_note}{todo_note})");
             containers.warn_kept();
             if let Some(path) = archived {
                 println!("archive: {}", path.display());
@@ -1783,30 +1791,75 @@ fn main_inner(args: &[String]) -> Res<i32> {
             let include_files = has(&flags, "--files");
             let detail = !pos.is_empty();
             let show_all = has(&flags, "--all") || !pos.is_empty();
-            let all = if pos.is_empty() {
-                runs::all_runs()
-            } else {
-                pos.iter()
-                    .map(|x| runs::resolve_head(x))
-                    .collect::<Res<Vec<_>>>()?
-            };
+            if detail {
+                for x in &pos {
+                    match runs::resolve_head(x) {
+                        Ok(run) => {
+                            let mut status = runs::status(&run);
+                            if output::json_enabled() {
+                                if !include_files {
+                                    if let Some(obj) = status.as_object_mut() {
+                                        obj.remove("files");
+                                    }
+                                }
+                                println!("{}", format_status(status));
+                            } else {
+                                println!("{}", output::human_detail(&run, &status));
+                            }
+                        }
+                        Err(err) => {
+                            if let Ok(chain) = notes::resolve_cleaned(x) {
+                                if output::json_enabled() {
+                                    println!("{}", format_status(output::cleaned_note_json(&chain)));
+                                } else {
+                                    println!("{}", output::human_cleaned_note(&chain, true));
+                                }
+                            } else {
+                                return Err(err);
+                            }
+                        }
+                    }
+                }
+                return Ok(0);
+            }
+
+            let all = runs::all_runs();
+            let cleaned_notes = notes::cleaned_pending_chains(&all);
+            if !all.is_empty() || !cleaned_notes.is_empty() {
+                notes::register_repo();
+            }
+            let collapse_chains = !show_all && !output::json_enabled();
+            let superseded: std::collections::BTreeSet<String> = all
+                .iter()
+                .filter_map(|run| {
+                    let meta = json(run.join("meta.json"));
+                    let parent = s(&meta, "parent");
+                    (!parent.is_empty()).then(|| parent.to_string())
+                })
+                .collect();
             let current_caller = caller();
             let mut shown = Vec::new();
             let mut older_uncleaned = Vec::new();
             for run in &all {
+                let meta = json(run.join("meta.json"));
+                let id = notes::run_id(run, &meta);
+                if collapse_chains && superseded.contains(&id) {
+                    continue;
+                }
                 if show_all {
                     shown.push(run.clone());
                     continue;
                 }
                 let st = runs::state(run);
-                let meta = json(run.join("meta.json"));
                 let is_active = runs::active(&st) || st == "needs-redispatch";
                 let is_session = current_caller
                     .as_deref()
-                    .is_some_and(|id| meta["caller"].as_str() == Some(id));
+                    .is_some_and(|cid| meta["caller"].as_str() == Some(cid));
                 let cleaned = run.join(".applied-cleaned").exists();
                 let is_recent_uncleaned = !cleaned && runs::finished_within(run, 86400.0);
-                if is_active || is_session || is_recent_uncleaned {
+                let has_pending_notes =
+                    notes::for_run(run, &all).is_some_and(|c| c.pending_count() > 0);
+                if is_active || is_session || is_recent_uncleaned || has_pending_notes {
                     shown.push(run.clone());
                 } else if !cleaned {
                     older_uncleaned.push(run.clone());
@@ -1821,10 +1874,15 @@ fn main_inner(args: &[String]) -> Res<i32> {
                         }
                     }
                     println!("{}", format_status(status));
-                } else if detail {
-                    println!("{}", output::human_detail(&run, &status));
                 } else {
-                    println!("{}", output::human(&run, &status));
+                    println!("{}", output::human_line(&run, &status, collapse_chains));
+                }
+            }
+            for chain in &cleaned_notes {
+                if output::json_enabled() {
+                    println!("{}", format_status(output::cleaned_note_json(chain)));
+                } else {
+                    println!("{}", output::human_cleaned_note(chain, false));
                 }
             }
             if !older_uncleaned.is_empty() {
@@ -1925,6 +1983,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "tiers" => tiers(rest),
         "fit" => fit::command(rest),
         "handoff" => handoff::command(rest),
+        "note" => notes::command(rest),
         "probe" => probe::command(rest),
         "protocol" => {
             if let Some(arg) = rest.first() {

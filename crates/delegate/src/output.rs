@@ -229,6 +229,10 @@ fn pending_label(pending: &Value) -> Option<String> {
 }
 
 pub fn human(run: &Path, status: &Value) -> String {
+    human_line(run, status, false)
+}
+
+pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
     let meta = json(run.join("meta.json"));
     let state = s(status, "state");
     let label = match state {
@@ -259,8 +263,20 @@ pub fn human(run: &Path, status: &Value) -> String {
     } else {
         format!("{} 分钟", seconds / 60)
     };
+    let display_name = if collapse_chain
+        && n(status, "chainRound") > 1
+        && !s(status, "chainName").is_empty()
+    {
+        format!(
+            "{}（第 {} 轮）",
+            s(status, "chainName").replace(['\n', '\r'], " "),
+            n(status, "chainRound")
+        )
+    } else {
+        s(status, "name").replace(['\n', '\r'], " ")
+    };
     let mut parts = vec![
-        s(status, "name").replace(['\n', '\r'], " "),
+        display_name,
         format!("{label} {elapsed}"),
         agent_label(status),
     ];
@@ -505,6 +521,10 @@ pub fn human(run: &Path, status: &Value) -> String {
             .join(", ");
         parts.push(format!("快照对象已丢失（{list}，可能被 git prune 清理）"));
     }
+    let pending_notes = n(status, "pendingNotes");
+    if pending_notes > 0 {
+        parts.push(format!("待办 {pending_notes}"));
+    }
     let id = s(status, "run");
     let next = if b(status, "cleaned") {
         format!("证据归档：{}", s(status, "archive"))
@@ -641,7 +661,81 @@ pub fn human_detail(run: &Path, status: &Value) -> String {
     if !blind.is_empty() {
         lines.push(format!("  {blind}"));
     }
+    if let Some(items) = status["notes"].as_array().filter(|items| !items.is_empty()) {
+        let pending = n(status, "pendingNotes");
+        lines.push(format!("  待办（未完成 {pending} / 共 {}）：", items.len()));
+        for item in items {
+            let idx = n(item, "index");
+            let mark = if b(item, "done") { "x" } else { " " };
+            let text = s(item, "text");
+            let created = s(item, "createdAt");
+            let done_suffix = if !s(item, "doneAt").is_empty() {
+                format!("，完成于 {}", s(item, "doneAt"))
+            } else {
+                String::new()
+            };
+            lines.push(format!("    {idx}. [{mark}] {text} ({created}{done_suffix})"));
+        }
+    }
     lines.join("\n")
+}
+
+pub fn human_cleaned_note(chain: &crate::notes::ChainNotes, detail: bool) -> String {
+    let pending = chain.pending_count();
+    let mut parts = vec![chain.name.replace(['\n', '\r'], " ")];
+    if chain.applied {
+        parts.push("已合入 · 已清理".into());
+    } else {
+        parts.push("已清理".into());
+    }
+    if pending > 0 {
+        parts.push(format!("待办 {pending}"));
+        parts.push(format!(
+            "下一步：delegate note {} --done",
+            chain.latest_run
+        ));
+    }
+    let mut lines = vec![parts.join(" · ")];
+    if detail && !chain.items.is_empty() {
+        lines.push(format!(
+            "  待办（未完成 {pending} / 共 {}）：",
+            chain.items.len()
+        ));
+        for (i, item) in chain.items.iter().enumerate() {
+            let mark = if item.done { "x" } else { " " };
+            let done_suffix = item
+                .done_at
+                .as_deref()
+                .map(|t| format!("，完成于 {t}"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "    {}. [{}] {} ({}{})",
+                i + 1,
+                mark,
+                item.text,
+                item.created_at,
+                done_suffix
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+pub fn cleaned_note_json(chain: &crate::notes::ChainNotes) -> Value {
+    let pending = chain.pending_count();
+    let mut obj = json!({
+        "run": chain.latest_run,
+        "name": chain.name,
+        "state": "cleaned",
+        "cleaned": true,
+        "applied": chain.applied,
+        "notes": chain.items_json(),
+        "pendingNotes": pending,
+    });
+    if pending > 0 {
+        obj["next"] = json!(format!("delegate note {} --done", chain.latest_run));
+    }
+    obj
 }
 
 /// `pi/<tier>` for a tier's pick; `pi/<model>` for a pinned model, which no tier chose.
@@ -673,8 +767,9 @@ fn agent_label(status: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_label, pending_label};
+    use super::{agent_label, human_detail, human_line, pending_label};
     use serde_json::json;
+    use std::path::Path;
 
     #[test]
     fn a_pinned_model_is_named_instead_of_the_tier() {
@@ -695,5 +790,36 @@ mod tests {
         assert!(pending_label(&json!({"error":"rework limit reached"}))
             .unwrap()
             .contains("pending reply failed: rework limit reached"));
+    }
+
+    #[test]
+    fn collapsed_chain_and_pending_notes_render_in_summary_and_detail() {
+        let status = json!({
+            "run": "20261122-100200-r3",
+            "name": "reply to reply to 合入员",
+            "chainName": "合入员",
+            "chainRound": 3,
+            "state": "running",
+            "elapsedSeconds": 120,
+            "agent": "pi",
+            "tier": "write",
+            "pendingNotes": 2,
+            "notes": [
+                {"index": 1, "text": "换线上服务", "createdAt": "2026-11-22T02:00:00Z", "done": false},
+                {"index": 2, "text": "真机验证", "createdAt": "2026-11-22T02:01:00Z", "done": false}
+            ]
+        });
+        let dummy = Path::new("/nonexistent/delegate-test-run");
+        let collapsed = human_line(dummy, &status, true);
+        assert!(collapsed.starts_with("合入员（第 3 轮） · 运行中 2 分钟"), "{collapsed}");
+        assert!(collapsed.contains("待办 2"), "{collapsed}");
+
+        let raw = human_line(dummy, &status, false);
+        assert!(raw.starts_with("reply to reply to 合入员 · 运行中 2 分钟"), "{raw}");
+
+        let detail = human_detail(dummy, &status);
+        assert!(detail.contains("待办（未完成 2 / 共 2）"), "{detail}");
+        assert!(detail.contains("1. [ ] 换线上服务 (2026-11-22T02:00:00Z)"), "{detail}");
+        assert!(detail.contains("2. [ ] 真机验证 (2026-11-22T02:01:00Z)"), "{detail}");
     }
 }

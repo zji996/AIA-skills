@@ -11,6 +11,7 @@
 
 ### 技能
 
+- `delegate` 6.25.0：新增 `delegate note <run> "<文字>"` / `<run>` / `--done [<序号>|--all]` 在 run 上挂合入后待办，随整条续做链走，存在 `<runs>/notes.json` 并在 `clean` 后保留直到标完成；`status` 一行显示 `待办 N`、`status <run>` 展开全文，且默认把续做链折叠成链末环一行（如 `合入员（第 3 轮） · …`），`--all`/`--json` 仍列每环；`handoff` 在对应 run 下列出未完成待办并增设「合入后待办」汇总已合入或已清理的待办；新增 `hooks/claude-code-stop.py`（合并原 `delegate-unmerged.sh`、`delegate-waiter.sh` 并加入未完成待办与跨仓库 live/提问/未合入检查，`stop_hook_active` 为 true 时放行）及 `scripts/install-claude-hooks.sh`。
 - `agent-interface-design`「顺着模型习惯」：拿不准习惯时先问用它的模型本人（从真实请求分叉追问、复用缓存、不写回），回答只当线索、回到记录核实。
 
 - `delegate` 6.24.0：`status` 默认一行只留计数（`commitsDiffer`/保护提示/源改动路径移至 `status <run>` 详情），`--json` 默认省去 `files` 数组（加 `--files` 才带）；同事在 worktree 里 rebase/merge 新主干后，净改动、保护路径检查、`changes.patch`、`diff`/`apply` 统一相对 merge-base（记录为 `meta.netBase`）计算，不再把主干提交误报为 `protectViolation`；新增 `delegate handoff` 生成 `.local/run/delegate/HANDOFF.md` 一页交接索引（含 `netBase`、`TODO(master)` 计数、迁移文件与重叠修改）；`hooks/claude-code-background.py` 拦截前台 `while/until … sleep` 轮询 delegate 输出或 run 目录，放行有限重试。
