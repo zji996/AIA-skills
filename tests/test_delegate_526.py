@@ -143,3 +143,4 @@ class Delegate526Tests(unittest.TestCase):
         state = self.outcome(result)
         self.assertIn(str(alias) + " wait", state["next"])
         self.cli("stop", state["run"])
+        self.cli("wait", state["run"])
