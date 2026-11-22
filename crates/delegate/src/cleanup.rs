@@ -9,7 +9,14 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-static SYSTEMD: OnceLock<bool> = OnceLock::new();
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SystemdScope {
+    Unavailable,
+    Plain,
+    NoExpandEnv,
+}
+
+static SYSTEMD: OnceLock<SystemdScope> = OnceLock::new();
 static DOCKER_FAILURE: OnceLock<String> = OnceLock::new();
 static GROUP_KEEP: OnceLock<Mutex<BTreeMap<i32, BTreeSet<String>>>> = OnceLock::new();
 
@@ -598,23 +605,39 @@ fn unit_contains_kept(properties: &BTreeMap<&str, &str>, keep: &BTreeSet<String>
     pids.iter().any(|pid| keep.contains(&executable(*pid)))
 }
 
+fn probe_systemd_scope(extra: &[&str]) -> bool {
+    Command::new("systemd-run")
+        .args(["--user", "--scope", "--quiet"])
+        .args(extra)
+        .args(["--", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 pub fn probe_systemd() {
     SYSTEMD.get_or_init(|| {
-        setting("CGROUP", "1") != "0"
-            && std::env::var_os("XDG_RUNTIME_DIR").is_some()
-            && Command::new("systemd-run")
-                .args(["--user", "--scope", "--quiet", "--", "true"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
+        if setting("CGROUP", "1") == "0" || std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+            return SystemdScope::Unavailable;
+        }
+        // systemd 254+ supports --expand-environment=no, and systemd 259 expands $$ and
+        // ${VAR} by default even for --scope, corrupting shell commands passed to sh -c.
+        if probe_systemd_scope(&["--expand-environment=no"]) {
+            SystemdScope::NoExpandEnv
+        } else if probe_systemd_scope(&[]) {
+            SystemdScope::Plain
+        } else {
+            SystemdScope::Unavailable
+        }
     });
 }
 
 pub fn scoped_command(run: &Path, role: &str, program: &str, args: &[String]) -> Command {
     probe_systemd();
-    if SYSTEMD.get() != Some(&true) {
+    let mode = *SYSTEMD.get().unwrap_or(&SystemdScope::Unavailable);
+    if mode == SystemdScope::Unavailable {
         let mut command = Command::new(program);
         command.args(args);
         return command;
@@ -652,8 +675,12 @@ pub fn scoped_command(run: &Path, role: &str, program: &str, args: &[String]) ->
         return command;
     }
     let mut command = Command::new("systemd-run");
+    command.args(["--user", "--scope", "--quiet", "--collect"]);
+    if mode == SystemdScope::NoExpandEnv {
+        command.arg("--expand-environment=no");
+    }
     command
-        .args(["--user", "--scope", "--quiet", "--collect", "--unit"])
+        .arg("--unit")
         .arg(unit)
         .arg("--")
         .arg(program)

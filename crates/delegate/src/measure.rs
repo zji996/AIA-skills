@@ -194,20 +194,32 @@ fn loadavg() -> Option<f64> {
         .ok()
 }
 
-fn systemd_usable() -> bool {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SystemdMeasure {
+    Unavailable,
+    Plain,
+    NoExpandEnv,
+}
+
+fn probe_systemd_measure(extra: &[&str]) -> bool {
     Command::new("systemd-run")
-        .args([
-            "--quiet",
-            "--user",
-            "--scope",
-            "-p",
-            "CPUWeight=10000",
-            "true",
-        ])
+        .args(["--quiet", "--user", "--scope", "-p", "CPUWeight=10000"])
+        .args(extra)
+        .args(["--", "true"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+fn systemd_mode() -> SystemdMeasure {
+    if probe_systemd_measure(&["--expand-environment=no"]) {
+        SystemdMeasure::NoExpandEnv
+    } else if probe_systemd_measure(&[]) {
+        SystemdMeasure::Plain
+    } else {
+        SystemdMeasure::Unavailable
+    }
 }
 
 fn record(
@@ -556,16 +568,14 @@ pub fn execute_argv(run: &Path, real: &str, args: &[String]) -> Res<i32> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     let mut diagnostic = None;
-    let mut child = if systemd_usable() {
-        Command::new("systemd-run")
-            .args([
-                "--quiet",
-                "--user",
-                "--scope",
-                "-p",
-                "CPUWeight=10000",
-                "--",
-            ])
+    let mode = systemd_mode();
+    let mut child = if mode != SystemdMeasure::Unavailable {
+        let mut sd = Command::new("systemd-run");
+        sd.args(["--quiet", "--user", "--scope", "-p", "CPUWeight=10000"]);
+        if mode == SystemdMeasure::NoExpandEnv {
+            sd.arg("--expand-environment=no");
+        }
+        sd.arg("--")
             .arg("taskset")
             .args(["-c", &slot.cpus, real])
             .args(args)
@@ -632,13 +642,14 @@ pub fn run_lane(command: &str, cwd: &Path, run: Option<&Path>, meta: &Value) -> 
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    let status = if systemd_usable() {
-        Command::new("systemd-run")
-            .args([
-                "--user",
-                "--scope",
-                "-p",
-                "CPUWeight=10000",
+    let mode = systemd_mode();
+    let status = if mode != SystemdMeasure::Unavailable {
+        let mut sd = Command::new("systemd-run");
+        sd.args(["--user", "--scope", "-p", "CPUWeight=10000"]);
+        if mode == SystemdMeasure::NoExpandEnv {
+            sd.arg("--expand-environment=no");
+        }
+        sd.args([
                 "--",
                 "taskset",
                 "-c",
