@@ -296,8 +296,15 @@ class Delegate615Tests(unittest.TestCase):
 
     def test_shell_readonly_rejects_worktree_and_source_writes_and_apply(self):
         repo = self.repo({"a.txt": "old\n"})
-        for pre in ("echo local > a.txt", f"echo source > {shlex.quote(str(repo / 'a.txt'))}"):
-            self.fake_pi([fixtures.answer("需要主控决定\nwhy?"), fixtures.SETTLED], pre=pre)
+        cases = (
+            ("echo local > a.txt", []),
+            (
+                f"echo source > {shlex.quote(str(repo / 'a.txt'))}",
+                [{"type": "tool_execution_start", "toolName": "bash", "args": {"command": f"echo source > {shlex.quote(str(repo / 'a.txt'))}"}}],
+            ),
+        )
+        for pre, tool_events in cases:
+            self.fake_pi([*tool_events, fixtures.answer("需要主控决定\nwhy?"), fixtures.SETTLED], pre=pre)
             result = self.cli("run", "--read-only", "--shell", "--workdir", repo, "inspect", human=True)
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertIn("只读任务产生了写入", result.stdout)
@@ -470,9 +477,10 @@ class Delegate615Tests(unittest.TestCase):
         self.assertEqual(out3["sourceWorkspaceChanges"], ["a.txt"])
         self.assertNotIn("sourceWriteViolation", out3)
 
-        # Case 4 (guardrail): committing a manually-dirty file NOT in applied.json must NOT be exempted.
+        # Case 4 (6.25.0): controller committing their own dirty file (advancing HEAD) is exempted
+        # because the working tree has no uncommitted diff left for that path.
         (repo / "manual.txt").write_text("m1\n")
-        gate4, slow4 = self.start_gated_question(repo, "manual-not-logged")
+        gate4, slow4 = self.start_gated_question(repo, "manual-committed")
         subprocess.run(["git", "-C", str(repo), "add", "manual.txt"], check=True)
         subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
                         "commit", "-qm", "commit manual"], check=True)
@@ -480,7 +488,7 @@ class Delegate615Tests(unittest.TestCase):
         res4 = self.cli("wait", "--all", slow4["run"])
         self.assertEqual(res4.returncode, 0, res4.stdout + res4.stderr)
         out4 = self.outcome(res4)
-        self.assertEqual(out4["sourceWorkspaceChanges"], ["manual.txt"])
+        self.assertNotIn("sourceWorkspaceChanges", out4)
         self.assertNotIn("sourceWriteViolation", out4)
 
 

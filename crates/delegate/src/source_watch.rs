@@ -264,7 +264,7 @@ pub fn guard(source: &Path, exclusive: bool) -> Res<fs::File> {
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     lock(&dir.join("lock"), exclusive, false).map_err(|e| e.to_string())
 }
-pub fn fingerprint(source: &Path) -> Res<Value> {
+fn fingerprint_pair(source: &Path) -> Res<(Value, Value)> {
     let data = git(
         source,
         &[
@@ -276,6 +276,7 @@ pub fn fingerprint(source: &Path) -> Res<Value> {
         ],
     )?;
     let mut out = json!({});
+    let mut wt = json!({});
     for row in data.split(|b| *b == 0).filter(|r| r.len() > 3) {
         let path = String::from_utf8_lossy(&row[3..]).into_owned();
         if path == ".local" || path.starts_with(".local/") { continue; }
@@ -300,19 +301,27 @@ pub fn fingerprint(source: &Path) -> Res<Value> {
         digest.update(&index);
         digest.update(&mode.to_le_bytes());
         out[&path] = json!(digest.digest().to_string());
+        let mut wt_digest = sha1_smol::Sha1::new();
+        wt_digest.update(&content);
+        wt_digest.update(&mode.to_le_bytes());
+        wt[&path] = json!(wt_digest.digest().to_string());
     }
     for rel in node_modules_dirs(source, Some(&data)) {
         if let Some(digest) = fingerprint_node_modules(&source.join(&rel)) {
             out[&rel] = json!(digest);
         }
     }
-    Ok(out)
+    Ok((out, wt))
+}
+pub fn fingerprint(source: &Path) -> Res<Value> {
+    Ok(fingerprint_pair(source)?.0)
 }
 pub fn baseline(source: &Path) -> Res<Value> {
     let _guard = guard(source, false)?;
     let head =
         git_text(source, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]).unwrap_or_default();
-    Ok(json!({"files":fingerprint(source)?, "head":head, "at":now_ns().to_string()}))
+    let (files, worktree) = fingerprint_pair(source)?;
+    Ok(json!({"files":files, "worktree":worktree, "head":head, "at":now_ns().to_string()}))
 }
 fn different(before: &Value, after: &Value) -> Vec<String> {
     before
@@ -426,7 +435,7 @@ fn changes_now(meta: &Value, nonblocking: bool) -> Vec<String> {
     let Ok(_guard) = lock(&dir.join("lock"), false, nonblocking) else {
         return vec![];
     };
-    let Ok(now) = fingerprint(source) else {
+    let Ok((now, now_worktree)) = fingerprint_pair(source) else {
         return vec![];
     };
     let applied = json(journal(source).join("applied.json"));
@@ -441,7 +450,10 @@ fn changes_now(meta: &Value, nonblocking: bool) -> Vec<String> {
             {
                 return false;
             }
-            if now[path].is_null() && record.is_object() {
+            if now[path].is_null()
+                || (baseline["worktree"][path].is_string()
+                    && baseline["worktree"][path] == now_worktree[path])
+            {
                 let paths = committed.get_or_insert_with(|| committed_since(source, baseline));
                 if paths.contains(path) {
                     return false;
@@ -791,13 +803,54 @@ pub fn attributed(meta: &Value, run: &Path, source_changed: &[String]) -> Vec<St
         if cmd.is_empty() || is_readonly_bash(cmd, workdir, &source) {
             return;
         }
-        for (primary, fallback) in extract_source_rels(cmd, &roots) {
-            if !mark_rel(&primary, source_changed, matched) {
-                if let Some(fb) = fallback {
-                    mark_rel(&fb, source_changed, matched);
+        let check_text = |text: &str, matched: &mut BTreeSet<String>| {
+            for (primary, fallback) in extract_source_rels(text, &roots) {
+                if !mark_rel(&primary, source_changed, matched) {
+                    if let Some(fb) = fallback {
+                        mark_rel(&fb, source_changed, matched);
+                    }
                 }
             }
+        };
+        if !cmd.contains('>')
+            && !cmd.contains('`')
+            && !cmd.contains("$(")
+            && !cmd.contains('\n')
+            && !cmd.contains('\r')
+        {
+            let mut segs = Vec::new();
+            let mut cd_into_source = false;
+            for part in cmd.split("&&") {
+                for part in part.split("||") {
+                    for part in part.split(';') {
+                        for seg in part.split('|') {
+                            let seg = seg.trim();
+                            if seg.is_empty() {
+                                continue;
+                            }
+                            let first = seg
+                                .split_whitespace()
+                                .find(|w| !(w.contains('=') && !w.starts_with('-')))
+                                .map(|w| w.trim_matches(['\'', '"', '(', ')']))
+                                .unwrap_or("");
+                            if first == "cd" && !extract_source_rels(seg, &roots).is_empty() {
+                                cd_into_source = true;
+                            }
+                            segs.push(seg);
+                        }
+                    }
+                }
+            }
+            if !cd_into_source {
+                for seg in segs {
+                    if !is_readonly_segment(seg, workdir, &source) {
+                        check_text(seg, matched);
+                    }
+                }
+                return;
+            }
         }
+        check_text(cmd, matched);
     };
 
     for ev in crate::runs::events(run) {

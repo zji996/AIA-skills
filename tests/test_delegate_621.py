@@ -181,6 +181,80 @@ class Delegate621Tests(unittest.TestCase):
         self.assertNotIn("sourceWriteViolation", state)
         self.assertNotIn("sourceWorkspaceChanges", state)
 
+    def test_controller_source_commit_during_shell_readonly_and_write_runs_is_not_violation(self):
+        import subprocess
+        repo = self.repo({"a.txt": "v0\n", "partial.txt": "p0\n", "other.txt": "o0\n"})
+        # Dirty a.txt and partially staged partial.txt before runs start.
+        (repo / "a.txt").write_text("v1 by controller\n")
+        (repo / "partial.txt").write_text("p1 staged\n")
+        subprocess.run(["git", "-C", str(repo), "add", "partial.txt"], check=True)
+        (repo / "partial.txt").write_text("p2 unstaged\n")
+
+        gate = self.work / "release-shell"
+        ready = self.work / "ready-shell"
+        self.fake_pi(
+            [
+                # Even if colleague runs a non-readonly-classified bash referencing repo root (no writes),
+                # controller's HEAD commit must not trigger a violation.
+                {"type": "tool_execution_start", "toolName": "bash", "args": {"command": f"env | grep -q . && ls {shlex.quote(str(repo))}"}},
+                fixtures.answer("verified ok"),
+                fixtures.SETTLED,
+            ],
+            pre=f"touch {shlex.quote(str(ready))}; while [ ! -f {shlex.quote(str(gate))} ]; do sleep .05; done",
+        )
+        started = self.outcome(
+            self.cli("start", "--read-only", "--shell", "--workdir", repo, "verify actions")
+        )
+        self.addCleanup(lambda: self.cli("stop", started["run"]))
+        self.until(ready.exists, "shell agent started")
+
+        # Controller commits a.txt and the staged portion of partial.txt, advancing HEAD,
+        # AND leaves an unrelated uncommitted edit in other.txt.
+        subprocess.run(["git", "-C", str(repo), "add", "a.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-qm", "controller commit during run"], check=True)
+        (repo / "other.txt").write_text("o1 controller dirty\n")
+
+        gate.touch()
+        finished = self.cli("wait", "--all", started["run"])
+        self.assertEqual(finished.returncode, 0, finished.stdout + finished.stderr)
+        state = self.outcome(finished)
+        self.assertEqual(state["state"], "answered")
+        self.assertNotIn("readOnlyViolation", state)
+        self.assertNotIn("sourceWriteViolation", state)
+        # Committed a.txt and unchanged-worktree partial.txt are excluded; only uncommitted other.txt shows.
+        self.assertEqual(state.get("sourceWorkspaceChanges"), ["other.txt"])
+
+        # Guardrail: if colleague actually edits a committed path in working tree after controller's commit,
+        # it IS still caught and rejected.
+        gate2 = self.work / "release-rogue"
+        ready2 = self.work / "ready-rogue"
+        rogue_cmd = f"echo rogue > {shlex.quote(str(repo / 'a.txt'))}"
+        self.fake_pi(
+            [
+                {"type": "tool_execution_start", "toolName": "bash", "args": {"command": rogue_cmd}},
+                fixtures.answer("sneaky"),
+                fixtures.SETTLED,
+            ],
+            pre=f"touch {shlex.quote(str(ready2))}; while [ ! -f {shlex.quote(str(gate2))} ]; do sleep .05; done; {rogue_cmd}",
+        )
+        started2 = self.outcome(
+            self.cli("start", "--read-only", "--shell", "--workdir", repo, "verify again")
+        )
+        self.addCleanup(lambda: self.cli("stop", started2["run"]))
+        self.until(ready2.exists, "rogue agent started")
+        (repo / "a.txt").write_text("v2 committed\n")
+        subprocess.run(["git", "-C", str(repo), "add", "a.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-qm", "commit a v2"], check=True)
+        gate2.touch()
+        finished2 = self.cli("wait", "--all", started2["run"])
+        self.assertEqual(finished2.returncode, 1, finished2.stdout + finished2.stderr)
+        state2 = self.outcome(finished2)
+        self.assertEqual(state2["state"], "rejected")
+        self.assertEqual(state2["readOnlyViolation"], ["source:a.txt"])
+        self.assertEqual(state2["sourceWriteViolation"], ["a.txt"])
+
 
 if __name__ == "__main__":
     unittest.main()

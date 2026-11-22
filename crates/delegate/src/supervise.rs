@@ -363,7 +363,7 @@ fn settle(
         })
         .unwrap_or_default();
     let mut source_changed = crate::source_watch::changed(meta);
-    let attributed_source = if s(meta, "mode") == "write" {
+    let attributed_source = if s(meta, "mode") == "write" || b(meta, "shell") {
         crate::source_watch::attributed(meta, run, &source_changed)
     } else {
         vec![]
@@ -554,11 +554,16 @@ fn settle(
         }
         sum.as_object_mut().unwrap().remove("question");
     }
-    if b(meta, "shell") && (!changed.is_empty() || !source_changed.is_empty()) {
+    if b(meta, "shell") && (!changed.is_empty() || outside_write) {
         state = "rejected".into();
         sum["state"] = json!(state);
         let mut paths = changed.clone();
-        paths.extend(source_changed.iter().map(|p| format!("source:{p}")));
+        let mut src_hits = attributed_source.clone();
+        src_hits.extend(source_leaks.iter().cloned());
+        src_hits.extend(worktree_nm_links.iter().cloned());
+        src_hits.sort();
+        src_hits.dedup();
+        paths.extend(src_hits.iter().map(|p| format!("source:{p}")));
         sum["readOnlyViolation"] = json!(paths);
         sum["error"] = json!("只读任务产生了写入 / read-only shell task wrote files");
         sum.as_object_mut().unwrap().remove("question");
