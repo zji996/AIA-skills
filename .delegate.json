@@ -1,1 +1,4 @@
-{"remote": false}
+{
+  "remote": false,
+  "accept": "scripts/verify.sh"
+}
