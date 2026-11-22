@@ -201,6 +201,7 @@
 - 合入前后要记上线替换/补数据/真机验证：`delegate note <run> "换线上服务"` 追加待办，`delegate note <run>` 列出，`delegate note <run> --done [<序号>|--all]` 标完成；挂在续做链任一环全链共享，`clean` 时保留在 `<runs>/notes.json` 直到 `--done`，`status`/`handoff` 持续展示。Post-merge todos attached to runs and reply chains, surviving `clean` until `--done`.
 - 多轮 reply 续做链跑 `delegate status`：默认折叠成一行显示末环状态与轮次（如 `合入员（第 3 轮） · 运行中 …`），旧环提问/未通过不再刷屏；`--all` 与 `--json` 仍可看到每一环。Collapse reply chains in default human `status` while keeping every round in `--all` and `--json`.
 - Claude Code 回合结束：`hooks/claude-code-stop.py` 跨本机所有有 delegate 记录的仓库检查提问、无 waiter 在跑、未合入（支持 `.local/delegate/deferred.tsv` 与 `DEFER_HOURS`）及未完成待办，写明仓库名并返回 `{"decision":"block","reason":...}`，`stop_hook_active` 为 true 时放行。Unified cross-repo Claude Code Stop hook covering questions, missing waiters, unmerged runs, and pending notes.
+- 源仓库在 run 期间由主控提交改动（HEAD 前进，含手动脏改与部分暂存提交）：`source-watch` 排除已提交且工作区无新变的路径，`--read-only --shell` 同样按同事工具调用归属判定，不再误拒；systemd 254+/259 主机下 `systemd-run --scope` 自动附加 `--expand-environment=no`，`accept`/`setup`/`generate`/`measure` 中的 `$$` 与 `${VAR}` 不再被展开破坏。Exclude source HEAD commits from source-watch, attribute read-only shell source writes, and pass `--expand-environment=no` to `systemd-run --scope` when supported.
 
 ## 6.24 上下文瘦身、净基准与交接
 
