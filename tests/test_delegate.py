@@ -127,7 +127,11 @@ if args[0] == "ps":
     assert args == ["ps", "-aq", "--filter", "label=com.docker.compose.project.working_dir"]
     print("\\n".join(items))
 elif args[0] == "inspect":
-    print(json.dumps([{"Id": key, "Config": {"Labels": {
+    print(json.dumps([{"Id": key, "Name": "/" + items[key].get("name", key),
+        "State": {"Running": bool(items[key].get("serving"))},
+        "NetworkSettings": {"Ports": {"8004/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8004"}]}
+                            if items[key].get("serving") else {}},
+        "Config": {"Labels": {
         "com.docker.compose.project.working_dir": items[key]["path"]}}} for key in args[1:]]))
 elif args[:3] == ["rm", "-f", "-v"]:
     key = args[3]
@@ -172,6 +176,22 @@ else:
         self.assertEqual(rows[1]["orphanCleanup"]["containersRemoved"], 1)
         self.assertEqual(set(json.loads(db.read_text())), {"a3", "a5", "a6", "a7", "a8"})
         self.assertFalse(tree.exists())
+
+    def test_clean_keeps_a_serving_container_and_names_what_it_removes(self):
+        # 11-22: a colleague deployed the embed service from its worktree; clean took it down.
+        self.fake_pi([answer("done"), SETTLED])
+        repo = self.repo({"a.txt": "a\n"})
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        db = self.fake_docker({
+            "d1": {"path": state["worktree"], "name": "svc-embed-1", "serving": True},
+            "d2": {"path": state["worktree"], "name": "scratch-db-1"},
+        })
+        result = self.cli("clean", state["run"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(json.loads(db.read_text())), {"d1"})
+        self.assertIn("删除了容器 scratch-db-1", result.stdout)
+        self.assertIn("svc-embed-1", result.stderr)
+        self.assertIn("没有删除", result.stderr)
 
     def test_clean_uses_recorded_path_when_worktree_is_already_missing(self):
         self.fake_pi([answer("done"), SETTLED])

@@ -166,13 +166,42 @@ pub fn bounded_output(mut command: Command, timeout: Duration) -> Result<String,
 #[derive(Default)]
 pub struct Containers {
     pub removed: usize,
+    /// Names of the removed containers, so a clean never deletes something silently.
+    pub removed_names: Vec<String>,
+    /// Running containers that publish a host port: a colleague deployed a service from its
+    /// worktree. Removing one takes a live service down (11-22: the embed service vanished
+    /// on clean), so they stay and the caller is told to re-create them from the source tree.
+    pub kept_serving: Vec<String>,
     pub diagnostic: Option<String>,
 }
 
 impl Containers {
     pub fn json(&self) -> Value {
-        value!({"containersRemoved": self.removed, "diagnostic": self.diagnostic})
+        value!({"containersRemoved": self.removed, "containersRemovedNames": self.removed_names, "containersKeptServing": self.kept_serving, "diagnostic": self.diagnostic})
     }
+
+    /// One stderr line per kept service, with what to do; empty when nothing was kept.
+    pub fn warn_kept(&self) {
+        for name in &self.kept_serving {
+            eprintln!(
+                "delegate: 警告：容器 {name} 仍在运行并对外开放端口，它是从这个工作树部署的服务，没有删除。\
+                 在源仓库用同一个 compose 重新部署它（之后旧容器会被替换），否则下次清理孤儿容器前它会失去源文件。"
+            );
+        }
+    }
+}
+
+fn serving(item: &Value) -> bool {
+    item["State"]["Running"].as_bool() == Some(true)
+        && item["NetworkSettings"]["Ports"]
+            .as_object()
+            .is_some_and(|ports| {
+                ports.values().any(|bindings| {
+                    bindings.as_array().is_some_and(|list| {
+                        list.iter().any(|b| !s(b, "HostPort").is_empty())
+                    })
+                })
+            })
 }
 
 // Test builds only: shorten the shared container budget so the black-box timeout path is verifiable.
@@ -200,8 +229,8 @@ fn label_below(path: &Path, root: &Path) -> bool {
 pub fn containers(root: &Path, missing_only: bool) -> Containers {
     if let Some(message) = DOCKER_FAILURE.get() {
         return Containers {
-            removed: 0,
             diagnostic: Some(message.clone()),
+            ..Containers::default()
         };
     }
     let mut report = Containers::default();
@@ -244,8 +273,14 @@ pub fn containers(root: &Path, missing_only: bool) -> Containers {
             if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
                 continue;
             }
+            let name = s(item, "Name").trim_start_matches('/').to_string();
+            if serving(item) {
+                report.kept_serving.push(name);
+                continue;
+            }
             docker(&["rm", "-f", "-v", id])?;
             report.removed += 1;
+            report.removed_names.push(name);
         }
         Ok(())
     };

@@ -1132,15 +1132,16 @@ fn clean(args: &[String]) -> Res<i32> {
         if output::json_enabled() {
             println!(
                 "{}",
-                json!({"run":name,"state":st,"removed":true,"archive":archived,"systemdStopped":units,"containersRemoved":containers.removed,"diagnostic":containers.diagnostic})
+                json!({"run":name,"state":st,"removed":true,"archive":archived,"systemdStopped":units,"containersRemoved":containers.removed,"containersRemovedNames":containers.removed_names,"containersKeptServing":containers.kept_serving,"diagnostic":containers.diagnostic})
             );
         } else {
             let container_note = if containers.removed > 0 {
-                format!("；删除了 {} 个容器", containers.removed)
+                format!("；删除了容器 {}", containers.removed_names.join("、"))
             } else {
                 String::new()
             };
             println!("removed {name} ({st}{note}{cleanup_note}{container_note})");
+            containers.warn_kept();
             if let Some(path) = archived {
                 println!("archive: {}", path.display());
             }
@@ -1151,10 +1152,11 @@ fn clean(args: &[String]) -> Res<i32> {
         println!("{}", json!({"orphanCleanup":orphans.json()}));
     } else if orphans.removed > 0 {
         println!(
-            "清理：删除了 {} 个孤儿容器（worktree 目录已不存在）",
-            orphans.removed
+            "清理：删除了孤儿容器 {}（worktree 目录已不存在）",
+            orphans.removed_names.join("、")
         );
     }
+    orphans.warn_kept();
     Ok(0)
 }
 fn stop(args: &[String]) -> Res<i32> {

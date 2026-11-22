@@ -801,7 +801,11 @@ pub fn remove_after_apply(run: &Path) -> Vec<String> {
     let _ = write(run.join(".applied-cleaned"), "1\n");
     let _ = fs::remove_file(run.join("exit_code"));
     let _ = write(run.join("exit_code"), "0\n");
-    let mut diagnostics = containers.diagnostic.into_iter().collect::<Vec<_>>();
+    containers.warn_kept();
+    let mut diagnostics = containers.diagnostic.clone().into_iter().collect::<Vec<_>>();
+    if !containers.removed_names.is_empty() {
+        diagnostics.push(format!("removed containers: {}", containers.removed_names.join(", ")));
+    }
     if !shared
         && !crate::pool::is_slot(Path::new(path))
         && Path::new(path).is_absolute()
