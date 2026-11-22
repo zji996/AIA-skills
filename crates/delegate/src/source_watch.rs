@@ -698,7 +698,7 @@ fn extract_source_rels(cmd: &str, roots: &[&str]) -> Vec<(String, Option<String>
                 continue;
             }
             let quote = (idx > 0 && matches!(bytes[idx - 1], b'\'' | b'"'))
-                .then_some(bytes[idx - 1]);
+                .then(|| bytes[idx - 1]);
             let after = idx + root.len();
             if after == bytes.len() || is_delim(bytes[after]) {
                 out.push((String::new(), None));
@@ -825,6 +825,13 @@ pub fn attributed(meta: &Value, run: &Path, source_changed: &[String]) -> Vec<St
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn command_starting_with_the_source_root_does_not_underflow() {
+        // `then_some` evaluated `bytes[idx - 1]` even when idx == 0 (delegate 6.24.0 crash, 11-22).
+        let rels = extract_source_rels("/srv/repo/src/a.rs", &["/srv/repo"]);
+        assert_eq!(rels.first().map(|(p, _)| p.as_str()), Some("src/a.rs"));
+    }
 
     fn git_ok(dir: &Path, args: &[&str]) {
         let out = git_command()
