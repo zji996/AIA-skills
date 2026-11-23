@@ -525,18 +525,30 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
         AcceptStatus::None => (" -", None),
     };
 
+    let review_snippet = run
+        .review
+        .as_ref()
+        .map(ReviewInfo::row_snippet)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!(" [{s}]"))
+        .unwrap_or_default();
+
     let full_name = if let (GroupKind::Running, Some(act)) = (run.group, run.activity.as_ref()) {
-        let snippet = match act.kind.as_str() {
-            "running_command" => {
-                if let Some(cmd) = &act.cmd {
-                    format!(" [{}]", cmd)
-                } else {
-                    String::new()
+        let snippet = if !review_snippet.is_empty() {
+            review_snippet
+        } else {
+            match act.kind.as_str() {
+                "running_command" => {
+                    if let Some(cmd) = &act.cmd {
+                        format!(" [{}]", cmd)
+                    } else {
+                        String::new()
+                    }
                 }
+                "quota" | "error" => format!(" [{}]", act.label),
+                _ if run.stall_warning.is_some() => " [卡住提醒]".to_string(),
+                _ => String::new(),
             }
-            "quota" | "error" => format!(" [{}]", act.label),
-            _ if run.stall_warning.is_some() => " [卡住提醒]".to_string(),
-            _ => String::new(),
         };
         if !snippet.is_empty() && cols.name_w > 10 {
             let base = if run.chain_round > 1 {
@@ -556,6 +568,13 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
         } else {
             truncate(&run.display_name, cols.name_w)
         }
+    } else if !review_snippet.is_empty() && cols.name_w > 10 {
+        let base = if run.chain_round > 1 {
+            format!("{} [{}轮]", run.display_name, run.chain_round)
+        } else {
+            run.display_name.clone()
+        };
+        truncate(&format!("{base}{review_snippet}"), cols.name_w)
     } else if run.chain_round > 1 {
         let suffix = format!(" [{}轮]", run.chain_round);
         let sw = display_width(&suffix);
@@ -890,6 +909,60 @@ fn build_detail_lines(app: &App, run: &RunItem, width: usize) -> Vec<Line<'stati
             );
         }
         AcceptStatus::None => {}
+    }
+
+    // Review status (6.29)
+    if let Some(rev) = &run.review {
+        let label = rev.detail_label();
+        if !label.is_empty() {
+            let (rev_color, bold) = if rev.status == "reviewing" {
+                (STATUS_QUEUED, true)
+            } else if rev.status == "reworking" || rev.verdict.as_deref() == Some("REWORK") {
+                (STATUS_PENDING, true)
+            } else if rev.verdict.as_deref() == Some("PASS") {
+                (STATUS_RUNNING, false)
+            } else if rev.verdict.as_deref() == Some("NEEDS_CONTROLLER") {
+                (STATUS_FAILED, true)
+            } else {
+                (STATUS_PENDING, false)
+            };
+            let mut style = Style::default().fg(rev_color);
+            if bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            let attn = if rev.needs_attention && rev.verdict.as_deref() != Some("PASS") {
+                " · ⚠ 需主控关注"
+            } else {
+                ""
+            };
+            push_wrapped(&mut out, &format!("审查: {label}{attn}"), width, style);
+            if let Some(up) = &rev.upgraded_by {
+                push_wrapped(&mut out, &format!("  升级原因: {up}"), width, muted());
+            }
+            if !rev.controller_paths.is_empty() {
+                push_wrapped(
+                    &mut out,
+                    &format!("  controllerReviewPaths: {}", rev.controller_paths.join("、")),
+                    width,
+                    Style::default().fg(STATUS_PENDING),
+                );
+            }
+            if let Some(hash) = &rev.sign_hash {
+                let sign_note = if rev.sign_valid {
+                    "已签字有效"
+                } else if rev.sign_invalidated {
+                    "签字已失效"
+                } else {
+                    "待签字"
+                };
+                push_wrapped(
+                    &mut out,
+                    &format!("  签字哈希 ({sign_note}): {hash}"),
+                    width,
+                    muted(),
+                );
+            }
+        }
     }
 
     // Alerts (only when present)
@@ -1509,6 +1582,14 @@ fn run_glyph_color(run: &RunItem) -> (&'static str, Option<Color>) {
     }
     match run.group {
         GroupKind::Running => {
+            if let Some(rev) = &run.review {
+                if rev.status == "reviewing" {
+                    return ("◎", Some(STATUS_QUEUED));
+                }
+                if rev.status == "reworking" {
+                    return ("↻", Some(STATUS_PENDING));
+                }
+            }
             if run.stall_warning.is_some() {
                 return ("!", Some(STATUS_PENDING));
             }
@@ -1525,12 +1606,21 @@ fn run_glyph_color(run: &RunItem) -> (&'static str, Option<Color>) {
         GroupKind::Queued => ("◔", Some(STATUS_QUEUED)),
         GroupKind::MergedUncleaned => ("○", None),
         GroupKind::Stopped => ("·", None),
-        GroupKind::Pending => match run.state.as_str() {
-            "rejected" | "failed" | "timeout" | "stalled" | "malformed" | "crashed" | "killed" => {
-                ("✕", Some(STATUS_FAILED))
+        GroupKind::Pending => {
+            if run
+                .review
+                .as_ref()
+                .and_then(|r| r.verdict.as_deref())
+                == Some("NEEDS_CONTROLLER")
+            {
+                return ("!", Some(STATUS_FAILED));
             }
-            _ => ("◆", Some(STATUS_PENDING)),
-        },
+            match run.state.as_str() {
+                "rejected" | "failed" | "timeout" | "stalled" | "malformed" | "crashed"
+                | "killed" => ("✕", Some(STATUS_FAILED)),
+                _ => ("◆", Some(STATUS_PENDING)),
+            }
+        }
     }
 }
 
@@ -1658,9 +1748,11 @@ fn render_dag_queue_detail_pane(
 fn event_kind_color(kind: &str) -> Option<Color> {
     match kind {
         "delivered" | "applied" | "queue_dispatched" => Some(STATUS_RUNNING),
-        "question" | "stall_warning" | "loop_review" => Some(STATUS_PENDING),
-        "rejected" | "failed" | "queue_paused" => Some(STATUS_FAILED),
-        "started" | "queued" | "lane_acquired" => Some(STATUS_QUEUED),
+        "question" | "stall_warning" | "loop_review" | "review_verdict" | "rework_sent" => {
+            Some(STATUS_PENDING)
+        }
+        "rejected" | "failed" | "queue_paused" | "needs_attention" => Some(STATUS_FAILED),
+        "started" | "queued" | "lane_acquired" | "review_started" => Some(STATUS_QUEUED),
         _ => None,
     }
 }

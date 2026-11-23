@@ -1,5 +1,12 @@
 # delegate
 
+## 6.29 审-改闭环、`controllerReviewPaths` 与签字哈希
+
+- 自动审-改闭环：仓库 `.delegate.json` 开启 `review: {"tier": "review"}` 后，写入任务验收通过自动派新上下文只读审查员（不能写文件、不能派活），输入任务说明、`diff --total` 与审查要点（默认 `references/review-rubric.md`，可覆盖）；首行严格 `PASS`/`REWORK`/`NEEDS_CONTROLLER`（格式不对失败关闭为 `NEEDS_CONTROLLER`），写进 `review.json` 与 `summary.review` 并联动 DAG 续派队列。Automatic read-only review loop with controlled first-line verdicts and fail-closed format validation.
+- 返工原文透传与增量续审：判定 `REWORK` 时 Host 把审查结论文件原样退回作者（不经模型转述），作者交付后审查员续接自身会话且只看本轮增量 diff；不设轮数上限，第 3 轮起发 `needs_attention` 事件提醒主控并照常继续不强杀。Verbatim rework handback, incremental re-review, and unlimited rounds with round-3+ needs_attention alert.
+- `controllerReviewPaths` 与 `delegate sign`：本链改到通配符命中的路径（如 `SKILL.md`、提示词文件）时，无论审查结论为何均升级为 `NEEDS_CONTROLLER`，交付附命中路径 diff 全文与 SHA-256 签字哈希；主控执行 `delegate sign <run>` 落盘 `sign.json`，受控路径 diff 改动任意一字即令 `delegate sign --check <run>` 失效；不改 `apply` 语义。Controller review escalation for sensitive paths with SHA-256 diff sign-off invalidated on any single-character edit.
+- 事件流、Stop hook 与 TUI：`review_started`/`review_verdict`/`rework_sent`/`needs_attention` 接入 `events.jsonl`、`events --rebuild` 与 Stop hook（仅对 `needs_attention` 与 `NEEDS_CONTROLLER` 拦截未读）；`status` 与 `delegate tui` 实时显示「审查中 / PASS / REWORK 第N轮 / NEEDS_CONTROLLER」与签字状态。Review lifecycle events, Stop hook unread alerting, and status/TUI display.
+
 ## 6.28 确定性事件流、transcript 判活、Stop Hook 竞态锁、卡住只提醒与 DAG 续派
 
 - 全机事件流与游标等待：每次起、排队、拿/放 lane、交付、提问、验收、停止、apply、clean、卡住提醒与续派推进都追加 `<state>/events.jsonl`（单调 `seq`，写入失败仅记诊断不阻断 run）；`delegate events [--since SEQ] [--follow] [--rebuild] [--json]` 可回放、实时跟踪或从 run meta 重建，`delegate wait --since SEQ` 只返回 `seq > SEQ` 的事件并输出新游标。Deterministic append-only event stream, rebuild from run metas, and cursor-based wait.

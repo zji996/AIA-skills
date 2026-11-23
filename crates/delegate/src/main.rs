@@ -29,6 +29,7 @@ mod queue;
 mod refs;
 mod resources;
 mod remote;
+mod review;
 mod runs;
 mod source_build;
 mod source_watch;
@@ -268,6 +269,8 @@ fn format_status(status: serde_json::Value) -> String {
         "pendingChanges",
         "shape",
         "accept",
+        "review",
+        "sign",
         "readOnlyViolation",
         "protectViolation",
         "protectViolationReasons",
@@ -683,6 +686,11 @@ fn collect_timed(
                     mark_result_read(run);
                 }
             }
+            if !output::json_enabled() {
+                review::print_delivery_review(run);
+            }
+        } else if !output::json_enabled() && show_result {
+            review::print_delivery_review(run);
         }
         if show_result || !has_result {
             touch(run.join(".delivered"));
@@ -2272,9 +2280,21 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     let has_worktree_changes = s(&meta, "mode") == "write"
                         && meta["worktree"].is_object()
                         && n(sum.get("pendingChanges").unwrap_or(&sum["changes"]), "files") > 0;
+                    let rev_doc = {
+                        let f = json(run.join("review.json"));
+                        if f.is_object() { f } else { sum["review"].clone() }
+                    };
+                    let needs_ctrl = s(&rev_doc, "verdict") == "NEEDS_CONTROLLER"
+                        && !is_applied
+                        && !is_replied
+                        && review::sign_status(run, &meta, &rev_doc)
+                            .is_none_or(|sg| !b(&sg, "valid"));
                     if unresolved_conflicts || (has_worktree_changes && !is_applied && !is_replied)
                     {
                         pending_apply += 1;
+                        true
+                    } else if needs_ctrl {
+                        other_actionable += 1;
                         true
                     } else if is_applied || is_replied || is_delivered_read {
                         false
@@ -2463,6 +2483,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         }
         "events" => events::command(rest),
         "queue" => dag_queue::command(rest),
+        "sign" => review::sign_command(rest),
         "diff" => diff(rest),
         "patch" => patch(rest),
         "apply" => apply(rest),

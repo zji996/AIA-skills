@@ -474,6 +474,9 @@ pub fn command(args: &[String]) -> Res<i32> {
 }
 
 fn add_cmd(args: &[String]) -> Res<i32> {
+    if let Some(err) = crate::agents::nesting_error() {
+        return Err(err);
+    }
     let mut name: Option<String> = None;
     let mut after: Vec<String> = Vec::new();
     let mut prompt_file: Option<String> = None;

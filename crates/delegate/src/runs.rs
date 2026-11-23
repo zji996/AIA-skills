@@ -377,6 +377,26 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
         ));
     }
     if state == "delivered" || state == "answered" {
+        let rev = {
+            let f = json(run.join("review.json"));
+            if f.is_object() {
+                f
+            } else {
+                sum["review"].clone()
+            }
+        };
+        if s(&rev, "verdict") == "NEEDS_CONTROLLER" && !run.join(".applied").exists() {
+            if let Some(sign) = crate::review::sign_status(run, meta, &rev) {
+                if b(&sign, "required") && !b(&sign, "valid") {
+                    return Some(format!(
+                        "review controller-review.diff (NEEDS_CONTROLLER) and sign with {script} sign {name} before {script} apply {name}"
+                    ));
+                }
+            }
+            return Some(format!(
+                "review review.md (NEEDS_CONTROLLER), then {script} reply {name} '<decision>' or {script} apply {name}"
+            ));
+        }
         if s(meta, "mode") != "write"
             || n(
                 sum.get("pendingChanges").unwrap_or(&sum["changes"]),
@@ -542,6 +562,22 @@ pub fn status(run: &Path) -> Value {
     let stall_warning = json(run.join("stall-warning.json"));
     if stall_warning.is_object() {
         out["stallWarning"] = stall_warning;
+    }
+    let review_doc = {
+        let f = json(run.join("review.json"));
+        if f.is_object() {
+            f
+        } else if sum["review"].is_object() {
+            sum["review"].clone()
+        } else {
+            Value::Null
+        }
+    };
+    if review_doc.is_object() {
+        out["review"] = review_doc.clone();
+    }
+    if let Some(sign) = crate::review::sign_status(run, &meta, &review_doc) {
+        out["sign"] = sign;
     }
     if sum.is_object() {
         for key in [
@@ -779,6 +815,11 @@ pub fn remove_after_apply(run: &Path) -> Vec<String> {
         "result.md",
         "result-original.md",
         "summary.json",
+        "review.json",
+        "review.md",
+        "review",
+        "controller-review.diff",
+        "sign.json",
         "compression.json",
         "exit_code",
         ".applied",

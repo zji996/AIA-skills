@@ -624,6 +624,7 @@ fn parse_run_item(
     let files = string_list(v.get("files"));
     let (dir_changes, dirs_more) = parse_dir_changes(v.get("shape"), &files);
     let accept = parse_accept(v.get("accept"));
+    let review = parse_review(v.get("review"), v.get("sign"));
 
     let protect_violation = string_list(v.get("protectViolation"));
     let prompt_protected_paths = string_list(v.get("promptProtectedPaths"));
@@ -732,6 +733,7 @@ fn parse_run_item(
         dirs_more,
         files,
         accept,
+        review,
         protect_violation,
         prompt_protected_paths,
         source_write_violation,
@@ -815,6 +817,83 @@ fn format_model_name(v: &Value) -> String {
         .unwrap_or("-");
     let short = raw.rsplit('/').next().unwrap_or(raw);
     short.replace("gemini-4-", "")
+}
+
+fn parse_review(rev_val: Option<&Value>, sign_val: Option<&Value>) -> Option<ReviewInfo> {
+    let obj = rev_val.filter(|v| v.is_object())?;
+    let status = obj
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("done")
+        .to_string();
+    let verdict = obj
+        .get("verdict")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if status.is_empty() && verdict.is_none() {
+        return None;
+    }
+    let cr = obj.get("controllerReview").filter(|v| v.is_object());
+    let sign = sign_val.filter(|v| v.is_object());
+    let controller_paths = sign
+        .and_then(|s| s.get("paths"))
+        .map(|p| string_list(Some(p)))
+        .filter(|l| !l.is_empty())
+        .or_else(|| cr.map(|c| string_list(c.get("paths"))))
+        .unwrap_or_default();
+    let sign_hash = sign
+        .and_then(|s| s.get("hash"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            cr.and_then(|c| c.get("hash"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        })
+        .map(str::to_string);
+    let sign_required = sign
+        .and_then(|s| s.get("required"))
+        .and_then(Value::as_bool)
+        .unwrap_or(!controller_paths.is_empty());
+    let signed = sign
+        .and_then(|s| s.get("signed"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let sign_valid = sign
+        .and_then(|s| s.get("valid"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let sign_invalidated = sign
+        .and_then(|s| s.get("invalidated"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Some(ReviewInfo {
+        status,
+        verdict,
+        round: obj.get("round").and_then(Value::as_u64).unwrap_or(0),
+        rework_rounds: obj.get("reworkRounds").and_then(Value::as_u64).unwrap_or(0),
+        needs_attention: obj
+            .get("needsAttention")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        upgraded_by: obj
+            .get("upgradedBy")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        verdict_file: obj
+            .get("verdictFile")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        controller_paths,
+        sign_hash,
+        sign_required,
+        signed,
+        sign_valid,
+        sign_invalidated,
+    })
 }
 
 fn parse_accept(val: Option<&Value>) -> AcceptStatus {
@@ -1346,6 +1425,45 @@ fn summarize_event_payload(kind: &str, run: &str, p: &Value) -> String {
         "loop_review" => ps("reason").to_string(),
         "queue_dispatched" => format!("-> {}", ps("nextRun")),
         "queue_paused" => ps("reason").to_string(),
+        "review_started" => {
+            let round = p.get("round").and_then(Value::as_u64).unwrap_or(1);
+            let inc = if p.get("incremental").and_then(Value::as_bool) == Some(true) {
+                " 增量"
+            } else {
+                ""
+            };
+            format!("审查中 第{round}轮{inc}")
+        }
+        "review_verdict" => {
+            let v = ps("verdict");
+            let round = p.get("round").and_then(Value::as_u64).unwrap_or(0);
+            let up = ps("upgradedBy");
+            let mut s = if round > 0 {
+                format!("{v}（第{round}轮）")
+            } else {
+                v.to_string()
+            };
+            if !up.is_empty() {
+                s.push_str(&format!(" [{up}]"));
+            }
+            s
+        }
+        "rework_sent" => {
+            let round = p
+                .get("reworkRounds")
+                .or_else(|| p.get("round"))
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            format!("退回返工 第{round}轮")
+        }
+        "needs_attention" => {
+            let det = ps("detail");
+            if det.is_empty() {
+                ps("reason").to_string()
+            } else {
+                det.to_string()
+            }
+        }
         "applied" => {
             let head = ps("head");
             if head.is_empty() {

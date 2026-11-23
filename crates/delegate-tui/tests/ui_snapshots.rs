@@ -252,3 +252,48 @@ fn snapshot_events_tab_liveness_activity_and_dag_queue() {
     assert!(events_screen.contains("step-2"), "{events_screen}");
     assert!(events_screen.contains("事件 #3"), "{events_screen}");
 }
+
+#[test]
+fn snapshot_review_states_and_review_events() {
+    use delegate_tui::data::parse_events_jsonl;
+    let raw_runs = r#"
+{"run":"20261123-100000-r-ing","name":"审中任务","state":"running","mode":"write","modelName":"neon","elapsedSeconds":60,"ageSeconds":60,"review":{"status":"reviewing","round":1,"reworkRounds":0}}
+{"run":"20261123-100100-r-rw","name":"返工任务","state":"running","mode":"write","modelName":"neon","elapsedSeconds":120,"ageSeconds":120,"review":{"status":"reworking","verdict":"REWORK","round":2,"reworkRounds":2,"needsAttention":false}}
+{"run":"20261123-100200-r-pass","name":"通过任务","state":"delivered","mode":"write","modelName":"neon","elapsedSeconds":90,"ageSeconds":150,"accept":{"command":"cargo test","ok":true},"review":{"status":"done","verdict":"PASS","round":1,"reworkRounds":0}}
+{"run":"20261123-100300-r-ctrl","name":"主审任务","state":"delivered","mode":"write","modelName":"neon","elapsedSeconds":100,"ageSeconds":110,"accept":{"command":"cargo test","ok":true},"review":{"status":"done","verdict":"NEEDS_CONTROLLER","round":1,"reworkRounds":0,"needsAttention":true,"upgradedBy":"controllerReviewPaths","controllerReview":{"paths":["skills/delegate/SKILL.md"],"hash":"sha256:abcdef012345"}},"sign":{"required":true,"signed":false,"valid":false,"invalidated":false,"hash":"sha256:abcdef012345","paths":["skills/delegate/SKILL.md"]}}
+"#;
+    let raw_events = r#"
+{"seq":10,"at":"2026-11-23T10:00:00Z","run":"20261123-100000-r-ing","repo":"/home/dev/demo-api","kind":"review_started","payload":{"name":"审中任务","round":1,"incremental":false}}
+{"seq":11,"at":"2026-11-23T10:01:00Z","run":"20261123-100100-r-rw","repo":"/home/dev/demo-api","kind":"review_verdict","payload":{"name":"返工任务","round":2,"verdict":"REWORK"}}
+{"seq":12,"at":"2026-11-23T10:01:01Z","run":"20261123-100100-r-rw","repo":"/home/dev/demo-api","kind":"rework_sent","payload":{"name":"返工任务","round":2,"reworkRounds":2}}
+{"seq":13,"at":"2026-11-23T10:03:00Z","run":"20261123-100300-r-ctrl","repo":"/home/dev/demo-api","kind":"needs_attention","payload":{"name":"主审任务","reason":"controllerReviewPaths","detail":"命中受控路径"}}
+"#;
+    let repo = parse_status_jsonl(Path::new("/home/dev/demo-api"), "~/demo-api", raw_runs);
+    let snap = AppSnapshot {
+        repos: vec![repo],
+        lane: LaneStatus::default(),
+        events: parse_events_jsonl(raw_events),
+        dag_queue: vec![],
+        host_load: None,
+        refreshed_at: "10:04:00".into(),
+        warnings: vec![],
+    };
+    let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/dev/demo-api"), 5);
+    let screen = render_to_string(&mut app, 150, 34);
+    assert!(screen.contains("主审"), "{screen}");
+    assert!(screen.contains("NEEDS_CONTROLLER"), "{screen}");
+    assert!(screen.contains("PASS"), "{screen}");
+    assert!(screen.contains("审中"), "{screen}");
+    assert!(screen.contains("审查中"), "{screen}");
+    assert!(screen.contains("返工"), "{screen}");
+    assert!(screen.contains("REWORK 第2轮"), "{screen}");
+    assert!(screen.contains("controllerReviewPaths"), "{screen}");
+    assert!(screen.contains("sha256:abcdef012345"), "{screen}");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    let ev_screen = render_to_string(&mut app, 150, 34);
+    assert!(ev_screen.contains("开审"), "{ev_screen}");
+    assert!(ev_screen.contains("审结"), "{ev_screen}");
+    assert!(ev_screen.contains("返工"), "{ev_screen}");
+    assert!(ev_screen.contains("关注"), "{ev_screen}");
+}

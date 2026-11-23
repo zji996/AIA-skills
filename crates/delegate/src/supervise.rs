@@ -205,7 +205,7 @@ fn accept(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
     }
     result
 }
-fn attempts_from(
+pub(crate) fn attempts_from(
     meta: &Value,
     run: &Path,
     first: i64,
@@ -305,7 +305,7 @@ fn compress_answer(
     let _ = write_json(run.join("compression.json"), &record);
     (result.unwrap_or(answer), used_attempt)
 }
-fn settle(
+pub(crate) fn settle(
     meta: &mut Value,
     run: &Path,
     verdict: &str,
@@ -712,28 +712,32 @@ fn continuation(meta: &Value, run: &Path) -> Option<Value> {
     continuation_with(meta, run, transient::PROMPT)
 }
 
-fn continuation_with(meta: &Value, run: &Path, message: &str) -> Option<Value> {
+pub(crate) fn continuation_with_file(meta: &Value, run: &Path, prompt_file: &Path) -> Option<Value> {
     let id = runs::events(run)
         .into_iter()
         .rev()
         .find(|event| s(event, "e") == "session" && !s(event, "id").is_empty())
         .map(|event| s(&event, "id").to_string())?;
     let session = agents::continuation_target(meta, &id)?;
-    let prompt = run.join("resume-prompt.md");
-    write(&prompt, format!("{message}\n")).ok()?;
     let mut next = meta.clone();
     next["fork"] = json!(session);
-    next["agentPromptFile"] = json!(prompt);
+    next["agentPromptFile"] = json!(prompt_file);
     // The images went out with the first message and stay in the session; attaching them to a
     // continuation would send them a second time for no reason.
     next["images"] = json!([]);
     Some(next)
 }
 
+fn continuation_with(meta: &Value, run: &Path, message: &str) -> Option<Value> {
+    let prompt = run.join("resume-prompt.md");
+    write(&prompt, format!("{message}\n")).ok()?;
+    continuation_with_file(meta, run, &prompt)
+}
+
 /// A command that hangs (a test waiting forever, a server that never exits) is killed at the
 /// command stall limit. Killing the whole colleague then left no answer at all; instead the same
 /// session gets one more turn that names the command, so the colleague can find what hung.
-fn resume_stalled(
+pub(crate) fn resume_stalled(
     meta: &Value,
     run: &Path,
     first: (String, String, i64),
@@ -774,18 +778,18 @@ fn resume_stalled(
 }
 
 /// What a run did after waiting out an upstream outage.
-struct Resumed {
-    verdict: String,
-    answer: String,
-    attempts: i64,
-    resumes: i64,
-    error: String,
+pub(crate) struct Resumed {
+    pub(crate) verdict: String,
+    pub(crate) answer: String,
+    pub(crate) attempts: i64,
+    pub(crate) resumes: i64,
+    pub(crate) error: String,
 }
 
 /// A provider outage is not the task failing: wait for it to pass, check through Pi that the
 /// model answers again, then let the same session carry on in this run — same model, same
 /// worktree, changes kept. Only when the tries run out does the run fail (and escalate) as before.
-fn resume_transient(
+pub(crate) fn resume_transient(
     meta: &Value,
     run: &Path,
     first: (String, String, i64),
@@ -1028,6 +1032,31 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         );
         sum["escalatedFrom"] = json!(original_model);
     }
+    sum["attempts"] = json!(attempts);
+    if resumes > 0 {
+        sum["resumes"] = json!(resumes);
+    }
+    if !transient_error.is_empty() {
+        sum["transientError"] = json!(clip(&transient_error, 300));
+    }
+    if !answer.trim().is_empty() {
+        write(
+            run.join("result.md"),
+            format!("{}\n", answer.trim_end_matches('\n')),
+        )?;
+    }
+    crate::review::run_if_applicable(
+        &mut meta,
+        run,
+        &mut state,
+        &mut sum,
+        &mut rec,
+        &mut changed,
+        &mut answer,
+        &mut attempts,
+        holder.clone(),
+        grace.clone(),
+    )?;
     sum["attempts"] = json!(attempts);
     if resumes > 0 {
         sum["resumes"] = json!(resumes);

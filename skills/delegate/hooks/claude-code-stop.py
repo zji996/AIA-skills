@@ -35,6 +35,7 @@ UNREAD_ALERT_KINDS = {
     "failed",
     "stall_warning",
     "queue_paused",
+    "needs_attention",
 }
 KIND_LABELS = {
     "delivered": "交付",
@@ -43,6 +44,10 @@ KIND_LABELS = {
     "failed": "失败",
     "stall_warning": "卡住提醒",
     "queue_paused": "续派暂停",
+    "review_started": "开始审查",
+    "review_verdict": "审查判定",
+    "rework_sent": "退回返工",
+    "needs_attention": "需主控关注",
 }
 
 
@@ -395,7 +400,11 @@ def check_unread_events(payload: dict, cwd: str) -> str | None:
                 if not isinstance(seq, int) or seq <= cursor_seq:
                     continue
                 kind = str(ev.get("kind") or "")
-                if kind not in UNREAD_ALERT_KINDS:
+                pl = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+                is_alert = kind in UNREAD_ALERT_KINDS or (
+                    kind == "review_verdict" and pl.get("verdict") == "NEEDS_CONTROLLER"
+                )
+                if not is_alert:
                     continue
                 if current_only and current_repo_str is not None:
                     ev_repo = str(ev.get("repo") or "")

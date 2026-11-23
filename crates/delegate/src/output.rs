@@ -443,6 +443,53 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
     } else if state == "answered" {
         parts.push("未设验收".into());
     }
+    if status["review"].is_object() {
+        let rev = &status["review"];
+        let rstatus = s(rev, "status");
+        let rverdict = s(rev, "verdict");
+        let round = n(rev, "round").max(1);
+        let rework_rounds = n(rev, "reworkRounds");
+        let review_label = if rstatus == "reviewing" {
+            if round > 1 {
+                format!("审查中（第 {round} 轮）")
+            } else {
+                "审查中".to_string()
+            }
+        } else if rstatus == "reworking" {
+            let r = rework_rounds.max(round);
+            format!("REWORK 第 {r} 轮（返工中）")
+        } else if rverdict == "PASS" {
+            if rework_rounds > 0 {
+                format!("审查 PASS（第 {round} 轮）")
+            } else {
+                "审查 PASS".to_string()
+            }
+        } else if rverdict == "REWORK" {
+            let r = rework_rounds.max(round);
+            format!("REWORK 第 {r} 轮")
+        } else if rverdict == "NEEDS_CONTROLLER" {
+            let sign = &status["sign"];
+            if sign.is_object() && b(sign, "required") {
+                if b(sign, "valid") {
+                    "审查 NEEDS_CONTROLLER（已签字）".to_string()
+                } else if b(sign, "invalidated") {
+                    "审查 NEEDS_CONTROLLER（签字已失效）".to_string()
+                } else {
+                    "审查 NEEDS_CONTROLLER（待签字）".to_string()
+                }
+            } else {
+                "审查 NEEDS_CONTROLLER".to_string()
+            }
+        } else {
+            String::new()
+        };
+        if !review_label.is_empty() {
+            parts.push(review_label);
+        }
+        if b(rev, "needsAttention") && rverdict != "PASS" {
+            parts.push("⚠ 需主控关注".to_string());
+        }
+    }
     if status["evidence"].is_object() {
         parts.push(format!(
             "证据 {}",
@@ -580,7 +627,15 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
         } else if ["timeout", "stalled"].contains(&state) && s(status, "mode") == "write" {
             format!("改动保留，续做不计返工次数：{}", s(status, "next"))
         } else if matches!(state, "delivered" | "answered") {
-            if meta["worktree"].is_object() {
+            let rverdict = s(&status["review"], "verdict");
+            if rverdict == "NEEDS_CONTROLLER" {
+                let sign = &status["sign"];
+                if sign.is_object() && b(sign, "required") && !b(sign, "valid") {
+                    format!("主控审查 controllerReviewPaths 并签字：delegate sign {id}，再 delegate apply {id}")
+                } else {
+                    format!("主控审查结论（NEEDS_CONTROLLER）：delegate status {id}，再 delegate reply {id} '<决定>' 或 delegate apply {id}")
+                }
+            } else if meta["worktree"].is_object() {
                 if status["sourceDrift"]["overlap"]
                     .as_array()
                     .is_some_and(|paths| !paths.is_empty())
@@ -733,6 +788,65 @@ pub fn human_detail(run: &Path, status: &Value) -> String {
     let blind = blind_note(&status["acceptBlind"]);
     if !blind.is_empty() {
         lines.push(format!("  {blind}"));
+    }
+    if status["review"].is_object() {
+        let rev = &status["review"];
+        let verdict = s(rev, "verdict");
+        let rstatus = s(rev, "status");
+        let round = n(rev, "round");
+        let rework_rounds = n(rev, "reworkRounds");
+        let up = s(rev, "upgradedBy");
+        let mut info = Vec::new();
+        if rstatus == "reviewing" {
+            info.push(format!("状态：审查中（第 {} 轮）", round.max(1)));
+        } else if rstatus == "reworking" {
+            info.push(format!("状态：REWORK 第 {} 轮（返工中）", rework_rounds.max(round).max(1)));
+        } else if !verdict.is_empty() {
+            info.push(format!("结论：{verdict}（共 {round} 轮，返工 {rework_rounds} 轮）"));
+        }
+        if !up.is_empty() {
+            info.push(format!("升级：{up}"));
+        }
+        if !s(rev, "model").is_empty() {
+            info.push(format!("模型：{}", s(rev, "model")));
+        }
+        if !info.is_empty() {
+            lines.push(format!("  审查：{}", info.join(" · ")));
+        }
+        if !s(rev, "parseError").is_empty() {
+            lines.push(format!("  审查异常：{}", s(rev, "parseError")));
+        }
+        if !s(rev, "verdictFile").is_empty() {
+            lines.push(format!("  审查结论文件：{}", s(rev, "verdictFile")));
+        }
+        let cr = &rev["controllerReview"];
+        if cr.is_object() && !s(cr, "hash").is_empty() {
+            let paths = strings(&cr["paths"]);
+            lines.push(format!("  controllerReviewPaths：{}", paths.join("、")));
+            lines.push(format!("  签字哈希：{}", s(cr, "hash")));
+            if !s(cr, "diffFile").is_empty() {
+                lines.push(format!("  diff 文件：{}", s(cr, "diffFile")));
+            }
+        }
+        let sign = &status["sign"];
+        if sign.is_object() && b(sign, "required") {
+            let id = s(status, "run");
+            if b(sign, "valid") {
+                lines.push(format!(
+                    "  签字状态：已签字有效（{}，于 {}）",
+                    s(sign, "signedHash"),
+                    s(sign, "signedAt")
+                ));
+            } else if b(sign, "invalidated") {
+                lines.push(format!(
+                    "  签字状态：已失效（原签字 {} ≠ 当前 {}）；重新审查后执行 delegate sign {id}",
+                    s(sign, "signedHash"),
+                    s(sign, "hash")
+                ));
+            } else {
+                lines.push(format!("  签字状态：未签字（确认无误后执行 delegate sign {id}）"));
+            }
+        }
     }
     if let Some(items) = status["notes"].as_array().filter(|items| !items.is_empty()) {
         let pending = n(status, "pendingNotes");

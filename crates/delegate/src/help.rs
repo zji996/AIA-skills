@@ -96,6 +96,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "Manage the deterministic DAG continuation queue (add, list, remove/cancel).",
     ),
     (
+        "sign",
+        "Sign a run's controllerReviewPaths diff SHA-256 hash (or --check validity; invalidated on any edit).",
+    ),
+    (
         "status",
         "Show counts and concise one-line status for runs/chains needing action (status <run> adds path and note details); --all lists every round.",
     ),
@@ -225,6 +229,11 @@ pub fn print(command: Option<&str>) -> bool {
             ("add <name>", "Add a queued step: --after <run|name> (repeatable/comma-separated) --prompt-file <FILE> [delegate start options...]."),
             ("list [--all] [--json]", "List queued, dispatched, and paused DAG items."),
             ("remove|cancel <name>", "Cancel queued item(s)."),
+        ]),
+        "sign" => ("[--check] [--json] [<run>]", "Record (or --check) the controller sign-off SHA-256 hash over a run's controllerReviewPaths diff. Any 1-byte change to matched paths invalidates the signature.", &[
+            ("run", "Run id, name, or directory (default: last)."),
+            ("--check", "Verify existing sign.json against the current diff without modifying (exit 0 valid/not required, 1 unsigned or invalidated)."),
+            ("--json", "Print structured JSON output."),
         ]),
         "status" | "list" => ("[--all] [--json] [--files] [runs ...]", "Show a counts line plus concise one-line status for runs needing action (running/queued, questions, unapplied or unread results, unhandled rejections, and pending todos; collapsing reply chains to their latest round) and a footer pointing to delegate history. Passing run names appends indented path and todo details.", &[
             ("runs", "Run ids or directories (default: actionable runs and pending todos)."),

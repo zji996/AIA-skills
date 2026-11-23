@@ -48,22 +48,21 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 
 ## 同事全量检查拦截（agentDeny）
 
-仓库根 `.delegate.json` 可配置：
+仓库根 `.delegate.json` 示例：
 
 ```json
 {"agentDeny": [
-  {"argv": ["cargo", "xtask", "check"], "hint": "全量检查由主控合入后跑；改跑 cargo test -p <crate> 与 cargo clippy -p <crate>"},
-  {"argv": ["cargo", "xtask", "infra-test"], "exact": true, "hint": "请带过滤参数只测相关用例"},
-  {"argv": ["pnpm", "check"], "hint": "全量检查由主控合入后跑；改跑 pnpm --filter <package> test"}
+  {"argv": ["cargo", "xtask", "check"], "hint": "全量检查由主控合入后跑；改跑 cargo test -p <crate>"},
+  {"argv": ["cargo", "xtask", "infra-test"], "exact": true, "hint": "带过滤参数只测相关用例"}
 ]}
 ```
 
-默认按完整 argv 的逐项、大小写敏感前缀匹配；尾部可以有更多参数。`exact: true` 必须 argv 完全相等且无多余参数：上述 `cargo xtask infra-test` 命中，`cargo xtask infra-test --filter db` 放行。`cargo xtask check --all` 命中前缀规则，`cargo --locked xtask check` 不命中，不忽略或重排 `+toolchain`、`--locked` 等全局参数。每条规则的 `argv` 非空，首项是程序名（字母、数字、`._-`，不能是路径或 `.`/`..`），其他项为字符串，`hint` 非空，`exact` 可选且为布尔值；字符串不能含 NUL。同程序多条规则按配置顺序匹配首条。
+默认按完整 argv 大小写敏感前缀匹配；`exact: true` 要求 argv 完全相等（不忽略或重排 `+toolchain`/`--locked`）。规则 `argv` 非空、首项为程序名、`hint` 非空、无 NUL，同程序按序匹配首条。
 
-启动时在 run 的 `agent-shims/` 为每个程序生成 shell shim，按原 PATH（含顶层 env.PATH）与同事工作目录解析真实程序的绝对路径，保留 cargo/rustup 等多调用符号链接的名称；真实程序缺失时，未命中的调用退出 127。只在同事进程的 PATH 最前面插入该目录，reply 继承规则。命中打印 hint 到 stderr，退出 77；未命中直接 exec，参数、stdin/stdout 与退出码透传。同事的 `lane` 继承 shim PATH，即使自己设置 `DELEGATE_ALLOW_HEAVY=1` 或 `DELEGATE_LANE_HELD=1` 仍会拒绝。`denied.log` 累计本轮各尝试的次数，结论 `denied: N`，短行显示“拦下 N 次全量检查”；未配置或空列表不生成 deny 规则，不增加 denied 字段；进程匹配的三个 shim 始终生成。
-
-验收、证据、setup、收尾生成核对、apply 的生成与 applyVerify 都由未注入 shim 的执行环境运行，主控自己的 lane 同理。没有环境放行开关或可交给同事的令牌。威胁模型是防误用，不是防恶意：同 UID 进程可以改 PATH、用绝对路径或改 shim/记录，这不是安全沙箱。
+启动时在 `agent-shims/` 生成 shell shim 并插入同事 PATH 前端（reply 继承）；命中输出 hint 到 stderr 并退出 77，未命中透传 exec。同事的 `lane` 同样继承 shim PATH。`denied.log` 累计次数，结论记 `denied: N`；进程匹配三个 shim 始终生成。验收、证据、setup、生成核对、apply 与主控 `lane` 不注入 shim。威胁模型是防误用，非安全沙箱。
 
 - `stall`：`{"idle":"30m","command":"90m","accept":"10m"}`，`"0"` 关闭；`DELEGATE_STALL_IDLE`/`COMMAND`/`ACCEPT` 优先，均只发 `stall_warning` 不杀进程。
 - `checkIn`：wait 检查线时长，`"0"` 关闭；`DELEGATE_CHECK_IN` 优先。未设置时 Claude Code 使用 50m，其它调用方不设默认。
 - `agy`：`{"agent":"aia"}` 为 agy 同事附加 `--agent <名>`（新会话、续做与 `probe` 生效），名称非空且无空白/控制字符，未设不变。
+- `review`（默认关）：`true` 或 `{"enabled"?:true,"tier"?:"review"|"scout","model"?:"<别名>","thinking"?:"<档>","rubric"?:"<路径>"}`（仓库优先）。写入验收通过后派新上下文只读审查员（禁写文件/派活），输入任务说明、`diff --total` 与要点（默认 [review-rubric.md](review-rubric.md)）；首行严格 `PASS`/`REWORK`/`NEEDS_CONTROLLER`（格式不对或越权写入失败关闭为 `NEEDS_CONTROLLER`），`REWORK` 原样退回且续审只看增量 diff（不设轮数上限，第 3 轮起发 `needs_attention` 不强杀）。
+- `controllerReviewPaths`：glob 数组（支持 `*`/`?`/`**`/末尾 `/`），仓库优先。净改动命中时一律升 `NEEDS_CONTROLLER` 并附 diff 全文与 SHA-256 哈希，主控用 `delegate sign <run>` 落盘 `sign.json`（改一字即失效，`sign --check` 校验）。

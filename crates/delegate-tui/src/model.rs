@@ -88,6 +88,91 @@ pub struct StallWarningInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReviewInfo {
+    pub status: String,
+    pub verdict: Option<String>,
+    pub round: u64,
+    pub rework_rounds: u64,
+    pub needs_attention: bool,
+    pub upgraded_by: Option<String>,
+    pub verdict_file: Option<String>,
+    pub controller_paths: Vec<String>,
+    pub sign_hash: Option<String>,
+    pub sign_required: bool,
+    pub signed: bool,
+    pub sign_valid: bool,
+    pub sign_invalidated: bool,
+}
+
+impl ReviewInfo {
+    pub fn row_snippet(&self) -> String {
+        if self.status == "reviewing" {
+            if self.round > 1 {
+                format!("审查中 第{}轮", self.round)
+            } else {
+                "审查中".to_string()
+            }
+        } else if self.status == "reworking" {
+            let r = self.rework_rounds.max(self.round).max(1);
+            format!("REWORK 第{r}轮")
+        } else {
+            match self.verdict.as_deref() {
+                Some("PASS") => "PASS".to_string(),
+                Some("REWORK") => {
+                    let r = self.rework_rounds.max(self.round).max(1);
+                    format!("REWORK 第{r}轮")
+                }
+                Some("NEEDS_CONTROLLER") => "NEEDS_CONTROLLER".to_string(),
+                Some(other) if !other.is_empty() => other.to_string(),
+                _ => String::new(),
+            }
+        }
+    }
+
+    pub fn detail_label(&self) -> String {
+        if self.status == "reviewing" {
+            if self.round > 1 {
+                format!("审查中（第 {} 轮）", self.round)
+            } else {
+                "审查中".to_string()
+            }
+        } else if self.status == "reworking" {
+            let r = self.rework_rounds.max(self.round).max(1);
+            format!("REWORK 第 {r} 轮（返工中）")
+        } else {
+            match self.verdict.as_deref() {
+                Some("PASS") => {
+                    if self.rework_rounds > 0 {
+                        format!("PASS（第 {} 轮）", self.round.max(1))
+                    } else {
+                        "PASS".to_string()
+                    }
+                }
+                Some("REWORK") => {
+                    let r = self.rework_rounds.max(self.round).max(1);
+                    format!("REWORK 第 {r} 轮")
+                }
+                Some("NEEDS_CONTROLLER") => {
+                    if self.sign_required {
+                        if self.sign_valid {
+                            "NEEDS_CONTROLLER（已签字）".to_string()
+                        } else if self.sign_invalidated {
+                            "NEEDS_CONTROLLER（签字已失效）".to_string()
+                        } else {
+                            "NEEDS_CONTROLLER（待签字）".to_string()
+                        }
+                    } else {
+                        "NEEDS_CONTROLLER".to_string()
+                    }
+                }
+                Some(other) => other.to_string(),
+                None => String::new(),
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EventItem {
     pub seq: u64,
     pub at: String,
@@ -131,6 +216,10 @@ impl EventItem {
             "loop_review" => "自检",
             "queue_dispatched" => "续派",
             "queue_paused" => "暂停",
+            "review_started" => "开审",
+            "review_verdict" => "审结",
+            "rework_sent" => "返工",
+            "needs_attention" => "关注",
             _ => "事件",
         }
     }
@@ -209,6 +298,7 @@ pub struct RunItem {
     pub dirs_more: usize,
     pub files: Vec<String>,
     pub accept: AcceptStatus,
+    pub review: Option<ReviewInfo>,
     pub protect_violation: Vec<String>,
     pub prompt_protected_paths: Vec<String>,
     pub source_write_violation: bool,
@@ -282,6 +372,14 @@ impl RunItem {
             return "提问";
         }
         if matches!(self.state.as_str(), "running" | "starting") {
+            if let Some(rev) = &self.review {
+                if rev.status == "reviewing" {
+                    return "审中";
+                }
+                if rev.status == "reworking" {
+                    return "返工";
+                }
+            }
             if self.stall_warning.is_some() {
                 return "卡警";
             }
@@ -294,6 +392,13 @@ impl RunItem {
                     "error" => "报错",
                     _ => "运行",
                 };
+            }
+        }
+        if !self.applied {
+            if let Some(rev) = &self.review {
+                if rev.verdict.as_deref() == Some("NEEDS_CONTROLLER") {
+                    return "主审";
+                }
             }
         }
         match self.state.as_str() {
@@ -333,6 +438,11 @@ impl RunItem {
         if query_lower.is_empty() {
             return true;
         }
+        let review_snippet = self
+            .review
+            .as_ref()
+            .map(ReviewInfo::detail_label)
+            .unwrap_or_default();
         let haystacks = [
             self.display_name.as_str(),
             self.name.as_str(),
@@ -344,6 +454,7 @@ impl RunItem {
             self.group.label(),
             self.last_command.as_deref().unwrap_or(""),
             self.activity.as_ref().map(|a| a.label.as_str()).unwrap_or(""),
+            review_snippet.as_str(),
             self.next_step.as_deref().unwrap_or(""),
         ];
         if haystacks

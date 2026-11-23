@@ -939,6 +939,12 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     extra["cleanupKeepExecutables"] = config.value["cleanupKeepExecutables"].clone();
     extra["share"] = json!(o.share);
     extra["acceptBlind"] = config.value["acceptBlind"].clone();
+    extra["controllerReviewPaths"] = config.value["controllerReviewPaths"].clone();
+    if !o.read_only {
+        if let Some(rc) = crate::review::resolve_launch_config(&config.value, repo.as_deref())? {
+            extra["reviewConfig"] = rc;
+        }
+    }
     extra["remoteOff"] = json!(std::env::var("DELEGATE_REMOTE").ok().as_deref() == Some("0"));
     extra["remote"] = config.value["remote"].clone();
     extra["resources"] = config.value["resources"].clone();
@@ -1539,6 +1545,21 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     extra["cleanupKeepExecutables"] = config.value["cleanupKeepExecutables"].clone();
     extra["share"] = meta["share"].clone();
     extra["acceptBlind"] = meta["acceptBlind"].clone();
+    extra["controllerReviewPaths"] = if config.value["controllerReviewPaths"].is_array() {
+        config.value["controllerReviewPaths"].clone()
+    } else {
+        meta["controllerReviewPaths"].clone()
+    };
+    if !o.read_only {
+        if let Some(rc) = crate::review::resolve_launch_config(
+            &config.value,
+            (!top.is_empty()).then_some(Path::new(top)),
+        )? {
+            extra["reviewConfig"] = rc;
+        } else if meta["reviewConfig"].is_object() {
+            extra["reviewConfig"] = meta["reviewConfig"].clone();
+        }
+    }
     extra["remoteOff"] = json!(match std::env::var("DELEGATE_REMOTE") {
         Ok(value) => value == "0",
         Err(_) => b(&meta, "remoteOff"),
@@ -1645,6 +1666,9 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         &extra,
         Some(&parent),
     )?;
+    if !after_apply && parent.join("sign.json").is_file() {
+        let _ = fs::copy(parent.join("sign.json"), child.join("sign.json"));
+    }
     if parent.join("meta.json").is_file() && !crate::archive::is_record(&parent) {
         let mut parent_meta = json(parent.join("meta.json"));
         parent_meta["repliedAt"] = json!(iso());
@@ -2320,6 +2344,8 @@ pub fn launch(
         "cleanupKeepExecutables",
         "share",
         "acceptBlind",
+        "controllerReviewPaths",
+        "reviewConfig",
         "resources",
         "remote",
         "remoteOff",

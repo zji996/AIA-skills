@@ -288,6 +288,8 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
                 return Err("acceptBlind must be a list of non-empty globs".into());
             }
         }
+        crate::review::validate_review_config(value.get("review"))?;
+        crate::review::validate_controller_review_paths(value.get("controllerReviewPaths"))?;
         Ok(())
     };
     check().map_err(|e| format!("{}: {e}", path.display()))?;
@@ -369,6 +371,8 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         "repoMaxActive",
         "resultChars",
         "acceptBlind",
+        "review",
+        "controllerReviewPaths",
         "stall",
         "checkIn",
         "agy",

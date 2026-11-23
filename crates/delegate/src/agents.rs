@@ -368,6 +368,14 @@ pub const COLLEAGUE: &str = "You are a delegated colleague: a delegator gave you
 - After a context compaction, continue from the summary; do not restart or redo finished work.
 - Answer in the brief's language: the conclusion first, then evidence (file:line) and what you did not verify.
 ";
+pub const REVIEWER_COLLEAGUE: &str = "You are an independent read-only code reviewer running in a fresh context.
+- Do not create, modify, or delete any files, and do not delegate subtasks.
+- Your VERY FIRST output line MUST be exactly one of: `PASS`, `REWORK`, or `NEEDS_CONTROLLER` (no prefix, no markdown formatting, no extra text on line 1).
+- Use `PASS` when changes satisfy the brief with no blocking defects, regressions, vacuous tests, or out-of-scope edits.
+- Use `REWORK` when concrete fixable issues exist; list each issue with `file:line` evidence and required fix.
+- Use `NEEDS_CONTROLLER` when a requirement ambiguity, architecture trade-off, out-of-authority change, or inability to verify requires the controller's decision.
+- After a context compaction, continue from the summary; do not restart.
+";
 pub const QUESTION_MARKERS: [&str; 2] = ["需要主控决定", "Needs a decision"];
 
 /// The colleague stopped to ask: its answer opens with a question marker.
@@ -857,7 +865,12 @@ pub fn run_agent(
     };
     let session_dir = Path::new(s(meta, "sessionDir"));
     let known = session_files(session_dir);
-    write(Path::new(s(meta, "dir")).join("colleague.md"), COLLEAGUE)?;
+    let addendum_text = if b(meta, "isReviewer") {
+        REVIEWER_COLLEAGUE
+    } else {
+        COLLEAGUE
+    };
+    write(Path::new(s(meta, "dir")).join("colleague.md"), addendum_text)?;
     let mut args = if on_agy {
         crate::agy::command(meta, Some(s(meta, "fork")))
     } else {
@@ -874,7 +887,7 @@ pub fn run_agent(
         // agy takes the prompt as one stream-json message; the addendum Pi gets as a
         // system-prompt append opens a new conversation's first message.
         let task = fs::read_to_string(&prompt_path).map_err(|e| e.to_string())?;
-        let addendum = if s(meta, "fork").is_empty() { COLLEAGUE } else { "" };
+        let addendum = if s(meta, "fork").is_empty() { addendum_text } else { "" };
         let images = meta["images"].as_array().cloned().unwrap_or_default();
         let input = run.join(format!("agy-input-{attempt}.jsonl"));
         write(&input, crate::agy::input(addendum, &task, &images))?;

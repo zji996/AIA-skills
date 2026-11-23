@@ -12,14 +12,22 @@ use std::time::{Duration, Instant};
 
 /// Event kinds that require controller attention and trigger the Stop hook race lock
 /// when unread past the controller's cursor.
-pub const ALERT_KINDS: [&str; 6] = [
+pub const ALERT_KINDS: [&str; 7] = [
     "delivered",
     "question",
     "rejected",
     "failed",
     "stall_warning",
     "queue_paused",
+    "needs_attention",
 ];
+
+/// Whether an event record requires controller attention for cursor advancement & Stop hook.
+pub fn is_alert_event(ev: &Value) -> bool {
+    let kind = s(ev, "kind");
+    ALERT_KINDS.contains(&kind)
+        || (kind == "review_verdict" && s(&ev["payload"], "verdict") == "NEEDS_CONTROLLER")
+}
 
 pub fn events_path() -> PathBuf {
     state_dir().join("events.jsonl")
@@ -336,8 +344,7 @@ pub fn mark_runs_read_in(state: &Path, caller_id: Option<&str>, run_ids: &[Strin
     let mut new_seq = cur_seq;
     for ev in &events {
         let seq = ev["seq"].as_u64().unwrap_or(0);
-        let kind = s(ev, "kind");
-        if ALERT_KINDS.contains(&kind) {
+        if is_alert_event(ev) {
             let r = s(ev, "run");
             let covered = read_runs_snapshot
                 .get(r)
@@ -577,6 +584,159 @@ pub fn rebuild_in(state: &Path, extra_runs_dirs: &[PathBuf]) -> Res<Value> {
                 ));
             }
 
+            // Reconstruct 6.29 review events from review.json / summary.review.
+            let rev = {
+                let f = json(run.join("review.json"));
+                if f.is_object() {
+                    f
+                } else {
+                    sum["review"].clone()
+                }
+            };
+            if rev.is_object() {
+                if let Some(rounds) = rev["rounds"].as_array() {
+                    for (idx, r) in rounds.iter().enumerate() {
+                        let rnum = n(r, "round").max((idx + 1) as i64);
+                        let r_start = if !s(r, "startedAt").is_empty() {
+                            s(r, "startedAt").to_string()
+                        } else {
+                            fin_at.clone()
+                        };
+                        let r_end = if !s(r, "finishedAt").is_empty() {
+                            s(r, "finishedAt").to_string()
+                        } else {
+                            r_start.clone()
+                        };
+                        let r_sts = iso_epoch(&r_start).unwrap_or(fin_ts);
+                        let r_ets = iso_epoch(&r_end).unwrap_or(r_sts);
+                        raw.push((
+                            r_sts,
+                            4,
+                            run_id.clone(),
+                            r_start,
+                            repo.clone(),
+                            "review_started",
+                            json!({
+                                "name": name,
+                                "round": rnum,
+                                "incremental": b(r, "incremental"),
+                                "model": rev["model"],
+                                "tier": rev["tier"],
+                            }),
+                        ));
+                        let r_verdict = s(r, "verdict");
+                        if !r_verdict.is_empty() {
+                            let mut vp = json!({
+                                "name": name,
+                                "round": rnum,
+                                "verdict": r_verdict,
+                                "verdictFile": r["verdictFile"],
+                            });
+                            if !s(r, "upgradedBy").is_empty() {
+                                vp["upgradedBy"] = r["upgradedBy"].clone();
+                            }
+                            if b(r, "formatError") {
+                                vp["formatError"] = json!(true);
+                            }
+                            raw.push((
+                                r_ets,
+                                4,
+                                run_id.clone(),
+                                r_end.clone(),
+                                repo.clone(),
+                                "review_verdict",
+                                vp,
+                            ));
+                            if r_verdict == "REWORK" {
+                                raw.push((
+                                    r_ets,
+                                    4,
+                                    run_id.clone(),
+                                    r_end.clone(),
+                                    repo.clone(),
+                                    "rework_sent",
+                                    json!({
+                                        "name": name,
+                                        "round": rnum,
+                                        "reworkRounds": rnum,
+                                        "verdictFile": r["verdictFile"],
+                                    }),
+                                ));
+                                if rnum >= 3 {
+                                    raw.push((
+                                        r_ets,
+                                        4,
+                                        run_id.clone(),
+                                        r_end.clone(),
+                                        repo.clone(),
+                                        "needs_attention",
+                                        json!({
+                                            "name": name,
+                                            "round": rnum,
+                                            "reworkRounds": rnum,
+                                            "reason": "rework_rounds",
+                                            "verdict": "REWORK",
+                                            "detail": format!("审-改返工已达第 {rnum} 轮"),
+                                        }),
+                                    ));
+                                }
+                            } else if r_verdict == "NEEDS_CONTROLLER" {
+                                raw.push((
+                                    r_ets,
+                                    4,
+                                    run_id.clone(),
+                                    r_end.clone(),
+                                    repo.clone(),
+                                    "needs_attention",
+                                    json!({
+                                        "name": name,
+                                        "round": rnum,
+                                        "reason": if s(r, "upgradedBy").is_empty() { "needs_controller" } else { s(r, "upgradedBy") },
+                                        "verdict": "NEEDS_CONTROLLER",
+                                        "detail": s(r, "parseError"),
+                                    }),
+                                ));
+                            }
+                        }
+                    }
+                } else if s(&rev, "verdict") == "NEEDS_CONTROLLER" {
+                    let at = if !s(&rev, "finishedAt").is_empty() {
+                        s(&rev, "finishedAt").to_string()
+                    } else {
+                        fin_at.clone()
+                    };
+                    let ts = iso_epoch(&at).unwrap_or(fin_ts);
+                    raw.push((
+                        ts,
+                        4,
+                        run_id.clone(),
+                        at.clone(),
+                        repo.clone(),
+                        "review_verdict",
+                        json!({
+                            "name": name,
+                            "round": n(&rev, "round"),
+                            "verdict": "NEEDS_CONTROLLER",
+                            "upgradedBy": rev["upgradedBy"],
+                        }),
+                    ));
+                    raw.push((
+                        ts,
+                        4,
+                        run_id.clone(),
+                        at,
+                        repo.clone(),
+                        "needs_attention",
+                        json!({
+                            "name": name,
+                            "round": n(&rev, "round"),
+                            "reason": if s(&rev, "upgradedBy").is_empty() { "needs_controller" } else { s(&rev, "upgradedBy") },
+                            "verdict": "NEEDS_CONTROLLER",
+                        }),
+                    ));
+                }
+            }
+
             let state_str = s(&sum, "state");
             let question = b(&sum, "question");
             let kind = if question {
@@ -800,6 +960,45 @@ pub fn format_human(ev: &Value) -> String {
         }
         "queue_paused" => {
             format!("续派暂停 {}: {}", s(p, "queueName"), clip(s(p, "reason"), 80))
+        }
+        "review_started" => {
+            let round = n(p, "round").max(1);
+            let inc = if b(p, "incremental") { "，增量 diff" } else { "" };
+            let model = s(p, "model");
+            if model.is_empty() {
+                format!("开始审查（第 {round} 轮{inc}）")
+            } else {
+                format!("开始审查（第 {round} 轮{inc}，{model}）")
+            }
+        }
+        "review_verdict" => {
+            let verdict = s(p, "verdict");
+            let round = n(p, "round");
+            let up = s(p, "upgradedBy");
+            let mut msg = if round > 0 {
+                format!("审查判定 {verdict}（第 {round} 轮）")
+            } else {
+                format!("审查判定 {verdict}")
+            };
+            if !up.is_empty() {
+                msg.push_str(&format!(" [升级:{up}]"));
+            }
+            msg
+        }
+        "rework_sent" => {
+            let round = n(p, "reworkRounds").max(n(p, "round")).max(1);
+            format!("原样退回作者返工（第 {round} 轮）")
+        }
+        "needs_attention" => {
+            let det = s(p, "detail");
+            let reason = s(p, "reason");
+            if !det.is_empty() {
+                format!("⚠ 需要主控关注：{}", clip(det, 80))
+            } else if !reason.is_empty() {
+                format!("⚠ 需要主控关注（{reason}）")
+            } else {
+                "⚠ 需要主控关注".to_string()
+            }
         }
         _ => String::new(),
     };
