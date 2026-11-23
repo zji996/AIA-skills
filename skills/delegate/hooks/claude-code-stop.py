@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified Claude Code Stop hook for delegate (6.36.0).
+"""Unified Claude Code Stop hook for delegate (6.36.1).
 
 Replaces legacy `delegate-waiter.sh`, `delegate-unmerged.sh`, and earlier Stop hooks
 with a single zero-lock, zero-git turn-end guard across the current repository and all
@@ -293,6 +293,32 @@ def strip_reply_prefixes(name: str) -> str:
     return cur or name
 
 
+def overlay_sign_status(rdir: Path, obj: dict) -> None:
+    """Lock-free sign status overlay matching `review::sign_status` JSON comparison."""
+    sign_doc = read_json_file(rdir / "sign.json")
+    if not sign_doc:
+        return
+    signed_hash = str(sign_doc.get("hash") or "").strip()
+    if not signed_hash:
+        return
+    rev = read_json_file(rdir / "review.json")
+    if rev is None and isinstance(obj.get("review"), dict):
+        rev = obj["review"]
+    cr = rev.get("controllerReview") if isinstance(rev, dict) and isinstance(rev.get("controllerReview"), dict) else {}
+    cur_hash = str(cr.get("hash") or "").strip()
+    if not cur_hash:
+        return
+    valid = signed_hash == cur_hash
+    obj["sign"] = {
+        "required": True,
+        "signed": True,
+        "valid": valid,
+        "invalidated": not valid,
+        "hash": cur_hash,
+        "signedHash": signed_hash,
+    }
+
+
 def read_run_snapshot(rdir: Path) -> dict | None:
     """Zero-lock, zero-git, zero-subprocess snapshot of a single run directory."""
     meta = read_json_file(rdir / "meta.json")
@@ -380,6 +406,7 @@ def read_run_snapshot(rdir: Path) -> dict | None:
         obj["premerge"] = pm
     if rev is not None:
         obj["review"] = rev
+    overlay_sign_status(rdir, obj)
 
     # Synthesize `next` for finished unapplied write runs so downstream classification stays uniform.
     if st == "delivered" and mode == "write" and not is_applied:
@@ -429,10 +456,11 @@ def fetch_status(runs_dir: Path, index_runs: dict[str, dict]) -> list[dict]:
                         stale = True
             if not stale:
                 cand.setdefault("dir", str(rdir))
-                # Overlay fresh premerge.json directly from disk (lock-free).
+                # Overlay fresh premerge.json and sign.json directly from disk (lock-free).
                 pm = read_json_file(rdir / "premerge.json")
                 if pm is not None:
                     cand["premerge"] = pm
+                overlay_sign_status(rdir, cand)
                 # Preserve merge metadata for active serial merge runs.
                 if st in ("running", "starting", "waiting", "queued") and not cand.get("isMerge"):
                     meta = read_json_file(rdir / "meta.json")
@@ -772,13 +800,12 @@ def parse_iso_utc(ts_str: str) -> int | None:
         return None
 
 
-def work_deferred_runs(now: int) -> tuple[set[str], set[str]]:
-    """Read `<state>/work.jsonl` and return (fresh_deferred_run_ids, expired_deferred_run_ids)."""
+def load_work_items() -> list[dict]:
+    """Lock-free read of `<state>/work.jsonl`."""
     wfile = state_dir() / "work.jsonl"
     if not wfile.is_file():
-        return set(), set()
-    fresh: set[str] = set()
-    expired: set[str] = set()
+        return []
+    items: list[dict] = []
     try:
         with wfile.open("r", encoding="utf-8") as fh:
             for line in fh:
@@ -789,25 +816,151 @@ def work_deferred_runs(now: int) -> tuple[set[str], set[str]]:
                     item = json.loads(line)
                 except ValueError:
                     continue
-                if not isinstance(item, dict) or item.get("state") == "done":
-                    continue
-                runs = [r for r in (item.get("runs") or []) if isinstance(r, str) and r]
-                if not runs:
-                    continue
-                st = str(item.get("state") or "")
-                until_raw = str(item.get("deferUntil") or "").strip()
-                reason_raw = str(item.get("deferReason") or "").strip()
-                if st == "deferred":
-                    until_ts = parse_iso_utc(until_raw)
-                    if until_ts is not None and until_ts > now:
-                        fresh.update(runs)
-                    else:
-                        expired.update(runs)
-                elif reason_raw and not until_raw:
-                    expired.update(runs)
+                if isinstance(item, dict):
+                    items.append(item)
     except OSError:
-        return set(), set()
+        return []
+    return items
+
+
+def work_deferred_runs(work_items: list[dict], now: int) -> tuple[set[str], set[str]]:
+    """Return (fresh_deferred_run_ids, expired_deferred_run_ids) from parsed work items."""
+    fresh: set[str] = set()
+    expired: set[str] = set()
+    for item in work_items:
+        if item.get("state") == "done":
+            continue
+        runs = [r for r in (item.get("runs") or []) if isinstance(r, str) and r]
+        if not runs:
+            continue
+        st = str(item.get("state") or "")
+        until_raw = str(item.get("deferUntil") or "").strip()
+        reason_raw = str(item.get("deferReason") or "").strip()
+        if st == "deferred":
+            until_ts = parse_iso_utc(until_raw)
+            if until_ts is not None and until_ts > now:
+                fresh.update(runs)
+            else:
+                expired.update(runs)
+        elif reason_raw and not until_raw:
+            expired.update(runs)
     return fresh, expired
+
+
+def load_queue_items_by_name() -> dict[str, list[dict]] | None:
+    """Lock-free read of `<state>/dag-queue.json` grouped by queue item name."""
+    doc = read_json_file(state_dir() / "dag-queue.json")
+    if doc is None:
+        return None
+    raw_items = doc.get("items")
+    if not isinstance(raw_items, list):
+        return None
+    by_name: dict[str, list[dict]] = {}
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if name:
+            by_name.setdefault(name, []).append(item)
+    return by_name
+
+
+def is_alert_event_stale(
+    ev: dict,
+    seq: int,
+    now: int,
+    work_by_id: dict[str, dict],
+    all_runs_by_id: dict[str, dict],
+    replied_parents: set[str],
+    resolving: dict[str, dict[str, int]],
+    queue_items_by_name: dict[str, list[dict]] | None,
+) -> bool:
+    """Return True when an unread alert event has already been resolved or superseded."""
+    kind = str(ev.get("kind") or "")
+    pl = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+
+    # 1) Work-item state events (`work_ready`, `work_defer_expired`, `work_stale`).
+    if kind in ("work_ready", "work_defer_expired", "work_stale"):
+        wid = str(pl.get("workId") or "").strip()
+        w = work_by_id.get(wid) if wid else None
+        if w is None:
+            return False
+        wstate = str(w.get("state") or "")
+        if kind == "work_ready":
+            # Stale once closed/dropped (`done`) or no longer `ready` (e.g. `verify`, `active`, `deferred`).
+            return wstate != "ready"
+        if wstate == "done":
+            return True
+        if wstate == "deferred":
+            until_ts = parse_iso_utc(str(w.get("deferUntil") or ""))
+            if until_ts is not None and until_ts > now:
+                return True
+        if kind == "work_defer_expired":
+            return wstate == "active"
+        if kind == "work_stale":
+            ev_state = str(pl.get("state") or "").strip()
+            if ev_state and wstate != ev_state:
+                return True
+            return False
+
+    # 2) DAG queue paused events (`queue_paused`).
+    if kind == "queue_paused":
+        qname = str(pl.get("queueName") or pl.get("name") or "").strip()
+        if qname and queue_items_by_name is not None and qname in queue_items_by_name:
+            entries = queue_items_by_name[qname]
+            if entries and not any(str(e.get("status") or "") == "paused" for e in entries):
+                return True
+        return False
+
+    # 3) Run-scoped alert events.
+    rid = str(ev.get("run") or "").strip()
+    if not rid:
+        return False
+
+    run_obj = all_runs_by_id.get(rid)
+    is_applied = (
+        resolving["applied"].get(rid, 0) > seq
+        or (run_obj is not None and run_obj.get("applied") is True)
+    )
+    is_cleaned = (
+        resolving["cleaned"].get(rid, 0) > seq
+        or (run_obj is not None and run_obj.get("cleaned") is True)
+    )
+    is_replied = rid in replied_parents or resolving["replied"].get(rid, 0) > seq
+
+    if is_applied or is_cleaned or is_replied:
+        return True
+
+    if kind == "stall_warning":
+        if resolving["stopped"].get(rid, 0) > seq or resolving["terminal"].get(rid, 0) > seq:
+            return True
+        if run_obj is not None:
+            rst = str(run_obj.get("state") or "")
+            if rst and rst not in ("running", "starting", "waiting", "queued"):
+                return True
+        return False
+
+    if kind in ("premerge_conflict", "premerge_failed"):
+        if resolving["premerge_ready"].get(rid, 0) > seq:
+            return True
+        if run_obj is not None:
+            pm = run_obj.get("premerge")
+            if isinstance(pm, dict) and str(pm.get("status") or "") == "ready":
+                return True
+        return False
+
+    if kind == "needs_attention" or (
+        kind == "review_verdict" and pl.get("verdict") == "NEEDS_CONTROLLER"
+    ):
+        if resolving["review_pass"].get(rid, 0) > seq:
+            return True
+        if run_obj is not None:
+            sign = run_obj.get("sign")
+            if isinstance(sign, dict) and sign.get("valid") is True:
+                return True
+        return False
+
+    return False
 
 
 def run_label(obj: dict, repo_label: str, is_current: bool) -> str:
@@ -816,7 +969,14 @@ def run_label(obj: dict, repo_label: str, is_current: bool) -> str:
     return name if is_current else f"【{repo_label}】{name}"
 
 
-def check_unread_events(payload: dict, cwd: str) -> tuple[str | None, list[str], list[str]]:
+def check_unread_events(
+    payload: dict,
+    cwd: str,
+    now: int,
+    work_by_id: dict[str, dict],
+    all_runs_by_id: dict[str, dict],
+    replied_parents: set[str],
+) -> tuple[str | None, list[str], list[str]]:
     """Race lock: block if unread delivery/question/attention events exist past the cursor.
     Returns (reason, display_names, run_ids)."""
     sdir = state_dir()
@@ -861,7 +1021,21 @@ def check_unread_events(payload: dict, cwd: str) -> tuple[str | None, list[str],
             except OSError:
                 current_repo_str = str(cur)
 
-    unread: list[dict] = []
+    candidates: list[tuple[int, dict]] = []
+    resolving: dict[str, dict[str, int]] = {
+        "applied": {},
+        "cleaned": {},
+        "stopped": {},
+        "terminal": {},
+        "premerge_ready": {},
+        "review_pass": {},
+        "replied": {},
+    }
+
+    def bump(bucket: str, key: str, seq_val: int) -> None:
+        if key and seq_val > resolving[bucket].get(key, 0):
+            resolving[bucket][key] = seq_val
+
     try:
         with events_file.open("r", encoding="utf-8") as fh:
             for line in fh:
@@ -879,6 +1053,26 @@ def check_unread_events(payload: dict, cwd: str) -> tuple[str | None, list[str],
                     continue
                 kind = str(ev.get("kind") or "")
                 pl = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+                run_id = str(ev.get("run") or "").strip()
+
+                # Record resolving events so superseded/resolved alerts are suppressed.
+                if kind == "applied":
+                    bump("applied", run_id, seq)
+                elif kind == "cleaned":
+                    bump("cleaned", run_id, seq)
+                elif kind == "stopped":
+                    bump("stopped", run_id, seq)
+                elif kind in ("delivered", "rejected", "failed", "question"):
+                    bump("terminal", run_id, seq)
+                elif kind == "premerge_ready":
+                    bump("premerge_ready", run_id, seq)
+                elif kind == "review_verdict" and pl.get("verdict") == "PASS":
+                    bump("review_pass", run_id, seq)
+                elif kind == "started":
+                    parent_id = str(pl.get("parent") or "").strip()
+                    if parent_id:
+                        bump("replied", parent_id, seq)
+
                 is_alert = kind in UNREAD_ALERT_KINDS or (
                     kind == "review_verdict" and pl.get("verdict") == "NEEDS_CONTROLLER"
                 )
@@ -893,12 +1087,34 @@ def check_unread_events(payload: dict, cwd: str) -> tuple[str | None, list[str],
                             pass
                     if ev_repo != current_repo_str:
                         continue
-                run_id = str(ev.get("run") or "")
                 if run_id and run_id in read_runs and seq <= read_runs[run_id]:
                     continue
-                unread.append(ev)
+                candidates.append((seq, ev))
     except OSError:
         return None, [], []
+
+    if not candidates:
+        return None, [], []
+
+    queue_items_by_name = (
+        load_queue_items_by_name()
+        if any(str(ev.get("kind") or "") == "queue_paused" for _, ev in candidates)
+        else None
+    )
+    unread = [
+        ev
+        for seq, ev in candidates
+        if not is_alert_event_stale(
+            ev,
+            seq,
+            now,
+            work_by_id,
+            all_runs_by_id,
+            replied_parents,
+            resolving,
+            queue_items_by_name,
+        )
+    ]
 
     if not unread:
         return None, [], []
@@ -972,10 +1188,51 @@ def evaluate(payload: dict) -> dict | None:
         return None
 
     cwd = str(payload.get("cwd") or os.getcwd())
+    now = int(time.time())
     reasons: list[str] = []
     log_records: list[dict] = []
 
-    unread_reason, ev_names, ev_run_ids = check_unread_events(payload, cwd)
+    index_runs = load_index_runs()
+    work_items = load_work_items()
+    work_by_id = {
+        str(item.get("id") or "").strip(): item
+        for item in work_items
+        if str(item.get("id") or "").strip()
+    }
+    repos = discover_repos(cwd, index_runs)
+
+    # Fetch per-repo run snapshots once; share with both unread-event staleness filtering and run checks.
+    repo_items: list[tuple[Path | None, Path, str, bool, list[dict]]] = []
+    all_runs_by_id: dict[str, dict] = {}
+    replied_parents: set[str] = set()
+    for entry in index_runs.values():
+        if isinstance(entry, dict) and isinstance(entry.get("status"), dict):
+            st_obj = entry["status"]
+            rid = st_obj.get("run")
+            if isinstance(rid, str) and rid:
+                all_runs_by_id[rid] = st_obj
+            par = st_obj.get("parent")
+            if isinstance(par, str) and par:
+                replied_parents.add(par)
+    for repo_root, runs_dir, label, is_current in repos:
+        items = fetch_status(runs_dir, index_runs)
+        repo_items.append((repo_root, runs_dir, label, is_current, items))
+        for obj in items:
+            rid = obj.get("run")
+            if isinstance(rid, str) and rid:
+                all_runs_by_id[rid] = obj
+            par = obj.get("parent")
+            if isinstance(par, str) and par:
+                replied_parents.add(par)
+
+    unread_reason, ev_names, ev_run_ids = check_unread_events(
+        payload,
+        cwd,
+        now,
+        work_by_id,
+        all_runs_by_id,
+        replied_parents,
+    )
     if unread_reason:
         reasons.append(unread_reason)
         log_records.append(
@@ -986,11 +1243,7 @@ def evaluate(payload: dict) -> dict | None:
             }
         )
 
-    index_runs = load_index_runs()
     delegate_cmd = find_delegate_bin() or "delegate"
-    now = int(time.time())
-
-    repos = discover_repos(cwd, index_runs)
     if not repos:
         if reasons:
             append_stop_logs(log_records)
@@ -1011,10 +1264,9 @@ def evaluate(payload: dict) -> dict | None:
     live_other: list[tuple[str, str]] = []  # (display, run_id)
     unmerged_items: list[tuple[str, str]] = []  # (display, run_id)
     stale_run_ids: list[str] = []
-    work_fresh_def, work_expired_def = work_deferred_runs(now)
+    work_fresh_def, work_expired_def = work_deferred_runs(work_items, now)
 
-    for repo_root, runs_dir, label, is_current in repos:
-        items = fetch_status(runs_dir, index_runs)
+    for repo_root, _runs_dir, label, is_current, items in repo_items:
         if not items:
             continue
 

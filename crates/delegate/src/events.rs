@@ -275,7 +275,7 @@ fn update_cursor_entry(entry: &mut Value, seq: u64) {
     }
 }
 
-/// Record that the current caller (from `wait` / `run`) has read up to `seq`.
+/// Record that the current caller (from `wait` / `run` / human `events`) has read up to `seq`.
 pub fn record_cursor(seq: u64) {
     record_cursor_in(&state_dir(), caller().as_deref(), seq);
 }
@@ -1255,24 +1255,43 @@ pub fn command(args: &[String]) -> Res<i32> {
 
     let mut cursor = since;
     let initial = read_since(cursor);
-    for ev in &initial {
-        if let Some(seq) = ev["seq"].as_u64() {
-            cursor = cursor.max(seq);
+    let mut last_printed_seq: Option<u64> = None;
+    let mut write_ok = true;
+    {
+        let mut out = io::stdout().lock();
+        for ev in &initial {
+            let line = if json_mode {
+                ev.to_string()
+            } else {
+                format_human(ev)
+            };
+            if writeln!(out, "{line}").is_err() {
+                write_ok = false;
+                break;
+            }
+            if let Some(seq) = ev["seq"].as_u64() {
+                cursor = cursor.max(seq);
+                last_printed_seq = Some(last_printed_seq.map_or(seq, |prev| prev.max(seq)));
+            }
         }
-        if json_mode {
-            println!("{ev}");
-        } else {
-            println!("{}", format_human(ev));
+        if write_ok && out.flush().is_err() {
+            write_ok = false;
         }
     }
 
     if !follow {
         let current = latest_seq().max(cursor);
         if !json_mode {
+            if write_ok {
+                if let Some(printed) = last_printed_seq {
+                    record_cursor(printed);
+                }
+            }
             if initial.is_empty() && since_given {
                 println!("无新事件（当前游标：{current}）");
             } else if !initial.is_empty() || since_given {
-                println!("游标：{current}");
+                let shown_cursor = last_printed_seq.unwrap_or(current);
+                println!("游标：{shown_cursor}");
             }
         }
         return Ok(0);
@@ -1486,6 +1505,22 @@ mod tests {
         assert!(doc["callers"]["s1"]["readRuns"]
             .as_object()
             .is_none_or(|m| m.is_empty()));
+
+        let _ = fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn record_cursor_updates_named_caller_and_default_monotonically() {
+        let state = temp_dir("record-cursor");
+        record_cursor_in(&state, Some("sess-a"), 309);
+        record_cursor_in(&state, Some("sess-a"), 994);
+        record_cursor_in(&state, Some("sess-a"), 100); // must not regress
+        record_cursor_in(&state, None, 42);
+        record_cursor_in(&state, Some(""), 88); // empty caller maps to default
+
+        let doc = load_cursors_doc(&state);
+        assert_eq!(doc["callers"]["sess-a"]["seq"], json!(994));
+        assert_eq!(doc["default"]["seq"], json!(88));
 
         let _ = fs::remove_dir_all(&state);
     }

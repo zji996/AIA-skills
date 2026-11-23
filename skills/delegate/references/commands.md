@@ -14,7 +14,7 @@
 | `wait [<run>...\|--all] [--since <SEQ>] [--max <时长>] [--no-result] [--full] [--progress]` | 无参和带名字的 `wait <run>...` 默认同 `--any`：返回上次 wait 之后所有进入终态或提问态的 run（首个给全文，其余给一行摘要加 `result` 命令）；`--since <SEQ>` 仅返回 `seq > SEQ` 的事件并输出新游标，同时更新 `cursors.json`；`--all` / `--until-all` 等全部（单次最多 50 分钟）。人读末行给本会话剩余数和原样重跑命令 |
 | `work [list\|show\|add\|wait\|close\|drop\|defer\|import-md] ...` | 统一工作表（7 态/6 列/卡片、`--after-applied`、`owner:Qxx`、`--auto`、`defer --reason --until`），见 [工作表](worktable.md) |
 | `hook stats [--weeks N] [--json]` | 按周统计 Stop 钩子触发与去向（wait/apply/defer/忽略） |
-| `events [--since <SEQ>] [--follow] [--rebuild] [--json]` | 读/跟随全机只追加事件流 `<state_dir>/events.jsonl`（单调 `seq`，含起/排队/lane/验收/交付/提问/停/apply/clean/卡警/续派/`review_*`/`merge_*`/`radar_*`/`work_*`）；`--rebuild` 从 run 重建；写失败仅记诊断 |
+| `events [--since <SEQ>] [--follow] [--rebuild] [--json]` | 读/跟随全机事件流 `events.jsonl`；非 `--follow` 人读推进 `cursors.json`（`--json` 不推）；`--rebuild` 从 run 重建 |
 | `queue <add\|list\|remove\|cancel> ...` | 确定性 DAG 续派队列：支持 `--after`（上游交付通过且审查 `PASS`）与 `--after-applied`（上游合入后），零模型调用自动起下一步（`queue_dispatched`），异常暂停（`queue_paused`） |
 | `sign [--check] [--json] [<run>]` | 记录或校验 `controllerReviewPaths` diff 的 SHA-256 签字（`sign.json`）；改一字即失效（`--check` 有效退出 0，未签/失效退出 1），供合入员验签，不改 `apply` 语义 |
 | `merge [--ready\|<run>...] [--name <名>] [--json]` | 独立集成 worktree 串行 3-way 合入（重生、逐个 `accept`、末尾 `mergeAccept`，按 `autoMerge` 出 `merge-report.md` 供 `apply --keep-commits` 落回）；`merge list [--all]` 查批次，见 [合入员与 Radar](merge-and-radar.md) |

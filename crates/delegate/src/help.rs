@@ -244,7 +244,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("--until-all", "Wait until every selected run finishes before returning; Alias of --all for waiting semantics."),
             ("--stream", "Print one outcome line per run as each finishes (answers are read with wait <run>) and exit when none is left; without run arguments it also picks up runs this caller starts meanwhile. For hosts that turn each output line into a notification."),
         ]),
-        "events" => ("[--since SEQ] [--follow] [--rebuild] [--json]", "Show, follow, or rebuild the machine-wide append-only event stream (<state_dir>/events.jsonl).", &[
+        "events" => ("[--since SEQ] [--follow] [--rebuild] [--json]", "Show, follow, or rebuild the machine-wide append-only event stream (<state_dir>/events.jsonl). Human-readable non-follow reads advance the caller cursor in cursors.json; --json and --follow leave it unchanged.", &[
             ("--since SEQ", "Only show events with seq > SEQ."),
             ("--follow, -f", "Keep following newly appended events until interrupted."),
             ("--rebuild", "Reconstruct events.jsonl from existing run meta/summary files across known repos."),

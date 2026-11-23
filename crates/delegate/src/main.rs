@@ -1268,6 +1268,7 @@ fn clean(args: &[String]) -> Res<i32> {
                 "archive": archived.as_ref().map(|p| p.to_string_lossy().into_owned()),
             }),
         );
+        events::mark_run_read(&run_id_for_ev);
 
         let containers = if sync_gc {
             let _ = gc::execute_job_inner(&job_path, false);

@@ -42,6 +42,7 @@ pub fn caller_source() -> Option<(String, &'static str)> {
     CALLER_ENV.iter().find_map(|name| {
         env::var(name)
             .ok()
+            .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .map(|value| (value, *name))
     })
