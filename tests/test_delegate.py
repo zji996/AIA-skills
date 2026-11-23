@@ -43,6 +43,15 @@ if not os.access(DELEGATE, os.X_OK):
     raise RuntimeError(f"{DELEGATE} is missing: install cargo, set DELEGATE_BIN, or run scripts/fetch-binary.sh delegate")
 
 
+def settle_supervisors(runs_dir, seconds=10.0):
+    deadline = time.monotonic() + seconds
+    pids = list(Path(runs_dir).glob("*/pid")) if Path(runs_dir).is_dir() else []
+    while pids and time.monotonic() < deadline:
+        pids = [p for p in pids if not process_gone(p)]
+        if pids:
+            time.sleep(0.05)
+
+
 def process_gone(pid_file):
     try:
         pid = int(Path(pid_file).read_text())
@@ -84,6 +93,9 @@ class DelegateTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="delegate-")
         self.addCleanup(self.temp.cleanup)
         self.work = Path(self.temp.name)
+        # Cleanups run last-in first-out: let supervisors that are still settling (delivery, index,
+        # events after `wait` returned) exit before the temp tree is removed under them.
+        self.addCleanup(settle_supervisors, self.work / "runs")
         self.bin = self.work / "bin"
         self.bin.mkdir()
         self.env = {k: v for k, v in os.environ.items()
