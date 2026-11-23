@@ -536,6 +536,12 @@ pub fn status(run: &Path) -> Value {
         if !source_changes.is_empty() {
             out["sourceWorkspaceChanges"] = json!(source_changes);
         }
+        let act = crate::activity::inspect(run, &meta, &st);
+        out["activity"] = act;
+    }
+    let stall_warning = json(run.join("stall-warning.json"));
+    if stall_warning.is_object() {
+        out["stallWarning"] = stall_warning;
     }
     if sum.is_object() {
         for key in [

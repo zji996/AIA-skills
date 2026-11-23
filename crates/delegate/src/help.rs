@@ -17,7 +17,7 @@ const LAUNCH: &[(&str, &str)] = &[
     ("--protect-reason PATH REASON", "Protect a path with its reason; repeatable. Report necessary protected changes instead of bypassing protection."),
     ("--allow PATH", "Open a protected path for this run and its replies only; repeatable, inside a protected path. Directories may use a trailing /. Echoed at start."),
     ("--hide-accept", "Keep the acceptance command from the agent for blind verification."),
-    ("--accept-timeout DURATION", "Acceptance command limit (default: .delegate.json acceptTimeout, else 10m)."),
+    ("--accept-timeout DURATION", "Optional acceptance command limit (default: .delegate.json acceptTimeout, else unlimited; silent accept emits stall_warning)."),
     ("--evidence COMMAND", "Run after successful acceptance or answer; records evidence without changing state or exit code."),
     ("--no-evidence", "Disable the default evidence command."),
     ("--evidence-timeout DURATION", "Evidence command limit excluding queue time (default: 30m)."),
@@ -59,7 +59,7 @@ const REPLY: &[(&str, &str)] = &[
     ("--protect / --protect-reason", "Protected paths and reasons are inherited from the previous run and cannot be changed in reply."),
     ("--allow PATH", "Open a protected path for this reply and its follow-up replies only; repeatable, inside a protected path. Directories may use a trailing /. Echoed at start."),
     ("--hide-accept", "Keep the acceptance command from the agent."),
-    ("--accept-timeout DURATION", "Acceptance command limit (inherited; default: .delegate.json acceptTimeout, else 10m)."),
+    ("--accept-timeout DURATION", "Optional acceptance command limit (inherited; default: .delegate.json acceptTimeout, else unlimited)."),
     ("--evidence COMMAND", "Replace the inherited evidence command; failure never changes state or exit code."),
     ("--no-evidence", "Remove the inherited evidence command."),
     ("--evidence-timeout DURATION", "Evidence command limit (inherited; default: 30m)."),
@@ -86,7 +86,15 @@ const COMMANDS: &[(&str, &str)] = &[
         "reply",
         "Continue a finished run's conversation in the background.",
     ),
-    ("wait", "Wait for runs; print outcomes and answers."),
+    ("wait", "Wait for runs or events (--since SEQ); print outcomes, answers, or new cursor."),
+    (
+        "events",
+        "Show or follow the machine-wide append-only event stream (--since, --follow, --rebuild, --json).",
+    ),
+    (
+        "queue",
+        "Manage the deterministic DAG continuation queue (add, list, remove/cancel).",
+    ),
     (
         "status",
         "Show counts and concise one-line status for runs/chains needing action (status <run> adds path and note details); --all lists every round.",
@@ -196,8 +204,9 @@ pub fn print(command: Option<&str>) -> bool {
         "start" => ("[options] [words ...]", "Launch in the background and return at once.", LAUNCH),
         "run" => ("[options] [words ...]", "Start, then wait for the outcome and answer.", LAUNCH),
         "reply" => ("[options] run [words ...]", "Continue a finished run in the background, inheriting its agent, workdir, and worktree by default. Use --wait to collect its answer.", REPLY),
-        "wait" => ("[options] [runs ...]", "With no run arguments, return once the next run finishes and print its answer. Repeat the same command for the next result.", &[
+        "wait" => ("[options] [runs ...]", "With no run arguments, return once the next run finishes and print its answer. Repeat the same command for the next result. With --since SEQ, wait for new events past SEQ and return the new cursor.", &[
             ("runs", "Run ids or directories. With no arguments, collect active and undelivered runs from this caller when known; otherwise collect all in this repository."),
+            ("--since SEQ", "Wait on the machine-wide event stream and return only events with seq > SEQ plus the new cursor (records read cursor for Stop hook)."),
             ("--all", "Wait for ALL selected runs (up to 50m per call); without names, select repository runs regardless of caller. Timeout lists pending names."),
             ("--machine", "Collect active and waiting runs registered across all repositories on this machine."),
             ("--json", "Print complete JSON fields instead of concise status lines. Tasks covered by another live waiter are skipped; exit 76 when all are covered."),
@@ -205,6 +214,17 @@ pub fn print(command: Option<&str>) -> bool {
             ("--any", "Return once any selected run finishes or asks a question (the default for no arguments and named runs); lists every run settled since the previous wait (full answer for the first, one-line summary + result command for the rest)."),
             ("--until-all", "Wait until every selected run finishes before returning; Alias of --all for waiting semantics."),
             ("--stream", "Print one outcome line per run as each finishes (answers are read with wait <run>) and exit when none is left; without run arguments it also picks up runs this caller starts meanwhile. For hosts that turn each output line into a notification."),
+        ]),
+        "events" => ("[--since SEQ] [--follow] [--rebuild] [--json]", "Show, follow, or rebuild the machine-wide append-only event stream (<state_dir>/events.jsonl).", &[
+            ("--since SEQ", "Only show events with seq > SEQ."),
+            ("--follow, -f", "Keep following newly appended events until interrupted."),
+            ("--rebuild", "Reconstruct events.jsonl from existing run meta/summary files across known repos."),
+            ("--json", "Print raw JSONL event lines."),
+        ]),
+        "queue" => ("<add|list|remove|cancel> [options]", "Deterministic DAG continuation queue: automatically dispatches the next step with zero LLM calls when upstream runs deliver and pass acceptance (plus review PASS when present), or pauses and emits queue_paused on failure/question/NEEDS_CONTROLLER.", &[
+            ("add <name>", "Add a queued step: --after <run|name> (repeatable/comma-separated) --prompt-file <FILE> [delegate start options...]."),
+            ("list [--all] [--json]", "List queued, dispatched, and paused DAG items."),
+            ("remove|cancel <name>", "Cancel queued item(s)."),
         ]),
         "status" | "list" => ("[--all] [--json] [--files] [runs ...]", "Show a counts line plus concise one-line status for runs needing action (running/queued, questions, unapplied or unread results, unhandled rejections, and pending todos; collapsing reply chains to their latest round) and a footer pointing to delegate history. Passing run names appends indented path and todo details.", &[
             ("runs", "Run ids or directories (default: actionable runs and pending todos)."),

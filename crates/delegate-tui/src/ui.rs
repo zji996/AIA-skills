@@ -1,4 +1,4 @@
-use crate::app::{App, CollapseKind, FocusPane, ListRow, Overlay};
+use crate::app::{App, CollapseKind, FocusPane, ListRow, Overlay, ViewTab};
 use crate::markdown::render_markdown;
 use crate::model::*;
 use crate::width::{display_width, pad_left, pad_right, truncate, wrap_text};
@@ -40,15 +40,31 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
             .split(chunks[1]);
-        render_list_pane(frame, app, body[0]);
-        render_detail_pane(frame, app, body[1]);
+        match app.tab {
+            ViewTab::Runs => {
+                render_list_pane(frame, app, body[0]);
+                render_detail_pane(frame, app, body[1]);
+            }
+            ViewTab::Events => {
+                render_events_list_pane(frame, app, body[0]);
+                render_event_detail_pane(frame, app, body[1]);
+            }
+        }
     } else {
         let body = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
             .split(chunks[1]);
-        render_list_pane(frame, app, body[0]);
-        render_detail_pane(frame, app, body[1]);
+        match app.tab {
+            ViewTab::Runs => {
+                render_list_pane(frame, app, body[0]);
+                render_detail_pane(frame, app, body[1]);
+            }
+            ViewTab::Events => {
+                render_events_list_pane(frame, app, body[0]);
+                render_event_detail_pane(frame, app, body[1]);
+            }
+        }
     }
 
     render_bottom_bar(frame, app, chunks[2]);
@@ -95,11 +111,35 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
     let queued = app.snapshot.total_count(GroupKind::Queued);
     let merged = app.snapshot.total_count(GroupKind::MergedUncleaned);
     let stopped = app.snapshot.total_count(GroupKind::Stopped);
+    let dag_pending = app
+        .snapshot
+        .dag_queue
+        .iter()
+        .filter(|q| matches!(q.status.as_str(), "pending" | "paused"))
+        .count();
+
+    let tab_runs_style = if app.tab == ViewTab::Runs {
+        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        muted()
+    };
+    let tab_events_style = if app.tab == ViewTab::Events {
+        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        muted()
+    };
 
     let mut spans = vec![
         Span::styled(
             " delegate-tui ",
             Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(" 1任务 ", tab_runs_style),
+        Span::raw(" "),
+        Span::styled(
+            format!(" 2事件({}) ", app.snapshot.events.len()),
+            tab_events_style,
         ),
         Span::raw("  "),
         Span::styled(
@@ -137,7 +177,16 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(" · ", muted()),
         Span::styled(format!("已合 {merged}"), muted()),
     ];
-    if stopped > 0 && area.width >= 90 {
+    if dag_pending > 0 {
+        spans.push(Span::styled(" · ", muted()));
+        spans.push(Span::styled(
+            format!("续派 {dag_pending}"),
+            Style::default()
+                .fg(STATUS_QUEUED)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if stopped > 0 && area.width >= 100 {
         spans.push(Span::styled(" · ", muted()));
         spans.push(Span::styled(format!("已停 {stopped}"), muted()));
     }
@@ -291,6 +340,18 @@ fn render_list_pane(frame: &mut Frame, app: &mut App, area: Rect) {
             ),
             ListRow::Run { repo_idx, run_idx } => {
                 render_run_row(&app.snapshot.repos[repo_idx].runs[run_idx], selected, cols, inner_w)
+            }
+            ListRow::DagQueueHeader { count } => {
+                let text = format!("▌ 确定性续派队列 ({count})");
+                Line::from(Span::styled(
+                    truncate(&text, inner_w),
+                    Style::default()
+                        .fg(STATUS_QUEUED)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            }
+            ListRow::DagQueueEntry { idx } => {
+                render_dag_queue_row(&app.snapshot.dag_queue[idx], selected, inner_w)
             }
         };
         lines.push(line);
@@ -464,7 +525,38 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
         AcceptStatus::None => (" -", None),
     };
 
-    let full_name = if run.chain_round > 1 {
+    let full_name = if let (GroupKind::Running, Some(act)) = (run.group, run.activity.as_ref()) {
+        let snippet = match act.kind.as_str() {
+            "running_command" => {
+                if let Some(cmd) = &act.cmd {
+                    format!(" [{}]", cmd)
+                } else {
+                    String::new()
+                }
+            }
+            "quota" | "error" => format!(" [{}]", act.label),
+            _ if run.stall_warning.is_some() => " [卡住提醒]".to_string(),
+            _ => String::new(),
+        };
+        if !snippet.is_empty() && cols.name_w > 10 {
+            let base = if run.chain_round > 1 {
+                format!("{} [{}轮]", run.display_name, run.chain_round)
+            } else {
+                run.display_name.clone()
+            };
+            truncate(&format!("{base}{snippet}"), cols.name_w)
+        } else if run.chain_round > 1 {
+            let suffix = format!(" [{}轮]", run.chain_round);
+            let sw = display_width(&suffix);
+            if cols.name_w > sw + 2 {
+                format!("{}{suffix}", truncate(&run.display_name, cols.name_w - sw))
+            } else {
+                truncate(&run.display_name, cols.name_w)
+            }
+        } else {
+            truncate(&run.display_name, cols.name_w)
+        }
+    } else if run.chain_round > 1 {
         let suffix = format!(" [{}轮]", run.chain_round);
         let sw = display_width(&suffix);
         if cols.name_w > sw + 2 {
@@ -594,6 +686,10 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
 
 fn render_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == FocusPane::Detail && matches!(app.overlay, Overlay::None);
+    if let Some(q) = app.selected_dag_queue().cloned() {
+        render_dag_queue_detail_pane(frame, app, &q, area, focused);
+        return;
+    }
     let Some(run) = app.selected_run().cloned() else {
         let block = rounded_block(Line::from(Span::styled(" 详情 ", muted())), focused);
         frame.render_widget(block, area);
@@ -708,6 +804,39 @@ fn build_detail_lines(app: &App, run: &RunItem, width: usize) -> Vec<Line<'stati
     }
     if !timing_parts.is_empty() {
         push_wrapped(&mut out, &timing_parts.join(" · "), width, muted());
+    }
+
+    // Liveness activity ("正在做什么") & stall warning
+    if let Some(act) = &run.activity {
+        if !act.label.is_empty() {
+            let act_color = match act.kind.as_str() {
+                "running_command" | "thinking" => STATUS_RUNNING,
+                "waiting" => STATUS_QUEUED,
+                "quota" => STATUS_PENDING,
+                "error" => STATUS_FAILED,
+                _ => STATUS_RUNNING,
+            };
+            push_wrapped(
+                &mut out,
+                &format!("正在做什么: {}", act.label),
+                width,
+                Style::default().fg(act_color).add_modifier(Modifier::BOLD),
+            );
+        }
+    }
+    if let Some(sw) = &run.stall_warning {
+        let det = sw.detail.as_deref().unwrap_or(&sw.kind);
+        push_wrapped(
+            &mut out,
+            &format!("⚠ 卡住提醒 ({}): {det}", sw.kind),
+            width,
+            Style::default()
+                .fg(STATUS_PENDING)
+                .add_modifier(Modifier::BOLD),
+        );
+        if let Some(sc) = &sw.self_check {
+            push_wrapped(&mut out, &format!("  自检: {sc}"), width, muted());
+        }
     }
 
     // Queue info
@@ -1153,10 +1282,21 @@ fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ))
     } else {
-        let keys = if area.width >= 100 {
-            " jk 选择  Tab 切栏  Enter 结论  d diff  / 过滤  r 刷新  a/c/s/p 命令  ? 帮助  q 退出"
-        } else {
-            " jk选 Tab栏 Enter结论 d diff /滤 r刷 a/c/s/p令 ?助 q退"
+        let keys = match app.tab {
+            ViewTab::Runs => {
+                if area.width >= 100 {
+                    " jk 选择  1/2/e 任务·事件  Tab 切栏  Enter 结论  d diff  / 过滤  r 刷新  a/c/s/p 命令  ? 帮助  q 退出"
+                } else {
+                    " jk选 Tab栏 1/2/e事 Enter结论 d diff /滤 r刷 a/c/s/p令 ?助 q退"
+                }
+            }
+            ViewTab::Events => {
+                if area.width >= 100 {
+                    " jk 浏览事件  f 切换跟随  1/2/e 返回任务  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
+                } else {
+                    " jk览 f跟随 1/2/e任务 Tab栏 /滤 r刷 ?助 q退"
+                }
+            }
         };
         Line::from(Span::styled(truncate(keys, w), muted()))
     };
@@ -1309,7 +1449,7 @@ fn render_command_modal(
 
 fn render_help_modal(frame: &mut Frame, area: Rect) {
     let w = area.width.saturating_sub(6).clamp(40, 72);
-    let h = 14u16.min(area.height.saturating_sub(2));
+    let h = 16u16.min(area.height.saturating_sub(2));
     let modal = centered_rect(area, w, h);
     frame.render_widget(Clear, modal);
 
@@ -1322,7 +1462,9 @@ fn render_help_modal(frame: &mut Frame, area: Rect) {
     frame.render_widget(block, modal);
 
     let rows = [
-        ("↑↓ / j k", "选择任务 / 滚动详情"),
+        ("↑↓ / j k", "选择任务/事件 / 滚动详情"),
+        ("1 / 2 / e", "切换「任务」与「事件」标签页"),
+        ("f", "事件页切换自动跟随"),
         ("Tab", "切换焦点栏"),
         ("Enter", "完整结论（P 交 $PAGER）"),
         ("d", "diff --stat 改动统计"),
@@ -1366,7 +1508,20 @@ fn run_glyph_color(run: &RunItem) -> (&'static str, Option<Color>) {
         return ("?", Some(STATUS_PENDING));
     }
     match run.group {
-        GroupKind::Running => ("●", Some(STATUS_RUNNING)),
+        GroupKind::Running => {
+            if run.stall_warning.is_some() {
+                return ("!", Some(STATUS_PENDING));
+            }
+            if let Some(act) = &run.activity {
+                return match act.kind.as_str() {
+                    "quota" => ("!", Some(STATUS_PENDING)),
+                    "error" => ("✕", Some(STATUS_FAILED)),
+                    "waiting" => ("◔", Some(STATUS_QUEUED)),
+                    _ => ("●", Some(STATUS_RUNNING)),
+                };
+            }
+            ("●", Some(STATUS_RUNNING))
+        }
         GroupKind::Queued => ("◔", Some(STATUS_QUEUED)),
         GroupKind::MergedUncleaned => ("○", None),
         GroupKind::Stopped => ("·", None),
@@ -1377,4 +1532,301 @@ fn run_glyph_color(run: &RunItem) -> (&'static str, Option<Color>) {
             _ => ("◆", Some(STATUS_PENDING)),
         },
     }
+}
+
+fn render_dag_queue_row(q: &DagQueueItem, selected: bool, width: usize) -> Line<'static> {
+    let (glyph, color) = match q.status.as_str() {
+        "pending" | "dispatching" => ("▸", Some(STATUS_QUEUED)),
+        "dispatched" => ("✓", Some(STATUS_RUNNING)),
+        "paused" => ("!", Some(STATUS_FAILED)),
+        _ => ("·", None),
+    };
+    let after = q.after.join(",");
+    let extra = if let Some(reason) = &q.pause_reason {
+        format!(" · {reason}")
+    } else if let Some(rid) = &q.run_id {
+        format!(" -> {rid}")
+    } else {
+        format!(" · after: {after}")
+    };
+    let text = format!("{} {} [{}{}]", q.status_badge(), q.name, q.repo, extra);
+    if selected {
+        let rev = Style::default().add_modifier(Modifier::REVERSED);
+        let accent = match color {
+            Some(c) => Style::default().fg(c).add_modifier(Modifier::BOLD),
+            None => bold_primary(),
+        };
+        let body = truncate(&text, width.saturating_sub(4));
+        let used = 4 + display_width(&body);
+        let pad = width.saturating_sub(used);
+        return Line::from(vec![
+            Span::styled("▎", accent),
+            Span::styled(format!(" {glyph} "), rev.add_modifier(Modifier::BOLD)),
+            Span::styled(body, rev),
+            Span::styled(" ".repeat(pad), rev),
+        ]);
+    }
+    let st = match color {
+        Some(c) => Style::default().fg(c),
+        None => muted(),
+    };
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!("{glyph} "), st.add_modifier(Modifier::BOLD)),
+        Span::styled(truncate(&text, width.saturating_sub(4)), st),
+    ])
+}
+
+fn render_dag_queue_detail_pane(
+    frame: &mut Frame,
+    app: &mut App,
+    q: &DagQueueItem,
+    area: Rect,
+    focused: bool,
+) {
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let badge_color = match q.status.as_str() {
+        "pending" | "dispatching" => STATUS_QUEUED,
+        "dispatched" => STATUS_RUNNING,
+        "paused" => STATUS_FAILED,
+        _ => Color::DarkGray,
+    };
+    out.push(Line::from(vec![
+        Span::styled(
+            format!(" {} ", q.status_badge()),
+            Style::default()
+                .fg(badge_color)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(q.name.clone(), bold_primary()),
+    ]));
+    push_wrapped(
+        &mut out,
+        &format!("仓库: {} · 状态: {} · 创建于 {}", q.repo, q.status, q.created_at),
+        inner_w,
+        muted(),
+    );
+    out.push(Line::raw(""));
+    out.push(section_header("上游依赖 (DAG)"));
+    for dep in &q.after {
+        push_indented_wrapped(&mut out, "  - ", dep, inner_w, primary());
+    }
+    if let Some(rid) = &q.run_id {
+        out.push(Line::raw(""));
+        out.push(section_header("已自动派发任务"));
+        push_indented_wrapped(&mut out, "  ", rid, inner_w, Style::default().fg(STATUS_RUNNING));
+    }
+    if let Some(reason) = &q.pause_reason {
+        out.push(Line::raw(""));
+        out.push(section_header("暂停原因"));
+        push_indented_wrapped(
+            &mut out,
+            "  ",
+            reason,
+            inner_w,
+            Style::default()
+                .fg(STATUS_FAILED)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    out.push(Line::raw(""));
+    out.push(section_header("提示词文件"));
+    push_indented_wrapped(&mut out, "  ", &q.prompt_file, inner_w, muted());
+
+    let max_scroll = out.len().saturating_sub(inner_h);
+    if app.detail_scroll > max_scroll {
+        app.detail_scroll = max_scroll;
+    }
+    let title = Line::from(Span::styled(
+        format!(" 续派: {} ", truncate(&q.name, inner_w.saturating_sub(10))),
+        if focused { bold_primary() } else { muted() },
+    ));
+    let block = rounded_block(title, focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let visible: Vec<Line> = out
+        .into_iter()
+        .skip(app.detail_scroll)
+        .take(inner_h)
+        .collect();
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
+fn event_kind_color(kind: &str) -> Option<Color> {
+    match kind {
+        "delivered" | "applied" | "queue_dispatched" => Some(STATUS_RUNNING),
+        "question" | "stall_warning" | "loop_review" => Some(STATUS_PENDING),
+        "rejected" | "failed" | "queue_paused" => Some(STATUS_FAILED),
+        "started" | "queued" | "lane_acquired" => Some(STATUS_QUEUED),
+        _ => None,
+    }
+}
+
+fn short_event_hms(at: &str) -> &str {
+    if at.len() >= 19 {
+        &at[11..19]
+    } else {
+        at
+    }
+}
+
+fn render_events_list_pane(frame: &mut Frame, app: &mut App, area: Rect) {
+    let focused = app.focus == FocusPane::List && matches!(app.overlay, Overlay::None);
+    let follow_tag = if app.events_follow { " · 跟随" } else { " · 暂停跟随" };
+    let filter_tag = if app.filter.is_empty() { "" } else { " · 过滤" };
+    let title = Line::from(Span::styled(
+        format!(
+            " 事件流 ({}){} {} ",
+            app.filtered_events.len(),
+            follow_tag,
+            filter_tag
+        ),
+        if focused { bold_primary() } else { muted() },
+    ));
+    let block = rounded_block(title, focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if app.filtered_events.is_empty() {
+        let msg = if app.filter.is_empty() {
+            "暂无事件记录"
+        } else {
+            "无匹配事件"
+        };
+        frame.render_widget(Paragraph::new(Line::from(Span::styled(format!(" {msg}"), muted()))), inner);
+        return;
+    }
+
+    let inner_w = inner.width as usize;
+    let view_h = inner.height as usize;
+    if let Some(sel) = app.selected_event {
+        if sel < app.events_scroll {
+            app.events_scroll = sel;
+        } else if view_h > 0 && sel >= app.events_scroll + view_h {
+            app.events_scroll = sel + 1 - view_h;
+        }
+    }
+    let max_scroll = app.filtered_events.len().saturating_sub(view_h);
+    if app.events_scroll > max_scroll {
+        app.events_scroll = max_scroll;
+    }
+
+    let mut lines: Vec<Line> = Vec::with_capacity(view_h);
+    for (pos, &ev_idx) in app
+        .filtered_events
+        .iter()
+        .enumerate()
+        .skip(app.events_scroll)
+        .take(view_h)
+    {
+        let ev = &app.snapshot.events[ev_idx];
+        let selected = app.selected_event == Some(pos);
+        let color = event_kind_color(&ev.kind);
+        let prefix = format!(
+            "#{:<4} {} {} ",
+            ev.seq,
+            short_event_hms(&ev.at),
+            pad_right(ev.kind_badge(), 4)
+        );
+        let repo_part = if ev.repo.is_empty() {
+            String::new()
+        } else {
+            format!("[{}] ", ev.repo)
+        };
+        let rest_avail = inner_w.saturating_sub(2 + display_width(&prefix));
+        let rest = truncate(&format!("{repo_part}{}", ev.summary), rest_avail);
+
+        if selected {
+            let rev = Style::default().add_modifier(Modifier::REVERSED);
+            let accent = match color {
+                Some(c) => Style::default().fg(c).add_modifier(Modifier::BOLD),
+                None => bold_primary(),
+            };
+            let used = 2 + display_width(&prefix) + display_width(&rest);
+            let pad = inner_w.saturating_sub(used);
+            lines.push(Line::from(vec![
+                Span::styled("▎", accent),
+                Span::styled(" ", rev),
+                Span::styled(prefix, rev.add_modifier(Modifier::BOLD)),
+                Span::styled(rest, rev),
+                Span::styled(" ".repeat(pad), rev),
+            ]));
+        } else {
+            let badge_style = match color {
+                Some(c) => Style::default().fg(c).add_modifier(Modifier::BOLD),
+                None => muted(),
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("#{:<4} ", ev.seq), muted()),
+                Span::styled(format!("{} ", short_event_hms(&ev.at)), muted()),
+                Span::styled(format!("{} ", pad_right(ev.kind_badge(), 4)), badge_style),
+                Span::styled(rest, primary()),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_event_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
+    let focused = app.focus == FocusPane::Detail && matches!(app.overlay, Overlay::None);
+    let Some(ev) = app.selected_event_item().cloned() else {
+        let block = rounded_block(Line::from(Span::styled(" 事件详情 ", muted())), focused);
+        frame.render_widget(block, area);
+        return;
+    };
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let badge_style = match event_kind_color(&ev.kind) {
+        Some(c) => Style::default()
+            .fg(c)
+            .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+        None => Style::default().add_modifier(Modifier::REVERSED),
+    };
+    out.push(Line::from(vec![
+        Span::styled(format!(" {} ", ev.kind_badge()), badge_style),
+        Span::raw(" "),
+        Span::styled(format!("#{} · {}", ev.seq, ev.kind), bold_primary()),
+    ]));
+    push_wrapped(&mut out, &format!("时间: {}", ev.at), inner_w, muted());
+    if !ev.repo.is_empty() {
+        push_wrapped(&mut out, &format!("仓库: {}", ev.repo), inner_w, muted());
+    }
+    if !ev.run.is_empty() {
+        push_wrapped(&mut out, &format!("任务: {}", ev.run), inner_w, primary());
+    }
+    if !ev.summary.is_empty() {
+        out.push(Line::raw(""));
+        out.push(section_header("摘要"));
+        push_indented_wrapped(&mut out, "  ", &ev.summary, inner_w, primary());
+    }
+    out.push(Line::raw(""));
+    out.push(section_header("Payload"));
+    for line in ev.payload_pretty.lines() {
+        push_indented_wrapped(&mut out, "  ", line, inner_w, muted());
+    }
+
+    let max_scroll = out.len().saturating_sub(inner_h);
+    if app.detail_scroll > max_scroll {
+        app.detail_scroll = max_scroll;
+    }
+    let title = Line::from(Span::styled(
+        format!(" 事件 #{} ({}) ", ev.seq, ev.kind),
+        if focused { bold_primary() } else { muted() },
+    ));
+    let block = rounded_block(title, focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let visible: Vec<Line> = out
+        .into_iter()
+        .skip(app.detail_scroll)
+        .take(inner_h)
+        .collect();
+    frame.render_widget(Paragraph::new(visible), inner);
 }

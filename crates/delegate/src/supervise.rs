@@ -36,7 +36,7 @@ fn evidence(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
             Path::new(s(meta, "workdir")),
             run,
             &meta["env"],
-            meta["evidenceTimeoutSeconds"].as_f64().unwrap_or(1800.0),
+            Some(meta["evidenceTimeoutSeconds"].as_f64().unwrap_or(1800.0)),
             &mut log,
             Some(&holder),
         );
@@ -108,12 +108,13 @@ fn accept(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
         result["excluded"] = json!(excluded);
     }
     let before = changes::repository_snapshot_excluding(Path::new(s(meta, "top")), run, &excluded);
+    let accept_timeout = meta["acceptTimeoutSeconds"].as_f64().filter(|t| *t > 0.0);
     let (mut code, mut timed) = run_shell(
         (s(meta, "accept"), "accept"),
         Path::new(s(meta, "workdir")),
         run,
         &meta["env"],
-        meta["acceptTimeoutSeconds"].as_f64().unwrap_or(600.0),
+        accept_timeout,
         &mut log,
         Some(&holder),
     )
@@ -134,7 +135,7 @@ fn accept(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
                 Path::new(s(meta, "workdir")),
                 run,
                 &meta["env"],
-                meta["acceptTimeoutSeconds"].as_f64().unwrap_or(600.0),
+                accept_timeout,
                 &mut log,
                 Some(&holder),
                 true,
@@ -483,6 +484,19 @@ fn settle(
         && !lane::stopped()
     {
         sum["accept"] = accept(meta, run, holder);
+        crate::events::emit(
+            &crate::events::run_id_for(run, meta),
+            &crate::events::repo_for_meta(meta),
+            "accept",
+            json!({
+                "name": s(meta, "name"),
+                "ok": b(&sum["accept"], "ok"),
+                "exitCode": sum["accept"]["exitCode"],
+                "command": clip(s(&sum["accept"], "command"), 120),
+                "notExecuted": b(&sum["accept"], "notExecuted"),
+                "infrastructureFailure": b(&sum["accept"], "infrastructureFailure"),
+            }),
+        );
         if b(&sum["accept"], "infrastructureFailure") {
             sum["infrastructureFailure"] = json!(true);
             sum["error"] = json!("remote infrastructure failure; retry does not spend a rework round");
@@ -659,7 +673,7 @@ fn check_generated(
             top,
             run,
             &meta["env"],
-            seconds(&setting("GENERATE_TIMEOUT", "10m"))?,
+            Some(seconds(&setting("GENERATE_TIMEOUT", "10m"))?),
             &mut log,
             Some(&holder),
         )?;
@@ -1200,6 +1214,18 @@ fn admit_waiting(run: &Path, meta: &mut Value) -> Res<bool> {
             fs::remove_file(run.join(".waiting")).map_err(|e| e.to_string())?;
             drop(local);
             drop(machine);
+            crate::events::emit(
+                &crate::events::run_id_for(run, meta),
+                &crate::events::repo_for_meta(meta),
+                "started",
+                json!({
+                    "name": s(meta, "name"),
+                    "mode": s(meta, "mode"),
+                    "tier": meta["tier"],
+                    "model": meta["model"],
+                    "fromQueue": true,
+                }),
+            );
             crate::board::refresh_for_run(run);
             return Ok(true);
         }

@@ -1,5 +1,13 @@
 # delegate
 
+## 6.28 确定性事件流、transcript 判活、Stop Hook 竞态锁、卡住只提醒与 DAG 续派
+
+- 全机事件流与游标等待：每次起、排队、拿/放 lane、交付、提问、验收、停止、apply、clean、卡住提醒与续派推进都追加 `<state>/events.jsonl`（单调 `seq`，写入失败仅记诊断不阻断 run）；`delegate events [--since SEQ] [--follow] [--rebuild] [--json]` 可回放、实时跟踪或从 run meta 重建，`delegate wait --since SEQ` 只返回 `seq > SEQ` 的事件并输出新游标。Deterministic append-only event stream, rebuild from run metas, and cursor-based wait.
+- Stop Hook 竞态锁：主控在 Claude Code 准备结束回合时，`hooks/claude-code-stop.py` 核对 `cursors.json` 之后是否存在未读的交付/提问/卡住提醒/续派暂停事件；有则拦截并返回「有新事件，先看 delegate events --since N（未读 K 条：…）。」，待 `wait`/`result` 推进游标或 `stop_hook_active` 为 true 后放行。Stop hook race lock preventing premature turn exit on unread colleague events.
+- 判活看 transcript 尾部：`delegate status` 与 `delegate tui` 读取同事 transcript/事件/错误日志尾部，区分等待中、在思考、在跑命令（带命令名与已跑时长）、配额或报错，并展示「正在做什么」。Activity and liveness classification from colleague transcript tail.
+- 卡住只提醒不强杀、验收默认不设超时与机械重复自检：`agents.rs` 遇到 idle/command 停滞或连续重复同一命令+同类结果（ADR 0120，默认阈值 12 次）不再 `kill_group`，验收也不再默认 10 分钟硬超时（仅显式 `--accept-timeout`/`.delegate.json` `acceptTimeout` 生效，验收长时间无输出发 `stallKind: "accept"` 带已跑时长与最后一行输出且不杀进程），统一写同事不可见的 `stall_warning` 供主控和 TUI 查看，仅主控显式 `stop` 才杀进程；旧 6.27 `stalled` 记录照常可读。Warn-only stall, unlimited default acceptance with silent-output stall warning, and mechanical repetition self-check without auto-kill.
+- 确定性 DAG 续派与 TUI 事件页：`delegate queue add <name> --after <run|name> --prompt-file …` 建立有序队列，前一步交付、验收通过且（若有 6.29 审查结果）审查 `PASS` 时零模型调用自动派下一步，失败/提问/`NEEDS_CONTROLLER` 则暂停并写 `queue_paused` 事件；`delegate queue list` 与 `delegate tui`（含新增「事件」标签页）均实时展示。Zero-LLM deterministic DAG continuation queue and TUI Events tab.
+
 ## 6.27 续做链净改动口径、主干漂移单列与默认基线同步
 
 - pool slot 续做链进行中，主干推进若干提交（含受保护路径）：`status` 只报本链自身改动数、`diff --total` 不含主干变更、不误报 `protectViolation`、不产生无关 `commitsDiffer`；`status <run>` / `wait` 单列一行「主干已前进 N 个提交 / M 个文件，与本链改动重叠 K 个」，仅重叠非零时加 `!!!` 醒目提示。Chain-net diff accounting in pooled replies with separate drift line highlighted only on overlap.

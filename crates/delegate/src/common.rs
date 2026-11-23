@@ -414,12 +414,37 @@ pub fn shell_quote(s: &str) -> String {
         format!("'{}'", s.replace('\'', "'\"'\"'"))
     }
 }
+fn last_non_empty_line(path: &Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = File::open(path) else {
+        return String::new();
+    };
+    let Ok(len) = f.metadata().map(|m| m.len()) else {
+        return String::new();
+    };
+    let start = len.saturating_sub(8192);
+    if start > 0 && f.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| clip(line, 160))
+        .unwrap_or_default()
+}
+
 pub fn run_shell(
     command: (&str, &str),
     cwd: &Path,
     run: &Path,
     extra: &Value,
-    timeout: f64,
+    timeout: Option<f64>,
     log: &mut File,
     holder: Option<&std::sync::atomic::AtomicI32>,
 ) -> Res<(i32, bool)> {
@@ -431,7 +456,7 @@ pub fn run_shell_with(
     cwd: &Path,
     run: &Path,
     extra: &Value,
-    timeout: f64,
+    timeout: Option<f64>,
     log: &mut File,
     holder: Option<&std::sync::atomic::AtomicI32>,
     force_local: bool,
@@ -462,6 +487,18 @@ pub fn run_shell_with(
     group(&mut c);
     let started = std::time::Instant::now();
     let queued_before = crate::lane::queued_seconds(run);
+    let monitor_accept_stall = matches!(role, "accept" | "verify");
+    let accept_stall_limit = if monitor_accept_stall {
+        crate::agents::stall_seconds(&meta, "accept")
+    } else {
+        None
+    };
+    let log_path = run.join(format!("{role}.log"));
+    let mut last_log_len = log.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut last_output_at = std::time::Instant::now();
+    let mut queued_at_last_output = 0.0_f64;
+    let mut last_warn_at: Option<std::time::Instant> = None;
+    let mut warned_stall = false;
     let mut child = c.spawn().map_err(|e| e.to_string())?;
     let pid = child.id() as i32;
     if let Some(h) = holder {
@@ -494,10 +531,97 @@ pub fn run_shell_with(
             break false;
         }
         let queued = (crate::lane::queued_seconds(run) - queued_before).max(0.0);
-        if started.elapsed().as_secs_f64() - queued >= timeout {
-            break true;
+        if let Some(limit) = timeout.filter(|t| *t > 0.0) {
+            if started.elapsed().as_secs_f64() - queued >= limit {
+                break true;
+            }
+        }
+        if monitor_accept_stall {
+            let cur_len = log.metadata().map(|m| m.len()).unwrap_or(last_log_len);
+            if cur_len != last_log_len {
+                last_log_len = cur_len;
+                last_output_at = std::time::Instant::now();
+                queued_at_last_output = queued;
+                if warned_stall {
+                    let _ = fs::remove_file(run.join("stall-warning.json"));
+                    warned_stall = false;
+                    last_warn_at = None;
+                }
+            } else if let Some(limit) = accept_stall_limit {
+                let silent = (last_output_at.elapsed().as_secs_f64()
+                    - (queued - queued_at_last_output).max(0.0))
+                .max(0.0);
+                if silent >= limit
+                    && last_warn_at.is_none_or(|t| t.elapsed().as_secs_f64() >= limit)
+                {
+                    let elapsed = (started.elapsed().as_secs_f64() - queued).max(0.0).round() as u64;
+                    let silent_u64 = silent.round() as u64;
+                    let last_line = last_non_empty_line(&log_path);
+                    let detail = if last_line.is_empty() {
+                        format!("验收已跑 {elapsed}s（{silent_u64}s 无新输出）")
+                    } else {
+                        format!("验收已跑 {elapsed}s（{silent_u64}s 无新输出），最后输出：{last_line}")
+                    };
+                    let at = iso();
+                    let _ = write_json(
+                        run.join("stall-warning.json"),
+                        &serde_json::json!({
+                            "kind": "accept",
+                            "cmd": clip(command, 180),
+                            "elapsedSeconds": elapsed,
+                            "silentSeconds": silent_u64,
+                            "limitSeconds": limit,
+                            "lastLine": last_line,
+                            "detail": detail,
+                            "at": at,
+                        }),
+                    );
+                    crate::supervise::log_event(
+                        run,
+                        serde_json::json!({
+                            "e": "stall_warning",
+                            "kind": "accept",
+                            "cmd": clip(command, 180),
+                            "elapsedSeconds": elapsed,
+                            "silentSeconds": silent_u64,
+                            "limitSeconds": limit,
+                            "lastLine": last_line,
+                            "detail": detail,
+                            "at": at,
+                        }),
+                    );
+                    let run_id = s(&meta, "run");
+                    let repo = if !s(&meta["worktree"], "source").is_empty() {
+                        s(&meta["worktree"], "source")
+                    } else if !s(&meta, "top").is_empty() {
+                        s(&meta, "top")
+                    } else {
+                        s(&meta, "workdir")
+                    };
+                    crate::events::emit(
+                        run_id,
+                        repo,
+                        "stall_warning",
+                        serde_json::json!({
+                            "name": s(&meta, "name"),
+                            "stallKind": "accept",
+                            "cmd": clip(command, 120),
+                            "elapsedSeconds": elapsed,
+                            "silentSeconds": silent_u64,
+                            "limitSeconds": limit,
+                            "lastLine": last_line,
+                            "detail": detail,
+                        }),
+                    );
+                    last_warn_at = Some(std::time::Instant::now());
+                    warned_stall = true;
+                }
+            }
         }
     };
+    if warned_stall {
+        let _ = fs::remove_file(run.join("stall-warning.json"));
+    }
     crate::cleanup::record(run, pid);
     end_group(pid, if timed { 5.0 } else { 2.0 });
     if let Some(h) = holder {
@@ -542,8 +666,11 @@ pub fn finish_run(run: &std::path::Path, mut summary: serde_json::Value, code: i
     write_json(run.join("summary.json"), &summary)?;
     crate::refs::mark_finished(run);
     write(run.join("exit_code"), format!("{code}\n"))?;
+    let meta = json(run.join("meta.json"));
     crate::history::record_finish(run);
     crate::board::refresh_for_run(run);
+    crate::events::emit_run_finished(run, &meta, &summary);
+    crate::dag_queue::advance();
     Ok(())
 }
 

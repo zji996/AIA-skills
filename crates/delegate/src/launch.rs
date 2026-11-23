@@ -1298,6 +1298,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     if o.accept_timeout.is_none() {
         o.accept_timeout = meta["acceptTimeoutSeconds"]
             .as_f64()
+            .filter(|seconds| *seconds > 0.0)
             .map(|seconds| format!("{seconds}s"));
     }
     if !o.evidence_set {
@@ -2244,6 +2245,11 @@ pub fn launch(
         .map(seconds)
         .transpose()?
         .unwrap_or(0.0);
+    let accept_timeout_seconds = o
+        .accept_timeout
+        .as_deref()
+        .map(seconds)
+        .transpose()?;
     let chain_base = if !s(&extra["syncedBase"], "tree").is_empty() {
         s(&extra["syncedBase"], "tree").to_string()
     } else if !b(extra, "newAfterApply") && !s(parent, "chainBase").is_empty() {
@@ -2253,7 +2259,7 @@ pub fn launch(
             .map(|x| s(x, "tree").to_string())
             .unwrap_or_default()
     };
-    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":crate::agy::colleague(o.model.as_deref().unwrap_or("")),"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":timeout_seconds,"accept":o.accept,"acceptTimeoutSeconds":seconds(o.accept_timeout.as_deref().unwrap_or("10m"))? ,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":chain_base,"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
+    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":crate::agy::colleague(o.model.as_deref().unwrap_or("")),"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":timeout_seconds,"accept":o.accept,"acceptTimeoutSeconds":accept_timeout_seconds,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":chain_base,"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
     // A forked session continues on the executable that wrote it: Pi and rpi
     // keep different session formats.
     let parent_bin = s(parent, "agentBin");
@@ -2372,11 +2378,33 @@ pub fn launch(
     if deferred {
         touch(run.join(".waiting"));
         crate::queue::enter(&run, &mut meta)?;
-        crate::queue::update(
-            &run,
-            reason.as_deref().unwrap_or("总路数"),
-            crate::queue::ahead(&meta),
-        )?;
+        let q_ahead = crate::queue::ahead(&meta);
+        let q_reason = reason.as_deref().unwrap_or("总路数");
+        crate::queue::update(&run, q_reason, q_ahead)?;
+        crate::events::emit(
+            &crate::events::run_id_for(&run, &meta),
+            &crate::events::repo_for_meta(&meta),
+            "queued",
+            json!({
+                "scope": "capacity",
+                "name": s(&meta, "name"),
+                "reason": q_reason,
+                "ahead": q_ahead,
+            }),
+        );
+    } else {
+        crate::events::emit(
+            &crate::events::run_id_for(&run, &meta),
+            &crate::events::repo_for_meta(&meta),
+            "started",
+            json!({
+                "name": s(&meta, "name"),
+                "mode": s(&meta, "mode"),
+                "tier": meta["tier"],
+                "model": meta["model"],
+                "parent": meta["parent"],
+            }),
+        );
     }
     runs::prune();
     let hash = sha1_smol::Sha1::from(run.to_string_lossy().as_bytes())

@@ -24,7 +24,7 @@ class Delegate621Tests(unittest.TestCase):
         result = self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "task")
         self.assertEqual(result.returncode, 0, result.stderr)
         meta = self.meta(self.outcome(result))
-        self.assertEqual(meta["acceptTimeoutSeconds"], 600)
+        self.assertIsNone(meta["acceptTimeoutSeconds"])
         self.assertNotIn("acceptTimeout", meta.get("defaults", {}))
 
     def test_accept_timeout_uses_repo_config_and_echoes_source(self):

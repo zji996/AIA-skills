@@ -83,7 +83,7 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
         }
         if let Some(v) = value.get("stall") {
             let map = v.as_object().ok_or("stall must be an object")?;
-            for key in ["idle", "command"] {
+            for key in ["idle", "command", "accept"] {
                 if let Some(item) = map.get(key) {
                     if !valid_duration(item, true) {
                         return Err(format!("stall.{key} must be a duration or \"0\""));
@@ -92,7 +92,7 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
             }
             if map
                 .keys()
-                .any(|key| !["idle", "command"].contains(&key.as_str()))
+                .any(|key| !["idle", "command", "accept"].contains(&key.as_str()))
             {
                 return Err("stall has unknown fields".into());
             }

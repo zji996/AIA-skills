@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Claude Code Stop hook for delegate.
 
-Merges three turn-end guards across the current repository and all other
+Merges four turn-end guards across the current repository and all other
 repositories on this machine with live, questioning, unmerged, or noted runs:
+0. Event-stream race lock: unread delivery/question/attention events past the
+   controller's read cursor recorded by `wait` / `result` in `cursors.json`.
 1. Questioning runs (waiting on controller decision) or live runs without a
    running `delegate wait`.
 2. Unmerged delivered or rejected write runs without a fresh deferral in
@@ -26,6 +28,22 @@ from pathlib import Path
 
 WAIT_RE = re.compile(r"(?:^|/|\s)delegate\s+wait(?:\s|$)")
 UNMERGED_NEXT_RE = re.compile(r"^(?:review|apply)\b")
+UNREAD_ALERT_KINDS = {
+    "delivered",
+    "question",
+    "rejected",
+    "failed",
+    "stall_warning",
+    "queue_paused",
+}
+KIND_LABELS = {
+    "delivered": "交付",
+    "question": "提问",
+    "rejected": "未通过",
+    "failed": "失败",
+    "stall_warning": "卡住提醒",
+    "queue_paused": "续派暂停",
+}
 
 
 def find_delegate_bin() -> str | None:
@@ -307,14 +325,124 @@ def run_label(obj: dict, repo_label: str, is_current: bool) -> str:
     return name if is_current else f"【{repo_label}】{name}"
 
 
+def check_unread_events(payload: dict, cwd: str) -> str | None:
+    """Race lock: block if unread delivery/question/attention events exist past the cursor."""
+    sdir = state_dir()
+    events_file = sdir / "events.jsonl"
+    if not events_file.is_file():
+        return None
+
+    cursors_file = sdir / "cursors.json"
+    cursors_doc: dict = {}
+    if cursors_file.is_file():
+        try:
+            loaded = json.loads(cursors_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                cursors_doc = loaded
+        except (OSError, ValueError):
+            cursors_doc = {}
+
+    caller_id = (
+        os.environ.get("DELEGATE_CALLER")
+        or os.environ.get("CLAUDE_CODE_SESSION_ID")
+        or os.environ.get("CODEX_THREAD_ID")
+        or os.environ.get("PI_SESSION_ID")
+        or str(payload.get("session_id") or "")
+    ).strip()
+
+    callers_map = cursors_doc.get("callers") if isinstance(cursors_doc.get("callers"), dict) else {}
+    if caller_id and isinstance(callers_map.get(caller_id), dict):
+        entry = callers_map[caller_id]
+    elif isinstance(cursors_doc.get("default"), dict):
+        entry = cursors_doc["default"]
+    else:
+        entry = {}
+
+    try:
+        cursor_seq = int(entry.get("seq") or 0)
+    except (TypeError, ValueError):
+        cursor_seq = 0
+    raw_read = entry.get("readRuns") if isinstance(entry.get("readRuns"), dict) else {}
+    read_runs: dict[str, int] = {}
+    for k, v in raw_read.items():
+        if isinstance(k, str) and isinstance(v, int):
+            read_runs[k] = v
+
+    current_only = os.environ.get("DELEGATE_STOP_HOOK_CURRENT_ONLY") == "1"
+    current_repo_str: str | None = None
+    if current_only:
+        cur = git_toplevel(cwd)
+        if cur is not None:
+            try:
+                current_repo_str = str(cur.resolve())
+            except OSError:
+                current_repo_str = str(cur)
+
+    unread: list[dict] = []
+    try:
+        with events_file.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                seq = ev.get("seq")
+                if not isinstance(seq, int) or seq <= cursor_seq:
+                    continue
+                kind = str(ev.get("kind") or "")
+                if kind not in UNREAD_ALERT_KINDS:
+                    continue
+                if current_only and current_repo_str is not None:
+                    ev_repo = str(ev.get("repo") or "")
+                    if ev_repo:
+                        try:
+                            ev_repo = str(Path(ev_repo).resolve())
+                        except OSError:
+                            pass
+                    if ev_repo != current_repo_str:
+                        continue
+                run_id = str(ev.get("run") or "")
+                if run_id and run_id in read_runs and seq <= read_runs[run_id]:
+                    continue
+                unread.append(ev)
+    except OSError:
+        return None
+
+    if not unread:
+        return None
+
+    previews: list[str] = []
+    for ev in unread[:5]:
+        kind = str(ev.get("kind") or "")
+        klabel = KIND_LABELS.get(kind, kind)
+        pl = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+        label = str(pl.get("name") or pl.get("queueName") or ev.get("run") or "?").replace("\n", " ")
+        previews.append(f"{klabel}:{label}")
+    more = f" 等共 {len(unread)} 条" if len(unread) > 5 else ""
+    summary = "、".join(previews) + more
+    return f"有新事件，先看 delegate events --since {cursor_seq}（未读 {len(unread)} 条：{summary}）。"
+
+
 def evaluate(payload: dict) -> dict | None:
     if payload.get("stop_hook_active") in (True, "true"):
         return None
-    delegate_bin = find_delegate_bin()
-    if not delegate_bin:
-        return None
 
     cwd = str(payload.get("cwd") or os.getcwd())
+    reasons: list[str] = []
+
+    unread_reason = check_unread_events(payload, cwd)
+    if unread_reason:
+        reasons.append(unread_reason)
+
+    delegate_bin = find_delegate_bin()
+    if not delegate_bin:
+        return {"decision": "block", "reason": "\n".join(reasons)} if reasons else None
+
     try:
         defer_hours = float(os.environ.get("DEFER_HOURS", "4"))
     except ValueError:
@@ -323,7 +451,7 @@ def evaluate(payload: dict) -> dict | None:
 
     repos = discover_repos(cwd)
     if not repos:
-        return None
+        return {"decision": "block", "reason": "\n".join(reasons)} if reasons else None
 
     questions: list[tuple[str, str, bool]] = []  # (display, run_id, is_current)
     live_current: list[str] = []
@@ -389,8 +517,6 @@ def evaluate(payload: dict) -> dict | None:
         for rid, disp in repo_unmerged.items():
             if rid not in fresh_def:
                 unmerged_items.append(disp)
-
-    reasons: list[str] = []
 
     # Build questioning reminder (always blocks — needs controller reply now).
     if questions:

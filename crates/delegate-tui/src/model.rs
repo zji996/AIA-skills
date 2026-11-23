@@ -69,6 +69,116 @@ pub struct NoteItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ActivityInfo {
+    pub kind: String,
+    pub label: String,
+    pub cmd: Option<String>,
+    pub elapsed_seconds: Option<u64>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StallWarningInfo {
+    pub kind: String,
+    pub cmd: Option<String>,
+    pub seconds: Option<u64>,
+    pub count: Option<u64>,
+    pub detail: Option<String>,
+    pub self_check: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EventItem {
+    pub seq: u64,
+    pub at: String,
+    pub run: String,
+    pub repo: String,
+    pub kind: String,
+    pub summary: String,
+    pub payload_pretty: String,
+}
+
+impl EventItem {
+    pub fn matches_filter(&self, query_lower: &str) -> bool {
+        if query_lower.is_empty() {
+            return true;
+        }
+        [
+            self.kind.as_str(),
+            self.run.as_str(),
+            self.repo.as_str(),
+            self.summary.as_str(),
+        ]
+        .iter()
+        .any(|h| h.to_lowercase().contains(query_lower))
+    }
+
+    pub fn kind_badge(&self) -> &'static str {
+        match self.kind.as_str() {
+            "started" => "启动",
+            "queued" => "排队",
+            "lane_acquired" => "占槽",
+            "lane_released" => "放槽",
+            "accept" => "验收",
+            "delivered" => "交付",
+            "question" => "提问",
+            "rejected" => "未过",
+            "failed" => "失败",
+            "stopped" => "已停",
+            "applied" => "合入",
+            "cleaned" => "清理",
+            "stall_warning" => "卡警",
+            "loop_review" => "自检",
+            "queue_dispatched" => "续派",
+            "queue_paused" => "暂停",
+            _ => "事件",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DagQueueItem {
+    pub name: String,
+    pub status: String,
+    pub after: Vec<String>,
+    pub repo: String,
+    pub prompt_file: String,
+    pub run_id: Option<String>,
+    pub pause_reason: Option<String>,
+    pub created_at: String,
+}
+
+impl DagQueueItem {
+    pub fn status_badge(&self) -> &'static str {
+        match self.status.as_str() {
+            "pending" => "待续",
+            "dispatching" => "派中",
+            "dispatched" => "已派",
+            "paused" => "暂停",
+            "cancelled" => "取消",
+            _ => "队列",
+        }
+    }
+
+    pub fn matches_filter(&self, query_lower: &str) -> bool {
+        if query_lower.is_empty() {
+            return true;
+        }
+        let after_joined = self.after.join(",");
+        [
+            self.name.as_str(),
+            self.status.as_str(),
+            self.status_badge(),
+            after_joined.as_str(),
+            self.repo.as_str(),
+            self.pause_reason.as_deref().unwrap_or(""),
+        ]
+        .iter()
+        .any(|h| h.to_lowercase().contains(query_lower))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RunItem {
     pub run: String,
     pub name: String,
@@ -104,6 +214,8 @@ pub struct RunItem {
     pub source_write_violation: bool,
     pub conflict_markers: Vec<String>,
     pub last_command: Option<String>,
+    pub activity: Option<ActivityInfo>,
+    pub stall_warning: Option<StallWarningInfo>,
     pub next_step: Option<String>,
     pub recovery: Option<String>,
     pub error: Option<String>,
@@ -169,6 +281,21 @@ impl RunItem {
         if self.question && !self.applied {
             return "提问";
         }
+        if matches!(self.state.as_str(), "running" | "starting") {
+            if self.stall_warning.is_some() {
+                return "卡警";
+            }
+            if let Some(act) = &self.activity {
+                return match act.kind.as_str() {
+                    "running_command" => "跑命",
+                    "thinking" => "思考",
+                    "waiting" => "等待",
+                    "quota" => "配额",
+                    "error" => "报错",
+                    _ => "运行",
+                };
+            }
+        }
         match self.state.as_str() {
             "running" => "运行",
             "starting" => "启动",
@@ -216,6 +343,7 @@ impl RunItem {
             self.state_badge(),
             self.group.label(),
             self.last_command.as_deref().unwrap_or(""),
+            self.activity.as_ref().map(|a| a.label.as_str()).unwrap_or(""),
             self.next_step.as_deref().unwrap_or(""),
         ];
         if haystacks
@@ -320,6 +448,8 @@ impl HostLoad {
 pub struct AppSnapshot {
     pub repos: Vec<RepoGroup>,
     pub lane: LaneStatus,
+    pub events: Vec<EventItem>,
+    pub dag_queue: Vec<DagQueueItem>,
     pub host_load: Option<HostLoad>,
     pub refreshed_at: String,
     pub warnings: Vec<String>,
@@ -331,6 +461,8 @@ impl AppSnapshot {
         let mut h = DefaultHasher::new();
         self.repos.hash(&mut h);
         self.lane.hash(&mut h);
+        self.events.hash(&mut h);
+        self.dag_queue.hash(&mut h);
         self.host_load.hash(&mut h);
         self.warnings.hash(&mut h);
         h.finish()

@@ -21,7 +21,7 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 
 `measure` 是 argv 前缀数组，例如 `{"measure":[["cargo","xtask","bench-concurrency"]]}`；仓库配置覆盖用户配置。`measureCpus` 是预约核列表（如 `"8-11"`），未设置时取最后 `max(2, nproc/3)` 个在线逻辑核。匹配的同事、验收、证据和 lane 命令自动排队到机器级测量预约；预约开始时在跑的 lane 命令会让出预约核，预约期间普通 lane 命令使用其余核。
 
-- 标量：仓库 > 用户 > 内置默认；容量的 `DELEGATE_MAX_ACTIVE` / `DELEGATE_MAX_HEAVY` / `DELEGATE_REPO_MAX_ACTIVE` 最高，`0` 不限。整机/仓库上限默认 32/0、重命令 2；实际限流靠模型 `maxActive`、`maxHeavy` 与内存水位，不足自动排队。写入默认 `accept`/`acceptTimeout`/`evidence` 仓库优先于用户、CLI 覆盖或关闭（`acceptTimeout` 如 `"40m"`，默认 `10m`，回显来源，`reply` 继承）；只读不继承。
+- 标量：仓库 > 用户 > 内置默认；容量的 `DELEGATE_MAX_ACTIVE` / `DELEGATE_MAX_HEAVY` / `DELEGATE_REPO_MAX_ACTIVE` 最高，`0` 不限。整机/仓库上限默认 32/0、重命令 2；实际限流靠模型 `maxActive`、`maxHeavy` 与内存水位，不足自动排队。写入默认 `accept`/`acceptTimeout`/`evidence` 仓库优先于用户、CLI 覆盖或关闭（`acceptTimeout` 可选、未设不限时，回显来源，`reply` 继承）；只读不继承。
 - 模型选择独立为 `tiers.scout/review/write` 用途、`models` 登记别名与 `thinking` 长度；models/tiers 按键合并。模型全集只来自登记表，Pi 仅校验与提供能力；旧档与模型 thinking 后缀不兼容。匹配、规则、优先级、图片守卫、agy 同事与迁移见 [用途、模型与思维长度](model-routing.md)。
 - 任务测试用可重复的 `--accept-also COMMAND`，按顺序以 `&&` 追加到生效的 `--accept` 或配置默认（无基础命令则单独运行）；与 `--no-accept` 冲突退出 2。`--accept` 替换非空且不同的默认命令时，start 提示原命令与追加用法；meta 的 `accept` 与 summary 的 `accept.command` 记录最终命令。
 - `env` 按键合并，仓库优先；`agentDeny` 按 `(argv, exact)` 去重，省略 `exact` 等于 `false`；仓库同键 hint 覆盖用户值，保留原顺序。仓库 `{"argv":["cargo","xtask","check"],"exact":true,"allow":true}` 撤销完全相同 argv 且 exact 相同的一条用户规则，无需 hint；不撤销不同 exact 或其他前缀规则，用户配置不能声明 `allow: true`。
@@ -64,6 +64,6 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 
 验收、证据、setup、收尾生成核对、apply 的生成与 applyVerify 都由未注入 shim 的执行环境运行，主控自己的 lane 同理。没有环境放行开关或可交给同事的令牌。威胁模型是防误用，不是防恶意：同 UID 进程可以改 PATH、用绝对路径或改 shim/记录，这不是安全沙箱。
 
-- `stall`：`{"idle":"30m","command":"90m"}`，单项 `"0"` 关闭；环境变量 `DELEGATE_STALL_IDLE` / `DELEGATE_STALL_COMMAND` 优先。
+- `stall`：`{"idle":"30m","command":"90m","accept":"10m"}`，`"0"` 关闭；`DELEGATE_STALL_IDLE`/`COMMAND`/`ACCEPT` 优先，均只发 `stall_warning` 不杀进程。
 - `checkIn`：wait 检查线时长，`"0"` 关闭；`DELEGATE_CHECK_IN` 优先。未设置时 Claude Code 使用 50m，其它调用方不设默认。
 - `agy`：`{"agent":"aia"}` 为 agy 同事附加 `--agent <名>`（新会话、续做与 `probe` 生效），名称非空且无空白/控制字符，未设不变。

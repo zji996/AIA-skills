@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI（pi-kit 的 rpi 通道下 `pi` 即 rpi）。
 metadata:
-  version: "6.27.0"
+  version: "6.28.0"
   binary: delegate
   extra-binaries: delegate-tui
   exclude-agents: pi
@@ -35,10 +35,11 @@ $D wait                                                                  # 放�
 | 审某个已完成任务的工作树 | `$D start --read-only --in <name> "…"`；先 `wait` 确认上游结果再派下一步 |
 | 自己跑重检查、测性能 | `$D lane make check`；测量用 `lane --measure` |
 | 节点不稳、换档前先测连通 | `$D probe`：走 Pi 本身（不是裸 HTTP）测各档模型，不建任务、不占名额 |
-| 看全文 / 改动 / 停掉 / 清理 | `$D result` / `$D diff` / `$D stop` / `$D clean --finished`；`status` 首行计数并只列待处理任务与未完成待办（续做链折成末环一行，详情看 `status <run>`，`--all` 列全部，`--json` 加 `--files` 才带文件数组），末行指向 `history` |
+| 看全文 / 改动 / 停掉 / 清理 | `$D result` / `$D diff` / `$D stop` / `$D clean --finished`；`status` 首行计数并只列待处理任务与未完成待办（在跑行显示 transcript 尾部判活「正在做什么」及卡住提醒；续做链折成末环一行，详情看 `status <run>`，`--all` 列全部，`--json` 加 `--files` 才带文件数组），末行指向 `history` |
+| 事件流 / 游标等待 / 确定性续派 | `$D events [--since SEQ] [--follow] [--rebuild] [--json]` 查全机只追加事件流；`$D wait --since SEQ` 返回新事件与新游标（Stop hook 按 `wait`/`result` 游标拦下未读交付/提问）；`$D queue add <name> --after <run\|name> --prompt-file …` / `queue list` 建有序 DAG，上游交付通过后零模型调用自动起下一步，失败/提问则暂停并写事件提醒 |
 | 给任务挂合入后待办 | `$D note <run> "…"` / `$D note <run>` / `$D note <run> --done [<序号>\|--all]`；随续做链共享，`clean` 后保留直到 `--done` |
 | `/clear` 前交接 / 查历史与看板 | `$D handoff` 写一页交接索引（含待办）；`$D history [关键词…]` 查永久索引；`$D show <run>` 看摘要、合入后同文件提交与归档；`$D board` 打印/刷新自动看板（`.delegate.json` `board` 配路径） |
-| 交互式终端看板（只读 TUI） | `$D tui`（自动 exec 同目录或 PATH 中的 `delegate-tui`，随 `install.sh` / `fetch-binary.sh` 安装）：跨仓库按状态分组展示与续做链折叠，`↑↓`/`jk` 选择、`Tab` 切栏、`Enter` 完整结论、`d` diff 统计、`/` 过滤、`r` 刷新（默认每 5 秒无变化不重绘）、`a/c/s/p` 仅生成写命令并可复制到剪贴板、`q` 退出 |
+| 交互式终端看板（只读 TUI） | `$D tui`（自动 exec 同目录或 PATH 中的 `delegate-tui`，随 `install.sh` / `fetch-binary.sh` 安装）：跨仓库按状态分组展示、任务行判活状态、确定性续派队列与「事件」标签页（`1`/`2`/`e` 切页、`f` 跟随、`↑↓`/`jk` 选择、`Tab` 切栏、`Enter` 完整结论、`d` diff 统计、`/` 过滤、`r` 刷新、`a/c/s/p` 生成写命令并复制、`q` 退出） |
 
 `start`/`run` 派发前比对在跑与近 14 天 `history`，相似时在 stderr 提示最多 3 条（只提示不拦截）。
 

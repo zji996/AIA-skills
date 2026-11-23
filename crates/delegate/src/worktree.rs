@@ -411,7 +411,7 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<Option<String>> {
             &path,
             run,
             &env,
-            timeout,
+            Some(timeout),
             &mut file,
             None,
         )?;
@@ -2187,6 +2187,7 @@ pub fn run_verify(run: &Path, commands: &[String]) -> Value {
     result.as_object_mut().unwrap().remove("notExecuted");
     result.as_object_mut().unwrap().remove("next");
     let mut code = 0;
+    let accept_timeout = meta["acceptTimeoutSeconds"].as_f64().filter(|t| *t > 0.0);
     for command in commands {
         let _ = writeln!(log, "$ {command}");
         let (mut exit, mut timed) = crate::common::run_shell(
@@ -2194,7 +2195,7 @@ pub fn run_verify(run: &Path, commands: &[String]) -> Value {
             Path::new(&cwd),
             run,
             &meta["env"],
-            meta["acceptTimeoutSeconds"].as_f64().unwrap_or(600.0),
+            accept_timeout,
             &mut log,
             None,
         )
@@ -2214,7 +2215,7 @@ pub fn run_verify(run: &Path, commands: &[String]) -> Value {
                     Path::new(&cwd),
                     run,
                     &meta["env"],
-                    meta["acceptTimeoutSeconds"].as_f64().unwrap_or(600.0),
+                    accept_timeout,
                     &mut log,
                     None,
                     true,
@@ -2899,7 +2900,7 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
             &source,
             run,
             &meta["env"],
-            timeout,
+            Some(timeout),
             &mut file,
             None,
         );

@@ -16,7 +16,7 @@ pub enum FocusPane {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewTab {
     Runs,
-    // Reserved for 6.28: Blackboard (posts by floor, highlighting @主控)
+    Events,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,11 +90,20 @@ pub enum ListRow {
         repo_idx: usize,
         run_idx: usize,
     },
+    DagQueueHeader {
+        count: usize,
+    },
+    DagQueueEntry {
+        idx: usize,
+    },
 }
 
 impl ListRow {
     pub fn is_selectable(&self) -> bool {
-        matches!(self, ListRow::Run { .. } | ListRow::ToggleFold { .. })
+        matches!(
+            self,
+            ListRow::Run { .. } | ListRow::ToggleFold { .. } | ListRow::DagQueueEntry { .. }
+        )
     }
 }
 
@@ -102,6 +111,7 @@ impl ListRow {
 enum SelectionKey {
     Run(PathBuf, String),
     Fold(PathBuf, CollapseKind),
+    DagQueue(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +137,10 @@ pub struct App {
     pub detail_scroll: usize,
     pub focus: FocusPane,
     pub tab: ViewTab,
+    pub filtered_events: Vec<usize>,
+    pub selected_event: Option<usize>,
+    pub events_scroll: usize,
+    pub events_follow: bool,
     pub filter: String,
     pub filter_mode: bool,
     pub expanded_folds: HashSet<(PathBuf, CollapseKind)>,
@@ -158,6 +172,10 @@ impl App {
             detail_scroll: 0,
             focus: FocusPane::List,
             tab: ViewTab::Runs,
+            filtered_events: Vec::new(),
+            selected_event: None,
+            events_scroll: 0,
+            events_follow: true,
             filter: String::new(),
             filter_mode: false,
             expanded_folds: HashSet::new(),
@@ -201,6 +219,10 @@ impl App {
             ListRow::ToggleFold { repo_idx, kind, .. } => {
                 let repo = self.snapshot.repos.get(*repo_idx)?;
                 Some(SelectionKey::Fold(repo.path.clone(), *kind))
+            }
+            ListRow::DagQueueEntry { idx } => {
+                let q = self.snapshot.dag_queue.get(*idx)?;
+                Some(SelectionKey::DagQueue(q.name.clone()))
             }
             _ => None,
         }
@@ -351,9 +373,51 @@ impl App {
                 }
             }
         }
+        // Append deterministic DAG queue items if any match filter.
+        let matching_queue: Vec<usize> = self
+            .snapshot
+            .dag_queue
+            .iter()
+            .enumerate()
+            .filter(|(_, q)| q.status != "cancelled" && q.matches_filter(&query))
+            .map(|(i, _)| i)
+            .collect();
+        if !matching_queue.is_empty() {
+            rows.push(ListRow::DagQueueHeader {
+                count: matching_queue.len(),
+            });
+            for idx in matching_queue {
+                rows.push(ListRow::DagQueueEntry { idx });
+            }
+        }
         self.rows = rows;
 
-        // Restore prior selection if present; else prefer first visible Run, falling back to first fold.
+        // Rebuild filtered events list and keep follow cursor synced.
+        let prev_event_seq = self.selected_event_item().map(|e| e.seq);
+        self.filtered_events = self
+            .snapshot
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, ev)| ev.matches_filter(&query))
+            .map(|(i, _)| i)
+            .collect();
+        if self.filtered_events.is_empty() {
+            self.selected_event = None;
+            self.events_scroll = 0;
+        } else if self.events_follow {
+            self.selected_event = Some(self.filtered_events.len() - 1);
+        } else if let Some(seq) = prev_event_seq {
+            self.selected_event = self
+                .filtered_events
+                .iter()
+                .position(|&idx| self.snapshot.events[idx].seq == seq)
+                .or(Some(self.filtered_events.len() - 1));
+        } else {
+            self.selected_event = Some(self.filtered_events.len() - 1);
+        }
+
+        // Restore prior selection if present; else prefer first visible Run, falling back to first selectable.
         let mut next_sel = None;
         if let Some(key) = preserve {
             for (row_idx, row) in self.rows.iter().enumerate() {
@@ -372,6 +436,12 @@ impl App {
                         SelectionKey::Fold(prev_repo, prev_kind),
                         ListRow::ToggleFold { repo_idx, kind, .. },
                     ) if &self.snapshot.repos[*repo_idx].path == prev_repo && kind == prev_kind => {
+                        next_sel = Some(row_idx);
+                        break;
+                    }
+                    (SelectionKey::DagQueue(prev_name), ListRow::DagQueueEntry { idx })
+                        if &self.snapshot.dag_queue[*idx].name == prev_name =>
+                    {
                         next_sel = Some(row_idx);
                         break;
                     }
@@ -421,6 +491,42 @@ impl App {
                 self.snapshot.repos.get(*repo_idx)?.runs.get(*run_idx)
             }
             _ => None,
+        }
+    }
+
+    pub fn selected_dag_queue(&self) -> Option<&DagQueueItem> {
+        let row_idx = self.selected_row?;
+        match self.rows.get(row_idx)? {
+            ListRow::DagQueueEntry { idx } => self.snapshot.dag_queue.get(*idx),
+            _ => None,
+        }
+    }
+
+    pub fn selected_event_item(&self) -> Option<&EventItem> {
+        let pos = self.selected_event?;
+        let &ev_idx = self.filtered_events.get(pos)?;
+        self.snapshot.events.get(ev_idx)
+    }
+
+    pub fn move_event_selection(&mut self, delta: isize) -> bool {
+        if self.filtered_events.is_empty() {
+            self.selected_event = None;
+            return false;
+        }
+        let len = self.filtered_events.len();
+        let cur = self.selected_event.unwrap_or(len - 1);
+        let next = if delta >= 0 {
+            (cur + delta as usize).min(len - 1)
+        } else {
+            cur.saturating_sub((-delta) as usize)
+        };
+        self.events_follow = next + 1 >= len;
+        if Some(next) != self.selected_event {
+            self.selected_event = Some(next);
+            self.detail_scroll = 0;
+            true
+        } else {
+            false
         }
     }
 
@@ -688,6 +794,178 @@ impl App {
     }
 
     fn handle_main_key(&mut self, key: KeyEvent) -> AppAction {
+        match key.code {
+            KeyCode::Char('1') => {
+                if self.tab != ViewTab::Runs {
+                    self.tab = ViewTab::Runs;
+                    self.detail_scroll = 0;
+                    self.dirty = true;
+                    return AppAction::Redraw;
+                }
+                return AppAction::None;
+            }
+            KeyCode::Char('2') => {
+                if self.tab != ViewTab::Events {
+                    self.tab = ViewTab::Events;
+                    self.detail_scroll = 0;
+                    self.dirty = true;
+                    return AppAction::Redraw;
+                }
+                return AppAction::None;
+            }
+            KeyCode::Char('e') => {
+                self.tab = match self.tab {
+                    ViewTab::Runs => ViewTab::Events,
+                    ViewTab::Events => ViewTab::Runs,
+                };
+                self.detail_scroll = 0;
+                self.dirty = true;
+                return AppAction::Redraw;
+            }
+            KeyCode::Char('f') if self.tab == ViewTab::Events => {
+                self.events_follow = !self.events_follow;
+                if self.events_follow && !self.filtered_events.is_empty() {
+                    self.selected_event = Some(self.filtered_events.len() - 1);
+                    self.detail_scroll = 0;
+                }
+                self.dirty = true;
+                return AppAction::Redraw;
+            }
+            _ => {}
+        }
+
+        if self.tab == ViewTab::Events {
+            return match key.code {
+                KeyCode::Char('q') => AppAction::Quit,
+                KeyCode::Tab | KeyCode::BackTab => {
+                    self.focus = match self.focus {
+                        FocusPane::List => FocusPane::Detail,
+                        FocusPane::Detail => FocusPane::List,
+                    };
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                KeyCode::Down | KeyCode::Char('j') => match self.focus {
+                    FocusPane::List => {
+                        if self.move_event_selection(1) {
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = self.detail_scroll.saturating_add(1);
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                },
+                KeyCode::Up | KeyCode::Char('k') => match self.focus {
+                    FocusPane::List => {
+                        if self.move_event_selection(-1) {
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                },
+                KeyCode::PageDown => match self.focus {
+                    FocusPane::List => {
+                        if self.move_event_selection(10) {
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = self.detail_scroll.saturating_add(10);
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                },
+                KeyCode::PageUp => match self.focus {
+                    FocusPane::List => {
+                        if self.move_event_selection(-10) {
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = self.detail_scroll.saturating_sub(10);
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                },
+                KeyCode::Home | KeyCode::Char('g') => match self.focus {
+                    FocusPane::List => {
+                        if !self.filtered_events.is_empty() {
+                            self.selected_event = Some(0);
+                            self.events_follow = false;
+                            self.detail_scroll = 0;
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = 0;
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                },
+                KeyCode::End | KeyCode::Char('G') => match self.focus {
+                    FocusPane::List => {
+                        if !self.filtered_events.is_empty() {
+                            self.selected_event = Some(self.filtered_events.len() - 1);
+                            self.events_follow = true;
+                            self.detail_scroll = 0;
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = usize::MAX / 2;
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                },
+                KeyCode::Char('r') => AppAction::Refresh,
+                KeyCode::Char('/') => {
+                    self.filter_mode = true;
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                KeyCode::Esc => {
+                    if !self.filter.is_empty() {
+                        self.filter.clear();
+                        self.rebuild_rows(None);
+                        self.dirty = true;
+                        AppAction::Redraw
+                    } else {
+                        AppAction::None
+                    }
+                }
+                KeyCode::Char('?') => {
+                    self.overlay = Overlay::Help;
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                _ => AppAction::None,
+            };
+        }
+
         match key.code {
             KeyCode::Char('q') => AppAction::Quit,
             KeyCode::Tab | KeyCode::BackTab => {

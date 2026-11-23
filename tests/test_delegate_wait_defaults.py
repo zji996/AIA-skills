@@ -123,36 +123,49 @@ class DelegateWaitDefaultsTests(unittest.TestCase):
         result = self.cli("run", "task")
         self.assertEqual((result.returncode, self.outcome(result)["state"]), (0, "answered"))
 
-    def test_idle_stall_is_terminal_but_keeps_worktree_changes(self):
+    def test_idle_stall_warns_without_killing_and_keeps_worktree_changes(self):
         self.env["DELEGATE_STALL_IDLE"] = ".1s"
         self.env["DELEGATE_STALL_COMMAND"] = "0"
         repo = self.repo({"seed.txt": "seed\n"})
-        self.fake_pi([], pre="echo kept > kept.txt", sleep=.5)
+        self.fake_pi([fixtures.answer("finished after idle"), fixtures.SETTLED],
+                     pre="echo kept > kept.txt", sleep=.35)
         state = self.outcome(self.cli("run", "--workdir", repo, "--worktree", "task"))
-        self.assertEqual(state["state"], "stalled")
-        self.assertTrue((Path(state["dir"]) / "stall.json").exists())
+        # 6.28: stall only emits a reminder event and never kills the colleague.
+        self.assertEqual(state["state"], "answered")
+        run_events = (Path(state["dir"]) / "events.jsonl").read_text()
+        self.assertIn('"stall_warning"', run_events)
+        self.assertIn('"idle"', run_events)
+        machine_events = (Path(self.env["XDG_STATE_HOME"]) / "delegate" / "events.jsonl").read_text()
+        self.assertIn('"stall_warning"', machine_events)
 
-    def test_command_stall_records_the_in_flight_command(self):
+    def test_command_stall_warns_naming_command_without_killing(self):
         self.env["DELEGATE_STALL_IDLE"] = "0"
         self.env["DELEGATE_STALL_COMMAND"] = ".1s"
-        event = {"type": "tool_execution_start", "toolName": "bash", "args": {"command": "sleep 2"}}
-        self.fake_pi([], pre=f"printf '%s\\n' {shlex.quote(__import__('json').dumps(event))}; sleep 2")
+        event = {"type": "tool_execution_start", "toolName": "bash", "args": {"command": "sleep 0.4"}}
+        done_ev = {"type": "tool_execution_end", "toolName": "bash", "isError": False}
+        self.fake_pi(
+            [done_ev, fixtures.answer("command finished"), fixtures.SETTLED],
+            pre=f"printf '%s\\n' {shlex.quote(__import__('json').dumps(event))}; sleep .35",
+        )
         state = self.outcome(self.cli("run", "task"))
-        self.assertEqual(state["state"], "stalled")
-        self.assertEqual(state["stall"]["kind"], "command")
-        self.assertIn("sleep 2", state["stall"]["cmd"])
+        self.assertEqual(state["state"], "answered")
+        run_events = (Path(state["dir"]) / "events.jsonl").read_text()
+        self.assertIn('"stall_warning"', run_events)
+        self.assertIn("sleep 0.4", run_events)
+        self.assertFalse((Path(state["dir"]) / "stall-warning.json").exists())
 
-    def test_command_stall_continues_the_session_once_naming_the_command(self):
-        self.env["DELEGATE_STALL_IDLE"] = "0"
-        self.env["DELEGATE_STALL_COMMAND"] = ".5s"
-        event = {"type": "tool_execution_start", "toolName": "bash", "args": {"command": "cargo test --hangs"}}
-        self.fake_pi([], [fixtures.answer("found the hang"), fixtures.SETTLED],
-                     pre=f'if [ "$n" -eq 1 ]; then printf \'%s\\n\' {shlex.quote(__import__("json").dumps(event))}; sleep 5; fi')
+    def test_legacy_stalled_run_remains_readable(self):
+        self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED])
         state = self.outcome(self.cli("run", "task"))
-        self.assertEqual((state["state"], state["attempts"]), ("answered", 2))
-        run = Path(state["dir"])
-        self.assertIn("cargo test --hangs", (run / "resume-prompt.md").read_text())
-        self.assertEqual((run / "result.md").read_text().strip(), "found the hang")
+        run_dir = Path(state["dir"])
+        # Simulate a pre-6.28 run whose summary.json recorded state=stalled.
+        summary = __import__("json").loads((run_dir / "summary.json").read_text())
+        summary["state"] = "stalled"
+        summary["stall"] = {"kind": "command", "cmd": "cargo test --hangs", "seconds": 5400}
+        (run_dir / "summary.json").write_text(__import__("json").dumps(summary))
+        st = self.outcome(self.cli("status", state["run"]))
+        self.assertEqual(st["state"], "stalled")
+        self.assertEqual(st["stall"]["cmd"], "cargo test --hangs")
 
 
 if __name__ == "__main__":

@@ -30,6 +30,8 @@ fn make_sample_app() -> App {
     let snap = AppSnapshot {
         repos: vec![repo_a, repo_b],
         lane,
+        events: vec![],
+        dag_queue: vec![],
         host_load: Some(HostLoad {
             load1_tenths: 18,
             load5_tenths: 14,
@@ -189,6 +191,8 @@ fn snapshot_empty_state_is_minimal_and_tiny_terminal_does_not_panic() {
     let snap = AppSnapshot {
         repos: vec![],
         lane: LaneStatus::default(),
+        events: vec![],
+        dag_queue: vec![],
         host_load: None,
         refreshed_at: "11:00:00".to_string(),
         warnings: vec![],
@@ -201,4 +205,50 @@ fn snapshot_empty_state_is_minimal_and_tiny_terminal_does_not_panic() {
 
     let tiny = render_to_string(&mut app, 16, 6);
     assert!(tiny.contains("窗口过小"), "{tiny}");
+}
+
+#[test]
+fn snapshot_events_tab_liveness_activity_and_dag_queue() {
+    use delegate_tui::data::{parse_dag_queue_jsonl, parse_events_jsonl};
+    let raw_runs = r#"
+{"run":"20261123-090000-live","name":"事件流实现","state":"running","mode":"write","modelName":"neon","elapsedSeconds":180,"ageSeconds":180,"activity":{"kind":"running_command","cmd":"cargo test -p delegate","elapsedSeconds":45,"label":"在跑命令：cargo test -p delegate（45秒）"}}
+{"run":"20261123-090100-warn","name":"卡住观察","state":"running","mode":"write","modelName":"sol","elapsedSeconds":900,"ageSeconds":900,"activity":{"kind":"thinking","label":"在思考（卡住提醒：已 15 分）"},"stallWarning":{"kind":"idle","seconds":900,"detail":"已 900 秒无新动作"}}
+"#;
+    let raw_events = r#"
+{"seq":1,"at":"2026-11-23T09:00:00Z","run":"20261123-090000-live","repo":"/home/dev/demo-api","kind":"started","payload":{"name":"事件流实现","mode":"write","model":"neon"}}
+{"seq":2,"at":"2026-11-23T09:05:00Z","run":"20261123-090100-warn","repo":"/home/dev/demo-api","kind":"stall_warning","payload":{"name":"卡住观察","stallKind":"idle","detail":"已 900 秒无新动作"}}
+{"seq":3,"at":"2026-11-23T09:06:00Z","run":"","repo":"/home/dev/demo-api","kind":"queued","payload":{"scope":"dag","queueName":"step-2","after":["20261123-090000-live"]}}
+"#;
+    let raw_queue = r#"
+{"name":"step-2","status":"pending","after":["20261123-090000-live"],"repo":"/home/dev/demo-api","promptFile":"/tmp/step2.md","createdAt":"2026-11-23T09:06:00Z"}
+"#;
+    let repo = parse_status_jsonl(Path::new("/home/dev/demo-api"), "~/demo-api", raw_runs);
+    let snap = AppSnapshot {
+        repos: vec![repo],
+        lane: LaneStatus::default(),
+        events: parse_events_jsonl(raw_events),
+        dag_queue: parse_dag_queue_jsonl(raw_queue),
+        host_load: None,
+        refreshed_at: "09:06:10".into(),
+        warnings: vec![],
+    };
+    let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/dev/demo-api"), 5);
+
+    // Runs tab shows liveness badges ("跑命", "卡警"), detail "正在做什么", and DAG queue section!
+    let runs_screen = render_to_string(&mut app, 140, 32);
+    assert!(runs_screen.contains("跑命"), "{runs_screen}");
+    assert!(runs_screen.contains("卡警"), "{runs_screen}");
+    assert!(runs_screen.contains("正在做什么"), "{runs_screen}");
+    assert!(runs_screen.contains("确定性续派队列 (1)"), "{runs_screen}");
+    assert!(runs_screen.contains("step-2"), "{runs_screen}");
+    assert!(runs_screen.contains("2事件(3)"), "{runs_screen}");
+
+    // Press '2' to switch to Events tab!
+    app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    let events_screen = render_to_string(&mut app, 140, 32);
+    assert!(events_screen.contains("事件流 (3) · 跟随"), "{events_screen}");
+    assert!(events_screen.contains("#1"), "{events_screen}");
+    assert!(events_screen.contains("卡警"), "{events_screen}");
+    assert!(events_screen.contains("step-2"), "{events_screen}");
+    assert!(events_screen.contains("事件 #3"), "{events_screen}");
 }

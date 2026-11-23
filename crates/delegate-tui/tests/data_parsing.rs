@@ -134,6 +134,8 @@ fn folds_stale_pending_and_merged_by_default_and_toggles_on_enter() {
     let snap = AppSnapshot {
         repos: vec![repo],
         lane: LaneStatus::default(),
+        events: vec![],
+        dag_queue: vec![],
         host_load: None,
         refreshed_at: "10:00:00".into(),
         warnings: vec![],
@@ -258,6 +260,8 @@ fn snapshot_fingerprint_skips_redraw_when_unchanged_and_preserves_selection() {
     let snap1 = AppSnapshot {
         repos: vec![repo.clone()],
         lane: LaneStatus::default(),
+        events: vec![],
+        dag_queue: vec![],
         host_load: Some(HostLoad {
             load1_tenths: 12,
             load5_tenths: 10,
@@ -302,6 +306,8 @@ fn write_actions_only_generate_commands_and_filter_narrows_rows() {
     let snap = AppSnapshot {
         repos: vec![repo],
         lane: LaneStatus::default(),
+        events: vec![],
+        dag_queue: vec![],
         host_load: None,
         refreshed_at: "10:00:00".to_string(),
         warnings: vec![],

@@ -162,11 +162,29 @@ pub struct Slot {
     ticket: Option<PathBuf>,
     _file: Option<File>,
     pub queued: f64,
+    acquired_at: Option<Instant>,
+    event_run: String,
+    event_repo: String,
+    event_label: String,
+    event_remote: bool,
 }
 impl Drop for Slot {
     fn drop(&mut self) {
         if let Some(p) = self.ticket.take() {
             let _ = fs::remove_file(p);
+            if let Some(at) = self.acquired_at.take() {
+                let held = (at.elapsed().as_secs_f64() * 100.0).round() / 100.0;
+                crate::events::emit(
+                    &self.event_run,
+                    &self.event_repo,
+                    "lane_released",
+                    json!({
+                        "label": self.event_label,
+                        "heldSeconds": held,
+                        "remote": self.event_remote,
+                    }),
+                );
+            }
         }
     }
 }
@@ -181,7 +199,7 @@ pub fn acquire(
     context: Option<&Path>,
     waiting: impl FnMut(usize, &[String]),
 ) -> Res<Slot> {
-    acquire_in(&lane_dir(), heavy_limit(context)?, label, account, waiting)
+    acquire_in(&lane_dir(), heavy_limit(context)?, label, account, context, false, waiting)
 }
 pub fn acquire_remote(
     label: &str,
@@ -194,6 +212,8 @@ pub fn acquire_remote(
         remote["maxHeavy"].as_u64().unwrap_or(4) as usize,
         label,
         account,
+        account,
+        true,
         waiting,
     )
 }
@@ -218,6 +238,8 @@ fn acquire_in(
     limit: usize,
     label: &str,
     account: Option<&Path>,
+    context: Option<&Path>,
+    remote: bool,
     mut waiting: impl FnMut(usize, &[String]),
 ) -> Res<Slot> {
     if limit == 0 || std::env::var_os("DELEGATE_LANE_HELD").is_some() {
@@ -225,9 +247,28 @@ fn acquire_in(
             ticket: None,
             _file: None,
             queued: 0.0,
+            acquired_at: None,
+            event_run: String::new(),
+            event_repo: String::new(),
+            event_label: String::new(),
+            event_remote: remote,
         });
     }
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let event_run_path = account.or(context);
+    let event_run = event_run_path
+        .map(|r| crate::events::run_id_for(r, &json(r.join("meta.json"))))
+        .unwrap_or_default();
+    let event_repo = event_run_path
+        .map(crate::events::repo_for_run)
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|cwd| git_top(&cwd))
+                .map(|p| fs::canonicalize(&p).unwrap_or(p).to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
     let priority = account.map(|r| json(r.join("meta.json"))["lanePriority"][label].as_u64().unwrap_or(0)).unwrap_or(0);
     let stamp = if priority == 0 { now_ns() as u64 } else { priority };
     let mut me = json!({"pid":std::process::id(),"label":label,"since":iso(),"epoch":epoch(),"queuedNs":stamp,"run":account,"running":false});
@@ -244,6 +285,7 @@ fn acquire_in(
         .map(|m| locked_file(m, &me.to_string()))
         .transpose()?;
     let started = Instant::now();
+    let mut emitted_queued = false;
     let outcome = (|| {
         loop {
             let guard = lock(&dir.join(".lock"), true, false).map_err(|e| e.to_string())?;
@@ -255,11 +297,26 @@ fn acquire_in(
                 break;
             }
             drop(guard);
+            let ahead = pos - limit + 1;
+            if !emitted_queued {
+                emitted_queued = true;
+                crate::events::emit(
+                    &event_run,
+                    &event_repo,
+                    "queued",
+                    json!({
+                        "scope": "lane",
+                        "label": label,
+                        "ahead": ahead,
+                        "remote": remote,
+                    }),
+                );
+            }
             let labels: Vec<String> = live[..pos]
                 .iter()
                 .map(|(_, v)| s(v, "label").to_string())
                 .collect();
-            waiting(pos - limit + 1, &labels);
+            waiting(ahead, &labels);
             LANE_WAITING.store(true, Ordering::SeqCst);
             if stopped() {
                 LANE_WAITING.store(false, Ordering::SeqCst);
@@ -286,10 +343,25 @@ fn acquire_in(
         let _ = fs::remove_file(ticket);
         return Err(e);
     }
+    crate::events::emit(
+        &event_run,
+        &event_repo,
+        "lane_acquired",
+        json!({
+            "label": label,
+            "queuedSeconds": (queued * 100.0).round() / 100.0,
+            "remote": remote,
+        }),
+    );
     Ok(Slot {
         ticket: Some(ticket),
         _file: Some(file),
         queued,
+        acquired_at: Some(Instant::now()),
+        event_run,
+        event_repo,
+        event_label: label.to_string(),
+        event_remote: remote,
     })
 }
 /// Keep only queued jobs, not processes: question cleanup still reclaims every child.

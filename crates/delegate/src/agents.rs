@@ -22,6 +22,191 @@ struct WatchState {
     // for the heavy lane is not the command being stuck.
     command_queued: f64,
     command: String,
+    // Rate-limit stall reminders so we warn once per stall interval without spinning or killing.
+    idle_warned_at: Option<Instant>,
+    command_warned_at: Option<Instant>,
+}
+
+/// Mechanical repetition detector (ADR 0120): only consecutive identical commands with identical
+/// outcomes count; edits/writes or changed arguments/outcomes reset the streak.
+struct LoopDetector {
+    threshold: usize,
+    last_sig: Option<(String, bool, String)>,
+    streak: usize,
+}
+
+impl LoopDetector {
+    fn new(threshold: usize) -> Self {
+        Self {
+            threshold,
+            last_sig: None,
+            streak: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.last_sig = None;
+        self.streak = 0;
+    }
+
+    /// Record a completed bash command; returns `Some(count)` when the threshold is reached
+    /// and resets the streak so another `threshold` identical repeats are needed to trigger again.
+    fn record_bash(&mut self, cmd: &str, ok: bool, detail: &str) -> Option<usize> {
+        if self.threshold == 0 || cmd.trim().is_empty() {
+            return None;
+        }
+        let sig = (cmd.trim().to_string(), ok, detail.trim().to_string());
+        if self.last_sig.as_ref() == Some(&sig) {
+            self.streak += 1;
+        } else {
+            self.last_sig = Some(sig);
+            self.streak = 1;
+        }
+        if self.streak >= self.threshold {
+            let count = self.streak;
+            self.streak = 0;
+            Some(count)
+        } else {
+            None
+        }
+    }
+}
+
+fn loop_threshold(meta: &Value) -> usize {
+    let default = meta["loop"]["threshold"]
+        .as_u64()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "12".into());
+    let raw = setting("LOOP_THRESHOLD", &default);
+    raw.trim().parse::<usize>().unwrap_or(12)
+}
+
+/// Optional ADR 0120 colleague-invisible background fork self-check on a copied Pi session file.
+/// Never mutates the live session and never kills the colleague; records a `loop_review` event.
+fn spawn_isolated_loop_review(meta: &Value, run: &Path, cmd: &str, count: usize) {
+    if crate::agy::is_agy(s(meta, "model")) {
+        return;
+    }
+    let enabled = setting("LOOP_REVIEW", "") == "1" || b(&meta["loop"], "review");
+    if !enabled {
+        return;
+    }
+    let session_dir = Path::new(s(meta, "sessionDir"));
+    let Some(latest) = session_files(session_dir).into_iter().last() else {
+        return;
+    };
+    let bin = Some(s(meta, "agentBin"))
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| agent_bin(AGENT));
+    let Some(bin) = bin else {
+        return;
+    };
+    let meta = meta.clone();
+    let run = run.to_path_buf();
+    let cmd = cmd.to_string();
+    std::thread::spawn(move || {
+        let scratch = std::env::temp_dir().join(format!(
+            "delegate-loop-review-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        if fs::create_dir_all(&scratch).is_err() {
+            return;
+        }
+        let copy = scratch.join(latest.file_name().unwrap_or_default());
+        if fs::copy(&latest, &copy).is_err() {
+            let _ = fs::remove_dir_all(&scratch);
+            return;
+        }
+        // Copy rpi progress sidecar if present.
+        let mut sidecar_name = latest.as_os_str().to_owned();
+        sidecar_name.push(".progress.jsonl");
+        let sidecar = PathBuf::from(sidecar_name);
+        if sidecar.is_file() {
+            let mut copy_sidecar = copy.as_os_str().to_owned();
+            copy_sidecar.push(".progress.jsonl");
+            let _ = fs::copy(&sidecar, PathBuf::from(copy_sidecar));
+        }
+        let prompt = format!(
+            "你是后台自检复核（同事看不见此消息）：同事刚连续 {count} 次执行完全相同的命令 `{cmd}` 且结果相同。\
+             请判断是否陷入机械重复。只输出一行 JSON：`{{\"stop\": true|false, \"reason\": \"一句话理由\"}}`，不要调用任何工具。\n"
+        );
+        let mut c = std::process::Command::new(&bin);
+        c.args([
+            "--fork",
+            &copy.to_string_lossy(),
+            "--session-dir",
+            &scratch.to_string_lossy(),
+            "--mode",
+            "json",
+            "--tools",
+            "",
+            "-p",
+        ]);
+        for key in ["provider", "model", "thinking"] {
+            if !s(&meta, key).is_empty() {
+                c.args([format!("--{key}"), s(&meta, key).to_string()]);
+            }
+        }
+        c.current_dir(s(&meta, "workdir"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        clean_env(&mut c, &meta["env"]);
+        if let Ok(mut child) = c.spawn() {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(prompt.as_bytes());
+            }
+            if let Ok(out) = child.wait_with_output() {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let mut text = String::new();
+                for line in stdout.lines() {
+                    if let Ok(ev) = serde_json::from_str::<Value>(line) {
+                        for item in filter_pi(&ev) {
+                            if s(&item, "e") == "result" {
+                                text = s(&item, "text").to_string();
+                            }
+                        }
+                    }
+                }
+                if let Some(start) = text.find('{') {
+                    if let Some(end) = text.rfind('}') {
+                        if let Ok(verdict) = serde_json::from_str::<Value>(&text[start..=end]) {
+                            if verdict.get("stop").and_then(Value::as_bool).is_some() {
+                                let stop = b(&verdict, "stop");
+                                let reason = clip(s(&verdict, "reason"), 200);
+                                let ev = json!({
+                                    "e": "loop_review",
+                                    "cmd": clip(&cmd, 120),
+                                    "count": count,
+                                    "stop": stop,
+                                    "reason": reason,
+                                    "at": iso(),
+                                });
+                                let _ = append(run.join("events.jsonl"), &format!("{ev}\n"));
+                                let run_id = crate::events::run_id_for(&run, &meta);
+                                let repo = crate::events::repo_for_meta(&meta);
+                                crate::events::emit(
+                                    &run_id,
+                                    &repo,
+                                    "loop_review",
+                                    json!({
+                                        "name": s(&meta, "name"),
+                                        "cmd": clip(&cmd, 120),
+                                        "count": count,
+                                        "stop": stop,
+                                        "reason": reason,
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(&scratch);
+    });
 }
 
 /// Harness-facing protocol version; bump when docs/delegate-protocol.md §2 breaks.
@@ -484,9 +669,13 @@ fn filter_pi(v: &Value) -> Vec<Value> {
         _ => vec![],
     }
 }
-fn stall_seconds(meta: &Value, key: &str) -> Option<f64> {
+pub(crate) fn stall_seconds(meta: &Value, key: &str) -> Option<f64> {
     let env_name = format!("STALL_{}", key.to_uppercase());
-    let default = if key == "idle" { "30m" } else { "90m" };
+    let default = match key {
+        "idle" => "30m",
+        "accept" => "10m",
+        _ => "90m",
+    };
     let configured = meta["stall"]
         .get(key)
         .and_then(Value::as_str)
@@ -741,6 +930,8 @@ pub fn run_agent(
             command_started: None,
             command_queued: 0.0,
             command: String::new(),
+            idle_warned_at: None,
+            command_warned_at: None,
         }),
         Condvar::new(),
     ));
@@ -752,15 +943,12 @@ pub fn run_agent(
     let hard = soft.map(|x| x * (1.0 + g / 100.0));
     let stall_idle = stall_seconds(meta, "idle");
     let stall_command = stall_seconds(meta, "command");
-    let stalled = Arc::new(Mutex::new(None::<Value>));
-    let (watcher_state, t, go, stalled_out) = (
-        watch.clone(),
-        timed.clone(),
-        grace_out.clone(),
-        stalled.clone(),
-    );
+    let (watcher_state, t, go) = (watch.clone(), timed.clone(), grace_out.clone());
     let runpath = run.to_path_buf();
     let source_meta = meta.clone();
+    let watcher_run_id = crate::events::run_id_for(run, meta);
+    let watcher_repo = crate::events::repo_for_meta(meta);
+    let watcher_name = s(meta, "name").to_string();
     let watcher = std::thread::spawn(move || {
         let (mutex, changed) = &*watcher_state;
         let mut state = mutex.lock().unwrap();
@@ -776,51 +964,96 @@ pub fn run_agent(
             let command_age = state
                 .command_started
                 .map(|at| at.elapsed().as_secs_f64() - (queued - state.command_queued).max(0.0));
-            if stall_idle.is_some_and(|limit| state.commands == 0 && idle >= limit) {
-                let elapsed = idle.round() as u64;
-                let reason = json!({"kind":"idle","seconds":elapsed,"limitSeconds":stall_idle.unwrap_or(0.0)});
-                if let Ok(mut out) = stalled_out.lock() {
-                    *out = Some(reason.clone());
-                }
-                if let Ok(mut log) = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(runpath.join("events.jsonl"))
-                {
-                    let _ = writeln!(
-                        log,
-                        "{}",
-                        json!({"e":"stalled","kind":"idle","seconds":elapsed,"at":iso()})
+            if let Some(limit) = stall_idle {
+                let due = state.commands == 0
+                    && idle >= limit
+                    && state
+                        .idle_warned_at
+                        .is_none_or(|w| w.elapsed().as_secs_f64() >= limit);
+                if due {
+                    let elapsed = idle.round() as u64;
+                    let at = iso();
+                    let detail = format!("已 {elapsed} 秒无新动作");
+                    let warning = json!({
+                        "kind": "idle",
+                        "seconds": elapsed,
+                        "limitSeconds": limit,
+                        "detail": detail,
+                        "at": at,
+                    });
+                    let _ = write_json(runpath.join("stall-warning.json"), &warning);
+                    if let Ok(mut log) = OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(runpath.join("events.jsonl"))
+                    {
+                        let _ = writeln!(
+                            log,
+                            "{}",
+                            json!({"e":"stall_warning","kind":"idle","seconds":elapsed,"limitSeconds":limit,"detail":detail,"at":at})
+                        );
+                    }
+                    crate::events::emit(
+                        &watcher_run_id,
+                        &watcher_repo,
+                        "stall_warning",
+                        json!({
+                            "name": watcher_name,
+                            "stallKind": "idle",
+                            "seconds": elapsed,
+                            "limitSeconds": limit,
+                            "detail": detail,
+                        }),
                     );
+                    state.idle_warned_at = Some(Instant::now());
                 }
-                t.store(false, Ordering::SeqCst);
-                crate::cleanup::record(&runpath, pid);
-                kill_group(pid, 5.0);
-                break;
             }
-            if stall_command
-                .is_some_and(|limit| state.command_started.is_some() && command_idle >= limit)
-            {
-                let elapsed = command_age.unwrap_or(0.0).round() as u64;
-                let reason = json!({"kind":"command","cmd":state.command,"seconds":elapsed,"limitSeconds":stall_command.unwrap_or(0.0)});
-                if let Ok(mut out) = stalled_out.lock() {
-                    *out = Some(reason.clone());
-                }
-                if let Ok(mut log) = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(runpath.join("events.jsonl"))
-                {
-                    let _ = writeln!(
-                        log,
-                        "{}",
-                        json!({"e":"stalled","kind":"command","cmd":state.command,"seconds":elapsed,"at":iso()})
+            if let Some(limit) = stall_command {
+                let due = state.command_started.is_some()
+                    && command_idle >= limit
+                    && state
+                        .command_warned_at
+                        .is_none_or(|w| w.elapsed().as_secs_f64() >= limit);
+                if due {
+                    let elapsed = command_age.unwrap_or(0.0).round() as u64;
+                    let at = iso();
+                    let cmd = state.command.clone();
+                    let detail = format!("命令 {} 已运行 {elapsed} 秒无新输出", clip(&cmd, 80));
+                    let warning = json!({
+                        "kind": "command",
+                        "cmd": cmd,
+                        "seconds": elapsed,
+                        "limitSeconds": limit,
+                        "detail": detail,
+                        "at": at,
+                    });
+                    let _ = write_json(runpath.join("stall-warning.json"), &warning);
+                    if let Ok(mut log) = OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(runpath.join("events.jsonl"))
+                    {
+                        let _ = writeln!(
+                            log,
+                            "{}",
+                            json!({"e":"stall_warning","kind":"command","cmd":cmd,"seconds":elapsed,"limitSeconds":limit,"detail":detail,"at":at})
+                        );
+                    }
+                    crate::events::emit(
+                        &watcher_run_id,
+                        &watcher_repo,
+                        "stall_warning",
+                        json!({
+                            "name": watcher_name,
+                            "stallKind": "command",
+                            "cmd": cmd,
+                            "seconds": elapsed,
+                            "limitSeconds": limit,
+                            "detail": detail,
+                        }),
                     );
+                    state.command_warned_at = Some(Instant::now());
                 }
-                t.store(false, Ordering::SeqCst);
-                crate::cleanup::record(&runpath, pid);
-                kill_group(pid, 5.0);
-                break;
             }
             if let Some(soft) = soft {
                 if spent >= soft {
@@ -852,12 +1085,20 @@ pub fn run_agent(
             }
             if let Some(limit) = stall_idle {
                 if state.commands == 0 {
-                    delay = delay.min((limit - idle).max(0.01));
+                    let rem = match state.idle_warned_at {
+                        Some(w) => limit - w.elapsed().as_secs_f64(),
+                        None => limit - idle,
+                    };
+                    delay = delay.min(rem.max(0.05));
                 }
             }
             if let Some(limit) = stall_command {
                 if state.command_started.is_some() {
-                    delay = delay.min((limit - command_idle).max(0.01));
+                    let rem = match state.command_warned_at {
+                        Some(w) => limit - w.elapsed().as_secs_f64(),
+                        None => limit - command_idle,
+                    };
+                    delay = delay.min(rem.max(0.05));
                 }
             }
             state = changed
@@ -871,6 +1112,10 @@ pub fn run_agent(
     let mut settled = false;
     let mut agy_filter = crate::agy::Filter::default();
     let mut agy_session = String::new();
+    let mut loop_detector = LoopDetector::new(loop_threshold(meta));
+    let loop_run_id = crate::events::run_id_for(run, meta);
+    let loop_repo = crate::events::repo_for_meta(meta);
+    let loop_name = s(meta, "name").to_string();
     if let Some(stdout) = child.stdout.take() {
         let mut reader = BufReader::new(stdout);
         let mut raw = Vec::new();
@@ -913,6 +1158,8 @@ pub fn run_agent(
                     }
                 }
             }
+            let mut bash_done_in_batch: Option<(String, bool)> = None;
+            let mut bash_err_in_batch = String::new();
             for mut item in items {
                 let kind = s(&item, "e").to_string();
                 item["attempt"] = json!(attempt);
@@ -921,21 +1168,34 @@ pub fn run_agent(
                     let (mutex, changed) = &*watch;
                     let mut state = mutex.lock().unwrap();
                     state.last = Instant::now();
+                    if state.idle_warned_at.take().is_some() {
+                        let _ = fs::remove_file(run.join("stall-warning.json"));
+                    }
                     if kind == "bash" {
                         state.commands += 1;
                         state.command_started = Some(Instant::now());
                         state.command_queued = lane::queued_seconds(run);
                         state.command = s(&item, "cmd").to_string();
+                        state.command_warned_at = None;
                     } else if kind == "bash_done" {
                         state.commands = (state.commands - 1).max(0);
                         if state.commands == 0 {
                             state.command_started = None;
+                            if state.command_warned_at.take().is_some() {
+                                let _ = fs::remove_file(run.join("stall-warning.json"));
+                            }
                         }
                         if !state.command.is_empty() {
                             item["cmd"] = json!(state.command.clone());
                         }
+                        bash_done_in_batch = Some((s(&item, "cmd").to_string(), b(&item, "ok")));
                     }
                     changed.notify_one();
+                }
+                if kind == "tool_error" && s(&item, "tool") == "bash" {
+                    bash_err_in_batch = s(&item, "detail").to_string();
+                } else if matches!(kind.as_str(), "edit" | "write") {
+                    loop_detector.reset();
                 }
                 let _ = writeln!(log, "{item}");
                 let _ = log.flush();
@@ -951,6 +1211,49 @@ pub fn run_agent(
                     "settled" => settled = true,
                     "turn_error" => turn = json!({"stopReason":"error"}),
                     _ => {}
+                }
+            }
+            if let Some((cmd, ok)) = bash_done_in_batch {
+                if let Some(count) = loop_detector.record_bash(&cmd, ok, &bash_err_in_batch) {
+                    let at = iso();
+                    let detail = format!(
+                        "同一命令连续重复 {count} 次且结果相同：{}",
+                        clip(&cmd, 80)
+                    );
+                    let self_check = format!(
+                        "疑似机械重复（ADR 0120 规则：连续 {count} 次相同命令与结果）；请检查进展或执行 delegate stop {loop_run_id} 后 reply 纠正"
+                    );
+                    let warning = json!({
+                        "kind": "loop",
+                        "cmd": clip(&cmd, 180),
+                        "count": count,
+                        "ok": ok,
+                        "detail": detail,
+                        "selfCheck": self_check,
+                        "at": at,
+                    });
+                    let _ = write_json(run.join("stall-warning.json"), &warning);
+                    let _ = writeln!(
+                        log,
+                        "{}",
+                        json!({"e":"stall_warning","kind":"loop","cmd":clip(&cmd, 180),"count":count,"ok":ok,"detail":detail,"selfCheck":self_check,"at":at})
+                    );
+                    let _ = log.flush();
+                    crate::events::emit(
+                        &loop_run_id,
+                        &loop_repo,
+                        "stall_warning",
+                        json!({
+                            "name": loop_name,
+                            "stallKind": "loop",
+                            "cmd": clip(&cmd, 180),
+                            "count": count,
+                            "ok": ok,
+                            "detail": detail,
+                            "selfCheck": self_check,
+                        }),
+                    );
+                    spawn_isolated_loop_review(meta, run, &cmd, count);
                 }
             }
         }
@@ -996,14 +1299,9 @@ pub fn run_agent(
             );
         }
     }
-    let stalled_reason = stalled.lock().ok().and_then(|x| x.clone());
-    if let Some(reason) = &stalled_reason {
-        let _ = write_json(run.join("stall.json"), reason);
-    }
+    let _ = fs::remove_file(run.join("stall-warning.json"));
     let verdict = if lane::stopped() {
         "stopped"
-    } else if stalled_reason.is_some() {
-        "stalled"
     } else if timed.load(Ordering::SeqCst) {
         "timeout"
     } else if !status.success() {
@@ -1181,5 +1479,21 @@ mod tests {
                 "@/a.png"
             ]
         );
+    }
+
+    #[test]
+    fn loop_detector_counts_only_identical_consecutive_commands_and_resets() {
+        let mut d = LoopDetector::new(3);
+        assert_eq!(d.record_bash("cargo test", false, "err A"), None);
+        assert_eq!(d.record_bash("cargo test", false, "err A"), None);
+        // Different error resets streak
+        assert_eq!(d.record_bash("cargo test", false, "err B"), None);
+        assert_eq!(d.record_bash("cargo test", false, "err B"), None);
+        // 3rd identical triggers and resets
+        assert_eq!(d.record_bash("cargo test", false, "err B"), Some(3));
+        assert_eq!(d.record_bash("cargo test", false, "err B"), None);
+        // Explicit reset (e.g. after edit/write) resets streak
+        d.reset();
+        assert_eq!(d.record_bash("cargo test", false, "err B"), None);
     }
 }

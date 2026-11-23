@@ -119,6 +119,34 @@ impl DelegateClient {
         Ok(String::new())
     }
 
+    pub fn fetch_events(&self) -> Vec<EventItem> {
+        let Ok(output) = Command::new(&self.bin)
+            .args(["events", "--json"])
+            .output()
+        else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        parse_events_jsonl(&stdout)
+    }
+
+    pub fn fetch_dag_queue(&self) -> Vec<DagQueueItem> {
+        let Ok(output) = Command::new(&self.bin)
+            .args(["queue", "list", "--json"])
+            .output()
+        else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        parse_dag_queue_jsonl(&stdout)
+    }
+
     pub fn collect_snapshot(
         &self,
         repos: &[PathBuf],
@@ -128,9 +156,13 @@ impl DelegateClient {
         let mut groups = Vec::new();
         let mut warnings = Vec::new();
         let mut lane_res: Result<LaneStatus, String> = Ok(LaneStatus::default());
+        let mut events_list: Vec<EventItem> = Vec::new();
+        let mut dag_queue_list: Vec<DagQueueItem> = Vec::new();
 
         std::thread::scope(|s| {
             let lane_handle = s.spawn(|| self.fetch_lane());
+            let events_handle = s.spawn(|| self.fetch_events());
+            let queue_handle = s.spawn(|| self.fetch_dag_queue());
             let repo_handles: Vec<_> = repos
                 .iter()
                 .map(|repo| s.spawn(move || self.fetch_repo_status(repo, home)))
@@ -150,6 +182,12 @@ impl DelegateClient {
             if let Ok(res) = lane_handle.join() {
                 lane_res = res;
             }
+            if let Ok(evs) = events_handle.join() {
+                events_list = evs;
+            }
+            if let Ok(qs) = queue_handle.join() {
+                dag_queue_list = qs;
+            }
         });
 
         sort_repos_for_cwd(&mut groups, cwd);
@@ -165,6 +203,8 @@ impl DelegateClient {
         AppSnapshot {
             repos: groups,
             lane,
+            events: events_list,
+            dag_queue: dag_queue_list,
             host_load,
             refreshed_at: local_hms(),
             warnings,
@@ -593,6 +633,11 @@ fn parse_run_item(
     let conflict_markers = string_list(v.get("conflictMarkers"));
 
     let last_command = parse_last_command(v.get("last"));
+    let activity = parse_activity(v.get("activity"));
+    let stall_warning = parse_stall_warning(
+        v.get("stallWarning")
+            .or_else(|| v.get("activity").and_then(|a| a.get("stallWarning"))),
+    );
     let next_step = v
         .get("next")
         .and_then(Value::as_str)
@@ -692,6 +737,8 @@ fn parse_run_item(
         source_write_violation,
         conflict_markers,
         last_command,
+        activity,
+        stall_warning,
         next_step,
         recovery,
         error,
@@ -1118,4 +1165,260 @@ pub fn local_hms() -> String {
         }
         format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
     }
+}
+
+fn parse_activity(val: Option<&Value>) -> Option<ActivityInfo> {
+    let obj = val.filter(|v| v.is_object())?;
+    let kind = obj.get("kind").and_then(Value::as_str)?.to_string();
+    let label = obj
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if kind.is_empty() && label.is_empty() {
+        return None;
+    }
+    Some(ActivityInfo {
+        kind,
+        label: single_line(&label),
+        cmd: obj
+            .get("cmd")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(single_line),
+        elapsed_seconds: obj.get("elapsedSeconds").and_then(Value::as_u64),
+        detail: obj
+            .get("detail")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(single_line),
+    })
+}
+
+fn parse_stall_warning(val: Option<&Value>) -> Option<StallWarningInfo> {
+    let obj = val.filter(|v| v.is_object())?;
+    let kind = obj
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if kind.is_empty() {
+        return None;
+    }
+    Some(StallWarningInfo {
+        kind,
+        cmd: obj
+            .get("cmd")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(single_line),
+        seconds: obj.get("seconds").and_then(Value::as_u64),
+        count: obj.get("count").and_then(Value::as_u64),
+        detail: obj
+            .get("detail")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(single_line),
+        self_check: obj
+            .get("selfCheck")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(single_line),
+    })
+}
+
+pub fn parse_events_jsonl(raw: &str) -> Vec<EventItem> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let Some(seq) = v.get("seq").and_then(Value::as_u64) else {
+            continue;
+        };
+        let at = v
+            .get("at")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let run = v
+            .get("run")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let repo_full = v.get("repo").and_then(Value::as_str).unwrap_or("");
+        let repo = Path::new(repo_full)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(repo_full)
+            .to_string();
+        let kind = v
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let p = &v["payload"];
+        let summary = summarize_event_payload(&kind, &run, p);
+        let payload_pretty =
+            serde_json::to_string_pretty(p).unwrap_or_else(|_| p.to_string());
+        out.push(EventItem {
+            seq,
+            at,
+            run,
+            repo,
+            kind,
+            summary,
+            payload_pretty,
+        });
+    }
+    if out.len() > 500 {
+        let drop_n = out.len() - 500;
+        out.drain(..drop_n);
+    }
+    out
+}
+
+fn summarize_event_payload(kind: &str, run: &str, p: &Value) -> String {
+    let ps = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or("");
+    let name = ps("name");
+    let target = if !name.is_empty() {
+        single_line(name)
+    } else if !ps("queueName").is_empty() {
+        single_line(ps("queueName"))
+    } else if !run.is_empty() {
+        run.to_string()
+    } else {
+        single_line(ps("label"))
+    };
+    let extra = match kind {
+        "started" => {
+            let m = ps("model");
+            if m.is_empty() {
+                ps("mode").to_string()
+            } else {
+                format!("{} {m}", ps("mode"))
+            }
+        }
+        "queued" => {
+            let scope = ps("scope");
+            if scope == "dag" {
+                let after = string_list(p.get("after")).join(",");
+                format!("after: {after}")
+            } else {
+                let r = ps("reason");
+                if r.is_empty() {
+                    ps("label").to_string()
+                } else {
+                    r.to_string()
+                }
+            }
+        }
+        "lane_acquired" | "lane_released" => ps("label").to_string(),
+        "accept" => {
+            let ok = if p.get("ok").and_then(Value::as_bool) == Some(true) {
+                "通过"
+            } else {
+                "失败"
+            };
+            format!("{ok} {}", ps("command"))
+        }
+        "delivered" => {
+            if ps("state") == "answered" {
+                "已答复".into()
+            } else {
+                "已交付".into()
+            }
+        }
+        "question" => "等待主控决定".into(),
+        "rejected" | "failed" => ps("error").to_string(),
+        "stall_warning" => {
+            let det = ps("detail");
+            if det.is_empty() {
+                ps("stallKind").to_string()
+            } else {
+                det.to_string()
+            }
+        }
+        "loop_review" => ps("reason").to_string(),
+        "queue_dispatched" => format!("-> {}", ps("nextRun")),
+        "queue_paused" => ps("reason").to_string(),
+        "applied" => {
+            let head = ps("head");
+            if head.is_empty() {
+                "已合入".into()
+            } else {
+                format!("合入 {}", &head[..head.len().min(7)])
+            }
+        }
+        _ => String::new(),
+    };
+    if extra.is_empty() {
+        target
+    } else if target.is_empty() {
+        single_line(&extra)
+    } else {
+        format!("{target} · {}", single_line(&extra))
+    }
+}
+
+pub fn parse_dag_queue_jsonl(raw: &str) -> Vec<DagQueueItem> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let name = v
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let repo_full = v.get("repo").and_then(Value::as_str).unwrap_or("");
+        let repo = Path::new(repo_full)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(repo_full)
+            .to_string();
+        out.push(DagQueueItem {
+            name,
+            status: v
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("pending")
+                .to_string(),
+            after: string_list(v.get("after")),
+            repo,
+            prompt_file: v
+                .get("promptFile")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            run_id: v
+                .get("runId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            pause_reason: v
+                .get("pauseReason")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(single_line),
+            created_at: v
+                .get("createdAt")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        });
+    }
+    out
 }

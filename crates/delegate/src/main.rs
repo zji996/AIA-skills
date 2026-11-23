@@ -1,3 +1,4 @@
+mod activity;
 mod agents;
 mod agy;
 mod archive;
@@ -6,7 +7,9 @@ mod changes;
 mod cleanup;
 mod common;
 mod config;
+mod dag_queue;
 mod deny;
+mod events;
 mod fit;
 mod handoff;
 mod help;
@@ -281,6 +284,8 @@ fn format_status(status: serde_json::Value) -> String {
         "missingObjects",
         "recovery",
         "last",
+        "activity",
+        "stallWarning",
         "idleSeconds",
         "result",
         "resultChars",
@@ -682,6 +687,8 @@ fn collect_timed(
         if show_result || !has_result {
             touch(run.join(".delivered"));
             board::refresh_for_run(run);
+            let meta = json(run.join("meta.json"));
+            events::mark_run_read(&events::run_id_for(run, &meta));
         }
     }
     if glanced {
@@ -911,6 +918,8 @@ fn wait_each(
                         }
                     }
                     println!("{line}");
+                    let meta = json(run.join("meta.json"));
+                    events::mark_run_read(&events::run_id_for(run, &meta));
                     if !["delivered", "answered"].contains(&state.as_str()) {
                         code = 1;
                     }
@@ -972,6 +981,7 @@ fn wait_each(
                         touch(run.join(".delivered"));
                     }
                     println!("{line}");
+                    events::mark_run_read(&id);
                     if !["delivered", "answered"].contains(&state.as_str()) && code == 0 {
                         code = 1;
                     }
@@ -1159,9 +1169,21 @@ fn clean(args: &[String]) -> Res<i32> {
             archive::preserve(&run)?
         };
         let pending_notes = notes::pending_count_for_run(&run);
+        let run_id_for_ev = events::run_id_for(&run, &run_meta);
+        let repo_for_ev = events::repo_for_meta(&run_meta);
         let (units, containers) = runs::remove(&run);
         history::record_clean(&run, &run_meta, archived.as_deref());
         board::refresh_for_meta(&run_meta);
+        events::emit(
+            &run_id_for_ev,
+            &repo_for_ev,
+            "cleaned",
+            json!({
+                "name": s(&run_meta, "name"),
+                "state": st,
+                "archive": archived.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            }),
+        );
         let cleanup_note = if units > 0 {
             format!("；停止了 {units} 个 systemd 服务")
         } else {
@@ -1258,6 +1280,13 @@ fn stop(args: &[String]) -> Res<i32> {
                     sum["state"] = json!("stopped");
                     write_json(run.join("summary.json"), &sum)?;
                     history::record_finish(&run);
+                    let run_meta = json(run.join("meta.json"));
+                    events::emit(
+                        &events::run_id_for(&run, &run_meta),
+                        &events::repo_for_meta(&run_meta),
+                        "stopped",
+                        json!({"name": s(&run_meta, "name"), "state": "stopped"}),
+                    );
                 }
             }
         }
@@ -1814,6 +1843,16 @@ fn apply(args: &[String]) -> Res<i32> {
                 if by.is_empty() { "delegate" } else { by },
                 arch.as_deref(),
             );
+            events::emit(
+                &events::run_id_for(run, &meta),
+                &events::repo_for_meta(&meta),
+                "applied",
+                json!({
+                    "name": s(&meta, "name"),
+                    "head": s(&applied, "head"),
+                    "appliedBy": if by.is_empty() { "delegate" } else { by },
+                }),
+            );
             board::refresh_for_run(run);
         }
     }
@@ -1971,12 +2010,18 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     "--stream",
                     "--json",
                 ],
-                &["--max"],
+                &["--max", "--since"],
             )?;
             if has(&flags, "--json") {
                 output::enable_json();
             }
             let mut max = value(&kv, "--max").map(seconds).transpose()?;
+            if let Some(raw_since) = value(&kv, "--since") {
+                let since = raw_since
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid --since sequence number: {raw_since}"))?;
+                return events::wait_since(since, &pos, max);
+            }
             if has(&flags, "--machine") && !pos.is_empty() {
                 return Err("--machine does not take run arguments".into());
             }
@@ -2411,9 +2456,13 @@ fn main_inner(args: &[String]) -> Res<i32> {
             if !no_mark && !runs::active(&runs::state(&run)) {
                 touch(run.join(".delivered"));
                 board::refresh_for_run(&run);
+                let run_meta = json(run.join("meta.json"));
+                events::mark_run_read(&events::run_id_for(&run, &run_meta));
             }
             Ok(0)
         }
+        "events" => events::command(rest),
+        "queue" => dag_queue::command(rest),
         "diff" => diff(rest),
         "patch" => patch(rest),
         "apply" => apply(rest),
@@ -2583,10 +2632,14 @@ fn main() {
             .first()
             .is_some_and(|command| matches!(command.as_str(), "status" | "list" | "wait"))
     {
-        output::worktree_disk();
-        output::source_build_disk();
-        if args.first().is_some_and(|command| command == "wait") {
-            wait_remaining_hint(&args);
+        let wait_since_mode = args.first().is_some_and(|c| c == "wait")
+            && args.iter().any(|a| a == "--since" || a.starts_with("--since="));
+        if !wait_since_mode {
+            output::worktree_disk();
+            output::source_build_disk();
+            if args.first().is_some_and(|command| command == "wait") {
+                wait_remaining_hint(&args);
+            }
         }
     }
     match result {

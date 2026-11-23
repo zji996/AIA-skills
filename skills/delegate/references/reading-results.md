@@ -49,6 +49,6 @@ state 通常描述答复。普通只读任务写文件仍是 `answered`（`--she
 2. **只读**：git 仓库里默认读启动时的工作区快照（独立 worktree，含未提交改动），你可以同时改代码；要读实时工作区加 `--in-place`。Pi 默认只给读取/搜索工具；加 `--shell` 才能在快照里查日志/跑只读查询，产生文件改动会拒收；非 git 或 `--in-place` 不支持 shell。只读靠约定与事后核对，不是权限沙箱。
 3. **写入**：原地写入同一目录同时只能有一个，且你同时改的文件会算进它的改动；要并行或不想被打扰就加 `--worktree`。同源已有写入任务在运行时，不带 `--worktree` 的写入任务会自动改用 worktree，把源工作区留给你 apply；`apply` 时如果有原地写入任务正在改源工作区，会警告。
 4. **worktree 依赖与验收**：`worktree.copy` 复制忽略材料，或用 `link`/`setup`（`writeSetup` 仅写入）；缺源/空源带 `warnings`。`env` 注入同事、验收、证据和 setup；`accept`/`evidence` 是写入默认，只读不用；CLI 覆盖或关闭。合并后主干默认复验验收没法沿用的任务，`applyVerify: false` 关闭。别 link `node_modules`/`.venv`。
-5. **超时与停滞**：没有默认 agent timeout；显式 `--timeout` 仍按不含排队时间和宽限执行。stall guard 默认空闲 30m、单命令无动作 90m，可用 `stall`/`DELEGATE_STALL_*` 配置，`0` 关闭。停滞保留改动，`reply` 续做不耗返工次数。Claude Code 的 wait 默认 50m 检查一次，控制器在 1 小时提示缓存内醒来后重跑打印的命令。
+5. **超时与停滞**：没有默认 agent timeout，验收也默认不设超时；显式 `--timeout` / `--accept-timeout`（或 `.delegate.json` `acceptTimeout`）才按不含排队时间执行。stall guard 默认空闲 30m、单命令 90m、验收无输出 10m，可用 `stall`/`DELEGATE_STALL_*` 配置（`0` 关闭），只发同事不可见的 `stall_warning` 不强杀，仅显式 `stop` 终止；历史停滞或显式超时后 `reply` 续做不耗返工次数。Claude Code 的 wait 默认 50m 检查一次，控制器在 1 小时提示缓存内醒来后重跑打印的命令。
 
 命令与全部选项见 `$D --help`；run 目录、文件、环境变量与清理策略见 [references/output-and-files.md](output-and-files.md)。

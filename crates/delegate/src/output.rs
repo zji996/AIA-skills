@@ -378,32 +378,46 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
             n(&status["pendingChanges"], "deleted")
         ));
     }
-    if state == "running" {
-        // Waiting out an upstream outage is what the run is doing now; its last command is old news.
-        match status["last"]
-            .as_str()
-            .and_then(|last| last.strip_prefix("resume: "))
-        {
-            Some(waiting) => parts.push(waiting.to_string()),
-            None => {
-                if let Some(command) = runs::events(run)
-                    .iter()
-                    .rev()
-                    .find(|e| !s(e, "cmd").is_empty())
-                {
-                    let mut cmd = s(command, "cmd").replace(['\n', '\r'], " ");
-                    for root in [
-                        s(&meta, "top"),
-                        s(&meta, "workdir"),
-                        s(&meta["worktree"], "source"),
-                    ] {
-                        if !root.is_empty() {
-                            cmd = cmd.replace(&format!("{root}/"), "").replace(root, ".");
+    if runs::active(state) {
+        let act_label = s(&status["activity"], "label");
+        if !act_label.is_empty() {
+            parts.push(act_label.to_string());
+        } else if state == "running" {
+            // Waiting out an upstream outage is what the run is doing now; its last command is old news.
+            match status["last"]
+                .as_str()
+                .and_then(|last| last.strip_prefix("resume: "))
+            {
+                Some(waiting) => parts.push(waiting.to_string()),
+                None => {
+                    if let Some(command) = runs::events(run)
+                        .iter()
+                        .rev()
+                        .find(|e| !s(e, "cmd").is_empty())
+                    {
+                        let mut cmd = s(command, "cmd").replace(['\n', '\r'], " ");
+                        for root in [
+                            s(&meta, "top"),
+                            s(&meta, "workdir"),
+                            s(&meta["worktree"], "source"),
+                        ] {
+                            if !root.is_empty() {
+                                cmd = cmd.replace(&format!("{root}/"), "").replace(root, ".");
+                            }
                         }
+                        parts.push(format!("最近：{}", clip(&cmd, 97)));
                     }
-                    parts.push(format!("最近：{}", clip(&cmd, 97)));
                 }
             }
+        }
+    }
+    if status["stallWarning"].is_object() {
+        let sw = &status["stallWarning"];
+        let det = s(sw, "detail");
+        if det.is_empty() {
+            parts.push(format!("⚠ 卡住提醒（{}）", s(sw, "kind")));
+        } else if !s(&status["activity"], "label").contains("卡住提醒") {
+            parts.push(format!("⚠ 卡住提醒：{}", clip(det, 60)));
         }
     }
     if let Some(ahead) = status["measureWaitingAhead"].as_u64() {
@@ -642,6 +656,17 @@ pub fn human_detail(run: &Path, status: &Value) -> String {
     let mut lines = vec![human(run, status)];
     let summary_path = run.join("summary.json");
     let meta = json(run.join("meta.json"));
+    if status["stallWarning"].is_object() {
+        let sw = &status["stallWarning"];
+        let det = s(sw, "detail");
+        let sc = s(sw, "selfCheck");
+        if !det.is_empty() {
+            lines.push(format!("  ⚠ 卡住提醒（{}）：{det}", s(sw, "kind")));
+        }
+        if !sc.is_empty() {
+            lines.push(format!("  自检建议：{sc}"));
+        }
+    }
     if let Some(drift_line) = format_source_drift(&status["sourceDrift"]) {
         lines.push(format!("  {drift_line}"));
     }

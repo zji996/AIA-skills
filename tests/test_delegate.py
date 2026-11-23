@@ -720,9 +720,9 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         self.until(lambda: (run / "events.jsonl").exists() and "cargo test" in (run / "events.jsonl").read_text(), "command event")
         out = self.cli("status", "running", human=True)
         self.assertEqual(out.returncode, 0, out.stderr)
-        for field in ("running · 运行中", "pi/m · write（推断）", "最近：cargo test", "下一步："):
+        for field in ("running · 运行中", "pi/m · write（推断）", "在跑命令：cargo test", "下一步："):
             self.assertIn(field, out.stdout)
-        recent = out.stdout.split("最近：", 1)[1].split(" · ", 1)[0]
+        recent = out.stdout.split("在跑命令：", 1)[1].split("（", 1)[0]
         self.assertLessEqual(len(recent), 100)
         self.assertTrue(recent.endswith("..."))
         self.assertNotIn(str(self.work), out.stdout)
