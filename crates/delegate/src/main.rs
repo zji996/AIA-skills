@@ -265,6 +265,7 @@ fn format_status(status: serde_json::Value) -> String {
         "queuedSeconds",
         "graceSeconds",
         "tokens",
+        "tokensDelta",
         "cleanup",
         "warnings",
         "warning",
@@ -1174,6 +1175,23 @@ fn clean(args: &[String]) -> Res<i32> {
     targets.dedup();
     let mut staged_any = false;
     for run in targets {
+        if archive::is_record(&run) {
+            let meta = json(run.join("meta.json"));
+            let id = notes::run_id(&run, &meta);
+            let arch_path = run
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if output::json_enabled() {
+                println!(
+                    "{}",
+                    json!({"run": id, "alreadyCleaned": true, "removed": false, "archive": arch_path})
+                );
+            } else {
+                println!("already cleaned & archived: {id} ({arch_path})");
+            }
+            continue;
+        }
         let st = runs::state(&run);
         let name = run.file_name().unwrap_or_default().to_string_lossy().into_owned();
         if pending_reply::status(&run).is_some() && !has(&flags, "--force") {
@@ -1383,14 +1401,140 @@ fn stop(args: &[String]) -> Res<i32> {
     }
     Ok(0)
 }
+fn filter_patch_bytes(data: &[u8], paths: &[String]) -> Res<Vec<u8>> {
+    if paths.is_empty() {
+        return Ok(data.to_vec());
+    }
+    let mut out_bytes = Vec::new();
+    let mut blocks = Vec::<Vec<u8>>::new();
+    for line in data.split_inclusive(|b| *b == b'\n') {
+        if let Some(name) = line.strip_prefix(b"# binary/large file omitted: ") {
+            if let Ok(name) = serde_json::from_slice::<String>(name) {
+                if paths.iter().any(|p| crate::changes::under_path(&name, p)) {
+                    out_bytes.extend_from_slice(line);
+                }
+            }
+            continue;
+        }
+        if line.starts_with(b"diff --git ") || blocks.is_empty() {
+            blocks.push(Vec::new());
+        }
+        blocks.last_mut().unwrap().extend_from_slice(line);
+    }
+    for block in blocks {
+        if !block.starts_with(b"diff --git ") {
+            continue;
+        }
+        let mut child = git_command()
+            .args(["apply", "--numstat", "-z"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&block)
+            .map_err(|e| e.to_string())?;
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).into());
+        }
+        let name = out
+            .stdout
+            .splitn(3, |b| *b == b'\t')
+            .nth(2)
+            .unwrap_or_default();
+        let name = String::from_utf8_lossy(name)
+            .trim_end_matches('\0')
+            .to_string();
+        if paths.iter().any(|p| crate::changes::under_path(&name, p)) {
+            out_bytes.extend_from_slice(&block);
+        }
+    }
+    Ok(out_bytes)
+}
+
+fn archived_patch_file(run: &Path) -> Option<PathBuf> {
+    if run.join("applied.patch").is_file() {
+        Some(run.join("applied.patch"))
+    } else if run.join("changes.patch").is_file() {
+        Some(run.join("changes.patch"))
+    } else {
+        None
+    }
+}
+
+fn print_archived_diff(run: &Path, paths: &[String], stat_only: bool) -> Res<i32> {
+    let Some(patch_file) = archived_patch_file(run) else {
+        return Err(format!("archived run {} has no retained patch", run.display()));
+    };
+    let meta = json(run.join("meta.json"));
+    let id = notes::run_id(run, &meta);
+    eprintln!(
+        "delegate: {id} 已清理归档，从归档补丁读取（完整信息见 `delegate show {id}`）：{}",
+        patch_file.display()
+    );
+    let data = fs::read(&patch_file).map_err(|e| format!("{}: {e}", patch_file.display()))?;
+    let filtered = filter_patch_bytes(&data, paths)?;
+    if stat_only {
+        let mut child = git_command()
+            .args(["apply", "--stat"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&filtered)
+            .map_err(|e| e.to_string())?;
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        if out.status.success() {
+            io::stdout().write_all(&out.stdout).map_err(|e| e.to_string())?;
+            return Ok(0);
+        }
+    }
+    io::stdout().write_all(&filtered).map_err(|e| e.to_string())?;
+    Ok(0)
+}
+
 fn diff(args: &[String]) -> Res<i32> {
     let (options, separated_paths) = match args.iter().position(|arg| arg == "--") {
         Some(index) => (&args[..index], &args[index + 1..]),
         None => (args, &[][..]),
     };
     let (pos, flags, _) = parse_simple(options, &["--stat", "--total"], &[])?;
-    let run = runs::resolve_head(pos.first().map(String::as_str).unwrap_or("last"))?;
-    let (meta, top, mut before, after) = changes::chain_changes(&run)?;
+    let reference = pos.first().map(String::as_str).unwrap_or("last");
+    let run = match runs::resolve_head(reference) {
+        Ok(r) => r,
+        Err(err) => match history::resolve_archive_record(reference) {
+            Some(rec) => rec,
+            None => return Err(err),
+        },
+    };
+    let filter_paths: Vec<String> = pos
+        .iter()
+        .skip(1)
+        .chain(separated_paths.iter())
+        .cloned()
+        .collect();
+    if archive::is_record(&run) && archived_patch_file(&run).is_some() {
+        return print_archived_diff(&run, &filter_paths, has(&flags, "--stat"));
+    }
+    let (meta, top, mut before, after) = match changes::chain_changes(&run) {
+        Ok(x) => x,
+        Err(err) => {
+            if archived_patch_file(&run).is_some() {
+                return print_archived_diff(&run, &filter_paths, has(&flags, "--stat"));
+            }
+            return Err(err);
+        }
+    };
     let before_label = if has(&flags, "--total") {
         let (total_before, label) = worktree::effective_total_base(&top, &meta);
         before = total_before;
@@ -1412,6 +1556,9 @@ fn diff(args: &[String]) -> Res<i32> {
         &[(before_label, &before), ("after", &after)],
     );
     if !missing.is_empty() {
+        if archive::is_record(&run) && archived_patch_file(&run).is_some() {
+            return print_archived_diff(&run, &filter_paths, has(&flags, "--stat"));
+        }
         return Err(refs::recovery_message(&run, &meta, &missing));
     }
     let mut cmd = git_command();
@@ -1442,7 +1589,13 @@ fn patch(args: &[String]) -> Res<i32> {
     if split != 1 {
         return Err("patch requires one run, followed by optional -- paths".into());
     }
-    let run = runs::resolve(&args[0])?;
+    let run = match runs::resolve(&args[0]) {
+        Ok(r) => r,
+        Err(err) => match history::resolve_archive_record(&args[0]) {
+            Some(rec) => rec,
+            None => return Err(err),
+        },
+    };
     let file = if run.join("applied.patch").is_file() {
         run.join("applied.patch")
     } else {
@@ -1450,60 +1603,8 @@ fn patch(args: &[String]) -> Res<i32> {
     };
     let data = fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
     let paths = args.get(split + 1..).unwrap_or_default();
-    if paths.is_empty() {
-        io::stdout().write_all(&data).map_err(|e| e.to_string())?;
-    } else {
-        // Parse names using Git's own patch parser (including quoted/space paths),
-        // then print whole diff sections, never partial hunks.
-        let mut blocks = Vec::<Vec<u8>>::new();
-        for line in data.split_inclusive(|b| *b == b'\n') {
-            if let Some(name) = line.strip_prefix(b"# binary/large file omitted: ") {
-                if let Ok(name) = serde_json::from_slice::<String>(name) {
-                    if paths.iter().any(|p| crate::changes::under_path(&name, p)) {
-                        io::stdout().write_all(line).map_err(|e| e.to_string())?;
-                    }
-                }
-                continue;
-            }
-            if line.starts_with(b"diff --git ") || blocks.is_empty() {
-                blocks.push(Vec::new());
-            }
-            blocks.last_mut().unwrap().extend_from_slice(line);
-        }
-        for block in blocks {
-            if !block.starts_with(b"diff --git ") {
-                continue;
-            }
-            let mut child = git_command()
-                .args(["apply", "--numstat", "-z"])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .map_err(|e| e.to_string())?;
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(&block)
-                .map_err(|e| e.to_string())?;
-            let out = child.wait_with_output().map_err(|e| e.to_string())?;
-            if !out.status.success() {
-                return Err(String::from_utf8_lossy(&out.stderr).into());
-            }
-            let name = out
-                .stdout
-                .splitn(3, |b| *b == b'\t')
-                .nth(2)
-                .unwrap_or_default();
-            let name = String::from_utf8_lossy(name)
-                .trim_end_matches('\0')
-                .to_string();
-            if paths.iter().any(|p| crate::changes::under_path(&name, p)) {
-                io::stdout().write_all(&block).map_err(|e| e.to_string())?;
-            }
-        }
-    }
+    let filtered = filter_patch_bytes(&data, paths)?;
+    io::stdout().write_all(&filtered).map_err(|e| e.to_string())?;
     Ok(0)
 }
 fn apply(args: &[String]) -> Res<i32> {
@@ -1909,15 +2010,6 @@ fn apply(args: &[String]) -> Res<i32> {
             }
         }
     }
-    if code == 0 && !dry && !has(&flags, "--keep") {
-        for item in &done {
-            if worktree::clean_on_apply(&item.run) {
-                for diagnostic in runs::remove_after_apply(&item.run) {
-                    eprintln!("delegate: apply cleanup: {diagnostic}");
-                }
-            }
-        }
-    }
     if !dry {
         let mut applied_records: Vec<(PathBuf, Value, Value)> = Vec::new();
         for run in &applied_runs {
@@ -1961,6 +2053,115 @@ fn apply(args: &[String]) -> Res<i32> {
                     println!("{hint}");
                 }
             }
+        }
+    }
+    if code == 0 && !dry && !has(&flags, "--keep") {
+        let done_set: std::collections::HashSet<PathBuf> =
+            done.iter().map(|item| item.run.clone()).collect();
+        let mut staged_gc = false;
+
+        let wt_is_shared_active = |run: &Path, wt_path: &str| -> bool {
+            !wt_path.is_empty()
+                && runs::all_runs().iter().any(|other| {
+                    other != run
+                        && s(&json(other.join("meta.json"))["worktree"], "path") == wt_path
+                        && (runs::active(&runs::state(other)) || !other.join(".applied").exists())
+                })
+        };
+
+        // 1. Chain-tail applied runs (`done`):
+        //    Fail-closed full auto-clean when committed (`--commit`/`--keep-commits`) or
+        //    `verify.ok == true` or `acceptStillValid == true` (with no conflicts, no pending
+        //    reply, no `.generate-pending`, and no unread truncated result).
+        //    Otherwise keep lightweight `.applied-cleaned` and stage worktree removal to trash.
+        for item in &done {
+            if !worktree::clean_on_apply(&item.run) {
+                continue;
+            }
+            let sum = json(item.run.join("summary.json"));
+            let no_conflicts = item.conclusion["apply"]["conflictMarkers"]
+                .as_array()
+                .is_none_or(|a| a.is_empty())
+                && sum["conflictMarkers"]
+                    .as_array()
+                    .is_none_or(|a| a.is_empty());
+            let no_gen_pending = !item.run.join(".generate-pending").exists();
+            let no_pending_reply = pending_reply::status(&item.run).is_none();
+            let not_truncated = !item.run.join(".truncated").exists();
+            let not_active =
+                !runs::active(&runs::state(&item.run)) && !runs::agent_alive(&item.run);
+            let committed = b(&item.conclusion["apply"], "committed")
+                || b(&item.conclusion["apply"], "keepCommits");
+            let verify_ok = verify["ok"] == json!(true);
+            let accept_valid = item.conclusion["acceptStillValid"] == json!(true);
+            let should_full_clean = no_conflicts
+                && no_gen_pending
+                && no_pending_reply
+                && not_truncated
+                && not_active
+                && (committed || verify_ok || accept_valid);
+
+            if should_full_clean {
+                let meta = json(item.run.join("meta.json"));
+                let wt_path = s(&meta["worktree"], "path").to_string();
+                let shared = wt_is_shared_active(&item.run, &wt_path);
+                match runs::auto_clean_applied_run(&item.run, !shared) {
+                    Ok(Some(arch)) => {
+                        staged_gc = true;
+                        eprintln!("delegate: archive: {}", arch.display());
+                    }
+                    Ok(None) => staged_gc = true,
+                    Err(err) => {
+                        eprintln!("delegate: apply cleanup: kept run: {err}");
+                    }
+                }
+            } else {
+                let (diagnostics, staged) = runs::remove_after_apply(&item.run);
+                if staged {
+                    staged_gc = true;
+                }
+                for diagnostic in diagnostics {
+                    eprintln!("delegate: apply cleanup: {diagnostic}");
+                }
+                index::upsert_run(&item.run);
+                board::refresh_for_run(&item.run);
+            }
+        }
+
+        // 2. Superseded predecessors in the applied chain (`applied_runs` not in `done`):
+        //    Clean immediately (fail-closed) so applied reply chains never leave dead rounds behind.
+        for pred in &applied_runs {
+            if done_set.contains(pred) || !pred.is_dir() {
+                continue;
+            }
+            if !worktree::clean_on_apply(pred)
+                || pred.join(".generate-pending").exists()
+                || pending_reply::status(pred).is_some()
+                || runs::active(&runs::state(pred))
+                || runs::agent_alive(pred)
+            {
+                continue;
+            }
+            let sum = json(pred.join("summary.json"));
+            if sum["conflictMarkers"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty())
+            {
+                continue;
+            }
+            let meta = json(pred.join("meta.json"));
+            let wt_path = s(&meta["worktree"], "path").to_string();
+            let shared = wt_is_shared_active(pred, &wt_path);
+            match runs::auto_clean_applied_run(pred, !shared) {
+                Ok(_) => staged_gc = true,
+                Err(err) => {
+                    eprintln!("delegate: apply predecessor cleanup: kept run: {err}");
+                }
+            }
+        }
+
+        if staged_gc {
+            gc::spawn_worker();
         }
     }
     Ok(code)
@@ -2299,7 +2500,15 @@ fn main_inner(args: &[String]) -> Res<i32> {
             }
 
             let hist_entries = history::load_entries(&history::current_history_key());
-            let replied_ids = runs::superseded_by_reply(&all, &hist_entries);
+            let entries: Vec<(PathBuf, Value, Value)> = all
+                .iter()
+                .map(|run| {
+                    let (st, m) = index::status_and_meta_cached(run, &idx, &wsig);
+                    (run.clone(), st, m)
+                })
+                .collect();
+            let replied_ids = runs::superseded_by_reply_cached(&entries, &hist_entries);
+            let notes_exist = work::any_notes_exist();
 
             let mut running = 0usize;
             let mut pending_apply = 0usize;
@@ -2309,36 +2518,46 @@ fn main_inner(args: &[String]) -> Res<i32> {
             let mut rejected = 0usize;
             let mut other_actionable = 0usize;
             let mut pending_todo = 0usize;
-            let mut shown = Vec::new();
+            let mut shown: Vec<(PathBuf, Value)> = Vec::new();
             let mut shown_ids = std::collections::HashSet::<String>::new();
             let mut hidden_ids = std::collections::HashSet::<String>::new();
 
-            for run in &all {
-                let meta = json(run.join("meta.json"));
-                let st = runs::state(run);
-                let sum = json(run.join("summary.json"));
-                let id = notes::run_id(run, &meta);
+            for (i, (run, status, idx_meta)) in entries.iter().enumerate() {
+                let st = s(status, "state");
+                let id = {
+                    let r = s(status, "run");
+                    if !r.is_empty() {
+                        r.to_string()
+                    } else {
+                        run.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
+                    }
+                };
                 let is_replied = replied_ids.contains(&id);
-                let is_applied = (run.join(".applied").exists()
-                    && !run.join(".generate-pending").exists())
-                    || !s(&meta, "appliedAt").is_empty();
-                let has_explicit_read = !s(&meta, "resultReadAt").is_empty();
+                let is_applied =
+                    b(status, "applied") || !s(idx_meta, "appliedAt").is_empty();
+                let has_explicit_read = !s(idx_meta, "resultReadAt").is_empty();
                 let is_delivered_read = has_explicit_read
-                    || (run.join(".delivered").exists() && !run.join(".truncated").exists());
-                let unresolved_conflicts = sum["conflictMarkers"]
+                    || (b(idx_meta, "delivered") && !b(idx_meta, "truncated"));
+                let unresolved_conflicts = status["conflictMarkers"]
                     .as_array()
                     .into_iter()
                     .flatten()
                     .filter_map(Value::as_str)
                     .any(|path| {
-                        !worktree::conflict_labels(
-                            &Path::new(s(&meta["worktree"], "source")).join(path),
-                        )
-                        .is_empty()
+                        let src = s(idx_meta, "worktreeSource");
+                        !src.is_empty()
+                            && !worktree::conflict_labels(&Path::new(src).join(path)).is_empty()
                     });
-                let note_pending = notes::for_run(run, &all).map_or(0, |c| c.pending_count());
+                let note_pending = if notes_exist {
+                    notes::for_run(run, &all).map_or(0, |c| c.pending_count())
+                } else {
+                    0
+                };
 
-                let mut keep = if matches!(st.as_str(), "running" | "starting") {
+                let mut keep = if matches!(st, "running" | "starting") {
                     running += 1;
                     true
                 } else if st == "waiting" {
@@ -2347,25 +2566,20 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 } else if st == "needs-redispatch" {
                     other_actionable += 1;
                     true
-                } else if b(&sum, "question") {
+                } else if b(status, "question") {
                     if is_replied {
                         false
                     } else {
                         pending_question += 1;
                         true
                     }
-                } else if matches!(st.as_str(), "delivered" | "answered") {
+                } else if matches!(st, "delivered" | "answered") {
                     let has_worktree_changes =
-                        runs::chain_pending_apply_files(run, &meta, &sum, &all) > 0;
-                    let rev_doc = {
-                        let f = json(run.join("review.json"));
-                        if f.is_object() { f } else { sum["review"].clone() }
-                    };
-                    let needs_ctrl = s(&rev_doc, "verdict") == "NEEDS_CONTROLLER"
+                        runs::chain_pending_apply_files_cached(i, &entries) > 0;
+                    let needs_ctrl = s(&status["review"], "verdict") == "NEEDS_CONTROLLER"
                         && !is_applied
                         && !is_replied
-                        && review::sign_status(run, &meta, &rev_doc)
-                            .is_none_or(|sg| !b(&sg, "valid"));
+                        && !(status["sign"].is_object() && b(&status["sign"], "valid"));
                     if unresolved_conflicts || (has_worktree_changes && !is_applied && !is_replied)
                     {
                         pending_apply += 1;
@@ -2383,7 +2597,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     if is_replied
                         || has_explicit_read
                         || is_applied
-                        || run.join(".applied-cleaned").exists()
+                        || b(idx_meta, "appliedCleaned")
                     {
                         false
                     } else {
@@ -2406,7 +2620,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                         pending_todo += note_pending;
                     }
                     shown_ids.insert(id);
-                    shown.push(run.clone());
+                    shown.push((run.clone(), status.clone()));
                 } else {
                     hidden_ids.insert(id);
                 }
@@ -2431,8 +2645,8 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 .map(|plan| jobserver::inspect_pool_readonly(plan.pool_tokens, plan.budget));
 
             if output::json_enabled() {
-                for run in &shown {
-                    let mut status = index::status_cached(run, &idx, &wsig);
+                for (_run, status) in &shown {
+                    let mut status = status.clone();
                     if !include_files {
                         if let Some(obj) = status.as_object_mut() {
                             obj.remove("files");
@@ -2482,9 +2696,8 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     counts.push_str(&format!(" · 异常 {other_actionable}"));
                 }
                 println!("{counts}");
-                for run in &shown {
-                    let status = index::status_cached(run, &idx, &wsig);
-                    println!("{}", output::human_line(run, &status, true));
+                for (run, status) in &shown {
+                    println!("{}", output::human_line(run, status, true));
                 }
                 for chain in &cleaned_notes {
                     println!("{}", output::human_cleaned_note(chain, false));

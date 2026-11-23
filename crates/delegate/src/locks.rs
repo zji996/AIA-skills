@@ -32,6 +32,9 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u16)]
 pub enum LockKind {
+    /// Short-lived background worker single-instance lock (`_gc-worker`, etc., `LOCK_NB`).
+    /// Outermost role guard: acquired once at worker startup before any state/pool/history locks.
+    Worker = 3,
     /// `<run>/waiter.lock` — outer role-claim lock held across `delegate wait` (non-blocking only).
     WaiterClaim = 5,
     /// `<run>/reply.lock` — per-run pending-reply mailbox lock (wraps `launch::reply` delivery).
@@ -57,8 +60,6 @@ pub enum LockKind {
     Jobserver = 130,
     /// Heavy lane, measure queue, or remote lane lock.
     Lane = 140,
-    /// Short-lived background worker single-instance lock (`_gc-worker`, etc., `LOCK_NB`).
-    Worker = 145,
     /// Per-run or standalone local locks (`scopes.lock`, `cleanup.lock`, `supervisor.lock`, `fit`).
     RunLocal = 150,
 }

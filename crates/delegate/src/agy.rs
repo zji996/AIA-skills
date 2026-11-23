@@ -81,9 +81,9 @@ pub fn command(meta: &Value, conversation: Option<&str>) -> Vec<String> {
     a
 }
 
-/// agy can push a long command into a background task and end its turn before the
-/// result arrives; the run then settles on "waiting for …". Every message says so.
-const FOREGROUND: &str = "Run commands in the foreground and wait for their results; do not end your reply while a background task is still running.";
+/// agy moves commands exceeding WaitMsBeforeAsync (max 10s) to the background and wakes
+/// the model when they finish; state that fact so the model does not poll with sleep loops.
+const FOREGROUND: &str = "Long commands move to the background after 10 seconds and you are woken when they finish; there is no need to poll with sleep. Finish your reply only after every background task has ended.";
 
 /// One stream-json user message carrying the colleague addendum, the task, any
 /// images (agy reads them from disk by path) and the foreground rule.

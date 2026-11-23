@@ -89,6 +89,64 @@ fn rename_to_trash(src: &Path, preferred_dst: &Path, id: &str) -> Res<PathBuf> {
     }
 }
 
+/// Atomically stage ONLY the worktree (not the run directory) into trash for `apply`
+/// when the lightweight `.applied-cleaned` run record is kept. O(1) rename (<2ms).
+pub fn stage_worktree_only_to_trash(run: &Path, meta: &Value) -> Res<Option<PathBuf>> {
+    let wt_path_str = s(&meta["worktree"], "path").to_string();
+    let source_str = s(&meta["worktree"], "source").to_string();
+    if wt_path_str.is_empty() {
+        return Ok(None);
+    }
+    let wt_path = Path::new(&wt_path_str);
+    if !wt_path.is_absolute() || wt_path == Path::new(&source_str) {
+        return Ok(None);
+    }
+    if crate::pool::is_slot(wt_path) {
+        crate::pool::release(wt_path, run);
+        return Ok(None);
+    }
+    let id = unique_trash_id(run);
+    let jobs = jobs_dir();
+    fs::create_dir_all(&jobs).map_err(|e| e.to_string())?;
+    let mut trash_wt = String::new();
+    let mut git_owner = String::new();
+    if wt_path.exists() {
+        let git_dirs = worktree_git_dirs_fast(wt_path);
+        git_owner = git_dirs
+            .as_ref()
+            .map(|(_, common)| common.to_string_lossy().into_owned())
+            .unwrap_or_else(|| source_str.clone());
+        let dst = trash_root().join("wt").join(&id);
+        let moved = rename_to_trash(wt_path, &dst, &id)?;
+        trash_wt = moved.to_string_lossy().into_owned();
+        if let Some((admin_dir, _)) = git_dirs {
+            if admin_dir
+                .parent()
+                .and_then(|p| p.file_name())
+                .is_some_and(|n| n == "worktrees")
+            {
+                let _ = fs::remove_dir_all(&admin_dir);
+            }
+        }
+    }
+    let job_path = jobs.join(format!("{id}.json"));
+    let job = json!({
+        "id": id,
+        "runId": s(meta, "run"),
+        "trashRunDir": "",
+        "worktreePath": wt_path_str,
+        "trashWorktreeDir": trash_wt,
+        "gitOwner": git_owner,
+        "sourceRepo": source_str,
+        "pooled": false,
+        "remote": meta["remote"],
+        "meta": meta,
+        "createdAt": iso(),
+    });
+    write_json(&job_path, &job)?;
+    Ok(Some(job_path))
+}
+
 /// Atomically stage a run directory and (if unshared & non-pooled) its worktree into trash,
 /// recording a GC job JSON for `_gc-worker`. O(1) rename on the same filesystem (<2ms).
 pub fn stage_clean_to_trash(
@@ -249,6 +307,7 @@ pub fn worker_command(_args: &[String]) -> Res<i32> {
     };
 
     let jobs = jobs_dir();
+    let mut drained_any = false;
     for _pass in 0..8 {
         let mut pending: Vec<PathBuf> = fs::read_dir(&jobs)
             .into_iter()
@@ -263,6 +322,7 @@ pub fn worker_command(_args: &[String]) -> Res<i32> {
         pending.sort();
         for job in pending {
             let _ = execute_job(&job);
+            drained_any = true;
         }
     }
 
@@ -274,7 +334,93 @@ pub fn worker_command(_args: &[String]) -> Res<i32> {
     crate::refs::backfill_all();
     crate::history::ensure_backfilled();
 
+    // Auto-clean lightweight `.applied-cleaned` runs whose uncommitted changes have now
+    // landed in source `HEAD` (fail-closed: no pending reply, no conflicts, no unread truncated result).
+    auto_clean_committed_applied_runs(&state);
+
+    // Drain any jobs staged by auto-clean above.
+    for _pass in 0..4 {
+        let mut pending: Vec<PathBuf> = fs::read_dir(&jobs)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+            .collect();
+        if pending.is_empty() {
+            break;
+        }
+        pending.sort();
+        for job in pending {
+            let _ = execute_job(&job);
+            drained_any = true;
+        }
+    }
+
+    // P2-1: Cold-start / version-mismatch / corrupt index rebuild in the background worker.
+    if crate::index::needs_rebuild(&state) {
+        crate::index::rebuild_all();
+    }
+
+    // P1-2: Keep `<cache>/delegate/archive/.usage.json` warm and accurate.
+    if !crate::archive::usage_cache_path().is_file() || drained_any {
+        let _ = crate::archive::refresh_usage_cache();
+    }
+
     Ok(0)
+}
+
+fn auto_clean_committed_applied_runs(state: &Path) {
+    let repos = crate::index::discover_snapshot_repos(state, &[], None);
+    for (_, runs_dir) in repos {
+        let all = crate::runs::all_runs_in(&runs_dir);
+        for run in &all {
+            if !run.join(".applied-cleaned").exists() || !run.join(".applied").exists() {
+                continue;
+            }
+            if run.join(".generate-pending").exists()
+                || run.join(".truncated").exists()
+                || crate::pending_reply::status(run).is_some()
+            {
+                continue;
+            }
+            if crate::runs::active(&crate::runs::state(run)) || crate::runs::agent_alive(run) {
+                continue;
+            }
+            if !crate::worktree::clean_on_apply(run) {
+                continue;
+            }
+            let sum = json(run.join("summary.json"));
+            if sum["conflictMarkers"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty())
+            {
+                continue;
+            }
+            let meta = json(run.join("meta.json"));
+            let run_id = crate::notes::run_id(run, &meta);
+            let has_active_child = all.iter().any(|other| {
+                other != run
+                    && s(&json(other.join("meta.json")), "parent") == run_id
+                    && (crate::runs::active(&crate::runs::state(other))
+                        || !other.join(".applied").exists())
+            });
+            if has_active_child {
+                continue;
+            }
+            if crate::worktree::is_applied_committed_in_head(run, &meta) {
+                let wt_path = s(&meta["worktree"], "path");
+                let shared = !wt_path.is_empty()
+                    && all.iter().any(|other| {
+                        other != run
+                            && s(&json(other.join("meta.json"))["worktree"], "path") == wt_path
+                            && (crate::runs::active(&crate::runs::state(other))
+                                || !other.join(".applied").exists())
+                    });
+                let _ = crate::runs::auto_clean_applied_run(run, !shared);
+            }
+        }
+    }
 }
 
 /// V2 interface reservation for background premerge -> fast-forward `apply` (Review §3 & §5).

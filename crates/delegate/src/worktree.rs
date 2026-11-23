@@ -758,7 +758,14 @@ fn recorded_entries(
     if let Some(entries) = rec["finalEntries"].as_object() {
         return Some(entries.clone());
     }
-    let top = Path::new(s(rec, "top"));
+    let top = {
+        let p = Path::new(s(rec, "top"));
+        if p.is_dir() {
+            p
+        } else {
+            Path::new(s(&meta["worktree"], "source"))
+        }
+    };
     final_changes(run, meta, rec)?.iter().map(|change| {
         let path = s(change, "path");
         if b(change, "large") || b(change, "submodule") {
@@ -904,6 +911,72 @@ pub fn is_applied_in_repo_readonly(run: &Path, meta: &Value) -> bool {
         return false;
     }
     entries_match_working_tree(root, &entries) || entries_match_head(root, &entries)
+}
+
+/// Fail-closed check for `_gc-worker`: returns true only if an `.applied-cleaned` run's
+/// applied changes are now committed in source `HEAD` (HEAD has advanced past the uncommitted
+/// apply's `head` AND all recorded changed entries match `HEAD`).
+pub fn is_applied_committed_in_head(run: &Path, meta: &Value) -> bool {
+    if !run.join(".applied-cleaned").exists() || !run.join(".applied").exists() {
+        return false;
+    }
+    if s(meta, "mode") != "write" || !meta["worktree"].is_object() {
+        return false;
+    }
+    let root = Path::new(s(&meta["worktree"], "source"));
+    if !root.is_dir() {
+        return false;
+    }
+    let applied = json(run.join(".applied"));
+    let applied_head = s(&applied, "head");
+    let Some(current_head) = read_git_head(root) else {
+        return false;
+    };
+    if current_head.is_empty() || (!applied_head.is_empty() && current_head == applied_head) {
+        return false;
+    }
+    let rec = json(run.join("changes.json"));
+    if !rec.is_object() {
+        return false;
+    }
+    let entries = if let Some(fe) = rec["finalEntries"].as_object() {
+        fe.clone()
+    } else {
+        // After apply, `.applied` already records `after` and the worktree may be gone;
+        // reconstruct expected entries directly from `rec["changes"]` + pinned `after` tree in `root`.
+        let after = s(&rec, "after");
+        if after.is_empty() {
+            return false;
+        }
+        let Some(changes) = rec["changes"].as_array() else {
+            return false;
+        };
+        let mut map = serde_json::Map::new();
+        for change in changes {
+            let path = s(change, "path");
+            if path.is_empty() || b(change, "large") || b(change, "submodule") {
+                return false;
+            }
+            let Ok((mode, content)) = blob(root, after, path) else {
+                return false;
+            };
+            let entry = if let (Some(mode), Some(bytes)) = (mode, content) {
+                json!({
+                    "mode": mode,
+                    "size": bytes.len(),
+                    "hash": sha1_smol::Sha1::from(&bytes).digest().to_string()
+                })
+            } else {
+                json!({"mode": "absent"})
+            };
+            map.insert(path.to_string(), entry);
+        }
+        map
+    };
+    if entries.is_empty() {
+        return false;
+    }
+    entries_match_head(root, &entries)
 }
 
 /// Write-path detection: checks if `run`'s changes are already in the source repo (working tree

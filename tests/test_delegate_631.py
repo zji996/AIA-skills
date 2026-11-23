@@ -510,6 +510,7 @@ class Delegate631Tests(unittest.TestCase):
         )
         self.assertEqual(r_ok["review"]["verdict"], "PASS", r_ok["review"])
         self.assertNotIn("readOnlyViolation", r_ok["review"])
+        self.assertNotIn("roViolationCount", r_ok["review"])
 
         # Run 2: reviewer touches tracked src/app.ts + unignored src/sneaky.ts + node_modules ->
         # upgraded to NEEDS_CONTROLLER, listing ONLY src/app.ts and src/sneaky.ts!
@@ -518,10 +519,15 @@ class Delegate631Tests(unittest.TestCase):
         )
         self.assertEqual(r_bad["review"]["verdict"], "NEEDS_CONTROLLER", r_bad["review"])
         self.assertEqual(r_bad["review"]["upgradedBy"], "readOnlyViolation", r_bad["review"])
+        self.assertEqual(r_bad["review"]["roViolationCount"], 2, r_bad["review"])
         self.assertEqual(
-            sorted(r_bad["review"]["readOnlyViolation"]),
+            sorted(r_bad["review"]["roViolationSample"]),
             ["src/app.ts", "src/sneaky.ts"],
             r_bad["review"],
+        )
+        self.assertEqual(
+            sorted(Path(r_bad["review"]["roViolationFile"]).read_text().splitlines()),
+            ["src/app.ts", "src/sneaky.ts"],
         )
 
 

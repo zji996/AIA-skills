@@ -173,11 +173,14 @@ fn is_fs_critical(avail: u64, total: u64, min_free_bytes: u64, min_free_pct: u64
         || (min_free_pct > 0 && total > 0 && avail.saturating_mul(100) < total.saturating_mul(min_free_pct))
 }
 
-pub fn usage() -> ArchiveUsage {
-    let root = cache_dir().join("archive");
+pub fn usage_cache_path() -> PathBuf {
+    cache_dir().join("archive").join(".usage.json")
+}
+
+fn scan_usage_counts(root: &Path) -> (u64, usize) {
     let mut bytes = 0u64;
     let mut count = 0usize;
-    for entry in fs::read_dir(&root).into_iter().flatten().flatten() {
+    for entry in fs::read_dir(root).into_iter().flatten().flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;
@@ -190,6 +193,41 @@ pub fn usage() -> ArchiveUsage {
             .unwrap_or_else(|| dir_bytes(&path));
         bytes = bytes.saturating_add(size);
     }
+    (bytes, count)
+}
+
+fn write_usage_cache(root: &Path, bytes: u64, count: usize) {
+    if !root.is_dir() {
+        return;
+    }
+    let _ = write_json(
+        root.join(".usage.json"),
+        &json!({
+            "bytes": bytes,
+            "count": count,
+            "updatedAt": iso(),
+        }),
+    );
+}
+
+/// Rescan `<cache>/delegate/archive` and atomically refresh `.usage.json`.
+/// Only called from write paths (`preserve`, `trim`, `_gc-worker`).
+pub fn refresh_usage_cache() -> (u64, usize) {
+    let root = cache_dir().join("archive");
+    let (bytes, count) = scan_usage_counts(&root);
+    write_usage_cache(&root, bytes, count);
+    (bytes, count)
+}
+
+/// Strictly read-only archive usage check: reads atomic `.usage.json` cache when present,
+/// falling back to an in-memory scan without writing if the cache is missing or corrupt.
+pub fn usage() -> ArchiveUsage {
+    let root = cache_dir().join("archive");
+    let cached = json(root.join(".usage.json"));
+    let (bytes, count) = match (cached["bytes"].as_u64(), cached["count"].as_u64()) {
+        (Some(b), Some(c)) => (b, c as usize),
+        _ => scan_usage_counts(&root),
+    };
     let (min_bytes, min_pct) = critical_watermarks();
     let (fs_avail_bytes, fs_critical) = match fs_space(&root) {
         Some((avail, total)) => (
@@ -251,6 +289,11 @@ pub fn preserve(run: &Path) -> Res<Option<PathBuf>> {
     let run_name = run.file_name().ok_or("run has no name")?;
     let archive = cache_dir().join("archive").join(run_name);
     let existing = json(archive.join("manifest.json"));
+    let existed = existing.is_object();
+    let prev_total_bytes = existing["totalBytes"]
+        .as_u64()
+        .or_else(|| existing["bytes"].as_u64())
+        .unwrap_or(0);
     let mut kept = strings(&existing["files"]);
     let mut skipped = existing["skipped"]
         .as_array()
@@ -346,9 +389,14 @@ pub fn preserve(run: &Path) -> Res<Option<PathBuf>> {
         "changes.json",
         "changes.patch",
         "applied.patch",
+        "review.json",
+        "review.md",
+        "controller-review.diff",
+        "sign.json",
         "exit_code",
         ".delivered",
         ".applied",
+        ".applied-cleaned",
         "compression.json",
     ] {
         if run.join(name).is_file() {
@@ -374,7 +422,18 @@ pub fn preserve(run: &Path) -> Res<Option<PathBuf>> {
         write_json(run.join("archive.json"), &manifest)?;
     }
     touch(&archive)?;
-    prune_if_fs_critical(&archive);
+    let trimmed = prune_if_fs_critical(&archive);
+    let archive_root = cache_dir().join("archive");
+    let cached = json(archive_root.join(".usage.json"));
+    if trimmed {
+        refresh_usage_cache();
+    } else if let (Some(old_b), Some(old_c)) = (cached["bytes"].as_u64(), cached["count"].as_u64()) {
+        let new_b = old_b.saturating_sub(prev_total_bytes).saturating_add(total_bytes);
+        let new_c = if existed { old_c as usize } else { old_c as usize + 1 };
+        write_usage_cache(&archive_root, new_b, new_c);
+    } else {
+        refresh_usage_cache();
+    }
     Ok(Some(archive))
 }
 
@@ -410,14 +469,14 @@ fn update_manifest_sizes(archive: &Path, evicted_events: bool, evicted_files: bo
 /// Only when the archive filesystem hits its critical free-space watermark do we trim
 /// least-recently-read trace bytes (`events.jsonl.gz` / `events.jsonl`, then `files/`).
 /// `prompt.md`, `result.md`, `meta.json`, `summary.json`, patches, and `history.jsonl` are never deleted.
-fn prune_if_fs_critical(keep: &Path) {
+fn prune_if_fs_critical(keep: &Path) -> bool {
     let root = cache_dir().join("archive");
     let Some((mut avail, total)) = fs_space(&root) else {
-        return;
+        return false;
     };
     let (min_free_bytes, min_free_pct) = critical_watermarks();
     if !is_fs_critical(avail, total, min_free_bytes, min_free_pct) {
-        return;
+        return false;
     }
     let mut entries: Vec<(f64, PathBuf)> = fs::read_dir(&root)
         .into_iter()
@@ -481,7 +540,9 @@ fn prune_if_fs_critical(keep: &Path) {
             "delegate: archive filesystem critically low; trimmed {} ({trimmed_events} event log(s), {trimmed_files} evidence dir(s)); prompt/result/meta/summary/patch kept",
             format_bytes(freed_total)
         );
+        return true;
     }
+    false
 }
 
 pub fn is_record(run: &Path) -> bool {

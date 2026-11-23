@@ -32,7 +32,10 @@ class Delegate526Tests(unittest.TestCase):
         first = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "original task"))
         self.assertEqual(self.cli("apply", first["run"]).returncode, 0)
         run = Path(first["dir"])
-        archive = run
+        # 6.33 P1-4: acceptStillValid=true auto-cleans and archives the applied run;
+        # prompt.md and result.md live in the archive record and `reply` still retains context!
+        archive = Path(self.env["XDG_CACHE_HOME"]) / "delegate" / "archive" / first["run"] / "record"
+        self.assertFalse(run.exists())
         self.assertTrue((archive / "prompt.md").exists())
         self.assertTrue((archive / "result.md").exists())
         self.assertFalse(Path(first["worktree"]).exists())
@@ -49,7 +52,7 @@ class Delegate526Tests(unittest.TestCase):
         self.assertNotEqual(first["worktree"], second["worktree"])
         self.assertIn("one", (Path(second["worktree"]) / "a.txt").read_text())
         self.assertEqual(self.cli("clean", first["run"]).returncode, 0)
-        self.assertFalse(archive.exists())
+        self.assertTrue(archive.exists(), "clean must never delete archive records")
 
     def test_keep_commits_and_default_preserve_order(self):
         repo = self.repo({"a.txt": "old\n"})

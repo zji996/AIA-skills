@@ -1391,13 +1391,14 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         .iter()
         .filter(|x| s(x, "e") == "session" && !s(x, "id").is_empty())
         .collect::<Vec<_>>();
-    if let Some(last) = sessions.last() {
-        sum["session"] = json!(s(last, "id"));
+    let session_id = sessions
+        .last()
+        .map(|last| s(last, "id").to_string())
+        .unwrap_or_default();
+    if !session_id.is_empty() {
+        sum["session"] = json!(&session_id);
     }
-    let mut tokens = json!({});
-    for key in ["input", "output", "cacheRead"] {
-        tokens[key] = json!(turns.iter().map(|x| n(&x["usage"], key)).sum::<i64>());
-    }
+    let (tokens, tokens_delta) = compute_tokens(run, &meta, &turns, &session_id);
     sum["elapsedSeconds"] = json!((epoch() - started) as i64);
     sum["model"] = turns
         .last()
@@ -1406,6 +1407,9 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
     sum["turns"] = json!(turns.len());
     sum["files"] = json!(files);
     sum["tokens"] = tokens;
+    if let Some(delta) = tokens_delta {
+        sum["tokensDelta"] = delta;
+    }
     if lane::queued_seconds(run) >= 1.0 {
         sum["queuedSeconds"] = json!(lane::queued_seconds(run) as i64);
     }
@@ -1598,4 +1602,156 @@ pub fn supervise(run: &Path) -> Res<()> {
         }
     }
     Ok(())
+}
+
+/// Compute `summary.json["tokens"]` and (for `agy` reply runs continuing the same session)
+/// `summary.json["tokensDelta"]`.
+///
+/// Pi reports per-turn delta usage on each `turn` event, so turns are summed.
+/// `agy` reports session-cumulative usage on every `turn` event, so we take the last turn
+/// to avoid double-counting across rework/resume turns, and subtract the parent run's last
+/// turn when a `reply` child continues the same `session` ID.
+fn compute_tokens(
+    run: &Path,
+    meta: &Value,
+    turns: &[&Value],
+    session_id: &str,
+) -> (Value, Option<Value>) {
+    let is_agy = crate::agy::is_agy(s(meta, "model"))
+        || turns
+            .last()
+            .is_some_and(|x| s(x, "provider") == crate::agy::BIN);
+    let mut tokens = json!({});
+    if is_agy {
+        let last_usage = turns.last().map(|x| &x["usage"]);
+        for key in ["input", "output", "cacheRead"] {
+            tokens[key] = json!(last_usage.map_or(0, |u| n(u, key)));
+        }
+    } else {
+        for key in ["input", "output", "cacheRead"] {
+            tokens[key] = json!(turns.iter().map(|x| n(&x["usage"], key)).sum::<i64>());
+        }
+    }
+
+    let mut delta = None;
+    let parent_id = s(meta, "parent");
+    if is_agy && !parent_id.is_empty() && !session_id.is_empty() {
+        let parent_dir = run
+            .parent()
+            .map(|p| p.join(parent_id))
+            .filter(|p| p.join("summary.json").is_file() || p.join("events.jsonl").is_file())
+            .or_else(|| {
+                let arch = cache_dir().join("archive").join(parent_id).join("record");
+                (arch.join("summary.json").is_file() || arch.join("events.jsonl").is_file())
+                    .then_some(arch)
+            });
+        if let Some(pdir) = parent_dir {
+            let psum = json(pdir.join("summary.json"));
+            let psession = {
+                let ps = s(&psum, "session");
+                if !ps.is_empty() {
+                    ps.to_string()
+                } else {
+                    runs::events(&pdir)
+                        .iter()
+                        .rev()
+                        .find(|e| s(e, "e") == "session" && !s(e, "id").is_empty())
+                        .map(|e| s(e, "id").to_string())
+                        .unwrap_or_default()
+                }
+            };
+            if psession == session_id {
+                let parent_usage = runs::events(&pdir)
+                    .into_iter()
+                    .rev()
+                    .find(|e| s(e, "e") == "turn")
+                    .map(|e| e["usage"].clone())
+                    .filter(Value::is_object)
+                    .or_else(|| psum["tokens"].is_object().then(|| psum["tokens"].clone()));
+                if let Some(pu) = parent_usage {
+                    let mut d = json!({});
+                    for key in ["input", "output", "cacheRead"] {
+                        d[key] = json!((n(&tokens, key) - n(&pu, key)).max(0));
+                    }
+                    delta = Some(d);
+                }
+            }
+        }
+    }
+    (tokens, delta)
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    #[test]
+    fn agy_takes_last_turn_cumulative_and_pi_sums_turns() {
+        let dir = std::env::temp_dir().join(format!(
+            "delegate-tokens-test-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let t1 = json!({"e":"turn","provider":"agy","usage":{"input":100,"output":20,"cacheRead":47_570_000}});
+        let t2 = json!({"e":"turn","provider":"agy","usage":{"input":130,"output":35,"cacheRead":56_680_000}});
+        let turns = vec![&t1, &t2];
+
+        let agy_meta = json!({"model":"agy/gemini-4-neon"});
+        let (tok, delta) = compute_tokens(&dir, &agy_meta, &turns, "conv-1");
+        assert_eq!(tok, json!({"input": 130, "output": 35, "cacheRead": 56_680_000}));
+        assert!(delta.is_none());
+
+        let pi_t1 = json!({"e":"turn","provider":"anthropic","usage":{"input":100,"output":20,"cacheRead":500}});
+        let pi_t2 = json!({"e":"turn","provider":"anthropic","usage":{"input":80,"output":15,"cacheRead":700}});
+        let pi_meta = json!({"model":"anthropic/claude"});
+        let (pi_tok, pi_delta) = compute_tokens(&dir, &pi_meta, &[&pi_t1, &pi_t2], "s-1");
+        assert_eq!(pi_tok, json!({"input": 180, "output": 35, "cacheRead": 1200}));
+        assert!(pi_delta.is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agy_reply_records_tokens_delta_for_same_session_only() {
+        let base = std::env::temp_dir().join(format!(
+            "delegate-tokens-delta-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let parent = base.join("run-parent");
+        let child = base.join("run-child");
+        fs::create_dir_all(&parent).unwrap();
+        fs::create_dir_all(&child).unwrap();
+        write_json(
+            parent.join("summary.json"),
+            &json!({"session":"conv-42","tokens":{"input":999,"output":999,"cacheRead":999}}),
+        )
+        .unwrap();
+        // Parent events.jsonl has two cumulative turns; child must subtract parent's LAST turn.
+        write(
+            parent.join("events.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({"e":"turn","provider":"agy","usage":{"input":100,"output":10,"cacheRead":1000}}),
+                json!({"e":"turn","provider":"agy","usage":{"input":250,"output":40,"cacheRead":5000}})
+            ),
+        )
+        .unwrap();
+
+        let ct = json!({"e":"turn","provider":"agy","usage":{"input":310,"output":65,"cacheRead":8200}});
+        let child_meta = json!({"model":"agy/gemini-4-neon","parent":"run-parent"});
+        let (tok, delta) = compute_tokens(&child, &child_meta, &[&ct], "conv-42");
+        assert_eq!(tok, json!({"input": 310, "output": 65, "cacheRead": 8200}));
+        assert_eq!(
+            delta,
+            Some(json!({"input": 60, "output": 25, "cacheRead": 3200}))
+        );
+
+        // Fresh session (`reply --fresh`) -> different session id -> no subtraction delta.
+        let (_, fresh_delta) = compute_tokens(&child, &child_meta, &[&ct], "conv-99");
+        assert!(fresh_delta.is_none());
+
+        let _ = fs::remove_dir_all(&base);
+    }
 }

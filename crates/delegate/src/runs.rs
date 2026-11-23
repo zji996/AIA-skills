@@ -170,8 +170,13 @@ pub fn resolve(reference: &str) -> Res<PathBuf> {
             .iter()
             .filter(|p| s(&json(p.join("meta.json")), "name") == reference)
             .collect::<Vec<_>>();
-        if named_arch.len() == 1 {
-            return Ok(named_arch[0].clone());
+        if !named_arch.is_empty() {
+            if let Some(newest) = named_arch
+                .into_iter()
+                .max_by_key(|p| json(p.join("meta.json"))["startedNs"].as_u64().unwrap_or(0))
+            {
+                return Ok(newest.clone());
+            }
         }
         let matches_arch = archived
             .iter()
@@ -403,7 +408,13 @@ pub fn agent_pinned(meta: &Value) -> bool {
         .as_bool()
         .unwrap_or_else(|| s(meta, "tier").is_empty() && !s(meta, "agent").is_empty())
 }
-pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<String> {
+pub fn next_step(
+    run: &Path,
+    meta: &Value,
+    state: &str,
+    sum: &Value,
+    live_worktree: bool,
+) -> Option<String> {
     let name = if !s(meta, "run").is_empty() {
         s(meta, "run").to_string()
     } else {
@@ -442,7 +453,7 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
             }
         };
         if s(&rev, "verdict") == "NEEDS_CONTROLLER" && !run.join(".applied").exists() {
-            if let Some(sign) = crate::review::sign_status(run, meta, &rev) {
+            if let Some(sign) = crate::review::sign_status(run, meta, &rev, live_worktree) {
                 if b(&sign, "required") && !b(&sign, "valid") {
                     return Some(format!(
                         "review controller-review.diff (NEEDS_CONTROLLER) and sign with {script} sign {name} before {script} apply {name}"
@@ -454,7 +465,13 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
             ));
         }
         let changed_files = if meta["worktree"].is_object() {
-            chain_pending_apply_files(run, meta, sum, &all_runs())
+            if let Some(pending) = sum.get("pendingChanges").filter(|v| v.is_object()) {
+                n(pending, "files")
+            } else if n(&sum["changes"], "files") > 0 {
+                n(&sum["changes"], "files")
+            } else {
+                chain_pending_apply_files_opts(run, meta, sum, &all_runs(), live_worktree)
+            }
         } else {
             n(
                 sum.get("pendingChanges")
@@ -600,6 +617,12 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
     if meta["worktree"].is_object() {
         out["worktree"] = json!(s(&meta["worktree"], "path"));
     }
+    if !s(&meta, "top").is_empty() {
+        out["top"] = meta["top"].clone();
+    }
+    if b(&meta, "shell") {
+        out["shell"] = json!(true);
+    }
     if !s(&meta, "netBase").is_empty() {
         out["netBase"] = meta["netBase"].clone();
     }
@@ -645,9 +668,9 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
         }
     };
     if review_doc.is_object() {
-        out["review"] = review_doc.clone();
+        out["review"] = crate::review::compact_review_summary(&review_doc);
     }
-    if let Some(sign) = crate::review::sign_status(run, &meta, &review_doc) {
+    if let Some(sign) = crate::review::sign_status(run, &meta, &review_doc, check_missing_objects) {
         out["sign"] = sign;
     }
     if sum.is_object() {
@@ -681,6 +704,7 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
             "stall",
             "denied",
             "tokens",
+            "tokensDelta",
             "cleanup",
             "warnings",
             "warning",
@@ -776,7 +800,7 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
         out["result"] = json!(result.to_string_lossy());
         out["resultChars"] = json!(read(&result).chars().count());
     }
-    if let Some(step) = next_step(run, &meta, &st, &sum) {
+    if let Some(step) = next_step(run, &meta, &st, &sum, check_missing_objects) {
         out["next"] = json!(step);
     }
     if !run.join(".applied-cleaned").exists() && !crate::archive::is_record(run) {
@@ -858,13 +882,15 @@ pub fn remove(run: &Path) -> (usize, crate::cleanup::Containers) {
     (stopped, containers)
 }
 
-/// Apply cleanup has the same scope as explicit clean, but cannot change apply's exit status.
-pub fn remove_after_apply(run: &Path) -> Vec<String> {
+/// Apply cleanup (lightweight retention mode): archives evidence and stages worktree removal
+/// asynchronously via `gc::stage_worktree_only_to_trash`, keeping `.applied-cleaned` + patches.
+/// Returns `(diagnostics, staged_gc)`.
+pub fn remove_after_apply(run: &Path) -> (Vec<String>, bool) {
     if active(&state(run)) || agent_alive(run) {
-        return vec![format!("kept active run {}", run.display())];
+        return (vec![format!("kept active run {}", run.display())], false);
     }
     let meta = json(run.join("meta.json"));
-    let path = s(&meta["worktree"], "path");
+    let path = s(&meta["worktree"], "path").to_string();
     let shared = !path.is_empty()
         && all_runs().iter().any(|other| {
             other != run
@@ -875,17 +901,20 @@ pub fn remove_after_apply(run: &Path) -> Vec<String> {
         match crate::archive::preserve(run) {
             Ok(Some(path)) => eprintln!("delegate: archive: {}", path.display()),
             Ok(None) => {}
-            Err(error) => return vec![format!("kept worktree: archive failed: {error}")],
+            Err(error) => return (vec![format!("kept worktree: archive failed: {error}")], false),
         }
     }
     let _ = crate::cleanup::record(run, 0);
-    let containers = if !shared {
-        crate::remote::clean(&meta);
-        worktree::remove(&meta)
-    } else {
-        crate::cleanup::Containers::default()
-    };
-    if crate::pool::is_slot(Path::new(path)) {
+    let mut diagnostics = Vec::new();
+    let mut staged_gc = false;
+    if !shared && !path.is_empty() {
+        match crate::gc::stage_worktree_only_to_trash(run, &meta) {
+            Ok(Some(_)) => staged_gc = true,
+            Ok(None) => {}
+            Err(error) => diagnostics.push(format!("could not stage worktree {path} to trash: {error}")),
+        }
+    }
+    if crate::pool::is_slot(Path::new(&path)) {
         // Every applied round sharing the slot must stop holding it, not just the
         // latest reply. Active/unapplied sharers are still protected by `shared`.
         for other in all_runs()
@@ -905,6 +934,7 @@ pub fn remove_after_apply(run: &Path) -> Vec<String> {
         "pending-reply.json",
         "reply.lock",
         "reply-delivered.json",
+        "changes.json",
         "applied.patch",
         "prompt.md",
         "result.md",
@@ -938,20 +968,64 @@ pub fn remove_after_apply(run: &Path) -> Vec<String> {
     let _ = write(run.join(".applied-cleaned"), "1\n");
     let _ = fs::remove_file(run.join("exit_code"));
     let _ = write(run.join("exit_code"), "0\n");
-    containers.warn_kept();
-    let mut diagnostics = containers.diagnostic.clone().into_iter().collect::<Vec<_>>();
-    if !containers.removed_names.is_empty() {
-        diagnostics.push(format!("removed containers: {}", containers.removed_names.join(", ")));
-    }
     if !shared
-        && !crate::pool::is_slot(Path::new(path))
-        && Path::new(path).is_absolute()
+        && !crate::pool::is_slot(Path::new(&path))
+        && Path::new(&path).is_absolute()
         && path != s(&meta["worktree"], "source")
-        && Path::new(path).exists()
+        && Path::new(&path).exists()
     {
         diagnostics.push(format!("could not remove worktree {path}"));
     }
-    diagnostics
+    (diagnostics, staged_gc)
+}
+
+/// Fail-closed full automatic clean of an applied run (or superseded predecessor in an applied chain):
+/// preserves archive first, deletes pinned refs, stages run + unshared worktree into trash via
+/// `gc::stage_clean_to_trash`, records clean in history/index/board/events.
+pub fn auto_clean_applied_run(run: &Path, remove_worktree: bool) -> Res<Option<PathBuf>> {
+    if !run.is_dir() {
+        return Ok(None);
+    }
+    let st = state(run);
+    if active(&st) || agent_alive(run) {
+        return Err(format!("kept active run {}", run.display()));
+    }
+    let meta = json(run.join("meta.json"));
+    let archived = crate::archive::preserve(run)?;
+    let _ = crate::work::on_run_cleaned(run, &meta);
+    crate::refs::delete_run(run, &meta);
+    let _ = crate::cleanup::reclaim_on_clean(run, false);
+    let wt_path = s(&meta["worktree"], "path").to_string();
+    if remove_worktree && !wt_path.is_empty() && crate::pool::is_slot(Path::new(&wt_path)) {
+        for other in all_runs() {
+            if other == run {
+                continue;
+            }
+            let mut released = json(other.join("meta.json"));
+            if s(&released["worktree"], "path") == wt_path && !active(&state(&other)) {
+                released["worktree"]["path"] = json!(format!("{wt_path}#released"));
+                let _ = write_json(other.join("meta.json"), &released);
+            }
+        }
+    }
+    let run_id_ev = crate::events::run_id_for(run, &meta);
+    let repo_ev = crate::events::repo_for_meta(&meta);
+    let _job = crate::gc::stage_clean_to_trash(run, &meta, remove_worktree)?;
+    crate::history::record_clean(run, &meta, archived.as_deref());
+    crate::index::remove_run(run);
+    crate::board::refresh_for_meta(&meta);
+    crate::events::emit(
+        &run_id_ev,
+        &repo_ev,
+        "cleaned",
+        json!({
+            "name": s(&meta, "name"),
+            "state": st,
+            "autoCleanedOnApply": true,
+            "archive": archived.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        }),
+    );
+    Ok(archived)
 }
 
 pub fn record_worktree_bytes(run: &Path) {
@@ -1026,9 +1100,24 @@ pub fn prune() {
 /// A reply round carries the conversation on unless it was malformed or
 /// ended without saving a session (the agent failed before it wrote one);
 /// the next reply then continues from the round before it.
-pub fn continues_conversation(run: &Path) -> bool {
+pub fn continues_conversation_from(run: &Path, meta: &Value, st: &str, sum: &Value) -> bool {
     // A lightweight applied round deliberately has no session. It still owns
     // the conversation head: reply will reopen it from current source context.
+    if run.join(".applied-cleaned").exists() {
+        return true;
+    }
+    if st == "malformed" {
+        return false;
+    }
+    if active(st) {
+        return true;
+    }
+    // agy keeps its conversation itself: the recorded id is what a reply continues.
+    let session = s(sum, "session");
+    !session.is_empty() && crate::agents::continuation_target(meta, session).is_some()
+}
+
+pub fn continues_conversation(run: &Path) -> bool {
     if run.join(".applied-cleaned").exists() {
         return true;
     }
@@ -1039,10 +1128,29 @@ pub fn continues_conversation(run: &Path) -> bool {
     if active(&st) {
         return true;
     }
-    // agy keeps its conversation itself: the recorded id is what a reply continues.
-    let session = s(&json(run.join("summary.json")), "session").to_string();
-    !session.is_empty()
-        && crate::agents::continuation_target(&json(run.join("meta.json")), &session).is_some()
+    let meta = json(run.join("meta.json"));
+    let sum = json(run.join("summary.json"));
+    continues_conversation_from(run, &meta, &st, &sum)
+}
+
+/// Lightweight auxiliary metadata cached alongside `status` in `state/index.json`
+/// so non-`--all` `status` classifies runs without re-opening `meta.json` or `summary.json`.
+pub fn index_meta(run: &Path) -> Value {
+    let meta = json(run.join("meta.json"));
+    let st = state(run);
+    let sum = json(run.join("summary.json"));
+    let cont = continues_conversation_from(run, &meta, &st, &sum);
+    json!({
+        "resultReadAt": s(&meta, "resultReadAt"),
+        "delivered": run.join(".delivered").exists(),
+        "truncated": run.join(".truncated").exists(),
+        "appliedCleaned": run.join(".applied-cleaned").exists(),
+        "appliedAt": s(&meta, "appliedAt"),
+        "repliedAt": s(&meta, "repliedAt"),
+        "hasSyncBase": run.join(".sync-base").exists(),
+        "continuesConversation": cont,
+        "worktreeSource": s(&meta["worktree"], "source"),
+    })
 }
 
 pub fn latest(mut run: PathBuf) -> PathBuf {
@@ -1122,19 +1230,132 @@ pub fn superseded_by_reply(
     superseded
 }
 
+/// Zero-disk-read version of `superseded_by_reply` driven directly by `index::status_and_meta_cached`.
+pub fn superseded_by_reply_cached(
+    entries: &[(PathBuf, Value, Value)],
+    hist_entries: &[crate::history::HistoryEntry],
+) -> std::collections::HashSet<String> {
+    use std::collections::{HashMap, HashSet};
+    let mut live_children: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, (_, status, _)) in entries.iter().enumerate() {
+        let parent = s(status, "parent");
+        if !parent.is_empty() {
+            live_children.entry(parent).or_default().push(i);
+        }
+    }
+
+    let mut superseded = HashSet::<String>::new();
+    for (parent, indices) in &live_children {
+        if indices.iter().any(|&idx| {
+            let (_, status, idx_meta) = &entries[idx];
+            active(s(status, "state")) || b(idx_meta, "continuesConversation")
+        }) {
+            superseded.insert((*parent).to_string());
+        }
+    }
+    for e in hist_entries {
+        if !e.parent.is_empty()
+            && !live_children.contains_key(e.parent.as_str())
+            && !matches!(e.state.as_str(), "malformed" | "crashed")
+        {
+            superseded.insert(e.parent.clone());
+        }
+    }
+    for (run, status, idx_meta) in entries {
+        let id = {
+            let r = s(status, "run");
+            if !r.is_empty() {
+                r.to_string()
+            } else {
+                run.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        if !s(idx_meta, "repliedAt").is_empty() && !live_children.contains_key(id.as_str()) {
+            superseded.insert(id);
+        }
+    }
+    superseded
+}
+
+/// Zero-disk-read, zero-git version of `chain_pending_apply_files` driven by cached status + meta.
+pub fn chain_pending_apply_files_cached(
+    idx: usize,
+    entries: &[(PathBuf, Value, Value)],
+) -> i64 {
+    let (_, status, _) = &entries[idx];
+    if s(status, "mode") != "write" || s(status, "worktree").is_empty() {
+        return 0;
+    }
+    if let Some(pending) = status.get("pendingChanges").filter(|v| v.is_object()) {
+        return n(pending, "files");
+    }
+    let own = n(&status["changes"], "files");
+    if own > 0 {
+        return own;
+    }
+    let wt_path = s(status, "worktree");
+    let mut parent = s(status, "parent").to_string();
+    let mut visited = std::collections::HashSet::new();
+    while !parent.is_empty() && visited.insert(parent.clone()) {
+        let Some((_, anc_status, anc_meta)) = entries.iter().find(|(r, st, _)| {
+            s(st, "run") == parent.as_str()
+                || r.file_name().is_some_and(|name| name == parent.as_str())
+        }) else {
+            break;
+        };
+        if b(anc_status, "applied")
+            || b(anc_meta, "appliedCleaned")
+            || b(anc_meta, "hasSyncBase")
+            || !s(anc_meta, "appliedAt").is_empty()
+        {
+            break;
+        }
+        if !wt_path.is_empty() && s(anc_status, "worktree") != wt_path {
+            break;
+        }
+        if let Some(pending) = anc_status.get("pendingChanges").filter(|v| v.is_object()) {
+            let pf = n(pending, "files");
+            if pf > 0 {
+                return pf;
+            }
+        }
+        let af = n(&anc_status["changes"], "files");
+        if af > 0 {
+            return af;
+        }
+        parent = s(anc_status, "parent").to_string();
+    }
+    0
+}
+
 /// Count unapplied worktree files for `run` across its continuation chain.
 /// Handles null/missing `pendingChanges` and zero-edit reply tails whose unapplied ancestors
 /// in the same worktree carry pending changes.
 pub fn chain_pending_apply_files(run: &Path, meta: &Value, sum: &Value, all: &[PathBuf]) -> i64 {
+    chain_pending_apply_files_opts(run, meta, sum, all, true)
+}
+
+pub fn chain_pending_apply_files_opts(
+    run: &Path,
+    meta: &Value,
+    sum: &Value,
+    all: &[PathBuf],
+    live_git: bool,
+) -> i64 {
     if s(meta, "mode") != "write" || !meta["worktree"].is_object() {
         return 0;
     }
     if let Some(pending) = sum.get("pendingChanges").filter(|v| v.is_object()) {
         return n(pending, "files");
     }
-    if let Some(pending) = crate::worktree::pending_changes(run, meta) {
-        if pending.is_object() {
-            return n(&pending, "files");
+    if live_git {
+        if let Some(pending) = crate::worktree::pending_changes(run, meta) {
+            if pending.is_object() {
+                return n(&pending, "files");
+            }
         }
     }
     let own = n(&sum["changes"], "files");

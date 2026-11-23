@@ -458,8 +458,11 @@ pub fn evaluate_controller_paths(
     }))
 }
 
-/// Compute live signature validity for `status`, `sign --check`, and 6.30 merger.
-pub fn sign_status(run: &Path, meta: &Value, review: &Value) -> Option<Value> {
+/// Compute signature validity for `status`, `sign --check`, and merger.
+/// When `live_worktree` is false (read paths: `status`, `snapshot`, `index`), performs pure
+/// JSON comparison between `sign.json` and `review.json` with zero git subprocesses.
+/// `sign`, `apply`, and `merge` pass `live_worktree = true` to verify the live worktree.
+pub fn sign_status(run: &Path, meta: &Value, review: &Value, live_worktree: bool) -> Option<Value> {
     let sign_doc = json(run.join("sign.json"));
     let cr = &review["controllerReview"];
     let has_cr = cr.is_object() && !s(cr, "hash").is_empty();
@@ -468,7 +471,11 @@ pub fn sign_status(run: &Path, meta: &Value, review: &Value) -> Option<Value> {
         return None;
     }
 
-    let live = evaluate_controller_paths(run, meta, true).ok().flatten();
+    let live = if live_worktree {
+        evaluate_controller_paths(run, meta, true).ok().flatten()
+    } else {
+        None
+    };
     let (current_hash, current_paths) = if let Some(hit) = live {
         (hit.hash, hit.paths)
     } else if has_cr {
@@ -539,7 +546,7 @@ pub fn sign_command(args: &[String]) -> Res<i32> {
     };
 
     if check_only {
-        if let Some(status) = sign_status(&run, &meta, &review_doc) {
+        if let Some(status) = sign_status(&run, &meta, &review_doc, true) {
             let valid = b(&status, "valid");
             let required = b(&status, "required");
             if json_mode {
@@ -601,9 +608,14 @@ pub fn sign_command(args: &[String]) -> Res<i32> {
     let hit = evaluate_controller_paths(&run, &meta, true)?.or_else(|| {
         let cr = &review_doc["controllerReview"];
         if cr.is_object() && !s(cr, "hash").is_empty() {
+            let diff = if !s(cr, "diff").is_empty() {
+                s(cr, "diff").to_string()
+            } else {
+                read(s(cr, "diffFile"))
+            };
             Some(ControllerReviewHit {
                 paths: strings(&cr["paths"]),
-                diff: s(cr, "diff").to_string(),
+                diff,
                 hash: s(cr, "hash").to_string(),
             })
         } else {
@@ -958,6 +970,94 @@ fn copy_pi_fork_if_needed(target: &str, dest_dir: &Path, is_agy: bool) -> Res<St
     Ok(dst.to_string_lossy().into_owned())
 }
 
+const MAX_PARSE_ERROR_CHARS: usize = 240;
+const RO_VIOLATION_SAMPLE_MAX: usize = 5;
+
+struct CleanupDir(PathBuf);
+impl Drop for CleanupDir {
+    fn drop(&mut self) {
+        if self.0.exists() {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+/// Out-of-repo read-only checkout directory for `agy` reviewers so parent `.gitignore`
+/// rules (such as `.local/`) never swallow `rg` / `fd` searches inside the checkout.
+pub(crate) fn ro_workspace_dir(run_id: &str) -> PathBuf {
+    cache_dir().join("review-ro").join(run_id)
+}
+
+fn compact_controller_review(cr: &Value) -> Option<Value> {
+    if !cr.is_object() {
+        return None;
+    }
+    let mut out = json!({
+        "paths": cr["paths"],
+        "hash": cr["hash"],
+    });
+    if !s(cr, "diffFile").is_empty() {
+        out["diffFile"] = cr["diffFile"].clone();
+    }
+    if let Some(bytes) = cr["diffBytes"].as_u64() {
+        out["diffBytes"] = json!(bytes);
+    } else if let Some(diff) = cr["diff"].as_str() {
+        out["diffBytes"] = json!(diff.len());
+    }
+    Some(out)
+}
+
+/// Produce a bounded, index-safe summary from either a new 6.33 or legacy `review.json`.
+/// Never inlines `rounds[]`, full `readOnlyViolation` lists, raw `controllerReview.diff`,
+/// or unbounded `parseError` text.
+pub fn compact_review_summary(doc: &Value) -> Value {
+    if !doc.is_object() {
+        return Value::Null;
+    }
+    let mut out = serde_json::Map::new();
+    for key in [
+        "status",
+        "verdict",
+        "round",
+        "reworkRounds",
+        "model",
+        "tier",
+        "needsAttention",
+        "upgradedBy",
+        "originalVerdict",
+        "formatError",
+        "verdictFile",
+        "stoppedDuringRework",
+        "reworkOutcome",
+        "roViolationCount",
+        "roViolationSample",
+        "roViolationFile",
+    ] {
+        if let Some(v) = doc.get(key) {
+            if !v.is_null() {
+                out.insert(key.to_string(), v.clone());
+            }
+        }
+    }
+    if let Some(err) = doc.get("parseError").and_then(Value::as_str).filter(|e| !e.is_empty()) {
+        out.insert("parseError".into(), json!(clip(err, MAX_PARSE_ERROR_CHARS)));
+    }
+    // Backward compatibility with legacy review.json that stored raw `readOnlyViolation` arrays.
+    if !out.contains_key("roViolationCount") {
+        if let Some(arr) = doc.get("readOnlyViolation").and_then(Value::as_array) {
+            if !arr.is_empty() {
+                let sample: Vec<Value> = arr.iter().take(RO_VIOLATION_SAMPLE_MAX).cloned().collect();
+                out.insert("roViolationCount".into(), json!(arr.len()));
+                out.insert("roViolationSample".into(), Value::Array(sample));
+            }
+        }
+    }
+    if let Some(cr) = compact_controller_review(&doc["controllerReview"]) {
+        out.insert("controllerReview".into(), cr);
+    }
+    Value::Object(out)
+}
+
 fn build_controller_review_json(run: &Path, hit: &ControllerReviewHit) -> Res<Value> {
     let diff_file = run.join("controller-review.diff");
     write(&diff_file, &hit.diff)?;
@@ -965,7 +1065,7 @@ fn build_controller_review_json(run: &Path, hit: &ControllerReviewHit) -> Res<Va
         "paths": hit.paths,
         "hash": hit.hash,
         "diffFile": diff_file.to_string_lossy(),
-        "diff": hit.diff,
+        "diffBytes": hit.diff.len(),
     }))
 }
 
@@ -1010,7 +1110,7 @@ pub fn run_if_applicable(
                     "finishedAt": now,
                 });
                 write_json(run.join("review.json"), &review_doc)?;
-                sum["review"] = review_doc;
+                sum["review"] = compact_review_summary(&review_doc);
                 let run_id = events::run_id_for(run, meta);
                 let repo = events::repo_for_meta(meta);
                 let name = s(meta, "name");
@@ -1057,12 +1157,14 @@ pub fn run_if_applicable(
     let run_name = s(meta, "name").to_string();
     let review_root = run.join("review");
     fs::create_dir_all(&review_root).map_err(|e| e.to_string())?;
-    let ro_workspace = review_root.join("ro-workspace");
+    let ro_workspace = ro_workspace_dir(&run_id);
+    let _ro_cleanup = CleanupDir(ro_workspace.clone());
 
     let (rubric_text, rubric_source) = match load_rubric(&review_cfg) {
         Ok(pair) => pair,
         Err(err) => {
             let now = iso();
+            let err_short = clip(&err, MAX_PARSE_ERROR_CHARS);
             let review_doc = json!({
                 "status": "done",
                 "verdict": "NEEDS_CONTROLLER",
@@ -1072,14 +1174,14 @@ pub fn run_if_applicable(
                 "tier": review_cfg["tier"],
                 "needsAttention": true,
                 "upgradedBy": "rubricError",
-                "parseError": err,
+                "parseError": err_short,
                 "rounds": [],
                 "startedAt": now,
                 "updatedAt": now,
                 "finishedAt": now,
             });
             write_json(run.join("review.json"), &review_doc)?;
-            sum["review"] = review_doc;
+            sum["review"] = compact_review_summary(&review_doc);
             events::emit(
                 &run_id,
                 &repo,
@@ -1137,7 +1239,7 @@ pub fn run_if_applicable(
                 "finishedAt": now,
             });
             write_json(run.join("review.json"), &doc)?;
-            sum["review"] = doc;
+            sum["review"] = compact_review_summary(&doc);
             break;
         }
 
@@ -1352,10 +1454,14 @@ pub fn run_if_applicable(
                         ("NEEDS_CONTROLLER".to_string(), text)
                     }
                     ParsedVerdict::Invalid(first) => {
-                        raw_first_line = first.clone();
+                        raw_first_line = clip(&first, MAX_PARSE_ERROR_CHARS);
                         format_error = true;
-                        parse_error = Some(format!(
-                            "invalid reviewer verdict first line: {first:?} (expected PASS, REWORK, or NEEDS_CONTROLLER)"
+                        parse_error = Some(clip(
+                            &format!(
+                                "invalid reviewer verdict first line: {:?} (expected PASS, REWORK, or NEEDS_CONTROLLER)",
+                                clip(&first, 120)
+                            ),
+                            MAX_PARSE_ERROR_CHARS,
                         ));
                         upgraded_by = Some("formatError".into());
                         ("NEEDS_CONTROLLER".to_string(), text)
@@ -1380,27 +1486,56 @@ pub fn run_if_applicable(
                         "finishedAt": round_finished,
                     });
                     write_json(run.join("review.json"), &doc)?;
-                    sum["review"] = doc;
+                    sum["review"] = compact_review_summary(&doc);
                     break;
                 }
-                parse_error = Some(format!("reviewer ended with outcome: {agent_outcome}"));
+                parse_error = Some(clip(
+                    &format!("reviewer ended with outcome: {agent_outcome}"),
+                    MAX_PARSE_ERROR_CHARS,
+                ));
                 upgraded_by = Some("reviewerError".into());
                 ("NEEDS_CONTROLLER".to_string(), text)
             }
             Err(err) => {
-                parse_error = Some(format!("reviewer execution error: {err}"));
+                parse_error = Some(clip(
+                    &format!("reviewer execution error: {err}"),
+                    MAX_PARSE_ERROR_CHARS,
+                ));
                 upgraded_by = Some("reviewerError".into());
                 ("NEEDS_CONTROLLER".to_string(), String::new())
             }
         };
 
+        let mut ro_violation_file: Option<PathBuf> = None;
+        let ro_violation_sample: Vec<String> = ro_violations
+            .iter()
+            .take(RO_VIOLATION_SAMPLE_MAX)
+            .cloned()
+            .collect();
         if !ro_violations.is_empty() {
-            parse_error = Some(format!(
-                "reviewer violated read-only boundary and modified files: {}",
-                ro_violations.join(", ")
-            ));
+            let vfile = review_root.join(format!("round-{round}-ro-violations.txt"));
+            let mut body = ro_violations.join("\n");
+            body.push('\n');
+            write(&vfile, &body)?;
+            let extra = ro_violations.len().saturating_sub(ro_violation_sample.len());
+            let summary_msg = if extra > 0 {
+                format!(
+                    "reviewer violated read-only boundary ({} files: {}, +{extra} more; see {})",
+                    ro_violations.len(),
+                    ro_violation_sample.join(", "),
+                    vfile.display()
+                )
+            } else {
+                format!(
+                    "reviewer violated read-only boundary ({} files: {})",
+                    ro_violations.len(),
+                    ro_violation_sample.join(", ")
+                )
+            };
+            parse_error = Some(clip(&summary_msg, MAX_PARSE_ERROR_CHARS));
             upgraded_by = Some("readOnlyViolation".into());
             verdict_str = "NEEDS_CONTROLLER".to_string();
+            ro_violation_file = Some(vfile);
         }
 
         // Write exact raw reviewer verdict file (never modified or paraphrased).
@@ -1449,7 +1584,11 @@ pub fn run_if_applicable(
             round_entry["upgradedBy"] = json!(up);
         }
         if !ro_violations.is_empty() {
-            round_entry["readOnlyViolation"] = json!(ro_violations);
+            round_entry["roViolationCount"] = json!(ro_violations.len());
+            round_entry["roViolationSample"] = json!(ro_violation_sample);
+            if let Some(ref vf) = ro_violation_file {
+                round_entry["roViolationFile"] = json!(vf.to_string_lossy());
+            }
         }
         rounds_history.push(round_entry);
 
@@ -1495,7 +1634,7 @@ pub fn run_if_applicable(
                 "finishedAt": round_finished,
             });
             write_json(run.join("review.json"), &final_doc)?;
-            sum["review"] = final_doc;
+            sum["review"] = compact_review_summary(&final_doc);
             break;
         }
 
@@ -1552,13 +1691,17 @@ pub fn run_if_applicable(
                 final_doc["upgradedBy"] = json!(up);
             }
             if !ro_violations.is_empty() {
-                final_doc["readOnlyViolation"] = json!(ro_violations);
+                final_doc["roViolationCount"] = json!(ro_violations.len());
+                final_doc["roViolationSample"] = json!(ro_violation_sample);
+                if let Some(ref vf) = ro_violation_file {
+                    final_doc["roViolationFile"] = json!(vf.to_string_lossy());
+                }
             }
             if controller_review_json.is_object() {
                 final_doc["controllerReview"] = controller_review_json;
             }
             write_json(run.join("review.json"), &final_doc)?;
-            sum["review"] = final_doc;
+            sum["review"] = compact_review_summary(&final_doc);
             break;
         }
 
@@ -1636,7 +1779,7 @@ pub fn run_if_applicable(
                 "finishedAt": now,
             });
             write_json(run.join("review.json"), &final_doc)?;
-            sum["review"] = final_doc;
+            sum["review"] = compact_review_summary(&final_doc);
             events::emit(
                 &run_id,
                 &repo,
@@ -1720,7 +1863,7 @@ pub fn run_if_applicable(
                 "finishedAt": now,
             });
             write_json(run.join("review.json"), &final_doc)?;
-            new_sum["review"] = final_doc;
+            new_sum["review"] = compact_review_summary(&final_doc);
             *sum = new_sum;
             break;
         }
@@ -1728,9 +1871,6 @@ pub fn run_if_applicable(
         round += 1;
     }
 
-    if ro_workspace.exists() {
-        let _ = fs::remove_dir_all(&ro_workspace);
-    }
     Ok(())
 }
 
@@ -1773,6 +1913,13 @@ pub fn print_delivery_review(run: &Path) {
         }
         if !s(&review, "parseError").is_empty() {
             println!("详情：{}", s(&review, "parseError"));
+        }
+        if !s(&review, "roViolationFile").is_empty() {
+            println!(
+                "只读违规清单（{} 项）：{}",
+                n(&review, "roViolationCount"),
+                s(&review, "roViolationFile")
+            );
         }
         if !vf.is_empty() {
             println!("审查结论文件：{vf}");
@@ -1936,5 +2083,132 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ro_workspace_outside_repo_is_searchable_by_rg_despite_local_gitignore() {
+        let base = std::env::temp_dir().join(format!(
+            "delegate-review-rg-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let repo = base.join("repo");
+        let scratch = base.join("scratch");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(&scratch).unwrap();
+        fs::write(repo.join(".gitignore"), ".local/\n").unwrap();
+        fs::write(repo.join("src/needle.rs"), "pub fn unique_ro_needle() -> u32 { 42 }\n").unwrap();
+
+        let run_git = |args: &[&str]| {
+            let out = git_command()
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["add", ".gitignore", "src/needle.rs"]);
+        run_git(&["commit", "-qm", "init"]);
+
+        let head_tree = git_text(&repo, &["rev-parse", "HEAD^{tree}"]).unwrap();
+        // ro_workspace_dir lives under `<cache>/delegate/review-ro/<run>`, outside any repo `.local/`.
+        let run_id = format!("test-rg-{}-{}", std::process::id(), now_ns());
+        let ro_ws = ro_workspace_dir(&run_id);
+        let _guard = CleanupDir(ro_ws.clone());
+        assert!(!ro_ws.starts_with(&repo));
+        assert!(ro_ws.to_string_lossy().contains("review-ro"));
+
+        prepare_ro_workspace(&repo, &head_tree, &ro_ws, &scratch).unwrap();
+        assert!(ro_ws.join("src/needle.rs").is_file());
+
+        // Verify `rg` finds `unique_ro_needle` inside `ro_ws` (whereas an in-repo `.local/...` checkout would be ignored).
+        if let Ok(out) = std::process::Command::new("rg")
+            .args(["-l", "unique_ro_needle"])
+            .current_dir(&ro_ws)
+            .output()
+        {
+            assert!(out.status.success(), "rg failed: {}", String::from_utf8_lossy(&out.stderr));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains("src/needle.rs"), "rg returned: {stdout:?}");
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn compact_review_summary_strips_bloat_and_reads_legacy_records() {
+        let huge_list: Vec<String> = (0..500).map(|i| format!("node_modules/pkg-{i}/index.js")).collect();
+        let huge_diff = format!("diff --git a/p.md b/p.md\n+{}", "x".repeat(50_000));
+        let legacy = json!({
+            "status": "done",
+            "verdict": "NEEDS_CONTROLLER",
+            "originalVerdict": "PASS",
+            "round": 1,
+            "reworkRounds": 0,
+            "needsAttention": true,
+            "upgradedBy": "readOnlyViolation",
+            "parseError": format!("reviewer violated read-only boundary: {}", huge_list.join(", ")),
+            "readOnlyViolation": huge_list,
+            "verdictFile": "/tmp/run/review/round-1-verdict.md",
+            "controllerReview": {
+                "paths": ["prompts/a.md"],
+                "hash": "sha256:abc",
+                "diffFile": "/tmp/run/controller-review.diff",
+                "diff": huge_diff,
+            },
+            "rounds": [{"round": 1, "readOnlyViolation": huge_list}],
+        });
+
+        let compact = compact_review_summary(&legacy);
+        let serialized = serde_json::to_string(&compact).unwrap();
+        assert!(serialized.len() < 2048, "compact summary too large: {} bytes", serialized.len());
+        assert!(compact.get("rounds").is_none());
+        assert!(compact.get("readOnlyViolation").is_none());
+        assert_eq!(compact["roViolationCount"], json!(500));
+        assert_eq!(compact["roViolationSample"].as_array().unwrap().len(), 5);
+        assert!(s(&compact, "parseError").chars().count() <= MAX_PARSE_ERROR_CHARS + 3);
+        assert!(compact["controllerReview"].get("diff").is_none());
+        assert_eq!(compact["controllerReview"]["diffFile"], json!("/tmp/run/controller-review.diff"));
+        assert_eq!(compact["controllerReview"]["diffBytes"], json!(huge_diff.len()));
+    }
+
+    #[test]
+    fn sign_status_non_live_reads_json_without_git() {
+        let dir = std::env::temp_dir().join(format!(
+            "delegate-sign-nonlive-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let meta = json!({"mode": "write", "worktree": {"source": "/nonexistent-repo-xyz", "path": "/nonexistent-wt"}});
+        let review = json!({
+            "verdict": "NEEDS_CONTROLLER",
+            "controllerReview": {
+                "paths": ["prompts/a.md"],
+                "hash": "sha256:1111",
+                "diffFile": dir.join("controller-review.diff").to_string_lossy(),
+                "diffBytes": 12,
+            }
+        });
+        let unsigned = sign_status(&dir, &meta, &review, false).unwrap();
+        assert_eq!(unsigned["required"], json!(true));
+        assert_eq!(unsigned["signed"], json!(false));
+        assert_eq!(unsigned["valid"], json!(false));
+
+        write_json(dir.join("sign.json"), &json!({"hash": "sha256:1111", "signedAt": "2026-01-01T00:00:00Z"})).unwrap();
+        let valid = sign_status(&dir, &meta, &review, false).unwrap();
+        assert_eq!(valid["signed"], json!(true));
+        assert_eq!(valid["valid"], json!(true));
+        assert_eq!(valid["invalidated"], json!(false));
+
+        write_json(dir.join("sign.json"), &json!({"hash": "sha256:2222"})).unwrap();
+        let inv = sign_status(&dir, &meta, &review, false).unwrap();
+        assert_eq!(inv["valid"], json!(false));
+        assert_eq!(inv["invalidated"], json!(true));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

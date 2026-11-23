@@ -50,6 +50,19 @@ def settle_supervisors(runs_dir, seconds=10.0):
         pids = [p for p in pids if not process_gone(p)]
         if pids:
             time.sleep(0.05)
+    gc_lock = Path(runs_dir).parent / "state" / "delegate" / ".gc-worker.lock"
+    if gc_lock.is_file():
+        import fcntl
+        while time.monotonic() < deadline:
+            try:
+                with open(gc_lock, "r+") as fh:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                break
+            except BlockingIOError:
+                time.sleep(0.03)
+            except OSError:
+                break
 
 
 def process_gone(pid_file):

@@ -233,7 +233,6 @@ pub fn human(run: &Path, status: &Value) -> String {
 }
 
 pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
-    let meta = json(run.join("meta.json"));
     let state = s(status, "state");
     let label = match state {
         "running" => "运行中",
@@ -302,8 +301,9 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
         .map(str::to_string)
         .collect::<Vec<_>>();
     let mut dirs = BTreeMap::<String, usize>::new();
+    let status_top = s(status, "top");
     for path in &paths {
-        let relative = repository_relative(path, s(&meta, "top"));
+        let relative = repository_relative(path, status_top);
         let relative = Path::new(&relative);
         let parent = relative.parent().unwrap_or(Path::new("."));
         let dir = parent
@@ -324,8 +324,9 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
         .map(|(dir, count)| format!("{dir} {count}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let use_pending = meta["worktree"].is_object()
-        && s(&meta, "mode") == "write"
+    let has_worktree = !s(status, "worktree").is_empty();
+    let use_pending = has_worktree
+        && s(status, "mode") == "write"
         && status["pendingChanges"].is_object();
     let display_totals = if use_pending {
         status["pendingChanges"].clone()
@@ -396,11 +397,7 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
                         .find(|e| !s(e, "cmd").is_empty())
                     {
                         let mut cmd = s(command, "cmd").replace(['\n', '\r'], " ");
-                        for root in [
-                            s(&meta, "top"),
-                            s(&meta, "workdir"),
-                            s(&meta["worktree"], "source"),
-                        ] {
+                        for root in [status_top, s(status, "worktree")] {
                             if !root.is_empty() {
                                 cmd = cmd.replace(&format!("{root}/"), "").replace(root, ".");
                             }
@@ -545,7 +542,7 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
     }
     if !status["readOnlyViolation"].is_null() || !status["workspaceChanged"].is_null() {
         parts.push(
-            if b(&meta, "shell") {
+            if b(status, "shell") {
                 "只读任务产生了写入"
             } else {
                 "只读工作区有改动"
@@ -635,7 +632,7 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
                 } else {
                     format!("主控审查结论（NEEDS_CONTROLLER）：delegate status {id}，再 delegate reply {id} '<决定>' 或 delegate apply {id}")
                 }
-            } else if meta["worktree"].is_object() {
+            } else if has_worktree {
                 if status["sourceDrift"]["overlap"]
                     .as_array()
                     .is_some_and(|paths| !paths.is_empty())
@@ -815,6 +812,13 @@ pub fn human_detail(run: &Path, status: &Value) -> String {
         }
         if !s(rev, "parseError").is_empty() {
             lines.push(format!("  审查异常：{}", s(rev, "parseError")));
+        }
+        if !s(rev, "roViolationFile").is_empty() {
+            lines.push(format!(
+                "  只读违规清单（{} 项）：{}",
+                n(rev, "roViolationCount"),
+                s(rev, "roViolationFile")
+            ));
         }
         if !s(rev, "verdictFile").is_empty() {
             lines.push(format!("  审查结论文件：{}", s(rev, "verdictFile")));

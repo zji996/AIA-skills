@@ -1184,13 +1184,14 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
             parent.file_name().unwrap_or_default().to_string_lossy()
         ));
     }
-    let after_apply = parent.join(".applied-cleaned").exists();
+    let after_apply = parent.join(".applied-cleaned").exists()
+        || (crate::archive::is_record(&parent) && parent.join(".applied").exists());
     let compose_after_apply = after_apply && !o.fresh;
     if after_apply {
         o.fresh = true;
         eprintln!("delegate: 原会话已合入，已开新会话续做");
     }
-    let parent_name = parent.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let parent_name = crate::notes::run_id(&parent, &meta);
     let existing_child = all_runs().into_iter().find(|run| {
         s(&json(run.join("meta.json")), "parent") == parent_name
             && runs::continues_conversation(run)

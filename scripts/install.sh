@@ -266,4 +266,18 @@ while IFS= read -r entry; do
   echo "  [Pruned] $entry (source skill no longer exists)"
 done < <(owned_entries)
 
+# Warm up delegate's state index and archive usage cache asynchronously on install/upgrade.
+if [ -z "${AIA_SKILLS_SKIP_BINARIES:-}" ]; then
+  for skill in "${SELECTED_SKILLS[@]}"; do
+    if [ "$skill" = delegate ]; then
+      delegate_state="${XDG_STATE_HOME:-$HOME/.local/state}/delegate"
+      delegate_bin="$SKILLS_SRC/delegate/bin/delegate"
+      if [ -d "$delegate_state" ] && [ -x "$delegate_bin" ]; then
+        "$delegate_bin" _gc-worker </dev/null >/dev/null 2>&1 &
+      fi
+      break
+    fi
+  done
+fi
+
 echo "Done! Installed ${#SELECTED_SKILLS[@]} skills."

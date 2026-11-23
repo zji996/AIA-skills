@@ -188,8 +188,12 @@ class DelegateSessionFrictionsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("could not remove worktree", result.stderr)
         self.assertTrue(Path(state["worktree"]).exists(), "pool slot stays cached")
+        # 6.33 P1-4: superseded predecessor `state` is auto-cleaned & archived with `.applied`,
+        # while tail `reply` keeps lightweight `.applied-cleaned` record; both report 已合入.
+        state_arch = Path(self.env["XDG_CACHE_HOME"]) / "delegate" / "archive" / state["run"] / "record"
+        self.assertTrue((state_arch / ".applied").exists())
+        self.assertTrue((Path(reply["dir"]) / ".applied").exists())
         for run in (state, reply):
-            self.assertTrue((Path(run["dir"]) / ".applied").exists())
             self.assertIn("已合入", self.cli("status", run["run"], human=True).stdout)
             self.assertNotIn("never applied", self.cli("clean", "--force", run["run"]).stdout)
 

@@ -27,7 +27,10 @@ class DelegateApplyFinishTests(unittest.TestCase):
         self.assertEqual(outcome["apply"], {"ok": True, "dryRun": False})
         self.assertTrue(outcome["acceptStillValid"])
         self.assertNotIn("cleanup", outcome)
-        self.assertTrue(Path(state["dir"]).exists())
+        # 6.33 P1-4: acceptStillValid=true auto-cleans and archives the applied run.
+        self.assertFalse(Path(state["dir"]).exists())
+        arch_record = Path(self.env["XDG_CACHE_HOME"]) / "delegate" / "archive" / state["run"] / "record"
+        self.assertTrue((arch_record / "applied.patch").is_file())
         self.assertFalse(Path(state["worktree"]).exists())
         self.assertEqual((repo / "a.txt").read_text(), "new\n")
 
@@ -64,7 +67,8 @@ class DelegateApplyFinishTests(unittest.TestCase):
         self.fake_docker({"b1": {"path": state["worktree"], "fail": True}})
         result = self.cli("apply", state["run"], human=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("apply cleanup:", result.stderr)
+        # 6.33 P1-4: worktree/container cleanup is staged asynchronously via trash + _gc-worker,
+        # so docker cleanup errors never block or fail `apply`.
         self.assertTrue(Path(state["dir"]).exists())
         self.assertFalse(Path(state["worktree"]).exists())
         self.assertIn("任务没有验收命令", result.stdout.splitlines()[-1])

@@ -291,7 +291,11 @@ class Delegate622Tests(unittest.TestCase):
         res = self.cli("apply", "--json", r2["run"])
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertFalse(Path(r1["worktree"]).exists(), "worktree should be deleted once whole chain is applied")
-        self.assertTrue((Path(r1["dir"]) / ".applied").exists())
+        # 6.33 P1-4: superseded predecessor r1 is auto-cleaned & archived immediately on apply;
+        # tail r2 (uncommitted, no accept/verify) keeps lightweight .applied-cleaned record.
+        self.assertFalse(Path(r1["dir"]).exists(), "superseded predecessor r1 should be auto-cleaned on apply")
+        r1_arch = Path(self.env["XDG_CACHE_HOME"]) / "delegate" / "archive" / r1["run"] / "record"
+        self.assertTrue((r1_arch / ".applied").exists())
         self.assertTrue((Path(r2["dir"]) / ".applied").exists())
 
 

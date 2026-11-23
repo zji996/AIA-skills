@@ -35,13 +35,16 @@ pub fn work_file_sig(state: &Path) -> String {
 /// Deliberately excludes `work.jsonl` so unrelated work-table writes never invalidate
 /// cached run entries; notes overlays are applied separately only when notes exist.
 pub fn run_sig(run: &Path, _work_sig: &str) -> String {
-    let mut parts = Vec::with_capacity(13);
+    let mut parts = Vec::with_capacity(16);
     for name in [
         "meta.json",
         "summary.json",
         "exit_code",
         ".applied",
         ".applied-cleaned",
+        ".delivered",
+        ".truncated",
+        ".sync-base",
         ".generate-pending",
         ".waiting",
         "review.json",
@@ -66,7 +69,10 @@ fn run_key(run: &Path) -> String {
 /// Strictly lock-free read of `<state>/index.json`. Returns an empty skeleton if missing/corrupt.
 pub fn load_index(state: &Path) -> Value {
     let v = json(index_path(state));
-    if v.is_object() && v["runs"].is_object() {
+    if v.is_object()
+        && v["runs"].is_object()
+        && v["schemaVersion"].as_u64() == Some(SCHEMA_VERSION)
+    {
         v
     } else {
         json!({
@@ -76,6 +82,30 @@ pub fn load_index(state: &Path) -> Value {
             "runs": {}
         })
     }
+}
+
+/// Returns true if `<state>/index.json` is missing, corrupt, has a mismatched `schemaVersion`,
+/// or contains pre-6.33 entries lacking the `meta` block. Only `_gc-worker` acts on this.
+pub fn needs_rebuild(state: &Path) -> bool {
+    let path = index_path(state);
+    if !path.is_file() {
+        return true;
+    }
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return true;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+        return true;
+    };
+    if !v.is_object()
+        || v["schemaVersion"].as_u64() != Some(SCHEMA_VERSION)
+        || !v["runs"].is_object()
+    {
+        return true;
+    }
+    v["runs"]
+        .as_object()
+        .is_some_and(|m| m.values().any(|entry| !entry["meta"].is_object()))
 }
 
 /// Fast lock-free lookup of a run's `startedNs` from `index.json` (zero `meta.json` opens on hit).
@@ -94,9 +124,36 @@ pub fn cached_started_ns(run: &Path, index: &Value) -> Option<u64> {
     entry["startedNs"].as_u64()
 }
 
-/// Fast lock-free, zero-side-effect status lookup backed by `index.json`.
-/// Uses cached status for finished runs whose stat `sig` still matches; recomputes in-memory
+/// Fast lock-free, zero-side-effect `(status, meta)` lookup backed by `index.json`.
+/// Uses cached entry for finished runs whose stat `sig` still matches; recomputes in-memory
 /// for active runs, missing entries, or runs edited externally / by an older CLI.
+pub fn status_and_meta_cached(run: &Path, index: &Value, work_sig: &str) -> (Value, Value) {
+    let raw = run.to_string_lossy();
+    let entry = index["runs"]
+        .get(raw.as_ref())
+        .or_else(|| {
+            let key = run_key(run);
+            if key == raw {
+                None
+            } else {
+                index["runs"].get(&key)
+            }
+        });
+    if let Some(entry) = entry {
+        let cached_state = s(&entry["status"], "state");
+        if !cached_state.is_empty()
+            && !runs::active(cached_state)
+            && entry["status"].is_object()
+            && entry["meta"].is_object()
+            && s(entry, "sig") == run_sig(run, work_sig)
+        {
+            return (entry["status"].clone(), entry["meta"].clone());
+        }
+    }
+    (runs::status(run), runs::index_meta(run))
+}
+
+/// Fast lock-free, zero-side-effect status lookup backed by `index.json`.
 pub fn status_cached(run: &Path, index: &Value, work_sig: &str) -> Value {
     let raw = run.to_string_lossy();
     let entry = index["runs"]
@@ -154,6 +211,7 @@ pub fn upsert_run(run: &Path) {
     let meta = json(run.join("meta.json"));
     let started_ns = meta["startedNs"].as_u64().unwrap_or(0);
     let status = runs::status(run);
+    let idx_meta = runs::index_meta(run);
     let key = run_key(run);
     let repo = repo_for_run_status(run, &status);
     let runs_root_str = run
@@ -165,7 +223,16 @@ pub fn upsert_run(run: &Path) {
     };
     let wsig = work_file_sig(&state);
     let sig = run_sig(run, &wsig);
-    upsert_entry_locked(&state, &key, &repo, &runs_root_str, started_ns, &sig, status);
+    upsert_entry_locked(
+        &state,
+        &key,
+        &repo,
+        &runs_root_str,
+        started_ns,
+        &sig,
+        status,
+        idx_meta,
+    );
 }
 
 /// Upsert a pre-built run status while caller ALREADY holds `<state>/.state.lock`.
@@ -173,15 +240,26 @@ pub fn upsert_run(run: &Path) {
 pub fn upsert_run_locked(state: &Path, run: &Path, repo: &str, status: Value) {
     let key = run_key(run);
     let started_ns = json(run.join("meta.json"))["startedNs"].as_u64().unwrap_or(0);
+    let idx_meta = runs::index_meta(run);
     let runs_root_str = run
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     let wsig = work_file_sig(state);
     let sig = run_sig(run, &wsig);
-    upsert_entry_locked(state, &key, repo, &runs_root_str, started_ns, &sig, status);
+    upsert_entry_locked(
+        state,
+        &key,
+        repo,
+        &runs_root_str,
+        started_ns,
+        &sig,
+        status,
+        idx_meta,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn upsert_entry_locked(
     state: &Path,
     key: &str,
@@ -190,6 +268,7 @@ fn upsert_entry_locked(
     started_ns: u64,
     sig: &str,
     status: Value,
+    idx_meta: Value,
 ) {
     let _ = fs::create_dir_all(state);
     let mut doc = load_index(state);
@@ -210,6 +289,7 @@ fn upsert_entry_locked(
                 "runsRoot": runs_root,
                 "startedNs": started_ns,
                 "status": status,
+                "meta": idx_meta,
             }),
         );
     }
@@ -248,6 +328,7 @@ pub fn rebuild_all() {
             let key = run_key(&run);
             let started_ns = json(run.join("meta.json"))["startedNs"].as_u64().unwrap_or(0);
             let st = runs::status(&run);
+            let idx_meta = runs::index_meta(&run);
             let sig = run_sig(&run, &wsig);
             entries.insert(
                 key,
@@ -257,6 +338,7 @@ pub fn rebuild_all() {
                     "runsRoot": runs_root_str,
                     "startedNs": started_ns,
                     "status": st,
+                    "meta": idx_meta,
                 }),
             );
         }

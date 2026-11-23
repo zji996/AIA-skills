@@ -409,9 +409,12 @@ class Delegate629Tests(unittest.TestCase):
         cr = st["review"]["controllerReview"]
         self.assertEqual(cr["paths"], ["prompts/system.md"])
         self.assertTrue(cr["hash"].startswith("sha256:"))
-        self.assertIn("+Hello model v2", cr["diff"])
-        self.assertNotIn("src/code.rs", cr["diff"])
+        self.assertNotIn("diff", cr)
         self.assertTrue(Path(cr["diffFile"]).is_file())
+        self.assertGreater(cr["diffBytes"], 0)
+        diff_text = Path(cr["diffFile"]).read_text()
+        self.assertIn("+Hello model v2", diff_text)
+        self.assertNotIn("src/code.rs", diff_text)
         self.assertTrue(st["sign"]["required"])
         self.assertFalse(st["sign"]["signed"])
         self.assertFalse(st["sign"]["valid"])
@@ -494,10 +497,14 @@ class Delegate629Tests(unittest.TestCase):
         self.assertNotEqual(probe["q_rc"], 0)
         self.assertIn("refusing nested delegation", probe["q_err"])
 
-        # Rogue write caught -> fail-closed to NEEDS_CONTROLLER with readOnlyViolation!
+        # Rogue write caught -> fail-closed to NEEDS_CONTROLLER with roViolation index pointer!
         self.assertEqual(st["review"]["verdict"], "NEEDS_CONTROLLER")
         self.assertEqual(st["review"]["upgradedBy"], "readOnlyViolation")
-        self.assertIn("rogue.txt", st["review"]["readOnlyViolation"])
+        self.assertGreaterEqual(st["review"]["roViolationCount"], 1)
+        self.assertIn("rogue.txt", st["review"]["roViolationSample"])
+        ro_file = Path(st["review"]["roViolationFile"])
+        self.assertTrue(ro_file.is_file())
+        self.assertIn("rogue.txt", ro_file.read_text())
 
     def test_stop_hook_events_rebuild_and_old_run_compatibility(self):
         repo = self.repo({"a.txt": "v0\n"})

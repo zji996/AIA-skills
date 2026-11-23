@@ -1690,6 +1690,22 @@ fn find_history_entry<'a>(entries: &'a [HistoryEntry], reference: &str) -> Optio
     None
 }
 
+/// Resolve a cleaned/archived run's `archive/<run>/record` directory via the repository history index.
+pub fn resolve_archive_record(reference: &str) -> Option<PathBuf> {
+    let entries = load_entries(&current_history_key());
+    let h = find_history_entry(&entries, reference)?;
+    if h.archive.is_empty() {
+        return None;
+    }
+    let rec = Path::new(&h.archive).join("record");
+    if rec.join("meta.json").is_file() {
+        let _ = crate::archive::touch(Path::new(&h.archive));
+        Some(rec)
+    } else {
+        None
+    }
+}
+
 fn format_tokens(tokens: &Value) -> String {
     if !tokens.is_object() {
         return String::new();

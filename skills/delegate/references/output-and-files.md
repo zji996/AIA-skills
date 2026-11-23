@@ -30,7 +30,7 @@
 | `events.jsonl` | 过滤后的全过程：读取、命令、编辑路径、错误、每轮模型与用量、重跑；不含编辑全文 |
 | `result.md` | 完整答复；自动压缩成功时为压缩后的答复 |
 | `result-original.md` / `compression.json` / `compression-prompt.md` | 自动压缩前的原文 / 是否成功、原文路径、失败原因 / 压缩追问 |
-| `summary.json` | 结论：`state`、`attempts`、`files`、`changes`、`shape`、`accept`、可选 `evidence`、`cleanup`（已终止进程数、可执行名、端口、命令、已停 user unit 与诊断）、`warnings`（空/缺失 worktree 源）、`readOnlyViolation` / `workspaceChanged`、`protectViolation`、`queuedSeconds`、`graceSeconds`、`warning`、`tokens`、`session`、`error`（`next` 由 `status` 现算） |
+| `summary.json` | 结论：`state`、`attempts`、`files`、`changes`、`shape`、`accept`、紧凑 `review` 摘要（无 `rounds[]`/内联 diff）、可选 `evidence`/`cleanup`/`warnings`、`readOnlyViolation`/`workspaceChanged`/`protectViolation`、`queuedSeconds`/`graceSeconds`/`warning`、`tokens`（`agy` 取末轮累计，同会话 `reply` 另记 `tokensDelta`）、`session`、`error`（`next` 现算） |
 | `cleanup.json` / `cleanup.lock` | 多阶段后台进程与 user unit 回收记录 / 并发回收锁；systemctl 缺失、bus 不可用、无标记与回收失败只记诊断 |
 | `scopes` / `scopes.lock` | 本轮的 systemd scope 单元名 / 并发读写锁；仅在用户 systemd 可用时出现 |
 | `changes.json` / `changes.patch` | 前后快照的 tree、逐文件状态与行数；可选 `finalEntries` 冻结结束时改动路径的最终指纹，供手动合入检测；可直接 `git apply` 的补丁 |
@@ -60,7 +60,7 @@
 
 ## 清理
 
-成功 `apply` 释放 worktree、保留轻量 run 与补丁 7 天，`clean` 可提前删；`--keep` 另保留 worktree。dry-run/失败不清理；共享 worktree 仍有引用时保留。人读末行提示验收有效性（无效时列完整验收命令）；回收豁免内置 `sccache` 与 `cleanupKeepExecutables`。每次 `start` 清理结束超 7 天且已读记录（`DELEGATE_KEEP_DAYS` 调整，`0` 关闭）。容器回收、磁盘字段与失败语义见 [清理](cleanup.md)。
+成功 `apply` 归档并经异步 trash 自动清理已合入链：前驱立即清，链尾在已提交或 `verify.ok`/`acceptStillValid`（且无冲突/未读截断/待续答）时立即清，否则先释 worktree 待进 HEAD 后由 `_gc-worker` 清（`diff`/`show` 回退读归档）；`--keep`/dry-run/失败或共享引用保留。人读末行提示验收有效性；每次 `start` 清理超 7 天已读记录（`DELEGATE_KEEP_DAYS`，`0` 关闭）。容器与磁盘见 [清理](cleanup.md)。
 
 ## 环境变量
 

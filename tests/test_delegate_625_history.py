@@ -94,9 +94,11 @@ class Delegate625HistoryTests(unittest.TestCase):
         self.assertEqual(self.cli("result", rejected_run["run"]).returncode, 0)
         self.assertIn("resultReadAt", json.loads((Path(rejected_run["dir"]) / "meta.json").read_text()))
 
-        # Applying pending-apply records appliedAt & appliedHead in meta.json and hides it from status.
+        # Applying pending-apply records appliedAt & appliedHead (archived on auto-clean) and hides it from status.
         self.assertEqual(self.cli("apply", pending_apply["run"]).returncode, 0)
-        applied_meta = json.loads((Path(pending_apply["dir"]) / "meta.json").read_text())
+        live_meta = Path(pending_apply["dir"]) / "meta.json"
+        arch_meta = self.work / "cache/delegate/archive" / pending_apply["run"] / "record" / "meta.json"
+        applied_meta = json.loads((live_meta if live_meta.is_file() else arch_meta).read_text())
         self.assertTrue(applied_meta.get("appliedAt"))
         self.assertEqual(applied_meta.get("appliedHead"), self.git(repo, "rev-parse", "HEAD"))
 
