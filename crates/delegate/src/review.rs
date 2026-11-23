@@ -2117,22 +2117,25 @@ pub fn run_accept_and_review(
         let conclusion = rev_outcome.conclusion;
         let focus_count = rev_outcome.focus_count;
 
-        // Check `controllerReviewPaths` when NOT entering rework (or upgrade on pass/needs_controller).
+        // Check `controllerReviewPaths` ONLY when NOT entering rework (upgrade PASS / NEEDS_CONTROLLER,
+        // never hijack REWORK and skip automatic rework).
         let mut original_verdict: Option<String> = None;
         let mut controller_review_json = Value::Null;
         let mut controller_paths: Vec<String> = Vec::new();
         let mut sign_hash = String::new();
-        if let Some(hit) = evaluate_controller_paths(run, meta, false)? {
-            controller_paths = hit.paths.clone();
-            sign_hash = hit.hash.clone();
-            controller_review_json = build_controller_review_json(run, &hit)?;
-            if verdict_str != "NEEDS_CONTROLLER" {
-                original_verdict = Some(verdict_str.clone());
-                verdict_str = "NEEDS_CONTROLLER".to_string();
-            } else if upgraded_by.is_none() {
-                original_verdict = Some("NEEDS_CONTROLLER".to_string());
+        if verdict_str != "REWORK" {
+            if let Some(hit) = evaluate_controller_paths(run, meta, false)? {
+                controller_paths = hit.paths.clone();
+                sign_hash = hit.hash.clone();
+                controller_review_json = build_controller_review_json(run, &hit)?;
+                if verdict_str != "NEEDS_CONTROLLER" {
+                    original_verdict = Some(verdict_str.clone());
+                    verdict_str = "NEEDS_CONTROLLER".to_string();
+                } else if upgraded_by.is_none() {
+                    original_verdict = Some("NEEDS_CONTROLLER".to_string());
+                }
+                upgraded_by = Some("controllerReviewPaths".into());
             }
-            upgraded_by = Some("controllerReviewPaths".into());
         }
 
         let mut round_entry = json!({

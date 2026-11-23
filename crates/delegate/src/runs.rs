@@ -193,7 +193,121 @@ pub fn resolve(reference: &str) -> Res<PathBuf> {
             return Ok(matches_arch[0].clone());
         }
     }
-    Err(format!("run '{reference}' matched {} runs under {} (runs live under the git root of the directory where start ran; pass a run directory or set DELEGATE_RUNS)",matches.len(),root.display()))
+    if matches.len() > 1 {
+        let names: Vec<String> = matches
+            .iter()
+            .take(5)
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        return Err(format!(
+            "run '{reference}' matched {} runs under {}（{}）",
+            matches.len(),
+            root.display(),
+            names.join(", ")
+        ));
+    }
+    let suggestions = suggest_similar_runs(reference, &runs);
+    if !suggestions.is_empty() {
+        return Err(format!(
+            "run '{reference}' matched 0 runs under {}；相近 run：{}（可用 delegate status --all 查看）",
+            root.display(),
+            suggestions.join(", ")
+        ));
+    }
+    Err(format!("run '{reference}' matched 0 runs under {} (runs live under the git root of the directory where start ran; pass a run directory or set DELEGATE_RUNS)",root.display()))
+}
+
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
+}
+
+fn strip_run_timestamp(s: &str) -> &str {
+    // Strip leading `YYYYMMDD-HHMMSS-` when present to compare human slugs cleanly.
+    let bytes = s.as_bytes();
+    if bytes.len() > 16
+        && bytes[8] == b'-'
+        && bytes[15] == b'-'
+        && bytes[..8].iter().all(|b| b.is_ascii_digit())
+        && bytes[9..15].iter().all(|b| b.is_ascii_digit())
+    {
+        &s[16..]
+    } else {
+        s
+    }
+}
+
+/// Suggest up to 5 existing runs with similar prefix or slug tokens when a run lookup misses.
+pub fn suggest_similar_runs(reference: &str, repo_runs: &[PathBuf]) -> Vec<String> {
+    let ref_lc = reference.trim().to_ascii_lowercase();
+    if ref_lc.is_empty() {
+        return Vec::new();
+    }
+    let ref_slug = strip_run_timestamp(&ref_lc);
+    let ref_tokens: Vec<&str> = ref_slug
+        .split(['-', '_', '/'])
+        .filter(|t| t.len() >= 2)
+        .collect();
+
+    let mut seen = std::collections::BTreeSet::<String>::new();
+    let mut candidates = Vec::<String>::new();
+    let mut push_path = |p: &Path| {
+        let meta = json(p.join("meta.json"));
+        let id = {
+            let r = s(&meta, "run");
+            if !r.is_empty() {
+                r.to_string()
+            } else {
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        if !id.is_empty() && seen.insert(id.clone()) {
+            candidates.push(id);
+        }
+    };
+    for r in repo_runs {
+        push_path(r);
+    }
+    for r in crate::launch::machine_runs(&crate::common::state_dir()) {
+        push_path(&r);
+    }
+    for r in archived_runs() {
+        push_path(&r);
+    }
+
+    let mut scored: Vec<(usize, String)> = Vec::new();
+    for cand in candidates {
+        let cand_lc = cand.to_ascii_lowercase();
+        let cand_slug = strip_run_timestamp(&cand_lc);
+        let full_pref = common_prefix_len(&ref_lc, &cand_lc);
+        let slug_pref = common_prefix_len(ref_slug, cand_slug);
+        let exact_slug = !ref_slug.is_empty() && ref_slug == cand_slug;
+        let slug_sub = !ref_slug.is_empty()
+            && !cand_slug.is_empty()
+            && ((ref_slug.len() >= 3 && cand_slug.contains(ref_slug))
+                || (cand_slug.len() >= 3 && ref_slug.contains(cand_slug)));
+        let cand_tokens: Vec<&str> = cand_slug
+            .split(['-', '_', '/'])
+            .filter(|t| t.len() >= 2)
+            .collect();
+        let shared_tokens = ref_tokens
+            .iter()
+            .filter(|t| cand_tokens.contains(t))
+            .count();
+
+        if exact_slug || slug_sub || shared_tokens > 0 || slug_pref >= 3 || full_pref >= 4 {
+            let score = (if exact_slug { 1000 } else { 0 })
+                + (if slug_sub { 300 } else { 0 })
+                + shared_tokens * 120
+                + slug_pref * 20
+                + full_pref * 10;
+            scored.push((score, cand));
+        }
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    scored.into_iter().take(5).map(|(_, id)| id).collect()
 }
 /// Like `resolve`, but a conversation name follows its reply chain to the newest run.
 pub fn resolve_head(reference: &str) -> Res<PathBuf> {
@@ -625,6 +739,9 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
     }
     if !s(&meta, "netBase").is_empty() {
         out["netBase"] = meta["netBase"].clone();
+    }
+    if !s(&meta, "caller").is_empty() {
+        out["caller"] = meta["caller"].clone();
     }
     if let Some(bytes) = meta["worktreeBytes"].as_u64() {
         out["worktreeBytes"] = json!(bytes);

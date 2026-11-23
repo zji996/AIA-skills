@@ -440,6 +440,20 @@ fn proc_locks_holders(file: &File) -> Vec<(u32, Option<String>)> {
         .collect()
 }
 
+/// Strictly read-only, zero-lock check whether another process holds an advisory lock on `path`
+/// (via `/proc/locks` `(major, minor, ino)` match). Returns `None` if `/proc/locks` is unreadable.
+pub fn file_locked_by_other_readonly(path: &Path) -> Option<bool> {
+    let meta = fs::metadata(path).ok()?;
+    let content = fs::read_to_string("/proc/locks").ok()?;
+    let dev = meta.dev();
+    let major = libc::major(dev) as u64;
+    let minor = libc::minor(dev) as u64;
+    let ino = meta.ino();
+    let my_pid = std::process::id();
+    let holders = parse_proc_locks_holders(&content, major, minor, ino);
+    Some(holders.into_iter().any(|pid| pid != my_pid))
+}
+
 fn read_owner_file(path: &Path) -> Option<(u32, String)> {
     let text = fs::read_to_string(path).ok()?;
     let v: Value = serde_json::from_str(text.trim()).ok()?;

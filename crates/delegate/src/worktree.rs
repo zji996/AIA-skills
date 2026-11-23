@@ -2292,6 +2292,8 @@ fn apply_checked(
     commit_mode: bool,
     written_paths: &[String],
 ) -> Res<ApplyOutcome> {
+    let apply_started_at = iso();
+    let apply_t0 = std::time::Instant::now();
     apply_progress("checking merge / 正在检查合并");
     let source = s(&json(run.join("meta.json"))["worktree"], "source").to_string();
     for (name, _) in active_writes_on(&source, Some(run))
@@ -2303,7 +2305,7 @@ fn apply_checked(
         );
     }
     let mut conclusion = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),
-        "operation":"apply","apply":{"ok":false,"dryRun":dry}});
+        "operation":"apply","apply":{"ok":false,"dryRun":dry},"startedAt":apply_started_at});
     if let Some(sources) = json(run.join("meta.json")).get("configSources") {
         conclusion["configSources"] = sources.clone();
     }
@@ -2437,6 +2439,9 @@ fn apply_checked(
                         "missCode": "path_validation",
                         "reason": "预合并树路径校验未通过，走三方合并",
                     });
+                    if !dry && crate::premerge::cancel_for_run(run, source) {
+                        conclusion["applyTiming"]["premergeCancelled"] = json!(true);
+                    }
                     apply_inner(run, merge, dry, &mut conclusion)?
                 }
             }
@@ -2446,6 +2451,9 @@ fn apply_checked(
                     "missCode": miss.code(),
                     "reason": miss.human_line(),
                 });
+                if !dry && crate::premerge::cancel_for_run(run, source) {
+                    conclusion["applyTiming"]["premergeCancelled"] = json!(true);
+                }
                 apply_inner(run, merge, dry, &mut conclusion)?
             }
         }
@@ -2489,6 +2497,8 @@ fn apply_checked(
         }
     }
     conclusion["apply"]["ok"] = json!(code == 0);
+    conclusion["finishedAt"] = json!(iso());
+    conclusion["elapsedMs"] = json!(apply_t0.elapsed().as_millis() as u64);
     accept_validity(run, dry, &mut conclusion);
     let marked = strings(&conclusion["apply"]["conflictMarkers"]);
     let mut total_uncommitted: std::collections::BTreeSet<&str> =
@@ -3224,10 +3234,35 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
         // Still record this round (including zero-change replies) as applied.
     }
     if !conflicts.is_empty() && !merge {
+        let run_id = {
+            let r = s(&meta, "run");
+            if !r.is_empty() {
+                r.to_string()
+            } else {
+                run.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        let files_preview = if conflicts.len() <= 5 {
+            conflicts.join(", ")
+        } else {
+            format!("{} 等 {} 个文件", conflicts[..5].join(", "), conflicts.len())
+        };
+        let rebase_cmd = format!(
+            "delegate reply --sync=agent {run_id} \"rebase 到最新主干并解决冲突（{files_preview}）\""
+        );
+        let merge_cmd = format!("{} apply --merge {run_id}", script().display());
         for p in &conflicts {
             println!(" conflict         {p}");
         }
-        eprintln!("delegate: nothing applied; {} file(s) were also changed in {} since the run started. Rerun with --merge to apply the rest and write conflict markers into text files, or inspect with: {} diff {} --total",conflicts.len(),source.display(),script().display(),run.file_name().unwrap_or_default().to_string_lossy());
+        eprintln!(
+            "delegate: nothing applied; {} file(s) were also changed in {} since the run started.\n  下一步（推荐，交同事 rebase 解决冲突）：{rebase_cmd}\n  或本地合并写入冲突标记：{merge_cmd}\n  或查看改动：{} diff {run_id} --total",
+            conflicts.len(),
+            source.display(),
+            script().display(),
+        );
         conclusion["apply"]["failedStep"] = json!("conflicts");
         conclusion["apply"]["failureDetail"] = json!(format!(
             "{} file(s) also changed in source: {}",
@@ -3236,6 +3271,8 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
         ));
         conclusion["apply"]["conflicts"] = json!(conflicts);
         conclusion["apply"]["writtenFiles"] = json!([]);
+        conclusion["apply"]["next"] = json!([rebase_cmd, merge_cmd]);
+        conclusion["next"] = json!(rebase_cmd);
         return Ok(ApplyInnerResult {
             code: 1,
             written: vec![],
@@ -3372,6 +3409,7 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
                 had_dirty_merge,
             });
         }
+        let gen_queue_t0 = std::time::Instant::now();
         let _slot = match lane::acquire_shell(
             &format!(
                 "regenerate {}",
@@ -3402,10 +3440,39 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
             }
             Err(error) => return Err(error),
         };
+        conclusion["applyTiming"]["generateQueueMs"] =
+            json!(gen_queue_t0.elapsed().as_millis() as u64);
         let log = std::path::absolute(run.join("generate.log")).map_err(|e| e.to_string())?;
         let mut file =
             fs::File::create(&log).map_err(|e| format!("apply {}: {e}", log.display()))?;
         let timeout = seconds(&setting("GENERATE_TIMEOUT", "10m"))?;
+        let mut gen_env = meta["env"].clone();
+        if !gen_env.is_object() {
+            gen_env = json!({});
+        }
+        let target_contended = crate::source_watch::cargo_target_busy(&source);
+        let isolate_mode = setting("APPLY_ISOLATE_TARGET", "auto").to_ascii_lowercase();
+        let explicit_target = gen_env
+            .get("CARGO_TARGET_DIR")
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.trim().is_empty())
+            || std::env::var_os("CARGO_TARGET_DIR").is_some_and(|v| !v.is_empty());
+        if target_contended {
+            conclusion["applyTiming"]["targetContended"] = json!(true);
+        }
+        if !explicit_target && (isolate_mode == "always" || (isolate_mode != "never" && target_contended)) {
+            let iso_target = cache_dir()
+                .join("apply-target")
+                .join(crate::premerge::repo_key(&source));
+            let _ = fs::create_dir_all(&iso_target);
+            gen_env["CARGO_TARGET_DIR"] = json!(iso_target.to_string_lossy());
+            conclusion["applyTiming"]["regenerateTargetIsolated"] = json!(true);
+            conclusion["applyTiming"]["regenerateTargetDir"] = json!(iso_target.to_string_lossy());
+            apply_progress(format!(
+                "主仓 target/ 正在被占用（疑似 post-commit/构建），本次 regenerate 改用独立 CARGO_TARGET_DIR={} 避让",
+                iso_target.display()
+            ));
+        }
         apply_progress(format!(
             "generating / 正在生成; log: {}; execution timeout: {timeout}s (queue excluded)",
             log.display()
@@ -3414,15 +3481,17 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
             let _g = crate::source_watch::guard(&source, false)?;
             crate::source_watch::fingerprint(&source)?
         };
+        let gen_t0 = std::time::Instant::now();
         let shell = run_shell(
             (&generate_command, "generate"),
             &source,
             run,
-            &meta["env"],
+            &gen_env,
             Some(timeout),
             &mut file,
             None,
         );
+        conclusion["applyTiming"]["generateMs"] = json!(gen_t0.elapsed().as_millis() as u64);
         let stopped = interrupted();
         let succeeded = stopped.is_none() && matches!(shell, Ok((0, false)));
         let reg = {

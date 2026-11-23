@@ -117,6 +117,71 @@ pub fn spawn_worker(source: &Path) {
     let _ = c.spawn();
 }
 
+/// Cancel an in-flight `_merge-worker` that is currently premerging THIS same run so
+/// `delegate apply` never double-runs `regenerate` / acceptance alongside `_merge-worker`.
+/// Returns `true` if a live same-run worker was signaled.
+pub fn cancel_for_run(run: &Path, source: &Path) -> bool {
+    let pm_path = premerge_path(run);
+    let pm = json(&pm_path);
+    if s(&pm, "status") != "running" {
+        return false;
+    }
+    let wpid = pm["workerPid"].as_i64().unwrap_or(0) as i32;
+    if wpid <= 0 || wpid == std::process::id() as i32 {
+        return false;
+    }
+    let recorded_pid = read(worker_pid_path(source))
+        .trim()
+        .parse::<i32>()
+        .unwrap_or(0);
+    if recorded_pid != wpid || !pid_alive(wpid) {
+        return false;
+    }
+    unsafe {
+        libc::kill(wpid, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + std::time::Duration::from_millis(250);
+    while Instant::now() < deadline && pid_alive(wpid) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let cur = json(&pm_path);
+    if s(&cur, "status") == "running" && cur["workerPid"].as_i64() == Some(wpid as i64) {
+        let _ = fs::remove_file(&pm_path);
+        index::upsert_run(run);
+    }
+    true
+}
+
+fn should_yield_to_apply(run: &Path, source_canon: &Path) -> bool {
+    lane::stopped()
+        || !run.join("meta.json").is_file()
+        || run.join(".applied").exists()
+        || crate::source_watch::apply_lock_busy(source_canon)
+}
+
+fn clear_running_marker_if_ours(run: &Path) {
+    let p = premerge_path(run);
+    let doc = json(&p);
+    if s(&doc, "status") == "running"
+        && doc["workerPid"].as_u64() == Some(std::process::id() as u64)
+    {
+        if run.join(".applied").exists() || !run.join("meta.json").is_file() {
+            let _ = fs::remove_file(&p);
+        } else {
+            let cancelled = json!({
+                "status": "cancelled",
+                "cancelledBy": "apply",
+                "baseHead": doc["baseHead"],
+                "acceptOk": false,
+                "conflicts": [],
+                "updatedAt": iso(),
+            });
+            let _ = write_json(&p, &cancelled);
+        }
+        index::upsert_run(run);
+    }
+}
+
 pub fn spawn_worker_for_meta(meta: &Value) {
     let src = s(&meta["worktree"], "source");
     if !src.is_empty() {
@@ -770,7 +835,9 @@ pub fn validate_fast_forward(run: &Path, source: &Path) -> FastForwardCheck {
         return FastForwardCheck::Miss(FastForwardMiss::MissingPremerge);
     }
     let status = s(&doc, "status");
-    if matches!(status, "running" | "pending") {
+    if matches!(status, "running" | "pending")
+        || (status == "cancelled" && s(&doc, "cancelledBy") == "apply")
+    {
         return FastForwardCheck::Miss(FastForwardMiss::PremergeRunning);
     }
     if status == "conflict" {
@@ -1477,7 +1544,7 @@ fn run_needs_premerge(run: &Path, source_head: &str) -> bool {
     if base != source_head {
         return true;
     }
-    matches!(st, "pending" | "running" | "crashed" | "")
+    matches!(st, "pending" | "running" | "crashed" | "cancelled" | "")
 }
 
 /// Full eligibility verification inside `_merge-worker` (includes live `controllerReviewPaths`
@@ -1629,6 +1696,7 @@ fn premerge_workdir(source: &Path, meta: &Value, wt_path: &Path) -> PathBuf {
 
 struct PremergeLayersOutcome {
     ok: bool,
+    aborted: bool,
     layers: Vec<Value>,
     ran_layers: Vec<String>,
     failed_layer: Option<String>,
@@ -1644,6 +1712,16 @@ fn run_premerge_layers(
     changed_paths: &[String],
     log_path: &Path,
 ) -> Res<PremergeLayersOutcome> {
+    if should_yield_to_apply(run, source) {
+        return Ok(PremergeLayersOutcome {
+            ok: false,
+            aborted: true,
+            layers: Vec::new(),
+            ran_layers: Vec::new(),
+            failed_layer: None,
+            failed_code: None,
+        });
+    }
     let mut eval_meta = meta.clone();
     if eval_meta["acceptRules"].is_null() && repo_cfg["acceptRules"].is_array() {
         eval_meta["acceptRules"] = repo_cfg["acceptRules"].clone();
@@ -1659,6 +1737,7 @@ fn run_premerge_layers(
     if specs.is_empty() {
         return Ok(PremergeLayersOutcome {
             ok: true,
+            aborted: false,
             layers: Vec::new(),
             ran_layers: Vec::new(),
             failed_layer: None,
@@ -1680,16 +1759,49 @@ fn run_premerge_layers(
     let mut failed_code = None;
 
     for (idx, spec) in specs.iter().enumerate() {
+        if should_yield_to_apply(run, source) {
+            return Ok(PremergeLayersOutcome {
+                ok: false,
+                aborted: true,
+                layers,
+                ran_layers,
+                failed_layer: None,
+                failed_code: None,
+            });
+        }
         let _slot = if spec.lane {
             let label = format!(
                 "premerge {} ({})",
                 run.file_name().unwrap_or_default().to_string_lossy(),
                 spec.name
             );
-            Some(lane::acquire_shell(&label, None, Some(run), |_, _| {})?)
+            match lane::acquire_shell(&label, None, Some(run), |_, _| {}) {
+                Ok(slot) => Some(slot),
+                Err(_) if should_yield_to_apply(run, source) => {
+                    return Ok(PremergeLayersOutcome {
+                        ok: false,
+                        aborted: true,
+                        layers,
+                        ran_layers,
+                        failed_layer: None,
+                        failed_code: None,
+                    });
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             None
         };
+        if should_yield_to_apply(run, source) {
+            return Ok(PremergeLayersOutcome {
+                ok: false,
+                aborted: true,
+                layers,
+                ran_layers,
+                failed_layer: None,
+                failed_code: None,
+            });
+        }
         let _ = writeln!(
             log,
             "=== [premerge:{}] {} ({}) ===\n$ {}",
@@ -1717,6 +1829,17 @@ fn run_premerge_layers(
         let secs = (t0.elapsed().as_secs_f64() * 100.0).round() / 100.0;
         let _ = writeln!(log, "\n[exit {code}]");
         let _ = log.flush();
+
+        if should_yield_to_apply(run, source) {
+            return Ok(PremergeLayersOutcome {
+                ok: false,
+                aborted: true,
+                layers,
+                ran_layers,
+                failed_layer: None,
+                failed_code: None,
+            });
+        }
 
         let ok = code == 0;
         ran_layers.push(spec.name.clone());
@@ -1761,6 +1884,7 @@ fn run_premerge_layers(
 
     Ok(PremergeLayersOutcome {
         ok: overall_ok,
+        aborted: false,
         layers,
         ran_layers,
         failed_layer,
@@ -1779,7 +1903,7 @@ fn process_one_run(
     managed: &[String],
     repo_cfg: &Value,
 ) -> Res<bool> {
-    if !run.join("meta.json").is_file() || run.join(".applied").exists() {
+    if should_yield_to_apply(run, source_canon) {
         return Ok(false);
     }
     let meta = json(run.join("meta.json"));
@@ -1808,15 +1932,28 @@ fn process_one_run(
     index::upsert_run(run);
 
     // Optional test hook: allow concurrency tests to pause/kill the worker deterministically
-    // while `premerge.json` is in `running` state.
+    // while `premerge.json` is in `running` state (still yielding promptly to `apply` / SIGTERM).
     if cfg!(debug_assertions) {
         if let Ok(delay_str) = std::env::var("DELEGATE_TEST_PREMERGE_DELAY") {
             if let Ok(secs) = seconds(&delay_str) {
                 if secs > 0.0 {
-                    std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+                    let until = Instant::now() + std::time::Duration::from_secs_f64(secs);
+                    while Instant::now() < until {
+                        if should_yield_to_apply(run, source_canon) {
+                            clear_running_marker_if_ours(run);
+                            return Ok(false);
+                        }
+                        let rem = until.saturating_duration_since(Instant::now());
+                        std::thread::sleep(rem.min(std::time::Duration::from_millis(40)));
+                    }
                 }
             }
         }
+    }
+
+    if should_yield_to_apply(run, source_canon) {
+        clear_running_marker_if_ours(run);
+        return Ok(false);
     }
 
     // Reset persistent integration worktree to `source_head`.
@@ -1825,6 +1962,11 @@ fn process_one_run(
         return Err(err);
     }
     let _ = File::create(&log_path);
+
+    if should_yield_to_apply(run, source_canon) {
+        clear_running_marker_if_ours(run);
+        return Ok(false);
+    }
 
     // 3-way merge run's net diff onto `source_head` inside the integration worktree.
     let merge_res = match worktree::merge_run_into_dir(run, wt_path, source_canon) {
@@ -1934,12 +2076,30 @@ fn process_one_run(
 
     // Regenerate `generated.paths` if `generated.inputs` were touched.
     if merge_res.touches_generated_inputs && !merge_res.generate_command.is_empty() {
-        let _slot = lane::acquire_shell(
+        if should_yield_to_apply(run, source_canon) {
+            let _ = clean_integration_worktree(wt_path, source_head, managed);
+            clear_running_marker_if_ours(run);
+            return Ok(false);
+        }
+        let _slot = match lane::acquire_shell(
             &format!("premerge-generate {run_id}"),
             None,
             Some(run),
             |_, _| {},
-        )?;
+        ) {
+            Ok(slot) => slot,
+            Err(_) if should_yield_to_apply(run, source_canon) => {
+                let _ = clean_integration_worktree(wt_path, source_head, managed);
+                clear_running_marker_if_ours(run);
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        };
+        if should_yield_to_apply(run, source_canon) {
+            let _ = clean_integration_worktree(wt_path, source_head, managed);
+            clear_running_marker_if_ours(run);
+            return Ok(false);
+        }
         let mut log = OpenOptions::new()
             .create(true)
             .append(true)
@@ -1960,9 +2120,15 @@ fn process_one_run(
         )
         .unwrap_or((1, false));
         let _ = writeln!(log, "\n[exit {code}]");
+        if should_yield_to_apply(run, source_canon) {
+            let _ = clean_integration_worktree(wt_path, source_head, managed);
+            clear_running_marker_if_ours(run);
+            return Ok(false);
+        }
         if code != 0 {
             let _ = clean_integration_worktree(wt_path, source_head, managed);
-            if !run.join("meta.json").is_file() || run.join(".applied").exists() {
+            if should_yield_to_apply(run, source_canon) {
+                clear_running_marker_if_ours(run);
                 return Ok(false);
             }
             if read_git_head(source_canon).as_deref() != Some(source_head) {
@@ -2002,6 +2168,11 @@ fn process_one_run(
             board::refresh_for_run(run);
             return Ok(false);
         }
+    }
+
+    if should_yield_to_apply(run, source_canon) {
+        clear_running_marker_if_ours(run);
+        return Ok(false);
     }
 
     // Snapshot merged integration worktree.
@@ -2063,6 +2234,10 @@ fn process_one_run(
                 &changed_paths,
                 &log_path,
             )?;
+            if res.aborted {
+                clear_running_marker_if_ours(run);
+                return Ok(false);
+            }
             (res.ok, false, res.layers, res.ran_layers, res.failed_layer, res.failed_code)
         };
 
@@ -2082,8 +2257,9 @@ fn process_one_run(
         }
     }
 
-    // Final race checks: if run was applied/cleaned or source HEAD moved while we worked, bail cleanly!
-    if !run.join("meta.json").is_file() || run.join(".applied").exists() {
+    // Final race checks: if run was applied/cleaned, apply holds apply.lock, or source HEAD moved while we worked, bail cleanly!
+    if should_yield_to_apply(run, source_canon) {
+        clear_running_marker_if_ours(run);
         return Ok(false);
     }
     if read_git_head(source_canon).as_deref() != Some(source_head) {
@@ -2311,7 +2487,10 @@ fn run_worker_passes(source_canon: &Path, repo_str: &str) -> Res<()> {
 
         let mut head_changed = false;
         for run in &pending {
-            if lane::stopped() || !source_canon.is_dir() {
+            if lane::stopped()
+                || !source_canon.is_dir()
+                || crate::source_watch::apply_lock_busy(source_canon)
+            {
                 break;
             }
             if read_git_head(source_canon).as_deref() != Some(source_head.as_str()) {

@@ -176,19 +176,24 @@ pub fn refused(command: &str, cwd: &Path, source: &Path) -> Option<PathBuf> {
     // Only literal words and redirections; expansions, scripts and nested shells
     // cannot be classified reliably without executing/parsing them.
     let separated = command.replace('>', " > ");
-    let words = separated
-        .split_whitespace()
+    let raw_words: Vec<&str> = separated.split_whitespace().collect();
+    let words = raw_words
+        .iter()
         .map(|w| w.trim_matches(['\'', '"', ';', '&', '|', '(', ')']))
         .filter(|w| !w.is_empty())
         .collect::<Vec<_>>();
     let program = words.first()?;
-    for pair in words.windows(2) {
-        if pair[0] == ">"
-            && pair[1] != ">"
-            && !pair[1].starts_with('&')
-            && inside(&absolute(cwd, pair[1]), source)
-        {
-            return Some(absolute(cwd, pair[1]));
+    for pair in raw_words.windows(2) {
+        if pair[0] == ">" {
+            // Preserve leading `&` before trimming shell punctuation so fd duplications/closes
+            // (`2>&1`, `>&2`, `2>&-`, `2>&1;`, `2>&1|head`) are not mistaken for writing `<cwd>/1`.
+            if pair[1].starts_with('&') {
+                continue;
+            }
+            let target = pair[1].trim_matches(['\'', '"', ';', '&', '|', '(', ')']);
+            if !target.is_empty() && target != ">" && inside(&absolute(cwd, target), source) {
+                return Some(absolute(cwd, target));
+            }
         }
     }
     let name = Path::new(program)
@@ -409,6 +414,36 @@ mod tests {
             format!("ln -s a {}/.local/log", source.display()),
         ] {
             assert_eq!(refused(&cmd, &tree, &source), None, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn fd_duplication_redirects_are_not_misread_as_file_writes() {
+        let root = std::env::current_dir().unwrap();
+        let source = root.join("guard-source");
+        // Read-only commands with `2>&1`, `>&2`, `2>&-` inside source must NOT be refused as `<source>/1`.
+        for cmd in [
+            "ls 2>&1",
+            "git status 2>&1",
+            "rg foo 2>&1; echo ok",
+            "cat a.txt 2>&1|head",
+            "echo hi >&2",
+            "ls 2>&-",
+            "cat a.txt 2>&1 >/dev/null",
+        ] {
+            assert_eq!(refused(cmd, &source, &source), None, "{cmd}");
+        }
+        // Real file redirections (including `&>`, `>>`, backgrounded `> file&`, and quoted `'&file'`) remain refused.
+        for (cmd, expected) in [
+            ("ls > out.txt", source.join("out.txt")),
+            ("ls >> out.txt", source.join("out.txt")),
+            ("ls &> out.txt", source.join("out.txt")),
+            ("ls &>> out.txt", source.join("out.txt")),
+            ("ls 2>&1 > out.txt", source.join("out.txt")),
+            ("ls > out.txt&", source.join("out.txt")),
+            ("ls > '&1'", source.join("1")),
+        ] {
+            assert_eq!(refused(cmd, &source, &source), Some(expected), "{cmd}");
         }
     }
 }

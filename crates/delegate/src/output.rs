@@ -843,6 +843,7 @@ pub fn human_detail(run: &Path, status: &Value) -> String {
     if status["review"].is_object() {
         let rev = &status["review"];
         let verdict = s(rev, "verdict");
+        let orig = s(rev, "originalVerdict");
         let rstatus = s(rev, "status");
         let round = n(rev, "round");
         let rework_rounds = n(rev, "reworkRounds");
@@ -854,6 +855,9 @@ pub fn human_detail(run: &Path, status: &Value) -> String {
             info.push(format!("状态：REWORK 第 {} 轮（返工中）", rework_rounds.max(round).max(1)));
         } else if !verdict.is_empty() {
             info.push(format!("结论：{verdict}（共 {round} 轮，返工 {rework_rounds} 轮）"));
+        }
+        if !orig.is_empty() && orig != verdict {
+            info.push(format!("原判：{orig}"));
         }
         if !up.is_empty() {
             info.push(format!("升级：{up}"));

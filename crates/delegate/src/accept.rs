@@ -4,9 +4,9 @@ use crate::lane;
 use crate::review::glob_match;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Instant;
 
@@ -1045,9 +1045,346 @@ pub fn build_accept_summary(
         } else if not_executed {
             result["tail"] = json!("stopped while queued for the heavy lane");
         }
+        if !cancelled && !not_executed && !infrastructure_failure {
+            let changed = changed_paths_from_run(run);
+            if let Some(attr) = analyze_failure_attribution(run, meta, &changed) {
+                result["failureAttribution"] = attr;
+            }
+        }
     }
 
     result
+}
+
+const KNOWN_SOURCE_EXTS: &[&str] = &[
+    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "css", "scss", "less", "html", "vue", "svelte",
+    "py", "go", "sql", "toml", "json", "yaml", "yml", "md", "sh", "bash", "c", "cc", "cpp", "h",
+    "hpp", "java", "kt", "swift", "rb", "php", "proto", "graphql", "prisma", "wgsl", "glsl",
+];
+
+fn has_known_source_ext(path: &str) -> bool {
+    let Some(ext) = Path::new(path).extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    KNOWN_SOURCE_EXTS.contains(&ext.to_ascii_lowercase().as_str())
+}
+
+fn changed_paths_from_run(run: &Path) -> Vec<String> {
+    json(run.join("changes.json"))["changes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| s(c, "path").to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+fn collect_repo_roots(meta: &Value) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for raw in [
+        s(&meta["worktree"], "path"),
+        s(&meta["worktree"], "source"),
+        s(meta, "top"),
+        s(meta, "workdir"),
+    ] {
+        if raw.is_empty() {
+            continue;
+        }
+        let p = PathBuf::from(raw);
+        if !roots.contains(&p) {
+            roots.push(p.clone());
+        }
+        if let Ok(canon) = fs::canonicalize(&p) {
+            if !roots.contains(&canon) {
+                roots.push(canon);
+            }
+        }
+    }
+    roots
+}
+
+fn normalize_repo_path(
+    raw: &str,
+    roots: &[PathBuf],
+    any_root_exists: bool,
+    changed_set: &BTreeSet<String>,
+) -> Option<String> {
+    let mut tok = raw
+        .trim()
+        .trim_matches(|c: char| matches!(c, '\'' | '"' | '`' | '(' | ')' | '[' | ']' | ',' | ';' | ':'));
+    if tok.is_empty()
+        || tok.contains("://")
+        || tok.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    let rel = if tok.starts_with('/') {
+        let p = Path::new(tok);
+        let mut matched = None;
+        for root in roots {
+            if let Ok(stripped) = p.strip_prefix(root) {
+                let s = stripped.to_string_lossy().into_owned();
+                if !s.is_empty() {
+                    matched = Some(s);
+                    break;
+                }
+            }
+        }
+        matched?
+    } else {
+        while let Some(rest) = tok.strip_prefix("./") {
+            tok = rest;
+        }
+        tok.to_string()
+    };
+    if rel.is_empty()
+        || rel.starts_with('/')
+        || rel.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return None;
+    }
+    if rel.starts_with(".local/")
+        || rel.starts_with(".git/")
+        || rel.starts_with("node_modules/")
+        || rel.starts_with("target/")
+        || rel.contains("/node_modules/")
+        || rel.contains("/target/")
+    {
+        return None;
+    }
+    if any_root_exists {
+        if changed_set.contains(&rel) || roots.iter().any(|r| r.join(&rel).is_file()) {
+            return Some(rel);
+        }
+        return None;
+    }
+    if changed_set.contains(&rel) || (rel.contains('/') && has_known_source_ext(&rel)) {
+        return Some(rel);
+    }
+    None
+}
+
+fn extract_path_before_line_col(tok: &str) -> Option<&str> {
+    // Handles `path:42`, `path:42:10`, `path:42:10:`, and `path(42,10)`.
+    let cleaned = tok.trim_matches(|c: char| matches!(c, '\'' | '"' | '`' | '[' | ']' | ',' | ';'));
+    if let Some(open) = cleaned.rfind('(') {
+        if let Some(inside) = cleaned[open + 1..].strip_suffix(')') {
+            let mut parts = inside.split(',');
+            if let (Some(l), Some(c), None) = (parts.next(), parts.next(), parts.next()) {
+                if !l.is_empty()
+                    && l.bytes().all(|b| b.is_ascii_digit())
+                    && !c.is_empty()
+                    && c.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return Some(&cleaned[..open]);
+                }
+            }
+        }
+    }
+    let trimmed = cleaned.trim_end_matches(':');
+    let mut parts = trimmed.rsplitn(3, ':');
+    let last = parts.next()?;
+    if last.is_empty() || !last.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let prev = parts.next()?;
+    if prev.bytes().all(|b| b.is_ascii_digit()) && !prev.is_empty() {
+        parts.next()
+    } else {
+        Some(&trimmed[..trimmed.len() - last.len() - 1])
+    }
+}
+
+fn is_failure_marker_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    line.contains("FAIL")
+        || line.contains("ERROR")
+        || lower.contains("error:")
+        || lower.contains("error[")
+        || lower.contains("panicked at")
+        || lower.contains("exceeds")
+        || lower.contains("size-audit")
+        || lower.contains("violation")
+        || lower.contains("assertionerror")
+        || lower.contains("syntaxerror")
+        || lower.contains("typeerror")
+        || line.contains('✗')
+        || line.contains('×')
+}
+
+fn is_warning_header(trimmed: &str) -> bool {
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("warning:") || lower.starts_with("warning[")
+}
+
+fn is_error_or_section_header(trimmed: &str) -> bool {
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("error:")
+        || lower.starts_with("error[")
+        || trimmed.starts_with("===")
+        || trimmed.starts_with("---")
+        || trimmed.starts_with("FAIL")
+        || trimmed.starts_with("FAILED")
+        || lower.starts_with("thread '")
+}
+
+/// Cross-reference error file paths extracted from `accept.log` against this run's changed files
+/// to flag failures whose reported files are completely outside this run's changes (suspected
+/// pre-existing mainline failure).
+pub fn analyze_failure_attribution(
+    run: &Path,
+    meta: &Value,
+    changed_paths: &[String],
+) -> Option<Value> {
+    let log_path = run.join("accept.log");
+    if !log_path.is_file() {
+        return None;
+    }
+    let log_text = read(&log_path);
+    if log_text.trim().is_empty() {
+        return None;
+    }
+
+    let roots = collect_repo_roots(meta);
+    let any_root_exists = roots.iter().any(|r| r.is_dir());
+    let changed_set: BTreeSet<String> = changed_paths
+        .iter()
+        .map(|p| p.trim_start_matches("./").to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    let lines: Vec<&str> = log_text.lines().collect();
+    let mut seen: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut in_warning_block = false;
+
+    let mut record_path = |path: String, line_no: usize, raw_line: &str| {
+        seen.entry(path.clone()).or_insert_with(|| {
+            order.push(path);
+            (line_no, clip(raw_line.trim(), 160))
+        });
+    };
+
+    for (idx, &raw_line) in lines.iter().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("$ ")
+            || trimmed.starts_with("[exit ")
+            || trimmed.starts_with("[skipped]")
+            || trimmed.starts_with("[reused]")
+        {
+            continue;
+        }
+        if is_warning_header(trimmed) {
+            in_warning_block = true;
+            continue;
+        }
+        if is_error_or_section_header(trimmed) {
+            in_warning_block = false;
+        }
+        if in_warning_block {
+            continue;
+        }
+
+        // 1) Rust/Cargo/Clippy arrow diagnostic (`--> path:line:col` / `::: path:line:col`).
+        for prefix in ["--> ", "::: "] {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                let first = rest.split_whitespace().next().unwrap_or("");
+                let cand = extract_path_before_line_col(first).unwrap_or(first);
+                if let Some(p) = normalize_repo_path(cand, &roots, any_root_exists, &changed_set) {
+                    record_path(p, line_no, raw_line);
+                }
+            }
+        }
+
+        // 2) Python traceback (`File "path", line N`).
+        if let Some(pos) = trimmed.find("File \"") {
+            let after = &trimmed[pos + 6..];
+            if let Some(end) = after.find('"') {
+                if let Some(p) =
+                    normalize_repo_path(&after[..end], &roots, any_root_exists, &changed_set)
+                {
+                    record_path(p, line_no, raw_line);
+                }
+            }
+        }
+
+        // 3) ESLint / Stylelint standalone file header followed within 5 lines by an `error` diagnostic.
+        if !trimmed.contains(' ') {
+            if let Some(p) = normalize_repo_path(trimmed, &roots, any_root_exists, &changed_set) {
+                let has_following_error = lines[idx + 1..(idx + 6).min(lines.len())].iter().any(|next| {
+                    let nt = next.trim();
+                    let nl = nt.to_ascii_lowercase();
+                    !nt.is_empty()
+                        && (nl.contains(" error ") || nl.ends_with(" error") || nl.starts_with("error"))
+                });
+                if has_following_error {
+                    record_path(p, line_no, raw_line);
+                }
+            }
+        }
+
+        // 4) Generic `path:line(:col)` or `path(line,col)` tokens on non-warning lines.
+        let lower_line = trimmed.to_ascii_lowercase();
+        let line_is_warning_only =
+            lower_line.contains(" warning ") && !lower_line.contains("error") && !trimmed.contains("FAIL");
+        if !line_is_warning_only {
+            for tok in trimmed.split_whitespace() {
+                if let Some(cand) = extract_path_before_line_col(tok) {
+                    if let Some(p) =
+                        normalize_repo_path(cand, &roots, any_root_exists, &changed_set)
+                    {
+                        record_path(p, line_no, raw_line);
+                    }
+                }
+            }
+        }
+
+        // 5) Explicit failure marker lines (`FAIL:`, `ERROR`, `size-audit`, `panicked at`, etc.).
+        if is_failure_marker_line(trimmed) {
+            for tok in trimmed.split(|c: char| {
+                c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | ',' | ';' | '\'' | '"')
+            }) {
+                if tok.is_empty() {
+                    continue;
+                }
+                let cand = extract_path_before_line_col(tok).unwrap_or(tok);
+                if let Some(p) = normalize_repo_path(cand, &roots, any_root_exists, &changed_set) {
+                    record_path(p, line_no, raw_line);
+                }
+            }
+        }
+    }
+
+    if order.is_empty() {
+        return None;
+    }
+
+    let mut in_run = Vec::new();
+    let mut outside_run = Vec::new();
+    for path in order {
+        let (log_line, excerpt) = &seen[&path];
+        let item = json!({
+            "path": path,
+            "logLine": log_line,
+            "excerpt": excerpt,
+        });
+        if changed_set.contains(&path) {
+            in_run.push(item);
+        } else {
+            outside_run.push(item);
+        }
+    }
+
+    let suspected_mainline = !outside_run.is_empty() && in_run.is_empty();
+    Some(json!({
+        "suspectedMainline": suspected_mainline,
+        "logFile": log_path.to_string_lossy(),
+        "inRunFiles": in_run,
+        "outsideRunFiles": outside_run,
+        "changedFileCount": changed_set.len(),
+    }))
 }
 
 /// Concise human-readable acceptance label for L0 status/wait/delivery lines.
@@ -1248,5 +1585,73 @@ mod tests {
         assert_eq!(p.fast.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), vec!["rust-fast"]);
         // `rust-slow` WAS touched (and hadn't passed) -> runs!
         assert_eq!(p.slow.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), vec!["rust-slow"]);
+    }
+
+    #[test]
+    fn failure_attribution_flags_errors_outside_run_changes_and_ignores_warnings() {
+        let base = std::env::temp_dir().join(format!("delegate-attr-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        let run = base.join("run");
+        fs::create_dir_all(repo.join("apps/web/src/styles")).unwrap();
+        fs::create_dir_all(repo.join("apps/web/src/scene")).unwrap();
+        fs::create_dir_all(repo.join("crates/runtime/src")).unwrap();
+        fs::create_dir_all(&run).unwrap();
+        fs::write(repo.join("apps/web/src/styles/agent-birth.css"), ".a {}\n").unwrap();
+        fs::write(repo.join("apps/web/src/scene/camera.ts"), "export const x = 1;\n").unwrap();
+        fs::write(repo.join("crates/runtime/src/inbound.rs"), "fn main() {}\n").unwrap();
+        fs::write(repo.join("crates/runtime/src/retry.rs"), "fn retry() {}\n").unwrap();
+
+        let meta = json!({"worktree": {"path": repo, "source": repo}});
+
+        // Case 1: Error in unrelated CSS file while run only edited camera.ts -> suspectedMainline = true.
+        fs::write(
+            run.join("accept.log"),
+            "=== [accept:fast] web ===\n$ pnpm check:web\napps/web/src/styles/agent-birth.css:14:3: Unknown word\n[exit 1]\n",
+        )
+        .unwrap();
+        let attr1 = analyze_failure_attribution(
+            &run,
+            &meta,
+            &["apps/web/src/scene/camera.ts".to_string()],
+        )
+        .unwrap();
+        assert_eq!(attr1["suspectedMainline"], json!(true), "{attr1}");
+        assert_eq!(attr1["inRunFiles"].as_array().unwrap().len(), 0);
+        assert_eq!(attr1["outsideRunFiles"][0]["path"], "apps/web/src/styles/agent-birth.css");
+        assert_eq!(attr1["outsideRunFiles"][0]["logLine"], 3);
+
+        // Case 2: Warning in run's own file + size-audit FAIL in unrelated inbound.rs -> suspectedMainline = true.
+        fs::write(
+            run.join("accept.log"),
+            "warning: unused variable\n  --> crates/runtime/src/retry.rs:5:9\nFAIL: crates/runtime/src/inbound.rs (1250 lines > 1000)\n",
+        )
+        .unwrap();
+        let attr2 = analyze_failure_attribution(
+            &run,
+            &meta,
+            &["crates/runtime/src/retry.rs".to_string()],
+        )
+        .unwrap();
+        assert_eq!(attr2["suspectedMainline"], json!(true), "{attr2}");
+        assert_eq!(attr2["outsideRunFiles"][0]["path"], "crates/runtime/src/inbound.rs");
+        assert_eq!(attr2["outsideRunFiles"][0]["logLine"], 3);
+
+        // Case 3: Real compiler error in run's own file -> suspectedMainline = false.
+        fs::write(
+            run.join("accept.log"),
+            "error[E0308]: mismatched types\n  --> crates/runtime/src/retry.rs:42:9\n",
+        )
+        .unwrap();
+        let attr3 = analyze_failure_attribution(
+            &run,
+            &meta,
+            &["crates/runtime/src/retry.rs".to_string()],
+        )
+        .unwrap();
+        assert_eq!(attr3["suspectedMainline"], json!(false), "{attr3}");
+        assert_eq!(attr3["inRunFiles"][0]["path"], "crates/runtime/src/retry.rs");
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

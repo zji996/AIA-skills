@@ -1329,14 +1329,13 @@ pub fn command(args: &[String]) -> Res<i32> {
 
 /// Cursor-based wait: `delegate wait --since SEQ [runs...] [--max DURATION] [--json]`
 pub fn wait_since(since: u64, run_filter: &[String], max: Option<f64>) -> Res<i32> {
-    let resolved_ids: HashSet<String> = run_filter
-        .iter()
-        .map(|r| {
-            runs::resolve_head(r)
-                .map(|p| run_id_for(&p, &json(p.join("meta.json"))))
-                .unwrap_or_else(|_| r.clone())
-        })
-        .collect();
+    let mut resolved_runs: Vec<(String, PathBuf)> = Vec::new();
+    for r in run_filter {
+        let p = runs::resolve_head(r)?;
+        let id = run_id_for(&p, &json(p.join("meta.json")));
+        resolved_runs.push((id, p));
+    }
+    let resolved_ids: HashSet<String> = resolved_runs.iter().map(|(id, _)| id.clone()).collect();
 
     let matches_filter = |ev: &Value| -> bool {
         if resolved_ids.is_empty() {
@@ -1372,11 +1371,24 @@ pub fn wait_since(since: u64, run_filter: &[String], max: Option<f64>) -> Res<i3
         if max.is_some_and(|m| begin.elapsed().as_secs_f64() >= m) {
             break;
         }
-        let has_active = !crate::launch::machine_runs(&state_dir()).is_empty()
-            || runs::all_runs().iter().any(|r| runs::active(&runs::state(r)))
-            || crate::dag_queue::has_pending();
-        if !has_active && max.is_none() {
-            break;
+        if resolved_runs.is_empty() {
+            let has_active = !crate::launch::machine_runs(&state_dir()).is_empty()
+                || runs::all_runs().iter().any(|r| runs::active(&runs::state(r)))
+                || crate::dag_queue::has_pending();
+            if !has_active && max.is_none() {
+                break;
+            }
+        } else {
+            // Filtered mode: only check whether the target run(s) themselves are still active.
+            let target_active = resolved_runs.iter().any(|(id, path)| {
+                runs::active(&runs::state(path))
+                    || crate::launch::machine_runs(&state_dir()).iter().any(|mr| {
+                        mr == path || mr.file_name().is_some_and(|n| n == id.as_str())
+                    })
+            });
+            if !target_active {
+                break;
+            }
         }
         let wait_s = match max {
             Some(m) => (m - begin.elapsed().as_secs_f64()).max(0.0).min(fallback_poll),

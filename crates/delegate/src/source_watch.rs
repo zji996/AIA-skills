@@ -278,6 +278,38 @@ pub fn apply_guard(source: &Path) -> Res<crate::locks::LockGuard> {
     )
     .map_err(|e| e.to_string())
 }
+
+/// Return true when another process currently holds `apply.lock` on `source`.
+/// Prefers strictly read-only `/proc/locks` inspection to avoid contending with `apply`.
+pub fn apply_lock_busy(source: &Path) -> bool {
+    let path = journal(source).join("apply.lock");
+    if !path.is_file() {
+        return false;
+    }
+    if let Some(locked) = crate::locks::file_locked_by_other_readonly(&path) {
+        return locked;
+    }
+    matches!(
+        crate::locks::try_acquire_opts(crate::locks::LockKind::SourceWatchApply, &path, true, false),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Return true when another process holds a Cargo build lock under `<source>/target`
+/// (e.g. a main-repo `post-commit` / `dev_fresh` build), using read-only `/proc/locks`.
+pub fn cargo_target_busy(source: &Path) -> bool {
+    let target = source.join("target");
+    if !target.is_dir() {
+        return false;
+    }
+    for rel in [".cargo-lock", "debug/.cargo-lock", "release/.cargo-lock"] {
+        let p = target.join(rel);
+        if p.is_file() && crate::locks::file_locked_by_other_readonly(&p) == Some(true) {
+            return true;
+        }
+    }
+    false
+}
 fn fingerprint_pair(source: &Path) -> Res<(Value, Value)> {
     let data = git(
         source,

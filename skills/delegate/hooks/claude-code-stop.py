@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""Unified Claude Code Stop hook for delegate (6.36.1).
+"""Unified Claude Code Stop hook for delegate (6.39.0).
 
 Replaces legacy `delegate-waiter.sh`, `delegate-unmerged.sh`, and earlier Stop hooks
-with a single zero-lock, zero-git turn-end guard across the current repository and all
-other repositories on this machine:
+with a single zero-lock, zero-git turn-end guard scoped to this session's caller or
+the current repository:
 0. Event-stream race lock: unread alert events past `<state>/cursors.json`.
 1. Questioning runs (waiting on controller decision) or live runs without a running
-   `delegate wait` (recognizes both bare `delegate wait` in PATH and `/.../delegate wait`).
+   waiter (checks `<run>/waiter.lock` via `/proc/locks` AND live `delegate wait` /
+   `delegate wait --any` / `delegate wait --machine` / `delegate wait --since` processes).
 2. Unmerged delivered or rejected write runs without a fresh deferral in
    `<state>/work.jsonl` (`delegate work defer <run> --reason "…" --until <time>`).
    Skips zero-change deliveries and runs currently being applied, merged (serial merger
    or `_merge-worker` premerge), or gated (`delegate lane`).
 
 Reads only `<state>/index.json`, `<state>/work.jsonl`, `<state>/events.jsonl`,
-`<state>/cursors.json`, `<state>/lane/*.ticket`, `/proc`, and run-dir JSON snapshots
-(zero locks, zero git subprocesses). Appends one JSONL record per triggered hook class
-to `<state>/stop-hook.jsonl` for `delegate hook stats`.
+`<state>/cursors.json`, `<state>/lane/*.ticket`, `/proc`, `/proc/locks`, and run-dir JSON
+snapshots (zero locks, zero git subprocesses). Appends one JSONL record per triggered hook
+class to `<state>/stop-hook.jsonl` for `delegate hook stats`.
 
 When `stop_hook_active` is true, exits 0 immediately to avoid blocking loops.
 """
@@ -23,6 +24,10 @@ When `stop_hook_active` is true, exits 0 immediately to avoid blocking loops.
 from __future__ import annotations
 
 import calendar
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
 import json
 import os
 import re
@@ -386,6 +391,7 @@ def read_run_snapshot(rdir: Path) -> dict | None:
         "state": st,
         "mode": mode,
         "parent": parent,
+        "caller": str(meta.get("caller") or "").strip(),
         "applied": is_applied,
         "cleaned": False,
         "question": summary.get("question") is True,
@@ -588,23 +594,160 @@ def match_delegate_subcmd(tokens: list[str], subcmd: str) -> list[str] | None:
     return None
 
 
-def active_waiter_argvs(procs: list[tuple[list[str], Path | None]]) -> list[list[str]]:
+def current_caller_id(payload: dict) -> str:
+    return (
+        os.environ.get("DELEGATE_CALLER")
+        or os.environ.get("CLAUDE_CODE_SESSION_ID")
+        or os.environ.get("CODEX_THREAD_ID")
+        or os.environ.get("PI_SESSION_ID")
+        or str(payload.get("session_id") or "")
+    ).strip()
+
+
+def get_run_caller(obj: dict) -> str:
+    raw = obj.get("caller")
+    if isinstance(raw, str):
+        val = raw.strip()
+        if val:
+            return val
+    rdir = obj.get("dir")
+    if isinstance(rdir, str) and rdir:
+        meta = read_json_file(Path(rdir) / "meta.json")
+        if meta and isinstance(meta.get("caller"), str):
+            val = meta["caller"].strip()
+            obj["caller"] = val
+            return val
+    return ""
+
+
+def run_belongs_to_scope(obj: dict, is_current: bool, caller_id: str) -> bool:
+    """Only guard runs in the current repo OR launched by this session's caller."""
+    if is_current:
+        return True
+    run_caller = get_run_caller(obj)
+    if caller_id:
+        return run_caller == caller_id
+    # When no session caller id is present (e.g. standalone CLI / legacy tests),
+    # only include other-repo runs that also do not belong to a specific session.
+    return not run_caller
+
+
+def read_locked_inodes() -> set[tuple[int, int, int]] | None:
+    """Strictly read-only parse of `/proc/locks` returning held `(major, minor, inode)` tuples."""
+    proc_locks = Path("/proc/locks")
+    if not proc_locks.is_file():
+        return None
+    inodes: set[tuple[int, int, int]] = set()
+    try:
+        for line in proc_locks.read_text(encoding="utf-8", errors="ignore").splitlines():
+            fields = line.split()
+            if len(fields) < 6:
+                continue
+            # Skip blocked waiter entries (`1: -> FLOCK ...`).
+            if fields[1] == "->":
+                continue
+            dev_ino = fields[5].split(":")
+            if len(dev_ino) != 3:
+                continue
+            try:
+                maj = int(dev_ino[0], 16)
+                minor = int(dev_ino[1], 16)
+                ino = int(dev_ino[2], 10)
+            except ValueError:
+                continue
+            inodes.add((maj, minor, ino))
+    except OSError:
+        return None
+    return inodes
+
+
+def has_active_waiter_lock(
+    run_dir: Path | None,
+    locked_inodes: set[tuple[int, int, int]] | None,
+) -> bool:
+    """Zero-lock check whether `<run>/waiter.lock` is actively held by a live waiter."""
+    if run_dir is None:
+        return False
+    lock_path = run_dir / "waiter.lock"
+    if not lock_path.is_file():
+        return False
+    try:
+        st = lock_path.stat()
+    except OSError:
+        return False
+    if locked_inodes is not None:
+        return (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino) in locked_inodes
+    # Non-Linux fallback: check recorded PID + non-blocking shared lock probe.
+    try:
+        pid = int(lock_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        pid = 0
+    if pid > 0 and not pid_alive(pid):
+        return False
+    if fcntl is not None:
+        try:
+            with lock_path.open("rb") as fh:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                    return False
+                except BlockingIOError:
+                    return True
+        except OSError:
+            pass
+    return pid > 0 and pid_alive(pid)
+
+
+def active_waiters(
+    procs: list[tuple[list[str], Path | None]],
+) -> list[tuple[list[str], Path | None]]:
     override = os.environ.get("DELEGATE_STOP_HOOK_WAITERS")
     if override is not None:
-        matched: list[list[str]] = []
+        matched: list[tuple[list[str], Path | None]] = []
         for ln in override.splitlines():
             if not ln.strip():
                 continue
             args = match_delegate_subcmd(split_cmdline(ln), "wait")
             if args is not None:
-                matched.append(args)
+                matched.append((args, None))
         return matched
-    out: list[list[str]] = []
-    for argv, _ in procs:
+    out: list[tuple[list[str], Path | None]] = []
+    for argv, pcwd in procs:
         args = match_delegate_subcmd(argv, "wait")
         if args is not None:
-            out.append(args)
+            out.append((args, pcwd))
     return out
+
+
+def waiter_covers_run(
+    run_dir: Path | None,
+    rid: str,
+    obj: dict,
+    repo_root: Path | None,
+    is_current: bool,
+    waiters: list[tuple[list[str], Path | None]],
+    locked_inodes: set[tuple[int, int, int]] | None,
+) -> bool:
+    """Return True if a run is already covered by `<run>/waiter.lock` or a live `delegate wait`."""
+    if has_active_waiter_lock(run_dir, locked_inodes):
+        return True
+    for args, pcwd in waiters:
+        if "--machine" in args:
+            return True
+        targets = extract_positional_targets(args, {"--max", "--since"})
+        if "--since" in args and not targets:
+            # Unfiltered `delegate wait --since SEQ` watches the global event stream.
+            return True
+        if not targets:
+            # Bare `delegate wait`, `delegate wait --any`, `delegate wait --all`, etc.
+            if pcwd is not None:
+                if cwd_in_repo(pcwd, repo_root):
+                    return True
+            elif is_current:
+                return True
+        elif any(run_matches_target(rid, obj, t) for t in targets):
+            return True
+    return False
 
 
 def extract_positional_targets(args: list[str], value_flags: set[str]) -> list[str]:
@@ -985,13 +1128,7 @@ def check_unread_events(
         return None, [], []
 
     cursors_doc = read_json_file(sdir / "cursors.json") or {}
-    caller_id = (
-        os.environ.get("DELEGATE_CALLER")
-        or os.environ.get("CLAUDE_CODE_SESSION_ID")
-        or os.environ.get("CODEX_THREAD_ID")
-        or os.environ.get("PI_SESSION_ID")
-        or str(payload.get("session_id") or "")
-    ).strip()
+    caller_id = current_caller_id(payload)
 
     callers_map = cursors_doc.get("callers") if isinstance(cursors_doc.get("callers"), dict) else {}
     if caller_id and isinstance(callers_map.get(caller_id), dict):
@@ -1013,13 +1150,12 @@ def check_unread_events(
 
     current_only = os.environ.get("DELEGATE_STOP_HOOK_CURRENT_ONLY") == "1"
     current_repo_str: str | None = None
-    if current_only:
-        cur = git_toplevel(cwd)
-        if cur is not None:
-            try:
-                current_repo_str = str(cur.resolve())
-            except OSError:
-                current_repo_str = str(cur)
+    cur = git_toplevel(cwd)
+    if cur is not None:
+        try:
+            current_repo_str = str(cur.resolve())
+        except OSError:
+            current_repo_str = str(cur)
 
     candidates: list[tuple[int, dict]] = []
     resolving: dict[str, dict[str, int]] = {
@@ -1078,14 +1214,18 @@ def check_unread_events(
                 )
                 if not is_alert:
                     continue
-                if current_only and current_repo_str is not None:
-                    ev_repo = str(ev.get("repo") or "")
-                    if ev_repo:
-                        try:
-                            ev_repo = str(Path(ev_repo).resolve())
-                        except OSError:
-                            pass
-                    if ev_repo != current_repo_str:
+                ev_repo = str(ev.get("repo") or "")
+                if ev_repo:
+                    try:
+                        ev_repo = str(Path(ev_repo).resolve())
+                    except OSError:
+                        pass
+                ev_is_current = current_repo_str is not None and ev_repo == current_repo_str
+                if current_only and current_repo_str is not None and not ev_is_current:
+                    continue
+                if run_id and not ev_is_current:
+                    run_obj = all_runs_by_id.get(run_id)
+                    if run_obj is not None and not run_belongs_to_scope(run_obj, False, caller_id):
                         continue
                 if run_id and run_id in read_runs and seq <= read_runs[run_id]:
                     continue
@@ -1259,9 +1399,10 @@ def evaluate(payload: dict) -> dict | None:
     ]
     gate_cwds, lane_runs = active_lane_state(procs)
 
+    caller_id = current_caller_id(payload)
     questions: list[tuple[str, str, bool]] = []  # (display, run_id, is_current)
-    live_current: list[tuple[str, str]] = []  # (display, run_id)
-    live_other: list[tuple[str, str]] = []  # (display, run_id)
+    live_current: list[tuple[str, str, dict, Path | None]] = []  # (display, run_id, obj, repo_root)
+    live_other: list[tuple[str, str, dict, Path | None]] = []  # (display, run_id, obj, repo_root)
     unmerged_items: list[tuple[str, str]] = []  # (display, run_id)
     stale_run_ids: list[str] = []
     work_fresh_def, work_expired_def = work_deferred_runs(work_items, now)
@@ -1299,6 +1440,9 @@ def evaluate(payload: dict) -> dict | None:
             if is_cleaned or is_applied:
                 continue
 
+            if not run_belongs_to_scope(obj, is_current, caller_id):
+                continue
+
             # 1) Questioning runs (stopped waiting for controller decision).
             if is_question:
                 questions.append((disp, rid, is_current))
@@ -1307,9 +1451,9 @@ def evaluate(payload: dict) -> dict | None:
             # 2) Live runs (running / waiting / starting / queued).
             if st in ("running", "waiting", "starting", "queued"):
                 if is_current:
-                    live_current.append((disp, rid))
+                    live_current.append((disp, rid, obj, repo_root))
                 else:
-                    live_other.append((disp, rid))
+                    live_other.append((disp, rid, obj, repo_root))
                 continue
 
             # 3) Unmerged delivered or rejected write runs.
@@ -1358,15 +1502,22 @@ def evaluate(payload: dict) -> dict | None:
 
     # Build waiter reminder for live runs.
     if live_current or live_other:
-        waiter_argvs = active_waiter_argvs(procs)
-        has_any_waiter = bool(waiter_argvs)
-        has_machine_waiter = any("--machine" in args for args in waiter_argvs)
+        waiters = active_waiters(procs)
+        locked_inodes = read_locked_inodes()
 
-        uncovered_cur = [] if has_any_waiter else live_current
+        def _rdir(obj: dict) -> Path | None:
+            d = obj.get("dir")
+            return Path(d) if isinstance(d, str) and d else None
+
+        uncovered_cur = [
+            (disp, rid)
+            for disp, rid, obj, rroot in live_current
+            if not waiter_covers_run(_rdir(obj), rid, obj, rroot, True, waiters, locked_inodes)
+        ]
         uncovered_other = [
             (disp, rid)
-            for disp, rid in live_other
-            if not has_machine_waiter and not any(any(rid in tok for tok in args) for args in waiter_argvs)
+            for disp, rid, obj, rroot in live_other
+            if not waiter_covers_run(_rdir(obj), rid, obj, rroot, False, waiters, locked_inodes)
         ]
         waiter_log_names: list[str] = []
         waiter_log_ids: list[str] = []

@@ -27,6 +27,29 @@ pub fn record_action(action: &str, runs: &[String], work_id: Option<&str>, machi
     record_action_in(&state, action, runs, work_id, machine);
 }
 
+pub fn record_action_timed(
+    action: &str,
+    runs: &[String],
+    work_id: Option<&str>,
+    machine: bool,
+    started_at: &str,
+    finished_at: &str,
+    elapsed_ms: u64,
+) {
+    let state = state_dir();
+    if !stop_log_path(&state).is_file() {
+        return;
+    }
+    record_action_in_timed(
+        &state,
+        action,
+        runs,
+        work_id,
+        machine,
+        Some((started_at, finished_at, elapsed_ms)),
+    );
+}
+
 pub fn record_action_in(
     state: &Path,
     action: &str,
@@ -34,11 +57,31 @@ pub fn record_action_in(
     work_id: Option<&str>,
     machine: bool,
 ) {
+    record_action_in_timed(state, action, runs, work_id, machine, None);
+}
+
+fn record_action_in_timed(
+    state: &Path,
+    action: &str,
+    runs: &[String],
+    work_id: Option<&str>,
+    machine: bool,
+    timing: Option<(&str, &str, u64)>,
+) {
     let mut entry = json!({
         "ts": iso(),
         "action": action,
         "runs": runs,
     });
+    if let Some((started_at, finished_at, elapsed_ms)) = timing {
+        if !started_at.is_empty() {
+            entry["startedAt"] = json!(started_at);
+        }
+        if !finished_at.is_empty() {
+            entry["finishedAt"] = json!(finished_at);
+        }
+        entry["elapsedMs"] = json!(elapsed_ms);
+    }
     if let Some(wid) = work_id.filter(|w| !w.is_empty()) {
         entry["workId"] = json!(wid);
     }

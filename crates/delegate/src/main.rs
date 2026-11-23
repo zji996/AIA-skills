@@ -1633,6 +1633,8 @@ fn patch(args: &[String]) -> Res<i32> {
     Ok(0)
 }
 fn apply(args: &[String]) -> Res<i32> {
+    let apply_started_at = iso();
+    let apply_t0 = std::time::Instant::now();
     let (pos, flags, kv) = parse_simple(
         args,
         &[
@@ -2036,6 +2038,13 @@ fn apply(args: &[String]) -> Res<i32> {
                         format!("；{detail}")
                     }
                 );
+                if let Some(nexts) = conclusion["apply"]["next"].as_array() {
+                    for next_cmd in nexts.iter().filter_map(serde_json::Value::as_str) {
+                        if !next_cmd.is_empty() {
+                            println!("  下一步：{next_cmd}");
+                        }
+                    }
+                }
             }
         }
     }
@@ -2058,6 +2067,8 @@ fn apply(args: &[String]) -> Res<i32> {
         }
     }
     if !dry {
+        let apply_finished_at = iso();
+        let apply_elapsed_ms = apply_t0.elapsed().as_millis() as u64;
         let mut applied_records: Vec<(PathBuf, Value, Value)> = Vec::new();
         for run in &applied_runs {
             let applied = json(run.join(".applied"));
@@ -2076,15 +2087,42 @@ fn apply(args: &[String]) -> Res<i32> {
                 arch.as_deref(),
             );
             let run_id_ev = events::run_id_for(run, &meta);
+            let done_item = done.iter().find(|d| d.run == *run);
+            let run_started = done_item
+                .map(|d| s(&d.conclusion, "startedAt"))
+                .filter(|v| !v.is_empty())
+                .unwrap_or(&apply_started_at);
+            let run_finished = done_item
+                .map(|d| s(&d.conclusion, "finishedAt"))
+                .filter(|v| !v.is_empty())
+                .unwrap_or(&apply_finished_at);
+            let run_elapsed_ms = done_item
+                .and_then(|d| d.conclusion["elapsedMs"].as_u64())
+                .unwrap_or(apply_elapsed_ms);
+            let mut ev_payload = json!({
+                "name": s(&meta, "name"),
+                "head": s(&applied, "head"),
+                "appliedBy": if by.is_empty() { "delegate" } else { by },
+                "startedAt": run_started,
+                "finishedAt": run_finished,
+                "elapsedMs": run_elapsed_ms,
+            });
+            if let Some(d) = done_item {
+                if d.conclusion["fastForward"].is_object() {
+                    ev_payload["fastForward"] = json!(b(&d.conclusion["fastForward"], "hit"));
+                }
+                if let Some(gms) = d.conclusion["applyTiming"]["generateMs"].as_u64() {
+                    ev_payload["generateMs"] = json!(gms);
+                }
+                if b(&d.conclusion["applyTiming"], "regenerateTargetIsolated") {
+                    ev_payload["regenerateTargetIsolated"] = json!(true);
+                }
+            }
             events::emit(
                 &run_id_ev,
                 &events::repo_for_meta(&meta),
                 "applied",
-                json!({
-                    "name": s(&meta, "name"),
-                    "head": s(&applied, "head"),
-                    "appliedBy": if by.is_empty() { "delegate" } else { by },
-                }),
+                ev_payload,
             );
             events::mark_run_read(&run_id_ev);
             index::upsert_run(run);
@@ -2096,7 +2134,15 @@ fn apply(args: &[String]) -> Res<i32> {
                 .iter()
                 .map(|(r, m, _)| events::run_id_for(r, m))
                 .collect();
-            hook::record_action("apply", &applied_ids, None, false);
+            hook::record_action_timed(
+                "apply",
+                &applied_ids,
+                None,
+                false,
+                &apply_started_at,
+                &apply_finished_at,
+                apply_elapsed_ms,
+            );
             let work_hints = work::on_runs_applied(&applied_records, closes_work.as_deref());
             work::check_stale_and_expired();
             dag_queue::advance();

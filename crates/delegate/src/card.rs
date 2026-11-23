@@ -2485,33 +2485,106 @@ fn load_effective_configs(meta: &Value) -> (Vec<String>, Vec<String>, Vec<String
 }
 
 fn load_reviewer_info(run: &Path, review_doc: &Value) -> (Option<String>, Vec<ReviewerFocusItem>, Option<String>) {
-    let verdict_file = {
-        let vf = s(review_doc, "verdictFile");
-        if !vf.is_empty() && Path::new(vf).is_file() {
-            Some(vf.to_string())
-        } else if run.join("review.md").is_file() {
-            Some(run.join("review.md").to_string_lossy().into_owned())
-        } else {
-            None
-        }
+    let raw_vf = s(review_doc, "verdictFile");
+    let round_num = n(review_doc, "round");
+    let round_vf = (round_num > 0).then(|| run.join("review").join(format!("round-{round_num}-verdict.md")));
+    let verdict_file = if !raw_vf.is_empty() && Path::new(raw_vf).is_file() {
+        Some(raw_vf.to_string())
+    } else if let Some(ref rvf) = round_vf.filter(|p| p.is_file()) {
+        Some(rvf.to_string_lossy().into_owned())
+    } else if run.join("review.md").is_file() {
+        Some(run.join("review.md").to_string_lossy().into_owned())
+    } else if !raw_vf.is_empty() {
+        Some(raw_vf.to_string())
+    } else {
+        None
     };
     let Some(vf) = verdict_file else {
         return (None, Vec::new(), None);
     };
-    let raw = read(&vf);
-    if raw.trim().is_empty() {
-        return (None, Vec::new(), Some(vf));
-    }
+    let raw = if Path::new(&vf).is_file() { read(&vf) } else { String::new() };
     let conclusion = {
         let c = s(review_doc, "conclusion");
         if !c.is_empty() {
             Some(c.to_string())
-        } else {
+        } else if !raw.trim().is_empty() {
             extract_reviewer_conclusion(&raw)
+        } else {
+            None
         }
     };
-    let focus = parse_reviewer_focus(&raw);
+    let focus = if raw.trim().is_empty() {
+        Vec::new()
+    } else {
+        parse_reviewer_focus(&raw)
+    };
     (conclusion, focus, Some(vf))
+}
+
+fn resolve_base_info(run: &Path, meta: &Value) -> Value {
+    let cur_base = {
+        let nb = s(meta, "netBase");
+        if !nb.is_empty() {
+            nb.to_string()
+        } else {
+            s(&meta["worktree"], "base").to_string()
+        }
+    };
+    if cur_base.is_empty() {
+        return Value::Null;
+    }
+    let short = cur_base[..cur_base.len().min(7)].to_string();
+    let parent_id = s(meta, "parent");
+    let prev_base = if !parent_id.is_empty() {
+        let sibling_meta = run
+            .parent()
+            .map(|p| p.join(parent_id).join("meta.json"))
+            .filter(|p| p.is_file())
+            .map(json);
+        let parent_meta = sibling_meta.or_else(|| {
+            crate::runs::resolve(parent_id)
+                .ok()
+                .map(|p| json(p.join("meta.json")))
+                .filter(|v| v.is_object())
+        });
+        let from_parent = parent_meta
+            .as_ref()
+            .map(|pm| {
+                let nb = s(pm, "netBase");
+                if !nb.is_empty() {
+                    nb.to_string()
+                } else {
+                    s(&pm["worktree"], "base").to_string()
+                }
+            })
+            .unwrap_or_default();
+        if !from_parent.is_empty() {
+            from_parent
+        } else {
+            s(&meta["syncedBase"], "from").to_string()
+        }
+    } else if b(meta, "netBaseRebased") {
+        s(&meta["worktree"], "base").to_string()
+    } else {
+        String::new()
+    };
+
+    if !prev_base.is_empty() && prev_base != cur_base {
+        let prev_short = prev_base[..prev_base.len().min(7)].to_string();
+        json!({
+            "sha": cur_base,
+            "short": short,
+            "rebased": true,
+            "previousSha": prev_base,
+            "previousShort": prev_short,
+        })
+    } else {
+        json!({
+            "sha": cur_base,
+            "short": short,
+            "rebased": false,
+        })
+    }
 }
 
 /// Build the compact L0 summary (`< 500 bytes`) stored inside `summary.json["card"]` and `index.json`.
@@ -2656,6 +2729,7 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
             "enabled": true,
             "status": review_doc["status"],
             "verdict": review_doc["verdict"],
+            "originalVerdict": review_doc["originalVerdict"],
             "round": review_doc["round"],
             "reworkRounds": review_doc["reworkRounds"],
             "upgradedBy": review_doc["upgradedBy"],
@@ -2667,16 +2741,70 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
         json!({"enabled": false})
     };
 
-    let accept_val = if sum["accept"].is_object() {
+    let mut accept_val = if sum["accept"].is_object() {
         sum["accept"].clone()
     } else {
         Value::Null
     };
+    if accept_val.is_object()
+        && accept_val["ok"] == json!(false)
+        && !b(&accept_val, "cancelled")
+        && !b(&accept_val, "notExecuted")
+        && !b(&accept_val, "infrastructureFailure")
+        && !accept_val["failureAttribution"].is_object()
+    {
+        let mut changed_paths: Vec<String> = parsed_files.iter().map(|f| f.path.clone()).collect();
+        if changed_paths.is_empty() {
+            changed_paths = json(run.join("changes.json"))["changes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|c| s(c, "path").to_string())
+                .filter(|p| !p.is_empty())
+                .collect();
+        }
+        if let Some(attr) = crate::accept::analyze_failure_attribution(run, meta, &changed_paths) {
+            accept_val["failureAttribution"] = attr;
+        }
+    }
+
+    let base_info = resolve_base_info(run, meta);
 
     let mut next_cmds = vec![
         json!({"label": "仅看风险改动", "command": format!("delegate diff {run_id} --risky")}),
         json!({"label": "查看完整改动", "command": format!("delegate diff {run_id}{}", if meta["worktree"].is_object() { " --total" } else { "" })}),
     ];
+    if accept_val["failureAttribution"].is_object()
+        && b(&accept_val["failureAttribution"], "suspectedMainline")
+    {
+        let attr = &accept_val["failureAttribution"];
+        let log_file = s(attr, "logFile");
+        if let Some(first) = attr["outsideRunFiles"].as_array().and_then(|a| a.first()) {
+            let line = n(first, "logLine").max(1);
+            let start = line.saturating_sub(5).max(1);
+            let end = line + 15;
+            if !log_file.is_empty() {
+                next_cmds.push(json!({
+                    "label": "查看验收报错上下文",
+                    "command": format!("sed -n '{start},{end}p' {}", shell_quote(log_file)),
+                }));
+            }
+        }
+        let failed_cmd = accept_val["layers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|l| s(l, "status") == "failed")
+            .map(|l| s(l, "command"))
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| s(&accept_val, "command"));
+        if !failed_cmd.is_empty() {
+            next_cmds.push(json!({
+                "label": "在主干复现验收确认是否主干已有失败",
+                "command": format!("delegate lane {}", shell_quote(failed_cmd)),
+            }));
+        }
+    }
     if needs_sign {
         next_cmds.push(json!({"label": "受控路径签字", "command": format!("delegate sign {run_id}")}));
     }
@@ -2689,6 +2817,7 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
         "run": run_id,
         "name": name,
         "state": state,
+        "base": base_info,
         "changes": {
             "files": total_files,
             "added": total_added,
@@ -2752,29 +2881,49 @@ pub fn render_card_human(card: &Value) -> String {
     let added = n(&card["changes"], "added");
     let deleted = n(&card["changes"], "deleted");
     let ff = format_l0_fast_forward(&card["l0"], card.get("premerge"));
+    let base_seg = if card["base"].is_object() {
+        let short = s(&card["base"], "short");
+        let prev = s(&card["base"], "previousShort");
+        if !short.is_empty() && b(&card["base"], "rebased") && !prev.is_empty() && prev != short {
+            format!(" · 基线 {short}（已 rebase：{prev}→{short}）")
+        } else if !short.is_empty() {
+            format!(" · 基线 {short}")
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
 
     let mut out = Vec::new();
     out.push(format!(
-        "审查卡 · {name} ({run_id}) · {state_zh} · 改 {files} 个文件 +{added}/-{deleted} · {ff}"
+        "审查卡 · {name} ({run_id}) · {state_zh}{base_seg} · 改 {files} 个文件 +{added}/-{deleted} · {ff}"
     ));
 
     let accept_line = if card["accept"].is_object() {
-        human_accept_label(&card["accept"], false)
+        let mut lbl = human_accept_label(&card["accept"], false);
+        if b(&card["accept"]["failureAttribution"], "suspectedMainline") {
+            lbl.push_str("（报错文件不在本 run 改动中，疑似主干已有失败）");
+        }
+        lbl
     } else {
         "未设验收".into()
     };
     let rev = &card["review"];
     let review_head = if b(rev, "enabled") {
         let v = s(rev, "verdict");
+        let orig = s(rev, "originalVerdict");
         let st = s(rev, "status");
         if st == "cancelled" {
             format!("已取消（{}）", s(rev, "cancelledBy"))
         } else if !v.is_empty() {
             let up = s(rev, "upgradedBy");
-            if up.is_empty() {
-                v.to_string()
-            } else {
-                format!("{v}（{up}）")
+            let has_orig = !orig.is_empty() && orig != v;
+            match (up.is_empty(), has_orig) {
+                (true, false) => v.to_string(),
+                (false, false) => format!("{v}（{up}）"),
+                (true, true) => format!("{v}（原判 {orig}）"),
+                (false, true) => format!("{v}（原判 {orig}，经 {up} 升级）"),
             }
         } else {
             st.to_string()
@@ -2882,6 +3031,8 @@ pub fn render_card_human(card: &Value) -> String {
     }
     if b(rev, "enabled") {
         let verdict = s(rev, "verdict");
+        let orig = s(rev, "originalVerdict");
+        let up = s(rev, "upgradedBy");
         let concl = s(rev, "conclusion");
         let vf = s(rev, "verdictFile");
         let concl_part = if concl.is_empty() {
@@ -2898,7 +3049,17 @@ pub fn render_card_human(card: &Value) -> String {
         } else {
             format!("（原文：{vf}）")
         };
-        let v_prefix = if verdict.is_empty() { "—" } else { verdict };
+        let v_prefix = if verdict.is_empty() {
+            "—".to_string()
+        } else if !orig.is_empty() && orig != verdict {
+            if up.is_empty() {
+                format!("{verdict}（原判 {orig}）")
+            } else {
+                format!("{verdict}（原判 {orig}，经 {up} 升级）")
+            }
+        } else {
+            verdict.to_string()
+        };
         out.push(format!("   审查员：{v_prefix} — {concl_part}{vf_part}"));
     }
     out.push(String::new());
@@ -2991,6 +3152,24 @@ pub fn render_card_human(card: &Value) -> String {
                 "   - [{st_zh}] accept: {}",
                 clip(s(acc, "command"), 80)
             ));
+        }
+        let attr = &acc["failureAttribution"];
+        if attr.is_object() && b(attr, "suspectedMainline") {
+            let log_file = s(attr, "logFile");
+            out.push("   ! 报错文件不在本 run 改动中（疑似主干已有失败）：".into());
+            let outside = attr["outsideRunFiles"].as_array().cloned().unwrap_or_default();
+            for item in outside.iter().take(5) {
+                let p = s(item, "path");
+                let ln = n(item, "logLine");
+                if !log_file.is_empty() && ln > 0 {
+                    out.push(format!("     - {p}（日志：{log_file}:{ln}）"));
+                } else {
+                    out.push(format!("     - {p}"));
+                }
+            }
+            if outside.len() > 5 {
+                out.push(format!("     … 另有 {} 个报错文件", outside.len() - 5));
+            }
         }
     } else {
         out.push("   验收：未配置".into());
@@ -3592,5 +3771,68 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn card_renders_original_verdict_rebase_sha_and_mainline_failure_attribution() {
+        let card = json!({
+            "run": "20261124-023910-3d-camera-rebase",
+            "name": "3d-camera-rebase",
+            "state": "rejected",
+            "base": {
+                "sha": "37d22a51234567890",
+                "short": "37d22a5",
+                "rebased": true,
+                "previousSha": "e80ed531234567890",
+                "previousShort": "e80ed53",
+            },
+            "changes": {"files": 13, "added": 877, "deleted": 28},
+            "l0": {},
+            "author": {"lines": ["rebased camera fix"], "path": "/tmp/run/result.md", "totalLines": 1, "totalChars": 18, "rounds": []},
+            "review": {
+                "enabled": true,
+                "status": "done",
+                "verdict": "NEEDS_CONTROLLER",
+                "originalVerdict": "REWORK",
+                "upgradedBy": "controllerReviewPaths",
+                "conclusion": "发现阻塞缺陷",
+                "verdictFile": "/tmp/run/review/round-1-verdict.md",
+            },
+            "risks": [],
+            "riskStats": {"total": 0, "ruleHits": 0, "reviewerHints": 0},
+            "tests": {"added": 0, "modified": 0, "deleted": 0, "testFiles": 0},
+            "accept": {
+                "ok": false,
+                "command": "pnpm check:web",
+                "failureAttribution": {
+                    "suspectedMainline": true,
+                    "logFile": "/tmp/run/accept.log",
+                    "inRunFiles": [],
+                    "outsideRunFiles": [
+                        {"path": "apps/web/src/styles/agent-birth.css", "logLine": 42, "excerpt": "Unknown word"}
+                    ],
+                },
+            },
+            "otherChanges": [],
+            "next": [
+                {"label": "查看验收报错上下文", "command": "sed -n '37,57p' /tmp/run/accept.log"},
+            ],
+        });
+        let rendered = render_card_human(&card);
+        let first_line = rendered.lines().next().unwrap_or("");
+        assert!(
+            first_line.contains("基线 37d22a5（已 rebase：e80ed53→37d22a5）"),
+            "{first_line}"
+        );
+        assert!(rendered.contains("原判 REWORK"), "{rendered}");
+        assert!(rendered.contains("round-1-verdict.md"), "{rendered}");
+        assert!(
+            rendered.contains("报错文件不在本 run 改动中（疑似主干已有失败）"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("apps/web/src/styles/agent-birth.css（日志：/tmp/run/accept.log:42）"),
+            "{rendered}"
+        );
     }
 }
