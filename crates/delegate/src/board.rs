@@ -551,10 +551,16 @@ pub fn render_for(key: &str, runs_dir: Option<&Path>) -> String {
         format_bytes(arch.bytes),
         arch.count
     );
+    if arch.size_warning {
+        footer.push_str(&format!(
+            " · 提示：归档总量异常偏大（超过阈值 {}）",
+            format_bytes(arch.warn_bytes)
+        ));
+    }
     if arch.fs_critical {
         if let Some(avail) = arch.fs_avail_bytes {
             footer.push_str(&format!(
-                " · 警告：归档文件系统剩余仅 {}，将按最久未读淘汰事件日志",
+                " · 警告：归档文件系统剩余仅 {}，将按最久未读淘汰可重建字节",
                 format_bytes(avail)
             ));
         }

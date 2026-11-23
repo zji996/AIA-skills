@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `delegate`：返工分析工具侧 6 项修复——`start` 写任务并发热点/撞号预警扩展至在跑与未合入 run（覆盖 `migrations/`、`Cargo.toml`、`CHANGELOG.md`、版本文件及同占版本/迁移号），命中时于 stderr 单行提示并附 `--after <run>` 建议且不阻断派发；本仓启用版本号延迟分配（同事只写 `CHANGELOG.md` `## Unreleased`、`.delegate.json` `standing.write` 与 `AGENTS.md`/`README.md` 同步约定，`scripts/release-binary.sh bump <skill> <ver|patch|minor|major>` 统一分配版本并落段）；`review.rs` `original_task_brief()` 沿 `reply` 链（含归档祖先）按时间顺序拼接每轮续做说明并同步 `review-rubric.md`；`transient.rs` 将 `agy` OAuth2 401（`UNAUTHENTICATED (code 401)` / `Expected OAuth 2 access token`）归为 `Kind::AuthRefresh`，退避重探 1 次（仍失败判永久失败并在结论写「agy 登录失效，`delegate agy account status`」）；用量口径统一由 `tokensDelta`（`runs::effective_tokens_delta`）驱动，`history` / `show` / `card` 展示本轮增量并增强多跳同会话祖先查找；移除归档单 run 大小硬上限（全部保留，磁盘临满仍由水位清理淘汰可重建字节）并在 `status`/`board` 提示归档总量异常（默认阈值 5 GiB，`DELEGATE_ARCHIVE_WARN_GIB` 可调）。
+
 ## 未发布
 
 ### 仓库脚本

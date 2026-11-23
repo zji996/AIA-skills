@@ -658,31 +658,52 @@ pub fn sign_command(args: &[String]) -> Res<i32> {
     Ok(0)
 }
 
-/// Extract the original task brief for this run (or root of its reply chain).
+/// Extract the complete chronological task brief across the `reply` chain (root -> each reply ->
+/// current run, including archived ancestors). Single runs return their brief directly; multi-round
+/// reply chains concatenate every round in order and mark the latest round so reviewers judge by
+/// the latest decisions and direction changes rather than stale root instructions.
 fn original_task_brief(run: &Path, meta: &Value) -> String {
-    let mut cur = run.to_path_buf();
-    let mut cur_meta = meta.clone();
-    let mut visited = BTreeSet::new();
-    loop {
-        let parent = s(&cur_meta, "parent").to_string();
-        if parent.is_empty() || !visited.insert(parent.clone()) {
-            break;
-        }
-        let Some(pdir) = cur.parent().map(|p| p.join(&parent)) else {
-            break;
+    let mut chain = crate::runs::chain_ancestors_to_run(run);
+    if chain.is_empty() {
+        chain.push(run.to_path_buf());
+    }
+    let mut briefs: Vec<(String, String)> = Vec::new();
+    for dir in &chain {
+        let node_meta = if dir == run && meta.is_object() {
+            meta.clone()
+        } else {
+            json(dir.join("meta.json"))
         };
-        if !pdir.join("meta.json").is_file() {
-            break;
+        let extracted = crate::history::extract_user_prompt(dir, &node_meta);
+        let text = if !extracted.trim().is_empty() {
+            extracted.trim().to_string()
+        } else {
+            read(dir.join("prompt.md")).trim().to_string()
+        };
+        if !text.is_empty() {
+            let rid = crate::notes::run_id(dir, &node_meta);
+            briefs.push((rid, text));
         }
-        cur_meta = json(pdir.join("meta.json"));
-        cur = pdir;
     }
-    let extracted = crate::history::extract_user_prompt(&cur, &cur_meta);
-    if !extracted.trim().is_empty() {
-        extracted
-    } else {
-        read(cur.join("prompt.md"))
+    if briefs.is_empty() {
+        return String::new();
     }
+    if briefs.len() == 1 {
+        return briefs.remove(0).1;
+    }
+    let last_idx = briefs.len() - 1;
+    let mut sections = Vec::with_capacity(briefs.len());
+    for (idx, (rid, text)) in briefs.into_iter().enumerate() {
+        let heading = if idx == 0 {
+            format!("### 初始说明（{rid}）")
+        } else if idx == last_idx {
+            format!("### 续做说明 #{idx}（{rid}，最新——以本轮拍板/方向为准）")
+        } else {
+            format!("### 续做说明 #{idx}（{rid}）")
+        };
+        sections.push(format!("{heading}\n\n{text}"));
+    }
+    sections.join("\n\n")
 }
 
 fn format_diff_for_prompt(diff_text: &str, diff_file: &Path, top: &Path, from_tree: &str, to_tree: &str) -> String {
@@ -2825,5 +2846,51 @@ mod tests {
         assert_eq!(inv["invalidated"], json!(true));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn original_task_brief_concatenates_full_reply_chain_including_archived_ancestors() {
+        let root_tmp = std::env::temp_dir().join(format!(
+            "delegate-brief-chain-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let runs_dir = root_tmp.join("runs");
+        let r1 = runs_dir.join("20261123-100000-root");
+        let r2 = runs_dir.join("20261123-110000-mid");
+        let r3 = runs_dir.join("20261123-121617-c9cb");
+        fs::create_dir_all(&r1).unwrap();
+        fs::create_dir_all(&r2).unwrap();
+        fs::create_dir_all(&r3).unwrap();
+
+        write_json(r1.join("meta.json"), &json!({"run": "20261123-100000-root"})).unwrap();
+        write(r1.join("prompt.md"), "旧方向：按方案 A 实现").unwrap();
+        write_json(
+            r2.join("meta.json"),
+            &json!({"run": "20261123-110000-mid", "parent": "20261123-100000-root"}),
+        )
+        .unwrap();
+        write(r2.join("prompt.md"), "主控拍板：改为方案 B").unwrap();
+        let m3 = json!({"run": "20261123-121617-c9cb", "parent": "20261123-110000-mid"});
+        write_json(r3.join("meta.json"), &m3).unwrap();
+        write(r3.join("prompt.md"), "按方案 B 修完剩余 3 处缺陷").unwrap();
+
+        // Single run returns its brief directly without headings.
+        let single = original_task_brief(&r1, &json!({"run": "20261123-100000-root"}));
+        assert_eq!(single, "旧方向：按方案 A 实现");
+
+        // Reply chain preserves root + every reply in chronological order with latest marked.
+        let chain_brief = original_task_brief(&r3, &m3);
+        let p1 = chain_brief.find("旧方向：按方案 A 实现").expect("root brief missing");
+        let p2 = chain_brief.find("主控拍板：改为方案 B").expect("mid reply missing");
+        let p3 = chain_brief
+            .find("按方案 B 修完剩余 3 处缺陷")
+            .expect("latest reply missing");
+        assert!(p1 < p2 && p2 < p3, "chronological order broken: {chain_brief}");
+        assert!(chain_brief.contains("初始说明（20261123-100000-root）"));
+        assert!(chain_brief.contains("续做说明 #1（20261123-110000-mid）"));
+        assert!(chain_brief.contains("续做说明 #2（20261123-121617-c9cb，最新"));
+
+        let _ = fs::remove_dir_all(&root_tmp);
     }
 }

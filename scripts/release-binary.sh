@@ -2,6 +2,9 @@
 # Release a skill's binary: static musl builds for x86_64 and aarch64, checksums committed in the skill,
 # assets on the GitHub release tagged <name>-v<version> (and on Forgejo when a token is given).
 #
+#   release-binary.sh bump <skill> <ver|patch|minor|major> [--allow-empty]
+#                                       bump SKILL.md + crates/*/Cargo.{toml,lock} and turn CHANGELOG.md
+#                                       ## Unreleased entries into a versioned section
 #   release-binary.sh build <skill>     build into dist/ and write skills/<skill>/bin.sha256
 #   (commit bin.sha256 with the version bump and push)
 #   release-binary.sh publish <skill>   tag that commit and upload dist/ to the releases
@@ -38,8 +41,12 @@ forgejo_token_over_ssh() {
     || { FORGEJO_TOKEN=""; echo "  [Forgejo] could not read the token from $FORGEJO_TOKEN_SSH" >&2; }
 }
 
-usage() { echo "usage: release-binary.sh build|verify|publish <skill>" >&2; exit 2; }
-(( $# == 2 )) || usage
+usage() {
+  echo "usage: release-binary.sh bump <skill> <X.Y.Z|patch|minor|major> [--allow-empty]" >&2
+  echo "       release-binary.sh build|verify|publish <skill>" >&2
+  exit 2
+}
+(( $# >= 2 )) || usage
 ACTION=$1 SKILL=$2
 DIR="$REPO_ROOT/skills/$SKILL"
 [ -f "$DIR/SKILL.md" ] || { echo "Invalid or missing skill: $SKILL" >&2; exit 2; }
@@ -49,6 +56,222 @@ frontmatter_value() {
 NAME="$(frontmatter_value "$DIR/SKILL.md" binary)"
 EXTRA_BINARIES="$(frontmatter_value "$DIR/SKILL.md" extra-binaries | tr ',[]' '   ')"
 VERSION="$(frontmatter_value "$DIR/SKILL.md" version)"
+
+bump() {
+  local target_spec="${1:-}" allow_empty="0"
+  shift || true
+  while (( $# > 0 )); do
+    case "$1" in
+      --allow-empty) allow_empty="1" ;;
+      *) usage ;;
+    esac
+    shift
+  done
+  [ -n "$target_spec" ] || usage
+  local bins=()
+  if [ -n "$NAME" ]; then
+    bins=("$NAME")
+    for extra in $EXTRA_BINARIES; do
+      bins+=("$extra")
+    done
+  fi
+  python3 - "$REPO_ROOT" "$SKILL" "$VERSION" "$target_spec" "$allow_empty" "${bins[@]}" <<'PY'
+import datetime
+import re
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+skill = sys.argv[2]
+old_ver = sys.argv[3]
+spec = sys.argv[4]
+allow_empty = sys.argv[5] == "1"
+bins = sys.argv[6:]
+
+m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", old_ver)
+if not m:
+    sys.exit(f"Invalid current version in skills/{skill}/SKILL.md: {old_ver!r}")
+maj, minor, patch = map(int, m.groups())
+if spec == "patch":
+    new_ver = f"{maj}.{minor}.{patch + 1}"
+elif spec == "minor":
+    new_ver = f"{maj}.{minor + 1}.0"
+elif spec == "major":
+    new_ver = f"{maj + 1}.0.0"
+elif re.fullmatch(r"\d+\.\d+\.\d+", spec):
+    new_ver = spec
+else:
+    sys.exit(f"Invalid version specifier: {spec!r} (expected X.Y.Z, patch, minor, or major)")
+
+if new_ver == old_ver:
+    sys.exit(f"Target version {new_ver} equals current version {old_ver}")
+
+changelog = repo / "CHANGELOG.md"
+new_changelog_text = None
+moved_count = 0
+if changelog.is_file():
+    raw = changelog.read_text(encoding="utf-8")
+    lines = raw.splitlines(keepends=True)
+    unrel_start = None
+    for idx, line in enumerate(lines):
+        if re.fullmatch(r"##\s+Unreleased\s*", line.strip()):
+            unrel_start = idx
+            break
+    if unrel_start is None:
+        if not allow_empty:
+            sys.exit("CHANGELOG.md has no '## Unreleased' section (add one or pass --allow-empty)")
+    else:
+        unrel_end = len(lines)
+        for idx in range(unrel_start + 1, len(lines)):
+            if re.match(r"^##\s+", lines[idx]):
+                unrel_end = idx
+                break
+        body = lines[unrel_start + 1 : unrel_end]
+        # Group lines into top-level bullet entries (and non-bullet preamble lines).
+        known_skills = {p.name for p in (repo / "skills").iterdir() if p.is_dir()} if (repo / "skills").is_dir() else set()
+        entries = []
+        preamble = []
+        current = None
+        for line in body:
+            if line.startswith("- "):
+                if current is not None:
+                    entries.append(current)
+                current = [line]
+            elif current is not None:
+                if line.strip() == "":
+                    # Keep blank separator only if followed by indented continuation; flush later
+                    current.append(line)
+                elif line.startswith((" ", "\t")):
+                    current.append(line)
+                else:
+                    entries.append(current)
+                    current = None
+                    preamble.append(line)
+            else:
+                if line.strip():
+                    preamble.append(line)
+        if current is not None:
+            entries.append(current)
+
+        moved = []
+        kept = []
+        for ent in entries:
+            # Strip trailing blank lines from an entry
+            while ent and ent[-1].strip() == "":
+                ent.pop()
+            first = ent[0]
+            sm = re.match(r"^-\s+`([^`]+)`", first)
+            if sm and sm.group(1) in known_skills and sm.group(1) != skill:
+                kept.append(ent)
+            else:
+                # Stamp version into leading `- `<skill>`：` if it has no version yet
+                ent[0] = re.sub(
+                    rf"^(-\s+`{re.escape(skill)}`)(\s*[：:])",
+                    rf"\1 {new_ver}\2",
+                    first,
+                )
+                moved.append(ent)
+        moved_count = len(moved)
+        if moved_count == 0 and not allow_empty:
+            sys.exit(
+                f"No unreleased entries for {skill} in CHANGELOG.md '## Unreleased' "
+                f"(add bullets there or pass --allow-empty)"
+            )
+        if moved_count > 0:
+            today = datetime.date.today().isoformat()
+            rebuilt = []
+            rebuilt.extend(lines[: unrel_start + 1])
+            rebuilt.append("\n")
+            if preamble:
+                rebuilt.extend(preamble)
+                rebuilt.append("\n")
+            if kept:
+                for ent in kept:
+                    rebuilt.extend(ent)
+                rebuilt.append("\n")
+            rebuilt.append(f"## {skill} {new_ver} - {today}\n\n")
+            for ent in moved:
+                rebuilt.extend(ent)
+            rebuilt.append("\n")
+            rebuilt.extend(lines[unrel_end:])
+            new_changelog_text = "".join(rebuilt)
+
+# Validate all crate files before writing any file.
+skill_md = repo / "skills" / skill / "SKILL.md"
+skill_text = skill_md.read_text(encoding="utf-8")
+fm_match = re.match(r"\A(---\s*\n)(.*?)(\n---\s*\n)", skill_text, re.S)
+if not fm_match:
+    sys.exit(f"Invalid frontmatter in {skill_md}")
+fm_body = fm_match.group(2)
+new_fm_body, n_sub = re.subn(
+    r'^([ \t]*version:[ \t]*")' + re.escape(old_ver) + r'("[ \t]*)$',
+    rf"\g<1>{new_ver}\g<2>",
+    fm_body,
+    count=1,
+    flags=re.M,
+)
+if n_sub != 1:
+    new_fm_body, n_sub = re.subn(
+        r"^([ \t]*version:[ \t]*)" + re.escape(old_ver) + r"([ \t]*)$",
+        rf"\g<1>{new_ver}\g<2>",
+        fm_body,
+        count=1,
+        flags=re.M,
+    )
+if n_sub != 1:
+    sys.exit(f"Could not update version {old_ver} in {skill_md}")
+new_skill_text = fm_match.group(1) + new_fm_body + fm_match.group(3) + skill_text[fm_match.end():]
+
+crate_updates = []
+for b in bins:
+    cargo_toml = repo / "crates" / b / "Cargo.toml"
+    if not cargo_toml.is_file():
+        sys.exit(f"Missing {cargo_toml}")
+    ct_text = cargo_toml.read_text(encoding="utf-8")
+    new_ct, n_ct = re.subn(
+        r'(?m)^(\s*version\s*=\s*")' + re.escape(old_ver) + r'(")',
+        rf"\g<1>{new_ver}\g<2>",
+        ct_text,
+        count=1,
+    )
+    if n_ct != 1:
+        sys.exit(f"Could not update version {old_ver} in {cargo_toml}")
+    crate_updates.append((cargo_toml, new_ct))
+    cargo_lock = repo / "crates" / b / "Cargo.lock"
+    if cargo_lock.is_file():
+        cl_text = cargo_lock.read_text(encoding="utf-8")
+        pattern = re.compile(
+            r'(\[\[package\]\]\s*\nname\s*=\s*"' + re.escape(b) + r'"\s*\nversion\s*=\s*")'
+            + re.escape(old_ver)
+            + r'(")',
+            re.M,
+        )
+        new_cl, n_cl = pattern.subn(rf"\g<1>{new_ver}\g<2>", cl_text, count=1)
+        if n_cl == 1:
+            crate_updates.append((cargo_lock, new_cl))
+
+# Apply updates atomically in order.
+skill_md.write_text(new_skill_text, encoding="utf-8")
+for path, content in crate_updates:
+    path.write_text(content, encoding="utf-8")
+if new_changelog_text is not None:
+    changelog.write_text(new_changelog_text, encoding="utf-8")
+
+print(f"Bumped {skill}: {old_ver} -> {new_ver} (CHANGELOG entries stamped: {moved_count})")
+if bins:
+    print(f"Next: ./scripts/release-binary.sh build {skill}, commit, push, then: ./scripts/release-binary.sh publish {skill}")
+else:
+    print("Next: run ./scripts/verify.sh, commit and push")
+PY
+}
+
+if [ "$ACTION" = "bump" ]; then
+  shift 2
+  bump "$@"
+  exit 0
+fi
+
+(( $# == 2 )) || usage
 [ -n "$NAME" ] || { echo "skills/$SKILL declares no binary" >&2; exit 2; }
 BINARIES=("$NAME")
 for extra in $EXTRA_BINARIES; do

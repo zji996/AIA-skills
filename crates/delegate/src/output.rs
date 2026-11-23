@@ -676,6 +676,8 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
             } else {
                 format!("先看审查卡：delegate card {id}（或 delegate diff {id}）")
             }
+        } else if state == "failed" && s(status, "error").contains("agy 登录失效") {
+            "agy 登录失效，`delegate agy account status`".into()
         } else {
             format!("查看结论后接手或返工：delegate status {id} --json")
         }

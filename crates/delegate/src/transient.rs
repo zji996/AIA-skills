@@ -40,6 +40,9 @@ pub enum Kind {
     Gateway,
     /// 429 throttling Pi itself did not retry.
     RateLimit,
+    /// `agy` OAuth2 access token expired (401 UNAUTHENTICATED / Expected OAuth 2 access token):
+    /// recoverable once via backoff + re-probe so `agy` can refresh its token.
+    AuthRefresh,
 }
 
 /// A three-digit status code as a standalone number, so `1401` or a timestamp is not a 401.
@@ -66,6 +69,13 @@ pub fn kind(text: &str) -> Option<Kind> {
     ) || ["502", "503", "504"].iter().any(|code| status(&text, code))
     {
         return Some(Kind::Gateway);
+    }
+    // `agy` OAuth2 access token expiration: allow one backoff + re-probe so `agy` refreshes
+    // its credential automatically; ordinary API key 401s still fall through as permanent.
+    if text.contains("expected oauth 2 access token")
+        || (text.contains("unauthenticated") && status(&text, "401"))
+    {
+        return Some(Kind::AuthRefresh);
     }
     // Anything the caller has to fix: waiting and continuing the same session cannot help.
     if ["400", "401", "403", "404", "422"]
@@ -151,10 +161,10 @@ pub fn kind(text: &str) -> Option<Kind> {
     None
 }
 
-/// The transient error text that ended `attempt`, ready to show the caller. `None` means the
-/// attempt failed for a reason a resume cannot fix. A 429 Pi already retried with its own
-/// backoff is not counted again: Pi's retry ran and did not help.
-pub fn ended_by(run: &Path, attempt: i64) -> Option<String> {
+/// The transient failure kind and error text that ended `attempt`, ready to show the caller.
+/// `None` means the attempt failed for a reason a resume cannot fix. A 429 Pi already retried
+/// with its own backoff is not counted again: Pi's retry ran and did not help.
+pub fn ended_by_kind(run: &Path, attempt: i64) -> Option<(Kind, String)> {
     let events = runs::events(run);
     let mine = || {
         events
@@ -185,7 +195,7 @@ pub fn ended_by(run: &Path, attempt: i64) -> Option<String> {
         {
             continue;
         }
-        return Some(clip(text, 300));
+        return Some((found, clip(text, 300)));
     }
     None
 }
@@ -232,8 +242,22 @@ mod tests {
             kind("sse error: error reading sse body: error decoding response body (caused by: request or response body error; error reading a body from connection; unexpected EOF during chunk size line)"),
             Some(Kind::Stream)
         );
+        // agy OAuth2 401 expiry is recoverable once via backoff + re-probe.
+        assert_eq!(
+            kind("UNAUTHENTICATED (code 401): Expected OAuth 2 access token"),
+            Some(Kind::AuthRefresh)
+        );
+        assert_eq!(
+            kind("Error: UNAUTHENTICATED (code 401)"),
+            Some(Kind::AuthRefresh)
+        );
+        assert_eq!(
+            kind("Request failed: Expected OAuth 2 access token, login cookie or other valid authentication credential"),
+            Some(Kind::AuthRefresh)
+        );
         // The caller has to fix these; retrying the same session would just repeat the error.
         assert_eq!(kind("401 Unauthorized: invalid api key"), None);
+        assert_eq!(kind("UNAUTHENTICATED: invalid api key"), None);
         assert_eq!(kind("403 Forbidden"), None);
         assert_eq!(kind("400 Bad Request: invalid_request_error"), None);
         assert_eq!(kind("404 model not found: p/typo"), None);

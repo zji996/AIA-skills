@@ -249,6 +249,48 @@ class ScriptTests(unittest.TestCase):
                              capture_output=True, text=True, check=True)
         self.assertEqual(tag.stdout, "")
 
+    def test_release_bump_allocates_version_and_stamps_unreleased_changelog(self):
+        repo, skill, crate, _, _ = self.binary_fixture("release-bump")
+        (crate / "Cargo.lock").write_text('version = 4\n\n[[package]]\nname = "demo"\nversion = "1.2.3"\n')
+        other_skill = repo / "skills/other"
+        other_skill.mkdir(parents=True)
+        (other_skill / "SKILL.md").write_text('---\nname: other\nmetadata:\n  version: "0.1.0"\n---\n')
+        (repo / "CHANGELOG.md").write_text(
+            "# Changelog\n\n## Unreleased\n\n"
+            "- `demo`：新增功能 A。\n"
+            "- `other`：其他技能改动。\n\n"
+            "## 未发布\n\n- 旧条目\n",
+            encoding="utf-8",
+        )
+        env = {**os.environ, "AIA_SKILLS_REPO_ROOT": str(repo)}
+
+        # Bump minor: updates SKILL.md, Cargo.toml, Cargo.lock, and stamps CHANGELOG.md
+        # while leaving other-skill entries under ## Unreleased.
+        res = self.run_script(RELEASE, "bump", "demo", "minor", env=env)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("Bumped demo: 1.2.3 -> 1.3.0", res.stdout)
+        self.assertIn('version: "1.3.0"', (skill / "SKILL.md").read_text(encoding="utf-8"))
+        self.assertIn('version = "1.3.0"', (crate / "Cargo.toml").read_text(encoding="utf-8"))
+        self.assertIn('version = "1.3.0"', (crate / "Cargo.lock").read_text(encoding="utf-8"))
+        changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## Unreleased\n\n- `other`：其他技能改动。", changelog)
+        self.assertRegex(changelog, r"## demo 1\.3\.0 - \d{4}-\d{2}-\d{2}\n\n- `demo` 1\.3\.0：新增功能 A。")
+
+        # Second bump without new Unreleased entries for demo fails closed without touching files.
+        fail = self.run_script(RELEASE, "bump", "demo", "patch", env=env)
+        self.assertNotEqual(fail.returncode, 0)
+        self.assertIn("No unreleased entries for demo", fail.stderr)
+        self.assertIn('version: "1.3.0"', (skill / "SKILL.md").read_text(encoding="utf-8"))
+
+        # Explicit version with --allow-empty succeeds, and non-binary skill bump works too.
+        ok_empty = self.run_script(RELEASE, "bump", "demo", "1.3.1", "--allow-empty", env=env)
+        self.assertEqual(ok_empty.returncode, 0, ok_empty.stdout + ok_empty.stderr)
+        self.assertIn('version: "1.3.1"', (skill / "SKILL.md").read_text(encoding="utf-8"))
+
+        ok_doc = self.run_script(RELEASE, "bump", "other", "patch", env=env)
+        self.assertEqual(ok_doc.returncode, 0, ok_doc.stdout + ok_doc.stderr)
+        self.assertIn('version: "0.1.1"', (other_skill / "SKILL.md").read_text(encoding="utf-8"))
+
     def test_fetch_binary_fallback_marks_unverified_and_strict_mode_preserves_old(self):
         repo, skill, crate, _, _ = self.binary_fixture("fetch-fallback")
         fake = self.work / "fake-bin"

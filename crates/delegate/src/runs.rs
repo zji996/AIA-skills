@@ -1715,6 +1715,43 @@ pub fn collect_result_rounds(run: &Path, include_chain: bool) -> Vec<ResultRound
     out
 }
 
+/// Canonical per-run incremental token usage (`{input, output, cacheRead}`):
+///
+/// - For same-session `agy` reply runs, `summary.json["tokens"]` holds session-cumulative counts
+///   while `summary.json["tokensDelta"]` holds this round's incremental usage; prefer `tokensDelta`.
+/// - For root `agy` runs and all Pi runs, `summary.json["tokens"]` is already this run's
+///   incremental usage (and `tokensDelta` is omitted).
+///
+/// Callers (`history`, `show`, `card`, and per-account `agy-usage`) should use this helper (or
+/// read `tokensDelta` falling back to `tokens`) so summing across runs never double-counts.
+pub fn effective_tokens_delta(summary: &Value) -> Option<Value> {
+    for key in ["tokensDelta", "tokens"] {
+        let v = &summary[key];
+        if v.as_object().is_some_and(|o| !o.is_empty()) {
+            return Some(v.clone());
+        }
+    }
+    None
+}
+
+/// Format a `{input, output, cacheRead}` token usage object for human display.
+pub fn format_tokens_usage(tokens: &Value) -> String {
+    if !tokens.is_object() {
+        return String::new();
+    }
+    let input = n(tokens, "input");
+    let output = n(tokens, "output");
+    let cache = n(tokens, "cacheRead");
+    if input == 0 && output == 0 && cache == 0 {
+        return String::new();
+    }
+    if cache > 0 {
+        format!("in {input} / out {output} / cache {cache}")
+    } else {
+        format!("in {input} / out {output}")
+    }
+}
+
 #[cfg(test)]
 mod agy_conversation_tests {
     use super::*;

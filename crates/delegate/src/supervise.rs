@@ -700,11 +700,15 @@ pub(crate) struct Resumed {
     pub(crate) attempts: i64,
     pub(crate) resumes: i64,
     pub(crate) error: String,
+    pub(crate) auth_failed: bool,
 }
 
 /// A provider outage is not the task failing: wait for it to pass, check through Pi that the
 /// model answers again, then let the same session carry on in this run — same model, same
 /// worktree, changes kept. Only when the tries run out does the run fail (and escalate) as before.
+///
+/// For `agy` OAuth2 401 (`Kind::AuthRefresh`), wait once and re-probe once so `agy` can refresh
+/// its access token; if the re-probe or resumed attempt still fails, judge permanent failure.
 pub(crate) fn resume_transient(
     meta: &Value,
     run: &Path,
@@ -714,11 +718,96 @@ pub(crate) fn resume_transient(
 ) -> Resumed {
     let (mut verdict, mut answer, mut attempts) = first;
     let waits = transient::waits();
+    let is_agy =
+        crate::agy::is_agy(s(meta, "model")) || s(meta, "agent") == crate::agy::BIN;
     let (mut tried, mut resumes, mut error) = (0usize, 0i64, String::new());
-    while verdict == "failed" && tried < waits.len() && !lane::stopped() {
-        let Some(found) = transient::ended_by(run, attempts) else {
+    let mut auth_probed = false;
+    let mut auth_failed = false;
+    while verdict == "failed" && !lane::stopped() {
+        let Some((found_kind, found)) = transient::ended_by_kind(run, attempts) else {
             break;
         };
+        if found_kind == transient::Kind::AuthRefresh {
+            if !is_agy {
+                break;
+            }
+            if auth_probed || waits.is_empty() {
+                auth_failed = true;
+                error.clear();
+                break;
+            }
+            auth_probed = true;
+            let wait = waits[tried.min(waits.len() - 1)];
+            tried += 1;
+            let waiting = format!(
+                "agy 401 鉴权过期，等待 {}s 后重探刷新令牌（仅 1 次）",
+                (wait * 10.0).round() / 10.0
+            );
+            log_event(
+                run,
+                json!({"e":"resume","n":tried,"waitSeconds":wait,"kind":"auth_refresh","error":found,"detail":waiting}),
+            );
+            if !transient::wait(wait) {
+                break;
+            }
+            let bin = Some(s(meta, "agentBin"))
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| agents::agent_bin(crate::agy::colleague(s(meta, "model"))));
+            let down = match bin {
+                Some(bin) => probe::recovered(
+                    &bin,
+                    s(meta, "model"),
+                    &meta["env"],
+                    &meta["agy"],
+                    transient::probe_timeout(),
+                ),
+                None => Err("missing required tools: agy".to_string()),
+            };
+            if let Err(down) = down {
+                log_event(
+                    run,
+                    json!({"e":"resume_skipped","n":tried,"kind":"auth_refresh","error":down}),
+                );
+                auth_failed = true;
+                error.clear();
+                break;
+            }
+            let next = match continuation(meta, run) {
+                Some(next) => next,
+                None if attempts == 1 => meta.clone(),
+                None => {
+                    log_event(
+                        run,
+                        json!({"e":"resume_skipped","n":tried,"kind":"auth_refresh","error":"no saved session to continue"}),
+                    );
+                    auth_failed = true;
+                    error.clear();
+                    break;
+                }
+            };
+            resumes += 1;
+            attempts += 1;
+            match agents::run_agent(&next, run, attempts, holder.clone(), grace.clone()) {
+                Ok((outcome, text)) => {
+                    verdict = outcome;
+                    answer = text;
+                }
+                Err(failure) => {
+                    error = failure.clone();
+                    let _ = append(
+                        run.join("stderr.log"),
+                        &format!("supervisor error: {failure}\n"),
+                    );
+                    auth_failed = true;
+                    break;
+                }
+            }
+            continue;
+        }
+        if tried >= waits.len() {
+            break;
+        }
         error = found;
         let wait = waits[tried];
         tried += 1;
@@ -786,6 +875,7 @@ pub(crate) fn resume_transient(
         attempts,
         resumes,
         error,
+        auth_failed,
     }
 }
 fn escalate(
@@ -1180,7 +1270,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
     } else {
         ("failed".into(), String::new(), 0)
     };
-    let (mut resumes, mut transient_error) = (0i64, String::new());
+    let (mut resumes, mut transient_error, mut auth_failed) = (0i64, String::new(), false);
     if setup_error.is_none() {
         let resumed = resume_transient(
             &meta,
@@ -1190,7 +1280,8 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
             grace.clone(),
         );
         (verdict, answer, attempts) = (resumed.verdict, resumed.answer, resumed.attempts);
-        (resumes, transient_error) = (resumed.resumes, resumed.error);
+        (resumes, transient_error, auth_failed) =
+            (resumed.resumes, resumed.error, resumed.auth_failed);
         (verdict, answer, attempts) = resume_stalled(
             &meta,
             run,
@@ -1207,8 +1298,12 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         holder.clone(),
         verdict == "ok" && agents::is_question(&answer),
     );
-    if transient_error.is_empty() && verdict == "failed" {
-        transient_error = transient::ended_by(run, attempts).unwrap_or_default();
+    if !auth_failed && transient_error.is_empty() && verdict == "failed" {
+        if let Some((kind, msg)) = transient::ended_by_kind(run, attempts) {
+            if kind != transient::Kind::AuthRefresh {
+                transient_error = msg;
+            }
+        }
     }
     let original_model = model_label(&meta);
     let protected = !pre.sum["protectViolation"].is_null();
@@ -1360,22 +1455,26 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
             .rev()
             .collect::<Vec<_>>()
             .join("; ");
-        let hint = match state.as_str() {
-            "malformed" => "answer was empty or a leaked tool call".into(),
-            "timeout" => format!("{} exceeded {}", s(&meta, "agent"), s(&meta, "timeout")),
-            "stalled" => {
-                let reason = json(run.join("stall.json"));
-                if s(&reason, "kind") == "command" {
-                    format!(
-                        "命令 {} 连续 {} 秒无新动作而停滞",
-                        s(&reason, "cmd"),
-                        n(&reason, "seconds")
-                    )
-                } else {
-                    format!("idle：已 {} 秒无新动作而停滞", n(&reason, "seconds"))
+        let hint = if auth_failed && state == "failed" {
+            "agy 登录失效，`delegate agy account status`".into()
+        } else {
+            match state.as_str() {
+                "malformed" => "answer was empty or a leaked tool call".into(),
+                "timeout" => format!("{} exceeded {}", s(&meta, "agent"), s(&meta, "timeout")),
+                "stalled" => {
+                    let reason = json(run.join("stall.json"));
+                    if s(&reason, "kind") == "command" {
+                        format!(
+                            "命令 {} 连续 {} 秒无新动作而停滞",
+                            s(&reason, "cmd"),
+                            n(&reason, "seconds")
+                        )
+                    } else {
+                        format!("idle：已 {} 秒无新动作而停滞", n(&reason, "seconds"))
+                    }
                 }
+                _ => String::new(),
             }
-            _ => String::new(),
         };
         let message = [
             setup_error.unwrap_or(hint),
@@ -1561,18 +1660,28 @@ fn compute_tokens(
     }
 
     let mut delta = None;
-    let parent_id = s(meta, "parent");
+    let mut parent_id = s(meta, "parent").to_string();
     if is_agy && !parent_id.is_empty() && !session_id.is_empty() {
-        let parent_dir = run
-            .parent()
-            .map(|p| p.join(parent_id))
-            .filter(|p| p.join("summary.json").is_file() || p.join("events.jsonl").is_file())
-            .or_else(|| {
-                let arch = cache_dir().join("archive").join(parent_id).join("record");
-                (arch.join("summary.json").is_file() || arch.join("events.jsonl").is_file())
+        let mut visited = std::collections::BTreeSet::new();
+        while !parent_id.is_empty() && visited.insert(parent_id.clone()) {
+            let parent_dir = run
+                .parent()
+                .map(|p| p.join(&parent_id))
+                .filter(|p| {
+                    p.join("summary.json").is_file()
+                        || p.join("events.jsonl").is_file()
+                        || p.join("meta.json").is_file()
+                })
+                .or_else(|| {
+                    let arch = cache_dir().join("archive").join(&parent_id).join("record");
+                    (arch.join("summary.json").is_file()
+                        || arch.join("events.jsonl").is_file()
+                        || arch.join("meta.json").is_file())
                     .then_some(arch)
-            });
-        if let Some(pdir) = parent_dir {
+                });
+            let Some(pdir) = parent_dir else {
+                break;
+            };
             let psum = json(pdir.join("summary.json"));
             let psession = {
                 let ps = s(&psum, "session");
@@ -1601,8 +1710,11 @@ fn compute_tokens(
                         d[key] = json!((n(&tokens, key) - n(&pu, key)).max(0));
                     }
                     delta = Some(d);
+                    break;
                 }
             }
+            let pmeta = json(pdir.join("meta.json"));
+            parent_id = s(&pmeta, "parent").to_string();
         }
     }
     (tokens, delta)

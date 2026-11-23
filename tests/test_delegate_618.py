@@ -46,7 +46,7 @@ class Delegate618Tests(unittest.TestCase):
         self.assertIn(str(archive), result.stderr)
         self.assertIn(str(archive), self.cli("status", state["run"], human=True).stdout)
 
-    def test_archive_cap_prioritizes_references_and_skips_largest(self):
+    def test_archive_preserves_all_evidence_without_size_cap_and_status_warns_on_total_size(self):
         self.env["DELEGATE_ARCHIVE_MAX_BYTES"] = "10"
         repo = self.repo({"a.txt": "old\n", ".gitignore": ".local/\n"})
         state = self.run_tree(repo, "mkdir .local; printf 123456 > .local/ref; "
@@ -54,10 +54,20 @@ class Delegate618Tests(unittest.TestCase):
         result = self.cli("clean", "--json", state["run"])
         archive = Path(self.clean_outcome(result)["archive"])
         manifest = json.loads((archive / "manifest.json").read_text())
-        self.assertEqual(manifest["files"], [".local/ref", ".local/small"])
-        self.assertEqual(manifest["bytes"], 10)
-        self.assertEqual(manifest["skipped"][0]["path"], ".local/large")
-        self.assertIn("size cap", result.stderr)
+        self.assertEqual(manifest["files"], [".local/ref", ".local/small", ".local/large"])
+        self.assertEqual(manifest["bytes"], 19)
+        self.assertEqual(manifest["skipped"], [])
+        self.assertNotIn("size cap", result.stderr)
+
+        # Status surfaces an archive size anomaly warning when total archive size exceeds threshold.
+        self.env["DELEGATE_ARCHIVE_WARN_BYTES"] = "10"
+        st_human = self.cli("status", human=True)
+        self.assertEqual(st_human.returncode, 0, st_human.stderr)
+        self.assertIn("归档总量异常偏大", st_human.stdout)
+        st_json = self.cli("status")
+        summary_line = [json.loads(l) for l in st_json.stdout.splitlines() if "statusSummary" in l][-1]["statusSummary"]
+        self.assertTrue(summary_line["archiveSizeWarning"])
+        self.assertEqual(summary_line["archiveWarnBytes"], 10)
 
     def test_clean_no_archive_and_archive_copy_error_preserves_tree(self):
         repo = self.repo({"a.txt": "old\n", ".gitignore": ".local/\n"})

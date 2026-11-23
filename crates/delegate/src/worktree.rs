@@ -1064,10 +1064,100 @@ pub fn active_writes_on(top: &str, except: Option<&Path>) -> Vec<(String, bool)>
         })
         .collect()
 }
-/// Running write tasks on the same source (field notes 16): what each has
-/// changed so far, and which of those paths the new task's prompt names, so
-/// the caller can choose to serialize before the overlap becomes a conflict.
+fn is_hotspot_file(path: &str) -> bool {
+    if path.starts_with("migrations/") || path.contains("/migrations/") {
+        return true;
+    }
+    let base = path.rsplit('/').next().unwrap_or(path);
+    matches!(
+        base,
+        "Cargo.toml"
+            | "Cargo.lock"
+            | "CHANGELOG.md"
+            | "SKILL.md"
+            | "package.json"
+            | "pyproject.toml"
+            | "VERSION"
+            | "version.txt"
+            | "bin.sha256"
+    )
+}
+
+fn is_version_file(path: &str) -> bool {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    matches!(
+        base,
+        "Cargo.toml"
+            | "CHANGELOG.md"
+            | "SKILL.md"
+            | "package.json"
+            | "pyproject.toml"
+            | "VERSION"
+            | "version.txt"
+            | "bin.sha256"
+    )
+}
+
+fn mentions_standalone_digits(text: &str, digits: &str) -> bool {
+    if digits.is_empty() {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    text.match_indices(digits).any(|(at, _)| {
+        let before_ok = at == 0 || !bytes[at - 1].is_ascii_digit();
+        let after = at + digits.len();
+        let after_ok = after >= bytes.len() || !bytes[after].is_ascii_digit();
+        before_ok && after_ok
+    })
+}
+
+fn extract_semvers(text: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'.' {
+            continue;
+        }
+        i += 1;
+        let m_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == m_start || i >= bytes.len() || bytes[i] != b'.' {
+            continue;
+        }
+        i += 1;
+        let p_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == p_start {
+            continue;
+        }
+        let prev_ok = start == 0 || (!bytes[start - 1].is_ascii_digit() && bytes[start - 1] != b'.');
+        let next_ok = i >= bytes.len() || (!bytes[i].is_ascii_digit() && bytes[i] != b'.');
+        if prev_ok && next_ok {
+            out.insert(text[start..i].to_string());
+        }
+    }
+    out
+}
+
+/// Running and unapplied write tasks on the same source (field notes 16): what each has
+/// changed so far, which of those paths the new task's prompt names, and any hotspot
+/// (`migrations/`, `Cargo.toml`, `CHANGELOG.md`, version files) or version/migration number
+/// collisions, so the caller can serialize (`--after <run>`) before overlap becomes a conflict.
 pub fn concurrent_writes(created: &Path) -> Vec<Value> {
+    use std::collections::BTreeSet;
     let meta = json(created.join("meta.json"));
     if s(&meta, "mode") != "write" {
         return vec![];
@@ -1082,7 +1172,17 @@ pub fn concurrent_writes(created: &Path) -> Vec<Value> {
     if ours.is_empty() {
         return vec![];
     }
-    let prompt = read(created.join("prompt.md"));
+    let extracted_prompt = crate::history::extract_user_prompt(created, &meta);
+    let prompt = if !extracted_prompt.trim().is_empty() {
+        extracted_prompt
+    } else {
+        read(created.join("prompt.md"))
+    };
+    let prompt_lower = prompt.to_lowercase();
+    let our_versions = extract_semvers(&prompt);
+    let prompt_mentions_migrations = prompt_lower.contains("migrations/")
+        || prompt_lower.contains("migration")
+        || prompt.contains("迁移");
     let generic = [
         "mod.rs",
         "lib.rs",
@@ -1090,49 +1190,188 @@ pub fn concurrent_writes(created: &Path) -> Vec<Value> {
         "index.ts",
         "index.tsx",
         "README.md",
-        "Cargo.toml",
-        "package.json",
     ];
     let named = |path: &str| {
         let base = path.rsplit('/').next().unwrap_or(path);
         prompt.contains(path)
+            || (is_hotspot_file(path) && prompt.contains(base))
             || (base.len() >= 8
                 && base.contains('.')
                 && !generic.contains(&base)
                 && prompt.contains(base))
     };
+
+    let all = crate::runs::all_runs();
+    let superseded_parents: BTreeSet<String> = all
+        .iter()
+        .filter_map(|r| {
+            let p = s(&json(r.join("meta.json")), "parent").to_string();
+            (!p.is_empty()).then_some(p)
+        })
+        .collect();
+
     let mut found = vec![];
-    for other in crate::runs::all_runs() {
-        if other == created || !crate::runs::active(&crate::runs::state(&other)) {
+    for other in all {
+        if other == created {
             continue;
         }
+        let state = crate::runs::state(&other);
+        let is_active = crate::runs::active(&state);
         let theirs = json(other.join("meta.json"));
         if s(&theirs, "mode") != "write" || source_of(&theirs) != ours {
+            continue;
+        }
+        let other_id = other
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let is_unapplied = !is_active
+            && !other.join(".applied").exists()
+            && !other.join(".applied-cleaned").exists()
+            && !b(&theirs, "appliedCleaned")
+            && !superseded_parents.contains(&other_id)
+            && matches!(
+                state.as_str(),
+                "delivered" | "answered" | "rejected" | "stalled" | "timeout" | "malformed"
+            );
+        if !is_active && !is_unapplied {
             continue;
         }
         let top = Some(s(&theirs["worktree"], "path"))
             .filter(|x| !x.is_empty())
             .unwrap_or(s(&theirs, "top"));
         let base = s(&theirs, "chainBase");
-        let changed = if base.is_empty() {
-            vec![]
+        let changed = if is_active {
+            if base.is_empty() {
+                vec![]
+            } else {
+                snapshot(Path::new(top), &other, &strings(&theirs["snapshotExclude"]))
+                    .and_then(|now| {
+                        tree_changes(Path::new(top), &json!({"tree":base}), &now, false).ok()
+                    })
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|c| s(c, "path").to_string())
+                    .collect::<Vec<_>>()
+            }
         } else {
-            snapshot(Path::new(top), &other, &strings(&theirs["snapshotExclude"]))
-                .and_then(|now| {
-                    tree_changes(Path::new(top), &json!({"tree":base}), &now, false).ok()
-                })
-                .unwrap_or_default()
-                .iter()
-                .map(|c| s(c, "path").to_string())
-                .collect::<Vec<_>>()
+            let sum_files = strings(&json(other.join("summary.json"))["files"]);
+            if !sum_files.is_empty() {
+                sum_files
+            } else {
+                let ch_files = strings(&json(other.join("changes.json"))["files"]);
+                if !ch_files.is_empty() {
+                    ch_files
+                } else if !base.is_empty() && Path::new(top).is_dir() {
+                    snapshot(Path::new(top), &other, &strings(&theirs["snapshotExclude"]))
+                        .and_then(|now| {
+                            tree_changes(Path::new(top), &json!({"tree":base}), &now, false).ok()
+                        })
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|c| s(c, "path").to_string())
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![]
+                }
+            }
         };
+        if is_unapplied && changed.is_empty() {
+            continue;
+        }
         let mentioned = changed
             .iter()
             .filter(|p| named(p))
             .cloned()
             .collect::<Vec<_>>();
-        let mut entry = json!({"name":s(&theirs,"name"),"run":other.file_name().unwrap_or_default().to_string_lossy(),
-            "changed":changed.len(),"sample":changed.iter().take(5).collect::<Vec<_>>(),"named":mentioned});
+
+        let mut collisions = Vec::<String>::new();
+        let mut seen_coll = BTreeSet::<String>::new();
+        let mut push_coll = |msg: String| {
+            if seen_coll.insert(msg.clone()) {
+                collisions.push(msg);
+            }
+        };
+
+        // 1. Migration / numbered-file prefix collisions.
+        let mut saw_migration_dir = false;
+        for p in &changed {
+            let in_mig = p.starts_with("migrations/") || p.contains("/migrations/");
+            if let Some((dir, prefix)) = numbered_prefix(p) {
+                if mentions_standalone_digits(&prompt, &prefix) {
+                    push_coll(format!("同占编号 {dir}/{prefix}"));
+                    if in_mig {
+                        saw_migration_dir = true;
+                    }
+                } else if in_mig && prompt_mentions_migrations {
+                    push_coll(format!("同触 {dir}/（已占 {prefix}）"));
+                    saw_migration_dir = true;
+                }
+            } else if in_mig && prompt_mentions_migrations && !saw_migration_dir {
+                push_coll("同触 migrations/".to_string());
+                saw_migration_dir = true;
+            }
+        }
+
+        // 2. Shared version number (semver) across prompt / version files / patch.
+        if !our_versions.is_empty() {
+            let mut their_versions = BTreeSet::new();
+            let their_prompt = crate::history::extract_user_prompt(&other, &theirs);
+            their_versions.extend(extract_semvers(&their_prompt));
+            let patch_path = other.join("changes.patch");
+            if let Ok(bytes) = fs::read(&patch_path) {
+                let sample = String::from_utf8_lossy(&bytes[..bytes.len().min(256 * 1024)]);
+                their_versions.extend(extract_semvers(&sample));
+            }
+            if Path::new(top).is_dir() {
+                for p in &changed {
+                    if is_version_file(p) {
+                        let fp = Path::new(top).join(p);
+                        if let Ok(bytes) = fs::read(&fp) {
+                            let sample =
+                                String::from_utf8_lossy(&bytes[..bytes.len().min(128 * 1024)]);
+                            their_versions.extend(extract_semvers(&sample));
+                        }
+                    }
+                }
+            }
+            for ver in our_versions.intersection(&their_versions) {
+                push_coll(format!("同占版本号 {ver}"));
+            }
+        }
+
+        // 3. Active run that hasn't written files yet: check shared hotspot keywords in prompts.
+        if is_active && changed.is_empty() {
+            let their_prompt = crate::history::extract_user_prompt(&other, &theirs);
+            let their_lower = their_prompt.to_lowercase();
+            for hot in ["CHANGELOG.md", "Cargo.toml", "SKILL.md", "package.json", "migrations/"] {
+                if prompt.contains(hot) && their_prompt.contains(hot) {
+                    push_coll(format!("同触热点 {hot}"));
+                }
+            }
+            if prompt_mentions_migrations
+                && (their_lower.contains("migrations/")
+                    || their_lower.contains("migration")
+                    || their_prompt.contains("迁移"))
+            {
+                push_coll("同触 migrations/".to_string());
+            }
+        }
+
+        if is_unapplied && mentioned.is_empty() && collisions.is_empty() {
+            continue;
+        }
+
+        let mut entry = json!({
+            "name": s(&theirs, "name"),
+            "run": other_id,
+            "status": if is_active { "running" } else { "unapplied" },
+            "changed": changed.len(),
+            "sample": changed.iter().take(5).collect::<Vec<_>>(),
+            "named": mentioned,
+            "collisions": collisions,
+        });
         if theirs["protect"].as_array().is_some_and(|p| !p.is_empty()) {
             entry["protect"] = theirs["protect"].clone();
         }

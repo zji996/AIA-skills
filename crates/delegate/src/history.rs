@@ -47,6 +47,7 @@ pub struct HistoryEntry {
     pub applied_head: String,
     pub applied_by: String,
     pub tokens: Value,
+    pub tokens_delta: Value,
     pub elapsed_seconds: i64,
     pub rework_count: u64,
     pub archive: String,
@@ -55,6 +56,15 @@ pub struct HistoryEntry {
 }
 
 impl HistoryEntry {
+    /// Canonical per-run incremental token usage (`tokensDelta` when present, else `tokens`).
+    pub fn effective_tokens(&self) -> &Value {
+        if self.tokens_delta.as_object().is_some_and(|o| !o.is_empty()) {
+            &self.tokens_delta
+        } else {
+            &self.tokens
+        }
+    }
+
     fn sort_ts(&self) -> i64 {
         iso_epoch(&self.started_at)
             .or_else(|| iso_epoch(&self.finished_at))
@@ -137,6 +147,9 @@ impl HistoryEntry {
         }
         if self.tokens.is_object() && !self.tokens.as_object().unwrap().is_empty() {
             obj.insert("tokens".into(), self.tokens.clone());
+        }
+        if self.tokens_delta.is_object() && !self.tokens_delta.as_object().unwrap().is_empty() {
+            obj.insert("tokensDelta".into(), self.tokens_delta.clone());
         }
         if self.elapsed_seconds > 0 {
             obj.insert("elapsedSeconds".into(), json!(self.elapsed_seconds));
@@ -631,6 +644,9 @@ fn build_finish_record(run: &Path) -> Option<(String, Value)> {
     if sum["tokens"].is_object() && !sum["tokens"].as_object().unwrap().is_empty() {
         rec.insert("tokens".into(), sum["tokens"].clone());
     }
+    if sum["tokensDelta"].is_object() && !sum["tokensDelta"].as_object().unwrap().is_empty() {
+        rec.insert("tokensDelta".into(), sum["tokensDelta"].clone());
+    }
     if n(&sum, "elapsedSeconds") > 0 {
         rec.insert("elapsedSeconds".into(), json!(n(&sum, "elapsedSeconds")));
     }
@@ -883,6 +899,9 @@ fn load_entries_from_text(content: &str) -> Vec<HistoryEntry> {
                 }
                 if v["tokens"].is_object() {
                     entry.tokens = v["tokens"].clone();
+                }
+                if v["tokensDelta"].is_object() {
+                    entry.tokens_delta = v["tokensDelta"].clone();
                 }
                 if n(&v, "elapsedSeconds") > 0 {
                     entry.elapsed_seconds = n(&v, "elapsedSeconds");
@@ -1557,10 +1576,23 @@ pub fn history_command(args: &[String]) -> Res<i32> {
         let model_label =
             compact_model_label(&entry.agent, &entry.model, &entry.model_name, &entry.tier);
         let changes_label = compact_changes_label(entry);
-        println!(
-            "{time_str} · {clean_name} · {st_label} · {model_label} · {changes_label} · delegate show {}",
-            entry.run
-        );
+        let tok_str = format_tokens(entry.effective_tokens());
+        if tok_str.is_empty() {
+            println!(
+                "{time_str} · {clean_name} · {st_label} · {model_label} · {changes_label} · delegate show {}",
+                entry.run
+            );
+        } else {
+            let tok_suffix = if entry.tokens_delta.as_object().is_some_and(|o| !o.is_empty()) {
+                "（增量）"
+            } else {
+                ""
+            };
+            println!(
+                "{time_str} · {clean_name} · {st_label} · {model_label} · {changes_label} · tokens {tok_str}{tok_suffix} · delegate show {}",
+                entry.run
+            );
+        }
     }
     Ok(0)
 }
@@ -1841,6 +1873,7 @@ pub fn show_command(args: &[String]) -> Res<i32> {
         applied_head,
         applied_by,
         tokens,
+        tokens_delta,
         elapsed_seconds,
         rework_count,
         source_root,
@@ -1933,6 +1966,7 @@ pub fn show_command(args: &[String]) -> Res<i32> {
             applied_head,
             applied_by,
             sum["tokens"].clone(),
+            sum["tokensDelta"].clone(),
             n(&sum, "elapsedSeconds"),
             rework,
             source_root_for_meta(&meta),
@@ -1976,6 +2010,7 @@ pub fn show_command(args: &[String]) -> Res<i32> {
             h.applied_head.clone(),
             h.applied_by.clone(),
             h.tokens.clone(),
+            h.tokens_delta.clone(),
             h.elapsed_seconds,
             h.rework_count,
             src,
@@ -2002,7 +2037,7 @@ pub fn show_command(args: &[String]) -> Res<i32> {
         if archive_alive {
             next.insert("archive".into(), json!(archive_path));
         }
-        let out = json!({
+        let mut out = json!({
             "run": run_id,
             "name": name,
             "mode": mode,
@@ -2033,6 +2068,9 @@ pub fn show_command(args: &[String]) -> Res<i32> {
             "originalExpired": original_expired,
             "next": Value::Object(next),
         });
+        if tokens_delta.as_object().is_some_and(|o| !o.is_empty()) {
+            out["tokensDelta"] = tokens_delta;
+        }
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
         return Ok(0);
     }
@@ -2049,9 +2087,15 @@ pub fn show_command(args: &[String]) -> Res<i32> {
     if !elapsed_str.is_empty() {
         header.push(format!("耗时 {elapsed_str}"));
     }
-    let tok_str = format_tokens(&tokens);
+    let has_delta = tokens_delta.as_object().is_some_and(|o| !o.is_empty());
+    let display_tokens = if has_delta { &tokens_delta } else { &tokens };
+    let tok_str = format_tokens(display_tokens);
     if !tok_str.is_empty() {
-        header.push(format!("tokens {tok_str}"));
+        if has_delta {
+            header.push(format!("tokens {tok_str}（本轮增量）"));
+        } else {
+            header.push(format!("tokens {tok_str}"));
+        }
     }
     if rework_count > 0 {
         header.push(format!("返工 {rework_count}"));

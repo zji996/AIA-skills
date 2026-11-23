@@ -322,7 +322,25 @@ fn hint_undelivered_other_runs(created: &Path) {
 
 fn hint_concurrent_writes(created: &Path) {
     for other in worktree::concurrent_writes(created) {
-        let named = other["named"].as_array().map_or(0, Vec::len);
+        let run_id = s(&other, "run");
+        let name = s(&other, "name");
+        let status = s(&other, "status");
+        let named_list = other["named"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let collisions = other["collisions"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let files = other["sample"]
             .as_array()
             .map(|a| {
@@ -332,32 +350,48 @@ fn hint_concurrent_writes(created: &Path) {
                     .join(", ")
             })
             .unwrap_or_default();
-        eprintln!(
-            "delegate: {} write task {} is running on this source ({} files changed so far{}){}",
-            if named > 0 { "overlap:" } else { "note:" },
-            s(&other, "name"),
-            other["changed"],
-            if files.is_empty() {
-                String::new()
-            } else {
-                format!(": {files}")
-            },
-            if named > 0 {
-                format!(
-                    "; this prompt names {named} of them ({}): consider waiting for {} or using --protect",
-                    other["named"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    s(&other, "name")
-                )
-            } else {
-                String::new()
+        let files_part = if files.is_empty() {
+            String::new()
+        } else {
+            format!(": {files}")
+        };
+        let coll_part = if collisions.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", collisions.join("、"))
+        };
+        if status == "unapplied" {
+            let mut reasons = Vec::new();
+            if !named_list.is_empty() {
+                reasons.push(format!("同文件 {}", named_list.join(", ")));
             }
-        );
+            if !collisions.is_empty() {
+                reasons.push(collisions.join("、"));
+            }
+            eprintln!(
+                "delegate: overlap: unapplied write task {name} ({run_id}) on this source ({} files changed{files_part}; {}): consider applying it first or queueing with delegate queue add … --after {run_id}",
+                other["changed"],
+                reasons.join("；")
+            );
+        } else if !named_list.is_empty() {
+            eprintln!(
+                "delegate: overlap: write task {name} is running on this source ({} files changed so far{files_part}); this prompt names {} of them ({}){coll_part}: consider waiting for {name}, using --protect, or queueing with --after {run_id}",
+                other["changed"],
+                named_list.len(),
+                named_list.join(", ")
+            );
+        } else if !collisions.is_empty() {
+            eprintln!(
+                "delegate: overlap: write task {name} ({run_id}) is running on this source ({} files changed so far{files_part}; {}): consider waiting for {name} or queueing with delegate queue add … --after {run_id}",
+                other["changed"],
+                collisions.join("、")
+            );
+        } else {
+            eprintln!(
+                "delegate: note: write task {name} is running on this source ({} files changed so far{files_part})",
+                other["changed"]
+            );
+        }
     }
 }
 
@@ -2784,6 +2818,8 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     "archiveBytes": arch_usage.bytes,
                     "archiveCount": arch_usage.count,
                     "archiveFsCritical": arch_usage.fs_critical,
+                    "archiveSizeWarning": arch_usage.size_warning,
+                    "archiveWarnBytes": arch_usage.warn_bytes,
                     "history": "delegate history"
                 });
                 if let Some(ref plan) = concurrency_plan {
@@ -2826,10 +2862,17 @@ fn main_inner(args: &[String]) -> Res<i32> {
                         format_bytes(arch_usage.bytes),
                         arch_usage.count
                     );
+                    if arch_usage.size_warning {
+                        arch_text.push_str(&format!(
+                            "（归档总量异常偏大，超过阈值 {}，位于 {}）",
+                            format_bytes(arch_usage.warn_bytes),
+                            cache_dir().join("archive").display()
+                        ));
+                    }
                     if arch_usage.fs_critical {
                         if let Some(avail) = arch_usage.fs_avail_bytes {
                             arch_text.push_str(&format!(
-                                "（文件系统剩余仅 {}，将按最久未读清理事件日志）",
+                                "（文件系统剩余仅 {}，将按最久未读清理可重建字节）",
                                 format_bytes(avail)
                             ));
                         }

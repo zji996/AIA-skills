@@ -13,7 +13,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
-pub const DEFAULT_ARCHIVE_MAX_BYTES: u64 = 200 * 1024 * 1024;
+/// Default total-archive size anomaly warning threshold for `status` and `board` (5 GiB).
+/// Configurable via `DELEGATE_ARCHIVE_WARN_GIB` (`0` disables) or `DELEGATE_ARCHIVE_WARN_BYTES`.
+/// Archives have no hard cap: files are never skipped by size during preservation.
+pub const DEFAULT_ARCHIVE_WARN_GIB: f64 = 5.0;
 /// Filesystem critical-space watermark (aligned with disk-pressure warning policy):
 /// free space below 10 GiB or below 5% of total filesystem capacity.
 pub const ARCHIVE_FS_CRITICAL_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
@@ -25,6 +28,8 @@ pub struct ArchiveUsage {
     pub count: usize,
     pub fs_avail_bytes: Option<u64>,
     pub fs_critical: bool,
+    pub warn_bytes: u64,
+    pub size_warning: bool,
 }
 
 fn build_path(path: &str) -> bool {
@@ -219,6 +224,22 @@ pub fn refresh_usage_cache() -> (u64, usize) {
     (bytes, count)
 }
 
+fn archive_warn_bytes() -> u64 {
+    if let Ok(v) = setting("ARCHIVE_WARN_BYTES", "").parse::<u64>() {
+        return v;
+    }
+    let gib = setting("ARCHIVE_WARN_GIB", &format!("{DEFAULT_ARCHIVE_WARN_GIB}"))
+        .parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .unwrap_or(DEFAULT_ARCHIVE_WARN_GIB);
+    if gib <= 0.0 {
+        0
+    } else {
+        (gib * (1024.0 * 1024.0 * 1024.0)) as u64
+    }
+}
+
 /// Strictly read-only archive usage check: reads atomic `.usage.json` cache when present,
 /// falling back to an in-memory scan without writing if the cache is missing or corrupt.
 pub fn usage() -> ArchiveUsage {
@@ -236,11 +257,15 @@ pub fn usage() -> ArchiveUsage {
         ),
         None => (None, false),
     };
+    let warn_bytes = archive_warn_bytes();
+    let size_warning = warn_bytes > 0 && bytes >= warn_bytes;
     ArchiveUsage {
         bytes,
         count,
         fs_avail_bytes,
         fs_critical,
+        warn_bytes,
+        size_warning,
     }
 }
 
@@ -352,32 +377,20 @@ pub fn preserve(run: &Path) -> Res<Option<PathBuf>> {
             }
         }
         if !candidates.is_empty() {
-            // Retain referenced evidence first; within each class drop largest files first.
+            // Keep all candidate evidence files without any per-run size hard cap;
+            // referenced evidence is ordered first and disk pressure is handled solely by
+            // `prune_if_fs_critical` (which trims only reconstructible bytes).
             candidates.sort();
-            let cap = setting("ARCHIVE_MAX_BYTES", &DEFAULT_ARCHIVE_MAX_BYTES.to_string())
-                .parse::<u64>()
-                .unwrap_or(DEFAULT_ARCHIVE_MAX_BYTES);
             kept.clear();
             skipped.clear();
             bytes = 0;
             for (_, size, name) in candidates {
-                if size > cap.saturating_sub(bytes) {
-                    skipped.push(json!({"path":name,"bytes":size,"reason":"per-run size cap"}));
-                    continue;
-                }
                 let dest = archive.join("files").join(&name);
                 fs::create_dir_all(dest.parent().ok_or("archive path has no parent")?)
                     .map_err(|e| e.to_string())?;
                 fs::copy(top.join(&name), dest).map_err(|e| format!("archive {name}: {e}"))?;
-                bytes += size;
+                bytes = bytes.saturating_add(size);
                 kept.push(name);
-            }
-            if !skipped.is_empty() {
-                eprintln!(
-                    "delegate: archive size cap: skipped {} file(s); see {}/manifest.json",
-                    skipped.len(),
-                    archive.display()
-                );
             }
         }
     }

@@ -2813,7 +2813,7 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
     let rule_count = risks.iter().filter(|r| r.source.contains("规则")).count();
     let rev_count = risks.iter().filter(|r| r.source.contains("审查员")).count();
 
-    Ok(json!({
+    let mut card_doc = json!({
         "run": run_id,
         "name": name,
         "state": state,
@@ -2843,7 +2843,14 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
         "accept": accept_val,
         "otherChanges": other_changes,
         "next": next_cmds,
-    }))
+    });
+    if sum["tokens"].as_object().is_some_and(|o| !o.is_empty()) {
+        card_doc["tokens"] = sum["tokens"].clone();
+    }
+    if sum["tokensDelta"].as_object().is_some_and(|o| !o.is_empty()) {
+        card_doc["tokensDelta"] = sum["tokensDelta"].clone();
+    }
+    Ok(card_doc)
 }
 
 /// Compute and persist `run/card.json` + compact `sum["card"]` during supervisor settlement.
@@ -2931,7 +2938,23 @@ pub fn render_card_human(card: &Value) -> String {
     } else {
         "未启用".into()
     };
-    out.push(format!("验收：{accept_line} · 审查：{review_head}"));
+    let has_delta = card["tokensDelta"]
+        .as_object()
+        .is_some_and(|o| !o.is_empty());
+    let tok_str = runs::effective_tokens_delta(card)
+        .map(|t| runs::format_tokens_usage(&t))
+        .unwrap_or_default();
+    if tok_str.is_empty() {
+        out.push(format!("验收：{accept_line} · 审查：{review_head}"));
+    } else if has_delta {
+        out.push(format!(
+            "验收：{accept_line} · 审查：{review_head} · 用量 {tok_str}（本轮增量）"
+        ));
+    } else {
+        out.push(format!(
+            "验收：{accept_line} · 审查：{review_head} · 用量 {tok_str}"
+        ));
+    }
     if card["premerge"].is_object() {
         let pm = &card["premerge"];
         let pm_st = s(pm, "status");

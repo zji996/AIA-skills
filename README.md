@@ -132,7 +132,8 @@ cd AIA-skills
 ### 版本与发布
 
 - 每个技能的 `metadata.version` 按语义化版本维护：只改文档写法升修订号，新增能力升次版本号，命令、参数或文件格式不兼容时升主版本号。
-- 改动记入 [CHANGELOG.md](CHANGELOG.md) 的"未发布"一节；发布时把它改成版本号和日期，提交后打 `git tag vX.Y.Z`。
+- **版本号延迟分配**：开发与委派同事不改 `SKILL.md` / `Cargo.toml` / `Cargo.lock` 的版本号，只把改动条目追加到 [CHANGELOG.md](CHANGELOG.md) 顶部的 `## Unreleased` 段（`- \`<技能>\`：...`），避免并发任务互撞版本号。
+- 主控发版时运行 `./scripts/release-binary.sh bump <技能> <X.Y.Z|patch|minor|major>` 统一更新 `SKILL.md`、关联 crate 的 `Cargo.toml`/`Cargo.lock` 并把 `## Unreleased` 落成版本段；带二进制的技能再依次执行 `build`、提交并推送、`publish`；全仓发版可再打 `git tag vX.Y.Z`。
 - 拷贝安装的机器更新到某个版本：`git checkout vX.Y.Z && ./scripts/install.sh --copy`。
 
 ### 验证
