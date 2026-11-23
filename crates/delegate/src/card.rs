@@ -660,6 +660,97 @@ fn has_sql_ddl(line: &str) -> bool {
     .any(|kw| up.contains(kw))
 }
 
+fn is_lockfile_self_version_only(file: &DiffFile) -> bool {
+    if file.is_new || file.is_deleted || file.hunks.is_empty() {
+        return false;
+    }
+    let lower = file.path.to_ascii_lowercase();
+    let is_toml_lock = lower.ends_with("cargo.lock")
+        || lower.ends_with("uv.lock")
+        || lower.ends_with("poetry.lock");
+    let is_pkg_lock = lower.ends_with("package-lock.json");
+    if !is_toml_lock && !is_pkg_lock {
+        return false;
+    }
+
+    let is_toml_version_line = |line: &str| -> bool {
+        let t = line.trim();
+        let Some((k, v)) = t.split_once('=') else {
+            return false;
+        };
+        k.trim() == "version" && {
+            let vt = v.trim();
+            vt.len() >= 2 && vt.starts_with('"') && vt.ends_with('"')
+        }
+    };
+    let is_json_version_line = |line: &str| -> bool {
+        let t = line.trim().trim_end_matches(',');
+        let Some((k, v)) = t.split_once(':') else {
+            return false;
+        };
+        k.trim() == "\"version\"" && {
+            let vt = v.trim();
+            vt.len() >= 2 && vt.starts_with('"') && vt.ends_with('"')
+        }
+    };
+
+    let mut add_count = 0usize;
+    let mut del_count = 0usize;
+
+    for hunk in &file.hunks {
+        let mut hunk_has_change = false;
+        for (idx, l) in hunk.lines.iter().enumerate() {
+            if l.kind == DiffLineKind::Context {
+                continue;
+            }
+            hunk_has_change = true;
+            if is_toml_lock {
+                if !is_toml_version_line(&l.text) {
+                    return false;
+                }
+                // External registry/git packages in Cargo.lock/uv.lock have `source =` or
+                // `checksum =` inside the same `[[package]]` block. Local workspace/self packages do not.
+                for ctx in hunk.lines[idx + 1..].iter() {
+                    let ct = ctx.text.trim();
+                    if ct.is_empty() || ct.starts_with("[[") {
+                        break;
+                    }
+                    if ct.starts_with("source =")
+                        || ct.starts_with("source=")
+                        || ct.starts_with("checksum =")
+                        || ct.starts_with("checksum=")
+                    {
+                        return false;
+                    }
+                }
+            } else if is_pkg_lock {
+                if !is_json_version_line(&l.text) {
+                    return false;
+                }
+                for ctx in hunk.lines[idx + 1..].iter() {
+                    let ct = ctx.text.trim();
+                    if ct == "}" || ct == "}," {
+                        break;
+                    }
+                    if ct.starts_with("\"resolved\":") || ct.starts_with("\"integrity\":") {
+                        return false;
+                    }
+                }
+            }
+            match l.kind {
+                DiffLineKind::Add => add_count += 1,
+                DiffLineKind::Del => del_count += 1,
+                DiffLineKind::Context => {}
+            }
+        }
+        if !hunk_has_change {
+            return false;
+        }
+    }
+
+    add_count > 0 && add_count == del_count
+}
+
 fn is_comment_line(trimmed: &str) -> bool {
     trimmed.starts_with("//")
         || trimmed.starts_with("/*")
@@ -668,27 +759,164 @@ fn is_comment_line(trimmed: &str) -> bool {
         || (trimmed.starts_with("# ") || trimmed == "#")
 }
 
-fn is_skip_or_ignore_marker(line: &str) -> Option<&'static str> {
+/// Strip quoted string literals so keywords/numbers inside strings do not trigger code rules.
+/// Preserves Rust lifetimes like `'static` / `'a` when `preserve_single_quotes` is true.
+fn strip_string_literals(line: &str, preserve_single_quotes: bool) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            out.push(' ');
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+        } else if b == b'\'' {
+            if preserve_single_quotes {
+                // Skip only Rust char literals like `'x'` or `'\n'`, keep lifetimes like `'static`.
+                if i + 2 < bytes.len() && bytes[i + 1] != b'\\' && bytes[i + 2] == b'\'' {
+                    out.push(' ');
+                    i += 3;
+                } else if i + 3 < bytes.len() && bytes[i + 1] == b'\\' && bytes[i + 3] == b'\'' {
+                    out.push(' ');
+                    i += 4;
+                } else {
+                    out.push('\'');
+                    i += 1;
+                }
+            } else {
+                out.push(' ');
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+        } else if b == b'`' && !preserve_single_quotes {
+            out.push(' ');
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'`' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+        } else {
+            let ch = line[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+fn has_token_prefix(code: &str, needle: &str) -> bool {
+    let bytes = code.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = code[start..].find(needle) {
+        let abs = start + pos;
+        let prev_ok = abs == 0
+            || !(bytes[abs - 1].is_ascii_alphanumeric()
+                || bytes[abs - 1] == b'_'
+                || bytes[abs - 1] == b'.');
+        if prev_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
+}
+
+fn is_skip_or_ignore_marker(path: &str, line: &str) -> Option<&'static str> {
     let trimmed = line.trim();
     if is_comment_line(trimmed) {
         return None;
     }
-    for (needle, label) in [
-        ("#[ignore", "#[ignore]"),
-        ("test.skip(", "test.skip"),
-        ("it.skip(", "it.skip"),
-        ("describe.skip(", "describe.skip"),
-        ("xit(", "xit"),
-        ("xtest(", "xtest"),
-        ("xdescribe(", "xdescribe"),
-        ("@pytest.mark.skip", "@pytest.mark.skip"),
-        ("@unittest.skip", "@unittest.skip"),
-        ("t.Skip(", "t.Skip"),
-        ("t.SkipNow(", "t.SkipNow"),
-    ] {
-        if trimmed.contains(needle) {
-            return Some(label);
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".rs") {
+        let code = strip_string_literals(trimmed, true);
+        let bytes = code.as_bytes();
+        let mut start = 0;
+        while let Some(pos) = code[start..].find("#[ignore") {
+            let abs = start + pos;
+            let after = abs + "#[ignore".len();
+            let next_ok = bytes
+                .get(after)
+                .is_some_and(|&b| matches!(b, b']' | b'=' | b'(' | b' ' | b'\t'));
+            if next_ok {
+                return Some("#[ignore]");
+            }
+            start = abs + 1;
         }
+        return None;
+    }
+    if lower.ends_with(".py") {
+        if trimmed.starts_with("@pytest.mark.skip") {
+            return Some("@pytest.mark.skip");
+        }
+        if trimmed.starts_with("@unittest.skip") {
+            return Some("@unittest.skip");
+        }
+        return None;
+    }
+    if lower.ends_with(".js")
+        || lower.ends_with(".jsx")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".tsx")
+        || lower.ends_with(".mjs")
+        || lower.ends_with(".cjs")
+        || lower.ends_with(".mts")
+        || lower.ends_with(".cts")
+    {
+        let code = strip_string_literals(trimmed, false);
+        for (needle, label) in [
+            ("test.skip(", "test.skip"),
+            ("it.skip(", "it.skip"),
+            ("describe.skip(", "describe.skip"),
+            ("xit(", "xit"),
+            ("xtest(", "xtest"),
+            ("xdescribe(", "xdescribe"),
+        ] {
+            if has_token_prefix(&code, needle) {
+                return Some(label);
+            }
+        }
+        return None;
+    }
+    if lower.ends_with(".go") {
+        let code = strip_string_literals(trimmed, false);
+        for (needle, label) in [
+            ("t.Skip(", "t.Skip"),
+            ("t.SkipNow(", "t.SkipNow"),
+            ("t.Skipf(", "t.Skipf"),
+        ] {
+            if has_token_prefix(&code, needle) {
+                return Some(label);
+            }
+        }
+        return None;
     }
     None
 }
@@ -830,7 +1058,7 @@ fn contains_numeric_literal(s: &str) -> bool {
     let bytes = s.as_bytes();
     for i in 0..bytes.len() {
         if bytes[i].is_ascii_digit() {
-            let prev_ok = i == 0 || !bytes[i - 1].is_ascii_alphabetic() && bytes[i - 1] != b'_';
+            let prev_ok = i == 0 || (!bytes[i - 1].is_ascii_alphabetic() && bytes[i - 1] != b'_');
             if prev_ok {
                 return true;
             }
@@ -839,72 +1067,161 @@ fn contains_numeric_literal(s: &str) -> bool {
     false
 }
 
+/// Split an expression into lowercase identifier words (handling snake_case and camelCase),
+/// ignoring `.min(` / `.max(` method calls such as `7.min(len)` or `len.max(1)`.
+fn find_config_keyword(text: &str) -> Option<&'static str> {
+    const CONFIG_KEYWORDS: &[&str] = &[
+        "timeout",
+        "limit",
+        "max",
+        "default",
+        "threshold",
+        "budget",
+        "cap",
+        "pool",
+        "interval",
+        "retries",
+        "retry",
+        "port",
+        "concurrency",
+        "workers",
+        "quota",
+        "ttl",
+        "delay",
+        "backoff",
+    ];
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic() {
+            let start = i;
+            let preceded_by_dot = start > 0 && bytes[start - 1] == b'.';
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let followed_by_paren = bytes.get(i) == Some(&b'(');
+            let token = &text[start..i];
+            // Skip method calls like `.min(len)` / `.max(1)` — slicing/clamping, not config names.
+            if preceded_by_dot && followed_by_paren && matches!(token, "min" | "max") {
+                continue;
+            }
+            // Split snake_case and camelCase into words.
+            for part in token.split('_').filter(|p| !p.is_empty()) {
+                let mut wstart = 0;
+                let pbytes = part.as_bytes();
+                for j in 1..=pbytes.len() {
+                    let boundary = j == pbytes.len()
+                        || (pbytes[j].is_ascii_uppercase()
+                            && pbytes[j - 1].is_ascii_lowercase());
+                    if boundary {
+                        let word = part[wstart..j].to_ascii_lowercase();
+                        if let Some(kw) = CONFIG_KEYWORDS.iter().find(|&&k| k == word) {
+                            return Some(kw);
+                        }
+                        wstart = j;
+                    }
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn is_const_or_static_decl(trimmed: &str) -> bool {
+    let rest = if let Some(r) = trimmed.strip_prefix("pub") {
+        let r = r.trim_start();
+        if let Some(after_paren) = r.strip_prefix('(') {
+            match after_paren.find(')') {
+                Some(idx) => after_paren[idx + 1..].trim_start(),
+                None => return false,
+            }
+        } else if r.len() < trimmed.len() - 3 {
+            r
+        } else {
+            return false;
+        }
+    } else if let Some(r) = trimmed.strip_prefix("export ") {
+        r.trim_start()
+    } else {
+        trimmed
+    };
+    rest.starts_with("const ") || rest.starts_with("static ")
+}
+
+fn call_arg_has_numeric_literal(code: &str, needle: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(pos) = code[search_from..].find(needle) {
+        let arg_start = search_from + pos + needle.len();
+        search_from = arg_start;
+        let bytes = code.as_bytes();
+        let mut depth = 1usize;
+        let mut i = arg_start;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            if depth > 0 {
+                i += 1;
+            }
+        }
+        let arg = &code[arg_start..i];
+        if contains_numeric_literal(arg) {
+            return true;
+        }
+    }
+    false
+}
+
 fn config_constant_hit(path: &str, line: &str) -> Option<String> {
-    if is_markdown_or_doc(path) || is_lockfile(path) {
+    if is_markdown_or_doc(path) || is_lockfile(path) || is_test_path(path) {
         return None;
     }
     let trimmed = line.trim();
     if trimmed.is_empty() || is_comment_line(trimmed) {
         return None;
     }
-    if !contains_numeric_literal(trimmed) {
-        return None;
-    }
     let lower = path.to_ascii_lowercase();
+    let is_rust = lower.ends_with(".rs");
     let is_config_file = lower.ends_with(".json")
         || lower.ends_with(".toml")
         || lower.ends_with(".yaml")
         || lower.ends_with(".yml")
         || lower.ends_with(".env");
 
-    const LIMIT_HINTS: &[&str] = &[
-        "max",
-        "min",
-        "limit",
-        "timeout",
-        "budget",
-        "cap",
-        "pool",
-        "threshold",
-        "interval",
-        "retries",
-        "retry",
-        "default",
-        "size",
-        "port",
-        "concurrency",
-        "workers",
-        "quota",
-        "ttl",
-        "window",
-        "rate",
-        "delay",
-        "backoff",
-        "bytes",
-        "chars",
-        "lines",
-        "seconds",
-        "millis",
-        "ms",
-    ];
-
-    if is_config_file && !is_test_path(path) {
-        let lower_line = trimmed.to_ascii_lowercase();
-        if let Some(kw) = LIMIT_HINTS.iter().find(|k| lower_line.contains(**k)) {
+    if is_config_file {
+        let code = strip_string_literals(trimmed, false);
+        if !contains_numeric_literal(&code) {
+            return None;
+        }
+        if let Some(kw) = find_config_keyword(trimmed) {
             return Some(format!("配置数字项（{kw}）变化"));
         }
         return None;
     }
 
-    // Code files: named constants or explicit timeout/default numeric literals.
-    if (trimmed.contains("const ") || trimmed.contains("static "))
-        && trimmed.contains('=')
-        && !is_test_path(path)
-    {
-        return Some("数字常量定义变化（可能为硬上限/默认值）".into());
+    let code = strip_string_literals(trimmed, is_rust);
+    if !contains_numeric_literal(&code) {
+        return None;
     }
-    if !is_test_path(path) {
-        if let Some((lhs, _rhs)) = trimmed.split_once('=') {
+
+    // `const` / `static` declarations: inspect the RHS value only so array type lengths like
+    // `pub const ALERT_KINDS: [&str; 12] = [` are never treated as numeric constants.
+    if is_const_or_static_decl(trimmed) {
+        if let Some((_lhs, rhs)) = code.split_once('=') {
+            if contains_numeric_literal(rhs) {
+                return Some("数字常量定义变化（可能为硬上限/默认值）".into());
+            }
+        }
+        return None;
+    }
+
+    // Module-level UPPER_SNAKE = <numeric> constants with config-like names (Python/JS/etc.).
+    if let Some((lhs, rhs)) = code.split_once('=') {
+        if !rhs.starts_with('=') && contains_numeric_literal(rhs) {
             let ident = lhs
                 .split_whitespace()
                 .last()
@@ -915,19 +1232,20 @@ fn config_constant_hit(path: &str, line: &str) -> Option<String> {
                     .chars()
                     .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
                 && ident.contains('_');
-            if is_upper_const {
+            if is_upper_const && find_config_keyword(ident).is_some() {
                 return Some(format!("常量 {ident} 数值变化"));
             }
         }
-        if trimmed.contains("Duration::from_secs(")
-            || trimmed.contains("Duration::from_millis(")
-            || trimmed.contains("unwrap_or(")
-        {
-            let lower_line = trimmed.to_ascii_lowercase();
-            if LIMIT_HINTS.iter().any(|k| lower_line.contains(*k)) {
-                return Some("默认值/超时数字变化".into());
-            }
-        }
+    }
+
+    // Timeout / default fallbacks: only when the call takes a numeric literal AND the line
+    // references a config-like identifier/field name (timeout/limit/max/default/threshold/...).
+    let has_timed_or_default_call = call_arg_has_numeric_literal(&code, "Duration::from_secs(")
+        || call_arg_has_numeric_literal(&code, "Duration::from_millis(")
+        || call_arg_has_numeric_literal(&code, "Duration::from_secs_f64(")
+        || call_arg_has_numeric_literal(&code, "unwrap_or(");
+    if has_timed_or_default_call && find_config_keyword(trimmed).is_some() {
+        return Some("默认值/超时数字变化".into());
     }
     None
 }
@@ -1264,18 +1582,20 @@ pub fn detect_rule_risks(
         // 4. Dependencies & lockfile
         if enabled("dependency") {
             if is_lockfile(&file.path) {
-                items.push(RiskItem {
-                    severity: Severity::Medium,
-                    file: file.path.clone(),
-                    line: first_line,
-                    rule_id: "dependency".into(),
-                    category: "依赖/Lockfile".into(),
-                    source: "规则".into(),
-                    reason: "Lockfile 变更".into(),
-                    hunk_index: if file.hunks.is_empty() { None } else { Some(0) },
-                    file_level: false,
-                    verdict_file: None,
-                });
+                if !is_lockfile_self_version_only(file) {
+                    items.push(RiskItem {
+                        severity: Severity::Medium,
+                        file: file.path.clone(),
+                        line: first_line,
+                        rule_id: "dependency".into(),
+                        category: "依赖/Lockfile".into(),
+                        source: "规则".into(),
+                        reason: "Lockfile 变更".into(),
+                        hunk_index: if file.hunks.is_empty() { None } else { Some(0) },
+                        file_level: false,
+                        verdict_file: None,
+                    });
+                }
             } else if is_manifest_file(&file.path) {
                 'dep_scan: for (hi, hunk) in file.hunks.iter().enumerate() {
                     for l in &hunk.lines {
@@ -1375,7 +1695,10 @@ pub fn detect_rule_risks(
             if enabled("weakened_test") && !file.is_deleted && !is_markdown_or_doc(&file.path) {
                 if let Some((line_no, marker)) = hunk.lines.iter().find_map(|l| {
                     (l.kind == DiffLineKind::Add)
-                        .then(|| is_skip_or_ignore_marker(&l.text).map(|m| (l.new_line.unwrap_or(1).max(1), m)))
+                        .then(|| {
+                            is_skip_or_ignore_marker(&file.path, &l.text)
+                                .map(|m| (l.new_line.unwrap_or(1).max(1), m))
+                        })
                         .flatten()
                 }) {
                     items.push(RiskItem {
@@ -3043,5 +3366,105 @@ mod tests {
         assert!(detect_secret_or_internal("host = \"ssh://dev@box.local:22\"").is_some());
         assert!(detect_secret_or_internal("ip = \"192.168.1.50\"").is_some());
         assert!(detect_secret_or_internal("ip = \"127.0.0.1\"").is_none());
+    }
+
+    #[test]
+    fn lockfile_self_version_bump_is_not_dependency_risk() {
+        let self_bump = "diff --git a/crates/delegate/Cargo.lock b/crates/delegate/Cargo.lock\n\
+            --- a/crates/delegate/Cargo.lock\n\
+            +++ b/crates/delegate/Cargo.lock\n\
+            @@ -4,7 +4,7 @@ version = 4\n\
+             [[package]]\n\
+             name = \"delegate\"\n\
+            -version = \"6.34.0\"\n\
+            +version = \"6.35.0\"\n\
+             dependencies = [\n";
+        let files = parse_unified_diff(self_bump);
+        let risks = detect_rule_risks(&files, &[], &[], &[], &RiskConfig::default());
+        assert!(risks.is_empty(), "self version bump should not flag dependency: {risks:?}");
+
+        // External registry dependency version change (has `source =` / `checksum =`) MUST still flag.
+        let ext_bump = "diff --git a/crates/delegate/Cargo.lock b/crates/delegate/Cargo.lock\n\
+            --- a/crates/delegate/Cargo.lock\n\
+            +++ b/crates/delegate/Cargo.lock\n\
+            @@ -20,6 +20,6 @@\n\
+             [[package]]\n\
+             name = \"libc\"\n\
+            -version = \"0.2.150\"\n\
+            +version = \"0.2.160\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+        let ext_files = parse_unified_diff(ext_bump);
+        let ext_risks = detect_rule_risks(&ext_files, &[], &[], &[], &RiskConfig::default());
+        assert!(ext_risks.iter().any(|r| r.rule_id == "dependency"), "{ext_risks:?}");
+
+        // Root package-lock.json self version bump is also exempt; resolved dependency change is not.
+        let pkg_self = "diff --git a/package-lock.json b/package-lock.json\n\
+            --- a/package-lock.json\n\
+            +++ b/package-lock.json\n\
+            @@ -2,4 +2,4 @@\n\
+               \"name\": \"my-app\",\n\
+            -  \"version\": \"1.0.0\",\n\
+            +  \"version\": \"1.1.0\",\n\
+               \"lockfileVersion\": 3,\n";
+        let pkg_files = parse_unified_diff(pkg_self);
+        assert!(detect_rule_risks(&pkg_files, &[], &[], &[], &RiskConfig::default()).is_empty());
+    }
+
+    #[test]
+    fn skip_markers_respect_language_and_syntax_boundaries() {
+        // Python `sys.exit(0)` must NOT trigger `xit(`!
+        assert_eq!(is_skip_or_ignore_marker("tests/test_app.py", "    sys.exit(0)"), None);
+        assert_eq!(is_skip_or_ignore_marker("tests/test_app.py", "    \"sys.exit(0)\""), None);
+        // Python `#[ignore]` inside a string fixture must NOT trigger Rust marker.
+        assert_eq!(is_skip_or_ignore_marker("tests/test_app.py", "    '#[ignore]\\n'"), None);
+        // Real Python decorators DO trigger.
+        assert_eq!(
+            is_skip_or_ignore_marker("tests/test_app.py", "@unittest.skip('flaky')"),
+            Some("@unittest.skip")
+        );
+        assert_eq!(
+            is_skip_or_ignore_marker("tests/test_app.py", "@pytest.mark.skip(reason='wip')"),
+            Some("@pytest.mark.skip")
+        );
+        // Rust `#[ignore]` triggers in .rs, not in strings.
+        assert_eq!(is_skip_or_ignore_marker("crates/a/src/lib.rs", "#[ignore]"), Some("#[ignore]"));
+        assert_eq!(
+            is_skip_or_ignore_marker("crates/a/src/lib.rs", "#[ignore = \"slow\"]"),
+            Some("#[ignore]")
+        );
+        assert_eq!(
+            is_skip_or_ignore_marker("crates/a/src/lib.rs", "let s = \"#[ignore]\";"),
+            None
+        );
+        // JS/TS `it.skip(` / `xit(` trigger only in JS/TS with word boundary, not `process.exit(`.
+        assert_eq!(is_skip_or_ignore_marker("web/app.test.ts", "  it.skip('broken', () => {})"), Some("it.skip"));
+        assert_eq!(is_skip_or_ignore_marker("web/app.test.ts", "  xit('broken', () => {})"), Some("xit"));
+        assert_eq!(is_skip_or_ignore_marker("web/cli.ts", "  process.exit(0);"), None);
+        assert_eq!(is_skip_or_ignore_marker("crates/a/src/lib.rs", "  xit(0);"), None);
+        // Go `t.Skip(` triggers in .go only.
+        assert_eq!(is_skip_or_ignore_marker("pkg/foo_test.go", "\tt.Skip(\"wip\")"), Some("t.Skip"));
+        assert_eq!(is_skip_or_ignore_marker("tests/test_foo.py", "  t.Skip('wip')"), None);
+    }
+
+    #[test]
+    fn config_constant_ignores_array_lengths_slices_and_plain_field_fallbacks() {
+        // Array length type annotation change `[&str; 10]` -> `[&str; 12]` is NOT a config constant.
+        assert!(config_constant_hit("crates/delegate/src/events.rs", "pub const ALERT_KINDS: [&str; 12] = [").is_none());
+        // Slice clamping `7.min(len)` / `bh[..7.min(bh.len())]` is NOT a config constant.
+        assert!(config_constant_hit("crates/delegate/src/main.rs", "let short = &bh[..7.min(bh.len())];").is_none());
+        assert!(config_constant_hit("crates/delegate/src/main.rs", "let n = v.unwrap_or(7.min(len));").is_none());
+        // Plain JSON field extraction fallbacks (ms/bytes/seconds) are NOT config defaults.
+        assert!(config_constant_hit("crates/delegate/src/main.rs", "let ms = ff[\"ms\"].as_u64().unwrap_or(0);").is_none());
+        assert!(config_constant_hit("crates/delegate/src/output.rs", ".map(|item| item[\"bytes\"].as_u64().unwrap_or(0))").is_none());
+        assert!(config_constant_hit("crates/delegate/src/events.rs", "let secs = p[\"elapsedSeconds\"].as_f64().unwrap_or(0.0);").is_none());
+        // Rust `&'static str` return signature is NOT a static definition.
+        assert!(config_constant_hit("crates/delegate/src/premerge.rs", "pub fn code(&self) -> &'static str { \"0\" }").is_none());
+
+        // Real config/constant/timeout changes MUST still trigger.
+        assert!(config_constant_hit("crates/core/src/limits.rs", "const MAX_BATCH: usize = 500;").is_some());
+        assert!(config_constant_hit("crates/core/src/limits.rs", "static DEFAULT_TIMEOUT_SECS: u64 = 30;").is_some());
+        assert!(config_constant_hit("crates/core/src/net.rs", "let timeout = cfg.unwrap_or(30);").is_some());
+        assert!(config_constant_hit("crates/core/src/net.rs", "let poll_interval = Duration::from_secs(60);").is_some());
+        assert!(config_constant_hit("scripts/cfg.py", "DEFAULT_TIMEOUT = 45").is_some());
     }
 }

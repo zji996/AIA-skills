@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""Claude Code Stop hook for delegate.
+"""Unified Claude Code Stop hook for delegate (6.36.0).
 
-Graded turn-end guard across the current repository and all other repositories on
-this machine — blocks ONLY on immediate blockers (never on blocked/deferred/non-stale
-verify/backlog ready items):
-0. Event-stream race lock: unread alert events (delivered, question, rejected, failed,
-   stall_warning, queue_paused, needs_attention, NEEDS_CONTROLLER, and one-shot work
-   transitions work_ready / work_defer_expired / work_stale) past `cursors.json`.
-1. Questioning runs (waiting on controller decision) or live runs without a
-   running `delegate wait`.
+Replaces legacy `delegate-waiter.sh`, `delegate-unmerged.sh`, and earlier Stop hooks
+with a single zero-lock, zero-git turn-end guard across the current repository and all
+other repositories on this machine:
+0. Event-stream race lock: unread alert events past `<state>/cursors.json`.
+1. Questioning runs (waiting on controller decision) or live runs without a running
+   `delegate wait` (recognizes both bare `delegate wait` in PATH and `/.../delegate wait`).
 2. Unmerged delivered or rejected write runs without a fresh deferral in
-   `<state>/work.jsonl` (or legacy `<repo>/.local/delegate/deferred.tsv`).
+   `<state>/work.jsonl` (`delegate work defer <run> --reason "…" --until <time>`).
+   Skips zero-change deliveries and runs currently being applied, merged (serial merger
+   or `_merge-worker` premerge), or gated (`delegate lane`).
+
+Reads only `<state>/index.json`, `<state>/work.jsonl`, `<state>/events.jsonl`,
+`<state>/cursors.json`, `<state>/lane/*.ticket`, `/proc`, and run-dir JSON snapshots
+(zero locks, zero git subprocesses). Appends one JSONL record per triggered hook class
+to `<state>/stop-hook.jsonl` for `delegate hook stats`.
 
 When `stop_hook_active` is true, exits 0 immediately to avoid blocking loops.
 """
@@ -21,13 +26,13 @@ import calendar
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-WAIT_RE = re.compile(r"(?:^|/|\s)delegate\s+wait(?:\s|$)")
 UNMERGED_NEXT_RE = re.compile(r"^(?:review|apply)\b")
 UNREAD_ALERT_KINDS = {
     "delivered",
@@ -67,6 +72,7 @@ KIND_LABELS = {
     "work_defer_expired": "暂缓到期",
     "work_stale": "工作项停滞",
 }
+APPLY_VALUE_FLAGS = {"--closes", "--message", "-m", "--work"}
 
 
 def find_delegate_bin() -> str | None:
@@ -92,31 +98,40 @@ def cache_dir() -> Path:
     return (Path(base) if base else Path.home() / ".cache") / "delegate"
 
 
+def read_json_file(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def git_toplevel(path: str) -> Path | None:
+    """Pure filesystem `.git` walk — strictly zero git subprocesses."""
     if not path or not os.path.isdir(path):
         return None
-    # Pure-filesystem lookup first (zero subprocesses, <0.1ms).
     try:
         cur = Path(path).resolve()
     except OSError:
         cur = Path(path)
-    if ".git" not in cur.parts:
-        for candidate in (cur, *cur.parents):
-            if (candidate / ".git").exists():
-                return candidate
-    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
-    try:
-        res = subprocess.run(
-            ["git", "-C", path, "rev-parse", "--path-format=absolute", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=2,
-        )
-        if res.returncode == 0 and res.stdout.strip():
-            return Path(res.stdout.strip())
-    except (OSError, subprocess.SubprocessError):
-        pass
+    # If invoked inside `.git/...`, step out of `.git` first.
+    if ".git" in cur.parts:
+        idx = cur.parts.index(".git")
+        if idx > 0:
+            cur = Path(*cur.parts[:idx])
+    for candidate in (cur, *cur.parents):
+        if (candidate / ".git").exists():
+            return candidate
     return None
 
 
@@ -127,7 +142,16 @@ def repo_from_runs_dir(runs_dir: Path) -> Path | None:
     return None
 
 
-def discover_repos(cwd: str) -> list[tuple[Path | None, Path, str, bool]]:
+def load_index_runs() -> dict[str, dict]:
+    """Lock-free read of `<state>/index.json` runs map (zero subprocesses)."""
+    doc = read_json_file(state_dir() / "index.json")
+    if not doc:
+        return {}
+    runs_map = doc.get("runs")
+    return runs_map if isinstance(runs_map, dict) else {}
+
+
+def discover_repos(cwd: str, index_runs: dict[str, dict]) -> list[tuple[Path | None, Path, str, bool]]:
     """Return deduplicated list of (repo_root, runs_dir, label, is_current)."""
     candidates: list[tuple[Path | None, Path, bool]] = []
 
@@ -146,27 +170,41 @@ def discover_repos(cwd: str) -> list[tuple[Path | None, Path, str, bool]]:
 
     if os.environ.get("DELEGATE_STOP_HOOK_CURRENT_ONLY") != "1":
         sdir = state_dir()
-        # 1) Machine repo registry written by delegate launch / note / status.
-        repos_file = sdir / "repos.json"
-        if repos_file.is_file():
-            try:
-                data = json.loads(repos_file.read_text(encoding="utf-8"))
-                repos_map = data.get("repos") if isinstance(data, dict) else None
-                if isinstance(repos_map, dict):
-                    for entry in repos_map.values():
-                        if not isinstance(entry, dict):
-                            continue
-                        runs_str = entry.get("runs")
-                        repo_str = entry.get("repo")
-                        if not isinstance(runs_str, str) or not runs_str:
-                            continue
-                        runs_p = Path(runs_str)
-                        repo_p = Path(repo_str) if isinstance(repo_str, str) and repo_str else repo_from_runs_dir(runs_p)
-                        candidates.append((repo_p, runs_p, False))
-            except (OSError, ValueError):
-                pass
+        # 1) Machine repo registry (`state/repos.json`).
+        repos_doc = read_json_file(sdir / "repos.json")
+        repos_map = repos_doc.get("repos") if repos_doc else None
+        if isinstance(repos_map, dict):
+            for entry in repos_map.values():
+                if not isinstance(entry, dict):
+                    continue
+                runs_str = entry.get("runs")
+                repo_str = entry.get("repo")
+                if not isinstance(runs_str, str) or not runs_str:
+                    continue
+                runs_p = Path(runs_str)
+                repo_p = (
+                    Path(repo_str)
+                    if isinstance(repo_str, str) and repo_str
+                    else repo_from_runs_dir(runs_p)
+                )
+                candidates.append((repo_p, runs_p, False))
 
-        # 2) Live slot files under state_dir (covers pre-6.25.0 active runs).
+        # 2) Materialized index (`state/index.json`).
+        for entry in index_runs.values():
+            if not isinstance(entry, dict):
+                continue
+            runs_str = entry.get("runsRoot")
+            repo_str = entry.get("repo")
+            if isinstance(runs_str, str) and runs_str:
+                runs_p = Path(runs_str)
+                repo_p = (
+                    Path(repo_str)
+                    if isinstance(repo_str, str) and repo_str
+                    else repo_from_runs_dir(runs_p)
+                )
+                candidates.append((repo_p, runs_p, False))
+
+        # 3) Live slot files under state_dir.
         if sdir.is_dir():
             try:
                 for entry in sdir.iterdir():
@@ -181,19 +219,16 @@ def discover_repos(cwd: str) -> list[tuple[Path | None, Path, str, bool]]:
                     runs_p = run_dir.parent
                     repo_p = repo_from_runs_dir(runs_p)
                     if repo_p is None:
-                        try:
-                            meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
-                            src = (meta.get("worktree") or {}).get("source") if isinstance(meta.get("worktree"), dict) else None
-                            raw = src or meta.get("top") or meta.get("workdir")
-                            if isinstance(raw, str) and raw:
-                                repo_p = Path(raw)
-                        except (OSError, ValueError):
-                            pass
+                        meta = read_json_file(run_dir / "meta.json") or {}
+                        wt = meta.get("worktree") if isinstance(meta.get("worktree"), dict) else {}
+                        raw = wt.get("source") or meta.get("top") or meta.get("workdir")
+                        if isinstance(raw, str) and raw:
+                            repo_p = Path(raw)
                     candidates.append((repo_p, runs_p, False))
             except OSError:
                 pass
 
-        # 3) Worktree directories under cache_dir (fallback for older repos with unmerged worktrees).
+        # 4) Worktree directories under cache_dir.
         wt_root = cache_dir() / "worktrees"
         if wt_root.is_dir():
             try:
@@ -251,105 +286,218 @@ def discover_repos(cwd: str) -> list[tuple[Path | None, Path, str, bool]]:
     return result
 
 
-def load_index_runs() -> dict[str, dict]:
-    """Lock-free read of `<state>/index.json` runs map (zero subprocesses)."""
-    idx_file = state_dir() / "index.json"
-    if not idx_file.is_file():
-        return {}
-    try:
-        doc = json.loads(idx_file.read_text(encoding="utf-8"))
-        runs_map = doc.get("runs") if isinstance(doc, dict) else None
-        return runs_map if isinstance(runs_map, dict) else {}
-    except (OSError, ValueError):
-        return {}
+def strip_reply_prefixes(name: str) -> str:
+    cur = name.strip()
+    while cur.lower().startswith("reply to "):
+        cur = cur[9:].strip()
+    return cur or name
 
 
-def fetch_status_from_index(runs_dir: Path, index_runs: dict[str, dict]) -> list[dict] | None:
-    """Try reading all runs under `runs_dir` directly from `index.json` (lock-free, zero forks).
-    Returns `None` to trigger fallback if any run directory is missing from the index or stale."""
-    if not index_runs or not runs_dir.is_dir():
+def read_run_snapshot(rdir: Path) -> dict | None:
+    """Zero-lock, zero-git, zero-subprocess snapshot of a single run directory."""
+    meta = read_json_file(rdir / "meta.json")
+    if not meta:
         return None
+    rid = str(meta.get("run") or rdir.name)
+    name = str(meta.get("name") or rid)
+    mode = str(meta.get("mode") or "")
+    parent = meta.get("parent") if isinstance(meta.get("parent"), str) else ""
+    summary = read_json_file(rdir / "summary.json") or {}
+    exit_file = rdir / "exit_code"
+    has_exit = exit_file.is_file()
+
+    if has_exit:
+        st = str(summary.get("state") or "")
+        if not st:
+            try:
+                code = exit_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                code = "1"
+            if code == "0":
+                st = "delivered" if mode == "write" else "answered"
+            else:
+                st = "failed"
+    else:
+        if (rdir / ".waiting").exists():
+            st = "waiting"
+        else:
+            alive = False
+            for pf in (rdir / "pid", rdir / "agent.pid"):
+                if pf.is_file():
+                    try:
+                        if pid_alive(int(pf.read_text(encoding="utf-8").strip())):
+                            alive = True
+                            break
+                    except (OSError, ValueError):
+                        pass
+            if alive:
+                st = "running"
+            else:
+                # Newly starting run may not have written pid yet.
+                started_ep = meta.get("startedEpoch")
+                if isinstance(started_ep, (int, float)) and time.time() - float(started_ep) < 10.0:
+                    st = "starting"
+                else:
+                    st = "crashed"
+
+    is_applied = (
+        (rdir / ".applied").exists()
+        or (rdir / ".applied-cleaned").exists()
+        or bool(meta.get("appliedAt"))
+    ) and not (rdir / ".generate-pending").exists()
+
+    wt = meta.get("worktree") if isinstance(meta.get("worktree"), dict) else {}
+    wt_path = str(wt.get("path") or "") if wt else ""
+    pm = read_json_file(rdir / "premerge.json")
+    rev = read_json_file(rdir / "review.json")
+    if rev is None and isinstance(summary.get("review"), dict):
+        rev = summary.get("review")
+
+    obj: dict = {
+        "run": rid,
+        "name": name,
+        "chainName": strip_reply_prefixes(name),
+        "state": st,
+        "mode": mode,
+        "parent": parent,
+        "applied": is_applied,
+        "cleaned": False,
+        "question": summary.get("question") is True,
+        "worktree": wt_path,
+        "dir": str(rdir),
+    }
+    if isinstance(summary.get("pendingChanges"), dict):
+        obj["pendingChanges"] = summary["pendingChanges"]
+    if isinstance(summary.get("changes"), dict):
+        obj["changes"] = summary["changes"]
+    if isinstance(summary.get("files"), list):
+        obj["files"] = summary["files"]
+    if meta.get("isMerge") is True:
+        obj["isMerge"] = True
+        if isinstance(meta.get("merge"), dict):
+            obj["merge"] = meta["merge"]
+    if pm is not None:
+        obj["premerge"] = pm
+    if rev is not None:
+        obj["review"] = rev
+
+    # Synthesize `next` for finished unapplied write runs so downstream classification stays uniform.
+    if st == "delivered" and mode == "write" and not is_applied:
+        if rev and rev.get("verdict") == "NEEDS_CONTROLLER":
+            obj["next"] = f"review {rid}"
+        else:
+            obj["next"] = f"apply {rid}"
+    return obj
+
+
+def fetch_status(runs_dir: Path, index_runs: dict[str, dict]) -> list[dict]:
+    """Strictly lock-free, zero-git, zero-subprocess status reader backed by `index.json`
+    with per-run disk snapshot fallback when missing or stale."""
+    if not runs_dir.is_dir():
+        return []
     try:
         actual_dirs = [
             p.resolve() for p in runs_dir.iterdir() if p.is_dir() and (p / "meta.json").is_file()
         ]
     except OSError:
-        return None
+        return []
     if not actual_dirs:
         return []
+
     out: list[dict] = []
     for rdir in actual_dirs:
         entry = index_runs.get(str(rdir))
-        if not isinstance(entry, dict) or not isinstance(entry.get("status"), dict):
-            return None
-        st_obj = entry["status"]
-        st = str(st_obj.get("state") or "")
-        # If the run was active in the index, check if it has since exited or been applied.
-        if st in ("running", "starting", "waiting", "queued"):
-            if (rdir / "exit_code").is_file():
-                return None
-            # Verify supervisor is still alive; if crashed, fall back to full status.
-            pid_file = rdir / "pid"
-            if pid_file.is_file():
-                try:
-                    pid = int(pid_file.read_text(encoding="utf-8").strip())
-                    os.kill(pid, 0)
-                except (OSError, ValueError):
-                    return None
-        else:
-            # Verify `.applied` wasn't added directly on disk after index write.
-            if (rdir / ".applied").exists() and not (rdir / ".generate-pending").exists():
-                if st_obj.get("applied") is not True:
-                    return None
-        out.append(st_obj)
+        st_obj: dict | None = None
+        if isinstance(entry, dict) and isinstance(entry.get("status"), dict):
+            cand = dict(entry["status"])
+            st = str(cand.get("state") or "")
+            stale = False
+            if st in ("running", "starting", "waiting", "queued"):
+                if (rdir / "exit_code").is_file():
+                    stale = True
+                else:
+                    pid_file = rdir / "pid"
+                    if pid_file.is_file():
+                        try:
+                            if not pid_alive(int(pid_file.read_text(encoding="utf-8").strip())):
+                                stale = True
+                        except (OSError, ValueError):
+                            stale = True
+            else:
+                if (rdir / ".applied").exists() and not (rdir / ".generate-pending").exists():
+                    if cand.get("applied") is not True:
+                        stale = True
+            if not stale:
+                cand.setdefault("dir", str(rdir))
+                # Overlay fresh premerge.json directly from disk (lock-free).
+                pm = read_json_file(rdir / "premerge.json")
+                if pm is not None:
+                    cand["premerge"] = pm
+                # Preserve merge metadata for active serial merge runs.
+                if st in ("running", "starting", "waiting", "queued") and not cand.get("isMerge"):
+                    meta = read_json_file(rdir / "meta.json")
+                    if meta and meta.get("isMerge") is True:
+                        cand["isMerge"] = True
+                        if isinstance(meta.get("merge"), dict):
+                            cand["merge"] = meta["merge"]
+                st_obj = cand
+        if st_obj is None:
+            st_obj = read_run_snapshot(rdir)
+        if st_obj is not None and isinstance(st_obj.get("run"), str):
+            out.append(st_obj)
     return out
 
 
-def fetch_status(
-    delegate_bin: str | None,
-    repo_root: Path | None,
-    runs_dir: Path,
-    index_runs: dict[str, dict] | None = None,
-) -> list[dict]:
-    if index_runs:
-        fast = fetch_status_from_index(runs_dir, index_runs)
-        if fast is not None:
-            return fast
-    if not delegate_bin:
-        return []
-    env = {**os.environ, "DELEGATE_RUNS": str(runs_dir)}
-    cwd = str(repo_root) if repo_root and repo_root.is_dir() else None
+def split_cmdline(line: str) -> list[str]:
     try:
-        res = subprocess.run(
-            [delegate_bin, "status", "--json"],
-            capture_output=True,
-            text=True,
-            env=env,
-            cwd=cwd,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
-    if res.returncode != 0:
-        return []
-    out: list[dict] = []
-    for line in res.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(obj, dict) and isinstance(obj.get("run"), str):
-            out.append(obj)
-    return out
+        return shlex.split(line)
+    except ValueError:
+        return line.split()
 
 
-def active_waiter_cmdlines() -> list[str]:
-    override = os.environ.get("DELEGATE_STOP_HOOK_WAITERS")
+def list_processes() -> list[tuple[list[str], Path | None]]:
+    """List live processes as `(argv, cwd_or_none)` via `/proc` (zero subprocesses on Linux),
+    with `ps` fallback."""
+    override = os.environ.get("DELEGATE_STOP_HOOK_PROCS")
     if override is not None:
-        return [ln for ln in override.splitlines() if ln.strip()]
+        return [(split_cmdline(ln), None) for ln in override.splitlines() if ln.strip()]
+
+    proc = Path("/proc")
+    if proc.is_dir():
+        my_pid = os.getpid()
+        procs: list[tuple[list[str], Path | None]] = []
+        try:
+            for entry in proc.iterdir():
+                name = entry.name
+                if not name.isdigit():
+                    continue
+                pid = int(name)
+                if pid == my_pid:
+                    continue
+                try:
+                    # Skip zombie processes.
+                    stat_txt = (entry / "stat").read_text(encoding="utf-8", errors="ignore")
+                    rparen = stat_txt.rfind(")")
+                    if rparen != -1 and rparen + 2 < len(stat_txt) and stat_txt[rparen + 2] == "Z":
+                        continue
+                    raw = (entry / "cmdline").read_bytes()
+                except OSError:
+                    continue
+                if not raw:
+                    continue
+                tokens = [t.decode("utf-8", errors="replace") for t in raw.split(b"\x00") if t]
+                if not tokens:
+                    continue
+                pcwd: Path | None = None
+                try:
+                    pcwd = Path(os.readlink(str(entry / "cwd")))
+                except OSError:
+                    pass
+                procs.append((tokens, pcwd))
+            return procs
+        except OSError:
+            pass
+
     try:
         res = subprocess.run(
             ["ps", "-eo", "args="],
@@ -357,11 +505,258 @@ def active_waiter_cmdlines() -> list[str]:
             text=True,
             timeout=2,
         )
-        if res.returncode != 0:
-            return []
-        return [ln.strip() for ln in res.stdout.splitlines() if WAIT_RE.search(ln)]
+        if res.returncode == 0:
+            return [(split_cmdline(ln), None) for ln in res.stdout.splitlines() if ln.strip()]
     except (OSError, subprocess.SubprocessError):
-        return []
+        pass
+    return []
+
+
+def cwd_in_repo(proc_cwd: Path | None, repo_root: Path | None) -> bool:
+    """Return True if `proc_cwd` is unknown (synthetic/override) or inside `repo_root`."""
+    if proc_cwd is None:
+        return True
+    if repo_root is None:
+        return False
+    try:
+        p = proc_cwd.resolve()
+        r = repo_root.resolve()
+        return p == r or r in p.parents
+    except OSError:
+        return str(proc_cwd).startswith(str(repo_root))
+
+
+def match_delegate_subcmd(tokens: list[str], subcmd: str) -> list[str] | None:
+    """Match both bare `delegate <subcmd>` and `/path/to/delegate <subcmd>` (and `env ... delegate`).
+    Returns the argument list following `<subcmd>`, or `None` if not matched."""
+    if not tokens:
+        return None
+    idx = 0
+    # Unwrap `env [VAR=VAL ...] [-u VAR] delegate ...`
+    if os.path.basename(tokens[0]) == "env":
+        idx = 1
+        while idx < len(tokens):
+            tok = tokens[idx]
+            if tok == "--":
+                idx += 1
+                break
+            if tok in ("-u", "-C", "-S"):
+                idx += 2
+                continue
+            if tok.startswith("-") or "=" in tok:
+                idx += 1
+                continue
+            break
+    if idx >= len(tokens):
+        return None
+    if os.path.basename(tokens[idx]) != "delegate":
+        return None
+    idx += 1
+    # Skip leading global flags such as `--json`.
+    while idx < len(tokens) and tokens[idx].startswith("-"):
+        idx += 1
+    if idx < len(tokens) and tokens[idx] == subcmd:
+        return tokens[idx + 1 :]
+    return None
+
+
+def active_waiter_argvs(procs: list[tuple[list[str], Path | None]]) -> list[list[str]]:
+    override = os.environ.get("DELEGATE_STOP_HOOK_WAITERS")
+    if override is not None:
+        matched: list[list[str]] = []
+        for ln in override.splitlines():
+            if not ln.strip():
+                continue
+            args = match_delegate_subcmd(split_cmdline(ln), "wait")
+            if args is not None:
+                matched.append(args)
+        return matched
+    out: list[list[str]] = []
+    for argv, _ in procs:
+        args = match_delegate_subcmd(argv, "wait")
+        if args is not None:
+            out.append(args)
+    return out
+
+
+def extract_positional_targets(args: list[str], value_flags: set[str]) -> list[str]:
+    pos: list[str] = []
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok == "--":
+            pos.extend(args[i + 1 :])
+            break
+        if tok in value_flags:
+            i += 2
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        pos.append(tok)
+        i += 1
+    return pos
+
+
+def run_matches_target(rid: str, obj: dict, target: str) -> bool:
+    if not target:
+        return False
+    name = str(obj.get("name") or "")
+    chain = str(obj.get("chainName") or "")
+    if target in (rid, name, chain):
+        return True
+    if rid.endswith(f"-{target}") or (len(target) >= 4 and target in rid):
+        return True
+    return False
+
+
+def active_lane_state(
+    procs: list[tuple[list[str], Path | None]],
+) -> tuple[list[Path | None], set[str]]:
+    """Return (list_of_gate_cwds, set_of_run_ids_with_running_lane_ticket).
+    `None` inside `gate_cwds` means synthetic/unscoped gate (matches current repo).
+    Strictly lock-free: reads ticket JSON and checks PID liveness via `kill(pid, 0)`."""
+    gate_cwds: list[Path | None] = []
+    for argv, pcwd in procs:
+        if match_delegate_subcmd(argv, "lane") is not None:
+            gate_cwds.append(pcwd)
+
+    lane_runs: set[str] = set()
+    sdir = state_dir()
+    for sub in ("lane", "lane-remote"):
+        ldir = sdir / sub
+        if not ldir.is_dir():
+            continue
+        try:
+            for ent in ldir.iterdir():
+                if ent.suffix != ".ticket":
+                    continue
+                doc = read_json_file(ent)
+                if not doc or doc.get("running") is not True:
+                    continue
+                pid = doc.get("pid")
+                if isinstance(pid, int) and pid > 0 and not pid_alive(pid):
+                    continue
+                run_val = str(doc.get("run") or "").strip()
+                label = str(doc.get("label") or "").strip()
+                if not run_val or label.startswith(("premerge-", "merge-", "apply-")):
+                    tcwd: Path | None = None
+                    if isinstance(pid, int) and pid > 0:
+                        try:
+                            tcwd = Path(os.readlink(f"/proc/{pid}/cwd"))
+                        except OSError:
+                            pass
+                    gate_cwds.append(tcwd)
+                if run_val:
+                    lane_runs.add(run_val)
+                    lane_runs.add(Path(run_val).name)
+        except OSError:
+            pass
+    return gate_cwds, lane_runs
+
+
+def is_premerge_running(obj: dict) -> bool:
+    pm = obj.get("premerge")
+    if not isinstance(pm, dict):
+        return False
+    if str(pm.get("status") or "") != "running":
+        return False
+    wpid = pm.get("workerPid")
+    if isinstance(wpid, int) and wpid > 0:
+        return pid_alive(wpid)
+    return True
+
+
+def is_run_being_handled(
+    rid: str,
+    obj: dict,
+    repo_root: Path | None,
+    applying_procs: list[tuple[list[str], Path | None]],
+    merging_procs: list[tuple[list[str], Path | None]],
+    active_merge_source_runs: set[str],
+    gate_cwds: list[Path | None],
+    lane_runs: set[str],
+) -> bool:
+    """True when `apply`, serial `merge`, background `_merge-worker`, or `lane` gate is in flight."""
+    if any(cwd_in_repo(gcwd, repo_root) for gcwd in gate_cwds):
+        return True
+    if rid in lane_runs or any(rid in lr for lr in lane_runs):
+        return True
+    if rid in active_merge_source_runs:
+        return True
+    if is_premerge_running(obj):
+        return True
+    for args, pcwd in applying_procs:
+        targets = extract_positional_targets(args, APPLY_VALUE_FLAGS)
+        if not targets:
+            if cwd_in_repo(pcwd, repo_root):
+                return True
+        elif any(
+            (t in ("last", "--all") and cwd_in_repo(pcwd, repo_root))
+            or run_matches_target(rid, obj, t)
+            for t in targets
+        ):
+            return True
+    for args, pcwd in merging_procs:
+        if "--ready" in args:
+            if cwd_in_repo(pcwd, repo_root):
+                return True
+            continue
+        targets = extract_positional_targets(args, {"--name", "--base"})
+        if not targets:
+            if cwd_in_repo(pcwd, repo_root):
+                return True
+        elif any(run_matches_target(rid, obj, t) for t in targets):
+            return True
+    return False
+
+
+def is_zero_change_delivery(obj: dict, all_by_id: dict[str, dict]) -> bool:
+    """Return True if a delivered run has zero pending file changes across its unapplied chain."""
+    if str(obj.get("state") or "") != "delivered":
+        return False
+    pending = obj.get("pendingChanges")
+    if isinstance(pending, dict) and "files" in pending:
+        try:
+            return int(pending.get("files") or 0) == 0
+        except (TypeError, ValueError):
+            pass
+    changes = obj.get("changes")
+    if isinstance(changes, dict) and "files" in changes:
+        try:
+            if int(changes.get("files") or 0) > 0:
+                return False
+        except (TypeError, ValueError):
+            pass
+    # Walk unapplied ancestors in the same worktree when `pendingChanges` is absent.
+    wt = str(obj.get("worktree") or "")
+    parent = str(obj.get("parent") or "")
+    visited: set[str] = set()
+    while parent and parent not in visited:
+        visited.add(parent)
+        anc = all_by_id.get(parent)
+        if not anc:
+            break
+        if anc.get("applied") is True:
+            break
+        if wt and str(anc.get("worktree") or "") != wt:
+            break
+        ap = anc.get("pendingChanges")
+        if isinstance(ap, dict) and int(ap.get("files") or 0) > 0:
+            return False
+        ac = anc.get("changes")
+        if isinstance(ac, dict) and int(ac.get("files") or 0) > 0:
+            return False
+        parent = str(anc.get("parent") or "")
+    if isinstance(changes, dict) and "files" in changes:
+        try:
+            return int(changes.get("files") or 0) == 0
+        except (TypeError, ValueError):
+            return False
+    files = obj.get("files")
+    if isinstance(files, list):
+        return len(files) == 0
+    return False
 
 
 def parse_iso_utc(ts_str: str) -> int | None:
@@ -394,64 +789,25 @@ def work_deferred_runs(now: int) -> tuple[set[str], set[str]]:
                     item = json.loads(line)
                 except ValueError:
                     continue
-                if not isinstance(item, dict) or item.get("state") != "deferred":
+                if not isinstance(item, dict) or item.get("state") == "done":
                     continue
                 runs = [r for r in (item.get("runs") or []) if isinstance(r, str) and r]
                 if not runs:
                     continue
-                until_ts = parse_iso_utc(str(item.get("deferUntil") or ""))
-                if until_ts is not None and until_ts > now:
-                    fresh.update(runs)
-                else:
+                st = str(item.get("state") or "")
+                until_raw = str(item.get("deferUntil") or "").strip()
+                reason_raw = str(item.get("deferReason") or "").strip()
+                if st == "deferred":
+                    until_ts = parse_iso_utc(until_raw)
+                    if until_ts is not None and until_ts > now:
+                        fresh.update(runs)
+                    else:
+                        expired.update(runs)
+                elif reason_raw and not until_raw:
                     expired.update(runs)
     except OSError:
         return set(), set()
     return fresh, expired
-
-
-def tidy_and_check_deferred(
-    repo_root: Path | None,
-    pending_ids: set[str],
-    now: int,
-    defer_hours: float,
-) -> tuple[set[str], set[str]]:
-    """Return (fresh_deferred_ids, stale_deferred_ids) and tidy deferred.tsv in place."""
-    if repo_root is None:
-        return set(), set()
-    deferred_path = repo_root / ".local" / "delegate" / "deferred.tsv"
-    if not deferred_path.is_file():
-        return set(), set()
-    try:
-        original = deferred_path.read_text(encoding="utf-8")
-    except OSError:
-        return set(), set()
-
-    kept_lines: list[str] = []
-    fresh: set[str] = set()
-    stale: set[str] = set()
-    limit_secs = defer_hours * 3600.0
-
-    for raw in original.splitlines():
-        if not raw.strip():
-            continue
-        cols = raw.split("\t")
-        run_id = cols[0].strip()
-        if not run_id or run_id not in pending_ids:
-            continue
-        reason = cols[1] if len(cols) >= 2 else ""
-        ts_str = cols[2].strip() if len(cols) >= 3 else ""
-        if ts_str.isdigit():
-            ts = int(ts_str)
-        else:
-            ts = now
-        kept_lines.append(f"{run_id}\t{reason}\t{ts}")
-        if now - ts > limit_secs:
-            stale.add(run_id)
-        else:
-            fresh.add(run_id)
-
-    # Strictly read-only: never rewrite deferred.tsv from the Stop hook.
-    return fresh, stale
 
 
 def run_label(obj: dict, repo_label: str, is_current: bool) -> str:
@@ -460,23 +816,15 @@ def run_label(obj: dict, repo_label: str, is_current: bool) -> str:
     return name if is_current else f"【{repo_label}】{name}"
 
 
-def check_unread_events(payload: dict, cwd: str) -> str | None:
-    """Race lock: block if unread delivery/question/attention events exist past the cursor."""
+def check_unread_events(payload: dict, cwd: str) -> tuple[str | None, list[str], list[str]]:
+    """Race lock: block if unread delivery/question/attention events exist past the cursor.
+    Returns (reason, display_names, run_ids)."""
     sdir = state_dir()
     events_file = sdir / "events.jsonl"
     if not events_file.is_file():
-        return None
+        return None, [], []
 
-    cursors_file = sdir / "cursors.json"
-    cursors_doc: dict = {}
-    if cursors_file.is_file():
-        try:
-            loaded = json.loads(cursors_file.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                cursors_doc = loaded
-        except (OSError, ValueError):
-            cursors_doc = {}
-
+    cursors_doc = read_json_file(sdir / "cursors.json") or {}
     caller_id = (
         os.environ.get("DELEGATE_CALLER")
         or os.environ.get("CLAUDE_CODE_SESSION_ID")
@@ -550,12 +898,14 @@ def check_unread_events(payload: dict, cwd: str) -> str | None:
                     continue
                 unread.append(ev)
     except OSError:
-        return None
+        return None, [], []
 
     if not unread:
-        return None
+        return None, [], []
 
     previews: list[str] = []
+    ev_names: list[str] = []
+    ev_run_ids: list[str] = []
     for ev in unread[:5]:
         kind = str(ev.get("kind") or "")
         klabel = KIND_LABELS.get(kind, kind)
@@ -563,6 +913,10 @@ def check_unread_events(payload: dict, cwd: str) -> str | None:
         wid = str(pl.get("workId") or "").strip()
         raw_label = str(pl.get("name") or pl.get("queueName") or ev.get("run") or "?").replace("\n", " ")
         label = f"{wid}:{raw_label}" if wid else raw_label
+        ev_names.append(label)
+        rid = str(ev.get("run") or "").strip()
+        if rid and rid not in ev_run_ids:
+            ev_run_ids.append(rid)
         card = pl.get("card") if isinstance(pl.get("card"), dict) else None
         pm = pl.get("premerge") if isinstance(pl.get("premerge"), dict) else None
         if kind == "delivered" and card is not None and isinstance(card.get("riskTotal"), int):
@@ -585,7 +939,32 @@ def check_unread_events(payload: dict, cwd: str) -> str | None:
             previews.append(f"{klabel}:{label}")
     more = f" 等共 {len(unread)} 条" if len(unread) > 5 else ""
     summary = "、".join(previews) + more
-    return f"有新事件，先看 delegate events --since {cursor_seq}（未读 {len(unread)} 条：{summary}）。"
+    return (
+        f"有新事件，先看 delegate events --since {cursor_seq}（未读 {len(unread)} 条：{summary}）。",
+        ev_names,
+        ev_run_ids,
+    )
+
+
+def append_stop_logs(records: list[dict]) -> None:
+    """Zero-lock O_APPEND log to `<state>/stop-hook.jsonl` for `delegate hook stats`."""
+    if not records:
+        return
+    try:
+        sdir = state_dir()
+        sdir.mkdir(parents=True, exist_ok=True)
+        log_path = sdir / "stop-hook.jsonl"
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            for rec in records:
+                row = {"ts": ts, **rec}
+                line = (json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+                os.write(fd, line)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
 
 def evaluate(payload: dict) -> dict | None:
@@ -594,43 +973,68 @@ def evaluate(payload: dict) -> dict | None:
 
     cwd = str(payload.get("cwd") or os.getcwd())
     reasons: list[str] = []
+    log_records: list[dict] = []
 
-    unread_reason = check_unread_events(payload, cwd)
+    unread_reason, ev_names, ev_run_ids = check_unread_events(payload, cwd)
     if unread_reason:
         reasons.append(unread_reason)
+        log_records.append(
+            {
+                "hook": "events",
+                "runs": "、".join(ev_names[:8]),
+                "runIds": ev_run_ids[:8],
+            }
+        )
 
     index_runs = load_index_runs()
-    delegate_bin = find_delegate_bin()
-    if not delegate_bin and not index_runs:
-        return {"decision": "block", "reason": "\n".join(reasons)} if reasons else None
-
-    try:
-        defer_hours = float(os.environ.get("DEFER_HOURS", "4"))
-    except ValueError:
-        defer_hours = 4.0
+    delegate_cmd = find_delegate_bin() or "delegate"
     now = int(time.time())
 
-    repos = discover_repos(cwd)
+    repos = discover_repos(cwd, index_runs)
     if not repos:
-        return {"decision": "block", "reason": "\n".join(reasons)} if reasons else None
+        if reasons:
+            append_stop_logs(log_records)
+            return {"decision": "block", "reason": "\n".join(reasons)}
+        return None
+
+    procs = list_processes()
+    applying_procs = [
+        (a, pcwd) for argv, pcwd in procs if (a := match_delegate_subcmd(argv, "apply")) is not None
+    ]
+    merging_procs = [
+        (a, pcwd) for argv, pcwd in procs if (a := match_delegate_subcmd(argv, "merge")) is not None
+    ]
+    gate_cwds, lane_runs = active_lane_state(procs)
 
     questions: list[tuple[str, str, bool]] = []  # (display, run_id, is_current)
-    live_current: list[str] = []
+    live_current: list[tuple[str, str]] = []  # (display, run_id)
     live_other: list[tuple[str, str]] = []  # (display, run_id)
-    unmerged_items: list[str] = []
-    has_stale_defer = False
+    unmerged_items: list[tuple[str, str]] = []  # (display, run_id)
+    stale_run_ids: list[str] = []
     work_fresh_def, work_expired_def = work_deferred_runs(now)
 
     for repo_root, runs_dir, label, is_current in repos:
-        items = fetch_status(delegate_bin, repo_root, runs_dir, index_runs)
+        items = fetch_status(runs_dir, index_runs)
         if not items:
-            tidy_and_check_deferred(repo_root, set(), now, defer_hours)
             continue
 
+        all_by_id = {obj["run"]: obj for obj in items if isinstance(obj.get("run"), str)}
         parents = {obj["parent"] for obj in items if isinstance(obj.get("parent"), str) and obj["parent"]}
         leaves = [obj for obj in items if obj["run"] not in parents]
 
-        repo_unmerged: dict[str, str] = {}
+        # Collect source runs currently being merged by an active serial merge run.
+        active_merge_sources: set[str] = set()
+        for obj in items:
+            if obj.get("isMerge") is True and str(obj.get("state") or "") in (
+                "running",
+                "waiting",
+                "starting",
+                "queued",
+            ):
+                m = obj.get("merge") if isinstance(obj.get("merge"), dict) else {}
+                for src in m.get("sourceRuns") or []:
+                    if isinstance(src, str) and src:
+                        active_merge_sources.add(src)
 
         for obj in leaves:
             rid = obj["run"]
@@ -640,8 +1044,6 @@ def evaluate(payload: dict) -> dict | None:
             is_question = obj.get("question") is True
             disp = run_label(obj, label, is_current)
 
-            # Non-stale post-merge notes / verify items do NOT block turn end (6.31 graded guard;
-            # stale >24h items emit one-shot `work_stale` events consumed via events.jsonl).
             if is_cleaned or is_applied:
                 continue
 
@@ -650,74 +1052,119 @@ def evaluate(payload: dict) -> dict | None:
                 questions.append((disp, rid, is_current))
                 continue
 
-            # 2) Live runs (running / waiting / starting).
+            # 2) Live runs (running / waiting / starting / queued).
             if st in ("running", "waiting", "starting", "queued"):
                 if is_current:
-                    live_current.append(disp)
+                    live_current.append((disp, rid))
                 else:
                     live_other.append((disp, rid))
                 continue
 
             # 3) Unmerged delivered or rejected write runs.
+            if is_zero_change_delivery(obj, all_by_id):
+                continue
             next_str = str(obj.get("next") or "")
-            if st == "rejected" or (st == "delivered" and UNMERGED_NEXT_RE.search(next_str)):
-                repo_unmerged[rid] = disp
+            is_unmerged_candidate = st == "rejected" or (
+                st == "delivered"
+                and (str(obj.get("mode") or "") == "write" or bool(UNMERGED_NEXT_RE.search(next_str)))
+            )
+            if not is_unmerged_candidate:
+                continue
 
-        fresh_def, stale_def = tidy_and_check_deferred(
-            repo_root, set(repo_unmerged.keys()), now, defer_hours
-        )
-        fresh_all = (fresh_def | work_fresh_def) - stale_def
-        if stale_def or (set(repo_unmerged.keys()) & work_expired_def):
-            has_stale_defer = True
-        for rid, disp in repo_unmerged.items():
-            if rid not in fresh_all:
-                unmerged_items.append(disp)
+            # Skip runs currently being applied, merged, premerged, or gated.
+            if is_run_being_handled(
+                rid,
+                obj,
+                repo_root,
+                applying_procs,
+                merging_procs,
+                active_merge_sources,
+                gate_cwds,
+                lane_runs,
+            ):
+                continue
+
+            # Check work-table deferrals (`delegate work defer`).
+            if rid in work_fresh_def:
+                continue
+            if rid in work_expired_def:
+                stale_run_ids.append(rid)
+            unmerged_items.append((disp, rid))
 
     # Build questioning reminder (always blocks — needs controller reply now).
     if questions:
         names = "、".join(d for d, _, _ in questions[:8])
         cmds = "、".join(f"`delegate reply {rid} '<决定>'`" for _, rid, _ in questions[:3])
         reasons.append(f"有委派正在提问等决定（{names}）：先回答再结束回合（{cmds}）。")
+        log_records.append(
+            {
+                "hook": "question",
+                "runs": names,
+                "runIds": [rid for _, rid, _ in questions[:8]],
+            }
+        )
 
     # Build waiter reminder for live runs.
     if live_current or live_other:
-        waiters = active_waiter_cmdlines()
-        has_any_waiter = bool(waiters)
-        has_machine_waiter = any("--machine" in w for w in waiters)
+        waiter_argvs = active_waiter_argvs(procs)
+        has_any_waiter = bool(waiter_argvs)
+        has_machine_waiter = any("--machine" in args for args in waiter_argvs)
 
         uncovered_cur = [] if has_any_waiter else live_current
         uncovered_other = [
-            disp
+            (disp, rid)
             for disp, rid in live_other
-            if not has_machine_waiter and not any(rid in w for w in waiters)
+            if not has_machine_waiter and not any(any(rid in tok for tok in args) for args in waiter_argvs)
         ]
+        waiter_log_names: list[str] = []
+        waiter_log_ids: list[str] = []
         if uncovered_cur:
-            names = "、".join(uncovered_cur[:5])
+            names = "、".join(d for d, _ in uncovered_cur[:5])
             reasons.append(
-                f"还有委派在跑（{names}），但没有 delegate wait 挂着：在后台挂上 `{delegate_bin} wait` 再结束回合。"
+                f"还有委派在跑（{names}），但没有 delegate wait 挂着：在后台挂上 `{delegate_cmd} wait` 再结束回合。"
             )
+            waiter_log_names.extend(d for d, _ in uncovered_cur[:5])
+            waiter_log_ids.extend(rid for _, rid in uncovered_cur[:5])
         if uncovered_other:
-            names = "、".join(uncovered_other[:5])
+            names = "、".join(d for d, _ in uncovered_other[:5])
             reasons.append(
-                f"其他仓库还有委派在跑（{names}），但没有对应 waiter：在后台挂上 `{delegate_bin} wait --machine` 或切到对应仓库处理。"
+                f"其他仓库还有委派在跑（{names}），但没有对应 waiter：在后台挂上 `{delegate_cmd} wait --machine` 或切到对应仓库处理。"
+            )
+            waiter_log_names.extend(d for d, _ in uncovered_other[:5])
+            waiter_log_ids.extend(rid for _, rid in uncovered_other[:5])
+        if waiter_log_names:
+            log_records.append(
+                {
+                    "hook": "waiter",
+                    "runs": "、".join(waiter_log_names[:8]),
+                    "runIds": waiter_log_ids[:8],
+                }
             )
 
     # Build unmerged reminder.
     if unmerged_items:
-        names = "、".join(unmerged_items[:8])
-        hours_str = str(int(defer_hours)) if defer_hours == int(defer_hours) else str(defer_hours)
+        names = "、".join(d for d, _ in unmerged_items[:8])
         stale_note = (
-            f"其中延后超过 {hours_str} 小时的要重新决定：合、清掉，或重新暂缓。"
-            if has_stale_defer
+            "其中暂缓已到期的要重新决定：合、清掉，或重新暂缓。"
+            if stale_run_ids
             else ""
         )
         reasons.append(
             f"有已交付的委派还没合也没写明原因（{names}）。{stale_note}"
             "现在就合（delegate apply），或合不了就执行 `delegate work defer <run> --reason \"…\" --until 4h` 再结束回合。"
         )
+        log_records.append(
+            {
+                "hook": "unmerged",
+                "runs": names,
+                "runIds": [rid for _, rid in unmerged_items[:8]],
+                "stale": ",".join(stale_run_ids[:8]),
+            }
+        )
 
     if not reasons:
         return None
+    append_stop_logs(log_records)
     return {"decision": "block", "reason": "\n".join(reasons[:8])}
 
 

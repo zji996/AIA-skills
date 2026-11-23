@@ -93,6 +93,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "Manage the machine-wide unified work table (<state>/work.jsonl): list, show, add, wait (--after-applied), close, drop, defer, import-md.",
     ),
     (
+        "hook",
+        "Inspect Stop hook telemetry (<state>/stop-hook.jsonl): weekly trigger counts and post-block outcomes (hook stats).",
+    ),
+    (
         "events",
         "Show or follow the machine-wide append-only event stream (--since, --follow, --rebuild, --json).",
     ),
@@ -281,8 +285,13 @@ pub fn print(command: Option<&str>) -> bool {
             ("wait <Wxx|Qxx|Dxxx> [--after-applied RUN] [--after-delivered RUN] [--after-work Wxx] [--wait-owner Qxx] [--after-time TIME] [--wait-manual TEXT] [--brief FILE] [--auto -- <start-args>] [--clear]", "Attach or update wait_on conditions on a work item (blocks until satisfied; unlocks on apply/finish or auto-dispatches with --auto)."),
             ("close <Wxx|Qxx|Dxxx> --evidence \"<text>\"", "Explicitly close a work item or owner item with evidence (unlocks waiting work items)."),
             ("drop <Wxx|Qxx|Dxxx> --reason \"<text>\"", "Explicitly drop/reject a work item or owner item with a recorded reason."),
-            ("defer <Wxx|Qxx|Dxxx|run> --reason \"<text>\" [--until 4h|24h|YYYY-MM-DD|ISO]", "Defer a work item or unattached run (materializes into work.jsonl) until automatic wake-up."),
+            ("defer <Wxx|Qxx|Dxxx|run> --reason \"<text>\" --until <4h|24h|YYYY-MM-DD|ISO>", "Defer a work item or unattached run (materializes into work.jsonl) with a reason and expiry time."),
             ("import-md <FILE> [--dry-run] [--include-stale] [--repo DIR] [--json]", "Parse a Markdown backlog, cross-check history.jsonl for already-applied/stale items, and preview (--dry-run) or import."),
+        ]),
+        "hook" => ("stats [--weeks N] [--json]", "Read-only weekly Stop hook statistics from <state>/stop-hook.jsonl: trigger counts by hook type and post-block outcomes (waited / applied / deferred / ignored).", &[
+            ("stats", "Aggregate triggers and outcomes by ISO week."),
+            ("--weeks N", "Show only the most recent N weeks."),
+            ("--json", "Print structured JSON output."),
         ]),
         "note" => ("[<run> [text ... | --done [<index> ... | --all]]] [--all] [--json]", "Thin compatibility wrapper over the unified work table (<state>/work.jsonl) for attaching, listing, or completing post-merge todos on a run or reply chain.", &[
             ("run", "Run id, name, or unique fragment (works after clean while pending todos remain). Omit to list all chains with pending todos."),

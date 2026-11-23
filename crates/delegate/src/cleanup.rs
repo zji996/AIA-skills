@@ -452,9 +452,9 @@ fn stop_unit(unit: &str) -> Result<bool, String> {
     }
 }
 
-fn user_units(run: &Path, saved: &mut Value) -> usize {
+fn user_units(run: &Path, config_dir: &Path, saved: &mut Value) -> usize {
     let mut stopped = 0;
-    let keep = keep_executables(run);
+    let keep = keep_executables(config_dir);
     let mut diagnostics = BTreeSet::new();
     if let Some(items) = saved["diagnostics"].as_array() {
         diagnostics.extend(items.iter().filter_map(Value::as_str).map(str::to_string));
@@ -892,10 +892,18 @@ fn members(
 }
 
 pub fn record(run: &Path, pgid: i32) -> usize {
-    let Ok(_guard) = crate::locks::acquire(crate::locks::LockKind::RunLocal, &run.join("cleanup.lock"), true) else {
+    record_with_config(run, run, pgid)
+}
+
+pub fn record_with_config(scope_dir: &Path, config_dir: &Path, pgid: i32) -> usize {
+    let Ok(_guard) = crate::locks::acquire(
+        crate::locks::LockKind::RunLocal,
+        &scope_dir.join("cleanup.lock"),
+        true,
+    ) else {
         return 0;
     };
-    let keep = keep_executables(run);
+    let keep = keep_executables(config_dir);
     if pgid > 0 {
         if let Ok(mut groups) = GROUP_KEEP
             .get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -904,23 +912,23 @@ pub fn record(run: &Path, pgid: i32) -> usize {
             groups.insert(pgid, keep.clone());
         }
     }
-    let scopes = scopes(run);
+    let scopes = scopes(scope_dir);
     let scope_pids = scopes
         .iter()
         .flat_map(|(_, _, pids)| pids.iter().copied())
         .collect();
-    let found = members(run, pgid, &scope_pids, &keep);
+    let found = members(scope_dir, pgid, &scope_pids, &keep);
     let executables: BTreeMap<_, _> = found
         .iter()
         .map(|(pid, _, _, _)| (*pid, executable(*pid)))
         .collect();
-    let supervisor = read(run.join("pid")).trim().parse::<i32>().unwrap_or(0);
+    let supervisor = read(scope_dir.join("pid")).trim().parse::<i32>().unwrap_or(0);
     for (unit, root, pids) in &scopes {
         if !pids.contains(&(std::process::id() as i32)) && !pids.contains(&supervisor) {
             kill_scope(unit, root, pids, &keep);
         }
     }
-    let file = run.join("cleanup.json");
+    let file = scope_dir.join("cleanup.json");
     let mut previous = json(&file);
     if !previous.is_object() {
         previous = value!({"processes":{}});
@@ -952,7 +960,7 @@ pub fn record(run: &Path, pgid: i32) -> usize {
             }
         }
     }
-    let stopped = user_units(run, &mut previous);
+    let stopped = user_units(scope_dir, config_dir, &mut previous);
     let _ = write_json(file, &previous);
     stopped
 }
@@ -982,7 +990,7 @@ pub fn reclaim_on_clean(run: &Path, full_scan: bool) -> usize {
     if !previous.is_object() {
         previous = value!({"processes":{}});
     }
-    let stopped = user_units(run, &mut previous);
+    let stopped = user_units(run, run, &mut previous);
     if stopped > 0 {
         let _ = write_json(file, &previous);
     }

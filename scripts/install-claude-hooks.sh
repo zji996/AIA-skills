@@ -6,6 +6,7 @@ set -euo pipefail
 # delegate-waiter.sh Stop hook entries with skills/delegate/hooks/claude-code-stop.py.
 
 SETTINGS="${HOME}/.claude/settings.json"
+CUSTOM_SETTINGS=0
 ACTION="install"
 STOP_ONLY=0
 
@@ -25,6 +26,7 @@ while [ $# -gt 0 ]; do
     --settings)
       [ $# -ge 2 ] || usage
       SETTINGS="$2"
+      CUSTOM_SETTINGS=1
       shift 2
       ;;
     --stop-only)
@@ -57,7 +59,8 @@ stop_only = sys.argv[3] == "1"
 
 STOP_CMD = 'python3 "$HOME/.claude/skills/delegate/hooks/claude-code-stop.py"'
 BG_CMD = 'python3 "$HOME/.claude/skills/delegate/hooks/claude-code-background.py"'
-LEGACY_STOP_MARKERS = ("delegate-unmerged.sh", "delegate-waiter.sh", "claude-code-stop.py")
+LEGACY_SHELL_MARKERS = ("delegate-unmerged.sh", "delegate-waiter.sh")
+LEGACY_STOP_MARKERS = (*LEGACY_SHELL_MARKERS, "claude-code-stop.py", "delegate hook stop")
 BG_MARKERS = ("claude-code-background.py",)
 
 
@@ -177,7 +180,19 @@ os.replace(tmp, settings_path)
 
 if action == "install":
     note = f" (replaced {removed_stop} previous Stop entry/entries)" if removed_stop else ""
-    print(f"Configured delegate Claude Code Stop hook in {settings_path}{note}.")
+    print(f"Configured unified delegate Claude Code Stop hook in {settings_path}{note}.")
 else:
     print(f"Removed delegate Claude Code hooks from {settings_path}.")
 PY
+
+# When installing into the user's real Claude settings, also run one-time idempotent
+# migration of any legacy `<repo>/.local/delegate/deferred.tsv` into `<state>/work.jsonl`.
+if [ "$ACTION" = "install" ] && [ "$CUSTOM_SETTINGS" = "0" ]; then
+  DELEGATE_BIN="${HOME}/.claude/skills/delegate/bin/delegate"
+  if [ ! -x "$DELEGATE_BIN" ]; then
+    DELEGATE_BIN="$(command -v delegate 2>/dev/null || true)"
+  fi
+  if [ -n "$DELEGATE_BIN" ] && [ -x "$DELEGATE_BIN" ]; then
+    "$DELEGATE_BIN" work --rebuild >/dev/null 2>&1 || true
+  fi
+fi

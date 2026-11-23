@@ -93,9 +93,16 @@ pub fn premerge_log_path(run: &Path) -> PathBuf {
     run.join("premerge.log")
 }
 
+pub fn disabled() -> bool {
+    matches!(
+        std::env::var("DELEGATE_PREMERGE").ok().as_deref(),
+        Some("0" | "false" | "off")
+    )
+}
+
 /// Spawn a detached background `delegate _merge-worker <source>` (non-blocking, zero locks).
 pub fn spawn_worker(source: &Path) {
-    if !source.is_dir() {
+    if disabled() || !source.is_dir() {
         return;
     }
     let canon = canonical_repo(source);
@@ -208,7 +215,7 @@ pub fn is_eligible_fast(run: &Path, meta: &Value, sum: &Value) -> bool {
 /// Write initial pending `premerge.json` right before `finish_run` emits `delivered` & updates
 /// `index.json` so L0 immediately transitions to `预合并中` (not `快进 —`) for eligible runs.
 pub fn mark_pending_before_finish(run: &Path, meta: &Value, sum: &Value) -> bool {
-    if !is_eligible_fast(run, meta, sum) {
+    if disabled() || !is_eligible_fast(run, meta, sum) {
         return false;
     }
     let source = Path::new(s(&meta["worktree"], "source"));
@@ -228,6 +235,9 @@ pub fn mark_pending_before_finish(run: &Path, meta: &Value, sum: &Value) -> bool
 
 /// Trigger premerge after `delegate sign <run>` succeeds.
 pub fn on_sign_success(run: &Path, meta: &Value) {
+    if disabled() {
+        return;
+    }
     let sum = json(run.join("summary.json"));
     if !is_eligible_fast(run, meta, &sum) {
         return;
@@ -601,9 +611,6 @@ pub struct FastForwardPlan {
     pub base_head: String,
     pub merged_tree: String,
     pub changed_paths: Vec<String>,
-    /// True if source working tree has uncommitted changes on OTHER (non-overlapping) paths,
-    /// or has submodules / special index flags requiring full `accept_validity` verification.
-    pub needs_full_validity_check: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -748,17 +755,6 @@ fn dirty_source_paths(source: &Path) -> Res<Vec<String>> {
     Ok(dirty)
 }
 
-fn has_special_index_flags(source: &Path) -> bool {
-    let Ok(raw) = git(source, &["ls-files", "-v", "-z"]) else {
-        return true;
-    };
-    raw.split(|b| *b == 0).any(|entry| {
-        entry
-            .first()
-            .is_some_and(|b| b.is_ascii_lowercase() || *b == b'S')
-    })
-}
-
 fn count_commits_ahead(source: &Path, base: &str, head: &str) -> Option<u64> {
     let range = format!("{base}..{head}");
     git_text(source, &["rev-list", "--count", &range])
@@ -862,20 +858,11 @@ pub fn validate_fast_forward(run: &Path, source: &Path) -> FastForwardCheck {
             return FastForwardCheck::Miss(FastForwardMiss::DirtyOverlap { paths: overlaps });
         }
     }
-    let other_dirty = dirty
-        .iter()
-        .any(|d| !changed_paths.iter().any(|p| paths_overlap(p, d)));
-    let needs_full_validity_check = other_dirty
-        || b(&doc, "reusedFromDirtyBase")
-        || source.join(".gitmodules").is_file()
-        || has_special_index_flags(source);
-
     FastForwardCheck::Hit(FastForwardPlan {
         doc,
         base_head,
         merged_tree,
         changed_paths,
-        needs_full_validity_check,
     })
 }
 
@@ -1187,24 +1174,12 @@ pub(crate) fn apply_fast_forward(
     }
 
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0).round() as u64;
-    let short = &plan.base_head[..7.min(plan.base_head.len())];
     conclusion["fastForward"] = json!({
         "hit": true,
         "baseHead": plan.base_head,
         "mergedTree": plan.merged_tree,
         "ms": elapsed_ms,
     });
-    if !dry && !plan.needs_full_validity_check {
-        let excluded = strings(&json(run.join("summary.json"))["accept"]["excluded"]);
-        if !excluded.is_empty() {
-            conclusion["excluded"] = json!(excluded);
-        }
-        conclusion["acceptValidityScope"] = json!("repository-snapshot");
-        conclusion["acceptStillValid"] = json!(true);
-        conclusion["acceptValidityReason"] = json!(format!(
-            "premerge fast-forward hit (baseHead {short} matches source HEAD; acceptance verified on mergedTree)"
-        ));
-    }
     Ok(Some(worktree::ApplyInnerResult {
         code: 0,
         written,
@@ -1725,11 +1700,13 @@ fn run_premerge_layers(
         );
         let _ = log.flush();
         let t0 = Instant::now();
+        let cleanup_dir = wt_path.parent().unwrap_or(wt_path);
         // No timeout for premerge acceptance; silent commands emit the existing stall_warning.
-        let (code, _timed) = run_shell_with(
+        let (code, _timed) = run_shell_isolated(
             (&spec.command, "premerge"),
             &cwd,
             run,
+            cleanup_dir,
             &eval_meta["env"],
             None,
             &mut log,
@@ -1953,6 +1930,8 @@ fn process_one_run(
         return Ok(false);
     }
 
+    let cleanup_dir = wt_path.parent().unwrap_or(wt_path);
+
     // Regenerate `generated.paths` if `generated.inputs` were touched.
     if merge_res.touches_generated_inputs && !merge_res.generate_command.is_empty() {
         let _slot = lane::acquire_shell(
@@ -1968,10 +1947,11 @@ fn process_one_run(
             .map_err(|e| e.to_string())?;
         let _ = writeln!(log, "=== [premerge:generate] ===\n$ {}", merge_res.generate_command);
         let _ = log.flush();
-        let (code, _) = run_shell_with(
+        let (code, _) = run_shell_isolated(
             (&merge_res.generate_command, "premerge"),
             wt_path,
             run,
+            cleanup_dir,
             &meta["env"],
             None,
             &mut log,
@@ -2031,7 +2011,9 @@ fn process_one_run(
             excluded.push(m.clone());
         }
     }
-    let Some(merged_snap) = changes::repository_snapshot_excluding(wt_path, run, &excluded) else {
+    let Some(merged_snap) =
+        changes::repository_snapshot_excluding(wt_path, cleanup_dir, &excluded)
+    else {
         return Err("failed to snapshot premerge integration worktree".into());
     };
     let merged_tree = s(&merged_snap, "tree").to_string();
@@ -2089,7 +2071,9 @@ fn process_one_run(
     let mut failed_layer = failed_layer;
     let mut extra_error = String::new();
     if accept_ok && !reused_accept {
-        if let Some(after_snap) = changes::repository_snapshot_excluding(wt_path, run, &excluded) {
+        if let Some(after_snap) =
+            changes::repository_snapshot_excluding(wt_path, cleanup_dir, &excluded)
+        {
             if s(&after_snap, "tree") != merged_tree {
                 accept_ok = false;
                 failed_layer = Some("tree-mutated".into());

@@ -125,6 +125,9 @@ class DelegateTests(unittest.TestCase):
                         XDG_CACHE_HOME=str(self.work / "cache"),
                         XDG_CONFIG_HOME=str(self.work / "config"),
                         PI_LOG=str(self.work / "pi.log"),
+                        # Keep background `_merge-worker` off by default for deterministic tests;
+                        # premerge/fast-forward tests explicitly pop DELEGATE_PREMERGE and synchronize.
+                        DELEGATE_PREMERGE="0",
                         # All tiers equal: tests opt into per-purpose routing.
                         DELEGATE_SCOUT_MODEL="p/m", DELEGATE_REVIEW_MODEL="p/m", DELEGATE_WRITE_MODEL="p/m")
         DelegateTests.user_config(self, {"models": REGISTERED_MODELS})
@@ -886,6 +889,22 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
             if time.time() > deadline:
                 self.fail(f"timed out waiting for {what}")
             time.sleep(0.05)
+
+    def wait_premerge(self, run_dir, expected=("ready",), timeout=15.0):
+        pm_file = Path(run_dir) / "premerge.json"
+        wanted = set(expected)
+
+        def check():
+            if not pm_file.is_file():
+                return False
+            try:
+                doc = json.loads(pm_file.read_text())
+            except ValueError:
+                return False
+            return doc.get("status") in wanted
+
+        self.until(check, f"premerge.json status in {wanted}", timeout=timeout)
+        return json.loads(pm_file.read_text())
 
     def hold_lane(self, seconds):
         """Occupy the heavy lane from another process, as a caller's own check would."""

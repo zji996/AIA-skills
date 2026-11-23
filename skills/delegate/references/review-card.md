@@ -19,10 +19,10 @@
 内置 9 类确定性规则（均由宿主基于 diff 计算）：
 1. `model_visible`（模型可见文字，高）：沿用 `controllerReviewPaths`。
 2. `migration_schema`（迁移/Schema，高）：`migrations/**`、`*.sql`、`schema.*`、`*.proto`、`*.graphql` 或 SQL DDL。
-3. `weakened_test`（测试减弱，高）：删除测试文件/测试定义、净删减断言或新增 `#[ignore]`/`.skip`/`@pytest.mark.skip`。
-4. `dependency`（依赖/Lockfile，中）：lockfile 变更或清单文件新增依赖。
+3. `weakened_test`（测试减弱，高）：删除测试文件/测试定义、净删减断言或按语言与语法识别新增跳过标记（Rust `#[ignore]`、Python `@pytest.mark.skip`/`@unittest.skip`、JS/TS `it.skip`/`xit(`、Go `t.Skip`，不误命 `sys.exit`）。
+4. `dependency`（依赖/Lockfile，中）：lockfile 变更（仅本包自身版本号变化除外）或清单文件新增依赖。
 5. `protected_path`（受保护路径，高）：命中 `protect` / `defaults.protect`（含 `--allow` 放开项）。
-6. `config_constant`（配置/常量，中）：数字常量、配置限额或超时默认值变更。
+6. `config_constant`（配置/常量，中）：`const`/`static` 数值定义（不含 `[&str; N]` 数组类型长度）、配置限额或含 `timeout`/`limit`/`max`/`default`/`threshold` 等配置词的默认值/超时变更（不含 `7.min(len)` 切片截取与普通字段回退）。
 7. `concurrency_unsafe`（锁/并发/unsafe，高/中）：`unsafe`、`Mutex`/`RwLock`/`flock`/原子或线程原语。
 8. `secret_internal`（敏感信息/内网，严重）：私钥、常见 Token/硬编码凭据、内网 IP 或内网主机名。
 9. `large_deletion`（大段删除，中）：单 hunk 删除 ≥40 行且净删明显，或整文件删除。

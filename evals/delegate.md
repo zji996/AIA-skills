@@ -1,5 +1,11 @@
 # delegate
 
+## 6.36 Stop 钩子合一、工作表与审查卡误报修复
+
+- 统一 Stop 钩子（零锁、零 git）：`hooks/claude-code-stop.py` 合并 waiter/unmerged/事件游标拦截且只读 `state/index.json` 与快照，识别 PATH 裸 `delegate wait` 与带路径写法，跳过进行中的 `apply`/合入员（含 `_merge-worker`）/门禁（`lane`）与零改动交付；延后走 `delegate work defer --reason … --until …` 并删掉钩子侧 `deferred.tsv`；每次拦截写 `<state>/stop-hook.jsonl`，`delegate hook stats` 按周统计触发与处理去向；`scripts/install-claude-hooks.sh` 仅装单一 Stop 钩子并移除旧脚本配置。Unified zero-lock/zero-git Stop hook with bare/path waiter matching, in-flight apply/merge/lane & zero-change exemptions, work-table deferrals, stop-hook.jsonl logging, and weekly `delegate hook stats`.
+- 工作表误报修复（W044）：已 clean/归档的 run 不再影响工作项状态（带手动前置条件的项如实保持 `blocked`），零改动交付在工作表里显示为「已收取」而非 `attention · 待合 +0f`。Cleaned/archived runs no longer drive work item state and zero-change deliveries display as 已收取.
+- 审查卡误报修复：lockfile 仅本包自身版本号变化不报依赖风险；跳过标记按语言与语法识别（`sys.exit` 不误命 `xit`）；`[&str; N]` 数组长度、`7.min(len)` 切片截取与普通字段 `unwrap_or` 不误报配置/常量风险。Review card false-positive fixes for lockfile self-version bumps, language-aware skip markers, and config/constant heuristics.
+
 ## 6.35 后台预合并与快进 apply
 
 - 写入任务交付（或命中 `controllerReviewPaths` 后完成 `delegate sign`）：后台按仓库单实例拉起 `_merge-worker`（`LOCK_NB`），在 `<cache>` 持久化集成 worktree（复用 `target/` 与 `node_modules/`）做源 HEAD + 净 diff 三方合并并只跑命中的 `acceptRules` 层（未配则跑 `accept`），钉 `refs/delegate/premerge/<run>` 并写 `premerge.json`；L0/L1 与 TUI run 行、工作表「此刻在干什么」实时展示 `预合并中` → `快进 ✓（基于 <short>）` / `快进 ✗ 主干已前进` / `预合并冲突：<文件>`。Background per-repo `_merge-worker` premerge with persistent cache worktree, pinned premerge ref, and live L0/L1/TUI fast-forward states.

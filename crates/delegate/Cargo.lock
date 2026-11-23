@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "delegate"
-version = "6.35.0"
+version = "6.36.0"
 dependencies = [
  "libc",
  "serde_json",

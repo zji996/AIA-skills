@@ -993,29 +993,49 @@ fn migrate_legacy_impl(state: &Path, items: &mut Vec<WorkItem>, persist: bool) -
 // Run lookup & wait_on evaluation (zero token, pure deterministic)
 // ---------------------------------------------------------------------------
 
-fn find_run_dir(run_ref: &str, preferred_dirs: &BTreeMap<String, String>, state: &Path) -> Option<PathBuf> {
+fn is_archived_run_dir(dir: &Path) -> bool {
+    if crate::archive::is_record(dir) {
+        return true;
+    }
+    if dir.file_name().and_then(|n| n.to_str()) == Some("record")
+        && dir
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+            == Some("archive")
+    {
+        return true;
+    }
+    dir.parent()
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str())
+        == Some(".applied")
+}
+
+/// Find a live (non-archived, non-cleaned) run directory across registered repos.
+/// Never resolves `<cache>/archive/<run>/record` or legacy `<runs>/.applied/<run>`.
+fn find_live_run_dir(
+    run_ref: &str,
+    preferred_dirs: &BTreeMap<String, String>,
+    state: &Path,
+) -> Option<PathBuf> {
     if let Some(p) = preferred_dirs.get(run_ref) {
         let pb = PathBuf::from(p);
-        if pb.join("meta.json").is_file() {
+        if pb.join("meta.json").is_file() && !is_archived_run_dir(&pb) {
             return Some(pb);
         }
     }
-    if let Ok(p) = runs::resolve_head(run_ref) {
-        if p.join("meta.json").is_file() {
-            return Some(p);
-        }
-    }
-    // Search registered repos' runs dirs (exact match first, then unique suffix/substring)
     let mut partial_matches = Vec::new();
     for (_, runs_dir) in registered_repo_runs(state) {
         let exact = runs_dir.join(run_ref);
-        if exact.join("meta.json").is_file() {
+        if exact.join("meta.json").is_file() && !is_archived_run_dir(&exact) {
             return Some(exact);
         }
         if let Ok(rd) = fs::read_dir(&runs_dir) {
             for ent in rd.flatten() {
                 let p = ent.path();
-                if !p.join("meta.json").is_file() {
+                if !p.join("meta.json").is_file() || is_archived_run_dir(&p) {
                     continue;
                 }
                 let fname = ent.file_name().to_string_lossy().into_owned();
@@ -1030,6 +1050,46 @@ fn find_run_dir(run_ref: &str, preferred_dirs: &BTreeMap<String, String>, state:
     }
     if partial_matches.len() == 1 {
         return partial_matches.into_iter().next();
+    }
+    None
+}
+
+fn delivered_pending_files(rdir: &Path, meta: &Value, sum: &Value) -> u64 {
+    if let Some(pending) = sum.get("pendingChanges").filter(|v| v.is_object()) {
+        return pending["files"].as_u64().unwrap_or(0);
+    }
+    let own = sum["changes"]["files"].as_u64().unwrap_or(0);
+    if own > 0 {
+        return own;
+    }
+    if meta["worktree"].is_object() {
+        if let Some(parent_dir) = rdir.parent() {
+            let all = runs::all_runs_in(parent_dir);
+            let chain_f = runs::chain_pending_apply_files_opts(rdir, meta, sum, &all, false);
+            if chain_f > 0 {
+                return chain_f as u64;
+            }
+        }
+    }
+    0
+}
+
+fn is_zero_change_delivered(rdir: &Path, meta: &Value, sum: &Value) -> bool {
+    runs::state(rdir) == "delivered"
+        && s(meta, "mode") == "write"
+        && !rdir.join(".applied").exists()
+        && !rdir.join(".applied-cleaned").exists()
+        && delivered_pending_files(rdir, meta, sum) == 0
+}
+
+fn find_run_dir(run_ref: &str, preferred_dirs: &BTreeMap<String, String>, state: &Path) -> Option<PathBuf> {
+    if let Some(p) = find_live_run_dir(run_ref, preferred_dirs, state) {
+        return Some(p);
+    }
+    if let Ok(p) = runs::resolve_head(run_ref) {
+        if p.join("meta.json").is_file() {
+            return Some(p);
+        }
     }
     None
 }
@@ -1404,13 +1464,24 @@ pub fn evaluate_condition(
     }
 }
 
-fn latest_live_run(item: &WorkItem, state: &Path) -> Option<(String, PathBuf)> {
+fn latest_live_run_excluding(
+    item: &WorkItem,
+    state: &Path,
+    exclude_run: Option<&str>,
+) -> Option<(String, PathBuf)> {
     for rid in item.runs.iter().rev() {
-        if let Some(dir) = find_run_dir(rid, &item.run_dirs, state) {
+        if exclude_run.is_some_and(|ex| ex == rid.as_str()) {
+            continue;
+        }
+        if let Some(dir) = find_live_run_dir(rid, &item.run_dirs, state) {
             return Some((rid.clone(), dir));
         }
     }
     None
+}
+
+fn latest_live_run(item: &WorkItem, state: &Path) -> Option<(String, PathBuf)> {
+    latest_live_run_excluding(item, state, None)
 }
 
 struct ReconcileOutcome {
@@ -1422,6 +1493,14 @@ struct ReconcileOutcome {
 }
 
 fn reconcile_all_locked(state: &Path, items: &mut [WorkItem]) -> ReconcileOutcome {
+    reconcile_all_locked_excluding(state, items, None)
+}
+
+fn reconcile_all_locked_excluding(
+    state: &Path,
+    items: &mut [WorkItem],
+    exclude_run: Option<&str>,
+) -> ReconcileOutcome {
     let now_epoch = epoch() as i64;
     let now_iso = iso();
     let verify_stale_secs = std::env::var("DELEGATE_WORK_STALE_VERIFY_HOURS")
@@ -1468,9 +1547,10 @@ fn reconcile_all_locked(state: &Path, items: &mut [WorkItem]) -> ReconcileOutcom
             }
         }
 
-        // 2. Inspect latest live run (if any)
+        // 2. Inspect latest live (uncleaned) run, if any.
         let mut live_state: Option<String> = None;
-        if let Some((_, rdir)) = latest_live_run(item, state) {
+        let mut live_zero_change_delivered = false;
+        if let Some((_, rdir)) = latest_live_run_excluding(item, state, exclude_run) {
             let st = runs::state(&rdir);
             let meta = json(rdir.join("meta.json"));
             let sum = json(rdir.join("summary.json"));
@@ -1501,10 +1581,17 @@ fn reconcile_all_locked(state: &Path, items: &mut [WorkItem]) -> ReconcileOutcom
                     if !is_applied {
                         live_state = Some("attention".into());
                     }
-                } else if (st == "delivered" && !is_applied && s(&meta, "mode") == "write")
-                    || (st == "answered"
-                        && !rdir.join(".delivered").exists()
-                        && s(&meta, "resultReadAt").is_empty())
+                } else if st == "delivered" && !is_applied && s(&meta, "mode") == "write" {
+                    if delivered_pending_files(&rdir, &meta, &sum) > 0 {
+                        live_state = Some("attention".into());
+                    } else {
+                        // Zero-change delivery needs no merge; let wait_on take precedence,
+                        // otherwise show as 已收取 in verify.
+                        live_zero_change_delivered = true;
+                    }
+                } else if st == "answered"
+                    && !rdir.join(".delivered").exists()
+                    && s(&meta, "resultReadAt").is_empty()
                 {
                     live_state = Some("attention".into());
                 } else if is_applied {
@@ -1579,8 +1666,11 @@ fn reconcile_all_locked(state: &Path, items: &mut [WorkItem]) -> ReconcileOutcom
             }
             continue;
         }
-        if item.state == "deferred" || item.state == "active" {
-            let next_st = if item.has_open_closure() && (item.applied || item.cleaned || !item.runs.is_empty()) {
+        if matches!(item.state.as_str(), "deferred" | "active" | "attention") {
+            let next_st = if live_zero_change_delivered
+                || (item.has_open_closure()
+                    && (item.applied || item.cleaned || !item.runs.is_empty()))
+            {
                 "verify"
             } else {
                 "ready"
@@ -1971,7 +2061,9 @@ pub fn on_run_finished(run: &Path, meta: &Value, summary: &Value) {
                     st,
                     "rejected" | "failed" | "malformed" | "timeout" | "stalled" | "killed" | "crashed"
                 )
-                || (st == "delivered" && s(meta, "mode") == "write")
+                || (st == "delivered"
+                    && s(meta, "mode") == "write"
+                    && delivered_pending_files(run, meta, summary) > 0)
                 || st == "answered"
             {
                 Some("attention")
@@ -2476,35 +2568,34 @@ pub fn on_run_cleaned(run: &Path, meta: &Value) -> Option<String> {
             || !s(meta, "appliedAt").is_empty();
         let mut snap: Option<WorkItem> = None;
         let mut changed = false;
+        let mut target_pos: Option<usize> = None;
         if let Some(pos) = items
             .iter()
             .position(|w| (!wid.is_empty() && w.id == wid) || w.matches_run(&rid))
         {
+            target_pos = Some(pos);
             let entry = &mut items[pos];
             if is_applied {
                 entry.applied = true;
             }
             let others_live = entry.runs.iter().any(|other| {
                 other != &rid
-                    && parent_dir.is_some_and(|p| p.join(other).join("meta.json").is_file())
+                    && parent_dir.is_some_and(|p| {
+                        let cand = p.join(other);
+                        cand.join("meta.json").is_file() && !is_archived_run_dir(&cand)
+                    })
             });
             if !others_live {
                 entry.cleaned = true;
             }
-            if entry.state != "done"
-                && entry.has_open_closure()
-                && entry.cleaned
-                && (entry.state == "attention" || entry.state == "active")
-            {
-                entry.set_state("verify", &now_iso);
-            }
             entry.updated_at = now_iso;
-            snap = Some(entry.clone());
             changed = true;
         }
-        // Reconcile downstream `wait_on: run_applied:<rid>` items if this run was applied!
-        let outcome = if is_applied {
-            let o = reconcile_all_locked(&state, &mut items);
+        // Reconcile immediately treating `rid` as already cleaned (before trash rename),
+        // so cleaned runs never keep a work item stuck in `attention` and applied runs
+        // unlock downstream `run_applied:<rid>` dependencies right away.
+        let outcome = if is_applied || target_pos.is_some() {
+            let o = reconcile_all_locked_excluding(&state, &mut items, Some(&rid));
             if o.changed {
                 changed = true;
             }
@@ -2512,6 +2603,9 @@ pub fn on_run_cleaned(run: &Path, meta: &Value) -> Option<String> {
         } else {
             None
         };
+        if let Some(pos) = target_pos {
+            snap = Some(items[pos].clone());
+        }
         if changed {
             let _ = save_raw(&state, &items);
         }
@@ -2956,12 +3050,11 @@ fn focus_for_item(item: &WorkItem, all_items: &[WorkItem], state: &Path, now_epo
                     return format!("run {} 需主控审查", short_run_id(&rid));
                 }
                 if st == "delivered" {
-                    let files = sum
-                        .get("pendingChanges")
-                        .filter(|v| v.is_object())
-                        .and_then(|v| v["files"].as_u64())
-                        .or_else(|| sum["changes"]["files"].as_u64())
-                        .unwrap_or(0);
+                    let meta = json(rdir.join("meta.json"));
+                    let files = delivered_pending_files(&rdir, &meta, &sum);
+                    if files == 0 {
+                        return "已收取".into();
+                    }
                     let rev_tag = if review_v == "PASS" { " 审PASS" } else { "" };
                     let acc_tag = if sum["accept"]["ok"] == json!(true) {
                         " 验✓"
@@ -3009,6 +3102,17 @@ fn focus_for_item(item: &WorkItem, all_items: &[WorkItem], state: &Path, now_epo
             let pending = item.pending_followups();
             if pending > 0 {
                 return format!("待办 {pending} 条");
+            }
+            if let Some((_, rdir)) = latest_live_run(item, state) {
+                let meta = json(rdir.join("meta.json"));
+                let sum = json(rdir.join("summary.json"));
+                if is_zero_change_delivered(&rdir, &meta, &sum) {
+                    return if !item.done_when.is_empty() {
+                        format!("已收取 · 待验({})", clip_chars(&item.done_when, 12))
+                    } else {
+                        "已收取".into()
+                    };
+                }
             }
             let age = format_age(&item.state_since, now_epoch);
             if !item.done_when.is_empty() {
@@ -3060,6 +3164,10 @@ fn next_action_for(item: &WorkItem, _all_items: &[WorkItem], state: &Path) -> St
                     return format!("reply {short} \"…\"");
                 }
                 if st == "delivered" {
+                    let meta = json(rdir.join("meta.json"));
+                    if delivered_pending_files(&rdir, &meta, &sum) == 0 {
+                        return format!("result {short}");
+                    }
                     return format!("apply {short}");
                 }
                 if st == "answered" {
@@ -3236,17 +3344,20 @@ fn ephemeral_run_rows(items: &[WorkItem], state: &Path, now_epoch: i64) -> Vec<T
                     format!("reply {} \"…\"", short_run_id(rid)),
                 )
             } else if st == "delivered" && s(meta, "mode") == "write" {
-                let files = sum
-                    .get("pendingChanges")
-                    .filter(|v| v.is_object())
-                    .and_then(|v| v["files"].as_u64())
-                    .or_else(|| sum["changes"]["files"].as_u64())
-                    .unwrap_or(0);
-                (
-                    "attention".to_string(),
-                    format!("待合 +{files}f"),
-                    format!("apply {}", short_run_id(rid)),
-                )
+                let files = delivered_pending_files(r, meta, &sum);
+                if files == 0 {
+                    (
+                        "verify".to_string(),
+                        "已收取".to_string(),
+                        format!("clean {}", short_run_id(rid)),
+                    )
+                } else {
+                    (
+                        "attention".to_string(),
+                        format!("待合 +{files}f"),
+                        format!("apply {}", short_run_id(rid)),
+                    )
+                }
             } else if st == "answered"
                 && !r.join(".delivered").exists()
                 && s(meta, "resultReadAt").is_empty()
@@ -3391,10 +3502,14 @@ fn render_card(item: &WorkItem, all_items: &[WorkItem], state: &Path, now_epoch:
     if !item.runs.is_empty() {
         lines.push(format!("关联运行（{}）：", item.runs.len()));
         for rid in item.runs.iter().rev().take(5).rev() {
-            if let Some(rdir) = find_run_dir(rid, &item.run_dirs, state) {
+            if let Some(rdir) = find_live_run_dir(rid, &item.run_dirs, state) {
                 let st = runs::state(&rdir);
+                let meta = json(rdir.join("meta.json"));
+                let sum = json(rdir.join("summary.json"));
                 let applied_tag = if rdir.join(".applied").exists() || rdir.join(".applied-cleaned").exists() {
                     " · 已合入"
+                } else if is_zero_change_delivered(&rdir, &meta, &sum) {
+                    " · 已收取"
                 } else {
                     ""
                 };
@@ -5134,15 +5249,21 @@ fn defer_cmd(args: &[String]) -> Res<i32> {
     }
 
     let raw = target_raw
-        .ok_or("usage: delegate work defer <Wxx|run> --reason \"<暂缓原因>\" [--until <4h|24h|YYYY-MM-DD|ISO>]")?;
+        .ok_or("usage: delegate work defer <Wxx|run> --reason \"<暂缓原因>\" --until <4h|24h|YYYY-MM-DD|ISO>")?;
     let r = reason
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             format!("work defer requires --reason \"<原因>\" (e.g. delegate work defer {raw} --reason \"等上游窗口\" --until 4h)")
         })?;
+    let u = until_raw
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            format!("work defer requires --until <4h|24h|YYYY-MM-DD|ISO> (e.g. delegate work defer {raw} --reason \"等上游窗口\" --until 4h)")
+        })?;
     let now_epoch = epoch() as i64;
-    let until_iso = parse_time_spec(until_raw.as_deref().unwrap_or("4h"), now_epoch)?;
+    let until_iso = parse_time_spec(&u, now_epoch)?;
 
     let state = state_dir();
     fs::create_dir_all(&state).map_err(|e| e.to_string())?;
@@ -5199,6 +5320,7 @@ fn defer_cmd(args: &[String]) -> Res<i32> {
 
     if !deferred_item.runs.is_empty() {
         events::mark_runs_read(&deferred_item.runs);
+        crate::hook::record_action("defer", &deferred_item.runs, Some(&deferred_item.id), false);
     }
     if json_mode {
         println!("{}", deferred_item.to_json());
@@ -5719,6 +5841,157 @@ mod tests {
         assert!(card.contains("主控建议：建议先跑 2 天验证再决定"), "{card}");
         assert!(card.contains("不定会怎样：沿用固定片段"), "{card}");
         assert!(card.contains("成本：2 天开发"), "{card}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn w044_cleaned_and_zero_change_runs_do_not_force_attention() {
+        let dir = temp_dir("w044");
+        let state = dir.join("state");
+        let repo = dir.join("repo");
+        let runs_dir = repo.join(".local/run/delegate");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&runs_dir).unwrap();
+        notes::register_repo_paths(&state, &repo, &runs_dir);
+
+        // 1) W038-like item: manual wait_on + a live zero-change delivered write run
+        let r0 = runs_dir.join("20261123-100000-zero");
+        fs::create_dir_all(&r0).unwrap();
+        write_json(
+            r0.join("meta.json"),
+            &json!({"run": "20261123-100000-zero", "name": "zero", "mode": "write", "workId": "W038"}),
+        )
+        .unwrap();
+        write_json(
+            r0.join("summary.json"),
+            &json!({
+                "state": "delivered",
+                "changes": {"files": 0, "added": 0, "deleted": 0},
+                "pendingChanges": {"files": 0, "added": 0, "deleted": 0}
+            }),
+        )
+        .unwrap();
+        fs::write(r0.join("exit_code"), "0\n").unwrap();
+
+        let mut w038 = WorkItem {
+            id: "W038".into(),
+            title: "Phase 0 收尾".into(),
+            repo: repo.to_string_lossy().into_owned(),
+            state: "attention".into(), // simulate stale attention from pre-6.36
+            wait_on: vec!["manual:Phase 0 A/B 收集中".into()],
+            created_at: "2026-11-23T08:00:00Z".into(),
+            updated_at: "2026-11-23T08:00:00Z".into(),
+            state_since: "2026-11-23T08:00:00Z".into(),
+            ..Default::default()
+        };
+        w038.add_run("20261123-100000-zero", Some(&r0), Some(&repo.to_string_lossy()));
+
+        // 2) Live zero-change delivered write run WITHOUT wait_on -> verify + focus "已收取"
+        let r1 = runs_dir.join("20261123-100500-zero2");
+        fs::create_dir_all(&r1).unwrap();
+        write_json(
+            r1.join("meta.json"),
+            &json!({"run": "20261123-100500-zero2", "name": "zero2", "mode": "write", "workId": "W039"}),
+        )
+        .unwrap();
+        write_json(
+            r1.join("summary.json"),
+            &json!({
+                "state": "delivered",
+                "changes": {"files": 0, "added": 0, "deleted": 0},
+                "pendingChanges": {"files": 0, "added": 0, "deleted": 0}
+            }),
+        )
+        .unwrap();
+        fs::write(r1.join("exit_code"), "0\n").unwrap();
+
+        let mut w039 = WorkItem {
+            id: "W039".into(),
+            title: "零改动确认".into(),
+            repo: repo.to_string_lossy().into_owned(),
+            state: "active".into(),
+            created_at: "2026-11-23T08:05:00Z".into(),
+            updated_at: "2026-11-23T08:05:00Z".into(),
+            state_since: "2026-11-23T08:05:00Z".into(),
+            ..Default::default()
+        };
+        w039.add_run("20261123-100500-zero2", Some(&r1), Some(&repo.to_string_lossy()));
+
+        // 3) Archived/cleaned run directory (under archive/<run>/record) must be ignored completely!
+        let arch_rec = dir.join("archive/20261123-090000-old/record");
+        fs::create_dir_all(&arch_rec).unwrap();
+        write_json(
+            arch_rec.join("meta.json"),
+            &json!({"run": "20261123-090000-old", "name": "old", "mode": "write", "workId": "W040"}),
+        )
+        .unwrap();
+        write_json(
+            arch_rec.join("summary.json"),
+            &json!({
+                "state": "delivered",
+                "changes": {"files": 2, "added": 10, "deleted": 1},
+                "pendingChanges": {"files": 2, "added": 10, "deleted": 1}
+            }),
+        )
+        .unwrap();
+        fs::write(arch_rec.join("exit_code"), "0\n").unwrap();
+
+        let mut w040 = WorkItem {
+            id: "W040".into(),
+            title: "已归档项".into(),
+            repo: repo.to_string_lossy().into_owned(),
+            state: "attention".into(),
+            wait_on: vec!["manual:等待外部".into()],
+            cleaned: true,
+            created_at: "2026-11-23T07:00:00Z".into(),
+            updated_at: "2026-11-23T07:00:00Z".into(),
+            state_since: "2026-11-23T07:00:00Z".into(),
+            ..Default::default()
+        };
+        w040.add_run("20261123-090000-old", Some(&arch_rec), Some(&repo.to_string_lossy()));
+
+        let mut items = vec![w038, w039, w040];
+        let now_epoch = epoch() as i64;
+        reconcile_all_locked(&state, &mut items);
+
+        assert_eq!(items[0].state, "blocked", "W038 must honor manual wait_on, not attention");
+        assert!(
+            focus_for_item(&items[0], &items, &state, now_epoch).contains("Phase 0 A/B 收集中")
+        );
+
+        assert_eq!(items[1].state, "verify", "live zero-change delivery should move to verify");
+        assert_eq!(focus_for_item(&items[1], &items, &state, now_epoch), "已收取");
+
+        assert_eq!(items[2].state, "blocked", "cleaned/archived run must not affect work state");
+
+        // Also check ephemeral zero-change run shows verify + 已收取
+        let r_eph = runs_dir.join("20261123-101000-ephzero");
+        fs::create_dir_all(&r_eph).unwrap();
+        write_json(
+            r_eph.join("meta.json"),
+            &json!({"run": "20261123-101000-ephzero", "name": "ephzero", "mode": "write"}),
+        )
+        .unwrap();
+        write_json(
+            r_eph.join("summary.json"),
+            &json!({
+                "state": "delivered",
+                "changes": {"files": 0, "added": 0, "deleted": 0},
+                "pendingChanges": {"files": 0, "added": 0, "deleted": 0}
+            }),
+        )
+        .unwrap();
+        fs::write(r_eph.join("exit_code"), "0\n").unwrap();
+
+        let eph_rows = ephemeral_run_rows(&items, &state, now_epoch);
+        let zrow = eph_rows
+            .iter()
+            .find(|r| r.run_id == "20261123-101000-ephzero")
+            .expect("ephemeral zero-change run row");
+        assert_eq!(zrow.state, "verify");
+        assert_eq!(zrow.focus, "已收取");
+        assert!(!zrow.next.starts_with("apply"), "unexpected next: {}", zrow.next);
 
         let _ = fs::remove_dir_all(&dir);
     }

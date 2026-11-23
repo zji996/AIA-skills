@@ -25,7 +25,8 @@
 - `delegate start --work <Wxx> …`：将 run 绑定到工作项；`delegate reply` 自动继承父 run 的 `workId`。
 - `delegate work close <Wxx|Qxx|Dxxx> --evidence "<SHA/测试/所有者结论>"` / `delegate apply --closes <Wxx> <run>`：带证据关闭（关闭所有者事项自动解锁等它的 `owner:Qxx` 下游）。
 - `delegate work drop <Wxx|Qxx|Dxxx> --reason "<放弃/否决理由>"`：留痕放弃/否决（不自动解锁下游，TUI 按 `x` 可查「已否」）。
-- `delegate work defer <Wxx|run> --reason "<原因>" [--until 4h|24h|YYYY-MM-DD|ISO]`：暂缓工作项或将临时 run 升格为暂缓项。
+- `delegate work defer <Wxx|run> --reason "<原因>" --until <4h|24h|YYYY-MM-DD|ISO>`：暂缓工作项或将临时 run 升格为暂缓项（必须提供理由与到期时间，取代旧 `deferred.tsv`）。
+- `delegate hook stats [--weeks N] [--json]`：只读按周统计 `<state>/stop-hook.jsonl` 触发次数与处理去向（挂了 wait / apply 了 / defer 了 / 被忽略了）。
 - `delegate work import-md <文件> [--dry-run] [--include-stale] [--repo <目录>] [--json]`：解析 Markdown 待办并比对 `history.jsonl` 标出疑似已合入/重复项，每条附源文件行号指针。
 
 ## 4. 前置条件与只读边界
@@ -42,5 +43,5 @@
   - `apply`：立即求值 `run_applied` 与 `work_closed`，打印被解锁的可执行 `start --work` 命令或自动派发结果，并说明本项留在 `verify` 的原因。
   - `merge`：提示本次批次合入落盘后将解锁哪些下游项。
   - `clean`：对未关闭工作项印 1 行保留确认，不阻断清理、不写 Stop hook 拦截事件。
-- **Stop Hook 分级**：`hooks/claude-code-stop.py` 只拦当下阻断项（未读告警事件含 `work_ready`/`work_defer_expired`/`work_stale` 经游标消费一次、提问、无 waiter 在跑、未暂缓的已交付未合入）；不再因 `blocked`、`deferred`、未超期 `verify`（含 24h 内合入后待办）或积压 `ready` 反复拦。`verify` 超 24h 或 `ready` 超 48h 按单项 24h 冷却发低频 `work_stale` 事件。
-- **自动迁移**：首次读写 `work.jsonl` 时自动幂等迁入已登记仓库未完成的 `notes.json`（入 `verify`）与未过期的 `deferred.tsv`（入 `deferred`）；`delegate note` 保留为薄壳读写 `work.jsonl`，不再写入 `notes.json`。
+- **Stop Hook 合一与分级**：`hooks/claude-code-stop.py` 为唯一 Stop 钩子，严格零锁、零 git 只读 `state/index.json` 与快照，统一处理未读告警事件（经游标消费一次）、提问、无 waiter 在跑（同时识别 PATH 裸 `delegate wait` 与带路径写法）及未暂缓的已交付未合入（跳过进行中的 `apply`/合入员/门禁与零改动交付）；延后统一走 `delegate work defer`，每次拦截写入 `<state>/stop-hook.jsonl` 供 `delegate hook stats` 统计。不再因 `blocked`、`deferred`、未超期 `verify` 或积压 `ready` 反复拦；已 clean/归档的 run 不再影响工作项状态，零改动交付在工作表里显示为「已收取」。
+- **自动迁移**：升级或读写 `work.jsonl` 时自动幂等迁入已登记仓库未完成的 `notes.json`（入 `verify`）与未过期的历史 `deferred.tsv`（入 `deferred`），Stop hook 不再读取 `deferred.tsv`；`delegate note` 保留为薄壳读写 `work.jsonl`。

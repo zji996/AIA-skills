@@ -22,6 +22,8 @@
 """
 import json
 import os
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -33,7 +35,10 @@ import test_delegate as fixtures
 
 
 class Delegate635Tests(unittest.TestCase):
-    setUp = fixtures.DelegateTests.setUp
+    def setUp(self):
+        fixtures.DelegateTests.setUp(self)
+        self.env.pop("DELEGATE_PREMERGE", None)
+
     fake_pi = fixtures.DelegateTests.fake_pi
     cli = fixtures.DelegateTests.cli
     outcome = fixtures.DelegateTests.outcome
@@ -620,6 +625,220 @@ class Delegate635Tests(unittest.TestCase):
         self.assertEqual(ap2.returncode, 0, ap2.stdout + ap2.stderr)
         self.assertTrue(self.outcome(ap2)["fastForward"]["hit"])
         self.assertEqual((repo / "k2.txt").read_text(), "k2-new\n")
+
+    # ------------------------------------------------------------------
+    # 6. Fast-forward apply MUST run the exact same accept_validity checks
+    #    as non-fast-forward apply, and concurrent worker shells must never
+    #    SIGTERM `apply`'s generate/verify shells.
+    # ------------------------------------------------------------------
+    def _make_repo(self, name: str, files: dict[str, str]) -> Path:
+        repo = self.work / name
+        repo.mkdir(parents=True, exist_ok=True)
+        git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run(git[:3] + ["init", "-q"], check=True)
+        for rel, text in files.items():
+            (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (repo / rel).write_text(text)
+        subprocess.run(git + ["add", "-A"], check=True)
+        subprocess.run(git + ["commit", "-qm", "init"], check=True)
+        return repo
+
+    @staticmethod
+    def _validity_sig(doc: dict) -> tuple:
+        return (
+            "acceptStillValid" in doc,
+            doc.get("acceptStillValid"),
+            doc.get("acceptValidityScope"),
+            doc.get("acceptValidityReason"),
+        )
+
+    def _run_validity_matrix(self, prefix: str, premerge_ready: bool) -> dict[str, tuple]:
+        if premerge_ready:
+            self.env.pop("DELEGATE_PREMERGE", None)
+        else:
+            self.env["DELEGATE_PREMERGE"] = "0"
+
+        results: dict[str, tuple] = {}
+
+        # Case 1: clean valid reuse, legacy snapshot, large untracked, write-tree failure, dry-run
+        repo = self._make_repo(f"{prefix}-basic", {"a.txt": "old\n"})
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo new > a.txt")
+        st = self.outcome(
+            self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "--name", f"{prefix}-basic", "task")
+        )
+        run_dir = Path(st["dir"])
+        if premerge_ready:
+            self.wait_premerge_status(run_dir, {"ready"})
+
+        def reset_clean():
+            self.git(repo, "checkout", "--", "a.txt")
+            for marker in (".applied", ".sync-base"):
+                p = run_dir / marker
+                if p.exists():
+                    p.unlink()
+
+        # 1a. dry-run
+        dry_doc = self.outcome(self.cli("apply", "--json", "--keep", "--dry-run", st["run"]))
+        self.assertEqual(dry_doc["fastForward"]["hit"], premerge_ready, dry_doc)
+        results["dry_run"] = self._validity_sig(dry_doc)
+
+        # 1b. clean valid apply
+        ok_doc = self.outcome(self.cli("apply", "--json", "--keep", st["run"]))
+        self.assertEqual(ok_doc["fastForward"]["hit"], premerge_ready, ok_doc)
+        self.assertEqual(ok_doc["verify"], {"skipped": "acceptStillValid"})
+        results["clean_valid"] = self._validity_sig(ok_doc)
+
+        # 1c. legacy / incomplete acceptance snapshot
+        reset_clean()
+        summary = json.loads((run_dir / "summary.json").read_text())
+        legacy = dict(summary)
+        legacy["accept"] = {"ok": True, "exitCode": 0, "command": "true"}
+        (run_dir / "summary.json").write_text(json.dumps(legacy))
+        leg_doc = self.outcome(self.cli("apply", "--json", "--keep", st["run"]))
+        self.assertEqual(leg_doc["fastForward"]["hit"], premerge_ready, leg_doc)
+        results["legacy_snapshot"] = self._validity_sig(leg_doc)
+        (run_dir / "summary.json").write_text(json.dumps(summary))
+
+        # 1d. large untracked file in source
+        reset_clean()
+        (repo / "large-untracked").write_bytes(b"x" * 2097153)
+        large_doc = self.outcome(self.cli("apply", "--json", "--keep", st["run"]))
+        self.assertEqual(large_doc["fastForward"]["hit"], premerge_ready, large_doc)
+        results["large_untracked"] = self._validity_sig(large_doc)
+        (repo / "large-untracked").unlink()
+
+        # 1e. source snapshot failure (`git write-tree` fails)
+        reset_clean()
+        wrapper = self.bin / "git"
+        real_git = shutil.which("git", path=os.environ["PATH"])
+        wrapper.write_text(
+            f'#!/bin/sh\ncase "$*" in *"write-tree"*) exit 1;; esac\nexec {shlex.quote(real_git)} "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        try:
+            fail_doc = self.outcome(self.cli("apply", "--json", "--keep", st["run"]))
+            self.assertEqual(fail_doc["fastForward"]["hit"], premerge_ready, fail_doc)
+            results["snapshot_failed"] = self._validity_sig(fail_doc)
+        finally:
+            wrapper.unlink()
+
+        # Case 2: generated regeneration changes result relative to accepted tree
+        gen_repo = self._make_repo(
+            f"{prefix}-gen",
+            {
+                ".delegate.json": json.dumps(
+                    {"generated": {"paths": ["gen/"], "command": "cp a.txt gen/out.txt"}}
+                ),
+                "a.txt": "old\n",
+                "gen/out.txt": "old\n",
+            },
+        )
+        self.fake_pi(
+            [fixtures.answer("done"), fixtures.SETTLED],
+            pre="echo next > a.txt; echo different > gen/out.txt",
+        )
+        st_gen = self.outcome(
+            self.cli("run", "--worktree", "--workdir", gen_repo, "--accept", "true", "--name", f"{prefix}-gen", "task")
+        )
+        if premerge_ready:
+            self.wait_premerge_status(Path(st_gen["dir"]), {"ready"})
+        gen_doc = self.outcome(self.cli("apply", "--json", "--keep", st_gen["run"]))
+        self.assertEqual(gen_doc["fastForward"]["hit"], premerge_ready, gen_doc)
+        results["generated_changed"] = self._validity_sig(gen_doc)
+
+        # Case 3: acceptance command mutated worktree
+        mut_repo = self._make_repo(f"{prefix}-mut", {"a.txt": "old\n"})
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo again > a.txt")
+        st_mut = self.outcome(
+            self.cli(
+                "run", "--worktree", "--workdir", mut_repo,
+                "--accept", "echo accept-edit >> a.txt",
+                "--name", f"{prefix}-mut", "task",
+            )
+        )
+        if premerge_ready:
+            self.wait_premerge_status(Path(st_mut["dir"]), {"ready", "failed"})
+        mut_doc = self.outcome(self.cli("apply", "--json", "--keep", st_mut["run"]))
+        results["accept_mutated"] = self._validity_sig(mut_doc)
+
+        return results
+
+    def test_apply_accept_validity_matches_when_premerge_ready(self):
+        ready = self._run_validity_matrix("ready", premerge_ready=True)
+        disabled = self._run_validity_matrix("disabled", premerge_ready=False)
+
+        self.assertEqual(ready, disabled)
+        self.assertFalse(ready["dry_run"][0])
+        self.assertIn("dry run", ready["dry_run"][3])
+        self.assertEqual(ready["clean_valid"][:2], (True, True))
+        self.assertFalse(ready["legacy_snapshot"][0])
+        self.assertIn("incomplete acceptance", ready["legacy_snapshot"][3])
+        self.assertFalse(ready["large_untracked"][0])
+        self.assertIn("large untracked", ready["large_untracked"][3])
+        self.assertFalse(ready["snapshot_failed"][0])
+        self.assertIn("snapshot failed", ready["snapshot_failed"][3])
+        self.assertEqual(ready["generated_changed"][:2], (True, False))
+        self.assertEqual(ready["accept_mutated"][:2], (True, False))
+        self.assertIn("acceptance changed", ready["accept_mutated"][3])
+
+    def test_apply_accept_validity_matches_when_premerge_not_ready(self):
+        # 1. Premerge actively running in parallel with `apply` during `generated` regeneration:
+        #    `_merge-worker`'s shell cleanup MUST NOT SIGTERM `apply`'s generate command, and
+        #    the validity conclusion must match the premerge-ready path identically.
+        repo_live = self._make_repo(
+            "notready-gen-live",
+            {
+                ".delegate.json": json.dumps(
+                    {"generated": {"paths": ["gen/"], "command": "sleep 0.15; cp a.txt gen/out.txt"}}
+                ),
+                "a.txt": "old\n",
+                "gen/out.txt": "old\n",
+            },
+        )
+        self.fake_pi(
+            [fixtures.answer("done"), fixtures.SETTLED],
+            pre="echo new > a.txt; cp a.txt gen/out.txt",
+        )
+        self.env.pop("DELEGATE_PREMERGE", None)
+        self.env["DELEGATE_TEST_PREMERGE_DELAY"] = "0.2"
+        st_live = self.outcome(
+            self.cli("run", "--worktree", "--workdir", repo_live, "--accept", "true", "--name", "nr-live", "task")
+        )
+        self.wait_premerge_status(Path(st_live["dir"]), {"running"})
+        self.env.pop("DELEGATE_TEST_PREMERGE_DELAY", None)
+        ap_live = self.cli("apply", "--json", "--keep", st_live["run"], cwd=repo_live)
+        self.assertEqual(ap_live.returncode, 0, ap_live.stdout + ap_live.stderr)
+        live_doc = self.outcome(ap_live)
+        self.assertTrue(live_doc["apply"]["ok"], live_doc)
+        self.assertFalse(live_doc["fastForward"]["hit"], live_doc)
+        self.assertEqual(live_doc["fastForward"]["missCode"], "premerge_running", live_doc)
+        self.assertIs(live_doc["acceptStillValid"], True, live_doc)
+        self.assertFalse((Path(st_live["dir"]) / ".generate-pending").exists())
+
+        # 2. Same scenario after premerge finishes -> fast-forward hit, identical validity conclusion!
+        repo_ready = self._make_repo(
+            "notready-gen-ready",
+            {
+                ".delegate.json": json.dumps(
+                    {"generated": {"paths": ["gen/"], "command": "cp a.txt gen/out.txt"}}
+                ),
+                "a.txt": "old\n",
+                "gen/out.txt": "old\n",
+            },
+        )
+        self.fake_pi(
+            [fixtures.answer("done"), fixtures.SETTLED],
+            pre="echo new > a.txt; cp a.txt gen/out.txt",
+        )
+        st_ready = self.outcome(
+            self.cli("run", "--worktree", "--workdir", repo_ready, "--accept", "true", "--name", "nr-ready", "task")
+        )
+        self.wait_premerge_status(Path(st_ready["dir"]), {"ready"})
+        ap_ready = self.cli("apply", "--json", "--keep", st_ready["run"], cwd=repo_ready)
+        self.assertEqual(ap_ready.returncode, 0, ap_ready.stdout + ap_ready.stderr)
+        ready_doc = self.outcome(ap_ready)
+        self.assertTrue(ready_doc["fastForward"]["hit"], ready_doc)
+        self.assertEqual(self._validity_sig(live_doc), self._validity_sig(ready_doc))
 
 
 if __name__ == "__main__":

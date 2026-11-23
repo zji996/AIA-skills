@@ -17,6 +17,7 @@ mod gc;
 mod handoff;
 mod help;
 mod history;
+mod hook;
 mod index;
 mod inotify;
 mod jobserver;
@@ -1907,8 +1908,10 @@ fn apply(args: &[String]) -> Res<i32> {
                 let ms = ff["ms"].as_u64().unwrap_or(0);
                 if dry {
                     println!("快进预演 ✓（基于 {short}）");
-                } else {
+                } else if conclusion["acceptStillValid"] == json!(true) {
                     println!("快进合入 ✓（基于 {short}，跳过重跑验收，{ms}ms）");
+                } else {
+                    println!("快进合入 ✓（基于 {short}，{ms}ms）");
                 }
             } else {
                 let reason = s(ff, "reason");
@@ -2076,6 +2079,11 @@ fn apply(args: &[String]) -> Res<i32> {
             applied_records.push((run.clone(), meta, applied));
         }
         if !applied_records.is_empty() {
+            let applied_ids: Vec<String> = applied_records
+                .iter()
+                .map(|(r, m, _)| events::run_id_for(r, m))
+                .collect();
+            hook::record_action("apply", &applied_ids, None, false);
             let work_hints = work::on_runs_applied(&applied_records, closes_work.as_deref());
             work::check_stale_and_expired();
             dag_queue::advance();
@@ -2358,6 +2366,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 ],
                 &["--max", "--since"],
             )?;
+            hook::record_action("wait", &pos, None, has(&flags, "--machine"));
             if has(&flags, "--json") {
                 output::enable_json();
             }
@@ -2846,6 +2855,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
             Ok(0)
         }
         "work" => work::command(rest),
+        "hook" => hook::command(rest),
         "events" => events::command(rest),
         "queue" => dag_queue::command(rest),
         "sign" => review::sign_command(rest),

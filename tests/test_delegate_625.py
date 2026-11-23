@@ -297,7 +297,7 @@ class Delegate625Tests(unittest.TestCase):
             out = res.stdout.strip()
             return json.loads(out) if out else None
 
-        # 1) Unmerged delivered run in repo_a blocks; deferred.tsv silences it until stale.
+        # 1) Unmerged delivered run in repo_a blocks; `delegate work defer` silences it until expiry.
         self.fake_pi([fixtures.answer("done a"), fixtures.SETTLED], pre="echo a1 > a.txt")
         ra = self.outcome(run_in(repo_a, "run", "--worktree", "--name", "feat-a", "--accept", "true", "task a"))
 
@@ -310,22 +310,26 @@ class Delegate625Tests(unittest.TestCase):
         self.assertIn("feat-a", blocked["reason"])
         self.assertIn("delegate apply", blocked["reason"])
 
-        # Add fresh deferral in repo_a/.local/delegate/deferred.tsv -> passes without mutating disk (6.32 zero-side-effect Stop hook).
-        deferred = repo_a / ".local/delegate/deferred.tsv"
-        deferred.parent.mkdir(parents=True, exist_ok=True)
-        deferred.write_text(f"{ra['run']}\t等上游窗口\n")
+        # Add fresh deferral via `delegate work defer` -> passes without mutating disk in Stop hook.
+        def_res = run_in(repo_a, "work", "defer", ra["run"], "--reason", "等上游窗口", "--until", "4h", human=True)
+        self.assertEqual(def_res.returncode, 0, def_res.stdout + def_res.stderr)
         self.assertIsNone(hook(repo_a))
-        self.assertEqual(deferred.read_text(), f"{ra['run']}\t等上游窗口\n")
 
-        # Make deferral stale (> 4 hours old) -> blocks again with stale notice.
-        old_ts = int(time.time()) - 5 * 3600
-        deferred.write_text(f"{ra['run']}\t等上游窗口\t{old_ts}\n")
+        # Expire deferral in work.jsonl -> blocks again with expiry notice.
+        wfile = Path(self.env["XDG_STATE_HOME"]) / "delegate" / "work.jsonl"
+        lines = []
+        for ln in wfile.read_text().splitlines():
+            obj = json.loads(ln)
+            if ra["run"] in obj.get("runs", []):
+                obj["deferUntil"] = "2020-01-01T00:00:00Z"
+            lines.append(json.dumps(obj, ensure_ascii=False))
+        wfile.write_text("\n".join(lines) + "\n")
         stale_block = hook(repo_a)
         self.assertIsNotNone(stale_block)
-        self.assertIn("超过 4 小时", stale_block["reason"])
+        self.assertIn("暂缓已到期", stale_block["reason"])
 
-        # Attach a post-merge note to ra, apply & clean ra -> deferred.tsv is tidied;
-        # under 6.31 graded Stop hook, fresh (<24h) verify/note does not block turn end.
+        # Attach a post-merge note to ra, apply & clean ra;
+        # under graded Stop hook, fresh (<24h) verify/note does not block turn end.
         self.assertEqual(run_in(repo_a, "note", ra["run"], "重启线上进程", human=True).returncode, 0)
         self.assertEqual(run_in(repo_a, "apply", "--json", ra["run"]).returncode, 0)
         self.assertEqual(run_in(repo_a, "clean", "--no-archive", ra["run"], human=True).returncode, 0)

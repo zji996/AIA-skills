@@ -680,6 +680,31 @@ pub fn run_shell_with(
     run_shell_cancellable(command, cwd, run, extra, timeout, log, holder, force_local, None)
 }
 #[allow(clippy::too_many_arguments)]
+pub fn run_shell_isolated(
+    command: (&str, &str),
+    cwd: &Path,
+    run: &Path,
+    cleanup_dir: &Path,
+    extra: &Value,
+    timeout: Option<f64>,
+    log: &mut File,
+    holder: Option<&std::sync::atomic::AtomicI32>,
+    force_local: bool,
+) -> Res<(i32, bool)> {
+    run_shell_inner(
+        command,
+        cwd,
+        run,
+        cleanup_dir,
+        extra,
+        timeout,
+        log,
+        holder,
+        force_local,
+        None,
+    )
+}
+#[allow(clippy::too_many_arguments)]
 pub fn run_shell_cancellable(
     command: (&str, &str),
     cwd: &Path,
@@ -691,11 +716,37 @@ pub fn run_shell_cancellable(
     force_local: bool,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Res<(i32, bool)> {
+    run_shell_inner(
+        command,
+        cwd,
+        run,
+        run,
+        extra,
+        timeout,
+        log,
+        holder,
+        force_local,
+        cancel,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn run_shell_inner(
+    command: (&str, &str),
+    cwd: &Path,
+    run: &Path,
+    cleanup_dir: &Path,
+    extra: &Value,
+    timeout: Option<f64>,
+    log: &mut File,
+    holder: Option<&std::sync::atomic::AtomicI32>,
+    force_local: bool,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Res<(i32, bool)> {
     if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
         return Ok((130, false));
     }
     let (command, role) = command;
-    let mut c = crate::cleanup::scoped_command(run, role, "sh", &[]);
+    let mut c = crate::cleanup::scoped_command(cleanup_dir, role, "sh", &[]);
     c.arg("-c")
         .arg(command)
         .current_dir(cwd)
@@ -718,7 +769,7 @@ pub fn run_shell_cancellable(
     if let Some(path) = crate::deny::shell_path_with(&meta, run, force_local)? {
         c.env("PATH", path);
     }
-    let remote_status = run.join(format!("{role}.remote.json"));
+    let remote_status = cleanup_dir.join(format!("{role}.remote.json"));
     let _ = fs::remove_file(&remote_status);
     c.env("DELEGATE_SHELL_STATUS", &remote_status);
     if !force_local && matches!(role, "accept" | "verify") {
@@ -727,7 +778,7 @@ pub fn run_shell_cancellable(
         c.env_remove("DELEGATE_REMOTE_FALLBACK_ON_MISSING");
     }
     c.env("DELEGATE_LANE_HELD", "1")
-        .env("DELEGATE_RUN_DIR", run);
+        .env("DELEGATE_RUN_DIR", cleanup_dir);
     group(&mut c);
     let started = std::time::Instant::now();
     let queued_before = crate::lane::queued_seconds(run);
@@ -872,7 +923,7 @@ pub fn run_shell_cancellable(
     if warned_stall {
         let _ = fs::remove_file(run.join("stall-warning.json"));
     }
-    crate::cleanup::record(run, pid);
+    crate::cleanup::record_with_config(cleanup_dir, run, pid);
     end_group(pid, if timed { 5.0 } else { 2.0 });
     if let Some(h) = holder {
         h.store(0, std::sync::atomic::Ordering::SeqCst);

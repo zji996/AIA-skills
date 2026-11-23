@@ -2489,9 +2489,7 @@ fn apply_checked(
         }
     }
     conclusion["apply"]["ok"] = json!(code == 0);
-    if !(b(&conclusion["fastForward"], "hit") && conclusion["acceptStillValid"] == json!(true)) {
-        accept_validity(run, dry, &mut conclusion);
-    }
+    accept_validity(run, dry, &mut conclusion);
     let marked = strings(&conclusion["apply"]["conflictMarkers"]);
     let mut total_uncommitted: std::collections::BTreeSet<&str> =
         written_files.iter().map(String::as_str).collect();
