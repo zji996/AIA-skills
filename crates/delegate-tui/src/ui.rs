@@ -49,6 +49,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 render_events_list_pane(frame, app, body[0]);
                 render_event_detail_pane(frame, app, body[1]);
             }
+            ViewTab::Merges => {
+                render_merges_list_pane(frame, app, body[0]);
+                render_merge_detail_pane(frame, app, body[1]);
+            }
+            ViewTab::Candidates => {
+                render_candidates_list_pane(frame, app, body[0]);
+                render_candidate_detail_pane(frame, app, body[1]);
+            }
         }
     } else {
         let body = Layout::default()
@@ -63,6 +71,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             ViewTab::Events => {
                 render_events_list_pane(frame, app, body[0]);
                 render_event_detail_pane(frame, app, body[1]);
+            }
+            ViewTab::Merges => {
+                render_merges_list_pane(frame, app, body[0]);
+                render_merge_detail_pane(frame, app, body[1]);
+            }
+            ViewTab::Candidates => {
+                render_candidates_list_pane(frame, app, body[0]);
+                render_candidate_detail_pane(frame, app, body[1]);
             }
         }
     }
@@ -128,6 +144,16 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         muted()
     };
+    let tab_merges_style = if app.tab == ViewTab::Merges {
+        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        muted()
+    };
+    let tab_candidates_style = if app.tab == ViewTab::Candidates {
+        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        muted()
+    };
 
     let mut spans = vec![
         Span::styled(
@@ -140,6 +166,16 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(
             format!(" 2事件({}) ", app.snapshot.events.len()),
             tab_events_style,
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!(" 3合入({}) ", app.snapshot.merges.len()),
+            tab_merges_style,
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!(" 4候选({}) ", app.snapshot.candidates.len()),
+            tab_candidates_style,
         ),
         Span::raw("  "),
         Span::styled(
@@ -1280,6 +1316,31 @@ fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
+    let leases_strip = lane.leases_summary();
+    let pool_text = if area.width >= 100 {
+        if leases_strip.is_some() {
+            lane.pool_summary(false)
+                .or_else(|| lane.concurrency_summary.clone())
+        } else {
+            lane.concurrency_summary
+                .clone()
+                .or_else(|| lane.pool_summary(false))
+        }
+    } else {
+        lane.compact_concurrency()
+            .or_else(|| lane.concurrency_summary.clone())
+    };
+    if let Some(summary) = pool_text {
+        left_spans.push(Span::styled(" · ", muted()));
+        left_spans.push(Span::styled(summary, muted()));
+    }
+    if let Some(strip) = leases_strip {
+        if area.width >= 90 {
+            left_spans.push(Span::styled(" · ", muted()));
+            left_spans.push(Span::styled(strip, primary()));
+        }
+    }
+
     if !lane.remote.is_empty() {
         let r_run = lane.remote_running();
         let r_q = lane.remote_queued();
@@ -1299,15 +1360,6 @@ fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
             left_spans.push(Span::styled(
                 format!(" +{r_q}排"),
                 Style::default().fg(STATUS_QUEUED),
-            ));
-        }
-    }
-
-    if area.width >= 120 {
-        if let Some(active) = lane.local.iter().chain(lane.remote.iter()).find(|e| e.running) {
-            left_spans.push(Span::styled(
-                format!("  {}", truncate(&active.label, 28)),
-                muted(),
             ));
         }
     }
@@ -1358,16 +1410,30 @@ fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
         let keys = match app.tab {
             ViewTab::Runs => {
                 if area.width >= 100 {
-                    " jk 选择  1/2/e 任务·事件  Tab 切栏  Enter 结论  d diff  / 过滤  r 刷新  a/c/s/p 命令  ? 帮助  q 退出"
+                    " jk 选择  1-4 任务·事件·合入·候选  Tab 切栏  Enter 结论  d diff  / 过滤  r 刷新  a/c/s/p 命令  ? 帮助  q 退出"
                 } else {
-                    " jk选 Tab栏 1/2/e事 Enter结论 d diff /滤 r刷 a/c/s/p令 ?助 q退"
+                    " jk选 Tab栏 1-4切页 Enter结论 d diff /滤 r刷 a/c/s/p令 ?助 q退"
                 }
             }
             ViewTab::Events => {
                 if area.width >= 100 {
-                    " jk 浏览事件  f 切换跟随  1/2/e 返回任务  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
+                    " jk 浏览事件  f 切换跟随  1-4 切页  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
                 } else {
-                    " jk览 f跟随 1/2/e任务 Tab栏 /滤 r刷 ?助 q退"
+                    " jk览 f跟随 1-4切页 Tab栏 /滤 r刷 ?助 q退"
+                }
+            }
+            ViewTab::Merges => {
+                if area.width >= 100 {
+                    " jk 选择合入批次  a/Enter 生成 apply --keep-commits  1-4 切页  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
+                } else {
+                    " jk选 a/Enter合回 1-4切页 Tab栏 /滤 r刷 ?助 q退"
+                }
+            }
+            ViewTab::Candidates => {
+                if area.width >= 100 {
+                    " jk 选择候选  p/Enter 生成 radar pick 草稿命令  1-4 切页  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
+                } else {
+                    " jk选 p/Enter挑草稿 1-4切页 Tab栏 /滤 r刷 ?助 q退"
                 }
             }
         };
@@ -1535,15 +1601,16 @@ fn render_help_modal(frame: &mut Frame, area: Rect) {
     frame.render_widget(block, modal);
 
     let rows = [
-        ("↑↓ / j k", "选择任务/事件 / 滚动详情"),
-        ("1 / 2 / e", "切换「任务」与「事件」标签页"),
+        ("↑↓ / j k", "选择列表项 / 滚动详情"),
+        ("1 / 2 / 3 / 4", "切换「任务 / 事件 / 合入 / 候选」标签页"),
+        ("e / m / b", "快捷切换「事件 / 合入 / 候选」"),
         ("f", "事件页切换自动跟随"),
         ("Tab", "切换焦点栏"),
-        ("Enter", "完整结论（P 交 $PAGER）"),
+        ("Enter", "任务完整结论 / 合入 apply / 候选 pick 命令"),
         ("d", "diff --stat 改动统计"),
         ("/", "过滤（Esc 清除）"),
         ("r", "立即刷新"),
-        ("a / c / s / p", "生成 apply / clean / stop / reply 命令"),
+        ("a / c / s / p", "生成 apply / clean / stop / reply (候选页 pick)"),
         ("y", "复制推荐命令"),
         ("q / Ctrl-C", "关闭浮层 / 退出"),
     ];
@@ -1747,12 +1814,15 @@ fn render_dag_queue_detail_pane(
 
 fn event_kind_color(kind: &str) -> Option<Color> {
     match kind {
-        "delivered" | "applied" | "queue_dispatched" => Some(STATUS_RUNNING),
-        "question" | "stall_warning" | "loop_review" | "review_verdict" | "rework_sent" => {
-            Some(STATUS_PENDING)
+        "delivered" | "applied" | "queue_dispatched" | "merge_done" | "radar_done" => {
+            Some(STATUS_RUNNING)
         }
+        "question" | "stall_warning" | "loop_review" | "review_verdict" | "rework_sent"
+        | "merge_item" => Some(STATUS_PENDING),
         "rejected" | "failed" | "queue_paused" | "needs_attention" => Some(STATUS_FAILED),
-        "started" | "queued" | "lane_acquired" | "review_started" => Some(STATUS_QUEUED),
+        "started" | "queued" | "lane_acquired" | "review_started" | "merge_started" => {
+            Some(STATUS_QUEUED)
+        }
         _ => None,
     }
 }
@@ -1910,6 +1980,422 @@ fn render_event_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let title = Line::from(Span::styled(
         format!(" 事件 #{} ({}) ", ev.seq, ev.kind),
+        if focused { bold_primary() } else { muted() },
+    ));
+    let block = rounded_block(title, focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let visible: Vec<Line> = out
+        .into_iter()
+        .skip(app.detail_scroll)
+        .take(inner_h)
+        .collect();
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
+fn render_merges_list_pane(frame: &mut Frame, app: &mut App, area: Rect) {
+    let focused = app.focus == FocusPane::List && matches!(app.overlay, Overlay::None);
+    let filter_tag = if app.filter.is_empty() { "" } else { " · 过滤" };
+    let title = Line::from(Span::styled(
+        format!(" 合入批次 ({}){} ", app.filtered_merges.len(), filter_tag),
+        if focused { bold_primary() } else { muted() },
+    ));
+    let block = rounded_block(title, focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if app.filtered_merges.is_empty() {
+        let msg = if app.filter.is_empty() {
+            "暂无合入批次（运行 delegate merge --ready 生成）"
+        } else {
+            "无匹配合入批次"
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {}", truncate(msg, inner.width.saturating_sub(1) as usize)),
+                muted(),
+            ))),
+            inner,
+        );
+        return;
+    }
+
+    let inner_w = inner.width as usize;
+    let view_h = inner.height as usize;
+    if let Some(sel) = app.selected_merge {
+        if sel < app.merges_scroll {
+            app.merges_scroll = sel;
+        } else if view_h > 0 && sel >= app.merges_scroll + view_h {
+            app.merges_scroll = sel + 1 - view_h;
+        }
+    }
+    let max_scroll = app.filtered_merges.len().saturating_sub(view_h);
+    if app.merges_scroll > max_scroll {
+        app.merges_scroll = max_scroll;
+    }
+
+    let mut lines: Vec<Line> = Vec::with_capacity(view_h);
+    for (pos, &idx) in app
+        .filtered_merges
+        .iter()
+        .enumerate()
+        .skip(app.merges_scroll)
+        .take(view_h)
+    {
+        let m = &app.snapshot.merges[idx];
+        let selected = app.selected_merge == Some(pos);
+        let (glyph, color) = if m.applied {
+            ("○", None)
+        } else if m.merged_count > 0 && m.merge_accept_ok {
+            ("✓", Some(STATUS_RUNNING))
+        } else if m.merged_count == 0 {
+            ("✕", Some(STATUS_FAILED))
+        } else {
+            ("!", Some(STATUS_PENDING))
+        };
+        let auto_tag = if m.all_auto_merge {
+            "自主"
+        } else if m.auto_merge_count > 0 {
+            "含自主"
+        } else {
+            "待点头"
+        };
+        let state_tag = if m.applied { "已合回" } else { auto_tag };
+        let summary = format!(
+            "[{}] {}  合{}/跳{} · {}",
+            m.repo_label, m.merge_run, m.merged_count, m.skipped_count, state_tag
+        );
+        let text = truncate(&summary, inner_w.saturating_sub(4));
+        if selected {
+            let rev = Style::default().add_modifier(Modifier::REVERSED);
+            let accent = match color {
+                Some(c) => Style::default().fg(c).add_modifier(Modifier::BOLD),
+                None => bold_primary(),
+            };
+            let used = 4 + display_width(&text);
+            let pad = inner_w.saturating_sub(used);
+            lines.push(Line::from(vec![
+                Span::styled("▎", accent),
+                Span::styled(format!(" {glyph} "), rev.add_modifier(Modifier::BOLD)),
+                Span::styled(text, rev),
+                Span::styled(" ".repeat(pad), rev),
+            ]));
+        } else {
+            let st = match color {
+                Some(c) => Style::default().fg(c).add_modifier(Modifier::BOLD),
+                None => muted(),
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{glyph} "), st),
+                Span::styled(text, if m.applied { muted() } else { primary() }),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_merge_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
+    let focused = app.focus == FocusPane::Detail && matches!(app.overlay, Overlay::None);
+    let Some(m) = app.selected_merge_item().cloned() else {
+        let block = rounded_block(Line::from(Span::styled(" 合入详情 ", muted())), focused);
+        frame.render_widget(block, area);
+        return;
+    };
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let badge_color = if m.applied {
+        Color::DarkGray
+    } else if m.merged_count > 0 && m.merge_accept_ok {
+        STATUS_RUNNING
+    } else {
+        STATUS_FAILED
+    };
+    let badge_text = if m.applied {
+        "已合回"
+    } else if m.merged_count > 0 && m.merge_accept_ok {
+        "待主控 apply"
+    } else {
+        "需检查"
+    };
+    out.push(Line::from(vec![
+        Span::styled(
+            format!(" {badge_text} "),
+            Style::default()
+                .fg(badge_color)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(m.merge_run.clone(), bold_primary()),
+    ]));
+    let base_short = &m.base_head[..m.base_head.len().min(7)];
+    let head_short = &m.head[..m.head.len().min(7)];
+    push_wrapped(
+        &mut out,
+        &format!(
+            "仓库: {} · 基线 {base_short} → {head_short} · 合入 {} / 跳过 {} / 可自主合入 {}",
+            m.repo_label, m.merged_count, m.skipped_count, m.auto_merge_count
+        ),
+        inner_w,
+        muted(),
+    );
+    let ma_label = if m.merge_accept_skipped {
+        "未执行".to_string()
+    } else if m.merge_accept_ok {
+        format!("PASS ({})", m.merge_accept_cmd)
+    } else {
+        format!("FAIL ({})", m.merge_accept_cmd)
+    };
+    push_wrapped(&mut out, &format!("总验收 mergeAccept: {ma_label}"), inner_w, primary());
+    if !m.report_path.is_empty() {
+        push_wrapped(&mut out, &format!("报告: {}", m.report_path), inner_w, muted());
+    }
+
+    out.push(Line::raw(""));
+    out.push(section_header("逐项明细"));
+    for it in &m.items {
+        let is_merged = it.status == "MERGED";
+        let st_style = if is_merged {
+            Style::default().fg(STATUS_RUNNING).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(STATUS_FAILED).add_modifier(Modifier::BOLD)
+        };
+        let short_commit = &it.commit[..it.commit.len().min(7)];
+        let auto_str = if is_merged {
+            if it.auto_merge {
+                " [可自主合入]"
+            } else {
+                " [待主控点头]"
+            }
+        } else {
+            ""
+        };
+        let acc_str = match it.accept_ok {
+            Some(true) => " 验✓",
+            Some(false) => " 验✗",
+            None => "",
+        };
+        let header = if is_merged {
+            format!("{} {} {}{acc_str}{auto_str}", it.run, short_commit, it.title)
+        } else {
+            format!("{} {}", it.run, it.reason)
+        };
+        out.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{:<7} ", it.status), st_style),
+            Span::styled(truncate(&header, inner_w.saturating_sub(10)), primary()),
+        ]));
+    }
+
+    out.push(Line::raw(""));
+    out.push(section_header("下一步（按 a 复制）"));
+    push_indented_wrapped(
+        &mut out,
+        "  ",
+        &format!("delegate apply --keep-commits {}", m.merge_run),
+        inner_w,
+        Style::default().fg(STATUS_QUEUED),
+    );
+
+    let max_scroll = out.len().saturating_sub(inner_h);
+    if app.detail_scroll > max_scroll {
+        app.detail_scroll = max_scroll;
+    }
+    let title = Line::from(Span::styled(
+        format!(" 合入: {} ", truncate(&m.merge_run, inner_w.saturating_sub(10))),
+        if focused { bold_primary() } else { muted() },
+    ));
+    let block = rounded_block(title, focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let visible: Vec<Line> = out
+        .into_iter()
+        .skip(app.detail_scroll)
+        .take(inner_h)
+        .collect();
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
+fn render_candidates_list_pane(frame: &mut Frame, app: &mut App, area: Rect) {
+    let focused = app.focus == FocusPane::List && matches!(app.overlay, Overlay::None);
+    let filter_tag = if app.filter.is_empty() { "" } else { " · 过滤" };
+    let title = Line::from(Span::styled(
+        format!(
+            " Radar 候选板 ({}){} ",
+            app.filtered_candidates.len(),
+            filter_tag
+        ),
+        if focused { bold_primary() } else { muted() },
+    ));
+    let block = rounded_block(title, focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if app.filtered_candidates.is_empty() {
+        let msg = if app.filter.is_empty() {
+            "候选板为空（运行 delegate radar 采集侦察）"
+        } else {
+            "无匹配候选"
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {}", truncate(msg, inner.width.saturating_sub(1) as usize)),
+                muted(),
+            ))),
+            inner,
+        );
+        return;
+    }
+
+    let inner_w = inner.width as usize;
+    let view_h = inner.height as usize;
+    if let Some(sel) = app.selected_candidate {
+        if sel < app.candidates_scroll {
+            app.candidates_scroll = sel;
+        } else if view_h > 0 && sel >= app.candidates_scroll + view_h {
+            app.candidates_scroll = sel + 1 - view_h;
+        }
+    }
+    let max_scroll = app.filtered_candidates.len().saturating_sub(view_h);
+    if app.candidates_scroll > max_scroll {
+        app.candidates_scroll = max_scroll;
+    }
+
+    let mut lines: Vec<Line> = Vec::with_capacity(view_h);
+    for (pos, &idx) in app
+        .filtered_candidates
+        .iter()
+        .enumerate()
+        .skip(app.candidates_scroll)
+        .take(view_h)
+    {
+        let c = &app.snapshot.candidates[idx];
+        let selected = app.selected_candidate == Some(pos);
+        let (glyph, color) = if !c.picked_at.is_empty() {
+            ("✓", None)
+        } else if c.brief_ready {
+            ("◆", Some(STATUS_RUNNING))
+        } else {
+            ("◇", Some(STATUS_PENDING))
+        };
+        let ready_tag = if !c.picked_at.is_empty() {
+            "已挑"
+        } else if c.brief_ready {
+            "可直派"
+        } else {
+            "需细化"
+        };
+        let summary = format!(
+            "{} [{}] [{}] {}",
+            c.id, c.repo_label, ready_tag, c.title
+        );
+        let text = truncate(&summary, inner_w.saturating_sub(4));
+        if selected {
+            let rev = Style::default().add_modifier(Modifier::REVERSED);
+            let accent = match color {
+                Some(col) => Style::default().fg(col).add_modifier(Modifier::BOLD),
+                None => bold_primary(),
+            };
+            let used = 4 + display_width(&text);
+            let pad = inner_w.saturating_sub(used);
+            lines.push(Line::from(vec![
+                Span::styled("▎", accent),
+                Span::styled(format!(" {glyph} "), rev.add_modifier(Modifier::BOLD)),
+                Span::styled(text, rev),
+                Span::styled(" ".repeat(pad), rev),
+            ]));
+        } else {
+            let st = match color {
+                Some(col) => Style::default().fg(col).add_modifier(Modifier::BOLD),
+                None => muted(),
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{glyph} "), st),
+                Span::styled(text, primary()),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_candidate_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
+    let focused = app.focus == FocusPane::Detail && matches!(app.overlay, Overlay::None);
+    let Some(c) = app.selected_candidate_item().cloned() else {
+        let block = rounded_block(Line::from(Span::styled(" 候选详情 ", muted())), focused);
+        frame.render_widget(block, area);
+        return;
+    };
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let (badge, badge_color) = if c.brief_ready {
+        ("可直接写成任务说明", STATUS_RUNNING)
+    } else {
+        ("需主控细化", STATUS_PENDING)
+    };
+    out.push(Line::from(vec![
+        Span::styled(
+            format!(" {badge} "),
+            Style::default()
+                .fg(badge_color)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(format!("[{}] {}", c.id, c.title), bold_primary()),
+    ]));
+    push_wrapped(
+        &mut out,
+        &format!(
+            "仓库: {} · 粗估成本: {} · 首次发现: {}",
+            c.repo_label, c.cost, c.first_seen_at
+        ),
+        inner_w,
+        muted(),
+    );
+    if !c.brief_note.is_empty() {
+        push_wrapped(&mut out, &format!("说明: {}", c.brief_note), inner_w, muted());
+    }
+    if !c.picked_at.is_empty() {
+        push_wrapped(&mut out, &format!("已于 {} 生成任务草稿", c.picked_at), inner_w, muted());
+    }
+
+    out.push(Line::raw(""));
+    out.push(section_header("证据锚点"));
+    for ev in &c.evidence {
+        push_indented_wrapped(&mut out, "  - ", ev, inner_w, Style::default().fg(STATUS_QUEUED));
+    }
+
+    out.push(Line::raw(""));
+    out.push(section_header("建议做法"));
+    for line in c.suggestion.lines() {
+        push_indented_wrapped(&mut out, "  ", line, inner_w, primary());
+    }
+
+    out.push(Line::raw(""));
+    out.push(section_header("挑选草稿（按 p 复制，不自动派活）"));
+    push_indented_wrapped(
+        &mut out,
+        "  ",
+        &format!("delegate radar pick {}", c.id),
+        inner_w,
+        Style::default().fg(STATUS_RUNNING),
+    );
+    if !c.board_path.is_empty() {
+        push_wrapped(&mut out, &format!("候选板: {}", c.board_path), inner_w, muted());
+    }
+
+    let max_scroll = out.len().saturating_sub(inner_h);
+    if app.detail_scroll > max_scroll {
+        app.detail_scroll = max_scroll;
+    }
+    let title = Line::from(Span::styled(
+        format!(" 候选: {} ", c.id),
         if focused { bold_primary() } else { muted() },
     ));
     let block = rounded_block(title, focused);

@@ -154,6 +154,10 @@ fn spawn_isolated_loop_review(meta: &Value, run: &Path, cmd: &str, count: usize)
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         clean_env(&mut c, &meta["env"]);
+        c.env(
+            "CARGO_BUILD_JOBS",
+            crate::lane::local_heavy_jobs(Some(&run)).to_string(),
+        );
         if let Ok(mut child) = c.spawn() {
             if let Some(mut stdin) = child.stdin.take() {
                 let _ = stdin.write_all(prompt.as_bytes());
@@ -536,7 +540,7 @@ pub fn protocol() -> Value {
             "version": version,
             "shadowed": bins.iter().skip(1).map(|(path, _)| path).collect::<Vec<_>>(),
         }],
-        "capacityDefaults": {"maxActive": 32, "maxHeavy": 2, "repoMaxActive": 0},
+        "capacityDefaults": {"maxActive": 32, "maxHeavy": crate::lane::default_local_max_heavy(), "repoMaxActive": 0},
     })
 }
 pub fn agent_identity(agent: &str) -> Res<(PathBuf, Option<String>)> {
@@ -924,6 +928,10 @@ pub fn run_agent(
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr));
     clean_env(&mut c, &meta["env"]);
+    c.env(
+        "CARGO_BUILD_JOBS",
+        crate::lane::local_heavy_jobs(Some(run)).to_string(),
+    );
     crate::deny::inject(&mut c, meta, run)?;
     crate::source_guard::inject(&mut c, meta, run)?;
     c.env("DELEGATE_AGENT", s(meta, "agent"))

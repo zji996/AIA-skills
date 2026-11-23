@@ -143,7 +143,7 @@ enum WorkerCmd {
 
 enum WorkerEvent {
     Snapshot {
-        snapshot: AppSnapshot,
+        snapshot: Box<AppSnapshot>,
         force: bool,
     },
     ResultLoaded {
@@ -204,7 +204,10 @@ fn spawn_worker(
                     let snapshot =
                         client.collect_snapshot(&repos, home.as_deref(), Some(&cwd));
                     if tx_ev
-                        .send(WorkerEvent::Snapshot { snapshot, force })
+                        .send(WorkerEvent::Snapshot {
+                            snapshot: Box::new(snapshot),
+                            force,
+                        })
                         .is_err()
                     {
                         break;
@@ -477,7 +480,7 @@ fn main() {
                 WorkerEvent::Snapshot { snapshot, force } => {
                     refresh_in_flight = false;
                     last_refresh = Instant::now();
-                    if app.apply_snapshot(snapshot, force) {
+                    if app.apply_snapshot(*snapshot, force) {
                         request_selected_result(&app, &tx_worker, &mut inflight_results, false);
                     }
                 }

@@ -147,6 +147,34 @@ impl DelegateClient {
         parse_dag_queue_jsonl(&stdout)
     }
 
+    pub fn fetch_merges(&self) -> Vec<MergeRunItem> {
+        let Ok(output) = Command::new(&self.bin)
+            .args(["merge", "list", "--all", "--json"])
+            .output()
+        else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        parse_merges_jsonl(&stdout)
+    }
+
+    pub fn fetch_candidates(&self) -> Vec<RadarCandidateItem> {
+        let Ok(output) = Command::new(&self.bin)
+            .args(["radar", "list", "--all", "--json"])
+            .output()
+        else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        parse_candidates_jsonl(&stdout)
+    }
+
     pub fn collect_snapshot(
         &self,
         repos: &[PathBuf],
@@ -158,11 +186,15 @@ impl DelegateClient {
         let mut lane_res: Result<LaneStatus, String> = Ok(LaneStatus::default());
         let mut events_list: Vec<EventItem> = Vec::new();
         let mut dag_queue_list: Vec<DagQueueItem> = Vec::new();
+        let mut merges_list: Vec<MergeRunItem> = Vec::new();
+        let mut candidates_list: Vec<RadarCandidateItem> = Vec::new();
 
         std::thread::scope(|s| {
             let lane_handle = s.spawn(|| self.fetch_lane());
             let events_handle = s.spawn(|| self.fetch_events());
             let queue_handle = s.spawn(|| self.fetch_dag_queue());
+            let merges_handle = s.spawn(|| self.fetch_merges());
+            let candidates_handle = s.spawn(|| self.fetch_candidates());
             let repo_handles: Vec<_> = repos
                 .iter()
                 .map(|repo| s.spawn(move || self.fetch_repo_status(repo, home)))
@@ -188,6 +220,12 @@ impl DelegateClient {
             if let Ok(qs) = queue_handle.join() {
                 dag_queue_list = qs;
             }
+            if let Ok(ms) = merges_handle.join() {
+                merges_list = ms;
+            }
+            if let Ok(cs) = candidates_handle.join() {
+                candidates_list = cs;
+            }
         });
 
         sort_repos_for_cwd(&mut groups, cwd);
@@ -205,6 +243,8 @@ impl DelegateClient {
             lane,
             events: events_list,
             dag_queue: dag_queue_list,
+            merges: merges_list,
+            candidates: candidates_list,
             host_load,
             refreshed_at: local_hms(),
             warnings,
@@ -1081,11 +1121,56 @@ pub fn parse_lane_json(raw: &str) -> Result<LaneStatus, String> {
                     .to_string(),
                 running: e.get("running").and_then(Value::as_bool).unwrap_or(false),
                 remote,
+                rank: e.get("rank").and_then(Value::as_u64).map(|n| n as usize),
+                used: e.get("used").and_then(Value::as_u64).map(|n| n as usize),
+                share: e.get("share").and_then(Value::as_u64).map(|n| n as usize),
             })
             .collect()
     };
+    let pool = v.get("pool").and_then(Value::as_object);
+    let leases = pool
+        .and_then(|p| p.get("leases"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|l| {
+            Some(LaneLease {
+                rank: l.get("rank").and_then(Value::as_u64)? as usize,
+                used: l.get("used").and_then(Value::as_u64)? as usize,
+                share: l.get("share").and_then(Value::as_u64)? as usize,
+            })
+        })
+        .collect();
     Ok(LaneStatus {
         max_heavy: v.get("maxHeavy").and_then(Value::as_u64).map(|n| n as usize),
+        heavy_jobs: v
+            .get("heavyJobs")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize),
+        threads: v.get("threads").and_then(Value::as_u64).map(|n| n as usize),
+        budget: v.get("budget").and_then(Value::as_u64).map(|n| n as usize),
+        heavy_jobs_explicit: v
+            .get("heavyJobsExplicit")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        pool_total: pool
+            .and_then(|p| p.get("total"))
+            .and_then(Value::as_u64)
+            .map(|n| n as usize),
+        pool_target: pool
+            .and_then(|p| p.get("target"))
+            .and_then(Value::as_u64)
+            .map(|n| n as usize),
+        pool_free: pool
+            .and_then(|p| p.get("free"))
+            .and_then(Value::as_u64)
+            .map(|n| n as usize),
+        leases,
+        concurrency_summary: v
+            .get("concurrencySummary")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(single_line),
         remote_max_heavy: v
             .get("remoteMaxHeavy")
             .and_then(Value::as_u64)
@@ -1099,9 +1184,15 @@ pub fn parse_lane_json(raw: &str) -> Result<LaneStatus, String> {
 pub fn parse_lane_text(raw: &str) -> LaneStatus {
     let mut local = Vec::new();
     let mut remote = Vec::new();
+    let mut leases = Vec::new();
+    let mut concurrency_summary = None;
     for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("线程 ") && concurrency_summary.is_none() {
+            concurrency_summary = Some(single_line(trimmed));
             continue;
         }
         let (is_remote, rest) = if let Some(r) = trimmed.strip_prefix("remote ") {
@@ -1118,12 +1209,37 @@ pub fn parse_lane_text(raw: &str) -> LaneStatus {
         };
         let mut parts = after_state.splitn(2, char::is_whitespace);
         let since = parts.next().unwrap_or("").to_string();
-        let label = single_line(parts.next().unwrap_or(""));
+        let rest_label = parts.next().unwrap_or("").trim_start();
+        let (rank, used, share, label) = if !is_remote && running && rest_label.starts_with('#') {
+            let mut tokens = rest_label.splitn(3, char::is_whitespace);
+            let r_tok = tokens.next().unwrap_or("");
+            let u_tok = tokens.next().unwrap_or("");
+            let lbl = tokens.next().unwrap_or("").trim_start();
+            let parsed_rank = r_tok.strip_prefix('#').and_then(|s| s.parse::<usize>().ok());
+            let parsed_pair = u_tok.split_once('/').and_then(|(u, sh)| {
+                Some((u.parse::<usize>().ok()?, sh.parse::<usize>().ok()?))
+            });
+            if let (Some(r), Some((u, sh))) = (parsed_rank, parsed_pair) {
+                leases.push(LaneLease {
+                    rank: r,
+                    used: u,
+                    share: sh,
+                });
+                (Some(r), Some(u), Some(sh), single_line(lbl))
+            } else {
+                (None, None, None, single_line(rest_label))
+            }
+        } else {
+            (None, None, None, single_line(rest_label))
+        };
         let entry = LaneEntry {
             label,
             since,
             running,
             remote: is_remote,
+            rank,
+            used,
+            share,
         };
         if is_remote {
             remote.push(entry);
@@ -1133,6 +1249,15 @@ pub fn parse_lane_text(raw: &str) -> LaneStatus {
     }
     LaneStatus {
         max_heavy: None,
+        heavy_jobs: None,
+        threads: None,
+        budget: None,
+        heavy_jobs_explicit: false,
+        pool_total: None,
+        pool_target: None,
+        pool_free: None,
+        leases,
+        concurrency_summary,
         remote_max_heavy: None,
         local,
         remote,
@@ -1472,6 +1597,35 @@ fn summarize_event_payload(kind: &str, run: &str, p: &Value) -> String {
                 format!("合入 {}", &head[..head.len().min(7)])
             }
         }
+        "merge_started" => {
+            let cnt = p.get("count").and_then(Value::as_u64).unwrap_or(0);
+            format!("串行合入 {cnt} 个 run")
+        }
+        "merge_item" => {
+            let src = ps("sourceRun");
+            if ps("status") == "MERGED" {
+                let tag = if p.get("autoMerge").and_then(Value::as_bool) == Some(true) {
+                    "可自主合入"
+                } else {
+                    "待主控点头"
+                };
+                format!("已合入 {src}（{tag}）")
+            } else {
+                format!("跳过 {src}：{}", ps("reason"))
+            }
+        }
+        "merge_done" => {
+            let m = p.get("mergedCount").and_then(Value::as_u64).unwrap_or(0);
+            let s = p.get("skippedCount").and_then(Value::as_u64).unwrap_or(0);
+            let a = p.get("autoMergeCount").and_then(Value::as_u64).unwrap_or(0);
+            format!("合入 {m} · 跳过 {s} · 自主 {a}")
+        }
+        "radar_unchanged" => "指纹未变化（0 token）".into(),
+        "radar_done" => {
+            let added = p.get("added").and_then(Value::as_u64).unwrap_or(0);
+            let total = p.get("total").and_then(Value::as_u64).unwrap_or(0);
+            format!("新增 {added} · 共 {total} 条")
+        }
         _ => String::new(),
     };
     if extra.is_empty() {
@@ -1536,6 +1690,115 @@ pub fn parse_dag_queue_jsonl(raw: &str) -> Vec<DagQueueItem> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
+        });
+    }
+    out
+}
+
+pub fn parse_merges_jsonl(raw: &str) -> Vec<MergeRunItem> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let Some(merge_run) = v.get("mergeRun").and_then(Value::as_str) else {
+            continue;
+        };
+        let repo_str = v.get("repo").and_then(Value::as_str).unwrap_or("");
+        let repo_path = PathBuf::from(repo_str);
+        let repo_label = repo_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(repo_str)
+            .to_string();
+        let ma = &v["mergeAccept"];
+        let items = v
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|it| MergeItemEntry {
+                run: it.get("run").and_then(Value::as_str).unwrap_or("").to_string(),
+                name: single_line(it.get("name").and_then(Value::as_str).unwrap_or("")),
+                status: it.get("status").and_then(Value::as_str).unwrap_or("").to_string(),
+                commit: it.get("commit").and_then(Value::as_str).unwrap_or("").to_string(),
+                title: single_line(it.get("title").and_then(Value::as_str).unwrap_or("")),
+                accept_ok: it.get("acceptOk").and_then(Value::as_bool),
+                auto_merge: it.get("autoMerge").and_then(Value::as_bool).unwrap_or(false),
+                reason: single_line(it.get("reason").and_then(Value::as_str).unwrap_or("")),
+            })
+            .collect();
+        out.push(MergeRunItem {
+            merge_run: merge_run.to_string(),
+            name: single_line(v.get("name").and_then(Value::as_str).unwrap_or(merge_run)),
+            repo_path,
+            repo_label,
+            base_head: v.get("baseHead").and_then(Value::as_str).unwrap_or("").to_string(),
+            head: v.get("head").and_then(Value::as_str).unwrap_or("").to_string(),
+            state: v.get("state").and_then(Value::as_str).unwrap_or("").to_string(),
+            started_at: v.get("startedAt").and_then(Value::as_str).unwrap_or("").to_string(),
+            finished_at: v.get("finishedAt").and_then(Value::as_str).unwrap_or("").to_string(),
+            merged_count: v.get("mergedCount").and_then(Value::as_u64).unwrap_or(0),
+            skipped_count: v.get("skippedCount").and_then(Value::as_u64).unwrap_or(0),
+            auto_merge_count: v.get("autoMergeCount").and_then(Value::as_u64).unwrap_or(0),
+            all_auto_merge: v.get("allAutoMerge").and_then(Value::as_bool).unwrap_or(false),
+            merge_accept_ok: ma.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            merge_accept_skipped: ma.get("skipped").and_then(Value::as_bool).unwrap_or(false),
+            merge_accept_cmd: single_line(ma.get("command").and_then(Value::as_str).unwrap_or("")),
+            applied: v.get("applied").and_then(Value::as_bool).unwrap_or(false),
+            report_path: v.get("reportPath").and_then(Value::as_str).unwrap_or("").to_string(),
+            items,
+        });
+    }
+    out
+}
+
+pub fn parse_candidates_jsonl(raw: &str) -> Vec<RadarCandidateItem> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let Some(id) = v.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let repo_str = v.get("repo").and_then(Value::as_str).unwrap_or("");
+        let repo_path = PathBuf::from(repo_str);
+        let repo_label = v
+            .get("repoName")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                repo_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(repo_str)
+                    .to_string()
+            });
+        out.push(RadarCandidateItem {
+            id: id.to_string(),
+            repo_path,
+            repo_label,
+            title: single_line(v.get("title").and_then(Value::as_str).unwrap_or("")),
+            evidence: string_list(v.get("evidence")),
+            suggestion: v.get("suggestion").and_then(Value::as_str).unwrap_or("").to_string(),
+            cost: single_line(v.get("cost").and_then(Value::as_str).unwrap_or("")),
+            brief_ready: v.get("briefReady").and_then(Value::as_bool).unwrap_or(false),
+            brief_note: single_line(v.get("briefNote").and_then(Value::as_str).unwrap_or("")),
+            fingerprint: v.get("fingerprint").and_then(Value::as_str).unwrap_or("").to_string(),
+            first_seen_at: v.get("firstSeenAt").and_then(Value::as_str).unwrap_or("").to_string(),
+            last_seen_at: v.get("lastSeenAt").and_then(Value::as_str).unwrap_or("").to_string(),
+            picked_at: v.get("pickedAt").and_then(Value::as_str).unwrap_or("").to_string(),
+            board_path: v.get("boardPath").and_then(Value::as_str).unwrap_or("").to_string(),
         });
     }
     out

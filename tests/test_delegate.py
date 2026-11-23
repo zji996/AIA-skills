@@ -663,7 +663,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
             for option in options:
                 self.assertIn(option, result.stdout, command)
         self.assertEqual(self.cli("-h").returncode, 0)
-        self.assertIn("default: 2", self.cli("lane", "--help").stdout)
+        self.assertIn("CARGO_BUILD_JOBS", self.cli("lane", "--help").stdout)
         wait_help = self.cli("wait", "--help").stdout
         self.assertIn("regardless of caller", " ".join(wait_help.split()))
         self.assertNotIn("(the default)", wait_help)
@@ -869,12 +869,13 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         command = "mkdir held && sleep 0.6 && rmdir held"
         runs = [subprocess.Popen([str(DELEGATE), "lane", command], cwd=self.work, env=self.env,
                                  stderr=subprocess.PIPE, text=True) for _ in range(3)]
-        self.until(lambda: self.cli("lane").stdout.count("\n") == 3, "three commands in the lane")
+        ticket_lines = lambda out: [ln for ln in out.splitlines() if ln.startswith(("running", "queued", "remote running", "remote queued"))]
+        self.until(lambda: len(ticket_lines(self.cli("lane").stdout)) == 3, "three commands in the lane")
         listing = self.cli("lane").stdout
         self.assertEqual((listing.count("running"), listing.count("queued")), (1, 2), listing)
         self.assertEqual([r.wait(timeout=20) for r in runs], [0, 0, 0])
         self.assertTrue(any("queued behind" in r.stderr.read() for r in runs))
-        self.assertEqual(self.cli("lane").stdout, "")
+        self.assertEqual(ticket_lines(self.cli("lane").stdout), [])
         # Inside a slot, a nested lane runs at once instead of waiting for itself; exit codes pass through.
         self.assertEqual(self.cli("lane", f"{DELEGATE} lane true", timeout=10).returncode, 0)
         self.assertEqual(self.cli("lane", "--", "sh", "-c", "exit 3").returncode, 3)
@@ -913,7 +914,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         holder.kill()
         self.until(lambda: process_gone(Path(run["dir"]) / "pid"), "the supervisor to exit")
         self.assertFalse((self.work / "accepted").exists())
-        self.assertEqual(self.cli("lane").stdout, "")
+        self.assertEqual([ln for ln in self.cli("lane").stdout.splitlines() if ln.startswith(("running", "queued"))], [])
         # Started from inside a lane command, a run still queues: the slot it was started in is not its own.
         self.hold_lane(2)
         self.env["DELEGATE_LANE_HELD"] = "1"
@@ -929,7 +930,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         lane.terminate()
         self.assertEqual(lane.wait(timeout=10), 128 + signal.SIGTERM)
         self.assertFalse(Path(f"/proc/{pid}").exists() and "Z" not in Path(f"/proc/{pid}/stat").read_text().split()[2])
-        self.assertEqual(self.cli("lane").stdout, "")
+        self.assertEqual([ln for ln in self.cli("lane").stdout.splitlines() if ln.startswith(("running", "queued"))], [])
 
     def test_timeout_grace_while_at_work_and_queue_time_is_free(self):
         start = {"type": "tool_execution_start", "toolName": "bash", "args": {"command": "make check"}}
@@ -3551,7 +3552,10 @@ cargo check --package small; echo $? > "$DELEGATE_RUN_DIR/prefix-code"
         self.assertIn("DELEGATE_REPO_MAX_ACTIVE", blocked.stderr)
 
     def test_v518_capacity_defaults_config_precedence_and_protocol(self):
-        defaults = {"maxActive": 32, "maxHeavy": 2, "repoMaxActive": 0}
+        lane_info = json.loads(self.cli("lane", "--json").stdout)
+        derived_mh = lane_info["maxHeavy"]
+        self.assertGreaterEqual(derived_mh, 1)
+        defaults = {"maxActive": 32, "maxHeavy": derived_mh, "repoMaxActive": 0}
         self.fake_pi([answer("done"), SETTLED])
         state = self.outcome(self.cli("run", "--read-only", "task"))
         self.assertEqual(json.loads((Path(state["dir"]) / "meta.json").read_text())["configCapacity"], defaults)
@@ -3570,17 +3574,21 @@ cargo check --package small; echo $? > "$DELEGATE_RUN_DIR/prefix-code"
         self.assertIn("repoMaxActive must be", self.cli("start", "--workdir", repo, "task").stderr)
 
     def test_v518_default_heavy_lane_runs_two_commands(self):
+        default_mh = json.loads(self.cli("lane", "--json").stdout)["maxHeavy"]
+        self.assertGreaterEqual(default_mh, 1)
         gate = self.work / "release-lane"
         command = f'while [ ! -f {shlex.quote(str(gate))} ]; do sleep .02; done'
         runners = []
-        for index in range(3):
+        total = default_mh + 1
+        for index in range(total):
             process = subprocess.Popen([str(DELEGATE), "lane", "--label", f"default-{index}", command],
                                        cwd=self.work, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             self.addCleanup(process.kill)
             runners.append(process)
-        self.until(lambda: self.cli("lane").stdout.count("\n") == 3, "three default lane tickets")
+        ticket_lines = lambda out: [ln for ln in out.splitlines() if ln.startswith(("running", "queued"))]
+        self.until(lambda: len(ticket_lines(self.cli("lane").stdout)) == total, "default lane tickets")
         listing = self.cli("lane").stdout
-        self.assertEqual((listing.count("running"), listing.count("queued")), (2, 1), listing)
+        self.assertEqual((listing.count("running"), listing.count("queued")), (default_mh, 1), listing)
         gate.touch()
         for process in runners:
             process.communicate(timeout=10)

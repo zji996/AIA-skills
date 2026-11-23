@@ -220,8 +220,113 @@ impl EventItem {
             "review_verdict" => "审结",
             "rework_sent" => "返工",
             "needs_attention" => "关注",
+            "merge_started" => "合始",
+            "merge_item" => "合项",
+            "merge_done" => "合结",
+            "radar_unchanged" => "侦静",
+            "radar_done" => "侦察",
             _ => "事件",
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MergeItemEntry {
+    pub run: String,
+    pub name: String,
+    pub status: String,
+    pub commit: String,
+    pub title: String,
+    pub accept_ok: Option<bool>,
+    pub auto_merge: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MergeRunItem {
+    pub merge_run: String,
+    pub name: String,
+    pub repo_path: PathBuf,
+    pub repo_label: String,
+    pub base_head: String,
+    pub head: String,
+    pub state: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub merged_count: u64,
+    pub skipped_count: u64,
+    pub auto_merge_count: u64,
+    pub all_auto_merge: bool,
+    pub merge_accept_ok: bool,
+    pub merge_accept_skipped: bool,
+    pub merge_accept_cmd: String,
+    pub applied: bool,
+    pub report_path: String,
+    pub items: Vec<MergeItemEntry>,
+}
+
+impl MergeRunItem {
+    pub fn matches_filter(&self, query_lower: &str) -> bool {
+        if query_lower.is_empty() {
+            return true;
+        }
+        if [
+            self.merge_run.as_str(),
+            self.name.as_str(),
+            self.repo_label.as_str(),
+            self.state.as_str(),
+        ]
+        .iter()
+        .any(|h| h.to_lowercase().contains(query_lower))
+        {
+            return true;
+        }
+        self.items.iter().any(|it| {
+            it.run.to_lowercase().contains(query_lower)
+                || it.title.to_lowercase().contains(query_lower)
+                || it.reason.to_lowercase().contains(query_lower)
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RadarCandidateItem {
+    pub id: String,
+    pub repo_path: PathBuf,
+    pub repo_label: String,
+    pub title: String,
+    pub evidence: Vec<String>,
+    pub suggestion: String,
+    pub cost: String,
+    pub brief_ready: bool,
+    pub brief_note: String,
+    pub fingerprint: String,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub picked_at: String,
+    pub board_path: String,
+}
+
+impl RadarCandidateItem {
+    pub fn matches_filter(&self, query_lower: &str) -> bool {
+        if query_lower.is_empty() {
+            return true;
+        }
+        if [
+            self.id.as_str(),
+            self.repo_label.as_str(),
+            self.title.as_str(),
+            self.suggestion.as_str(),
+            self.cost.as_str(),
+        ]
+        .iter()
+        .any(|h| h.to_lowercase().contains(query_lower))
+        {
+            return true;
+        }
+        self.evidence
+            .iter()
+            .any(|e| e.to_lowercase().contains(query_lower))
     }
 }
 
@@ -492,22 +597,91 @@ impl RepoGroup {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LaneLease {
+    pub rank: usize,
+    pub used: usize,
+    pub share: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LaneEntry {
     pub label: String,
     pub since: String,
     pub running: bool,
     pub remote: bool,
+    pub rank: Option<usize>,
+    pub used: Option<usize>,
+    pub share: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct LaneStatus {
     pub max_heavy: Option<usize>,
+    pub heavy_jobs: Option<usize>,
+    pub threads: Option<usize>,
+    pub budget: Option<usize>,
+    pub heavy_jobs_explicit: bool,
+    pub pool_total: Option<usize>,
+    pub pool_target: Option<usize>,
+    pub pool_free: Option<usize>,
+    pub leases: Vec<LaneLease>,
+    pub concurrency_summary: Option<String>,
     pub remote_max_heavy: Option<usize>,
     pub local: Vec<LaneEntry>,
     pub remote: Vec<LaneEntry>,
 }
 
 impl LaneStatus {
+    pub fn pool_summary(&self, compact: bool) -> Option<String> {
+        let (total, target, free) = (self.pool_total?, self.pool_target?, self.pool_free?);
+        let exp = if self.heavy_jobs_explicit {
+            self.heavy_jobs
+                .map(|j| format!("（显式×{j}）"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        if compact {
+            Some(format!("令牌 {total}/{target} 闲{free}{exp}"))
+        } else {
+            Some(format!("令牌 {total}/{target} 空闲 {free}{exp}"))
+        }
+    }
+    pub fn leases_summary(&self) -> Option<String> {
+        if !self.leases.is_empty() {
+            let parts: Vec<String> = self
+                .leases
+                .iter()
+                .map(|l| format!("#{} {}/{}", l.rank, l.used, l.share))
+                .collect();
+            return Some(parts.join(" · "));
+        }
+        let mut from_local: Vec<String> = self
+            .local
+            .iter()
+            .filter(|e| e.running)
+            .filter_map(|e| Some(format!("#{} {}/{}", e.rank?, e.used?, e.share?)))
+            .collect();
+        if from_local.is_empty() {
+            None
+        } else {
+            from_local.truncate(6);
+            Some(from_local.join(" · "))
+        }
+    }
+    pub fn compact_concurrency(&self) -> Option<String> {
+        if let Some(pool) = self.pool_summary(true) {
+            return Some(pool);
+        }
+        let (t, b, j) = (self.threads?, self.budget?, self.heavy_jobs?);
+        let mh = match self.max_heavy {
+            Some(0) => "∞".to_string(),
+            Some(n) => n.to_string(),
+            None => "?".to_string(),
+        };
+        let tag = if self.heavy_jobs_explicit { "显" } else { "" };
+        Some(format!("{t}−2={b}→{mh}×{j}{tag}"))
+    }
     pub fn local_running(&self) -> usize {
         self.local.iter().filter(|e| e.running).count()
     }
@@ -561,6 +735,8 @@ pub struct AppSnapshot {
     pub lane: LaneStatus,
     pub events: Vec<EventItem>,
     pub dag_queue: Vec<DagQueueItem>,
+    pub merges: Vec<MergeRunItem>,
+    pub candidates: Vec<RadarCandidateItem>,
     pub host_load: Option<HostLoad>,
     pub refreshed_at: String,
     pub warnings: Vec<String>,
@@ -574,6 +750,8 @@ impl AppSnapshot {
         self.lane.hash(&mut h);
         self.events.hash(&mut h);
         self.dag_queue.hash(&mut h);
+        self.merges.hash(&mut h);
+        self.candidates.hash(&mut h);
         self.host_load.hash(&mut h);
         self.warnings.hash(&mut h);
         h.finish()

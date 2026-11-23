@@ -1,5 +1,6 @@
 use crate::common::*;
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -8,6 +9,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+thread_local! {
+    static SLOT_ENV_STACK: RefCell<Vec<Vec<(String, String)>>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn current_slot_env() -> Option<Vec<(String, String)>> {
+    SLOT_ENV_STACK.with(|s| s.borrow().last().cloned())
+}
 
 pub static SIGNAL: AtomicI32 = AtomicI32::new(0);
 static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
@@ -71,12 +80,295 @@ pub fn wake_lane_waiter_after_stop() {
 pub fn stopped() -> bool {
     SIGNAL.load(Ordering::SeqCst) != 0
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConcurrencyPlan {
+    pub threads: usize,
+    pub budget: usize,
+    pub max_heavy: usize,
+    pub pool_tokens: usize,
+    pub heavy_jobs: usize,
+    pub max_heavy_explicit: bool,
+    pub heavy_jobs_explicit: bool,
+    pub remote: bool,
+    pub fallback: bool,
+    pub diagnostic: Option<String>,
+}
+
+impl ConcurrencyPlan {
+    /// Human-readable summary:
+    /// - Local: `线程 96 − 2 = 94 · 令牌 88/88 空闲 88` (plus `（显式 ×7）` when `heavyJobs` is explicit)
+    /// - Remote (no FIFO/proxy): `线程 96 − 2 = 94 → 4 条 × 23`
+    pub fn format_summary(&self) -> String {
+        if self.remote {
+            let lanes_str = if self.max_heavy == 0 {
+                "不限".to_string()
+            } else {
+                format!("{} 条", self.max_heavy)
+            };
+            let suffix = if self.heavy_jobs_explicit {
+                "（显式）"
+            } else {
+                ""
+            };
+            if self.fallback && self.threads == 0 {
+                format!("{lanes_str} × {}{suffix}（回退配置）", self.heavy_jobs)
+            } else {
+                format!(
+                    "线程 {} − 2 = {} → {} × {}{suffix}",
+                    self.threads, self.budget, lanes_str, self.heavy_jobs
+                )
+            }
+        } else {
+            let explicit_suffix = if self.heavy_jobs_explicit {
+                format!("（显式 ×{}）", self.heavy_jobs)
+            } else {
+                String::new()
+            };
+            format!(
+                "线程 {} − 2 = {} · 令牌 {}/{} 空闲 {}{explicit_suffix}",
+                self.threads, self.budget, self.pool_tokens, self.pool_tokens, self.pool_tokens
+            )
+        }
+    }
+
+    pub fn format_summary_with_pool(&self, pool: &crate::jobserver::PoolStatus) -> String {
+        if self.remote {
+            return self.format_summary();
+        }
+        let explicit_suffix = if self.heavy_jobs_explicit {
+            format!("（显式 ×{}）", self.heavy_jobs)
+        } else {
+            String::new()
+        };
+        format!(
+            "线程 {} − 2 = {} · {}{explicit_suffix}",
+            self.threads,
+            self.budget,
+            pool.format_pool_part()
+        )
+    }
+
+    pub fn to_json(&self) -> Value {
+        let mut obj = json!({
+            "threads": self.threads,
+            "budget": self.budget,
+            "maxHeavy": self.max_heavy,
+            "poolTokens": self.pool_tokens,
+            "heavyJobs": self.heavy_jobs,
+            "maxHeavyExplicit": self.max_heavy_explicit,
+            "heavyJobsExplicit": self.heavy_jobs_explicit,
+            "summary": self.format_summary(),
+        });
+        if self.remote {
+            obj["remote"] = json!(true);
+        }
+        if self.fallback {
+            obj["fallback"] = json!(true);
+        }
+        if let Some(ref diag) = self.diagnostic {
+            obj["diagnostic"] = json!(diag);
+        }
+        obj
+    }
+
+    pub fn to_json_with_pool(&self, pool: &crate::jobserver::PoolStatus) -> Value {
+        let mut obj = self.to_json();
+        obj["summary"] = json!(self.format_summary_with_pool(pool));
+        obj["pool"] = pool.to_json();
+        obj
+    }
+}
+
+/// Parse a cgroup v2 `cpu.max` line (`<quota> <period>`). Returns `ceil(quota / period)` >= 1,
+/// or `None` when unlimited (`max`) or unparseable.
+pub fn parse_cgroup_v2_cpu_max(text: &str) -> Option<usize> {
+    let mut parts = text.split_whitespace();
+    let quota_str = parts.next()?;
+    let period_str = parts.next()?;
+    if quota_str == "max" {
+        return None;
+    }
+    let quota: u64 = quota_str.parse().ok()?;
+    let period: u64 = period_str.parse().ok()?;
+    if quota == 0 || period == 0 {
+        return None;
+    }
+    let ceil = quota.div_ceil(period).max(1);
+    usize::try_from(ceil).ok()
+}
+
+/// Walk upward from the current process's cgroup v2 path (`0::<rel>` in `/proc/self/cgroup`)
+/// to `cgroup_root`, returning the tightest numeric `cpu.max` limit found along the chain.
+pub fn detect_cgroup_v2_cpu_limit_in(cgroup_root: &Path, proc_cgroup: &str) -> Option<usize> {
+    let rel = proc_cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(|p| p.trim().trim_start_matches('/'))?;
+    let mut cur = if rel.is_empty() {
+        cgroup_root.to_path_buf()
+    } else {
+        cgroup_root.join(rel)
+    };
+    let mut tightest: Option<usize> = None;
+    loop {
+        let cpu_max = cur.join("cpu.max");
+        if let Ok(text) = fs::read_to_string(&cpu_max) {
+            if let Some(lim) = parse_cgroup_v2_cpu_max(&text) {
+                tightest = Some(tightest.map_or(lim, |prev| prev.min(lim)));
+            }
+        }
+        if cur == cgroup_root {
+            break;
+        }
+        let Some(parent) = cur.parent() else {
+            break;
+        };
+        if !parent.starts_with(cgroup_root) {
+            break;
+        }
+        cur = parent.to_path_buf();
+    }
+    tightest
+}
+
+pub fn detect_cgroup_v2_cpu_limit() -> Option<usize> {
+    let proc_cg = fs::read_to_string("/proc/self/cgroup").ok()?;
+    detect_cgroup_v2_cpu_limit_in(Path::new("/sys/fs/cgroup"), &proc_cg)
+}
+
+pub fn detect_nproc() -> Option<usize> {
+    let out = Command::new("nproc").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n > 0)
+}
+
+/// Effective available threads = min(available_parallelism, cgroup v2 cpu.max, nproc), floor 1.
+pub fn effective_threads(
+    avail_parallelism: Option<usize>,
+    cgroup_limit: Option<usize>,
+    nproc_val: Option<usize>,
+) -> usize {
+    [avail_parallelism, cgroup_limit, nproc_val]
+        .into_iter()
+        .flatten()
+        .filter(|&n| n > 0)
+        .min()
+        .unwrap_or(1)
+        .max(1)
+}
+
+pub fn detect_local_threads() -> usize {
+    let avail = std::thread::available_parallelism().ok().map(|n| n.get());
+    let cgroup = detect_cgroup_v2_cpu_limit();
+    let nproc_val = detect_nproc();
+    effective_threads(avail, cgroup, nproc_val)
+}
+
+/// Derive local build concurrency from available threads and optional explicit `maxHeavy` / `heavyJobs`:
+/// - `budget = max(1, threads - 2)`
+/// - default `maxHeavy = max(2, budget / 12)` (memory/IO guard; CPU is governed by the jobserver pool)
+/// - shared pool tokens = `budget - maxHeavy` (each cargo brings 1 implicit token)
+/// - local per-command parallelism is dynamically fair-shared by the in-process proxy FIFO up to `budget`;
+///   explicit `heavyJobs` caps each command at `heavyJobs` and marks `heavy_jobs_explicit = true`.
+pub fn derive_concurrency(
+    threads: usize,
+    explicit_max_heavy: Option<usize>,
+    explicit_heavy_jobs: Option<usize>,
+) -> ConcurrencyPlan {
+    let threads = threads.max(1);
+    let budget = threads.saturating_sub(2).max(1);
+    let default_max_heavy = (budget / 12).max(2);
+    let (max_heavy, max_heavy_explicit) = match explicit_max_heavy {
+        Some(n) => (n, true),
+        None => (default_max_heavy, false),
+    };
+    let pool_tokens = crate::jobserver::compute_pool_tokens(budget, max_heavy, default_max_heavy);
+    let (heavy_jobs, heavy_jobs_explicit) = match explicit_heavy_jobs {
+        Some(n) => (n.max(1), true),
+        None => (budget, false),
+    };
+    ConcurrencyPlan {
+        threads,
+        budget,
+        max_heavy,
+        pool_tokens,
+        heavy_jobs,
+        max_heavy_explicit,
+        heavy_jobs_explicit,
+        remote: false,
+        fallback: false,
+        diagnostic: None,
+    }
+}
+
+/// Derive remote build concurrency (no FIFO/proxy on remote hosts: divides `budget / maxHeavy`
+/// and injects `CARGO_BUILD_JOBS`).
+pub fn derive_remote_concurrency(
+    threads: usize,
+    explicit_max_heavy: Option<usize>,
+    explicit_heavy_jobs: Option<usize>,
+) -> ConcurrencyPlan {
+    let threads = threads.max(1);
+    let budget = threads.saturating_sub(2).max(1);
+    let default_max_heavy = (budget / 12).max(2);
+    let (max_heavy, max_heavy_explicit) = match explicit_max_heavy {
+        Some(n) => (n, true),
+        None => (default_max_heavy, false),
+    };
+    let derived_jobs = budget
+        .checked_div(max_heavy)
+        .unwrap_or(budget / default_max_heavy)
+        .max(1);
+    let (heavy_jobs, heavy_jobs_explicit) = match explicit_heavy_jobs {
+        Some(n) => (n.max(1), true),
+        None => (derived_jobs, false),
+    };
+    ConcurrencyPlan {
+        threads,
+        budget,
+        max_heavy,
+        pool_tokens: 0,
+        heavy_jobs,
+        max_heavy_explicit,
+        heavy_jobs_explicit,
+        remote: true,
+        fallback: false,
+        diagnostic: None,
+    }
+}
+
+pub fn default_local_max_heavy() -> usize {
+    derive_concurrency(detect_local_threads(), None, None).max_heavy
+}
+
+pub fn local_plan_for_config(config: &Value) -> Res<ConcurrencyPlan> {
+    let explicit_mh = crate::config::explicit_max_heavy(config)?;
+    let explicit_hj = crate::config::explicit_heavy_jobs(config)?;
+    Ok(derive_concurrency(detect_local_threads(), explicit_mh, explicit_hj))
+}
+
+pub fn local_plan(run: Option<&Path>) -> Res<ConcurrencyPlan> {
+    let config = crate::config::context_capacity(run)?;
+    local_plan_for_config(&config)
+}
+
+pub fn local_heavy_jobs(run: Option<&Path>) -> usize {
+    local_plan(run)
+        .map(|p| p.heavy_jobs)
+        .unwrap_or_else(|_| derive_concurrency(detect_local_threads(), None, None).heavy_jobs)
+}
+
 pub fn max_heavy() -> Res<usize> {
     heavy_limit(None)
 }
 fn heavy_limit(run: Option<&Path>) -> Res<usize> {
-    let config = crate::config::context_capacity(run)?;
-    Ok(crate::config::capacity(&config, "maxHeavy", "MAX_HEAVY", 2)? as usize)
+    Ok(local_plan(run)?.max_heavy)
 }
 fn lane_dir() -> PathBuf {
     state_dir().join("lane")
@@ -112,7 +404,7 @@ fn tickets() -> Vec<(PathBuf, Value)> {
 pub fn remote_holders() -> Res<Vec<(String, String, bool)>> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let cfg = crate::config::load(git_top(&cwd).as_deref())?;
-    let lim = cfg.value["remote"]["maxHeavy"].as_u64().unwrap_or(4) as usize;
+    let lim = crate::remote::remote_plan(&cfg.value["remote"], false).max_heavy;
     Ok(tickets_in(&state_dir().join("lane-remote"))
         .iter()
         .enumerate()
@@ -161,6 +453,8 @@ pub fn holder_processes() -> Res<Vec<(String, i32)>> {
 pub struct Slot {
     ticket: Option<PathBuf>,
     _file: Option<File>,
+    proxy: Option<crate::jobserver::ProxyGuard>,
+    pushed_env: bool,
     pub queued: f64,
     acquired_at: Option<Instant>,
     event_run: String,
@@ -168,8 +462,21 @@ pub struct Slot {
     event_label: String,
     event_remote: bool,
 }
+impl Slot {
+    pub fn env_vars(&self) -> Option<Vec<(String, String)>> {
+        self.proxy.as_ref().map(|p| p.env_vars())
+    }
+}
 impl Drop for Slot {
     fn drop(&mut self) {
+        if self.pushed_env {
+            SLOT_ENV_STACK.with(|s| {
+                s.borrow_mut().pop();
+            });
+            self.pushed_env = false;
+        }
+        // Stop proxy & return tokens before removing the lane ticket so pool state stays consistent.
+        self.proxy.take();
         if let Some(p) = self.ticket.take() {
             let _ = fs::remove_file(p);
             if let Some(at) = self.acquired_at.take() {
@@ -207,9 +514,10 @@ pub fn acquire_remote(
     remote: &Value,
     waiting: impl FnMut(usize, &[String]),
 ) -> Res<Slot> {
+    let plan = crate::remote::remote_plan(remote, true);
     acquire_in(
         &state_dir().join("lane-remote"),
-        remote["maxHeavy"].as_u64().unwrap_or(4) as usize,
+        plan.max_heavy,
         label,
         account,
         account,
@@ -233,6 +541,53 @@ pub fn acquire_shell(
         acquire(label, account, context, waiting)
     }
 }
+fn run_started_ns_for(run: Option<&Path>, fallback_ns: u64) -> u64 {
+    let Some(r) = run else {
+        return fallback_ns;
+    };
+    let meta = json(r.join("meta.json"));
+    if let Some(ns) = meta["startedNs"].as_u64().filter(|&n| n > 0) {
+        return ns;
+    }
+    if let Some(ep) = meta["startedEpoch"].as_u64().filter(|&n| n > 0) {
+        return ep.saturating_mul(1_000_000_000);
+    }
+    fallback_ns
+}
+
+fn start_local_proxy(
+    label: &str,
+    context: Option<&Path>,
+    run_started_ns: u64,
+) -> (Option<crate::jobserver::ProxyGuard>, bool) {
+    if std::env::var_os("DELEGATE_LANE_HELD").is_some() {
+        return (None, false);
+    }
+    let Ok(plan) = local_plan(context) else {
+        return (None, false);
+    };
+    let explicit_cap = if plan.heavy_jobs_explicit {
+        Some(plan.heavy_jobs)
+    } else {
+        None
+    };
+    match crate::jobserver::ProxyGuard::start(
+        state_dir(),
+        plan.pool_tokens,
+        plan.budget,
+        run_started_ns,
+        label.to_string(),
+        explicit_cap,
+    ) {
+        Ok(proxy) => {
+            let vars = proxy.env_vars();
+            SLOT_ENV_STACK.with(|s| s.borrow_mut().push(vars));
+            (Some(proxy), true)
+        }
+        Err(_) => (None, false),
+    }
+}
+
 fn acquire_in(
     dir: &Path,
     limit: usize,
@@ -242,10 +597,34 @@ fn acquire_in(
     remote: bool,
     mut waiting: impl FnMut(usize, &[String]),
 ) -> Res<Slot> {
-    if limit == 0 || std::env::var_os("DELEGATE_LANE_HELD").is_some() {
+    if std::env::var_os("DELEGATE_LANE_HELD").is_some() {
         return Ok(Slot {
             ticket: None,
             _file: None,
+            proxy: None,
+            pushed_env: false,
+            queued: 0.0,
+            acquired_at: None,
+            event_run: String::new(),
+            event_repo: String::new(),
+            event_label: String::new(),
+            event_remote: remote,
+        });
+    }
+    let event_run_path = account.or(context);
+    let stamp_now = now_ns() as u64;
+    let run_started_ns = run_started_ns_for(event_run_path, stamp_now);
+    if limit == 0 {
+        let (proxy, pushed_env) = if !remote {
+            start_local_proxy(label, context, run_started_ns)
+        } else {
+            (None, false)
+        };
+        return Ok(Slot {
+            ticket: None,
+            _file: None,
+            proxy,
+            pushed_env,
             queued: 0.0,
             acquired_at: None,
             event_run: String::new(),
@@ -255,7 +634,6 @@ fn acquire_in(
         });
     }
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let event_run_path = account.or(context);
     let event_run = event_run_path
         .map(|r| crate::events::run_id_for(r, &json(r.join("meta.json"))))
         .unwrap_or_default();
@@ -270,8 +648,8 @@ fn acquire_in(
                 .unwrap_or_default()
         });
     let priority = account.map(|r| json(r.join("meta.json"))["lanePriority"][label].as_u64().unwrap_or(0)).unwrap_or(0);
-    let stamp = if priority == 0 { now_ns() as u64 } else { priority };
-    let mut me = json!({"pid":std::process::id(),"label":label,"since":iso(),"epoch":epoch(),"queuedNs":stamp,"run":account,"running":false});
+    let stamp = if priority == 0 { stamp_now } else { priority };
+    let mut me = json!({"pid":std::process::id(),"label":label,"since":iso(),"epoch":epoch(),"queuedNs":stamp,"runStartedNs":run_started_ns,"run":account,"running":false});
     let ticket;
     let file;
     {
@@ -343,6 +721,11 @@ fn acquire_in(
         let _ = fs::remove_file(ticket);
         return Err(e);
     }
+    let (proxy, pushed_env) = if !remote {
+        start_local_proxy(label, context, run_started_ns)
+    } else {
+        (None, false)
+    };
     crate::events::emit(
         &event_run,
         &event_repo,
@@ -356,6 +739,8 @@ fn acquire_in(
     Ok(Slot {
         ticket: Some(ticket),
         _file: Some(file),
+        proxy,
+        pushed_env,
         queued,
         acquired_at: Some(Instant::now()),
         event_run,
@@ -433,29 +818,86 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
     };
     if words.is_empty() {
         let remote = remote_holders()?;
-        let local = holders()?;
+        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+        let cfg = crate::config::load(git_top(&cwd).as_deref())?;
+        let plan = local_plan_for_config(&cfg.value)?;
+        let pool = crate::jobserver::reconcile_pool(plan.pool_tokens, plan.budget);
+        let lim = plan.max_heavy;
+        let local_tickets: Vec<(u32, String, String, bool)> = tickets()
+            .iter()
+            .enumerate()
+            .map(|(i, (_, v))| {
+                (
+                    v["pid"].as_u64().unwrap_or(0) as u32,
+                    s(v, "label").to_string(),
+                    s(v, "since").to_string(),
+                    lim == 0 || i < lim,
+                )
+            })
+            .collect();
+        let match_lease = |pid: u32, lbl: &str| -> Option<&crate::jobserver::LeaseView> {
+            pool.leases
+                .iter()
+                .find(|l| pid != 0 && l.pid == pid)
+                .or_else(|| pool.leases.iter().find(|l| l.label == lbl))
+        };
+        let remote_enabled = crate::remote::enabled(&cfg.value["remote"]);
+        let remote_plan = if remote_enabled {
+            Some(crate::remote::remote_plan(&cfg.value["remote"], false))
+        } else {
+            None
+        };
+        let remote_limit = remote_plan
+            .as_ref()
+            .map(|p| p.max_heavy)
+            .unwrap_or_else(|| cfg.value["remote"]["maxHeavy"].as_u64().unwrap_or(4) as usize);
         if json_mode {
-            let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-            let cfg = crate::config::load(git_top(&cwd).as_deref())?;
-            let remote_limit = cfg.value["remote"]["maxHeavy"].as_u64().unwrap_or(4) as usize;
-            let to_items = |entries: Vec<(String, String, bool)>| -> Vec<Value> {
-                entries
-                    .into_iter()
-                    .map(|(label, since, running)| {
-                        json!({"label": label, "since": since, "running": running})
-                    })
-                    .collect()
-            };
-            println!(
-                "{}",
-                json!({
-                    "maxHeavy": max_heavy()?,
-                    "local": to_items(local),
-                    "remoteMaxHeavy": remote_limit,
-                    "remote": to_items(remote),
+            let local_items: Vec<Value> = local_tickets
+                .into_iter()
+                .map(|(pid, label, since, running)| {
+                    let mut item = json!({"label": label, "since": since, "running": running});
+                    if running {
+                        if let Some(lease) = match_lease(pid, &label) {
+                            item["rank"] = json!(lease.rank);
+                            item["borrowed"] = json!(lease.borrowed);
+                            item["used"] = json!(lease.used_jobs());
+                            item["share"] = json!(lease.share);
+                        }
+                    }
+                    item
                 })
-            );
+                .collect();
+            let remote_items: Vec<Value> = remote
+                .into_iter()
+                .map(|(label, since, running)| {
+                    json!({"label": label, "since": since, "running": running})
+                })
+                .collect();
+            let mut out = json!({
+                "maxHeavy": plan.max_heavy,
+                "heavyJobs": plan.heavy_jobs,
+                "threads": plan.threads,
+                "budget": plan.budget,
+                "poolTokens": plan.pool_tokens,
+                "maxHeavyExplicit": plan.max_heavy_explicit,
+                "heavyJobsExplicit": plan.heavy_jobs_explicit,
+                "concurrencySummary": plan.format_summary_with_pool(&pool),
+                "leasesSummary": pool.format_leases_strip(),
+                "pool": pool.to_json(),
+                "concurrency": plan.to_json_with_pool(&pool),
+                "local": local_items,
+                "remoteMaxHeavy": remote_limit,
+                "remote": remote_items,
+            });
+            if let Some(rp) = remote_plan {
+                out["remoteConcurrency"] = rp.to_json();
+            }
+            println!("{out}");
             return Ok(0);
+        }
+        println!("{}", plan.format_summary_with_pool(&pool));
+        if let Some(rp) = remote_plan {
+            println!("remote {}", rp.format_summary());
         }
         for (label, since, running) in remote {
             println!(
@@ -463,7 +905,19 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
                 if running { "running" } else { "queued" }
             );
         }
-        for (label, since, running) in local {
+        for (pid, label, since, running) in local_tickets {
+            if running {
+                if let Some(lease) = match_lease(pid, &label) {
+                    println!(
+                        "{:<8} {since}  #{} {}/{}  {label}",
+                        "running",
+                        lease.rank,
+                        lease.used_jobs(),
+                        lease.share
+                    );
+                    continue;
+                }
+            }
             println!(
                 "{:<8} {since}  {label}",
                 if running { "running" } else { "queued" }
@@ -548,10 +1002,21 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
             c.env("PATH", path);
         }
     }
+    let plan = local_plan(account.as_deref())?;
     c.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .env("DELEGATE_LANE_HELD", "1");
+    if let Some(vars) = slot.env_vars() {
+        c.env_remove("CARGO_BUILD_JOBS")
+            .env_remove("MAKEFLAGS")
+            .env_remove("CARGO_MAKEFLAGS");
+        for (k, v) in vars {
+            c.env(k, v);
+        }
+    } else if std::env::var_os("DELEGATE_LANE_HELD").is_none() {
+        c.env("CARGO_BUILD_JOBS", plan.heavy_jobs.to_string());
+    }
     group(&mut c);
     let mut child = c.spawn().map_err(|e| e.to_string())?;
     let pid = child.id() as i32;
@@ -580,5 +1045,102 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
             return Ok(128 + sig);
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derives_concurrency_for_96_20_4_2_1_threads() {
+        let p96 = derive_concurrency(96, None, None);
+        assert_eq!(
+            (p96.threads, p96.budget, p96.max_heavy, p96.pool_tokens),
+            (96, 94, 7, 87)
+        );
+        assert!(!p96.max_heavy_explicit && !p96.heavy_jobs_explicit);
+        assert_eq!(p96.format_summary(), "线程 96 − 2 = 94 · 令牌 87/87 空闲 87");
+
+        let p20 = derive_concurrency(20, None, None);
+        assert_eq!(
+            (p20.threads, p20.budget, p20.max_heavy, p20.pool_tokens),
+            (20, 18, 2, 16)
+        );
+
+        let p4 = derive_concurrency(4, None, None);
+        assert_eq!(
+            (p4.threads, p4.budget, p4.max_heavy, p4.pool_tokens),
+            (4, 2, 2, 0)
+        );
+
+        let p2 = derive_concurrency(2, None, None);
+        assert_eq!(
+            (p2.threads, p2.budget, p2.max_heavy, p2.pool_tokens),
+            (2, 1, 2, 0)
+        );
+
+        let p1 = derive_concurrency(1, None, None);
+        assert_eq!(
+            (p1.threads, p1.budget, p1.max_heavy, p1.pool_tokens),
+            (1, 1, 2, 0)
+        );
+    }
+
+    #[test]
+    fn explicit_max_heavy_and_heavy_jobs_overrides() {
+        // Local: 96 threads + explicit maxHeavy=6 => pool_tokens = 94 - 6 = 88
+        let p = derive_concurrency(96, Some(6), None);
+        assert_eq!((p.budget, p.max_heavy, p.pool_tokens), (94, 6, 88));
+        assert!(p.max_heavy_explicit && !p.heavy_jobs_explicit);
+        assert_eq!(p.format_summary(), "线程 96 − 2 = 94 · 令牌 88/88 空闲 88");
+
+        // Remote still divides budget / maxHeavy without FIFO/proxy
+        let pr = derive_remote_concurrency(96, Some(6), None);
+        assert_eq!((pr.budget, pr.max_heavy, pr.heavy_jobs), (94, 6, 15));
+        assert_eq!(pr.format_summary(), "线程 96 − 2 = 94 → 6 条 × 15");
+
+        // Remote explicit maxHeavy exceeding budget never lets jobs drop below 1
+        let pr_huge = derive_remote_concurrency(4, Some(20), None);
+        assert_eq!((pr_huge.budget, pr_huge.max_heavy, pr_huge.heavy_jobs), (2, 20, 1));
+
+        // Explicit heavyJobs overrides per-command cap and marks source as 「显式」
+        let p_exp = derive_concurrency(96, Some(6), Some(8));
+        assert_eq!((p_exp.max_heavy, p_exp.pool_tokens, p_exp.heavy_jobs), (6, 88, 8));
+        assert!(p_exp.heavy_jobs_explicit);
+        assert_eq!(
+            p_exp.format_summary(),
+            "线程 96 − 2 = 94 · 令牌 88/88 空闲 88（显式 ×8）"
+        );
+    }
+
+    #[test]
+    fn cgroup_v2_cpu_max_walks_up_and_caps_below_nproc() {
+        let dir = std::env::temp_dir().join(format!(
+            "delegate-cg-test-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let leaf = dir.join("user.slice/user-1000.slice/session-1.scope");
+        fs::create_dir_all(&leaf).unwrap();
+        // Root has 16 cores, parent slice caps at 5.5 -> ceil 6 cores, leaf is unlimited ("max").
+        fs::write(dir.join("cpu.max"), "1600000 100000\n").unwrap();
+        fs::write(dir.join("user.slice/cpu.max"), "550000 100000\n").unwrap();
+        fs::write(leaf.join("cpu.max"), "max 100000\n").unwrap();
+
+        let proc_cg = "0::/user.slice/user-1000.slice/session-1.scope\n";
+        let cg_lim = detect_cgroup_v2_cpu_limit_in(&dir, proc_cg);
+        assert_eq!(cg_lim, Some(6));
+
+        // Effective threads takes min(available_parallelism=96, cgroup=6, nproc=96) = 6
+        let eff = effective_threads(Some(96), cg_lim, Some(96));
+        assert_eq!(eff, 6);
+        let plan = derive_concurrency(eff, None, None);
+        assert_eq!(
+            (plan.threads, plan.budget, plan.max_heavy, plan.pool_tokens),
+            (6, 4, 2, 2)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

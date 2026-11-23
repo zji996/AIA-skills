@@ -203,6 +203,15 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
                 ));
             }
         }
+        if let Some(v) = value.get("heavyJobs") {
+            if !v.is_null()
+                && !v
+                    .as_u64()
+                    .is_some_and(|n| n >= 1 && usize::try_from(n).is_ok())
+            {
+                return Err("heavyJobs must be a positive integer or null".into());
+            }
+        }
         if let Some(level) = value.get("thinking") {
             crate::models::validate_thinking(level.as_str().ok_or("thinking must be a string")?)?;
         }
@@ -317,6 +326,12 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
                 ))
             }
         }
+        crate::merge::validate_merge_accept(value.get("mergeAccept"))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        crate::merge::validate_auto_merge(value.get("autoMerge"))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        crate::radar::validate_radar_config(value.get("radar"))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -334,7 +349,16 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         validate(user, &user_file, false)?;
         crate::source_build::validate(user, &user_file, top)?;
         sources.push("user");
-        for key in ["worktree", "generated", "appendOnly", "applyVerify", "board"] {
+        for key in [
+            "worktree",
+            "generated",
+            "appendOnly",
+            "applyVerify",
+            "board",
+            "mergeAccept",
+            "autoMerge",
+            "radar",
+        ] {
             if user.get(key).is_some() {
                 ignored.push(key);
             }
@@ -368,6 +392,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         "sourceBuild",
         "maxActive",
         "maxHeavy",
+        "heavyJobs",
         "repoMaxActive",
         "resultChars",
         "acceptBlind",
@@ -486,12 +511,54 @@ pub fn capacity(value: &Value, key: &str, name: &str, default: u64) -> Res<u64> 
     number(name, value[key].as_u64().unwrap_or(default))
 }
 
+pub fn explicit_max_heavy(value: &Value) -> Res<Option<usize>> {
+    let env_raw = setting("MAX_HEAVY", "");
+    if !env_raw.is_empty() {
+        let parsed = number("MAX_HEAVY", 0)?;
+        return Ok(Some(parsed as usize));
+    }
+    if let Some(n) = value.get("maxHeavy").and_then(Value::as_u64) {
+        return Ok(Some(n as usize));
+    }
+    Ok(None)
+}
+
+pub fn explicit_heavy_jobs(value: &Value) -> Res<Option<usize>> {
+    let env_raw = setting("HEAVY_JOBS", "");
+    if !env_raw.is_empty() {
+        if !env_raw.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!(
+                "DELEGATE_HEAVY_JOBS must be a positive integer, got {env_raw:?}"
+            ));
+        }
+        let parsed = env_raw
+            .parse::<usize>()
+            .map_err(|e| format!("DELEGATE_HEAVY_JOBS: {e}"))?;
+        if parsed == 0 {
+            return Err("DELEGATE_HEAVY_JOBS must be a positive integer (>= 1)".into());
+        }
+        return Ok(Some(parsed));
+    }
+    if let Some(n) = value.get("heavyJobs").and_then(Value::as_u64) {
+        if n == 0 {
+            return Err("heavyJobs must be a positive integer (>= 1)".into());
+        }
+        return Ok(Some(n as usize));
+    }
+    Ok(None)
+}
+
 pub fn capacities(value: &Value) -> Res<Value> {
-    Ok(json!({
+    let plan = crate::lane::local_plan_for_config(value)?;
+    let mut out = json!({
         "maxActive": capacity(value, "maxActive", "MAX_ACTIVE", 32)?,
-        "maxHeavy": capacity(value, "maxHeavy", "MAX_HEAVY", 2)?,
+        "maxHeavy": plan.max_heavy,
         "repoMaxActive": capacity(value, "repoMaxActive", "REPO_MAX_ACTIVE", 0)?,
-    }))
+    });
+    if plan.heavy_jobs_explicit {
+        out["heavyJobs"] = json!(plan.heavy_jobs);
+    }
+    Ok(out)
 }
 
 pub fn context_capacity(run: Option<&Path>) -> Res<Value> {

@@ -14,9 +14,11 @@ mod fit;
 mod handoff;
 mod help;
 mod history;
+mod jobserver;
 mod lane;
 mod launch;
 mod measure;
+mod merge;
 mod models;
 mod notes;
 mod output;
@@ -26,6 +28,7 @@ mod process_match;
 mod pending_reply;
 mod source_guard;
 mod queue;
+mod radar;
 mod refs;
 mod resources;
 mod remote;
@@ -369,8 +372,8 @@ fn hint_concurrent_writes(created: &Path) {
     }
 }
 
-type Parsed = (Vec<String>, Vec<String>, Vec<(String, String)>);
-fn parse_simple(args: &[String], flags: &[&str], values: &[&str]) -> Res<Parsed> {
+pub(crate) type Parsed = (Vec<String>, Vec<String>, Vec<(String, String)>);
+pub(crate) fn parse_simple(args: &[String], flags: &[&str], values: &[&str]) -> Res<Parsed> {
     let mut pos = vec![];
     let mut present = vec![];
     let mut kv = vec![];
@@ -394,10 +397,10 @@ fn parse_simple(args: &[String], flags: &[&str], values: &[&str]) -> Res<Parsed>
     }
     Ok((pos, present, kv))
 }
-fn has(flags: &[String], key: &str) -> bool {
+pub(crate) fn has(flags: &[String], key: &str) -> bool {
     flags.iter().any(|x| x == key)
 }
-fn value<'a>(kv: &'a [(String, String)], key: &str) -> Option<&'a str> {
+pub(crate) fn value<'a>(kv: &'a [(String, String)], key: &str) -> Option<&'a str> {
     kv.iter()
         .rev()
         .find(|(k, _)| k == key)
@@ -1513,6 +1516,9 @@ fn apply(args: &[String]) -> Res<i32> {
             }
             let applied_json = json(run.join(".applied"));
             let run_meta = json(run.join("meta.json"));
+            if b(&run_meta, "isMerge") {
+                merge::mark_merge_run_applied(run, s(&applied_json, "head"));
+            }
             let path = s(&run_meta["worktree"], "path").to_string();
             let run_ns = run_meta["startedNs"].as_u64().unwrap_or(0);
             for other in runs::all_runs() {
@@ -2348,6 +2354,10 @@ fn main_inner(args: &[String]) -> Res<i32> {
             let finished_count = finished_ids.len();
 
             let arch_usage = archive::usage();
+            let concurrency_plan = lane::local_plan(None).ok();
+            let concurrency_pool = concurrency_plan
+                .as_ref()
+                .map(|plan| jobserver::reconcile_pool(plan.pool_tokens, plan.budget));
 
             if output::json_enabled() {
                 for run in &shown {
@@ -2356,24 +2366,28 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 for chain in &cleaned_notes {
                     println!("{}", format_status(output::cleaned_note_json(chain)));
                 }
-                println!(
-                    "{}",
-                    json!({"statusSummary": {
-                        "running": running,
-                        "pendingApply": pending_apply,
-                        "pendingQuestion": pending_question,
-                        "queued": queued,
-                        "unread": unread,
-                        "rejected": rejected,
-                        "pendingNotes": pending_todo,
-                        "otherActionable": other_actionable,
-                        "finished": finished_count,
-                        "archiveBytes": arch_usage.bytes,
-                        "archiveCount": arch_usage.count,
-                        "archiveFsCritical": arch_usage.fs_critical,
-                        "history": "delegate history"
-                    }})
-                );
+                let mut summary = json!({
+                    "running": running,
+                    "pendingApply": pending_apply,
+                    "pendingQuestion": pending_question,
+                    "queued": queued,
+                    "unread": unread,
+                    "rejected": rejected,
+                    "pendingNotes": pending_todo,
+                    "otherActionable": other_actionable,
+                    "finished": finished_count,
+                    "archiveBytes": arch_usage.bytes,
+                    "archiveCount": arch_usage.count,
+                    "archiveFsCritical": arch_usage.fs_critical,
+                    "history": "delegate history"
+                });
+                if let Some(ref plan) = concurrency_plan {
+                    summary["concurrency"] = match concurrency_pool.as_ref() {
+                        Some(pool) => plan.to_json_with_pool(pool),
+                        None => plan.to_json(),
+                    };
+                }
+                println!("{}", json!({"statusSummary": summary}));
             } else {
                 let mut counts = format!(
                     "运行中 {running} · 待合入 {pending_apply} · 待回答 {pending_question} · 排队 {queued}"
@@ -2417,6 +2431,15 @@ fn main_inner(args: &[String]) -> Res<i32> {
                         }
                     }
                     footer_parts.push(arch_text);
+                }
+                if let Some(ref plan) = concurrency_plan {
+                    if plan.heavy_jobs_explicit {
+                        let summary_str = match concurrency_pool.as_ref() {
+                            Some(pool) => plan.format_summary_with_pool(pool),
+                            None => plan.format_summary(),
+                        };
+                        footer_parts.push(format!("编译并发：{summary_str}"));
+                    }
                 }
                 if !footer_parts.is_empty() {
                     println!("{}", footer_parts.join(" · "));
@@ -2484,6 +2507,8 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "events" => events::command(rest),
         "queue" => dag_queue::command(rest),
         "sign" => review::sign_command(rest),
+        "merge" => merge::command(rest),
+        "radar" => radar::command(rest),
         "diff" => diff(rest),
         "patch" => patch(rest),
         "apply" => apply(rest),

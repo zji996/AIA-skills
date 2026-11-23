@@ -24,7 +24,7 @@ fn make_sample_app() -> App {
     let repo_a = parse_status_jsonl(Path::new("/home/dev/demo-api"), "~/demo-api", REPO_A_JSONL);
     let repo_b = parse_status_jsonl(Path::new("/home/dev/web-app"), "~/web-app", REPO_B_JSONL);
     let lane = parse_lane_json(
-        r#"{"maxHeavy":2,"local":[{"label":"demo-api: cargo test","since":"2026-11-22T10:40:00Z","running":true}],"remoteMaxHeavy":4,"remote":[]}"#,
+        r#"{"maxHeavy":6,"heavyJobs":94,"threads":96,"budget":94,"poolTokens":88,"heavyJobsExplicit":false,"concurrencySummary":"线程 96 − 2 = 94 · 令牌 88/88 空闲 31","pool":{"target":88,"total":88,"free":31,"borrowed":57,"leases":[{"rank":1,"used":61,"share":62},{"rank":2,"used":31,"share":31}]},"local":[{"label":"demo-api: cargo test","since":"2026-11-22T10:40:00Z","running":true,"rank":1,"used":61,"share":62},{"label":"web-app: cargo build","since":"2026-11-22T10:41:00Z","running":true,"rank":2,"used":31,"share":31}],"remoteMaxHeavy":4,"remote":[]}"#,
     )
     .unwrap();
     let snap = AppSnapshot {
@@ -32,6 +32,8 @@ fn make_sample_app() -> App {
         lane,
         events: vec![],
         dag_queue: vec![],
+        merges: vec![],
+        candidates: vec![],
         host_load: Some(HostLoad {
             load1_tenths: 18,
             load5_tenths: 14,
@@ -121,8 +123,11 @@ fn snapshot_wide_screen_renders_rounded_borders_bars_relative_time_and_lane_mete
     assert!(screen.contains("crates/api"), "{screen}");
     assert!(screen.contains("下一步"), "{screen}");
 
-    // Bottom bar mini lane meter + host load + time
-    assert!(screen.contains("Lane █░ 1/2"), "{screen}");
+    // Bottom bar mini lane meter + pool tokens + per-command shares + host load + time
+    assert!(screen.contains("Lane ██░░░░ 2/6"), "{screen}");
+    assert!(screen.contains("令牌 88/88 空闲 31"), "{screen}");
+    assert!(screen.contains("#1 61/62 · #2 31/31"), "{screen}");
+    assert!(!screen.contains("demo-api: cargo test"), "active label should not crowd bottom bar: {screen}");
     assert!(screen.contains("负载 1.8 1.4"), "{screen}");
     assert!(screen.contains("10:52:00"), "{screen}");
 }
@@ -138,7 +143,8 @@ fn snapshot_narrow_80_columns_uses_readable_stacked_layout() {
     assert!(screen.contains("[2轮]"), "{screen}");
     assert!(screen.contains("3 分钟前"), "{screen}");
     assert!(screen.contains("结论摘要"), "{screen}");
-    assert!(screen.contains("Lane █░ 1/2"), "{screen}");
+    assert!(screen.contains("Lane ██░░░░ 2/6"), "{screen}");
+    assert!(screen.contains("令牌 88/88 闲31"), "{screen}");
     assert!(screen.contains("jk选 Tab栏"), "{screen}");
 }
 
@@ -193,6 +199,8 @@ fn snapshot_empty_state_is_minimal_and_tiny_terminal_does_not_panic() {
         lane: LaneStatus::default(),
         events: vec![],
         dag_queue: vec![],
+        merges: vec![],
+        candidates: vec![],
         host_load: None,
         refreshed_at: "11:00:00".to_string(),
         warnings: vec![],
@@ -228,6 +236,8 @@ fn snapshot_events_tab_liveness_activity_and_dag_queue() {
         lane: LaneStatus::default(),
         events: parse_events_jsonl(raw_events),
         dag_queue: parse_dag_queue_jsonl(raw_queue),
+        merges: vec![],
+        candidates: vec![],
         host_load: None,
         refreshed_at: "09:06:10".into(),
         warnings: vec![],
@@ -274,6 +284,8 @@ fn snapshot_review_states_and_review_events() {
         lane: LaneStatus::default(),
         events: parse_events_jsonl(raw_events),
         dag_queue: vec![],
+        merges: vec![],
+        candidates: vec![],
         host_load: None,
         refreshed_at: "10:04:00".into(),
         warnings: vec![],
@@ -296,4 +308,76 @@ fn snapshot_review_states_and_review_events() {
     assert!(ev_screen.contains("审结"), "{ev_screen}");
     assert!(ev_screen.contains("返工"), "{ev_screen}");
     assert!(ev_screen.contains("关注"), "{ev_screen}");
+}
+
+#[test]
+fn snapshot_merges_and_candidates_tabs_and_events() {
+    use delegate_tui::data::{parse_candidates_jsonl, parse_events_jsonl, parse_merges_jsonl};
+    let raw_merges = r#"
+{"mergeRun":"20261123-110000-merge","name":"merge","repo":"/home/dev/demo-api","baseHead":"1111111abcdef","head":"2222222abcdef","state":"delivered","startedAt":"2026-11-23T11:00:00Z","finishedAt":"2026-11-23T11:02:00Z","mergedCount":1,"skippedCount":1,"autoMergeCount":1,"allAutoMerge":true,"applied":false,"reportPath":"/tmp/merge-report.md","mergeAccept":{"command":"cargo test","ok":true,"skipped":false},"items":[{"run":"20261123-100000-docs","name":"docs","status":"MERGED","commit":"2222222abcdef","title":"docs: update guide","acceptOk":true,"autoMerge":true,"reason":""},{"run":"20261123-100500-conflict","name":"conflict","status":"SKIPPED","commit":"","title":"","acceptOk":null,"autoMerge":false,"reason":"语义冲突 / 冲突标记：src/lib.rs"}]}
+"#;
+    let raw_candidates = r#"
+{"id":"r-a1b2c3d4","repo":"/home/dev/demo-api","repoName":"demo-api","title":"补齐 capabilities 缺口测试","evidence":["crates/api/src/lib.rs:42","collect#2:L15"],"suggestion":"为未覆盖的 endpoint 补单测","cost":"低（15 分钟）","briefReady":true,"briefNote":"","fingerprint":"sha256:a1b2c3d4","firstSeenAt":"2026-11-23T02:30:00Z","lastSeenAt":"2026-11-23T02:30:00Z","pickedAt":"","boardPath":"/tmp/board.md"}
+"#;
+    let raw_events = r#"
+{"seq":20,"at":"2026-11-23T11:00:00Z","run":"20261123-110000-merge","repo":"/home/dev/demo-api","kind":"merge_started","payload":{"name":"merge","count":2}}
+{"seq":21,"at":"2026-11-23T11:01:00Z","run":"20261123-110000-merge","repo":"/home/dev/demo-api","kind":"merge_item","payload":{"sourceRun":"20261123-100000-docs","status":"MERGED","autoMerge":true}}
+{"seq":22,"at":"2026-11-23T11:02:00Z","run":"20261123-110000-merge","repo":"/home/dev/demo-api","kind":"merge_done","payload":{"mergedCount":1,"skippedCount":1,"autoMergeCount":1,"mergeAcceptOk":true}}
+{"seq":23,"at":"2026-11-23T02:30:00Z","run":"radar-demo-api","repo":"/home/dev/demo-api","kind":"radar_done","payload":{"added":1,"total":1}}
+"#;
+    let snap = AppSnapshot {
+        repos: vec![],
+        lane: LaneStatus::default(),
+        events: parse_events_jsonl(raw_events),
+        dag_queue: vec![],
+        merges: parse_merges_jsonl(raw_merges),
+        candidates: parse_candidates_jsonl(raw_candidates),
+        host_load: None,
+        refreshed_at: "11:03:00".into(),
+        warnings: vec![],
+    };
+    let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/dev/demo-api"), 5);
+
+    // Top bar shows 3合入(1) and 4候选(1)
+    let home = render_to_string(&mut app, 148, 32);
+    assert!(home.contains("3合入(1)"), "{home}");
+    assert!(home.contains("4候选(1)"), "{home}");
+
+    // Switch to Merges tab ('3')
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    let merges_screen = render_to_string(&mut app, 148, 32);
+    assert!(merges_screen.contains("合入批次 (1)"), "{merges_screen}");
+    assert!(merges_screen.contains("20261123-110000-merge"), "{merges_screen}");
+    assert!(merges_screen.contains("可自主合入"), "{merges_screen}");
+    assert!(merges_screen.contains("SKIPPED"), "{merges_screen}");
+    assert!(merges_screen.contains("delegate apply --keep-commits 20261123-110000-merge"), "{merges_screen}");
+
+    // Press 'a' in Merges tab opens CommandModal for apply --keep-commits
+    app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    let apply_modal = render_to_string(&mut app, 148, 32);
+    assert!(apply_modal.contains("apply --keep-commits 20261123-110000-merge"), "{apply_modal}");
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    // Switch to Candidates tab ('4')
+    app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+    let cand_screen = render_to_string(&mut app, 148, 32);
+    assert!(cand_screen.contains("Radar 候选板 (1)"), "{cand_screen}");
+    assert!(cand_screen.contains("r-a1b2c3d4"), "{cand_screen}");
+    assert!(cand_screen.contains("补齐 capabilities 缺口测试"), "{cand_screen}");
+    assert!(cand_screen.contains("crates/api/src/lib.rs:42"), "{cand_screen}");
+    assert!(cand_screen.contains("delegate radar pick r-a1b2c3d4"), "{cand_screen}");
+
+    // Press 'p' in Candidates tab opens CommandModal for radar pick
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+    let pick_modal = render_to_string(&mut app, 148, 32);
+    assert!(pick_modal.contains("radar pick r-a1b2c3d4"), "{pick_modal}");
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    // Switch to Events tab ('2') and verify merge/radar event badges
+    app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    let ev_screen = render_to_string(&mut app, 148, 32);
+    assert!(ev_screen.contains("合始"), "{ev_screen}");
+    assert!(ev_screen.contains("合项"), "{ev_screen}");
+    assert!(ev_screen.contains("合结"), "{ev_screen}");
+    assert!(ev_screen.contains("侦察"), "{ev_screen}");
 }

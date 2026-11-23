@@ -136,6 +136,14 @@ const COMMANDS: &[(&str, &str)] = &[
         "Merge a worktree conversation into the source tree.",
     ),
     (
+        "merge",
+        "Serially integrate delivered runs in an isolated integration worktree, run per-run accept + mergeAccept, and write merge-report.md (delegate apply --keep-commits <merge-run> to land).",
+    ),
+    (
+        "radar",
+        "Deterministic collect + fingerprint; on change runs a read-only scout to update <state>/radar/<repo>/board.md; pick <id> drafts a brief without dispatching.",
+    ),
+    (
         "busy",
         "Query live resource occupants (exit 0 busy, 1 idle).",
     ),
@@ -187,7 +195,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("-h, --help", "Show this help."),
             ("--version", "Show the Cargo package version."),
         ]);
-        println!("Capacity: maxActive=32 and repoMaxActive=0 (unlimited) are runaway guards; model maxActive, maxHeavy=2 and available memory are the actual throttles. Shortages queue without a timeout or new worktree/pool claim. status shows queue reason/ahead/since; queued runs have no runtime elapsed. stop cancels. Lost supervisors/reboots leave crashed runs, like deferred runs; no automatic recovery.");
+        println!("Capacity: maxActive=32 and repoMaxActive=0 (unlimited) are runaway guards; model maxActive, maxHeavy (default: max(2, (available_threads - 2) / 12), memory/IO guard) and available memory are the actual throttles; local CPU concurrency uses a shared jobserver FIFO (<state>/jobserver.fifo, budget - maxHeavy tokens) with an in-process per-command proxy FIFO dynamically fair-sharing by seniority (weights 1, 1/2, 1/4…, floor 2; override cap with heavyJobs). Shortages queue without a timeout or new worktree/pool claim. status shows queue reason/ahead/since; queued runs have no runtime elapsed. stop cancels. Lost supervisors/reboots leave crashed runs, like deferred runs; no automatic recovery.");
         println!("\nStates: waiting | running | delivered (accept passed) | answered (no --accept) | rejected (accept failed or protected path changed) | malformed (empty or leaked tool call after reruns) | failed | timeout | stalled | killed | stopped | crashed | needs-redispatch (legacy --after run from 6.21.x).");
         println!(
             "An interrupted upstream (cut stream, reset or timed-out connection, 502/503/504, a 429 Pi did not retry) is not the task failing: the run waits 15s/45s/120s, checks the model through `probe`'s path, and continues the same session up to 3 times (DELEGATE_RESUME_BACKOFF, `0` off); `status --json` reports `resumes` and `transientError`. Auth failures, 400s and missing models are not retried."
@@ -234,6 +242,18 @@ pub fn print(command: Option<&str>) -> bool {
             ("run", "Run id, name, or directory (default: last)."),
             ("--check", "Verify existing sign.json against the current diff without modifying (exit 0 valid/not required, 1 unsigned or invalidated)."),
             ("--json", "Print structured JSON output."),
+        ]),
+        "merge" => ("[--ready | <run>...] [--name NAME] [--json] | list [--all] [--json]", "Serially 3-way merge runs into an isolated integration worktree based on source HEAD. Regenerates generated.paths on generated.inputs hits, runs per-run accept and final mergeAccept through lane, preserves original commit titles with Delegate-Run trailers, skips & rolls back on conflict/red test/protected/unsigned or invalidated controllerReviewPaths, marks autoMerge eligibility, and writes merge-report.md.", &[
+            ("--ready", "Select all unapplied delivered runs in this repository with passed acceptance and review PASS (or validly signed controllerReviewPaths)."),
+            ("--name NAME", "Label for the integration merge run (default: merge)."),
+            ("list [--all] [--json]", "List recorded merge runs and reports (--all across repositories)."),
+            ("--json", "Print structured JSON output."),
+        ]),
+        "radar" => ("[run] [--force] [--dry-run] [--json] | list|board [--all] [--json] | pick <id> [--out PATH] [--json] | schedule [--repo PATH]", "Run deterministic radar.collect commands and fingerprint their output; exit with zero tokens when unchanged, or launch a read-only scout (scout tier) to add evidence-anchored candidates to <state>/radar/<repo>/board.md.", &[
+            ("run [--force] [--dry-run]", "Collect and fingerprint; run read-only scout when changed (--force ignores unchanged fingerprint; --dry-run prints collected output without calling a model)."),
+            ("list | board [--all] [--json]", "List candidates from <state>/radar/<repo>/board.md (--all across repositories)."),
+            ("pick <id> [--out PATH]", "Generate a task brief draft for candidate <id> without auto-dispatching."),
+            ("schedule [--repo PATH]", "Print systemd user timer and cron installation instructions (00:30-04:30 every 2h) without installing."),
         ]),
         "status" | "list" => ("[--all] [--json] [--files] [runs ...]", "Show a counts line plus concise one-line status for runs needing action (running/queued, questions, unapplied or unread results, unhandled rejections, and pending todos; collapsing reply chains to their latest round) and a footer pointing to delegate history. Passing run names appends indented path and todo details.", &[
             ("runs", "Run ids or directories (default: actionable runs and pending todos)."),
@@ -293,7 +313,7 @@ pub fn print(command: Option<&str>) -> bool {
         ]),
         "config" => ("", "Show merged effective configuration (including the remote host).", &[]),
         "remote" => ("check", "Test SSH, rsync and remote program versions; never falls back locally.", &[]),
-        "lane" => ("[--label TEXT] [--measure] [--json] [command ...]", "Queue a heavy command with acceptance, evidence, worktree setup, and other machine checks. --measure uses the FIFO measurement reservation and reserved CPUs. DELEGATE_MAX_HEAVY run at once (default: 2). One argument is a shell command; no command lists the lane.", &[
+        "lane" => ("[--label TEXT] [--measure] [--json] [command ...]", "Queue a heavy command with acceptance, evidence, worktree setup, and other machine checks. --measure uses the FIFO measurement reservation and reserved CPUs. Local builds share a machine jobserver FIFO (<state>/jobserver.fifo, tokens = budget - maxHeavy where budget = max(1, available_threads - 2) and default maxHeavy = max(2, budget / 12)) via an in-process per-command proxy FIFO (MAKEFLAGS/CARGO_MAKEFLAGS/CARGO_BUILD_JOBS) with dynamic seniority-weighted fair sharing (weights 1, 1/2, 1/4…, floor 2; override with DELEGATE_MAX_HEAVY / maxHeavy and DELEGATE_HEAVY_JOBS / heavyJobs). One argument is a shell command; no command shows pool status, shares, and lists the lane.", &[
             ("--label TEXT", "Label shown in the lane listing."),
             ("--measure", "Run through the machine measurement reservation."),
             ("--json", "With no command, print lane occupancy and limits as JSON."),

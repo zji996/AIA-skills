@@ -1000,6 +1000,55 @@ pub fn format_human(ev: &Value) -> String {
                 "⚠ 需要主控关注".to_string()
             }
         }
+        "merge_started" => {
+            let cnt = n(p, "count");
+            let base = s(p, "baseHead");
+            let short = &base[..base.len().min(7)];
+            if short.is_empty() {
+                format!("开始串行合入（{cnt} 个 run）")
+            } else {
+                format!("开始串行合入（{cnt} 个 run，基线 {short}）")
+            }
+        }
+        "merge_item" => {
+            let src = s(p, "sourceRun");
+            let st = s(p, "status");
+            if st == "MERGED" {
+                let commit = s(p, "commit");
+                let short = &commit[..commit.len().min(7)];
+                let tag = if b(p, "autoMerge") {
+                    "可自主合入"
+                } else {
+                    "待主控点头"
+                };
+                format!("已合入 {src} → {short}（{tag}）")
+            } else {
+                let reason = s(p, "reason");
+                format!("已跳过 {src}：{}", clip(reason, 80))
+            }
+        }
+        "merge_done" => {
+            let merged = n(p, "mergedCount");
+            let skipped = n(p, "skippedCount");
+            let auto = n(p, "autoMergeCount");
+            let ok = if b(p, "mergeAcceptOk") {
+                "mergeAccept✓"
+            } else {
+                "mergeAccept✗"
+            };
+            format!("合入完成：合入 {merged} · 跳过 {skipped} · 自主 {auto} · {ok}")
+        }
+        "radar_unchanged" => {
+            let fp = s(p, "fingerprint");
+            format!("侦察指纹未变化（{}，0 token）", &fp[..fp.len().min(15)])
+        }
+        "radar_done" => {
+            let added = n(p, "added");
+            let deduped = n(p, "deduped");
+            let dropped = n(p, "droppedNoAnchor");
+            let total = n(p, "total");
+            format!("侦察完成：新增 {added} · 去重 {deduped} · 无锚丢弃 {dropped} · 共 {total} 条")
+        }
         _ => String::new(),
     };
 

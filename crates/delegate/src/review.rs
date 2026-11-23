@@ -693,8 +693,8 @@ fn format_diff_for_prompt(diff_text: &str, diff_file: &Path, top: &Path, from_tr
     }
 }
 
-/// Build an isolated read-only checkout of `tree` for `agy` reviewers (which lack `--tools`).
-fn prepare_ro_workspace(top: &Path, tree: &str, dest: &Path, scratch: &Path) -> Res<()> {
+/// Build an isolated read-only checkout of `tree` for `agy` reviewers/scouts (which lack `--tools`).
+pub(crate) fn prepare_ro_workspace(top: &Path, tree: &str, dest: &Path, scratch: &Path) -> Res<()> {
     if dest.exists() {
         let _ = fs::remove_dir_all(dest);
     }
@@ -728,7 +728,7 @@ fn prepare_ro_workspace(top: &Path, tree: &str, dest: &Path, scratch: &Path) -> 
     res
 }
 
-fn dir_manifest(root: &Path) -> Res<BTreeMap<String, String>> {
+pub(crate) fn dir_manifest(root: &Path) -> Res<BTreeMap<String, String>> {
     fn visit(root: &Path, path: &Path, out: &mut BTreeMap<String, String>) -> Res<()> {
         let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
         if meta.is_dir() {
@@ -765,7 +765,7 @@ fn dir_manifest(root: &Path) -> Res<BTreeMap<String, String>> {
     Ok(out)
 }
 
-fn diff_manifests(before: &BTreeMap<String, String>, after: &BTreeMap<String, String>) -> Vec<String> {
+pub(crate) fn diff_manifests(before: &BTreeMap<String, String>, after: &BTreeMap<String, String>) -> Vec<String> {
     before
         .keys()
         .chain(after.keys())

@@ -121,6 +121,26 @@ pub fn format_time(local: bool, pattern: &str) -> String {
 pub fn iso() -> String {
     format_time(false, "%Y-%m-%dT%H:%M:%SZ")
 }
+pub fn stamp() -> String {
+    format_time(true, "%Y%m%d-%H%M%S")
+}
+pub fn slug(text: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for ch in text.trim().chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            out.push(ch);
+            dash = false;
+        } else if !out.is_empty() && !dash {
+            out.push('-');
+            dash = true;
+        }
+        if out.chars().count() >= 32 {
+            break;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
 pub fn iso_epoch(value: &str) -> Option<i64> {
     let field = |start: usize, end: usize| value.get(start..end)?.parse::<i32>().ok();
     let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
@@ -331,8 +351,14 @@ pub fn clean_env(c: &mut Command, extra: &Value) {
     for k in GUARDS {
         c.env_remove(k);
     }
+    // Existing host env and config env.CARGO_BUILD_JOBS no longer take effect;
+    // delegate injects the derived (or explicit heavyJobs) CARGO_BUILD_JOBS instead.
+    c.env_remove("CARGO_BUILD_JOBS");
     if let Some(obj) = extra.as_object() {
         for (k, v) in obj {
+            if k == "CARGO_BUILD_JOBS" {
+                continue;
+            }
             if let Some(v) = v.as_str() {
                 c.env(k, v);
             }
@@ -470,6 +496,17 @@ pub fn run_shell_with(
         .stdout(log.try_clone().map_err(|e| e.to_string())?)
         .stderr(Stdio::from(log.try_clone().map_err(|e| e.to_string())?));
     clean_env(&mut c, extra);
+    if let Some(vars) = crate::lane::current_slot_env() {
+        c.env_remove("MAKEFLAGS").env_remove("CARGO_MAKEFLAGS");
+        for (k, v) in vars {
+            c.env(k, v);
+        }
+    } else {
+        c.env(
+            "CARGO_BUILD_JOBS",
+            crate::lane::local_heavy_jobs(Some(run)).to_string(),
+        );
+    }
     let meta = json(run.join("meta.json"));
     if let Some(path) = crate::deny::shell_path_with(&meta, run, force_local)? {
         c.env("PATH", path);

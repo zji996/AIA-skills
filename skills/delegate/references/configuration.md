@@ -17,28 +17,28 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 
 ## 用户与仓库配置
 
-用户配置 `${XDG_CONFIG_HOME}/delegate/config.json` 支持 `remote`、`agentDeny`、`measure`、`measureCpus`、`env`、`maxRework`、默认 `accept`/`acceptTimeout`/`evidence`、`maxActive`、`maxHeavy`、`repoMaxActive`、`models`/`tiers`/`thinking`、`sourceBuild.paths`、`standing`、`defaults`、`resultChars`、`cleanupKeepExecutables`、`agy`。仓库根 `.delegate.json` 使用相同字段并保存仓库事实。
+用户配置 `${XDG_CONFIG_HOME}/delegate/config.json` 支持 `remote`、`agentDeny`、`measure`、`measureCpus`、`env`、`maxRework`、默认 `accept`/`acceptTimeout`/`evidence`、`maxActive`、`maxHeavy`、`heavyJobs`、`repoMaxActive`、`models`/`tiers`/`thinking`、`sourceBuild.paths`、`standing`、`defaults`、`resultChars`、`cleanupKeepExecutables`、`agy`。仓库根 `.delegate.json` 使用相同字段并保存仓库事实。
 
 `measure` 是 argv 前缀数组，例如 `{"measure":[["cargo","xtask","bench-concurrency"]]}`；仓库配置覆盖用户配置。`measureCpus` 是预约核列表（如 `"8-11"`），未设置时取最后 `max(2, nproc/3)` 个在线逻辑核。匹配的同事、验收、证据和 lane 命令自动排队到机器级测量预约；预约开始时在跑的 lane 命令会让出预约核，预约期间普通 lane 命令使用其余核。
 
-- 标量：仓库 > 用户 > 内置默认；容量的 `DELEGATE_MAX_ACTIVE` / `DELEGATE_MAX_HEAVY` / `DELEGATE_REPO_MAX_ACTIVE` 最高，`0` 不限。整机/仓库上限默认 32/0、重命令 2；实际限流靠模型 `maxActive`、`maxHeavy` 与内存水位，不足自动排队。写入默认 `accept`/`acceptTimeout`/`evidence` 仓库优先于用户、CLI 覆盖或关闭（`acceptTimeout` 可选、未设不限时，回显来源，`reply` 继承）；只读不继承。
-- 模型选择独立为 `tiers.scout/review/write` 用途、`models` 登记别名与 `thinking` 长度；models/tiers 按键合并。模型全集只来自登记表，Pi 仅校验与提供能力；旧档与模型 thinking 后缀不兼容。匹配、规则、优先级、图片守卫、agy 同事与迁移见 [用途、模型与思维长度](model-routing.md)。
-- 任务测试用可重复的 `--accept-also COMMAND`，按顺序以 `&&` 追加到生效的 `--accept` 或配置默认（无基础命令则单独运行）；与 `--no-accept` 冲突退出 2。`--accept` 替换非空且不同的默认命令时，start 提示原命令与追加用法；meta 的 `accept` 与 summary 的 `accept.command` 记录最终命令。
-- `env` 按键合并，仓库优先；`agentDeny` 按 `(argv, exact)` 去重，省略 `exact` 等于 `false`；仓库同键 hint 覆盖用户值，保留原顺序。仓库 `{"argv":["cargo","xtask","check"],"exact":true,"allow":true}` 撤销完全相同 argv 且 exact 相同的一条用户规则，无需 hint；不撤销不同 exact 或其他前缀规则，用户配置不能声明 `allow: true`。
-- `sourceBuild` 整个对象按仓库 > 用户 > 内置默认覆盖；`{"sourceBuild":{"paths":["target","build"]}}` 指定相对源仓库根的构建目录，替换默认的 Cargo.toml → target 探测，`paths: []` 关闭。两份配置的绝对路径、越界路径及外部符号链接独立报错（文件与 `sourceBuild.paths[index]`，退出 2），不存在的目录可配置。启动保存设置，reply 用当前配置；仅写入收尾测一次，提示阈值只用 `DELEGATE_SOURCE_BUILD_WARN_GIB`（默认 60 GiB，0 关闭）。缓存与输出见 [清理](cleanup.md)。
-- `standing` 是固定说明：字符串、字符串数组，或 `{"all":"通用规矩","write":["写入规矩"],"readOnly":"只读规矩"}`；前两种等价于 `all`。按字段仓库覆盖用户，任务末尾附 `all` 与模式字段，再列生效的 deny 命令、匹配方式与 hint。启动回显附加行数及配置层，JSON 的 `standing`/`standingSources` 保存实际文字与来源；普通 reply 沿用会话，回显零行，`--fresh` 读取当前配置并附加。
-- `defaults` 按字段仓库覆盖用户，支持 `worktree`、`keepCommits`（布尔）、`protect`/`acceptAlso`（字符串数组）、`timeout`（时长字符串）、`evidence`（命令字符串）；`keepCommits` 默认 false，CLI `apply --keep-commits` 可按次开启。启动选项的 CLI 显式值覆盖默认；`start`/`reply` 的 `--allow <path>` 可重复，只能在生效保护范围内按次开放文件/子目录（目录以 `/` 结尾，现存目录可省略），启动回显，任务说明列剩余保护与本次例外，收尾不将开放路径判违规；不改配置，后续 reply/fresh 继承。正文提及未开放的受保护路径时仅提示补 `--allow` 并在 `status`/`wait` 标记，不拦截。`worktree.cleanOnApply`（默认 true）控制 `apply` 成功后是否归档并删除 worktree。
-- `resources` 按资源名仓库覆盖用户，例如 `{"pg":{"commands":[["cargo","xtask","infra-test"]]}}`；argv 逐项前缀匹配同 `agentDeny`。匹配命令开始执行时登记，结束删除；`busy` 也按 `/proc` 进程身份剔除已消失记录。只查询占用，不排队、不加锁；同事、验收和 lane 均登记。
-- `acceptBlind` 是 glob 数组，例如 `["**/Dockerfile*","**/compose*.y*ml","manage.sh"]`，仓库值覆盖用户值。写入交付时命中路径仍可交付，但短行、JSON `acceptBlind` 与 apply 末行提示最多五个文件及其余数量。
-- `resultChars` 是答复显示上限（正整数，默认 20000），环境变量 `DELEGATE_RESULT_CHARS` 优先；答复不超过上限的 1.25 倍时全文显示，超出才显示头尾。每任务 `--max-answer N` 是另一项答复约定，超过 N 的 1.5 倍时自动续接一次压缩，不计返工预算。
-- `cleanupKeepExecutables` 是共享守护进程的可执行文件名数组，用户与仓库追加去重，内置 `sccache`；按实际可执行文件名识别，不能配置路径。回收不终止这些进程，普通进程提示名字和端口。
-- `worktree`、`generated`、`applyVerify` 只认仓库：用户级出现时忽略，`start`（含 `run`）在 stderr 汇总提示一次。
-- 两份文件独立校验，错误指出文件与字段并退出 2。meta、summary 与 `--json` 记 `configSources`（实际存在的 `user`/`repo`）。普通 reply 沿用启动时的 env、deny、验收与证据，fresh 更新 deny 与固定说明，返工预算和容量读当前配置。
+- 标量：仓库 > 用户 > 内置默认；`DELEGATE_MAX_ACTIVE`/`MAX_HEAVY`/`HEAVY_JOBS`/`REPO_MAX_ACTIVE` 最高，`0` 不限（`heavyJobs` 须 ≥1）。整机/仓库默认 32/0；**编译并发按线程自动推导与共享令牌池**：可用线程取 `available_parallelism()`、向上查找的 cgroup v2 `cpu.max`（向上取整）与 `nproc` 最小值，`budget = max(1, 线程 − 2)`；`maxHeavy` 默认 `max(2, budget / 12)`（内存/IO 保护）；CPU 由 `<state>/jobserver.fifo`（目标令牌 `budget − maxHeavy`）管理，每条 `lane` 命令由进程内线程维护私有代理 FIFO（注入 `MAKEFLAGS`/`CARGO_MAKEFLAGS` 与 `CARGO_BUILD_JOBS`，覆盖宿主及 `env.CARGO_BUILD_JOBS`），按资历权重 `1, 1/2, 1/4…`（每条保底 2）动态公平分配——每条最多借 `份额 − 1`（另有 cargo 自带 1 个隐含令牌），用不满的份额让给他人，单条结束自动升至满预算，进程被杀或 `lane`/`status` 时自动校正补回；显式上限用 `heavyJobs`（`lane`/`status` 标「显式」）；远端不做代理与 FIFO，探测一次并缓存远端线程按 `budget / remote.maxHeavy` 注入 `CARGO_BUILD_JOBS`（失败回退配置并写诊断）。**未覆盖项**：`cargo test` 测试线程、链接器（如 `mold`）线程不在令牌池内。写入默认 `accept`/`acceptTimeout`/`evidence` 仓库优先、CLI 覆盖或关闭；只读不继承。
+- 模型选择分为 `tiers.scout/review/write`、`models` 别名与 `thinking`；models/tiers 按键合并，详见 [用途、模型与思维长度](model-routing.md)。
+- 任务测试用可重复的 `--accept-also COMMAND` 以 `&&` 追加到生效 `--accept` 或默认命令（与 `--no-accept` 冲突退出 2）；`--accept` 替换默认命令时 start 提示原命令。
+- `env` 按键合并（仓库优先）；`agentDeny` 按 `(argv, exact)` 去重（缺省 `exact: false`），仓库同键覆盖 hint，仓库可用 `allow: true` 撤销完全匹配的用户规则（用户级禁用 `allow`）。
+- `sourceBuild` 整对象按仓库 > 用户 > 默认覆盖（`paths: []` 关闭），相对路径独立校验越界与外部符号链接（退出 2）；仅写入收尾测一次，阈值 `DELEGATE_SOURCE_BUILD_WARN_GIB`（默认 60 GiB，0 关闭），见 [清理](cleanup.md)。
+- `standing` 支持字符串、数组或 `{"all","write","readOnly"}`，按字段仓库覆盖用户，附在任务末尾并列生效 deny；reply 沿用会话，`--fresh` 重读。
+- `defaults` 按字段仓库覆盖用户，含 `worktree`、`keepCommits`、`protect`/`acceptAlso`、`timeout`、`evidence`；CLI 覆盖默认。`--allow <path>` 在保护范围内按次放行（reply/fresh 继承），正文提受保护路径仅提示补 `--allow`；`worktree.cleanOnApply`（默认 true）控制 apply 后清理。
+- `resources` 按资源名仓库覆盖用户（前缀匹配同 `agentDeny`），只登记占用不加锁，`busy` 按 `/proc` 剔除已退出进程。
+- `acceptBlind`（glob 数组，仓库覆盖用户）：交付命中仍可交付，但短行、JSON 与 apply 末行提示最多 5 个文件及余数。
+- `resultChars`（正整数，默认 20000，`DELEGATE_RESULT_CHARS` 优先）：答复超 1.25 倍才截断显示头尾；`--max-answer N` 超 1.5 倍自动续接压缩，不计返工。
+- `cleanupKeepExecutables` 追加去重（内置 `sccache`），按可执行文件名豁免回收，不能配路径。
+- `worktree`、`generated`、`applyVerify`、`board`、`mergeAccept`、`autoMerge`、`radar` 只认仓库；用户级忽略并 stderr 提示。
+- 两份文件独立校验，错指文件与字段退出 2；meta/summary/`--json` 记 `configSources`。普通 reply 沿用 env/deny/验收/证据，fresh 更新 deny/standing，返工与容量读当前配置。
 
 用户级示例：
 
 ```json
-{"maxActive":32,"maxHeavy":2,"repoMaxActive":0,"maxRework":1,
+{"maxActive":32,"repoMaxActive":0,"maxRework":1,
  "models":{"sol":"provider/code-model","ds":"provider/fast-model"},
  "thinking":"high",
  "tiers":{"scout":"ds","review":"sol","write":[{"model":"sol","maxActive":10},"ds"]},
@@ -64,5 +64,7 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 - `stall`：`{"idle":"30m","command":"90m","accept":"10m"}`，`"0"` 关闭；`DELEGATE_STALL_IDLE`/`COMMAND`/`ACCEPT` 优先，均只发 `stall_warning` 不杀进程。
 - `checkIn`：wait 检查线时长，`"0"` 关闭；`DELEGATE_CHECK_IN` 优先。未设置时 Claude Code 使用 50m，其它调用方不设默认。
 - `agy`：`{"agent":"aia"}` 为 agy 同事附加 `--agent <名>`（新会话、续做与 `probe` 生效），名称非空且无空白/控制字符，未设不变。
-- `review`（默认关）：`true` 或 `{"enabled"?:true,"tier"?:"review"|"scout","model"?:"<别名>","thinking"?:"<档>","rubric"?:"<路径>"}`（仓库优先）。写入验收通过后派新上下文只读审查员（禁写文件/派活），输入任务说明、`diff --total` 与要点（默认 [review-rubric.md](review-rubric.md)）；首行严格 `PASS`/`REWORK`/`NEEDS_CONTROLLER`（格式不对或越权写入失败关闭为 `NEEDS_CONTROLLER`），`REWORK` 原样退回且续审只看增量 diff（不设轮数上限，第 3 轮起发 `needs_attention` 不强杀）。
-- `controllerReviewPaths`：glob 数组（支持 `*`/`?`/`**`/末尾 `/`），仓库优先。净改动命中时一律升 `NEEDS_CONTROLLER` 并附 diff 全文与 SHA-256 哈希，主控用 `delegate sign <run>` 落盘 `sign.json`（改一字即失效，`sign --check` 校验）。
+- `review`（默认关）：`true` 或 `{"enabled"?,"tier"?:"review"|"scout","model"?,"thinking"?,"rubric"?}`（仓库优先）。写入验收通过后派新上下文只读审查员（要点默认 [review-rubric.md](review-rubric.md)）；首行严格 `PASS`/`REWORK`/`NEEDS_CONTROLLER`（畸形/越权写入失败关闭），`REWORK` 原样退回且续审只看增量 diff（第 3 轮起发 `needs_attention` 不强杀）。
+- `controllerReviewPaths`：glob 数组（`*`/`?`/`**`/末尾 `/`），仓库优先。命中一律升 `NEEDS_CONTROLLER` 并附 diff 与 SHA-256，主控 `delegate sign <run>` 签字（改一字即失效，`sign --check` 验签）。
+- `mergeAccept` / `autoMerge`（仓库级）：`mergeAccept` 为 `delegate merge` 终验命令（默认等于 `accept`）；`autoMerge` 为 glob 数组（默认空，支持 `!` 排除与 `add:` 纯新增），全改动命中且审查 `PASS` 标「可自主合入」，详见 [合入员与 Radar](merge-and-radar.md)。
+- `radar`（仓库级）：`{"collect":[命令或{"name","command"}],"tier"?:"scout"|"review","model"?,"thinking"?,"timeout"?}`；确定性采集算指纹，未变零 token 退出，变化派只读 scout 更新 `<state>/radar/<repo>/board.md`，见 [合入员与 Radar](merge-and-radar.md)。

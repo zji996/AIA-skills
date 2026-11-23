@@ -136,6 +136,8 @@ fn folds_stale_pending_and_merged_by_default_and_toggles_on_enter() {
         lane: LaneStatus::default(),
         events: vec![],
         dag_queue: vec![],
+        merges: vec![],
+        candidates: vec![],
         host_load: None,
         refreshed_at: "10:00:00".into(),
         warnings: vec![],
@@ -216,8 +218,9 @@ fn parses_lane_both_json_and_text() {
     assert_eq!(parsed.remote_queued(), 0);
 
     let text_raw = "\
+线程 96 − 2 = 94 · 令牌 88/88 空闲 31
 remote running  2026-11-22T20:50:00Z  demo-api: cargo clippy
-running  2026-11-22T20:50:42Z  demo-api: cargo test
+running  2026-11-22T20:50:42Z  #1 61/62  demo-api: cargo test
 queued   2026-11-22T20:51:00Z  web-app: pnpm build
 ";
     let parsed_text = parse_lane_text(text_raw);
@@ -225,6 +228,7 @@ queued   2026-11-22T20:51:00Z  web-app: pnpm build
     assert_eq!(parsed_text.local_running(), 1);
     assert_eq!(parsed_text.local_queued(), 1);
     assert_eq!(parsed_text.remote_running(), 1);
+    assert_eq!(parsed_text.leases_summary().as_deref(), Some("#1 61/62"));
 }
 
 #[test]
@@ -262,6 +266,8 @@ fn snapshot_fingerprint_skips_redraw_when_unchanged_and_preserves_selection() {
         lane: LaneStatus::default(),
         events: vec![],
         dag_queue: vec![],
+        merges: vec![],
+        candidates: vec![],
         host_load: Some(HostLoad {
             load1_tenths: 12,
             load5_tenths: 10,
@@ -295,6 +301,9 @@ fn snapshot_fingerprint_skips_redraw_when_unchanged_and_preserves_selection() {
         since: "2026-11-22T20:00:00Z".into(),
         running: true,
         remote: false,
+        rank: None,
+        used: None,
+        share: None,
     });
     assert!(app.apply_snapshot(snap3, false));
     assert_eq!(app.selected_run().unwrap().run, selected_id);
@@ -308,6 +317,8 @@ fn write_actions_only_generate_commands_and_filter_narrows_rows() {
         lane: LaneStatus::default(),
         events: vec![],
         dag_queue: vec![],
+        merges: vec![],
+        candidates: vec![],
         host_load: None,
         refreshed_at: "10:00:00".to_string(),
         warnings: vec![],

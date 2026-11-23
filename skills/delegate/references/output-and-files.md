@@ -60,11 +60,7 @@
 
 ## 清理
 
-成功 `apply` 释放 worktree、保留轻量 run 与补丁 7 天，`clean` 可提前删；`--keep` 另保留 worktree。dry-run/失败不清理；清理失败只提示。共享 worktree 仍有未合入或运行中的 run 引用时保留。人读最后一行说明验收是否仍有效，无效或未确认时列出任务完整验收命令；`--json` 不加这行。回收豁免内置 `sccache` 与配置 `cleanupKeepExecutables` 的共享守护进程。
-
-每次 `start` 会删除结束超过 7 天且结果已读取的记录（只显示过截断答复的不算已读取）；`DELEGATE_KEEP_DAYS` 调整天数，设为 `0` 关闭。
-
-容器回收、磁盘字段与失败语义见 [清理](cleanup.md)。
+成功 `apply` 释放 worktree、保留轻量 run 与补丁 7 天，`clean` 可提前删；`--keep` 另保留 worktree。dry-run/失败不清理；共享 worktree 仍有引用时保留。人读末行提示验收有效性（无效时列完整验收命令）；回收豁免内置 `sccache` 与 `cleanupKeepExecutables`。每次 `start` 清理结束超 7 天且已读记录（`DELEGATE_KEEP_DAYS` 调整，`0` 关闭）。容器回收、磁盘字段与失败语义见 [清理](cleanup.md)。
 
 ## 环境变量
 
@@ -74,7 +70,8 @@
 |---|---|
 | `DELEGATE_RUNS` | run 根目录 |
 | `DELEGATE_MAX_ACTIVE` | 整机防失控任务上限，默认 32；`0` 不限 |
-| `DELEGATE_MAX_HEAVY` | lane 同时放行的重命令数，默认 2；`0` 不限 |
+| `DELEGATE_MAX_HEAVY` | lane 并发数（内存/IO 保护），默认 `max(2, (线程-2)/12)`；`0` 不限 |
+| `DELEGATE_HEAVY_JOBS` | 显式覆盖单条重命令并发上限（正整数） |
 | `DELEGATE_REPO_MAX_ACTIVE` | 同仓库防失控任务上限，默认 0；`0` 不限 |
 | `DELEGATE_MIN_AVAILABLE_MB` | 可用内存低于该值（MB）时排队，默认 4096；`0` 不检查 |
 | `DELEGATE_CGROUP` | `0` 关闭 delegate 自建用户 systemd scope；默认自动探测。项目脚本自行启动的 user unit 仍按任务归属回收 |

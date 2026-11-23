@@ -58,7 +58,8 @@ class V515Tests(unittest.TestCase):
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
         first = self.outcome(self.cli("run", "--workdir", repo, "task"))
         self.assertEqual(first["configSources"], ["user"])
-        self.assertEqual(self.meta(first)["configCapacity"], {"maxActive": 32, "maxHeavy": 2,
+        default_max_heavy = json.loads(self.cli("lane", "--json", cwd=repo).stdout)["maxHeavy"]
+        self.assertEqual(self.meta(first)["configCapacity"], {"maxActive": 32, "maxHeavy": default_max_heavy,
                                                              "repoMaxActive": 0})
         (repo / ".delegate.json").write_text(json.dumps({"accept": "true", "env": {"LOCAL": "repo"},
                                                         "maxRework": 0}))

@@ -46,6 +46,9 @@ pub fn validate(value: Option<&Value>, repo: bool) -> Res<()> {
                         .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
             }),
             "maxHeavy" => v.as_u64().is_some_and(|n| usize::try_from(n).is_ok()),
+            "heavyJobs" => v
+                .as_u64()
+                .is_some_and(|n| n >= 1 && usize::try_from(n).is_ok()),
             "programs" => v.as_array().is_some_and(|a| {
                 a.iter().all(|v| {
                     v.as_str().is_some_and(|s| {
@@ -78,6 +81,9 @@ pub fn effective(v: &Value) -> Value {
         return json!(false);
     }
     let mut v = v.clone();
+    if v.get("maxHeavy").is_some() {
+        v["maxHeavyExplicit"] = json!(true);
+    }
     for (k, default) in [
         ("root", json!("delegate")),
         ("programs", json!(["cargo"])),
@@ -89,6 +95,149 @@ pub fn effective(v: &Value) -> Value {
         }
     }
     v
+}
+
+const REMOTE_THREADS_PROBE_SH: &str = r#"n=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0)
+cg=""
+if [ -r /proc/self/cgroup ]; then
+  rel=$(sed -n 's/^0:://p' /proc/self/cgroup | head -n 1)
+  p="/sys/fs/cgroup${rel}"
+  while [ -n "$p" ]; do
+    if [ -r "$p/cpu.max" ]; then
+      read q per < "$p/cpu.max"
+      if [ "$q" != "max" ] && [ -n "$q" ] && [ -n "$per" ] && [ "$per" -gt 0 ] 2>/dev/null; then
+        lim=$(( (q + per - 1) / per ))
+        [ "$lim" -lt 1 ] && lim=1
+        if [ -z "$cg" ] || [ "$lim" -lt "$cg" ]; then cg="$lim"; fi
+      fi
+    fi
+    [ "$p" = "/sys/fs/cgroup" ] && break
+    p=$(dirname "$p")
+  done
+fi
+if [ -n "$cg" ] && [ "$n" -gt 0 ] 2>/dev/null; then
+  [ "$cg" -lt "$n" ] && echo "$cg" || echo "$n"
+elif [ -n "$cg" ]; then
+  echo "$cg"
+else
+  echo "$n"
+fi"#;
+
+fn remote_threads_cache_path(host: &str, slice: &str) -> PathBuf {
+    let key = sha1_smol::Sha1::from(format!("{host}:{slice}"))
+        .digest()
+        .to_string();
+    state_dir().join("remote-threads").join(format!("{key}.json"))
+}
+
+fn read_cached_remote_threads(host: &str, slice: &str) -> Option<usize> {
+    let doc = json(remote_threads_cache_path(host, slice));
+    doc.get("threads")
+        .and_then(Value::as_u64)
+        .filter(|&n| n > 0)
+        .map(|n| n as usize)
+}
+
+fn write_cached_remote_threads(host: &str, slice: &str, threads: usize) {
+    let path = remote_threads_cache_path(host, slice);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = write_json(
+        &path,
+        &json!({
+            "host": host,
+            "slice": slice,
+            "threads": threads,
+            "probedAt": iso(),
+        }),
+    );
+}
+
+fn probe_remote_threads_ssh(host: &str, slice: &str) -> Res<usize> {
+    let script = if !slice.is_empty() {
+        format!(
+            "if command -v systemd-run >/dev/null 2>&1; then systemd-run --user --slice={} --wait --pipe --collect --quiet sh -c {} 2>/dev/null || sh -c {}; else sh -c {}; fi",
+            shell_quote(slice),
+            shell_quote(REMOTE_THREADS_PROBE_SH),
+            shell_quote(REMOTE_THREADS_PROBE_SH),
+            shell_quote(REMOTE_THREADS_PROBE_SH),
+        )
+    } else {
+        REMOTE_THREADS_PROBE_SH.to_string()
+    };
+    let raw = capture(ssh(host, &script), 15.0, false)?;
+    let parsed = raw
+        .lines()
+        .rev()
+        .find_map(|ln| ln.trim().parse::<usize>().ok().filter(|&n| n > 0))
+        .ok_or_else(|| format!("invalid remote thread count output: {:?}", clip(raw.trim(), 80)))?;
+    Ok(parsed)
+}
+
+/// Derive concurrency plan for a remote host using its own thread count (probed once and cached).
+/// When `allow_ssh` is false (e.g. non-blocking `delegate lane` / TUI polling), uses cached threads
+/// if present and falls back to configured `remote.maxHeavy` without running SSH.
+/// On SSH probe failure, prints a diagnostic and falls back to configured `remote.maxHeavy`.
+pub fn remote_plan(remote: &Value, allow_ssh: bool) -> crate::lane::ConcurrencyPlan {
+    let host = s(remote, "host");
+    let slice = s(remote, "slice");
+    let explicit_mh = if b(remote, "maxHeavyExplicit") {
+        remote.get("maxHeavy").and_then(Value::as_u64).map(|n| n as usize)
+    } else {
+        None
+    };
+    let fallback_mh = remote.get("maxHeavy").and_then(Value::as_u64).unwrap_or(4) as usize;
+    let explicit_hj = remote
+        .get("heavyJobs")
+        .and_then(Value::as_u64)
+        .filter(|&n| n >= 1)
+        .map(|n| n as usize);
+
+    if let Some(threads) = read_cached_remote_threads(host, slice) {
+        return crate::lane::derive_remote_concurrency(threads, explicit_mh, explicit_hj);
+    }
+
+    if allow_ssh && !host.is_empty() {
+        match probe_remote_threads_ssh(host, slice) {
+            Ok(threads) => {
+                write_cached_remote_threads(host, slice, threads);
+                return crate::lane::derive_remote_concurrency(threads, explicit_mh, explicit_hj);
+            }
+            Err(err) => {
+                let msg = format!(
+                    "无法探测远端 {host} 线程数（{}），回退到配置值 maxHeavy={fallback_mh}",
+                    err.lines().next().unwrap_or(&err)
+                );
+                eprintln!("delegate remote: {msg}");
+                return crate::lane::ConcurrencyPlan {
+                    threads: 0,
+                    budget: 0,
+                    max_heavy: fallback_mh,
+                    pool_tokens: 0,
+                    heavy_jobs: explicit_hj.unwrap_or(1),
+                    max_heavy_explicit: explicit_mh.is_some(),
+                    heavy_jobs_explicit: explicit_hj.is_some(),
+                    remote: true,
+                    fallback: true,
+                    diagnostic: Some(msg),
+                };
+            }
+        }
+    }
+
+    crate::lane::ConcurrencyPlan {
+        threads: 0,
+        budget: 0,
+        max_heavy: fallback_mh,
+        pool_tokens: 0,
+        heavy_jobs: explicit_hj.unwrap_or(1),
+        max_heavy_explicit: explicit_mh.is_some(),
+        heavy_jobs_explicit: explicit_hj.is_some(),
+        remote: true,
+        fallback: true,
+        diagnostic: None,
+    }
 }
 pub fn programs(v: &Value) -> Vec<&str> {
     if !enabled(v) {
@@ -430,7 +579,7 @@ fn environment(meta: &Value) -> BTreeMap<String, String> {
             vars.insert(k.into(), v);
         }
     }
-    // Never transplant the local machine's process/shim identity or search paths.
+    // Never transplant the local machine's process/shim identity, search paths, or CARGO_BUILD_JOBS.
     vars.retain(|k, _| {
         ![
             "PATH",
@@ -442,10 +591,13 @@ fn environment(meta: &Value) -> BTreeMap<String, String> {
             "XDG_CONFIG_HOME",
             "XDG_STATE_HOME",
             "XDG_CACHE_HOME",
+            "CARGO_BUILD_JOBS",
         ]
         .contains(&k.as_str())
             && !k.starts_with("DELEGATE_")
     });
+    let plan = remote_plan(&meta["remote"], true);
+    vars.insert("CARGO_BUILD_JOBS".into(), plan.heavy_jobs.to_string());
     vars
 }
 fn relay(
@@ -845,9 +997,11 @@ pub fn check(args: &[String]) -> Res<i32> {
     let _ = fs::remove_dir_all(&dir);
     match result {
         Ok(()) => {
+            let plan = remote_plan(remote, true);
             println!(
-                "delegate remote: {} ok (ssh + rsync + programs)",
-                s(remote, "host")
+                "delegate remote: {} ok (ssh + rsync + programs) · {}",
+                s(remote, "host"),
+                plan.format_summary()
             );
             Ok(0)
         }

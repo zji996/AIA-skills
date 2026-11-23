@@ -1,5 +1,13 @@
 # delegate
 
+## 6.30 合入员与发散侦察（Radar）
+
+- 串行合入员与 `merge-report.md`：`delegate merge --ready` 或 `delegate merge <run>...` 基于源 HEAD 在独立集成 worktree 串行 3-way 合入，命中 `generated.inputs` 重跑生成，逐个经 lane 跑 `accept` 并于末尾跑 `mergeAccept`（默认等于 `accept`），原样沿用同事提交标题附 `Delegate-Run: <run>` trailer；遇冲突、测试变红、命中受保护路径或未签字/失效的 `controllerReviewPaths` 原子回退到上一个全绿提交并标 `SKIPPED` 后继续；主控用 `delegate apply --keep-commits <merge-run>` 拿回提交链自行 push。Serial integration merger in an isolated worktree with rollback-and-skip, per-run accept + mergeAccept, and verbatim commits with Delegate-Run trailers.
+- `autoMerge` 自主合入白名单：`.delegate.json` 配置 `autoMerge`（支持 `!` 排除与 `add:` 纯新增，如 `docs/**`、`!docs/decision/**`、`add:**/tests/**`、`apps/web/src/styles/**`）；全部改动落在白名单且审查 `PASS` 的 run 标「可自主合入」，其余标「待主控点头」。Auto-merge glob whitelist with negation and add-only modifiers gated on review PASS.
+- 发散侦察（Radar）与候选板：`delegate radar` 顺序运行 `.delegate.json` `radar.collect` 并计算指纹，未变时零 token 退出并记 `radar_unchanged`；变化时派只读 scout（禁写文件、禁派活），Host 校验每条候选的证据锚点（`文件:行`/commit/输出行号，无锚丢弃）并按指纹去重写 `<state>/radar/<repo>/board.md`；主控用 `delegate radar pick <id>` 生成任务说明草稿不自动派活，`delegate radar schedule` 输出 00:30–04:30 每 2 小时定时安装说明。Deterministic collect-and-fingerprint Radar scout with zero-token unchanged exit, Host-validated evidence anchors, deduplicated board, and draft-only pick.
+- 事件流与 TUI：`merge_started`/`merge_item`/`merge_done`/`radar_unchanged`/`radar_done` 接入 `events.jsonl`；`delegate tui` 新增「3合入」与「4候选」标签页（`1-4`/`e`/`m`/`b` 切页）。Merge/radar events in the event stream and new Merges/Candidates tabs in delegate-tui.
+- 编译并发共享令牌池与动态公平分配：可用线程取 `available_parallelism()`、cgroup v2 `cpu.max`（向上取整）与 `nproc` 最小值，`budget = max(1, 线程 - 2)`，`maxHeavy` 默认 `max(2, budget / 12)`（内存/IO 保护），CPU 由 `<state>/jobserver.fifo`（`budget - maxHeavy` 令牌）与 `lane` 进程内代理线程按资历权重（`1, 1/2, 1/4…`，每条保底 2）动态公平分配（注入 `MAKEFLAGS`/`CARGO_MAKEFLAGS`/`CARGO_BUILD_JOBS`，用不满的份额让给他人，结束升满预算，被杀自动校正回收；`heavyJobs` 显式覆盖；远端不做代理照旧相除注入 `CARGO_BUILD_JOBS`），`delegate lane` 与 TUI 底栏显示池子与各命令份额（如 `令牌 88/88 空闲 31 · #1 61/62 · #2 31/31`）。Shared machine jobserver FIFO with in-process per-command dynamic seniority-weighted fair-share proxy, surplus yielding, kill recovery, explicit heavyJobs override, and live pool/share display in lane and TUI.
+
 ## 6.29 审-改闭环、`controllerReviewPaths` 与签字哈希
 
 - 自动审-改闭环：仓库 `.delegate.json` 开启 `review: {"tier": "review"}` 后，写入任务验收通过自动派新上下文只读审查员（不能写文件、不能派活），输入任务说明、`diff --total` 与审查要点（默认 `references/review-rubric.md`，可覆盖）；首行严格 `PASS`/`REWORK`/`NEEDS_CONTROLLER`（格式不对失败关闭为 `NEEDS_CONTROLLER`），写进 `review.json` 与 `summary.review` 并联动 DAG 续派队列。Automatic read-only review loop with controlled first-line verdicts and fail-closed format validation.

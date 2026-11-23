@@ -235,7 +235,7 @@ pub fn matches_rule(path: &str, rules: &[String]) -> bool {
         }
     })
 }
-fn copy_rec(src: &Path, dst: &Path) -> Res<()> {
+pub(crate) fn copy_rec(src: &Path, dst: &Path) -> Res<()> {
     let m = fs::symlink_metadata(src).map_err(|e| e.to_string())?;
     if m.file_type().is_symlink() {
         symlink(fs::read_link(src).map_err(|e| e.to_string())?, dst).map_err(|e| e.to_string())?;
@@ -1753,6 +1753,319 @@ pub fn apply(
     }
     apply_checked(run, merge, dry, keep_commits, commit_mode, &written_paths)
 }
+pub(crate) fn collect_commits(run: &Path, meta: &Value) -> Res<Vec<Value>> {
+    let worktree = Path::new(s(&meta["worktree"], "path"));
+    let (base_slot, base) = if b(meta, "netBaseRebased") && !s(meta, "netBase").is_empty() {
+        ("net-base", s(meta, "netBase").to_string())
+    } else {
+        (
+            "worktree-base",
+            crate::changes::worktree_base_commit(run, meta).unwrap_or_default(),
+        )
+    };
+    if base.is_empty() || !worktree.is_dir() {
+        return Ok(Vec::new());
+    }
+    let missing = crate::refs::missing_in_top(worktree, run, meta, &[(base_slot, &base)]);
+    if !missing.is_empty() {
+        return Err(crate::refs::recovery_message(run, meta, &missing));
+    }
+    let log = git_text(
+        worktree,
+        &[
+            "log",
+            "--reverse",
+            "--format=%H%x09%s",
+            &format!("{base}..HEAD"),
+        ],
+    )?;
+    Ok(log
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(hash, title)| {
+            let files = git_text(
+                worktree,
+                &["diff-tree", "--no-commit-id", "--name-only", "-r", hash],
+            )
+            .unwrap_or_default()
+            .lines()
+            .count();
+            json!({"hash":hash,"title":title,"files":files})
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MergeDirOutcome {
+    pub conflicts: Vec<String>,
+    pub marked_paths: Vec<String>,
+    pub numbered_warnings: Vec<Value>,
+    pub touches_generated_inputs: bool,
+    pub generate_command: String,
+}
+
+/// 3-way merge a run's net changes into an arbitrary target worktree directory (used by
+/// `delegate merge` for its isolated integration worktree). Reuses `apply_inner`'s exact
+/// merge semantics (3-way `git merge-file`, `appendOnly` `--union`, `generated.paths` skip,
+/// conflict-marker rejection, large files, symlinks/exec modes). Fails closed without writing
+/// if any conflict or conflict marker is detected.
+pub(crate) fn merge_run_into_dir(
+    run: &Path,
+    target_root: &Path,
+    source_for_config: &Path,
+) -> Res<MergeDirOutcome> {
+    let (meta, mut top, _, mut after) = chain_changes(run)?;
+    if meta["worktree"].is_null() {
+        return Err(format!(
+            "{} worked in place; not a worktree run",
+            run.file_name().unwrap_or_default().to_string_lossy()
+        ));
+    }
+    if s(&meta, "mode") == "read-only" {
+        return Err(format!(
+            "{} is read-only; nothing to merge",
+            run.file_name().unwrap_or_default().to_string_lossy()
+        ));
+    }
+    let applied = applied_state(run, &meta);
+    let (total_base, _) = effective_total_base(&top, &meta);
+    let before = if !s(&applied, "tree").is_empty() {
+        s(&applied, "tree").to_string()
+    } else {
+        total_base.clone()
+    };
+    let (generated_paths, generate_command) = generated(source_for_config)?;
+    let append_only = append_only(source_for_config)?;
+    let worktree = PathBuf::from(s(&meta["worktree"], "path"));
+    let mut large = json(run.join("changes.json"))["afterLarge"].clone();
+    let exclude = strings(&meta["snapshotExclude"]);
+    if worktree.is_dir() {
+        if let Some(now) = snapshot(&worktree, run, &exclude) {
+            top = worktree.clone();
+            after = s(&now, "tree").into();
+            large = now["large"].clone();
+        }
+    }
+    let missing = crate::refs::missing_in_top(
+        &top,
+        run,
+        &meta,
+        &[("base", &before), ("after", &after)],
+    );
+    if !missing.is_empty() {
+        return Err(crate::refs::recovery_message(run, &meta, &missing));
+    }
+    let changes = tree_changes(
+        &top,
+        &json!({"tree":before,"large":applied["large"]}),
+        &json!({"tree":after,"large":large}),
+        false,
+    )?;
+
+    let mut actions = vec![];
+    let mut matched = vec![];
+    let mut conflicts = vec![];
+    let mut additions = vec![];
+    for c in changes {
+        if b(&c, "large") {
+            continue;
+        }
+        let path = s(&c, "path").to_string();
+        if matches_rule(&path, &generated_paths) {
+            continue;
+        }
+        let target = target_root.join(&path);
+        let (old_mode, old) = blob(&top, &before, &path)?;
+        let (mode, new) = blob(&top, &after, &path)?;
+        if old_mode.is_none() && mode.is_some() {
+            additions.push(path.clone());
+        }
+        let now = current(&target);
+        let now_mode = entry_mode(&target);
+        let valid = |x: &Option<String>| {
+            x.as_deref()
+                .is_none_or(|v| ["100644", "100755", "120000"].contains(&v))
+        };
+        if through_symlink(target_root, &target)
+            || now_mode.as_deref() == Some("dir")
+            || !valid(&old_mode)
+            || !valid(&mode)
+        {
+            conflicts.push(path);
+        } else if now == new && now_mode == mode {
+            matched.push(path);
+            continue;
+        } else if now == old && (now_mode == old_mode || now_mode == mode) {
+            actions.push(Action {
+                kind: if new.is_none() { "deleted" } else { "applied" }.into(),
+                path,
+                target,
+                mode,
+                content: new.unwrap_or_default(),
+            });
+        } else if let (Some(base), Some(theirs), Some(mine)) = (&old, &new, &now) {
+            if [old_mode.as_deref(), mode.as_deref(), now_mode.as_deref()].contains(&Some("120000"))
+                || base.contains(&0)
+                || theirs.contains(&0)
+                || mine.contains(&0)
+            {
+                conflicts.push(path);
+                continue;
+            }
+            let scratch = target_root
+                .parent()
+                .unwrap_or(target_root)
+                .join(format!(".merge-int-{}-{}", std::process::id(), now_ns()));
+            fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+            let minefile = scratch.join("mine");
+            let basefile = scratch.join("base");
+            let theirfile = scratch.join("theirs");
+            write(&minefile, mine).map_err(|e| format!("{}: {e}", minefile.display()))?;
+            write(&basefile, base).map_err(|e| format!("{}: {e}", basefile.display()))?;
+            write(&theirfile, theirs).map_err(|e| format!("{}: {e}", theirfile.display()))?;
+            let status = git_command()
+                .arg("merge-file")
+                .args([
+                    "-L",
+                    "current",
+                    "-L",
+                    "base",
+                    "-L",
+                    run.file_name().unwrap_or_default().to_str().unwrap_or(""),
+                ])
+                .args([&minefile, &basefile, &theirfile])
+                .status()
+                .map_err(|e| e.to_string())?;
+            let mut clean = status.success();
+            if !clean && matches_rule(&path, &append_only) {
+                write(&minefile, mine).map_err(|e| format!("{}: {e}", minefile.display()))?;
+                clean = git_command()
+                    .args(["merge-file", "--union"])
+                    .args([&minefile, &basefile, &theirfile])
+                    .status()
+                    .map_err(|e| e.to_string())?
+                    .success();
+            }
+            let merged = fs::read(&minefile).map_err(|e| format!("{}: {e}", minefile.display()))?;
+            let _ = fs::remove_dir_all(&scratch);
+            if clean {
+                actions.push(Action {
+                    kind: "merged".into(),
+                    path,
+                    target,
+                    mode: if old_mode != mode { mode } else { None },
+                    content: merged,
+                });
+            } else {
+                conflicts.push(path);
+            }
+        } else {
+            conflicts.push(path);
+        }
+    }
+    if let Some(obj) = large.as_object() {
+        for path in obj.keys() {
+            if matches_rule(path, &generated_paths) {
+                continue;
+            }
+            let origin = worktree.join(path);
+            if applied["large"].get(path).is_none() && blob(&top, &before, path)?.0.is_none() {
+                additions.push(path.clone());
+            }
+            let target = target_root.join(path);
+            if !origin.is_file()
+                || through_symlink(target_root, &target)
+                || target.is_symlink()
+                || entry_mode(&target).as_deref() == Some("dir")
+            {
+                conflicts.push(path.clone());
+            } else if !target.exists() {
+                actions.push(Action {
+                    kind: "copied".into(),
+                    path: path.clone(),
+                    target,
+                    mode: Some("large".into()),
+                    content: fs::read(&origin).map_err(|e| format!("{}: {e}", origin.display()))?,
+                });
+            } else if current(&target)
+                != Some(fs::read(&origin).map_err(|e| format!("{}: {e}", origin.display()))?)
+            {
+                conflicts.push(path.clone());
+            } else {
+                matched.push(path.clone());
+            }
+        }
+    }
+
+    let mut marked_paths = Vec::new();
+    for action in &actions {
+        if action.kind != "copied"
+            && !conflict_labels_in_bytes(Path::new(&action.path), &action.content).is_empty()
+        {
+            marked_paths.push(action.path.clone());
+        }
+    }
+
+    let gen_inputs = generated_inputs(source_for_config)?;
+    let touches_generated_inputs = !actions.is_empty()
+        && !generated_paths.is_empty()
+        && !generate_command.is_empty()
+        && (gen_inputs.is_empty()
+            || actions
+                .iter()
+                .any(|a| matches_rule(&a.path, &gen_inputs)));
+
+    additions.retain(|path| {
+        actions
+            .iter()
+            .any(|a| &a.path == path && a.kind != "deleted")
+    });
+    let numbered_warnings =
+        numbered_conflicts(target_root, &additions, &actions, &generated_paths)?;
+
+    if !conflicts.is_empty() || !marked_paths.is_empty() {
+        return Ok(MergeDirOutcome {
+            conflicts,
+            marked_paths,
+            numbered_warnings,
+            touches_generated_inputs: false,
+            generate_command,
+        });
+    }
+
+    for a in actions {
+        let op = match a.kind.as_str() {
+            "deleted" => fs::remove_file(&a.target)
+                .map_err(|e| e.to_string())
+                .map(|()| remove_empty_parents(&a.target, target_root)),
+            "copied" => {
+                fs::create_dir_all(a.target.parent().unwrap_or(target_root))
+                    .map_err(|e| format!("merge {}: {e}", a.target.display()))?;
+                write(&a.target, &a.content)
+            }
+            _ => {
+                if let Some(mode) = a.mode.as_deref() {
+                    write_entry(&a.target, mode, &a.content)
+                } else {
+                    write(&a.target, &a.content)
+                }
+            }
+        };
+        if let Err(e) = op {
+            return Err(format!("merge {}: {e}", a.target.display()));
+        }
+    }
+
+    let _ = matched;
+    Ok(MergeDirOutcome {
+        conflicts,
+        marked_paths,
+        numbered_warnings,
+        touches_generated_inputs,
+        generate_command,
+    })
+}
+
 fn apply_checked(
     run: &Path,
     merge: bool,
@@ -1779,45 +2092,7 @@ fn apply_checked(
     let meta = json(run.join("meta.json"));
     let source = Path::new(s(&meta["worktree"], "source"));
     let worktree = Path::new(s(&meta["worktree"], "path"));
-    let (base_slot, base) = if b(&meta, "netBaseRebased") && !s(&meta, "netBase").is_empty() {
-        ("net-base", s(&meta, "netBase").to_string())
-    } else {
-        (
-            "worktree-base",
-            crate::changes::worktree_base_commit(run, &meta).unwrap_or_default(),
-        )
-    };
-    let commits = if !base.is_empty() && worktree.is_dir() {
-        let missing =
-            crate::refs::missing_in_top(worktree, run, &meta, &[(base_slot, &base)]);
-        if !missing.is_empty() {
-            return Err(crate::refs::recovery_message(run, &meta, &missing));
-        }
-        let log = git_text(
-            worktree,
-            &[
-                "log",
-                "--reverse",
-                "--format=%H%x09%s",
-                &format!("{base}..HEAD"),
-            ],
-        )?;
-        log.lines()
-            .filter_map(|line| line.split_once('\t'))
-            .map(|(hash, title)| {
-                let files = git_text(
-                    worktree,
-                    &["diff-tree", "--no-commit-id", "--name-only", "-r", hash],
-                )
-                .unwrap_or_default()
-                .lines()
-                .count();
-                json!({"hash":hash,"title":title,"files":files})
-            })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let commits = collect_commits(run, &meta)?;
     conclusion["commits"] = json!(commits);
     let uncommitted = crate::changes::uncommitted(&meta)?;
     if !uncommitted.is_empty() {

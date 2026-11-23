@@ -17,6 +17,8 @@ pub enum FocusPane {
 pub enum ViewTab {
     Runs,
     Events,
+    Merges,
+    Candidates,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +143,12 @@ pub struct App {
     pub selected_event: Option<usize>,
     pub events_scroll: usize,
     pub events_follow: bool,
+    pub filtered_merges: Vec<usize>,
+    pub selected_merge: Option<usize>,
+    pub merges_scroll: usize,
+    pub filtered_candidates: Vec<usize>,
+    pub selected_candidate: Option<usize>,
+    pub candidates_scroll: usize,
     pub filter: String,
     pub filter_mode: bool,
     pub expanded_folds: HashSet<(PathBuf, CollapseKind)>,
@@ -176,6 +184,12 @@ impl App {
             selected_event: None,
             events_scroll: 0,
             events_follow: true,
+            filtered_merges: Vec::new(),
+            selected_merge: None,
+            merges_scroll: 0,
+            filtered_candidates: Vec::new(),
+            selected_candidate: None,
+            candidates_scroll: 0,
             filter: String::new(),
             filter_mode: false,
             expanded_folds: HashSet::new(),
@@ -417,6 +431,57 @@ impl App {
             self.selected_event = Some(self.filtered_events.len() - 1);
         }
 
+        // Rebuild filtered merges list preserving selection by merge_run id.
+        let prev_merge_id = self.selected_merge_item().map(|m| m.merge_run.clone());
+        self.filtered_merges = self
+            .snapshot
+            .merges
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.matches_filter(&query))
+            .map(|(i, _)| i)
+            .collect();
+        if self.filtered_merges.is_empty() {
+            self.selected_merge = None;
+            self.merges_scroll = 0;
+        } else if let Some(ref mid) = prev_merge_id {
+            self.selected_merge = self
+                .filtered_merges
+                .iter()
+                .position(|&idx| self.snapshot.merges[idx].merge_run == *mid)
+                .or(Some(0));
+        } else {
+            self.selected_merge = Some(0);
+        }
+
+        // Rebuild filtered radar candidates list preserving selection by candidate id.
+        let prev_cand_id = self
+            .selected_candidate_item()
+            .map(|c| (c.repo_path.clone(), c.id.clone()));
+        self.filtered_candidates = self
+            .snapshot
+            .candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.matches_filter(&query))
+            .map(|(i, _)| i)
+            .collect();
+        if self.filtered_candidates.is_empty() {
+            self.selected_candidate = None;
+            self.candidates_scroll = 0;
+        } else if let Some((ref repo, ref cid)) = prev_cand_id {
+            self.selected_candidate = self
+                .filtered_candidates
+                .iter()
+                .position(|&idx| {
+                    let c = &self.snapshot.candidates[idx];
+                    c.repo_path == *repo && c.id == *cid
+                })
+                .or(Some(0));
+        } else {
+            self.selected_candidate = Some(0);
+        }
+
         // Restore prior selection if present; else prefer first visible Run, falling back to first selectable.
         let mut next_sel = None;
         if let Some(key) = preserve {
@@ -506,6 +571,60 @@ impl App {
         let pos = self.selected_event?;
         let &ev_idx = self.filtered_events.get(pos)?;
         self.snapshot.events.get(ev_idx)
+    }
+
+    pub fn selected_merge_item(&self) -> Option<&MergeRunItem> {
+        let pos = self.selected_merge?;
+        let &idx = self.filtered_merges.get(pos)?;
+        self.snapshot.merges.get(idx)
+    }
+
+    pub fn selected_candidate_item(&self) -> Option<&RadarCandidateItem> {
+        let pos = self.selected_candidate?;
+        let &idx = self.filtered_candidates.get(pos)?;
+        self.snapshot.candidates.get(idx)
+    }
+
+    pub fn move_merge_selection(&mut self, delta: isize) -> bool {
+        if self.filtered_merges.is_empty() {
+            self.selected_merge = None;
+            return false;
+        }
+        let len = self.filtered_merges.len();
+        let cur = self.selected_merge.unwrap_or(0);
+        let next = if delta >= 0 {
+            (cur + delta as usize).min(len - 1)
+        } else {
+            cur.saturating_sub((-delta) as usize)
+        };
+        if Some(next) != self.selected_merge {
+            self.selected_merge = Some(next);
+            self.detail_scroll = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn move_candidate_selection(&mut self, delta: isize) -> bool {
+        if self.filtered_candidates.is_empty() {
+            self.selected_candidate = None;
+            return false;
+        }
+        let len = self.filtered_candidates.len();
+        let cur = self.selected_candidate.unwrap_or(0);
+        let next = if delta >= 0 {
+            (cur + delta as usize).min(len - 1)
+        } else {
+            cur.saturating_sub((-delta) as usize)
+        };
+        if Some(next) != self.selected_candidate {
+            self.selected_candidate = Some(next);
+            self.detail_scroll = 0;
+            true
+        } else {
+            false
+        }
     }
 
     pub fn move_event_selection(&mut self, delta: isize) -> bool {
@@ -813,10 +932,49 @@ impl App {
                 }
                 return AppAction::None;
             }
+            KeyCode::Char('3') => {
+                if self.tab != ViewTab::Merges {
+                    self.tab = ViewTab::Merges;
+                    self.detail_scroll = 0;
+                    self.dirty = true;
+                    return AppAction::Redraw;
+                }
+                return AppAction::None;
+            }
+            KeyCode::Char('4') => {
+                if self.tab != ViewTab::Candidates {
+                    self.tab = ViewTab::Candidates;
+                    self.detail_scroll = 0;
+                    self.dirty = true;
+                    return AppAction::Redraw;
+                }
+                return AppAction::None;
+            }
             KeyCode::Char('e') => {
-                self.tab = match self.tab {
-                    ViewTab::Runs => ViewTab::Events,
-                    ViewTab::Events => ViewTab::Runs,
+                self.tab = if self.tab == ViewTab::Events {
+                    ViewTab::Runs
+                } else {
+                    ViewTab::Events
+                };
+                self.detail_scroll = 0;
+                self.dirty = true;
+                return AppAction::Redraw;
+            }
+            KeyCode::Char('m') => {
+                self.tab = if self.tab == ViewTab::Merges {
+                    ViewTab::Runs
+                } else {
+                    ViewTab::Merges
+                };
+                self.detail_scroll = 0;
+                self.dirty = true;
+                return AppAction::Redraw;
+            }
+            KeyCode::Char('b') => {
+                self.tab = if self.tab == ViewTab::Candidates {
+                    ViewTab::Runs
+                } else {
+                    ViewTab::Candidates
                 };
                 self.detail_scroll = 0;
                 self.dirty = true;
@@ -832,6 +990,226 @@ impl App {
                 return AppAction::Redraw;
             }
             _ => {}
+        }
+
+        if matches!(self.tab, ViewTab::Merges | ViewTab::Candidates) {
+            let is_merges = self.tab == ViewTab::Merges;
+            return match key.code {
+                KeyCode::Char('q') => AppAction::Quit,
+                KeyCode::Tab | KeyCode::BackTab => {
+                    self.focus = match self.focus {
+                        FocusPane::List => FocusPane::Detail,
+                        FocusPane::Detail => FocusPane::List,
+                    };
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                KeyCode::Down | KeyCode::Char('j') => match self.focus {
+                    FocusPane::List => {
+                        let moved = if is_merges {
+                            self.move_merge_selection(1)
+                        } else {
+                            self.move_candidate_selection(1)
+                        };
+                        if moved {
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = self.detail_scroll.saturating_add(1);
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                },
+                KeyCode::Up | KeyCode::Char('k') => match self.focus {
+                    FocusPane::List => {
+                        let moved = if is_merges {
+                            self.move_merge_selection(-1)
+                        } else {
+                            self.move_candidate_selection(-1)
+                        };
+                        if moved {
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                },
+                KeyCode::PageDown => match self.focus {
+                    FocusPane::List => {
+                        let moved = if is_merges {
+                            self.move_merge_selection(10)
+                        } else {
+                            self.move_candidate_selection(10)
+                        };
+                        if moved {
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = self.detail_scroll.saturating_add(10);
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                },
+                KeyCode::PageUp => match self.focus {
+                    FocusPane::List => {
+                        let moved = if is_merges {
+                            self.move_merge_selection(-10)
+                        } else {
+                            self.move_candidate_selection(-10)
+                        };
+                        if moved {
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = self.detail_scroll.saturating_sub(10);
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                },
+                KeyCode::Home | KeyCode::Char('g') => match self.focus {
+                    FocusPane::List => {
+                        let has_items = if is_merges {
+                            !self.filtered_merges.is_empty()
+                        } else {
+                            !self.filtered_candidates.is_empty()
+                        };
+                        if has_items {
+                            if is_merges {
+                                self.selected_merge = Some(0);
+                            } else {
+                                self.selected_candidate = Some(0);
+                            }
+                            self.detail_scroll = 0;
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = 0;
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                },
+                KeyCode::End | KeyCode::Char('G') => match self.focus {
+                    FocusPane::List => {
+                        let len = if is_merges {
+                            self.filtered_merges.len()
+                        } else {
+                            self.filtered_candidates.len()
+                        };
+                        if len > 0 {
+                            if is_merges {
+                                self.selected_merge = Some(len - 1);
+                            } else {
+                                self.selected_candidate = Some(len - 1);
+                            }
+                            self.detail_scroll = 0;
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = usize::MAX / 2;
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                },
+                KeyCode::Char('a') | KeyCode::Enter | KeyCode::Char('y') if is_merges => {
+                    if let Some(m) = self.selected_merge_item().cloned() {
+                        let cmd = format_repo_cmd(
+                            &self.cwd,
+                            &m.repo_path,
+                            &format!(
+                                "{} apply --keep-commits {}",
+                                shell_quote(&self.delegate_bin.to_string_lossy()),
+                                shell_quote(&m.merge_run)
+                            ),
+                        );
+                        let note = if m.applied {
+                            "该合入批次已合回源仓库。".to_string()
+                        } else if !m.merge_accept_ok {
+                            "注意：最终 mergeAccept 未通过，请先排查报告再合回。".to_string()
+                        } else {
+                            "把集成提交链原样拿到源仓库，push 仍由主控执行。".to_string()
+                        };
+                        self.overlay = Overlay::CommandModal {
+                            action_label: "合回源仓库 (apply --keep-commits)".to_string(),
+                            command: cmd,
+                            note,
+                        };
+                        self.dirty = true;
+                        AppAction::Redraw
+                    } else {
+                        AppAction::None
+                    }
+                }
+                KeyCode::Char('p') | KeyCode::Enter | KeyCode::Char('y') if !is_merges => {
+                    if let Some(c) = self.selected_candidate_item().cloned() {
+                        let cmd = format_repo_cmd(
+                            &self.cwd,
+                            &c.repo_path,
+                            &format!(
+                                "{} radar pick {}",
+                                shell_quote(&self.delegate_bin.to_string_lossy()),
+                                shell_quote(&c.id)
+                            ),
+                        );
+                        self.overlay = Overlay::CommandModal {
+                            action_label: "生成任务说明草稿 (radar pick)".to_string(),
+                            command: cmd,
+                            note: "仅生成任务说明草稿，不会自动派活。".to_string(),
+                        };
+                        self.dirty = true;
+                        AppAction::Redraw
+                    } else {
+                        AppAction::None
+                    }
+                }
+                KeyCode::Char('r') => AppAction::Refresh,
+                KeyCode::Char('/') => {
+                    self.filter_mode = true;
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                KeyCode::Esc => {
+                    if !self.filter.is_empty() {
+                        self.filter.clear();
+                        self.rebuild_rows(None);
+                        self.dirty = true;
+                        AppAction::Redraw
+                    } else {
+                        AppAction::None
+                    }
+                }
+                KeyCode::Char('?') => {
+                    self.overlay = Overlay::Help;
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                _ => AppAction::None,
+            };
         }
 
         if self.tab == ViewTab::Events {

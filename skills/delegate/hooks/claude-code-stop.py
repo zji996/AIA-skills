@@ -48,6 +48,11 @@ KIND_LABELS = {
     "review_verdict": "审查判定",
     "rework_sent": "退回返工",
     "needs_attention": "需主控关注",
+    "merge_started": "开始合入",
+    "merge_item": "合入进度",
+    "merge_done": "合入完成",
+    "radar_unchanged": "侦察未变",
+    "radar_done": "侦察完成",
 }
 
 
