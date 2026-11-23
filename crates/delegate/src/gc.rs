@@ -423,47 +423,28 @@ fn auto_clean_committed_applied_runs(state: &Path) {
     }
 }
 
-/// V2 interface reservation for background premerge -> fast-forward `apply` (Review §3 & §5).
-/// V1 reserves the fail-closed contract & schema without running background `_merge-worker` yet.
-#[allow(dead_code)]
+/// Premerge fast-forward interface compatibility facade (implemented in `crate::premerge`).
 pub mod premerge {
-    use crate::common::*;
     use serde_json::Value;
     use std::path::{Path, PathBuf};
 
+    #[allow(dead_code)]
     pub fn premerge_path(run: &Path) -> PathBuf {
-        run.join("premerge.json")
+        crate::premerge::premerge_path(run)
     }
 
     /// Fail-closed validation of a `premerge.json` artifact against the current source `HEAD`.
-    /// Returns `Some(merged_tree)` ONLY if `baseHead == current_head`, `acceptOk == true`,
+    /// Returns `Some(doc)` ONLY if `baseHead == current_head`, `acceptOk == true`,
     /// `conflicts` is empty, and `mergedTree` is non-empty.
+    #[allow(dead_code)]
     pub fn validate_fast_forward(run: &Path, source: &Path) -> Option<Value> {
-        let doc = json(premerge_path(run));
-        if !doc.is_object() {
-            return None;
-        }
-        let base_head = s(&doc, "baseHead");
-        let merged_tree = s(&doc, "mergedTree");
-        if base_head.is_empty() || merged_tree.is_empty() || !b(&doc, "acceptOk") {
-            return None;
-        }
-        if doc["conflicts"]
-            .as_array()
-            .is_some_and(|c| !c.is_empty())
-        {
-            return None;
-        }
-        let current_head = read_git_head(source)?;
-        if current_head != base_head {
-            return None;
-        }
-        Some(doc)
+        crate::premerge::validate_fast_forward_basic(run, source)
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::common::*;
         use serde_json::json;
         use std::fs;
 

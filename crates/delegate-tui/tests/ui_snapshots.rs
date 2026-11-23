@@ -556,3 +556,51 @@ fn work_card_markdown_rendering_and_bidirectional_run_linkage() {
 
     let _ = std::fs::remove_file(&tmp);
 }
+
+#[test]
+fn premerge_status_renders_in_run_rows_detail_and_work_live_column() {
+    use delegate_tui::data::parse_work_jsonl;
+
+    let raw_runs = [
+        r#"{"run":"20261123-100001-ready","name":"ready-task","state":"delivered","mode":"write","model":"p/write","ageSeconds":40,"elapsedSeconds":20,"changes":{"files":2,"added":10,"deleted":2},"accept":{"ok":true,"command":"cargo test"},"premerge":{"status":"ready","baseHead":"abcdef1234567890","baseShort":"abcdef1","changedCount":2},"workId":"W101"}"#,
+        r#"{"run":"20261123-100002-running","name":"merging-task","state":"delivered","mode":"write","model":"p/write","ageSeconds":30,"elapsedSeconds":15,"changes":{"files":1,"added":5,"deleted":1},"accept":{"ok":true,"command":"cargo test"},"premerge":{"status":"running","baseHead":"abcdef1234567890","baseShort":"abcdef1"},"workId":"W102"}"#,
+        r#"{"run":"20261123-100003-stale","name":"stale-task","state":"delivered","mode":"write","model":"p/write","ageSeconds":20,"elapsedSeconds":10,"changes":{"files":1,"added":3,"deleted":0},"accept":{"ok":true,"command":"cargo test"},"premerge":{"status":"stale","baseHead":"1111111234567890","baseShort":"1111111"},"workId":"W103"}"#,
+        r#"{"run":"20261123-100004-conf","name":"conflict-task","state":"delivered","mode":"write","model":"p/write","ageSeconds":10,"elapsedSeconds":8,"changes":{"files":1,"added":4,"deleted":2},"accept":{"ok":true,"command":"cargo test"},"premerge":{"status":"conflict","baseHead":"abcdef1234567890","baseShort":"abcdef1","conflicts":["src/lib.rs"],"conflictCount":1,"log":"/tmp/run/premerge.log"},"workId":"W104"}"#,
+    ]
+    .join("\n");
+
+    let repo = parse_status_jsonl(Path::new("/home/dev/demo-api"), "demo-api", &raw_runs);
+    let raw_work = [
+        r#"{"id":"W101","title":"Fast forward ready","repo":"/home/dev/demo-api","repoLabel":"demo-api","state":"attention","runs":["20261123-100001-ready"],"focus":"待合入","createdAt":"2026-11-23T01:00:00Z","updatedAt":"2026-11-23T02:00:00Z"}"#,
+        r#"{"id":"W102","title":"Premerge running","repo":"/home/dev/demo-api","repoLabel":"demo-api","state":"attention","runs":["20261123-100002-running"],"focus":"待合入","createdAt":"2026-11-23T01:00:00Z","updatedAt":"2026-11-23T02:00:00Z"}"#,
+        r#"{"id":"W103","title":"Main advanced","repo":"/home/dev/demo-api","repoLabel":"demo-api","state":"attention","runs":["20261123-100003-stale"],"focus":"待合入","createdAt":"2026-11-23T01:00:00Z","updatedAt":"2026-11-23T02:00:00Z"}"#,
+        r#"{"id":"W104","title":"Premerge conflict","repo":"/home/dev/demo-api","repoLabel":"demo-api","state":"attention","runs":["20261123-100004-conf"],"focus":"待合入","createdAt":"2026-11-23T01:00:00Z","updatedAt":"2026-11-23T02:00:00Z"}"#,
+    ]
+    .join("\n");
+    let work = parse_work_jsonl(&raw_work);
+
+    let snap = AppSnapshot {
+        repos: vec![repo],
+        work,
+        refreshed_at: "12:00:00".into(),
+        ..AppSnapshot::default()
+    };
+    let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("."), 5);
+
+    // 1. Runs tab: run rows show premerge tags AND detail pane shows full premerge line + log
+    let runs_screen = render_to_string(&mut app, 170, 30);
+    assert!(runs_screen.contains("快进✓ abcdef1"), "{runs_screen}");
+    assert!(runs_screen.contains("预合并中"), "{runs_screen}");
+    assert!(runs_screen.contains("快进✗ 主干已前进"), "{runs_screen}");
+    assert!(runs_screen.contains("预合并冲突:src/lib.rs"), "{runs_screen}");
+    assert!(runs_screen.contains("预合并: 预合并冲突：src/lib.rs"), "{runs_screen}");
+    assert!(runs_screen.contains("/tmp/run/premerge.log"), "{runs_screen}");
+
+    // 2. Work tab ("此刻在干什么"): shows live premerge status for every linked work item
+    app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+    let work_screen = render_to_string(&mut app, 140, 28);
+    assert!(work_screen.contains("快进 ✓（基于 abcdef1）"), "{work_screen}");
+    assert!(work_screen.contains("预合并中"), "{work_screen}");
+    assert!(work_screen.contains("快进 ✗ 主干已前进"), "{work_screen}");
+    assert!(work_screen.contains("预合并冲突：src/lib.rs"), "{work_screen}");
+}

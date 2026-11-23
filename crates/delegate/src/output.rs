@@ -71,146 +71,167 @@ pub fn blind_note(files: &Value) -> String {
     )
 }
 
-pub fn worktree_disk() {
-    let threshold = setting("WORKTREE_WARN_GIB", "20")
+/// Combined single-pass `worktree_disk` + `source_build_disk` warning emitter for `status`/`wait`.
+/// Reads each run's `meta.json` at most once (instead of 4x across two `runs::all_runs()` calls).
+pub fn disk_warnings() {
+    let wt_threshold = setting("WORKTREE_WARN_GIB", "20")
         .parse::<f64>()
         .ok()
         .filter(|n| n.is_finite() && *n >= 0.0)
         .unwrap_or(20.0);
-    if threshold == 0.0 {
-        return;
-    }
-    let threshold_bytes = (threshold * 1024.0_f64.powi(3)) as u64;
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let repo = crate::launch::repo_key(&cwd);
-    let all = runs::all_runs();
-    let active_paths: std::collections::BTreeSet<_> = all
-        .iter()
-        .filter(|run| runs::active(&runs::state(run)))
-        .map(|run| s(&json(run.join("meta.json"))["worktree"], "path").to_string())
-        .collect();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut items = Vec::new();
-    for run in all.iter().rev() {
-        let meta = json(run.join("meta.json"));
-        let path = s(&meta["worktree"], "path");
-        if s(&meta, "mode") != "write"
-            || runs::active(&runs::state(run))
-            || crate::launch::repo_key_for_meta(&meta) != repo
-            || path.is_empty()
-            || !Path::new(path).is_dir()
-            || active_paths.contains(path)
-            || !seen.insert(path.to_string())
-        {
-            continue;
-        }
-        let Some(bytes) = meta["worktreeBytes"].as_u64() else {
-            continue;
-        };
-        items.push(json!({"run":meta["run"], "name":meta["name"], "bytes":bytes}));
-    }
-    let total = items
-        .iter()
-        .map(|item| item["bytes"].as_u64().unwrap_or(0))
-        .fold(0u64, u64::saturating_add);
-    if total < threshold_bytes || items.is_empty() {
-        return;
-    }
-    items.sort_by_key(|item| std::cmp::Reverse(item["bytes"].as_u64().unwrap_or(0)));
-    items.truncate(3);
-    let next = "已确认合入后：delegate clean <name> --force";
-    if json_enabled() {
-        println!(
-            "{}",
-            json!({"worktreeDisk":{"totalBytes":total,"thresholdBytes":threshold_bytes,"largest":items,"next":next}})
-        );
-    } else {
-        let largest = items
-            .iter()
-            .map(|item| {
-                format!(
-                    "{} {:.1} GiB",
-                    s(item, "name").replace(['\n', '\r'], " "),
-                    item["bytes"].as_u64().unwrap_or(0) as f64 / 1024.0_f64.powi(3)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("、");
-        println!(
-            "提示：已结束未清理 worktree 共 {:.1} GiB；最大：{largest}；{next}",
-            total as f64 / 1024.0_f64.powi(3)
-        );
-    }
-}
-
-pub fn source_build_disk() {
-    let threshold = setting("SOURCE_BUILD_WARN_GIB", "60")
+    let sb_threshold = setting("SOURCE_BUILD_WARN_GIB", "60")
         .parse::<f64>()
         .ok()
         .filter(|n| n.is_finite() && *n >= 0.0)
         .unwrap_or(60.0);
-    if threshold == 0.0 {
+    if wt_threshold == 0.0 && sb_threshold == 0.0 {
         return;
     }
-    let threshold_bytes = (threshold * 1024.0_f64.powi(3)) as u64;
+
+    let mut roots = vec![runs_root()];
+    if let Some(old) = legacy_runs_root() {
+        roots.push(old);
+    }
+    let mut entries: Vec<(u64, std::path::PathBuf, Value)> = Vec::new();
+    for root in roots {
+        let Ok(rd) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for ent in rd.flatten() {
+            let p = ent.path();
+            let mp = p.join("meta.json");
+            if !mp.is_file() {
+                continue;
+            }
+            let meta = json(&mp);
+            let ns = meta["startedNs"].as_u64().unwrap_or(0);
+            entries.push((ns, p, meta));
+        }
+    }
+    if entries.is_empty() {
+        return;
+    }
     let cwd = std::env::current_dir().unwrap_or_default();
     let repo = crate::launch::repo_key(&cwd);
-    let latest = runs::all_runs()
-        .iter()
-        .map(|run| json(run.join("meta.json")))
-        .filter(|meta| {
-            s(meta, "mode") == "write"
-                && crate::launch::repo_key_for_meta(meta) == repo
-                && meta["sourceBuildBytes"].as_u64().is_some()
-                && meta["sourceBuildPaths"].as_array().is_some_and(|paths| {
-                    paths.iter().all(|item| {
-                        item["path"].as_str().is_some_and(|path| !path.is_empty())
-                            && item["bytes"].as_u64().is_some()
+
+    if wt_threshold > 0.0 {
+        entries.sort_by_key(|(ns, _, _)| *ns);
+        let threshold_bytes = (wt_threshold * 1024.0_f64.powi(3)) as u64;
+        let mut active_paths = std::collections::BTreeSet::new();
+        for (_, run, meta) in &entries {
+            if !run.join("exit_code").is_file() && runs::active(&runs::state(run)) {
+                active_paths.insert(s(&meta["worktree"], "path").to_string());
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut items = Vec::new();
+        for (_, run, meta) in entries.iter().rev() {
+            let Some(bytes) = meta["worktreeBytes"].as_u64() else {
+                continue;
+            };
+            let path = s(&meta["worktree"], "path");
+            if s(meta, "mode") != "write"
+                || path.is_empty()
+                || (!run.join("exit_code").is_file() && runs::active(&runs::state(run)))
+                || crate::launch::repo_key_for_meta(meta) != repo
+                || !Path::new(path).is_dir()
+                || active_paths.contains(path)
+                || !seen.insert(path.to_string())
+            {
+                continue;
+            }
+            items.push(json!({"run":meta["run"], "name":meta["name"], "bytes":bytes}));
+        }
+        let total = items
+            .iter()
+            .map(|item| item["bytes"].as_u64().unwrap_or(0))
+            .fold(0u64, u64::saturating_add);
+        if total >= threshold_bytes && !items.is_empty() {
+            items.sort_by_key(|item| std::cmp::Reverse(item["bytes"].as_u64().unwrap_or(0)));
+            items.truncate(3);
+            let next = "已确认合入后：delegate clean <name> --force";
+            if json_enabled() {
+                println!(
+                    "{}",
+                    json!({"worktreeDisk":{"totalBytes":total,"thresholdBytes":threshold_bytes,"largest":items,"next":next}})
+                );
+            } else {
+                let largest = items
+                    .iter()
+                    .map(|item| {
+                        format!(
+                            "{} {:.1} GiB",
+                            s(item, "name").replace(['\n', '\r'], " "),
+                            item["bytes"].as_u64().unwrap_or(0) as f64 / 1024.0_f64.powi(3)
+                        )
                     })
-                })
-                && meta["sourceBuildMeasuredAt"]
-                    .as_str()
-                    .is_some_and(|time| !time.is_empty())
-        })
-        .filter_map(|meta| {
-            let time = s(&meta, "sourceBuildMeasuredNs").parse::<u128>().ok()?;
-            Some((time, meta))
-        })
-        .max_by_key(|(time, _)| *time);
-    let Some((_, meta)) = latest else {
-        return;
-    };
-    let total = meta["sourceBuildBytes"].as_u64().unwrap_or(0);
-    if total == 0 || total < threshold_bytes {
-        return;
+                    .collect::<Vec<_>>()
+                    .join("、");
+                println!(
+                    "提示：已结束未清理 worktree 共 {:.1} GiB；最大：{largest}；{next}",
+                    total as f64 / 1024.0_f64.powi(3)
+                );
+            }
+        }
     }
-    let next = "先量再删：见 references/cleanup.md 的“源仓库的构建缓存”";
-    if json_enabled() {
-        println!(
-            "{}",
-            json!({"sourceBuildDisk":{
-                "totalBytes":total,"thresholdBytes":threshold_bytes,
-                "paths":meta["sourceBuildPaths"],"measuredAt":meta["sourceBuildMeasuredAt"],"next":next
-            }})
-        );
-    } else {
-        let paths = meta["sourceBuildPaths"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|item| {
-                format!(
-                    "{} {:.1} GiB",
-                    s(item, "path").replace(['\n', '\r'], " "),
-                    item["bytes"].as_u64().unwrap_or(0) as f64 / 1024.0_f64.powi(3)
-                )
+
+    if sb_threshold > 0.0 {
+        let threshold_bytes = (sb_threshold * 1024.0_f64.powi(3)) as u64;
+        let latest = entries
+            .iter()
+            .map(|(_, _, meta)| meta)
+            .filter(|meta| {
+                s(meta, "mode") == "write"
+                    && meta["sourceBuildBytes"].as_u64().is_some()
+                    && crate::launch::repo_key_for_meta(meta) == repo
+                    && meta["sourceBuildPaths"].as_array().is_some_and(|paths| {
+                        paths.iter().all(|item| {
+                            item["path"].as_str().is_some_and(|path| !path.is_empty())
+                                && item["bytes"].as_u64().is_some()
+                        })
+                    })
+                    && meta["sourceBuildMeasuredAt"]
+                        .as_str()
+                        .is_some_and(|time| !time.is_empty())
             })
-            .collect::<Vec<_>>()
-            .join("、");
-        println!(
-            "提示：源仓库构建目录共 {:.1} GiB；各路径：{paths}；{next}",
-            total as f64 / 1024.0_f64.powi(3)
-        );
+            .filter_map(|meta| {
+                let time = s(meta, "sourceBuildMeasuredNs").parse::<u128>().ok()?;
+                Some((time, meta))
+            })
+            .max_by_key(|(time, _)| *time);
+        if let Some((_, meta)) = latest {
+            let total = meta["sourceBuildBytes"].as_u64().unwrap_or(0);
+            if total > 0 && total >= threshold_bytes {
+                let next = "先量再删：见 references/cleanup.md 的“源仓库的构建缓存”";
+                if json_enabled() {
+                    println!(
+                        "{}",
+                        json!({"sourceBuildDisk":{
+                            "totalBytes":total,"thresholdBytes":threshold_bytes,
+                            "paths":meta["sourceBuildPaths"],"measuredAt":meta["sourceBuildMeasuredAt"],"next":next
+                        }})
+                    );
+                } else {
+                    let paths = meta["sourceBuildPaths"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|item| {
+                            format!(
+                                "{} {:.1} GiB",
+                                s(item, "path").replace(['\n', '\r'], " "),
+                                item["bytes"].as_u64().unwrap_or(0) as f64 / 1024.0_f64.powi(3)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("、");
+                    println!(
+                        "提示：源仓库构建目录共 {:.1} GiB；各路径：{paths}；{next}",
+                        total as f64 / 1024.0_f64.powi(3)
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -489,7 +510,12 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
         if !risk_str.is_empty() {
             parts.push(risk_str);
         }
-        parts.push(crate::card::format_l0_fast_forward(&status["card"]));
+        parts.push(crate::card::format_l0_fast_forward(
+            &status["card"],
+            status.get("premerge"),
+        ));
+    } else if status["premerge"].is_object() {
+        parts.push(crate::premerge::format_l0(&status["premerge"]));
     } else if s(status, "mode") == "write" && matches!(state, "delivered" | "answered") {
         parts.push("快进 —".into());
     }

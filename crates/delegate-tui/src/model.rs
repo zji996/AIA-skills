@@ -173,6 +173,84 @@ impl ReviewInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PremergeInfo {
+    pub status: String, // "ready" | "running" | "stale" | "conflict" | "failed"
+    pub base_short: String,
+    pub conflicts: Vec<String>,
+    pub conflict_count: usize,
+    pub failed_layer: Option<String>,
+    pub log: Option<String>,
+}
+
+impl PremergeInfo {
+    pub fn row_snippet(&self) -> String {
+        match self.status.as_str() {
+            "ready" => {
+                if self.base_short.is_empty() {
+                    "快进✓".to_string()
+                } else {
+                    format!("快进✓ {}", self.base_short)
+                }
+            }
+            "stale" => "快进✗ 主干已前进".to_string(),
+            "running" | "pending" => "预合并中".to_string(),
+            "conflict" => {
+                if let Some(first) = self.conflicts.first() {
+                    if self.conflict_count > 1 {
+                        format!("预合并冲突:{first} 等{}", self.conflict_count)
+                    } else {
+                        format!("预合并冲突:{first}")
+                    }
+                } else {
+                    "预合并冲突".to_string()
+                }
+            }
+            "failed" => {
+                if let Some(layer) = &self.failed_layer {
+                    format!("预合并失败:{layer}")
+                } else {
+                    "预合并失败".to_string()
+                }
+            }
+            _ => String::new(),
+        }
+    }
+
+    pub fn full_label(&self) -> String {
+        match self.status.as_str() {
+            "ready" => {
+                if self.base_short.is_empty() {
+                    "快进 ✓".to_string()
+                } else {
+                    format!("快进 ✓（基于 {}）", self.base_short)
+                }
+            }
+            "stale" => "快进 ✗ 主干已前进".to_string(),
+            "running" | "pending" => "预合并中".to_string(),
+            "conflict" => {
+                if self.conflicts.is_empty() {
+                    "预合并冲突".to_string()
+                } else if self.conflict_count == 1 {
+                    format!("预合并冲突：{}", self.conflicts[0])
+                } else if self.conflict_count == 2 && self.conflicts.len() >= 2 {
+                    format!("预合并冲突：{}、{}", self.conflicts[0], self.conflicts[1])
+                } else {
+                    format!("预合并冲突：{} 等 {} 个", self.conflicts[0], self.conflict_count)
+                }
+            }
+            "failed" => {
+                if let Some(layer) = &self.failed_layer {
+                    format!("预合并失败（{layer}）")
+                } else {
+                    "预合并失败".to_string()
+                }
+            }
+            _ => String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EventItem {
     pub seq: u64,
     pub at: String,
@@ -223,6 +301,9 @@ impl EventItem {
             "merge_started" => "合始",
             "merge_item" => "合项",
             "merge_done" => "合结",
+            "premerge_ready" => "快进",
+            "premerge_conflict" => "预冲",
+            "premerge_failed" => "预败",
             "radar_unchanged" => "侦静",
             "radar_done" => "侦察",
             _ => "事件",
@@ -404,6 +485,7 @@ pub struct RunItem {
     pub files: Vec<String>,
     pub accept: AcceptStatus,
     pub review: Option<ReviewInfo>,
+    pub premerge: Option<PremergeInfo>,
     pub protect_violation: Vec<String>,
     pub prompt_protected_paths: Vec<String>,
     pub source_write_violation: bool,
@@ -549,6 +631,11 @@ impl RunItem {
             .as_ref()
             .map(ReviewInfo::detail_label)
             .unwrap_or_default();
+        let premerge_snippet = self
+            .premerge
+            .as_ref()
+            .map(PremergeInfo::full_label)
+            .unwrap_or_default();
         let haystacks = [
             self.display_name.as_str(),
             self.name.as_str(),
@@ -561,6 +648,7 @@ impl RunItem {
             self.last_command.as_deref().unwrap_or(""),
             self.activity.as_ref().map(|a| a.label.as_str()).unwrap_or(""),
             review_snippet.as_str(),
+            premerge_snippet.as_str(),
             self.next_step.as_deref().unwrap_or(""),
             self.work_id.as_deref().unwrap_or(""),
         ];
@@ -1142,7 +1230,8 @@ impl AppSnapshot {
         if item.state != "done" {
             if let Some((_, _, run)) = self.find_run_for_work(item) {
                 let use_run = matches!(run.group, GroupKind::Running | GroupKind::Queued)
-                    || (!run.applied && matches!(item.state.as_str(), "attention" | "active"));
+                    || (!run.applied
+                        && matches!(item.state.as_str(), "attention" | "active" | "verify"));
                 if use_run {
                     return live_run_one_liner(run);
                 }
@@ -1290,6 +1379,12 @@ pub fn live_run_one_liner(run: &RunItem) -> String {
                 && (run.state == "delivered"
                     || (run.state == "answered" && run.pending_files > 0))
             {
+                if let Some(pm) = &run.premerge {
+                    let lbl = pm.full_label();
+                    if !lbl.is_empty() {
+                        return lbl;
+                    }
+                }
                 let mut tags = Vec::new();
                 match &run.accept {
                     AcceptStatus::Passed { .. } => tags.push("验收✓".to_string()),

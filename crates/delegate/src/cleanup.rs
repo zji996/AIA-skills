@@ -814,7 +814,7 @@ fn listening() -> BTreeMap<String, u16> {
     ports
 }
 
-fn alive(pid: i32) -> bool {
+pub(crate) fn alive(pid: i32) -> bool {
     fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
         .and_then(|s| s.rsplit_once(") ").map(|(_, tail)| !tail.starts_with('Z')))

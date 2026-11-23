@@ -35,8 +35,10 @@ pub fn work_file_sig(state: &Path) -> String {
 /// Deliberately excludes `work.jsonl` so unrelated work-table writes never invalidate
 /// cached run entries; notes overlays are applied separately only when notes exist.
 pub fn run_sig(run: &Path, _work_sig: &str) -> String {
-    let mut parts = Vec::with_capacity(16);
-    for name in [
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(256);
+    let mut path = run.to_path_buf();
+    for (idx, name) in [
         "meta.json",
         "summary.json",
         "exit_code",
@@ -49,15 +51,29 @@ pub fn run_sig(run: &Path, _work_sig: &str) -> String {
         ".waiting",
         "review.json",
         "card.json",
+        "premerge.json",
         "stall-warning.json",
         "missing-objects.json",
         "result.md",
         "pending-reply.json",
         "sign.json",
-    ] {
-        parts.push(stat_token(&run.join(name)));
+    ]
+    .iter()
+    .enumerate()
+    {
+        if idx > 0 {
+            out.push('|');
+        }
+        path.push(name);
+        match fs::metadata(&path) {
+            Ok(m) => {
+                let _ = write!(out, "{}.{}:{}", m.mtime(), m.mtime_nsec(), m.len());
+            }
+            Err(_) => out.push('-'),
+        }
+        path.pop();
     }
-    parts.join("|")
+    out
 }
 
 fn run_key(run: &Path) -> String {
@@ -511,11 +527,14 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
 
     let mut repo_groups = Vec::new();
     let mut all_seen_runs: BTreeMap<String, Value> = BTreeMap::new();
+    let mut head_cache: std::collections::HashMap<PathBuf, Option<String>> =
+        std::collections::HashMap::new();
     for (repo_path, runs_dir) in repos {
         let run_dirs = runs::all_runs_in_with_index(&runs_dir, &index);
         let mut run_statuses = Vec::with_capacity(run_dirs.len());
         for run in &run_dirs {
-            let st = status_cached(run, &index, &wsig);
+            let mut st = status_cached(run, &index, &wsig);
+            crate::premerge::overlay_live_status(&mut st, run, &mut head_cache);
             let rid = s(&st, "run").to_string();
             if !rid.is_empty() {
                 all_seen_runs.insert(rid, st.clone());

@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI（pi-kit 的 rpi 通道下 `pi` 即 rpi）。
 metadata:
-  version: "6.34.0"
+  version: "6.35.0"
   binary: delegate
   extra-binaries: delegate-tui
   exclude-agents: pi
@@ -35,7 +35,7 @@ $D wait                                                                  # 放�
 | 审某个已完成任务的工作树 | `$D start --read-only --in <name> "…"`；先 `wait` 确认上游结果再派下一步 |
 | 自己跑重检查、测性能 | `$D lane make check`；测量用 `lane --measure` |
 | 节点不稳、换档前先测连通 | `$D probe`：走 Pi 本身（不是裸 HTTP）测各档模型，不建任务、不占名额 |
-| 看审查卡 / 全文 / 改动 / 停 / 清 | `$D card <run>`（L1 一屏审查卡：摘要与原文指针、规则+审查员去重风险项、测试与分层验收、目录折叠改动）、`$D diff <run> --risky`（L2 仅风险 hunk）、`$D diff`（L3 完整）、`$D result` / `$D stop` / `$D clean --finished`；`status`/`wait` 首行 L0 含验收、审查、改动、风险计数与 `快进 —`（`--all` 列全部，`--json --files` 带文件数组），见 [审查卡与分层验收](references/review-card.md) |
+| 看审查卡 / 预合并快进 / 改动 / 停 / 清 | `$D card <run>`（L1 一屏审查卡：摘要与原文指针、风险项、测试与分层验收、预合并状态、目录折叠改动）、`$D diff <run> --risky`（L2 风险 hunk）、`$D diff`（L3 完整）、`$D result` / `$D stop` / `$D clean --finished`；交付或 `$D sign` 后后台 `_merge-worker` 在 `<cache>` 持久集成树预合并并钉 `refs/delegate/premerge/<run>`，`status`/`wait` L0 实显 `预合并中` / `快进 ✓（基于 <short>）` / `快进 ✗ 主干已前进` / `预合并冲突：<文件>`；`$D apply` 在 `apply.lock` 内命中快进则 <2s 写回未提交改动并跳过复验，否则明报原因回退三方合并，见 [审查卡与预合并](references/review-card.md) |
 | 自动审-改闭环与分层并行验收 | `.delegate.json` 配 `acceptRules` 按改动路径分层（未命中或改构建配置 fail-closed 跑全量）；快层通过后慢层与只读审查员并行（任一失败互停、被取消不记 `PASS`，两者均过才 `delivered`，返工只重跑受影响层）；审查员首行 `PASS`/`REWORK`/`NEEDS_CONTROLLER` 并附 `## 主控重点看` 并入审查卡，改到 `controllerReviewPaths` 升 `NEEDS_CONTROLLER` 并由 `$D sign <run>` 签字，见 [审查要点](references/review-rubric.md) |
 | 事件流 / 游标等待 / 确定性续派 | `$D events [--since SEQ] [--follow] [--rebuild] [--json]` 查全机只追加事件流（含 `review_*` / `merge_*` / `radar_*`）；`$D wait --since SEQ` 返回新事件与新游标（Stop hook 按游标拦下未读交付/提问/需关注/`NEEDS_CONTROLLER`）；`$D queue add <name> --after <run\|name> --prompt-file …` / `queue list` 建有序 DAG，上游交付通过且审查 `PASS` 后零模型调用自动起下一步，异常暂停提醒 |
 | 串行合入员与自主合入白名单 | `$D merge <run>...` 或 `$D merge --ready` 在独立集成 worktree 基于源 HEAD 串行 3-way 合入、命中 `generated.inputs` 重生、逐个经 lane 跑 `accept`、末尾跑 `mergeAccept`，沿用原提交标题并带 `Delegate-Run` trailer，冲突/红测/受保护路径/未签字或失效 `controllerReviewPaths` 自动回退标 `SKIPPED`；`.delegate.json` `autoMerge`（支持 `!` 排除与 `add:` 纯新增）标「可自主合入 / 待主控点头」并出 `merge-report.md`，主控 `$D apply --keep-commits <merge-run>` 落回后自行 push，详见 [合入员与 Radar](references/merge-and-radar.md) |

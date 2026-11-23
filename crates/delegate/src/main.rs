@@ -29,6 +29,7 @@ mod models;
 mod notes;
 mod output;
 mod pool;
+mod premerge;
 mod probe;
 mod process_match;
 mod pending_reply;
@@ -1834,6 +1835,8 @@ fn apply(args: &[String]) -> Res<i32> {
                         }
                         done[idx].conclusion["apply"]["commitSubject"] = json!(&subject);
                     }
+                    // HEAD advanced: wake `_merge-worker` for any other pending runs in this repo.
+                    premerge::spawn_worker(Path::new(&src));
                 }
                 Err(err) => {
                     code = 1;
@@ -1896,6 +1899,24 @@ fn apply(args: &[String]) -> Res<i32> {
         };
         let blind_note = output::blind_note(&conclusion["acceptBlind"]);
         println!("{}", format_status(conclusion.clone()));
+        if !output::json_enabled() && conclusion["fastForward"].is_object() {
+            let ff = &conclusion["fastForward"];
+            if b(ff, "hit") {
+                let bh = s(ff, "baseHead");
+                let short = &bh[..7.min(bh.len())];
+                let ms = ff["ms"].as_u64().unwrap_or(0);
+                if dry {
+                    println!("快进预演 ✓（基于 {short}）");
+                } else {
+                    println!("快进合入 ✓（基于 {short}，跳过重跑验收，{ms}ms）");
+                }
+            } else {
+                let reason = s(ff, "reason");
+                if !reason.is_empty() && s(ff, "missCode") != "missing_premerge" {
+                    println!("{reason}");
+                }
+            }
+        }
         if !output::json_enabled() && !dry && conclusion["apply"]["ok"] == json!(true) {
             let mut touched = std::collections::BTreeSet::<&str>::new();
             for p in &item.written_files {
@@ -2229,6 +2250,9 @@ fn main_inner(args: &[String]) -> Res<i32> {
     if command == "_gc-worker" {
         return gc::worker_command(rest);
     }
+    if command == "_merge-worker" {
+        return premerge::worker_command(rest);
+    }
     if command == "snapshot" {
         return index::snapshot_command(rest);
     }
@@ -2440,11 +2464,16 @@ fn main_inner(args: &[String]) -> Res<i32> {
             let detail = !pos.is_empty();
             let show_all = has(&flags, "--all");
             if detail {
+                let mut head_cache: std::collections::HashMap<PathBuf, Option<String>> =
+                    std::collections::HashMap::new();
+                let mut stale_repos = std::collections::BTreeSet::<PathBuf>::new();
                 for x in &pos {
                     match runs::resolve_head(x) {
                         Ok(run) => {
+                            let mut status = runs::status_detail(&run);
+                            premerge::overlay_live_status(&mut status, &run, &mut head_cache);
+                            premerge::collect_stale_repo(&run, &status, &mut stale_repos);
                             if output::json_enabled() {
-                                let mut status = runs::status_detail(&run);
                                 if !include_files {
                                     if let Some(obj) = status.as_object_mut() {
                                         obj.remove("files");
@@ -2452,7 +2481,6 @@ fn main_inner(args: &[String]) -> Res<i32> {
                                 }
                                 println!("{}", format_status(status));
                             } else {
-                                let status = runs::status_detail(&run);
                                 println!("{}", output::human_detail(&run, &status));
                             }
                         }
@@ -2469,6 +2497,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                         }
                     }
                 }
+                premerge::wake_repos(&stale_repos);
                 return Ok(0);
             }
 
@@ -2477,9 +2506,14 @@ fn main_inner(args: &[String]) -> Res<i32> {
             let wsig = index::work_file_sig(&state_root);
             let all = runs::all_runs_sorted_with_index(&idx);
             let cleaned_notes = notes::cleaned_pending_chains(&all);
+            let mut head_cache: std::collections::HashMap<PathBuf, Option<String>> =
+                std::collections::HashMap::new();
+            let mut stale_repos = std::collections::BTreeSet::<PathBuf>::new();
             if show_all {
                 for run in &all {
                     let mut status = index::status_cached(run, &idx, &wsig);
+                    premerge::overlay_live_status(&mut status, run, &mut head_cache);
+                    premerge::collect_stale_repo(run, &status, &mut stale_repos);
                     if output::json_enabled() {
                         if !include_files {
                             if let Some(obj) = status.as_object_mut() {
@@ -2506,6 +2540,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                         );
                     }
                 }
+                premerge::wake_repos(&stale_repos);
                 return Ok(0);
             }
 
@@ -2513,7 +2548,8 @@ fn main_inner(args: &[String]) -> Res<i32> {
             let entries: Vec<(PathBuf, Value, Value)> = all
                 .iter()
                 .map(|run| {
-                    let (st, m) = index::status_and_meta_cached(run, &idx, &wsig);
+                    let (mut st, m) = index::status_and_meta_cached(run, &idx, &wsig);
+                    premerge::overlay_live_status(&mut st, run, &mut head_cache);
                     (run.clone(), st, m)
                 })
                 .collect();
@@ -2751,6 +2787,10 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     );
                 }
             }
+            for (run, st, _) in &entries {
+                premerge::collect_stale_repo(run, st, &mut stale_repos);
+            }
+            premerge::wake_repos(&stale_repos);
             Ok(0)
         }
         "history" => history::history_command(rest),
@@ -2982,8 +3022,7 @@ fn main() {
         let wait_since_mode = args.first().is_some_and(|c| c == "wait")
             && args.iter().any(|a| a == "--since" || a.starts_with("--since="));
         if !wait_since_mode {
-            output::worktree_disk();
-            output::source_build_disk();
+            output::disk_warnings();
             if args.first().is_some_and(|command| command == "wait") {
                 wait_remaining_hint(&args);
             }

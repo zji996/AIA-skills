@@ -345,6 +345,22 @@ pub fn pin_slot(run: &Path, meta: &Value, slot: &str, oid: &str) {
     pin_slots(run, meta, &[(slot, oid)]);
 }
 
+pub fn premerge_ref_name(run_id: &str) -> String {
+    format!("refs/delegate/premerge/{}", ref_component(run_id))
+}
+
+/// Pin a premerged tree OID under `refs/delegate/premerge/<run-id>` so `git gc` keeps it alive.
+pub fn pin_premerge(run: &Path, meta: &Value, merged_tree: &str) -> Option<String> {
+    let oid = merged_tree.trim();
+    if !is_oid(oid) {
+        return None;
+    }
+    let git_dir = repo_git_dir(run, meta)?;
+    let refname = premerge_ref_name(&run_id(run, meta));
+    update_refs(&git_dir, &format!("update {refname} {oid}\n"));
+    Some(refname)
+}
+
 fn write_marker(run: &Path, finished: bool) {
     if run.is_dir() && !crate::archive::is_record(run) {
         let _ = write(
@@ -384,12 +400,14 @@ pub fn delete_run(run: &Path, meta: &Value) {
     let Some(git_dir) = repo_git_dir(run, meta) else {
         return;
     };
-    let prefix = ref_prefix(&run_id(run, meta));
+    let id = run_id(run, meta);
+    let prefix = ref_prefix(&id);
+    let premerge_ref = premerge_ref_name(&id);
     let Ok(output) = cmd_output({
         let mut cmd = git_command();
         cmd.arg("--git-dir")
             .arg(&git_dir)
-            .args(["for-each-ref", "--format=%(refname)", &prefix]);
+            .args(["for-each-ref", "--format=%(refname)", &prefix, &premerge_ref]);
         cmd
     }) else {
         return;

@@ -37,6 +37,8 @@ UNREAD_ALERT_KINDS = {
     "stall_warning",
     "queue_paused",
     "needs_attention",
+    "premerge_conflict",
+    "premerge_failed",
     "work_ready",
     "work_defer_expired",
     "work_stale",
@@ -52,6 +54,9 @@ KIND_LABELS = {
     "review_verdict": "审查判定",
     "rework_sent": "退回返工",
     "needs_attention": "需主控关注",
+    "premerge_ready": "预合并就绪",
+    "premerge_conflict": "预合并冲突",
+    "premerge_failed": "预合并失败",
     "merge_started": "开始合入",
     "merge_item": "合入进度",
     "merge_done": "合入完成",
@@ -559,9 +564,23 @@ def check_unread_events(payload: dict, cwd: str) -> str | None:
         raw_label = str(pl.get("name") or pl.get("queueName") or ev.get("run") or "?").replace("\n", " ")
         label = f"{wid}:{raw_label}" if wid else raw_label
         card = pl.get("card") if isinstance(pl.get("card"), dict) else None
+        pm = pl.get("premerge") if isinstance(pl.get("premerge"), dict) else None
         if kind == "delivered" and card is not None and isinstance(card.get("riskTotal"), int):
             rt = card["riskTotal"]
-            previews.append(f"{klabel}:{label}(风险{rt},快进—)")
+            pm_st = str((pm or {}).get("status") or "")
+            if pm_st == "ready":
+                ff_tag = "快进✓"
+            elif pm_st in ("running", "pending"):
+                ff_tag = "预合并中"
+            elif pm_st == "stale":
+                ff_tag = "快进✗"
+            elif pm_st == "conflict":
+                ff_tag = "预合并冲突"
+            elif pm_st == "failed":
+                ff_tag = "预合并失败"
+            else:
+                ff_tag = "快进—"
+            previews.append(f"{klabel}:{label}(风险{rt},{ff_tag})")
         else:
             previews.append(f"{klabel}:{label}")
     more = f" 等共 {len(unread)} 条" if len(unread) > 5 else ""

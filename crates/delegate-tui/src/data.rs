@@ -784,6 +784,7 @@ fn parse_run_item(
     let (dir_changes, dirs_more) = parse_dir_changes(v.get("shape"), &files);
     let accept = parse_accept(v.get("accept"));
     let review = parse_review(v.get("review"), v.get("sign"));
+    let premerge = parse_premerge(v.get("premerge"));
 
     let protect_violation = string_list(v.get("protectViolation"));
     let prompt_protected_paths = string_list(v.get("promptProtectedPaths"));
@@ -893,6 +894,7 @@ fn parse_run_item(
         files,
         accept,
         review,
+        premerge,
         protect_violation,
         prompt_protected_paths,
         source_write_violation,
@@ -933,6 +935,52 @@ fn parse_run_item(
             .filter(|s| !s.is_empty())
             .map(str::to_string),
     }
+}
+
+fn parse_premerge(v: Option<&Value>) -> Option<PremergeInfo> {
+    let obj = v.filter(|x| x.is_object())?;
+    let status = obj
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if status.is_empty() || matches!(status.as_str(), "unknown" | "crashed") {
+        return None;
+    }
+    let base_short = obj
+        .get("baseShort")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let bh = obj.get("baseHead").and_then(Value::as_str).unwrap_or("");
+            bh[..bh.len().min(7)].to_string()
+        });
+    let conflicts = string_list(obj.get("conflicts"));
+    let conflict_count = obj
+        .get("conflictCount")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(conflicts.len());
+    let failed_layer = obj
+        .get("failedLayer")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let log = obj
+        .get("log")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Some(PremergeInfo {
+        status,
+        base_short,
+        conflicts,
+        conflict_count,
+        failed_layer,
+        log,
+    })
 }
 
 fn classify_group(state: &str, applied: bool, has_queue: bool) -> GroupKind {
@@ -2005,6 +2053,32 @@ fn summarize_event_payload(kind: &str, run: &str, p: &Value) -> String {
             let s = p.get("skippedCount").and_then(Value::as_u64).unwrap_or(0);
             let a = p.get("autoMergeCount").and_then(Value::as_u64).unwrap_or(0);
             format!("合入 {m} · 跳过 {s} · 自主 {a}")
+        }
+        "premerge_ready" => {
+            let bs = ps("baseShort");
+            let short = if !bs.is_empty() {
+                bs
+            } else {
+                let bh = ps("baseHead");
+                &bh[..bh.len().min(7)]
+            };
+            format!("快进 ✓（基于 {short}）")
+        }
+        "premerge_conflict" => {
+            let files = string_list(p.get("conflicts"));
+            if files.is_empty() {
+                "预合并冲突".into()
+            } else {
+                format!("预合并冲突：{}", files.join("、"))
+            }
+        }
+        "premerge_failed" => {
+            let layer = ps("failedLayer");
+            if !layer.is_empty() {
+                format!("预合并失败（{layer}）")
+            } else {
+                format!("预合并失败：{}", ps("error"))
+            }
         }
         "radar_unchanged" => "指纹未变化（0 token）".into(),
         "radar_done" => {

@@ -673,6 +673,9 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
     if let Some(sign) = crate::review::sign_status(run, &meta, &review_doc, check_missing_objects) {
         out["sign"] = sign;
     }
+    if let Some(pm) = crate::premerge::status_for_run(run, &meta, &sum, None) {
+        out["premerge"] = pm;
+    }
     if sum.is_object() {
         for key in [
             "finishedAt",

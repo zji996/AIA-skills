@@ -36,6 +36,7 @@
 | `changes.json` / `changes.patch` | 前后快照的 tree、逐文件状态与行数；可选 `finalEntries` 冻结结束时改动路径的最终指纹，供手动合入检测；可直接 `git apply` 的补丁 |
 | `applied.patch` | apply 时冻结该轮相对基线的完整补丁，释放工作树后保留；`patch <run> -- <path>…` 按路径打印 |
 | `setup.log` | `--worktree` 的 `setup` 命令输出 |
+| `premerge.json` / `premerge.log` | `_merge-worker` 预合并记录与日志；成功钉 `refs/delegate/premerge/<run>` |
 | `verify.log` | `apply` 合并后验收（`applyVerify` / `--verify`）的输出 |
 | `generate.log` | `apply` 执行 `.delegate.json` 的 `generated.command` 时的输出 |
 | `.generate-pending` | 生成未成功，后续 apply 仍须重试；成功后清除 |
@@ -60,7 +61,7 @@
 
 ## 清理
 
-成功 `apply` 归档并经异步 trash 自动清理已合入链：前驱立即清，链尾在已提交或 `verify.ok`/`acceptStillValid`（且无冲突/未读截断/待续答）时立即清，否则先释 worktree 待进 HEAD 后由 `_gc-worker` 清（`diff`/`show` 回退读归档）；`--keep`/dry-run/失败或共享引用保留。人读末行提示验收有效性；每次 `start` 清理超 7 天已读记录（`DELEGATE_KEEP_DAYS`，`0` 关闭）。容器与磁盘见 [清理](cleanup.md)。
+成功 `apply` 归档并经异步 trash 自动清理已合入链（前驱立即清，链尾在已提交或 `verify.ok`/`acceptStillValid` 且无冲突/未读截断/待续答时立即清，否则先释 worktree 待进 HEAD 后由 `_gc-worker` 清，`diff`/`show` 回退读归档；`--keep`/dry-run/失败/共享引用保留）。`start` 清理超 7 天已读记录（`DELEGATE_KEEP_DAYS`，`0` 关闭）。容器与磁盘见 [清理](cleanup.md)。
 
 ## 环境变量
 

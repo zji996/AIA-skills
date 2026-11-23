@@ -51,18 +51,22 @@ def settle_supervisors(runs_dir, seconds=10.0):
         if pids:
             time.sleep(0.05)
     gc_lock = Path(runs_dir).parent / "state" / "delegate" / ".gc-worker.lock"
-    if gc_lock.is_file():
+    premerge_locks = list((Path(runs_dir).parent / "state" / "delegate" / "premerge").glob("*.lock")) \
+        if (Path(runs_dir).parent / "state" / "delegate" / "premerge").is_dir() else []
+    lock_files = [p for p in [gc_lock, *premerge_locks] if p.is_file()]
+    if lock_files:
         import fcntl
-        while time.monotonic() < deadline:
-            try:
-                with open(gc_lock, "r+") as fh:
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-                break
-            except BlockingIOError:
-                time.sleep(0.03)
-            except OSError:
-                break
+        for lock_file in lock_files:
+            while time.monotonic() < deadline:
+                try:
+                    with open(lock_file, "r+") as fh:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                    break
+                except BlockingIOError:
+                    time.sleep(0.03)
+                except OSError:
+                    break
 
 
 def process_gone(pid_file):

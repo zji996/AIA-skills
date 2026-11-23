@@ -1,5 +1,11 @@
 # delegate
 
+## 6.35 后台预合并与快进 apply
+
+- 写入任务交付（或命中 `controllerReviewPaths` 后完成 `delegate sign`）：后台按仓库单实例拉起 `_merge-worker`（`LOCK_NB`），在 `<cache>` 持久化集成 worktree（复用 `target/` 与 `node_modules/`）做源 HEAD + 净 diff 三方合并并只跑命中的 `acceptRules` 层（未配则跑 `accept`），钉 `refs/delegate/premerge/<run>` 并写 `premerge.json`；L0/L1 与 TUI run 行、工作表「此刻在干什么」实时展示 `预合并中` → `快进 ✓（基于 <short>）` / `快进 ✗ 主干已前进` / `预合并冲突：<文件>`。Background per-repo `_merge-worker` premerge with persistent cache worktree, pinned premerge ref, and live L0/L1/TUI fast-forward states.
+- 主控审完审查卡执行 `delegate apply`：在 `apply.lock` 内命中源 `HEAD == baseHead` 且 `changedPaths` 无脏改时 2 秒内直接写出 `mergedTree` 改动（保持未提交语义）并跳过复验；主干前进或有重叠脏改时失败关闭回退三方合并并输出一行原因（如「主干已前进 2 个提交，走三方合并」），零锁 `status` 发现主干前进后自动唤醒 worker 重新预合并。Fail-closed fast-forward apply (<2s, uncommitted semantics, skips re-verify) with explicit fallback reason and zero-lock stale re-premerge wakeup.
+- 预合并冲突/验收失败与并发竞态：写 `premerge_conflict` / `premerge_failed` 事件带冲突文件与日志指针，绝不自动续做或 `autoApply`；worker 运行中主控提交、双 run 同时交付、预合并期间 `apply`、worker 被 `SIGKILL` 均保持源工作区完好。Conflict/failure events with log pointers without auto-rework, and fail-closed concurrency/SIGKILL safety.
+
 ## 6.31 统一工作表与适时提示
 
 - 全机统一工作表与 7 态状态机：`delegate work` 展示第 0 层计数与 6 列紧凑表（`id`/`repo`/`title`/`state`/`focus`/`next`，单行 ≤100 字，自动把未绑定活跃/待处理 run 折叠合表为 `R:<id>`，默认折叠 `blocked`/`deferred`）；`delegate work show <ID>` 展第 2 层卡片与宿主写出的第 3 层原文指针；`work close --evidence`、`work drop --reason`、`work defer --reason --until` 显式管理闭环与暂缓，预留 `artifacts[]` 与 `followups[]`。Unified machine-wide work table (`<state>/work.jsonl`) with 7 states, 6-column table merging ephemeral runs, Layer-2 card with Host-written pointers, and explicit close/drop/defer.

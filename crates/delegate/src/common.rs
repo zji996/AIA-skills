@@ -731,7 +731,7 @@ pub fn run_shell_cancellable(
     group(&mut c);
     let started = std::time::Instant::now();
     let queued_before = crate::lane::queued_seconds(run);
-    let monitor_accept_stall = matches!(role, "accept" | "verify");
+    let monitor_accept_stall = matches!(role, "accept" | "verify" | "premerge");
     let accept_stall_limit = if monitor_accept_stall {
         crate::agents::stall_seconds(&meta, "accept")
     } else {
@@ -917,6 +917,7 @@ pub fn finish_run(run: &std::path::Path, mut summary: serde_json::Value, code: i
     crate::refs::mark_finished(run);
     write(run.join("exit_code"), format!("{code}\n"))?;
     let meta = json(run.join("meta.json"));
+    let spawn_premerge = crate::premerge::mark_pending_before_finish(run, &meta, &summary);
     crate::history::record_finish(run);
     crate::board::refresh_for_run(run);
     crate::events::emit_run_finished(run, &meta, &summary);
@@ -924,6 +925,9 @@ pub fn finish_run(run: &std::path::Path, mut summary: serde_json::Value, code: i
     crate::work::check_stale_and_expired();
     crate::index::upsert_run(run);
     crate::dag_queue::advance();
+    if spawn_premerge {
+        crate::premerge::spawn_worker_for_meta(&meta);
+    }
     Ok(())
 }
 

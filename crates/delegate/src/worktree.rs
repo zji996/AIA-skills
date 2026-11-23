@@ -217,7 +217,7 @@ fn rule_list(spec: &Value, key: &str, file: &Path) -> Res<Option<Vec<String>>> {
     Ok(Some(rules))
 }
 /// After a merged deletion, drop directories it left empty, stopping at the repository root.
-fn remove_empty_parents(file: &Path, root: &Path) {
+pub(crate) fn remove_empty_parents(file: &Path, root: &Path) {
     let mut dir = file.parent();
     while let Some(d) = dir {
         if d == root || !d.starts_with(root) || fs::remove_dir(d).is_err() {
@@ -480,7 +480,7 @@ fn blob(top: &Path, tree: &str, path: &str) -> Res<(Option<String>, Option<Vec<u
     };
     Ok((mode, bytes))
 }
-fn entry_mode(path: &Path) -> Option<String> {
+pub(crate) fn entry_mode(path: &Path) -> Option<String> {
     if path.is_symlink() {
         Some("120000".into())
     } else if path.is_file() {
@@ -514,7 +514,7 @@ fn current(path: &Path) -> Option<Vec<u8>> {
         None
     }
 }
-fn through_symlink(root: &Path, path: &Path) -> bool {
+pub(crate) fn through_symlink(root: &Path, path: &Path) -> bool {
     let Ok(rel) = path.strip_prefix(root) else {
         return true;
     };
@@ -530,7 +530,7 @@ fn through_symlink(root: &Path, path: &Path) -> bool {
     }
     false
 }
-fn write_entry(path: &Path, mode: &str, content: &[u8]) -> Res<()> {
+pub(crate) fn write_entry(path: &Path, mode: &str, content: &[u8]) -> Res<()> {
     if path.is_symlink() || path.exists() {
         fs::remove_file(path).map_err(|e| e.to_string())?;
     }
@@ -1606,11 +1606,11 @@ pub struct ApplyOutcome {
     pub regenerated_files: Vec<String>,
     pub had_dirty_merge: bool,
 }
-struct ApplyInnerResult {
-    code: i32,
-    written: Vec<String>,
-    regenerated: Vec<String>,
-    had_dirty_merge: bool,
+pub(crate) struct ApplyInnerResult {
+    pub code: i32,
+    pub written: Vec<String>,
+    pub regenerated: Vec<String>,
+    pub had_dirty_merge: bool,
 }
 fn apply_progress(message: impl std::fmt::Display) {
     eprintln!("delegate: {message}");
@@ -1652,7 +1652,7 @@ fn fence_marker(line: &str) -> Option<(u8, usize, &str)> {
     let tail = &line[indent + count..];
     Some((ch, count, tail))
 }
-fn conflict_labels_in_bytes(path: &Path, bytes: &[u8]) -> Vec<String> {
+pub(crate) fn conflict_labels_in_bytes(path: &Path, bytes: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(bytes);
     let markdown = is_markdown(path);
     let mut labels = Vec::new();
@@ -2012,6 +2012,8 @@ pub(crate) struct MergeDirOutcome {
     pub numbered_warnings: Vec<Value>,
     pub touches_generated_inputs: bool,
     pub generate_command: String,
+    pub after_tree: String,
+    pub has_large: bool,
 }
 
 /// 3-way merge a run's net changes into an arbitrary target worktree directory (used by
@@ -2233,6 +2235,8 @@ pub(crate) fn merge_run_into_dir(
     let numbered_warnings =
         numbered_conflicts(target_root, &additions, &actions, &generated_paths)?;
 
+    let has_large = large.as_object().is_some_and(|m| !m.is_empty());
+
     if !conflicts.is_empty() || !marked_paths.is_empty() {
         return Ok(MergeDirOutcome {
             conflicts,
@@ -2240,6 +2244,8 @@ pub(crate) fn merge_run_into_dir(
             numbered_warnings,
             touches_generated_inputs: false,
             generate_command,
+            after_tree: after,
+            has_large,
         });
     }
 
@@ -2273,6 +2279,8 @@ pub(crate) fn merge_run_into_dir(
         numbered_warnings,
         touches_generated_inputs,
         generate_command,
+        after_tree: after,
+        has_large,
     })
 }
 
@@ -2399,6 +2407,7 @@ fn apply_checked(
                 }
                 let _ = write_json(run.join("meta.json"), &updated);
                 crate::refs::pin_slot(run, &meta, "applied", s(&meta["base"], "tree"));
+                crate::premerge::spawn_worker(source);
             } else if let Some((hash, title)) = failed_commit {
                 let short = &hash[..7.min(hash.len())];
                 conclusion["apply"]["failedStep"] = json!("cherry-pick");
@@ -2413,6 +2422,31 @@ fn apply_checked(
                 written,
                 regenerated: vec![],
                 had_dirty_merge: false,
+            }
+        }
+    } else if source.is_absolute() && !meta["worktree"].is_null() {
+        match crate::premerge::validate_fast_forward(run, source) {
+            crate::premerge::FastForwardCheck::Hit(plan) => {
+                if let Some(ff_res) =
+                    crate::premerge::apply_fast_forward(run, source, &plan, dry, &mut conclusion)?
+                {
+                    ff_res
+                } else {
+                    conclusion["fastForward"] = json!({
+                        "hit": false,
+                        "missCode": "path_validation",
+                        "reason": "预合并树路径校验未通过，走三方合并",
+                    });
+                    apply_inner(run, merge, dry, &mut conclusion)?
+                }
+            }
+            crate::premerge::FastForwardCheck::Miss(miss) => {
+                conclusion["fastForward"] = json!({
+                    "hit": false,
+                    "missCode": miss.code(),
+                    "reason": miss.human_line(),
+                });
+                apply_inner(run, merge, dry, &mut conclusion)?
             }
         }
     } else {
@@ -2455,7 +2489,9 @@ fn apply_checked(
         }
     }
     conclusion["apply"]["ok"] = json!(code == 0);
-    accept_validity(run, dry, &mut conclusion);
+    if !(b(&conclusion["fastForward"], "hit") && conclusion["acceptStillValid"] == json!(true)) {
+        accept_validity(run, dry, &mut conclusion);
+    }
     let marked = strings(&conclusion["apply"]["conflictMarkers"]);
     let mut total_uncommitted: std::collections::BTreeSet<&str> =
         written_files.iter().map(String::as_str).collect();

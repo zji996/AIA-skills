@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 /// Event kinds that require controller attention and trigger the Stop hook race lock
 /// when unread past the controller's cursor.
-pub const ALERT_KINDS: [&str; 10] = [
+pub const ALERT_KINDS: [&str; 12] = [
     "delivered",
     "question",
     "rejected",
@@ -20,6 +20,8 @@ pub const ALERT_KINDS: [&str; 10] = [
     "stall_warning",
     "queue_paused",
     "needs_attention",
+    "premerge_conflict",
+    "premerge_failed",
     "work_ready",
     "work_defer_expired",
     "work_stale",
@@ -205,6 +207,9 @@ pub fn emit_run_finished(run: &Path, meta: &Value, summary: &Value) {
     }
     if summary["card"].is_object() {
         payload["card"] = summary["card"].clone();
+    }
+    if let Some(pm) = crate::premerge::status_for_run(run, meta, summary, None) {
+        payload["premerge"] = pm;
     }
     if mode == "write" && kind == "delivered" {
         payload["next"] = json!(format!("delegate card {run_id}"));
@@ -969,7 +974,12 @@ pub fn format_human(ev: &Value) -> String {
                 if !risk_str.is_empty() {
                     segs.push(risk_str);
                 }
-                segs.push(crate::card::format_l0_fast_forward(&p["card"]));
+                segs.push(crate::card::format_l0_fast_forward(
+                    &p["card"],
+                    p.get("premerge"),
+                ));
+            } else if p["premerge"].is_object() {
+                segs.push(crate::premerge::format_l0(&p["premerge"]));
             } else if s(p, "mode") == "write" {
                 segs.push("快进 —".into());
             }
@@ -1093,6 +1103,50 @@ pub fn format_human(ev: &Value) -> String {
                 "mergeAccept✗"
             };
             format!("合入完成：合入 {merged} · 跳过 {skipped} · 自主 {auto} · {ok}")
+        }
+        "premerge_ready" => {
+            let short = {
+                let bs = s(p, "baseShort");
+                if !bs.is_empty() {
+                    bs
+                } else {
+                    let bh = s(p, "baseHead");
+                    &bh[..bh.len().min(7)]
+                }
+            };
+            let secs = p["elapsedSeconds"].as_f64().unwrap_or(0.0);
+            format!("快进 ✓（基于 {short}，{secs:.1}s）")
+        }
+        "premerge_conflict" => {
+            let files = strings(&p["conflicts"]);
+            let log = s(p, "log");
+            let fpart = if files.is_empty() {
+                "存在冲突".to_string()
+            } else {
+                files.join("、")
+            };
+            if log.is_empty() {
+                format!("预合并冲突：{fpart}")
+            } else {
+                format!("预合并冲突：{fpart}（日志 {log}）")
+            }
+        }
+        "premerge_failed" => {
+            let layer = s(p, "failedLayer");
+            let log = s(p, "log");
+            let err = s(p, "error");
+            let head = if !layer.is_empty() {
+                format!("预合并验收失败（{layer}）")
+            } else if !err.is_empty() {
+                format!("预合并失败：{}", clip(err, 80))
+            } else {
+                "预合并失败".to_string()
+            };
+            if log.is_empty() {
+                head
+            } else {
+                format!("{head}（日志 {log}）")
+            }
         }
         "radar_unchanged" => {
             let fp = s(p, "fingerprint");

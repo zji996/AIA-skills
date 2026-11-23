@@ -606,6 +606,17 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
         .filter(|s| !s.is_empty())
         .map(|s| format!(" [{s}]"))
         .unwrap_or_default();
+    let premerge_snippet = if !run.applied {
+        run.premerge
+            .as_ref()
+            .map(PremergeInfo::row_snippet)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(" [{s}]"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let row_tag_snippet = format!("{review_snippet}{premerge_snippet}");
 
     let full_name = if let (GroupKind::Running, Some(act)) = (run.group, run.activity.as_ref()) {
         let snippet = if !review_snippet.is_empty() {
@@ -642,13 +653,19 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
         } else {
             truncate(&run.display_name, cols.name_w)
         }
-    } else if !review_snippet.is_empty() && cols.name_w > 10 {
+    } else if !row_tag_snippet.is_empty() && cols.name_w > 10 {
         let base = if run.chain_round > 1 {
             format!("{} [{}轮]", run.display_name, run.chain_round)
         } else {
             run.display_name.clone()
         };
-        truncate(&format!("{base}{review_snippet}"), cols.name_w)
+        let tag_w = display_width(&row_tag_snippet);
+        if cols.name_w >= tag_w + 8 {
+            let name_avail = cols.name_w - tag_w;
+            format!("{}{row_tag_snippet}", truncate(&base, name_avail))
+        } else {
+            truncate(&format!("{base}{row_tag_snippet}"), cols.name_w)
+        }
     } else if run.chain_round > 1 {
         let suffix = format!(" [{}轮]", run.chain_round);
         let sw = display_width(&suffix);
@@ -1058,6 +1075,32 @@ fn build_detail_lines(app: &App, run: &RunItem, width: usize) -> Vec<Line<'stati
                     width,
                     muted(),
                 );
+            }
+        }
+    }
+
+    // Premerge / fast-forward status (6.35)
+    if !run.applied {
+        if let Some(pm) = &run.premerge {
+            let lbl = pm.full_label();
+            if !lbl.is_empty() {
+                let (pm_color, bold) = match pm.status.as_str() {
+                    "ready" => (STATUS_RUNNING, false),
+                    "running" | "pending" => (STATUS_QUEUED, true),
+                    "stale" => (STATUS_PENDING, true),
+                    "conflict" | "failed" => (STATUS_FAILED, true),
+                    _ => (STATUS_PENDING, false),
+                };
+                let mut style = Style::default().fg(pm_color);
+                if bold {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                push_wrapped(&mut out, &format!("预合并: {lbl}"), width, style);
+                if matches!(pm.status.as_str(), "conflict" | "failed") {
+                    if let Some(log) = &pm.log {
+                        push_wrapped(&mut out, &format!("  日志: {log}"), width, muted());
+                    }
+                }
             }
         }
     }
@@ -1886,12 +1929,12 @@ fn render_dag_queue_detail_pane(
 
 fn event_kind_color(kind: &str) -> Option<Color> {
     match kind {
-        "delivered" | "applied" | "queue_dispatched" | "merge_done" | "radar_done" => {
-            Some(STATUS_RUNNING)
-        }
+        "delivered" | "applied" | "queue_dispatched" | "merge_done" | "radar_done"
+        | "premerge_ready" => Some(STATUS_RUNNING),
         "question" | "stall_warning" | "loop_review" | "review_verdict" | "rework_sent"
         | "merge_item" => Some(STATUS_PENDING),
-        "rejected" | "failed" | "queue_paused" | "needs_attention" => Some(STATUS_FAILED),
+        "rejected" | "failed" | "queue_paused" | "needs_attention" | "premerge_conflict"
+        | "premerge_failed" => Some(STATUS_FAILED),
         "started" | "queued" | "lane_acquired" | "review_started" | "merge_started" => {
             Some(STATUS_QUEUED)
         }

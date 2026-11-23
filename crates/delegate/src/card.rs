@@ -2228,11 +2228,17 @@ pub fn format_l0_risk(card: &Value) -> String {
     }
 }
 
-/// Format L0 fast-forward status (6.35 placeholder: `快进 —`).
-pub fn format_l0_fast_forward(card: &Value) -> String {
+/// Format L0/L1 fast-forward / premerge status.
+pub fn format_l0_fast_forward(card: &Value, premerge: Option<&Value>) -> String {
+    if let Some(pm) = premerge.filter(|v| v.is_object()) {
+        return crate::premerge::format_l0(pm);
+    }
+    if card["premerge"].is_object() {
+        return crate::premerge::format_l0(&card["premerge"]);
+    }
     match card.get("fastForward") {
-        Some(Value::Bool(true)) => "快进 可".into(),
-        Some(Value::Bool(false)) => "快进 否".into(),
+        Some(Value::Bool(true)) => "快进 ✓".into(),
+        Some(Value::Bool(false)) => "快进 ✗".into(),
         _ => "快进 —".into(),
     }
 }
@@ -2294,7 +2300,17 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
     let test_stats = count_test_changes(&parsed_files);
     let other_changes = fold_remaining_changes(&parsed_files, &risky_files);
     let author_summary = extract_author_summary(run);
-    let l0 = build_l0_summary(&risks);
+    let mut l0 = build_l0_summary(&risks);
+    let premerge_live = crate::premerge::status_for_run(run, meta, sum, None);
+    let ff_bool = match premerge_live.as_ref().map(|pm| s(pm, "status")) {
+        Some("ready") => json!(true),
+        Some("stale" | "conflict" | "failed") => json!(false),
+        _ => Value::Null,
+    };
+    l0["fastForward"] = ff_bool.clone();
+    if let Some(ref pm) = premerge_live {
+        l0["premerge"] = pm.clone();
+    }
 
     let sign_status = crate::review::sign_status(run, meta, &review_doc, false);
     let needs_sign = sign_status
@@ -2345,7 +2361,8 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
             "deleted": total_deleted,
         },
         "l0": l0,
-        "fastForward": Value::Null,
+        "fastForward": ff_bool,
+        "premerge": premerge_live.unwrap_or(Value::Null),
         "author": author_summary,
         "review": review_section,
         "risks": risks.iter().map(RiskItem::to_json).collect::<Vec<_>>(),
@@ -2400,7 +2417,7 @@ pub fn render_card_human(card: &Value) -> String {
     let files = n(&card["changes"], "files");
     let added = n(&card["changes"], "added");
     let deleted = n(&card["changes"], "deleted");
-    let ff = format_l0_fast_forward(&card["l0"]);
+    let ff = format_l0_fast_forward(&card["l0"], card.get("premerge"));
 
     let mut out = Vec::new();
     out.push(format!(
@@ -2432,6 +2449,32 @@ pub fn render_card_human(card: &Value) -> String {
         "未启用".into()
     };
     out.push(format!("验收：{accept_line} · 审查：{review_head}"));
+    if card["premerge"].is_object() {
+        let pm = &card["premerge"];
+        let pm_st = s(pm, "status");
+        let pm_label = crate::premerge::format_l0(pm);
+        let mut extra_parts = Vec::new();
+        if let Some(secs) = pm["elapsedSeconds"].as_f64() {
+            extra_parts.push(format!("{secs:.1}s"));
+        }
+        let ran = strings(&pm["ranLayers"]);
+        if !ran.is_empty() {
+            let tag = if b(pm, "reusedAccept") {
+                format!("沿用 {}", ran.join("、"))
+            } else {
+                format!("已跑 {}", ran.join("、"))
+            };
+            extra_parts.push(tag);
+        }
+        if matches!(pm_st, "conflict" | "failed") && !s(pm, "log").is_empty() {
+            extra_parts.push(format!("日志 {}", s(pm, "log")));
+        }
+        if extra_parts.is_empty() {
+            out.push(format!("预合并：{pm_label}"));
+        } else {
+            out.push(format!("预合并：{pm_label}（{}）", extra_parts.join(" · ")));
+        }
+    }
     out.push(String::new());
 
     // 1. 做了什么
@@ -2792,6 +2835,15 @@ pub fn card_command(args: &[String]) -> Res<i32> {
     let meta = json(run.join("meta.json"));
     let sum = json(run.join("summary.json"));
     let card_doc = compute_card(&run, &meta, &sum, round_only)?;
+    // Zero-lock wakeup if premerge is stale or worker died.
+    if card_doc["premerge"].is_object()
+        && matches!(s(&card_doc["premerge"], "status"), "stale" | "crashed")
+    {
+        let src = s(&meta["worktree"], "source");
+        if !src.is_empty() {
+            crate::premerge::spawn_worker(Path::new(src));
+        }
+    }
     if json_mode {
         println!("{}", serde_json::to_string_pretty(&card_doc).unwrap_or_else(|_| card_doc.to_string()));
     } else {
