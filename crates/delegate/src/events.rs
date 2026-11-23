@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 /// Event kinds that require controller attention and trigger the Stop hook race lock
 /// when unread past the controller's cursor.
-pub const ALERT_KINDS: [&str; 7] = [
+pub const ALERT_KINDS: [&str; 10] = [
     "delivered",
     "question",
     "rejected",
@@ -20,6 +20,9 @@ pub const ALERT_KINDS: [&str; 7] = [
     "stall_warning",
     "queue_paused",
     "needs_attention",
+    "work_ready",
+    "work_defer_expired",
+    "work_stale",
 ];
 
 /// Whether an event record requires controller attention for cursor advancement & Stop hook.
@@ -1049,6 +1052,30 @@ pub fn format_human(ev: &Value) -> String {
             let total = n(p, "total");
             format!("侦察完成：新增 {added} · 去重 {deduped} · 无锚丢弃 {dropped} · 共 {total} 条")
         }
+        "work_ready" => {
+            let wid = s(p, "workId");
+            let brief = s(p, "brief");
+            if brief.is_empty() {
+                format!("工作项就绪 [{wid}]（卡片：delegate work show {wid}）")
+            } else {
+                format!("工作项就绪 [{wid}] · 说明 {brief}（卡片：delegate work show {wid}）")
+            }
+        }
+        "work_dispatched" => {
+            let wid = s(p, "workId");
+            let next = s(p, "nextRun");
+            format!("工作项自动派发 [{wid}] -> {next}（卡片：delegate work show {wid}）")
+        }
+        "work_defer_expired" => {
+            let wid = s(p, "workId");
+            let reason = s(p, "reason");
+            format!("暂缓到期 [{wid}]（{} · 卡片：delegate work show {wid}）", clip(reason, 60))
+        }
+        "work_stale" => {
+            let wid = s(p, "workId");
+            let reason = s(p, "reason");
+            format!("工作项停滞 [{wid}]（{} · 卡片：delegate work show {wid}）", clip(reason, 60))
+        }
         _ => String::new(),
     };
 
@@ -1265,6 +1292,9 @@ pub fn wait_since(since: u64, run_filter: &[String], max: Option<f64>) -> Res<i3
             println!("无新事件（游标：{new_cursor}）");
         } else {
             println!("游标：{new_cursor}");
+            for hint in crate::work::hints_for_events(&collected) {
+                println!("{hint}");
+            }
         }
         let has_active = !crate::launch::machine_runs(&state_dir()).is_empty()
             || runs::all_runs().iter().any(|r| runs::active(&runs::state(r)));

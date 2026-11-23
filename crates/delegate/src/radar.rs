@@ -596,7 +596,7 @@ fn run_scout_agent(
     let (agent_workdir, before_pi_snap, before_agy_manifest) =
         if is_agy && !head_tree.is_empty() {
             review::prepare_ro_workspace(repo, &head_tree, &ro_workspace, work_dir)?;
-            let manifest = review::dir_manifest(&ro_workspace)?;
+            let manifest = review::dir_manifest_for_repo(&ro_workspace, repo)?;
             (ro_workspace.clone(), None, Some(manifest))
         } else {
             let snap = changes::snapshot(repo, work_dir, &excludes);
@@ -648,8 +648,8 @@ fn run_scout_agent(
     }
 
     // Fail closed if the scout violated its read-only boundary.
-    let ro_violations: Vec<String> = if let Some(before_m) = before_agy_manifest {
-        let after_m = review::dir_manifest(&ro_workspace).unwrap_or_default();
+    let raw_ro_violations: Vec<String> = if let Some(before_m) = before_agy_manifest {
+        let after_m = review::dir_manifest_for_repo(&ro_workspace, repo).unwrap_or_default();
         review::diff_manifests(&before_m, &after_m)
     } else if let Some(before_s) = before_pi_snap {
         if let Some(after_s) = changes::snapshot(repo, work_dir, &excludes) {
@@ -668,6 +668,7 @@ fn run_scout_agent(
     } else {
         Vec::new()
     };
+    let ro_violations = review::filter_ro_violations(repo, raw_ro_violations);
 
     if ro_workspace.exists() {
         let _ = fs::remove_dir_all(&ro_workspace);

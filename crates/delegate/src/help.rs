@@ -32,6 +32,7 @@ const LAUNCH: &[(&str, &str)] = &[
     ("--allow-parallel-writes", "Allow concurrent write runs in one workdir."),
     ("--worktree", "Write in a detached git worktree seeded from the current tree; merge with apply."),
     ("--in RUN", "Read-only: review a separate snapshot of a finished RUN's worktree."),
+    ("--work ID", "Attach this run to a persistent work item (e.g. W019); replies inherit workId automatically."),
 ];
 
 const COLLECT: &[(&str, &str)] = &[
@@ -87,6 +88,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "Continue a finished run's conversation in the background.",
     ),
     ("wait", "Wait for runs or events (--since SEQ); print outcomes, answers, or new cursor."),
+    (
+        "work",
+        "Manage the machine-wide unified work table (<state>/work.jsonl): list, show, add, wait (--after-applied), close, drop, defer, import-md.",
+    ),
     (
         "events",
         "Show or follow the machine-wide append-only event stream (--since, --follow, --rebuild, --json).",
@@ -261,7 +266,17 @@ pub fn print(command: Option<&str>) -> bool {
             ("--json", "Print JSON status without the files array (pass --files to include files)."),
             ("--files", "With --json, include the full files array."),
         ]),
-        "note" => ("[<run> [text ... | --done [<index> ... | --all]]] [--all] [--json]", "Attach, list, or complete post-merge todos on a run. Notes follow the entire reply chain and survive clean under <runs>/notes.json until marked --done.", &[
+        "work" => ("[list|show|add|wait|close|drop|defer|import-md] ...", "Machine-wide unified work table (<state>/work.jsonl) with 7 states (attention/ready/verify/active/blocked/deferred/done), structured wait_on (including run_applied and read-only owner:Qxx), 6-column table & card views, and automatic migration of notes.json / deferred.tsv.", &[
+            ("[--all] [--state ST] [--repo NAME] [--rebuild] [--json]", "Show Layer-0 summary + 6-column table (merges unattached active/actionable runs as R:<id>; folds blocked/deferred by default)."),
+            ("show <Wxx|R:id> [--json]", "Show Layer-2 work item card with wait_on status, linked runs, artifacts, followups, and Layer-3 original pointers."),
+            ("add \"<title>\" [--done-when TEXT] [--brief FILE] [--after-applied RUN] [--after-delivered RUN] [--after-work Wxx] [--wait-owner Qxx] [--after-time TIME] [--wait-manual TEXT] [--artifact PATH] [--auto -- <start-args>]", "Create a persistent work item."),
+            ("wait <Wxx> [--after-applied RUN] [--after-delivered RUN] [--after-work Wxx] [--wait-owner Qxx] [--after-time TIME] [--wait-manual TEXT] [--brief FILE] [--auto -- <start-args>] [--clear]", "Attach or update wait_on conditions on a work item (blocks until satisfied; unlocks on apply/finish or auto-dispatches with --auto)."),
+            ("close <Wxx> --evidence \"<text>\"", "Explicitly close a work item with evidence (commit SHA, test/screenshot verification)."),
+            ("drop <Wxx> --reason \"<text>\"", "Explicitly drop a work item with a recorded reason."),
+            ("defer <Wxx|run> --reason \"<text>\" [--until 4h|24h|YYYY-MM-DD|ISO]", "Defer a work item or unattached run (materializes into work.jsonl) until automatic wake-up."),
+            ("import-md <FILE> [--dry-run] [--include-stale] [--repo DIR] [--json]", "Parse a Markdown backlog, cross-check history.jsonl for already-applied/stale items, and preview (--dry-run) or import."),
+        ]),
+        "note" => ("[<run> [text ... | --done [<index> ... | --all]]] [--all] [--json]", "Thin compatibility wrapper over the unified work table (<state>/work.jsonl) for attaching, listing, or completing post-merge todos on a run or reply chain.", &[
             ("run", "Run id, name, or unique fragment (works after clean while pending todos remain). Omit to list all chains with pending todos."),
             ("text", "Todo text to append (timestamped). Omit to list notes on this chain."),
             ("--done", "Mark note(s) done: specify 1-based index(es), --all, or omit when only one pending todo remains."),
@@ -310,6 +325,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("--no-verify", "Skip the post-merge acceptance."),
             ("--keep-commits", "Cherry-pick the colleague's commits instead of applying the final tree; refuses uncommitted files (listed in commitsDiffer)."),
             ("--commit", "Stage only the applied paths and create one squash commit using the colleague's commit title(s); refuses when the source index already has staged changes or a 3-way merged file had local uncommitted edits."),
+            ("--closes ID", "Explicitly close work item ID (e.g. W019) with this apply's commit/run evidence."),
         ]),
         "config" => ("", "Show merged effective configuration (including the remote host).", &[]),
         "remote" => ("check", "Test SSH, rsync and remote program versions; never falls back locally.", &[]),

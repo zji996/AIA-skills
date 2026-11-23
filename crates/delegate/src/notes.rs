@@ -130,6 +130,7 @@ impl ChainNotes {
         })
     }
 
+    #[cfg(test)]
     fn to_storage_json(&self) -> Value {
         json!({
             "root": self.root,
@@ -341,6 +342,7 @@ fn notes_path(root: &Path) -> PathBuf {
     root.join("notes.json")
 }
 
+#[cfg(test)]
 fn notes_lock(root: &Path) -> PathBuf {
     root.join(".notes.lock")
 }
@@ -355,6 +357,7 @@ pub fn load_in(root: &Path) -> Vec<ChainNotes> {
         .collect()
 }
 
+#[cfg(test)]
 fn save_in(root: &Path, chains: &[ChainNotes]) -> Res<()> {
     fs::create_dir_all(root).map_err(|e| format!("{}: {e}", root.display()))?;
     let val = json!({
@@ -364,7 +367,7 @@ fn save_in(root: &Path, chains: &[ChainNotes]) -> Res<()> {
 }
 
 pub fn load() -> Vec<ChainNotes> {
-    load_in(&runs_root())
+    crate::work::note_chains_for_current_root(&runs::all_runs())
 }
 
 /// Record the current repository / runs directory in machine state so cross-repo tools
@@ -423,6 +426,7 @@ pub fn register_repo_paths(state: &Path, repo_dir: &Path, runs_dir: &Path) {
     let _ = write_json(&path, &doc);
 }
 
+#[cfg(test)]
 pub fn for_run_in(root: &Path, run: &Path, all: &[PathBuf]) -> Option<ChainNotes> {
     let chains = load_in(root);
     if chains.is_empty() {
@@ -440,51 +444,20 @@ fn is_archived_path(run: &Path) -> bool {
             .is_some_and(|n| n == ".applied")
 }
 
-fn notes_root_for_run(run: &Path) -> PathBuf {
-    if is_archived_path(run) {
-        return runs_root();
-    }
-    run.parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(runs_root)
-}
-
 pub fn for_run(run: &Path, all: &[PathBuf]) -> Option<ChainNotes> {
-    let root = if is_archived_path(run) {
-        runs_root()
-    } else {
-        run.parent()
-            .filter(|p| notes_path(p).is_file())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(runs_root)
-    };
-    if !notes_path(&root).is_file() {
-        return None;
-    }
-    for_run_in(&root, run, all)
+    crate::work::note_chain_for_run(run, all)
 }
 
 pub fn for_run_lazy(run: &Path) -> Option<ChainNotes> {
-    let root = if is_archived_path(run) {
-        runs_root()
-    } else {
-        run.parent()
-            .filter(|p| notes_path(p).is_file())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(runs_root)
-    };
-    if !notes_path(&root).is_file() {
-        return None;
-    }
     let all = runs::all_runs();
-    for_run_in(&root, run, &all)
+    crate::work::note_chain_for_run(run, &all)
 }
 
 pub fn pending_count_for_run(run: &Path) -> usize {
     for_run_lazy(run).map_or(0, |c| c.pending_count())
 }
 
-/// Return chains stored in `notes.json` that still have pending notes and have no
+/// Return chains stored in `work.jsonl` that still have pending notes and have no
 /// remaining run directory in `all`.
 pub fn cleaned_pending_chains(all: &[PathBuf]) -> Vec<ChainNotes> {
     let live_ids: BTreeSet<String> = all
@@ -504,11 +477,15 @@ pub fn cleaned_pending_chains(all: &[PathBuf]) -> Vec<ChainNotes> {
 }
 
 pub fn resolve_cleaned(reference: &str) -> Res<ChainNotes> {
-    resolve_cleaned_in(&runs_root(), reference)
+    resolve_in_chains(load(), reference, &runs_root())
 }
 
+#[cfg(test)]
 fn resolve_cleaned_in(root: &Path, reference: &str) -> Res<ChainNotes> {
-    let chains = load_in(root);
+    resolve_in_chains(load_in(root), reference, root)
+}
+
+fn resolve_in_chains(chains: Vec<ChainNotes>, reference: &str, root: &Path) -> Res<ChainNotes> {
     if chains.is_empty() {
         return Err(format!("no notes found under {}", root.display()));
     }
@@ -550,7 +527,8 @@ fn resolve_cleaned_in(root: &Path, reference: &str) -> Res<ChainNotes> {
     ))
 }
 
-/// Called by `runs::remove` before deleting a run directory so pending notes survive `clean`.
+#[cfg(test)]
+/// Legacy `notes.json` helper kept for unit tests; runtime uses `work::on_run_cleaned`.
 pub fn on_run_removed(run: &Path, meta: &Value) {
     let Some(root) = run.parent() else {
         return;
@@ -608,6 +586,7 @@ pub fn on_run_removed(run: &Path, meta: &Value) {
     let _ = save_in(root, &chains);
 }
 
+#[cfg(test)]
 fn sync_chain_entry(
     chains: &mut Vec<ChainNotes>,
     run: &Path,
@@ -763,19 +742,12 @@ pub fn command(args: &[String]) -> Res<i32> {
             return Err("cannot combine --all with explicit note indices".into());
         }
         let target = resolve_target(reference)?;
-        let root = match &target {
-            Target::Live(run) => notes_root_for_run(run),
-            Target::Cleaned(_) => runs_root(),
-        };
-        fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
-        let _guard = lock(&notes_lock(&root), true, false).map_err(|e| e.to_string())?;
-        let mut chains = load_in(&root);
         let all = runs::all_runs();
-        let pos = match &target {
-            Target::Live(run) => sync_chain_entry(&mut chains, run, &all, false),
-            Target::Cleaned(id) => chains.iter().position(|c| c.latest_run == *id),
+        let updated = match &target {
+            Target::Live(run) => crate::work::note_done_for_run(Some(run), None, all_flag, index_args, &all)?,
+            Target::Cleaned(id) => crate::work::note_done_for_run(None, Some(id), all_flag, index_args, &all)?,
         };
-        let Some(pos) = pos else {
+        let Some(snapshot) = updated else {
             if json_flag {
                 println!("{}", json!({"ok": true, "pendingCount": 0, "items": []}));
             } else {
@@ -783,81 +755,7 @@ pub fn command(args: &[String]) -> Res<i32> {
             }
             return Ok(0);
         };
-
-        let entry = &mut chains[pos];
-        let pending_indices: Vec<usize> = entry
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| !item.done)
-            .map(|(idx, _)| idx)
-            .collect();
-
-        if pending_indices.is_empty() {
-            let snapshot = entry.clone();
-            let cleaned_empty = entry.cleaned;
-            if cleaned_empty {
-                chains.remove(pos);
-                save_in(&root, &chains)?;
-            }
-            if json_flag {
-                println!("{}", snapshot.to_json());
-            } else {
-                println!("{}：已无未完成待办", snapshot.name);
-            }
-            return Ok(0);
-        }
-
-        let now = iso();
-        let to_mark: Vec<usize> = if all_flag {
-            pending_indices.clone()
-        } else if !index_args.is_empty() {
-            let total = entry.items.len();
-            let mut chosen = Vec::new();
-            for raw in index_args {
-                let idx = raw.parse::<usize>().map_err(|_| {
-                    format!(
-                        "invalid note index '{raw}': expected integer 1..={total} or --all"
-                    )
-                })?;
-                if idx == 0 || idx > total {
-                    return Err(format!(
-                        "note index {idx} out of range (valid: 1..={total})"
-                    ));
-                }
-                chosen.push(idx - 1);
-            }
-            chosen
-        } else if pending_indices.len() == 1 {
-            pending_indices.clone()
-        } else {
-            let listing = format_items_lines(entry).join("\n");
-            return Err(format!(
-                "{} 有 {} 条未完成待办，请指定序号（如 delegate note {} --done 1）或 --all：\n{listing}",
-                entry.name,
-                pending_indices.len(),
-                entry.latest_run
-            ));
-        };
-
-        for idx in to_mark {
-            if !entry.items[idx].done {
-                entry.items[idx].done = true;
-                entry.items[idx].done_at = Some(now.clone());
-            }
-        }
-
-        let snapshot = entry.clone();
         let remaining = snapshot.pending_count();
-        let has_live_dir = snapshot
-            .runs
-            .iter()
-            .any(|id| root.join(id).join("meta.json").is_file());
-        if !has_live_dir && remaining == 0 {
-            chains.remove(pos);
-        }
-        save_in(&root, &chains)?;
-
         if json_flag {
             println!("{}", snapshot.to_json());
         } else {
@@ -941,38 +839,17 @@ pub fn command(args: &[String]) -> Res<i32> {
         return Ok(0);
     }
 
-    // Append a new note to the run's chain.
+    // Append a new note to the run's chain (backed by `<state>/work.jsonl`).
     let text = text_parts.join(" ").trim().to_string();
     if text.is_empty() {
         return Err("note text cannot be empty".into());
     }
     let target = resolve_target(reference)?;
-    let root = match &target {
-        Target::Live(run) => notes_root_for_run(run),
-        Target::Cleaned(_) => runs_root(),
-    };
-    fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
-    let _guard = lock(&notes_lock(&root), true, false).map_err(|e| e.to_string())?;
-    let mut chains = load_in(&root);
     let all = runs::all_runs();
-    let pos = match &target {
-        Target::Live(run) => sync_chain_entry(&mut chains, run, &all, true).unwrap(),
-        Target::Cleaned(id) => chains
-            .iter()
-            .position(|c| c.latest_run == *id)
-            .ok_or_else(|| format!("run '{reference}' not found"))?,
+    let (snapshot, added_index) = match &target {
+        Target::Live(run) => crate::work::note_add_for_run(Some(run), None, &text, &all)?,
+        Target::Cleaned(id) => crate::work::note_add_for_run(None, Some(id), &text, &all)?,
     };
-    let created_at = iso();
-    let entry = &mut chains[pos];
-    entry.items.push(NoteItem {
-        text: text.clone(),
-        created_at,
-        done: false,
-        done_at: None,
-    });
-    let added_index = entry.items.len();
-    let snapshot = entry.clone();
-    save_in(&root, &chains)?;
     register_repo();
 
     if json_flag {

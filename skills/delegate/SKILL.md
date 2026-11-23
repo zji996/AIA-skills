@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI（pi-kit 的 rpi 通道下 `pi` 即 rpi）。
 metadata:
-  version: "6.30.0"
+  version: "6.31.0"
   binary: delegate
   extra-binaries: delegate-tui
   exclude-agents: pi
@@ -40,7 +40,7 @@ $D wait                                                                  # 放�
 | 事件流 / 游标等待 / 确定性续派 | `$D events [--since SEQ] [--follow] [--rebuild] [--json]` 查全机只追加事件流（含 `review_*` / `merge_*` / `radar_*`）；`$D wait --since SEQ` 返回新事件与新游标（Stop hook 按游标拦下未读交付/提问/需关注/`NEEDS_CONTROLLER`）；`$D queue add <name> --after <run\|name> --prompt-file …` / `queue list` 建有序 DAG，上游交付通过且审查 `PASS` 后零模型调用自动起下一步，异常暂停提醒 |
 | 串行合入员与自主合入白名单 | `$D merge <run>...` 或 `$D merge --ready` 在独立集成 worktree 基于源 HEAD 串行 3-way 合入、命中 `generated.inputs` 重生、逐个经 lane 跑 `accept`、末尾跑 `mergeAccept`，沿用原提交标题并带 `Delegate-Run` trailer，冲突/红测/受保护路径/未签字或失效 `controllerReviewPaths` 自动回退标 `SKIPPED`；`.delegate.json` `autoMerge`（支持 `!` 排除与 `add:` 纯新增）标「可自主合入 / 待主控点头」并出 `merge-report.md`，主控 `$D apply --keep-commits <merge-run>` 落回后自行 push，详见 [合入员与 Radar](references/merge-and-radar.md) |
 | 发散侦察（Radar）与候选板 | `$D radar` 按 `.delegate.json` `radar.collect` 顺序采集并算指纹，未变零 token 退出；变化时派只读 scout 侦察，Host 校验锚点（`文件:行`/commit/输出行号，无锚丢弃）去重写 `<state>/radar/<repo>/board.md`；`$D radar list` 查看，`$D radar pick <id>` 生成任务说明草稿不自动派活，`$D radar schedule` 输出 00:30–04:30 每 2 小时定时安装说明，见 [合入员与 Radar](references/merge-and-radar.md) |
-| 给任务挂合入后待办 | `$D note <run> "…"` / `$D note <run>` / `$D note <run> --done [<序号>\|--all]`；随续做链共享，`clean` 后保留直到 `--done` |
+| 统一工作表与适时提示 | `$D work`（6 列紧凑表并合入未绑定 run）、`$D work show/add/wait/close/drop/defer/import-md`、`start --work <ID>`（`reply` 继承）、`--after-applied`；`wait`/`apply`/`merge`/`clean` 尾部附带原文指针提示，Stop hook 分级只拦当下阻断项；自动迁移 `notes.json`/`deferred.tsv`，`note` 保留为薄壳，见 [工作表](references/worktable.md) |
 | `/clear` 前交接 / 查历史与看板 | `$D handoff` 写一页交接索引（含待办）；`$D history [关键词…]` 查永久索引；`$D show <run>` 看摘要、合入后同文件提交与归档；`$D board` 打印/刷新自动看板（`.delegate.json` `board` 配路径） |
 | 交互式终端看板（只读 TUI） | `$D tui`（自动 exec 同目录或 PATH 中的 `delegate-tui`，随 `install.sh` / `fetch-binary.sh` 安装）：跨仓库按状态分组、任务行判活与审查状态、确定性续派队列及「任务 / 事件 / 合入 / 候选」四标签页（`1-4`/`e`/`m`/`b` 切页、`f` 跟随、`↑↓`/`jk` 选择、`Tab` 切栏、`Enter` 结论/命令、`d` diff 统计、`/` 过滤、`r` 刷新、`a/c/s/p` 生成写命令并复制、`q` 退出） |
 

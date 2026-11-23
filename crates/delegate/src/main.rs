@@ -40,6 +40,7 @@ mod supervise;
 mod transient;
 mod tui;
 mod waiting;
+mod work;
 mod worktree;
 use common::*;
 use serde_json::{json, Value};
@@ -594,6 +595,7 @@ fn collect_timed(
     let timed_out = max.is_some_and(|m| begin.elapsed().as_secs_f64() >= m);
     let mut code = 0;
     let mut glanced = false;
+    let mut settled_for_hints: Vec<PathBuf> = Vec::new();
     for run in runs {
         let state = runs::state(run);
         if timed_out && runs::active(&state) {
@@ -700,6 +702,15 @@ fn collect_timed(
             board::refresh_for_run(run);
             let meta = json(run.join("meta.json"));
             events::mark_run_read(&events::run_id_for(run, &meta));
+            if !run.join(".truncated").exists() {
+                work::on_run_result_read(run, &meta);
+            }
+        }
+        settled_for_hints.push(run.clone());
+    }
+    if !output::json_enabled() && !settled_for_hints.is_empty() {
+        for hint in work::hints_for_wait(&settled_for_hints) {
+            println!("{hint}");
         }
     }
     if glanced {
@@ -1180,6 +1191,7 @@ fn clean(args: &[String]) -> Res<i32> {
             archive::preserve(&run)?
         };
         let pending_notes = notes::pending_count_for_run(&run);
+        let work_keep_hint = work::on_run_cleaned(&run, &run_meta);
         let run_id_for_ev = events::run_id_for(&run, &run_meta);
         let repo_for_ev = events::repo_for_meta(&run_meta);
         let (units, containers) = runs::remove(&run);
@@ -1218,6 +1230,9 @@ fn clean(args: &[String]) -> Res<i32> {
                 String::new()
             };
             println!("removed {name} ({st}{note}{cleanup_note}{container_note}{todo_note})");
+            if let Some(hint) = work_keep_hint {
+                println!("{hint}");
+            }
             containers.warn_kept();
             if let Some(path) = archived {
                 println!("archive: {}", path.display());
@@ -1433,7 +1448,7 @@ fn patch(args: &[String]) -> Res<i32> {
     Ok(0)
 }
 fn apply(args: &[String]) -> Res<i32> {
-    let (pos, flags, _) = parse_simple(
+    let (pos, flags, kv) = parse_simple(
         args,
         &[
             "--dry-run",
@@ -1445,8 +1460,12 @@ fn apply(args: &[String]) -> Res<i32> {
             "--commit",
             "--json",
         ],
-        &[],
+        &["--closes"],
     )?;
+    let closes_work = value(&kv, "--closes").map(str::to_string);
+    if let Some(ref raw_w) = closes_work {
+        let _ = work::validate_work_id(raw_w)?;
+    }
     if has(&flags, "--json") {
         output::enable_json();
     }
@@ -1841,6 +1860,7 @@ fn apply(args: &[String]) -> Res<i32> {
         }
     }
     if !dry {
+        let mut applied_records: Vec<(PathBuf, Value, Value)> = Vec::new();
         for run in &applied_runs {
             let applied = json(run.join(".applied"));
             if !applied.is_object() {
@@ -1857,8 +1877,9 @@ fn apply(args: &[String]) -> Res<i32> {
                 if by.is_empty() { "delegate" } else { by },
                 arch.as_deref(),
             );
+            let run_id_ev = events::run_id_for(run, &meta);
             events::emit(
-                &events::run_id_for(run, &meta),
+                &run_id_ev,
                 &events::repo_for_meta(&meta),
                 "applied",
                 json!({
@@ -1867,7 +1888,18 @@ fn apply(args: &[String]) -> Res<i32> {
                     "appliedBy": if by.is_empty() { "delegate" } else { by },
                 }),
             );
+            events::mark_run_read(&run_id_ev);
             board::refresh_for_run(run);
+            applied_records.push((run.clone(), meta, applied));
+        }
+        if !applied_records.is_empty() {
+            let work_hints = work::on_runs_applied(&applied_records, closes_work.as_deref());
+            dag_queue::advance();
+            if !output::json_enabled() {
+                for hint in work_hints {
+                    println!("{hint}");
+                }
+            }
         }
     }
     Ok(code)
@@ -2180,6 +2212,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
             if !all.is_empty() || !cleaned_notes.is_empty() {
                 notes::register_repo();
             }
+            work::check_stale_and_expired();
             if show_all {
                 for run in &all {
                     if output::json_enabled() {
@@ -2501,9 +2534,11 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 board::refresh_for_run(&run);
                 let run_meta = json(run.join("meta.json"));
                 events::mark_run_read(&events::run_id_for(&run, &run_meta));
+                work::on_run_result_read(&run, &run_meta);
             }
             Ok(0)
         }
+        "work" => work::command(rest),
         "events" => events::command(rest),
         "queue" => dag_queue::command(rest),
         "sign" => review::sign_command(rest),

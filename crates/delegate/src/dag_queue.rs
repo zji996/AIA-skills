@@ -202,13 +202,87 @@ fn evaluate_dep(
     }
 }
 
+fn evaluate_applied_dep(
+    dep: &str,
+    after_dirs: &Value,
+    items_by_name: &HashMap<String, Value>,
+    state: &Path,
+    repo: &str,
+) -> UpstreamVerdict {
+    if let Some(up) = items_by_name.get(dep) {
+        let ust = s(up, "status");
+        return match ust {
+            "pending" | "dispatching" => UpstreamVerdict::Waiting,
+            "dispatched" => {
+                let rid = s(up, "runId");
+                let rdir = s(up, "runDir");
+                if !rid.is_empty() && crate::work::is_run_applied(rid, state, Some(repo)) {
+                    return UpstreamVerdict::Satisfied;
+                }
+                if !rdir.is_empty() {
+                    match evaluate_run_dir(Path::new(rdir)) {
+                        UpstreamVerdict::Paused { upstream_run, reason, state } => {
+                            UpstreamVerdict::Paused { upstream_run, reason, state }
+                        }
+                        _ => UpstreamVerdict::Waiting,
+                    }
+                } else {
+                    UpstreamVerdict::Waiting
+                }
+            }
+            "paused" => UpstreamVerdict::Paused {
+                upstream_run: s(up, "upstreamRun").to_string(),
+                reason: format!("上游队列项 {dep} 已暂停（{}）", s(up, "pauseReason")),
+                state: "paused".into(),
+            },
+            "cancelled" => UpstreamVerdict::Paused {
+                upstream_run: dep.to_string(),
+                reason: format!("上游队列项 {dep} 已取消"),
+                state: "cancelled".into(),
+            },
+            _ => UpstreamVerdict::Waiting,
+        };
+    }
+    if crate::work::is_run_applied(dep, state, Some(repo)) {
+        return UpstreamVerdict::Satisfied;
+    }
+    if let Some(dir_str) = after_dirs.get(dep).and_then(Value::as_str) {
+        if !dir_str.is_empty() {
+            let p = Path::new(dir_str);
+            if p.join(".applied").exists() || p.join(".applied-cleaned").exists() {
+                return UpstreamVerdict::Satisfied;
+            }
+            return match evaluate_run_dir(p) {
+                UpstreamVerdict::Paused { upstream_run, reason, state } => {
+                    UpstreamVerdict::Paused { upstream_run, reason, state }
+                }
+                _ => UpstreamVerdict::Waiting,
+            };
+        }
+    }
+    if let Ok(run_dir) = runs::resolve_head(dep) {
+        if run_dir.join(".applied").exists() || run_dir.join(".applied-cleaned").exists() {
+            return UpstreamVerdict::Satisfied;
+        }
+        return match evaluate_run_dir(&run_dir) {
+            UpstreamVerdict::Paused { upstream_run, reason, state } => {
+                UpstreamVerdict::Paused { upstream_run, reason, state }
+            }
+            _ => UpstreamVerdict::Waiting,
+        };
+    }
+    UpstreamVerdict::Waiting
+}
+
 fn has_cycle(items: &[Value], new_name: &str, new_after: &[String]) -> bool {
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     for item in items {
         if s(item, "status") == "cancelled" {
             continue;
         }
-        adj.insert(s(item, "name").to_string(), strings(&item["after"]));
+        let mut deps = strings(&item["after"]);
+        deps.extend(strings(&item["afterApplied"]));
+        adj.insert(s(item, "name").to_string(), deps);
     }
     adj.insert(new_name.to_string(), new_after.to_vec());
 
@@ -264,6 +338,8 @@ pub fn advance() {
                     continue;
                 }
                 let deps = strings(&item["after"]);
+                let applied_deps = strings(&item["afterApplied"]);
+                let item_repo = s(item, "repo").to_string();
                 let mut all_satisfied = true;
                 let mut paused: Option<(String, String, String)> = None;
 
@@ -281,6 +357,25 @@ pub fn advance() {
                             all_satisfied = false;
                             paused = Some((upstream_run, reason, st));
                             break;
+                        }
+                    }
+                }
+                if paused.is_none() {
+                    for dep in &applied_deps {
+                        match evaluate_applied_dep(dep, &item["afterDirs"], &by_name, &state, &item_repo) {
+                            UpstreamVerdict::Satisfied => {}
+                            UpstreamVerdict::Waiting => {
+                                all_satisfied = false;
+                            }
+                            UpstreamVerdict::Paused {
+                                upstream_run,
+                                reason,
+                                state: st,
+                            } => {
+                                all_satisfied = false;
+                                paused = Some((upstream_run, reason, st));
+                                break;
+                            }
                         }
                     }
                 }
@@ -479,6 +574,7 @@ fn add_cmd(args: &[String]) -> Res<i32> {
     }
     let mut name: Option<String> = None;
     let mut after: Vec<String> = Vec::new();
+    let mut after_applied: Vec<String> = Vec::new();
     let mut prompt_file: Option<String> = None;
     let mut start_args: Vec<String> = Vec::new();
     let mut json_mode = false;
@@ -504,6 +600,7 @@ fn add_cmd(args: &[String]) -> Res<i32> {
         "--class",
         "--overflow",
         "--in",
+        "--work",
     ];
     let bool_start_flags = [
         "--read-only",
@@ -540,6 +637,23 @@ fn add_cmd(args: &[String]) -> Res<i32> {
                     let t = part.trim();
                     if !t.is_empty() {
                         after.push(t.to_string());
+                    }
+                }
+            }
+            "--after-applied" => {
+                let raw = match inline {
+                    Some(v) => v.to_string(),
+                    None => {
+                        i += 1;
+                        args.get(i)
+                            .cloned()
+                            .ok_or("argument --after-applied: expected one argument")?
+                    }
+                };
+                for part in raw.split(',') {
+                    let t = part.trim();
+                    if !t.is_empty() {
+                        after_applied.push(t.to_string());
                     }
                 }
             }
@@ -597,9 +711,9 @@ fn add_cmd(args: &[String]) -> Res<i32> {
 
     let name = name
         .filter(|n| !n.trim().is_empty())
-        .ok_or("usage: delegate queue add <name> --after <run|name> --prompt-file <FILE> [start options...]")?;
-    if after.is_empty() {
-        return Err("queue add requires at least one --after <run|name>".into());
+        .ok_or("usage: delegate queue add <name> --after|--after-applied <run|name> --prompt-file <FILE> [start options...]")?;
+    if after.is_empty() && after_applied.is_empty() {
+        return Err("queue add requires at least one --after or --after-applied <run|name>".into());
     }
     let prompt_file_raw = prompt_file
         .ok_or("queue add requires --prompt-file <FILE>")?;
@@ -677,6 +791,7 @@ fn add_cmd(args: &[String]) -> Res<i32> {
             .collect();
 
         let mut normalized_after: Vec<String> = Vec::new();
+        let mut normalized_after_applied: Vec<String> = Vec::new();
         let mut after_dirs = serde_json::Map::new();
         for dep in &after {
             if active_queue_names.contains(dep) {
@@ -700,17 +815,46 @@ fn add_cmd(args: &[String]) -> Res<i32> {
                 ));
             }
         }
+        for dep in &after_applied {
+            if active_queue_names.contains(dep) {
+                if !normalized_after_applied.contains(dep) {
+                    normalized_after_applied.push(dep.clone());
+                }
+            } else if let Ok(run_dir) = runs::resolve_head(dep) {
+                let meta = json(run_dir.join("meta.json"));
+                let rid = events::run_id_for(&run_dir, &meta);
+                let canonical_dir = fs::canonicalize(&run_dir)
+                    .unwrap_or(run_dir)
+                    .to_string_lossy()
+                    .into_owned();
+                if !normalized_after_applied.contains(&rid) {
+                    normalized_after_applied.push(rid.clone());
+                }
+                after_dirs.insert(rid, json!(canonical_dir));
+            } else if crate::work::is_run_applied(dep, &state, Some(&repo)) {
+                if !normalized_after_applied.contains(dep) {
+                    normalized_after_applied.push(dep.clone());
+                }
+            } else {
+                return Err(format!(
+                    "unknown upstream run or queue item in --after-applied: '{dep}'"
+                ));
+            }
+        }
 
-        if has_cycle(&items, &name, &normalized_after) {
+        let mut all_deps = normalized_after.clone();
+        all_deps.extend(normalized_after_applied.iter().cloned());
+        if has_cycle(&items, &name, &all_deps) {
             return Err(format!(
                 "dependency cycle detected when adding '{name}' after {:?}",
-                normalized_after
+                all_deps
             ));
         }
 
         created_item = json!({
             "name": name,
             "after": normalized_after,
+            "afterApplied": normalized_after_applied,
             "afterDirs": Value::Object(after_dirs),
             "promptFile": resolved_prompt.to_string_lossy(),
             "startArgs": start_args,
@@ -758,6 +902,15 @@ fn format_item_human(item: &Value) -> String {
     let name = s(item, "name");
     let status = s(item, "status");
     let after = strings(&item["after"]).join(", ");
+    let after_applied = strings(&item["afterApplied"]).join(", ");
+    let mut dep_parts = Vec::new();
+    if !after.is_empty() {
+        dep_parts.push(format!("after: [{after}]"));
+    }
+    if !after_applied.is_empty() {
+        dep_parts.push(format!("after-applied: [{after_applied}]"));
+    }
+    let deps_str = dep_parts.join(" · ");
     let repo = Path::new(s(item, "repo"))
         .file_name()
         .and_then(|n| n.to_str())
@@ -770,7 +923,7 @@ fn format_item_human(item: &Value) -> String {
         "cancelled" => "已取消".to_string(),
         other => other.to_string(),
     };
-    format!("{name} · {status_zh} · after: [{after}] · [{repo}] · {}", s(item, "promptFile"))
+    format!("{name} · {status_zh} · {deps_str} · [{repo}] · {}", s(item, "promptFile"))
 }
 
 fn list_cmd(args: &[String]) -> Res<i32> {

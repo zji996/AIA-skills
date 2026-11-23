@@ -163,9 +163,9 @@ class Delegate625Tests(unittest.TestCase):
         self.cli("note", run_d["run"], "--done", human=True)
         self.assertEqual(self.cli("clean", "--no-archive", run_d["run"], human=True).returncode, 0)
 
-        # Independent notes.json file exists under DELEGATE_RUNS.
-        notes_file = Path(self.env["DELEGATE_RUNS"]) / "notes.json"
-        self.assertTrue(notes_file.is_file())
+        # Since 6.31, `delegate note` is backed by machine-wide `<state>/work.jsonl` (not notes.json).
+        work_file = Path(self.env["XDG_STATE_HOME"]) / "delegate" / "work.jsonl"
+        self.assertTrue(work_file.is_file())
 
         # `status` from a fresh caller session STILL displays B (applied-cleaned) and C (cleaned), not D.
         prev_caller = self.env.get("DELEGATE_CALLER")
@@ -326,17 +326,17 @@ class Delegate625Tests(unittest.TestCase):
         self.assertIsNotNone(stale_block)
         self.assertIn("超过 4 小时", stale_block["reason"])
 
-        # Attach a post-merge note to ra, apply & clean ra -> deferred.tsv is tidied, note still blocks!
+        # Attach a post-merge note to ra, apply & clean ra -> deferred.tsv is tidied;
+        # under 6.31 graded Stop hook, fresh (<24h) verify/note does not block turn end.
         self.assertEqual(run_in(repo_a, "note", ra["run"], "重启线上进程", human=True).returncode, 0)
         self.assertEqual(run_in(repo_a, "apply", "--json", ra["run"]).returncode, 0)
         self.assertEqual(run_in(repo_a, "clean", "--no-archive", ra["run"], human=True).returncode, 0)
 
-        note_block = hook(repo_a)
-        self.assertIsNotNone(note_block)
-        self.assertIn("重启线上进程", note_block["reason"])
-        self.assertIn(f"delegate note {ra['run']} --done", note_block["reason"])
+        self.assertIsNone(hook(repo_a))
         # deferred.tsv was tidied because ra is no longer unmerged.
         self.assertEqual(deferred.read_text().strip(), "")
+        # Note is still preserved in `delegate note` until `--done`.
+        self.assertIn("重启线上进程", run_in(repo_a, "note", ra["run"], human=True).stdout)
 
         # Mark note done -> repo_a is now completely clean!
         self.assertEqual(run_in(repo_a, "note", ra["run"], "--done", human=True).returncode, 0)
@@ -382,8 +382,7 @@ class Delegate625Tests(unittest.TestCase):
         cross_unmerged = hook(repo_a)
         self.assertIsNotNone(cross_unmerged)
         self.assertIn("【repo-beta】beta-feat", cross_unmerged["reason"])
-        self.assertIn("验证 beta 真机", cross_unmerged["reason"])
-        self.assertIn(f"delegate note {ub['run']} --done", cross_unmerged["reason"])
+        self.assertIn("delegate apply", cross_unmerged["reason"])
 
 
 if __name__ == "__main__":

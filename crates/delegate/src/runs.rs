@@ -517,6 +517,9 @@ pub fn status(run: &Path) -> Value {
     if !s(&meta, "parent").is_empty() {
         out["parent"] = meta["parent"].clone();
     }
+    if !s(&meta, "workId").is_empty() {
+        out["workId"] = meta["workId"].clone();
+    }
     if st == "needs-redispatch" {
         out["redispatch"] = json!(redispatch_command(run, &meta));
     }
@@ -746,7 +749,7 @@ pub fn unmerged(run: &Path) -> bool {
 pub fn remove(run: &Path) -> (usize, crate::cleanup::Containers) {
     let meta = json(run.join("meta.json"));
     let path = s(&meta["worktree"], "path").to_string();
-    crate::notes::on_run_removed(run, &meta);
+    let _ = crate::work::on_run_cleaned(run, &meta);
     crate::refs::delete_run(run, &meta);
     let stopped = crate::cleanup::record(run, 0);
     let _ = fs::remove_dir_all(run);

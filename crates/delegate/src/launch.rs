@@ -68,6 +68,7 @@ pub struct Options {
     pub over_limit: Option<String>,
     pub rework: Option<Value>,
     pub max_answer: Option<u64>,
+    pub work: Option<String>,
 }
 impl Options {
     pub fn new() -> Self {
@@ -168,6 +169,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             "--after",
             "--in",
             "--over-limit",
+            "--work",
         ]
         .contains(&key);
         if takes {
@@ -234,6 +236,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 }
                 "--in" => o.in_run = Some(v),
                 "--over-limit" if reply => o.over_limit = Some(v),
+                "--work" => o.work = Some(v),
                 _ => {}
             }
         } else {
@@ -843,6 +846,10 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     if let Some(e) = nesting_error() {
         return Err(e);
     }
+    if let Some(raw_w) = o.work.clone() {
+        let item = crate::work::validate_work_id(&raw_w)?;
+        o.work = Some(item.id);
+    }
     choose_tier(&mut o)?;
     let prompt = read_prompt(&mut o)?;
     let in_run = o.in_run.as_deref().map(runs::resolve).transpose()?;
@@ -1156,6 +1163,15 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     let accept_timeout_overridden = o.accept_timeout.is_some();
     let parent = runs::latest(runs::resolve(o.run.as_deref().unwrap_or("last"))?);
     let meta = json(parent.join("meta.json"));
+    if o.work.is_none() {
+        let parent_work = s(&meta, "workId");
+        if !parent_work.is_empty() {
+            o.work = Some(parent_work.to_string());
+        }
+    } else if let Some(raw_w) = o.work.clone() {
+        let item = crate::work::validate_work_id(&raw_w)?;
+        o.work = Some(item.id);
+    }
     o.share = strings(&meta["share"]);
     let summary = json(parent.join("summary.json"));
     if active(&state(&parent)) {
@@ -2389,8 +2405,14 @@ pub fn launch(
     if let Some(rework) = &o.rework {
         meta["rework"] = rework.clone();
     }
+    if let Some(wid) = &o.work {
+        meta["workId"] = json!(wid);
+    }
     meta["userPromptLen"] = json!(prompt.len());
     write_json(run.join("meta.json"), &meta)?;
+    if let Some(wid) = &o.work {
+        crate::work::on_run_started(wid, &run, &meta);
+    }
     if !s(&extra["syncedBase"], "commit").is_empty() {
         let commit = s(&extra["syncedBase"], "commit");
         write(run.join("worktree-base-commit"), commit)?;

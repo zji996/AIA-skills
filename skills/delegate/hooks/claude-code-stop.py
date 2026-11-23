@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """Claude Code Stop hook for delegate.
 
-Merges four turn-end guards across the current repository and all other
-repositories on this machine with live, questioning, unmerged, or noted runs:
-0. Event-stream race lock: unread delivery/question/attention events past the
-   controller's read cursor recorded by `wait` / `result` in `cursors.json`.
+Graded turn-end guard across the current repository and all other repositories on
+this machine — blocks ONLY on immediate blockers (never on blocked/deferred/non-stale
+verify/backlog ready items):
+0. Event-stream race lock: unread alert events (delivered, question, rejected, failed,
+   stall_warning, queue_paused, needs_attention, NEEDS_CONTROLLER, and one-shot work
+   transitions work_ready / work_defer_expired / work_stale) past `cursors.json`.
 1. Questioning runs (waiting on controller decision) or live runs without a
    running `delegate wait`.
 2. Unmerged delivered or rejected write runs without a fresh deferral in
-   `<repo>/.local/delegate/deferred.tsv` (expiring after `DEFER_HOURS`, default 4).
-3. Unfinished post-merge todos recorded via `delegate note` (including runs
-   whose directories were already removed by `delegate clean`).
+   `<state>/work.jsonl` (or legacy `<repo>/.local/delegate/deferred.tsv`).
 
 When `stop_hook_active` is true, exits 0 immediately to avoid blocking loops.
 """
 
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import re
@@ -36,6 +37,9 @@ UNREAD_ALERT_KINDS = {
     "stall_warning",
     "queue_paused",
     "needs_attention",
+    "work_ready",
+    "work_defer_expired",
+    "work_stale",
 }
 KIND_LABELS = {
     "delivered": "交付",
@@ -53,6 +57,10 @@ KIND_LABELS = {
     "merge_done": "合入完成",
     "radar_unchanged": "侦察未变",
     "radar_done": "侦察完成",
+    "work_ready": "工作项就绪",
+    "work_dispatched": "工作项自动派发",
+    "work_defer_expired": "暂缓到期",
+    "work_stale": "工作项停滞",
 }
 
 
@@ -277,6 +285,51 @@ def active_waiter_cmdlines() -> list[str]:
         return []
 
 
+def parse_iso_utc(ts_str: str) -> int | None:
+    if not ts_str or not isinstance(ts_str, str):
+        return None
+    s = ts_str.strip()
+    if len(s) == 10 and s[4:5] == "-" and s[7:8] == "-":
+        s = f"{s}T00:00:00Z"
+    try:
+        tm = time.strptime(s, "%Y-%m-%dT%H:%M:%SZ")
+        return int(calendar.timegm(tm))
+    except ValueError:
+        return None
+
+
+def work_deferred_runs(now: int) -> tuple[set[str], set[str]]:
+    """Read `<state>/work.jsonl` and return (fresh_deferred_run_ids, expired_deferred_run_ids)."""
+    wfile = state_dir() / "work.jsonl"
+    if not wfile.is_file():
+        return set(), set()
+    fresh: set[str] = set()
+    expired: set[str] = set()
+    try:
+        with wfile.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(item, dict) or item.get("state") != "deferred":
+                    continue
+                runs = [r for r in (item.get("runs") or []) if isinstance(r, str) and r]
+                if not runs:
+                    continue
+                until_ts = parse_iso_utc(str(item.get("deferUntil") or ""))
+                if until_ts is not None and until_ts > now:
+                    fresh.update(runs)
+                else:
+                    expired.update(runs)
+    except OSError:
+        return set(), set()
+    return fresh, expired
+
+
 def tidy_and_check_deferred(
     repo_root: Path | None,
     pending_ids: set[str],
@@ -435,7 +488,9 @@ def check_unread_events(payload: dict, cwd: str) -> str | None:
         kind = str(ev.get("kind") or "")
         klabel = KIND_LABELS.get(kind, kind)
         pl = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
-        label = str(pl.get("name") or pl.get("queueName") or ev.get("run") or "?").replace("\n", " ")
+        wid = str(pl.get("workId") or "").strip()
+        raw_label = str(pl.get("name") or pl.get("queueName") or ev.get("run") or "?").replace("\n", " ")
+        label = f"{wid}:{raw_label}" if wid else raw_label
         previews.append(f"{klabel}:{label}")
     more = f" 等共 {len(unread)} 条" if len(unread) > 5 else ""
     summary = "、".join(previews) + more
@@ -472,7 +527,7 @@ def evaluate(payload: dict) -> dict | None:
     live_other: list[tuple[str, str]] = []  # (display, run_id)
     unmerged_items: list[str] = []
     has_stale_defer = False
-    pending_notes: list[tuple[str, str, list[str]]] = []  # (display, run_id, pending_texts)
+    work_fresh_def, work_expired_def = work_deferred_runs(now)
 
     for repo_root, runs_dir, label, is_current in repos:
         items = fetch_status(delegate_bin, repo_root, runs_dir)
@@ -493,24 +548,17 @@ def evaluate(payload: dict) -> dict | None:
             is_question = obj.get("question") is True
             disp = run_label(obj, label, is_current)
 
-            # 1) Pending post-merge todos (even if applied or cleaned).
-            if (obj.get("pendingNotes") or 0) > 0:
-                texts = [
-                    str(n.get("text", "")).strip()
-                    for n in (obj.get("notes") or [])
-                    if isinstance(n, dict) and not n.get("done") and str(n.get("text", "")).strip()
-                ]
-                pending_notes.append((disp, rid, texts))
-
+            # Non-stale post-merge notes / verify items do NOT block turn end (6.31 graded guard;
+            # stale >24h items emit one-shot `work_stale` events consumed via events.jsonl).
             if is_cleaned or is_applied:
                 continue
 
-            # 2) Questioning runs (stopped waiting for controller decision).
+            # 1) Questioning runs (stopped waiting for controller decision).
             if is_question:
                 questions.append((disp, rid, is_current))
                 continue
 
-            # 3) Live runs (running / waiting / starting).
+            # 2) Live runs (running / waiting / starting).
             if st in ("running", "waiting", "starting", "queued"):
                 if is_current:
                     live_current.append(disp)
@@ -518,7 +566,7 @@ def evaluate(payload: dict) -> dict | None:
                     live_other.append((disp, rid))
                 continue
 
-            # 4) Unmerged delivered or rejected write runs.
+            # 3) Unmerged delivered or rejected write runs.
             next_str = str(obj.get("next") or "")
             if st == "rejected" or (st == "delivered" and UNMERGED_NEXT_RE.search(next_str)):
                 repo_unmerged[rid] = disp
@@ -526,10 +574,11 @@ def evaluate(payload: dict) -> dict | None:
         fresh_def, stale_def = tidy_and_check_deferred(
             repo_root, set(repo_unmerged.keys()), now, defer_hours
         )
-        if stale_def:
+        fresh_all = (fresh_def | work_fresh_def) - stale_def
+        if stale_def or (set(repo_unmerged.keys()) & work_expired_def):
             has_stale_defer = True
         for rid, disp in repo_unmerged.items():
-            if rid not in fresh_def:
+            if rid not in fresh_all:
                 unmerged_items.append(disp)
 
     # Build questioning reminder (always blocks — needs controller reply now).
@@ -561,43 +610,23 @@ def evaluate(payload: dict) -> dict | None:
                 f"其他仓库还有委派在跑（{names}），但没有对应 waiter：在后台挂上 `{delegate_bin} wait --machine` 或切到对应仓库处理。"
             )
 
-    # Build unmerged reminder (matching delegate-unmerged.sh tone & rules).
+    # Build unmerged reminder.
     if unmerged_items:
         names = "、".join(unmerged_items[:8])
         hours_str = str(int(defer_hours)) if defer_hours == int(defer_hours) else str(defer_hours)
         stale_note = (
-            f"其中延后超过 {hours_str} 小时的要重新决定：合、清掉，或更新原因（删掉该行第三列重新计时）。"
+            f"其中延后超过 {hours_str} 小时的要重新决定：合、清掉，或重新暂缓。"
             if has_stale_defer
             else ""
         )
         reasons.append(
             f"有已交付的委派还没合也没写明原因（{names}）。{stale_note}"
-            "现在就合（delegate apply），或合不了就在 .local/delegate/deferred.tsv "
-            "写一行「run<Tab>原因」并告诉所有者，再结束回合。续做链只看最末一环，合完把整条链 clean 掉。"
-        )
-
-    # Build post-merge todo reminder (delegate note).
-    if pending_notes:
-        summary_parts: list[str] = []
-        cmd_parts: list[str] = []
-        for disp, rid, texts in pending_notes[:8]:
-            if texts:
-                preview = "；".join(texts[:2])
-                if len(texts) > 2:
-                    preview += f" 等共 {len(texts)} 条"
-                summary_parts.append(f"{disp}（{preview}）")
-            else:
-                summary_parts.append(disp)
-            cmd_parts.append(f"`delegate note {rid} --done`")
-        items_str = "、".join(summary_parts)
-        cmds_str = "、".join(cmd_parts[:3])
-        reasons.append(
-            f"有未完成的合入后待办（{items_str}）：处理完请执行 {cmds_str}（多条指定序号或 `--all`）再结束回合。"
+            "现在就合（delegate apply），或合不了就执行 `delegate work defer <run> --reason \"…\" --until 4h` 再结束回合。"
         )
 
     if not reasons:
         return None
-    return {"decision": "block", "reason": "\n".join(reasons)}
+    return {"decision": "block", "reason": "\n".join(reasons[:8])}
 
 
 def main() -> int:

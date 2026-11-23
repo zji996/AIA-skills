@@ -707,6 +707,7 @@ pub fn finish_run(run: &std::path::Path, mut summary: serde_json::Value, code: i
     crate::history::record_finish(run);
     crate::board::refresh_for_run(run);
     crate::events::emit_run_finished(run, &meta, &summary);
+    crate::work::on_run_finished(run, &meta, &summary);
     crate::dag_queue::advance();
     Ok(())
 }

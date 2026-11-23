@@ -728,12 +728,120 @@ pub(crate) fn prepare_ro_workspace(top: &Path, tree: &str, dest: &Path, scratch:
     res
 }
 
-pub(crate) fn dir_manifest(root: &Path) -> Res<BTreeMap<String, String>> {
-    fn visit(root: &Path, path: &Path, out: &mut BTreeMap<String, String>) -> Res<()> {
+const RO_IGNORED_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    ".venv",
+    "__pycache__",
+    "dist",
+    "test-results",
+];
+
+fn has_ro_ignored_component(path: &str) -> bool {
+    path.split('/').any(|seg| RO_IGNORED_DIRS.contains(&seg))
+}
+
+fn git_tracked_files(top: &Path) -> BTreeSet<String> {
+    if !top.is_dir() {
+        return BTreeSet::new();
+    }
+    let Ok(bytes) = git(top, &["ls-files", "-z"]) else {
+        return BTreeSet::new();
+    };
+    bytes
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
+}
+
+fn git_ignored_paths(top: &Path, candidates: &[String]) -> BTreeSet<String> {
+    if candidates.is_empty() || !top.is_dir() {
+        return BTreeSet::new();
+    }
+    let Ok(mut child) = git_command()
+        .arg("-C")
+        .arg(top)
+        .args(["check-ignore", "--no-index", "-z", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return BTreeSet::new();
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(candidates.join("\0").as_bytes());
+    }
+    let Ok(out) = child.wait_with_output() else {
+        return BTreeSet::new();
+    };
+    out.stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
+}
+
+/// Filter candidate changed paths for a read-only reviewer/scout:
+/// - Always flag git-tracked files.
+/// - Exclude untracked dependency/build paths (`node_modules`, `target`, `.venv`,
+///   `__pycache__`, `dist`, `test-results`) and paths ignored by `.gitignore`.
+/// - Flag unignored new/modified files.
+pub(crate) fn filter_ro_violations(top: &Path, paths: Vec<String>) -> Vec<String> {
+    if paths.is_empty() {
+        return paths;
+    }
+    let tracked = git_tracked_files(top);
+    let mut violations = BTreeSet::new();
+    let mut untracked = Vec::new();
+    for p in paths {
+        let norm = p.trim_start_matches("./").to_string();
+        if norm.is_empty() {
+            continue;
+        }
+        if tracked.contains(&norm) {
+            violations.insert(norm);
+        } else if !has_ro_ignored_component(&norm) {
+            untracked.push(norm);
+        }
+    }
+    let ignored = git_ignored_paths(top, &untracked);
+    for p in untracked {
+        if !ignored.contains(&p) {
+            violations.insert(p);
+        }
+    }
+    violations.into_iter().collect()
+}
+
+pub(crate) fn dir_manifest_for_repo(root: &Path, top: &Path) -> Res<BTreeMap<String, String>> {
+    let tracked = git_tracked_files(top);
+    fn visit(
+        root: &Path,
+        path: &Path,
+        tracked: &BTreeSet<String>,
+        out: &mut BTreeMap<String, String>,
+    ) -> Res<()> {
         let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
         if meta.is_dir() {
+            if path != root {
+                let rel = path
+                    .strip_prefix(root)
+                    .map_err(|e| e.to_string())?
+                    .to_string_lossy()
+                    .into_owned();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if RO_IGNORED_DIRS.contains(&name) {
+                    let prefix = format!("{rel}/");
+                    if !tracked.iter().any(|t| t.starts_with(&prefix)) {
+                        return Ok(());
+                    }
+                }
+            }
             for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
-                visit(root, &entry.map_err(|e| e.to_string())?.path(), out)?;
+                visit(root, &entry.map_err(|e| e.to_string())?.path(), tracked, out)?;
             }
         } else {
             let rel = path
@@ -760,7 +868,7 @@ pub(crate) fn dir_manifest(root: &Path) -> Res<BTreeMap<String, String>> {
     }
     let mut out = BTreeMap::new();
     if root.is_dir() {
-        visit(root, root, &mut out)?;
+        visit(root, root, &tracked, &mut out)?;
     }
     Ok(out)
 }
@@ -1163,7 +1271,7 @@ pub fn run_if_applicable(
             && !after_tree.is_empty()
         {
             prepare_ro_workspace(&top, &after_tree, &ro_workspace, &round_dir)?;
-            let manifest = dir_manifest(&ro_workspace)?;
+            let manifest = dir_manifest_for_repo(&ro_workspace, &top)?;
             (ro_workspace.clone(), None, Some(manifest))
         } else {
             let snap = if top.is_dir() {
@@ -1192,9 +1300,10 @@ pub fn run_if_applicable(
             end_group(rev_pgid, 1.0);
         }
 
-        // Verify reviewer did not modify any files.
-        let ro_violations: Vec<String> = if let Some(before_m) = before_agy_manifest {
-            let after_m = dir_manifest(&ro_workspace).unwrap_or_default();
+        // Verify reviewer did not modify any git-tracked or unignored files
+        // (dependency/build dirs and .gitignore-ignored paths are excluded).
+        let raw_ro_violations: Vec<String> = if let Some(before_m) = before_agy_manifest {
+            let after_m = dir_manifest_for_repo(&ro_workspace, &top).unwrap_or_default();
             diff_manifests(&before_m, &after_m)
         } else if let Some(before_s) = before_pi_snap {
             if let Some(after_s) = changes::snapshot(&top, &round_dir, &excludes) {
@@ -1213,6 +1322,7 @@ pub fn run_if_applicable(
         } else {
             Vec::new()
         };
+        let ro_violations = filter_ro_violations(&top, raw_ro_violations);
 
         if let Some(cont) = find_session_continuation(&round_dir, &review_meta) {
             prev_review_continuation = Some(cont);
@@ -1744,5 +1854,87 @@ mod tests {
         assert!(validate_controller_review_paths(Some(&json!(["skills/*/SKILL.md"]))).is_ok());
         assert!(validate_controller_review_paths(Some(&json!([""]))).is_err());
         assert!(validate_controller_review_paths(Some(&json!("skills/*"))).is_err());
+    }
+
+    #[test]
+    fn ro_guard_excludes_dep_build_and_gitignore_but_flags_tracked_and_unignored() {
+        let base = std::env::temp_dir().join(format!(
+            "delegate-review-ro-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let repo = base.join("repo");
+        let ro_ws = base.join("ro-ws");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(repo.join("dist")).unwrap();
+        fs::write(repo.join(".gitignore"), "*.log\ncustom-cache/\n").unwrap();
+        fs::write(repo.join("src/app.ts"), "export const v = 1;\n").unwrap();
+        fs::write(repo.join("dist/tracked.js"), "console.log('tracked');\n").unwrap();
+
+        let run_git = |args: &[&str]| {
+            let out = git_command()
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["add", "-f", ".gitignore", "src/app.ts", "dist/tracked.js"]);
+        run_git(&["commit", "-qm", "init"]);
+
+        let head_tree = git_text(&repo, &["rev-parse", "HEAD^{tree}"]).unwrap();
+        prepare_ro_workspace(&repo, &head_tree, &ro_ws, &base).unwrap();
+        let before = dir_manifest_for_repo(&ro_ws, &repo).unwrap();
+
+        // Simulate reviewer running pnpm/cargo/pytest creating dep/build/ignored outputs
+        fs::create_dir_all(ro_ws.join("apps/web/node_modules/pkg")).unwrap();
+        fs::write(ro_ws.join("apps/web/node_modules/pkg/index.js"), "module.exports = {};").unwrap();
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(
+                ro_ws.join("apps/web/node_modules/pkg"),
+                ro_ws.join("apps/web/node_modules/pkg-link"),
+            );
+        }
+        fs::create_dir_all(ro_ws.join("target/debug")).unwrap();
+        fs::write(ro_ws.join("target/debug/bin"), "elf").unwrap();
+        fs::create_dir_all(ro_ws.join(".venv/lib")).unwrap();
+        fs::write(ro_ws.join(".venv/lib/site.py"), "").unwrap();
+        fs::create_dir_all(ro_ws.join("pkg/__pycache__")).unwrap();
+        fs::write(ro_ws.join("pkg/__pycache__/a.pyc"), "pyc").unwrap();
+        fs::write(ro_ws.join("dist/bundle.js"), "untracked dist").unwrap();
+        fs::create_dir_all(ro_ws.join("test-results")).unwrap();
+        fs::write(ro_ws.join("test-results/shot.png"), "png").unwrap();
+        fs::write(ro_ws.join("run.log"), "ignored by gitignore").unwrap();
+        fs::create_dir_all(ro_ws.join("custom-cache")).unwrap();
+        fs::write(ro_ws.join("custom-cache/item.bin"), "ignored dir").unwrap();
+
+        let after_clean = dir_manifest_for_repo(&ro_ws, &repo).unwrap();
+        let clean_violations = filter_ro_violations(&repo, diff_manifests(&before, &after_clean));
+        assert!(
+            clean_violations.is_empty(),
+            "dep/build/ignored files must not be violations: {clean_violations:?}"
+        );
+
+        // Now modify a tracked file (even under dist/), modify src/app.ts, and add an unignored new file
+        fs::write(ro_ws.join("src/app.ts"), "export const v = 2;\n").unwrap();
+        fs::write(ro_ws.join("dist/tracked.js"), "console.log('tampered');\n").unwrap();
+        fs::write(ro_ws.join("src/new_unignored.ts"), "export const x = 1;\n").unwrap();
+
+        let after_dirty = dir_manifest_for_repo(&ro_ws, &repo).unwrap();
+        let violations = filter_ro_violations(&repo, diff_manifests(&before, &after_dirty));
+        assert_eq!(
+            violations,
+            vec![
+                "dist/tracked.js".to_string(),
+                "src/app.ts".to_string(),
+                "src/new_unignored.ts".to_string(),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

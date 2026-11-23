@@ -1866,6 +1866,9 @@ pub fn command(args: &[String]) -> Res<i32> {
     } else {
         print!("{report_md}");
         println!("报告文件：{}", report_path.display());
+        for hint in crate::work::hints_for_merge(&merge_run_id, &report) {
+            println!("{hint}");
+        }
     }
 
     Ok(if final_state == "delivered" { 0 } else { 1 })
