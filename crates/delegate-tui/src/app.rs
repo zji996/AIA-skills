@@ -19,6 +19,48 @@ pub enum ViewTab {
     Events,
     Merges,
     Candidates,
+    Work,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkFilterMode {
+    All,
+    OwnerOnly,
+    DroppedOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WorkFoldKind {
+    Done,
+    Dropped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkRow {
+    GroupHeader {
+        bucket: WorkBucket,
+        count: usize,
+    },
+    Item {
+        work_idx: usize,
+        depth: usize,
+        /// For each ancestor level 0..depth-1, true if a vertical guide `│` continues downward.
+        branch_guides: Vec<bool>,
+        is_last_sibling: bool,
+        /// Number of additional prerequisites beyond the parent this item is attached to.
+        extra_deps: usize,
+    },
+    FoldToggle {
+        kind: WorkFoldKind,
+        count: usize,
+        expanded: bool,
+    },
+}
+
+impl WorkRow {
+    pub fn is_selectable(&self) -> bool {
+        matches!(self, WorkRow::Item { .. } | WorkRow::FoldToggle { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +101,10 @@ pub enum Overlay {
         action_label: String,
         command: String,
         note: String,
+    },
+    WorkCard {
+        work_id: String,
+        scroll: usize,
     },
     Help,
 }
@@ -149,6 +195,12 @@ pub struct App {
     pub filtered_candidates: Vec<usize>,
     pub selected_candidate: Option<usize>,
     pub candidates_scroll: usize,
+    pub work_rows: Vec<WorkRow>,
+    pub selected_work_row: Option<usize>,
+    pub work_scroll_line: usize,
+    pub work_filter_mode: WorkFilterMode,
+    pub work_done_expanded: bool,
+    pub work_dropped_expanded: bool,
     pub filter: String,
     pub filter_mode: bool,
     pub expanded_folds: HashSet<(PathBuf, CollapseKind)>,
@@ -190,6 +242,12 @@ impl App {
             filtered_candidates: Vec::new(),
             selected_candidate: None,
             candidates_scroll: 0,
+            work_rows: Vec::new(),
+            selected_work_row: None,
+            work_scroll_line: 0,
+            work_filter_mode: WorkFilterMode::All,
+            work_done_expanded: false,
+            work_dropped_expanded: false,
             filter: String::new(),
             filter_mode: false,
             expanded_folds: HashSet::new(),
@@ -528,6 +586,495 @@ impl App {
         if self.selected_row.is_none() {
             self.list_scroll = 0;
         }
+
+        self.rebuild_work_rows(None);
+    }
+
+    pub fn selected_work_item(&self) -> Option<&WorkItem> {
+        let row_idx = self.selected_work_row?;
+        match self.work_rows.get(row_idx)? {
+            WorkRow::Item { work_idx, .. } => self.snapshot.work.get(*work_idx),
+            _ => None,
+        }
+    }
+
+    fn current_work_selection_id(&self) -> Option<String> {
+        let row_idx = self.selected_work_row?;
+        match self.work_rows.get(row_idx)? {
+            WorkRow::Item { work_idx, .. } => {
+                self.snapshot.work.get(*work_idx).map(|w| w.id.clone())
+            }
+            WorkRow::FoldToggle { kind, .. } => Some(match kind {
+                WorkFoldKind::Done => "__fold_done__".to_string(),
+                WorkFoldKind::Dropped => "__fold_dropped__".to_string(),
+            }),
+            WorkRow::GroupHeader { .. } => None,
+        }
+    }
+
+    /// Rebuild the L1 Work View row list with status grouping, owner pinning,
+    /// dependency chain indentation (`work_closed` / `run_applied`), and folded done/dropped sections.
+    pub fn rebuild_work_rows(&mut self, preserve_id: Option<String>) {
+        let prev_id = preserve_id.or_else(|| self.current_work_selection_id());
+        let query = self.filter.trim().to_lowercase();
+        let filtering = !query.is_empty();
+        let mode = self.work_filter_mode;
+
+        let visible_indices: Vec<usize> = self
+            .snapshot
+            .work
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| {
+                let mode_ok = match mode {
+                    WorkFilterMode::All => true,
+                    WorkFilterMode::OwnerOnly => w.owner.is_some(),
+                    WorkFilterMode::DroppedOnly => {
+                        w.state == "done" && w.closed_kind == "dropped"
+                    }
+                };
+                mode_ok && w.matches_filter(&query)
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        let mut rows = Vec::new();
+
+        if mode == WorkFilterMode::DroppedOnly {
+            let mut dropped: Vec<usize> = visible_indices;
+            dropped.sort_by(|&a, &b| {
+                let wa = &self.snapshot.work[a];
+                let wb = &self.snapshot.work[b];
+                wb.owner
+                    .is_some()
+                    .cmp(&wa.owner.is_some())
+                    .then_with(|| wb.updated_at.cmp(&wa.updated_at))
+                    .then_with(|| wa.id.cmp(&wb.id))
+            });
+            if !dropped.is_empty() {
+                rows.push(WorkRow::GroupHeader {
+                    bucket: WorkBucket::Dropped,
+                    count: dropped.len(),
+                });
+                for idx in dropped {
+                    rows.push(WorkRow::Item {
+                        work_idx: idx,
+                        depth: 0,
+                        branch_guides: Vec::new(),
+                        is_last_sibling: true,
+                        extra_deps: 0,
+                    });
+                }
+            }
+            self.finish_work_rows(rows, prev_id);
+            return;
+        }
+
+        // Partition visible indices into Owner (open), Engineering Open, Done, and Dropped.
+        let mut owner_open: Vec<usize> = Vec::new();
+        let mut eng_open: Vec<usize> = Vec::new();
+        let mut done_items: Vec<usize> = Vec::new();
+        let mut dropped_items: Vec<usize> = Vec::new();
+
+        for idx in visible_indices {
+            let w = &self.snapshot.work[idx];
+            match w.bucket() {
+                WorkBucket::Owner => owner_open.push(idx),
+                WorkBucket::Done => done_items.push(idx),
+                WorkBucket::Dropped => dropped_items.push(idx),
+                _ => eng_open.push(idx),
+            }
+        }
+
+        // 1. Owner items pinned at top: 动手 -> 点头 -> 看卡 -> 方向, then ID
+        owner_open.sort_by(|&a, &b| {
+            let wa = &self.snapshot.work[a];
+            let wb = &self.snapshot.work[b];
+            let ka = wa.owner.as_ref().map(|o| o.kind);
+            let kb = wb.owner.as_ref().map(|o| o.kind);
+            ka.cmp(&kb).then_with(|| wa.id.cmp(&wb.id))
+        });
+        if !owner_open.is_empty() {
+            rows.push(WorkRow::GroupHeader {
+                bucket: WorkBucket::Owner,
+                count: owner_open.len(),
+            });
+            for idx in owner_open {
+                rows.push(WorkRow::Item {
+                    work_idx: idx,
+                    depth: 0,
+                    branch_guides: Vec::new(),
+                    is_last_sibling: true,
+                    extra_deps: 0,
+                });
+            }
+        }
+
+        // 2. Engineering open items: build dependency parent links among open engineering items
+        let eng_set: HashSet<usize> = eng_open.iter().copied().collect();
+        let id_to_idx: HashMap<String, usize> = eng_open
+            .iter()
+            .map(|&i| (self.snapshot.work[i].id.clone(), i))
+            .collect();
+
+        // Map each engineering item to its first open dependency parent (work_closed or run_applied)
+        let mut parent_of: HashMap<usize, usize> = HashMap::new();
+        let mut extra_deps_of: HashMap<usize, usize> = HashMap::new();
+        let mut children_of: HashMap<usize, Vec<usize>> = HashMap::new();
+
+        for &idx in &eng_open {
+            let w = &self.snapshot.work[idx];
+            let mut first_parent: Option<usize> = None;
+            let mut dep_count: usize = 0;
+            for cond in &w.wait_on {
+                if let Some(wid) = cond.strip_prefix("work_closed:") {
+                    dep_count += 1;
+                    if first_parent.is_none() {
+                        let norm = normalize_wid_for_match(wid);
+                        if let Some(&pidx) = id_to_idx.get(&norm) {
+                            if pidx != idx && eng_set.contains(&pidx) {
+                                first_parent = Some(pidx);
+                            }
+                        }
+                    }
+                } else if let Some(run_ref) = cond.strip_prefix("run_applied:") {
+                    dep_count += 1;
+                    if first_parent.is_none() {
+                        if let Some(pidx) = find_work_by_run_ref(&self.snapshot.work, &eng_open, run_ref) {
+                            if pidx != idx {
+                                first_parent = Some(pidx);
+                            }
+                        }
+                    }
+                } else if cond.starts_with("owner:")
+                    || cond.starts_with("run_delivered:")
+                    || cond.starts_with("after_time:")
+                    || cond.starts_with("manual:")
+                {
+                    dep_count += 1;
+                }
+            }
+            if let Some(pidx) = first_parent {
+                let p_bucket = self.snapshot.work[pidx].bucket();
+                let c_bucket = w.bucket();
+                // Attach under parent if parent has >= priority (smaller bucket ordinal) or child is Waiting
+                let can_attach = p_bucket <= c_bucket || c_bucket == WorkBucket::Waiting;
+                if can_attach && !creates_parent_cycle(idx, pidx, &parent_of) {
+                    parent_of.insert(idx, pidx);
+                    extra_deps_of.insert(idx, dep_count.saturating_sub(1));
+                    children_of.entry(pidx).or_default().push(idx);
+                }
+            }
+        }
+
+        let item_sort_key = |idx: usize| -> (WorkBucket, u8, String) {
+            let w = &self.snapshot.work[idx];
+            // Within NeedsAction, put attention before verify
+            let sub = if w.state == "attention" {
+                0
+            } else if w.state == "verify" {
+                1
+            } else {
+                2
+            };
+            (w.bucket(), sub, w.id.clone())
+        };
+
+        for kids in children_of.values_mut() {
+            kids.sort_by_key(|&i| item_sort_key(i));
+        }
+
+        let open_buckets = [
+            WorkBucket::NeedsAction,
+            WorkBucket::InProgress,
+            WorkBucket::Ready,
+            WorkBucket::Waiting,
+            WorkBucket::Deferred,
+        ];
+        let mut emitted: HashSet<usize> = HashSet::new();
+
+        for bucket in open_buckets {
+            let mut roots: Vec<usize> = eng_open
+                .iter()
+                .copied()
+                .filter(|&i| !parent_of.contains_key(&i) && self.snapshot.work[i].bucket() == bucket)
+                .collect();
+            roots.sort_by_key(|&i| item_sort_key(i));
+            if roots.is_empty() {
+                continue;
+            }
+            rows.push(WorkRow::GroupHeader {
+                bucket,
+                count: roots.len(),
+            });
+            for root in roots {
+                emit_work_subtree(
+                    root,
+                    0,
+                    &mut Vec::new(),
+                    true,
+                    &children_of,
+                    &extra_deps_of,
+                    &mut emitted,
+                    &mut rows,
+                );
+            }
+        }
+
+        // Safety net: emit any un-emitted open engineering items (e.g. disconnected cycle)
+        let mut leftover: Vec<usize> = eng_open
+            .iter()
+            .copied()
+            .filter(|i| !emitted.contains(i))
+            .collect();
+        leftover.sort_by_key(|&i| item_sort_key(i));
+        for idx in leftover {
+            rows.push(WorkRow::Item {
+                work_idx: idx,
+                depth: 0,
+                branch_guides: Vec::new(),
+                is_last_sibling: true,
+                extra_deps: 0,
+            });
+        }
+
+        // 3. Folded Done section (newest first; expanded when text-filtering or explicitly toggled)
+        done_items.sort_by(|&a, &b| {
+            let wa = &self.snapshot.work[a];
+            let wb = &self.snapshot.work[b];
+            wb.updated_at
+                .cmp(&wa.updated_at)
+                .then_with(|| wb.id.cmp(&wa.id))
+        });
+        if !done_items.is_empty() {
+            let expanded = self.work_done_expanded || filtering;
+            rows.push(WorkRow::FoldToggle {
+                kind: WorkFoldKind::Done,
+                count: done_items.len(),
+                expanded,
+            });
+            if expanded {
+                for idx in done_items {
+                    rows.push(WorkRow::Item {
+                        work_idx: idx,
+                        depth: 0,
+                        branch_guides: Vec::new(),
+                        is_last_sibling: true,
+                        extra_deps: 0,
+                    });
+                }
+            }
+        }
+
+        // 4. Folded Dropped (已否) section
+        dropped_items.sort_by(|&a, &b| {
+            let wa = &self.snapshot.work[a];
+            let wb = &self.snapshot.work[b];
+            wb.owner
+                .is_some()
+                .cmp(&wa.owner.is_some())
+                .then_with(|| wb.updated_at.cmp(&wa.updated_at))
+                .then_with(|| wb.id.cmp(&wa.id))
+        });
+        if !dropped_items.is_empty() {
+            let expanded = self.work_dropped_expanded || filtering;
+            rows.push(WorkRow::FoldToggle {
+                kind: WorkFoldKind::Dropped,
+                count: dropped_items.len(),
+                expanded,
+            });
+            if expanded {
+                for idx in dropped_items {
+                    rows.push(WorkRow::Item {
+                        work_idx: idx,
+                        depth: 0,
+                        branch_guides: Vec::new(),
+                        is_last_sibling: true,
+                        extra_deps: 0,
+                    });
+                }
+            }
+        }
+
+        self.finish_work_rows(rows, prev_id);
+    }
+
+    fn finish_work_rows(&mut self, rows: Vec<WorkRow>, prev_id: Option<String>) {
+        self.work_rows = rows;
+        let mut next_sel = None;
+        if let Some(ref key) = prev_id {
+            for (i, row) in self.work_rows.iter().enumerate() {
+                match row {
+                    WorkRow::Item { work_idx, .. }
+                        if self.snapshot.work[*work_idx].id == *key =>
+                    {
+                        next_sel = Some(i);
+                        break;
+                    }
+                    WorkRow::FoldToggle {
+                        kind: WorkFoldKind::Done,
+                        ..
+                    } if key == "__fold_done__" => {
+                        next_sel = Some(i);
+                        break;
+                    }
+                    WorkRow::FoldToggle {
+                        kind: WorkFoldKind::Dropped,
+                        ..
+                    } if key == "__fold_dropped__" => {
+                        next_sel = Some(i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if next_sel.is_none() {
+            next_sel = self
+                .work_rows
+                .iter()
+                .position(|r| matches!(r, WorkRow::Item { .. }))
+                .or_else(|| self.work_rows.iter().position(WorkRow::is_selectable));
+        }
+        self.selected_work_row = next_sel;
+        if self.selected_work_row.is_none() {
+            self.work_scroll_line = 0;
+        }
+    }
+
+    pub fn move_work_selection(&mut self, delta: isize) -> bool {
+        let selectable: Vec<usize> = self
+            .work_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| r.is_selectable().then_some(i))
+            .collect();
+        if selectable.is_empty() {
+            self.selected_work_row = None;
+            return false;
+        }
+        let cur_pos = self
+            .selected_work_row
+            .and_then(|sel| selectable.iter().position(|&i| i == sel))
+            .unwrap_or(0);
+        let next_pos = if delta >= 0 {
+            (cur_pos + delta as usize).min(selectable.len() - 1)
+        } else {
+            cur_pos.saturating_sub((-delta) as usize)
+        };
+        let next_row = Some(selectable[next_pos]);
+        if next_row != self.selected_work_row {
+            self.selected_work_row = next_row;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn toggle_selected_work_fold(&mut self) -> bool {
+        let Some(row_idx) = self.selected_work_row else {
+            return false;
+        };
+        let Some(&WorkRow::FoldToggle { kind, .. }) = self.work_rows.get(row_idx) else {
+            return false;
+        };
+        let preserve = match kind {
+            WorkFoldKind::Done => {
+                self.work_done_expanded = !self.work_done_expanded;
+                "__fold_done__".to_string()
+            }
+            WorkFoldKind::Dropped => {
+                self.work_dropped_expanded = !self.work_dropped_expanded;
+                "__fold_dropped__".to_string()
+            }
+        };
+        self.rebuild_work_rows(Some(preserve));
+        self.dirty = true;
+        true
+    }
+
+    /// Jump from a Work item (or open WorkCard) to its linked Run in the Runs view.
+    pub fn jump_to_work_run(&mut self, work_id: Option<&str>) -> bool {
+        let item = match work_id {
+            Some(id) => self.snapshot.work_item_by_id(id).cloned(),
+            None => self.selected_work_item().cloned(),
+        };
+        let Some(item) = item else {
+            self.set_toast("当前没有选中的工作项");
+            return false;
+        };
+        let Some((repo_idx, run_idx, run_ref)) = self.snapshot.find_run_for_work(&item) else {
+            if let Some(last_rid) = item.runs.last() {
+                self.set_toast(format!("关联 run 已清理（delegate show {last_rid}）"));
+            } else {
+                self.set_toast("该工作项暂无关联 run");
+            }
+            return false;
+        };
+        let target_repo = self.snapshot.repos[repo_idx].path.clone();
+        let target_run_id = run_ref.run.clone();
+        let target_group = run_ref.group;
+        let is_stale = run_ref.is_stale_pending();
+
+        // Ensure the run is not hidden inside a collapsed fold or filter
+        if !self.filter.is_empty() && !run_ref.matches_filter(&self.filter.trim().to_lowercase()) {
+            self.filter.clear();
+        }
+        match target_group {
+            GroupKind::MergedUncleaned => {
+                self.expanded_folds
+                    .insert((target_repo.clone(), CollapseKind::MergedUncleaned));
+            }
+            GroupKind::Stopped => {
+                self.expanded_folds
+                    .insert((target_repo.clone(), CollapseKind::Stopped));
+            }
+            GroupKind::Pending if is_stale => {
+                self.expanded_folds
+                    .insert((target_repo.clone(), CollapseKind::StalePending));
+            }
+            _ => {}
+        }
+        self.rebuild_rows_inner(Some(SelectionKey::Run(
+            target_repo.clone(),
+            target_run_id.clone(),
+        )));
+        if let Some(pos) = self.rows.iter().position(|r| {
+            matches!(
+                r,
+                ListRow::Run {
+                    repo_idx: ri,
+                    run_idx: rj
+                } if *ri == repo_idx && *rj == run_idx
+            )
+        }) {
+            self.selected_row = Some(pos);
+        }
+        self.overlay = Overlay::None;
+        self.tab = ViewTab::Runs;
+        self.focus = FocusPane::List;
+        self.detail_scroll = 0;
+        self.dirty = true;
+        true
+    }
+
+    /// Jump to a specific work item ID in the Work tab (expanding done/dropped folds if needed).
+    pub fn jump_to_work_id(&mut self, work_id: &str) -> bool {
+        let Some(item) = self.snapshot.work_item_by_id(work_id).cloned() else {
+            return false;
+        };
+        if item.state == "done" {
+            if item.closed_kind == "dropped" {
+                self.work_dropped_expanded = true;
+            } else {
+                self.work_done_expanded = true;
+            }
+        }
+        self.work_filter_mode = WorkFilterMode::All;
+        self.rebuild_work_rows(Some(work_id.to_string()));
+        self.tab = ViewTab::Work;
+        self.dirty = true;
+        true
     }
 
     pub fn toggle_selected_fold(&mut self) -> bool {
@@ -870,6 +1417,70 @@ impl App {
                     _ => AppAction::None,
                 }
             }
+            Overlay::WorkCard { work_id, scroll } => {
+                let wid = work_id.clone();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Left => {
+                        self.overlay = Overlay::None;
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        *scroll = scroll.saturating_add(1);
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        *scroll = scroll.saturating_sub(1);
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                    KeyCode::PageDown | KeyCode::Char(' ') => {
+                        *scroll = scroll.saturating_add(12);
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                    KeyCode::PageUp => {
+                        *scroll = scroll.saturating_sub(12);
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => {
+                        *scroll = 0;
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                    KeyCode::End | KeyCode::Char('G') => {
+                        *scroll = usize::MAX / 2;
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                    KeyCode::Char('t') | KeyCode::Right => {
+                        if self.jump_to_work_run(Some(&wid)) {
+                            if self.needs_selected_result() {
+                                AppAction::LoadSelectedResult
+                            } else {
+                                AppAction::Redraw
+                            }
+                        } else {
+                            AppAction::Redraw
+                        }
+                    }
+                    KeyCode::Char('y') => {
+                        let cmd = self
+                            .snapshot
+                            .work_item_by_id(&wid)
+                            .map(|w| build_work_next_command(&self.delegate_bin, &self.cwd, w))
+                            .unwrap_or_default();
+                        if cmd.is_empty() {
+                            AppAction::None
+                        } else {
+                            AppAction::CopyClipboard(cmd)
+                        }
+                    }
+                    _ => AppAction::None,
+                }
+            }
         }
     }
 
@@ -950,6 +1561,37 @@ impl App {
                 }
                 return AppAction::None;
             }
+            KeyCode::Char('5') => {
+                if self.tab != ViewTab::Work {
+                    self.tab = ViewTab::Work;
+                    self.detail_scroll = 0;
+                    self.dirty = true;
+                    return AppAction::Redraw;
+                }
+                return AppAction::None;
+            }
+            KeyCode::Char('w') => {
+                if self.tab == ViewTab::Work {
+                    self.tab = ViewTab::Runs;
+                    self.detail_scroll = 0;
+                    self.dirty = true;
+                    return AppAction::Redraw;
+                } else {
+                    if self.tab == ViewTab::Runs {
+                        if let Some(run) = self.selected_run().cloned() {
+                            if let Some(wid) = self.snapshot.work_id_for_run(&run) {
+                                if self.jump_to_work_id(&wid) {
+                                    return AppAction::Redraw;
+                                }
+                            }
+                        }
+                    }
+                    self.tab = ViewTab::Work;
+                    self.detail_scroll = 0;
+                    self.dirty = true;
+                    return AppAction::Redraw;
+                }
+            }
             KeyCode::Char('e') => {
                 self.tab = if self.tab == ViewTab::Events {
                     ViewTab::Runs
@@ -990,6 +1632,150 @@ impl App {
                 return AppAction::Redraw;
             }
             _ => {}
+        }
+
+        if self.tab == ViewTab::Work {
+            return match key.code {
+                KeyCode::Char('q') => AppAction::Quit,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.move_work_selection(1) {
+                        self.dirty = true;
+                        AppAction::Redraw
+                    } else {
+                        AppAction::None
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.move_work_selection(-1) {
+                        self.dirty = true;
+                        AppAction::Redraw
+                    } else {
+                        AppAction::None
+                    }
+                }
+                KeyCode::PageDown => {
+                    if self.move_work_selection(10) {
+                        self.dirty = true;
+                        AppAction::Redraw
+                    } else {
+                        AppAction::None
+                    }
+                }
+                KeyCode::PageUp => {
+                    if self.move_work_selection(-10) {
+                        self.dirty = true;
+                        AppAction::Redraw
+                    } else {
+                        AppAction::None
+                    }
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    let first = self.work_rows.iter().position(WorkRow::is_selectable);
+                    if first != self.selected_work_row {
+                        self.selected_work_row = first;
+                        self.dirty = true;
+                        AppAction::Redraw
+                    } else {
+                        AppAction::None
+                    }
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    let last = self.work_rows.iter().rposition(WorkRow::is_selectable);
+                    if last != self.selected_work_row {
+                        self.selected_work_row = last;
+                        self.dirty = true;
+                        AppAction::Redraw
+                    } else {
+                        AppAction::None
+                    }
+                }
+                KeyCode::Enter => {
+                    if self.toggle_selected_work_fold() {
+                        AppAction::Redraw
+                    } else if let Some(w) = self.selected_work_item().cloned() {
+                        self.overlay = Overlay::WorkCard {
+                            work_id: w.id,
+                            scroll: 0,
+                        };
+                        self.dirty = true;
+                        AppAction::Redraw
+                    } else {
+                        AppAction::None
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if self.toggle_selected_work_fold() {
+                        AppAction::Redraw
+                    } else {
+                        AppAction::None
+                    }
+                }
+                KeyCode::Char('t') | KeyCode::Right => {
+                    if self.jump_to_work_run(None) {
+                        if self.needs_selected_result() {
+                            AppAction::LoadSelectedResult
+                        } else {
+                            AppAction::Redraw
+                        }
+                    } else {
+                        AppAction::Redraw
+                    }
+                }
+                KeyCode::Char('o') => {
+                    self.work_filter_mode = if self.work_filter_mode == WorkFilterMode::OwnerOnly {
+                        WorkFilterMode::All
+                    } else {
+                        WorkFilterMode::OwnerOnly
+                    };
+                    self.work_scroll_line = 0;
+                    self.rebuild_work_rows(None);
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                KeyCode::Char('x') => {
+                    self.work_filter_mode =
+                        if self.work_filter_mode == WorkFilterMode::DroppedOnly {
+                            WorkFilterMode::All
+                        } else {
+                            WorkFilterMode::DroppedOnly
+                        };
+                    self.work_scroll_line = 0;
+                    self.rebuild_work_rows(None);
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                KeyCode::Char('y') => {
+                    if let Some(w) = self.selected_work_item().cloned() {
+                        let cmd = build_work_next_command(&self.delegate_bin, &self.cwd, &w);
+                        AppAction::CopyClipboard(cmd)
+                    } else {
+                        AppAction::None
+                    }
+                }
+                KeyCode::Char('r') => AppAction::Refresh,
+                KeyCode::Char('/') => {
+                    self.filter_mode = true;
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                KeyCode::Esc => {
+                    if !self.filter.is_empty() || self.work_filter_mode != WorkFilterMode::All {
+                        self.filter.clear();
+                        self.work_filter_mode = WorkFilterMode::All;
+                        self.rebuild_rows(None);
+                        self.dirty = true;
+                        AppAction::Redraw
+                    } else {
+                        AppAction::None
+                    }
+                }
+                KeyCode::Char('?') => {
+                    self.overlay = Overlay::Help;
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                _ => AppAction::None,
+            };
         }
 
         if matches!(self.tab, ViewTab::Merges | ViewTab::Candidates) {
@@ -1732,4 +2518,134 @@ fn base64_encode(input: &[u8]) -> String {
         }
     }
     out
+}
+
+fn normalize_wid_for_match(raw: &str) -> String {
+    let t = raw.trim();
+    for (up, low, pad) in [('W', 'w', 3usize), ('Q', 'q', 2usize), ('D', 'd', 3usize)] {
+        if let Some(rest) = t.strip_prefix(up).or_else(|| t.strip_prefix(low)) {
+            if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+                if let Ok(n) = rest.parse::<u64>() {
+                    return format!("{up}{n:0pad$}");
+                }
+            }
+        }
+    }
+    t.to_string()
+}
+
+fn find_work_by_run_ref(work: &[WorkItem], candidates: &[usize], run_ref: &str) -> Option<usize> {
+    let needle = run_ref.trim();
+    if needle.is_empty() {
+        return None;
+    }
+    // Exact match first, then unique suffix/contains match (e.g. short run slug)
+    for &idx in candidates {
+        if work[idx].runs.iter().any(|r| r == needle) {
+            return Some(idx);
+        }
+    }
+    candidates
+        .iter()
+        .find(|&&idx| {
+            work[idx]
+                .runs
+                .iter()
+                .any(|r| r.ends_with(needle) || r.contains(needle))
+        })
+        .copied()
+}
+
+fn creates_parent_cycle(
+    child: usize,
+    proposed_parent: usize,
+    parent_of: &HashMap<usize, usize>,
+) -> bool {
+    let mut cur = Some(proposed_parent);
+    let mut steps = 0usize;
+    while let Some(node) = cur {
+        if node == child {
+            return true;
+        }
+        steps += 1;
+        if steps > parent_of.len() + 2 {
+            return true;
+        }
+        cur = parent_of.get(&node).copied();
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_work_subtree(
+    idx: usize,
+    depth: usize,
+    guides: &mut Vec<bool>,
+    is_last_sibling: bool,
+    children_of: &HashMap<usize, Vec<usize>>,
+    extra_deps_of: &HashMap<usize, usize>,
+    emitted: &mut HashSet<usize>,
+    rows: &mut Vec<WorkRow>,
+) {
+    if !emitted.insert(idx) {
+        return;
+    }
+    let extra_deps = extra_deps_of.get(&idx).copied().unwrap_or(0);
+    rows.push(WorkRow::Item {
+        work_idx: idx,
+        depth,
+        branch_guides: guides.clone(),
+        is_last_sibling,
+        extra_deps,
+    });
+    if let Some(kids) = children_of.get(&idx) {
+        let len = kids.len();
+        for (pos, &kid) in kids.iter().enumerate() {
+            let kid_last = pos + 1 == len;
+            if depth > 0 {
+                guides.push(!is_last_sibling);
+            }
+            emit_work_subtree(
+                kid,
+                depth + 1,
+                guides,
+                kid_last,
+                children_of,
+                extra_deps_of,
+                emitted,
+                rows,
+            );
+            if depth > 0 {
+                guides.pop();
+            }
+        }
+    }
+}
+
+pub fn build_work_next_command(delegate_bin: &Path, cwd: &Path, w: &WorkItem) -> String {
+    let bin = shell_quote(&delegate_bin.to_string_lossy());
+    let next = if w.next.is_empty() {
+        format!("work show {}", w.id)
+    } else {
+        w.next.clone()
+    };
+    let cmd = if let Some(stripped) = next.strip_prefix("delegate ") {
+        format!("{bin} {stripped}")
+    } else if next.starts_with("work ")
+        || next.starts_with("start ")
+        || next.starts_with("apply ")
+        || next.starts_with("reply ")
+        || next.starts_with("result ")
+        || next.starts_with("status ")
+        || next.starts_with("wait")
+    {
+        format!("{bin} {next}")
+    } else {
+        format!("{bin} work show {}", w.id)
+    };
+    if w.repo.is_empty() {
+        cmd
+    } else {
+        format_repo_cmd(cwd, Path::new(&w.repo), &cmd)
+    }
 }

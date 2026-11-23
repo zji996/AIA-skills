@@ -22,6 +22,73 @@ pub const STATES: [&str; 7] = [
     "done",
 ];
 
+pub const OWNER_KINDS: [&str; 4] = ["act", "nod", "card", "direction"];
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OwnerInfo {
+    pub kind: String,
+    pub ask: String,
+    pub recommendation: String,
+    pub if_undecided: String,
+    pub cost: String,
+}
+
+impl OwnerInfo {
+    pub fn kind_label(kind: &str) -> &'static str {
+        match kind {
+            "act" => "动手",
+            "nod" => "点头",
+            "card" => "看卡",
+            "direction" => "方向",
+            _ => "其他",
+        }
+    }
+
+    pub fn kind_priority(kind: &str) -> u8 {
+        match kind {
+            "act" => 0,
+            "nod" => 1,
+            "card" => 2,
+            "direction" => 3,
+            _ => 4,
+        }
+    }
+
+    fn from_value(v: &Value) -> Option<Self> {
+        if !v.is_object() {
+            return None;
+        }
+        let kind = s(v, "kind").trim().to_string();
+        if !OWNER_KINDS.contains(&kind.as_str()) {
+            return None;
+        }
+        Some(Self {
+            kind,
+            ask: s(v, "ask").to_string(),
+            recommendation: s(v, "recommendation").to_string(),
+            if_undecided: s(v, "ifUndecided").to_string(),
+            cost: s(v, "cost").to_string(),
+        })
+    }
+
+    fn to_json(&self) -> Value {
+        let mut obj = json!({
+            "kind": self.kind,
+            "ask": self.ask,
+        });
+        if !self.recommendation.is_empty() {
+            obj["recommendation"] = json!(self.recommendation);
+        }
+        if !self.if_undecided.is_empty() {
+            obj["ifUndecided"] = json!(self.if_undecided);
+        }
+        if !self.cost.is_empty() {
+            obj["cost"] = json!(self.cost);
+        }
+        obj
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FollowupItem {
     pub id: usize,
@@ -196,6 +263,7 @@ pub struct WorkItem {
     pub artifacts: Vec<ArtifactItem>,
     pub brief: String,
     pub followups: Vec<FollowupItem>,
+    pub owner: Option<OwnerInfo>,
     pub owner_ref: String,
     pub defer_reason: String,
     pub defer_until: String,
@@ -334,6 +402,7 @@ impl WorkItem {
             artifacts,
             brief: s(v, "brief").to_string(),
             followups,
+            owner: OwnerInfo::from_value(&v["owner"]),
             owner_ref: s(v, "ownerRef").to_string(),
             defer_reason: s(v, "deferReason").to_string(),
             defer_until: s(v, "deferUntil").to_string(),
@@ -381,6 +450,9 @@ impl WorkItem {
         }
         if !self.brief.is_empty() {
             obj["brief"] = json!(self.brief);
+        }
+        if let Some(ow) = &self.owner {
+            obj["owner"] = ow.to_json();
         }
         if !self.owner_ref.is_empty() {
             obj["ownerRef"] = json!(self.owner_ref);
@@ -455,17 +527,53 @@ pub fn current_repo_str() -> String {
     String::new()
 }
 
-fn parse_work_num(id: &str) -> Option<u64> {
-    let rest = id.strip_prefix('W').or_else(|| id.strip_prefix('w'))?;
+fn parse_prefixed_num(id: &str, upper: char, lower: char) -> Option<u64> {
+    let rest = id.strip_prefix(upper).or_else(|| id.strip_prefix(lower))?;
     if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     rest.parse::<u64>().ok()
 }
 
+fn parse_work_num(id: &str) -> Option<u64> {
+    parse_prefixed_num(id, 'W', 'w')
+}
+
 pub fn normalize_work_id(raw: &str) -> Option<String> {
-    let n = parse_work_num(raw.trim())?;
-    Some(format!("W{n:03}"))
+    let t = raw.trim();
+    if let Some(n) = parse_prefixed_num(t, 'W', 'w') {
+        return Some(format!("W{n:03}"));
+    }
+    if let Some(n) = parse_prefixed_num(t, 'Q', 'q') {
+        return Some(format!("Q{n:02}"));
+    }
+    if let Some(n) = parse_prefixed_num(t, 'D', 'd') {
+        return Some(format!("D{n:03}"));
+    }
+    None
+}
+
+fn is_owner_id(id: &str) -> bool {
+    let t = id.trim();
+    parse_prefixed_num(t, 'Q', 'q').is_some() || parse_prefixed_num(t, 'D', 'd').is_some()
+}
+
+fn next_owner_id(items: &[WorkItem], kind: &str) -> String {
+    if kind == "direction" {
+        let max_d = items
+            .iter()
+            .filter_map(|it| parse_prefixed_num(&it.id, 'D', 'd'))
+            .max()
+            .unwrap_or(0);
+        format!("D{:03}", max_d.saturating_add(1))
+    } else {
+        let max_q = items
+            .iter()
+            .filter_map(|it| parse_prefixed_num(&it.id, 'Q', 'q'))
+            .max()
+            .unwrap_or(0);
+        format!("Q{:02}", max_q.saturating_add(1))
+    }
 }
 
 fn next_id_impl(state: &Path, items: &[WorkItem], persist: bool) -> String {
@@ -1217,6 +1325,37 @@ pub fn evaluate_condition(
         };
     }
     if let Some(oref) = cond.strip_prefix("owner:") {
+        let trimmed = oref.trim();
+        let norm = normalize_work_id(trimmed).unwrap_or_else(|| trimmed.to_string());
+        if let Some(owner_item) = all_items
+            .iter()
+            .find(|w| w.id == norm || w.id.eq_ignore_ascii_case(trimmed))
+        {
+            let (ok, detail) = if owner_item.state == "done" && owner_item.closed_kind != "dropped" {
+                if owner_item.close_evidence.is_empty() {
+                    (true, format!("所有者 {} 已定", owner_item.id))
+                } else {
+                    (
+                        true,
+                        format!(
+                            "所有者 {} 已定：{}",
+                            owner_item.id,
+                            clip_chars(&owner_item.close_evidence, 22)
+                        ),
+                    )
+                }
+            } else if owner_item.state == "done" && owner_item.closed_kind == "dropped" {
+                (false, format!("所有者 {} 已否（需人工确认）", owner_item.id))
+            } else {
+                (false, format!("等所有者 {}", owner_item.id))
+            };
+            return CondEval {
+                raw: cond.to_string(),
+                satisfied: ok,
+                detail,
+                pointer: format!("delegate work show {}", owner_item.id),
+            };
+        }
         let repo_path = if item.repo.is_empty() {
             PathBuf::from(current_repo_str())
         } else {
@@ -1227,7 +1366,7 @@ pub fn evaluate_condition(
             OwnerStatus::Waiting => (false, format!("等所有者 {oref}")),
             OwnerStatus::Resolved => (true, format!("所有者 {oref} 已拍板/移出案头")),
             OwnerStatus::Rejected => (true, format!("所有者 {oref} 已否")),
-            OwnerStatus::MissingFile => (false, format!("等所有者 {oref}（未找到 docs/owner/README.md）")),
+            OwnerStatus::MissingFile => (false, format!("等所有者 {oref}（未找到工作项或 docs/owner/README.md）")),
         };
         return CondEval {
             raw: cond.to_string(),
@@ -1397,7 +1536,17 @@ fn reconcile_all_locked(state: &Path, items: &mut [WorkItem]) -> ReconcileOutcom
             }
             // All `wait_on` satisfied!
             if item.state == "blocked" {
-                if item
+                if let Some(ow) = &item.owner {
+                    let target_st = if ow.kind == "direction" {
+                        "active"
+                    } else {
+                        "attention"
+                    };
+                    if item.set_state(target_st, &now_iso) {
+                        out.changed = true;
+                    }
+                    out.unlocked_ready.push(item.clone());
+                } else if item
                     .auto_dispatch
                     .as_ref()
                     .is_some_and(|ad| ad.dispatched_run.is_empty())
@@ -1417,6 +1566,19 @@ fn reconcile_all_locked(state: &Path, items: &mut [WorkItem]) -> ReconcileOutcom
         }
 
         // 4. If item fell out of deferred or active without an active/attention run:
+        if let Some(ow) = &item.owner {
+            if item.state == "deferred" {
+                let target_st = if ow.kind == "direction" {
+                    "active"
+                } else {
+                    "attention"
+                };
+                if item.set_state(target_st, &now_iso) {
+                    out.changed = true;
+                }
+            }
+            continue;
+        }
         if item.state == "deferred" || item.state == "active" {
             let next_st = if item.has_open_closure() && (item.applied || item.cleaned || !item.runs.is_empty()) {
                 "verify"
@@ -1656,6 +1818,21 @@ pub fn load_readonly_json(state: &Path) -> Vec<Value> {
             obj["repoLabel"] = json!(w.repo_label());
             obj["focus"] = json!(focus_for_item(w, &items, state, now_epoch));
             obj["next"] = json!(next_action_for(w, &items, state));
+            if !w.wait_on.is_empty() {
+                obj["waitOnStatus"] = json!(w
+                    .wait_on
+                    .iter()
+                    .map(|c| {
+                        let ev = evaluate_condition(c, w, &items, state, now_epoch);
+                        json!({
+                            "condition": ev.raw,
+                            "satisfied": ev.satisfied,
+                            "detail": ev.detail,
+                            "pointer": ev.pointer,
+                        })
+                    })
+                    .collect::<Vec<_>>());
+            }
             obj
         })
         .collect()
@@ -2722,6 +2899,25 @@ fn state_priority(st: &str) -> u8 {
 }
 
 fn focus_for_item(item: &WorkItem, all_items: &[WorkItem], state: &Path, now_epoch: i64) -> String {
+    if let Some(ow) = &item.owner {
+        if item.state == "done" {
+            return if item.closed_kind == "dropped" {
+                format!("已否：{}", clip_chars(&item.close_reason, 20))
+            } else if !item.close_evidence.is_empty() {
+                format!("已定：{}", clip_chars(&item.close_evidence, 20))
+            } else {
+                "已定".into()
+            };
+        }
+        let kl = OwnerInfo::kind_label(&ow.kind);
+        if !ow.recommendation.is_empty() {
+            return format!("{kl} · 建议：{}", clip_chars(&ow.recommendation, 20));
+        }
+        if !ow.cost.is_empty() {
+            return format!("{kl} · {}", clip_chars(&ow.cost, 20));
+        }
+        return format!("等所有者（{kl}）");
+    }
     match item.state.as_str() {
         "active" => {
             if let Some((rid, rdir)) = latest_live_run(item, state) {
@@ -2845,6 +3041,15 @@ fn focus_for_item(item: &WorkItem, all_items: &[WorkItem], state: &Path, now_epo
 }
 
 fn next_action_for(item: &WorkItem, _all_items: &[WorkItem], state: &Path) -> String {
+    if let Some(ow) = &item.owner {
+        if item.state == "done" {
+            return format!("work show {}", item.id);
+        }
+        if ow.kind == "direction" {
+            return format!("work show {}", item.id);
+        }
+        return format!("work close {} --evidence \"所有者：…\"", item.id);
+    }
     match item.state.as_str() {
         "attention" => {
             if let Some((rid, rdir)) = latest_live_run(item, state) {
@@ -3120,11 +3325,31 @@ fn render_card(item: &WorkItem, all_items: &[WorkItem], state: &Path, now_epoch:
         item.state,
         age_str
     ));
+    if let Some(ow) = &item.owner {
+        lines.push(format!(
+            "所有者事项：{}（{}）",
+            OwnerInfo::kind_label(&ow.kind),
+            ow.kind
+        ));
+        if !ow.ask.is_empty() {
+            lines.push(format!("要你回答：{}", ow.ask));
+        }
+        if !ow.recommendation.is_empty() {
+            lines.push(format!("主控建议：{}", ow.recommendation));
+        }
+        if !ow.if_undecided.is_empty() {
+            lines.push(format!("不定会怎样：{}", ow.if_undecided));
+        }
+        if !ow.cost.is_empty() {
+            lines.push(format!("成本：{}", ow.cost));
+        }
+    }
     if !item.done_when.is_empty() {
         lines.push(format!("完成条件：{}", item.done_when));
     }
     if !item.brief.is_empty() {
-        lines.push(format!("任务说明：{}", item.brief));
+        let label = if item.owner.is_some() { "卡片" } else { "任务说明" };
+        lines.push(format!("{label}：{}", item.brief));
     }
     if !item.owner_ref.is_empty() {
         let owner_path = if item.repo.is_empty() {
@@ -3618,18 +3843,23 @@ fn parse_markdown_backlog(
 // ---------------------------------------------------------------------------
 
 fn has_work_cycle(items: &[WorkItem], from_id: &str, new_wait_on: &[String]) -> bool {
+    let extract_dep = |c: &str| -> Option<String> {
+        c.strip_prefix("work_closed:")
+            .or_else(|| c.strip_prefix("owner:"))
+            .and_then(normalize_work_id)
+    };
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     for item in items {
         let deps: Vec<String> = item
             .wait_on
             .iter()
-            .filter_map(|c| c.strip_prefix("work_closed:").and_then(normalize_work_id))
+            .filter_map(|c| extract_dep(c))
             .collect();
         adj.insert(item.id.clone(), deps);
     }
     let added: Vec<String> = new_wait_on
         .iter()
-        .filter_map(|c| c.strip_prefix("work_closed:").and_then(normalize_work_id))
+        .filter_map(|c| extract_dep(c))
         .collect();
     adj.entry(from_id.to_string()).or_default().extend(added.clone());
 
@@ -3679,6 +3909,7 @@ pub fn command(args: &[String]) -> Res<i32> {
 
 fn list_cmd(args: &[String]) -> Res<i32> {
     let mut show_all = false;
+    let mut owner_only = false;
     let mut rebuild = false;
     let mut state_filter: Option<String> = None;
     let mut repo_filter: Option<String> = None;
@@ -3692,6 +3923,7 @@ fn list_cmd(args: &[String]) -> Res<i32> {
             .map_or((a.as_str(), None), |(k, v)| (k, Some(v)));
         match key {
             "--all" => show_all = true,
+            "--owner" => owner_only = true,
             "--rebuild" => rebuild = true,
             "--json" => json_mode = true,
             "--state" => {
@@ -3738,6 +3970,10 @@ fn list_cmd(args: &[String]) -> Res<i32> {
         load_readonly_in(&state)
     };
     let now_epoch = epoch() as i64;
+
+    if owner_only {
+        return render_owner_list(&items, &state, now_epoch, show_all, state_filter.as_deref(), repo_filter.as_deref(), json_mode);
+    }
     let ephemeral = ephemeral_run_rows(&items, &state, now_epoch);
 
     let mut all_rows: Vec<TableRow> = items
@@ -3850,6 +4086,212 @@ fn list_cmd(args: &[String]) -> Res<i32> {
         String::new()
     };
     println!("卡片：delegate work show <ID> · 全部：delegate work --all{done_hint}");
+    Ok(0)
+}
+
+fn render_owner_list(
+    items: &[WorkItem],
+    state: &Path,
+    now_epoch: i64,
+    show_all: bool,
+    state_filter: Option<&str>,
+    repo_filter: Option<&str>,
+    json_mode: bool,
+) -> Res<i32> {
+    let mut owner_items: Vec<&WorkItem> = items
+        .iter()
+        .filter(|w| w.owner.is_some())
+        .filter(|w| {
+            if let Some(rf) = repo_filter {
+                w.repo_label()
+                    .to_ascii_lowercase()
+                    .contains(&rf.to_ascii_lowercase())
+            } else {
+                true
+            }
+        })
+        .filter(|w| {
+            if let Some(sf) = state_filter {
+                w.state == sf
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    let mut open: Vec<&WorkItem> = Vec::new();
+    let mut dropped: Vec<&WorkItem> = Vec::new();
+    let mut closed: Vec<&WorkItem> = Vec::new();
+    for w in owner_items.drain(..) {
+        if w.state == "done" {
+            if w.closed_kind == "dropped" {
+                dropped.push(w);
+            } else {
+                closed.push(w);
+            }
+        } else {
+            open.push(w);
+        }
+    }
+
+    open.sort_by(|a, b| {
+        let ka = a
+            .owner
+            .as_ref()
+            .map(|o| OwnerInfo::kind_priority(&o.kind))
+            .unwrap_or(9);
+        let kb = b
+            .owner
+            .as_ref()
+            .map(|o| OwnerInfo::kind_priority(&o.kind))
+            .unwrap_or(9);
+        ka.cmp(&kb).then_with(|| a.id.cmp(&b.id))
+    });
+    dropped.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.id.cmp(&b.id)));
+    closed.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.id.cmp(&b.id)));
+
+    let count_kind = |k: &str| -> usize {
+        open.iter()
+            .filter(|w| w.owner.as_ref().is_some_and(|o| o.kind == k))
+            .count()
+    };
+    let n_act = count_kind("act");
+    let n_nod = count_kind("nod");
+    let n_card = count_kind("card");
+    let n_dir = count_kind("direction");
+
+    if json_mode {
+        for w in &open {
+            let mut obj = w.to_json();
+            obj["repoLabel"] = json!(w.repo_label());
+            obj["focus"] = json!(focus_for_item(w, items, state, now_epoch));
+            obj["next"] = json!(next_action_for(w, items, state));
+            println!("{obj}");
+        }
+        for w in &dropped {
+            let mut obj = w.to_json();
+            obj["repoLabel"] = json!(w.repo_label());
+            obj["focus"] = json!(focus_for_item(w, items, state, now_epoch));
+            obj["next"] = json!(next_action_for(w, items, state));
+            println!("{obj}");
+        }
+        if show_all || state_filter == Some("done") {
+            for w in &closed {
+                let mut obj = w.to_json();
+                obj["repoLabel"] = json!(w.repo_label());
+                obj["focus"] = json!(focus_for_item(w, items, state, now_epoch));
+                obj["next"] = json!(next_action_for(w, items, state));
+                println!("{obj}");
+            }
+        }
+        println!(
+            "{}",
+            json!({
+                "ownerSummary": {
+                    "open": open.len(),
+                    "act": n_act,
+                    "nod": n_nod,
+                    "card": n_card,
+                    "direction": n_dir,
+                    "dropped": dropped.len(),
+                    "closed": closed.len(),
+                }
+            })
+        );
+        return Ok(0);
+    }
+
+    let dropped_part = if dropped.is_empty() {
+        String::new()
+    } else {
+        format!(" · 已否 {}", dropped.len())
+    };
+    println!(
+        "等你 {}（动手 {n_act} · 点头 {n_nod} · 看卡 {n_card} · 方向 {n_dir}）{dropped_part}",
+        open.len()
+    );
+
+    if open.is_empty() {
+        println!("（当前无待所有者处理项）");
+    } else {
+        for &kind in &OWNER_KINDS {
+            let group: Vec<&&WorkItem> = open
+                .iter()
+                .filter(|w| w.owner.as_ref().is_some_and(|o| o.kind == kind))
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            println!("\n## {} ({})", OwnerInfo::kind_label(kind), group.len());
+            for w in group {
+                let ow = w.owner.as_ref().unwrap();
+                let ask = if ow.ask.is_empty() {
+                    w.title.as_str()
+                } else {
+                    ow.ask.as_str()
+                };
+                println!("[{}] [{}] {}", w.id, w.repo_label(), ask);
+                if !ow.recommendation.is_empty() {
+                    println!("  建议：{}", ow.recommendation);
+                }
+                if !ow.if_undecided.is_empty() {
+                    println!("  不定：{}", ow.if_undecided);
+                }
+                if !ow.cost.is_empty() {
+                    println!("  成本：{}", ow.cost);
+                }
+                if !w.brief.is_empty() {
+                    println!("  卡片：{}", w.brief);
+                }
+                println!("  下一步：delegate {}", next_action_for(w, items, state));
+            }
+        }
+    }
+
+    if !dropped.is_empty() {
+        println!("\n## 已否 ({})", dropped.len());
+        for w in &dropped {
+            let ow = w.owner.as_ref().unwrap();
+            let ask = if ow.ask.is_empty() {
+                w.title.as_str()
+            } else {
+                ow.ask.as_str()
+            };
+            let date = if w.updated_at.len() >= 10 {
+                &w.updated_at[..10]
+            } else {
+                ""
+            };
+            let date_tag = if date.is_empty() {
+                String::new()
+            } else {
+                format!("（{date}）")
+            };
+            println!(
+                "[{}] [{}] {} — {}{}",
+                w.id,
+                w.repo_label(),
+                ask,
+                w.close_reason,
+                date_tag
+            );
+        }
+    }
+
+    if (show_all || state_filter == Some("done")) && !closed.is_empty() {
+        println!("\n## 已定 ({})", closed.len());
+        for w in &closed {
+            let ow = w.owner.as_ref().unwrap();
+            let ask = if ow.ask.is_empty() {
+                w.title.as_str()
+            } else {
+                ow.ask.as_str()
+            };
+            println!("[{}] [{}] {} — {}", w.id, w.repo_label(), ask, w.close_evidence);
+        }
+    }
+
+    println!("\n卡片：delegate work show <ID> · 关闭：delegate work close <ID> --evidence \"所有者：…\" · 否决：delegate work drop <ID> --reason \"…\"");
     Ok(0)
 }
 
@@ -4013,8 +4455,9 @@ fn parse_wait_conditions(args: &[String], allow_clear: bool) -> Res<ParsedWaitAr
                 if trimmed.is_empty() {
                     return Err("--wait-owner requires a non-empty ref (e.g. Q18, D002)".into());
                 }
-                wf.owner_ref = Some(trimmed.to_string());
-                wf.wait_on.push(format!("owner:{trimmed}"));
+                let norm = normalize_work_id(trimmed).unwrap_or_else(|| trimmed.to_string());
+                wf.owner_ref = Some(norm.clone());
+                wf.wait_on.push(format!("owner:{norm}"));
             }
             "--after-time" => {
                 let raw = take_val(key, &mut i)?;
@@ -4028,7 +4471,19 @@ fn parse_wait_conditions(args: &[String], allow_clear: bool) -> Res<ParsedWaitAr
                 }
                 wf.wait_on.push(format!("manual:{}", raw.trim()));
             }
-            "--done-when" | "--repo" | "--artifact" | "--followup" | "--run" => {
+            "--done-when"
+            | "--repo"
+            | "--artifact"
+            | "--followup"
+            | "--run"
+            | "--owner-kind"
+            | "--qid"
+            | "--id"
+            | "--ask"
+            | "--recommendation"
+            | "--rec"
+            | "--if-undecided"
+            | "--cost" => {
                 let raw = take_val(key, &mut i)?;
                 extra.entry(key.to_string()).or_default().push(raw);
             }
@@ -4085,10 +4540,98 @@ fn add_cmd(args: &[String]) -> Res<i32> {
         json_mode,
         extra,
     } = parse_wait_conditions(args, false)?;
-    let title = positional.join(" ").trim().to_string();
-    if title.is_empty() {
-        return Err("usage: delegate work add \"<title>\" [--done-when \"…\"] [--brief <path>] [--after-applied <run>] [--wait-owner <Qxx>] [--auto -- <start-args>]".into());
-    }
+
+    let owner_kind_raw = extra.get("--owner-kind").and_then(|v| v.last()).cloned();
+    let explicit_id_raw = extra
+        .get("--qid")
+        .or_else(|| extra.get("--id"))
+        .and_then(|v| v.last())
+        .cloned();
+    let ask_raw = extra.get("--ask").and_then(|v| v.last()).cloned();
+    let rec_raw = extra
+        .get("--recommendation")
+        .or_else(|| extra.get("--rec"))
+        .and_then(|v| v.last())
+        .cloned()
+        .unwrap_or_default();
+    let if_undecided_raw = extra
+        .get("--if-undecided")
+        .and_then(|v| v.last())
+        .cloned()
+        .unwrap_or_default();
+    let cost_raw = extra
+        .get("--cost")
+        .and_then(|v| v.last())
+        .cloned()
+        .unwrap_or_default();
+
+    let is_owner_item = owner_kind_raw.is_some()
+        || ask_raw.is_some()
+        || !rec_raw.is_empty()
+        || !if_undecided_raw.is_empty()
+        || !cost_raw.is_empty()
+        || explicit_id_raw
+            .as_deref()
+            .is_some_and(is_owner_id);
+
+    let pos_title = positional.join(" ").trim().to_string();
+    let (title, owner_info) = if is_owner_item {
+        let kind = owner_kind_raw
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or("owner work item requires --owner-kind <act|nod|card|direction>")?;
+        if !OWNER_KINDS.contains(&kind) {
+            return Err(format!(
+                "invalid --owner-kind '{kind}' (expected: {})",
+                OWNER_KINDS.join("|")
+            ));
+        }
+        let ask = ask_raw
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| pos_title.clone());
+        let final_title = if pos_title.is_empty() {
+            ask.clone()
+        } else {
+            pos_title
+        };
+        if final_title.is_empty() {
+            return Err("usage: delegate work add --owner-kind <act|nod|card|direction> --ask \"<要所有者回答什么>\" [--qid Q20|D003] [--recommendation \"…\"] [--if-undecided \"…\"] [--cost \"…\"] [--brief <path>]".into());
+        }
+        (
+            final_title,
+            Some(OwnerInfo {
+                kind: kind.to_string(),
+                ask,
+                recommendation: rec_raw.trim().to_string(),
+                if_undecided: if_undecided_raw.trim().to_string(),
+                cost: cost_raw.trim().to_string(),
+            }),
+        )
+    } else {
+        if pos_title.is_empty() {
+            return Err("usage: delegate work add \"<title>\" [--done-when \"…\"] [--brief <path>] [--after-applied <run>] [--wait-owner <Qxx>] [--auto -- <start-args>]".into());
+        }
+        (pos_title, None)
+    };
+
+    let explicit_id = if let Some(raw_id) = explicit_id_raw {
+        let norm = normalize_work_id(&raw_id).ok_or_else(|| {
+            format!("invalid id '{raw_id}' (expected Qxx, Dxxx, or Wxxx)")
+        })?;
+        if owner_info.is_some() && !is_owner_id(&norm) {
+            return Err(format!(
+                "owner work item id must start with Q or D (got '{norm}')"
+            ));
+        }
+        Some(norm)
+    } else {
+        None
+    };
+
     let repo = extra
         .get("--repo")
         .and_then(|v| v.last())
@@ -4118,15 +4661,30 @@ fn add_cmd(args: &[String]) -> Res<i32> {
         let mut items = load_raw(&state);
         let _ = migrate_legacy_locked(&state, &mut items);
 
-        let id = next_id_locked(&state, &items);
+        let id = if let Some(ref eid) = explicit_id {
+            if items.iter().any(|w| w.id == *eid) {
+                return Err(format!("work item '{eid}' already exists"));
+            }
+            eid.clone()
+        } else if let Some(ref ow) = owner_info {
+            next_owner_id(&items, &ow.kind)
+        } else {
+            next_id_locked(&state, &items)
+        };
         if has_work_cycle(&items, &id, &wf.wait_on) {
             return Err("dependency cycle detected in --after-work".into());
         }
 
-        let init_state = if wf.wait_on.is_empty() {
-            "ready"
-        } else {
+        let init_state = if !wf.wait_on.is_empty() {
             "blocked"
+        } else if let Some(ref ow) = owner_info {
+            if ow.kind == "direction" {
+                "active"
+            } else {
+                "attention"
+            }
+        } else {
+            "ready"
         };
         let mut item = WorkItem {
             id: id.clone(),
@@ -4137,6 +4695,7 @@ fn add_cmd(args: &[String]) -> Res<i32> {
             wait_on: wf.wait_on,
             auto_dispatch,
             brief,
+            owner: owner_info,
             owner_ref: wf.owner_ref.unwrap_or_default(),
             created_at: now_iso.clone(),
             updated_at: now_iso.clone(),
@@ -4490,9 +5049,13 @@ fn drop_cmd(args: &[String]) -> Res<i32> {
             .iter()
             .filter(|w| {
                 w.state != "done"
-                    && w.wait_on
-                        .iter()
-                        .any(|c| c == &format!("work_closed:{norm}"))
+                    && w.wait_on.iter().any(|c| {
+                        c == &format!("work_closed:{norm}")
+                            || c.strip_prefix("owner:")
+                                .and_then(normalize_work_id)
+                                .as_deref()
+                                == Some(norm.as_str())
+                    })
             })
             .map(|w| w.id.clone())
             .collect();
@@ -5069,6 +5632,93 @@ mod tests {
         // Second pass is idempotent (no duplicates!)
         assert!(!migrate_legacy_locked(&state, &mut items));
         assert_eq!(items.len(), 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owner_work_item_roundtrip_id_normalization_and_unlock_on_close() {
+        assert_eq!(normalize_work_id("w5").as_deref(), Some("W005"));
+        assert_eq!(normalize_work_id("q7").as_deref(), Some("Q07"));
+        assert_eq!(normalize_work_id("Q18").as_deref(), Some("Q18"));
+        assert_eq!(normalize_work_id("d2").as_deref(), Some("D002"));
+        assert_eq!(normalize_work_id("D002").as_deref(), Some("D002"));
+        assert_eq!(normalize_work_id("X1"), None);
+
+        let dir = temp_dir("owner-work");
+        let state = dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+
+        let owner_item = WorkItem {
+            id: "Q20".into(),
+            title: "是否切到流式动作".into(),
+            repo: dir.to_string_lossy().into_owned(),
+            state: "attention".into(),
+            brief: "docs/owner/directions/streaming.md".into(),
+            owner: Some(OwnerInfo {
+                kind: "card".into(),
+                ask: "身体第二步是否改成流式驱动？".into(),
+                recommendation: "建议先跑 2 天验证再决定".into(),
+                if_undecided: "沿用固定片段".into(),
+                cost: "2 天开发".into(),
+            }),
+            created_at: "2026-11-23T08:00:00Z".into(),
+            updated_at: "2026-11-23T08:00:00Z".into(),
+            state_since: "2026-11-23T08:00:00Z".into(),
+            ..Default::default()
+        };
+        let waiting_item = WorkItem {
+            id: "W001".into(),
+            title: "实施流式动作".into(),
+            repo: dir.to_string_lossy().into_owned(),
+            state: "blocked".into(),
+            wait_on: vec!["owner:Q20".into()],
+            owner_ref: "Q20".into(),
+            created_at: "2026-11-23T08:01:00Z".into(),
+            updated_at: "2026-11-23T08:01:00Z".into(),
+            state_since: "2026-11-23T08:01:00Z".into(),
+            ..Default::default()
+        };
+        save_raw(&state, &[owner_item, waiting_item]).unwrap();
+
+        // Roundtrip JSON + waitOnStatus in load_readonly_json
+        let snap = load_readonly_json(&state);
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0]["owner"]["kind"], "card");
+        assert_eq!(snap[0]["owner"]["ifUndecided"], "沿用固定片段");
+        assert_eq!(snap[1]["state"], "blocked");
+        assert_eq!(snap[1]["waitOnStatus"][0]["satisfied"], false);
+        assert!(snap[1]["waitOnStatus"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("等所有者 Q20"));
+
+        // Dropping Q20 must NOT auto-unlock W001
+        let mut items = load_raw(&state);
+        items[0].state = "done".into();
+        items[0].closed_kind = "dropped".into();
+        items[0].close_reason = "先不做".into();
+        reconcile_all_locked(&state, &mut items);
+        assert_eq!(items[1].state, "blocked");
+
+        // Closing Q20 with evidence unlocks W001 to ready automatically
+        items[0].closed_kind = "closed".into();
+        items[0].close_evidence = "所有者：同意".into();
+        let rec = reconcile_all_locked(&state, &mut items);
+        assert_eq!(items[1].state, "ready");
+        assert_eq!(rec.unlocked_ready.len(), 1);
+        assert_eq!(rec.unlocked_ready[0].id, "W001");
+
+        // Next owner ID allocation respects existing Q/D items
+        assert_eq!(next_owner_id(&items, "nod"), "Q21");
+        assert_eq!(next_owner_id(&items, "direction"), "D001");
+
+        // Render card includes owner details
+        let card = render_card(&items[0], &items, &state, epoch() as i64);
+        assert!(card.contains("所有者事项：看卡（card）"), "{card}");
+        assert!(card.contains("主控建议：建议先跑 2 天验证再决定"), "{card}");
+        assert!(card.contains("不定会怎样：沿用固定片段"), "{card}");
+        assert!(card.contains("成本：2 天开发"), "{card}");
 
         let _ = fs::remove_dir_all(&dir);
     }

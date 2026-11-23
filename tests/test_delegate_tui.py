@@ -154,6 +154,102 @@ class DelegateTuiTests(unittest.TestCase):
             self.assertEqual((skill / "bin/demo").read_bytes(), b"bin-demo")
             self.assertEqual((skill / "bin/demo-tui").read_bytes(), b"bin-demo-tui")
 
+    def test_owner_work_items_cli_unlock_and_snapshot_wait_status(self):
+        repo = self.repo({"a.txt": "hello\n"})
+        card = repo / "docs/owner/directions/routing.md"
+        card.parent.mkdir(parents=True)
+        card.write_text("# Q20 路由方案\n\n建议选方案 A。\n")
+
+        # 1. Add owner items (act, nod, card, direction) with explicit Q/D IDs and auto-allocated ID
+        r1 = self.cli(
+            "work", "add",
+            "--owner-kind", "act",
+            "--ask", "清理旧配置",
+            "--recommendation", "直接删除旧项",
+            "--cost", "2 分钟",
+            "--qid", "Q18",
+            "--repo", str(repo),
+            cwd=repo,
+        )
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        r2 = self.cli(
+            "work", "add",
+            "--owner-kind", "card",
+            "--ask", "选方案 A 还是 B？",
+            "--recommendation", "建议选 A",
+            "--if-undecided", "沿用旧逻辑",
+            "--cost", "2 天",
+            "--brief", "docs/owner/directions/routing.md",
+            "--qid", "Q20",
+            "--repo", str(repo),
+            cwd=repo,
+        )
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        r3 = self.cli(
+            "work", "add",
+            "--owner-kind", "direction",
+            "--ask", "流式动作方向调研",
+            "--qid", "D002",
+            "--repo", str(repo),
+            cwd=repo,
+        )
+        self.assertEqual(r3.returncode, 0, r3.stderr)
+        r4 = self.cli(
+            "work", "add",
+            "--owner-kind", "nod",
+            "--ask", "买直连 key？",
+            "--qid", "Q19",
+            "--repo", str(repo),
+            cwd=repo,
+        )
+        self.assertEqual(r4.returncode, 0, r4.stderr)
+
+        # 2. Drop Q19 and verify it appears under 已否
+        drop = self.cli("work", "drop", "Q19", "--reason", "现有渠道够用", cwd=repo)
+        self.assertEqual(drop.returncode, 0, drop.stderr)
+
+        # 3. Add a work item waiting on owner:Q20
+        w_add = self.cli(
+            "work", "add", "实施路由方案 A",
+            "--wait-owner", "Q20",
+            "--repo", str(repo),
+            cwd=repo,
+        )
+        self.assertEqual(w_add.returncode, 0, w_add.stderr)
+
+        # 4. `delegate work --owner` outputs grouped owner view + 已否
+        owner_view = self.cli("work", "--owner", cwd=repo)
+        self.assertEqual(owner_view.returncode, 0, owner_view.stderr)
+        self.assertIn("等你 3", owner_view.stdout)
+        self.assertIn("已否 1", owner_view.stdout)
+        self.assertIn("## 动手", owner_view.stdout)
+        self.assertIn("## 看卡", owner_view.stdout)
+        self.assertIn("## 方向", owner_view.stdout)
+        self.assertIn("## 已否", owner_view.stdout)
+        self.assertIn("Q18", owner_view.stdout)
+        self.assertIn("Q20", owner_view.stdout)
+        self.assertIn("D002", owner_view.stdout)
+        self.assertIn("Q19", owner_view.stdout)
+
+        # 5. `delegate snapshot --json` exposes owner fields & evaluated waitOnStatus
+        snap = json.loads(self.cli("snapshot", "--json", cwd=repo).stdout)
+        by_id = {w["id"]: w for w in snap["work"]}
+        self.assertEqual(by_id["Q20"]["owner"]["kind"], "card")
+        self.assertEqual(by_id["Q20"]["owner"]["recommendation"], "建议选 A")
+        self.assertEqual(by_id["W001"]["state"], "blocked")
+        self.assertFalse(by_id["W001"]["waitOnStatus"][0]["satisfied"])
+
+        # 6. Closing Q20 unlocks W001 automatically
+        close = self.cli("work", "close", "Q20", "--evidence", "所有者：同意选 A", cwd=repo)
+        self.assertEqual(close.returncode, 0, close.stderr)
+        self.assertIn("已解锁 [W001]", close.stdout)
+
+        snap2 = json.loads(self.cli("snapshot", "--json", cwd=repo).stdout)
+        by_id2 = {w["id"]: w for w in snap2["work"]}
+        self.assertEqual(by_id2["Q20"]["state"], "done")
+        self.assertEqual(by_id2["W001"]["state"], "ready")
+        self.assertTrue(by_id2["W001"]["waitOnStatus"][0]["satisfied"])
+
 
 if __name__ == "__main__":
     unittest.main()

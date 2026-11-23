@@ -18,13 +18,13 @@
 
 ## 3. 命令速查
 
-- `delegate work [--all] [--state <态>] [--repo <名>] [--rebuild] [--json]`：查看工作表（`--rebuild` 强制重算派生状态与迁移）。
-- `delegate work show <Wxx|R:id> [--json]`：查看工作项卡片。
-- `delegate work add "<标题>" [--done-when "<条件>"] [--brief <文件>] [--after-applied <run>] [--after-delivered <run>] [--after-work <Wxx>] [--wait-owner <Qxx>] [--after-time <4h|YYYY-MM-DD|ISO>] [--wait-manual "<说明>"] [--artifact <路径>] [--auto -- <start参数>]`：立项。
+- `delegate work [--owner] [--all] [--state <态>] [--repo <名>] [--rebuild] [--json]`：查看工作表（`--owner` 按 动手/点头/看卡/方向 与 已否 纯文本展示所有者事项；`--rebuild` 强制重算派生状态与迁移）。
+- `delegate work show <Wxx|Qxx|Dxxx|R:id> [--json]`：查看工作项或所有者事项卡片。
+- `delegate work add "<标题>" [--done-when "<条件>"] [--brief <文件>] [--after-applied <run>] [--after-delivered <run>] [--after-work <Wxx>] [--wait-owner <Qxx>] [--after-time <4h|YYYY-MM-DD|ISO>] [--wait-manual "<说明>"] [--artifact <路径>] [--owner-kind act|nod|card|direction --ask "<问题>" --qid <Qxx|Dxxx> --recommendation "<建议>" --if-undecided "<不定会怎样>" --cost "<成本>"] [--auto -- <start参数>]`：立项或新建所有者事项（`Q`/`D` 编号，卡片路径用 `--brief`）。
 - `delegate work wait <Wxx> [同上前置选项] [--clear]`：给已有工作项挂载或更新前置（含 `--after-applied` 与 `--auto` 自动派发）。
 - `delegate start --work <Wxx> …`：将 run 绑定到工作项；`delegate reply` 自动继承父 run 的 `workId`。
-- `delegate work close <Wxx> --evidence "<SHA/测试/截图记录>"` / `delegate apply --closes <Wxx> <run>`：带证据关闭。
-- `delegate work drop <Wxx> --reason "<放弃理由>"`：留痕放弃（不自动解锁下游 `work_closed`）。
+- `delegate work close <Wxx|Qxx|Dxxx> --evidence "<SHA/测试/所有者结论>"` / `delegate apply --closes <Wxx> <run>`：带证据关闭（关闭所有者事项自动解锁等它的 `owner:Qxx` 下游）。
+- `delegate work drop <Wxx|Qxx|Dxxx> --reason "<放弃/否决理由>"`：留痕放弃/否决（不自动解锁下游，TUI 按 `x` 可查「已否」）。
 - `delegate work defer <Wxx|run> --reason "<原因>" [--until 4h|24h|YYYY-MM-DD|ISO]`：暂缓工作项或将临时 run 升格为暂缓项。
 - `delegate work import-md <文件> [--dry-run] [--include-stale] [--repo <目录>] [--json]`：解析 Markdown 待办并比对 `history.jsonl` 标出疑似已合入/重复项，每条附源文件行号指针。
 
@@ -32,7 +32,8 @@
 
 - `run_applied:<run>`（`--after-applied`）：检查 run 目录 `.applied`/`.applied-cleaned`、`history.jsonl` 与 `events.jsonl`，兼容直接 `apply` 与经 `delegate merge` 后 `apply --keep-commits`。`delegate queue add` 同样支持 `--after-applied`。
 - `run_delivered:<run>`、`work_closed:<Wxx>`（含环检测）、`after_time:<ISO>`、`manual:<说明>`。
-- `owner:<Qxx>`：只读扫描仓库 `docs/owner/README.md`，绝不反写该文件；编号从开放表移除或进入「已否」时自动判定满足。
+- `owner:<Qxx>`：优先指向工作表中的所有者事项（`Q`/`D` 关闭后自动解锁下游，否决不自动解锁）；未迁入时回退只读扫描 `docs/owner/README.md`。
+- **TUI 工作视图**：`delegate tui` 按 `w`/`5` 切到工作表（L0 计数、所有者事项置顶、依赖链缩进、Enter 看工作卡与 Markdown 卡片正文、`t`/`→` 跳关联 run、`o`/`x` 过滤、`<70` 列手机双行紧凑布局）。
 
 ## 5. 适时提示、Stop Hook 分级与迁移
 

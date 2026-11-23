@@ -274,14 +274,14 @@ pub fn print(command: Option<&str>) -> bool {
             ("--json", "Print JSON status without the files array (pass --files to include files)."),
             ("--files", "With --json, include the full files array."),
         ]),
-        "work" => ("[list|show|add|wait|close|drop|defer|import-md] ...", "Machine-wide unified work table (<state>/work.jsonl) with 7 states (attention/ready/verify/active/blocked/deferred/done), structured wait_on (including run_applied and read-only owner:Qxx), 6-column table & card views, and automatic migration of notes.json / deferred.tsv.", &[
-            ("[--all] [--state ST] [--repo NAME] [--rebuild] [--json]", "Show Layer-0 summary + 6-column table (merges unattached active/actionable runs as R:<id>; folds blocked/deferred by default)."),
-            ("show <Wxx|R:id> [--json]", "Show Layer-2 work item card with wait_on status, linked runs, artifacts, followups, and Layer-3 original pointers."),
-            ("add \"<title>\" [--done-when TEXT] [--brief FILE] [--after-applied RUN] [--after-delivered RUN] [--after-work Wxx] [--wait-owner Qxx] [--after-time TIME] [--wait-manual TEXT] [--artifact PATH] [--auto -- <start-args>]", "Create a persistent work item."),
-            ("wait <Wxx> [--after-applied RUN] [--after-delivered RUN] [--after-work Wxx] [--wait-owner Qxx] [--after-time TIME] [--wait-manual TEXT] [--brief FILE] [--auto -- <start-args>] [--clear]", "Attach or update wait_on conditions on a work item (blocks until satisfied; unlocks on apply/finish or auto-dispatches with --auto)."),
-            ("close <Wxx> --evidence \"<text>\"", "Explicitly close a work item with evidence (commit SHA, test/screenshot verification)."),
-            ("drop <Wxx> --reason \"<text>\"", "Explicitly drop a work item with a recorded reason."),
-            ("defer <Wxx|run> --reason \"<text>\" [--until 4h|24h|YYYY-MM-DD|ISO]", "Defer a work item or unattached run (materializes into work.jsonl) until automatic wake-up."),
+        "work" => ("[list|show|add|wait|close|drop|defer|import-md] ...", "Machine-wide unified work table (<state>/work.jsonl) with 7 states (attention/ready/verify/active/blocked/deferred/done), owner items (Q/D), structured wait_on (including run_applied and owner:Qxx), 6-column table & card views, and automatic migration of notes.json / deferred.tsv.", &[
+            ("[--owner] [--all] [--state ST] [--repo NAME] [--rebuild] [--json]", "Show Layer-0 summary + 6-column table (--owner renders owner items grouped by 动手/点头/看卡/方向 + 已否; default folds blocked/deferred)."),
+            ("show <Wxx|Qxx|Dxxx|R:id> [--json]", "Show Layer-2 work item card with wait_on status, owner details, linked runs, artifacts, followups, and Layer-3 original pointers."),
+            ("add \"<title>\" [--done-when TEXT] [--brief FILE] [--after-applied RUN] [--after-delivered RUN] [--after-work Wxx] [--wait-owner Qxx] [--after-time TIME] [--wait-manual TEXT] [--artifact PATH] [--owner-kind act|nod|card|direction] [--qid Qxx|Dxxx] [--ask TEXT] [--recommendation TEXT] [--if-undecided TEXT] [--cost TEXT] [--auto -- <start-args>]", "Create a persistent work item or owner item (Q/D)."),
+            ("wait <Wxx|Qxx|Dxxx> [--after-applied RUN] [--after-delivered RUN] [--after-work Wxx] [--wait-owner Qxx] [--after-time TIME] [--wait-manual TEXT] [--brief FILE] [--auto -- <start-args>] [--clear]", "Attach or update wait_on conditions on a work item (blocks until satisfied; unlocks on apply/finish or auto-dispatches with --auto)."),
+            ("close <Wxx|Qxx|Dxxx> --evidence \"<text>\"", "Explicitly close a work item or owner item with evidence (unlocks waiting work items)."),
+            ("drop <Wxx|Qxx|Dxxx> --reason \"<text>\"", "Explicitly drop/reject a work item or owner item with a recorded reason."),
+            ("defer <Wxx|Qxx|Dxxx|run> --reason \"<text>\" [--until 4h|24h|YYYY-MM-DD|ISO]", "Defer a work item or unattached run (materializes into work.jsonl) until automatic wake-up."),
             ("import-md <FILE> [--dry-run] [--include-stale] [--repo DIR] [--json]", "Parse a Markdown backlog, cross-check history.jsonl for already-applied/stale items, and preview (--dry-run) or import."),
         ]),
         "note" => ("[<run> [text ... | --done [<index> ... | --all]]] [--all] [--json]", "Thin compatibility wrapper over the unified work table (<state>/work.jsonl) for attaching, listing, or completing post-merge todos on a run or reply chain.", &[

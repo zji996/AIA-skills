@@ -133,14 +133,8 @@ fn folds_stale_pending_and_merged_by_default_and_toggles_on_enter() {
     let repo = parse_status_jsonl(Path::new("/tmp/demo"), "~/demo", raw);
     let snap = AppSnapshot {
         repos: vec![repo],
-        lane: LaneStatus::default(),
-        events: vec![],
-        dag_queue: vec![],
-        merges: vec![],
-        candidates: vec![],
-        host_load: None,
         refreshed_at: "10:00:00".into(),
-        warnings: vec![],
+        ..AppSnapshot::default()
     };
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/tmp/demo"), 5);
 
@@ -263,11 +257,6 @@ fn snapshot_fingerprint_skips_redraw_when_unchanged_and_preserves_selection() {
     let repo = parse_status_jsonl(Path::new("/home/dev/demo-api"), "~/demo-api", STATUS_FIXTURE);
     let snap1 = AppSnapshot {
         repos: vec![repo.clone()],
-        lane: LaneStatus::default(),
-        events: vec![],
-        dag_queue: vec![],
-        merges: vec![],
-        candidates: vec![],
         host_load: Some(HostLoad {
             load1_tenths: 12,
             load5_tenths: 10,
@@ -276,7 +265,7 @@ fn snapshot_fingerprint_skips_redraw_when_unchanged_and_preserves_selection() {
             mem_total_tenths_gib: Some(640),
         }),
         refreshed_at: "10:00:00".to_string(),
-        warnings: vec![],
+        ..AppSnapshot::default()
     };
     let mut app = App::new(
         snap1.clone(),
@@ -314,14 +303,8 @@ fn write_actions_only_generate_commands_and_filter_narrows_rows() {
     let repo = parse_status_jsonl(Path::new("/home/dev/demo-api"), "~/demo-api", STATUS_FIXTURE);
     let snap = AppSnapshot {
         repos: vec![repo],
-        lane: LaneStatus::default(),
-        events: vec![],
-        dag_queue: vec![],
-        merges: vec![],
-        candidates: vec![],
-        host_load: None,
         refreshed_at: "10:00:00".to_string(),
-        warnings: vec![],
+        ..AppSnapshot::default()
     };
     let mut app = App::new(
         snap,

@@ -264,12 +264,14 @@ impl DelegateClient {
         let host_load = read_host_load();
         AppSnapshot {
             repos: groups,
+            work: Vec::new(),
             lane,
             events: events_list,
             dag_queue: dag_queue_list,
             merges: merges_list,
             candidates: candidates_list,
             host_load,
+            today_ymd: local_ymd(),
             refreshed_at: local_hms(),
             warnings,
         }
@@ -403,20 +405,27 @@ pub fn parse_snapshot_json(
             .unwrap_or_default()
     };
 
+    let work = parse_work_value(&doc["work"]);
     let events = parse_events_jsonl(&arr_to_jsonl(&doc["events"]));
     let dag_queue = parse_dag_queue_jsonl(&arr_to_jsonl(&doc["dagQueue"]));
     let merges = parse_merges_jsonl(&arr_to_jsonl(&doc["merges"]));
     let candidates = parse_candidates_jsonl(&arr_to_jsonl(&doc["candidates"]));
     let host_load = read_host_load();
+    let today_ymd = doc["generatedAt"]
+        .as_str()
+        .and_then(iso_to_local_ymd)
+        .unwrap_or_else(local_ymd);
 
     Ok(AppSnapshot {
         repos: groups,
+        work,
         lane,
         events,
         dag_queue,
         merges,
         candidates,
         host_load,
+        today_ymd,
         refreshed_at: local_hms(),
         warnings: Vec::new(),
     })
@@ -918,6 +927,11 @@ fn parse_run_item(
         tokens_input,
         tokens_output,
         tokens_cache_read,
+        work_id: v
+            .get("workId")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     }
 }
 
@@ -1479,6 +1493,268 @@ pub fn local_hms() -> String {
         }
         format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
     }
+}
+
+pub fn local_ymd() -> String {
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            return String::new();
+        }
+        format!(
+            "{:04}-{:02}-{:02}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday
+        )
+    }
+}
+
+pub fn parse_work_value(val: &Value) -> Vec<WorkItem> {
+    let Some(arr) = val.as_array() else {
+        return Vec::new();
+    };
+    arr.iter().filter_map(parse_single_work_item).collect()
+}
+
+pub fn parse_work_jsonl(raw: &str) -> Vec<WorkItem> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+            if let Some(item) = parse_single_work_item(&v) {
+                out.push(item);
+            }
+        }
+    }
+    out
+}
+
+fn parse_single_work_item(v: &Value) -> Option<WorkItem> {
+    let id = v.get("id").and_then(Value::as_str)?.trim().to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let repo = v.get("repo").and_then(Value::as_str).unwrap_or("").to_string();
+    let repo_label = v
+        .get("repoLabel")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if repo.is_empty() {
+                "-".to_string()
+            } else {
+                Path::new(&repo)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&repo)
+                    .to_string()
+            }
+        });
+    let owner = v
+        .get("owner")
+        .filter(|o| o.is_object())
+        .and_then(|o| {
+            let kind = OwnerKind::parse(o.get("kind").and_then(Value::as_str)?)?;
+            Some(WorkOwnerInfo {
+                kind,
+                ask: single_line(o.get("ask").and_then(Value::as_str).unwrap_or("")),
+                recommendation: single_line(
+                    o.get("recommendation").and_then(Value::as_str).unwrap_or(""),
+                ),
+                if_undecided: single_line(
+                    o.get("ifUndecided").and_then(Value::as_str).unwrap_or(""),
+                ),
+                cost: single_line(o.get("cost").and_then(Value::as_str).unwrap_or("")),
+            })
+        });
+    let wait_on_status = v
+        .get("waitOnStatus")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|w| {
+            let condition = w.get("condition").and_then(Value::as_str)?.to_string();
+            Some(WorkWaitStatus {
+                condition,
+                satisfied: w.get("satisfied").and_then(Value::as_bool).unwrap_or(false),
+                detail: single_line(w.get("detail").and_then(Value::as_str).unwrap_or("")),
+                pointer: w.get("pointer").and_then(Value::as_str).unwrap_or("").to_string(),
+            })
+        })
+        .collect();
+    let followups = v
+        .get("followups")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            let text = f.get("text").and_then(Value::as_str)?.trim();
+            if text.is_empty() {
+                return None;
+            }
+            Some(WorkFollowup {
+                id: f.get("id").and_then(Value::as_u64).map(|x| x as usize).unwrap_or(i + 1),
+                kind: f
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("note")
+                    .to_string(),
+                text: single_line(text),
+                anchor: f.get("anchor").and_then(Value::as_str).unwrap_or("").to_string(),
+                source_run: f
+                    .get("sourceRun")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                done: f.get("done").and_then(Value::as_bool).unwrap_or(false),
+            })
+        })
+        .collect();
+    let artifacts = v
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            if let Some(p) = a.as_str() {
+                return (!p.trim().is_empty()).then(|| WorkArtifact {
+                    path: p.trim().to_string(),
+                    source_run: String::new(),
+                    note: String::new(),
+                });
+            }
+            let path = a.get("path").and_then(Value::as_str)?.trim();
+            if path.is_empty() {
+                return None;
+            }
+            Some(WorkArtifact {
+                path: path.to_string(),
+                source_run: a
+                    .get("sourceRun")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                note: single_line(a.get("note").and_then(Value::as_str).unwrap_or("")),
+            })
+        })
+        .collect();
+    let ad = v.get("autoDispatch").filter(|x| x.is_object());
+    Some(WorkItem {
+        id,
+        title: single_line(v.get("title").and_then(Value::as_str).unwrap_or("")),
+        repo,
+        repo_label,
+        state: v
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("ready")
+            .to_string(),
+        closed_kind: v
+            .get("closedKind")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        done_when: v
+            .get("doneWhen")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        wait_on: string_list(v.get("waitOn")),
+        wait_on_status,
+        runs: string_list(v.get("runs")),
+        artifacts,
+        brief: v.get("brief").and_then(Value::as_str).unwrap_or("").to_string(),
+        followups,
+        owner,
+        owner_ref: v
+            .get("ownerRef")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        auto_dispatch_prompt: ad
+            .and_then(|x| x.get("promptFile"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        auto_dispatch_run: ad
+            .and_then(|x| x.get("dispatchedRun"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        defer_reason: single_line(
+            v.get("deferReason").and_then(Value::as_str).unwrap_or(""),
+        ),
+        defer_until: v
+            .get("deferUntil")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        created_at: v
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        updated_at: v
+            .get("updatedAt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        state_since: v
+            .get("stateSince")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        close_reason: single_line(
+            v.get("closeReason").and_then(Value::as_str).unwrap_or(""),
+        ),
+        close_evidence: single_line(
+            v.get("closeEvidence").and_then(Value::as_str).unwrap_or(""),
+        ),
+        focus: single_line(v.get("focus").and_then(Value::as_str).unwrap_or("")),
+        next: single_line(v.get("next").and_then(Value::as_str).unwrap_or("")),
+        applied: v.get("applied").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+/// Pure read-only load of a work item's brief/card markdown file (zero subprocesses, zero writes).
+pub fn read_work_brief_markdown(item: &WorkItem) -> Option<Result<String, String>> {
+    let brief = item.brief.trim();
+    if brief.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(brief);
+    let resolved = if p.is_absolute() {
+        p
+    } else if !item.repo.is_empty() {
+        Path::new(&item.repo).join(&p)
+    } else {
+        p
+    };
+    let meta = match fs::metadata(&resolved) {
+        Ok(m) if m.is_file() => m,
+        Ok(_) => return Some(Err(format!("路径不是普通文件：{}", resolved.display()))),
+        Err(_) => return Some(Err(format!("卡片文件不存在：{}", resolved.display()))),
+    };
+    const MAX_BYTES: u64 = 256 * 1024;
+    if meta.len() > MAX_BYTES {
+        return Some(Err(format!(
+            "卡片文件过大（{} KB > 256 KB）：{}",
+            meta.len() / 1024,
+            resolved.display()
+        )));
+    }
+    Some(
+        fs::read_to_string(&resolved)
+            .map_err(|e| format!("无法读取卡片 {}: {e}", resolved.display())),
+    )
 }
 
 fn parse_activity(val: Option<&Value>) -> Option<ActivityInfo> {

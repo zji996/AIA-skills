@@ -30,10 +30,6 @@ fn make_sample_app() -> App {
     let snap = AppSnapshot {
         repos: vec![repo_a, repo_b],
         lane,
-        events: vec![],
-        dag_queue: vec![],
-        merges: vec![],
-        candidates: vec![],
         host_load: Some(HostLoad {
             load1_tenths: 18,
             load5_tenths: 14,
@@ -42,7 +38,7 @@ fn make_sample_app() -> App {
             mem_total_tenths_gib: Some(640),
         }),
         refreshed_at: "10:52:00".to_string(),
-        warnings: vec![],
+        ..AppSnapshot::default()
     };
     let mut app = App::new(
         snap,
@@ -195,15 +191,8 @@ fn snapshot_overlays_result_diff_and_command_modal() {
 #[test]
 fn snapshot_empty_state_is_minimal_and_tiny_terminal_does_not_panic() {
     let snap = AppSnapshot {
-        repos: vec![],
-        lane: LaneStatus::default(),
-        events: vec![],
-        dag_queue: vec![],
-        merges: vec![],
-        candidates: vec![],
-        host_load: None,
         refreshed_at: "11:00:00".to_string(),
-        warnings: vec![],
+        ..AppSnapshot::default()
     };
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("."), 5);
     let empty = render_to_string(&mut app, 80, 24);
@@ -233,14 +222,10 @@ fn snapshot_events_tab_liveness_activity_and_dag_queue() {
     let repo = parse_status_jsonl(Path::new("/home/dev/demo-api"), "~/demo-api", raw_runs);
     let snap = AppSnapshot {
         repos: vec![repo],
-        lane: LaneStatus::default(),
         events: parse_events_jsonl(raw_events),
         dag_queue: parse_dag_queue_jsonl(raw_queue),
-        merges: vec![],
-        candidates: vec![],
-        host_load: None,
         refreshed_at: "09:06:10".into(),
-        warnings: vec![],
+        ..AppSnapshot::default()
     };
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/dev/demo-api"), 5);
 
@@ -281,14 +266,9 @@ fn snapshot_review_states_and_review_events() {
     let repo = parse_status_jsonl(Path::new("/home/dev/demo-api"), "~/demo-api", raw_runs);
     let snap = AppSnapshot {
         repos: vec![repo],
-        lane: LaneStatus::default(),
         events: parse_events_jsonl(raw_events),
-        dag_queue: vec![],
-        merges: vec![],
-        candidates: vec![],
-        host_load: None,
         refreshed_at: "10:04:00".into(),
-        warnings: vec![],
+        ..AppSnapshot::default()
     };
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/dev/demo-api"), 5);
     let screen = render_to_string(&mut app, 150, 34);
@@ -326,15 +306,11 @@ fn snapshot_merges_and_candidates_tabs_and_events() {
 {"seq":23,"at":"2026-11-23T02:30:00Z","run":"radar-demo-api","repo":"/home/dev/demo-api","kind":"radar_done","payload":{"added":1,"total":1}}
 "#;
     let snap = AppSnapshot {
-        repos: vec![],
-        lane: LaneStatus::default(),
         events: parse_events_jsonl(raw_events),
-        dag_queue: vec![],
         merges: parse_merges_jsonl(raw_merges),
         candidates: parse_candidates_jsonl(raw_candidates),
-        host_load: None,
         refreshed_at: "11:03:00".into(),
-        warnings: vec![],
+        ..AppSnapshot::default()
     };
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/dev/demo-api"), 5);
 
@@ -380,4 +356,203 @@ fn snapshot_merges_and_candidates_tabs_and_events() {
     assert!(ev_screen.contains("合项"), "{ev_screen}");
     assert!(ev_screen.contains("合结"), "{ev_screen}");
     assert!(ev_screen.contains("侦察"), "{ev_screen}");
+}
+
+fn make_work_sample_app(card_path: Option<&Path>) -> App {
+    use delegate_tui::data::parse_work_jsonl;
+
+    let raw_runs = r#"
+{"run":"20261123-100000-r33","name":"6.33 快修","workId":"W033","state":"running","mode":"write","modelName":"neon","elapsedSeconds":720,"ageSeconds":720,"activity":{"kind":"running_command","cmd":"scripts/verify.sh","elapsedSeconds":30,"label":"在跑命令"}}
+{"run":"20261123-100500-r29","name":"导出工具","workId":"W029","state":"running","mode":"write","modelName":"sol","elapsedSeconds":180,"ageSeconds":180,"review":{"status":"reviewing","round":1,"reworkRounds":0}}
+{"run":"20261123-094000-r10","name":"鉴权改动","workId":"W010","state":"delivered","mode":"write","modelName":"neon","elapsedSeconds":300,"ageSeconds":500,"changes":{"files":2,"added":50,"deleted":10},"pendingChanges":{"files":2,"added":50,"deleted":10},"accept":{"command":"cargo test","ok":true,"exitCode":0},"review":{"status":"done","verdict":"PASS","round":1,"reworkRounds":0}}
+"#;
+    let brief_str = card_path
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "docs/owner/directions/streaming.md".to_string());
+    let raw_work = format!(
+        r#"
+{{"id":"D002","title":"身体流式动作","repo":"/home/dev/app","repoLabel":"app","state":"active","brief":"{brief}","owner":{{"kind":"direction","ask":"身体按意图实时生成连贯动作","recommendation":"先跑 2 天验证再定","ifUndecided":"沿用固定片段","cost":"2 天"}},"createdAt":"2026-11-23T01:00:00Z","updatedAt":"2026-11-23T01:00:00Z","stateSince":"2026-11-23T01:00:00Z","next":"work show D002"}}
+{{"id":"Q18","title":"删掉旧星痕","repo":"/home/dev/app","repoLabel":"app","state":"attention","owner":{{"kind":"act","ask":"在管理页删掉两条旧星痕","recommendation":"管理员私聊通知即可","ifUndecided":"她还会以为不能看视频","cost":"2 分钟"}},"createdAt":"2026-11-23T02:00:00Z","updatedAt":"2026-11-23T02:00:00Z","stateSince":"2026-11-23T02:00:00Z","next":"work close Q18 --evidence \"所有者：已处理\""}}
+{{"id":"Q20","title":"开启每日摘要","repo":"/home/dev/app","repoLabel":"app","state":"attention","owner":{{"kind":"nod","ask":"是否默认开启每日摘要？","recommendation":"建议照做，零额外成本","ifUndecided":"保持手工触发","cost":"0"}},"createdAt":"2026-11-23T02:05:00Z","updatedAt":"2026-11-23T02:05:00Z","stateSince":"2026-11-23T02:05:00Z","next":"work close Q20 --evidence \"所有者：同意\""}}
+{{"id":"Q21","title":"模型路由方案","repo":"/home/dev/app","repoLabel":"app","state":"attention","brief":"{brief}","owner":{{"kind":"card","ask":"看卡权衡路由方案 A/B","recommendation":"建议选方案 A","ifUndecided":"暂用默认路由","cost":"月增 $20"}},"createdAt":"2026-11-23T02:10:00Z","updatedAt":"2026-11-23T02:10:00Z","stateSince":"2026-11-23T02:10:00Z","next":"work close Q21 --evidence \"所有者：选 A\""}}
+{{"id":"Q19","title":"买官方直连 key","repo":"/home/dev/app","repoLabel":"app","state":"done","closedKind":"dropped","closeReason":"现有渠道够用，不买","owner":{{"kind":"nod","ask":"买官方直连 key？","recommendation":"不建议买","ifUndecided":"继续用现有渠道","cost":"$100/月"}},"createdAt":"2026-11-22T02:00:00Z","updatedAt":"2026-11-23T03:00:00Z","stateSince":"2026-11-23T03:00:00Z"}}
+{{"id":"W010","title":"接口鉴权交付","repo":"/home/dev/demo-api","repoLabel":"demo-api","state":"attention","doneWhen":"合入并跑通鉴权回归","runs":["20261123-094000-r10"],"focus":"待合 +2f 验✓ 审PASS","next":"apply r10","createdAt":"2026-11-23T01:00:00Z","updatedAt":"2026-11-23T04:00:00Z","stateSince":"2026-11-23T04:00:00Z"}}
+{{"id":"W011","title":"合入后核对日志","repo":"/home/dev/demo-api","repoLabel":"demo-api","state":"verify","doneWhen":"核对生产日志无报错","followups":[{{"id":1,"kind":"note","text":"观察 10 分钟错误率","done":false}}],"focus":"待办 1 条","next":"work close W011 --evidence \"…\"","createdAt":"2026-11-23T01:00:00Z","updatedAt":"2026-11-23T04:00:00Z","stateSince":"2026-11-23T04:00:00Z"}}
+{{"id":"W033","title":"6.33 审计快修","repo":"/home/dev/demo-api","repoLabel":"demo-api","state":"active","doneWhen":"verify 全绿","runs":["20261123-100000-r33"],"focus":"run r33 运行中 12m","next":"wait r33","createdAt":"2026-11-23T02:00:00Z","updatedAt":"2026-11-23T05:00:00Z","stateSince":"2026-11-23T05:00:00Z"}}
+{{"id":"W034","title":"6.34 分层验收","repo":"/home/dev/demo-api","repoLabel":"demo-api","state":"blocked","waitOn":["work_closed:W033"],"waitOnStatus":[{{"condition":"work_closed:W033","satisfied":false,"detail":"等 W033 关闭（当前 active）","pointer":"delegate work show W033"}}],"focus":"等 W033 关闭","next":"work show W034","createdAt":"2026-11-23T02:10:00Z","updatedAt":"2026-11-23T05:00:00Z","stateSince":"2026-11-23T05:00:00Z"}}
+{{"id":"W035","title":"6.35 预合并与快进 apply","repo":"/home/dev/demo-api","repoLabel":"demo-api","state":"blocked","waitOn":["work_closed:W034","owner:Q20"],"waitOnStatus":[{{"condition":"work_closed:W034","satisfied":false,"detail":"等 W034 关闭（当前 blocked）","pointer":"delegate work show W034"}},{{"condition":"owner:Q20","satisfied":false,"detail":"等所有者 Q20","pointer":"delegate work show Q20"}}],"focus":"等 W034 关闭","next":"work show W035","createdAt":"2026-11-23T02:20:00Z","updatedAt":"2026-11-23T05:00:00Z","stateSince":"2026-11-23T05:00:00Z"}}
+{{"id":"W029","title":"导出工具基础层","repo":"/home/dev/app","repoLabel":"app","state":"active","runs":["20261123-100500-r29"],"focus":"run r29 运行中","next":"wait r29","createdAt":"2026-11-23T02:00:00Z","updatedAt":"2026-11-23T05:00:00Z","stateSince":"2026-11-23T05:00:00Z"}}
+{{"id":"W031","title":"无损搬家上层流程","repo":"/home/dev/app","repoLabel":"app","state":"blocked","waitOn":["run_applied:20261123-100500-r29"],"waitOnStatus":[{{"condition":"run_applied:20261123-100500-r29","satisfied":false,"detail":"等 r29 合入","pointer":"delegate show 20261123-100500-r29"}}],"focus":"等 r29 合入","next":"work show W031","createdAt":"2026-11-23T02:30:00Z","updatedAt":"2026-11-23T05:00:00Z","stateSince":"2026-11-23T05:00:00Z"}}
+{{"id":"W040","title":"清理旧兼容列","repo":"/home/dev/app","repoLabel":"app","state":"ready","focus":"可派发 2h","next":"start --work W040 \"…\"","createdAt":"2026-11-23T01:00:00Z","updatedAt":"2026-11-23T01:00:00Z","stateSince":"2026-11-23T01:00:00Z"}}
+{{"id":"W041","title":"跟进所有者问题","repo":"/home/dev/app","repoLabel":"app","state":"blocked","waitOn":["owner:Q12"],"waitOnStatus":[{{"condition":"owner:Q12","satisfied":false,"detail":"等所有者 Q12","pointer":"delegate work show Q12"}}],"focus":"等所有者 Q12","next":"work show W041","createdAt":"2026-11-23T01:00:00Z","updatedAt":"2026-11-23T01:00:00Z","stateSince":"2026-11-23T01:00:00Z"}}
+{{"id":"W042","title":"夜间压测计划","repo":"/home/dev/app","repoLabel":"app","state":"deferred","deferReason":"等低峰窗口","deferUntil":"2026-11-24T00:00:00Z","focus":"暂缓至 2026-11-24","next":"work show W042","createdAt":"2026-11-23T01:00:00Z","updatedAt":"2026-11-23T01:00:00Z","stateSince":"2026-11-23T01:00:00Z"}}
+{{"id":"W001","title":"今天完成的基础重构","repo":"/home/dev/app","repoLabel":"app","state":"done","closedKind":"closed","closeEvidence":"abc1234 测试全绿","createdAt":"2026-11-23T00:30:00Z","updatedAt":"2026-11-23T04:00:00Z","stateSince":"2026-11-23T04:00:00Z"}}
+"#,
+        brief = brief_str
+    );
+
+    let repo = parse_status_jsonl(Path::new("/home/dev/demo-api"), "~/demo-api", raw_runs);
+    let snap = AppSnapshot {
+        repos: vec![repo],
+        work: parse_work_jsonl(&raw_work),
+        today_ymd: "2026-11-23".to_string(),
+        refreshed_at: "10:15:00".to_string(),
+        ..AppSnapshot::default()
+    };
+    App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/dev/demo-api"), 5)
+}
+
+#[test]
+fn work_view_renders_grouping_dependency_chains_live_status_at_120_80_50_and_empty() {
+    use delegate_tui::app::ViewTab;
+
+    let mut app = make_work_sample_app(None);
+    // Press 'w' to enter Work view
+    app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Work);
+
+    // 1. Wide 120 columns
+    let s120 = render_to_string(&mut app, 120, 34);
+    // L0 top bar counts: 等你 4 (Q18, Q20, Q21, D002), 需处理 2 (W010, W011), 就绪 1 (W040), 推进中 2 (W029, W033), 等待 4 (W034, W035, W031, W041), 暂缓 1 (W042), 今天完成 1 (W001)
+    assert!(s120.contains("等你 4"), "{s120}");
+    assert!(s120.contains("需处理 2"), "{s120}");
+    assert!(s120.contains("就绪 1"), "{s120}");
+    assert!(s120.contains("推进中 2"), "{s120}");
+    assert!(s120.contains("等待 4"), "{s120}");
+    assert!(s120.contains("暂缓 1"), "{s120}");
+    assert!(s120.contains("今天完成 1"), "{s120}");
+
+    // Owner items pinned at top in 动手 -> 点头 -> 看卡 -> 方向 order
+    let pos_q18 = s120.find("Q18").expect("Q18");
+    let pos_q20 = s120.find("Q20").expect("Q20");
+    let pos_q21 = s120.find("Q21").expect("Q21");
+    let pos_d002 = s120.find("D002").expect("D002");
+    assert!(pos_q18 < pos_q20 && pos_q20 < pos_q21 && pos_q21 < pos_d002, "{s120}");
+
+    // Group order: 等你 -> 需处理 -> 推进中 -> 就绪 -> 等待 -> 暂缓 -> 已完成折叠
+    let pos_owner = s120.find("▾ 等你").expect("owner group");
+    let pos_need = s120.find("▾ 需处理").expect("need group");
+    let pos_prog = s120.find("▾ 推进中").expect("prog group");
+    let pos_ready = s120.find("▾ 就绪").expect("ready group");
+    let pos_wait = s120.find("▾ 等待").expect("wait group");
+    let pos_defer = s120.find("▾ 暂缓").expect("defer group");
+    let pos_done_fold = s120.find("▸ 已完成 1 条").expect("done fold");
+    assert!(
+        pos_owner < pos_need
+            && pos_need < pos_prog
+            && pos_prog < pos_ready
+            && pos_ready < pos_wait
+            && pos_wait < pos_defer
+            && pos_defer < pos_done_fold,
+        "{s120}"
+    );
+    // Done item is folded by default
+    assert!(!s120.contains("今天完成的基础重构"), "{s120}");
+
+    // Dependency chain indentation: W033 -> W034 -> W035 (+1) and W029 -> W031
+    assert!(s120.contains("└─ ◌ W034"), "{s120}");
+    assert!(s120.contains("   └─ ◌ W035"), "{s120}");
+    assert!(s120.contains("+1"), "{s120}");
+    assert!(s120.contains("└─ ◌ W031"), "{s120}");
+
+    // Live run one-liners
+    assert!(s120.contains("运行中 12 分钟 · 在跑验收"), "{s120}");
+    assert!(s120.contains("审查中"), "{s120}");
+    assert!(s120.contains("待合入 · 验收✓ 审查 PASS"), "{s120}");
+    assert!(s120.contains("等 W033 关闭"), "{s120}");
+    assert!(s120.contains("等所有者 Q12"), "{s120}");
+
+    // 2. 80 columns (still single-line L0 and single-line items)
+    let s80 = render_to_string(&mut app, 80, 32);
+    assert!(s80.contains("等你 4"), "{s80}");
+    assert!(s80.contains("今天完成 1"), "{s80}");
+    assert!(s80.contains("└─ ◌ W034"), "{s80}");
+    assert!(s80.contains("+1"), "{s80}");
+
+    // 3. 50 columns (mobile/compact layout: 2-line L0, 2-line items, compact ↳ prefix)
+    let s50 = render_to_string(&mut app, 50, 48);
+    let lines50: Vec<&str> = s50.lines().collect();
+    assert!(lines50[0].contains("等你 4") && lines50[0].contains("推进中 2"), "{s50}");
+    assert!(lines50[1].contains("等待 4") && lines50[1].contains("今天完成 1"), "{s50}");
+    assert!(s50.contains("↳ ◌ W034"), "{s50}");
+    assert!(s50.contains(" ↳ ◌ W035"), "{s50}");
+    assert!(s50.contains("等待 +1"), "{s50}");
+
+    // 4. Dropped filter ('x' key) surfaces Q19
+    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    let s_drop = render_to_string(&mut app, 100, 20);
+    assert!(s_drop.contains("滤:已否"), "{s_drop}");
+    assert!(s_drop.contains("Q19"), "{s_drop}");
+    assert!(s_drop.contains("现有渠道够用"), "{s_drop}");
+    // Clear filter with Esc
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    // 5. Empty worktable
+    let empty_snap = AppSnapshot {
+        refreshed_at: "11:00:00".into(),
+        ..AppSnapshot::default()
+    };
+    let mut empty_app = App::new(empty_snap, PathBuf::from("delegate"), PathBuf::from("."), 5);
+    empty_app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+    let s_empty = render_to_string(&mut empty_app, 80, 20);
+    assert!(s_empty.contains("暂无工作项"), "{s_empty}");
+    assert!(s_empty.contains("等你 0"), "{s_empty}");
+}
+
+#[test]
+fn work_card_markdown_rendering_and_bidirectional_run_linkage() {
+    use delegate_tui::app::ViewTab;
+
+    // Create a temporary owner direction card markdown file
+    let tmp = std::env::temp_dir().join(format!(
+        "delegate-tui-card-test-{}.md",
+        std::process::id()
+    ));
+    std::fs::write(
+        &tmp,
+        "# Q21 路由方案权衡\n\n**方案 A** 延迟低，见 [`router.rs`](file:///tmp/router.rs)。\n\n- 成本可控\n",
+    )
+    .unwrap();
+
+    let mut app = make_work_sample_app(Some(&tmp));
+    // Run view initially selects W010's run (or first run) — verify detail pane shows linked work item ID!
+    let runs_screen = render_to_string(&mut app, 140, 32);
+    assert!(runs_screen.contains("[W010]") || runs_screen.contains("[W033]"), "{runs_screen}");
+    assert!(runs_screen.contains("工作项:"), "{runs_screen}");
+
+    // Press 'w' in Run view -> jumps straight to Work view selecting that run's work item!
+    let expected_wid = app
+        .snapshot
+        .work_id_for_run(app.selected_run().unwrap())
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Work);
+    assert_eq!(
+        app.selected_work_item().map(|w| w.id.as_str()),
+        Some(expected_wid.as_str())
+    );
+
+    // Press 't' in Work view -> jumps back to Runs view selecting that item's run!
+    app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Runs);
+    assert_eq!(
+        app.snapshot.work_id_for_run(app.selected_run().unwrap()).as_deref(),
+        Some(expected_wid.as_str())
+    );
+
+    // Jump to owner card item Q21 and press Enter -> opens L2 Work Card with rendered Markdown!
+    assert!(app.jump_to_work_id("Q21"));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let card_screen = render_to_string(&mut app, 100, 30);
+    assert!(card_screen.contains("工作卡 · Q21"), "{card_screen}");
+    assert!(card_screen.contains("主控建议：建议选方案 A"), "{card_screen}");
+    assert!(card_screen.contains("不定会怎样：暂用默认路由"), "{card_screen}");
+    assert!(card_screen.contains("成本：月增 $20"), "{card_screen}");
+    assert!(card_screen.contains("Q21 路由方案权衡"), "{card_screen}");
+    assert!(card_screen.contains("方案 A"), "{card_screen}");
+    assert!(card_screen.contains("router.rs"), "{card_screen}");
+    assert!(!card_screen.contains("**"), "raw markdown bold leaked: {card_screen}");
+    assert!(!card_screen.contains("file:///"), "raw markdown link leaked: {card_screen}");
+
+    let _ = std::fs::remove_file(&tmp);
 }

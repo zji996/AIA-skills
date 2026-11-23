@@ -432,6 +432,7 @@ pub struct RunItem {
     pub tokens_input: Option<u64>,
     pub tokens_output: Option<u64>,
     pub tokens_cache_read: Option<u64>,
+    pub work_id: Option<String>,
 }
 
 impl RunItem {
@@ -561,6 +562,7 @@ impl RunItem {
             self.activity.as_ref().map(|a| a.label.as_str()).unwrap_or(""),
             review_snippet.as_str(),
             self.next_step.as_deref().unwrap_or(""),
+            self.work_id.as_deref().unwrap_or(""),
         ];
         if haystacks
             .iter()
@@ -729,15 +731,262 @@ impl HostLoad {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OwnerKind {
+    Act,
+    Nod,
+    Card,
+    Direction,
+}
+
+impl OwnerKind {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "act" => Some(Self::Act),
+            "nod" => Some(Self::Nod),
+            "card" => Some(Self::Card),
+            "direction" => Some(Self::Direction),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Act => "动手",
+            Self::Nod => "点头",
+            Self::Card => "看卡",
+            Self::Direction => "方向",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkOwnerInfo {
+    pub kind: OwnerKind,
+    pub ask: String,
+    pub recommendation: String,
+    pub if_undecided: String,
+    pub cost: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkWaitStatus {
+    pub condition: String,
+    pub satisfied: bool,
+    pub detail: String,
+    pub pointer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkFollowup {
+    pub id: usize,
+    pub kind: String,
+    pub text: String,
+    pub anchor: String,
+    pub source_run: String,
+    pub done: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkArtifact {
+    pub path: String,
+    pub source_run: String,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WorkBucket {
+    Owner,
+    NeedsAction,
+    InProgress,
+    Ready,
+    Waiting,
+    Deferred,
+    Done,
+    Dropped,
+}
+
+impl WorkBucket {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Owner => "等你",
+            Self::NeedsAction => "需处理",
+            Self::InProgress => "推进中",
+            Self::Ready => "就绪",
+            Self::Waiting => "等待",
+            Self::Deferred => "暂缓",
+            Self::Done => "已完成",
+            Self::Dropped => "已否",
+        }
+    }
+
+    pub fn is_open(self) -> bool {
+        !matches!(self, Self::Done | Self::Dropped)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct WorkItem {
+    pub id: String,
+    pub title: String,
+    pub repo: String,
+    pub repo_label: String,
+    pub state: String,
+    pub closed_kind: String,
+    pub done_when: String,
+    pub wait_on: Vec<String>,
+    pub wait_on_status: Vec<WorkWaitStatus>,
+    pub runs: Vec<String>,
+    pub artifacts: Vec<WorkArtifact>,
+    pub brief: String,
+    pub followups: Vec<WorkFollowup>,
+    pub owner: Option<WorkOwnerInfo>,
+    pub owner_ref: String,
+    pub auto_dispatch_prompt: String,
+    pub auto_dispatch_run: String,
+    pub defer_reason: String,
+    pub defer_until: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub state_since: String,
+    pub close_reason: String,
+    pub close_evidence: String,
+    pub focus: String,
+    pub next: String,
+    pub applied: bool,
+}
+
+impl WorkItem {
+    pub fn bucket(&self) -> WorkBucket {
+        if self.state == "done" {
+            if self.closed_kind == "dropped" {
+                return WorkBucket::Dropped;
+            }
+            return WorkBucket::Done;
+        }
+        if self.owner.is_some() {
+            return WorkBucket::Owner;
+        }
+        match self.state.as_str() {
+            "attention" | "verify" => WorkBucket::NeedsAction,
+            "active" => WorkBucket::InProgress,
+            "ready" => WorkBucket::Ready,
+            "blocked" => WorkBucket::Waiting,
+            "deferred" => WorkBucket::Deferred,
+            _ => WorkBucket::Ready,
+        }
+    }
+
+    pub fn state_badge(&self) -> &'static str {
+        if self.state == "done" {
+            return if self.closed_kind == "dropped" {
+                "已否"
+            } else {
+                "完成"
+            };
+        }
+        if let Some(ow) = &self.owner {
+            return ow.kind.label();
+        }
+        match self.state.as_str() {
+            "attention" => "需处理",
+            "verify" => "待闭环",
+            "active" => "推进中",
+            "ready" => "就绪",
+            "blocked" => "等待",
+            "deferred" => "暂缓",
+            _ => "工作",
+        }
+    }
+
+    pub fn display_title(&self) -> &str {
+        if let Some(ow) = &self.owner {
+            if !ow.ask.is_empty() {
+                return &ow.ask;
+            }
+        }
+        &self.title
+    }
+
+    pub fn pending_followups(&self) -> usize {
+        self.followups.iter().filter(|f| !f.done).count()
+    }
+
+    pub fn matches_filter(&self, query_lower: &str) -> bool {
+        if query_lower.is_empty() {
+            return true;
+        }
+        let ow_kind = self
+            .owner
+            .as_ref()
+            .map(|o| o.kind.label())
+            .unwrap_or("");
+        let ow_ask = self
+            .owner
+            .as_ref()
+            .map(|o| o.ask.as_str())
+            .unwrap_or("");
+        let ow_rec = self
+            .owner
+            .as_ref()
+            .map(|o| o.recommendation.as_str())
+            .unwrap_or("");
+        let haystacks = [
+            self.id.as_str(),
+            self.title.as_str(),
+            self.repo_label.as_str(),
+            self.state.as_str(),
+            self.state_badge(),
+            self.bucket().label(),
+            self.focus.as_str(),
+            self.done_when.as_str(),
+            self.close_reason.as_str(),
+            self.close_evidence.as_str(),
+            self.brief.as_str(),
+            ow_kind,
+            ow_ask,
+            ow_rec,
+        ];
+        if haystacks
+            .iter()
+            .any(|h| h.to_lowercase().contains(query_lower))
+        {
+            return true;
+        }
+        self.wait_on
+            .iter()
+            .any(|w| w.to_lowercase().contains(query_lower))
+            || self
+                .runs
+                .iter()
+                .any(|r| r.to_lowercase().contains(query_lower))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkCounts {
+    pub owner: usize,
+    pub needs_action: usize,
+    pub ready: usize,
+    pub in_progress: usize,
+    pub waiting: usize,
+    pub deferred: usize,
+    pub done_today: usize,
+    pub done_total: usize,
+    pub dropped_total: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppSnapshot {
     pub repos: Vec<RepoGroup>,
+    pub work: Vec<WorkItem>,
     pub lane: LaneStatus,
     pub events: Vec<EventItem>,
     pub dag_queue: Vec<DagQueueItem>,
     pub merges: Vec<MergeRunItem>,
     pub candidates: Vec<RadarCandidateItem>,
     pub host_load: Option<HostLoad>,
+    pub today_ymd: String,
     pub refreshed_at: String,
     pub warnings: Vec<String>,
 }
@@ -747,6 +996,7 @@ impl AppSnapshot {
     pub fn data_fingerprint(&self) -> u64 {
         let mut h = DefaultHasher::new();
         self.repos.hash(&mut h);
+        self.work.hash(&mut h);
         self.lane.hash(&mut h);
         self.events.hash(&mut h);
         self.dag_queue.hash(&mut h);
@@ -759,6 +1009,352 @@ impl AppSnapshot {
 
     pub fn total_count(&self, group: GroupKind) -> usize {
         self.repos.iter().map(|r| r.count_group(group)).sum()
+    }
+
+    pub fn is_done_today(&self, item: &WorkItem) -> bool {
+        if item.state != "done" || item.closed_kind == "dropped" {
+            return false;
+        }
+        if self.today_ymd.is_empty() {
+            return false;
+        }
+        let ts = if !item.state_since.is_empty() {
+            item.state_since.as_str()
+        } else {
+            item.updated_at.as_str()
+        };
+        iso_to_local_ymd(ts).is_some_and(|d| d == self.today_ymd)
+            || ts.starts_with(&self.today_ymd)
+    }
+
+    pub fn work_counts(&self) -> WorkCounts {
+        let mut c = WorkCounts::default();
+        for w in &self.work {
+            match w.bucket() {
+                WorkBucket::Owner => c.owner += 1,
+                WorkBucket::NeedsAction => c.needs_action += 1,
+                WorkBucket::InProgress => c.in_progress += 1,
+                WorkBucket::Ready => c.ready += 1,
+                WorkBucket::Waiting => c.waiting += 1,
+                WorkBucket::Deferred => c.deferred += 1,
+                WorkBucket::Done => {
+                    c.done_total += 1;
+                    if self.is_done_today(w) {
+                        c.done_today += 1;
+                    }
+                }
+                WorkBucket::Dropped => c.dropped_total += 1,
+            }
+        }
+        c
+    }
+
+    pub fn find_run_by_id(&self, run_id: &str) -> Option<(usize, usize, &RunItem)> {
+        if run_id.is_empty() {
+            return None;
+        }
+        for (ri, repo) in self.repos.iter().enumerate() {
+            for (run_i, run) in repo.runs.iter().enumerate() {
+                if run.run == run_id || run.chain_ids.iter().any(|c| c == run_id) {
+                    return Some((ri, run_i, run));
+                }
+            }
+        }
+        None
+    }
+
+    /// Find the most relevant `RunItem` linked to a work item (preferring active runs, then latest).
+    pub fn find_run_for_work(&self, item: &WorkItem) -> Option<(usize, usize, &RunItem)> {
+        let mut fallback: Option<(usize, usize, &RunItem)> = None;
+        for rid in item.runs.iter().rev() {
+            if let Some((ri, run_i, run)) = self.find_run_by_id(rid) {
+                if matches!(run.group, GroupKind::Running | GroupKind::Queued) {
+                    return Some((ri, run_i, run));
+                }
+                if fallback.is_none() {
+                    fallback = Some((ri, run_i, run));
+                }
+            }
+        }
+        if fallback.is_none() {
+            // Also check runs carrying `work_id == Some(item.id)`
+            for (ri, repo) in self.repos.iter().enumerate() {
+                for (run_i, run) in repo.runs.iter().enumerate() {
+                    if run.work_id.as_deref() == Some(item.id.as_str()) {
+                        if matches!(run.group, GroupKind::Running | GroupKind::Queued) {
+                            return Some((ri, run_i, run));
+                        }
+                        if fallback.is_none() {
+                            fallback = Some((ri, run_i, run));
+                        }
+                    }
+                }
+            }
+        }
+        fallback
+    }
+
+    pub fn work_id_for_run(&self, run: &RunItem) -> Option<String> {
+        if let Some(wid) = &run.work_id {
+            if !wid.is_empty() {
+                return Some(wid.clone());
+            }
+        }
+        for w in &self.work {
+            if w.runs.iter().any(|r| {
+                r == &run.run || run.chain_ids.iter().any(|cid| cid == r)
+            }) {
+                return Some(w.id.clone());
+            }
+        }
+        None
+    }
+
+    pub fn work_item_by_id(&self, id: &str) -> Option<&WorkItem> {
+        self.work.iter().find(|w| w.id == id)
+    }
+
+    /// Synthesize a live one-line status ("此刻在干什么") for a work item, enriched with
+    /// live RunItem details when an active or pending run is attached.
+    pub fn work_live_status(&self, item: &WorkItem) -> String {
+        if let Some(ow) = &item.owner {
+            if item.state == "done" {
+                return if item.closed_kind == "dropped" {
+                    format!("已否：{}", item.close_reason)
+                } else if !item.close_evidence.is_empty() {
+                    format!("已定：{}", item.close_evidence)
+                } else {
+                    "已定".to_string()
+                };
+            }
+            if !ow.recommendation.is_empty() {
+                return format!("建议：{}", ow.recommendation);
+            }
+            if !ow.cost.is_empty() {
+                return format!("成本：{}", ow.cost);
+            }
+            if !item.brief.is_empty() {
+                return "见卡片".to_string();
+            }
+            return format!("等所有者（{}）", ow.kind.label());
+        }
+
+        if item.state != "done" {
+            if let Some((_, _, run)) = self.find_run_for_work(item) {
+                let use_run = matches!(run.group, GroupKind::Running | GroupKind::Queued)
+                    || (!run.applied && matches!(item.state.as_str(), "attention" | "active"));
+                if use_run {
+                    return live_run_one_liner(run);
+                }
+            }
+        }
+
+        match item.state.as_str() {
+            "blocked" => {
+                if let Some(ws) = item.wait_on_status.iter().find(|w| !w.satisfied) {
+                    return clean_wait_detail(&ws.detail);
+                }
+                if let Some(raw) = item.wait_on.first() {
+                    return format_raw_wait(raw);
+                }
+                if !item.focus.is_empty() {
+                    return item.focus.clone();
+                }
+                "等前置".to_string()
+            }
+            "verify" => {
+                if let Some(art) = item.artifacts.first() {
+                    return format!("待接线 {}", art.path);
+                }
+                let pending = item.pending_followups();
+                if pending > 0 {
+                    return format!("待办 {pending} 条");
+                }
+                if !item.focus.is_empty() {
+                    return item.focus.clone();
+                }
+                "待闭环".to_string()
+            }
+            "done" => {
+                if item.closed_kind == "dropped" {
+                    format!("已否：{}", item.close_reason)
+                } else if !item.close_evidence.is_empty() {
+                    format!("已完成：{}", item.close_evidence)
+                } else {
+                    "已完成".to_string()
+                }
+            }
+            _ => {
+                if !item.focus.is_empty() {
+                    item.focus.clone()
+                } else {
+                    item.state_badge().to_string()
+                }
+            }
+        }
+    }
+}
+
+fn clean_wait_detail(detail: &str) -> String {
+    if let Some((head, _)) = detail.split_once("（当前 ") {
+        head.to_string()
+    } else {
+        detail.to_string()
+    }
+}
+
+fn format_raw_wait(raw: &str) -> String {
+    if let Some(wid) = raw.strip_prefix("work_closed:") {
+        format!("等 {wid} 关闭")
+    } else if let Some(oref) = raw.strip_prefix("owner:") {
+        format!("等所有者 {oref}")
+    } else if let Some(run_ref) = raw.strip_prefix("run_applied:") {
+        format!("等 {run_ref} 合入")
+    } else if let Some(run_ref) = raw.strip_prefix("run_delivered:") {
+        format!("等 {run_ref} 交付")
+    } else if let Some(ts) = raw.strip_prefix("after_time:") {
+        format!("等到 {}", &ts[..ts.len().min(10)])
+    } else if let Some(m) = raw.strip_prefix("manual:") {
+        format!("手动：{m}")
+    } else {
+        raw.to_string()
+    }
+}
+
+pub fn live_run_one_liner(run: &RunItem) -> String {
+    if run.question && !run.applied {
+        return "提问等决定".to_string();
+    }
+    match run.group {
+        GroupKind::Running => {
+            if let Some(rev) = &run.review {
+                if rev.status == "reviewing" {
+                    return if rev.round > 1 {
+                        format!("审查中 第{}轮", rev.round)
+                    } else {
+                        "审查中".to_string()
+                    };
+                }
+                if rev.status == "reworking" {
+                    let r = rev.rework_rounds.max(rev.round).max(1);
+                    return format!("返工中 第{r}轮");
+                }
+            }
+            let dur = format_duration_zh(run.elapsed_seconds.or(run.age_seconds));
+            let base = if run.stall_warning.is_some() {
+                format!("卡住提醒 {dur}")
+            } else {
+                format!("运行中 {dur}")
+            };
+            let act_phrase = run.activity.as_ref().and_then(|act| match act.kind.as_str() {
+                "running_command" => {
+                    let cmd = act.cmd.as_deref().unwrap_or("");
+                    let low = cmd.to_ascii_lowercase();
+                    if low.contains("verify")
+                        || low.contains("accept")
+                        || low.contains("cargo test")
+                        || low.contains("clippy")
+                        || low.contains("pytest")
+                        || low.contains("pnpm test")
+                    {
+                        Some("在跑验收".to_string())
+                    } else if !cmd.is_empty() {
+                        let first = cmd.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+                        Some(format!("在跑 {first}"))
+                    } else {
+                        Some("在跑命令".to_string())
+                    }
+                }
+                "thinking" => Some("在思考".to_string()),
+                "waiting" => Some("等待中".to_string()),
+                "quota" => Some("等配额".to_string()),
+                "error" => Some("报错".to_string()),
+                _ => None,
+            });
+            match act_phrase {
+                Some(p) => format!("{base} · {p}"),
+                None => base,
+            }
+        }
+        GroupKind::Queued => {
+            if let Some(ahead) = run.queue_ahead.or(run.measure_waiting_ahead) {
+                format!("排队中 · 前方 {ahead} 位")
+            } else if let Some(reason) = &run.queue_reason {
+                format!("排队中 · {reason}")
+            } else {
+                "排队中".to_string()
+            }
+        }
+        GroupKind::Pending => {
+            if !run.applied
+                && (run.state == "delivered"
+                    || (run.state == "answered" && run.pending_files > 0))
+            {
+                let mut tags = Vec::new();
+                match &run.accept {
+                    AcceptStatus::Passed { .. } => tags.push("验收✓".to_string()),
+                    AcceptStatus::Failed { .. } => tags.push("验收✗".to_string()),
+                    AcceptStatus::NotExecuted { .. } => tags.push("验收待".to_string()),
+                    AcceptStatus::None => {}
+                }
+                if let Some(rev) = &run.review {
+                    match rev.verdict.as_deref() {
+                        Some("PASS") => tags.push("审查 PASS".to_string()),
+                        Some("NEEDS_CONTROLLER") => tags.push("需主控审查".to_string()),
+                        Some("REWORK") => tags.push("退回返工".to_string()),
+                        _ => {}
+                    }
+                }
+                if tags.is_empty() {
+                    return "待合入".to_string();
+                }
+                return format!("待合入 · {}", tags.join(" "));
+            }
+            if run.state == "answered" && !run.applied {
+                return "待回答/有新答复".to_string();
+            }
+            format!("需处理 · {}", run.state_badge())
+        }
+        GroupKind::MergedUncleaned => "已合入待清理".to_string(),
+        GroupKind::Stopped => "已停止".to_string(),
+    }
+}
+
+/// Parse an ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) and convert to local `YYYY-MM-DD`.
+pub fn iso_to_local_ymd(iso: &str) -> Option<String> {
+    let s = iso.trim();
+    if s.len() < 19 || !s.ends_with('Z') {
+        if s.len() >= 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-' {
+            return Some(s[..10].to_string());
+        }
+        return None;
+    }
+    let y: i32 = s[0..4].parse().ok()?;
+    let mo: i32 = s[5..7].parse().ok()?;
+    let d: i32 = s[8..10].parse().ok()?;
+    let h: i32 = s[11..13].parse().ok()?;
+    let mi: i32 = s[14..16].parse().ok()?;
+    let sec: i32 = s[17..19].parse().ok()?;
+    // Howard Hinnant civil-from-days inverse for UTC epoch seconds (avoids mutating TZ)
+    let y_adj = y - i32::from(mo <= 2);
+    let era = y_adj.div_euclid(400);
+    let yoe = (y_adj - era * 400) as i64;
+    let m_adj = (mo + if mo > 2 { -3 } else { 9 }) as i64;
+    let doy = (153 * m_adj + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era as i64 * 146097 + doe - 719468;
+    let utc_secs = (days * 86400 + h as i64 * 3600 + mi as i64 * 60 + sec as i64) as libc::time_t;
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&utc_secs, &mut tm).is_null() {
+            return Some(s[..10].to_string());
+        }
+        Some(format!(
+            "{:04}-{:02}-{:02}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday
+        ))
     }
 }
 
