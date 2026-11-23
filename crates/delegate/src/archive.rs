@@ -410,6 +410,7 @@ pub fn preserve(run: &Path) -> Res<Option<PathBuf>> {
         "applied.patch",
         "review.json",
         "review.md",
+        "usage-rounds.jsonl",
         "controller-review.diff",
         "sign.json",
         "exit_code",
@@ -428,6 +429,17 @@ pub fn preserve(run: &Path) -> Res<Option<PathBuf>> {
             if crate::runs::is_round_result_name(&fname.to_string_lossy()) && entry.path().is_file()
             {
                 fs::copy(entry.path(), record.join(&fname)).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(run.join("review")) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let ufile = p.join("usage.json");
+            if p.is_dir() && ufile.is_file() {
+                let dst = record.join("review").join(entry.file_name());
+                fs::create_dir_all(&dst).map_err(|e| e.to_string())?;
+                fs::copy(&ufile, dst.join("usage.json")).map_err(|e| e.to_string())?;
             }
         }
     }

@@ -3685,12 +3685,15 @@ fn render_accounts_list_pane(frame: &mut Frame, app: &mut App, area: Rect) {
         app.accounts_scroll = max_scroll;
     }
 
-    let id_w: usize = if iw >= 56 { 14 } else { 10 };
-    let used_w: usize = if iw >= 52 { 16 } else { 0 };
+    let id_w: usize = if iw >= 56 { 12 } else { 10 };
+    let show_usage = iw >= 48;
+    let u5_w: usize = if show_usage { 7 } else { 0 };
+    let u7_w: usize = if show_usage { 7 } else { 0 };
+    let used_w: usize = if iw >= 78 { 11 } else { 0 };
     let status_w: usize = 6; // "★ 活跃" or "  备用"
-    let email_w: usize = iw
-        .saturating_sub(2 + status_w + 1 + id_w + 1 + if used_w > 0 { 1 + used_w } else { 0 })
-        .max(8);
+    let extra_w = (if show_usage { 1 + u5_w + 1 + u7_w } else { 0 })
+        + (if used_w > 0 { 1 + used_w } else { 0 });
+    let email_w: usize = iw.saturating_sub(2 + status_w + 1 + id_w + 1 + extra_w).max(8);
 
     let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
     if show_header {
@@ -3701,6 +3704,12 @@ fn render_accounts_list_pane(frame: &mut Frame, app: &mut App, area: Rect) {
         hdr.push_str(&pad_right("槽位", id_w));
         hdr.push(' ');
         hdr.push_str(&pad_right("邮箱", email_w));
+        if show_usage {
+            hdr.push(' ');
+            hdr.push_str(&pad_left("5h用量", u5_w));
+            hdr.push(' ');
+            hdr.push_str(&pad_left("7d用量", u7_w));
+        }
         if used_w > 0 {
             hdr.push(' ');
             hdr.push_str(&pad_left("最后使用", used_w));
@@ -3750,6 +3759,28 @@ fn render_accounts_list_pane(frame: &mut Frame, app: &mut App, area: Rect) {
             Span::raw(" "),
             Span::styled(pad_right(email_text, email_w), if selected { primary() } else { muted() }),
         ];
+        if show_usage {
+            let u5 = &acct.usage.five_hour;
+            let u7 = &acct.usage.seven_day;
+            let u5_txt = if u5.uncounted_running > 0 {
+                format!("{}+", format_tokens_short(u5.total))
+            } else {
+                format_tokens_short(u5.total)
+            };
+            let u7_txt = format_tokens_short(u7.total);
+            let u5_style = if u5.uncounted_running > 0 {
+                Style::default().fg(STATUS_PENDING)
+            } else if u5.total > 0 {
+                primary()
+            } else {
+                muted()
+            };
+            let u7_style = if u7.total > 0 { primary() } else { muted() };
+            row_spans.push(Span::raw(" "));
+            row_spans.push(Span::styled(pad_left(&u5_txt, u5_w), u5_style));
+            row_spans.push(Span::raw(" "));
+            row_spans.push(Span::styled(pad_left(&u7_txt, u7_w), u7_style));
+        }
         if used_w > 0 {
             let used_short = format_iso_compact(&acct.last_used_at);
             row_spans.push(Span::raw(" "));
@@ -3764,6 +3795,68 @@ fn render_accounts_list_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn format_tokens_short(n: u64) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    let f = n as f64;
+    if f >= 1_000_000_000.0 {
+        format!("{:.2}B", f / 1_000_000_000.0)
+    } else if f >= 1_000_000.0 {
+        format!("{:.1}M", f / 1_000_000.0)
+    } else if f >= 1_000.0 {
+        format!("{:.1}K", f / 1_000.0)
+    } else {
+        format!("{n}")
+    }
+}
+
+fn format_pct_x100(pct_x100: u32) -> String {
+    format!("{:.2}%", pct_x100 as f64 / 100.0)
+}
+
+fn format_minutes_short(mins: u64) -> String {
+    if mins < 60 {
+        format!("{mins}m")
+    } else if mins < 48 * 60 {
+        let h = mins / 60;
+        let m = mins % 60;
+        if m == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h{m:02}m")
+        }
+    } else {
+        let d = mins / (24 * 60);
+        let h = (mins % (24 * 60)) / 60;
+        if h == 0 {
+            format!("{d}d")
+        } else {
+            format!("{d}d{h}h")
+        }
+    }
+}
+
+fn format_usage_window_line(label: &str, w: &AccountUsageWindow) -> String {
+    let mut text = if w.total == 0 {
+        format!("{label}: 0")
+    } else {
+        format!(
+            "{label}: {}（in {} / out {} / cache {} · 作者 {} / 审查 {}）",
+            format_tokens_short(w.total),
+            format_tokens_short(w.input),
+            format_tokens_short(w.output),
+            format_tokens_short(w.cache_read),
+            format_tokens_short(w.author_total),
+            format_tokens_short(w.reviewer_total),
+        )
+    };
+    if w.uncounted_running > 0 {
+        text.push_str(&format!(" · 运行中未计 {}", w.uncounted_running));
+    }
+    text
 }
 
 fn format_iso_compact(iso: &str) -> String {
@@ -3890,6 +3983,75 @@ fn render_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled("来源: ", muted()),
                 Span::styled(acct.source.clone(), muted()),
             ]));
+        }
+        out.push(Line::raw(""));
+
+        // Local-only usage (5h / 7d) + optional manual quota snapshot & advisory estimate
+        out.push(section_header("本地用量（不调外部额度接口）"));
+        push_indented_wrapped(
+            &mut out,
+            "  ",
+            &format_usage_window_line("近 5 小时", &acct.usage.five_hour),
+            iw,
+            if acct.usage.five_hour.total > 0 { primary() } else { muted() },
+        );
+        push_indented_wrapped(
+            &mut out,
+            "  ",
+            &format_usage_window_line("近 7 天", &acct.usage.seven_day),
+            iw,
+            if acct.usage.seven_day.total > 0 { primary() } else { muted() },
+        );
+        if let Some(note) = &acct.quota_note {
+            let mut parts = Vec::new();
+            if let Some(w) = note.weekly_pct_x100 {
+                let ts = format_iso_compact(&note.weekly_at);
+                parts.push(format!("周余 {} ({ts})", format_pct_x100(w)));
+            }
+            if let Some(fh) = note.five_hour_pct_x100 {
+                let ts = format_iso_compact(&note.five_hour_at);
+                parts.push(format!("5h余 {} ({ts})", format_pct_x100(fh)));
+            }
+            if !parts.is_empty() {
+                push_indented_wrapped(
+                    &mut out,
+                    "  ",
+                    &format!("手动快照: {}", parts.join(" · ")),
+                    iw,
+                    primary(),
+                );
+            }
+            if let Some(est) = &acct.quota_estimate {
+                for (label, win) in [("周推算", &est.weekly), ("5h推算", &est.five_hour)] {
+                    if let Some(e) = win {
+                        let pace = match e.estimated_remaining_minutes {
+                            Some(m) => format!(" · 当前速度约 {}", format_minutes_short(m)),
+                            None => String::new(),
+                        };
+                        push_indented_wrapped(
+                            &mut out,
+                            "  ",
+                            &format!(
+                                "{label}: 每 1% ≈ {} tok{pace}（仅提示，不自动换号）",
+                                format_tokens_short(e.tokens_per_pct),
+                            ),
+                            iw,
+                            Style::default().fg(STATUS_QUEUED),
+                        );
+                    }
+                }
+            }
+        } else {
+            push_indented_wrapped(
+                &mut out,
+                "  ",
+                &format!(
+                    "余量快照: 未登记（delegate agy account note {} --weekly <%> --five-hour <%>）",
+                    acct.id
+                ),
+                iw,
+                muted(),
+            );
         }
         out.push(Line::raw(""));
     }

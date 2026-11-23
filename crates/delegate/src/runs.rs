@@ -826,6 +826,8 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
             "denied",
             "tokens",
             "tokensDelta",
+            "reviewTokens",
+            "agyAccount",
             "cleanup",
             "warnings",
             "warning",

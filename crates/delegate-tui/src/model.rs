@@ -1071,6 +1071,50 @@ pub struct RunningAgyProc {
     pub cmdline: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct AccountUsageWindow {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub total: u64,
+    pub author_total: u64,
+    pub reviewer_total: u64,
+    pub rounds: usize,
+    pub runs: usize,
+    pub live_counted: usize,
+    pub uncounted_running: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct AccountUsageStats {
+    pub five_hour: AccountUsageWindow,
+    pub seven_day: AccountUsageWindow,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct QuotaNoteSnapshot {
+    pub weekly_pct_x100: Option<u32>,
+    pub weekly_at: String,
+    pub five_hour_pct_x100: Option<u32>,
+    pub five_hour_at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct QuotaWindowEstimate {
+    pub remaining_pct_x100: u32,
+    pub tokens_per_pct: u64,
+    pub estimated_remaining_tokens: u64,
+    pub estimated_remaining_minutes: Option<u64>,
+    pub burn_rate_per_hour: u64,
+    pub method: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct QuotaEstimate {
+    pub weekly: Option<QuotaWindowEstimate>,
+    pub five_hour: Option<QuotaWindowEstimate>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AgyAccountItem {
     pub id: String,
@@ -1084,6 +1128,9 @@ pub struct AgyAccountItem {
     pub file_count: usize,
     pub files: Vec<String>,
     pub source: String,
+    pub usage: AccountUsageStats,
+    pub quota_note: Option<QuotaNoteSnapshot>,
+    pub quota_estimate: Option<QuotaEstimate>,
 }
 
 impl AgyAccountItem {
@@ -1111,6 +1158,7 @@ pub struct AgyAccountsState {
     pub live_drifted: bool,
     pub running_agy: Vec<RunningAgyProc>,
     pub accounts: Vec<AgyAccountItem>,
+    pub unassigned_usage: AccountUsageStats,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

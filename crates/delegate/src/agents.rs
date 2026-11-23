@@ -1261,6 +1261,8 @@ pub fn run_agent_cancellable(
         kill_group(pid, 1.0);
     }
     write(run.join("agent.pid"), pid.to_string())?;
+    let mut usage_tracker = crate::usage::LiveTracker::start(meta, run, attempt);
+    let mut attempt_turns: Vec<Value> = Vec::new();
     let timed = Arc::new(AtomicBool::new(false));
     let watch = Arc::new((
         Mutex::new(WatchState {
@@ -1483,12 +1485,16 @@ pub fn run_agent_cancellable(
                 if agy_session.is_empty() {
                     if let Some(id) = crate::agy::conversation(&event) {
                         agy_session = id.to_string();
+                        usage_tracker.observe_session(id);
                         let _ = writeln!(
                             log,
                             "{}",
                             json!({"e":"session","id":id,"attempt":attempt,"at":iso()})
                         );
                     }
+                }
+                if let Some(raw_u) = crate::agy::extract_usage(&event) {
+                    usage_tracker.observe_live_usage(crate::usage::TokenCounts::from_tuple(raw_u));
                 }
                 agy_filter.events(&event)
             } else {
@@ -1550,6 +1556,7 @@ pub fn run_agent_cancellable(
                 let _ = log.flush();
                 match kind.as_str() {
                     "turn" => {
+                        attempt_turns.push(item.clone());
                         turn = item;
                         answer.clear();
                     }
@@ -1671,6 +1678,7 @@ pub fn run_agent_cancellable(
     } else {
         "failed"
     };
+    usage_tracker.finish(&attempt_turns, verdict);
     Ok((verdict.into(), answer))
 }
 

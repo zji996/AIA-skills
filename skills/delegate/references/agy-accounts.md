@@ -20,15 +20,19 @@
 
 | 命令 | 作用 |
 |---|---|
-| `delegate agy account list [--json]` | 列出所有槽位、活跃标记（`*`）、邮箱、最后使用时间与文件数 |
-| `delegate agy account status [--json]` | 显示当前活跃槽位、实盘 `~/.gemini` 邮箱（及是否漂移）、在跑 `agy` 进程列表、本地令牌到期时间（不调外部额度接口） |
+| `delegate agy account list [--json]` | 列出所有槽位、活跃标记（`*`）、邮箱、最后使用时间、文件数与近 5h/7d 本地用量 |
+| `delegate agy account status [--json]` | 显示当前活跃槽位、实盘 `~/.gemini` 邮箱（及是否漂移）、近 5h/7d 本地用量、手动余量快照、在跑 `agy` 进程列表、本地令牌到期时间（不调外部额度接口） |
 | `delegate agy account add [<id>] [--label TEXT] [--overwrite]` | 在临时 `0700` HOME 中交互启动 `agy` 登录，退出后把新凭据收进新槽位并销毁临时 HOME；不影响当前活跃账号 |
 | `delegate agy account use <id> [--force] [--json]` | 排他锁内：校验无在跑 `agy` → 回存当前活跃账号被 `agy` 刷新过的最新凭据 → 原子替换为目标槽位（清理目标槽位不存在的残留文件如旧 `credential-user-scope`） |
+| `delegate agy account note <id> [--weekly PCT] [--five-hour PCT] [--clear] [--json]` | 手动登记「周剩余 %」「五小时剩余 %」快照，结合本地用量推算「每 1% 约多少 token」与按当前速度还能跑多久（仅作提示，不自动换号） |
 | `delegate agy account remove <id> [--force]` | 删除槽位（不碰实盘 `~/.gemini`；删除活跃槽位需 `--force`） |
 | `delegate agy account import-agy-swap [--dry-run] [--source DIR] [--overwrite]` | 从 `~/.gemini/agy-swap/vault.json` 与 `accounts.json` 导入槽位（支持 `go-keyring-base64:` 与纯 JSON），绝不打印令牌，不改原目录 |
 | `delegate agy account restore-entry [--dry-run] [--mode wrapper\|symlink]` | 备份原 `~/.local/bin/agy` 到 `~/.local/bin/agy.bak-agy-swap`，替换为直连 `~/.local/libexec/agy` 的最小 `exec` 包装（默认）或符号链接 |
+| `delegate usage [--since 24h\|7d\|all] [--by account\|day\|run\|repo] [--account ID] [--repo PATH] [--all] [--json]` | 按账号槽位 / 日 / run / 仓库汇总本地 `agy` 用量（作者与审查员分列，运行中实时计入或单列「运行中未计」，绝不记邮箱） |
 
-**TUI**：`delegate tui` 按 `6` 或 `A` 进入「账号」页，展示槽位列表、活跃标记（`★ 活跃`）、本机在跑 `agy` 进程；选中账号按 `Enter` 或 `u` 弹出就地确认框，`Enter`/`y` 执行切换，`Esc`/`n` 取消。
+**用量记录与 TUI**：
+- 每轮作者、审查员、返工结束时自动记录增量 tokens（`input` / `output` / `cacheRead`）与当时活跃槽位 ID（不记邮箱），审查员轮次落 `<run>/review/round-N/usage.json` 并汇总进 `summary.json`（`agyAccount` / `reviewTokens` / `usage`）与 `<state>/agy-usage.jsonl`；运行中若 `agy` 输出含累计用量则实时写 `live-usage.json`，否则标「运行中未计」。
+- `delegate tui` 按 `6` 或 `A` 进入「账号」页，展示槽位列表（含 `5h用量`/`7d用量`）、活跃标记（`★ 活跃`）、本地用量明细、手动余量快照与推算提示及在跑 `agy` 进程；选中账号按 `Enter` 或 `u` 弹出就地确认框，`Enter`/`y` 执行切换，`Esc`/`n` 取消。
 
 ## 设计取舍：有在跑 `agy` 时拒切（不做 `--next-start`）
 

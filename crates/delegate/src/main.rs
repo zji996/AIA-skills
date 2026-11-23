@@ -4,6 +4,7 @@ mod agents;
 mod agy;
 mod agy_accounts;
 mod archive;
+mod usage;
 mod board;
 mod card;
 mod changes;
@@ -2910,6 +2911,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "result" => result_command(rest),
         "work" => work::command(rest),
         "agy" => agy_accounts::command(rest),
+        "usage" => usage::command(rest),
         "hook" => hook::command(rest),
         "events" => events::command(rest),
         "queue" => dag_queue::command(rest),

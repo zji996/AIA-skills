@@ -2346,6 +2346,133 @@ pub fn parse_agy_accounts_json(raw: &str) -> AgyAccountsState {
     parse_agy_accounts_value(&v)
 }
 
+fn parse_usage_window(v: &Value) -> AccountUsageWindow {
+    if !v.is_object() {
+        return AccountUsageWindow::default();
+    }
+    let input = v.get("input").and_then(Value::as_u64).unwrap_or(0);
+    let output = v.get("output").and_then(Value::as_u64).unwrap_or(0);
+    let cache_read = v.get("cacheRead").and_then(Value::as_u64).unwrap_or(0);
+    let total = v
+        .get("total")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| input.saturating_add(output).saturating_add(cache_read));
+    let author_total = v
+        .get("author")
+        .and_then(|a| a.get("total"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let reviewer_total = v
+        .get("reviewer")
+        .and_then(|r| r.get("total"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    AccountUsageWindow {
+        input,
+        output,
+        cache_read,
+        total,
+        author_total,
+        reviewer_total,
+        rounds: v.get("rounds").and_then(Value::as_u64).unwrap_or(0) as usize,
+        runs: v.get("runs").and_then(Value::as_u64).unwrap_or(0) as usize,
+        live_counted: v.get("liveCounted").and_then(Value::as_u64).unwrap_or(0) as usize,
+        uncounted_running: v
+            .get("uncountedRunning")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize,
+    }
+}
+
+fn parse_usage_stats(v: &Value) -> AccountUsageStats {
+    if !v.is_object() {
+        return AccountUsageStats::default();
+    }
+    AccountUsageStats {
+        five_hour: parse_usage_window(&v["fiveHour"]),
+        seven_day: parse_usage_window(&v["sevenDay"]),
+    }
+}
+
+fn pct_to_x100(v: Option<&Value>) -> Option<u32> {
+    let f = v?.as_f64()?;
+    if !f.is_finite() || !(0.0..=100.0).contains(&f) {
+        return None;
+    }
+    Some((f * 100.0).round() as u32)
+}
+
+fn parse_quota_note(v: &Value) -> Option<QuotaNoteSnapshot> {
+    if !v.is_object() {
+        return None;
+    }
+    let weekly_pct_x100 = pct_to_x100(v.get("weekly"));
+    let five_hour_pct_x100 = pct_to_x100(v.get("fiveHour"));
+    if weekly_pct_x100.is_none() && five_hour_pct_x100.is_none() {
+        return None;
+    }
+    Some(QuotaNoteSnapshot {
+        weekly_pct_x100,
+        weekly_at: v
+            .get("weeklyAt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        five_hour_pct_x100,
+        five_hour_at: v
+            .get("fiveHourAt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+fn parse_quota_window_estimate(v: &Value) -> Option<QuotaWindowEstimate> {
+    if !v.is_object() {
+        return None;
+    }
+    let remaining_pct_x100 = pct_to_x100(v.get("remainingPct"))?;
+    let tokens_per_pct = v.get("tokensPerPct").and_then(Value::as_u64)?;
+    let estimated_remaining_tokens = v
+        .get("estimatedRemainingTokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let estimated_remaining_minutes = v
+        .get("estimatedRemainingHours")
+        .and_then(Value::as_f64)
+        .filter(|h| h.is_finite() && *h >= 0.0)
+        .map(|h| (h * 60.0).round() as u64);
+    let burn_rate_per_hour = v
+        .get("burnRatePerHour")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let method = v
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Some(QuotaWindowEstimate {
+        remaining_pct_x100,
+        tokens_per_pct,
+        estimated_remaining_tokens,
+        estimated_remaining_minutes,
+        burn_rate_per_hour,
+        method,
+    })
+}
+
+fn parse_quota_estimate(v: &Value) -> Option<QuotaEstimate> {
+    if !v.is_object() {
+        return None;
+    }
+    let weekly = parse_quota_window_estimate(&v["weekly"]);
+    let five_hour = parse_quota_window_estimate(&v["fiveHour"]);
+    if weekly.is_none() && five_hour.is_none() {
+        return None;
+    }
+    Some(QuotaEstimate { weekly, five_hour })
+}
+
 pub fn parse_agy_accounts_value(v: &Value) -> AgyAccountsState {
     if !v.is_object() {
         return AgyAccountsState::default();
@@ -2418,9 +2545,13 @@ pub fn parse_agy_accounts_value(v: &Value) -> AgyAccountsState {
                 file_count,
                 files,
                 source: a.get("source").and_then(Value::as_str).unwrap_or("").to_string(),
+                usage: parse_usage_stats(&a["usage"]),
+                quota_note: parse_quota_note(&a["quotaNote"]),
+                quota_estimate: parse_quota_estimate(&a["quotaEstimate"]),
             })
         })
         .collect();
+    let unassigned_usage = parse_usage_stats(&v["unassignedUsage"]);
     AgyAccountsState {
         root,
         active,
@@ -2428,6 +2559,7 @@ pub fn parse_agy_accounts_value(v: &Value) -> AgyAccountsState {
         live_drifted,
         running_agy,
         accounts,
+        unassigned_usage,
     }
 }
 

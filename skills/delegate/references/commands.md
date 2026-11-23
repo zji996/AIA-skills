@@ -30,20 +30,15 @@
 | `stop <run>...` | 终止任务及其 scope、进程组 |
 | `clean <run>...\|--finished [--force] [--sync]` | 删除已结束任务（默认原子移入 trash 异步回收，`--sync` 同步；清理前检测是否已进 HEAD 以解锁 `run_applied`）；`--finished` 默认保留未读结果 |
 | `lane [--label <文字>] [--measure] [--] <命令>` | 整机重任务队列执行命令；`--measure` 预约核串行排队，退出码原样返回；无参列占用 |
-| `agy account <list\|status\|add\|use\|remove\|import-agy-swap\|restore-entry>` | 手工管理本地 `agy` 账号槽位（0700/0600，回存刷新令牌、在跑 `agy` 拒切、不自动轮换），见 [agy 账号](agy-accounts.md) |
+| `agy account <list\|status\|add\|use\|note\|remove\|import-agy-swap\|restore-entry>` | 手工管理本地 `agy` 账号槽位与余量快照（不自动轮换、不调额度接口），见 [agy 账号](agy-accounts.md) |
+| `usage [--since 24h\|7d] [--by account\|day\|run\|repo] [--account ID] [--repo PATH] [--all] [--json]` | 按账号/日/run/仓库汇总本地 `agy` 用量（作者与审查员分列，运行中未计单列） |
 
-启动选项：`--tier scout|review|write`（用途，不写时只读推断 review、写入推断 write，明确提醒并标记；scout/review 自动只读；三档须配齐）、`--image <路径>`（可重复）、`--accept <命令>` / `--no-accept`（覆盖或关闭仓库默认验收）、`--hide-accept`、`--accept-timeout`（可选；默认 `.delegate.json` 的 `acceptTimeout`，未设不限时；无输出仅发 `stall_warning`；`reply` 继承）、`--read-only`、`--shell`（仅 git 快照内只读调查，写文件拒收）、`--in-place`（只读读实时工作区；写入覆盖 worktree 默认并原地写入）、`--workdir`、`--timeout`（每次尝试，可选；没有默认值）、`--retries`（答复畸形时重跑次数，默认 1）、`--model <别名或已登记完整名>`（可与 --tier 同用，只在 models 别名表内精确/唯一子串匹配，固定模型不自动换）、`--thinking off|minimal|low|medium|high|xhigh`（独立长度，模型名不带后缀；reply 也可换模型、档位或长度）、`--allow-parallel-writes`、`--worktree`、`--in <run>`（只读，在已完成任务 worktree 的快照里审它的改动）、`--protect <路径>`（可重复；末尾 `/` 为目录；被改动即判 `rejected` 并带 `protectViolation`，不跑验收；reply 沿用；正文出现未放开的保护路径时启动回显与 status/wait 均提示补 `--allow`，不拦截）。`--name` 省略时取说明首分句生成最多 24 字的可读名称，唯一 ID 规则不变；reply 轮次命名不变。`<run>` 可以是完整 id、唯一片段、`last` 或 run 目录。
+启动选项：`--tier scout|review|write`（省写时只读推断 review、写入推断 write 并标记；scout/review 自动只读）、`--image <路径>`（可重复）、`--accept <命令>` / `--no-accept`、`--hide-accept`、`--accept-timeout`（默认 `.delegate.json` 的 `acceptTimeout`，未设不限时；`reply` 继承）、`--read-only`、`--shell`（仅快照内只读调查，写文件拒收）、`--in-place`、`--workdir`、`--timeout`（每次尝试，无默认）、`--retries`（畸形重跑次数，默认 1）、`--model <别名或完整名>`（在 models 内匹配，固定模型不自动换）、`--thinking off|minimal|low|medium|high|xhigh`、`--allow-parallel-writes`、`--worktree`、`--in <run>`（只读审已完成任务快照）、`--protect <路径>`（可重复，末尾 `/` 为目录，改动即 `rejected`；正文提及未放开保护路径仅提示补 `--allow`）。`--name` 省略取首分句（最多 24 字）。`<run>` 可为完整 id、唯一片段、`last` 或目录。
 
-`start`/`run`/`reply` 另支持 `--evidence <命令>`、`--no-evidence` 与 `--evidence-timeout`（默认 30m，reply 沿用）。`--model` 固定模型时 JSON `agentPinned: true`，不自动升档；旧 meta 缺字段推断显示不改写。6.0 起移除 `--agent`。
-
-`start`/`run`/`reply` 支持 `--max-answer N`（正整数，reply 继承）：超出 1.5 倍时续接压缩一次；失败时只显示前后截断的 N 字及原文路径、字数、原因，`result` 仍读全文。原文另存 `result-original.md`，不耗返工预算。`start --share PATH` 可重复，repo 内在 worktree 同位置建链接，repo 外只写入任务说明，reply 继承。固定说明与默认参数见 [配置](configuration.md)。
+`start`/`run`/`reply` 另支持 `--evidence <命令>`、`--no-evidence`、`--evidence-timeout`（默认 30m）、`--max-answer N`（超 1.5 倍续接压缩一次，原文存 `result-original.md`）、`--share PATH`（可重复，reply 继承）与 `--accept-also <命令>`（`&&` 追加，与 `--no-accept` 冲突退出 2）。固定说明与默认参数见 [配置](configuration.md)。
 
 ## 证据命令
 
-证据用于真实模型评测等慢且不确定的检查。验收通过后执行；未设验收时在正常答复后执行；验收失败或 protect 违规时跳过。在同事工作目录（隔离任务为其 worktree）通过 lane 排队，用验收相同的 env、原 PATH、独立进程组及 cgroup 回收，deny shim 不影响证据。拿到 lane 名额才开始计算 `--evidence-timeout`。
+证据用于慢且不确定的检查：验收通过（或未设验收时正常答复）后经 lane 在同事目录执行，失败仅记诊断、不改任务 state 或退出码，结果写入可选 `evidence{exit,timedOut,seconds,tail,log}`，也不替代 `acceptStillValid`。
 
-`start`/`run`/`reply` 可重复使用 `--accept-also <命令>`，按顺序以 `&&` 追加到生效验收；无基础命令则独立运行，与 `--no-accept` 冲突退出 2。
-
-证据命令默认未设置。结果写入 meta 与 JSON 结论的可选 `evidence{exit,timedOut,seconds,tail,log}`：退出码、是否超时、执行秒数、日志末尾和完整日志位置。短行加“证据 通过/失败/超时”。任何证据失败只记诊断，永不改变任务 state、升档判断或命令退出码；它也不替代 `acceptStillValid` 的验收快照依据。
-
-等待检查线：Claude Code 在未给 `--max` 时默认 50m 后打印每个运行任务的进度 glance 并退出 75；`--stream` 每 50m 打印一次并继续。`checkIn`、`DELEGATE_CHECK_IN` 可改时长，`0` 关闭。
+等待检查线：未给 `--max` 时默认 50m 后打印运行进度并退出 75（`--stream` 继续）；`checkIn`/`DELEGATE_CHECK_IN` 可改时长，`0` 关闭。

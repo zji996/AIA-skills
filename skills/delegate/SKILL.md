@@ -42,7 +42,7 @@ $D wait                                                                  # 放�
 | 发散侦察（Radar）与候选板 | `$D radar` 按 `.delegate.json` `radar.collect` 顺序采集并算指纹，未变零 token 退出；变化时派只读 scout 侦察，Host 校验锚点（`文件:行`/commit/输出行号，无锚丢弃）去重写 `<state>/radar/<repo>/board.md`；`$D radar list` 查看，`$D radar pick <id>` 生成任务说明草稿不自动派活，`$D radar schedule` 输出 00:30–04:30 每 2 小时定时安装说明，见 [合入员与 Radar](references/merge-and-radar.md) |
 | 统一工作表与 Stop 钩子 | `$D work`（6 列紧凑表并合入未绑定 run，零改动交付显「已收取」、已 clean run 不影响状态）、`$D work show/add/wait/close/drop/defer/import-md`、`start --work <ID>`、`--after-applied`；唯一零锁零 git Stop 钩子统一事件/提问/waiter/未合入，延后走 `work defer`，`$D hook stats` 按周统计；`note` 为薄壳，见 [工作表](references/worktable.md) |
 | `/clear` 前交接 / 查历史与看板 | `$D handoff` 写一页交接索引（含待办）；`$D history [关键词…]` 查永久索引；`$D show <run>` 看摘要、合入后同文件提交与归档；`$D board` 打印/刷新自动看板（`.delegate.json` `board` 配路径） |
-| 交互式终端看板与 agy 多账号 | `$D tui`（exec `delegate-tui`，6 标签页：任务/事件/合入/候选/工作表/账号，`1-6`/`w`/`A` 切页、`Enter`/`u` 账号就地确认切换）；`$D agy account list\|status\|add\|use\|remove\|import-agy-swap\|restore-entry` 本地手工管理 agy 凭据槽位（0700/0600、有在跑 agy 拒切、不做自动轮换、不调额度接口），见 [agy 账号与迁移](references/agy-accounts.md) |
+| 终端看板与 agy 账号/用量 | `$D tui`（6 页：`6`/`A` 切账号页看近 5h/7d 用量与余量推算、`Enter`/`u` 就地切换）；`$D agy account list\|status\|add\|use\|note\|remove\|import-agy-swap\|restore-entry`（不自动轮换、不调额度接口）；`$D usage [--since 24h\|7d] [--by account\|day\|run\|repo] [--json]` 按账号/日/run/仓汇总作者与审查员用量并单列运行中未计，见 [agy 账号与用量](references/agy-accounts.md) |
 
 `start`/`run` 派发前比对在跑与近 14 天 `history`，相似时在 stderr 提示最多 3 条（只提示不拦截）。
 

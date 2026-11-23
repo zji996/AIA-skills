@@ -691,3 +691,106 @@ fn snapshot_accounts_tab_active_marker_and_inplace_confirm_modal() {
     assert_eq!(app.overlay, Overlay::None);
     assert_eq!(app.switching_account.as_deref(), Some("bob"));
 }
+
+#[test]
+fn snapshot_accounts_tab_shows_5h_7d_usage_and_manual_quota_estimates() {
+    use delegate_tui::app::ViewTab;
+    use delegate_tui::data::parse_agy_accounts_json;
+
+    let raw_accounts = r#"{
+        "root": "/tmp/fake-home/.config/delegate/agy-accounts",
+        "active": "work",
+        "liveEmail": "work@example.test",
+        "liveDrifted": false,
+        "runningAgy": [],
+        "accounts": [
+            {
+                "id": "work",
+                "email": "work@example.test",
+                "label": "",
+                "active": true,
+                "addedAt": "2026-11-20T01:00:00Z",
+                "lastUsedAt": "2026-11-24T03:50:00Z",
+                "lastSyncedAt": "2026-11-24T03:50:00Z",
+                "tokenExpiresAt": "",
+                "files": ["oauth_creds.json"],
+                "fileCount": 1,
+                "source": "login",
+                "usage": {
+                    "fiveHour": {
+                        "input": 500000,
+                        "output": 100000,
+                        "cacheRead": 14400000,
+                        "total": 15000000,
+                        "author": {"total": 12000000},
+                        "reviewer": {"total": 3000000},
+                        "rounds": 4,
+                        "runs": 2,
+                        "liveCounted": 0,
+                        "uncountedRunning": 1
+                    },
+                    "sevenDay": {
+                        "input": 2000000,
+                        "output": 500000,
+                        "cacheRead": 47500000,
+                        "total": 50000000,
+                        "author": {"total": 40000000},
+                        "reviewer": {"total": 10000000},
+                        "rounds": 12,
+                        "runs": 6,
+                        "liveCounted": 0,
+                        "uncountedRunning": 1
+                    }
+                },
+                "quotaNote": {
+                    "weekly": 95.41,
+                    "weeklyAt": "2026-11-24T03:40:00Z",
+                    "fiveHour": 85.10,
+                    "fiveHourAt": "2026-11-24T03:40:00Z"
+                },
+                "quotaEstimate": {
+                    "weekly": {
+                        "remainingPct": 95.41,
+                        "tokensPerPct": 10893246,
+                        "estimatedRemainingTokens": 1039324600,
+                        "estimatedRemainingHours": 346.4,
+                        "burnRatePerHour": 3000000,
+                        "method": "window"
+                    },
+                    "fiveHour": {
+                        "remainingPct": 85.10,
+                        "tokensPerPct": 1006711,
+                        "estimatedRemainingTokens": 85671140,
+                        "estimatedRemainingHours": 28.6,
+                        "burnRatePerHour": 3000000,
+                        "method": "window"
+                    }
+                }
+            }
+        ]
+    }"#;
+    let agy_accounts = parse_agy_accounts_json(raw_accounts);
+    let snap = AppSnapshot {
+        agy_accounts,
+        refreshed_at: "04:00:00".into(),
+        ..AppSnapshot::default()
+    };
+    let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("."), 5);
+    app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Accounts);
+
+    let screen = render_to_string(&mut app, 140, 34);
+    assert!(screen.contains("5h用量"), "{screen}");
+    assert!(screen.contains("7d用量"), "{screen}");
+    assert!(screen.contains("15.0M+"), "{screen}");
+    assert!(screen.contains("50.0M"), "{screen}");
+    assert!(screen.contains("本地用量（不调外部额度接口）"), "{screen}");
+    assert!(screen.contains("近 5 小时: 15.0M"), "{screen}");
+    assert!(screen.contains("运行中未计 1"), "{screen}");
+    assert!(screen.contains("近 7 天: 50.0M"), "{screen}");
+    assert!(screen.contains("周余 95.41%"), "{screen}");
+    assert!(screen.contains("5h余 85.10%"), "{screen}");
+    assert!(screen.contains("每 1% ≈ 10.9M tok"), "{screen}");
+    assert!(screen.contains("每 1% ≈ 1.0M tok"), "{screen}");
+    assert!(screen.contains("不自动换号"), "{screen}");
+}

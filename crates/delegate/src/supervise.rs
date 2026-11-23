@@ -1430,6 +1430,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
     if let Some(delta) = tokens_delta {
         sum["tokensDelta"] = delta;
     }
+    crate::usage::summarize_run_into_summary(run, &meta, &mut sum);
     if lane::queued_seconds(run) >= 1.0 {
         sum["queuedSeconds"] = json!(lane::queued_seconds(run) as i64);
     }
@@ -1659,64 +1660,15 @@ fn compute_tokens(
         }
     }
 
-    let mut delta = None;
-    let mut parent_id = s(meta, "parent").to_string();
-    if is_agy && !parent_id.is_empty() && !session_id.is_empty() {
-        let mut visited = std::collections::BTreeSet::new();
-        while !parent_id.is_empty() && visited.insert(parent_id.clone()) {
-            let parent_dir = run
-                .parent()
-                .map(|p| p.join(&parent_id))
-                .filter(|p| {
-                    p.join("summary.json").is_file()
-                        || p.join("events.jsonl").is_file()
-                        || p.join("meta.json").is_file()
-                })
-                .or_else(|| {
-                    let arch = cache_dir().join("archive").join(&parent_id).join("record");
-                    (arch.join("summary.json").is_file()
-                        || arch.join("events.jsonl").is_file()
-                        || arch.join("meta.json").is_file())
-                    .then_some(arch)
-                });
-            let Some(pdir) = parent_dir else {
-                break;
-            };
-            let psum = json(pdir.join("summary.json"));
-            let psession = {
-                let ps = s(&psum, "session");
-                if !ps.is_empty() {
-                    ps.to_string()
-                } else {
-                    runs::events(&pdir)
-                        .iter()
-                        .rev()
-                        .find(|e| s(e, "e") == "session" && !s(e, "id").is_empty())
-                        .map(|e| s(e, "id").to_string())
-                        .unwrap_or_default()
-                }
-            };
-            if psession == session_id {
-                let parent_usage = runs::events(&pdir)
-                    .into_iter()
-                    .rev()
-                    .find(|e| s(e, "e") == "turn")
-                    .map(|e| e["usage"].clone())
-                    .filter(Value::is_object)
-                    .or_else(|| psum["tokens"].is_object().then(|| psum["tokens"].clone()));
-                if let Some(pu) = parent_usage {
-                    let mut d = json!({});
-                    for key in ["input", "output", "cacheRead"] {
-                        d[key] = json!((n(&tokens, key) - n(&pu, key)).max(0));
-                    }
-                    delta = Some(d);
-                    break;
-                }
-            }
-            let pmeta = json(pdir.join("meta.json"));
-            parent_id = s(&pmeta, "parent").to_string();
-        }
-    }
+    let delta = if is_agy {
+        crate::usage::ancestor_session_usage(run, meta, session_id).map(|pu| {
+            crate::usage::TokenCounts::from_json(&tokens)
+                .sub_clamped(pu)
+                .to_json()
+        })
+    } else {
+        None
+    };
     (tokens, delta)
 }
 

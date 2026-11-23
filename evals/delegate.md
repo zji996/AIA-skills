@@ -1,5 +1,10 @@
 # delegate
 
+## agy 按账号与时间段用量统计与余量快照推算
+
+- 换号后查各账号近 24 小时或 7 天用了多少 token：`delegate usage --since 24h --by account` / `--since 7d --by day|run|repo --json`，作者与审查员轮次分列，审查员用量单独落在 `review/round-N/usage.json` 并汇总进 `summary.json`（只记活跃 `agy` 槽位 ID、不记邮箱），运行中拿到累计用量实时更新，拿不到单列「运行中未计」。Summarize local `agy` token usage by account slot, day, run, or repo with author vs reviewer split and uncounted running runs listed separately.
+- TUI 账号页与手动余量快照：`delegate tui` 账号页（`6`/`A`）展示各账号近 5 小时与近 7 天本地用量（不调 Google 额度接口）；可选运行 `delegate agy account note <id> --weekly 95.41 --five-hour 85.10` 登记手动剩余百分比快照，按本地用量推算每 1% 约多少 token 及当前速度还能跑多久（仅提示、不自动换号）。Local 5h/7d usage in TUI Accounts tab and advisory-only manual quota snapshot burn-rate estimation without external API polling or auto-rotation.
+
 ## 6.38 agy 本地多账号管理与迁移
 
 - 管理多个 `agy` 账号替代 `agy-swap`：`delegate agy account add <id>` 在隔离临时 HOME 跑交互登录并将 6 份凭据文件（`0700`/`0600`）收入 `~/.config/delegate/agy-accounts/<id>/`，不影响当前活跃账号；`list`/`status` 展示活跃槽位、最后使用时间与在跑 `agy` 进程，永不打印令牌、不调外部 Google 额度接口、不做自动轮换。Local manual `agy` multi-account slots with 0700/0600 permissions, isolated temp-HOME login, no auto-rotation, and no external quota polling.

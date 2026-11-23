@@ -114,6 +114,47 @@ pub fn input(colleague: &str, prompt: &str, images: &[Value]) -> String {
     )
 }
 
+/// Extract cumulative `(input, output, cache_read)` token counts from any `agy` stream-json
+/// event that carries a usage block (`result.usage`, `step_update.usage`, `step_update.token_usage`,
+/// top-level `usage` / `token_usage`). Returns `None` when no numeric usage fields are present.
+pub fn extract_usage(v: &Value) -> Option<(i64, i64, i64)> {
+    fn parse_usage_obj(u: &Value) -> Option<(i64, i64, i64)> {
+        let obj = u.as_object()?;
+        let pick = |keys: &[&str]| -> Option<i64> {
+            keys.iter()
+                .find_map(|k| obj.get(*k).and_then(Value::as_i64))
+        };
+        let input = pick(&["input_tokens", "input", "prompt_tokens"]);
+        let output = pick(&["output_tokens", "output", "completion_tokens"]);
+        let cache = pick(&[
+            "cache_read_tokens",
+            "cacheRead",
+            "cached_tokens",
+            "cache_read_input_tokens",
+        ]);
+        if input.is_none() && output.is_none() && cache.is_none() {
+            return None;
+        }
+        let i = input.unwrap_or(0).max(0);
+        let o = output.unwrap_or(0).max(0);
+        let c = cache.unwrap_or(0).max(0);
+        if i == 0 && o == 0 && c == 0 {
+            return None;
+        }
+        Some((i, o, c))
+    }
+
+    [
+        &v["result"]["usage"],
+        &v["step_update"]["usage"],
+        &v["step_update"]["token_usage"],
+        &v["usage"],
+        &v["token_usage"],
+    ]
+    .into_iter()
+    .find_map(parse_usage_obj)
+}
+
 /// The conversation id agy reports, from its `init` (or any later) event.
 pub fn conversation(v: &Value) -> Option<&str> {
     [
@@ -403,5 +444,35 @@ mod tests {
             Some("c-8")
         );
         assert_eq!(conversation(&json!({"event":"init","conversation_id":""})), None);
+    }
+
+    #[test]
+    fn extract_usage_reads_result_and_midrun_step_events() {
+        assert_eq!(
+            extract_usage(&json!({
+                "event": "result",
+                "result": {"usage": {"input_tokens": 120, "output_tokens": 45, "cache_read_tokens": 900}}
+            })),
+            Some((120, 45, 900))
+        );
+        assert_eq!(
+            extract_usage(&json!({
+                "event": "step_update",
+                "step_update": {"step_index": 2, "usage": {"input_tokens": 80, "output_tokens": 10, "cache_read_tokens": 500}}
+            })),
+            Some((80, 10, 500))
+        );
+        assert_eq!(
+            extract_usage(&json!({
+                "event": "usage",
+                "usage": {"input": 50, "output": 20, "cacheRead": 300}
+            })),
+            Some((50, 20, 300))
+        );
+        assert_eq!(extract_usage(&json!({"event": "init", "conversation_id": "c-1"})), None);
+        assert_eq!(
+            extract_usage(&json!({"event": "result", "result": {"usage": {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0}}})),
+            None
+        );
     }
 }

@@ -501,6 +501,16 @@ pub fn detect_running_agy_for_home(target_home: &Path) -> Vec<RunningAgy> {
     found
 }
 
+/// Lock-free lookup of the active `agy` account slot ID (never reads or returns email).
+pub fn active_account_id() -> Option<String> {
+    let root = accounts_root();
+    let state = load_state(&root);
+    state["active"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Strictly lock-free, zero-subprocess snapshot of local `agy` accounts for
 /// `delegate snapshot --json`, `delegate agy account list/status`, and `delegate-tui`.
 /// Never reads or exposes secret tokens.
@@ -530,6 +540,14 @@ fn snapshot_json_opts(scan_procs: bool) -> Value {
         Vec::new()
     };
 
+    let empty_map = Map::new();
+    let accounts_map = state["accounts"].as_object().unwrap_or(&empty_map);
+    let usage_snap = if !accounts_map.is_empty() || crate::usage::ledger_path().is_file() {
+        Some(crate::usage::accounts_usage_snapshot(accounts_map))
+    } else {
+        None
+    };
+
     let mut items: Vec<Value> = Vec::new();
     let mut active_email = String::new();
     if let Some(map) = state["accounts"].as_object() {
@@ -552,7 +570,7 @@ fn snapshot_json_opts(scan_procs: bool) -> Value {
             }
             let files = slot_present_files(&sdir);
             let token_expiry = slot_token_expiry(&sdir).unwrap_or_default();
-            items.push(json!({
+            let mut item = json!({
                 "id": id,
                 "email": email,
                 "label": s(entry, "label"),
@@ -564,7 +582,17 @@ fn snapshot_json_opts(scan_procs: bool) -> Value {
                 "files": files,
                 "fileCount": files.len(),
                 "source": s(entry, "source"),
-            }));
+            });
+            if let Some(view) = usage_snap.as_ref().and_then(|u| u.per_account.get(id)) {
+                item["usage"] = view.usage.clone();
+                if !view.quota_note.is_null() {
+                    item["quotaNote"] = view.quota_note.clone();
+                }
+                if !view.quota_estimate.is_null() {
+                    item["quotaEstimate"] = view.quota_estimate.clone();
+                }
+            }
+            items.push(item);
         }
     }
 
@@ -582,14 +610,18 @@ fn snapshot_json_opts(scan_procs: bool) -> Value {
         })
         .collect();
 
-    json!({
+    let mut out = json!({
         "root": root.to_string_lossy(),
         "active": active_id,
         "liveEmail": live,
         "liveDrifted": live_drifted,
         "runningAgy": running_json,
         "accounts": items,
-    })
+    });
+    if let Some(snap) = usage_snap {
+        out["unassignedUsage"] = snap.unassigned;
+    }
+    out
 }
 
 fn find_slot_by_email(state: &Value, email: &str) -> Option<String> {
@@ -755,7 +787,28 @@ fn cmd_list(args: &[String]) -> Res<i32> {
         } else {
             format!(" [{label}]")
         };
-        println!("  {mark} {id:<16} {email:<30} last_used={last_str} files={files}{label_part}");
+        let t5 = n(&item["usage"]["fiveHour"], "total");
+        let t7 = n(&item["usage"]["sevenDay"], "total");
+        let unc = item["usage"]["fiveHour"]["uncountedRunning"].as_u64().unwrap_or(0);
+        let unc_mark = if unc > 0 { "+" } else { "" };
+        let usage_part = format!(
+            " 5h={}{unc_mark} 7d={}",
+            crate::usage::format_token_compact(t5),
+            crate::usage::format_token_compact(t7),
+        );
+        let mut note_bits = Vec::new();
+        if let Some(w) = item["quotaNote"]["weekly"].as_f64() {
+            note_bits.push(format!("wk={w:.2}%"));
+        }
+        if let Some(fh) = item["quotaNote"]["fiveHour"].as_f64() {
+            note_bits.push(format!("5h={fh:.2}%"));
+        }
+        let note_part = if note_bits.is_empty() {
+            String::new()
+        } else {
+            format!(" rem({})", note_bits.join(","))
+        };
+        println!("  {mark} {id:<16} {email:<30} last_used={last_str} files={files}{usage_part}{note_part}{label_part}");
     }
     if b(&snap, "liveDrifted") {
         println!(
@@ -806,6 +859,25 @@ fn cmd_status(args: &[String]) -> Res<i32> {
             println!("local token expiry: {exp} (quota not polled externally)");
         }
         println!("stored files: {}", cur["fileCount"].as_u64().unwrap_or(0));
+        let t5 = n(&cur["usage"]["fiveHour"], "total");
+        let t7 = n(&cur["usage"]["sevenDay"], "total");
+        println!(
+            "local usage: 5h={}  7d={} (local records only, no external quota API)",
+            crate::usage::format_token_compact(t5),
+            crate::usage::format_token_compact(t7),
+        );
+        if cur["quotaNote"].is_object() {
+            let mut parts = Vec::new();
+            if let Some(w) = cur["quotaNote"]["weekly"].as_f64() {
+                parts.push(format!("weekly={w:.2}%"));
+            }
+            if let Some(fh) = cur["quotaNote"]["fiveHour"].as_f64() {
+                parts.push(format!("five-hour={fh:.2}%"));
+            }
+            if !parts.is_empty() {
+                println!("quota note (advisory only): {}", parts.join(", "));
+            }
+        }
     }
     println!("total slots: {}", accounts.len());
     println!("running agy processes: {}", running.len());
@@ -1781,17 +1853,150 @@ fn cmd_restore_entry(args: &[String]) -> Res<i32> {
     Ok(0)
 }
 
+fn parse_pct_flag(raw: &str, flag: &str) -> Res<f64> {
+    let trimmed = raw.trim().trim_end_matches('%');
+    let v = trimmed
+        .parse::<f64>()
+        .map_err(|_| format!("{flag} must be a percentage in 0..=100, got {raw:?}"))?;
+    if !v.is_finite() || !(0.0..=100.0).contains(&v) {
+        return Err(format!("{flag} must be in 0..=100, got {raw:?}"));
+    }
+    Ok((v * 100.0).round() / 100.0)
+}
+
+fn cmd_note(args: &[String]) -> Res<i32> {
+    let (pos, flags, kv) = parse_simple(
+        args,
+        &["--clear", "--json"],
+        &["--weekly", "--five-hour"],
+    )?;
+    if pos.len() != 1 {
+        return Err(
+            "usage: delegate agy account note <id> [--weekly PCT] [--five-hour PCT] [--clear] [--json]"
+                .into(),
+        );
+    }
+    let id = &pos[0];
+    validate_id(id)?;
+    let clear = has(&flags, "--clear");
+    let json_out = has(&flags, "--json");
+    let weekly = match value(&kv, "--weekly") {
+        Some(raw) => Some(parse_pct_flag(raw, "--weekly")?),
+        None => None,
+    };
+    let five_hour = match value(&kv, "--five-hour") {
+        Some(raw) => Some(parse_pct_flag(raw, "--five-hour")?),
+        None => None,
+    };
+    if !clear && weekly.is_none() && five_hour.is_none() {
+        return Err("provide at least one of --weekly <PCT>, --five-hour <PCT>, or --clear".into());
+    }
+
+    let root = accounts_root();
+    let _lock = acquire_accounts_lock(&root)?;
+    let mut state = load_state(&root);
+    if state["accounts"].get(id).is_none() {
+        return Err(format!(
+            "unknown agy account slot {id:?}; run `delegate agy account list`"
+        ));
+    }
+
+    let now = iso();
+    let now_ep = epoch() as i64;
+    if let Some(obj) = state["accounts"][id].as_object_mut() {
+        if clear {
+            obj.remove("quotaNotes");
+        } else {
+            let mut notes = obj
+                .get("quotaNotes")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut entry = json!({
+                "at": now,
+                "epoch": now_ep,
+            });
+            if let Some(w) = weekly {
+                entry["weekly"] = json!(w);
+            }
+            if let Some(fh) = five_hour {
+                entry["fiveHour"] = json!(fh);
+            }
+            notes.push(entry);
+            obj.insert("quotaNotes".into(), Value::Array(notes));
+        }
+    }
+    state["schemaVersion"] = json!(SCHEMA_VERSION);
+    save_state(&root, &state)?;
+    drop(_lock);
+
+    let snap = snapshot_json();
+    let acct_view = snap["accounts"]
+        .as_array()
+        .and_then(|arr| arr.iter().find(|a| s(a, "id") == id))
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    if json_out {
+        println!(
+            "{}",
+            json!({
+                "ok": true,
+                "id": id,
+                "cleared": clear,
+                "quotaNote": acct_view["quotaNote"],
+                "quotaEstimate": acct_view["quotaEstimate"],
+                "usage": acct_view["usage"],
+            })
+        );
+        return Ok(0);
+    }
+
+    if clear {
+        println!("cleared quota snapshots for agy account slot {id}.");
+        return Ok(0);
+    }
+
+    let mut parts = Vec::new();
+    if let Some(w) = weekly {
+        parts.push(format!("weekly={w:.2}%"));
+    }
+    if let Some(fh) = five_hour {
+        parts.push(format!("five-hour={fh:.2}%"));
+    }
+    println!(
+        "recorded quota snapshot for {id}: {} @ {now} (advisory only; no automatic switching).",
+        parts.join(", ")
+    );
+    for (label, key) in [("weekly", "weekly"), ("five-hour", "fiveHour")] {
+        let est = &acct_view["quotaEstimate"][key];
+        if est.is_object() {
+            let tpp = crate::usage::format_token_compact(n(est, "tokensPerPct"));
+            let rem_h = est["estimatedRemainingHours"]
+                .as_f64()
+                .map(crate::usage::format_hours_compact)
+                .unwrap_or_else(|| "-".to_string());
+            let method = s(est, "method");
+            println!("  {label} estimate ({method}): ~{tpp} tok / 1% · est remaining at current pace: {rem_h}");
+        }
+    }
+    println!("Next: delegate agy account status | delegate usage --account {id}");
+    Ok(0)
+}
+
 fn print_account_help() {
     println!(
         "Usage: delegate agy account <subcommand> [options]\n\n\
          Manage local Antigravity CLI (agy) accounts manually (~/.config/delegate/agy-accounts/).\n\
          No automatic rotation and no external quota API calls.\n\n\
          Subcommands:\n\
-         \x20 list [--json]                        List saved account slots and active marker\n\
-         \x20 status [--json]                      Show active account, live email, last used, running agy\n\
+         \x20 list [--json]                        List saved account slots, active marker, 5h/7d local usage\n\
+         \x20 status [--json]                      Show active account, live email, local usage, running agy\n\
          \x20 add [<id>] [--label TEXT] [--overwrite] [--agy-bin PATH] [-- <agy-args>...]\n\
          \x20                                      Run interactive agy login in a temp HOME and save slot\n\
          \x20 use <id> [--force] [--json]          Save back refreshed tokens and switch (refuses if agy running)\n\
+         \x20 note <id> [--weekly PCT] [--five-hour PCT] [--clear] [--json]\n\
+         \x20                                      Record manual remaining-% snapshot for local burn-rate hint only\n\
          \x20 remove <id> [--force] [--json]       Delete a saved account slot (alias: rm)\n\
          \x20 import-agy-swap [--dry-run] [--source DIR] [--overwrite] [--json]\n\
          \x20                                      Import accounts from ~/.gemini/agy-swap without printing tokens\n\
@@ -1835,6 +2040,7 @@ pub fn command(args: &[String]) -> Res<i32> {
         "status" => cmd_status(sub_args),
         "add" => cmd_add(sub_args),
         "use" => cmd_use(sub_args),
+        "note" => cmd_note(sub_args),
         "remove" | "rm" => cmd_remove(sub_args),
         "import-agy-swap" => cmd_import_agy_swap(sub_args),
         "restore-entry" => cmd_restore_entry(sub_args),

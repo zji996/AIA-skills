@@ -1061,6 +1061,8 @@ pub fn compact_review_summary(doc: &Value) -> Value {
         "roViolationCount",
         "roViolationSample",
         "roViolationFile",
+        "tokens",
+        "agyAccount",
     ] {
         if let Some(v) = doc.get(key) {
             if !v.is_null() {
@@ -2031,7 +2033,7 @@ pub fn run_accept_and_review(
             sum["state"] = json!("rejected");
             let now = iso();
             if rev_outcome.cancelled {
-                let round_entry = json!({
+                let mut round_entry = json!({
                     "round": round,
                     "verdict": Value::Null,
                     "cancelled": true,
@@ -2041,8 +2043,9 @@ pub fn run_accept_and_review(
                     "startedAt": rev_outcome.round_started,
                     "finishedAt": rev_outcome.round_finished,
                 });
+                crate::usage::attach_reviewer_round_usage(&round_dir, &mut round_entry);
                 rounds_history.push(round_entry);
-                let final_doc = json!({
+                let mut final_doc = json!({
                     "status": "cancelled",
                     "verdict": Value::Null,
                     "cancelled": true,
@@ -2058,6 +2061,7 @@ pub fn run_accept_and_review(
                     "updatedAt": now,
                     "finishedAt": now,
                 });
+                crate::usage::attach_review_totals(&rounds_history, &mut final_doc);
                 write_json(run.join("review.json"), &final_doc)?;
                 sum["review"] = compact_review_summary(&final_doc);
                 events::emit(
@@ -2077,7 +2081,7 @@ pub fn run_accept_and_review(
                 // but keep run state `rejected` (both must pass to enter `delivered`).
                 write(&rev_outcome.verdict_file, &rev_outcome.raw_answer)?;
                 let _ = write(run.join("review.md"), &rev_outcome.raw_answer);
-                let round_entry = json!({
+                let mut round_entry = json!({
                     "round": round,
                     "verdict": rev_outcome.verdict_str,
                     "rawFirstLine": rev_outcome.raw_first_line,
@@ -2088,6 +2092,7 @@ pub fn run_accept_and_review(
                     "startedAt": rev_outcome.round_started,
                     "finishedAt": rev_outcome.round_finished,
                 });
+                crate::usage::attach_reviewer_round_usage(&round_dir, &mut round_entry);
                 rounds_history.push(round_entry);
                 let mut final_doc = json!({
                     "status": "done",
@@ -2111,6 +2116,7 @@ pub fn run_accept_and_review(
                 if rev_outcome.focus_count > 0 {
                     final_doc["focusCount"] = json!(rev_outcome.focus_count);
                 }
+                crate::usage::attach_review_totals(&rounds_history, &mut final_doc);
                 write_json(run.join("review.json"), &final_doc)?;
                 sum["review"] = compact_review_summary(&final_doc);
             }
@@ -2188,6 +2194,7 @@ pub fn run_accept_and_review(
                 round_entry["roViolationFile"] = json!(vf.to_string_lossy());
             }
         }
+        crate::usage::attach_reviewer_round_usage(&round_dir, &mut round_entry);
         rounds_history.push(round_entry);
 
         let mut verdict_ev = json!({
@@ -2237,6 +2244,7 @@ pub fn run_accept_and_review(
             if focus_count > 0 {
                 final_doc["focusCount"] = json!(focus_count);
             }
+            crate::usage::attach_review_totals(&rounds_history, &mut final_doc);
             write_json(run.join("review.json"), &final_doc)?;
             sum["review"] = compact_review_summary(&final_doc);
             *state = "delivered".into();
@@ -2312,6 +2320,7 @@ pub fn run_accept_and_review(
             if controller_review_json.is_object() {
                 final_doc["controllerReview"] = controller_review_json;
             }
+            crate::usage::attach_review_totals(&rounds_history, &mut final_doc);
             write_json(run.join("review.json"), &final_doc)?;
             sum["review"] = compact_review_summary(&final_doc);
             *state = if accept_ok { "delivered" } else { "rejected" }.into();
@@ -2370,7 +2379,7 @@ pub fn run_accept_and_review(
         let prev_tree_for_delta = (!after_tree.is_empty()).then_some(after_tree.clone());
         prev_reviewed_tree = prev_tree_for_delta.clone();
 
-        let Some(author_next) = supervise::continuation_with_file(meta, run, &verdict_file) else {
+        let Some(mut author_next) = supervise::continuation_with_file(meta, run, &verdict_file) else {
             let err = "author has no saved session to continue for rework";
             let now = iso();
             let final_doc = json!({
@@ -2435,6 +2444,8 @@ pub fn run_accept_and_review(
         }
         supervise::log_event(run, rework_ev);
 
+        author_next["authorRound"] = json!(round + 1);
+        author_next["isRework"] = json!(true);
         let (mut author_verdict, mut author_answer, mut next_attempts) =
             supervise::attempts_from(&author_next, run, *attempts + 1, holder.clone(), grace.clone());
         let resumed = supervise::resume_transient(

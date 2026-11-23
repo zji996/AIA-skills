@@ -180,7 +180,11 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "agy",
-        "Manage local Antigravity CLI (agy) accounts manually: agy account list|status|add|use|remove|import-agy-swap|restore-entry.",
+        "Manage local Antigravity CLI (agy) accounts manually: agy account list|status|add|use|note|remove|import-agy-swap|restore-entry.",
+    ),
+    (
+        "usage",
+        "Summarize local agy token usage by account, day, run, or repo (author vs reviewer split, uncounted running runs listed separately).",
     ),
     (
         "protocol",
@@ -391,14 +395,23 @@ pub fn print(command: Option<&str>) -> bool {
             ("--model ALIAS", "Probe one registered model instead; exclusive with --tier."),
             ("--timeout SECONDS", "Limit per model (default: 60)."),
         ]),
-        "agy" => ("account <list|status|add|use|remove|import-agy-swap|restore-entry> [options]", "Manage local Antigravity CLI (agy) credential slots under ~/.config/delegate/agy-accounts/ (0700 dirs, 0600 files). Manual switching only — no automatic rotation and no external quota API calls.", &[
-            ("account list [--json]", "List saved slots, active marker, email, and last used time."),
-            ("account status [--json]", "Show active slot, live ~/.gemini email, running agy processes, and local token expiry."),
+        "agy" => ("account <list|status|add|use|note|remove|import-agy-swap|restore-entry> [options]", "Manage local Antigravity CLI (agy) credential slots under ~/.config/delegate/agy-accounts/ (0700 dirs, 0600 files). Manual switching only — no automatic rotation and no external quota API calls.", &[
+            ("account list [--json]", "List saved slots, active marker, email, last used time, and 5h/7d local usage."),
+            ("account status [--json]", "Show active slot, live ~/.gemini email, local usage, running agy processes, and local token expiry."),
             ("account add [<id>] [--label TEXT] [--overwrite] [--agy-bin PATH]", "Run interactive agy login in an isolated temporary HOME and save credentials without affecting the active account."),
             ("account use <id> [--force] [--json]", "Save back live refreshed tokens to the active slot and atomically switch; refuses while any agy process runs in this HOME."),
+            ("account note <id> [--weekly PCT] [--five-hour PCT] [--clear] [--json]", "Record manual remaining-% snapshot on a slot to estimate tokens/1% and remaining runtime from local usage (advisory only; no auto-switch)."),
             ("account remove <id> [--force] [--json]", "Delete a saved account slot without touching live ~/.gemini files."),
             ("account import-agy-swap [--dry-run] [--source DIR] [--overwrite] [--json]", "Import accounts from ~/.gemini/agy-swap/vault.json and accounts.json without printing tokens."),
             ("account restore-entry [--dry-run] [--mode wrapper|symlink] [--entry PATH] [--real-bin PATH]", "Replace the agy-swap ~/.local/bin/agy wrapper with a direct exec wrapper or symlink (backs up old file)."),
+        ]),
+        "usage" => ("[--since DURATION|all] [--by account|day|run|repo] [--account ID] [--repo PATH] [--all] [--json]", "Summarize local token usage (default: agy runs over the last 24h) grouped by account slot id, local calendar day, run, or repository. Splits author and reviewer tokens, folds in live-reported agy cumulative usage, and lists running runs without live usage separately as 运行中未计.", &[
+            ("--since DURATION|all", "Time window to include (default: 24h; e.g. 5h, 24h, 7d, 30d, all)."),
+            ("--by account|day|run|repo", "Grouping key (default: account)."),
+            ("--account ID", "Filter to one agy account slot id."),
+            ("--repo PATH", "Filter to one repository path or basename."),
+            ("--all", "Include non-agy (Pi) runs in addition to agy runs."),
+            ("--json", "Print structured JSON output."),
         ]),
         "protocol" => ("", "Print one JSON line for harness adapters: protocol version, delegate version, the caller session and its source variable, and each agent's tier, resolved binary, version and PATH entries it shadows.", &[]),
         _ => return false,
