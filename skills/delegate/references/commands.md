@@ -26,7 +26,7 @@
 | `history [关键词…] [--since <时长>] [--state <状态>] [--limit N] [--json]` | 查本仓库永久追加索引 `history.jsonl`（老的在上新的在下，每条一行指向 `show`）；关键词匹配名字、提示词与结论，中文支持单字加二元组 |
 | `show [<run>] [--json]` | 第二层单 run 摘要：提示词前几行、确定性结论段、验收行、合入后源仓库同文件提交（现查 `git log`）、续做链与归档路径，末行指向 `result`/`patch`/归档原文；clean 后从归档读，归档过期说明「原文已过期，仅剩索引」 |
 | `board [--path]` | 刷新并打印本工作区的自动委派看板（默认放在 history 目录旁 `BOARD.md`，可用仓库 `.delegate.json` 的 `board` 配置路径）；每次状态变化自动原子重写，顶行含整机在途与各节计数，写失败只记诊断不阻断委派 |
-| `result [<run>] [--path]` | 输出完整答复 |
+| `result [<run>] [--round N\|--all\|--rounds] [--path] [--no-mark] [--json]` | 输出答复；`--round N`/`--all`/`--rounds` 查单轮、全部或索引 |
 | `stop <run>...` | 终止任务及其 scope、进程组 |
 | `clean <run>...\|--finished [--force] [--sync]` | 删除已结束的任务（默认原子移入 trash 并由后台 `_gc-worker` 异步回收，加 `--sync` 同步回收；清理前自动检测是否已合入 HEAD 以解锁 `run_applied` 下游）；`--finished` 默认保留结果未读取的 |
 | `lane [--label <文字>] [--measure] [--] <命令>` | 在整机重任务队列里执行命令；`--measure` 使用测量预约核并串行排队（一个参数按 shell 命令执行），退出码原样返回；不带命令时列出正在跑与排队的项 |

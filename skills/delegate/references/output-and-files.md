@@ -28,7 +28,7 @@
 | `meta.json` | 用途 `tier`/`tierInferred`、模型 `model`/`modelName`、`thinking`、`tierModels`/`tierCandidates`；同事与启动/验收参数；`standing`/`standingSources`、`defaults`、`share`、`resources`、`acceptBlind`、`resultDisplayChars`、`maxAnswer`；可选 `agentPinned`、`repoKey`、`evidenceCommand`/`evidenceTimeoutSeconds`/`evidence`；`protect` 字符串数组、`allow` 本次开放路径与可选 `protectReasons` 原因映射（reply/fresh 继承） |
 | `prompt.md` | 同事实际收到的任务说明；末尾可能附完成标准（`--accept`）与只读边界（worktree 里的只读任务） |
 | `events.jsonl` | 过滤后的全过程：读取、命令、编辑路径、错误、每轮模型与用量、重跑；不含编辑全文 |
-| `result.md` | 完整答复；自动压缩成功时为压缩后的答复 |
+| `result.md` / `round-N-result.md` | 最新答复（压缩时为压缩稿）；审-改返工按轮留存 `round-N-result.md`（不覆盖，随归档保留） |
 | `result-original.md` / `compression.json` / `compression-prompt.md` | 自动压缩前的原文 / 是否成功、原文路径、失败原因 / 压缩追问 |
 | `summary.json` | 结论：`state`、`attempts`、`files`、`changes`、`shape`、`accept`、紧凑 `review` 摘要（无 `rounds[]`/内联 diff）、可选 `evidence`/`cleanup`/`warnings`、`readOnlyViolation`/`workspaceChanged`/`protectViolation`、`queuedSeconds`/`graceSeconds`/`warning`、`tokens`（`agy` 取末轮累计，同会话 `reply` 另记 `tokensDelta`）、`session`、`error`（`next` 现算） |
 | `cleanup.json` / `cleanup.lock` | 多阶段后台进程与 user unit 回收记录 / 并发回收锁；systemctl 缺失、bus 不可用、无标记与回收失败只记诊断 |

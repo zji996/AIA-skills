@@ -320,12 +320,16 @@ pub fn print(command: Option<&str>) -> bool {
         "tui" => ("[delegate-tui options ...]", "Launch the interactive read-only TUI dashboard by exec'ing `delegate-tui`.", &[
             ("options", "Forwarded directly to delegate-tui (run `delegate-tui --help` for flags)."),
         ]),
-        "result" => ("[--path] [--no-mark] [run]", "Print a run's full answer.", &[
+        "result" => ("[--path] [--no-mark] [--round N|--all|--rounds] [--json] [run]", "Print a run's full answer (or inspect preserved per-round results across rework and reply chains).", &[
             ("run", "Run id or directory (default: last)."),
-            ("--path", "Print the result file path instead of its contents."),
+            ("--round N", "Print 1-based round N from the run/chain's preserved results (oldest to newest)."),
+            ("--all", "Print all preserved rounds in chronological order with round headers and original file paths."),
+            ("--rounds", "List the index of preserved rounds (number, kind, original path, lines/chars) without marking read."),
+            ("--path", "Print the result file path(s) instead of contents."),
+            ("--json", "Emit structured JSON with round metadata and paths."),
             ("--no-mark", "Read without marking resultReadAt or .delivered (used by read-only viewers)."),
         ]),
-        "card" => ("[--json] [--round] [run]", "Show a deterministic one-screen L1 merge review card: author summary + result.md pointer, reviewer conclusion + verdict pointer, deduplicated risk items (built-in + .delegate.json riskRules + reviewer focus), test counts & tiered acceptance layers, directory-folded remaining changes, and next commands.", &[
+        "card" => ("[--json] [--round] [run]", "Show a deterministic one-screen L1 merge review card: author summary + per-round result pointers, reviewer conclusion + verdict pointer, deduplicated risk items (built-in + .delegate.json riskRules + reviewer focus), test counts & tiered acceptance layers, directory-folded remaining changes, and next commands.", &[
             ("run", "Run id or directory (default: last)."),
             ("--json", "Emit structured JSON card."),
             ("--round", "Inspect only the last round instead of the chain's net total diff."),

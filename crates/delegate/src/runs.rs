@@ -958,7 +958,9 @@ pub fn remove_after_apply(run: &Path) -> (Vec<String>, bool) {
     ];
     if let Ok(entries) = fs::read_dir(run) {
         for entry in entries.flatten() {
-            if keep.contains(&entry.file_name().to_string_lossy().as_ref()) {
+            let fname = entry.file_name();
+            let fname_str = fname.to_string_lossy();
+            if keep.contains(&fname_str.as_ref()) || is_round_result_name(&fname_str) {
                 continue;
             }
             let path = entry.path();
@@ -1405,9 +1407,200 @@ pub fn chain_pending_apply_files_opts(
     0
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResultRound {
+    pub round: usize,
+    pub run_id: String,
+    pub intra_round: usize,
+    pub kind: &'static str,
+    pub path: PathBuf,
+    pub total_lines: usize,
+    pub total_chars: usize,
+    pub current: bool,
+}
+
+impl ResultRound {
+    pub fn kind_zh(&self) -> &'static str {
+        match self.kind {
+            "rework" => "返工",
+            "reply" => "reply",
+            _ => "初稿",
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "round": self.round,
+            "run": self.run_id,
+            "intraRound": self.intra_round,
+            "kind": self.kind,
+            "path": self.path.to_string_lossy(),
+            "totalLines": self.total_lines,
+            "totalChars": self.total_chars,
+            "current": self.current,
+        })
+    }
+
+    pub fn to_json_with_text(&self, text: &str) -> Value {
+        let mut obj = self.to_json();
+        obj["text"] = json!(text);
+        obj
+    }
+}
+
+/// Parse `round-<N>-result.md` (1-based positive integer, no leading zeros).
+pub fn parse_round_result_name(name: &str) -> Option<usize> {
+    let rest = name.strip_prefix("round-")?.strip_suffix("-result.md")?;
+    if rest.is_empty() || rest.starts_with('0') || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse::<usize>().ok().filter(|&n| n >= 1)
+}
+
+pub fn is_round_result_name(name: &str) -> bool {
+    parse_round_result_name(name).is_some()
+}
+
+/// List preserved result files within a single run directory in ascending round order.
+/// When `round-N-result.md` files exist, returns them in order (and appends `result.md` only if
+/// it exists with non-empty content differing from the last preserved round). Otherwise falls
+/// back to `result.md` as round 1.
+pub fn intra_run_result_files(run: &Path) -> Vec<(usize, PathBuf)> {
+    let mut numbered: Vec<(usize, PathBuf)> = fs::read_dir(run)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() {
+                return None;
+            }
+            let fname = entry.file_name();
+            let n = parse_round_result_name(&fname.to_string_lossy())?;
+            Some((n, path))
+        })
+        .collect();
+    numbered.sort_by_key(|(n, _)| *n);
+
+    let main_result = run.join("result.md");
+    if numbered.is_empty() {
+        if main_result.is_file() {
+            return vec![(1, main_result)];
+        }
+        return Vec::new();
+    }
+    if main_result.is_file() {
+        let main_text = read(&main_result);
+        if !main_text.trim().is_empty() {
+            let last_matches = numbered
+                .last()
+                .is_some_and(|(_, p)| read(p).trim_end_matches('\n') == main_text.trim_end_matches('\n'));
+            if !last_matches {
+                let next_n = numbered.last().map(|(n, _)| n + 1).unwrap_or(1);
+                numbered.push((next_n, main_result));
+            }
+        }
+    }
+    numbered
+}
+
+fn find_parent_run(current: &Path, meta: &Value, parent_id: &str) -> Option<PathBuf> {
+    if parent_id.is_empty() {
+        return None;
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(base) = current.parent() {
+        candidates.push(base.join(parent_id));
+        candidates.push(base.join(".applied").join(parent_id));
+    }
+    let recorded_dir = s(meta, "dir");
+    if !recorded_dir.is_empty() {
+        if let Some(orig_base) = Path::new(recorded_dir).parent() {
+            candidates.push(orig_base.join(parent_id));
+            candidates.push(orig_base.join(".applied").join(parent_id));
+        }
+    }
+    let root = runs_root();
+    candidates.push(root.join(parent_id));
+    candidates.push(root.join(".applied").join(parent_id));
+    if let Some(old) = legacy_runs_root() {
+        candidates.push(old.join(parent_id));
+        candidates.push(old.join(".applied").join(parent_id));
+    }
+    candidates.push(cache_dir().join("archive").join(parent_id).join("record"));
+    candidates.into_iter().find(|p| p.join("meta.json").is_file())
+}
+
+/// Walk `parent` links from `run` back to the root of its reply chain, returning run directories
+/// ordered oldest -> `run` (zero locks, zero git subprocesses, includes archived ancestors).
+pub fn chain_ancestors_to_run(run: &Path) -> Vec<PathBuf> {
+    let mut chain = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut current = run.to_path_buf();
+    loop {
+        let meta = json(current.join("meta.json"));
+        let id = crate::notes::run_id(&current, &meta);
+        if id.is_empty() || !seen.insert(id) {
+            break;
+        }
+        let parent_id = s(&meta, "parent").to_string();
+        let next = find_parent_run(&current, &meta, &parent_id);
+        chain.push(current);
+        match next {
+            Some(p) => current = p,
+            None => break,
+        }
+    }
+    chain.reverse();
+    chain
+}
+
+/// Collect all preserved author result rounds in chronological order.
+/// When `include_chain` is true, walks `reply` ancestors (including archived records) as well as
+/// intra-run review-rework rounds (`round-N-result.md`).
+pub fn collect_result_rounds(run: &Path, include_chain: bool) -> Vec<ResultRound> {
+    let dirs = if include_chain {
+        chain_ancestors_to_run(run)
+    } else {
+        vec![run.to_path_buf()]
+    };
+    let mut out = Vec::new();
+    for (run_idx, dir) in dirs.iter().enumerate() {
+        let meta = json(dir.join("meta.json"));
+        let rid = crate::notes::run_id(dir, &meta);
+        for (intra_round, path) in intra_run_result_files(dir) {
+            let raw = read(&path);
+            let total_lines = raw.lines().count();
+            let total_chars = raw.chars().count();
+            let kind = if intra_round > 1 {
+                "rework"
+            } else if run_idx > 0 {
+                "reply"
+            } else {
+                "initial"
+            };
+            let round = out.len() + 1;
+            out.push(ResultRound {
+                round,
+                run_id: rid.clone(),
+                intra_round,
+                kind,
+                path,
+                total_lines,
+                total_chars,
+                current: false,
+            });
+        }
+    }
+    if let Some(last) = out.last_mut() {
+        last.current = true;
+    }
+    out
+}
+
 #[cfg(test)]
 mod agy_conversation_tests {
-    use super::continues_conversation;
+    use super::*;
     use std::fs;
 
     #[test]
@@ -1421,5 +1614,50 @@ mod agy_conversation_tests {
         fs::write(run.join("summary.json"), r#"{"state":"delivered","session":""}"#).unwrap();
         assert!(!continues_conversation(&run));
         fs::remove_dir_all(&run).unwrap();
+    }
+
+    #[test]
+    fn parses_round_result_filenames_strictly() {
+        assert_eq!(parse_round_result_name("round-1-result.md"), Some(1));
+        assert_eq!(parse_round_result_name("round-12-result.md"), Some(12));
+        assert_eq!(parse_round_result_name("round-0-result.md"), None);
+        assert_eq!(parse_round_result_name("round-01-result.md"), None);
+        assert_eq!(parse_round_result_name("result.md"), None);
+        assert_eq!(parse_round_result_name("round-1-verdict.md"), None);
+    }
+
+    #[test]
+    fn collects_intra_run_and_chain_rounds_in_order() {
+        let base = std::env::temp_dir().join(format!("delegate-rounds-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let r1 = base.join("20261124-010000-task");
+        let r2 = base.join("20261124-020000-reply");
+        fs::create_dir_all(&r1).unwrap();
+        fs::create_dir_all(&r2).unwrap();
+        fs::write(r1.join("meta.json"), r#"{"run":"20261124-010000-task","name":"task"}"#).unwrap();
+        fs::write(r1.join("round-1-result.md"), "r1 initial\np99=12ms\n").unwrap();
+        fs::write(r1.join("round-2-result.md"), "r1 rework\n").unwrap();
+        fs::write(r1.join("result.md"), "r1 rework\n").unwrap();
+        fs::write(
+            r2.join("meta.json"),
+            r#"{"run":"20261124-020000-reply","name":"reply to task","parent":"20261124-010000-task"}"#,
+        )
+        .unwrap();
+        fs::write(r2.join("result.md"), "r2 reply answer\n").unwrap();
+
+        let all = collect_result_rounds(&r2, true);
+        assert_eq!(all.len(), 3);
+        assert_eq!((all[0].round, all[0].kind, all[0].current), (1, "initial", false));
+        assert_eq!(all[0].path, r1.join("round-1-result.md"));
+        assert_eq!((all[1].round, all[1].kind, all[1].current), (2, "rework", false));
+        assert_eq!(all[1].path, r1.join("round-2-result.md"));
+        assert_eq!((all[2].round, all[2].kind, all[2].current), (3, "reply", true));
+        assert_eq!(all[2].path, r2.join("result.md"));
+
+        let single = collect_result_rounds(&r2, false);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].path, r2.join("result.md"));
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

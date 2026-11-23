@@ -329,11 +329,17 @@ pub fn preserve(run: &Path) -> Res<Option<PathBuf>> {
                 "-z",
             ],
         )?));
-        let result = format!(
+        let mut result = format!(
             "{}\n{}",
             read(run.join("result.md")),
             read(run.join("result-original.md"))
         );
+        for (_, rpath) in crate::runs::intra_run_result_files(run) {
+            if rpath != run.join("result.md") {
+                result.push('\n');
+                result.push_str(&read(&rpath));
+            }
+        }
         let mut candidates = vec![];
         for name in all {
             let priority = mentioned(&result, &name);
@@ -401,6 +407,15 @@ pub fn preserve(run: &Path) -> Res<Option<PathBuf>> {
     ] {
         if run.join(name).is_file() {
             fs::copy(run.join(name), record.join(name)).map_err(|e| e.to_string())?;
+        }
+    }
+    if let Ok(entries) = fs::read_dir(run) {
+        for entry in entries.flatten() {
+            let fname = entry.file_name();
+            if crate::runs::is_round_result_name(&fname.to_string_lossy()) && entry.path().is_file()
+            {
+                fs::copy(entry.path(), record.join(&fname)).map_err(|e| e.to_string())?;
+            }
         }
     }
     archive_events(&run.join("events.jsonl"), &record)?;

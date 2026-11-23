@@ -2249,17 +2249,27 @@ pub fn count_test_changes(files: &[DiffFile]) -> TestChangeStats {
     stats
 }
 
-/// Extract up to 3 summary lines from `result.md` without modifying or truncating the original file.
-pub fn extract_author_summary(run: &Path) -> Value {
+/// Extract up to 3 summary lines from `result.md` without modifying or truncating the original file,
+/// alongside deterministic pointers to every preserved round result (`round-N-result.md` and/or
+/// reply-chain ancestors).
+pub fn extract_author_summary_with_rounds(run: &Path, include_chain: bool) -> Value {
+    let rounds = runs::collect_result_rounds(run, include_chain);
+    let rounds_json: Vec<Value> = rounds.iter().map(runs::ResultRound::to_json).collect();
     let path = run.join("result.md");
-    if !path.is_file() {
+    let display_path = if path.is_file() {
+        Some(path)
+    } else {
+        rounds.last().map(|r| r.path.clone())
+    };
+    let Some(path) = display_path else {
         return json!({
             "lines": [],
             "path": Value::Null,
             "totalLines": 0,
             "totalChars": 0,
+            "rounds": rounds_json,
         });
-    }
+    };
     let raw = read(&path);
     let total_lines = raw.lines().count();
     let total_chars = raw.chars().count();
@@ -2292,6 +2302,7 @@ pub fn extract_author_summary(run: &Path) -> Value {
         "path": path.to_string_lossy(),
         "totalLines": total_lines,
         "totalChars": total_chars,
+        "rounds": rounds_json,
     })
 }
 
@@ -2622,7 +2633,7 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
     let risky_files: BTreeSet<String> = risks.iter().map(|r| r.file.clone()).collect();
     let test_stats = count_test_changes(&parsed_files);
     let other_changes = fold_remaining_changes(&parsed_files, &risky_files);
-    let author_summary = extract_author_summary(run);
+    let author_summary = extract_author_summary_with_rounds(run, !round_only);
     let mut l0 = build_l0_summary(&risks);
     let premerge_live = crate::premerge::status_for_run(run, meta, sum, None);
     let ff_bool = match premerge_live.as_ref().map(|pm| s(pm, "status")) {
@@ -2811,12 +2822,63 @@ pub fn render_card_human(card: &Value) -> String {
         }
     }
     let result_path = s(&card["author"], "path");
+    let author_rounds = card["author"]["rounds"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     if !result_path.is_empty() {
-        out.push(format!(
-            "   原文：{result_path}（共 {} 行 / {} 字）",
-            n(&card["author"], "totalLines"),
-            n(&card["author"], "totalChars")
-        ));
+        if author_rounds.len() > 1 {
+            out.push(format!(
+                "   原文：{result_path}（共 {} 行 / {} 字；共 {} 轮，查看：delegate result {run_id} --round <1..={}> / --all）",
+                n(&card["author"], "totalLines"),
+                n(&card["author"], "totalChars"),
+                author_rounds.len(),
+                author_rounds.len()
+            ));
+        } else {
+            out.push(format!(
+                "   原文：{result_path}（共 {} 行 / {} 字）",
+                n(&card["author"], "totalLines"),
+                n(&card["author"], "totalChars")
+            ));
+        }
+    }
+    if author_rounds.len() > 1 {
+        let multi_run = author_rounds
+            .iter()
+            .map(|r| s(r, "run"))
+            .collect::<BTreeSet<_>>()
+            .len()
+            > 1;
+        out.push("   各轮原文：".into());
+        for r in &author_rounds {
+            let rn = n(r, "round");
+            let rpath = s(r, "path");
+            let rlines = n(r, "totalLines");
+            let rchars = n(r, "totalChars");
+            let kind_zh = match s(r, "kind") {
+                "rework" => "返工",
+                "reply" => "reply",
+                _ => "初稿",
+            };
+            let is_cur = b(r, "current");
+            let mut tags = Vec::new();
+            if multi_run {
+                let rid = s(r, "run");
+                if !rid.is_empty() {
+                    tags.push(rid.to_string());
+                }
+            }
+            tags.push(kind_zh.to_string());
+            let tag_str = if is_cur {
+                format!("{}，当前", tags.join(" · "))
+            } else {
+                tags.join(" · ")
+            };
+            out.push(format!(
+                "     - 第 {rn} 轮（{tag_str}）：{rpath}（共 {rlines} 行 / {rchars} 字）"
+            ));
+        }
     }
     if b(rev, "enabled") {
         let verdict = s(rev, "verdict");
@@ -3466,5 +3528,69 @@ mod tests {
         assert!(config_constant_hit("crates/core/src/net.rs", "let timeout = cfg.unwrap_or(30);").is_some());
         assert!(config_constant_hit("crates/core/src/net.rs", "let poll_interval = Duration::from_secs(60);").is_some());
         assert!(config_constant_hit("scripts/cfg.py", "DEFAULT_TIMEOUT = 45").is_some());
+    }
+
+    #[test]
+    fn card_section1_links_all_round_results_without_cluttering_single_round() {
+        let base = std::env::temp_dir().join(format!("delegate-card-rounds-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let single_dir = base.join("20261124-010000-single");
+        let multi_dir = base.join("20261124-020000-multi");
+        fs::create_dir_all(&single_dir).unwrap();
+        fs::create_dir_all(&multi_dir).unwrap();
+        fs::write(single_dir.join("meta.json"), r#"{"run":"20261124-010000-single","name":"single"}"#).unwrap();
+        fs::write(single_dir.join("result.md"), "single round summary\n").unwrap();
+
+        let single_author = extract_author_summary_with_rounds(&single_dir, true);
+        let single_card = json!({
+            "run": "20261124-010000-single",
+            "name": "single",
+            "state": "delivered",
+            "changes": {"files": 1, "added": 2, "deleted": 0},
+            "l0": {},
+            "author": single_author,
+            "review": {"enabled": false},
+            "risks": [],
+            "riskStats": {"total": 0, "ruleHits": 0, "reviewerHints": 0},
+            "tests": {"added": 0, "modified": 0, "deleted": 0, "testFiles": 0},
+            "accept": Value::Null,
+            "otherChanges": [],
+            "next": [],
+        });
+        let single_rendered = render_card_human(&single_card);
+        assert!(!single_rendered.contains("各轮原文："), "{single_rendered}");
+
+        fs::write(multi_dir.join("meta.json"), r#"{"run":"20261124-020000-multi","name":"multi"}"#).unwrap();
+        fs::write(multi_dir.join("round-1-result.md"), "Round 1 bench: p99=12ms\n").unwrap();
+        fs::write(multi_dir.join("round-2-result.md"), "Round 2 fix: null check\n").unwrap();
+        fs::write(multi_dir.join("result.md"), "Round 2 fix: null check\n").unwrap();
+
+        let multi_author = extract_author_summary_with_rounds(&multi_dir, true);
+        assert_eq!(multi_author["rounds"].as_array().unwrap().len(), 2);
+        let multi_card = json!({
+            "run": "20261124-020000-multi",
+            "name": "multi",
+            "state": "delivered",
+            "changes": {"files": 1, "added": 2, "deleted": 0},
+            "l0": {},
+            "author": multi_author,
+            "review": {"enabled": false},
+            "risks": [],
+            "riskStats": {"total": 0, "ruleHits": 0, "reviewerHints": 0},
+            "tests": {"added": 0, "modified": 0, "deleted": 0, "testFiles": 0},
+            "accept": Value::Null,
+            "otherChanges": [],
+            "next": [],
+        });
+        let multi_rendered = render_card_human(&multi_card);
+        assert!(multi_rendered.contains("各轮原文："), "{multi_rendered}");
+        assert!(multi_rendered.contains("round-1-result.md"), "{multi_rendered}");
+        assert!(multi_rendered.contains("round-2-result.md"), "{multi_rendered}");
+        assert!(
+            multi_rendered.contains("delegate result 20261124-020000-multi --round <1..=2> / --all"),
+            "{multi_rendered}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

@@ -464,6 +464,17 @@ fn print_answer(run: &Path, full: bool) -> bool {
             s(&compression, "error").lines().next().unwrap_or("unknown")
         );
     }
+    if !output::json_enabled() {
+        let rounds = runs::collect_result_rounds(run, true);
+        if rounds.len() > 1 {
+            let run_id = run.file_name().unwrap_or_default().to_string_lossy();
+            println!(
+                "各轮答复：共 {} 轮（当前最新；查看各轮：delegate result {run_id} --round <1..={}> / --all / --rounds）",
+                rounds.len(),
+                rounds.len()
+            );
+        }
+    }
     truncated
 }
 fn progress(run: &Path, tag: &str) {
@@ -2806,55 +2817,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "history" => history::history_command(rest),
         "show" => history::show_command(rest),
         "board" => board::command(rest),
-        "result" => {
-            let (pos, flags, _) = parse_simple(rest, &["--path", "--no-mark"], &[])?;
-            if pos.len() > 1 {
-                return Err("result takes one run".into());
-            }
-            let no_mark = has(&flags, "--no-mark");
-            let run = runs::resolve_head(pos.first().map(String::as_str).unwrap_or("last"))?;
-            let result = run.join("result.md");
-            if !result.exists() {
-                eprintln!(
-                    "delegate: no result for {} (state: {})",
-                    run.file_name().unwrap_or_default().to_string_lossy(),
-                    runs::state(&run)
-                );
-                return Ok(1);
-            }
-            if let Some(archive) = archive::status(&run) {
-                eprintln!("archive: {}", s(&archive, "path"));
-            }
-            if has(&flags, "--path") {
-                println!("{}", result.display());
-                if !no_mark && !runs::active(&runs::state(&run)) && !run.join(".truncated").exists()
-                {
-                    mark_result_read(&run);
-                }
-            } else {
-                let mut out = io::stdout().lock();
-                // 全文确实写出后才解除保留，写入失败时 clean 仍会保留它。
-                if out
-                    .write_all(read(&result).as_bytes())
-                    .and_then(|()| out.flush())
-                    .is_ok()
-                    && !no_mark
-                {
-                    fs::remove_file(run.join(".truncated")).ok();
-                    if !runs::active(&runs::state(&run)) {
-                        mark_result_read(&run);
-                    }
-                }
-            }
-            if !no_mark && !runs::active(&runs::state(&run)) {
-                touch(run.join(".delivered"));
-                board::refresh_for_run(&run);
-                let run_meta = json(run.join("meta.json"));
-                events::mark_run_read(&events::run_id_for(&run, &run_meta));
-                work::on_run_result_read(&run, &run_meta);
-            }
-            Ok(0)
-        }
+        "result" => result_command(rest),
         "work" => work::command(rest),
         "hook" => hook::command(rest),
         "events" => events::command(rest),
@@ -3019,6 +2982,291 @@ fn tiers(args: &[String]) -> Res<i32> {
         "Pi 里还有 {} 个模型未登记",
         models::unregistered_count(&config.value, &listed)
     );
+    Ok(0)
+}
+
+fn result_command(rest: &[String]) -> Res<i32> {
+    let (pos, flags, kv) = parse_simple(
+        rest,
+        &["--path", "--no-mark", "--all", "--rounds", "--json"],
+        &["--round"],
+    )?;
+    if pos.len() > 1 {
+        return Err("result takes one run".into());
+    }
+    let want_path = has(&flags, "--path");
+    let no_mark = has(&flags, "--no-mark");
+    let show_all = has(&flags, "--all");
+    let list_rounds = has(&flags, "--rounds");
+    let want_json = has(&flags, "--json") || output::json_enabled();
+    let want_round_raw = value(&kv, "--round");
+
+    let mode_count = usize::from(want_round_raw.is_some())
+        + usize::from(show_all)
+        + usize::from(list_rounds);
+    if mode_count > 1 {
+        return Err("result: --round, --all, and --rounds are mutually exclusive".into());
+    }
+    if want_path && want_json {
+        return Err("result: --path and --json cannot be used together".into());
+    }
+    let want_round = match want_round_raw {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if n >= 1 => Some(n),
+            _ => {
+                return Err(format!(
+                    "result: invalid --round value {raw:?} (expected a positive 1-based integer)"
+                ))
+            }
+        },
+        None => None,
+    };
+
+    let run = runs::resolve_head(pos.first().map(String::as_str).unwrap_or("last"))?;
+    let run_meta = json(run.join("meta.json"));
+    let run_id = notes::run_id(&run, &run_meta);
+    let rounds = runs::collect_result_rounds(&run, true);
+    let result = run.join("result.md");
+
+    if want_round.is_some() || show_all || list_rounds {
+        if rounds.is_empty() {
+            eprintln!(
+                "delegate: no result for {} (state: {})",
+                run_id,
+                runs::state(&run)
+            );
+            return Ok(1);
+        }
+    } else if !result.exists() {
+        eprintln!(
+            "delegate: no result for {} (state: {})",
+            run_id,
+            runs::state(&run)
+        );
+        return Ok(1);
+    }
+
+    if let Some(k) = want_round {
+        if k > rounds.len() {
+            return Err(format!(
+                "result: round {k} out of range for {run_id} (available: 1..={}; use --rounds to list or --all to print all)",
+                rounds.len()
+            ));
+        }
+    }
+
+    if !want_json {
+        if let Some(archive) = archive::status(&run) {
+            eprintln!("archive: {}", s(&archive, "path"));
+        }
+        if want_round.is_none() && !show_all && !list_rounds && rounds.len() > 1 {
+            eprintln!(
+                "rounds: 共 {} 轮（当前最新；单轮 delegate result {run_id} --round <1..={}>，全部 --all，索引 --rounds）",
+                rounds.len(),
+                rounds.len()
+            );
+        }
+    }
+
+    let rounds_index_json = || -> Vec<Value> {
+        rounds.iter().map(runs::ResultRound::to_json).collect()
+    };
+    let multi_run = rounds
+        .iter()
+        .map(|r| r.run_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        > 1;
+    let round_label = |r: &runs::ResultRound| -> String {
+        let mut parts = Vec::new();
+        if multi_run && !r.run_id.is_empty() {
+            parts.push(r.run_id.clone());
+        }
+        parts.push(r.kind_zh().to_string());
+        if r.current {
+            format!("{}，当前", parts.join(" · "))
+        } else {
+            parts.join(" · ")
+        }
+    };
+
+    let mut should_mark_read = false;
+    let mut wrote_full_current = false;
+
+    if list_rounds {
+        if want_json {
+            let doc = json!({
+                "run": run_id,
+                "totalRounds": rounds.len(),
+                "rounds": rounds_index_json(),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&doc).unwrap_or_else(|_| doc.to_string())
+            );
+        } else if want_path {
+            for r in &rounds {
+                println!("{}", r.path.display());
+            }
+        } else {
+            println!("共 {} 轮（{run_id}）：", rounds.len());
+            for r in &rounds {
+                println!(
+                    "  {}. [{}] {}（共 {} 行 / {} 字）",
+                    r.round,
+                    round_label(r),
+                    r.path.display(),
+                    r.total_lines,
+                    r.total_chars
+                );
+            }
+            println!(
+                "查看单轮：delegate result {run_id} --round <1..={}> · 全部：delegate result {run_id} --all",
+                rounds.len()
+            );
+        }
+    } else if show_all {
+        if want_json {
+            let items: Vec<Value> = rounds
+                .iter()
+                .map(|r| r.to_json_with_text(&read(&r.path)))
+                .collect();
+            let doc = json!({
+                "run": run_id,
+                "totalRounds": rounds.len(),
+                "rounds": items,
+            });
+            let text = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| doc.to_string());
+            let mut out = io::stdout().lock();
+            if out
+                .write_all(format!("{text}\n").as_bytes())
+                .and_then(|()| out.flush())
+                .is_ok()
+            {
+                wrote_full_current = true;
+            }
+        } else if want_path {
+            for r in &rounds {
+                println!("{}", r.path.display());
+            }
+        } else {
+            let mut buf = String::new();
+            let total = rounds.len();
+            for (i, r) in rounds.iter().enumerate() {
+                if i > 0 {
+                    buf.push('\n');
+                }
+                buf.push_str(&format!(
+                    "===== round {}/{total} ({} · {}) =====\n",
+                    r.round,
+                    round_label(r),
+                    r.path.display()
+                ));
+                let body = read(&r.path);
+                buf.push_str(body.trim_end_matches('\n'));
+                buf.push('\n');
+            }
+            let mut out = io::stdout().lock();
+            if out
+                .write_all(buf.as_bytes())
+                .and_then(|()| out.flush())
+                .is_ok()
+            {
+                wrote_full_current = true;
+            }
+        }
+        should_mark_read = !no_mark;
+    } else if let Some(k) = want_round {
+        let entry = &rounds[k - 1];
+        if want_json {
+            let body = read(&entry.path);
+            let doc = json!({
+                "run": run_id,
+                "totalRounds": rounds.len(),
+                "selectedRound": k,
+                "round": entry.to_json_with_text(&body),
+                "text": body,
+                "rounds": rounds_index_json(),
+            });
+            let text = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| doc.to_string());
+            let mut out = io::stdout().lock();
+            if out
+                .write_all(format!("{text}\n").as_bytes())
+                .and_then(|()| out.flush())
+                .is_ok()
+                && entry.current
+            {
+                wrote_full_current = true;
+            }
+        } else if want_path {
+            println!("{}", entry.path.display());
+        } else {
+            let mut out = io::stdout().lock();
+            if out
+                .write_all(read(&entry.path).as_bytes())
+                .and_then(|()| out.flush())
+                .is_ok()
+                && entry.current
+            {
+                wrote_full_current = true;
+            }
+        }
+        should_mark_read = !no_mark && entry.current;
+    } else {
+        if want_json {
+            let body = read(&result);
+            let doc = json!({
+                "run": run_id,
+                "totalRounds": rounds.len().max(1),
+                "selectedRound": rounds.len().max(1),
+                "path": result.to_string_lossy(),
+                "totalLines": body.lines().count(),
+                "totalChars": body.chars().count(),
+                "text": body,
+                "rounds": rounds_index_json(),
+            });
+            let text = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| doc.to_string());
+            let mut out = io::stdout().lock();
+            if out
+                .write_all(format!("{text}\n").as_bytes())
+                .and_then(|()| out.flush())
+                .is_ok()
+            {
+                wrote_full_current = true;
+            }
+        } else if want_path {
+            println!("{}", result.display());
+        } else {
+            let mut out = io::stdout().lock();
+            // 全文确实写出后才解除保留，写入失败时 clean 仍会保留它。
+            if out
+                .write_all(read(&result).as_bytes())
+                .and_then(|()| out.flush())
+                .is_ok()
+            {
+                wrote_full_current = true;
+            }
+        }
+        should_mark_read = !no_mark;
+    }
+
+    if should_mark_read {
+        let is_active = runs::active(&runs::state(&run));
+        if wrote_full_current {
+            fs::remove_file(run.join(".truncated")).ok();
+            if !is_active {
+                mark_result_read(&run);
+            }
+        } else if want_path && !is_active && !run.join(".truncated").exists() {
+            mark_result_read(&run);
+        }
+        if !is_active {
+            touch(run.join(".delivered"));
+            board::refresh_for_run(&run);
+            events::mark_run_read(&events::run_id_for(&run, &run_meta));
+            work::on_run_result_read(&run, &run_meta);
+        }
+    }
     Ok(0)
 }
 

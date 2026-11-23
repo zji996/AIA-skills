@@ -1,6 +1,6 @@
 [package]
 name = "delegate-tui"
-version = "6.36.1"
+version = "6.37.0"
 edition = "2021"
 rust-version = "1.93"
 

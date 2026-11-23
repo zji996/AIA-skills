@@ -1,5 +1,9 @@
 # delegate
 
+## 6.37 返工/续做各轮答复保留与审查卡索引（W051）
+
+- 审-改自动返工（或 `reply` 续做链）保留各轮原文：触发 `REWORK` 前将上一轮答复持久化为 `round-N-result.md`（不覆盖旧结论与实测数字，`result.md` 始终镜像最新一轮；归档 `archive/<run>/record/` 与轻量保留均完整保存并纳入证据引用扫描）；`delegate card <run>` 第 1 段在多轮时确定性列出每轮原文路径与行/字数（单轮不变）；`delegate result <run>` 支持 `--round N`（越界给 `1..=N` 范围）、`--all`、`--rounds`（不标已读）、`--path` 与 `--json` 查看任意轮或全部轮次，包括已归档的父 run。Preserve per-round results (`round-N-result.md`) across review-rework and reply chains (including archived ancestors), link every round's original path in review card section 1, and inspect rounds via `delegate result --round/--all/--rounds/--json`.
+
 ## 6.36 Stop 钩子合一、工作表与审查卡误报修复
 
 - 统一 Stop 钩子（零锁、零 git）：`hooks/claude-code-stop.py` 合并 waiter/unmerged/事件游标拦截且只读 `state/index.json` 与快照，识别 PATH 裸 `delegate wait` 与带路径写法，跳过进行中的 `apply`/合入员（含 `_merge-worker`）/门禁（`lane`）与零改动交付；延后走 `delegate work defer --reason … --until …` 并删掉钩子侧 `deferred.tsv`；每次拦截写 `<state>/stop-hook.jsonl`，`delegate hook stats` 按周统计触发与处理去向；`scripts/install-claude-hooks.sh` 仅装单一 Stop 钩子并移除旧脚本配置。Unified zero-lock/zero-git Stop hook with bare/path waiter matching, in-flight apply/merge/lane & zero-change exemptions, work-table deferrals, stop-hook.jsonl logging, and weekly `delegate hook stats`.

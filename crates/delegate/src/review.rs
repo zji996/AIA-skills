@@ -2387,15 +2387,29 @@ pub fn run_accept_and_review(
             break;
         };
 
-        supervise::log_event(
-            run,
-            json!({
-                "e": "review_rework",
-                "round": round,
-                "reworkRounds": rework_rounds,
-                "verdictFile": verdict_file.to_string_lossy(),
-            }),
-        );
+        // Preserve previous round's result before rework overwrites `result.md` (compression as index).
+        let prev_round_result = run.join(format!("round-{round}-result.md"));
+        if !prev_round_result.is_file() {
+            let prev_text = if !answer.trim().is_empty() {
+                format!("{}\n", answer.trim_end_matches('\n'))
+            } else {
+                read(run.join("result.md"))
+            };
+            if !prev_text.trim().is_empty() {
+                write(&prev_round_result, prev_text)?;
+            }
+        }
+
+        let mut rework_ev = json!({
+            "e": "review_rework",
+            "round": round,
+            "reworkRounds": rework_rounds,
+            "verdictFile": verdict_file.to_string_lossy(),
+        });
+        if prev_round_result.is_file() {
+            rework_ev["prevResultFile"] = json!(prev_round_result.to_string_lossy());
+        }
+        supervise::log_event(run, rework_ev);
 
         let (mut author_verdict, mut author_answer, mut next_attempts) =
             supervise::attempts_from(&author_next, run, *attempts + 1, holder.clone(), grace.clone());
@@ -2418,10 +2432,9 @@ pub fn run_accept_and_review(
         *attempts = next_attempts;
         if !author_answer.trim().is_empty() {
             *answer = author_answer;
-            write(
-                run.join("result.md"),
-                format!("{}\n", answer.trim_end_matches('\n')),
-            )?;
+            let formatted = format!("{}\n", answer.trim_end_matches('\n'));
+            write(run.join(format!("round-{}-result.md", round + 1)), &formatted)?;
+            write(run.join("result.md"), &formatted)?;
         }
         let pre = supervise::settle_pre_accept(
             meta,
