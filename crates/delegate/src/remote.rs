@@ -700,7 +700,11 @@ fn execute(run: &Path, meta: &Value, program: &str, args: &[String]) -> Res<i32>
     let marker = run.join(format!("lane-waiting-{}", std::process::id()));
     let mut waiting = None;
     let _slot = loop {
-        match lock(&locks.join(lock_name.as_str()), true, true) {
+        match crate::locks::try_acquire(
+            crate::locks::LockKind::Lane,
+            &locks.join(lock_name.as_str()),
+            true,
+        ) {
             Ok(f) => break f,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && !crate::lane::stopped() => {
                 if waiting.is_none() {

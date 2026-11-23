@@ -106,7 +106,7 @@ pub fn command(args: &[String]) -> Res<i32> {
         }
         let path = path();
         std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
-        let _guard = lock(&path.with_extension("lock"), true, false).map_err(|e| e.to_string())?;
+        let _guard = crate::locks::acquire(crate::locks::LockKind::RunLocal, &path.with_extension("lock"), true).map_err(|e| e.to_string())?;
         let mut card = load()?;
         let demoted = set(
             &mut card,

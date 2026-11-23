@@ -260,17 +260,23 @@ fn journal(source: &Path) -> PathBuf {
         .to_string(),
     )
 }
-pub fn guard(source: &Path, exclusive: bool) -> Res<fs::File> {
+pub fn guard(source: &Path, exclusive: bool) -> Res<crate::locks::LockGuard> {
     let dir = journal(source);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    lock(&dir.join("lock"), exclusive, false).map_err(|e| e.to_string())
+    crate::locks::acquire(crate::locks::LockKind::SourceWatch, &dir.join("lock"), exclusive)
+        .map_err(|e| e.to_string())
 }
 /// Serializes concurrent `apply` operations on the same source repository without
 /// holding the source-watch observation/baseline lock across slow non-write phases.
-pub fn apply_guard(source: &Path) -> Res<fs::File> {
+pub fn apply_guard(source: &Path) -> Res<crate::locks::LockGuard> {
     let dir = journal(source);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    lock(&dir.join("apply.lock"), true, false).map_err(|e| e.to_string())
+    crate::locks::acquire(
+        crate::locks::LockKind::SourceWatchApply,
+        &dir.join("apply.lock"),
+        true,
+    )
+    .map_err(|e| e.to_string())
 }
 fn fingerprint_pair(source: &Path) -> Res<(Value, Value)> {
     let data = git(
@@ -328,12 +334,17 @@ pub fn baseline(source: &Path) -> Res<Value> {
     let dir = journal(source);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let lock_path = dir.join("lock");
-    let _guard = match lock(&lock_path, false, true) {
-        Ok(file) => file,
+    let _guard = match crate::locks::try_acquire(
+        crate::locks::LockKind::SourceWatch,
+        &lock_path,
+        false,
+    ) {
+        Ok(guard) => guard,
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
             eprintln!("delegate: waiting for apply to finish writing source workspace / 等待 apply 完成写盘...");
             let _ = std::io::stderr().flush();
-            lock(&lock_path, false, false).map_err(|e| e.to_string())?
+            crate::locks::acquire(crate::locks::LockKind::SourceWatch, &lock_path, false)
+                .map_err(|e| e.to_string())?
         }
         Err(err) => return Err(err.to_string()),
     };
@@ -397,7 +408,13 @@ pub fn register_matching(
 }
 pub fn busy(meta: &Value) -> bool {
     let source = Path::new(s(&meta["worktree"], "source"));
-    meta["sourceStatusBaseline"].is_object() && lock(&journal(source).join("lock"), false, true).is_err()
+    meta["sourceStatusBaseline"].is_object()
+        && crate::locks::try_acquire(
+            crate::locks::LockKind::SourceWatch,
+            &journal(source).join("lock"),
+            false,
+        )
+        .is_err()
 }
 pub fn changed(meta: &Value) -> Vec<String> {
     changes_now(meta, false)
@@ -454,7 +471,11 @@ fn changes_now(meta: &Value, nonblocking: bool) -> Vec<String> {
         return vec![];
     }
     let dir = journal(source);
-    let Ok(_guard) = lock(&dir.join("lock"), false, nonblocking) else {
+    let Ok(_guard) = (if nonblocking {
+        crate::locks::try_acquire(crate::locks::LockKind::SourceWatch, &dir.join("lock"), false)
+    } else {
+        crate::locks::acquire(crate::locks::LockKind::SourceWatch, &dir.join("lock"), false)
+    }) else {
         return vec![];
     };
     let Ok((now, now_worktree)) = fingerprint_pair(source) else {

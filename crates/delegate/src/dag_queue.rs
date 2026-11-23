@@ -319,7 +319,7 @@ pub fn advance() {
         let mut paused_events: Vec<(String, String, Value)> = Vec::new();
 
         {
-            let Ok(_guard) = lock(&queue_lock(&state), true, false) else {
+            let Ok(_guard) = crate::locks::acquire(crate::locks::LockKind::DagQueue, &queue_lock(&state), true) else {
                 return;
             };
             let mut items = load_items(&state);
@@ -501,7 +501,7 @@ fn dispatch_one(state: &Path, item: &Value) {
         Err("delegate start produced no run JSON".into())
     })();
 
-    let Ok(_guard) = lock(&queue_lock(state), true, false) else {
+    let Ok(_guard) = crate::locks::acquire(crate::locks::LockKind::DagQueue, &queue_lock(state), true) else {
         return;
     };
     let mut items = load_items(state);
@@ -772,7 +772,7 @@ fn add_cmd(args: &[String]) -> Res<i32> {
 
     let created_item: Value;
     {
-        let _guard = lock(&queue_lock(&state), true, false).map_err(|e| e.to_string())?;
+        let _guard = crate::locks::acquire(crate::locks::LockKind::DagQueue, &queue_lock(&state), true).map_err(|e| e.to_string())?;
         let mut items = load_items(&state);
 
         if items
@@ -971,7 +971,7 @@ fn remove_cmd(args: &[String]) -> Res<i32> {
         return Err("queue remove requires at least one <name>".into());
     }
     let state = state_dir();
-    let _guard = lock(&queue_lock(&state), true, false).map_err(|e| e.to_string())?;
+    let _guard = crate::locks::acquire(crate::locks::LockKind::DagQueue, &queue_lock(&state), true).map_err(|e| e.to_string())?;
     let mut items = load_items(&state);
     let mut removed = Vec::new();
     for target in &names {

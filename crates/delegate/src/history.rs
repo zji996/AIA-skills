@@ -230,7 +230,7 @@ pub fn history_path_for_key(key: &str) -> PathBuf {
 fn append_jsonl(key: &str, value: &Value) -> Res<()> {
     let dir = history_dir_for_key(key);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let _guard = lock(&dir.join("history.lock"), true, false).map_err(|e| e.to_string())?;
+    let _guard = crate::locks::acquire(crate::locks::LockKind::History, &dir.join("history.lock"), true).map_err(|e| e.to_string())?;
     let line = serde_json::to_string(value).map_err(|e| e.to_string())?;
     append(dir.join("history.jsonl"), &format!("{line}\n"))
 }
@@ -927,7 +927,7 @@ pub fn ensure_backfilled() {
     if fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let Ok(_guard) = lock(&dir.join("history.lock"), true, false) else {
+    let Ok(_guard) = crate::locks::acquire(crate::locks::LockKind::History, &dir.join("history.lock"), true) else {
         return;
     };
     if marker.is_file() && history_file.is_file() {

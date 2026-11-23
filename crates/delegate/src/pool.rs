@@ -37,8 +37,13 @@ fn claimed(slot: &Path) -> bool {
         run.is_dir()
             && s(&json(run.join("meta.json"))["worktree"], "path") == slot.to_string_lossy()
     };
-    // Between the claim and its meta.json the owner run exists without a record yet.
-    let pending = |run: &Path| run.is_dir() && !run.join("meta.json").exists();
+    // Between the claim and its finalized meta.json the owner run exists without worktree.path yet.
+    let pending = |run: &Path| {
+        run.is_dir()
+            && !run.join("exit_code").exists()
+            && (!run.join("meta.json").exists()
+                || s(&json(run.join("meta.json"))["worktree"], "path").is_empty())
+    };
     let owner = fs::read_to_string(owner_file(slot))
         .map(|owner| PathBuf::from(owner.trim()))
         .ok();
@@ -51,7 +56,12 @@ fn claimed(slot: &Path) -> bool {
 /// Claim a free slot for `run` among `slots` slots of `source`; `None` when all are held.
 pub fn claim(source: &Path, run: &Path, slots: u64) -> Option<PathBuf> {
     fs::create_dir_all(root()).ok()?;
-    let _guard = lock(&root().join(".claim.lock"), true, false).ok()?;
+    let _guard = crate::locks::acquire(
+        crate::locks::LockKind::PoolClaim,
+        &root().join(".claim.lock"),
+        true,
+    )
+    .ok()?;
     let repo = source.file_name().unwrap_or_default().to_string_lossy();
     (1..=slots.min(MAX_SLOTS)).find_map(|n| {
         let slot = root().join(format!("{repo}-{n}"));

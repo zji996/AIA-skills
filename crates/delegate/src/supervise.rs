@@ -1207,8 +1207,18 @@ fn admit_waiting(run: &Path, meta: &mut Value) -> Res<bool> {
     let slots = state_dir();
     let root = runs_root();
     loop {
-        let machine = lock(&slots.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
-        let local = lock(&root.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
+        let machine = crate::locks::acquire(
+            crate::locks::LockKind::StartMachine,
+            &slots.join(".start.lock"),
+            true,
+        )
+        .map_err(|e| e.to_string())?;
+        let local = crate::locks::acquire(
+            crate::locks::LockKind::StartRepo,
+            &root.join(".start.lock"),
+            true,
+        )
+        .map_err(|e| e.to_string())?;
         if lane::stopped() {
             return Ok(false);
         }
@@ -1228,6 +1238,13 @@ fn admit_waiting(run: &Path, meta: &mut Value) -> Res<bool> {
                     }
                 }
             }
+            meta["startedEpoch"] = json!(epoch() as i64);
+            meta["startedAt"] = json!(iso());
+            write_json(run.join("meta.json"), meta)?;
+            fs::remove_file(run.join(".waiting")).map_err(|e| e.to_string())?;
+            drop(local);
+            drop(machine);
+            // Claim worktree pool slot outside `.start.lock` under `PoolClaim`.
             let origin = PathBuf::from(s(meta, "workdir"));
             let mut wd = origin.clone();
             let mut tree = meta["worktree"].clone();
@@ -1237,12 +1254,7 @@ fn admit_waiting(run: &Path, meta: &mut Value) -> Res<bool> {
             }
             meta["workdir"] = json!(wd);
             meta["worktree"] = tree;
-            meta["startedEpoch"] = json!(epoch() as i64);
-            meta["startedAt"] = json!(iso());
             write_json(run.join("meta.json"), meta)?;
-            fs::remove_file(run.join(".waiting")).map_err(|e| e.to_string())?;
-            drop(local);
-            drop(machine);
             crate::events::emit(
                 &crate::events::run_id_for(run, meta),
                 &crate::events::repo_for_meta(meta),

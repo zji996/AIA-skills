@@ -1,4 +1,4 @@
-use crate::common::{json, lock, now_ns, state_dir, Res};
+use crate::common::{json, now_ns, state_dir, Res};
 use serde_json::{json as j, Value};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -649,7 +649,13 @@ pub fn reconcile_pool_in(base: &Path, target_tokens: usize, budget: usize) -> Po
             leases: vec![],
         };
     }
-    let Ok(_guard) = lock(&lock_path(base), true, false) else {
+    let Ok(_guard) = crate::locks::try_acquire_with_retry(
+        crate::locks::LockKind::Jobserver,
+        &lock_path(base),
+        true,
+        3,
+        Duration::from_millis(15),
+    ) else {
         return PoolStatus {
             fifo,
             target: target_tokens,
@@ -754,7 +760,7 @@ impl ProxyGuard {
 
         let global_fifo = fifo_path(&base);
         let (global_fd, mut lease_file, initial_jobs) = {
-            let _guard = lock(&lock_path(&base), true, false).map_err(|e| e.to_string())?;
+            let _guard = crate::locks::acquire(crate::locks::LockKind::Jobserver, &lock_path(&base), true).map_err(|e| e.to_string())?;
             ensure_fifo(&global_fifo)?;
             let global_fd = open_fifo_nonblock(&global_fifo)?;
             let _status = reconcile_locked(&base, global_fd.raw(), target_tokens, budget);
@@ -933,7 +939,7 @@ fn run_proxy_loop(
         let mut did_work = false;
         let mut global_has_tokens = false;
 
-        if let Ok(_guard) = lock(&lock_path(&base), true, false) {
+        if let Ok(_guard) = crate::locks::acquire(crate::locks::LockKind::Jobserver, &lock_path(&base), true) {
             if last_reconcile.elapsed() >= Duration::from_millis(RECONCILE_INTERVAL_MS) {
                 let _ = reconcile_locked(&base, global_fd.raw(), target_tokens, budget);
                 last_reconcile = Instant::now();
@@ -1043,7 +1049,7 @@ fn run_proxy_loop(
     drop(proxy_fd);
     let _ = fs::remove_file(&proxy_fifo);
 
-    if let Ok(_guard) = lock(&lock_path(&base), true, false) {
+    if let Ok(_guard) = crate::locks::acquire(crate::locks::LockKind::Jobserver, &lock_path(&base), true) {
         let _ = fs::remove_file(&lease_path);
         // Check whether other proxies are still alive before returning tokens.
         let (alive_others, _) = scan_leases_locked(&base, budget);
@@ -1250,7 +1256,12 @@ mod tests {
 
         // Part B: Simulate a SIGKILLed delegate lane process (unlocked dead lease + missing tokens in global FIFO).
         {
-            let _g = lock(&lock_path(&state), true, false).unwrap();
+            let _g = crate::locks::acquire(
+                crate::locks::LockKind::Jobserver,
+                &lock_path(&state),
+                true,
+            )
+            .unwrap();
             let gfd = open_fifo_nonblock(&fifo_path(&state)).unwrap();
             let drained = read_nonblock(gfd.raw(), 3);
             assert_eq!(drained, 3);

@@ -96,7 +96,11 @@ pub fn status(run: &Path) -> Option<Value> {
     }
     let mut out = json(run.join("queue.json"));
     // Admission owns the live view. Listings never scan processes or wait for it.
-    if let Ok(_guard) = lock(&state_dir().join(".start.lock"), false, true) {
+    if let Ok(_guard) = crate::locks::try_acquire(
+        crate::locks::LockKind::StartMachine,
+        &state_dir().join(".start.lock"),
+        false,
+    ) {
         let meta = json(run.join("meta.json"));
         out["ahead"] = json!(waiting().iter().filter(|(_, other)| key(other) < key(&meta)).count());
     } else {

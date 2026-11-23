@@ -259,30 +259,7 @@ pub fn render_for(key: &str, runs_dir: Option<&Path>) -> String {
     let hist_by_id: HashMap<String, &HistoryEntry> =
         hist_entries.iter().map(|e| (e.run.clone(), e)).collect();
 
-    let mut replied_ids = HashSet::<String>::new();
-    for e in &hist_entries {
-        if !e.parent.is_empty() {
-            replied_ids.insert(e.parent.clone());
-        }
-    }
-    for run in &all {
-        let meta = json(run.join("meta.json"));
-        let parent = s(&meta, "parent");
-        if !parent.is_empty() {
-            replied_ids.insert(parent.to_string());
-        }
-        if !s(&meta, "repliedAt").is_empty() {
-            let id = if !s(&meta, "run").is_empty() {
-                s(&meta, "run").to_string()
-            } else {
-                run.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            replied_ids.insert(id);
-        }
-    }
+    let replied_ids = runs::superseded_by_reply(&all, &hist_entries);
 
     let now = epoch() as i64;
     let day_cutoff = now - 86400;
@@ -432,10 +409,12 @@ pub fn render_for(key: &str, runs_dir: Option<&Path>) -> String {
         }
 
         if matches!(st.as_str(), "delivered" | "answered") {
-            let changes_val = sum.get("pendingChanges").unwrap_or(&sum["changes"]);
-            let has_worktree_changes = s(&meta, "mode") == "write"
-                && meta["worktree"].is_object()
-                && n(changes_val, "files") > 0;
+            let changes_val = sum
+                .get("pendingChanges")
+                .filter(|v| v.is_object())
+                .unwrap_or(&sum["changes"]);
+            let pending_files = runs::chain_pending_apply_files(run, &meta, &sum, &all);
+            let has_worktree_changes = pending_files > 0;
             if unresolved_conflicts || (has_worktree_changes && !is_applied && !is_replied) {
                 let conclusion = history::extract_conclusion(&read(run.join("result.md")));
                 let summary_line = first_conclusion_sentence(&conclusion);
@@ -587,7 +566,7 @@ pub fn render_for(key: &str, runs_dir: Option<&Path>) -> String {
 
 fn write_atomic_to(lock_dir: &Path, board_path: &Path, content: &str) -> Res<()> {
     fs::create_dir_all(lock_dir).map_err(|e| e.to_string())?;
-    let _guard = lock(&lock_dir.join("board.lock"), true, false).map_err(|e| e.to_string())?;
+    let _guard = crate::locks::acquire(crate::locks::LockKind::Board, &lock_dir.join("board.lock"), true).map_err(|e| e.to_string())?;
     if let Some(parent) = board_path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }

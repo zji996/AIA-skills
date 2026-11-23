@@ -1,12 +1,11 @@
 use crate::common::*;
-use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 
 pub const COVERED: i32 = 76;
 
 // Keep the lock inode: unlinking it allows a new waiter to lock a different file.
-pub fn claim(runs: &[PathBuf]) -> Res<(Vec<PathBuf>, Vec<File>)> {
+pub fn claim(runs: &[PathBuf]) -> Res<(Vec<PathBuf>, Vec<crate::locks::LockGuard>)> {
     let mut claimed = Vec::new();
     let mut held = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -15,11 +14,17 @@ pub fn claim(runs: &[PathBuf]) -> Res<(Vec<PathBuf>, Vec<File>)> {
             continue;
         }
         let path = run.join("waiter.lock");
-        match lock(&path, true, true) {
-            Ok(mut file) => {
+        match crate::locks::try_acquire_opts(
+            crate::locks::LockKind::WaiterClaim,
+            &path,
+            true,
+            false,
+        ) {
+            Ok(mut guard) => {
+                let file = guard.file_mut();
                 file.set_len(0).map_err(|e| e.to_string())?;
                 writeln!(file, "{}", std::process::id()).map_err(|e| e.to_string())?;
-                held.push(file);
+                held.push(guard);
                 claimed.push(run.clone());
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {

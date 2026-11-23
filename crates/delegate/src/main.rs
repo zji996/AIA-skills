@@ -17,6 +17,7 @@ mod history;
 mod jobserver;
 mod lane;
 mod launch;
+mod locks;
 mod measure;
 mod merge;
 mod models;
@@ -887,7 +888,7 @@ fn wait_each(
         let rescan_into =
             |list: &mut Vec<PathBuf>,
              covered: &mut std::collections::HashSet<PathBuf>,
-             claims: &mut Vec<std::fs::File>| {
+             claims: &mut Vec<locks::LockGuard>| {
                 if let Some((pos, flags)) = rescan {
                     if let Ok((fresh, _)) = wait_list(pos, flags, true) {
                         for run in fresh {
@@ -2241,22 +2242,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
             }
 
             let hist_entries = history::load_entries(&history::current_history_key());
-            let mut replied_ids = std::collections::HashSet::<String>::new();
-            for e in &hist_entries {
-                if !e.parent.is_empty() {
-                    replied_ids.insert(e.parent.clone());
-                }
-            }
-            for run in &all {
-                let meta = json(run.join("meta.json"));
-                let parent = s(&meta, "parent");
-                if !parent.is_empty() {
-                    replied_ids.insert(parent.to_string());
-                }
-                if !s(&meta, "repliedAt").is_empty() {
-                    replied_ids.insert(notes::run_id(run, &meta));
-                }
-            }
+            let replied_ids = runs::superseded_by_reply(&all, &hist_entries);
 
             let mut running = 0usize;
             let mut pending_apply = 0usize;
@@ -2316,9 +2302,8 @@ fn main_inner(args: &[String]) -> Res<i32> {
                         true
                     }
                 } else if matches!(st.as_str(), "delivered" | "answered") {
-                    let has_worktree_changes = s(&meta, "mode") == "write"
-                        && meta["worktree"].is_object()
-                        && n(sum.get("pendingChanges").unwrap_or(&sum["changes"]), "files") > 0;
+                    let has_worktree_changes =
+                        runs::chain_pending_apply_files(run, &meta, &sum, &all) > 0;
                     let rev_doc = {
                         let f = json(run.join("review.json"));
                         if f.is_object() { f } else { sum["review"].clone() }

@@ -20,7 +20,7 @@ pub fn enqueue(args: &[String], o: &mut launch::Options) -> Res<bool> {
     if o.wait {
         return Err("--when-done cannot be combined with --wait; collect the reply later".into());
     }
-    let _guard = lock(&run.join("reply.lock"), true, true)
+    let _guard = crate::locks::try_acquire(crate::locks::LockKind::ReplyMailbox, &run.join("reply.lock"), true)
         .map_err(|_| "reply mailbox busy; try again".to_string())?;
     if status(&run).is_some() {
         return Err("a pending reply already exists; stop cancels it".into());
@@ -45,7 +45,7 @@ pub fn enqueue(args: &[String], o: &mut launch::Options) -> Res<bool> {
 }
 
 pub fn cancel(run: &Path) -> Res<()> {
-    let _guard = lock(&run.join("reply.lock"), true, false).map_err(|e| e.to_string())?;
+    let _guard = crate::locks::acquire(crate::locks::LockKind::ReplyMailbox, &run.join("reply.lock"), true).map_err(|e| e.to_string())?;
     touch(run.join(".stopped"));
     let _ = fs::remove_file(run.join("pending-reply.json"));
     Ok(())
@@ -61,7 +61,7 @@ pub fn deliver(run: &Path) -> Res<()> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let _guard = lock(&run.join("reply.lock"), true, false).map_err(|e| e.to_string())?;
+    let _guard = crate::locks::acquire(crate::locks::LockKind::ReplyMailbox, &run.join("reply.lock"), true).map_err(|e| e.to_string())?;
     let Some(saved) = status(run) else {
         return Ok(());
     };

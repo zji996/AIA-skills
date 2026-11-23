@@ -135,7 +135,7 @@ pub fn emit(run: &str, repo: &str, kind: &str, payload: Value) -> Option<u64> {
 
 pub fn emit_in(state: &Path, run: &str, repo: &str, kind: &str, payload: Value) -> Res<u64> {
     fs::create_dir_all(state).map_err(|e| e.to_string())?;
-    let _guard = lock(&state.join(".events.lock"), true, false).map_err(|e| e.to_string())?;
+    let _guard = crate::locks::acquire(crate::locks::LockKind::Events, &state.join(".events.lock"), true).map_err(|e| e.to_string())?;
     let events_file = state.join("events.jsonl");
     let seq_file = state.join("events.seq");
     let next_seq = current_max_seq_locked(&events_file, &seq_file).saturating_add(1);
@@ -261,7 +261,7 @@ pub fn record_cursor_in(state: &Path, caller_id: Option<&str>, seq: u64) {
     if fs::create_dir_all(state).is_err() {
         return;
     }
-    let Ok(_guard) = lock(&state.join(".cursors.lock"), true, false) else {
+    let Ok(_guard) = crate::locks::acquire(crate::locks::LockKind::Cursors, &state.join(".cursors.lock"), true) else {
         return;
     };
     let mut doc = load_cursors_doc(state);
@@ -294,7 +294,7 @@ pub fn mark_runs_read_in(state: &Path, caller_id: Option<&str>, run_ids: &[Strin
     if run_ids.is_empty() || fs::create_dir_all(state).is_err() {
         return;
     }
-    let Ok(_guard) = lock(&state.join(".cursors.lock"), true, false) else {
+    let Ok(_guard) = crate::locks::acquire(crate::locks::LockKind::Cursors, &state.join(".cursors.lock"), true) else {
         return;
     };
     let mut doc = load_cursors_doc(state);
@@ -805,7 +805,7 @@ pub fn rebuild_in(state: &Path, extra_runs_dirs: &[PathBuf]) -> Res<Value> {
             .then_with(|| a.2.cmp(&b.2))
     });
 
-    let _guard = lock(&state.join(".events.lock"), true, false).map_err(|e| e.to_string())?;
+    let _guard = crate::locks::acquire(crate::locks::LockKind::Events, &state.join(".events.lock"), true).map_err(|e| e.to_string())?;
     let events_file = state.join("events.jsonl");
     let seq_file = state.join("events.seq");
     let tmp = state.join(".events.jsonl.tmp");

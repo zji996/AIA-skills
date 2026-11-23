@@ -264,6 +264,9 @@ class Delegate625HistoryTests(unittest.TestCase):
                      "给前端个人资料页加上用户头像上传和裁剪功能")
         )
         self.addCleanup(lambda: (gate.touch(), self.cli("stop", active["run"])))
+        fixtures.DelegateTests.until(
+            self, lambda: (Path(active["dir"]) / "agent.pid").is_file(), "active agent started"
+        )
 
         # Positive: paraphrased Chinese task ("同一任务换个说法") hits both recent & active, non-blocking (exit 0).
         self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED])

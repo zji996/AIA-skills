@@ -653,7 +653,7 @@ fn acquire_in(
     let ticket;
     let file;
     {
-        let _guard = lock(&dir.join(".lock"), true, false).map_err(|e| e.to_string())?;
+        let _guard = crate::locks::acquire(crate::locks::LockKind::Lane, &dir.join(".lock"), true).map_err(|e| e.to_string())?;
         ticket = dir.join(format!("{stamp:020}-{}.ticket", std::process::id()));
         file = locked_file(&ticket, &me.to_string())?;
     }
@@ -666,7 +666,7 @@ fn acquire_in(
     let mut emitted_queued = false;
     let outcome = (|| {
         loop {
-            let guard = lock(&dir.join(".lock"), true, false).map_err(|e| e.to_string())?;
+            let guard = crate::locks::acquire(crate::locks::LockKind::Lane, &dir.join(".lock"), true).map_err(|e| e.to_string())?;
             let live = tickets_in(dir);
             let pos = live.iter().position(|(p, _)| p == &ticket).unwrap_or(0);
             if pos < limit {
@@ -754,7 +754,7 @@ pub fn save_priority(run: &Path) -> Res<()> {
     let mut priority = json!({});
     for dir in [lane_dir(), state_dir().join("lane-remote")] {
         if !dir.is_dir() { continue; }
-        let _guard = lock(&dir.join(".lock"), true, false).map_err(|e| e.to_string())?;
+        let _guard = crate::locks::acquire(crate::locks::LockKind::Lane, &dir.join(".lock"), true).map_err(|e| e.to_string())?;
         for (_, ticket) in tickets_in(&dir) {
             if ticket["run"] == json!(run) && !b(&ticket, "running") {
                 let label = s(&ticket, "label");

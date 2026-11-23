@@ -153,7 +153,7 @@ impl Drop for Slot {
             // the old slot restore it to all CPUs afterward.
             let guard = path
                 .parent()
-                .and_then(|dir| lock(&dir.join(".lock"), true, false).ok());
+                .and_then(|dir| crate::locks::acquire(crate::locks::LockKind::Lane, &dir.join(".lock"), true).ok());
             let _ = fs::remove_file(&path);
             let target = remaining_cpus().unwrap_or_else(|| format_cpus(&online_cpus()));
             // Lane commands started during the reservation were pinned to the
@@ -466,7 +466,7 @@ pub fn acquire(
         json!({"pid":std::process::id(),"label":label,"cpus":cpus,"since":iso(),"epoch":epoch()});
     let ticket = dir.join(format!("{:020}-{}.ticket", now_ns(), std::process::id()));
     let file = {
-        let _guard = lock(&dir.join(".lock"), true, false).map_err(|e| e.to_string())?;
+        let _guard = crate::locks::acquire(crate::locks::LockKind::Lane, &dir.join(".lock"), true).map_err(|e| e.to_string())?;
         locked_file(&ticket, &me.to_string())?
     };
     let marker = run.map(|p| p.join(format!("measure-waiting-{}", std::process::id())));
@@ -517,7 +517,7 @@ pub fn acquire(
     // Hold the measurement lock while changing existing lane holders.  A
     // concurrent Slot::drop uses the same lock, so a successor reservation
     // cannot be undone by the predecessor's restore step.
-    let guard = lock(&dir.join(".lock"), true, false).ok();
+    let guard = crate::locks::acquire(crate::locks::LockKind::Lane, &dir.join(".lock"), true).ok();
     let holder_cpus = remaining_cpus().unwrap_or_else(|| format_cpus(&online_cpus()));
     let (holders, moved) = move_holders(run, &holder_cpus, queued);
     record(run, "start", label, &cpus, queued, None, &moved);

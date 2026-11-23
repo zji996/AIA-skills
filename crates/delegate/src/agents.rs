@@ -27,8 +27,226 @@ struct WatchState {
     command_warned_at: Option<Instant>,
 }
 
+/// Split a shell command string on `;`, `&&`, `||`, `|`, and `\n` while respecting single/double quotes.
+fn split_shell_segments(cmd: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut cur = String::new();
+    let mut chars = cmd.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    while let Some(c) = chars.next() {
+        if escaped {
+            cur.push(c);
+            escaped = false;
+            continue;
+        }
+        if c == '\\' && !in_single {
+            cur.push(c);
+            escaped = true;
+            continue;
+        }
+        if c == '\'' && !in_double {
+            in_single = !in_single;
+            cur.push(c);
+            continue;
+        }
+        if c == '"' && !in_single {
+            in_double = !in_double;
+            cur.push(c);
+            continue;
+        }
+        if !in_single && !in_double {
+            match c {
+                ';' | '\n' => {
+                    if !cur.trim().is_empty() {
+                        segments.push(std::mem::take(&mut cur));
+                    } else {
+                        cur.clear();
+                    }
+                    continue;
+                }
+                '&' if chars.peek() == Some(&'&') => {
+                    chars.next();
+                    if !cur.trim().is_empty() {
+                        segments.push(std::mem::take(&mut cur));
+                    } else {
+                        cur.clear();
+                    }
+                    continue;
+                }
+                '|' => {
+                    if chars.peek() == Some(&'|') {
+                        chars.next();
+                    }
+                    if !cur.trim().is_empty() {
+                        segments.push(std::mem::take(&mut cur));
+                    } else {
+                        cur.clear();
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        cur.push(c);
+    }
+    if !cur.trim().is_empty() {
+        segments.push(cur);
+    }
+    segments
+}
+
+/// True if `seg` contains a shell output redirection to a file (ignoring `2>&1`, `>/dev/null`, `2>/dev/null`).
+fn has_file_write_redirection(seg: &str) -> bool {
+    let bytes = seg.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' && !in_single {
+            i += 2;
+            continue;
+        }
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if b == b'"' && !in_single {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        if !in_single && !in_double && b == b'>' {
+            let rest = &seg[i..];
+            let allowed = rest.starts_with(">&1")
+                || rest.starts_with(">&2")
+                || rest.starts_with(">/dev/null")
+                || rest.starts_with("> /dev/null")
+                || rest.starts_with(">>/dev/null")
+                || rest.starts_with(">> /dev/null");
+            if !allowed {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Extract command basename and remaining argument tokens from a single shell segment,
+/// stripping leading env assignments (`FOO=bar`), `env`, `command`, and shell wrappers.
+fn segment_cmd_and_args(seg: &str) -> Option<(String, Vec<String>)> {
+    let mut tokens = seg.split_whitespace().peekable();
+    while let Some(&tok) = tokens.peek() {
+        let stripped = tok.trim_start_matches(['(', '{', '!']);
+        if stripped.is_empty() {
+            tokens.next();
+            continue;
+        }
+        if matches!(stripped, "env" | "command" | "builtin" | "time" | "do" | "then" | "else" | "elif" | "while" | "until") {
+            tokens.next();
+            continue;
+        }
+        if stripped.contains('=')
+            && !stripped.starts_with('-')
+            && stripped
+                .split_once('=')
+                .is_some_and(|(k, _)| !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+        {
+            tokens.next();
+            continue;
+        }
+        let first = stripped.trim_end_matches([')', '}']);
+        tokens.next();
+        let base = first.rsplit('/').next().unwrap_or(first).to_string();
+        let rest: Vec<String> = tokens.map(str::to_string).collect();
+        return Some((base, rest));
+    }
+    None
+}
+
+/// Returns true for pure waiting/polling shell commands (`sleep`, `wait`, `tail` polling,
+/// optionally combined with read-only liveness/log-inspection companions like `ps`, `kill -0`,
+/// `pgrep`, `jobs`, `wc`, `head`, `ls`, `stat`, `cat`, `test`, `[`, `echo`, `date`, `cd`, `true`).
+/// Mutating commands or file-write redirections always return `false`.
+pub(crate) fn is_pure_wait_command(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let segments = split_shell_segments(trimmed);
+    if segments.is_empty() {
+        return false;
+    }
+    let mut has_wait_core = false;
+    for seg in &segments {
+        if has_file_write_redirection(seg) {
+            return false;
+        }
+        let Some((base, args)) = segment_cmd_and_args(seg) else {
+            continue;
+        };
+        if matches!(base.as_str(), "done" | "fi") {
+            continue;
+        }
+        if matches!(base.as_str(), "sleep" | "wait" | "tail") {
+            has_wait_core = true;
+            continue;
+        }
+        // `kill -0 <pid>` is a pure liveness probe; any other `kill` sends a signal.
+        if base == "kill" {
+            if args.iter().any(|a| a == "-0" || a == "-s0") {
+                continue;
+            }
+            return false;
+        }
+        // `sed -i` mutates files in-place; reject it.
+        if base == "sed" && args.iter().any(|a| a == "-i" || a.starts_with("-i")) {
+            return false;
+        }
+        let read_only_companion = matches!(
+            base.as_str(),
+            "cd" | "true"
+                | "false"
+                | ":"
+                | "echo"
+                | "printf"
+                | "date"
+                | "ps"
+                | "pgrep"
+                | "jobs"
+                | "wc"
+                | "head"
+                | "stat"
+                | "ls"
+                | "test"
+                | "["
+                | "[["
+                | "cat"
+                | "grep"
+                | "rg"
+                | "sed"
+                | "awk"
+                | "tr"
+                | "cut"
+                | "sort"
+                | "uniq"
+        );
+        if !read_only_companion {
+            return false;
+        }
+    }
+    has_wait_core
+}
+
 /// Mechanical repetition detector (ADR 0120): only consecutive identical commands with identical
 /// outcomes count; edits/writes or changed arguments/outcomes reset the streak.
+/// Pure waiting/polling commands (`sleep`, `wait`, `tail` polling) are excluded so polling a
+/// background build/test never triggers false loop warnings.
 struct LoopDetector {
     threshold: usize,
     last_sig: Option<(String, bool, String)>,
@@ -52,7 +270,7 @@ impl LoopDetector {
     /// Record a completed bash command; returns `Some(count)` when the threshold is reached
     /// and resets the streak so another `threshold` identical repeats are needed to trigger again.
     fn record_bash(&mut self, cmd: &str, ok: bool, detail: &str) -> Option<usize> {
-        if self.threshold == 0 || cmd.trim().is_empty() {
+        if self.threshold == 0 || cmd.trim().is_empty() || is_pure_wait_command(cmd) {
             return None;
         }
         let sig = (cmd.trim().to_string(), ok, detail.trim().to_string());
@@ -1516,5 +1734,60 @@ mod tests {
         // Explicit reset (e.g. after edit/write) resets streak
         d.reset();
         assert_eq!(d.record_bash("cargo test", false, "err B"), None);
+    }
+
+    #[test]
+    fn loop_detector_excludes_pure_wait_and_poll_commands() {
+        for cmd in [
+            "sleep 5",
+            "/bin/sleep 10",
+            "wait",
+            "wait 12345",
+            "tail -n 30 /tmp/build.log",
+            "tail -f app.log",
+            "sleep 10 && tail -n 20 /tmp/build.log",
+            "sleep 5; ps -p 12345 && tail -n 10 /tmp/out.log",
+            "sleep 5 && kill -0 12345 2>/dev/null",
+            "sleep 5 && test -f /tmp/done && cat /tmp/done",
+            "cd /work && sleep 3 && tail -n 50 log | grep -i error || true",
+            "while kill -0 1234; do sleep 2; done",
+        ] {
+            assert!(
+                is_pure_wait_command(cmd),
+                "expected pure wait/poll command: {cmd}"
+            );
+            let mut d = LoopDetector::new(3);
+            for _ in 0..10 {
+                assert_eq!(
+                    d.record_bash(cmd, true, ""),
+                    None,
+                    "wait/poll should never trigger loop: {cmd}"
+                );
+            }
+        }
+
+        for cmd in [
+            "cargo test",
+            "sleep 1 && cargo test",
+            "sleep 2 && rm -f /tmp/lock",
+            "sleep 1 && kill -9 12345",
+            "tail -n 20 /tmp/a.log > /tmp/b.log",
+            "sleep 1 && sed -i 's/a/b/' file.txt",
+            "ps aux",
+            "cat /tmp/out.log",
+        ] {
+            assert!(
+                !is_pure_wait_command(cmd),
+                "expected NON-wait command: {cmd}"
+            );
+        }
+
+        let mut d = LoopDetector::new(3);
+        assert_eq!(d.record_bash("sleep 1 && cargo test", false, "fail"), None);
+        assert_eq!(d.record_bash("sleep 1 && cargo test", false, "fail"), None);
+        assert_eq!(
+            d.record_bash("sleep 1 && cargo test", false, "fail"),
+            Some(3)
+        );
     }
 }

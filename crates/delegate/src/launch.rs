@@ -422,20 +422,25 @@ fn apply_tier_model(o: &mut Options, config: &Value) -> Res<Value> {
 }
 
 /// Under the start lock, count maxActive by resolved id and snapshot candidates for retry.
-fn pick_tier_under_cap(o: &mut Options, extra: &mut Value, active_runs: &[PathBuf]) -> Res<()> {
+/// `listed` is pre-fetched outside `.start.lock` so no subprocess runs while holding the lock.
+fn pick_tier_under_cap(
+    o: &mut Options,
+    extra: &mut Value,
+    active_runs: &[PathBuf],
+    listed: &[models::PiModel],
+) -> Res<()> {
     let busy = active_runs
         .iter()
         .map(|run| s(&json(run.join("meta.json")), "model").to_string())
         .collect::<Vec<_>>();
     let running = |model: &str| busy.iter().filter(|m| *m == model).count();
     let config = &extra["tierConfig"];
-    let listed = agents::pi_models();
     let tier = o.tier.as_deref().unwrap_or("review");
     let pick = models::pick(
         config,
         tier,
         o.thinking_cli.as_deref(),
-        &listed,
+        listed,
         agents::local_clock(),
         &running,
     )?;
@@ -451,7 +456,7 @@ fn pick_tier_under_cap(o: &mut Options, extra: &mut Value, active_runs: &[PathBu
     extra["tierModels"] = agents::ALL_TIERS
         .iter()
         .map(|t| {
-            let model = models::pick(config, t, None, &listed, agents::local_clock(), &running)
+            let model = models::pick(config, t, None, listed, agents::local_clock(), &running)
                 .map(|p| p.model)
                 .unwrap_or_default();
             (t.to_string(), json!(model))
@@ -463,7 +468,7 @@ fn pick_tier_under_cap(o: &mut Options, extra: &mut Value, active_runs: &[PathBu
         &extra["tierConfig"],
         tier,
         o.thinking_cli.as_deref(),
-        &listed
+        listed
     )?
     .iter()
     .map(models::Pick::value)
@@ -1714,8 +1719,10 @@ pub fn active_machine(slots: &Path) -> Vec<PathBuf> {
     }
     out
 }
+/// Read-only listing of machine-active runs from `.slot` files.
+/// Never blocks on `.start.lock` so read-only callers (`status`, `work`, TUI) cannot deadlock
+/// with concurrent `start` calls.
 pub fn machine_runs(slots: &Path) -> Vec<PathBuf> {
-    let _guard = lock(&slots.join(".start.lock"), true, false).ok();
     let Ok(entries) = fs::read_dir(slots) else {
         return vec![];
     };
@@ -1884,16 +1891,19 @@ pub fn launch(
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let slots = state_dir();
     fs::create_dir_all(&slots).map_err(|e| e.to_string())?;
-    let _machine = lock(&slots.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
-    let _local = lock(&root.join(".start.lock"), true, false).map_err(|e| e.to_string())?;
-    let active_runs = active_machine(&slots);
-    let source = s(&extra["worktree"], "source");
-    let repo = repo_key(if source.is_empty() {
+    if setting("RUNS", "").is_empty() && !root.join(".gitignore").exists() {
+        write(root.join(".gitignore"), "*\n")?;
+    }
+
+    // Pre-lock work: git rev-parse, config prep, timeout validation, model listing, and
+    // agent identity probing all run OUTSIDE `.start.lock` so concurrent starts never
+    // serialize slow subprocesses behind the admission lock.
+    let source_str = s(&extra["worktree"], "source");
+    let repo = repo_key(if source_str.is_empty() {
         workdir
     } else {
-        Path::new(source)
+        Path::new(source_str)
     });
-    capacity(&active_runs, &extra["configCapacity"], &repo)?;
     let mut extra = extra.clone();
     if let Some(overflow) = &o.overflow {
         if let Some(tiers) = extra["tierConfig"]["tiers"].as_object_mut() {
@@ -1904,51 +1914,29 @@ pub fn launch(
             }
         }
     }
-    if o.tier_picked && !o.agent_pinned {
-        pick_tier_under_cap(&mut o, &mut extra, &active_runs)?;
-    }
-    if !o.images.is_empty() {
-        let listed = agents::pi_models();
-        let model = o.model.as_deref().unwrap_or("");
-        models::guard_images(model, &listed)?;
-    }
-    let model_cap = models::model_cap(&extra["tierConfig"], o.model.as_deref().unwrap_or(""))?;
-    let admission = json!({"configCapacity":extra["configCapacity"],"repoKey":repo,
-        "model":o.model,"modelCap":model_cap,"parent":extra["parent"]["run"],
-        "queuedNs":now_ns() as u64});
-    let reason = crate::queue::reason(&admission, &active_runs)?;
-    let deferred = reason.is_some();
-    let extra = &extra;
-    if !deferred && mode == "write" && !o.parallel && !extra["worktree"].is_object() {
-        for run in all_runs() {
-            let m = json(run.join("meta.json"));
-            if s(&m, "mode") == "write"
-                && s(&m, "workdir") == workdir.to_string_lossy()
-                && (active(&state(&run)) || agent_alive(&run))
-            {
-                return Err(format!("write run {} is still active in {}; wait for it, use --read-only, or pass --allow-parallel-writes",run.file_name().unwrap_or_default().to_string_lossy(),workdir.display()));
-            }
-        }
-    }
-    if let Some(parent) = parent_path {
-        let p = parent.file_name().unwrap_or_default().to_string_lossy();
-        let replies = all_runs()
-            .into_iter()
-            .filter(|r| {
-                s(&json(r.join("meta.json")), "parent") == p && runs::continues_conversation(r)
-            })
-            .collect::<Vec<_>>();
-        if let Some(last) = replies.last() {
-            return Err(format!(
-                "{p} already has a reply ({}); wait for it and reply to that",
-                last.file_name().unwrap_or_default().to_string_lossy()
-            ));
-        }
-    }
-    if setting("RUNS", "").is_empty() && !root.join(".gitignore").exists() {
-        write(root.join(".gitignore"), "*\n")?;
-    }
-    let name = o.name.clone().unwrap_or_else(|| {
+    let listed_pi_models = if !o.images.is_empty() || (o.tier_picked && !o.agent_pinned) {
+        agents::pi_models()
+    } else {
+        Vec::new()
+    };
+    let timeout_seconds = o
+        .timeout
+        .as_deref()
+        .map(seconds)
+        .transpose()?
+        .unwrap_or(0.0);
+    let accept_timeout_seconds = o
+        .accept_timeout
+        .as_deref()
+        .map(seconds)
+        .transpose()?;
+    let evidence_timeout_seconds = o
+        .evidence
+        .as_deref()
+        .filter(|command| !command.is_empty())
+        .map(|_| seconds(o.evidence_timeout.as_deref().unwrap_or("30m")))
+        .transpose()?;
+    let fallback_name = o.name.clone().unwrap_or_else(|| {
         prompt
             .lines()
             .find(|x| !x.trim().is_empty())
@@ -1957,6 +1945,13 @@ pub fn launch(
             .chars()
             .take(120)
             .collect()
+    });
+    let display_name = o.name.clone().unwrap_or_else(|| {
+        if extra["parent"].is_object() {
+            format!("reply to {}", s(&extra["parent"], "name"))
+        } else {
+            fallback_name.clone()
+        }
     });
     let slug = o
         .name
@@ -1980,18 +1975,201 @@ pub fn launch(
     } else {
         slug
     };
-    let stamp = format_time(true, "%Y%m%d-%H%M%S");
-    let mut run = root.join(format!("{stamp}-{slug}"));
-    while run.exists()
-        || cache_dir()
-            .join("archive")
-            .join(run.file_name().unwrap_or_default())
-            .exists()
-    {
-        run = root.join(format!("{stamp}-{slug}-{:04x}", now_ns() as u16));
+    let pre_colleague = crate::agy::colleague(o.model.as_deref().unwrap_or("")).to_string();
+    let pre_fork = extra
+        .get("session")
+        .and_then(Value::as_str)
+        .filter(|x| !x.is_empty());
+    let pre_parent_bin = s(&extra["parent"], "agentBin");
+    let pre_identity = if !(extra["parent"].is_object() && pre_fork.is_some() && !pre_parent_bin.is_empty()) {
+        agent_identity(&pre_colleague).ok()
+    } else {
+        None
+    };
+
+    struct StartLockTimer(Option<std::time::Instant>);
+    impl Drop for StartLockTimer {
+        fn drop(&mut self) {
+            if let Some(t) = self.0 {
+                eprintln!(
+                    "START_LOCK_HOLD_MS={:.3}",
+                    t.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        }
     }
-    fs::create_dir(&run).map_err(|e| e.to_string())?;
-    fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+
+    // Critical section: ONLY capacity/admission checks + run directory & slot registration.
+    // All slow operations (pool claim, git snapshot, source-watch baseline, work table update,
+    // git ref pinning, events, supervisor startup) run AFTER releasing `.start.lock`.
+    let (run, slot_file, deferred, reason, queued_ns, model_cap, started_at, started_epoch, started_ns, queued_at, q_ahead) = {
+        let _machine = crate::locks::acquire(
+            crate::locks::LockKind::StartMachine,
+            &slots.join(".start.lock"),
+            true,
+        )
+        .map_err(|e| e.to_string())?;
+        let _start_lock_timer = StartLockTimer(
+            (std::env::var("DELEGATE_MEASURE_START_LOCK").as_deref() == Ok("1"))
+                .then(std::time::Instant::now),
+        );
+        let _local = crate::locks::acquire(
+            crate::locks::LockKind::StartRepo,
+            &root.join(".start.lock"),
+            true,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let active_runs = active_machine(&slots);
+        capacity(&active_runs, &extra["configCapacity"], &repo)?;
+        if o.tier_picked && !o.agent_pinned {
+            pick_tier_under_cap(&mut o, &mut extra, &active_runs, &listed_pi_models)?;
+        }
+        if !o.images.is_empty() {
+            let model = o.model.as_deref().unwrap_or("");
+            models::guard_images(model, &listed_pi_models)?;
+        }
+        let model_cap = models::model_cap(&extra["tierConfig"], o.model.as_deref().unwrap_or(""))?;
+        let admission = json!({
+            "configCapacity": extra["configCapacity"],
+            "repoKey": repo,
+            "model": o.model,
+            "modelCap": model_cap,
+            "parent": extra["parent"]["run"],
+            "queuedNs": now_ns() as u64
+        });
+        let reason = crate::queue::reason(&admission, &active_runs)?;
+        let deferred = reason.is_some();
+        if !deferred && mode == "write" && !o.parallel && !extra["worktree"].is_object() {
+            for existing in all_runs() {
+                let m = json(existing.join("meta.json"));
+                if s(&m, "mode") == "write"
+                    && s(&m, "workdir") == workdir.to_string_lossy()
+                    && (active(&state(&existing)) || agent_alive(&existing))
+                {
+                    return Err(format!(
+                        "write run {} is still active in {}; wait for it, use --read-only, or pass --allow-parallel-writes",
+                        existing.file_name().unwrap_or_default().to_string_lossy(),
+                        workdir.display()
+                    ));
+                }
+            }
+        }
+        if let Some(parent) = parent_path {
+            let p = parent.file_name().unwrap_or_default().to_string_lossy();
+            let replies = all_runs()
+                .into_iter()
+                .filter(|r| {
+                    s(&json(r.join("meta.json")), "parent") == p && runs::continues_conversation(r)
+                })
+                .collect::<Vec<_>>();
+            if let Some(last) = replies.last() {
+                return Err(format!(
+                    "{p} already has a reply ({}); wait for it and reply to that",
+                    last.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+        }
+
+        let stamp = format_time(true, "%Y%m%d-%H%M%S");
+        let mut run = root.join(format!("{stamp}-{slug}"));
+        while run.exists()
+            || cache_dir()
+                .join("archive")
+                .join(run.file_name().unwrap_or_default())
+                .exists()
+        {
+            run = root.join(format!("{stamp}-{slug}-{:04x}", now_ns() as u16));
+        }
+        fs::create_dir(&run).map_err(|e| e.to_string())?;
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+        write(run.join("launch.pid"), format!("{}\n", std::process::id()))?;
+
+        let started_at = iso();
+        let started_epoch = epoch() as i64;
+        let started_ns = now_ns() as u64;
+        let mut provisional = json!({
+            "run": run.file_name().unwrap_or_default().to_string_lossy(),
+            "dir": run,
+            "workdir": workdir,
+            "mode": mode,
+            "agent": crate::agy::colleague(o.model.as_deref().unwrap_or("")),
+            "tier": o.tier,
+            "name": display_name,
+            "model": o.model,
+            "modelCap": model_cap,
+            "repoKey": repo,
+            "configCapacity": extra["configCapacity"],
+            "worktree": extra["worktree"],
+            "parent": if extra["parent"].is_object() { extra["parent"]["run"].clone() } else { Value::Null },
+            "parallel": o.parallel,
+            "startedAt": started_at,
+            "startedEpoch": started_epoch,
+            "startedNs": started_ns,
+            "queuedNs": admission["queuedNs"].clone(),
+        });
+        let (queued_at, q_ahead, queued_ns) = if deferred {
+            touch(run.join(".waiting"));
+            crate::queue::enter(&run, &mut provisional)?;
+            let ahead = crate::queue::ahead(&provisional);
+            let q_reason = reason.as_deref().unwrap_or("总路数");
+            crate::queue::update(&run, q_reason, ahead)?;
+            (
+                s(&provisional, "queuedAt").to_string(),
+                ahead,
+                provisional["queuedNs"].clone(),
+            )
+        } else {
+            write_json(run.join("meta.json"), &provisional)?;
+            (String::new(), 0usize, admission["queuedNs"].clone())
+        };
+        let hash = sha1_smol::Sha1::from(run.to_string_lossy().as_bytes())
+            .digest()
+            .to_string();
+        let slot_file = slots.join(format!("{}.slot", &hash[..16]));
+        write(&slot_file, format!("{}\n", run.display()))?;
+        (
+            run,
+            slot_file,
+            deferred,
+            reason,
+            queued_ns,
+            model_cap,
+            started_at,
+            started_epoch,
+            started_ns,
+            queued_at,
+            q_ahead,
+        )
+    };
+
+    struct LaunchRollback {
+        run: PathBuf,
+        slot_file: PathBuf,
+        claimed_slot: Option<PathBuf>,
+        armed: bool,
+    }
+    impl Drop for LaunchRollback {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(self.run.join("launch.pid"));
+            if self.armed {
+                if let Some(slot) = &self.claimed_slot {
+                    crate::pool::release(slot, &self.run);
+                }
+                let _ = fs::remove_file(&self.slot_file);
+                let _ = fs::remove_dir_all(&self.run);
+            }
+        }
+    }
+    let mut rollback = LaunchRollback {
+        run: run.clone(),
+        slot_file,
+        claimed_slot: None,
+        armed: true,
+    };
+    let extra = &extra;
+    let name = fallback_name;
     let warnings = tree_source_warnings(extra);
     if !warnings.is_empty() {
         for warning in &warnings {
@@ -2210,6 +2388,12 @@ pub fn launch(
     }
     let run_id = run.file_name().unwrap_or_default().to_string_lossy();
     let claimed_slot = b(&tree, "pooled") && s(&tree, "claimedBy") == run_id;
+    if claimed_slot {
+        let p = PathBuf::from(s(&tree, "path"));
+        if !p.as_os_str().is_empty() {
+            rollback.claimed_slot = Some(p);
+        }
+    }
     let top = if tree.is_object() {
         let p = PathBuf::from(s(&tree, "path"));
         // Only a newly claimed pool slot holds an earlier unrelated task's files: snapshot the source.
@@ -2244,7 +2428,6 @@ pub fn launch(
         top.as_deref().and_then(|p| snapshot(p, &run, &exclude))
     };
     if tree.is_object() && tree["in"].is_null() && base.is_none() {
-        let _ = fs::remove_dir_all(&run);
         return Err(format!(
             "cannot snapshot {} for the worktree",
             s(&tree, "source")
@@ -2279,17 +2462,6 @@ pub fn launch(
     } else {
         Value::Null
     };
-    let timeout_seconds = o
-        .timeout
-        .as_deref()
-        .map(seconds)
-        .transpose()?
-        .unwrap_or(0.0);
-    let accept_timeout_seconds = o
-        .accept_timeout
-        .as_deref()
-        .map(seconds)
-        .transpose()?;
     let chain_base = if !s(&extra["syncedBase"], "tree").is_empty() {
         s(&extra["syncedBase"], "tree").to_string()
     } else if !b(extra, "newAfterApply") && !s(parent, "chainBase").is_empty() {
@@ -2299,7 +2471,7 @@ pub fn launch(
             .map(|x| s(x, "tree").to_string())
             .unwrap_or_default()
     };
-    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":crate::agy::colleague(o.model.as_deref().unwrap_or("")),"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":timeout_seconds,"accept":o.accept,"acceptTimeoutSeconds":accept_timeout_seconds,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":chain_base,"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"parallel":o.parallel,"startedAt":iso(),"startedEpoch":epoch() as i64,"startedNs":now_ns() as u64});
+    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":crate::agy::colleague(o.model.as_deref().unwrap_or("")),"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":timeout_seconds,"accept":o.accept,"acceptTimeoutSeconds":accept_timeout_seconds,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":chain_base,"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"parallel":o.parallel,"startedAt":started_at,"startedEpoch":started_epoch,"startedNs":started_ns});
     // A forked session continues on the executable that wrote it: Pi and rpi
     // keep different session formats.
     let parent_bin = s(parent, "agentBin");
@@ -2313,16 +2485,24 @@ pub fn launch(
             PathBuf::from(parent_bin),
             parent["agentVersion"].as_str().map(str::to_string),
         )
+    } else if s(&meta, "agent") == pre_colleague {
+        if let Some(id) = pre_identity {
+            id
+        } else {
+            agent_identity(s(&meta, "agent"))?
+        }
     } else {
         agent_identity(s(&meta, "agent"))?
     };
     meta["modelCap"] = model_cap;
-    meta["queuedNs"] = admission["queuedNs"].clone();
+    meta["queuedNs"] = queued_ns;
+    if !queued_at.is_empty() {
+        meta["queuedAt"] = json!(queued_at);
+    }
     meta["agentPinned"] = json!(o.agent_pinned);
     if let Some(command) = o.evidence.filter(|command| !command.is_empty()) {
         meta["evidenceCommand"] = json!(command);
-        meta["evidenceTimeoutSeconds"] =
-            json!(seconds(o.evidence_timeout.as_deref().unwrap_or("30m"))?);
+        meta["evidenceTimeoutSeconds"] = json!(evidence_timeout_seconds.unwrap_or(1800.0));
     }
     meta["allow"] = json!(o.allow);
     meta["shell"] = json!(o.shell);
@@ -2424,11 +2604,7 @@ pub fn launch(
         write_json(run.join("sync.json"), &extra["sync"])?;
     }
     if deferred {
-        touch(run.join(".waiting"));
-        crate::queue::enter(&run, &mut meta)?;
-        let q_ahead = crate::queue::ahead(&meta);
         let q_reason = reason.as_deref().unwrap_or("总路数");
-        crate::queue::update(&run, q_reason, q_ahead)?;
         crate::events::emit(
             &crate::events::run_id_for(&run, &meta),
             &crate::events::repo_for_meta(&meta),
@@ -2455,13 +2631,6 @@ pub fn launch(
         );
     }
     runs::prune();
-    let hash = sha1_smol::Sha1::from(run.to_string_lossy().as_bytes())
-        .digest()
-        .to_string();
-    write(
-        slots.join(format!("{}.slot", &hash[..16])),
-        format!("{}\n", run.display()),
-    )?;
     let log = File::create(run.join("supervisor.log")).map_err(|e| e.to_string())?;
     let mut c = Command::new(script());
     c.arg("_supervise")
@@ -2474,6 +2643,7 @@ pub fn launch(
     let mut child = match c.spawn() {
         Ok(child) => child,
         Err(error) => {
+            rollback.armed = false;
             finish_run(
                 &run,
                 json!({"state":"crashed","error":error.to_string()}),
@@ -2493,11 +2663,14 @@ pub fn launch(
     let deadline = std::time::Instant::now() + Duration::from_secs_f64(startup_timeout);
     while std::time::Instant::now() < deadline {
         if run.join("pid").is_file() {
+            rollback.armed = false;
+            drop(rollback);
             crate::board::refresh_for_run(&run);
             return Ok(run);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    rollback.armed = false;
     end_group(child.id() as i32, 2.0);
     child.wait().map_err(|e| e.to_string())?;
     finish_run(

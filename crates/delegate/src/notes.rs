@@ -392,18 +392,7 @@ pub fn register_repo() {
 }
 
 pub fn register_repo_paths(state: &Path, repo_dir: &Path, runs_dir: &Path) {
-    let _ = fs::create_dir_all(state);
-    let Ok(_guard) = lock(&state.join(".repos.lock"), true, false) else {
-        return;
-    };
     let path = state.join("repos.json");
-    let mut doc = json(&path);
-    if !doc.is_object() {
-        doc = json!({"repos": {}});
-    }
-    if !doc["repos"].is_object() {
-        doc["repos"] = json!({});
-    }
     let runs_key = fs::canonicalize(runs_dir)
         .unwrap_or_else(|_| runs_dir.to_path_buf())
         .to_string_lossy()
@@ -412,6 +401,31 @@ pub fn register_repo_paths(state: &Path, repo_dir: &Path, runs_dir: &Path) {
         .unwrap_or_else(|_| repo_dir.to_path_buf())
         .to_string_lossy()
         .into_owned();
+    // Lock-free fast path: if already registered with the same repo path, avoid taking `.repos.lock`.
+    let existing = json(&path);
+    if existing["repos"]
+        .get(&runs_key)
+        .is_some_and(|e| s(e, "repo") == repo_val && s(e, "runs") == runs_key)
+    {
+        return;
+    }
+    let _ = fs::create_dir_all(state);
+    let Ok(_guard) = crate::locks::try_acquire_with_retry(
+        crate::locks::LockKind::Repos,
+        &state.join(".repos.lock"),
+        true,
+        3,
+        std::time::Duration::from_millis(15),
+    ) else {
+        return;
+    };
+    let mut doc = json(&path);
+    if !doc.is_object() {
+        doc = json!({"repos": {}});
+    }
+    if !doc["repos"].is_object() {
+        doc["repos"] = json!({});
+    }
     if let Some(map) = doc["repos"].as_object_mut() {
         map.retain(|k, _| k == &runs_key || Path::new(k).is_dir());
         map.insert(

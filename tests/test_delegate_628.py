@@ -378,6 +378,7 @@ class Delegate628Tests(unittest.TestCase):
         item_f = json.loads(add_f.stdout.strip())
         self.assertEqual(item_f["status"], "dispatched")
         self.assertTrue(item_f.get("runId"))
+        self.cli("wait", "--no-result", item_f["runId"])
 
     def test_events_follow_streams_live_events(self):
         self.fake_pi([fixtures.answer("first"), fixtures.SETTLED])

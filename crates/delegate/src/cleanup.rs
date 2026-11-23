@@ -1,4 +1,4 @@
-use crate::common::{append, json, lock, read, s, setting, write_json};
+use crate::common::{append, json, read, s, setting, write_json};
 use serde_json::{json as value, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -664,7 +664,7 @@ pub fn scoped_command(run: &Path, role: &str, program: &str, args: &[String]) ->
             }
         })
         .collect();
-    let Ok(_guard) = lock(&run.join("scopes.lock"), true, false) else {
+    let Ok(_guard) = crate::locks::acquire(crate::locks::LockKind::RunLocal, &run.join("scopes.lock"), true) else {
         let mut command = Command::new(program);
         command.args(args);
         return command;
@@ -705,7 +705,7 @@ pub(crate) fn scopes(run: &Path) -> Vec<(String, PathBuf, BTreeSet<i32>)> {
     if !run.join("scopes").is_file() {
         return Vec::new();
     }
-    let Ok(_guard) = lock(&run.join("scopes.lock"), true, false) else {
+    let Ok(_guard) = crate::locks::acquire(crate::locks::LockKind::RunLocal, &run.join("scopes.lock"), true) else {
         return Vec::new();
     };
     let mut found = Vec::new();
@@ -892,7 +892,7 @@ fn members(
 }
 
 pub fn record(run: &Path, pgid: i32) -> usize {
-    let Ok(_guard) = lock(&run.join("cleanup.lock"), true, false) else {
+    let Ok(_guard) = crate::locks::acquire(crate::locks::LockKind::RunLocal, &run.join("cleanup.lock"), true) else {
         return 0;
     };
     let keep = keep_executables(run);

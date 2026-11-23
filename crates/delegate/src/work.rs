@@ -516,9 +516,12 @@ fn save_raw(state: &Path, items: &[WorkItem]) -> Res<()> {
         buf.push_str(&item.to_json().to_string());
         buf.push('\n');
     }
-    let tmp = state.join(".work.jsonl.tmp");
+    let tmp = state.join(format!(".work.jsonl.{}.tmp", std::process::id()));
     write(&tmp, buf)?;
-    fs::rename(&tmp, work_path(state)).map_err(|e| format!("work.jsonl rename: {e}"))?;
+    fs::rename(&tmp, work_path(state)).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("work.jsonl rename: {e}")
+    })?;
     let _ = write(work_seq_path(state), format!("{max_n}\n"));
     Ok(())
 }
@@ -1468,7 +1471,9 @@ fn emit_reconcile_events_and_dispatch(
         match &res {
             Ok(new_run) => {
                 // Record dispatchedRun on the work item
-                if let Ok(_guard) = lock(&work_lock(state), true, false) {
+                if let Ok(_guard) =
+                    crate::locks::acquire(crate::locks::LockKind::Work, &work_lock(state), true)
+                {
                     let mut items = load_raw(state);
                     if let Some(w) = items.iter_mut().find(|w| w.id == item.id) {
                         if let Some(wad) = w.auto_dispatch.as_mut() {
@@ -1559,22 +1564,85 @@ fn dispatch_work_auto(item: &WorkItem, ad: &AutoDispatch) -> Res<String> {
     Err("delegate start produced no run JSON".into())
 }
 
-/// Load work items with automatic migration & reconciliation (non-blocking diagnostic on lock failure).
-pub fn load_synced() -> Vec<WorkItem> {
-    let state = state_dir();
-    match load_synced_in(&state) {
-        Ok(items) => items,
-        Err(err) => {
-            eprintln!("delegate: work table sync failed: {err}");
-            load_raw(&state)
+/// Lock-free check: does any legacy `notes.json` or `deferred.tsv` still need migration?
+fn needs_legacy_migration(state: &Path) -> bool {
+    let mig = json(work_migrations_path(state));
+    for (repo_root, runs_dir) in registered_repo_runs(state) {
+        let notes_file = runs_dir.join("notes.json");
+        if notes_file.is_file() {
+            let key = format!("notes:{}", notes_file.display());
+            if s(&mig, &key) != file_sig(&notes_file) {
+                return true;
+            }
+        }
+        let def_file = repo_root.join(".local/delegate/deferred.tsv");
+        if def_file.is_file() {
+            let key = format!("deferred:{}", def_file.display());
+            if s(&mig, &key) != file_sig(&def_file) {
+                return true;
+            }
         }
     }
+    false
+}
+
+/// Pure read-only snapshot of work items (never blocks writers).
+/// Reads the atomically-renamed `work.jsonl` directly; if a one-time legacy migration is
+/// pending, uses a bounded non-blocking `try_acquire_with_retry`.
+pub fn load_readonly() -> Vec<WorkItem> {
+    load_readonly_in(&state_dir())
+}
+
+fn load_readonly_in(state: &Path) -> Vec<WorkItem> {
+    if needs_legacy_migration(state) {
+        if let Ok(_guard) = crate::locks::try_acquire_with_retry(
+            crate::locks::LockKind::Work,
+            &work_lock(state),
+            true,
+            2,
+            std::time::Duration::from_millis(10),
+        ) {
+            let mut items = load_raw(state);
+            let mig = migrate_legacy_locked(state, &mut items);
+            if mig {
+                let _ = save_raw(state, &items);
+            }
+            let _ = reconcile_all_locked(state, &mut items);
+            return items;
+        }
+    }
+    let mut items = load_raw(state);
+    let _ = reconcile_all_locked(state, &mut items);
+    items
 }
 
 fn load_synced_in(state: &Path) -> Res<Vec<WorkItem>> {
+    // Fast lock-free path: if no legacy migration is pending and no state changed,
+    // return the atomically-written snapshot directly without touching `.work.lock`.
+    let needs_mig = needs_legacy_migration(state);
+    let mut snapshot = load_raw(state);
+    let preview = reconcile_all_locked(state, &mut snapshot);
+    if !needs_mig && !preview.changed {
+        return Ok(snapshot);
+    }
+
     fs::create_dir_all(state).map_err(|e| format!("{}: {e}", state.display()))?;
+    // Non-blocking with short retry so read-only views (`work`, `status`, TUI) never block writers.
+    let guard = match crate::locks::try_acquire_with_retry(
+        crate::locks::LockKind::Work,
+        &work_lock(state),
+        true,
+        3,
+        std::time::Duration::from_millis(15),
+    ) {
+        Ok(g) => g,
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            return Ok(snapshot);
+        }
+        Err(err) => return Err(err.to_string()),
+    };
     let (items, outcome) = {
-        let _guard = lock(&work_lock(state), true, false).map_err(|e| e.to_string())?;
+        let _guard = guard;
         let mut items = load_raw(state);
         let mig = migrate_legacy_locked(state, &mut items);
         let outcome = reconcile_all_locked(state, &mut items);
@@ -1591,12 +1659,34 @@ fn load_synced_in(state: &Path) -> Res<Vec<WorkItem>> {
 }
 
 /// Opportunistic zero-token stale/expiry check (called from `status`).
+/// Strictly non-blocking: reads lock-free first and uses a single `try_acquire` only if
+/// a transition actually needs persisting, so `status` / TUI can never block `start`.
 pub fn check_stale_and_expired() {
     let state = state_dir();
     if !work_path(&state).is_file() {
         return;
     }
-    let _ = load_synced_in(&state);
+    let mut snapshot = load_raw(&state);
+    let preview = reconcile_all_locked(&state, &mut snapshot);
+    if !preview.changed {
+        return;
+    }
+    let Ok(_guard) =
+        crate::locks::try_acquire(crate::locks::LockKind::Work, &work_lock(&state), true)
+    else {
+        return;
+    };
+    let outcome = {
+        let mut items = load_raw(&state);
+        let mig = migrate_legacy_locked(&state, &mut items);
+        let outcome = reconcile_all_locked(&state, &mut items);
+        if mig || outcome.changed {
+            let _ = save_raw(&state, &items);
+        }
+        outcome
+    };
+    drop(_guard);
+    let _ = emit_reconcile_events_and_dispatch(&state, &outcome);
 }
 
 // ---------------------------------------------------------------------------
@@ -1608,7 +1698,7 @@ pub fn validate_work_id(raw: &str) -> Res<WorkItem> {
     let norm = normalize_work_id(raw).ok_or_else(|| {
         format!("invalid work id '{raw}' (expected W001...; list with: delegate work --all)")
     })?;
-    let items = load_synced_in(&state).unwrap_or_else(|_| load_raw(&state));
+    let items = load_readonly_in(&state);
     items.into_iter().find(|w| w.id == norm).ok_or_else(|| {
         format!("work item '{norm}' not found (list with: delegate work --all)")
     })
@@ -1619,7 +1709,9 @@ pub fn on_run_started(work_id: &str, run: &Path, meta: &Value) {
     let Some(norm) = normalize_work_id(work_id) else {
         return;
     };
-    let Ok(_guard) = lock(&work_lock(&state), true, false) else {
+    let Ok(_guard) =
+        crate::locks::acquire(crate::locks::LockKind::Work, &work_lock(&state), true)
+    else {
         eprintln!("delegate: work table lock failed on start ({norm})");
         return;
     };
@@ -1643,7 +1735,7 @@ pub fn on_run_finished(run: &Path, meta: &Value, summary: &Value) {
     let rid = events::run_id_for(run, meta);
     let work_id = s(meta, "workId").to_string();
     let outcome = {
-        let Ok(_guard) = lock(&work_lock(&state), true, false) else {
+        let Ok(_guard) = crate::locks::acquire(crate::locks::LockKind::Work, &work_lock(&state), true) else {
             return;
         };
         let mut items = load_raw(&state);
@@ -1701,7 +1793,7 @@ pub fn on_run_result_read(run: &Path, meta: &Value) {
         return;
     }
     let outcome = {
-        let Ok(_guard) = lock(&work_lock(&state), true, false) else {
+        let Ok(_guard) = crate::locks::acquire(crate::locks::LockKind::Work, &work_lock(&state), true) else {
             return;
         };
         let mut items = load_raw(&state);
@@ -1806,7 +1898,7 @@ pub fn on_runs_applied(
     }
 
     let (outcome, verify_stays, auto_closed) = {
-        let Ok(_guard) = lock(&work_lock(&state), true, false) else {
+        let Ok(_guard) = crate::locks::acquire(crate::locks::LockKind::Work, &work_lock(&state), true) else {
             return hints;
         };
         let mut items = load_raw(&state);
@@ -2160,7 +2252,7 @@ pub fn on_run_cleaned(run: &Path, meta: &Value) -> Option<String> {
     let wid = s(meta, "workId").to_string();
     let parent_dir = run.parent();
 
-    let Ok(_guard) = lock(&work_lock(&state), true, false) else {
+    let Ok(_guard) = crate::locks::acquire(crate::locks::LockKind::Work, &work_lock(&state), true) else {
         return None;
     };
     let mut items = load_raw(&state);
@@ -2279,7 +2371,7 @@ fn item_belongs_to_runs_root(w: &WorkItem, root: &Path) -> bool {
 
 pub fn note_chains_for_current_root(all: &[PathBuf]) -> Vec<notes::ChainNotes> {
     let root = runs_root();
-    let items = load_synced();
+    let items = load_readonly();
     items
         .iter()
         .filter(|w| !w.followups.is_empty() && item_belongs_to_runs_root(w, &root))
@@ -2289,7 +2381,7 @@ pub fn note_chains_for_current_root(all: &[PathBuf]) -> Vec<notes::ChainNotes> {
 
 pub fn note_chain_for_run(run: &Path, all: &[PathBuf]) -> Option<notes::ChainNotes> {
     let (_, _, members, _) = notes::chain_info_for(run, all);
-    let items = load_synced();
+    let items = load_readonly();
     items
         .iter()
         .find(|w| !w.followups.is_empty() && members.iter().any(|m| w.matches_run(m)))
@@ -2304,7 +2396,7 @@ pub fn note_add_for_run(
 ) -> Res<(notes::ChainNotes, usize)> {
     let state = state_dir();
     fs::create_dir_all(&state).map_err(|e| e.to_string())?;
-    let _guard = lock(&work_lock(&state), true, false).map_err(|e| e.to_string())?;
+    let _guard = crate::locks::acquire(crate::locks::LockKind::Work, &work_lock(&state), true).map_err(|e| e.to_string())?;
     let mut items = load_raw(&state);
     let _ = migrate_legacy_locked(&state, &mut items);
     let now_iso = iso();
@@ -2412,7 +2504,7 @@ pub fn note_done_for_run(
 ) -> Res<Option<notes::ChainNotes>> {
     let state = state_dir();
     fs::create_dir_all(&state).map_err(|e| e.to_string())?;
-    let _guard = lock(&work_lock(&state), true, false).map_err(|e| e.to_string())?;
+    let _guard = crate::locks::acquire(crate::locks::LockKind::Work, &work_lock(&state), true).map_err(|e| e.to_string())?;
     let mut items = load_raw(&state);
     let _ = migrate_legacy_locked(&state, &mut items);
     let now_iso = iso();
@@ -2575,7 +2667,12 @@ fn focus_for_item(item: &WorkItem, all_items: &[WorkItem], state: &Path, now_epo
                     return format!("run {} 需主控审查", short_run_id(&rid));
                 }
                 if st == "delivered" {
-                    let files = sum["changes"]["files"].as_u64().unwrap_or(0);
+                    let files = sum
+                        .get("pendingChanges")
+                        .filter(|v| v.is_object())
+                        .and_then(|v| v["files"].as_u64())
+                        .or_else(|| sum["changes"]["files"].as_u64())
+                        .unwrap_or(0);
                     let rev_tag = if review_v == "PASS" { " 审PASS" } else { "" };
                     let acc_tag = if sum["accept"]["ok"] == json!(true) {
                         " 验✓"
@@ -2807,7 +2904,12 @@ fn ephemeral_run_rows(items: &[WorkItem], state: &Path, now_epoch: i64) -> Vec<T
                     format!("reply {} \"…\"", short_run_id(&rid)),
                 )
             } else if st == "delivered" && s(&meta, "mode") == "write" {
-                let files = sum["changes"]["files"].as_u64().unwrap_or(0);
+                let files = sum
+                    .get("pendingChanges")
+                    .filter(|v| v.is_object())
+                    .and_then(|v| v["files"].as_u64())
+                    .or_else(|| sum["changes"]["files"].as_u64())
+                    .unwrap_or(0);
                 (
                     "attention".to_string(),
                     format!("待合 +{files}f"),
@@ -3883,7 +3985,7 @@ fn add_cmd(args: &[String]) -> Res<i32> {
     let now_iso = iso();
 
     let (created_id, outcome) = {
-        let _guard = lock(&work_lock(&state), true, false).map_err(|e| e.to_string())?;
+        let _guard = crate::locks::acquire(crate::locks::LockKind::Work, &work_lock(&state), true).map_err(|e| e.to_string())?;
         let mut items = load_raw(&state);
         let _ = migrate_legacy_locked(&state, &mut items);
 
@@ -4002,7 +4104,7 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
     let state = state_dir();
     let now_iso = iso();
     let outcome = {
-        let _guard = lock(&work_lock(&state), true, false).map_err(|e| e.to_string())?;
+        let _guard = crate::locks::acquire(crate::locks::LockKind::Work, &work_lock(&state), true).map_err(|e| e.to_string())?;
         let mut items = load_raw(&state);
         let _ = migrate_legacy_locked(&state, &mut items);
         let Some(pos) = items.iter().position(|w| w.id == norm) else {
@@ -4140,7 +4242,7 @@ fn close_cmd(args: &[String]) -> Res<i32> {
     let state = state_dir();
     let now_iso = iso();
     let (closed_item, outcome) = {
-        let _guard = lock(&work_lock(&state), true, false).map_err(|e| e.to_string())?;
+        let _guard = crate::locks::acquire(crate::locks::LockKind::Work, &work_lock(&state), true).map_err(|e| e.to_string())?;
         let mut items = load_raw(&state);
         let _ = migrate_legacy_locked(&state, &mut items);
         let Some(pos) = items.iter().position(|w| w.id == norm) else {
@@ -4243,7 +4345,7 @@ fn drop_cmd(args: &[String]) -> Res<i32> {
     let state = state_dir();
     let now_iso = iso();
     let (dropped_item, dependents) = {
-        let _guard = lock(&work_lock(&state), true, false).map_err(|e| e.to_string())?;
+        let _guard = crate::locks::acquire(crate::locks::LockKind::Work, &work_lock(&state), true).map_err(|e| e.to_string())?;
         let mut items = load_raw(&state);
         let _ = migrate_legacy_locked(&state, &mut items);
         let Some(pos) = items.iter().position(|w| w.id == norm) else {
@@ -4355,7 +4457,7 @@ fn defer_cmd(args: &[String]) -> Res<i32> {
     let now_iso = iso();
 
     let deferred_item = {
-        let _guard = lock(&work_lock(&state), true, false).map_err(|e| e.to_string())?;
+        let _guard = crate::locks::acquire(crate::locks::LockKind::Work, &work_lock(&state), true).map_err(|e| e.to_string())?;
         let mut items = load_raw(&state);
         let _ = migrate_legacy_locked(&state, &mut items);
 
@@ -4591,7 +4693,7 @@ fn import_md_cmd(args: &[String]) -> Res<i32> {
     let mut skipped = 0usize;
 
     {
-        let _guard = lock(&work_lock(&state), true, false).map_err(|e| e.to_string())?;
+        let _guard = crate::locks::acquire(crate::locks::LockKind::Work, &work_lock(&state), true).map_err(|e| e.to_string())?;
         let mut items = load_raw(&state);
         let _ = migrate_legacy_locked(&state, &mut items);
 

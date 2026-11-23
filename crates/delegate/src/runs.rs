@@ -278,6 +278,17 @@ pub fn state(run: &Path) -> String {
     if run.join("pid").is_file() {
         return "crashed".into();
     }
+    if run.join("launch.pid").is_file() {
+        if let Ok(pid) = read(run.join("launch.pid")).trim().parse::<i32>() {
+            if pid_alive(pid) {
+                return if run.join(".waiting").exists() {
+                    "waiting".into()
+                } else {
+                    "starting".into()
+                };
+            }
+        }
+    }
     if epoch()
         - json(run.join("meta.json"))["startedEpoch"]
             .as_f64()
@@ -397,12 +408,17 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
                 "review review.md (NEEDS_CONTROLLER), then {script} reply {name} '<decision>' or {script} apply {name}"
             ));
         }
-        if s(meta, "mode") != "write"
-            || n(
-                sum.get("pendingChanges").unwrap_or(&sum["changes"]),
+        let changed_files = if meta["worktree"].is_object() {
+            chain_pending_apply_files(run, meta, sum, &all_runs())
+        } else {
+            n(
+                sum.get("pendingChanges")
+                    .filter(|v| v.is_object())
+                    .unwrap_or(&sum["changes"]),
                 "files",
-            ) == 0
-        {
+            )
+        };
+        if s(meta, "mode") != "write" || changed_files == 0 {
             return None;
         }
         if meta["worktree"].is_null() {
@@ -980,6 +996,112 @@ pub fn latest(mut run: PathBuf) -> PathBuf {
         }
         return run;
     }
+}
+
+/// Return run IDs that have been superseded by a valid continuation reply.
+/// Unlike a blind `parent`/`repliedAt` scan, a live child that failed without continuing the
+/// conversation (e.g. `malformed` / `crashed` with no saved session) does NOT suppress its
+/// delivered parent from `status` / `board`.
+pub fn superseded_by_reply(
+    all: &[PathBuf],
+    hist_entries: &[crate::history::HistoryEntry],
+) -> std::collections::HashSet<String> {
+    use std::collections::{HashMap, HashSet};
+    let mut live_children: HashMap<String, Vec<&PathBuf>> = HashMap::new();
+    for run in all {
+        let meta = json(run.join("meta.json"));
+        let parent = s(&meta, "parent");
+        if !parent.is_empty() {
+            live_children
+                .entry(parent.to_string())
+                .or_default()
+                .push(run);
+        }
+    }
+
+    let mut superseded = HashSet::<String>::new();
+    for (parent, children) in &live_children {
+        if children
+            .iter()
+            .any(|c| active(&state(c)) || continues_conversation(c))
+        {
+            superseded.insert(parent.clone());
+        }
+    }
+    for e in hist_entries {
+        if !e.parent.is_empty()
+            && !live_children.contains_key(&e.parent)
+            && !matches!(e.state.as_str(), "malformed" | "crashed")
+        {
+            superseded.insert(e.parent.clone());
+        }
+    }
+    for run in all {
+        let meta = json(run.join("meta.json"));
+        let id = crate::notes::run_id(run, &meta);
+        if !s(&meta, "repliedAt").is_empty() && !live_children.contains_key(&id) {
+            superseded.insert(id);
+        }
+    }
+    superseded
+}
+
+/// Count unapplied worktree files for `run` across its continuation chain.
+/// Handles null/missing `pendingChanges` and zero-edit reply tails whose unapplied ancestors
+/// in the same worktree carry pending changes.
+pub fn chain_pending_apply_files(run: &Path, meta: &Value, sum: &Value, all: &[PathBuf]) -> i64 {
+    if s(meta, "mode") != "write" || !meta["worktree"].is_object() {
+        return 0;
+    }
+    if let Some(pending) = sum.get("pendingChanges").filter(|v| v.is_object()) {
+        return n(pending, "files");
+    }
+    if let Some(pending) = crate::worktree::pending_changes(run, meta) {
+        if pending.is_object() {
+            return n(&pending, "files");
+        }
+    }
+    let own = n(&sum["changes"], "files");
+    if own > 0 {
+        return own;
+    }
+    let wt_path = s(&meta["worktree"], "path");
+    let mut parent = s(meta, "parent").to_string();
+    let mut visited = std::collections::HashSet::new();
+    while !parent.is_empty() && visited.insert(parent.clone()) {
+        let Some(anc) = all
+            .iter()
+            .find(|r| r.file_name().is_some_and(|name| name == parent.as_str()))
+        else {
+            break;
+        };
+        if anc.join(".applied").exists()
+            || anc.join(".applied-cleaned").exists()
+            || anc.join(".sync-base").exists()
+        {
+            break;
+        }
+        let anc_meta = json(anc.join("meta.json"));
+        if !s(&anc_meta, "appliedAt").is_empty() {
+            break;
+        }
+        if !wt_path.is_empty() && s(&anc_meta["worktree"], "path") != wt_path {
+            break;
+        }
+        let anc_sum = json(anc.join("summary.json"));
+        if let Some(pending) = anc_sum.get("pendingChanges").filter(|v| v.is_object()) {
+            let pf = n(pending, "files");
+            if pf > 0 {
+                return pf;
+            }
+        }
+        let af = n(&anc_sum["changes"], "files");
+        if af > 0 {
+            return af;
+        }
+        parent = s(&anc_meta, "parent").to_string();
+    }
+    0
 }
 
 #[cfg(test)]

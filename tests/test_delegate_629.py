@@ -300,6 +300,12 @@ class Delegate629Tests(unittest.TestCase):
             return any(i["name"] == "after-pass" and i["status"] == "dispatched" for i in items)
 
         self.until(dag_dispatched, "DAG step dispatched after review PASS")
+        q_list = self.cli("queue", "list", "--json", cwd=repo)
+        for ln in q_list.stdout.splitlines():
+            if ln.strip():
+                it = json.loads(ln)
+                if it.get("name") == "after-pass" and it.get("runId"):
+                    self.cli("wait", "--no-result", it["runId"])
 
     def test_unlimited_rework_rounds_3_plus_emits_needs_attention_and_live_status_shows_states(self):
         repo = self.repo({
