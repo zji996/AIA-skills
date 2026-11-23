@@ -68,7 +68,7 @@ pub fn claim(source: &Path, run: &Path, slots: u64) -> Option<PathBuf> {
         if claimed(&slot) {
             return None;
         }
-        fs::write(owner_file(&slot), run.to_string_lossy().as_bytes()).ok()?;
+        atomic_write(owner_file(&slot), run.to_string_lossy().as_bytes()).ok()?;
         Some(slot)
     })
 }

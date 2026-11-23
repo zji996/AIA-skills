@@ -286,11 +286,18 @@ class Delegate626Tests(unittest.TestCase):
         releaser = threading.Thread(target=release_soon, daemon=True)
         releaser.start()
         self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED])
+        t0 = time.monotonic()
         started = self.cli("start", "--worktree", "--workdir", repo, "--name", "wait-write-lock", "task", timeout=10)
-        releaser.join(timeout=5)
+        start_elapsed = time.monotonic() - t0
         self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
-        self.assertIn("等待 apply 完成写盘", started.stderr)
-        self.cli("wait", self.outcome(started)["run"])
+        # 6.32.0: `start` returns immediately without blocking on source-watch/lock; `_supervise` waits for it.
+        self.assertLess(start_elapsed, 0.35, f"start blocked on source-watch/lock: {start_elapsed:.3f}s")
+        info = self.outcome(started)
+        releaser.join(timeout=5)
+        waited = self.cli("wait", info["run"])
+        self.assertEqual(waited.returncode, 0, waited.stdout + waited.stderr)
+        sup_log = (Path(info["dir"]) / "supervisor.log").read_text(encoding="utf-8")
+        self.assertIn("等待 apply 完成写盘", sup_log)
 
 
 if __name__ == "__main__":

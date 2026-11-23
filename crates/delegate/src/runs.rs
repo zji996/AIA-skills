@@ -4,6 +4,31 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub fn all_runs_in(root: &Path) -> Vec<PathBuf> {
+    let mut v = fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.join("meta.json").is_file())
+        .collect::<Vec<_>>();
+    v.sort_by_cached_key(|p| json(p.join("meta.json"))["startedNs"].as_u64().unwrap_or(0));
+    v
+}
+pub fn all_runs_in_with_index(root: &Path, index: &Value) -> Vec<PathBuf> {
+    let mut v = fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.join("meta.json").is_file())
+        .collect::<Vec<_>>();
+    v.sort_by_cached_key(|p| {
+        crate::index::cached_started_ns(p, index)
+            .unwrap_or_else(|| json(p.join("meta.json"))["startedNs"].as_u64().unwrap_or(0))
+    });
+    v
+}
 pub fn all_runs() -> Vec<PathBuf> {
     let mut roots = vec![runs_root()];
     if let Some(old) = legacy_runs_root() {
@@ -17,7 +42,26 @@ pub fn all_runs() -> Vec<PathBuf> {
         .map(|e| e.path())
         .filter(|p| p.join("meta.json").is_file())
         .collect::<Vec<_>>();
-    v.sort_by_key(|p| json(p.join("meta.json"))["startedNs"].as_u64().unwrap_or(0));
+    v.sort_by_cached_key(|p| json(p.join("meta.json"))["startedNs"].as_u64().unwrap_or(0));
+    v
+}
+pub fn all_runs_sorted_with_index(index: &Value) -> Vec<PathBuf> {
+    let mut roots = vec![runs_root()];
+    if let Some(old) = legacy_runs_root() {
+        roots.push(old);
+    }
+    let mut v = roots
+        .into_iter()
+        .filter_map(|root| fs::read_dir(root).ok())
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.join("meta.json").is_file())
+        .collect::<Vec<_>>();
+    v.sort_by_cached_key(|p| {
+        crate::index::cached_started_ns(p, index)
+            .unwrap_or_else(|| json(p.join("meta.json"))["startedNs"].as_u64().unwrap_or(0))
+    });
     v
 }
 pub fn archived_runs() -> Vec<PathBuf> {
@@ -64,7 +108,6 @@ pub fn resolve(reference: &str) -> Res<PathBuf> {
     let path = Path::new(reference);
     if path.join("meta.json").is_file() {
         let resolved = path.canonicalize().map_err(|e| e.to_string())?;
-        crate::refs::backfill_one(&resolved);
         return Ok(resolved);
     }
     let root = runs_root();
@@ -278,14 +321,16 @@ pub fn state(run: &Path) -> String {
     if run.join("pid").is_file() {
         return "crashed".into();
     }
-    if run.join("launch.pid").is_file() {
-        if let Ok(pid) = read(run.join("launch.pid")).trim().parse::<i32>() {
-            if pid_alive(pid) {
-                return if run.join(".waiting").exists() {
-                    "waiting".into()
-                } else {
-                    "starting".into()
-                };
+    for pid_file in ["launch.pid", "supervisor.pid"] {
+        if run.join(pid_file).is_file() {
+            if let Ok(pid) = read(run.join(pid_file)).trim().parse::<i32>() {
+                if pid_alive(pid) {
+                    return if run.join(".waiting").exists() {
+                        "waiting".into()
+                    } else {
+                        "starting".into()
+                    };
+                }
             }
         }
     }
@@ -475,12 +520,19 @@ pub fn next_step(run: &Path, meta: &Value, state: &str, sum: &Value) -> Option<S
         _ => None,
     }
 }
+/// Zero-lock, zero-side-effect run status (does not run `detect_applied` writes or `git cat-file`
+/// object probes unless `check_missing_objects` is explicitly enabled for single-run inspection).
 pub fn status(run: &Path) -> Value {
+    status_with_opts(run, false)
+}
+
+pub fn status_detail(run: &Path) -> Value {
+    status_with_opts(run, true)
+}
+
+pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
     let meta = json(run.join("meta.json"));
     let st = state(run);
-    if !active(&st) && json(run.join("changes.json"))["finalEntries"].is_object() {
-        worktree::detect_applied(run, &meta);
-    }
     let sum = json(run.join("summary.json"));
     let mut out = json!({"run":meta.get("run").and_then(Value::as_str).unwrap_or_else(||run.file_name().and_then(|x|x.to_str()).unwrap_or("")),"name":meta.get("name"),"state":st,"agent":meta.get("agent").and_then(Value::as_str).unwrap_or(crate::agents::AGENT),"mode":meta.get("mode")});
     if let Some(archive) = crate::archive::status(run) {
@@ -728,7 +780,30 @@ pub fn status(run: &Path) -> Value {
         out["next"] = json!(step);
     }
     if !run.join(".applied-cleaned").exists() && !crate::archive::is_record(run) {
-        let missing = crate::refs::missing_objects(run, &meta);
+        let missing = if check_missing_objects {
+            crate::refs::missing_objects(run, &meta)
+        } else {
+            let cached = json(run.join("missing-objects.json"));
+            cached
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|item| {
+                    let slot = match s(item, "ref") {
+                        "base" => "base",
+                        "after" => "after",
+                        "chain-base" => "chain-base",
+                        "applied" => "applied",
+                        "applied-base" => "applied-base",
+                        "sync-base" => "sync-base",
+                        "worktree-base" => "worktree-base",
+                        _ => return None,
+                    };
+                    let sha = s(item, "sha").to_string();
+                    (!sha.is_empty()).then_some((slot, sha))
+                })
+                .collect()
+        };
         if !missing.is_empty() {
             out["missingObjects"] = json!(missing
                 .iter()
@@ -738,15 +813,19 @@ pub fn status(run: &Path) -> Value {
             out["next"] = json!(crate::refs::recovery_message(run, &meta, &missing));
         }
     }
-    let (chain_name, chain_round) = crate::notes::chain_display_info(run);
-    if chain_round > 1 {
-        out["chainName"] = json!(chain_name);
-        out["chainRound"] = json!(chain_round);
+    if !s(&meta, "parent").is_empty() {
+        let (chain_name, chain_round) = crate::notes::chain_display_info(run);
+        if chain_round > 1 {
+            out["chainName"] = json!(chain_name);
+            out["chainRound"] = json!(chain_round);
+        }
     }
-    if let Some(chain_notes) = crate::notes::for_run_lazy(run) {
-        if !chain_notes.items.is_empty() {
-            out["notes"] = chain_notes.items_json();
-            out["pendingNotes"] = json!(chain_notes.pending_count());
+    if crate::work::any_notes_exist() {
+        if let Some(chain_notes) = crate::notes::for_run_lazy(run) {
+            if !chain_notes.items.is_empty() {
+                out["notes"] = chain_notes.items_json();
+                out["pendingNotes"] = json!(chain_notes.pending_count());
+            }
         }
     }
     out["dir"] = json!(run.to_string_lossy());
@@ -754,9 +833,6 @@ pub fn status(run: &Path) -> Value {
 }
 pub fn unmerged(run: &Path) -> bool {
     let m = json(run.join("meta.json"));
-    if !active(&state(run)) {
-        worktree::detect_applied(run, &m);
-    }
     s(&m, "mode") == "write"
         && m["worktree"].is_object()
         && Path::new(s(&m["worktree"], "path")).exists()

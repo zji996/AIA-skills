@@ -74,13 +74,12 @@ class Delegate627Tests(unittest.TestCase):
         self.assertEqual(r2["changes"]["files"], 1)
         self.assertEqual(r2["pendingChanges"]["files"], 2)
 
-        # Human `status <run>` shows ONLY the chain's 2 files + separate calm drift line.
+        # Human `status <run>` shows ONLY the chain's 2 files (6.32: zero-side-effect read path omits live sourceDrift).
         st = self.cli("status", r2["run"], human=True)
         self.assertEqual(st.returncode, 0, st.stderr)
         self.assertIn("改 2 个文件", st.stdout)
         self.assertNotIn("触及保护路径", st.stdout)
-        self.assertIn("主干已前进 2 个提交 / 4 个文件，与本链改动重叠 0 个", st.stdout)
-        self.assertNotIn("!!! 主干已前进", st.stdout)
+        self.assertNotIn("主干已前进", st.stdout)
 
         # `diff --total` shows ONLY the chain's own 2 files.
         total_diff = self.cli("diff", "--total", r2["run"])
@@ -104,27 +103,23 @@ class Delegate627Tests(unittest.TestCase):
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo a1 > a.txt; echo b1 > b.txt")
         r1 = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "drift-check", "task"))
 
-        # Disjoint commit on main -> calm drift line (no `!!!`).
+        # 6.32.0: read paths (`status`, `wait`) stay zero-side-effect and do not run live `source_drift`.
         (repo / "c.txt").write_text("c1\n")
         self.git(repo, "add", "c.txt")
         self.git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "disjoint")
         calm = self.cli("status", r1["run"], human=True)
         self.assertEqual(calm.returncode, 0, calm.stderr)
         self.assertIn("改 2 个文件", calm.stdout)
-        self.assertIn("主干已前进 1 个提交 / 1 个文件，与本链改动重叠 0 个", calm.stdout)
-        self.assertNotIn("!!! 主干已前进", calm.stdout)
+        self.assertNotIn("主干已前进", calm.stdout)
 
-        # Overlapping commit on main -> prominent `!!!` drift line naming b.txt.
         (repo / "b.txt").write_text("b-main\n")
         self.git(repo, "add", "b.txt")
         self.git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "overlap b")
         warn_status = self.cli("status", r1["run"], human=True)
         self.assertEqual(warn_status.returncode, 0, warn_status.stderr)
         self.assertIn("改 2 个文件", warn_status.stdout)
-        self.assertIn("!!! 主干已前进 2 个提交 / 2 个文件，与本链改动重叠 1 个：b.txt", warn_status.stdout)
-
-        warn_wait = self.cli("wait", r1["run"], human=True)
-        self.assertIn("!!! 主干已前进 2 个提交 / 2 个文件，与本链改动重叠 1 个：b.txt", warn_wait.stdout)
+        self.assertNotIn("主干已前进", warn_status.stdout)
+        self.assertEqual(list(Path(r1["dir"]).glob(".snapshot-index-*")), [])
 
     def test_reply_default_auto_sync_clean_rebases_preserves_target_and_notifies_prompt(self):
         repo = self.repo({
@@ -263,7 +258,6 @@ class Delegate627Tests(unittest.TestCase):
 
         st = self.cli("status", r2["run"], human=True)
         self.assertIn("改 1 个文件", st.stdout)
-        self.assertIn("!!! 主干已前进 1 个提交 / 2 个文件，与本链改动重叠 1 个：a.txt", st.stdout)
 
 
 if __name__ == "__main__":

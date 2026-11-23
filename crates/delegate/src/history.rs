@@ -748,7 +748,52 @@ pub fn record_reply(parent_meta: &Value, child_run: &Path, rework_count: u64) {
 /// Read and fold all lines in a repository's `history.jsonl` into entries sorted oldest-first.
 pub fn load_entries(key: &str) -> Vec<HistoryEntry> {
     let path = history_path_for_key(key);
-    let content = read(path);
+    load_entries_from_text(&read(path))
+}
+
+/// Strictly read-only `load_entries` that also folds un-backfilled legacy runs/archives in memory
+/// when `.backfilled-v1` has not yet been written (zero locks, zero disk writes).
+pub fn load_entries_readonly(key: &str) -> Vec<HistoryEntry> {
+    let dir = history_dir_for_key(key);
+    let path = dir.join("history.jsonl");
+    let mut text = read(&path);
+    if !dir.join(".backfilled-v1").is_file() && key == current_history_key() {
+        let existing: HashSet<String> = load_entries_from_text(&text)
+            .into_iter()
+            .map(|e| e.run)
+            .collect();
+        let mut seen = existing;
+        for run in runs::all_runs().into_iter().chain(runs::archived_runs()) {
+            if !run.join("meta.json").is_file() || runs::active(&runs::state(&run)) {
+                continue;
+            }
+            let meta = json(run.join("meta.json"));
+            let id = if !s(&meta, "run").is_empty() {
+                s(&meta, "run").to_string()
+            } else {
+                run.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            if id.is_empty() || !seen.insert(id) {
+                continue;
+            }
+            if let Some((_, rec)) = build_finish_record(&run) {
+                if let Ok(line) = serde_json::to_string(&rec) {
+                    if !text.is_empty() && !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                    text.push_str(&line);
+                    text.push('\n');
+                }
+            }
+        }
+    }
+    load_entries_from_text(&text)
+}
+
+fn load_entries_from_text(content: &str) -> Vec<HistoryEntry> {
     let mut map: HashMap<String, HistoryEntry> = HashMap::new();
     for line in content.lines() {
         let line = line.trim();
@@ -1455,7 +1500,7 @@ pub fn history_command(args: &[String]) -> Res<i32> {
 
     let key = current_history_key();
     let now = epoch() as i64;
-    let mut entries: Vec<HistoryEntry> = load_entries(&key)
+    let mut entries: Vec<HistoryEntry> = load_entries_readonly(&key)
         .into_iter()
         .filter(|e| {
             if let Some(window) = since {

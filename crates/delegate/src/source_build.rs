@@ -83,6 +83,11 @@ fn measurement_timeout() -> f64 {
 }
 
 pub fn record(run: &Path) {
+    if cfg!(debug_assertions)
+        && std::env::var("DELEGATE_TEST_FAIL_SOURCE_BUILD_CACHE").as_deref() == Ok("1")
+    {
+        return;
+    }
     let mut meta = json(run.join("meta.json"));
     if s(&meta, "mode") != "write" || meta["sourceBuildBytes"].as_u64().is_some() {
         return;

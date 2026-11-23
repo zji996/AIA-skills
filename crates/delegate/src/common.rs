@@ -6,7 +6,10 @@ use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+static ATOMIC_NONCE: AtomicU64 = AtomicU64::new(1);
 
 pub type Res<T> = Result<T, String>;
 pub fn strings(value: &Value) -> Vec<String> {
@@ -199,14 +202,14 @@ pub fn runs_root() -> PathBuf {
         }
     }
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    git_top(&cwd).unwrap_or(cwd).join(".local/run/delegate")
+    git_top_fast(&cwd).unwrap_or(cwd).join(".local/run/delegate")
 }
 pub fn legacy_runs_root() -> Option<PathBuf> {
     if !setting("RUNS", "").is_empty() {
         return None;
     }
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    Some(git_top(&cwd).unwrap_or(cwd).join(".local/run/pi"))
+    Some(git_top_fast(&cwd).unwrap_or(cwd).join(".local/run/pi"))
 }
 pub fn read(path: impl AsRef<Path>) -> String {
     fs::read_to_string(path).unwrap_or_default()
@@ -214,14 +217,52 @@ pub fn read(path: impl AsRef<Path>) -> String {
 pub fn json(path: impl AsRef<Path>) -> Value {
     serde_json::from_str(&read(path)).unwrap_or(Value::Null)
 }
+/// Generate a collision-free sibling temp path: `.<name>.<pid>.<nonce>.tmp`.
+pub fn atomic_tmp_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let pid = std::process::id();
+    let seq = ATOMIC_NONCE.fetch_add(1, AtomicOrdering::Relaxed);
+    let nonce = seq.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (now_ns() as u64);
+    path.with_file_name(format!(".{name}.{pid}.{nonce:016x}.tmp"))
+}
+
+/// Atomic file write: unique PID+nonce sibling temp file -> `write_all` -> `sync_data` -> `rename`.
+pub fn atomic_write(path: impl AsRef<Path>, data: impl AsRef<[u8]>) -> Res<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if !parent.exists() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    let tmp = atomic_tmp_path(path);
+    let res = (|| -> io::Result<()> {
+        let mut f = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)?;
+        f.write_all(data.as_ref())?;
+        f.sync_data()?;
+        Ok(())
+    })();
+    if let Err(err) = res {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.to_string());
+    }
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.to_string());
+    }
+    Ok(())
+}
+
 pub fn write(path: impl AsRef<Path>, data: impl AsRef<[u8]>) -> Res<()> {
-    fs::write(path, data).map_err(|e| e.to_string())
+    atomic_write(path, data)
 }
 pub fn write_json(path: impl AsRef<Path>, val: &Value) -> Res<()> {
-    let path = path.as_ref();
-    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-    write(&tmp, format!("{}\n", val))?;
-    fs::rename(tmp, path).map_err(|e| e.to_string())
+    atomic_write(path, format!("{val}\n"))
 }
 pub fn append(path: impl AsRef<Path>, data: &str) -> Res<()> {
     OpenOptions::new()
@@ -229,6 +270,17 @@ pub fn append(path: impl AsRef<Path>, data: &str) -> Res<()> {
         .append(true)
         .open(path)
         .and_then(|mut f| f.write_all(data.as_bytes()))
+        .map_err(|e| e.to_string())
+}
+pub fn append_synced(path: impl AsRef<Path>, data: &str) -> Res<()> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| {
+            f.write_all(data.as_bytes())?;
+            f.sync_data()
+        })
         .map_err(|e| e.to_string())
 }
 pub fn touch(path: impl AsRef<Path>) {
@@ -307,21 +359,31 @@ pub fn lock(path: &Path, exclusive: bool, nonblock: bool) -> io::Result<File> {
     Ok(f)
 }
 pub fn locked_file(path: &Path, content: &str) -> Res<File> {
-    let tmp = path.with_file_name(format!(
-        ".{}.tmp",
-        path.file_name().unwrap_or_default().to_string_lossy()
-    ));
+    let tmp = atomic_tmp_path(path);
     let mut f = lock(&tmp, true, false).map_err(|e| e.to_string())?;
-    f.set_len(0).map_err(|e| e.to_string())?;
-    f.write_all(content.as_bytes()).map_err(|e| e.to_string())?;
-    fs::rename(tmp, path).map_err(|e| e.to_string())?;
+    let res = (|| -> io::Result<()> {
+        f.set_len(0)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_data()?;
+        Ok(())
+    })();
+    if let Err(err) = res {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.to_string());
+    }
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.to_string());
+    }
     Ok(f)
 }
 pub fn cmd_output(mut c: Command) -> Res<Output> {
+    crate::locks::assert_not_holding_state_lock("subprocess");
     c.output().map_err(|e| e.to_string())
 }
 /// All Git invocations, including source probes, must avoid optional index writes.
 pub fn git_command() -> Command {
+    crate::locks::assert_not_holding_state_lock("git");
     let mut command = Command::new("git");
     command.env("GIT_OPTIONAL_LOCKS", "0");
     command
@@ -343,9 +405,137 @@ pub fn git_text(top: &Path, args: &[&str]) -> Res<String> {
         .to_string())
 }
 pub fn git_top(path: &Path) -> Option<PathBuf> {
+    if env::var_os("GIT_DIR").is_none() && env::var_os("GIT_WORK_TREE").is_none() {
+        return git_top_fast(path);
+    }
+    if crate::locks::holding_state_lock() {
+        return git_top_fast(path);
+    }
     git_text(path, &["rev-parse", "--show-toplevel"])
         .ok()
         .map(PathBuf::from)
+}
+/// Pure-filesystem git toplevel lookup (<0.05ms, zero subprocesses, safe anywhere).
+pub fn git_top_fast(path: &Path) -> Option<PathBuf> {
+    let start = if path.is_file() {
+        path.parent()?
+    } else {
+        path
+    };
+    let canonical = fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    if canonical
+        .components()
+        .any(|c| c.as_os_str() == std::ffi::OsStr::new(".git"))
+    {
+        return None;
+    }
+    let mut cur = canonical.as_path();
+    loop {
+        if cur.join(".git").exists() {
+            return Some(cur.to_path_buf());
+        }
+        cur = cur.parent()?;
+    }
+}
+/// Pure-filesystem git common directory lookup (<0.05ms, zero git subprocesses).
+pub fn git_common_dir_fast(path: &Path) -> Option<PathBuf> {
+    let top = git_top_fast(path)?;
+    let dot_git = top.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    if dot_git.is_file() {
+        let text = fs::read_to_string(&dot_git).ok()?;
+        let raw = text.lines().next()?.trim().strip_prefix("gitdir:")?.trim();
+        let git_dir = if Path::new(raw).is_absolute() {
+            PathBuf::from(raw)
+        } else {
+            top.join(raw)
+        };
+        if let Ok(common_raw) = fs::read_to_string(git_dir.join("commondir")) {
+            let trimmed = common_raw.trim();
+            if !trimmed.is_empty() {
+                let p = PathBuf::from(trimmed);
+                let resolved = if p.is_absolute() { p } else { git_dir.join(p) };
+                return Some(fs::canonicalize(&resolved).unwrap_or(resolved));
+            }
+        }
+        return Some(fs::canonicalize(&git_dir).unwrap_or(git_dir));
+    }
+    None
+}
+/// Pure-filesystem resolution of `HEAD` commit SHA (<0.1ms, zero git subprocesses).
+pub fn read_git_head(repo: &Path) -> Option<String> {
+    let top = git_top_fast(repo)?;
+    let dot_git = top.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else if dot_git.is_file() {
+        let text = fs::read_to_string(&dot_git).ok()?;
+        let raw = text
+            .lines()
+            .next()?
+            .trim()
+            .strip_prefix("gitdir:")?
+            .trim();
+        let p = PathBuf::from(raw);
+        if p.is_absolute() {
+            p
+        } else {
+            top.join(p)
+        }
+    } else {
+        return None;
+    };
+    let common_dir = if let Ok(raw) = fs::read_to_string(git_dir.join("commondir")) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            git_dir.clone()
+        } else {
+            let p = PathBuf::from(trimmed);
+            if p.is_absolute() {
+                p
+            } else {
+                git_dir.join(p)
+            }
+        }
+    } else {
+        git_dir.clone()
+    };
+    let head_raw = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head_raw.trim();
+    if let Some(ref_name) = head.strip_prefix("ref:") {
+        let ref_name = ref_name.trim();
+        for base in [&git_dir, &common_dir] {
+            if let Ok(sha) = fs::read_to_string(base.join(ref_name)) {
+                let sha = sha.trim();
+                if sha.len() >= 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Some(sha.to_string());
+                }
+            }
+        }
+        if let Ok(packed) = fs::read_to_string(common_dir.join("packed-refs")) {
+            for line in packed.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+                    continue;
+                }
+                if let Some((sha, name)) = line.split_once(' ') {
+                    if name.trim() == ref_name
+                        && sha.len() >= 40
+                        && sha.bytes().all(|b| b.is_ascii_hexdigit())
+                    {
+                        return Some(sha.to_string());
+                    }
+                }
+            }
+        }
+        None
+    } else if head.len() >= 40 && head.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(head.to_string())
+    } else {
+        None
+    }
 }
 pub fn clean_env(c: &mut Command, extra: &Value) {
     for k in GUARDS {
@@ -708,6 +898,8 @@ pub fn finish_run(run: &std::path::Path, mut summary: serde_json::Value, code: i
     crate::board::refresh_for_run(run);
     crate::events::emit_run_finished(run, &meta, &summary);
     crate::work::on_run_finished(run, &meta, &summary);
+    crate::work::check_stale_and_expired();
+    crate::index::upsert_run(run);
     crate::dag_queue::advance();
     Ok(())
 }

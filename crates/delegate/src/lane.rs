@@ -651,7 +651,7 @@ fn acquire_in(
     let stamp = if priority == 0 { stamp_now } else { priority };
     let mut me = json!({"pid":std::process::id(),"label":label,"since":iso(),"epoch":epoch(),"queuedNs":stamp,"runStartedNs":run_started_ns,"run":account,"running":false});
     let ticket;
-    let file;
+    let mut file;
     {
         let _guard = crate::locks::acquire(crate::locks::LockKind::Lane, &dir.join(".lock"), true).map_err(|e| e.to_string())?;
         ticket = dir.join(format!("{stamp:020}-{}.ticket", std::process::id()));
@@ -670,8 +670,13 @@ fn acquire_in(
             let live = tickets_in(dir);
             let pos = live.iter().position(|(p, _)| p == &ticket).unwrap_or(0);
             if pos < limit {
+                use std::io::{Seek, SeekFrom, Write};
                 me["running"] = json!(true);
-                write(&ticket, me.to_string())?;
+                file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+                file.set_len(0).map_err(|e| e.to_string())?;
+                file.write_all(me.to_string().as_bytes())
+                    .map_err(|e| e.to_string())?;
+                let _ = file.sync_data();
                 break;
             }
             drop(guard);
@@ -788,6 +793,85 @@ pub fn queued_seconds(run: &Path) -> f64 {
     }
     total
 }
+/// Zero-lock, zero-side-effect JSON snapshot of local + remote lane & jobserver pool state.
+pub fn status_json_readonly() -> Res<Value> {
+    let remote = remote_holders().unwrap_or_default();
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let cfg = crate::config::load(git_top_fast(&cwd).as_deref())?;
+    let plan = local_plan_for_config(&cfg.value)?;
+    let pool = crate::jobserver::inspect_pool_readonly(plan.pool_tokens, plan.budget);
+    let lim = plan.max_heavy;
+    let local_tickets: Vec<(u32, String, String, bool)> = tickets()
+        .iter()
+        .enumerate()
+        .map(|(i, (_, v))| {
+            (
+                v["pid"].as_u64().unwrap_or(0) as u32,
+                s(v, "label").to_string(),
+                s(v, "since").to_string(),
+                lim == 0 || i < lim,
+            )
+        })
+        .collect();
+    let match_lease = |pid: u32, lbl: &str| -> Option<&crate::jobserver::LeaseView> {
+        pool.leases
+            .iter()
+            .find(|l| pid != 0 && l.pid == pid)
+            .or_else(|| pool.leases.iter().find(|l| l.label == lbl))
+    };
+    let remote_enabled = crate::remote::enabled(&cfg.value["remote"]);
+    let remote_plan = if remote_enabled {
+        Some(crate::remote::remote_plan(&cfg.value["remote"], false))
+    } else {
+        None
+    };
+    let remote_limit = remote_plan
+        .as_ref()
+        .map(|p| p.max_heavy)
+        .unwrap_or_else(|| cfg.value["remote"]["maxHeavy"].as_u64().unwrap_or(4) as usize);
+    let local_items: Vec<Value> = local_tickets
+        .into_iter()
+        .map(|(pid, label, since, running)| {
+            let mut item = json!({"label": label, "since": since, "running": running});
+            if running {
+                if let Some(lease) = match_lease(pid, &label) {
+                    item["rank"] = json!(lease.rank);
+                    item["borrowed"] = json!(lease.borrowed);
+                    item["used"] = json!(lease.used_jobs());
+                    item["share"] = json!(lease.share);
+                }
+            }
+            item
+        })
+        .collect();
+    let remote_items: Vec<Value> = remote
+        .into_iter()
+        .map(|(label, since, running)| {
+            json!({"label": label, "since": since, "running": running})
+        })
+        .collect();
+    let mut out = json!({
+        "maxHeavy": plan.max_heavy,
+        "heavyJobs": plan.heavy_jobs,
+        "threads": plan.threads,
+        "budget": plan.budget,
+        "poolTokens": plan.pool_tokens,
+        "maxHeavyExplicit": plan.max_heavy_explicit,
+        "heavyJobsExplicit": plan.heavy_jobs_explicit,
+        "concurrencySummary": plan.format_summary_with_pool(&pool),
+        "leasesSummary": pool.format_leases_strip(),
+        "pool": pool.to_json(),
+        "concurrency": plan.to_json_with_pool(&pool),
+        "local": local_items,
+        "remoteMaxHeavy": remote_limit,
+        "remote": remote_items,
+    });
+    if let Some(rp) = remote_plan {
+        out["remoteConcurrency"] = rp.to_json();
+    }
+    Ok(out)
+}
+
 pub fn lane_command(args: &[String]) -> Res<i32> {
     let mut i = 0;
     let mut label = None;

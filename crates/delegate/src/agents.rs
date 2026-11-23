@@ -609,8 +609,64 @@ pub fn is_question(answer: &str) -> bool {
         .is_some_and(|line| QUESTION_MARKERS.iter().any(|m| line.starts_with(m)))
 }
 
+fn binary_cache_sig(bin: &Path, include_pi_models_cfg: bool) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let canon = fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
+    let meta = fs::metadata(&canon).ok()?;
+    let mut sig = format!(
+        "{}|{}.{}:{}",
+        canon.display(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.len()
+    );
+    // Small wrapper scripts (e.g. test stubs or shims <= 64 KiB) may be rewritten within the same
+    // filesystem mtime quantum; hash their bytes to prevent stale cache hits.
+    if meta.len() <= 65_536 {
+        if let Ok(bytes) = fs::read(&canon) {
+            let hash = sha1_smol::Sha1::from(&bytes).digest().to_string();
+            sig.push('|');
+            sig.push_str(&hash[..16]);
+        }
+    }
+    if include_pi_models_cfg {
+        let cfg = home().join(".pi/agent/models.json");
+        if let Ok(cm) = fs::metadata(&cfg) {
+            sig.push_str(&format!("|cfg:{}.{}:{}", cm.mtime(), cm.mtime_nsec(), cm.len()));
+        }
+    }
+    Some(sig)
+}
+
+fn probe_cache_path() -> PathBuf {
+    cache_dir().join("agent-probe-cache.json")
+}
+
+fn read_probe_cache(section: &str, key: &str, expected_sig: &str) -> Option<Value> {
+    let doc = json(probe_cache_path());
+    let entry = doc.get(section)?.get(key)?;
+    if s(entry, "sig") == expected_sig {
+        entry.get("val").cloned()
+    } else {
+        None
+    }
+}
+
+fn write_probe_cache(section: &str, key: &str, sig: &str, val: Value) {
+    let path = probe_cache_path();
+    let mut doc = json(&path);
+    if !doc.is_object() {
+        doc = json!({});
+    }
+    if !doc[section].is_object() {
+        doc[section] = json!({});
+    }
+    doc[section][key] = json!({"sig": sig, "val": val, "at": iso()});
+    let _ = write_json(&path, &doc);
+}
+
 /// Pi capability metadata (not the selectable universe), from the offline model table;
-/// empty when Pi is missing or prints nothing usable.
+/// empty when Pi is missing or prints nothing usable. Cached by binary mtime.
 pub fn pi_models() -> Vec<crate::models::PiModel> {
     let Some(bin) = agent_bin(AGENT) else {
         return vec![];
@@ -618,13 +674,30 @@ pub fn pi_models() -> Vec<crate::models::PiModel> {
     pi_models_for(&bin)
 }
 pub fn pi_models_for(bin: &Path) -> Vec<crate::models::PiModel> {
+    let key = bin.to_string_lossy().into_owned();
+    let sig = binary_cache_sig(bin, true);
+    if let Some(ref expected) = sig {
+        if let Some(cached) = read_probe_cache("piModels", &key, expected)
+            .and_then(|v| v.as_str().map(str::to_string))
+        {
+            return crate::models::parse_pi_models(&cached);
+        }
+    }
+    crate::locks::assert_not_holding_state_lock("pi_models");
     let out = std::process::Command::new(bin)
         .args(["--offline", "--list-models"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output();
     let Ok(out) = out else { return vec![] };
-    crate::models::parse_pi_models(&String::from_utf8_lossy(&out.stdout))
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let parsed = crate::models::parse_pi_models(&stdout);
+    if !parsed.is_empty() {
+        if let Some(ref expected) = sig {
+            write_probe_cache("piModels", &key, expected, json!(stdout));
+        }
+    }
+    parsed
 }
 
 /// What a caller needs to configure the tiers itself in one step.
@@ -763,6 +836,15 @@ pub fn protocol() -> Value {
 }
 pub fn agent_identity(agent: &str) -> Res<(PathBuf, Option<String>)> {
     let bin = agent_bin(agent).ok_or_else(|| format!("missing required tools: {agent}"))?;
+    let key = bin.to_string_lossy().into_owned();
+    let sig = binary_cache_sig(&bin, false);
+    if let Some(ref expected) = sig {
+        if let Some(cached) = read_probe_cache("agentIdentity", &key, expected) {
+            let ver = cached.as_str().filter(|x| !x.is_empty()).map(str::to_string);
+            return Ok((bin, ver));
+        }
+    }
+    crate::locks::assert_not_holding_state_lock("agent_identity");
     let mut command = std::process::Command::new(&bin);
     command
         .arg("--version")
@@ -794,6 +876,9 @@ pub fn agent_identity(agent: &str) -> Res<(PathBuf, Option<String>)> {
                 .filter(|line| !line.is_empty())
         })
     });
+    if let (Some(ref expected), Some(ref ver)) = (&sig, &version) {
+        write_probe_cache("agentIdentity", &key, expected, json!(ver));
+    }
     Ok((bin, version))
 }
 pub fn missing_tools(agent: &str) -> Res<()> {

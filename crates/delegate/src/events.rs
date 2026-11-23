@@ -135,7 +135,7 @@ pub fn emit(run: &str, repo: &str, kind: &str, payload: Value) -> Option<u64> {
 
 pub fn emit_in(state: &Path, run: &str, repo: &str, kind: &str, payload: Value) -> Res<u64> {
     fs::create_dir_all(state).map_err(|e| e.to_string())?;
-    let _guard = crate::locks::acquire(crate::locks::LockKind::Events, &state.join(".events.lock"), true).map_err(|e| e.to_string())?;
+    let _guard = crate::locks::acquire_state(state).map_err(|e| e.to_string())?;
     let events_file = state.join("events.jsonl");
     let seq_file = state.join("events.seq");
     let next_seq = current_max_seq_locked(&events_file, &seq_file).saturating_add(1);
@@ -148,14 +148,8 @@ pub fn emit_in(state: &Path, run: &str, repo: &str, kind: &str, payload: Value) 
         "payload": if payload.is_object() { payload } else { json!({}) },
     });
     let line = format!("{record}\n");
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&events_file)
-        .map_err(|e| e.to_string())?;
-    f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
-    f.flush().map_err(|e| e.to_string())?;
-    let _ = write(&seq_file, format!("{next_seq}\n"));
+    append_synced(&events_file, &line)?;
+    let _ = atomic_write(&seq_file, format!("{next_seq}\n"));
     Ok(next_seq)
 }
 
@@ -261,7 +255,7 @@ pub fn record_cursor_in(state: &Path, caller_id: Option<&str>, seq: u64) {
     if fs::create_dir_all(state).is_err() {
         return;
     }
-    let Ok(_guard) = crate::locks::acquire(crate::locks::LockKind::Cursors, &state.join(".cursors.lock"), true) else {
+    let Ok(_guard) = crate::locks::acquire_state(state) else {
         return;
     };
     let mut doc = load_cursors_doc(state);
@@ -294,7 +288,7 @@ pub fn mark_runs_read_in(state: &Path, caller_id: Option<&str>, run_ids: &[Strin
     if run_ids.is_empty() || fs::create_dir_all(state).is_err() {
         return;
     }
-    let Ok(_guard) = crate::locks::acquire(crate::locks::LockKind::Cursors, &state.join(".cursors.lock"), true) else {
+    let Ok(_guard) = crate::locks::acquire_state(state) else {
         return;
     };
     let mut doc = load_cursors_doc(state);
@@ -805,10 +799,9 @@ pub fn rebuild_in(state: &Path, extra_runs_dirs: &[PathBuf]) -> Res<Value> {
             .then_with(|| a.2.cmp(&b.2))
     });
 
-    let _guard = crate::locks::acquire(crate::locks::LockKind::Events, &state.join(".events.lock"), true).map_err(|e| e.to_string())?;
+    let _guard = crate::locks::acquire_state(state).map_err(|e| e.to_string())?;
     let events_file = state.join("events.jsonl");
     let seq_file = state.join("events.seq");
-    let tmp = state.join(".events.jsonl.tmp");
     let mut out_buf = String::new();
     let mut seq: u64 = 0;
     for (_, _, run_id, at, repo, kind, payload) in raw {
@@ -824,9 +817,8 @@ pub fn rebuild_in(state: &Path, extra_runs_dirs: &[PathBuf]) -> Res<Value> {
         out_buf.push_str(&line.to_string());
         out_buf.push('\n');
     }
-    write(&tmp, out_buf)?;
-    fs::rename(&tmp, &events_file).map_err(|e| e.to_string())?;
-    write(&seq_file, format!("{seq}\n"))?;
+    atomic_write(&events_file, out_buf)?;
+    atomic_write(&seq_file, format!("{seq}\n"))?;
 
     Ok(json!({
         "rebuilt": true,
@@ -1131,7 +1123,10 @@ pub fn command(args: &[String]) -> Res<i32> {
         if follow {
             return Err("--rebuild and --follow cannot be combined".into());
         }
+        crate::refs::backfill_all();
+        crate::history::ensure_backfilled();
         let info = rebuild()?;
+        crate::index::rebuild_all();
         if json_mode {
             println!("{info}");
         } else {
@@ -1168,12 +1163,12 @@ pub fn command(args: &[String]) -> Res<i32> {
         return Ok(0);
     }
 
-    // Follow mode: poll events.jsonl for newly appended lines until signaled.
+    // Follow mode: watch state directory with Linux `inotify` for instant event delivery.
     crate::lane::install_signals();
+    let watcher = crate::inotify::StateWatcher::watch(&state_dir());
     let stdout = io::stdout();
     let _ = stdout.lock().flush();
     while !crate::lane::stopped() {
-        std::thread::sleep(Duration::from_millis(200));
         let fresh = read_since(cursor);
         if !fresh.is_empty() {
             let mut out = stdout.lock();
@@ -1191,7 +1186,9 @@ pub fn command(args: &[String]) -> Res<i32> {
                 }
             }
             let _ = out.flush();
+            continue;
         }
+        crate::inotify::wait_or_sleep(watcher.as_ref(), Duration::from_millis(500));
     }
     Ok(0)
 }
@@ -1214,10 +1211,12 @@ pub fn wait_since(since: u64, run_filter: &[String], max: Option<f64>) -> Res<i3
         resolved_ids.contains(s(ev, "run"))
     };
 
-    let poll = setting("POLL", "0.2")
+    // Start inotify watch BEFORE initial read so events written concurrently are never missed.
+    let watcher = crate::inotify::StateWatcher::watch(&state_dir());
+    let fallback_poll = setting("POLL", "0.5")
         .parse::<f64>()
-        .unwrap_or(0.2)
-        .clamp(0.02, 1.0);
+        .unwrap_or(0.5)
+        .clamp(0.05, 1.0);
     let begin = Instant::now();
     let mut collected: Vec<Value>;
 
@@ -1229,7 +1228,7 @@ pub fn wait_since(since: u64, run_filter: &[String], max: Option<f64>) -> Res<i3
             .collect();
         if !collected.is_empty() {
             // Brief coalesce window to pick up paired events written back-to-back (e.g. accept + delivered).
-            std::thread::sleep(Duration::from_millis(40));
+            crate::inotify::wait_or_sleep(watcher.as_ref(), Duration::from_millis(30));
             collected = read_since(since)
                 .into_iter()
                 .filter(&matches_filter)
@@ -1245,11 +1244,14 @@ pub fn wait_since(since: u64, run_filter: &[String], max: Option<f64>) -> Res<i3
         if !has_active && max.is_none() {
             break;
         }
-        let sleep_s = match max {
-            Some(m) => (m - begin.elapsed().as_secs_f64()).max(0.0).min(poll),
-            None => poll,
+        let wait_s = match max {
+            Some(m) => (m - begin.elapsed().as_secs_f64()).max(0.0).min(fallback_poll),
+            None => fallback_poll,
         };
-        std::thread::sleep(Duration::from_secs_f64(sleep_s));
+        if wait_s <= 0.0 {
+            break;
+        }
+        crate::inotify::wait_or_sleep(watcher.as_ref(), Duration::from_secs_f64(wait_s));
     }
 
     let new_cursor = collected

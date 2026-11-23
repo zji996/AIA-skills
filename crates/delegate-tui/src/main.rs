@@ -5,17 +5,20 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use delegate_tui::app::{copy_to_clipboard, App, AppAction, Overlay};
-use delegate_tui::data::{discover_repos, home_dir, local_hms, DelegateClient};
+use delegate_tui::data::{discover_repos, home_dir, local_hms, state_dir, DelegateClient};
 use delegate_tui::model::AppSnapshot;
 use delegate_tui::ui;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::collections::HashSet;
 use std::env;
+use std::ffi::CString;
 use std::io::{self, IsTerminal, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -175,6 +178,69 @@ fn resolve_repos(
         .cloned()
         .unwrap_or_else(|| cwd.to_path_buf());
     discover_repos(&root, Some(cwd))
+}
+
+/// Spawn a Linux `inotify` thread watching `<state>` (`events.seq`, `index.json`, `work.jsonl`).
+/// Returns `(rx_notify, active)` so the UI refreshes immediately on state changes without
+/// periodically spawning subprocesses when idle.
+fn spawn_state_watcher(stop: Arc<AtomicBool>) -> (mpsc::Receiver<()>, bool) {
+    let (tx, rx) = mpsc::channel::<()>();
+    let dir = state_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(cpath) = CString::new(dir.as_os_str().as_bytes()) else {
+        return (rx, false);
+    };
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if fd < 0 {
+        return (rx, false);
+    }
+    let mask = libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE | libc::IN_CREATE | libc::IN_MODIFY;
+    let wd = unsafe { libc::inotify_add_watch(fd, cpath.as_ptr(), mask) };
+    if wd < 0 {
+        unsafe {
+            libc::close(fd);
+        }
+        return (rx, false);
+    }
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut last_seq = std::fs::read_to_string(dir.join("events.seq")).unwrap_or_default();
+        while !stop.load(Ordering::Relaxed) {
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, 250) };
+            if rc <= 0 {
+                continue;
+            }
+            // Drain all buffered events and debounce slightly to coalesce paired writes.
+            loop {
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(60));
+            loop {
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+            }
+            let cur_seq = std::fs::read_to_string(dir.join("events.seq")).unwrap_or_default();
+            let _ = (&last_seq, &cur_seq);
+            last_seq = cur_seq;
+            if tx.send(()).is_err() {
+                break;
+            }
+        }
+        unsafe {
+            libc::close(fd);
+        }
+    });
+    (rx, true)
 }
 
 fn spawn_worker(
@@ -468,12 +534,26 @@ fn main() {
     };
 
     let refresh_every = Duration::from_secs(cli.interval);
+    let idle_heartbeat = Duration::from_secs(cli.interval.max(60));
+    let stop_watcher = Arc::new(AtomicBool::new(false));
+    let (rx_notify, inotify_active) = spawn_state_watcher(stop_watcher.clone());
     let mut last_refresh = Instant::now();
     let mut print_on_exit: Option<String> = None;
     let mut inflight_results: HashSet<String> = HashSet::new();
     let mut inflight_diffs: HashSet<String> = HashSet::new();
 
     loop {
+        // React immediately to state directory `inotify` events (`events.seq`, `index.json`, `work.jsonl`).
+        let mut notified = false;
+        while rx_notify.try_recv().is_ok() {
+            notified = true;
+        }
+        if notified && !refresh_in_flight {
+            refresh_in_flight = true;
+            let _ = tx_worker.send(WorkerCmd::Refresh { force: false });
+            last_refresh = Instant::now();
+        }
+
         // Drain completed background worker responses without blocking UI.
         while let Ok(ev) = rx_worker.try_recv() {
             match ev {
@@ -616,13 +696,25 @@ fn main() {
             }
         }
 
-        if !refresh_in_flight && last_refresh.elapsed() >= refresh_every {
+        let has_active_runs = app
+            .snapshot
+            .repos
+            .iter()
+            .flat_map(|g| &g.runs)
+            .any(|r| matches!(r.state.as_str(), "running" | "starting" | "waiting"));
+        let effective_interval = if inotify_active && !has_active_runs {
+            idle_heartbeat
+        } else {
+            refresh_every
+        };
+        if !refresh_in_flight && last_refresh.elapsed() >= effective_interval {
             refresh_in_flight = true;
             let _ = tx_worker.send(WorkerCmd::Refresh { force: false });
             last_refresh = Instant::now();
         }
     }
 
+    stop_watcher.store(true, Ordering::Relaxed);
     let _ = tx_worker.send(WorkerCmd::Shutdown);
     drop(_guard);
     // Avoid blocking exit if a slow subprocess is mid-flight; detach cleanly if needed.

@@ -18,7 +18,8 @@
 | `sign [--check] [--json] [<run>]` | 记录或校验 `controllerReviewPaths` diff 的 SHA-256 签字（`sign.json`）；改一字即失效（`--check` 有效退出 0，未签/失效退出 1），供合入员验签，不改 `apply` 语义 |
 | `merge [--ready\|<run>...] [--name <名>] [--json]` | 独立集成 worktree 串行 3-way 合入（重生、逐个 `accept`、末尾 `mergeAccept`，按 `autoMerge` 出 `merge-report.md` 供 `apply --keep-commits` 落回）；`merge list [--all]` 查批次，见 [合入员与 Radar](merge-and-radar.md) |
 | `radar [run\|list\|board\|pick\|schedule]` | 跑 `radar.collect` 算指纹，变化时派只读 scout 去重写 `<state>/radar/<repo>/board.md`；`pick <id>` 出草稿，`schedule` 给定时说明，见 [合入员与 Radar](merge-and-radar.md) |
-| `status [<run>...] [--all] [--json] [--files]` | 首行计数并只列待处理任务与未完成待办（判活、审查与签字状态；续做链折末环，详情看 `status <run>`，`--all` 全量，`--json --files` 带文件数组），末行指向 `history` |
+| `status [<run>...] [--all] [--json] [--files]` | 首行计数并只列待处理任务与未完成待办（零锁零副作用直读 `<state>/index.json`；续做链折末环，详情看 `status <run>`，`--all` 全量，`--json --files` 带文件数组），末行指向 `history` |
+| `snapshot --json [--repo <路径>...] [--events-limit N]` | 零锁、零子进程一次输出全机 runs、work、events、lane、queue、merges 与 candidates 快照（供 TUI 与工具使用） |
 | `note [<run> ["<文字>"\|--done [<序号>\|--all]]] [--all] [--json]` | `work.jsonl` 薄壳：追加、查看或完成 run/续做链待办，自动迁入旧 `notes.json`，`clean` 后保留 |
 | `handoff [--out <路径>]` | 生成未清理未合入任务与待办的一页交接索引（默认 `.local/run/delegate/HANDOFF.md`），含净改动、新增 `TODO(master)`、迁移文件与重叠文件 |
 | `history [关键词…] [--since <时长>] [--state <状态>] [--limit N] [--json]` | 查本仓库永久追加索引 `history.jsonl`（老的在上新的在下，每条一行指向 `show`）；关键词匹配名字、提示词与结论，中文支持单字加二元组 |
@@ -26,7 +27,7 @@
 | `board [--path]` | 刷新并打印本工作区的自动委派看板（默认放在 history 目录旁 `BOARD.md`，可用仓库 `.delegate.json` 的 `board` 配置路径）；每次状态变化自动原子重写，顶行含整机在途与各节计数，写失败只记诊断不阻断委派 |
 | `result [<run>] [--path]` | 输出完整答复 |
 | `stop <run>...` | 终止任务及其 scope、进程组 |
-| `clean <run>...\|--finished [--force]` | 删除已结束的任务；`--finished` 默认保留结果未读取的 |
+| `clean <run>...\|--finished [--force] [--sync]` | 删除已结束的任务（默认原子移入 trash 并由后台 `_gc-worker` 异步回收，加 `--sync` 同步回收；清理前自动检测是否已合入 HEAD 以解锁 `run_applied` 下游）；`--finished` 默认保留结果未读取的 |
 | `lane [--label <文字>] [--measure] [--] <命令>` | 在整机重任务队列里执行命令；`--measure` 使用测量预约核并串行排队（一个参数按 shell 命令执行），退出码原样返回；不带命令时列出正在跑与排队的项 |
 
 启动选项：`--tier scout|review|write`（用途，不写时只读推断 review、写入推断 write，明确提醒并标记；scout/review 自动只读；三档须配齐）、`--image <路径>`（可重复）、`--accept <命令>` / `--no-accept`（覆盖或关闭仓库默认验收）、`--hide-accept`、`--accept-timeout`（可选；默认 `.delegate.json` 的 `acceptTimeout`，未设不限时；无输出仅发 `stall_warning`；`reply` 继承）、`--read-only`、`--shell`（仅 git 快照内只读调查，写文件拒收）、`--in-place`（只读读实时工作区；写入覆盖 worktree 默认并原地写入）、`--workdir`、`--timeout`（每次尝试，可选；没有默认值）、`--retries`（答复畸形时重跑次数，默认 1）、`--model <别名或已登记完整名>`（可与 --tier 同用，只在 models 别名表内精确/唯一子串匹配，固定模型不自动换）、`--thinking off|minimal|low|medium|high|xhigh`（独立长度，模型名不带后缀；reply 也可换模型、档位或长度）、`--allow-parallel-writes`、`--worktree`、`--in <run>`（只读，在已完成任务 worktree 的快照里审它的改动）、`--protect <路径>`（可重复；末尾 `/` 为目录；被改动即判 `rejected` 并带 `protectViolation`，不跑验收；reply 沿用；正文出现未放开的保护路径时启动回显与 status/wait 均提示补 `--allow`，不拦截）。`--name` 省略时取说明首分句生成最多 24 字的可读名称，唯一 ID 规则不变；reply 轮次命名不变。`<run>` 可以是完整 id、唯一片段、`last` 或 run 目录。

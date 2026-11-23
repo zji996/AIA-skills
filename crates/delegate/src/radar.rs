@@ -781,7 +781,7 @@ fn save_board_doc(radar_dir: &Path, board: &Value) -> Res<PathBuf> {
     Ok(board_md_path)
 }
 
-fn load_all_candidates(repo_filter: Option<&Path>) -> Vec<Value> {
+pub fn load_all_candidates(repo_filter: Option<&Path>) -> Vec<Value> {
     let root = radar_root();
     let Ok(entries) = fs::read_dir(&root) else {
         return Vec::new();

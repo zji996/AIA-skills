@@ -570,23 +570,7 @@ fn write_atomic_to(lock_dir: &Path, board_path: &Path, content: &str) -> Res<()>
     if let Some(parent) = board_path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let file_name = board_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let tmp = board_path.with_file_name(format!(
-        ".{file_name}.tmp.{}.{}",
-        std::process::id(),
-        now_ns()
-    ));
-    if let Err(err) = write(&tmp, content) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
-    }
-    if let Err(err) = fs::rename(&tmp, board_path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err.to_string());
-    }
+    atomic_write(board_path, content)?;
     Ok(())
 }
 

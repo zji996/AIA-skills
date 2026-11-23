@@ -695,6 +695,70 @@ pub fn reconcile_pool(target_tokens: usize, budget: usize) -> PoolStatus {
     reconcile_pool_in(&state_dir(), target_tokens, budget)
 }
 
+/// Pure read-only snapshot of jobserver pool status (zero locks, zero file creation/deletion).
+pub fn inspect_pool_readonly(target_tokens: usize, budget: usize) -> PoolStatus {
+    let base = state_dir();
+    let fifo = fifo_path(&base);
+    let mut alive = Vec::new();
+    if let Ok(entries) = fs::read_dir(leases_dir(&base)) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("lease") {
+                continue;
+            }
+            let v = json(&path);
+            let pid = v["pid"].as_u64().unwrap_or(0) as u32;
+            if pid == 0 || !crate::common::pid_alive(pid as i32) {
+                continue;
+            }
+            let id = v["id"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    path.file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                });
+            let run_started_ns = v["runStartedNs"].as_u64().unwrap_or(0);
+            let label = v["label"].as_str().unwrap_or("").to_string();
+            let borrowed = v["borrowed"].as_u64().unwrap_or(0) as usize;
+            let staged = v["staged"].as_u64().unwrap_or(0) as usize;
+            let held = v["held"].as_u64().unwrap_or(0) as usize;
+            let wanting = v["wanting"].as_bool().unwrap_or(false);
+            let explicit_cap = v["explicitCap"]
+                .as_u64()
+                .filter(|&n| n >= 1)
+                .map(|n| n as usize);
+            alive.push(LeaseView {
+                id,
+                pid,
+                run_started_ns,
+                label,
+                borrowed,
+                staged,
+                held,
+                wanting,
+                explicit_cap,
+                share: 0,
+                rank: 0,
+            });
+        }
+    }
+    assign_ranks_and_shares(&mut alive, budget);
+    let borrowed: usize = alive.iter().map(|l| l.borrowed).sum();
+    let free = target_tokens.saturating_sub(borrowed);
+    PoolStatus {
+        fifo,
+        target: target_tokens,
+        total: target_tokens,
+        free,
+        borrowed,
+        recovered: 0,
+        leases: alive,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn format_lease_json(
     id: &str,

@@ -460,12 +460,23 @@ pub fn backfill_all() {
             }
         }
         update_refs(&git_dir, &batch);
-        for (run, _, _, finished) in group {
+        for (run, _, slots, finished) in group {
+            let missing: Vec<Value> = slots
+                .iter()
+                .filter(|(_, oid)| !present.contains(oid))
+                .map(|(slot, oid)| serde_json::json!({"ref": slot, "sha": oid}))
+                .collect();
+            if !missing.is_empty() {
+                let _ = write_json(run.join("missing-objects.json"), &serde_json::json!(missing));
+            } else {
+                let _ = std::fs::remove_file(run.join("missing-objects.json"));
+            }
             write_marker(&run, finished);
         }
     }
 }
 
+#[allow(dead_code)]
 pub fn backfill_one(run: &Path) {
     if !needs_backfill(run) {
         return;

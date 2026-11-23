@@ -134,7 +134,9 @@ class Delegate6221Tests(unittest.TestCase):
         self.git(repo, "prune", "--expire=now")
         self.git(repo, "update-ref", "-d", "refs/temp/hold-ok")
 
-        # First 6.22.1 command (`status`) backfills refs for existing objects on legacy runs.
+        # 6.32.0: read-only `status` has zero side effects; backfill runs via maintenance/write path (`events --rebuild` or `_gc-worker`).
+        rebuilt = self.cli("events", "--rebuild", "--json")
+        self.assertEqual(rebuilt.returncode, 0, rebuilt.stderr)
         status_human = self.cli("status", human=True)
         self.assertEqual(status_human.returncode, 0, status_human.stderr)
 

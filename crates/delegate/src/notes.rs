@@ -385,7 +385,7 @@ pub fn register_repo() {
         .or_else(|| {
             std::env::current_dir()
                 .ok()
-                .and_then(|cwd| git_top(&cwd).or(Some(cwd)))
+                .and_then(|cwd| git_top_fast(&cwd).or(Some(cwd)))
         })
         .unwrap_or_else(|| runs_dir.clone());
     register_repo_paths(&state_dir(), &repo_dir, &runs_dir);
@@ -410,13 +410,7 @@ pub fn register_repo_paths(state: &Path, repo_dir: &Path, runs_dir: &Path) {
         return;
     }
     let _ = fs::create_dir_all(state);
-    let Ok(_guard) = crate::locks::try_acquire_with_retry(
-        crate::locks::LockKind::Repos,
-        &state.join(".repos.lock"),
-        true,
-        3,
-        std::time::Duration::from_millis(15),
-    ) else {
+    let Ok(_guard) = crate::locks::acquire_state(state) else {
         return;
     };
     let mut doc = json(&path);
@@ -474,12 +468,15 @@ pub fn pending_count_for_run(run: &Path) -> usize {
 /// Return chains stored in `work.jsonl` that still have pending notes and have no
 /// remaining run directory in `all`.
 pub fn cleaned_pending_chains(all: &[PathBuf]) -> Vec<ChainNotes> {
+    if !crate::work::any_notes_exist() {
+        return Vec::new();
+    }
     let live_ids: BTreeSet<String> = all
         .iter()
         .map(|p| run_id(p, &json(p.join("meta.json"))))
         .filter(|id| !id.is_empty())
         .collect();
-    load()
+    crate::work::note_chains_for_current_root(all)
         .into_iter()
         .filter(|c| {
             c.pending_count() > 0

@@ -1,5 +1,4 @@
 use crate::agents::{self, agent_identity, missing_tools, nesting_error, session_file};
-use crate::changes::snapshot;
 use crate::common::*;
 use crate::runs::{self, active, agent_alive, all_runs, state};
 use crate::{models, worktree};
@@ -890,7 +889,7 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     if o.in_place && o.worktree {
         return Err("--in-place and --worktree contradict each other".into());
     }
-    let repo = git_top(&workdir);
+    let repo = git_top_fast(&workdir);
     if o.shell && (repo.is_none() || o.in_place) {
         return Err("--shell requires a git worktree snapshot (not --in-place)".into());
     }
@@ -1413,9 +1412,16 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     } else {
         None
     };
-    let synced = match sync_mode {
-        Some(mode) => Some((mode, worktree::sync_with_mode(&parent, &meta, mode)?)),
-        None => None,
+    // Explicit `--sync` (`Strict`) and `--sync=agent` (`Agent`) run synchronously in foreground
+    // because callers rely on immediate conflict / non-text conflict rejection; default `Auto`
+    // sync moves to `_supervise` so interactive `reply` returns in <50ms.
+    let (synced, deferred_sync_mode) = match sync_mode {
+        Some(mode @ (worktree::SyncMode::Strict | worktree::SyncMode::Agent)) => (
+            Some((mode, worktree::sync_with_mode(&parent, &meta, mode)?)),
+            None,
+        ),
+        Some(worktree::SyncMode::Auto) => (None, Some(worktree::SyncMode::Auto)),
+        None => (None, None),
     };
     let mut prompt = prompt;
     if let Some((mode, report)) = &synced {
@@ -1523,6 +1529,16 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     };
     let mut extra =
         json!({"parent":meta,"session":session,"env":meta["env"],"worktree":meta["worktree"]});
+    if let Some(dmode) = deferred_sync_mode {
+        extra["pendingSync"] = json!({
+            "mode": match dmode {
+                worktree::SyncMode::Auto => "auto",
+                worktree::SyncMode::Agent => "agent",
+                worktree::SyncMode::Strict => "strict",
+            },
+            "parentDir": parent.to_string_lossy(),
+        });
+    }
     extra["denyAcceptConflicts"] = json!(deny_accept_conflicts);
     if after_apply {
         extra["newAfterApply"] = json!(true);
@@ -1734,13 +1750,7 @@ pub fn machine_runs(slots: &Path) -> Vec<PathBuf> {
         .collect()
 }
 pub fn repo_key(path: &Path) -> String {
-    let common = git_text(
-        path,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .ok()
-    .map(PathBuf::from)
-    .unwrap_or_else(|| path.to_path_buf());
+    let common = git_common_dir_fast(path).unwrap_or_else(|| path.to_path_buf());
     fs::canonicalize(&common)
         .or_else(|_| std::path::absolute(&common))
         .unwrap_or(common)
@@ -1987,38 +1997,10 @@ pub fn launch(
         None
     };
 
-    struct StartLockTimer(Option<std::time::Instant>);
-    impl Drop for StartLockTimer {
-        fn drop(&mut self) {
-            if let Some(t) = self.0 {
-                eprintln!(
-                    "START_LOCK_HOLD_MS={:.3}",
-                    t.elapsed().as_secs_f64() * 1000.0
-                );
-            }
-        }
-    }
-
-    // Critical section: ONLY capacity/admission checks + run directory & slot registration.
-    // All slow operations (pool claim, git snapshot, source-watch baseline, work table update,
-    // git ref pinning, events, supervisor startup) run AFTER releasing `.start.lock`.
+    // Critical section: ONLY capacity/admission checks + run directory & slot registration
+    // under the single short-lived `<state>/.state.lock` (<5ms, zero git/subprocess/sleep).
     let (run, slot_file, deferred, reason, queued_ns, model_cap, started_at, started_epoch, started_ns, queued_at, q_ahead) = {
-        let _machine = crate::locks::acquire(
-            crate::locks::LockKind::StartMachine,
-            &slots.join(".start.lock"),
-            true,
-        )
-        .map_err(|e| e.to_string())?;
-        let _start_lock_timer = StartLockTimer(
-            (std::env::var("DELEGATE_MEASURE_START_LOCK").as_deref() == Ok("1"))
-                .then(std::time::Instant::now),
-        );
-        let _local = crate::locks::acquire(
-            crate::locks::LockKind::StartRepo,
-            &root.join(".start.lock"),
-            true,
-        )
-        .map_err(|e| e.to_string())?;
+        let _state_lock = crate::locks::acquire_state(&slots).map_err(|e| e.to_string())?;
 
         let active_runs = active_machine(&slots);
         capacity(&active_runs, &extra["configCapacity"], &repo)?;
@@ -2230,23 +2212,6 @@ pub fn launch(
     if extra["protectGenerated"].is_object() {
         actual.push_str(&format!("\n\n生成物保护例外 / Generated protection exception: {} 只允许通过生成命令改动 / may only be changed by the generator: `{}`. You may run this command; completion reruns it and rejects manually edited generated output. This exception overrides the protected-path restriction only for these generated paths.\n", extra["protectGenerated"]["paths"], s(&extra["protectGenerated"], "command")));
     }
-    if mode != "read-only" && extra["worktree"].is_object() {
-        let taken = crate::worktree::numbers_taken(
-            Path::new(s(&extra["worktree"], "source")),
-            Path::new(s(&extra["worktree"], "path")),
-        );
-        if !taken.is_empty() {
-            let list = taken
-                .iter()
-                .map(|(directory, prefix, owner)| format!("{directory} {prefix} ({owner})"))
-                .collect::<Vec<_>>()
-                .join("、");
-            actual.push_str(&format!(
-                "\n\n未提交的编号文件已占用这些编号，你的工作区里看不到；在同目录新增编号文件时用更大的编号 / Numbered files not yet committed hold these numbers and are not in your worktree; number new files in those directories above them: {list}\n"
-            ));
-            eprintln!("delegate: 已占用编号 {list}");
-        }
-    }
     if let Some(limit) = o.max_answer {
         actual.push_str(&format!(
             "\n\n答复不超过 {limit} 字 / Answer in no more than {limit} characters.\n"
@@ -2354,6 +2319,7 @@ pub fn launch(
         },
     )?;
     let mut fork_value = fork.map(str::to_string);
+    let mut pending_fork = Value::Null;
     if let (true, Some(fork_id), true) = (
         parent.is_object(),
         fork,
@@ -2364,21 +2330,13 @@ pub fn launch(
     } else if let (true, Some(fork_id)) = (parent.is_object(), fork) {
         let source = session_file(s(parent, "sessionDir"), fork_id)
             .ok_or_else(|| "missing parent session".to_string())?;
-        fs::create_dir(run.join("fork")).map_err(|e| e.to_string())?;
         let target = run
             .join("fork")
             .join(source.file_name().unwrap_or_default());
-        fs::copy(&source, &target).map_err(|e| e.to_string())?;
-        // rpi keeps a progress companion beside the session and refuses to open a
-        // session without it, so the copy carries it along.
-        let beside = |path: &Path| {
-            let mut name = path.as_os_str().to_owned();
-            name.push(".progress.jsonl");
-            PathBuf::from(name)
-        };
-        if beside(&source).is_file() {
-            fs::copy(beside(&source), beside(&target)).map_err(|e| e.to_string())?;
-        }
+        pending_fork = json!({
+            "source": source,
+            "target": target,
+        });
         fork_value = Some(target.to_string_lossy().into());
     }
     let mut tree = extra["worktree"].clone();
@@ -2394,17 +2352,17 @@ pub fn launch(
             rollback.claimed_slot = Some(p);
         }
     }
+    let new_tree =
+        tree.is_object() && (claimed_slot || !Path::new(s(&tree, "path")).exists());
     let top = if tree.is_object() {
         let p = PathBuf::from(s(&tree, "path"));
-        // Only a newly claimed pool slot holds an earlier unrelated task's files: snapshot the source.
-        // A reply continuing in the same pool slot must snapshot the worktree itself.
-        if p.exists() && !claimed_slot {
-            Some(p)
+        if !p.as_os_str().is_empty() {
+            p
         } else {
-            Some(PathBuf::from(s(&tree, "source")))
+            PathBuf::from(s(&tree, "source"))
         }
     } else {
-        git_top(&wd)
+        git_top_fast(&wd).unwrap_or_default()
     };
     let mut exclude = vec![];
     if tree.is_object() {
@@ -2422,30 +2380,6 @@ pub fn launch(
             }
         }
     }
-    let mut base = if tree["in"].is_string() {
-        None
-    } else {
-        top.as_deref().and_then(|p| snapshot(p, &run, &exclude))
-    };
-    if tree.is_object() && tree["in"].is_null() && base.is_none() {
-        return Err(format!(
-            "cannot snapshot {} for the worktree",
-            s(&tree, "source")
-        ));
-    }
-    let new_tree =
-        tree.is_object() && (claimed_slot || !Path::new(s(&tree, "path")).exists());
-    if new_tree {
-        if let Some(v) = &mut base {
-            v["large"] = json!({});
-            v["submodules"] = json!({});
-        }
-    }
-    let top = if new_tree {
-        PathBuf::from(s(&tree, "path"))
-    } else {
-        top.unwrap_or_default()
-    };
     let applied_base = if parent.is_object() && !b(extra, "newAfterApply") {
         let parent_dir = Path::new(s(parent, "dir"));
         let synced = json(parent_dir.join(".sync-base"));
@@ -2467,11 +2401,18 @@ pub fn launch(
     } else if !b(extra, "newAfterApply") && !s(parent, "chainBase").is_empty() {
         s(parent, "chainBase").to_string()
     } else {
-        base.as_ref()
-            .map(|x| s(x, "tree").to_string())
-            .unwrap_or_default()
+        String::new()
     };
-    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":crate::agy::colleague(o.model.as_deref().unwrap_or("")),"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":timeout_seconds,"accept":o.accept,"acceptTimeoutSeconds":accept_timeout_seconds,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":base,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":chain_base,"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"parallel":o.parallel,"startedAt":started_at,"startedEpoch":started_epoch,"startedNs":started_ns});
+    let mut meta = json!({"run":run.file_name().unwrap_or_default().to_string_lossy(),"dir":run,"workdir":wd,"mode":mode,"agent":crate::agy::colleague(o.model.as_deref().unwrap_or("")),"tier":o.tier,"name":o.name.clone().unwrap_or_else(||if parent.is_object(){format!("reply to {}",s(parent,"name"))}else{name}),"caller":caller(),"callerSource":caller_source().map(|(_, source)| source),"provider":o.provider,"model":o.model,"thinking":o.thinking,"timeout":o.timeout,"timeoutSeconds":timeout_seconds,"accept":o.accept,"acceptTimeoutSeconds":accept_timeout_seconds,"retries":o.retries,"images":o.images,"protect":o.protect,"top":if top.as_os_str().is_empty(){Value::Null}else{json!(top)},"base":Value::Null,"snapshotExclude":exclude,"worktree":tree,"env":extra.get("env").cloned().unwrap_or(json!({})),"chainBase":chain_base,"appliedBase":applied_base,"sessionDir":run.join("session"),"parent":if parent.is_object(){parent["run"].clone()}else{Value::Null},"fork":fork_value,"parallel":o.parallel,"startedAt":started_at,"startedEpoch":started_epoch,"startedNs":started_ns,"phase":"preparing","pendingPrepare":true,"newTree":new_tree});
+    if pending_fork.is_object() {
+        meta["pendingFork"] = pending_fork;
+    }
+    if extra["pendingSync"].is_object() {
+        meta["pendingSync"] = extra["pendingSync"].clone();
+    }
+    if b(extra, "newAfterApply") {
+        meta["newAfterApply"] = json!(true);
+    }
     // A forked session continues on the executable that wrote it: Pi and rpi
     // keep different session formats.
     let parent_bin = s(parent, "agentBin");
@@ -2508,7 +2449,6 @@ pub fn launch(
     meta["shell"] = json!(o.shell);
     if meta["worktree"].is_object() {
         let source = PathBuf::from(s(&meta["worktree"], "source"));
-        meta["sourceStatusBaseline"] = crate::source_watch::baseline(&source)?;
         if !s(&extra["syncedBase"], "head").is_empty() {
             meta["netBase"] = extra["syncedBase"]["head"].clone();
         } else if !b(extra, "newAfterApply") && parent.is_object() && !s(parent, "netBase").is_empty() {
@@ -2519,10 +2459,8 @@ pub fn launch(
                     meta["netBaseTree"] = parent["netBaseTree"].clone();
                 }
             }
-        } else if let Ok(head) = git_text(&source, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]) {
-            if !head.is_empty() {
-                meta["netBase"] = json!(head);
-            }
+        } else if let Some(head) = read_git_head(&source) {
+            meta["netBase"] = json!(head);
         }
     }
     meta["agentBin"] = json!(agent_bin);
@@ -2590,47 +2528,71 @@ pub fn launch(
     }
     meta["userPromptLen"] = json!(prompt.len());
     write_json(run.join("meta.json"), &meta)?;
-    if let Some(wid) = &o.work {
-        crate::work::on_run_started(wid, &run, &meta);
-    }
     if !s(&extra["syncedBase"], "commit").is_empty() {
         let commit = s(&extra["syncedBase"], "commit");
         write(run.join("worktree-base-commit"), commit)?;
-        crate::refs::pin_slot(&run, &meta, "worktree-base", commit);
     }
-    crate::notes::register_repo();
-    crate::refs::pin_run(&run, &meta);
     if !extra["sync"].is_null() {
         write_json(run.join("sync.json"), &extra["sync"])?;
     }
-    if deferred {
-        let q_reason = reason.as_deref().unwrap_or("总路数");
-        crate::events::emit(
-            &crate::events::run_id_for(&run, &meta),
+    // Single short-lived `.state.lock` commit for work table, repo registry, event, and index (<3ms).
+    {
+        let _state_lock = crate::locks::acquire_state(&slots).map_err(|e| e.to_string())?;
+        if let Some(wid) = &o.work {
+            crate::work::on_run_started(wid, &run, &meta);
+        }
+        crate::notes::register_repo();
+        if deferred {
+            let q_reason = reason.as_deref().unwrap_or("总路数");
+            crate::events::emit(
+                &crate::events::run_id_for(&run, &meta),
+                &crate::events::repo_for_meta(&meta),
+                "queued",
+                json!({
+                    "scope": "capacity",
+                    "name": s(&meta, "name"),
+                    "reason": q_reason,
+                    "ahead": q_ahead,
+                }),
+            );
+        } else {
+            crate::events::emit(
+                &crate::events::run_id_for(&run, &meta),
+                &crate::events::repo_for_meta(&meta),
+                "started",
+                json!({
+                    "name": s(&meta, "name"),
+                    "mode": s(&meta, "mode"),
+                    "tier": meta["tier"],
+                    "model": meta["model"],
+                    "parent": meta["parent"],
+                }),
+            );
+        }
+        let initial_state = if deferred { "waiting" } else { "starting" };
+        let initial_status = json!({
+            "run": meta["run"],
+            "name": meta["name"],
+            "state": initial_state,
+            "agent": meta["agent"],
+            "mode": meta["mode"],
+            "dir": run.to_string_lossy(),
+        });
+        crate::index::upsert_run_locked(
+            &slots,
+            &run,
             &crate::events::repo_for_meta(&meta),
-            "queued",
-            json!({
-                "scope": "capacity",
-                "name": s(&meta, "name"),
-                "reason": q_reason,
-                "ahead": q_ahead,
-            }),
-        );
-    } else {
-        crate::events::emit(
-            &crate::events::run_id_for(&run, &meta),
-            &crate::events::repo_for_meta(&meta),
-            "started",
-            json!({
-                "name": s(&meta, "name"),
-                "mode": s(&meta, "mode"),
-                "tier": meta["tier"],
-                "model": meta["model"],
-                "parent": meta["parent"],
-            }),
+            initial_status,
         );
     }
-    runs::prune();
+    let explicit_startup_timeout = if cfg!(debug_assertions) {
+        std::env::var("DELEGATE_TEST_STARTUP_TIMEOUT")
+            .ok()
+            .and_then(|value| seconds(&value).ok())
+    } else {
+        None
+    };
+    touch(run.join("events.jsonl"));
     let log = File::create(run.join("supervisor.log")).map_err(|e| e.to_string())?;
     let mut c = Command::new(script());
     c.arg("_supervise")
@@ -2652,36 +2614,35 @@ pub fn launch(
             return Err(error.to_string());
         }
     };
-    let startup_timeout = if cfg!(debug_assertions) {
-        std::env::var("DELEGATE_TEST_STARTUP_TIMEOUT")
-            .ok()
-            .and_then(|value| seconds(&value).ok())
-            .unwrap_or(5.0)
-    } else {
-        5.0
-    };
-    let deadline = std::time::Instant::now() + Duration::from_secs_f64(startup_timeout);
-    while std::time::Instant::now() < deadline {
-        if run.join("pid").is_file() {
-            rollback.armed = false;
-            drop(rollback);
-            crate::board::refresh_for_run(&run);
-            return Ok(run);
+    if let Some(startup_timeout) = explicit_startup_timeout {
+        let deadline = std::time::Instant::now() + Duration::from_secs_f64(startup_timeout);
+        while std::time::Instant::now() < deadline {
+            if run.join("pid").is_file() {
+                rollback.armed = false;
+                drop(rollback);
+                return Ok(run);
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        rollback.armed = false;
+        end_group(child.id() as i32, 2.0);
+        child.wait().map_err(|e| e.to_string())?;
+        finish_run(
+            &run,
+            json!({"state":"crashed","error":"supervisor did not start"}),
+            1,
+        )?;
+        return Err(format!(
+            "supervisor did not start; see {}",
+            run.join("supervisor.log").display()
+        ));
     }
+    // Write `pid` immediately so `status`, `stop`, and `wait` know the supervisor PID right away
+    // without blocking `start`/`reply` on a polling loop (<50ms return).
+    let _ = write(run.join("pid"), format!("{}\n", child.id()));
     rollback.armed = false;
-    end_group(child.id() as i32, 2.0);
-    child.wait().map_err(|e| e.to_string())?;
-    finish_run(
-        &run,
-        json!({"state":"crashed","error":"supervisor did not start"}),
-        1,
-    )?;
-    Err(format!(
-        "supervisor did not start; see {}",
-        run.join("supervisor.log").display()
-    ))
+    drop(rollback);
+    Ok(run)
 }
 
 #[cfg(test)]

@@ -118,6 +118,8 @@ class Delegate618Tests(unittest.TestCase):
         log.write_text("")
         self.cli("status", state["run"])
         self.cli("wait", state["run"], "--no-result")
+        self.cli("diff", state["run"])
+        self.cli("apply", "--dry-run", state["run"])
         source_calls = [line for line in log.read_text().splitlines() if str(repo) in line]
         self.assertTrue(source_calls)
         self.assertTrue(all(line.startswith("0 ") for line in source_calls), source_calls)

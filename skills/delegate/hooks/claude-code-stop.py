@@ -90,6 +90,15 @@ def cache_dir() -> Path:
 def git_toplevel(path: str) -> Path | None:
     if not path or not os.path.isdir(path):
         return None
+    # Pure-filesystem lookup first (zero subprocesses, <0.1ms).
+    try:
+        cur = Path(path).resolve()
+    except OSError:
+        cur = Path(path)
+    if ".git" not in cur.parts:
+        for candidate in (cur, *cur.parents):
+            if (candidate / ".git").exists():
+                return candidate
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
     try:
         res = subprocess.run(
@@ -237,7 +246,72 @@ def discover_repos(cwd: str) -> list[tuple[Path | None, Path, str, bool]]:
     return result
 
 
-def fetch_status(delegate_bin: str, repo_root: Path | None, runs_dir: Path) -> list[dict]:
+def load_index_runs() -> dict[str, dict]:
+    """Lock-free read of `<state>/index.json` runs map (zero subprocesses)."""
+    idx_file = state_dir() / "index.json"
+    if not idx_file.is_file():
+        return {}
+    try:
+        doc = json.loads(idx_file.read_text(encoding="utf-8"))
+        runs_map = doc.get("runs") if isinstance(doc, dict) else None
+        return runs_map if isinstance(runs_map, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def fetch_status_from_index(runs_dir: Path, index_runs: dict[str, dict]) -> list[dict] | None:
+    """Try reading all runs under `runs_dir` directly from `index.json` (lock-free, zero forks).
+    Returns `None` to trigger fallback if any run directory is missing from the index or stale."""
+    if not index_runs or not runs_dir.is_dir():
+        return None
+    try:
+        actual_dirs = [
+            p.resolve() for p in runs_dir.iterdir() if p.is_dir() and (p / "meta.json").is_file()
+        ]
+    except OSError:
+        return None
+    if not actual_dirs:
+        return []
+    out: list[dict] = []
+    for rdir in actual_dirs:
+        entry = index_runs.get(str(rdir))
+        if not isinstance(entry, dict) or not isinstance(entry.get("status"), dict):
+            return None
+        st_obj = entry["status"]
+        st = str(st_obj.get("state") or "")
+        # If the run was active in the index, check if it has since exited or been applied.
+        if st in ("running", "starting", "waiting", "queued"):
+            if (rdir / "exit_code").is_file():
+                return None
+            # Verify supervisor is still alive; if crashed, fall back to full status.
+            pid_file = rdir / "pid"
+            if pid_file.is_file():
+                try:
+                    pid = int(pid_file.read_text(encoding="utf-8").strip())
+                    os.kill(pid, 0)
+                except (OSError, ValueError):
+                    return None
+        else:
+            # Verify `.applied` wasn't added directly on disk after index write.
+            if (rdir / ".applied").exists() and not (rdir / ".generate-pending").exists():
+                if st_obj.get("applied") is not True:
+                    return None
+        out.append(st_obj)
+    return out
+
+
+def fetch_status(
+    delegate_bin: str | None,
+    repo_root: Path | None,
+    runs_dir: Path,
+    index_runs: dict[str, dict] | None = None,
+) -> list[dict]:
+    if index_runs:
+        fast = fetch_status_from_index(runs_dir, index_runs)
+        if fast is not None:
+            return fast
+    if not delegate_bin:
+        return []
     env = {**os.environ, "DELEGATE_RUNS": str(runs_dir)}
     cwd = str(repo_root) if repo_root and repo_root.is_dir() else None
     try:
@@ -371,14 +445,7 @@ def tidy_and_check_deferred(
         else:
             fresh.add(run_id)
 
-    new_content = ("\n".join(kept_lines) + "\n") if kept_lines else ""
-    if new_content != original:
-        try:
-            tmp = deferred_path.with_suffix(".tsv.tmp")
-            tmp.write_text(new_content, encoding="utf-8")
-            os.replace(tmp, deferred_path)
-        except OSError:
-            pass
+    # Strictly read-only: never rewrite deferred.tsv from the Stop hook.
     return fresh, stale
 
 
@@ -508,8 +575,9 @@ def evaluate(payload: dict) -> dict | None:
     if unread_reason:
         reasons.append(unread_reason)
 
+    index_runs = load_index_runs()
     delegate_bin = find_delegate_bin()
-    if not delegate_bin:
+    if not delegate_bin and not index_runs:
         return {"decision": "block", "reason": "\n".join(reasons)} if reasons else None
 
     try:
@@ -530,7 +598,7 @@ def evaluate(payload: dict) -> dict | None:
     work_fresh_def, work_expired_def = work_deferred_runs(now)
 
     for repo_root, runs_dir, label, is_current in repos:
-        items = fetch_status(delegate_bin, repo_root, runs_dir)
+        items = fetch_status(delegate_bin, repo_root, runs_dir, index_runs)
         if not items:
             tidy_and_check_deferred(repo_root, set(), now, defer_hours)
             continue

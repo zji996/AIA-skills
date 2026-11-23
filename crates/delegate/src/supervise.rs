@@ -921,6 +921,289 @@ fn escalate(
     write_json(run.join("meta.json"), meta)?;
     Ok(true)
 }
+fn append_prepare_notice(run: &Path, line: &str) {
+    let _ = append(run.join("prepare-notices.txt"), &format!("{line}\n"));
+}
+
+fn prepare_run_in_supervisor(run: &Path, meta: &mut Value) -> Res<()> {
+    // 1. Deferred fork session copy (moved out of foreground `reply`).
+    if meta["pendingFork"].is_object() {
+        let source = PathBuf::from(s(&meta["pendingFork"], "source"));
+        let target = PathBuf::from(s(&meta["pendingFork"], "target"));
+        if !source.is_file() {
+            return Err("missing parent session".into());
+        }
+        if let Some(dir) = target.parent() {
+            fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        fs::copy(&source, &target).map_err(|e| e.to_string())?;
+        let beside = |path: &Path| {
+            let mut name = path.as_os_str().to_owned();
+            name.push(".progress.jsonl");
+            PathBuf::from(name)
+        };
+        if beside(&source).is_file() {
+            fs::copy(beside(&source), beside(&target)).map_err(|e| e.to_string())?;
+        }
+        if let Some(obj) = meta.as_object_mut() {
+            obj.remove("pendingFork");
+        }
+    }
+
+    // 2. Deferred `reply` Auto / Agent baseline sync (moved out of foreground `reply`).
+    if meta["pendingSync"].is_object() {
+        let mode_str = s(&meta["pendingSync"], "mode").to_string();
+        let parent_dir = PathBuf::from(s(&meta["pendingSync"], "parentDir"));
+        let mode = match mode_str.as_str() {
+            "agent" => worktree::SyncMode::Agent,
+            "strict" => worktree::SyncMode::Strict,
+            _ => worktree::SyncMode::Auto,
+        };
+        let parent_meta = json(parent_dir.join("meta.json"));
+        let report = worktree::sync_with_mode(&parent_dir, &parent_meta, mode)?;
+        let prompt_path = run.join("prompt.md");
+        let mut prompt_text = read(&prompt_path);
+        let is_zh = prompt_text
+            .chars()
+            .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+        let short_head = if !report.source_dirty && !report.base_head.is_empty() {
+            Some(&report.base_head[..report.base_head.len().min(7)])
+        } else {
+            None
+        };
+        if report.synced {
+            let notice = if let Some(short) = short_head {
+                format!(
+                    "delegate: 基线已同步到主干 {short}（同步 {} 个文件）",
+                    report.paths.len()
+                )
+            } else {
+                format!(
+                    "delegate: 基线已同步到当前源快照（同步 {} 个文件）",
+                    report.paths.len()
+                )
+            };
+            append_prepare_notice(run, &notice);
+            if mode == worktree::SyncMode::Auto {
+                let fact = match (is_zh, short_head) {
+                    (true, Some(short)) => format!(
+                        "基线已同步到主干 {short}（同步 {} 个文件）。",
+                        report.paths.len()
+                    ),
+                    (true, None) => format!(
+                        "基线已同步到当前源快照（同步 {} 个文件）。",
+                        report.paths.len()
+                    ),
+                    (false, Some(short)) => format!(
+                        "Baseline synced to main {short} ({} file(s) updated).",
+                        report.paths.len()
+                    ),
+                    (false, None) => format!(
+                        "Baseline synced to current source snapshot ({} file(s) updated).",
+                        report.paths.len()
+                    ),
+                };
+                prompt_text = format!("{}\n\n{fact}\n", prompt_text.trim_end());
+            } else if is_zh {
+                let base_note = short_head
+                    .map(|short| format!("；基线已同步到主干 {short}"))
+                    .unwrap_or_default();
+                prompt_text = format!(
+                    "{}\n\n主控在上一轮之后的改动已同步进工作目录：{}{base_note}\n",
+                    prompt_text.trim_end(),
+                    if report.paths.is_empty() {
+                        "（无）".to_string()
+                    } else {
+                        report.paths.join("、")
+                    }
+                );
+            } else {
+                let base_note = short_head
+                    .map(|short| format!(" (baseline synced to main {short})"))
+                    .unwrap_or_default();
+                prompt_text = format!(
+                    "{}\n\nThe caller's changes since the previous round have been synced into the workdir: {}{base_note}\n",
+                    prompt_text.trim_end(),
+                    if report.paths.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        report.paths.join(", ")
+                    }
+                );
+            }
+            if !report.conflicts.is_empty() {
+                prompt_text = format!(
+                    "Resolve these sync conflicts FIRST before any other work: {}. Remove all conflict markers; acceptance fails while any remain.\n\n{}",
+                    report.conflicts.join(", "),
+                    prompt_text
+                );
+            }
+            write(&prompt_path, &prompt_text)?;
+
+            let sync_doc = json!({
+                "paths": report.paths,
+                "conflicts": report.conflicts,
+                "mode": mode_str,
+                "baseHead": report.base_head,
+            });
+            write_json(run.join("sync.json"), &sync_doc)?;
+            if !report.base_tree.is_empty() {
+                meta["chainBase"] = json!(report.base_tree);
+            }
+            if !report.base_head.is_empty() {
+                meta["netBase"] = json!(report.base_head);
+            }
+            if let Some(commit) = &report.base_commit {
+                if !commit.is_empty() {
+                    write(run.join("worktree-base-commit"), commit)?;
+                    crate::refs::pin_slot(run, meta, "worktree-base", commit);
+                }
+            }
+            let synced_base = json(parent_dir.join(".sync-base"));
+            if !s(&synced_base, "tree").is_empty() {
+                meta["appliedBase"] = synced_base;
+            }
+            let refreshed_parent = json(parent_dir.join("meta.json"));
+            if b(&refreshed_parent, "netBaseRebased") {
+                meta["netBaseRebased"] = json!(true);
+                if !s(&refreshed_parent, "netBaseTree").is_empty() {
+                    meta["netBaseTree"] = refreshed_parent["netBaseTree"].clone();
+                }
+            }
+        } else if mode == worktree::SyncMode::Auto && !report.conflicts.is_empty() {
+            append_prepare_notice(
+                run,
+                &format!(
+                    "delegate: 主干改动与本链存在冲突，保持旧基线继续；重叠文件：{}（可用 --no-sync 跳过同步，或用 --sync=agent 写入冲突标记交同事解决）",
+                    report.conflicts.join("、")
+                ),
+            );
+        } else if mode != worktree::SyncMode::Auto {
+            if is_zh {
+                prompt_text = format!(
+                    "{}\n\n主控在上一轮之后的改动已同步进工作目录：（无）\n",
+                    prompt_text.trim_end()
+                );
+            } else {
+                prompt_text = format!(
+                    "{}\n\nThe caller's changes since the previous round have been synced into the workdir: (none)\n",
+                    prompt_text.trim_end()
+                );
+            }
+            write(&prompt_path, &prompt_text)?;
+        }
+        if let Some(obj) = meta.as_object_mut() {
+            obj.remove("pendingSync");
+        }
+    }
+
+    // 3. Deferred `numbers_taken`, `changes::snapshot`, `source_watch::baseline`, `refs::pin_run`.
+    if b(meta, "pendingPrepare") {
+        if cfg!(debug_assertions) && std::env::var("DELEGATE_TEST_FAIL_PREPARE").as_deref() == Ok("1") {
+            return Err("injected prepare failure".into());
+        }
+        let mode = s(meta, "mode").to_string();
+        if mode != "read-only" && meta["worktree"].is_object() {
+            let taken = crate::worktree::numbers_taken(
+                Path::new(s(&meta["worktree"], "source")),
+                Path::new(s(&meta["worktree"], "path")),
+            );
+            if !taken.is_empty() {
+                let list = taken
+                    .iter()
+                    .map(|(directory, prefix, owner)| format!("{directory} {prefix} ({owner})"))
+                    .collect::<Vec<_>>()
+                    .join("、");
+                let prompt_path = run.join("prompt.md");
+                let mut text = read(&prompt_path);
+                text.push_str(&format!(
+                    "\n\n未提交的编号文件已占用这些编号，你的工作区里看不到；在同目录新增编号文件时用更大的编号 / Numbered files not yet committed hold these numbers and are not in your worktree; number new files in those directories above them: {list}\n"
+                ));
+                write(&prompt_path, &text)?;
+                append_prepare_notice(run, &format!("delegate: 已占用编号 {list}"));
+            }
+        }
+
+        if meta["worktree"]["in"].is_null() {
+            let run_id = run.file_name().unwrap_or_default().to_string_lossy();
+            let claimed_slot = b(&meta["worktree"], "pooled")
+                && s(&meta["worktree"], "claimedBy") == run_id;
+            let wt_path = PathBuf::from(s(&meta["worktree"], "path"));
+            let new_tree = meta["worktree"].is_object()
+                && (claimed_slot || !wt_path.exists());
+            let snap_top = if meta["worktree"].is_object() {
+                if wt_path.exists() && !claimed_slot {
+                    Some(wt_path.clone())
+                } else {
+                    Some(PathBuf::from(s(&meta["worktree"], "source")))
+                }
+            } else {
+                git_top_fast(Path::new(s(meta, "workdir")))
+            };
+            let exclude = strings(&meta["snapshotExclude"]);
+            let mut base = snap_top
+                .as_deref()
+                .and_then(|p| changes::snapshot(p, run, &exclude));
+            if meta["worktree"].is_object() && base.is_none() {
+                return Err(format!(
+                    "cannot snapshot {} for the worktree",
+                    s(&meta["worktree"], "source")
+                ));
+            }
+            if new_tree {
+                if let Some(v) = &mut base {
+                    v["large"] = json!({});
+                    v["submodules"] = json!({});
+                }
+            }
+            if s(meta, "chainBase").is_empty() {
+                if let Some(tree_sha) = base.as_ref().map(|x| s(x, "tree")).filter(|x| !x.is_empty()) {
+                    meta["chainBase"] = json!(tree_sha);
+                }
+            }
+            meta["base"] = base.unwrap_or(Value::Null);
+            if new_tree {
+                meta["top"] = json!(wt_path);
+            } else if let Some(st) = snap_top {
+                if meta["top"].is_null() {
+                    meta["top"] = json!(st);
+                }
+            }
+        }
+
+        if meta["worktree"].is_object() {
+            let source = PathBuf::from(s(&meta["worktree"], "source"));
+            meta["sourceStatusBaseline"] = crate::source_watch::baseline(&source)?;
+            if s(meta, "netBase").is_empty() {
+                if let Ok(head) = git_text(&source, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]) {
+                    if !head.is_empty() {
+                        meta["netBase"] = json!(head);
+                    }
+                }
+            }
+        }
+
+        meta["phase"] = json!("running");
+        if let Some(obj) = meta.as_object_mut() {
+            obj.remove("pendingPrepare");
+            obj.remove("newTree");
+        }
+        write_json(run.join("meta.json"), meta)?;
+        if run.join("worktree-base-commit").is_file() {
+            let commit = read(run.join("worktree-base-commit"));
+            let commit = commit.trim();
+            if !commit.is_empty() {
+                crate::refs::pin_slot(run, meta, "worktree-base", commit);
+            }
+        }
+        crate::refs::pin_run(run, meta);
+        crate::index::upsert_run(run);
+        crate::board::refresh_for_run(run);
+        runs::prune();
+    }
+    Ok(())
+}
+
 fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> Res<()> {
     let mut meta = json(run.join("meta.json"));
     if !s(&meta, "after").is_empty() {
@@ -930,6 +1213,16 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
             1,
         );
     }
+    if run.join(".waiting").exists() {
+        if !run.join("queue.json").is_file() {
+            crate::queue::enter(run, &mut meta)?;
+        }
+        crate::board::refresh_for_run(run);
+        if !admit_waiting(run, &mut meta)? {
+            return finish_run(run, json!({"state":"stopped"}), 1);
+        }
+    }
+    prepare_run_in_supervisor(run, &mut meta)?;
     if meta["worktree"]["in"].is_string() {
         let in_run = Path::new(s(&meta["worktree"], "in"));
         let source = Path::new(s(&meta["worktree"], "source"));
@@ -949,14 +1242,6 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         meta["base"] = base;
         write_json(run.join("meta.json"), &meta)?;
         crate::refs::pin_run(run, &meta);
-    }
-    if run.join(".waiting").exists() {
-        if !run.join("queue.json").is_file() {
-            crate::queue::enter(run, &mut meta)?;
-        }
-        if !admit_waiting(run, &mut meta)? {
-            return finish_run(run, json!({"state":"stopped"}), 1);
-        }
     }
     let started = epoch();
     let mut setup_error = None;
@@ -1205,20 +1490,8 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
 }
 fn admit_waiting(run: &Path, meta: &mut Value) -> Res<bool> {
     let slots = state_dir();
-    let root = runs_root();
     loop {
-        let machine = crate::locks::acquire(
-            crate::locks::LockKind::StartMachine,
-            &slots.join(".start.lock"),
-            true,
-        )
-        .map_err(|e| e.to_string())?;
-        let local = crate::locks::acquire(
-            crate::locks::LockKind::StartRepo,
-            &root.join(".start.lock"),
-            true,
-        )
-        .map_err(|e| e.to_string())?;
+        let state_guard = crate::locks::acquire_state(&slots).map_err(|e| e.to_string())?;
         if lane::stopped() {
             return Ok(false);
         }
@@ -1242,9 +1515,8 @@ fn admit_waiting(run: &Path, meta: &mut Value) -> Res<bool> {
             meta["startedAt"] = json!(iso());
             write_json(run.join("meta.json"), meta)?;
             fs::remove_file(run.join(".waiting")).map_err(|e| e.to_string())?;
-            drop(local);
-            drop(machine);
-            // Claim worktree pool slot outside `.start.lock` under `PoolClaim`.
+            drop(state_guard);
+            // Claim worktree pool slot outside `.state.lock` under `PoolClaim`.
             let origin = PathBuf::from(s(meta, "workdir"));
             let mut wd = origin.clone();
             let mut tree = meta["worktree"].clone();
@@ -1267,11 +1539,11 @@ fn admit_waiting(run: &Path, meta: &mut Value) -> Res<bool> {
                     "fromQueue": true,
                 }),
             );
+            crate::index::upsert_run(run);
             crate::board::refresh_for_run(run);
             return Ok(true);
         }
-        drop(local);
-        drop(machine);
+        drop(state_guard);
         // Poll also when memory is the only blocker, or no run is active.
         std::thread::sleep(Duration::from_millis(100));
     }

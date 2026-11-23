@@ -506,6 +506,8 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
                              "--name", "job", "--accept", "false", "task"))
         self.fake_pi([fixtures.answer("later"), fixtures.SETTLED], pre="echo fix >> a.txt", sleep=30)
         started = self.outcome(self.cli("reply", "job", "fix"))
+        # 6.32.0: async `reply` returns in <50ms before `pi` starts; wait until the agent launches before stopping.
+        self.until(lambda: (Path(started["dir"]) / "agent.pid").is_file(), "agent launched")
         self.assertEqual(self.cli("stop", started["run"]).returncode, 0)
         self.assertEqual(self.outcome(self.cli("status", started["run"]))["state"], "stopped")
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo done >> a.txt")

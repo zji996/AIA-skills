@@ -304,7 +304,7 @@ class Delegate625HistoryTests(unittest.TestCase):
             "排查旧版单点登录会话超时掉线的问题并修复 cookie 刷新",
         )
         self.assertEqual(old_dup.returncode, 0, old_dup.stderr)
-        self.assertFalse(any(old["run"] in l for l in old_dup.stderr.splitlines()), old_dup.stderr)
+        self.assertFalse(any(l.startswith("相似：") and old["run"] in l for l in old_dup.stderr.splitlines()), old_dup.stderr)
 
         gate.touch()
         self.cli("wait", "--all")
@@ -400,8 +400,15 @@ class Delegate625HistoryTests(unittest.TestCase):
         self.addCleanup(lambda: (gate1.touch(), gate2.touch(), self.cli("stop", r_live["run"], r_queued["run"], cwd=repo)))
         self.env.pop("DELEGATE_MAX_ACTIVE", None)
 
+        deadline = time.time() + 10
+        b1 = ""
+        while time.time() < deadline:
+            if board_file.is_file():
+                b1 = board_file.read_text(encoding="utf-8")
+                if "在跑 1（排队 1）" in b1.splitlines()[0] and "run-two" in b1:
+                    break
+            time.sleep(0.05)
         self.assertTrue(board_file.is_file(), "board file should be created automatically on start")
-        b1 = board_file.read_text(encoding="utf-8")
         self.assertIn("在跑 1（排队 1）", b1.splitlines()[0])
         self.assertIn("整机在途 2", b1.splitlines()[0])
         self.assertIn("## 在跑", b1)

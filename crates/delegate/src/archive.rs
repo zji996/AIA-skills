@@ -211,7 +211,7 @@ fn archive_events(src: &Path, record: &Path) -> Res<()> {
         return Ok(());
     }
     let gz = record.join("events.jsonl.gz");
-    let tmp = record.join("events.jsonl.gz.tmp");
+    let tmp = atomic_tmp_path(&gz);
     let compressed = (|| -> std::io::Result<bool> {
         let input = File::open(src)?;
         let output = File::create(&tmp)?;
@@ -221,6 +221,11 @@ fn archive_events(src: &Path, record: &Path) -> Res<()> {
             .stdout(Stdio::from(output))
             .stderr(Stdio::null())
             .status()?;
+        if status.success() {
+            if let Ok(f) = File::open(&tmp) {
+                let _ = f.sync_data();
+            }
+        }
         Ok(status.success())
     })();
     match compressed {

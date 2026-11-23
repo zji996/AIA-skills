@@ -957,6 +957,38 @@ pub fn record(run: &Path, pgid: i32) -> usize {
     stopped
 }
 
+/// Fast foreground cleanup during `clean` for runs that already completed `cleanup::record`
+/// at finish time: reclaims any tracked systemd scopes and historical user units without
+/// performing an O(all host processes) `/proc` walk.
+pub fn reclaim_on_clean(run: &Path, full_scan: bool) -> usize {
+    if full_scan || !run.join("cleanup.json").is_file() {
+        return record(run, 0);
+    }
+    let Ok(_guard) =
+        crate::locks::acquire(crate::locks::LockKind::RunLocal, &run.join("cleanup.lock"), true)
+    else {
+        return 0;
+    };
+    let keep = keep_executables(run);
+    let scopes = scopes(run);
+    let supervisor = read(run.join("pid")).trim().parse::<i32>().unwrap_or(0);
+    for (unit, root, pids) in &scopes {
+        if !pids.contains(&(std::process::id() as i32)) && !pids.contains(&supervisor) {
+            kill_scope(unit, root, pids, &keep);
+        }
+    }
+    let file = run.join("cleanup.json");
+    let mut previous = json(&file);
+    if !previous.is_object() {
+        previous = value!({"processes":{}});
+    }
+    let stopped = user_units(run, &mut previous);
+    if stopped > 0 {
+        let _ = write_json(file, &previous);
+    }
+    stopped
+}
+
 pub fn summary(run: &Path) -> Option<Value> {
     let saved = json(run.join("cleanup.json"));
     let processes = saved["processes"].as_object()?;

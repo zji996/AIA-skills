@@ -24,6 +24,11 @@ use std::time::{Duration, Instant};
 
 /// Strict global acquisition order for all file locks in `delegate`.
 /// Lower numeric rank MUST always be acquired before higher numeric rank.
+///
+/// Control-plane metadata (`start`/slot admission, `work.jsonl`, `events.jsonl`, `cursors.json`,
+/// `dag-queue.json`, `repos.json`, `index.json`) shares a SINGLE short-lived lock:
+/// `LockKind::State` (`<state>/.state.lock`, held < 5ms, no git / subprocess / sleep inside).
+/// Read-only paths NEVER acquire `LockKind::State`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u16)]
 pub enum LockKind {
@@ -31,26 +36,19 @@ pub enum LockKind {
     WaiterClaim = 5,
     /// `<run>/reply.lock` — per-run pending-reply mailbox lock (wraps `launch::reply` delivery).
     ReplyMailbox = 8,
-    /// `<state>/.start.lock` — machine-wide admission & slot registration.
-    StartMachine = 10,
-    /// `<runs_root>/.start.lock` — repository-local admission & reply serialization.
-    StartRepo = 20,
     /// `<cache>/pool/.claim.lock` — worktree pool slot claim.
     PoolClaim = 30,
     /// `<source_watch>/apply.lock` — serializes apply writes against source repo.
     SourceWatchApply = 40,
     /// `<source_watch>/lock` — source-watch observation & baseline lock.
     SourceWatch = 50,
-    /// `<state>/.work.lock` — machine-wide work table (`work.jsonl`).
-    Work = 60,
-    /// `<state>/.dag-queue.lock` — DAG queue file (`dag-queue.json`).
-    DagQueue = 70,
-    /// `<state>/.repos.lock` — registered repositories registry (`repos.json`).
-    Repos = 80,
-    /// `<state>/.events.lock` — machine-wide event log (`events.jsonl`).
-    Events = 90,
-    /// `<state>/.cursors.lock` — per-reader event cursors (`cursors.json`).
-    Cursors = 100,
+    /// `<state>/.state.lock` — THE single machine-wide short-lived control-plane write lock
+    /// (<5ms, zero git/subprocess/sleep; never acquires outer pool/source_watch locks).
+    State = 90,
+    /// `<state>/.start.lock` — transition compatibility lock acquired ONLY if already present on disk.
+    LegacyStart = 92,
+    /// `<state>/.work.lock` — transition compatibility lock acquired ONLY if already present on disk.
+    LegacyWork = 94,
     /// `<history>/<key>/history.lock` — per-repo history log.
     History = 110,
     /// `<history>/<key>/board.lock` — per-repo `BOARD.md` write lock.
@@ -59,8 +57,9 @@ pub enum LockKind {
     Jobserver = 130,
     /// Heavy lane, measure queue, or remote lane lock.
     Lane = 140,
-    /// Per-run or standalone local locks (`reply.lock`, `scopes.lock`, `cleanup.lock`,
-    /// `waiter.lock`, `supervisor.lock`, `fit`, legacy `.notes.lock`).
+    /// Short-lived background worker single-instance lock (`_gc-worker`, etc., `LOCK_NB`).
+    Worker = 145,
+    /// Per-run or standalone local locks (`scopes.lock`, `cleanup.lock`, `supervisor.lock`, `fit`).
     RunLocal = 150,
 }
 
@@ -69,20 +68,17 @@ impl LockKind {
         match self {
             LockKind::WaiterClaim => "WaiterClaim",
             LockKind::ReplyMailbox => "ReplyMailbox",
-            LockKind::StartMachine => "StartMachine",
-            LockKind::StartRepo => "StartRepo",
+            LockKind::State => "State",
+            LockKind::LegacyStart => "LegacyStart",
+            LockKind::LegacyWork => "LegacyWork",
             LockKind::PoolClaim => "PoolClaim",
             LockKind::SourceWatchApply => "SourceWatchApply",
             LockKind::SourceWatch => "SourceWatch",
-            LockKind::Work => "Work",
-            LockKind::DagQueue => "DagQueue",
-            LockKind::Repos => "Repos",
-            LockKind::Events => "Events",
-            LockKind::Cursors => "Cursors",
             LockKind::History => "History",
             LockKind::Board => "Board",
             LockKind::Jobserver => "Jobserver",
             LockKind::Lane => "Lane",
+            LockKind::Worker => "Worker",
             LockKind::RunLocal => "RunLocal",
         }
     }
@@ -90,6 +86,149 @@ impl LockKind {
 
 thread_local! {
     static HELD_LOCKS: RefCell<Vec<(LockKind, PathBuf)>> = const { RefCell::new(Vec::new()) };
+    static STATE_LOCK_DEPTH: RefCell<usize> = const { RefCell::new(0) };
+}
+
+/// Returns true if the current thread currently holds `state/.state.lock`.
+pub fn holding_state_lock() -> bool {
+    STATE_LOCK_DEPTH.with(|d| *d.borrow() > 0)
+}
+
+/// Guard against running git / subprocesses / sleeps while holding `state/.state.lock`.
+pub fn assert_not_holding_state_lock(op: &str) {
+    if holding_state_lock() {
+        let msg = format!(
+            "delegate: forbidden slow operation ({op}) while holding state/.state.lock"
+        );
+        #[cfg(debug_assertions)]
+        panic!("{msg}");
+        #[cfg(not(debug_assertions))]
+        eprintln!("{msg}");
+    }
+}
+
+/// Re-entrant guard for the single control-plane state write lock (`<state>/.state.lock`),
+/// with fixed-order transition compatibility for legacy `.start.lock`/`.work.lock` if present.
+#[derive(Debug)]
+pub struct StateLockGuard {
+    _state: Option<LockGuard>,
+    _legacy_start: Option<LockGuard>,
+    _legacy_work: Option<LockGuard>,
+    acquired_at: Option<Instant>,
+}
+
+impl Drop for StateLockGuard {
+    fn drop(&mut self) {
+        if let Some(t0) = self.acquired_at {
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            if std::env::var("DELEGATE_MEASURE_STATE_LOCK").as_deref() == Ok("1") {
+                eprintln!("STATE_LOCK_HOLD_MS={ms:.3}");
+            }
+            if std::env::var("DELEGATE_MEASURE_START_LOCK").as_deref() == Ok("1") {
+                eprintln!("START_LOCK_HOLD_MS={ms:.3}");
+            }
+        }
+        // Release legacy locks before `.state.lock` (reverse acquisition order).
+        self._legacy_work.take();
+        self._legacy_start.take();
+        self._state.take();
+        STATE_LOCK_DEPTH.with(|d| {
+            let mut depth = d.borrow_mut();
+            *depth = depth.saturating_sub(1);
+        });
+    }
+}
+
+/// Acquire `<state>/.state.lock` (re-entrant within the same thread).
+/// Hold duration MUST remain < 5ms with zero git/subprocess/sleep calls inside.
+pub fn acquire_state(state: &Path) -> io::Result<StateLockGuard> {
+    let already_held = STATE_LOCK_DEPTH.with(|d| *d.borrow() > 0);
+    if already_held {
+        STATE_LOCK_DEPTH.with(|d| *d.borrow_mut() += 1);
+        return Ok(StateLockGuard {
+            _state: None,
+            _legacy_start: None,
+            _legacy_work: None,
+            acquired_at: None,
+        });
+    }
+    let state_guard = acquire(LockKind::State, &state.join(".state.lock"), true)?;
+    // Transition compatibility with 6.31.x CLI: if legacy `.start.lock` or `.work.lock` already
+    // exists on disk, acquire them in the same fixed ascending order (`.start.lock` < `.work.lock`)
+    // without modifying their owner metadata. New state dirs have neither file (zero extra flock).
+    let legacy_start_path = state.join(".start.lock");
+    let legacy_start = if legacy_start_path.exists() {
+        Some(acquire_opts(
+            LockKind::LegacyStart,
+            &legacy_start_path,
+            true,
+            false,
+        )?)
+    } else {
+        None
+    };
+    let legacy_work_path = state.join(".work.lock");
+    let legacy_work = if legacy_work_path.exists() {
+        Some(acquire_opts(
+            LockKind::LegacyWork,
+            &legacy_work_path,
+            true,
+            false,
+        )?)
+    } else {
+        None
+    };
+    STATE_LOCK_DEPTH.with(|d| *d.borrow_mut() += 1);
+    Ok(StateLockGuard {
+        _state: Some(state_guard),
+        _legacy_start: legacy_start,
+        _legacy_work: legacy_work,
+        acquired_at: Some(Instant::now()),
+    })
+}
+
+/// Non-blocking single attempt to acquire `<state>/.state.lock`.
+pub fn try_acquire_state(state: &Path) -> io::Result<StateLockGuard> {
+    let already_held = STATE_LOCK_DEPTH.with(|d| *d.borrow() > 0);
+    if already_held {
+        STATE_LOCK_DEPTH.with(|d| *d.borrow_mut() += 1);
+        return Ok(StateLockGuard {
+            _state: None,
+            _legacy_start: None,
+            _legacy_work: None,
+            acquired_at: None,
+        });
+    }
+    let state_guard = try_acquire(LockKind::State, &state.join(".state.lock"), true)?;
+    let legacy_start_path = state.join(".start.lock");
+    let legacy_start = if legacy_start_path.exists() {
+        Some(try_acquire_opts(
+            LockKind::LegacyStart,
+            &legacy_start_path,
+            true,
+            false,
+        )?)
+    } else {
+        None
+    };
+    let legacy_work_path = state.join(".work.lock");
+    let legacy_work = if legacy_work_path.exists() {
+        Some(try_acquire_opts(
+            LockKind::LegacyWork,
+            &legacy_work_path,
+            true,
+            false,
+        )?)
+    } else {
+        None
+    };
+    STATE_LOCK_DEPTH.with(|d| *d.borrow_mut() += 1);
+    Ok(StateLockGuard {
+        _state: Some(state_guard),
+        _legacy_start: legacy_start,
+        _legacy_work: legacy_work,
+        acquired_at: Some(Instant::now()),
+    })
 }
 
 /// RAII guard holding an OS `flock` and tracking global lock-order compliance.
@@ -526,7 +665,7 @@ mod tests {
     #[test]
     fn exclusive_lock_records_owner_and_describe_holder_finds_pid() {
         let path = temp_lock("owner.lock");
-        let guard = acquire(LockKind::Work, &path, true).unwrap();
+        let guard = acquire(LockKind::State, &path, true).unwrap();
         let desc = describe_holder(guard.file(), &path);
         let expected_pid = format!("pid={}", std::process::id());
         assert!(desc.contains(&expected_pid), "expected {expected_pid} in {desc}");
@@ -538,8 +677,8 @@ mod tests {
     fn ascending_lock_order_is_allowed() {
         let p1 = temp_lock("a.lock");
         let p2 = p1.parent().unwrap().join("b.lock");
-        let g1 = acquire(LockKind::StartMachine, &p1, true).unwrap();
-        let g2 = acquire(LockKind::StartRepo, &p2, true).unwrap();
+        let g1 = acquire(LockKind::SourceWatchApply, &p1, true).unwrap();
+        let g2 = acquire(LockKind::State, &p2, true).unwrap();
         drop(g2);
         drop(g1);
         let _ = fs::remove_dir_all(p1.parent().unwrap());
@@ -550,19 +689,34 @@ mod tests {
     fn reversed_lock_order_panics_in_debug() {
         let p1 = temp_lock("rev-a.lock");
         let p2 = p1.parent().unwrap().join("rev-b.lock");
-        let _g1 = acquire(LockKind::Work, &p1, true).unwrap();
-        let _g2 = try_acquire(LockKind::StartMachine, &p2, true);
+        let _g1 = acquire(LockKind::State, &p1, true).unwrap();
+        let _g2 = try_acquire(LockKind::SourceWatchApply, &p2, true);
+    }
+
+    #[test]
+    fn state_lock_is_reentrant_and_tracks_depth() {
+        let dir = temp_lock("s").parent().unwrap().to_path_buf();
+        assert!(!holding_state_lock());
+        let g1 = acquire_state(&dir).unwrap();
+        assert!(holding_state_lock());
+        let g2 = acquire_state(&dir).unwrap();
+        assert!(holding_state_lock());
+        drop(g2);
+        assert!(holding_state_lock());
+        drop(g1);
+        assert!(!holding_state_lock());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn try_acquire_with_retry_returns_would_block_without_hanging() {
         let path = temp_lock("contended.lock");
-        let holder = acquire(LockKind::Work, &path, true).unwrap();
+        let holder = acquire(LockKind::State, &path, true).unwrap();
         let p_clone = path.clone();
         let handle = std::thread::spawn(move || {
             let t0 = Instant::now();
             let res = try_acquire_with_retry(
-                LockKind::Work,
+                LockKind::State,
                 &p_clone,
                 true,
                 2,

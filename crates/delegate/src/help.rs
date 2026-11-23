@@ -110,6 +110,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     ("list", "Alias of status."),
     (
+        "snapshot",
+        "Zero-lock, zero-subprocess JSON snapshot of all repos, runs, work items, events, lane, DAG queue, merges, and radar candidates.",
+    ),
+    (
         "note",
         "Attach, list, or complete post-merge todos on a run or reply chain (survives clean until --done).",
     ),
@@ -338,11 +342,18 @@ pub fn print(command: Option<&str>) -> bool {
         "stop" => ("runs ...", "Terminate one or more runs.", &[
             ("runs", "One or more run ids or directories."),
         ]),
-        "clean" => ("[--finished] [--force] [--no-archive] [--json] [runs ...]", "Delete finished runs and their compose containers; reclaim containers whose delegate worktree directory is missing.", &[
+        "snapshot" => ("--json [--repo PATH ...] [--root DIR] [--events-limit N]", "Print one consistent JSON snapshot of runs (backed by <state>/index.json), work table, recent events, lane, DAG queue, merges, and radar candidates without acquiring locks or spawning subprocesses.", &[
+            ("--json", "Emit JSON snapshot (default)."),
+            ("--repo PATH", "Limit snapshot to explicit repository path(s); repeatable."),
+            ("--root DIR", "Optional workspace root hint."),
+            ("--events-limit N", "Maximum recent events to include (default: 200; 0 for all)."),
+        ]),
+        "clean" => ("[--finished] [--force] [--no-archive] [--sync] [--json] [runs ...]", "Delete finished runs (staged to trash and reclaimed asynchronously by _gc-worker by default; pass --sync for synchronous GC) and their compose containers; reclaim containers whose delegate worktree directory is missing.", &[
             ("runs", "Run ids or directories to remove."),
             ("--no-archive", "Skip evidence archiving; by default keep ignored non-build outputs and final-answer references under cache/archive/<run>/ (200 MiB/run)."),
             ("--finished", "Select all finished runs that have been reported in full (answers shown truncated are kept until read with result)."),
             ("--force", "With --finished, also select unreported or truncated finished runs."),
+            ("--sync", "Run trash/worktree/container garbage collection synchronously before returning."),
             ("--json", "Print deletion counts and orphan container cleanup as JSON lines."),
         ]),
         "tiers" => ("[--scout ALIAS] [--review ALIAS] [--write ALIAS] [--alias NAME=provider/id] [--thinking LEVEL]", "Print each purpose's rules (alias, full id, thinking) and registered aliases with Pi context/images/thinking capabilities. The final line counts unregistered Pi models without listing them. Settings validate and atomically update user config; --alias is repeatable. All three tiers must resolve for start/run/reply. Old tiers and model :thinking suffixes are unsupported: register aliases, configure the three purposes and move suffixes into thinking.", &[]),

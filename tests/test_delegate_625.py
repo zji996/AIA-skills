@@ -310,14 +310,12 @@ class Delegate625Tests(unittest.TestCase):
         self.assertIn("feat-a", blocked["reason"])
         self.assertIn("delegate apply", blocked["reason"])
 
-        # Add fresh deferral in repo_a/.local/delegate/deferred.tsv -> passes and stamps 3rd column.
+        # Add fresh deferral in repo_a/.local/delegate/deferred.tsv -> passes without mutating disk (6.32 zero-side-effect Stop hook).
         deferred = repo_a / ".local/delegate/deferred.tsv"
         deferred.parent.mkdir(parents=True, exist_ok=True)
         deferred.write_text(f"{ra['run']}\t等上游窗口\n")
         self.assertIsNone(hook(repo_a))
-        cols = deferred.read_text().strip().split("\t")
-        self.assertEqual(len(cols), 3)
-        self.assertTrue(cols[2].isdigit())
+        self.assertEqual(deferred.read_text(), f"{ra['run']}\t等上游窗口\n")
 
         # Make deferral stale (> 4 hours old) -> blocks again with stale notice.
         old_ts = int(time.time()) - 5 * 3600
@@ -333,8 +331,8 @@ class Delegate625Tests(unittest.TestCase):
         self.assertEqual(run_in(repo_a, "clean", "--no-archive", ra["run"], human=True).returncode, 0)
 
         self.assertIsNone(hook(repo_a))
-        # deferred.tsv was tidied because ra is no longer unmerged.
-        self.assertEqual(deferred.read_text().strip(), "")
+        # In 6.32, Stop hook is strictly zero-side-effect so it does not rewrite deferred.tsv on disk;
+        # ra is already applied & cleaned so the hook passes regardless.
         # Note is still preserved in `delegate note` until `--done`.
         self.assertIn("重启线上进程", run_in(repo_a, "note", ra["run"], human=True).stdout)
 

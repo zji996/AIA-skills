@@ -169,7 +169,7 @@ else:
             "a7": {"path": str(root / "../source/deleted")},
             "a8": {"path": str(repo / "missing")},
         })
-        result = self.cli("clean", "--json", state["run"])
+        result = self.cli("clean", "--sync", "--json", state["run"])
         self.assertEqual(result.returncode, 0, result.stderr)
         rows = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual(rows[0]["containersRemoved"], 2)
@@ -186,7 +186,7 @@ else:
             "d1": {"path": state["worktree"], "name": "svc-embed-1", "serving": True},
             "d2": {"path": state["worktree"], "name": "scratch-db-1"},
         })
-        result = self.cli("clean", state["run"])
+        result = self.cli("clean", "--sync", state["run"])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(set(json.loads(db.read_text())), {"d1"})
         self.assertIn("删除了容器 scratch-db-1", result.stdout)
@@ -199,7 +199,7 @@ else:
         state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
         shutil.rmtree(state["worktree"])
         db = self.fake_docker({"b1": {"path": state["worktree"]}})
-        result = self.cli("clean", "--json", state["run"])
+        result = self.cli("clean", "--sync", "--json", state["run"])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout.splitlines()[0])["containersRemoved"], 1)
         self.assertEqual(json.loads(db.read_text()), {})
@@ -221,7 +221,7 @@ else:
                 elif failure == "permission":
                     self.env["TEST_DOCKER_FAIL"] = "1"
                 try:
-                    result = self.cli("clean", "--json", state["run"])
+                    result = self.cli("clean", "--sync", "--json", state["run"])
                 finally:
                     self.env["PATH"] = original_path
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -237,7 +237,7 @@ else:
         self.fake_docker({})
         self.env["TEST_DOCKER_HANG"] = "1"
         started = time.monotonic()
-        result = self.cli("clean", "--finished", "--json", timeout=25)
+        result = self.cli("clean", "--sync", "--finished", "--json", timeout=25)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertLess(time.monotonic() - started, 8)
         self.assertIn("timed out", json.loads(result.stdout)["orphanCleanup"]["diagnostic"])
@@ -466,8 +466,11 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         self.env["DELEGATE_SOURCE_BUILD_WARN_GIB"] = "0.000001"
         for failure in ("exit", "malformed", "cache", "escape"):
             with self.subTest(failure=failure):
-                pre = 'mkdir "$DELEGATE_RUN_DIR/meta.json.tmp"' if failure == "cache" else ""
-                self.fake_pi([answer("done"), SETTLED], pre=pre)
+                if failure == "cache":
+                    self.env["DELEGATE_TEST_FAIL_SOURCE_BUILD_CACHE"] = "1"
+                else:
+                    self.env.pop("DELEGATE_TEST_FAIL_SOURCE_BUILD_CACHE", None)
+                self.fake_pi([answer("done"), SETTLED])
                 du = self.bin / "du"
                 du.write_text("#!/bin/sh\n" + ("exit 1\n" if failure == "exit" else
                               "echo invalid\n" if failure == "malformed" else "echo '999999999999 target'\n"))
@@ -2087,6 +2090,8 @@ db.write_text(json.dumps(units))
         self.assertIn("streamed answer", collected.stdout)
 
     def test_outcome_reports_source_changes_since_the_worktree_snapshot(self):
+        # 6.32.0: read paths (`wait`, `status`) are strictly zero-lock and zero-side-effect,
+        # so live `source_drift` (which writes temp git indexes / loose trees) is no longer run on read.
         repo = self.repo({"a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n"})
         self.fake_pi([answer("done"), SETTLED], pre="echo run > a.txt; echo run > b.txt")
         result = self.cli("run", "--worktree", "--workdir", repo, "task")
@@ -2096,15 +2101,9 @@ db.write_text(json.dumps(units))
         (repo / "c.txt").write_text("caller\n")
         (repo / "d.txt").write_text("new\n")
         again = self.outcome(self.cli("wait", state["run"]))
-        self.assertEqual(again["sourceDrift"], {"files": 3, "overlap": ["b.txt"]})
-        self.assertIn("reply", again["next"])
-        self.assertIn("--sync", again["next"])
-        self.assertNotIn("sourceDrift", self.outcome(self.cli("status", state["run"])))  # status stays cheap
-        (repo / "b.txt").write_text("b\n")
-        calm = self.outcome(self.cli("wait", state["run"]))
-        self.assertEqual(calm["sourceDrift"], {"files": 2, "overlap": []})
-        self.assertIn(f"apply {state['run']}", calm["next"])
-        self.assertNotIn("--sync", calm["next"])
+        self.assertNotIn("sourceDrift", again)
+        self.assertNotIn("sourceDrift", self.outcome(self.cli("status", state["run"])))
+        self.assertEqual(list(Path(state["dir"]).glob(".snapshot-index-*")), [])
 
     def test_caller_is_written_for_start_run_reply_and_waiting_run(self):
         self.fake_pi([answer("ok"), SETTLED],
@@ -3611,17 +3610,15 @@ cargo check --package small; echo $? > "$DELEGATE_RUN_DIR/prefix-code"
         self.assertNotIn("applied", self.outcome(self.cli("status", state["run"])))  # executable mode differs
         (repo / "run.sh").chmod(0o755)
         (repo / "unrelated.txt").write_text("caller edit\n")
-        detected = self.outcome(self.cli("wait", state["run"]))
-        self.assertEqual((detected["applied"], detected["appliedBy"]), (True, "detected"))
-        self.assertIn("clean", detected["next"])
-        self.assertEqual(json.loads((Path(state["dir"]) / ".applied").read_text())["appliedBy"], "detected")
-        human = self.cli("status", state["run"], human=True).stdout
-        self.assertIn("已合入（主干已含改动）", human)
-        self.assertIn("下一步：清理", human)
-        self.assertNotIn("delegate apply", human)
+        # 6.32.0: read paths (`wait`, `status`) have zero side effects and do not write `.applied`.
+        self.assertNotIn("applied", self.outcome(self.cli("wait", state["run"])))
+        self.assertFalse((Path(state["dir"]) / ".applied").exists())
+        # Write path (`clean --finished`) detects the manual merge, records `.applied` in archive, and removes the worktree.
         self.assertEqual(self.cli("clean", "--finished").returncode, 0)
         self.assertFalse(tree.exists())
         self.assertFalse(Path(state["dir"]).exists())
+        arch_applied = self.work / "cache/delegate/archive" / state["run"] / "record/.applied"
+        self.assertEqual(json.loads(arch_applied.read_text())["appliedBy"], "detected")
 
     def test_detect_manual_merge_freezes_final_files_and_handles_old_records(self):
         repo = self.repo({"a.txt": "old\n"})
@@ -3630,14 +3627,20 @@ cargo check --package small; echo $? > "$DELEGATE_RUN_DIR/prefix-code"
         (Path(state["worktree"]) / "a.txt").write_text("later\n")
         (repo / "a.txt").write_text("later\n")
         self.assertNotIn("applied", self.outcome(self.cli("status", state["run"])))
+        # clean --finished keeps it because "later" does not match frozen final file "task".
+        self.assertEqual(self.cli("clean", "--finished").returncode, 0)
+        self.assertTrue(Path(state["dir"]).is_dir())
         (repo / "a.txt").write_text("task\n")
         run = Path(state["dir"])
         rec = json.loads((run / "changes.json").read_text())
         del rec["finalEntries"]
         (run / "changes.json").write_text(json.dumps(rec))
         self.assertNotIn("applied", self.outcome(self.cli("status", state["run"])))
-        detected = self.outcome(self.cli("wait", state["run"]))
-        self.assertEqual(detected["appliedBy"], "detected")
+        # Write path (`clean --finished`) falls back to old-record blob check and detects manual merge.
+        self.assertEqual(self.cli("clean", "--finished").returncode, 0)
+        self.assertFalse(run.exists())
+        arch_applied = self.work / "cache/delegate/archive" / state["run"] / "record/.applied"
+        self.assertEqual(json.loads(arch_applied.read_text())["appliedBy"], "detected")
 
     def test_clean_detects_manual_merge_without_status_and_large_files(self):
         repo = self.repo({"a.txt": "old\n"})
@@ -3659,9 +3662,13 @@ cargo check --package small; echo $? > "$DELEGATE_RUN_DIR/prefix-code"
         self.fake_pi([answer("second"), SETTLED], pre="echo second > b.txt")
         second = self.outcome(self.cli("reply", "--wait", first["run"], "continue"))
         (repo / "b.txt").write_text("second\n")
-        self.assertNotIn("applied", self.outcome(self.cli("status", second["run"])))
+        self.assertEqual(self.cli("clean", "--finished").returncode, 0)
+        self.assertTrue(Path(second["dir"]).is_dir())  # a.txt not yet merged
         (repo / "a.txt").write_text("first\n")
-        self.assertEqual(self.outcome(self.cli("status", second["run"]))["appliedBy"], "detected")
+        self.assertEqual(self.cli("clean", "--finished").returncode, 0)
+        self.assertFalse(Path(second["dir"]).exists())
+        arch_applied = self.work / "cache/delegate/archive" / second["run"] / "record/.applied"
+        self.assertEqual(json.loads(arch_applied.read_text())["appliedBy"], "detected")
 
     def test_pinned_model_displays_its_model_and_never_escalates(self):
         self.user_config({"tiers": {"scout": "p/scout-m", "review": "p/review-m", "write": "p/write-m"}})

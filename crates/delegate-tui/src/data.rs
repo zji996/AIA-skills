@@ -175,12 +175,36 @@ impl DelegateClient {
         parse_candidates_jsonl(&stdout)
     }
 
+    pub fn fetch_snapshot_fast(
+        &self,
+        repos: &[PathBuf],
+        home: Option<&Path>,
+        cwd: Option<&Path>,
+    ) -> Option<AppSnapshot> {
+        let mut cmd = Command::new(&self.bin);
+        cmd.args(["snapshot", "--json"]);
+        for repo in repos {
+            cmd.arg("--repo").arg(repo);
+        }
+        let output = cmd.output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        parse_snapshot_json(&stdout, home, cwd).ok()
+    }
+
     pub fn collect_snapshot(
         &self,
         repos: &[PathBuf],
         home: Option<&Path>,
         cwd: Option<&Path>,
     ) -> AppSnapshot {
+        // Fast single-process path (delegate >= 6.32.0): zero locks, zero per-repo fanout.
+        if let Some(snap) = self.fetch_snapshot_fast(repos, home, cwd) {
+            return snap;
+        }
+        // Fallback for older delegate binaries (< 6.32.0).
         let mut groups = Vec::new();
         let mut warnings = Vec::new();
         let mut lane_res: Result<LaneStatus, String> = Ok(LaneStatus::default());
@@ -310,6 +334,92 @@ fn probe_help_contains(bin: &Path, subcommand: &str, needle: &str) -> bool {
 
 pub fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(PathBuf::from)
+}
+
+pub fn state_dir() -> PathBuf {
+    if let Some(s) = env::var_os("XDG_STATE_HOME") {
+        if !s.is_empty() {
+            return PathBuf::from(s).join("delegate");
+        }
+    }
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".local/state/delegate")
+}
+
+/// Parse the single JSON document emitted by `delegate snapshot --json` into an `AppSnapshot`.
+pub fn parse_snapshot_json(
+    raw: &str,
+    home: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Result<AppSnapshot, String> {
+    let doc: Value = serde_json::from_str(raw.trim()).map_err(|e| format!("snapshot json: {e}"))?;
+    if !doc.is_object() {
+        return Err("snapshot json: expected object".to_string());
+    }
+
+    let mut groups = Vec::new();
+    if let Some(repos) = doc["repos"].as_array() {
+        for r in repos {
+            let repo_path = PathBuf::from(r["path"].as_str().unwrap_or(""));
+            let label = repo_display_label(&repo_path, home);
+            let mut jsonl = String::new();
+            if let Some(runs) = r["runs"].as_array() {
+                for item in runs {
+                    jsonl.push_str(&item.to_string());
+                    jsonl.push('\n');
+                }
+            }
+            if let Some(cleaned) = r["cleanedNotes"].as_array() {
+                for item in cleaned {
+                    jsonl.push_str(&item.to_string());
+                    jsonl.push('\n');
+                }
+            }
+            let group = parse_status_jsonl(&repo_path, &label, &jsonl);
+            if !group.runs.is_empty() {
+                groups.push(group);
+            }
+        }
+    }
+    sort_repos_for_cwd(&mut groups, cwd);
+
+    let lane = if doc["lane"].is_object() && !doc["lane"].as_object().is_none_or(|m| m.is_empty()) {
+        parse_lane_json(&doc["lane"].to_string()).unwrap_or_default()
+    } else {
+        LaneStatus::default()
+    };
+
+    let arr_to_jsonl = |val: &Value| -> String {
+        val.as_array()
+            .map(|items| {
+                let mut out = String::new();
+                for it in items {
+                    out.push_str(&it.to_string());
+                    out.push('\n');
+                }
+                out
+            })
+            .unwrap_or_default()
+    };
+
+    let events = parse_events_jsonl(&arr_to_jsonl(&doc["events"]));
+    let dag_queue = parse_dag_queue_jsonl(&arr_to_jsonl(&doc["dagQueue"]));
+    let merges = parse_merges_jsonl(&arr_to_jsonl(&doc["merges"]));
+    let candidates = parse_candidates_jsonl(&arr_to_jsonl(&doc["candidates"]));
+    let host_load = read_host_load();
+
+    Ok(AppSnapshot {
+        repos: groups,
+        lane,
+        events,
+        dag_queue,
+        merges,
+        candidates,
+        host_load,
+        refreshed_at: local_hms(),
+        warnings: Vec::new(),
+    })
 }
 
 pub fn repo_display_label(repo: &Path, home: Option<&Path>) -> String {
@@ -1802,4 +1912,61 @@ pub fn parse_candidates_jsonl(raw: &str) -> Vec<RadarCandidateItem> {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn parse_snapshot_json_hydrates_repos_events_and_lane() {
+        let raw = r#"{
+            "schemaVersion": 1,
+            "seq": 42,
+            "repos": [
+                {
+                    "path": "/tmp/demo-repo",
+                    "runsDir": "/tmp/demo-repo/.local/run/delegate",
+                    "runs": [
+                        {
+                            "run": "20261123-120000-demo",
+                            "name": "demo",
+                            "state": "delivered",
+                            "agent": "pi",
+                            "mode": "write",
+                            "elapsedSeconds": 12
+                        }
+                    ],
+                    "cleanedNotes": []
+                }
+            ],
+            "events": [
+                {
+                    "seq": 42,
+                    "ts": "2026-11-23T12:00:00Z",
+                    "run": "20261123-120000-demo",
+                    "repo": "/tmp/demo-repo",
+                    "event": "delivered",
+                    "detail": {"name": "demo"}
+                }
+            ],
+            "lane": {
+                "maxHeavy": 2,
+                "heavyJobs": 4,
+                "active": [],
+                "queued": []
+            },
+            "dagQueue": [],
+            "merges": [],
+            "candidates": []
+        }"#;
+        let snap = parse_snapshot_json(raw, None, None).expect("snapshot parses");
+        assert_eq!(snap.repos.len(), 1);
+        assert_eq!(snap.repos[0].runs.len(), 1);
+        assert_eq!(snap.repos[0].runs[0].run, "20261123-120000-demo");
+        assert_eq!(snap.repos[0].runs[0].state, "delivered");
+        assert_eq!(snap.events.len(), 1);
+        assert_eq!(snap.events[0].seq, 42);
+        assert_eq!(snap.lane.max_heavy, Some(2));
+    }
 }

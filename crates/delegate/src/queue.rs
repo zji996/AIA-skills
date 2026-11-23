@@ -89,23 +89,14 @@ pub fn update(run: &Path, reason: &str, ahead: usize) -> Res<()> {
     }
     write_json(path, &record)
 }
-/// Status is a live view; it does not admit or allocate anything.
+/// Status is a live view; it does not admit or allocate anything (strictly lock-free).
 pub fn status(run: &Path) -> Option<Value> {
     if !run.join(".waiting").exists() || !run.join("queue.json").is_file() {
         return None;
     }
     let mut out = json(run.join("queue.json"));
-    // Admission owns the live view. Listings never scan processes or wait for it.
-    if let Ok(_guard) = crate::locks::try_acquire(
-        crate::locks::LockKind::StartMachine,
-        &state_dir().join(".start.lock"),
-        false,
-    ) {
-        let meta = json(run.join("meta.json"));
-        out["ahead"] = json!(waiting().iter().filter(|(_, other)| key(other) < key(&meta)).count());
-    } else {
-        out["busy"] = json!(true);
-    }
+    let meta = json(run.join("meta.json"));
+    out["ahead"] = json!(waiting().iter().filter(|(_, other)| key(other) < key(&meta)).count());
     Some(out)
 }
 pub fn notice(run: &Path) {

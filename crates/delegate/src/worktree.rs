@@ -717,6 +717,14 @@ pub fn capture_final_entries(meta: &Value, run: &Path) {
         })
         .collect::<serde_json::Map<String, Value>>();
     rec["finalEntries"] = json!(entries);
+    if let Some(wt_head) = read_git_head(root) {
+        let base_head = s(meta, "netBase");
+        let base_commit = read(run.join("worktree-base-commit"));
+        let base_commit = base_commit.trim();
+        if wt_head != base_head && wt_head != base_commit {
+            rec["worktreeHead"] = json!(wt_head);
+        }
+    }
     let _ = write_json(run.join("changes.json"), &rec);
 }
 fn final_changes(run: &Path, meta: &Value, rec: &Value) -> Option<Vec<Value>> {
@@ -765,8 +773,94 @@ fn recorded_entries(
         Some((path.to_string(), entry))
     }).collect()
 }
-pub fn detect_applied(run: &Path, meta: &Value) -> bool {
-    if run.join(".applied").exists() {
+fn entries_match_working_tree(
+    root: &Path,
+    entries: &serde_json::Map<String, Value>,
+) -> bool {
+    if !root.is_dir() || entries.is_empty() {
+        return false;
+    }
+    entries.iter().all(|(path, expected)| {
+        if !expected.is_object() {
+            return false;
+        }
+        // Check cheap metadata before reading and hashing the file.
+        let target = root.join(path);
+        if s(expected, "mode") != "absent"
+            && s(expected, "mode") != "120000"
+            && !fs::symlink_metadata(&target).is_ok_and(|info| {
+                info.is_file()
+                    && !info.file_type().is_symlink()
+                    && Some(info.len()) == expected["size"].as_u64()
+                    && entry_mode(&target).as_deref() == Some(s(expected, "mode"))
+            })
+        {
+            return false;
+        }
+        final_entry(root, path).is_some_and(|actual| actual == *expected)
+    })
+}
+
+fn entries_match_head(root: &Path, entries: &serde_json::Map<String, Value>) -> bool {
+    if !root.is_dir() || entries.is_empty() || crate::locks::holding_state_lock() {
+        return false;
+    }
+    entries.iter().all(|(path, expected)| {
+        if !expected.is_object() {
+            return false;
+        }
+        let Ok((mode, bytes)) = blob(root, "HEAD", path) else {
+            return false;
+        };
+        if s(expected, "mode") == "absent" {
+            return mode.is_none();
+        }
+        let (Some(mode), Some(bytes)) = (mode, bytes) else {
+            return false;
+        };
+        let hash = sha1_smol::Sha1::from(&bytes).digest().to_string();
+        mode == s(expected, "mode")
+            && Some(bytes.len() as u64) == expected["size"].as_u64()
+            && hash == s(expected, "hash")
+    })
+}
+
+fn commit_contained_in_head(root: &Path, wt_head: &str, base_head: &str) -> bool {
+    if !root.is_dir() || wt_head.is_empty() || crate::locks::holding_state_lock() {
+        return false;
+    }
+    // 1. Direct merge / fast-forward: wt_head is an ancestor of HEAD.
+    if git(root, &["merge-base", "--is-ancestor", wt_head, "HEAD"]).is_ok() {
+        return true;
+    }
+    // 2. Cherry-pick / rebase: every commit in base_head..wt_head has patch-id in HEAD.
+    if !base_head.is_empty() && base_head != wt_head {
+        if let Ok(out) = git_text(root, &["cherry", "HEAD", wt_head, base_head]) {
+            let mut saw_minus = false;
+            let mut saw_plus = false;
+            for line in out.lines() {
+                if line.starts_with("- ") {
+                    saw_minus = true;
+                } else if line.starts_with("+ ") {
+                    saw_plus = true;
+                }
+            }
+            if saw_minus && !saw_plus {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Strictly read-only check: are this run's changes already present in the source repository
+/// (matching working tree, matching HEAD tree, or worktree commits contained in HEAD)?
+/// Never writes files or acquires locks.
+pub fn is_applied_in_repo_readonly(run: &Path, meta: &Value) -> bool {
+    if run.join(".applied").exists() || run.join(".applied-cleaned").exists() {
+        return true;
+    }
+    if !s(meta, "appliedAt").is_empty() {
         return true;
     }
     if s(meta, "mode") != "write"
@@ -776,37 +870,56 @@ pub fn detect_applied(run: &Path, meta: &Value) -> bool {
     {
         return false;
     }
+    let root = Path::new(s(&meta["worktree"], "source"));
+    if !root.is_dir() {
+        return false;
+    }
     let rec = json(run.join("changes.json"));
+    let wt_head = {
+        let recorded = s(&rec, "worktreeHead").to_string();
+        if !recorded.is_empty() {
+            recorded
+        } else {
+            let wt_dir = Path::new(s(&meta["worktree"], "path"));
+            read_git_head(wt_dir)
+                .filter(|h| h != s(meta, "netBase") && h != read(run.join("worktree-base-commit")).trim())
+                .unwrap_or_default()
+        }
+    };
+    let base_head = {
+        let wt_base = read(run.join("worktree-base-commit")).trim().to_string();
+        if !wt_base.is_empty() {
+            wt_base
+        } else {
+            s(meta, "netBase").to_string()
+        }
+    };
+    if !wt_head.is_empty() && commit_contained_in_head(root, &wt_head, &base_head) {
+        return true;
+    }
     let Some(entries) = recorded_entries(run, meta, &rec) else {
         return false;
     };
     if entries.is_empty() {
         return false;
     }
-    let root = Path::new(s(&meta["worktree"], "source"));
-    if !root.is_dir()
-        || !entries.iter().all(|(path, expected)| {
-            if !expected.is_object() {
-                return false;
-            }
-            // Check cheap metadata before reading and hashing the file.
-            let target = root.join(path);
-            if s(expected, "mode") != "absent"
-                && s(expected, "mode") != "120000"
-                && !fs::symlink_metadata(&target).is_ok_and(|info| {
-                    info.is_file()
-                        && !info.file_type().is_symlink()
-                        && Some(info.len()) == expected["size"].as_u64()
-                        && entry_mode(&target).as_deref() == Some(s(expected, "mode"))
-                })
-            {
-                return false;
-            }
-            final_entry(root, path).is_some_and(|actual| actual == *expected)
-        })
-    {
+    entries_match_working_tree(root, &entries) || entries_match_head(root, &entries)
+}
+
+/// Write-path detection: checks if `run`'s changes are already in the source repo (working tree
+/// or HEAD), and if so persists `.applied`, updates `meta.json`, history, events, work table,
+/// and board. Must ONLY be called from write paths (`clean`, `apply`, `merge`, workers) — never
+/// from read paths (`status`, `work`, `events`, `snapshot`).
+pub fn detect_applied(run: &Path, meta: &Value) -> bool {
+    if run.join(".applied").exists() {
+        return true;
+    }
+    if !is_applied_in_repo_readonly(run, meta) {
         return false;
     }
+    let rec = json(run.join("changes.json"));
+    let entries = recorded_entries(run, meta, &rec).unwrap_or_default();
+    let root = Path::new(s(&meta["worktree"], "source"));
     let mut large_hashes = serde_json::Map::new();
     for (path, entry) in &entries {
         if rec["afterLarge"].get(path).is_some() {
@@ -814,23 +927,46 @@ pub fn detect_applied(run: &Path, meta: &Value) -> bool {
         }
     }
     let at = iso();
-    let head = git_text(root, &["rev-parse", "HEAD"]).ok().unwrap_or_default();
+    let head = read_git_head(root)
+        .or_else(|| git_text(root, &["rev-parse", "HEAD"]).ok())
+        .unwrap_or_default();
     let ok = write_json(
         run.join(".applied"),
         &json!({"at":at,"head":head,"tree":rec["after"],"large":rec["afterLarge"],"largeHashes":large_hashes,"appliedBy":"detected"}),
     )
     .is_ok();
     if ok {
-        if run.join("meta.json").is_file() && !crate::archive::is_record(run) {
-            let mut updated = json(run.join("meta.json"));
-            updated["appliedAt"] = json!(at);
+        let mut updated = if run.join("meta.json").is_file() && !crate::archive::is_record(run) {
+            let mut m = json(run.join("meta.json"));
+            m["appliedAt"] = json!(at);
             if !head.is_empty() {
-                updated["appliedHead"] = json!(head);
+                m["appliedHead"] = json!(head);
             }
-            let _ = write_json(run.join("meta.json"), &updated);
+            let _ = write_json(run.join("meta.json"), &m);
+            m
+        } else {
+            meta.clone()
+        };
+        if s(&updated, "appliedAt").is_empty() {
+            updated["appliedAt"] = json!(at);
         }
-        crate::refs::pin_slot(run, meta, "applied", s(&rec, "after"));
-        crate::history::record_apply(run, meta, &at, &head, "detected", None);
+        crate::refs::pin_slot(run, &updated, "applied", s(&rec, "after"));
+        crate::history::record_apply(run, &updated, &at, &head, "detected", None);
+        crate::events::emit(
+            &crate::events::run_id_for(run, &updated),
+            &crate::events::repo_for_meta(&updated),
+            "applied",
+            json!({
+                "name": s(&updated, "name"),
+                "appliedBy": "detected",
+                "head": head,
+            }),
+        );
+        let applied_doc = json(run.join(".applied"));
+        let _ = crate::work::on_runs_applied(
+            &[(run.to_path_buf(), updated.clone(), applied_doc)],
+            None,
+        );
         crate::board::refresh_for_run(run);
     }
     ok
@@ -933,6 +1069,7 @@ pub fn concurrent_writes(created: &Path) -> Vec<Value> {
 }
 /// How far the source moved since a finished, unapplied worktree run took its snapshot:
 /// commits advanced, changed files, and which of them overlap with this chain's own changes.
+#[allow(dead_code)]
 pub fn source_drift(run: &Path) -> Option<Value> {
     let meta = json(run.join("meta.json"));
     if !meta["worktree"].is_object() || s(&meta, "mode") != "write" || run.join(".applied").exists()
