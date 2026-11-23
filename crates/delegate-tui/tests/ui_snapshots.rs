@@ -604,3 +604,90 @@ fn premerge_status_renders_in_run_rows_detail_and_work_live_column() {
     assert!(work_screen.contains("快进 ✗ 主干已前进"), "{work_screen}");
     assert!(work_screen.contains("预合并冲突：src/lib.rs"), "{work_screen}");
 }
+
+#[test]
+fn snapshot_accounts_tab_active_marker_and_inplace_confirm_modal() {
+    use delegate_tui::app::{AppAction, ViewTab};
+    use delegate_tui::data::parse_agy_accounts_json;
+
+    let raw_accounts = r#"{
+        "root": "/tmp/fake-home/.config/delegate/agy-accounts",
+        "active": "alice",
+        "liveEmail": "alice@example.test",
+        "liveDrifted": false,
+        "runningAgy": [
+            {"pid": 4242, "run": "20261124-030000-demo", "cmdline": "agy --model gemini-4-neon"}
+        ],
+        "accounts": [
+            {
+                "id": "alice",
+                "email": "alice@example.test",
+                "label": "primary",
+                "active": true,
+                "addedAt": "2026-11-23T01:00:00Z",
+                "lastUsedAt": "2026-11-24T02:30:00Z",
+                "lastSyncedAt": "2026-11-24T02:30:00Z",
+                "tokenExpiresAt": "2026-11-24T03:30:00Z",
+                "files": ["oauth_creds.json", "google_accounts.json", "jetski-standalone-oauth-token"],
+                "fileCount": 3,
+                "source": "import-agy-swap"
+            },
+            {
+                "id": "bob",
+                "email": "bob@example.test",
+                "label": "backup",
+                "active": false,
+                "addedAt": "2026-11-23T02:00:00Z",
+                "lastUsedAt": "2026-11-23T18:15:00Z",
+                "lastSyncedAt": "2026-11-23T18:15:00Z",
+                "tokenExpiresAt": "",
+                "files": ["oauth_creds.json", "google_accounts.json"],
+                "fileCount": 2,
+                "source": "login"
+            }
+        ]
+    }"#;
+    let agy_accounts = parse_agy_accounts_json(raw_accounts);
+    assert_eq!(agy_accounts.accounts.len(), 2);
+    assert_eq!(agy_accounts.running_agy.len(), 1);
+
+    let snap = AppSnapshot {
+        agy_accounts,
+        refreshed_at: "03:40:00".into(),
+        ..AppSnapshot::default()
+    };
+    let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("."), 5);
+
+    // Press '6' to open Accounts tab
+    app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Accounts);
+    let screen = render_to_string(&mut app, 130, 30);
+    assert!(screen.contains("6账号(2)"), "{screen}");
+    assert!(screen.contains("agy 账号 (2)"), "{screen}");
+    assert!(screen.contains("★ 活跃"), "{screen}");
+    assert!(screen.contains("alice@example.test"), "{screen}");
+    assert!(screen.contains("bob@example.test"), "{screen}");
+    assert!(screen.contains("在跑 agy 进程: 1 个"), "{screen}");
+    assert!(screen.contains("pid=4242"), "{screen}");
+
+    // Move selection down to 'bob' and press Enter to open in-place confirmation modal
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert_eq!(app.selected_account_item().map(|a| a.id.as_str()), Some("bob"));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let modal_screen = render_to_string(&mut app, 130, 30);
+    assert!(modal_screen.contains("确认切换 agy 账号"), "{modal_screen}");
+    assert!(modal_screen.contains("bob (bob@example.test)"), "{modal_screen}");
+    assert!(modal_screen.contains("1 个在跑 agy 进程"), "{modal_screen}");
+    assert!(modal_screen.contains("Enter/y 确认切换"), "{modal_screen}");
+
+    // Cancel with 'n'
+    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+    assert_eq!(app.overlay, Overlay::None);
+
+    // Open with 'u' and confirm with 'y' -> emits SwitchAgyAccount("bob")
+    app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+    let act = app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    assert_eq!(act, AppAction::SwitchAgyAccount("bob".to_string()));
+    assert_eq!(app.overlay, Overlay::None);
+    assert_eq!(app.switching_account.as_deref(), Some("bob"));
+}

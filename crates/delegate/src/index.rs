@@ -569,6 +569,7 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
     let dag_queue = crate::dag_queue::load_items(&state);
     let merges = crate::merge::load_merge_reports(None);
     let candidates = crate::radar::load_all_candidates(None);
+    let agy_accounts = crate::agy_accounts::snapshot_json_fast();
 
     let payload = json!({
         "schemaVersion": SCHEMA_VERSION,
@@ -581,6 +582,7 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
         "dagQueue": dag_queue,
         "merges": merges,
         "candidates": candidates,
+        "agyAccounts": agy_accounts,
     });
     println!("{payload}");
     Ok(0)

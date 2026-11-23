@@ -179,6 +179,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "Check each tier model's connectivity through Pi itself before dispatching.",
     ),
     (
+        "agy",
+        "Manage local Antigravity CLI (agy) accounts manually: agy account list|status|add|use|remove|import-agy-swap|restore-entry.",
+    ),
+    (
         "protocol",
         "Print the harness protocol version, caller and agents as JSON.",
     ),
@@ -386,6 +390,15 @@ pub fn print(command: Option<&str>) -> bool {
             ("--tier scout|review|write", "Probe only this tier's registered candidates, including inactive rules."),
             ("--model ALIAS", "Probe one registered model instead; exclusive with --tier."),
             ("--timeout SECONDS", "Limit per model (default: 60)."),
+        ]),
+        "agy" => ("account <list|status|add|use|remove|import-agy-swap|restore-entry> [options]", "Manage local Antigravity CLI (agy) credential slots under ~/.config/delegate/agy-accounts/ (0700 dirs, 0600 files). Manual switching only — no automatic rotation and no external quota API calls.", &[
+            ("account list [--json]", "List saved slots, active marker, email, and last used time."),
+            ("account status [--json]", "Show active slot, live ~/.gemini email, running agy processes, and local token expiry."),
+            ("account add [<id>] [--label TEXT] [--overwrite] [--agy-bin PATH]", "Run interactive agy login in an isolated temporary HOME and save credentials without affecting the active account."),
+            ("account use <id> [--force] [--json]", "Save back live refreshed tokens to the active slot and atomically switch; refuses while any agy process runs in this HOME."),
+            ("account remove <id> [--force] [--json]", "Delete a saved account slot without touching live ~/.gemini files."),
+            ("account import-agy-swap [--dry-run] [--source DIR] [--overwrite] [--json]", "Import accounts from ~/.gemini/agy-swap/vault.json and accounts.json without printing tokens."),
+            ("account restore-entry [--dry-run] [--mode wrapper|symlink] [--entry PATH] [--real-bin PATH]", "Replace the agy-swap ~/.local/bin/agy wrapper with a direct exec wrapper or symlink (backs up old file)."),
         ]),
         "protocol" => ("", "Print one JSON line for harness adapters: protocol version, delegate version, the caller session and its source variable, and each agent's tier, resolved binary, version and PATH entries it shadows.", &[]),
         _ => return false,

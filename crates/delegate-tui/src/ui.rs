@@ -69,6 +69,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 render_candidates_list_pane(frame, app, body[0]);
                 render_candidate_detail_pane(frame, app, body[1]);
             }
+            ViewTab::Accounts => {
+                render_accounts_list_pane(frame, app, body[0]);
+                render_account_detail_pane(frame, app, body[1]);
+            }
             ViewTab::Work => unreachable!(),
         }
     } else {
@@ -93,6 +97,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 render_candidates_list_pane(frame, app, body[0]);
                 render_candidate_detail_pane(frame, app, body[1]);
             }
+            ViewTab::Accounts => {
+                render_accounts_list_pane(frame, app, body[0]);
+                render_account_detail_pane(frame, app, body[1]);
+            }
             ViewTab::Work => unreachable!(),
         }
     }
@@ -104,6 +112,21 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Overlay::FullResult { .. } => render_text_overlay(frame, app, chunks[1], true),
         Overlay::DiffStat { .. } => render_text_overlay(frame, app, chunks[1], false),
         Overlay::WorkCard { .. } => render_work_card_overlay(frame, app, chunks[1]),
+        Overlay::ConfirmAccountSwitch {
+            id,
+            email,
+            current_active,
+            is_already_active,
+            running_count,
+        } => render_account_switch_modal(
+            frame,
+            area,
+            id,
+            email,
+            current_active.as_deref(),
+            *is_already_active,
+            *running_count,
+        ),
         Overlay::CommandModal {
             action_label,
             command,
@@ -183,6 +206,16 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         muted()
     };
+    let tab_accounts_style = if app.tab == ViewTab::Accounts {
+        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else if app.snapshot.agy_accounts.live_drifted {
+        Style::default()
+            .fg(STATUS_PENDING)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        muted()
+    };
+    let accounts_count = app.snapshot.agy_accounts.accounts.len();
 
     let mut spans = vec![
         Span::styled(
@@ -214,6 +247,15 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
                 " 5工作 ".to_string()
             },
             tab_work_style,
+        ),
+        Span::raw(" "),
+        Span::styled(
+            if accounts_count > 0 {
+                format!(" 6账号({accounts_count}) ")
+            } else {
+                " 6账号 ".to_string()
+            },
+            tab_accounts_style,
         ),
         Span::raw("  "),
         Span::styled(
@@ -1514,39 +1556,46 @@ fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
         let keys = match app.tab {
             ViewTab::Runs => {
                 if area.width >= 100 {
-                    " jk 选择  1-5 任务·事件·合入·候选·工作  w 工作表  Tab 切栏  Enter 结论  d diff  / 过滤  r 刷新  a/c/s/p 命令  ? 帮助  q 退出"
+                    " jk 选择  1-6 任务·事件·合入·候选·工作·账号  w 工作  A 账号  Tab 切栏  Enter 结论  d diff  / 过滤  r 刷新  a/c/s/p 命令  ? 帮助  q 退出"
                 } else {
-                    " jk选 Tab栏 1-5切页 w工作 Enter结论 d diff /滤 r刷 a/c/s/p令 ?助 q退"
+                    " jk选 Tab栏 1-6切页 w工作 A账号 Enter结论 d diff /滤 r刷 a/c/s/p令 ?助 q退"
                 }
             }
             ViewTab::Events => {
                 if area.width >= 100 {
-                    " jk 浏览事件  f 切换跟随  1-5 切页  w 工作表  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
+                    " jk 浏览事件  f 切换跟随  1-6 切页  w 工作  A 账号  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
                 } else {
-                    " jk览 f跟随 1-5切页 w工作 Tab栏 /滤 r刷 ?助 q退"
+                    " jk览 f跟随 1-6切页 w工作 A账号 Tab栏 /滤 r刷 ?助 q退"
                 }
             }
             ViewTab::Merges => {
                 if area.width >= 100 {
-                    " jk 选择合入批次  a/Enter 生成 apply --keep-commits  1-5 切页  w 工作表  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
+                    " jk 选择合入批次  a/Enter 生成 apply --keep-commits  1-6 切页  w 工作  A 账号  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
                 } else {
-                    " jk选 a/Enter合回 1-5切页 w工作 Tab栏 /滤 r刷 ?助 q退"
+                    " jk选 a/Enter合回 1-6切页 w工作 A账号 Tab栏 /滤 r刷 ?助 q退"
                 }
             }
             ViewTab::Candidates => {
                 if area.width >= 100 {
-                    " jk 选择候选  p/Enter 生成 radar pick 草稿命令  1-5 切页  w 工作表  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
+                    " jk 选择候选  p/Enter 生成 radar pick 草稿命令  1-6 切页  w 工作  A 账号  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
                 } else {
-                    " jk选 p/Enter挑草稿 1-5切页 w工作 Tab栏 /滤 r刷 ?助 q退"
+                    " jk选 p/Enter挑草稿 1-6切页 w工作 A账号 Tab栏 /滤 r刷 ?助 q退"
                 }
             }
             ViewTab::Work => {
                 if area.width >= 100 {
-                    " ↑↓/jk 选择  Enter 工作卡/折叠  t/→ 跳到 run  o 等你  x 已否  / 过滤  y 复制命令  w 切任务  r 刷新  ? 帮助  q 退出"
+                    " ↑↓/jk 选择  Enter 工作卡/折叠  t/→ 跳到 run  o 等你  x 已否  / 过滤  y 复制命令  w 切任务  6 账号  r 刷新  ? 帮助  q 退出"
                 } else if area.width >= COMPACT_BREAKPOINT {
-                    " jk选 Enter卡 t跳run o等你 x已否 /滤 y复 w任务 r刷 ?助 q退"
+                    " jk选 Enter卡 t跳run o等你 x已否 /滤 y复 w任务 6账号 r刷 ?助 q退"
                 } else {
                     " ↑↓选 Enter卡 t跳run o等你 x已否 w任务 q退"
+                }
+            }
+            ViewTab::Accounts => {
+                if area.width >= 100 {
+                    " jk 选择账号  Enter/u 切换账号（就地确认）  y 复制命令  Tab 切栏  1-6 切页  / 过滤  r 刷新  ? 帮助  q 退出"
+                } else {
+                    " jk选 Enter/u切换 y复 Tab栏 1-6切页 /滤 r刷 ?助 q退"
                 }
             }
         };
@@ -1715,13 +1764,13 @@ fn render_help_modal(frame: &mut Frame, area: Rect) {
 
     let rows = [
         ("↑↓ / j k", "选择列表项 / 滚动详情"),
-        ("1-5 / w", "切换「任务 / 事件 / 合入 / 候选 / 工作表」(w 切工作表)"),
+        ("1-6 / w / A", "切换「任务 / 事件 / 合入 / 候选 / 工作表 / 账号」"),
         ("e / m / b", "快捷切换「事件 / 合入 / 候选」"),
         ("t / →", "工作表选中项跳到关联 run"),
         ("o / x", "工作表过滤「等你 / 已否」"),
         ("f", "事件页切换自动跟随"),
         ("Tab", "切换焦点栏"),
-        ("Enter", "工作卡 / 任务完整结论 / 折叠 / 命令"),
+        ("Enter / u", "工作卡 / 完整结论 / 账号切换就地确认 / 命令"),
         ("d", "diff --stat 改动统计"),
         ("/", "过滤（Esc 清除）"),
         ("r", "立即刷新"),
@@ -2614,6 +2663,8 @@ fn render_work_top_bar(frame: &mut Frame, app: &App, area: Rect) {
             " 5工作 ",
             Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
         ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("6账", muted()));
         spans.push(Span::raw("  "));
     } else {
         spans.push(Span::styled(
@@ -3572,4 +3623,434 @@ fn build_work_card_lines(app: &App, item: &WorkItem, width: usize) -> Vec<Line<'
     );
 
     out
+}
+
+// ---------------------------------------------------------------------------
+// Agy Accounts View: list, active marker, detail pane, and in-place confirm modal
+// ---------------------------------------------------------------------------
+
+fn render_accounts_list_pane(frame: &mut Frame, app: &mut App, area: Rect) {
+    let focused = app.focus == FocusPane::List && matches!(app.overlay, Overlay::None);
+    let total = app.filtered_accounts.len();
+    let running_n = app.snapshot.agy_accounts.running_agy.len();
+    let title_text = if app.filter.is_empty() {
+        if running_n > 0 {
+            format!(" agy 账号 ({total}) · 在跑 {running_n} ")
+        } else {
+            format!(" agy 账号 ({total}) ")
+        }
+    } else {
+        format!(" agy 账号 ({total}) · 过滤 ")
+    };
+    let title = Line::from(Span::styled(
+        title_text,
+        if focused { bold_primary() } else { muted() },
+    ));
+    let block = rounded_block(title, focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    if app.filtered_accounts.is_empty() {
+        let msg = if !app.filter.is_empty() {
+            format!("无匹配“{}”的 agy 账号", app.filter)
+        } else {
+            "暂无 agy 账号 · 运行 delegate agy account add 或 import-agy-swap --dry-run".to_string()
+        };
+        let lines = wrap_text(&msg, inner.width.saturating_sub(2) as usize)
+            .into_iter()
+            .map(|l| Line::from(Span::styled(format!(" {l}"), muted())))
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+
+    let iw = inner.width as usize;
+    let show_header = inner.height >= 4;
+    let header_h: usize = if show_header { 1 } else { 0 };
+    let view_h = (inner.height as usize).saturating_sub(header_h);
+
+    if let Some(sel) = app.selected_account {
+        if sel < app.accounts_scroll {
+            app.accounts_scroll = sel;
+        } else if view_h > 0 && sel >= app.accounts_scroll + view_h {
+            app.accounts_scroll = sel + 1 - view_h;
+        }
+    }
+    let max_scroll = app.filtered_accounts.len().saturating_sub(view_h);
+    if app.accounts_scroll > max_scroll {
+        app.accounts_scroll = max_scroll;
+    }
+
+    let id_w: usize = if iw >= 56 { 14 } else { 10 };
+    let used_w: usize = if iw >= 52 { 16 } else { 0 };
+    let status_w: usize = 6; // "★ 活跃" or "  备用"
+    let email_w: usize = iw
+        .saturating_sub(2 + status_w + 1 + id_w + 1 + if used_w > 0 { 1 + used_w } else { 0 })
+        .max(8);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
+    if show_header {
+        let mut hdr = String::new();
+        hdr.push_str("  ");
+        hdr.push_str(&pad_right("状态", status_w));
+        hdr.push(' ');
+        hdr.push_str(&pad_right("槽位", id_w));
+        hdr.push(' ');
+        hdr.push_str(&pad_right("邮箱", email_w));
+        if used_w > 0 {
+            hdr.push(' ');
+            hdr.push_str(&pad_left("最后使用", used_w));
+        }
+        lines.push(Line::from(Span::styled(truncate(&hdr, iw), muted())));
+    }
+
+    for (pos, &acct_idx) in app
+        .filtered_accounts
+        .iter()
+        .enumerate()
+        .skip(app.accounts_scroll)
+        .take(view_h)
+    {
+        let acct = &app.snapshot.agy_accounts.accounts[acct_idx];
+        let selected = app.selected_account == Some(pos);
+        let stripe = if selected {
+            Span::styled("▎ ", Style::default().fg(STATUS_QUEUED).add_modifier(Modifier::BOLD))
+        } else {
+            Span::raw("  ")
+        };
+        let (badge_txt, badge_style) = if acct.active {
+            (
+                pad_right("★ 活跃", status_w),
+                Style::default()
+                    .fg(STATUS_RUNNING)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (pad_right("  备用", status_w), muted())
+        };
+        let id_style = if selected || acct.active {
+            bold_primary()
+        } else {
+            primary()
+        };
+        let email_text = if acct.email.is_empty() {
+            "-"
+        } else {
+            acct.email.as_str()
+        };
+        let mut row_spans = vec![
+            stripe,
+            Span::styled(badge_txt, badge_style),
+            Span::raw(" "),
+            Span::styled(pad_right(&acct.id, id_w), id_style),
+            Span::raw(" "),
+            Span::styled(pad_right(email_text, email_w), if selected { primary() } else { muted() }),
+        ];
+        if used_w > 0 {
+            let used_short = format_iso_compact(&acct.last_used_at);
+            row_spans.push(Span::raw(" "));
+            row_spans.push(Span::styled(pad_left(&used_short, used_w), muted()));
+        }
+        let line = if selected {
+            Line::from(row_spans).style(Style::default().add_modifier(Modifier::BOLD))
+        } else {
+            Line::from(row_spans)
+        };
+        lines.push(line);
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn format_iso_compact(iso: &str) -> String {
+    let t = iso.trim();
+    if t.is_empty() {
+        return "-".to_string();
+    }
+    if t.len() >= 16 && t.as_bytes()[10] == b'T' {
+        return format!("{} {}", &t[5..10], &t[11..16]);
+    }
+    truncate(t, 16)
+}
+
+fn render_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
+    let focused = app.focus == FocusPane::Detail && matches!(app.overlay, Overlay::None);
+    let title = match app.selected_account_item() {
+        Some(a) => format!(" 账号详情 · {} ", a.id),
+        None => " 账号详情 ".to_string(),
+    };
+    let block = rounded_block(
+        Line::from(Span::styled(
+            title,
+            if focused { bold_primary() } else { muted() },
+        )),
+        focused,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let iw = inner.width as usize;
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let state = &app.snapshot.agy_accounts;
+
+    if let Some(err) = &app.account_switch_error {
+        out.push(Line::from(Span::styled(
+            "▸ 上次切换被拒绝 / 失败（Esc 清除）",
+            Style::default()
+                .fg(STATUS_FAILED)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for line in err.lines() {
+            push_indented_wrapped(
+                &mut out,
+                "  ",
+                line,
+                iw,
+                Style::default().fg(STATUS_FAILED),
+            );
+        }
+        out.push(Line::raw(""));
+    }
+
+    if let Some(acct) = app.selected_account_item() {
+        let status_label = if acct.active {
+            "★ 当前活跃"
+        } else {
+            "备用槽位"
+        };
+        let status_style = if acct.active {
+            Style::default()
+                .fg(STATUS_RUNNING)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            muted()
+        };
+        out.push(Line::from(vec![
+            Span::styled("槽位: ", muted()),
+            Span::styled(acct.id.clone(), bold_primary()),
+            Span::raw("  "),
+            Span::styled(status_label, status_style),
+        ]));
+        if !acct.email.is_empty() {
+            out.push(Line::from(vec![
+                Span::styled("邮箱: ", muted()),
+                Span::styled(acct.email.clone(), primary()),
+            ]));
+        }
+        if !acct.label.is_empty() {
+            out.push(Line::from(vec![
+                Span::styled("备注: ", muted()),
+                Span::styled(acct.label.clone(), primary()),
+            ]));
+        }
+        out.push(Line::from(vec![
+            Span::styled("最后使用: ", muted()),
+            Span::styled(
+                if acct.last_used_at.is_empty() {
+                    "-"
+                } else {
+                    acct.last_used_at.as_str()
+                }
+                .to_string(),
+                primary(),
+            ),
+        ]));
+        if !acct.last_synced_at.is_empty() {
+            out.push(Line::from(vec![
+                Span::styled("最近回存: ", muted()),
+                Span::styled(acct.last_synced_at.clone(), muted()),
+            ]));
+        }
+        if !acct.token_expires_at.is_empty() {
+            out.push(Line::from(vec![
+                Span::styled("本地令牌到期: ", muted()),
+                Span::styled(acct.token_expires_at.clone(), muted()),
+            ]));
+        }
+        out.push(Line::from(vec![
+            Span::styled("凭据文件: ", muted()),
+            Span::styled(
+                format!("{} 份（仅本地 0600，不打印令牌）", acct.file_count),
+                primary(),
+            ),
+        ]));
+        if !acct.files.is_empty() {
+            push_indented_wrapped(&mut out, "  ", &acct.files.join(", "), iw, muted());
+        }
+        if !acct.source.is_empty() {
+            out.push(Line::from(vec![
+                Span::styled("来源: ", muted()),
+                Span::styled(acct.source.clone(), muted()),
+            ]));
+        }
+        out.push(Line::raw(""));
+    }
+
+    // Live environment & running agy processes section
+    out.push(section_header("本机状态"));
+    if !state.live_email.is_empty() {
+        let style = if state.live_drifted {
+            Style::default()
+                .fg(STATUS_PENDING)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            primary()
+        };
+        let drift_note = if state.live_drifted {
+            "（与活跃槽位不一致）"
+        } else {
+            ""
+        };
+        push_indented_wrapped(
+            &mut out,
+            "  ",
+            &format!("~/.gemini 当前账号: {}{drift_note}", state.live_email),
+            iw,
+            style,
+        );
+    }
+    let run_cnt = state.running_agy.len();
+    let proc_style = if run_cnt > 0 {
+        Style::default()
+            .fg(STATUS_PENDING)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(STATUS_RUNNING)
+    };
+    let proc_summary = if run_cnt > 0 {
+        format!("在跑 agy 进程: {run_cnt} 个（有进程时拒绝切换，确保令牌不冲突）")
+    } else {
+        "在跑 agy 进程: 0 个（可安全手动切换）".to_string()
+    };
+    push_indented_wrapped(&mut out, "  ", &proc_summary, iw, proc_style);
+    for p in state.running_agy.iter().take(6) {
+        let line = match &p.run {
+            Some(r) => format!("pid={} (run: {}) {}", p.pid, r, p.cmdline),
+            None => format!("pid={} {}", p.pid, p.cmdline),
+        };
+        push_indented_wrapped(&mut out, "    ", &line, iw, muted());
+    }
+    if state.running_agy.len() > 6 {
+        push_indented_wrapped(
+            &mut out,
+            "    ",
+            &format!("… 另有 {} 个 agy 进程", state.running_agy.len() - 6),
+            iw,
+            muted(),
+        );
+    }
+
+    out.push(Line::raw(""));
+    out.push(section_header("操作说明"));
+    push_indented_wrapped(
+        &mut out,
+        "  ",
+        "按 Enter 或 u 弹出就地确认并切换选中账号；不做自动轮换，不调外部额度接口。",
+        iw,
+        muted(),
+    );
+    push_indented_wrapped(
+        &mut out,
+        "  ",
+        "新增账号请在终端运行: delegate agy account add [<id>]",
+        iw,
+        muted(),
+    );
+
+    let view_h = inner.height as usize;
+    let max_scroll = out.len().saturating_sub(view_h);
+    if app.detail_scroll > max_scroll {
+        app.detail_scroll = max_scroll;
+    }
+    let visible: Vec<Line> = out
+        .into_iter()
+        .skip(app.detail_scroll)
+        .take(view_h)
+        .collect();
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_account_switch_modal(
+    frame: &mut Frame,
+    area: Rect,
+    target_id: &str,
+    target_email: &str,
+    current_active: Option<&str>,
+    is_already_active: bool,
+    running_count: usize,
+) {
+    let w = area.width.saturating_sub(6).clamp(40, 76);
+    let h = if running_count > 0 { 11u16 } else { 9u16 }.min(area.height.saturating_sub(2));
+    let modal = centered_rect(area, w, h);
+    frame.render_widget(Clear, modal);
+
+    let title_style = if running_count > 0 {
+        Style::default()
+            .fg(STATUS_FAILED)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(STATUS_PENDING)
+            .add_modifier(Modifier::BOLD)
+    };
+    let block = rounded_block(
+        Line::from(Span::styled(" 确认切换 agy 账号 ", title_style)),
+        true,
+    )
+    .title_bottom(Line::from(Span::styled(
+        " Enter/y 确认切换 · Esc/n 取消 ",
+        muted(),
+    )));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let iw = inner.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    let target_desc = if target_email.is_empty() {
+        target_id.to_string()
+    } else {
+        format!("{target_id} ({target_email})")
+    };
+    lines.push(Line::from(vec![
+        Span::styled("目标账号: ", muted()),
+        Span::styled(truncate(&target_desc, iw.saturating_sub(10)), bold_primary()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("当前活跃: ", muted()),
+        Span::styled(current_active.unwrap_or("无").to_string(), primary()),
+    ]));
+    lines.push(Line::raw(""));
+
+    let note = if is_already_active {
+        "该账号已是当前活跃账号；确认后将把当前最新刷新令牌回存到槽位并保持激活。"
+    } else {
+        "确认后将先回存当前活跃账号的刷新令牌，再原子替换本地 agy 凭据（手动切换，不做自动轮换）。"
+    };
+    for l in wrap_text(note, iw) {
+        lines.push(Line::from(Span::styled(l, primary())));
+    }
+    if running_count > 0 {
+        lines.push(Line::raw(""));
+        let warn = format!(
+            "注意：当前检测到 {running_count} 个在跑 agy 进程，确认后命令将安全拒绝并列出进程。"
+        );
+        for l in wrap_text(&warn, iw) {
+            lines.push(Line::from(Span::styled(
+                l,
+                Style::default()
+                    .fg(STATUS_FAILED)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }

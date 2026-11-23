@@ -1,5 +1,11 @@
 # delegate
 
+## 6.38 agy 本地多账号管理与迁移
+
+- 管理多个 `agy` 账号替代 `agy-swap`：`delegate agy account add <id>` 在隔离临时 HOME 跑交互登录并将 6 份凭据文件（`0700`/`0600`）收入 `~/.config/delegate/agy-accounts/<id>/`，不影响当前活跃账号；`list`/`status` 展示活跃槽位、最后使用时间与在跑 `agy` 进程，永不打印令牌、不调外部 Google 额度接口、不做自动轮换。Local manual `agy` multi-account slots with 0700/0600 permissions, isolated temp-HOME login, no auto-rotation, and no external quota polling.
+- 手动切换与防竞态：`delegate agy account use <id>` 持排他锁，先将当前活跃账号被 `agy` 刷新过的最新凭据回存到原槽位再原子替换并清理残留 `credential-user-scope`；同 HOME 存在在跑 `agy` 进程时拒绝切换并列出 PID 与 delegate run。File-locked manual account switch saving back refreshed tokens first and refusing while `agy` processes run in the same HOME.
+- 迁移与 TUI：`delegate agy account import-agy-swap --dry-run` 预览从 `agy-swap` vault/accounts 导入的槽位且不打印令牌，`restore-entry --dry-run` 预览备份并恢复 `~/.local/bin/agy` 为直连 `~/.local/libexec/agy` 的最小包装或符号链接；`delegate tui` 新增「6账号」页（`6`/`A` 切页、活跃标记、`Enter`/`u` 就地确认切换）。Dry-run/execute `agy-swap` import, entry-point restoration, and TUI Accounts tab with in-place switch confirmation.
+
 ## 6.37 返工/续做各轮答复保留与审查卡索引（W051）
 
 - 审-改自动返工（或 `reply` 续做链）保留各轮原文：触发 `REWORK` 前将上一轮答复持久化为 `round-N-result.md`（不覆盖旧结论与实测数字，`result.md` 始终镜像最新一轮；归档 `archive/<run>/record/` 与轻量保留均完整保存并纳入证据引用扫描）；`delegate card <run>` 第 1 段在多轮时确定性列出每轮原文路径与行/字数（单轮不变）；`delegate result <run>` 支持 `--round N`（越界给 `1..=N` 范围）、`--all`、`--rounds`（不标已读）、`--path` 与 `--json` 查看任意轮或全部轮次，包括已归档的父 run。Preserve per-round results (`round-N-result.md`) across review-rework and reply chains (including archived ancestors), link every round's original path in review card section 1, and inspect rounds via `delegate result --round/--all/--rounds/--json`.

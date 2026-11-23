@@ -20,6 +20,7 @@ pub enum ViewTab {
     Merges,
     Candidates,
     Work,
+    Accounts,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +107,13 @@ pub enum Overlay {
         work_id: String,
         scroll: usize,
     },
+    ConfirmAccountSwitch {
+        id: String,
+        email: String,
+        current_active: Option<String>,
+        is_already_active: bool,
+        running_count: usize,
+    },
     Help,
 }
 
@@ -172,6 +180,7 @@ pub enum AppAction {
     OpenDiffStat,
     CopyClipboard(String),
     OpenPager(String),
+    SwitchAgyAccount(String),
     Quit,
     QuitAndPrint(String),
 }
@@ -195,6 +204,11 @@ pub struct App {
     pub filtered_candidates: Vec<usize>,
     pub selected_candidate: Option<usize>,
     pub candidates_scroll: usize,
+    pub filtered_accounts: Vec<usize>,
+    pub selected_account: Option<usize>,
+    pub accounts_scroll: usize,
+    pub switching_account: Option<String>,
+    pub account_switch_error: Option<String>,
     pub work_rows: Vec<WorkRow>,
     pub selected_work_row: Option<usize>,
     pub work_scroll_line: usize,
@@ -242,6 +256,11 @@ impl App {
             filtered_candidates: Vec::new(),
             selected_candidate: None,
             candidates_scroll: 0,
+            filtered_accounts: Vec::new(),
+            selected_account: None,
+            accounts_scroll: 0,
+            switching_account: None,
+            account_switch_error: None,
             work_rows: Vec::new(),
             selected_work_row: None,
             work_scroll_line: 0,
@@ -538,6 +557,35 @@ impl App {
                 .or(Some(0));
         } else {
             self.selected_candidate = Some(0);
+        }
+
+        // Rebuild filtered agy accounts list preserving selection by account id.
+        let prev_acct_id = self.selected_account_item().map(|a| a.id.clone());
+        self.filtered_accounts = self
+            .snapshot
+            .agy_accounts
+            .accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.matches_filter(&query))
+            .map(|(i, _)| i)
+            .collect();
+        if self.filtered_accounts.is_empty() {
+            self.selected_account = None;
+            self.accounts_scroll = 0;
+        } else if let Some(ref aid) = prev_acct_id {
+            self.selected_account = self
+                .filtered_accounts
+                .iter()
+                .position(|&idx| self.snapshot.agy_accounts.accounts[idx].id == *aid)
+                .or(Some(0));
+        } else {
+            // Default select active account if present, else first
+            self.selected_account = self
+                .filtered_accounts
+                .iter()
+                .position(|&idx| self.snapshot.agy_accounts.accounts[idx].active)
+                .or(Some(0));
         }
 
         // Restore prior selection if present; else prefer first visible Run, falling back to first selectable.
@@ -1132,6 +1180,53 @@ impl App {
         self.snapshot.candidates.get(idx)
     }
 
+    pub fn selected_account_item(&self) -> Option<&AgyAccountItem> {
+        let pos = self.selected_account?;
+        let &idx = self.filtered_accounts.get(pos)?;
+        self.snapshot.agy_accounts.accounts.get(idx)
+    }
+
+    pub fn move_account_selection(&mut self, delta: isize) -> bool {
+        if self.filtered_accounts.is_empty() {
+            self.selected_account = None;
+            return false;
+        }
+        let len = self.filtered_accounts.len();
+        let cur = self.selected_account.unwrap_or(0);
+        let next = if delta >= 0 {
+            (cur + delta as usize).min(len - 1)
+        } else {
+            cur.saturating_sub((-delta) as usize)
+        };
+        if Some(next) != self.selected_account {
+            self.selected_account = Some(next);
+            self.detail_scroll = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn open_account_switch_confirm(&mut self) -> bool {
+        if self.switching_account.is_some() {
+            self.set_toast("正在切换账号，请稍候…");
+            return false;
+        }
+        let Some(acct) = self.selected_account_item().cloned() else {
+            self.set_toast("当前没有可切换的 agy 账号");
+            return false;
+        };
+        self.overlay = Overlay::ConfirmAccountSwitch {
+            id: acct.id,
+            email: acct.email,
+            current_active: self.snapshot.agy_accounts.active.clone(),
+            is_already_active: acct.active,
+            running_count: self.snapshot.agy_accounts.running_agy.len(),
+        };
+        self.dirty = true;
+        true
+    }
+
     pub fn move_merge_selection(&mut self, delta: isize) -> bool {
         if self.filtered_merges.is_empty() {
             self.selected_merge = None;
@@ -1417,6 +1512,24 @@ impl App {
                     _ => AppAction::None,
                 }
             }
+            Overlay::ConfirmAccountSwitch { id, .. } => {
+                let target_id = id.clone();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+                        self.overlay = Overlay::None;
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                    KeyCode::Enter | KeyCode::Char('y') => {
+                        self.overlay = Overlay::None;
+                        self.switching_account = Some(target_id.clone());
+                        self.account_switch_error = None;
+                        self.dirty = true;
+                        AppAction::SwitchAgyAccount(target_id)
+                    }
+                    _ => AppAction::None,
+                }
+            }
             Overlay::WorkCard { work_id, scroll } => {
                 let wid = work_id.clone();
                 match key.code {
@@ -1570,6 +1683,25 @@ impl App {
                 }
                 return AppAction::None;
             }
+            KeyCode::Char('6') => {
+                if self.tab != ViewTab::Accounts {
+                    self.tab = ViewTab::Accounts;
+                    self.detail_scroll = 0;
+                    self.dirty = true;
+                    return AppAction::Redraw;
+                }
+                return AppAction::None;
+            }
+            KeyCode::Char('A') => {
+                self.tab = if self.tab == ViewTab::Accounts {
+                    ViewTab::Runs
+                } else {
+                    ViewTab::Accounts
+                };
+                self.detail_scroll = 0;
+                self.dirty = true;
+                return AppAction::Redraw;
+            }
             KeyCode::Char('w') => {
                 if self.tab == ViewTab::Work {
                     self.tab = ViewTab::Runs;
@@ -1632,6 +1764,160 @@ impl App {
                 return AppAction::Redraw;
             }
             _ => {}
+        }
+
+        if self.tab == ViewTab::Accounts {
+            return match key.code {
+                KeyCode::Char('q') => AppAction::Quit,
+                KeyCode::Tab | KeyCode::BackTab => {
+                    self.focus = match self.focus {
+                        FocusPane::List => FocusPane::Detail,
+                        FocusPane::Detail => FocusPane::List,
+                    };
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                KeyCode::Down | KeyCode::Char('j') => match self.focus {
+                    FocusPane::List => {
+                        if self.move_account_selection(1) {
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = self.detail_scroll.saturating_add(1);
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                },
+                KeyCode::Up | KeyCode::Char('k') => match self.focus {
+                    FocusPane::List => {
+                        if self.move_account_selection(-1) {
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                },
+                KeyCode::PageDown => match self.focus {
+                    FocusPane::List => {
+                        if self.move_account_selection(10) {
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = self.detail_scroll.saturating_add(10);
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                },
+                KeyCode::PageUp => match self.focus {
+                    FocusPane::List => {
+                        if self.move_account_selection(-10) {
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = self.detail_scroll.saturating_sub(10);
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                },
+                KeyCode::Home | KeyCode::Char('g') => match self.focus {
+                    FocusPane::List => {
+                        if !self.filtered_accounts.is_empty() {
+                            self.selected_account = Some(0);
+                            self.detail_scroll = 0;
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = 0;
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                },
+                KeyCode::End | KeyCode::Char('G') => match self.focus {
+                    FocusPane::List => {
+                        if !self.filtered_accounts.is_empty() {
+                            self.selected_account = Some(self.filtered_accounts.len() - 1);
+                            self.detail_scroll = 0;
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = usize::MAX / 2;
+                        self.dirty = true;
+                        AppAction::Redraw
+                    }
+                },
+                KeyCode::Enter | KeyCode::Char('u') => {
+                    self.open_account_switch_confirm();
+                    AppAction::Redraw
+                }
+                KeyCode::Char('y') => {
+                    if let Some(a) = self.selected_account_item() {
+                        let cmd = format!(
+                            "{} agy account use {}",
+                            shell_quote(&self.delegate_bin.to_string_lossy()),
+                            shell_quote(&a.id)
+                        );
+                        AppAction::CopyClipboard(cmd)
+                    } else {
+                        AppAction::None
+                    }
+                }
+                KeyCode::Char('r') => AppAction::Refresh,
+                KeyCode::Char('/') => {
+                    self.filter_mode = true;
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                KeyCode::Esc => {
+                    let mut changed = false;
+                    if !self.filter.is_empty() {
+                        self.filter.clear();
+                        self.rebuild_rows(None);
+                        changed = true;
+                    }
+                    if self.account_switch_error.is_some() {
+                        self.account_switch_error = None;
+                        changed = true;
+                    }
+                    if changed {
+                        self.dirty = true;
+                        AppAction::Redraw
+                    } else {
+                        AppAction::None
+                    }
+                }
+                KeyCode::Char('?') => {
+                    self.overlay = Overlay::Help;
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                _ => AppAction::None,
+            };
         }
 
         if self.tab == ViewTab::Work {

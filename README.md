@@ -28,6 +28,8 @@
 
 `delegate` 架构总览：[docs/assets/delegate-architecture.webp](docs/assets/delegate-architecture.webp)（提示词同目录）。
 
+`delegate` 6.38.0：内置本地 `agy` 多账号管理与 TUI 账号页，替换第三方 `agy-swap`——新增 `delegate agy account list|status|add|use|remove|import-agy-swap|restore-entry`（凭据隔离存于 `~/.config/delegate/agy-accounts/<id>/`，目录 `0700`/文件 `0600`，永不打印令牌、不做自动轮换、不调外部额度接口）；`add` 在独立临时 HOME 跑交互登录不干扰活跃账号，`use` 全程排他锁并先回存刷新过的令牌再原子切换、有同 HOME 在跑 `agy` 进程时拒绝切换并列出 PID 与 run；`import-agy-swap [--dry-run]` 支持解码 `agy-swap` 的 `go-keyring-base64:` vault 导入槽位，`restore-entry [--dry-run]` 备份并恢复 `~/.local/bin/agy` 为直连 `~/.local/libexec/agy` 的最小包装或符号链接；`delegate-tui` 新增「6账号」标签页（`6`/`A` 切页、活跃标记、就地确认切换），详见 [agy 账号与迁移](skills/delegate/references/agy-accounts.md)。
+
 `delegate` 6.37.0：按「压缩即索引」保留各轮答复（W051）——审-改自动返工前将上一轮答复持久化为 `round-N-result.md`（不覆盖旧结论与实测数字，`result.md` 仍镜像最新一轮；归档与轻量保留均完整保存）；审查卡第 1 段在存在多轮（审-改返工或 `reply` 续做链，含已归档父 run）时确定性列出每轮原文路径与行/字数；`delegate result <run>` 支持 `--round N`、`--all`、`--rounds`、`--path` 与 `--json` 查看任意轮或全部轮次。
 
 `delegate` 6.36.1：修复 Stop 钩子事件游标无法消除及过期告警误拦——非 `--follow`、非 `--json` 的 `delegate events` 打印完后经短锁原子推进调用方（`DELEGATE_CALLER`/`CLAUDE_CODE_SESSION_ID` 等，未设时走 `default`）在 `cursors.json` 中的游标到最后打印的 `seq`（`--json`/`--follow` 不推进），照钩子提示执行 `delegate events --since N` 即可放行；Stop 钩子不再将已关闭/放弃/脱离 `ready` 的 `work_ready`、已闭环或重暂缓的 `work_defer_expired`/`work_stale`、已恢复的 `queue_paused` 与已 `apply`/`clean`/`reply`/结束/签字的 run 告警计作未读。

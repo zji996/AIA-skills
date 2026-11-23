@@ -1064,6 +1064,55 @@ pub struct WorkCounts {
     pub dropped_total: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RunningAgyProc {
+    pub pid: u32,
+    pub run: Option<String>,
+    pub cmdline: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AgyAccountItem {
+    pub id: String,
+    pub email: String,
+    pub label: String,
+    pub active: bool,
+    pub added_at: String,
+    pub last_used_at: String,
+    pub last_synced_at: String,
+    pub token_expires_at: String,
+    pub file_count: usize,
+    pub files: Vec<String>,
+    pub source: String,
+}
+
+impl AgyAccountItem {
+    pub fn matches_filter(&self, query_lower: &str) -> bool {
+        if query_lower.is_empty() {
+            return true;
+        }
+        [
+            self.id.as_str(),
+            self.email.as_str(),
+            self.label.as_str(),
+            self.source.as_str(),
+            if self.active { "活跃 active" } else { "备用" },
+        ]
+        .iter()
+        .any(|h| h.to_lowercase().contains(query_lower))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct AgyAccountsState {
+    pub root: String,
+    pub active: Option<String>,
+    pub live_email: String,
+    pub live_drifted: bool,
+    pub running_agy: Vec<RunningAgyProc>,
+    pub accounts: Vec<AgyAccountItem>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppSnapshot {
     pub repos: Vec<RepoGroup>,
@@ -1073,6 +1122,7 @@ pub struct AppSnapshot {
     pub dag_queue: Vec<DagQueueItem>,
     pub merges: Vec<MergeRunItem>,
     pub candidates: Vec<RadarCandidateItem>,
+    pub agy_accounts: AgyAccountsState,
     pub host_load: Option<HostLoad>,
     pub today_ymd: String,
     pub refreshed_at: String,
@@ -1090,6 +1140,7 @@ impl AppSnapshot {
         self.dag_queue.hash(&mut h);
         self.merges.hash(&mut h);
         self.candidates.hash(&mut h);
+        self.agy_accounts.hash(&mut h);
         self.host_load.hash(&mut h);
         self.warnings.hash(&mut h);
         h.finish()

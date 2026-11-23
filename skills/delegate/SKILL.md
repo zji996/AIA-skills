@@ -4,7 +4,7 @@ description: 把可独立验收的任务交给同事 Agent 在后台并行完成
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI（pi-kit 的 rpi 通道下 `pi` 即 rpi）。
 metadata:
-  version: "6.37.0"
+  version: "6.38.0"
   binary: delegate
   extra-binaries: delegate-tui
   exclude-agents: pi
@@ -42,7 +42,7 @@ $D wait                                                                  # 放�
 | 发散侦察（Radar）与候选板 | `$D radar` 按 `.delegate.json` `radar.collect` 顺序采集并算指纹，未变零 token 退出；变化时派只读 scout 侦察，Host 校验锚点（`文件:行`/commit/输出行号，无锚丢弃）去重写 `<state>/radar/<repo>/board.md`；`$D radar list` 查看，`$D radar pick <id>` 生成任务说明草稿不自动派活，`$D radar schedule` 输出 00:30–04:30 每 2 小时定时安装说明，见 [合入员与 Radar](references/merge-and-radar.md) |
 | 统一工作表与 Stop 钩子 | `$D work`（6 列紧凑表并合入未绑定 run，零改动交付显「已收取」、已 clean run 不影响状态）、`$D work show/add/wait/close/drop/defer/import-md`、`start --work <ID>`、`--after-applied`；唯一零锁零 git Stop 钩子统一事件/提问/waiter/未合入，延后走 `work defer`，`$D hook stats` 按周统计；`note` 为薄壳，见 [工作表](references/worktable.md) |
 | `/clear` 前交接 / 查历史与看板 | `$D handoff` 写一页交接索引（含待办）；`$D history [关键词…]` 查永久索引；`$D show <run>` 看摘要、合入后同文件提交与归档；`$D board` 打印/刷新自动看板（`.delegate.json` `board` 配路径） |
-| 交互式终端看板（只读 TUI） | `$D tui`（自动 exec 同目录或 PATH 中的 `delegate-tui`，随 `install.sh` / `fetch-binary.sh` 安装）：跨仓库按状态分组、任务行判活与审查状态、确定性续派队列及「任务 / 事件 / 合入 / 候选」四标签页（`1-4`/`e`/`m`/`b` 切页、`f` 跟随、`↑↓`/`jk` 选择、`Tab` 切栏、`Enter` 结论/命令、`d` diff 统计、`/` 过滤、`r` 刷新、`a/c/s/p` 生成写命令并复制、`q` 退出） |
+| 交互式终端看板与 agy 多账号 | `$D tui`（exec `delegate-tui`，6 标签页：任务/事件/合入/候选/工作表/账号，`1-6`/`w`/`A` 切页、`Enter`/`u` 账号就地确认切换）；`$D agy account list\|status\|add\|use\|remove\|import-agy-swap\|restore-entry` 本地手工管理 agy 凭据槽位（0700/0600、有在跑 agy 拒切、不做自动轮换、不调额度接口），见 [agy 账号与迁移](references/agy-accounts.md) |
 
 `start`/`run` 派发前比对在跑与近 14 天 `history`，相似时在 stderr 提示最多 3 条（只提示不拦截）。
 

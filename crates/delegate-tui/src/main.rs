@@ -43,8 +43,8 @@ fn print_help() {
          \x20 --version           Print version\n\
          \x20 -h, --help          Show this help\n\n\
          Keys:\n\
-         \x20 ↑↓/jk select/scroll  Tab switch pane  Enter full result  d diff --stat\n\
-         \x20 / filter  r refresh  a/c/s/p show write command  y copy  ? help  q quit",
+         \x20 ↑↓/jk select/scroll  1-6/w/A tabs  Tab switch pane  Enter full result / confirm switch\n\
+         \x20 d diff --stat  / filter  r refresh  a/c/s/p write command  y copy  ? help  q quit",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -141,6 +141,9 @@ enum WorkerCmd {
         run_id: String,
         title: String,
     },
+    SwitchAgyAccount {
+        id: String,
+    },
     Shutdown,
 }
 
@@ -160,6 +163,10 @@ enum WorkerEvent {
         cache_key: String,
         run_id: String,
         title: String,
+        result: Result<String, String>,
+    },
+    AgyAccountSwitched {
+        id: String,
         result: Result<String, String>,
     },
 }
@@ -314,6 +321,15 @@ fn spawn_worker(
                             title,
                             result,
                         })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                WorkerCmd::SwitchAgyAccount { id } => {
+                    let result = client.switch_agy_account(&id);
+                    if tx_ev
+                        .send(WorkerEvent::AgyAccountSwitched { id, result })
                         .is_err()
                     {
                         break;
@@ -594,6 +610,25 @@ fn main() {
                         open_diff_overlay_from_result(&mut app, &run_id, &title, result);
                     }
                 }
+                WorkerEvent::AgyAccountSwitched { id, result } => {
+                    app.switching_account = None;
+                    match result {
+                        Ok(msg) => {
+                            app.account_switch_error = None;
+                            app.set_toast(msg);
+                        }
+                        Err(err) => {
+                            let first_line = err.lines().next().unwrap_or("切换失败").to_string();
+                            app.account_switch_error = Some(err);
+                            app.set_toast(format!("切换 {id} 失败：{first_line}"));
+                        }
+                    }
+                    if !refresh_in_flight {
+                        refresh_in_flight = true;
+                        let _ = tx_worker.send(WorkerCmd::Refresh { force: true });
+                        last_refresh = Instant::now();
+                    }
+                }
             }
         }
 
@@ -683,6 +718,10 @@ fn main() {
                             AppAction::OpenPager(content) => {
                                 let _ = open_in_pager(&mut terminal, &content);
                                 app.dirty = true;
+                            }
+                            AppAction::SwitchAgyAccount(id) => {
+                                app.set_toast(format!("正在切换到 agy 账号 {id}…"));
+                                let _ = tx_worker.send(WorkerCmd::SwitchAgyAccount { id });
                             }
                             AppAction::Quit => break,
                             AppAction::QuitAndPrint(cmd) => {

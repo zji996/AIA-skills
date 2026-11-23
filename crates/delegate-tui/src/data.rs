@@ -175,6 +175,73 @@ impl DelegateClient {
         parse_candidates_jsonl(&stdout)
     }
 
+    pub fn fetch_agy_accounts(&self) -> AgyAccountsState {
+        let Ok(output) = Command::new(&self.bin)
+            .args(["agy", "account", "list", "--json"])
+            .output()
+        else {
+            return AgyAccountsState::default();
+        };
+        if !output.status.success() {
+            return AgyAccountsState::default();
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        parse_agy_accounts_json(&stdout)
+    }
+
+    pub fn switch_agy_account(&self, id: &str) -> Result<String, String> {
+        let output = Command::new(&self.bin)
+            .args(["agy", "account", "use", id, "--json"])
+            .output()
+            .map_err(|e| format!("无法执行 agy account use: {e}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if let Ok(v) = serde_json::from_str::<Value>(stdout.trim()) {
+            if v.get("ok").and_then(Value::as_bool) == Some(true) {
+                let email = v.get("email").and_then(Value::as_str).unwrap_or("");
+                return if email.is_empty() {
+                    Ok(format!("已切换 agy 账号：{id}"))
+                } else {
+                    Ok(format!("已切换 agy 账号：{id} ({email})"))
+                };
+            }
+            let msg = v
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("切换失败");
+            if let Some(procs) = v.get("runningAgy").and_then(Value::as_array) {
+                if !procs.is_empty() {
+                    let mut lines = vec![msg.to_string()];
+                    for p in procs.iter().take(6) {
+                        let pid = p.get("pid").and_then(Value::as_u64).unwrap_or(0);
+                        let run = p.get("run").and_then(Value::as_str).unwrap_or("");
+                        let cmd = p.get("cmdline").and_then(Value::as_str).unwrap_or("");
+                        if run.is_empty() {
+                            lines.push(format!("pid={pid} {cmd}"));
+                        } else {
+                            lines.push(format!("pid={pid} (run: {run}) {cmd}"));
+                        }
+                    }
+                    if procs.len() > 6 {
+                        lines.push(format!("… 共 {} 个 agy 进程", procs.len()));
+                    }
+                    return Err(lines.join("\n"));
+                }
+            }
+            return Err(msg.to_string());
+        }
+        if output.status.success() {
+            Ok(format!("已切换 agy 账号：{id}"))
+        } else {
+            let err = single_line(&stderr);
+            if err.is_empty() {
+                Err(format!("切换失败（退出码 {:?}）", output.status.code()))
+            } else {
+                Err(err)
+            }
+        }
+    }
+
     pub fn fetch_snapshot_fast(
         &self,
         repos: &[PathBuf],
@@ -212,6 +279,7 @@ impl DelegateClient {
         let mut dag_queue_list: Vec<DagQueueItem> = Vec::new();
         let mut merges_list: Vec<MergeRunItem> = Vec::new();
         let mut candidates_list: Vec<RadarCandidateItem> = Vec::new();
+        let mut agy_accounts_state = AgyAccountsState::default();
 
         std::thread::scope(|s| {
             let lane_handle = s.spawn(|| self.fetch_lane());
@@ -219,6 +287,7 @@ impl DelegateClient {
             let queue_handle = s.spawn(|| self.fetch_dag_queue());
             let merges_handle = s.spawn(|| self.fetch_merges());
             let candidates_handle = s.spawn(|| self.fetch_candidates());
+            let accounts_handle = s.spawn(|| self.fetch_agy_accounts());
             let repo_handles: Vec<_> = repos
                 .iter()
                 .map(|repo| s.spawn(move || self.fetch_repo_status(repo, home)))
@@ -250,6 +319,9 @@ impl DelegateClient {
             if let Ok(cs) = candidates_handle.join() {
                 candidates_list = cs;
             }
+            if let Ok(ac) = accounts_handle.join() {
+                agy_accounts_state = ac;
+            }
         });
 
         sort_repos_for_cwd(&mut groups, cwd);
@@ -270,6 +342,7 @@ impl DelegateClient {
             dag_queue: dag_queue_list,
             merges: merges_list,
             candidates: candidates_list,
+            agy_accounts: agy_accounts_state,
             host_load,
             today_ymd: local_ymd(),
             refreshed_at: local_hms(),
@@ -410,6 +483,7 @@ pub fn parse_snapshot_json(
     let dag_queue = parse_dag_queue_jsonl(&arr_to_jsonl(&doc["dagQueue"]));
     let merges = parse_merges_jsonl(&arr_to_jsonl(&doc["merges"]));
     let candidates = parse_candidates_jsonl(&arr_to_jsonl(&doc["candidates"]));
+    let agy_accounts = parse_agy_accounts_value(&doc["agyAccounts"]);
     let host_load = read_host_load();
     let today_ymd = doc["generatedAt"]
         .as_str()
@@ -424,6 +498,7 @@ pub fn parse_snapshot_json(
         dag_queue,
         merges,
         candidates,
+        agy_accounts,
         host_load,
         today_ymd,
         refreshed_at: local_hms(),
@@ -2262,6 +2337,98 @@ pub fn parse_candidates_jsonl(raw: &str) -> Vec<RadarCandidateItem> {
         });
     }
     out
+}
+
+pub fn parse_agy_accounts_json(raw: &str) -> AgyAccountsState {
+    let Ok(v) = serde_json::from_str::<Value>(raw.trim()) else {
+        return AgyAccountsState::default();
+    };
+    parse_agy_accounts_value(&v)
+}
+
+pub fn parse_agy_accounts_value(v: &Value) -> AgyAccountsState {
+    if !v.is_object() {
+        return AgyAccountsState::default();
+    }
+    let root = v
+        .get("root")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let active = v
+        .get("active")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let live_email = v
+        .get("liveEmail")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let live_drifted = v
+        .get("liveDrifted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let running_agy: Vec<RunningAgyProc> = v
+        .get("runningAgy")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            let pid = p.get("pid").and_then(Value::as_u64)? as u32;
+            let run = p
+                .get("run")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let cmdline = single_line(p.get("cmdline").and_then(Value::as_str).unwrap_or(""));
+            Some(RunningAgyProc { pid, run, cmdline })
+        })
+        .collect();
+    let accounts: Vec<AgyAccountItem> = v
+        .get("accounts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            let id = a
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())?
+                .to_string();
+            let files = string_list(a.get("files"));
+            let file_count = a
+                .get("fileCount")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize)
+                .unwrap_or(files.len());
+            Some(AgyAccountItem {
+                id,
+                email: single_line(a.get("email").and_then(Value::as_str).unwrap_or("")),
+                label: single_line(a.get("label").and_then(Value::as_str).unwrap_or("")),
+                active: a.get("active").and_then(Value::as_bool).unwrap_or(false),
+                added_at: a.get("addedAt").and_then(Value::as_str).unwrap_or("").to_string(),
+                last_used_at: a.get("lastUsedAt").and_then(Value::as_str).unwrap_or("").to_string(),
+                last_synced_at: a.get("lastSyncedAt").and_then(Value::as_str).unwrap_or("").to_string(),
+                token_expires_at: a
+                    .get("tokenExpiresAt")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                file_count,
+                files,
+                source: a.get("source").and_then(Value::as_str).unwrap_or("").to_string(),
+            })
+        })
+        .collect();
+    AgyAccountsState {
+        root,
+        active,
+        live_email,
+        live_drifted,
+        running_agy,
+        accounts,
+    }
 }
 
 #[cfg(test)]
