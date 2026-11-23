@@ -1,8 +1,10 @@
+mod accept;
 mod activity;
 mod agents;
 mod agy;
 mod archive;
 mod board;
+mod card;
 mod changes;
 mod cleanup;
 mod common;
@@ -254,6 +256,7 @@ fn format_status(status: serde_json::Value) -> String {
         "pendingChanges",
         "shape",
         "accept",
+        "card",
         "review",
         "sign",
         "readOnlyViolation",
@@ -1508,7 +1511,7 @@ fn diff(args: &[String]) -> Res<i32> {
         Some(index) => (&args[..index], &args[index + 1..]),
         None => (args, &[][..]),
     };
-    let (pos, flags, _) = parse_simple(options, &["--stat", "--total"], &[])?;
+    let (pos, flags, _) = parse_simple(options, &["--stat", "--total", "--risky", "--round"], &[])?;
     let reference = pos.first().map(String::as_str).unwrap_or("last");
     let run = match runs::resolve_head(reference) {
         Ok(r) => r,
@@ -1523,6 +1526,13 @@ fn diff(args: &[String]) -> Res<i32> {
         .chain(separated_paths.iter())
         .cloned()
         .collect();
+    if has(&flags, "--risky") {
+        let meta = json(run.join("meta.json"));
+        let round_only = has(&flags, "--round") && !has(&flags, "--total");
+        let (rendered, _) = card::render_risky_diff(&run, &meta, round_only, &filter_paths)?;
+        print!("{rendered}");
+        return Ok(0);
+    }
     if archive::is_record(&run) && archived_patch_file(&run).is_some() {
         return print_archived_diff(&run, &filter_paths, has(&flags, "--stat"));
     }
@@ -2799,6 +2809,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "events" => events::command(rest),
         "queue" => dag_queue::command(rest),
         "sign" => review::sign_command(rest),
+        "card" => card::card_command(rest),
         "merge" => merge::command(rest),
         "radar" => radar::command(rest),
         "diff" => diff(rest),

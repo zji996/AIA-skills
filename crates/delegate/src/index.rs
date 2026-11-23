@@ -48,6 +48,7 @@ pub fn run_sig(run: &Path, _work_sig: &str) -> String {
         ".generate-pending",
         ".waiting",
         "review.json",
+        "card.json",
         "stall-warning.json",
         "missing-objects.json",
         "result.md",

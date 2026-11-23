@@ -1148,6 +1148,19 @@ pub fn run_agent(
     holder: Arc<AtomicI32>,
     grace_out: Arc<std::sync::Mutex<Option<f64>>>,
 ) -> Res<(String, String)> {
+    run_agent_cancellable(meta, run, attempt, holder, grace_out, None)
+}
+pub fn run_agent_cancellable(
+    meta: &Value,
+    run: &Path,
+    attempt: i64,
+    holder: Arc<AtomicI32>,
+    grace_out: Arc<std::sync::Mutex<Option<f64>>>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Res<(String, String)> {
+    if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+        return Ok(("cancelled".into(), String::new()));
+    }
     if ![AGENT, crate::agy::BIN].contains(&s(meta, "agent")) {
         return Err(format!(
             "{} runs are no longer supported; delegate runs Pi or agy",
@@ -1244,6 +1257,9 @@ pub fn run_agent(
     let mut child = c.spawn().map_err(|e| e.to_string())?;
     let pid = child.id() as i32;
     holder.store(pid, Ordering::SeqCst);
+    if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+        kill_group(pid, 1.0);
+    }
     write(run.join("agent.pid"), pid.to_string())?;
     let timed = Arc::new(AtomicBool::new(false));
     let watch = Arc::new((
@@ -1273,6 +1289,7 @@ pub fn run_agent(
     let watcher_run_id = crate::events::run_id_for(run, meta);
     let watcher_repo = crate::events::repo_for_meta(meta);
     let watcher_name = s(meta, "name").to_string();
+    let watcher_cancel = cancel.clone();
     let watcher = std::thread::spawn(move || {
         let (mutex, changed) = &*watcher_state;
         let mut state = mutex.lock().unwrap();
@@ -1424,6 +1441,14 @@ pub fn run_agent(
                     };
                     delay = delay.min(rem.max(0.05));
                 }
+            }
+            if watcher_cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+                crate::cleanup::record(&runpath, pid);
+                kill_group(pid, 1.0);
+                break;
+            }
+            if watcher_cancel.is_some() {
+                delay = delay.min(0.05);
             }
             state = changed
                 .wait_timeout(state, Duration::from_secs_f64(delay.max(0.001)))
@@ -1626,6 +1651,8 @@ pub fn run_agent(
     let _ = fs::remove_file(run.join("stall-warning.json"));
     let verdict = if lane::stopped() {
         "stopped"
+    } else if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+        "cancelled"
     } else if timed.load(Ordering::SeqCst) {
         "timeout"
     } else if !status.success() {

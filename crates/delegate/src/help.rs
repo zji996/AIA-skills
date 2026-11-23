@@ -105,6 +105,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "Sign a run's controllerReviewPaths diff SHA-256 hash (or --check validity; invalidated on any edit).",
     ),
     (
+        "card",
+        "Show a one-screen merge review card (L1: summary, risk items, tests/acceptance layers, folded changes, next steps).",
+    ),
+    (
         "status",
         "Show counts and concise one-line status for runs/chains needing action (status <run> adds path and note details); --all lists every round.",
     ),
@@ -312,11 +316,18 @@ pub fn print(command: Option<&str>) -> bool {
             ("--path", "Print the result file path instead of its contents."),
             ("--no-mark", "Read without marking resultReadAt or .delivered (used by read-only viewers)."),
         ]),
-        "diff" => ("[--stat] [--total] [run] [--] [paths...]", "Show a run's changes as a git diff.", &[
+        "card" => ("[--json] [--round] [run]", "Show a deterministic one-screen L1 merge review card: author summary + result.md pointer, reviewer conclusion + verdict pointer, deduplicated risk items (built-in + .delegate.json riskRules + reviewer focus), test counts & tiered acceptance layers, directory-folded remaining changes, and next commands.", &[
+            ("run", "Run id or directory (default: last)."),
+            ("--json", "Emit structured JSON card."),
+            ("--round", "Inspect only the last round instead of the chain's net total diff."),
+        ]),
+        "diff" => ("[--stat] [--total] [--risky] [--round] [run] [--] [paths...]", "Show a run's changes as a git diff (or L2 --risky for risk-matched hunks only).", &[
             ("run", "Run id or directory (default: last)."),
             ("paths", "Limit the diff to these paths."),
             ("--stat", "Show diff statistics."),
             ("--total", "Show the whole conversation, not only this run."),
+            ("--risky", "L2 view: output only hunks matching deterministic risk rules or reviewer focus items, with surrounding context."),
+            ("--round", "With --risky, inspect only the last round instead of the chain's net total diff."),
         ]),
         "patch" => ("run [-- paths...]", "Print retained applied.patch (or delivered changes.patch before apply), optionally limited to exact paths/directory prefixes. Suitable for git apply --3way.", &[]),
         "apply" => ("[--merge] [--dry-run] [--verify|--no-verify] [--keep] [--keep-commits|--commit] [--json] [run ...]", "Merge worktree conversations into the source working tree, in the order given; stops at the first that fails.", &[

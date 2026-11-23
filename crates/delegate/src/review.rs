@@ -13,7 +13,10 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{atomic::AtomicI32, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicI32, Ordering},
+    Arc, Mutex,
+};
 
 pub const DEFAULT_RUBRIC: &str =
     include_str!("../../../skills/delegate/references/review-rubric.md");
@@ -1027,6 +1030,10 @@ pub fn compact_review_summary(doc: &Value) -> Value {
         "originalVerdict",
         "formatError",
         "verdictFile",
+        "conclusion",
+        "focusCount",
+        "cancelled",
+        "cancelledBy",
         "stoppedDuringRework",
         "reworkOutcome",
         "roViolationCount",
@@ -1069,12 +1076,149 @@ fn build_controller_review_json(run: &Path, hit: &ControllerReviewHit) -> Res<Va
     }))
 }
 
-/// Entry point called from `supervise::inner` after initial `settle()` (and escalation)
-/// and before `finish_run()`.
+fn emit_accept_event(run: &Path, meta: &Value, accept_doc: &Value) {
+    let mut payload = json!({
+        "name": s(meta, "name"),
+        "ok": b(accept_doc, "ok"),
+        "exitCode": accept_doc["exitCode"],
+        "command": clip(s(accept_doc, "command"), 120),
+        "notExecuted": b(accept_doc, "notExecuted"),
+        "infrastructureFailure": b(accept_doc, "infrastructureFailure"),
+    });
+    if b(accept_doc, "tiered") {
+        payload["tiered"] = json!(true);
+        payload["failClosed"] = accept_doc["failClosed"].clone();
+        payload["ranLayers"] = accept_doc["ranLayers"].clone();
+        payload["skippedLayers"] = accept_doc["skippedLayers"].clone();
+    }
+    if b(accept_doc, "parallelWithReview") {
+        payload["parallelWithReview"] = json!(true);
+    }
+    if b(accept_doc, "cancelled") {
+        payload["cancelled"] = json!(true);
+        payload["cancelledBy"] = accept_doc["cancelledBy"].clone();
+    }
+    events::emit(
+        &events::run_id_for(run, meta),
+        &events::repo_for_meta(meta),
+        "accept",
+        payload,
+    );
+}
+
+fn diff_tree_paths(top: &Path, from_tree: &str, to_tree: &str) -> Option<Vec<String>> {
+    if !top.is_dir() || from_tree.is_empty() || to_tree.is_empty() {
+        return None;
+    }
+    let out = git(
+        top,
+        &["diff", "--name-only", "--no-renames", from_tree, to_tree],
+    )
+    .ok()?;
+    Some(
+        String::from_utf8_lossy(&out)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+fn check_controller_paths_when_review_off(
+    run: &Path,
+    meta: &Value,
+    state: &str,
+    sum: &mut Value,
+) -> Res<()> {
+    if !matches!(state, "delivered" | "answered") {
+        return Ok(());
+    }
+    if let Some(hit) = evaluate_controller_paths(run, meta, false)? {
+        let cr_json = build_controller_review_json(run, &hit)?;
+        let now = iso();
+        let review_doc = json!({
+            "status": "done",
+            "verdict": "NEEDS_CONTROLLER",
+            "round": 0,
+            "reworkRounds": 0,
+            "needsAttention": true,
+            "upgradedBy": "controllerReviewPaths",
+            "controllerReview": cr_json,
+            "rounds": [],
+            "startedAt": now,
+            "updatedAt": now,
+            "finishedAt": now,
+        });
+        write_json(run.join("review.json"), &review_doc)?;
+        sum["review"] = compact_review_summary(&review_doc);
+        let run_id = events::run_id_for(run, meta);
+        let repo = events::repo_for_meta(meta);
+        let name = s(meta, "name");
+        events::emit(
+            &run_id,
+            &repo,
+            "review_verdict",
+            json!({
+                "name": name,
+                "round": 0,
+                "verdict": "NEEDS_CONTROLLER",
+                "upgradedBy": "controllerReviewPaths",
+                "controllerReviewPaths": hit.paths,
+                "signHash": hit.hash,
+            }),
+        );
+        events::emit(
+            &run_id,
+            &repo,
+            "needs_attention",
+            json!({
+                "name": name,
+                "round": 0,
+                "reworkRounds": 0,
+                "reason": "controllerReviewPaths",
+                "verdict": "NEEDS_CONTROLLER",
+                "controllerReviewPaths": hit.paths,
+                "signHash": hit.hash,
+                "detail": format!("改动命中 controllerReviewPaths（{}），需主控审查并签字", hit.paths.join("、")),
+            }),
+        );
+    }
+    Ok(())
+}
+
+struct ReviewRoundOutcome {
+    cancelled: bool,
+    stopped: bool,
+    verdict_str: String,
+    raw_answer: String,
+    raw_first_line: String,
+    format_error: bool,
+    parse_error: Option<String>,
+    upgraded_by: Option<String>,
+    ro_violations: Vec<String>,
+    ro_violation_sample: Vec<String>,
+    ro_violation_file: Option<PathBuf>,
+    verdict_file: PathBuf,
+    diff_file: PathBuf,
+    round_started: String,
+    round_finished: String,
+    next_continuation: Option<String>,
+    conclusion: Option<String>,
+    focus_count: usize,
+}
+
+/// Entry point called from `supervise::inner` after `settle_pre_accept()` (and escalation)
+/// and before `finalize_post_accept()` / `card::generate_and_save()` / `finish_run()`.
+///
+/// Orchestrates tiered acceptance (L1 fast -> L2 slow || read-only Reviewer in parallel),
+/// mutual cancellation (a cancelled reviewer is NEVER recorded as `PASS`), and rework
+/// incremental layer re-execution.
 #[allow(clippy::too_many_arguments)]
-pub fn run_if_applicable(
+pub fn run_accept_and_review(
     meta: &mut Value,
     run: &Path,
+    can_accept: bool,
     state: &mut String,
     sum: &mut Value,
     rec: &mut Option<(Vec<Value>, Value)>,
@@ -1089,69 +1233,82 @@ pub fn run_if_applicable(
     }
     let review_cfg = meta["reviewConfig"].clone();
     let review_enabled = review_cfg.is_object() && b(&review_cfg, "enabled");
+    let has_accept = crate::accept::has_acceptance(meta);
 
-    // Case B: Auto-review is OFF, but controllerReviewPaths is configured and matched.
-    if !review_enabled {
-        if matches!(state.as_str(), "delivered" | "answered") {
-            if let Some(hit) = evaluate_controller_paths(run, meta, false)? {
-                let cr_json = build_controller_review_json(run, &hit)?;
-                let now = iso();
-                let review_doc = json!({
-                    "status": "done",
-                    "verdict": "NEEDS_CONTROLLER",
-                    "round": 0,
-                    "reworkRounds": 0,
-                    "needsAttention": true,
-                    "upgradedBy": "controllerReviewPaths",
-                    "controllerReview": cr_json,
-                    "rounds": [],
-                    "startedAt": now,
-                    "updatedAt": now,
-                    "finishedAt": now,
-                });
-                write_json(run.join("review.json"), &review_doc)?;
-                sum["review"] = compact_review_summary(&review_doc);
-                let run_id = events::run_id_for(run, meta);
-                let repo = events::repo_for_meta(meta);
-                let name = s(meta, "name");
-                events::emit(
-                    &run_id,
-                    &repo,
-                    "review_verdict",
-                    json!({
-                        "name": name,
-                        "round": 0,
-                        "verdict": "NEEDS_CONTROLLER",
-                        "upgradedBy": "controllerReviewPaths",
-                        "controllerReviewPaths": hit.paths,
-                        "signHash": hit.hash,
-                    }),
-                );
-                events::emit(
-                    &run_id,
-                    &repo,
-                    "needs_attention",
-                    json!({
-                        "name": name,
-                        "round": 0,
-                        "reworkRounds": 0,
-                        "reason": "controllerReviewPaths",
-                        "verdict": "NEEDS_CONTROLLER",
-                        "controllerReviewPaths": hit.paths,
-                        "signHash": hit.hash,
-                        "detail": format!("改动命中 controllerReviewPaths（{}），需主控审查并签字", hit.paths.join("、")),
-                    }),
-                );
-            }
+    if !can_accept {
+        return Ok(());
+    }
+
+    // No acceptance configured: preserve "answered" state and check controllerReviewPaths.
+    if !has_accept {
+        if !review_enabled {
+            check_controller_paths_when_review_off(run, meta, state, sum)?;
         }
         return Ok(());
     }
 
-    // Case A: Auto-review is ON -> only runs after acceptance passes (`state == "delivered"`).
-    if state.as_str() != "delivered" {
+    // Acceptance configured, auto-review OFF: run tiered fast -> slow sequentially.
+    if !review_enabled {
+        let passed = BTreeMap::new();
+        let plan = crate::accept::plan(meta, changed, rec.is_some(), None, &passed);
+        let (excluded, before_snap) = crate::accept::snapshot_for_accept(meta, run);
+        let fast_outcome = if !plan.fast.is_empty() {
+            Some(crate::accept::run_phase(
+                meta,
+                run,
+                &plan.fast,
+                false,
+                holder.as_ref(),
+                None,
+                None,
+            ))
+        } else {
+            None
+        };
+        let fast_ok = fast_outcome.as_ref().is_none_or(|f| f.ok);
+        let slow_outcome = if fast_ok && !plan.slow.is_empty() {
+            Some(crate::accept::run_phase(
+                meta,
+                run,
+                &plan.slow,
+                fast_outcome.is_some(),
+                holder.as_ref(),
+                None,
+                None,
+            ))
+        } else {
+            None
+        };
+        let (_, after_snap) = crate::accept::snapshot_for_accept(meta, run);
+        let accept_doc = crate::accept::build_accept_summary(
+            meta,
+            run,
+            &plan,
+            fast_outcome.as_ref(),
+            slow_outcome.as_ref(),
+            false,
+            excluded,
+            before_snap.as_ref(),
+            after_snap.as_ref(),
+        );
+        emit_accept_event(run, meta, &accept_doc);
+        if b(&accept_doc, "infrastructureFailure") {
+            sum["infrastructureFailure"] = json!(true);
+            sum["error"] = json!("remote infrastructure failure; retry does not spend a rework round");
+        }
+        *state = if b(&accept_doc, "ok") {
+            "delivered"
+        } else {
+            "rejected"
+        }
+        .into();
+        sum["accept"] = accept_doc;
+        sum["state"] = json!(*state);
+        check_controller_paths_when_review_off(run, meta, state, sum)?;
         return Ok(());
     }
 
+    // Acceptance + auto-review ON: L1 fast -> L2 (slow || read-only Reviewer in parallel) + rework loop.
     let run_id = events::run_id_for(run, meta);
     let repo = events::repo_for_meta(meta);
     let run_name = s(meta, "name").to_string();
@@ -1163,6 +1320,57 @@ pub fn run_if_applicable(
     let (rubric_text, rubric_source) = match load_rubric(&review_cfg) {
         Ok(pair) => pair,
         Err(err) => {
+            // Still run acceptance before escalating rubricError so acceptance state is known.
+            let passed = BTreeMap::new();
+            let plan = crate::accept::plan(meta, changed, rec.is_some(), None, &passed);
+            let (excluded, before_snap) = crate::accept::snapshot_for_accept(meta, run);
+            let fast_outcome = if !plan.fast.is_empty() {
+                Some(crate::accept::run_phase(
+                    meta,
+                    run,
+                    &plan.fast,
+                    false,
+                    holder.as_ref(),
+                    None,
+                    None,
+                ))
+            } else {
+                None
+            };
+            let fast_ok = fast_outcome.as_ref().is_none_or(|f| f.ok);
+            let slow_outcome = if fast_ok && !plan.slow.is_empty() {
+                Some(crate::accept::run_phase(
+                    meta,
+                    run,
+                    &plan.slow,
+                    fast_outcome.is_some(),
+                    holder.as_ref(),
+                    None,
+                    None,
+                ))
+            } else {
+                None
+            };
+            let (_, after_snap) = crate::accept::snapshot_for_accept(meta, run);
+            let accept_doc = crate::accept::build_accept_summary(
+                meta,
+                run,
+                &plan,
+                fast_outcome.as_ref(),
+                slow_outcome.as_ref(),
+                false,
+                excluded,
+                before_snap.as_ref(),
+                after_snap.as_ref(),
+            );
+            emit_accept_event(run, meta, &accept_doc);
+            let acc_ok = b(&accept_doc, "ok");
+            sum["accept"] = accept_doc;
+            *state = if acc_ok { "delivered" } else { "rejected" }.into();
+            sum["state"] = json!(*state);
+            if !acc_ok {
+                return Ok(());
+            }
             let now = iso();
             let err_short = clip(&err, MAX_PARSE_ERROR_CHARS);
             let review_doc = json!({
@@ -1218,6 +1426,8 @@ pub fn run_if_applicable(
     let mut rework_rounds: u64 = 0;
     let mut prev_reviewed_tree: Option<String> = None;
     let mut prev_review_continuation: Option<String> = None;
+    let mut passed_layers: BTreeMap<String, Value> = BTreeMap::new();
+    let mut rework_delta_files: Option<Vec<String>> = None;
     let is_agy_reviewer = crate::agy::is_agy(s(&review_cfg, "model"));
 
     loop {
@@ -1243,12 +1453,85 @@ pub fn run_if_applicable(
             break;
         }
 
+        // Phase L1: plan tiered acceptance and run fast layers BEFORE slow accept & reviewer.
+        let plan = crate::accept::plan(
+            meta,
+            changed,
+            rec.is_some(),
+            rework_delta_files.as_deref(),
+            &passed_layers,
+        );
+        let (excluded, accept_before_snap) = crate::accept::snapshot_for_accept(meta, run);
+        let fast_outcome = if !plan.fast.is_empty() {
+            Some(crate::accept::run_phase(
+                meta,
+                run,
+                &plan.fast,
+                false,
+                holder.as_ref(),
+                None,
+                None,
+            ))
+        } else {
+            None
+        };
+        if let Some(fo) = &fast_outcome {
+            for (k, v) in &fo.passed_layers {
+                passed_layers.insert(k.clone(), v.clone());
+            }
+            if !fo.ok {
+                let (_, accept_after_snap) = crate::accept::snapshot_for_accept(meta, run);
+                let accept_doc = crate::accept::build_accept_summary(
+                    meta,
+                    run,
+                    &plan,
+                    Some(fo),
+                    None,
+                    false,
+                    excluded,
+                    accept_before_snap.as_ref(),
+                    accept_after_snap.as_ref(),
+                );
+                emit_accept_event(run, meta, &accept_doc);
+                if b(&accept_doc, "infrastructureFailure") {
+                    sum["infrastructureFailure"] = json!(true);
+                    sum["error"] =
+                        json!("remote infrastructure failure; retry does not spend a rework round");
+                }
+                sum["accept"] = accept_doc;
+                *state = if lane::stopped() { "stopped" } else { "rejected" }.into();
+                sum["state"] = json!(*state);
+                if round > 1 {
+                    let now = iso();
+                    let final_doc = json!({
+                        "status": "done",
+                        "verdict": "REWORK",
+                        "round": round - 1,
+                        "reworkRounds": rework_rounds,
+                        "model": review_cfg["model"],
+                        "tier": review_cfg["tier"],
+                        "rubric": rubric_source,
+                        "needsAttention": rework_rounds >= NEEDS_ATTENTION_REWORK_ROUND,
+                        "stoppedDuringRework": true,
+                        "reworkOutcome": state,
+                        "rounds": rounds_history,
+                        "startedAt": review_started_at,
+                        "updatedAt": now,
+                        "finishedAt": now,
+                    });
+                    write_json(run.join("review.json"), &final_doc)?;
+                    sum["review"] = compact_review_summary(&final_doc);
+                }
+                break;
+            }
+        }
+
+        // Fast layers passed (or none configured). Prepare review round inputs.
         let round_dir = review_root.join(format!("round-{round}"));
         fs::create_dir_all(&round_dir).map_err(|e| e.to_string())?;
         let round_started = iso();
         let incremental = round > 1 && prev_reviewed_tree.is_some();
 
-        // Update review.json so `status` and TUI immediately show "审查中".
         let live_review = json!({
             "status": "reviewing",
             "verdict": if rework_rounds > 0 { json!("REWORK") } else { Value::Null },
@@ -1275,10 +1558,10 @@ pub fn run_if_applicable(
                 "incremental": incremental,
                 "model": review_cfg["model"],
                 "tier": review_cfg["tier"],
+                "parallelWithSlowAccept": !plan.slow.is_empty(),
             }),
         );
 
-        // Compute the diff for this review round.
         let changes_doc = json(run.join("changes.json"));
         let top = {
             let t = PathBuf::from(s(&changes_doc, "top"));
@@ -1316,7 +1599,6 @@ pub fn run_if_applicable(
         let diff_file = round_dir.join(format!("{diff_label}.diff"));
         write(&diff_file, &diff_text)?;
 
-        // Prepare reviewer prompt & fork target.
         let fork_target = if incremental {
             match prev_review_continuation.as_deref() {
                 Some(prev) => copy_pi_fork_if_needed(prev, &round_dir, is_agy_reviewer).ok(),
@@ -1328,15 +1610,15 @@ pub fn run_if_applicable(
         let diff_section = format_diff_for_prompt(&diff_text, &diff_file, &top, &diff_from, &after_tree);
         let prompt_body = if fork_target.is_some() {
             format!(
-                "作者已完成第 {} 轮返工并通过验收。下面是仅限本轮返工的增量 diff，请基于此前审查结论续审：\n\
+                "作者已完成第 {} 轮返工。下面是仅限本轮返工的增量 diff，请基于此前审查结论续审：\n\
                  - 核实上轮指出的问题是否全部真正修复，且未引入新回归或范围外改动。\n\
-                 - 第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`（无前缀、无 Markdown 修饰）。\n\n\
+                 - 第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`（无前缀、无 Markdown 修饰）。\n\
+                 - 结论正文后附加 `## 主控重点看` 小节（`- [高|中|低] path:line — 理由`，无则写 `无`）。\n\n\
                  ## 本轮增量 diff（第 {round} 轮审查）\n\n\
                  {diff_section}\n",
                 round - 1
             )
         } else if incremental {
-            // Fallback when previous review session wasn't saved: provide rubric + brief + incremental diff.
             format!(
                 "请作为独立只读审查员进行第 {round} 轮续审（上轮审查会话不可续接，已提供完整上下文与本轮增量 diff）。\n\
                  输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`。\n\n\
@@ -1366,12 +1648,13 @@ pub fn run_if_applicable(
         let review_prompt_file = round_dir.join("prompt.md");
         write(&review_prompt_file, &prompt_body)?;
 
-        // Prepare read-only execution environment & write-detection snapshot.
+        // Prepare isolated read-only workspace whenever running agy OR running in parallel with slow accept.
+        let parallel_with_slow = !plan.slow.is_empty();
         let excludes = strings(&meta["snapshotExclude"]);
-        let (reviewer_workdir, before_pi_snap, before_agy_manifest) = if is_agy_reviewer
+        let use_ro_workspace = (is_agy_reviewer || parallel_with_slow)
             && top.is_dir()
-            && !after_tree.is_empty()
-        {
+            && !after_tree.is_empty();
+        let (reviewer_workdir, before_pi_snap, before_ro_manifest) = if use_ro_workspace {
             prepare_ro_workspace(&top, &after_tree, &ro_workspace, &round_dir)?;
             let manifest = dir_manifest_for_repo(&ro_workspace, &top)?;
             (ro_workspace.clone(), None, Some(manifest))
@@ -1394,156 +1677,446 @@ pub fn run_if_applicable(
         );
         crate::deny::prepare(&review_meta, &round_dir)?;
 
-        let review_res = agents::run_agent(&review_meta, &round_dir, 1, holder.clone(), grace.clone());
-        // Clean up any leftover reviewer subprocesses.
-        let rev_pgid = read(round_dir.join("agent.pid")).trim().parse().unwrap_or(0);
-        crate::cleanup::record(&round_dir, rev_pgid);
-        if rev_pgid > 0 && group_members(rev_pgid) {
-            end_group(rev_pgid, 1.0);
-        }
+        // Phase L2: run slow acceptance and read-only reviewer in parallel with mutual cancellation.
+        let slow_holder = Arc::new(AtomicI32::new(0));
+        let rev_holder = Arc::new(AtomicI32::new(0));
+        let slow_cancel = Arc::new(AtomicBool::new(false));
+        let rev_cancel = Arc::new(AtomicBool::new(false));
+        supervise::register_stop_holder(slow_holder.clone());
+        supervise::register_stop_holder(rev_holder.clone());
 
-        // Verify reviewer did not modify any git-tracked or unignored files
-        // (dependency/build dirs and .gitignore-ignored paths are excluded).
-        let raw_ro_violations: Vec<String> = if let Some(before_m) = before_agy_manifest {
-            let after_m = dir_manifest_for_repo(&ro_workspace, &top).unwrap_or_default();
-            diff_manifests(&before_m, &after_m)
-        } else if let Some(before_s) = before_pi_snap {
-            if let Some(after_s) = changes::snapshot(&top, &round_dir, &excludes) {
-                if s(&before_s, "tree") != s(&after_s, "tree") {
-                    changes::tree_changes(&top, &before_s, &after_s, meta["worktree"].is_object())
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|c| s(&c, "path").to_string())
-                        .collect()
-                } else {
-                    Vec::new()
+        let append_slow_log = fast_outcome.is_some();
+        let (slow_outcome, rev_outcome) = std::thread::scope(|scope| {
+            let slow_handle = if parallel_with_slow {
+                let slow_holder_t = slow_holder.clone();
+                let slow_cancel_t = slow_cancel.clone();
+                let rev_cancel_t = rev_cancel.clone();
+                let rev_holder_t = rev_holder.clone();
+                let meta_ref: &Value = meta;
+                let plan_slow = &plan.slow;
+                let round_dir_ref: &Path = &round_dir;
+                Some(scope.spawn(move || {
+                    let res = crate::accept::run_phase(
+                        meta_ref,
+                        run,
+                        plan_slow,
+                        append_slow_log,
+                        slow_holder_t.as_ref(),
+                        Some(slow_cancel_t.as_ref()),
+                        Some("审查员判定需要返工/失败，取消慢层验收"),
+                    );
+                    if !res.ok && !res.cancelled && !lane::stopped() {
+                        // Slow acceptance failed -> cancel reviewer immediately (never PASS).
+                        rev_cancel_t.store(true, Ordering::SeqCst);
+                        let rpid = rev_holder_t.load(Ordering::SeqCst);
+                        if rpid > 0 {
+                            crate::cleanup::record(round_dir_ref, rpid);
+                            kill_group(rpid, 1.0);
+                        }
+                    }
+                    res
+                }))
+            } else {
+                None
+            };
+
+            let review_res = agents::run_agent_cancellable(
+                &review_meta,
+                &round_dir,
+                1,
+                rev_holder.clone(),
+                grace.clone(),
+                Some(rev_cancel.clone()),
+            );
+            let rev_pgid = read(round_dir.join("agent.pid")).trim().parse().unwrap_or(0);
+            crate::cleanup::record(&round_dir, rev_pgid);
+            if rev_pgid > 0 && group_members(rev_pgid) {
+                end_group(rev_pgid, 1.0);
+            }
+
+            let cancelled_by_accept = rev_cancel.load(Ordering::SeqCst);
+            let round_finished = iso();
+            let verdict_file = review_root.join(format!("round-{round}-verdict.md"));
+
+            let rev_out = if cancelled_by_accept {
+                ReviewRoundOutcome {
+                    cancelled: true,
+                    stopped: false,
+                    verdict_str: String::new(),
+                    raw_answer: String::new(),
+                    raw_first_line: String::new(),
+                    format_error: false,
+                    parse_error: None,
+                    upgraded_by: None,
+                    ro_violations: Vec::new(),
+                    ro_violation_sample: Vec::new(),
+                    ro_violation_file: None,
+                    verdict_file,
+                    diff_file: diff_file.clone(),
+                    round_started: round_started.clone(),
+                    round_finished,
+                    next_continuation: None,
+                    conclusion: None,
+                    focus_count: 0,
                 }
             } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-        let ro_violations = filter_ro_violations(&top, raw_ro_violations);
+                let raw_ro_violations: Vec<String> = if let Some(before_m) = before_ro_manifest {
+                    let after_m = dir_manifest_for_repo(&ro_workspace, &top).unwrap_or_default();
+                    diff_manifests(&before_m, &after_m)
+                } else if let Some(before_s) = before_pi_snap {
+                    if let Some(after_s) = changes::snapshot(&top, &round_dir, &excludes) {
+                        if s(&before_s, "tree") != s(&after_s, "tree") {
+                            changes::tree_changes(
+                                &top,
+                                &before_s,
+                                &after_s,
+                                meta["worktree"].is_object(),
+                            )
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|c| s(&c, "path").to_string())
+                            .collect()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+                let ro_violations = filter_ro_violations(&top, raw_ro_violations);
+                let next_continuation = find_session_continuation(&round_dir, &review_meta);
 
-        if let Some(cont) = find_session_continuation(&round_dir, &review_meta) {
+                let mut format_error = false;
+                let mut parse_error: Option<String> = None;
+                let mut upgraded_by: Option<String> = None;
+                let mut raw_first_line = String::new();
+                let mut stopped_flag = false;
+
+                let (mut verdict_str, raw_answer) = match review_res {
+                    Ok((agent_outcome, text)) if agent_outcome == "ok" => {
+                        match parse_verdict(&text) {
+                            ParsedVerdict::Pass => {
+                                raw_first_line = "PASS".into();
+                                ("PASS".to_string(), text)
+                            }
+                            ParsedVerdict::Rework => {
+                                raw_first_line = "REWORK".into();
+                                ("REWORK".to_string(), text)
+                            }
+                            ParsedVerdict::NeedsController => {
+                                raw_first_line = "NEEDS_CONTROLLER".into();
+                                ("NEEDS_CONTROLLER".to_string(), text)
+                            }
+                            ParsedVerdict::Invalid(first) => {
+                                raw_first_line = clip(&first, MAX_PARSE_ERROR_CHARS);
+                                format_error = true;
+                                parse_error = Some(clip(
+                                    &format!(
+                                        "invalid reviewer verdict first line: {:?} (expected PASS, REWORK, or NEEDS_CONTROLLER)",
+                                        clip(&first, 120)
+                                    ),
+                                    MAX_PARSE_ERROR_CHARS,
+                                ));
+                                upgraded_by = Some("formatError".into());
+                                ("NEEDS_CONTROLLER".to_string(), text)
+                            }
+                        }
+                    }
+                    Ok((agent_outcome, _)) if agent_outcome == "cancelled" => {
+                        return (
+                            slow_handle.map(|h| h.join().unwrap_or_else(|_| crate::accept::PhaseOutcome::empty_ok())),
+                            ReviewRoundOutcome {
+                                cancelled: true,
+                                stopped: false,
+                                verdict_str: String::new(),
+                                raw_answer: String::new(),
+                                raw_first_line: String::new(),
+                                format_error: false,
+                                parse_error: None,
+                                upgraded_by: None,
+                                ro_violations: Vec::new(),
+                                ro_violation_sample: Vec::new(),
+                                ro_violation_file: None,
+                                verdict_file,
+                                diff_file: diff_file.clone(),
+                                round_started: round_started.clone(),
+                                round_finished,
+                                next_continuation: None,
+                                conclusion: None,
+                                focus_count: 0,
+                            },
+                        );
+                    }
+                    Ok((agent_outcome, text)) => {
+                        if lane::stopped() {
+                            stopped_flag = true;
+                            (String::new(), text)
+                        } else {
+                            parse_error = Some(clip(
+                                &format!("reviewer ended with outcome: {agent_outcome}"),
+                                MAX_PARSE_ERROR_CHARS,
+                            ));
+                            upgraded_by = Some("reviewerError".into());
+                            ("NEEDS_CONTROLLER".to_string(), text)
+                        }
+                    }
+                    Err(err) => {
+                        parse_error = Some(clip(
+                            &format!("reviewer execution error: {err}"),
+                            MAX_PARSE_ERROR_CHARS,
+                        ));
+                        upgraded_by = Some("reviewerError".into());
+                        ("NEEDS_CONTROLLER".to_string(), String::new())
+                    }
+                };
+
+                let mut ro_violation_file: Option<PathBuf> = None;
+                let ro_violation_sample: Vec<String> = ro_violations
+                    .iter()
+                    .take(RO_VIOLATION_SAMPLE_MAX)
+                    .cloned()
+                    .collect();
+                if !ro_violations.is_empty() && !stopped_flag {
+                    let vfile = review_root.join(format!("round-{round}-ro-violations.txt"));
+                    let mut body = ro_violations.join("\n");
+                    body.push('\n');
+                    let _ = write(&vfile, &body);
+                    let extra = ro_violations.len().saturating_sub(ro_violation_sample.len());
+                    let summary_msg = if extra > 0 {
+                        format!(
+                            "reviewer violated read-only boundary ({} files: {}, +{extra} more; see {})",
+                            ro_violations.len(),
+                            ro_violation_sample.join(", "),
+                            vfile.display()
+                        )
+                    } else {
+                        format!(
+                            "reviewer violated read-only boundary ({} files: {})",
+                            ro_violations.len(),
+                            ro_violation_sample.join(", ")
+                        )
+                    };
+                    parse_error = Some(clip(&summary_msg, MAX_PARSE_ERROR_CHARS));
+                    upgraded_by = Some("readOnlyViolation".into());
+                    verdict_str = "NEEDS_CONTROLLER".to_string();
+                    ro_violation_file = Some(vfile);
+                }
+
+                // If reviewer rejected (REWORK) or failed (reviewerError), cancel slow accept immediately!
+                if parallel_with_slow
+                    && !stopped_flag
+                    && (verdict_str == "REWORK" || upgraded_by.as_deref() == Some("reviewerError"))
+                {
+                    slow_cancel.store(true, Ordering::SeqCst);
+                    let spid = slow_holder.load(Ordering::SeqCst);
+                    if spid > 0 {
+                        crate::cleanup::record(run, spid);
+                        kill_group(spid, 1.0);
+                    }
+                }
+
+                let conclusion = crate::card::extract_reviewer_conclusion(&raw_answer);
+                let focus_count = crate::card::parse_reviewer_focus(&raw_answer).len();
+
+                ReviewRoundOutcome {
+                    cancelled: rev_cancel.load(Ordering::SeqCst),
+                    stopped: stopped_flag,
+                    verdict_str,
+                    raw_answer,
+                    raw_first_line,
+                    format_error,
+                    parse_error,
+                    upgraded_by,
+                    ro_violations,
+                    ro_violation_sample,
+                    ro_violation_file,
+                    verdict_file,
+                    diff_file: diff_file.clone(),
+                    round_started: round_started.clone(),
+                    round_finished,
+                    next_continuation,
+                    conclusion,
+                    focus_count,
+                }
+            };
+
+            let slow_res = slow_handle.map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| crate::accept::PhaseOutcome::empty_ok())
+            });
+            (slow_res, rev_out)
+        });
+
+        supervise::unregister_stop_holder(&slow_holder);
+        supervise::unregister_stop_holder(&rev_holder);
+
+        if let Some(so) = &slow_outcome {
+            for (k, v) in &so.passed_layers {
+                passed_layers.insert(k.clone(), v.clone());
+            }
+        }
+        let (_, accept_after_snap) = crate::accept::snapshot_for_accept(meta, run);
+        let accept_doc = crate::accept::build_accept_summary(
+            meta,
+            run,
+            &plan,
+            fast_outcome.as_ref(),
+            slow_outcome.as_ref(),
+            parallel_with_slow,
+            excluded,
+            accept_before_snap.as_ref(),
+            accept_after_snap.as_ref(),
+        );
+        emit_accept_event(run, meta, &accept_doc);
+        let accept_ok = b(&accept_doc, "ok");
+        let accept_cancelled = b(&accept_doc, "cancelled");
+        if b(&accept_doc, "infrastructureFailure") {
+            sum["infrastructureFailure"] = json!(true);
+            sum["error"] =
+                json!("remote infrastructure failure; retry does not spend a rework round");
+        }
+        sum["accept"] = accept_doc;
+
+        // 1. Supervisor stopped externally.
+        if lane::stopped() || rev_outcome.stopped {
+            *state = "stopped".into();
+            sum["state"] = json!("stopped");
+            let now = iso();
+            let doc = json!({
+                "status": "done",
+                "verdict": Value::Null,
+                "round": round,
+                "reworkRounds": rework_rounds,
+                "model": review_cfg["model"],
+                "tier": review_cfg["tier"],
+                "rubric": rubric_source,
+                "rounds": rounds_history,
+                "startedAt": review_started_at,
+                "updatedAt": now,
+                "finishedAt": now,
+            });
+            write_json(run.join("review.json"), &doc)?;
+            sum["review"] = compact_review_summary(&doc);
+            break;
+        }
+
+        // 2. Slow acceptance failed (not cancelled by reviewer): NEVER enter delivered,
+        //    and a cancelled reviewer MUST NEVER be recorded as PASS.
+        if !accept_ok && !accept_cancelled {
+            *state = "rejected".into();
+            sum["state"] = json!("rejected");
+            let now = iso();
+            if rev_outcome.cancelled {
+                let round_entry = json!({
+                    "round": round,
+                    "verdict": Value::Null,
+                    "cancelled": true,
+                    "cancelledBy": "acceptFailed",
+                    "diffFile": rev_outcome.diff_file.to_string_lossy(),
+                    "incremental": incremental,
+                    "startedAt": rev_outcome.round_started,
+                    "finishedAt": rev_outcome.round_finished,
+                });
+                rounds_history.push(round_entry);
+                let final_doc = json!({
+                    "status": "cancelled",
+                    "verdict": Value::Null,
+                    "cancelled": true,
+                    "cancelledBy": "acceptFailed",
+                    "round": round,
+                    "reworkRounds": rework_rounds,
+                    "model": review_cfg["model"],
+                    "tier": review_cfg["tier"],
+                    "rubric": rubric_source,
+                    "needsAttention": false,
+                    "rounds": rounds_history,
+                    "startedAt": review_started_at,
+                    "updatedAt": now,
+                    "finishedAt": now,
+                });
+                write_json(run.join("review.json"), &final_doc)?;
+                sum["review"] = compact_review_summary(&final_doc);
+                events::emit(
+                    &run_id,
+                    &repo,
+                    "review_verdict",
+                    json!({
+                        "name": run_name,
+                        "round": round,
+                        "verdict": Value::Null,
+                        "cancelled": true,
+                        "cancelledBy": "acceptFailed",
+                    }),
+                );
+            } else {
+                // Reviewer happened to finish before slow accept failed; persist raw verdict
+                // but keep run state `rejected` (both must pass to enter `delivered`).
+                write(&rev_outcome.verdict_file, &rev_outcome.raw_answer)?;
+                let _ = write(run.join("review.md"), &rev_outcome.raw_answer);
+                let round_entry = json!({
+                    "round": round,
+                    "verdict": rev_outcome.verdict_str,
+                    "rawFirstLine": rev_outcome.raw_first_line,
+                    "verdictFile": rev_outcome.verdict_file.to_string_lossy(),
+                    "diffFile": rev_outcome.diff_file.to_string_lossy(),
+                    "incremental": incremental,
+                    "acceptFailed": true,
+                    "startedAt": rev_outcome.round_started,
+                    "finishedAt": rev_outcome.round_finished,
+                });
+                rounds_history.push(round_entry);
+                let mut final_doc = json!({
+                    "status": "done",
+                    "verdict": rev_outcome.verdict_str,
+                    "acceptFailed": true,
+                    "round": round,
+                    "reworkRounds": rework_rounds,
+                    "model": review_cfg["model"],
+                    "tier": review_cfg["tier"],
+                    "rubric": rubric_source,
+                    "verdictFile": rev_outcome.verdict_file.to_string_lossy(),
+                    "needsAttention": false,
+                    "rounds": rounds_history,
+                    "startedAt": review_started_at,
+                    "updatedAt": now,
+                    "finishedAt": now,
+                });
+                if let Some(concl) = &rev_outcome.conclusion {
+                    final_doc["conclusion"] = json!(concl);
+                }
+                if rev_outcome.focus_count > 0 {
+                    final_doc["focusCount"] = json!(rev_outcome.focus_count);
+                }
+                write_json(run.join("review.json"), &final_doc)?;
+                sum["review"] = compact_review_summary(&final_doc);
+            }
+            break;
+        }
+
+        if let Some(cont) = rev_outcome.next_continuation {
             prev_review_continuation = Some(cont);
         }
 
-        let round_finished = iso();
-        let verdict_file = review_root.join(format!("round-{round}-verdict.md"));
-        let mut format_error = false;
-        let mut parse_error: Option<String> = None;
-        let mut upgraded_by: Option<String> = None;
-        let mut raw_first_line = String::new();
-
-        let (mut verdict_str, raw_answer) = match review_res {
-            Ok((agent_outcome, text)) if agent_outcome == "ok" => {
-                let parsed = parse_verdict(&text);
-                match parsed {
-                    ParsedVerdict::Pass => {
-                        raw_first_line = "PASS".into();
-                        ("PASS".to_string(), text)
-                    }
-                    ParsedVerdict::Rework => {
-                        raw_first_line = "REWORK".into();
-                        ("REWORK".to_string(), text)
-                    }
-                    ParsedVerdict::NeedsController => {
-                        raw_first_line = "NEEDS_CONTROLLER".into();
-                        ("NEEDS_CONTROLLER".to_string(), text)
-                    }
-                    ParsedVerdict::Invalid(first) => {
-                        raw_first_line = clip(&first, MAX_PARSE_ERROR_CHARS);
-                        format_error = true;
-                        parse_error = Some(clip(
-                            &format!(
-                                "invalid reviewer verdict first line: {:?} (expected PASS, REWORK, or NEEDS_CONTROLLER)",
-                                clip(&first, 120)
-                            ),
-                            MAX_PARSE_ERROR_CHARS,
-                        ));
-                        upgraded_by = Some("formatError".into());
-                        ("NEEDS_CONTROLLER".to_string(), text)
-                    }
-                }
-            }
-            Ok((agent_outcome, text)) => {
-                if lane::stopped() {
-                    *state = "stopped".into();
-                    sum["state"] = json!("stopped");
-                    let doc = json!({
-                        "status": "done",
-                        "verdict": Value::Null,
-                        "round": round,
-                        "reworkRounds": rework_rounds,
-                        "model": review_cfg["model"],
-                        "tier": review_cfg["tier"],
-                        "rubric": rubric_source,
-                        "rounds": rounds_history,
-                        "startedAt": review_started_at,
-                        "updatedAt": round_finished,
-                        "finishedAt": round_finished,
-                    });
-                    write_json(run.join("review.json"), &doc)?;
-                    sum["review"] = compact_review_summary(&doc);
-                    break;
-                }
-                parse_error = Some(clip(
-                    &format!("reviewer ended with outcome: {agent_outcome}"),
-                    MAX_PARSE_ERROR_CHARS,
-                ));
-                upgraded_by = Some("reviewerError".into());
-                ("NEEDS_CONTROLLER".to_string(), text)
-            }
-            Err(err) => {
-                parse_error = Some(clip(
-                    &format!("reviewer execution error: {err}"),
-                    MAX_PARSE_ERROR_CHARS,
-                ));
-                upgraded_by = Some("reviewerError".into());
-                ("NEEDS_CONTROLLER".to_string(), String::new())
-            }
-        };
-
-        let mut ro_violation_file: Option<PathBuf> = None;
-        let ro_violation_sample: Vec<String> = ro_violations
-            .iter()
-            .take(RO_VIOLATION_SAMPLE_MAX)
-            .cloned()
-            .collect();
-        if !ro_violations.is_empty() {
-            let vfile = review_root.join(format!("round-{round}-ro-violations.txt"));
-            let mut body = ro_violations.join("\n");
-            body.push('\n');
-            write(&vfile, &body)?;
-            let extra = ro_violations.len().saturating_sub(ro_violation_sample.len());
-            let summary_msg = if extra > 0 {
-                format!(
-                    "reviewer violated read-only boundary ({} files: {}, +{extra} more; see {})",
-                    ro_violations.len(),
-                    ro_violation_sample.join(", "),
-                    vfile.display()
-                )
-            } else {
-                format!(
-                    "reviewer violated read-only boundary ({} files: {})",
-                    ro_violations.len(),
-                    ro_violation_sample.join(", ")
-                )
-            };
-            parse_error = Some(clip(&summary_msg, MAX_PARSE_ERROR_CHARS));
-            upgraded_by = Some("readOnlyViolation".into());
-            verdict_str = "NEEDS_CONTROLLER".to_string();
-            ro_violation_file = Some(vfile);
-        }
-
         // Write exact raw reviewer verdict file (never modified or paraphrased).
-        write(&verdict_file, &raw_answer)?;
-        let _ = write(run.join("review.md"), &raw_answer);
+        write(&rev_outcome.verdict_file, &rev_outcome.raw_answer)?;
+        let _ = write(run.join("review.md"), &rev_outcome.raw_answer);
 
-        // Check `controllerReviewPaths` on the chain's net changed files:
-        // touching any matched path ALWAYS upgrades the verdict to `NEEDS_CONTROLLER`.
+        let mut verdict_str = rev_outcome.verdict_str;
+        let mut upgraded_by = rev_outcome.upgraded_by;
+        let parse_error = rev_outcome.parse_error;
+        let format_error = rev_outcome.format_error;
+        let raw_first_line = rev_outcome.raw_first_line;
+        let verdict_file = rev_outcome.verdict_file;
+        let ro_violations = rev_outcome.ro_violations;
+        let ro_violation_sample = rev_outcome.ro_violation_sample;
+        let ro_violation_file = rev_outcome.ro_violation_file;
+        let round_finished = rev_outcome.round_finished;
+        let conclusion = rev_outcome.conclusion;
+        let focus_count = rev_outcome.focus_count;
+
+        // Check `controllerReviewPaths` when NOT entering rework (or upgrade on pass/needs_controller).
         let mut original_verdict: Option<String> = None;
         let mut controller_review_json = Value::Null;
         let mut controller_paths: Vec<String> = Vec::new();
@@ -1566,9 +2139,9 @@ pub fn run_if_applicable(
             "verdict": verdict_str,
             "rawFirstLine": raw_first_line,
             "verdictFile": verdict_file.to_string_lossy(),
-            "diffFile": diff_file.to_string_lossy(),
+            "diffFile": rev_outcome.diff_file.to_string_lossy(),
             "incremental": incremental,
-            "startedAt": round_started,
+            "startedAt": rev_outcome.round_started,
             "finishedAt": round_finished,
         });
         if format_error {
@@ -1618,7 +2191,7 @@ pub fn run_if_applicable(
         events::emit(&run_id, &repo, "review_verdict", verdict_ev);
 
         if verdict_str == "PASS" {
-            let final_doc = json!({
+            let mut final_doc = json!({
                 "status": "done",
                 "verdict": "PASS",
                 "round": round,
@@ -1633,8 +2206,16 @@ pub fn run_if_applicable(
                 "updatedAt": round_finished,
                 "finishedAt": round_finished,
             });
+            if let Some(concl) = &conclusion {
+                final_doc["conclusion"] = json!(concl);
+            }
+            if focus_count > 0 {
+                final_doc["focusCount"] = json!(focus_count);
+            }
             write_json(run.join("review.json"), &final_doc)?;
             sum["review"] = compact_review_summary(&final_doc);
+            *state = "delivered".into();
+            sum["state"] = json!("delivered");
             break;
         }
 
@@ -1681,6 +2262,12 @@ pub fn run_if_applicable(
                 "updatedAt": round_finished,
                 "finishedAt": round_finished,
             });
+            if let Some(concl) = &conclusion {
+                final_doc["conclusion"] = json!(concl);
+            }
+            if focus_count > 0 {
+                final_doc["focusCount"] = json!(focus_count);
+            }
             if let Some(err) = &parse_error {
                 final_doc["parseError"] = json!(err);
             }
@@ -1702,10 +2289,12 @@ pub fn run_if_applicable(
             }
             write_json(run.join("review.json"), &final_doc)?;
             sum["review"] = compact_review_summary(&final_doc);
+            *state = if accept_ok { "delivered" } else { "rejected" }.into();
+            sum["state"] = json!(*state);
             break;
         }
 
-        // Verdict is `REWORK`: send the raw verdict file verbatim back to the author.
+        // Verdict is `REWORK`: send raw verdict file verbatim back to the author.
         rework_rounds += 1;
         let attention_now = rework_rounds >= NEEDS_ATTENTION_REWORK_ROUND;
         let reworking_doc = json!({
@@ -1753,10 +2342,9 @@ pub fn run_if_applicable(
             );
         }
 
-        // Remember this round's delivered tree so the next review round diffs ONLY the incremental change.
-        prev_reviewed_tree = (!after_tree.is_empty()).then_some(after_tree);
+        let prev_tree_for_delta = (!after_tree.is_empty()).then_some(after_tree.clone());
+        prev_reviewed_tree = prev_tree_for_delta.clone();
 
-        // Continue author's session with the EXACT review verdict file (zero LLM paraphrasing).
         let Some(author_next) = supervise::continuation_with_file(meta, run, &verdict_file) else {
             let err = "author has no saved session to continue for rework";
             let now = iso();
@@ -1780,6 +2368,8 @@ pub fn run_if_applicable(
             });
             write_json(run.join("review.json"), &final_doc)?;
             sum["review"] = compact_review_summary(&final_doc);
+            *state = if accept_ok { "delivered" } else { "rejected" }.into();
+            sum["state"] = json!(*state);
             events::emit(
                 &run_id,
                 &repo,
@@ -1832,7 +2422,7 @@ pub fn run_if_applicable(
                 format!("{}\n", answer.trim_end_matches('\n')),
             )?;
         }
-        let (new_state, mut new_sum, new_rec, new_changed) = supervise::settle(
+        let pre = supervise::settle_pre_accept(
             meta,
             run,
             &author_verdict,
@@ -1840,10 +2430,11 @@ pub fn run_if_applicable(
             holder.clone(),
             author_verdict == "ok" && agents::is_question(answer),
         );
-        *state = new_state;
-        *rec = new_rec;
-        *changed = new_changed;
-        if state.as_str() != "delivered" {
+        *state = pre.state;
+        *rec = pre.rec;
+        *changed = pre.changed;
+        let mut new_sum = pre.sum;
+        if !pre.can_accept {
             let now = iso();
             let final_doc = json!({
                 "status": "done",
@@ -1867,6 +2458,13 @@ pub fn run_if_applicable(
             *sum = new_sum;
             break;
         }
+
+        // Compute which files changed in this rework turn so the next round ONLY re-runs affected layers.
+        let new_changes_doc = json(run.join("changes.json"));
+        let new_after_tree = s(&new_changes_doc, "after").to_string();
+        rework_delta_files = prev_tree_for_delta
+            .as_deref()
+            .and_then(|prev_t| diff_tree_paths(&top, prev_t, &new_after_tree));
         *sum = new_sum;
         round += 1;
     }

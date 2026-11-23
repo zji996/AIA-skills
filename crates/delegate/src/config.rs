@@ -299,6 +299,8 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
         }
         crate::review::validate_review_config(value.get("review"))?;
         crate::review::validate_controller_review_paths(value.get("controllerReviewPaths"))?;
+        crate::accept::validate_accept_rules(value.get("acceptRules"))?;
+        crate::card::validate_risk_rules(value.get("riskRules"))?;
         Ok(())
     };
     check().map_err(|e| format!("{}: {e}", path.display()))?;
@@ -386,6 +388,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
     for key in [
         "thinking",
         "accept",
+        "acceptRules",
         "acceptTimeout",
         "evidence",
         "maxRework",
@@ -398,6 +401,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         "acceptBlind",
         "review",
         "controllerReviewPaths",
+        "riskRules",
         "stall",
         "checkIn",
         "agy",

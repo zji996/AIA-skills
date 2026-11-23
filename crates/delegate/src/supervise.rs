@@ -9,15 +9,46 @@ use crate::transient;
 use crate::worktree;
 use serde_json::{json, Value};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicI32, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 use std::time::Duration;
 
 type Recorded = Option<(Vec<Value>, Value)>;
+
+static EXTRA_STOP_HOLDERS: OnceLock<Mutex<Vec<Arc<AtomicI32>>>> = OnceLock::new();
+
+pub(crate) fn register_stop_holder(h: Arc<AtomicI32>) {
+    let list = EXTRA_STOP_HOLDERS.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut guard) = list.lock() {
+        guard.push(h);
+    }
+}
+
+pub(crate) fn unregister_stop_holder(h: &Arc<AtomicI32>) {
+    if let Some(list) = EXTRA_STOP_HOLDERS.get() {
+        if let Ok(mut guard) = list.lock() {
+            guard.retain(|x| !Arc::ptr_eq(x, h));
+        }
+    }
+}
+
+fn kill_extra_stop_holders(runpath: &Path) {
+    if let Some(list) = EXTRA_STOP_HOLDERS.get() {
+        if let Ok(guard) = list.lock() {
+            for h in guard.iter() {
+                let pid = h.load(Ordering::SeqCst);
+                if pid > 0 {
+                    crate::cleanup::record(runpath, pid);
+                    kill_group(pid, 5.0);
+                }
+            }
+        }
+    }
+}
 
 fn evidence(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
     let path = run.join("evidence.log");
@@ -69,141 +100,6 @@ fn evidence(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
 pub fn log_event(run: &Path, mut event: Value) {
     event["at"] = json!(iso());
     let _ = append(run.join("events.jsonl"), &format!("{event}\n"));
-}
-fn accept(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
-    let mut result = json!({"command":s(meta,"accept"),"notExecuted":true,"infrastructureFailure":true});
-    let label = format!(
-        "accept {}",
-        run.file_name().unwrap_or_default().to_string_lossy()
-    );
-    let slot = lane::acquire_shell(&label, None, Some(run), |ahead, _| {
-        log_event(run, json!({"e":"queue","ahead":ahead}))
-    });
-    let Ok(slot) = slot else {
-        result["ok"] = json!(false);
-        result["exitCode"] = Value::Null;
-        result["tail"] = json!("stopped while queued for the heavy lane");
-        return result;
-    };
-    if lane::stopped() {
-        result["ok"] = json!(false);
-        result["exitCode"] = Value::Null;
-        result["tail"] = json!("stopped while queued for the heavy lane");
-        return result;
-    }
-    let path = run.join("accept.log");
-    let mut log = match File::create(&path) {
-        Ok(f) => f,
-        Err(e) => {
-            result["ok"] = json!(false);
-            result["exitCode"] = json!(1);
-            result["tail"] = json!(e.to_string());
-            return result;
-        }
-    };
-    let _ = writeln!(log, "$ {}", s(meta, "accept"));
-    let _ = log.flush();
-    let excluded = changes::managed_paths(meta);
-    if !excluded.is_empty() {
-        result["excluded"] = json!(excluded);
-    }
-    let before = changes::repository_snapshot_excluding(Path::new(s(meta, "top")), run, &excluded);
-    let accept_timeout = meta["acceptTimeoutSeconds"].as_f64().filter(|t| *t > 0.0);
-    let (mut code, mut timed) = run_shell(
-        (s(meta, "accept"), "accept"),
-        Path::new(s(meta, "workdir")),
-        run,
-        &meta["env"],
-        accept_timeout,
-        &mut log,
-        Some(&holder),
-    )
-    .unwrap_or((1, false));
-    let mut local_fallback = Value::Null;
-    if code == 75 {
-        let remote_status = json(run.join("accept.remote.json"));
-        if s(&remote_status, "stage") == "missing_managed" {
-            let reason = s(&remote_status, "reason").to_string();
-            let paths = remote_status["paths"].clone();
-            let _ = writeln!(
-                log,
-                "\n[remote missing managed paths: {reason}; rerunning acceptance locally]"
-            );
-            let _ = log.flush();
-            (code, timed) = run_shell_with(
-                (s(meta, "accept"), "accept"),
-                Path::new(s(meta, "workdir")),
-                run,
-                &meta["env"],
-                accept_timeout,
-                &mut log,
-                Some(&holder),
-                true,
-            )
-            .unwrap_or((1, false));
-            local_fallback = json!({"reason": reason, "paths": paths});
-        }
-    }
-    let after = changes::repository_snapshot_excluding(Path::new(s(meta, "top")), run, &excluded);
-    if let (Some(before), Some(after)) = (&before, &after) {
-        let mut excluded = excluded
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>();
-        for evidence in [before, after] {
-            excluded.extend(
-                evidence["excluded"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string),
-            );
-        }
-        if !excluded.is_empty() {
-            result["excluded"] = json!(excluded);
-        }
-        result["tree"] = before["tree"].clone();
-        result["treeAfter"] = after["tree"].clone();
-        result["snapshotComplete"] = json!(b(before, "complete") && b(after, "complete"));
-        if !b(&result, "snapshotComplete") {
-            result["snapshotReason"] = before
-                .get("incompleteReason")
-                .or_else(|| after.get("incompleteReason"))
-                .cloned()
-                .unwrap_or(json!("incomplete repository snapshot"));
-        }
-    } else {
-        result["snapshotReason"] = json!("acceptance repository snapshot failed");
-    }
-    let _ = writeln!(
-        log,
-        "{}\n[exit {code}]",
-        if timed { "\n[accept timed out]" } else { "" }
-    );
-    if slot.queued >= 1.0 {
-        result["queuedSeconds"] = json!(slot.queued as i64);
-    }
-    result["ok"] = json!(code == 0);
-    result["exitCode"] = json!(code);
-    result.as_object_mut().unwrap().extend(shell_outcome(run, "accept", code, timed).as_object().unwrap().clone());
-    if local_fallback.is_object() {
-        result["localFallback"] = local_fallback;
-    }
-    if code != 0 {
-        let text = read(&path);
-        let body = text.split_once('\n').map(|(_, x)| x).unwrap_or("");
-        let body = body.rsplit_once("\n[exit ").map(|(x, _)| x).unwrap_or(body);
-        result["tail"] = json!(body
-            .trim()
-            .chars()
-            .rev()
-            .take(1500)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect::<String>());
-    }
-    result
 }
 pub(crate) fn attempts_from(
     meta: &Value,
@@ -305,14 +201,22 @@ fn compress_answer(
     let _ = write_json(run.join("compression.json"), &record);
     (result.unwrap_or(answer), used_attempt)
 }
-pub(crate) fn settle(
+pub(crate) struct PreAccept {
+    pub state: String,
+    pub sum: Value,
+    pub rec: Recorded,
+    pub changed: Vec<String>,
+    pub can_accept: bool,
+}
+
+pub(crate) fn settle_pre_accept(
     meta: &mut Value,
     run: &Path,
     verdict: &str,
     setup_error: &Option<String>,
     holder: Arc<AtomicI32>,
     question: bool,
-) -> (String, Value, Recorded, Vec<String>) {
+) -> PreAccept {
     let mut state = if verdict == "ok" {
         "answered".to_string()
     } else {
@@ -363,15 +267,15 @@ pub(crate) fn settle(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let mut source_changed = crate::source_watch::changed(meta);
+    let source_changed = crate::source_watch::changed(meta);
     let attributed_source = if s(meta, "mode") == "write" || b(meta, "shell") {
         crate::source_watch::attributed(meta, run, &source_changed)
     } else {
         vec![]
     };
-    let mut source_leaks = crate::source_watch::worktree_leaks(meta);
+    let source_leaks = crate::source_watch::worktree_leaks(meta);
     let worktree_nm_links = crate::source_watch::worktree_source_node_modules_links(meta);
-    let mut outside_write = !attributed_source.is_empty()
+    let outside_write = !attributed_source.is_empty()
         || !source_leaks.is_empty()
         || !worktree_nm_links.is_empty();
     let protected = meta["protect"]
@@ -475,52 +379,7 @@ pub(crate) fn settle(
         sum["state"] = json!(state);
         sum["error"] = json!(error);
     }
-    if violations.is_empty()
-        && !outside_write
-        && generation_error.is_none()
-        && verdict == "ok"
-        && !question
-        && !s(meta, "accept").is_empty()
-        && !lane::stopped()
-    {
-        sum["accept"] = accept(meta, run, holder);
-        crate::events::emit(
-            &crate::events::run_id_for(run, meta),
-            &crate::events::repo_for_meta(meta),
-            "accept",
-            json!({
-                "name": s(meta, "name"),
-                "ok": b(&sum["accept"], "ok"),
-                "exitCode": sum["accept"]["exitCode"],
-                "command": clip(s(&sum["accept"], "command"), 120),
-                "notExecuted": b(&sum["accept"], "notExecuted"),
-                "infrastructureFailure": b(&sum["accept"], "infrastructureFailure"),
-            }),
-        );
-        if b(&sum["accept"], "infrastructureFailure") {
-            sum["infrastructureFailure"] = json!(true);
-            sum["error"] = json!("remote infrastructure failure; retry does not spend a rework round");
-        }
-        state = if b(&sum["accept"], "ok") {
-            "delivered"
-        } else {
-            "rejected"
-        }
-        .into();
-        sum["state"] = json!(state);
-        let post_leaks = crate::source_watch::worktree_leaks(meta);
-        if !post_leaks.is_empty() {
-            source_leaks = post_leaks;
-            source_changed = crate::source_watch::changed(meta);
-            outside_write = true;
-        }
-    }
-    // Acceptance commands may edit files too: inspect the actual delivered tree.
-    if let Ok(paths) = changes::uncommitted(meta) {
-        if !paths.is_empty() {
-            sum["commitsDiffer"] = json!(paths);
-        }
-    }
+    let mut sync_markers_found = false;
     let sync = json(run.join("sync.json"));
     if b(&sync, "agent") {
         let top = Path::new(s(&meta["worktree"], "path"));
@@ -534,6 +393,7 @@ pub(crate) fn settle(
             .filter(|p| worktree::has_conflict_markers(&top.join(p)))
             .collect::<Vec<_>>();
         if !markers.is_empty() {
+            sync_markers_found = true;
             state = "rejected".into();
             sum["state"] = json!(state);
             sum["syncConflictMarkers"] = json!(markers);
@@ -587,7 +447,63 @@ pub(crate) fn settle(
         sum["error"] = json!("只读任务产生了写入 / read-only shell task wrote files");
         sum.as_object_mut().unwrap().remove("question");
     }
-    (state, sum, rec, changed)
+    let can_accept = violations.is_empty()
+        && !outside_write
+        && generation_error.is_none()
+        && !sync_markers_found
+        && verdict == "ok"
+        && !question
+        && !lane::stopped();
+    PreAccept {
+        state,
+        sum,
+        rec,
+        changed,
+        can_accept,
+    }
+}
+
+pub(crate) fn finalize_post_accept(meta: &Value, run: &Path, state: &mut String, sum: &mut Value) {
+    // Acceptance commands may edit files too: inspect the actual delivered tree.
+    if let Ok(paths) = changes::uncommitted(meta) {
+        if !paths.is_empty() {
+            sum["commitsDiffer"] = json!(paths);
+        }
+    }
+    let post_leaks = crate::source_watch::worktree_leaks(meta);
+    if !post_leaks.is_empty() {
+        let source_changed = crate::source_watch::changed(meta);
+        if !source_changed.is_empty() {
+            sum["sourceWorkspaceChanges"] = json!(source_changed);
+        }
+        *state = "rejected".into();
+        sum["state"] = json!(*state);
+        sum["sourceWriteViolation"] = json!(post_leaks);
+        sum["error"] = json!(format!(
+            "source node_modules points into this worktree ({}); restore source dependencies before cleaning the worktree / 源仓库的 node_modules 指向了本工作树，清理工作树前请先恢复源仓库依赖",
+            post_leaks.join(", ")
+        ));
+        sum.as_object_mut().unwrap().remove("question");
+    }
+    let sync = json(run.join("sync.json"));
+    if b(&sync, "agent") && sum["syncConflictMarkers"].is_null() {
+        let top = Path::new(s(&meta["worktree"], "path"));
+        let mut paths = strings(&sync["conflicts"]);
+        paths.extend(changes::uncommitted(meta).unwrap_or_default());
+        paths.sort();
+        paths.dedup();
+        let markers = paths
+            .into_iter()
+            .filter(|p| worktree::has_conflict_markers(&top.join(p)))
+            .collect::<Vec<_>>();
+        if !markers.is_empty() {
+            *state = "rejected".into();
+            sum["state"] = json!(*state);
+            sum["syncConflictMarkers"] = json!(markers);
+            sum["accept"] = json!({"ok":false,"error":"unresolved sync conflict markers"});
+            sum["error"] = json!("resolve sync conflict markers before delivery");
+        }
+    }
 }
 fn generated_manifest(
     top: &Path,
@@ -1283,7 +1199,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
             grace.clone(),
         );
     }
-    let (mut state, mut sum, mut rec, mut changed) = settle(
+    let mut pre = settle_pre_accept(
         &mut meta,
         run,
         &verdict,
@@ -1295,19 +1211,19 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         transient_error = transient::ended_by(run, attempts).unwrap_or_default();
     }
     let original_model = model_label(&meta);
-    let protected = !sum["protectViolation"].is_null();
+    let protected = !pre.sum["protectViolation"].is_null();
     if !lane::stopped()
-        && sum["question"].is_null()
+        && pre.sum["question"].is_null()
         && !transient_error.is_empty()
-        && escalate(&mut meta, run, &state, rec.is_some(), &changed, protected)?
+        && escalate(&mut meta, run, &pre.state, pre.rec.is_some(), &pre.changed, protected)?
     {
         log_event(
             run,
-            json!({"e":"escalate","from":original_model,"to":model_label(&meta),"after":state}),
+            json!({"e":"escalate","from":original_model,"to":model_label(&meta),"after":pre.state}),
         );
         (verdict, answer, attempts) =
             attempts_from(&meta, run, attempts + 1, holder.clone(), grace.clone());
-        (state, sum, rec, changed) = settle(
+        pre = settle_pre_accept(
             &mut meta,
             run,
             &verdict,
@@ -1315,8 +1231,15 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
             holder.clone(),
             verdict == "ok" && agents::is_question(&answer),
         );
-        sum["escalatedFrom"] = json!(original_model);
+        pre.sum["escalatedFrom"] = json!(original_model);
     }
+    let PreAccept {
+        mut state,
+        mut sum,
+        mut rec,
+        mut changed,
+        can_accept,
+    } = pre;
     sum["attempts"] = json!(attempts);
     if resumes > 0 {
         sum["resumes"] = json!(resumes);
@@ -1330,9 +1253,10 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
             format!("{}\n", answer.trim_end_matches('\n')),
         )?;
     }
-    crate::review::run_if_applicable(
+    crate::review::run_accept_and_review(
         &mut meta,
         run,
+        can_accept,
         &mut state,
         &mut sum,
         &mut rec,
@@ -1342,6 +1266,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         holder.clone(),
         grace.clone(),
     )?;
+    finalize_post_accept(&meta, run, &mut state, &mut sum);
     sum["attempts"] = json!(attempts);
     if resumes > 0 {
         sum["resumes"] = json!(resumes);
@@ -1481,6 +1406,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         sum["warnings"] = warnings;
     }
     worktree::capture_final_entries(&meta, run);
+    crate::card::generate_and_save(run, &meta, &mut sum);
     finish_run(
         run,
         sum,
@@ -1580,6 +1506,7 @@ pub fn supervise(run: &Path) -> Res<()> {
                 crate::cleanup::record(&runpath, pid);
                 kill_group(pid, 5.0);
             }
+            kill_extra_stop_holders(&runpath);
         }
     });
     if let Err(e) = inner(run, holder, grace) {

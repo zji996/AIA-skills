@@ -677,6 +677,23 @@ pub fn run_shell_with(
     holder: Option<&std::sync::atomic::AtomicI32>,
     force_local: bool,
 ) -> Res<(i32, bool)> {
+    run_shell_cancellable(command, cwd, run, extra, timeout, log, holder, force_local, None)
+}
+#[allow(clippy::too_many_arguments)]
+pub fn run_shell_cancellable(
+    command: (&str, &str),
+    cwd: &Path,
+    run: &Path,
+    extra: &Value,
+    timeout: Option<f64>,
+    log: &mut File,
+    holder: Option<&std::sync::atomic::AtomicI32>,
+    force_local: bool,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Res<(i32, bool)> {
+    if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+        return Ok((130, false));
+    }
     let (command, role) = command;
     let mut c = crate::cleanup::scoped_command(run, role, "sh", &[]);
     c.arg("-c")
@@ -731,6 +748,9 @@ pub fn run_shell_with(
     if let Some(h) = holder {
         h.store(pid, std::sync::atomic::Ordering::SeqCst);
     }
+    if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+        kill_group(pid, 1.0);
+    }
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let waiter = std::thread::spawn(move || {
         loop {
@@ -755,6 +775,9 @@ pub fn run_shell_with(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
         if holder.is_none() && crate::lane::stopped() {
+            break false;
+        }
+        if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
             break false;
         }
         let queued = (crate::lane::queued_seconds(run) - queued_before).max(0.0);

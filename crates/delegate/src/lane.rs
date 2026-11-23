@@ -495,8 +495,21 @@ impl Drop for Slot {
         }
     }
 }
-fn block_on(p: &Path) {
-    if let Ok(f) = OpenOptions::new().read(true).open(p) {
+fn block_on(p: &Path, cancel: Option<&AtomicBool>) {
+    let Ok(f) = OpenOptions::new().read(true).open(p) else {
+        return;
+    };
+    if let Some(flag) = cancel {
+        loop {
+            if flag.load(Ordering::SeqCst) || stopped() {
+                return;
+            }
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    } else {
         unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH) };
     }
 }
@@ -506,7 +519,7 @@ pub fn acquire(
     context: Option<&Path>,
     waiting: impl FnMut(usize, &[String]),
 ) -> Res<Slot> {
-    acquire_in(&lane_dir(), heavy_limit(context)?, label, account, context, false, waiting)
+    acquire_in(&lane_dir(), heavy_limit(context)?, label, account, context, false, None, waiting)
 }
 pub fn acquire_remote(
     label: &str,
@@ -522,6 +535,7 @@ pub fn acquire_remote(
         account,
         account,
         true,
+        None,
         waiting,
     )
 }
@@ -532,13 +546,44 @@ pub fn acquire_shell(
     context: Option<&Path>,
     waiting: impl FnMut(usize, &[String]),
 ) -> Res<Slot> {
+    acquire_shell_cancellable(label, account, context, None, waiting)
+}
+pub fn acquire_shell_cancellable(
+    label: &str,
+    account: Option<&Path>,
+    context: Option<&Path>,
+    cancel: Option<&AtomicBool>,
+    waiting: impl FnMut(usize, &[String]),
+) -> Res<Slot> {
+    if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+        return Err("cancelled while queued for the heavy lane".into());
+    }
     let meta = context
         .map(|r| json(r.join("meta.json")))
         .unwrap_or(Value::Null);
     if crate::remote::enabled(&meta["remote"]) {
-        acquire_remote(label, account.or(context), &meta["remote"], waiting)
+        let plan = crate::remote::remote_plan(&meta["remote"], true);
+        acquire_in(
+            &state_dir().join("lane-remote"),
+            plan.max_heavy,
+            label,
+            account.or(context),
+            account.or(context),
+            true,
+            cancel,
+            waiting,
+        )
     } else {
-        acquire(label, account, context, waiting)
+        acquire_in(
+            &lane_dir(),
+            heavy_limit(context)?,
+            label,
+            account,
+            context,
+            false,
+            cancel,
+            waiting,
+        )
     }
 }
 fn run_started_ns_for(run: Option<&Path>, fallback_ns: u64) -> u64 {
@@ -588,6 +633,7 @@ fn start_local_proxy(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn acquire_in(
     dir: &Path,
     limit: usize,
@@ -595,6 +641,7 @@ fn acquire_in(
     account: Option<&Path>,
     context: Option<&Path>,
     remote: bool,
+    cancel: Option<&AtomicBool>,
     mut waiting: impl FnMut(usize, &[String]),
 ) -> Res<Slot> {
     if std::env::var_os("DELEGATE_LANE_HELD").is_some() {
@@ -705,10 +752,17 @@ fn acquire_in(
                 LANE_WAITING.store(false, Ordering::SeqCst);
                 return Err("stopped while queued for the heavy lane".into());
             }
-            block_on(&live[pos - limit].0);
+            if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+                LANE_WAITING.store(false, Ordering::SeqCst);
+                return Err("cancelled while queued for the heavy lane".into());
+            }
+            block_on(&live[pos - limit].0, cancel);
             LANE_WAITING.store(false, Ordering::SeqCst);
             if stopped() {
                 return Err("stopped while queued for the heavy lane".into());
+            }
+            if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+                return Err("cancelled while queued for the heavy lane".into());
             }
         }
         Ok(())

@@ -689,6 +689,7 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
             "syncConflictMarkers",
             "shape",
             "accept",
+            "card",
             "infrastructureFailure",
             "evidence",
             "readOnlyViolation",

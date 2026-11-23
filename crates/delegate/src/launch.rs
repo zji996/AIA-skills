@@ -951,6 +951,13 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     extra["share"] = json!(o.share);
     extra["acceptBlind"] = config.value["acceptBlind"].clone();
     extra["controllerReviewPaths"] = config.value["controllerReviewPaths"].clone();
+    extra["riskRules"] = config.value["riskRules"].clone();
+    if !o.read_only && !o.accept_set && config.value["acceptRules"].is_array() {
+        extra["acceptRules"] = config.value["acceptRules"].clone();
+    }
+    if !o.read_only && !o.accept_also.is_empty() {
+        extra["acceptAlso"] = json!(o.accept_also);
+    }
     if !o.read_only {
         if let Some(rc) = crate::review::resolve_launch_config(&config.value, repo.as_deref())? {
             extra["reviewConfig"] = rc;
@@ -1588,6 +1595,23 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     } else {
         meta["controllerReviewPaths"].clone()
     };
+    extra["riskRules"] = if !config.value["riskRules"].is_null() {
+        config.value["riskRules"].clone()
+    } else {
+        meta["riskRules"].clone()
+    };
+    if !o.read_only && !accept_overridden {
+        extra["acceptRules"] = if config.value["acceptRules"].is_array() {
+            config.value["acceptRules"].clone()
+        } else {
+            meta["acceptRules"].clone()
+        };
+        if !o.accept_also.is_empty() {
+            extra["acceptAlso"] = json!(o.accept_also);
+        } else if meta["acceptAlso"].is_array() {
+            extra["acceptAlso"] = meta["acceptAlso"].clone();
+        }
+    }
     if !o.read_only {
         if let Some(rc) = crate::review::resolve_launch_config(
             &config.value,
@@ -2479,7 +2503,10 @@ pub fn launch(
         "cleanupKeepExecutables",
         "share",
         "acceptBlind",
+        "acceptRules",
+        "acceptAlso",
         "controllerReviewPaths",
+        "riskRules",
         "reviewConfig",
         "resources",
         "remote",

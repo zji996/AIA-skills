@@ -179,11 +179,35 @@ pub fn emit_run_finished(run: &Path, meta: &Value, summary: &Value) {
         "state": state,
         "mode": mode,
     });
-    if summary["changes"]["files"].as_u64().is_some() {
-        payload["files"] = summary["changes"]["files"].clone();
+    let change_totals = if summary["pendingChanges"].is_object() {
+        &summary["pendingChanges"]
+    } else {
+        &summary["changes"]
+    };
+    if change_totals["files"].as_u64().is_some() {
+        payload["files"] = change_totals["files"].clone();
+        payload["added"] = change_totals["added"].clone();
+        payload["deleted"] = change_totals["deleted"].clone();
     }
     if summary["accept"].is_object() {
         payload["acceptOk"] = summary["accept"]["ok"].clone();
+        payload["acceptLabel"] = json!(crate::accept::human_accept_label(
+            &summary["accept"],
+            b(summary, "infrastructureFailure"),
+        ));
+    }
+    if summary["review"].is_object() {
+        if !s(&summary["review"], "verdict").is_empty() {
+            payload["reviewVerdict"] = summary["review"]["verdict"].clone();
+        } else if b(&summary["review"], "cancelled") {
+            payload["reviewVerdict"] = json!("cancelled");
+        }
+    }
+    if summary["card"].is_object() {
+        payload["card"] = summary["card"].clone();
+    }
+    if mode == "write" && kind == "delivered" {
+        payload["next"] = json!(format!("delegate card {run_id}"));
     }
     if !s(summary, "error").is_empty() {
         payload["error"] = json!(clip(s(summary, "error"), 200));
@@ -912,11 +936,48 @@ pub fn format_human(ev: &Value) -> String {
         }
         "delivered" => {
             let st = s(p, "state");
-            if st == "answered" {
+            let mut segs = vec![if st == "answered" {
                 "已答复".to_string()
             } else {
                 "已交付".to_string()
+            }];
+            let acc_lbl = s(p, "acceptLabel");
+            if !acc_lbl.is_empty() {
+                segs.push(acc_lbl.to_string());
+            } else if let Some(ok) = p["acceptOk"].as_bool() {
+                segs.push(if ok { "验收通过" } else { "验收失败" }.into());
             }
+            let rv = s(p, "reviewVerdict");
+            if !rv.is_empty() {
+                segs.push(format!("审查 {rv}"));
+            }
+            if let Some(files) = p["files"].as_u64() {
+                if files > 0 {
+                    if p["added"].as_u64().is_some() {
+                        segs.push(format!(
+                            "改 {files} 个文件 +{}/-{}",
+                            n(p, "added"),
+                            n(p, "deleted")
+                        ));
+                    } else {
+                        segs.push(format!("改 {files} 个文件"));
+                    }
+                }
+            }
+            if p["card"].is_object() {
+                let risk_str = crate::card::format_l0_risk(&p["card"]);
+                if !risk_str.is_empty() {
+                    segs.push(risk_str);
+                }
+                segs.push(crate::card::format_l0_fast_forward(&p["card"]));
+            } else if s(p, "mode") == "write" {
+                segs.push("快进 —".into());
+            }
+            let next_cmd = s(p, "next");
+            if !next_cmd.is_empty() {
+                segs.push(format!("下一步：{next_cmd}"));
+            }
+            segs.join(" · ")
         }
         "question" => "需要主控决定".to_string(),
         "rejected" | "failed" => {

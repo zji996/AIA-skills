@@ -421,20 +421,10 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
         parts.push(format!("等待测量预约，前面 {ahead} 个"));
     }
     if status["accept"].is_object() {
-        let mut label = if b(&status["accept"], "notExecuted") {
-            "验收未执行（排队/基础设施）".to_string()
-        } else if b(status, "infrastructureFailure") {
-            "验收基础设施失败".to_string()
-        } else if b(&status["accept"], "ok") {
-            "验收通过".to_string()
-        } else {
-            "验收失败".to_string()
-        };
-        if status["accept"]["localFallback"].is_object() {
-            let reason = s(&status["accept"]["localFallback"], "reason");
-            label.push_str(&format!("（本地回退：{}）", clip(reason, 80)));
-        }
-        parts.push(label);
+        parts.push(crate::accept::human_accept_label(
+            &status["accept"],
+            b(status, "infrastructureFailure"),
+        ));
         // Excluded roots are managed links and unfetched reference submodules by
         // design; `--json` keeps them.
     } else if state == "answered" {
@@ -455,6 +445,13 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
         } else if rstatus == "reworking" {
             let r = rework_rounds.max(round);
             format!("REWORK 第 {r} 轮（返工中）")
+        } else if rstatus == "cancelled" || b(rev, "cancelled") {
+            let by = s(rev, "cancelledBy");
+            if by.is_empty() {
+                "审查已取消".to_string()
+            } else {
+                format!("审查已取消（{by}）")
+            }
         } else if rverdict == "PASS" {
             if rework_rounds > 0 {
                 format!("审查 PASS（第 {round} 轮）")
@@ -486,6 +483,15 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
         if b(rev, "needsAttention") && rverdict != "PASS" {
             parts.push("⚠ 需主控关注".to_string());
         }
+    }
+    if status["card"].is_object() {
+        let risk_str = crate::card::format_l0_risk(&status["card"]);
+        if !risk_str.is_empty() {
+            parts.push(risk_str);
+        }
+        parts.push(crate::card::format_l0_fast_forward(&status["card"]));
+    } else if s(status, "mode") == "write" && matches!(state, "delivered" | "answered") {
+        parts.push("快进 —".into());
     }
     if status["evidence"].is_object() {
         parts.push(format!(
@@ -628,21 +634,21 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
             if rverdict == "NEEDS_CONTROLLER" {
                 let sign = &status["sign"];
                 if sign.is_object() && b(sign, "required") && !b(sign, "valid") {
-                    format!("主控审查 controllerReviewPaths 并签字：delegate sign {id}，再 delegate apply {id}")
+                    format!("先看审查卡并签字：delegate card {id}，delegate sign {id}，再 delegate apply {id}")
                 } else {
-                    format!("主控审查结论（NEEDS_CONTROLLER）：delegate status {id}，再 delegate reply {id} '<决定>' 或 delegate apply {id}")
+                    format!("主控审查结论（NEEDS_CONTROLLER）：delegate card {id}，再 delegate reply {id} '<决定>' 或 delegate apply {id}")
                 }
             } else if has_worktree {
                 if status["sourceDrift"]["overlap"]
                     .as_array()
                     .is_some_and(|paths| !paths.is_empty())
                 {
-                    format!("源改动重叠，审查后合入或同步返工：delegate diff {id} --total，再 delegate apply {id} 或 delegate reply {id} --sync '<修正>'")
+                    format!("源改动重叠，先看审查卡：delegate card {id}（或 delegate diff {id} --total），再 delegate apply {id} 或 delegate reply {id} --sync '<修正>'")
                 } else {
-                    format!("审查后合入：delegate diff {id} --total，再 delegate apply {id}")
+                    format!("先看审查卡：delegate card {id}（或 delegate diff {id} --total），再 delegate apply {id}")
                 }
             } else {
-                format!("审查改动：delegate diff {id}")
+                format!("先看审查卡：delegate card {id}（或 delegate diff {id}）")
             }
         } else {
             format!("查看结论后接手或返工：delegate status {id} --json")
@@ -785,6 +791,28 @@ pub fn human_detail(run: &Path, status: &Value) -> String {
     let blind = blind_note(&status["acceptBlind"]);
     if !blind.is_empty() {
         lines.push(format!("  {blind}"));
+    }
+    if status["accept"]["layers"].as_array().is_some_and(|a| !a.is_empty()) {
+        let acc = &status["accept"];
+        if b(acc, "failClosed") {
+            lines.push(format!("  验收全量兜底：{}", s(acc, "failClosedReason")));
+        }
+        for layer in acc["layers"].as_array().unwrap() {
+            let st = s(layer, "status");
+            let st_zh = match st {
+                "passed" => "通过",
+                "failed" => "失败",
+                "skipped" => "跳过",
+                "reused" => "复用",
+                "cancelled" => "取消",
+                "not_run" => "未跑",
+                _ => st,
+            };
+            let lname = s(layer, "name");
+            let tier = s(layer, "tier");
+            let reason = s(layer, "reason");
+            lines.push(format!("  验收层 [{st_zh}] {lname} ({tier})：{reason}"));
+        }
     }
     if status["review"].is_object() {
         let rev = &status["review"];

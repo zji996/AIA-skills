@@ -558,7 +558,12 @@ def check_unread_events(payload: dict, cwd: str) -> str | None:
         wid = str(pl.get("workId") or "").strip()
         raw_label = str(pl.get("name") or pl.get("queueName") or ev.get("run") or "?").replace("\n", " ")
         label = f"{wid}:{raw_label}" if wid else raw_label
-        previews.append(f"{klabel}:{label}")
+        card = pl.get("card") if isinstance(pl.get("card"), dict) else None
+        if kind == "delivered" and card is not None and isinstance(card.get("riskTotal"), int):
+            rt = card["riskTotal"]
+            previews.append(f"{klabel}:{label}(风险{rt},快进—)")
+        else:
+            previews.append(f"{klabel}:{label}")
     more = f" 等共 {len(unread)} 条" if len(unread) > 5 else ""
     summary = "、".join(previews) + more
     return f"有新事件，先看 delegate events --since {cursor_seq}（未读 {len(unread)} 条：{summary}）。"
