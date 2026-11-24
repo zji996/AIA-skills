@@ -615,7 +615,11 @@ fn discover_repos(
 
 fn repo_base_name(repo_p: Option<&Path>, runs_p: &Path) -> String {
     if let Some(rp) = repo_p {
-        if let Some(n) = rp.file_name().and_then(|x| x.to_str()).filter(|s| !s.is_empty()) {
+        if let Some(n) = rp
+            .file_name()
+            .and_then(|x| x.to_str())
+            .filter(|s| !s.is_empty())
+        {
             return n.to_string();
         }
     }
@@ -1280,7 +1284,10 @@ fn find_alive_callers_in_proc(target_callers: &HashSet<String>) -> HashSet<Strin
             }
         }
         if let Ok(cmd_raw) = fs::read(p.join("cmdline")) {
-            let toks: Vec<&[u8]> = cmd_raw.split(|&b| b == 0).filter(|t| !t.is_empty()).collect();
+            let toks: Vec<&[u8]> = cmd_raw
+                .split(|&b| b == 0)
+                .filter(|t| !t.is_empty())
+                .collect();
             for i in 0..toks.len() {
                 if (toks[i] == b"--session-id" || toks[i] == b"--resume") && i + 1 < toks.len() {
                     let trimmed = trim_ascii_bytes(toks[i + 1]);
@@ -1370,10 +1377,7 @@ impl CallerLivenessChecker {
         cur_cwd: String,
     ) -> Self {
         let sessions_val = json(state.join("sessions.json"));
-        let sessions = sessions_val
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
+        let sessions = sessions_val.as_object().cloned().unwrap_or_default();
         Self {
             cursors_doc,
             sessions,
@@ -1401,7 +1405,10 @@ impl CallerLivenessChecker {
     }
 
     fn is_superseded_same_harness(&self, orig_caller: &str, rec: &Value) -> bool {
-        let Some(pid) = rec["pid"].as_u64().filter(|&p| p > 0 && p <= u32::MAX as u64) else {
+        let Some(pid) = rec["pid"]
+            .as_u64()
+            .filter(|&p| p > 0 && p <= u32::MAX as u64)
+        else {
             return false;
         };
         let pid_u32 = pid as u32;
@@ -1453,7 +1460,10 @@ impl CallerLivenessChecker {
         let mut superseded = false;
         let rec_opt = self.sessions.get(orig_caller).cloned();
         if let Some(ref rec) = rec_opt {
-            if let Some(pid) = rec["pid"].as_u64().filter(|&p| p > 0 && p <= u32::MAX as u64) {
+            if let Some(pid) = rec["pid"]
+                .as_u64()
+                .filter(|&p| p > 0 && p <= u32::MAX as u64)
+            {
                 has_recorded_pid = true;
                 if self.is_superseded_same_harness(orig_caller, rec) {
                     superseded = true;
@@ -1466,9 +1476,8 @@ impl CallerLivenessChecker {
             alive = true;
         }
         if !alive && !has_recorded_pid {
-            let mut last_ts: Option<i64> = rec_opt
-                .as_ref()
-                .and_then(|r| iso_epoch(s(r, "lastSeenAt")));
+            let mut last_ts: Option<i64> =
+                rec_opt.as_ref().and_then(|r| iso_epoch(s(r, "lastSeenAt")));
             if let Some(cts) = self.cursors_doc["callers"]
                 .get(orig_caller)
                 .and_then(|c| iso_epoch(s(c, "updatedAt")))
@@ -1493,7 +1502,9 @@ impl CallerLivenessChecker {
         };
         if let (Some((hp, ht)), Some(pid)) = (
             self.cur_harness,
-            rec["pid"].as_u64().filter(|&p| p > 0 && p <= u32::MAX as u64),
+            rec["pid"]
+                .as_u64()
+                .filter(|&p| p > 0 && p <= u32::MAX as u64),
         ) {
             let ticks = rec["startTicks"].as_u64();
             if hp == pid as u32 && ticks.is_none_or(|t| t == ht) {
@@ -2032,7 +2043,10 @@ fn is_run_verbatim_in_source_head(
 
     // Fallback for records without `finalEntries`: compare `after` tree blobs against `HEAD`.
     let after_tree = s(&rec, "after").trim();
-    if let Some(raw_changes) = rec["changes"].as_array().filter(|a| !a.is_empty() && !after_tree.is_empty()) {
+    if let Some(raw_changes) = rec["changes"]
+        .as_array()
+        .filter(|a| !a.is_empty() && !after_tree.is_empty())
+    {
         let mut paths = Vec::with_capacity(raw_changes.len());
         for ch in raw_changes {
             if !ch.is_object() || b(ch, "large") || b(ch, "submodule") {
@@ -2123,8 +2137,7 @@ fn inspect_run_resolution(
     let mut is_replied = replied_parents.contains(rid)
         || resolving.replied.get(rid).copied().unwrap_or(0) > seq
         || run_obj.is_some_and(|o| !s(o, "repliedAt").trim().is_empty());
-    let mut has_result_read =
-        run_obj.is_some_and(|o| !s(o, "resultReadAt").trim().is_empty());
+    let mut has_result_read = run_obj.is_some_and(|o| !s(o, "resultReadAt").trim().is_empty());
 
     let Some(obj) = run_obj else {
         if !is_cleaned && cache.join("archive").join(rid).join("record").is_dir() {
@@ -2189,9 +2202,7 @@ fn is_alert_event_stale(
         if w.state == "done" {
             return true;
         }
-        if w.state == "deferred"
-            && iso_epoch(w.defer_until.trim()).is_some_and(|ts| ts > now)
-        {
+        if w.state == "deferred" && iso_epoch(w.defer_until.trim()).is_some_and(|ts| ts > now) {
             return true;
         }
         if kind == "work_defer_expired" {
@@ -2429,7 +2440,10 @@ fn save_work_remind(state: &Path, remind_map: &BTreeMap<String, BTreeMap<String,
         let mut inner = serde_json::Map::new();
         for (ck, &ts) in per_caller {
             if ts >= cutoff {
-                inner.insert(ck.clone(), json!(format_epoch(ts, false, "%Y-%m-%dT%H:%M:%SZ")));
+                inner.insert(
+                    ck.clone(),
+                    json!(format_epoch(ts, false, "%Y-%m-%dT%H:%M:%SZ")),
+                );
             }
         }
         if !inner.is_empty() {
@@ -2464,7 +2478,11 @@ fn run_label(obj: &Value, repo_label: &str, is_current: bool) -> String {
                 n
             } else {
                 let r = s(obj, "run");
-                if !r.is_empty() { r } else { "?" }
+                if !r.is_empty() {
+                    r
+                } else {
+                    "?"
+                }
             }
         }
     };
@@ -2793,7 +2811,10 @@ impl PendingItem {
             }
             _ => self.display_name.clone(),
         };
-        format!("[{}] {obj} · {} · 下一步：{next}", self.category_label, self.status_text)
+        format!(
+            "[{}] {obj} · {} · 下一步：{next}",
+            self.category_label, self.status_text
+        )
     }
 
     fn to_json(&self, format: HookFormat) -> Value {
@@ -2868,8 +2889,10 @@ fn evaluate_core(
         now,
         mode == EvalMode::Check,
     );
-    let orphan_secs =
-        parse_pos_f64_env("DELEGATE_ORPHAN_TAKEOVER_HOURS", DEFAULT_ORPHAN_TAKEOVER_HOURS) * 3600.0;
+    let orphan_secs = parse_pos_f64_env(
+        "DELEGATE_ORPHAN_TAKEOVER_HOURS",
+        DEFAULT_ORPHAN_TAKEOVER_HOURS,
+    ) * 3600.0;
     let stall_penetrate_secs = (parse_pos_f64_env(
         "DELEGATE_STALL_PENETRATE_MINUTES",
         DEFAULT_STALL_PENETRATE_MINUTES,
@@ -2878,9 +2901,10 @@ fn evaluate_core(
         "DELEGATE_STALL_VERIFY_MINUTES",
         DEFAULT_STALL_VERIFY_MINUTES,
     ) * 60.0) as i64;
-    let verify_stale_secs =
-        (parse_pos_f64_env("DELEGATE_WORK_STALE_VERIFY_HOURS", DEFAULT_STALE_VERIFY_HOURS)
-            * 3600.0) as i64;
+    let verify_stale_secs = (parse_pos_f64_env(
+        "DELEGATE_WORK_STALE_VERIFY_HOURS",
+        DEFAULT_STALE_VERIFY_HOURS,
+    ) * 3600.0) as i64;
     let ready_stale_secs =
         (parse_pos_f64_env("DELEGATE_WORK_STALE_READY_HOURS", DEFAULT_STALE_READY_HOURS) * 3600.0)
             as i64;
@@ -2976,15 +3000,11 @@ fn evaluate_core(
     };
     let applying_procs: Vec<(Vec<String>, Option<PathBuf>)> = procs
         .iter()
-        .filter_map(|(argv, pcwd)| {
-            match_delegate_subcmd(argv, "apply").map(|a| (a, pcwd.clone()))
-        })
+        .filter_map(|(argv, pcwd)| match_delegate_subcmd(argv, "apply").map(|a| (a, pcwd.clone())))
         .collect();
     let merging_procs: Vec<(Vec<String>, Option<PathBuf>)> = procs
         .iter()
-        .filter_map(|(argv, pcwd)| {
-            match_delegate_subcmd(argv, "merge").map(|a| (a, pcwd.clone()))
-        })
+        .filter_map(|(argv, pcwd)| match_delegate_subcmd(argv, "merge").map(|a| (a, pcwd.clone())))
         .collect();
     let (gate_cwds, lane_runs) = active_lane_state(state, &procs);
 
@@ -3186,8 +3206,12 @@ fn evaluate_core(
                 if adopt_only {
                     continue;
                 }
-                let reason =
-                    build_unmerged_reason(&obj, is_expired_def_chain, &blocked_downstream, wait_mins);
+                let reason = build_unmerged_reason(
+                    &obj,
+                    is_expired_def_chain,
+                    &blocked_downstream,
+                    wait_mins,
+                );
                 let stall_score = (blocked_downstream.len() as u64).saturating_mul(wait_mins);
                 let status_text = if reason.is_empty() {
                     "已交付未合入".to_string()
@@ -3374,7 +3398,11 @@ fn evaluate_core(
             let any_current = uncovered.iter().any(|(_, _, cur)| *cur);
             let first_name = uncovered[0].0.clone();
             let count = uncovered.len();
-            let run_ids: Vec<String> = uncovered.iter().take(8).map(|(_, r, _)| r.clone()).collect();
+            let run_ids: Vec<String> = uncovered
+                .iter()
+                .take(8)
+                .map(|(_, r, _)| r.clone())
+                .collect();
             let target_id = uncovered[0].1.clone();
             out_items.push(PendingItem {
                 priority_tier: 4,
@@ -3463,9 +3491,11 @@ fn evaluate_core(
             continue;
         }
         let item_repo_norm = norm_path_str(&item.repo);
-        let item_is_current =
-            current_repo_str.is_empty() || item_repo_norm.is_empty() || item_repo_norm == current_repo_str;
-        let item_repo_path = (!item.repo.trim().is_empty()).then(|| PathBuf::from(item.repo.trim()));
+        let item_is_current = current_repo_str.is_empty()
+            || item_repo_norm.is_empty()
+            || item_repo_norm == current_repo_str;
+        let item_repo_path =
+            (!item.repo.trim().is_empty()).then(|| PathBuf::from(item.repo.trim()));
 
         let since_raw = if !item.state_since.trim().is_empty() {
             item.state_since.trim()
@@ -3516,8 +3546,7 @@ fn evaluate_core(
             let caller_dead = !item_caller.is_empty() && !liveness.is_alive(item_caller);
             let mut is_orphan = false;
             if !item_caller.is_empty() && item_caller != caller_id {
-                let penetrates =
-                    is_blocking && (caller_dead || age_secs >= stall_penetrate_secs);
+                let penetrates = is_blocking && (caller_dead || age_secs >= stall_penetrate_secs);
                 if penetrates {
                     is_orphan = caller_dead;
                 } else if liveness.can_takeover(item_caller, since_ts) {
@@ -3786,7 +3815,9 @@ fn collect_unread_events(
         return;
     }
 
-    let need_queue = candidates.iter().any(|(_, ev, _)| s(ev, "kind") == "queue_paused");
+    let need_queue = candidates
+        .iter()
+        .any(|(_, ev, _)| s(ev, "kind") == "queue_paused");
     let queue_items_by_name = if need_queue {
         load_queue_items_by_name(state)
     } else {
@@ -3848,7 +3879,11 @@ fn collect_unread_events(
                                 n
                             } else {
                                 let rn = s(run_obj, "name");
-                                if !rn.is_empty() { rn } else { rid.as_str() }
+                                if !rn.is_empty() {
+                                    rn
+                                } else {
+                                    rid.as_str()
+                                }
                             }
                         };
                         adoptable_runs.push((
@@ -4226,6 +4261,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn strip_reply_prefixes_handles_multibyte_names() {
+        assert_eq!(strip_reply_prefixes("暂缓到期时间测试"), "暂缓到期时间测试");
+        assert_eq!(strip_reply_prefixes("reply to reply to 青禾"), "青禾");
+        assert_eq!(strip_reply_prefixes("Reply To eta-1"), "eta-1");
+    }
+
+    #[test]
     fn shared_pending_classification_fixture_matches_hook_kernel() {
         let fixture_raw = include_str!("../../../tests/fixtures/pending_classification.json");
         let doc: Value = serde_json::from_str(fixture_raw).expect("valid shared fixture json");
@@ -4277,9 +4319,11 @@ mod tests {
             Some("colleague")
         );
         assert_eq!(
-            check_entry_guards_with(&json!({"stop_hook_active": true}), HookFormat::Claude, |_| {
-                None
-            }),
+            check_entry_guards_with(
+                &json!({"stop_hook_active": true}),
+                HookFormat::Claude,
+                |_| { None }
+            ),
             Some("loop")
         );
         assert_eq!(
