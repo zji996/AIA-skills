@@ -148,7 +148,7 @@ struct BlockRecord {
 #[derive(Clone, Debug)]
 struct ActionRecord {
     ts: i64,
-    action: String, // "wait" | "apply" | "defer"
+    action: String, // "wait" | "apply" | "defer" | "close" | "wait_on"
     tokens: Vec<String>,
     machine: bool,
 }
@@ -158,6 +158,8 @@ enum Outcome {
     Waited,
     Applied,
     Deferred,
+    Closed,
+    WaitedOn,
     Ignored,
 }
 
@@ -168,6 +170,8 @@ struct WeekBucket {
     waited: usize,
     applied: usize,
     deferred: usize,
+    closed: usize,
+    waited_on: usize,
     ignored: usize,
 }
 
@@ -190,6 +194,13 @@ fn extract_block_tokens(v: &Value) -> Vec<String> {
         }
     };
     if let Some(arr) = v["runIds"].as_array() {
+        for item in arr {
+            if let Some(st) = item.as_str() {
+                push_unique(clean_run_token(st));
+            }
+        }
+    }
+    if let Some(arr) = v["workIds"].as_array() {
         for item in arr {
             if let Some(st) = item.as_str() {
                 push_unique(clean_run_token(st));
@@ -282,14 +293,18 @@ fn load_actions(state: &Path) -> Vec<ActionRecord> {
                 continue;
             };
             let action = s(&v, "action").to_string();
-            if !matches!(action.as_str(), "wait" | "apply" | "defer") {
+            if !matches!(action.as_str(), "wait" | "apply" | "defer" | "close" | "wait_on") {
                 continue;
             }
-            let tokens: Vec<String> = strings(&v["runs"])
+            let mut tokens: Vec<String> = strings(&v["runs"])
                 .into_iter()
                 .map(|r| clean_run_token(&r))
                 .filter(|r| !r.is_empty())
                 .collect();
+            let wid = clean_run_token(s(&v, "workId"));
+            if !wid.is_empty() && !tokens.contains(&wid) {
+                tokens.push(wid);
+            }
             actions.push(ActionRecord {
                 ts,
                 action,
@@ -347,7 +362,7 @@ fn load_actions(state: &Path) -> Vec<ActionRecord> {
         }
     }
 
-    // 3. Work table (`<state>/work.jsonl`) for deferred / applied timestamps
+    // 3. Work table (`<state>/work.jsonl`) for deferred / applied / closed / wait_on timestamps
     if let Ok(f) = OpenOptions::new()
         .read(true)
         .open(state.join("work.jsonl"))
@@ -361,6 +376,10 @@ fn load_actions(state: &Path) -> Vec<ActionRecord> {
                 continue;
             };
             let mut tokens = strings(&v["runs"]);
+            let wid = s(&v, "id");
+            if !wid.is_empty() && !tokens.iter().any(|x| x == wid) {
+                tokens.push(wid.to_string());
+            }
             let title = s(&v, "title");
             if !title.is_empty() && !tokens.iter().any(|x| x == title) {
                 tokens.push(title.to_string());
@@ -368,16 +387,37 @@ fn load_actions(state: &Path) -> Vec<ActionRecord> {
             if tokens.is_empty() {
                 continue;
             }
-            if s(&v, "state") == "deferred" || !s(&v, "deferReason").is_empty() {
-                let ts_str = if !s(&v, "stateSince").is_empty() {
-                    s(&v, "stateSince")
-                } else {
-                    s(&v, "updatedAt")
-                };
-                if let Some(ts) = iso_epoch(ts_str) {
+            let state_ts_str = if !s(&v, "stateSince").is_empty() {
+                s(&v, "stateSince")
+            } else {
+                s(&v, "updatedAt")
+            };
+            let st = s(&v, "state");
+            if st == "deferred" || !s(&v, "deferReason").is_empty() {
+                if let Some(ts) = iso_epoch(state_ts_str) {
                     actions.push(ActionRecord {
                         ts,
                         action: "defer".to_string(),
+                        tokens: tokens.clone(),
+                        machine: false,
+                    });
+                }
+            }
+            if st == "done" && s(&v, "closedKind") != "dropped" {
+                if let Some(ts) = iso_epoch(state_ts_str) {
+                    actions.push(ActionRecord {
+                        ts,
+                        action: "close".to_string(),
+                        tokens: tokens.clone(),
+                        machine: false,
+                    });
+                }
+            }
+            if st == "blocked" && !strings(&v["waitOn"]).is_empty() {
+                if let Some(ts) = iso_epoch(state_ts_str) {
+                    actions.push(ActionRecord {
+                        ts,
+                        action: "wait_on".to_string(),
                         tokens: tokens.clone(),
                         machine: false,
                     });
@@ -495,8 +535,7 @@ fn attribute_outcome(
                         || act.tokens.is_empty()
                         || tokens_overlap(&blk.tokens, &act.tokens))
             }
-            "apply" => tokens_overlap(&blk.tokens, &act.tokens),
-            "defer" => tokens_overlap(&blk.tokens, &act.tokens),
+            "apply" | "defer" | "close" | "wait_on" => tokens_overlap(&blk.tokens, &act.tokens),
             _ => false,
         };
         if !matched {
@@ -506,6 +545,8 @@ fn attribute_outcome(
             "wait" => Outcome::Waited,
             "apply" => Outcome::Applied,
             "defer" => Outcome::Deferred,
+            "close" => Outcome::Closed,
+            "wait_on" => Outcome::WaitedOn,
             _ => continue,
         };
         if best.is_none_or(|(bts, _)| act.ts < bts) {
@@ -530,6 +571,8 @@ pub fn compute_stats(state: &Path, max_weeks: Option<usize>) -> Value {
             Outcome::Waited => entry.waited += 1,
             Outcome::Applied => entry.applied += 1,
             Outcome::Deferred => entry.deferred += 1,
+            Outcome::Closed => entry.closed += 1,
+            Outcome::WaitedOn => entry.waited_on += 1,
             Outcome::Ignored => entry.ignored += 1,
         }
     }
@@ -546,6 +589,8 @@ pub fn compute_stats(state: &Path, max_weeks: Option<usize>) -> Value {
     let mut total_waited = 0usize;
     let mut total_applied = 0usize;
     let mut total_deferred = 0usize;
+    let mut total_closed = 0usize;
+    let mut total_waited_on = 0usize;
     let mut total_ignored = 0usize;
     let mut total_by_hook: BTreeMap<String, usize> = BTreeMap::new();
 
@@ -556,6 +601,8 @@ pub fn compute_stats(state: &Path, max_weeks: Option<usize>) -> Value {
             total_waited += b.waited;
             total_applied += b.applied;
             total_deferred += b.deferred;
+            total_closed += b.closed;
+            total_waited_on += b.waited_on;
             total_ignored += b.ignored;
             for (k, &v) in &b.by_hook {
                 *total_by_hook.entry(k.clone()).or_insert(0) += v;
@@ -568,6 +615,8 @@ pub fn compute_stats(state: &Path, max_weeks: Option<usize>) -> Value {
                     "waited": b.waited,
                     "applied": b.applied,
                     "deferred": b.deferred,
+                    "closed": b.closed,
+                    "waitedOn": b.waited_on,
                     "ignored": b.ignored,
                 }
             })
@@ -582,6 +631,8 @@ pub fn compute_stats(state: &Path, max_weeks: Option<usize>) -> Value {
             "waited": total_waited,
             "applied": total_applied,
             "deferred": total_deferred,
+            "closed": total_closed,
+            "waitedOn": total_waited_on,
             "ignored": total_ignored,
         },
         "weeks": weeks_json,
@@ -597,7 +648,7 @@ pub fn render_stats_human(doc: &Value) -> String {
     let mut lines = Vec::new();
     lines.push(format!("Stop hook 统计（{log_path}，共 {total} 次触发）"));
     lines.push(
-        "周次       触发  waiter  unmerged  question  events | 挂了 wait  apply 了  defer 了  被忽略了"
+        "周次       触发  waiter  unmerged  question  events  work | 挂了 wait  apply 了  defer 了  close 了  wait_on 了  被忽略了"
             .to_string(),
     );
     for w in doc["weeks"].as_array().into_iter().flatten() {
@@ -606,30 +657,36 @@ pub fn render_stats_human(doc: &Value) -> String {
         let bh = &w["byHook"];
         let oc = &w["outcomes"];
         lines.push(format!(
-            "{week:<9} {:>5} {:>7} {:>9} {:>9} {:>7} | {:>9} {:>9} {:>9} {:>8}",
+            "{week:<9} {:>5} {:>7} {:>9} {:>9} {:>7} {:>5} | {:>9} {:>9} {:>9} {:>9} {:>11} {:>8}",
             trig,
             bh["waiter"].as_u64().unwrap_or(0),
             bh["unmerged"].as_u64().unwrap_or(0),
             bh["question"].as_u64().unwrap_or(0),
             bh["events"].as_u64().unwrap_or(0),
+            bh["work"].as_u64().unwrap_or(0),
             oc["waited"].as_u64().unwrap_or(0),
             oc["applied"].as_u64().unwrap_or(0),
             oc["deferred"].as_u64().unwrap_or(0),
+            oc["closed"].as_u64().unwrap_or(0),
+            oc["waitedOn"].as_u64().unwrap_or(0),
             oc["ignored"].as_u64().unwrap_or(0),
         ));
     }
     let bh = &doc["byHook"];
     let oc = &doc["outcomes"];
     lines.push(format!(
-        "合计      {:>5} {:>7} {:>9} {:>9} {:>7} | {:>9} {:>9} {:>9} {:>8}",
+        "合计      {:>5} {:>7} {:>9} {:>9} {:>7} {:>5} | {:>9} {:>9} {:>9} {:>9} {:>11} {:>8}",
         total,
         bh["waiter"].as_u64().unwrap_or(0),
         bh["unmerged"].as_u64().unwrap_or(0),
         bh["question"].as_u64().unwrap_or(0),
         bh["events"].as_u64().unwrap_or(0),
+        bh["work"].as_u64().unwrap_or(0),
         oc["waited"].as_u64().unwrap_or(0),
         oc["applied"].as_u64().unwrap_or(0),
         oc["deferred"].as_u64().unwrap_or(0),
+        oc["closed"].as_u64().unwrap_or(0),
+        oc["waitedOn"].as_u64().unwrap_or(0),
         oc["ignored"].as_u64().unwrap_or(0),
     ));
     lines.join("\n")
@@ -775,7 +832,47 @@ mod tests {
         assert!(rendered.contains("挂了 wait"), "{rendered}");
         assert!(rendered.contains("apply 了"), "{rendered}");
         assert!(rendered.contains("defer 了"), "{rendered}");
+        assert!(rendered.contains("close 了"), "{rendered}");
+        assert!(rendered.contains("wait_on 了"), "{rendered}");
         assert!(rendered.contains("被忽略了"), "{rendered}");
+
+        let _ = fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn hook_stats_attributes_work_hook_close_wait_on_and_defer() {
+        let state = temp_state("work-stats");
+        fs::write(
+            stop_log_path(&state),
+            concat!(
+                "{\"ts\":\"2026-11-24T09:00:00Z\",\"hook\":\"work\",\"runs\":\"W001\",\"workIds\":[\"W001\"]}\n",
+                "{\"ts\":\"2026-11-24T09:10:00Z\",\"hook\":\"work\",\"runs\":\"W002\",\"workIds\":[\"W002\"]}\n",
+                "{\"ts\":\"2026-11-24T09:20:00Z\",\"hook\":\"work\",\"runs\":\"W003\",\"workIds\":[\"W003\"]}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            actions_log_path(&state),
+            concat!(
+                "{\"ts\":\"2026-11-24T09:01:00Z\",\"action\":\"close\",\"runs\":[],\"workId\":\"W001\"}\n",
+                "{\"ts\":\"2026-11-24T09:11:00Z\",\"action\":\"wait_on\",\"runs\":[],\"workId\":\"W002\"}\n",
+                "{\"ts\":\"2026-11-24T09:21:00Z\",\"action\":\"defer\",\"runs\":[],\"workId\":\"W003\"}\n",
+            ),
+        )
+        .unwrap();
+
+        let doc = compute_stats(&state, None);
+        assert_eq!(doc["total"], 3);
+        assert_eq!(doc["byHook"]["work"], 3);
+        assert_eq!(doc["outcomes"]["closed"], 1);
+        assert_eq!(doc["outcomes"]["waitedOn"], 1);
+        assert_eq!(doc["outcomes"]["deferred"], 1);
+        assert_eq!(doc["outcomes"]["ignored"], 0);
+
+        let rendered = render_stats_human(&doc);
+        assert!(rendered.contains("work"), "{rendered}");
+        assert!(rendered.contains("close 了"), "{rendered}");
+        assert!(rendered.contains("wait_on 了"), "{rendered}");
 
         let _ = fs::remove_dir_all(&state);
     }

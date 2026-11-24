@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `delegate`：工作表防晾置闭环机制——`work.rs` 老化默认阈值调为 `verify` 4h、`ready` 8h、同项提醒冷却 6h；`claude-code-stop.py` 末尾在无更高优阻断且本仓库有空闲位时，挑出老化 `ready`（不含所有者项）/`verify` 及缺 `--brief` 的 `ready` 项中最老 3 条阻断并经 `<state>/work-remind.json` 维持 6h 冷却，`hook stats` 新增 `close`/`wait_on`/`defer`（含 `work` 钩子）归因，同一项连续暂缓 3 次在工作表标「反复暂缓」；`work add` 新增 `--needs-owner <nod|act|card>` 同时建 `Qxx` 并挂 `owner:Qxx` 直接进 `blocked`，标题/完成条件命中审批或不可逆关键词且未设前置时印警告不拒绝；`WorkItem` 新增 `verify_on`（`add`/`wait --verify-on` 支持 `run_applied:`/`work_closed:`/`owner:`/`commit_exists:<sha>`，拒绝 `cmd:`），`reconcile` 全部满足自动关闭并写入求值证据，无 `verify_on` 的 `verify` 项在写任务合入时不自动关；`delegate-tui` 工作表行尾增加 `停 Nh`（1× 黄 / 2× 红）与 `缺说明`、顶栏有老化项时多一格 `老化 N`。
 - `delegate`：`delegate-tui` 全页（0–6 页、帮助页与窄屏降级）清理界面文案与去重——移除产品行为解说与数据来源说明（改为代码注释），同一条信息/数字全 TUI 与同屏只就近保留一处，统一额度进度条为「剩余 % · 全中文重置倒计时」、取数时间仅在标题显示一处（「N 分钟前更新」），预估改为一句结论（晚于重置时间直说「在重置前用不完」、隐藏「每 1% ≈」中间量），未知原始行仅在账号详情页原样显示，底栏仅列当前页可用快捷键。
 
 ## delegate 6.41.0 - 2026-11-24

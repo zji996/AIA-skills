@@ -23,6 +23,15 @@ pub const STATES: [&str; 7] = [
 ];
 
 pub const OWNER_KINDS: [&str; 4] = ["act", "nod", "card", "direction"];
+pub const NEEDS_OWNER_KINDS: [&str; 3] = ["nod", "act", "card"];
+pub const DEFAULT_STALE_VERIFY_HOURS: f64 = 4.0;
+pub const DEFAULT_STALE_READY_HOURS: f64 = 8.0;
+pub const DEFAULT_REMIND_COOLDOWN_HOURS: f64 = 6.0;
+const OWNER_WAIT_KEYWORDS: [&str; 8] = [
+    "点头", "确认", "真机", "对外", "发布", "删除", "不可逆", "所有者",
+];
+const OWNER_WAIT_WARNING: &str =
+    "这项像要所有者点头或等前置，仍放进就绪；若是，加 --needs-owner nod 或 --wait-manual \"…\"";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OwnerInfo {
@@ -257,6 +266,7 @@ pub struct WorkItem {
     pub closed_kind: String,
     pub done_when: String,
     pub wait_on: Vec<String>,
+    pub verify_on: Vec<String>,
     pub auto_dispatch: Option<AutoDispatch>,
     pub runs: Vec<String>,
     pub run_dirs: BTreeMap<String, String>,
@@ -267,6 +277,7 @@ pub struct WorkItem {
     pub owner_ref: String,
     pub defer_reason: String,
     pub defer_until: String,
+    pub defer_streak: u32,
     pub created_at: String,
     pub updated_at: String,
     pub state_since: String,
@@ -286,6 +297,7 @@ impl WorkItem {
 
     pub fn has_open_closure(&self) -> bool {
         !self.done_when.trim().is_empty()
+            || !self.verify_on.is_empty()
             || !self.artifacts.is_empty()
             || self.pending_followups() > 0
     }
@@ -396,6 +408,7 @@ impl WorkItem {
             closed_kind: s(v, "closedKind").to_string(),
             done_when: s(v, "doneWhen").to_string(),
             wait_on: strings(&v["waitOn"]),
+            verify_on: strings(&v["verifyOn"]),
             auto_dispatch: AutoDispatch::from_value(&v["autoDispatch"]),
             runs: strings(&v["runs"]),
             run_dirs,
@@ -406,6 +419,7 @@ impl WorkItem {
             owner_ref: s(v, "ownerRef").to_string(),
             defer_reason: s(v, "deferReason").to_string(),
             defer_until: s(v, "deferUntil").to_string(),
+            defer_streak: v["deferStreak"].as_u64().unwrap_or(0) as u32,
             created_at,
             updated_at: s(v, "updatedAt").to_string(),
             state_since,
@@ -442,6 +456,9 @@ impl WorkItem {
         if !self.done_when.is_empty() {
             obj["doneWhen"] = json!(self.done_when);
         }
+        if !self.verify_on.is_empty() {
+            obj["verifyOn"] = json!(self.verify_on);
+        }
         if let Some(ad) = &self.auto_dispatch {
             obj["autoDispatch"] = ad.to_json();
         }
@@ -462,6 +479,9 @@ impl WorkItem {
         }
         if !self.defer_until.is_empty() {
             obj["deferUntil"] = json!(self.defer_until);
+        }
+        if self.defer_streak > 0 {
+            obj["deferStreak"] = json!(self.defer_streak);
         }
         if !self.last_reminded_at.is_empty() {
             obj["lastRemindedAt"] = json!(self.last_reminded_at);
@@ -1328,6 +1348,221 @@ pub struct CondEval {
     pub pointer: String,
 }
 
+fn resolve_git_common_dir_fs(repo: &Path) -> Option<PathBuf> {
+    if !repo.is_dir() {
+        return None;
+    }
+    if repo.join("HEAD").is_file() && repo.join("objects").is_dir() {
+        return Some(repo.to_path_buf());
+    }
+    let dot_git = repo.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    if dot_git.is_file() {
+        let content = fs::read_to_string(&dot_git).ok()?;
+        let raw = content.trim().strip_prefix("gitdir:")?.trim();
+        let gitdir = {
+            let p = PathBuf::from(raw);
+            if p.is_absolute() {
+                p
+            } else {
+                repo.join(p)
+            }
+        };
+        if let Ok(common_raw) = fs::read_to_string(gitdir.join("commondir")) {
+            let trimmed = common_raw.trim();
+            if !trimmed.is_empty() {
+                let cp = PathBuf::from(trimmed);
+                let resolved = if cp.is_absolute() {
+                    cp
+                } else {
+                    gitdir.join(cp)
+                };
+                if resolved.is_dir() {
+                    return Some(resolved);
+                }
+            }
+        }
+        if gitdir.is_dir() {
+            return Some(gitdir);
+        }
+    }
+    None
+}
+
+fn git_object_dirs_fs(git_dir: &Path) -> Vec<PathBuf> {
+    let main = git_dir.join("objects");
+    let mut dirs = vec![main.clone()];
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    seen.insert(main);
+    let mut idx = 0;
+    while idx < dirs.len() {
+        let alts = dirs[idx].join("info/alternates");
+        idx += 1;
+        for line in read(&alts).lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let p = PathBuf::from(line);
+            let p = if p.is_absolute() {
+                p
+            } else {
+                dirs[idx - 1].join(p)
+            };
+            if p.is_dir() && seen.insert(p.clone()) {
+                dirs.push(p);
+            }
+        }
+    }
+    dirs
+}
+
+fn entry_matches_hex_prefix(entry: &[u8], full_bytes: &[u8], odd_nibble: Option<u8>) -> bool {
+    if entry.len() < full_bytes.len() {
+        return false;
+    }
+    if &entry[..full_bytes.len()] != full_bytes {
+        return false;
+    }
+    if let Some(nib) = odd_nibble {
+        if entry.len() <= full_bytes.len() || (entry[full_bytes.len()] >> 4) != nib {
+            return false;
+        }
+    }
+    true
+}
+
+fn sha_prefix_exists_fs(obj_dirs: &[PathBuf], sha_lower: &str) -> Option<bool> {
+    if sha_lower.len() < 4
+        || sha_lower.len() > 40
+        || !sha_lower.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Some(false);
+    }
+    let prefix = &sha_lower[..2];
+    let suffix = &sha_lower[2..];
+    let b0 = u8::from_str_radix(prefix, 16).ok()? as usize;
+
+    let mut full_bytes = Vec::with_capacity(sha_lower.len() / 2);
+    let bytes = sha_lower.as_bytes();
+    for pair in bytes.chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16)? as u8;
+        let lo = (pair[1] as char).to_digit(16)? as u8;
+        full_bytes.push((hi << 4) | lo);
+    }
+    let odd_nibble = if sha_lower.len() % 2 == 1 {
+        Some((bytes[sha_lower.len() - 1] as char).to_digit(16)? as u8)
+    } else {
+        None
+    };
+
+    let mut unknown = false;
+    for dir in obj_dirs {
+        let loose_dir = dir.join(prefix);
+        if sha_lower.len() == 40 {
+            if loose_dir.join(suffix).is_file() {
+                return Some(true);
+            }
+        } else if let Ok(entries) = fs::read_dir(&loose_dir) {
+            for ent in entries.flatten() {
+                let name = ent.file_name();
+                if let Some(ns) = name.to_str() {
+                    if ns.starts_with(suffix) && ent.path().is_file() {
+                        return Some(true);
+                    }
+                }
+            }
+        }
+
+        let pack_dir = dir.join("pack");
+        let Ok(entries) = fs::read_dir(&pack_dir) else {
+            continue;
+        };
+        for ent in entries.flatten() {
+            let path = ent.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("idx") {
+                continue;
+            }
+            let Ok(data) = fs::read(&path) else {
+                unknown = true;
+                continue;
+            };
+            if data.len() < 1032 || &data[0..8] != b"\xfftOc\x00\x00\x00\x02" {
+                unknown = true;
+                continue;
+            }
+            let u32_at = |offset: usize| -> usize {
+                u32::from_be_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]) as usize
+            };
+            let mut lo = if b0 == 0 { 0 } else { u32_at(8 + (b0 - 1) * 4) };
+            let mut hi = u32_at(8 + b0 * 4);
+            let total = u32_at(8 + 255 * 4);
+            let table_end = 1032usize.saturating_add(total.saturating_mul(20));
+            if lo > hi || hi > total || data.len() < table_end {
+                unknown = true;
+                continue;
+            }
+            // Binary search for lower bound of full_bytes prefix within [lo, hi)
+            let orig_hi = hi;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let off = 1032 + mid * 20;
+                if &data[off..off + full_bytes.len()] < full_bytes.as_slice() {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            let mut scan = lo;
+            while scan < orig_hi {
+                let off = 1032 + scan * 20;
+                let entry = &data[off..off + 20];
+                if &entry[..full_bytes.len()] != full_bytes.as_slice() {
+                    break;
+                }
+                if entry_matches_hex_prefix(entry, &full_bytes, odd_nibble) {
+                    return Some(true);
+                }
+                scan += 1;
+            }
+        }
+    }
+    if unknown { None } else { Some(false) }
+}
+
+pub fn commit_exists_in_repo(repo: &Path, sha: &str) -> bool {
+    let sha_lower = sha.trim().to_ascii_lowercase();
+    if sha_lower.len() < 4
+        || sha_lower.len() > 40
+        || !sha_lower.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    let Some(git_dir) = resolve_git_common_dir_fs(repo) else {
+        return false;
+    };
+    let obj_dirs = git_object_dirs_fs(&git_dir);
+    match sha_prefix_exists_fs(&obj_dirs, &sha_lower) {
+        Some(found) => found,
+        None => Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["cat-file", "-e", &format!("{sha_lower}^{{commit}}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|st| st.success()),
+    }
+}
+
 pub fn evaluate_condition(
     cond: &str,
     item: &WorkItem,
@@ -1435,6 +1670,29 @@ pub fn evaluate_condition(
             pointer: readme.to_string_lossy().into_owned(),
         };
     }
+    if let Some(sha_raw) = cond.strip_prefix("commit_exists:") {
+        let sha = sha_raw.trim();
+        let repo_path = if item.repo.is_empty() {
+            PathBuf::from(current_repo_str())
+        } else {
+            PathBuf::from(&item.repo)
+        };
+        let ok = !sha.is_empty() && commit_exists_in_repo(&repo_path, sha);
+        return CondEval {
+            raw: cond.to_string(),
+            satisfied: ok,
+            detail: if ok {
+                format!("提交 {sha} 已存在")
+            } else {
+                format!("等提交 {sha}")
+            },
+            pointer: if repo_path.as_os_str().is_empty() {
+                format!("git show --stat {sha}")
+            } else {
+                format!("git -C {} show --stat {sha}", repo_path.display())
+            },
+        };
+    }
     if let Some(ts_str) = cond.strip_prefix("after_time:") {
         let ok = parse_iso_or_date_epoch(ts_str).is_some_and(|t| now_epoch >= t);
         return CondEval {
@@ -1507,15 +1765,20 @@ fn reconcile_all_locked_excluding(
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| *v > 0.0)
-        .unwrap_or(24.0)
+        .unwrap_or(DEFAULT_STALE_VERIFY_HOURS)
         * 3600.0;
     let ready_stale_secs = std::env::var("DELEGATE_WORK_STALE_READY_HOURS")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| *v > 0.0)
-        .unwrap_or(48.0)
+        .unwrap_or(DEFAULT_STALE_READY_HOURS)
         * 3600.0;
-    let cooldown_secs = 24.0 * 3600.0;
+    let cooldown_secs = std::env::var("DELEGATE_WORK_REMIND_COOLDOWN_HOURS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(DEFAULT_REMIND_COOLDOWN_HOURS)
+        * 3600.0;
 
     let mut out = ReconcileOutcome {
         changed: false,
@@ -1525,105 +1788,138 @@ fn reconcile_all_locked_excluding(
         stale_items: Vec::new(),
     };
 
-    let snapshot: Vec<WorkItem> = items.to_vec();
+    for _pass in 0..4 {
+        let mut any_auto_closed = false;
+        let snapshot: Vec<WorkItem> = items.to_vec();
 
-    for item in items.iter_mut() {
-        if item.state == "done" {
-            continue;
-        }
-
-        // 1. Check deferred expiry first
-        if item.state == "deferred" {
-            if let Some(until_ts) = parse_iso_or_date_epoch(&item.defer_until) {
-                if now_epoch < until_ts {
-                    continue;
-                }
-                // Expired!
-                item.defer_until.clear();
-                out.defer_expired.push(item.clone());
-                out.changed = true;
-            } else if !item.defer_until.is_empty() {
+        for item in items.iter_mut() {
+            if item.state == "done" {
                 continue;
             }
-        }
 
-        // 2. Inspect latest live (uncleaned) run, if any.
-        let mut live_state: Option<String> = None;
-        let mut live_zero_change_delivered = false;
-        if let Some((_, rdir)) = latest_live_run_excluding(item, state, exclude_run) {
-            let st = runs::state(&rdir);
-            let meta = json(rdir.join("meta.json"));
-            let sum = json(rdir.join("summary.json"));
-            if runs::active(&st) {
-                if rdir.join("stall-warning.json").is_file() {
-                    live_state = Some("attention".into());
+            // 1. Check deferred expiry first
+            if item.state == "deferred" {
+                if let Some(until_ts) = parse_iso_or_date_epoch(&item.defer_until) {
+                    if now_epoch < until_ts {
+                        continue;
+                    }
+                    // Expired!
+                    item.defer_until.clear();
+                    out.defer_expired.push(item.clone());
+                    out.changed = true;
+                } else if !item.defer_until.is_empty() {
+                    continue;
+                }
+            }
+
+            // 2. Inspect latest live (uncleaned) run, if any.
+            let mut live_state: Option<String> = None;
+            let mut live_zero_change_delivered = false;
+            if let Some((_, rdir)) = latest_live_run_excluding(item, state, exclude_run) {
+                let st = runs::state(&rdir);
+                let meta = json(rdir.join("meta.json"));
+                let sum = json(rdir.join("summary.json"));
+                if runs::active(&st) {
+                    if rdir.join("stall-warning.json").is_file() {
+                        live_state = Some("attention".into());
+                    } else {
+                        live_state = Some("active".into());
+                    }
                 } else {
-                    live_state = Some("active".into());
-                }
-            } else {
-                let is_applied = rdir.join(".applied").exists() || rdir.join(".applied-cleaned").exists();
-                let is_question = b(&sum, "question");
-                let review_verdict = {
-                    let rf = json(rdir.join("review.json"));
-                    if rf.is_object() {
-                        s(&rf, "verdict").to_string()
-                    } else {
-                        s(&sum["review"], "verdict").to_string()
-                    }
-                };
-                if is_question
-                    || review_verdict == "NEEDS_CONTROLLER"
-                    || matches!(
-                        st.as_str(),
-                        "rejected" | "failed" | "malformed" | "timeout" | "stalled" | "killed" | "crashed"
-                    )
-                {
-                    if !is_applied {
+                    let is_applied = rdir.join(".applied").exists() || rdir.join(".applied-cleaned").exists();
+                    let is_question = b(&sum, "question");
+                    let review_verdict = {
+                        let rf = json(rdir.join("review.json"));
+                        if rf.is_object() {
+                            s(&rf, "verdict").to_string()
+                        } else {
+                            s(&sum["review"], "verdict").to_string()
+                        }
+                    };
+                    if is_question
+                        || review_verdict == "NEEDS_CONTROLLER"
+                        || matches!(
+                            st.as_str(),
+                            "rejected" | "failed" | "malformed" | "timeout" | "stalled" | "killed" | "crashed"
+                        )
+                    {
+                        if !is_applied {
+                            live_state = Some("attention".into());
+                        }
+                    } else if st == "delivered" && !is_applied && s(&meta, "mode") == "write" {
+                        if delivered_pending_files(&rdir, &meta, &sum) > 0 {
+                            live_state = Some("attention".into());
+                        } else {
+                            // Zero-change delivery needs no merge; let wait_on take precedence,
+                            // otherwise show as 已收取 in verify.
+                            live_zero_change_delivered = true;
+                        }
+                    } else if st == "answered"
+                        && !rdir.join(".delivered").exists()
+                        && s(&meta, "resultReadAt").is_empty()
+                    {
                         live_state = Some("attention".into());
+                    } else if is_applied {
+                        item.applied = true;
                     }
-                } else if st == "delivered" && !is_applied && s(&meta, "mode") == "write" {
-                    if delivered_pending_files(&rdir, &meta, &sum) > 0 {
-                        live_state = Some("attention".into());
-                    } else {
-                        // Zero-change delivery needs no merge; let wait_on take precedence,
-                        // otherwise show as 已收取 in verify.
-                        live_zero_change_delivered = true;
-                    }
-                } else if st == "answered"
-                    && !rdir.join(".delivered").exists()
-                    && s(&meta, "resultReadAt").is_empty()
-                {
-                    live_state = Some("attention".into());
-                } else if is_applied {
-                    item.applied = true;
                 }
             }
-        }
 
-        if let Some(target_st) = live_state {
-            if item.set_state(&target_st, &now_iso) {
-                out.changed = true;
-            }
-            continue;
-        }
-
-        // 3. Evaluate `wait_on` conditions
-        if !item.wait_on.is_empty() {
-            let evals: Vec<CondEval> = item
-                .wait_on
-                .iter()
-                .map(|c| evaluate_condition(c, item, &snapshot, state, now_epoch))
-                .collect();
-            let all_ok = evals.iter().all(|e| e.satisfied);
-            if !all_ok {
-                if item.set_state("blocked", &now_iso) {
+            if let Some(target_st) = live_state {
+                if item.set_state(&target_st, &now_iso) {
                     out.changed = true;
                 }
                 continue;
             }
-            // All `wait_on` satisfied!
-            if item.state == "blocked" {
-                if let Some(ow) = &item.owner {
+
+            // 3. Evaluate `wait_on` conditions
+            if !item.wait_on.is_empty() {
+                let evals: Vec<CondEval> = item
+                    .wait_on
+                    .iter()
+                    .map(|c| evaluate_condition(c, item, &snapshot, state, now_epoch))
+                    .collect();
+                let all_ok = evals.iter().all(|e| e.satisfied);
+                if !all_ok {
+                    if item.set_state("blocked", &now_iso) {
+                        out.changed = true;
+                    }
+                    continue;
+                }
+                // All `wait_on` satisfied!
+                if item.state == "blocked" {
+                    if let Some(ow) = &item.owner {
+                        let target_st = if ow.kind == "direction" {
+                            "active"
+                        } else {
+                            "attention"
+                        };
+                        if item.set_state(target_st, &now_iso) {
+                            out.changed = true;
+                        }
+                        out.unlocked_ready.push(item.clone());
+                    } else if item
+                        .auto_dispatch
+                        .as_ref()
+                        .is_some_and(|ad| ad.dispatched_run.is_empty())
+                    {
+                        if item.set_state("ready", &now_iso) {
+                            out.changed = true;
+                        }
+                        out.to_auto_dispatch.push(item.clone());
+                    } else {
+                        if item.set_state("ready", &now_iso) {
+                            out.changed = true;
+                        }
+                        out.unlocked_ready.push(item.clone());
+                    }
+                    continue;
+                }
+            }
+
+            // 4. If item fell out of deferred or active without an active/attention run:
+            if let Some(ow) = &item.owner {
+                if item.state == "deferred" {
                     let target_st = if ow.kind == "direction" {
                         "active"
                     } else {
@@ -1632,81 +1928,79 @@ fn reconcile_all_locked_excluding(
                     if item.set_state(target_st, &now_iso) {
                         out.changed = true;
                     }
-                    out.unlocked_ready.push(item.clone());
-                } else if item
-                    .auto_dispatch
-                    .as_ref()
-                    .is_some_and(|ad| ad.dispatched_run.is_empty())
-                {
-                    if item.set_state("ready", &now_iso) {
-                        out.changed = true;
-                    }
-                    out.to_auto_dispatch.push(item.clone());
-                } else {
-                    if item.set_state("ready", &now_iso) {
-                        out.changed = true;
-                    }
-                    out.unlocked_ready.push(item.clone());
                 }
                 continue;
             }
-        }
-
-        // 4. If item fell out of deferred or active without an active/attention run:
-        if let Some(ow) = &item.owner {
-            if item.state == "deferred" {
-                let target_st = if ow.kind == "direction" {
-                    "active"
+            if matches!(item.state.as_str(), "deferred" | "active" | "attention") {
+                let next_st = if live_zero_change_delivered
+                    || (item.has_open_closure()
+                        && (item.applied || item.cleaned || !item.runs.is_empty()))
+                {
+                    "verify"
                 } else {
-                    "attention"
+                    "ready"
                 };
-                if item.set_state(target_st, &now_iso) {
+                if item.set_state(next_st, &now_iso) {
                     out.changed = true;
                 }
             }
-            continue;
-        }
-        if matches!(item.state.as_str(), "deferred" | "active" | "attention") {
-            let next_st = if live_zero_change_delivered
-                || (item.has_open_closure()
-                    && (item.applied || item.cleaned || !item.runs.is_empty()))
-            {
-                "verify"
-            } else {
-                "ready"
-            };
-            if item.set_state(next_st, &now_iso) {
-                out.changed = true;
-            }
-        }
 
-        // 5. Stale reminder check (24h cooldown per item)
-        if matches!(item.state.as_str(), "verify" | "ready") {
-            let threshold = if item.state == "verify" {
-                verify_stale_secs
-            } else {
-                ready_stale_secs
-            };
-            if let Some(since_ts) = parse_iso_or_date_epoch(&item.state_since) {
-                let elapsed = (now_epoch - since_ts) as f64;
-                if elapsed >= threshold {
-                    let cooled = item.last_reminded_at.is_empty()
-                        || parse_iso_or_date_epoch(&item.last_reminded_at)
-                            .is_none_or(|t| (now_epoch - t) as f64 >= cooldown_secs);
-                    if cooled {
-                        let hours = (elapsed / 3600.0).floor() as i64;
-                        let reason = if item.state == "verify" {
-                            format!("待闭环停滞 {hours}h")
-                        } else {
-                            format!("就绪未派 {hours}h")
-                        };
-                        item.last_reminded_at = now_iso.clone();
-                        item.updated_at = now_iso.clone();
-                        out.changed = true;
-                        out.stale_items.push((item.clone(), reason));
+            // 4b. Auto-close `verify` items when all `verify_on` conditions are satisfied.
+            // Items in `verify` without `verify_on` never auto-close here.
+            if item.state == "verify" && !item.verify_on.is_empty() {
+                let evals: Vec<CondEval> = item
+                    .verify_on
+                    .iter()
+                    .map(|c| evaluate_condition(c, item, &snapshot, state, now_epoch))
+                    .collect();
+                if evals.iter().all(|e| e.satisfied) {
+                    let evidence = evals
+                        .iter()
+                        .map(|e| format!("{}={}", e.raw, e.detail))
+                        .collect::<Vec<_>>()
+                        .join("；");
+                    item.closed_kind = "auto".into();
+                    item.close_evidence = evidence;
+                    item.defer_streak = 0;
+                    item.set_state("done", &now_iso);
+                    out.changed = true;
+                    any_auto_closed = true;
+                    continue;
+                }
+            }
+
+            // 5. Stale reminder check (default 4h verify / 8h ready, 6h cooldown per item)
+            if matches!(item.state.as_str(), "verify" | "ready") {
+                let threshold = if item.state == "verify" {
+                    verify_stale_secs
+                } else {
+                    ready_stale_secs
+                };
+                if let Some(since_ts) = parse_iso_or_date_epoch(&item.state_since) {
+                    let elapsed = (now_epoch - since_ts) as f64;
+                    if elapsed >= threshold {
+                        let cooled = item.last_reminded_at.is_empty()
+                            || parse_iso_or_date_epoch(&item.last_reminded_at)
+                                .is_none_or(|t| (now_epoch - t) as f64 >= cooldown_secs);
+                        if cooled {
+                            let hours = (elapsed / 3600.0).floor() as i64;
+                            let reason = if item.state == "verify" {
+                                format!("待闭环停滞 {hours}h")
+                            } else {
+                                format!("就绪未派 {hours}h")
+                            };
+                            item.last_reminded_at = now_iso.clone();
+                            item.updated_at = now_iso.clone();
+                            out.changed = true;
+                            out.stale_items.push((item.clone(), reason));
+                        }
                     }
                 }
             }
+        }
+
+        if !any_auto_closed {
+            break;
         }
     }
 
@@ -1923,6 +2217,21 @@ pub fn load_readonly_json(state: &Path) -> Vec<Value> {
                     })
                     .collect::<Vec<_>>());
             }
+            if !w.verify_on.is_empty() {
+                obj["verifyOnStatus"] = json!(w
+                    .verify_on
+                    .iter()
+                    .map(|c| {
+                        let ev = evaluate_condition(c, w, &items, state, now_epoch);
+                        json!({
+                            "condition": ev.raw,
+                            "satisfied": ev.satisfied,
+                            "detail": ev.detail,
+                            "pointer": ev.pointer,
+                        })
+                    })
+                    .collect::<Vec<_>>());
+            }
             obj
         })
         .collect()
@@ -2026,6 +2335,7 @@ pub fn on_run_started(work_id: &str, run: &Path, meta: &Value) {
     if let Some(w) = items.iter_mut().find(|w| w.id == norm) {
         w.add_run(&rid, Some(run), Some(&repo));
         w.cleaned = false;
+        w.defer_streak = 0;
         w.set_state("active", &now_iso);
         if let Err(err) = save_raw(&state, &items) {
             eprintln!("delegate: work table write failed on start ({norm}): {err}");
@@ -2133,6 +2443,9 @@ fn verify_reasons(item: &WorkItem) -> Vec<String> {
     if !item.done_when.trim().is_empty() {
         parts.push(format!("完成条件：{}", clip_chars(&item.done_when, 48)));
     }
+    if !item.verify_on.is_empty() {
+        parts.push(format!("{} 条闭环条件待满足", item.verify_on.len()));
+    }
     if !item.artifacts.is_empty() {
         let first = &item.artifacts[0].path;
         if item.artifacts.len() == 1 {
@@ -2144,6 +2457,9 @@ fn verify_reasons(item: &WorkItem) -> Vec<String> {
     let pending = item.pending_followups();
     if pending > 0 {
         parts.push(format!("{pending} 条未完成待办"));
+    }
+    if parts.is_empty() {
+        parts.push("待人工验过闭环".to_string());
     }
     parts
 }
@@ -2221,12 +2537,14 @@ pub fn on_runs_applied(
                 .find(|w| (!wid.is_empty() && w.id == *wid) || w.matches_run(rid))
             {
                 w.applied = true;
+                w.defer_streak = 0;
                 if let Some(dir) = rdir {
                     w.add_run(rid, Some(dir), None);
                 }
                 let explicit_close = closes_norm.as_deref() == Some(w.id.as_str());
+                let keep_verify_without_cond = w.state == "verify" && w.verify_on.is_empty();
                 let short_head = if head.len() >= 7 { &head[..7] } else { head.as_str() };
-                if explicit_close || !w.has_open_closure() {
+                if explicit_close || (!w.has_open_closure() && !keep_verify_without_cond) {
                     w.closed_kind = if explicit_close {
                         "closed".into()
                     } else {
@@ -2262,6 +2580,7 @@ pub fn on_runs_applied(
                         .unwrap_or("");
                     let short_h = &first_head[..first_head.len().min(7)];
                     w.applied = true;
+                    w.defer_streak = 0;
                     w.closed_kind = "closed".into();
                     w.close_evidence = if short_h.is_empty() {
                         format!("applied {first_rid}")
@@ -2276,6 +2595,12 @@ pub fn on_runs_applied(
         }
 
         let rec = reconcile_all_locked(&state, &mut items);
+        stays.retain(|s| {
+            items
+                .iter()
+                .find(|w| w.id == s.id)
+                .is_some_and(|w| w.state == "verify")
+        });
         if changed || rec.changed {
             let _ = save_raw(&state, &items);
         }
@@ -2993,6 +3318,15 @@ fn state_priority(st: &str) -> u8 {
 }
 
 fn focus_for_item(item: &WorkItem, all_items: &[WorkItem], state: &Path, now_epoch: i64) -> String {
+    let base = focus_for_item_core(item, all_items, state, now_epoch);
+    if item.defer_streak >= 3 && item.state != "done" {
+        format!("反复暂缓 · {base}")
+    } else {
+        base
+    }
+}
+
+fn focus_for_item_core(item: &WorkItem, all_items: &[WorkItem], state: &Path, now_epoch: i64) -> String {
     if let Some(ow) = &item.owner {
         if item.state == "done" {
             return if item.closed_kind == "dropped" {
@@ -3483,6 +3817,19 @@ fn render_card(item: &WorkItem, all_items: &[WorkItem], state: &Path, now_epoch:
             lines.push(format!("  {mark} {} — {}{}", ev.raw, ev.detail, ptr));
         }
     }
+    if !item.verify_on.is_empty() {
+        lines.push("闭环条件：".to_string());
+        for cond in &item.verify_on {
+            let ev = evaluate_condition(cond, item, all_items, state, now_epoch);
+            let mark = if ev.satisfied { "✓" } else { "⏳" };
+            let ptr = if ev.pointer.is_empty() {
+                String::new()
+            } else {
+                format!("（{}）", ev.pointer)
+            };
+            lines.push(format!("  {mark} {} — {}{}", ev.raw, ev.detail, ptr));
+        }
+    }
     if let Some(ad) = &item.auto_dispatch {
         let status = if ad.dispatched_run.is_empty() {
             "待触发".to_string()
@@ -3561,14 +3908,20 @@ fn render_card(item: &WorkItem, all_items: &[WorkItem], state: &Path, now_epoch:
         }
     }
     if item.state == "deferred" || !item.defer_reason.is_empty() {
+        let streak_tag = if item.defer_streak >= 3 {
+            format!(" · 反复暂缓（连续 {} 次）", item.defer_streak)
+        } else {
+            String::new()
+        };
         lines.push(format!(
-            "暂缓：{}（至 {}）",
+            "暂缓：{}（至 {}）{}",
             item.defer_reason,
             if item.defer_until.is_empty() {
                 "已到期"
             } else {
                 item.defer_until.as_str()
-            }
+            },
+            streak_tag
         ));
     }
     if item.state == "done" {
@@ -4452,6 +4805,21 @@ fn show_cmd(args: &[String]) -> Res<i32> {
                     })
                 })
                 .collect::<Vec<_>>());
+            if !item.verify_on.is_empty() {
+                obj["verifyOnStatus"] = json!(item
+                    .verify_on
+                    .iter()
+                    .map(|c| {
+                        let ev = evaluate_condition(c, item, &items, &state, now_epoch);
+                        json!({
+                            "condition": ev.raw,
+                            "satisfied": ev.satisfied,
+                            "detail": ev.detail,
+                            "pointer": ev.pointer,
+                        })
+                    })
+                    .collect::<Vec<_>>());
+            }
             println!("{obj}");
         } else {
             println!("{}", render_card(item, &items, &state, now_epoch));
@@ -4478,11 +4846,66 @@ fn show_cmd(args: &[String]) -> Res<i32> {
 
 struct WaitFlags {
     wait_on: Vec<String>,
+    verify_on: Vec<String>,
     owner_ref: Option<String>,
     brief: Option<String>,
     auto: bool,
     start_args: Vec<String>,
     clear_wait: bool,
+}
+
+fn normalize_verify_condition(raw: &str) -> Res<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("--verify-on requires a non-empty condition".into());
+    }
+    if trimmed.starts_with("cmd:") {
+        return Err(
+            "--verify-on does not support cmd: (supported: run_applied:<run>, work_closed:<Wxx>, owner:<Qxx>, commit_exists:<sha>)"
+                .into(),
+        );
+    }
+    if let Some(run_ref) = trimmed.strip_prefix("run_applied:") {
+        let r = run_ref.trim();
+        if r.is_empty() {
+            return Err("invalid --verify-on 'run_applied:' (missing run id)".into());
+        }
+        return Ok(format!("run_applied:{r}"));
+    }
+    if let Some(wid) = trimmed.strip_prefix("work_closed:") {
+        let norm = normalize_work_id(wid)
+            .ok_or_else(|| format!("invalid work id in --verify-on: '{wid}'"))?;
+        return Ok(format!("work_closed:{norm}"));
+    }
+    if let Some(oref) = trimmed.strip_prefix("owner:") {
+        let o = oref.trim();
+        if o.is_empty() {
+            return Err("invalid --verify-on 'owner:' (missing owner ref)".into());
+        }
+        let norm = normalize_work_id(o).unwrap_or_else(|| o.to_string());
+        return Ok(format!("owner:{norm}"));
+    }
+    if let Some(sha) = trimmed.strip_prefix("commit_exists:") {
+        let s_clean = sha.trim();
+        if s_clean.len() < 4
+            || s_clean.len() > 40
+            || !s_clean.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(format!(
+                "invalid commit sha in --verify-on '{trimmed}' (expected 4..=40 hex chars)"
+            ));
+        }
+        return Ok(format!("commit_exists:{}", s_clean.to_ascii_lowercase()));
+    }
+    Err(format!(
+        "invalid --verify-on '{trimmed}' (supported: run_applied:<run>, work_closed:<Wxx>, owner:<Qxx>, commit_exists:<sha>)"
+    ))
+}
+
+fn matches_owner_wait_keyword(title: &str, done_when: &str) -> bool {
+    OWNER_WAIT_KEYWORDS
+        .iter()
+        .any(|kw| title.contains(kw) || done_when.contains(kw))
 }
 
 struct ParsedWaitArgs {
@@ -4497,6 +4920,7 @@ fn parse_wait_conditions(args: &[String], allow_clear: bool) -> Res<ParsedWaitAr
     let mut json_mode = crate::output::json_enabled();
     let mut wf = WaitFlags {
         wait_on: Vec::new(),
+        verify_on: Vec::new(),
         owner_ref: None,
         brief: None,
         auto: false,
@@ -4586,7 +5010,15 @@ fn parse_wait_conditions(args: &[String], allow_clear: bool) -> Res<ParsedWaitAr
                 }
                 wf.wait_on.push(format!("manual:{}", raw.trim()));
             }
-            "--done-when"
+            "--verify-on" => {
+                let raw = take_val(key, &mut i)?;
+                let cond = normalize_verify_condition(&raw)?;
+                if !wf.verify_on.contains(&cond) {
+                    wf.verify_on.push(cond);
+                }
+            }
+            "--needs-owner"
+            | "--done-when"
             | "--repo"
             | "--artifact"
             | "--followup"
@@ -4689,6 +5121,23 @@ fn add_cmd(args: &[String]) -> Res<i32> {
             .as_deref()
             .is_some_and(is_owner_id);
 
+    let needs_owner_kind = match extra.get("--needs-owner").and_then(|v| v.last()) {
+        Some(raw) => {
+            let k = raw.trim();
+            if !NEEDS_OWNER_KINDS.contains(&k) {
+                return Err(format!(
+                    "invalid --needs-owner '{k}' (expected: {})",
+                    NEEDS_OWNER_KINDS.join("|")
+                ));
+            }
+            if is_owner_item {
+                return Err("--needs-owner cannot be combined with --owner-kind".into());
+            }
+            Some(k.to_string())
+        }
+        None => None,
+    };
+
     let pos_title = positional.join(" ").trim().to_string();
     let (title, owner_info) = if is_owner_item {
         let kind = owner_kind_raw
@@ -4770,11 +5219,50 @@ fn add_cmd(args: &[String]) -> Res<i32> {
     let state = state_dir();
     fs::create_dir_all(&state).map_err(|e| format!("{}: {e}", state.display()))?;
     let now_iso = iso();
+    let should_warn_owner_kw = owner_info.is_none()
+        && wf.wait_on.is_empty()
+        && needs_owner_kind.is_none()
+        && matches_owner_wait_keyword(&title, &done_when);
 
-    let (created_id, outcome) = {
+    let (created_id, created_owner_id, outcome) = {
         let _guard = crate::locks::acquire_state(&state).map_err(|e| e.to_string())?;
         let mut items = load_raw(&state);
         let _ = migrate_legacy_locked(&state, &mut items);
+
+        let mut wait_on = wf.wait_on;
+        let mut owner_ref = wf.owner_ref.unwrap_or_default();
+        let created_q = if let Some(ref kind) = needs_owner_kind {
+            let qid = next_owner_id(&items, kind);
+            let q_item = WorkItem {
+                id: qid.clone(),
+                title: title.clone(),
+                repo: repo.clone(),
+                state: "attention".to_string(),
+                owner: Some(OwnerInfo {
+                    kind: kind.clone(),
+                    ask: title.clone(),
+                    recommendation: String::new(),
+                    if_undecided: String::new(),
+                    cost: String::new(),
+                }),
+                created_at: now_iso.clone(),
+                updated_at: now_iso.clone(),
+                state_since: now_iso.clone(),
+                origin: "manual".into(),
+                ..Default::default()
+            };
+            items.push(q_item);
+            let cond = format!("owner:{qid}");
+            if !wait_on.contains(&cond) {
+                wait_on.push(cond);
+            }
+            if owner_ref.is_empty() {
+                owner_ref = qid.clone();
+            }
+            Some(qid)
+        } else {
+            None
+        };
 
         let id = if let Some(ref eid) = explicit_id {
             if items.iter().any(|w| w.id == *eid) {
@@ -4786,11 +5274,11 @@ fn add_cmd(args: &[String]) -> Res<i32> {
         } else {
             next_id_locked(&state, &items)
         };
-        if has_work_cycle(&items, &id, &wf.wait_on) {
+        if has_work_cycle(&items, &id, &wait_on) {
             return Err("dependency cycle detected in --after-work".into());
         }
 
-        let init_state = if !wf.wait_on.is_empty() {
+        let init_state = if !wait_on.is_empty() {
             "blocked"
         } else if let Some(ref ow) = owner_info {
             if ow.kind == "direction" {
@@ -4807,11 +5295,12 @@ fn add_cmd(args: &[String]) -> Res<i32> {
             repo: repo.clone(),
             state: init_state.to_string(),
             done_when,
-            wait_on: wf.wait_on,
+            wait_on,
+            verify_on: wf.verify_on,
             auto_dispatch,
             brief,
             owner: owner_info,
-            owner_ref: wf.owner_ref.unwrap_or_default(),
+            owner_ref,
             created_at: now_iso.clone(),
             updated_at: now_iso.clone(),
             state_since: now_iso.clone(),
@@ -4864,10 +5353,13 @@ fn add_cmd(args: &[String]) -> Res<i32> {
         items.push(item);
         let rec = reconcile_all_locked(&state, &mut items);
         save_raw(&state, &items)?;
-        (id, rec)
+        (id, created_q, rec)
     };
 
     let _ = emit_reconcile_events_and_dispatch(&state, &outcome);
+    if should_warn_owner_kw {
+        eprintln!("{OWNER_WAIT_WARNING}");
+    }
     let items = load_raw(&state);
     let final_item = items.iter().find(|w| w.id == created_id).unwrap();
     let now_epoch = epoch() as i64;
@@ -4882,7 +5374,14 @@ fn add_cmd(args: &[String]) -> Res<i32> {
             final_item.id
         );
         if !final_item.wait_on.is_empty() {
-            println!("前置：{}", focus_for_item(final_item, &items, &state, now_epoch));
+            let owner_note = created_owner_id
+                .as_ref()
+                .map(|qid| format!("（已建所有者项 [{qid}]）"))
+                .unwrap_or_default();
+            println!(
+                "前置：{}{owner_note}",
+                focus_for_item(final_item, &items, &state, now_epoch)
+            );
         }
     }
     Ok(0)
@@ -4900,10 +5399,17 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
         .ok_or("usage: delegate work wait <Wxx> --after-applied <run> [--brief <FILE>] [--auto -- <start-args>]")?;
     let norm = normalize_work_id(raw_id)
         .ok_or_else(|| format!("invalid work id '{raw_id}' (expected W001...)"))?;
-    if !wf.clear_wait && wf.wait_on.is_empty() && wf.brief.is_none() && !wf.auto && !extra.contains_key("--artifact") {
-        return Err("work wait requires at least one condition (--after-applied / --after-delivered / --after-work / --wait-owner / --after-time / --wait-manual / --clear)".into());
+    if !wf.clear_wait
+        && wf.wait_on.is_empty()
+        && wf.verify_on.is_empty()
+        && wf.brief.is_none()
+        && !wf.auto
+        && !extra.contains_key("--artifact")
+    {
+        return Err("work wait requires at least one condition (--after-applied / --after-delivered / --after-work / --wait-owner / --after-time / --wait-manual / --verify-on / --brief / --clear)".into());
     }
 
+    let recorded_wait_on = !wf.wait_on.is_empty();
     let state = state_dir();
     let now_iso = iso();
     let outcome = {
@@ -4942,6 +5448,11 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
                 item.wait_on.push(c.clone());
             }
         }
+        for c in &wf.verify_on {
+            if !item.verify_on.contains(c) {
+                item.verify_on.push(c.clone());
+            }
+        }
         if let Some(oref) = wf.owner_ref {
             item.owner_ref = oref;
         }
@@ -4964,6 +5475,7 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
             }
         }
         if !item.wait_on.is_empty() {
+            item.defer_streak = 0;
             item.set_state("blocked", &now_iso);
         } else if wf.clear_wait && item.state == "blocked" {
             item.set_state("ready", &now_iso);
@@ -4978,6 +5490,9 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
     let _ = emit_reconcile_events_and_dispatch(&state, &outcome);
     let items = load_raw(&state);
     let updated = items.iter().find(|w| w.id == norm).unwrap();
+    if recorded_wait_on {
+        crate::hook::record_action("wait_on", &updated.runs, Some(&updated.id), false);
+    }
     let now_epoch = epoch() as i64;
     if json_mode {
         println!("{}", updated.to_json());
@@ -5055,6 +5570,7 @@ fn close_cmd(args: &[String]) -> Res<i32> {
         };
         items[pos].closed_kind = "closed".into();
         items[pos].close_evidence = ev;
+        items[pos].defer_streak = 0;
         items[pos].set_state("done", &now_iso);
         let snap = items[pos].clone();
         let rec = reconcile_all_locked(&state, &mut items);
@@ -5066,6 +5582,7 @@ fn close_cmd(args: &[String]) -> Res<i32> {
     if !closed_item.runs.is_empty() {
         events::mark_runs_read(&closed_item.runs);
     }
+    crate::hook::record_action("close", &closed_item.runs, Some(&closed_item.id), false);
     if json_mode {
         println!("{}", closed_item.to_json());
     } else {
@@ -5158,6 +5675,7 @@ fn drop_cmd(args: &[String]) -> Res<i32> {
         };
         items[pos].closed_kind = "dropped".into();
         items[pos].close_reason = r;
+        items[pos].defer_streak = 0;
         items[pos].set_state("done", &now_iso);
         let snap = items[pos].clone();
         let deps: Vec<String> = items
@@ -5312,6 +5830,7 @@ fn defer_cmd(args: &[String]) -> Res<i32> {
 
         items[pos].defer_reason = r;
         items[pos].defer_until = until_iso;
+        items[pos].defer_streak = items[pos].defer_streak.saturating_add(1);
         items[pos].set_state("deferred", &now_iso);
         let snap = items[pos].clone();
         save_raw(&state, &items)?;
@@ -5320,8 +5839,8 @@ fn defer_cmd(args: &[String]) -> Res<i32> {
 
     if !deferred_item.runs.is_empty() {
         events::mark_runs_read(&deferred_item.runs);
-        crate::hook::record_action("defer", &deferred_item.runs, Some(&deferred_item.id), false);
     }
+    crate::hook::record_action("defer", &deferred_item.runs, Some(&deferred_item.id), false);
     if json_mode {
         println!("{}", deferred_item.to_json());
     } else {
@@ -5992,6 +6511,222 @@ mod tests {
         assert_eq!(zrow.state, "verify");
         assert_eq!(zrow.focus, "已收取");
         assert!(!zrow.next.starts_with("apply"), "unexpected next: {}", zrow.next);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_thresholds_4h_verify_8h_ready_and_6h_cooldown() {
+        let dir = temp_dir("stale-thresholds");
+        let state = dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let now_ep = epoch() as i64;
+        let ago = |h: i64| format_epoch(now_ep - h * 3600 - 60, false, "%Y-%m-%dT%H:%M:%SZ");
+
+        let mut items = vec![
+            WorkItem {
+                id: "W001".into(),
+                title: "fresh verify 3h".into(),
+                state: "verify".into(),
+                state_since: format_epoch(now_ep - 3 * 3600, false, "%Y-%m-%dT%H:%M:%SZ"),
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W002".into(),
+                title: "stale verify 4h".into(),
+                state: "verify".into(),
+                state_since: ago(4),
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W003".into(),
+                title: "fresh ready 7h".into(),
+                state: "ready".into(),
+                brief: "docs/b.md".into(),
+                state_since: format_epoch(now_ep - 7 * 3600, false, "%Y-%m-%dT%H:%M:%SZ"),
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W004".into(),
+                title: "stale ready 8h".into(),
+                state: "ready".into(),
+                brief: "docs/b.md".into(),
+                state_since: ago(8),
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W005".into(),
+                title: "stale ready cooled 5h".into(),
+                state: "ready".into(),
+                brief: "docs/b.md".into(),
+                state_since: ago(12),
+                last_reminded_at: format_epoch(now_ep - 5 * 3600, false, "%Y-%m-%dT%H:%M:%SZ"),
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W006".into(),
+                title: "stale ready cooldown expired 6h".into(),
+                state: "ready".into(),
+                brief: "docs/b.md".into(),
+                state_since: ago(12),
+                last_reminded_at: ago(6),
+                ..Default::default()
+            },
+        ];
+
+        let rec = reconcile_all_locked(&state, &mut items);
+        let stale_ids: Vec<&str> = rec.stale_items.iter().map(|(w, _)| w.id.as_str()).collect();
+        assert_eq!(stale_ids, vec!["W002", "W004", "W006"]);
+
+        // Immediate second reconcile must respect 6h cooldown and emit nothing.
+        let rec2 = reconcile_all_locked(&state, &mut items);
+        assert!(rec2.stale_items.is_empty(), "{:?}", rec2.stale_items);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_on_auto_closes_with_evidence_supports_commit_exists_and_rejects_cmd() {
+        assert!(normalize_verify_condition("cmd:true").is_err());
+        assert!(normalize_verify_condition("manual:wait").is_err());
+        assert_eq!(
+            normalize_verify_condition("commit_exists:ABCDEF1").unwrap(),
+            "commit_exists:abcdef1"
+        );
+        assert_eq!(
+            normalize_verify_condition("work_closed:w1").unwrap(),
+            "work_closed:W001"
+        );
+        assert_eq!(
+            normalize_verify_condition("owner:q2").unwrap(),
+            "owner:Q02"
+        );
+
+        let dir = temp_dir("verify-on");
+        let state = dir.join("state");
+        let repo = dir.join("repo");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+
+        // Create a real git repo with one commit to test commit_exists:<sha>
+        let run_git = |args: &[&str]| {
+            let st = Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Test"]);
+        fs::write(repo.join("a.txt"), "hello\n").unwrap();
+        run_git(&["add", "a.txt"]);
+        run_git(&["commit", "-q", "-m", "init"]);
+        let sha_out = Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let full_sha = String::from_utf8_lossy(&sha_out.stdout).trim().to_string();
+        let short_sha = &full_sha[..7];
+
+        assert!(commit_exists_in_repo(&repo, &full_sha));
+        assert!(commit_exists_in_repo(&repo, short_sha));
+        assert!(!commit_exists_in_repo(&repo, "deadbeef"));
+
+        let now_iso = iso();
+        let mut items = vec![
+            WorkItem {
+                id: "Q01".into(),
+                title: "点头发布".into(),
+                repo: repo.to_string_lossy().into_owned(),
+                state: "attention".into(),
+                owner: Some(OwnerInfo {
+                    kind: "nod".into(),
+                    ask: "点头发布".into(),
+                    ..Default::default()
+                }),
+                created_at: now_iso.clone(),
+                updated_at: now_iso.clone(),
+                state_since: now_iso.clone(),
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W001".into(),
+                title: "带 verify_on 闭环".into(),
+                repo: repo.to_string_lossy().into_owned(),
+                state: "verify".into(),
+                verify_on: vec![
+                    format!("commit_exists:{short_sha}"),
+                    "owner:Q01".into(),
+                ],
+                created_at: now_iso.clone(),
+                updated_at: now_iso.clone(),
+                state_since: now_iso.clone(),
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W002".into(),
+                title: "无 verify_on 的 verify 项".into(),
+                repo: repo.to_string_lossy().into_owned(),
+                state: "verify".into(),
+                created_at: now_iso.clone(),
+                updated_at: now_iso.clone(),
+                state_since: now_iso.clone(),
+                ..Default::default()
+            },
+        ];
+
+        // Q01 still open -> W001 stays verify; W002 has empty verify_on -> stays verify.
+        reconcile_all_locked(&state, &mut items);
+        assert_eq!(items[1].state, "verify");
+        assert_eq!(items[2].state, "verify");
+
+        // Close Q01 -> W001 auto-closes with evidence containing both condition results; W002 stays verify!
+        items[0].state = "done".into();
+        items[0].closed_kind = "closed".into();
+        items[0].close_evidence = "所有者已点头".into();
+        reconcile_all_locked(&state, &mut items);
+        assert_eq!(items[1].state, "done");
+        assert_eq!(items[1].closed_kind, "auto");
+        assert!(
+            items[1].close_evidence.contains(&format!("commit_exists:{short_sha}"))
+                && items[1].close_evidence.contains("owner:Q01"),
+            "evidence: {}",
+            items[1].close_evidence
+        );
+        assert_eq!(items[2].state, "verify");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owner_wait_keywords_and_repeated_defer_display() {
+        assert!(matches_owner_wait_keyword("需要真机验证", ""));
+        assert!(matches_owner_wait_keyword("普通改动", "对外发布前确认"));
+        assert!(matches_owner_wait_keyword("删除旧表", ""));
+        assert!(!matches_owner_wait_keyword("修单测", "cargo test 通过"));
+
+        let dir = temp_dir("repeat-defer");
+        let state = dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let now_ep = epoch() as i64;
+
+        let mut w = WorkItem {
+            id: "W009".into(),
+            title: "老被推迟的项".into(),
+            state: "deferred".into(),
+            defer_reason: "等窗口".into(),
+            defer_until: "2026-11-26T00:00:00Z".into(),
+            defer_streak: 2,
+            ..Default::default()
+        };
+        assert!(!focus_for_item(&w, std::slice::from_ref(&w), &state, now_ep).contains("反复暂缓"));
+        w.defer_streak = 3;
+        assert!(focus_for_item(&w, std::slice::from_ref(&w), &state, now_ep).contains("反复暂缓"));
+        let card = render_card(&w, std::slice::from_ref(&w), &state, now_ep);
+        assert!(card.contains("反复暂缓（连续 3 次）"), "{card}");
 
         let _ = fs::remove_dir_all(&dir);
     }

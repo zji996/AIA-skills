@@ -4,6 +4,9 @@ use std::path::PathBuf;
 
 /// Pending runs inactive for more than 24 hours are folded by default.
 pub const STALE_PENDING_SECS: u64 = 24 * 3600;
+/// Default stale thresholds for work items (aligned with `delegate` work.rs).
+pub const WORK_STALE_VERIFY_SECS: u64 = 4 * 3600;
+pub const WORK_STALE_READY_SECS: u64 = 8 * 3600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GroupKind {
@@ -923,6 +926,7 @@ pub struct WorkItem {
     pub closed_kind: String,
     pub done_when: String,
     pub wait_on: Vec<String>,
+    pub verify_on: Vec<String>,
     pub wait_on_status: Vec<WorkWaitStatus>,
     pub runs: Vec<String>,
     pub artifacts: Vec<WorkArtifact>,
@@ -934,6 +938,7 @@ pub struct WorkItem {
     pub auto_dispatch_run: String,
     pub defer_reason: String,
     pub defer_until: String,
+    pub defer_streak: u32,
     pub created_at: String,
     pub updated_at: String,
     pub state_since: String,
@@ -1000,6 +1005,10 @@ impl WorkItem {
         self.followups.iter().filter(|f| !f.done).count()
     }
 
+    pub fn is_missing_brief(&self) -> bool {
+        self.owner.is_none() && self.state == "ready" && self.brief.trim().is_empty()
+    }
+
     pub fn matches_filter(&self, query_lower: &str) -> bool {
         if query_lower.is_empty() {
             return true;
@@ -1059,6 +1068,7 @@ pub struct WorkCounts {
     pub in_progress: usize,
     pub waiting: usize,
     pub deferred: usize,
+    pub stale: usize,
     pub done_today: usize,
     pub done_total: usize,
     pub dropped_total: usize,
@@ -1254,6 +1264,7 @@ pub struct AppSnapshot {
     pub agy_accounts: AgyAccountsState,
     pub analytics: AnalyticsSnapshot,
     pub host_load: Option<HostLoad>,
+    pub generated_epoch: Option<i64>,
     pub today_ymd: String,
     pub refreshed_at: String,
     pub warnings: Vec<String>,
@@ -1265,6 +1276,9 @@ impl AppSnapshot {
         let mut h = DefaultHasher::new();
         self.repos.hash(&mut h);
         self.work.hash(&mut h);
+        for w in &self.work {
+            self.work_item_stale_info(w).hash(&mut h);
+        }
         self.lane.hash(&mut h);
         self.events.hash(&mut h);
         self.dag_queue.hash(&mut h);
@@ -1275,6 +1289,40 @@ impl AppSnapshot {
         self.host_load.hash(&mut h);
         self.warnings.hash(&mut h);
         h.finish()
+    }
+
+    pub fn work_item_stale_info(&self, item: &WorkItem) -> Option<(u64, bool)> {
+        if item.owner.is_some() {
+            return None;
+        }
+        let threshold_secs = match item.state.as_str() {
+            "verify" => std::env::var("DELEGATE_WORK_STALE_VERIFY_HOURS")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| *v > 0.0)
+                .map(|h| (h * 3600.0).round() as u64)
+                .unwrap_or(WORK_STALE_VERIFY_SECS),
+            "ready" => std::env::var("DELEGATE_WORK_STALE_READY_HOURS")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| *v > 0.0)
+                .map(|h| (h * 3600.0).round() as u64)
+                .unwrap_or(WORK_STALE_READY_SECS),
+            _ => return None,
+        };
+        let since_raw = if !item.state_since.is_empty() {
+            item.state_since.as_str()
+        } else {
+            item.created_at.as_str()
+        };
+        let since = parse_iso_utc_epoch(since_raw)?;
+        let now = self.generated_epoch.unwrap_or_else(current_utc_epoch);
+        let elapsed = (now - since).max(0) as u64;
+        if elapsed >= threshold_secs {
+            Some((elapsed / 3600, elapsed >= threshold_secs.saturating_mul(2)))
+        } else {
+            None
+        }
     }
 
     pub fn total_count(&self, group: GroupKind) -> usize {
@@ -1300,6 +1348,9 @@ impl AppSnapshot {
     pub fn work_counts(&self) -> WorkCounts {
         let mut c = WorkCounts::default();
         for w in &self.work {
+            if self.work_item_stale_info(w).is_some() {
+                c.stale += 1;
+            }
             match w.bucket() {
                 WorkBucket::Owner => c.owner += 1,
                 WorkBucket::NeedsAction => c.needs_action += 1,
@@ -1597,6 +1648,49 @@ pub fn live_run_one_liner(run: &RunItem) -> String {
     }
 }
 
+pub fn current_utc_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Parse an ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) or date (`YYYY-MM-DD`) to UTC epoch seconds.
+pub fn parse_iso_utc_epoch(iso: &str) -> Option<i64> {
+    let s = iso.trim();
+    let (y, mo, d, h, mi, sec): (i32, i32, i32, i32, i32, i32) =
+        if s.len() >= 19 && s.ends_with('Z') {
+            (
+                s[0..4].parse().ok()?,
+                s[5..7].parse().ok()?,
+                s[8..10].parse().ok()?,
+                s[11..13].parse().ok()?,
+                s[14..16].parse().ok()?,
+                s[17..19].parse().ok()?,
+            )
+        } else if s.len() == 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-' {
+            (
+                s[0..4].parse().ok()?,
+                s[5..7].parse().ok()?,
+                s[8..10].parse().ok()?,
+                0,
+                0,
+                0,
+            )
+        } else {
+            return None;
+        };
+    // Howard Hinnant civil-from-days inverse for UTC epoch seconds (avoids mutating TZ)
+    let y_adj = y - i32::from(mo <= 2);
+    let era = y_adj.div_euclid(400);
+    let yoe = (y_adj - era * 400) as i64;
+    let m_adj = (mo + if mo > 2 { -3 } else { 9 }) as i64;
+    let doy = (153 * m_adj + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era as i64 * 146097 + doe - 719468;
+    Some(days * 86400 + h as i64 * 3600 + mi as i64 * 60 + sec as i64)
+}
+
 /// Parse an ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) and convert to local `YYYY-MM-DD`.
 pub fn iso_to_local_ymd(iso: &str) -> Option<String> {
     let s = iso.trim();
@@ -1606,21 +1700,7 @@ pub fn iso_to_local_ymd(iso: &str) -> Option<String> {
         }
         return None;
     }
-    let y: i32 = s[0..4].parse().ok()?;
-    let mo: i32 = s[5..7].parse().ok()?;
-    let d: i32 = s[8..10].parse().ok()?;
-    let h: i32 = s[11..13].parse().ok()?;
-    let mi: i32 = s[14..16].parse().ok()?;
-    let sec: i32 = s[17..19].parse().ok()?;
-    // Howard Hinnant civil-from-days inverse for UTC epoch seconds (avoids mutating TZ)
-    let y_adj = y - i32::from(mo <= 2);
-    let era = y_adj.div_euclid(400);
-    let yoe = (y_adj - era * 400) as i64;
-    let m_adj = (mo + if mo > 2 { -3 } else { 9 }) as i64;
-    let doy = (153 * m_adj + 2) / 5 + d as i64 - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era as i64 * 146097 + doe - 719468;
-    let utc_secs = (days * 86400 + h as i64 * 3600 + mi as i64 * 60 + sec as i64) as libc::time_t;
+    let utc_secs = parse_iso_utc_epoch(s)? as libc::time_t;
     unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
         if libc::localtime_r(&utc_secs, &mut tm).is_null() {

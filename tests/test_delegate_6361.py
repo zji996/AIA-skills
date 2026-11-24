@@ -121,13 +121,16 @@ class Delegate6361Tests(unittest.TestCase):
         other_env = self.clean_caller_env({"DELEGATE_CALLER": other_sid})
 
         # Create W001 + W002 waiting on W001, then close W001 to emit a real `work_ready` event.
+        brief = repo / "docs/downstream-brief.md"
+        brief.parent.mkdir(parents=True, exist_ok=True)
+        brief.write_text("# Downstream\n")
         self.assertEqual(
-            self.run_delegate(["work", "add", "前置任务", "--repo", str(repo)], repo, sess_env).returncode,
+            self.run_delegate(["work", "add", "前置任务", "--repo", str(repo), "--brief", str(brief)], repo, sess_env).returncode,
             0,
         )
         self.assertEqual(
             self.run_delegate(
-                ["work", "add", "待派下游", "--repo", str(repo), "--after-work", "W001"],
+                ["work", "add", "待派下游", "--repo", str(repo), "--after-work", "W001", "--brief", str(brief)],
                 repo,
                 sess_env,
             ).returncode,

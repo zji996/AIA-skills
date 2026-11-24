@@ -78,6 +78,11 @@ KIND_LABELS = {
     "work_stale": "工作项停滞",
 }
 APPLY_VALUE_FLAGS = {"--closes", "--message", "-m", "--work"}
+DEFAULT_STALE_VERIFY_HOURS = 4.0
+DEFAULT_STALE_READY_HOURS = 8.0
+DEFAULT_REMIND_COOLDOWN_HOURS = 6.0
+DEFAULT_MAX_ACTIVE = 32
+DEFAULT_REPO_MAX_ACTIVE = 0
 
 
 def find_delegate_bin() -> str | None:
@@ -101,6 +106,11 @@ def state_dir() -> Path:
 def cache_dir() -> Path:
     base = os.environ.get("XDG_CACHE_HOME")
     return (Path(base) if base else Path.home() / ".cache") / "delegate"
+
+
+def config_dir() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME")
+    return (Path(base) if base else Path.home() / ".config") / "delegate"
 
 
 def read_json_file(path: Path) -> dict | None:
@@ -1302,6 +1312,235 @@ def check_unread_events(
     )
 
 
+def _parse_pos_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        val = float(raw)
+        return val if val > 0 else default
+    except ValueError:
+        return default
+
+
+def _parse_nonneg_int_env(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw or not raw.isdigit():
+        return None
+    return int(raw)
+
+
+def read_capacity_limits(current_repo: Path | None) -> tuple[int, int]:
+    """Read `(max_active, repo_max_active)` from env / repo `.delegate.json` / user `config.json`."""
+    user_cfg = read_json_file(config_dir() / "config.json") or {}
+    repo_cfg = (
+        read_json_file(current_repo / ".delegate.json") or {}
+        if current_repo is not None
+        else {}
+    )
+
+    def resolve(env_key: str, cfg_key: str, default: int) -> int:
+        ev = _parse_nonneg_int_env(env_key)
+        if ev is not None:
+            return ev
+        for cfg in (repo_cfg, user_cfg):
+            val = cfg.get(cfg_key)
+            if isinstance(val, int) and not isinstance(val, bool) and val >= 0:
+                return val
+        return default
+
+    return (
+        resolve("DELEGATE_MAX_ACTIVE", "maxActive", DEFAULT_MAX_ACTIVE),
+        resolve("DELEGATE_REPO_MAX_ACTIVE", "repoMaxActive", DEFAULT_REPO_MAX_ACTIVE),
+    )
+
+
+def has_idle_slot(
+    current_repo: Path | None,
+    repo_items: list[tuple[Path | None, Path, str, bool, list[dict]]],
+    index_runs: dict[str, dict],
+) -> bool:
+    """Return True if the current repository (and machine) still has a free run slot."""
+    max_active, repo_max_active = read_capacity_limits(current_repo)
+    active_states = ("running", "starting", "waiting", "queued")
+    cur_active: set[str] = set()
+    cur_queued: set[str] = set()
+    total_active: set[str] = set()
+
+    for _repo_root, _runs_dir, _label, is_current, items in repo_items:
+        for obj in items:
+            rid = str(obj.get("run") or "").strip()
+            if not rid:
+                continue
+            st = str(obj.get("state") or "")
+            if st in active_states:
+                total_active.add(rid)
+                if is_current:
+                    cur_active.add(rid)
+                    if st in ("waiting", "queued"):
+                        cur_queued.add(rid)
+
+    # Also include live runs from `<state>/*.slot` not yet covered by `repo_items`.
+    sdir = state_dir()
+    if sdir.is_dir():
+        try:
+            for ent in sdir.iterdir():
+                if ent.suffix != ".slot":
+                    continue
+                try:
+                    rdir = Path(ent.read_text(encoding="utf-8").strip())
+                except OSError:
+                    continue
+                if not rdir.is_dir() or (rdir / "exit_code").is_file():
+                    continue
+                snap = read_run_snapshot(rdir)
+                if snap is None:
+                    continue
+                rid = str(snap.get("run") or "").strip()
+                st = str(snap.get("state") or "")
+                if rid and st in active_states:
+                    total_active.add(rid)
+        except OSError:
+            pass
+
+    if cur_queued:
+        return False
+    if repo_max_active > 0 and len(cur_active) >= repo_max_active:
+        return False
+    if max_active > 0 and len(total_active) >= max_active:
+        return False
+    return True
+
+
+def load_work_remind(sdir: Path) -> dict[str, int]:
+    """Read `<state>/work-remind.json` -> `{work_id: epoch_secs}`."""
+    doc = read_json_file(sdir / "work-remind.json")
+    if not doc:
+        return {}
+    out: dict[str, int] = {}
+    for k, v in doc.items():
+        if not isinstance(k, str) or not k.strip():
+            continue
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[k.strip()] = int(v)
+        elif isinstance(v, str):
+            ts = parse_iso_utc(v)
+            if ts is not None:
+                out[k.strip()] = ts
+    return out
+
+
+def save_work_remind(sdir: Path, remind_map: dict[str, int], now: int) -> None:
+    """Atomically persist `<state>/work-remind.json` without acquiring `.state.lock`."""
+    try:
+        sdir.mkdir(parents=True, exist_ok=True)
+        # Drop entries older than 7 days to keep file bounded.
+        cutoff = now - 7 * 86400
+        payload = {
+            k: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+            for k, ts in sorted(remind_map.items())
+            if ts >= cutoff
+        }
+        target = sdir / "work-remind.json"
+        tmp = sdir / f"work-remind.json.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError:
+        pass
+
+
+def check_stale_work_items(
+    work_items: list[dict],
+    cwd: str,
+    now: int,
+    current_repo: Path | None,
+) -> tuple[str | None, list[str]]:
+    """Pick up to 3 oldest stale `ready`/`verify` or missing-brief `ready` work items
+    (excluding owner items and items reminded within the 6h cooldown).
+    Updates `<state>/work-remind.json` for reminded items."""
+    if not work_items:
+        return None, []
+
+    verify_stale_secs = _parse_pos_float_env("DELEGATE_WORK_STALE_VERIFY_HOURS", DEFAULT_STALE_VERIFY_HOURS) * 3600.0
+    ready_stale_secs = _parse_pos_float_env("DELEGATE_WORK_STALE_READY_HOURS", DEFAULT_STALE_READY_HOURS) * 3600.0
+    cooldown_secs = _parse_pos_float_env("DELEGATE_WORK_REMIND_COOLDOWN_HOURS", DEFAULT_REMIND_COOLDOWN_HOURS) * 3600.0
+
+    current_only = os.environ.get("DELEGATE_STOP_HOOK_CURRENT_ONLY") == "1"
+    current_repo_str: str | None = None
+    if current_repo is not None:
+        try:
+            current_repo_str = str(current_repo.resolve())
+        except OSError:
+            current_repo_str = str(current_repo)
+
+    sdir = state_dir()
+    remind_map = load_work_remind(sdir)
+    candidates: list[tuple[int, str, str, str]] = []  # (age_secs, id, title, label)
+
+    for item in work_items:
+        if item.get("owner"):
+            continue
+        wid = str(item.get("id") or "").strip()
+        if not wid:
+            continue
+        st = str(item.get("state") or "")
+        if st not in ("ready", "verify"):
+            continue
+        if current_only and current_repo_str is not None:
+            item_repo = str(item.get("repo") or "").strip()
+            if item_repo:
+                try:
+                    item_repo = str(Path(item_repo).resolve())
+                except OSError:
+                    pass
+                if item_repo != current_repo_str:
+                    continue
+
+        since_raw = str(item.get("stateSince") or item.get("createdAt") or "").strip()
+        since_ts = parse_iso_utc(since_raw)
+        age_secs = max(0, now - since_ts) if since_ts is not None else 0
+
+        label: str | None = None
+        if st == "verify":
+            if age_secs >= verify_stale_secs:
+                label = "待闭环"
+        elif st == "ready":
+            brief = str(item.get("brief") or "").strip()
+            if not brief:
+                label = "缺说明"
+            elif age_secs >= ready_stale_secs:
+                label = "就绪"
+
+        if label is None:
+            continue
+
+        last_rem = remind_map.get(wid)
+        if last_rem is not None and (now - last_rem) < cooldown_secs:
+            continue
+
+        title = str(item.get("title") or wid).replace("\n", " ").replace("\r", " ").strip()
+        candidates.append((age_secs, wid, title, label))
+
+    if not candidates:
+        return None, []
+
+    candidates.sort(key=lambda c: (-c[0], c[1]))
+    picked = candidates[:3]
+
+    for _, wid, _, _ in picked:
+        remind_map[wid] = now
+    save_work_remind(sdir, remind_map, now)
+
+    lines = [f"工作表有 {len(picked)} 项停着没动，本回合给每项一个去向："]
+    for age_secs, wid, title, label in picked:
+        hours = int(age_secs // 3600)
+        lines.append(f"[{wid}] {title} · 停 {hours} 小时 · {label}")
+    lines.append(
+        '可选：派发 `delegate start --work Wxx …` · 等人或等运行 `delegate work wait Wxx --wait-manual "…"|--after-applied RUN` · 暂缓 `delegate work defer Wxx --until … --reason "…"` · 关闭 `delegate work close Wxx --evidence "…"`'
+    )
+    return "\n".join(lines), [wid for _, wid, _, _ in picked]
+
+
 def append_stop_logs(records: list[dict]) -> None:
     """Zero-lock O_APPEND log to `<state>/stop-hook.jsonl` for `delegate hook stats`."""
     if not records:
@@ -1384,186 +1623,196 @@ def evaluate(payload: dict) -> dict | None:
         )
 
     delegate_cmd = find_delegate_bin() or "delegate"
-    if not repos:
-        if reasons:
-            append_stop_logs(log_records)
-            return {"decision": "block", "reason": "\n".join(reasons)}
-        return None
-
-    procs = list_processes()
-    applying_procs = [
-        (a, pcwd) for argv, pcwd in procs if (a := match_delegate_subcmd(argv, "apply")) is not None
-    ]
-    merging_procs = [
-        (a, pcwd) for argv, pcwd in procs if (a := match_delegate_subcmd(argv, "merge")) is not None
-    ]
-    gate_cwds, lane_runs = active_lane_state(procs)
-
-    caller_id = current_caller_id(payload)
-    questions: list[tuple[str, str, bool]] = []  # (display, run_id, is_current)
-    live_current: list[tuple[str, str, dict, Path | None]] = []  # (display, run_id, obj, repo_root)
-    live_other: list[tuple[str, str, dict, Path | None]] = []  # (display, run_id, obj, repo_root)
-    unmerged_items: list[tuple[str, str]] = []  # (display, run_id)
-    stale_run_ids: list[str] = []
-    work_fresh_def, work_expired_def = work_deferred_runs(work_items, now)
-
-    for repo_root, _runs_dir, label, is_current, items in repo_items:
-        if not items:
-            continue
-
-        all_by_id = {obj["run"]: obj for obj in items if isinstance(obj.get("run"), str)}
-        parents = {obj["parent"] for obj in items if isinstance(obj.get("parent"), str) and obj["parent"]}
-        leaves = [obj for obj in items if obj["run"] not in parents]
-
-        # Collect source runs currently being merged by an active serial merge run.
-        active_merge_sources: set[str] = set()
-        for obj in items:
-            if obj.get("isMerge") is True and str(obj.get("state") or "") in (
-                "running",
-                "waiting",
-                "starting",
-                "queued",
-            ):
-                m = obj.get("merge") if isinstance(obj.get("merge"), dict) else {}
-                for src in m.get("sourceRuns") or []:
-                    if isinstance(src, str) and src:
-                        active_merge_sources.add(src)
-
-        for obj in leaves:
-            rid = obj["run"]
-            st = str(obj.get("state") or "")
-            is_applied = obj.get("applied") is True
-            is_cleaned = obj.get("cleaned") is True
-            is_question = obj.get("question") is True
-            disp = run_label(obj, label, is_current)
-
-            if is_cleaned or is_applied:
-                continue
-
-            if not run_belongs_to_scope(obj, is_current, caller_id):
-                continue
-
-            # 1) Questioning runs (stopped waiting for controller decision).
-            if is_question:
-                questions.append((disp, rid, is_current))
-                continue
-
-            # 2) Live runs (running / waiting / starting / queued).
-            if st in ("running", "waiting", "starting", "queued"):
-                if is_current:
-                    live_current.append((disp, rid, obj, repo_root))
-                else:
-                    live_other.append((disp, rid, obj, repo_root))
-                continue
-
-            # 3) Unmerged delivered or rejected write runs.
-            if is_zero_change_delivery(obj, all_by_id):
-                continue
-            next_str = str(obj.get("next") or "")
-            is_unmerged_candidate = st == "rejected" or (
-                st == "delivered"
-                and (str(obj.get("mode") or "") == "write" or bool(UNMERGED_NEXT_RE.search(next_str)))
-            )
-            if not is_unmerged_candidate:
-                continue
-
-            # Skip runs currently being applied, merged, premerged, or gated.
-            if is_run_being_handled(
-                rid,
-                obj,
-                repo_root,
-                applying_procs,
-                merging_procs,
-                active_merge_sources,
-                gate_cwds,
-                lane_runs,
-            ):
-                continue
-
-            # Check work-table deferrals (`delegate work defer`).
-            if rid in work_fresh_def:
-                continue
-            if rid in work_expired_def:
-                stale_run_ids.append(rid)
-            unmerged_items.append((disp, rid))
-
-    # Build questioning reminder (always blocks — needs controller reply now).
-    if questions:
-        names = "、".join(d for d, _, _ in questions[:8])
-        cmds = "、".join(f"`delegate reply {rid} '<决定>'`" for _, rid, _ in questions[:3])
-        reasons.append(f"有委派正在提问等决定（{names}）：先回答再结束回合（{cmds}）。")
-        log_records.append(
-            {
-                "hook": "question",
-                "runs": names,
-                "runIds": [rid for _, rid, _ in questions[:8]],
-            }
-        )
-
-    # Build waiter reminder for live runs.
-    if live_current or live_other:
-        waiters = active_waiters(procs)
-        locked_inodes = read_locked_inodes()
-
-        def _rdir(obj: dict) -> Path | None:
-            d = obj.get("dir")
-            return Path(d) if isinstance(d, str) and d else None
-
-        uncovered_cur = [
-            (disp, rid)
-            for disp, rid, obj, rroot in live_current
-            if not waiter_covers_run(_rdir(obj), rid, obj, rroot, True, waiters, locked_inodes)
+    if repos:
+        procs = list_processes()
+        applying_procs = [
+            (a, pcwd) for argv, pcwd in procs if (a := match_delegate_subcmd(argv, "apply")) is not None
         ]
-        uncovered_other = [
-            (disp, rid)
-            for disp, rid, obj, rroot in live_other
-            if not waiter_covers_run(_rdir(obj), rid, obj, rroot, False, waiters, locked_inodes)
+        merging_procs = [
+            (a, pcwd) for argv, pcwd in procs if (a := match_delegate_subcmd(argv, "merge")) is not None
         ]
-        waiter_log_names: list[str] = []
-        waiter_log_ids: list[str] = []
-        if uncovered_cur:
-            names = "、".join(d for d, _ in uncovered_cur[:5])
-            reasons.append(
-                f"还有委派在跑（{names}），但没有 delegate wait 挂着：在后台挂上 `{delegate_cmd} wait` 再结束回合。"
-            )
-            waiter_log_names.extend(d for d, _ in uncovered_cur[:5])
-            waiter_log_ids.extend(rid for _, rid in uncovered_cur[:5])
-        if uncovered_other:
-            names = "、".join(d for d, _ in uncovered_other[:5])
-            reasons.append(
-                f"其他仓库还有委派在跑（{names}），但没有对应 waiter：在后台挂上 `{delegate_cmd} wait --machine` 或切到对应仓库处理。"
-            )
-            waiter_log_names.extend(d for d, _ in uncovered_other[:5])
-            waiter_log_ids.extend(rid for _, rid in uncovered_other[:5])
-        if waiter_log_names:
+        gate_cwds, lane_runs = active_lane_state(procs)
+
+        caller_id = current_caller_id(payload)
+        questions: list[tuple[str, str, bool]] = []  # (display, run_id, is_current)
+        live_current: list[tuple[str, str, dict, Path | None]] = []  # (display, run_id, obj, repo_root)
+        live_other: list[tuple[str, str, dict, Path | None]] = []  # (display, run_id, obj, repo_root)
+        unmerged_items: list[tuple[str, str]] = []  # (display, run_id)
+        stale_run_ids: list[str] = []
+        work_fresh_def, work_expired_def = work_deferred_runs(work_items, now)
+
+        for repo_root, _runs_dir, label, is_current, items in repo_items:
+            if not items:
+                continue
+
+            all_by_id = {obj["run"]: obj for obj in items if isinstance(obj.get("run"), str)}
+            parents = {obj["parent"] for obj in items if isinstance(obj.get("parent"), str) and obj["parent"]}
+            leaves = [obj for obj in items if obj["run"] not in parents]
+
+            # Collect source runs currently being merged by an active serial merge run.
+            active_merge_sources: set[str] = set()
+            for obj in items:
+                if obj.get("isMerge") is True and str(obj.get("state") or "") in (
+                    "running",
+                    "waiting",
+                    "starting",
+                    "queued",
+                ):
+                    m = obj.get("merge") if isinstance(obj.get("merge"), dict) else {}
+                    for src in m.get("sourceRuns") or []:
+                        if isinstance(src, str) and src:
+                            active_merge_sources.add(src)
+
+            for obj in leaves:
+                rid = obj["run"]
+                st = str(obj.get("state") or "")
+                is_applied = obj.get("applied") is True
+                is_cleaned = obj.get("cleaned") is True
+                is_question = obj.get("question") is True
+                disp = run_label(obj, label, is_current)
+
+                if is_cleaned or is_applied:
+                    continue
+
+                if not run_belongs_to_scope(obj, is_current, caller_id):
+                    continue
+
+                # 1) Questioning runs (stopped waiting for controller decision).
+                if is_question:
+                    questions.append((disp, rid, is_current))
+                    continue
+
+                # 2) Live runs (running / waiting / starting / queued).
+                if st in ("running", "waiting", "starting", "queued"):
+                    if is_current:
+                        live_current.append((disp, rid, obj, repo_root))
+                    else:
+                        live_other.append((disp, rid, obj, repo_root))
+                    continue
+
+                # 3) Unmerged delivered or rejected write runs.
+                if is_zero_change_delivery(obj, all_by_id):
+                    continue
+                next_str = str(obj.get("next") or "")
+                is_unmerged_candidate = st == "rejected" or (
+                    st == "delivered"
+                    and (str(obj.get("mode") or "") == "write" or bool(UNMERGED_NEXT_RE.search(next_str)))
+                )
+                if not is_unmerged_candidate:
+                    continue
+
+                # Skip runs currently being applied, merged, premerged, or gated.
+                if is_run_being_handled(
+                    rid,
+                    obj,
+                    repo_root,
+                    applying_procs,
+                    merging_procs,
+                    active_merge_sources,
+                    gate_cwds,
+                    lane_runs,
+                ):
+                    continue
+
+                # Check work-table deferrals (`delegate work defer`).
+                if rid in work_fresh_def:
+                    continue
+                if rid in work_expired_def:
+                    stale_run_ids.append(rid)
+                unmerged_items.append((disp, rid))
+
+        # Build questioning reminder (always blocks — needs controller reply now).
+        if questions:
+            names = "、".join(d for d, _, _ in questions[:8])
+            cmds = "、".join(f"`delegate reply {rid} '<决定>'`" for _, rid, _ in questions[:3])
+            reasons.append(f"有委派正在提问等决定（{names}）：先回答再结束回合（{cmds}）。")
             log_records.append(
                 {
-                    "hook": "waiter",
-                    "runs": "、".join(waiter_log_names[:8]),
-                    "runIds": waiter_log_ids[:8],
+                    "hook": "question",
+                    "runs": names,
+                    "runIds": [rid for _, rid, _ in questions[:8]],
                 }
             )
 
-    # Build unmerged reminder.
-    if unmerged_items:
-        names = "、".join(d for d, _ in unmerged_items[:8])
-        stale_note = (
-            "其中暂缓已到期的要重新决定：合、清掉，或重新暂缓。"
-            if stale_run_ids
-            else ""
-        )
-        reasons.append(
-            f"有已交付的委派还没合也没写明原因（{names}）。{stale_note}"
-            "现在就合（delegate apply），或合不了就执行 `delegate work defer <run> --reason \"…\" --until 4h` 再结束回合。"
-        )
-        log_records.append(
-            {
-                "hook": "unmerged",
-                "runs": names,
-                "runIds": [rid for _, rid in unmerged_items[:8]],
-                "stale": ",".join(stale_run_ids[:8]),
-            }
-        )
+        # Build waiter reminder for live runs.
+        if live_current or live_other:
+            waiters = active_waiters(procs)
+            locked_inodes = read_locked_inodes()
+
+            def _rdir(obj: dict) -> Path | None:
+                d = obj.get("dir")
+                return Path(d) if isinstance(d, str) and d else None
+
+            uncovered_cur = [
+                (disp, rid)
+                for disp, rid, obj, rroot in live_current
+                if not waiter_covers_run(_rdir(obj), rid, obj, rroot, True, waiters, locked_inodes)
+            ]
+            uncovered_other = [
+                (disp, rid)
+                for disp, rid, obj, rroot in live_other
+                if not waiter_covers_run(_rdir(obj), rid, obj, rroot, False, waiters, locked_inodes)
+            ]
+            waiter_log_names: list[str] = []
+            waiter_log_ids: list[str] = []
+            if uncovered_cur:
+                names = "、".join(d for d, _ in uncovered_cur[:5])
+                reasons.append(
+                    f"还有委派在跑（{names}），但没有 delegate wait 挂着：在后台挂上 `{delegate_cmd} wait` 再结束回合。"
+                )
+                waiter_log_names.extend(d for d, _ in uncovered_cur[:5])
+                waiter_log_ids.extend(rid for _, rid in uncovered_cur[:5])
+            if uncovered_other:
+                names = "、".join(d for d, _ in uncovered_other[:5])
+                reasons.append(
+                    f"其他仓库还有委派在跑（{names}），但没有对应 waiter：在后台挂上 `{delegate_cmd} wait --machine` 或切到对应仓库处理。"
+                )
+                waiter_log_names.extend(d for d, _ in uncovered_other[:5])
+                waiter_log_ids.extend(rid for _, rid in uncovered_other[:5])
+            if waiter_log_names:
+                log_records.append(
+                    {
+                        "hook": "waiter",
+                        "runs": "、".join(waiter_log_names[:8]),
+                        "runIds": waiter_log_ids[:8],
+                    }
+                )
+
+        # Build unmerged reminder.
+        if unmerged_items:
+            names = "、".join(d for d, _ in unmerged_items[:8])
+            stale_note = (
+                "其中暂缓已到期的要重新决定：合、清掉，或重新暂缓。"
+                if stale_run_ids
+                else ""
+            )
+            reasons.append(
+                f"有已交付的委派还没合也没写明原因（{names}）。{stale_note}"
+                "现在就合（delegate apply），或合不了就执行 `delegate work defer <run> --reason \"…\" --until 4h` 再结束回合。"
+            )
+            log_records.append(
+                {
+                    "hook": "unmerged",
+                    "runs": names,
+                    "runIds": [rid for _, rid in unmerged_items[:8]],
+                    "stale": ",".join(stale_run_ids[:8]),
+                }
+            )
+
+    # Low-priority work-hygiene reminder: only when no higher-priority block AND current repo has idle slot.
+    if not reasons:
+        current_repo = git_toplevel(cwd)
+        if has_idle_slot(current_repo, repo_items, index_runs):
+            work_reason, work_ids = check_stale_work_items(work_items, cwd, now, current_repo)
+            if work_reason:
+                reasons.append(work_reason)
+                log_records.append(
+                    {
+                        "hook": "work",
+                        "runs": "、".join(work_ids),
+                        "workIds": work_ids,
+                    }
+                )
 
     if not reasons:
         return None

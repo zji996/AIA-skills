@@ -2708,6 +2708,10 @@ fn render_work_top_bar(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(sep, muted()),
             count_span("今天完成", c.done_today, Some(STATUS_RUNNING)),
         ];
+        if c.stale > 0 {
+            line2_spans.push(Span::styled(sep, muted()));
+            line2_spans.push(count_span("老化", c.stale, Some(STATUS_PENDING)));
+        }
         if let Some(fb) = filter_badge {
             line2_spans.push(Span::raw(" "));
             line2_spans.push(fb);
@@ -2740,7 +2744,18 @@ fn render_work_top_bar(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::raw(" "));
     }
 
-    let sep = if area.width >= 82 { " · " } else { "·" };
+    let wide_nav = area.width >= 115;
+    let sep = if c.stale > 0 {
+        if (wide_nav && area.width >= 128) || (!wide_nav && area.width >= 92) {
+            " · "
+        } else {
+            "·"
+        }
+    } else if area.width >= 82 {
+        " · "
+    } else {
+        "·"
+    };
     spans.push(count_span("等你", c.owner, Some(STATUS_FAILED)));
     spans.push(Span::styled(sep, muted()));
     spans.push(count_span("需处理", c.needs_action, Some(STATUS_PENDING)));
@@ -2754,6 +2769,10 @@ fn render_work_top_bar(frame: &mut Frame, app: &App, area: Rect) {
     spans.push(count_span("暂缓", c.deferred, None));
     spans.push(Span::styled(sep, muted()));
     spans.push(count_span("今天完成", c.done_today, Some(STATUS_RUNNING)));
+    if c.stale > 0 {
+        spans.push(Span::styled(sep, muted()));
+        spans.push(count_span("老化", c.stale, Some(STATUS_PENDING)));
+    }
 
     if let Some(fb) = filter_badge {
         spans.push(Span::raw(" "));
@@ -2940,10 +2959,12 @@ fn render_work_pane(frame: &mut Frame, app: &mut App, area: Rect) {
             } => {
                 let item = &app.snapshot.work[*work_idx];
                 let live = app.snapshot.work_live_status(item);
+                let stale_info = app.snapshot.work_item_stale_info(item);
                 if compact {
                     render_work_item_compact(
                         item,
                         &live,
+                        stale_info,
                         *depth,
                         *extra_deps,
                         selected,
@@ -2953,6 +2974,7 @@ fn render_work_pane(frame: &mut Frame, app: &mut App, area: Rect) {
                     vec![render_work_item_wide(
                         item,
                         &live,
+                        stale_info,
                         *depth,
                         branch_guides,
                         *is_last_sibling,
@@ -3102,10 +3124,40 @@ fn format_tree_prefix_compact(depth: usize) -> String {
     format!("{}↳ ", " ".repeat(capped.saturating_sub(1)))
 }
 
+fn work_item_tail_tags(item: &WorkItem, stale_info: Option<(u64, bool)>) -> Vec<(String, Color)> {
+    let mut tags = Vec::new();
+    if let Some((hours, is_2x)) = stale_info {
+        let color = if is_2x { STATUS_FAILED } else { STATUS_PENDING };
+        tags.push((format!(" 停 {hours}h"), color));
+    }
+    if item.is_missing_brief() {
+        tags.push((" 缺说明".to_string(), STATUS_PENDING));
+    }
+    tags
+}
+
+/// When the row tail already displays `停 Nh`, drop a trailing ` {N}[smhd]` age from
+/// `可派发 {age}` / `待闭环 {age}` so the same duration is never shown twice on one row.
+fn dedup_stale_live_status(live_status: &str, has_stale_tag: bool) -> &str {
+    if !has_stale_tag {
+        return live_status;
+    }
+    if let Some((head, tail)) = live_status.rsplit_once(' ') {
+        let is_age_token = tail.len() >= 2
+            && matches!(tail.as_bytes().last(), Some(b's' | b'm' | b'h' | b'd'))
+            && tail[..tail.len() - 1].bytes().all(|b| b.is_ascii_digit());
+        if is_age_token && (head.ends_with("可派发") || head.ends_with("待闭环")) {
+            return head;
+        }
+    }
+    live_status
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_work_item_wide(
     item: &WorkItem,
     live_status: &str,
+    stale_info: Option<(u64, bool)>,
     depth: usize,
     branch_guides: &[bool],
     is_last_sibling: bool,
@@ -3131,10 +3183,14 @@ fn render_work_item_wide(
     } else {
         String::new()
     };
+    let tail_tags = work_item_tail_tags(item, stale_info);
+    let live_status = dedup_stale_live_status(live_status, stale_info.is_some());
+    let tail_w: usize = tail_tags.iter().map(|(t, _)| display_width(t)).sum();
     let extra_w = display_width(&extra_tag);
-    let status_avail = cols.status_w.saturating_sub(extra_w);
+    let status_avail = cols.status_w.saturating_sub(extra_w + tail_w);
     let status_core = truncate(live_status, status_avail);
-    let status_full = format!("{status_core}{extra_tag}");
+    let tail_plain: String = tail_tags.iter().map(|(t, _)| t.as_str()).collect();
+    let status_full = format!("{status_core}{extra_tag}{tail_plain}");
 
     if selected {
         let rev = Style::default().add_modifier(Modifier::REVERSED);
@@ -3212,15 +3268,19 @@ fn render_work_item_wide(
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    for (tag, col) in tail_tags {
+        spans.push(Span::styled(tag, Style::default().fg(col)));
+    }
     Line::from(spans)
 }
 
 /// Compact 2-line layout for narrow / phone screens (< 70 cols):
 /// Line 1: [sel] [↳] [glyph] ID [repo] ... [state] [+N]
-/// Line 2:     title · live_status
+/// Line 2:     title · live_status [停 Nh] [缺说明]
 fn render_work_item_compact(
     item: &WorkItem,
     live_status: &str,
+    stale_info: Option<(u64, bool)>,
     depth: usize,
     extra_deps: usize,
     selected: bool,
@@ -3247,9 +3307,12 @@ fn render_work_item_compact(
     let left_clipped = truncate(&left_full, width.saturating_sub(2 + state_w + 1));
     let gap1 = width.saturating_sub(2 + display_width(&left_clipped) + state_w);
 
-    // Line 2: title · live_status
+    // Line 2: title · live_status [tail_tags]
+    let tail_tags = work_item_tail_tags(item, stale_info);
+    let live_status = dedup_stale_live_status(live_status, stale_info.is_some());
+    let tail_w: usize = tail_tags.iter().map(|(t, _)| display_width(t)).sum();
     let indent2 = format!("  {}", " ".repeat(display_width(&tree_prefix)));
-    let avail2 = width.saturating_sub(display_width(&indent2) + 2);
+    let avail2 = width.saturating_sub(display_width(&indent2) + 2 + tail_w);
     let title = item.display_title();
     let title_w = display_width(title);
     let status_w = display_width(live_status);
@@ -3277,10 +3340,11 @@ fn render_work_item_compact(
             Span::styled(" ".repeat(gap1), rev),
             Span::styled(state_text, rev_bold),
         ]);
+        let tail_plain: String = tail_tags.iter().map(|(t, _)| t.as_str()).collect();
         let line2_body = if status_part.is_empty() {
-            title_part
+            format!("{title_part}{tail_plain}")
         } else {
-            format!("{title_part} · {status_part}")
+            format!("{title_part} · {status_part}{tail_plain}")
         };
         let line2_prefix = format!(" {indent2}");
         let used2 = 1 + display_width(&line2_prefix) + display_width(&line2_body);
@@ -3325,6 +3389,9 @@ fn render_work_item_compact(
     if !status_part.is_empty() {
         l2_spans.push(Span::styled(" · ", muted()));
         l2_spans.push(Span::styled(status_part, status_style));
+    }
+    for (tag, col) in tail_tags {
+        l2_spans.push(Span::styled(tag, Style::default().fg(col)));
     }
     vec![line1, Line::from(l2_spans)]
 }

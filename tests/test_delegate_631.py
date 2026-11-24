@@ -422,15 +422,18 @@ class Delegate631Tests(unittest.TestCase):
         self.assertEqual(defer_res.returncode, 0, defer_res.stdout + defer_res.stderr)
         self.assertIsNone(self.run_stop_hook({"cwd": str(repo), "stop_hook_active": False}))
 
-        # Add a blocked item, a ready item, and a fresh verify item (note) -> NONE of them block Stop hook!
+        # Add a blocked item, a ready item (with brief), and a fresh verify item (note) -> NONE of them block Stop hook!
+        brief = repo / "docs/ready-brief.md"
+        brief.parent.mkdir(parents=True, exist_ok=True)
+        brief.write_text("# Ready Brief\n")
         self.assertEqual(self.cli("work", "add", "远期阻塞", "--repo", repo, "--wait-manual", "等发版", human=True).returncode, 0)
-        self.assertEqual(self.cli("work", "add", "积压就绪", "--repo", repo, human=True).returncode, 0)
+        self.assertEqual(self.cli("work", "add", "积压就绪", "--repo", repo, "--brief", str(brief), human=True).returncode, 0)
         self.assertEqual(self.cli("apply", r_old["run"], human=True).returncode, 0)
         self.assertEqual(self.cli("note", r_old["run"], "合入后看一眼监控", human=True).returncode, 0)
         self.assertIsNone(self.run_stop_hook({"cwd": str(repo), "stop_hook_active": False}))
 
         # Now emit a one-shot `work_ready` event -> Stop hook blocks ONCE until cursor advances!
-        self.assertEqual(self.cli("work", "add", "等旧任务关闭", "--repo", repo, "--after-work", "W001", human=True).returncode, 0)
+        self.assertEqual(self.cli("work", "add", "等旧任务关闭", "--repo", repo, "--after-work", "W001", "--brief", str(brief), human=True).returncode, 0)
         # Closing W001 unlocks W004 and emits `work_ready`
         self.assertEqual(self.cli("work", "close", "W001", "--evidence", "verified", human=True).returncode, 0)
         ev_blk = self.run_stop_hook({"cwd": str(repo), "stop_hook_active": False})

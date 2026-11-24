@@ -363,6 +363,7 @@ impl DelegateClient {
             agy_accounts: agy_accounts_state,
             analytics: AnalyticsSnapshot::default(),
             host_load,
+            generated_epoch: None,
             today_ymd: local_ymd(),
             refreshed_at: local_hms(),
             warnings,
@@ -505,6 +506,7 @@ pub fn parse_snapshot_json(
     let agy_accounts = parse_agy_accounts_value(&doc["agyAccounts"]);
     let analytics = parse_analytics_value(&doc["analytics"]);
     let host_load = read_host_load();
+    let generated_epoch = doc["generatedAt"].as_str().and_then(parse_iso_utc_epoch);
     let today_ymd = doc["generatedAt"]
         .as_str()
         .and_then(iso_to_local_ymd)
@@ -521,6 +523,7 @@ pub fn parse_snapshot_json(
         agy_accounts,
         analytics,
         host_load,
+        generated_epoch,
         today_ymd,
         refreshed_at: local_hms(),
         warnings: Vec::new(),
@@ -1812,6 +1815,7 @@ fn parse_single_work_item(v: &Value) -> Option<WorkItem> {
             .unwrap_or("")
             .to_string(),
         wait_on: string_list(v.get("waitOn")),
+        verify_on: string_list(v.get("verifyOn")),
         wait_on_status,
         runs: string_list(v.get("runs")),
         artifacts,
@@ -1841,6 +1845,7 @@ fn parse_single_work_item(v: &Value) -> Option<WorkItem> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        defer_streak: v.get("deferStreak").and_then(Value::as_u64).unwrap_or(0) as u32,
         created_at: v
             .get("createdAt")
             .and_then(Value::as_str)

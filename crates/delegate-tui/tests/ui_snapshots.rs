@@ -1221,3 +1221,188 @@ fn quota_estimate_reports_depletion_when_earlier_than_reset() {
         "{acct}"
     );
 }
+
+#[test]
+fn work_view_renders_stale_badges_colors_missing_brief_and_top_bar_count() {
+    use delegate_tui::app::ViewTab;
+    use delegate_tui::data::parse_snapshot_json;
+    use ratatui::style::Color;
+
+    // generatedAt = 2026-11-24T12:00:00Z
+    let raw = r#"{
+        "schemaVersion": 1,
+        "generatedAt": "2026-11-24T12:00:00Z",
+        "seq": 10,
+        "repos": [],
+        "work": [
+            {
+                "id": "Q01",
+                "title": "所有者项不老化不标缺说明",
+                "repo": "/repo/demo",
+                "state": "attention",
+                "owner": {"kind": "nod", "ask": "所有者项不老化"},
+                "stateSince": "2026-11-22T00:00:00Z"
+            },
+            {
+                "id": "W001",
+                "title": "一倍老化待闭环",
+                "repo": "/repo/demo",
+                "state": "verify",
+                "doneWhen": "验证",
+                "stateSince": "2026-11-24T07:00:00Z",
+                "focus": "待闭环"
+            },
+            {
+                "id": "W002",
+                "title": "两倍老化待闭环",
+                "repo": "/repo/demo",
+                "state": "verify",
+                "doneWhen": "验证",
+                "stateSince": "2026-11-24T03:00:00Z",
+                "focus": "待闭环"
+            },
+            {
+                "id": "W003",
+                "title": "一倍老化就绪",
+                "repo": "/repo/demo",
+                "state": "ready",
+                "brief": "docs/w3.md",
+                "stateSince": "2026-11-24T02:00:00Z",
+                "focus": "可派发 10h"
+            },
+            {
+                "id": "W004",
+                "title": "两倍老化缺说明就绪",
+                "repo": "/repo/demo",
+                "state": "ready",
+                "stateSince": "2026-11-23T18:00:00Z",
+                "focus": "可派发"
+            },
+            {
+                "id": "W005",
+                "title": "新鲜缺说明就绪",
+                "repo": "/repo/demo",
+                "state": "ready",
+                "stateSince": "2026-11-24T11:30:00Z",
+                "focus": "可派发"
+            }
+        ],
+        "events": [],
+        "lane": {},
+        "dagQueue": [],
+        "merges": [],
+        "candidates": []
+    }"#;
+
+    let snap = parse_snapshot_json(raw, None, None).unwrap();
+    let counts = snap.work_counts();
+    assert_eq!(counts.stale, 4, "W001/W002/W003/W004 should be stale, not Q01 or W005");
+
+    let mut app = App::new(
+        snap,
+        PathBuf::from("delegate"),
+        PathBuf::from("/repo/demo"),
+        2,
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Work);
+
+    // Move selection away from W001..W005 (keep on Q01 at top) so fg colors are not reversed.
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+    let buf = terminal.backend().buffer().clone();
+
+    let mut rows_text = Vec::new();
+    for y in 0..buf.area.height {
+        let mut line = String::new();
+        let mut x = 0u16;
+        while x < buf.area.width {
+            let sym = buf[(x, y)].symbol();
+            line.push_str(sym);
+            let w = display_width(sym).max(1) as u16;
+            x = x.saturating_add(w);
+        }
+        rows_text.push(line);
+    }
+    let screen = rows_text.join("\n");
+
+    // Top bar shows 老化 4
+    assert!(rows_text[0].contains("老化 4"), "top bar: {}", rows_text[0]);
+
+    // Check row tail markers and colors (scan right-to-left to hit the tail badge, not the title)
+    let find_cell_fg = |row_needle: &str, token_first_char: &str| -> Option<Color> {
+        for y in 0..buf.area.height {
+            if !rows_text[y as usize].contains(row_needle) {
+                continue;
+            }
+            for x in (0..buf.area.width).rev() {
+                if buf[(x, y)].symbol() == token_first_char {
+                    return Some(buf[(x, y)].fg);
+                }
+            }
+        }
+        None
+    };
+
+    assert!(screen.contains("W001") && screen.contains("停 5h"), "{screen}");
+    assert!(screen.contains("W002") && screen.contains("停 9h"), "{screen}");
+    assert!(screen.contains("W003") && screen.contains("停 10h"), "{screen}");
+    let w003_line = rows_text.iter().find(|l| l.contains("W003")).unwrap();
+    assert_eq!(w003_line.matches("10h").count(), 1, "duration must not appear twice: {w003_line}");
+    assert!(screen.contains("W004") && screen.contains("停 18h") && screen.contains("缺说明"), "{screen}");
+    assert!(screen.contains("W005") && screen.contains("缺说明"), "{screen}");
+    // Q01 row must not have 停 or 缺说明
+    let q01_line = rows_text.iter().find(|l| l.contains("Q01")).unwrap();
+    assert!(!q01_line.contains("停 ") && !q01_line.contains("缺说明"), "{q01_line}");
+
+    // 1x threshold -> Yellow (STATUS_PENDING), 2x threshold -> Red (STATUS_FAILED)
+    assert_eq!(find_cell_fg("W001", "停"), Some(Color::Yellow));
+    assert_eq!(find_cell_fg("W002", "停"), Some(Color::Red));
+    assert_eq!(find_cell_fg("W003", "停"), Some(Color::Yellow));
+    assert_eq!(find_cell_fg("W004", "停"), Some(Color::Red));
+    assert_eq!(find_cell_fg("W005", "缺"), Some(Color::Yellow));
+
+    // Compact layout (<70 cols) also shows 老化 4, 停 Nh, 缺说明 without overflow
+    let compact = render_to_string(&mut app, 60, 30);
+    assert_lines_fit_width(&compact, 60);
+    assert!(compact.contains("老化 4"), "{compact}");
+    assert!(compact.contains("停 5h"), "{compact}");
+    assert!(compact.contains("停 9h"), "{compact}");
+    assert!(compact.contains("缺说明"), "{compact}");
+
+    // When no stale items exist, top bar does NOT show 老化
+    let fresh_raw = r#"{
+        "schemaVersion": 1,
+        "generatedAt": "2026-11-24T12:00:00Z",
+        "seq": 11,
+        "repos": [],
+        "work": [
+            {
+                "id": "W010",
+                "title": "新鲜带说明",
+                "repo": "/repo/demo",
+                "state": "ready",
+                "brief": "docs/w10.md",
+                "stateSince": "2026-11-24T11:00:00Z",
+                "focus": "可派发"
+            }
+        ],
+        "events": [],
+        "lane": {},
+        "dagQueue": [],
+        "merges": [],
+        "candidates": []
+    }"#;
+    let fresh_snap = parse_snapshot_json(fresh_raw, None, None).unwrap();
+    let mut fresh_app = App::new(
+        fresh_snap,
+        PathBuf::from("delegate"),
+        PathBuf::from("/repo/demo"),
+        2,
+    );
+    fresh_app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+    let fresh_screen = render_to_string(&mut fresh_app, 120, 20);
+    assert!(!fresh_screen.contains("老化"), "{fresh_screen}");
+    assert!(!fresh_screen.contains("缺说明"), "{fresh_screen}");
+}
