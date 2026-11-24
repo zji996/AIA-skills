@@ -1781,14 +1781,7 @@ fn admit_waiting(run: &Path, meta: &mut Value) -> Res<bool> {
                 &crate::events::run_id_for(run, meta),
                 &crate::events::repo_for_meta(meta),
                 "started",
-                json!({
-                    "name": s(meta, "name"),
-                    "mode": s(meta, "mode"),
-                    "tier": meta["tier"],
-                    "model": meta["model"],
-                    "parent": meta["parent"],
-                    "fromQueue": true,
-                }),
+                crate::events::started_payload(meta, true),
             );
             crate::index::upsert_run(run);
             crate::board::refresh_for_run(run);

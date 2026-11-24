@@ -1002,10 +1002,29 @@ pub fn build_accept_summary(
         }
     }
 
+    let mut elapsed_total = 0.0_f64;
+    let mut layer_seconds = serde_json::Map::new();
+    for l in &all_layers {
+        if let Some(secs) = l["seconds"].as_f64() {
+            elapsed_total += secs;
+            let lname = s(l, "name");
+            if !lname.is_empty() {
+                layer_seconds.insert(
+                    lname.to_string(),
+                    json!((secs * 100.0).round() / 100.0),
+                );
+            }
+        }
+    }
+    result["elapsedSeconds"] = json!((elapsed_total * 100.0).round() / 100.0);
+    if !layer_seconds.is_empty() {
+        result["layerSeconds"] = Value::Object(layer_seconds);
+    }
+
     let queued = fast_outcome.map_or(0.0, |f| f.queued_seconds)
         + slow_outcome.map_or(0.0, |s| s.queued_seconds);
-    if queued >= 1.0 {
-        result["queuedSeconds"] = json!(queued as i64);
+    if queued >= 0.01 {
+        result["queuedSeconds"] = json!((queued * 100.0).round() / 100.0);
     }
 
     let fallback = slow_outcome

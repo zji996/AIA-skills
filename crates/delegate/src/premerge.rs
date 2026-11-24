@@ -3071,6 +3071,19 @@ fn process_one_run(
     if write_json(premerge_path(run), &doc).is_err() {
         return Ok(false);
     }
+    events::emit(
+        &run_id,
+        repo_str,
+        "premerge_ready",
+        json!({
+            "name": run_name,
+            "baseHead": source_head,
+            "baseShort": &source_head[..source_head.len().min(7)],
+            "elapsedSeconds": elapsed,
+            "reusedAccept": reused_accept,
+            "ranLayers": ran_layers,
+        }),
+    );
     index::upsert_run(run);
     board::refresh_for_run(run);
     Ok(false)

@@ -38,10 +38,6 @@ pub fn events_path() -> PathBuf {
     state_dir().join("events.jsonl")
 }
 
-fn events_seq_path() -> PathBuf {
-    state_dir().join("events.seq")
-}
-
 /// Resolve a canonical repository root path string for a run's `meta.json`.
 pub fn repo_for_meta(meta: &Value) -> String {
     let src = crate::history::source_root_for_meta(meta);
@@ -116,11 +112,43 @@ fn current_max_seq_locked(events_file: &Path, seq_file: &Path) -> u64 {
     from_seq.max(from_log)
 }
 
+/// Latest sequence number currently recorded in `<state>/events.jsonl` (0 if empty/missing).
+pub fn latest_seq_in(state: &Path) -> u64 {
+    let from_seq = read(state.join("events.seq"))
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    let from_log = last_seq_from_file(&state.join("events.jsonl"));
+    from_seq.max(from_log)
+}
+
 /// Latest sequence number currently recorded in `events.jsonl` (0 if empty/missing).
 pub fn latest_seq() -> u64 {
-    let from_seq = read(events_seq_path()).trim().parse::<u64>().unwrap_or(0);
-    let from_log = last_seq_from_file(&events_path());
-    from_seq.max(from_log)
+    latest_seq_in(&state_dir())
+}
+
+/// Build the standard `started` event payload from `meta.json`.
+pub fn started_payload(meta: &Value, from_queue: bool) -> Value {
+    let mut payload = json!({
+        "name": s(meta, "name"),
+        "mode": s(meta, "mode"),
+        "tier": meta["tier"],
+        "model": meta["model"],
+        "parent": meta["parent"],
+    });
+    if !s(meta, "class").is_empty() {
+        payload["class"] = meta["class"].clone();
+    }
+    if !s(meta, "thinking").is_empty() {
+        payload["thinking"] = meta["thinking"].clone();
+    }
+    if !s(meta, "workId").is_empty() {
+        payload["workId"] = meta["workId"].clone();
+    }
+    if from_queue {
+        payload["fromQueue"] = json!(true);
+    }
+    payload
 }
 
 /// Append one event to `<state_dir>/events.jsonl` with a strictly monotonic `seq`.
@@ -529,13 +557,7 @@ pub fn rebuild_in(state: &Path, extra_runs_dirs: &[PathBuf]) -> Res<Value> {
                 started_at.clone(),
                 repo.clone(),
                 "started",
-                json!({
-                    "name": name,
-                    "mode": mode,
-                    "tier": meta["tier"],
-                    "model": meta["model"],
-                    "parent": meta["parent"],
-                }),
+                started_payload(&meta, false),
             ));
         }
 
@@ -614,6 +636,29 @@ pub fn rebuild_in(state: &Path, extra_runs_dirs: &[PathBuf]) -> Res<Value> {
             let fin_ts = iso_epoch(&fin_at).unwrap_or(started_ts);
 
             if sum["accept"].is_object() {
+                let acc = &sum["accept"];
+                let mut acc_payload = json!({
+                    "name": name,
+                    "ok": b(acc, "ok"),
+                    "exitCode": acc["exitCode"],
+                    "command": clip(s(acc, "command"), 120),
+                    "notExecuted": b(acc, "notExecuted"),
+                });
+                if b(acc, "tiered") {
+                    acc_payload["tiered"] = json!(true);
+                    acc_payload["failClosed"] = acc["failClosed"].clone();
+                    acc_payload["ranLayers"] = acc["ranLayers"].clone();
+                    acc_payload["skippedLayers"] = acc["skippedLayers"].clone();
+                }
+                if let Some(el) = acc["elapsedSeconds"].as_f64() {
+                    acc_payload["elapsedSeconds"] = json!((el * 100.0).round() / 100.0);
+                }
+                if let Some(q) = acc["queuedSeconds"].as_f64() {
+                    acc_payload["queuedSeconds"] = json!((q * 100.0).round() / 100.0);
+                }
+                if acc["layerSeconds"].is_object() {
+                    acc_payload["layerSeconds"] = acc["layerSeconds"].clone();
+                }
                 raw.push((
                     fin_ts,
                     4,
@@ -621,13 +666,7 @@ pub fn rebuild_in(state: &Path, extra_runs_dirs: &[PathBuf]) -> Res<Value> {
                     fin_at.clone(),
                     repo.clone(),
                     "accept",
-                    json!({
-                        "name": name,
-                        "ok": b(&sum["accept"], "ok"),
-                        "exitCode": sum["accept"]["exitCode"],
-                        "command": clip(s(&sum["accept"], "command"), 120),
-                        "notExecuted": b(&sum["accept"], "notExecuted"),
-                    }),
+                    acc_payload,
                 ));
             }
 

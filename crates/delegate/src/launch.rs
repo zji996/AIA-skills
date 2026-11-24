@@ -3385,6 +3385,11 @@ pub fn launch(
     if let Some(rework) = &o.rework {
         meta["rework"] = rework.clone();
     }
+    if let Some(class) = &o.class {
+        meta["class"] = json!(class);
+    } else if !s(parent, "class").is_empty() {
+        meta["class"] = parent["class"].clone();
+    }
     if let Some(wid) = &o.work {
         meta["workId"] = json!(wid);
     }
@@ -3435,13 +3440,7 @@ pub fn launch(
                 &crate::events::run_id_for(&run, &meta),
                 &crate::events::repo_for_meta(&meta),
                 "started",
-                json!({
-                    "name": s(&meta, "name"),
-                    "mode": s(&meta, "mode"),
-                    "tier": meta["tier"],
-                    "model": meta["model"],
-                    "parent": meta["parent"],
-                }),
+                crate::events::started_payload(&meta, false),
             );
         }
         let initial_state = if deferred { "waiting" } else { "starting" };

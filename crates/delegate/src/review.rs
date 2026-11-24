@@ -1762,6 +1762,28 @@ fn emit_accept_event(run: &Path, meta: &Value, accept_doc: &Value) {
         payload["cancelled"] = json!(true);
         payload["cancelledBy"] = accept_doc["cancelledBy"].clone();
     }
+    if !b(accept_doc, "notExecuted") {
+        let elapsed = accept_doc["elapsedSeconds"].as_f64().unwrap_or(0.0);
+        let queued = accept_doc["queuedSeconds"].as_f64().unwrap_or(0.0);
+        payload["elapsedSeconds"] = json!((elapsed * 100.0).round() / 100.0);
+        payload["queuedSeconds"] = json!((queued * 100.0).round() / 100.0);
+        if accept_doc["layerSeconds"].is_object() {
+            payload["layerSeconds"] = accept_doc["layerSeconds"].clone();
+        } else if let Some(layers) = accept_doc["layers"].as_array() {
+            let mut ls = serde_json::Map::new();
+            for l in layers {
+                if let Some(secs) = l["seconds"].as_f64() {
+                    let lname = s(l, "name");
+                    if !lname.is_empty() {
+                        ls.insert(lname.to_string(), json!((secs * 100.0).round() / 100.0));
+                    }
+                }
+            }
+            if !ls.is_empty() {
+                payload["layerSeconds"] = Value::Object(ls);
+            }
+        }
+    }
     events::emit(
         &events::run_id_for(run, meta),
         &events::repo_for_meta(meta),
