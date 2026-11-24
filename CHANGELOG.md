@@ -3,6 +3,7 @@
 ## Unreleased
 
 - `delegate`：Stop 钩子（`hooks/claude-code-stop.py`）补齐跨会话判旧与按负责会话隔离——保留 `cursors.json` 按 caller 独立游标且不改事件流/游标格式；交付/提问类事件若对应 run 已合入、已 clean、已回复或已被任一会话读过结论（`resultReadAt`）即判旧放行，非本会话发起的 run 仅在原 caller 会话已不在且超过无人认领阈值（默认 `DEFAULT_ORPHAN_TAKEOVER_HOURS=6h`，`DELEGATE_ORPHAN_TAKEOVER_HOURS` 可配）时拦截接盘，否则只计数不拦；工作项新增 `caller` 字段（由 `work add`/`work wait`/`start --work` 记录最近负责会话），老化提醒只拦负责会话（未记录或负责会话失效超时后才允许接手），`<state>/work-remind.json` 冷却改按「项 × 会话」记录，非负责会话不触发也不消耗负责会话冷却。
+- `delegate`：`lane` 结束时用 `wait4` / `getrusage(RUSAGE_CHILDREN)` 记录整棵子进程树的 `cpuUserSecs`、`cpuSysSecs` 与 `maxRssKb` 写入 `lane_released` 事件（不可得时写 `null`），并在 `delegate events` 人类视图与 `delegate lane --measure` 摘要中显示 CPU user/sys、墙钟与 CPU/墙钟 比（不改排队与令牌逻辑）。
 
 ## delegate 6.43.0 - 2026-11-24
 

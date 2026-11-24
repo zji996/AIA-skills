@@ -450,6 +450,119 @@ pub fn holder_processes() -> Res<Vec<(String, i32)>> {
         })
         .collect())
 }
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChildRusage {
+    pub cpu_user_secs: f64,
+    pub cpu_sys_secs: f64,
+    pub max_rss_kb: Option<u64>,
+}
+
+fn timeval_to_secs(tv: libc::timeval) -> f64 {
+    (tv.tv_sec as f64) + (tv.tv_usec as f64) / 1_000_000.0
+}
+
+fn round_ms(secs: f64) -> f64 {
+    if !secs.is_finite() || secs <= 0.0 {
+        0.0
+    } else {
+        (secs * 1000.0).round() / 1000.0
+    }
+}
+
+fn rusage_from_raw(ru: &libc::rusage) -> ChildRusage {
+    let cpu_user_secs = timeval_to_secs(ru.ru_utime).max(0.0);
+    let cpu_sys_secs = timeval_to_secs(ru.ru_stime).max(0.0);
+    let raw_rss = ru.ru_maxrss.max(0) as u64;
+    #[cfg(target_os = "macos")]
+    let rss_kb = raw_rss / 1024;
+    #[cfg(not(target_os = "macos"))]
+    let rss_kb = raw_rss;
+    ChildRusage {
+        cpu_user_secs,
+        cpu_sys_secs,
+        max_rss_kb: if rss_kb > 0 { Some(rss_kb) } else { None },
+    }
+}
+
+fn rusage_delta(start: ChildRusage, end: ChildRusage) -> ChildRusage {
+    ChildRusage {
+        cpu_user_secs: (end.cpu_user_secs - start.cpu_user_secs).max(0.0),
+        cpu_sys_secs: (end.cpu_sys_secs - start.cpu_sys_secs).max(0.0),
+        max_rss_kb: end.max_rss_kb.filter(|&kb| kb > 0),
+    }
+}
+
+/// Snapshot cumulative rusage for all waited-for child processes (entire reaped subtree).
+pub fn getrusage_children() -> Option<ChildRusage> {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut ru) } == 0 {
+        Some(rusage_from_raw(&ru))
+    } else {
+        None
+    }
+}
+
+/// Non-blocking `wait4` for a specific child PID; returns raw wait status and subtree rusage.
+pub fn try_wait4(pid: i32) -> io::Result<Option<(i32, Option<ChildRusage>)>> {
+    let mut status: libc::c_int = 0;
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        let rc = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut ru) };
+        if rc == 0 {
+            return Ok(None);
+        }
+        if rc > 0 {
+            return Ok(Some((status, Some(rusage_from_raw(&ru)))));
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
+}
+
+/// Blocking `wait4` for a specific child PID; returns raw wait status and subtree rusage.
+pub fn wait4_blocking(pid: i32) -> io::Result<(i32, Option<ChildRusage>)> {
+    let mut status: libc::c_int = 0;
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        let rc = unsafe { libc::wait4(pid, &mut status, 0, &mut ru) };
+        if rc > 0 {
+            return Ok((status, Some(rusage_from_raw(&ru))));
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
+}
+
+pub fn wait_status_exit_code(status: i32) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        1
+    }
+}
+
+pub fn format_cpu_summary(wall_secs: f64, user: Option<f64>, sys: Option<f64>) -> Option<String> {
+    let (u, s) = (user?, sys?);
+    let total = (u + s).max(0.0);
+    let wall = wall_secs.max(0.0);
+    let ratio = if wall > 0.0005 {
+        format!("{:.2}x", total / wall)
+    } else {
+        "—".to_string()
+    };
+    Some(format!(
+        "CPU user {u:.2}s / sys {s:.2}s · 墙钟 {wall:.2}s · CPU/墙钟 {ratio}"
+    ))
+}
+
 pub struct Slot {
     ticket: Option<PathBuf>,
     _file: Option<File>,
@@ -457,6 +570,8 @@ pub struct Slot {
     pushed_env: bool,
     pub queued: f64,
     acquired_at: Option<Instant>,
+    rusage_start: Option<ChildRusage>,
+    recorded_rusage: Option<ChildRusage>,
     event_run: String,
     event_repo: String,
     event_label: String,
@@ -465,6 +580,9 @@ pub struct Slot {
 impl Slot {
     pub fn env_vars(&self) -> Option<Vec<(String, String)>> {
         self.proxy.as_ref().map(|p| p.env_vars())
+    }
+    pub fn set_rusage(&mut self, rusage: Option<ChildRusage>) {
+        self.recorded_rusage = rusage;
     }
 }
 impl Drop for Slot {
@@ -481,6 +599,19 @@ impl Drop for Slot {
             let _ = fs::remove_file(p);
             if let Some(at) = self.acquired_at.take() {
                 let held = (at.elapsed().as_secs_f64() * 100.0).round() / 100.0;
+                let usage = self.recorded_rusage.or_else(|| {
+                    let start = self.rusage_start?;
+                    let end = getrusage_children()?;
+                    Some(rusage_delta(start, end))
+                });
+                let (cpu_user, cpu_sys, max_rss_kb) = match usage {
+                    Some(u) => (
+                        json!(round_ms(u.cpu_user_secs)),
+                        json!(round_ms(u.cpu_sys_secs)),
+                        u.max_rss_kb.map_or(Value::Null, |kb| json!(kb)),
+                    ),
+                    None => (Value::Null, Value::Null, Value::Null),
+                };
                 crate::events::emit(
                     &self.event_run,
                     &self.event_repo,
@@ -489,6 +620,9 @@ impl Drop for Slot {
                         "label": self.event_label,
                         "heldSeconds": held,
                         "remote": self.event_remote,
+                        "cpuUserSecs": cpu_user,
+                        "cpuSysSecs": cpu_sys,
+                        "maxRssKb": max_rss_kb,
                     }),
                 );
             }
@@ -652,6 +786,8 @@ fn acquire_in(
             pushed_env: false,
             queued: 0.0,
             acquired_at: None,
+            rusage_start: None,
+            recorded_rusage: None,
             event_run: String::new(),
             event_repo: String::new(),
             event_label: String::new(),
@@ -674,6 +810,8 @@ fn acquire_in(
             pushed_env,
             queued: 0.0,
             acquired_at: None,
+            rusage_start: None,
+            recorded_rusage: None,
             event_run: String::new(),
             event_repo: String::new(),
             event_label: String::new(),
@@ -802,6 +940,8 @@ fn acquire_in(
         pushed_env,
         queued,
         acquired_at: Some(Instant::now()),
+        rusage_start: getrusage_children(),
+        recorded_rusage: None,
         event_run,
         event_repo,
         event_label: label.to_string(),
@@ -1095,7 +1235,7 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
         let meta = json!({"measure":config.value["measure"],"measureCpus":config.value["measureCpus"],"workdir":cwd});
         return crate::measure::run_lane(&command, &cwd, account.as_deref(), &meta);
     }
-    let slot = acquire(
+    let mut slot = acquire(
         &label,
         account.as_deref(),
         account.as_deref(),
@@ -1156,10 +1296,11 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
         c.env("CARGO_BUILD_JOBS", plan.heavy_jobs.to_string());
     }
     group(&mut c);
-    let mut child = c.spawn().map_err(|e| e.to_string())?;
+    let child = c.spawn().map_err(|e| e.to_string())?;
     let pid = child.id() as i32;
     loop {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+        if let Some((status, rusage)) = try_wait4(pid).map_err(|e| e.to_string())? {
+            slot.set_rusage(rusage);
             let sig = SIGNAL.load(Ordering::SeqCst);
             if let Some(dir) = &temporary {
                 let _ = fs::remove_dir_all(dir);
@@ -1167,16 +1308,15 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
             return Ok(if sig != 0 {
                 128 + sig
             } else {
-                use std::os::unix::process::ExitStatusExt;
-                status
-                    .code()
-                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
+                wait_status_exit_code(status)
             });
         }
         let sig = SIGNAL.load(Ordering::SeqCst);
         if sig != 0 {
             end_group(pid, 3.0);
-            let _ = child.wait();
+            if let Ok((_, rusage)) = wait4_blocking(pid) {
+                slot.set_rusage(rusage);
+            }
             if let Some(dir) = &temporary {
                 let _ = fs::remove_dir_all(dir);
             }
@@ -1280,5 +1420,91 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait4_records_child_tree_cpu_seconds_and_rss() {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
+        let started = Instant::now();
+        // Run CPU work inside a nested subshell so we verify process-tree rusage coverage.
+        let child = Command::new("sh")
+            .args([
+                "-c",
+                "( i=0; while [ $i -lt 80000 ]; do i=$((i + 1)); done )",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cpu-burning sh");
+        let pid = child.id() as i32;
+        let (status, rusage) = wait4_blocking(pid).expect("wait4 child");
+        let wall = started.elapsed().as_secs_f64();
+        assert_eq!(wait_status_exit_code(status), 0);
+        let ru = rusage.expect("rusage present");
+        assert!(
+            ru.cpu_user_secs > 0.0,
+            "expected cpuUserSecs > 0, got {} (wall={wall:.4}s)",
+            ru.cpu_user_secs
+        );
+        // Allow small timer granularity margin on very fast machines.
+        let upper = (wall + 0.05) * cores;
+        assert!(
+            ru.cpu_user_secs <= upper,
+            "expected cpuUserSecs ({}) <= wall ({wall:.4}s) * cores ({cores})",
+            ru.cpu_user_secs
+        );
+        assert!(
+            ru.max_rss_kb.is_some_and(|kb| kb > 0),
+            "expected maxRssKb > 0, got {:?}",
+            ru.max_rss_kb
+        );
+        let summary = format_cpu_summary(wall, Some(ru.cpu_user_secs), Some(ru.cpu_sys_secs))
+            .expect("cpu summary");
+        assert!(summary.contains("CPU user "), "summary={summary}");
+        assert!(summary.contains(" / sys "), "summary={summary}");
+        assert!(summary.contains("墙钟 "), "summary={summary}");
+        assert!(summary.contains("CPU/墙钟 "), "summary={summary}");
+    }
+
+    #[test]
+    fn lane_released_human_format_handles_cpu_and_null() {
+        let ev_with_cpu = json!({
+            "seq": 7,
+            "at": "2026-11-24T21:00:00Z",
+            "repo": "/tmp/demo",
+            "run": "",
+            "kind": "lane_released",
+            "payload": {
+                "label": "demo: cargo test",
+                "heldSeconds": 2.5,
+                "remote": false,
+                "cpuUserSecs": 4.2,
+                "cpuSysSecs": 0.3,
+                "maxRssKb": 123456
+            }
+        });
+        let line = crate::events::format_human(&ev_with_cpu);
+        assert!(line.contains("CPU user 4.20s / sys 0.30s"), "line={line}");
+        assert!(line.contains("墙钟 2.50s"), "line={line}");
+        assert!(line.contains("CPU/墙钟 1.80x"), "line={line}");
+
+        let ev_null = json!({
+            "seq": 8,
+            "at": "2026-11-24T21:00:01Z",
+            "repo": "/tmp/demo",
+            "run": "",
+            "kind": "lane_released",
+            "payload": {
+                "label": "demo: noop",
+                "heldSeconds": 1.0,
+                "remote": false,
+                "cpuUserSecs": Value::Null,
+                "cpuSysSecs": Value::Null,
+                "maxRssKb": Value::Null
+            }
+        });
+        let line_null = crate::events::format_human(&ev_null);
+        assert!(line_null.contains("(持 1s)"), "line_null={line_null}");
     }
 }

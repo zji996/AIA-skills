@@ -490,6 +490,42 @@ class Delegate628Tests(unittest.TestCase):
         self.assertEqual(timed_state["state"], "rejected")
         self.assertTrue(timed_state["accept"]["timedOut"])
 
+    def test_lane_released_records_cpu_seconds_and_human_summaries(self):
+        import os
+
+        self.env.pop("DELEGATE_LANE_HELD", None)
+        burn = "( i=0; while [ $i -lt 80000 ]; do i=$((i + 1)); done )"
+        t0 = time.monotonic()
+        res = self.cli("lane", "--label", "cpu-burn", "--", "sh", "-c", burn, human=True)
+        wall = time.monotonic() - t0
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        evs = [e for e in self.read_events() if e["kind"] == "lane_released" and e["payload"].get("label") == "cpu-burn"]
+        self.assertEqual(len(evs), 1, evs)
+        p = evs[0]["payload"]
+        cores = os.cpu_count() or 1
+        self.assertIsInstance(p.get("cpuUserSecs"), (int, float), p)
+        self.assertIsInstance(p.get("cpuSysSecs"), (int, float), p)
+        self.assertIsInstance(p.get("maxRssKb"), int, p)
+        self.assertGreater(p["cpuUserSecs"], 0.0, p)
+        self.assertLessEqual(p["cpuUserSecs"], (wall + 0.1) * cores, p)
+        self.assertGreaterEqual(p["cpuSysSecs"], 0.0, p)
+        self.assertGreater(p["maxRssKb"], 0, p)
+
+        human = self.cli("events", human=True)
+        self.assertEqual(human.returncode, 0, human.stderr)
+        self.assertIn("CPU user ", human.stdout)
+        self.assertIn(" / sys ", human.stdout)
+        self.assertIn("墙钟 ", human.stdout)
+        self.assertIn("CPU/墙钟 ", human.stdout)
+
+        mres = self.cli("lane", "--measure", "--", "sh", "-c", "( i=0; while [ $i -lt 40000 ]; do i=$((i + 1)); done )", human=True)
+        self.assertEqual(mres.returncode, 0, mres.stderr)
+        self.assertIn("CPU user ", mres.stderr)
+        self.assertIn(" / sys ", mres.stderr)
+        self.assertIn("墙钟 ", mres.stderr)
+        self.assertIn("CPU/墙钟 ", mres.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

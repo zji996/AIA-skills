@@ -643,7 +643,8 @@ pub fn run_lane(command: &str, cwd: &Path, run: Option<&Path>, meta: &Value) -> 
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     let mode = systemd_mode();
-    let status = if mode != SystemdMeasure::Unavailable {
+    let started = Instant::now();
+    let child = if mode != SystemdMeasure::Unavailable {
         let mut sd = Command::new("systemd-run");
         sd.args(["--user", "--scope", "-p", "CPUWeight=10000"]);
         if mode == SystemdMeasure::NoExpandEnv {
@@ -668,7 +669,7 @@ pub fn run_lane(command: &str, cwd: &Path, run: Option<&Path>, meta: &Value) -> 
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
-            .status()
+            .spawn()
             .map_err(|e| e.to_string())?
     } else {
         eprintln!("delegate measure: systemd-run unavailable; direct execution");
@@ -681,10 +682,22 @@ pub fn run_lane(command: &str, cwd: &Path, run: Option<&Path>, meta: &Value) -> 
             Some("systemd-run unavailable; direct execution"),
             &[],
         );
-        c.status().map_err(|e| e.to_string())?
+        c.spawn().map_err(|e| e.to_string())?
     };
+    let pid = child.id() as i32;
+    let (raw_status, rusage) = crate::lane::wait4_blocking(pid).map_err(|e| e.to_string())?;
+    let wall = started.elapsed().as_secs_f64();
     record(run, "end", command, &slot.cpus, slot.queued, None, &[]);
-    Ok(status.code().unwrap_or(1))
+    if let Some(summary) = crate::lane::format_cpu_summary(
+        wall,
+        rusage.map(|r| r.cpu_user_secs),
+        rusage.map(|r| r.cpu_sys_secs),
+    ) {
+        eprintln!("delegate lane --measure: {summary}");
+    } else {
+        eprintln!("delegate lane --measure: CPU — · 墙钟 {wall:.2}s · CPU/墙钟 —");
+    }
+    Ok(crate::lane::wait_status_exit_code(raw_status))
 }
 
 #[cfg(test)]

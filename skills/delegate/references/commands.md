@@ -30,7 +30,7 @@
 | `result [<run>] [--round N\|--all\|--rounds] [--path] [--no-mark] [--json]` | 输出答复；`--round N`/`--all`/`--rounds` 查单轮、全部或索引 |
 | `stop <run>...` | 终止任务及其 scope、进程组 |
 | `clean <run>...\|--finished [--force] [--sync]` | 删除已结束任务（默认原子移入 trash 异步回收，`--sync` 同步；清理前检测是否已进 HEAD 以解锁 `run_applied`）；`--finished` 默认保留未读结果 |
-| `lane [--label <文字>] [--measure] [--] <命令>` | 整机重任务队列执行命令；`--measure` 预约核串行排队，退出码原样返回；无参列占用 |
+| `lane [--label <文字>] [--measure] [--] <命令>` | 整机重任务队列执行命令，结束时在 `lane_released` 记录子进程树 `cpuUserSecs`/`cpuSysSecs`/`maxRssKb`（`events` 与 `--measure` 摘要显示 CPU user/sys、墙钟与 CPU/墙钟 比）；`--measure` 预约核串行排队，退出码原样返回；无参列占用 |
 | `agy account <list\|status\|add\|use\|note\|remove\|import-agy-swap\|restore-entry>` | 手工管理本地 `agy` 账号槽位与余量快照（不自动轮换、不调额度接口），见 [agy 账号](agy-accounts.md) |
 | `usage [--since 24h\|7d] [--by account\|day\|run\|repo] [--account ID] [--repo PATH] [--all] [--json]` | 按账号/日/run/仓库汇总本地 `agy` 用量（作者与审查员分列，运行中未计单列） |
 

@@ -936,7 +936,16 @@ pub fn format_human(ev: &Value) -> String {
         }
         "lane_released" => {
             let h = p["heldSeconds"].as_f64().unwrap_or(0.0);
-            format!("{} (持 {:.0}s)", s(p, "label"), h)
+            let label = s(p, "label");
+            if let Some(cpu) = crate::lane::format_cpu_summary(
+                h,
+                p["cpuUserSecs"].as_f64(),
+                p["cpuSysSecs"].as_f64(),
+            ) {
+                format!("{label} ({cpu})")
+            } else {
+                format!("{label} (持 {h:.0}s)")
+            }
         }
         "accept" => {
             let ok = if b(p, "ok") {
