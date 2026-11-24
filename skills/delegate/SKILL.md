@@ -19,12 +19,12 @@ metadata:
 ```bash
 D=<本技能目录>/bin/delegate
 $D start --read-only "审查 apps/api 的错误处理，列真实缺陷并写文件:行号"   # 放出，可连放多个
-$D wait                                                                  # 放后台；下一个结束就返回，末行给出继续等的命令
+$D wait                                                                  # 放后台（agy 用 run_command 设 WaitMsBeforeAsync=500）；下一个结束即返并印续等命令
 ```
 
-总路数、仓库路数、模型并发或内存不足时自动排队、不换模型；`status` 看排队原因与前方人数，`--json` 看 `queue`。只有愿意模型满时改用下一候选才加 `--overflow next`。
+总路数、仓库路数、模型并发或内存不足时自动排队、不换模型；`status` 看排队原因与前方人数，`--json` 看 `queue`。愿意满时换候选再加 `--overflow next`。
 
-每个任务回一条短行（状态、改动、验收、下一步）和答复。写入任务看 `$D diff <name>`，满意后 `$D apply <name>`（源工作区有未提交重叠时默认拒绝，加 `--allow-dirty-overlap` 接受合并；末行印 `$D files <run>` 便于 `git add`，`--commit` 仅暂存本批压单提交，`ok: false` 明报失败阶段与已写文件）；未解冲突拒合入，细节见 [并行合入](references/parallel-safety.md) 与 [清理](references/cleanup.md)。
+每个任务回短行（状态/改动/验收/下一步）与答复。写入任务看 `$D diff <name>`，满意后 `$D apply <name>`（锁内先查 `.applied`，已合入报「已于 `<时间>` 合入」零改动退出；未提交重叠默认拒，`--allow-dirty-overlap` 接受；末行印 `$D files <run>`，`--commit` 仅暂存本批压单提交，`ok: false` 明报失败阶段）；细节见 [并行合入](references/parallel-safety.md) 与 [清理](references/cleanup.md)。
 
 | 想要 | 命令 |
 |---|---|

@@ -1885,6 +1885,7 @@ pub struct ApplyOutcome {
     pub written_files: Vec<String>,
     pub regenerated_files: Vec<String>,
     pub had_dirty_merge: bool,
+    pub already_applied: bool,
 }
 pub(crate) struct ApplyInnerResult {
     pub code: i32,
@@ -2350,6 +2351,70 @@ fn record_dirty_overlap_failure(
     }
 }
 
+fn already_applied_outcome(run: &Path, meta: &Value) -> Option<ApplyOutcome> {
+    let run_id = {
+        let id = s(meta, "run");
+        if !id.is_empty() {
+            id.to_string()
+        } else {
+            run.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    let direct_applied = run.join(".applied");
+    let direct_cleaned = run.join(".applied-cleaned");
+    let archived_applied = cache_dir()
+        .join("archive")
+        .join(&run_id)
+        .join("record")
+        .join(".applied");
+    let applied_doc = if direct_applied.is_file() {
+        json(&direct_applied)
+    } else if direct_cleaned.is_file() {
+        Value::Null
+    } else if !run.join("meta.json").is_file() && archived_applied.is_file() {
+        json(&archived_applied)
+    } else {
+        return None;
+    };
+    let at = if !s(&applied_doc, "at").is_empty() {
+        s(&applied_doc, "at").to_string()
+    } else if !s(meta, "appliedAt").is_empty() {
+        s(meta, "appliedAt").to_string()
+    } else {
+        "未知时间".to_string()
+    };
+    let head = if !s(&applied_doc, "head").is_empty() {
+        s(&applied_doc, "head").to_string()
+    } else {
+        s(meta, "appliedHead").to_string()
+    };
+    let message = format!("已于 {at} 合入");
+    let mut apply_obj = json!({
+        "ok": true,
+        "alreadyApplied": true,
+        "appliedAt": at,
+        "message": message,
+    });
+    if !head.is_empty() {
+        apply_obj["head"] = json!(head);
+    }
+    let conclusion = json!({
+        "run": run_id,
+        "apply": apply_obj,
+    });
+    Some(ApplyOutcome {
+        code: 0,
+        conclusion,
+        written_files: Vec::new(),
+        regenerated_files: Vec::new(),
+        had_dirty_merge: false,
+        already_applied: true,
+    })
+}
+
 pub fn apply(
     run: &Path,
     merge: bool,
@@ -2364,6 +2429,9 @@ pub fn apply(
     }
     let source = PathBuf::from(s(&meta["worktree"], "source"));
     if !source.is_absolute() {
+        if let Some(outcome) = already_applied_outcome(run, &meta) {
+            return Ok(outcome);
+        }
         return apply_checked(
             run,
             merge,
@@ -2378,6 +2446,9 @@ pub fn apply(
         lane::install_signals();
     }
     let _apply_guard = crate::source_watch::apply_guard(&source)?;
+    if let Some(outcome) = already_applied_outcome(run, &meta) {
+        return Ok(outcome);
+    }
     // Refresh the delivered diff before releasing its worktree (also captures later edits).
     if Path::new(s(&meta["worktree"], "path")).is_dir() {
         crate::changes::record(&mut meta, run);
@@ -2415,6 +2486,7 @@ pub fn apply(
                 written_files: vec![],
                 regenerated_files: vec![],
                 had_dirty_merge: false,
+                already_applied: false,
             });
         }
     };
@@ -3113,6 +3185,7 @@ fn apply_checked(
         written_files,
         regenerated_files,
         had_dirty_merge: inner.had_dirty_merge,
+        already_applied: false,
     })
 }
 fn accept_validity(run: &Path, dry: bool, conclusion: &mut Value) {

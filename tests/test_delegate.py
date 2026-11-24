@@ -160,7 +160,13 @@ def interrupted(text="Upstream response stream was interrupted"):
 
 
 # Session variables delegate reads as the caller id; host sessions must not leak into tests.
-CALLER_ENV = ("DELEGATE_CALLER", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "PI_SESSION_ID")
+CALLER_ENV = (
+    "DELEGATE_CALLER",
+    "ANTIGRAVITY_CONVERSATION_ID",
+    "CLAUDE_CODE_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "PI_SESSION_ID",
+)
 SETTLED = {"type": "agent_settled"}
 # Verbatim shape of a real failure: the model printed its tool call as text and stopped.
 LEAKED = "Let's read `trainingStyles.ts` as well.call:default_api:read{limit:120,offset:1,path:src/trainingStyles.ts}"
@@ -181,7 +187,7 @@ class DelegateTests(unittest.TestCase):
         self.bin = self.work / "bin"
         self.bin.mkdir()
         self.env = {k: v for k, v in os.environ.items()
-                    if not k.startswith(("DELEGATE_", "PI_DELEGATE_")) and k not in CALLER_ENV}
+                    if not k.startswith(("DELEGATE_", "PI_DELEGATE_", "ANTIGRAVITY_")) and k not in CALLER_ENV}
         # Nested test runs must resolve real tools, not another run's private shims.
         path = os.pathsep.join(p for p in os.environ["PATH"].split(os.pathsep)
                                if Path(p).name not in {"agent-shims", "measure-shims", "resource-shims", "remote-shims"})
@@ -193,6 +199,8 @@ class DelegateTests(unittest.TestCase):
                         # Keep background `_merge-worker` off by default for deterministic tests;
                         # premerge/fast-forward tests explicitly pop DELEGATE_PREMERGE and synchronize.
                         DELEGATE_PREMERGE="0",
+                        # Synthetic test sessions must not inherit the outer controller harness PID.
+                        DELEGATE_SESSION_HARNESS_PID="0",
                         # All tiers equal: tests opt into per-purpose routing.
                         DELEGATE_SCOUT_MODEL="p/m", DELEGATE_REVIEW_MODEL="p/m", DELEGATE_WRITE_MODEL="p/m")
         DelegateTests.user_config(self, {"models": REGISTERED_MODELS})
@@ -2610,8 +2618,16 @@ db.write_text(json.dumps(units))
         self.assertEqual((repo / "a.txt").read_text(), "one\n2\n3\n4\nfive\n")
         self.assertEqual((repo / "seen.txt").read_text(), "seeded\n")
         self.assertNotIn("next", self.outcome(self.cli("status", state["run"])))  # merged: nothing left to do
+        # Re-applying an already-applied run is idempotent and leaves the workspace untouched.
         (repo / "a.txt").write_text("uno\n2\n3\n4\nfive\n")
         (repo / "seen.txt").unlink()
+        idem = self.cli("apply", "--json", "--keep", "--allow-dirty-overlap", state["run"])
+        self.assertEqual(idem.returncode, 0, idem.stdout + idem.stderr)
+        self.assertTrue(self.outcome(idem)["apply"]["alreadyApplied"])
+        self.assertIn("已于 ", idem.stderr)
+        self.assertFalse((repo / "seen.txt").exists())
+        # Reset `.applied` to verify conflict refusal and `--merge` conflict markers on an unapplied run.
+        (Path(state["dir"]) / ".applied").unlink()
         refused = self.cli("apply", "--json", "--keep", "--allow-dirty-overlap", state["run"])
         self.assertEqual(refused.returncode, 3)
         self.assertIn("nothing applied", refused.stderr)
@@ -2915,7 +2931,10 @@ db.write_text(json.dumps(units))
         self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
         self.assertEqual((repo / "a.txt").read_text(), "a\nround-two\nc\n")
         self.assertEqual((repo / "b.txt").read_text(), "x\ncaller\n")
-        self.assertIn("no changes to apply", self.cli("apply", "--json", "--keep", "conv").stderr)  # applying twice is harmless
+        again = self.cli("apply", "--json", "--keep", "conv")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertTrue(self.outcome(again)["apply"]["alreadyApplied"])
+        self.assertIn("已于 ", again.stderr)  # applying twice is idempotent and harmless
 
     def test_reply_sync_brings_the_callers_later_work_into_the_worktree(self):
         # The caller wrote a test after the run started; `reply --sync` lets the colleague see it, and the
@@ -3270,11 +3289,14 @@ db.write_text(json.dumps(units))
         self.assertIs(result["acceptStillValid"], True)
         self.assertEqual(result["acceptValidityScope"], "repository-snapshot")
         self.assertEqual(result["apply"], {"ok": True, "dryRun": False})
+        (Path(state["dir"]) / ".applied").unlink()
         self.assertIs(self.outcome(self.cli("apply", "--json", "--keep", state["run"]))["acceptStillValid"], True)
+        (Path(state["dir"]) / ".applied").unlink()
         (repo / "unrelated.txt").write_text("caller edit\n")
         stale = self.outcome(self.cli("apply", "--json", "--keep", "--no-verify", state["run"]))
         self.assertIs(stale["acceptStillValid"], False)
         self.assertEqual(counter.read_text(), "checked\n")
+        (Path(state["dir"]) / ".applied").unlink()
         dry = self.outcome(self.cli("apply", "--json", "--keep", state["run"], "--dry-run"))
         self.assertNotIn("acceptStillValid", dry)
         self.assertIn("dry run", dry["acceptValidityReason"])
@@ -3322,11 +3344,13 @@ db.write_text(json.dumps(units))
         result = self.outcome(self.cli("apply", "--json", "--keep", state["run"]))
         self.assertNotIn("acceptStillValid", result)
         self.assertIn("incomplete acceptance", result["acceptValidityReason"])
+        (run / ".applied").unlink()
         (run / "summary.json").write_text(json.dumps(summary))
         (repo / "large-untracked").write_bytes(b"x" * 2097153)
         result = self.outcome(self.cli("apply", "--json", "--keep", state["run"]))
         self.assertNotIn("acceptStillValid", result)
         self.assertIn("large untracked", result["acceptValidityReason"])
+        (run / ".applied").unlink()
         (repo / "large-untracked").unlink()
         wrapper = self.bin / "git"
         real_git = shutil.which("git", path=os.environ["PATH"])
@@ -3373,12 +3397,15 @@ db.write_text(json.dumps(units))
         result = self.outcome(self.cli("apply", "--json", "--keep", state["run"]))
         self.assertEqual(result["verify"]["commands"], ["echo task-check"])
         self.assertIs(result["verify"]["ok"], True)
+        (Path(state["dir"]) / ".applied").unlink()
         (repo / ".delegate.json").write_text(json.dumps({"applyVerify": False}))
         self.assertNotIn("verify", self.outcome(self.cli("apply", "--json", "--keep", state["run"])))
+        (Path(state["dir"]) / ".applied").unlink()
         (repo / ".delegate.json").write_text(json.dumps({"applyVerify": "echo own-command"}))
         result = self.outcome(self.cli("apply", "--json", "--keep", state["run"]))
         self.assertEqual(result["verify"]["commands"], ["echo own-command"])
         self.assertIs(result["verify"]["ok"], True)
+        (Path(state["dir"]) / ".applied").unlink()
         (repo / ".delegate.json").write_text(json.dumps({"applyVerify": 3}))
         self.assertIn("applyVerify must be", self.cli("apply", "--json", "--keep", state["run"]).stderr)
         self.assertEqual(self.cli("apply", "--json", "--keep", state["run"], "--verify", "--no-verify").returncode, 2)
@@ -3572,15 +3599,18 @@ db.write_text(json.dumps(units))
         self.fake_pi([answer("done"), SETTLED], pre="git -c protocol.file.allow=always submodule update --init -q; echo new > a.txt")
         state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "task"))
         self.assertIs(self.outcome(self.cli("apply", "--json", "--keep", state["run"]))["acceptStillValid"], True)
+        (Path(state["dir"]) / ".applied").unlink()
         (repo / "vendor/lib.txt").write_text("dirty\n")
         result = self.outcome(self.cli("apply", "--json", "--keep", state["run"]))
         self.assertNotIn("acceptStillValid", result)
         self.assertIn("submodules", result["acceptValidityReason"])
+        (Path(state["dir"]) / ".applied").unlink()
         (repo / "vendor/lib.txt").write_text("lib\n")
         subprocess.run(["git", "-C", str(repo), "update-index", "--assume-unchanged", "a.txt"], check=True)
         result = self.outcome(self.cli("apply", "--json", "--keep", state["run"]))
         self.assertNotIn("acceptStillValid", result)
         self.assertIn("index", result["acceptValidityReason"])
+        (Path(state["dir"]) / ".applied").unlink()
         subprocess.run(["git", "-C", str(repo), "update-index", "--no-assume-unchanged", "a.txt"], check=True)
         subprocess.run(["git", "-C", str(repo / "vendor"), "update-index", "--assume-unchanged", "lib.txt"], check=True)
         (repo / "vendor/lib.txt").write_text("hidden dirty\n")
@@ -3600,13 +3630,16 @@ db.write_text(json.dumps(units))
         applied = self.outcome(self.cli("apply", "--json", "--keep", state["run"]))
         self.assertIs(applied["acceptStillValid"], True)
         self.assertEqual(applied["excluded"], ["vendor"])
+        (Path(state["dir"]) / ".applied").unlink()
         subprocess.run(["git", "-C", str(repo), "-c", "protocol.file.allow=always",
                         "submodule", "update", "--init", "-q", "vendor"], check=True)
         self.assertIs(self.outcome(self.cli("apply", "--json", "--keep", state["run"]))["acceptStillValid"], True)
+        (Path(state["dir"]) / ".applied").unlink()
         (repo / "vendor/lib.txt").write_text("dirty\n")
         dirty = self.outcome(self.cli("apply", "--json", "--keep", state["run"]))
         self.assertNotIn("acceptStillValid", dirty)
         self.assertIn("submodules", dirty["acceptValidityReason"])
+        (Path(state["dir"]) / ".applied").unlink()
         (repo / "vendor/lib.txt").write_text("v1\n")
         subprocess.run(["git", "-C", str(repo / "vendor"), "-c", "user.name=t", "-c", "user.email=t@t",
                         "commit", "--allow-empty", "-qm", "moved pointer"], check=True)

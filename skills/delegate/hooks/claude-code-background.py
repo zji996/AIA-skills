@@ -47,6 +47,13 @@ POLL_REASON = (
     "`delegate wait --any` 配合 Bash 工具的 `run_in_background: true` 放后台等完成通知。"
     " Do not poll delegate output or run directories in a foreground while/until sleep loop; "
     "run `delegate wait --any` with `run_in_background: true` to be notified on completion.")
+AGY_POLL_REASON = (
+    "不要在前台用 while/until + sleep 轮询 delegate 输出或 run 目录；请改用 "
+    "`delegate wait --any` 配合 `run_command` 的 `WaitMsBeforeAsync: 500, IsDaemon: false` 放后台等自动唤醒。"
+    " Do not poll delegate output or run directories in a foreground while/until sleep loop; "
+    "run `delegate wait --any` alone with `run_command` (`WaitMsBeforeAsync: 500, IsDaemon: false`) "
+    "so Reactive Wakeup notifies you on completion.")
+AGY_MAX_BG_WAIT_MS = 2000
 DELEGATE_RUN_ARTIFACTS = (
     "exit_code", "result.md", "summary.json", "events.jsonl",
     "meta.json", "changes.json", ".waiting", ".delivered", "accept.log",
@@ -182,11 +189,26 @@ def blocking_calls(command: str) -> tuple[list[str], bool]:
             continue
         calls.append(token + " " + shlex.join(argv))
         spans.append((i, end))
-    mixed = bool(spans and any(t not in SEPARATORS for t in tokens[:spans[0][0]] + tokens[spans[0][1]:]))
+    if spans:
+        before_tokens = [t for t in tokens[:spans[0][0]] if t not in SEPARATORS]
+        after_tokens = [t for t in tokens[spans[0][1]:] if t not in SEPARATORS]
+        only_env_prefix = all(t == "env" or ASSIGNMENT.fullmatch(t) for t in before_tokens)
+        mixed = bool(after_tokens or not only_env_prefix)
+    else:
+        mixed = False
     return calls, mixed
 
 
-def deny(reason: str) -> int:
+def allow(fmt: str = "claude") -> int:
+    if fmt == "agy":
+        json.dump({"decision": "allow"}, sys.stdout, ensure_ascii=False)
+    return 0
+
+
+def deny(reason: str, fmt: str = "claude") -> int:
+    if fmt == "agy":
+        json.dump({"decision": "deny", "reason": reason}, sys.stdout, ensure_ascii=False)
+        return 0
     json.dump(
         {
             "hookSpecificOutput": {
@@ -621,29 +643,114 @@ def foreground_delegate_poll(command: str) -> str | None:
     return None
 
 
-def main() -> int:
+def _parse_format(argv: list[str]) -> str | None:
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--format" and i + 1 < len(argv):
+            val = argv[i + 1].strip().lower()
+            if val in ("claude", "agy"):
+                return val
+            i += 2
+            continue
+        if arg.startswith("--format="):
+            val = arg.split("=", 1)[1].strip().lower()
+            if val in ("claude", "agy"):
+                return val
+        i += 1
+    return None
+
+
+def _is_colleague_process() -> bool:
+    return bool(
+        os.environ.get("PI_DELEGATE_ACTIVE", "").strip()
+        or os.environ.get("DELEGATE_AGENT", "").strip()
+    )
+
+
+def _parse_int(value: object) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value.strip()))
+        except ValueError:
+            return None
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    cli_fmt = _parse_format(sys.argv[1:] if argv is None else argv)
     try:
         payload = json.load(sys.stdin)
     except ValueError:
-        return 0
-    tool_input = payload.get("tool_input") or {}
-    if payload.get("tool_name") != "Bash":
-        return 0
-    command = strip_heredocs(str(tool_input.get("command", "")))
+        return allow(cli_fmt or "claude")
+    if not isinstance(payload, dict):
+        return allow(cli_fmt or "claude")
+    fmt = cli_fmt or ("agy" if isinstance(payload.get("toolCall"), dict) else "claude")
+    if fmt == "agy":
+        tool_call = payload.get("toolCall")
+        if not isinstance(tool_call, dict) or tool_call.get("name") != "run_command":
+            return allow(fmt)
+        tool_args = tool_call.get("args")
+        if not isinstance(tool_args, dict):
+            tool_args = {}
+        raw_command = str(tool_args.get("CommandLine", ""))
+        wait_ms = _parse_int(tool_args.get("WaitMsBeforeAsync"))
+        is_daemon = bool(tool_args.get("IsDaemon"))
+        is_bg = wait_ms is not None and wait_ms <= AGY_MAX_BG_WAIT_MS and not is_daemon
+    else:
+        tool_input = payload.get("tool_input") or {}
+        if payload.get("tool_name") != "Bash":
+            return allow(fmt)
+        raw_command = str(tool_input.get("command", ""))
+        wait_ms = None
+        is_daemon = False
+        is_bg = bool(tool_input.get("run_in_background"))
+    command = strip_heredocs(raw_command)
     call = self_matching_pgrep(command)
     if call:
-        return deny(SELF_MATCH_REASON.format(call=call))
+        return deny(SELF_MATCH_REASON.format(call=call), fmt)
     prune_call = dangerous_git_prune(command, str(payload.get("cwd") or os.getcwd()))
     if prune_call:
-        return deny(PRUNE_REASON.format(call=prune_call))
-    if tool_input.get("run_in_background"):
-        return 0
+        return deny(PRUNE_REASON.format(call=prune_call), fmt)
+    if _is_colleague_process():
+        return allow(fmt)
+    if fmt == "agy":
+        calls, mixed = blocking_calls(command)
+        if calls:
+            wait_command = calls[0]
+            if mixed:
+                return deny(
+                    f"把 wait 单独作为一条后台命令发出：{wait_command}"
+                    "（run_command 设 WaitMsBeforeAsync: 500, IsDaemon: false）；其余部分另发一条。",
+                    fmt,
+                )
+            if not is_bg:
+                return deny(
+                    "delegate wait/run/reply --wait blocks until colleagues finish. Rerun the same "
+                    "command alone with run_command WaitMsBeforeAsync: 500, IsDaemon: false; the "
+                    "system wakes you automatically when it exits (Reactive Wakeup), or after 50 "
+                    "minutes with a progress glance. Use start (or reply without --wait) to launch, "
+                    "then one background wait.",
+                    fmt,
+                )
+            return allow(fmt)
+        if not is_bg:
+            poll_call = foreground_delegate_poll(command)
+            if poll_call:
+                return deny(AGY_POLL_REASON, fmt)
+        return allow(fmt)
+    if is_bg:
+        return allow(fmt)
     poll_call = foreground_delegate_poll(command)
     if poll_call:
-        return deny(POLL_REASON)
+        return deny(POLL_REASON, fmt)
     calls, mixed = blocking_calls(command)
     if not calls:
-        return 0
+        return allow(fmt)
     wait_command = calls[0]
     reason = (f"把 wait 单独作为一条后台命令发出：{wait_command}；其余部分另发一条。"
               if mixed else
@@ -653,7 +760,7 @@ def main() -> int:
               "--wait) to launch, then one background wait. To look at each run as it finishes, "
               "run `wait --stream` under the Monitor tool (one notification per run), or run "
               "`wait --any` in the background and repeat it after each notification.")
-    return deny(reason)
+    return deny(reason, fmt)
 
 
 if __name__ == "__main__":

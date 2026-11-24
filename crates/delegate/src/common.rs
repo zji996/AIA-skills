@@ -30,39 +30,110 @@ pub const GUARDS: [&str; 7] = [
     "PI_DELEGATE_AGENT",
     "PI_DELEGATE_PARENT_RUN",
 ];
-/// Where the caller's session id comes from, in order: an explicit id from any harness,
-/// then the session variables Claude Code, Codex and Pi export to the commands they run.
-pub const CALLER_ENV: [&str; 4] = [
+/// Parent-controller session and Antigravity runtime variables stripped when launching
+/// colleagues so nested `agy` / Claude / Codex / Pi invocations never cross-talk with
+/// the parent controller's language server or session identity.
+pub const CONTROLLER_ENV: [&str; 10] = [
+    "ANTIGRAVITY_LS_ADDRESS",
+    "ANTIGRAVITY_CSRF_TOKEN",
+    "ANTIGRAVITY_CONVERSATION_ID",
+    "ANTIGRAVITY_TRAJECTORY_ID",
+    "ANTIGRAVITY_SOURCE_METADATA",
+    "ANTIGRAVITY_AGENT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "PI_SESSION_ID",
     "DELEGATE_CALLER",
+];
+/// Where the caller's session id comes from: an explicit id from any harness,
+/// then Antigravity (prioritized when `ANTIGRAVITY_AGENT` is active), Claude Code,
+/// Codex and Pi session variables.
+pub const CALLER_ENV: [&str; 5] = [
+    "DELEGATE_CALLER",
+    "ANTIGRAVITY_CONVERSATION_ID",
     "CLAUDE_CODE_SESSION_ID",
     "CODEX_THREAD_ID",
     "PI_SESSION_ID",
 ];
+fn env_nonempty(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+fn is_antigravity_agent_with(get: impl Fn(&str) -> Option<String>) -> bool {
+    get("ANTIGRAVITY_AGENT")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .is_some_and(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+}
 pub fn caller_source() -> Option<(String, &'static str)> {
-    CALLER_ENV.iter().find_map(|name| {
-        env::var(name)
-            .ok()
+    caller_source_with(env_nonempty)
+}
+fn caller_source_with(get: impl Fn(&str) -> Option<String>) -> Option<(String, &'static str)> {
+    let order: [&str; 5] = if is_antigravity_agent_with(&get) {
+        CALLER_ENV
+    } else {
+        [
+            "DELEGATE_CALLER",
+            "CLAUDE_CODE_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "PI_SESSION_ID",
+            "ANTIGRAVITY_CONVERSATION_ID",
+        ]
+    };
+    order.into_iter().find_map(|name| {
+        get(name)
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
-            .map(|value| (value, *name))
+            .map(|value| (value, name))
     })
 }
 pub fn caller() -> Option<String> {
     caller_source().map(|(id, _)| id)
 }
 
-fn proc_stat_ppid_ticks_tty(pid: u32) -> Option<(u32, u64, i32)> {
+fn proc_stat_state_ppid_ticks_tty(pid: u32) -> Option<(char, u32, u64, i32)> {
     let txt = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rparen = txt.rfind(')')?;
     let fields: Vec<&str> = txt.get(rparen + 2..)?.split_whitespace().collect();
     // fields[0]=state, fields[1]=ppid, fields[4]=tty_nr (field 7), fields[19]=starttime (field 22).
+    let state = fields.first()?.chars().next()?;
     let ppid = fields.get(1)?.parse::<u32>().ok()?;
     let tty_nr = fields.get(4)?.parse::<i32>().unwrap_or(0);
     let ticks = fields.get(19)?.parse::<u64>().ok()?;
-    Some((ppid, ticks, tty_nr))
+    Some((state, ppid, ticks, tty_nr))
 }
 
-fn is_harness_cmdline(pid: u32) -> bool {
+fn pid_alive_with_ticks(pid: u32, expected_ticks: Option<u64>) -> bool {
+    if !pid_alive(pid as i32) {
+        return false;
+    }
+    if let Some((state, _ppid, actual_ticks, _tty_nr)) = proc_stat_state_ppid_ticks_tty(pid) {
+        if state == 'Z' {
+            return false;
+        }
+        if let Some(exp) = expected_ticks.filter(|&t| t > 0) {
+            if actual_ticks != exp {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn pid_is_delegate_colleague(pid: u32) -> bool {
+    let Ok(raw) = fs::read(format!("/proc/{pid}/environ")) else {
+        return false;
+    };
+    raw.split(|&b| b == 0).any(|entry| {
+        entry
+            .strip_prefix(b"PI_DELEGATE_ACTIVE=")
+            .is_some_and(|v| !v.is_empty() && v != b"0")
+    })
+}
+
+fn is_harness_cmdline(pid: u32, source: Option<&str>) -> bool {
     let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
     };
@@ -78,29 +149,53 @@ fn is_harness_cmdline(pid: u32) -> bool {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(first);
-    if matches!(base, "claude" | "codex" | "pi" | "rpi") {
+    let matches_direct = match source {
+        Some("CLAUDE_CODE_SESSION_ID") => matches!(base, "claude"),
+        Some("ANTIGRAVITY_CONVERSATION_ID") => matches!(base, "agy" | "antigravity"),
+        Some("CODEX_THREAD_ID") => matches!(base, "codex"),
+        Some("PI_SESSION_ID") => matches!(base, "pi" | "rpi"),
+        _ => matches!(
+            base,
+            "claude" | "codex" | "pi" | "rpi" | "agy" | "antigravity"
+        ),
+    };
+    if matches_direct {
         return true;
     }
     if matches!(base, "node" | "bun" | "deno") {
         return tokens.iter().skip(1).take(3).any(|arg| {
             let lower = arg.to_ascii_lowercase();
-            lower.contains("claude")
-                || lower.contains("codex")
-                || lower.ends_with("/pi")
-                || lower.contains("pi-coding-agent")
+            match source {
+                Some("CLAUDE_CODE_SESSION_ID") => lower.contains("claude"),
+                Some("ANTIGRAVITY_CONVERSATION_ID") => lower.contains("antigravity"),
+                Some("CODEX_THREAD_ID") => lower.contains("codex"),
+                Some("PI_SESSION_ID") => {
+                    lower.ends_with("/pi") || lower.contains("pi-coding-agent")
+                }
+                _ => {
+                    lower.contains("claude")
+                        || lower.contains("codex")
+                        || lower.ends_with("/pi")
+                        || lower.contains("pi-coding-agent")
+                        || lower.contains("antigravity")
+                }
+            }
         });
     }
     false
 }
 
-fn find_session_harness_pid() -> Option<(u32, u64, i32)> {
+fn find_session_harness_pid(source: Option<&str>) -> Option<(u32, u64, i32)> {
+    if env::var("DELEGATE_SESSION_HARNESS_PID").ok().as_deref() == Some("0") {
+        return None;
+    }
     let mut pid = std::os::unix::process::parent_id();
     for _ in 0..8 {
         if pid <= 1 {
             break;
         }
-        let (ppid, ticks, tty_nr) = proc_stat_ppid_ticks_tty(pid)?;
-        if is_harness_cmdline(pid) {
+        let (_state, ppid, ticks, tty_nr) = proc_stat_state_ppid_ticks_tty(pid)?;
+        if is_harness_cmdline(pid, source) && !pid_is_delegate_colleague(pid) {
             return Some((pid, ticks, tty_nr));
         }
         if ppid == pid {
@@ -129,7 +224,7 @@ fn current_terminal_id(harness_tty_nr: i32) -> Option<String> {
     if harness_tty_nr != 0 {
         return Some(format!("tty:{harness_tty_nr}"));
     }
-    if let Some((_, _, self_tty)) = proc_stat_ppid_ticks_tty(std::process::id()) {
+    if let Some((_, _, _, self_tty)) = proc_stat_state_ppid_ticks_tty(std::process::id()) {
         if self_tty != 0 {
             return Some(format!("tty:{self_tty}"));
         }
@@ -143,15 +238,12 @@ fn current_cwd_canonical() -> Option<String> {
     Some(canon.to_string_lossy().into_owned())
 }
 
-/// Lock-free best-effort recording of the caller's enclosing harness PID, terminal and cwd into
-/// `<state>/sessions.json` so the Stop hook can tell whether a session is still live and
+/// Lock-free best-effort recording of the caller's activity timestamp, terminal, cwd,
+/// and enclosing harness PID (when detected) into `<state>/sessions.json` so the Stop
+/// hook can tell whether a session is still live using delegate's own timestamps and
 /// suggest `delegate adopt <run>` after `/clear` in the same terminal or working directory.
-/// Only writes when a known harness ancestor (`claude` / `codex` / `pi`) is detected.
 pub fn touch_caller_session() {
-    let Some(id) = caller() else {
-        return;
-    };
-    let Some((pid, start_ticks, tty_nr)) = find_session_harness_pid() else {
+    let Some((id, source)) = caller_source() else {
         return;
     };
     let state = state_dir();
@@ -165,19 +257,37 @@ pub fn touch_caller_session() {
     }
     let now_epoch = epoch() as i64;
     let cutoff = now_epoch - 14 * 86_400;
-    let tty = current_terminal_id(tty_nr);
+    let harness = find_session_harness_pid(Some(source));
+    let tty = current_terminal_id(harness.map_or(0, |(_, _, tty_nr)| tty_nr));
     let cwd = current_cwd_canonical();
     if let Some(map) = doc.as_object_mut() {
+        let prev = map.get(&id).cloned().unwrap_or(Value::Null);
         map.retain(|k, v| {
             k == &id
                 || iso_epoch(s(v, "lastSeenAt")).is_none_or(|ts| ts >= cutoff)
         });
         let mut rec = serde_json::json!({
-            "pid": pid,
-            "startTicks": start_ticks,
             "lastSeenAt": iso(),
         });
-        if let Some(t) = tty {
+        if let Some((pid, start_ticks, _tty_nr)) = harness {
+            rec["pid"] = serde_json::json!(pid);
+            rec["startTicks"] = serde_json::json!(start_ticks);
+        } else if let Some(prev_pid) = prev["pid"]
+            .as_u64()
+            .filter(|&p| p > 0 && p <= u32::MAX as u64)
+        {
+            let prev_ticks = prev["startTicks"].as_u64();
+            if pid_alive_with_ticks(prev_pid as u32, prev_ticks) {
+                rec["pid"] = serde_json::json!(prev_pid);
+                if let Some(ticks) = prev_ticks {
+                    rec["startTicks"] = serde_json::json!(ticks);
+                }
+            }
+        }
+        if let Some(t) = tty.or_else(|| {
+            let old = s(&prev, "tty");
+            (!old.is_empty()).then(|| old.to_string())
+        }) {
             rec["tty"] = serde_json::json!(t);
         }
         if let Some(c) = cwd {
@@ -679,6 +789,9 @@ pub fn clean_env(c: &mut Command, extra: &Value) {
     for k in GUARDS {
         c.env_remove(k);
     }
+    for k in CONTROLLER_ENV {
+        c.env_remove(k);
+    }
     // Existing host env and config env.CARGO_BUILD_JOBS no longer take effect;
     // delegate injects the derived (or explicit heavyJobs) CARGO_BUILD_JOBS instead.
     c.env_remove("CARGO_BUILD_JOBS");
@@ -1123,6 +1236,7 @@ pub fn finish_run(run: &std::path::Path, mut summary: serde_json::Value, code: i
 #[cfg(test)]
 mod git_lock_tests {
     use super::*;
+    use std::collections::HashMap;
     #[test]
     fn every_git_command_disables_optional_index_locks() {
         let command = git_command();
@@ -1130,5 +1244,77 @@ mod git_lock_tests {
             .get_envs()
             .any(|(key, value)| key == "GIT_OPTIONAL_LOCKS"
                 && value == Some(std::ffi::OsStr::new("0"))));
+    }
+
+    #[test]
+    fn caller_source_priority_respects_delegate_caller_and_antigravity_agent() {
+        let lookup = |pairs: &[(&str, &str)]| {
+            let map: HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            caller_source_with(move |k| map.get(k).cloned())
+        };
+        assert_eq!(
+            lookup(&[
+                ("DELEGATE_CALLER", "explicit"),
+                ("ANTIGRAVITY_AGENT", "1"),
+                ("ANTIGRAVITY_CONVERSATION_ID", "agy-1"),
+                ("CLAUDE_CODE_SESSION_ID", "claude-1"),
+            ]),
+            Some(("explicit".into(), "DELEGATE_CALLER"))
+        );
+        assert_eq!(
+            lookup(&[
+                ("ANTIGRAVITY_AGENT", "1"),
+                ("ANTIGRAVITY_CONVERSATION_ID", "agy-1"),
+                ("CLAUDE_CODE_SESSION_ID", "claude-1"),
+                ("CODEX_THREAD_ID", "codex-1"),
+                ("PI_SESSION_ID", "pi-1"),
+            ]),
+            Some(("agy-1".into(), "ANTIGRAVITY_CONVERSATION_ID"))
+        );
+        assert_eq!(
+            lookup(&[
+                ("ANTIGRAVITY_CONVERSATION_ID", "agy-1"),
+                ("CLAUDE_CODE_SESSION_ID", "claude-1"),
+            ]),
+            Some(("claude-1".into(), "CLAUDE_CODE_SESSION_ID"))
+        );
+        assert_eq!(
+            lookup(&[("ANTIGRAVITY_CONVERSATION_ID", "agy-only")]),
+            Some(("agy-only".into(), "ANTIGRAVITY_CONVERSATION_ID"))
+        );
+        assert_eq!(
+            lookup(&[
+                ("CODEX_THREAD_ID", "codex-1"),
+                ("PI_SESSION_ID", "pi-1"),
+            ]),
+            Some(("codex-1".into(), "CODEX_THREAD_ID"))
+        );
+        assert_eq!(
+            lookup(&[("PI_SESSION_ID", "pi-1")]),
+            Some(("pi-1".into(), "PI_SESSION_ID"))
+        );
+        assert_eq!(lookup(&[]), None);
+    }
+
+    #[test]
+    fn clean_env_strips_parent_controller_and_antigravity_vars() {
+        let mut cmd = Command::new("true");
+        clean_env(&mut cmd, &serde_json::json!({"CUSTOM_KEEP": "yes"}));
+        let envs: HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|val| val.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for key in CONTROLLER_ENV {
+            assert_eq!(envs.get(key), Some(&None), "expected {key} to be removed");
+        }
+        assert_eq!(envs.get("CUSTOM_KEEP"), Some(&Some("yes".into())));
     }
 }

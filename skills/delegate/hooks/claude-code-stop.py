@@ -82,6 +82,7 @@ KIND_LABELS = {
 APPLY_VALUE_FLAGS = {"--closes", "--message", "-m", "--work"}
 CALLER_ENV_KEYS = (
     "DELEGATE_CALLER",
+    "ANTIGRAVITY_CONVERSATION_ID",
     "CLAUDE_CODE_SESSION_ID",
     "CODEX_THREAD_ID",
     "PI_SESSION_ID",
@@ -639,14 +640,41 @@ def match_delegate_subcmd(tokens: list[str], subcmd: str) -> list[str] | None:
     return None
 
 
+def _is_antigravity_agent() -> bool:
+    val = os.environ.get("ANTIGRAVITY_AGENT", "").strip()
+    return bool(val) and val != "0" and val.lower() != "false"
+
+
+def current_caller_source(payload: dict) -> tuple[str, str]:
+    if _is_antigravity_agent():
+        order = (
+            "DELEGATE_CALLER",
+            "ANTIGRAVITY_CONVERSATION_ID",
+            "CLAUDE_CODE_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "PI_SESSION_ID",
+        )
+    else:
+        order = (
+            "DELEGATE_CALLER",
+            "CLAUDE_CODE_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "PI_SESSION_ID",
+            "ANTIGRAVITY_CONVERSATION_ID",
+        )
+    for key in order:
+        val = os.environ.get(key, "").strip()
+        if val:
+            return val, key
+    if payload.get("session_id"):
+        return str(payload.get("session_id") or "").strip(), "CLAUDE_CODE_SESSION_ID"
+    if payload.get("conversationId"):
+        return str(payload.get("conversationId") or "").strip(), "ANTIGRAVITY_CONVERSATION_ID"
+    return "", ""
+
+
 def current_caller_id(payload: dict) -> str:
-    return (
-        os.environ.get("DELEGATE_CALLER")
-        or os.environ.get("CLAUDE_CODE_SESSION_ID")
-        or os.environ.get("CODEX_THREAD_ID")
-        or os.environ.get("PI_SESSION_ID")
-        or str(payload.get("session_id") or "")
-    ).strip()
+    return current_caller_source(payload)[0]
 
 
 def get_run_caller(obj: dict) -> str:
@@ -748,7 +776,20 @@ def pid_alive_with_ticks(pid: int, expected_ticks: int | None = None) -> bool:
     return True
 
 
-def _is_harness_cmdline(pid: int) -> bool:
+def _pid_is_delegate_colleague(pid: int) -> bool:
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return False
+    for entry in raw.split(b"\x00"):
+        if entry.startswith(b"PI_DELEGATE_ACTIVE="):
+            val = entry[len(b"PI_DELEGATE_ACTIVE=") :]
+            if val and val != b"0":
+                return True
+    return False
+
+
+def _is_harness_cmdline(pid: int, source: str = "") -> bool:
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
@@ -759,24 +800,49 @@ def _is_harness_cmdline(pid: int) -> bool:
     if not tokens:
         return False
     base = os.path.basename(tokens[0])
-    if base in ("claude", "codex", "pi", "rpi"):
+    if source == "CLAUDE_CODE_SESSION_ID":
+        direct_ok = base == "claude"
+    elif source == "ANTIGRAVITY_CONVERSATION_ID":
+        direct_ok = base in ("agy", "antigravity")
+    elif source == "CODEX_THREAD_ID":
+        direct_ok = base == "codex"
+    elif source == "PI_SESSION_ID":
+        direct_ok = base in ("pi", "rpi")
+    else:
+        direct_ok = base in ("claude", "codex", "pi", "rpi", "agy", "antigravity")
+    if direct_ok:
         return True
     if base in ("node", "bun", "deno"):
         for arg in tokens[1:4]:
             low = arg.lower()
-            if (
+            if source == "CLAUDE_CODE_SESSION_ID":
+                if "claude" in low:
+                    return True
+            elif source == "ANTIGRAVITY_CONVERSATION_ID":
+                if "antigravity" in low:
+                    return True
+            elif source == "CODEX_THREAD_ID":
+                if "codex" in low:
+                    return True
+            elif source == "PI_SESSION_ID":
+                if low.endswith("/pi") or "pi-coding-agent" in low:
+                    return True
+            elif (
                 "claude" in low
                 or "codex" in low
                 or low.endswith("/pi")
                 or "pi-coding-agent" in low
+                or "antigravity" in low
             ):
                 return True
     return False
 
 
-def find_session_harness_pid() -> tuple[int, int, int] | None:
-    """Walk ancestor processes up to 8 hops to locate an enclosing Claude/Codex/Pi harness.
+def find_session_harness_pid(source: str = "") -> tuple[int, int, int] | None:
+    """Walk ancestor processes up to 8 hops to locate an enclosing controller harness.
     Returns `(pid, start_ticks, tty_nr)`."""
+    if os.environ.get("DELEGATE_SESSION_HARNESS_PID") == "0":
+        return None
     pid = os.getppid()
     for _ in range(8):
         if pid <= 1:
@@ -785,7 +851,7 @@ def find_session_harness_pid() -> tuple[int, int, int] | None:
         if stat_info is None:
             break
         _state, ppid, ticks, tty_nr = stat_info
-        if _is_harness_cmdline(pid):
+        if _is_harness_cmdline(pid, source) and not _pid_is_delegate_colleague(pid):
             return pid, ticks, tty_nr
         if ppid == pid:
             break
@@ -798,10 +864,11 @@ def touch_caller_session(
     caller_id: str,
     now: int,
     cwd: str = "",
+    caller_source: str = "",
 ) -> tuple[tuple[int, int] | None, str, str]:
     """Lock-free atomic update of `<state>/sessions.json` for the current caller.
     Returns `(cur_harness_pid_ticks, cur_tty, cur_cwd)`."""
-    harness = find_session_harness_pid()
+    harness = find_session_harness_pid(caller_source)
     harness_pt: tuple[int, int] | None = (harness[0], harness[1]) if harness is not None else None
     cur_tty = current_terminal_id(harness[2] if harness is not None else 0)
     cur_cwd = _norm_path_str(cwd) if cwd else ""
@@ -2228,8 +2295,8 @@ def evaluate(payload: dict) -> dict | None:
     cwd = str(payload.get("cwd") or os.getcwd())
     now = int(time.time())
     sdir = state_dir()
-    caller_id = current_caller_id(payload)
-    cur_harness, cur_tty, cur_cwd = touch_caller_session(sdir, caller_id, now, cwd)
+    caller_id, caller_source = current_caller_source(payload)
+    cur_harness, cur_tty, cur_cwd = touch_caller_session(sdir, caller_id, now, cwd, caller_source)
     orphan_secs = (
         _parse_pos_float_env("DELEGATE_ORPHAN_TAKEOVER_HOURS", DEFAULT_ORPHAN_TAKEOVER_HOURS)
         * 3600.0

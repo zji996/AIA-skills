@@ -478,6 +478,9 @@ pub fn age_seconds(meta: &Value) -> Option<i64> {
         .map(|started| (epoch() - started).max(0.0) as i64)
 }
 pub fn other_runs_hint(runs: &[PathBuf]) {
+    other_runs_hint_with(runs, false);
+}
+pub fn other_runs_hint_with(runs: &[PathBuf], machine: bool) {
     if runs.is_empty() {
         return;
     }
@@ -509,7 +512,12 @@ pub fn other_runs_hint(runs: &[PathBuf]) {
         .collect::<Vec<_>>()
         .join(", ");
     let more = if runs.len() > 3 { ", ..." } else { "" };
-    eprintln!("delegate: {} other runs not started by this session ({names}{more}); collect with wait --all or remove with clean <run>", runs.len());
+    let collect_cmd = if machine {
+        "wait --machine --all"
+    } else {
+        "wait --all"
+    };
+    eprintln!("delegate: {} other runs not started by this session ({names}{more}); collect with {collect_cmd} or remove with clean <run>", runs.len());
 }
 pub fn events(run: &Path) -> Vec<Value> {
     read(run.join("events.jsonl"))

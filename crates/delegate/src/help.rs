@@ -39,7 +39,7 @@ const LAUNCH: &[(&str, &str)] = &[
 const COLLECT: &[(&str, &str)] = &[
     (
         "--max DURATION",
-        "Stop waiting after this long; exit 75 if still running. Claude Code defaults to a 50m check-in when omitted.",
+        "Stop waiting after this long; exit 75 if still running. Claude Code and agy default to a 50m check-in when omitted.",
     ),
     ("--progress", "Also print writes, errors, and retries."),
     (
@@ -255,8 +255,8 @@ pub fn print(command: Option<&str>) -> bool {
         "wait" => ("[options] [runs ...]", "With no run arguments, return once the next run finishes and print its answer. Repeat the same command for the next result. With --since SEQ, wait for new events past SEQ and return the new cursor.", &[
             ("runs", "Run ids or directories. With no arguments, collect active and undelivered runs from this caller when known; otherwise collect all in this repository."),
             ("--since SEQ", "Wait on the machine-wide event stream and return only events with seq > SEQ plus the new cursor (records read cursor for Stop hook)."),
-            ("--all", "Wait for ALL selected runs (up to 50m per call); without names, select repository runs regardless of caller. Timeout lists pending names."),
-            ("--machine", "Collect active and waiting runs registered across all repositories on this machine."),
+            ("--all", "Select runs regardless of caller (including with --machine); without --any/--stream, also wait for ALL selected runs (up to 50m per call). Timeout lists pending names."),
+            ("--machine", "Collect active and waiting runs registered across all repositories on this machine for the current caller (pass --all to include all sessions)."),
             ("--json", "Print complete JSON fields instead of concise status lines. Tasks covered by another live waiter are skipped; exit 76 when all are covered."),
             ("--no-result", "Print only the outcome line."),
             ("--any", "Return once any selected run finishes or asks a question (the default for no arguments and named runs); lists every run settled since the previous wait (full answer for the first, one-line summary + result command for the rest)."),

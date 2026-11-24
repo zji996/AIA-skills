@@ -126,9 +126,10 @@ class Delegate526Tests(unittest.TestCase):
 
     def test_hook_mixed_command_and_pure_wait(self):
         hook = ROOT / "skills/delegate/hooks/claude-code-background.py"
+        hook_env = {k: v for k, v in os.environ.items() if k not in ("PI_DELEGATE_ACTIVE", "DELEGATE_AGENT")}
         def check(command):
             out = subprocess.check_output([sys.executable, str(hook)], input=json.dumps({
-                "tool_name": "Bash", "tool_input": {"command": command}}), text=True)
+                "tool_name": "Bash", "tool_input": {"command": command}}), env=hook_env, text=True)
             return json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"]
         mixed = check("$D wait --any & python3 analyze.py")
         self.assertIn("把 wait 单独作为一条后台命令发出", mixed)

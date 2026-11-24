@@ -8,7 +8,7 @@
 
 提问收尾仍回收进程，但把尚未开始的 lane 票按 label 保存原排队时间；回答后重跑同一 label 的作业先于较晚的排队者，已运行者不被抢占。浏览器测试不自动另开轻量 lane：浏览器、服务夹具与编译都可能吃内存，另开槽会隐性突破 maxHeavy/测量隔离；仍共用 heavy lane，由用户决定容量。
 
-每任务有 `waiter.lock`，持有排他 flock 并记录等待者 PID；重复 `wait` 跳过已有活等待者覆盖的任务，全被覆盖时退出 `76`，通知仍给原等待者。`--any`、`--stream`（含后续加入的任务）、`--machine` 同样处理；等待者退出或死亡时内核释放锁，旧 PID 不阻止后续等待。
+每任务有 `waiter.lock`（排他 flock + PID）；重复 `wait` 跳过已被活等待者覆盖的任务，全覆盖退出 `76`，通知给原等待者（`--any`/`--stream`/`--machine` 同理，其中 `--machine` 默认按当前 caller 过滤、`--all` 全机等；进程退出内核释放锁）。启动同事时 `clean_env` 清除父主控 `ANTIGRAVITY_*` 与会话 env；`<state>/sessions.json` 记 delegate 自身 `lastSeenAt` 供原 caller 失效判定。
 
 整机一条先进先出队列，同时放行 `DELEGATE_MAX_HEAVY` 个（默认 `max(2, (线程-2)/12)`，内存/IO 保护，`0` 不限），CPU 并发经 `<state>/jobserver.fifo` 共享令牌池（`budget − maxHeavy` 个令牌）与进程内代理 FIFO 动态按资历权重公平分配（每条保底 2，可用 `heavyJobs` 显式封顶）：验收、证据、worktree `setup`、同事与主控用 `lane` 跑的检查都在这里排队。每个排队者在 `${XDG_STATE_HOME}/delegate/lane/` 下有一张按到达时间命名的票，持有其排他 flock 直到结束；等待者阻塞在前一张票的锁上，由内核在其结束或进程死亡时唤醒，不轮询，崩溃不留死锁。已在队列内的命令（带 `DELEGATE_LANE_HELD`）再调用 `lane` 直接执行，不会等自己。
 
@@ -32,7 +32,7 @@ remote 生效时，同事的 argv0 命中 programs 就转给 `_remote`；按名�
 
 ### 后台服务回收
 
-5.19.0 起，以上回收阶段还检查项目脚本通过 `systemd-run --user` 启动、脱离任务进程组和 scope 的 service/scope；`clean` 和过期清理在删除 run/worktree 前也检查历史遗留。只查询用户实例，不按 unit 名前缀归属任务。以下任一条件足够：
+以上回收阶段还检查项目脚本通过 `systemd-run --user` 启动、脱离任务进程组和 scope 的 service/scope；`clean` 和过期清理在删除 run/worktree 前也检查历史遗留。只查询用户实例，不按 unit 名前缀归属任务。以下任一条件足够：
 
 - `Environment` 包含完整且相等的 `DELEGATE_RUN_DIR=<本轮 run 目录>`；复用进程回收的标记，支持 systemctl 的引号与 C 转义。项目脚本需用 `systemd-run --user --setenv=DELEGATE_RUN_DIR="$DELEGATE_RUN_DIR" ...` 显式传入；用户 manager 不会自动继承调用者环境。
 - 隔离 worktree 中，`WorkingDirectory` 或 `ExecStart` 的可执行文件/argv 绝对路径落在本任务 worktree 内；按路径组件判断，拒绝 `..` 和指向树外的符号链接，不解析 `sh -c` 字符串里的路径。源仓库的同名前缀服务不会命中。

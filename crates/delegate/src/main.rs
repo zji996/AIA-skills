@@ -85,6 +85,16 @@ fn output_line(run: &Path, status: serde_json::Value) -> String {
     }
 }
 
+fn default_check_in_with(get: impl Fn(&str) -> Option<String>) -> Option<f64> {
+    if get("CLAUDE_CODE_SESSION_ID").is_some_and(|v| !v.trim().is_empty())
+        || get("ANTIGRAVITY_CONVERSATION_ID").is_some_and(|v| !v.trim().is_empty())
+    {
+        Some(50.0 * 60.0)
+    } else {
+        None
+    }
+}
+
 fn check_in(max: Option<f64>, runs: &[PathBuf]) -> Option<f64> {
     if max.is_some() {
         return max;
@@ -112,11 +122,7 @@ fn check_in(max: Option<f64>, runs: &[PathBuf]) -> Option<f64> {
             seconds(&value).ok()
         };
     }
-    if env::var_os("CLAUDE_CODE_SESSION_ID").is_some_and(|v| !v.is_empty()) {
-        Some(50.0 * 60.0)
-    } else {
-        None
-    }
+    default_check_in_with(|k| env::var(k).ok())
 }
 
 fn minutes_text(seconds: i64) -> String {
@@ -801,7 +807,20 @@ fn wait_list(pos: &[String], flags: &[String], quiet: bool) -> Res<(Vec<PathBuf>
         let mut v = launch::machine_runs(&state_dir());
         v.sort();
         v.dedup();
-        return Ok((v, false));
+        let mut hinted = false;
+        if !has(flags, "--all") {
+            if let Some(caller) = caller() {
+                let (own, other): (Vec<_>, Vec<_>) = v
+                    .into_iter()
+                    .partition(|run| json(run.join("meta.json"))["caller"].as_str() == Some(&caller));
+                if !quiet {
+                    runs::other_runs_hint_with(&other, true);
+                }
+                hinted = !other.is_empty();
+                v = own;
+            }
+        }
+        return Ok((v, hinted));
     }
     if !pos.is_empty() {
         return Ok((
@@ -1909,6 +1928,7 @@ fn apply(args: &[String]) -> Res<i32> {
         written_files: Vec<String>,
         regenerated_files: Vec<String>,
         had_dirty_merge: bool,
+        already_applied: bool,
     }
     let mut done: Vec<DoneApply> = Vec::new();
     let mut applied_runs = Vec::new();
@@ -1926,7 +1946,7 @@ fn apply(args: &[String]) -> Res<i32> {
             commit_mode,
             has(&flags, "--allow-dirty-overlap"),
         )?;
-        if !dry && run.join(".applied").exists() {
+        if !outcome.already_applied && !dry && run.join(".applied").exists() {
             if !applied_runs.contains(run) {
                 applied_runs.push(run.clone());
             }
@@ -1965,7 +1985,7 @@ fn apply(args: &[String]) -> Res<i32> {
                 }
             }
         }
-        if outcome.code == 0 {
+        if outcome.code == 0 && (!outcome.already_applied || (forced == Some(true) && !dry)) {
             for command in worktree::verify_plan(run, forced, &mut outcome.conclusion)? {
                 if !plan.contains(&command) {
                     plan.push(command);
@@ -1984,6 +2004,7 @@ fn apply(args: &[String]) -> Res<i32> {
             written_files: outcome.written_files,
             regenerated_files: outcome.regenerated_files,
             had_dirty_merge: outcome.had_dirty_merge,
+            already_applied: outcome.already_applied,
         });
         if code != 0 {
             break;
@@ -2002,6 +2023,9 @@ fn apply(args: &[String]) -> Res<i32> {
     if code == 0 && !dry && commit_mode {
         let mut sources = Vec::<String>::new();
         for item in &done {
+            if item.already_applied {
+                continue;
+            }
             if !item.source.is_empty() && !sources.contains(&item.source) {
                 sources.push(item.source.clone());
             }
@@ -2013,7 +2037,7 @@ fn apply(args: &[String]) -> Res<i32> {
             let mut dirty_merge = false;
             let mut indices = Vec::new();
             for (idx, item) in done.iter().enumerate() {
-                if item.source != src {
+                if item.already_applied || item.source != src {
                     continue;
                 }
                 indices.push(idx);
@@ -2081,6 +2105,17 @@ fn apply(args: &[String]) -> Res<i32> {
         let run = &item.run;
         let conclusion = &item.conclusion;
         let commands = &item.commands;
+        if item.already_applied {
+            let run_id = s(conclusion, "run");
+            let at = s(&conclusion["apply"], "appliedAt");
+            if output::json_enabled() {
+                println!("{}", format_status(conclusion.clone()));
+                eprintln!("delegate: {run_id} 已于 {at} 合入");
+            } else {
+                println!("{run_id} 已于 {at} 合入");
+            }
+            continue;
+        }
         let final_line = if conclusion["acceptStillValid"] == json!(true) {
             "验收仍然有效（仓库快照范围）".to_string()
         } else if conclusion["apply"]["ok"] == json!(true)
@@ -2425,6 +2460,9 @@ fn apply(args: &[String]) -> Res<i32> {
     }
     if code == 0 && !dry && !output::json_enabled() {
         for item in &done {
+            if item.already_applied {
+                continue;
+            }
             let mut touched = std::collections::BTreeSet::<&str>::new();
             for p in &item.written_files {
                 touched.insert(p.as_str());
@@ -2474,7 +2512,7 @@ fn apply(args: &[String]) -> Res<i32> {
         //    reply, no `.generate-pending`, and no unread truncated result).
         //    Otherwise keep lightweight `.applied-cleaned` and stage worktree removal to trash.
         for item in &done {
-            if !worktree::clean_on_apply(&item.run) {
+            if item.already_applied || !worktree::clean_on_apply(&item.run) {
                 continue;
             }
             let sum = json(item.run.join("summary.json"));
@@ -2740,17 +2778,18 @@ fn main_inner(args: &[String]) -> Res<i32> {
             if has(&flags, "--machine") && !pos.is_empty() {
                 return Err("--machine does not take run arguments".into());
             }
-            let (explicit_any, stream, until_all) = (
+            let (explicit_any, stream, explicit_until_all) = (
                 has(&flags, "--any"),
                 has(&flags, "--stream"),
-                has(&flags, "--until-all") || has(&flags, "--all"),
+                has(&flags, "--until-all"),
             );
             if explicit_any && stream {
                 return Err("--any and --stream cannot be combined".into());
             }
-            if until_all && (explicit_any || stream) {
+            if explicit_until_all && (explicit_any || stream) {
                 return Err("--until-all cannot be combined with --any or --stream".into());
             }
+            let until_all = explicit_until_all || (has(&flags, "--all") && !explicit_any && !stream);
             // Named waits have the same first-completion semantics as the default wait;
             // use --until-all when the caller needs every selected run.
             let any = !until_all && (explicit_any || !stream);
@@ -3656,5 +3695,27 @@ fn main() {
             eprintln!("delegate: {e}");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod check_in_tests {
+    use super::*;
+
+    #[test]
+    fn default_check_in_enabled_for_claude_and_antigravity_sessions() {
+        assert_eq!(default_check_in_with(|_| None), None);
+        assert_eq!(
+            default_check_in_with(|k| (k == "CLAUDE_CODE_SESSION_ID").then(|| "c-1".into())),
+            Some(3000.0)
+        );
+        assert_eq!(
+            default_check_in_with(|k| (k == "ANTIGRAVITY_CONVERSATION_ID").then(|| "a-1".into())),
+            Some(3000.0)
+        );
+        assert_eq!(
+            default_check_in_with(|k| (k == "ANTIGRAVITY_CONVERSATION_ID").then(|| "   ".into())),
+            None
+        );
     }
 }

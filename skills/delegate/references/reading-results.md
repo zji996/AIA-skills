@@ -35,8 +35,8 @@ state 通常描述答复。普通只读写文件仍是 `answered`（`--shell` �
 ## 等待的细节
 
 - 每任务只允许一个等待者；已有活等待者时跳过，全被覆盖退出 `76`，通知给原等待者。上下文压缩后旧等待者可能仍占着，此时用 `status` 看结局、`result <name>` 读答复，不必再等。
-- 无参 `wait` 只收本会话，无会话标识时收全部；`--all` 收本仓库全部并等齐，`--machine` 收整机；无参及带名字的 `wait`/`wait --any` 在任一任务进入终态或提问态时返回（不以主控 stop 唤醒），列出上次 wait 之后所有已结束与提问的 run（首个给全文，其余给一行摘要加 `result` 查看命令），旧交付首行说明；`--all` 或 `--until-all` 等范围内全部结束（单次最多 50 分钟，超时列仍在跑的 run）。6.21.x 遗留的 `--after` 等待任务会标为「需要重派」并给出重派命令，不会静默挂住。
-- 宿主能把后台进程的每行输出变成事件时（Claude Code 的 Monitor）可用 `wait --stream`。宿主没有完成唤醒时不会自动收到结果：在自己的步骤之间用 `wait --max 4m` 主动收取，返回 `75` 后再等。Claude Code 的 `hooks/claude-code-background.py` 可拒绝前台等待。
+- 无参 `wait` 与 `wait --machine` 默认只收本会话（识别 `DELEGATE_CALLER`、`ANTIGRAVITY_CONVERSATION_ID`、`CLAUDE_CODE_SESSION_ID`、`CODEX_THREAD_ID`、`PI_SESSION_ID`），无会话标识收全部；`--all` 放开跨会话过滤并等齐（与 `--any`/`--stream` 同用仅放开过滤）；`wait`/`wait --any` 任一任务终态或提问即返回（首个全文，其余一行摘要加 `result` 命令），`--all`/`--until-all` 等齐（单次最多 50m）。
+- 后台唤醒：Claude Code 用 `run_in_background` 或 Monitor + `wait --stream`；`agy` 主控用 `run_command` 设 `WaitMsBeforeAsync: 500, IsDaemon: false` 单独放后台；无唤醒宿主用 `wait --max 4m` 轮次收取。`hooks/claude-code-background.py`（支持 Claude 与 `agy`）拦前台等待、混跑、轮询、`pgrep -f` 与 `git prune`（同事仅放行 wait 规则，保留 `git prune`）。
 - 脚本加 `--json`：`completionTiming` 区分旧结果与等待中新完成，`sourceDrift.overlap` 提示源改动重叠。
 - 只看过截断答复的任务 `clean --finished` 会保留，读过全文（`result <name>`）或加 `--force` 才删。
 
@@ -50,6 +50,6 @@ state 通常描述答复。普通只读写文件仍是 `answered`（`--shell` �
 2. **只读**：git 仓库里默认读启动时的工作区快照（独立 worktree，含未提交改动），你可以同时改代码；要读实时工作区加 `--in-place`。Pi 默认只给读取/搜索工具；加 `--shell` 才能在快照里查日志/跑只读查询，产生文件改动会拒收；非 git 或 `--in-place` 不支持 shell。只读靠约定与事后核对，不是权限沙箱。
 3. **写入**：原地写入同一目录同时只能有一个，且你同时改的文件会算进它的改动；要并行或不想被打扰就加 `--worktree`。同源已有写入任务在运行时，不带 `--worktree` 的写入任务会自动改用 worktree，把源工作区留给你 apply；`apply` 时如果有原地写入任务正在改源工作区，会警告。
 4. **worktree 依赖与验收**：`worktree.copy` 复制忽略材料，或用 `link`/`setup`（`writeSetup` 仅写入）；缺源/空源带 `warnings`。`env` 注入同事、验收、证据和 setup；`accept`/`evidence` 是写入默认，只读不用；CLI 覆盖或关闭。合并后主干默认复验验收没法沿用的任务，`applyVerify: false` 关闭。别 link `node_modules`/`.venv`。
-5. **超时与停滞**：没有默认 agent timeout，验收也默认不设超时；显式 `--timeout` / `--accept-timeout`（或 `.delegate.json` `acceptTimeout`）才按不含排队时间执行。stall guard 默认空闲 30m、单命令 90m、验收无输出 10m，可用 `stall`/`DELEGATE_STALL_*` 配置（`0` 关闭），只发同事不可见的 `stall_warning` 不强杀，仅显式 `stop` 终止；历史停滞或显式超时后 `reply` 续做不耗返工次数。Claude Code 的 wait 默认 50m 检查一次，控制器在 1 小时提示缓存内醒来后重跑打印的命令。
+5. **超时与停滞**：没有默认 agent timeout，验收也默认不设超时；显式 `--timeout` / `--accept-timeout`（或 `.delegate.json` `acceptTimeout`）才按不含排队时间执行。stall guard 默认空闲 30m、单命令 90m、验收无输出 10m，可用 `stall`/`DELEGATE_STALL_*` 配置（`0` 关闭），只发同事不可见的 `stall_warning` 不强杀，仅显式 `stop` 终止；历史停滞或显式超时后 `reply` 续做不耗返工次数。Claude Code 与 `agy`（`ANTIGRAVITY_CONVERSATION_ID`）的 wait 均默认 50m 检查一次，控制器在 1 小时提示缓存内醒来后重跑打印的命令。
 
 命令与全部选项见 `$D --help`；run 目录、文件、环境变量与清理策略见 [references/output-and-files.md](output-and-files.md)。

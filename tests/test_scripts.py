@@ -728,9 +728,10 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("every-session baseline: ~12 tokens", result.stdout)
 
     def test_background_hook_denies_only_foreground_blocking_delegate_calls(self):
+        hook_env = {k: v for k, v in os.environ.items() if k not in ("PI_DELEGATE_ACTIVE", "DELEGATE_AGENT")}
         def decision(command, background=False, tool="Bash"):
             payload = json.dumps({"tool_name": tool, "tool_input": {"command": command, "run_in_background": background}})
-            result = subprocess.run([sys.executable, str(BACKGROUND_HOOK)], input=payload, capture_output=True, text=True)
+            result = subprocess.run([sys.executable, str(BACKGROUND_HOOK)], input=payload, env=hook_env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             return json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] if result.stdout else "allow"
 
@@ -749,9 +750,10 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(decision(f"{d} wait", tool="Read"), "allow")
 
     def test_background_hook_reply_message_is_not_command_or_option(self):
+        hook_env = {k: v for k, v in os.environ.items() if k not in ("PI_DELEGATE_ACTIVE", "DELEGATE_AGENT")}
         def denied(command):
             result = subprocess.run([sys.executable, str(BACKGROUND_HOOK)], input=json.dumps({
-                "tool_name": "Bash", "tool_input": {"command": command}}), capture_output=True, text=True)
+                "tool_name": "Bash", "tool_input": {"command": command}}), env=hook_env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             return bool(result.stdout)
         for invocation in ("$D", "${D}", "/skills/delegate/bin/delegate"):
@@ -894,6 +896,7 @@ class ScriptTests(unittest.TestCase):
             self.assertEqual(run_hook(cmd, repo_plain)[0], "allow", cmd)
 
     def test_background_hook_denies_foreground_delegate_polling_and_allows_bounded_retries(self):
+        hook_env = {k: v for k, v in os.environ.items() if k not in ("PI_DELEGATE_ACTIVE", "DELEGATE_AGENT")}
         def run_hook(command, background=False):
             payload = json.dumps({
                 "tool_name": "Bash",
@@ -901,7 +904,7 @@ class ScriptTests(unittest.TestCase):
             })
             result = subprocess.run(
                 [sys.executable, str(BACKGROUND_HOOK)],
-                input=payload, capture_output=True, text=True,
+                input=payload, env=hook_env, capture_output=True, text=True,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             if not result.stdout:

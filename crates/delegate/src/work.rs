@@ -268,6 +268,7 @@ pub struct AutoDispatch {
     pub cwd: String,
     pub repo: String,
     pub runs_dir: String,
+    pub caller: String,
     pub dispatched_run: String,
 }
 
@@ -286,6 +287,7 @@ impl AutoDispatch {
             cwd: s(v, "cwd").to_string(),
             repo: s(v, "repo").to_string(),
             runs_dir: s(v, "runsDir").to_string(),
+            caller: s(v, "caller").to_string(),
             dispatched_run: s(v, "dispatchedRun").to_string(),
         })
     }
@@ -299,6 +301,9 @@ impl AutoDispatch {
         });
         if !self.runs_dir.is_empty() {
             obj["runsDir"] = json!(self.runs_dir);
+        }
+        if !self.caller.is_empty() {
+            obj["caller"] = json!(self.caller);
         }
         if !self.dispatched_run.is_empty() {
             obj["dispatchedRun"] = json!(self.dispatched_run);
@@ -2891,6 +2896,14 @@ fn dispatch_work_auto(item: &WorkItem, ad: &AutoDispatch) -> Res<String> {
     }
     if !ad.runs_dir.is_empty() {
         cmd.env("DELEGATE_RUNS", &ad.runs_dir);
+    }
+    let effective_caller = if !ad.caller.is_empty() {
+        ad.caller.as_str()
+    } else {
+        item.caller.as_str()
+    };
+    if !effective_caller.is_empty() {
+        cmd.env("DELEGATE_CALLER", effective_caller);
     }
     let out = cmd.output().map_err(|e| format!("spawn delegate start: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -6484,6 +6497,7 @@ fn build_auto_dispatch(brief: &str, start_args: &[String], repo: &str) -> Res<Au
         cwd: cwd.to_string_lossy().into_owned(),
         repo: repo.to_string(),
         runs_dir,
+        caller: caller().unwrap_or_default(),
         dispatched_run: String::new(),
     })
 }
@@ -9540,6 +9554,7 @@ mod tests {
                 cwd: repo.into(),
                 repo: repo.into(),
                 runs_dir: String::new(),
+                caller: String::new(),
                 dispatched_run: String::new(),
             }),
             created_at: state_since.into(),
