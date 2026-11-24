@@ -38,6 +38,8 @@ class DelegateApplySafetyTests(unittest.TestCase):
     outcome = fixtures.DelegateTests.outcome
     repo = fixtures.DelegateTests.repo
     until = fixtures.DelegateTests.until
+    wait_json = fixtures.DelegateTests.wait_json
+    wait_gone = fixtures.DelegateTests.wait_gone
 
     def state_dir(self) -> Path:
         return Path(self.env["XDG_STATE_HOME"]) / "delegate"
@@ -197,8 +199,9 @@ class DelegateApplySafetyTests(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_2_adopt_rewrites_entire_reply_chain_and_emits_event(self):
         repo = self.repo({"a.txt": "v0\n"})
-        old_sid = "sess-before-clear"
-        new_sid = "sess-after-clear"
+        uniq = f"{os.getpid()}-{time.monotonic_ns()}"
+        old_sid = f"sess-before-clear-{uniq}"
+        new_sid = f"sess-after-clear-{uniq}"
         old_env = self.clean_caller_env({"CLAUDE_CODE_SESSION_ID": old_sid})
         new_env = self.clean_caller_env({"CLAUDE_CODE_SESSION_ID": new_sid})
 
@@ -261,8 +264,9 @@ class DelegateApplySafetyTests(unittest.TestCase):
 
     def test_2b_stop_hook_hints_adopt_for_dead_caller_in_same_cwd_or_terminal_or_clear(self):
         repo = self.repo({"a.txt": "v0\n"})
-        old_sid = "sess-old-clear"
-        new_sid = "sess-new-clear"
+        uniq = f"{os.getpid()}-{time.monotonic_ns()}"
+        old_sid = f"sess-old-clear-{uniq}"
+        new_sid = f"sess-new-clear-{uniq}"
         old_env = self.clean_caller_env({"CLAUDE_CODE_SESSION_ID": old_sid})
         new_env = self.clean_caller_env({"CLAUDE_CODE_SESSION_ID": new_sid})
 
@@ -274,7 +278,9 @@ class DelegateApplySafetyTests(unittest.TestCase):
                 old_env,
             )
         )
-        self.until(lambda: (Path(r["dir"]) / "exit_code").exists(), "clear-run finished")
+        run_dir = Path(r["dir"])
+        self.until(lambda: (run_dir / "exit_code").exists(), "clear-run finished")
+        self.wait_gone(run_dir / "pid", "clear-run supervisor exited")
 
         sdir = self.state_dir()
         sdir.mkdir(parents=True, exist_ok=True)
@@ -430,9 +436,9 @@ class DelegateApplySafetyTests(unittest.TestCase):
             self.cli("run", "--worktree", "--workdir", repo, "--name", "warm", "--accept", accept_script, "warm")
         )
         pm_wt = self._premerge_wt_dir(repo)
-        self.until(
-            lambda: (Path(r_warm["dir"]) / "premerge.json").is_file()
-            and json.loads((Path(r_warm["dir"]) / "premerge.json").read_text())["status"] == "ready",
+        self.wait_json(
+            Path(r_warm["dir"]) / "premerge.json",
+            lambda d: d.get("status") == "ready",
             "warm premerge ready",
             timeout=25,
         )
@@ -447,9 +453,9 @@ class DelegateApplySafetyTests(unittest.TestCase):
         )
         run_dir = Path(r_feat["dir"])
         run_wt = Path(r_feat["worktree"])
-        self.until(
-            lambda: (run_dir / "premerge.json").is_file()
-            and json.loads((run_dir / "premerge.json").read_text())["status"] == "ready",
+        self.wait_json(
+            run_dir / "premerge.json",
+            lambda d: d.get("status") == "ready",
             "initial reused premerge ready",
             timeout=25,
         )
@@ -475,10 +481,9 @@ class DelegateApplySafetyTests(unittest.TestCase):
 
         # Wake worker via `status`.
         self.cli("status", r_feat["run"], cwd=repo)
-        self.until(
-            lambda: (run_dir / "premerge.json").is_file()
-            and json.loads((run_dir / "premerge.json").read_text()).get("baseHead") == new_head
-            and json.loads((run_dir / "premerge.json").read_text()).get("status") == "ready",
+        self.wait_json(
+            run_dir / "premerge.json",
+            lambda d: d.get("baseHead") == new_head and d.get("status") == "ready",
             "healed premerge ready on new head",
             timeout=25,
         )
@@ -524,9 +529,9 @@ class DelegateApplySafetyTests(unittest.TestCase):
         )
         run_dir = Path(r["dir"])
         pm_wt = self._premerge_wt_dir(repo)
-        self.until(
-            lambda: (run_dir / "premerge.json").is_file()
-            and json.loads((run_dir / "premerge.json").read_text())["status"] == "ready",
+        self.wait_json(
+            run_dir / "premerge.json",
+            lambda d: d.get("status") == "ready",
             "initial premerge ready",
             timeout=25,
         )
@@ -544,10 +549,9 @@ class DelegateApplySafetyTests(unittest.TestCase):
         new_head = self.git(repo, "rev-parse", "HEAD")
 
         self.cli("status", r["run"], cwd=repo)
-        self.until(
-            lambda: (run_dir / "premerge.json").is_file()
-            and json.loads((run_dir / "premerge.json").read_text()).get("baseHead") == new_head
-            and json.loads((run_dir / "premerge.json").read_text()).get("status") == "failed",
+        self.wait_json(
+            run_dir / "premerge.json",
+            lambda d: d.get("baseHead") == new_head and d.get("status") == "failed",
             "second failure reports premerge_failed",
             timeout=25,
         )
@@ -597,9 +601,9 @@ class DelegateApplySafetyTests(unittest.TestCase):
             self.cli("run", "--worktree", "--workdir", repo, "--name", "gen-warm", "--accept", "true", "warm")
         )
         pm_wt = self._premerge_wt_dir(repo)
-        self.until(
-            lambda: (Path(r_warm["dir"]) / "premerge.json").is_file()
-            and json.loads((Path(r_warm["dir"]) / "premerge.json").read_text())["status"] == "ready",
+        self.wait_json(
+            Path(r_warm["dir"]) / "premerge.json",
+            lambda d: d.get("status") == "ready",
             "warm premerge ready",
             timeout=25,
         )
@@ -623,9 +627,9 @@ class DelegateApplySafetyTests(unittest.TestCase):
             self.cli("run", "--worktree", "--workdir", repo, "--name", "gen-heal", "--accept", "true", "edit schema")
         )
         run_dir = Path(r_gen["dir"])
-        self.until(
-            lambda: (run_dir / "premerge.json").is_file()
-            and json.loads((run_dir / "premerge.json").read_text())["status"] == "ready",
+        self.wait_json(
+            run_dir / "premerge.json",
+            lambda d: d.get("status") == "ready",
             "generate cache-healed premerge ready",
             timeout=25,
         )

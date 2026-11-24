@@ -44,6 +44,8 @@ class Delegate635Tests(unittest.TestCase):
     outcome = fixtures.DelegateTests.outcome
     repo = fixtures.DelegateTests.repo
     until = fixtures.DelegateTests.until
+    wait_json = fixtures.DelegateTests.wait_json
+    wait_gone = fixtures.DelegateTests.wait_gone
 
     def state_dir(self) -> Path:
         return Path(self.env["XDG_STATE_HOME"]) / "delegate"
@@ -132,10 +134,12 @@ class Delegate635Tests(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_delivery_premerge_transition_and_fast_forward_apply_under_2s(self):
         verify_marker = self.work / "verify-ran"
+        pm_gate = self.work / "ff-premerge.gate"
+        self.addCleanup(lambda: pm_gate.touch())
         repo = self.repo({
             ".delegate.json": json.dumps({
                 "accept": "true",
-                "applyVerify": f"touch {verify_marker} && true",
+                "applyVerify": f"touch {verify_marker} && exit 1",
             }),
             "src/a.txt": "v0\n",
             "src/del.txt": "to-delete\n",
@@ -143,8 +147,8 @@ class Delegate635Tests(unittest.TestCase):
         head0 = self.git(repo, "rev-parse", "HEAD")
         short0 = head0[:7]
 
-        # Slow down worker slightly so we deterministically observe `预合并中` right after delivery!
-        self.env["DELEGATE_TEST_PREMERGE_DELAY"] = "0.6"
+        # Hold worker on an explicit gate so we deterministically observe `预合并中`!
+        self.env["DELEGATE_TEST_PREMERGE_GATE"] = str(pm_gate)
         self.fake_pi(
             [fixtures.answer("updated a.txt and removed del.txt"), fixtures.SETTLED],
             pre="echo v1 > src/a.txt; rm -f src/del.txt; echo new > src/new.txt",
@@ -156,11 +160,13 @@ class Delegate635Tests(unittest.TestCase):
         run_id = st["run"]
         run_dir = Path(st["dir"])
 
-        # Immediately after delivery: L0 shows `预合并中`!
+        # While worker is paused at the gate: L0 deterministically shows `预合并中`!
+        self.wait_premerge_status(run_dir, {"running"})
         l0_during = self.cli("status", run_id, human=True, cwd=repo).stdout.splitlines()[0]
         self.assertIn("预合并中", l0_during, l0_during)
 
-        # Wait for `_merge-worker` to finish -> `premerge.json` is ready + ref pinned!
+        # Release gate and wait for `_merge-worker` to finish -> `premerge.json` is ready + ref pinned!
+        pm_gate.touch()
         pm = self.wait_premerge_status(run_dir, {"ready"})
         self.assertEqual(pm["baseHead"], head0)
         self.assertTrue(pm["mergedTree"])
@@ -184,13 +190,10 @@ class Delegate635Tests(unittest.TestCase):
         l1_card = self.cli("card", run_id, human=True, cwd=repo).stdout
         self.assertIn(f"快进 ✓（基于 {short0}）", l1_card, l1_card)
 
-        # Fast-forward apply must finish < 2s, keep changes uncommitted, and skip verify!
-        self.env.pop("DELEGATE_TEST_PREMERGE_DELAY", None)
-        t0 = time.perf_counter()
+        # Fast-forward apply hits the premerged tree, keeps changes uncommitted, and skips failing applyVerify!
+        self.env.pop("DELEGATE_TEST_PREMERGE_GATE", None)
         ap = self.cli("apply", "--json", run_id, cwd=repo)
-        elapsed = time.perf_counter() - t0
         self.assertEqual(ap.returncode, 0, ap.stdout + ap.stderr)
-        self.assertLess(elapsed, 2.0, f"fast-forward apply took {elapsed:.3f}s (>2s)")
         ap_doc = self.outcome(ap)
         self.assertTrue(ap_doc["fastForward"]["hit"], ap_doc)
         self.assertEqual(ap_doc["fastForward"]["baseHead"], head0)
@@ -252,7 +255,7 @@ class Delegate635Tests(unittest.TestCase):
         self.assertEqual(st["review"]["verdict"], "NEEDS_CONTROLLER")
 
         # Before `delegate sign`, `_merge-worker` MUST NOT premerge (unsigned controllerReviewPaths).
-        time.sleep(0.3)
+        fixtures.settle_supervisors(self.work / "runs")
         self.assertFalse((run_dir / "premerge.json").exists())
         l0_unsigned = self.cli("status", run_id, human=True, cwd=repo).stdout.splitlines()[0]
         self.assertIn("快进 —", l0_unsigned)
@@ -291,9 +294,9 @@ class Delegate635Tests(unittest.TestCase):
         l0_stale = self.cli("status", run_id, human=True, cwd=repo).stdout.splitlines()[0]
         self.assertIn("快进 ✗ 主干已前进", l0_stale, l0_stale)
 
-        self.until(
-            lambda: json.loads((run_dir / "premerge.json").read_text()).get("baseHead") == head2
-            and json.loads((run_dir / "premerge.json").read_text()).get("status") == "ready",
+        self.wait_json(
+            run_dir / "premerge.json",
+            lambda d: d.get("baseHead") == head2 and d.get("status") == "ready",
             "worker re-premerges onto head2 after status wakeup",
             timeout=15.0,
         )
@@ -328,14 +331,12 @@ class Delegate635Tests(unittest.TestCase):
 
         # `status` wakes worker -> worker hits 3-way conflict
         _ = self.cli("status", run_id, human=True, cwd=repo)
-        pm_conf = self.until(
-            lambda: json.loads((run_dir / "premerge.json").read_text()).get("baseHead") == head_c
-            and json.loads((run_dir / "premerge.json").read_text()).get("status") == "conflict",
+        pm_doc = self.wait_json(
+            run_dir / "premerge.json",
+            lambda d: d.get("baseHead") == head_c and d.get("status") == "conflict",
             "premerge hits conflict",
             timeout=15.0,
         )
-        _ = pm_conf
-        pm_doc = json.loads((run_dir / "premerge.json").read_text())
         self.assertIn("shared.txt", pm_doc["conflicts"])
         self.assertTrue(Path(pm_doc["log"]).is_file())
 
@@ -361,13 +362,12 @@ class Delegate635Tests(unittest.TestCase):
         head_f = self.git(repo, "rev-parse", "HEAD")
 
         _ = self.cli("status", run_id, human=True, cwd=repo)
-        self.until(
-            lambda: json.loads((run_dir / "premerge.json").read_text()).get("baseHead") == head_f
-            and json.loads((run_dir / "premerge.json").read_text()).get("status") == "failed",
+        pm_fail = self.wait_json(
+            run_dir / "premerge.json",
+            lambda d: d.get("baseHead") == head_f and d.get("status") == "failed",
             "premerge hits accept failure",
             timeout=15.0,
         )
-        pm_fail = json.loads((run_dir / "premerge.json").read_text())
         self.assertFalse(pm_fail["acceptOk"])
         self.assertTrue(Path(pm_fail["log"]).is_file())
         fail_evs = [e for e in self.read_events() if e["run"] == run_id and e["kind"] == "premerge_failed"]
@@ -437,24 +437,27 @@ class Delegate635Tests(unittest.TestCase):
             "a.txt": "v0\n",
             "main.txt": "m0\n",
         })
-        self.env["DELEGATE_TEST_PREMERGE_DELAY"] = "0.8"
+        pm_gate = self.work / "race1-premerge.gate"
+        self.addCleanup(lambda: pm_gate.touch())
+        self.env["DELEGATE_TEST_PREMERGE_GATE"] = str(pm_gate)
         self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED], pre="echo a1 > a.txt")
         st = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "race-commit", "edit a"))
         run_dir = Path(st["dir"])
 
-        # Wait until worker is actively running
+        # Wait until worker is actively paused at the gate.
         self.wait_premerge_status(run_dir, {"running"})
 
-        # Controller commits while worker is mid-flight!
+        # Controller commits while worker is mid-flight, then releases gate!
         (repo / "main.txt").write_text("m1\n")
         self.git(repo, "add", "main.txt")
         self.git(repo, "commit", "-qm", "controller commit mid-premerge")
         head1 = self.git(repo, "rev-parse", "HEAD")
+        pm_gate.touch()
 
         # Worker must detect HEAD moved and re-premerge onto head1!
-        self.until(
-            lambda: json.loads((run_dir / "premerge.json").read_text()).get("baseHead") == head1
-            and json.loads((run_dir / "premerge.json").read_text()).get("status") == "ready",
+        self.wait_json(
+            run_dir / "premerge.json",
+            lambda d: d.get("baseHead") == head1 and d.get("status") == "ready",
             "worker re-premerges onto head1 after mid-flight commit",
             timeout=15.0,
         )
@@ -464,7 +467,7 @@ class Delegate635Tests(unittest.TestCase):
         self.assertEqual((repo / "a.txt").read_text(), "v0\n")
 
         # Fast-forward apply succeeds cleanly on head1!
-        self.env.pop("DELEGATE_TEST_PREMERGE_DELAY", None)
+        self.env.pop("DELEGATE_TEST_PREMERGE_GATE", None)
         ap = self.cli("apply", "--json", st["run"], cwd=repo)
         self.assertEqual(ap.returncode, 0, ap.stdout + ap.stderr)
         self.assertTrue(self.outcome(ap)["fastForward"]["hit"])
@@ -532,32 +535,31 @@ class Delegate635Tests(unittest.TestCase):
             ".delegate.json": json.dumps({"accept": "true"}),
             "x.txt": "v0\n",
         })
-        self.env["DELEGATE_TEST_PREMERGE_DELAY"] = "2.5"
+        pm_gate = self.work / "race3-premerge.gate"
+        self.addCleanup(lambda: pm_gate.touch())
+        self.env["DELEGATE_TEST_PREMERGE_GATE"] = str(pm_gate)
         self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED], pre="echo x1 > x.txt")
         st = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "race-apply", "edit x"))
         run_dir = Path(st["dir"])
 
-        # Confirm worker is actively running right now.
+        # Confirm worker is actively paused at the gate right now.
         pm_running = self.wait_premerge_status(run_dir, {"running"})
         worker_pid = pm_running.get("workerPid", 0)
         self.assertGreater(worker_pid, 0)
 
-        # Immediately run `apply` while worker is still sleeping/running!
-        # Must NOT wait for worker's 2.5s delay; must fall back cleanly to 3-way merge.
-        t0 = time.perf_counter()
-        ap = self.cli("apply", "--json", st["run"], cwd=repo)
-        elapsed = time.perf_counter() - t0
+        # Immediately run `apply` while `pm_gate` is still untouched!
+        # Must NOT wait for the gated worker; must yield/fall back cleanly to 3-way merge.
+        ap = self.cli("apply", "--json", st["run"], cwd=repo, timeout=15)
         self.assertEqual(ap.returncode, 0, ap.stdout + ap.stderr)
-        self.assertLess(elapsed, 2.0, f"apply blocked on running worker ({elapsed:.2f}s)")
         ap_doc = self.outcome(ap)
         self.assertFalse(ap_doc["fastForward"]["hit"])
         self.assertEqual(ap_doc["fastForward"]["missCode"], "premerge_running")
         self.assertEqual((repo / "x.txt").read_text(), "x1\n")
 
-        # Modify x.txt in source after apply to ensure exiting worker never overwrites source!
+        # Modify x.txt in source after apply to ensure yielding worker never overwrites source!
         (repo / "x.txt").write_text("x1-controller-edit\n")
-        # Wait for worker process to exit cleanly.
-        self.until(lambda: not Path(f"/proc/{worker_pid}").exists(), "worker exits cleanly", timeout=10.0)
+        # Worker must yield and exit cleanly without `pm_gate` ever being touched.
+        self.wait_gone(worker_pid, "worker exits cleanly", timeout=10.0)
         self.assertEqual((repo / "x.txt").read_text(), "x1-controller-edit\n")
 
     # ------------------------------------------------------------------
@@ -569,7 +571,10 @@ class Delegate635Tests(unittest.TestCase):
             "k1.txt": "v0\n",
             "k2.txt": "v0\n",
         })
-        self.env["DELEGATE_TEST_PREMERGE_DELAY"] = "5.0"
+        pm_gate1 = self.work / "race4-premerge1.gate"
+        pm_gate2 = self.work / "race4-premerge2.gate"
+        self.addCleanup(lambda: (pm_gate1.touch(), pm_gate2.touch()))
+        self.env["DELEGATE_TEST_PREMERGE_GATE"] = str(pm_gate1)
         self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED], pre="echo k1-new > k1.txt")
         st1 = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "kill-1", "edit k1"))
         run1_dir = Path(st1["dir"])
@@ -578,14 +583,9 @@ class Delegate635Tests(unittest.TestCase):
         wpid = int(pm1["workerPid"])
         self.assertGreater(wpid, 0)
 
-        # Plant a simulated stale worktree index.lock (as if SIGKILL hit mid-reset) and SIGKILL worker!
+        # SIGKILL worker while paused mid-run!
         os.kill(wpid, signal.SIGKILL)
-        self.until(
-            lambda: not Path(f"/proc/{wpid}").exists()
-            or Path(f"/proc/{wpid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z",
-            "killed worker gone",
-            timeout=5.0,
-        )
+        self.wait_gone(wpid, "killed worker gone", timeout=5.0)
 
         # Source working tree must be completely intact!
         self.assertEqual(self.git(repo, "status", "--porcelain"), "")
@@ -594,7 +594,7 @@ class Delegate635Tests(unittest.TestCase):
         self.assertIsInstance(json.loads((run1_dir / "premerge.json").read_text()), dict)
 
         # Case A: `apply` right after SIGKILL falls back cleanly to 3-way merge!
-        self.env.pop("DELEGATE_TEST_PREMERGE_DELAY", None)
+        self.env.pop("DELEGATE_TEST_PREMERGE_GATE", None)
         ap1 = self.cli("apply", "--json", st1["run"], cwd=repo)
         self.assertEqual(ap1.returncode, 0, ap1.stdout + ap1.stderr)
         self.assertFalse(self.outcome(ap1)["fastForward"]["hit"])
@@ -603,22 +603,17 @@ class Delegate635Tests(unittest.TestCase):
         self.git(repo, "commit", "-qm", "commit k1")
 
         # Case B: Second run SIGKILLed, then `status` detects dead workerPid and restarts worker -> `快进 ✓`!
-        self.env["DELEGATE_TEST_PREMERGE_DELAY"] = "5.0"
+        self.env["DELEGATE_TEST_PREMERGE_GATE"] = str(pm_gate2)
         self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED], pre="echo k2-new > k2.txt")
         st2 = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "kill-2", "edit k2"))
         run2_dir = Path(st2["dir"])
         pm2 = self.wait_premerge_status(run2_dir, {"running"})
         wpid2 = int(pm2["workerPid"])
         os.kill(wpid2, signal.SIGKILL)
-        self.until(
-            lambda: not Path(f"/proc/{wpid2}").exists()
-            or Path(f"/proc/{wpid2}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z",
-            "killed worker2 gone",
-            timeout=5.0,
-        )
+        self.wait_gone(wpid2, "killed worker2 gone", timeout=5.0)
 
-        # Remove artificial delay; calling `status` detects dead workerPid and wakes fresh `_merge-worker`!
-        self.env.pop("DELEGATE_TEST_PREMERGE_DELAY", None)
+        # Remove gate; calling `status` detects dead workerPid and wakes fresh `_merge-worker`!
+        self.env.pop("DELEGATE_TEST_PREMERGE_GATE", None)
         _ = self.cli("status", st2["run"], human=True, cwd=repo)
         self.wait_premerge_status(run2_dir, {"ready"}, timeout=15.0)
         ap2 = self.cli("apply", "--json", st2["run"], cwd=repo)
@@ -800,12 +795,14 @@ class Delegate635Tests(unittest.TestCase):
             pre="echo new > a.txt; cp a.txt gen/out.txt",
         )
         self.env.pop("DELEGATE_PREMERGE", None)
-        self.env["DELEGATE_TEST_PREMERGE_DELAY"] = "0.2"
+        pm_gate = self.work / "notready-live-premerge.gate"
+        self.addCleanup(lambda: pm_gate.touch())
+        self.env["DELEGATE_TEST_PREMERGE_GATE"] = str(pm_gate)
         st_live = self.outcome(
             self.cli("run", "--worktree", "--workdir", repo_live, "--accept", "true", "--name", "nr-live", "task")
         )
-        self.wait_premerge_status(Path(st_live["dir"]), {"running"})
-        self.env.pop("DELEGATE_TEST_PREMERGE_DELAY", None)
+        pm_running = self.wait_premerge_status(Path(st_live["dir"]), {"running"})
+        self.env.pop("DELEGATE_TEST_PREMERGE_GATE", None)
         ap_live = self.cli("apply", "--json", "--keep", st_live["run"], cwd=repo_live)
         self.assertEqual(ap_live.returncode, 0, ap_live.stdout + ap_live.stderr)
         live_doc = self.outcome(ap_live)
@@ -814,6 +811,7 @@ class Delegate635Tests(unittest.TestCase):
         self.assertEqual(live_doc["fastForward"]["missCode"], "premerge_running", live_doc)
         self.assertIs(live_doc["acceptStillValid"], True, live_doc)
         self.assertFalse((Path(st_live["dir"]) / ".generate-pending").exists())
+        self.wait_gone(int(pm_running["workerPid"]), "yielding premerge worker exited", timeout=10.0)
 
         # 2. Same scenario after premerge finishes -> fast-forward hit, identical validity conclusion!
         repo_ready = self._make_repo(

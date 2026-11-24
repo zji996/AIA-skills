@@ -399,9 +399,13 @@ class DelegateAgyUsageTests(unittest.TestCase):
         self.assertEqual(snap_alpha["quotaNote"]["weekly"], 95.0)
         self.assertEqual(snap_alpha["quotaEstimate"]["weekly"]["tokensPerPct"], 10_000_000)
 
-        # 4. Append 6M tokens after note 1, then record note 2 (93.00% -> 2% drop => delta 3M / 1%)
-        time.sleep(1.1)
-        t_between = int(time.time())
+        # 4. Backdate note 1 by 60s, append 6M tokens at +30s, then record note 2 (93.00% -> 2% drop => delta 3M / 1%)
+        acct_file = self.fake_home / ".config/delegate/agy-accounts/accounts.json"
+        acct_doc = json.loads(acct_file.read_text(encoding="utf-8"))
+        note1_epoch = int(acct_doc["accounts"]["alpha"]["quotaNotes"][0]["epoch"]) - 60
+        acct_doc["accounts"]["alpha"]["quotaNotes"][0]["epoch"] = note1_epoch
+        acct_file.write_text(json.dumps(acct_doc), encoding="utf-8")
+        t_between = note1_epoch + 30
         extra = {
             "v": 1,
             "at": "2026-11-24T04:01:00Z",
@@ -422,7 +426,6 @@ class DelegateAgyUsageTests(unittest.TestCase):
         }
         with ledger.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(extra) + "\n")
-        time.sleep(1.1)
 
         n2_res = self.cli("agy", "account", "note", "alpha", "--weekly", "93.00", "--json")
         self.assertEqual(n2_res.returncode, 0, n2_res.stderr)

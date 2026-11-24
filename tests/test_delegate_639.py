@@ -39,6 +39,8 @@ class Delegate639Tests(unittest.TestCase):
     outcome = fixtures.DelegateTests.outcome
     repo = fixtures.DelegateTests.repo
     until = fixtures.DelegateTests.until
+    wait_json = fixtures.DelegateTests.wait_json
+    wait_gone = fixtures.DelegateTests.wait_gone
 
     def state_dir(self) -> Path:
         return Path(self.env["XDG_STATE_HOME"]) / "delegate"
@@ -295,7 +297,9 @@ class Delegate639Tests(unittest.TestCase):
     def test_p0_3_apply_premerge_no_double_run_target_isolation_and_timing(self):
         gen_count_file = self.work / "gen-invocations.log"
         pm_started_marker = self.work / "premerge-gen-started"
+        pm_gate = self.work / "premerge-gen-gate"
         pm_finished_marker = self.work / "premerge-gen-finished"
+        self.addCleanup(lambda: pm_gate.touch())
         repo = self.make_repo(
             "repo-apply-premerge",
             {
@@ -306,7 +310,9 @@ class Delegate639Tests(unittest.TestCase):
                             "inputs": ["src/"],
                             "command": (
                                 "case \"$PWD\" in "
-                                f"*/premerge/*) touch {shlex.quote(str(pm_started_marker))}; sleep 8; touch {shlex.quote(str(pm_finished_marker))} ;; "
+                                f"*/premerge/*) touch {shlex.quote(str(pm_started_marker))}; "
+                                f"while [ ! -f {shlex.quote(str(pm_gate))} ]; do sleep .05; done; "
+                                f"touch {shlex.quote(str(pm_finished_marker))} ;; "
                                 f"*) printf '%s|%s\\n' \"$PWD\" \"${{CARGO_TARGET_DIR:-}}\" >> {shlex.quote(str(gen_count_file))} ;; "
                                 "esac; "
                                 "mkdir -p gen && cp src/a.txt gen/out.txt"
@@ -338,21 +344,18 @@ class Delegate639Tests(unittest.TestCase):
         run_dir = Path(st["dir"])
 
         # Wait until `_merge-worker` is actively executing `premerge-generate` (mid-flight!).
-        self.until(
-            lambda: pm_started_marker.is_file()
-            and (run_dir / "premerge.json").is_file()
-            and json.loads((run_dir / "premerge.json").read_text()).get("status") == "running",
+        self.until(pm_started_marker.is_file, "premerge-generate started", timeout=10.0)
+        pm_doc = self.wait_json(
+            run_dir / "premerge.json",
+            lambda d: d.get("status") == "running",
             "premerge worker entered premerge-generate",
             timeout=10.0,
         )
-        worker_pid = json.loads((run_dir / "premerge.json").read_text())["workerPid"]
+        worker_pid = pm_doc["workerPid"]
 
-        # Apply immediately while worker is mid-flight in premerge-generate AND `<repo>/target/.cargo-lock` is held!
-        t0 = time.perf_counter()
-        ap = self.cli("apply", "--json", "--keep", st["run"], cwd=repo)
-        wall = time.perf_counter() - t0
+        # Apply immediately while worker is paused at `pm_gate` AND `<repo>/target/.cargo-lock` is held!
+        ap = self.cli("apply", "--json", "--keep", st["run"], cwd=repo, timeout=15)
         self.assertEqual(ap.returncode, 0, ap.stdout + ap.stderr)
-        self.assertLess(wall, 4.0, f"apply waited for premerge-generate ({wall:.2f}s)")
         doc = self.outcome(ap)
         self.assertTrue(doc["apply"]["ok"], doc)
         timing = doc.get("applyTiming") or {}
@@ -366,12 +369,7 @@ class Delegate639Tests(unittest.TestCase):
         self.assertIsInstance(timing.get("generateMs"), int, doc)
 
         # Worker must exit promptly and MUST NOT complete its cancelled `premerge-generate`!
-        self.until(
-            lambda: not Path(f"/proc/{worker_pid}").exists()
-            or Path(f"/proc/{worker_pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z",
-            "cancelled premerge worker exited",
-            timeout=5.0,
-        )
+        self.wait_gone(worker_pid, "cancelled premerge worker exited", timeout=5.0)
         self.assertFalse(pm_finished_marker.exists(), "cancelled premerge-generate must not run to completion")
         gen_lines = [ln for ln in gen_count_file.read_text().splitlines() if ln.strip()]
         self.assertEqual(len(gen_lines), 1, f"expected apply regenerate once, got: {gen_lines}")

@@ -305,7 +305,7 @@ cargo test; echo $? > "$DELEGATE_RUN_DIR/denied-code"
         first = subprocess.Popen([str(fixtures.DELEGATE), "wait", state["run"]],
                                  env=self.env, cwd=self.work, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(lambda: first.poll() is None and first.kill())
-        self.until(lambda: lock.exists() and lock.read_text().strip() == str(first.pid), "waiter lock")
+        self.wait_text(lock, lambda t: t.strip() == str(first.pid), "waiter lock")
         for args in ((state["run"],), ("--any", state["run"]), ("--stream", state["run"]), ("--machine",)):
             out = self.cli("wait", *args)
             self.assertEqual(out.returncode, 76, out.stderr)
@@ -329,7 +329,7 @@ cargo test; echo $? > "$DELEGATE_RUN_DIR/denied-code"
         first = subprocess.Popen([str(fixtures.DELEGATE), "wait", one["run"]],
                                  env=self.env, cwd=self.work, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(lambda: first.poll() is None and first.kill())
-        self.until(lambda: lock.exists() and lock.read_text().strip() == str(first.pid), "waiter lock")
+        self.wait_text(lock, lambda t: t.strip() == str(first.pid), "waiter lock")
         out = self.cli("wait", "--any", one["run"], two["run"])
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(self.outcome(out)["name"], "two")

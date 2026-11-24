@@ -8,6 +8,8 @@
 """
 
 import json
+import os
+import select
 import shlex
 import subprocess
 import sys
@@ -386,22 +388,47 @@ class Delegate628Tests(unittest.TestCase):
         base_seq = self.read_events()[-1]["seq"]
 
         proc = subprocess.Popen(
-            [str(fixtures.DELEGATE), "events", "--since", str(base_seq), "--follow", "--json"],
+            [str(fixtures.DELEGATE), "events", "--since", str(base_seq - 1), "--follow", "--json"],
             cwd=self.work,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            bufsize=0,
             env=self.env,
         )
         try:
-            time.sleep(0.15)
+            fd = proc.stdout.fileno()
+            buf = bytearray()
+
+            def next_line(deadline):
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl != -1:
+                        raw = bytes(buf[:nl])
+                        del buf[: nl + 1]
+                        return raw.decode("utf-8")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return ""
+                    ready, _, _ = select.select([fd], [], [], remaining)
+                    if not ready:
+                        return ""
+                    chunk = os.read(fd, 4096)
+                    if not chunk:
+                        return ""
+                    buf.extend(chunk)
+
+            # Wait for the initial replay line (seq == base_seq) to confirm `--follow` is live.
+            first_line = next_line(time.monotonic() + 10.0)
+            self.assertTrue(first_line, "events --follow did not emit initial event")
+            self.assertEqual(json.loads(first_line)["seq"], base_seq)
+
             self.fake_pi([fixtures.answer("streamed"), fixtures.SETTLED])
             r2 = self.outcome(self.cli("run", "--read-only", "--name", "ev-live", "live"))
 
             seen = []
-            deadline = time.monotonic() + 10.0
+            deadline = time.monotonic() + 15.0
             while time.monotonic() < deadline:
-                line = proc.stdout.readline()
+                line = next_line(deadline)
                 if not line:
                     break
                 ev = json.loads(line)

@@ -181,4 +181,86 @@ if [ "$errors" -gt 0 ]; then
   echo "Validation FAILED with $errors script errors." >&2
   exit 1
 fi
+
+# Static AST gate for timing-flaky test antipatterns (see tests/README.md).
+if ! python3 - "$REPO_ROOT" <<'PY'
+import ast, re, sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+test_files = sorted(list((root / "tests").glob("test_*.py")) + list(root.glob("crates/*/tests/test_*.py")))
+TIMING_RE = re.compile(r"(?:perf_counter|monotonic|elapsed|wall|p99|latency|_ms\b|\bms\b|took|duration)", re.I)
+MS_RE = re.compile(r"(?:_ms\b|\bms\b|p99)", re.I)
+errors = []
+
+def has_ok(lines, node, tag):
+    pat = re.compile(rf"#\s*{tag}-ok:\s*\S")
+    lo, hi = max(1, node.lineno), min(len(lines), getattr(node, "end_lineno", node.lineno))
+    return any(pat.search(lines[i - 1]) for i in range(lo, hi + 1))
+
+for path in test_files:
+    rel = path.relative_to(root)
+    src = path.read_text(encoding="utf-8")
+    lines = src.splitlines()
+    tree = ast.parse(src, str(rel))
+    time_mods = {a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names if a.name == "time"}
+    imp_sleep = {a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "time" for a in n.names if a.name == "sleep"}
+    imp_time = {a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "time" for a in n.names if a.name == "time"}
+
+    def is_time_call(call, attr, direct):
+        f = call.func
+        return (isinstance(f, ast.Attribute) and f.attr == attr and isinstance(f.value, ast.Name) and f.value.id in time_mods) or (isinstance(f, ast.Name) and f.id in direct)
+
+    class Checker(ast.NodeVisitor):
+        def __init__(self):
+            self.in_test = 0
+        def visit_FunctionDef(self, node):
+            hit = node.name.startswith("test_")
+            self.in_test += hit
+            self.generic_visit(node)
+            self.in_test -= hit
+        def visit_While(self, node):
+            if any(is_time_call(c, "time", imp_time) for c in ast.walk(node) if isinstance(c, ast.Call)):
+                if not has_ok(lines, node, "poll"):
+                    errors.append(f"{rel}:{node.lineno}: hand-written time.time() polling loop; use wait_until() (or # poll-ok: <reason>)")
+            self.generic_visit(node)
+        def _wall(self, node, lhs, rhs):
+            if not (isinstance(rhs, ast.Constant) and isinstance(rhs.value, (int, float)) and not isinstance(rhs.value, bool)):
+                return
+            lhs_src = ast.unparse(lhs)
+            if TIMING_RE.search(lhs_src) and float(rhs.value) < (1000.0 if MS_RE.search(lhs_src) else 1.0) and not has_ok(lines, node, "wall-clock"):
+                errors.append(f"{rel}:{node.lineno}: tight wall-clock assertion (< {rhs.value}); use gates/invariants/probes (or # wall-clock-ok: <reason>)")
+        def visit_Assert(self, node):
+            if isinstance(node.test, ast.Compare) and len(node.test.ops) == 1 and isinstance(node.test.ops[0], (ast.Lt, ast.LtE)):
+                self._wall(node, node.test.left, node.test.comparators[0])
+            self.generic_visit(node)
+        def visit_Call(self, node):
+            if self.in_test:
+                if is_time_call(node, "sleep", imp_sleep) and not has_ok(lines, node, "sleep"):
+                    errors.append(f"{rel}:{node.lineno}: bare time.sleep() inside test; use gates or wait_until() (or # sleep-ok: <reason>)")
+                if isinstance(node.func, ast.Attribute) and node.func.attr == "kill" and isinstance(node.func.value, ast.Name) and node.func.value.id == "os":
+                    if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant) and node.args[1].value == 0 and not has_ok(lines, node, "kill"):
+                        errors.append(f"{rel}:{node.lineno}: bare os.kill(pid, 0); use wait_gone() (or # kill-ok: <reason>)")
+            fn = node.func.attr if isinstance(node.func, ast.Attribute) else (node.func.id if isinstance(node.func, ast.Name) else "")
+            if fn in ("assertLess", "assertLessEqual") and len(node.args) >= 2:
+                self._wall(node, node.args[0], node.args[1])
+            elif fn == "assertTrue" and node.args and isinstance(node.args[0], ast.Compare) and len(node.args[0].ops) == 1 and isinstance(node.args[0].ops[0], (ast.Lt, ast.LtE)):
+                self._wall(node, node.args[0].left, node.args[0].comparators[0])
+            elif fn in ("until", "wait_until") and node.args:
+                if any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) and c.func.attr == "read_text" for c in ast.walk(node.args[0])):
+                    if not has_ok(lines, node, "until"):
+                        errors.append(f"{rel}:{node.lineno}: until(...read_text()); use wait_text()/wait_json()/wait_gone() (or # until-ok: <reason>)")
+            self.generic_visit(node)
+
+    Checker().visit(tree)
+
+for err in errors:
+    print(f"  [FAIL] {err}", file=sys.stderr)
+if not errors:
+    print(f"  [PASS] Test timing AST gate ({len(test_files)} files)")
+sys.exit(bool(errors))
+PY
+then
+  exit 1
+fi
 echo "All checks passed successfully."

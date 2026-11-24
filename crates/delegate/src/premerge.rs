@@ -2401,9 +2401,22 @@ fn process_one_run(
     }
     index::upsert_run(run);
 
-    // Optional test hook: allow concurrency tests to pause/kill the worker deterministically
+    // Optional test hooks: allow concurrency tests to pause/kill the worker deterministically
     // while `premerge.json` is in `running` state (still yielding promptly to `apply` / SIGTERM).
     if cfg!(debug_assertions) {
+        if let Ok(gate_str) = std::env::var("DELEGATE_TEST_PREMERGE_GATE") {
+            if !gate_str.is_empty() {
+                let gate_path = Path::new(&gate_str);
+                let limit = Instant::now() + std::time::Duration::from_secs(30);
+                while !gate_path.exists() && Instant::now() < limit {
+                    if should_yield_to_apply(run, source_canon) {
+                        clear_running_marker_if_ours(run);
+                        return Ok(false);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
+        }
         if let Ok(delay_str) = std::env::var("DELEGATE_TEST_PREMERGE_DELAY") {
             if let Ok(secs) = seconds(&delay_str) {
                 if secs > 0.0 {

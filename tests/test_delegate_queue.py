@@ -16,6 +16,7 @@ class QueueTests(unittest.TestCase):
     repo = fixtures.DelegateTests.repo
     until = fixtures.DelegateTests.until
     wait_until = fixtures.DelegateTests.wait_until
+    wait_text = fixtures.DelegateTests.wait_text
     user_config = fixtures.DelegateTests.user_config
 
     def gates(self):
@@ -255,7 +256,7 @@ class QueueTests(unittest.TestCase):
         self.env["DELEGATE_MAX_ACTIVE"] = "1"
         self.start_active("holder")
         queued = self.start("queued")
-        pid = self.until(lambda: int((Path(queued["dir"]) / "pid").read_text()), "queued supervisor pid")
+        pid = int(self.wait_text(Path(queued["dir"]) / "pid", lambda t: t.strip().isdigit(), "queued supervisor pid").strip())
         os.kill(pid, signal.SIGKILL)
         self.until(lambda: self.status(queued)["state"] == "crashed", "dead supervisor reported crashed")
         self.assertNotIn("queue", self.status(queued))

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `delegate`：计时不稳治本收尾——新增仅 debug 生效的 `DELEGATE_TEST_PREMERGE_GATE` 门控钩子并清理全仓剩余高危测试存量（`635`/`632`/`639`/`626`/`628`/`6361`/`638`/`agy_usage`/`apply_safety`/`queue`/`session_frictions`/`stop_hook_read_state`/`tui_quota_and_in`/`test_delegate`/`test_v515` 移除固定延迟、紧墙钟断言、裸 `time.sleep` 与 `until(...read_text())` 改用 gate/不变量/`wait_text`/`wait_json`/`wait_gone`/时间戳回拨）；`scripts/check.sh` 新增 Python AST 静态门禁拦截裸 `time.sleep`、手写 `time.time()` 轮询、紧墙钟断言（`< 1s` / `< 1000ms`）、`until(...read_text())` 与测试内裸 `os.kill(pid, 0)`（确有必要须带非空原因的行尾 `*-ok:` 注释）；新增 `tests/README.md` 写明不依赖计时的测试写法与帮手索引。
 - `delegate`：修复 `reply` 判定 `continuation` 仍读入口旧快照 `summary.json` 而未对齐 `runs::state(parent)` 导致的 `stop`/收尾竞态漏写缺陷，并补门控复现回归测试；升级测试基建（`fake_pi` 临时文件原子替换 + `start_gated()` 按 run 就绪同步、`wait_until` 单调时钟与瞬态异常容错 + `wait_text`/`wait_json`/`wait_gone`），将高发计时不稳用例（`625_history`/`wait_defaults`/`evidence`/`wait_slices`/`resume`/`queue`/`v515` 及散落轮询）统一改为事件/不变量同步，并在 `scripts/run-tests.py` 将 `ThreadPoolExecutor` 重压用例拆出并行池串行执行且新增 `--repeat N`。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
 - `delegate`：合入审查卡新增第 10 类内置风险规则 `size_budget`（「体量」），自动读取目标仓库 `.repo-governance.json` token 预算并支持 `.delegate.json` `riskRules.sizeBudgets` 按路径配置 `maxLines`/`maxTestFnLines`/`maxTokens`，仅在本次改动使文件或测试函数跨过阈值（中）或已超且继续增长（低）时标出，未碰或缩小的文件不标。

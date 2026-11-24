@@ -360,22 +360,24 @@ class Delegate638AgyAccountsTests(unittest.TestCase):
         fake_agy = fake_bin_dir / "agy"
         # Do NOT `exec sleep`, otherwise cmdline/exe becomes `sleep`; keep `sh .../agy` alive
         # just like a real agy wrapper or binary.
-        fake_agy.write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
+        fake_agy.write_text('#!/bin/sh\n[ -n "${READY_FILE:-}" ] && : > "$READY_FILE"\nsleep 30\n', encoding="utf-8")
         fake_agy.chmod(0o755)
 
         other_home = Path(self._tmp.name) / "other-home"
         other_home.mkdir()
+        other_ready = Path(self._tmp.name) / "other-agy.ready"
+        same_ready = Path(self._tmp.name) / "same-agy.ready"
 
         other_proc = subprocess.Popen(
             [str(fake_agy), "--model", "gemini-4-neon"],
-            env={**self.env, "HOME": str(other_home)},
+            env={**self.env, "HOME": str(other_home), "READY_FILE": str(other_ready)},
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
         same_proc = None
         try:
-            time.sleep(0.15)
+            fixtures.wait_until(other_ready.is_file, "other-home fake agy started")
             # Process in another HOME must NOT block switching in self.home
             ok_sw = self.run_cli("agy", "account", "use", "beta", "--json")
             self.assertEqual(ok_sw.returncode, 0, ok_sw.stderr)
@@ -384,12 +386,16 @@ class Delegate638AgyAccountsTests(unittest.TestCase):
             # Process in self.home MUST block switching and list PID + delegate run
             same_proc = subprocess.Popen(
                 [str(fake_agy), "--model", "gemini-4-neon"],
-                env={**self.env, "DELEGATE_RUN_DIR": "/tmp/fake/20261124-030000-testrun"},
+                env={
+                    **self.env,
+                    "DELEGATE_RUN_DIR": "/tmp/fake/20261124-030000-testrun",
+                    "READY_FILE": str(same_ready),
+                },
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
-            time.sleep(0.15)
+            fixtures.wait_until(same_ready.is_file, "same-home fake agy started")
 
             blocked = self.run_cli("agy", "account", "use", "alpha")
             self.assertEqual(blocked.returncode, 1)
@@ -439,27 +445,46 @@ class Delegate638AgyAccountsTests(unittest.TestCase):
         self.assertEqual(self.run_cli("agy", "account", "import-agy-swap").returncode, 0)
 
         lock_path = self.home / ".config/delegate/agy-accounts/.lock"
+        lock_target = str(lock_path.resolve())
         lock_file = open(lock_path, "r+b")
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        proc = subprocess.Popen(
+            [str(fixtures.DELEGATE), "agy", "account", "use", "beta", "--json"],
+            env=self.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            def blocked_on_lock():
+                if proc.poll() is not None:
+                    raise AssertionError(
+                        f"use exited (rc={proc.returncode}) without blocking on .lock"
+                    )
+                wchan = Path(f"/proc/{proc.pid}/wchan").read_text().strip()
+                if "lock" not in wchan:
+                    return False
+                for fd in Path(f"/proc/{proc.pid}/fd").iterdir():
+                    try:
+                        if os.readlink(fd) == lock_target:
+                            return True
+                    except OSError:
+                        pass
+                return False
 
-        release_at = [0.0]
-
-        def hold_and_release():
-            time.sleep(0.35)
-            release_at[0] = time.monotonic()
+            fixtures.wait_until(blocked_on_lock, "use blocked on .lock", timeout=10, ignore=(OSError,))
+            self.assertIsNone(proc.poll(), "use must stay blocked while .lock is held")
+            self.assertEqual(
+                json.loads((self.home / ".config/delegate/agy-accounts/accounts.json").read_text())["active"],
+                "alpha",
+            )
+        finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
             lock_file.close()
 
-        holder = threading.Thread(target=hold_and_release)
-        holder.start()
-        t0 = time.monotonic()
-        res = self.run_cli("agy", "account", "use", "beta", "--json")
-        finished = time.monotonic()
-        holder.join()
-
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertGreaterEqual(finished - t0, 0.30, "use must block until .lock is released")
-        self.assertGreaterEqual(finished, release_at[0])
+        stdout, stderr = proc.communicate(timeout=10)
+        self.assertEqual(proc.returncode, 0, stderr)
+        self.assertEqual(json.loads(stdout)["active"], "beta")
 
         # Concurrent switches stay consistent (no torn state between accounts.json and live files)
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:

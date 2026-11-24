@@ -436,6 +436,66 @@ class ScriptTests(unittest.TestCase):
         (repository / "README.md").write_text("# Empty index\n")
         self.assertIn("missing skill index", self.run_script(check).stderr)
 
+    def test_check_rejects_flaky_timing_antipatterns(self):
+        repository = self.work / "timing-gate"
+        (repository / "scripts").mkdir(parents=True)
+        shutil.copy2(CHECK, repository / "scripts/check.sh")
+        skill = repository / "skills/example"
+        skill.mkdir(parents=True)
+        (repository / "evals").mkdir()
+        (repository / "evals/example.md").write_text("# example\n")
+        (repository / "README.md").write_text("| **`example`** | `skills/example/` | example |\n")
+        (skill / "SKILL.md").write_text(
+            "---\nname: example\ndescription: 测试时使用。Use when testing.\nmetadata:\n  version: \"1.0.0\"\n---\n"
+        )
+        (repository / "tests").mkdir()
+        sample = repository / "tests/test_sample.py"
+        check = repository / "scripts/check.sh"
+
+        # All 5 antipatterns (and empty exemption reason) must fail.
+        sample.write_text(
+            "import os, time\n"
+            "def test_bad(self, p, pid):\n"
+            "    time.sleep(0.1)\n"
+            "    time.sleep(0.2)  # sleep-ok:\n"
+            "    while time.time() < 10:\n"
+            "        pass\n"
+            "    self.assertLess(elapsed, 0.5)\n"
+            "    self.assertLess(best_ms, 50.0)\n"
+            "    self.until(lambda: 'x' in p.read_text(), 'x')\n"
+            "    os.kill(pid, 0)\n"
+        )
+        res = self.run_script(check)
+        self.assertNotEqual(res.returncode, 0, res.stdout + res.stderr)
+        for token in (
+            "bare time.sleep()",
+            "hand-written time.time() polling loop",
+            "tight wall-clock assertion (< 0.5)",
+            "tight wall-clock assertion (< 50.0)",
+            "until(...read_text())",
+            "bare os.kill(pid, 0)",
+        ):
+            self.assertIn(token, res.stderr)
+        # Both unannotated and empty `# sleep-ok:` lines are rejected.
+        self.assertEqual(res.stderr.count("bare time.sleep()"), 2, res.stderr)
+
+        # Documented exemptions with reasons and helper-level sleeps pass.
+        sample.write_text(
+            "import os, time\n"
+            "def helper_wait():\n"
+            "    time.sleep(0.05)\n"
+            "def test_good(self, p, pid):\n"
+            "    time.sleep(0.2)  # sleep-ok: negative window check\n"
+            "    while time.time() < 10:  # poll-ok: synthetic fixture\n"
+            "        break\n"
+            "    self.assertLess(elapsed, 0.5)  # wall-clock-ok: benchmark\n"
+            "    self.assertLess(elapsed, 2.0)\n"
+            "    self.until(lambda: 'x' in p.read_text(), 'x')  # until-ok: pre-existing file\n"
+            "    os.kill(pid, 0)  # kill-ok: direct probe check\n"
+        )
+        ok = self.run_script(check)
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+
     def test_check_budget_overage_warns_and_exits_zero_unless_strict(self):
         repository = self.work / "budget-repo"
         (repository / "scripts").mkdir(parents=True)

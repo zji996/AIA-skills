@@ -14,6 +14,7 @@
 """
 import json
 import re
+import select
 import signal
 import subprocess
 import sys
@@ -185,7 +186,11 @@ class Delegate6361Tests(unittest.TestCase):
             env=sess_env,
         )
         try:
-            time.sleep(0.25)
+            # Wait until `--follow` prints its initial event line before sending SIGINT.
+            ready, _, _ = select.select([proc.stdout], [], [], 10.0)
+            self.assertTrue(ready, "events --follow did not print initial event")
+            first_line = proc.stdout.readline()
+            self.assertTrue(first_line.strip(), "expected non-empty initial event line")
             proc.send_signal(signal.SIGINT)
             proc.communicate(timeout=5)
         finally:

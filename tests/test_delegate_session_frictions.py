@@ -111,9 +111,18 @@ class DelegateSessionFrictionsTests(unittest.TestCase):
                                             cwd=self.work, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                     self.addCleanup(lambda: proc.poll() is None and proc.terminate())
                     return proc
+                def read_tickets():
+                    if not lane_dir.exists():
+                        return []
+                    docs = []
+                    for p in lane_dir.glob("*.ticket"):
+                        try:
+                            docs.append(json.loads(p.read_text()))
+                        except (OSError, ValueError):
+                            pass
+                    return docs
                 blocker = spawn("blocker", f"while [ ! -f {gate} ]; do sleep .02; done")
-                self.until(lambda: lane_dir.exists() and any(json.loads(p.read_text()).get("running")
-                           for p in lane_dir.glob("*.ticket")), "blocker holds lane")
+                self.until(lambda: any(d.get("running") for d in read_tickets()), "blocker holds lane")
                 command = f"echo resumed >> {order}"
                 label = "browser-recheck-" + suffix
                 log = self.work / ("queue-" + suffix)
@@ -135,8 +144,7 @@ class DelegateSessionFrictionsTests(unittest.TestCase):
                              pre=f"{fixtures.DELEGATE} lane --label {label} {shlex.quote(command)}")
                 reply = self.outcome(self.cli("reply", state["run"], "use the first option"))
                 self.addCleanup(lambda: self.cli("stop", reply["run"]))
-                self.until(lambda: any(json.loads(p.read_text()).get("label") == label
-                           for p in lane_dir.glob("*.ticket")), "reply rejoins lane")
+                self.until(lambda: any(d.get("label") == label for d in read_tickets()), "reply rejoins lane")
                 if already_running:
                     self.assertEqual(order.read_text().splitlines(), ["later"], "old age must not steal a running slot")
                     later_gate.touch()

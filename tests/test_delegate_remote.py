@@ -198,7 +198,7 @@ print("local:" + " ".join(sys.argv[1:]))
         repo, state = self.run_remote(pre="echo changed > a.txt", accept="cargo check")
         run = Path(state["dir"])
         meta = json.loads((run / "meta.json").read_text())
-        meta["acceptTimeoutSeconds"] = 3
+        meta["acceptTimeoutSeconds"] = 8
         (run / "meta.json").write_text(json.dumps(meta))
         # apply uses the source directory's remote slot. Hold that transaction lock,
         # not a heavy lane: this is the second queue inside run_shell.
@@ -211,9 +211,9 @@ print("local:" + " ".join(sys.argv[1:]))
                                     cwd=repo, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             self.addCleanup(lambda: proc.poll() is None and proc.terminate())
             self.until(lambda: bool(list(run.glob("lane-waiting-*"))), "remote slot queued")
-            time.sleep(4)
-            self.assertIsNone(proc.poll(), "queue must not spend the 3s execution timeout")
-        stdout, stderr = proc.communicate(timeout=15)
+            time.sleep(8.5)  # sleep-ok: hold slot past 8s acceptTimeoutSeconds to prove queue wait excluded
+            self.assertIsNone(proc.poll(), "queue must not spend the 8s execution timeout")
+        stdout, stderr = proc.communicate(timeout=25)
         self.assertEqual(proc.returncode, 0, stdout + stderr)
         self.assertTrue(self.outcome(subprocess.CompletedProcess([], proc.returncode, stdout, stderr))["verify"]["ok"])
 
@@ -371,7 +371,7 @@ print("local:" + " ".join(sys.argv[1:]))
         listing = self.cli("lane", cwd=state["worktree"]).stdout
         self.assertIn("remote running", listing)
         self.assertIn("remote queued", listing)
-        time.sleep(.2)
+        time.sleep(.2)  # sleep-ok: accumulate >0.1s queued wait duration in lane-wait
         first.terminate()
         first.communicate(timeout=10)
         stdout, stderr = second.communicate(timeout=10)

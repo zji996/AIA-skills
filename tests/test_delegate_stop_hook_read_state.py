@@ -296,9 +296,11 @@ class DelegateStopHookReadStateTests(unittest.TestCase):
 
         # 4) Live running job owned by main (no waiter).
         gate = self.work / "main-live-gate-b"
+        ready = self.work / "main-live-ready-b"
         self.fake_pi(
             [fixtures.answer("done"), fixtures.SETTLED],
-            pre=f"while [ ! -f {shlex.quote(str(gate))} ]; do sleep 0.05; done",
+            gate=gate,
+            ready_file=ready,
         )
         r_live = self.outcome(
             self.run_delegate(
@@ -308,6 +310,7 @@ class DelegateStopHookReadStateTests(unittest.TestCase):
             )
         )
         self.addCleanup(lambda: (gate.touch(), self.run_delegate(["stop", r_live["run"]], repo, main_env)))
+        self.until(ready.is_file, "main-live agent entered gate")
 
         # Even if main's runs are 10h old (> 6h!), main is ALIVE -> chat session MUST NOT be blocked!
         self.backdate_events_and_runs(10.0, [Path(r_ro["dir"]), Path(r_wr["dir"]), Path(r_q["dir"])])

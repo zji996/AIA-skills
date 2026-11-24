@@ -880,7 +880,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         state = self.outcome(self.cli("start", "--worktree", "--workdir", repo, "--name", "running", "task"))
         self.addCleanup(self.cli, "stop", state["run"])
         run = Path(state["dir"])
-        self.until(lambda: (run / "events.jsonl").exists() and "cargo test" in (run / "events.jsonl").read_text(), "command event")
+        self.wait_text(run / "events.jsonl", "cargo test", "command event")
         out = self.cli("status", "running", human=True)
         self.assertEqual(out.returncode, 0, out.stderr)
         for field in ("running · 运行中", "pi/m · write（推断）", "在跑命令：cargo test", "下一步："):
@@ -956,7 +956,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         self.assertIn("finishedAt", self.outcome(self.cli("status", str(run))))
         self.assertTrue(process_gone(run / "startup.pid"))
         before = {p.name: p.stat().st_mtime_ns for p in run.iterdir()}
-        time.sleep(2.1)
+        time.sleep(2.1)  # sleep-ok: negative check past DELEGATE_TEST_SUPERVISOR_DELAY=2s window
         self.assertEqual(before, {p.name: p.stat().st_mtime_ns for p in run.iterdir()})
         self.assertFalse((run / "pid").exists())
 
@@ -1132,9 +1132,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
     def test_terminating_lane_ends_its_command_before_the_slot_is_free(self):
         lane = subprocess.Popen([str(DELEGATE), "lane", "sleep 30 & echo $! > bg.pid; wait"], cwd=self.work,
                                 env=self.env)
-        self.until(lambda: (self.work / "bg.pid").is_file() and (self.work / "bg.pid").read_text().strip(),
-                   "the command to start")
-        pid = int((self.work / "bg.pid").read_text())
+        pid = int(self.wait_text(self.work / "bg.pid", lambda t: bool(t.strip()), "the command to start").strip())
         lane.terminate()
         self.assertEqual(lane.wait(timeout=10), 128 + signal.SIGTERM)
         self.assertFalse(Path(f"/proc/{pid}").exists() and "Z" not in Path(f"/proc/{pid}/stat").read_text().split()[2])
@@ -1143,33 +1141,41 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
     def test_timeout_grace_while_at_work_and_queue_time_is_free(self):
         start = {"type": "tool_execution_start", "toolName": "bash", "args": {"command": "make check"}}
         end = {"type": "tool_execution_end", "toolName": "bash"}
-        # With --timeout 1 the work must still be running past 1s but finish before the 100% grace limit (2s).
+        # With --timeout 2 the work must still be running past 2s but finish before the 100% grace limit (4s).
         lines = ["#!/bin/sh", '[ "$1" = --version ] && { echo "fake-pi 1.0"; exit 0; }', "cat > /dev/null",
-                 f"printf '%s\\n' {shlex.quote(json.dumps(start))}", "sleep 1.5",
+                 f"printf '%s\\n' {shlex.quote(json.dumps(start))}", "sleep 3",
                  f"printf '%s\\n' {' '.join(shlex.quote(json.dumps(e)) for e in (end, answer('checked'), SETTLED))}"]
-        (self.bin / "pi").write_text("\n".join(lines) + "\n")
-        (self.bin / "pi").chmod(0o755)
+        pi = self.bin / "pi"
+        tmp = self.bin / f".pi.{os.getpid()}.{time.monotonic_ns()}.tmp"
+        tmp.write_text("\n".join(lines) + "\n")
+        tmp.chmod(0o755)
+        os.replace(tmp, pi)
         # A command in progress at the timeout earns up to DELEGATE_TIMEOUT_GRACE percent more.
         self.env["DELEGATE_TIMEOUT_GRACE"] = "100"
-        state = self.outcome(self.cli("run", "--timeout", "1", "task"))
+        state = self.outcome(self.cli("run", "--timeout", "2", "task"))
         self.assertEqual(state["state"], "answered")
         self.assertGreaterEqual(state["graceSeconds"], 0)
         self.env["DELEGATE_TIMEOUT_GRACE"] = "0"
-        self.assertEqual(self.outcome(self.cli("run", "--timeout", "1", "task"))["state"], "timeout")
+        self.assertEqual(self.outcome(self.cli("run", "--timeout", "2", "task"))["state"], "timeout")
         # Waiting in the lane for its own check does not use up the agent's time.
         holder, lane_gate = self.hold_lane_gated()
         self.fake_pi([answer("checked"), SETTLED], pre=f"{DELEGATE} lane --label agent-check true")
         proc = subprocess.Popen(
-            [str(DELEGATE), "run", "--json", "--timeout", "1", "task"],
+            [str(DELEGATE), "run", "--json", "--timeout", "4", "task"],
             cwd=self.work, env=self.env, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         self.addCleanup(lambda: (lane_gate.touch(), proc.poll() is None and proc.terminate()))
-        self.until(
-            lambda: "queued" in self.cli("lane").stdout and "agent-check" in self.cli("lane").stdout,
-            "agent lane check queued",
-        )
-        release_at = time.monotonic() + 1.5
+
+        def agent_check_queued():
+            if proc.poll() is not None:
+                out, err = proc.communicate(timeout=5)
+                raise AssertionError(f"run exited (rc={proc.returncode}) before agent-check queued:\n{out}\n{err}")
+            lane_out = self.cli("lane").stdout
+            return "queued" in lane_out and "agent-check" in lane_out
+
+        self.until(agent_check_queued, "agent lane check queued", timeout=15)
+        release_at = time.monotonic() + 4.5
         self.until(lambda: time.monotonic() >= release_at, "lane queue exceeds timeout")
         lane_gate.touch()
         holder.wait(timeout=10)
@@ -1283,9 +1289,9 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
                 pid_file = self.work / f"{role}-untagged.pid"
                 command = ("env -i setsid sh -c "
                            + shlex.quote(f"echo $$ > {shlex.quote(str(pid_file))}; exec sleep 300")
-                           + " </dev/null >/dev/null 2>&1 & sleep .2")
+                           + f" </dev/null >/dev/null 2>&1 & while [ ! -s {shlex.quote(str(pid_file))} ]; do sleep .02; done")
                 self.fake_pi([answer("done"), SETTLED], pre=command if role == "agent" else "")
-                result = self.cli("run", *( ["--accept", command] if role == "accept" else []), "task")
+                result = self.cli("run", *( ["--accept", command] if role == "accept" else []), "task", timeout=60)
                 state = self.outcome(result)
                 self.assertEqual(state["state"], "delivered" if role == "accept" else "answered", result.stderr)
                 pid = int(pid_file.read_text())
@@ -1299,15 +1305,18 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         setup_pid = self.work / "setup-untagged.pid"
         setup_command = ("env -i setsid sh -c "
                          + shlex.quote(f"echo $$ > {shlex.quote(str(setup_pid))}; exec sleep 300")
-                         + " </dev/null >/dev/null 2>&1 & sleep .2")
+                         + f" </dev/null >/dev/null 2>&1 & while [ ! -s {shlex.quote(str(setup_pid))} ]; do sleep .02; done")
         (repo / ".delegate.json").write_text(json.dumps({"worktree": {"setup": [setup_command]}}))
         self.fake_pi([answer("done"), SETTLED])
-        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task"))
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "task", timeout=60))
         pid = int(setup_pid.read_text())
         self.addCleanup(lambda p=pid: os.kill(p, signal.SIGKILL) if Path(f"/proc/{p}").exists() else None)
         self.assertTrue(process_gone(setup_pid))
         self.assertIn(str(pid), json.loads((Path(state["dir"]) / "cleanup.json").read_text())["processes"])
         self.assertIn("-setup-1", (Path(state["dir"]) / "scopes").read_text())
+
+    # Uses the host systemd --user D-Bus manager; serialize so --repeat N clones do not contend on it.
+    test_cgroup_cleans_untagged_detached_agent_and_acceptance._stress_serial = True
 
     def test_cgroup_opt_out_keeps_group_and_marker_cleanup(self):
         self.env["DELEGATE_CGROUP"] = "0"

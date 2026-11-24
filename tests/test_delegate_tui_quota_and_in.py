@@ -221,7 +221,10 @@ class DelegateQuotaAndInFailClosedTests(unittest.TestCase):
         failing_agy.write_text("#!/bin/sh\necho SHOULD_NOT_RUN >&2\nexit 99\n", encoding="utf-8")
         failing_agy.chmod(0o755)
         self.env["DELEGATE_AGY_BIN"] = str(failing_agy)
-        time.sleep(1.1)
+        quota_cache = Path(self.env["XDG_STATE_HOME"]) / "delegate/agy-quota.json"
+        qdoc = json.loads(quota_cache.read_text(encoding="utf-8"))
+        qdoc["accounts"]["alpha"]["fetchedEpoch"] = int(qdoc["accounts"]["alpha"]["fetchedEpoch"]) - 5
+        quota_cache.write_text(json.dumps(qdoc), encoding="utf-8")
 
         snap_res = self.cli("snapshot", "--json")
         self.assertEqual(snap_res.returncode, 0, snap_res.stderr)

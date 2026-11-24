@@ -24,6 +24,7 @@ class Delegate626Tests(unittest.TestCase):
     outcome = fixtures.DelegateTests.outcome
     repo = fixtures.DelegateTests.repo
     until = fixtures.DelegateTests.until
+    wait_text = fixtures.DelegateTests.wait_text
 
     def run_write(self, repo, pre, name="task", *options):
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre=pre)
@@ -292,10 +293,7 @@ class Delegate626Tests(unittest.TestCase):
             info = self.outcome(started)
             sup_log_path = Path(info["dir"]) / "supervisor.log"
             # Hold the lock until `_supervise` actually observes contention and logs progress.
-            self.until(
-                lambda: sup_log_path.is_file() and "等待 apply 完成写盘" in sup_log_path.read_text(encoding="utf-8", errors="replace"),
-                "supervisor logged apply-lock wait",
-            )
+            self.wait_text(sup_log_path, "等待 apply 完成写盘", "supervisor logged apply-lock wait")
         finally:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
             lock_file.close()
