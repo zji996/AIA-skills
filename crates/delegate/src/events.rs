@@ -523,6 +523,7 @@ pub fn rebuild_in(state: &Path, extra_runs_dirs: &[PathBuf]) -> Res<Value> {
                     "mode": mode,
                     "tier": meta["tier"],
                     "model": meta["model"],
+                    "parent": meta["parent"],
                 }),
             ));
         }

@@ -33,6 +33,7 @@
 | `lane [--label <文字>] [--measure] [--] <命令>` | 整机重任务队列执行命令，结束时在 `lane_released` 记录子进程树 `cpuUserSecs`/`cpuSysSecs`/`maxRssKb`（`events` 与 `--measure` 摘要显示 CPU user/sys、墙钟与 CPU/墙钟 比）；`--measure` 预约核串行排队，退出码原样返回；无参列占用 |
 | `agy account <list\|status\|add\|use\|note\|remove\|import-agy-swap\|restore-entry>` | 手工管理本地 `agy` 账号槽位与余量快照（不自动轮换、不调额度接口），见 [agy 账号](agy-accounts.md) |
 | `usage [--since 24h\|7d] [--by account\|day\|run\|repo] [--account ID] [--repo PATH] [--all] [--json]` | 按账号/日/run/仓库汇总本地 `agy` 用量（作者与审查员分列，运行中未计单列） |
+| `speed [--since 7d\|14d\|all] [--repo PATH] [--json]` | 从 `events.jsonl` 按仓库校准工期参数（`t_chain`/`t_crit`/`P_eff`/`T_merge`、返工率、只读链），写 `<state>/speed/<repo-slug>.jsonl` 并标 `±20%` 漂移，见 [容量与工期](capacity.md) |
 
 启动选项：`--tier scout|review|write`（省写时只读推断 review、写入推断 write 并标记；scout/review 自动只读）、`--image <路径>`（可重复）、`--accept <命令>` / `--no-accept`、`--hide-accept`、`--accept-timeout`（默认 `.delegate.json` 的 `acceptTimeout`，未设不限时；`reply` 继承）、`--read-only`、`--shell`（仅快照内只读调查，写文件拒收）、`--in-place`、`--workdir`、`--timeout`（每次尝试，无默认）、`--retries`（畸形重跑次数，默认 1）、`--model <别名或完整名>`（在 models 内匹配，固定模型不自动换）、`--thinking off|minimal|low|medium|high|xhigh`、`--allow-parallel-writes`、`--worktree`、`--in <run>`（只读审已完成任务快照）、`--protect <路径>`（可重复，末尾 `/` 为目录，改动即 `rejected`；正文提及未放开保护路径仅提示补 `--allow`）。`--name` 省略取首分句（最多 24 字）。`<run>` 可为完整 id、唯一片段、`last` 或目录。
 

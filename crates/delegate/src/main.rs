@@ -46,6 +46,7 @@ mod review;
 mod runs;
 mod source_build;
 mod source_watch;
+mod speed;
 mod supervise;
 mod transient;
 mod tui;
@@ -3009,6 +3010,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "work" => work::command(rest),
         "agy" => agy_accounts::command(rest),
         "usage" => usage::command(rest),
+        "speed" => speed::command(rest),
         "hook" => hook::command(rest),
         "events" => events::command(rest),
         "queue" => dag_queue::command(rest),

@@ -35,7 +35,7 @@ $D wait                                                                  # 放�
 | 审某个已完成任务的工作树 | `$D start --read-only --in <name> "…"`（已清理时自动从归档重建，不可重建则报错退出）；先 `wait` 确认上游结果再派下一步 |
 | 自己跑重检查、测性能 | `$D lane make check`；测量用 `lane --measure` |
 | 节点不稳、换档前先测连通 | `$D probe`：走 Pi 本身（不是裸 HTTP）测各档模型，不建任务、不占名额 |
-| 看审查卡 / 预合并快进 / 改动 / 停 / 清 | `$D card <run>`（L1 一屏审查卡：摘要与各轮原文、风险项、测试与验收、预合并、折叠改动）、`$D diff <run> --risky`（L2 风险 hunk）、`$D diff`（L3 完整）、`$D result [--round N\|--all\|--rounds]` / `$D stop` / `$D clean --finished`；交付或 `$D sign` 后 `_merge-worker` 在 `<cache>` 预合并并钉 `refs/delegate/premerge/<run>`，L0 实显 `预合并中` / `快进 ✓（基于 <short>）` / `快进 ✗ 主干已前进` / `预合并冲突：<文件>`；`$D apply` 命中快进 <2s 写回未提交改动并跳过复验，否则明报原因回退三方合并，见 [审查卡与预合并](references/review-card.md) |
+| 看审查卡 / 预合并快进 / 改动 / 停 / 清 | `$D card <run>`（L1 一屏审查卡：摘要与各轮原文、风险项、测试与验收、预合并、折叠改动）、`$D diff <run> --risky`（L2 风险 hunk）、`$D diff`（L3 完整）、`$D result [--round N\|--all\|--rounds]` / `$D stop` / `$D clean --finished`；交付或 `$D sign` 后 `_merge-worker` 在 `<cache>` 预合并并钉 `refs/delegate/premerge/<run>`，L0 实显预合并/快进状态，`$D apply` 命中快进 <2s 写回并跳过复验，否则回退三方合并，见 [审查卡与预合并](references/review-card.md) |
 | 自动审-改闭环与分层并行验收 | `.delegate.json` 配 `acceptRules` 按改动路径分层（未命中或改构建配置 fail-closed 跑全量）；快层通过后慢层与只读审查员并行（任一失败互停、被取消不记 `PASS`，两者均过才 `delivered`，返工只重跑受影响层）；审查员首行 `PASS`/`REWORK`/`NEEDS_CONTROLLER` 并附 `## 主控重点看` 并入审查卡，改到 `controllerReviewPaths` 升 `NEEDS_CONTROLLER` 并由 `$D sign <run>` 签字，见 [审查要点](references/review-rubric.md) |
 | 事件流 / 游标等待 / 确定性续派 | `$D events [--since SEQ] [--follow] [--rebuild] [--json]` 查全机只追加事件流（含 `review_*` / `merge_*` / `radar_*`）；`$D wait --since SEQ` 返回新事件与新游标（Stop hook 按游标拦下未读交付/提问/需关注/`NEEDS_CONTROLLER`）；`$D queue add <name> --after <run\|name> --prompt-file …` / `queue list` 建有序 DAG，上游交付通过且审查 `PASS` 后零模型调用自动起下一步，异常暂停提醒 |
 | 串行合入员与自主合入白名单 | `$D merge <run>...` 或 `$D merge --ready` 在独立集成 worktree 基于源 HEAD 串行 3-way 合入、命中 `generated.inputs` 重生、逐个经 lane 跑 `accept`、末尾跑 `mergeAccept`，沿用原提交标题并带 `Delegate-Run` trailer，冲突/红测/受保护路径/未签字或失效 `controllerReviewPaths` 自动回退标 `SKIPPED`；`.delegate.json` `autoMerge`（支持 `!` 排除与 `add:` 纯新增）标「可自主合入 / 待主控点头」并出 `merge-report.md`，主控 `$D apply --keep-commits <merge-run>` 落回后自行 push，详见 [合入员与 Radar](references/merge-and-radar.md) |
@@ -43,6 +43,7 @@ $D wait                                                                  # 放�
 | 统一工作表与 Stop 钩子 | `$D work`（6 列紧凑表并合入未绑定 run，零改动交付显「已收取」、已 clean run 不影响状态）、`$D work show/add/wait/close/drop/defer/import-md`（等待仅支持可判定前置与 `--needs-owner` 建 Q 项，建 Q 须填问句/建议/不定/成本）、`start --work <ID>`、`--after-applied`；唯一零锁零 git Stop 钩子统一事件/提问/waiter/未合入，延后走 `work defer`，`$D hook stats` 按周统计；`note` 为薄壳，见 [工作表](references/worktable.md) |
 | `/clear` 前交接 / 查历史与看板 | `$D handoff` 写一页交接索引（含待办）；`$D history [关键词…]` 查永久索引；`$D show <run>` 看摘要、合入后同文件提交与归档；`$D board` 打印/刷新自动看板（`.delegate.json` `board` 配路径） |
 | 终端看板与 agy 账号/额度 | `$D tui`（`0`/`O` 总览图表、`6`/`A` 账号与真实额度、`Q` 刷新、`Enter`/`u` 切换）；`$D agy account list\|status [--quota]\|add\|use\|note\|remove\|import-agy-swap\|restore-entry`（经 `agy -p /usage` 取真实额度，不自动换号）；`$D usage [--since 24h\|7d] [--by account\|day\|run\|repo] [--json]`，见 [agy 账号与用量](references/agy-accounts.md) |
+| 工期参数校准 | `$D speed [--since 7d\|14d\|all] [--repo PATH] [--json]` 算 `t_chain`/`t_crit`/`P_eff`/`T_merge` 与漂移，见 [容量与工期](references/capacity.md) |
 
 `start`/`run` 派发前比对在跑与近 14 天 `history`，相似时在 stderr 提示最多 3 条（只提示不拦截）。
 

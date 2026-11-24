@@ -1786,6 +1786,7 @@ fn admit_waiting(run: &Path, meta: &mut Value) -> Res<bool> {
                     "mode": s(meta, "mode"),
                     "tier": meta["tier"],
                     "model": meta["model"],
+                    "parent": meta["parent"],
                     "fromQueue": true,
                 }),
             );

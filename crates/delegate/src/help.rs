@@ -188,6 +188,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "Summarize local agy token usage by account, day, run, or repo (author vs reviewer split, uncounted running runs listed separately).",
     ),
     (
+        "speed",
+        "Calibrate wall-clock estimation parameters (t_chain, t_crit, P_eff, T_merge) per repo from events.jsonl and track drift.",
+    ),
+    (
         "protocol",
         "Print the harness protocol version, caller and agents as JSON.",
     ),
@@ -418,6 +422,11 @@ pub fn print(command: Option<&str>) -> bool {
             ("--repo PATH", "Filter to one repository path or basename."),
             ("--all", "Include non-agy (Pi) runs in addition to agy runs."),
             ("--json", "Print structured JSON output."),
+        ]),
+        "speed" => ("[--since 7d|14d|all] [--repo PATH] [--json]", "Calibrate wall-clock estimation parameters (T_dev = max(D*t_crit, N*t_chain/P_eff) + T_merge) per repo from <state_dir>/events.jsonl. Automatically expands a <14d window to 14d when a repo has fewer than 30 applied write chains, appends each snapshot to <state_dir>/speed/<repo-slug>.jsonl, and flags >20% drift against the previous run.", &[
+            ("--since 7d|14d|all", "Time window to include (default: 7d; auto-expands to 14d when <30 applied write chains)."),
+            ("--repo PATH", "Filter to one repository path or basename."),
+            ("--json", "Print all numeric metrics and drift details as JSON."),
         ]),
         "protocol" => ("", "Print one JSON line for harness adapters: protocol version, delegate version, the caller session and its source variable, and each agent's tier, resolved binary, version and PATH entries it shadows.", &[]),
         _ => return false,

@@ -10,3 +10,22 @@
 ## 放行
 
 全机启动锁内复查全部容量并登记放行，避免多个等待者抢同一名额。排在前面的任务若其模型或仓库满了，就暂时跳过；尚可运行的前序任务先虚拟保留名额，确保同级 FIFO 与 reply 优先。`ahead` 是所有更高优先级及同级较早入队的任务数，不表示它们会阻塞本任务。容量队每 100ms 检查一次，也能在没有任何 active 任务时等内存水位恢复；heavy lane 的锁等待机制不变。
+
+## 工期参数校准（speed）
+
+用写任务链数 `N` 与关键路径深度 `D` 估墙钟，不再按人类工作日估算：
+
+```text
+T_dev = max(D · t_crit, N · t_chain / P_eff) + T_merge
+```
+
+运行 `delegate speed [--since 7d|14d|all] [--repo PATH] [--json]`，从全机事件流 `<state>/events.jsonl` 按仓库计算各参数（建议每周校准一次）：
+
+- **写任务链（`t_chain`）**：`started` 且 `mode == "write"` 的 run 按 `payload.parent` 递归归到根任务；统计从首次 `started` 到首次 `applied` 的墙钟分布（`p50` / `p75` / `mean` 与合入条数），公式中的 `t_chain` 取 `p50`。
+- **关键路径单链耗时（`t_crit`）**：非一次过写链（链内 `started` 的 run 数 `> 1` 或出现过 `rework_sent`）的 `p50` / `p75`；一次过写链的 `p50` 单独列出。
+- **返工率（分母为已合入写链）**：自动打回比例（含 `rework_sent`）、总非一次过比例（run 数 `> 1` 或含 `rework_sent`）、3 轮以上占比（总轮数 = 链内 `started` run 数 + `rework_sent` 次数 `>= 3`）。
+- **有效并发（`P_eff`）**：按分钟统计至少有 1 条写链在跑的活跃分钟内并发均值（同时输出 `p50` / `p75`），以及每活跃小时合入写链数；每条链的活跃区间取链内各 run 从 `started` 到终态（`delivered` / `rejected` / `failed` / `stopped` / `question`，无终态回退 `applied`）的并集，不把交付后等待合入的空闲时段计入并发。
+- **合入摩擦（`T_merge`）**：`premerge_conflict` / `premerge_failed` 写链占比（分母为窗口内全部写链），以及每条已合入写链最后一次 `delivered` / `review_verdict` 到首次 `applied` 的等待耗时 `p75`。
+- **只读链**：`mode != "write"` 的任务链按首次 `started` 到末次终态计算 `p50` / `p75`，单独列示。
+- **自动扩窗**：请求窗口短于 14 天（默认 `7d`）且该仓库已合入写链不足 30 条时，自动扩至 `14d` 并在表尾说明。
+- **历史记录与漂移**：每次运行将快照追加到 `<state>/speed/<repo-slug>.jsonl`，并与上一条记录对比 `t_chain`、`t_crit`、`P_eff`、`T_merge` 的相对变化，超过 `±20%` 标出 `⚠`。
