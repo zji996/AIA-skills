@@ -1,5 +1,11 @@
 # delegate
 
+## 审查模型可配置、按类别选 thinking、格式补问与补充审查
+
+- 按配置或单次参数选定审查模型并容错回退：在 `.delegate.json` 或用户配置设置 `review.model` / `review.thinking`（或传 `start --review-model <别名>`，优先级 CLI > 仓库 > 用户 > `review` 档位）；不可用时回退 `review` 档并在审查卡写 `审查改用 <别名>（原因）`，审查卡与 `status` 显示实际模型。Configure reviewer model/thinking with 4-layer precedence, non-silent fallback to the review tier on unavailability, and actual model display in card and status.
+- 按任务类别定默认思考档：`delegate start --class build|hard|design|scout` 在未显式给 `--thinking` 时分别默认 `medium`/`high`/`medium`/`medium` 并回显 `thinking <档>〔类别 <类>〕`；显式 `--thinking` 优先。Class-based default thinking (`build`/`design`/`scout` -> `medium`, `hard` -> `high`) when `--thinking` is omitted.
+- 审查员格式出错同会话补问与 `review.extra` 补充审查：审查员首行缺 `PASS`/`REWORK`/`NEEDS_CONTROLLER` 时在同会话尾部补问 1 次，仍不合格才判 `formatError` 并注明「补问 1 次仍无结论」；配置 `review.extra` 仅在命中 `controllerReviewPaths` 或 `risk:high` 且 `agy-quota.json` Claude/GPT 池余量高于阈值时并行跑第二意见（低于阈值跳过并写明余量，意见不一致时标「意见不一致」并升 `NEEDS_CONTROLLER`）。Single same-session format-error follow-up and trigger/quota-gated supplementary review (`review.extra`) escalating disagreements to `NEEDS_CONTROLLER`.
+
 ## agy 按账号与时间段用量统计与余量快照推算
 
 - 换号后查各账号近 24 小时或 7 天用了多少 token：`delegate usage --since 24h --by account` / `--since 7d --by day|run|repo --json`，作者与审查员轮次分列，审查员用量单独落在 `review/round-N/usage.json` 并汇总进 `summary.json`（只记活跃 `agy` 槽位 ID、不记邮箱），运行中拿到累计用量实时更新，拿不到单列「运行中未计」。Summarize local `agy` token usage by account slot, day, run, or repo with author vs reviewer split and uncounted running runs listed separately.

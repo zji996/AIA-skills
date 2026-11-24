@@ -427,6 +427,67 @@ pub fn validate_areas_config(v: Option<&Value>) -> Res<()> {
     Ok(())
 }
 
+/// Merge user and repository `review` config layers.
+/// Repository overrides user per-field (`true` enables while keeping user-level `model`/`thinking`,
+/// `false` or `{"enabled": false}` disables). Returns `(merged_review, model_source)` where
+/// `model_source` is `Some("repo")` or `Some("user")` when an explicit `review.model` is set.
+pub fn merge_review(
+    user: Option<&Value>,
+    repo: Option<&Value>,
+) -> (Option<Value>, Option<&'static str>) {
+    let user = user.filter(|v| !v.is_null());
+    let repo = repo.filter(|v| !v.is_null());
+    let has_model = |v: Option<&Value>| {
+        v.and_then(Value::as_object)
+            .and_then(|m| m.get("model"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+    };
+    let model_source = if has_model(repo) {
+        Some("repo")
+    } else if has_model(user) {
+        Some("user")
+    } else {
+        None
+    };
+    match (user, repo) {
+        (None, None) => (None, None),
+        (Some(u), None) => (Some(u.clone()), model_source),
+        (None, Some(r)) => (Some(r.clone()), model_source),
+        (Some(u), Some(r)) => {
+            if r == &json!(false)
+                || r.as_object().and_then(|m| m.get("enabled")) == Some(&json!(false))
+            {
+                return (Some(r.clone()), None);
+            }
+            let mut merged = match u {
+                Value::Object(um) => um.clone(),
+                Value::Bool(flag) => {
+                    let mut m = serde_json::Map::new();
+                    m.insert("enabled".into(), json!(flag));
+                    m
+                }
+                _ => serde_json::Map::new(),
+            };
+            match r {
+                Value::Bool(true) => {
+                    merged.insert("enabled".into(), json!(true));
+                }
+                Value::Object(rm) => {
+                    for (k, v) in rm {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                    if !rm.contains_key("enabled") {
+                        merged.insert("enabled".into(), json!(true));
+                    }
+                }
+                _ => {}
+            }
+            (Some(Value::Object(merged)), model_source)
+        }
+    }
+}
+
 pub fn load(top: Option<&Path>) -> Res<Config> {
     let user_file = user_path();
     let user = read_file(&user_file)?;
@@ -489,7 +550,6 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         "repoMaxActive",
         "resultChars",
         "acceptBlind",
-        "review",
         "controllerReviewPaths",
         "riskRules",
         "stall",
@@ -509,6 +569,16 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
     let mut defaults = json!({});
     let mut standing = json!({});
     let mut origins = json!({"defaults":{},"standing":{}});
+    let (merged_review, review_model_source) = merge_review(
+        user.as_ref().and_then(|u| u.get("review")),
+        repo.as_ref().and_then(|r| r.get("review")),
+    );
+    if let Some(rv) = merged_review {
+        value["review"] = rv;
+    }
+    if let Some(src) = review_model_source {
+        origins["reviewModel"] = json!(src);
+    }
     let mut keep = Vec::<Value>::new();
     let mut rules: Vec<Value> = vec![];
     let mut rule_sources = Vec::new();
@@ -809,5 +879,42 @@ mod tests {
             let err = validate(&bad, p, true).unwrap_err();
             assert!(err.contains("areas"), "expected areas error, got {err}");
         }
+    }
+
+    #[test]
+    fn merge_review_preserves_precedence_and_boolean_shorthand() {
+        // Repo true alone: stays true, no explicit model source (uses review tier).
+        let (v, src) = merge_review(None, Some(&json!(true)));
+        assert_eq!(v, Some(json!(true)));
+        assert_eq!(src, None);
+
+        // User specifies model, repo enables with `true`: user model is preserved.
+        let (v, src) = merge_review(
+            Some(&json!({"enabled": true, "model": "hydrogen", "thinking": "high"})),
+            Some(&json!(true)),
+        );
+        let merged = v.unwrap();
+        assert_eq!(merged["enabled"], json!(true));
+        assert_eq!(merged["model"], json!("hydrogen"));
+        assert_eq!(merged["thinking"], json!("high"));
+        assert_eq!(src, Some("user"));
+
+        // Repo overrides user model.
+        let (v, src) = merge_review(
+            Some(&json!({"enabled": true, "model": "hydrogen", "thinking": "high"})),
+            Some(&json!({"enabled": true, "model": "sonnet", "thinking": "medium"})),
+        );
+        let merged = v.unwrap();
+        assert_eq!(merged["model"], json!("sonnet"));
+        assert_eq!(merged["thinking"], json!("medium"));
+        assert_eq!(src, Some("repo"));
+
+        // Repo false disables user-enabled review.
+        let (v, src) = merge_review(
+            Some(&json!({"enabled": true, "model": "hydrogen"})),
+            Some(&json!(false)),
+        );
+        assert_eq!(v, Some(json!(false)));
+        assert_eq!(src, None);
     }
 }

@@ -2725,18 +2725,36 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
         .is_some_and(|sg| b(sg, "required") && !b(sg, "valid"));
 
     let review_section = if review_doc.is_object() {
-        json!({
+        let mut sec = json!({
             "enabled": true,
             "status": review_doc["status"],
             "verdict": review_doc["verdict"],
             "originalVerdict": review_doc["originalVerdict"],
             "round": review_doc["round"],
             "reworkRounds": review_doc["reworkRounds"],
+            "model": review_doc["model"],
+            "modelName": review_doc["modelName"],
+            "thinking": review_doc["thinking"],
             "upgradedBy": review_doc["upgradedBy"],
             "cancelledBy": review_doc["cancelledBy"],
             "conclusion": rev_conclusion,
             "verdictFile": rev_verdict_file,
-        })
+        });
+        for key in [
+            "fallback",
+            "formatError",
+            "formatRetried",
+            "formatRetryFailed",
+            "parseError",
+            "extra",
+        ] {
+            if let Some(v) = review_doc.get(key) {
+                if !v.is_null() {
+                    sec[key] = v.clone();
+                }
+            }
+        }
+        sec
     } else {
         json!({"enabled": false})
     };
@@ -2854,6 +2872,20 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
     Ok(card_doc)
 }
 
+/// Deterministically evaluate built-in and repo-configured risk rules against a unified diff.
+/// Used both for card rendering and for pre-flight `review.extra` trigger checks (`risk:high`).
+pub fn evaluate_diff_rule_risks(meta: &Value, diff_text: &str) -> Vec<RiskItem> {
+    let parsed_files = parse_unified_diff(diff_text);
+    let (controller_paths, protect_rules, allowed_rules, risk_cfg) = load_effective_configs(meta);
+    detect_rule_risks(
+        &parsed_files,
+        &controller_paths,
+        &protect_rules,
+        &allowed_rules,
+        &risk_cfg,
+    )
+}
+
 /// Compute and persist `run/card.json` + compact `sum["card"]` during supervisor settlement.
 /// Never fails the run: auxiliary failure degrades gracefully with a diagnostic warning.
 pub fn generate_and_save(run: &Path, meta: &Value, sum: &mut Value) {
@@ -2922,23 +2954,56 @@ pub fn render_card_human(card: &Value) -> String {
         "未设验收".into()
     };
     let rev = &card["review"];
+    let rev_model_label = {
+        let name = s(rev, "modelName");
+        if !name.is_empty() {
+            name.to_string()
+        } else {
+            s(rev, "model").to_string()
+        }
+    };
+    let rev_extra = &rev["extra"];
+    let extra_disagreed = rev_extra.is_object() && b(rev_extra, "disagreed");
+    let format_retry_failed =
+        b(rev, "formatRetryFailed") || (b(rev, "formatError") && b(rev, "formatRetried"));
     let review_head = if b(rev, "enabled") {
         let v = s(rev, "verdict");
         let orig = s(rev, "originalVerdict");
         let st = s(rev, "status");
-        if st == "cancelled" {
+        let base = if st == "cancelled" {
             format!("已取消（{}）", s(rev, "cancelledBy"))
         } else if !v.is_empty() {
             let up = s(rev, "upgradedBy");
             let has_orig = !orig.is_empty() && orig != v;
-            match (up.is_empty(), has_orig) {
-                (true, false) => v.to_string(),
-                (false, false) => format!("{v}（{up}）"),
-                (true, true) => format!("{v}（原判 {orig}）"),
-                (false, true) => format!("{v}（原判 {orig}，经 {up} 升级）"),
+            let mut notes = Vec::new();
+            if has_orig {
+                notes.push(format!("原判 {orig}"));
+            }
+            if !up.is_empty() {
+                if has_orig {
+                    notes.push(format!("经 {up} 升级"));
+                } else {
+                    notes.push(up.to_string());
+                }
+            }
+            if format_retry_failed {
+                notes.push("补问 1 次仍无结论".into());
+            }
+            if extra_disagreed {
+                notes.push("意见不一致".into());
+            }
+            if notes.is_empty() {
+                v.to_string()
+            } else {
+                format!("{v}（{}）", notes.join("，"))
             }
         } else {
             st.to_string()
+        };
+        if !rev_model_label.is_empty() {
+            format!("{base} · {rev_model_label}")
+        } else {
+            base
         }
     } else {
         "未启用".into()
@@ -2959,6 +3024,27 @@ pub fn render_card_human(card: &Value) -> String {
         out.push(format!(
             "验收：{accept_line} · 审查：{review_head} · 用量 {tok_str}"
         ));
+    }
+    if rev["fallback"].is_object() {
+        let fb = &rev["fallback"];
+        let to = {
+            let n = s(fb, "to");
+            if !n.is_empty() { n } else { s(fb, "toModel") }
+        };
+        let reason = s(fb, "reason");
+        if !to.is_empty() {
+            if reason.is_empty() {
+                out.push(format!("审查改用 {to}"));
+            } else {
+                out.push(format!("审查改用 {to}（{reason}）"));
+            }
+        }
+    }
+    if rev_extra.is_object() && s(rev_extra, "status") == "skipped" {
+        let skip_reason = s(rev_extra, "skipReason");
+        if !skip_reason.is_empty() {
+            out.push(skip_reason.to_string());
+        }
     }
     if card["premerge"].is_object() {
         let pm = &card["premerge"];
@@ -3088,7 +3174,59 @@ pub fn render_card_human(card: &Value) -> String {
         } else {
             verdict.to_string()
         };
-        out.push(format!("   审查员：{v_prefix} — {concl_part}{vf_part}"));
+        let rev_label = if rev_model_label.is_empty() {
+            "审查员".to_string()
+        } else {
+            format!("审查员（{rev_model_label}）")
+        };
+        let retry_note = if format_retry_failed {
+            "〔补问 1 次仍无结论〕"
+        } else {
+            ""
+        };
+        out.push(format!("   {rev_label}：{v_prefix}{retry_note} — {concl_part}{vf_part}"));
+        if rev_extra.is_object() {
+            let em = {
+                let n = s(rev_extra, "modelName");
+                if !n.is_empty() { n } else { s(rev_extra, "model") }
+            };
+            let em_tag = if em.is_empty() {
+                "补充审查".to_string()
+            } else {
+                format!("补充审查（{em}）")
+            };
+            match s(rev_extra, "status") {
+                "done" => {
+                    let ev = s(rev_extra, "verdict");
+                    let disagree = if b(rev_extra, "disagreed") {
+                        "（意见不一致）"
+                    } else {
+                        ""
+                    };
+                    let econcl = {
+                        let c = s(rev_extra, "conclusion");
+                        if c.is_empty() { "无正文结论" } else { c }
+                    };
+                    let evf = s(rev_extra, "verdictFile");
+                    let evf_part = if evf.is_empty() {
+                        String::new()
+                    } else {
+                        format!("（原文：{evf}）")
+                    };
+                    out.push(format!(
+                        "   {em_tag}：{ev}{disagree} — {econcl}{evf_part}"
+                    ));
+                }
+                "error" => {
+                    let err = s(rev_extra, "error");
+                    out.push(format!(
+                        "   {em_tag}：失败（{}，以主审查为准）",
+                        if err.is_empty() { "执行异常" } else { err }
+                    ));
+                }
+                _ => {}
+            }
+        }
     }
     out.push(String::new());
 
@@ -3861,6 +3999,88 @@ mod tests {
         assert!(
             rendered.contains("apps/web/src/styles/agent-birth.css（日志：/tmp/run/accept.log:42）"),
             "{rendered}"
+        );
+    }
+
+    #[test]
+    fn card_renders_review_model_fallback_format_retry_and_extra_review() {
+        let card = json!({
+            "run": "20261124-203347-rev-demo",
+            "name": "rev-demo",
+            "state": "delivered",
+            "changes": {"files": 1, "added": 5, "deleted": 1},
+            "l0": {},
+            "author": {"lines": ["demo change"], "path": "/tmp/run/result.md", "totalLines": 1, "totalChars": 11, "rounds": []},
+            "review": {
+                "enabled": true,
+                "status": "done",
+                "verdict": "NEEDS_CONTROLLER",
+                "originalVerdict": "PASS",
+                "upgradedBy": "extraReviewDisagreement",
+                "model": "agy/rev-fallback",
+                "modelName": "rev-fb",
+                "fallback": {
+                    "from": "hydrogen",
+                    "to": "rev-fb",
+                    "reason": "额度用尽"
+                },
+                "formatError": true,
+                "formatRetried": true,
+                "formatRetryFailed": true,
+                "conclusion": "主审查结论",
+                "verdictFile": "/tmp/run/review/round-1-verdict.md",
+                "extra": {
+                    "status": "done",
+                    "modelName": "sonnet",
+                    "verdict": "REWORK",
+                    "disagreed": true,
+                    "conclusion": "补充审查指出风险",
+                    "verdictFile": "/tmp/run/review/round-1-extra-verdict.md"
+                }
+            },
+            "risks": [],
+            "riskStats": {"total": 0, "ruleHits": 0, "reviewerHints": 0},
+            "tests": {"added": 0, "modified": 0, "deleted": 0, "testFiles": 0},
+            "accept": {"ok": true, "command": "true"},
+            "otherChanges": [],
+            "next": [],
+        });
+        let rendered = render_card_human(&card);
+        assert!(rendered.contains("rev-fb"), "{rendered}");
+        assert!(rendered.contains("审查改用 rev-fb（额度用尽）"), "{rendered}");
+        assert!(rendered.contains("补问 1 次仍无结论"), "{rendered}");
+        assert!(rendered.contains("意见不一致"), "{rendered}");
+        assert!(rendered.contains("补充审查（sonnet）：REWORK（意见不一致）"), "{rendered}");
+
+        let skipped_card = json!({
+            "run": "20261124-203347-skip-demo",
+            "name": "skip-demo",
+            "state": "delivered",
+            "changes": {"files": 1, "added": 5, "deleted": 1},
+            "l0": {},
+            "author": {"lines": ["demo"], "path": "/tmp/run/result.md", "totalLines": 1, "totalChars": 4, "rounds": []},
+            "review": {
+                "enabled": true,
+                "status": "done",
+                "verdict": "PASS",
+                "modelName": "hydrogen",
+                "extra": {
+                    "status": "skipped",
+                    "modelName": "sonnet",
+                    "skipReason": "补充审查跳过：Claude 池剩余 5 小时 40% / 本周 60%"
+                }
+            },
+            "risks": [],
+            "riskStats": {"total": 0, "ruleHits": 0, "reviewerHints": 0},
+            "tests": {"added": 0, "modified": 0, "deleted": 0, "testFiles": 0},
+            "accept": {"ok": true, "command": "true"},
+            "otherChanges": [],
+            "next": [],
+        });
+        let skipped_rendered = render_card_human(&skipped_card);
+        assert!(
+            skipped_rendered.contains("补充审查跳过：Claude 池剩余 5 小时 40% / 本周 60%"),
+            "{skipped_rendered}"
         );
     }
 }

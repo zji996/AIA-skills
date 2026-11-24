@@ -21,6 +21,14 @@ use std::sync::{
 pub const DEFAULT_RUBRIC: &str =
     include_str!("../../../skills/delegate/references/review-rubric.md");
 
+/// Verbatim single tail-appended follow-up prompt when the reviewer's first line is not
+/// `PASS`, `REWORK`, or `NEEDS_CONTROLLER` (reuses the same session and model binding).
+pub const FORMAT_RETRY_PROMPT: &str = "上一条回复缺少结论。验收已由流水线跑完，不用等命令。请直接给出结论：首行只写 PASS、REWORK 或 NEEDS_CONTROLLER，下面写理由，并附「## 主控重点看」。";
+
+const EXTRA_TRIGGERS: [&str; 3] = ["controllerReviewPaths", "risk:high", "risk:critical"];
+const DEFAULT_EXTRA_MIN_FIVE_HOUR_PCT: f64 = 50.0;
+const DEFAULT_EXTRA_MIN_WEEKLY_PCT: f64 = 30.0;
+
 const MAX_INLINE_DIFF_BYTES: usize = 200 * 1024;
 const NEEDS_ATTENTION_REWORK_ROUND: u64 = 3;
 
@@ -147,6 +155,98 @@ pub fn glob_match(pattern: &str, path: &str) -> bool {
     dp(pb, sb, 0, 0, &mut memo)
 }
 
+fn validate_extra_review_config(val: &Value) -> Res<()> {
+    match val {
+        Value::Null | Value::Bool(false) => Ok(()),
+        Value::Object(map) => {
+            let mut enabled = true;
+            for (k, v) in map {
+                match k.as_str() {
+                    "enabled" => {
+                        enabled = v.as_bool().ok_or("review.extra.enabled must be a boolean")?;
+                    }
+                    "model" => {
+                        let m = v.as_str().ok_or("review.extra.model must be a string")?;
+                        models::validate_model(m)?;
+                    }
+                    "thinking" => {
+                        let t = v.as_str().ok_or("review.extra.thinking must be a string")?;
+                        models::validate_thinking(t)?;
+                    }
+                    "on" => {
+                        let arr = v
+                            .as_array()
+                            .ok_or("review.extra.on must be a list of trigger names")?;
+                        for item in arr {
+                            let name = item
+                                .as_str()
+                                .ok_or("review.extra.on entries must be strings")?;
+                            if !EXTRA_TRIGGERS.contains(&name) {
+                                return Err(format!(
+                                    "review.extra.on has unknown trigger {name:?} (allowed: {})",
+                                    EXTRA_TRIGGERS.join(", ")
+                                ));
+                            }
+                        }
+                    }
+                    "minQuota" => {
+                        if !v.is_null() {
+                            let mq = v
+                                .as_object()
+                                .ok_or("review.extra.minQuota must be an object {fiveHour?, weekly?}")?;
+                            for (mk, mv) in mq {
+                                match mk.as_str() {
+                                    "fiveHour" | "weekly" => {
+                                        let pct = mv.as_f64().ok_or_else(|| {
+                                            format!("review.extra.minQuota.{mk} must be a number 0..=100")
+                                        })?;
+                                        if !pct.is_finite() || !(0.0..=100.0).contains(&pct) {
+                                            return Err(format!(
+                                                "review.extra.minQuota.{mk} must be within 0..=100"
+                                            ));
+                                        }
+                                    }
+                                    other => {
+                                        return Err(format!(
+                                            "review.extra.minQuota has unknown field {other:?} (allowed: fiveHour, weekly)"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "review.extra has unknown field {other:?} (allowed: enabled, model, thinking, on, minQuota)"
+                        ));
+                    }
+                }
+            }
+            if enabled {
+                if map
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .is_none_or(|m| m.is_empty())
+                {
+                    return Err("review.extra.model is required when review.extra is enabled".into());
+                }
+                if map
+                    .get("on")
+                    .and_then(Value::as_array)
+                    .is_none_or(|a| a.is_empty())
+                {
+                    return Err("review.extra.on must be a non-empty list when review.extra is enabled".into());
+                }
+            }
+            Ok(())
+        }
+        _ => Err(
+            "review.extra must be false, null, or {enabled?, model, thinking?, on, minQuota?}"
+                .into(),
+        ),
+    }
+}
+
 pub fn validate_review_config(value: Option<&Value>) -> Res<()> {
     let Some(v) = value else { return Ok(()) };
     match v {
@@ -188,9 +288,12 @@ pub fn validate_review_config(value: Option<&Value>) -> Res<()> {
                             );
                         }
                     }
+                    "extra" => {
+                        validate_extra_review_config(val)?;
+                    }
                     other => {
                         return Err(format!(
-                            "review has unknown field {other:?} (allowed: enabled, tier, model, thinking, rubric)"
+                            "review has unknown field {other:?} (allowed: enabled, tier, model, thinking, rubric, extra)"
                         ));
                     }
                 }
@@ -198,7 +301,8 @@ pub fn validate_review_config(value: Option<&Value>) -> Res<()> {
             Ok(())
         }
         _ => Err(
-            "review must be a boolean or {enabled?, tier?, model?, thinking?, rubric?}".into(),
+            "review must be a boolean or {enabled?, tier?, model?, thinking?, rubric?, extra?}"
+                .into(),
         ),
     }
 }
@@ -225,36 +329,219 @@ pub fn is_enabled(review_val: &Value) -> bool {
     }
 }
 
-/// Resolve reviewer model/agent/rubric at launch time and snapshot into `meta["reviewConfig"]`.
-pub fn resolve_launch_config(config_val: &Value, repo: Option<&Path>) -> Res<Option<Value>> {
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewModelSelection {
+    pub tier: String,
+    pub model: String,
+    pub model_name: String,
+    pub thinking: Option<String>,
+    pub model_source: String,
+    pub fallback_model: Option<String>,
+    pub fallback_name: Option<String>,
+    pub fallback_thinking: Option<String>,
+    pub launch_fallback_from: Option<String>,
+    pub launch_fallback_reason: Option<String>,
+}
+
+/// Pure model selection for automatic review, respecting four-layer precedence:
+/// `start --review-model` (`cli`) > repo `.delegate.json` (`repo`) > user config (`user`) > `review` tier (`tier`).
+/// If the explicitly selected model cannot be resolved in the alias/model registry, falls back to
+/// the `review` tier with a non-silent reason.
+pub fn resolve_review_selection(
+    config_val: &Value,
+    cli_model: Option<&str>,
+    config_model_source: Option<&str>,
+    listed: &[models::PiModel],
+) -> Res<Option<ReviewModelSelection>> {
     let review_val = &config_val["review"];
-    if !is_enabled(review_val) {
+    let cli_model = cli_model.filter(|m| !m.is_empty());
+    let enabled = match review_val {
+        Value::Bool(flag) => *flag,
+        Value::Object(map) => map.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+        Value::Null => cli_model.is_some(),
+        _ => false,
+    };
+    if !enabled {
         return Ok(None);
     }
     let tier = review_val["tier"]
         .as_str()
         .filter(|t| !t.is_empty())
-        .unwrap_or("review");
-    let explicit_model = review_val["model"].as_str().filter(|m| !m.is_empty());
+        .unwrap_or("review")
+        .to_string();
     let explicit_thinking = review_val["thinking"].as_str().filter(|t| !t.is_empty());
-    let listed = agents::pi_models();
-    let (model, model_name, thinking) = if let Some(name) = explicit_model {
-        let resolved = models::resolve_model(name, config_val, &listed)?;
-        let think = models::thinking(explicit_thinking, &json!(name), config_val)?;
-        (resolved, name.to_string(), think)
-    } else {
-        let pick = models::pick(
+
+    let tier_pick = models::pick(
+        config_val,
+        &tier,
+        None,
+        listed,
+        agents::local_clock(),
+        &|_| 0,
+    );
+    let tier_pick_with_thinking = if explicit_thinking.is_some() {
+        models::pick(
             config_val,
-            tier,
+            &tier,
             explicit_thinking,
-            &listed,
+            listed,
             agents::local_clock(),
             &|_| 0,
-        )?;
-        (pick.model, pick.name, pick.thinking)
+        )
+    } else {
+        tier_pick.clone()
     };
-    let colleague = crate::agy::colleague(&model);
-    let (agent_bin, agent_version) = agents::agent_identity(colleague)?;
+
+    let (explicit_model, model_source) = if let Some(m) = cli_model {
+        (Some(m), "cli")
+    } else if let Some(m) = review_val["model"].as_str().filter(|m| !m.is_empty()) {
+        (Some(m), config_model_source.unwrap_or("repo"))
+    } else {
+        (None, "tier")
+    };
+
+    if let Some(name) = explicit_model {
+        match models::resolve_model(name, config_val, listed)
+            .and_then(|resolved| {
+                let think = models::thinking(explicit_thinking, &json!(name), config_val)?;
+                Ok((resolved, think))
+            }) {
+            Ok((resolved, think)) => {
+                let alias = models::selected_alias(name, config_val).to_string();
+                let (fb_model, fb_name, fb_thinking) = match tier_pick {
+                    Ok(fb) if fb.model != resolved => {
+                        let fb_alias = models::selected_alias(&fb.name, config_val).to_string();
+                        (Some(fb.model), Some(fb_alias), fb.thinking)
+                    }
+                    _ => (None, None, None),
+                };
+                Ok(Some(ReviewModelSelection {
+                    tier,
+                    model: resolved,
+                    model_name: alias,
+                    thinking: think,
+                    model_source: model_source.to_string(),
+                    fallback_model: fb_model,
+                    fallback_name: fb_name,
+                    fallback_thinking: fb_thinking,
+                    launch_fallback_from: None,
+                    launch_fallback_reason: None,
+                }))
+            }
+            Err(err) => {
+                let fb = tier_pick.map_err(|_| err.clone())?;
+                let fb_alias = models::selected_alias(&fb.name, config_val).to_string();
+                let reason = if err.contains("not registered") {
+                    format!("模型 {name} 未登记")
+                } else {
+                    format!("模型 {name} 不可用")
+                };
+                Ok(Some(ReviewModelSelection {
+                    tier,
+                    model: fb.model,
+                    model_name: fb_alias,
+                    thinking: fb.thinking,
+                    model_source: "tier".to_string(),
+                    fallback_model: None,
+                    fallback_name: None,
+                    fallback_thinking: None,
+                    launch_fallback_from: Some(name.to_string()),
+                    launch_fallback_reason: Some(reason),
+                }))
+            }
+        }
+    } else {
+        let pick = tier_pick_with_thinking?;
+        let alias = models::selected_alias(&pick.name, config_val).to_string();
+        Ok(Some(ReviewModelSelection {
+            tier,
+            model: pick.model,
+            model_name: alias,
+            thinking: pick.thinking,
+            model_source: "tier".to_string(),
+            fallback_model: None,
+            fallback_name: None,
+            fallback_thinking: None,
+            launch_fallback_from: None,
+            launch_fallback_reason: None,
+        }))
+    }
+}
+
+/// Resolve reviewer model/agent/rubric/fallback/extra at launch time and snapshot into `meta["reviewConfig"]`.
+pub fn resolve_launch_config(
+    config_val: &Value,
+    repo: Option<&Path>,
+    cli_model: Option<&str>,
+    config_model_source: Option<&str>,
+) -> Res<Option<Value>> {
+    let listed = agents::pi_models();
+    let Some(sel) = resolve_review_selection(config_val, cli_model, config_model_source, &listed)?
+    else {
+        return Ok(None);
+    };
+    let review_val = &config_val["review"];
+
+    let mut model = sel.model;
+    let mut model_name = sel.model_name;
+    let mut thinking = sel.thinking;
+    let mut model_source = sel.model_source;
+    let mut launch_fallback: Option<Value> = match (&sel.launch_fallback_from, &sel.launch_fallback_reason) {
+        (Some(from), Some(reason)) => Some(json!({
+            "from": from,
+            "to": model_name,
+            "toModel": model,
+            "reason": reason,
+        })),
+        _ => None,
+    };
+
+    let mut fallback_json: Option<Value> = None;
+    if let (Some(fb_model), Some(fb_name)) = (&sel.fallback_model, &sel.fallback_name) {
+        let fb_colleague = crate::agy::colleague(fb_model);
+        if let Ok((fb_bin, fb_ver)) = agents::agent_identity(fb_colleague) {
+            fallback_json = Some(json!({
+                "tier": sel.tier,
+                "model": fb_model,
+                "modelName": fb_name,
+                "thinking": sel.fallback_thinking,
+                "agent": fb_colleague,
+                "agentBin": fb_bin,
+                "agentVersion": fb_ver,
+            }));
+        }
+    }
+
+    let primary_colleague = crate::agy::colleague(&model);
+    let (colleague, agent_bin, agent_version) = match agents::agent_identity(primary_colleague) {
+        Ok((bin, ver)) => (primary_colleague, bin, ver),
+        Err(err) => {
+            if let Some(fb) = fallback_json.take() {
+                let from_alias = model_name.clone();
+                let from_model = model.clone();
+                model = s(&fb, "model").to_string();
+                model_name = s(&fb, "modelName").to_string();
+                thinking = fb["thinking"].as_str().map(str::to_string);
+                model_source = "tier".to_string();
+                launch_fallback = Some(json!({
+                    "from": from_alias,
+                    "fromModel": from_model,
+                    "to": model_name,
+                    "toModel": model,
+                    "reason": format!("启动失败：{}", clip(&err, 80)),
+                }));
+                let fb_col = crate::agy::colleague(&model);
+                (
+                    fb_col,
+                    PathBuf::from(s(&fb, "agentBin")),
+                    fb["agentVersion"].as_str().map(str::to_string),
+                )
+            } else {
+                return Err(err);
+            }
+        }
+    };
+
     let rubric = review_val["rubric"]
         .as_str()
         .filter(|s| !s.trim().is_empty())
@@ -268,17 +555,309 @@ pub fn resolve_launch_config(config_val: &Value, repo: Option<&Path>) -> Res<Opt
                 p.to_path_buf()
             }
         });
-    Ok(Some(json!({
+
+    let mut out = json!({
         "enabled": true,
-        "tier": tier,
+        "tier": sel.tier,
         "model": model,
         "modelName": model_name,
+        "modelSource": model_source,
         "thinking": thinking,
         "agent": colleague,
         "agentBin": agent_bin,
         "agentVersion": agent_version,
         "rubric": rubric.map(|p| p.to_string_lossy().into_owned()),
-    })))
+    });
+    if let Some(fb) = fallback_json {
+        out["fallback"] = fb;
+    }
+    if let Some(lfb) = launch_fallback {
+        out["launchFallback"] = lfb;
+    }
+
+    // Resolve optional supplementary reviewer (`review.extra`).
+    let extra_val = &review_val["extra"];
+    if extra_val.is_object()
+        && extra_val
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    {
+        let em_raw = s(extra_val, "model");
+        let em_thinking = extra_val["thinking"].as_str().filter(|t| !t.is_empty());
+        let on = strings(&extra_val["on"]);
+        let min_quota = extra_val.get("minQuota").cloned().unwrap_or(Value::Null);
+        if !em_raw.is_empty() && !on.is_empty() {
+            match models::resolve_model(em_raw, config_val, &listed).and_then(|resolved| {
+                let think = models::thinking(em_thinking, &json!(em_raw), config_val)?;
+                let col = crate::agy::colleague(&resolved);
+                let (bin, ver) = agents::agent_identity(col)?;
+                Ok((resolved, think, col, bin, ver))
+            }) {
+                Ok((resolved, think, col, bin, ver)) => {
+                    let alias = models::selected_alias(em_raw, config_val).to_string();
+                    out["extra"] = json!({
+                        "enabled": true,
+                        "model": resolved,
+                        "modelName": alias,
+                        "thinking": think,
+                        "agent": col,
+                        "agentBin": bin,
+                        "agentVersion": ver,
+                        "on": on,
+                        "minQuota": min_quota,
+                    });
+                }
+                Err(err) => {
+                    out["extra"] = json!({
+                        "enabled": true,
+                        "modelName": em_raw,
+                        "on": on,
+                        "minQuota": min_quota,
+                        "resolveError": clip(&err, 160),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(Some(out))
+}
+
+/// Classify whether a reviewer execution result indicates the configured review model is
+/// unavailable (startup failure, upstream refusal, or quota exhaustion), returning a concise
+/// Chinese reason for `审查改用 <别名>（原因）`.
+pub fn classify_unavailable_reason(
+    res: &Res<(String, String)>,
+    round_dir: &Path,
+) -> Option<String> {
+    match res {
+        Err(err) => Some(format!("启动失败：{}", clip(err, 80))),
+        Ok((outcome, text)) => {
+            if lane::stopped() || matches!(outcome.as_str(), "cancelled" | "timeout") {
+                return None;
+            }
+            if outcome == "ok" {
+                return crate::agy::is_policy_refusal(text).then(|| "上游拒绝".to_string());
+            }
+            let mut diag = Vec::new();
+            for ev in runs::events(round_dir) {
+                if matches!(s(&ev, "e"), "turn_error" | "tool_error") {
+                    let d = s(&ev, "detail").trim();
+                    if !d.is_empty() {
+                        diag.push(d.to_string());
+                    }
+                }
+            }
+            let stderr_txt = read(round_dir.join("stderr.log"));
+            if !stderr_txt.trim().is_empty() {
+                diag.push(stderr_txt);
+            }
+            if !text.trim().is_empty() {
+                diag.push(text.clone());
+            }
+            let joined = diag.join("\n").to_ascii_lowercase();
+            let quota_markers = [
+                "insufficient_quota",
+                "quota exceeded",
+                "quota",
+                "resource_exhausted",
+                "insufficient credit",
+                "rate limit",
+                "rate_limit",
+                "too many requests",
+                "429",
+                "usage limit",
+                "limit reached",
+                "capacity",
+            ];
+            if quota_markers.iter().any(|m| joined.contains(m)) {
+                return Some("额度用尽".into());
+            }
+            let refusal_markers = [
+                "prohibited use policy",
+                "content policy",
+                "sensitive words",
+                "forbidden",
+                "unauthorized",
+                "unauthenticated",
+                "model not found",
+                "no such model",
+                "unknown model",
+                "unsupported model",
+                "does not exist",
+                "bad request",
+                "bad gateway",
+                "service unavailable",
+                "upstream",
+                "rejected",
+                "refused",
+                "403",
+                "401",
+                "400",
+                "502",
+                "503",
+                "504",
+            ];
+            if refusal_markers.iter().any(|m| joined.contains(m)) {
+                return Some("上游拒绝".into());
+            }
+            Some("启动失败".into())
+        }
+    }
+}
+
+/// Evaluate which `review.extra.on` triggers matched for the current change set.
+pub fn evaluate_extra_triggers(
+    extra_cfg: &Value,
+    run: &Path,
+    meta: &Value,
+    total_diff: &str,
+) -> Vec<String> {
+    let wanted = strings(&extra_cfg["on"]);
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let mut matched = Vec::new();
+    let mut cached_risks: Option<Vec<crate::card::RiskItem>> = None;
+    for trigger in wanted {
+        let hit = match trigger.as_str() {
+            "controllerReviewPaths" => evaluate_controller_paths(run, meta, false)
+                .ok()
+                .flatten()
+                .is_some(),
+            "risk:high" => {
+                let risks = cached_risks.get_or_insert_with(|| {
+                    crate::card::evaluate_diff_rule_risks(meta, total_diff)
+                });
+                risks.iter().any(|r| r.severity <= crate::card::Severity::High)
+            }
+            "risk:critical" => {
+                let risks = cached_risks.get_or_insert_with(|| {
+                    crate::card::evaluate_diff_rule_risks(meta, total_diff)
+                });
+                risks
+                    .iter()
+                    .any(|r| r.severity == crate::card::Severity::Critical)
+            }
+            _ => false,
+        };
+        if hit {
+            matched.push(trigger);
+        }
+    }
+    matched
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExtraQuotaDecision {
+    Allow,
+    Skip {
+        five_hour_pct: Option<f64>,
+        weekly_pct: Option<f64>,
+        reason: String,
+    },
+}
+
+fn format_quota_pct_label(pct: Option<f64>) -> String {
+    match pct {
+        Some(v) if (v - v.round()).abs() < 0.05 => format!("{}%", v.round() as i64),
+        Some(v) => format!("{v:.1}%"),
+        None => "未知".to_string(),
+    }
+}
+
+/// Check cached `agy` Claude/GPT pool quota against `review.extra.minQuota` before launching
+/// the supplementary reviewer. Never runs a subprocess or refreshes quota; reads cache only.
+pub fn check_extra_quota(
+    extra_cfg: &Value,
+    quota_cache: &Value,
+    active_account: Option<&str>,
+) -> ExtraQuotaDecision {
+    let mq = &extra_cfg["minQuota"];
+    let is_agy = crate::agy::is_agy(s(extra_cfg, "model"));
+    let min_5h = mq["fiveHour"]
+        .as_f64()
+        .or_else(|| is_agy.then_some(DEFAULT_EXTRA_MIN_FIVE_HOUR_PCT));
+    let min_wk = mq["weekly"]
+        .as_f64()
+        .or_else(|| is_agy.then_some(DEFAULT_EXTRA_MIN_WEEKLY_PCT));
+    if min_5h.is_none() && min_wk.is_none() {
+        return ExtraQuotaDecision::Allow;
+    }
+
+    let Some(accounts) = quota_cache["accounts"].as_object() else {
+        return ExtraQuotaDecision::Allow;
+    };
+    let acct = active_account
+        .and_then(|id| accounts.get(id))
+        .filter(|a| a.is_object() && b(a, "ok"))
+        .or_else(|| {
+            if active_account.is_none() {
+                accounts
+                    .get("default")
+                    .filter(|a| a.is_object() && b(a, "ok"))
+                    .or_else(|| {
+                        accounts
+                            .values()
+                            .find(|a| {
+                                a.is_object()
+                                    && b(a, "ok")
+                                    && a["entries"].as_array().is_some_and(|e| !e.is_empty())
+                            })
+                    })
+            } else {
+                None
+            }
+        });
+    let Some(acct) = acct else {
+        return ExtraQuotaDecision::Allow;
+    };
+
+    let mut five_hour: Option<f64> = None;
+    let mut weekly: Option<f64> = None;
+    for entry in acct["entries"].as_array().into_iter().flatten() {
+        let pool_low = s(entry, "pool").to_ascii_lowercase();
+        if !pool_low.contains("claude") && !pool_low.contains("gpt") {
+            continue;
+        }
+        let Some(pct) = entry["remainingPct"].as_f64() else {
+            continue;
+        };
+        match s(entry, "window") {
+            "fiveHour" => five_hour = Some(five_hour.map_or(pct, |cur| cur.min(pct))),
+            "weekly" => weekly = Some(weekly.map_or(pct, |cur| cur.min(pct))),
+            _ => {}
+        }
+    }
+    if five_hour.is_none() && weekly.is_none() {
+        return ExtraQuotaDecision::Allow;
+    }
+    let low_5h = min_5h.is_some_and(|th| five_hour.is_some_and(|v| v < th));
+    let low_wk = min_wk.is_some_and(|th| weekly.is_some_and(|v| v < th));
+    if low_5h || low_wk {
+        let reason = format!(
+            "补充审查跳过：Claude 池剩余 5 小时 {} / 本周 {}",
+            format_quota_pct_label(five_hour),
+            format_quota_pct_label(weekly),
+        );
+        ExtraQuotaDecision::Skip {
+            five_hour_pct: five_hour,
+            weekly_pct: weekly,
+            reason,
+        }
+    } else {
+        ExtraQuotaDecision::Allow
+    }
+}
+
+/// Whether the supplementary reviewer's controlled verdict disagrees with the primary reviewer.
+pub fn extra_verdict_disagrees(main_verdict: &str, extra_verdict: Option<&str>) -> bool {
+    let valid = |v: &str| matches!(v, "PASS" | "REWORK" | "NEEDS_CONTROLLER");
+    let Some(ev) = extra_verdict else {
+        return false;
+    };
+    valid(main_verdict) && valid(ev) && main_verdict != ev
 }
 
 /// Locate the default rubric on disk next to the skill, or fall back to the compiled copy.
@@ -1032,6 +1611,36 @@ fn compact_controller_review(cr: &Value) -> Option<Value> {
     Some(out)
 }
 
+fn compact_extra_review(ex: &Value) -> Option<Value> {
+    if !ex.is_object() {
+        return None;
+    }
+    let mut out = serde_json::Map::new();
+    for key in [
+        "status",
+        "model",
+        "modelName",
+        "verdict",
+        "disagreed",
+        "triggers",
+        "skipReason",
+        "fiveHourPct",
+        "weeklyPct",
+        "verdictFile",
+        "conclusion",
+    ] {
+        if let Some(v) = ex.get(key) {
+            if !v.is_null() {
+                out.insert(key.to_string(), v.clone());
+            }
+        }
+    }
+    if let Some(err) = ex.get("error").and_then(Value::as_str).filter(|e| !e.is_empty()) {
+        out.insert("error".into(), json!(clip(err, MAX_PARSE_ERROR_CHARS)));
+    }
+    Some(Value::Object(out))
+}
+
 /// Produce a bounded, index-safe summary from either a new 6.33 or legacy `review.json`.
 /// Never inlines `rounds[]`, full `readOnlyViolation` lists, raw `controllerReview.diff`,
 /// or unbounded `parseError` text.
@@ -1046,11 +1655,16 @@ pub fn compact_review_summary(doc: &Value) -> Value {
         "round",
         "reworkRounds",
         "model",
+        "modelName",
+        "thinking",
         "tier",
+        "fallback",
         "needsAttention",
         "upgradedBy",
         "originalVerdict",
         "formatError",
+        "formatRetried",
+        "formatRetryFailed",
         "verdictFile",
         "conclusion",
         "focusCount",
@@ -1085,6 +1699,9 @@ pub fn compact_review_summary(doc: &Value) -> Value {
     }
     if let Some(cr) = compact_controller_review(&doc["controllerReview"]) {
         out.insert("controllerReview".into(), cr);
+    }
+    if let Some(ex) = compact_extra_review(&doc["extra"]) {
+        out.insert("extra".into(), ex);
     }
     Value::Object(out)
 }
@@ -1218,6 +1835,8 @@ struct ReviewRoundOutcome {
     raw_answer: String,
     raw_first_line: String,
     format_error: bool,
+    format_retried: bool,
+    format_retry_failed: bool,
     parse_error: Option<String>,
     upgraded_by: Option<String>,
     ro_violations: Vec<String>,
@@ -1225,11 +1844,164 @@ struct ReviewRoundOutcome {
     ro_violation_file: Option<PathBuf>,
     verdict_file: PathBuf,
     diff_file: PathBuf,
+    usage_dir: PathBuf,
     round_started: String,
     round_finished: String,
     next_continuation: Option<String>,
     conclusion: Option<String>,
     focus_count: usize,
+}
+
+struct ExtraRoundOutcome {
+    cancelled: bool,
+    verdict: Option<String>,
+    raw_answer: String,
+    conclusion: Option<String>,
+    error: Option<String>,
+}
+
+enum ExtraPreDecision {
+    None,
+    Skipped {
+        model: String,
+        model_name: String,
+        triggers: Vec<String>,
+        five_hour_pct: Option<f64>,
+        weekly_pct: Option<f64>,
+        reason: String,
+    },
+    Error {
+        model: String,
+        model_name: String,
+        triggers: Vec<String>,
+        error: String,
+    },
+    Run {
+        model: String,
+        model_name: String,
+        triggers: Vec<String>,
+        extra_dir: PathBuf,
+        extra_meta: Value,
+        verdict_file: PathBuf,
+    },
+}
+
+struct AgentAttemptWithRetry {
+    res: Res<(String, String)>,
+    format_retried: bool,
+    format_retry_failed: bool,
+}
+
+fn attach_review_model_fields(doc: &mut Value, active_cfg: &Value, fallback: Option<&Value>) {
+    doc["model"] = active_cfg["model"].clone();
+    if !s(active_cfg, "modelName").is_empty() {
+        doc["modelName"] = active_cfg["modelName"].clone();
+    }
+    if !s(active_cfg, "thinking").is_empty() {
+        doc["thinking"] = active_cfg["thinking"].clone();
+    }
+    doc["tier"] = active_cfg["tier"].clone();
+    if let Some(fb) = fallback {
+        doc["fallback"] = fb.clone();
+    }
+}
+
+fn run_agent_and_cleanup(
+    meta: &Value,
+    exec_dir: &Path,
+    attempt: i64,
+    holder: Arc<AtomicI32>,
+    grace: Arc<Mutex<Option<f64>>>,
+    cancel: Arc<AtomicBool>,
+) -> Res<(String, String)> {
+    let res = agents::run_agent_cancellable(meta, exec_dir, attempt, holder, grace, Some(cancel));
+    let pgid = read(exec_dir.join("agent.pid")).trim().parse().unwrap_or(0);
+    crate::cleanup::record(exec_dir, pgid);
+    if pgid > 0 && group_members(pgid) {
+        end_group(pgid, 1.0);
+    }
+    res
+}
+
+/// Run a single reviewer attempt; if its first line is not a controlled verdict (`PASS`, `REWORK`,
+/// `NEEDS_CONTROLLER`) and the reply was not a policy refusal or cancellation, append
+/// `FORMAT_RETRY_PROMPT` ONCE at the tail of the same session with the same model binding.
+fn run_reviewer_with_format_retry(
+    review_meta: &Value,
+    exec_dir: &Path,
+    holder: Arc<AtomicI32>,
+    grace: Arc<Mutex<Option<f64>>>,
+    cancel: Arc<AtomicBool>,
+    allow_format_retry: bool,
+) -> AgentAttemptWithRetry {
+    let first = run_agent_and_cleanup(
+        review_meta,
+        exec_dir,
+        1,
+        holder.clone(),
+        grace.clone(),
+        cancel.clone(),
+    );
+    if !allow_format_retry || cancel.load(Ordering::SeqCst) || lane::stopped() {
+        return AgentAttemptWithRetry {
+            res: first,
+            format_retried: false,
+            format_retry_failed: false,
+        };
+    }
+    let needs_retry = match &first {
+        Ok((outcome, text)) if outcome == "ok" && !crate::agy::is_policy_refusal(text) => {
+            matches!(parse_verdict(text), ParsedVerdict::Invalid(_))
+        }
+        _ => false,
+    };
+    if !needs_retry {
+        return AgentAttemptWithRetry {
+            res: first,
+            format_retried: false,
+            format_retry_failed: false,
+        };
+    }
+    let retry_prompt_file = exec_dir.join("format-retry-prompt.md");
+    let next_meta = write(&retry_prompt_file, format!("{FORMAT_RETRY_PROMPT}\n"))
+        .ok()
+        .and_then(|()| supervise::continuation_with_file(review_meta, exec_dir, &retry_prompt_file));
+    let Some(retry_meta) = next_meta else {
+        return AgentAttemptWithRetry {
+            res: first,
+            format_retried: false,
+            format_retry_failed: false,
+        };
+    };
+    supervise::log_event(
+        exec_dir,
+        json!({"e": "format_retry", "n": 1, "detail": "审查员首行缺少结论，同会话尾部补问 1 次"}),
+    );
+    let second = run_agent_and_cleanup(&retry_meta, exec_dir, 2, holder, grace, cancel);
+    let retry_failed = match &second {
+        Ok((outcome, text)) if outcome == "ok" => {
+            matches!(parse_verdict(text), ParsedVerdict::Invalid(_))
+        }
+        Ok((outcome, _)) if outcome == "cancelled" => false,
+        _ => true,
+    };
+    AgentAttemptWithRetry {
+        res: second,
+        format_retried: true,
+        format_retry_failed: retry_failed,
+    }
+}
+
+fn apply_fallback_cfg(current: &Value, fallback: &Value) -> Value {
+    let mut next = fallback.clone();
+    next["enabled"] = json!(true);
+    if !current["rubric"].is_null() {
+        next["rubric"] = current["rubric"].clone();
+    }
+    if current["extra"].is_object() {
+        next["extra"] = current["extra"].clone();
+    }
+    next
 }
 
 /// Entry point called from `supervise::inner` after `settle_pre_accept()` (and escalation)
@@ -1399,13 +2171,11 @@ pub fn run_accept_and_review(
             }
             let now = iso();
             let err_short = clip(&err, MAX_PARSE_ERROR_CHARS);
-            let review_doc = json!({
+            let mut review_doc = json!({
                 "status": "done",
                 "verdict": "NEEDS_CONTROLLER",
                 "round": 1,
                 "reworkRounds": 0,
-                "model": review_cfg["model"],
-                "tier": review_cfg["tier"],
                 "needsAttention": true,
                 "upgradedBy": "rubricError",
                 "parseError": err_short,
@@ -1414,6 +2184,11 @@ pub fn run_accept_and_review(
                 "updatedAt": now,
                 "finishedAt": now,
             });
+            attach_review_model_fields(
+                &mut review_doc,
+                &review_cfg,
+                review_cfg.get("launchFallback").filter(|v| v.is_object()),
+            );
             write_json(run.join("review.json"), &review_doc)?;
             sum["review"] = compact_review_summary(&review_doc);
             events::emit(
@@ -1454,26 +2229,32 @@ pub fn run_accept_and_review(
     let mut prev_review_continuation: Option<String> = None;
     let mut passed_layers: BTreeMap<String, Value> = BTreeMap::new();
     let mut rework_delta_files: Option<Vec<String>> = None;
-    let is_agy_reviewer = crate::agy::is_agy(s(&review_cfg, "model"));
+    let mut active_review_cfg = review_cfg.clone();
+    let mut active_fallback: Option<Value> = review_cfg
+        .get("launchFallback")
+        .filter(|v| v.is_object())
+        .cloned();
+    let extra_ro_workspace = ro_workspace_dir(&format!("{run_id}-extra"));
+    let _extra_ro_cleanup = CleanupDir(extra_ro_workspace.clone());
 
     loop {
+        let mut is_agy_reviewer = crate::agy::is_agy(s(&active_review_cfg, "model"));
         if lane::stopped() {
             *state = "stopped".into();
             sum["state"] = json!("stopped");
             let now = iso();
-            let doc = json!({
+            let mut doc = json!({
                 "status": "done",
                 "verdict": Value::Null,
                 "round": round,
                 "reworkRounds": rework_rounds,
-                "model": review_cfg["model"],
-                "tier": review_cfg["tier"],
                 "rubric": rubric_source,
                 "rounds": rounds_history,
                 "startedAt": review_started_at,
                 "updatedAt": now,
                 "finishedAt": now,
             });
+            attach_review_model_fields(&mut doc, &active_review_cfg, active_fallback.as_ref());
             write_json(run.join("review.json"), &doc)?;
             sum["review"] = compact_review_summary(&doc);
             break;
@@ -1529,13 +2310,11 @@ pub fn run_accept_and_review(
                 sum["state"] = json!(*state);
                 if round > 1 {
                     let now = iso();
-                    let final_doc = json!({
+                    let mut final_doc = json!({
                         "status": "done",
                         "verdict": "REWORK",
                         "round": round - 1,
                         "reworkRounds": rework_rounds,
-                        "model": review_cfg["model"],
-                        "tier": review_cfg["tier"],
                         "rubric": rubric_source,
                         "needsAttention": rework_rounds >= NEEDS_ATTENTION_REWORK_ROUND,
                         "stoppedDuringRework": true,
@@ -1545,6 +2324,11 @@ pub fn run_accept_and_review(
                         "updatedAt": now,
                         "finishedAt": now,
                     });
+                    attach_review_model_fields(
+                        &mut final_doc,
+                        &active_review_cfg,
+                        active_fallback.as_ref(),
+                    );
                     write_json(run.join("review.json"), &final_doc)?;
                     sum["review"] = compact_review_summary(&final_doc);
                 }
@@ -1558,19 +2342,18 @@ pub fn run_accept_and_review(
         let round_started = iso();
         let incremental = round > 1 && prev_reviewed_tree.is_some();
 
-        let live_review = json!({
+        let mut live_review = json!({
             "status": "reviewing",
             "verdict": if rework_rounds > 0 { json!("REWORK") } else { Value::Null },
             "round": round,
             "reworkRounds": rework_rounds,
-            "model": review_cfg["model"],
-            "tier": review_cfg["tier"],
             "rubric": rubric_source,
             "needsAttention": rework_rounds >= NEEDS_ATTENTION_REWORK_ROUND,
             "rounds": rounds_history,
             "startedAt": review_started_at,
             "updatedAt": round_started,
         });
+        attach_review_model_fields(&mut live_review, &active_review_cfg, active_fallback.as_ref());
         write_json(run.join("review.json"), &live_review)?;
 
         events::emit(
@@ -1582,8 +2365,9 @@ pub fn run_accept_and_review(
                 "round": round,
                 "reworkRounds": rework_rounds,
                 "incremental": incremental,
-                "model": review_cfg["model"],
-                "tier": review_cfg["tier"],
+                "model": active_review_cfg["model"],
+                "modelName": active_review_cfg["modelName"],
+                "tier": active_review_cfg["tier"],
                 "parallelWithSlowAccept": !plan.slow.is_empty(),
             }),
         );
@@ -1695,7 +2479,7 @@ pub fn run_accept_and_review(
 
         let review_meta = build_reviewer_meta(
             meta,
-            &review_cfg,
+            &active_review_cfg,
             &round_dir,
             &reviewer_workdir,
             &review_prompt_file,
@@ -1703,21 +2487,154 @@ pub fn run_accept_and_review(
         );
         crate::deny::prepare(&review_meta, &round_dir)?;
 
-        // Phase L2: run slow acceptance and read-only reviewer in parallel with mutual cancellation.
+        // Evaluate optional supplementary reviewer (`review.extra`) triggers + quota cache.
+        let extra_pre = {
+            let extra_cfg = &active_review_cfg["extra"];
+            if extra_cfg.is_object() && b(extra_cfg, "enabled") {
+                let total_diff_for_extra = if diff_label == "total" {
+                    diff_text.clone()
+                } else {
+                    let (total_base, _) = worktree::effective_total_base(&top, meta);
+                    if !top.is_dir() || total_base.is_empty() || after_tree.is_empty() {
+                        String::new()
+                    } else {
+                        git(
+                            &top,
+                            &[
+                                "diff",
+                                "--no-ext-diff",
+                                "--no-textconv",
+                                "--no-renames",
+                                "--color=never",
+                                &total_base,
+                                &after_tree,
+                            ],
+                        )
+                        .map(|b| String::from_utf8_lossy(&b).into_owned())
+                        .unwrap_or_default()
+                    }
+                };
+                let triggers = evaluate_extra_triggers(extra_cfg, run, meta, &total_diff_for_extra);
+                if triggers.is_empty() {
+                    ExtraPreDecision::None
+                } else {
+                    let em_model = s(extra_cfg, "model").to_string();
+                    let em_name = {
+                        let mn = s(extra_cfg, "modelName");
+                        if !mn.is_empty() { mn.to_string() } else { em_model.clone() }
+                    };
+                    let res_err = s(extra_cfg, "resolveError");
+                    if !res_err.is_empty() || em_model.is_empty() {
+                        ExtraPreDecision::Error {
+                            model: em_model,
+                            model_name: em_name,
+                            triggers,
+                            error: if res_err.is_empty() {
+                                "补充审查模型未解析".to_string()
+                            } else {
+                                res_err.to_string()
+                            },
+                        }
+                    } else {
+                        let quota_cache = crate::agy_accounts::load_quota_cache();
+                        let active_acct = crate::agy_accounts::active_account_id();
+                        match check_extra_quota(extra_cfg, &quota_cache, active_acct.as_deref()) {
+                            ExtraQuotaDecision::Skip {
+                                five_hour_pct,
+                                weekly_pct,
+                                reason,
+                            } => ExtraPreDecision::Skipped {
+                                model: em_model,
+                                model_name: em_name,
+                                triggers,
+                                five_hour_pct,
+                                weekly_pct,
+                                reason,
+                            },
+                            ExtraQuotaDecision::Allow => {
+                                let extra_dir = round_dir.join("extra");
+                                fs::create_dir_all(&extra_dir).map_err(|e| e.to_string())?;
+                                let extra_diff_file = extra_dir.join("total.diff");
+                                write(&extra_diff_file, &total_diff_for_extra)?;
+                                let (total_base, _) = worktree::effective_total_base(&top, meta);
+                                let extra_diff_sec = format_diff_for_prompt(
+                                    &total_diff_for_extra,
+                                    &extra_diff_file,
+                                    &top,
+                                    &total_base,
+                                    &after_tree,
+                                );
+                                let extra_prompt_body = format!(
+                                    "请作为独立只读补充审查员审查以下写入任务的交付结果（提供第二意见）。\n\
+                                     严格遵守：不修改任何文件，不委派子任务；输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`（无前缀、无 Markdown 修饰）。\n\n\
+                                     ## 审查要点（{rubric_source}）\n\n\
+                                     {}\n\n\
+                                     ## 任务说明\n\n\
+                                     {}\n\n\
+                                     ## 本链净 diff（diff --total）\n\n\
+                                     {extra_diff_sec}\n",
+                                    rubric_text.trim(),
+                                    task_brief.trim(),
+                                );
+                                let extra_prompt_file = extra_dir.join("prompt.md");
+                                write(&extra_prompt_file, &extra_prompt_body)?;
+                                let extra_workdir = if top.is_dir() && !after_tree.is_empty() {
+                                    prepare_ro_workspace(
+                                        &top,
+                                        &after_tree,
+                                        &extra_ro_workspace,
+                                        &extra_dir,
+                                    )?;
+                                    extra_ro_workspace.clone()
+                                } else {
+                                    PathBuf::from(s(meta, "workdir"))
+                                };
+                                let extra_meta = build_reviewer_meta(
+                                    meta,
+                                    extra_cfg,
+                                    &extra_dir,
+                                    &extra_workdir,
+                                    &extra_prompt_file,
+                                    None,
+                                );
+                                crate::deny::prepare(&extra_meta, &extra_dir)?;
+                                ExtraPreDecision::Run {
+                                    model: em_model,
+                                    model_name: em_name,
+                                    triggers,
+                                    extra_dir,
+                                    extra_meta,
+                                    verdict_file: review_root
+                                        .join(format!("round-{round}-extra-verdict.md")),
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                ExtraPreDecision::None
+            }
+        };
+
+        // Phase L2: run slow acceptance, main read-only reviewer, and optional extra reviewer in parallel.
         let slow_holder = Arc::new(AtomicI32::new(0));
         let rev_holder = Arc::new(AtomicI32::new(0));
+        let extra_holder = Arc::new(AtomicI32::new(0));
         let slow_cancel = Arc::new(AtomicBool::new(false));
         let rev_cancel = Arc::new(AtomicBool::new(false));
         supervise::register_stop_holder(slow_holder.clone());
         supervise::register_stop_holder(rev_holder.clone());
+        supervise::register_stop_holder(extra_holder.clone());
 
+        let extra_running = matches!(extra_pre, ExtraPreDecision::Run { .. });
         let append_slow_log = fast_outcome.is_some();
-        let (slow_outcome, rev_outcome) = std::thread::scope(|scope| {
+        let (slow_outcome, rev_outcome, extra_outcome) = std::thread::scope(|scope| {
             let slow_handle = if parallel_with_slow {
                 let slow_holder_t = slow_holder.clone();
                 let slow_cancel_t = slow_cancel.clone();
                 let rev_cancel_t = rev_cancel.clone();
                 let rev_holder_t = rev_holder.clone();
+                let extra_holder_t = extra_holder.clone();
                 let meta_ref: &Value = meta;
                 let plan_slow = &plan.slow;
                 let round_dir_ref: &Path = &round_dir;
@@ -1732,12 +2649,17 @@ pub fn run_accept_and_review(
                         Some("审查员判定需要返工/失败，取消慢层验收"),
                     );
                     if !res.ok && !res.cancelled && !lane::stopped() {
-                        // Slow acceptance failed -> cancel reviewer immediately (never PASS).
+                        // Slow acceptance failed -> cancel reviewers immediately (never PASS).
                         rev_cancel_t.store(true, Ordering::SeqCst);
                         let rpid = rev_holder_t.load(Ordering::SeqCst);
                         if rpid > 0 {
                             crate::cleanup::record(round_dir_ref, rpid);
                             kill_group(rpid, 1.0);
+                        }
+                        let epid = extra_holder_t.load(Ordering::SeqCst);
+                        if epid > 0 {
+                            crate::cleanup::record(round_dir_ref, epid);
+                            kill_group(epid, 1.0);
                         }
                     }
                     res
@@ -1746,18 +2668,181 @@ pub fn run_accept_and_review(
                 None
             };
 
-            let review_res = agents::run_agent_cancellable(
-                &review_meta,
-                &round_dir,
-                1,
+            let extra_handle = match &extra_pre {
+                ExtraPreDecision::Run {
+                    extra_dir,
+                    extra_meta,
+                    ..
+                } => {
+                    let eh = extra_holder.clone();
+                    let eg = grace.clone();
+                    let ec = rev_cancel.clone();
+                    let ed = extra_dir.clone();
+                    let em = extra_meta.clone();
+                    Some(scope.spawn(move || {
+                        let attempt = run_reviewer_with_format_retry(&em, &ed, eh, eg, ec.clone(), true);
+                        if ec.load(Ordering::SeqCst) {
+                            return ExtraRoundOutcome {
+                                cancelled: true,
+                                verdict: None,
+                                raw_answer: String::new(),
+                                conclusion: None,
+                                error: None,
+                            };
+                        }
+                        match attempt.res {
+                            Ok((outcome, text)) if outcome == "ok" => {
+                                let v = match parse_verdict(&text) {
+                                    ParsedVerdict::Pass => Some("PASS".to_string()),
+                                    ParsedVerdict::Rework => Some("REWORK".to_string()),
+                                    ParsedVerdict::NeedsController => {
+                                        Some("NEEDS_CONTROLLER".to_string())
+                                    }
+                                    ParsedVerdict::Invalid(first) => {
+                                        return ExtraRoundOutcome {
+                                            cancelled: false,
+                                            verdict: None,
+                                            raw_answer: text,
+                                            conclusion: None,
+                                            error: Some(clip(
+                                                &format!("格式异常：{first}"),
+                                                MAX_PARSE_ERROR_CHARS,
+                                            )),
+                                        };
+                                    }
+                                };
+                                let concl = crate::card::extract_reviewer_conclusion(&text);
+                                ExtraRoundOutcome {
+                                    cancelled: false,
+                                    verdict: v,
+                                    raw_answer: text,
+                                    conclusion: concl,
+                                    error: None,
+                                }
+                            }
+                            Ok((outcome, _)) if outcome == "cancelled" => ExtraRoundOutcome {
+                                cancelled: true,
+                                verdict: None,
+                                raw_answer: String::new(),
+                                conclusion: None,
+                                error: None,
+                            },
+                            Ok((outcome, _)) => ExtraRoundOutcome {
+                                cancelled: false,
+                                verdict: None,
+                                raw_answer: String::new(),
+                                conclusion: None,
+                                error: Some(format!("补充审查结束状态：{outcome}")),
+                            },
+                            Err(err) => ExtraRoundOutcome {
+                                cancelled: false,
+                                verdict: None,
+                                raw_answer: String::new(),
+                                conclusion: None,
+                                error: Some(clip(&err, MAX_PARSE_ERROR_CHARS)),
+                            },
+                        }
+                    }))
+                }
+                _ => None,
+            };
+
+            // Run primary reviewer; if configured review model is unavailable (startup failure,
+            // upstream refusal, quota exhaustion), fall back to `review` tier and record reason.
+            let mut active_exec_dir = round_dir.clone();
+            let mut active_exec_meta = review_meta.clone();
+            let mut attempt = run_reviewer_with_format_retry(
+                &active_exec_meta,
+                &active_exec_dir,
                 rev_holder.clone(),
                 grace.clone(),
-                Some(rev_cancel.clone()),
+                rev_cancel.clone(),
+                true,
             );
-            let rev_pgid = read(round_dir.join("agent.pid")).trim().parse().unwrap_or(0);
-            crate::cleanup::record(&round_dir, rev_pgid);
-            if rev_pgid > 0 && group_members(rev_pgid) {
-                end_group(rev_pgid, 1.0);
+            if !rev_cancel.load(Ordering::SeqCst)
+                && !lane::stopped()
+                && active_fallback.is_none()
+                && active_review_cfg["fallback"].is_object()
+                && !s(&active_review_cfg["fallback"], "model").is_empty()
+                && s(&active_review_cfg["fallback"], "model") != s(&active_review_cfg, "model")
+            {
+                if let Some(reason) = classify_unavailable_reason(&attempt.res, &active_exec_dir) {
+                    let fb_cfg = active_review_cfg["fallback"].clone();
+                    let from_alias = {
+                        let n = s(&active_review_cfg, "modelName");
+                        if !n.is_empty() { n } else { s(&active_review_cfg, "model") }
+                    }
+                    .to_string();
+                    let from_model = s(&active_review_cfg, "model").to_string();
+                    let to_alias = {
+                        let n = s(&fb_cfg, "modelName");
+                        if !n.is_empty() { n } else { s(&fb_cfg, "model") }
+                    }
+                    .to_string();
+                    let to_model = s(&fb_cfg, "model").to_string();
+                    active_fallback = Some(json!({
+                        "from": from_alias,
+                        "fromModel": from_model,
+                        "to": to_alias,
+                        "toModel": to_model,
+                        "reason": reason,
+                    }));
+                    active_review_cfg = apply_fallback_cfg(&active_review_cfg, &fb_cfg);
+                    is_agy_reviewer = crate::agy::is_agy(s(&active_review_cfg, "model"));
+                    let fallback_dir = round_dir.join("fallback");
+                    if fs::create_dir_all(&fallback_dir).is_ok() {
+                        let fb_prompt_file = if fork_target.is_some() {
+                            let fb_body = format!(
+                                "请作为独立只读审查员进行第 {round} 轮续审（已回退到备用审查模型，提供完整上下文与本轮增量 diff）。\n\
+                                 输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`。\n\n\
+                                 ## 审查要点（{rubric_source}）\n\n\
+                                 {}\n\n\
+                                 ## 任务说明\n\n\
+                                 {}\n\n\
+                                 ## 本轮增量 diff\n\n\
+                                 {diff_section}\n",
+                                rubric_text.trim(),
+                                task_brief.trim(),
+                            );
+                            let p = fallback_dir.join("prompt.md");
+                            let _ = write(&p, &fb_body);
+                            p
+                        } else {
+                            review_prompt_file.clone()
+                        };
+                        let fb_workdir = if use_ro_workspace {
+                            ro_workspace.clone()
+                        } else if is_agy_reviewer && top.is_dir() && !after_tree.is_empty() {
+                            let _ = prepare_ro_workspace(&top, &after_tree, &ro_workspace, &fallback_dir);
+                            ro_workspace.clone()
+                        } else {
+                            reviewer_workdir.clone()
+                        };
+                        let fb_meta = build_reviewer_meta(
+                            meta,
+                            &active_review_cfg,
+                            &fallback_dir,
+                            &fb_workdir,
+                            &fb_prompt_file,
+                            None,
+                        );
+                        let _ = crate::deny::prepare(&fb_meta, &fallback_dir);
+                        active_exec_dir = fallback_dir;
+                        active_exec_meta = fb_meta;
+                        attempt = run_reviewer_with_format_retry(
+                            &active_exec_meta,
+                            &active_exec_dir,
+                            rev_holder.clone(),
+                            grace.clone(),
+                            rev_cancel.clone(),
+                            true,
+                        );
+                        let fb_usage = active_exec_dir.join("usage.json");
+                        if fb_usage.is_file() {
+                            let _ = fs::copy(&fb_usage, round_dir.join("usage.json"));
+                        }
+                    }
+                }
             }
 
             let cancelled_by_accept = rev_cancel.load(Ordering::SeqCst);
@@ -1772,6 +2857,8 @@ pub fn run_accept_and_review(
                     raw_answer: String::new(),
                     raw_first_line: String::new(),
                     format_error: false,
+                    format_retried: attempt.format_retried,
+                    format_retry_failed: false,
                     parse_error: None,
                     upgraded_by: None,
                     ro_violations: Vec::new(),
@@ -1779,6 +2866,7 @@ pub fn run_accept_and_review(
                     ro_violation_file: None,
                     verdict_file,
                     diff_file: diff_file.clone(),
+                    usage_dir: active_exec_dir.clone(),
                     round_started: round_started.clone(),
                     round_finished,
                     next_continuation: None,
@@ -1790,7 +2878,7 @@ pub fn run_accept_and_review(
                     let after_m = dir_manifest_for_repo(&ro_workspace, &top).unwrap_or_default();
                     diff_manifests(&before_m, &after_m)
                 } else if let Some(before_s) = before_pi_snap {
-                    if let Some(after_s) = changes::snapshot(&top, &round_dir, &excludes) {
+                    if let Some(after_s) = changes::snapshot(&top, &active_exec_dir, &excludes) {
                         if s(&before_s, "tree") != s(&after_s, "tree") {
                             changes::tree_changes(
                                 &top,
@@ -1812,47 +2900,68 @@ pub fn run_accept_and_review(
                     Vec::new()
                 };
                 let ro_violations = filter_ro_violations(&top, raw_ro_violations);
-                let next_continuation = find_session_continuation(&round_dir, &review_meta);
+                let next_continuation =
+                    find_session_continuation(&active_exec_dir, &active_exec_meta);
 
                 let mut format_error = false;
+                let mut format_retry_failed = attempt.format_retry_failed;
                 let mut parse_error: Option<String> = None;
                 let mut upgraded_by: Option<String> = None;
                 let mut raw_first_line = String::new();
                 let mut stopped_flag = false;
 
-                let (mut verdict_str, raw_answer) = match review_res {
+                let (mut verdict_str, raw_answer) = match attempt.res {
                     Ok((agent_outcome, text)) if agent_outcome == "ok" => {
                         match parse_verdict(&text) {
                             ParsedVerdict::Pass => {
                                 raw_first_line = "PASS".into();
+                                format_retry_failed = false;
                                 ("PASS".to_string(), text)
                             }
                             ParsedVerdict::Rework => {
                                 raw_first_line = "REWORK".into();
+                                format_retry_failed = false;
                                 ("REWORK".to_string(), text)
                             }
                             ParsedVerdict::NeedsController => {
                                 raw_first_line = "NEEDS_CONTROLLER".into();
+                                format_retry_failed = false;
                                 ("NEEDS_CONTROLLER".to_string(), text)
                             }
                             ParsedVerdict::Invalid(first) => {
                                 raw_first_line = clip(&first, MAX_PARSE_ERROR_CHARS);
                                 format_error = true;
-                                parse_error = Some(clip(
-                                    &format!(
-                                        "invalid reviewer verdict first line: {:?} (expected PASS, REWORK, or NEEDS_CONTROLLER)",
-                                        clip(&first, 120)
-                                    ),
-                                    MAX_PARSE_ERROR_CHARS,
-                                ));
+                                if attempt.format_retried {
+                                    format_retry_failed = true;
+                                    parse_error = Some(clip(
+                                        &format!(
+                                            "补问 1 次仍无结论：首行 {:?}（期望 PASS、REWORK 或 NEEDS_CONTROLLER）",
+                                            clip(&first, 120)
+                                        ),
+                                        MAX_PARSE_ERROR_CHARS,
+                                    ));
+                                } else {
+                                    parse_error = Some(clip(
+                                        &format!(
+                                            "invalid reviewer verdict first line: {:?} (expected PASS, REWORK, or NEEDS_CONTROLLER)",
+                                            clip(&first, 120)
+                                        ),
+                                        MAX_PARSE_ERROR_CHARS,
+                                    ));
+                                }
                                 upgraded_by = Some("formatError".into());
                                 ("NEEDS_CONTROLLER".to_string(), text)
                             }
                         }
                     }
                     Ok((agent_outcome, _)) if agent_outcome == "cancelled" => {
+                        let extra_res = extra_handle.and_then(|h| h.join().ok());
+                        let slow_res = slow_handle.map(|h| {
+                            h.join()
+                                .unwrap_or_else(|_| crate::accept::PhaseOutcome::empty_ok())
+                        });
                         return (
-                            slow_handle.map(|h| h.join().unwrap_or_else(|_| crate::accept::PhaseOutcome::empty_ok())),
+                            slow_res,
                             ReviewRoundOutcome {
                                 cancelled: true,
                                 stopped: false,
@@ -1860,6 +2969,8 @@ pub fn run_accept_and_review(
                                 raw_answer: String::new(),
                                 raw_first_line: String::new(),
                                 format_error: false,
+                                format_retried: attempt.format_retried,
+                                format_retry_failed: false,
                                 parse_error: None,
                                 upgraded_by: None,
                                 ro_violations: Vec::new(),
@@ -1867,18 +2978,29 @@ pub fn run_accept_and_review(
                                 ro_violation_file: None,
                                 verdict_file,
                                 diff_file: diff_file.clone(),
+                                usage_dir: active_exec_dir,
                                 round_started: round_started.clone(),
                                 round_finished,
                                 next_continuation: None,
                                 conclusion: None,
                                 focus_count: 0,
                             },
+                            extra_res,
                         );
                     }
                     Ok((agent_outcome, text)) => {
                         if lane::stopped() {
                             stopped_flag = true;
                             (String::new(), text)
+                        } else if attempt.format_retried {
+                            format_error = true;
+                            format_retry_failed = true;
+                            parse_error = Some(clip(
+                                &format!("补问 1 次仍无结论（outcome: {agent_outcome}）"),
+                                MAX_PARSE_ERROR_CHARS,
+                            ));
+                            upgraded_by = Some("formatError".into());
+                            ("NEEDS_CONTROLLER".to_string(), text)
                         } else {
                             parse_error = Some(clip(
                                 &format!("reviewer ended with outcome: {agent_outcome}"),
@@ -1889,11 +3011,21 @@ pub fn run_accept_and_review(
                         }
                     }
                     Err(err) => {
-                        parse_error = Some(clip(
-                            &format!("reviewer execution error: {err}"),
-                            MAX_PARSE_ERROR_CHARS,
-                        ));
-                        upgraded_by = Some("reviewerError".into());
+                        if attempt.format_retried {
+                            format_error = true;
+                            format_retry_failed = true;
+                            parse_error = Some(clip(
+                                &format!("补问 1 次仍无结论（{err}）"),
+                                MAX_PARSE_ERROR_CHARS,
+                            ));
+                            upgraded_by = Some("formatError".into());
+                        } else {
+                            parse_error = Some(clip(
+                                &format!("reviewer execution error: {err}"),
+                                MAX_PARSE_ERROR_CHARS,
+                            ));
+                            upgraded_by = Some("reviewerError".into());
+                        }
                         ("NEEDS_CONTROLLER".to_string(), String::new())
                     }
                 };
@@ -1930,8 +3062,9 @@ pub fn run_accept_and_review(
                     ro_violation_file = Some(vfile);
                 }
 
-                // If reviewer rejected (REWORK) or failed (reviewerError), cancel slow accept immediately!
-                if parallel_with_slow
+                // If no extra reviewer is running, cancel slow accept immediately on REWORK/error.
+                if !extra_running
+                    && parallel_with_slow
                     && !stopped_flag
                     && (verdict_str == "REWORK" || upgraded_by.as_deref() == Some("reviewerError"))
                 {
@@ -1953,6 +3086,8 @@ pub fn run_accept_and_review(
                     raw_answer,
                     raw_first_line,
                     format_error,
+                    format_retried: attempt.format_retried,
+                    format_retry_failed,
                     parse_error,
                     upgraded_by,
                     ro_violations,
@@ -1960,6 +3095,7 @@ pub fn run_accept_and_review(
                     ro_violation_file,
                     verdict_file,
                     diff_file: diff_file.clone(),
+                    usage_dir: active_exec_dir,
                     round_started: round_started.clone(),
                     round_finished,
                     next_continuation,
@@ -1968,15 +3104,38 @@ pub fn run_accept_and_review(
                 }
             };
 
+            let extra_res = extra_handle.and_then(|h| h.join().ok());
+            // When extra reviewer ran alongside main reviewer, cancel slow accept on REWORK only
+            // when extra reviewer did NOT disagree (disagreement escalates to NEEDS_CONTROLLER).
+            if extra_running
+                && parallel_with_slow
+                && !rev_out.stopped
+                && !rev_out.cancelled
+                && (rev_out.verdict_str == "REWORK"
+                    || rev_out.upgraded_by.as_deref() == Some("reviewerError"))
+            {
+                let disagrees = extra_res.as_ref().is_some_and(|ex| {
+                    extra_verdict_disagrees(&rev_out.verdict_str, ex.verdict.as_deref())
+                });
+                if !disagrees {
+                    slow_cancel.store(true, Ordering::SeqCst);
+                    let spid = slow_holder.load(Ordering::SeqCst);
+                    if spid > 0 {
+                        crate::cleanup::record(run, spid);
+                        kill_group(spid, 1.0);
+                    }
+                }
+            }
             let slow_res = slow_handle.map(|h| {
                 h.join()
                     .unwrap_or_else(|_| crate::accept::PhaseOutcome::empty_ok())
             });
-            (slow_res, rev_out)
+            (slow_res, rev_out, extra_res)
         });
 
         supervise::unregister_stop_holder(&slow_holder);
         supervise::unregister_stop_holder(&rev_holder);
+        supervise::unregister_stop_holder(&extra_holder);
 
         if let Some(so) = &slow_outcome {
             for (k, v) in &so.passed_layers {
@@ -2010,19 +3169,18 @@ pub fn run_accept_and_review(
             *state = "stopped".into();
             sum["state"] = json!("stopped");
             let now = iso();
-            let doc = json!({
+            let mut doc = json!({
                 "status": "done",
                 "verdict": Value::Null,
                 "round": round,
                 "reworkRounds": rework_rounds,
-                "model": review_cfg["model"],
-                "tier": review_cfg["tier"],
                 "rubric": rubric_source,
                 "rounds": rounds_history,
                 "startedAt": review_started_at,
                 "updatedAt": now,
                 "finishedAt": now,
             });
+            attach_review_model_fields(&mut doc, &active_review_cfg, active_fallback.as_ref());
             write_json(run.join("review.json"), &doc)?;
             sum["review"] = compact_review_summary(&doc);
             break;
@@ -2045,7 +3203,7 @@ pub fn run_accept_and_review(
                     "startedAt": rev_outcome.round_started,
                     "finishedAt": rev_outcome.round_finished,
                 });
-                crate::usage::attach_reviewer_round_usage(&round_dir, &mut round_entry);
+                crate::usage::attach_reviewer_round_usage(&rev_outcome.usage_dir, &mut round_entry);
                 rounds_history.push(round_entry);
                 let mut final_doc = json!({
                     "status": "cancelled",
@@ -2054,8 +3212,6 @@ pub fn run_accept_and_review(
                     "cancelledBy": "acceptFailed",
                     "round": round,
                     "reworkRounds": rework_rounds,
-                    "model": review_cfg["model"],
-                    "tier": review_cfg["tier"],
                     "rubric": rubric_source,
                     "needsAttention": false,
                     "rounds": rounds_history,
@@ -2063,6 +3219,11 @@ pub fn run_accept_and_review(
                     "updatedAt": now,
                     "finishedAt": now,
                 });
+                attach_review_model_fields(
+                    &mut final_doc,
+                    &active_review_cfg,
+                    active_fallback.as_ref(),
+                );
                 crate::usage::attach_review_totals(&rounds_history, &mut final_doc);
                 write_json(run.join("review.json"), &final_doc)?;
                 sum["review"] = compact_review_summary(&final_doc);
@@ -2094,7 +3255,7 @@ pub fn run_accept_and_review(
                     "startedAt": rev_outcome.round_started,
                     "finishedAt": rev_outcome.round_finished,
                 });
-                crate::usage::attach_reviewer_round_usage(&round_dir, &mut round_entry);
+                crate::usage::attach_reviewer_round_usage(&rev_outcome.usage_dir, &mut round_entry);
                 rounds_history.push(round_entry);
                 let mut final_doc = json!({
                     "status": "done",
@@ -2102,8 +3263,6 @@ pub fn run_accept_and_review(
                     "acceptFailed": true,
                     "round": round,
                     "reworkRounds": rework_rounds,
-                    "model": review_cfg["model"],
-                    "tier": review_cfg["tier"],
                     "rubric": rubric_source,
                     "verdictFile": rev_outcome.verdict_file.to_string_lossy(),
                     "needsAttention": false,
@@ -2112,6 +3271,11 @@ pub fn run_accept_and_review(
                     "updatedAt": now,
                     "finishedAt": now,
                 });
+                attach_review_model_fields(
+                    &mut final_doc,
+                    &active_review_cfg,
+                    active_fallback.as_ref(),
+                );
                 if let Some(concl) = &rev_outcome.conclusion {
                     final_doc["conclusion"] = json!(concl);
                 }
@@ -2137,6 +3301,8 @@ pub fn run_accept_and_review(
         let mut upgraded_by = rev_outcome.upgraded_by;
         let parse_error = rev_outcome.parse_error;
         let format_error = rev_outcome.format_error;
+        let format_retried = rev_outcome.format_retried;
+        let format_retry_failed = rev_outcome.format_retry_failed;
         let raw_first_line = rev_outcome.raw_first_line;
         let verdict_file = rev_outcome.verdict_file;
         let ro_violations = rev_outcome.ro_violations;
@@ -2145,10 +3311,107 @@ pub fn run_accept_and_review(
         let round_finished = rev_outcome.round_finished;
         let conclusion = rev_outcome.conclusion;
         let focus_count = rev_outcome.focus_count;
+        let mut original_verdict: Option<String> = None;
+
+        // Reconcile optional supplementary reviewer (`review.extra`): second opinion only;
+        // when both verdicts are valid and disagree, mark `意见不一致` and escalate to NEEDS_CONTROLLER.
+        let mut extra_json: Option<Value> = None;
+        match extra_pre {
+            ExtraPreDecision::None => {}
+            ExtraPreDecision::Skipped {
+                model,
+                model_name,
+                triggers,
+                five_hour_pct,
+                weekly_pct,
+                reason,
+            } => {
+                let mut ex = json!({
+                    "status": "skipped",
+                    "model": model,
+                    "modelName": model_name,
+                    "triggers": triggers,
+                    "skipReason": reason,
+                    "disagreed": false,
+                });
+                if let Some(v) = five_hour_pct {
+                    ex["fiveHourPct"] = json!(v);
+                }
+                if let Some(v) = weekly_pct {
+                    ex["weeklyPct"] = json!(v);
+                }
+                extra_json = Some(ex);
+            }
+            ExtraPreDecision::Error {
+                model,
+                model_name,
+                triggers,
+                error,
+            } => {
+                extra_json = Some(json!({
+                    "status": "error",
+                    "model": model,
+                    "modelName": model_name,
+                    "triggers": triggers,
+                    "error": error,
+                    "disagreed": false,
+                }));
+            }
+            ExtraPreDecision::Run {
+                model,
+                model_name,
+                triggers,
+                verdict_file: extra_vf,
+                ..
+            } => {
+                if let Some(ex_out) = extra_outcome {
+                    if !ex_out.cancelled {
+                        if !ex_out.raw_answer.is_empty() {
+                            let _ = write(&extra_vf, &ex_out.raw_answer);
+                        }
+                        if let Some(ex_v) = ex_out.verdict {
+                            let disagreed = extra_verdict_disagrees(&verdict_str, Some(&ex_v));
+                            let mut ex = json!({
+                                "status": "done",
+                                "model": model,
+                                "modelName": model_name,
+                                "triggers": triggers,
+                                "verdict": ex_v,
+                                "verdictFile": extra_vf.to_string_lossy(),
+                                "disagreed": disagreed,
+                            });
+                            if let Some(c) = ex_out.conclusion {
+                                ex["conclusion"] = json!(c);
+                            }
+                            extra_json = Some(ex);
+                            if disagreed {
+                                if verdict_str != "NEEDS_CONTROLLER" {
+                                    original_verdict = Some(verdict_str.clone());
+                                    verdict_str = "NEEDS_CONTROLLER".to_string();
+                                } else if upgraded_by.is_none() {
+                                    original_verdict = Some("NEEDS_CONTROLLER".to_string());
+                                }
+                                if upgraded_by.is_none() {
+                                    upgraded_by = Some("extraReviewDisagreement".into());
+                                }
+                            }
+                        } else if let Some(err) = ex_out.error {
+                            extra_json = Some(json!({
+                                "status": "error",
+                                "model": model,
+                                "modelName": model_name,
+                                "triggers": triggers,
+                                "error": err,
+                                "disagreed": false,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
 
         // Check `controllerReviewPaths` ONLY when NOT entering rework (upgrade PASS / NEEDS_CONTROLLER,
         // never hijack REWORK and skip automatic rework).
-        let mut original_verdict: Option<String> = None;
         let mut controller_review_json = Value::Null;
         let mut controller_paths: Vec<String> = Vec::new();
         let mut sign_hash = String::new();
@@ -2160,7 +3423,7 @@ pub fn run_accept_and_review(
                 if verdict_str != "NEEDS_CONTROLLER" {
                     original_verdict = Some(verdict_str.clone());
                     verdict_str = "NEEDS_CONTROLLER".to_string();
-                } else if upgraded_by.is_none() {
+                } else if original_verdict.is_none() && upgraded_by.is_none() {
                     original_verdict = Some("NEEDS_CONTROLLER".to_string());
                 }
                 upgraded_by = Some("controllerReviewPaths".into());
@@ -2180,6 +3443,12 @@ pub fn run_accept_and_review(
         if format_error {
             round_entry["formatError"] = json!(true);
         }
+        if format_retried {
+            round_entry["formatRetried"] = json!(true);
+        }
+        if format_retry_failed {
+            round_entry["formatRetryFailed"] = json!(true);
+        }
         if let Some(err) = &parse_error {
             round_entry["parseError"] = json!(err);
         }
@@ -2189,6 +3458,9 @@ pub fn run_accept_and_review(
         if let Some(up) = &upgraded_by {
             round_entry["upgradedBy"] = json!(up);
         }
+        if let Some(ref ex) = extra_json {
+            round_entry["extra"] = ex.clone();
+        }
         if !ro_violations.is_empty() {
             round_entry["roViolationCount"] = json!(ro_violations.len());
             round_entry["roViolationSample"] = json!(ro_violation_sample);
@@ -2196,7 +3468,7 @@ pub fn run_accept_and_review(
                 round_entry["roViolationFile"] = json!(vf.to_string_lossy());
             }
         }
-        crate::usage::attach_reviewer_round_usage(&round_dir, &mut round_entry);
+        crate::usage::attach_reviewer_round_usage(&rev_outcome.usage_dir, &mut round_entry);
         rounds_history.push(round_entry);
 
         let mut verdict_ev = json!({
@@ -2205,6 +3477,8 @@ pub fn run_accept_and_review(
             "verdict": verdict_str,
             "reworkRounds": rework_rounds,
             "verdictFile": verdict_file.to_string_lossy(),
+            "model": active_review_cfg["model"],
+            "modelName": active_review_cfg["modelName"],
         });
         if format_error {
             verdict_ev["formatError"] = json!(true);
@@ -2230,8 +3504,6 @@ pub fn run_accept_and_review(
                 "verdict": "PASS",
                 "round": round,
                 "reworkRounds": rework_rounds,
-                "model": review_cfg["model"],
-                "tier": review_cfg["tier"],
                 "rubric": rubric_source,
                 "verdictFile": verdict_file.to_string_lossy(),
                 "needsAttention": rework_rounds >= NEEDS_ATTENTION_REWORK_ROUND,
@@ -2240,6 +3512,13 @@ pub fn run_accept_and_review(
                 "updatedAt": round_finished,
                 "finishedAt": round_finished,
             });
+            attach_review_model_fields(&mut final_doc, &active_review_cfg, active_fallback.as_ref());
+            if format_retried {
+                final_doc["formatRetried"] = json!(true);
+            }
+            if let Some(ref ex) = extra_json {
+                final_doc["extra"] = ex.clone();
+            }
             if let Some(concl) = &conclusion {
                 final_doc["conclusion"] = json!(concl);
             }
@@ -2260,6 +3539,12 @@ pub fn run_accept_and_review(
                 format!(
                     "改动命中 controllerReviewPaths（{}），已升级为 NEEDS_CONTROLLER",
                     controller_paths.join("、")
+                )
+            } else if reason == "extraReviewDisagreement" {
+                format!(
+                    "主审查与补充审查意见不一致（主审查 {} / 补充审查 {}），已升级为 NEEDS_CONTROLLER",
+                    original_verdict.as_deref().unwrap_or("NEEDS_CONTROLLER"),
+                    extra_json.as_ref().map(|e| s(e, "verdict")).unwrap_or("")
                 )
             } else if let Some(err) = &parse_error {
                 err.clone()
@@ -2286,8 +3571,6 @@ pub fn run_accept_and_review(
                 "verdict": "NEEDS_CONTROLLER",
                 "round": round,
                 "reworkRounds": rework_rounds,
-                "model": review_cfg["model"],
-                "tier": review_cfg["tier"],
                 "rubric": rubric_source,
                 "verdictFile": verdict_file.to_string_lossy(),
                 "needsAttention": true,
@@ -2297,6 +3580,16 @@ pub fn run_accept_and_review(
                 "updatedAt": round_finished,
                 "finishedAt": round_finished,
             });
+            attach_review_model_fields(&mut final_doc, &active_review_cfg, active_fallback.as_ref());
+            if format_retried {
+                final_doc["formatRetried"] = json!(true);
+            }
+            if format_retry_failed {
+                final_doc["formatRetryFailed"] = json!(true);
+            }
+            if let Some(ref ex) = extra_json {
+                final_doc["extra"] = ex.clone();
+            }
             if let Some(concl) = &conclusion {
                 final_doc["conclusion"] = json!(concl);
             }
@@ -2333,13 +3626,11 @@ pub fn run_accept_and_review(
         // Verdict is `REWORK`: send raw verdict file verbatim back to the author.
         rework_rounds += 1;
         let attention_now = rework_rounds >= NEEDS_ATTENTION_REWORK_ROUND;
-        let reworking_doc = json!({
+        let mut reworking_doc = json!({
             "status": "reworking",
             "verdict": "REWORK",
             "round": round,
             "reworkRounds": rework_rounds,
-            "model": review_cfg["model"],
-            "tier": review_cfg["tier"],
             "rubric": rubric_source,
             "verdictFile": verdict_file.to_string_lossy(),
             "needsAttention": attention_now,
@@ -2347,6 +3638,7 @@ pub fn run_accept_and_review(
             "startedAt": review_started_at,
             "updatedAt": iso(),
         });
+        attach_review_model_fields(&mut reworking_doc, &active_review_cfg, active_fallback.as_ref());
         write_json(run.join("review.json"), &reworking_doc)?;
 
         events::emit(
@@ -2384,7 +3676,7 @@ pub fn run_accept_and_review(
         let Some(mut author_next) = supervise::continuation_with_file(meta, run, &verdict_file) else {
             let err = "author has no saved session to continue for rework";
             let now = iso();
-            let final_doc = json!({
+            let mut final_doc = json!({
                 "status": "done",
                 "verdict": "NEEDS_CONTROLLER",
                 "originalVerdict": "REWORK",
@@ -2392,8 +3684,6 @@ pub fn run_accept_and_review(
                 "parseError": err,
                 "round": round,
                 "reworkRounds": rework_rounds,
-                "model": review_cfg["model"],
-                "tier": review_cfg["tier"],
                 "rubric": rubric_source,
                 "verdictFile": verdict_file.to_string_lossy(),
                 "needsAttention": true,
@@ -2402,6 +3692,7 @@ pub fn run_accept_and_review(
                 "updatedAt": now,
                 "finishedAt": now,
             });
+            attach_review_model_fields(&mut final_doc, &active_review_cfg, active_fallback.as_ref());
             write_json(run.join("review.json"), &final_doc)?;
             sum["review"] = compact_review_summary(&final_doc);
             *state = if accept_ok { "delivered" } else { "rejected" }.into();
@@ -2498,13 +3789,11 @@ pub fn run_accept_and_review(
         let mut new_sum = pre.sum;
         if !pre.can_accept {
             let now = iso();
-            let final_doc = json!({
+            let mut final_doc = json!({
                 "status": "done",
                 "verdict": "REWORK",
                 "round": round,
                 "reworkRounds": rework_rounds,
-                "model": review_cfg["model"],
-                "tier": review_cfg["tier"],
                 "rubric": rubric_source,
                 "verdictFile": verdict_file.to_string_lossy(),
                 "needsAttention": attention_now,
@@ -2515,6 +3804,7 @@ pub fn run_accept_and_review(
                 "updatedAt": now,
                 "finishedAt": now,
             });
+            attach_review_model_fields(&mut final_doc, &active_review_cfg, active_fallback.as_ref());
             write_json(run.join("review.json"), &final_doc)?;
             new_sum["review"] = compact_review_summary(&final_doc);
             *sum = new_sum;
@@ -2916,5 +4206,192 @@ mod tests {
         assert!(chain_brief.contains("续做说明 #2（20261123-121617-c9cb，最新"));
 
         let _ = fs::remove_dir_all(&root_tmp);
+    }
+
+    #[test]
+    fn review_model_four_layer_precedence() {
+        let base_models = json!({
+            "tier-rev": "agy/tier-rev",
+            "user-rev": "agy/user-rev",
+            "repo-rev": "agy/gemini-4-hydrogen",
+            "cli-rev": "agy/cli-rev",
+        });
+        let base_tiers = json!({"scout": "tier-rev", "review": "tier-rev", "write": "tier-rev"});
+
+        // Layer 4: repo `"review": true`, no user/repo/CLI model -> review tier.
+        let (rv4, src4) = crate::config::merge_review(None, Some(&json!(true)));
+        let cfg4 = json!({"models": base_models, "tiers": base_tiers, "review": rv4});
+        let sel4 = resolve_review_selection(&cfg4, None, src4, &[]).unwrap().unwrap();
+        assert_eq!(sel4.model_name, "tier-rev");
+        assert_eq!(sel4.model, "agy/tier-rev");
+        assert_eq!(sel4.model_source, "tier");
+
+        // Layer 3: user config sets `review.model`, repo sets `"review": true` -> user model wins over tier.
+        let user_rev = json!({"enabled": true, "model": "user-rev", "thinking": "high"});
+        let (rv3, src3) = crate::config::merge_review(Some(&user_rev), Some(&json!(true)));
+        let cfg3 = json!({"models": base_models, "tiers": base_tiers, "review": rv3});
+        let sel3 = resolve_review_selection(&cfg3, None, src3, &[]).unwrap().unwrap();
+        assert_eq!(sel3.model_name, "user-rev");
+        assert_eq!(sel3.model, "agy/user-rev");
+        assert_eq!(sel3.thinking.as_deref(), Some("high"));
+        assert_eq!(sel3.model_source, "user");
+        assert_eq!(sel3.fallback_name.as_deref(), Some("tier-rev"));
+
+        // Layer 2: repo config sets `review.model` -> repo wins over user & tier.
+        let repo_rev = json!({"enabled": true, "model": "repo-rev", "thinking": "high"});
+        let (rv2, src2) = crate::config::merge_review(Some(&user_rev), Some(&repo_rev));
+        let cfg2 = json!({"models": base_models, "tiers": base_tiers, "review": rv2});
+        let sel2 = resolve_review_selection(&cfg2, None, src2, &[]).unwrap().unwrap();
+        assert_eq!(sel2.model_name, "repo-rev");
+        assert_eq!(sel2.model, "agy/gemini-4-hydrogen");
+        assert_eq!(sel2.model_source, "repo");
+        assert_eq!(sel2.fallback_name.as_deref(), Some("tier-rev"));
+
+        // Layer 1: CLI `--review-model` -> CLI wins over repo, user, and tier.
+        let sel1 = resolve_review_selection(&cfg2, Some("cli-rev"), src2, &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(sel1.model_name, "cli-rev");
+        assert_eq!(sel1.model, "agy/cli-rev");
+        assert_eq!(sel1.model_source, "cli");
+        assert_eq!(sel1.fallback_name.as_deref(), Some("tier-rev"));
+    }
+
+    #[test]
+    fn review_model_unavailable_classification_and_launch_fallback() {
+        // Launch-time fallback when configured review.model is not registered.
+        let cfg = json!({
+            "models": {"rev-tier": "agy/rev-tier"},
+            "tiers": {"scout": "rev-tier", "review": "rev-tier", "write": "rev-tier"},
+            "review": {"enabled": true, "model": "missing-model", "thinking": "high"},
+        });
+        let sel = resolve_review_selection(&cfg, None, Some("repo"), &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(sel.model_name, "rev-tier");
+        assert_eq!(sel.launch_fallback_from.as_deref(), Some("missing-model"));
+        assert!(sel.launch_fallback_reason.as_deref().unwrap_or("").contains("missing-model"));
+
+        // Runtime classification: startup failure, quota exhaustion, upstream refusal.
+        let tmp = std::env::temp_dir().join(format!(
+            "delegate-rev-unavail-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        let startup = classify_unavailable_reason(&Err("No such file or directory".into()), &tmp);
+        assert!(startup.as_deref().unwrap_or("").starts_with("启动失败"));
+
+        let policy_txt = "The prompt could not be submitted. The prompt contains sensitive words that violate Google's Generative AI Prohibited Use policy.";
+        assert_eq!(
+            classify_unavailable_reason(&Ok(("ok".into(), policy_txt.into())), &tmp).as_deref(),
+            Some("上游拒绝")
+        );
+
+        write(tmp.join("stderr.log"), "429 RESOURCE_EXHAUSTED: quota exceeded\n").unwrap();
+        assert_eq!(
+            classify_unavailable_reason(&Ok(("failed".into(), String::new())), &tmp).as_deref(),
+            Some("额度用尽")
+        );
+
+        write(tmp.join("stderr.log"), "HTTP 403 Forbidden: upstream rejected\n").unwrap();
+        assert_eq!(
+            classify_unavailable_reason(&Ok(("failed".into(), String::new())), &tmp).as_deref(),
+            Some("上游拒绝")
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn format_retry_prompt_is_verbatim() {
+        assert_eq!(
+            FORMAT_RETRY_PROMPT,
+            "上一条回复缺少结论。验收已由流水线跑完，不用等命令。请直接给出结论：首行只写 PASS、REWORK 或 NEEDS_CONTROLLER，下面写理由，并附「## 主控重点看」。"
+        );
+    }
+
+    #[test]
+    fn extra_review_validation_triggers_quota_guard_and_disagreement() {
+        // Validation
+        assert!(validate_review_config(Some(&json!({
+            "enabled": true,
+            "model": "hydrogen",
+            "thinking": "high",
+            "extra": {
+                "model": "sonnet",
+                "on": ["controllerReviewPaths", "risk:high"],
+                "minQuota": {"fiveHour": 50, "weekly": 30}
+            }
+        })))
+        .is_ok());
+        assert!(validate_review_config(Some(&json!({"extra": false}))).is_ok());
+        assert!(validate_review_config(Some(&json!({"extra": {"model": "sonnet", "on": []}}))).is_err());
+        assert!(validate_review_config(Some(&json!({"extra": {"model": "sonnet", "on": ["unknown"]}}))).is_err());
+        assert!(validate_review_config(Some(&json!({"extra": {"model": "sonnet", "on": ["risk:high"], "minQuota": {"fiveHour": 150}}}))).is_err());
+
+        // Triggers: risk:high hits on SQL migration diff, does not hit on ordinary text diff.
+        let extra_cfg = json!({
+            "enabled": true,
+            "model": "agy/claude-sonnet-4",
+            "modelName": "sonnet",
+            "on": ["controllerReviewPaths", "risk:high"],
+            "minQuota": {"fiveHour": 50, "weekly": 30}
+        });
+        let meta = json!({});
+        let tmp_run = std::env::temp_dir().join(format!(
+            "delegate-extra-trig-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir_all(&tmp_run).unwrap();
+        let plain_diff = "diff --git a/notes.txt b/notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        assert!(evaluate_extra_triggers(&extra_cfg, &tmp_run, &meta, plain_diff).is_empty());
+        let high_diff = "diff --git a/migrations/001.sql b/migrations/001.sql\nnew file mode 100644\n--- /dev/null\n+++ b/migrations/001.sql\n@@ -0,0 +1 @@\n+ALTER TABLE users ADD COLUMN role TEXT;\n";
+        assert_eq!(
+            evaluate_extra_triggers(&extra_cfg, &tmp_run, &meta, high_diff),
+            vec!["risk:high".to_string()]
+        );
+        let _ = fs::remove_dir_all(&tmp_run);
+
+        // Quota guard: fiveHour < 50 -> skip, weekly < 30 -> skip, both >= threshold -> allow.
+        let mk_cache = |fh: f64, wk: f64| {
+            json!({
+                "accounts": {
+                    "acct1": {
+                        "ok": true,
+                        "entries": [
+                            {"pool": "Gemini Models", "window": "weekly", "remainingPct": 98.0},
+                            {"pool": "Claude and GPT models", "window": "fiveHour", "remainingPct": fh},
+                            {"pool": "Claude and GPT models", "window": "weekly", "remainingPct": wk},
+                        ]
+                    }
+                }
+            })
+        };
+        assert_eq!(
+            check_extra_quota(&extra_cfg, &mk_cache(60.0, 40.0), Some("acct1")),
+            ExtraQuotaDecision::Allow
+        );
+        match check_extra_quota(&extra_cfg, &mk_cache(45.0, 60.0), Some("acct1")) {
+            ExtraQuotaDecision::Skip { reason, .. } => {
+                assert_eq!(reason, "补充审查跳过：Claude 池剩余 5 小时 45% / 本周 60%");
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+        match check_extra_quota(&extra_cfg, &mk_cache(80.0, 20.0), Some("acct1")) {
+            ExtraQuotaDecision::Skip { reason, .. } => {
+                assert_eq!(reason, "补充审查跳过：Claude 池剩余 5 小时 80% / 本周 20%");
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+
+        // Disagreement check.
+        assert!(!extra_verdict_disagrees("PASS", Some("PASS")));
+        assert!(extra_verdict_disagrees("PASS", Some("REWORK")));
+        assert!(extra_verdict_disagrees("PASS", Some("NEEDS_CONTROLLER")));
+        assert!(extra_verdict_disagrees("REWORK", Some("PASS")));
+        assert!(!extra_verdict_disagrees("PASS", None));
     }
 }

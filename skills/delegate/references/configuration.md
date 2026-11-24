@@ -64,7 +64,7 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 - `stall`：`{"idle":"30m","command":"90m","accept":"10m"}`，`"0"` 关闭；`DELEGATE_STALL_IDLE`/`COMMAND`/`ACCEPT` 优先，均只发 `stall_warning` 不杀进程。
 - `checkIn`：wait 检查线时长，`"0"` 关闭；`DELEGATE_CHECK_IN` 优先。未设置时 Claude Code 使用 50m，其它调用方不设默认。
 - `agy`：`{"agent":"aia"}` 为 agy 同事附加 `--agent <名>`（新会话、续做与 `probe` 生效），名称非空且无空白/控制字符，未设不变。
-- `review`（默认关）：`true` 或 `{"enabled"?,"tier"?:"review"|"scout","model"?,"thinking"?,"rubric"?}`（仓库优先）。快层验收通过后与慢层验收并行派只读审查员（要点默认 [review-rubric.md](review-rubric.md)）；首行严格 `PASS`/`REWORK`/`NEEDS_CONTROLLER`（畸形/越权写入失败关闭）并附 `## 主控重点看` 并入审查卡，任一方失败互停且被取消不记 `PASS`，`REWORK` 原样退回且续审只看增量 diff 与受影响验收层。
+- `review`（默认关）：`true` 或 `{"enabled"?,"tier"?:"review"|"scout","model"?,"thinking"?,"rubric"?,"extra"?}`（仓库按字段覆盖用户）。模型优先级：`--review-model` > 仓库 > 用户 > review 档位；不可用回退 review 档并在卡上写 `审查改用 <别名>（原因）`。快层过与慢层并行派只读审查员（[review-rubric.md](review-rubric.md)）；首行缺结论同会话尾部补问 1 次，仍不合格才判 `formatError`；`REWORK` 原样退回续审增量 diff。`review.extra`（`{"model","on":["controllerReviewPaths","risk:high"],"minQuota":{"fiveHour":50,"weekly":30}}`）命中条件且 `agy-quota.json` Claude/GPT 池够用时并行给第二意见（不足则跳过并明报余量，不一致升 `NEEDS_CONTROLLER`），详见 [review-card.md](review-card.md)。
 - `acceptRules` / `riskRules`（可选，向后兼容单条 `accept`）：`acceptRules` 按 glob 分快/慢层并记录跑/跳原因（未命中或改构建配置 fail-closed 跑全量）；`riskRules` 定制审查卡风险规则（`disable`/`largeDeletionLines`/`extra`），详见 [审查卡与分层验收](review-card.md)。
 - `controllerReviewPaths`：glob 数组（`*`/`?`/`**`/末尾 `/`），仓库优先。命中一律升 `NEEDS_CONTROLLER` 并附 diff 与 SHA-256，主控 `delegate sign <run>` 签字（改一字即失效，`sign --check` 验签），并作为审查卡「模型可见文字」规则源。
 - `mergeAccept` / `autoMerge`（仓库级）：`mergeAccept` 为 `delegate merge` 终验命令（默认等于 `accept`）；`autoMerge` 为 glob 数组（默认空，支持 `!` 排除与 `add:` 纯新增），全改动命中且审查 `PASS` 标「可自主合入」，详见 [合入员与 Radar](merge-and-radar.md)。

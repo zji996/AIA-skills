@@ -1,6 +1,11 @@
 {
   "remote": false,
   "accept": "scripts/verify.sh",
+  "review": {
+    "enabled": true,
+    "model": "hydrogen",
+    "thinking": "high"
+  },
   "standing": {
     "write": "版本号延迟分配：不要修改 skills/*/SKILL.md 的 metadata.version、crates/*/Cargo.toml 或 Cargo.lock 的版本号，也不要在 CHANGELOG.md 写具体版本号；改动条目只追加到 CHANGELOG.md 顶部的 `## Unreleased` 段（格式 `- `<技能>`：...`），版本号由主控在发版时通过 `scripts/release-binary.sh bump <技能> <X.Y.Z|patch|minor|major>` 统一分配并把 `## Unreleased` 落成版本段。"
   },

@@ -501,7 +501,19 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
             String::new()
         };
         if !review_label.is_empty() {
-            parts.push(review_label);
+            let rev_model = {
+                let mn = s(rev, "modelName");
+                if !mn.is_empty() { mn } else { s(rev, "model") }
+            };
+            let mut full_label = if rev_model.is_empty() {
+                review_label
+            } else {
+                format!("{review_label} · {rev_model}")
+            };
+            if rev["extra"].is_object() && b(&rev["extra"], "disagreed") {
+                full_label.push_str(" · 意见不一致");
+            }
+            parts.push(full_label);
         }
         if b(rev, "needsAttention") && rverdict != "PASS" {
             parts.push("⚠ 需主控关注".to_string());
@@ -869,11 +881,83 @@ pub fn human_detail(run: &Path, status: &Value) -> String {
         if !up.is_empty() {
             info.push(format!("升级：{up}"));
         }
-        if !s(rev, "model").is_empty() {
-            info.push(format!("模型：{}", s(rev, "model")));
+        let rev_model_name = s(rev, "modelName");
+        let rev_model_id = s(rev, "model");
+        if !rev_model_name.is_empty() && !rev_model_id.is_empty() && rev_model_name != rev_model_id
+        {
+            info.push(format!("模型：{rev_model_name}（{rev_model_id}）"));
+        } else if !rev_model_name.is_empty() {
+            info.push(format!("模型：{rev_model_name}"));
+        } else if !rev_model_id.is_empty() {
+            info.push(format!("模型：{rev_model_id}"));
+        }
+        if b(rev, "formatRetryFailed") || (b(rev, "formatError") && b(rev, "formatRetried")) {
+            info.push("补问 1 次仍无结论".into());
+        }
+        if rev["extra"].is_object() && b(&rev["extra"], "disagreed") {
+            info.push("意见不一致".into());
         }
         if !info.is_empty() {
             lines.push(format!("  审查：{}", info.join(" · ")));
+        }
+        if rev["fallback"].is_object() {
+            let fb = &rev["fallback"];
+            let to = {
+                let n = s(fb, "to");
+                if !n.is_empty() { n } else { s(fb, "toModel") }
+            };
+            let reason = s(fb, "reason");
+            if !to.is_empty() {
+                if reason.is_empty() {
+                    lines.push(format!("  审查改用 {to}"));
+                } else {
+                    lines.push(format!("  审查改用 {to}（{reason}）"));
+                }
+            }
+        }
+        if rev["extra"].is_object() {
+            let ex = &rev["extra"];
+            let em = {
+                let n = s(ex, "modelName");
+                if !n.is_empty() { n } else { s(ex, "model") }
+            };
+            match s(ex, "status") {
+                "skipped" => {
+                    let sr = s(ex, "skipReason");
+                    if !sr.is_empty() {
+                        lines.push(format!("  {sr}"));
+                    }
+                }
+                "done" => {
+                    let ev = s(ex, "verdict");
+                    let disagree = if b(ex, "disagreed") {
+                        " · 意见不一致"
+                    } else {
+                        ""
+                    };
+                    let mut ex_parts = Vec::new();
+                    if !em.is_empty() {
+                        ex_parts.push(format!("模型：{em}"));
+                    }
+                    if !ev.is_empty() {
+                        ex_parts.push(format!("结论：{ev}{disagree}"));
+                    }
+                    if !ex_parts.is_empty() {
+                        lines.push(format!("  补充审查：{}", ex_parts.join(" · ")));
+                    }
+                    if !s(ex, "verdictFile").is_empty() {
+                        lines.push(format!("  补充审查文件：{}", s(ex, "verdictFile")));
+                    }
+                }
+                "error" => {
+                    let err = s(ex, "error");
+                    lines.push(format!(
+                        "  补充审查：模型：{em} · 失败：{}",
+                        if err.is_empty() { "执行异常" } else { err }
+                    ));
+                }
+                _ => {}
+            }
         }
         if !s(rev, "parseError").is_empty() {
             lines.push(format!("  审查异常：{}", s(rev, "parseError")));

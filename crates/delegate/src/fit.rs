@@ -3,6 +3,16 @@ use crate::common::*;
 use serde_json::{json, Value};
 
 pub const CLASSES: [&str; 4] = ["scout", "build", "hard", "design"];
+
+/// Default thinking level implied by `--class` when no explicit `--thinking` or `DELEGATE_THINKING` is set.
+pub fn default_thinking(class: &str) -> Option<&'static str> {
+    match class {
+        "build" | "design" | "scout" => Some("medium"),
+        "hard" => Some("high"),
+        _ => None,
+    }
+}
+
 fn path() -> std::path::PathBuf {
     crate::config::user_path().with_file_name("fit.json")
 }
@@ -202,5 +212,14 @@ mod tests {
             Some("a")
         );
         assert_eq!(s(&card["hard"]["a"], "verdict"), "ok");
+    }
+
+    #[test]
+    fn default_thinking_matches_four_classes() {
+        assert_eq!(default_thinking("build"), Some("medium"));
+        assert_eq!(default_thinking("design"), Some("medium"));
+        assert_eq!(default_thinking("scout"), Some("medium"));
+        assert_eq!(default_thinking("hard"), Some("high"));
+        assert_eq!(default_thinking("other"), None);
     }
 }

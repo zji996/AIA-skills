@@ -650,6 +650,7 @@ fn add_cmd(args: &[String]) -> Res<i32> {
         "--retries",
         "--provider",
         "--model",
+        "--review-model",
         "--thinking",
         "--class",
         "--overflow",

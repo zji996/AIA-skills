@@ -8,6 +8,7 @@
 - `delegate`：所有者事项不许空着建——`--needs-owner`（`add`/`wait`）与非 `direction` `--owner-kind` 必须同时给 `--ask`（问句且不能等于标题）、`--recommendation`、`--if-undecided`、`--cost`（缺项拒绝并列出缺失参数），`work wait <Qxx>` 可用同名参数补齐既有 Q 项；`work show` 与 `delegate-tui` 的 Q 项卡片新增「在等它的工作」列出挂 `owner:<Qxx>` 的 W 项（标题、完成条件、说明路径，一行一个）；既有缺字段 Q 项不改写数据，在 `work list --owner` 与 TUI 行尾标「缺建议」。
 - `delegate`：`reply --minor` 去掉默认 10 分钟时限（显式 `--timeout` 照旧生效，长时间不动由 `stall_warning` 处理），保留不计返工次数与说明 ≤600 字语义。
 - `delegate`：新增 `delegate speed [--since 7d|14d|all] [--repo PATH] [--json]`，从全机事件流 `events.jsonl` 按仓库计算写任务链墙钟（`t_chain`）、非一次过与一次过耗时（`t_crit`）、三口径返工率、活跃分钟有效并发（`P_eff`）与每活跃小时合入数、预合并冲突/失败率及合入等待（`T_merge`）与只读链耗时；不足 30 条写链时自动扩窗至 14 天，追加快照到 `<state>/speed/<repo-slug>.jsonl` 并标出超 ±20% 的漂移。
+- `delegate`：审查模型可配置（`review.model`/`thinking`，优先级 `start --review-model` > 仓库 > 用户 > `review` 档位；不可用时回退 `review` 档并在审查卡明示 `审查改用 <别名>（原因）`，审查卡与 `status` 显示实际审查模型）；`start --class build|hard|design|scout` 未传 `--thinking` 时按类别定默认档（`build`/`design`/`scout` → `medium`，`hard` → `high`，回显 `thinking <档>〔类别 <类>〕`）；审查员首行缺结论时同会话尾部补问 1 次，仍不合格才判 `NEEDS_CONTROLLER`（`formatError`）并注「补问 1 次仍无结论」；新增可选 `review.extra` 补充审查（命中 `controllerReviewPaths` 或 `risk:high` 时按 `agy-quota.json` Claude/GPT 池阈值保护并行跑第二意见，低于阈值跳过并写明余量，意见不一致时标「意见不一致」并升 `NEEDS_CONTROLLER`）；本仓 `.delegate.json` 启用 `hydrogen`（`high`）审查。
 
 ## delegate 6.43.0 - 2026-11-24
 

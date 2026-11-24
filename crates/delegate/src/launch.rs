@@ -51,6 +51,7 @@ pub struct Options {
     pub retries: i64,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub review_model: Option<String>,
     pub thinking: Option<String>,
     pub parallel: bool,
     pub fresh: bool,
@@ -161,6 +162,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             "--retries",
             "--provider",
             "--model",
+            "--review-model",
             "--thinking",
             "--class",
             "--overflow",
@@ -227,6 +229,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 }
                 "--provider" => o.provider = Some(v),
                 "--model" => o.model = Some(v),
+                "--review-model" => { models::validate_model(&v)?; o.review_model = Some(v); }
                 "--class" => { crate::fit::validate_class(&v)?; o.class = Some(v); },
                 "--thinking" => { models::validate_thinking(&v)?; o.thinking = Some(v.clone()); o.thinking_cli = Some(v); },
                 "--max" => o.max = Some(seconds(&v)?),
@@ -393,21 +396,30 @@ fn require_models(config: &Value, listed: &[models::PiModel]) -> Res<Value> {
     Ok(result)
 }
 
+/// Thinking override from CLI `--thinking`, falling back to `--class` default thinking
+/// (`build|design|scout` -> `medium`, `hard` -> `high`) when no explicit `--thinking` was given.
+fn effective_thinking_override(o: &Options) -> Option<&str> {
+    o.thinking_cli
+        .as_deref()
+        .or_else(|| o.class.as_deref().and_then(crate::fit::default_thinking))
+}
+
 /// Resolve explicit identity independently of purpose, then choose thinking.
 fn apply_tier_model(o: &mut Options, config: &Value) -> Res<Value> {
     let listed = agents::pi_models();
     let models = require_models(config, &listed)?;
+    let thinking_override = effective_thinking_override(o).map(str::to_string);
     if o.agent_pinned {
         let name = o.model.as_deref().unwrap_or("");
         let model = models::resolve_model(name, config, &listed)?;
         o.model_name = Some(name.into());
-        o.thinking = models::thinking(o.thinking_cli.as_deref(), &json!(name), config)?;
+        o.thinking = models::thinking(thinking_override.as_deref(), &json!(name), config)?;
         o.model = Some(model);
     } else {
         let pick = models::pick(
             config,
             o.tier.as_deref().unwrap_or("review"),
-            o.thinking_cli.as_deref(),
+            thinking_override.as_deref(),
             &listed,
             agents::local_clock(),
             &|_| 0,
@@ -435,10 +447,11 @@ fn pick_tier_under_cap(
     let running = |model: &str| busy.iter().filter(|m| *m == model).count();
     let config = &extra["tierConfig"];
     let tier = o.tier.as_deref().unwrap_or("review");
+    let thinking_override = effective_thinking_override(o).map(str::to_string);
     let pick = models::pick(
         config,
         tier,
-        o.thinking_cli.as_deref(),
+        thinking_override.as_deref(),
         listed,
         agents::local_clock(),
         &running,
@@ -466,7 +479,7 @@ fn pick_tier_under_cap(
     extra["tierCandidates"] = json!(models::candidates(
         &extra["tierConfig"],
         tier,
-        o.thinking_cli.as_deref(),
+        thinking_override.as_deref(),
         listed
     )?
     .iter()
@@ -1675,8 +1688,16 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     if !o.read_only && !o.accept_also.is_empty() {
         extra["acceptAlso"] = json!(o.accept_also);
     }
+    if let Some(class) = &o.class {
+        extra["class"] = json!(class);
+    }
     if !o.read_only {
-        if let Some(rc) = crate::review::resolve_launch_config(&config.value, repo.as_deref())? {
+        if let Some(rc) = crate::review::resolve_launch_config(
+            &config.value,
+            repo.as_deref(),
+            o.review_model.as_deref(),
+            config.origins["reviewModel"].as_str(),
+        )? {
             extra["reviewConfig"] = rc;
         }
     }
@@ -2129,13 +2150,15 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         require_models(&config.value, &listed)?
     };
     if !switching {
-        // Ordinary reply keeps the captured level; only env/CLI may override it.
+        // Ordinary reply keeps the captured level; only env/CLI/--class may override it.
         let env = setting("THINKING", "");
         if !env.is_empty() {
             models::validate_thinking(&env)?;
             o.thinking = Some(env);
         } else if requested_thinking.is_some() {
             o.thinking = requested_thinking;
+        } else if let Some(level) = o.class.as_deref().and_then(crate::fit::default_thinking) {
+            o.thinking = Some(level.into());
         }
     }
     let deny_accept_conflicts =
@@ -2360,9 +2383,20 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         }
     }
     if !o.read_only {
+        let inherited_cli_review_model = if o.review_model.is_none()
+            && s(&meta["reviewConfig"], "modelSource") == "cli"
+        {
+            let prev = s(&meta["reviewConfig"], "modelName");
+            (!prev.is_empty()).then_some(prev)
+        } else {
+            None
+        };
+        let cli_rev_model = o.review_model.as_deref().or(inherited_cli_review_model);
         if let Some(rc) = crate::review::resolve_launch_config(
             &config.value,
             (!top.is_empty()).then_some(Path::new(top)),
+            cli_rev_model,
+            config.origins["reviewModel"].as_str(),
         )? {
             extra["reviewConfig"] = rc;
         } else if meta["reviewConfig"].is_object() {
@@ -3048,15 +3082,20 @@ pub fn launch(
     } else {
         json!(o.model_name)
     };
-    let source = if parent_path.is_some()
-        && !o.tier_picked
-        && !o.agent_pinned
-        && o.thinking_cli.is_none()
-        && setting("THINKING", "").is_empty()
+    let source: String = if !setting("THINKING", "").is_empty() {
+        "环境".into()
+    } else if o.thinking_cli.is_some() {
+        "CLI".into()
+    } else if let Some(class) = o
+        .class
+        .as_deref()
+        .filter(|c| crate::fit::default_thinking(c).is_some())
     {
-        "原会话"
+        format!("类别 {class}")
+    } else if parent_path.is_some() && !o.tier_picked && !o.agent_pinned {
+        "原会话".into()
     } else {
-        models::thinking_source(o.thinking_cli.as_deref(), &rule, &extra["tierConfig"])
+        models::thinking_source(None, &rule, &extra["tierConfig"]).into()
     };
     let level = format!(
         "{}〔{}〕",
@@ -3064,15 +3103,27 @@ pub fn launch(
         source
     );
     if o.tier_inferred && o.tier_picked {
-        eprintln!(
-            "{}",
-            models::inference_notice(
-                o.tier.as_deref().unwrap_or("review"),
-                o.model_name.as_deref().unwrap_or(model),
-                model,
-                o.thinking.as_deref()
-            ) + &format!("〔{source}〕")
-        );
+        if o.class.is_some() {
+            eprintln!(
+                "{}",
+                models::inference_notice(
+                    o.tier.as_deref().unwrap_or("review"),
+                    o.model_name.as_deref().unwrap_or(model),
+                    model,
+                    Some(&level)
+                )
+            );
+        } else {
+            eprintln!(
+                "{}",
+                models::inference_notice(
+                    o.tier.as_deref().unwrap_or("review"),
+                    o.model_name.as_deref().unwrap_or(model),
+                    model,
+                    o.thinking.as_deref()
+                ) + &format!("〔{source}〕")
+            );
+        }
     } else if parent_path.is_some() && !o.tier_picked && !o.agent_pinned {
         eprintln!("delegate: 沿用原会话的模型 {model}，thinking {level}");
     } else if o.agent_pinned {

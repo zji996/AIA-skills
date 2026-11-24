@@ -36,7 +36,7 @@ $D wait                                                                  # 放�
 | 自己跑重检查、测性能 | `$D lane make check`；测量用 `lane --measure` |
 | 节点不稳、换档前先测连通 | `$D probe`：走 Pi 本身（不是裸 HTTP）测各档模型，不建任务、不占名额 |
 | 看审查卡 / 预合并快进 / 改动 / 停 / 清 | `$D card <run>`（L1 一屏审查卡：摘要与各轮原文、风险项、测试与验收、预合并、折叠改动）、`$D diff <run> --risky`（L2 风险 hunk）、`$D diff`（L3 完整）、`$D result [--round N\|--all\|--rounds]` / `$D stop` / `$D clean --finished`；交付或 `$D sign` 后 `_merge-worker` 在 `<cache>` 预合并并钉 `refs/delegate/premerge/<run>`，L0 实显预合并/快进状态，`$D apply` 命中快进 <2s 写回并跳过复验，否则回退三方合并，见 [审查卡与预合并](references/review-card.md) |
-| 自动审-改闭环与分层并行验收 | `.delegate.json` 配 `acceptRules` 按改动路径分层（未命中或改构建配置 fail-closed 跑全量）；快层通过后慢层与只读审查员并行（任一失败互停、被取消不记 `PASS`，两者均过才 `delivered`，返工只重跑受影响层）；审查员首行 `PASS`/`REWORK`/`NEEDS_CONTROLLER` 并附 `## 主控重点看` 并入审查卡，改到 `controllerReviewPaths` 升 `NEEDS_CONTROLLER` 并由 `$D sign <run>` 签字，见 [审查要点](references/review-rubric.md) |
+| 自动审-改闭环与分层并行验收 | `.delegate.json` 配 `acceptRules` 按改动路径分层（未命中或改构建配置 fail-closed 跑全量）；快层通过后慢层与只读审查员并行（任一失败互停、被取消不记 `PASS`，两者均过才 `delivered`，返工只重跑受影响层）；审查模型按 `--review-model` > 仓库 > 用户 > review 档选，不可用回退 review 档并在卡上明示；首行缺结论同会话尾部补问 1 次；`review.extra` 命中 `controllerReviewPaths`/`risk:high` 且 Claude 池余量够时并行给第二意见（不一致升 `NEEDS_CONTROLLER`），改到 `controllerReviewPaths` 由 `$D sign <run>` 签字，见 [审查要点](references/review-rubric.md) |
 | 事件流 / 游标等待 / 确定性续派 | `$D events [--since SEQ] [--follow] [--rebuild] [--json]` 查全机只追加事件流（含 `review_*` / `merge_*` / `radar_*`）；`$D wait --since SEQ` 返回新事件与新游标（Stop hook 按游标拦下未读交付/提问/需关注/`NEEDS_CONTROLLER`）；`$D queue add <name> --after <run\|name> --prompt-file …` / `queue list` 建有序 DAG，上游交付通过且审查 `PASS` 后零模型调用自动起下一步，异常暂停提醒 |
 | 串行合入员与自主合入白名单 | `$D merge <run>...` 或 `$D merge --ready` 在独立集成 worktree 基于源 HEAD 串行 3-way 合入、命中 `generated.inputs` 重生、逐个经 lane 跑 `accept`、末尾跑 `mergeAccept`，沿用原提交标题并带 `Delegate-Run` trailer，冲突/红测/受保护路径/未签字或失效 `controllerReviewPaths` 自动回退标 `SKIPPED`；`.delegate.json` `autoMerge`（支持 `!` 排除与 `add:` 纯新增）标「可自主合入 / 待主控点头」并出 `merge-report.md`，主控 `$D apply --keep-commits <merge-run>` 落回后自行 push，详见 [合入员与 Radar](references/merge-and-radar.md) |
 | 发散侦察（Radar）与候选板 | `$D radar` 按 `.delegate.json` `radar.collect` 顺序采集并算指纹，未变零 token 退出；变化时派只读 scout 侦察，Host 校验锚点（`文件:行`/commit/输出行号，无锚丢弃）去重写 `<state>/radar/<repo>/board.md`；`$D radar list` 查看，`$D radar pick <id>` 生成任务说明草稿不自动派活，`$D radar schedule` 输出 00:30–04:30 每 2 小时定时安装说明，见 [合入员与 Radar](references/merge-and-radar.md) |
@@ -58,7 +58,7 @@ $D wait                                                                  # 放�
 强模型按任务性质选思考档，不是一律 high；别名可配 `{"model":"provider/id","thinking":"medium"}` 作为默认。
 规格写死的实现（前端、逐项改批量、修测试、只读查代码）用 medium；内核/账本、并发时序、沙箱安全、迁移、找根因用 high。
 便宜模型保持配置默认；拿不准先 medium，返工一次就升 high。
-优先级：环境变量 > `--thinking` > 档位规则 > 别名默认 > 顶层 thinking > Pi 默认，启动回显生效档及来源。
+优先级：环境变量 > `--thinking` > `--class`（build/design/scout→medium，hard→high）> 档位规则 > 别名默认 > 顶层 thinking > Pi 默认，启动回显生效档及来源。
 
 ### 模型适配卡
 
@@ -67,7 +67,7 @@ $D wait                                                                  # 放�
 设计归主控：界面的结构、取舍、文案与观感由主控自己画成设计稿，不委派；`design` 类的说明里给设计稿源码路径，观感仍由主控看截图收尾。
 同类任务首次把同份规格各派一路对比 → `$D fit set <类别> <别名> first|ok|avoid "一句话" --sample <规格文件>` 记结论 → 之后直接派首选。
 `$D fit` 查看四类卡与未评项，`--json` 看完整 note/sample；记录在用户配置目录的 `fit.json`，每格仅留最新一句（上限 80 字符）。
-配置新增别名会列为未评，用各类别记录的 sample 重跑即可；`start --class <类别>` 提示避用、首选与未评，不拦派发。
+配置新增别名会列为未评，用各类别记录的 sample 重跑即可；`start --class <类别>` 未传 `--thinking` 时按类别定默认思考档（`thinking <档>〔类别 <类>〕`）并提示避用、首选与未评，不拦派发。
 
 ## 任务说明
 
