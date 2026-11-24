@@ -1087,8 +1087,31 @@ pub struct AccountUsageWindow {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct AccountUsageStats {
+    pub one_hour: AccountUsageWindow,
     pub five_hour: AccountUsageWindow,
     pub seven_day: AccountUsageWindow,
+    pub hourly_24h: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct QuotaPoolEntry {
+    pub pool: String,
+    pub window: String,       // "weekly" | "fiveHour" | "other"
+    pub window_label: String, // e.g. "Weekly Limit Remaining"
+    pub remaining_pct_x100: u32,
+    pub reset_at: String,
+    pub reset_in_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct AccountRealQuota {
+    pub fetched_at: String,
+    pub fetched_epoch: i64,
+    pub age_seconds: u64,
+    pub ok: bool,
+    pub error: Option<String>,
+    pub entries: Vec<QuotaPoolEntry>,
+    pub unknown_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -1107,12 +1130,23 @@ pub struct QuotaWindowEstimate {
     pub estimated_remaining_minutes: Option<u64>,
     pub burn_rate_per_hour: u64,
     pub method: String,
+    pub source: String,
+    pub burn_rate_source: String,
+    pub pool: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct QuotaPoolEstimate {
+    pub pool: String,
+    pub weekly: Option<QuotaWindowEstimate>,
+    pub five_hour: Option<QuotaWindowEstimate>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct QuotaEstimate {
     pub weekly: Option<QuotaWindowEstimate>,
     pub five_hour: Option<QuotaWindowEstimate>,
+    pub pools: Vec<QuotaPoolEstimate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1129,6 +1163,7 @@ pub struct AgyAccountItem {
     pub files: Vec<String>,
     pub source: String,
     pub usage: AccountUsageStats,
+    pub quota: Option<AccountRealQuota>,
     pub quota_note: Option<QuotaNoteSnapshot>,
     pub quota_estimate: Option<QuotaEstimate>,
 }
@@ -1159,6 +1194,52 @@ pub struct AgyAccountsState {
     pub running_agy: Vec<RunningAgyProc>,
     pub accounts: Vec<AgyAccountItem>,
     pub unassigned_usage: AccountUsageStats,
+    pub quota_updated_at: String,
+    pub quota_age_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct PurposeBreakdown {
+    pub write: u64,
+    pub review: u64,
+    pub rework: u64,
+    pub read_only: u64,
+}
+
+impl PurposeBreakdown {
+    pub fn total(&self) -> u64 {
+        self.write
+            .saturating_add(self.review)
+            .saturating_add(self.rework)
+            .saturating_add(self.read_only)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct ModelTokens {
+    pub model: String,
+    pub tokens: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct DailyTrendPoint {
+    pub ymd: String,
+    pub date: String,
+    pub merged_count: u64,
+    pub median_merge_secs: Option<u64>,
+    pub avg_merge_secs: Option<u64>,
+    pub total_chains: u64,
+    pub first_round_pass: u64,
+    pub first_round_pass_pct: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct AnalyticsSnapshot {
+    pub hourly_24h_total: Vec<u64>,
+    pub hourly_24h_by_account: Vec<(String, Vec<u64>)>,
+    pub by_purpose: PurposeBreakdown,
+    pub by_model: Vec<ModelTokens>,
+    pub daily_7d: Vec<DailyTrendPoint>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1171,6 +1252,7 @@ pub struct AppSnapshot {
     pub merges: Vec<MergeRunItem>,
     pub candidates: Vec<RadarCandidateItem>,
     pub agy_accounts: AgyAccountsState,
+    pub analytics: AnalyticsSnapshot,
     pub host_load: Option<HostLoad>,
     pub today_ymd: String,
     pub refreshed_at: String,
@@ -1189,6 +1271,7 @@ impl AppSnapshot {
         self.merges.hash(&mut h);
         self.candidates.hash(&mut h);
         self.agy_accounts.hash(&mut h);
+        self.analytics.hash(&mut h);
         self.host_load.hash(&mut h);
         self.warnings.hash(&mut h);
         h.finish()

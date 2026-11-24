@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `delegate`：TUI 与 `agy` 真实额度、图表总览及 `--in` 失败关闭——仅经官方 `agy -p /usage </dev/null`（活跃账号走真实 HOME、非活跃账号在临时 HOME 隔离查询并回写刷新的 `~/.gemini` 凭据后删除临时目录，未知行原样保留）采集各账号额度池周/5h 剩余 % 与重置时刻，缓存至 `<state>/agy-quota.json` 并显示数据年龄；支持 `delegate agy account status|list --quota` 及 TUI 打开总览/账号页时触发、开启期间每 10 分钟刷新（关闭不轮询），真实额度优先于手动 `note` 结合近 1 小时速率推算「每 1% 约多少 token」与预计可用时长（仅提醒不自动换号）。`delegate-tui` 新增「0总览」仪表盘与账号页图表（`Gauge` 额度+重置倒计时、按账号近 24h `Sparkline`、按用途/模型切换的 `BarChart` 与近 7 天派发→合入耗时及一轮通过率走势，80 列窄屏降级为无错位纯文本）。修复 `start --read-only --in <run>` 在上游 worktree 已清理或池槽位已释放时静默读到主干的缺陷：改为从归档（`manifest.json` / `applied.patch` + 基线提交）重建只读快照，无法重建时立即报错退出并说明原因与下一步。
+
 ## delegate 6.40.0 - 2026-11-24
 
 - `delegate` 6.40.0：返工分析工具侧 6 项修复——`start` 写任务并发热点/撞号预警扩展至在跑与未合入 run（覆盖 `migrations/`、`Cargo.toml`、`CHANGELOG.md`、版本文件及同占版本/迁移号），命中时于 stderr 单行提示并附 `--after <run>` 建议且不阻断派发；本仓启用版本号延迟分配（同事只写 `CHANGELOG.md` `## Unreleased`、`.delegate.json` `standing.write` 与 `AGENTS.md`/`README.md` 同步约定，`scripts/release-binary.sh bump <skill> <ver|patch|minor|major>` 统一分配版本并落段）；`review.rs` `original_task_brief()` 沿 `reply` 链（含归档祖先）按时间顺序拼接每轮续做说明并同步 `review-rubric.md`；`transient.rs` 将 `agy` OAuth2 401（`UNAUTHENTICATED (code 401)` / `Expected OAuth 2 access token`）归为 `Kind::AuthRefresh`，退避重探 1 次（仍失败判永久失败并在结论写「agy 登录失效，`delegate agy account status`」）；用量口径统一由 `tokensDelta`（`runs::effective_tokens_delta`）驱动，`history` / `show` / `card` 展示本轮增量并增强多跳同会话祖先查找；移除归档单 run 大小硬上限（全部保留，磁盘临满仍由水位清理淘汰可重建字节）并在 `status`/`board` 提示归档总量异常（默认阈值 5 GiB，`DELEGATE_ARCHIVE_WARN_GIB` 可调）。

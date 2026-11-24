@@ -15,7 +15,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub const ONE_HOUR_SECS: i64 = 3600;
 pub const FIVE_HOURS_SECS: i64 = 5 * 3600;
+pub const TWENTY_FOUR_HOURS_SECS: i64 = 24 * 3600;
 pub const SEVEN_DAYS_SECS: i64 = 7 * 86400;
 pub const UNASSIGNED_ACCOUNT: &str = "(unassigned)";
 
@@ -266,6 +268,7 @@ pub struct LiveTracker {
     repo: String,
     repo_name: String,
     role: &'static str,
+    mode: String,
     round: u64,
     rework: bool,
     attempt: i64,
@@ -295,6 +298,18 @@ impl LiveTracker {
     pub fn start(meta: &Value, run_dir: &Path, attempt: i64) -> Self {
         let is_reviewer = b(meta, "isReviewer");
         let role = if is_reviewer { "reviewer" } else { "author" };
+        let mode = {
+            let m = s(meta, "mode");
+            if m.is_empty() {
+                if is_reviewer {
+                    "read-only".to_string()
+                } else {
+                    "write".to_string()
+                }
+            } else {
+                m.to_string()
+            }
+        };
         let parent_run_dir = if is_reviewer {
             run_dir
                 .parent()
@@ -349,6 +364,7 @@ impl LiveTracker {
             repo,
             repo_name,
             role,
+            mode,
             round,
             rework,
             attempt,
@@ -432,6 +448,7 @@ impl LiveTracker {
             "repo": self.repo,
             "repoName": self.repo_name,
             "role": self.role,
+            "mode": self.mode,
             "round": self.round,
             "rework": self.rework,
             "attempt": self.attempt,
@@ -521,6 +538,7 @@ impl LiveTracker {
             "repo": self.repo,
             "repoName": self.repo_name,
             "role": self.role,
+            "mode": self.mode,
             "round": self.round,
             "rework": self.rework,
             "attempt": self.attempt,
@@ -762,6 +780,10 @@ pub struct UsageEntry {
     pub repo: String,
     pub repo_name: String,
     pub role: String, // "author" | "reviewer"
+    pub mode: String, // "write" | "read-only" | ""
+    pub rework: bool,
+    pub model: String,
+    pub is_agy: bool,
     pub account: Option<String>,
     pub tokens: TokenCounts,
     pub live: bool,
@@ -773,7 +795,10 @@ pub struct RunningUsageItem {
     pub repo: String,
     pub repo_name: String,
     pub role: String,
+    pub mode: String,
+    pub rework: bool,
     pub round: u64,
+    pub is_agy: bool,
     pub account: Option<String>,
     pub model: String,
     pub started_at: String,
@@ -828,6 +853,9 @@ fn parse_ledger_entries(since_epoch: Option<i64>, include_non_agy: bool) -> (Vec
             "reviewer" => "reviewer".to_string(),
             _ => "author".to_string(),
         };
+        let mode = s(&v, "mode").to_string();
+        let rework = b(&v, "rework") || (role != "reviewer" && v["round"].as_u64().unwrap_or(1) > 1);
+        let model = s(&v, "model").to_string();
         let account = v["account"]
             .as_str()
             .filter(|a| !a.is_empty())
@@ -838,6 +866,10 @@ fn parse_ledger_entries(since_epoch: Option<i64>, include_non_agy: bool) -> (Vec
             repo,
             repo_name,
             role,
+            mode,
+            rework,
+            model,
+            is_agy,
             account,
             tokens,
             live: false,
@@ -900,6 +932,10 @@ fn extract_disk_run_entries(
         .filter(|a| !a.is_empty())
         .map(str::to_string);
 
+    let mode = s(&meta, "mode").to_string();
+    let author_rework = b(&meta, "isRework") || !s(&meta, "parent").is_empty();
+    let author_model = s(&meta, "model").to_string();
+
     if include_non_agy || is_agy {
         let author_tok = runs::effective_tokens_delta(&sum)
             .map(|v| TokenCounts::from_json(&v))
@@ -911,6 +947,10 @@ fn extract_disk_run_entries(
                 repo: repo.clone(),
                 repo_name: repo_name.clone(),
                 role: "author".into(),
+                mode: mode.clone(),
+                rework: author_rework,
+                model: author_model.clone(),
+                is_agy,
                 account: acct.clone(),
                 tokens: author_tok,
                 live: false,
@@ -939,6 +979,10 @@ fn extract_disk_run_entries(
                 repo: repo.clone(),
                 repo_name: repo_name.clone(),
                 role: "reviewer".into(),
+                mode: "read-only".into(),
+                rework: false,
+                model: s(&rv, "model").to_string(),
+                is_agy: rv_agy,
                 account: rv["agyAccount"]
                     .as_str()
                     .filter(|a| !a.is_empty())
@@ -964,6 +1008,10 @@ fn extract_disk_run_entries(
                     repo,
                     repo_name,
                     role: "reviewer".into(),
+                    mode: "read-only".into(),
+                    rework: false,
+                    model: rev_model.to_string(),
+                    is_agy: rev_agy,
                     account: sum["review"]["agyAccount"]
                         .as_str()
                         .filter(|a| !a.is_empty())
@@ -1056,7 +1104,17 @@ fn inspect_running_dir(
                 } else {
                     "author".into()
                 },
+                mode: {
+                    let m = s(&lv, "mode");
+                    if m.is_empty() {
+                        s(&meta, "mode").to_string()
+                    } else {
+                        m.to_string()
+                    }
+                },
+                rework: b(&lv, "rework"),
                 round: lv["round"].as_u64().unwrap_or(1),
+                is_agy: lv_agy,
                 account: lv["agyAccount"]
                     .as_str()
                     .filter(|a| !a.is_empty())
@@ -1090,7 +1148,10 @@ fn inspect_running_dir(
         repo,
         repo_name,
         role: "author".into(),
+        mode: s(&meta, "mode").to_string(),
+        rework: b(&meta, "isRework"),
         round: 1,
+        is_agy,
         account: acct,
         model: s(&meta, "model").to_string(),
         started_at: s(&meta, "startedAt").to_string(),
@@ -1416,6 +1477,10 @@ pub fn command(args: &[String]) -> Res<i32> {
                 repo: lr.repo.clone(),
                 repo_name: lr.repo_name.clone(),
                 role: lr.role.clone(),
+                mode: lr.mode.clone(),
+                rework: lr.rework,
+                model: lr.model.clone(),
+                is_agy: lr.is_agy,
                 account: lr.account.clone(),
                 tokens: tok,
                 live: true,
@@ -1768,10 +1833,131 @@ fn window_json(st: &BucketStats, uncounted: usize) -> Value {
     })
 }
 
-/// Lock-free, zero-subprocess local 5h & 7d usage + quota snapshot estimates for
-/// `agy_accounts::snapshot_json_opts` and `delegate-tui`.
-pub fn accounts_usage_snapshot(accounts_map: &Map<String, Value>) -> AccountsUsageSnapshot {
+fn model_matches_pool(model: &str, pool: &str) -> bool {
+    let p = pool.to_ascii_lowercase();
+    let m = model.to_ascii_lowercase();
+    if p.contains("gemini") {
+        m.contains("gemini") || m.contains("neon") || m.contains("flash") || m.contains("pro")
+    } else if p.contains("claude") || p.contains("gpt") {
+        m.contains("claude")
+            || m.contains("gpt")
+            || m.contains("sonnet")
+            || m.contains("opus")
+            || m.contains("codex")
+    } else {
+        true
+    }
+}
+
+fn parse_real_quota_points_for_pool(acct_quota: &Value, pool: Option<&str>) -> Vec<QuotaNotePoint> {
+    let mut pts = Vec::new();
+    if !acct_quota.is_object() {
+        return pts;
+    }
+    if let Some(hist) = acct_quota["history"].as_array() {
+        for item in hist {
+            let ep = item["epoch"].as_i64().unwrap_or(0);
+            if ep <= 0 {
+                continue;
+            }
+            let (weekly, five_hour) = if let Some(pname) = pool {
+                let p = &item["pools"][pname];
+                (
+                    p["weekly"].as_f64().filter(|v| v.is_finite()),
+                    p["fiveHour"].as_f64().filter(|v| v.is_finite()),
+                )
+            } else {
+                (
+                    item["weekly"].as_f64().filter(|v| v.is_finite()),
+                    item["fiveHour"].as_f64().filter(|v| v.is_finite()),
+                )
+            };
+            if weekly.is_some() || five_hour.is_some() {
+                pts.push(QuotaNotePoint {
+                    epoch: ep,
+                    weekly,
+                    five_hour,
+                });
+            }
+        }
+    }
+    // Always ensure the latest fetched `entries` are represented even if history was empty.
+    if b(acct_quota, "ok") {
+        let fetched_ep = acct_quota["fetchedEpoch"]
+            .as_i64()
+            .or_else(|| iso_epoch(s(acct_quota, "fetchedAt")))
+            .unwrap_or(0);
+        if fetched_ep > 0 {
+            let mut w: Option<f64> = None;
+            let mut fh: Option<f64> = None;
+            if let Some(arr) = acct_quota["entries"].as_array() {
+                for e in arr {
+                    if let Some(pname) = pool {
+                        if s(e, "pool") != pname {
+                            continue;
+                        }
+                    }
+                    let Some(pct) = e["remainingPct"].as_f64().filter(|v| v.is_finite()) else {
+                        continue;
+                    };
+                    match s(e, "window") {
+                        "weekly" => w = Some(w.map_or(pct, |prev| prev.min(pct))),
+                        "fiveHour" => fh = Some(fh.map_or(pct, |prev| prev.min(pct))),
+                        _ => {}
+                    }
+                }
+            }
+            if w.is_some() || fh.is_some() {
+                let already = pts.last().is_some_and(|p| p.epoch == fetched_ep);
+                if !already {
+                    pts.push(QuotaNotePoint {
+                        epoch: fetched_ep,
+                        weekly: w,
+                        five_hour: fh,
+                    });
+                }
+            }
+        }
+    }
+    pts.sort_by_key(|p| p.epoch);
+    pts
+}
+
+fn fill_hourly_24h(entries: &[&UsageEntry], now_ep: i64) -> [u64; 24] {
+    let mut buckets = [0u64; 24];
+    for e in entries {
+        let age = now_ep - e.epoch;
+        if !(0..TWENTY_FOUR_HOURS_SECS).contains(&age) {
+            continue;
+        }
+        let hours_ago = (age / ONE_HOUR_SECS) as usize;
+        if hours_ago < 24 {
+            let idx = 23 - hours_ago;
+            buckets[idx] = buckets[idx].saturating_add(e.tokens.total().max(0) as u64);
+        }
+    }
+    buckets
+}
+
+fn attach_estimate_meta(mut est: Value, source: &str, burn_rate_source: &str, pool: Option<&str>) -> Value {
+    if let Some(obj) = est.as_object_mut() {
+        obj.insert("source".into(), json!(source));
+        obj.insert("burnRateSource".into(), json!(burn_rate_source));
+        if let Some(p) = pool {
+            obj.insert("pool".into(), json!(p));
+        }
+    }
+    est
+}
+
+/// Lock-free, zero-subprocess local 1h / 5h / 7d usage + 24h hourly series + quota estimates
+/// (real `agy -p /usage` prioritized over manual `note`) for `agy_accounts` and `delegate-tui`.
+pub fn accounts_usage_snapshot(
+    accounts_map: &Map<String, Value>,
+    quota_cache: &Value,
+) -> AccountsUsageSnapshot {
     let now_ep = epoch() as i64;
+    let cutoff_1h = now_ep - ONE_HOUR_SECS;
     let cutoff_5h = now_ep - FIVE_HOURS_SECS;
     let cutoff_7d = now_ep - SEVEN_DAYS_SECS;
 
@@ -1787,6 +1973,10 @@ pub fn accounts_usage_snapshot(accounts_map: &Map<String, Value>) -> AccountsUsa
                 repo: lr.repo.clone(),
                 repo_name: lr.repo_name.clone(),
                 role: lr.role.clone(),
+                mode: lr.mode.clone(),
+                rework: lr.rework,
+                model: lr.model.clone(),
+                is_agy: lr.is_agy,
                 account: lr.account.clone(),
                 tokens: tok,
                 live: true,
@@ -1794,6 +1984,7 @@ pub fn accounts_usage_snapshot(accounts_map: &Map<String, Value>) -> AccountsUsa
         }
     }
 
+    let mut stats_1h: HashMap<String, BucketStats> = HashMap::new();
     let mut stats_5h: HashMap<String, BucketStats> = HashMap::new();
     let mut stats_7d: HashMap<String, BucketStats> = HashMap::new();
     let mut uncounted_by_acct: HashMap<String, usize> = HashMap::new();
@@ -1805,7 +1996,10 @@ pub fn accounts_usage_snapshot(accounts_map: &Map<String, Value>) -> AccountsUsa
             .unwrap_or_else(|| UNASSIGNED_ACCOUNT.to_string());
         stats_7d.entry(key.clone()).or_default().add_entry(e);
         if e.epoch >= cutoff_5h {
-            stats_5h.entry(key).or_default().add_entry(e);
+            stats_5h.entry(key.clone()).or_default().add_entry(e);
+        }
+        if e.epoch >= cutoff_1h {
+            stats_1h.entry(key).or_default().add_entry(e);
         }
     }
     for u in &uncounted_running {
@@ -1818,17 +2012,26 @@ pub fn accounts_usage_snapshot(accounts_map: &Map<String, Value>) -> AccountsUsa
 
     let mut per_account = HashMap::new();
     for (id, entry) in accounts_map {
+        let s1 = stats_1h.get(id).cloned().unwrap_or_default();
         let s5 = stats_5h.get(id).cloned().unwrap_or_default();
         let s7 = stats_7d.get(id).cloned().unwrap_or_default();
         let unc = uncounted_by_acct.get(id).copied().unwrap_or(0);
 
+        let acct_entries: Vec<&UsageEntry> = entries
+            .iter()
+            .filter(|e| e.account.as_deref() == Some(id.as_str()))
+            .collect();
+        let hourly_24h = fill_hourly_24h(&acct_entries, now_ep);
+
         let usage = json!({
+            "oneHour": window_json(&s1, unc),
             "fiveHour": window_json(&s5, unc),
             "sevenDay": window_json(&s7, unc),
+            "hourly24h": hourly_24h,
         });
 
         let ParsedQuotaNotes {
-            points: pts,
+            points: note_pts,
             latest_weekly: latest_w,
             latest_five_hour: latest_fh,
         } = parse_quota_notes(entry);
@@ -1847,50 +2050,191 @@ pub fn accounts_usage_snapshot(accounts_map: &Map<String, Value>) -> AccountsUsa
             Value::Null
         };
 
-        let acct_entries: Vec<&UsageEntry> = entries
-            .iter()
-            .filter(|e| e.account.as_deref() == Some(id.as_str()))
-            .collect();
+        let t1 = s1.total().total();
         let t5 = s5.total().total();
         let t7 = s7.total().total();
-        let burn_rate_per_hour = if t5 > 0 {
-            t5 as f64 / 5.0
+        let (burn_rate_per_hour, burn_rate_source) = if t1 > 0 {
+            (t1 as f64, "1h")
+        } else if t5 > 0 {
+            (t5 as f64 / 5.0, "5h")
         } else if t7 > 0 {
-            t7 as f64 / 168.0
+            (t7 as f64 / 168.0, "7d")
         } else {
-            0.0
+            (0.0, "none")
         };
 
-        let est_weekly = estimate_quota_window(
-            &pts,
-            |p| p.weekly,
-            SEVEN_DAYS_SECS,
-            now_ep,
-            &acct_entries,
-            t7,
-            burn_rate_per_hour,
-        );
-        let est_five_hour = estimate_quota_window(
-            &pts,
-            |p| p.five_hour,
-            FIVE_HOURS_SECS,
-            now_ep,
-            &acct_entries,
-            t5,
-            burn_rate_per_hour,
-        );
-        let quota_estimate = if est_weekly.is_some() || est_five_hour.is_some() {
-            let mut obj = Map::new();
-            if let Some(w) = est_weekly {
-                obj.insert("weekly".into(), w);
+        // Real quota takes priority over manual `note`.
+        let acct_quota = &quota_cache["accounts"][id];
+        let mut pool_names: Vec<String> = Vec::new();
+        if b(acct_quota, "ok") {
+            if let Some(arr) = acct_quota["entries"].as_array() {
+                for e in arr {
+                    let pname = s(e, "pool");
+                    if !pname.is_empty() && !pool_names.iter().any(|p| p == pname) {
+                        pool_names.push(pname.to_string());
+                    }
+                }
             }
-            if let Some(fh) = est_five_hour {
-                obj.insert("fiveHour".into(), fh);
+        }
+
+        let mut pool_estimates: Vec<Value> = Vec::new();
+        let mut best_real_weekly: Option<(f64, Value)> = None;
+        let mut best_real_five_hour: Option<(f64, Value)> = None;
+
+        for pname in &pool_names {
+            let real_pts = parse_real_quota_points_for_pool(acct_quota, Some(pname));
+            let matched: Vec<&UsageEntry> = acct_entries
+                .iter()
+                .copied()
+                .filter(|e| model_matches_pool(&e.model, pname))
+                .collect();
+            let use_entries: &[&UsageEntry] = if matched.is_empty() {
+                &acct_entries
+            } else {
+                &matched
+            };
+            let pt1: i64 = use_entries
+                .iter()
+                .filter(|e| e.epoch >= cutoff_1h)
+                .map(|e| e.tokens.total())
+                .sum();
+            let pt5: i64 = use_entries
+                .iter()
+                .filter(|e| e.epoch >= cutoff_5h)
+                .map(|e| e.tokens.total())
+                .sum();
+            let pt7: i64 = use_entries.iter().map(|e| e.tokens.total()).sum();
+            let (p_burn, p_bsrc) = if pt1 > 0 {
+                (pt1 as f64, "1h")
+            } else if pt5 > 0 {
+                (pt5 as f64 / 5.0, "5h")
+            } else if pt7 > 0 {
+                (pt7 as f64 / 168.0, "7d")
+            } else {
+                (burn_rate_per_hour, burn_rate_source)
+            };
+
+            let pw = estimate_quota_window(
+                &real_pts,
+                |p| p.weekly,
+                SEVEN_DAYS_SECS,
+                now_ep,
+                use_entries,
+                pt7,
+                p_burn,
+            )
+            .map(|v| attach_estimate_meta(v, "real", p_bsrc, Some(pname)));
+            let pfh = estimate_quota_window(
+                &real_pts,
+                |p| p.five_hour,
+                FIVE_HOURS_SECS,
+                now_ep,
+                use_entries,
+                pt5,
+                p_burn,
+            )
+            .map(|v| attach_estimate_meta(v, "real", p_bsrc, Some(pname)));
+
+            if let Some(ref wv) = pw {
+                let pct = wv["remainingPct"].as_f64().unwrap_or(100.0);
+                if best_real_weekly.as_ref().is_none_or(|(prev, _)| pct < *prev) {
+                    best_real_weekly = Some((pct, wv.clone()));
+                }
             }
-            Value::Object(obj)
-        } else {
-            Value::Null
-        };
+            if let Some(ref fhv) = pfh {
+                let pct = fhv["remainingPct"].as_f64().unwrap_or(100.0);
+                if best_real_five_hour
+                    .as_ref()
+                    .is_none_or(|(prev, _)| pct < *prev)
+                {
+                    best_real_five_hour = Some((pct, fhv.clone()));
+                }
+            }
+            if pw.is_some() || pfh.is_some() {
+                let mut pe = json!({ "pool": pname });
+                if let Some(w) = pw {
+                    pe["weekly"] = w;
+                }
+                if let Some(fh) = pfh {
+                    pe["fiveHour"] = fh;
+                }
+                pool_estimates.push(pe);
+            }
+        }
+
+        // If real quota exists across pools, prefer it; otherwise fall back to manual `note`.
+        let est_weekly = best_real_weekly
+            .map(|(_, v)| v)
+            .or_else(|| {
+                let real_all = parse_real_quota_points_for_pool(acct_quota, None);
+                estimate_quota_window(
+                    &real_all,
+                    |p| p.weekly,
+                    SEVEN_DAYS_SECS,
+                    now_ep,
+                    &acct_entries,
+                    t7,
+                    burn_rate_per_hour,
+                )
+                .map(|v| attach_estimate_meta(v, "real", burn_rate_source, None))
+            })
+            .or_else(|| {
+                estimate_quota_window(
+                    &note_pts,
+                    |p| p.weekly,
+                    SEVEN_DAYS_SECS,
+                    now_ep,
+                    &acct_entries,
+                    t7,
+                    burn_rate_per_hour,
+                )
+                .map(|v| attach_estimate_meta(v, "note", burn_rate_source, None))
+            });
+
+        let est_five_hour = best_real_five_hour
+            .map(|(_, v)| v)
+            .or_else(|| {
+                let real_all = parse_real_quota_points_for_pool(acct_quota, None);
+                estimate_quota_window(
+                    &real_all,
+                    |p| p.five_hour,
+                    FIVE_HOURS_SECS,
+                    now_ep,
+                    &acct_entries,
+                    t5,
+                    burn_rate_per_hour,
+                )
+                .map(|v| attach_estimate_meta(v, "real", burn_rate_source, None))
+            })
+            .or_else(|| {
+                estimate_quota_window(
+                    &note_pts,
+                    |p| p.five_hour,
+                    FIVE_HOURS_SECS,
+                    now_ep,
+                    &acct_entries,
+                    t5,
+                    burn_rate_per_hour,
+                )
+                .map(|v| attach_estimate_meta(v, "note", burn_rate_source, None))
+            });
+
+        let quota_estimate =
+            if est_weekly.is_some() || est_five_hour.is_some() || !pool_estimates.is_empty() {
+                let mut obj = Map::new();
+                if let Some(w) = est_weekly {
+                    obj.insert("weekly".into(), w);
+                }
+                if let Some(fh) = est_five_hour {
+                    obj.insert("fiveHour".into(), fh);
+                }
+                if !pool_estimates.is_empty() {
+                    obj.insert("pools".into(), Value::Array(pool_estimates));
+                }
+                Value::Object(obj)
+            } else {
+                Value::Null
+            };
 
         per_account.insert(
             id.clone(),
@@ -1902,6 +2246,10 @@ pub fn accounts_usage_snapshot(accounts_map: &Map<String, Value>) -> AccountsUsa
         );
     }
 
+    let u1 = stats_1h
+        .get(UNASSIGNED_ACCOUNT)
+        .cloned()
+        .unwrap_or_default();
     let u5 = stats_5h
         .get(UNASSIGNED_ACCOUNT)
         .cloned()
@@ -1914,15 +2262,358 @@ pub fn accounts_usage_snapshot(accounts_map: &Map<String, Value>) -> AccountsUsa
         .get(UNASSIGNED_ACCOUNT)
         .copied()
         .unwrap_or(0);
+    let unassigned_entries: Vec<&UsageEntry> = entries
+        .iter()
+        .filter(|e| e.account.is_none())
+        .collect();
     let unassigned = json!({
+        "oneHour": window_json(&u1, u_unc),
         "fiveHour": window_json(&u5, u_unc),
         "sevenDay": window_json(&u7, u_unc),
+        "hourly24h": fill_hourly_24h(&unassigned_entries, now_ep),
     });
 
     AccountsUsageSnapshot {
         per_account,
         unassigned,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Lock-Free TUI Analytics Snapshot (24h Hourly, Purpose/Model Distribution, 7d Trend)
+// ---------------------------------------------------------------------------
+
+fn short_model_label(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "unknown".to_string();
+    }
+    let stripped = trimmed
+        .strip_prefix("agy/")
+        .or_else(|| trimmed.strip_prefix("anthropic/"))
+        .or_else(|| trimmed.strip_prefix("openai/"))
+        .or_else(|| trimmed.strip_prefix("google/"))
+        .unwrap_or(trimmed);
+    stripped.to_string()
+}
+
+#[derive(Debug, Clone)]
+struct RunTrendRecord {
+    run: String,
+    mode: String,
+    state: String,
+    parent: String,
+    started_epoch: i64,
+    finished_epoch: i64,
+    applied_epoch: Option<i64>,
+    rework_count: u64,
+}
+
+fn load_trend_records(
+    state_root: &Path,
+    all_seen_runs: &BTreeMap<String, Value>,
+) -> HashMap<String, RunTrendRecord> {
+    let mut map: HashMap<String, RunTrendRecord> = HashMap::new();
+
+    // 1. Lock-free scan of per-repo `<state>/history/*/history.jsonl`.
+    let hist_root = state_root.join("history");
+    if let Ok(rd) = fs::read_dir(&hist_root) {
+        for ent in rd.flatten() {
+            let hp = ent.path().join("history.jsonl");
+            if !hp.is_file() {
+                continue;
+            }
+            for line in read(&hp).lines() {
+                let Ok(v) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                let rid = s(&v, "run");
+                if rid.is_empty() {
+                    continue;
+                }
+                let started = iso_epoch(s(&v, "startedAt")).unwrap_or(0);
+                let finished = iso_epoch(s(&v, "finishedAt")).unwrap_or(started);
+                let applied = iso_epoch(s(&v, "appliedAt"));
+                let entry = RunTrendRecord {
+                    run: rid.to_string(),
+                    mode: s(&v, "mode").to_string(),
+                    state: s(&v, "state").to_string(),
+                    parent: s(&v, "parent").to_string(),
+                    started_epoch: started,
+                    finished_epoch: finished,
+                    applied_epoch: applied,
+                    rework_count: v["reworkCount"].as_u64().unwrap_or(0),
+                };
+                // History is append-only (later lines supersede earlier ones for the same run).
+                map.insert(rid.to_string(), entry);
+            }
+        }
+    }
+
+    // 2. Overlay currently known live/uncleaned runs from `snapshot_command`.
+    for (rid, st) in all_seen_runs {
+        if rid.is_empty() {
+            continue;
+        }
+        let started = iso_epoch(s(st, "startedAt"))
+            .or_else(|| st["startedEpoch"].as_i64())
+            .unwrap_or_else(|| {
+                let age = st["ageSeconds"].as_i64().unwrap_or(0);
+                if age > 0 {
+                    epoch() as i64 - age
+                } else {
+                    0
+                }
+            });
+        let finished = iso_epoch(s(st, "finishedAt")).unwrap_or(started);
+        let applied = iso_epoch(s(st, "appliedAt")).or_else(|| {
+            if b(st, "applied") {
+                Some(finished.max(started))
+            } else {
+                None
+            }
+        });
+        let rw = st["reworkCount"]
+            .as_u64()
+            .unwrap_or(0)
+            .max(st["review"]["reworkRounds"].as_u64().unwrap_or(0));
+        map.insert(
+            rid.clone(),
+            RunTrendRecord {
+                run: rid.clone(),
+                mode: s(st, "mode").to_string(),
+                state: s(st, "state").to_string(),
+                parent: s(st, "parent").to_string(),
+                started_epoch: started,
+                finished_epoch: finished,
+                applied_epoch: applied,
+                rework_count: rw,
+            },
+        );
+    }
+
+    map
+}
+
+fn compute_daily_7d_trend(records: &HashMap<String, RunTrendRecord>, now_ep: i64) -> Vec<Value> {
+    // Build 7 local calendar days: D-6 ..= D-0
+    let mut days: Vec<(String, String)> = Vec::with_capacity(7);
+    for d in (0..7).rev() {
+        let ep = now_ep - d * 86400;
+        let ymd = format_epoch(ep, true, "%Y-%m-%d");
+        let md = format_epoch(ep, true, "%m-%d");
+        days.push((ymd, md));
+    }
+    let day_index: HashMap<String, usize> = days
+        .iter()
+        .enumerate()
+        .map(|(i, (ymd, _))| (ymd.clone(), i))
+        .collect();
+
+    // Identify parent runs so we count each reply chain once (at its head/latest run).
+    let mut has_child: HashSet<&str> = HashSet::new();
+    for rec in records.values() {
+        if !rec.parent.is_empty() {
+            has_child.insert(rec.parent.as_str());
+        }
+    }
+
+    let mut merge_secs_by_day: Vec<Vec<u64>> = vec![Vec::new(); 7];
+    let mut total_chains_by_day = [0u64; 7];
+    let mut first_pass_by_day = [0u64; 7];
+
+    for rec in records.values() {
+        if has_child.contains(rec.run.as_str()) {
+            continue;
+        }
+        if rec.mode != "write" && !rec.mode.is_empty() {
+            continue;
+        }
+        // Walk up to root of this chain to get initial dispatch timestamp & detect reply rounds.
+        let mut root_started = rec.started_epoch;
+        let mut chain_len = 1usize;
+        let mut total_rework = rec.rework_count;
+        let mut cur_parent = rec.parent.as_str();
+        let mut visited = HashSet::new();
+        visited.insert(rec.run.as_str());
+        while !cur_parent.is_empty() && visited.insert(cur_parent) {
+            chain_len += 1;
+            if let Some(p) = records.get(cur_parent) {
+                if p.started_epoch > 0 && (root_started == 0 || p.started_epoch < root_started) {
+                    root_started = p.started_epoch;
+                }
+                total_rework = total_rework.saturating_add(p.rework_count);
+                cur_parent = p.parent.as_str();
+            } else {
+                break;
+            }
+        }
+
+        // 1. Dispatch -> merge latency (bucketed by local date of appliedAt)
+        if let Some(app_ep) = rec.applied_epoch {
+            let ymd = format_epoch(app_ep, true, "%Y-%m-%d");
+            if let Some(&idx) = day_index.get(&ymd) {
+                if root_started > 0 && app_ep >= root_started {
+                    merge_secs_by_day[idx].push((app_ep - root_started) as u64);
+                }
+            }
+        }
+
+        // 2. First-round pass rate (finished write chains bucketed by finishedAt/appliedAt)
+        let is_terminal = matches!(
+            rec.state.as_str(),
+            "delivered" | "rejected" | "failed" | "timeout" | "stalled" | "crashed" | "malformed"
+        ) || rec.applied_epoch.is_some();
+        if !is_terminal {
+            continue;
+        }
+        let ref_ep = rec
+            .applied_epoch
+            .unwrap_or(rec.finished_epoch.max(rec.started_epoch));
+        if ref_ep <= 0 {
+            continue;
+        }
+        let ymd = format_epoch(ref_ep, true, "%Y-%m-%d");
+        if let Some(&idx) = day_index.get(&ymd) {
+            total_chains_by_day[idx] += 1;
+            let passed = rec.state == "delivered" || rec.applied_epoch.is_some();
+            if passed && chain_len == 1 && total_rework == 0 {
+                first_pass_by_day[idx] += 1;
+            }
+        }
+    }
+
+    days.into_iter()
+        .enumerate()
+        .map(|(i, (ymd, md))| {
+            let list = &mut merge_secs_by_day[i];
+            list.sort_unstable();
+            let merged_count = list.len() as u64;
+            let median_merge_secs = if list.is_empty() {
+                None
+            } else {
+                Some(list[list.len() / 2])
+            };
+            let avg_merge_secs = if list.is_empty() {
+                None
+            } else {
+                Some(list.iter().sum::<u64>() / merged_count)
+            };
+            let total_chains = total_chains_by_day[i];
+            let first_pass = first_pass_by_day[i];
+            let pass_pct = (first_pass * 100 + total_chains / 2).checked_div(total_chains);
+            json!({
+                "ymd": ymd,
+                "date": md,
+                "mergedCount": merged_count,
+                "medianMergeSecs": median_merge_secs,
+                "avgMergeSecs": avg_merge_secs,
+                "totalChains": total_chains,
+                "firstRoundPass": first_pass,
+                "firstRoundPassPct": pass_pct,
+            })
+        })
+        .collect()
+}
+
+/// Lock-free, zero-subprocess analytics bundle embedded in `delegate snapshot --json` for TUI charts:
+/// - Last 24h hourly token series (total + per account)
+/// - Last 7d token breakdown by purpose (`write` / `review` / `rework` / `readOnly`) and by model
+/// - Last 7d daily dispatch->merge latency & first-round pass rate trend
+pub fn tui_analytics_snapshot(state_root: &Path, all_seen_runs: &BTreeMap<String, Value>) -> Value {
+    let now_ep = epoch() as i64;
+    let cutoff_7d = now_ep - SEVEN_DAYS_SECS;
+
+    let (mut entries, live_running, _) = collect_all(Some(cutoff_7d), true, false);
+    for lr in &live_running {
+        if let Some(tok) = lr.tokens {
+            entries.push(UsageEntry {
+                epoch: now_ep,
+                run: lr.run.clone(),
+                repo: lr.repo.clone(),
+                repo_name: lr.repo_name.clone(),
+                role: lr.role.clone(),
+                mode: lr.mode.clone(),
+                rework: lr.rework,
+                model: lr.model.clone(),
+                is_agy: lr.is_agy,
+                account: lr.account.clone(),
+                tokens: tok,
+                live: true,
+            });
+        }
+    }
+
+    let entry_refs: Vec<&UsageEntry> = entries.iter().collect();
+    let total_hourly_24h = fill_hourly_24h(&entry_refs, now_ep);
+
+    let mut by_acct_refs: BTreeMap<String, Vec<&UsageEntry>> = BTreeMap::new();
+    let mut purpose_write = 0u64;
+    let mut purpose_review = 0u64;
+    let mut purpose_rework = 0u64;
+    let mut purpose_readonly = 0u64;
+    let mut by_model_map: HashMap<String, u64> = HashMap::new();
+
+    for e in &entries {
+        let tok = e.tokens.total().max(0) as u64;
+        if e.is_agy {
+            let acct = e
+                .account
+                .clone()
+                .unwrap_or_else(|| UNASSIGNED_ACCOUNT.to_string());
+            by_acct_refs.entry(acct).or_default().push(e);
+        }
+        let eff_mode = if !e.mode.is_empty() {
+            e.mode.as_str()
+        } else {
+            all_seen_runs
+                .get(&e.run)
+                .map(|st| s(st, "mode"))
+                .unwrap_or("")
+        };
+        if e.role == "reviewer" {
+            purpose_review = purpose_review.saturating_add(tok);
+        } else if e.rework {
+            purpose_rework = purpose_rework.saturating_add(tok);
+        } else if eff_mode == "read-only" {
+            purpose_readonly = purpose_readonly.saturating_add(tok);
+        } else {
+            purpose_write = purpose_write.saturating_add(tok);
+        }
+        let mlabel = short_model_label(&e.model);
+        *by_model_map.entry(mlabel).or_default() += tok;
+    }
+
+    let mut by_acct_json = Map::new();
+    for (acct, list) in by_acct_refs {
+        by_acct_json.insert(acct, json!(fill_hourly_24h(&list, now_ep)));
+    }
+
+    let mut models_vec: Vec<(String, u64)> = by_model_map.into_iter().collect();
+    models_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    models_vec.truncate(8);
+    let by_model_json: Vec<Value> = models_vec
+        .into_iter()
+        .map(|(m, t)| json!({"model": m, "tokens": t}))
+        .collect();
+
+    let trend_records = load_trend_records(state_root, all_seen_runs);
+    let daily_7d = compute_daily_7d_trend(&trend_records, now_ep);
+
+    json!({
+        "hourly24h": {
+            "total": total_hourly_24h,
+            "byAccount": Value::Object(by_acct_json),
+        },
+        "byPurpose": {
+            "write": purpose_write,
+            "review": purpose_review,
+            "rework": purpose_rework,
+            "readOnly": purpose_readonly,
+        },
+        "byModel": by_model_json,
+        "daily7d": daily_7d,
+    })
 }
 
 #[cfg(test)]
@@ -1953,6 +2644,10 @@ mod tests {
             repo: "/repo".into(),
             repo_name: "repo".into(),
             role: "author".into(),
+            mode: "write".into(),
+            rework: false,
+            model: "agy/gemini-4-neon".into(),
+            is_agy: true,
             account: Some("work".into()),
             tokens: TokenCounts::new(1_000_000, 500_000, 8_500_000), // 10M total
             live: false,
@@ -2019,5 +2714,84 @@ mod tests {
             2_000_000.0,
         )
         .is_none());
+    }
+
+    #[test]
+    fn hourly_24h_and_daily_7d_trend_compute_expected_metrics() {
+        let now = iso_epoch("2026-11-24T12:00:00Z").unwrap();
+        let e_recent = UsageEntry {
+            epoch: now - 300, // current hour -> bucket 23
+            run: "r1".into(),
+            repo: "/repo".into(),
+            repo_name: "repo".into(),
+            role: "author".into(),
+            mode: "write".into(),
+            rework: false,
+            model: "agy/gemini-4-neon".into(),
+            is_agy: true,
+            account: Some("alpha".into()),
+            tokens: TokenCounts::new(1000, 0, 0),
+            live: false,
+        };
+        let e_prev = UsageEntry {
+            epoch: now - 23 * 3600 - 10, // oldest hour -> bucket 0
+            tokens: TokenCounts::new(2500, 0, 0),
+            ..e_recent.clone()
+        };
+        let hourly = fill_hourly_24h(&[&e_recent, &e_prev], now);
+        assert_eq!(hourly[23], 1000);
+        assert_eq!(hourly[0], 2500);
+        assert_eq!(hourly[12], 0);
+
+        let mut recs = HashMap::new();
+        // First-round pass merged in 600s today
+        recs.insert(
+            "run-a".to_string(),
+            RunTrendRecord {
+                run: "run-a".into(),
+                mode: "write".into(),
+                state: "delivered".into(),
+                parent: String::new(),
+                started_epoch: now - 1200,
+                finished_epoch: now - 800,
+                applied_epoch: Some(now - 600),
+                rework_count: 0,
+            },
+        );
+        // Reworked chain merged in 1800s today (NOT first-round pass)
+        recs.insert(
+            "run-b-r1".to_string(),
+            RunTrendRecord {
+                run: "run-b-r1".into(),
+                mode: "write".into(),
+                state: "rejected".into(),
+                parent: String::new(),
+                started_epoch: now - 2400,
+                finished_epoch: now - 1800,
+                applied_epoch: None,
+                rework_count: 0,
+            },
+        );
+        recs.insert(
+            "run-b-r2".to_string(),
+            RunTrendRecord {
+                run: "run-b-r2".into(),
+                mode: "write".into(),
+                state: "delivered".into(),
+                parent: "run-b-r1".into(),
+                started_epoch: now - 1700,
+                finished_epoch: now - 900,
+                applied_epoch: Some(now - 600),
+                rework_count: 1,
+            },
+        );
+        let daily = compute_daily_7d_trend(&recs, now);
+        assert_eq!(daily.len(), 7);
+        let today = daily.last().unwrap();
+        assert_eq!(today["mergedCount"], 2);
+        assert_eq!(today["totalChains"], 2);
+        assert_eq!(today["firstRoundPass"], 1);
+        assert_eq!(today["firstRoundPassPct"], 50);
+        assert_eq!(today["avgMergeSecs"], 1200);
     }
 }

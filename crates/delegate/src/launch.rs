@@ -846,6 +846,398 @@ fn validate_allow(allow: &mut Vec<String>, repo: Option<&Path>, protect: &[Strin
     Ok(())
 }
 
+struct ReconstructedInSnapshot {
+    origin_repo: PathBuf,
+    tree_sha: String,
+    base_commit: Option<String>,
+    archive_dir: Option<PathBuf>,
+    summary: String,
+}
+
+struct TempRebuildDir {
+    path: PathBuf,
+}
+
+impl TempRebuildDir {
+    fn create() -> Res<Self> {
+        let dir = env::temp_dir().join(format!(
+            "delegate-in-rebuild-{}-{:016x}",
+            std::process::id(),
+            now_ns() as u64
+        ));
+        fs::create_dir_all(&dir).map_err(|e| format!("create temp dir {}: {e}", dir.display()))?;
+        Ok(Self { path: dir })
+    }
+}
+
+impl Drop for TempRebuildDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn is_upstream_worktree_live(upstream: &Path, prior: &Value) -> bool {
+    let wt_str = s(&prior["worktree"], "path");
+    if wt_str.is_empty() {
+        return false;
+    }
+    let wt_path = Path::new(wt_str);
+    if !wt_path.is_dir() || !wt_path.join(".git").exists() {
+        return false;
+    }
+    if upstream.join(".applied-cleaned").exists() || crate::archive::is_record(upstream) {
+        return false;
+    }
+    if crate::pool::is_slot(wt_path) || b(&prior["worktree"], "pooled") {
+        return crate::pool::slot_belongs_to_run(wt_path, upstream, prior);
+    }
+    true
+}
+
+fn git_object_type(repo: &Path, sha: &str) -> Option<String> {
+    if sha.is_empty() {
+        return None;
+    }
+    let out = git_command()
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "-t", sha])
+        .output()
+        .ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn resolve_upstream_archive_dir(upstream: &Path, prior: &Value) -> Option<PathBuf> {
+    if crate::archive::is_record(upstream) {
+        if let Some(parent) = upstream.parent() {
+            if parent.is_dir() {
+                return Some(parent.to_path_buf());
+            }
+        }
+    }
+    let arch_json = json(upstream.join("archive.json"));
+    let recorded = s(&arch_json, "path");
+    if !recorded.is_empty() {
+        let p = PathBuf::from(recorded);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    let run_id = {
+        let r = s(prior, "run");
+        if !r.is_empty() {
+            r.to_string()
+        } else {
+            upstream
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    if !run_id.is_empty() {
+        let p = cache_dir().join("archive").join(run_id);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn find_upstream_record_file(
+    upstream: &Path,
+    archive_dir: Option<&Path>,
+    name: &str,
+) -> Option<PathBuf> {
+    let direct = upstream.join(name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    if let Some(arch) = archive_dir {
+        let rec = arch.join("record").join(name);
+        if rec.is_file() {
+            return Some(rec);
+        }
+    }
+    None
+}
+
+fn fail_closed_in_err(run_id: &str, wt_path: &str, reason: &str) -> String {
+    let wt_note = if wt_path.is_empty() {
+        "未记录 worktree 路径".to_string()
+    } else {
+        format!("{wt_path} 已清理或已释放")
+    };
+    format!(
+        "--in {run_id}: 原 worktree 不可用（{wt_note}），且无法从归档重建只读快照（{reason}）；已拒绝启动，避免审查员静默读到主干。\n\
+         下一步：用 `delegate show {run_id}` 或 `delegate diff {run_id}` 查看归档记录；若确需审查当前主干，去掉 `--in {run_id}` 后重跑。"
+    )
+}
+
+fn apply_patch_onto_base(
+    origin_git_dir: &Path,
+    base_sha: &str,
+    patch_bytes: &[u8],
+) -> Result<String, String> {
+    let tmp = TempRebuildDir::create()?;
+    let wt = tmp.path.join("wt");
+    fs::create_dir_all(&wt).map_err(|e| format!("create rebuild worktree: {e}"))?;
+    let idx = tmp.path.join("index");
+
+    let run_git = |args: &[&str], stdin_data: Option<&[u8]>| -> Result<Vec<u8>, String> {
+        let mut cmd = git_command();
+        cmd.arg("--git-dir")
+            .arg(origin_git_dir)
+            .arg("--work-tree")
+            .arg(&wt)
+            .env("GIT_INDEX_FILE", &idx)
+            .args(args);
+        if stdin_data.is_some() {
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+            if let Some(bytes) = stdin_data {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = std::io::Write::write_all(&mut stdin, bytes);
+                }
+            }
+            let out = child.wait_with_output().map_err(|e| e.to_string())?;
+            if out.status.success() {
+                Ok(out.stdout)
+            } else {
+                Err(clip(String::from_utf8_lossy(&out.stderr).trim(), 300))
+            }
+        } else {
+            let out = cmd.output().map_err(|e| e.to_string())?;
+            if out.status.success() {
+                Ok(out.stdout)
+            } else {
+                Err(clip(String::from_utf8_lossy(&out.stderr).trim(), 300))
+            }
+        }
+    };
+
+    run_git(&["read-tree", base_sha], None)
+        .map_err(|e| format!("read-tree {base_sha}: {e}"))?;
+    run_git(&["checkout-index", "-a", "-f"], None)
+        .map_err(|e| format!("checkout-index {base_sha}: {e}"))?;
+    if !patch_bytes.is_empty() {
+        run_git(&["apply", "--index", "--binary"], Some(patch_bytes))
+            .map_err(|e| format!("git apply 失败: {e}"))?;
+    }
+    let tree_bytes = run_git(&["write-tree"], None)
+        .map_err(|e| format!("write-tree 失败: {e}"))?;
+    let tree_sha = String::from_utf8_lossy(&tree_bytes).trim().to_string();
+    if tree_sha.is_empty() {
+        return Err("write-tree 返回空 SHA".into());
+    }
+    Ok(tree_sha)
+}
+
+/// Fail-closed reconstruction of an upstream run's read-only snapshot when its original
+/// worktree has been cleaned, archived, or released from a pool slot.
+fn reconstruct_in_snapshot(
+    upstream: &Path,
+    prior: &Value,
+    fallback_workdir: &Path,
+) -> Res<ReconstructedInSnapshot> {
+    let run_id = {
+        let r = s(prior, "run");
+        if !r.is_empty() {
+            r.to_string()
+        } else {
+            upstream
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    let wt_path = s(&prior["worktree"], "path");
+
+    let origin_repo = {
+        let src = s(&prior["worktree"], "source");
+        if !src.is_empty() && Path::new(src).is_dir() && git_top_fast(Path::new(src)).is_some() {
+            git_top_fast(Path::new(src)).unwrap_or_else(|| PathBuf::from(src))
+        } else if let Some(top) = git_top_fast(fallback_workdir) {
+            top
+        } else {
+            return Err(fail_closed_in_err(
+                &run_id,
+                wt_path,
+                "找不到源 git 仓库目录",
+            ));
+        }
+    };
+    let origin_git_dir = git_text(
+        &origin_repo,
+        &["rev-parse", "--path-format=absolute", "--git-dir"],
+    )
+    .map(PathBuf::from)
+    .map_err(|e| fail_closed_in_err(&run_id, wt_path, &format!("源仓库 git-dir 不可读: {e}")))?;
+
+    let archive_dir = resolve_upstream_archive_dir(upstream, prior);
+    let changes_doc = find_upstream_record_file(upstream, archive_dir.as_deref(), "changes.json")
+        .map(|p| json(&p))
+        .unwrap_or(Value::Null);
+    let applied_doc = find_upstream_record_file(upstream, archive_dir.as_deref(), ".applied")
+        .map(|p| json(&p))
+        .unwrap_or(Value::Null);
+    let (patch_path, patch_label) =
+        if let Some(p) = find_upstream_record_file(upstream, archive_dir.as_deref(), "applied.patch") {
+            (Some(p), "applied.patch")
+        } else if let Some(p) =
+            find_upstream_record_file(upstream, archive_dir.as_deref(), "changes.patch")
+        {
+            (Some(p), "changes.patch")
+        } else {
+            (None, "")
+        };
+
+    let wt_base_commit =
+        find_upstream_record_file(upstream, archive_dir.as_deref(), "worktree-base-commit")
+            .map(|p| read(&p).trim().to_string())
+            .unwrap_or_default();
+
+    let raw_bases: Vec<(&str, String)> = vec![
+        ("changes.base", s(&changes_doc, "base").to_string()),
+        ("meta.base.tree", s(&prior["base"], "tree").to_string()),
+        ("meta.chainBase", s(prior, "chainBase").to_string()),
+        ("meta.netBase", s(prior, "netBase").to_string()),
+        ("worktree-base-commit", wt_base_commit),
+        ("meta.base.head", s(&prior["base"], "head").to_string()),
+    ];
+    let mut seen_bases = std::collections::HashSet::new();
+    let mut valid_bases: Vec<(&str, String, String)> = Vec::new();
+    let mut first_base_commit: Option<String> = None;
+    for (label, sha) in raw_bases {
+        if sha.is_empty() || !seen_bases.insert(sha.clone()) {
+            continue;
+        }
+        if let Some(ty) = git_object_type(&origin_repo, &sha) {
+            if matches!(ty.as_str(), "tree" | "commit") {
+                if ty == "commit" && first_base_commit.is_none() {
+                    first_base_commit = Some(sha.clone());
+                }
+                valid_bases.push((label, sha, ty));
+            }
+        }
+    }
+
+    let after_tree = {
+        let c_after = s(&changes_doc, "after");
+        let a_after = s(&applied_doc, "tree");
+        let cand = if !c_after.is_empty() { c_after } else { a_after };
+        if !cand.is_empty() && git_object_type(&origin_repo, cand).as_deref() == Some("tree") {
+            Some(cand.to_string())
+        } else {
+            None
+        }
+    };
+
+    let explicit_zero_changes = changes_doc.is_object()
+        && changes_doc["changes"]
+            .as_array()
+            .is_some_and(Vec::is_empty);
+
+    // 1. Primary reconstruction: apply archived `applied.patch` / `changes.patch` onto base commit/tree.
+    if let Some(pp) = &patch_path {
+        let patch_bytes = fs::read(pp)
+            .map_err(|e| fail_closed_in_err(&run_id, wt_path, &format!("读取 {patch_label} 失败: {e}")))?;
+        if valid_bases.is_empty() {
+            if let Some(after) = after_tree {
+                return Ok(ReconstructedInSnapshot {
+                    origin_repo,
+                    tree_sha: after.clone(),
+                    base_commit: first_base_commit,
+                    archive_dir,
+                    summary: format!("归档 after tree ({})", &after[..after.len().min(7)]),
+                });
+            }
+            return Err(fail_closed_in_err(
+                &run_id,
+                wt_path,
+                &format!("存在 {patch_label} 但原基线提交/树对象在源仓库中已不可达"),
+            ));
+        }
+        let mut last_err = String::new();
+        for (base_label, base_sha, obj_type) in &valid_bases {
+            match apply_patch_onto_base(&origin_git_dir, base_sha, &patch_bytes) {
+                Ok(tree_sha) => {
+                    let base_commit = if obj_type == "commit" {
+                        Some(base_sha.clone())
+                    } else {
+                        first_base_commit.clone()
+                    };
+                    return Ok(ReconstructedInSnapshot {
+                        origin_repo,
+                        tree_sha,
+                        base_commit,
+                        archive_dir,
+                        summary: format!(
+                            "{patch_label} + {base_label} ({})",
+                            &base_sha[..base_sha.len().min(7)]
+                        ),
+                    });
+                }
+                Err(e) => {
+                    last_err = format!("{base_label}({}): {e}", &base_sha[..base_sha.len().min(7)]);
+                }
+            }
+        }
+        return Err(fail_closed_in_err(
+            &run_id,
+            wt_path,
+            &format!("{patch_label} 无法应用到基线提交（{last_err}）"),
+        ));
+    }
+
+    // 2. Zero-change run with an intact base object.
+    if explicit_zero_changes {
+        if let Some((base_label, base_sha, obj_type)) = valid_bases.first() {
+            let tree_sha = if obj_type == "tree" {
+                base_sha.clone()
+            } else {
+                git_text(&origin_repo, &["rev-parse", &format!("{base_sha}^{{tree}}")])
+                    .map_err(|e| fail_closed_in_err(&run_id, wt_path, &format!("解析基线树失败: {e}")))?
+            };
+            return Ok(ReconstructedInSnapshot {
+                origin_repo,
+                tree_sha,
+                base_commit: if obj_type == "commit" {
+                    Some(base_sha.clone())
+                } else {
+                    first_base_commit
+                },
+                archive_dir,
+                summary: format!("零改动基线 {base_label} ({})", &base_sha[..base_sha.len().min(7)]),
+            });
+        }
+    }
+
+    // 3. Fallback if patch file is absent but `after` tree object is still intact in origin_repo.
+    if let Some(after) = after_tree {
+        return Ok(ReconstructedInSnapshot {
+            origin_repo,
+            tree_sha: after.clone(),
+            base_commit: first_base_commit,
+            archive_dir,
+            summary: format!("归档 after tree ({})", &after[..after.len().min(7)]),
+        });
+    }
+
+    Err(fail_closed_in_err(
+        &run_id,
+        wt_path,
+        "归档缺少 applied.patch / changes.patch，且基线或 after 树对象不可达",
+    ))
+}
+
 pub fn start(mut o: Options) -> Res<PathBuf> {
     if let Some(e) = nesting_error() {
         return Err(e);
@@ -870,9 +1262,16 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         o.workdir
             .clone()
             .or_else(|| {
-                in_run
-                    .as_ref()
-                    .map(|r| s(&json(r.join("meta.json"))["worktree"], "sourceWorkdir").to_string())
+                in_run.as_ref().and_then(|r| {
+                    let prior = json(r.join("meta.json"));
+                    let sw = s(&prior["worktree"], "sourceWorkdir");
+                    if !sw.is_empty() && Path::new(sw).is_dir() {
+                        Some(sw.to_string())
+                    } else {
+                        let src = s(&prior["worktree"], "source");
+                        (!src.is_empty() && Path::new(src).is_dir()).then(|| src.to_string())
+                    }
+                })
             })
             .unwrap_or_else(|| {
                 env::current_dir()
@@ -885,6 +1284,33 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         return Err(format!("workdir does not exist: {}", workdir.display()));
     }
     let workdir = workdir.canonicalize().map_err(|e| e.to_string())?;
+    let reconstructed_in = if let Some(upstream) = &in_run {
+        let prior = json(upstream.join("meta.json"));
+        if is_upstream_worktree_live(upstream, &prior) {
+            None
+        } else {
+            let rec = reconstruct_in_snapshot(upstream, &prior, &workdir)?;
+            let rid = {
+                let r = s(&prior, "run");
+                if !r.is_empty() {
+                    r.to_string()
+                } else {
+                    upstream
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            };
+            eprintln!(
+                "delegate: --in {rid} 的原 worktree 已清理，已从归档（{}）重建只读快照",
+                rec.summary
+            );
+            Some(rec)
+        }
+    } else {
+        None
+    };
     missing_tools(&o.agent)?;
     if o.in_place && o.worktree {
         return Err("--in-place and --worktree contradict each other".into());
@@ -1023,7 +1449,30 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         }
         if let Some(upstream) = &in_run {
             let prior = json(upstream.join("meta.json"));
-            extra["worktree"] = json!({"source":s(&prior["worktree"],"path"),"sourceWorkdir":s(&prior,"workdir"),"config":cfg,"in":upstream});
+            if let Some(rec) = &reconstructed_in {
+                let mut wt = json!({
+                    "source": rec.origin_repo,
+                    "sourceWorkdir": workdir,
+                    "config": cfg,
+                    "in": upstream,
+                    "reconstructedTree": rec.tree_sha,
+                    "reconstructedSummary": rec.summary,
+                });
+                if let Some(base_commit) = &rec.base_commit {
+                    wt["reconstructedBase"] = json!(base_commit);
+                }
+                if let Some(arch) = &rec.archive_dir {
+                    wt["reconstructedArchive"] = json!(arch);
+                }
+                extra["worktree"] = wt;
+            } else {
+                extra["worktree"] = json!({
+                    "source": s(&prior["worktree"], "path"),
+                    "sourceWorkdir": s(&prior, "workdir"),
+                    "config": cfg,
+                    "in": upstream,
+                });
+            }
         } else if o.worktree || (o.read_only && !o.in_place) {
             extra["worktree"] = json!({"source":top,"sourceWorkdir":workdir,"config":cfg});
         } else if !o.read_only && !o.in_place {
@@ -1896,7 +2345,7 @@ pub fn allocate_tree(tree: &mut Value, wd: &mut PathBuf, workdir: &Path, run: &P
             tree["claimedBy"] = json!(run.file_name().unwrap_or_default().to_string_lossy());
         }
         tree["path"] = json!(path);
-        let origin = if tree["in"].is_string() {
+        let origin = if tree["in"].is_string() && s(tree, "reconstructedTree").is_empty() {
             Path::new(s(tree, "sourceWorkdir"))
         } else {
             workdir

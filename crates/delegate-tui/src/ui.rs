@@ -1,5 +1,6 @@
 use crate::app::{
-    App, CollapseKind, FocusPane, ListRow, Overlay, ViewTab, WorkFilterMode, WorkFoldKind, WorkRow,
+    App, CollapseKind, FocusPane, ListRow, Overlay, OverviewBarMode, ViewTab, WorkFilterMode,
+    WorkFoldKind, WorkRow,
 };
 use crate::data::read_work_brief_markdown;
 use crate::markdown::render_markdown;
@@ -7,8 +8,9 @@ use crate::model::*;
 use crate::width::{display_width, pad_left, pad_right, truncate, wrap_text};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::bar;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Bar, BarChart, BarGroup, Block, BorderType, Borders, Clear, Gauge, Paragraph, Sparkline};
 use ratatui::Frame;
 
 const NARROW_BREAKPOINT: u16 = 100;
@@ -47,6 +49,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     if app.tab == ViewTab::Work {
         render_work_pane(frame, app, chunks[1]);
+    } else if app.tab == ViewTab::Overview {
+        render_overview_pane(frame, app, chunks[1]);
     } else if area.width >= NARROW_BREAKPOINT {
         let body = Layout::default()
             .direction(Direction::Horizontal)
@@ -73,12 +77,23 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 render_accounts_list_pane(frame, app, body[0]);
                 render_account_detail_pane(frame, app, body[1]);
             }
-            ViewTab::Work => unreachable!(),
+            ViewTab::Work | ViewTab::Overview => unreachable!(),
         }
     } else {
+        let top_pct = if app.tab == ViewTab::Accounts {
+            let need = (app.filtered_accounts.len() as u16).saturating_add(3).clamp(5, 9);
+            Constraint::Length(need)
+        } else {
+            Constraint::Percentage(46)
+        };
+        let bot_constraint = if app.tab == ViewTab::Accounts {
+            Constraint::Min(8)
+        } else {
+            Constraint::Percentage(54)
+        };
         let body = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+            .constraints([top_pct, bot_constraint])
             .split(chunks[1]);
         match app.tab {
             ViewTab::Runs => {
@@ -101,7 +116,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 render_accounts_list_pane(frame, app, body[0]);
                 render_account_detail_pane(frame, app, body[1]);
             }
-            ViewTab::Work => unreachable!(),
+            ViewTab::Work | ViewTab::Overview => unreachable!(),
         }
     }
 
@@ -179,6 +194,11 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
     let wc = app.snapshot.work_counts();
     let work_open = wc.owner + wc.needs_action + wc.ready + wc.in_progress + wc.waiting + wc.deferred;
 
+    let tab_overview_style = if app.tab == ViewTab::Overview {
+        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        muted()
+    };
     let tab_runs_style = if app.tab == ViewTab::Runs {
         Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
     } else {
@@ -217,11 +237,76 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
     };
     let accounts_count = app.snapshot.agy_accounts.accounts.len();
 
+    if area.width < NARROW_BREAKPOINT {
+        let mut spans = vec![
+            Span::styled(
+                " delegate-tui ",
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(" 0览 ", tab_overview_style),
+            Span::styled(" 1任 ", tab_runs_style),
+            Span::styled(" 2事 ", tab_events_style),
+            Span::styled(" 3合 ", tab_merges_style),
+            Span::styled(" 4候 ", tab_candidates_style),
+            Span::styled(" 5工 ", tab_work_style),
+            Span::styled(" 6账 ", tab_accounts_style),
+            Span::raw(" "),
+            Span::styled(
+                format!("待{pending}"),
+                if pending > 0 {
+                    Style::default()
+                        .fg(STATUS_PENDING)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    muted()
+                },
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("运{running}"),
+                if running > 0 {
+                    Style::default()
+                        .fg(STATUS_RUNNING)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    muted()
+                },
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("排{queued}"),
+                if queued > 0 {
+                    Style::default()
+                        .fg(STATUS_QUEUED)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    muted()
+                },
+            ),
+            Span::raw(" "),
+            Span::styled(format!("合{merged}"), muted()),
+        ];
+        if !app.filter.is_empty() {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!("滤:{}", truncate(&app.filter, 8)),
+                Style::default()
+                    .fg(STATUS_PENDING)
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+
     let mut spans = vec![
         Span::styled(
             " delegate-tui ",
             Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
         ),
+        Span::raw(" "),
+        Span::styled(" 0总览 ", tab_overview_style),
         Span::raw(" "),
         Span::styled(" 1任务 ", tab_runs_style),
         Span::raw(" "),
@@ -1554,32 +1639,39 @@ fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
         ))
     } else {
         let keys = match app.tab {
+            ViewTab::Overview => {
+                if area.width >= 100 {
+                    " 0-6 切页  v 切用途/模型  Q 刷新真实额度  r 刷新  jk 滚动  O/1 返回任务  ? 帮助  q 退出"
+                } else {
+                    " jk滚 v切图 Q刷额度 0-6切页 r刷 ?助 q退"
+                }
+            }
             ViewTab::Runs => {
                 if area.width >= 100 {
-                    " jk 选择  1-6 任务·事件·合入·候选·工作·账号  w 工作  A 账号  Tab 切栏  Enter 结论  d diff  / 过滤  r 刷新  a/c/s/p 命令  ? 帮助  q 退出"
+                    " jk 选择  0-6 总览·任务·事件·合入·候选·工作·账号  w 工作  A 账号  Tab 切栏  Enter 结论  d diff  / 过滤  r 刷新  a/c/s/p 命令  ? 帮助  q 退出"
                 } else {
-                    " jk选 Tab栏 1-6切页 w工作 A账号 Enter结论 d diff /滤 r刷 a/c/s/p令 ?助 q退"
+                    " jk选 Tab栏 0-6切页 w工作 A账号 Enter结论 d diff /滤 r刷 a/c/s/p令 ?助 q退"
                 }
             }
             ViewTab::Events => {
                 if area.width >= 100 {
-                    " jk 浏览事件  f 切换跟随  1-6 切页  w 工作  A 账号  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
+                    " jk 浏览事件  f 切换跟随  0-6 切页  w 工作  A 账号  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
                 } else {
-                    " jk览 f跟随 1-6切页 w工作 A账号 Tab栏 /滤 r刷 ?助 q退"
+                    " jk览 f跟随 0-6切页 w工作 A账号 Tab栏 /滤 r刷 ?助 q退"
                 }
             }
             ViewTab::Merges => {
                 if area.width >= 100 {
-                    " jk 选择合入批次  a/Enter 生成 apply --keep-commits  1-6 切页  w 工作  A 账号  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
+                    " jk 选择合入批次  a/Enter 生成 apply --keep-commits  0-6 切页  w 工作  A 账号  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
                 } else {
-                    " jk选 a/Enter合回 1-6切页 w工作 A账号 Tab栏 /滤 r刷 ?助 q退"
+                    " jk选 a/Enter合回 0-6切页 w工作 A账号 Tab栏 /滤 r刷 ?助 q退"
                 }
             }
             ViewTab::Candidates => {
                 if area.width >= 100 {
-                    " jk 选择候选  p/Enter 生成 radar pick 草稿命令  1-6 切页  w 工作  A 账号  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
+                    " jk 选择候选  p/Enter 生成 radar pick 草稿命令  0-6 切页  w 工作  A 账号  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
                 } else {
-                    " jk选 p/Enter挑草稿 1-6切页 w工作 A账号 Tab栏 /滤 r刷 ?助 q退"
+                    " jk选 p/Enter挑草稿 0-6切页 w工作 A账号 Tab栏 /滤 r刷 ?助 q退"
                 }
             }
             ViewTab::Work => {
@@ -1593,9 +1685,9 @@ fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
             }
             ViewTab::Accounts => {
                 if area.width >= 100 {
-                    " jk 选择账号  Enter/u 切换账号（就地确认）  y 复制命令  Tab 切栏  1-6 切页  / 过滤  r 刷新  ? 帮助  q 退出"
+                    " jk 选择账号  Enter/u 切换账号（就地确认）  Q 刷新额度  y 复制命令  Tab 切栏  0-6 切页  / 过滤  r 刷新  ? 帮助  q 退出"
                 } else {
-                    " jk选 Enter/u切换 y复 Tab栏 1-6切页 /滤 r刷 ?助 q退"
+                    " jk选 Enter/u切换 Q刷额度 y复 Tab栏 0-6切页 /滤 r刷 ?助 q退"
                 }
             }
         };
@@ -1764,8 +1856,9 @@ fn render_help_modal(frame: &mut Frame, area: Rect) {
 
     let rows = [
         ("↑↓ / j k", "选择列表项 / 滚动详情"),
-        ("1-6 / w / A", "切换「任务 / 事件 / 合入 / 候选 / 工作表 / 账号」"),
+        ("0-6 / O/w/A", "切换「总览 / 任务 / 事件 / 合入 / 候选 / 工作表 / 账号」"),
         ("e / m / b", "快捷切换「事件 / 合入 / 候选」"),
+        ("Q / v", "手动刷新 agy 真实额度 / 总览切用途与模型图"),
         ("t / →", "工作表选中项跳到关联 run"),
         ("o / x", "工作表过滤「等你 / 已否」"),
         ("f", "事件页切换自动跟随"),
@@ -3626,6 +3719,1000 @@ fn build_work_card_lines(app: &App, item: &WorkItem, width: usize) -> Vec<Line<'
 }
 
 // ---------------------------------------------------------------------------
+// Overview Dashboard (`0总览`): Real Quota Gauges, 24h Sparklines, BarChart, 7d Trends
+// ---------------------------------------------------------------------------
+
+fn quota_bar_color(pct_x100: u32) -> Color {
+    if pct_x100 < 2000 {
+        STATUS_FAILED
+    } else if pct_x100 < 5000 {
+        STATUS_PENDING
+    } else {
+        STATUS_RUNNING
+    }
+}
+
+fn format_quota_age_short(age_secs: u64) -> String {
+    if age_secs < 60 {
+        format!("{age_secs}s前")
+    } else if age_secs < 3600 {
+        format!("{}m前", age_secs / 60)
+    } else if age_secs < 86400 {
+        let h = age_secs / 3600;
+        let m = (age_secs % 3600) / 60;
+        if m == 0 {
+            format!("{h}h前")
+        } else {
+            format!("{h}h{m:02}m前")
+        }
+    } else {
+        format!("{}d前", age_secs / 86400)
+    }
+}
+
+fn format_reset_countdown(secs: Option<u64>) -> String {
+    match secs {
+        None => String::new(),
+        Some(0) => "已重置".to_string(),
+        Some(s) if s < 60 => format!("{s}s后重置"),
+        Some(s) if s < 3600 => format!("{}m后重置", s / 60),
+        Some(s) if s < 48 * 3600 => {
+            let h = s / 3600;
+            let m = (s % 3600) / 60;
+            if m == 0 {
+                format!("{h}h后重置")
+            } else {
+                format!("{h}h{m:02}m后重置")
+            }
+        }
+        Some(s) => {
+            let d = s / 86400;
+            let h = (s % 86400) / 3600;
+            if h == 0 {
+                format!("{d}d后重置")
+            } else {
+                format!("{d}d{h}h后重置")
+            }
+        }
+    }
+}
+
+fn format_reset_compact(secs: Option<u64>) -> String {
+    match secs {
+        None => String::new(),
+        Some(0) => "0m".to_string(),
+        Some(s) if s < 60 => format!("{s}s"),
+        Some(s) if s < 3600 => format!("{}m", s / 60),
+        Some(s) if s < 48 * 3600 => {
+            let h = s / 3600;
+            let m = (s % 3600) / 60;
+            if m == 0 {
+                format!("{h}h")
+            } else {
+                format!("{h}h{m:02}m")
+            }
+        }
+        Some(s) => {
+            let d = s / 86400;
+            let h = (s % 86400) / 3600;
+            if h == 0 {
+                format!("{d}d")
+            } else {
+                format!("{d}d{h}h")
+            }
+        }
+    }
+}
+
+fn short_pool_name(pool: &str) -> String {
+    let low = pool.to_ascii_lowercase();
+    if low.contains("gemini") {
+        "Gemini".to_string()
+    } else if low.contains("claude") && low.contains("gpt") {
+        "Claude/GPT".to_string()
+    } else if low.contains("claude") {
+        "Claude".to_string()
+    } else if low.contains("gpt") {
+        "GPT".to_string()
+    } else {
+        truncate(pool, 12)
+    }
+}
+
+fn short_window_name(e: &QuotaPoolEntry) -> String {
+    match e.window.as_str() {
+        "weekly" => "周".to_string(),
+        "fiveHour" => "5h".to_string(),
+        _ => truncate(&e.window_label, 6),
+    }
+}
+
+fn format_pct_clean(pct_x100: u32) -> String {
+    if pct_x100.is_multiple_of(100) {
+        format!("{}%", pct_x100 / 100)
+    } else {
+        format!("{:.1}%", pct_x100 as f64 / 100.0)
+    }
+}
+
+fn format_estimate_one_liner(est: &QuotaEstimate) -> Option<String> {
+    let pick = est.five_hour.as_ref().or(est.weekly.as_ref())?;
+    let tpp = format_tokens_short(pick.tokens_per_pct);
+    let pace_lbl = match pick.burn_rate_source.as_str() {
+        "1h" => "近1h速",
+        "5h" => "近5h均速",
+        "7d" => "近7d均速",
+        _ => "当前速",
+    };
+    let rem = match pick.estimated_remaining_minutes {
+        Some(m) => format!(" · {pace_lbl}约可用 {}", format_minutes_short(m)),
+        None => String::new(),
+    };
+    Some(format!("每1%≈{tpp}{rem}"))
+}
+
+fn inline_spark_text(values: &[u64], buckets: usize) -> String {
+    if values.is_empty() || buckets == 0 {
+        return "-".to_string();
+    }
+    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let step = (values.len() / buckets).max(1);
+    let mut sampled = Vec::with_capacity(buckets);
+    for chunk in values.chunks(step) {
+        sampled.push(chunk.iter().copied().sum::<u64>());
+    }
+    let max_v = sampled.iter().copied().max().unwrap_or(0);
+    if max_v == 0 {
+        return "▁".repeat(sampled.len());
+    }
+    sampled
+        .into_iter()
+        .map(|v| {
+            let idx = ((v as f64 / max_v as f64) * 7.0).round() as usize;
+            BLOCKS[idx.min(7)]
+        })
+        .collect()
+}
+
+fn render_quota_gauge_row(frame: &mut Frame, area: Rect, label: &str, entry: &QuotaPoolEntry) {
+    if area.width < 16 || area.height == 0 {
+        return;
+    }
+    let label_w: u16 = if area.width >= 48 { 18 } else { 14 };
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(label_w), Constraint::Min(10)])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            pad_right(label, label_w as usize),
+            primary(),
+        ))),
+        cols[0],
+    );
+    let ratio = (entry.remaining_pct_x100 as f64 / 10_000.0).clamp(0.0, 1.0);
+    let reset_txt = format_reset_countdown(entry.reset_in_seconds);
+    let gauge_lbl = if reset_txt.is_empty() {
+        format_pct_clean(entry.remaining_pct_x100)
+    } else {
+        format!("{} · {reset_txt}", format_pct_clean(entry.remaining_pct_x100))
+    };
+    let gauge = Gauge::default()
+        .ratio(ratio)
+        .use_unicode(true)
+        .gauge_style(Style::default().fg(quota_bar_color(entry.remaining_pct_x100)))
+        .label(Span::styled(gauge_lbl, bold_primary()));
+    frame.render_widget(gauge, cols[1]);
+}
+
+fn render_overview_pane(frame: &mut Frame, app: &mut App, area: Rect) {
+    if area.width < NARROW_BREAKPOINT {
+        render_overview_narrow(frame, app, area);
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(54), Constraint::Percentage(46)])
+        .split(area);
+    let top_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+        .split(rows[0]);
+    let bot_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+        .split(rows[1]);
+
+    render_overview_quota_panel(frame, app, top_cols[0]);
+    render_overview_sparkline_panel(frame, app, top_cols[1]);
+    render_overview_barchart_panel(frame, app, bot_cols[0]);
+    render_overview_trend_panel(frame, app, bot_cols[1]);
+}
+
+fn render_overview_quota_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let state = &app.snapshot.agy_accounts;
+    let age_badge = if app.quota_refreshing {
+        " · 刷新中…".to_string()
+    } else if let Some(age) = state.quota_age_seconds {
+        format!(" · {}", format_quota_age_short(age))
+    } else if let Some(age) = state
+        .accounts
+        .iter()
+        .filter_map(|a| a.quota.as_ref().map(|q| q.age_seconds))
+        .min()
+    {
+        format!(" · {}", format_quota_age_short(age))
+    } else {
+        " · 未取数（按Q）".to_string()
+    };
+    let block = rounded_block(
+        Line::from(Span::styled(
+            format!(" 账号真实额度 (agy /usage){age_badge} "),
+            bold_primary(),
+        )),
+        true,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    if state.accounts.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "暂无 agy 账号 · 运行 delegate agy account add",
+                muted(),
+            ))),
+            inner,
+        );
+        return;
+    }
+
+    let mut y = inner.y;
+    let max_y = inner.y.saturating_add(inner.height);
+    let iw = inner.width as usize;
+
+    for (idx, acct) in state.accounts.iter().enumerate() {
+        if y >= max_y {
+            break;
+        }
+        if idx > 0 && y + 1 < max_y {
+            y += 1;
+        }
+        let mark = if acct.active { "★" } else { "·" };
+        let mark_style = if acct.active {
+            Style::default()
+                .fg(STATUS_RUNNING)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            muted()
+        };
+        let est_hint = acct
+            .quota_estimate
+            .as_ref()
+            .and_then(format_estimate_one_liner)
+            .map(|s| format!("  {s}"))
+            .unwrap_or_default();
+        let hdr_line = Line::from(vec![
+            Span::styled(format!("{mark} "), mark_style),
+            Span::styled(acct.id.clone(), bold_primary()),
+            Span::styled(
+                truncate(&est_hint, iw.saturating_sub(display_width(&acct.id) + 3)),
+                Style::default().fg(STATUS_QUEUED),
+            ),
+        ]);
+        frame.render_widget(
+            Paragraph::new(hdr_line),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        y += 1;
+
+        if let Some(q) = &acct.quota {
+            if !q.ok {
+                if y < max_y {
+                    let err_msg = q.error.as_deref().unwrap_or("取数失败");
+                    frame.render_widget(
+                        Paragraph::new(Line::from(Span::styled(
+                            truncate(&format!("  ✗ {err_msg}"), iw),
+                            Style::default().fg(STATUS_FAILED),
+                        ))),
+                        Rect::new(inner.x, y, inner.width, 1),
+                    );
+                    y += 1;
+                }
+            } else if q.entries.is_empty() && q.unknown_lines.is_empty() {
+                if y < max_y {
+                    frame.render_widget(
+                        Paragraph::new(Line::from(Span::styled("  （/usage 无额度行）", muted()))),
+                        Rect::new(inner.x, y, inner.width, 1),
+                    );
+                    y += 1;
+                }
+            } else {
+                for entry in &q.entries {
+                    if y >= max_y {
+                        break;
+                    }
+                    let lbl = format!("  {} {}", short_pool_name(&entry.pool), short_window_name(entry));
+                    render_quota_gauge_row(
+                        frame,
+                        Rect::new(inner.x, y, inner.width, 1),
+                        &lbl,
+                        entry,
+                    );
+                    y += 1;
+                }
+                for unk in &q.unknown_lines {
+                    if y >= max_y {
+                        break;
+                    }
+                    frame.render_widget(
+                        Paragraph::new(Line::from(Span::styled(
+                            truncate(&format!("  [原始] {unk}"), iw),
+                            muted(),
+                        ))),
+                        Rect::new(inner.x, y, inner.width, 1),
+                    );
+                    y += 1;
+                }
+            }
+        } else if let Some(note) = &acct.quota_note {
+            if let Some(fh) = note.five_hour_pct_x100 {
+                if y < max_y {
+                    let fake = QuotaPoolEntry {
+                        pool: "手动".into(),
+                        window: "fiveHour".into(),
+                        window_label: "5h".into(),
+                        remaining_pct_x100: fh,
+                        reset_at: String::new(),
+                        reset_in_seconds: None,
+                    };
+                    render_quota_gauge_row(
+                        frame,
+                        Rect::new(inner.x, y, inner.width, 1),
+                        "  [手动] 5h",
+                        &fake,
+                    );
+                    y += 1;
+                }
+            }
+            if let Some(w) = note.weekly_pct_x100 {
+                if y < max_y {
+                    let fake = QuotaPoolEntry {
+                        pool: "手动".into(),
+                        window: "weekly".into(),
+                        window_label: "周".into(),
+                        remaining_pct_x100: w,
+                        reset_at: String::new(),
+                        reset_in_seconds: None,
+                    };
+                    render_quota_gauge_row(
+                        frame,
+                        Rect::new(inner.x, y, inner.width, 1),
+                        "  [手动] 周",
+                        &fake,
+                    );
+                    y += 1;
+                }
+            }
+        } else if y < max_y {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "  尚未取数（按 Q 或 delegate agy account list --quota）",
+                    muted(),
+                ))),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+            y += 1;
+        }
+    }
+
+    if y < max_y {
+        let foot_y = max_y - 1;
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate("仅作提醒，不自动换号 · Q 立即刷额度（每10m自动）", iw),
+                muted(),
+            ))),
+            Rect::new(inner.x, foot_y, inner.width, 1),
+        );
+    }
+}
+
+fn render_overview_sparkline_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let block = rounded_block(
+        Line::from(Span::styled(" 近 24h 每小时 Token（按账号） ", bold_primary())),
+        false,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Collect (id, active, hourly_24h) from agy_accounts first, plus any extra from analytics.
+    let mut series: Vec<(String, bool, Vec<u64>)> = Vec::new();
+    for acct in &app.snapshot.agy_accounts.accounts {
+        let mut h = acct.usage.hourly_24h.clone();
+        if h.is_empty() {
+            if let Some((_, found)) = app
+                .snapshot
+                .analytics
+                .hourly_24h_by_account
+                .iter()
+                .find(|(k, _)| k == &acct.id)
+            {
+                h = found.clone();
+            }
+        }
+        if h.is_empty() {
+            h = vec![0; 24];
+        }
+        series.push((acct.id.clone(), acct.active, h));
+    }
+    for (id, h) in &app.snapshot.analytics.hourly_24h_by_account {
+        if !series.iter().any(|(k, _, _)| k == id) {
+            series.push((id.clone(), false, h.clone()));
+        }
+    }
+
+    if series.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled("近 24h 暂无 agy Token 记录", muted()))),
+            inner,
+        );
+        return;
+    }
+
+    let n = series.len().min(3);
+    let per_h = ((inner.height as usize) / n).max(3);
+    let spark_h = per_h.saturating_sub(2).clamp(1, 3) as u16;
+    let iw = inner.width as usize;
+    let mut y = inner.y;
+    let max_y = inner.y.saturating_add(inner.height);
+
+    for (id, active, data) in series.into_iter().take(n) {
+        if y >= max_y {
+            break;
+        }
+        let sum24: u64 = data.iter().copied().sum();
+        let peak: u64 = data.iter().copied().max().unwrap_or(0);
+        let last1h: u64 = data.last().copied().unwrap_or(0);
+        let mark = if active { "★" } else { "·" };
+        let color = if active { STATUS_RUNNING } else { STATUS_QUEUED };
+        let title_line = format!(
+            "{mark} {id}  24h {} · 近1h {} · 峰 {}/h",
+            format_tokens_short(sum24),
+            format_tokens_short(last1h),
+            format_tokens_short(peak),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate(&title_line, iw),
+                if active { bold_primary() } else { primary() },
+            ))),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        y += 1;
+
+        let avail_h = max_y.saturating_sub(y).min(spark_h);
+        if avail_h > 0 {
+            // Stretch 24 hourly points cleanly across available width (1 or 2 cols per hour).
+            let repeat_x = if inner.width >= 48 { 2 } else { 1 };
+            let mut expanded = Vec::with_capacity(data.len() * repeat_x);
+            for &v in &data {
+                for _ in 0..repeat_x {
+                    expanded.push(v);
+                }
+            }
+            let spark = Sparkline::default()
+                .data(&expanded)
+                .max(peak.max(1))
+                .style(Style::default().fg(color))
+                .bar_set(bar::NINE_LEVELS);
+            frame.render_widget(spark, Rect::new(inner.x, y, inner.width.min(expanded.len() as u16), avail_h));
+            y += avail_h;
+        }
+
+        if y < max_y {
+            let axis_w = if inner.width >= 48 { 48 } else { 24 }.min(iw);
+            let axis = if axis_w >= 24 {
+                let left = "-24h";
+                let mid = "-12h";
+                let right = "now";
+                let gap1 = (axis_w / 2).saturating_sub(left.len() + mid.len() / 2);
+                let gap2 = axis_w.saturating_sub(left.len() + gap1 + mid.len() + right.len());
+                format!("{left}{}{mid}{}{right}", " ".repeat(gap1), " ".repeat(gap2))
+            } else {
+                "-24h .. now".to_string()
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(truncate(&axis, iw), muted()))),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+            y += 1;
+        }
+    }
+}
+
+fn render_overview_barchart_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let mode_label = match app.overview_bar_mode {
+        OverviewBarMode::Purpose => "按用途（写/审/返/只读）· v切模型",
+        OverviewBarMode::Model => "按模型（7d Top）· v切用途",
+    };
+    let block = rounded_block(
+        Line::from(Span::styled(format!(" Token 分布 · {mode_label} "), bold_primary())),
+        false,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let bp = &app.snapshot.analytics.by_purpose;
+    let total_p = bp.total();
+    let models = &app.snapshot.analytics.by_model;
+    let iw = inner.width as usize;
+
+    let has_data = total_p > 0 || !models.is_empty();
+    if !has_data {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled("近 7 天暂无 Token 分布数据", muted()))),
+            inner,
+        );
+        return;
+    }
+
+    let footer_h: u16 = if inner.height >= 8 { 2 } else { 0 };
+    let chart_h = inner.height.saturating_sub(footer_h);
+    let chart_area = Rect::new(inner.x, inner.y, inner.width, chart_h);
+
+    match app.overview_bar_mode {
+        OverviewBarMode::Purpose => {
+            let items = [
+                ("写", bp.write, STATUS_RUNNING),
+                ("审查", bp.review, STATUS_QUEUED),
+                ("返工", bp.rework, STATUS_PENDING),
+                ("只读", bp.read_only, Color::DarkGray),
+            ];
+            let max_v = items.iter().map(|(_, v, _)| *v).max().unwrap_or(1).max(1);
+            let bw: u16 = if inner.width >= 48 { 8 } else { 6 };
+            let bg: u16 = if inner.width >= 48 { 4 } else { 2 };
+            let bars: Vec<Bar> = items
+                .iter()
+                .map(|(lbl, val, color)| {
+                    Bar::default()
+                        .value(*val)
+                        .label(Line::from(*lbl))
+                        .text_value(format_tokens_short(*val))
+                        .style(Style::default().fg(*color))
+                })
+                .collect();
+            let chart = BarChart::default()
+                .data(BarGroup::default().bars(&bars))
+                .bar_width(bw)
+                .bar_gap(bg)
+                .max(max_v)
+                .value_style(bold_primary())
+                .label_style(primary());
+            frame.render_widget(chart, chart_area);
+        }
+        OverviewBarMode::Model => {
+            let take_n = if inner.width >= 48 { 4 } else { 3 };
+            let shown: Vec<&ModelTokens> = models.iter().take(take_n).collect();
+            let max_v = shown.iter().map(|m| m.tokens).max().unwrap_or(1).max(1);
+            let bw: u16 = if inner.width >= 48 { 10 } else { 8 };
+            let bg: u16 = 2;
+            let colors = [STATUS_RUNNING, STATUS_QUEUED, STATUS_PENDING, Color::DarkGray];
+            let bars: Vec<Bar> = shown
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    Bar::default()
+                        .value(m.tokens)
+                        .label(Line::from(truncate(&m.model, bw as usize)))
+                        .text_value(format_tokens_short(m.tokens))
+                        .style(Style::default().fg(colors[i % colors.len()]))
+                })
+                .collect();
+            let chart = BarChart::default()
+                .data(BarGroup::default().bars(&bars))
+                .bar_width(bw)
+                .bar_gap(bg)
+                .max(max_v)
+                .value_style(bold_primary())
+                .label_style(primary());
+            frame.render_widget(chart, chart_area);
+        }
+    }
+
+    if footer_h >= 2 {
+        let fy = inner.y + chart_h;
+        let pct = |v: u64| -> u64 { (v * 100 + total_p / 2).checked_div(total_p).unwrap_or(0) };
+        let line1 = format!(
+            "用途占比: 写 {}% · 审查 {}% · 返工 {}% · 只读 {}%",
+            pct(bp.write),
+            pct(bp.review),
+            pct(bp.rework),
+            pct(bp.read_only),
+        );
+        let model_parts: Vec<String> = models
+            .iter()
+            .take(3)
+            .map(|m| {
+                let name = m
+                    .model
+                    .strip_suffix("-latest")
+                    .unwrap_or(&m.model);
+                format!("{} {}", truncate(name, 13), format_tokens_short(m.tokens))
+            })
+            .collect();
+        let line2 = if model_parts.is_empty() {
+            "模型(7d): 暂无".to_string()
+        } else {
+            format!("模型: {}", model_parts.join(" · "))
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(truncate(&line1, iw), muted())),
+                Line::from(Span::styled(truncate(&line2, iw), muted())),
+            ]),
+            Rect::new(inner.x, fy, inner.width, footer_h),
+        );
+    }
+}
+
+fn render_overview_trend_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let block = rounded_block(
+        Line::from(Span::styled(" 近 7 天交付走势（合入耗时 & 一轮通过率） ", bold_primary())),
+        false,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let daily = &app.snapshot.analytics.daily_7d;
+    let iw = inner.width as usize;
+    if daily.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled("近 7 天暂无已合入/完成写任务记录", muted()))),
+            inner,
+        );
+        return;
+    }
+
+    let halves = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+
+    // Upper half: Dispatch -> Merge median duration (minutes)
+    let mut all_medians: Vec<u64> = daily
+        .iter()
+        .filter_map(|d| d.median_merge_secs)
+        .collect();
+    all_medians.sort_unstable();
+    let total_merged: u64 = daily.iter().map(|d| d.merged_count).sum();
+    let overall_med_txt = if all_medians.is_empty() {
+        "-".to_string()
+    } else {
+        format_minutes_short((all_medians[all_medians.len() / 2] / 60).max(1))
+    };
+    let merge_hdr = format!("派发→合入中位耗时  7日中位 {overall_med_txt} · 共 {total_merged} 单");
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(truncate(&merge_hdr, iw), primary()))),
+        Rect::new(halves[0].x, halves[0].y, halves[0].width, 1),
+    );
+    if halves[0].height >= 3 {
+        let chart_area = Rect::new(
+            halves[0].x,
+            halves[0].y + 1,
+            halves[0].width,
+            halves[0].height.saturating_sub(1),
+        );
+        let max_mins = daily
+            .iter()
+            .filter_map(|d| d.median_merge_secs)
+            .map(|s| (s / 60).max(1))
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let bw: u16 = if halves[0].width >= 56 { 6 } else { 5 };
+        let bg: u16 = if halves[0].width >= 56 { 2 } else { 1 };
+        let bars: Vec<Bar> = daily
+            .iter()
+            .map(|d| {
+                let mins = d.median_merge_secs.map(|s| (s / 60).max(1)).unwrap_or(0);
+                let txt = if d.median_merge_secs.is_some() {
+                    format!("{mins}m")
+                } else {
+                    "-".to_string()
+                };
+                Bar::default()
+                    .value(mins)
+                    .label(Line::from(d.date.clone()))
+                    .text_value(txt)
+                    .style(Style::default().fg(STATUS_QUEUED))
+            })
+            .collect();
+        let chart = BarChart::default()
+            .data(BarGroup::default().bars(&bars))
+            .bar_width(bw)
+            .bar_gap(bg)
+            .max(max_mins)
+            .value_style(primary())
+            .label_style(muted());
+        frame.render_widget(chart, chart_area);
+    }
+
+    // Lower half: First-round pass rate (%)
+    let total_chains: u64 = daily.iter().map(|d| d.total_chains).sum();
+    let total_pass: u64 = daily.iter().map(|d| d.first_round_pass).sum();
+    let pass_summary = match (total_pass * 100 + total_chains / 2).checked_div(total_chains) {
+        Some(pct) => format!("一轮通过率  7日 {pct}% ({total_pass}/{total_chains})"),
+        None => "一轮通过率  暂无样本".to_string(),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(truncate(&pass_summary, iw), primary()))),
+        Rect::new(halves[1].x, halves[1].y, halves[1].width, 1),
+    );
+    if halves[1].height >= 3 {
+        let chart_area = Rect::new(
+            halves[1].x,
+            halves[1].y + 1,
+            halves[1].width,
+            halves[1].height.saturating_sub(1),
+        );
+        let bw: u16 = if halves[1].width >= 56 { 6 } else { 5 };
+        let bg: u16 = if halves[1].width >= 56 { 2 } else { 1 };
+        let bars: Vec<Bar> = daily
+            .iter()
+            .map(|d| {
+                let val = d.first_round_pass_pct.unwrap_or(0);
+                let txt = match d.first_round_pass_pct {
+                    Some(p) => format!("{p}%"),
+                    None => "-".to_string(),
+                };
+                let color = if d.first_round_pass_pct.is_none() {
+                    Color::DarkGray
+                } else if val >= 75 {
+                    STATUS_RUNNING
+                } else if val >= 50 {
+                    STATUS_PENDING
+                } else {
+                    STATUS_FAILED
+                };
+                Bar::default()
+                    .value(val)
+                    .label(Line::from(d.date.clone()))
+                    .text_value(txt)
+                    .style(Style::default().fg(color))
+            })
+            .collect();
+        let chart = BarChart::default()
+            .data(BarGroup::default().bars(&bars))
+            .bar_width(bw)
+            .bar_gap(bg)
+            .max(100)
+            .value_style(primary())
+            .label_style(muted());
+        frame.render_widget(chart, chart_area);
+    }
+}
+
+fn render_overview_narrow(frame: &mut Frame, app: &mut App, area: Rect) {
+    let state = &app.snapshot.agy_accounts;
+    let age_badge = if app.quota_refreshing {
+        "刷新中…".to_string()
+    } else if let Some(age) = state.quota_age_seconds {
+        format_quota_age_short(age)
+    } else if let Some(age) = state
+        .accounts
+        .iter()
+        .filter_map(|a| a.quota.as_ref().map(|q| q.age_seconds))
+        .min()
+    {
+        format_quota_age_short(age)
+    } else {
+        "未取数".to_string()
+    };
+    let block = rounded_block(
+        Line::from(Span::styled(
+            format!(" 总览（紧凑文字 · 额度 {age_badge}） "),
+            bold_primary(),
+        )),
+        true,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let iw = inner.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // 1. Real Quota (text degraded)
+    lines.push(section_header("账号真实额度（仅提示，不自动换号）"));
+    if state.accounts.is_empty() {
+        lines.push(Line::from(Span::styled("  暂无 agy 账号", muted())));
+    } else {
+        for acct in &state.accounts {
+            let mark = if acct.active { "★" } else { "·" };
+            let mut bits = Vec::new();
+            if let Some(q) = &acct.quota {
+                if !q.ok {
+                    bits.push(format!("错:{}", q.error.as_deref().unwrap_or("失败")));
+                } else {
+                    for e in &q.entries {
+                        let r = format_reset_compact(e.reset_in_seconds);
+                        let r_part = if r.is_empty() {
+                            String::new()
+                        } else {
+                            format!("({r})")
+                        };
+                        bits.push(format!(
+                            "{} {}{}{}",
+                            short_pool_name(&e.pool),
+                            short_window_name(e),
+                            format_pct_clean(e.remaining_pct_x100),
+                            r_part
+                        ));
+                    }
+                }
+            } else if let Some(note) = &acct.quota_note {
+                if let Some(fh) = note.five_hour_pct_x100 {
+                    bits.push(format!("手动5h:{}", format_pct_clean(fh)));
+                }
+                if let Some(w) = note.weekly_pct_x100 {
+                    bits.push(format!("手动周:{}", format_pct_clean(w)));
+                }
+            } else {
+                bits.push("未取数(按Q)".to_string());
+            }
+            let row = format!("{mark} {}  {}", acct.id, bits.join(" | "));
+            push_indented_wrapped(&mut lines, "  ", &row, iw, primary());
+            if let Some(q) = &acct.quota {
+                for unk in &q.unknown_lines {
+                    push_indented_wrapped(&mut lines, "    ", &format!("[原始] {unk}"), iw, muted());
+                }
+            }
+            if let Some(est_txt) = acct.quota_estimate.as_ref().and_then(format_estimate_one_liner) {
+                push_indented_wrapped(
+                    &mut lines,
+                    "    ",
+                    &format!("估算: {est_txt}"),
+                    iw,
+                    Style::default().fg(STATUS_QUEUED),
+                );
+            }
+        }
+    }
+
+    // 2. 24h Hourly Token per account (text sparkline)
+    lines.push(section_header("近 24h Token（按账号）"));
+    if state.accounts.is_empty() && app.snapshot.analytics.hourly_24h_by_account.is_empty() {
+        lines.push(Line::from(Span::styled("  暂无 24h 记录", muted())));
+    } else {
+        for acct in &state.accounts {
+            let h = if !acct.usage.hourly_24h.is_empty() {
+                acct.usage.hourly_24h.as_slice()
+            } else {
+                app.snapshot
+                    .analytics
+                    .hourly_24h_by_account
+                    .iter()
+                    .find(|(k, _)| k == &acct.id)
+                    .map(|(_, v)| v.as_slice())
+                    .unwrap_or(&[])
+            };
+            let sum24: u64 = h.iter().copied().sum();
+            let last1h = h.last().copied().unwrap_or(0);
+            let peak = h.iter().copied().max().unwrap_or(0);
+            let spark = inline_spark_text(h, 12);
+            let txt = format!(
+                "{} 24h {} · 1h {} · 峰 {}/h  {spark}",
+                acct.id,
+                format_tokens_short(sum24),
+                format_tokens_short(last1h),
+                format_tokens_short(peak),
+            );
+            push_indented_wrapped(&mut lines, "  ", &txt, iw, primary());
+        }
+    }
+
+    // 3. Purpose / Model Distribution
+    lines.push(section_header("Token 分布（7d）"));
+    let bp = &app.snapshot.analytics.by_purpose;
+    let total_p = bp.total();
+    if total_p > 0 {
+        let pct = |v: u64| (v * 100 + total_p / 2) / total_p;
+        let p_txt = format!(
+            "用途: 写 {}%({}) · 审查 {}%({}) · 返工 {}%({}) · 只读 {}%({})",
+            pct(bp.write),
+            format_tokens_short(bp.write),
+            pct(bp.review),
+            format_tokens_short(bp.review),
+            pct(bp.rework),
+            format_tokens_short(bp.rework),
+            pct(bp.read_only),
+            format_tokens_short(bp.read_only),
+        );
+        push_indented_wrapped(&mut lines, "  ", &p_txt, iw, primary());
+    }
+    if !app.snapshot.analytics.by_model.is_empty() {
+        let m_parts: Vec<String> = app
+            .snapshot
+            .analytics
+            .by_model
+            .iter()
+            .take(4)
+            .map(|m| format!("{} {}", m.model, format_tokens_short(m.tokens)))
+            .collect();
+        push_indented_wrapped(&mut lines, "  ", &format!("模型: {}", m_parts.join(" · ")), iw, muted());
+    }
+
+    // 4. 7d Merge Latency & First-Round Pass Rate
+    lines.push(section_header("近 7 天交付走势"));
+    let daily = &app.snapshot.analytics.daily_7d;
+    if daily.is_empty() {
+        lines.push(Line::from(Span::styled("  近 7 天暂无数据", muted())));
+    } else {
+        let merge_parts: Vec<String> = daily
+            .iter()
+            .map(|d| match d.median_merge_secs {
+                Some(s) => format!("{}:{}m", d.date, (s / 60).max(1)),
+                None => format!("{}:-", d.date),
+            })
+            .collect();
+        let pass_parts: Vec<String> = daily
+            .iter()
+            .map(|d| match d.first_round_pass_pct {
+                Some(p) => format!("{}:{p}%", d.date),
+                None => format!("{}:-", d.date),
+            })
+            .collect();
+        let total_chains: u64 = daily.iter().map(|d| d.total_chains).sum();
+        let total_pass: u64 = daily.iter().map(|d| d.first_round_pass).sum();
+        let overall_pass = match (total_pass * 100 + total_chains / 2).checked_div(total_chains) {
+            Some(pct) => format!("{pct}% ({total_pass}/{total_chains})"),
+            None => "-".to_string(),
+        };
+        push_indented_wrapped(
+            &mut lines,
+            "  ",
+            &format!("合入耗时: {}", merge_parts.join(" ")),
+            iw,
+            primary(),
+        );
+        push_indented_wrapped(
+            &mut lines,
+            "  ",
+            &format!("一轮通过 {overall_pass}: {}", pass_parts.join(" ")),
+            iw,
+            primary(),
+        );
+    }
+
+    let view_h = inner.height as usize;
+    let max_scroll = lines.len().saturating_sub(view_h);
+    if app.overview_scroll > max_scroll {
+        app.overview_scroll = max_scroll;
+    }
+    let visible: Vec<Line> = lines
+        .into_iter()
+        .skip(app.overview_scroll)
+        .take(view_h)
+        .collect();
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
+// ---------------------------------------------------------------------------
 // Agy Accounts View: list, active marker, detail pane, and in-place confirm modal
 // ---------------------------------------------------------------------------
 
@@ -3633,11 +4720,18 @@ fn render_accounts_list_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == FocusPane::List && matches!(app.overlay, Overlay::None);
     let total = app.filtered_accounts.len();
     let running_n = app.snapshot.agy_accounts.running_agy.len();
+    let age_part = if app.quota_refreshing {
+        " · 额度刷新中…".to_string()
+    } else if let Some(age) = app.snapshot.agy_accounts.quota_age_seconds {
+        format!(" · 额度 {}", format_quota_age_short(age))
+    } else {
+        String::new()
+    };
     let title_text = if app.filter.is_empty() {
         if running_n > 0 {
-            format!(" agy 账号 ({total}) · 在跑 {running_n} ")
+            format!(" agy 账号 ({total}) · 在跑 {running_n}{age_part} ")
         } else {
-            format!(" agy 账号 ({total}) ")
+            format!(" agy 账号 ({total}){age_part} ")
         }
     } else {
         format!(" agy 账号 ({total}) · 过滤 ")
@@ -3873,7 +4967,13 @@ fn format_iso_compact(iso: &str) -> String {
 fn render_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == FocusPane::Detail && matches!(app.overlay, Overlay::None);
     let title = match app.selected_account_item() {
-        Some(a) => format!(" 账号详情 · {} ", a.id),
+        Some(a) => {
+            if let Some(q) = &a.quota {
+                format!(" 账号详情 · {} · 额度 {} ", a.id, format_quota_age_short(q.age_seconds))
+            } else {
+                format!(" 账号详情 · {} ", a.id)
+            }
+        }
         None => " 账号详情 ".to_string(),
     };
     let block = rounded_block(
@@ -3887,6 +4987,15 @@ fn render_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(block, area);
 
     if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Wide visual mode with ratatui Gauge + Sparkline when the selected account has real quota.
+    let has_real_quota = app
+        .selected_account_item()
+        .is_some_and(|a| a.quota.is_some());
+    if has_real_quota && area.width >= 52 && inner.height >= 18 && app.account_switch_error.is_none() {
+        render_account_detail_wide_visual(frame, app, inner);
         return;
     }
 
@@ -3944,50 +5053,141 @@ fn render_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(acct.label.clone(), primary()),
             ]));
         }
-        out.push(Line::from(vec![
-            Span::styled("最后使用: ", muted()),
-            Span::styled(
-                if acct.last_used_at.is_empty() {
-                    "-"
-                } else {
-                    acct.last_used_at.as_str()
+
+        // Real quota text-degraded section (used on narrow 80-col terminals)
+        if let Some(q) = &acct.quota {
+            out.push(section_header(&format!(
+                "真实额度（agy /usage · {}）",
+                format_quota_age_short(q.age_seconds)
+            )));
+            if !q.ok {
+                let err_msg = q.error.as_deref().unwrap_or("取数失败");
+                push_indented_wrapped(
+                    &mut out,
+                    "  ",
+                    &format!("✗ {err_msg}"),
+                    iw,
+                    Style::default().fg(STATUS_FAILED),
+                );
+            } else {
+                for e in &q.entries {
+                    let reset = format_reset_countdown(e.reset_in_seconds);
+                    let r_part = if reset.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {reset}")
+                    };
+                    let row = format!(
+                        "{} {}: {}{r_part}",
+                        short_pool_name(&e.pool),
+                        short_window_name(e),
+                        format_pct_clean(e.remaining_pct_x100),
+                    );
+                    push_indented_wrapped(
+                        &mut out,
+                        "  ",
+                        &row,
+                        iw,
+                        Style::default().fg(quota_bar_color(e.remaining_pct_x100)),
+                    );
                 }
-                .to_string(),
-                primary(),
-            ),
-        ]));
-        if !acct.last_synced_at.is_empty() {
+                for unk in &q.unknown_lines {
+                    push_indented_wrapped(&mut out, "  ", &format!("[原始] {unk}"), iw, muted());
+                }
+            }
+            if let Some(est) = &acct.quota_estimate {
+                for (label, win) in [("5h推算", &est.five_hour), ("周推算", &est.weekly)] {
+                    if let Some(e) = win {
+                        let pace_lbl = match e.burn_rate_source.as_str() {
+                            "1h" => "近1h速",
+                            "5h" => "近5h均速",
+                            "7d" => "近7d均速",
+                            _ => "当前速",
+                        };
+                        let pace = match e.estimated_remaining_minutes {
+                            Some(m) => format!(" · {pace_lbl}约 {}", format_minutes_short(m)),
+                            None => String::new(),
+                        };
+                        push_indented_wrapped(
+                            &mut out,
+                            "  ",
+                            &format!(
+                                "{label}: 每 1% ≈ {} tok{pace}（仅提示，不自动换号）",
+                                format_tokens_short(e.tokens_per_pct),
+                            ),
+                            iw,
+                            Style::default().fg(STATUS_QUEUED),
+                        );
+                    }
+                }
+            }
+            if !acct.usage.hourly_24h.is_empty() {
+                let sum24: u64 = acct.usage.hourly_24h.iter().copied().sum();
+                let spark = inline_spark_text(&acct.usage.hourly_24h, 12);
+                push_indented_wrapped(
+                    &mut out,
+                    "  ",
+                    &format!("24h Token: {}  {spark}", format_tokens_short(sum24)),
+                    iw,
+                    primary(),
+                );
+            }
+            out.push(Line::raw(""));
+        } else {
             out.push(Line::from(vec![
-                Span::styled("最近回存: ", muted()),
-                Span::styled(acct.last_synced_at.clone(), muted()),
+                Span::styled("最后使用: ", muted()),
+                Span::styled(
+                    if acct.last_used_at.is_empty() {
+                        "-"
+                    } else {
+                        acct.last_used_at.as_str()
+                    }
+                    .to_string(),
+                    primary(),
+                ),
             ]));
-        }
-        if !acct.token_expires_at.is_empty() {
+            if !acct.last_synced_at.is_empty() {
+                out.push(Line::from(vec![
+                    Span::styled("最近回存: ", muted()),
+                    Span::styled(acct.last_synced_at.clone(), muted()),
+                ]));
+            }
+            if !acct.token_expires_at.is_empty() {
+                out.push(Line::from(vec![
+                    Span::styled("本地令牌到期: ", muted()),
+                    Span::styled(acct.token_expires_at.clone(), muted()),
+                ]));
+            }
             out.push(Line::from(vec![
-                Span::styled("本地令牌到期: ", muted()),
-                Span::styled(acct.token_expires_at.clone(), muted()),
+                Span::styled("凭据文件: ", muted()),
+                Span::styled(
+                    format!("{} 份（仅本地 0600，不打印令牌）", acct.file_count),
+                    primary(),
+                ),
             ]));
+            if !acct.files.is_empty() {
+                push_indented_wrapped(&mut out, "  ", &acct.files.join(", "), iw, muted());
+            }
+            if !acct.source.is_empty() {
+                out.push(Line::from(vec![
+                    Span::styled("来源: ", muted()),
+                    Span::styled(acct.source.clone(), muted()),
+                ]));
+            }
+            out.push(Line::raw(""));
         }
-        out.push(Line::from(vec![
-            Span::styled("凭据文件: ", muted()),
-            Span::styled(
-                format!("{} 份（仅本地 0600，不打印令牌）", acct.file_count),
-                primary(),
-            ),
-        ]));
-        if !acct.files.is_empty() {
-            push_indented_wrapped(&mut out, "  ", &acct.files.join(", "), iw, muted());
-        }
-        if !acct.source.is_empty() {
-            out.push(Line::from(vec![
-                Span::styled("来源: ", muted()),
-                Span::styled(acct.source.clone(), muted()),
-            ]));
-        }
-        out.push(Line::raw(""));
 
         // Local-only usage (5h / 7d) + optional manual quota snapshot & advisory estimate
         out.push(section_header("本地用量（不调外部额度接口）"));
+        if acct.usage.one_hour.total > 0 {
+            push_indented_wrapped(
+                &mut out,
+                "  ",
+                &format_usage_window_line("近 1 小时", &acct.usage.one_hour),
+                iw,
+                primary(),
+            );
+        }
         push_indented_wrapped(
             &mut out,
             "  ",
@@ -4013,42 +5213,46 @@ fn render_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
                 parts.push(format!("5h余 {} ({ts})", format_pct_x100(fh)));
             }
             if !parts.is_empty() {
+                let note_lbl = if acct.quota.is_some() {
+                    "手动快照(真实额度优先)"
+                } else {
+                    "手动快照"
+                };
                 push_indented_wrapped(
                     &mut out,
                     "  ",
-                    &format!("手动快照: {}", parts.join(" · ")),
+                    &format!("{note_lbl}: {}", parts.join(" · ")),
                     iw,
                     primary(),
                 );
             }
-            if let Some(est) = &acct.quota_estimate {
-                for (label, win) in [("周推算", &est.weekly), ("5h推算", &est.five_hour)] {
-                    if let Some(e) = win {
-                        let pace = match e.estimated_remaining_minutes {
-                            Some(m) => format!(" · 当前速度约 {}", format_minutes_short(m)),
-                            None => String::new(),
-                        };
-                        push_indented_wrapped(
-                            &mut out,
-                            "  ",
-                            &format!(
-                                "{label}: 每 1% ≈ {} tok{pace}（仅提示，不自动换号）",
-                                format_tokens_short(e.tokens_per_pct),
-                            ),
-                            iw,
-                            Style::default().fg(STATUS_QUEUED),
-                        );
+            if acct.quota.is_none() {
+                if let Some(est) = &acct.quota_estimate {
+                    for (label, win) in [("周推算", &est.weekly), ("5h推算", &est.five_hour)] {
+                        if let Some(e) = win {
+                            let pace = match e.estimated_remaining_minutes {
+                                Some(m) => format!(" · 当前速度约 {}", format_minutes_short(m)),
+                                None => String::new(),
+                            };
+                            push_indented_wrapped(
+                                &mut out,
+                                "  ",
+                                &format!(
+                                    "{label}: 每 1% ≈ {} tok{pace}（仅提示，不自动换号）",
+                                    format_tokens_short(e.tokens_per_pct),
+                                ),
+                                iw,
+                                Style::default().fg(STATUS_QUEUED),
+                            );
+                        }
                     }
                 }
             }
-        } else {
+        } else if acct.quota.is_none() {
             push_indented_wrapped(
                 &mut out,
                 "  ",
-                &format!(
-                    "余量快照: 未登记（delegate agy account note {} --weekly <%> --five-hour <%>）",
-                    acct.id
-                ),
+                "真实额度: 未取数（按 Q 或 delegate agy account status --quota）",
                 iw,
                 muted(),
             );
@@ -4115,7 +5319,7 @@ fn render_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     push_indented_wrapped(
         &mut out,
         "  ",
-        "按 Enter 或 u 弹出就地确认并切换选中账号；不做自动轮换，不调外部额度接口。",
+        "按 Enter/u 切号 · 按 Q 通过 agy -p /usage 刷新真实额度（不做自动轮换）。",
         iw,
         muted(),
     );
@@ -4138,6 +5342,308 @@ fn render_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
         .take(view_h)
         .collect();
     frame.render_widget(Paragraph::new(visible), inner);
+}
+
+fn render_account_detail_wide_visual(frame: &mut Frame, app: &mut App, inner: Rect) {
+    let Some(acct) = app.selected_account_item().cloned() else {
+        return;
+    };
+    let state = &app.snapshot.agy_accounts;
+    let iw = inner.width as usize;
+    let mut y = inner.y;
+    let max_y = inner.y.saturating_add(inner.height);
+
+    // 1. Compact account header (2 lines)
+    let status_label = if acct.active { "★ 当前活跃" } else { "备用槽位" };
+    let status_style = if acct.active {
+        Style::default()
+            .fg(STATUS_RUNNING)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        muted()
+    };
+    let mut hdr_spans = vec![
+        Span::styled("槽位: ", muted()),
+        Span::styled(acct.id.clone(), bold_primary()),
+        Span::raw("  "),
+        Span::styled(status_label, status_style),
+    ];
+    if !acct.email.is_empty() {
+        hdr_spans.push(Span::raw("  "));
+        hdr_spans.push(Span::styled(acct.email.clone(), primary()));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(hdr_spans)),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+    y += 1;
+
+    if y < max_y {
+        let meta_line = format!(
+            "最后使用: {} · 凭据 {} 份(0600){}",
+            if acct.last_used_at.is_empty() {
+                "-".to_string()
+            } else {
+                format_iso_compact(&acct.last_used_at)
+            },
+            acct.file_count,
+            if acct.label.is_empty() {
+                String::new()
+            } else {
+                format!(" · [{}]", acct.label)
+            }
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(truncate(&meta_line, iw), muted()))),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        y += 1;
+    }
+
+    // 2. Real Quota Gauges (agy -p /usage)
+    if let Some(q) = &acct.quota {
+        if y < max_y {
+            let qhdr = format!(
+                "▸ 真实额度（agy /usage · {}）",
+                format_quota_age_short(q.age_seconds)
+            );
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(truncate(&qhdr, iw), bold_primary()))),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+            y += 1;
+        }
+        if !q.ok {
+            if y < max_y {
+                let err_msg = q.error.as_deref().unwrap_or("取数失败");
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        truncate(&format!("  ✗ {err_msg}"), iw),
+                        Style::default().fg(STATUS_FAILED),
+                    ))),
+                    Rect::new(inner.x, y, inner.width, 1),
+                );
+                y += 1;
+            }
+        } else {
+            for e in &q.entries {
+                if y >= max_y.saturating_sub(4) {
+                    break;
+                }
+                let lbl = format!("  {} {}", short_pool_name(&e.pool), short_window_name(e));
+                render_quota_gauge_row(frame, Rect::new(inner.x, y, inner.width, 1), &lbl, e);
+                y += 1;
+            }
+            for unk in &q.unknown_lines {
+                if y >= max_y.saturating_sub(4) {
+                    break;
+                }
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        truncate(&format!("  [原始] {unk}"), iw),
+                        muted(),
+                    ))),
+                    Rect::new(inner.x, y, inner.width, 1),
+                );
+                y += 1;
+            }
+        }
+        if let Some(est) = &acct.quota_estimate {
+            for (label, win) in [("5h推算", &est.five_hour), ("周推算", &est.weekly)] {
+                if let Some(e) = win {
+                    if y >= max_y.saturating_sub(4) {
+                        break;
+                    }
+                    let pace_lbl = match e.burn_rate_source.as_str() {
+                        "1h" => "近1h速",
+                        "5h" => "近5h均速",
+                        "7d" => "近7d均速",
+                        _ => "当前速",
+                    };
+                    let txt = match e.estimated_remaining_minutes {
+                        Some(m) => format!(
+                            "  {label}: 每1%≈{} · {pace_lbl}约 {}（仅提醒）",
+                            format_tokens_short(e.tokens_per_pct),
+                            format_minutes_short(m),
+                        ),
+                        None => format!(
+                            "  {label}: 每1%≈{}（仅提醒）",
+                            format_tokens_short(e.tokens_per_pct),
+                        ),
+                    };
+                    frame.render_widget(
+                        Paragraph::new(Line::from(Span::styled(
+                            truncate(&txt, iw),
+                            Style::default().fg(STATUS_QUEUED),
+                        ))),
+                        Rect::new(inner.x, y, inner.width, 1),
+                    );
+                    y += 1;
+                }
+            }
+        }
+        if let Some(note) = &acct.quota_note {
+            if y < max_y.saturating_sub(4) {
+                let mut parts = Vec::new();
+                if let Some(w) = note.weekly_pct_x100 {
+                    parts.push(format!("周{}", format_pct_clean(w)));
+                }
+                if let Some(fh) = note.five_hour_pct_x100 {
+                    parts.push(format!("5h{}", format_pct_clean(fh)));
+                }
+                if !parts.is_empty() {
+                    frame.render_widget(
+                        Paragraph::new(Line::from(Span::styled(
+                            truncate(&format!("  手动备注(真实额度优先): {}", parts.join(" · ")), iw),
+                            muted(),
+                        ))),
+                        Rect::new(inner.x, y, inner.width, 1),
+                    );
+                    y += 1;
+                }
+            }
+        }
+    }
+
+    // 3. 24h Hourly Token Sparkline for this account
+    if y + 4 < max_y {
+        y += 1;
+        let data: Vec<u64> = if !acct.usage.hourly_24h.is_empty() {
+            acct.usage.hourly_24h.clone()
+        } else {
+            vec![0; 24]
+        };
+        let sum24: u64 = data.iter().copied().sum();
+        let peak: u64 = data.iter().copied().max().unwrap_or(0);
+        let hdr = format!(
+            "▸ 近 24h Token  24h {} · 近1h {} · 峰 {}/h",
+            format_tokens_short(sum24),
+            format_tokens_short(acct.usage.one_hour.total),
+            format_tokens_short(peak),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(truncate(&hdr, iw), bold_primary()))),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        y += 1;
+
+        let spark_h = max_y.saturating_sub(y + 5).clamp(2, 3);
+        let repeat_x = if inner.width >= 50 { 2 } else { 1 };
+        let mut expanded = Vec::with_capacity(data.len() * repeat_x);
+        for &v in &data {
+            for _ in 0..repeat_x {
+                expanded.push(v);
+            }
+        }
+        let spark_color = if acct.active { STATUS_RUNNING } else { STATUS_QUEUED };
+        let spark = Sparkline::default()
+            .data(&expanded)
+            .max(peak.max(1))
+            .style(Style::default().fg(spark_color))
+            .bar_set(bar::NINE_LEVELS);
+        frame.render_widget(
+            spark,
+            Rect::new(inner.x + 2, y, inner.width.saturating_sub(2).min(expanded.len() as u16), spark_h),
+        );
+        y += spark_h;
+
+        if y < max_y {
+            let axis_w = expanded.len().min(iw.saturating_sub(2));
+            let axis = if axis_w >= 24 {
+                let left = "-24h";
+                let mid = "-12h";
+                let right = "now";
+                let gap1 = (axis_w / 2).saturating_sub(left.len() + mid.len() / 2);
+                let gap2 = axis_w.saturating_sub(left.len() + gap1 + mid.len() + right.len());
+                format!("  {left}{}{mid}{}{right}", " ".repeat(gap1), " ".repeat(gap2))
+            } else {
+                "  -24h .. now".to_string()
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(truncate(&axis, iw), muted()))),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+            y += 1;
+        }
+    }
+
+    // 4. Remaining space: local usage breakdown + live host status + key tips (scrollable)
+    if y < max_y {
+        y += 1;
+        let rem_h = max_y.saturating_sub(y) as usize;
+        if rem_h > 0 {
+            let mut out: Vec<Line<'static>> = Vec::new();
+            out.push(section_header("本机状态 & 操作"));
+            if !state.live_email.is_empty() {
+                let drift_note = if state.live_drifted { "（与活跃槽位不一致）" } else { "" };
+                push_indented_wrapped(
+                    &mut out,
+                    "  ",
+                    &format!("~/.gemini 当前账号: {}{drift_note}", state.live_email),
+                    iw,
+                    if state.live_drifted {
+                        Style::default().fg(STATUS_PENDING).add_modifier(Modifier::BOLD)
+                    } else {
+                        primary()
+                    },
+                );
+            }
+            let run_cnt = state.running_agy.len();
+            let proc_summary = if run_cnt > 0 {
+                format!("在跑 agy 进程: {run_cnt} 个（有进程时拒绝切换，确保令牌不冲突）")
+            } else {
+                "在跑 agy 进程: 0 个（可安全手动切换）".to_string()
+            };
+            push_indented_wrapped(
+                &mut out,
+                "  ",
+                &proc_summary,
+                iw,
+                if run_cnt > 0 {
+                    Style::default().fg(STATUS_PENDING).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(STATUS_RUNNING)
+                },
+            );
+            for p in state.running_agy.iter().take(4) {
+                let line = match &p.run {
+                    Some(r) => format!("pid={} (run: {}) {}", p.pid, r, p.cmdline),
+                    None => format!("pid={} {}", p.pid, p.cmdline),
+                };
+                push_indented_wrapped(&mut out, "    ", &line, iw, muted());
+            }
+            push_indented_wrapped(
+                &mut out,
+                "  ",
+                &format_usage_window_line("近 5 小时", &acct.usage.five_hour),
+                iw,
+                muted(),
+            );
+            push_indented_wrapped(
+                &mut out,
+                "  ",
+                &format_usage_window_line("近 7 天", &acct.usage.seven_day),
+                iw,
+                muted(),
+            );
+            push_indented_wrapped(
+                &mut out,
+                "  ",
+                "Enter/u 就地确认切号 · Q 刷新真实额度 · 不做自动轮换",
+                iw,
+                muted(),
+            );
+            let max_scroll = out.len().saturating_sub(rem_h);
+            if app.detail_scroll > max_scroll {
+                app.detail_scroll = max_scroll;
+            }
+            let visible: Vec<Line> = out.into_iter().skip(app.detail_scroll).take(rem_h).collect();
+            frame.render_widget(
+                Paragraph::new(visible),
+                Rect::new(inner.x, y, inner.width, rem_h as u16),
+            );
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

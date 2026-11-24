@@ -30,6 +30,42 @@ pub fn is_slot(path: &Path) -> bool {
     path.parent() == Some(root().as_path())
 }
 
+/// Return the run directory currently recorded as owning `slot`, if any.
+pub fn owner_of(slot: &Path) -> Option<PathBuf> {
+    let raw = fs::read_to_string(owner_file(slot)).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
+}
+
+/// True when `slot` is still owned by `run` (or the claiming ancestor of `run`'s reply chain)
+/// and has not been released or reassigned to another run.
+pub fn slot_belongs_to_run(slot: &Path, run: &Path, meta: &serde_json::Value) -> bool {
+    let Some(owner) = owner_of(slot) else {
+        return false;
+    };
+    let owner_canon = fs::canonicalize(&owner).unwrap_or_else(|_| owner.clone());
+    let run_canon = fs::canonicalize(run).unwrap_or_else(|_| run.to_path_buf());
+    if owner_canon == run_canon {
+        return true;
+    }
+    let claimed_by = s(&meta["worktree"], "claimedBy");
+    if !claimed_by.is_empty()
+        && owner
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == claimed_by)
+        && owner.is_dir()
+        && !owner.join(".applied-cleaned").exists()
+    {
+        return true;
+    }
+    false
+}
+
 /// A slot is held while its owner run, or any other run record (a reply continuing in
 /// it), still points at it.
 fn claimed(slot: &Path) -> bool {

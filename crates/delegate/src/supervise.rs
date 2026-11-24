@@ -1230,24 +1230,47 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
     }
     prepare_run_in_supervisor(run, &mut meta)?;
     if meta["worktree"]["in"].is_string() {
-        let in_run = Path::new(s(&meta["worktree"], "in"));
-        let source = Path::new(s(&meta["worktree"], "source"));
-        let upstream = json(in_run.join("meta.json"));
-        let exclude = upstream["snapshotExclude"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let base =
-            changes::snapshot(source, run, &exclude).ok_or("cannot snapshot upstream worktree")?;
-        meta["chainBase"] = base["tree"].clone();
-        meta["base"] = base;
-        write_json(run.join("meta.json"), &meta)?;
-        crate::refs::pin_run(run, &meta);
+        let reconstructed_tree = s(&meta["worktree"], "reconstructedTree").to_string();
+        if !reconstructed_tree.is_empty() {
+            let reconstructed_base = s(&meta["worktree"], "reconstructedBase").to_string();
+            let mut base = json!({
+                "tree": reconstructed_tree,
+                "large": {},
+                "submodules": {},
+            });
+            if !reconstructed_base.is_empty() {
+                base["head"] = json!(reconstructed_base);
+            }
+            meta["chainBase"] = json!(reconstructed_tree);
+            meta["base"] = base;
+            write_json(run.join("meta.json"), &meta)?;
+            crate::refs::pin_run(run, &meta);
+        } else {
+            let in_run = Path::new(s(&meta["worktree"], "in"));
+            let source = Path::new(s(&meta["worktree"], "source"));
+            if !source.is_dir() || !source.join(".git").exists() {
+                return Err(format!(
+                    "--in upstream worktree vanished before snapshot ({}); refusing to fall back to trunk",
+                    source.display()
+                ));
+            }
+            let upstream = json(in_run.join("meta.json"));
+            let exclude = upstream["snapshotExclude"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let base =
+                changes::snapshot(source, run, &exclude).ok_or("cannot snapshot upstream worktree")?;
+            meta["chainBase"] = base["tree"].clone();
+            meta["base"] = base;
+            write_json(run.join("meta.json"), &meta)?;
+            crate::refs::pin_run(run, &meta);
+        }
     }
     let started = epoch();
     let mut setup_error = None;

@@ -189,6 +189,24 @@ impl DelegateClient {
         parse_agy_accounts_json(&stdout)
     }
 
+    pub fn refresh_agy_quota(&self) -> Result<AgyAccountsState, String> {
+        let output = Command::new(&self.bin)
+            .args(["agy", "account", "list", "--quota", "--json"])
+            .output()
+            .map_err(|e| format!("无法执行 agy account list --quota: {e}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let msg = single_line(&stderr);
+            return Err(if msg.is_empty() {
+                format!("额度刷新失败（退出码 {:?}）", output.status.code())
+            } else {
+                msg
+            });
+        }
+        Ok(parse_agy_accounts_json(&stdout))
+    }
+
     pub fn switch_agy_account(&self, id: &str) -> Result<String, String> {
         let output = Command::new(&self.bin)
             .args(["agy", "account", "use", id, "--json"])
@@ -343,6 +361,7 @@ impl DelegateClient {
             merges: merges_list,
             candidates: candidates_list,
             agy_accounts: agy_accounts_state,
+            analytics: AnalyticsSnapshot::default(),
             host_load,
             today_ymd: local_ymd(),
             refreshed_at: local_hms(),
@@ -484,6 +503,7 @@ pub fn parse_snapshot_json(
     let merges = parse_merges_jsonl(&arr_to_jsonl(&doc["merges"]));
     let candidates = parse_candidates_jsonl(&arr_to_jsonl(&doc["candidates"]));
     let agy_accounts = parse_agy_accounts_value(&doc["agyAccounts"]);
+    let analytics = parse_analytics_value(&doc["analytics"]);
     let host_load = read_host_load();
     let today_ymd = doc["generatedAt"]
         .as_str()
@@ -499,6 +519,7 @@ pub fn parse_snapshot_json(
         merges,
         candidates,
         agy_accounts,
+        analytics,
         host_load,
         today_ymd,
         refreshed_at: local_hms(),
@@ -2384,14 +2405,87 @@ fn parse_usage_window(v: &Value) -> AccountUsageWindow {
     }
 }
 
+fn parse_u64_vec(v: Option<&Value>) -> Vec<u64> {
+    v.and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|n| n.as_u64().unwrap_or(0))
+        .collect()
+}
+
 fn parse_usage_stats(v: &Value) -> AccountUsageStats {
     if !v.is_object() {
         return AccountUsageStats::default();
     }
     AccountUsageStats {
+        one_hour: parse_usage_window(&v["oneHour"]),
         five_hour: parse_usage_window(&v["fiveHour"]),
         seven_day: parse_usage_window(&v["sevenDay"]),
+        hourly_24h: parse_u64_vec(v.get("hourly24h")),
     }
+}
+
+fn parse_real_quota(v: &Value) -> Option<AccountRealQuota> {
+    if !v.is_object() {
+        return None;
+    }
+    let fetched_at = v
+        .get("fetchedAt")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let fetched_epoch = v.get("fetchedEpoch").and_then(Value::as_i64).unwrap_or(0);
+    if fetched_at.is_empty() && fetched_epoch == 0 {
+        return None;
+    }
+    let age_seconds = v.get("ageSeconds").and_then(Value::as_u64).unwrap_or(0);
+    let ok = v.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let error = v
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(single_line);
+    let entries: Vec<QuotaPoolEntry> = v
+        .get("entries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let pool = single_line(e.get("pool").and_then(Value::as_str).unwrap_or(""));
+            if pool.is_empty() {
+                return None;
+            }
+            let remaining_pct_x100 = pct_to_x100(e.get("remainingPct"))?;
+            Some(QuotaPoolEntry {
+                pool,
+                window: e
+                    .get("window")
+                    .and_then(Value::as_str)
+                    .unwrap_or("other")
+                    .to_string(),
+                window_label: single_line(
+                    e.get("windowLabel").and_then(Value::as_str).unwrap_or(""),
+                ),
+                remaining_pct_x100,
+                reset_at: e
+                    .get("resetAt")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                reset_in_seconds: e.get("resetInSeconds").and_then(Value::as_u64),
+            })
+        })
+        .collect();
+    let unknown_lines = string_list(v.get("unknownLines"));
+    Some(AccountRealQuota {
+        fetched_at,
+        fetched_epoch,
+        age_seconds,
+        ok,
+        error,
+        entries,
+        unknown_lines,
+    })
 }
 
 fn pct_to_x100(v: Option<&Value>) -> Option<u32> {
@@ -2451,6 +2545,21 @@ fn parse_quota_window_estimate(v: &Value) -> Option<QuotaWindowEstimate> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let source = v
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let burn_rate_source = v
+        .get("burnRateSource")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let pool = v
+        .get("pool")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(single_line);
     Some(QuotaWindowEstimate {
         remaining_pct_x100,
         tokens_per_pct,
@@ -2458,6 +2567,9 @@ fn parse_quota_window_estimate(v: &Value) -> Option<QuotaWindowEstimate> {
         estimated_remaining_minutes,
         burn_rate_per_hour,
         method,
+        source,
+        burn_rate_source,
+        pool,
     })
 }
 
@@ -2467,10 +2579,106 @@ fn parse_quota_estimate(v: &Value) -> Option<QuotaEstimate> {
     }
     let weekly = parse_quota_window_estimate(&v["weekly"]);
     let five_hour = parse_quota_window_estimate(&v["fiveHour"]);
-    if weekly.is_none() && five_hour.is_none() {
+    let pools: Vec<QuotaPoolEstimate> = v
+        .get("pools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            let pool = single_line(p.get("pool").and_then(Value::as_str).unwrap_or(""));
+            if pool.is_empty() {
+                return None;
+            }
+            let pw = parse_quota_window_estimate(&p["weekly"]);
+            let pfh = parse_quota_window_estimate(&p["fiveHour"]);
+            if pw.is_none() && pfh.is_none() {
+                return None;
+            }
+            Some(QuotaPoolEstimate {
+                pool,
+                weekly: pw,
+                five_hour: pfh,
+            })
+        })
+        .collect();
+    if weekly.is_none() && five_hour.is_none() && pools.is_empty() {
         return None;
     }
-    Some(QuotaEstimate { weekly, five_hour })
+    Some(QuotaEstimate {
+        weekly,
+        five_hour,
+        pools,
+    })
+}
+
+pub fn parse_analytics_value(v: &Value) -> AnalyticsSnapshot {
+    if !v.is_object() {
+        return AnalyticsSnapshot::default();
+    }
+    let hourly_24h_total = parse_u64_vec(v["hourly24h"].get("total"));
+    let mut hourly_24h_by_account: Vec<(String, Vec<u64>)> = v["hourly24h"]["byAccount"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(k, arr)| (k.clone(), parse_u64_vec(Some(arr))))
+        .collect();
+    hourly_24h_by_account.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let bp = &v["byPurpose"];
+    let by_purpose = PurposeBreakdown {
+        write: bp.get("write").and_then(Value::as_u64).unwrap_or(0),
+        review: bp.get("review").and_then(Value::as_u64).unwrap_or(0),
+        rework: bp.get("rework").and_then(Value::as_u64).unwrap_or(0),
+        read_only: bp.get("readOnly").and_then(Value::as_u64).unwrap_or(0),
+    };
+
+    let by_model: Vec<ModelTokens> = v
+        .get("byModel")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let model = single_line(m.get("model").and_then(Value::as_str).unwrap_or(""));
+            if model.is_empty() {
+                return None;
+            }
+            let tokens = m.get("tokens").and_then(Value::as_u64).unwrap_or(0);
+            Some(ModelTokens { model, tokens })
+        })
+        .collect();
+
+    let daily_7d: Vec<DailyTrendPoint> = v
+        .get("daily7d")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|d| DailyTrendPoint {
+            ymd: d
+                .get("ymd")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            date: d
+                .get("date")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            merged_count: d.get("mergedCount").and_then(Value::as_u64).unwrap_or(0),
+            median_merge_secs: d.get("medianMergeSecs").and_then(Value::as_u64),
+            avg_merge_secs: d.get("avgMergeSecs").and_then(Value::as_u64),
+            total_chains: d.get("totalChains").and_then(Value::as_u64).unwrap_or(0),
+            first_round_pass: d.get("firstRoundPass").and_then(Value::as_u64).unwrap_or(0),
+            first_round_pass_pct: d.get("firstRoundPassPct").and_then(Value::as_u64),
+        })
+        .collect();
+
+    AnalyticsSnapshot {
+        hourly_24h_total,
+        hourly_24h_by_account,
+        by_purpose,
+        by_model,
+        daily_7d,
+    }
 }
 
 pub fn parse_agy_accounts_value(v: &Value) -> AgyAccountsState {
@@ -2546,12 +2754,19 @@ pub fn parse_agy_accounts_value(v: &Value) -> AgyAccountsState {
                 files,
                 source: a.get("source").and_then(Value::as_str).unwrap_or("").to_string(),
                 usage: parse_usage_stats(&a["usage"]),
+                quota: parse_real_quota(&a["quota"]),
                 quota_note: parse_quota_note(&a["quotaNote"]),
                 quota_estimate: parse_quota_estimate(&a["quotaEstimate"]),
             })
         })
         .collect();
     let unassigned_usage = parse_usage_stats(&v["unassignedUsage"]);
+    let quota_updated_at = v
+        .get("quotaUpdatedAt")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let quota_age_seconds = v.get("quotaAgeSeconds").and_then(Value::as_u64);
     AgyAccountsState {
         root,
         active,
@@ -2560,6 +2775,8 @@ pub fn parse_agy_accounts_value(v: &Value) -> AgyAccountsState {
         running_agy,
         accounts,
         unassigned_usage,
+        quota_updated_at,
+        quota_age_seconds,
     }
 }
 

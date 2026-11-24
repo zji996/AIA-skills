@@ -5,7 +5,8 @@
 //!
 //! Design invariants:
 //! - No automatic rotation (quota exhaustion never switches accounts automatically).
-//! - No external quota API calls (local metadata only).
+//! - Real quota is fetched exclusively via the official `agy -p /usage </dev/null` slash command
+//!   (no Google internal HTTP APIs); cached in `<state>/agy-quota.json` with fetch timestamp.
 //! - Secret tokens (`access_token`, `refresh_token`, `id_token`) are never printed to
 //!   stdout, stderr, JSON output, or logs.
 //! - Slot directories are `0700`, credential files and `accounts.json` are `0600`,
@@ -20,12 +21,20 @@ use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub const SCHEMA_VERSION: u64 = 1;
+pub const QUOTA_CACHE_SCHEMA_VERSION: u64 = 1;
+const QUOTA_HISTORY_LIMIT: usize = 200;
+const QUOTA_HISTORY_RETENTION_SECS: i64 = 7 * 86400;
+const DEFAULT_QUOTA_TIMEOUT_SECS: u64 = 30;
+static TEMP_HOME_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy)]
 pub struct CredFile {
@@ -518,6 +527,655 @@ pub fn snapshot_json() -> Value {
     snapshot_json_opts(true)
 }
 
+// ---------------------------------------------------------------------------
+// Real Quota via `agy -p /usage </dev/null` + Cache in State Dir
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuotaPoolEntry {
+    pub pool: String,
+    pub window: String,       // "weekly" | "fiveHour" | "other"
+    pub window_label: String, // e.g. "Weekly Limit Remaining"
+    pub remaining_pct: f64,
+    pub reset_at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ParsedAgyUsage {
+    pub entries: Vec<QuotaPoolEntry>,
+    pub unknown_lines: Vec<String>,
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    for ch in chars.by_ref() {
+                        if ('@'..='~').contains(&ch) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(ch) = chars.next() {
+                        if ch == '\x07' {
+                            break;
+                        }
+                        if ch == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+        if c != '\r' {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn classify_usage_window(label: &str) -> &'static str {
+    let low = label.to_ascii_lowercase();
+    if low.contains("weekly") || low.contains("week") || low.contains("7d") || low.contains("7 day") {
+        "weekly"
+    } else if low.contains("five hour")
+        || low.contains("5 hour")
+        || low.contains("5h")
+        || low.contains("five-hour")
+        || low.contains("5-hour")
+    {
+        "fiveHour"
+    } else {
+        "other"
+    }
+}
+
+fn parse_pct_value(raw: &str) -> Option<f64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let num = trimmed.strip_suffix('%').unwrap_or(trimmed).trim();
+    let v = num.parse::<f64>().ok()?;
+    if !v.is_finite() || !(0.0..=100.0).contains(&v) {
+        return None;
+    }
+    Some((v * 100.0).round() / 100.0)
+}
+
+/// Parse stdout of `agy -p /usage </dev/null`.
+///
+/// Expected TSV format:
+///   `Gemini Models\tWeekly Limit Remaining\t97%\t2026-11-30T20:09:03Z`
+///   `Claude and GPT models\tFive Hour Limit Remaining\t92%\t2026-11-24T07:32:40Z`
+///
+/// Missing columns (e.g. absent reset timestamp) or missing windows are tolerated,
+/// and any unrecognized/non-TSV lines are preserved verbatim in `unknown_lines` without error.
+pub fn parse_agy_usage_output(raw: &str) -> ParsedAgyUsage {
+    let mut parsed = ParsedAgyUsage::default();
+    for raw_line in raw.lines() {
+        let clean = strip_ansi(raw_line);
+        let trimmed = clean.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = clean.split('\t').map(str::trim).collect();
+        if cols.len() >= 3 && !cols[0].is_empty() && !cols[1].is_empty() {
+            if let Some(pct) = parse_pct_value(cols[2]) {
+                let window = classify_usage_window(cols[1]).to_string();
+                let reset_at = cols.get(3).copied().unwrap_or("").to_string();
+                parsed.entries.push(QuotaPoolEntry {
+                    pool: cols[0].to_string(),
+                    window,
+                    window_label: cols[1].to_string(),
+                    remaining_pct: pct,
+                    reset_at,
+                });
+                continue;
+            }
+        }
+        parsed.unknown_lines.push(trimmed.to_string());
+    }
+    parsed
+}
+
+pub fn quota_cache_path() -> PathBuf {
+    state_dir().join("agy-quota.json")
+}
+
+/// Lock-free read of `<state>/agy-quota.json`.
+pub fn load_quota_cache() -> Value {
+    let v = json(quota_cache_path());
+    if v.is_object() && v["accounts"].is_object() {
+        v
+    } else {
+        json!({
+            "schemaVersion": QUOTA_CACHE_SCHEMA_VERSION,
+            "updatedAt": "",
+            "updatedEpoch": 0,
+            "accounts": {}
+        })
+    }
+}
+
+fn save_quota_cache(doc: &Value) -> Res<()> {
+    let path = quota_cache_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    write_json(&path, doc)
+}
+
+pub fn format_age_compact(age_secs: i64) -> String {
+    let s = age_secs.max(0);
+    if s < 60 {
+        format!("{s}s前")
+    } else if s < 3600 {
+        format!("{}m前", s / 60)
+    } else if s < 86400 {
+        let h = s / 3600;
+        let m = (s % 3600) / 60;
+        if m == 0 {
+            format!("{h}h前")
+        } else {
+            format!("{h}h{m:02}m前")
+        }
+    } else {
+        let d = s / 86400;
+        let h = (s % 86400) / 3600;
+        if h == 0 {
+            format!("{d}d前")
+        } else {
+            format!("{d}d{h}h前")
+        }
+    }
+}
+
+pub fn format_countdown_compact(rem_secs: i64) -> String {
+    if rem_secs <= 0 {
+        return "已重置".to_string();
+    }
+    if rem_secs < 60 {
+        format!("{rem_secs}s")
+    } else if rem_secs < 3600 {
+        format!("{}m", rem_secs / 60)
+    } else if rem_secs < 48 * 3600 {
+        let h = rem_secs / 3600;
+        let m = (rem_secs % 3600) / 60;
+        if m == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h{m:02}m")
+        }
+    } else {
+        let d = rem_secs / 86400;
+        let h = (rem_secs % 86400) / 3600;
+        if h == 0 {
+            format!("{d}d")
+        } else {
+            format!("{d}d{h}h")
+        }
+    }
+}
+
+/// Enrich a cached per-account quota record with live `ageSeconds` and per-entry `resetInSeconds`.
+pub fn enrich_quota_for_snapshot(raw_acct: &Value, now_ep: i64) -> Option<Value> {
+    if !raw_acct.is_object() {
+        return None;
+    }
+    let fetched_at = s(raw_acct, "fetchedAt");
+    let fetched_ep = raw_acct["fetchedEpoch"]
+        .as_i64()
+        .or_else(|| iso_epoch(fetched_at))
+        .unwrap_or(0);
+    if fetched_at.is_empty() && fetched_ep == 0 {
+        return None;
+    }
+    let age_seconds = (now_ep - fetched_ep).max(0);
+    let entries: Vec<Value> = raw_acct["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|e| {
+            let mut obj = e.clone();
+            let reset_at = s(e, "resetAt");
+            if let Some(rep) = iso_epoch(reset_at) {
+                obj["resetInSeconds"] = json!((rep - now_ep).max(0));
+            }
+            obj
+        })
+        .collect();
+    let unknown_lines: Vec<Value> = raw_acct["unknownLines"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut out = json!({
+        "fetchedAt": fetched_at,
+        "fetchedEpoch": fetched_ep,
+        "ageSeconds": age_seconds,
+        "ok": b(raw_acct, "ok"),
+        "entries": entries,
+        "unknownLines": unknown_lines,
+    });
+    if let Some(err) = raw_acct["error"].as_str().filter(|e| !e.is_empty()) {
+        out["error"] = json!(err);
+    }
+    Some(out)
+}
+
+fn quota_timeout_secs() -> u64 {
+    env::var("DELEGATE_AGY_QUOTA_TIMEOUT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_QUOTA_TIMEOUT_SECS)
+}
+
+fn run_agy_usage_cmd(
+    agy_bin: &Path,
+    target_home: &Path,
+    isolated_temp_home: bool,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let mut cmd = Command::new(agy_bin);
+    cmd.args(["-p", "/usage"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("AGY_SWAP_SKIP_SYNC", "1");
+    if isolated_temp_home {
+        cmd.env("HOME", target_home)
+            .env("XDG_CONFIG_HOME", target_home.join(".config"))
+            .env("XDG_CACHE_HOME", target_home.join(".cache"))
+            .env("XDG_STATE_HOME", target_home.join(".local/state"));
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to run {} -p /usage: {e}", agy_bin.display()))?;
+
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let out_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut p) = stdout_pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut p) = stderr_pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Ok(st),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(format!(
+                        "agy -p /usage timed out after {timeout_secs}s"
+                    ));
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => break Err(format!("wait agy -p /usage failed: {e}")),
+        }
+    };
+
+    let stdout_bytes = out_handle.join().unwrap_or_default();
+    let stderr_bytes = err_handle.join().unwrap_or_default();
+    let st = status?;
+    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+    if !st.success() {
+        let msg = if !stderr.trim().is_empty() {
+            clip(stderr.trim(), 240)
+        } else if !stdout.trim().is_empty() {
+            clip(stdout.trim(), 240)
+        } else {
+            format!("exit status {st}")
+        };
+        return Err(format!("agy -p /usage failed: {msg}"));
+    }
+    Ok(stdout)
+}
+
+#[derive(Debug)]
+struct SlotQuotaFetch {
+    id: String,
+    ok: bool,
+    error: Option<String>,
+    parsed: ParsedAgyUsage,
+    refreshed_creds: usize,
+}
+
+fn seed_keyring_markers(real_home: &Path, temp_home: &Path) {
+    for marker in KEYRING_MARKERS {
+        let src = real_home.join(marker);
+        if src.is_file() {
+            let dst = temp_home.join(marker);
+            if let Some(parent) = dst.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::copy(&src, &dst);
+        }
+    }
+}
+
+/// Run `agy -p /usage </dev/null` for a single account slot.
+/// - Active slot (when live `~/.gemini` matches): runs directly in real `HOME`.
+/// - Inactive/standby slot: installs slot creds into a `0700` temporary `HOME`,
+///   runs `agy -p /usage </dev/null`, writes back any refreshed `~/.gemini` credentials
+///   atomically (`0600`) to the slot directory, and deletes the temporary `HOME`.
+fn fetch_quota_for_slot(
+    agy_bin: &Path,
+    real_home: &Path,
+    root: &Path,
+    id: &str,
+    use_real_home: bool,
+    timeout_secs: u64,
+) -> SlotQuotaFetch {
+    if use_real_home {
+        return match run_agy_usage_cmd(agy_bin, real_home, false, timeout_secs) {
+            Ok(stdout) => SlotQuotaFetch {
+                id: id.to_string(),
+                ok: true,
+                error: None,
+                parsed: parse_agy_usage_output(&stdout),
+                refreshed_creds: 0,
+            },
+            Err(err) => SlotQuotaFetch {
+                id: id.to_string(),
+                ok: false,
+                error: Some(err),
+                parsed: ParsedAgyUsage::default(),
+                refreshed_creds: 0,
+            },
+        };
+    }
+
+    let sdir = slot_dir(root, id);
+    if !slot_has_core_token(&sdir) {
+        return SlotQuotaFetch {
+            id: id.to_string(),
+            ok: false,
+            error: Some("slot missing core OAuth credentials".to_string()),
+            parsed: ParsedAgyUsage::default(),
+            refreshed_creds: 0,
+        };
+    }
+
+    let temp_home = match TempHome::create() {
+        Ok(t) => t,
+        Err(err) => {
+            return SlotQuotaFetch {
+                id: id.to_string(),
+                ok: false,
+                error: Some(err),
+                parsed: ParsedAgyUsage::default(),
+                refreshed_creds: 0,
+            }
+        }
+    };
+    seed_keyring_markers(real_home, &temp_home.path);
+    if let Err(err) = install_slot_to_home(&sdir, &temp_home.path) {
+        return SlotQuotaFetch {
+            id: id.to_string(),
+            ok: false,
+            error: Some(err),
+            parsed: ParsedAgyUsage::default(),
+            refreshed_creds: 0,
+        };
+    }
+
+    // Snapshot credential bytes before running `agy -p /usage` to detect token refreshes.
+    let mut before: BTreeMap<&'static str, Option<Vec<u8>>> = BTreeMap::new();
+    for cf in CRED_FILES {
+        let p = temp_home.path.join(cf.home_rel);
+        let bytes = fs::read(&p).ok();
+        before.insert(cf.slot_name, bytes);
+    }
+
+    let run_res = run_agy_usage_cmd(agy_bin, &temp_home.path, true, timeout_secs);
+
+    // Check if any credential files under temp HOME (e.g. ~/.gemini/*) were refreshed.
+    let mut refreshed: Vec<(&'static str, Vec<u8>)> = Vec::new();
+    for cf in CRED_FILES {
+        let p = temp_home.path.join(cf.home_rel);
+        if let Ok(after_bytes) = fs::read(&p) {
+            if !after_bytes.is_empty() && before.get(cf.slot_name).and_then(Option::as_ref) != Some(&after_bytes) {
+                refreshed.push((cf.slot_name, after_bytes));
+            }
+        }
+    }
+
+    let mut refreshed_creds = 0usize;
+    if !refreshed.is_empty() {
+        if let Ok(_lock) = acquire_accounts_lock(root) {
+            let _ = ensure_dir_mode(&sdir, 0o700);
+            for (slot_name, bytes) in &refreshed {
+                if write_secret_0600(&sdir.join(slot_name), bytes, true).is_ok() {
+                    refreshed_creds += 1;
+                }
+            }
+            if refreshed_creds > 0 {
+                let mut st = load_state(root);
+                if let Some(obj) = st["accounts"][id].as_object_mut() {
+                    obj.insert("lastSyncedAt".into(), json!(iso()));
+                }
+                let _ = save_state(root, &st);
+            }
+        }
+    }
+
+    drop(temp_home);
+
+    match run_res {
+        Ok(stdout) => SlotQuotaFetch {
+            id: id.to_string(),
+            ok: true,
+            error: None,
+            parsed: parse_agy_usage_output(&stdout),
+            refreshed_creds,
+        },
+        Err(err) => SlotQuotaFetch {
+            id: id.to_string(),
+            ok: false,
+            error: Some(err),
+            parsed: ParsedAgyUsage::default(),
+            refreshed_creds,
+        },
+    }
+}
+
+fn build_quota_history_point(now_ep: i64, entries: &[QuotaPoolEntry]) -> Option<Value> {
+    if entries.is_empty() {
+        return None;
+    }
+    let mut min_weekly: Option<f64> = None;
+    let mut min_five_hour: Option<f64> = None;
+    let mut pools: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
+    for e in entries {
+        match e.window.as_str() {
+            "weekly" => {
+                min_weekly = Some(min_weekly.map_or(e.remaining_pct, |p| p.min(e.remaining_pct)));
+                pools
+                    .entry(e.pool.clone())
+                    .or_default()
+                    .insert("weekly".into(), json!(e.remaining_pct));
+            }
+            "fiveHour" => {
+                min_five_hour =
+                    Some(min_five_hour.map_or(e.remaining_pct, |p| p.min(e.remaining_pct)));
+                pools
+                    .entry(e.pool.clone())
+                    .or_default()
+                    .insert("fiveHour".into(), json!(e.remaining_pct));
+            }
+            _ => {}
+        }
+    }
+    if min_weekly.is_none() && min_five_hour.is_none() {
+        return None;
+    }
+    let mut pt = Map::new();
+    pt.insert("epoch".into(), json!(now_ep));
+    if let Some(w) = min_weekly {
+        pt.insert("weekly".into(), json!(w));
+    }
+    if let Some(fh) = min_five_hour {
+        pt.insert("fiveHour".into(), json!(fh));
+    }
+    if !pools.is_empty() {
+        let pools_val: Map<String, Value> = pools
+            .into_iter()
+            .map(|(k, v)| (k, Value::Object(v)))
+            .collect();
+        pt.insert("pools".into(), Value::Object(pools_val));
+    }
+    Some(Value::Object(pt))
+}
+
+/// Refresh real quota for all configured `agy` account slots via `agy -p /usage </dev/null`
+/// and atomically persist the results + rolling history to `<state>/agy-quota.json`.
+pub fn refresh_all_quotas(agy_bin_opt: Option<&str>) -> Res<Value> {
+    let agy_bin = resolve_agy_bin(agy_bin_opt)?;
+    let root = accounts_root();
+    let real_home = home();
+    let state = load_state(&root);
+    let active_id = state["active"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let live = live_email(&real_home).unwrap_or_default();
+    let timeout_secs = quota_timeout_secs();
+
+    let mut targets: Vec<(String, bool)> = Vec::new();
+    if let Some(map) = state["accounts"].as_object() {
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort();
+        for id in keys {
+            let entry = &map[id];
+            let email = s(entry, "email");
+            let is_active = active_id.as_deref() == Some(id.as_str());
+            let drifted = !live.is_empty() && !email.is_empty() && !email.eq_ignore_ascii_case(&live);
+            let use_real_home = is_active && !drifted;
+            targets.push((id.clone(), use_real_home));
+        }
+    }
+
+    let mut results: Vec<SlotQuotaFetch> = Vec::with_capacity(targets.len());
+    thread::scope(|sc| {
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|(id, use_real)| {
+                let agy_bin = &agy_bin;
+                let real_home = &real_home;
+                let root = &root;
+                let id_str = id.as_str();
+                let ur = *use_real;
+                sc.spawn(move || fetch_quota_for_slot(agy_bin, real_home, root, id_str, ur, timeout_secs))
+            })
+            .collect();
+        for h in handles {
+            if let Ok(r) = h.join() {
+                results.push(r);
+            }
+        }
+    });
+
+    let now_iso = iso();
+    let now_ep = epoch() as i64;
+    let cutoff = now_ep - QUOTA_HISTORY_RETENTION_SECS;
+
+    let _lock = crate::locks::acquire_state(&state_dir()).ok();
+    let mut cache = load_quota_cache();
+    if !cache["accounts"].is_object() {
+        cache["accounts"] = json!({});
+    }
+    cache["schemaVersion"] = json!(QUOTA_CACHE_SCHEMA_VERSION);
+    cache["updatedAt"] = json!(now_iso);
+    cache["updatedEpoch"] = json!(now_ep);
+
+    for res in results {
+        let mut history: Vec<Value> = cache["accounts"][&res.id]["history"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|pt| pt["epoch"].as_i64().unwrap_or(0) >= cutoff)
+            .collect();
+
+        if res.ok {
+            if let Some(pt) = build_quota_history_point(now_ep, &res.parsed.entries) {
+                let dup = history.last().is_some_and(|prev| {
+                    (now_ep - prev["epoch"].as_i64().unwrap_or(0)).abs() <= 10
+                        && prev["weekly"] == pt["weekly"]
+                        && prev["fiveHour"] == pt["fiveHour"]
+                        && prev["pools"] == pt["pools"]
+                });
+                if !dup {
+                    history.push(pt);
+                }
+            }
+        }
+        if history.len() > QUOTA_HISTORY_LIMIT {
+            let drop_n = history.len() - QUOTA_HISTORY_LIMIT;
+            history.drain(0..drop_n);
+        }
+
+        let entries_json: Vec<Value> = res
+            .parsed
+            .entries
+            .iter()
+            .map(|e| {
+                json!({
+                    "pool": e.pool,
+                    "window": e.window,
+                    "windowLabel": e.window_label,
+                    "remainingPct": e.remaining_pct,
+                    "resetAt": e.reset_at,
+                })
+            })
+            .collect();
+
+        let mut acct_doc = json!({
+            "fetchedAt": now_iso,
+            "fetchedEpoch": now_ep,
+            "ok": res.ok,
+            "entries": entries_json,
+            "unknownLines": res.parsed.unknown_lines,
+            "refreshedCreds": res.refreshed_creds,
+            "history": history,
+        });
+        if let Some(err) = res.error {
+            acct_doc["error"] = json!(err);
+        }
+        cache["accounts"][&res.id] = acct_doc;
+    }
+
+    save_quota_cache(&cache)?;
+    Ok(cache)
+}
+
 /// Fast snapshot for `delegate snapshot --json`: skips the `/proc` scan when no local
 /// `agy-accounts/accounts.json` exists yet so snapshot stays well under 20 ms.
 pub fn snapshot_json_fast() -> Value {
@@ -540,10 +1198,15 @@ fn snapshot_json_opts(scan_procs: bool) -> Value {
         Vec::new()
     };
 
+    let now_ep = epoch() as i64;
+    let quota_cache = load_quota_cache();
     let empty_map = Map::new();
     let accounts_map = state["accounts"].as_object().unwrap_or(&empty_map);
     let usage_snap = if !accounts_map.is_empty() || crate::usage::ledger_path().is_file() {
-        Some(crate::usage::accounts_usage_snapshot(accounts_map))
+        Some(crate::usage::accounts_usage_snapshot(
+            accounts_map,
+            &quota_cache,
+        ))
     } else {
         None
     };
@@ -583,6 +1246,9 @@ fn snapshot_json_opts(scan_procs: bool) -> Value {
                 "fileCount": files.len(),
                 "source": s(entry, "source"),
             });
+            if let Some(q) = enrich_quota_for_snapshot(&quota_cache["accounts"][id], now_ep) {
+                item["quota"] = q;
+            }
             if let Some(view) = usage_snap.as_ref().and_then(|u| u.per_account.get(id)) {
                 item["usage"] = view.usage.clone();
                 if !view.quota_note.is_null() {
@@ -610,6 +1276,14 @@ fn snapshot_json_opts(scan_procs: bool) -> Value {
         })
         .collect();
 
+    let quota_updated_at = s(&quota_cache, "updatedAt").to_string();
+    let quota_updated_ep = quota_cache["updatedEpoch"].as_i64().unwrap_or(0);
+    let quota_age_secs = if quota_updated_ep > 0 {
+        Some((now_ep - quota_updated_ep).max(0))
+    } else {
+        None
+    };
+
     let mut out = json!({
         "root": root.to_string_lossy(),
         "active": active_id,
@@ -617,6 +1291,8 @@ fn snapshot_json_opts(scan_procs: bool) -> Value {
         "liveDrifted": live_drifted,
         "runningAgy": running_json,
         "accounts": items,
+        "quotaUpdatedAt": quota_updated_at,
+        "quotaAgeSeconds": quota_age_secs,
     });
     if let Some(snap) = usage_snap {
         out["unassignedUsage"] = snap.unassigned;
@@ -693,8 +1369,9 @@ impl TempHome {
             .map(PathBuf::from)
             .filter(|p| p.is_dir())
             .unwrap_or_else(env::temp_dir);
+        let seq = TEMP_HOME_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = base.join(format!(
-            "delegate-agy-add-{}-{:016x}",
+            "delegate-agy-home-{}-{seq}-{:016x}",
             std::process::id(),
             now_ns() as u64
         ));
@@ -750,10 +1427,53 @@ fn resolve_agy_bin(explicit: Option<&str>) -> Res<PathBuf> {
     Err("could not locate executable `agy` (checked ~/.local/libexec/agy and PATH; override with --agy-bin)".into())
 }
 
+fn format_quota_brief(quota: &Value) -> String {
+    if !quota.is_object() {
+        return String::new();
+    }
+    let age = quota["ageSeconds"]
+        .as_i64()
+        .map(format_age_compact)
+        .unwrap_or_default();
+    if !b(quota, "ok") {
+        let err = s(quota, "error");
+        let msg = if err.is_empty() { "失败" } else { err };
+        return format!(" quota[err: {msg}, {age}]");
+    }
+    let entries = quota["entries"].as_array().cloned().unwrap_or_default();
+    if entries.is_empty() {
+        let unk = quota["unknownLines"].as_array().map_or(0, Vec::len);
+        if unk > 0 {
+            return format!(" quota[raw:{unk}行, {age}]");
+        }
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    for e in &entries {
+        let pool = s(e, "pool");
+        let short_pool = pool.split_whitespace().next().unwrap_or(pool);
+        let win = match s(e, "window") {
+            "weekly" => "wk",
+            "fiveHour" => "5h",
+            _ => s(e, "windowLabel"),
+        };
+        let pct = e["remainingPct"].as_f64().unwrap_or(0.0);
+        let reset = e["resetInSeconds"]
+            .as_i64()
+            .map(|r| format!("({})", format_countdown_compact(r)))
+            .unwrap_or_default();
+        parts.push(format!("{short_pool}:{win}={pct:.0}%{reset}"));
+    }
+    format!(" quota[{} · {age}]", parts.join(", "))
+}
+
 fn cmd_list(args: &[String]) -> Res<i32> {
-    let (pos, flags, _) = parse_simple(args, &["--json"], &[])?;
+    let (pos, flags, kv) = parse_simple(args, &["--json", "--quota"], &["--agy-bin"])?;
     if !pos.is_empty() {
         return Err(format!("unrecognized arguments: {}", pos.join(" ")));
+    }
+    if has(&flags, "--quota") {
+        refresh_all_quotas(value(&kv, "--agy-bin"))?;
     }
     let snap = snapshot_json();
     if has(&flags, "--json") {
@@ -768,8 +1488,12 @@ fn cmd_list(args: &[String]) -> Res<i32> {
         println!("Next: delegate agy account add [<id>] | delegate agy account import-agy-swap --dry-run");
         return Ok(0);
     }
+    let age_hdr = snap["quotaAgeSeconds"]
+        .as_i64()
+        .map(|a| format!(", quota age: {}", format_age_compact(a)))
+        .unwrap_or_default();
     println!(
-        "agy accounts ({}, active: {}, running agy: {}):",
+        "agy accounts ({}, active: {}, running agy: {}{age_hdr}):",
         accounts.len(),
         if active.is_empty() { "none" } else { active },
         running
@@ -796,19 +1520,23 @@ fn cmd_list(args: &[String]) -> Res<i32> {
             crate::usage::format_token_compact(t5),
             crate::usage::format_token_compact(t7),
         );
-        let mut note_bits = Vec::new();
-        if let Some(w) = item["quotaNote"]["weekly"].as_f64() {
-            note_bits.push(format!("wk={w:.2}%"));
-        }
-        if let Some(fh) = item["quotaNote"]["fiveHour"].as_f64() {
-            note_bits.push(format!("5h={fh:.2}%"));
-        }
-        let note_part = if note_bits.is_empty() {
-            String::new()
+        let quota_part = if item["quota"].is_object() {
+            format_quota_brief(&item["quota"])
         } else {
-            format!(" rem({})", note_bits.join(","))
+            let mut note_bits = Vec::new();
+            if let Some(w) = item["quotaNote"]["weekly"].as_f64() {
+                note_bits.push(format!("wk={w:.2}%"));
+            }
+            if let Some(fh) = item["quotaNote"]["fiveHour"].as_f64() {
+                note_bits.push(format!("5h={fh:.2}%"));
+            }
+            if note_bits.is_empty() {
+                String::new()
+            } else {
+                format!(" rem({})", note_bits.join(","))
+            }
         };
-        println!("  {mark} {id:<16} {email:<30} last_used={last_str} files={files}{usage_part}{note_part}{label_part}");
+        println!("  {mark} {id:<16} {email:<30} last_used={last_str} files={files}{usage_part}{quota_part}{label_part}");
     }
     if b(&snap, "liveDrifted") {
         println!(
@@ -817,14 +1545,17 @@ fn cmd_list(args: &[String]) -> Res<i32> {
             if active.is_empty() { "none" } else { active }
         );
     }
-    println!("Next: delegate agy account use <id> | delegate agy account status");
+    println!("Next: delegate agy account use <id> | delegate agy account status --quota");
     Ok(0)
 }
 
 fn cmd_status(args: &[String]) -> Res<i32> {
-    let (pos, flags, _) = parse_simple(args, &["--json"], &[])?;
+    let (pos, flags, kv) = parse_simple(args, &["--json", "--quota"], &["--agy-bin"])?;
     if !pos.is_empty() {
         return Err(format!("unrecognized arguments: {}", pos.join(" ")));
+    }
+    if has(&flags, "--quota") {
+        refresh_all_quotas(value(&kv, "--agy-bin"))?;
     }
     let snap = snapshot_json();
     if has(&flags, "--json") {
@@ -856,16 +1587,67 @@ fn cmd_status(args: &[String]) -> Res<i32> {
         }
         let exp = s(cur, "tokenExpiresAt");
         if !exp.is_empty() {
-            println!("local token expiry: {exp} (quota not polled externally)");
+            println!("local token expiry: {exp}");
         }
         println!("stored files: {}", cur["fileCount"].as_u64().unwrap_or(0));
+        let t1 = n(&cur["usage"]["oneHour"], "total");
         let t5 = n(&cur["usage"]["fiveHour"], "total");
         let t7 = n(&cur["usage"]["sevenDay"], "total");
         println!(
-            "local usage: 5h={}  7d={} (local records only, no external quota API)",
+            "local usage: 1h={}  5h={}  7d={}",
+            crate::usage::format_token_compact(t1),
             crate::usage::format_token_compact(t5),
             crate::usage::format_token_compact(t7),
         );
+        if cur["quota"].is_object() {
+            let q = &cur["quota"];
+            let age = q["ageSeconds"]
+                .as_i64()
+                .map(format_age_compact)
+                .unwrap_or_else(|| "-".to_string());
+            let fetched = s(q, "fetchedAt");
+            println!("real quota (agy -p /usage, {age}, fetched {fetched}):");
+            if !b(q, "ok") {
+                println!("  error: {}", s(q, "error"));
+            }
+            if let Some(entries) = q["entries"].as_array() {
+                for e in entries {
+                    let pool = s(e, "pool");
+                    let wlabel = s(e, "windowLabel");
+                    let pct = e["remainingPct"].as_f64().unwrap_or(0.0);
+                    let reset_part = match (e["resetInSeconds"].as_i64(), s(e, "resetAt")) {
+                        (Some(rem), at) if !at.is_empty() => {
+                            format!(" · reset in {} ({at})", format_countdown_compact(rem))
+                        }
+                        (_, at) if !at.is_empty() => format!(" · reset {at}"),
+                        _ => String::new(),
+                    };
+                    println!("  - {pool} | {wlabel}: {pct:.0}%{reset_part}");
+                }
+            }
+            if let Some(unk) = q["unknownLines"].as_array() {
+                for line in unk.iter().filter_map(Value::as_str) {
+                    println!("  [raw] {line}");
+                }
+            }
+        }
+        if cur["quotaEstimate"].is_object() {
+            for (label, key) in [("weekly", "weekly"), ("five-hour", "fiveHour")] {
+                let est = &cur["quotaEstimate"][key];
+                if est.is_object() {
+                    let tpp = crate::usage::format_token_compact(n(est, "tokensPerPct"));
+                    let rem_h = est["estimatedRemainingHours"]
+                        .as_f64()
+                        .map(crate::usage::format_hours_compact)
+                        .unwrap_or_else(|| "-".to_string());
+                    let src = s(est, "source");
+                    let bsrc = s(est, "burnRateSource");
+                    println!(
+                        "  {label} estimate ({src}, pace {bsrc}): ~{tpp} tok / 1% · est remaining: {rem_h} (advisory only)"
+                    );
+                }
+            }
+        }
         if cur["quotaNote"].is_object() {
             let mut parts = Vec::new();
             if let Some(w) = cur["quotaNote"]["weekly"].as_f64() {
@@ -875,7 +1657,12 @@ fn cmd_status(args: &[String]) -> Res<i32> {
                 parts.push(format!("five-hour={fh:.2}%"));
             }
             if !parts.is_empty() {
-                println!("quota note (advisory only): {}", parts.join(", "));
+                let prio = if cur["quota"].is_object() {
+                    "fallback; real quota takes priority"
+                } else {
+                    "advisory only"
+                };
+                println!("quota note ({prio}): {}", parts.join(", "));
             }
         }
     }
@@ -891,7 +1678,7 @@ fn cmd_status(args: &[String]) -> Res<i32> {
         }
     }
     println!("store: {}", s(&snap, "root"));
-    println!("Next: delegate agy account list | delegate agy account use <id>");
+    println!("Next: delegate agy account list --quota | delegate agy account use <id>");
     Ok(0)
 }
 
@@ -1988,15 +2775,17 @@ fn print_account_help() {
     println!(
         "Usage: delegate agy account <subcommand> [options]\n\n\
          Manage local Antigravity CLI (agy) accounts manually (~/.config/delegate/agy-accounts/).\n\
-         No automatic rotation and no external quota API calls.\n\n\
+         No automatic rotation; real quota uses `agy -p /usage </dev/null` only (no internal HTTP APIs).\n\n\
          Subcommands:\n\
-         \x20 list [--json]                        List saved account slots, active marker, 5h/7d local usage\n\
-         \x20 status [--json]                      Show active account, live email, local usage, running agy\n\
+         \x20 list [--quota] [--agy-bin PATH] [--json]\n\
+         \x20                                      List saved account slots, active marker, 5h/7d usage & quota\n\
+         \x20 status [--quota] [--agy-bin PATH] [--json]\n\
+         \x20                                      Show active account, live email, quota, usage, running agy\n\
          \x20 add [<id>] [--label TEXT] [--overwrite] [--agy-bin PATH] [-- <agy-args>...]\n\
          \x20                                      Run interactive agy login in a temp HOME and save slot\n\
          \x20 use <id> [--force] [--json]          Save back refreshed tokens and switch (refuses if agy running)\n\
          \x20 note <id> [--weekly PCT] [--five-hour PCT] [--clear] [--json]\n\
-         \x20                                      Record manual remaining-% snapshot for local burn-rate hint only\n\
+         \x20                                      Record manual remaining-% snapshot (fallback when real quota absent)\n\
          \x20 remove <id> [--force] [--json]       Delete a saved account slot (alias: rm)\n\
          \x20 import-agy-swap [--dry-run] [--source DIR] [--overwrite] [--json]\n\
          \x20                                      Import accounts from ~/.gemini/agy-swap without printing tokens\n\
@@ -2105,5 +2894,78 @@ mod tests {
             None
         ));
         assert!(!is_agy_argv(&["grep".into(), "agy".into()], None));
+    }
+
+    #[test]
+    fn parse_agy_usage_handles_standard_ansi_missing_and_unknown_lines() {
+        let raw = "\
+\x1b[1mAccount Usage\x1b[0m
+Gemini Models\tWeekly Limit Remaining\t97%\t2026-11-30T20:09:03Z
+Claude and GPT models\tFive Hour Limit Remaining\t92%\t2026-11-24T07:32:40Z
+Gemini Models\tFive Hour Limit Remaining\t88.5%
+Experimental Pool\tDaily Limit Remaining\t60%\t2026-11-25T00:00:00Z
+Some unexpected warning line without tabs
+BadRow\tWeekly Limit Remaining\tnot-a-pct\t2026-11-30T00:00:00Z
+";
+        let parsed = parse_agy_usage_output(raw);
+        assert_eq!(parsed.entries.len(), 4);
+        assert_eq!(parsed.entries[0].pool, "Gemini Models");
+        assert_eq!(parsed.entries[0].window, "weekly");
+        assert_eq!(parsed.entries[0].remaining_pct, 97.0);
+        assert_eq!(parsed.entries[0].reset_at, "2026-11-30T20:09:03Z");
+
+        assert_eq!(parsed.entries[1].pool, "Claude and GPT models");
+        assert_eq!(parsed.entries[1].window, "fiveHour");
+        assert_eq!(parsed.entries[1].remaining_pct, 92.0);
+        assert_eq!(parsed.entries[1].reset_at, "2026-11-24T07:32:40Z");
+
+        // Missing 4th column (reset timestamp) is tolerated without error.
+        assert_eq!(parsed.entries[2].pool, "Gemini Models");
+        assert_eq!(parsed.entries[2].window, "fiveHour");
+        assert_eq!(parsed.entries[2].remaining_pct, 88.5);
+        assert_eq!(parsed.entries[2].reset_at, "");
+
+        // Unknown window label still parsed with window = "other".
+        assert_eq!(parsed.entries[3].pool, "Experimental Pool");
+        assert_eq!(parsed.entries[3].window, "other");
+        assert_eq!(parsed.entries[3].remaining_pct, 60.0);
+
+        // Unknown / unparseable lines are preserved verbatim without error.
+        assert_eq!(parsed.unknown_lines.len(), 3);
+        assert_eq!(parsed.unknown_lines[0], "Account Usage");
+        assert_eq!(parsed.unknown_lines[1], "Some unexpected warning line without tabs");
+        assert!(parsed.unknown_lines[2].contains("not-a-pct"));
+
+        // Empty / missing-all-rows input produces empty vectors without error.
+        let empty = parse_agy_usage_output("\n   \n");
+        assert!(empty.entries.is_empty());
+        assert!(empty.unknown_lines.is_empty());
+    }
+
+    #[test]
+    fn enrich_quota_computes_age_and_reset_countdown() {
+        let now = iso_epoch("2026-11-24T10:00:00Z").unwrap();
+        let fetched = now - 185; // 3m 5s ago
+        let raw = json!({
+            "fetchedAt": "2026-11-24T09:56:55Z",
+            "fetchedEpoch": fetched,
+            "ok": true,
+            "entries": [
+                {
+                    "pool": "Gemini Models",
+                    "window": "fiveHour",
+                    "windowLabel": "Five Hour Limit Remaining",
+                    "remainingPct": 91.0,
+                    "resetAt": "2026-11-24T13:30:00Z"
+                }
+            ],
+            "unknownLines": ["Note: beta quota"]
+        });
+        let enriched = enrich_quota_for_snapshot(&raw, now).unwrap();
+        assert_eq!(enriched["ageSeconds"], 185);
+        assert_eq!(enriched["entries"][0]["resetInSeconds"], 3 * 3600 + 30 * 60);
+        assert_eq!(enriched["unknownLines"][0], "Note: beta quota");
+        assert_eq!(format_age_compact(185), "3m前");
+        assert_eq!(format_countdown_compact(3 * 3600 + 30 * 60), "3h30m");
     }
 }

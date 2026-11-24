@@ -255,8 +255,18 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<Option<String>> {
     let source = PathBuf::from(s(tree, "source"));
     let cfg = &tree["config"];
     fs::create_dir_all(path.parent().unwrap_or(Path::new("/"))).map_err(|e| e.to_string())?;
-    let head =
-        git_text(&source, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]).unwrap_or_default();
+    let reconstructed = !s(tree, "reconstructedTree").is_empty();
+    let head = if reconstructed {
+        let rb = s(tree, "reconstructedBase");
+        if !rb.is_empty() {
+            git_text(&source, &["rev-parse", "-q", "--verify", &format!("{rb}^{{commit}}")])
+                .unwrap_or_default()
+        } else {
+            String::new()
+        }
+    } else {
+        git_text(&source, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]).unwrap_or_default()
+    };
     let mut c = git_command();
     c.arg("-C")
         .arg(&source)
@@ -325,6 +335,31 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<Option<String>> {
     }
     if s(meta, "mode") == "read-only" && !head.is_empty() {
         let _ = git(&path, &["reset", "-q", "--soft", &head]);
+    }
+    if reconstructed {
+        let arch_str = s(tree, "reconstructedArchive");
+        if !arch_str.is_empty() {
+            let arch_dir = Path::new(arch_str);
+            let manifest = json(arch_dir.join("manifest.json"));
+            for rel in strings(&manifest["files"]) {
+                let rel_path = Path::new(&rel);
+                if rel_path.is_absolute()
+                    || !rel_path
+                        .components()
+                        .all(|c| matches!(c, std::path::Component::Normal(_)))
+                {
+                    continue;
+                }
+                let src = arch_dir.join("files").join(rel_path);
+                let dst = path.join(rel_path);
+                if src.is_file() && !dst.exists() && !dst.is_symlink() {
+                    if let Some(parent) = dst.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let _ = fs::copy(&src, &dst);
+                }
+            }
+        }
     }
     let copies = strings(&cfg["copy"]);
     let links = strings(&cfg["link"]);

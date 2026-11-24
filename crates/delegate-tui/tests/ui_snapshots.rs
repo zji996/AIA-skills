@@ -794,3 +794,334 @@ fn snapshot_accounts_tab_shows_5h_7d_usage_and_manual_quota_estimates() {
     assert!(screen.contains("每 1% ≈ 1.0M tok"), "{screen}");
     assert!(screen.contains("不自动换号"), "{screen}");
 }
+
+fn make_rich_quota_and_charts_app() -> App {
+    use delegate_tui::data::parse_snapshot_json;
+
+    let raw = r#"{
+        "schemaVersion": 1,
+        "generatedAt": "2026-11-24T10:50:00Z",
+        "seq": 88,
+        "repos": [
+            {
+                "path": "/home/dev/demo-api",
+                "runsDir": "/home/dev/demo-api/.local/run/delegate",
+                "runs": [
+                    {
+                        "run": "20261124-102000-auth-fix",
+                        "name": "鉴权修复",
+                        "state": "delivered",
+                        "mode": "write",
+                        "modelName": "neon",
+                        "elapsedSeconds": 420,
+                        "ageSeconds": 600
+                    },
+                    {
+                        "run": "20261124-104000-worker",
+                        "name": "并发队列优化",
+                        "state": "running",
+                        "mode": "write",
+                        "modelName": "neon",
+                        "elapsedSeconds": 240,
+                        "ageSeconds": 240
+                    }
+                ],
+                "cleanedNotes": []
+            }
+        ],
+        "events": [],
+        "lane": {
+            "maxHeavy": 6,
+            "heavyJobs": 94,
+            "threads": 96,
+            "budget": 94,
+            "pool": {"target": 88, "total": 88, "free": 56, "borrowed": 32, "leases": [{"rank": 1, "used": 32, "share": 88}]},
+            "local": [{"label": "demo-api: cargo test", "since": "2026-11-24T10:45:00Z", "running": true, "rank": 1, "used": 32, "share": 88}],
+            "remote": []
+        },
+        "dagQueue": [],
+        "merges": [],
+        "candidates": [],
+        "agyAccounts": {
+            "root": "/home/dev/.config/delegate/agy-accounts",
+            "active": "alpha",
+            "liveEmail": "alpha@example.test",
+            "liveDrifted": false,
+            "quotaUpdatedAt": "2026-11-24T10:47:00Z",
+            "quotaAgeSeconds": 180,
+            "runningAgy": [
+                {"pid": 9102, "run": "20261124-104000-worker", "cmdline": "agy --model gemini-4-neon"}
+            ],
+            "accounts": [
+                {
+                    "id": "alpha",
+                    "email": "alpha@example.test",
+                    "label": "主力",
+                    "active": true,
+                    "addedAt": "2026-11-18T01:00:00Z",
+                    "lastUsedAt": "2026-11-24T10:40:00Z",
+                    "lastSyncedAt": "2026-11-24T10:47:00Z",
+                    "tokenExpiresAt": "2026-11-24T11:40:00Z",
+                    "files": ["oauth_creds.json", "google_accounts.json", "jetski-standalone-oauth-token"],
+                    "fileCount": 3,
+                    "source": "login",
+                    "quota": {
+                        "fetchedAt": "2026-11-24T10:47:00Z",
+                        "fetchedEpoch": 1795488420,
+                        "ageSeconds": 180,
+                        "ok": true,
+                        "entries": [
+                            {
+                                "pool": "Gemini Models",
+                                "window": "fiveHour",
+                                "windowLabel": "Five Hour Limit Remaining",
+                                "remainingPct": 82.0,
+                                "resetAt": "2026-11-24T14:50:00Z",
+                                "resetInSeconds": 14400
+                            },
+                            {
+                                "pool": "Gemini Models",
+                                "window": "weekly",
+                                "windowLabel": "Weekly Limit Remaining",
+                                "remainingPct": 91.0,
+                                "resetAt": "2026-11-30T20:09:03Z",
+                                "resetInSeconds": 551943
+                            },
+                            {
+                                "pool": "Claude and GPT models",
+                                "window": "fiveHour",
+                                "windowLabel": "Five Hour Limit Remaining",
+                                "remainingPct": 44.0,
+                                "resetAt": "2026-11-24T13:20:00Z",
+                                "resetInSeconds": 9000
+                            },
+                            {
+                                "pool": "Claude and GPT models",
+                                "window": "weekly",
+                                "windowLabel": "Weekly Limit Remaining",
+                                "remainingPct": 76.0,
+                                "resetAt": "2026-11-30T20:09:03Z",
+                                "resetInSeconds": 551943
+                            }
+                        ],
+                        "unknownLines": ["Preview Tier: experimental pool active"]
+                    },
+                    "usage": {
+                        "oneHour": {"input": 300000, "output": 80000, "cacheRead": 2120000, "total": 2500000, "author": {"total": 2000000}, "reviewer": {"total": 500000}, "rounds": 3, "runs": 2},
+                        "fiveHour": {"input": 1200000, "output": 300000, "cacheRead": 10500000, "total": 12000000, "author": {"total": 9600000}, "reviewer": {"total": 2400000}, "rounds": 9, "runs": 5},
+                        "sevenDay": {"input": 4800000, "output": 1200000, "cacheRead": 48000000, "total": 54000000, "author": {"total": 42000000}, "reviewer": {"total": 12000000}, "rounds": 36, "runs": 18},
+                        "hourly24h": [0, 0, 400000, 900000, 1200000, 800000, 300000, 0, 200000, 600000, 1500000, 2200000, 3100000, 2800000, 1900000, 1400000, 2600000, 3800000, 2900000, 1800000, 2100000, 2400000, 3200000, 2500000]
+                    },
+                    "quotaNote": {
+                        "weekly": 95.0,
+                        "weeklyAt": "2026-11-23T08:00:00Z",
+                        "fiveHour": 90.0,
+                        "fiveHourAt": "2026-11-23T08:00:00Z"
+                    },
+                    "quotaEstimate": {
+                        "fiveHour": {
+                            "remainingPct": 44.0,
+                            "tokensPerPct": 666667,
+                            "estimatedRemainingTokens": 29333348,
+                            "estimatedRemainingHours": 11.73,
+                            "burnRatePerHour": 2500000,
+                            "method": "delta",
+                            "source": "real",
+                            "burnRateSource": "1h",
+                            "pool": "Claude and GPT models"
+                        },
+                        "weekly": {
+                            "remainingPct": 91.0,
+                            "tokensPerPct": 6000000,
+                            "estimatedRemainingTokens": 546000000,
+                            "estimatedRemainingHours": 218.4,
+                            "burnRatePerHour": 2500000,
+                            "method": "window",
+                            "source": "real",
+                            "burnRateSource": "1h",
+                            "pool": "Gemini Models"
+                        }
+                    }
+                },
+                {
+                    "id": "beta",
+                    "email": "beta@example.test",
+                    "label": "备用",
+                    "active": false,
+                    "addedAt": "2026-11-19T02:00:00Z",
+                    "lastUsedAt": "2026-11-23T19:20:00Z",
+                    "lastSyncedAt": "2026-11-24T10:47:00Z",
+                    "tokenExpiresAt": "2026-11-24T12:00:00Z",
+                    "files": ["oauth_creds.json", "google_accounts.json"],
+                    "fileCount": 2,
+                    "source": "import-agy-swap",
+                    "quota": {
+                        "fetchedAt": "2026-11-24T10:47:00Z",
+                        "fetchedEpoch": 1795488420,
+                        "ageSeconds": 180,
+                        "ok": true,
+                        "entries": [
+                            {
+                                "pool": "Gemini Models",
+                                "window": "fiveHour",
+                                "windowLabel": "Five Hour Limit Remaining",
+                                "remainingPct": 100.0,
+                                "resetAt": "2026-11-24T15:47:00Z",
+                                "resetInSeconds": 18000
+                            },
+                            {
+                                "pool": "Gemini Models",
+                                "window": "weekly",
+                                "windowLabel": "Weekly Limit Remaining",
+                                "remainingPct": 98.0,
+                                "resetAt": "2026-12-01T00:00:00Z",
+                                "resetInSeconds": 565800
+                            }
+                        ],
+                        "unknownLines": []
+                    },
+                    "usage": {
+                        "oneHour": {"input": 0, "output": 0, "cacheRead": 0, "total": 0, "author": {"total": 0}, "reviewer": {"total": 0}},
+                        "fiveHour": {"input": 100000, "output": 20000, "cacheRead": 680000, "total": 800000, "author": {"total": 800000}, "reviewer": {"total": 0}},
+                        "sevenDay": {"input": 600000, "output": 150000, "cacheRead": 5450000, "total": 6200000, "author": {"total": 5000000}, "reviewer": {"total": 1200000}},
+                        "hourly24h": [0, 0, 0, 0, 500000, 900000, 600000, 0, 0, 0, 0, 0, 0, 400000, 1200000, 0, 0, 0, 0, 0, 500000, 300000, 0, 0]
+                    }
+                }
+            ]
+        },
+        "analytics": {
+            "hourly24h": {
+                "total": [0, 0, 400000, 900000, 1700000, 1700000, 900000, 0, 200000, 600000, 1500000, 2200000, 3100000, 3200000, 3100000, 1400000, 2600000, 3800000, 2900000, 1800000, 2600000, 2700000, 3200000, 2500000],
+                "byAccount": {
+                    "alpha": [0, 0, 400000, 900000, 1200000, 800000, 300000, 0, 200000, 600000, 1500000, 2200000, 3100000, 2800000, 1900000, 1400000, 2600000, 3800000, 2900000, 1800000, 2100000, 2400000, 3200000, 2500000],
+                    "beta": [0, 0, 0, 0, 500000, 900000, 600000, 0, 0, 0, 0, 0, 0, 400000, 1200000, 0, 0, 0, 0, 0, 500000, 300000, 0, 0]
+                }
+            },
+            "byPurpose": {
+                "write": 36500000,
+                "review": 13200000,
+                "rework": 7800000,
+                "readOnly": 2700000
+            },
+            "byModel": [
+                {"model": "gemini-4-neon", "tokens": 41200000},
+                {"model": "claude-sonnet-4", "tokens": 14600000},
+                {"model": "sol", "tokens": 4400000}
+            ],
+            "daily7d": [
+                {"ymd": "2026-11-18", "date": "11-18", "mergedCount": 3, "medianMergeSecs": 1320, "avgMergeSecs": 1400, "totalChains": 4, "firstRoundPass": 3, "firstRoundPassPct": 75},
+                {"ymd": "2026-11-19", "date": "11-19", "mergedCount": 4, "medianMergeSecs": 1140, "avgMergeSecs": 1200, "totalChains": 5, "firstRoundPass": 4, "firstRoundPassPct": 80},
+                {"ymd": "2026-11-20", "date": "11-20", "mergedCount": 3, "medianMergeSecs": 900, "avgMergeSecs": 960, "totalChains": 3, "firstRoundPass": 3, "firstRoundPassPct": 100},
+                {"ymd": "2026-11-21", "date": "11-21", "mergedCount": 2, "medianMergeSecs": 1500, "avgMergeSecs": 1560, "totalChains": 3, "firstRoundPass": 2, "firstRoundPassPct": 67},
+                {"ymd": "2026-11-22", "date": "11-22", "mergedCount": 4, "medianMergeSecs": 960, "avgMergeSecs": 1020, "totalChains": 4, "firstRoundPass": 3, "firstRoundPassPct": 75},
+                {"ymd": "2026-11-23", "date": "11-23", "mergedCount": 5, "medianMergeSecs": 1080, "avgMergeSecs": 1120, "totalChains": 5, "firstRoundPass": 4, "firstRoundPassPct": 80},
+                {"ymd": "2026-11-24", "date": "11-24", "mergedCount": 3, "medianMergeSecs": 840, "avgMergeSecs": 900, "totalChains": 3, "firstRoundPass": 3, "firstRoundPassPct": 100}
+            ]
+        }
+    }"#;
+    let mut snap = parse_snapshot_json(raw, Some(Path::new("/home/dev")), None).unwrap();
+    snap.host_load = Some(HostLoad {
+        load1_tenths: 14,
+        load5_tenths: 12,
+        load15_tenths: 10,
+        mem_used_tenths_gib: Some(210),
+        mem_total_tenths_gib: Some(640),
+    });
+    snap.refreshed_at = "10:50:00".to_string();
+    App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/dev/demo-api"), 5)
+}
+
+fn assert_lines_fit_width(screen: &str, max_width: usize) {
+    for (idx, line) in screen.lines().enumerate() {
+        let w = display_width(line);
+        assert!(
+            w <= max_width,
+            "line {} exceeded width {} (got {}): {:?}\n--- FULL SCREEN ---\n{}",
+            idx + 1,
+            max_width,
+            w,
+            line,
+            screen
+        );
+    }
+}
+
+#[test]
+fn snapshot_overview_and_accounts_real_quota_charts_120x40_and_80x24() {
+    use delegate_tui::app::ViewTab;
+
+    let mut app = make_rich_quota_and_charts_app();
+
+    // 1. Overview 120x40 (wide charts: Gauge + Sparkline + BarChart + 7d trends)
+    app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Overview);
+    let ov_wide = render_to_string(&mut app, 120, 40);
+    assert_lines_fit_width(&ov_wide, 120);
+    assert!(ov_wide.contains("0总览"), "{ov_wide}");
+    assert!(ov_wide.contains("账号真实额度"), "{ov_wide}");
+    assert!(ov_wide.contains("3m前"), "{ov_wide}");
+    assert!(ov_wide.contains("Gemini"), "{ov_wide}");
+    assert!(ov_wide.contains("Claude/GPT"), "{ov_wide}");
+    assert!(ov_wide.contains("82%"), "{ov_wide}");
+    assert!(ov_wide.contains("4h后重置"), "{ov_wide}");
+    assert!(ov_wide.contains("Preview Tier: experimental pool active"), "{ov_wide}");
+    assert!(ov_wide.contains("每1%≈"), "{ov_wide}");
+    assert!(ov_wide.contains("近 24h 每小时 Token"), "{ov_wide}");
+    assert!(ov_wide.contains("Token 分布"), "{ov_wide}");
+    assert!(ov_wide.contains("写"), "{ov_wide}");
+    assert!(ov_wide.contains("审查"), "{ov_wide}");
+    assert!(ov_wide.contains("返工"), "{ov_wide}");
+    assert!(ov_wide.contains("只读"), "{ov_wide}");
+    assert!(ov_wide.contains("派发→合入中位耗时"), "{ov_wide}");
+    assert!(ov_wide.contains("一轮通过率"), "{ov_wide}");
+    assert!(ov_wide.contains("11-18") && ov_wide.contains("11-24"), "{ov_wide}");
+
+    // Toggle BarChart to Model mode with 'v'
+    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    let ov_wide_model = render_to_string(&mut app, 120, 40);
+    assert_lines_fit_width(&ov_wide_model, 120);
+    assert!(ov_wide_model.contains("按模型"), "{ov_wide_model}");
+    assert!(ov_wide_model.contains("gemini-4"), "{ov_wide_model}");
+    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+
+    // 2. Overview 80x24 (narrow text degradation, zero misalignment)
+    let ov_narrow = render_to_string(&mut app, 80, 24);
+    assert_lines_fit_width(&ov_narrow, 80);
+    assert!(ov_narrow.contains("总览（紧凑文字"), "{ov_narrow}");
+    assert!(ov_narrow.contains("alpha"), "{ov_narrow}");
+    assert!(ov_narrow.contains("Gemini"), "{ov_narrow}");
+    assert!(ov_narrow.contains("82%"), "{ov_narrow}");
+    assert!(ov_narrow.contains("近 24h Token"), "{ov_narrow}");
+    assert!(ov_narrow.contains("Token 分布"), "{ov_narrow}");
+    assert!(ov_narrow.contains("近 7 天交付走势"), "{ov_narrow}");
+
+    // 3. Accounts 120x40 (wide: list + real quota Gauges + 24h Sparkline + estimates)
+    app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Accounts);
+    let acct_wide = render_to_string(&mut app, 120, 40);
+    assert_lines_fit_width(&acct_wide, 120);
+    assert!(acct_wide.contains("6账号(2)"), "{acct_wide}");
+    assert!(acct_wide.contains("真实额度（agy /usage · 3m前）"), "{acct_wide}");
+    assert!(acct_wide.contains("Gemini"), "{acct_wide}");
+    assert!(acct_wide.contains("Claude/GPT"), "{acct_wide}");
+    assert!(acct_wide.contains("Preview Tier: experimental pool active"), "{acct_wide}");
+    assert!(acct_wide.contains("近1h速"), "{acct_wide}");
+    assert!(acct_wide.contains("手动备注(真实额度优先)"), "{acct_wide}");
+    assert!(acct_wide.contains("近 24h Token"), "{acct_wide}");
+    assert!(acct_wide.contains("在跑 agy 进程: 1 个"), "{acct_wide}");
+
+    // 4. Accounts 80x24 (narrow text degradation, zero misalignment)
+    let acct_narrow = render_to_string(&mut app, 80, 24);
+    assert_lines_fit_width(&acct_narrow, 80);
+    assert!(acct_narrow.contains("agy 账号 (2)"), "{acct_narrow}");
+    assert!(acct_narrow.contains("真实额度"), "{acct_narrow}");
+    assert!(acct_narrow.contains("Gemini"), "{acct_narrow}");
+    assert!(acct_narrow.contains("82%"), "{acct_narrow}");
+
+    if std::env::var("PRINT_TUI_SNAPSHOTS").as_deref() == Ok("1") {
+        println!("\n=== OVERVIEW 120x40 ===\n{ov_wide}");
+        println!("\n=== OVERVIEW 80x24 ===\n{ov_narrow}");
+        println!("\n=== ACCOUNTS 120x40 ===\n{acct_wide}");
+        println!("\n=== ACCOUNTS 80x24 ===\n{acct_narrow}");
+    }
+}

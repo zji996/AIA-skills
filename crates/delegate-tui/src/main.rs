@@ -4,9 +4,9 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use delegate_tui::app::{copy_to_clipboard, App, AppAction, Overlay};
+use delegate_tui::app::{copy_to_clipboard, App, AppAction, Overlay, ViewTab};
 use delegate_tui::data::{discover_repos, home_dir, local_hms, state_dir, DelegateClient};
-use delegate_tui::model::AppSnapshot;
+use delegate_tui::model::{AgyAccountsState, AppSnapshot};
 use delegate_tui::ui;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -43,8 +43,8 @@ fn print_help() {
          \x20 --version           Print version\n\
          \x20 -h, --help          Show this help\n\n\
          Keys:\n\
-         \x20 ↑↓/jk select/scroll  1-6/w/A tabs  Tab switch pane  Enter full result / confirm switch\n\
-         \x20 d diff --stat  / filter  r refresh  a/c/s/p write command  y copy  ? help  q quit",
+         \x20 ↑↓/jk select/scroll  0-6/O/w/A tabs  Tab switch pane  Enter full result / confirm switch\n\
+         \x20 d diff --stat  / filter  r refresh  Q refresh quota  v toggle chart  a/c/s/p write cmd  y copy  ? help  q quit",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -248,6 +248,36 @@ fn spawn_state_watcher(stop: Arc<AtomicBool>) -> (mpsc::Receiver<()>, bool) {
         }
     });
     (rx, true)
+}
+
+enum QuotaCmd {
+    Refresh,
+    Shutdown,
+}
+
+fn spawn_quota_worker(
+    client: DelegateClient,
+) -> (
+    mpsc::Sender<QuotaCmd>,
+    mpsc::Receiver<Result<AgyAccountsState, String>>,
+    thread::JoinHandle<()>,
+) {
+    let (tx_cmd, rx_cmd) = mpsc::channel::<QuotaCmd>();
+    let (tx_res, rx_res) = mpsc::channel::<Result<AgyAccountsState, String>>();
+    let handle = thread::spawn(move || {
+        while let Ok(cmd) = rx_cmd.recv() {
+            match cmd {
+                QuotaCmd::Refresh => {
+                    let res = client.refresh_agy_quota();
+                    if tx_res.send(res).is_err() {
+                        break;
+                    }
+                }
+                QuotaCmd::Shutdown => break,
+            }
+        }
+    });
+    (tx_cmd, rx_res, handle)
 }
 
 fn spawn_worker(
@@ -512,6 +542,7 @@ fn main() {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let home = home_dir();
     let client = DelegateClient::discover(cli.delegate.clone());
+    let quota_client = client.clone();
     let delegate_bin = client.bin.clone();
 
     let (tx_worker, rx_worker, worker_handle) = spawn_worker(
@@ -521,6 +552,7 @@ fn main() {
         home,
         cwd.clone(),
     );
+    let (tx_quota, rx_quota, quota_handle) = spawn_quota_worker(quota_client);
 
     let initial = AppSnapshot {
         refreshed_at: local_hms(),
@@ -551,14 +583,53 @@ fn main() {
 
     let refresh_every = Duration::from_secs(cli.interval);
     let idle_heartbeat = Duration::from_secs(cli.interval.max(60));
+    let quota_refresh_every = Duration::from_secs(600);
     let stop_watcher = Arc::new(AtomicBool::new(false));
     let (rx_notify, inotify_active) = spawn_state_watcher(stop_watcher.clone());
     let mut last_refresh = Instant::now();
+    let mut last_quota_refresh: Option<Instant> = None;
+    let mut quota_in_flight = false;
     let mut print_on_exit: Option<String> = None;
     let mut inflight_results: HashSet<String> = HashSet::new();
     let mut inflight_diffs: HashSet<String> = HashSet::new();
 
     loop {
+        // Trigger real quota refresh (`agy -p /usage`) when on Overview or Accounts tab:
+        // once on first entry, then every 10 minutes while TUI is open (never when TUI is closed).
+        let on_quota_tab = matches!(app.tab, ViewTab::Overview | ViewTab::Accounts);
+        if on_quota_tab && !quota_in_flight {
+            let due = match last_quota_refresh {
+                None => true,
+                Some(t) => t.elapsed() >= quota_refresh_every,
+            };
+            if due {
+                quota_in_flight = true;
+                app.quota_refreshing = true;
+                app.dirty = true;
+                last_quota_refresh = Some(Instant::now());
+                let _ = tx_quota.send(QuotaCmd::Refresh);
+            }
+        }
+
+        // Drain completed quota refresh results without blocking UI.
+        while let Ok(qres) = rx_quota.try_recv() {
+            quota_in_flight = false;
+            app.quota_refreshing = false;
+            last_quota_refresh = Some(Instant::now());
+            match qres {
+                Ok(agy_state) => {
+                    app.snapshot.agy_accounts = agy_state;
+                    app.last_fingerprint = app.snapshot.data_fingerprint();
+                    app.rebuild_rows(None);
+                    app.dirty = true;
+                }
+                Err(err) => {
+                    app.set_toast(format!("额度刷新失败：{err}"));
+                    app.dirty = true;
+                }
+            }
+        }
+
         // React immediately to state directory `inotify` events (`events.seq`, `index.json`, `work.jsonl`).
         let mut notified = false;
         while rx_notify.try_recv().is_ok() {
@@ -723,6 +794,17 @@ fn main() {
                                 app.set_toast(format!("正在切换到 agy 账号 {id}…"));
                                 let _ = tx_worker.send(WorkerCmd::SwitchAgyAccount { id });
                             }
+                            AppAction::RefreshQuota => {
+                                if !quota_in_flight {
+                                    quota_in_flight = true;
+                                    app.quota_refreshing = true;
+                                    last_quota_refresh = Some(Instant::now());
+                                    let _ = tx_quota.send(QuotaCmd::Refresh);
+                                    app.set_toast("正在通过 agy -p /usage 刷新真实额度…");
+                                } else {
+                                    app.set_toast("额度已在刷新中…");
+                                }
+                            }
                             AppAction::Quit => break,
                             AppAction::QuitAndPrint(cmd) => {
                                 print_on_exit = Some(cmd);
@@ -755,9 +837,11 @@ fn main() {
 
     stop_watcher.store(true, Ordering::Relaxed);
     let _ = tx_worker.send(WorkerCmd::Shutdown);
+    let _ = tx_quota.send(QuotaCmd::Shutdown);
     drop(_guard);
     // Avoid blocking exit if a slow subprocess is mid-flight; detach cleanly if needed.
     drop(worker_handle);
+    drop(quota_handle);
     if let Some(cmd) = print_on_exit {
         println!("{cmd}");
     }

@@ -15,12 +15,19 @@ pub enum FocusPane {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewTab {
+    Overview,
     Runs,
     Events,
     Merges,
     Candidates,
     Work,
     Accounts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverviewBarMode {
+    Purpose,
+    Model,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +188,7 @@ pub enum AppAction {
     CopyClipboard(String),
     OpenPager(String),
     SwitchAgyAccount(String),
+    RefreshQuota,
     Quit,
     QuitAndPrint(String),
 }
@@ -209,6 +217,9 @@ pub struct App {
     pub accounts_scroll: usize,
     pub switching_account: Option<String>,
     pub account_switch_error: Option<String>,
+    pub overview_scroll: usize,
+    pub overview_bar_mode: OverviewBarMode,
+    pub quota_refreshing: bool,
     pub work_rows: Vec<WorkRow>,
     pub selected_work_row: Option<usize>,
     pub work_scroll_line: usize,
@@ -261,6 +272,9 @@ impl App {
             accounts_scroll: 0,
             switching_account: None,
             account_switch_error: None,
+            overview_scroll: 0,
+            overview_bar_mode: OverviewBarMode::Purpose,
+            quota_refreshing: false,
             work_rows: Vec::new(),
             selected_work_row: None,
             work_scroll_line: 0,
@@ -1638,6 +1652,27 @@ impl App {
 
     fn handle_main_key(&mut self, key: KeyEvent) -> AppAction {
         match key.code {
+            KeyCode::Char('0') => {
+                if self.tab != ViewTab::Overview {
+                    self.tab = ViewTab::Overview;
+                    self.overview_scroll = 0;
+                    self.detail_scroll = 0;
+                    self.dirty = true;
+                    return AppAction::Redraw;
+                }
+                return AppAction::None;
+            }
+            KeyCode::Char('O') => {
+                self.tab = if self.tab == ViewTab::Overview {
+                    ViewTab::Runs
+                } else {
+                    ViewTab::Overview
+                };
+                self.overview_scroll = 0;
+                self.detail_scroll = 0;
+                self.dirty = true;
+                return AppAction::Redraw;
+            }
             KeyCode::Char('1') => {
                 if self.tab != ViewTab::Runs {
                     self.tab = ViewTab::Runs;
@@ -1766,6 +1801,58 @@ impl App {
             _ => {}
         }
 
+        if self.tab == ViewTab::Overview {
+            return match key.code {
+                KeyCode::Char('q') => AppAction::Quit,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.overview_scroll = self.overview_scroll.saturating_add(1);
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.overview_scroll = self.overview_scroll.saturating_sub(1);
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    self.overview_scroll = self.overview_scroll.saturating_add(8);
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                KeyCode::PageUp => {
+                    self.overview_scroll = self.overview_scroll.saturating_sub(8);
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    self.overview_scroll = 0;
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.overview_scroll = usize::MAX / 2;
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                KeyCode::Char('v') => {
+                    self.overview_bar_mode = match self.overview_bar_mode {
+                        OverviewBarMode::Purpose => OverviewBarMode::Model,
+                        OverviewBarMode::Model => OverviewBarMode::Purpose,
+                    };
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                KeyCode::Char('Q') => AppAction::RefreshQuota,
+                KeyCode::Char('r') => AppAction::Refresh,
+                KeyCode::Char('?') => {
+                    self.overlay = Overlay::Help;
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                _ => AppAction::None,
+            };
+        }
+
         if self.tab == ViewTab::Accounts {
             return match key.code {
                 KeyCode::Char('q') => AppAction::Quit,
@@ -1887,6 +1974,7 @@ impl App {
                         AppAction::None
                     }
                 }
+                KeyCode::Char('Q') => AppAction::RefreshQuota,
                 KeyCode::Char('r') => AppAction::Refresh,
                 KeyCode::Char('/') => {
                     self.filter_mode = true;
@@ -2038,6 +2126,7 @@ impl App {
                         AppAction::None
                     }
                 }
+                KeyCode::Char('Q') => AppAction::RefreshQuota,
                 KeyCode::Char('r') => AppAction::Refresh,
                 KeyCode::Char('/') => {
                     self.filter_mode = true;
@@ -2259,6 +2348,7 @@ impl App {
                         AppAction::None
                     }
                 }
+                KeyCode::Char('Q') => AppAction::RefreshQuota,
                 KeyCode::Char('r') => AppAction::Refresh,
                 KeyCode::Char('/') => {
                     self.filter_mode = true;
@@ -2391,6 +2481,7 @@ impl App {
                         AppAction::Redraw
                     }
                 },
+                KeyCode::Char('Q') => AppAction::RefreshQuota,
                 KeyCode::Char('r') => AppAction::Refresh,
                 KeyCode::Char('/') => {
                     self.filter_mode = true;

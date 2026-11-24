@@ -1,6 +1,6 @@
 # agy 多账号管理与从 agy-swap 迁移
 
-`delegate` 内置本地 Antigravity CLI（`agy`）多账号管理，替代闭源且带自更新的 `agy-swap`：纯手工切换、全程文件锁、不做自动轮换、不调外部 Google 额度接口、永不打印令牌。
+`delegate` 内置本地 Antigravity CLI（`agy`）多账号管理，替代闭源且带自更新的 `agy-swap`：纯手工切换、全程文件锁、不做自动轮换、不调任何 Google 内部 HTTP 接口（真实额度仅经官方 `agy -p /usage </dev/null` 获取）、永不打印令牌。
 
 ## 目录布局与权限
 
@@ -20,8 +20,8 @@
 
 | 命令 | 作用 |
 |---|---|
-| `delegate agy account list [--json]` | 列出所有槽位、活跃标记（`*`）、邮箱、最后使用时间、文件数与近 5h/7d 本地用量 |
-| `delegate agy account status [--json]` | 显示当前活跃槽位、实盘 `~/.gemini` 邮箱（及是否漂移）、近 5h/7d 本地用量、手动余量快照、在跑 `agy` 进程列表、本地令牌到期时间（不调外部额度接口） |
+| `delegate agy account list [--quota] [--json]` | 列出槽位、活跃标记（`*`）、邮箱、文件数、近 5h/7d 用量与真实额度（`--quota` 实时刷新） |
+| `delegate agy account status [--quota] [--json]` | 显示活跃槽位、实盘邮箱（含漂移）、近 1h/5h/7d 用量、真实额度与年龄、手动快照、在跑 `agy` 进程与本地令牌到期时间 |
 | `delegate agy account add [<id>] [--label TEXT] [--overwrite]` | 在临时 `0700` HOME 中交互启动 `agy` 登录，退出后把新凭据收进新槽位并销毁临时 HOME；不影响当前活跃账号 |
 | `delegate agy account use <id> [--force] [--json]` | 排他锁内：校验无在跑 `agy` → 回存当前活跃账号被 `agy` 刷新过的最新凭据 → 原子替换为目标槽位（清理目标槽位不存在的残留文件如旧 `credential-user-scope`） |
 | `delegate agy account note <id> [--weekly PCT] [--five-hour PCT] [--clear] [--json]` | 手动登记「周剩余 %」「五小时剩余 %」快照，结合本地用量推算「每 1% 约多少 token」与按当前速度还能跑多久（仅作提示，不自动换号） |
@@ -30,9 +30,10 @@
 | `delegate agy account restore-entry [--dry-run] [--mode wrapper\|symlink]` | 备份原 `~/.local/bin/agy` 到 `~/.local/bin/agy.bak-agy-swap`，替换为直连 `~/.local/libexec/agy` 的最小 `exec` 包装（默认）或符号链接 |
 | `delegate usage [--since 24h\|7d\|all] [--by account\|day\|run\|repo] [--account ID] [--repo PATH] [--all] [--json]` | 按账号槽位 / 日 / run / 仓库汇总本地 `agy` 用量（作者与审查员分列，运行中实时计入或单列「运行中未计」，绝不记邮箱） |
 
-**用量记录与 TUI**：
-- 每轮作者、审查员、返工结束时自动记录增量 tokens（`input` / `output` / `cacheRead`）与当时活跃槽位 ID（不记邮箱），审查员轮次落 `<run>/review/round-N/usage.json` 并汇总进 `summary.json`（`agyAccount` / `reviewTokens` / `usage`）与 `<state>/agy-usage.jsonl`；运行中若 `agy` 输出含累计用量则实时写 `live-usage.json`，否则标「运行中未计」。
-- `delegate tui` 按 `6` 或 `A` 进入「账号」页，展示槽位列表（含 `5h用量`/`7d用量`）、活跃标记（`★ 活跃`）、本地用量明细、手动余量快照与推算提示及在跑 `agy` 进程；选中账号按 `Enter` 或 `u` 弹出就地确认框，`Enter`/`y` 执行切换，`Esc`/`n` 取消。
+**真实额度、用量与 TUI**：
+- **真实额度**：仅调用 `agy -p /usage </dev/null`（解析「额度池 × 窗口 → 剩余 % + 重置时刻」，未知行原样保留）。活跃且未漂移槽位在真实 `HOME` 跑；非活跃槽位在临时 `0700` HOME 跑，凭据若刷新原子写回（`0600`）槽位后删临时目录。缓存于 `<state>/agy-quota.json` 并显数据年龄；TUI 打开总览/账号页及之后每 10 分钟刷新（关闭不轮询），也可用 `--quota` 或 `Q` 手动刷新。
+- **用量与推算**：作者/审查员/返工每轮记录增量 tokens 与活跃槽位 ID（不记邮箱），落 `summary.json` 与 `<state>/agy-usage.jsonl`（运行中实时写 `live-usage.json` 或标「运行中未计」）。真实额度优先于手动 `note`，按近 1h 速率推算每 1% token 与可用时长（仅提醒不自动换号）。
+- **TUI**：`0`/`O` 总览页看额度 `Gauge`、按账号 24h `Sparkline`、用途/模型 `BarChart`（`v` 切换）与近 7 天合入耗时/一轮通过率（80 列降级纯文本）；`6`/`A` 账号页看详情与在跑进程，`Enter`/`u` 切换，`Q` 刷新。
 
 ## 设计取舍：有在跑 `agy` 时拒切（不做 `--next-start`）
 
