@@ -215,6 +215,7 @@ pub struct App {
     pub filtered_accounts: Vec<usize>,
     pub selected_account: Option<usize>,
     pub accounts_scroll: usize,
+    pub revealed_accounts: HashSet<String>,
     pub switching_account: Option<String>,
     pub account_switch_error: Option<String>,
     pub overview_scroll: usize,
@@ -270,6 +271,7 @@ impl App {
             filtered_accounts: Vec::new(),
             selected_account: None,
             accounts_scroll: 0,
+            revealed_accounts: HashSet::new(),
             switching_account: None,
             account_switch_error: None,
             overview_scroll: 0,
@@ -1200,6 +1202,10 @@ impl App {
         self.snapshot.agy_accounts.accounts.get(idx)
     }
 
+    pub fn is_account_revealed(&self, id: &str) -> bool {
+        self.revealed_accounts.contains(id)
+    }
+
     pub fn move_account_selection(&mut self, delta: isize) -> bool {
         if self.filtered_accounts.is_empty() {
             self.selected_account = None;
@@ -1961,6 +1967,17 @@ impl App {
                 KeyCode::Enter | KeyCode::Char('u') => {
                     self.open_account_switch_confirm();
                     AppAction::Redraw
+                }
+                KeyCode::Char('i') => {
+                    if let Some(id) = self.selected_account_item().map(|a| a.id.clone()) {
+                        if !self.revealed_accounts.remove(&id) {
+                            self.revealed_accounts.insert(id);
+                        }
+                        self.dirty = true;
+                        AppAction::Redraw
+                    } else {
+                        AppAction::None
+                    }
                 }
                 KeyCode::Char('y') => {
                     if let Some(a) = self.selected_account_item() {

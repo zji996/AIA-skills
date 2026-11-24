@@ -453,6 +453,7 @@ pub fn parse_snapshot_json(
         return Err("snapshot json: expected object".to_string());
     }
 
+    let generated_epoch = doc["generatedAt"].as_str().and_then(parse_iso_utc_epoch);
     let mut groups = Vec::new();
     if let Some(repos) = doc["repos"].as_array() {
         for r in repos {
@@ -471,7 +472,7 @@ pub fn parse_snapshot_json(
                     jsonl.push('\n');
                 }
             }
-            let group = parse_status_jsonl(&repo_path, &label, &jsonl);
+            let group = parse_status_jsonl_at(&repo_path, &label, &jsonl, generated_epoch);
             if !group.runs.is_empty() {
                 groups.push(group);
             }
@@ -506,7 +507,6 @@ pub fn parse_snapshot_json(
     let agy_accounts = parse_agy_accounts_value(&doc["agyAccounts"]);
     let analytics = parse_analytics_value(&doc["analytics"]);
     let host_load = read_host_load();
-    let generated_epoch = doc["generatedAt"].as_str().and_then(parse_iso_utc_epoch);
     let today_ymd = doc["generatedAt"]
         .as_str()
         .and_then(iso_to_local_ymd)
@@ -670,6 +670,16 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
 
 /// Parse `delegate status --json --all [--files]` JSONL output into a chain-collapsed RepoGroup.
 pub fn parse_status_jsonl(repo_path: &Path, repo_label: &str, raw: &str) -> RepoGroup {
+    parse_status_jsonl_at(repo_path, repo_label, raw, None)
+}
+
+/// Like [`parse_status_jsonl`], computing `finished_ago_seconds` against `now_epoch` (or wall clock if `None`).
+pub fn parse_status_jsonl_at(
+    repo_path: &Path,
+    repo_label: &str,
+    raw: &str,
+    now_epoch: Option<i64>,
+) -> RepoGroup {
     let mut raw_items: Vec<Value> = Vec::new();
     for line in raw.lines() {
         let trimmed = line.trim();
@@ -727,6 +737,7 @@ pub fn parse_status_jsonl(repo_path: &Path, repo_label: &str, raw: &str) -> Repo
             chain_round,
             chain_ids,
             root_name.as_deref(),
+            now_epoch,
         ));
     }
 
@@ -797,6 +808,7 @@ fn parse_run_item(
     chain_round: usize,
     chain_ids: Vec<String>,
     root_name: Option<&str>,
+    now_epoch: Option<i64>,
 ) -> RunItem {
     let run = v
         .get("run")
@@ -839,7 +851,7 @@ fn parse_run_item(
         queue_obj.is_some() || measure_waiting_ahead.is_some(),
     );
 
-    let model = format_model_name(v);
+    let (model, thinking) = format_model_and_thinking(v);
     let tier = v
         .get("tier")
         .and_then(Value::as_str)
@@ -949,8 +961,16 @@ fn parse_run_item(
     let elapsed_seconds = v.get("elapsedSeconds").and_then(Value::as_u64);
     let age_seconds = v.get("ageSeconds").and_then(Value::as_u64);
     let queued_seconds = v.get("queuedSeconds").and_then(Value::as_u64);
+    let finished_at = v
+        .get("finishedAt")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let finished_ago_seconds = if matches!(group, GroupKind::Running | GroupKind::Queued) {
         None
+    } else if let Some(fin_ep) = finished_at.as_deref().and_then(parse_iso_utc_epoch) {
+        let now = now_epoch.unwrap_or_else(current_utc_epoch);
+        Some((now - fin_ep).max(0) as u64)
     } else {
         age_seconds.map(|age| {
             age.saturating_sub(elapsed_seconds.unwrap_or(0))
@@ -974,6 +994,7 @@ fn parse_run_item(
         state,
         group,
         model,
+        thinking,
         tier,
         mode,
         elapsed_seconds,
@@ -1021,10 +1042,7 @@ fn parse_run_item(
         result_chars,
         has_result,
         has_worktree,
-        finished_at: v
-            .get("finishedAt")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        finished_at,
         tokens_input,
         tokens_output,
         tokens_cache_read,
@@ -1110,7 +1128,7 @@ fn classify_group(state: &str, applied: bool, has_queue: bool) -> GroupKind {
     }
 }
 
-fn format_model_name(v: &Value) -> String {
+fn format_model_and_thinking(v: &Value) -> (String, Option<String>) {
     let raw = v
         .get("modelName")
         .and_then(Value::as_str)
@@ -1126,8 +1144,33 @@ fn format_model_name(v: &Value) -> String {
                 .filter(|s| !s.is_empty())
         })
         .unwrap_or("-");
-    let short = raw.rsplit('/').next().unwrap_or(raw);
-    short.replace("gemini-4-", "")
+    let short = raw.rsplit('/').next().unwrap_or(raw).replace("gemini-4-", "");
+
+    let explicit_thinking = v
+        .get("thinking")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let lower = short.to_ascii_lowercase();
+    for (suffix, level) in [
+        ("-xhigh", "xhigh"),
+        ("-high", "high"),
+        ("-medium", "medium"),
+        ("-med", "medium"),
+        ("-low", "low"),
+        ("-minimal", "minimal"),
+        ("-min", "minimal"),
+        ("-off", "off"),
+    ] {
+        if lower.ends_with(suffix) && short.len() > suffix.len() {
+            let base = short[..short.len() - suffix.len()].to_string();
+            return (base, explicit_thinking.or_else(|| Some(level.to_string())));
+        }
+    }
+
+    (short, explicit_thinking)
 }
 
 fn parse_review(rev_val: Option<&Value>, sign_val: Option<&Value>) -> Option<ReviewInfo> {

@@ -1,6 +1,7 @@
 use crate::width::{display_width, wrap_styled_line};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthChar;
 
 const CODE_COLOR: Color = Color::Cyan;
 
@@ -19,13 +20,16 @@ pub fn render_markdown(text: &str, indent: &str, max_cols: usize) -> Vec<Line<'s
         vec![(indent.to_string(), base)]
     };
 
-    for raw in text.lines() {
-        let line = raw.trim_end_matches('\r');
+    let raw_lines: Vec<&str> = text.lines().collect();
+    let mut idx = 0usize;
+    while idx < raw_lines.len() {
+        let line = raw_lines[idx].trim_end_matches('\r');
         let trimmed = line.trim();
 
         // Fenced code blocks (``` or ~~~)
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             in_code_block = !in_code_block;
+            idx += 1;
             continue;
         }
         if in_code_block {
@@ -38,12 +42,50 @@ pub fn render_markdown(text: &str, indent: &str, max_cols: usize) -> Vec<Line<'s
                 max_cols.max(8),
             );
             out.extend(wrapped);
+            idx += 1;
             continue;
         }
 
         if trimmed.is_empty() {
             out.push(Line::raw(""));
+            idx += 1;
             continue;
+        }
+
+        // Markdown table: header row + `|---|` separator row + body rows
+        if idx + 1 < raw_lines.len() {
+            if let Some(header_cells) = parse_table_row(trimmed) {
+                let sep_line = raw_lines[idx + 1].trim_end_matches('\r').trim();
+                if is_table_separator(sep_line) {
+                    let mut body_rows: Vec<Vec<String>> = Vec::new();
+                    let mut j = idx + 2;
+                    while j < raw_lines.len() {
+                        let btrim = raw_lines[j].trim_end_matches('\r').trim();
+                        if btrim.is_empty()
+                            || btrim.starts_with("```")
+                            || btrim.starts_with("~~~")
+                        {
+                            break;
+                        }
+                        if let Some(cells) = parse_table_row(btrim) {
+                            body_rows.push(cells);
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    out.extend(render_table(
+                        &header_cells,
+                        &body_rows,
+                        indent,
+                        max_cols.max(8),
+                        base,
+                        muted,
+                    ));
+                    idx = j;
+                    continue;
+                }
+            }
         }
 
         // Horizontal rule
@@ -55,6 +97,7 @@ pub fn render_markdown(text: &str, indent: &str, max_cols: usize) -> Vec<Line<'s
                 Span::raw(indent.to_string()),
                 Span::styled("─".repeat(rule_w), muted),
             ]));
+            idx += 1;
             continue;
         }
 
@@ -68,6 +111,7 @@ pub fn render_markdown(text: &str, indent: &str, max_cols: usize) -> Vec<Line<'s
                 &indent_seg,
                 max_cols.max(8),
             ));
+            idx += 1;
             continue;
         }
 
@@ -78,6 +122,7 @@ pub fn render_markdown(text: &str, indent: &str, max_cols: usize) -> Vec<Line<'s
             prefix.push(("│ ".to_string(), muted));
             let segs = parse_inline(body, muted);
             out.extend(wrap_styled_line(&segs, &prefix, &prefix, max_cols.max(8)));
+            idx += 1;
             continue;
         }
 
@@ -90,6 +135,7 @@ pub fn render_markdown(text: &str, indent: &str, max_cols: usize) -> Vec<Line<'s
             cont.push((format!("{extra}  "), base));
             let segs = parse_inline(item_body, base);
             out.extend(wrap_styled_line(&segs, &first, &cont, max_cols.max(8)));
+            idx += 1;
             continue;
         }
 
@@ -104,6 +150,7 @@ pub fn render_markdown(text: &str, indent: &str, max_cols: usize) -> Vec<Line<'s
             cont.push((cont_pad, base));
             let segs = parse_inline(item_body, base);
             out.extend(wrap_styled_line(&segs, &first, &cont, max_cols.max(8)));
+            idx += 1;
             continue;
         }
 
@@ -115,8 +162,210 @@ pub fn render_markdown(text: &str, indent: &str, max_cols: usize) -> Vec<Line<'s
             &indent_seg,
             max_cols.max(8),
         ));
+        idx += 1;
     }
 
+    out
+}
+
+fn parse_table_row(trimmed: &str) -> Option<Vec<String>> {
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let inner = trimmed
+        .strip_prefix('|')
+        .unwrap_or(trimmed);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && chars.peek() == Some(&'|') {
+            chars.next();
+            cur.push('|');
+        } else if ch == '|' {
+            cells.push(cur.trim().to_string());
+            cur.clear();
+        } else {
+            cur.push(ch);
+        }
+    }
+    cells.push(cur.trim().to_string());
+    if cells.len() < 2 {
+        return None;
+    }
+    Some(cells)
+}
+
+fn is_table_separator(trimmed: &str) -> bool {
+    let Some(cells) = parse_table_row(trimmed) else {
+        return false;
+    };
+    cells.iter().all(|c| {
+        let s = c.trim();
+        let core = s.trim_start_matches(':').trim_end_matches(':');
+        !core.is_empty() && core.chars().all(|ch| ch == '-')
+    })
+}
+
+fn spans_display_width(segs: &[(String, Style)]) -> usize {
+    segs.iter().map(|(t, _)| display_width(t)).sum()
+}
+
+fn clip_and_pad_styled(
+    segs: &[(String, Style)],
+    target_w: usize,
+    pad_style: Style,
+) -> Vec<Span<'static>> {
+    if target_w == 0 {
+        return Vec::new();
+    }
+    let total_w = spans_display_width(segs);
+    let mut out: Vec<Span<'static>> = Vec::new();
+    if total_w <= target_w {
+        for (t, st) in segs {
+            if !t.is_empty() {
+                out.push(Span::styled(t.clone(), *st));
+            }
+        }
+        if total_w < target_w {
+            out.push(Span::styled(" ".repeat(target_w - total_w), pad_style));
+        }
+        return out;
+    }
+    if target_w == 1 {
+        out.push(Span::styled("…", pad_style));
+        return out;
+    }
+    let limit = target_w - 1;
+    let mut used = 0usize;
+    let mut last_style = pad_style;
+    for (t, st) in segs {
+        let mut chunk = String::new();
+        for ch in t.chars() {
+            let cw = ch.width().unwrap_or(0);
+            if used + cw > limit {
+                break;
+            }
+            chunk.push(ch);
+            used += cw;
+        }
+        if !chunk.is_empty() {
+            last_style = *st;
+            out.push(Span::styled(chunk, *st));
+        }
+        if used >= limit {
+            break;
+        }
+    }
+    out.push(Span::styled("…", last_style));
+    used += 1;
+    if used < target_w {
+        out.push(Span::styled(" ".repeat(target_w - used), pad_style));
+    }
+    out
+}
+
+fn render_table(
+    header_cells: &[String],
+    body_rows: &[Vec<String>],
+    indent: &str,
+    max_cols: usize,
+    base: Style,
+    muted: Style,
+) -> Vec<Line<'static>> {
+    let num_cols = body_rows
+        .iter()
+        .map(Vec::len)
+        .fold(header_cells.len(), usize::max);
+    if num_cols == 0 {
+        return Vec::new();
+    }
+
+    let h_style = base.add_modifier(Modifier::BOLD);
+    let parsed_header: Vec<Vec<(String, Style)>> = (0..num_cols)
+        .map(|c| {
+            let txt = header_cells.get(c).map(String::as_str).unwrap_or("");
+            parse_inline(txt, h_style)
+        })
+        .collect();
+    let parsed_body: Vec<Vec<Vec<(String, Style)>>> = body_rows
+        .iter()
+        .map(|row| {
+            (0..num_cols)
+                .map(|c| {
+                    let txt = row.get(c).map(String::as_str).unwrap_or("");
+                    parse_inline(txt, base)
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut col_widths = vec![1usize; num_cols];
+    for (c, segs) in parsed_header.iter().enumerate() {
+        col_widths[c] = col_widths[c].max(spans_display_width(segs));
+    }
+    for row in &parsed_body {
+        for (c, segs) in row.iter().enumerate() {
+            col_widths[c] = col_widths[c].max(spans_display_width(segs));
+        }
+    }
+
+    let indent_w = display_width(indent);
+    let avail = max_cols.saturating_sub(indent_w).max(8);
+    let use_pipe = num_cols >= 2 && avail >= num_cols * 3 + (num_cols - 1) * 3;
+    let sep = if use_pipe { " │ " } else { " " };
+    let div_sep = if use_pipe { "─┼─" } else { " " };
+    let sep_total = display_width(sep) * num_cols.saturating_sub(1);
+    let content_budget = avail.saturating_sub(sep_total).max(num_cols);
+
+    while col_widths.iter().sum::<usize>() > content_budget {
+        let Some((widest_idx, &widest_val)) = col_widths
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, &w)| w)
+        else {
+            break;
+        };
+        if widest_val <= 2 {
+            break;
+        }
+        col_widths[widest_idx] -= 1;
+    }
+
+    let build_row = |cells: &[Vec<(String, Style)>], pad_style: Style| -> Line<'static> {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if !indent.is_empty() {
+            spans.push(Span::raw(indent.to_string()));
+        }
+        for (c, segs) in cells.iter().enumerate() {
+            if c > 0 {
+                spans.push(Span::styled(sep, muted));
+            }
+            spans.extend(clip_and_pad_styled(segs, col_widths[c], pad_style));
+        }
+        Line::from(spans)
+    };
+
+    let mut out = Vec::with_capacity(parsed_body.len() + 2);
+    out.push(build_row(&parsed_header, h_style));
+
+    // Divider line under header
+    let mut div_spans: Vec<Span<'static>> = Vec::new();
+    if !indent.is_empty() {
+        div_spans.push(Span::raw(indent.to_string()));
+    }
+    for (c, &w) in col_widths.iter().enumerate() {
+        if c > 0 {
+            div_spans.push(Span::styled(div_sep, muted));
+        }
+        div_spans.push(Span::styled("─".repeat(w), muted));
+    }
+    out.push(Line::from(div_spans));
+
+    for row in &parsed_body {
+        out.push(build_row(row, base));
+    }
     out
 }
 
@@ -382,5 +631,31 @@ mod tests {
             s.content.contains("pnpm") && s.style.fg == Some(CODE_COLOR)
         });
         assert!(has_code_color, "inline code should use code color");
+    }
+
+    #[test]
+    fn renders_markdown_table_as_aligned_columns() {
+        let md = "| 序 | 任务 | 状态 |\n|---|---|---|\n| 1 | `ui.rs` 改动 | **通过** |\n| 2 | 表格对齐 | 完成 |";
+        let lines = render_markdown(md, "  ", 48);
+        assert_eq!(lines.len(), 4, "header + divider + 2 body rows");
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let joined = rendered.join("\n");
+        assert!(!joined.contains("|---"), "raw separator leaked:\n{joined}");
+        assert!(!joined.contains("**"), "raw bold leaked:\n{joined}");
+        assert!(!joined.contains('`'), "raw code backticks leaked:\n{joined}");
+        assert!(joined.contains("─┼─"), "expected box divider:\n{joined}");
+        for line in &rendered {
+            assert!(display_width(line) <= 48, "table line too wide: {line}");
+        }
+        // Column separator `│` should align at the same display column across header and body rows.
+        let pipe_col = |s: &str| {
+            let idx = s.find('│').expect("separator");
+            display_width(&s[..idx])
+        };
+        assert_eq!(pipe_col(&rendered[0]), pipe_col(&rendered[2]), "\n{joined}");
+        assert_eq!(pipe_col(&rendered[2]), pipe_col(&rendered[3]), "\n{joined}");
     }
 }

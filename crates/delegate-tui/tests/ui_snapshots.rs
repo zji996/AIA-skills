@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use delegate_tui::app::{App, Overlay, WriteAction};
-use delegate_tui::data::{parse_lane_json, parse_status_jsonl};
+use delegate_tui::data::{parse_lane_json, parse_status_jsonl, parse_status_jsonl_at};
 use delegate_tui::model::*;
 use delegate_tui::ui;
 use delegate_tui::width::display_width;
@@ -21,8 +21,19 @@ const REPO_B_JSONL: &str = r#"
 "#;
 
 fn make_sample_app() -> App {
-    let repo_a = parse_status_jsonl(Path::new("/home/dev/demo-api"), "~/demo-api", REPO_A_JSONL);
-    let repo_b = parse_status_jsonl(Path::new("/home/dev/web-app"), "~/web-app", REPO_B_JSONL);
+    let fixed_now = parse_iso_utc_epoch("2026-11-22T10:43:00Z");
+    let repo_a = parse_status_jsonl_at(
+        Path::new("/home/dev/demo-api"),
+        "~/demo-api",
+        REPO_A_JSONL,
+        fixed_now,
+    );
+    let repo_b = parse_status_jsonl_at(
+        Path::new("/home/dev/web-app"),
+        "~/web-app",
+        REPO_B_JSONL,
+        fixed_now,
+    );
     let lane = parse_lane_json(
         r#"{"maxHeavy":6,"heavyJobs":94,"threads":96,"budget":94,"poolTokens":88,"heavyJobsExplicit":false,"concurrencySummary":"线程 96 − 2 = 94 · 令牌 88/88 空闲 31","pool":{"target":88,"total":88,"free":31,"borrowed":57,"leases":[{"rank":1,"used":61,"share":62},{"rank":2,"used":31,"share":31}]},"local":[{"label":"demo-api: cargo test","since":"2026-11-22T10:40:00Z","running":true,"rank":1,"used":61,"share":62},{"label":"web-app: cargo build","since":"2026-11-22T10:41:00Z","running":true,"rank":2,"used":31,"share":31}],"remoteMaxHeavy":4,"remote":[]}"#,
     )
@@ -412,16 +423,25 @@ fn work_view_renders_grouping_dependency_chains_live_status_at_120_80_50_and_emp
     app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
     assert_eq!(app.tab, ViewTab::Work);
 
-    // 1. Wide 120 columns
+    // 1. Wide 120 columns: unified full tab names, right-side counts trimmed cleanly without clipping
     let s120 = render_to_string(&mut app, 120, 34);
-    // L0 top bar counts: 等你 4 (Q18, Q20, Q21, D002), 需处理 2 (W010, W011), 就绪 1 (W040), 推进中 2 (W029, W033), 等待 4 (W034, W035, W031, W041), 暂缓 1 (W042), 今天完成 1 (W001)
+    let top120 = s120.lines().next().unwrap_or("");
+    assert!(top120.contains("0总览") && top120.contains("1任务") && top120.contains("5工作"), "{top120}");
+    assert!(!top120.contains("0览"), "work tab must not shrink tab labels: {top120}");
+    assert!(!top120.trim_end().ends_with('·'), "top bar must not leave trailing separator: {top120}");
     assert!(s120.contains("等你 4"), "{s120}");
     assert!(s120.contains("需处理 2"), "{s120}");
     assert!(s120.contains("就绪 1"), "{s120}");
-    assert!(s120.contains("推进中 2"), "{s120}");
-    assert!(s120.contains("等待 4"), "{s120}");
-    assert!(s120.contains("暂缓 1"), "{s120}");
-    assert!(s120.contains("今天完成 1"), "{s120}");
+
+    // Very wide 160 columns shows all work counts
+    let s160 = render_to_string(&mut app, 160, 34);
+    assert!(s160.contains("等你 4"), "{s160}");
+    assert!(s160.contains("需处理 2"), "{s160}");
+    assert!(s160.contains("就绪 1"), "{s160}");
+    assert!(s160.contains("推进中 2"), "{s160}");
+    assert!(s160.contains("等待 4"), "{s160}");
+    assert!(s160.contains("暂缓 1"), "{s160}");
+    assert!(s160.contains("今天完成 1"), "{s160}");
 
     // Owner items pinned at top in 动手 -> 点头 -> 看卡 -> 方向 order
     let pos_q18 = s120.find("Q18").expect("Q18");
@@ -463,10 +483,11 @@ fn work_view_renders_grouping_dependency_chains_live_status_at_120_80_50_and_emp
     assert!(s120.contains("等 W033 关闭"), "{s120}");
     assert!(s120.contains("等所有者 Q12"), "{s120}");
 
-    // 2. 80 columns (still single-line L0 and single-line items)
+    // 2. 80 columns (unified full tab names, counts trimmed cleanly on the right)
     let s80 = render_to_string(&mut app, 80, 32);
+    let top80 = s80.lines().next().unwrap_or("");
+    assert!(top80.contains("0总览") && top80.contains("5工作"), "{top80}");
     assert!(s80.contains("等你 4"), "{s80}");
-    assert!(s80.contains("今天完成 1"), "{s80}");
     assert!(s80.contains("└─ ◌ W034"), "{s80}");
     assert!(s80.contains("+1"), "{s80}");
 
@@ -666,10 +687,15 @@ fn snapshot_accounts_tab_active_marker_and_inplace_confirm_modal() {
     assert!(screen.contains("6账号(2)"), "{screen}");
     assert!(screen.contains("agy 账号 (2)"), "{screen}");
     assert!(screen.contains("★ 活跃"), "{screen}");
-    assert!(screen.contains("alice@example.test"), "{screen}");
-    assert!(screen.contains("bob@example.test"), "{screen}");
+    // Default masked display: 3-char prefix + `…`, no email column, one-line proc without cmdline
+    assert!(screen.contains("ali…"), "{screen}");
+    assert!(screen.contains("bob"), "{screen}");
+    assert!(!screen.contains("alice@example.test"), "email hidden by default:\n{screen}");
+    assert!(!screen.contains("bob@example.test"), "email hidden by default:\n{screen}");
     assert!(screen.contains("在跑 agy 进程: 1 个"), "{screen}");
-    assert!(screen.contains("pid=4242"), "{screen}");
+    assert!(screen.contains("4242 · 20261124-030000-demo"), "{screen}");
+    assert!(!screen.contains("pid=4242"), "old pid= format should be replaced:\n{screen}");
+    assert!(screen.contains("i 全称"), "bottom bar should advertise `i 全称`:\n{screen}");
 
     // Move selection down to 'bob' and press Enter to open in-place confirmation modal
     app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -1124,7 +1150,8 @@ fn snapshot_overview_and_accounts_real_quota_charts_120x40_and_80x24() {
     assert_lines_fit_width(&ov_narrow, 80);
     assert!(ov_narrow.contains("总览 · 3 分钟前更新"), "{ov_narrow}");
     assert_eq!(ov_narrow.matches("3 分钟前更新").count(), 1, "{ov_narrow}");
-    assert!(ov_narrow.contains("alpha"), "{ov_narrow}");
+    assert!(ov_narrow.contains("alp…"), "{ov_narrow}");
+    assert!(!ov_narrow.contains("alpha"), "account id should be masked by default:\n{ov_narrow}");
     assert!(ov_narrow.contains("Gemini · 5 小时  剩余 82% · 4 小时后重置"), "{ov_narrow}");
     assert!(ov_narrow.contains("按最近 5 小时的平均用量，5 小时与本周额度在重置前用不完"), "{ov_narrow}");
     assert!(!ov_narrow.contains("Preview Tier: experimental pool active"), "{ov_narrow}");
@@ -1137,15 +1164,16 @@ fn snapshot_overview_and_accounts_real_quota_charts_120x40_and_80x24() {
         assert!(!ov_narrow.contains(bad), "forbidden copy {bad:?} in ov_narrow:\n{ov_narrow}");
     }
 
-    // 3. Accounts 120x40 (wide: list + quota Gauges + 24h Sparkline + plain estimate)
+    // 3. Accounts 120x40 (wide: list + quota bars + 24h Sparkline + plain estimate)
     app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
     assert_eq!(app.tab, ViewTab::Accounts);
     let acct_wide = render_to_string(&mut app, 120, 40);
     assert_lines_fit_width(&acct_wide, 120);
     assert!(acct_wide.contains("6账号(2)"), "{acct_wide}");
-    assert!(acct_wide.contains("alpha · 3 分钟前更新"), "{acct_wide}");
+    assert!(acct_wide.contains("alp… · 3 分钟前更新"), "{acct_wide}");
     assert_eq!(acct_wide.matches("3 分钟前更新").count(), 1, "{acct_wide}");
-    assert_eq!(acct_wide.matches("alpha@example.test").count(), 1, "email should appear once: {acct_wide}");
+    assert!(!acct_wide.contains("alpha@example.test"), "email hidden by default: {acct_wide}");
+    assert!(!acct_wide.contains("主号"), "label hidden by default: {acct_wide}");
     assert!(!acct_wide.contains("近 5 小时: 12.0M"), "5h total should not repeat in detail: {acct_wide}");
     assert_eq!(acct_wide.matches("54.0M").count(), 1, "7d total should appear once: {acct_wide}");
     assert!(!acct_wide.contains("· 在跑 1"), "running count should not duplicate in list title: {acct_wide}");
@@ -1166,9 +1194,9 @@ fn snapshot_overview_and_accounts_real_quota_charts_120x40_and_80x24() {
     let acct_narrow = render_to_string(&mut app, 80, 24);
     assert_lines_fit_width(&acct_narrow, 80);
     assert!(acct_narrow.contains("agy 账号 (2)"), "{acct_narrow}");
-    assert!(acct_narrow.contains("alpha · 3 分钟前更新"), "{acct_narrow}");
+    assert!(acct_narrow.contains("alp… · 3 分钟前更新"), "{acct_narrow}");
     assert_eq!(acct_narrow.matches("3 分钟前更新").count(), 1, "{acct_narrow}");
-    assert_eq!(acct_narrow.matches("alpha@example.test").count(), 1, "{acct_narrow}");
+    assert!(!acct_narrow.contains("alpha@example.test"), "email hidden by default: {acct_narrow}");
     assert!(!acct_narrow.contains("· 在跑 1"), "{acct_narrow}");
     assert!(acct_narrow.contains("▸ 额度"), "{acct_narrow}");
     assert!(acct_narrow.contains("Gemini · 5 小时  剩余 82% · 4 小时后重置"), "{acct_narrow}");
@@ -1310,7 +1338,8 @@ fn work_view_renders_stale_badges_colors_missing_brief_and_top_bar_count() {
     assert_eq!(app.tab, ViewTab::Work);
 
     // Move selection away from W001..W005 (keep on Q01 at top) so fg colors are not reversed.
-    let backend = TestBackend::new(120, 30);
+    // Use 160 cols so all work counts including `老化 4` fit alongside the unified full tab names.
+    let backend = TestBackend::new(160, 30);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|f| ui::render(f, &mut app)).unwrap();
     let buf = terminal.backend().buffer().clone();
@@ -1407,4 +1436,243 @@ fn work_view_renders_stale_badges_colors_missing_brief_and_top_bar_count() {
     let fresh_screen = render_to_string(&mut fresh_app, 120, 20);
     assert!(!fresh_screen.contains("老化"), "{fresh_screen}");
     assert!(!fresh_screen.contains("缺说明"), "{fresh_screen}");
+}
+
+#[test]
+fn accounts_default_masked_and_toggle_full_with_i_while_y_copies_full_id() {
+    use delegate_tui::app::{AppAction, ViewTab};
+    use delegate_tui::data::parse_agy_accounts_json;
+
+    let raw_accounts = r#"{
+        "root": "/tmp/fake-home/.config/delegate/agy-accounts",
+        "active": "guimondbuchinsky",
+        "liveEmail": "guimondbuchinsky@gmail.com",
+        "liveDrifted": false,
+        "runningAgy": [
+            {"pid": 33057, "run": "20261124-155318-call-orphan", "cmdline": "/home/zji/.local/libexec/agy --input-format stream-json --output-format stream-json"},
+            {"pid": 2896311, "cmdline": "/bin/sh /home/zji/.local/bin/agy --agent aia-lead"}
+        ],
+        "accounts": [
+            {
+                "id": "guimondbuchinsky",
+                "email": "guimondbuchinsky@gmail.com",
+                "label": "Buchinsky Guimond",
+                "active": true,
+                "lastUsedAt": "2026-11-24T00:08:00Z",
+                "fileCount": 6,
+                "usage": {
+                    "oneHour": {"total": 56500000},
+                    "fiveHour": {"total": 496400000},
+                    "sevenDay": {"total": 557000000},
+                    "hourly24h": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,10000000,20000000,30000000,40000000,50000000,60000000,50000000,56500000]
+                },
+                "quota": {
+                    "fetchedAt": "2026-11-24T08:00:00Z",
+                    "ageSeconds": 60,
+                    "ok": true,
+                    "entries": [
+                        {"pool": "Gemini", "window": "weekly", "windowLabel": "Weekly Limit Remaining", "remainingPct": 87.0, "resetInSeconds": 558000},
+                        {"pool": "Claude/GPT", "window": "fiveHour", "windowLabel": "5-Hour Limit Remaining", "remainingPct": 100.0, "resetInSeconds": 15300}
+                    ]
+                }
+            },
+            {
+                "id": "jzy896370029",
+                "email": "jzy896370029@gmail.com",
+                "label": "",
+                "active": false,
+                "lastUsedAt": "",
+                "fileCount": 4,
+                "usage": {"hourly24h": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}
+            }
+        ]
+    }"#;
+
+    let agy_accounts = parse_agy_accounts_json(raw_accounts);
+    let snap = AppSnapshot {
+        agy_accounts,
+        refreshed_at: "16:17:40".into(),
+        ..AppSnapshot::default()
+    };
+    let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("."), 5);
+
+    // Overview: accounts masked (`gui…`, `jzy…`), zero-usage account collapsed to one line
+    app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Overview);
+    let ov = render_to_string(&mut app, 120, 40);
+    assert!(ov.contains("gui…"), "{ov}");
+    assert!(ov.contains("jzy…"), "{ov}");
+    assert!(ov.contains("· jzy… 近 24 小时无用量"), "{ov}");
+    assert!(!ov.contains("guimondbuchinsky"), "full account name leaked on overview:\n{ov}");
+    assert!(!ov.contains("jzy896370029"), "full account name leaked on overview:\n{ov}");
+    assert!(!ov.contains("Buchinsky Guimond"), "label leaked on overview:\n{ov}");
+
+    // Accounts tab: default masked, no email column, no label, one-line procs without cmdline
+    app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Accounts);
+    let masked = render_to_string(&mut app, 120, 40);
+    assert!(masked.contains("gui…"), "{masked}");
+    assert!(masked.contains("jzy…"), "{masked}");
+    assert!(!masked.contains("guimondbuchinsky"), "full id leaked:\n{masked}");
+    assert!(!masked.contains("gmail.com"), "email leaked:\n{masked}");
+    assert!(!masked.contains("Buchinsky Guimond"), "label leaked:\n{masked}");
+    assert!(!masked.contains("邮箱"), "email column header should be removed:\n{masked}");
+    assert!(masked.contains("i 全称"), "footer should show `i 全称`:\n{masked}");
+    assert!(masked.contains("33057 · 20261124-155318-call-orphan"), "{masked}");
+    assert!(masked.contains("2896311 · aia-lead"), "{masked}");
+    assert!(!masked.contains("--input-format"), "cmdline should not be printed:\n{masked}");
+
+    // `y` still copies the full account id even while masked
+    let y_act = app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    assert_eq!(
+        y_act,
+        AppAction::CopyClipboard("delegate agy account use guimondbuchinsky".to_string())
+    );
+
+    // Press `i` -> selected account reveals full id, email, and label; other account stays masked
+    app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+    let revealed = render_to_string(&mut app, 120, 40);
+    assert!(revealed.contains("guimondbuchinsky"), "{revealed}");
+    assert!(revealed.contains("guimondbuchinsky@gmail.com"), "{revealed}");
+    assert!(revealed.contains("Buchinsky Guimond"), "{revealed}");
+    assert!(revealed.contains("jzy…"), "{revealed}");
+    assert!(!revealed.contains("jzy896370029"), "unselected account must stay masked:\n{revealed}");
+
+    // Press `i` again -> restores masked default
+    app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+    let remasked = render_to_string(&mut app, 120, 40);
+    assert!(!remasked.contains("guimondbuchinsky"), "second `i` should hide full id:\n{remasked}");
+    assert!(!remasked.contains("gmail.com"), "second `i` should hide email:\n{remasked}");
+    assert!(!remasked.contains("Buchinsky Guimond"), "second `i` should hide label:\n{remasked}");
+}
+
+#[test]
+fn quota_row_has_space_between_bar_and_text_and_never_overflows_at_80_and_120_cols() {
+    use delegate_tui::app::ViewTab;
+    use delegate_tui::data::parse_agy_accounts_json;
+
+    let raw_accounts = r#"{
+        "root": "/tmp/fake-home/.config/delegate/agy-accounts",
+        "active": "guimondbuchinsky",
+        "liveEmail": "guimondbuchinsky@gmail.com",
+        "liveDrifted": false,
+        "runningAgy": [],
+        "accounts": [
+            {
+                "id": "guimondbuchinsky",
+                "email": "guimondbuchinsky@gmail.com",
+                "active": true,
+                "fileCount": 6,
+                "quota": {
+                    "fetchedAt": "2026-11-24T08:00:00Z",
+                    "ageSeconds": 60,
+                    "ok": true,
+                    "entries": [
+                        {"pool": "Gemini", "window": "weekly", "windowLabel": "Weekly Limit Remaining", "remainingPct": 87.0, "resetInSeconds": 558000},
+                        {"pool": "Gemini", "window": "fiveHour", "windowLabel": "5-Hour Limit Remaining", "remainingPct": 87.0, "resetInSeconds": 10260},
+                        {"pool": "Claude/GPT", "window": "weekly", "windowLabel": "Weekly Limit Remaining", "remainingPct": 90.0, "resetInSeconds": 237600},
+                        {"pool": "Claude/GPT", "window": "fiveHour", "windowLabel": "5-Hour Limit Remaining", "remainingPct": 100.0, "resetInSeconds": 15300}
+                    ]
+                }
+            }
+        ]
+    }"#;
+
+    let agy_accounts = parse_agy_accounts_json(raw_accounts);
+    let snap = AppSnapshot {
+        agy_accounts,
+        refreshed_at: "16:17:40".into(),
+        ..AppSnapshot::default()
+    };
+    let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("."), 5);
+
+    // 120x40 Overview & Accounts: bar has 1 space before `剩余`, and nothing trails after `重置`
+    for tab_key in ['0', '6'] {
+        app.handle_key(KeyEvent::new(KeyCode::Char(tab_key), KeyModifiers::NONE));
+        let screen = render_to_string(&mut app, 120, 40);
+        assert_lines_fit_width(&screen, 120);
+        assert!(
+            !screen.contains("█剩余") && !screen.contains("░剩余"),
+            "bar must be separated from text by a space:\n{screen}"
+        );
+        for line in screen.lines() {
+            if let Some(pos) = line.find("后重置") {
+                let after = &line[pos + "后重置".len()..];
+                // Before the right border `│`, there must be no stray block characters.
+                let before_border = after.split('│').next().unwrap_or(after);
+                assert!(
+                    !before_border.chars().any(|c| ('▏'..='█').contains(&c) || c == '░'),
+                    "bar overflowed after text on line: {line}"
+                );
+            }
+        }
+    }
+
+    // 80x24 Overview & Accounts: fits cleanly within 80 cols with no overflow
+    app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Overview);
+    let ov80 = render_to_string(&mut app, 80, 24);
+    assert_lines_fit_width(&ov80, 80);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Accounts);
+    let acct80 = render_to_string(&mut app, 80, 24);
+    assert_lines_fit_width(&acct80, 80);
+    assert!(!acct80.contains("█剩余"), "{acct80}");
+}
+
+#[test]
+fn runs_time_uses_finished_at_and_model_shows_alias_dot_thinking() {
+    use delegate_tui::data::parse_snapshot_json;
+
+    let raw = r#"{
+        "schemaVersion": 1,
+        "generatedAt": "2026-11-24T08:17:00Z",
+        "repos": [{
+            "path": "/repo/demo",
+            "runs": [
+                {
+                    "run": "20261124-114742-work-hygiene",
+                    "name": "work-hygiene",
+                    "state": "answered",
+                    "mode": "read-only",
+                    "modelName": "neon-med",
+                    "ageSeconds": 144,
+                    "elapsedSeconds": 142,
+                    "finishedAt": "2026-11-24T03:50:06Z"
+                },
+                {
+                    "run": "20261124-150000-hydro-check",
+                    "name": "hydro-check",
+                    "state": "answered",
+                    "mode": "read-only",
+                    "modelName": "hydrogen",
+                    "thinking": "high",
+                    "ageSeconds": 60,
+                    "elapsedSeconds": 58,
+                    "finishedAt": "2026-11-24T06:17:00Z"
+                }
+            ],
+            "cleanedNotes": []
+        }],
+        "work": [],
+        "events": [],
+        "lane": {},
+        "dagQueue": [],
+        "merges": [],
+        "candidates": []
+    }"#;
+
+    let snap = parse_snapshot_json(raw, None, None).unwrap();
+    let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/repo/demo"), 5);
+    let screen = render_to_string(&mut app, 120, 30);
+
+    // finishedAt is 4h27m and 2h ago — must NOT show `刚刚` from stale ageSeconds
+    assert!(!screen.contains("刚刚"), "stale ageSeconds caused 刚刚:\n{screen}");
+    assert!(screen.contains("4时前") || screen.contains("4 小时前"), "{screen}");
+    assert!(screen.contains("2时前") || screen.contains("2 小时前"), "{screen}");
+
+    // Model column shows `neon·中` and `hyd…·高` (truncating only alias, preserving `·高`)
+    assert!(screen.contains("neon·中"), "{screen}");
+    assert!(screen.contains("hyd…·高"), "{screen}");
 }

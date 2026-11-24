@@ -469,6 +469,7 @@ pub struct RunItem {
     pub state: String,
     pub group: GroupKind,
     pub model: String,
+    pub thinking: Option<String>,
     pub tier: Option<String>,
     pub mode: String,
     pub elapsed_seconds: Option<u64>,
@@ -1178,7 +1179,42 @@ pub struct AgyAccountItem {
     pub quota_estimate: Option<QuotaEstimate>,
 }
 
+pub fn mask_account_name(name: &str) -> String {
+    let mut chars = name.chars();
+    let prefix: String = chars.by_ref().take(3).collect();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
+pub fn thinking_short_zh(level: &str) -> Option<&'static str> {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "off" => Some("关"),
+        "minimal" | "min" => Some("微"),
+        "low" => Some("低"),
+        "medium" | "med" => Some("中"),
+        "high" => Some("高"),
+        "xhigh" => Some("极"),
+        _ => None,
+    }
+}
+
 impl AgyAccountItem {
+    /// Masked account name by default (first 3 chars + `…`); full id (+ email) when revealed.
+    pub fn display_name(&self, revealed: bool) -> String {
+        if revealed {
+            if self.email.is_empty() {
+                self.id.clone()
+            } else {
+                format!("{} ({})", self.id, self.email)
+            }
+        } else {
+            mask_account_name(&self.id)
+        }
+    }
+
     pub fn matches_filter(&self, query_lower: &str) -> bool {
         if query_lower.is_empty() {
             return true;
