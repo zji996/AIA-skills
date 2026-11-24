@@ -767,6 +767,15 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
     if !s(&meta, "caller").is_empty() {
         out["caller"] = meta["caller"].clone();
     }
+    if !s(&meta, "resultReadAt").is_empty() {
+        out["resultReadAt"] = meta["resultReadAt"].clone();
+    }
+    if !s(&meta, "appliedAt").is_empty() {
+        out["appliedAt"] = meta["appliedAt"].clone();
+    }
+    if !s(&meta, "repliedAt").is_empty() {
+        out["repliedAt"] = meta["repliedAt"].clone();
+    }
     if let Some(bytes) = meta["worktreeBytes"].as_u64() {
         out["worktreeBytes"] = json!(bytes);
     }

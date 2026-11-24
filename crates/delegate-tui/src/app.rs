@@ -127,6 +127,7 @@ pub enum Overlay {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CollapseKind {
     StalePending,
+    Collected,
     MergedUncleaned,
     Stopped,
 }
@@ -452,11 +453,11 @@ impl App {
                             rows.push(ListRow::Run { repo_idx, run_idx });
                         }
                     }
-                    GroupKind::MergedUncleaned | GroupKind::Stopped => {
-                        let kind = if group == GroupKind::MergedUncleaned {
-                            CollapseKind::MergedUncleaned
-                        } else {
-                            CollapseKind::Stopped
+                    GroupKind::Collected | GroupKind::MergedUncleaned | GroupKind::Stopped => {
+                        let kind = match group {
+                            GroupKind::Collected => CollapseKind::Collected,
+                            GroupKind::MergedUncleaned => CollapseKind::MergedUncleaned,
+                            _ => CollapseKind::Stopped,
                         };
                         let expanded = self.expanded_folds.contains(&(repo.path.clone(), kind));
                         let newest_ago = idxs
@@ -1084,6 +1085,10 @@ impl App {
             self.filter.clear();
         }
         match target_group {
+            GroupKind::Collected => {
+                self.expanded_folds
+                    .insert((target_repo.clone(), CollapseKind::Collected));
+            }
             GroupKind::MergedUncleaned => {
                 self.expanded_folds
                     .insert((target_repo.clone(), CollapseKind::MergedUncleaned));

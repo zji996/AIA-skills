@@ -13,15 +13,17 @@ pub enum GroupKind {
     Pending,
     Running,
     Queued,
+    Collected,
     MergedUncleaned,
     Stopped,
 }
 
 impl GroupKind {
-    pub const ALL: [GroupKind; 5] = [
+    pub const ALL: [GroupKind; 6] = [
         GroupKind::Pending,
         GroupKind::Running,
         GroupKind::Queued,
+        GroupKind::Collected,
         GroupKind::MergedUncleaned,
         GroupKind::Stopped,
     ];
@@ -31,6 +33,7 @@ impl GroupKind {
             GroupKind::Pending => "待处理",
             GroupKind::Running => "运行中",
             GroupKind::Queued => "排队",
+            GroupKind::Collected => "已收取",
             GroupKind::MergedUncleaned => "已合未清",
             GroupKind::Stopped => "已停",
         }
@@ -517,6 +520,7 @@ pub struct RunItem {
     pub result_chars: usize,
     pub has_result: bool,
     pub has_worktree: bool,
+    pub result_read_at: Option<String>,
     pub finished_at: Option<String>,
     pub tokens_input: Option<u64>,
     pub tokens_output: Option<u64>,
@@ -551,7 +555,10 @@ impl RunItem {
         match self.group {
             GroupKind::Running => self.idle_seconds.unwrap_or(0),
             GroupKind::Queued => 0,
-            GroupKind::Pending | GroupKind::MergedUncleaned | GroupKind::Stopped => self
+            GroupKind::Pending
+            | GroupKind::Collected
+            | GroupKind::MergedUncleaned
+            | GroupKind::Stopped => self
                 .finished_ago_seconds
                 .or(self.age_seconds)
                 .unwrap_or(u64::MAX),
@@ -1694,6 +1701,7 @@ pub fn live_run_one_liner(run: &RunItem) -> String {
             }
             format!("需处理 · {}", run.state_badge())
         }
+        GroupKind::Collected => "已收取".to_string(),
         GroupKind::MergedUncleaned => "已合入待清理".to_string(),
         GroupKind::Stopped => "已停止".to_string(),
     }

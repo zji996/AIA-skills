@@ -1,0 +1,214 @@
+{
+  "expectedPendingCount": 9,
+  "expectedPendingRuns": [
+    "20261124-100001-write-delivered-unmerged",
+    "20261124-100002-write-delivered-unmerged-unread",
+    "20261124-100006-write-chain-done-child",
+    "20261124-100007-question-run",
+    "20261124-100008-question-write-run",
+    "20261124-100009-failed-unread",
+    "20261124-100011-rejected-unread",
+    "20261124-100013-readonly-answered-unread",
+    "20261124-100018-write-zero-change-unread"
+  ],
+  "expectedCollectedRuns": [
+    "20261124-100010-failed-read",
+    "20261124-100012-rejected-read",
+    "20261124-100014-readonly-answered-read",
+    "20261124-100015-cleaned-state",
+    "20261124-100016-cleaned-flag-delivered",
+    "20261124-100017-write-zero-change-read"
+  ],
+  "runs": [
+    {
+      "run": "20261124-100001-write-delivered-unmerged",
+      "name": "write-delivered-unmerged",
+      "mode": "write",
+      "state": "delivered",
+      "applied": false,
+      "changes": { "files": 2, "added": 10, "deleted": 1 },
+      "resultReadAt": "2026-11-24T10:00:00Z",
+      "finishedAt": "2026-11-24T09:59:00Z"
+    },
+    {
+      "run": "20261124-100002-write-delivered-unmerged-unread",
+      "name": "write-delivered-unmerged-unread",
+      "mode": "write",
+      "state": "delivered",
+      "applied": false,
+      "changes": { "files": 1, "added": 5, "deleted": 0 },
+      "finishedAt": "2026-11-24T09:58:00Z"
+    },
+    {
+      "run": "20261124-100003-write-delivered-applied",
+      "name": "write-delivered-applied",
+      "mode": "write",
+      "state": "delivered",
+      "applied": true,
+      "changes": { "files": 2, "added": 8, "deleted": 2 },
+      "resultReadAt": "2026-11-24T10:01:00Z",
+      "finishedAt": "2026-11-24T09:57:00Z"
+    },
+    {
+      "run": "20261124-100004-write-chain-parent",
+      "name": "write-chain-running",
+      "mode": "write",
+      "state": "delivered",
+      "applied": false,
+      "changes": { "files": 1, "added": 4, "deleted": 0 },
+      "finishedAt": "2026-11-24T09:50:00Z"
+    },
+    {
+      "run": "20261124-100004-write-chain-child",
+      "name": "reply to write-chain-running",
+      "parent": "20261124-100004-write-chain-parent",
+      "mode": "write",
+      "state": "running",
+      "applied": false
+    },
+    {
+      "run": "20261124-100005-write-chain-done-parent",
+      "name": "write-chain-done",
+      "mode": "write",
+      "state": "delivered",
+      "applied": false,
+      "changes": { "files": 1, "added": 3, "deleted": 0 },
+      "finishedAt": "2026-11-24T09:40:00Z"
+    },
+    {
+      "run": "20261124-100006-write-chain-done-child",
+      "name": "reply to write-chain-done",
+      "parent": "20261124-100005-write-chain-done-parent",
+      "mode": "write",
+      "state": "delivered",
+      "applied": false,
+      "changes": { "files": 2, "added": 7, "deleted": 1 },
+      "finishedAt": "2026-11-24T09:45:00Z"
+    },
+    {
+      "run": "20261124-100007-question-run",
+      "name": "question-run",
+      "mode": "read-only",
+      "state": "answered",
+      "question": true,
+      "applied": false,
+      "resultReadAt": "2026-11-24T10:02:00Z",
+      "finishedAt": "2026-11-24T09:56:00Z"
+    },
+    {
+      "run": "20261124-100008-question-write-run",
+      "name": "question-write-run",
+      "mode": "write",
+      "state": "delivered",
+      "question": true,
+      "applied": false,
+      "finishedAt": "2026-11-24T09:55:00Z"
+    },
+    {
+      "run": "20261124-100009-failed-unread",
+      "name": "failed-unread",
+      "mode": "write",
+      "state": "failed",
+      "applied": false,
+      "finishedAt": "2026-11-24T09:54:00Z"
+    },
+    {
+      "run": "20261124-100010-failed-read",
+      "name": "failed-read",
+      "mode": "write",
+      "state": "failed",
+      "applied": false,
+      "resultReadAt": "2026-11-24T10:05:00Z",
+      "finishedAt": "2026-11-24T09:53:00Z"
+    },
+    {
+      "run": "20261124-100011-rejected-unread",
+      "name": "rejected-unread",
+      "mode": "write",
+      "state": "rejected",
+      "applied": false,
+      "changes": { "files": 1, "added": 2, "deleted": 0 },
+      "finishedAt": "2026-11-24T09:52:00Z"
+    },
+    {
+      "run": "20261124-100012-rejected-read",
+      "name": "rejected-read",
+      "mode": "write",
+      "state": "rejected",
+      "applied": false,
+      "changes": { "files": 1, "added": 2, "deleted": 0 },
+      "resultReadAt": "2026-11-24T10:06:00Z",
+      "finishedAt": "2026-11-24T09:51:00Z"
+    },
+    {
+      "run": "20261124-100013-readonly-answered-unread",
+      "name": "readonly-answered-unread",
+      "mode": "read-only",
+      "state": "answered",
+      "applied": false,
+      "finishedAt": "2026-11-24T09:50:00Z"
+    },
+    {
+      "run": "20261124-100014-readonly-answered-read",
+      "name": "readonly-answered-read",
+      "mode": "read-only",
+      "state": "answered",
+      "applied": false,
+      "resultReadAt": "2026-11-24T10:10:00Z",
+      "finishedAt": "2026-11-24T09:49:00Z"
+    },
+    {
+      "run": "20261124-100015-cleaned-state",
+      "name": "cleaned-state",
+      "mode": "write",
+      "state": "cleaned",
+      "cleaned": true,
+      "applied": false,
+      "finishedAt": "2026-11-24T09:48:00Z"
+    },
+    {
+      "run": "20261124-100016-cleaned-flag-delivered",
+      "name": "cleaned-flag-delivered",
+      "mode": "write",
+      "state": "delivered",
+      "cleaned": true,
+      "applied": false,
+      "changes": { "files": 1, "added": 1, "deleted": 0 },
+      "finishedAt": "2026-11-24T09:47:00Z"
+    },
+    {
+      "run": "20261124-100017-write-zero-change-read",
+      "name": "write-zero-change-read",
+      "mode": "write",
+      "state": "delivered",
+      "applied": false,
+      "changes": { "files": 0, "added": 0, "deleted": 0 },
+      "resultReadAt": "2026-11-24T10:12:00Z",
+      "finishedAt": "2026-11-24T09:46:00Z"
+    },
+    {
+      "run": "20261124-100018-write-zero-change-unread",
+      "name": "write-zero-change-unread",
+      "mode": "write",
+      "state": "delivered",
+      "applied": false,
+      "changes": { "files": 0, "added": 0, "deleted": 0 },
+      "finishedAt": "2026-11-24T09:45:00Z"
+    },
+    {
+      "run": "20261124-100019-stopped-run",
+      "name": "stopped-run",
+      "mode": "write",
+      "state": "stopped",
+      "applied": false,
+      "finishedAt": "2026-11-24T09:44:00Z"
+    },
+    {
+      "run": "20261124-100020-queued-run",
+      "name": "queued-run",
+      "mode": "write",
+      "state": "queued",
+      "applied": false
+    }
+  ]
+}

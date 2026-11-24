@@ -514,8 +514,15 @@ class DelegateFriction1125Tests(unittest.TestCase):
         self.consume_events(repo)
         blk_both = self.run_stop_hook(repo)
         self.assertIsNotNone(blk_both)
-        self.assertIn("org-step3-storage", blk_both["reason"])
-        self.assertIn("org-step3-routes", blk_both["reason"])
+        # Single-item progressive Stop hook surfaces 1 of the 2 unmerged runs and folds the other into count;
+        # `delegate hook pending` lists both.
+        shown_one = ("org-step3-storage" in blk_both["reason"]) ^ ("org-step3-routes" in blk_both["reason"])
+        self.assertTrue(shown_one, blk_both["reason"])
+        self.assertIn("另有 1 件", blk_both["reason"])
+        pend_both = self.cli("hook", "pending", cwd=repo)
+        self.assertEqual(pend_both.returncode, 0, pend_both.stdout + pend_both.stderr)
+        self.assertIn("org-step3-storage", pend_both.stdout)
+        self.assertIn("org-step3-routes", pend_both.stdout)
 
         # Defer ONLY org-step3-storage by run ID -> work item state stays non-deferred, sibling still blocks!
         def_run = self.cli(

@@ -15,6 +15,8 @@
 | `wait [<run>...\|--all] [--since <SEQ>] [--max <时长>] [--no-result] [--full] [--progress]` | 无参和带名字的 `wait <run>...` 默认同 `--any`：返回上次 wait 之后所有进入终态或提问态的 run（首个给全文，其余给一行摘要加 `result` 命令）；`--since <SEQ>` 仅返回 `seq > SEQ` 的事件并输出新游标，同时更新 `cursors.json`；`--all` / `--until-all` 等全部（单次最多 50 分钟）。人读末行给本会话剩余数和原样重跑命令 |
 | `work [list\|show\|add\|wait\|close\|drop\|defer\|import-md\|import-dag] ...` | 统一工作表（7 态/6 列/卡片、`--class feat\|unblock\|infra\|docs`、`import-dag` 批量导依赖图、`--after-applied`、`owner:Qxx`、`--auto`、`defer`），见 [工作表](worktable.md) |
 | `fill stats [--since 24h] [--repo <路径>] [--all] [--json]` | 按当前 `fill.target` 统计 premerge 冲突率、返工率、未合入峰值、lane 排队占比、每 10 次交付 agy 周额度、只读 run 数与 agy 占比，并提示停止线（仅提醒不自动降档） |
+| `hook check [--format claude\|agy\|json] [--cwd <目录>]` | 零锁零 git Stop 钩子内核：单件渐进披露、卡链分与跨仓 30m 穿透、Claude/`agy` 双格式适配 |
+| `hook pending [--json] [--cwd <目录>]` | 按优先级每项一行列出全部待办类别、状态与下一步命令（第 2 层视图，只读不写冷却） |
 | `hook stats [--weeks N] [--json]` | 按周统计 Stop 钩子触发与去向（wait/apply/defer/忽略） |
 | `events [--since <SEQ>] [--follow] [--rebuild] [--json]` | 读/跟随全机事件流 `events.jsonl`；非 `--follow` 人读推进 `cursors.json`（`--json` 不推）；`--rebuild` 从 run 重建 |
 | `queue <add\|list\|remove\|cancel> ...` | 确定性 DAG 续派队列：支持 `--after`（上游交付通过且审查 `PASS`）与 `--after-applied`（上游合入后），零模型调用自动起下一步（`queue_dispatched`），异常暂停（`queue_paused`） |

@@ -655,6 +655,7 @@ fn render_toggle_fold_row(
                 format!("  {arrow} 更早 {count} 条{ago}")
             }
         }
+        CollapseKind::Collected => format!("{arrow} 已收取 {count} 条{ago}"),
         CollapseKind::MergedUncleaned => format!("{arrow} 已合未清 {count} 条{ago}"),
         CollapseKind::Stopped => format!("{arrow} 已停 {count} 条{ago}"),
     };
@@ -667,7 +668,9 @@ fn render_toggle_fold_row(
             CollapseKind::StalePending => Style::default()
                 .fg(STATUS_PENDING)
                 .add_modifier(Modifier::BOLD),
-            CollapseKind::MergedUncleaned | CollapseKind::Stopped => bold_primary(),
+            CollapseKind::Collected | CollapseKind::MergedUncleaned | CollapseKind::Stopped => {
+                bold_primary()
+            }
         };
         let avail = width.saturating_sub(2 + hint_w + 1);
         let clipped = truncate(&label, avail);
@@ -894,7 +897,10 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
         Some(c) => Style::default().fg(c),
         None => muted(),
     };
-    let name_style = if matches!(run.group, GroupKind::MergedUncleaned | GroupKind::Stopped) {
+    let name_style = if matches!(
+        run.group,
+        GroupKind::Collected | GroupKind::MergedUncleaned | GroupKind::Stopped
+    ) {
         muted()
     } else {
         primary()
@@ -1904,7 +1910,7 @@ fn group_status_color(group: GroupKind) -> Option<Color> {
         GroupKind::Pending => Some(STATUS_PENDING),
         GroupKind::Running => Some(STATUS_RUNNING),
         GroupKind::Queued => Some(STATUS_QUEUED),
-        GroupKind::MergedUncleaned | GroupKind::Stopped => None,
+        GroupKind::Collected | GroupKind::MergedUncleaned | GroupKind::Stopped => None,
     }
 }
 
@@ -1936,6 +1942,7 @@ fn run_glyph_color(run: &RunItem) -> (&'static str, Option<Color>) {
             ("●", Some(STATUS_RUNNING))
         }
         GroupKind::Queued => ("◔", Some(STATUS_QUEUED)),
+        GroupKind::Collected => ("✓", None),
         GroupKind::MergedUncleaned => ("○", None),
         GroupKind::Stopped => ("·", None),
         GroupKind::Pending => {

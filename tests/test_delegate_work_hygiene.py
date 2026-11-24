@@ -170,33 +170,39 @@ class DelegateWorkHygieneTests(unittest.TestCase):
         self.assertIsNone(self.run_stop_hook({"cwd": str(repo), "stop_hook_active": True}))
         self.assertFalse((self.state_dir() / "work-remind.json").exists())
 
-        # First run: picks 3 oldest (W005 12h, W004 10h, W002 5h), exact verbatim format
+        # First run: picks single oldest item (W005 12h), collapses remaining 3, records ONLY W005
         blk1 = self.run_stop_hook({"cwd": str(repo), "stop_hook_active": False})
         self.assertIsNotNone(blk1)
         self.assertEqual(blk1["decision"], "block")
-        lines = blk1["reason"].splitlines()
-        self.assertEqual(lines[0], "工作表有 3 项停着没动，本回合给每项一个去向：", lines)
-        self.assertEqual(lines[1], "[W005] 最老就绪十二小时 · 停 12 小时 · 就绪", lines)
-        self.assertEqual(lines[2], "[W004] 老化就绪十小时 · 停 10 小时 · 就绪", lines)
-        self.assertEqual(lines[3], "[W002] 老化待闭环 · 停 5 小时 · 待闭环", lines)
-        self.assertEqual(lines[4], EXPECTED_HINT_LINE, lines)
-        self.assertEqual(len(lines), 5, lines)
+        self.assertEqual(
+            blk1["reason"],
+            f"[W005] 最老就绪十二小时 就绪 12 小时没派。下一步：`delegate start --work W005 --prompt-file {brief}`（另有 3 件：`delegate hook pending`）",
+        )
         self.assertNotIn("Q01", blk1["reason"])
         self.assertNotIn("W001", blk1["reason"])
         self.assertNotIn("W003", blk1["reason"])
-
         remind_doc = json.loads((self.state_dir() / "work-remind.json").read_text(encoding="utf-8"))
-        self.assertEqual(set(remind_doc.keys()), {"W005", "W004", "W002"})
+        self.assertEqual(set(remind_doc.keys()), {"W005"})
 
-        # Second run immediately: W005/W004/W002 are in 6h cooldown -> now lists remaining W006 (缺说明)
+        # Subsequent runs: W004 (10h), W002 (5h), then W006 (缺说明, >1h) — one item per turn!
+        blk_w4 = self.run_stop_hook({"cwd": str(repo), "stop_hook_active": False})
+        self.assertEqual(
+            blk_w4["reason"],
+            f"[W004] 老化就绪十小时 就绪 10 小时没派。下一步：`delegate start --work W004 --prompt-file {brief}`（另有 2 件：`delegate hook pending`）",
+        )
+        blk_w2 = self.run_stop_hook({"cwd": str(repo), "stop_hook_active": False})
+        self.assertEqual(
+            blk_w2["reason"],
+            '[W002] 老化待闭环 待闭环 5 小时。下一步：`delegate work close W002 --evidence "…"`（另有 1 件：`delegate hook pending`）',
+        )
         blk2 = self.run_stop_hook({"cwd": str(repo), "stop_hook_active": False})
         self.assertIsNotNone(blk2)
-        lines2 = blk2["reason"].splitlines()
-        self.assertEqual(lines2[0], "工作表有 1 项停着没动，本回合给每项一个去向：", lines2)
-        self.assertEqual(lines2[1], "[W006] 缺说明就绪项 · 停 1 小时 · 缺说明", lines2)
-        self.assertEqual(lines2[2], EXPECTED_HINT_LINE, lines2)
+        self.assertEqual(
+            blk2["reason"],
+            "[W006] 缺说明就绪项 没有任务说明。下一步：`delegate work wait W006 --brief <文件>`",
+        )
 
-        # Third run immediately: all 4 eligible items are within 6h cooldown -> passes!
+        # Next run immediately: all 4 eligible items are within 6h cooldown -> passes!
         self.assertIsNone(self.run_stop_hook({"cwd": str(repo), "stop_hook_active": False}))
 
         # Backdate W006's remind time past 6h -> re-triggers; then fill brief via `work wait W006 --brief` -> clears!
@@ -467,12 +473,11 @@ class DelegateWorkHygieneTests(unittest.TestCase):
             },
         ])
 
-        # Trigger Stop hook -> records `hook: "work"` in stop-hook.jsonl
+        # Trigger Stop hook -> shows oldest 1 item (W003, 11h) and collapses W001/W002 into 另有 2 件
         blk = self.run_stop_hook({"cwd": str(repo), "stop_hook_active": False})
         self.assertIsNotNone(blk)
-        self.assertIn("W001", blk["reason"])
-        self.assertIn("W002", blk["reason"])
-        self.assertIn("W003", blk["reason"])
+        self.assertIn("[W003]", blk["reason"])
+        self.assertIn("另有 2 件：`delegate hook pending`", blk["reason"])
 
         # Follow up with close (W001), wait_on (W002), and 3x defer (W003)
         self.assertEqual(self.cli("work", "close", "W001", "--evidence", "已验", human=True).returncode, 0)
@@ -507,10 +512,23 @@ class DelegateWorkHygieneTests(unittest.TestCase):
         imp = self.cli("work", "import-md", str(md), cwd=repo, human=True)
         self.assertEqual(imp.returncode, 0, imp.stdout + imp.stderr)
 
-        # Imported ready item without brief is listed as 缺说明 in Stop hook
+        # Freshly imported ready item without brief is within 1h grace period -> does NOT alert yet
+        self.assertIsNone(self.run_stop_hook({"cwd": str(repo), "stop_hook_active": False}))
+
+        # Backdate past 1h grace period -> alerts as missing brief
+        wpath = self.state_dir() / "work.jsonl"
+        rows = []
+        for ln in wpath.read_text(encoding="utf-8").splitlines():
+            if ln.strip():
+                obj = json.loads(ln)
+                obj["createdAt"] = iso_ago(1.5)
+                obj["stateSince"] = iso_ago(1.5)
+                rows.append(json.dumps(obj, ensure_ascii=False))
+        wpath.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
         blk = self.run_stop_hook({"cwd": str(repo), "stop_hook_active": False})
         self.assertIsNotNone(blk)
-        self.assertIn("缺说明", blk["reason"])
+        self.assertIn("没有任务说明", blk["reason"])
         self.assertIn("清理无说明旧接口", blk["reason"])
 
         # Add brief via `work wait W001 --brief` -> clears missing-brief mark

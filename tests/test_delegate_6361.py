@@ -231,13 +231,12 @@ class Delegate6361Tests(unittest.TestCase):
         )
         self.until(lambda: (Path(started["dir"]) / "exit_code").exists(), "ro-default finished")
 
-        # 1) Stop hook blocks on `default` cursor (0).
+        # 1) Stop hook blocks on `default` cursor (0) with single-item unread delivery.
         blk = self.run_stop_hook(repo, default_env, session_id=None)
         self.assertIsNotNone(blk)
         self.assertEqual(blk["decision"], "block")
-        m = SUGGESTED_EVENTS_RE.search(blk["reason"])
-        self.assertIsNotNone(m, f"missing suggested command in: {blk['reason']}")
-        since_arg = m.group(1)
+        self.assertIn(f"ro-default 已交付待看。下一步：`delegate card {started['run']}`", blk["reason"])
+        since_arg = "0"
 
         # 2) `--json` leaves `default` cursor untouched -> still blocks.
         jres = self.run_delegate(["events", "--since", since_arg, "--json"], repo, default_env)

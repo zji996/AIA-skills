@@ -333,7 +333,8 @@ class Delegate625Tests(unittest.TestCase):
         self.assertIsNotNone(blocked)
         self.assertEqual(blocked["decision"], "block")
         self.assertIn("feat-a", blocked["reason"])
-        self.assertIn("delegate apply", blocked["reason"])
+        self.assertIn("delegate card", blocked["reason"])
+        self.assertIn("delegate work defer", blocked["reason"])
 
         # Add fresh deferral via `delegate work defer` -> passes without mutating disk in Stop hook.
         def_res = run_in(repo_a, "work", "defer", ra["run"], "--reason", "等上游窗口", "--until", "4h", human=True)
@@ -409,7 +410,8 @@ class Delegate625Tests(unittest.TestCase):
         cross_unmerged = hook(repo_a)
         self.assertIsNotNone(cross_unmerged)
         self.assertIn("【repo-beta】beta-feat", cross_unmerged["reason"])
-        self.assertIn("delegate apply", cross_unmerged["reason"])
+        self.assertIn("delegate card", cross_unmerged["reason"])
+        self.assertIn("delegate work defer", cross_unmerged["reason"])
 
 
 if __name__ == "__main__":

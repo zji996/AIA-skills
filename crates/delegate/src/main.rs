@@ -21,6 +21,7 @@ mod handoff;
 mod help;
 mod history;
 mod hook;
+mod hook_check;
 mod index;
 mod inotify;
 mod jobserver;

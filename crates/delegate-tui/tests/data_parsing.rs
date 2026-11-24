@@ -344,3 +344,51 @@ fn write_actions_only_generate_commands_and_filter_narrows_rows() {
     );
     assert!(cmd.contains("reply --when-done 20261120-031500-metrics"));
 }
+
+#[test]
+fn collected_readonly_and_cleaned_runs_fold_by_default_and_exclude_from_pending() {
+    let raw = r#"
+{"run":"20261124-100001-write-unmerged","name":"待合写任务","mode":"write","state":"delivered","applied":false,"changes":{"files":2,"added":10,"deleted":1},"ageSeconds":300,"elapsedSeconds":60}
+{"run":"20261124-100002-ro-read","name":"已读只读","mode":"read-only","state":"answered","applied":false,"resultReadAt":"2026-11-24T10:05:00Z","ageSeconds":400,"elapsedSeconds":30}
+{"run":"20261124-100003-ro-unread","name":"未读只读","mode":"read-only","state":"answered","applied":false,"ageSeconds":500,"elapsedSeconds":30}
+{"run":"20261124-100004-cleaned","name":"已清理","mode":"write","state":"cleaned","cleaned":true,"applied":false,"ageSeconds":600}
+"#;
+    let repo = parse_status_jsonl(Path::new("/home/dev/demo-api"), "~/demo-api", raw);
+    assert_eq!(repo.count_group(GroupKind::Pending), 2);
+    assert_eq!(repo.count_group(GroupKind::Collected), 2);
+
+    let mut app = App::new(
+        AppSnapshot {
+            repos: vec![repo],
+            ..AppSnapshot::default()
+        },
+        PathBuf::from("delegate"),
+        PathBuf::from("/home/dev/demo-api"),
+        5,
+    );
+    // Only the 2 Pending runs are visible by default; the 2 Collected runs are folded.
+    let visible_runs = app
+        .rows
+        .iter()
+        .filter(|r| matches!(r, ListRow::Run { .. }))
+        .count();
+    assert_eq!(visible_runs, 2);
+    assert!(app.rows.iter().any(|r| matches!(
+        r,
+        ListRow::ToggleFold {
+            kind: CollapseKind::Collected,
+            count: 2,
+            expanded: false,
+            ..
+        }
+    )));
+    // Move to Collected fold row and press Enter -> expands to 4 visible runs.
+    assert!(app.move_selection(2));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let visible_after = app
+        .rows
+        .iter()
+        .filter(|r| matches!(r, ListRow::Run { .. }))
+        .count();
+    assert_eq!(visible_after, 4);
+}

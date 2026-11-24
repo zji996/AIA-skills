@@ -99,7 +99,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "hook",
-        "Inspect Stop hook telemetry (<state>/stop-hook.jsonl): weekly trigger counts and post-block outcomes (hook stats).",
+        "Zero-lock Stop hook kernel (hook check --format claude|agy|json), prioritized pending backlog (hook pending), and weekly telemetry (hook stats).",
     ),
     (
         "events",
@@ -316,9 +316,13 @@ pub fn print(command: Option<&str>) -> bool {
             ("--all", "Aggregate across all repositories."),
             ("--json", "Print structured JSON output."),
         ]),
-        "hook" => ("stats [--weeks N] [--json]", "Read-only weekly Stop hook statistics from <state>/stop-hook.jsonl: trigger counts by hook type and post-block outcomes (waited / applied / deferred / ignored).", &[
-            ("stats", "Aggregate triggers and outcomes by ISO week."),
-            ("--weeks N", "Show only the most recent N weeks."),
+        "hook" => ("<check|pending|stats> [options]", "Zero-lock, zero-git Stop hook kernel: single-item turn-end guard (hook check), full prioritized backlog (hook pending), and weekly statistics (hook stats).", &[
+            ("check", "Evaluate Stop hook and emit at most one highest-priority item (--format claude|agy|json, --cwd PATH)."),
+            ("pending", "List all actionable pending items across categories in priority order (--json, --cwd PATH)."),
+            ("stats", "Aggregate weekly Stop hook triggers and outcomes (--weeks N, --json)."),
+            ("--format FORMAT", "Output format for `hook check`: claude (default), agy, or json."),
+            ("--cwd PATH", "Override working directory for `hook check` / `hook pending`."),
+            ("--weeks N", "Show only the most recent N weeks for `hook stats`."),
             ("--json", "Print structured JSON output."),
         ]),
         "note" => ("[<run> [text ... | --done [<index> ... | --all]]] [--all] [--json]", "Thin compatibility wrapper over the unified work table (<state>/work.jsonl) for attaching, listing, or completing post-merge todos on a run or reply chain.", &[

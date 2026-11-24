@@ -328,8 +328,7 @@ class DelegateStopHookReadStateTests(unittest.TestCase):
         self.until(lambda: (Path(r_chat["dir"]) / "exit_code").exists(), "chat-own finished")
         blk_own = self.run_stop_hook(repo, chat_env, session_id=chat_sid)
         self.assertIsNotNone(blk_own)
-        self.assertIn("chat-own", blk_own["reason"])
-        self.assertIn("属其他活跃会话，未拦截", blk_own["reason"])
+        self.assertIn(f"chat-own 已交付待看。下一步：`delegate card {r_chat['run']}`", blk_own["reason"])
         for foreign in ("main-ro", "main-wr", "main-q", "main-live"):
             self.assertNotIn(foreign, blk_own["reason"])
 
@@ -401,7 +400,7 @@ class DelegateStopHookReadStateTests(unittest.TestCase):
         # 3h < default 6h -> NOT yet eligible for takeover.
         self.assertIsNone(self.run_stop_hook(repo, chat_env, session_id=chat_sid))
 
-        # Configurable timeout = 2h (< 3h) -> takeover reminder APPEARS!
+        # Configurable timeout = 2h (< 3h) -> takeover reminder APPEARS (single item + 另有 1 件)!
         blk_cfg = self.run_stop_hook(
             repo,
             chat_env,
@@ -411,9 +410,9 @@ class DelegateStopHookReadStateTests(unittest.TestCase):
         self.assertIsNotNone(blk_cfg)
         self.assertEqual(blk_cfg["decision"], "block")
         self.assertIn("接盘", blk_cfg["reason"])
-        self.assertIn("delegate events --since", blk_cfg["reason"])
+        self.assertIn("delegate card", blk_cfg["reason"])
         self.assertIn("orphan-ro", blk_cfg["reason"])
-        self.assertIn("orphan-wr", blk_cfg["reason"])
+        self.assertIn("另有 1 件：`delegate hook pending`", blk_cfg["reason"])
 
         # Backdate to 7h (> default 6h) with NO env override -> default 6h triggers takeover!
         self.backdate_events_and_runs(7.0, [Path(r_ro["dir"]), Path(r_wr["dir"])])
@@ -421,10 +420,13 @@ class DelegateStopHookReadStateTests(unittest.TestCase):
         self.assertIsNotNone(blk_def)
         self.assertIn("接盘", blk_def["reason"])
         self.assertIn("orphan-ro", blk_def["reason"])
-        self.assertIn("orphan-wr", blk_def["reason"])
+        self.assertIn("另有 1 件：`delegate hook pending`", blk_def["reason"])
 
-        # Reading orphan-ro clears it; applying orphan-wr clears everything!
+        # Reading orphan-ro clears it and surfaces orphan-wr; applying orphan-wr clears everything!
         self.assertEqual(self.run_delegate(["result", r_ro["run"]], repo, chat_env).returncode, 0)
+        blk_wr = self.run_stop_hook(repo, chat_env, session_id=chat_sid)
+        self.assertIsNotNone(blk_wr)
+        self.assertIn("orphan-wr", blk_wr["reason"])
         self.assertEqual(self.run_delegate(["apply", r_wr["run"]], repo, chat_env).returncode, 0)
         self.assertIsNone(self.run_stop_hook(repo, chat_env, session_id=chat_sid))
 
@@ -459,8 +461,7 @@ class DelegateStopHookReadStateTests(unittest.TestCase):
         blk = self.run_stop_hook(repo, own_env, session_id=own_sid)
         self.assertIsNotNone(blk)
         self.assertEqual(blk["decision"], "block")
-        self.assertIn("delegate events --since 0", blk["reason"])
-        self.assertIn("own-fresh", blk["reason"])
+        self.assertIn(f"own-fresh 已交付待看。下一步：`delegate card {r_own['run']}`", blk["reason"])
         self.assertNotIn("接盘", blk["reason"])
 
         # Running `delegate events --since 0` as own_sid advances own_sid's cursor and clears block.
@@ -610,21 +611,30 @@ class DelegateStopHookReadStateTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        blk_chat = self.run_stop_hook(repo, chat_env, session_id=chat_sid)
-        self.assertIsNotNone(blk_chat)
-        self.assertNotIn("W001", blk_chat["reason"])
-        self.assertIn("[W002] 失联会话项", blk_chat["reason"])
-        self.assertIn("原会话已失效待接手", blk_chat["reason"])
-        self.assertIn("[W003] 无负责会话项", blk_chat["reason"])
+        # Progressive single-item: chat_sid sees W003 first (ownerless), then W002 (orphan);
+        # only the displayed item is recorded in work-remind.json per call!
+        blk_chat1 = self.run_stop_hook(repo, chat_env, session_id=chat_sid)
+        self.assertIsNotNone(blk_chat1)
+        self.assertNotIn("W001", blk_chat1["reason"])
+        self.assertIn("[W003] 无负责会话项", blk_chat1["reason"])
+        self.assertIn("另有 1 件：`delegate hook pending`", blk_chat1["reason"])
+
+        blk_chat2 = self.run_stop_hook(repo, chat_env, session_id=chat_sid)
+        self.assertIsNotNone(blk_chat2)
+        self.assertIn("[W002] 失联会话项", blk_chat2["reason"])
+        self.assertNotIn("另有", blk_chat2["reason"])
 
         # chat_sid is now in cooldown for W002 & W003...
         self.assertIsNone(self.run_stop_hook(repo, chat_env, session_id=chat_sid))
         # ...but third_sid has its OWN independent cooldown per (item x session) and STILL gets reminded!
-        blk_third = self.run_stop_hook(repo, third_env, session_id=third_sid)
-        self.assertIsNotNone(blk_third)
-        self.assertIn("W002", blk_third["reason"])
-        self.assertIn("W003", blk_third["reason"])
-        self.assertNotIn("W001", blk_third["reason"])
+        blk_third1 = self.run_stop_hook(repo, third_env, session_id=third_sid)
+        self.assertIsNotNone(blk_third1)
+        self.assertIn("W003", blk_third1["reason"])
+        self.assertNotIn("W001", blk_third1["reason"])
+        blk_third2 = self.run_stop_hook(repo, third_env, session_id=third_sid)
+        self.assertIsNotNone(blk_third2)
+        self.assertIn("W002", blk_third2["reason"])
+        self.assertNotIn("W001", blk_third2["reason"])
 
         remind_doc2 = json.loads((self.state_dir() / "work-remind.json").read_text(encoding="utf-8"))
         self.assertEqual(set(remind_doc2["W002"].keys()), {chat_sid, third_sid})

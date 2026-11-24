@@ -282,7 +282,11 @@ class Delegate639Tests(unittest.TestCase):
         waiter_proc.wait(timeout=5)
         blk_cur = run_hook(norvane, norvane_env, "sess-norvane")
         self.assertIsNotNone(blk_cur)
-        self.assertIn("body-stream", blk_cur["reason"])
+        self.assertIn("等 3 个委派在跑，没有挂等待", blk_cur["reason"])
+        self.assertTrue(
+            any(nm in blk_cur["reason"] for nm in ("body-stream", "star-selfheal", "body-motion-svc")),
+            blk_cur["reason"],
+        )
 
         # 4) Bare `delegate wait` and `delegate wait --any` must both be recognized!
         for wcmd in ("delegate wait", "delegate wait --any", f"{fixtures.DELEGATE} wait --any"):

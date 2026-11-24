@@ -24,7 +24,7 @@
   - `--class feat|unblock|infra|docs`（`add`/`wait`）：价值类别（功能/解锁/基建/文档）；缺类别不参与补位且 `work` 行尾标「缺类别」。
   - `--needs-owner <nod|act|card>`（`add`/`wait`）：建 `Qxx` 并挂 `owner:Qxx` 进 `blocked`；与 `--owner-kind <act|nod|card>` 均须填 `--ask`（非标题问句）、`--recommendation`、`--if-undecided`、`--cost`（`direction` 除外）；命中审批/对外/删除/不可逆等词且无前置仅警告。
   - `--needs-verify` / `--verify-on <COND>`（`add`/`wait`）：`apply` 默认自动关为 `done`（`closedKind: auto`）；仅显式 `--needs-verify`、未满足 `--verify-on`（`run_applied:`/`work_applied:`/`work_closed:`/`owner:`/`commit_exists:<sha>`，拒 `cmd:`）、`artifacts`、未勾 `followups`、仍有在跑/提问 run、合入未过 run、所有者项或 `apply --keep-open` 时留 `verify` 并说明原因。
-  - 缺说明：`add`/`import-md` 没带 `--brief` 照常进 `ready`，Stop 钩子与 TUI 标 `缺说明`，用 `work wait <Wxx> --brief <文件>` 补齐。
+  - 缺说明：`add`/`import-md` 没带 `--brief` 照常进 `ready`，建好 1 小时宽限后进入 Stop 钩子提醒，TUI 标 `缺说明`，用 `work wait <Wxx> --brief <文件>` 补齐。
 - `delegate work wait <Wxx|Qxx> [--class <类>] [--files <前缀>] [同上前置] [--needs-verify|--no-needs-verify] [--needs-owner nod|act|card ...] [--ask … --recommendation … --if-undecided … --cost …] [--verify-on <条件>] [--brief <文件>] [--clear]`：更新类别、路径、前置、闭环策略或说明（同态不重置 `state_since`）；可补齐 `Qxx` 四字段消「缺建议」。
 - `delegate work import-dag <FILE> [--dry-run] [--repo <目录>] [--json]`：读 `{"items":[{"key","title","class","brief","doneWhen","after":[key…],"files":[前缀…],"tier","model","thinking"}]}` 批量建项（`after` 转 `work_closed:`、`files` 存前缀并附 `--auto`）；`--dry-run` 仅预览；重 key、成环或 brief 缺失整批拒绝。
 - `delegate fill stats [--since 24h] [--repo <目录>] [--all] [--json]`：按 `fill.target` 报冲突率（`>10%`）、返工率（`>28.3%`）、未合入峰值（`>5`）、lane 排队占比（`>15%`）、每 10 交付 agy 周额度与只读占比；越线仅提醒不降档，放开节奏见 [容量](capacity.md)。
@@ -32,6 +32,8 @@
 - `delegate work close <Wxx|Qxx|Dxxx> --evidence "<SHA/测试/所有者结论>"` / `delegate apply --closes <Wxx> <run>`：带证据关闭（关闭所有者事项自动解锁等它的 `owner:Qxx` 下游）。
 - `delegate work drop <Wxx|Qxx|Dxxx> --reason "<放弃/否决理由>"`：留痕放弃/否决（不自动解锁下游，TUI 按 `x` 可查「已否」）。
 - `delegate work defer <Wxx|run> --reason "<原因>" --until <4h|24h|YYYY-MM-DD|ISO>`：暂缓工作项或将临时 run 升格为暂缓项（必须提供理由与到期时间，取代旧 `deferred.tsv`）；同一项连续暂缓 3 次在工作表标「反复暂缓」（只显示不拦截）。
+- `delegate hook check [--format claude|agy|json] [--cwd <目录>]`：零锁零 git Stop 钩子内核（第 1 层），单回合只拦最高优先级 1 件并把其余合进 `另有 N 件：delegate hook pending`；支持 Claude（`block`/静默）与 `agy`（`continue`/`{}`、跳过非 `NO_TOOL_CALL` 与同事进程）。
+- `delegate hook pending [--json] [--cwd <目录>]`：只读第 2 层全量待办视图，按优先级每项一行列出对象、状态与下一步命令（不消耗工作项冷却）。
 - `delegate hook stats [--weeks N] [--json]`：只读按周统计 `<state>/stop-hook.jsonl` 触发次数与处理去向（挂了 wait / apply 了 / defer 了 / close 了 / wait_on 了 / 被忽略了）。
 - `delegate work import-md <文件> [--dry-run] [--include-stale] [--repo <目录>] [--json]`：解析 Markdown 待办并比对 `history.jsonl` 标出疑似已合入/重复项，每条附源文件行号指针。
 
@@ -49,5 +51,5 @@
   - `apply`：立即求值 `run_applied`、`work_applied` 与 `work_closed`，打印被解锁的可执行 `start --work` 命令或自动派发结果、自动关项证据或留在 `verify` 的具体原因（`--keep-open` 强制留 `verify`）。
   - `merge`：提示本次批次合入落盘后将解锁哪些下游项。
   - `clean`：对未关闭工作项印 1 行保留确认，不阻断清理、不写 Stop hook 拦截事件。
-- **Stop Hook 合一与分级**：`hooks/claude-code-stop.py` 为唯一 Stop 钩子，严格零锁、零 git 只读 `state/index.json` 与快照，保留按 caller 隔离游标；已合入、已 clean、已回复或已被任一会话读过结论（`resultReadAt`）的交付/提问类事件直接判旧放行，非本会话发起的 run 仅在原 caller 失效且超过无人认领阈值（默认 `DEFAULT_ORPHAN_TAKEOVER_HOURS=6h`，可由 `DELEGATE_ORPHAN_TAKEOVER_HOURS` 配置）时拦截接盘，否则只计数不拦；无更高优阻断且本仓库有空闲位时，工作项老化提醒只拦最近 `add`/`wait`/`start --work` 的负责会话（未记录或负责会话失效超时后才允许接手），`<state>/work-remind.json` 按「项 × 会话」维护 6h 冷却；延后统一走 `delegate work defer`，每次拦截写入 `<state>/stop-hook.jsonl` 供 `delegate hook stats` 统计。已 clean/归档的 run 不再影响工作项状态，零改动交付在工作表里显示为「已收取」。
+- **Stop Hook 渐进披露、卡链升级与 TUI 一致口径**：`hooks/claude-code-stop.py` 缩为薄壳委托 `delegate hook check --format claude`，与 `hook pending`、`delegate-tui` 共用同一「待处理」规则（仅计未合入非零改写 run、提问、未读失败/被拒与未读只读答复；已读只读与 `cleaned` 归 TUI 默认折叠的「已收取」，续做链被取代轮次不计）。钩子严格零锁零 git，保留按 caller 隔离游标、W058 判旧/6h 接盘与同终端/目录 `adopt` 提示；优先级为 提问 > 卡链阻塞（`卡链分 = 传递阻塞下游数 × 等待分钟`，沿 `parent` 链归根；挡下游 ≥1 且原 caller 失效或满 30m 未 `defer` 时跨仓跨会话穿透带可执行命令；挡下游 `verify` 阈值 30m 且所有 `verify` 不受空闲位门控，`blocked` 项本身不报警）> 未读交付 > 在跑无人等 > 已交付未合入 > 工作项（缺说明建好 1h 宽限后提醒；冷却仍按「项 × 会话」6h 且仅把真正显示出的那 1 项记为已提醒）。每次拦截写入 `<state>/stop-hook.jsonl` 供 `delegate hook stats` 统计。
 - **自动迁移**：升级或读写 `work.jsonl` 时自动幂等迁入已登记仓库未完成的 `notes.json`（入 `verify`）与未过期的历史 `deferred.tsv`（入 `deferred`），遇旧 `manual:` 前置一次性去掉、原文按「原手动前置：…」追加进 `followup`、无其他未满足前置即转 `ready` 并写回与记一条 `work_migrated` 事件；Stop hook 不再读取 `deferred.tsv`；`delegate note` 保留为薄壳读写 `work.jsonl`。

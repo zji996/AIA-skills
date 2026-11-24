@@ -137,13 +137,13 @@ class Delegate628Tests(unittest.TestCase):
         blocked = hook()
         self.assertIsNotNone(blocked)
         self.assertEqual(blocked["decision"], "block")
-        self.assertIn("有新事件，先看 delegate events --since 0", blocked["reason"])
+        self.assertIn(f"bg-one 已交付待看。下一步：`delegate card {r1['run']}`", blocked["reason"])
 
         # Reading with `result --no-mark` (used by TUI) MUST NOT advance the cursor!
         self.assertEqual(run_in("result", "--no-mark", r1["run"], human=True).returncode, 0)
         still_blocked = hook()
         self.assertIsNotNone(still_blocked)
-        self.assertIn("有新事件，先看 delegate events --since 0", still_blocked["reason"])
+        self.assertIn(f"bg-one 已交付待看。下一步：`delegate card {r1['run']}`", still_blocked["reason"])
 
         # Reading with `result` (normal) advances cursor -> Stop hook clears!
         self.assertEqual(run_in("result", r1["run"], human=True).returncode, 0)
@@ -155,10 +155,10 @@ class Delegate628Tests(unittest.TestCase):
         r2 = self.outcome(run_in("start", "--read-only", "--name", "bg-two", "task 2"))
         self.until(lambda: (Path(r2["dir"]) / "exit_code").exists(), "r2 finished")
 
-        # Race lock triggers again with exact previous cursor N!
+        # Race lock triggers again on unread delivery!
         blocked2 = hook()
         self.assertIsNotNone(blocked2)
-        self.assertIn(f"有新事件，先看 delegate events --since {cursor_before}", blocked2["reason"])
+        self.assertIn(f"bg-two 已交付待看。下一步：`delegate card {r2['run']}`", blocked2["reason"])
 
         w = run_in("wait", "--since", str(cursor_before), "--json")
         self.assertEqual(w.returncode, 0, w.stderr)

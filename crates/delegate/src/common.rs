@@ -61,7 +61,7 @@ fn env_nonempty(name: &str) -> Option<String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
-fn is_antigravity_agent_with(get: impl Fn(&str) -> Option<String>) -> bool {
+pub(crate) fn is_antigravity_agent_with(get: impl Fn(&str) -> Option<String>) -> bool {
     get("ANTIGRAVITY_AGENT")
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
@@ -93,7 +93,7 @@ pub fn caller() -> Option<String> {
     caller_source().map(|(id, _)| id)
 }
 
-fn proc_stat_state_ppid_ticks_tty(pid: u32) -> Option<(char, u32, u64, i32)> {
+pub(crate) fn proc_stat_state_ppid_ticks_tty(pid: u32) -> Option<(char, u32, u64, i32)> {
     let txt = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rparen = txt.rfind(')')?;
     let fields: Vec<&str> = txt.get(rparen + 2..)?.split_whitespace().collect();
@@ -105,7 +105,7 @@ fn proc_stat_state_ppid_ticks_tty(pid: u32) -> Option<(char, u32, u64, i32)> {
     Some((state, ppid, ticks, tty_nr))
 }
 
-fn pid_alive_with_ticks(pid: u32, expected_ticks: Option<u64>) -> bool {
+pub(crate) fn pid_alive_with_ticks(pid: u32, expected_ticks: Option<u64>) -> bool {
     if !pid_alive(pid as i32) {
         return false;
     }
@@ -185,7 +185,7 @@ fn is_harness_cmdline(pid: u32, source: Option<&str>) -> bool {
     false
 }
 
-fn find_session_harness_pid(source: Option<&str>) -> Option<(u32, u64, i32)> {
+pub(crate) fn find_session_harness_pid(source: Option<&str>) -> Option<(u32, u64, i32)> {
     if env::var("DELEGATE_SESSION_HARNESS_PID").ok().as_deref() == Some("0") {
         return None;
     }
@@ -206,7 +206,7 @@ fn find_session_harness_pid(source: Option<&str>) -> Option<(u32, u64, i32)> {
     None
 }
 
-fn current_terminal_id(harness_tty_nr: i32) -> Option<String> {
+pub(crate) fn current_terminal_id(harness_tty_nr: i32) -> Option<String> {
     for (env_key, prefix) in [
         ("TMUX_PANE", "tmux"),
         ("TERM_SESSION_ID", "term"),

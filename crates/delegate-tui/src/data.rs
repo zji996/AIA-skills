@@ -737,6 +737,7 @@ pub fn parse_status_jsonl_at(
             chain_round,
             chain_ids,
             root_name.as_deref(),
+            &by_id,
             now_epoch,
         ));
     }
@@ -750,7 +751,10 @@ pub fn parse_status_jsonl_at(
                     .age_seconds
                     .unwrap_or(u64::MAX)
                     .cmp(&b.age_seconds.unwrap_or(u64::MAX)),
-                GroupKind::Pending | GroupKind::MergedUncleaned | GroupKind::Stopped => a
+                GroupKind::Pending
+                | GroupKind::Collected
+                | GroupKind::MergedUncleaned
+                | GroupKind::Stopped => a
                     .last_activity_seconds()
                     .cmp(&b.last_activity_seconds()),
             })
@@ -801,6 +805,7 @@ fn strip_reply_prefixes(s: &str) -> String {
     single_line(cur)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_run_item(
     v: &Value,
     repo_path: &Path,
@@ -808,6 +813,7 @@ fn parse_run_item(
     chain_round: usize,
     chain_ids: Vec<String>,
     root_name: Option<&str>,
+    by_id: &HashMap<String, &Value>,
     now_epoch: Option<i64>,
 ) -> RunItem {
     let run = v
@@ -835,8 +841,21 @@ fn parse_run_item(
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string();
+    let mode = v
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let applied = v.get("applied").and_then(Value::as_bool).unwrap_or(false);
+    let cleaned = v.get("cleaned").and_then(Value::as_bool).unwrap_or(false) || state == "cleaned";
     let question = v.get("question").and_then(Value::as_bool).unwrap_or(false);
+    let result_read_at = v
+        .get("resultReadAt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let zero_change = is_zero_change_delivery(v, by_id);
     let queue_obj = v.get("queue").filter(|q| q.is_object());
     let queue_reason = queue_obj
         .and_then(|q| q.get("reason"))
@@ -847,7 +866,13 @@ fn parse_run_item(
 
     let group = classify_group(
         &state,
+        &mode,
         applied,
+        cleaned,
+        question,
+        result_read_at.is_some(),
+        false,
+        zero_change,
         queue_obj.is_some() || measure_waiting_ahead.is_some(),
     );
 
@@ -857,11 +882,6 @@ fn parse_run_item(
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let mode = v
-        .get("mode")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
 
     let changes = v.get("changes");
     let changes_files = changes
@@ -1042,6 +1062,7 @@ fn parse_run_item(
         result_chars,
         has_result,
         has_worktree,
+        result_read_at,
         finished_at,
         tokens_input,
         tokens_output,
@@ -1100,9 +1121,124 @@ fn parse_premerge(v: Option<&Value>) -> Option<PremergeInfo> {
     })
 }
 
-fn classify_group(state: &str, applied: bool, has_queue: bool) -> GroupKind {
+fn is_zero_change_delivery(v: &Value, by_id: &HashMap<String, &Value>) -> bool {
+    if v.get("state").and_then(Value::as_str) != Some("delivered") {
+        return false;
+    }
+    if v.get("mode").and_then(Value::as_str) != Some("write") {
+        return false;
+    }
+    if let Some(files) = v
+        .get("pendingChanges")
+        .and_then(|p| p.get("files"))
+        .and_then(Value::as_u64)
+    {
+        return files == 0;
+    }
+    let cur_changes = v
+        .get("changes")
+        .and_then(|c| c.get("files"))
+        .and_then(Value::as_u64);
+    if cur_changes.is_some_and(|n| n > 0) {
+        return false;
+    }
+    let wt = v.get("worktree").and_then(Value::as_str).unwrap_or("");
+    let mut parent = v
+        .get("parent")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let mut visited = HashSet::new();
+    while !parent.is_empty() && visited.insert(parent.clone()) {
+        let Some(anc) = by_id.get(&parent) else {
+            break;
+        };
+        if anc.get("applied").and_then(Value::as_bool).unwrap_or(false) {
+            break;
+        }
+        if !wt.is_empty() && anc.get("worktree").and_then(Value::as_str).unwrap_or("") != wt {
+            break;
+        }
+        if anc
+            .get("pendingChanges")
+            .and_then(|p| p.get("files"))
+            .and_then(Value::as_u64)
+            .is_some_and(|n| n > 0)
+        {
+            return false;
+        }
+        if anc
+            .get("changes")
+            .and_then(|c| c.get("files"))
+            .and_then(Value::as_u64)
+            .is_some_and(|n| n > 0)
+        {
+            return false;
+        }
+        parent = anc
+            .get("parent")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+    }
+    if let Some(files) = cur_changes {
+        return files == 0;
+    }
+    if let Some(files) = v.get("files").and_then(Value::as_array) {
+        return files.is_empty();
+    }
+    false
+}
+
+/// Shared actionable-pending rule (mirrored in `delegate` hook kernel):
+/// - Counted: unapplied write delivery (non-zero-change, not superseded); questioning run;
+///   failed/rejected/terminal-error run whose result has not been read (`resultReadAt` empty);
+///   read-only `answered` (or zero-change delivery) whose result has not been read.
+/// - Excluded: read-only `answered` with `resultReadAt` (goes to `Collected`/已收取);
+///   `cleaned`; superseded rounds in a continuation chain; applied; stopped; active runs.
+#[allow(clippy::too_many_arguments)]
+pub fn is_run_pending_actionable(
+    state: &str,
+    mode: &str,
+    applied: bool,
+    cleaned: bool,
+    question: bool,
+    result_read: bool,
+    superseded: bool,
+    zero_change: bool,
+) -> bool {
+    if superseded || cleaned || state == "cleaned" || applied {
+        return false;
+    }
+    if matches!(
+        state,
+        "running" | "starting" | "waiting" | "queued" | "stopped" | "blocked_mainline"
+    ) {
+        return false;
+    }
+    if question {
+        return true;
+    }
+    if state == "delivered" && mode == "write" {
+        return if zero_change { !result_read } else { true };
+    }
+    !result_read
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_group(
+    state: &str,
+    mode: &str,
+    applied: bool,
+    cleaned: bool,
+    question: bool,
+    result_read: bool,
+    superseded: bool,
+    zero_change: bool,
+    has_queue: bool,
+) -> GroupKind {
     match state {
-        "waiting" | "queued" => GroupKind::Queued,
+        "waiting" | "queued" | "blocked_mainline" => GroupKind::Queued,
         "running" | "starting" => {
             if has_queue {
                 GroupKind::Queued
@@ -1117,12 +1253,25 @@ fn classify_group(state: &str, applied: bool, has_queue: bool) -> GroupKind {
                 GroupKind::Stopped
             }
         }
-        "cleaned" => GroupKind::Pending,
+        "cleaned" => GroupKind::Collected,
         _ => {
-            if applied {
+            if cleaned {
+                GroupKind::Collected
+            } else if applied {
                 GroupKind::MergedUncleaned
-            } else {
+            } else if is_run_pending_actionable(
+                state,
+                mode,
+                applied,
+                cleaned,
+                question,
+                result_read,
+                superseded,
+                zero_change,
+            ) {
                 GroupKind::Pending
+            } else {
+                GroupKind::Collected
             }
         }
     }
@@ -2882,5 +3031,60 @@ mod snapshot_tests {
         assert_eq!(snap.events.len(), 1);
         assert_eq!(snap.events[0].seq, 42);
         assert_eq!(snap.lane.max_heavy, Some(2));
+    }
+
+    #[test]
+    fn shared_pending_classification_fixture_matches_tui_groups() {
+        let fixture_raw = include_str!("../../../tests/fixtures/pending_classification.json");
+        let doc: Value = serde_json::from_str(fixture_raw).expect("valid shared fixture json");
+        let expected_count = doc["expectedPendingCount"].as_u64().unwrap() as usize;
+        let mut expected_pending: Vec<String> = doc["expectedPendingRuns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        expected_pending.sort();
+        let mut expected_collected: Vec<String> = doc["expectedCollectedRuns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        expected_collected.sort();
+
+        let mut jsonl = String::new();
+        for item in doc["runs"].as_array().unwrap() {
+            jsonl.push_str(&item.to_string());
+            jsonl.push('\n');
+        }
+        let repo = parse_status_jsonl_at(
+            Path::new("/tmp/fixture-repo"),
+            "fixture-repo",
+            &jsonl,
+            Some(1_795_430_000),
+        );
+
+        let mut actual_pending: Vec<String> = repo
+            .runs
+            .iter()
+            .filter(|r| r.group == GroupKind::Pending)
+            .map(|r| r.run.clone())
+            .collect();
+        actual_pending.sort();
+        let mut actual_collected: Vec<String> = repo
+            .runs
+            .iter()
+            .filter(|r| r.group == GroupKind::Collected)
+            .map(|r| r.run.clone())
+            .collect();
+        actual_collected.sort();
+
+        assert_eq!(repo.count_group(GroupKind::Pending), expected_count);
+        assert_eq!(actual_pending, expected_pending);
+        assert_eq!(actual_collected, expected_collected);
+        assert_eq!(GroupKind::Collected.label(), "已收取");
     }
 }

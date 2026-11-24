@@ -533,7 +533,17 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
         let run_dirs = runs::all_runs_in_with_index(&runs_dir, &index);
         let mut run_statuses = Vec::with_capacity(run_dirs.len());
         for run in &run_dirs {
-            let mut st = status_cached(run, &index, &wsig);
+            let (mut st, idx_meta) = status_and_meta_cached(run, &index, &wsig);
+            for key in ["resultReadAt", "appliedAt", "repliedAt"] {
+                if s(&st, key).is_empty() && !s(&idx_meta, key).is_empty() {
+                    st[key] = idx_meta[key].clone();
+                }
+            }
+            if !run.join(".generate-pending").exists()
+                && (b(&idx_meta, "appliedCleaned") || !s(&st, "appliedAt").is_empty())
+            {
+                st["applied"] = json!(true);
+            }
             crate::premerge::overlay_live_status(&mut st, run, &mut head_cache);
             let rid = s(&st, "run").to_string();
             if !rid.is_empty() {

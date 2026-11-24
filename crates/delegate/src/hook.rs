@@ -694,12 +694,16 @@ pub fn render_stats_human(doc: &Value) -> String {
 
 pub fn command(args: &[String]) -> Res<i32> {
     let Some((first, rest)) = args.split_first() else {
-        return Err("usage: delegate hook stats [--weeks N] [--json]".into());
+        return Err(
+            "usage: delegate hook <check|pending|stats> [options]".into(),
+        );
     };
     match first.as_str() {
+        "check" => crate::hook_check::check_cmd(rest),
+        "pending" => crate::hook_check::pending_cmd(rest),
         "stats" => stats_cmd(rest),
         other => Err(format!(
-            "unknown hook subcommand '{other}' (expected: stats)"
+            "unknown hook subcommand '{other}' (expected: check, pending, stats)"
         )),
     }
 }

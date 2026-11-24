@@ -731,7 +731,8 @@ class Delegate632Tests(unittest.TestCase):
             self.assertIsNone(holder.poll(), "holder should still be holding .state.lock")
             decision = json.loads(hook_res.stdout)
             self.assertEqual(decision["decision"], "block")
-            self.assertIn("snap-run", decision["reason"])
+            self.assertIn("wake 已交付待看", decision["reason"])
+            self.assertIn("另有 1 件：`delegate hook pending`", decision["reason"])
         finally:
             release_file.touch()
             holder.wait(timeout=5)
