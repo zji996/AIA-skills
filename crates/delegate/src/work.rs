@@ -265,6 +265,7 @@ pub struct WorkItem {
     pub state: String,
     pub closed_kind: String,
     pub done_when: String,
+    pub needs_verify: bool,
     pub wait_on: Vec<String>,
     pub verify_on: Vec<String>,
     pub auto_dispatch: Option<AutoDispatch>,
@@ -297,7 +298,7 @@ impl WorkItem {
     }
 
     pub fn has_open_closure(&self) -> bool {
-        !self.done_when.trim().is_empty()
+        self.needs_verify
             || !self.verify_on.is_empty()
             || !self.artifacts.is_empty()
             || self.pending_followups() > 0
@@ -423,6 +424,7 @@ impl WorkItem {
             state,
             closed_kind: s(v, "closedKind").to_string(),
             done_when: s(v, "doneWhen").to_string(),
+            needs_verify: b(v, "needsVerify"),
             wait_on: strings(&v["waitOn"]),
             verify_on: strings(&v["verifyOn"]),
             auto_dispatch: AutoDispatch::from_value(&v["autoDispatch"]),
@@ -472,6 +474,9 @@ impl WorkItem {
         }
         if !self.done_when.is_empty() {
             obj["doneWhen"] = json!(self.done_when);
+        }
+        if self.needs_verify {
+            obj["needsVerify"] = json!(true);
         }
         if !self.verify_on.is_empty() {
             obj["verifyOn"] = json!(self.verify_on);
@@ -1841,6 +1846,25 @@ fn evaluate_condition_with_prefetch(
             pointer: format!("delegate show {run_ref}"),
         };
     }
+    if let Some(wid) = cond.strip_prefix("work_applied:") {
+        let norm = normalize_work_id(wid).unwrap_or_else(|| wid.to_string());
+        let target = all_items.iter().find(|w| w.id == norm);
+        let (ok, detail) = match target {
+            Some(w) if w.state == "done" && w.closed_kind == "dropped" => {
+                (false, format!("工作项 {norm} 已放弃（需人工确认）"))
+            }
+            Some(w) if w.applied => (true, format!("工作项 {norm} 已合入")),
+            Some(w) if w.state == "done" => (true, format!("工作项 {norm} 已关闭")),
+            Some(w) => (false, format!("等 {norm} 合入（当前 {}）", w.state)),
+            None => (false, format!("找不到工作项 {norm}")),
+        };
+        return CondEval {
+            raw: cond.to_string(),
+            satisfied: ok,
+            detail,
+            pointer: format!("delegate work show {norm}"),
+        };
+    }
     if let Some(wid) = cond.strip_prefix("work_closed:") {
         let norm = normalize_work_id(wid).unwrap_or_else(|| wid.to_string());
         let target = all_items.iter().find(|w| w.id == norm);
@@ -2103,8 +2127,10 @@ fn reconcile_all_locked_with_prefetch(
                         && s(&meta, "resultReadAt").is_empty()
                     {
                         live_state = Some("attention".into());
-                    } else if is_applied {
+                    } else if is_applied && !item.applied {
                         item.applied = true;
+                        any_auto_closed = true;
+                        out.changed = true;
                     }
                 }
             }
@@ -2191,9 +2217,16 @@ fn reconcile_all_locked_with_prefetch(
                 }
             }
 
-            // 4b. Auto-close `verify` items when all `verify_on` conditions are satisfied.
+            // 4b. Auto-close `verify` items when all `verify_on` conditions are satisfied
+            // and no other structural closure blockers remain.
             // Items in `verify` without `verify_on` never auto-close here.
-            if item.state == "verify" && !item.verify_on.is_empty() {
+            if item.state == "verify"
+                && !item.verify_on.is_empty()
+                && !item.needs_verify
+                && item.artifacts.is_empty()
+                && item.pending_followups() == 0
+                && item.owner.is_none()
+            {
                 let evals: Vec<CondEval> = item
                     .verify_on
                     .iter()
@@ -2485,7 +2518,7 @@ pub fn load_readonly_json(state: &Path) -> Vec<Value> {
         .collect()
 }
 
-fn load_readonly_in(state: &Path) -> Vec<WorkItem> {
+pub fn load_readonly_in(state: &Path) -> Vec<WorkItem> {
     let mut items = load_raw(state);
     if needs_legacy_migration(state) {
         let _ = migrate_legacy_impl(state, &mut items, false);
@@ -2736,10 +2769,18 @@ pub fn on_run_result_read(run: &Path, meta: &Value) {
     let _ = emit_reconcile_events_and_dispatch(&state, &outcome);
 }
 
-fn verify_reasons(item: &WorkItem) -> Vec<String> {
+fn verify_reasons_with_extra(item: &WorkItem, extra: &[String]) -> Vec<String> {
     let mut parts = Vec::new();
-    if !item.done_when.trim().is_empty() {
-        parts.push(format!("完成条件：{}", clip_chars(&item.done_when, 48)));
+    for r in extra {
+        if !r.trim().is_empty() && !parts.contains(r) {
+            parts.push(r.clone());
+        }
+    }
+    if item.needs_verify {
+        let label = "标记了 --needs-verify".to_string();
+        if !parts.contains(&label) {
+            parts.push(label);
+        }
     }
     if !item.verify_on.is_empty() {
         parts.push(format!("{} 条闭环条件待满足", item.verify_on.len()));
@@ -2762,6 +2803,260 @@ fn verify_reasons(item: &WorkItem) -> Vec<String> {
     parts
 }
 
+/// Walk a run's `parent` chain up to its root run, returning `[leaf_id, parent_id, ..., root_id]`.
+/// Strictly read-only, zero locks, zero writes.
+pub fn run_chain_ids_from_dir(run_dir: &Path, state: &Path) -> Vec<String> {
+    let meta = json(run_dir.join("meta.json"));
+    let rid = events::run_id_for(run_dir, &meta);
+    let repo_hint = {
+        let r = events::repo_for_meta(&meta);
+        (!r.is_empty()).then_some(r)
+    };
+    let runs_parent = run_dir.parent();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    if !rid.is_empty() && seen.insert(rid.clone()) {
+        out.push(rid);
+    }
+    let mut cur_parent = s(&meta, "parent").trim().to_string();
+    let empty_dirs = BTreeMap::new();
+    for _ in 0..64 {
+        if cur_parent.is_empty() || !seen.insert(cur_parent.clone()) {
+            break;
+        }
+        out.push(cur_parent.clone());
+        let next_meta = runs_parent
+            .map(|p| p.join(&cur_parent).join("meta.json"))
+            .filter(|p| p.is_file())
+            .map(json)
+            .or_else(|| {
+                find_live_run_dir(&cur_parent, &empty_dirs, state)
+                    .map(|d| json(d.join("meta.json")))
+            })
+            .or_else(|| find_archived_record(&cur_parent).map(|d| json(d.join("meta.json"))))
+            .or_else(|| history_entry_for_run(&cur_parent, state, repo_hint.as_deref()));
+        cur_parent = next_meta
+            .as_ref()
+            .map(|m| s(m, "parent").trim().to_string())
+            .unwrap_or_default();
+    }
+    out
+}
+
+/// Walk a run ID's `parent` chain up to its root run without requiring a pre-resolved directory.
+/// Strictly read-only, zero locks, zero writes.
+pub fn run_chain_ids_for_ref(rid: &str, repo_hint: Option<&str>, state: &Path) -> Vec<String> {
+    let trimmed = rid.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let empty_dirs = BTreeMap::new();
+    if let Some(dir) = find_run_dir(trimmed, &empty_dirs, state) {
+        return run_chain_ids_from_dir(&dir, state);
+    }
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cur = trimmed.to_string();
+    for _ in 0..64 {
+        if cur.is_empty() || !seen.insert(cur.clone()) {
+            break;
+        }
+        out.push(cur.clone());
+        let next_meta = find_archived_record(&cur)
+            .map(|d| json(d.join("meta.json")))
+            .or_else(|| history_entry_for_run(&cur, state, repo_hint));
+        cur = next_meta
+            .as_ref()
+            .map(|m| s(m, "parent").trim().to_string())
+            .unwrap_or_default();
+    }
+    out
+}
+
+/// Compute the sorted, deduplicated list of work item IDs transitively blocked by a run
+/// (matching any ID along its `parent` chain as well as any owning work item IDs).
+/// Strictly pure in-memory calculation over `items`.
+pub fn blocked_downstream_in(
+    items: &[WorkItem],
+    chain_ids: &[String],
+    owning_work_ids: &[String],
+) -> Vec<String> {
+    if items.is_empty() || (chain_ids.is_empty() && owning_work_ids.is_empty()) {
+        return Vec::new();
+    }
+    let by_id: HashMap<&str, &WorkItem> = items.iter().map(|w| (w.id.as_str(), w)).collect();
+
+    let mut owning_set: HashSet<String> = HashSet::new();
+    for wid in owning_work_ids {
+        if let Some(norm) = normalize_work_id(wid) {
+            owning_set.insert(norm);
+        } else if !wid.is_empty() {
+            owning_set.insert(wid.clone());
+        }
+    }
+    for w in items {
+        if chain_ids.iter().any(|cid| w.matches_run(cid)) {
+            owning_set.insert(w.id.clone());
+        }
+    }
+
+    // Build active blocking adjacency: upstream_work_id -> downstream_work_ids
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    for w in items {
+        if w.state == "done" {
+            continue;
+        }
+        for cond in &w.wait_on {
+            if let Some(raw) = cond.strip_prefix("work_applied:") {
+                if let Some(u) = normalize_work_id(raw) {
+                    if by_id
+                        .get(u.as_str())
+                        .is_some_and(|t| !t.applied && t.state != "done")
+                    {
+                        adj.entry(u).or_default().push(w.id.clone());
+                    }
+                }
+            } else if let Some(raw) = cond.strip_prefix("work_closed:") {
+                if let Some(u) = normalize_work_id(raw) {
+                    if by_id.get(u.as_str()).is_some_and(|t| t.state != "done") {
+                        adj.entry(u).or_default().push(w.id.clone());
+                    }
+                }
+            } else if let Some(raw) = cond.strip_prefix("owner:") {
+                if let Some(u) = normalize_work_id(raw) {
+                    if by_id.get(u.as_str()).is_some_and(|t| t.state != "done") {
+                        adj.entry(u).or_default().push(w.id.clone());
+                    }
+                }
+            } else if let Some(rref) = cond.strip_prefix("run_applied:") {
+                for u in items {
+                    if u.state == "done" || u.applied || u.id == w.id {
+                        continue;
+                    }
+                    let u_matches = u.runs.iter().any(|r| run_id_matches(r, rref))
+                        || (!u.note_root.is_empty() && run_id_matches(&u.note_root, rref));
+                    if u_matches {
+                        adj.entry(u.id.clone()).or_default().push(w.id.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Seed direct downstream items blocked on this run chain or its owning work items.
+    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    for w in items {
+        if w.state == "done" || owning_set.contains(&w.id) {
+            continue;
+        }
+        let directly_blocked = w.wait_on.iter().any(|cond| {
+            if let Some(rref) = cond.strip_prefix("run_applied:") {
+                return chain_ids.iter().any(|cid| run_id_matches(cid, rref));
+            }
+            if let Some(raw) = cond.strip_prefix("work_applied:") {
+                if let Some(u) = normalize_work_id(raw) {
+                    return owning_set.contains(&u)
+                        && by_id
+                            .get(u.as_str())
+                            .is_none_or(|t| !t.applied && t.state != "done");
+                }
+            }
+            if let Some(raw) = cond.strip_prefix("work_closed:") {
+                if let Some(u) = normalize_work_id(raw) {
+                    return owning_set.contains(&u)
+                        && by_id.get(u.as_str()).is_none_or(|t| t.state != "done");
+                }
+            }
+            false
+        });
+        if directly_blocked && visited.insert(w.id.clone()) {
+            queue.push_back(w.id.clone());
+        }
+    }
+
+    while let Some(cur) = queue.pop_front() {
+        if let Some(nexts) = adj.get(&cur) {
+            for n in nexts {
+                if !owning_set.contains(n) && visited.insert(n.clone()) {
+                    queue.push_back(n.clone());
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<String> = visited.into_iter().collect();
+    out.sort();
+    out
+}
+
+/// Compute transitive blocked downstream work item IDs for a run directory using a preloaded
+/// read-only `items` snapshot (and optional `parent_map` to avoid redundant meta reads).
+pub fn blocked_downstream_for_run_with_items(
+    items: &[WorkItem],
+    run_dir: &Path,
+    meta: &Value,
+    state: &Path,
+    parent_map: Option<&HashMap<String, String>>,
+) -> Vec<String> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let rid = events::run_id_for(run_dir, meta);
+    let chain_ids = if let Some(pmap) = parent_map {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        if !rid.is_empty() && seen.insert(rid.clone()) {
+            out.push(rid.clone());
+        }
+        let mut cur = s(meta, "parent").trim().to_string();
+        for _ in 0..64 {
+            if cur.is_empty() || !seen.insert(cur.clone()) {
+                break;
+            }
+            out.push(cur.clone());
+            if let Some(next) = pmap.get(&cur) {
+                cur = next.clone();
+            } else {
+                // Fall back to disk/archive/history for cleaned ancestors.
+                let repo_str = events::repo_for_meta(meta);
+                let tail = run_chain_ids_for_ref(
+                    &cur,
+                    (!repo_str.is_empty()).then_some(repo_str.as_str()),
+                    state,
+                );
+                for t in tail.into_iter().skip(1) {
+                    if seen.insert(t.clone()) {
+                        out.push(t);
+                    }
+                }
+                break;
+            }
+        }
+        out
+    } else {
+        run_chain_ids_from_dir(run_dir, state)
+    };
+    let mut owning = Vec::new();
+    let wid = s(meta, "workId").trim();
+    if !wid.is_empty() {
+        owning.push(wid.to_string());
+    }
+    blocked_downstream_in(items, &chain_ids, &owning)
+}
+
+/// Convenience wrapper loading `work.jsonl` read-only for a single run directory.
+#[allow(dead_code)]
+pub fn blocked_downstream_for_run(run_dir: &Path) -> Vec<String> {
+    let state = state_dir();
+    if !work_path(&state).is_file() {
+        return Vec::new();
+    }
+    let items = load_readonly_in(&state);
+    let meta = json(run_dir.join("meta.json"));
+    blocked_downstream_for_run_with_items(&items, run_dir, &meta, &state, None)
+}
+
 pub fn ready_command_for(item: &WorkItem) -> String {
     if !item.brief.is_empty() {
         format!("delegate start --work {} --prompt-file {}", item.id, item.brief)
@@ -2774,23 +3069,183 @@ pub fn ready_command_for(item: &WorkItem) -> String {
     }
 }
 
-/// Called after `delegate apply` succeeds on one or more runs.
-/// Returns 0..=4 timely hint lines for stdout tail (each with a Host-written pointer).
+#[derive(Clone, Debug, Default)]
+pub struct ApplyWorkOptions {
+    pub closes_work_id: Option<String>,
+    pub keep_open: bool,
+    pub forced: bool,
+    /// Run IDs that landed as git commits (`--commit`, `--keep-commits`, or detected in HEAD).
+    pub committed_runs: HashSet<String>,
+    /// Run IDs whose post-apply verification failed.
+    pub verify_failed_runs: HashSet<String>,
+}
+
+fn format_apply_evidence(rid: &str, head: &str, committed: bool) -> String {
+    let short_head = if head.len() >= 7 { &head[..7] } else { head };
+    if committed {
+        if short_head.is_empty() {
+            format!("applied {rid}")
+        } else {
+            format!("applied {rid} ({short_head})")
+        }
+    } else if short_head.is_empty() {
+        format!("applied {rid} (working-tree)")
+    } else {
+        format!("applied {rid} (working-tree @ {short_head})")
+    }
+}
+
+fn run_rejected_or_failed_reason(
+    rid: &str,
+    rdir: Option<&Path>,
+    verify_failed: bool,
+    forced: bool,
+) -> Option<String> {
+    if verify_failed {
+        return Some(format!("合并后验收未通过（{}）", short_run_id(rid)));
+    }
+    let dir = rdir?;
+    let st = runs::state(dir);
+    let sum = json(dir.join("summary.json"));
+    let sum_st = s(&sum, "state");
+    let accept_failed = sum["accept"].is_object() && sum["accept"]["ok"] == json!(false);
+    if st == "rejected"
+        || sum_st == "rejected"
+        || accept_failed
+        || b(&sum, "policyRefused")
+        || matches!(
+            st.as_str(),
+            "failed" | "timeout" | "stalled" | "malformed" | "killed" | "crashed"
+        )
+    {
+        let prefix = if forced { "--force 合入了" } else { "合入了" };
+        return Some(format!(
+            "{prefix}被拒或验收未通过的运行 {}",
+            short_run_id(rid)
+        ));
+    }
+    None
+}
+
+fn other_active_or_question_run_reasons(
+    w: &WorkItem,
+    applied_ids: &HashSet<String>,
+    extra_runs_dirs: &[PathBuf],
+    state: &Path,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    let mut checked = HashSet::new();
+    let mut inspect_dir = |other_rid: &str, rdir: &Path| {
+        if applied_ids.contains(other_rid) || !checked.insert(other_rid.to_string()) {
+            return;
+        }
+        if rdir.join(".applied").exists() || rdir.join(".applied-cleaned").exists() {
+            return;
+        }
+        let st = runs::state(rdir);
+        if runs::active(&st) {
+            reasons.push(format!("仍有在跑中的运行 {}", short_run_id(other_rid)));
+        } else {
+            let sum = json(rdir.join("summary.json"));
+            if b(&sum, "question") {
+                reasons.push(format!("仍有提问中的运行 {}", short_run_id(other_rid)));
+            }
+        }
+    };
+    for other_rid in &w.runs {
+        if applied_ids.contains(other_rid) {
+            continue;
+        }
+        if let Some(rdir) = find_live_run_dir(other_rid, &w.run_dirs, state) {
+            inspect_dir(other_rid, &rdir);
+        }
+    }
+    for parent_dir in extra_runs_dirs {
+        for cand in runs::all_runs_in(parent_dir) {
+            let m = json(cand.join("meta.json"));
+            if s(&m, "workId") != w.id {
+                continue;
+            }
+            let cand_id = events::run_id_for(&cand, &m);
+            if !cand_id.is_empty() {
+                inspect_dir(&cand_id, &cand);
+            }
+        }
+    }
+    reasons
+}
+
+/// Called after `delegate apply` succeeds on one or more runs (default options).
 pub fn on_runs_applied(
     applied_runs: &[(PathBuf, Value, Value)],
     closes_work_id: Option<&str>,
 ) -> Vec<String> {
+    let mut opts = ApplyWorkOptions {
+        closes_work_id: closes_work_id.map(str::to_string),
+        ..Default::default()
+    };
+    for (run_dir, meta, applied_json) in applied_runs {
+        if s(applied_json, "appliedBy") == "detected" {
+            opts.committed_runs.insert(events::run_id_for(run_dir, meta));
+        }
+    }
+    on_runs_applied_with_options(applied_runs, &opts)
+}
+
+/// Called after `delegate apply` succeeds on one or more runs.
+/// Returns 0..=4 timely hint lines for stdout tail (each with a Host-written pointer).
+pub fn on_runs_applied_with_options(
+    applied_runs: &[(PathBuf, Value, Value)],
+    opts: &ApplyWorkOptions,
+) -> Vec<String> {
     let state = state_dir();
-    let closes_norm = closes_work_id.and_then(normalize_work_id);
+    let closes_norm = opts
+        .closes_work_id
+        .as_deref()
+        .and_then(normalize_work_id);
     let mut hints: Vec<String> = Vec::new();
 
-    // Expand merged source runs if any applied run is a merge run.
-    let mut effective_run_ids: Vec<(String, String, Option<PathBuf>, String)> = Vec::new();
+    struct EffectiveRun {
+        rid: String,
+        wid: String,
+        rdir: Option<PathBuf>,
+        head: String,
+        chain_ids: Vec<String>,
+        committed: bool,
+        verify_failed: bool,
+    }
+
+    // Expand merged source runs and parent chains so leaf applies match root-linked work items.
+    let mut effective_runs: Vec<EffectiveRun> = Vec::new();
+    let mut all_applied_ids: HashSet<String> = HashSet::new();
+    let mut extra_runs_dirs: Vec<PathBuf> = Vec::new();
     for (run_dir, meta, applied_json) in applied_runs {
         let rid = events::run_id_for(run_dir, meta);
         let head = s(applied_json, "head").to_string();
         let wid = s(meta, "workId").to_string();
-        effective_run_ids.push((rid.clone(), wid, Some(run_dir.clone()), head.clone()));
+        let chain_ids = run_chain_ids_from_dir(run_dir, &state);
+        for cid in &chain_ids {
+            all_applied_ids.insert(cid.clone());
+        }
+        all_applied_ids.insert(rid.clone());
+        if let Some(p) = run_dir.parent() {
+            let pb = p.to_path_buf();
+            if !extra_runs_dirs.contains(&pb) {
+                extra_runs_dirs.push(pb);
+            }
+        }
+        let committed = opts.committed_runs.contains(&rid)
+            || s(applied_json, "appliedBy") == "detected";
+        let verify_failed = opts.verify_failed_runs.contains(&rid);
+        effective_runs.push(EffectiveRun {
+            rid: rid.clone(),
+            wid,
+            rdir: Some(run_dir.clone()),
+            head: head.clone(),
+            chain_ids,
+            committed,
+            verify_failed,
+        });
 
         if b(meta, "isMerge") {
             let report = json(run_dir.join("merge-report.json"));
@@ -2806,12 +3261,24 @@ pub fn on_runs_applied(
                 let src_dir = parent_runs.join(src_id);
                 let src_meta = json(src_dir.join("meta.json"));
                 let src_wid = s(&src_meta, "workId").to_string();
-                effective_run_ids.push((
-                    src_id.to_string(),
-                    src_wid,
-                    src_dir.is_dir().then_some(src_dir),
-                    head.clone(),
-                ));
+                let src_chain = if src_dir.is_dir() {
+                    run_chain_ids_from_dir(&src_dir, &state)
+                } else {
+                    run_chain_ids_for_ref(src_id, None, &state)
+                };
+                for cid in &src_chain {
+                    all_applied_ids.insert(cid.clone());
+                }
+                all_applied_ids.insert(src_id.to_string());
+                effective_runs.push(EffectiveRun {
+                    rid: src_id.to_string(),
+                    wid: src_wid,
+                    rdir: src_dir.is_dir().then_some(src_dir),
+                    head: head.clone(),
+                    chain_ids: src_chain,
+                    committed,
+                    verify_failed,
+                });
             }
         }
     }
@@ -2827,41 +3294,73 @@ pub fn on_runs_applied(
         }
         let mut changed = migrate_legacy_locked(&state, &mut items);
         let now_iso = iso();
-        let mut stays: Vec<WorkItem> = Vec::new();
+        let mut stays: Vec<(WorkItem, Vec<String>)> = Vec::new();
         let mut closed: Vec<WorkItem> = Vec::new();
+        let mut handled_work_ids: HashSet<String> = HashSet::new();
 
-        for (rid, wid, rdir, head) in &effective_run_ids {
-            if let Some(w) = items
-                .iter_mut()
-                .find(|w| (!wid.is_empty() && w.id == *wid) || w.matches_run(rid))
-            {
-                w.applied = true;
-                w.defer_streak = 0;
-                if let Some(dir) = rdir {
-                    w.add_run(rid, Some(dir), None);
-                }
-                let explicit_close = closes_norm.as_deref() == Some(w.id.as_str());
-                let keep_verify_without_cond = w.state == "verify" && w.verify_on.is_empty();
-                let short_head = if head.len() >= 7 { &head[..7] } else { head.as_str() };
-                if explicit_close || (!w.has_open_closure() && !keep_verify_without_cond) {
-                    w.closed_kind = if explicit_close {
-                        "closed".into()
-                    } else {
-                        "auto".into()
-                    };
-                    w.close_evidence = if short_head.is_empty() {
-                        format!("applied {rid}")
-                    } else {
-                        format!("applied {rid} ({short_head})")
-                    };
-                    w.set_state("done", &now_iso);
-                    closed.push(w.clone());
-                    changed = true;
-                } else {
+        for er in &effective_runs {
+            let Some(pos) = items.iter().position(|w| {
+                (!er.wid.is_empty() && w.id == er.wid)
+                    || er.chain_ids.iter().any(|cid| w.matches_run(cid))
+            }) else {
+                continue;
+            };
+            let w = &mut items[pos];
+            w.applied = true;
+            w.defer_streak = 0;
+            if let Some(dir) = &er.rdir {
+                w.add_run(&er.rid, Some(dir), None);
+            }
+            changed = true;
+            if !handled_work_ids.insert(w.id.clone()) {
+                continue;
+            }
+            let explicit_close = closes_norm.as_deref() == Some(w.id.as_str());
+            let evidence = format_apply_evidence(&er.rid, &er.head, er.committed);
+
+            if explicit_close {
+                w.closed_kind = "closed".into();
+                w.close_evidence = evidence;
+                w.set_state("done", &now_iso);
+                closed.push(w.clone());
+                continue;
+            }
+
+            // Collect all structured reasons that prevent automatic closure.
+            let mut block_reasons: Vec<String> = Vec::new();
+            if w.owner.is_some() {
+                block_reasons.push("所有者项需人工闭环".to_string());
+            }
+            if opts.keep_open {
+                block_reasons.push("指定了 apply --keep-open".to_string());
+            }
+            if let Some(rej_reason) = run_rejected_or_failed_reason(
+                &er.rid,
+                er.rdir.as_deref(),
+                er.verify_failed,
+                opts.forced,
+            ) {
+                block_reasons.push(rej_reason);
+            }
+            let active_reasons = other_active_or_question_run_reasons(
+                w,
+                &all_applied_ids,
+                &extra_runs_dirs,
+                &state,
+            );
+            block_reasons.extend(active_reasons);
+
+            if !w.has_open_closure() && block_reasons.is_empty() {
+                w.closed_kind = "auto".into();
+                w.close_evidence = evidence;
+                w.set_state("done", &now_iso);
+                closed.push(w.clone());
+            } else {
+                if w.owner.is_none() {
                     w.set_state("verify", &now_iso);
-                    stays.push(w.clone());
-                    changed = true;
                 }
+                let full_reasons = verify_reasons_with_extra(w, &block_reasons);
+                stays.push((w.clone(), full_reasons));
             }
         }
 
@@ -2869,23 +3368,21 @@ pub fn on_runs_applied(
         if let Some(cid) = &closes_norm {
             if !closed.iter().any(|w| w.id == *cid) {
                 if let Some(w) = items.iter_mut().find(|w| w.id == *cid) {
-                    let first_rid = effective_run_ids
+                    let first_rid = effective_runs
                         .first()
-                        .map(|(r, _, _, _)| r.as_str())
+                        .map(|e| e.rid.as_str())
                         .unwrap_or("");
-                    let first_head = effective_run_ids
+                    let first_head = effective_runs
                         .first()
-                        .map(|(_, _, _, h)| h.as_str())
+                        .map(|e| e.head.as_str())
                         .unwrap_or("");
-                    let short_h = &first_head[..first_head.len().min(7)];
+                    let first_committed = effective_runs
+                        .first()
+                        .is_some_and(|e| e.committed);
                     w.applied = true;
                     w.defer_streak = 0;
                     w.closed_kind = "closed".into();
-                    w.close_evidence = if short_h.is_empty() {
-                        format!("applied {first_rid}")
-                    } else {
-                        format!("applied {first_rid} ({short_h})")
-                    };
+                    w.close_evidence = format_apply_evidence(first_rid, first_head, first_committed);
                     w.set_state("done", &now_iso);
                     closed.push(w.clone());
                     changed = true;
@@ -2894,16 +3391,22 @@ pub fn on_runs_applied(
         }
 
         let rec = reconcile_all_locked_with_prefetch(&state, &mut items, None, Some(&prefetch));
-        stays.retain(|s| {
-            items
-                .iter()
-                .find(|w| w.id == s.id)
-                .is_some_and(|w| w.state == "verify")
-        });
+        let mut final_stays: Vec<(WorkItem, Vec<String>)> = Vec::new();
+        for (s_item, reasons) in stays {
+            if let Some(cur) = items.iter().find(|w| w.id == s_item.id) {
+                if cur.state == "done" {
+                    if !closed.iter().any(|c| c.id == cur.id) {
+                        closed.push(cur.clone());
+                    }
+                } else {
+                    final_stays.push((cur.clone(), reasons));
+                }
+            }
+        }
         if changed || rec.changed {
             let _ = save_raw(&state, &items);
         }
-        (rec, stays, closed)
+        (rec, final_stays, closed)
     };
 
     let dispatched = emit_reconcile_events_and_dispatch(&state, &outcome);
@@ -2945,26 +3448,36 @@ pub fn on_runs_applied(
         }
     }
 
-    // 3. Work item stayed in `verify`
-    for w in verify_stays.iter().take(2) {
-        let why = verify_reasons(w).join("；");
-        hints.push(format!(
-            "工作项 [{}] 留在 verify（{}）· 闭环：delegate work close {} --evidence \"…\"（卡片：delegate work show {}）",
-            w.id, why, w.id, w.id
-        ));
-    }
-
-    // 4. Explicitly closed via --closes
-    if let Some(cid) = &closes_norm {
-        if let Some(w) = auto_closed.iter().find(|w| w.id == *cid) {
+    // 3. Work item stayed open (`verify` or kept `active`/`attention` due to other runs/owner)
+    for (w, reasons) in verify_stays.iter().take(2) {
+        let why = reasons.join("；");
+        if w.state == "verify" {
             hints.push(format!(
-                "已关闭工作项 [{}] {}（{} · 卡片：delegate work show {}）",
-                w.id,
-                clip_chars(&w.title, 30),
-                w.close_evidence,
-                w.id
+                "工作项 [{}] 留在 verify（{}）· 闭环：delegate work close {} --evidence \"…\"（卡片：delegate work show {}）",
+                w.id, why, w.id, w.id
+            ));
+        } else {
+            hints.push(format!(
+                "工作项 [{}] 未自动关闭，保持 {}（{}）（卡片：delegate work show {}）",
+                w.id, w.state, why, w.id
             ));
         }
+    }
+
+    // 4. Closed / auto-closed work items
+    for w in auto_closed.iter().take(2) {
+        let verb = if w.closed_kind == "auto" {
+            "已自动关闭工作项"
+        } else {
+            "已关闭工作项"
+        };
+        hints.push(format!(
+            "{verb} [{}] {}（{} · 卡片：delegate work show {}）",
+            w.id,
+            clip_chars(&w.title, 30),
+            w.close_evidence,
+            w.id
+        ));
     }
 
     hints.truncate(4);
@@ -2989,12 +3502,17 @@ pub fn hints_for_wait(settled_runs: &[PathBuf]) -> Vec<String> {
         let meta = json(run_dir.join("meta.json"));
         let rid = events::run_id_for(run_dir, &meta);
         let wid = s(&meta, "workId");
+        let chain_ids = run_chain_ids_from_dir(run_dir, &state);
 
-        // 1. Owning work item (1 line)
-        if let Some(w) = items
-            .iter()
-            .find(|w| (!wid.is_empty() && w.id == wid) || w.matches_run(&rid))
-        {
+        // 1. Owning work item (1 line, matching across the full parent chain)
+        let mut owning_wids: HashSet<String> = HashSet::new();
+        if !wid.is_empty() {
+            owning_wids.insert(wid.to_string());
+        }
+        if let Some(w) = items.iter().find(|w| {
+            (!wid.is_empty() && w.id == wid) || chain_ids.iter().any(|cid| w.matches_run(cid))
+        }) {
+            owning_wids.insert(w.id.clone());
             if seen_work.insert(w.id.clone()) {
                 let ptr = if !w.brief.is_empty() {
                     format!("卡片：delegate work show {} · 说明：{}", w.id, w.brief)
@@ -3011,19 +3529,25 @@ pub fn hints_for_wait(settled_runs: &[PathBuf]) -> Vec<String> {
             }
         }
 
-        // 2. Downstream blocked/ready items waiting on this run (<= 3 lines)
+        // 2. Downstream blocked/ready items waiting on this run (or any ancestor in parent chain / owning work)
         let mut downstream_count = 0usize;
         for w in &items {
-            if w.state == "done" || downstream_count >= 3 {
+            if w.state == "done" || owning_wids.contains(&w.id) || downstream_count >= 3 {
                 continue;
             }
             let waiting_applied = w.wait_on.iter().any(|c| {
                 c.strip_prefix("run_applied:")
-                    .is_some_and(|r| run_id_matches(&rid, r))
+                    .is_some_and(|r| chain_ids.iter().any(|cid| run_id_matches(cid, r)))
+                    || c.strip_prefix("work_applied:")
+                        .and_then(normalize_work_id)
+                        .is_some_and(|u| owning_wids.contains(&u))
+                    || c.strip_prefix("work_closed:")
+                        .and_then(normalize_work_id)
+                        .is_some_and(|u| owning_wids.contains(&u))
             });
             let waiting_delivered = w.wait_on.iter().any(|c| {
                 c.strip_prefix("run_delivered:")
-                    .is_some_and(|r| run_id_matches(&rid, r))
+                    .is_some_and(|r| chain_ids.iter().any(|cid| run_id_matches(cid, r)))
             });
             if !waiting_applied && !waiting_delivered {
                 continue;
@@ -3098,15 +3622,31 @@ pub fn hints_for_events(evs: &[Value]) -> Vec<String> {
         if !matches!(kind, "delivered" | "question" | "rejected" | "failed") || rid.is_empty() {
             continue;
         }
+        let repo_hint = {
+            let r = s(ev, "repo");
+            (!r.is_empty()).then_some(r)
+        };
+        let chain_ids = run_chain_ids_for_ref(rid, repo_hint, &state);
+        let owning_wids: HashSet<String> = items
+            .iter()
+            .filter(|w| chain_ids.iter().any(|cid| w.matches_run(cid)))
+            .map(|w| w.id.clone())
+            .collect();
         for w in &items {
-            if w.state == "done" {
+            if w.state == "done" || owning_wids.contains(&w.id) {
                 continue;
             }
-            if w.wait_on.iter().any(|c| {
+            let matches_down = w.wait_on.iter().any(|c| {
                 c.strip_prefix("run_applied:")
-                    .is_some_and(|r| run_id_matches(rid, r))
-            }) && seen.insert(format!("down:{}", w.id))
-            {
+                    .is_some_and(|r| chain_ids.iter().any(|cid| run_id_matches(cid, r)))
+                    || c.strip_prefix("work_applied:")
+                        .and_then(normalize_work_id)
+                        .is_some_and(|u| owning_wids.contains(&u))
+                    || c.strip_prefix("work_closed:")
+                        .and_then(normalize_work_id)
+                        .is_some_and(|u| owning_wids.contains(&u))
+            });
+            if matches_down && seen.insert(format!("down:{}", w.id)) {
                 hints.push(format!(
                     "关联下游：[{}] {}（等 {} 合入后解锁 · 卡片：delegate work show {}）",
                     w.id,
@@ -3142,17 +3682,36 @@ pub fn hints_for_merge(merge_run_id: &str, report: &Value) -> Vec<String> {
     if merged_runs.is_empty() {
         return Vec::new();
     }
+    let mut expanded_runs: Vec<String> = Vec::new();
+    for mr in &merged_runs {
+        for cid in run_chain_ids_for_ref(mr, None, &state) {
+            if !expanded_runs.contains(&cid) {
+                expanded_runs.push(cid);
+            }
+        }
+    }
+    let merged_wids: HashSet<String> = items
+        .iter()
+        .filter(|w| expanded_runs.iter().any(|cid| w.matches_run(cid)))
+        .map(|w| w.id.clone())
+        .collect();
     let report_path = s(report, "reportPath");
     let mut hints = Vec::new();
     let mut seen = HashSet::new();
 
     for w in &items {
-        if w.state == "done" {
+        if w.state == "done" || merged_wids.contains(&w.id) {
             continue;
         }
         let unlocks = w.wait_on.iter().any(|c| {
             c.strip_prefix("run_applied:")
-                .is_some_and(|r| merged_runs.iter().any(|mr| run_id_matches(mr, r)))
+                .is_some_and(|r| expanded_runs.iter().any(|mr| run_id_matches(mr, r)))
+                || c.strip_prefix("work_applied:")
+                    .and_then(normalize_work_id)
+                    .is_some_and(|u| merged_wids.contains(&u))
+                || c.strip_prefix("work_closed:")
+                    .and_then(normalize_work_id)
+                    .is_some_and(|u| merged_wids.contains(&u))
         });
         if unlocks && seen.insert(w.id.clone()) {
             hints.push(format!(
@@ -4130,6 +4689,9 @@ fn render_card(item: &WorkItem, all_items: &[WorkItem], state: &Path, now_epoch:
     if !item.done_when.is_empty() {
         lines.push(format!("完成条件：{}", item.done_when));
     }
+    if item.needs_verify {
+        lines.push("闭环要求：合入后需人工验证（--needs-verify）".to_string());
+    }
     if !item.brief.is_empty() {
         let label = if item.owner.is_some() { "卡片" } else { "任务说明" };
         lines.push(format!("{label}：{}", item.brief));
@@ -4631,12 +5193,13 @@ fn parse_markdown_backlog(
 }
 
 // ---------------------------------------------------------------------------
-// Cycle check for `work_closed:<Wxx>`
+// Cycle check for `work_closed:<Wxx>` / `work_applied:<Wxx>` / `owner:<Qxx>`
 // ---------------------------------------------------------------------------
 
 fn has_work_cycle(items: &[WorkItem], from_id: &str, new_wait_on: &[String]) -> bool {
     let extract_dep = |c: &str| -> Option<String> {
         c.strip_prefix("work_closed:")
+            .or_else(|| c.strip_prefix("work_applied:"))
             .or_else(|| c.strip_prefix("owner:"))
             .and_then(normalize_work_id)
     };
@@ -5176,6 +5739,7 @@ fn show_cmd(args: &[String]) -> Res<i32> {
 struct WaitFlags {
     wait_on: Vec<String>,
     verify_on: Vec<String>,
+    needs_verify: Option<bool>,
     owner_ref: Option<String>,
     brief: Option<String>,
     auto: bool,
@@ -5190,7 +5754,7 @@ fn normalize_verify_condition(raw: &str) -> Res<String> {
     }
     if trimmed.starts_with("cmd:") {
         return Err(
-            "--verify-on does not support cmd: (supported: run_applied:<run>, work_closed:<Wxx>, owner:<Qxx>, commit_exists:<sha>)"
+            "--verify-on does not support cmd: (supported: run_applied:<run>, work_applied:<Wxx>, work_closed:<Wxx>, owner:<Qxx>, commit_exists:<sha>)"
                 .into(),
         );
     }
@@ -5200,6 +5764,11 @@ fn normalize_verify_condition(raw: &str) -> Res<String> {
             return Err("invalid --verify-on 'run_applied:' (missing run id)".into());
         }
         return Ok(format!("run_applied:{r}"));
+    }
+    if let Some(wid) = trimmed.strip_prefix("work_applied:") {
+        let norm = normalize_work_id(wid)
+            .ok_or_else(|| format!("invalid work id in --verify-on: '{wid}'"))?;
+        return Ok(format!("work_applied:{norm}"));
     }
     if let Some(wid) = trimmed.strip_prefix("work_closed:") {
         let norm = normalize_work_id(wid)
@@ -5227,7 +5796,7 @@ fn normalize_verify_condition(raw: &str) -> Res<String> {
         return Ok(format!("commit_exists:{}", s_clean.to_ascii_lowercase()));
     }
     Err(format!(
-        "invalid --verify-on '{trimmed}' (supported: run_applied:<run>, work_closed:<Wxx>, owner:<Qxx>, commit_exists:<sha>)"
+        "invalid --verify-on '{trimmed}' (supported: run_applied:<run>, work_applied:<Wxx>, work_closed:<Wxx>, owner:<Qxx>, commit_exists:<sha>)"
     ))
 }
 
@@ -5250,6 +5819,7 @@ fn parse_wait_conditions(args: &[String], allow_clear: bool) -> Res<ParsedWaitAr
     let mut wf = WaitFlags {
         wait_on: Vec::new(),
         verify_on: Vec::new(),
+        needs_verify: None,
         owner_ref: None,
         brief: None,
         auto: false,
@@ -5293,6 +5863,8 @@ fn parse_wait_conditions(args: &[String], allow_clear: bool) -> Res<ParsedWaitAr
         match key {
             "--json" => json_mode = true,
             "--auto" => wf.auto = true,
+            "--needs-verify" => wf.needs_verify = Some(true),
+            "--no-needs-verify" if allow_clear => wf.needs_verify = Some(false),
             "--clear" if allow_clear => wf.clear_wait = true,
             "--brief" | "--prompt-file" => {
                 wf.brief = Some(take_val(key, &mut i)?);
@@ -5300,7 +5872,16 @@ fn parse_wait_conditions(args: &[String], allow_clear: bool) -> Res<ParsedWaitAr
             "--after-applied" => {
                 let raw = take_val(key, &mut i)?;
                 for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                    wf.wait_on.push(format!("run_applied:{part}"));
+                    if let Some(wid) = part.strip_prefix("work_applied:") {
+                        let norm = normalize_work_id(wid)
+                            .ok_or_else(|| format!("invalid work id in --after-applied: '{part}'"))?;
+                        wf.wait_on.push(format!("work_applied:{norm}"));
+                    } else if parse_prefixed_num(part, 'W', 'w').is_some() {
+                        let norm = normalize_work_id(part).unwrap();
+                        wf.wait_on.push(format!("work_applied:{norm}"));
+                    } else {
+                        wf.wait_on.push(format!("run_applied:{part}"));
+                    }
                 }
             }
             "--after-delivered" => {
@@ -5697,7 +6278,7 @@ fn add_cmd(args: &[String]) -> Res<i32> {
             next_id_locked(&state, &items)
         };
         if has_work_cycle(&items, &id, &wait_on) {
-            return Err("dependency cycle detected in --after-work".into());
+            return Err("dependency cycle detected in --after-work / --after-applied".into());
         }
 
         let init_state = if !wait_on.is_empty() {
@@ -5717,6 +6298,7 @@ fn add_cmd(args: &[String]) -> Res<i32> {
             repo: repo.clone(),
             state: init_state.to_string(),
             done_when,
+            needs_verify: wf.needs_verify.unwrap_or(false),
             wait_on,
             verify_on: wf.verify_on,
             auto_dispatch,
@@ -5855,13 +6437,14 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
     if !wf.clear_wait
         && wf.wait_on.is_empty()
         && wf.verify_on.is_empty()
+        && wf.needs_verify.is_none()
         && wf.brief.is_none()
         && !wf.auto
         && !extra.contains_key("--artifact")
         && needs_owner_kind.is_none()
         && !has_owner_field_updates
     {
-        return Err("work wait requires at least one condition (--after-applied / --after-delivered / --after-work / --wait-owner / --needs-owner / --after-time / --verify-on / --brief / --ask / --recommendation / --if-undecided / --cost / --clear)".into());
+        return Err("work wait requires at least one condition (--after-applied / --after-delivered / --after-work / --wait-owner / --needs-owner / --after-time / --needs-verify / --verify-on / --brief / --ask / --recommendation / --if-undecided / --cost / --clear)".into());
     }
 
     let recorded_wait_on = !wf.wait_on.is_empty() || needs_owner_kind.is_some();
@@ -6001,6 +6584,9 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
             if !item.verify_on.contains(c) {
                 item.verify_on.push(c.clone());
             }
+        }
+        if let Some(nv) = wf.needs_verify {
+            item.needs_verify = nv;
         }
         if let Some(oref) = wf.owner_ref.or(extra_owner_ref) {
             item.owner_ref = oref;
@@ -6242,6 +6828,7 @@ fn drop_cmd(args: &[String]) -> Res<i32> {
                 w.state != "done"
                     && w.wait_on.iter().any(|c| {
                         c == &format!("work_closed:{norm}")
+                            || c == &format!("work_applied:{norm}")
                             || c.strip_prefix("owner:")
                                 .and_then(normalize_work_id)
                                 .as_deref()
@@ -7579,5 +8166,170 @@ mod tests {
         assert_eq!(card, expected);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn has_open_closure_ignores_text_done_when_and_honors_structural_blockers() {
+        let mut w = WorkItem {
+            id: "W054".into(),
+            title: "修复合入关项".into(),
+            done_when: "单测全绿并通过人工检查".into(),
+            ..Default::default()
+        };
+        assert!(!w.has_open_closure());
+
+        w.needs_verify = true;
+        assert!(w.has_open_closure());
+        w.needs_verify = false;
+
+        w.verify_on.push("owner:Q01".into());
+        assert!(w.has_open_closure());
+        w.verify_on.clear();
+
+        w.artifacts.push(ArtifactItem {
+            path: ".local/out.png".into(),
+            source_run: String::new(),
+            added_at: String::new(),
+            note: String::new(),
+        });
+        assert!(w.has_open_closure());
+        w.artifacts.clear();
+
+        w.followups.push(FollowupItem {
+            id: 1,
+            kind: "note".into(),
+            text: "补单测".into(),
+            anchor: String::new(),
+            source_run: String::new(),
+            done: false,
+            created_at: String::new(),
+            done_at: None,
+        });
+        assert!(w.has_open_closure());
+        w.followups[0].done = true;
+        assert!(!w.has_open_closure());
+    }
+
+    #[test]
+    fn work_applied_eval_and_cycle_detection() {
+        let dir = temp_dir("work-applied-eval");
+        let state = dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let now_ep = epoch() as i64;
+
+        let mut items = vec![
+            WorkItem {
+                id: "W071".into(),
+                title: "核心代码".into(),
+                state: "verify".into(),
+                needs_verify: true,
+                applied: false,
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W064".into(),
+                title: "真机实测".into(),
+                state: "blocked".into(),
+                wait_on: vec!["work_applied:W071".into()],
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W072".into(),
+                title: "已放弃上游".into(),
+                state: "done".into(),
+                closed_kind: "dropped".into(),
+                applied: false,
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W073".into(),
+                title: "等已放弃上游".into(),
+                state: "blocked".into(),
+                wait_on: vec!["work_applied:W072".into()],
+                ..Default::default()
+            },
+        ];
+
+        assert!(!evaluate_condition("work_applied:W071", &items[1], &items, &state, now_ep).satisfied);
+        // Applied while still in `verify` immediately satisfies `work_applied:W071`
+        items[0].applied = true;
+        assert!(evaluate_condition("work_applied:W071", &items[1], &items, &state, now_ep).satisfied);
+        // Dropped upstream never auto-unlocks `work_applied:`
+        assert!(!evaluate_condition("work_applied:W072", &items[3], &items, &state, now_ep).satisfied);
+
+        // Cycle detection covers work_applied: and mixed work_applied:/work_closed: cycles
+        assert!(has_work_cycle(&items, "W071", &["work_applied:W064".into()]));
+        assert!(has_work_cycle(&items, "W071", &["work_closed:W064".into()]));
+        assert!(!has_work_cycle(&items, "W099", &["work_applied:W064".into()]));
+
+        // `--after-applied <Wxx>` parses to `work_applied:<Wxxx>` while run refs stay `run_applied:`
+        let parsed = parse_wait_conditions(
+            &[
+                "--after-applied".into(),
+                "w71,20261124-140427-delegate-fixes".into(),
+                "--needs-verify".into(),
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.wf.wait_on,
+            vec![
+                "work_applied:W071".to_string(),
+                "run_applied:20261124-140427-delegate-fixes".to_string()
+            ]
+        );
+        assert_eq!(parsed.wf.needs_verify, Some(true));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blocked_downstream_walks_parent_chain_and_transitive_work_graph() {
+        let items = vec![
+            WorkItem {
+                id: "W057".into(),
+                title: "等根 run".into(),
+                state: "blocked".into(),
+                wait_on: vec!["run_applied:20261124-140427-delegate-fixes".into()],
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W058".into(),
+                title: "等 W057 合入".into(),
+                state: "blocked".into(),
+                wait_on: vec!["work_applied:W057".into()],
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W069".into(),
+                title: "等 W058 关闭".into(),
+                state: "blocked".into(),
+                wait_on: vec!["work_closed:W058".into()],
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W070".into(),
+                title: "也等 W058".into(),
+                state: "blocked".into(),
+                wait_on: vec!["work_closed:W058".into()],
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W071".into(),
+                title: "已完成不计入".into(),
+                state: "done".into(),
+                wait_on: vec!["work_closed:W058".into()],
+                ..Default::default()
+            },
+        ];
+
+        // Leaf `bb52` carries its parent chain back to root `140427`
+        let chain_ids = vec![
+            "20261124-145101-bb52".to_string(),
+            "20261124-140427-delegate-fixes".to_string(),
+        ];
+        let blocked = blocked_downstream_in(&items, &chain_ids, &[]);
+        assert_eq!(blocked, vec!["W057", "W058", "W069", "W070"]);
     }
 }

@@ -1839,6 +1839,8 @@ fn apply(args: &[String]) -> Res<i32> {
             "--verify",
             "--no-verify",
             "--keep",
+            "--keep-open",
+            "--force",
             "--keep-commits",
             "--commit",
             "--json",
@@ -1848,6 +1850,11 @@ fn apply(args: &[String]) -> Res<i32> {
     let closes_work = value(&kv, "--closes").map(str::to_string);
     if let Some(ref raw_w) = closes_work {
         let _ = work::validate_work_id(raw_w)?;
+    }
+    let keep_open = has(&flags, "--keep-open");
+    let force_apply = has(&flags, "--force");
+    if keep_open && closes_work.is_some() {
+        return Err("--keep-open and --closes are exclusive".into());
     }
     if has(&flags, "--json") {
         output::enable_json();
@@ -2346,7 +2353,40 @@ fn apply(args: &[String]) -> Res<i32> {
                 &apply_finished_at,
                 apply_elapsed_ms,
             );
-            let work_hints = work::on_runs_applied(&applied_records, closes_work.as_deref());
+            let mut committed_runs = std::collections::HashSet::new();
+            let mut committed_worktrees = std::collections::HashSet::new();
+            let mut verify_failed_runs = std::collections::HashSet::new();
+            let post_verify_failed = !verify.is_null() && verify["ok"] == json!(false);
+            for d in &done {
+                let is_committed = b(&d.conclusion["apply"], "committed")
+                    || b(&d.conclusion["apply"], "keepCommits");
+                if is_committed {
+                    let dm = json(d.run.join("meta.json"));
+                    committed_runs.insert(events::run_id_for(&d.run, &dm));
+                    let wt = s(&dm["worktree"], "path");
+                    if !wt.is_empty() {
+                        committed_worktrees.insert(wt.to_string());
+                    }
+                }
+            }
+            for (r, m, _) in &applied_records {
+                let rid = events::run_id_for(r, m);
+                let wt = s(&m["worktree"], "path");
+                if !wt.is_empty() && committed_worktrees.contains(wt) {
+                    committed_runs.insert(rid.clone());
+                }
+                if post_verify_failed {
+                    verify_failed_runs.insert(rid);
+                }
+            }
+            let work_opts = work::ApplyWorkOptions {
+                closes_work_id: closes_work.clone(),
+                keep_open,
+                forced: force_apply,
+                committed_runs,
+                verify_failed_runs,
+            };
+            let work_hints = work::on_runs_applied_with_options(&applied_records, &work_opts);
             work::check_stale_and_expired();
             dag_queue::advance();
             if !output::json_enabled() {

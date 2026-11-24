@@ -371,9 +371,9 @@ class DelegateWorkHygieneTests(unittest.TestCase):
         self.assertNotEqual(bad_cmd.returncode, 0)
         self.assertIn("cmd:", bad_cmd.stderr)
 
-        # W001: has done_when, NO verify_on -> write run applied stays in verify (not auto-closed)
+        # W001: has --needs-verify (and done_when), NO verify_on -> write run applied stays in verify (not auto-closed)
         self.assertEqual(
-            self.cli("work", "add", "无自动闭环条件项", "--repo", repo, "--done-when", "人工验收", human=True).returncode,
+            self.cli("work", "add", "无自动闭环条件项", "--repo", repo, "--done-when", "人工验收", "--needs-verify", human=True).returncode,
             0,
         )
         self.fake_pi([fixtures.answer("edit a"), fixtures.SETTLED], pre="echo v1 > a.txt")

@@ -1501,22 +1501,29 @@ fn discover_runs_for_repo(source_canon: &Path) -> Vec<PathBuf> {
         }
     }
 
-    // Collapse reply chains to their latest head.
+    // Collapse reply chains to their latest head and build parent map for downstream lookups.
     let mut parent_ids: BTreeSet<String> = BTreeSet::new();
-    for r in &all_in_repo {
-        let p = s(&json(r.join("meta.json")), "parent").to_string();
-        if !p.is_empty() {
-            parent_ids.insert(p);
-        }
-    }
-
-    let mut candidates: Vec<(u64, String, PathBuf)> = Vec::new();
+    let mut parent_map: HashMap<String, String> = HashMap::new();
+    let mut run_metas: Vec<(PathBuf, String, Value)> = Vec::with_capacity(all_in_repo.len());
     for r in all_in_repo {
         let meta = json(r.join("meta.json"));
+        let id = events::run_id_for(&r, &meta);
+        let p = s(&meta, "parent").trim().to_string();
+        if !p.is_empty() {
+            parent_ids.insert(p.clone());
+            if !id.is_empty() {
+                parent_map.insert(id.clone(), p);
+            }
+        }
+        run_metas.push((r, id, meta));
+    }
+
+    let work_items = crate::work::load_readonly_in(&state);
+    let mut candidates: Vec<(usize, u64, String, PathBuf)> = Vec::new();
+    for (r, id, meta) in run_metas {
         if !meta.is_object() || b(&meta, "isMerge") {
             continue;
         }
-        let id = events::run_id_for(&r, &meta);
         if parent_ids.contains(&id) {
             continue;
         }
@@ -1527,11 +1534,29 @@ fn discover_runs_for_repo(source_canon: &Path) -> Vec<PathBuf> {
         if r.join(".applied").exists() || r.join(".applied-cleaned").exists() {
             continue;
         }
+        let blocked = crate::work::blocked_downstream_for_run_with_items(
+            &work_items,
+            &r,
+            &meta,
+            &state,
+            Some(&parent_map),
+        )
+        .len();
         let ns = meta["startedNs"].as_u64().unwrap_or(0);
-        candidates.push((ns, id, r));
+        candidates.push((blocked, ns, id, r));
     }
-    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    candidates.into_iter().map(|(_, _, p)| p).collect()
+    sort_premerge_candidates(&mut candidates);
+    candidates.into_iter().map(|(_, _, _, p)| p).collect()
+}
+
+/// Sort premerge candidates by transitive blocked downstream count (descending),
+/// then `startedNs` (ascending FIFO), then `run_id` (ascending).
+fn sort_premerge_candidates(candidates: &mut [(usize, u64, String, PathBuf)]) {
+    candidates.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
 }
 
 fn run_needs_premerge(run: &Path, source_head: &str) -> bool {
@@ -3154,5 +3179,18 @@ mod tests {
         assert!(owt_debug.join("incremental").join("xtask-abcdef1234").exists());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sort_premerge_candidates_prioritizes_blocked_downstream_then_fifo() {
+        let mut cands = vec![
+            (0usize, 100u64, "run-a".to_string(), PathBuf::from("/tmp/a")),
+            (1usize, 300u64, "run-b".to_string(), PathBuf::from("/tmp/b")),
+            (3usize, 500u64, "run-c".to_string(), PathBuf::from("/tmp/c")),
+            (1usize, 200u64, "run-d".to_string(), PathBuf::from("/tmp/d")),
+        ];
+        sort_premerge_candidates(&mut cands);
+        let order: Vec<&str> = cands.iter().map(|c| c.2.as_str()).collect();
+        assert_eq!(order, vec!["run-c", "run-d", "run-b", "run-a"]);
     }
 }

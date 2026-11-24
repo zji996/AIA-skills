@@ -72,7 +72,7 @@
 
 合入仍由主控审查后手动 `delegate apply`（不做 `autoApply`，不自动 rebase/续做）：
 
-1. **事件驱动 `_merge-worker`**：每仓库单实例短命后台进程（`<state>/premerge/<repo-key>.lock` 非阻塞 `LOCK_NB` + `.wake` 无丢唤醒标记），在 run 进入 `delivered`（审查 `PASS` 或未开审查，且无未签字 `controllerReviewPaths`）、`delegate sign` 成功、或主控提交后由零锁 `status`/`card` 读路径发现过期时自动拉起。
+1. **事件驱动 `_merge-worker`**：每仓库单实例短命后台进程（`<state>/premerge/<repo-key>.lock` 非阻塞 `LOCK_NB` + `.wake` 无丢唤醒标记），在 run 进入 `delivered`（审查 `PASS` 或未开审查，且无未签字 `controllerReviewPaths`）、`delegate sign` 成功、或主控提交后由零锁 `status`/`card` 读路径发现过期时自动拉起；多 run 排队时按「沿 `parent` 链归并到根 run 后的传递阻塞下游数」降序优先预合并。
 2. **持久化集成 worktree**：放在 `<cache>/premerge/<repo-key>/worktree`（绝不放进源仓库，worker 永远不碰源工作区），复用 `target/` 与 `node_modules/`；每次先 `git reset --hard <源 HEAD>`，再对源 HEAD 与本 run 净 diff 做三方合并。
 3. **按层验收与产物**：集成树与原已验树完全一致时直接复用原验收结果，否则只跑命中的 `acceptRules` 层（未配时跑 `accept`，无超时/轮数上限，停滞沿用 `stall_warning`）；成功后在源仓钉 `refs/delegate/premerge/<run>` 并原子写 `premerge.json`（含 `baseHead`、`mergedTree`、`changedPaths`、跑过的层与耗时）；冲突或验收失败则写 `premerge_conflict` / `premerge_failed` 事件（带冲突文件与 `premerge.log` 指针），交主控决定 `reply`。
 4. **快进 `apply`（<2s）**：所有写源工作区操作严格发生在 `apply.lock` 内。命中「源 `HEAD == baseHead` 且源工作树在 `changedPaths` 上无脏改」时，直接把 `mergedTree` 的这些路径写入源工作区（保持未提交语义，不碰 git index）并跳过重跑验收；任一条件不满足则失败关闭回退到三方合并，并输出一行原因（如「主干已前进 2 个提交，走三方合并」）。
