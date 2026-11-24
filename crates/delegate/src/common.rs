@@ -50,6 +50,103 @@ pub fn caller_source() -> Option<(String, &'static str)> {
 pub fn caller() -> Option<String> {
     caller_source().map(|(id, _)| id)
 }
+
+fn proc_stat_ppid_ticks(pid: u32) -> Option<(u32, u64)> {
+    let txt = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rparen = txt.rfind(')')?;
+    let fields: Vec<&str> = txt.get(rparen + 2..)?.split_whitespace().collect();
+    // fields[0]=state, fields[1]=ppid, fields[19]=starttime (field 22 overall).
+    let ppid = fields.get(1)?.parse::<u32>().ok()?;
+    let ticks = fields.get(19)?.parse::<u64>().ok()?;
+    Some((ppid, ticks))
+}
+
+fn is_harness_cmdline(pid: u32) -> bool {
+    let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let tokens: Vec<String> = raw
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+    let base = Path::new(first)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(first);
+    if matches!(base, "claude" | "codex" | "pi" | "rpi") {
+        return true;
+    }
+    if matches!(base, "node" | "bun" | "deno") {
+        return tokens.iter().skip(1).take(3).any(|arg| {
+            let lower = arg.to_ascii_lowercase();
+            lower.contains("claude")
+                || lower.contains("codex")
+                || lower.ends_with("/pi")
+                || lower.contains("pi-coding-agent")
+        });
+    }
+    false
+}
+
+fn find_session_harness_pid() -> Option<(u32, u64)> {
+    let mut pid = std::os::unix::process::parent_id();
+    for _ in 0..8 {
+        if pid <= 1 {
+            break;
+        }
+        let (ppid, ticks) = proc_stat_ppid_ticks(pid)?;
+        if is_harness_cmdline(pid) {
+            return Some((pid, ticks));
+        }
+        if ppid == pid {
+            break;
+        }
+        pid = ppid;
+    }
+    None
+}
+
+/// Lock-free best-effort recording of the caller's enclosing harness PID into
+/// `<state>/sessions.json` so the Stop hook can tell whether a session is still live.
+/// Only writes when a known harness ancestor (`claude` / `codex` / `pi`) is detected.
+pub fn touch_caller_session() {
+    let Some(id) = caller() else {
+        return;
+    };
+    let Some((pid, start_ticks)) = find_session_harness_pid() else {
+        return;
+    };
+    let state = state_dir();
+    if fs::create_dir_all(&state).is_err() {
+        return;
+    }
+    let path = state.join("sessions.json");
+    let mut doc = json(&path);
+    if !doc.is_object() {
+        doc = serde_json::json!({});
+    }
+    let now_epoch = epoch() as i64;
+    let cutoff = now_epoch - 14 * 86_400;
+    if let Some(map) = doc.as_object_mut() {
+        map.retain(|k, v| {
+            k == &id
+                || iso_epoch(s(v, "lastSeenAt")).is_none_or(|ts| ts >= cutoff)
+        });
+        map.insert(
+            id,
+            serde_json::json!({
+                "pid": pid,
+                "startTicks": start_ticks,
+                "lastSeenAt": iso(),
+            }),
+        );
+    }
+    let _ = write_json(&path, &doc);
+}
 pub fn setting(name: &str, default: &str) -> String {
     env::var(format!("DELEGATE_{name}"))
         .ok()

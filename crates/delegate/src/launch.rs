@@ -3347,6 +3347,7 @@ pub fn launch(
     if !extra["sync"].is_null() {
         write_json(run.join("sync.json"), &extra["sync"])?;
     }
+    touch_caller_session();
     // Single short-lived `.state.lock` commit for work table, repo registry, event, and index (<3ms).
     {
         let _state_lock = crate::locks::acquire_state(&slots).map_err(|e| e.to_string())?;

@@ -78,9 +78,16 @@ KIND_LABELS = {
     "work_stale": "工作项停滞",
 }
 APPLY_VALUE_FLAGS = {"--closes", "--message", "-m", "--work"}
+CALLER_ENV_KEYS = (
+    "DELEGATE_CALLER",
+    "CLAUDE_CODE_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "PI_SESSION_ID",
+)
 DEFAULT_STALE_VERIFY_HOURS = 4.0
 DEFAULT_STALE_READY_HOURS = 8.0
 DEFAULT_REMIND_COOLDOWN_HOURS = 6.0
+DEFAULT_ORPHAN_TAKEOVER_HOURS = 6.0
 DEFAULT_MAX_ACTIVE = 32
 DEFAULT_REPO_MAX_ACTIVE = 0
 
@@ -408,6 +415,15 @@ def read_run_snapshot(rdir: Path) -> dict | None:
         "worktree": wt_path,
         "dir": str(rdir),
     }
+    for mkey in ("resultReadAt", "appliedAt", "repliedAt", "startedAt"):
+        mval = str(meta.get(mkey) or "").strip()
+        if mval:
+            obj[mkey] = mval
+    if isinstance(meta.get("startedEpoch"), (int, float)):
+        obj["startedEpoch"] = meta["startedEpoch"]
+    fin_at = str(summary.get("finishedAt") or "").strip()
+    if fin_at:
+        obj["finishedAt"] = fin_at
     if isinstance(summary.get("pendingChanges"), dict):
         obj["pendingChanges"] = summary["pendingChanges"]
     if isinstance(summary.get("changes"), dict):
@@ -431,6 +447,20 @@ def read_run_snapshot(rdir: Path) -> dict | None:
         else:
             obj["next"] = f"apply {rid}"
     return obj
+
+
+def overlay_index_meta(cand: dict, idx_meta: dict | None, rdir: Path | None = None) -> None:
+    """Copy auxiliary metadata (`resultReadAt`, `appliedAt`, `repliedAt`, `appliedCleaned`)
+    cached in `index.json` onto a run status dict without re-opening disk files."""
+    if not isinstance(idx_meta, dict):
+        return
+    for key in ("resultReadAt", "appliedAt", "repliedAt"):
+        val = str(idx_meta.get(key) or "").strip()
+        if val and not cand.get(key):
+            cand[key] = val
+    gen_pending = rdir is not None and (rdir / ".generate-pending").exists()
+    if not gen_pending and (idx_meta.get("appliedCleaned") is True or bool(cand.get("appliedAt"))):
+        cand["applied"] = True
 
 
 def fetch_status(runs_dir: Path, index_runs: dict[str, dict]) -> list[dict]:
@@ -467,11 +497,14 @@ def fetch_status(runs_dir: Path, index_runs: dict[str, dict]) -> list[dict]:
                         except (OSError, ValueError):
                             stale = True
             else:
-                if (rdir / ".applied").exists() and not (rdir / ".generate-pending").exists():
-                    if cand.get("applied") is not True:
-                        stale = True
+                has_applied_marker = (
+                    (rdir / ".applied").exists() or (rdir / ".applied-cleaned").exists()
+                ) and not (rdir / ".generate-pending").exists()
+                if has_applied_marker and cand.get("applied") is not True:
+                    stale = True
             if not stale:
                 cand.setdefault("dir", str(rdir))
+                overlay_index_meta(cand, entry.get("meta"), rdir)
                 # Overlay fresh premerge.json and sign.json directly from disk (lock-free).
                 pm = read_json_file(rdir / "premerge.json")
                 if pm is not None:
@@ -640,6 +673,306 @@ def run_belongs_to_scope(obj: dict, is_current: bool, caller_id: str) -> bool:
     # When no session caller id is present (e.g. standalone CLI / legacy tests),
     # only include other-repo runs that also do not belong to a specific session.
     return not run_caller
+
+
+def read_proc_stat_state_ppid_ticks(pid: int) -> tuple[str, int, int] | None:
+    """Return `(state_char, ppid, starttime_ticks)` from `/proc/<pid>/stat` (Linux)."""
+    try:
+        txt = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    rparen = txt.rfind(")")
+    if rparen == -1:
+        return None
+    fields = txt[rparen + 2 :].split()
+    if len(fields) < 20:
+        return None
+    try:
+        # fields[0]=state, fields[1]=ppid, fields[19]=starttime (field 22 overall).
+        return fields[0], int(fields[1]), int(fields[19])
+    except ValueError:
+        return None
+
+
+def pid_alive_with_ticks(pid: int, expected_ticks: int | None = None) -> bool:
+    """Check PID liveness, excluding zombies and guarding against PID reuse via startTicks."""
+    if not pid_alive(pid):
+        return False
+    stat_info = read_proc_stat_state_ppid_ticks(pid)
+    if stat_info is not None:
+        state_ch, _ppid, actual_ticks = stat_info
+        if state_ch == "Z":
+            return False
+        if isinstance(expected_ticks, int) and expected_ticks > 0 and actual_ticks != expected_ticks:
+            return False
+    return True
+
+
+def _is_harness_cmdline(pid: int) -> bool:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+    if not raw:
+        return False
+    tokens = [t.decode("utf-8", errors="replace") for t in raw.split(b"\x00") if t]
+    if not tokens:
+        return False
+    base = os.path.basename(tokens[0])
+    if base in ("claude", "codex", "pi", "rpi"):
+        return True
+    if base in ("node", "bun", "deno"):
+        for arg in tokens[1:4]:
+            low = arg.lower()
+            if (
+                "claude" in low
+                or "codex" in low
+                or low.endswith("/pi")
+                or "pi-coding-agent" in low
+            ):
+                return True
+    return False
+
+
+def find_session_harness_pid() -> tuple[int, int] | None:
+    """Walk ancestor processes up to 8 hops to locate an enclosing Claude/Codex/Pi harness."""
+    pid = os.getppid()
+    for _ in range(8):
+        if pid <= 1:
+            break
+        stat_info = read_proc_stat_state_ppid_ticks(pid)
+        if stat_info is None:
+            break
+        _state, ppid, ticks = stat_info
+        if _is_harness_cmdline(pid):
+            return pid, ticks
+        if ppid == pid:
+            break
+        pid = ppid
+    return None
+
+
+def touch_caller_session(sdir: Path, caller_id: str, now: int) -> None:
+    """Lock-free atomic update of `<state>/sessions.json` for the current caller."""
+    if not caller_id:
+        return
+    try:
+        sdir.mkdir(parents=True, exist_ok=True)
+        path = sdir / "sessions.json"
+        doc = read_json_file(path)
+        sessions = dict(doc) if isinstance(doc, dict) else {}
+        prev = sessions.get(caller_id) if isinstance(sessions.get(caller_id), dict) else {}
+        rec: dict = {
+            "lastSeenAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        }
+        harness = find_session_harness_pid()
+        if harness is not None:
+            rec["pid"] = harness[0]
+            rec["startTicks"] = harness[1]
+        elif isinstance(prev.get("pid"), int) and prev["pid"] > 0:
+            prev_ticks = prev.get("startTicks") if isinstance(prev.get("startTicks"), int) else None
+            if pid_alive_with_ticks(prev["pid"], prev_ticks):
+                rec["pid"] = prev["pid"]
+                if prev_ticks is not None:
+                    rec["startTicks"] = prev_ticks
+        sessions[caller_id] = rec
+        cutoff = now - 14 * 86400
+        pruned: dict = {}
+        for k, v in sessions.items():
+            if not isinstance(k, str) or not isinstance(v, dict):
+                continue
+            if k == caller_id:
+                pruned[k] = v
+                continue
+            ts = parse_iso_utc(str(v.get("lastSeenAt") or ""))
+            if ts is None or ts >= cutoff:
+                pruned[k] = v
+        tmp = sdir / f"sessions.json.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(pruned, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def find_alive_callers_in_proc(target_callers: set[str]) -> set[str]:
+    """Check whether any live user process carries one of `target_callers` in its
+    caller environment variables or `--session-id`/`--resume` argv."""
+    if not target_callers:
+        return set()
+    found: set[str] = set()
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return found
+    my_pid = os.getpid()
+    my_uid = os.getuid() if hasattr(os, "getuid") else None
+    env_prefixes = tuple(f"{k}=".encode("ascii") for k in CALLER_ENV_KEYS)
+    target_bytes = {c.encode("utf-8", errors="ignore"): c for c in target_callers if c}
+    if not target_bytes:
+        return found
+    try:
+        for entry in proc.iterdir():
+            name = entry.name
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            if pid == my_pid:
+                continue
+            try:
+                if my_uid is not None and entry.stat().st_uid != my_uid:
+                    continue
+                stat_txt = (entry / "stat").read_text(encoding="utf-8", errors="ignore")
+                rparen = stat_txt.rfind(")")
+                if rparen != -1 and rparen + 2 < len(stat_txt) and stat_txt[rparen + 2] == "Z":
+                    continue
+            except OSError:
+                continue
+            # Check `/proc/<pid>/environ` for exact `KEY=<caller>` match.
+            try:
+                env_raw = (entry / "environ").read_bytes()
+                if env_raw:
+                    for item in env_raw.split(b"\x00"):
+                        for pfx in env_prefixes:
+                            if item.startswith(pfx):
+                                val = item[len(pfx) :].strip()
+                                matched = target_bytes.get(val)
+                                if matched:
+                                    found.add(matched)
+                                    if len(found) == len(target_callers):
+                                        return found
+            except OSError:
+                pass
+            # Check `/proc/<pid>/cmdline` for `--session-id <id>` / `--resume <id>`.
+            try:
+                cmd_raw = (entry / "cmdline").read_bytes()
+                if cmd_raw:
+                    toks = [t for t in cmd_raw.split(b"\x00") if t]
+                    for i, tok in enumerate(toks):
+                        if tok in (b"--session-id", b"--resume") and i + 1 < len(toks):
+                            matched = target_bytes.get(toks[i + 1].strip())
+                            if matched:
+                                found.add(matched)
+                                if len(found) == len(target_callers):
+                                    return found
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return found
+
+
+def get_run_unclaimed_ts(obj: dict) -> int | None:
+    """Return epoch timestamp when a run became unclaimed (finishedAt for terminal runs,
+    startedAt/startedEpoch for active runs)."""
+    st = str(obj.get("state") or "")
+    is_active = st in ("running", "starting", "waiting", "queued")
+    if not is_active:
+        fin = parse_iso_utc(str(obj.get("finishedAt") or ""))
+        if fin is not None:
+            return fin
+        rdir = obj.get("dir")
+        if isinstance(rdir, str) and rdir:
+            summary = read_json_file(Path(rdir) / "summary.json") or {}
+            fin = parse_iso_utc(str(summary.get("finishedAt") or ""))
+            if fin is not None:
+                obj["finishedAt"] = str(summary.get("finishedAt") or "").strip()
+                return fin
+    st_at = parse_iso_utc(str(obj.get("startedAt") or ""))
+    if st_at is not None:
+        return st_at
+    ep = obj.get("startedEpoch")
+    if isinstance(ep, (int, float)) and ep > 0:
+        return int(ep)
+    rdir = obj.get("dir")
+    if isinstance(rdir, str) and rdir:
+        meta = read_json_file(Path(rdir) / "meta.json") or {}
+        st_at = parse_iso_utc(str(meta.get("startedAt") or ""))
+        if st_at is not None:
+            obj["startedAt"] = str(meta.get("startedAt") or "").strip()
+            return st_at
+        ep = meta.get("startedEpoch")
+        if isinstance(ep, (int, float)) and ep > 0:
+            obj["startedEpoch"] = ep
+            return int(ep)
+    return None
+
+
+class CallerLivenessChecker:
+    """Determines whether another caller session is still alive or has expired past
+    `DELEGATE_ORPHAN_TAKEOVER_HOURS` (default 6h) so this session may take over."""
+
+    def __init__(
+        self,
+        sdir: Path,
+        cursors_doc: dict,
+        now: int,
+        orphan_secs: float,
+    ) -> None:
+        self.sdir = sdir
+        self.cursors_doc = cursors_doc
+        self.now = now
+        self.orphan_secs = orphan_secs
+        raw_sessions = read_json_file(sdir / "sessions.json")
+        self.sessions: dict = raw_sessions if isinstance(raw_sessions, dict) else {}
+        self._alive_cache: dict[str, bool] = {}
+        self._proc_checked: set[str] = set()
+        self._proc_alive: set[str] = set()
+
+    def _check_proc(self, caller: str) -> bool:
+        if caller not in self._proc_checked:
+            found = find_alive_callers_in_proc({caller})
+            self._proc_checked.add(caller)
+            self._proc_alive.update(found)
+        return caller in self._proc_alive
+
+    def is_alive(self, orig_caller: str) -> bool:
+        if not orig_caller:
+            return False
+        if orig_caller in self._alive_cache:
+            return self._alive_cache[orig_caller]
+
+        alive = False
+        rec = self.sessions.get(orig_caller)
+        has_recorded_pid = False
+        if isinstance(rec, dict) and isinstance(rec.get("pid"), int) and rec["pid"] > 0:
+            has_recorded_pid = True
+            ticks = rec.get("startTicks") if isinstance(rec.get("startTicks"), int) else None
+            if pid_alive_with_ticks(rec["pid"], ticks):
+                alive = True
+
+        if not alive and self._check_proc(orig_caller):
+            alive = True
+
+        # When no explicit session PID was recorded, fall back to recent activity timestamps
+        # (`sessions.json` lastSeenAt or `cursors.json` updatedAt within orphan_secs).
+        if not alive and not has_recorded_pid:
+            last_ts: int | None = None
+            if isinstance(rec, dict):
+                ts = parse_iso_utc(str(rec.get("lastSeenAt") or ""))
+                if ts is not None:
+                    last_ts = ts
+            callers_map = self.cursors_doc.get("callers")
+            if isinstance(callers_map, dict):
+                centry = callers_map.get(orig_caller)
+                if isinstance(centry, dict):
+                    cts = parse_iso_utc(str(centry.get("updatedAt") or ""))
+                    if cts is not None and (last_ts is None or cts > last_ts):
+                        last_ts = cts
+            if last_ts is not None and (self.now - last_ts) < self.orphan_secs:
+                alive = True
+
+        self._alive_cache[orig_caller] = alive
+        return alive
+
+    def can_takeover(self, orig_caller: str, unclaimed_since_ts: int | None) -> bool:
+        """True only if `orig_caller` is empty (ownerless), OR `orig_caller` is NOT alive
+        AND the item has remained unclaimed for at least `orphan_secs`."""
+        if not orig_caller:
+            return True
+        if self.is_alive(orig_caller):
+            return False
+        if unclaimed_since_ts is None:
+            return True
+        return (self.now - unclaimed_since_ts) >= self.orphan_secs
 
 
 def read_locked_inodes() -> set[tuple[int, int, int]] | None:
@@ -1018,6 +1351,66 @@ def load_queue_items_by_name() -> dict[str, list[dict]] | None:
     return by_name
 
 
+def inspect_run_resolution(
+    rid: str,
+    seq: int,
+    run_obj: dict | None,
+    replied_parents: set[str],
+    resolving: dict[str, dict[str, int]],
+) -> tuple[bool, bool, bool, bool]:
+    """Return `(is_applied, is_cleaned, is_replied, has_result_read)` for a run-scoped event."""
+    is_applied = resolving["applied"].get(rid, 0) > seq or (
+        run_obj is not None
+        and (run_obj.get("applied") is True or bool(str(run_obj.get("appliedAt") or "").strip()))
+    )
+    is_cleaned = resolving["cleaned"].get(rid, 0) > seq or (
+        run_obj is not None and run_obj.get("cleaned") is True
+    )
+    is_replied = (
+        rid in replied_parents
+        or resolving["replied"].get(rid, 0) > seq
+        or (run_obj is not None and bool(str(run_obj.get("repliedAt") or "").strip()))
+    )
+    has_result_read = (
+        run_obj is not None and bool(str(run_obj.get("resultReadAt") or "").strip())
+    )
+
+    if run_obj is None:
+        if not is_cleaned and (cache_dir() / "archive" / rid / "record").is_dir():
+            is_cleaned = True
+        return is_applied, is_cleaned, is_replied, has_result_read
+
+    rdir_str = run_obj.get("dir")
+    if isinstance(rdir_str, str) and rdir_str and not (
+        is_applied and is_replied and has_result_read
+    ):
+        rdir = Path(rdir_str)
+        if not is_applied and (
+            (rdir / ".applied").exists() or (rdir / ".applied-cleaned").exists()
+        ) and not (rdir / ".generate-pending").exists():
+            is_applied = True
+            run_obj["applied"] = True
+        if not (is_applied and is_replied and has_result_read) and not run_obj.get("_metaChecked"):
+            meta = read_json_file(rdir / "meta.json")
+            run_obj["_metaChecked"] = True
+            if isinstance(meta, dict):
+                rra = str(meta.get("resultReadAt") or "").strip()
+                if rra:
+                    run_obj["resultReadAt"] = rra
+                    has_result_read = True
+                apa = str(meta.get("appliedAt") or "").strip()
+                if apa:
+                    run_obj["appliedAt"] = apa
+                    if not (rdir / ".generate-pending").exists():
+                        run_obj["applied"] = True
+                        is_applied = True
+                rpa = str(meta.get("repliedAt") or "").strip()
+                if rpa:
+                    run_obj["repliedAt"] = rpa
+                    is_replied = True
+    return is_applied, is_cleaned, is_replied, has_result_read
+
+
 def is_alert_event_stale(
     ev: dict,
     seq: int,
@@ -1071,17 +1464,22 @@ def is_alert_event_stale(
         return False
 
     run_obj = all_runs_by_id.get(rid)
-    is_applied = (
-        resolving["applied"].get(rid, 0) > seq
-        or (run_obj is not None and run_obj.get("applied") is True)
+    is_applied, is_cleaned, is_replied, has_result_read = inspect_run_resolution(
+        rid,
+        seq,
+        run_obj,
+        replied_parents,
+        resolving,
     )
-    is_cleaned = (
-        resolving["cleaned"].get(rid, 0) > seq
-        or (run_obj is not None and run_obj.get("cleaned") is True)
-    )
-    is_replied = rid in replied_parents or resolving["replied"].get(rid, 0) > seq
 
     if is_applied or is_cleaned or is_replied:
+        return True
+
+    # Delivery / question / terminal-outcome events already read by any session (`resultReadAt`).
+    if has_result_read and (
+        kind in ("delivered", "question", "rejected", "failed")
+        or (kind == "needs_attention" and pl.get("policyRefused") is True)
+    ):
         return True
 
     if kind == "stall_warning":
@@ -1122,6 +1520,38 @@ def run_label(obj: dict, repo_label: str, is_current: bool) -> str:
     return name if is_current else f"【{repo_label}】{name}"
 
 
+def _format_event_preview(ev: dict, is_orphan: bool) -> tuple[str, str, str]:
+    kind = str(ev.get("kind") or "")
+    klabel = KIND_LABELS.get(kind, kind)
+    pl = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+    wid = str(pl.get("workId") or "").strip()
+    raw_label = str(pl.get("name") or pl.get("queueName") or ev.get("run") or "?").replace("\n", " ")
+    label = f"{wid}:{raw_label}" if wid else raw_label
+    rid = str(ev.get("run") or "").strip()
+    prefix = "[接盘]" if is_orphan else ""
+    card = pl.get("card") if isinstance(pl.get("card"), dict) else None
+    pm = pl.get("premerge") if isinstance(pl.get("premerge"), dict) else None
+    if kind == "delivered" and card is not None and isinstance(card.get("riskTotal"), int):
+        rt = card["riskTotal"]
+        pm_st = str((pm or {}).get("status") or "")
+        if pm_st == "ready":
+            ff_tag = "快进✓"
+        elif pm_st in ("running", "pending"):
+            ff_tag = "预合并中"
+        elif pm_st == "stale":
+            ff_tag = "快进✗"
+        elif pm_st == "conflict":
+            ff_tag = "预合并冲突"
+        elif pm_st == "failed":
+            ff_tag = "预合并失败"
+        else:
+            ff_tag = "快进—"
+        preview = f"{prefix}{klabel}:{label}(风险{rt},{ff_tag})"
+    else:
+        preview = f"{prefix}{klabel}:{label}"
+    return preview, label, rid
+
+
 def check_unread_events(
     payload: dict,
     cwd: str,
@@ -1129,15 +1559,18 @@ def check_unread_events(
     work_by_id: dict[str, dict],
     all_runs_by_id: dict[str, dict],
     replied_parents: set[str],
-) -> tuple[str | None, list[str], list[str]]:
+    cursors_doc: dict,
+    liveness: CallerLivenessChecker,
+) -> tuple[str | None, list[str], list[str], int]:
     """Race lock: block if unread delivery/question/attention events exist past the cursor.
-    Returns (reason, display_names, run_ids)."""
+    Non-initiator runs only block when the original caller has expired past the orphan timeout;
+    otherwise they are counted without blocking.
+    Returns (reason, display_names, run_ids, other_caller_count)."""
     sdir = state_dir()
     events_file = sdir / "events.jsonl"
     if not events_file.is_file():
-        return None, [], []
+        return None, [], [], 0
 
-    cursors_doc = read_json_file(sdir / "cursors.json") or {}
     caller_id = current_caller_id(payload)
 
     callers_map = cursors_doc.get("callers") if isinstance(cursors_doc.get("callers"), dict) else {}
@@ -1167,7 +1600,7 @@ def check_unread_events(
         except OSError:
             current_repo_str = str(cur)
 
-    candidates: list[tuple[int, dict]] = []
+    candidates: list[tuple[int, dict, bool]] = []
     resolving: dict[str, dict[str, int]] = {
         "applied": {},
         "cleaned": {},
@@ -1239,22 +1672,25 @@ def check_unread_events(
                         continue
                 if run_id and run_id in read_runs and seq <= read_runs[run_id]:
                     continue
-                candidates.append((seq, ev))
+                candidates.append((seq, ev, ev_is_current))
     except OSError:
-        return None, [], []
+        return None, [], [], 0
 
     if not candidates:
-        return None, [], []
+        return None, [], [], 0
 
     queue_items_by_name = (
         load_queue_items_by_name()
-        if any(str(ev.get("kind") or "") == "queue_paused" for _, ev in candidates)
+        if any(str(ev.get("kind") or "") == "queue_paused" for _, ev, _ in candidates)
         else None
     )
-    unread = [
-        ev
-        for seq, ev in candidates
-        if not is_alert_event_stale(
+
+    own_unread: list[dict] = []
+    orphan_unread: list[dict] = []
+    other_caller_count = 0
+
+    for seq, ev, ev_is_current in candidates:
+        if is_alert_event_stale(
             ev,
             seq,
             now,
@@ -1263,53 +1699,82 @@ def check_unread_events(
             replied_parents,
             resolving,
             queue_items_by_name,
-        )
+        ):
+            continue
+
+        kind = str(ev.get("kind") or "")
+        pl = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+        rid = str(ev.get("run") or "").strip()
+
+        if kind == "work_stale":
+            wid = str(pl.get("workId") or "").strip()
+            w = work_by_id.get(wid) if wid else None
+            w_caller = str(w.get("caller") or "").strip() if isinstance(w, dict) else ""
+            if w_caller and w_caller != caller_id:
+                since_ts = parse_iso_utc(
+                    str((w or {}).get("stateSince") or ev.get("at") or "")
+                )
+                if liveness.can_takeover(w_caller, since_ts):
+                    orphan_unread.append(ev)
+                else:
+                    other_caller_count += 1
+                continue
+            own_unread.append(ev)
+            continue
+
+        if rid and kind not in ("work_ready", "work_defer_expired"):
+            run_obj = all_runs_by_id.get(rid)
+            run_caller = get_run_caller(run_obj) if run_obj is not None else ""
+            if run_caller and run_caller != caller_id:
+                if not ev_is_current:
+                    continue
+                ev_ts = parse_iso_utc(str(ev.get("at") or ""))
+                if ev_ts is None and run_obj is not None:
+                    ev_ts = get_run_unclaimed_ts(run_obj)
+                if liveness.can_takeover(run_caller, ev_ts):
+                    orphan_unread.append(ev)
+                else:
+                    other_caller_count += 1
+                continue
+
+        own_unread.append(ev)
+
+    if not own_unread and not orphan_unread:
+        return None, [], [], other_caller_count
+
+    ordered: list[tuple[dict, bool]] = [
+        *((ev, False) for ev in own_unread),
+        *((ev, True) for ev in orphan_unread),
     ]
-
-    if not unread:
-        return None, [], []
-
     previews: list[str] = []
     ev_names: list[str] = []
     ev_run_ids: list[str] = []
-    for ev in unread[:5]:
-        kind = str(ev.get("kind") or "")
-        klabel = KIND_LABELS.get(kind, kind)
-        pl = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
-        wid = str(pl.get("workId") or "").strip()
-        raw_label = str(pl.get("name") or pl.get("queueName") or ev.get("run") or "?").replace("\n", " ")
-        label = f"{wid}:{raw_label}" if wid else raw_label
+    for ev, is_orphan in ordered[:5]:
+        preview, label, rid = _format_event_preview(ev, is_orphan)
+        previews.append(preview)
         ev_names.append(label)
-        rid = str(ev.get("run") or "").strip()
         if rid and rid not in ev_run_ids:
             ev_run_ids.append(rid)
-        card = pl.get("card") if isinstance(pl.get("card"), dict) else None
-        pm = pl.get("premerge") if isinstance(pl.get("premerge"), dict) else None
-        if kind == "delivered" and card is not None and isinstance(card.get("riskTotal"), int):
-            rt = card["riskTotal"]
-            pm_st = str((pm or {}).get("status") or "")
-            if pm_st == "ready":
-                ff_tag = "快进✓"
-            elif pm_st in ("running", "pending"):
-                ff_tag = "预合并中"
-            elif pm_st == "stale":
-                ff_tag = "快进✗"
-            elif pm_st == "conflict":
-                ff_tag = "预合并冲突"
-            elif pm_st == "failed":
-                ff_tag = "预合并失败"
-            else:
-                ff_tag = "快进—"
-            previews.append(f"{klabel}:{label}(风险{rt},{ff_tag})")
-        else:
-            previews.append(f"{klabel}:{label}")
-    more = f" 等共 {len(unread)} 条" if len(unread) > 5 else ""
+
+    total = len(ordered)
+    more = f" 等共 {total} 条" if total > 5 else ""
     summary = "、".join(previews) + more
-    return (
-        f"有新事件，先看 delegate events --since {cursor_seq}（未读 {len(unread)} 条：{summary}）。",
-        ev_names,
-        ev_run_ids,
+    other_note = (
+        f"（另 {other_caller_count} 条属其他活跃会话，未拦截）"
+        if other_caller_count > 0
+        else ""
     )
+    if orphan_unread and not own_unread:
+        reason = (
+            f"有原会话已失效且超时未认领的事件，请接盘：先看 delegate events --since {cursor_seq}"
+            f"（待接盘 {len(orphan_unread)} 条：{summary}）。{other_note}"
+        )
+    else:
+        reason = (
+            f"有新事件，先看 delegate events --since {cursor_seq}"
+            f"（未读 {total} 条：{summary}）。{other_note}"
+        )
+    return reason, ev_names, ev_run_ids, other_caller_count
 
 
 def _parse_pos_float_env(name: str, default: float) -> float:
@@ -1412,35 +1877,64 @@ def has_idle_slot(
     return True
 
 
-def load_work_remind(sdir: Path) -> dict[str, int]:
-    """Read `<state>/work-remind.json` -> `{work_id: epoch_secs}`."""
+def _parse_remind_ts(v: object) -> int | None:
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return int(v)
+    if isinstance(v, str):
+        return parse_iso_utc(v)
+    return None
+
+
+def load_work_remind(sdir: Path) -> dict[str, dict[str, int]]:
+    """Read `<state>/work-remind.json` -> `{work_id: {caller_key: epoch_secs}}`.
+    Accepts legacy flat `{work_id: iso_ts}` entries under the `"default"` caller key."""
     doc = read_json_file(sdir / "work-remind.json")
     if not doc:
         return {}
-    out: dict[str, int] = {}
+    out: dict[str, dict[str, int]] = {}
     for k, v in doc.items():
         if not isinstance(k, str) or not k.strip():
             continue
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            out[k.strip()] = int(v)
-        elif isinstance(v, str):
-            ts = parse_iso_utc(v)
+        wid = k.strip()
+        if isinstance(v, dict):
+            per_caller: dict[str, int] = {}
+            for ck, cv in v.items():
+                if not isinstance(ck, str) or not ck.strip():
+                    continue
+                ts = _parse_remind_ts(cv)
+                if ts is not None:
+                    per_caller[ck.strip()] = ts
+            if per_caller:
+                out[wid] = per_caller
+        else:
+            ts = _parse_remind_ts(v)
             if ts is not None:
-                out[k.strip()] = ts
+                out[wid] = {"default": ts}
     return out
 
 
-def save_work_remind(sdir: Path, remind_map: dict[str, int], now: int) -> None:
-    """Atomically persist `<state>/work-remind.json` without acquiring `.state.lock`."""
+def save_work_remind(
+    sdir: Path,
+    remind_map: dict[str, dict[str, int]],
+    now: int,
+) -> None:
+    """Atomically persist `<state>/work-remind.json` keyed by `(work_id, caller_key)`
+    without acquiring `.state.lock`."""
     try:
         sdir.mkdir(parents=True, exist_ok=True)
         # Drop entries older than 7 days to keep file bounded.
         cutoff = now - 7 * 86400
-        payload = {
-            k: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
-            for k, ts in sorted(remind_map.items())
-            if ts >= cutoff
-        }
+        payload: dict[str, dict[str, str]] = {}
+        for wid, per_caller in sorted(remind_map.items()):
+            if not isinstance(per_caller, dict):
+                continue
+            kept = {
+                ck: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+                for ck, ts in sorted(per_caller.items())
+                if isinstance(ts, int) and ts >= cutoff
+            }
+            if kept:
+                payload[wid] = kept
         target = sdir / "work-remind.json"
         tmp = sdir / f"work-remind.json.{os.getpid()}.tmp"
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -1454,10 +1948,13 @@ def check_stale_work_items(
     cwd: str,
     now: int,
     current_repo: Path | None,
+    caller_id: str,
+    liveness: CallerLivenessChecker,
 ) -> tuple[str | None, list[str]]:
     """Pick up to 3 oldest stale `ready`/`verify` or missing-brief `ready` work items
-    (excluding owner items and items reminded within the 6h cooldown).
-    Updates `<state>/work-remind.json` for reminded items."""
+    owned by `caller_id` (or ownerless / whose owner caller expired past orphan timeout),
+    excluding owner items and items reminded to this caller within the 6h cooldown.
+    Updates `<state>/work-remind.json` keyed by `(work_id, caller_key)`."""
     if not work_items:
         return None, []
 
@@ -1475,7 +1972,8 @@ def check_stale_work_items(
 
     sdir = state_dir()
     remind_map = load_work_remind(sdir)
-    candidates: list[tuple[int, str, str, str]] = []  # (age_secs, id, title, label)
+    caller_key = caller_id or "default"
+    candidates: list[tuple[int, str, str, str, bool]] = []  # (age_secs, id, title, label, is_orphan)
 
     for item in work_items:
         if item.get("owner"):
@@ -1514,12 +2012,19 @@ def check_stale_work_items(
         if label is None:
             continue
 
-        last_rem = remind_map.get(wid)
+        item_caller = str(item.get("caller") or "").strip()
+        is_orphan = False
+        if item_caller and item_caller != caller_id:
+            if not liveness.can_takeover(item_caller, since_ts):
+                continue
+            is_orphan = True
+
+        last_rem = remind_map.get(wid, {}).get(caller_key)
         if last_rem is not None and (now - last_rem) < cooldown_secs:
             continue
 
         title = str(item.get("title") or wid).replace("\n", " ").replace("\r", " ").strip()
-        candidates.append((age_secs, wid, title, label))
+        candidates.append((age_secs, wid, title, label, is_orphan))
 
     if not candidates:
         return None, []
@@ -1527,18 +2032,19 @@ def check_stale_work_items(
     candidates.sort(key=lambda c: (-c[0], c[1]))
     picked = candidates[:3]
 
-    for _, wid, _, _ in picked:
-        remind_map[wid] = now
+    for _, wid, _, _, _ in picked:
+        remind_map.setdefault(wid, {})[caller_key] = now
     save_work_remind(sdir, remind_map, now)
 
     lines = [f"工作表有 {len(picked)} 项停着没动，本回合给每项一个去向："]
-    for age_secs, wid, title, label in picked:
+    for age_secs, wid, title, label, is_orphan in picked:
         hours = int(age_secs // 3600)
-        lines.append(f"[{wid}] {title} · 停 {hours} 小时 · {label}")
+        suffix = "（原会话已失效待接手）" if is_orphan else ""
+        lines.append(f"[{wid}] {title} · 停 {hours} 小时 · {label}{suffix}")
     lines.append(
         '可选：派发 `delegate start --work Wxx …` · 等人或等运行 `delegate work wait Wxx --wait-manual "…"|--after-applied RUN` · 暂缓 `delegate work defer Wxx --until … --reason "…"` · 关闭 `delegate work close Wxx --evidence "…"`'
     )
-    return "\n".join(lines), [wid for _, wid, _, _ in picked]
+    return "\n".join(lines), [wid for _, wid, _, _, _ in picked]
 
 
 def append_stop_logs(records: list[dict]) -> None:
@@ -1568,6 +2074,16 @@ def evaluate(payload: dict) -> dict | None:
 
     cwd = str(payload.get("cwd") or os.getcwd())
     now = int(time.time())
+    sdir = state_dir()
+    caller_id = current_caller_id(payload)
+    touch_caller_session(sdir, caller_id, now)
+    orphan_secs = (
+        _parse_pos_float_env("DELEGATE_ORPHAN_TAKEOVER_HOURS", DEFAULT_ORPHAN_TAKEOVER_HOURS)
+        * 3600.0
+    )
+    cursors_doc = read_json_file(sdir / "cursors.json") or {}
+    liveness = CallerLivenessChecker(sdir, cursors_doc, now, orphan_secs)
+
     reasons: list[str] = []
     log_records: list[dict] = []
 
@@ -1584,9 +2100,11 @@ def evaluate(payload: dict) -> dict | None:
     repo_items: list[tuple[Path | None, Path, str, bool, list[dict]]] = []
     all_runs_by_id: dict[str, dict] = {}
     replied_parents: set[str] = set()
-    for entry in index_runs.values():
+    for rdir_key, entry in index_runs.items():
         if isinstance(entry, dict) and isinstance(entry.get("status"), dict):
-            st_obj = entry["status"]
+            st_obj = dict(entry["status"])
+            st_obj.setdefault("dir", str(rdir_key))
+            overlay_index_meta(st_obj, entry.get("meta"), Path(rdir_key) if rdir_key else None)
             rid = st_obj.get("run")
             if isinstance(rid, str) and rid:
                 all_runs_by_id[rid] = st_obj
@@ -1604,13 +2122,15 @@ def evaluate(payload: dict) -> dict | None:
             if isinstance(par, str) and par:
                 replied_parents.add(par)
 
-    unread_reason, ev_names, ev_run_ids = check_unread_events(
+    unread_reason, ev_names, ev_run_ids, _other_ev_count = check_unread_events(
         payload,
         cwd,
         now,
         work_by_id,
         all_runs_by_id,
         replied_parents,
+        cursors_doc,
+        liveness,
     )
     if unread_reason:
         reasons.append(unread_reason)
@@ -1633,12 +2153,12 @@ def evaluate(payload: dict) -> dict | None:
         ]
         gate_cwds, lane_runs = active_lane_state(procs)
 
-        caller_id = current_caller_id(payload)
         questions: list[tuple[str, str, bool]] = []  # (display, run_id, is_current)
         live_current: list[tuple[str, str, dict, Path | None]] = []  # (display, run_id, obj, repo_root)
         live_other: list[tuple[str, str, dict, Path | None]] = []  # (display, run_id, obj, repo_root)
         unmerged_items: list[tuple[str, str]] = []  # (display, run_id)
         stale_run_ids: list[str] = []
+        other_caller_run_count = 0
         work_fresh_def, work_expired_def = work_deferred_runs(work_items, now)
 
         for repo_root, _runs_dir, label, is_current, items in repo_items:
@@ -1676,6 +2196,17 @@ def evaluate(payload: dict) -> dict | None:
 
                 if not run_belongs_to_scope(obj, is_current, caller_id):
                     continue
+
+                is_orphan = False
+                if is_current:
+                    run_caller = get_run_caller(obj)
+                    if run_caller and run_caller != caller_id:
+                        if liveness.can_takeover(run_caller, get_run_unclaimed_ts(obj)):
+                            is_orphan = True
+                            disp = f"{disp}(原会话已失效待接盘)"
+                        else:
+                            other_caller_run_count += 1
+                            continue
 
                 # 1) Questioning runs (stopped waiting for controller decision).
                 if is_question:
@@ -1786,9 +2317,14 @@ def evaluate(payload: dict) -> dict | None:
                 if stale_run_ids
                 else ""
             )
+            other_note = (
+                f"（另 {other_caller_run_count} 项属其他活跃会话，未拦截）"
+                if other_caller_run_count > 0
+                else ""
+            )
             reasons.append(
                 f"有已交付的委派还没合也没写明原因（{names}）。{stale_note}"
-                "现在就合（delegate apply），或合不了就执行 `delegate work defer <run> --reason \"…\" --until 4h` 再结束回合。"
+                f"现在就合（delegate apply），或合不了就执行 `delegate work defer <run> --reason \"…\" --until 4h` 再结束回合。{other_note}"
             )
             log_records.append(
                 {
@@ -1803,7 +2339,14 @@ def evaluate(payload: dict) -> dict | None:
     if not reasons:
         current_repo = git_toplevel(cwd)
         if has_idle_slot(current_repo, repo_items, index_runs):
-            work_reason, work_ids = check_stale_work_items(work_items, cwd, now, current_repo)
+            work_reason, work_ids = check_stale_work_items(
+                work_items,
+                cwd,
+                now,
+                current_repo,
+                caller_id,
+                liveness,
+            )
             if work_reason:
                 reasons.append(work_reason)
                 log_records.append(

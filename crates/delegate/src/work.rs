@@ -285,6 +285,7 @@ pub struct WorkItem {
     pub close_reason: String,
     pub close_evidence: String,
     pub origin: String,
+    pub caller: String,
     pub note_root: String,
     pub applied: bool,
     pub cleaned: bool,
@@ -427,6 +428,7 @@ impl WorkItem {
             close_reason: s(v, "closeReason").to_string(),
             close_evidence: s(v, "closeEvidence").to_string(),
             origin: s(v, "origin").to_string(),
+            caller: s(v, "caller").trim().to_string(),
             note_root: s(v, "noteRoot").to_string(),
             applied: b(v, "applied"),
             cleaned: b(v, "cleaned"),
@@ -494,6 +496,9 @@ impl WorkItem {
         }
         if !self.origin.is_empty() {
             obj["origin"] = json!(self.origin);
+        }
+        if !self.caller.is_empty() {
+            obj["caller"] = json!(self.caller);
         }
         if !self.note_root.is_empty() {
             obj["noteRoot"] = json!(self.note_root);
@@ -2429,6 +2434,15 @@ pub fn on_run_started(work_id: &str, run: &Path, meta: &Value) {
     let now_iso = iso();
     if let Some(w) = items.iter_mut().find(|w| w.id == norm) {
         w.add_run(&rid, Some(run), Some(&repo));
+        let run_caller = s(meta, "caller").trim();
+        let eff_caller = if !run_caller.is_empty() {
+            Some(run_caller.to_string())
+        } else {
+            caller()
+        };
+        if let Some(c) = eff_caller {
+            w.caller = c;
+        }
         w.cleaned = false;
         w.defer_streak = 0;
         w.set_state("active", &now_iso);
@@ -5327,6 +5341,8 @@ fn add_cmd(args: &[String]) -> Res<i32> {
 
     let state = state_dir();
     fs::create_dir_all(&state).map_err(|e| format!("{}: {e}", state.display()))?;
+    touch_caller_session();
+    let cur_caller = caller().unwrap_or_default();
     let now_iso = iso();
     let should_warn_owner_kw = owner_info.is_none()
         && wf.wait_on.is_empty()
@@ -5365,6 +5381,7 @@ fn add_cmd(args: &[String]) -> Res<i32> {
                 updated_at: now_iso.clone(),
                 state_since: now_iso.clone(),
                 origin: "manual".into(),
+                caller: cur_caller.clone(),
                 ..Default::default()
             };
             items.push(q_item);
@@ -5421,6 +5438,7 @@ fn add_cmd(args: &[String]) -> Res<i32> {
             updated_at: now_iso.clone(),
             state_since: now_iso.clone(),
             origin: "manual".into(),
+            caller: cur_caller,
             ..Default::default()
         };
 
@@ -5527,6 +5545,8 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
 
     let recorded_wait_on = !wf.wait_on.is_empty();
     let state = state_dir();
+    touch_caller_session();
+    let cur_caller = caller();
     let now_iso = iso();
     let wait_prefetch = {
         let existing = load_raw(&state);
@@ -5610,6 +5630,9 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
             item.set_state("blocked", &now_iso);
         } else if wf.clear_wait && item.state == "blocked" {
             item.set_state("ready", &now_iso);
+        }
+        if let Some(c) = cur_caller {
+            item.caller = c;
         }
         item.updated_at = now_iso;
 

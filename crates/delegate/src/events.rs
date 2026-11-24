@@ -284,6 +284,7 @@ fn update_cursor_entry(entry: &mut Value, seq: u64) {
 
 /// Record that the current caller (from `wait` / `run` / human `events`) has read up to `seq`.
 pub fn record_cursor(seq: u64) {
+    touch_caller_session();
     record_cursor_in(&state_dir(), caller().as_deref(), seq);
 }
 
@@ -317,6 +318,7 @@ pub fn mark_runs_read(run_ids: &[String]) {
     if run_ids.is_empty() {
         return;
     }
+    touch_caller_session();
     mark_runs_read_in(&state_dir(), caller().as_deref(), run_ids);
 }
 

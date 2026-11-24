@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `delegate`：Stop 钩子（`hooks/claude-code-stop.py`）补齐跨会话判旧与按负责会话隔离——保留 `cursors.json` 按 caller 独立游标且不改事件流/游标格式；交付/提问类事件若对应 run 已合入、已 clean、已回复或已被任一会话读过结论（`resultReadAt`）即判旧放行，非本会话发起的 run 仅在原 caller 会话已不在且超过无人认领阈值（默认 `DEFAULT_ORPHAN_TAKEOVER_HOURS=6h`，`DELEGATE_ORPHAN_TAKEOVER_HOURS` 可配）时拦截接盘，否则只计数不拦；工作项新增 `caller` 字段（由 `work add`/`work wait`/`start --work` 记录最近负责会话），老化提醒只拦负责会话（未记录或负责会话失效超时后才允许接手），`<state>/work-remind.json` 冷却改按「项 × 会话」记录，非负责会话不触发也不消耗负责会话冷却。
+
 ## delegate 6.43.0 - 2026-11-24
 
 - `delegate` 6.43.0：`delegate-tui` 账号默认脱敏与多页显示修整——列表、详情标题、总览额度与 24h Token 面板默认只显示账号前 3 字符加 `…`（去掉邮箱列、详情页默认隐藏 `label`），账号页按 `i` 切换当前账号完整名/邮箱/`label`（仅内存态，底栏增 `i 全称`，`y` 仍复制完整账号名）；额度行改按可用宽度计算进度条并与文字留一格空格、不再黏连或行尾溢出；账号详情在跑 `agy` 进程改单行 `pid · run/agent`；全页顶栏统一完整页签名、窄宽先截右侧计数不留悬空 `·`；任务页时间列改按 `finishedAt` 算距今、模型列按 `别名·档位` 显示且只截别名、右侧结论 `render_markdown` 支持对齐渲染 Markdown 表格；总览 24h Token 面板 0 用量账号压成单行「近 24 小时无用量」。
