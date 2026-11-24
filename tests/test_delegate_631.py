@@ -400,6 +400,31 @@ class Delegate631Tests(unittest.TestCase):
         # Create a synthetic pre-6.31 old run (no workId field in meta.json)
         self.fake_pi([fixtures.answer("old run ok"), fixtures.SETTLED], pre="echo v1 > a.txt")
         r_old = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "legacy-feat", "--accept", "true", "old task"))
+        index_file = self.state_dir() / "index.json"
+        pm_file = Path(r_old["dir"]) / "premerge.json"
+        def _old_ready():
+            if not index_file.is_file():
+                return False
+            if pm_file.is_file():
+                try:
+                    pm_st = json.loads(pm_file.read_text(encoding="utf-8")).get("status")
+                except ValueError:
+                    return False
+                if pm_st in ("pending", "running"):
+                    return False
+            try:
+                runs_map = json.loads(index_file.read_text(encoding="utf-8")).get("runs", {})
+            except ValueError:
+                return False
+            for e in runs_map.values():
+                if not isinstance(e, dict):
+                    continue
+                st = e.get("status") or {}
+                if st.get("run") == r_old["run"] and st.get("state") == "delivered":
+                    idx_pm = (st.get("premerge") or {}).get("status")
+                    return idx_pm not in ("pending", "running")
+            return False
+        self.until(_old_ready, "legacy-feat flushed to index.json with premerge settled")
         meta_path = Path(r_old["dir"]) / "meta.json"
         meta = json.loads(meta_path.read_text())
         meta.pop("workId", None)

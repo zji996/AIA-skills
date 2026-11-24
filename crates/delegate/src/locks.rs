@@ -522,6 +522,14 @@ fn flock_raw(fd: i32, exclusive: bool, nonblock: bool) -> io::Result<()> {
     }
 }
 
+fn trace_state_lock_attempt(kind: LockKind, mode: &str) {
+    if kind == LockKind::State
+        && std::env::var("DELEGATE_MEASURE_STATE_LOCK").as_deref() == Ok("1")
+    {
+        eprintln!("STATE_LOCK_ATTEMPT={mode}");
+    }
+}
+
 /// Non-blocking single attempt (`LOCK_NB`). Never waits.
 pub fn try_acquire(kind: LockKind, path: &Path, exclusive: bool) -> io::Result<LockGuard> {
     try_acquire_opts(kind, path, exclusive, exclusive)
@@ -534,6 +542,7 @@ pub fn try_acquire_opts(
     exclusive: bool,
     record_owner: bool,
 ) -> io::Result<LockGuard> {
+    trace_state_lock_attempt(kind, "try");
     check_order(kind, path);
     let mut f = open_lock_file(path)?;
     flock_raw(f.as_raw_fd(), exclusive, true)?;
@@ -582,6 +591,7 @@ pub fn acquire_opts(
     exclusive: bool,
     record_owner: bool,
 ) -> io::Result<LockGuard> {
+    trace_state_lock_attempt(kind, "acquire");
     check_order(kind, path);
     let mut f = open_lock_file(path)?;
     // Fast uncontended path: 1 syscall, zero sleeping.

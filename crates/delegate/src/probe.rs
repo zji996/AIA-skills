@@ -381,7 +381,10 @@ fn probe_one(
     let status = if timed_out {
         child.wait().ok()
     } else {
-        let grace = Instant::now() + Duration::from_secs(2);
+        // Under heavy CPU load, reaping an already-exiting child after stdout EOF can take >2s;
+        // scale the post-EOF exit grace with the probe timeout (2s..10s) so healthy probes are not
+        // spuriously SIGTERM'd.
+        let grace = Instant::now() + Duration::from_secs_f64(timeout.clamp(2.0, 10.0));
         loop {
             match child.try_wait() {
                 Ok(Some(done)) => break Some(done),
@@ -428,7 +431,7 @@ pub fn recovered(bin: &Path, model: &str, env: &Value, agy_cfg: &Value, timeout:
     if model.trim().is_empty() {
         return Ok(());
     }
-    let root = std::env::temp_dir().join(format!("delegate-probe-{}", now_ns()));
+    let root = std::env::temp_dir().join(format!("delegate-probe-{}-{}", std::process::id(), now_ns()));
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let thinking = !agents::pi_models()
         .iter()
@@ -507,7 +510,7 @@ pub fn command(args: &[String]) -> Res<i32> {
             .iter()
             .any(|m| m.name == model_id(model) && !m.thinking)
     };
-    let root = std::env::temp_dir().join(format!("delegate-probe-{}", now_ns()));
+    let root = std::env::temp_dir().join(format!("delegate-probe-{}-{}", std::process::id(), now_ns()));
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let results: Vec<Outcome> = std::thread::scope(|scope| {
         let handles: Vec<_> = jobs

@@ -1,6 +1,7 @@
 """6.32.0 (V1) regressions & concurrency stress suite:
 1. Read/write non-blocking & zero-deadlock stress test (20 status + 10 work + 8 start + 4 events
-   concurrent for 10s; plus holding `.state.lock` for 2s while read-only queries return <20ms).
+   concurrent for 10s; plus holding `.state.lock` for 2s while read-only queries finish unblocked
+   at < 1/10 of hold duration with zero state-lock attempts).
 2. Full atomic writes (PID+nonce + sync_data + rename) & random SIGKILL recovery stress test.
 3. Multi-repo isolation stress test (slow apply on repo A does not block repo B).
 4. V2 premerge fast-forward interface reservation (fail-closed on stale premerge.json + apply.lock).
@@ -219,19 +220,38 @@ class Delegate632Tests(unittest.TestCase):
         if started_run_ids:
             self.cli("wait", "--no-result", *started_run_ids)
 
-        # Part B: Force-hold `state/.state.lock` for 2.0s; assert ALL read-only commands still
-        # return in < 20ms (proving reads are truly zero-lock).
+        # Part B: Force-hold `state/.state.lock` for 2.0s; assert ALL read-only commands finish
+        # well below the lock-hold duration (< 1/10 of hold = 200ms), before the holder releases
+        # the lock, and make ZERO state-lock acquisition attempts (proving reads are truly lock-free
+        # without depending on a load-sensitive 20ms wall-clock cutoff).
         state = self.state_dir()
         state.mkdir(parents=True, exist_ok=True)
         lock_file = state / ".state.lock"
         ready_file = state / ".hold-ready"
+        hold_s = 2.0
+        max_read_ms = hold_s * 1000.0 / 10.0  # 200ms vs 2000ms lock hold
+        probe_env = {**self.env, "DELEGATE_MEASURE_STATE_LOCK": "1"}
+
+        # Positive control: verify a write command emits STATE_LOCK_ATTEMPT under probe_env.
+        ctrl = subprocess.run(
+            [str(fixtures.DELEGATE), "work", "add", "probe-state-lock", "--repo", str(repo), "--json"],
+            env=probe_env,
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(ctrl.returncode, 0, ctrl.stderr)
+        self.assertIn("STATE_LOCK_ATTEMPT=acquire", ctrl.stderr, f"state-lock probe did not fire: {ctrl.stderr!r}")
+        self.assertIn("STATE_LOCK_HOLD_MS=", ctrl.stderr, f"state-lock hold probe did not fire: {ctrl.stderr!r}")
+
         holder_code = (
             "import fcntl, os, sys, time\n"
-            "p, ready = sys.argv[1], sys.argv[2]\n"
+            "p, ready, hold = sys.argv[1], sys.argv[2], float(sys.argv[3])\n"
             "fd = os.open(p, os.O_CREAT | os.O_RDWR, 0o644)\n"
             "fcntl.flock(fd, fcntl.LOCK_EX)\n"
             "open(ready, 'w').write('held')\n"
-            "time.sleep(2.0)\n"
+            "time.sleep(hold)\n"
             "os.close(fd)\n"
         )
         # Warm up 1 read first so OS page cache / dynamic loader is hot.
@@ -239,7 +259,7 @@ class Delegate632Tests(unittest.TestCase):
         self.assertEqual(self.cli("snapshot", "--json", cwd=repo).returncode, 0)
 
         holder = subprocess.Popen(
-            [sys.executable, "-c", holder_code, str(lock_file), str(ready_file)],
+            [sys.executable, "-c", holder_code, str(lock_file), str(ready_file), str(hold_s)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -257,7 +277,7 @@ class Delegate632Tests(unittest.TestCase):
                     t0 = time.perf_counter()
                     res = subprocess.run(
                         [str(fixtures.DELEGATE), *cmd],
-                        env=self.env,
+                        env=probe_env,
                         cwd=repo,
                         capture_output=True,
                         text=True,
@@ -266,16 +286,27 @@ class Delegate632Tests(unittest.TestCase):
                     dt_ms = (time.perf_counter() - t0) * 1000.0
                     samples.append(dt_ms)
                     self.assertEqual(res.returncode, 0, f"{cmd} failed while lock held: {res.stderr}")
+                    self.assertNotIn(
+                        "STATE_LOCK_ATTEMPT",
+                        res.stderr,
+                        f"read command {cmd} attempted to acquire .state.lock: {res.stderr}",
+                    )
+                    self.assertNotIn(
+                        "STATE_LOCK_HOLD_MS",
+                        res.stderr,
+                        f"read command {cmd} held .state.lock: {res.stderr}",
+                    )
                     for ln in res.stdout.splitlines():
                         if ln.strip():
                             json.loads(ln)
                 best_ms = min(samples)
                 self.assertLess(
                     best_ms,
-                    20.0,
-                    f"read command {cmd} took {best_ms:.2f}ms (samples={samples}) while .state.lock held 2s!",
+                    max_read_ms,
+                    f"read command {cmd} took {best_ms:.2f}ms >= {max_read_ms:.0f}ms "
+                    f"(1/10 of {hold_s:.1f}s lock hold; samples={samples})",
                 )
-            # Confirm holder is STILL holding the lock (all reads finished long before 2s elapsed).
+            # Confirm holder is STILL holding the lock (all reads finished while lock was exclusively held).
             self.assertIsNone(holder.poll(), "holder should still be holding .state.lock")
         finally:
             holder.wait(timeout=5)
@@ -634,14 +665,38 @@ class Delegate632Tests(unittest.TestCase):
         # Stop hook reads `index.json` directly with zero locks (even while `.state.lock` is held!).
         lock_file = self.state_dir() / ".state.lock"
         ready_file = self.state_dir() / ".stop-hook-hold"
+        probe_log = self.state_dir() / ".stop-hook-lock-probe.log"
+        hold_s = 2.0
+        max_hook_ms = hold_s * 1000.0 / 4.0  # 500ms vs 2000ms lock hold (allows Python startup under load)
+        hook_runner = (
+            "import runpy, sys\n"
+            "hook_path, lock_path, log_path = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+            "hits = []\n"
+            "def _audit(ev, args):\n"
+            "    if ev == 'fcntl.flock':\n"
+            "        hits.append(f'flock:{args}')\n"
+            "    elif ev == 'open' and args and isinstance(args[0], (str, bytes)):\n"
+            "        p = args[0].decode('utf-8', 'ignore') if isinstance(args[0], bytes) else args[0]\n"
+            "        if p == lock_path or p.endswith('/.state.lock') or p == '.state.lock':\n"
+            "            hits.append(f'open:{p}')\n"
+            "sys.addaudithook(_audit)\n"
+            "sys.argv = [hook_path]\n"
+            "try:\n"
+            "    runpy.run_path(hook_path, run_name='__main__')\n"
+            "finally:\n"
+            "    with open(log_path, 'w', encoding='utf-8') as fh:\n"
+            "        fh.write('\\n'.join(hits))\n"
+        )
         holder = subprocess.Popen(
             [
                 sys.executable,
                 "-c",
                 "import fcntl, os, sys, time; fd=os.open(sys.argv[1], os.O_CREAT|os.O_RDWR, 0o644); "
-                "fcntl.flock(fd, fcntl.LOCK_EX); open(sys.argv[2], 'w').write('ok'); time.sleep(1.0); os.close(fd)",
+                "fcntl.flock(fd, fcntl.LOCK_EX); open(sys.argv[2], 'w').write('ok'); "
+                "time.sleep(float(sys.argv[3])); os.close(fd)",
                 str(lock_file),
                 str(ready_file),
+                str(hold_s),
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -651,16 +706,31 @@ class Delegate632Tests(unittest.TestCase):
             self.until(ready_file.is_file, "holder ready", timeout=5.0)
             t0 = time.perf_counter()
             hook_res = subprocess.run(
-                [sys.executable, str(STOP_HOOK)],
+                [sys.executable, "-c", hook_runner, str(STOP_HOOK), str(lock_file), str(probe_log)],
                 input=json.dumps({"cwd": str(repo), "stop_hook_active": False}),
-                env={**self.env, "DELEGATE_BIN": str(fixtures.DELEGATE), "DELEGATE_STOP_HOOK_CURRENT_ONLY": "1"},
+                env={
+                    **self.env,
+                    "DELEGATE_BIN": str(fixtures.DELEGATE),
+                    "DELEGATE_STOP_HOOK_CURRENT_ONLY": "1",
+                    "DELEGATE_MEASURE_STATE_LOCK": "1",
+                },
                 capture_output=True,
                 text=True,
                 timeout=5,
             )
             hook_ms = (time.perf_counter() - t0) * 1000.0
             self.assertEqual(hook_res.returncode, 0, hook_res.stderr)
-            self.assertLess(hook_ms, 500.0, f"Stop hook blocked on .state.lock: {hook_ms:.1f}ms")
+            self.assertNotIn("STATE_LOCK_ATTEMPT", hook_res.stderr, f"Stop hook touched .state.lock: {hook_res.stderr}")
+            self.assertNotIn("STATE_LOCK_HOLD_MS", hook_res.stderr, f"Stop hook held .state.lock: {hook_res.stderr}")
+            self.assertTrue(probe_log.is_file(), "Stop hook audit probe did not write log")
+            probe_hits = probe_log.read_text(encoding="utf-8").strip()
+            self.assertEqual(probe_hits, "", f"Stop hook attempted lock/open on .state.lock: {probe_hits}")
+            self.assertLess(
+                hook_ms,
+                max_hook_ms,
+                f"Stop hook blocked on .state.lock: {hook_ms:.1f}ms >= {max_hook_ms:.0f}ms (1/4 of {hold_s:.1f}s hold)",
+            )
+            self.assertIsNone(holder.poll(), "holder should still be holding .state.lock")
             decision = json.loads(hook_res.stdout)
             self.assertEqual(decision["decision"], "block")
             self.assertIn("snap-run", decision["reason"])

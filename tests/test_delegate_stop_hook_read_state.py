@@ -349,8 +349,8 @@ class DelegateStopHookReadStateTests(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_c_expired_caller_orphan_takeover_and_configurable_timeout(self):
         repo = self.repo({"a.txt": "v0\n"})
-        dead_sid = "sess-dead-c"
-        chat_sid = "sess-chat-c"
+        dead_sid = f"sess-dead-c-{os.getpid()}"
+        chat_sid = f"sess-chat-c-{os.getpid()}"
         dead_env = self.clean_caller_env({"CLAUDE_CODE_SESSION_ID": dead_sid})
         chat_env = self.clean_caller_env({"CLAUDE_CODE_SESSION_ID": chat_sid})
 
@@ -373,6 +373,24 @@ class DelegateStopHookReadStateTests(unittest.TestCase):
             )
         )
         self.until(lambda: (Path(r_wr["dir"]) / "exit_code").exists(), "orphan-wr finished")
+
+        # Wait until finish_run has also flushed events.jsonl and index.json for both runs before backdating.
+        events_file = self.state_dir() / "events.jsonl"
+        index_file = self.state_dir() / "index.json"
+        def _both_flushed():
+            if not (events_file.is_file() and index_file.is_file()):
+                return False
+            try:
+                runs_map = json.loads(index_file.read_text(encoding="utf-8")).get("runs", {})
+            except ValueError:
+                return False
+            by_run = {
+                (e.get("status") or {}).get("run"): (e.get("status") or {}).get("state")
+                for e in runs_map.values()
+                if isinstance(e, dict)
+            }
+            return by_run.get(r_ro["run"]) == "answered" and by_run.get(r_wr["run"]) == "delivered"
+        self.until(_both_flushed, "both runs flushed to events.jsonl and index.json")
 
         self.write_sessions_json({dead_sid: {"pid": self.get_dead_pid(), "lastSeenAt": iso_ago(3.5)}})
         self.backdate_events_and_runs(3.0, [Path(r_ro["dir"]), Path(r_wr["dir"])])
@@ -460,7 +478,7 @@ class DelegateStopHookReadStateTests(unittest.TestCase):
         handover_sid = "sess-handover-e"
         chat_sid = "sess-chat-e"
         third_sid = "sess-third-e"
-        gone_sid = "sess-gone-e"
+        gone_sid = f"sess-gone-e-{os.getpid()}"
 
         owner_env = self.clean_caller_env({"CLAUDE_CODE_SESSION_ID": owner_sid})
         handover_env = self.clean_caller_env({"CLAUDE_CODE_SESSION_ID": handover_sid})

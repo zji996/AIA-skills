@@ -456,14 +456,14 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
     def test_timeout_continuations_keep_rework_budget_and_copyable_next(self):
         repo = self.repo({"a.txt": "old\n"})
         self.env["DELEGATE_TIMEOUT_GRACE"] = "0"
-        self.fake_pi([fixtures.answer("later"), fixtures.SETTLED], pre="echo partial >> a.txt", sleep=10)
+        self.fake_pi([fixtures.answer("later"), fixtures.SETTLED], pre="echo partial >> a.txt", sleep=15)
         first = self.outcome(self.cli("run", "--worktree", "--workdir", repo,
-                                     "--name", "job", "--timeout", ".2s", "task"))
+                                     "--name", "job", "--timeout", "2s", "task"))
         self.assertEqual(first["state"], "timeout")
         self.assertTrue(first["next"].startswith(str(fixtures.DELEGATE) + " reply "))
         self.assertIn("不计返工次数", self.cli("status", first["run"], human=True).stdout)
         for _ in range(2):
-            self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="seq 1 80 >> a.txt", sleep=10)
+            self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="seq 1 80 >> a.txt", sleep=15)
             continued = self.outcome(self.cli("reply", "--wait", "job", "continue"))
             self.assertEqual(continued["state"], "timeout")
             meta = json.loads((Path(continued["dir"]) / "meta.json").read_text())
@@ -486,8 +486,8 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo first >> a.txt")
         self.outcome(self.cli("run", "--worktree", "--workdir", repo,
                              "--name", "job", "--accept", "false", "task"))
-        self.fake_pi([fixtures.answer("later"), fixtures.SETTLED], pre="echo fix >> a.txt", sleep=10)
-        timed = self.outcome(self.cli("reply", "--wait", "--timeout", ".2s", "job", "fix"))
+        self.fake_pi([fixtures.answer("later"), fixtures.SETTLED], pre="echo fix >> a.txt", sleep=15)
+        timed = self.outcome(self.cli("reply", "--wait", "--timeout", "2s", "job", "fix"))
         self.assertEqual(timed["state"], "timeout")
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="seq 1 80 >> a.txt")
         continued = self.outcome(self.cli("reply", "--wait", "--minor", "--timeout", "5s", "job", "continue"))
@@ -506,10 +506,24 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
                              "--name", "job", "--accept", "false", "task"))
         self.fake_pi([fixtures.answer("later"), fixtures.SETTLED], pre="echo fix >> a.txt", sleep=30)
         started = self.outcome(self.cli("reply", "job", "fix"))
-        # 6.32.0: async `reply` returns in <50ms before `pi` starts; wait until the agent launches before stopping.
-        self.until(lambda: (Path(started["dir"]) / "agent.pid").is_file(), "agent launched")
+        # 6.32.0: async `reply` returns in <50ms before `pi` starts; wait until fake_pi has
+        # created its session file and run `pre` (entering `sleep 30`) before stopping, otherwise
+        # under high load `stop` can kill fake_pi before a session is saved and `runs::latest`
+        # walks back to the rejected parent round.
+        self.until(
+            lambda: (Path(started["dir"]) / "agent.pid").is_file()
+            and any((Path(started["dir"]) / "session").glob("t_f*.jsonl"))
+            and "fix" in (Path(started["worktree"]) / "a.txt").read_text(),
+            "agent session and pre-hook ready",
+        )
         self.assertEqual(self.cli("stop", started["run"]).returncode, 0)
+        self.until(
+            lambda: (Path(started["dir"]) / "summary.json").is_file()
+            and json.loads((Path(started["dir"]) / "summary.json").read_text()).get("state") == "stopped",
+            "stopped summary written",
+        )
         self.assertEqual(self.outcome(self.cli("status", started["run"]))["state"], "stopped")
+        self.assertTrue(json.loads((Path(started["dir"]) / "summary.json").read_text()).get("session"))
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo done >> a.txt")
         continued = self.outcome(self.cli("reply", "--wait", "job", "continue"))
         meta = json.loads((Path(continued["dir"]) / "meta.json").read_text())

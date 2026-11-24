@@ -646,9 +646,9 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
 
     def test_evidence_queue_excludes_timeout_and_reclaims_children(self):
         self.fake_pi([answer("ok"), SETTLED])
-        self.hold_lane(2)
+        self.hold_lane(3)
         state = self.outcome(self.cli("run", "--evidence",
-            "sleep 30 & echo $! > evidence-bg.pid; echo proof", "--evidence-timeout", "0.5s", "task"))
+            "sleep 30 & echo $! > evidence-bg.pid; echo proof", "--evidence-timeout", "1.5s", "task"))
         self.assertEqual((state["state"], state["evidence"]["exit"]), ("answered", 0))
         self.assertGreaterEqual(state["queuedSeconds"], 1)
         self.assertFalse(state["evidence"]["timedOut"])
@@ -656,7 +656,7 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         pid = int((self.work / "evidence-bg.pid").read_text())
         self.until(lambda: not Path(f"/proc/{pid}").exists(), "the evidence child to go")
         meta = json.loads((Path(state["dir"]) / "meta.json").read_text())
-        self.assertEqual(meta["evidenceTimeoutSeconds"], 0.5)
+        self.assertEqual(meta["evidenceTimeoutSeconds"], 1.5)
         inherited = self.outcome(self.cli("reply", "--wait", state["run"], "--evidence", "sleep 10", "more"))
         self.assertTrue(inherited["evidence"]["timedOut"])
         self.assertEqual(inherited["state"], "answered")
@@ -1000,9 +1000,29 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         self.env["DELEGATE_TIMEOUT_GRACE"] = "0"
         self.assertEqual(self.outcome(self.cli("run", "--timeout", "1", "task"))["state"], "timeout")
         # Waiting in the lane for its own check does not use up the agent's time.
-        self.fake_pi([answer("checked"), SETTLED], pre=f"{DELEGATE} lane true")
-        self.hold_lane(2)
-        state = self.outcome(self.cli("run", "--timeout", "1", "task"))
+        lane_gate = self.work / "lane-release"
+        self.env["DELEGATE_MAX_HEAVY"] = "1"
+        holder = subprocess.Popen(
+            [str(DELEGATE), "lane", "--label", "caller check",
+             f"while [ ! -f {shlex.quote(str(lane_gate))} ]; do sleep .05; done"],
+            env=self.env,
+        )
+        self.addCleanup(lambda: (lane_gate.touch(), holder.kill()))
+        self.until(lambda: "caller check" in self.cli("lane").stdout, "the lane holder")
+        self.fake_pi([answer("checked"), SETTLED], pre=f"{DELEGATE} lane --label agent-check true")
+        proc = subprocess.Popen(
+            [str(DELEGATE), "run", "--json", "--timeout", "1", "task"],
+            cwd=self.work, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.until(
+            lambda: "queued" in self.cli("lane").stdout and "agent-check" in self.cli("lane").stdout,
+            "agent lane check queued",
+        )
+        time.sleep(1.5)
+        lane_gate.touch()
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, out + err)
+        state = self.outcome(subprocess.CompletedProcess(proc.args, proc.returncode, out, err))
         self.assertEqual(state["state"], "answered")
         self.assertGreaterEqual(state["queuedSeconds"], 1)
 
@@ -1528,7 +1548,11 @@ db.write_text(json.dumps(units))
         self.fake_pi([interrupted(), SETTLED], [answer("continued"), SETTLED], probe=[answer("ok"), SETTLED])
         result = self.cli("run", "task")
         state = self.outcome(result)
-        self.assertEqual((state["state"], state["resumes"], state["attempts"]), ("answered", 1, 2))
+        self.assertEqual(
+            (state.get("state"), state.get("resumes"), state.get("attempts")),
+            ("answered", 1, 2),
+            f"unexpected resume outcome: {state}",
+        )
         self.assertIn("Upstream response stream was interrupted", state["transientError"])
         self.assertIn("continued", result.stdout)
         run = Path(state["dir"])
@@ -1660,7 +1684,12 @@ db.write_text(json.dumps(units))
         self.assertEqual(result.returncode, 2)
         self.assertIn("still active", result.stderr)
         self.assertEqual(self.cli("start", "--read-only", "reviewer").returncode, 0)
-        pids = [int(line.split()[0]) for line in (self.work / "pi.log").read_text().splitlines()]
+        pi_log = self.work / "pi.log"
+        self.until(
+            lambda: pi_log.is_file() and len(pi_log.read_text().splitlines()) >= 2,
+            "both fake_pi processes logged",
+        )
+        pids = [int(line.split()[0]) for line in pi_log.read_text().splitlines()]
         result = self.cli("stop", "slow", "last")
         self.assertEqual([json.loads(line)["state"] for line in result.stdout.splitlines()], ["stopped", "stopped"])
         for pid in pids:
@@ -2920,6 +2949,7 @@ db.write_text(json.dumps(units))
         self.assertNotIn("applied", pending)
         self.assertIn("apply", pending["next"])
         # Zero file actions must still retry generation and advance the merge marker.
+        self.env.pop("DELEGATE_GENERATE_TIMEOUT", None)
         (repo / ".delegate.json").write_text(json.dumps({"generated": {
             "paths": ["gen/"], "command": "cp src.txt gen/out.txt; echo retried > retry.txt"}}))
         retried = self.cli("apply", "--json", "--keep", state["run"])

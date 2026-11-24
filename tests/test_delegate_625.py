@@ -299,7 +299,32 @@ class Delegate625Tests(unittest.TestCase):
 
         # 1) Unmerged delivered run in repo_a blocks; `delegate work defer` silences it until expiry.
         self.fake_pi([fixtures.answer("done a"), fixtures.SETTLED], pre="echo a1 > a.txt")
-        ra = self.outcome(run_in(repo_a, "run", "--worktree", "--name", "feat-a", "--accept", "true", "task a"))
+        ra = self.outcome(run_in(repo_a, "run", "--worktree", "--name", f"feat-a-{os.getpid()}", "--accept", "true", "task a"))
+        index_file = Path(self.env["XDG_STATE_HOME"]) / "delegate" / "index.json"
+        pm_file = Path(ra["dir"]) / "premerge.json"
+        def _feat_a_ready():
+            if not index_file.is_file():
+                return False
+            if pm_file.is_file():
+                try:
+                    pm_st = json.loads(pm_file.read_text(encoding="utf-8")).get("status")
+                except ValueError:
+                    return False
+                if pm_st in ("pending", "running"):
+                    return False
+            try:
+                runs_map = json.loads(index_file.read_text(encoding="utf-8")).get("runs", {})
+            except ValueError:
+                return False
+            for e in runs_map.values():
+                if not isinstance(e, dict):
+                    continue
+                st = e.get("status") or {}
+                if st.get("run") == ra["run"] and st.get("state") == "delivered":
+                    idx_pm = (st.get("premerge") or {}).get("status")
+                    return idx_pm not in ("pending", "running")
+            return False
+        self.until(_feat_a_ready, "feat-a flushed to index.json with premerge settled")
 
         # stop_hook_active=True ALWAYS passes through.
         self.assertIsNone(hook(repo_a, active=True))
@@ -378,7 +403,7 @@ class Delegate625Tests(unittest.TestCase):
         # Clean qb and create an unmerged write run + a cleaned note run in repo_b -> both alert from repo_a!
         self.assertEqual(run_in(repo_b, "clean", "--no-archive", qb["run"], human=True).returncode, 0)
         self.fake_pi([fixtures.answer("b work"), fixtures.SETTLED], pre="echo b2 > b.txt")
-        ub = self.outcome(run_in(repo_b, "run", "--worktree", "--name", "beta-feat", "--accept", "true", "b work"))
+        ub = self.outcome(run_in(repo_b, "run", "--worktree", "--name", f"beta-feat-{os.getpid()}", "--accept", "true", "b work"))
         self.assertEqual(run_in(repo_b, "note", ub["run"], "验证 beta 真机", human=True).returncode, 0)
 
         cross_unmerged = hook(repo_a)

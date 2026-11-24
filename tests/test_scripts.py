@@ -109,7 +109,7 @@ class ScriptTests(unittest.TestCase):
         (shared / "agent-delegation").symlink_to(ROOT / "skills/agent-delegation")
         (home / ".codex/skills").mkdir(parents=True)
         # Pre-4.0 name whose checkout still holds a cache directory after the rename.
-        leftover = ROOT / "skills/zz-renamed-skill-test"
+        leftover = ROOT / f"skills/zz-renamed-skill-test-{os.getpid()}"
         (leftover / "scripts/__pycache__").mkdir(parents=True)
         self.addCleanup(shutil.rmtree, leftover, True)
         (home / ".codex/skills/pi-delegation").symlink_to(leftover)

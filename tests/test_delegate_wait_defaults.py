@@ -93,9 +93,10 @@ class DelegateWaitDefaultsTests(unittest.TestCase):
         self.env["DELEGATE_CHECK_IN"] = ".1s"
         self.env["DELEGATE_STALL_IDLE"] = "0"
         self.env["DELEGATE_STALL_COMMAND"] = "0"
-        self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED], sleep=.5)
+        self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED], sleep=10)
         state = self.outcome(self.cli("start", "--read-only", "task"))
         self.addCleanup(lambda: self.cli("stop", state["run"]))
+        self.until(lambda: (Path(state["dir"]) / "agent.pid").exists(), "agent launched")
         result = self.cli("wait", human=True)
         self.assertEqual(result.returncode, 75)
         self.assertIn("正常推进", result.stdout)
@@ -108,9 +109,14 @@ class DelegateWaitDefaultsTests(unittest.TestCase):
         self.env["DELEGATE_STALL_IDLE"] = "0"
         self.env["DELEGATE_STALL_COMMAND"] = "0"
         event = {"type": "tool_execution_start", "toolName": "bash", "args": {"command": "cargo test --long"}}
-        self.fake_pi([], pre=f"printf '%s\\n' {shlex.quote(__import__('json').dumps(event))}; sleep 5")
+        self.fake_pi([], pre=f"printf '%s\\n' {shlex.quote(__import__('json').dumps(event))}; sleep 30")
         state = self.outcome(self.cli("start", "--read-only", "task"))
         self.addCleanup(lambda: self.cli("stop", state["run"]))
+        events_file = Path(state["dir"]) / "events.jsonl"
+        self.until(
+            lambda: events_file.is_file() and "cargo test --long" in events_file.read_text(errors="replace"),
+            "in-flight command event recorded",
+        )
         result = self.cli("wait", human=True)
         self.assertEqual(result.returncode, 75)
         self.assertIn("正在执行 cargo test --long", result.stdout)

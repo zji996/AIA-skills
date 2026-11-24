@@ -19,6 +19,7 @@ class Delegate625HistoryTests(unittest.TestCase):
     cli = fixtures.DelegateTests.cli
     outcome = fixtures.DelegateTests.outcome
     repo = fixtures.DelegateTests.repo
+    until = fixtures.DelegateTests.until
 
     def git(self, repo, *args):
         return subprocess.run(
@@ -62,15 +63,26 @@ class Delegate625HistoryTests(unittest.TestCase):
         )
 
         # 6. Active running + queued run (maxActive=1).
+        gate_entered = self.work / "status-gate-entered"
         self.fake_pi(
             [fixtures.answer("slow done"), fixtures.SETTLED],
-            pre=f'while [ ! -f {shlex.quote(str(gate))} ]; do sleep .05; done',
+            pre=f'touch {shlex.quote(str(gate_entered))}; while [ ! -f {shlex.quote(str(gate))} ]; do sleep .05; done',
         )
         self.env["DELEGATE_MAX_ACTIVE"] = "1"
         live = self.outcome(self.cli("start", "--read-only", "--workdir", repo, "--name", "live-one", "long task"))
         queued = self.outcome(self.cli("start", "--read-only", "--workdir", repo, "--name", "queued-one", "second task"))
         self.addCleanup(lambda: (gate.touch(), self.cli("stop", live["run"], queued["run"])))
         self.env.pop("DELEGATE_MAX_ACTIVE", None)
+
+        # Wait until live-one has actually exec'd the gated fake_pi (so overwriting fake_pi later
+        # for ask-q cannot cause live-one to exit early and unblock queued-one) and both runs have
+        # settled into their expected running/waiting states.
+        self.until(gate_entered.is_file, "live-one entered gate")
+        self.until(
+            lambda: self.outcome(self.cli("status", live["run"]))["state"] == "running"
+            and self.outcome(self.cli("status", queued["run"]))["state"] == "waiting",
+            "live-one running and queued-one waiting",
+        )
 
         human = self.cli("status", human=True)
         self.assertEqual(human.returncode, 0, human.stderr)
