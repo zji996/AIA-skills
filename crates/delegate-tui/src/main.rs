@@ -800,7 +800,8 @@ fn main() {
                                     app.quota_refreshing = true;
                                     last_quota_refresh = Some(Instant::now());
                                     let _ = tx_quota.send(QuotaCmd::Refresh);
-                                    app.set_toast("正在通过 agy -p /usage 刷新真实额度…");
+                                    // Refreshes account quota via `agy -p /usage`.
+                                    app.set_toast("正在刷新额度…");
                                 } else {
                                     app.set_toast("额度已在刷新中…");
                                 }

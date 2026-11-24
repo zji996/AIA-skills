@@ -114,7 +114,8 @@ fn snapshot_wide_screen_renders_rounded_borders_bars_relative_time_and_lane_mete
     assert!(!screen.contains('`'), "raw markdown backtick leaked: {screen}");
     assert!(!screen.contains("##"), "raw markdown heading leaked: {screen}");
     assert!(!screen.contains("file:///"), "raw markdown link URL leaked: {screen}");
-    assert!(screen.contains("最近命令"), "{screen}");
+    assert!(screen.contains("验收 ✓ cargo test -p api"), "{screen}");
+    assert!(!screen.contains("最近命令"), "accept command should not duplicate under 最近命令: {screen}");
     assert!(screen.contains("改动分布"), "{screen}");
     assert!(screen.contains("crates/api"), "{screen}");
     assert!(screen.contains("下一步"), "{screen}");
@@ -234,7 +235,7 @@ fn snapshot_events_tab_liveness_activity_and_dag_queue() {
     assert!(runs_screen.contains("跑命"), "{runs_screen}");
     assert!(runs_screen.contains("卡警"), "{runs_screen}");
     assert!(runs_screen.contains("正在做什么"), "{runs_screen}");
-    assert!(runs_screen.contains("确定性续派队列 (1)"), "{runs_screen}");
+    assert!(runs_screen.contains("续派队列 (1)"), "{runs_screen}");
     assert!(runs_screen.contains("step-2"), "{runs_screen}");
     assert!(runs_screen.contains("2事件(3)"), "{runs_screen}");
 
@@ -780,19 +781,24 @@ fn snapshot_accounts_tab_shows_5h_7d_usage_and_manual_quota_estimates() {
     assert_eq!(app.tab, ViewTab::Accounts);
 
     let screen = render_to_string(&mut app, 140, 34);
-    assert!(screen.contains("5h用量"), "{screen}");
-    assert!(screen.contains("7d用量"), "{screen}");
+    assert!(screen.contains("5小时用量"), "{screen}");
+    assert!(screen.contains("7天用量"), "{screen}");
     assert!(screen.contains("15.0M+"), "{screen}");
     assert!(screen.contains("50.0M"), "{screen}");
-    assert!(screen.contains("本地用量（不调外部额度接口）"), "{screen}");
-    assert!(screen.contains("近 5 小时: 15.0M"), "{screen}");
+    assert!(screen.contains("▸ 本地用量"), "{screen}");
+    assert!(screen.contains("近 5 小时: 输入 500.0K"), "{screen}");
     assert!(screen.contains("运行中未计 1"), "{screen}");
-    assert!(screen.contains("近 7 天: 50.0M"), "{screen}");
-    assert!(screen.contains("周余 95.41%"), "{screen}");
-    assert!(screen.contains("5h余 85.10%"), "{screen}");
-    assert!(screen.contains("每 1% ≈ 10.9M tok"), "{screen}");
-    assert!(screen.contains("每 1% ≈ 1.0M tok"), "{screen}");
-    assert!(screen.contains("不自动换号"), "{screen}");
+    assert!(screen.contains("近 7 天: 输入 2.0M"), "{screen}");
+    assert_eq!(screen.matches("15.0M").count(), 1, "5h total should appear once (in list): {screen}");
+    assert_eq!(screen.matches("50.0M").count(), 1, "7d total should appear once (in list): {screen}");
+    assert!(screen.contains("本周剩余 95.41%"), "{screen}");
+    assert!(screen.contains("5 小时剩余 85.1%"), "{screen}");
+    assert!(screen.contains("按当前用量，5 小时额度约 1 天 4 小时后用完"), "{screen}");
+    assert!(screen.contains("按当前用量，本周额度约 14 天 10 小时后用完"), "{screen}");
+    assert!(!screen.contains("不自动换号"), "{screen}");
+    assert!(!screen.contains("不调外部额度接口"), "{screen}");
+    assert!(!screen.contains("每 1%"), "{screen}");
+    assert!(!screen.contains("推算"), "{screen}");
 }
 
 fn make_rich_quota_and_charts_app() -> App {
@@ -1052,22 +1058,43 @@ fn snapshot_overview_and_accounts_real_quota_charts_120x40_and_80x24() {
 
     let mut app = make_rich_quota_and_charts_app();
 
+    let forbidden = [
+        "仅作提醒",
+        "仅提醒",
+        "仅提示",
+        "不自动换号",
+        "不做自动轮换",
+        "真实额度",
+        "真实额度优先",
+        "agy /usage",
+        "不调外部额度接口",
+        "紧凑文字",
+        "就地确认",
+        "每1%≈",
+        "每 1% ≈",
+        "5h推算",
+        "周推算",
+        "近1h速",
+        "[原始]",
+    ];
+
     // 1. Overview 120x40 (wide charts: Gauge + Sparkline + BarChart + 7d trends)
     app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
     assert_eq!(app.tab, ViewTab::Overview);
     let ov_wide = render_to_string(&mut app, 120, 40);
     assert_lines_fit_width(&ov_wide, 120);
     assert!(ov_wide.contains("0总览"), "{ov_wide}");
-    assert!(ov_wide.contains("账号真实额度"), "{ov_wide}");
-    assert!(ov_wide.contains("3m前"), "{ov_wide}");
-    assert!(ov_wide.contains("Gemini"), "{ov_wide}");
-    assert!(ov_wide.contains("Claude/GPT"), "{ov_wide}");
-    assert!(ov_wide.contains("82%"), "{ov_wide}");
-    assert!(ov_wide.contains("4h后重置"), "{ov_wide}");
-    assert!(ov_wide.contains("Preview Tier: experimental pool active"), "{ov_wide}");
-    assert!(ov_wide.contains("每1%≈"), "{ov_wide}");
-    assert!(ov_wide.contains("近 24h 每小时 Token"), "{ov_wide}");
-    assert!(ov_wide.contains("Token 分布"), "{ov_wide}");
+    assert!(ov_wide.contains("账号额度 · 3 分钟前更新"), "{ov_wide}");
+    assert_eq!(ov_wide.matches("3 分钟前更新").count(), 1, "{ov_wide}");
+    assert!(ov_wide.contains("Gemini · 5 小时"), "{ov_wide}");
+    assert!(ov_wide.contains("Gemini · 本周"), "{ov_wide}");
+    assert!(ov_wide.contains("Claude/GPT · 5 小时"), "{ov_wide}");
+    assert!(ov_wide.contains("剩余 82% · 4 小时后重置"), "{ov_wide}");
+    assert!(ov_wide.contains("剩余 91% · 6 天 9 小时后重置"), "{ov_wide}");
+    assert!(ov_wide.contains("按最近 1 小时的用量，5 小时与本周额度在重置前用不完"), "{ov_wide}");
+    assert!(!ov_wide.contains("Preview Tier: experimental pool active"), "unknown line should not show in overview: {ov_wide}");
+    assert!(ov_wide.contains("近 24 小时 Token（按账号）"), "{ov_wide}");
+    assert!(ov_wide.contains("近 7 天 Token 分布"), "{ov_wide}");
     assert!(ov_wide.contains("写"), "{ov_wide}");
     assert!(ov_wide.contains("审查"), "{ov_wide}");
     assert!(ov_wide.contains("返工"), "{ov_wide}");
@@ -1075,6 +1102,13 @@ fn snapshot_overview_and_accounts_real_quota_charts_120x40_and_80x24() {
     assert!(ov_wide.contains("派发→合入中位耗时"), "{ov_wide}");
     assert!(ov_wide.contains("一轮通过率"), "{ov_wide}");
     assert!(ov_wide.contains("11-18") && ov_wide.contains("11-24"), "{ov_wide}");
+    // Wide overview bottom bar lists only usable keys on wide overview (no jk scroll, no 0-6 repeat).
+    let ov_wide_last = ov_wide.lines().last().unwrap_or("");
+    assert!(!ov_wide_last.contains("jk"), "{ov_wide_last}");
+    assert!(!ov_wide_last.contains("0-6"), "{ov_wide_last}");
+    for bad in forbidden {
+        assert!(!ov_wide.contains(bad), "forbidden copy {bad:?} in ov_wide:\n{ov_wide}");
+    }
 
     // Toggle BarChart to Model mode with 'v'
     app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
@@ -1082,41 +1116,65 @@ fn snapshot_overview_and_accounts_real_quota_charts_120x40_and_80x24() {
     assert_lines_fit_width(&ov_wide_model, 120);
     assert!(ov_wide_model.contains("按模型"), "{ov_wide_model}");
     assert!(ov_wide_model.contains("gemini-4"), "{ov_wide_model}");
+    assert_eq!(ov_wide_model.matches("41.2M").count(), 1, "model total should not duplicate in footer: {ov_wide_model}");
     app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
 
     // 2. Overview 80x24 (narrow text degradation, zero misalignment)
     let ov_narrow = render_to_string(&mut app, 80, 24);
     assert_lines_fit_width(&ov_narrow, 80);
-    assert!(ov_narrow.contains("总览（紧凑文字"), "{ov_narrow}");
+    assert!(ov_narrow.contains("总览 · 3 分钟前更新"), "{ov_narrow}");
+    assert_eq!(ov_narrow.matches("3 分钟前更新").count(), 1, "{ov_narrow}");
     assert!(ov_narrow.contains("alpha"), "{ov_narrow}");
-    assert!(ov_narrow.contains("Gemini"), "{ov_narrow}");
-    assert!(ov_narrow.contains("82%"), "{ov_narrow}");
-    assert!(ov_narrow.contains("近 24h Token"), "{ov_narrow}");
-    assert!(ov_narrow.contains("Token 分布"), "{ov_narrow}");
+    assert!(ov_narrow.contains("Gemini · 5 小时  剩余 82% · 4 小时后重置"), "{ov_narrow}");
+    assert!(ov_narrow.contains("按最近 1 小时的用量，5 小时与本周额度在重置前用不完"), "{ov_narrow}");
+    assert!(!ov_narrow.contains("Preview Tier: experimental pool active"), "{ov_narrow}");
+    assert!(ov_narrow.contains("近 24 小时 Token"), "{ov_narrow}");
+    assert!(ov_narrow.contains("近 7 天 Token 分布"), "{ov_narrow}");
     assert!(ov_narrow.contains("近 7 天交付走势"), "{ov_narrow}");
+    let ov_narrow_last = ov_narrow.lines().last().unwrap_or("");
+    assert!(!ov_narrow_last.contains("v切图"), "v does nothing on narrow overview: {ov_narrow_last}");
+    for bad in forbidden {
+        assert!(!ov_narrow.contains(bad), "forbidden copy {bad:?} in ov_narrow:\n{ov_narrow}");
+    }
 
-    // 3. Accounts 120x40 (wide: list + real quota Gauges + 24h Sparkline + estimates)
+    // 3. Accounts 120x40 (wide: list + quota Gauges + 24h Sparkline + plain estimate)
     app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
     assert_eq!(app.tab, ViewTab::Accounts);
     let acct_wide = render_to_string(&mut app, 120, 40);
     assert_lines_fit_width(&acct_wide, 120);
     assert!(acct_wide.contains("6账号(2)"), "{acct_wide}");
-    assert!(acct_wide.contains("真实额度（agy /usage · 3m前）"), "{acct_wide}");
-    assert!(acct_wide.contains("Gemini"), "{acct_wide}");
-    assert!(acct_wide.contains("Claude/GPT"), "{acct_wide}");
+    assert!(acct_wide.contains("alpha · 3 分钟前更新"), "{acct_wide}");
+    assert_eq!(acct_wide.matches("3 分钟前更新").count(), 1, "{acct_wide}");
+    assert_eq!(acct_wide.matches("alpha@example.test").count(), 1, "email should appear once: {acct_wide}");
+    assert!(!acct_wide.contains("近 5 小时: 12.0M"), "5h total should not repeat in detail: {acct_wide}");
+    assert_eq!(acct_wide.matches("54.0M").count(), 1, "7d total should appear once: {acct_wide}");
+    assert!(!acct_wide.contains("· 在跑 1"), "running count should not duplicate in list title: {acct_wide}");
+    assert!(acct_wide.contains("▸ 额度"), "{acct_wide}");
+    assert!(acct_wide.contains("Gemini · 5 小时"), "{acct_wide}");
+    assert!(acct_wide.contains("Claude/GPT · 5 小时"), "{acct_wide}");
     assert!(acct_wide.contains("Preview Tier: experimental pool active"), "{acct_wide}");
-    assert!(acct_wide.contains("近1h速"), "{acct_wide}");
-    assert!(acct_wide.contains("手动备注(真实额度优先)"), "{acct_wide}");
-    assert!(acct_wide.contains("近 24h Token"), "{acct_wide}");
-    assert!(acct_wide.contains("在跑 agy 进程: 1 个"), "{acct_wide}");
+    assert!(acct_wide.contains("按最近 1 小时的用量，5 小时与本周额度在重置前用不完"), "{acct_wide}");
+    assert!(acct_wide.contains("手动记录: 本周剩余 95% · 5 小时剩余 90%"), "{acct_wide}");
+    assert!(acct_wide.contains("近 24 小时 Token"), "{acct_wide}");
+    assert!(acct_wide.contains("在跑 agy 进程: 1 个（有进程时无法切换）"), "{acct_wide}");
+    for bad in forbidden {
+        assert!(!acct_wide.contains(bad), "forbidden copy {bad:?} in acct_wide:\n{acct_wide}");
+    }
 
     // 4. Accounts 80x24 (narrow text degradation, zero misalignment)
     let acct_narrow = render_to_string(&mut app, 80, 24);
     assert_lines_fit_width(&acct_narrow, 80);
     assert!(acct_narrow.contains("agy 账号 (2)"), "{acct_narrow}");
-    assert!(acct_narrow.contains("真实额度"), "{acct_narrow}");
-    assert!(acct_narrow.contains("Gemini"), "{acct_narrow}");
-    assert!(acct_narrow.contains("82%"), "{acct_narrow}");
+    assert!(acct_narrow.contains("alpha · 3 分钟前更新"), "{acct_narrow}");
+    assert_eq!(acct_narrow.matches("3 分钟前更新").count(), 1, "{acct_narrow}");
+    assert_eq!(acct_narrow.matches("alpha@example.test").count(), 1, "{acct_narrow}");
+    assert!(!acct_narrow.contains("· 在跑 1"), "{acct_narrow}");
+    assert!(acct_narrow.contains("▸ 额度"), "{acct_narrow}");
+    assert!(acct_narrow.contains("Gemini · 5 小时  剩余 82% · 4 小时后重置"), "{acct_narrow}");
+    assert!(acct_narrow.contains("按最近 1 小时的用量，5 小时与本周额度在重置前用不完"), "{acct_narrow}");
+    for bad in forbidden {
+        assert!(!acct_narrow.contains(bad), "forbidden copy {bad:?} in acct_narrow:\n{acct_narrow}");
+    }
 
     if std::env::var("PRINT_TUI_SNAPSHOTS").as_deref() == Ok("1") {
         println!("\n=== OVERVIEW 120x40 ===\n{ov_wide}");
@@ -1124,4 +1182,42 @@ fn snapshot_overview_and_accounts_real_quota_charts_120x40_and_80x24() {
         println!("\n=== ACCOUNTS 120x40 ===\n{acct_wide}");
         println!("\n=== ACCOUNTS 80x24 ===\n{acct_narrow}");
     }
+}
+
+#[test]
+fn quota_estimate_reports_depletion_when_earlier_than_reset() {
+    use delegate_tui::app::ViewTab;
+
+    let mut app = make_rich_quota_and_charts_app();
+    // Make fiveHour run out in 90 minutes (before 2h30m reset) and weekly in 3 days (before 6d9h reset).
+    if let Some(alpha) = app.snapshot.agy_accounts.accounts.first_mut() {
+        if let Some(est) = alpha.quota_estimate.as_mut() {
+            if let Some(fh) = est.five_hour.as_mut() {
+                fh.estimated_remaining_minutes = Some(90);
+            }
+            if let Some(wk) = est.weekly.as_mut() {
+                wk.estimated_remaining_minutes = Some(3 * 24 * 60);
+            }
+        }
+    }
+
+    // Overview shows the sooner bottleneck in one sentence (wrapped cleanly without ellipsis).
+    app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Overview);
+    let ov = render_to_string(&mut app, 120, 40);
+    assert_lines_fit_width(&ov, 120);
+    assert!(ov.contains("按最近 1 小时的用量，Claude/GPT 5 小时额度约 1 小时 30 分"), "{ov}");
+    assert!(ov.contains("钟后用完"), "{ov}");
+    assert!(!ov.contains("30 分…"), "estimate should wrap rather than truncate: {ov}");
+
+    // Accounts detail shows both windows clearly.
+    app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
+    let acct = render_to_string(&mut app, 120, 40);
+    assert_lines_fit_width(&acct, 120);
+    assert!(acct.contains("按最近 1 小时的用量，Claude/GPT 5 小时额度约 1 小时 30 分"), "{acct}");
+    assert!(acct.contains("钟后用完"), "{acct}");
+    assert!(
+        acct.contains("按最近 1 小时的用量，Gemini 本周额度约 3 天后用完"),
+        "{acct}"
+    );
 }

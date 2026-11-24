@@ -2311,9 +2311,10 @@ impl App {
                         let note = if m.applied {
                             "该合入批次已合回源仓库。".to_string()
                         } else if !m.merge_accept_ok {
-                            "注意：最终 mergeAccept 未通过，请先排查报告再合回。".to_string()
+                            "最终 mergeAccept 未通过，请先排查报告再合回。".to_string()
                         } else {
-                            "把集成提交链原样拿到源仓库，push 仍由主控执行。".to_string()
+                            // Keeps commits intact on the source branch; push remains a separate manual step.
+                            "把集成提交链落回源仓库，不推送远端。".to_string()
                         };
                         self.overlay = Overlay::CommandModal {
                             action_label: "合回源仓库 (apply --keep-commits)".to_string(),
@@ -2337,10 +2338,11 @@ impl App {
                                 shell_quote(&c.id)
                             ),
                         );
+                        // `radar pick` only creates a task brief draft and never dispatches automatically.
                         self.overlay = Overlay::CommandModal {
                             action_label: "生成任务说明草稿 (radar pick)".to_string(),
                             command: cmd,
-                            note: "仅生成任务说明草稿，不会自动派活。".to_string(),
+                            note: String::new(),
                         };
                         self.dirty = true;
                         AppAction::Redraw
@@ -2810,7 +2812,7 @@ pub fn build_write_command(
             } else if run.question {
                 (
                     format!("{bin} reply {id} '<决定内容>'"),
-                    "回答提问不消耗返工次数。".to_string(),
+                    String::new(),
                 )
             } else {
                 (
@@ -2866,11 +2868,13 @@ pub fn copy_to_clipboard(text: &str) -> String {
                 let _ = stdin.write_all(text.as_bytes());
             }
             if child.wait().is_ok_and(|s| s.success()) {
-                return format!("已复制到剪贴板 ({prog} + OSC 52)");
+                // Copied via local clipboard tool (wl-copy/xclip/xsel) plus OSC 52.
+                return "已复制到剪贴板".to_string();
             }
         }
     }
-    "已发送到终端剪贴板 (OSC 52)".to_string()
+    // Fallback: sent to terminal clipboard via OSC 52.
+    "已复制到剪贴板".to_string()
 }
 
 fn base64_encode(input: &[u8]) -> String {
