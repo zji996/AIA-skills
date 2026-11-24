@@ -1,5 +1,9 @@
 # delegate
 
+## 依赖图导入、价值配额补位与停止线统计
+
+- 批量导入任务 DAG 并按价值配额无模型补位：`work add/wait --class feat|unblock|infra|docs` 标价值类别（缺类别不参与补位且 `work` 行尾标「缺类别」）；`delegate work import-dag <FILE> [--dry-run]` 读 JSON 批量建工作项（`after` 转 `work_closed:`、`files` 存路径前缀并附 `--auto` 参数，重 key/成环/brief 缺失整批拒绝）；`.delegate.json` 配 `fill: {"target": 6, "maxInfraDocsShare": 0.3}` 与 `hotspots` 在 `reconcile` 按类别/出度/就绪时间补位（只数写链、跳过热点冲突、记 `work_dispatched` `reason: "fill"`）；`delegate fill stats [--since 24h]` 统计冲突率/返工率/未合入峰值/lane 排队占比/每 10 交付 agy 周额度与只读占比并给出停止线提醒（不自动降档）。Batch-import JSON task DAGs with `work import-dag`, value-class auto-fill dispatch with `fill`/`hotspots` (counting write chains only), and advisory stop-line metrics via `delegate fill stats`.
+
 ## 审查模型可配置、按类别选 thinking、格式补问与补充审查
 
 - 按配置或单次参数选定审查模型并容错回退：在 `.delegate.json` 或用户配置设置 `review.model` / `review.thinking`（或传 `start --review-model <别名>`，优先级 CLI > 仓库 > 用户 > `review` 档位）；不可用时回退 `review` 档并在审查卡写 `审查改用 <别名>（原因）`，审查卡与 `status` 显示实际模型。Configure reviewer model/thinking with 4-layer precedence, non-silent fallback to the review tier on unavailability, and actual model display in card and status.

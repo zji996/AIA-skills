@@ -91,7 +91,11 @@ const COMMANDS: &[(&str, &str)] = &[
     ("wait", "Wait for runs or events (--since SEQ); print outcomes, answers, or new cursor."),
     (
         "work",
-        "Manage the machine-wide unified work table (<state>/work.jsonl): list, show, add, wait (--after-applied), close, drop, defer, import-md.",
+        "Manage the machine-wide unified work table (<state>/work.jsonl): list, show, add, wait (--class/--after-applied), close, drop, defer, import-md, import-dag.",
+    ),
+    (
+        "fill",
+        "Inspect auto-fill concurrency statistics and stop-line alerts (fill stats [--since 24h]).",
     ),
     (
         "hook",
@@ -293,15 +297,23 @@ pub fn print(command: Option<&str>) -> bool {
             ("--json", "Print JSON status without the files array (pass --files to include files)."),
             ("--files", "With --json, include the full files array."),
         ]),
-        "work" => ("[list|show|add|wait|close|drop|defer|import-md] ...", "Machine-wide unified work table (<state>/work.jsonl) with 7 states (attention/ready/verify/active/blocked/deferred/done), owner items (Q/D), structured wait_on (including run_applied and owner:Qxx), 6-column table & card views, and automatic migration of notes.json / deferred.tsv.", &[
-            ("[--owner] [--all] [--state ST] [--repo NAME] [--rebuild] [--json]", "Show Layer-0 summary + 6-column table (--owner renders owner items grouped by 动手/点头/看卡/方向 + 已否; default folds blocked/deferred)."),
-            ("show <Wxx|Qxx|Dxxx|R:id> [--json]", "Show Layer-2 work item card with wait_on status, owner details, linked runs, artifacts, followups, and Layer-3 original pointers."),
-            ("add \"<title>\" [--done-when TEXT] [--needs-verify] [--brief FILE] [--needs-owner nod|act|card --ask TEXT --recommendation TEXT --if-undecided TEXT --cost TEXT] [--verify-on COND] [--after-applied RUN|Wxx] [--after-delivered RUN] [--after-work Wxx] [--wait-owner Qxx] [--after-time TIME] [--artifact PATH] [--owner-kind act|nod|card|direction] [--qid Qxx|Dxxx] [--ask TEXT] [--recommendation TEXT] [--if-undecided TEXT] [--cost TEXT] [--auto -- <start-args>]", "Create a persistent work item or owner item (Q/D)."),
-            ("wait <Wxx|Qxx|Dxxx> [--after-applied RUN|Wxx] [--after-delivered RUN] [--after-work Wxx] [--wait-owner Qxx] [--needs-owner nod|act|card] [--after-time TIME] [--needs-verify|--no-needs-verify] [--verify-on COND] [--brief FILE] [--ask TEXT] [--recommendation TEXT] [--if-undecided TEXT] [--cost TEXT] [--auto -- <start-args>] [--clear]", "Attach or update wait_on / verify_on / needs_verify / brief, create a linked owner Q item (--needs-owner), or update Q item fields (--ask/--recommendation/--if-undecided/--cost)."),
+        "work" => ("[list|show|add|wait|close|drop|defer|import-md|import-dag] ...", "Machine-wide unified work table (<state>/work.jsonl) with 7 states (attention/ready/verify/active/blocked/deferred/done), value classes (feat|unblock|infra|docs), owner items (Q/D), structured wait_on (including run_applied/work_applied and owner:Qxx), 6-column table & card views, DAG import, and value-quota auto-fill.", &[
+            ("[--owner] [--all] [--state ST] [--repo NAME] [--rebuild] [--json]", "Show Layer-0 summary + 6-column table (items missing class show 缺类别; --owner renders owner items grouped by 动手/点头/看卡/方向 + 已否; default folds blocked/deferred)."),
+            ("show <Wxx|Qxx|Dxxx|R:id> [--json]", "Show Layer-2 work item card with class, files, wait_on status, owner details, linked runs, artifacts, followups, and Layer-3 original pointers."),
+            ("add \"<title>\" [--class feat|unblock|infra|docs] [--files PATHS] [--done-when TEXT] [--needs-verify] [--brief FILE] [--needs-owner nod|act|card --ask TEXT --recommendation TEXT --if-undecided TEXT --cost TEXT] [--verify-on COND] [--after-applied RUN|Wxx] [--after-delivered RUN] [--after-work Wxx] [--wait-owner Qxx] [--after-time TIME] [--artifact PATH] [--owner-kind act|nod|card|direction] [--qid Qxx|Dxxx] [--ask TEXT] [--recommendation TEXT] [--if-undecided TEXT] [--cost TEXT] [--auto -- <start-args>]", "Create a persistent work item or owner item (Q/D)."),
+            ("wait <Wxx|Qxx|Dxxx> [--class feat|unblock|infra|docs] [--files PATHS] [--after-applied RUN|Wxx] [--after-delivered RUN] [--after-work Wxx] [--wait-owner Qxx] [--needs-owner nod|act|card] [--after-time TIME] [--needs-verify|--no-needs-verify] [--verify-on COND] [--brief FILE] [--ask TEXT] [--recommendation TEXT] [--if-undecided TEXT] [--cost TEXT] [--auto -- <start-args>] [--clear]", "Attach or update class / files / wait_on / verify_on / needs_verify / brief, create a linked owner Q item (--needs-owner), or update Q item fields (--ask/--recommendation/--if-undecided/--cost)."),
             ("close <Wxx|Qxx|Dxxx> --evidence \"<text>\"", "Explicitly close a work item or owner item with evidence (unlocks waiting work items)."),
             ("drop <Wxx|Qxx|Dxxx> --reason \"<text>\"", "Explicitly drop/reject a work item or owner item with a recorded reason."),
             ("defer <Wxx|Qxx|Dxxx|run> --reason \"<text>\" --until <4h|24h|YYYY-MM-DD|ISO>", "Defer a work item or unattached run (materializes into work.jsonl) with a reason and expiry time."),
             ("import-md <FILE> [--dry-run] [--include-stale] [--repo DIR] [--json]", "Parse a Markdown backlog, cross-check history.jsonl for already-applied/stale items, and preview (--dry-run) or import."),
+            ("import-dag <FILE> [--dry-run] [--repo DIR] [--json]", "Import a JSON DAG of work items (key/title/class/brief/doneWhen/after/files/tier/model/thinking) with after-work edges and --auto dispatch parameters; rejects entire batch on duplicate keys, cycles, or missing brief files."),
+        ]),
+        "fill" => ("stats [--since 24h] [--repo PATH] [--all] [--json]", "Report auto-fill concurrency statistics for the current repo's fill.target: premerge conflict rate, rework rate, peak delivered-unmerged count, lane queue time share, agy weekly quota % per 10 deliveries, read-only run count & agy share, and advisory stop-line checks (never auto-downgrades).", &[
+            ("stats", "Show fill metrics and stop-line status."),
+            ("--since DURATION|all", "Time window to analyze (default: 24h)."),
+            ("--repo PATH", "Repository to inspect (default: current git repository)."),
+            ("--all", "Aggregate across all repositories."),
+            ("--json", "Print structured JSON output."),
         ]),
         "hook" => ("stats [--weeks N] [--json]", "Read-only weekly Stop hook statistics from <state>/stop-hook.jsonl: trigger counts by hook type and post-block outcomes (waited / applied / deferred / ignored).", &[
             ("stats", "Aggregate triggers and outcomes by ISO week."),

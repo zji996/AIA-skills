@@ -14,6 +14,7 @@ mod config;
 mod dag_queue;
 mod deny;
 mod events;
+mod fill;
 mod fit;
 mod gc;
 mod handoff;
@@ -3175,6 +3176,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "board" => board::command(rest),
         "result" => result_command(rest),
         "work" => work::command(rest),
+        "fill" => fill::command(rest),
         "agy" => agy_accounts::command(rest),
         "usage" => usage::command(rest),
         "speed" => speed::command(rest),

@@ -13,7 +13,8 @@
 | `apply [<run> …] [--dry-run] [--merge] [--allow-dirty-overlap] [--verify\|--no-verify] [--keep] [--keep-open] [--keep-commits\|--commit] [--closes <Wxx>] [--json]` | 按序将 worktree 改动合入源工作区，先检目标文件是否已有未提交改动（忽略本 run 自写相同内容），有重叠默认拒绝并给先提交或 `--allow-dirty-overlap` 两选项；默认不提交并列同事标题，成功末行印 `delegate files <run>`，遇错即停报 `failedStep`/`writtenFiles`；`acceptStillValid` 不为 true 时末次合入后经 lane 重跑验收（`applyVerify: false` 关闭）。`--keep-commits` 按序 cherry-pick；`--commit` 仅暂存本批路径压成单提交；合入默认自动关闭关联工作项（`--keep-open` 强制留 `verify`，`--closes <Wxx>` 显式关闭）；尾部提示解锁下游与 `verify` 留存原因，成功后按 `worktree.cleanOnApply` 归档删 worktree |
 | `busy <资源名>` | 有实际运行的匹配命令时逐行列 run、命令和持续秒数，退出 0；空闲无输出、退出 1 |
 | `wait [<run>...\|--all] [--since <SEQ>] [--max <时长>] [--no-result] [--full] [--progress]` | 无参和带名字的 `wait <run>...` 默认同 `--any`：返回上次 wait 之后所有进入终态或提问态的 run（首个给全文，其余给一行摘要加 `result` 命令）；`--since <SEQ>` 仅返回 `seq > SEQ` 的事件并输出新游标，同时更新 `cursors.json`；`--all` / `--until-all` 等全部（单次最多 50 分钟）。人读末行给本会话剩余数和原样重跑命令 |
-| `work [list\|show\|add\|wait\|close\|drop\|defer\|import-md] ...` | 统一工作表（7 态/6 列/卡片、`--after-applied`、`owner:Qxx`、`--auto`、`defer --reason --until`），见 [工作表](worktable.md) |
+| `work [list\|show\|add\|wait\|close\|drop\|defer\|import-md\|import-dag] ...` | 统一工作表（7 态/6 列/卡片、`--class feat\|unblock\|infra\|docs`、`import-dag` 批量导依赖图、`--after-applied`、`owner:Qxx`、`--auto`、`defer`），见 [工作表](worktable.md) |
+| `fill stats [--since 24h] [--repo <路径>] [--all] [--json]` | 按当前 `fill.target` 统计 premerge 冲突率、返工率、未合入峰值、lane 排队占比、每 10 次交付 agy 周额度、只读 run 数与 agy 占比，并提示停止线（仅提醒不自动降档） |
 | `hook stats [--weeks N] [--json]` | 按周统计 Stop 钩子触发与去向（wait/apply/defer/忽略） |
 | `events [--since <SEQ>] [--follow] [--rebuild] [--json]` | 读/跟随全机事件流 `events.jsonl`；非 `--follow` 人读推进 `cursors.json`（`--json` 不推）；`--rebuild` 从 run 重建 |
 | `queue <add\|list\|remove\|cancel> ...` | 确定性 DAG 续派队列：支持 `--after`（上游交付通过且审查 `PASS`）与 `--after-applied`（上游合入后），零模型调用自动起下一步（`queue_dispatched`），异常暂停（`queue_paused`） |

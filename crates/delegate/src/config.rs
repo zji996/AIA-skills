@@ -336,8 +336,108 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
             .map_err(|e| format!("{}: {e}", path.display()))?;
         validate_areas_config(value.get("areas"))
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        validate_fill_config(value.get("fill"))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        validate_hotspots_config(value.get("hotspots"))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(())
+}
+
+pub const DEFAULT_FILL_MAX_INFRA_DOCS_SHARE: f64 = 0.3;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FillConfig {
+    pub target: usize,
+    pub max_infra_docs_share: f64,
+}
+
+/// Validate repository-only `fill` config: `{"target": 6, "maxInfraDocsShare": 0.3}`.
+pub fn validate_fill_config(v: Option<&Value>) -> Res<()> {
+    let Some(val) = v else {
+        return Ok(());
+    };
+    if val.is_null() {
+        return Ok(());
+    }
+    let Some(obj) = val.as_object() else {
+        return Err("fill must be an object {\"target\": N, \"maxInfraDocsShare\": 0.3}".into());
+    };
+    for key in obj.keys() {
+        if !["target", "maxInfraDocsShare"].contains(&key.as_str()) {
+            return Err(format!("fill: unknown field '{key}'"));
+        }
+    }
+    let Some(target) = obj.get("target") else {
+        return Err("fill.target must be a non-negative integer".into());
+    };
+    if !target
+        .as_u64()
+        .is_some_and(|n| usize::try_from(n).is_ok())
+    {
+        return Err("fill.target must be a non-negative integer".into());
+    }
+    if let Some(share) = obj.get("maxInfraDocsShare") {
+        if !share
+            .as_f64()
+            .is_some_and(|x| x.is_finite() && (0.0..=1.0).contains(&x))
+        {
+            return Err("fill.maxInfraDocsShare must be a number between 0.0 and 1.0".into());
+        }
+    }
+    Ok(())
+}
+
+/// Parse repository-level `fill` config. Returns `None` when absent, null, or `target == 0`.
+pub fn parse_fill_config(v: Option<&Value>) -> Option<FillConfig> {
+    let obj = v?.as_object()?;
+    let target = obj.get("target")?.as_u64().and_then(|n| usize::try_from(n).ok())?;
+    if target == 0 {
+        return None;
+    }
+    let max_infra_docs_share = obj
+        .get("maxInfraDocsShare")
+        .and_then(Value::as_f64)
+        .filter(|x| x.is_finite() && (0.0..=1.0).contains(x))
+        .unwrap_or(DEFAULT_FILL_MAX_INFRA_DOCS_SHARE);
+    Some(FillConfig {
+        target,
+        max_infra_docs_share,
+    })
+}
+
+/// Validate repository-only `hotspots` config: list of frequently conflicting file paths.
+pub fn validate_hotspots_config(v: Option<&Value>) -> Res<()> {
+    let Some(val) = v else {
+        return Ok(());
+    };
+    if val.is_null() {
+        return Ok(());
+    }
+    let Some(arr) = val.as_array() else {
+        return Err("hotspots must be an array of non-empty path strings".into());
+    };
+    for item in arr {
+        let Some(s) = item.as_str() else {
+            return Err("hotspots must contain only non-empty path strings".into());
+        };
+        let clean = s.trim().trim_start_matches("./");
+        if clean.is_empty() || s.contains('\0') {
+            return Err("hotspots contains an empty or invalid path".into());
+        }
+    }
+    Ok(())
+}
+
+/// Parse repository-level `hotspots` paths (normalized by trimming whitespace and leading `./`).
+pub fn parse_hotspots_config(v: Option<&Value>) -> Vec<String> {
+    v.and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|s| s.trim().trim_start_matches("./").to_string())
+        .filter(|s| !s.is_empty() && !s.contains('\0'))
+        .collect()
 }
 
 /// Validate repository-only `areas` config for deterministic L0 experience A/B alternation:
@@ -511,6 +611,8 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
             "autoMerge",
             "radar",
             "areas",
+            "fill",
+            "hotspots",
         ] {
             if user.get(key).is_some() {
                 ignored.push(key);
@@ -916,5 +1018,48 @@ mod tests {
         );
         assert_eq!(v, Some(json!(false)));
         assert_eq!(src, None);
+    }
+
+    #[test]
+    fn validate_fill_and_hotspots_config() {
+        let p = Path::new(".delegate.json");
+        assert!(validate(
+            &json!({
+                "fill": {"target": 6, "maxInfraDocsShare": 0.3},
+                "hotspots": ["README.md", "xtask/size-baseline.txt"]
+            }),
+            p,
+            true
+        )
+        .is_ok());
+        assert!(validate(&json!({"fill": {"target": 0}}), p, true).is_ok());
+        assert!(parse_fill_config(Some(&json!({"target": 0}))).is_none());
+        let parsed = parse_fill_config(Some(&json!({"target": 6}))).unwrap();
+        assert_eq!(parsed.target, 6);
+        assert!((parsed.max_infra_docs_share - 0.3).abs() < 1e-9);
+
+        for bad in [
+            json!({"fill": 6}),
+            json!({"fill": {}}),
+            json!({"fill": {"target": -1}}),
+            json!({"fill": {"target": 6, "maxInfraDocsShare": 1.5}}),
+            json!({"fill": {"target": 6, "maxInfraDocsShare": -0.1}}),
+            json!({"fill": {"target": 6, "extra": true}}),
+        ] {
+            let err = validate(&bad, p, true).unwrap_err();
+            assert!(err.contains("fill"), "expected fill error, got {err}");
+        }
+        for bad in [
+            json!({"hotspots": "README.md"}),
+            json!({"hotspots": [""]}),
+            json!({"hotspots": ["./"]}),
+            json!({"hotspots": [123]}),
+        ] {
+            let err = validate(&bad, p, true).unwrap_err();
+            assert!(
+                err.contains("hotspots"),
+                "expected hotspots error, got {err}"
+            );
+        }
     }
 }

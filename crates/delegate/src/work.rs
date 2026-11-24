@@ -24,9 +24,60 @@ pub const STATES: [&str; 7] = [
 
 pub const OWNER_KINDS: [&str; 4] = ["act", "nod", "card", "direction"];
 pub const NEEDS_OWNER_KINDS: [&str; 3] = ["nod", "act", "card"];
+pub const WORK_CLASSES: [&str; 4] = ["feat", "unblock", "infra", "docs"];
 pub const DEFAULT_STALE_VERIFY_HOURS: f64 = 4.0;
 pub const DEFAULT_STALE_READY_HOURS: f64 = 8.0;
 pub const DEFAULT_REMIND_COOLDOWN_HOURS: f64 = 6.0;
+
+pub fn work_class_priority(cls: &str) -> u8 {
+    match cls {
+        "feat" => 0,
+        "unblock" => 1,
+        "infra" => 2,
+        "docs" => 3,
+        _ => 9,
+    }
+}
+
+pub fn validate_work_class(raw: &str) -> Res<String> {
+    let k = raw.trim();
+    if WORK_CLASSES.contains(&k) {
+        Ok(k.to_string())
+    } else {
+        Err(format!(
+            "invalid --class '{k}' (expected: {})",
+            WORK_CLASSES.join("|")
+        ))
+    }
+}
+
+fn is_infra_or_docs(cls: &str) -> bool {
+    matches!(cls, "infra" | "docs")
+}
+
+fn is_readonly_start_args(args: &[String]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--read-only" {
+            return true;
+        }
+        if let Some(val) = a.strip_prefix("--tier=") {
+            if matches!(val, "scout" | "review") {
+                return true;
+            }
+        } else if a == "--tier" {
+            if let Some(val) = args.get(i + 1) {
+                if matches!(val.as_str(), "scout" | "review") {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        i += 1;
+    }
+    false
+}
 const OWNER_WAIT_KEYWORDS: [&str; 8] = [
     "点头", "确认", "真机", "对外", "发布", "删除", "不可逆", "所有者",
 ];
@@ -263,6 +314,8 @@ pub struct WorkItem {
     pub repo: String,
     pub repos: Vec<String>,
     pub state: String,
+    pub class: String,
+    pub files: Vec<String>,
     pub closed_kind: String,
     pub done_when: String,
     pub needs_verify: bool,
@@ -317,6 +370,13 @@ impl WorkItem {
             || ow.recommendation.trim().is_empty()
             || ow.if_undecided.trim().is_empty()
             || ow.cost.trim().is_empty()
+    }
+
+    /// True when an open non-owner work item lacks a valid value class (`feat|unblock|infra|docs`).
+    pub fn is_missing_class(&self) -> bool {
+        self.owner.is_none()
+            && self.state != "done"
+            && !WORK_CLASSES.contains(&self.class.as_str())
     }
 
     pub fn repo_label(&self) -> String {
@@ -422,6 +482,8 @@ impl WorkItem {
             repo: s(v, "repo").to_string(),
             repos: strings(&v["repos"]),
             state,
+            class: s(v, "class").trim().to_string(),
+            files: strings(&v["files"]),
             closed_kind: s(v, "closedKind").to_string(),
             done_when: s(v, "doneWhen").to_string(),
             needs_verify: b(v, "needsVerify"),
@@ -468,6 +530,12 @@ impl WorkItem {
         });
         if !self.repos.is_empty() {
             obj["repos"] = json!(self.repos);
+        }
+        if !self.class.is_empty() {
+            obj["class"] = json!(self.class);
+        }
+        if !self.files.is_empty() {
+            obj["files"] = json!(self.files);
         }
         if !self.closed_kind.is_empty() {
             obj["closedKind"] = json!(self.closed_kind);
@@ -2008,16 +2076,281 @@ fn latest_live_run(item: &WorkItem, state: &Path) -> Option<(String, PathBuf)> {
     latest_live_run_excluding(item, state, None)
 }
 
+#[derive(Clone, Debug)]
+struct FillCandidate {
+    item: WorkItem,
+    active_writes: usize,
+}
+
 struct ReconcileOutcome {
     changed: bool,
     unlocked_ready: Vec<WorkItem>,
     to_auto_dispatch: Vec<WorkItem>,
+    to_fill_dispatch: Vec<FillCandidate>,
     defer_expired: Vec<WorkItem>,
     stale_items: Vec<(WorkItem, String)>,
 }
 
+fn canonical_repo_key(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    fs::canonicalize(trimmed)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| trimmed.trim_end_matches('/').to_string())
+}
+
+fn load_repo_fill_and_hotspots(repo: &str) -> Option<(crate::config::FillConfig, Vec<String>)> {
+    let trimmed = repo.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let cfg_path = Path::new(trimmed).join(".delegate.json");
+    let doc = crate::config::read_file(&cfg_path).ok().flatten()?;
+    let fill = crate::config::parse_fill_config(doc.get("fill"))?;
+    let hotspots = crate::config::parse_hotspots_config(doc.get("hotspots"));
+    Some((fill, hotspots))
+}
+
+fn waiting_out_degree(id: &str, items: &[WorkItem]) -> usize {
+    items
+        .iter()
+        .filter(|w| {
+            w.state != "done"
+                && w.wait_on.iter().any(|c| {
+                    c.strip_prefix("work_closed:")
+                        .or_else(|| c.strip_prefix("work_applied:"))
+                        .and_then(normalize_work_id)
+                        .as_deref()
+                        == Some(id)
+                })
+        })
+        .count()
+}
+
+fn select_fill_candidates(
+    state: &Path,
+    items: &[WorkItem],
+    exclude_run: Option<&str>,
+    already_dispatched_ids: &HashSet<String>,
+) -> Vec<FillCandidate> {
+    // Collect distinct canonical repos that have at least one potentially eligible ready item.
+    let mut candidate_repos: Vec<String> = Vec::new();
+    let mut seen_repos: HashSet<String> = HashSet::new();
+    for item in items {
+        if item.owner.is_some()
+            || item.state != "ready"
+            || item.brief.trim().is_empty()
+            || !WORK_CLASSES.contains(&item.class.as_str())
+            || already_dispatched_ids.contains(&item.id)
+        {
+            continue;
+        }
+        let Some(ad) = &item.auto_dispatch else {
+            continue;
+        };
+        if !ad.dispatched_run.is_empty() || is_readonly_start_args(&ad.start_args) {
+            continue;
+        }
+        let rkey = canonical_repo_key(&item.repo);
+        if !rkey.is_empty() && seen_repos.insert(rkey.clone()) {
+            candidate_repos.push(rkey);
+        }
+    }
+    if candidate_repos.is_empty() {
+        return Vec::new();
+    }
+    candidate_repos.sort();
+
+    // Pre-scan live active write runs once across registered repo run dirs & item run_dirs.
+    let mut seen_run_dirs: HashSet<PathBuf> = HashSet::new();
+    let mut active_runs_by_repo: HashMap<String, Vec<(String, PathBuf, Value)>> = HashMap::new();
+    let mut inspect_run_dir = |rdir: PathBuf, fallback_repo: &str| {
+        let canon_dir = fs::canonicalize(&rdir).unwrap_or_else(|_| rdir.clone());
+        if !seen_run_dirs.insert(canon_dir) {
+            return;
+        }
+        if !rdir.join("meta.json").is_file() || is_archived_run_dir(&rdir) {
+            return;
+        }
+        let meta = json(rdir.join("meta.json"));
+        let rid = notes::run_id(&rdir, &meta);
+        if rid.is_empty() || exclude_run.is_some_and(|ex| ex == rid) {
+            return;
+        }
+        let st = runs::state(&rdir);
+        if !runs::active(&st) {
+            return;
+        }
+        // Read-only / scout / research runs never count against fill.target.
+        if s(&meta, "mode") == "read-only" {
+            return;
+        }
+        let run_repo = {
+            let from_meta = events::repo_for_meta(&meta);
+            if !from_meta.is_empty() {
+                canonical_repo_key(&from_meta)
+            } else {
+                canonical_repo_key(fallback_repo)
+            }
+        };
+        if !run_repo.is_empty() && seen_repos.contains(&run_repo) {
+            active_runs_by_repo
+                .entry(run_repo)
+                .or_default()
+                .push((rid, rdir, meta));
+        }
+    };
+
+    for (repo_root, runs_dir) in registered_repo_runs(state) {
+        if !runs_dir.is_dir() {
+            continue;
+        }
+        let fallback = repo_root.to_string_lossy().into_owned();
+        if let Ok(rd) = fs::read_dir(&runs_dir) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if p.is_dir() {
+                    inspect_run_dir(p, &fallback);
+                }
+            }
+        }
+    }
+    for item in items {
+        for dir_s in item.run_dirs.values() {
+            let p = PathBuf::from(dir_s);
+            if p.is_dir() {
+                inspect_run_dir(p, &item.repo);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for rkey in candidate_repos {
+        let Some((fill_cfg, hotspots)) = load_repo_fill_and_hotspots(&rkey) else {
+            continue;
+        };
+
+        let mut counted_runs: HashSet<String> = HashSet::new();
+        let mut active_writes: usize = 0;
+        let mut active_infra_docs: usize = 0;
+        let mut active_files: Vec<String> = Vec::new();
+
+        if let Some(live_runs) = active_runs_by_repo.get(&rkey) {
+            for (rid, _rdir, meta) in live_runs {
+                if !counted_runs.insert(rid.clone()) {
+                    continue;
+                }
+                active_writes += 1;
+                active_files.extend(strings(&meta["files"]));
+                let work_id = s(meta, "workId");
+                let linked = items.iter().find(|w| {
+                    (!work_id.is_empty() && w.id == work_id) || w.matches_run(rid)
+                });
+                if let Some(w) = linked {
+                    if is_infra_or_docs(&w.class) {
+                        active_infra_docs += 1;
+                    }
+                    active_files.extend(w.files.iter().cloned());
+                }
+            }
+        }
+
+        // Also account for active work items (or items already selected in this reconcile pass)
+        // whose live run dir was not counted above (e.g. synthetic active items or freshly queued).
+        for w in items {
+            if w.owner.is_some() || canonical_repo_key(&w.repo) != rkey {
+                continue;
+            }
+            let is_active_item =
+                w.state == "active" || already_dispatched_ids.contains(&w.id);
+            if !is_active_item {
+                continue;
+            }
+            if w.runs.iter().any(|r| counted_runs.contains(r)) {
+                continue;
+            }
+            // If it has a live run and that live run is read-only, skip it!
+            if let Some((_, rdir)) = latest_live_run_excluding(w, state, exclude_run) {
+                let meta = json(rdir.join("meta.json"));
+                if s(&meta, "mode") == "read-only" {
+                    continue;
+                }
+            } else if w
+                .auto_dispatch
+                .as_ref()
+                .is_some_and(|ad| is_readonly_start_args(&ad.start_args))
+            {
+                continue;
+            }
+            active_writes += 1;
+            if is_infra_or_docs(&w.class) {
+                active_infra_docs += 1;
+            }
+            active_files.extend(w.files.iter().cloned());
+        }
+
+        if active_writes >= fill_cfg.target {
+            continue;
+        }
+
+        let max_infra_docs =
+            crate::fill::max_infra_docs_slots(fill_cfg.target, fill_cfg.max_infra_docs_share);
+        let active_hotspots = crate::fill::active_hotspots_from_files(&active_files, &hotspots);
+
+        let mut cands: Vec<(&WorkItem, u8, usize, i64)> = items
+            .iter()
+            .filter(|w| {
+                w.owner.is_none()
+                    && w.state == "ready"
+                    && canonical_repo_key(&w.repo) == rkey
+                    && !w.brief.trim().is_empty()
+                    && WORK_CLASSES.contains(&w.class.as_str())
+                    && !already_dispatched_ids.contains(&w.id)
+                    && w.auto_dispatch.as_ref().is_some_and(|ad| {
+                        ad.dispatched_run.is_empty() && !is_readonly_start_args(&ad.start_args)
+                    })
+            })
+            .map(|w| {
+                let prio = work_class_priority(&w.class);
+                let out_deg = waiting_out_degree(&w.id, items);
+                let ready_ts = parse_iso_or_date_epoch(&w.state_since)
+                    .or_else(|| parse_iso_or_date_epoch(&w.created_at))
+                    .unwrap_or(i64::MAX);
+                (w, prio, out_deg, ready_ts)
+            })
+            .collect();
+
+        // Sort: feat > unblock > infra > docs; then out-degree DESC; then ready time ASC; then id ASC.
+        cands.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| a.3.cmp(&b.3))
+                .then_with(|| a.0.state_since.cmp(&b.0.state_since))
+                .then_with(|| a.0.id.cmp(&b.0.id))
+        });
+
+        for (cand, _, _, _) in cands {
+            if is_infra_or_docs(&cand.class) && active_infra_docs + 1 > max_infra_docs {
+                continue;
+            }
+            if crate::fill::candidate_hits_active_hotspot(&cand.files, &active_hotspots) {
+                continue;
+            }
+            out.push(FillCandidate {
+                item: cand.clone(),
+                active_writes,
+            });
+            break;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
 fn reconcile_all_locked(state: &Path, items: &mut [WorkItem]) -> ReconcileOutcome {
-    reconcile_all_locked_with_prefetch(state, items, None, None)
+    reconcile_all_locked_full(state, items, None, None, true)
 }
 
 fn reconcile_all_locked_with_prefetch(
@@ -2025,6 +2358,16 @@ fn reconcile_all_locked_with_prefetch(
     items: &mut [WorkItem],
     exclude_run: Option<&str>,
     prefetch: Option<&ReconcilePrefetch>,
+) -> ReconcileOutcome {
+    reconcile_all_locked_full(state, items, exclude_run, prefetch, true)
+}
+
+fn reconcile_all_locked_full(
+    state: &Path,
+    items: &mut [WorkItem],
+    exclude_run: Option<&str>,
+    prefetch: Option<&ReconcilePrefetch>,
+    compute_fill: bool,
 ) -> ReconcileOutcome {
     let now_epoch = epoch() as i64;
     let now_iso = iso();
@@ -2051,6 +2394,7 @@ fn reconcile_all_locked_with_prefetch(
         changed: false,
         unlocked_ready: Vec::new(),
         to_auto_dispatch: Vec::new(),
+        to_fill_dispatch: Vec::new(),
         defer_expired: Vec::new(),
         stale_items: Vec::new(),
     };
@@ -2178,7 +2522,14 @@ fn reconcile_all_locked_with_prefetch(
                         if item.set_state("ready", &now_iso) {
                             out.changed = true;
                         }
-                        out.to_auto_dispatch.push(item.clone());
+                        if compute_fill
+                            && WORK_CLASSES.contains(&item.class.as_str())
+                            && load_repo_fill_and_hotspots(&item.repo).is_some()
+                        {
+                            out.unlocked_ready.push(item.clone());
+                        } else {
+                            out.to_auto_dispatch.push(item.clone());
+                        }
                     } else {
                         if item.set_state("ready", &now_iso) {
                             out.changed = true;
@@ -2285,7 +2636,75 @@ fn reconcile_all_locked_with_prefetch(
         }
     }
 
+    if compute_fill {
+        let already: HashSet<String> = out
+            .to_auto_dispatch
+            .iter()
+            .map(|w| w.id.clone())
+            .collect();
+        out.to_fill_dispatch = select_fill_candidates(state, items, exclude_run, &already);
+    }
+
     out
+}
+
+fn fill_claims_path(state: &Path) -> PathBuf {
+    state.join("fill-claims.json")
+}
+
+fn try_claim_fill_item(state: &Path, work_id: &str) -> bool {
+    let Ok(_guard) = crate::locks::acquire_state(state) else {
+        return false;
+    };
+    let items = load_raw(state);
+    let Some(w) = items.iter().find(|w| w.id == work_id) else {
+        return false;
+    };
+    if w.state != "ready"
+        || !w
+            .auto_dispatch
+            .as_ref()
+            .is_some_and(|ad| ad.dispatched_run.is_empty())
+    {
+        return false;
+    }
+    let path = fill_claims_path(state);
+    let mut doc = json(&path);
+    if !doc.is_object() {
+        doc = json!({});
+    }
+    let now_ep = epoch() as i64;
+    let map = doc.as_object_mut().unwrap();
+    // Prune stale or dead-PID claims.
+    map.retain(|_, v| {
+        let pid = v["pid"].as_u64().unwrap_or(0);
+        let at = v["epoch"].as_i64().unwrap_or(0);
+        pid > 0
+            && (now_ep - at) < 120
+            && Path::new(&format!("/proc/{pid}")).exists()
+    });
+    if map.contains_key(work_id) {
+        return false;
+    }
+    map.insert(
+        work_id.to_string(),
+        json!({"pid": std::process::id(), "epoch": now_ep}),
+    );
+    let _ = write_json(&path, &doc);
+    true
+}
+
+fn release_fill_claim(state: &Path, work_id: &str) {
+    let Ok(_guard) = crate::locks::acquire_state(state) else {
+        return;
+    };
+    let path = fill_claims_path(state);
+    let mut doc = json(&path);
+    if let Some(map) = doc.as_object_mut() {
+        if map.remove(work_id).is_some() {
+            let _ = write_json(&path, &doc);
+        }
+    }
 }
 
 fn emit_reconcile_events_and_dispatch(
@@ -2372,6 +2791,72 @@ fn emit_reconcile_events_and_dispatch(
                     json!({
                         "workId": item.id,
                         "name": item.title,
+                        "autoDispatchError": err,
+                    }),
+                );
+            }
+        }
+        dispatched.push((item.clone(), res));
+    }
+
+    for cand in &outcome.to_fill_dispatch {
+        let item = &cand.item;
+        let Some(ad) = &item.auto_dispatch else {
+            continue;
+        };
+        if !try_claim_fill_item(state, &item.id) {
+            continue;
+        }
+        let res = dispatch_work_auto(item, ad);
+        match &res {
+            Ok(new_run) => {
+                if let Ok(_guard) = crate::locks::acquire_state(state) {
+                    let mut items = load_raw(state);
+                    if let Some(w) = items.iter_mut().find(|w| w.id == item.id) {
+                        if let Some(wad) = w.auto_dispatch.as_mut() {
+                            wad.dispatched_run = new_run.clone();
+                        }
+                        w.add_run(new_run, None, Some(&ad.repo));
+                        let now_iso = iso();
+                        w.set_state("active", &now_iso);
+                        let _ = save_raw(state, &items);
+                    }
+                    // Also remove claim while holding state lock.
+                    let cpath = fill_claims_path(state);
+                    let mut doc = json(&cpath);
+                    if let Some(map) = doc.as_object_mut() {
+                        if map.remove(&item.id).is_some() {
+                            let _ = write_json(&cpath, &doc);
+                        }
+                    }
+                } else {
+                    release_fill_claim(state, &item.id);
+                }
+                events::emit(
+                    new_run,
+                    &item.repo,
+                    "work_dispatched",
+                    json!({
+                        "workId": item.id,
+                        "name": item.title,
+                        "nextRun": new_run,
+                        "brief": ad.prompt_file,
+                        "reason": "fill",
+                        "class": item.class,
+                        "activeWriteRuns": cand.active_writes,
+                    }),
+                );
+            }
+            Err(err) => {
+                release_fill_claim(state, &item.id);
+                events::emit(
+                    "",
+                    &item.repo,
+                    "work_ready",
+                    json!({
+                        "workId": item.id,
+                        "name": item.title,
+                        "reason": "fill",
                         "autoDispatchError": err,
                     }),
                 );
@@ -2523,7 +3008,7 @@ pub fn load_readonly_in(state: &Path) -> Vec<WorkItem> {
     if needs_legacy_migration(state) {
         let _ = migrate_legacy_impl(state, &mut items, false);
     }
-    let _ = reconcile_all_locked(state, &mut items);
+    let _ = reconcile_all_locked_full(state, &mut items, None, None, false);
     items
 }
 
@@ -2534,7 +3019,7 @@ fn load_synced_in(state: &Path) -> Res<Vec<WorkItem>> {
     let mut snapshot = load_raw(state);
     let prefetch = prefetch_reconcile_conditions(state, &snapshot, &[]);
     let preview = reconcile_all_locked_with_prefetch(state, &mut snapshot, None, Some(&prefetch));
-    if !needs_mig && !preview.changed {
+    if !needs_mig && !preview.changed && preview.to_fill_dispatch.is_empty() {
         return Ok(snapshot);
     }
 
@@ -2567,7 +3052,7 @@ pub fn check_stale_and_expired() {
     let mut snapshot = load_raw(&state);
     let prefetch = prefetch_reconcile_conditions(&state, &snapshot, &[]);
     let preview = reconcile_all_locked_with_prefetch(&state, &mut snapshot, None, Some(&prefetch));
-    if !preview.changed {
+    if !preview.changed && preview.to_fill_dispatch.is_empty() {
         return;
     }
     let Ok(_guard) = crate::locks::try_acquire_state(&state) else {
@@ -4166,6 +4651,7 @@ struct TableRow {
     next: String,
     is_ephemeral: bool,
     run_id: String,
+    missing_class: bool,
 }
 
 fn state_priority(st: &str) -> u8 {
@@ -4589,6 +5075,7 @@ fn ephemeral_run_rows(items: &[WorkItem], state: &Path, now_epoch: i64) -> Vec<T
                 next,
                 is_ephemeral: true,
                 run_id: rid.clone(),
+                missing_class: false,
             });
         }
     }
@@ -4603,7 +5090,13 @@ fn format_table_row(row: &TableRow) -> String {
         "[{}] [{}] {} · {} · {} · 下一步：{}",
         row.id, row.repo, title, row.state, focus, next
     );
-    clip_chars(&line, 100)
+    if row.missing_class {
+        let suffix = " · 缺类别";
+        let max_body = 100usize.saturating_sub(suffix.chars().count());
+        format!("{}{}", clip_chars(&line, max_body), suffix)
+    } else {
+        clip_chars(&line, 100)
+    }
 }
 
 fn render_layer0_summary(counts: &HashMap<&str, usize>) -> String {
@@ -4685,6 +5178,14 @@ fn render_card(item: &WorkItem, all_items: &[WorkItem], state: &Path, now_epoch:
                 lines.push(format!("  - {}", parts.join(" · ")));
             }
         }
+    }
+    if !item.class.is_empty() {
+        lines.push(format!("价值类别：{}", item.class));
+    } else if item.is_missing_class() {
+        lines.push("价值类别：缺类别（不参与补位，用 delegate work wait <ID> --class feat|unblock|infra|docs 补齐）".to_string());
+    }
+    if !item.files.is_empty() {
+        lines.push(format!("改动路径：{}", item.files.join("、")));
     }
     if !item.done_when.is_empty() {
         lines.push(format!("完成条件：{}", item.done_when));
@@ -5256,8 +5757,9 @@ pub fn command(args: &[String]) -> Res<i32> {
         "drop" => drop_cmd(rest),
         "defer" => defer_cmd(rest),
         "import-md" => import_md_cmd(rest),
+        "import-dag" => import_dag_cmd(rest),
         other => Err(format!(
-            "unknown work subcommand: '{other}' (expected: list, show, add, wait, close, drop, defer, import-md)"
+            "unknown work subcommand: '{other}' (expected: list, show, add, wait, close, drop, defer, import-md, import-dag)"
         )),
     }
 }
@@ -5342,6 +5844,7 @@ fn list_cmd(args: &[String]) -> Res<i32> {
             next: next_action_for(w, &items, &state),
             is_ephemeral: false,
             run_id: w.latest_run_id().unwrap_or("").to_string(),
+            missing_class: w.is_missing_class(),
         })
         .collect();
     all_rows.extend(ephemeral);
@@ -5921,6 +6424,8 @@ fn parse_wait_conditions(args: &[String], allow_clear: bool) -> Res<ParsedWaitAr
                 }
             }
             "--needs-owner"
+            | "--class"
+            | "--files"
             | "--done-when"
             | "--repo"
             | "--artifact"
@@ -6200,6 +6705,21 @@ fn add_cmd(args: &[String]) -> Res<i32> {
         .and_then(|v| v.last())
         .cloned()
         .unwrap_or_default();
+    let work_class = match extra.get("--class").and_then(|v| v.last()) {
+        Some(raw) => validate_work_class(raw)?,
+        None => String::new(),
+    };
+    let mut files: Vec<String> = Vec::new();
+    if let Some(raw_files) = extra.get("--files") {
+        for raw in raw_files {
+            for part in raw.split(',') {
+                let norm = crate::fill::normalize_rel_path(part);
+                if !norm.is_empty() && !norm.contains('\0') && !files.contains(&norm) {
+                    files.push(norm);
+                }
+            }
+        }
+    }
     let brief = wf.brief.unwrap_or_default();
     let auto_dispatch = if wf.auto {
         Some(build_auto_dispatch(&brief, &wf.start_args, &repo)?)
@@ -6297,6 +6817,8 @@ fn add_cmd(args: &[String]) -> Res<i32> {
             title,
             repo: repo.clone(),
             state: init_state.to_string(),
+            class: work_class,
+            files,
             done_when,
             needs_verify: wf.needs_verify.unwrap_or(false),
             wait_on,
@@ -6429,6 +6951,22 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
         .and_then(|v| v.last())
         .cloned();
     let cost_raw = extra.get("--cost").and_then(|v| v.last()).cloned();
+    let class_update = match extra.get("--class").and_then(|v| v.last()) {
+        Some(raw) => Some(validate_work_class(raw)?),
+        None => None,
+    };
+    let files_update: Option<Vec<String>> = extra.get("--files").map(|raw_files| {
+        let mut out = Vec::new();
+        for raw in raw_files {
+            for part in raw.split(',') {
+                let norm = crate::fill::normalize_rel_path(part);
+                if !norm.is_empty() && !norm.contains('\0') && !out.contains(&norm) {
+                    out.push(norm);
+                }
+            }
+        }
+        out
+    });
     let has_owner_field_updates = ask_raw.is_some()
         || rec_raw.is_some()
         || if_undecided_raw.is_some()
@@ -6441,10 +6979,12 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
         && wf.brief.is_none()
         && !wf.auto
         && !extra.contains_key("--artifact")
+        && class_update.is_none()
+        && files_update.is_none()
         && needs_owner_kind.is_none()
         && !has_owner_field_updates
     {
-        return Err("work wait requires at least one condition (--after-applied / --after-delivered / --after-work / --wait-owner / --needs-owner / --after-time / --needs-verify / --verify-on / --brief / --ask / --recommendation / --if-undecided / --cost / --clear)".into());
+        return Err("work wait requires at least one condition (--class / --files / --after-applied / --after-delivered / --after-work / --wait-owner / --needs-owner / --after-time / --needs-verify / --verify-on / --brief / --ask / --recommendation / --if-undecided / --cost / --clear)".into());
     }
 
     let recorded_wait_on = !wf.wait_on.is_empty() || needs_owner_kind.is_some();
@@ -6593,6 +7133,12 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
         }
         if let Some(b) = wf.brief {
             item.brief = b;
+        }
+        if let Some(cls) = class_update {
+            item.class = cls;
+        }
+        if let Some(fs_list) = files_update {
+            item.files = fs_list;
         }
         if let Some(a) = ad {
             item.auto_dispatch = Some(a);
@@ -7232,6 +7778,562 @@ fn import_md_cmd(args: &[String]) -> Res<i32> {
     Ok(0)
 }
 
+// ---------------------------------------------------------------------------
+// `delegate work import-dag <FILE> [--dry-run] [--repo <DIR>] [--json]`
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+struct DagImportItem {
+    key: String,
+    title: String,
+    class: String,
+    brief_raw: String,
+    brief_resolved: String,
+    done_when: String,
+    after: Vec<String>,
+    files: Vec<String>,
+    tier: String,
+    model: String,
+    thinking: String,
+}
+
+impl DagImportItem {
+    fn start_args(&self) -> Vec<String> {
+        let mut args = vec!["--worktree".to_string()];
+        if !self.tier.is_empty() {
+            args.push("--tier".to_string());
+            args.push(self.tier.clone());
+        }
+        if !self.model.is_empty() {
+            args.push("--model".to_string());
+            args.push(self.model.clone());
+        }
+        if !self.thinking.is_empty() {
+            args.push("--thinking".to_string());
+            args.push(self.thinking.clone());
+        }
+        args
+    }
+}
+
+fn resolve_dag_brief_path(raw: &str, repo: &str, base_dir: Option<&Path>) -> Option<PathBuf> {
+    let p = PathBuf::from(raw);
+    if p.is_absolute() {
+        return p.is_file().then(|| fs::canonicalize(&p).unwrap_or(p));
+    }
+    if p.is_file() {
+        return Some(fs::canonicalize(&p).unwrap_or(p));
+    }
+    if !repo.is_empty() {
+        let r = Path::new(repo).join(raw);
+        if r.is_file() {
+            return Some(fs::canonicalize(&r).unwrap_or(r));
+        }
+    }
+    if let Some(bd) = base_dir {
+        let b = bd.join(raw);
+        if b.is_file() {
+            return Some(fs::canonicalize(&b).unwrap_or(b));
+        }
+    }
+    None
+}
+
+fn parse_dag_import_json(
+    doc: &Value,
+    repo: &str,
+    base_dir: Option<&Path>,
+    existing_ids: &HashSet<String>,
+) -> Res<Vec<DagImportItem>> {
+    let Some(arr) = doc.as_object().and_then(|o| o.get("items")).and_then(Value::as_array) else {
+        return Err("import-dag: JSON must be an object with an \"items\" array".into());
+    };
+    if arr.is_empty() {
+        return Err("import-dag: \"items\" array is empty".into());
+    }
+
+    let mut seen_keys: HashSet<String> = HashSet::new();
+    let mut parsed: Vec<DagImportItem> = Vec::with_capacity(arr.len());
+
+    for (idx, raw_item) in arr.iter().enumerate() {
+        let Some(obj) = raw_item.as_object() else {
+            return Err(format!("import-dag: items[{idx}] must be an object"));
+        };
+        let key = obj
+            .get("key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if key.is_empty() {
+            return Err(format!("import-dag: items[{idx}] missing non-empty \"key\""));
+        }
+        if !seen_keys.insert(key.to_string()) {
+            return Err(format!("import-dag: duplicate key '{key}'"));
+        }
+        let title = obj
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if title.is_empty() {
+            return Err(format!("import-dag: item '{key}' missing non-empty \"title\""));
+        }
+        let class = match obj.get("class") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(raw)) => {
+                if raw.trim().is_empty() {
+                    String::new()
+                } else {
+                    validate_work_class(raw)
+                        .map_err(|e| format!("import-dag: item '{key}': {e}"))?
+                }
+            }
+            Some(_) => {
+                return Err(format!(
+                    "import-dag: item '{key}': \"class\" must be a string ({})",
+                    WORK_CLASSES.join("|")
+                ))
+            }
+        };
+        let brief_raw = obj
+            .get("brief")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if brief_raw.is_empty() {
+            return Err(format!("import-dag: item '{key}' missing non-empty \"brief\" file path"));
+        }
+        let Some(brief_path) = resolve_dag_brief_path(brief_raw, repo, base_dir) else {
+            return Err(format!(
+                "import-dag: item '{key}': brief file does not exist: {brief_raw}"
+            ));
+        };
+        let done_when = match obj.get("doneWhen") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(s)) => s.trim().to_string(),
+            Some(_) => {
+                return Err(format!(
+                    "import-dag: item '{key}': \"doneWhen\" must be a string"
+                ))
+            }
+        };
+        let mut after: Vec<String> = Vec::new();
+        if let Some(av) = obj.get("after").filter(|v| !v.is_null()) {
+            let Some(a_arr) = av.as_array() else {
+                return Err(format!(
+                    "import-dag: item '{key}': \"after\" must be an array of keys"
+                ));
+            };
+            for dep in a_arr {
+                let Some(ds) = dep.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+                    return Err(format!(
+                        "import-dag: item '{key}': \"after\" must contain non-empty key strings"
+                    ));
+                };
+                if !after.iter().any(|x| x == ds) {
+                    after.push(ds.to_string());
+                }
+            }
+        }
+        let mut files: Vec<String> = Vec::new();
+        if let Some(fv) = obj.get("files").filter(|v| !v.is_null()) {
+            let Some(f_arr) = fv.as_array() else {
+                return Err(format!(
+                    "import-dag: item '{key}': \"files\" must be an array of path prefixes"
+                ));
+            };
+            for f in f_arr {
+                let Some(fs_raw) = f.as_str() else {
+                    return Err(format!(
+                        "import-dag: item '{key}': \"files\" must contain non-empty path strings"
+                    ));
+                };
+                let norm = crate::fill::normalize_rel_path(fs_raw);
+                if norm.is_empty() || fs_raw.contains('\0') {
+                    return Err(format!(
+                        "import-dag: item '{key}': \"files\" contains an empty or invalid path"
+                    ));
+                }
+                if !files.contains(&norm) {
+                    files.push(norm);
+                }
+            }
+        }
+        let tier = match obj.get("tier") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(t)) => {
+                let tt = t.trim();
+                if !tt.is_empty() && !crate::agents::ALL_TIERS.contains(&tt) {
+                    return Err(format!(
+                        "import-dag: item '{key}': invalid tier '{tt}' (expected: scout|review|write)"
+                    ));
+                }
+                tt.to_string()
+            }
+            Some(_) => return Err(format!("import-dag: item '{key}': \"tier\" must be a string")),
+        };
+        let model = match obj.get("model") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(m)) => {
+                let mm = m.trim();
+                if !mm.is_empty() {
+                    crate::models::validate_model(mm)
+                        .map_err(|e| format!("import-dag: item '{key}': {e}"))?;
+                }
+                mm.to_string()
+            }
+            Some(_) => return Err(format!("import-dag: item '{key}': \"model\" must be a string")),
+        };
+        let thinking = match obj.get("thinking") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(th)) => {
+                let tt = th.trim();
+                if !tt.is_empty() {
+                    crate::models::validate_thinking(tt)
+                        .map_err(|e| format!("import-dag: item '{key}': {e}"))?;
+                }
+                tt.to_string()
+            }
+            Some(_) => {
+                return Err(format!(
+                    "import-dag: item '{key}': \"thinking\" must be a string"
+                ))
+            }
+        };
+
+        parsed.push(DagImportItem {
+            key: key.to_string(),
+            title: title.to_string(),
+            class,
+            brief_raw: brief_raw.to_string(),
+            brief_resolved: brief_path.to_string_lossy().into_owned(),
+            done_when,
+            after,
+            files,
+            tier,
+            model,
+            thinking,
+        });
+    }
+
+    // Validate every `after` reference exists either in the batch or in existing work items.
+    let key_to_idx: HashMap<&str, usize> = parsed
+        .iter()
+        .enumerate()
+        .map(|(i, it)| (it.key.as_str(), i))
+        .collect();
+    for item in &parsed {
+        for dep in &item.after {
+            if key_to_idx.contains_key(dep.as_str()) {
+                continue;
+            }
+            if normalize_work_id(dep).is_some_and(|id| existing_ids.contains(&id)) {
+                continue;
+            }
+            return Err(format!(
+                "import-dag: item '{}' references unknown dependency '{}'",
+                item.key, dep
+            ));
+        }
+    }
+
+    // 3-color DFS cycle detection across batch keys (rejects self-loops and any cycle).
+    let mut color = vec![0u8; parsed.len()]; // 0=white, 1=gray, 2=black
+    fn dfs_cycle(
+        u: usize,
+        parsed: &[DagImportItem],
+        key_to_idx: &HashMap<&str, usize>,
+        color: &mut [u8],
+    ) -> Option<String> {
+        color[u] = 1;
+        for dep in &parsed[u].after {
+            if let Some(&v) = key_to_idx.get(dep.as_str()) {
+                if color[v] == 1 {
+                    return Some(format!("{} -> {}", parsed[u].key, parsed[v].key));
+                }
+                if color[v] == 0 {
+                    if let Some(cyc) = dfs_cycle(v, parsed, key_to_idx, color) {
+                        return Some(cyc);
+                    }
+                }
+            }
+        }
+        color[u] = 2;
+        None
+    }
+    for i in 0..parsed.len() {
+        if color[i] == 0 {
+            if let Some(cyc) = dfs_cycle(i, &parsed, &key_to_idx, &mut color) {
+                return Err(format!("import-dag: dependency cycle detected ({cyc})"));
+            }
+        }
+    }
+
+    Ok(parsed)
+}
+
+fn import_dag_cmd(args: &[String]) -> Res<i32> {
+    let mut file_path: Option<String> = None;
+    let mut dry_run = false;
+    let mut repo_arg: Option<String> = None;
+    let mut json_mode = crate::output::json_enabled();
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let (key, inline) = a
+            .split_once('=')
+            .map_or((a.as_str(), None), |(k, v)| (k, Some(v)));
+        match key {
+            "--dry-run" => dry_run = true,
+            "--json" => json_mode = true,
+            "--repo" => {
+                let v = match inline {
+                    Some(v) => v.to_string(),
+                    None => {
+                        i += 1;
+                        args.get(i)
+                            .cloned()
+                            .ok_or("argument --repo: expected one argument")?
+                    }
+                };
+                repo_arg = Some(v);
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unrecognized arguments: {other}"));
+            }
+            other => {
+                if file_path.is_none() {
+                    file_path = Some(other.to_string());
+                } else {
+                    return Err(format!("unexpected positional argument: {other}"));
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let file_str =
+        file_path.ok_or("usage: delegate work import-dag <FILE> [--dry-run] [--repo <DIR>] [--json]")?;
+    let p = PathBuf::from(&file_str);
+    if !p.is_file() {
+        return Err(format!("file not found: {file_str}"));
+    }
+    let content = fs::read_to_string(&p).map_err(|e| format!("{file_str}: {e}"))?;
+    let doc: Value =
+        serde_json::from_str(&content).map_err(|e| format!("{file_str}: invalid JSON: {e}"))?;
+
+    let repo = repo_arg
+        .map(|r| {
+            let pb = PathBuf::from(r);
+            fs::canonicalize(&pb)
+                .unwrap_or(pb)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .unwrap_or_else(current_repo_str);
+
+    let state = state_dir();
+    let existing_ids: HashSet<String> = load_raw(&state).into_iter().map(|w| w.id).collect();
+    let base_dir = p.parent().filter(|d| !d.as_os_str().is_empty());
+    let dag_items = parse_dag_import_json(&doc, &repo, base_dir, &existing_ids)?;
+
+    let edges: Vec<(String, String)> = dag_items
+        .iter()
+        .flat_map(|it| it.after.iter().map(|dep| (dep.clone(), it.key.clone())))
+        .collect();
+
+    if dry_run {
+        if json_mode {
+            println!(
+                "{}",
+                json!({
+                    "dryRun": true,
+                    "file": file_str,
+                    "repo": repo,
+                    "items": dag_items.iter().map(|it| json!({
+                        "key": it.key,
+                        "title": it.title,
+                        "class": it.class,
+                        "brief": it.brief_resolved,
+                        "doneWhen": it.done_when,
+                        "after": it.after,
+                        "files": it.files,
+                        "startArgs": it.start_args(),
+                    })).collect::<Vec<_>>(),
+                    "edges": edges.iter().map(|(from, to)| json!({
+                        "from": from,
+                        "to": to,
+                    })).collect::<Vec<_>>(),
+                })
+            );
+        } else {
+            println!(
+                "预览导入（--dry-run，未写入）：{} 项 · {} 条依赖边（{}）",
+                dag_items.len(),
+                edges.len(),
+                file_str
+            );
+            for it in &dag_items {
+                let cls = if it.class.is_empty() {
+                    "缺类别"
+                } else {
+                    it.class.as_str()
+                };
+                let files_tag = if it.files.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · files={}", it.files.join(","))
+                };
+                let after_tag = if it.after.is_empty() {
+                    "ready".to_string()
+                } else {
+                    format!("after={}", it.after.join(","))
+                };
+                println!(
+                    "  [{}] {} · {} · {}{} · brief={} · auto={}",
+                    it.key,
+                    it.title,
+                    cls,
+                    after_tag,
+                    files_tag,
+                    it.brief_raw,
+                    it.start_args().join(" ")
+                );
+            }
+            if !edges.is_empty() {
+                println!("依赖边：");
+                for (from, to) in &edges {
+                    println!("  {from} -> {to}");
+                }
+            }
+        }
+        return Ok(0);
+    }
+
+    fs::create_dir_all(&state).map_err(|e| format!("{}: {e}", state.display()))?;
+    touch_caller_session();
+    let cur_caller = caller().unwrap_or_default();
+    let now_iso = iso();
+    let prefetch = prefetch_reconcile_for_state(&state, &[]);
+
+    let (created_records, outcome) = {
+        let _guard = crate::locks::acquire_state(&state).map_err(|e| e.to_string())?;
+        let mut items = load_raw(&state);
+        let _ = migrate_legacy_locked(&state, &mut items);
+
+        // Pre-allocate sequential W-IDs for every item in the batch so intra-batch `after`
+        // references resolve cleanly regardless of declaration order.
+        let mut key_to_id: HashMap<String, String> = HashMap::with_capacity(dag_items.len());
+        let mut allocated: Vec<(String, String)> = Vec::with_capacity(dag_items.len());
+        let mut dummy_items = items.clone();
+        for it in &dag_items {
+            let id = next_id_locked(&state, &dummy_items);
+            dummy_items.push(WorkItem {
+                id: id.clone(),
+                ..Default::default()
+            });
+            key_to_id.insert(it.key.clone(), id.clone());
+            allocated.push((it.key.clone(), id));
+        }
+
+        let mut records: Vec<Value> = Vec::with_capacity(dag_items.len());
+        for (it, (_, id)) in dag_items.iter().zip(allocated.iter()) {
+            let mut wait_on: Vec<String> = Vec::new();
+            for dep in &it.after {
+                let target_id = key_to_id
+                    .get(dep)
+                    .cloned()
+                    .or_else(|| normalize_work_id(dep))
+                    .ok_or_else(|| format!("import-dag: unresolved dependency '{dep}'"))?;
+                let cond = format!("work_closed:{target_id}");
+                if !wait_on.contains(&cond) {
+                    wait_on.push(cond);
+                }
+            }
+            let init_state = if wait_on.is_empty() {
+                "ready"
+            } else {
+                "blocked"
+            };
+            let ad = build_auto_dispatch(&it.brief_resolved, &it.start_args(), &repo)?;
+            let wi = WorkItem {
+                id: id.clone(),
+                title: it.title.clone(),
+                repo: repo.clone(),
+                state: init_state.to_string(),
+                class: it.class.clone(),
+                files: it.files.clone(),
+                done_when: it.done_when.clone(),
+                wait_on: wait_on.clone(),
+                auto_dispatch: Some(ad),
+                brief: it.brief_resolved.clone(),
+                created_at: now_iso.clone(),
+                updated_at: now_iso.clone(),
+                state_since: now_iso.clone(),
+                origin: format!("import-dag:{}:{}", file_str, it.key),
+                caller: cur_caller.clone(),
+                ..Default::default()
+            };
+            records.push(json!({
+                "key": it.key,
+                "id": id,
+                "title": it.title,
+                "class": it.class,
+                "state": init_state,
+                "waitOn": wait_on,
+                "files": it.files,
+                "brief": it.brief_resolved,
+            }));
+            items.push(wi);
+        }
+
+        let rec = reconcile_all_locked_with_prefetch(&state, &mut items, None, Some(&prefetch));
+        save_raw(&state, &items)?;
+        (records, rec)
+    };
+
+    let _ = emit_reconcile_events_and_dispatch(&state, &outcome);
+
+    if json_mode {
+        let mapped_edges: Vec<Value> = {
+            let key_map: HashMap<&str, &str> = created_records
+                .iter()
+                .map(|r| (s(r, "key"), s(r, "id")))
+                .collect();
+            edges
+                .iter()
+                .map(|(from, to)| {
+                    json!({
+                        "fromKey": from,
+                        "toKey": to,
+                        "fromId": key_map.get(from.as_str()).copied().unwrap_or(from.as_str()),
+                        "toId": key_map.get(to.as_str()).copied().unwrap_or(to.as_str()),
+                    })
+                })
+                .collect()
+        };
+        println!(
+            "{}",
+            json!({
+                "file": file_str,
+                "repo": repo,
+                "imported": created_records,
+                "edges": mapped_edges,
+            })
+        );
+    } else {
+        let ids: Vec<&str> = created_records.iter().map(|r| s(r, "id")).collect();
+        println!(
+            "已导入 DAG {} 条工作项（{} 条依赖边）：{} · 查看：delegate work --all",
+            created_records.len(),
+            edges.len(),
+            ids.join(", ")
+        );
+    }
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7313,6 +8415,7 @@ mod tests {
             next: "start --work W019 --prompt-file .local/plan/brief-body-idle-scene.md".into(),
             is_ephemeral: false,
             run_id: String::new(),
+            missing_class: false,
         };
         let rendered = format_table_row(&row);
         assert!(rendered.chars().count() <= 100, "row too long: {rendered}");
@@ -8331,5 +9434,278 @@ mod tests {
         ];
         let blocked = blocked_downstream_in(&items, &chain_ids, &[]);
         assert_eq!(blocked, vec!["W057", "W058", "W069", "W070"]);
+    }
+
+    #[test]
+    fn import_dag_rejects_dup_cycle_missing_brief_and_accepts_valid() {
+        let dir = temp_dir("import-dag");
+        let repo = dir.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let brief_a = repo.join("brief-a.md");
+        let brief_b = repo.join("brief-b.md");
+        fs::write(&brief_a, "implement A").unwrap();
+        fs::write(&brief_b, "implement B").unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+        let empty = HashSet::new();
+
+        // 1. Duplicate key rejected
+        let dup_doc = json!({
+            "items": [
+                {"key": "a", "title": "A1", "class": "feat", "brief": "brief-a.md"},
+                {"key": "a", "title": "A2", "class": "feat", "brief": "brief-b.md"}
+            ]
+        });
+        let err = parse_dag_import_json(&dup_doc, &repo_s, Some(&repo), &empty).unwrap_err();
+        assert!(err.contains("duplicate key"), "{err}");
+
+        // 2. Cycle rejected (2-node cycle)
+        let cyc_doc = json!({
+            "items": [
+                {"key": "a", "title": "A", "class": "feat", "brief": "brief-a.md", "after": ["b"]},
+                {"key": "b", "title": "B", "class": "unblock", "brief": "brief-b.md", "after": ["a"]}
+            ]
+        });
+        let err = parse_dag_import_json(&cyc_doc, &repo_s, Some(&repo), &empty).unwrap_err();
+        assert!(err.contains("cycle"), "{err}");
+
+        // 3. Missing brief rejected
+        let miss_doc = json!({
+            "items": [
+                {"key": "a", "title": "A", "class": "feat", "brief": "brief-a.md"},
+                {"key": "b", "title": "B", "class": "docs", "brief": "no-such-brief.md"}
+            ]
+        });
+        let err = parse_dag_import_json(&miss_doc, &repo_s, Some(&repo), &empty).unwrap_err();
+        assert!(err.contains("brief file does not exist"), "{err}");
+
+        // 4. Valid DAG accepted
+        let ok_doc = json!({
+            "items": [
+                {
+                    "key": "a",
+                    "title": "Base task",
+                    "class": "unblock",
+                    "brief": "brief-a.md",
+                    "doneWhen": "tests pass",
+                    "files": ["./crates/foo/src/lib.rs"],
+                    "tier": "write",
+                    "model": "sol",
+                    "thinking": "medium"
+                },
+                {
+                    "key": "b",
+                    "title": "Dependent task",
+                    "class": "feat",
+                    "brief": "brief-b.md",
+                    "after": ["a"],
+                    "files": ["README.md"]
+                }
+            ]
+        });
+        let parsed = parse_dag_import_json(&ok_doc, &repo_s, Some(&repo), &empty).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].files, vec!["crates/foo/src/lib.rs".to_string()]);
+        assert_eq!(
+            parsed[0].start_args(),
+            vec!["--worktree", "--tier", "write", "--model", "sol", "--thinking", "medium"]
+        );
+        assert_eq!(parsed[1].after, vec!["a".to_string()]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_fill_item(
+        id: &str,
+        repo: &str,
+        state: &str,
+        class: &str,
+        brief: &str,
+        state_since: &str,
+        files: &[&str],
+        wait_on: &[&str],
+    ) -> WorkItem {
+        WorkItem {
+            id: id.into(),
+            title: format!("task {id}"),
+            repo: repo.into(),
+            state: state.into(),
+            class: class.into(),
+            files: files.iter().map(|s| s.to_string()).collect(),
+            brief: brief.into(),
+            wait_on: wait_on.iter().map(|s| s.to_string()).collect(),
+            auto_dispatch: Some(AutoDispatch {
+                prompt_file: brief.into(),
+                start_args: vec!["--worktree".into()],
+                cwd: repo.into(),
+                repo: repo.into(),
+                runs_dir: String::new(),
+                dispatched_run: String::new(),
+            }),
+            created_at: state_since.into(),
+            updated_at: state_since.into(),
+            state_since: state_since.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fill_selection_class_order_out_degree_quota_hotspots_and_target_cap() {
+        let dir = temp_dir("fill-select");
+        let state = dir.join("state");
+        let repo = dir.join("repo");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let brief = repo.join("brief.md");
+        fs::write(&brief, "do work").unwrap();
+        let brief_s = brief.to_string_lossy().into_owned();
+        let repo_s = fs::canonicalize(&repo).unwrap().to_string_lossy().into_owned();
+
+        // Write .delegate.json with target=6, maxInfraDocsShare=0.3, hotspots=["README.md"]
+        fs::write(
+            repo.join(".delegate.json"),
+            r#"{"fill":{"target":6,"maxInfraDocsShare":0.3},"hotspots":["README.md"]}"#,
+        )
+        .unwrap();
+
+        // 1) Class priority: feat > unblock > infra > docs; classless ignored
+        let items = vec![
+            make_fill_item("W001", &repo_s, "ready", "", &brief_s, "2026-11-24T01:00:00Z", &[], &[]),
+            make_fill_item("W002", &repo_s, "ready", "docs", &brief_s, "2026-11-24T01:00:00Z", &[], &[]),
+            make_fill_item("W003", &repo_s, "ready", "infra", &brief_s, "2026-11-24T02:00:00Z", &[], &[]),
+            make_fill_item("W004", &repo_s, "ready", "unblock", &brief_s, "2026-11-24T03:00:00Z", &[], &[]),
+            make_fill_item("W005", &repo_s, "ready", "feat", &brief_s, "2026-11-24T04:00:00Z", &[], &[]),
+        ];
+        let picked = select_fill_candidates(&state, &items, None, &HashSet::new());
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].item.id, "W005");
+        assert_eq!(picked[0].active_writes, 0);
+
+        // Missing class row renders 缺类别 at line end without truncation
+        let row = TableRow {
+            id: "W001".into(),
+            repo: "repo".into(),
+            title: "一个非常长非常长非常长非常长非常长的标题".into(),
+            state: "ready".into(),
+            focus: "可派发 1h".into(),
+            next: "start --work W001 --prompt-file very/long/path/to/brief.md".into(),
+            is_ephemeral: false,
+            run_id: String::new(),
+            missing_class: items[0].is_missing_class(),
+        };
+        let rendered = format_table_row(&row);
+        assert!(rendered.ends_with(" · 缺类别"), "{rendered}");
+        assert!(rendered.chars().count() <= 100, "{rendered}");
+
+        // 2) Same class: higher out-degree wins over earlier ready time; tie falls back to ready time
+        let items_deg = vec![
+            make_fill_item("W010", &repo_s, "ready", "feat", &brief_s, "2026-11-24T01:00:00Z", &[], &[]),
+            make_fill_item("W011", &repo_s, "ready", "feat", &brief_s, "2026-11-24T05:00:00Z", &[], &[]),
+            make_fill_item("W012", &repo_s, "blocked", "feat", &brief_s, "2026-11-24T06:00:00Z", &[], &["work_closed:W011"]),
+            make_fill_item("W013", &repo_s, "blocked", "feat", &brief_s, "2026-11-24T06:00:00Z", &[], &["work_closed:W011"]),
+        ];
+        let picked_deg = select_fill_candidates(&state, &items_deg, None, &HashSet::new());
+        assert_eq!(picked_deg[0].item.id, "W011");
+
+        // 3) Infra/docs quota: target=6, share=0.3 -> max 2. With 2 active infra/docs, 3rd infra/docs skipped!
+        let items_quota = vec![
+            make_fill_item("W020", &repo_s, "active", "infra", &brief_s, "2026-11-24T01:00:00Z", &[], &[]),
+            make_fill_item("W021", &repo_s, "active", "docs", &brief_s, "2026-11-24T01:00:00Z", &[], &[]),
+            make_fill_item("W022", &repo_s, "ready", "infra", &brief_s, "2026-11-24T01:00:00Z", &[], &[]),
+            make_fill_item("W023", &repo_s, "ready", "docs", &brief_s, "2026-11-24T01:00:00Z", &[], &[]),
+        ];
+        let picked_quota = select_fill_candidates(&state, &items_quota, None, &HashSet::new());
+        assert!(picked_quota.is_empty(), "expected infra/docs quota cap at 2");
+
+        // With 1 active infra, 2nd docs IS allowed
+        let items_quota_ok = vec![
+            make_fill_item("W020", &repo_s, "active", "infra", &brief_s, "2026-11-24T01:00:00Z", &[], &[]),
+            make_fill_item("W023", &repo_s, "ready", "docs", &brief_s, "2026-11-24T01:00:00Z", &[], &[]),
+        ];
+        let picked_quota_ok = select_fill_candidates(&state, &items_quota_ok, None, &HashSet::new());
+        assert_eq!(picked_quota_ok.len(), 1);
+        assert_eq!(picked_quota_ok[0].item.id, "W023");
+
+        // 4) Hotspot skipping: active touches README.md -> skip W031 (touches README.md), pick W032 (overlaps non-hotspot src/a.rs!)
+        let items_hot = vec![
+            make_fill_item("W030", &repo_s, "active", "feat", &brief_s, "2026-11-24T01:00:00Z", &["README.md", "src/a.rs"], &[]),
+            make_fill_item("W031", &repo_s, "ready", "feat", &brief_s, "2026-11-24T01:00:00Z", &["README.md"], &[]),
+            make_fill_item("W032", &repo_s, "ready", "unblock", &brief_s, "2026-11-24T02:00:00Z", &["src/a.rs"], &[]),
+        ];
+        let picked_hot = select_fill_candidates(&state, &items_hot, None, &HashSet::new());
+        assert_eq!(picked_hot.len(), 1);
+        assert_eq!(picked_hot[0].item.id, "W032");
+
+        // 5) Target full (6 active writes) -> does not dispatch
+        let mut items_full: Vec<WorkItem> = (1..=6)
+            .map(|i| {
+                make_fill_item(
+                    &format!("W04{i}"),
+                    &repo_s,
+                    "active",
+                    "feat",
+                    &brief_s,
+                    "2026-11-24T01:00:00Z",
+                    &[],
+                    &[],
+                )
+            })
+            .collect();
+        items_full.push(make_fill_item(
+            "W049",
+            &repo_s,
+            "ready",
+            "feat",
+            &brief_s,
+            "2026-11-24T01:00:00Z",
+            &[],
+            &[],
+        ));
+        let picked_full = select_fill_candidates(&state, &items_full, None, &HashSet::new());
+        assert!(picked_full.is_empty(), "target=6 full must not dispatch");
+
+        // 6) Read-only active item does NOT count toward target=6 (5 write + 2 read-only = 5 < 6 -> dispatches!)
+        let mut items_ro: Vec<WorkItem> = (1..=5)
+            .map(|i| {
+                make_fill_item(
+                    &format!("W05{i}"),
+                    &repo_s,
+                    "active",
+                    "feat",
+                    &brief_s,
+                    "2026-11-24T01:00:00Z",
+                    &[],
+                    &[],
+                )
+            })
+            .collect();
+        let mut ro_active = make_fill_item(
+            "W056",
+            &repo_s,
+            "active",
+            "feat",
+            &brief_s,
+            "2026-11-24T01:00:00Z",
+            &[],
+            &[],
+        );
+        ro_active.auto_dispatch.as_mut().unwrap().start_args = vec!["--read-only".into()];
+        items_ro.push(ro_active);
+        items_ro.push(make_fill_item(
+            "W059",
+            &repo_s,
+            "ready",
+            "feat",
+            &brief_s,
+            "2026-11-24T01:00:00Z",
+            &[],
+            &[],
+        ));
+        let picked_ro = select_fill_candidates(&state, &items_ro, None, &HashSet::new());
+        assert_eq!(picked_ro.len(), 1);
+        assert_eq!(picked_ro[0].item.id, "W059");
+        assert_eq!(picked_ro[0].active_writes, 5);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

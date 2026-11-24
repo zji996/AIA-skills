@@ -29,3 +29,14 @@ T_dev = max(D · t_crit, N · t_chain / P_eff) + T_merge
 - **只读链**：`mode != "write"` 的任务链按首次 `started` 到末次终态计算 `p50` / `p75`，单独列示。
 - **自动扩窗**：请求窗口短于 14 天（默认 `7d`）且该仓库已合入写链不足 30 条时，自动扩至 `14d` 并在表尾说明。
 - **历史记录与漂移**：每次运行将快照追加到 `<state>/speed/<repo-slug>.jsonl`，并与上一条记录对比 `t_chain`、`t_crit`、`P_eff`、`T_merge` 的相对变化，超过 `±20%` 标出 `⚠`。
+
+## 无模型补位派发与热点
+
+- 仓库级 `.delegate.json` 配 `fill: {"target": 6, "maxInfraDocsShare": 0.3}`（缺省不启用）与 `hotspots: ["README.md", ...]`（常冲突单文件；norvane 先放 `xtask/size-baseline.txt`，aia-skills 先放 `README.md`）。
+- 工作表 `reconcile` 时，若该仓库在跑写链数 `< target`（只数写任务；只读、调研类 run 不计入也不设上限），从「就绪 + 有 brief + 有类别 + 有 `autoDispatch` 参数」中挑 1 项派出：先按类别 `feat > unblock > infra > docs`，同类按出度（有多少未关闭项在等它）从大到小，再按就绪时间从早到晚。
+- `infra` + `docs` 在跑数加本次派发后不超过 `maxInfraDocsShare` 配额（`target=6` 时最多 2 条）；候选 `files` 前缀与在跑项同撞某个 `hotspots` 路径时跳过（其余路径不互斥）。每次补位记 `work_dispatched`（带 `reason: "fill"`、`class` 与 `activeWriteRuns`）。
+
+## 放开的节奏（不自动升降档）
+
+- `target` 从 6 起（只数写链）。满 20 次写入交付后运行 `delegate fill stats [--since 24h]` 检查停止线：premerge 冲突率 `>10%`、返工率 `>28.3%`、已交付未合入峰值 `>5`、lane 排队占比 `>15%`（并核对每 10 次交付 agy 周额度与只读 run 占比）。
+- 没越线就试 `8`；越线就先补 `hotspots`，仍越线再退到 `5`。越线仅提醒（ADR 0120），不自动升降档，均由主控手动改 `.delegate.json`。

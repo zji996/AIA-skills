@@ -1218,7 +1218,15 @@ pub fn format_human(ev: &Value) -> String {
         "work_dispatched" => {
             let wid = s(p, "workId");
             let next = s(p, "nextRun");
-            format!("工作项自动派发 [{wid}] -> {next}（卡片：delegate work show {wid}）")
+            if s(p, "reason") == "fill" {
+                let cls = s(p, "class");
+                let active = n(p, "activeWriteRuns");
+                format!(
+                    "工作项补位派发 [{wid}]（{cls} · 在跑 {active}）-> {next}（卡片：delegate work show {wid}）"
+                )
+            } else {
+                format!("工作项自动派发 [{wid}] -> {next}（卡片：delegate work show {wid}）")
+            }
         }
         "work_defer_expired" => {
             let wid = s(p, "workId");

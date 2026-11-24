@@ -12,6 +12,7 @@
 - `delegate`：`reply --minor` 去掉默认 10 分钟时限（显式 `--timeout` 照旧生效，长时间不动由 `stall_warning` 处理），保留不计返工次数与说明 ≤600 字语义。
 - `delegate`：新增 `delegate speed [--since 7d|14d|all] [--repo PATH] [--json]`，从全机事件流 `events.jsonl` 按仓库计算写任务链墙钟（`t_chain`）、非一次过与一次过耗时（`t_crit`）、三口径返工率、活跃分钟有效并发（`P_eff`）与每活跃小时合入数、预合并冲突/失败率及合入等待（`T_merge`）与只读链耗时；不足 30 条写链时自动扩窗至 14 天，追加快照到 `<state>/speed/<repo-slug>.jsonl` 并标出超 ±20% 的漂移。
 - `delegate`：审查模型可配置（`review.model`/`thinking`，优先级 `start --review-model` > 仓库 > 用户 > `review` 档位；不可用时回退 `review` 档并在审查卡明示 `审查改用 <别名>（原因）`，审查卡与 `status` 显示实际审查模型）；`start --class build|hard|design|scout` 未传 `--thinking` 时按类别定默认档（`build`/`design`/`scout` → `medium`，`hard` → `high`，回显 `thinking <档>〔类别 <类>〕`）；审查员首行缺结论时同会话尾部补问 1 次，仍不合格才判 `NEEDS_CONTROLLER`（`formatError`）并注「补问 1 次仍无结论」；新增可选 `review.extra` 补充审查（命中 `controllerReviewPaths` 或 `risk:high` 时按 `agy-quota.json` Claude/GPT 池阈值保护并行跑第二意见，低于阈值跳过并写明余量，意见不一致时标「意见不一致」并升 `NEEDS_CONTROLLER`）；本仓 `.delegate.json` 启用 `hydrogen`（`high`）审查。
+- `delegate`：新增工作项价值类别（`work add/wait --class feat|unblock|infra|docs`，无类别不参与补位且 `work` 行尾标「缺类别」）、`work import-dag <FILE> [--dry-run]`（批量建项、`after` 转 `work_closed:`、`files` 存路径前缀并附 `--auto` 派发参数，key 重复/成环/brief 缺失整批拒绝）、仓库级 `.delegate.json` `fill`（`{"target": 6, "maxInfraDocsShare": 0.3}`，缺省关闭）与 `hotspots`（本仓先配 `README.md`）无模型补位派发（只数写链不计只读，按类别>出度>就绪时间排序并受 infra/docs 配额与热点避让，记 `work_dispatched` `reason: "fill"`），以及 `delegate fill stats [--since 24h]`（统计冲突率/返工率/未合入峰值/lane 排队占比/每 10 次交付 agy 周额度与只读占比，越线仅提醒不自动降档）。
 
 ## delegate 6.43.0 - 2026-11-24
 
