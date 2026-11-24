@@ -355,7 +355,7 @@ impl RepoSpeedReport {
     }
 }
 
-fn round2(v: f64) -> f64 {
+pub(crate) fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
@@ -363,11 +363,11 @@ fn round4(v: f64) -> f64 {
     (v * 10_000.0).round() / 10_000.0
 }
 
-fn sec_to_min(sec: f64) -> f64 {
+pub(crate) fn sec_to_min(sec: f64) -> f64 {
     round2(sec / 60.0)
 }
 
-fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
+pub(crate) fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
     if sorted.is_empty() {
         return None;
     }
@@ -412,7 +412,7 @@ fn weighted_percentile(buckets: &[(u32, i64)], p: f64) -> Option<f64> {
     Some(lo_v + frac * (hi_v - lo_v))
 }
 
-fn short_repo_name(repo: &str) -> String {
+pub(crate) fn short_repo_name(repo: &str) -> String {
     Path::new(repo)
         .file_name()
         .and_then(|n| n.to_str())
@@ -421,7 +421,7 @@ fn short_repo_name(repo: &str) -> String {
         .to_string()
 }
 
-fn repo_matches_filter(repo_path: &str, repo_name: &str, filter: &str) -> bool {
+pub(crate) fn repo_matches_filter(repo_path: &str, repo_name: &str, filter: &str) -> bool {
     let f = filter.trim();
     if f.is_empty() {
         return true;
@@ -1134,30 +1134,55 @@ pub fn format_human(reports: &[RepoSpeedReport], requested_since: &str) -> Strin
     out
 }
 
-/// CLI entrypoint: `delegate speed [--since 7d|14d|all] [--repo PATH] [--json]`
+/// CLI entrypoint: `delegate speed [--since 7d|14d|all] [--repo PATH] [--backtest] [--json]`
 pub fn command(args: &[String]) -> Res<i32> {
-    let (pos, flags, kv) = parse_simple(args, &["--json"], &["--since", "--repo"])?;
+    let (pos, flags, kv) =
+        parse_simple(args, &["--json", "--backtest"], &["--since", "--repo"])?;
     if !pos.is_empty() {
         return Err(format!("unrecognized arguments: {}", pos.join(" ")));
     }
-    let json_out = has(&flags, "--json");
-    let since_str = value(&kv, "--since").unwrap_or("7d");
+    let json_out = has(&flags, "--json") || crate::output::json_enabled();
+    let backtest_mode = has(&flags, "--backtest");
+    let since_opt = value(&kv, "--since");
     let repo_filter = value(&kv, "--repo");
 
     let now_ts = epoch() as i64;
     let state = state_dir();
+
+    if backtest_mode {
+        let since_str = since_opt.unwrap_or("14d");
+        let bt = backtest_in(&state, now_ts, since_str, repo_filter)?;
+        if json_out {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&bt.to_json()).unwrap_or_default()
+            );
+        } else {
+            print!("{}", format_backtest_human(&bt));
+        }
+        return Ok(0);
+    }
+
+    let since_str = since_opt.unwrap_or("7d");
     let reports = analyze_in(&state, now_ts, since_str, repo_filter, true)?;
+    let bt = backtest_in(&state, now_ts, "14d", repo_filter).ok();
 
     if json_out {
         let repos_json: Vec<Value> = reports.iter().map(|r| r.to_full_json()).collect();
-        let doc = json!({
+        let mut doc = json!({
             "at": format_epoch(now_ts, false, "%Y-%m-%dT%H:%M:%SZ"),
             "requestedSince": since_str,
             "repos": repos_json,
         });
+        if let Some(bt_rep) = bt {
+            doc["etaBacktest"] = bt_rep.to_json();
+        }
         println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
     } else {
         print!("{}", format_human(&reports, since_str));
+        if let Some(bt_rep) = bt.filter(|b| b.overall_start.count > 0) {
+            print!("{}", format_backtest_inline_summary(&bt_rep));
+        }
     }
     Ok(0)
 }
@@ -2958,6 +2983,738 @@ pub fn load_or_refresh_eta_model_in(state: &Path, now_ts: i64, allow_write: bool
     model
 }
 
+// ---------------------------------------------------------------------------
+// Rolling offline backtest (`delegate speed --backtest`)
+// Replays `events.jsonl` chronologically with strict causality: each prediction
+// at time `t` uses only samples completed strictly before `t` within the
+// trailing 14-day lookback window.
+// ---------------------------------------------------------------------------
+
+pub const BACKTEST_P75_HEALTH_LOW: f64 = 0.65;
+pub const BACKTEST_P75_HEALTH_HIGH: f64 = 0.85;
+pub const BACKTEST_P75_ALERT_LOW: f64 = 0.60;
+pub const BACKTEST_P75_ALERT_HIGH: f64 = 0.90;
+pub const BACKTEST_P50_BIAS_TARGET: f64 = 0.15;
+
+#[derive(Debug, Clone, Default)]
+pub struct BacktestMetrics {
+    pub count: usize,
+    pub p75_covered: usize,
+    pub p75_coverage: Option<f64>,
+    pub p75_status: &'static str,
+    pub p75_alert: bool,
+    pub p50_rel_bias: Option<f64>,
+    pub p50_bias_alert: bool,
+    pub p50_abs_err_min: Option<f64>,
+    pub by_level: BTreeMap<String, usize>,
+}
+
+impl BacktestMetrics {
+    fn from_obs(obs: &[BacktestObs]) -> Self {
+        let count = obs.len();
+        if count == 0 {
+            return Self {
+                p75_status: "insufficient",
+                ..Self::default()
+            };
+        }
+        let mut covered = 0usize;
+        let mut rel_biases = Vec::with_capacity(count);
+        let mut abs_errs = Vec::with_capacity(count);
+        let mut by_level: BTreeMap<String, usize> = BTreeMap::new();
+
+        for o in obs {
+            if o.actual_sec <= o.pred_p75_sec + 1e-6 {
+                covered += 1;
+            }
+            if o.actual_sec > 0.0 {
+                rel_biases.push((o.actual_sec - o.pred_p50_sec) / o.actual_sec);
+            }
+            abs_errs.push((o.actual_sec - o.pred_p50_sec).abs());
+            *by_level.entry(o.level.as_str().to_string()).or_insert(0) += 1;
+        }
+
+        rel_biases.sort_by(|a, b| a.total_cmp(b));
+        abs_errs.sort_by(|a, b| a.total_cmp(b));
+
+        let cov = covered as f64 / count as f64;
+        let (status, p75_alert) = if cov < BACKTEST_P75_ALERT_LOW {
+            ("optimistic", true)
+        } else if cov > BACKTEST_P75_ALERT_HIGH {
+            ("too_wide", true)
+        } else if (BACKTEST_P75_HEALTH_LOW..=BACKTEST_P75_HEALTH_HIGH).contains(&cov) {
+            ("healthy", false)
+        } else {
+            ("borderline", false)
+        };
+        let p50_rel_bias = percentile(&rel_biases, 0.50);
+        let p50_bias_alert = p50_rel_bias.is_some_and(|b| b.abs() > BACKTEST_P50_BIAS_TARGET);
+        let p50_abs_err_min = percentile(&abs_errs, 0.50).map(sec_to_min);
+
+        Self {
+            count,
+            p75_covered: covered,
+            p75_coverage: Some(cov),
+            p75_status: status,
+            p75_alert,
+            p50_rel_bias,
+            p50_bias_alert,
+            p50_abs_err_min,
+            by_level,
+        }
+    }
+
+    pub fn status_zh(&self) -> &'static str {
+        match self.p75_status {
+            "healthy" => "健康",
+            "optimistic" => "偏乐观",
+            "too_wide" => "偏宽",
+            "borderline" => "临界",
+            _ => "样本不足",
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "count": self.count,
+            "p75Covered": self.p75_covered,
+            "p75Coverage": self.p75_coverage.map(round4),
+            "p75CoveragePct": self.p75_coverage.map(|v| round2(v * 100.0)),
+            "p75Status": self.p75_status,
+            "p75Alert": self.p75_alert,
+            "p50RelBias": self.p50_rel_bias.map(round4),
+            "p50RelBiasPct": self.p50_rel_bias.map(|v| round2(v * 100.0)),
+            "p50BiasAlert": self.p50_bias_alert,
+            "p50MedianAbsErrMin": self.p50_abs_err_min,
+            "byLevel": self.by_level,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RepoBacktestReport {
+    pub repo: String,
+    pub repo_name: String,
+    pub start: BacktestMetrics,
+    pub mid: BacktestMetrics,
+    pub applied_chain: BacktestMetrics,
+}
+
+impl RepoBacktestReport {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "repo": self.repo,
+            "repoName": self.repo_name,
+            "start": self.start.to_json(),
+            "mid": self.mid.to_json(),
+            "appliedChain": self.applied_chain.to_json(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BacktestReport {
+    pub at: String,
+    pub window: String,
+    pub lookback_days: i64,
+    pub overall_start: BacktestMetrics,
+    pub overall_mid: BacktestMetrics,
+    pub overall_applied: BacktestMetrics,
+    pub repos: Vec<RepoBacktestReport>,
+}
+
+impl BacktestReport {
+    pub fn to_json(&self) -> Value {
+        let repos: Vec<Value> = self.repos.iter().map(|r| r.to_json()).collect();
+        json!({
+            "at": self.at,
+            "window": self.window,
+            "lookbackDays": self.lookback_days,
+            "healthBand": {
+                "p75Low": BACKTEST_P75_HEALTH_LOW,
+                "p75High": BACKTEST_P75_HEALTH_HIGH,
+                "p75AlertLow": BACKTEST_P75_ALERT_LOW,
+                "p75AlertHigh": BACKTEST_P75_ALERT_HIGH,
+                "p50BiasTarget": BACKTEST_P50_BIAS_TARGET,
+            },
+            "start": self.overall_start.to_json(),
+            "mid": self.overall_mid.to_json(),
+            "appliedChain": self.overall_applied.to_json(),
+            "repos": repos,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BacktestObs {
+    actual_sec: f64,
+    pred_p50_sec: f64,
+    pred_p75_sec: f64,
+    level: FallbackLevel,
+}
+
+#[derive(Debug, Clone)]
+struct ExtractedWriteRun {
+    repo: String,
+    repo_name: String,
+    class: String,
+    started_ts: i64,
+    delivered_ts: i64,
+    duration_sec: f64,
+    agent_work_sec: Option<f64>,
+    suffix_after_work_sec: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct ExtractedAppliedChain {
+    repo: String,
+    repo_name: String,
+    class: String,
+    started_ts: i64,
+    applied_ts: i64,
+    wall_sec: f64,
+}
+
+fn resolve_rolling_dist<F>(
+    history: &[&ExtractedWriteRun],
+    repo: &str,
+    class: &str,
+    extract: F,
+    prior: &SampleDist,
+) -> (SampleDist, FallbackLevel)
+where
+    F: Fn(&ExtractedWriteRun) -> Option<f64>,
+{
+    let mut l1 = Vec::new();
+    let mut l2 = Vec::new();
+    let mut l3 = Vec::new();
+    let mut l4 = Vec::new();
+    for h in history {
+        let Some(v) = extract(h) else {
+            continue;
+        };
+        if !v.is_finite() || v < 0.0 {
+            continue;
+        }
+        l4.push(v);
+        if h.class == class {
+            l3.push(v);
+        }
+        if h.repo == repo {
+            l2.push(v);
+            if h.class == class {
+                l1.push(v);
+            }
+        }
+    }
+    if l1.len() >= MIN_BUCKET_N {
+        (SampleDist::from_secs(l1), FallbackLevel::RepoModeClass)
+    } else if l2.len() >= MIN_BUCKET_N {
+        (SampleDist::from_secs(l2), FallbackLevel::RepoMode)
+    } else if l3.len() >= MIN_BUCKET_N {
+        (SampleDist::from_secs(l3), FallbackLevel::GlobalModeClass)
+    } else if l4.len() >= MIN_GLOBAL_MODE_N {
+        (SampleDist::from_secs(l4), FallbackLevel::GlobalMode)
+    } else {
+        (prior.clone(), FallbackLevel::Prior)
+    }
+}
+
+fn resolve_rolling_applied_dist(
+    history: &[&ExtractedAppliedChain],
+    repo: &str,
+    class: &str,
+    prior: &SampleDist,
+) -> (SampleDist, FallbackLevel) {
+    let mut l1 = Vec::new();
+    let mut l2 = Vec::new();
+    let mut l3 = Vec::new();
+    let mut l4 = Vec::new();
+    for h in history {
+        let v = h.wall_sec;
+        if !v.is_finite() || v < 0.0 {
+            continue;
+        }
+        l4.push(v);
+        if h.class == class {
+            l3.push(v);
+        }
+        if h.repo == repo {
+            l2.push(v);
+            if h.class == class {
+                l1.push(v);
+            }
+        }
+    }
+    if l1.len() >= MIN_BUCKET_N {
+        (SampleDist::from_secs(l1), FallbackLevel::RepoModeClass)
+    } else if l2.len() >= MIN_BUCKET_N {
+        (SampleDist::from_secs(l2), FallbackLevel::RepoMode)
+    } else if l3.len() >= MIN_BUCKET_N {
+        (SampleDist::from_secs(l3), FallbackLevel::GlobalModeClass)
+    } else if l4.len() >= MIN_GLOBAL_MODE_N {
+        (SampleDist::from_secs(l4), FallbackLevel::GlobalMode)
+    } else {
+        (prior.clone(), FallbackLevel::Prior)
+    }
+}
+
+/// Pure in-memory rolling offline backtest over parsed `events`.
+/// Evaluates start-of-run, mid-run (50% of agent work via conditional residual + suffix RSS),
+/// and applied-chain predictions with strict temporal causality.
+pub fn backtest_from_events(
+    events: &[EventRec],
+    now_ts: i64,
+    since_str: &str,
+    repo_filter: Option<&str>,
+) -> Res<BacktestReport> {
+    let (eval_cutoff, window_label) = if since_str.eq_ignore_ascii_case("all") {
+        (None, "all".to_string())
+    } else {
+        let secs = seconds(since_str)? as i64;
+        if secs <= 0 {
+            return Err(format!("--since must be positive, got {since_str:?}"));
+        }
+        (Some(now_ts - secs), since_str.to_string())
+    };
+    let lookback_secs = ETA_MODEL_WINDOW_DAYS * 86_400;
+    let priors = ColdStartPriors::default();
+
+    let mut by_repo: BTreeMap<String, Vec<(usize, &EventRec)>> = BTreeMap::new();
+    for (idx, ev) in events.iter().enumerate() {
+        by_repo.entry(ev.repo.clone()).or_default().push((idx, ev));
+    }
+
+    let mut all_runs: Vec<ExtractedWriteRun> = Vec::new();
+    let mut all_chains: Vec<ExtractedAppliedChain> = Vec::new();
+
+    for (repo, mut indexed) in by_repo {
+        indexed.sort_by_key(|(idx, ev)| (ev.ts, *idx));
+        let ordered: Vec<EventRec> = indexed.iter().map(|(_, ev)| (*ev).clone()).collect();
+        let chains = build_chains_for_repo(&ordered);
+        let repo_name = short_repo_name(&repo);
+
+        let mut events_by_run: HashMap<&str, Vec<&EventRec>> = HashMap::new();
+        for ev in &ordered {
+            events_by_run.entry(ev.run.as_str()).or_default().push(ev);
+        }
+
+        for ch in chains.values() {
+            if !ch.has_started || !ch.is_write {
+                continue;
+            }
+            let (_, norm_class) = ch.mode_and_class();
+            if let (Some(st), Some(ap)) = (ch.first_started_ts, ch.first_applied_ts) {
+                let wall = (ap - st).max(0) as f64;
+                all_chains.push(ExtractedAppliedChain {
+                    repo: repo.clone(),
+                    repo_name: repo_name.clone(),
+                    class: norm_class.clone(),
+                    started_ts: st,
+                    applied_ts: ap,
+                    wall_sec: wall,
+                });
+            }
+            for (run_id, rt) in &ch.runs {
+                let Some(st) = rt.started_ts else {
+                    continue;
+                };
+                let Some(revs) = events_by_run.get(run_id.as_str()) else {
+                    continue;
+                };
+                let Some(del_ts) = revs
+                    .iter()
+                    .rev()
+                    .find(|e| e.kind == "delivered")
+                    .map(|e| e.ts)
+                else {
+                    continue;
+                };
+                let samples = extract_run_stage_samples(revs);
+                let dur = (del_ts - st).max(0) as f64;
+                all_runs.push(ExtractedWriteRun {
+                    repo: repo.clone(),
+                    repo_name: repo_name.clone(),
+                    class: norm_class.clone(),
+                    started_ts: st,
+                    delivered_ts: del_ts,
+                    duration_sec: dur,
+                    agent_work_sec: samples.agent_work,
+                    suffix_after_work_sec: samples.suffix_after_work,
+                });
+            }
+        }
+    }
+
+    // Sort chronologically for rolling causal queries.
+    let mut runs_by_delivered: Vec<usize> = (0..all_runs.len()).collect();
+    runs_by_delivered.sort_by_key(|&i| (all_runs[i].delivered_ts, all_runs[i].started_ts));
+
+    let mut targets_start: Vec<usize> = (0..all_runs.len())
+        .filter(|&i| {
+            let r = &all_runs[i];
+            eval_cutoff.is_none_or(|c| r.started_ts >= c)
+                && repo_filter
+                    .is_none_or(|rf| repo_matches_filter(&r.repo, &r.repo_name, rf))
+        })
+        .collect();
+    targets_start.sort_by_key(|&i| (all_runs[i].started_ts, all_runs[i].delivered_ts));
+
+    let mut overall_start_obs: Vec<BacktestObs> = Vec::new();
+    let mut overall_mid_obs: Vec<BacktestObs> = Vec::new();
+    let mut repo_start_obs: BTreeMap<String, Vec<BacktestObs>> = BTreeMap::new();
+    let mut repo_mid_obs: BTreeMap<String, Vec<BacktestObs>> = BTreeMap::new();
+    let mut repo_applied_obs: BTreeMap<String, Vec<BacktestObs>> = BTreeMap::new();
+
+    // Start-of-run checkpoint: strictly delivered_ts < target.started_ts and started_ts >= t - 14d
+    let mut cursor = 0usize;
+    let mut active_hist: Vec<&ExtractedWriteRun> = Vec::new();
+    for &ti in &targets_start {
+        let target = &all_runs[ti];
+        let t_pred = target.started_ts;
+        while cursor < runs_by_delivered.len() {
+            let cand = &all_runs[runs_by_delivered[cursor]];
+            if cand.delivered_ts < t_pred {
+                active_hist.push(cand);
+                cursor += 1;
+            } else {
+                break;
+            }
+        }
+        let win_start = t_pred - lookback_secs;
+        let window_hist: Vec<&ExtractedWriteRun> = active_hist
+            .iter()
+            .copied()
+            .filter(|h| h.started_ts >= win_start)
+            .collect();
+        let (dist, level) = resolve_rolling_dist(
+            &window_hist,
+            &target.repo,
+            &target.class,
+            |r| Some(r.duration_sec),
+            &priors.write.run_to_delivered,
+        );
+        if let (Some(p50), Some(p75)) = (dist.p50_sec, dist.p75_sec) {
+            let obs = BacktestObs {
+                actual_sec: target.duration_sec,
+                pred_p50_sec: p50,
+                pred_p75_sec: p75.max(p50),
+                level,
+            };
+            overall_start_obs.push(obs.clone());
+            repo_start_obs
+                .entry(target.repo.clone())
+                .or_default()
+                .push(obs);
+        }
+    }
+
+    // Mid-run checkpoint: at 50% of round-1 agent_work (or 50% of duration when legacy)
+    let mut targets_mid: Vec<(i64, f64, f64, usize)> = targets_start
+        .iter()
+        .filter_map(|&ti| {
+            let r = &all_runs[ti];
+            let work_dur = r.agent_work_sec.unwrap_or(r.duration_sec);
+            if r.duration_sec < 2.0 || work_dur < 2.0 {
+                return None;
+            }
+            let elapsed = (work_dur * 0.5).floor().max(1.0);
+            let mid_ts = r.started_ts + elapsed as i64;
+            let actual_rem = (r.delivered_ts - mid_ts).max(0) as f64;
+            Some((mid_ts, elapsed, actual_rem, ti))
+        })
+        .collect();
+    targets_mid.sort_by_key(|&(mid_ts, _, _, ti)| (mid_ts, all_runs[ti].delivered_ts));
+
+    let mut mid_cursor = 0usize;
+    let mut mid_hist: Vec<&ExtractedWriteRun> = Vec::new();
+    for (mid_ts, elapsed, actual_rem, ti) in targets_mid {
+        let target = &all_runs[ti];
+        while mid_cursor < runs_by_delivered.len() {
+            let cand = &all_runs[runs_by_delivered[mid_cursor]];
+            if cand.delivered_ts < mid_ts {
+                mid_hist.push(cand);
+                mid_cursor += 1;
+            } else {
+                break;
+            }
+        }
+        let win_start = mid_ts - lookback_secs;
+        let window_hist: Vec<&ExtractedWriteRun> = mid_hist
+            .iter()
+            .copied()
+            .filter(|h| h.started_ts >= win_start)
+            .collect();
+        let (work_dist, level) = resolve_rolling_dist(
+            &window_hist,
+            &target.repo,
+            &target.class,
+            |r| r.agent_work_sec,
+            &priors.write.agent_work,
+        );
+        let (suf_dist, _) = resolve_rolling_dist(
+            &window_hist,
+            &target.repo,
+            &target.class,
+            |r| r.suffix_after_work_sec,
+            &priors.write.suffix_after_work,
+        );
+        if let Some((w50, w75, _)) = work_dist.conditional_residual(elapsed) {
+            let s50 = suf_dist.p50_sec.unwrap_or(0.0).max(0.0);
+            let s75 = suf_dist.p75_sec.unwrap_or(s50).max(s50);
+            let pred_p50 = round2(w50 + s50);
+            let spread = (w75 - w50).max(0.0).hypot((s75 - s50).max(0.0));
+            let pred_p75 = round2(pred_p50 + spread);
+            let obs = BacktestObs {
+                actual_sec: actual_rem,
+                pred_p50_sec: pred_p50,
+                pred_p75_sec: pred_p75,
+                level,
+            };
+            overall_mid_obs.push(obs.clone());
+            repo_mid_obs
+                .entry(target.repo.clone())
+                .or_default()
+                .push(obs);
+        }
+    }
+
+    // Applied-chain checkpoint: started -> applied
+    let mut chains_by_applied: Vec<usize> = (0..all_chains.len()).collect();
+    chains_by_applied.sort_by_key(|&i| (all_chains[i].applied_ts, all_chains[i].started_ts));
+
+    let mut targets_applied: Vec<usize> = (0..all_chains.len())
+        .filter(|&i| {
+            let c = &all_chains[i];
+            eval_cutoff.is_none_or(|cut| c.started_ts >= cut)
+                && repo_filter
+                    .is_none_or(|rf| repo_matches_filter(&c.repo, &c.repo_name, rf))
+        })
+        .collect();
+    targets_applied.sort_by_key(|&i| (all_chains[i].started_ts, all_chains[i].applied_ts));
+
+    let mut overall_applied_obs: Vec<BacktestObs> = Vec::new();
+    let mut ap_cursor = 0usize;
+    let mut ap_hist: Vec<&ExtractedAppliedChain> = Vec::new();
+    for &ci in &targets_applied {
+        let target = &all_chains[ci];
+        let t_pred = target.started_ts;
+        while ap_cursor < chains_by_applied.len() {
+            let cand = &all_chains[chains_by_applied[ap_cursor]];
+            if cand.applied_ts < t_pred {
+                ap_hist.push(cand);
+                ap_cursor += 1;
+            } else {
+                break;
+            }
+        }
+        let win_start = t_pred - lookback_secs;
+        let window_hist: Vec<&ExtractedAppliedChain> = ap_hist
+            .iter()
+            .copied()
+            .filter(|h| h.started_ts >= win_start)
+            .collect();
+        let (dist, level) = resolve_rolling_applied_dist(
+            &window_hist,
+            &target.repo,
+            &target.class,
+            &priors.write.chain_to_applied,
+        );
+        if let (Some(p50), Some(p75)) = (dist.p50_sec, dist.p75_sec) {
+            let obs = BacktestObs {
+                actual_sec: target.wall_sec,
+                pred_p50_sec: p50,
+                pred_p75_sec: p75.max(p50),
+                level,
+            };
+            overall_applied_obs.push(obs.clone());
+            repo_applied_obs
+                .entry(target.repo.clone())
+                .or_default()
+                .push(obs);
+        }
+    }
+
+    let mut repo_keys: BTreeMap<String, ()> = BTreeMap::new();
+    for k in repo_start_obs
+        .keys()
+        .chain(repo_mid_obs.keys())
+        .chain(repo_applied_obs.keys())
+    {
+        repo_keys.insert(k.clone(), ());
+    }
+    let mut repos: Vec<RepoBacktestReport> = repo_keys
+        .into_keys()
+        .map(|repo| {
+            let s_obs = repo_start_obs.remove(&repo).unwrap_or_default();
+            let m_obs = repo_mid_obs.remove(&repo).unwrap_or_default();
+            let a_obs = repo_applied_obs.remove(&repo).unwrap_or_default();
+            RepoBacktestReport {
+                repo_name: short_repo_name(&repo),
+                repo,
+                start: BacktestMetrics::from_obs(&s_obs),
+                mid: BacktestMetrics::from_obs(&m_obs),
+                applied_chain: BacktestMetrics::from_obs(&a_obs),
+            }
+        })
+        .collect();
+    repos.sort_by(|a, b| {
+        b.start
+            .count
+            .cmp(&a.start.count)
+            .then_with(|| a.repo_name.cmp(&b.repo_name))
+    });
+
+    Ok(BacktestReport {
+        at: format_epoch(now_ts, false, "%Y-%m-%dT%H:%M:%SZ"),
+        window: window_label,
+        lookback_days: ETA_MODEL_WINDOW_DAYS,
+        overall_start: BacktestMetrics::from_obs(&overall_start_obs),
+        overall_mid: BacktestMetrics::from_obs(&overall_mid_obs),
+        overall_applied: BacktestMetrics::from_obs(&overall_applied_obs),
+        repos,
+    })
+}
+
+pub fn backtest_in(
+    state: &Path,
+    now_ts: i64,
+    since_str: &str,
+    repo_filter: Option<&str>,
+) -> Res<BacktestReport> {
+    let raw = events::read_since_in(state, 0);
+    let parsed = parse_events(raw);
+    backtest_from_events(&parsed, now_ts, since_str, repo_filter)
+}
+
+fn fmt_signed_pct(v: Option<f64>) -> String {
+    match v {
+        Some(r) => {
+            let pct = r * 100.0;
+            if pct >= 0.0 {
+                format!("+{pct:.1}%")
+            } else {
+                format!("{pct:.1}%")
+            }
+        }
+        None => "-".to_string(),
+    }
+}
+
+fn fmt_bt_metric_brief(m: &BacktestMetrics) -> String {
+    if m.count == 0 {
+        return "无样本".to_string();
+    }
+    let cov = m
+        .p75_coverage
+        .map(|v| format!("{:.1}%", v * 100.0))
+        .unwrap_or_else(|| "-".into());
+    let alert = if m.p75_alert { " ⚠" } else { "" };
+    let bias = fmt_signed_pct(m.p50_rel_bias);
+    let bias_mark = if m.p50_bias_alert { " ⚠" } else { "" };
+    format!(
+        "p75 覆盖 {cov}（{}{alert}）· p50 偏差 {bias}{bias_mark}（n={}）",
+        m.status_zh(),
+        m.count
+    )
+}
+
+fn fmt_levels_brief(by_level: &BTreeMap<String, usize>) -> String {
+    let mut parts = Vec::new();
+    for lvl in ["L1", "L2", "L3", "L4", "L5"] {
+        if let Some(&n) = by_level.get(lvl) {
+            if n > 0 {
+                parts.push(format!("{lvl}:{n}"));
+            }
+        }
+    }
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn format_backtest_inline_summary(bt: &BacktestReport) -> String {
+    format!(
+        "\nETA 离线回测（{}，健康 65%–85%，偏差 ±15% 内）：\n  起跑交付：{}\n  中段剩余：{}\n",
+        bt.window,
+        fmt_bt_metric_brief(&bt.overall_start),
+        fmt_bt_metric_brief(&bt.overall_mid),
+    )
+}
+
+pub fn format_backtest_human(bt: &BacktestReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "delegate speed --backtest (回放窗口 {}，滚动训练 {}d，严格因果)\n",
+        bt.window, bt.lookback_days
+    ));
+    if bt.overall_start.count == 0 && bt.overall_applied.count == 0 {
+        out.push_str("\n（窗口内无可回测的已完成写任务）\n");
+        return out;
+    }
+
+    out.push_str(
+        "\n总体指标（p75 健康 65%–85%，<60% 偏乐观 / >90% 偏宽；p50 偏差目标 ±15% 内）：\n",
+    );
+    out.push_str(&format!(
+        "  起跑→交付：{}  回退[{}]\n",
+        fmt_bt_metric_brief(&bt.overall_start),
+        fmt_levels_brief(&bt.overall_start.by_level),
+    ));
+    out.push_str(&format!(
+        "  中段→交付：{}  回退[{}]\n",
+        fmt_bt_metric_brief(&bt.overall_mid),
+        fmt_levels_brief(&bt.overall_mid.by_level),
+    ));
+    if bt.overall_applied.count > 0 {
+        out.push_str(&format!(
+            "  写链→合入：{}  回退[{}]\n",
+            fmt_bt_metric_brief(&bt.overall_applied),
+            fmt_levels_brief(&bt.overall_applied.by_level),
+        ));
+    }
+
+    if !bt.repos.is_empty() {
+        out.push('\n');
+        out.push_str(&format!(
+            "{:<18} {:<6} {:<16} {:<10} {:<16} {:<10} {}\n",
+            "仓库", "样本", "起跑 p75覆盖", "起跑 p50偏", "中段 p75覆盖", "中段 p50偏", "回退分布"
+        ));
+        for r in &bt.repos {
+            let s_cov = r
+                .start
+                .p75_coverage
+                .map(|v| {
+                    let mark = if r.start.p75_alert { " ⚠" } else { "" };
+                    format!("{:.1}%({}){mark}", v * 100.0, r.start.status_zh())
+                })
+                .unwrap_or_else(|| "-".into());
+            let m_cov = r
+                .mid
+                .p75_coverage
+                .map(|v| {
+                    let mark = if r.mid.p75_alert { " ⚠" } else { "" };
+                    format!("{:.1}%({}){mark}", v * 100.0, r.mid.status_zh())
+                })
+                .unwrap_or_else(|| "-".into());
+            out.push_str(&format!(
+                "{:<18} {:<6} {:<16} {:<10} {:<16} {:<10} {}\n",
+                clip(&r.repo_name, 18),
+                r.start.count,
+                s_cov,
+                fmt_signed_pct(r.start.p50_rel_bias),
+                m_cov,
+                fmt_signed_pct(r.mid.p50_rel_bias),
+                fmt_levels_brief(&r.start.by_level),
+            ));
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3629,5 +4386,126 @@ mod tests {
         assert_eq!(rm.accept_layers.get("accept").map(|d| d.samples_sec.clone()), Some(vec![42.0]));
 
         let _ = fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn backtest_is_strictly_causal_and_computes_coverage_and_bias() {
+        let state = temp_dir_for_bt("causal");
+        let now = 1_800_000_000_i64;
+        let repo = "/work/bt-repo";
+        let t0 = now - 5 * 86_400;
+        let mut stream = Vec::new();
+
+        // 15 historical runs with steady durations 1000..=1140s (so L1 bucket activates after 10 completed runs).
+        for i in 0..15 {
+            let id = format!("h-{i}");
+            let st = t0 + i * 3600;
+            let dur = 1000 + (i % 5) * 35; // 1000, 1035, 1070, 1105, 1140
+            let del = st + dur;
+            stream.push(ev(st, &id, repo, "started", json!({"mode": "write", "class": "build"})));
+            stream.push(ev(del, &id, repo, "accept", json!({"ok": true, "tiered": false, "elapsedSeconds": 60.0, "queuedSeconds": 0.0})));
+            stream.push(ev(del, &id, repo, "delivered", json!({"mode": "write"})));
+            stream.push(ev(del + 180, &id, repo, "applied", json!({})));
+        }
+        // Future outlier run AFTER all 15 runs: must NOT leak backwards into earlier predictions!
+        let fut_st = t0 + 20 * 3600;
+        stream.push(ev(fut_st, "fut-giant", repo, "started", json!({"mode": "write", "class": "build"})));
+        stream.push(ev(fut_st + 90_000, "fut-giant", repo, "delivered", json!({"mode": "write"})));
+
+        write_events(&state, &stream);
+        let parsed = parse_events(events::read_since_in(&state, 0));
+        let bt = backtest_from_events(&parsed, now, "14d", None).unwrap();
+
+        // 16 write runs evaluated in start checkpoint; first 5 use L5 prior, next 5 use L4 global, last 6 use L1!
+        assert_eq!(bt.overall_start.count, 16);
+        assert_eq!(bt.overall_start.by_level.get("L5"), Some(&5));
+        assert_eq!(bt.overall_start.by_level.get("L4"), Some(&5));
+        assert_eq!(bt.overall_start.by_level.get("L1"), Some(&6));
+        assert_eq!(bt.overall_mid.count, 16);
+        assert!(bt.overall_start.p75_coverage.is_some());
+        assert!(bt.overall_start.p50_rel_bias.is_some());
+
+        // Strict causality check: run 0..14 must get identical metrics whether fut-giant exists or not.
+        let parsed_no_fut: Vec<EventRec> = parsed
+            .into_iter()
+            .filter(|e| e.run != "fut-giant")
+            .collect();
+        let bt_no_fut = backtest_from_events(&parsed_no_fut, now, "14d", None).unwrap();
+        assert_eq!(bt_no_fut.overall_start.count, 15);
+        // Removing the single 90_000s outlier leaves covered count identical (the outlier was not covered)
+        assert_eq!(bt.overall_start.p75_covered, bt_no_fut.overall_start.p75_covered);
+
+        let _ = fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn backtest_flags_optimistic_and_too_wide_alerts() {
+        let state = temp_dir_for_bt("alerts");
+        let now = 1_800_000_000_i64;
+        let repo = "/work/alert-repo";
+        let t0 = now - 6 * 86_400;
+
+        // Regime shift: 10 fast runs (200s) then 10 slow runs (2000s) -> optimistic (<60% coverage)
+        let mut fast_then_slow = Vec::new();
+        for i in 0..10 {
+            let st = t0 + i * 3600;
+            let id = format!("f-{i}");
+            fast_then_slow.push(ev(st, &id, repo, "started", json!({"mode": "write", "class": "build"})));
+            fast_then_slow.push(ev(st + 200, &id, repo, "delivered", json!({"mode": "write"})));
+        }
+        for i in 0..15 {
+            let st = t0 + (12 + i) * 3600;
+            let id = format!("s-{i}");
+            fast_then_slow.push(ev(st, &id, repo, "started", json!({"mode": "write", "class": "build"})));
+            fast_then_slow.push(ev(st + 2000 + i * 200, &id, repo, "delivered", json!({"mode": "write"})));
+        }
+        write_events(&state, &fast_then_slow);
+        let parsed = parse_events(events::read_since_in(&state, 0));
+        // Evaluate only the slow tail (last 4 days where history starts fast and keeps climbing)
+        let bt = backtest_from_events(&parsed, now, "14d", None).unwrap();
+        let human = format_backtest_human(&bt);
+        assert!(human.contains("delegate speed --backtest"));
+        assert!(bt.overall_start.p75_coverage.unwrap() < 0.85);
+
+        // Purely synthetic metric check: 100% covered -> too_wide + alert; 30% covered -> optimistic + alert
+        let wide_obs: Vec<BacktestObs> = (0..10)
+            .map(|_| BacktestObs {
+                actual_sec: 100.0,
+                pred_p50_sec: 500.0,
+                pred_p75_sec: 800.0,
+                level: FallbackLevel::Prior,
+            })
+            .collect();
+        let wide_m = BacktestMetrics::from_obs(&wide_obs);
+        assert_eq!(wide_m.p75_status, "too_wide");
+        assert!(wide_m.p75_alert);
+        assert!(wide_m.p50_bias_alert);
+
+        let opt_obs: Vec<BacktestObs> = (0..10)
+            .map(|i| BacktestObs {
+                actual_sec: 1000.0,
+                pred_p50_sec: 400.0,
+                pred_p75_sec: if i < 3 { 1200.0 } else { 500.0 },
+                level: FallbackLevel::RepoModeClass,
+            })
+            .collect();
+        let opt_m = BacktestMetrics::from_obs(&opt_obs);
+        assert_eq!(opt_m.p75_status, "optimistic");
+        assert!(opt_m.p75_alert);
+        // median((1000 - 400) / 1000) = +0.60
+        assert!((opt_m.p50_rel_bias.unwrap() - 0.60).abs() < 1e-6);
+
+        let _ = fs::remove_dir_all(&state);
+    }
+
+    fn temp_dir_for_bt(tag: &str) -> PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "delegate-speed-bt-{tag}-{}-{id}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

@@ -13,6 +13,7 @@ mod common;
 mod config;
 mod dag_queue;
 mod deny;
+mod eta;
 mod events;
 mod fill;
 mod fit;
@@ -3330,6 +3331,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "agy" => agy_accounts::command(rest),
         "usage" => usage::command(rest),
         "speed" => speed::command(rest),
+        "eta" => eta::command(rest),
         "hook" => hook::command(rest),
         "events" => events::command(rest),
         "queue" => dag_queue::command(rest),

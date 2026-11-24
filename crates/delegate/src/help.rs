@@ -196,7 +196,11 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "speed",
-        "Calibrate wall-clock estimation parameters (t_chain, t_crit, P_eff, T_merge) per repo from events.jsonl and track drift.",
+        "Calibrate wall-clock estimation parameters (t_chain, t_crit, P_eff, T_merge) per repo from events.jsonl, run rolling --backtest, and track drift.",
+    ),
+    (
+        "eta",
+        "Zero-token, lock-free ETA projection for a run, work item, work DAG (--work), or queue DAG (--queue) with stop-clock blocker attribution.",
     ),
     (
         "protocol",
@@ -443,10 +447,19 @@ pub fn print(command: Option<&str>) -> bool {
             ("--all", "Include non-agy (Pi) runs in addition to agy runs."),
             ("--json", "Print structured JSON output."),
         ]),
-        "speed" => ("[--since 7d|14d|all] [--repo PATH] [--json]", "Calibrate wall-clock estimation parameters (T_dev = max(D*t_crit, N*t_chain/P_eff) + T_merge) per repo from <state_dir>/events.jsonl. Automatically expands a <14d window to 14d when a repo has fewer than 30 applied write chains, appends each snapshot to <state_dir>/speed/<repo-slug>.jsonl, and flags >20% drift against the previous run.", &[
-            ("--since 7d|14d|all", "Time window to include (default: 7d; auto-expands to 14d when <30 applied write chains)."),
+        "speed" => ("[--since 7d|14d|all] [--repo PATH] [--backtest] [--json]", "Calibrate wall-clock estimation parameters (T_dev = max(D*t_crit, N*t_chain/P_eff) + T_merge) per repo from <state_dir>/events.jsonl, refresh <state_dir>/eta-model.json, and track >20% drift. Pass --backtest for a strictly causal rolling offline backtest (p75 coverage & p50 relative bias).", &[
+            ("--since 7d|14d|all", "Time window to include (default: 7d, or 14d with --backtest; normal mode auto-expands <14d to 14d when <30 applied write chains)."),
             ("--repo PATH", "Filter to one repository path or basename."),
-            ("--json", "Print all numeric metrics and drift details as JSON."),
+            ("--backtest", "Run strictly causal rolling offline backtest over past write runs (start & mid checkpoints) without modifying speed history."),
+            ("--json", "Print all numeric metrics, backtest stats, and drift details as JSON."),
+        ]),
+        "eta" => ("[<run>|<Wxx>] [--work] [--queue] [--repo PATH] [--all] [--json]", "Project remaining time (p50/p75) for a single run, a work item, the open work DAG (--work), or the continuation queue DAG (--queue) from <state_dir>/eta-model.json. Strictly lock-free and zero-token; stops the clock and names who is blocking whenever progress waits on a human, conflict, mainline block, owner, or stall warning.", &[
+            ("<run>|<Wxx>", "Target one run (resolved to chain head) or one work item (with upstream critical path)."),
+            ("--work", "Estimate open work items as a topological DAG (separating after_time EST and owner blockers from dev wall-clock)."),
+            ("--queue", "Estimate pending/active dag-queue.json steps along the DAG critical path."),
+            ("--repo PATH", "Filter overview/--work/--queue to one repository path or basename."),
+            ("--all", "Include all repositories instead of scoping to the current repository."),
+            ("--json", "Print structured ETA JSON."),
         ]),
         "adopt" => ("<run>... [--json]", "Transfer one or more runs (and every round in each run's reply/continuation chain) to the current caller session (DELEGATE_CALLER / CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID / PI_SESSION_ID) and emit an `adopted` event. Useful after `/clear` in Claude Code.", &[
             ("--json", "Print adopted chain metadata as JSON lines."),
