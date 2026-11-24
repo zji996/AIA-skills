@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-- `delegate`：TUI 与 `agy` 真实额度、图表总览及 `--in` 失败关闭——仅经官方 `agy -p /usage </dev/null`（活跃账号走真实 HOME、非活跃账号在临时 HOME 隔离查询并回写刷新的 `~/.gemini` 凭据后删除临时目录，未知行原样保留）采集各账号额度池周/5h 剩余 % 与重置时刻，缓存至 `<state>/agy-quota.json` 并显示数据年龄；支持 `delegate agy account status|list --quota` 及 TUI 打开总览/账号页时触发、开启期间每 10 分钟刷新（关闭不轮询），真实额度优先于手动 `note` 结合近 1 小时速率推算「每 1% 约多少 token」与预计可用时长（仅提醒不自动换号）。`delegate-tui` 新增「0总览」仪表盘与账号页图表（`Gauge` 额度+重置倒计时、按账号近 24h `Sparkline`、按用途/模型切换的 `BarChart` 与近 7 天派发→合入耗时及一轮通过率走势，80 列窄屏降级为无错位纯文本）。修复 `start --read-only --in <run>` 在上游 worktree 已清理或池槽位已释放时静默读到主干的缺陷：改为从归档（`manifest.json` / `applied.patch` + 基线提交）重建只读快照，无法重建时立即报错退出并说明原因与下一步。
+## delegate 6.41.0 - 2026-11-24
+
+- `delegate` 6.41.0：TUI 与 `agy` 真实额度、图表总览及 `--in` 失败关闭——仅经官方 `agy -p /usage </dev/null`（活跃账号走真实 HOME、非活跃账号在临时 HOME 隔离查询并回写刷新的 `~/.gemini` 凭据后删除临时目录，未知行原样保留）采集各账号额度池周/5h 剩余 % 与重置时刻，缓存至 `<state>/agy-quota.json` 并显示数据年龄；支持 `delegate agy account status|list --quota` 及 TUI 打开总览/账号页时触发、开启期间每 10 分钟刷新（关闭不轮询），真实额度优先于手动 `note` 结合近 1 小时速率推算「每 1% 约多少 token」与预计可用时长（仅提醒不自动换号）。`delegate-tui` 新增「0总览」仪表盘与账号页图表（`Gauge` 额度+重置倒计时、按账号近 24h `Sparkline`、按用途/模型切换的 `BarChart` 与近 7 天派发→合入耗时及一轮通过率走势，80 列窄屏降级为无错位纯文本）。修复 `start --read-only --in <run>` 在上游 worktree 已清理或池槽位已释放时静默读到主干的缺陷：改为从归档（`manifest.json` / `applied.patch` + 基线提交）重建只读快照，无法重建时立即报错退出并说明原因与下一步。
 
 ## delegate 6.40.0 - 2026-11-24
 
