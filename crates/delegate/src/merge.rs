@@ -1838,7 +1838,18 @@ pub fn command(args: &[String]) -> Res<i32> {
     meta["merge"]["skippedCount"] = json!(skipped_count);
     meta["merge"]["autoMergeCount"] = json!(auto_merge_count);
     meta["merge"]["head"] = json!(last_good_head);
-    let exit_code = if final_state == "delivered" { 0 } else { 1 };
+    let has_conflict_skip = items.iter().any(|it| {
+        it["conflicts"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+    });
+    let exit_code = if final_state == "delivered" {
+        0
+    } else if merged_count == 0 && has_conflict_skip {
+        worktree::EXIT_CONFLICT
+    } else {
+        1
+    };
     write_json(merge_run.join("meta.json"), &meta)?;
     write_json(merge_run.join("summary.json"), &sum)?;
     write(merge_run.join("exit_code"), format!("{exit_code}\n"))?;
@@ -1871,7 +1882,7 @@ pub fn command(args: &[String]) -> Res<i32> {
         }
     }
 
-    Ok(if final_state == "delivered" { 0 } else { 1 })
+    Ok(exit_code)
 }
 
 #[cfg(test)]

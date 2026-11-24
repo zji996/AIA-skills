@@ -67,6 +67,8 @@ KIND_LABELS = {
     "premerge_ready": "预合并就绪",
     "premerge_conflict": "预合并冲突",
     "premerge_failed": "预合并失败",
+    "premerge_cache_healed": "预合并缓存自愈",
+    "adopted": "接手会话",
     "merge_started": "开始合入",
     "merge_item": "合入进度",
     "merge_done": "合入完成",
@@ -677,6 +679,14 @@ def run_belongs_to_scope(obj: dict, is_current: bool, caller_id: str) -> bool:
 
 def read_proc_stat_state_ppid_ticks(pid: int) -> tuple[str, int, int] | None:
     """Return `(state_char, ppid, starttime_ticks)` from `/proc/<pid>/stat` (Linux)."""
+    info = read_proc_stat_full(pid)
+    if info is None:
+        return None
+    return info[0], info[1], info[2]
+
+
+def read_proc_stat_full(pid: int) -> tuple[str, int, int, int] | None:
+    """Return `(state_char, ppid, starttime_ticks, tty_nr)` from `/proc/<pid>/stat` (Linux)."""
     try:
         txt = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="ignore")
     except OSError:
@@ -688,10 +698,40 @@ def read_proc_stat_state_ppid_ticks(pid: int) -> tuple[str, int, int] | None:
     if len(fields) < 20:
         return None
     try:
-        # fields[0]=state, fields[1]=ppid, fields[19]=starttime (field 22 overall).
-        return fields[0], int(fields[1]), int(fields[19])
+        # fields[0]=state, fields[1]=ppid, fields[4]=tty_nr (field 7), fields[19]=starttime (field 22).
+        return fields[0], int(fields[1]), int(fields[19]), int(fields[4])
     except ValueError:
         return None
+
+
+def _norm_path_str(raw: str) -> str:
+    raw = raw.strip()
+    if not raw:
+        return ""
+    try:
+        return str(Path(raw).resolve())
+    except OSError:
+        return os.path.normpath(raw)
+
+
+def current_terminal_id(harness_tty_nr: int = 0) -> str:
+    """Identify the enclosing terminal (tmux pane / terminal session / controlling tty_nr)."""
+    for env_key, prefix in (
+        ("TMUX_PANE", "tmux"),
+        ("TERM_SESSION_ID", "term"),
+        ("WEZTERM_PANE", "wezterm"),
+        ("KITTY_WINDOW_ID", "kitty"),
+        ("WINDOWID", "win"),
+    ):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            return f"{prefix}:{val}"
+    if harness_tty_nr != 0:
+        return f"tty:{harness_tty_nr}"
+    self_info = read_proc_stat_full(os.getpid())
+    if self_info is not None and self_info[3] != 0:
+        return f"tty:{self_info[3]}"
+    return ""
 
 
 def pid_alive_with_ticks(pid: int, expected_ticks: int | None = None) -> bool:
@@ -734,28 +774,39 @@ def _is_harness_cmdline(pid: int) -> bool:
     return False
 
 
-def find_session_harness_pid() -> tuple[int, int] | None:
-    """Walk ancestor processes up to 8 hops to locate an enclosing Claude/Codex/Pi harness."""
+def find_session_harness_pid() -> tuple[int, int, int] | None:
+    """Walk ancestor processes up to 8 hops to locate an enclosing Claude/Codex/Pi harness.
+    Returns `(pid, start_ticks, tty_nr)`."""
     pid = os.getppid()
     for _ in range(8):
         if pid <= 1:
             break
-        stat_info = read_proc_stat_state_ppid_ticks(pid)
+        stat_info = read_proc_stat_full(pid)
         if stat_info is None:
             break
-        _state, ppid, ticks = stat_info
+        _state, ppid, ticks, tty_nr = stat_info
         if _is_harness_cmdline(pid):
-            return pid, ticks
+            return pid, ticks, tty_nr
         if ppid == pid:
             break
         pid = ppid
     return None
 
 
-def touch_caller_session(sdir: Path, caller_id: str, now: int) -> None:
-    """Lock-free atomic update of `<state>/sessions.json` for the current caller."""
+def touch_caller_session(
+    sdir: Path,
+    caller_id: str,
+    now: int,
+    cwd: str = "",
+) -> tuple[tuple[int, int] | None, str, str]:
+    """Lock-free atomic update of `<state>/sessions.json` for the current caller.
+    Returns `(cur_harness_pid_ticks, cur_tty, cur_cwd)`."""
+    harness = find_session_harness_pid()
+    harness_pt: tuple[int, int] | None = (harness[0], harness[1]) if harness is not None else None
+    cur_tty = current_terminal_id(harness[2] if harness is not None else 0)
+    cur_cwd = _norm_path_str(cwd) if cwd else ""
     if not caller_id:
-        return
+        return harness_pt, cur_tty, cur_cwd
     try:
         sdir.mkdir(parents=True, exist_ok=True)
         path = sdir / "sessions.json"
@@ -765,7 +816,6 @@ def touch_caller_session(sdir: Path, caller_id: str, now: int) -> None:
         rec: dict = {
             "lastSeenAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
         }
-        harness = find_session_harness_pid()
         if harness is not None:
             rec["pid"] = harness[0]
             rec["startTicks"] = harness[1]
@@ -775,6 +825,18 @@ def touch_caller_session(sdir: Path, caller_id: str, now: int) -> None:
                 rec["pid"] = prev["pid"]
                 if prev_ticks is not None:
                     rec["startTicks"] = prev_ticks
+                if harness_pt is None and prev_ticks is not None:
+                    harness_pt = (prev["pid"], prev_ticks)
+        if cur_tty:
+            rec["tty"] = cur_tty
+        elif isinstance(prev.get("tty"), str) and prev["tty"].strip():
+            rec["tty"] = prev["tty"].strip()
+            cur_tty = rec["tty"]
+        if cur_cwd:
+            rec["cwd"] = cur_cwd
+        elif isinstance(prev.get("cwd"), str) and prev["cwd"].strip():
+            rec["cwd"] = _norm_path_str(prev["cwd"])
+            cur_cwd = rec["cwd"]
         sessions[caller_id] = rec
         cutoff = now - 14 * 86400
         pruned: dict = {}
@@ -792,6 +854,7 @@ def touch_caller_session(sdir: Path, caller_id: str, now: int) -> None:
         os.replace(tmp, path)
     except OSError:
         pass
+    return harness_pt, cur_tty, cur_cwd
 
 
 def find_alive_callers_in_proc(target_callers: set[str]) -> set[str]:
@@ -897,8 +960,9 @@ def get_run_unclaimed_ts(obj: dict) -> int | None:
 
 
 class CallerLivenessChecker:
-    """Determines whether another caller session is still alive or has expired past
-    `DELEGATE_ORPHAN_TAKEOVER_HOURS` (default 6h) so this session may take over."""
+    """Determines whether another caller session is still alive, whether it has expired past
+    `DELEGATE_ORPHAN_TAKEOVER_HOURS` (default 6h) for takeover, or whether it is dead in the
+    same terminal/working directory so this session should be prompted to `delegate adopt`."""
 
     def __init__(
         self,
@@ -906,11 +970,19 @@ class CallerLivenessChecker:
         cursors_doc: dict,
         now: int,
         orphan_secs: float,
+        cur_caller: str = "",
+        cur_harness: tuple[int, int] | None = None,
+        cur_tty: str = "",
+        cur_cwd: str = "",
     ) -> None:
         self.sdir = sdir
         self.cursors_doc = cursors_doc
         self.now = now
         self.orphan_secs = orphan_secs
+        self.cur_caller = cur_caller
+        self.cur_harness = cur_harness
+        self.cur_tty = cur_tty
+        self.cur_cwd = _norm_path_str(cur_cwd) if cur_cwd else ""
         raw_sessions = read_json_file(sdir / "sessions.json")
         self.sessions: dict = raw_sessions if isinstance(raw_sessions, dict) else {}
         self._alive_cache: dict[str, bool] = {}
@@ -924,6 +996,36 @@ class CallerLivenessChecker:
             self._proc_alive.update(found)
         return caller in self._proc_alive
 
+    def _is_superseded_same_harness(self, orig_caller: str, rec: dict) -> bool:
+        """True if another session (e.g. after `/clear`) now occupies the exact same
+        enclosing harness `(pid, startTicks)`."""
+        pid = rec.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            return False
+        ticks = rec.get("startTicks") if isinstance(rec.get("startTicks"), int) else None
+        if self.cur_harness is not None and self.cur_caller and self.cur_caller != orig_caller:
+            if self.cur_harness[0] == pid and (ticks is None or self.cur_harness[1] == ticks):
+                return True
+        orig_ts = parse_iso_utc(str(rec.get("lastSeenAt") or ""))
+        for other_id, other_rec in self.sessions.items():
+            if other_id == orig_caller or not isinstance(other_rec, dict):
+                continue
+            if other_rec.get("pid") != pid:
+                continue
+            other_ticks = (
+                other_rec.get("startTicks")
+                if isinstance(other_rec.get("startTicks"), int)
+                else None
+            )
+            if ticks is not None and other_ticks is not None and other_ticks != ticks:
+                continue
+            if other_id == self.cur_caller:
+                return True
+            other_ts = parse_iso_utc(str(other_rec.get("lastSeenAt") or ""))
+            if other_ts is not None and (orig_ts is None or other_ts > orig_ts):
+                return True
+        return False
+
     def is_alive(self, orig_caller: str) -> bool:
         if not orig_caller:
             return False
@@ -933,13 +1035,17 @@ class CallerLivenessChecker:
         alive = False
         rec = self.sessions.get(orig_caller)
         has_recorded_pid = False
+        superseded = False
         if isinstance(rec, dict) and isinstance(rec.get("pid"), int) and rec["pid"] > 0:
             has_recorded_pid = True
-            ticks = rec.get("startTicks") if isinstance(rec.get("startTicks"), int) else None
-            if pid_alive_with_ticks(rec["pid"], ticks):
-                alive = True
+            if self._is_superseded_same_harness(orig_caller, rec):
+                superseded = True
+            else:
+                ticks = rec.get("startTicks") if isinstance(rec.get("startTicks"), int) else None
+                if pid_alive_with_ticks(rec["pid"], ticks):
+                    alive = True
 
-        if not alive and self._check_proc(orig_caller):
+        if not alive and not superseded and self._check_proc(orig_caller):
             alive = True
 
         # When no explicit session PID was recorded, fall back to recent activity timestamps
@@ -962,6 +1068,42 @@ class CallerLivenessChecker:
 
         self._alive_cache[orig_caller] = alive
         return alive
+
+    def same_terminal(self, orig_caller: str) -> bool:
+        rec = self.sessions.get(orig_caller)
+        if not isinstance(rec, dict):
+            return False
+        pid = rec.get("pid")
+        if self.cur_harness is not None and isinstance(pid, int) and pid > 0:
+            ticks = rec.get("startTicks") if isinstance(rec.get("startTicks"), int) else None
+            if self.cur_harness[0] == pid and (ticks is None or self.cur_harness[1] == ticks):
+                return True
+        if self.cur_tty:
+            orig_tty = str(rec.get("tty") or "").strip()
+            if orig_tty and orig_tty == self.cur_tty:
+                return True
+        return False
+
+    def same_cwd(self, orig_caller: str) -> bool:
+        if not self.cur_cwd:
+            return False
+        rec = self.sessions.get(orig_caller)
+        if not isinstance(rec, dict):
+            return False
+        orig_cwd = _norm_path_str(str(rec.get("cwd") or ""))
+        return bool(orig_cwd) and orig_cwd == self.cur_cwd
+
+    def same_terminal_or_cwd(self, orig_caller: str) -> bool:
+        return self.same_terminal(orig_caller) or self.same_cwd(orig_caller)
+
+    def is_adoptable(self, orig_caller: str) -> bool:
+        """True if `orig_caller` is a different, now-dead/superseded session in the same
+        terminal or same working directory (e.g. right after `/clear`)."""
+        if not self.cur_caller or not orig_caller or orig_caller == self.cur_caller:
+            return False
+        if self.is_alive(orig_caller):
+            return False
+        return self.same_terminal_or_cwd(orig_caller)
 
     def can_takeover(self, orig_caller: str, unclaimed_since_ts: int | None) -> bool:
         """True only if `orig_caller` is empty (ownerless), OR `orig_caller` is NOT alive
@@ -1561,15 +1703,15 @@ def check_unread_events(
     replied_parents: set[str],
     cursors_doc: dict,
     liveness: CallerLivenessChecker,
-) -> tuple[str | None, list[str], list[str], int]:
+) -> tuple[str | None, list[str], list[str], int, list[tuple[str, str]]]:
     """Race lock: block if unread delivery/question/attention events exist past the cursor.
     Non-initiator runs only block when the original caller has expired past the orphan timeout;
-    otherwise they are counted without blocking.
-    Returns (reason, display_names, run_ids, other_caller_count)."""
+    runs whose caller is dead in the same terminal/cwd are returned for `delegate adopt` hints.
+    Returns (reason, display_names, run_ids, other_caller_count, adoptable_runs)."""
     sdir = state_dir()
     events_file = sdir / "events.jsonl"
     if not events_file.is_file():
-        return None, [], [], 0
+        return None, [], [], 0, []
 
     caller_id = current_caller_id(payload)
 
@@ -1669,15 +1811,17 @@ def check_unread_events(
                 if run_id and not ev_is_current:
                     run_obj = all_runs_by_id.get(run_id)
                     if run_obj is not None and not run_belongs_to_scope(run_obj, False, caller_id):
-                        continue
+                        rc = get_run_caller(run_obj)
+                        if not (liveness.is_adoptable(rc) and liveness.same_terminal(rc)):
+                            continue
                 if run_id and run_id in read_runs and seq <= read_runs[run_id]:
                     continue
                 candidates.append((seq, ev, ev_is_current))
     except OSError:
-        return None, [], [], 0
+        return None, [], [], 0, []
 
     if not candidates:
-        return None, [], [], 0
+        return None, [], [], 0, []
 
     queue_items_by_name = (
         load_queue_items_by_name()
@@ -1687,6 +1831,8 @@ def check_unread_events(
 
     own_unread: list[dict] = []
     orphan_unread: list[dict] = []
+    adoptable_runs: list[tuple[str, str]] = []
+    adoptable_seen: set[str] = set()
     other_caller_count = 0
 
     for seq, ev, ev_is_current in candidates:
@@ -1726,21 +1872,28 @@ def check_unread_events(
             run_obj = all_runs_by_id.get(rid)
             run_caller = get_run_caller(run_obj) if run_obj is not None else ""
             if run_caller and run_caller != caller_id:
-                if not ev_is_current:
+                adoptable = liveness.is_adoptable(run_caller)
+                if not ev_is_current and not (adoptable and liveness.same_terminal(run_caller)):
                     continue
+                if adoptable and rid not in adoptable_seen:
+                    adoptable_seen.add(rid)
+                    disp_name = strip_reply_prefixes(
+                        str(pl.get("name") or (run_obj or {}).get("name") or rid)
+                    )
+                    adoptable_runs.append((disp_name, rid))
                 ev_ts = parse_iso_utc(str(ev.get("at") or ""))
                 if ev_ts is None and run_obj is not None:
                     ev_ts = get_run_unclaimed_ts(run_obj)
-                if liveness.can_takeover(run_caller, ev_ts):
+                if ev_is_current and liveness.can_takeover(run_caller, ev_ts):
                     orphan_unread.append(ev)
-                else:
+                elif not adoptable:
                     other_caller_count += 1
                 continue
 
         own_unread.append(ev)
 
     if not own_unread and not orphan_unread:
-        return None, [], [], other_caller_count
+        return None, [], [], other_caller_count, adoptable_runs
 
     ordered: list[tuple[dict, bool]] = [
         *((ev, False) for ev in own_unread),
@@ -1774,7 +1927,7 @@ def check_unread_events(
             f"有新事件，先看 delegate events --since {cursor_seq}"
             f"（未读 {total} 条：{summary}）。{other_note}"
         )
-    return reason, ev_names, ev_run_ids, other_caller_count
+    return reason, ev_names, ev_run_ids, other_caller_count, adoptable_runs
 
 
 def _parse_pos_float_env(name: str, default: float) -> float:
@@ -2076,13 +2229,22 @@ def evaluate(payload: dict) -> dict | None:
     now = int(time.time())
     sdir = state_dir()
     caller_id = current_caller_id(payload)
-    touch_caller_session(sdir, caller_id, now)
+    cur_harness, cur_tty, cur_cwd = touch_caller_session(sdir, caller_id, now, cwd)
     orphan_secs = (
         _parse_pos_float_env("DELEGATE_ORPHAN_TAKEOVER_HOURS", DEFAULT_ORPHAN_TAKEOVER_HOURS)
         * 3600.0
     )
     cursors_doc = read_json_file(sdir / "cursors.json") or {}
-    liveness = CallerLivenessChecker(sdir, cursors_doc, now, orphan_secs)
+    liveness = CallerLivenessChecker(
+        sdir,
+        cursors_doc,
+        now,
+        orphan_secs,
+        cur_caller=caller_id,
+        cur_harness=cur_harness,
+        cur_tty=cur_tty,
+        cur_cwd=cur_cwd,
+    )
 
     reasons: list[str] = []
     log_records: list[dict] = []
@@ -2122,7 +2284,7 @@ def evaluate(payload: dict) -> dict | None:
             if isinstance(par, str) and par:
                 replied_parents.add(par)
 
-    unread_reason, ev_names, ev_run_ids, _other_ev_count = check_unread_events(
+    unread_reason, ev_names, ev_run_ids, _other_ev_count, adoptable_from_events = check_unread_events(
         payload,
         cwd,
         now,
@@ -2141,6 +2303,13 @@ def evaluate(payload: dict) -> dict | None:
                 "runIds": ev_run_ids[:8],
             }
         )
+
+    adoptable_runs: list[tuple[str, str]] = []
+    adoptable_seen: set[str] = set()
+    for disp_ev, rid_ev in adoptable_from_events:
+        if rid_ev not in adoptable_seen:
+            adoptable_seen.add(rid_ev)
+            adoptable_runs.append((disp_ev, rid_ev))
 
     delegate_cmd = find_delegate_bin() or "delegate"
     if repos:
@@ -2194,31 +2363,44 @@ def evaluate(payload: dict) -> dict | None:
                 if is_cleaned or is_applied:
                     continue
 
-                if not run_belongs_to_scope(obj, is_current, caller_id):
+                run_caller = get_run_caller(obj)
+                is_adoptable = liveness.is_adoptable(run_caller)
+                if not run_belongs_to_scope(obj, is_current, caller_id) and not (
+                    is_adoptable and liveness.same_terminal(run_caller)
+                ):
                     continue
 
-                is_orphan = False
-                if is_current:
-                    run_caller = get_run_caller(obj)
-                    if run_caller and run_caller != caller_id:
-                        if liveness.can_takeover(run_caller, get_run_unclaimed_ts(obj)):
-                            is_orphan = True
-                            disp = f"{disp}(原会话已失效待接盘)"
-                        else:
+                adopt_only = False
+                if run_caller and run_caller != caller_id:
+                    if is_current and liveness.can_takeover(run_caller, get_run_unclaimed_ts(obj)):
+                        disp = f"{disp}(原会话已失效待接盘)"
+                    elif is_adoptable:
+                        adopt_only = True
+                    else:
+                        if is_current:
                             other_caller_run_count += 1
-                            continue
+                        continue
+
+                def _record_adoptable() -> None:
+                    if is_adoptable and rid not in adoptable_seen:
+                        adoptable_seen.add(rid)
+                        adoptable_runs.append((run_label(obj, label, is_current), rid))
 
                 # 1) Questioning runs (stopped waiting for controller decision).
                 if is_question:
-                    questions.append((disp, rid, is_current))
+                    _record_adoptable()
+                    if not adopt_only:
+                        questions.append((disp, rid, is_current))
                     continue
 
                 # 2) Live runs (running / waiting / starting / queued).
                 if st in ("running", "waiting", "starting", "queued"):
-                    if is_current:
-                        live_current.append((disp, rid, obj, repo_root))
-                    else:
-                        live_other.append((disp, rid, obj, repo_root))
+                    _record_adoptable()
+                    if not adopt_only:
+                        if is_current:
+                            live_current.append((disp, rid, obj, repo_root))
+                        else:
+                            live_other.append((disp, rid, obj, repo_root))
                     continue
 
                 # 3) Unmerged delivered or rejected write runs.
@@ -2247,6 +2429,9 @@ def evaluate(payload: dict) -> dict | None:
 
                 # Check work-table deferrals (`delegate work defer`).
                 if rid in work_fresh_def:
+                    continue
+                _record_adoptable()
+                if adopt_only:
                     continue
                 if rid in work_expired_def:
                     stale_run_ids.append(rid)
@@ -2334,6 +2519,20 @@ def evaluate(payload: dict) -> dict | None:
                     "stale": ",".join(stale_run_ids[:8]),
                 }
             )
+
+    if adoptable_runs:
+        names = "、".join(d for d, _ in adoptable_runs[:8])
+        rids_cmd = " ".join(rid for _, rid in adoptable_runs[:5])
+        reasons.append(
+            f"同终端/同工作目录的原会话已失效，有未接手的委派（{names}）：执行 `delegate adopt {rids_cmd}` 接手。"
+        )
+        log_records.append(
+            {
+                "hook": "adopt",
+                "runs": names,
+                "runIds": [rid for _, rid in adoptable_runs[:8]],
+            }
+        )
 
     # Low-priority work-hygiene reminder: only when no higher-priority block AND current repo has idle slot.
     if not reasons:

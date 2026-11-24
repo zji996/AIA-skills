@@ -1685,6 +1685,107 @@ fn patch(args: &[String]) -> Res<i32> {
     io::stdout().write_all(&filtered).map_err(|e| e.to_string())?;
     Ok(0)
 }
+fn adopt_command(args: &[String]) -> Res<i32> {
+    let (pos, flags, _) = parse_simple(args, &["--json"], &[])?;
+    if has(&flags, "--json") {
+        output::enable_json();
+    }
+    if pos.is_empty() {
+        return Err("adopt requires at least one run (usage: delegate adopt <run>...)".into());
+    }
+    let Some((new_caller, new_source)) = caller_source() else {
+        return Err(
+            "adopt requires an active caller session (DELEGATE_CALLER / CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID / PI_SESSION_ID)"
+                .into(),
+        );
+    };
+    touch_caller_session();
+
+    let mut seen_runs = std::collections::HashSet::<PathBuf>::new();
+    for reference in &pos {
+        let resolved = runs::resolve(reference)?;
+        let chain = runs::chain_rounds(&resolved);
+        if chain.is_empty() {
+            continue;
+        }
+        // Skip if this chain was already adopted by an earlier argument in the same invocation.
+        if chain.iter().all(|r| seen_runs.contains(r)) {
+            continue;
+        }
+        let head = chain.last().cloned().unwrap_or_else(|| resolved.clone());
+        let head_meta_before = json(head.join("meta.json"));
+        let head_id = events::run_id_for(&head, &head_meta_before);
+        let head_name = s(&head_meta_before, "name").to_string();
+        let head_repo = events::repo_for_meta(&head_meta_before);
+        let from_caller = s(&head_meta_before, "caller").to_string();
+
+        let mut round_ids: Vec<String> = Vec::with_capacity(chain.len());
+        let mut work_ids: Vec<String> = Vec::new();
+        for round in &chain {
+            seen_runs.insert(round.clone());
+            let mut meta = json(round.join("meta.json"));
+            if !meta.is_object() {
+                continue;
+            }
+            let rid = events::run_id_for(round, &meta);
+            let wid = s(&meta, "workId").to_string();
+            if !wid.is_empty() && !work_ids.contains(&wid) {
+                work_ids.push(wid);
+            }
+            meta["caller"] = json!(&new_caller);
+            meta["callerSource"] = json!(new_source);
+            write_json(round.join("meta.json"), &meta)?;
+            index::upsert_run(round);
+            board::refresh_for_run(round);
+            round_ids.push(rid);
+        }
+
+        work::on_runs_adopted(&round_ids, &work_ids, &new_caller);
+
+        events::emit(
+            &head_id,
+            &head_repo,
+            "adopted",
+            json!({
+                "name": head_name,
+                "fromCaller": from_caller,
+                "toCaller": new_caller,
+                "callerSource": new_source,
+                "rounds": round_ids,
+            }),
+        );
+
+        if output::json_enabled() {
+            println!(
+                "{}",
+                json!({
+                    "run": head_id,
+                    "name": head_name,
+                    "fromCaller": from_caller,
+                    "toCaller": new_caller,
+                    "callerSource": new_source,
+                    "rounds": round_ids,
+                })
+            );
+        } else {
+            let from_disp = if from_caller.is_empty() {
+                "(无)"
+            } else {
+                from_caller.as_str()
+            };
+            let rounds_note = if round_ids.len() > 1 {
+                format!("，共 {} 轮", round_ids.len())
+            } else {
+                String::new()
+            };
+            println!(
+                "已接手 {head_id}（{head_name}{rounds_note}）：caller {from_disp} → {new_caller}"
+            );
+        }
+    }
+    Ok(0)
+}
+
 fn files_command(args: &[String]) -> Res<i32> {
     let (pos, flags, _) = parse_simple(args, &["--json"], &[])?;
     if pos.len() > 1 {
@@ -2253,6 +2354,32 @@ fn apply(args: &[String]) -> Res<i32> {
                     println!("{hint}");
                 }
             }
+        }
+    }
+    // Invariant: whenever any run reported `apply.ok == false`, a `failedStep`, unresolved
+    // conflict markers, or a failed verify step, `apply` MUST NOT exit 0 (3 for conflicts /
+    // unresolved conflict markers, 1 for other failures; signal codes >= 128 are preserved).
+    {
+        let mut has_conflict = false;
+        let mut has_failure = !verify.is_null() && verify["ok"] != json!(true);
+        for item in &done {
+            let ap = &item.conclusion["apply"];
+            let step = s(ap, "failedStep");
+            let has_markers = ap["conflictMarkers"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty());
+            if has_markers || matches!(step, "conflicts" | "skipped-conflicts" | "conflict-markers")
+            {
+                has_conflict = true;
+            }
+            if ap["ok"] == json!(false) || !step.is_empty() {
+                has_failure = true;
+            }
+        }
+        if has_conflict && code < 128 {
+            code = worktree::EXIT_CONFLICT;
+        } else if has_failure && code == 0 {
+            code = 1;
         }
     }
     if code == 0 && !dry && !output::json_enabled() {
@@ -3022,6 +3149,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "files" => files_command(rest),
         "patch" => patch(rest),
         "apply" => apply(rest),
+        "adopt" => adopt_command(rest),
         "lane" => lane::lane_command(rest),
         "busy" => {
             if rest.len() != 1 {

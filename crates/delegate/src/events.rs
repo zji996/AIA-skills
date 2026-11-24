@@ -1150,6 +1150,34 @@ pub fn format_human(ev: &Value) -> String {
                 format!("预合并冲突：{fpart}（日志 {log}）")
             }
         }
+        "premerge_cache_healed" => {
+            let step = s(p, "step");
+            let layer = s(p, "layer");
+            let crates = strings(&p["crates"]);
+            let removed = n(p, "removed");
+            let scope = if !layer.is_empty() {
+                layer
+            } else if !step.is_empty() {
+                step
+            } else {
+                "premerge"
+            };
+            if crates.is_empty() {
+                format!("预合并缓存自愈（{scope}，清理 {removed} 项后重试）")
+            } else {
+                format!(
+                    "预合并缓存自愈（{scope}，清理 {} 共 {removed} 项后重试）",
+                    crates.join("、")
+                )
+            }
+        }
+        "adopted" => {
+            let from = s(p, "fromCaller");
+            let to = s(p, "toCaller");
+            let rounds = strings(&p["rounds"]).len().max(1);
+            let from_disp = if from.is_empty() { "(无)" } else { from };
+            format!("已接手会话（{from_disp} → {to}，共 {rounds} 轮）")
+        }
         "premerge_failed" => {
             let layer = s(p, "failedLayer");
             let log = s(p, "log");

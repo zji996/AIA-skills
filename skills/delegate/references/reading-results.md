@@ -14,7 +14,7 @@
 | `malformed` / `failed` / `timeout` / `stalled` / `killed` / `crashed` / `stopped` | 答复畸形 / 出错 / 超时 / 进程异常 / 被终止 |
 | 结论被模型服务拒绝（`policyRefused`） | Gemini/agy 策略拦截且同会话重写 1 次仍失败；`result.md` 指向 `review.md` 与 `delegate files <run>`，不当正常结论 |
 
-state 通常描述答复。普通只读写文件仍是 `answered`（`--shell` 写入判 `rejected`，见 [并行安全](parallel-safety.md)），JSON 带 `readOnlyViolation` 或 `workspaceChanged`。改动来自前后快照（含 shell 改动，排除原有脏改动与验收副产物）。退出码：`0` 成功，`1` 其他结局，`2` 用法错误/拒绝，`75` 仍运行，`76` 已有等待者。
+state 通常描述答复。普通只读写文件仍是 `answered`（`--shell` 写入判 `rejected`，见 [并行安全](parallel-safety.md)），JSON 带 `readOnlyViolation` 或 `workspaceChanged`。改动来自前后快照（排除原脏改动与验收副产物）。退出码：`0` 成功，`1` 其他失败，`2` 用法错误/拒绝，`3` 冲突或未解冲突标记，`75` 仍运行，`76` 已有等待者。
 
 `busy <资源>` 是独立查询：占用时退出 0 并打印占用者，空闲退出 1 且不输出；它不改变任务验收判定。`acceptBlind` 命中只提示验收盲区，不改变 `delivered`。
 

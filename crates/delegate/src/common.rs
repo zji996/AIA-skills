@@ -51,14 +51,15 @@ pub fn caller() -> Option<String> {
     caller_source().map(|(id, _)| id)
 }
 
-fn proc_stat_ppid_ticks(pid: u32) -> Option<(u32, u64)> {
+fn proc_stat_ppid_ticks_tty(pid: u32) -> Option<(u32, u64, i32)> {
     let txt = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rparen = txt.rfind(')')?;
     let fields: Vec<&str> = txt.get(rparen + 2..)?.split_whitespace().collect();
-    // fields[0]=state, fields[1]=ppid, fields[19]=starttime (field 22 overall).
+    // fields[0]=state, fields[1]=ppid, fields[4]=tty_nr (field 7), fields[19]=starttime (field 22).
     let ppid = fields.get(1)?.parse::<u32>().ok()?;
+    let tty_nr = fields.get(4)?.parse::<i32>().unwrap_or(0);
     let ticks = fields.get(19)?.parse::<u64>().ok()?;
-    Some((ppid, ticks))
+    Some((ppid, ticks, tty_nr))
 }
 
 fn is_harness_cmdline(pid: u32) -> bool {
@@ -92,15 +93,15 @@ fn is_harness_cmdline(pid: u32) -> bool {
     false
 }
 
-fn find_session_harness_pid() -> Option<(u32, u64)> {
+fn find_session_harness_pid() -> Option<(u32, u64, i32)> {
     let mut pid = std::os::unix::process::parent_id();
     for _ in 0..8 {
         if pid <= 1 {
             break;
         }
-        let (ppid, ticks) = proc_stat_ppid_ticks(pid)?;
+        let (ppid, ticks, tty_nr) = proc_stat_ppid_ticks_tty(pid)?;
         if is_harness_cmdline(pid) {
-            return Some((pid, ticks));
+            return Some((pid, ticks, tty_nr));
         }
         if ppid == pid {
             break;
@@ -110,14 +111,47 @@ fn find_session_harness_pid() -> Option<(u32, u64)> {
     None
 }
 
-/// Lock-free best-effort recording of the caller's enclosing harness PID into
-/// `<state>/sessions.json` so the Stop hook can tell whether a session is still live.
+fn current_terminal_id(harness_tty_nr: i32) -> Option<String> {
+    for (env_key, prefix) in [
+        ("TMUX_PANE", "tmux"),
+        ("TERM_SESSION_ID", "term"),
+        ("WEZTERM_PANE", "wezterm"),
+        ("KITTY_WINDOW_ID", "kitty"),
+        ("WINDOWID", "win"),
+    ] {
+        if let Ok(val) = env::var(env_key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(format!("{prefix}:{trimmed}"));
+            }
+        }
+    }
+    if harness_tty_nr != 0 {
+        return Some(format!("tty:{harness_tty_nr}"));
+    }
+    if let Some((_, _, self_tty)) = proc_stat_ppid_ticks_tty(std::process::id()) {
+        if self_tty != 0 {
+            return Some(format!("tty:{self_tty}"));
+        }
+    }
+    None
+}
+
+fn current_cwd_canonical() -> Option<String> {
+    let cwd = env::current_dir().ok()?;
+    let canon = fs::canonicalize(&cwd).unwrap_or(cwd);
+    Some(canon.to_string_lossy().into_owned())
+}
+
+/// Lock-free best-effort recording of the caller's enclosing harness PID, terminal and cwd into
+/// `<state>/sessions.json` so the Stop hook can tell whether a session is still live and
+/// suggest `delegate adopt <run>` after `/clear` in the same terminal or working directory.
 /// Only writes when a known harness ancestor (`claude` / `codex` / `pi`) is detected.
 pub fn touch_caller_session() {
     let Some(id) = caller() else {
         return;
     };
-    let Some((pid, start_ticks)) = find_session_harness_pid() else {
+    let Some((pid, start_ticks, tty_nr)) = find_session_harness_pid() else {
         return;
     };
     let state = state_dir();
@@ -131,19 +165,25 @@ pub fn touch_caller_session() {
     }
     let now_epoch = epoch() as i64;
     let cutoff = now_epoch - 14 * 86_400;
+    let tty = current_terminal_id(tty_nr);
+    let cwd = current_cwd_canonical();
     if let Some(map) = doc.as_object_mut() {
         map.retain(|k, v| {
             k == &id
                 || iso_epoch(s(v, "lastSeenAt")).is_none_or(|ts| ts >= cutoff)
         });
-        map.insert(
-            id,
-            serde_json::json!({
-                "pid": pid,
-                "startTicks": start_ticks,
-                "lastSeenAt": iso(),
-            }),
-        );
+        let mut rec = serde_json::json!({
+            "pid": pid,
+            "startTicks": start_ticks,
+            "lastSeenAt": iso(),
+        });
+        if let Some(t) = tty {
+            rec["tty"] = serde_json::json!(t);
+        }
+        if let Some(c) = cwd {
+            rec["cwd"] = serde_json::json!(c);
+        }
+        map.insert(id, rec);
     }
     let _ = write_json(&path, &doc);
 }

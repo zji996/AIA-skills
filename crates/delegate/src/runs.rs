@@ -1294,6 +1294,109 @@ pub fn index_meta(run: &Path) -> Value {
     })
 }
 
+/// Return every run directory in the reply/continuation chain containing `run`
+/// (ancestors via `parent`, `run` itself, and all descendants whose `parent` links into the chain),
+/// ordered chronologically by `(startedNs, dir_name)`.
+pub fn chain_rounds(run: &Path) -> Vec<PathBuf> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let all = all_runs();
+    let mut by_id: HashMap<String, PathBuf> = HashMap::new();
+    let mut parent_of: HashMap<String, String> = HashMap::new();
+    let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
+
+    let mut register = |dir: &Path| {
+        let meta = json(dir.join("meta.json"));
+        let id = {
+            let r = s(&meta, "run");
+            if !r.is_empty() {
+                r.to_string()
+            } else {
+                dir.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        if id.is_empty() {
+            return;
+        }
+        let parent = s(&meta, "parent").to_string();
+        by_id.entry(id.clone()).or_insert_with(|| dir.to_path_buf());
+        if !parent.is_empty() {
+            parent_of.entry(id.clone()).or_insert_with(|| parent.clone());
+            let kids = children_of.entry(parent).or_default();
+            if !kids.contains(&id) {
+                kids.push(id);
+            }
+        }
+    };
+
+    register(run);
+    for dir in &all {
+        register(dir);
+    }
+    // Also scan sibling run directories next to `run` in case `run` lives in a repo outside cwd.
+    if let Some(runs_parent) = run.parent() {
+        if let Ok(rd) = fs::read_dir(runs_parent) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if p.is_dir() && p.join("meta.json").is_file() {
+                    register(&p);
+                }
+            }
+        }
+    }
+
+    let start_meta = json(run.join("meta.json"));
+    let start_id = {
+        let r = s(&start_meta, "run");
+        if !r.is_empty() {
+            r.to_string()
+        } else {
+            run.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    if start_id.is_empty() {
+        return vec![run.to_path_buf()];
+    }
+
+    // BFS across undirected parent<->child edges so root, middle, leaf, or sibling rounds are all found.
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    visited.insert(start_id.clone());
+    queue.push_back(start_id);
+
+    while let Some(cur) = queue.pop_front() {
+        if let Some(par) = parent_of.get(&cur) {
+            if !par.is_empty() && by_id.contains_key(par) && visited.insert(par.clone()) {
+                queue.push_back(par.clone());
+            }
+        }
+        if let Some(kids) = children_of.get(&cur) {
+            for kid in kids {
+                if by_id.contains_key(kid) && visited.insert(kid.clone()) {
+                    queue.push_back(kid.clone());
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<(u64, String, PathBuf)> = visited
+        .into_iter()
+        .filter_map(|id| {
+            let dir = by_id.get(&id)?.clone();
+            let ns = json(dir.join("meta.json"))["startedNs"].as_u64().unwrap_or(0);
+            Some((ns, id, dir))
+        })
+        .collect();
+    result.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    result.into_iter().map(|(_, _, dir)| dir).collect()
+}
+
 pub fn latest(mut run: PathBuf) -> PathBuf {
     loop {
         let mut replies = all_runs()

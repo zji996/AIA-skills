@@ -2658,6 +2658,37 @@ pub fn on_run_finished(run: &Path, meta: &Value, summary: &Value) {
     let _ = emit_reconcile_events_and_dispatch(&state, &outcome);
 }
 
+pub fn on_runs_adopted(run_ids: &[String], work_ids: &[String], new_caller: &str) {
+    if new_caller.trim().is_empty() || (run_ids.is_empty() && work_ids.is_empty()) {
+        return;
+    }
+    let state = state_dir();
+    if !work_path(&state).is_file() {
+        return;
+    }
+    let Ok(_guard) = crate::locks::acquire_state(&state) else {
+        return;
+    };
+    let mut items = load_raw(&state);
+    let mut changed = false;
+    let now_iso = iso();
+    for w in &mut items {
+        if w.state == "done" {
+            continue;
+        }
+        let matched = work_ids.iter().any(|wid| !wid.is_empty() && w.id == *wid)
+            || run_ids.iter().any(|rid| !rid.is_empty() && w.matches_run(rid));
+        if matched && w.caller != new_caller {
+            w.caller = new_caller.to_string();
+            w.updated_at = now_iso.clone();
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = save_raw(&state, &items);
+    }
+}
+
 pub fn on_run_result_read(run: &Path, meta: &Value) {
     let state = state_dir();
     if !work_path(&state).is_file() {

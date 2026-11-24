@@ -170,6 +170,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("remote", "Check SSH remote heavy-command execution (remote check)."),
     ("config", "Show merged effective configuration, including remote."),
     ("stop", "Terminate runs."),
+    ("adopt", "Transfer a run (and every round in its reply chain) to the current caller session."),
     ("clean", "Delete finished runs."),
     ("fit", "Show or update the four-class model suitability card (fit set; fit --json)."),
     (
@@ -232,7 +233,7 @@ pub fn print(command: Option<&str>) -> bool {
             "An interrupted upstream (cut stream, reset or timed-out connection, 502/503/504, a 429 Pi did not retry) is not the task failing: the run waits 15s/45s/120s, checks the model through `probe`'s path, and continues the same session up to 3 times (DELEGATE_RESUME_BACKOFF, `0` off); `status --json` reports `resumes` and `transientError`. Auth failures, 400s and missing models are not retried."
         );
         println!(
-            "Exit: 0 delivered/answered, 1 other finished, 2 usage, 75 still running at --max, 76 already covered by another waiter, 77 agentDeny shim refusal."
+            "Exit: 0 delivered/answered, 1 other finished/failed, 2 usage, 3 conflict or unresolved conflict markers, 75 still running at --max, 76 already covered by another waiter, 77 agentDeny shim refusal."
         );
         println!(".delegate.json agentDeny: argv prefixes by default; exact: true matches the whole argv. No global-option normalization. Acceptance/evidence/setup/apply use remote-only shims when enabled; caller lane stays local. Shims have no environment bypass.");
         let cwd = std::env::current_dir().unwrap_or_default();
@@ -428,6 +429,9 @@ pub fn print(command: Option<&str>) -> bool {
             ("--since 7d|14d|all", "Time window to include (default: 7d; auto-expands to 14d when <30 applied write chains)."),
             ("--repo PATH", "Filter to one repository path or basename."),
             ("--json", "Print all numeric metrics and drift details as JSON."),
+        ]),
+        "adopt" => ("<run>... [--json]", "Transfer one or more runs (and every round in each run's reply/continuation chain) to the current caller session (DELEGATE_CALLER / CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID / PI_SESSION_ID) and emit an `adopted` event. Useful after `/clear` in Claude Code.", &[
+            ("--json", "Print adopted chain metadata as JSON lines."),
         ]),
         "protocol" => ("", "Print one JSON line for harness adapters: protocol version, delegate version, the caller session and its source variable, and each agent's tier, resolved binary, version and PATH entries it shadows.", &[]),
         _ => return false,

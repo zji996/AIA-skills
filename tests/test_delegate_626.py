@@ -83,7 +83,7 @@ class Delegate626Tests(unittest.TestCase):
         )
 
         res = self.cli("apply", state["run"], human=True)
-        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
         payload = self.outcome(res)
         self.assertFalse(payload["apply"]["ok"])
         self.assertEqual(payload["apply"]["failedStep"], "conflicts")
@@ -118,7 +118,7 @@ class Delegate626Tests(unittest.TestCase):
         pre2 = f"python3 -c {shlex.quote(f'open(\"docs/notes.md\", \"w\").write({real_conflict!r})')}"
         state2 = self.run_write(repo, pre2, "md-real-conflict")
         res2 = self.cli("apply", "--json", "--allow-dirty-overlap", state2["run"])
-        self.assertEqual(res2.returncode, 1, res2.stdout + res2.stderr)
+        self.assertEqual(res2.returncode, 3, res2.stdout + res2.stderr)
         payload2 = self.outcome(res2)
         self.assertFalse(payload2["apply"]["ok"])
         self.assertEqual(payload2["apply"]["conflictMarkers"], ["docs/notes.md"])

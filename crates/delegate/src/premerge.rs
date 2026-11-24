@@ -31,7 +31,7 @@ use crate::worktree;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1694,6 +1694,388 @@ fn premerge_workdir(source: &Path, meta: &Value, wt_path: &Path) -> PathBuf {
     wt_path.to_path_buf()
 }
 
+/// Detect corrupted incremental/linker cache failures in premerge generate/accept output
+/// (e.g. `mold: error: undefined symbol: ...` or `error: linking with \`cc\` failed`).
+pub(crate) fn is_linker_cache_error(output: &str) -> bool {
+    for line in output.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("undefined symbol") {
+            return true;
+        }
+        if let Some(pos) = lower.find("linking with") {
+            if lower[pos + "linking with".len()..].contains("failed") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn read_log_slice(path: &Path, start_offset: u64) -> String {
+    let Ok(mut f) = File::open(path) else {
+        return String::new();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if len <= start_offset {
+        return String::new();
+    }
+    const MAX_BYTES: u64 = 512 * 1024;
+    let seek_to = if len - start_offset > MAX_BYTES {
+        len - MAX_BYTES
+    } else {
+        start_offset
+    };
+    if f.seek(SeekFrom::Start(seek_to)).is_err() {
+        return String::new();
+    }
+    let mut buf = Vec::new();
+    let _ = f.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn is_valid_crate_ident(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn crate_name_from_artifact_stem(raw: &str) -> Option<String> {
+    let trimmed = raw
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.');
+    let without_ext = trimmed.split('.').next().unwrap_or(trimmed);
+    let (prefix, hash) = without_ext.rsplit_once('-')?;
+    if hash.len() < 8 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let name = prefix.strip_prefix("lib").unwrap_or(prefix);
+    is_valid_crate_ident(name).then(|| name.to_string())
+}
+
+fn cargo_toml_package_name(cargo_toml: &Path) -> Option<String> {
+    let text = fs::read_to_string(cargo_toml).ok()?;
+    let mut in_package = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_package = trimmed == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("name") {
+            let rest = rest.trim_start();
+            if let Some(val) = rest.strip_prefix('=') {
+                let val = val.trim();
+                let unquoted = val
+                    .strip_prefix('"')
+                    .and_then(|s| s.split('"').next())
+                    .or_else(|| val.strip_prefix('\'').and_then(|s| s.split('\'').next()))?;
+                if is_valid_crate_ident(unquoted) {
+                    return Some(unquoted.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn extract_affected_crates(
+    output: &str,
+    command: &str,
+    wt_path: &Path,
+    changed_paths: &[String],
+) -> Vec<String> {
+    let mut crates = BTreeSet::<String>::new();
+
+    for line in output.lines() {
+        // 1) `error: could not compile \`xtask\` (bin "xtask") ...`
+        if let Some(pos) = line.find("could not compile ") {
+            let rest = &line[pos + "could not compile ".len()..];
+            for quote in ['`', '\'', '"'] {
+                if let Some(after) = rest.strip_prefix(quote) {
+                    if let Some(name) = after.split(quote).next() {
+                        if is_valid_crate_ident(name) {
+                            crates.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        // 2) Paths referencing `deps/<artifact>`, `incremental/<crate>-<hash>`, `.fingerprint/<crate>-<hash>`.
+        for marker in ["deps/", "incremental/", ".fingerprint/"] {
+            let mut rest = line;
+            while let Some(pos) = rest.find(marker) {
+                let after = &rest[pos + marker.len()..];
+                let seg = after
+                    .split(|c: char| c.is_whitespace() || matches!(c, '/' | ':' | ')' | '(' | '"' | '\'' | '`' | ',' | ';'))
+                    .next()
+                    .unwrap_or("");
+                if let Some(name) = crate_name_from_artifact_stem(seg) {
+                    crates.insert(name);
+                }
+                rest = after;
+            }
+        }
+        // 3) Rust symbol prefixes on `undefined symbol` lines (e.g. `drop_in_place<my_crate::Foo>`).
+        if line.to_ascii_lowercase().contains("undefined symbol") {
+            let bytes = line.as_bytes();
+            let mut i = 0;
+            while i + 2 < bytes.len() {
+                if bytes[i] == b':' && bytes[i + 1] == b':' {
+                    let mut start = i;
+                    while start > 0
+                        && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_')
+                    {
+                        start -= 1;
+                    }
+                    // Only take leading path segment (not `foo::bar::` -> skip `bar`).
+                    let preceded_by_colon =
+                        start >= 2 && bytes[start - 1] == b':' && bytes[start - 2] == b':';
+                    if !preceded_by_colon && start < i {
+                        let seg = &line[start..i];
+                        if !matches!(
+                            seg,
+                            "core" | "std" | "alloc" | "proc_macro" | "test" | "drop_glue"
+                        ) && is_valid_crate_ident(seg)
+                        {
+                            crates.insert(seg.to_string());
+                        }
+                    }
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+        }
+    }
+
+    // 4) `-p <pkg>` / `--package <pkg>` / `--bin <bin>` in command.
+    let cmd_tokens: Vec<&str> = command.split_whitespace().collect();
+    for (idx, tok) in cmd_tokens.iter().enumerate() {
+        let candidate = if matches!(*tok, "-p" | "--package" | "--bin" | "--test" | "--example") {
+            cmd_tokens.get(idx + 1).copied()
+        } else {
+            tok.strip_prefix("--package=")
+                .or_else(|| tok.strip_prefix("--bin="))
+        };
+        if let Some(raw) = candidate {
+            let clean = raw.trim_matches(|c: char| matches!(c, '"' | '\'' | ';'));
+            if is_valid_crate_ident(clean) {
+                crates.insert(clean.to_string());
+            }
+        }
+    }
+
+    // 5) Nearest `Cargo.toml` owning any changed path inside `wt_path`.
+    for rel in changed_paths {
+        let mut dir = wt_path.join(rel);
+        if dir.is_file() || !dir.is_dir() {
+            if let Some(p) = dir.parent() {
+                dir = p.to_path_buf();
+            }
+        }
+        while dir.starts_with(wt_path) {
+            let manifest = dir.join("Cargo.toml");
+            if manifest.is_file() {
+                if let Some(name) = cargo_toml_package_name(&manifest) {
+                    crates.insert(name);
+                }
+                break;
+            }
+            if dir == wt_path {
+                break;
+            }
+            let Some(p) = dir.parent() else { break };
+            dir = p.to_path_buf();
+        }
+    }
+
+    crates.into_iter().collect()
+}
+
+fn premerge_owned_target_dirs(wt_path: &Path, cwd: &Path, env: &Value) -> Vec<PathBuf> {
+    let premerge_base = wt_path.parent().unwrap_or(wt_path);
+    let premerge_root = fs::canonicalize(premerge_base).unwrap_or_else(|_| premerge_base.to_path_buf());
+    let mut out = Vec::<PathBuf>::new();
+    let mut seen = BTreeSet::<PathBuf>::new();
+
+    let mut try_add = |cand: PathBuf| {
+        if !cand.is_dir() {
+            return;
+        }
+        let Ok(canon) = fs::canonicalize(&cand) else {
+            return;
+        };
+        // Strict safety boundary: ONLY touch target dirs strictly inside this repo's premerge dir,
+        // NEVER any worktree target or source repo target (even via symlinks or CARGO_TARGET_DIR).
+        if canon.starts_with(&premerge_root) && canon != premerge_root && seen.insert(canon.clone())
+        {
+            out.push(canon);
+        }
+    };
+
+    if let Some(env_target) = env.get("CARGO_TARGET_DIR").and_then(Value::as_str) {
+        let trimmed = env_target.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            try_add(if p.is_absolute() { p } else { cwd.join(p) });
+        }
+    }
+    if let Ok(proc_target) = std::env::var("CARGO_TARGET_DIR") {
+        let trimmed = proc_target.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            try_add(if p.is_absolute() { p } else { cwd.join(p) });
+        }
+    }
+    try_add(wt_path.join("target"));
+    if cwd != wt_path && cwd.starts_with(wt_path) {
+        try_add(cwd.join("target"));
+    }
+    out
+}
+
+fn has_cargo_cache_subdirs(dir: &Path) -> bool {
+    dir.join("incremental").is_dir()
+        || dir.join("deps").is_dir()
+        || dir.join(".fingerprint").is_dir()
+}
+
+fn discover_profile_dirs(target_dir: &Path) -> Vec<PathBuf> {
+    let mut profiles = Vec::new();
+    let Ok(rd) = fs::read_dir(target_dir) else {
+        return profiles;
+    };
+    for ent in rd.flatten() {
+        let p = ent.path();
+        if !p.is_dir() || p.is_symlink() {
+            continue;
+        }
+        let name = ent.file_name().to_string_lossy().into_owned();
+        if matches!(name.as_str(), "incremental" | "deps" | ".fingerprint" | "tmp") {
+            continue;
+        }
+        if has_cargo_cache_subdirs(&p) {
+            profiles.push(p);
+            continue;
+        }
+        // Check `<target>/<triple>/<profile>` layout.
+        if let Ok(sub_rd) = fs::read_dir(&p) {
+            for sub in sub_rd.flatten() {
+                let sp = sub.path();
+                if sp.is_dir() && !sp.is_symlink() && has_cargo_cache_subdirs(&sp) {
+                    profiles.push(sp);
+                }
+            }
+        }
+    }
+    profiles
+}
+
+fn entry_matches_crates(entry_name: &str, crates: &[String], allow_lib_prefix: bool) -> bool {
+    for c in crates {
+        let under = c.replace('-', "_");
+        let dash = c.replace('_', "-");
+        for variant in [&under, &dash] {
+            if entry_name == variant.as_str()
+                || entry_name.starts_with(&format!("{variant}-"))
+                || entry_name.starts_with(&format!("{variant}."))
+            {
+                return true;
+            }
+            if allow_lib_prefix
+                && (entry_name.starts_with(&format!("lib{variant}-"))
+                    || entry_name.starts_with(&format!("lib{variant}.")))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn remove_path_any(path: &Path) -> bool {
+    if path.is_symlink() || path.is_file() {
+        fs::remove_file(path).is_ok()
+    } else if path.is_dir() {
+        fs::remove_dir_all(path).is_ok()
+    } else {
+        false
+    }
+}
+
+pub(crate) struct CacheHealReport {
+    pub crates: Vec<String>,
+    pub targets: Vec<String>,
+    pub removed_count: usize,
+}
+
+pub(crate) fn heal_premerge_target_cache(
+    wt_path: &Path,
+    cwd: &Path,
+    env: &Value,
+    output: &str,
+    command: &str,
+    changed_paths: &[String],
+) -> CacheHealReport {
+    let crates = extract_affected_crates(output, command, wt_path, changed_paths);
+    let targets = premerge_owned_target_dirs(wt_path, cwd, env);
+    let mut removed_count = 0usize;
+
+    for target_dir in &targets {
+        for profile_dir in discover_profile_dirs(target_dir) {
+            let mut profile_removed = 0usize;
+            if !crates.is_empty() {
+                for (subdir, allow_lib) in [
+                    ("incremental", false),
+                    ("deps", true),
+                    (".fingerprint", false),
+                ] {
+                    let sub_path = profile_dir.join(subdir);
+                    let Ok(rd) = fs::read_dir(&sub_path) else {
+                        continue;
+                    };
+                    for ent in rd.flatten() {
+                        let name = ent.file_name().to_string_lossy().into_owned();
+                        if entry_matches_crates(&name, &crates, allow_lib)
+                            && remove_path_any(&ent.path())
+                        {
+                            profile_removed += 1;
+                        }
+                    }
+                }
+            }
+            // Fallback when no crate-specific entries matched: remove the profile's
+            // incremental / deps / .fingerprint directories inside premerge's own target.
+            if profile_removed == 0 {
+                for subdir in ["incremental", "deps", ".fingerprint"] {
+                    let sub_path = profile_dir.join(subdir);
+                    if sub_path.is_dir() && !sub_path.is_symlink() && remove_path_any(&sub_path) {
+                        profile_removed += 1;
+                    }
+                }
+            }
+            removed_count += profile_removed;
+        }
+    }
+
+    CacheHealReport {
+        crates,
+        targets: targets
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        removed_count,
+    }
+}
+
 struct PremergeLayersOutcome {
     ok: bool,
     aborted: bool,
@@ -1703,8 +2085,13 @@ struct PremergeLayersOutcome {
     failed_code: Option<i32>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_premerge_layers(
     run: &Path,
+    run_id: &str,
+    run_name: &str,
+    repo_str: &str,
+    source_head: &str,
     meta: &Value,
     repo_cfg: &Value,
     wt_path: &Path,
@@ -1813,8 +2200,9 @@ fn run_premerge_layers(
         let _ = log.flush();
         let t0 = Instant::now();
         let cleanup_dir = wt_path.parent().unwrap_or(wt_path);
+        let attempt_start = log.metadata().map(|m| m.len()).unwrap_or(0);
         // No timeout for premerge acceptance; silent commands emit the existing stall_warning.
-        let (code, _timed) = run_shell_isolated(
+        let (mut code, _timed) = run_shell_isolated(
             (&spec.command, "premerge"),
             &cwd,
             run,
@@ -1826,9 +2214,66 @@ fn run_premerge_layers(
             true,
         )
         .unwrap_or((1, false));
-        let secs = (t0.elapsed().as_secs_f64() * 100.0).round() / 100.0;
         let _ = writeln!(log, "\n[exit {code}]");
         let _ = log.flush();
+
+        if code != 0 && !should_yield_to_apply(run, source) {
+            let attempt_out = read_log_slice(log_path, attempt_start);
+            if is_linker_cache_error(&attempt_out) {
+                let report = heal_premerge_target_cache(
+                    wt_path,
+                    &cwd,
+                    &eval_meta["env"],
+                    &attempt_out,
+                    &spec.command,
+                    changed_paths,
+                );
+                let _ = writeln!(
+                    log,
+                    "=== [premerge:cache-heal] {} linker error detected; healed {} entries (crates: {}) and retrying once ===\n$ {}",
+                    spec.name,
+                    report.removed_count,
+                    if report.crates.is_empty() {
+                        "all-profile".to_string()
+                    } else {
+                        report.crates.join(", ")
+                    },
+                    spec.command
+                );
+                let _ = log.flush();
+                events::emit(
+                    run_id,
+                    repo_str,
+                    "premerge_cache_healed",
+                    json!({
+                        "name": run_name,
+                        "baseHead": source_head,
+                        "step": "accept",
+                        "layer": spec.name,
+                        "crates": report.crates,
+                        "removed": report.removed_count,
+                        "targets": report.targets,
+                        "log": log_path.to_string_lossy(),
+                    }),
+                );
+                let (retry_code, _) = run_shell_isolated(
+                    (&spec.command, "premerge"),
+                    &cwd,
+                    run,
+                    cleanup_dir,
+                    &eval_meta["env"],
+                    None,
+                    &mut log,
+                    None,
+                    true,
+                )
+                .unwrap_or((1, false));
+                code = retry_code;
+                let _ = writeln!(log, "\n[exit {code} (after cache heal)]");
+                let _ = log.flush();
+            }
+        }
+        let secs = (t0.elapsed().as_secs_f64() * 100.0).round() / 100.0;
 
         if should_yield_to_apply(run, source) {
             return Ok(PremergeLayersOutcome {
@@ -2107,7 +2552,8 @@ fn process_one_run(
             .map_err(|e| e.to_string())?;
         let _ = writeln!(log, "=== [premerge:generate] ===\n$ {}", merge_res.generate_command);
         let _ = log.flush();
-        let (code, _) = run_shell_isolated(
+        let gen_attempt_start = log.metadata().map(|m| m.len()).unwrap_or(0);
+        let (mut code, _) = run_shell_isolated(
             (&merge_res.generate_command, "premerge"),
             wt_path,
             run,
@@ -2120,6 +2566,63 @@ fn process_one_run(
         )
         .unwrap_or((1, false));
         let _ = writeln!(log, "\n[exit {code}]");
+        let _ = log.flush();
+        if code != 0 && !should_yield_to_apply(run, source_canon) {
+            let gen_out = read_log_slice(&log_path, gen_attempt_start);
+            if is_linker_cache_error(&gen_out) {
+                let run_changed = worktree::run_files(run);
+                let report = heal_premerge_target_cache(
+                    wt_path,
+                    wt_path,
+                    &meta["env"],
+                    &gen_out,
+                    &merge_res.generate_command,
+                    &run_changed,
+                );
+                let _ = writeln!(
+                    log,
+                    "=== [premerge:cache-heal] generate linker error detected; healed {} entries (crates: {}) and retrying once ===\n$ {}",
+                    report.removed_count,
+                    if report.crates.is_empty() {
+                        "all-profile".to_string()
+                    } else {
+                        report.crates.join(", ")
+                    },
+                    merge_res.generate_command
+                );
+                let _ = log.flush();
+                events::emit(
+                    &run_id,
+                    repo_str,
+                    "premerge_cache_healed",
+                    json!({
+                        "name": run_name,
+                        "baseHead": source_head,
+                        "step": "generate",
+                        "layer": "generate",
+                        "crates": report.crates,
+                        "removed": report.removed_count,
+                        "targets": report.targets,
+                        "log": log_str,
+                    }),
+                );
+                let (retry_code, _) = run_shell_isolated(
+                    (&merge_res.generate_command, "premerge"),
+                    wt_path,
+                    run,
+                    cleanup_dir,
+                    &meta["env"],
+                    None,
+                    &mut log,
+                    None,
+                    true,
+                )
+                .unwrap_or((1, false));
+                code = retry_code;
+                let _ = writeln!(log, "\n[exit {code} (after cache heal)]");
+                let _ = log.flush();
+            }
+        }
         if should_yield_to_apply(run, source_canon) {
             let _ = clean_integration_worktree(wt_path, source_head, managed);
             clear_running_marker_if_ours(run);
@@ -2227,6 +2730,10 @@ fn process_one_run(
         } else {
             let res = run_premerge_layers(
                 run,
+                &run_id,
+                &run_name,
+                repo_str,
+                source_head,
                 &meta,
                 repo_cfg,
                 wt_path,
@@ -2580,5 +3087,72 @@ mod tests {
         assert!(paths_overlap("src", "src/a.rs"));
         assert!(!paths_overlap("src/a.rs", "src/ab.rs"));
         assert!(!paths_overlap("src/a.rs", "tests/a.rs"));
+    }
+
+    #[test]
+    fn linker_cache_error_detection_matches_undefined_symbol_and_linking_failed() {
+        assert!(is_linker_cache_error(
+            "mold: error: undefined symbol: core::ptr::drop_in_place<my_crate::Widget>\n"
+        ));
+        assert!(is_linker_cache_error(
+            "error: linking with `cc` failed: exit status: 1\n"
+        ));
+        assert!(is_linker_cache_error(
+            "error: linking with `mold` failed\n"
+        ));
+        assert!(!is_linker_cache_error(
+            "error[E0425]: cannot find value `foo` in this scope\ntest result: FAILED.\n"
+        ));
+    }
+
+    #[test]
+    fn heal_premerge_target_cleans_only_premerge_target_and_never_touches_worktree() {
+        let root = std::env::temp_dir().join(format!(
+            "delegate-premerge-heal-test-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let premerge_dir = root.join("premerge").join("repo-key");
+        let wt_path = premerge_dir.join("worktree");
+        let other_wt_target = root.join("worktrees").join("run-1").join("target");
+
+        // Premerge own target with affected `xtask` + unrelated `serde` artifacts.
+        let pm_debug = wt_path.join("target").join("debug");
+        fs::create_dir_all(pm_debug.join("incremental").join("xtask-abcdef1234")).unwrap();
+        fs::create_dir_all(pm_debug.join("incremental").join("serde-11112222")).unwrap();
+        fs::create_dir_all(pm_debug.join("deps")).unwrap();
+        fs::write(pm_debug.join("deps").join("xtask-abcdef1234"), b"bad").unwrap();
+        fs::write(pm_debug.join("deps").join("libserde-11112222.rlib"), b"good").unwrap();
+        fs::create_dir_all(pm_debug.join(".fingerprint").join("xtask-abcdef1234")).unwrap();
+        fs::create_dir_all(pm_debug.join(".fingerprint").join("serde-11112222")).unwrap();
+
+        // Separate worktree target that must NEVER be touched even if passed via CARGO_TARGET_DIR.
+        let owt_debug = other_wt_target.join("debug");
+        fs::create_dir_all(owt_debug.join("incremental").join("xtask-abcdef1234")).unwrap();
+
+        let err_out = "mold: error: undefined symbol: drop_glue<xtask::State>\nerror: could not compile `xtask` (bin \"xtask\")\n";
+        let env = json!({"CARGO_TARGET_DIR": other_wt_target.to_string_lossy()});
+        let report = heal_premerge_target_cache(
+            &wt_path,
+            &wt_path,
+            &env,
+            err_out,
+            "cargo run -p xtask -- gen",
+            &[],
+        );
+
+        assert!(report.crates.iter().any(|c| c == "xtask"), "{:?}", report.crates);
+        assert!(report.removed_count >= 3, "removed={}", report.removed_count);
+        assert!(!pm_debug.join("incremental").join("xtask-abcdef1234").exists());
+        assert!(!pm_debug.join("deps").join("xtask-abcdef1234").exists());
+        assert!(!pm_debug.join(".fingerprint").join("xtask-abcdef1234").exists());
+        // Unrelated dependency preserved.
+        assert!(pm_debug.join("incremental").join("serde-11112222").exists());
+        assert!(pm_debug.join("deps").join("libserde-11112222.rlib").exists());
+        assert!(pm_debug.join(".fingerprint").join("serde-11112222").exists());
+        // External worktree target strictly untouched!
+        assert!(owt_debug.join("incremental").join("xtask-abcdef1234").exists());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -1876,6 +1876,9 @@ pub fn sync_with_mode(run: &Path, meta: &Value, mode: SyncMode) -> Res<SyncRepor
         source_dirty,
     })
 }
+/// Standard exit code for merge/apply conflicts and unresolved conflict markers.
+pub const EXIT_CONFLICT: i32 = 3;
+
 pub struct ApplyOutcome {
     pub code: i32,
     pub conclusion: Value,
@@ -2060,7 +2063,15 @@ fn marked_files(source: &Path, rules: &[String]) -> Res<Vec<String>> {
         .filter(|p| !conflict_labels(&source.join(p)).is_empty())
         .collect())
 }
-fn reject_existing_markers(run: &Path, meta: &Value, keep_commits: bool) -> Res<Vec<String>> {
+enum PreflightMarkers {
+    Clear(Vec<String>),
+    Blocked {
+        paths: Vec<String>,
+        details: Vec<String>,
+    },
+}
+
+fn check_existing_markers(run: &Path, meta: &Value, keep_commits: bool) -> Res<PreflightMarkers> {
     let (_, top, _, after) = chain_changes(run)?;
     let applied = applied_state(run, meta);
     let rec = json(run.join("changes.json"));
@@ -2158,22 +2169,23 @@ fn reject_existing_markers(run: &Path, meta: &Value, keep_commits: bool) -> Res<
     if regenerating && !keep_commits {
         checked.extend(generated_paths);
     }
-    let blocked = marked_files(source, &checked)?
-        .iter()
-        .map(|path| {
-            format!(
-                "{path} (markers: {})",
-                conflict_labels(&source.join(path)).join(", ")
-            )
-        })
-        .collect::<Vec<_>>();
-    if !blocked.is_empty() {
-        return Err(format!(
-            "nothing applied: unresolved conflict markers / 冲突标记未解决: {}",
-            blocked.join("; ")
-        ));
+    let blocked_paths = marked_files(source, &checked)?;
+    if !blocked_paths.is_empty() {
+        let details = blocked_paths
+            .iter()
+            .map(|path| {
+                format!(
+                    "{path} (markers: {})",
+                    conflict_labels(&source.join(path)).join(", ")
+                )
+            })
+            .collect::<Vec<_>>();
+        return Ok(PreflightMarkers::Blocked {
+            paths: blocked_paths,
+            details,
+        });
     }
-    Ok(checked)
+    Ok(PreflightMarkers::Clear(checked))
 }
 /// Uncommitted paths in `source` (staged, unstaged, and untracked, excluding `.local/`).
 /// In a freshly initialized repository with no HEAD commit yet, returns empty (no baseline commit
@@ -2370,7 +2382,42 @@ pub fn apply(
     if Path::new(s(&meta["worktree"], "path")).is_dir() {
         crate::changes::record(&mut meta, run);
     }
-    let written_paths = reject_existing_markers(run, &meta, keep_commits)?;
+    let written_paths = match check_existing_markers(run, &meta, keep_commits)? {
+        PreflightMarkers::Clear(paths) => paths,
+        PreflightMarkers::Blocked { paths, details } => {
+            let msg = format!(
+                "nothing applied: unresolved conflict markers / 冲突标记未解决: {}",
+                details.join("; ")
+            );
+            eprintln!("delegate: {msg}");
+            let now = iso();
+            let mut conclusion = json!({
+                "run": run.file_name().unwrap_or_default().to_string_lossy(),
+                "operation": "apply",
+                "apply": {
+                    "ok": false,
+                    "dryRun": dry,
+                    "failedStep": "conflict-markers",
+                    "failureDetail": msg,
+                    "conflictMarkers": paths,
+                    "writtenFiles": [],
+                },
+                "startedAt": now,
+                "finishedAt": now,
+                "elapsedMs": 0,
+            });
+            if let Some(sources) = meta.get("configSources") {
+                conclusion["configSources"] = sources.clone();
+            }
+            return Ok(ApplyOutcome {
+                code: EXIT_CONFLICT,
+                conclusion,
+                written_files: vec![],
+                regenerated_files: vec![],
+                had_dirty_merge: false,
+            });
+        }
+    };
     if !dry && run.join("changes.patch").is_file() {
         let mut patch = fs::read(run.join("changes.patch"))
             .map_err(|e| format!("retain applied.patch: {e}"))?;
@@ -2877,7 +2924,10 @@ fn apply_checked(
                     if !status.success() {
                         eprintln!("delegate: cherry-pick stopped at {hash}; resolve conflicts in {}, then continue with git cherry-pick --continue", source.display());
                         failed_commit = Some((hash.to_string(), title.to_string()));
-                        code = 1;
+                        let has_unmerged = git(source, &["diff", "--name-only", "--diff-filter=U"])
+                            .map(|out| !out.trim_ascii().is_empty())
+                            .unwrap_or(false);
+                        code = if has_unmerged { EXIT_CONFLICT } else { 1 };
                         break;
                     }
                     applied_commits.push(hash.to_string());
@@ -3004,7 +3054,7 @@ fn apply_checked(
             let mut summary = json(run.join("summary.json"));
             summary["conflictMarkers"] = json!(marked);
             write_json(run.join("summary.json"), &summary)?;
-            code = 1;
+            code = EXIT_CONFLICT;
         }
     }
     if code != 0 {
@@ -3837,7 +3887,7 @@ fn apply_inner(
         conclusion["apply"]["next"] = json!([rebase_cmd, merge_cmd]);
         conclusion["next"] = json!(rebase_cmd);
         return Ok(ApplyInnerResult {
-            code: 1,
+            code: EXIT_CONFLICT,
             written: vec![],
             regenerated: vec![],
             had_dirty_merge: false,
@@ -4177,7 +4227,7 @@ fn apply_inner(
         ));
         conclusion["apply"]["skippedFiles"] = json!(conflicts);
         conclusion["apply"]["writtenFiles"] = json!(&written);
-        1
+        EXIT_CONFLICT
     } else if marked {
         conclusion["apply"]["failedStep"] = json!("conflict-markers");
         conclusion["apply"]["failureDetail"] = json!(format!(
@@ -4186,7 +4236,7 @@ fn apply_inner(
             marked_paths.join(", ")
         ));
         conclusion["apply"]["writtenFiles"] = json!(&written);
-        1
+        EXIT_CONFLICT
     } else {
         0
     };
