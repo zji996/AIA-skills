@@ -2042,7 +2042,7 @@ def check_stale_work_items(
         suffix = "（原会话已失效待接手）" if is_orphan else ""
         lines.append(f"[{wid}] {title} · 停 {hours} 小时 · {label}{suffix}")
     lines.append(
-        '可选：派发 `delegate start --work Wxx …` · 等人或等运行 `delegate work wait Wxx --wait-manual "…"|--after-applied RUN` · 暂缓 `delegate work defer Wxx --until … --reason "…"` · 关闭 `delegate work close Wxx --evidence "…"`'
+        '可选：派发 `delegate start --work Wxx …` · 等所有者/运行/时间 `delegate work wait Wxx --needs-owner nod|--after-applied RUN|--after-time TIME` · 暂缓 `delegate work defer Wxx --until … --reason "…"` · 关闭 `delegate work close Wxx --evidence "…"`'
     )
     return "\n".join(lines), [wid for _, wid, _, _, _ in picked]
 

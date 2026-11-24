@@ -1676,3 +1676,91 @@ fn runs_time_uses_finished_at_and_model_shows_alias_dot_thinking() {
     assert!(screen.contains("neon·中"), "{screen}");
     assert!(screen.contains("hyd…·高"), "{screen}");
 }
+
+#[test]
+fn work_owner_missing_advice_tag_and_waiting_work_section_on_q_card() {
+    use delegate_tui::data::parse_snapshot_json;
+
+    let raw = r#"{
+        "schemaVersion": 1,
+        "generatedAt": "2026-11-24T12:00:00Z",
+        "seq": 12,
+        "repos": [],
+        "work": [
+            {
+                "id": "Q01",
+                "title": "旧空壳点头项",
+                "repo": "/repo/demo",
+                "repoLabel": "demo",
+                "state": "attention",
+                "owner": {"kind": "nod", "ask": "旧空壳点头项"},
+                "stateSince": "2026-11-24T10:00:00Z",
+                "focus": "等你点头"
+            },
+            {
+                "id": "Q02",
+                "title": "路由切换方案",
+                "repo": "/repo/demo",
+                "repoLabel": "demo",
+                "state": "attention",
+                "owner": {
+                    "kind": "nod",
+                    "ask": "是否切到方案 A？",
+                    "recommendation": "建议选 A",
+                    "ifUndecided": "维持旧路由",
+                    "cost": "半天"
+                },
+                "stateSince": "2026-11-24T10:00:00Z",
+                "focus": "等你点头"
+            },
+            {
+                "id": "D001",
+                "title": "方向调研",
+                "repo": "/repo/demo",
+                "repoLabel": "demo",
+                "state": "active",
+                "owner": {"kind": "direction", "ask": "方向调研"},
+                "stateSince": "2026-11-24T10:00:00Z",
+                "focus": "方向"
+            },
+            {
+                "id": "W001",
+                "title": "落地新路由",
+                "repo": "/repo/demo",
+                "repoLabel": "demo",
+                "state": "blocked",
+                "doneWhen": "灰度与单测全绿",
+                "brief": "docs/plan/routing.md",
+                "waitOn": ["owner:Q02"],
+                "stateSince": "2026-11-24T10:05:00Z",
+                "focus": "等所有者 Q02"
+            }
+        ],
+        "events": [],
+        "lane": {},
+        "dagQueue": [],
+        "merges": [],
+        "candidates": []
+    }"#;
+
+    let snap = parse_snapshot_json(raw, None, None).unwrap();
+    let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/repo/demo"), 2);
+    app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+
+    let list_screen = render_to_string(&mut app, 120, 24);
+    let q01_line = list_screen.lines().find(|l| l.contains("Q01")).expect("Q01 row");
+    let q02_line = list_screen.lines().find(|l| l.contains("Q02")).expect("Q02 row");
+    let d001_line = list_screen.lines().find(|l| l.contains("D001")).expect("D001 row");
+    assert!(q01_line.contains("缺建议"), "incomplete Q01 must show 缺建议: {q01_line}");
+    assert!(!q02_line.contains("缺建议"), "complete Q02 must not show 缺建议: {q02_line}");
+    assert!(!d001_line.contains("缺建议"), "direction D001 must not show 缺建议: {d001_line}");
+
+    // Move selection to Q02 and open its card -> must display 在等它的工作 with W001 details
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let card_screen = render_to_string(&mut app, 120, 32);
+    assert!(card_screen.contains("在等它的工作"), "{card_screen}");
+    assert!(card_screen.contains("[W001] 落地新路由"), "{card_screen}");
+    assert!(card_screen.contains("完成条件：灰度与单测全绿"), "{card_screen}");
+    assert!(card_screen.contains("说明：docs/plan/routing.md"), "{card_screen}");
+}

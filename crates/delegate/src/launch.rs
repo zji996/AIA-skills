@@ -1919,7 +1919,7 @@ fn rework_gate(
 }
 
 pub fn reply(mut o: Options) -> Res<PathBuf> {
-    let timeout_overridden = o.timeout.is_some() || o.minor;
+    let timeout_overridden = o.timeout.is_some();
     let evidence_overridden = o.evidence_set;
     let accept_overridden = o.accept_set;
     let accept_timeout_overridden = o.accept_timeout.is_some();
@@ -2066,12 +2066,8 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     if !added_allow.is_empty() {
         eprintln!("delegate: open for this task / 本次开放：{}", o.allow.join(", "));
     }
-    if o.timeout.is_none() {
-        if o.minor {
-            o.timeout = Some("10m".into());
-        } else if !s(&meta, "timeout").is_empty() {
-            o.timeout = Some(s(&meta, "timeout").into());
-        }
+    if o.timeout.is_none() && !s(&meta, "timeout").is_empty() {
+        o.timeout = Some(s(&meta, "timeout").into());
     }
     if !o.accept_set {
         o.accept = meta["accept"].as_str().map(str::to_string);

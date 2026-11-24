@@ -27,12 +27,12 @@ STOP_HOOK = ROOT / "skills/delegate/hooks/claude-code-stop.py"
 
 EXPECTED_HINT_LINE = (
     '可选：派发 `delegate start --work Wxx …` · '
-    '等人或等运行 `delegate work wait Wxx --wait-manual "…"|--after-applied RUN` · '
+    '等所有者/运行/时间 `delegate work wait Wxx --needs-owner nod|--after-applied RUN|--after-time TIME` · '
     '暂缓 `delegate work defer Wxx --until … --reason "…"` · '
     '关闭 `delegate work close Wxx --evidence "…"`'
 )
 EXPECTED_KEYWORD_WARN = (
-    '这项像要所有者点头或等前置，仍放进就绪；若是，加 --needs-owner nod 或 --wait-manual "…"'
+    '这项像要所有者点头或等前置，仍放进就绪；若是，加 --needs-owner nod 或 --after-applied / --after-time'
 )
 
 
@@ -301,7 +301,15 @@ class DelegateWorkHygieneTests(unittest.TestCase):
         repo = self.repo({"a.txt": "v0\n"})
 
         # 1) --needs-owner nod creates Q01 + W001 blocked on owner:Q01 without keyword warning
-        add_need = self.cli("work", "add", "对外发布审批", "--repo", repo, "--needs-owner", "nod", "--json", human=True)
+        add_need = self.cli(
+            "work", "add", "对外发布审批", "--repo", repo,
+            "--needs-owner", "nod",
+            "--ask", "是否批准本次对外发布？",
+            "--recommendation", "建议批准，回归已全绿",
+            "--if-undecided", "延后到下个发版窗口",
+            "--cost", "零开发成本",
+            "--json", human=True,
+        )
         self.assertEqual(add_need.returncode, 0, add_need.stdout + add_need.stderr)
         self.assertNotIn(EXPECTED_KEYWORD_WARN, add_need.stderr)
         w1 = json.loads(add_need.stdout)
@@ -311,6 +319,10 @@ class DelegateWorkHygieneTests(unittest.TestCase):
 
         q1 = json.loads(self.cli("work", "show", "Q01", "--json", human=True).stdout)
         self.assertEqual(q1["owner"]["kind"], "nod")
+        self.assertEqual(q1["owner"]["ask"], "是否批准本次对外发布？")
+        self.assertEqual(q1["owner"]["recommendation"], "建议批准，回归已全绿")
+        self.assertEqual(q1["owner"]["ifUndecided"], "延后到下个发版窗口")
+        self.assertEqual(q1["owner"]["cost"], "零开发成本")
         self.assertEqual(q1["state"], "attention")
 
         # Closing Q01 unlocks W001 to ready
@@ -319,7 +331,12 @@ class DelegateWorkHygieneTests(unittest.TestCase):
         self.assertEqual(w1_after["state"], "ready")
 
         # Invalid --needs-owner value fails closed
-        bad_need = self.cli("work", "add", "无效类型", "--repo", repo, "--needs-owner", "direction", human=True)
+        bad_need = self.cli(
+            "work", "add", "无效类型", "--repo", repo,
+            "--needs-owner", "direction",
+            "--ask", "问题？", "--recommendation", "建议", "--if-undecided", "不变", "--cost", "0",
+            human=True,
+        )
         self.assertNotEqual(bad_need.returncode, 0)
 
         # 2) Keyword in title without --needs-owner / --wait-* / --after-* prints warning, does NOT reject
@@ -336,9 +353,9 @@ class DelegateWorkHygieneTests(unittest.TestCase):
         w3 = json.loads(self.cli("work", "show", "W003", "--json", human=True).stdout)
         self.assertEqual(w3["state"], "ready")
 
-        # 4) Keyword with --wait-manual does NOT warn
+        # 4) Keyword with --after-time does NOT warn
         no_warn = self.cli(
-            "work", "add", "不可逆迁移", "--repo", repo, "--wait-manual", "等维护窗口", human=True
+            "work", "add", "不可逆迁移", "--repo", repo, "--after-time", "2099-01-01", human=True
         )
         self.assertEqual(no_warn.returncode, 0, no_warn.stdout + no_warn.stderr)
         self.assertNotIn(EXPECTED_KEYWORD_WARN, no_warn.stderr)
@@ -370,7 +387,14 @@ class DelegateWorkHygieneTests(unittest.TestCase):
 
         # Create owner item Q01 for W002's verify_on
         self.assertEqual(
-            self.cli("work", "add", "--owner-kind", "nod", "--ask", "上线点头", "--repo", repo, human=True).returncode,
+            self.cli(
+                "work", "add", "--owner-kind", "nod",
+                "--ask", "是否批准本次上线？",
+                "--recommendation", "建议上线",
+                "--if-undecided", "延后上线",
+                "--cost", "零成本",
+                "--repo", repo, human=True,
+            ).returncode,
             0,
         )
         # W002: has verify_on = [run_applied:r1, commit_exists:<head>, owner:Q01]
@@ -452,7 +476,7 @@ class DelegateWorkHygieneTests(unittest.TestCase):
 
         # Follow up with close (W001), wait_on (W002), and 3x defer (W003)
         self.assertEqual(self.cli("work", "close", "W001", "--evidence", "已验", human=True).returncode, 0)
-        self.assertEqual(self.cli("work", "wait", "W002", "--wait-manual", "等外部接口", human=True).returncode, 0)
+        self.assertEqual(self.cli("work", "wait", "W002", "--after-time", "2099-01-01", human=True).returncode, 0)
         for n in range(1, 4):
             dres = self.cli("work", "defer", "W003", "--reason", f"第{n}次延后", "--until", "4h", human=True)
             self.assertEqual(dres.returncode, 0, dres.stdout + dres.stderr)
@@ -497,6 +521,192 @@ class DelegateWorkHygieneTests(unittest.TestCase):
         # Remove remind file to test fresh evaluation
         (self.state_dir() / "work-remind.json").unlink(missing_ok=True)
         self.assertIsNone(self.run_stop_hook({"cwd": str(repo), "stop_hook_active": False}))
+
+    def test_wait_manual_removed_and_wait_needs_owner_and_idempotent_state_since(self):
+        repo = self.repo({"a.txt": "v0\n"})
+
+        # 1) --wait-manual is removed and rejected as an unrecognized argument on both add and wait
+        bad_add = self.cli("work", "add", "旧手动", "--repo", repo, "--wait-manual", "等人工", human=True)
+        self.assertNotEqual(bad_add.returncode, 0)
+        self.assertIn("unrecognized arguments: --wait-manual", bad_add.stderr)
+
+        self.assertEqual(self.cli("work", "add", "待挂前置项", "--repo", repo, "--done-when", "灰度通过", "--brief", "docs/spec.md", human=True).returncode, 0)
+        bad_wait = self.cli("work", "wait", "W001", "--wait-manual", "等人工", human=True)
+        self.assertNotEqual(bad_wait.returncode, 0)
+        self.assertIn("unrecognized arguments: --wait-manual", bad_wait.stderr)
+
+        # 2) `work wait W001 --needs-owner nod` creates Q01 and blocks W001 on owner:Q01
+        w_need = self.cli(
+            "work", "wait", "W001",
+            "--needs-owner", "nod",
+            "--ask", "是否批准放量？",
+            "--recommendation", "建议放量至 10%",
+            "--if-undecided", "停留在内部灰度",
+            "--cost", "10 分钟观察",
+            "--json", human=True,
+        )
+        self.assertEqual(w_need.returncode, 0, w_need.stdout + w_need.stderr)
+        w1 = json.loads(w_need.stdout)
+        self.assertEqual(w1["state"], "blocked")
+        self.assertEqual(w1["waitOn"], ["owner:Q01"])
+
+        # Q01 card snapshot shows 「在等它的工作」 with W001 title, done_when, and brief on one line
+        q1_card = self.cli("work", "show", "Q01", human=True)
+        self.assertEqual(q1_card.returncode, 0, q1_card.stderr)
+        self.assertIn("在等它的工作：\n  - [W001] 待挂前置项 · 完成条件：灰度通过 · 说明：docs/spec.md", q1_card.stdout)
+
+        # 3) Idempotent `work wait` on a blocked item does NOT reset stateSince; `--clear` to ready DOES
+        old_since = "2026-11-20T00:00:00Z"
+        work_file = self.state_dir() / "work.jsonl"
+        rows = [json.loads(ln) for ln in work_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        for r in rows:
+            if r["id"] == "W001":
+                r["stateSince"] = old_since
+        self.write_work_jsonl(rows)
+
+        # Same-state wait (blocked -> blocked) keeps stateSince unchanged
+        w_idem = self.cli("work", "wait", "W001", "--after-time", "2099-01-01", "--json", human=True)
+        self.assertEqual(w_idem.returncode, 0, w_idem.stdout + w_idem.stderr)
+        w1_idem = json.loads(w_idem.stdout)
+        self.assertEqual(w1_idem["state"], "blocked")
+        self.assertEqual(w1_idem["stateSince"], old_since)
+
+        # Clearing all waits transitions blocked -> ready and updates stateSince
+        w_clear = self.cli("work", "wait", "W001", "--clear", "--json", human=True)
+        self.assertEqual(w_clear.returncode, 0, w_clear.stdout + w_clear.stderr)
+        w1_clear = json.loads(w_clear.stdout)
+        self.assertEqual(w1_clear["state"], "ready")
+        self.assertNotEqual(w1_clear["stateSince"], old_since)
+
+    def test_legacy_manual_wait_migrated_once_on_read_and_logs_event(self):
+        repo = self.repo({"a.txt": "v0\n"})
+        self.write_work_jsonl([
+            {
+                "id": "W001",
+                "title": "旧手动项一",
+                "repo": str(repo),
+                "state": "blocked",
+                "waitOn": ["manual:等发版窗口"],
+                "createdAt": iso_ago(24),
+                "updatedAt": iso_ago(24),
+                "stateSince": iso_ago(24),
+            },
+            {
+                "id": "W002",
+                "title": "旧手动加时间项二",
+                "repo": str(repo),
+                "state": "blocked",
+                "waitOn": ["manual:等对方回信", "after_time:2099-01-01T00:00:00Z"],
+                "createdAt": iso_ago(24),
+                "updatedAt": iso_ago(24),
+                "stateSince": iso_ago(24),
+            },
+        ])
+
+        # Reading via `delegate work` triggers the one-time rewrite
+        res = self.cli("work", "--all", human=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        w1 = json.loads(self.cli("work", "show", "W001", "--json", human=True).stdout)
+        w2 = json.loads(self.cli("work", "show", "W002", "--json", human=True).stdout)
+        self.assertEqual(w1["state"], "ready")
+        self.assertEqual(w1.get("waitOn", []), [])
+        self.assertEqual([f["text"] for f in w1.get("followups", [])], ["原手动前置：等发版窗口"])
+
+        self.assertEqual(w2["state"], "blocked")
+        self.assertEqual(w2.get("waitOn", []), ["after_time:2099-01-01T00:00:00Z"])
+        self.assertEqual([f["text"] for f in w2.get("followups", [])], ["原手动前置：等对方回信"])
+
+        raw_disk = (self.state_dir() / "work.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn("manual:", raw_disk)
+
+        evs = [
+            json.loads(ln)
+            for ln in (self.state_dir() / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        mig_evs = [e for e in evs if e.get("kind") == "work_migrated"]
+        self.assertEqual(len(mig_evs), 1, evs)
+        self.assertEqual(mig_evs[0]["payload"]["workIds"], ["W001", "W002"])
+
+    def test_owner_required_fields_rejection_q_backfill_and_missing_advice_tag(self):
+        repo = self.repo({"a.txt": "v0\n"})
+
+        # 1) --needs-owner missing fields rejected and lists missing flags
+        miss_add = self.cli(
+            "work", "add", "发布新版本", "--repo", repo,
+            "--needs-owner", "nod",
+            "--ask", "是否发布？",
+            "--cost", "5 分钟",
+            human=True,
+        )
+        self.assertNotEqual(miss_add.returncode, 0)
+        self.assertIn("--recommendation", miss_add.stderr)
+        self.assertIn("--if-undecided", miss_add.stderr)
+        self.assertNotIn("--ask", miss_add.stderr)
+        self.assertNotIn("--cost", miss_add.stderr)
+
+        # --ask equal to title rejected
+        same_ask = self.cli(
+            "work", "add", "发布新版本", "--repo", repo,
+            "--needs-owner", "nod",
+            "--ask", "发布新版本",
+            "--recommendation", "建议发布",
+            "--if-undecided", "延期",
+            "--cost", "5 分钟",
+            human=True,
+        )
+        self.assertNotEqual(same_ask.returncode, 0)
+        self.assertIn("不能直接等于标题", same_ask.stderr)
+
+        # --owner-kind nod/act/card also requires all 4 fields; direction is exempt
+        miss_okind = self.cli("work", "add", "--owner-kind", "nod", "--ask", "要点头吗？", "--repo", repo, human=True)
+        self.assertNotEqual(miss_okind.returncode, 0)
+        self.assertIn("--recommendation", miss_okind.stderr)
+        self.assertIn("--if-undecided", miss_okind.stderr)
+        self.assertIn("--cost", miss_okind.stderr)
+
+        dir_ok = self.cli("work", "add", "--owner-kind", "direction", "--ask", "方向调研", "--repo", repo, human=True)
+        self.assertEqual(dir_ok.returncode, 0, dir_ok.stdout + dir_ok.stderr)
+
+        # 2) Legacy incomplete Q item: NOT rewritten on read, marked 「缺建议」 in `work list --owner`
+        self.write_work_jsonl([
+            {
+                "id": "Q05",
+                "title": "旧空壳问题",
+                "repo": str(repo),
+                "state": "attention",
+                "owner": {"kind": "nod", "ask": "旧空壳问题"},
+                "createdAt": iso_ago(5),
+                "updatedAt": iso_ago(5),
+                "stateSince": iso_ago(5),
+            }
+        ])
+        owner_before = self.cli("work", "list", "--owner", human=True)
+        self.assertEqual(owner_before.returncode, 0, owner_before.stderr)
+        self.assertIn("[Q05]", owner_before.stdout)
+        self.assertIn("缺建议", owner_before.stdout)
+
+        # 3) `work wait Q05` updates the 4 owner fields and clears 「缺建议」
+        upd = self.cli(
+            "work", "wait", "Q05",
+            "--ask", "是否保留旧兼容开关？",
+            "--recommendation", "建议删除，零调用方",
+            "--if-undecided", "继续背负维护成本",
+            "--cost", "30 分钟",
+            "--json", human=True,
+        )
+        self.assertEqual(upd.returncode, 0, upd.stdout + upd.stderr)
+        q5 = json.loads(upd.stdout)
+        self.assertEqual(q5["state"], "attention")
+        self.assertEqual(q5["owner"]["ask"], "是否保留旧兼容开关？")
+        self.assertEqual(q5["owner"]["recommendation"], "建议删除，零调用方")
+        self.assertEqual(q5["owner"]["ifUndecided"], "继续背负维护成本")
+        self.assertEqual(q5["owner"]["cost"], "30 分钟")
+
+        owner_after = self.cli("work", "list", "--owner", human=True)
+        self.assertEqual(owner_after.returncode, 0, owner_after.stderr)
+        self.assertNotIn("缺建议", owner_after.stdout)
 
 
 if __name__ == "__main__":

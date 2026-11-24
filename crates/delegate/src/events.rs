@@ -1201,6 +1201,15 @@ pub fn format_human(ev: &Value) -> String {
             let reason = s(p, "reason");
             format!("工作项停滞 [{wid}]（{} · 卡片：delegate work show {wid}）", clip(reason, 60))
         }
+        "work_migrated" => {
+            let ids = strings(&p["workIds"]);
+            let label = if !ids.is_empty() {
+                ids.join(", ")
+            } else {
+                s(p, "workId").to_string()
+            };
+            format!("迁移去掉旧手动前置 [{label}]（已记入 followup）")
+        }
         _ => String::new(),
     };
 

@@ -18,13 +18,13 @@
 
 ## 3. 命令速查
 
-- `delegate work [--owner] [--all] [--state <态>] [--repo <名>] [--rebuild] [--json]`：查看工作表（`--owner` 按 动手/点头/看卡/方向 与 已否 纯文本展示所有者事项；`--rebuild` 强制重算派生状态与迁移）。
-- `delegate work show <Wxx|Qxx|Dxxx|R:id> [--json]`：查看工作项或所有者事项卡片。
-- `delegate work add "<标题>" [--done-when "<条件>"] [--brief <文件>] [--needs-owner nod|act|card] [--verify-on <条件>] [--after-applied <run>] [--after-delivered <run>] [--after-work <Wxx>] [--wait-owner <Qxx>] [--after-time <4h|YYYY-MM-DD|ISO>] [--wait-manual "<说明>"] [--artifact <路径>] [--owner-kind act|nod|card|direction --ask "<问题>" --qid <Qxx|Dxxx> --recommendation "<建议>" --if-undecided "<不定会怎样>" --cost "<成本>"] [--auto -- <start参数>]`：立项或新建所有者事项（`Q`/`D` 编号，卡片路径用 `--brief`）。
-  - `--needs-owner <nod|act|card>`：同时建 `Qxx` 并给 `Wxx` 挂 `owner:Qxx` 直接进 `blocked`；标题或完成条件命中审批/对外/删除/不可逆等关键词且未给前置时印一行警告不拒绝。
+- `delegate work [--owner] [--all] [--state <态>] [--repo <名>] [--rebuild] [--json]`：查看工作表（`--owner` 按 动手/点头/看卡/方向 与 已否 纯文本展示所有者事项，缺字段的既有 Q 项行尾标「缺建议」；`--rebuild` 强制重算派生状态与迁移）。
+- `delegate work show <Wxx|Qxx|Dxxx|R:id> [--json]`：查看工作项或所有者事项卡片（Q 项卡片附「在等它的工作」列出挂 `owner:<Qxx>` 的 W 项）。
+- `delegate work add "<标题>" [--done-when "<条件>"] [--brief <文件>] [--needs-owner nod|act|card --ask "<问题>" --recommendation "<建议>" --if-undecided "<不定会怎样>" --cost "<成本>"] [--verify-on <条件>] [--after-applied <run>] [--after-delivered <run>] [--after-work <Wxx>] [--wait-owner <Qxx>] [--after-time <4h|YYYY-MM-DD|ISO>] [--artifact <路径>] [--owner-kind act|nod|card|direction --ask "<问题>" --qid <Qxx|Dxxx> --recommendation "<建议>" --if-undecided "<不定会怎样>" --cost "<成本>"] [--auto -- <start参数>]`：立项或新建所有者事项（`Q`/`D` 编号，卡片路径用 `--brief`）。
+  - `--needs-owner <nod|act|card>`（`add` 与 `wait` 均支持）：同时建 `Qxx` 并给 `Wxx` 挂 `owner:Qxx` 直接进 `blocked`；与 `--owner-kind <act|nod|card>` 一样须同时给 `--ask`（问句，不能等于标题）、`--recommendation`、`--if-undecided`、`--cost`（`direction` 走卡片除外）。标题或完成条件命中审批/对外/删除/不可逆等关键词且未给前置时印一行警告不拒绝。
   - `--verify-on <COND>`（`add`/`wait` 可多次）：设 `run_applied:`/`work_closed:`/`owner:`/`commit_exists:<sha>` 闭环条件（不做 `cmd:`），`reconcile` 全部满足自动 `done`（`closedKind: auto`）并写入各条件求值证据；无 `verify_on` 的 `verify` 项在写任务合入时不自动关闭。
   - 缺说明：`add`/`import-md` 没带 `--brief` 照常进 `ready`，Stop 钩子按「缺说明」列出且 TUI 行尾标 `缺说明`，用 `delegate work wait <Wxx> --brief <文件>` 补齐即消除。
-- `delegate work wait <Wxx> [同上前置选项] [--verify-on <条件>] [--brief <文件>] [--clear]`：给已有工作项挂载或更新前置、闭环条件或任务说明（含 `--after-applied` 与 `--auto` 自动派发）。
+- `delegate work wait <Wxx|Qxx> [同上前置选项] [--needs-owner nod|act|card ...] [--ask … --recommendation … --if-undecided … --cost …] [--verify-on <条件>] [--brief <文件>] [--clear]`：给已有工作项挂载或更新可判定前置、闭环条件或任务说明（同态重复不重置 `state_since`）；对已有 `Qxx` 可直接更新四项所有者字段补齐「缺建议」。
 - `delegate start --work <Wxx> …`：将 run 绑定到工作项；`delegate reply` 自动继承父 run 的 `workId`。
 - `delegate work close <Wxx|Qxx|Dxxx> --evidence "<SHA/测试/所有者结论>"` / `delegate apply --closes <Wxx> <run>`：带证据关闭（关闭所有者事项自动解锁等它的 `owner:Qxx` 下游）。
 - `delegate work drop <Wxx|Qxx|Dxxx> --reason "<放弃/否决理由>"`：留痕放弃/否决（不自动解锁下游，TUI 按 `x` 可查「已否」）。
@@ -35,9 +35,9 @@
 ## 4. 前置条件与只读边界
 
 - `run_applied:<run>`（`--after-applied`）：检查 run 目录 `.applied`/`.applied-cleaned`、`history.jsonl` 与 `events.jsonl`，兼容直接 `apply` 与经 `delegate merge` 后 `apply --keep-commits`。`delegate queue add` 同样支持 `--after-applied`。
-- `run_delivered:<run>`、`work_closed:<Wxx>`（含环检测）、`after_time:<ISO>`、`manual:<说明>`。
+- `run_delivered:<run>`、`work_closed:<Wxx>`（含环检测）、`after_time:<ISO>`（外部等待只用 `--after-time` 到点转 `ready` 或 `work defer --until`，不提供自由文本 `--wait-manual` 或 `cmd:` 探针）。
 - `owner:<Qxx>`：优先指向工作表中的所有者事项（`Q`/`D` 关闭后自动解锁下游，否决不自动解锁）；未迁入时回退只读扫描 `docs/owner/README.md`。
-- **TUI 工作视图**：`delegate tui` 按 `w`/`5` 切到工作表（L0 计数并在有老化项时显示 `老化 N`、所有者事项置顶、依赖链缩进、老化项行尾标 `停 Nh`、缺 brief 的 `ready` 项行尾标 `缺说明`、Enter 看工作卡与 Markdown 卡片正文、`t`/`→` 跳关联 run、`o`/`x` 过滤、`<70` 列手机双行紧凑布局）。
+- **TUI 工作视图**：`delegate tui` 按 `w`/`5` 切到工作表（L0 计数并在有老化项时显示 `老化 N`、所有者事项置顶、依赖链缩进、老化项行尾标 `停 Nh`、缺 brief 的 `ready` 项行尾标 `缺说明`、缺字段的 Q 项行尾标 `缺建议`、Enter 看工作卡含 Q 项「在等它的工作」与 Markdown 卡片正文、`t`/`→` 跳关联 run、`o`/`x` 过滤、`<70` 列手机双行紧凑布局）。
 
 ## 5. 适时提示、Stop Hook 分级与迁移
 
@@ -47,4 +47,4 @@
   - `merge`：提示本次批次合入落盘后将解锁哪些下游项。
   - `clean`：对未关闭工作项印 1 行保留确认，不阻断清理、不写 Stop hook 拦截事件。
 - **Stop Hook 合一与分级**：`hooks/claude-code-stop.py` 为唯一 Stop 钩子，严格零锁、零 git 只读 `state/index.json` 与快照，保留按 caller 隔离游标；已合入、已 clean、已回复或已被任一会话读过结论（`resultReadAt`）的交付/提问类事件直接判旧放行，非本会话发起的 run 仅在原 caller 失效且超过无人认领阈值（默认 `DEFAULT_ORPHAN_TAKEOVER_HOURS=6h`，可由 `DELEGATE_ORPHAN_TAKEOVER_HOURS` 配置）时拦截接盘，否则只计数不拦；无更高优阻断且本仓库有空闲位时，工作项老化提醒只拦最近 `add`/`wait`/`start --work` 的负责会话（未记录或负责会话失效超时后才允许接手），`<state>/work-remind.json` 按「项 × 会话」维护 6h 冷却；延后统一走 `delegate work defer`，每次拦截写入 `<state>/stop-hook.jsonl` 供 `delegate hook stats` 统计。已 clean/归档的 run 不再影响工作项状态，零改动交付在工作表里显示为「已收取」。
-- **自动迁移**：升级或读写 `work.jsonl` 时自动幂等迁入已登记仓库未完成的 `notes.json`（入 `verify`）与未过期的历史 `deferred.tsv`（入 `deferred`），Stop hook 不再读取 `deferred.tsv`；`delegate note` 保留为薄壳读写 `work.jsonl`。
+- **自动迁移**：升级或读写 `work.jsonl` 时自动幂等迁入已登记仓库未完成的 `notes.json`（入 `verify`）与未过期的历史 `deferred.tsv`（入 `deferred`），遇旧 `manual:` 前置一次性去掉、原文按「原手动前置：…」追加进 `followup`、无其他未满足前置即转 `ready` 并写回与记一条 `work_migrated` 事件；Stop hook 不再读取 `deferred.tsv`；`delegate note` 保留为薄壳读写 `work.jsonl`。

@@ -31,7 +31,7 @@ const OWNER_WAIT_KEYWORDS: [&str; 8] = [
     "点头", "确认", "真机", "对外", "发布", "删除", "不可逆", "所有者",
 ];
 const OWNER_WAIT_WARNING: &str =
-    "这项像要所有者点头或等前置，仍放进就绪；若是，加 --needs-owner nod 或 --wait-manual \"…\"";
+    "这项像要所有者点头或等前置，仍放进就绪；若是，加 --needs-owner nod 或 --after-applied / --after-time";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OwnerInfo {
@@ -301,6 +301,21 @@ impl WorkItem {
             || !self.verify_on.is_empty()
             || !self.artifacts.is_empty()
             || self.pending_followups() > 0
+    }
+
+    /// True when an open non-direction owner item lacks any of the four required fields
+    /// (`ask`, `recommendation`, `if_undecided`, `cost`).
+    pub fn is_missing_owner_fields(&self) -> bool {
+        let Some(ow) = &self.owner else {
+            return false;
+        };
+        if self.state == "done" || ow.kind == "direction" {
+            return false;
+        }
+        ow.ask.trim().is_empty()
+            || ow.recommendation.trim().is_empty()
+            || ow.if_undecided.trim().is_empty()
+            || ow.cost.trim().is_empty()
     }
 
     pub fn repo_label(&self) -> String {
@@ -619,7 +634,7 @@ fn next_id_locked(state: &Path, items: &[WorkItem]) -> String {
     next_id_impl(state, items, true)
 }
 
-fn load_raw(state: &Path) -> Vec<WorkItem> {
+fn load_raw_unmigrated(state: &Path) -> Vec<WorkItem> {
     let path = work_path(state);
     let Ok(f) = OpenOptions::new().read(true).open(path) else {
         return Vec::new();
@@ -637,6 +652,150 @@ fn load_raw(state: &Path) -> Vec<WorkItem> {
             }
         }
     }
+    items
+}
+
+struct ManualMigrationRecord {
+    id: String,
+    repo: String,
+    removed: Vec<String>,
+    state: String,
+}
+
+fn strip_legacy_manual_waits(
+    state: &Path,
+    items: &mut [WorkItem],
+    prefetch: Option<&ReconcilePrefetch>,
+) -> Vec<ManualMigrationRecord> {
+    let now_epoch = epoch() as i64;
+    let now_iso = iso();
+    let snapshot: Vec<WorkItem> = items.to_vec();
+    let mut records = Vec::new();
+
+    for item in items.iter_mut() {
+        let mut removed = Vec::new();
+        let mut kept = Vec::new();
+        for cond in item.wait_on.drain(..) {
+            if cond.starts_with("manual:") {
+                removed.push(cond);
+            } else {
+                kept.push(cond);
+            }
+        }
+        item.wait_on = kept;
+        if removed.is_empty() {
+            continue;
+        }
+
+        let base_fid = item.followups.iter().map(|f| f.id).max().unwrap_or(0);
+        for (idx, raw) in removed.iter().enumerate() {
+            let note = raw
+                .strip_prefix("manual:")
+                .unwrap_or(raw)
+                .replace(['\n', '\r'], " ");
+            let text = format!("原手动前置：{}", note.trim());
+            item.followups.push(FollowupItem {
+                id: base_fid + idx + 1,
+                kind: "note".to_string(),
+                text,
+                anchor: String::new(),
+                source_run: String::new(),
+                done: false,
+                created_at: now_iso.clone(),
+                done_at: None,
+            });
+        }
+
+        if item.state == "blocked" {
+            let all_remaining_ok = item.wait_on.is_empty()
+                || item.wait_on.iter().all(|c| {
+                    evaluate_condition_with_prefetch(
+                        c, item, &snapshot, state, now_epoch, prefetch,
+                    )
+                    .satisfied
+                });
+            if all_remaining_ok {
+                let target_st = match &item.owner {
+                    Some(ow) if ow.kind == "direction" => "active",
+                    Some(_) => "attention",
+                    None => "ready",
+                };
+                item.set_state(target_st, &now_iso);
+            }
+        }
+        item.updated_at = now_iso.clone();
+        records.push(ManualMigrationRecord {
+            id: item.id.clone(),
+            repo: item.repo.clone(),
+            removed,
+            state: item.state.clone(),
+        });
+    }
+    records
+}
+
+fn emit_manual_migration_event(state: &Path, records: &[ManualMigrationRecord]) {
+    if records.is_empty() {
+        return;
+    }
+    let work_ids: Vec<&str> = records.iter().map(|r| r.id.as_str()).collect();
+    let first_id = records[0].id.as_str();
+    let first_repo = records[0].repo.as_str();
+    let details: Vec<Value> = records
+        .iter()
+        .map(|r| {
+            json!({
+                "workId": r.id,
+                "removed": r.removed,
+                "state": r.state,
+            })
+        })
+        .collect();
+    let _ = events::emit_in(
+        state,
+        "",
+        first_repo,
+        "work_migrated",
+        json!({
+            "workId": first_id,
+            "workIds": work_ids,
+            "count": records.len(),
+            "reason": "manual_wait_removed",
+            "items": details,
+        }),
+    );
+}
+
+fn load_raw(state: &Path) -> Vec<WorkItem> {
+    let mut items = load_raw_unmigrated(state);
+    let has_manual = items
+        .iter()
+        .any(|w| w.wait_on.iter().any(|c| c.starts_with("manual:")));
+    if !has_manual {
+        return items;
+    }
+    if crate::locks::holding_state_lock() {
+        let migrated = strip_legacy_manual_waits(state, &mut items, None);
+        if !migrated.is_empty() {
+            let _ = save_raw(state, &items);
+            emit_manual_migration_event(state, &migrated);
+        }
+        return items;
+    }
+    let prefetch = prefetch_reconcile_conditions(state, &items, &[]);
+    if let Ok(_guard) = crate::locks::acquire_state(state) {
+        let mut locked_items = load_raw_unmigrated(state);
+        let migrated = strip_legacy_manual_waits(state, &mut locked_items, Some(&prefetch));
+        if !migrated.is_empty() {
+            let _ = save_raw(state, &locked_items);
+        }
+        drop(_guard);
+        if !migrated.is_empty() {
+            emit_manual_migration_event(state, &migrated);
+        }
+        return locked_items;
+    }
+    let _ = strip_legacy_manual_waits(state, &mut items, Some(&prefetch));
     items
 }
 
@@ -1794,14 +1953,6 @@ fn evaluate_condition_with_prefetch(
             } else {
                 format!("等到 {ts_str}")
             },
-            pointer: String::new(),
-        };
-    }
-    if let Some(note) = cond.strip_prefix("manual:") {
-        return CondEval {
-            raw: cond.to_string(),
-            satisfied: false,
-            detail: format!("手动前置：{note}"),
             pointer: String::new(),
         };
     }
@@ -3877,6 +4028,25 @@ fn render_layer0_summary(counts: &HashMap<&str, usize>) -> String {
     )
 }
 
+fn waiting_work_for_owner<'a>(owner_id: &str, all_items: &'a [WorkItem]) -> Vec<&'a WorkItem> {
+    let mut waiters: Vec<&WorkItem> = all_items
+        .iter()
+        .filter(|w| {
+            w.owner.is_none()
+                && w.state != "done"
+                && w.wait_on.iter().any(|c| {
+                    c.strip_prefix("owner:").is_some_and(|raw| {
+                        let trimmed = raw.trim();
+                        normalize_work_id(trimmed).as_deref() == Some(owner_id)
+                            || trimmed.eq_ignore_ascii_case(owner_id)
+                    })
+                })
+        })
+        .collect();
+    waiters.sort_by(|a, b| a.id.cmp(&b.id));
+    waiters
+}
+
 fn render_card(item: &WorkItem, all_items: &[WorkItem], state: &Path, now_epoch: i64) -> String {
     let mut lines = Vec::new();
     let age = format_age(&item.state_since, now_epoch);
@@ -3910,6 +4080,20 @@ fn render_card(item: &WorkItem, all_items: &[WorkItem], state: &Path, now_epoch:
         }
         if !ow.cost.is_empty() {
             lines.push(format!("成本：{}", ow.cost));
+        }
+        let waiters = waiting_work_for_owner(&item.id, all_items);
+        if !waiters.is_empty() {
+            lines.push("在等它的工作：".to_string());
+            for w in waiters {
+                let mut parts = vec![format!("[{}] {}", w.id, w.title)];
+                if !w.done_when.trim().is_empty() {
+                    parts.push(format!("完成条件：{}", w.done_when.trim()));
+                }
+                if !w.brief.trim().is_empty() {
+                    parts.push(format!("说明：{}", w.brief.trim()));
+                }
+                lines.push(format!("  - {}", parts.join(" · ")));
+            }
         }
     }
     if !item.done_when.is_empty() {
@@ -4330,20 +4514,6 @@ fn parse_markdown_backlog(
         }
         if let Some(future_iso) = extract_future_mmdd(text, current_year, now_epoch) {
             wait_on.push(format!("after_time:{future_iso}"));
-        }
-
-        let sec_is_blocked = section.contains("前置")
-            || section.contains("等待")
-            || section.contains("阻塞")
-            || section.contains("所有者");
-        if wait_on.is_empty() && (sec_is_blocked || text.contains("合入后") || text.contains("回来后"))
-        {
-            let clause = text
-                .split(['：', '，', '。'])
-                .next()
-                .unwrap_or(text)
-                .trim();
-            wait_on.push(format!("manual:{}", clip_chars(clause, 28)));
         }
 
         let proposed_state = if !wait_on.is_empty() {
@@ -4821,7 +4991,12 @@ fn render_owner_list(
                 } else {
                     ow.ask.as_str()
                 };
-                println!("[{}] [{}] {}", w.id, w.repo_label(), ask);
+                let missing_tag = if w.is_missing_owner_fields() {
+                    " · 缺建议"
+                } else {
+                    ""
+                };
+                println!("[{}] [{}] {}{}", w.id, w.repo_label(), ask, missing_tag);
                 if !ow.recommendation.is_empty() {
                     println!("  建议：{}", ow.recommendation);
                 }
@@ -5126,13 +5301,6 @@ fn parse_wait_conditions(args: &[String], allow_clear: bool) -> Res<ParsedWaitAr
                 let iso_ts = parse_time_spec(&raw, now_epoch)?;
                 wf.wait_on.push(format!("after_time:{iso_ts}"));
             }
-            "--wait-manual" => {
-                let raw = take_val(key, &mut i)?;
-                if raw.trim().is_empty() {
-                    return Err("--wait-manual requires a non-empty description".into());
-                }
-                wf.wait_on.push(format!("manual:{}", raw.trim()));
-            }
             "--verify-on" => {
                 let raw = take_val(key, &mut i)?;
                 let cond = normalize_verify_condition(&raw)?;
@@ -5203,6 +5371,57 @@ fn build_auto_dispatch(brief: &str, start_args: &[String], repo: &str) -> Res<Au
     })
 }
 
+struct ValidatedOwnerFields {
+    ask: String,
+    recommendation: String,
+    if_undecided: String,
+    cost: String,
+}
+
+fn validate_owner_fields(
+    ask_raw: Option<&str>,
+    rec_raw: Option<&str>,
+    if_undecided_raw: Option<&str>,
+    cost_raw: Option<&str>,
+    title_to_differ: Option<&str>,
+) -> Res<ValidatedOwnerFields> {
+    let ask = ask_raw.map(str::trim).unwrap_or("");
+    let rec = rec_raw.map(str::trim).unwrap_or("");
+    let if_undecided = if_undecided_raw.map(str::trim).unwrap_or("");
+    let cost = cost_raw.map(str::trim).unwrap_or("");
+
+    let mut missing = Vec::new();
+    if ask.is_empty() {
+        missing.push("--ask");
+    }
+    if rec.is_empty() {
+        missing.push("--recommendation");
+    }
+    if if_undecided.is_empty() {
+        missing.push("--if-undecided");
+    }
+    if cost.is_empty() {
+        missing.push("--cost");
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "所有者事项缺少必填字段：{}",
+            missing.join("、")
+        ));
+    }
+    if let Some(t) = title_to_differ.map(str::trim).filter(|t| !t.is_empty()) {
+        if ask == t {
+            return Err("--ask 须写具体问句，不能直接等于标题".into());
+        }
+    }
+    Ok(ValidatedOwnerFields {
+        ask: ask.to_string(),
+        recommendation: rec.to_string(),
+        if_undecided: if_undecided.to_string(),
+        cost: cost.to_string(),
+    })
+}
+
 fn add_cmd(args: &[String]) -> Res<i32> {
     let ParsedWaitArgs {
         positional,
@@ -5222,27 +5441,12 @@ fn add_cmd(args: &[String]) -> Res<i32> {
         .get("--recommendation")
         .or_else(|| extra.get("--rec"))
         .and_then(|v| v.last())
-        .cloned()
-        .unwrap_or_default();
+        .cloned();
     let if_undecided_raw = extra
         .get("--if-undecided")
         .and_then(|v| v.last())
-        .cloned()
-        .unwrap_or_default();
-    let cost_raw = extra
-        .get("--cost")
-        .and_then(|v| v.last())
-        .cloned()
-        .unwrap_or_default();
-
-    let is_owner_item = owner_kind_raw.is_some()
-        || ask_raw.is_some()
-        || !rec_raw.is_empty()
-        || !if_undecided_raw.is_empty()
-        || !cost_raw.is_empty()
-        || explicit_id_raw
-            .as_deref()
-            .is_some_and(is_owner_id);
+        .cloned();
+    let cost_raw = extra.get("--cost").and_then(|v| v.last()).cloned();
 
     let needs_owner_kind = match extra.get("--needs-owner").and_then(|v| v.last()) {
         Some(raw) => {
@@ -5253,7 +5457,9 @@ fn add_cmd(args: &[String]) -> Res<i32> {
                     NEEDS_OWNER_KINDS.join("|")
                 ));
             }
-            if is_owner_item {
+            if owner_kind_raw.is_some()
+                || explicit_id_raw.as_deref().is_some_and(is_owner_id)
+            {
                 return Err("--needs-owner cannot be combined with --owner-kind".into());
             }
             Some(k.to_string())
@@ -5261,8 +5467,16 @@ fn add_cmd(args: &[String]) -> Res<i32> {
         None => None,
     };
 
+    let is_owner_item = needs_owner_kind.is_none()
+        && (owner_kind_raw.is_some()
+            || ask_raw.is_some()
+            || rec_raw.is_some()
+            || if_undecided_raw.is_some()
+            || cost_raw.is_some()
+            || explicit_id_raw.as_deref().is_some_and(is_owner_id));
+
     let pos_title = positional.join(" ").trim().to_string();
-    let (title, owner_info) = if is_owner_item {
+    let (title, owner_info, needs_owner_fields) = if is_owner_item {
         let kind = owner_kind_raw
             .as_deref()
             .map(str::trim)
@@ -5274,35 +5488,77 @@ fn add_cmd(args: &[String]) -> Res<i32> {
                 OWNER_KINDS.join("|")
             ));
         }
-        let ask = ask_raw
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| pos_title.clone());
-        let final_title = if pos_title.is_empty() {
-            ask.clone()
+        if kind == "direction" {
+            let ask = ask_raw
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| pos_title.clone());
+            let final_title = if pos_title.is_empty() {
+                ask.clone()
+            } else {
+                pos_title
+            };
+            if final_title.is_empty() {
+                return Err("usage: delegate work add --owner-kind direction --ask \"<方向问题>\" [--qid D003] [--brief <path>]".into());
+            }
+            (
+                final_title,
+                Some(OwnerInfo {
+                    kind: kind.to_string(),
+                    ask,
+                    recommendation: rec_raw.as_deref().map(str::trim).unwrap_or("").to_string(),
+                    if_undecided: if_undecided_raw
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .to_string(),
+                    cost: cost_raw.as_deref().map(str::trim).unwrap_or("").to_string(),
+                }),
+                None,
+            )
         } else {
-            pos_title
-        };
-        if final_title.is_empty() {
-            return Err("usage: delegate work add --owner-kind <act|nod|card|direction> --ask \"<要所有者回答什么>\" [--qid Q20|D003] [--recommendation \"…\"] [--if-undecided \"…\"] [--cost \"…\"] [--brief <path>]".into());
+            let validated = validate_owner_fields(
+                ask_raw.as_deref(),
+                rec_raw.as_deref(),
+                if_undecided_raw.as_deref(),
+                cost_raw.as_deref(),
+                (!pos_title.is_empty()).then_some(pos_title.as_str()),
+            )?;
+            let final_title = if pos_title.is_empty() {
+                validated.ask.clone()
+            } else {
+                pos_title
+            };
+            (
+                final_title,
+                Some(OwnerInfo {
+                    kind: kind.to_string(),
+                    ask: validated.ask,
+                    recommendation: validated.recommendation,
+                    if_undecided: validated.if_undecided,
+                    cost: validated.cost,
+                }),
+                None,
+            )
         }
-        (
-            final_title,
-            Some(OwnerInfo {
-                kind: kind.to_string(),
-                ask,
-                recommendation: rec_raw.trim().to_string(),
-                if_undecided: if_undecided_raw.trim().to_string(),
-                cost: cost_raw.trim().to_string(),
-            }),
-        )
     } else {
         if pos_title.is_empty() {
-            return Err("usage: delegate work add \"<title>\" [--done-when \"…\"] [--brief <path>] [--after-applied <run>] [--wait-owner <Qxx>] [--auto -- <start-args>]".into());
+            return Err("usage: delegate work add \"<title>\" [--done-when \"…\"] [--brief <path>] [--after-applied <run>] [--wait-owner <Qxx>] [--needs-owner nod|act|card --ask \"…\" --recommendation \"…\" --if-undecided \"…\" --cost \"…\"] [--auto -- <start-args>]".into());
         }
-        (pos_title, None)
+        let no_fields = if needs_owner_kind.is_some() {
+            Some(validate_owner_fields(
+                ask_raw.as_deref(),
+                rec_raw.as_deref(),
+                if_undecided_raw.as_deref(),
+                cost_raw.as_deref(),
+                Some(pos_title.as_str()),
+            )?)
+        } else {
+            None
+        };
+        (pos_title, None, no_fields)
     };
 
     let explicit_id = if let Some(raw_id) = explicit_id_raw {
@@ -5363,7 +5619,9 @@ fn add_cmd(args: &[String]) -> Res<i32> {
 
         let mut wait_on = wf.wait_on;
         let mut owner_ref = wf.owner_ref.unwrap_or_default();
-        let created_q = if let Some(ref kind) = needs_owner_kind {
+        let created_q = if let (Some(ref kind), Some(ref nf)) =
+            (&needs_owner_kind, &needs_owner_fields)
+        {
             let qid = next_owner_id(&items, kind);
             let q_item = WorkItem {
                 id: qid.clone(),
@@ -5372,10 +5630,10 @@ fn add_cmd(args: &[String]) -> Res<i32> {
                 state: "attention".to_string(),
                 owner: Some(OwnerInfo {
                     kind: kind.clone(),
-                    ask: title.clone(),
-                    recommendation: String::new(),
-                    if_undecided: String::new(),
-                    cost: String::new(),
+                    ask: nf.ask.clone(),
+                    recommendation: nf.recommendation.clone(),
+                    if_undecided: nf.if_undecided.clone(),
+                    cost: nf.cost.clone(),
                 }),
                 created_at: now_iso.clone(),
                 updated_at: now_iso.clone(),
@@ -5530,20 +5788,52 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
     } = parse_wait_conditions(args, true)?;
     let raw_id = positional
         .first()
-        .ok_or("usage: delegate work wait <Wxx> --after-applied <run> [--brief <FILE>] [--auto -- <start-args>]")?;
+        .ok_or("usage: delegate work wait <Wxx|Qxx> --after-applied <run>|--after-time <TIME>|--needs-owner nod|act|card [--brief <FILE>] [--auto -- <start-args>]")?;
     let norm = normalize_work_id(raw_id)
-        .ok_or_else(|| format!("invalid work id '{raw_id}' (expected W001...)"))?;
+        .ok_or_else(|| format!("invalid work id '{raw_id}' (expected W001... / Q01...)"))?;
+
+    let needs_owner_kind = match extra.get("--needs-owner").and_then(|v| v.last()) {
+        Some(raw) => {
+            let k = raw.trim();
+            if !NEEDS_OWNER_KINDS.contains(&k) {
+                return Err(format!(
+                    "invalid --needs-owner '{k}' (expected: {})",
+                    NEEDS_OWNER_KINDS.join("|")
+                ));
+            }
+            Some(k.to_string())
+        }
+        None => None,
+    };
+    let ask_raw = extra.get("--ask").and_then(|v| v.last()).cloned();
+    let rec_raw = extra
+        .get("--recommendation")
+        .or_else(|| extra.get("--rec"))
+        .and_then(|v| v.last())
+        .cloned();
+    let if_undecided_raw = extra
+        .get("--if-undecided")
+        .and_then(|v| v.last())
+        .cloned();
+    let cost_raw = extra.get("--cost").and_then(|v| v.last()).cloned();
+    let has_owner_field_updates = ask_raw.is_some()
+        || rec_raw.is_some()
+        || if_undecided_raw.is_some()
+        || cost_raw.is_some();
+
     if !wf.clear_wait
         && wf.wait_on.is_empty()
         && wf.verify_on.is_empty()
         && wf.brief.is_none()
         && !wf.auto
         && !extra.contains_key("--artifact")
+        && needs_owner_kind.is_none()
+        && !has_owner_field_updates
     {
-        return Err("work wait requires at least one condition (--after-applied / --after-delivered / --after-work / --wait-owner / --after-time / --wait-manual / --verify-on / --brief / --clear)".into());
+        return Err("work wait requires at least one condition (--after-applied / --after-delivered / --after-work / --wait-owner / --needs-owner / --after-time / --verify-on / --brief / --ask / --recommendation / --if-undecided / --cost / --clear)".into());
     }
 
-    let recorded_wait_on = !wf.wait_on.is_empty();
+    let recorded_wait_on = !wf.wait_on.is_empty() || needs_owner_kind.is_some();
     let state = state_dir();
     touch_caller_session();
     let cur_caller = caller();
@@ -5563,7 +5853,7 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
             .collect();
         prefetch_reconcile_conditions(&state, &existing, &extra_conds)
     };
-    let outcome = {
+    let (created_owner_id, outcome) = {
         let _guard = crate::locks::acquire_state(&state).map_err(|e| e.to_string())?;
         let mut items = load_raw(&state);
         let _ = migrate_legacy_locked(&state, &mut items);
@@ -5579,6 +5869,7 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
             return Err(format!("dependency cycle detected when updating '{norm}'"));
         }
         let repo = items[pos].repo.clone();
+        let target_title = items[pos].title.clone();
         let brief_eff = wf
             .brief
             .clone()
@@ -5589,12 +5880,88 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
             None
         };
 
+        let mut extra_wait_on: Vec<String> = Vec::new();
+        let mut extra_owner_ref: Option<String> = None;
+        let created_q = if let Some(ref kind) = needs_owner_kind {
+            if items[pos].owner.is_some() {
+                return Err("--needs-owner cannot be used on an owner item".into());
+            }
+            let validated = validate_owner_fields(
+                ask_raw.as_deref(),
+                rec_raw.as_deref(),
+                if_undecided_raw.as_deref(),
+                cost_raw.as_deref(),
+                Some(target_title.as_str()),
+            )?;
+            let qid = next_owner_id(&items, kind);
+            let q_item = WorkItem {
+                id: qid.clone(),
+                title: target_title,
+                repo: repo.clone(),
+                state: "attention".to_string(),
+                owner: Some(OwnerInfo {
+                    kind: kind.clone(),
+                    ask: validated.ask,
+                    recommendation: validated.recommendation,
+                    if_undecided: validated.if_undecided,
+                    cost: validated.cost,
+                }),
+                created_at: now_iso.clone(),
+                updated_at: now_iso.clone(),
+                state_since: now_iso.clone(),
+                origin: "manual".into(),
+                ..Default::default()
+            };
+            items.push(q_item);
+            extra_wait_on.push(format!("owner:{qid}"));
+            extra_owner_ref = Some(qid.clone());
+            Some(qid)
+        } else {
+            if has_owner_field_updates {
+                let Some(ow) = items[pos].owner.as_mut() else {
+                    return Err("--ask / --recommendation / --if-undecided / --cost 仅用于所有者事项（Q/D）或配合 --needs-owner 使用".into());
+                };
+                if let Some(ref raw) = ask_raw {
+                    let v = raw.trim();
+                    if v.is_empty() {
+                        return Err("--ask requires a non-empty question".into());
+                    }
+                    if ow.kind != "direction" && v == target_title.trim() {
+                        return Err("--ask 须写具体问句，不能直接等于标题".into());
+                    }
+                    ow.ask = v.to_string();
+                }
+                if let Some(ref raw) = rec_raw {
+                    let v = raw.trim();
+                    if v.is_empty() {
+                        return Err("--recommendation requires a non-empty value".into());
+                    }
+                    ow.recommendation = v.to_string();
+                }
+                if let Some(ref raw) = if_undecided_raw {
+                    let v = raw.trim();
+                    if v.is_empty() {
+                        return Err("--if-undecided requires a non-empty value".into());
+                    }
+                    ow.if_undecided = v.to_string();
+                }
+                if let Some(ref raw) = cost_raw {
+                    let v = raw.trim();
+                    if v.is_empty() {
+                        return Err("--cost requires a non-empty value".into());
+                    }
+                    ow.cost = v.to_string();
+                }
+            }
+            None
+        };
+
         let item = &mut items[pos];
         if wf.clear_wait {
             item.wait_on.clear();
             item.auto_dispatch = None;
         }
-        for c in &wf.wait_on {
+        for c in wf.wait_on.iter().chain(extra_wait_on.iter()) {
             if !item.wait_on.contains(c) {
                 item.wait_on.push(c.clone());
             }
@@ -5604,7 +5971,7 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
                 item.verify_on.push(c.clone());
             }
         }
-        if let Some(oref) = wf.owner_ref {
+        if let Some(oref) = wf.owner_ref.or(extra_owner_ref) {
             item.owner_ref = oref;
         }
         if let Some(b) = wf.brief {
@@ -5638,7 +6005,7 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
 
         let rec = reconcile_all_locked_with_prefetch(&state, &mut items, None, Some(&wait_prefetch));
         save_raw(&state, &items)?;
-        rec
+        (created_q, rec)
     };
 
     let _ = emit_reconcile_events_and_dispatch(&state, &outcome);
@@ -5651,12 +6018,17 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
     if json_mode {
         println!("{}", updated.to_json());
     } else {
+        let owner_note = created_owner_id
+            .as_ref()
+            .map(|qid| format!("（已建所有者项 [{qid}]）"))
+            .unwrap_or_default();
         println!(
-            "已更新 [{}] {} · 状态：{} · {}（卡片：delegate work show {}）",
+            "已更新 [{}] {} · 状态：{} · {}{}（卡片：delegate work show {}）",
             updated.id,
             updated.title,
             updated.state,
             focus_for_item(updated, &items, &state, now_epoch),
+            owner_note,
             updated.id
         );
     }
@@ -6534,7 +6906,7 @@ mod tests {
         fs::create_dir_all(&runs_dir).unwrap();
         notes::register_repo_paths(&state, &repo, &runs_dir);
 
-        // 1) W038-like item: manual wait_on + a live zero-change delivered write run
+        // 1) W038-like item: structured wait_on + a live zero-change delivered write run
         let r0 = runs_dir.join("20261123-100000-zero");
         fs::create_dir_all(&r0).unwrap();
         write_json(
@@ -6558,7 +6930,7 @@ mod tests {
             title: "Phase 0 收尾".into(),
             repo: repo.to_string_lossy().into_owned(),
             state: "attention".into(), // simulate stale attention from pre-6.36
-            wait_on: vec!["manual:Phase 0 A/B 收集中".into()],
+            wait_on: vec!["after_time:2099-01-01T00:00:00Z".into()],
             created_at: "2026-11-23T08:00:00Z".into(),
             updated_at: "2026-11-23T08:00:00Z".into(),
             state_since: "2026-11-23T08:00:00Z".into(),
@@ -6621,7 +6993,7 @@ mod tests {
             title: "已归档项".into(),
             repo: repo.to_string_lossy().into_owned(),
             state: "attention".into(),
-            wait_on: vec!["manual:等待外部".into()],
+            wait_on: vec!["after_time:2099-01-01T00:00:00Z".into()],
             cleaned: true,
             created_at: "2026-11-23T07:00:00Z".into(),
             updated_at: "2026-11-23T07:00:00Z".into(),
@@ -6634,9 +7006,9 @@ mod tests {
         let now_epoch = epoch() as i64;
         reconcile_all_locked(&state, &mut items);
 
-        assert_eq!(items[0].state, "blocked", "W038 must honor manual wait_on, not attention");
+        assert_eq!(items[0].state, "blocked", "W038 must honor wait_on, not attention");
         assert!(
-            focus_for_item(&items[0], &items, &state, now_epoch).contains("Phase 0 A/B 收集中")
+            focus_for_item(&items[0], &items, &state, now_epoch).contains("2099-01-01")
         );
 
         assert_eq!(items[1].state, "verify", "live zero-change delivery should move to verify");
@@ -6988,6 +7360,192 @@ mod tests {
             let _guard = crate::locks::acquire_state(&state).unwrap();
             let _ = reconcile_all_locked(&state, &mut items);
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_legacy_manual_wait_strips_appends_followup_and_emits_event() {
+        let dir = temp_dir("migrate-manual-wait");
+        let state = dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+
+        let legacy_items = vec![
+            WorkItem {
+                id: "W001".into(),
+                title: "仅手动前置项".into(),
+                repo: "/tmp/demo".into(),
+                state: "blocked".into(),
+                wait_on: vec!["manual:等发版窗口\n第二行".into()],
+                created_at: "2026-11-20T08:00:00Z".into(),
+                updated_at: "2026-11-20T08:00:00Z".into(),
+                state_since: "2026-11-20T08:00:00Z".into(),
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W002".into(),
+                title: "混合前置项".into(),
+                repo: "/tmp/demo".into(),
+                state: "blocked".into(),
+                wait_on: vec![
+                    "manual:等接口上线".into(),
+                    "after_time:2099-01-01T00:00:00Z".into(),
+                ],
+                created_at: "2026-11-20T08:00:00Z".into(),
+                updated_at: "2026-11-20T08:00:00Z".into(),
+                state_since: "2026-11-20T08:00:00Z".into(),
+                ..Default::default()
+            },
+        ];
+        save_raw(&state, &legacy_items).unwrap();
+
+        // First read rewrites work.jsonl once and emits one `work_migrated` event.
+        let migrated = load_raw(&state);
+        assert_eq!(migrated.len(), 2);
+        assert!(migrated[0].wait_on.is_empty());
+        assert_eq!(migrated[0].state, "ready");
+        assert_eq!(migrated[0].followups.len(), 1);
+        assert_eq!(migrated[0].followups[0].text, "原手动前置：等发版窗口 第二行");
+        assert!(!migrated[0].followups[0].text.contains('\n'));
+
+        assert_eq!(migrated[1].wait_on, vec!["after_time:2099-01-01T00:00:00Z"]);
+        assert_eq!(migrated[1].state, "blocked");
+        assert_eq!(migrated[1].followups.len(), 1);
+        assert_eq!(migrated[1].followups[0].text, "原手动前置：等接口上线");
+
+        // On-disk work.jsonl has no manual: left.
+        let disk_text = fs::read_to_string(work_path(&state)).unwrap();
+        assert!(!disk_text.contains("manual:"), "{disk_text}");
+        assert!(disk_text.contains("原手动前置：等发版窗口 第二行"), "{disk_text}");
+
+        let ev_lines: Vec<Value> = fs::read_to_string(state.join("events.jsonl"))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(ev_lines.len(), 1, "{ev_lines:?}");
+        assert_eq!(ev_lines[0]["kind"], "work_migrated");
+        assert_eq!(ev_lines[0]["payload"]["reason"], "manual_wait_removed");
+        assert_eq!(ev_lines[0]["payload"]["workIds"], json!(["W001", "W002"]));
+
+        // Second read is idempotent: no duplicate followup and no second event.
+        let again = load_raw(&state);
+        assert_eq!(again[0].followups.len(), 1);
+        let ev_lines2: Vec<String> = fs::read_to_string(state.join("events.jsonl"))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect();
+        assert_eq!(ev_lines2.len(), 1);
+
+        // After migration, code no longer recognizes `manual:` in evaluate_condition.
+        let ev = evaluate_condition("manual:legacy", &again[0], &again, &state, epoch() as i64);
+        assert!(ev.detail.starts_with("未知前置："), "{}", ev.detail);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_owner_fields_rejects_missing_and_title_copy() {
+        let err = validate_owner_fields(None, Some("建议 A"), None, Some("1 天"), Some("发布审批"))
+            .err()
+            .expect("must reject missing fields");
+        assert!(err.contains("--ask"), "{err}");
+        assert!(err.contains("--if-undecided"), "{err}");
+        assert!(!err.contains("--recommendation"), "{err}");
+        assert!(!err.contains("--cost"), "{err}");
+
+        let same_err = validate_owner_fields(
+            Some("发布审批"),
+            Some("建议 A"),
+            Some("延期"),
+            Some("1 天"),
+            Some("发布审批"),
+        )
+        .err()
+        .expect("must reject ask == title");
+        assert!(same_err.contains("不能直接等于标题"), "{same_err}");
+
+        let ok = validate_owner_fields(
+            Some("是否批准对外发布？"),
+            Some("建议批准"),
+            Some("顺延至下周"),
+            Some("零成本"),
+            Some("发布审批"),
+        )
+        .expect("valid fields");
+        assert_eq!(ok.ask, "是否批准对外发布？");
+        assert_eq!(ok.recommendation, "建议批准");
+        assert_eq!(ok.if_undecided, "顺延至下周");
+        assert_eq!(ok.cost, "零成本");
+    }
+
+    #[test]
+    fn render_card_owner_snapshot_shows_waiting_work_items() {
+        let dir = temp_dir("owner-card-snapshot");
+        let state = dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+
+        let q10 = WorkItem {
+            id: "Q10".into(),
+            title: "路由方案选型".into(),
+            repo: "/tmp/demo-app".into(),
+            state: "attention".into(),
+            owner: Some(OwnerInfo {
+                kind: "nod".into(),
+                ask: "是否采用方案 A 切换路由？".into(),
+                recommendation: "建议选方案 A，回滚成本低".into(),
+                if_undecided: "继续使用旧路由".into(),
+                cost: "半天开发".into(),
+            }),
+            created_at: "2026-11-24T10:00:00Z".into(),
+            updated_at: "2026-11-24T10:00:00Z".into(),
+            state_since: "2026-11-24T10:00:00Z".into(),
+            ..Default::default()
+        };
+        let w1 = WorkItem {
+            id: "W001".into(),
+            title: "接入新路由".into(),
+            repo: "/tmp/demo-app".into(),
+            state: "blocked".into(),
+            done_when: "全量单测与灰度通过".into(),
+            brief: "docs/plan/routing-a.md".into(),
+            wait_on: vec!["owner:Q10".into()],
+            ..Default::default()
+        };
+        let w2 = WorkItem {
+            id: "W002".into(),
+            title: "清理旧路由配置".into(),
+            repo: "/tmp/demo-app".into(),
+            state: "blocked".into(),
+            done_when: "删除旧配置并跑通冒烟".into(),
+            wait_on: vec!["owner:q10".into()],
+            ..Default::default()
+        };
+        let w3_done = WorkItem {
+            id: "W003".into(),
+            title: "已关闭旧项".into(),
+            repo: "/tmp/demo-app".into(),
+            state: "done".into(),
+            wait_on: vec!["owner:Q10".into()],
+            ..Default::default()
+        };
+        let all = vec![q10.clone(), w1, w2, w3_done];
+        let now_ep = parse_iso_or_date_epoch("2026-11-24T12:00:00Z").unwrap();
+        let card = render_card(&q10, &all, &state, now_ep);
+        let expected = "\
+[Q10] 路由方案选型 · [demo-app] · 状态：attention（已停留 2h）
+所有者事项：点头（nod）
+要你回答：是否采用方案 A 切换路由？
+主控建议：建议选方案 A，回滚成本低
+不定会怎样：继续使用旧路由
+成本：半天开发
+在等它的工作：
+  - [W001] 接入新路由 · 完成条件：全量单测与灰度通过 · 说明：docs/plan/routing-a.md
+  - [W002] 清理旧路由配置 · 完成条件：删除旧配置并跑通冒烟";
+        assert_eq!(card, expected);
 
         let _ = fs::remove_dir_all(&dir);
     }

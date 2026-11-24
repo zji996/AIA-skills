@@ -243,15 +243,15 @@ class Delegate636Tests(unittest.TestCase):
     def test_w044_worktable_cleaned_and_zero_change_deliveries(self):
         repo = self.repo({"a.txt": "v0\n"})
 
-        # W038 scenario: work item with manual precondition + archived zero-change write run
+        # W038 scenario: work item with structured wait_on precondition + archived zero-change write run
         add = self.cli(
             "work",
             "add",
             "Phase 0 A/B 观察",
             "--repo",
             repo,
-            "--wait-manual",
-            "Phase 0 A/B 收集中",
+            "--after-time",
+            "2099-01-01",
             "--json",
             cwd=repo,
             human=True,
@@ -284,7 +284,7 @@ class Delegate636Tests(unittest.TestCase):
         self.assertEqual(self.cli("clean", "--force", r0["run"], cwd=repo, human=True).returncode, 0)
         w_after = json.loads(self.cli("work", "show", wid, "--json", cwd=repo, human=True).stdout)
         self.assertEqual(w_after["state"], "blocked", w_after)
-        self.assertIn("Phase 0 A/B 收集中", w_after["focus"])
+        self.assertIn("2099-01-01", w_after["focus"])
 
         # Live zero-change delivery on a work item without wait_on -> verify + focus `已收取`
         add2 = self.cli("work", "add", "零改动核对", "--repo", repo, "--json", cwd=repo, human=True)

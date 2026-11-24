@@ -1010,6 +1010,19 @@ impl WorkItem {
         self.owner.is_none() && self.state == "ready" && self.brief.trim().is_empty()
     }
 
+    pub fn is_missing_owner_advice(&self) -> bool {
+        let Some(ow) = &self.owner else {
+            return false;
+        };
+        if self.state == "done" || ow.kind == OwnerKind::Direction {
+            return false;
+        }
+        ow.ask.trim().is_empty()
+            || ow.recommendation.trim().is_empty()
+            || ow.if_undecided.trim().is_empty()
+            || ow.cost.trim().is_empty()
+    }
+
     pub fn matches_filter(&self, query_lower: &str) -> bool {
         if query_lower.is_empty() {
             return true;
@@ -1572,8 +1585,6 @@ fn format_raw_wait(raw: &str) -> String {
         format!("等 {run_ref} 交付")
     } else if let Some(ts) = raw.strip_prefix("after_time:") {
         format!("等到 {}", &ts[..ts.len().min(10)])
-    } else if let Some(m) = raw.strip_prefix("manual:") {
-        format!("手动：{m}")
     } else {
         raw.to_string()
     }

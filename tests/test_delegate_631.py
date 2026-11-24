@@ -426,7 +426,7 @@ class Delegate631Tests(unittest.TestCase):
         brief = repo / "docs/ready-brief.md"
         brief.parent.mkdir(parents=True, exist_ok=True)
         brief.write_text("# Ready Brief\n")
-        self.assertEqual(self.cli("work", "add", "远期阻塞", "--repo", repo, "--wait-manual", "等发版", human=True).returncode, 0)
+        self.assertEqual(self.cli("work", "add", "远期阻塞", "--repo", repo, "--after-time", "2099-01-01", human=True).returncode, 0)
         self.assertEqual(self.cli("work", "add", "积压就绪", "--repo", repo, "--brief", str(brief), human=True).returncode, 0)
         self.assertEqual(self.cli("apply", r_old["run"], human=True).returncode, 0)
         self.assertEqual(self.cli("note", r_old["run"], "合入后看一眼监控", human=True).returncode, 0)

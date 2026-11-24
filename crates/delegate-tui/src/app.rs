@@ -813,7 +813,6 @@ impl App {
                 } else if cond.starts_with("owner:")
                     || cond.starts_with("run_delivered:")
                     || cond.starts_with("after_time:")
-                    || cond.starts_with("manual:")
                 {
                     dep_count += 1;
                 }
@@ -2918,7 +2917,7 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-fn normalize_wid_for_match(raw: &str) -> String {
+pub(crate) fn normalize_wid_for_match(raw: &str) -> String {
     let t = raw.trim();
     for (up, low, pad) in [('W', 'w', 3usize), ('Q', 'q', 2usize), ('D', 'd', 3usize)] {
         if let Some(rest) = t.strip_prefix(up).or_else(|| t.strip_prefix(low)) {

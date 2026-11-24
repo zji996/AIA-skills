@@ -4,6 +4,9 @@
 
 - `delegate`：Stop 钩子（`hooks/claude-code-stop.py`）补齐跨会话判旧与按负责会话隔离——保留 `cursors.json` 按 caller 独立游标且不改事件流/游标格式；交付/提问类事件若对应 run 已合入、已 clean、已回复或已被任一会话读过结论（`resultReadAt`）即判旧放行，非本会话发起的 run 仅在原 caller 会话已不在且超过无人认领阈值（默认 `DEFAULT_ORPHAN_TAKEOVER_HOURS=6h`，`DELEGATE_ORPHAN_TAKEOVER_HOURS` 可配）时拦截接盘，否则只计数不拦；工作项新增 `caller` 字段（由 `work add`/`work wait`/`start --work` 记录最近负责会话），老化提醒只拦负责会话（未记录或负责会话失效超时后才允许接手），`<state>/work-remind.json` 冷却改按「项 × 会话」记录，非负责会话不触发也不消耗负责会话冷却。
 - `delegate`：`lane` 结束时用 `wait4` / `getrusage(RUSAGE_CHILDREN)` 记录整棵子进程树的 `cpuUserSecs`、`cpuSysSecs` 与 `maxRssKb` 写入 `lane_released` 事件（不可得时写 `null`），并在 `delegate events` 人类视图与 `delegate lane --measure` 摘要中显示 CPU user/sys、墙钟与 CPU/墙钟 比（不改排队与令牌逻辑）。
+- `delegate`：工作表删除 `--wait-manual` 与 `manual:` 前置求值/显示，等待仅保留可判定前置（`--needs-owner`/`--after-applied`/`--after-delivered`/`--after-work`/`--wait-owner`/`--after-time`）与 `work defer --until`；读 `work.jsonl` 遇旧 `manual:` 前置一次性去掉、原文按「原手动前置：…」追加进 `followup`、无其他未满足前置即转 `ready` 并写回与记一条 `work_migrated` 事件；`work wait` 新增 `--needs-owner nod|act|card` 且同态重复不重置 `state_since`，同步更新 Stop 钩子与帮助文案。
+- `delegate`：所有者事项不许空着建——`--needs-owner`（`add`/`wait`）与非 `direction` `--owner-kind` 必须同时给 `--ask`（问句且不能等于标题）、`--recommendation`、`--if-undecided`、`--cost`（缺项拒绝并列出缺失参数），`work wait <Qxx>` 可用同名参数补齐既有 Q 项；`work show` 与 `delegate-tui` 的 Q 项卡片新增「在等它的工作」列出挂 `owner:<Qxx>` 的 W 项（标题、完成条件、说明路径，一行一个）；既有缺字段 Q 项不改写数据，在 `work list --owner` 与 TUI 行尾标「缺建议」。
+- `delegate`：`reply --minor` 去掉默认 10 分钟时限（显式 `--timeout` 照旧生效，长时间不动由 `stall_warning` 处理），保留不计返工次数与说明 ≤600 字语义。
 
 ## delegate 6.43.0 - 2026-11-24
 

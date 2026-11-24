@@ -3143,6 +3143,9 @@ fn work_item_tail_tags(item: &WorkItem, stale_info: Option<(u64, bool)>) -> Vec<
     if item.is_missing_brief() {
         tags.push((" 缺说明".to_string(), STATUS_PENDING));
     }
+    if item.is_missing_owner_advice() {
+        tags.push((" 缺建议".to_string(), STATUS_PENDING));
+    }
     tags
 }
 
@@ -3523,6 +3526,36 @@ fn build_work_card_lines(app: &App, item: &WorkItem, width: usize) -> Vec<Line<'
         }
         if !ow.cost.is_empty() {
             push_indented_wrapped(&mut out, "  ", &format!("成本：{}", ow.cost), width, muted());
+        }
+        let mut waiters: Vec<&WorkItem> = app
+            .snapshot
+            .work
+            .iter()
+            .filter(|w| {
+                w.owner.is_none()
+                    && w.state != "done"
+                    && w.wait_on.iter().any(|c| {
+                        c.strip_prefix("owner:").is_some_and(|raw| {
+                            let norm = crate::app::normalize_wid_for_match(raw);
+                            norm == item.id || raw.trim().eq_ignore_ascii_case(&item.id)
+                        })
+                    })
+            })
+            .collect();
+        waiters.sort_by(|a, b| a.id.cmp(&b.id));
+        if !waiters.is_empty() {
+            out.push(Line::raw(""));
+            out.push(section_header("在等它的工作"));
+            for w in waiters {
+                let mut parts = vec![format!("[{}] {}", w.id, w.title)];
+                if !w.done_when.trim().is_empty() {
+                    parts.push(format!("完成条件：{}", w.done_when.trim()));
+                }
+                if !w.brief.trim().is_empty() {
+                    parts.push(format!("说明：{}", w.brief.trim()));
+                }
+                push_indented_wrapped(&mut out, "  - ", &parts.join(" · "), width, primary());
+            }
         }
     }
 
