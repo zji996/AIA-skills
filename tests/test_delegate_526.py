@@ -104,11 +104,10 @@ class Delegate526Tests(unittest.TestCase):
         proc = subprocess.Popen([str(fixtures.DELEGATE), "lane", "sleep 2"], cwd=repo,
                                 env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            for _ in range(80):
-                busy = self.cli("busy", "pg", cwd=repo)
-                if busy.returncode == 0:
-                    break
-                time.sleep(.05)
+            busy = fixtures.wait_until(
+                lambda: r if (r := self.cli("busy", "pg", cwd=repo)).returncode == 0 else False,
+                "busy pg to report active lane command",
+            )
             self.assertEqual(busy.returncode, 0, busy.stderr)
             self.assertIn("sleep 2", busy.stdout)
         finally:

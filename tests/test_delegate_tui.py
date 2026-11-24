@@ -79,10 +79,7 @@ class DelegateTuiTests(unittest.TestCase):
         status = json.loads(self.cli("status", "--json", "--all", cwd=repo).stdout.splitlines()[0])
         run_id = status["run"]
         run_dir = Path(status["dir"])
-        for _ in range(100):
-            if (run_dir / "exit_code").is_file():
-                break
-            time.sleep(0.05)
+        fixtures.wait_until(lambda: (run_dir / "exit_code").is_file(), "peek-test run finished")
         self.assertTrue((run_dir / "result.md").is_file())
         self.assertFalse((run_dir / ".delivered").exists())
 

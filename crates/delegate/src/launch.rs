@@ -1956,13 +1956,13 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         o.work = Some(item.id);
     }
     o.share = strings(&meta["share"]);
-    let summary = json(parent.join("summary.json"));
     if active(&state(&parent)) {
         return Err(format!(
             "{} is still running; use reply --when-done to deliver after it settles, or wait before replying",
             parent.file_name().unwrap_or_default().to_string_lossy()
         ));
     }
+    let summary = json(parent.join("summary.json"));
     let after_apply = parent.join(".applied-cleaned").exists()
         || (crate::archive::is_record(&parent) && parent.join(".applied").exists());
     let compose_after_apply = after_apply && !o.fresh;
@@ -2463,8 +2463,9 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     }
     extra["sourceBuild"] = config.value["sourceBuild"].clone();
     extra["sourceBuildRoot"] = meta.get("sourceBuildRoot").cloned().unwrap_or(json!(top));
-    if runs::interrupted(s(&summary, "state")) && s(&meta, "mode") == "write" {
-        extra["continuation"] = json!(s(&summary, "state"));
+    let parent_state = runs::state(&parent);
+    if runs::interrupted(&parent_state) && s(&meta, "mode") == "write" {
+        extra["continuation"] = json!(parent_state);
     }
     if let Some((mode, report)) = synced {
         if report.synced {

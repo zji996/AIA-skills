@@ -312,10 +312,7 @@ print("local:" + " ".join(sys.argv[1:]))
                                 cwd=state["worktree"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
         marker = self.work / "remote-pids"
-        deadline = time.monotonic() + 10
-        while not marker.exists() and time.monotonic() < deadline:
-            time.sleep(.02)
-        self.assertTrue(marker.exists())
+        fixtures.wait_until(lambda: marker.exists(), "remote-pids marker", interval=0.02)
         pids = [int(p) for p in marker.read_text().split()]
         proc.send_signal(signal.SIGTERM)
         stdout, stderr = proc.communicate(timeout=10)
@@ -360,19 +357,16 @@ print("local:" + " ".join(sys.argv[1:]))
         first = subprocess.Popen([str(fixtures.DELEGATE), "_remote", str(run), "cargo", "sleep"],
                                  cwd=state["worktree"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(lambda: first.poll() is None and first.terminate())
-        deadline = time.monotonic() + 10
-        while not (self.work / "remote-pids").exists() and time.monotonic() < deadline:
-            time.sleep(.02)
-        self.assertTrue((self.work / "remote-pids").exists(), "remote must not queue behind local")
+        fixtures.wait_until(lambda: (self.work / "remote-pids").exists(), "remote must not queue behind local", interval=0.02)
         second = subprocess.Popen([str(fixtures.DELEGATE), "_remote", str(run), "cargo", "check"],
                                   cwd=state["worktree"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(lambda: second.poll() is None and second.terminate())
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            status = self.outcome(self.cli("status", state["run"]))
-            if status["remoteLane"]["queued"] == 1:
-                break
-            time.sleep(.02)
+        status = fixtures.wait_until(
+            lambda: st if (st := self.outcome(self.cli("status", state["run"]))).get("remoteLane", {}).get("queued") == 1 else False,
+            "second remote command queued",
+            timeout=10,
+            interval=0.02,
+        )
         self.assertEqual(status["remoteLane"]["queued"], 1)
         listing = self.cli("lane", cwd=state["worktree"]).stdout
         self.assertIn("remote running", listing)
@@ -445,10 +439,7 @@ os.execvp(a[0],a)
         proc = subprocess.Popen([str(fixtures.DELEGATE), "_remote", state["dir"], "cargo", "sleep"],
                                 cwd=state["worktree"], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(lambda: proc.poll() is None and proc.terminate())
-        deadline = time.monotonic() + 10
-        while not (self.work / "remote-pids").exists() and time.monotonic() < deadline:
-            time.sleep(.02)
-        self.assertTrue((self.work / "remote-pids").exists())
+        fixtures.wait_until(lambda: (self.work / "remote-pids").exists(), "remote-pids in slice", interval=0.02)
         proc.terminate()
         proc.communicate(timeout=10)
         self.assertEqual(proc.returncode, 143)

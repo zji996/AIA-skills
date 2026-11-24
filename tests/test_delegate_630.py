@@ -659,11 +659,10 @@ emit_answer('[{"title":"x","evidence":["README.md:1"],"suggestion":"s","cost":"ä
         )
         p2 = None
         try:
-            deadline = time.time() + 10
-            while time.time() < deadline:
-                if "first-build" in self.cli("lane", cwd=repo).stdout:
-                    break
-                time.sleep(0.05)
+            fixtures.wait_until(
+                lambda: "first-build" in self.cli("lane", cwd=repo).stdout,
+                "first-build lane ticket",
+            )
             p2 = subprocess.Popen(
                 [str(fixtures.DELEGATE), "lane", "--label", "second-build", "sleep 20"],
                 cwd=repo,
@@ -671,14 +670,10 @@ emit_answer('[{"title":"x","evidence":["README.md:1"],"suggestion":"s","cost":"ä
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            deadline = time.time() + 10
-            live_json = None
-            while time.time() < deadline:
-                data = json.loads(self.cli("lane", "--json", cwd=repo).stdout)
-                if len(data.get("pool", {}).get("leases", [])) >= 2:
-                    live_json = data
-                    break
-                time.sleep(0.05)
+            live_json = fixtures.wait_until(
+                lambda: d if len((d := json.loads(self.cli("lane", "--json", cwd=repo).stdout)).get("pool", {}).get("leases", [])) >= 2 else False,
+                "2 active jobserver leases",
+            )
             self.assertIsNotNone(live_json, "expected 2 active jobserver leases")
             leases = live_json["pool"]["leases"]
             self.assertEqual([l["rank"] for l in leases[:2]], [1, 2])

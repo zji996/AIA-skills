@@ -21,8 +21,13 @@ class V515Tests(unittest.TestCase):
         self.env["XDG_CONFIG_HOME"] = str(self.work / "config")
 
     fake_pi = fixtures.DelegateTests.fake_pi
+    start_gated = fixtures.DelegateTests.start_gated
     repo = fixtures.DelegateTests.repo
     until = fixtures.DelegateTests.until
+    wait_until = fixtures.DelegateTests.wait_until
+    wait_text = fixtures.DelegateTests.wait_text
+    wait_json = fixtures.DelegateTests.wait_json
+    wait_gone = fixtures.DelegateTests.wait_gone
     outcome = fixtures.DelegateTests.outcome
 
     def cli(self, *args, human=False, **kwargs):
@@ -455,15 +460,16 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
 
     def test_timeout_continuations_keep_rework_budget_and_copyable_next(self):
         repo = self.repo({"a.txt": "old\n"})
+        self.env["DELEGATE_CGROUP"] = "0"
         self.env["DELEGATE_TIMEOUT_GRACE"] = "0"
-        self.fake_pi([fixtures.answer("later"), fixtures.SETTLED], pre="echo partial >> a.txt", sleep=15)
+        self.fake_pi([fixtures.answer("later"), fixtures.SETTLED], pre="echo partial >> a.txt", gate=True)
         first = self.outcome(self.cli("run", "--worktree", "--workdir", repo,
                                      "--name", "job", "--timeout", "2s", "task"))
         self.assertEqual(first["state"], "timeout")
         self.assertTrue(first["next"].startswith(str(fixtures.DELEGATE) + " reply "))
         self.assertIn("不计返工次数", self.cli("status", first["run"], human=True).stdout)
         for _ in range(2):
-            self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="seq 1 80 >> a.txt", sleep=15)
+            self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="seq 1 80 >> a.txt", gate=True)
             continued = self.outcome(self.cli("reply", "--wait", "job", "continue"))
             self.assertEqual(continued["state"], "timeout")
             meta = json.loads((Path(continued["dir"]) / "meta.json").read_text())
@@ -471,7 +477,7 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
             self.assertEqual(meta["rework"]["used"], 0)
             self.assertEqual(continued["worktree"], first["worktree"])
         self.fake_pi([fixtures.answer("finished"), fixtures.SETTLED], pre="echo finished >> a.txt")
-        continued = self.outcome(self.cli("reply", "--wait", "--timeout", "5s", "job", "continue"))
+        continued = self.outcome(self.cli("reply", "--wait", "--timeout", "30s", "job", "continue"))
         self.assertEqual(continued["state"], "answered")
         self.fake_pi([fixtures.answer("fixed"), fixtures.SETTLED], pre="echo fixed >> a.txt")
         rework = self.outcome(self.cli("reply", "--wait", "job", "fix"))
@@ -482,15 +488,16 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
 
     def test_timeout_continuation_allowed_after_rework_budget_is_spent(self):
         repo = self.repo({"a.txt": "old\n"})
+        self.env["DELEGATE_CGROUP"] = "0"
         self.env["DELEGATE_TIMEOUT_GRACE"] = "0"
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo first >> a.txt")
         self.outcome(self.cli("run", "--worktree", "--workdir", repo,
                              "--name", "job", "--accept", "false", "task"))
-        self.fake_pi([fixtures.answer("later"), fixtures.SETTLED], pre="echo fix >> a.txt", sleep=15)
+        self.fake_pi([fixtures.answer("later"), fixtures.SETTLED], pre="echo fix >> a.txt", gate=True)
         timed = self.outcome(self.cli("reply", "--wait", "--timeout", "2s", "job", "fix"))
         self.assertEqual(timed["state"], "timeout")
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="seq 1 80 >> a.txt")
-        continued = self.outcome(self.cli("reply", "--wait", "--minor", "--timeout", "5s", "job", "continue"))
+        continued = self.outcome(self.cli("reply", "--wait", "--minor", "--timeout", "30s", "job", "continue"))
         self.assertEqual(continued["state"], "rejected")
         meta = json.loads((Path(continued["dir"]) / "meta.json").read_text())
         self.assertEqual(meta["continuation"], "timeout")
@@ -501,29 +508,30 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
 
     def test_stopped_continuation_allowed_after_rework_budget_is_spent(self):
         repo = self.repo({"a.txt": "old\n"})
+        self.env["DELEGATE_CGROUP"] = "0"
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo first >> a.txt")
         self.outcome(self.cli("run", "--worktree", "--workdir", repo,
                              "--name", "job", "--accept", "false", "task"))
-        self.fake_pi([fixtures.answer("later"), fixtures.SETTLED], pre="echo fix >> a.txt", sleep=30)
+        self.fake_pi([fixtures.answer("later"), fixtures.SETTLED], pre="echo fix >> a.txt", gate=True)
         started = self.outcome(self.cli("reply", "job", "fix"))
-        # 6.32.0: async `reply` returns in <50ms before `pi` starts; wait until fake_pi has
-        # created its session file and run `pre` (entering `sleep 30`) before stopping, otherwise
-        # under high load `stop` can kill fake_pi before a session is saved and `runs::latest`
-        # walks back to the rejected parent round.
+        started_dir = Path(started["dir"])
+        self.addCleanup(lambda: (
+            (started_dir / ".fake-gate").touch() if started_dir.exists() else None,
+            self.cli("stop", started["run"]) if started_dir.exists() else None,
+        ))
+        # Wait until fake_pi finished session creation & pre-edit and entered the gate before stopping.
         self.until(
-            lambda: (Path(started["dir"]) / "agent.pid").is_file()
-            and any((Path(started["dir"]) / "session").glob("t_f*.jsonl"))
-            and "fix" in (Path(started["worktree"]) / "a.txt").read_text(),
-            "agent session and pre-hook ready",
+            lambda: (started_dir / ".fake-ready").is_file() and (started_dir / "agent.pid").is_file(),
+            "agent ready in gate",
         )
         self.assertEqual(self.cli("stop", started["run"]).returncode, 0)
-        self.until(
-            lambda: (Path(started["dir"]) / "summary.json").is_file()
-            and json.loads((Path(started["dir"]) / "summary.json").read_text()).get("state") == "stopped",
+        stopped_summary = self.wait_json(
+            started_dir / "summary.json",
+            lambda doc: doc.get("state") == "stopped",
             "stopped summary written",
         )
         self.assertEqual(self.outcome(self.cli("status", started["run"]))["state"], "stopped")
-        self.assertTrue(json.loads((Path(started["dir"]) / "summary.json").read_text()).get("session"))
+        self.assertTrue(stopped_summary.get("session"))
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo done >> a.txt")
         continued = self.outcome(self.cli("reply", "--wait", "job", "continue"))
         meta = json.loads((Path(continued["dir"]) / "meta.json").read_text())
@@ -533,13 +541,74 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
         self.assertEqual(result.returncode, 2)
         self.assertIn("rework limit reached (1/1)", result.stderr)
 
+    def test_continuation_uses_live_parent_state_when_stop_updates_summary_mid_reply(self):
+        repo = self.repo({"a.txt": "old\n"})
+        self.env["DELEGATE_CGROUP"] = "0"
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo first >> a.txt")
+        self.outcome(self.cli("run", "--worktree", "--workdir", repo,
+                             "--name", "job", "--accept", "false", "task"))
+        # Spend the 1/1 rework round and end with state="failed" + exit_code + saved session,
+        # matching the window before `stop` rewrites summary.json["state"] to "stopped".
+        self.fake_pi([fixtures.interrupted("401 Unauthorized: invalid api key"), fixtures.SETTLED],
+                     pre="echo fix >> a.txt", code=1)
+        parent = self.outcome(self.cli("reply", "--wait", "job", "fix"))
+        self.assertEqual(parent["state"], "failed")
+        parent_summary = Path(parent["dir"]) / "summary.json"
+
+        # Gate `pi --list-models` so `reply` pauses AFTER its initial `summary.json` read
+        # and BEFORE `rework_gate` and `extra["continuation"]` evaluate parent state.
+        list_ready = self.work / "list-models.ready"
+        list_gate = self.work / "list-models.gate"
+        self.fake_pi(
+            [fixtures.answer("done"), fixtures.SETTLED],
+            pre="echo done >> a.txt",
+            list_models_pre=(
+                f": > {shlex.quote(str(list_ready))}; "
+                f"while [ ! -f {shlex.quote(str(list_gate))} ]; do sleep .02; done"
+            ),
+        )
+        proc = subprocess.Popen(
+            [str(fixtures.DELEGATE), "reply", "--json", "--wait", "job", "continue"],
+            cwd=self.work, env=self.env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+
+        def _cleanup():
+            list_gate.touch()
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+
+        self.addCleanup(_cleanup)
+        self.until(lambda: list_ready.is_file(), "reply paused inside pi --list-models")
+        # Simulate `stop` patching parent summary.json["state"] to "stopped" mid-reply.
+        doc = json.loads(parent_summary.read_text())
+        doc["state"] = "stopped"
+        tmp = parent_summary.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(doc))
+        tmp.replace(parent_summary)
+        list_gate.touch()
+
+        stdout, stderr = proc.communicate(timeout=30)
+        continued = self.outcome(subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr))
+        self.assertEqual(continued["state"], "rejected", stdout + stderr)
+        meta = json.loads((Path(continued["dir"]) / "meta.json").read_text())
+        self.assertEqual(meta["rework"], {"kind": "continuation", "used": 1, "limit": 1})
+        self.assertEqual(meta.get("continuation"), "stopped", meta)
+
     def test_timeout_next_handles_missing_session_and_zero_budget(self):
         repo = self.repo({"a.txt": "old\n"})
         (repo / ".delegate.json").write_text(json.dumps({"maxRework": 0}))
+        self.env["DELEGATE_CGROUP"] = "0"
         self.env["DELEGATE_TIMEOUT_GRACE"] = "0"
-        self.fake_pi([fixtures.answer("later"), fixtures.SETTLED], pre="echo partial >> a.txt", sleep=10)
+        self.fake_pi([fixtures.answer("later"), fixtures.SETTLED], pre="echo partial >> a.txt", gate=True)
         first = self.outcome(self.cli("run", "--worktree", "--workdir", repo,
-                                     "--timeout", ".2s", "task"))
+                                     "--timeout", "2s", "task"))
+        self.assertEqual(first["state"], "timeout")
         session = Path(first["dir"]) / "session"
         for file in session.iterdir():
             file.unlink()
@@ -547,7 +616,7 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
         self.assertIn("--fresh", state["next"])
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo finished >> a.txt")
         command = shlex.split(state["next"])
-        continued = self.outcome(self.cli(*command[1:], "--timeout", "5s", "--wait"))
+        continued = self.outcome(self.cli(*command[1:], "--timeout", "30s", "--wait"))
         self.assertEqual(continued["state"], "answered")
         meta = json.loads((Path(continued["dir"]) / "meta.json").read_text())
         self.assertEqual(meta["continuation"], "timeout")
@@ -569,18 +638,25 @@ cargo --locked xtask check > "$DELEGATE_RUN_DIR/global-option"
             self.env["DELEGATE_CGROUP"] = "0"
         outside = subprocess.Popen(["sleep", "300"], env=self.env)
         self.addCleanup(lambda: (outside.terminate(), outside.wait()) if outside.poll() is None else None)
+        expect_kill = cgroup and command.lstrip().startswith(("pkill", "killall"))
+        wait_inside = (
+            'n=0; while [ "$n" -lt 100 ]; do '
+            'kill -0 "$inside" 2>/dev/null || break; '
+            'case "$(cat "/proc/$inside/stat" 2>/dev/null)" in *") Z "*) break;; esac; '
+            'sleep .02; n=$((n+1)); done\n'
+            if expect_kill else ""
+        )
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre='''
 sleep 300 & inside=$!
 printf '%s' "$inside" > "$DELEGATE_RUN_DIR/inside"
 ''' + '{ ' + command + '; }' + ''' > "$DELEGATE_RUN_DIR/matched" 2> "$DELEGATE_RUN_DIR/match-error"
 printf '%s' "$?" > "$DELEGATE_RUN_DIR/match-code"
-sleep .05
-if kill -0 "$inside" 2>/dev/null; then echo alive; else echo gone; fi > "$DELEGATE_RUN_DIR/inside-state"
+''' + wait_inside + '''if kill -0 "$inside" 2>/dev/null && ! case "$(cat "/proc/$inside/stat" 2>/dev/null)" in *") Z "*) true;; *) false;; esac; then echo alive; else echo gone; fi > "$DELEGATE_RUN_DIR/inside-state"
 kill "$inside" 2>/dev/null || :
 wait "$inside" 2>/dev/null || :
 ''')
         args = ["--read-only", "--shell", "--workdir", self.repo({"a.txt": "a\n"})] if shell else []
-        state = self.outcome(self.cli("run", *args, "task"))
+        state = self.outcome(self.cli("run", *args, "task", timeout=90))
         self.assertEqual(state["state"], "answered")
         self.assertIsNone(outside.poll(), "outside sleep must survive")
         return Path(state["dir"])

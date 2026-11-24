@@ -389,16 +389,17 @@ class DelegateApplySafetyTests(unittest.TestCase):
     # ------------------------------------------------------------------
     def _premerge_wt_dir(self, repo: Path) -> Path:
         premerge_root = self.cache_dir() / "premerge"
-        self.until(
-            lambda: premerge_root.is_dir() and any(premerge_root.iterdir()),
-            "premerge repo dir created",
-            timeout=20,
-        )
-        for d in premerge_root.iterdir():
-            wt = d / "worktree"
-            if wt.is_dir():
-                return wt
-        raise AssertionError(f"no premerge worktree under {premerge_root}")
+
+        def _find():
+            if not premerge_root.is_dir():
+                return False
+            for d in premerge_root.iterdir():
+                wt = d / "worktree"
+                if wt.is_dir():
+                    return wt
+            return False
+
+        return self.until(_find, f"premerge worktree created under {premerge_root}", timeout=20)
 
     def test_3_premerge_accept_linker_error_heals_cache_and_retries_once(self):
         self.env.pop("DELEGATE_PREMERGE", None)

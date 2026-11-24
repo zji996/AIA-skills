@@ -253,17 +253,20 @@ class DelegateAgyUsageTests(unittest.TestCase):
         self.assertEqual(r_unc.returncode, 0, r_unc.stderr)
 
         try:
-            deadline = time.time() + 15.0
-            while time.time() < deadline and not (ready_live.exists() and ready_unc.exists()):
-                time.sleep(0.05)
-            self.assertTrue(ready_live.exists(), "live task did not reach mid-run state")
-            self.assertTrue(ready_unc.exists(), "uncounted task did not reach mid-run state")
-            # Give supervisor a tiny moment to flush live-usage.json after reading stdout
-            time.sleep(0.2)
+            fixtures.wait_until(
+                lambda: ready_live.exists() and ready_unc.exists(),
+                "live and uncounted tasks to reach mid-run state",
+                timeout=15.0,
+            )
 
-            mid_json_res = self.cli("usage", "--since", "24h", "--by", "run", "--json")
-            self.assertEqual(mid_json_res.returncode, 0, mid_json_res.stderr)
-            mid = json.loads(mid_json_res.stdout)
+            def _mid_usage():
+                res = self.cli("usage", "--since", "24h", "--by", "run", "--json")
+                if res.returncode != 0:
+                    return False
+                doc = json.loads(res.stdout)
+                return doc if len(doc.get("liveRunning", [])) == 1 else False
+
+            mid = fixtures.wait_until(_mid_usage, "supervisor to flush live-usage.json", timeout=10.0)
 
             # Live task is counted in real time!
             self.assertEqual(len(mid["liveRunning"]), 1, mid)

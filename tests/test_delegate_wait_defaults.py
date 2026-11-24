@@ -1,3 +1,4 @@
+import json
 import shlex
 import threading
 import unittest
@@ -9,20 +10,33 @@ import test_delegate as fixtures
 class DelegateWaitDefaultsTests(unittest.TestCase):
     setUp = fixtures.DelegateTests.setUp
     fake_pi = fixtures.DelegateTests.fake_pi
+    start_gated = fixtures.DelegateTests.start_gated
     cli = fixtures.DelegateTests.cli
     outcome = fixtures.DelegateTests.outcome
     until = fixtures.DelegateTests.until
+    wait_until = fixtures.DelegateTests.wait_until
+    wait_text = fixtures.DelegateTests.wait_text
     repo = fixtures.DelegateTests.repo
 
     def start_pair(self):
         gate = self.work / "release"
-        self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED],
-                     pre=f'case "$*" in *slow*) while [ ! -f {shlex.quote(str(gate))} ]; do sleep .05; done;; esac')
+        self.fake_pi(
+            [fixtures.answer("ok"), fixtures.SETTLED],
+            pre=(
+                'case "$*" in *slow*) '
+                '[ -n "${DELEGATE_RUN_DIR:-}" ] && : > "$DELEGATE_RUN_DIR/.fake-ready"; '
+                f'while [ ! -f {shlex.quote(str(gate))} ]; do sleep .02; done;; esac'
+            ),
+        )
         states = {}
         for name in ("slow", "fast"):
             states[name] = self.outcome(self.cli("start", "--read-only", "--name", name, "task"))
-        self.addCleanup(lambda: self.cli("stop", "slow"))
-        self.until(lambda: (Path(states["fast"]["dir"]) / "exit_code").exists(), "fast")
+        self.addCleanup(lambda: (gate.touch(), self.cli("stop", "slow")))
+        self.until(
+            lambda: (Path(states["slow"]["dir"]) / ".fake-ready").is_file()
+            and (Path(states["fast"]["dir"]) / "exit_code").exists(),
+            "slow ready in gate and fast finished",
+        )
         return gate, states
 
     def test_default_wait_delivers_finished_and_names_exact_command(self):
@@ -93,34 +107,34 @@ class DelegateWaitDefaultsTests(unittest.TestCase):
         self.env["DELEGATE_CHECK_IN"] = ".1s"
         self.env["DELEGATE_STALL_IDLE"] = "0"
         self.env["DELEGATE_STALL_COMMAND"] = "0"
-        self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED], sleep=10)
-        state = self.outcome(self.cli("start", "--read-only", "task"))
-        self.addCleanup(lambda: self.cli("stop", state["run"]))
-        self.until(lambda: (Path(state["dir"]) / "agent.pid").exists(), "agent launched")
+        state, gate = self.start_gated(
+            "--read-only", "task",
+            attempts=([fixtures.answer("ok"), fixtures.SETTLED],),
+        )
         result = self.cli("wait", human=True)
-        self.assertEqual(result.returncode, 75)
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
         self.assertIn("正常推进", result.stdout)
         self.assertIn("继续等：", result.stdout)
         self.assertTrue((Path(state["dir"]) / "agent.pid").exists())
+        gate.touch()
 
     def test_check_in_reports_an_in_flight_command_as_progress(self):
         self.env["CLAUDE_CODE_SESSION_ID"] = "claude-check-in"
-        self.env["DELEGATE_CHECK_IN"] = ".3s"
+        self.env["DELEGATE_CHECK_IN"] = ".1s"
         self.env["DELEGATE_STALL_IDLE"] = "0"
         self.env["DELEGATE_STALL_COMMAND"] = "0"
         event = {"type": "tool_execution_start", "toolName": "bash", "args": {"command": "cargo test --long"}}
-        self.fake_pi([], pre=f"printf '%s\\n' {shlex.quote(__import__('json').dumps(event))}; sleep 30")
-        state = self.outcome(self.cli("start", "--read-only", "task"))
-        self.addCleanup(lambda: self.cli("stop", state["run"]))
-        events_file = Path(state["dir"]) / "events.jsonl"
-        self.until(
-            lambda: events_file.is_file() and "cargo test --long" in events_file.read_text(errors="replace"),
-            "in-flight command event recorded",
+        state, gate = self.start_gated(
+            "--read-only", "task",
+            attempts=([],),
+            pre=f"printf '%s\\n' {shlex.quote(json.dumps(event))}",
         )
+        self.wait_text(Path(state["dir"]) / "events.jsonl", "cargo test --long", "in-flight bash event recorded")
         result = self.cli("wait", human=True)
-        self.assertEqual(result.returncode, 75)
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
         self.assertIn("正在执行 cargo test --long", result.stdout)
         self.assertEqual(result.stdout.count("继续等："), 1)
+        gate.touch()
 
     def test_omitted_timeout_has_no_agent_cap(self):
         self.env["DELEGATE_STALL_IDLE"] = "0"
@@ -133,11 +147,16 @@ class DelegateWaitDefaultsTests(unittest.TestCase):
         self.env["DELEGATE_STALL_IDLE"] = ".1s"
         self.env["DELEGATE_STALL_COMMAND"] = "0"
         repo = self.repo({"seed.txt": "seed\n"})
-        self.fake_pi([fixtures.answer("finished after idle"), fixtures.SETTLED],
-                     pre="echo kept > kept.txt", sleep=.35)
-        state = self.outcome(self.cli("run", "--workdir", repo, "--worktree", "task"))
+        state, gate = self.start_gated(
+            "--workdir", repo, "--worktree", "task",
+            attempts=([fixtures.answer("finished after idle"), fixtures.SETTLED],),
+            pre="echo kept > kept.txt",
+        )
+        self.wait_text(Path(state["dir"]) / "events.jsonl", '"stall_warning"', "idle stall_warning emitted")
+        gate.touch()
+        waited = self.outcome(self.cli("wait", state["run"]))
         # 6.28: stall only emits a reminder event and never kills the colleague.
-        self.assertEqual(state["state"], "answered")
+        self.assertEqual(waited["state"], "answered")
         run_events = (Path(state["dir"]) / "events.jsonl").read_text()
         self.assertIn('"stall_warning"', run_events)
         self.assertIn('"idle"', run_events)
@@ -149,12 +168,15 @@ class DelegateWaitDefaultsTests(unittest.TestCase):
         self.env["DELEGATE_STALL_COMMAND"] = ".1s"
         event = {"type": "tool_execution_start", "toolName": "bash", "args": {"command": "sleep 0.4"}}
         done_ev = {"type": "tool_execution_end", "toolName": "bash", "isError": False}
-        self.fake_pi(
-            [done_ev, fixtures.answer("command finished"), fixtures.SETTLED],
-            pre=f"printf '%s\\n' {shlex.quote(__import__('json').dumps(event))}; sleep .35",
+        state, gate = self.start_gated(
+            "task",
+            attempts=([done_ev, fixtures.answer("command finished"), fixtures.SETTLED],),
+            pre=f"printf '%s\\n' {shlex.quote(json.dumps(event))}",
         )
-        state = self.outcome(self.cli("run", "task"))
-        self.assertEqual(state["state"], "answered")
+        self.wait_text(Path(state["dir"]) / "events.jsonl", '"stall_warning"', "command stall_warning emitted")
+        gate.touch()
+        waited = self.outcome(self.cli("wait", state["run"]))
+        self.assertEqual(waited["state"], "answered")
         run_events = (Path(state["dir"]) / "events.jsonl").read_text()
         self.assertIn('"stall_warning"', run_events)
         self.assertIn("sleep 0.4", run_events)

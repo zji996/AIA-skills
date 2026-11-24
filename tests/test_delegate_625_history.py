@@ -16,10 +16,14 @@ import test_delegate as fixtures
 class Delegate625HistoryTests(unittest.TestCase):
     setUp = fixtures.DelegateTests.setUp
     fake_pi = fixtures.DelegateTests.fake_pi
+    start_gated = fixtures.DelegateTests.start_gated
     cli = fixtures.DelegateTests.cli
     outcome = fixtures.DelegateTests.outcome
     repo = fixtures.DelegateTests.repo
     until = fixtures.DelegateTests.until
+    wait_until = fixtures.DelegateTests.wait_until
+    wait_text = fixtures.DelegateTests.wait_text
+    wait_gone = fixtures.DelegateTests.wait_gone
 
     def git(self, repo, *args):
         return subprocess.run(
@@ -35,7 +39,6 @@ class Delegate625HistoryTests(unittest.TestCase):
 
     def test_status_default_filters_actionable_and_tracks_result_and_apply(self):
         repo = self.repo({"a.txt": "base\n", "b.txt": "base\n"})
-        gate = self.work / "status-gate"
         # 1. Completed read-only run via `run` -> already read -> hidden from default status.
         self.fake_pi([fixtures.answer("already read answer"), fixtures.SETTLED])
         done_ro = self.outcome(self.cli("run", "--read-only", "--workdir", repo, "--name", "done-ro", "check docs"))
@@ -63,21 +66,19 @@ class Delegate625HistoryTests(unittest.TestCase):
         )
 
         # 6. Active running + queued run (maxActive=1).
-        gate_entered = self.work / "status-gate-entered"
-        self.fake_pi(
-            [fixtures.answer("slow done"), fixtures.SETTLED],
-            pre=f'touch {shlex.quote(str(gate_entered))}; while [ ! -f {shlex.quote(str(gate))} ]; do sleep .05; done',
-        )
         self.env["DELEGATE_MAX_ACTIVE"] = "1"
-        live = self.outcome(self.cli("start", "--read-only", "--workdir", repo, "--name", "live-one", "long task"))
+        live, live_gate = self.start_gated(
+            "--read-only", "--workdir", repo, "--name", "live-one", "long task",
+            attempts=([fixtures.answer("slow done"), fixtures.SETTLED],),
+        )
         queued = self.outcome(self.cli("start", "--read-only", "--workdir", repo, "--name", "queued-one", "second task"))
-        self.addCleanup(lambda: (gate.touch(), self.cli("stop", live["run"], queued["run"])))
+        queued_gate = Path(queued["dir"]) / ".fake-gate"
+        self.addCleanup(lambda: (
+            queued_gate.touch() if queued_gate.parent.exists() else None,
+            self.cli("stop", queued["run"]) if Path(queued["dir"]).exists() else None,
+        ))
+        self.assertEqual(queued["state"], "waiting")
         self.env.pop("DELEGATE_MAX_ACTIVE", None)
-
-        # Wait until live-one has actually exec'd the gated fake_pi (so overwriting fake_pi later
-        # for ask-q cannot cause live-one to exit early and unblock queued-one) and both runs have
-        # settled into their expected running/waiting states.
-        self.until(gate_entered.is_file, "live-one entered gate")
         self.until(
             lambda: self.outcome(self.cli("status", live["run"]))["state"] == "running"
             and self.outcome(self.cli("status", queued["run"]))["state"] == "waiting",
@@ -124,7 +125,8 @@ class Delegate625HistoryTests(unittest.TestCase):
             self.assertNotIn(name, after.stdout)
         self.assertIn("另有 6 条已结束：delegate history", after.stdout)
 
-        gate.touch()
+        live_gate.touch()
+        queued_gate.touch()
         self.cli("wait", live["run"], queued["run"])
 
     def test_history_append_only_chinese_search_filters_and_2kb_cap(self):
@@ -244,7 +246,6 @@ class Delegate625HistoryTests(unittest.TestCase):
 
     def test_dedup_positive_and_negative_against_active_and_14d_history(self):
         repo = self.repo({"a.txt": "1\n"})
-        gate = self.work / "dedup-gate"
         # Finished recent task (within 14d).
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
         prev = self.outcome(
@@ -269,17 +270,10 @@ class Delegate625HistoryTests(unittest.TestCase):
         hist_file.write_text("\n".join(patched) + "\n", encoding="utf-8")
 
         # Active running task about avatar cropping.
-        self.fake_pi(
-            [fixtures.answer("working"), fixtures.SETTLED],
-            pre=f'while [ ! -f {shlex.quote(str(gate))} ]; do sleep .05; done',
-        )
-        active = self.outcome(
-            self.cli("start", "--read-only", "--workdir", repo, "--name", "用户头像裁剪",
-                     "给前端个人资料页加上用户头像上传和裁剪功能")
-        )
-        self.addCleanup(lambda: (gate.touch(), self.cli("stop", active["run"])))
-        fixtures.DelegateTests.until(
-            self, lambda: (Path(active["dir"]) / "agent.pid").is_file(), "active agent started"
+        active, gate = self.start_gated(
+            "--read-only", "--workdir", repo, "--name", "用户头像裁剪",
+            "给前端个人资料页加上用户头像上传和裁剪功能",
+            attempts=([fixtures.answer("working"), fixtures.SETTLED],),
         )
 
         # Positive: paraphrased Chinese task ("同一任务换个说法") hits both recent & active, non-blocking (exit 0).
@@ -397,31 +391,24 @@ class Delegate625HistoryTests(unittest.TestCase):
         board_file = repo / ".local/delegate/board.md"
 
         # 1. Start + queued -> running transition.
-        gate1 = self.work / "board-gate-1"
-        gate2 = self.work / "board-gate-2"
-        self.fake_pi(
-            [fixtures.answer("first finished"), fixtures.SETTLED],
-            pre=(
-                f'case "$*" in '
-                f'*run-one*) while [ ! -f {shlex.quote(str(gate1))} ]; do sleep .05; done;; '
-                f'*run-two*) while [ ! -f {shlex.quote(str(gate2))} ]; do sleep .05; done;; '
-                f'esac'
-            ),
-        )
         self.env["DELEGATE_MAX_ACTIVE"] = "1"
-        r_live = self.outcome(self.cli("start", "--read-only", "--workdir", repo, "--name", "run-one", "run-one task", cwd=repo))
+        r_live, gate1 = self.start_gated(
+            "--read-only", "--workdir", repo, "--name", "run-one", "run-one task",
+            cwd=repo, attempts=([fixtures.answer("first finished"), fixtures.SETTLED],),
+        )
         r_queued = self.outcome(self.cli("start", "--read-only", "--workdir", repo, "--name", "run-two", "run-two task", cwd=repo))
-        self.addCleanup(lambda: (gate1.touch(), gate2.touch(), self.cli("stop", r_live["run"], r_queued["run"], cwd=repo)))
+        gate2 = Path(r_queued["dir"]) / ".fake-gate"
+        self.addCleanup(lambda: (
+            gate2.touch() if gate2.parent.exists() else None,
+            self.cli("stop", r_queued["run"], cwd=repo) if Path(r_queued["dir"]).exists() else None,
+        ))
         self.env.pop("DELEGATE_MAX_ACTIVE", None)
 
-        deadline = time.time() + 10
-        b1 = ""
-        while time.time() < deadline:
-            if board_file.is_file():
-                b1 = board_file.read_text(encoding="utf-8")
-                if "在跑 1（排队 1）" in b1.splitlines()[0] and "run-two" in b1:
-                    break
-            time.sleep(0.05)
+        b1 = self.wait_text(
+            board_file,
+            lambda txt: "在跑 1（排队 1）" in txt.splitlines()[0] and "run-two" in txt,
+            "board file created with running + queued",
+        )
         self.assertTrue(board_file.is_file(), "board file should be created automatically on start")
         self.assertIn("在跑 1（排队 1）", b1.splitlines()[0])
         self.assertIn("整机在途 2", b1.splitlines()[0])
@@ -433,12 +420,12 @@ class Delegate625HistoryTests(unittest.TestCase):
         # Release run-one -> run-one finishes (unread -> 待回答), run-two transitions queued -> running!
         gate1.touch()
         self.cli("wait", "--no-result", r_live["run"], cwd=repo)
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            b2 = board_file.read_text(encoding="utf-8")
-            if "在跑 1（排队 0）" in b2.splitlines()[0] and "## 待回答" in b2:
-                break
-            time.sleep(0.1)
+        b2 = self.wait_text(
+            board_file,
+            lambda txt: "在跑 1（排队 0）" in txt.splitlines()[0] and "## 待回答" in txt,
+            "board updated after run-one finished and run-two started",
+        )
+        self.until(lambda: (Path(r_queued["dir"]) / ".fake-ready").is_file(), "run-two entered gate")
         self.assertIn("在跑 1（排队 0）", b2.splitlines()[0], b2)
         self.assertIn("## 待回答", b2)
         self.assertIn("run-one", b2)
@@ -494,17 +481,13 @@ class Delegate625HistoryTests(unittest.TestCase):
         self.assertIn("待回答 0", b9.splitlines()[0], b9)
 
         # Crash (kill supervisor with SIGKILL) -> `delegate board` detects crashed in 失败或中断.
-        gate3 = self.work / "board-gate-3"
-        self.fake_pi([fixtures.answer("never"), fixtures.SETTLED],
-                     pre=f'while [ ! -f {shlex.quote(str(gate3))} ]; do sleep .05; done')
-        r_crash = self.outcome(self.cli("start", "--read-only", "--workdir", repo, "--name", "crash-job", "crash test", cwd=repo))
-        self.addCleanup(lambda: (gate3.touch(), self.cli("stop", r_crash["run"], cwd=repo)))
+        r_crash, gate3 = self.start_gated(
+            "--read-only", "--workdir", repo, "--name", "crash-job", "crash test",
+            cwd=repo, attempts=([fixtures.answer("never"), fixtures.SETTLED],),
+        )
         sup_pid = int((Path(r_crash["dir"]) / "pid").read_text().strip())
         os.kill(sup_pid, signal.SIGKILL)
-        for _ in range(40):
-            if not Path(f"/proc/{sup_pid}").exists():
-                break
-            time.sleep(0.05)
+        self.wait_gone(sup_pid, "killed supervisor to exit")
         board_cmd = self.cli("board", human=True, cwd=repo)
         self.assertEqual(board_cmd.returncode, 0, board_cmd.stderr)
         self.assertIn("## 失败或中断", board_cmd.stdout)
@@ -671,10 +654,7 @@ class Delegate625HistoryTests(unittest.TestCase):
             self.git(repo, "add", "-A")
             self.git(repo, "commit", "-qm", "init")
         gate = self.work / "two-ws-gate"
-        self.fake_pi(
-            [fixtures.answer("done"), fixtures.SETTLED],
-            pre=f'while [ ! -f {shlex.quote(str(gate))} ]; do sleep .05; done',
-        )
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], gate=gate)
         # Drop explicit DELEGATE_RUNS so each repo uses its own `.local/run/delegate` and history/BOARD.md.
         env_no_runs = {k: v for k, v in self.env.items() if k != "DELEGATE_RUNS"}
         def run_in(repo, *args):
@@ -689,6 +669,10 @@ class Delegate625HistoryTests(unittest.TestCase):
             run_in(repo_a, "stop", r_a["run"]),
             run_in(repo_b, "stop", r_b["run"]),
         ))
+        self.until(
+            lambda: (Path(r_a["dir"]) / ".fake-ready").is_file() and (Path(r_b["dir"]) / ".fake-ready").is_file(),
+            "both workspace agents ready in gate",
+        )
         path_a = Path(run_in(repo_a, "board", "--path").stdout.strip())
         path_b = Path(run_in(repo_b, "board", "--path").stdout.strip())
         self.assertNotEqual(path_a, path_b)

@@ -1,7 +1,7 @@
 """6.14 capacity queue: hermetic CLI tests using per-run release gates."""
 import json
+import os
 import signal
-import time
 import unittest
 from pathlib import Path
 
@@ -15,22 +15,35 @@ class QueueTests(unittest.TestCase):
     outcome = fixtures.DelegateTests.outcome
     repo = fixtures.DelegateTests.repo
     until = fixtures.DelegateTests.until
+    wait_until = fixtures.DelegateTests.wait_until
     user_config = fixtures.DelegateTests.user_config
 
     def gates(self):
         self.env["DELEGATE_MIN_AVAILABLE_MB"] = "0"
-        self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED],
-                     pre='while [ ! -f "$DELEGATE_RUN_DIR/release" ]; do sleep .02; done')
+        self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED], gate=True)
 
     def start(self, name, *args):
         result = self.cli("start", "--read-only", "--name", name, *args, "task")
         self.assertEqual(result.returncode, 0, result.stderr)
         state = self.outcome(result)
-        self.addCleanup(self.cli, "stop", state["dir"])
+        run_dir = Path(state["dir"])
+        self.addCleanup(lambda: (
+            (run_dir / ".fake-gate").touch() if run_dir.exists() else None,
+            self.cli("stop", state["dir"]) if run_dir.exists() else None,
+        ))
+        return state
+
+    def start_active(self, name, *args):
+        state = self.start(name, *args)
+        run_dir = Path(state["dir"])
+        self.until(
+            lambda: self.started(state) and (run_dir / ".fake-ready").is_file(),
+            f"{name} active in gate",
+        )
         return state
 
     def release(self, state):
-        (Path(state["dir"]) / "release").touch()
+        (Path(state["dir"]) / ".fake-gate").touch()
 
     def status(self, state):
         return self.outcome(self.cli("status", state["dir"]))
@@ -47,7 +60,7 @@ class QueueTests(unittest.TestCase):
     def test_total_capacity_returns_id_and_starts_automatically(self):
         self.gates()
         self.env["DELEGATE_MAX_ACTIVE"] = "1"
-        first = self.start("first")
+        first = self.start_active("first")
         second = self.start("second")
         self.assertEqual(second["state"], "waiting")
         self.assertIn("总路数", second["queue"]["reason"])
@@ -61,7 +74,7 @@ class QueueTests(unittest.TestCase):
         self.gates()
         self.env["DELEGATE_REPO_MAX_ACTIVE"] = "1"
         repo = self.repo({"a": "a"})
-        first = self.start("first", "--workdir", repo, "--in-place")
+        first = self.start_active("first", "--workdir", repo, "--in-place")
         second = self.start("second", "--workdir", repo, "--in-place")
         other = self.start("other")
         self.assertIn("仓库路数", second["queue"]["reason"])
@@ -73,7 +86,7 @@ class QueueTests(unittest.TestCase):
     def test_default_model_queue_keeps_identity(self):
         self.gates()
         self.model_rules()
-        first = self.start("first")
+        first = self.start_active("first")
         second = self.start("second")
         self.assertIn("模型并发", second["queue"]["reason"])
         self.assertIn("review", second["queue"]["reason"])
@@ -86,7 +99,7 @@ class QueueTests(unittest.TestCase):
     def test_overflow_next_selects_next_model(self):
         self.gates()
         self.model_rules("next")
-        self.start("first")
+        self.start_active("first")
         second = self.start("second")
         self.until(lambda: self.started(second), "overflow started")
         self.assertEqual(second["model"], "p/write-m")
@@ -95,7 +108,7 @@ class QueueTests(unittest.TestCase):
     def test_cli_overflow_overrides_both_directions(self):
         self.gates()
         self.model_rules("next")
-        self.start("first")
+        self.start_active("first")
         queued = self.start("queued", "--overflow", "queue")
         self.assertEqual(queued["state"], "waiting")
         self.model_rules()
@@ -106,7 +119,7 @@ class QueueTests(unittest.TestCase):
     def test_pinned_model_and_other_tiers_share_model_ceiling(self):
         self.gates()
         self.model_rules()
-        self.start("first", "--model", "review")
+        self.start_active("first", "--model", "review")
         second = self.start("second", "--model", "p/review-m")
         self.assertEqual(second["state"], "waiting")
         self.assertEqual(second["model"], "p/review-m")
@@ -114,7 +127,7 @@ class QueueTests(unittest.TestCase):
     def test_blocked_model_does_not_block_later_other_model(self):
         self.gates()
         self.model_rules()
-        self.start("first")
+        self.start_active("first")
         blocked = self.start("blocked")
         other = self.start("other", "--model", "write")
         self.until(lambda: self.started(other), "other model admitted")
@@ -123,16 +136,20 @@ class QueueTests(unittest.TestCase):
     def test_reply_has_priority_over_older_start(self):
         self.gates()
         self.env["DELEGATE_MAX_ACTIVE"] = "1"
-        parent = self.start("parent")
+        parent = self.start_active("parent")
         self.release(parent)
         self.assertEqual(self.cli("wait", parent["dir"]).returncode, 0)
-        holder = self.start("holder")
+        holder = self.start_active("holder")
         older = self.start("older")
         reply = self.outcome(self.cli("reply", parent["dir"], "continue"))
-        self.addCleanup(self.cli, "stop", reply["dir"])
+        reply_dir = Path(reply["dir"])
+        self.addCleanup(lambda: (
+            (reply_dir / ".fake-gate").touch() if reply_dir.exists() else None,
+            self.cli("stop", reply["dir"]) if reply_dir.exists() else None,
+        ))
         self.assertEqual(reply["state"], "waiting")
-        self.assertEqual(self.status(reply)["queue"]["ahead"], 0)
-        self.assertEqual(self.status(older)["queue"]["ahead"], 1)
+        self.until(lambda: self.status(reply).get("queue", {}).get("ahead") == 0, "reply at queue head")
+        self.until(lambda: self.status(older).get("queue", {}).get("ahead") == 1, "older behind reply")
         self.release(holder)
         self.until(lambda: self.started(reply), "reply admitted first")
         self.assertFalse(self.started(older))
@@ -142,7 +159,7 @@ class QueueTests(unittest.TestCase):
     def test_stop_queue_claims_no_worktree_or_pool_and_clean_removes_it(self):
         self.gates()
         self.env["DELEGATE_MAX_ACTIVE"] = "1"
-        self.start("holder")
+        self.start_active("holder")
         repo = self.repo({"a": "a"})
         (repo / ".delegate.json").write_text(json.dumps({"worktree": {"pool": 1}}))
         queued = self.outcome(self.cli("start", "--worktree", "--workdir", repo, "task"))
@@ -159,11 +176,19 @@ class QueueTests(unittest.TestCase):
     def test_status_queue_and_wait_any_leave_queued_unfinished(self):
         self.gates()
         self.env["DELEGATE_MAX_ACTIVE"] = "1"
-        first = self.start("first")
+        first = self.start_active("first")
         second = self.start("second", "--timeout", "0.1")
         third = self.start("third")
-        status = self.status(third)
+        self.until(
+            lambda: (Path(second["dir"]) / "pid").is_file() and (Path(third["dir"]) / "pid").is_file(),
+            "queued supervisors registered",
+        )
         # status deliberately uses the cached queue if the admission lock is busy.
+        status = self.until(
+            lambda: (st if st.get("queue", {}).get("ahead") == 1 else False)
+            if (st := self.status(third)) else False,
+            "third status shows ahead=1",
+        )
         self.assertEqual(set(status["queue"]) - {"busy"}, {"reason", "ahead", "since"})
         self.assertEqual(status["queue"]["ahead"], 1)
         self.assertNotIn("elapsedSeconds", status)
@@ -179,13 +204,20 @@ class QueueTests(unittest.TestCase):
     def test_only_one_waiter_admitted_per_free_slot_fifo(self):
         self.gates()
         self.env["DELEGATE_MAX_ACTIVE"] = "2"
-        first = self.start("first")
-        holder = self.start("holder")
+        first = self.start_active("first")
+        holder = self.start_active("holder")
         second = self.start("second")
         third = self.start("third")
         self.release(first)
-        self.until(lambda: self.started(second), "first waiter admitted")
-        time.sleep(.3)
+        self.until(
+            lambda: self.started(second) and (Path(second["dir"]) / ".fake-ready").is_file(),
+            "first waiter admitted into gate",
+        )
+        self.until(
+            lambda: self.status(third).get("queue", {}).get("ahead") == 0,
+            "third advanced to head while still waiting",
+        )
+        self.assertEqual(self.status(third)["state"], "waiting")
         self.assertFalse(self.started(third))
         self.release(holder)
         self.until(lambda: self.started(third), "second free slot admits next waiter")
@@ -203,12 +235,16 @@ class QueueTests(unittest.TestCase):
     def test_ordinary_reply_obeys_model_cap(self):
         self.gates()
         self.model_rules()
-        parent = self.start("parent")
+        parent = self.start_active("parent")
         self.release(parent)
         self.assertEqual(self.cli("wait", parent["dir"]).returncode, 0)
-        holder = self.start("holder", "--model", "review")
+        holder = self.start_active("holder", "--model", "review")
         reply = self.outcome(self.cli("reply", parent["dir"], "continue"))
-        self.addCleanup(self.cli, "stop", reply["dir"])
+        reply_dir = Path(reply["dir"])
+        self.addCleanup(lambda: (
+            (reply_dir / ".fake-gate").touch() if reply_dir.exists() else None,
+            self.cli("stop", reply["dir"]) if reply_dir.exists() else None,
+        ))
         self.assertIn("模型并发", reply["queue"]["reason"])
         self.release(holder)
         self.until(lambda: self.started(reply), "reply model cap released")
@@ -217,10 +253,9 @@ class QueueTests(unittest.TestCase):
     def test_supervisor_loss_uses_existing_crashed_semantics(self):
         self.gates()
         self.env["DELEGATE_MAX_ACTIVE"] = "1"
-        self.start("holder")
+        self.start_active("holder")
         queued = self.start("queued")
-        pid = int((Path(queued["dir"]) / "pid").read_text())
-        import os
+        pid = self.until(lambda: int((Path(queued["dir"]) / "pid").read_text()), "queued supervisor pid")
         os.kill(pid, signal.SIGKILL)
         self.until(lambda: self.status(queued)["state"] == "crashed", "dead supervisor reported crashed")
         self.assertNotIn("queue", self.status(queued))

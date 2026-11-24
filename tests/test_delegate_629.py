@@ -203,7 +203,11 @@ class Delegate629Tests(unittest.TestCase):
         self.assertEqual(add.returncode, 0, add.stderr)
 
         gate.touch()
-        self.until(lambda: (Path(run_a["dir"]) / "exit_code").exists(), "bad-fmt finished")
+        self.until(
+            lambda: (Path(run_a["dir"]) / "exit_code").exists()
+            and fixtures.process_gone(Path(run_a["dir"]) / "pid"),
+            "bad-fmt finished",
+        )
         st = self.outcome(self.cli("status", run_a["run"]))
         self.assertEqual(st["state"], "delivered")
         self.assertEqual(st["review"]["verdict"], "NEEDS_CONTROLLER")

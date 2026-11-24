@@ -80,6 +80,71 @@ def process_gone(pid_file):
         return True
 
 
+DEFAULT_WAIT_IGNORE = (FileNotFoundError, json.JSONDecodeError, ValueError)
+
+
+def wait_until(condition, what, timeout=10, interval=0.05, ignore=DEFAULT_WAIT_IGNORE):
+    """Poll `condition` using monotonic time, tolerating transient read errors until timeout."""
+    deadline = time.monotonic() + timeout
+    last_exc = None
+    while True:
+        try:
+            value = condition()
+            if value:
+                return value
+            last_exc = None
+        except ignore as exc:
+            last_exc = exc
+        if time.monotonic() >= deadline:
+            detail = f" (last error: {type(last_exc).__name__}: {last_exc})" if last_exc is not None else ""
+            raise AssertionError(f"timed out waiting for {what}{detail}")
+        time.sleep(interval)
+
+
+def wait_text(path, predicate, what=None, timeout=10, interval=0.05, encoding="utf-8"):
+    """Wait until file `path` matches substring or callable `predicate(text)`, returning its text."""
+    target = Path(path)
+    check = (lambda text: predicate in text) if isinstance(predicate, str) else predicate
+    matched = []
+
+    def _read():
+        text = target.read_text(encoding=encoding)
+        if check(text):
+            matched.append(text)
+            return True
+        return False
+
+    wait_until(_read, what or f"{target} to match", timeout=timeout, interval=interval)
+    return matched[-1]
+
+
+def wait_json(path, predicate=None, what=None, timeout=10, interval=0.05, encoding="utf-8"):
+    """Wait until JSON file `path` parses and satisfies optional `predicate(doc)`, returning the doc."""
+    target = Path(path)
+    matched = []
+
+    def _read():
+        doc = json.loads(target.read_text(encoding=encoding))
+        if predicate is None or predicate(doc):
+            matched.append(doc)
+            return True
+        return False
+
+    wait_until(_read, what or f"{target} JSON", timeout=timeout, interval=interval)
+    return matched[-1]
+
+
+def wait_gone(target, what=None, timeout=10, interval=0.05):
+    """Wait until a PID (`int`) or pid file (`Path`/`str`) is no longer alive (including zombie)."""
+    if isinstance(target, int):
+        check = lambda: not delegate_pid_alive(target)
+        label = what or f"pid {target} to exit"
+    else:
+        check = lambda: process_gone(target)
+        label = what or f"{target} process to exit"
+    wait_until(check, label, timeout=timeout, interval=interval)
+
+
 def answer(text, stop="stop"):
     content = [{"type": "text", "text": text}] if text is not None else []
     return {"type": "message_end", "message": {"role": "assistant", "stopReason": stop, "model": "fake-model",
@@ -544,33 +609,87 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
                 self.assertEqual(result.returncode, 0)
                 self.assertNotIn("sourceBuildDisk", result.stdout)
 
-    def fake_pi(self, *attempts, pre="", sleep=0, code=0, probe=None):
+    def fake_pi(self, *attempts, pre="", sleep=0, code=0, probe=None, gate=None, ready_file=None,
+                list_models_pre=""):
         """Each attempt is a list of events; later calls reuse the last attempt.
 
         probe: events a connectivity check (`probe`, and the check a run does before resuming
         after an interrupted upstream) prints. Such a call has neither --session-id nor --fork,
         so it is answered before the attempt counter advances: checks spend no attempt.
+        gate: True (per-run `$DELEGATE_RUN_DIR/.fake-gate`) or a Path/str file to wait on before
+        printing attempt events. Automatically touches `ready_file` (default `$DELEGATE_RUN_DIR/.fake-ready`)
+        once `pre` finishes and right before entering the gate loop.
         """
+        list_models_body = (
+            (f"{list_models_pre}; " if list_models_pre else "")
+            + 'printf "provider model context max-out thinking images\\n'
+            'p m 1M 1K yes yes\\np scout-m 64k 1K no no\\np review-m 1M 1K yes yes\\np write-m 1M 1K yes yes\\n'
+            'p ds-m 64k 1K yes no\\np gpt-m 1M 1K yes yes\\nx named 1M 1K yes yes\\nq env-m 1M 1K yes yes\\n"; exit 0;'
+        )
         lines = ["#!/bin/sh", '[ "$1" = --version ] && { echo "fake-pi 1.0"; exit 0; }',
-                 '[ "$2" = --list-models ] && { printf "provider model context max-out thinking images\\n'
-                 'p m 1M 1K yes yes\\np scout-m 64k 1K no no\\np review-m 1M 1K yes yes\\np write-m 1M 1K yes yes\\np ds-m 64k 1K yes no\\np gpt-m 1M 1K yes yes\\nx named 1M 1K yes yes\\nq env-m 1M 1K yes yes\\n"; exit 0; }',
+                 f'[ "$2" = --list-models ] && {{ {list_models_body} }}',
                  "cat > /dev/null"]
         if probe is not None:
             body = " ".join(shlex.quote(json.dumps(e)) for e in probe)
             lines.append('case " $* " in *" --session-id "*|*" --fork "*) ;; *) '
                          f"printf '%s\\n' {body}; exit 0;; esac")
-        lines += ['echo "$$ $PI_DELEGATE_ACTIVE $*" >> "$PI_LOG"',
-                 # Like Pi, keep the session as <dir>/<time>_<id>.jsonl.
+        lines += ['# Like Pi, keep the session as <dir>/<time>_<id>.jsonl.',
                  'dir=; id=; prev=; for a in "$@"; do case "$prev" in --session-dir) dir=$a;; --session-id) id=$a;; '
-                 'esac; prev=$a; done; [ -n "$dir" ] && mkdir -p "$dir" && touch "$dir/t_${id:-f$$}.jsonl"',
+                 'esac; prev=$a; done; [ -n "$dir" ] && mkdir -p "$dir" && : > "$dir/t_${id:-f$$}.jsonl"',
+                 'echo "$$ $PI_DELEGATE_ACTIVE $*" >> "$PI_LOG"',
                  'n=$(wc -l < "$PI_LOG")', pre]
+        effective_ready = True if (gate is not None and gate is not False and ready_file is None) else ready_file
+        if effective_ready is True:
+            lines.append('[ -n "${DELEGATE_RUN_DIR:-}" ] && : > "$DELEGATE_RUN_DIR/.fake-ready"')
+        elif effective_ready:
+            lines.append(f": > {shlex.quote(str(effective_ready))}")
+        if gate is True:
+            lines.append('while [ -d "${DELEGATE_RUN_DIR:-}" ] && [ ! -f "$DELEGATE_RUN_DIR/.fake-gate" ]; do sleep .02; done')
+        elif gate:
+            gate_path = Path(gate)
+            lines.append(
+                f"while [ -d {shlex.quote(str(gate_path.parent))} ] && [ ! -f {shlex.quote(str(gate_path))} ]; do sleep .02; done"
+            )
         for index, events in enumerate(attempts, 1):
             test = "true" if index == len(attempts) else f'[ "$n" -eq {index} ]'
             body = " ".join(shlex.quote(json.dumps(e)) for e in events)
             lines.append(f"if {test}; then sleep {sleep}; printf '%s\\n' {body}; exit {code}; fi")
         pi = self.bin / "pi"
-        pi.write_text("\n".join(lines) + "\n")
-        pi.chmod(0o755)
+        tmp = self.bin / f".pi.{os.getpid()}.{time.monotonic_ns()}.tmp"
+        tmp.write_text("\n".join(lines) + "\n")
+        tmp.chmod(0o755)
+        os.replace(tmp, pi)
+
+    def start_gated(self, *args, attempts=None, pre="", gate=True, ready_file=None,
+                    install_pi=True, cwd=None, timeout=15):
+        """Start an async run backed by a gated fake_pi and wait until the agent enters its gate."""
+        if install_pi:
+            eff_attempts = ([answer("ok"), SETTLED],) if attempts is None else attempts
+            self.fake_pi(*eff_attempts, pre=pre, gate=gate, ready_file=ready_file)
+        result = self.cli("start", *args, cwd=cwd)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        state = self.outcome(result)
+        run_dir = Path(state["dir"])
+        gate_path = run_dir / ".fake-gate" if gate is True else Path(gate)
+        ready_path = (
+            run_dir / ".fake-ready"
+            if (ready_file is None or ready_file is True)
+            else Path(ready_file)
+        )
+
+        def _cleanup():
+            if gate_path.parent.exists():
+                gate_path.touch()
+            if run_dir.exists():
+                self.cli("stop", state["dir"], cwd=cwd)
+
+        self.addCleanup(_cleanup)
+        self.until(
+            lambda: ready_path.is_file() and (run_dir / "agent.pid").is_file(),
+            f"gated agent {state['run']} ready",
+            timeout=timeout,
+        )
+        return state, gate_path
 
     def user_config(self, value):
         value = {"models": REGISTERED_MODELS, **value}
@@ -646,17 +765,26 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
 
     def test_evidence_queue_excludes_timeout_and_reclaims_children(self):
         self.fake_pi([answer("ok"), SETTLED])
-        self.hold_lane(3)
-        state = self.outcome(self.cli("run", "--evidence",
-            "sleep 30 & echo $! > evidence-bg.pid; echo proof", "--evidence-timeout", "1.5s", "task"))
+        holder, lane_gate = self.hold_lane_gated()
+        started = self.outcome(self.cli(
+            "start", "--evidence",
+            "sleep 30 & echo $! > evidence-bg.pid; echo proof",
+            "--evidence-timeout", "2s", "task",
+        ))
+        self.until(lambda: "queued" in self.cli("lane").stdout, "evidence queued behind lane holder")
+        release_at = time.monotonic() + 2.3
+        self.until(lambda: time.monotonic() >= release_at, "queue wait exceeds evidence timeout")
+        lane_gate.touch()
+        holder.wait(timeout=10)
+        state = self.outcome(self.cli("wait", started["run"]))
         self.assertEqual((state["state"], state["evidence"]["exit"]), ("answered", 0))
-        self.assertGreaterEqual(state["queuedSeconds"], 1)
+        self.assertGreaterEqual(state["queuedSeconds"], 2)
         self.assertFalse(state["evidence"]["timedOut"])
         self.assertGreaterEqual(state["cleanup"]["terminated"], 1)
         pid = int((self.work / "evidence-bg.pid").read_text())
-        self.until(lambda: not Path(f"/proc/{pid}").exists(), "the evidence child to go")
+        self.wait_gone(pid, "the evidence child to go")
         meta = json.loads((Path(state["dir"]) / "meta.json").read_text())
-        self.assertEqual(meta["evidenceTimeoutSeconds"], 1.5)
+        self.assertEqual(meta["evidenceTimeoutSeconds"], 2.0)
         inherited = self.outcome(self.cli("reply", "--wait", state["run"], "--evidence", "sleep 10", "more"))
         self.assertTrue(inherited["evidence"]["timedOut"])
         self.assertEqual(inherited["state"], "answered")
@@ -883,28 +1011,29 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         state = self.outcome(self.cli("run", "--accept", "sleep 5", "--accept-timeout", "1", "task"))
         self.assertEqual((state["state"], state["accept"]["exitCode"]), ("rejected", 124))
 
-    def until(self, condition, what, timeout=10):
-        deadline = time.time() + timeout
-        while not condition():
-            if time.time() > deadline:
-                self.fail(f"timed out waiting for {what}")
-            time.sleep(0.05)
+    def until(self, condition, what, timeout=10, interval=0.05, ignore=DEFAULT_WAIT_IGNORE):
+        return wait_until(condition, what, timeout=timeout, interval=interval, ignore=ignore)
+
+    wait_until = until
+
+    def wait_text(self, path, predicate, what=None, timeout=10, interval=0.05, encoding="utf-8"):
+        return wait_text(path, predicate, what=what, timeout=timeout, interval=interval, encoding=encoding)
+
+    def wait_json(self, path, predicate=None, what=None, timeout=10, interval=0.05, encoding="utf-8"):
+        return wait_json(path, predicate=predicate, what=what, timeout=timeout, interval=interval, encoding=encoding)
+
+    def wait_gone(self, target, what=None, timeout=10, interval=0.05):
+        return wait_gone(target, what=what, timeout=timeout, interval=interval)
 
     def wait_premerge(self, run_dir, expected=("ready",), timeout=15.0):
         pm_file = Path(run_dir) / "premerge.json"
         wanted = set(expected)
-
-        def check():
-            if not pm_file.is_file():
-                return False
-            try:
-                doc = json.loads(pm_file.read_text())
-            except ValueError:
-                return False
-            return doc.get("status") in wanted
-
-        self.until(check, f"premerge.json status in {wanted}", timeout=timeout)
-        return json.loads(pm_file.read_text())
+        return self.wait_json(
+            pm_file,
+            lambda doc: doc.get("status") in wanted,
+            f"premerge.json status in {wanted}",
+            timeout=timeout,
+        )
 
     def hold_lane(self, seconds):
         """Occupy the heavy lane from another process, as a caller's own check would."""
@@ -913,6 +1042,28 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         self.addCleanup(holder.kill)
         self.until(lambda: "caller check" in self.cli("lane").stdout, "the lane holder")
         return holder
+
+    def hold_lane_gated(self, label="caller check", gate=None):
+        """Occupy the heavy lane until `gate` is touched, returning `(holder, gate_path)`."""
+        self.env["DELEGATE_MAX_HEAVY"] = "1"
+        gate_path = Path(gate) if gate is not None else self.work / f"lane-gate-{time.monotonic_ns()}"
+        cmd = f"while [ ! -f {shlex.quote(str(gate_path))} ]; do sleep .02; done"
+        holder = subprocess.Popen([str(DELEGATE), "lane", "--label", label, cmd], env=self.env)
+
+        def _cleanup():
+            if gate_path.parent.exists():
+                gate_path.touch()
+            if holder.poll() is None:
+                holder.terminate()
+                try:
+                    holder.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    holder.kill()
+                    holder.wait(timeout=5)
+
+        self.addCleanup(_cleanup)
+        self.until(lambda: label in self.cli("lane").stdout, f"lane holder {label}")
+        return holder, gate_path
 
     def test_lane_runs_heavy_commands_one_at_a_time(self):
         self.env["DELEGATE_MAX_HEAVY"] = "1"
@@ -967,9 +1118,15 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         self.assertFalse((self.work / "accepted").exists())
         self.assertEqual([ln for ln in self.cli("lane").stdout.splitlines() if ln.startswith(("running", "queued"))], [])
         # Started from inside a lane command, a run still queues: the slot it was started in is not its own.
-        self.hold_lane(2)
+        holder2, gate2 = self.hold_lane_gated()
         self.env["DELEGATE_LANE_HELD"] = "1"
-        state = self.outcome(self.cli("run", "--accept", "true", "task"))
+        queued_run = self.outcome(self.cli("start", "--accept", "true", "task"))
+        self.until(lambda: f"accept {queued_run['run']}" in self.cli("lane").stdout, "nested-env acceptance to queue")
+        release_at = time.monotonic() + 1.2
+        self.until(lambda: time.monotonic() >= release_at, "nested-env acceptance waited >= 1s")
+        gate2.touch()
+        holder2.wait(timeout=10)
+        state = self.outcome(self.cli("wait", queued_run["run"]))
         self.assertGreaterEqual(state["accept"]["queuedSeconds"], 1)
 
     def test_terminating_lane_ends_its_command_before_the_slot_is_free(self):
@@ -1000,26 +1157,22 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
         self.env["DELEGATE_TIMEOUT_GRACE"] = "0"
         self.assertEqual(self.outcome(self.cli("run", "--timeout", "1", "task"))["state"], "timeout")
         # Waiting in the lane for its own check does not use up the agent's time.
-        lane_gate = self.work / "lane-release"
-        self.env["DELEGATE_MAX_HEAVY"] = "1"
-        holder = subprocess.Popen(
-            [str(DELEGATE), "lane", "--label", "caller check",
-             f"while [ ! -f {shlex.quote(str(lane_gate))} ]; do sleep .05; done"],
-            env=self.env,
-        )
-        self.addCleanup(lambda: (lane_gate.touch(), holder.kill()))
-        self.until(lambda: "caller check" in self.cli("lane").stdout, "the lane holder")
+        holder, lane_gate = self.hold_lane_gated()
         self.fake_pi([answer("checked"), SETTLED], pre=f"{DELEGATE} lane --label agent-check true")
         proc = subprocess.Popen(
             [str(DELEGATE), "run", "--json", "--timeout", "1", "task"],
-            cwd=self.work, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cwd=self.work, env=self.env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
+        self.addCleanup(lambda: (lane_gate.touch(), proc.poll() is None and proc.terminate()))
         self.until(
             lambda: "queued" in self.cli("lane").stdout and "agent-check" in self.cli("lane").stdout,
             "agent lane check queued",
         )
-        time.sleep(1.5)
+        release_at = time.monotonic() + 1.5
+        self.until(lambda: time.monotonic() >= release_at, "lane queue exceeds timeout")
         lane_gate.touch()
+        holder.wait(timeout=10)
         out, err = proc.communicate(timeout=30)
         self.assertEqual(proc.returncode, 0, out + err)
         state = self.outcome(subprocess.CompletedProcess(proc.args, proc.returncode, out, err))
@@ -1634,7 +1787,7 @@ db.write_text(json.dumps(units))
         self.fake_pi([interrupted(), SETTLED], probe=[answer("ok"), SETTLED])
         started = self.outcome(self.cli("start", "--name", "broken", "task"))
         run = Path(started["dir"])
-        self.until(lambda: '"resume"' in (run / "events.jsonl").read_text(), "the resume wait")
+        self.wait_text(run / "events.jsonl", '"resume"', "the resume wait")
         self.assertIn("第 1 次续做", self.cli("status", "broken", human=True).stdout)
         self.assertEqual(self.cli("stop", "broken").returncode, 0)
         state = self.outcome(self.cli("status", "broken"))
@@ -1675,26 +1828,20 @@ db.write_text(json.dumps(units))
         self.assertFalse((self.work / "runs").exists())
 
     def test_wait_slices_guard_writes_and_stop(self):
-        self.fake_pi([answer("slow"), SETTLED], sleep=30)
-        self.assertEqual(self.cli("start", "--name", "slow", "work").returncode, 0)
+        self.start_gated("--name", "slow", "work", attempts=([answer("slow"), SETTLED],))
         result = self.cli("wait", "slow", "--max", "0.3")
         self.assertEqual(result.returncode, 75)
         self.assertEqual(self.outcome(result)["state"], "running")
         result = self.cli("start", "second", "writer")
         self.assertEqual(result.returncode, 2)
         self.assertIn("still active", result.stderr)
-        self.assertEqual(self.cli("start", "--read-only", "reviewer").returncode, 0)
-        pi_log = self.work / "pi.log"
-        self.until(
-            lambda: pi_log.is_file() and len(pi_log.read_text().splitlines()) >= 2,
-            "both fake_pi processes logged",
-        )
-        pids = [int(line.split()[0]) for line in pi_log.read_text().splitlines()]
+        self.start_gated("--read-only", "reviewer", install_pi=False)
+        pids = [int(line.split()[0]) for line in (self.work / "pi.log").read_text().splitlines()]
+        self.assertEqual(len(pids), 2)
         result = self.cli("stop", "slow", "last")
         self.assertEqual([json.loads(line)["state"] for line in result.stdout.splitlines()], ["stopped", "stopped"])
         for pid in pids:
-            with self.assertRaises(ProcessLookupError):
-                os.kill(pid, 0)
+            self.wait_gone(pid, f"stopped pi pid {pid}")
         self.assertEqual(self.cli("clean", "--finished").stdout.count("removed"), 2)
 
     def test_concurrent_writers_share_start_lock(self):
@@ -2183,22 +2330,24 @@ db.write_text(json.dumps(units))
         self.assertEqual(list(Path(state["dir"]).glob(".snapshot-index-*")), [])
 
     def test_caller_is_written_for_start_run_reply_and_waiting_run(self):
-        self.fake_pi([answer("ok"), SETTLED],
-                     pre='if [ -f "$DELEGATE_RUN_DIR/block" ]; then while [ ! -f "$DELEGATE_RUN_DIR/go" ]; do sleep .02; done; fi')
+        self.fake_pi([answer("ok"), SETTLED])
         self.env["CLAUDE_CODE_SESSION_ID"] = "claude-session"
         first = self.outcome(self.cli("start", "--read-only", "task"))
         self.assertEqual(json.loads((Path(first["dir"]) / "meta.json").read_text())["caller"], "claude-session")
+        self.assertEqual(self.cli("wait", first["run"]).returncode, 0)
         self.env["DELEGATE_CALLER"] = "explicit-session"
-        gate = self.work / "caller-gate"
-        self.fake_pi([answer("ok"), SETTLED], pre=f"while [ ! -f {gate} ]; do sleep .02; done")
         self.env["DELEGATE_MAX_ACTIVE"] = "1"
-        blocker = self.outcome(self.cli("start", "--read-only", "blocker"))
-        self.addCleanup(self.cli, "stop", blocker["dir"])
+        blocker, gate = self.start_gated("--read-only", "blocker", attempts=([answer("ok"), SETTLED],))
         waiting = self.outcome(self.cli("start", "--read-only", "later"))
-        self.addCleanup(self.cli, "stop", waiting["dir"])
+        waiting_gate = Path(waiting["dir"]) / ".fake-gate"
+        self.addCleanup(lambda: (
+            waiting_gate.touch() if waiting_gate.parent.exists() else None,
+            self.cli("stop", waiting["dir"]) if Path(waiting["dir"]).exists() else None,
+        ))
         self.assertEqual(json.loads((Path(waiting["dir"]) / "meta.json").read_text())["caller"],
                          "explicit-session")
         gate.touch()
+        waiting_gate.touch()
         self.assertEqual(self.cli("wait", blocker["run"]).returncode, 0)
         self.assertEqual(self.cli("wait", waiting["run"]).returncode, 0)
         del self.env["DELEGATE_MAX_ACTIVE"]
@@ -2206,7 +2355,6 @@ db.write_text(json.dumps(units))
         synchronous = self.outcome(self.cli("run", "--read-only", "another"))
         self.assertEqual(json.loads((Path(synchronous["dir"]) / "meta.json").read_text())["caller"],
                          "explicit-session")
-        self.assertEqual(self.cli("wait", first["run"]).returncode, 0)
         replied = self.outcome(self.cli("reply", first["run"], "more"))
         self.assertEqual(json.loads((Path(replied["dir"]) / "meta.json").read_text())["caller"],
                          "explicit-session")
@@ -2587,18 +2735,14 @@ db.write_text(json.dumps(units))
         self.assertTrue(all("--fork" in call for call in calls[1:]))
 
     def test_agent_that_outlives_its_supervisor_blocks_clean_until_stopped(self):
-        self.fake_pi([answer("slow"), SETTLED], sleep=30)
-        run = Path(json.loads(self.cli("start", "--name", "orphan", "task").stdout)["dir"])
-        for _ in range(50):
-            if (run / "agent.pid").is_file():
-                break
-            time.sleep(0.1)
+        orphan, _ = self.start_gated("--name", "orphan", "task", attempts=([answer("slow"), SETTLED],))
+        run = Path(orphan["dir"])
         os.kill(int((run / "pid").read_text()), signal.SIGKILL)
         agent = int((run / "agent.pid").read_text())
         self.assertIn("outlived the supervisor", self.cli("clean", "orphan").stderr)
         self.assertEqual(self.cli("start", "--name", "rival", "task").returncode, 2)  # still writing here
         self.cli("stop", "orphan")
-        self.until(lambda: not delegate_pid_alive(agent), "the orphaned agent to go")  # not a fixed sleep: load varies
+        self.wait_gone(agent, "the orphaned agent to go")
         self.assertIn("removed", self.cli("clean", "orphan").stdout)
 
     def test_snapshot_survives_undecodable_names_and_sees_submodules(self):
@@ -3315,24 +3459,33 @@ db.write_text(json.dumps(units))
 
     def test_start_reports_running_write_tasks_and_named_overlap(self):
         repo = self.repo({"src/hot_file.rs": "old\n", "other.txt": "old\n"})
-        self.fake_pi([answer("done"), SETTLED], pre="echo new > src/hot_file.rs", sleep=20)
-        first = self.outcome(self.cli("start", "--worktree", "--workdir", repo, "--name", "hotwork", "task"))
+        first, _ = self.start_gated(
+            "--worktree", "--workdir", repo, "--name", "hotwork", "task",
+            attempts=([answer("done"), SETTLED],),
+            pre="echo new > src/hot_file.rs",
+        )
         edited = Path(first["worktree"]) / "src/hot_file.rs"
-        deadline = time.time() + 10
-        while not (edited.is_file() and edited.read_text() == "new\n") and time.time() < deadline:
-            time.sleep(0.05)
+        self.wait_text(edited, lambda txt: txt == "new\n", "hot_file.rs edited")
+        started_states = [first]
         try:
             named = self.cli("start", "--worktree", "--workdir", repo, "--name", "second", "fix src/hot_file.rs")
+            started_states.append(self.outcome(named))
             self.assertIn("overlap: write task hotwork is running on this source (1 files changed so far: src/hot_file.rs)",
                           named.stderr)
             self.assertIn("waiting for hotwork", named.stderr)
             unrelated = self.cli("start", "--worktree", "--workdir", repo, "--name", "third", "edit other.txt")
+            started_states.append(self.outcome(unrelated))
             self.assertIn("note: write task hotwork", unrelated.stderr)
             self.assertNotIn("overlap:", unrelated.stderr)
             reader = self.cli("start", "--read-only", "--workdir", repo, "look at hot_file.rs")
+            started_states.append(self.outcome(reader))
             self.assertNotIn("hotwork", reader.stderr)
         finally:
-            self.cli("stop", "hotwork", "second", "third")
+            for st in started_states:
+                run_dir = Path(st["dir"])
+                if run_dir.exists():
+                    (run_dir / ".fake-gate").touch()
+            self.cli("stop", *(st["run"] for st in started_states))
 
     def test_in_place_write_moves_to_worktree_while_another_write_runs(self):
         repo = self.repo({"a.txt": "old\n", "b.txt": "old\n"})
