@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `delegate`：额度耗尽预估按窗口选择用量回看期（不再使用 1 小时档）——周额度取近 24 小时平均（24 小时内才开始有记录则按有记录以来的时长平均、至少 1 小时，标 `since:Nh`；24 小时无用量退到 7 天平均），5 小时额度取近 5 小时平均（无用量退到 24 小时平均）；账号级与池级共用 `burn_rate_for_window` / `estimate_window_with_burn_rate`，`delegate-tui` `pace_prefix` 同步展示 `24h` / `5h` / `7d` / `since:Nh` 文案。
+
 ## delegate 6.42.0 - 2026-11-24
 
 - `delegate` 6.42.0：工作表防晾置闭环机制——`work.rs` 老化默认阈值调为 `verify` 4h、`ready` 8h、同项提醒冷却 6h；`claude-code-stop.py` 末尾在无更高优阻断且本仓库有空闲位时，挑出老化 `ready`（不含所有者项）/`verify` 及缺 `--brief` 的 `ready` 项中最老 3 条阻断并经 `<state>/work-remind.json` 维持 6h 冷却，`hook stats` 新增 `close`/`wait_on`/`defer`（含 `work` 钩子）归因，同一项连续暂缓 3 次在工作表标「反复暂缓」；`work add` 新增 `--needs-owner <nod|act|card>` 同时建 `Qxx` 并挂 `owner:Qxx` 直接进 `blocked`，标题/完成条件命中审批或不可逆关键词且未设前置时印警告不拒绝；`WorkItem` 新增 `verify_on`（`add`/`wait --verify-on` 支持 `run_applied:`/`work_closed:`/`owner:`/`commit_exists:<sha>`，拒绝 `cmd:`），`reconcile` 全部满足自动关闭并写入求值证据，无 `verify_on` 的 `verify` 项在写任务合入时不自动关；`delegate-tui` 工作表行尾增加 `停 Nh`（1× 黄 / 2× 红）与 `缺说明`、顶栏有老化项时多一格 `老化 N`。

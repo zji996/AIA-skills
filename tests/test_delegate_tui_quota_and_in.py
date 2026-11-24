@@ -101,7 +101,7 @@ class DelegateQuotaAndInFailClosedTests(unittest.TestCase):
         mock_agy.chmod(0o755)
         self.env["DELEGATE_AGY_BIN"] = str(mock_agy)
 
-        # Seed 1h and 5h/7d usage for `alpha` so burn-rate uses recent 1h pace (`burnRateSource == "1h"`).
+        # Seed 3h of usage for `alpha`: weekly uses `since:3h` average, fiveHour uses `5h` average.
         now = int(time.time())
         ledger = Path(self.env["XDG_STATE_HOME"]) / "delegate/agy-usage.jsonl"
         ledger.parent.mkdir(parents=True, exist_ok=True)
@@ -190,15 +190,20 @@ class DelegateQuotaAndInFailClosedTests(unittest.TestCase):
         self.assertEqual(claude_row["remainingPct"], 75.0)
         self.assertEqual(claude_row["resetAt"], "")
 
-        # Real quota takes priority over manual note (90% weekly vs manual 50%) and uses 1h burn rate!
+        # Real quota takes priority over manual note (90% weekly vs manual 50%):
+        # weekly uses `since:3h` average (~3.33M/h), fiveHour uses `5h` average (2M/h).
         self.assertEqual(alpha["quotaNote"]["weekly"], 50.0)
         self.assertEqual(alpha["quotaEstimate"]["weekly"]["source"], "real")
         self.assertEqual(alpha["quotaEstimate"]["weekly"]["remainingPct"], 90.0)
-        self.assertEqual(alpha["quotaEstimate"]["weekly"]["burnRateSource"], "1h")
-        self.assertEqual(alpha["quotaEstimate"]["weekly"]["burnRatePerHour"], 4_000_000)
-        # 10M tokens used in 7d / 10% used = 1M per 1% -> 90% rem = 90M / 4M/h = 22.5h
+        self.assertEqual(alpha["quotaEstimate"]["weekly"]["burnRateSource"], "since:3h")
+        self.assertAlmostEqual(alpha["quotaEstimate"]["weekly"]["burnRatePerHour"], 3_333_333, delta=5_000)
+        # 10M tokens used in 7d / 10% used = 1M per 1% -> 90% rem = 90M / (10M/3h) = 27.0h
         self.assertEqual(alpha["quotaEstimate"]["weekly"]["tokensPerPct"], 1_000_000)
-        self.assertEqual(alpha["quotaEstimate"]["weekly"]["estimatedRemainingHours"], 22.5)
+        self.assertAlmostEqual(alpha["quotaEstimate"]["weekly"]["estimatedRemainingHours"], 27.0, delta=0.1)
+        # Lowest fiveHour pool is Claude/GPT at 75% (25% used -> 400K/1% -> 30M rem / 2M/h = 15.0h)
+        self.assertEqual(alpha["quotaEstimate"]["fiveHour"]["burnRateSource"], "5h")
+        self.assertEqual(alpha["quotaEstimate"]["fiveHour"]["burnRatePerHour"], 2_000_000)
+        self.assertEqual(alpha["quotaEstimate"]["fiveHour"]["estimatedRemainingHours"], 15.0)
         self.assertEqual(alpha["usage"]["oneHour"]["total"], 4_000_000)
         self.assertEqual(len(alpha["usage"]["hourly24h"]), 24)
         self.assertEqual(alpha["usage"]["hourly24h"][-1], 4_000_000)

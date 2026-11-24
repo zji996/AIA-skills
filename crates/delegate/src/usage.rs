@@ -1939,6 +1939,86 @@ fn fill_hourly_24h(entries: &[&UsageEntry], now_ep: i64) -> [u64; 24] {
     buckets
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaWindowKind {
+    Weekly,
+    FiveHour,
+}
+
+fn burn_rate_24h(entries: &[&UsageEntry], now_ep: i64) -> Option<(f64, String)> {
+    let cutoff_24h = now_ep - TWENTY_FOUR_HOURS_SECS;
+    let t24: i64 = entries
+        .iter()
+        .filter(|e| e.epoch >= cutoff_24h)
+        .map(|e| e.tokens.total())
+        .sum();
+    if t24 <= 0 {
+        return None;
+    }
+    let earliest_ep = entries
+        .iter()
+        .filter(|e| e.tokens.total() > 0)
+        .map(|e| e.epoch)
+        .min()?;
+    if earliest_ep <= cutoff_24h {
+        Some((t24 as f64 / 24.0, "24h".to_string()))
+    } else {
+        let elapsed_secs = (now_ep - earliest_ep).max(ONE_HOUR_SECS);
+        let elapsed_hours = elapsed_secs as f64 / ONE_HOUR_SECS as f64;
+        let label_hours = (elapsed_hours.round() as i64).clamp(1, 24);
+        if label_hours >= 24 {
+            Some((t24 as f64 / 24.0, "24h".to_string()))
+        } else {
+            Some((t24 as f64 / elapsed_hours, format!("since:{label_hours}h")))
+        }
+    }
+}
+
+/// Compute hourly burn rate `(tokens_per_hour, burn_rate_source)` for a quota window.
+/// Shared by both account-level and pool-level estimation; 1h is never used.
+/// - `Weekly`: last 24h average (or elapsed time since first record, at least 1h, when
+///   all records started within the last 24h), falling back to 7d average.
+/// - `FiveHour`: last 5h average, falling back to 24h average.
+pub fn burn_rate_for_window(
+    entries: &[&UsageEntry],
+    now_ep: i64,
+    kind: QuotaWindowKind,
+) -> (f64, String) {
+    match kind {
+        QuotaWindowKind::Weekly => {
+            if let Some(res) = burn_rate_24h(entries, now_ep) {
+                return res;
+            }
+            let cutoff_7d = now_ep - SEVEN_DAYS_SECS;
+            let t7: i64 = entries
+                .iter()
+                .filter(|e| e.epoch >= cutoff_7d)
+                .map(|e| e.tokens.total())
+                .sum();
+            if t7 > 0 {
+                (t7 as f64 / 168.0, "7d".to_string())
+            } else {
+                (0.0, "none".to_string())
+            }
+        }
+        QuotaWindowKind::FiveHour => {
+            let cutoff_5h = now_ep - FIVE_HOURS_SECS;
+            let t5: i64 = entries
+                .iter()
+                .filter(|e| e.epoch >= cutoff_5h)
+                .map(|e| e.tokens.total())
+                .sum();
+            if t5 > 0 {
+                return (t5 as f64 / 5.0, "5h".to_string());
+            }
+            if let Some(res) = burn_rate_24h(entries, now_ep) {
+                return res;
+            }
+            (0.0, "none".to_string())
+        }
+    }
+}
+
 fn attach_estimate_meta(mut est: Value, source: &str, burn_rate_source: &str, pool: Option<&str>) -> Value {
     if let Some(obj) = est.as_object_mut() {
         obj.insert("source".into(), json!(source));
@@ -1948,6 +2028,47 @@ fn attach_estimate_meta(mut est: Value, source: &str, burn_rate_source: &str, po
         }
     }
     est
+}
+
+fn estimate_window_with_burn_rate(
+    notes: &[QuotaNotePoint],
+    kind: QuotaWindowKind,
+    now_ep: i64,
+    entries: &[&UsageEntry],
+    fallback_burn: Option<(f64, &str)>,
+    source: &str,
+    pool: Option<&str>,
+) -> Option<Value> {
+    let (window_secs, extract): (i64, fn(&QuotaNotePoint) -> Option<f64>) = match kind {
+        QuotaWindowKind::Weekly => (SEVEN_DAYS_SECS, |p| p.weekly),
+        QuotaWindowKind::FiveHour => (FIVE_HOURS_SECS, |p| p.five_hour),
+    };
+    let cutoff = now_ep - window_secs;
+    let window_total_tokens: i64 = entries
+        .iter()
+        .filter(|e| e.epoch >= cutoff)
+        .map(|e| e.tokens.total())
+        .sum();
+    let (burn_rate, burn_src) = {
+        let (r, src) = burn_rate_for_window(entries, now_ep, kind);
+        if r > 0.0 {
+            (r, src)
+        } else if let Some((fr, fsrc)) = fallback_burn {
+            (fr, fsrc.to_string())
+        } else {
+            (r, src)
+        }
+    };
+    estimate_quota_window(
+        notes,
+        extract,
+        window_secs,
+        now_ep,
+        entries,
+        window_total_tokens,
+        burn_rate,
+    )
+    .map(|v| attach_estimate_meta(v, source, &burn_src, pool))
 }
 
 /// Lock-free, zero-subprocess local 1h / 5h / 7d usage + 24h hourly series + quota estimates
@@ -2050,18 +2171,10 @@ pub fn accounts_usage_snapshot(
             Value::Null
         };
 
-        let t1 = s1.total().total();
-        let t5 = s5.total().total();
-        let t7 = s7.total().total();
-        let (burn_rate_per_hour, burn_rate_source) = if t1 > 0 {
-            (t1 as f64, "1h")
-        } else if t5 > 0 {
-            (t5 as f64 / 5.0, "5h")
-        } else if t7 > 0 {
-            (t7 as f64 / 168.0, "7d")
-        } else {
-            (0.0, "none")
-        };
+        let (acct_weekly_burn, acct_weekly_bsrc) =
+            burn_rate_for_window(&acct_entries, now_ep, QuotaWindowKind::Weekly);
+        let (acct_5h_burn, acct_5h_bsrc) =
+            burn_rate_for_window(&acct_entries, now_ep, QuotaWindowKind::FiveHour);
 
         // Real quota takes priority over manual `note`.
         let acct_quota = &quota_cache["accounts"][id];
@@ -2093,47 +2206,25 @@ pub fn accounts_usage_snapshot(
             } else {
                 &matched
             };
-            let pt1: i64 = use_entries
-                .iter()
-                .filter(|e| e.epoch >= cutoff_1h)
-                .map(|e| e.tokens.total())
-                .sum();
-            let pt5: i64 = use_entries
-                .iter()
-                .filter(|e| e.epoch >= cutoff_5h)
-                .map(|e| e.tokens.total())
-                .sum();
-            let pt7: i64 = use_entries.iter().map(|e| e.tokens.total()).sum();
-            let (p_burn, p_bsrc) = if pt1 > 0 {
-                (pt1 as f64, "1h")
-            } else if pt5 > 0 {
-                (pt5 as f64 / 5.0, "5h")
-            } else if pt7 > 0 {
-                (pt7 as f64 / 168.0, "7d")
-            } else {
-                (burn_rate_per_hour, burn_rate_source)
-            };
 
-            let pw = estimate_quota_window(
+            let pw = estimate_window_with_burn_rate(
                 &real_pts,
-                |p| p.weekly,
-                SEVEN_DAYS_SECS,
+                QuotaWindowKind::Weekly,
                 now_ep,
                 use_entries,
-                pt7,
-                p_burn,
-            )
-            .map(|v| attach_estimate_meta(v, "real", p_bsrc, Some(pname)));
-            let pfh = estimate_quota_window(
+                Some((acct_weekly_burn, &acct_weekly_bsrc)),
+                "real",
+                Some(pname),
+            );
+            let pfh = estimate_window_with_burn_rate(
                 &real_pts,
-                |p| p.five_hour,
-                FIVE_HOURS_SECS,
+                QuotaWindowKind::FiveHour,
                 now_ep,
                 use_entries,
-                pt5,
-                p_burn,
-            )
-            .map(|v| attach_estimate_meta(v, "real", p_bsrc, Some(pname)));
+                Some((acct_5h_burn, &acct_5h_bsrc)),
+                "real",
+                Some(pname),
+            );
 
             if let Some(ref wv) = pw {
                 let pct = wv["remainingPct"].as_f64().unwrap_or(100.0);
@@ -2167,56 +2258,52 @@ pub fn accounts_usage_snapshot(
             .map(|(_, v)| v)
             .or_else(|| {
                 let real_all = parse_real_quota_points_for_pool(acct_quota, None);
-                estimate_quota_window(
+                estimate_window_with_burn_rate(
                     &real_all,
-                    |p| p.weekly,
-                    SEVEN_DAYS_SECS,
+                    QuotaWindowKind::Weekly,
                     now_ep,
                     &acct_entries,
-                    t7,
-                    burn_rate_per_hour,
+                    None,
+                    "real",
+                    None,
                 )
-                .map(|v| attach_estimate_meta(v, "real", burn_rate_source, None))
             })
             .or_else(|| {
-                estimate_quota_window(
+                estimate_window_with_burn_rate(
                     &note_pts,
-                    |p| p.weekly,
-                    SEVEN_DAYS_SECS,
+                    QuotaWindowKind::Weekly,
                     now_ep,
                     &acct_entries,
-                    t7,
-                    burn_rate_per_hour,
+                    None,
+                    "note",
+                    None,
                 )
-                .map(|v| attach_estimate_meta(v, "note", burn_rate_source, None))
             });
 
         let est_five_hour = best_real_five_hour
             .map(|(_, v)| v)
             .or_else(|| {
                 let real_all = parse_real_quota_points_for_pool(acct_quota, None);
-                estimate_quota_window(
+                estimate_window_with_burn_rate(
                     &real_all,
-                    |p| p.five_hour,
-                    FIVE_HOURS_SECS,
+                    QuotaWindowKind::FiveHour,
                     now_ep,
                     &acct_entries,
-                    t5,
-                    burn_rate_per_hour,
+                    None,
+                    "real",
+                    None,
                 )
-                .map(|v| attach_estimate_meta(v, "real", burn_rate_source, None))
             })
             .or_else(|| {
-                estimate_quota_window(
+                estimate_window_with_burn_rate(
                     &note_pts,
-                    |p| p.five_hour,
-                    FIVE_HOURS_SECS,
+                    QuotaWindowKind::FiveHour,
                     now_ep,
                     &acct_entries,
-                    t5,
-                    burn_rate_per_hour,
+                    None,
+                    "note",
+                    None,
                 )
-                .map(|v| attach_estimate_meta(v, "note", burn_rate_source, None))
             });
 
         let quota_estimate =
@@ -2793,5 +2880,122 @@ mod tests {
         assert_eq!(today["firstRoundPass"], 1);
         assert_eq!(today["firstRoundPassPct"], 50);
         assert_eq!(today["avgMergeSecs"], 1200);
+    }
+
+    #[test]
+    fn burn_rate_window_selection_and_estimation() {
+        let now = 1_800_000_000i64;
+        let make_entry = |epoch: i64, total_tokens: i64| UsageEntry {
+            epoch,
+            run: format!("r-{epoch}"),
+            repo: "/repo".into(),
+            repo_name: "repo".into(),
+            role: "author".into(),
+            mode: "write".into(),
+            rework: false,
+            model: "agy/gemini-4-neon".into(),
+            is_agy: true,
+            account: Some("alpha".into()),
+            tokens: TokenCounts::new(total_tokens, 0, 0),
+            live: false,
+        };
+
+        // 1. Same fixture: 23h steady (1M/h) + last 1h 10x spike (10M/h), with history > 24h.
+        let mut spike_entries = vec![make_entry(now - 30 * 3600, 1_000_000)];
+        for h in 1..=23 {
+            // hours 1..=23 ago: 1M each
+            spike_entries.push(make_entry(now - h * 3600 - 1800, 1_000_000));
+        }
+        // last 1h: 10x spike (10M)
+        spike_entries.push(make_entry(now - 1800, 10_000_000));
+        let spike_refs: Vec<&UsageEntry> = spike_entries.iter().collect();
+
+        // Weekly uses 24h average: (23M + 10M) / 24 = 1.375M/h (unaffected by 1h spike rate of 10M/h).
+        let (wk_rate, wk_src) = burn_rate_for_window(&spike_refs, now, QuotaWindowKind::Weekly);
+        assert_eq!(wk_src, "24h");
+        assert!((wk_rate - 1_375_000.0).abs() < 1e-6);
+
+        // Five-hour uses 5h average: (4M + 10M) / 5 = 2.8M/h.
+        let (fh_rate, fh_src) = burn_rate_for_window(&spike_refs, now, QuotaWindowKind::FiveHour);
+        assert_eq!(fh_src, "5h");
+        assert!((fh_rate - 2_800_000.0).abs() < 1e-6);
+
+        // Verify end-to-end estimate_window_with_burn_rate for both windows & pool metadata.
+        let note = QuotaNotePoint {
+            epoch: now - 60,
+            weekly: Some(66.0),    // 34% used -> 34M / 34 = 1M/1% -> 66M rem
+            five_hour: Some(30.0), // 70% used -> 14M / 70 = 200K/1% -> 6M rem
+        };
+        let wk_est = estimate_window_with_burn_rate(
+            &[note],
+            QuotaWindowKind::Weekly,
+            now,
+            &spike_refs,
+            None,
+            "real",
+            Some("Gemini Models"),
+        )
+        .unwrap();
+        assert_eq!(wk_est["burnRateSource"], "24h");
+        assert_eq!(wk_est["burnRatePerHour"], 1_375_000);
+        assert_eq!(wk_est["pool"], "Gemini Models");
+        // 66M / 1.375M/h = 48.0h (would have been 6.6h under old 1h spike burn rate).
+        assert_eq!(wk_est["estimatedRemainingHours"], 48.0);
+
+        let fh_est = estimate_window_with_burn_rate(
+            &[note],
+            QuotaWindowKind::FiveHour,
+            now,
+            &spike_refs,
+            None,
+            "real",
+            Some("Gemini Models"),
+        )
+        .unwrap();
+        assert_eq!(fh_est["burnRateSource"], "5h");
+        assert_eq!(fh_est["burnRatePerHour"], 2_800_000);
+        assert_eq!(fh_est["estimatedRemainingHours"], round2(6_000_000.0 / 2_800_000.0));
+
+        // 2. Account with only 3 hours of records: weekly averages over 3h (`since:3h`), 5h over 5h.
+        let short_entries = vec![
+            make_entry(now - 3 * 3600, 1_500_000),
+            make_entry(now - 3600, 1_500_000),
+        ];
+        let short_refs: Vec<&UsageEntry> = short_entries.iter().collect();
+        let (s_wk_rate, s_wk_src) = burn_rate_for_window(&short_refs, now, QuotaWindowKind::Weekly);
+        assert_eq!(s_wk_src, "since:3h");
+        assert!((s_wk_rate - 1_000_000.0).abs() < 1e-6);
+        let (s_fh_rate, s_fh_src) =
+            burn_rate_for_window(&short_refs, now, QuotaWindowKind::FiveHour);
+        assert_eq!(s_fh_src, "5h");
+        assert!((s_fh_rate - 600_000.0).abs() < 1e-6);
+
+        // 3. Account with < 1h of records: weekly clamps denominator to 1h (`since:1h`).
+        let tiny_entries = vec![make_entry(now - 1200, 2_000_000)];
+        let tiny_refs: Vec<&UsageEntry> = tiny_entries.iter().collect();
+        let (t_wk_rate, t_wk_src) = burn_rate_for_window(&tiny_refs, now, QuotaWindowKind::Weekly);
+        assert_eq!(t_wk_src, "since:1h");
+        assert!((t_wk_rate - 2_000_000.0).abs() < 1e-6);
+
+        // 4. Fallbacks: no 24h usage -> weekly falls back to 7d; no 5h usage -> 5h falls back to 24h.
+        let old_7d_entries = vec![make_entry(now - 48 * 3600, 168_000_000)];
+        let old_7d_refs: Vec<&UsageEntry> = old_7d_entries.iter().collect();
+        let (f7_rate, f7_src) = burn_rate_for_window(&old_7d_refs, now, QuotaWindowKind::Weekly);
+        assert_eq!(f7_src, "7d");
+        assert!((f7_rate - 1_000_000.0).abs() < 1e-6);
+        let (f5_none_rate, f5_none_src) =
+            burn_rate_for_window(&old_7d_refs, now, QuotaWindowKind::FiveHour);
+        assert_eq!(f5_none_src, "none");
+        assert_eq!(f5_none_rate, 0.0);
+
+        let mid_24h_entries = vec![
+            make_entry(now - 30 * 3600, 1_000_000),
+            make_entry(now - 10 * 3600, 24_000_000),
+        ];
+        let mid_24h_refs: Vec<&UsageEntry> = mid_24h_entries.iter().collect();
+        let (f5_24_rate, f5_24_src) =
+            burn_rate_for_window(&mid_24h_refs, now, QuotaWindowKind::FiveHour);
+        assert_eq!(f5_24_src, "24h");
+        assert!((f5_24_rate - 1_000_000.0).abs() < 1e-6);
     }
 }

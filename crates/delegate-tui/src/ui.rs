@@ -3914,12 +3914,23 @@ fn account_has_multiple_pools(acct: &AgyAccountItem) -> bool {
     false
 }
 
-fn pace_prefix(burn_rate_source: &str) -> &'static str {
+fn pace_prefix(burn_rate_source: &str) -> String {
     match burn_rate_source {
-        "1h" => "按最近 1 小时的用量",
-        "5h" => "按最近 5 小时的平均用量",
-        "7d" => "按最近 7 天的平均用量",
-        _ => "按当前用量",
+        "24h" => "按最近 24 小时的平均用量".to_string(),
+        "5h" => "按最近 5 小时的平均用量".to_string(),
+        "7d" => "按最近 7 天的平均用量".to_string(),
+        other => {
+            if let Some(hours) = other
+                .strip_prefix("since:")
+                .and_then(|s| s.strip_suffix('h'))
+                .and_then(|n| n.parse::<u64>().ok())
+                .filter(|&n| n > 0)
+            {
+                format!("按最近 {hours} 小时的平均用量")
+            } else {
+                "按当前用量".to_string()
+            }
+        }
     }
 }
 
@@ -5796,4 +5807,20 @@ fn render_account_switch_modal(
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pace_prefix;
+
+    #[test]
+    fn pace_prefix_formats_all_burn_rate_sources() {
+        assert_eq!(pace_prefix("24h"), "按最近 24 小时的平均用量");
+        assert_eq!(pace_prefix("5h"), "按最近 5 小时的平均用量");
+        assert_eq!(pace_prefix("7d"), "按最近 7 天的平均用量");
+        assert_eq!(pace_prefix("since:3h"), "按最近 3 小时的平均用量");
+        assert_eq!(pace_prefix("since:1h"), "按最近 1 小时的平均用量");
+        assert_eq!(pace_prefix("none"), "按当前用量");
+        assert_eq!(pace_prefix("since:0h"), "按当前用量");
+    }
 }
