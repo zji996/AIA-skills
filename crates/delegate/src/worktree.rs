@@ -582,6 +582,23 @@ pub(crate) fn write_entry(path: &Path, mode: &str, content: &[u8]) -> Res<()> {
     }
     Ok(())
 }
+
+/// Resolve the target file mode when applying or merging a change onto a target file:
+/// - If the incoming side explicitly changed mode (`old_mode != incoming_mode`), use `incoming_mode`.
+/// - Otherwise preserve the target file's current mode (`now_mode`), falling back to `incoming_mode`/`old_mode`.
+fn resolved_mode(
+    old_mode: Option<&str>,
+    incoming_mode: Option<&str>,
+    now_mode: Option<&str>,
+) -> Option<String> {
+    let chosen = if old_mode != incoming_mode {
+        incoming_mode.or(now_mode)
+    } else {
+        now_mode.or(incoming_mode).or(old_mode)
+    };
+    chosen.map(str::to_string)
+}
+
 #[derive(Clone)]
 struct Action {
     kind: String,
@@ -1082,6 +1099,171 @@ pub fn detect_applied(run: &Path, meta: &Value) -> bool {
     }
     ok
 }
+
+pub struct MarkAppliedResult {
+    pub marked_runs: Vec<(PathBuf, Value, Value)>,
+    pub source: PathBuf,
+    pub commit_sha: String,
+    pub applied_at: String,
+    pub checked_files: Vec<String>,
+    pub missing_files: Vec<String>,
+}
+
+/// Manually mark a run (and any unapplied same-worktree ancestors) as applied against a verified
+/// commit in the source repository (defaulting to source `HEAD`).
+pub fn mark_applied(
+    run: &Path,
+    commit_arg: Option<&str>,
+    check_files: bool,
+) -> Res<MarkAppliedResult> {
+    use std::collections::BTreeSet;
+    let meta = json(run.join("meta.json"));
+    if !meta.is_object() {
+        return Err(format!("run metadata not found: {}", run.display()));
+    }
+    let source_str = Some(s(&meta["worktree"], "source"))
+        .filter(|x| !x.is_empty())
+        .or_else(|| Some(s(&meta, "top")).filter(|x| !x.is_empty()))
+        .or_else(|| Some(s(&meta, "workdir")).filter(|x| !x.is_empty()))
+        .ok_or_else(|| "cannot determine source repository for run".to_string())?;
+    let source = PathBuf::from(source_str);
+    if !source.is_dir() {
+        return Err(format!(
+            "source repository does not exist: {}",
+            source.display()
+        ));
+    }
+
+    let commit_sha = if let Some(raw_sha) = commit_arg {
+        let trimmed = raw_sha.trim();
+        if trimmed.is_empty() {
+            return Err("--commit requires a non-empty commit SHA".into());
+        }
+        git_text(
+            &source,
+            &["rev-parse", "--verify", &format!("{trimmed}^{{commit}}")],
+        )
+        .map_err(|_| {
+            format!(
+                "commit '{trimmed}' not found in source repository {}",
+                source.display()
+            )
+        })?
+    } else {
+        git_text(&source, &["rev-parse", "--verify", "HEAD^{commit}"]).map_err(|_| {
+            format!(
+                "cannot resolve HEAD commit in source repository {}",
+                source.display()
+            )
+        })?
+    };
+
+    let checked_files: Vec<String> = pending_changed_paths(run, &meta)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| run_files(run));
+
+    let commit_files: BTreeSet<String> = git_text(
+        &source,
+        &[
+            "log",
+            "-1",
+            "--first-parent",
+            "-m",
+            "--root",
+            "--name-only",
+            "--pretty=format:",
+            &commit_sha,
+        ],
+    )
+    .map(|out| {
+        out.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default();
+
+    let missing_files: Vec<String> = checked_files
+        .iter()
+        .filter(|p| !commit_files.contains(p.as_str()))
+        .cloned()
+        .collect();
+
+    if check_files && !missing_files.is_empty() {
+        let short = &commit_sha[..commit_sha.len().min(7)];
+        return Err(format!(
+            "commit {short} does not contain all net changed files of this run (missing: {})",
+            missing_files.join(", ")
+        ));
+    }
+
+    // Collect this run and any unapplied ancestors sharing the same worktree.
+    let wt_path = s(&meta["worktree"], "path").to_string();
+    let mut chain: Vec<PathBuf> = vec![run.to_path_buf()];
+    let mut cur = run.to_path_buf();
+    let mut cur_meta = meta.clone();
+    let mut seen = BTreeSet::new();
+    seen.insert(crate::events::run_id_for(run, &meta));
+    while !s(&cur_meta, "parent").is_empty() {
+        let parent_id = s(&cur_meta, "parent").to_string();
+        if !seen.insert(parent_id.clone()) {
+            break;
+        }
+        let Some(pdir) = cur.parent().map(|d| d.join(&parent_id)) else {
+            break;
+        };
+        if !pdir.join("meta.json").is_file() || pdir.join(".applied").exists() {
+            break;
+        }
+        let pmeta = json(pdir.join("meta.json"));
+        if !wt_path.is_empty() && s(&pmeta["worktree"], "path") != wt_path {
+            break;
+        }
+        chain.push(pdir.clone());
+        cur = pdir;
+        cur_meta = pmeta;
+    }
+
+    let at = iso();
+    let mut marked_runs = Vec::new();
+    for rdir in chain {
+        let _ = crate::premerge::cancel_for_run(&rdir, &source);
+        let _ = fs::remove_file(crate::premerge::premerge_path(&rdir));
+        let rec = json(rdir.join("changes.json"));
+        let applied_doc = json!({
+            "at": at,
+            "head": commit_sha,
+            "commit": commit_sha,
+            "tree": rec["after"],
+            "large": rec["afterLarge"],
+            "appliedBy": "manual",
+        });
+        write_json(rdir.join(".applied"), &applied_doc)?;
+        let updated_meta = if rdir.join("meta.json").is_file() && !crate::archive::is_record(&rdir) {
+            let mut m = json(rdir.join("meta.json"));
+            m["appliedAt"] = json!(at);
+            m["appliedHead"] = json!(commit_sha);
+            let _ = write_json(rdir.join("meta.json"), &m);
+            m
+        } else {
+            json(rdir.join("meta.json"))
+        };
+        if !s(&rec, "after").is_empty() {
+            crate::refs::pin_slot(&rdir, &updated_meta, "applied", s(&rec, "after"));
+        }
+        marked_runs.push((rdir, updated_meta, applied_doc));
+    }
+
+    Ok(MarkAppliedResult {
+        marked_runs,
+        source,
+        commit_sha,
+        applied_at: at,
+        checked_files,
+        missing_files,
+    })
+}
 /// Active write runs whose source tree is `top`, as (name, in place). Used to
 /// keep the source free for `apply` (field notes 22).
 pub fn active_writes_on(top: &str, except: Option<&Path>) -> Vec<(String, bool)> {
@@ -1279,14 +1461,15 @@ pub fn concurrent_writes(created: &Path) -> Vec<Value> {
         let top = Some(s(&theirs["worktree"], "path"))
             .filter(|x| !x.is_empty())
             .unwrap_or(s(&theirs, "top"));
-        let base = s(&theirs, "chainBase");
+        let base_state = effective_chain_base(&other, &theirs, Path::new(top));
+        let base = s(&base_state, "tree").to_string();
         let changed = if is_active {
             if base.is_empty() {
                 vec![]
             } else {
                 snapshot(Path::new(top), &other, &strings(&theirs["snapshotExclude"]))
                     .and_then(|now| {
-                        tree_changes(Path::new(top), &json!({"tree":base}), &now, false).ok()
+                        tree_changes(Path::new(top), &base_state, &now, false).ok()
                     })
                     .unwrap_or_default()
                     .iter()
@@ -1304,7 +1487,7 @@ pub fn concurrent_writes(created: &Path) -> Vec<Value> {
                 } else if !base.is_empty() && Path::new(top).is_dir() {
                     snapshot(Path::new(top), &other, &strings(&theirs["snapshotExclude"]))
                         .and_then(|now| {
-                            tree_changes(Path::new(top), &json!({"tree":base}), &now, false).ok()
+                            tree_changes(Path::new(top), &base_state, &now, false).ok()
                         })
                         .unwrap_or_default()
                         .iter()
@@ -1332,10 +1515,14 @@ pub fn concurrent_writes(created: &Path) -> Vec<Value> {
             }
         };
 
-        // 1. Migration / numbered-file prefix collisions.
+        // 1. Migration / numbered-file prefix collisions (ignore files already committed on source HEAD).
+        let source_path = Path::new(&ours);
         let mut saw_migration_dir = false;
         for p in &changed {
             let in_mig = p.starts_with("migrations/") || p.contains("/migrations/");
+            if in_mig && path_exists_in_rev(source_path, "HEAD", p) {
+                continue;
+            }
             if let Some((dir, prefix)) = numbered_prefix(p) {
                 if mentions_standalone_digits(&prompt, &prefix) {
                     push_coll(format!("同占编号 {dir}/{prefix}"));
@@ -1581,12 +1768,25 @@ fn replay_commits_onto_base(
 }
 
 pub fn sync_with_mode(run: &Path, meta: &Value, mode: SyncMode) -> Res<SyncReport> {
+    sync_with_mode_inner(run, meta, mode, false)
+}
+
+/// Sync a run's worktree cleanly to the committed source `HEAD` (never pulling dirty
+/// uncommitted working-tree files from source). Used by mainline-blocked auto-rerun.
+pub fn sync_to_head(run: &Path, meta: &Value) -> Res<SyncReport> {
+    sync_with_mode_inner(run, meta, SyncMode::Auto, true)
+}
+
+fn sync_with_mode_inner(
+    run: &Path,
+    meta: &Value,
+    mode: SyncMode,
+    committed_only: bool,
+) -> Res<SyncReport> {
     let agent = mode == SyncMode::Agent;
     let source = PathBuf::from(s(&meta["worktree"], "source"));
     let worktree = PathBuf::from(s(&meta["worktree"], "path"));
     let exclude = strings(&meta["snapshotExclude"]);
-    let current_source = snapshot(&source, run, &exclude)
-        .ok_or_else(|| format!("cannot snapshot {} for --sync", source.display()))?;
     let source_head =
         git_text(&source, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]).unwrap_or_default();
     let source_head_tree = if !source_head.is_empty() {
@@ -1594,7 +1794,17 @@ pub fn sync_with_mode(run: &Path, meta: &Value, mode: SyncMode) -> Res<SyncRepor
     } else {
         String::new()
     };
-    let source_dirty = source_head_tree != s(&current_source, "tree");
+    let (current_source, source_dirty) = if committed_only {
+        if source_head_tree.is_empty() {
+            return Err(format!("cannot resolve HEAD tree for {}", source.display()));
+        }
+        (json!({"tree": source_head_tree, "large": {}}), false)
+    } else {
+        let snap = snapshot(&source, run, &exclude)
+            .ok_or_else(|| format!("cannot snapshot {} for --sync", source.display()))?;
+        let dirty = source_head_tree != s(&snap, "tree");
+        (snap, dirty)
+    };
     let applied = applied_state(run, meta);
     let baseline = if !s(&applied, "tree").is_empty() {
         applied
@@ -1724,11 +1934,12 @@ pub fn sync_with_mode(run: &Path, meta: &Value, mode: SyncMode) -> Res<SyncRepor
                     kind: "merged".into(),
                     path,
                     target,
-                    mode: if old_mode != mode_str {
-                        mode_str.or(now_mode).or(Some("100644".into()))
-                    } else {
-                        None
-                    },
+                    mode: resolved_mode(
+                        old_mode.as_deref(),
+                        mode_str.as_deref(),
+                        now_mode.as_deref(),
+                    )
+                    .or_else(|| Some("100644".into())),
                     content: merged,
                 });
             } else {
@@ -2688,7 +2899,11 @@ pub(crate) fn merge_run_into_dir(
                 kind: if new.is_none() { "deleted" } else { "applied" }.into(),
                 path,
                 target,
-                mode,
+                mode: if new.is_none() {
+                    None
+                } else {
+                    resolved_mode(old_mode.as_deref(), mode.as_deref(), now_mode.as_deref())
+                },
                 content: new.unwrap_or_default(),
             });
         } else if let (Some(base), Some(theirs), Some(mine)) = (&old, &new, &now) {
@@ -2741,7 +2956,7 @@ pub(crate) fn merge_run_into_dir(
                     kind: "merged".into(),
                     path,
                     target,
-                    mode: if old_mode != mode { mode } else { None },
+                    mode: resolved_mode(old_mode.as_deref(), mode.as_deref(), now_mode.as_deref()),
                     content: merged,
                 });
             } else {
@@ -2772,7 +2987,7 @@ pub(crate) fn merge_run_into_dir(
                     kind: "copied".into(),
                     path: path.clone(),
                     target,
-                    mode: Some("large".into()),
+                    mode: entry_mode(&origin),
                     content: fs::read(&origin).map_err(|e| format!("{}: {e}", origin.display()))?,
                 });
             } else if current(&target)
@@ -2831,9 +3046,13 @@ pub(crate) fn merge_run_into_dir(
                 .map_err(|e| e.to_string())
                 .map(|()| remove_empty_parents(&a.target, target_root)),
             "copied" => {
-                fs::create_dir_all(a.target.parent().unwrap_or(target_root))
-                    .map_err(|e| format!("merge {}: {e}", a.target.display()))?;
-                write(&a.target, &a.content)
+                if let Some(mode) = a.mode.as_deref().filter(|m| *m == "100755" || *m == "100644") {
+                    write_entry(&a.target, mode, &a.content)
+                } else {
+                    fs::create_dir_all(a.target.parent().unwrap_or(target_root))
+                        .map_err(|e| format!("merge {}: {e}", a.target.display()))?;
+                    write(&a.target, &a.content)
+                }
             }
             _ => {
                 if let Some(mode) = a.mode.as_deref() {
@@ -3022,7 +3241,7 @@ fn apply_checked(
                 }
                 let _ = write_json(run.join("meta.json"), &updated);
                 crate::refs::pin_slot(run, &meta, "applied", s(&meta["base"], "tree"));
-                crate::premerge::spawn_worker(source);
+                crate::premerge::spawn_worker_force(source);
             } else if let Some((hash, title)) = failed_commit {
                 let short = &hash[..7.min(hash.len())];
                 conclusion["apply"]["failedStep"] = json!("cherry-pick");
@@ -3446,33 +3665,33 @@ fn numbered_prefix(path: &str) -> Option<(String, String)> {
         prefix.into(),
     ))
 }
-/// Numbered files (`0148_name.sql`) that exist only as uncommitted work: in the source
-/// checkout or in another run's worktree. A new task's worktree starts from the last commit
-/// and cannot see them, so its prompt names the numbers to stay clear of.
+fn path_exists_in_rev(repo: &Path, rev: &str, path: &str) -> bool {
+    if rev.is_empty() || path.is_empty() || !repo.is_dir() {
+        return false;
+    }
+    git_command()
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "-e", &format!("{rev}:{path}")])
+        .status()
+        .is_ok_and(|st| st.success())
+}
+
+/// Numbered files (`0148_name.sql`) that exist only as uncommitted work in the source
+/// checkout or as net additions (relative to `netBase` / effective chain base) in another
+/// unapplied run's worktree. Files already present on mainline (`source HEAD`) or synced
+/// from mainline are never reported as occupied by another run.
 pub fn numbers_taken(source: &Path, own: &Path) -> Vec<(String, String, String)> {
     use std::collections::BTreeSet;
-    let mut places = vec![(source.to_path_buf(), "source checkout".to_string())];
-    for run in crate::runs::all_runs() {
-        let meta = json(run.join("meta.json"));
-        let path = PathBuf::from(s(&meta["worktree"], "path"));
-        if Path::new(s(&meta["worktree"], "source")) == source
-            && path != own
-            && path.is_dir()
-            && !places.iter().any(|(seen, _)| seen == &path)
-        {
-            places.push((path, s(&meta, "name").to_string()));
-        }
-    }
     let mut taken = BTreeSet::new();
-    for (place, label) in places {
-        let Ok(out) = git_command()
-            .arg("-C")
-            .arg(&place)
-            .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
-            .output()
-        else {
-            continue;
-        };
+
+    // 1. Uncommitted newly added numbered files in the source checkout (excluding anything in HEAD).
+    if let Ok(out) = git_command()
+        .arg("-C")
+        .arg(source)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+    {
         for entry in out.stdout.split(|b| *b == 0) {
             let entry = String::from_utf8_lossy(entry);
             let Some((status, path)) = entry.split_at_checked(3) else {
@@ -3482,8 +3701,113 @@ pub fn numbers_taken(source: &Path, own: &Path) -> Vec<(String, String, String)>
                 continue;
             }
             if let Some((directory, prefix)) = numbered_prefix(path) {
-                taken.insert((directory, prefix, label.clone()));
+                if !path_exists_in_rev(source, "HEAD", path) {
+                    taken.insert((directory, prefix, "source checkout".to_string()));
+                }
             }
+        }
+    }
+
+    // 2. Other unapplied, non-superseded runs on the same source: count ONLY net newly added
+    //    numbered files relative to the run's netBase / effective chain base, and exclude
+    //    anything already present on mainline (`source HEAD`).
+    let all = crate::runs::all_runs();
+    let superseded_parents: BTreeSet<String> = all
+        .iter()
+        .filter_map(|r| {
+            let p = s(&json(r.join("meta.json")), "parent").to_string();
+            (!p.is_empty()).then_some(p)
+        })
+        .collect();
+    let mut seen_paths: BTreeSet<PathBuf> = BTreeSet::new();
+    seen_paths.insert(own.to_path_buf());
+    seen_paths.insert(source.to_path_buf());
+
+    for run in all {
+        let meta = json(run.join("meta.json"));
+        let wt_path = PathBuf::from(s(&meta["worktree"], "path"));
+        if Path::new(s(&meta["worktree"], "source")) != source
+            || !wt_path.is_dir()
+            || wt_path == own
+            || wt_path == source
+        {
+            continue;
+        }
+        if run.join(".applied").exists()
+            || run.join(".applied-cleaned").exists()
+            || b(&meta, "appliedCleaned")
+        {
+            continue;
+        }
+        let run_id = crate::events::run_id_for(&run, &meta);
+        if superseded_parents.contains(&run_id) {
+            continue;
+        }
+        if !seen_paths.insert(wt_path.clone()) {
+            continue;
+        }
+        let label = s(&meta, "name").to_string();
+        let base_state = effective_chain_base(&run, &meta, &wt_path);
+        let base_tree = s(&base_state, "tree").to_string();
+        let net_base = s(&meta, "netBase").to_string();
+        let base_rev = if !base_tree.is_empty() {
+            base_tree
+        } else if !net_base.is_empty() {
+            net_base.clone()
+        } else {
+            let wb = read(run.join("worktree-base-commit")).trim().to_string();
+            if !wb.is_empty() { wb } else { "HEAD".to_string() }
+        };
+
+        let mut added_paths: BTreeSet<String> = BTreeSet::new();
+        // Tracked additions (committed or staged/working-tree) relative to `base_rev`.
+        if let Ok(out) = git_command()
+            .arg("-C")
+            .arg(&wt_path)
+            .args(["diff", "--name-only", "--diff-filter=A", "-z", &base_rev])
+            .output()
+        {
+            if out.status.success() {
+                for raw in out.stdout.split(|b| *b == 0) {
+                    let p = String::from_utf8_lossy(raw);
+                    if !p.is_empty() {
+                        added_paths.insert(p.into_owned());
+                    }
+                }
+            }
+        }
+        // Untracked files in the worktree (must not already exist in `base_rev`).
+        if let Ok(out) = git_command()
+            .arg("-C")
+            .arg(&wt_path)
+            .args(["ls-files", "--others", "--exclude-standard", "-z"])
+            .output()
+        {
+            if out.status.success() {
+                for raw in out.stdout.split(|b| *b == 0) {
+                    let p = String::from_utf8_lossy(raw);
+                    if !p.is_empty() && !path_exists_in_rev(&wt_path, &base_rev, &p) {
+                        added_paths.insert(p.into_owned());
+                    }
+                }
+            }
+        }
+
+        for path in added_paths {
+            let Some((directory, prefix)) = numbered_prefix(&path) else {
+                continue;
+            };
+            // Exclude anything already committed on source mainline or in the run's netBase.
+            if path_exists_in_rev(source, "HEAD", &path) {
+                continue;
+            }
+            if !net_base.is_empty()
+                && (path_exists_in_rev(&wt_path, &net_base, &path)
+                    || path_exists_in_rev(source, &net_base, &path))
+            {
+                continue;
+            }
+            taken.insert((directory, prefix, label.clone()));
         }
     }
     taken.into_iter().collect()
@@ -3764,7 +4088,11 @@ fn apply_inner(
                     kind: if new.is_none() { "deleted" } else { "applied" }.into(),
                     path,
                     target,
-                    mode,
+                    mode: if new.is_none() {
+                        None
+                    } else {
+                        resolved_mode(old_mode.as_deref(), mode.as_deref(), now_mode.as_deref())
+                    },
                     content: new.unwrap_or_default(),
                 });
             } else if let (Some(base), Some(theirs), Some(mine)) = (&old, &new, &now) {
@@ -3814,12 +4142,14 @@ fn apply_inner(
                 }
                 let merged = fs::read(&minefile).map_err(|e| format!("{}: {e}", minefile.display()))?;
                 fs::remove_dir_all(&scratch).map_err(|e| format!("{}: {e}", scratch.display()))?;
+                let merged_mode =
+                    resolved_mode(old_mode.as_deref(), mode.as_deref(), now_mode.as_deref());
                 if clean {
                     actions.push(Action {
                         kind: "merged".into(),
                         path,
                         target,
-                        mode: if old_mode != mode { mode } else { None },
+                        mode: merged_mode,
                         content: merged,
                     });
                 } else if merge {
@@ -3827,7 +4157,7 @@ fn apply_inner(
                         kind: "conflict-markers".into(),
                         path,
                         target,
-                        mode: None,
+                        mode: merged_mode,
                         content: merged,
                     });
                 } else {
@@ -3882,7 +4212,7 @@ fn apply_inner(
                     kind: "copied".into(),
                     path: path.clone(),
                     target,
-                    mode: Some("large".into()),
+                    mode: entry_mode(&origin),
                     content: fs::read(&origin).map_err(|e| format!("{}: {e}", origin.display()))?,
                 });
             } else {
@@ -4033,9 +4363,13 @@ fn apply_inner(
                         .map_err(|e| e.to_string())
                         .map(|()| remove_empty_parents(&a.target, &source)),
                     "copied" => {
-                        fs::create_dir_all(a.target.parent().unwrap_or(&source))
-                            .map_err(|e| format!("apply {}: {e}", a.target.display()))?;
-                        write(&a.target, &a.content)
+                        if let Some(mode) = a.mode.as_deref().filter(|m| *m == "100755" || *m == "100644") {
+                            write_entry(&a.target, mode, &a.content)
+                        } else {
+                            fs::create_dir_all(a.target.parent().unwrap_or(&source))
+                                .map_err(|e| format!("apply {}: {e}", a.target.display()))?;
+                            write(&a.target, &a.content)
+                        }
                     }
                     _ => {
                         if let Some(mode) = a.mode.as_deref() {

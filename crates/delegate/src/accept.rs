@@ -92,6 +92,7 @@ pub struct SkippedLayer {
     pub command: String,
     pub reason: String,
     pub reused: bool,
+    pub reused_from_round: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -418,6 +419,7 @@ pub fn plan(
                 command: r.command.clone(),
                 reason: format!("改动未命中 {}", format_path_globs(&r.paths)),
                 reused: false,
+                reused_from_round: None,
             });
             continue;
         }
@@ -425,15 +427,23 @@ pub fn plan(
         // files match this layer, reuse the prior pass without re-running it.
         if let Some(delta) = rework_changed_files {
             let touched_by_rework = delta.iter().any(|p| matches_rule_paths(p, &r.paths));
-            if !touched_by_rework && prev_passed.contains_key(&r.name) {
-                skipped.push(SkippedLayer {
-                    name: r.name.clone(),
-                    tier: r.tier,
-                    command: r.command.clone(),
-                    reason: "返工未改动命中路径，沿用上轮通过结果".into(),
-                    reused: true,
-                });
-                continue;
+            if !touched_by_rework {
+                if let Some(prev) = prev_passed.get(&r.name) {
+                    let prev_round = prev["passedRound"].as_u64().filter(|&rn| rn > 0);
+                    let reason = match prev_round {
+                        Some(rn) => format!("返工未改动命中路径，沿用第 {rn} 轮通过"),
+                        None => "返工未改动命中路径，沿用上轮通过结果".into(),
+                    };
+                    skipped.push(SkippedLayer {
+                        name: r.name.clone(),
+                        tier: r.tier,
+                        command: r.command.clone(),
+                        reason,
+                        reused: true,
+                        reused_from_round: prev_round,
+                    });
+                    continue;
+                }
             }
         }
         let spec = AcceptLayerSpec {
@@ -884,7 +894,7 @@ pub fn build_accept_summary(
 
     for sk in &plan.skipped {
         let status = if sk.reused { "reused" } else { "skipped" };
-        all_layers.push(json!({
+        let mut layer_obj = json!({
             "name": sk.name,
             "tier": sk.tier.as_str(),
             "command": sk.command,
@@ -892,13 +902,19 @@ pub fn build_accept_summary(
             "ok": true,
             "reused": sk.reused,
             "reason": sk.reason,
-        }));
-        skipped_layers.push(json!({
+        });
+        let mut skip_obj = json!({
             "name": sk.name,
             "tier": sk.tier.as_str(),
             "reused": sk.reused,
             "reason": sk.reason,
-        }));
+        });
+        if let Some(rn) = sk.reused_from_round {
+            layer_obj["reusedFromRound"] = json!(rn);
+            skip_obj["reusedFromRound"] = json!(rn);
+        }
+        all_layers.push(layer_obj);
+        skipped_layers.push(skip_obj);
         if sk.reused {
             reused_layers.push(sk.name.clone());
         }
@@ -1387,6 +1403,282 @@ pub fn analyze_failure_attribution(
     }))
 }
 
+/// True when an acceptance failure is attributed purely to files outside this run's changes
+/// (`inRunFiles` empty and `outsideRunFiles` non-empty) and is not a cancellation or infra error.
+pub fn is_mainline_blocked(accept_doc: &Value) -> bool {
+    !b(accept_doc, "ok")
+        && !b(accept_doc, "cancelled")
+        && !b(accept_doc, "notExecuted")
+        && !b(accept_doc, "infrastructureFailure")
+        && accept_doc["failureAttribution"].is_object()
+        && b(&accept_doc["failureAttribution"], "suspectedMainline")
+        && accept_doc["failureAttribution"]["inRunFiles"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+        && accept_doc["failureAttribution"]["outsideRunFiles"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+}
+
+/// Compute exact git blob SHA-1 for a file under `root` (`"absent"` if missing).
+pub fn git_blob_hash_file(root: &Path, rel: &str) -> String {
+    let path = root.join(rel);
+    let Ok(meta) = fs::symlink_metadata(&path) else {
+        return "absent".into();
+    };
+    let bytes = if meta.file_type().is_symlink() {
+        use std::os::unix::ffi::OsStrExt;
+        match fs::read_link(&path) {
+            Ok(target) => target.as_os_str().as_bytes().to_vec(),
+            Err(_) => return "absent".into(),
+        }
+    } else if meta.is_file() {
+        match fs::read(&path) {
+            Ok(data) => data,
+            Err(_) => return "absent".into(),
+        }
+    } else {
+        return "absent".into();
+    };
+    let header = format!("blob {}\0", bytes.len());
+    let mut hasher = sha1_smol::Sha1::new();
+    hasher.update(header.as_bytes());
+    hasher.update(&bytes);
+    hasher.digest().to_string()
+}
+
+/// Build the `mainlineBlock` record persisted in `summary.json` when acceptance enters
+/// `blocked_mainline`. Captures blocking files, their git blob hashes in the worktree at failure
+/// time, the worktree's base HEAD, and which acceptance layers failed / were not run.
+pub fn build_mainline_block(run: &Path, meta: &Value, accept_doc: &Value) -> Value {
+    let attr = &accept_doc["failureAttribution"];
+    let blocking_files: Vec<String> = attr["outsideRunFiles"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|item| s(item, "path").to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    let wt_root = {
+        let wp = s(&meta["worktree"], "path");
+        if !wp.is_empty() && Path::new(wp).is_dir() {
+            PathBuf::from(wp)
+        } else {
+            let src = s(&meta["worktree"], "source");
+            if !src.is_empty() && Path::new(src).is_dir() {
+                PathBuf::from(src)
+            } else {
+                PathBuf::from(s(meta, "top"))
+            }
+        }
+    };
+    let mut blocking_blobs = serde_json::Map::new();
+    for p in &blocking_files {
+        let blob = if wt_root.is_dir() {
+            git_blob_hash_file(&wt_root, p)
+        } else {
+            "absent".into()
+        };
+        blocking_blobs.insert(p.clone(), json!(blob));
+    }
+
+    let blocked_base_head = {
+        let nb = s(meta, "netBase");
+        if !nb.is_empty() {
+            nb.to_string()
+        } else {
+            let wb = read(run.join("worktree-base-commit")).trim().to_string();
+            if !wb.is_empty() {
+                wb
+            } else {
+                let src = Path::new(s(&meta["worktree"], "source"));
+                read_git_head(src).unwrap_or_default()
+            }
+        }
+    };
+
+    let mut failed_layers = Vec::new();
+    let mut not_run_layers = Vec::new();
+    if let Some(layers) = accept_doc["layers"].as_array() {
+        for layer in layers {
+            let lname = s(layer, "name").to_string();
+            if lname.is_empty() {
+                continue;
+            }
+            match s(layer, "status") {
+                "failed" => failed_layers.push(lname),
+                "not_run" => not_run_layers.push(lname),
+                _ => {}
+            }
+        }
+    }
+
+    json!({
+        "blocked": true,
+        "blockingFiles": blocking_files,
+        "blockingBlobs": blocking_blobs,
+        "blockedBaseHead": blocked_base_head,
+        "failedLayers": failed_layers,
+        "notRunLayers": not_run_layers,
+        "logFile": s(attr, "logFile"),
+        "blockedAt": iso(),
+        "rerunCount": 0,
+    })
+}
+
+/// Build an `AcceptPlan` that re-runs ONLY the previously failed (and downstream `not_run`)
+/// acceptance layers, preserving previously passed layers as `reused` and previously skipped
+/// layers as `skipped`. Used by zero-LLM mainline-unblock auto-rerun.
+pub fn plan_failed_layers_only(
+    meta: &Value,
+    old_accept: &Value,
+    failed_layers: &[String],
+    not_run_layers: &[String],
+) -> AcceptPlan {
+    let rules = parse_rules(meta);
+    let legacy_cmd = s(meta, "accept").trim().to_string();
+    let accept_also = strings(&meta["acceptAlso"]);
+
+    if !b(old_accept, "tiered") || rules.is_empty() {
+        let mut slow = Vec::new();
+        if !legacy_cmd.is_empty() {
+            slow.push(AcceptLayerSpec {
+                name: "accept".into(),
+                tier: AcceptTier::Slow,
+                command: legacy_cmd,
+                lane: true,
+                matched_files: Vec::new(),
+                reason: "主干解除阻塞自动重验".into(),
+            });
+        }
+        for (idx, extra_cmd) in accept_also.iter().enumerate() {
+            slow.push(AcceptLayerSpec {
+                name: if accept_also.len() == 1 {
+                    "accept-also".into()
+                } else {
+                    format!("accept-also-{}", idx + 1)
+                },
+                tier: AcceptTier::Slow,
+                command: extra_cmd.clone(),
+                lane: true,
+                matched_files: Vec::new(),
+                reason: "主干解除阻塞自动重验（--accept-also）".into(),
+            });
+        }
+        return AcceptPlan {
+            tiered: false,
+            fail_closed: false,
+            fail_closed_reason: None,
+            fast: Vec::new(),
+            slow,
+            skipped: Vec::new(),
+        };
+    }
+
+    let mut rerun_set: BTreeSet<&str> = BTreeSet::new();
+    for name in failed_layers.iter().chain(not_run_layers.iter()) {
+        rerun_set.insert(name.as_str());
+    }
+    let old_layers_by_name: BTreeMap<String, &Value> = old_accept["layers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|l| {
+            let nm = s(l, "name");
+            (!nm.is_empty()).then(|| (nm.to_string(), l))
+        })
+        .collect();
+
+    let mut fast = Vec::new();
+    let mut slow = Vec::new();
+    let mut skipped = Vec::new();
+
+    for r in &rules {
+        if rerun_set.contains(r.name.as_str()) {
+            let spec = AcceptLayerSpec {
+                name: r.name.clone(),
+                tier: r.tier,
+                command: r.command.clone(),
+                lane: r.lane,
+                matched_files: Vec::new(),
+                reason: "主干阻塞解除，仅重跑失败层".into(),
+            };
+            match r.tier {
+                AcceptTier::Fast => fast.push(spec),
+                AcceptTier::Slow => slow.push(spec),
+            }
+        } else if let Some(prev) = old_layers_by_name.get(&r.name) {
+            let prev_st = s(prev, "status");
+            let is_reused = matches!(prev_st, "passed" | "reused");
+            let prev_round = prev["reusedFromRound"].as_u64().or(if prev_st == "passed" { Some(1) } else { None });
+            skipped.push(SkippedLayer {
+                name: r.name.clone(),
+                tier: r.tier,
+                command: r.command.clone(),
+                reason: if is_reused {
+                    match prev_round {
+                        Some(rn) => format!("主干解除阻塞自动重验，沿用第 {rn} 轮通过"),
+                        None => "主干解除阻塞自动重验，沿用先前通过结果".into(),
+                    }
+                } else {
+                    s(prev, "reason").to_string()
+                },
+                reused: is_reused,
+                reused_from_round: if is_reused { prev_round } else { None },
+            });
+        } else {
+            skipped.push(SkippedLayer {
+                name: r.name.clone(),
+                tier: r.tier,
+                command: r.command.clone(),
+                reason: format!("改动未命中 {}", format_path_globs(&r.paths)),
+                reused: false,
+                reused_from_round: None,
+            });
+        }
+    }
+
+    // Handle legacy "full" fail-closed layer or `--accept-also` layers if they were in `rerun_set`.
+    if rerun_set.contains("full") && !legacy_cmd.is_empty() {
+        slow.push(AcceptLayerSpec {
+            name: "full".into(),
+            tier: AcceptTier::Slow,
+            command: legacy_cmd,
+            lane: true,
+            matched_files: Vec::new(),
+            reason: "主干阻塞解除，重跑全量层".into(),
+        });
+    }
+    for (idx, extra_cmd) in accept_also.iter().enumerate() {
+        let nm = if accept_also.len() == 1 {
+            "accept-also".to_string()
+        } else {
+            format!("accept-also-{}", idx + 1)
+        };
+        if rerun_set.contains(nm.as_str()) {
+            slow.push(AcceptLayerSpec {
+                name: nm,
+                tier: AcceptTier::Slow,
+                command: extra_cmd.clone(),
+                lane: true,
+                matched_files: Vec::new(),
+                reason: "主干阻塞解除，仅重跑失败层".into(),
+            });
+        }
+    }
+
+    AcceptPlan {
+        tiered: true,
+        fail_closed: b(old_accept, "failClosed"),
+        fail_closed_reason: (!s(old_accept, "failClosedReason").is_empty())
+            .then(|| s(old_accept, "failClosedReason").to_string()),
+        fast,
+        slow,
+        skipped,
+    }
+}
+
 /// Concise human-readable acceptance label for L0 status/wait/delivery lines.
 pub fn human_accept_label(accept: &Value, infra_failure: bool) -> String {
     let mut label = if b(accept, "cancelled") {
@@ -1402,6 +1694,8 @@ pub fn human_accept_label(accept: &Value, infra_failure: bool) -> String {
         "验收基础设施失败".to_string()
     } else if b(accept, "ok") {
         "验收通过".to_string()
+    } else if b(accept, "mainlineBlocked") {
+        "主干阻塞".to_string()
     } else {
         "验收失败".to_string()
     };
@@ -1411,19 +1705,32 @@ pub fn human_accept_label(accept: &Value, infra_failure: bool) -> String {
             label.push_str("（全量兜底）");
         } else {
             let ran = strings(&accept["ranLayers"]);
-            let skipped: Vec<String> = accept["skippedLayers"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|x| s(x, "name").to_string())
-                .filter(|x| !x.is_empty())
-                .collect();
+            let mut reused = Vec::new();
+            let mut skipped = Vec::new();
+            for x in accept["skippedLayers"].as_array().into_iter().flatten() {
+                let nm = s(x, "name").to_string();
+                if nm.is_empty() {
+                    continue;
+                }
+                if b(x, "reused") {
+                    reused.push(nm);
+                } else {
+                    skipped.push(nm);
+                }
+            }
             let mut detail = Vec::new();
             if !ran.is_empty() {
                 if ran.len() <= 3 {
                     detail.push(format!("跑 {}", ran.join("、")));
                 } else {
                     detail.push(format!("跑 {} 层", ran.len()));
+                }
+            }
+            if !reused.is_empty() {
+                if reused.len() <= 2 {
+                    detail.push(format!("沿用 {}", reused.join("、")));
+                } else {
+                    detail.push(format!("沿用 {} 层", reused.len()));
                 }
             }
             if !skipped.is_empty() {

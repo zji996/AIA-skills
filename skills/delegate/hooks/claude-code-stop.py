@@ -28,6 +28,7 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover
     fcntl = None
+import hashlib
 import json
 import os
 import re
@@ -68,6 +69,8 @@ KIND_LABELS = {
     "premerge_conflict": "预合并冲突",
     "premerge_failed": "预合并失败",
     "premerge_cache_healed": "预合并缓存自愈",
+    "accept_blocked_mainline": "主干阻塞",
+    "accept_rerun": "自动重验",
     "adopted": "接手会话",
     "merge_started": "开始合入",
     "merge_item": "合入进度",
@@ -1526,20 +1529,249 @@ def work_deferred_runs(work_items: list[dict], now: int) -> tuple[set[str], set[
         if item.get("state") == "done":
             continue
         runs = [r for r in (item.get("runs") or []) if isinstance(r, str) and r]
-        if not runs:
-            continue
         st = str(item.get("state") or "")
         until_raw = str(item.get("deferUntil") or "").strip()
         reason_raw = str(item.get("deferReason") or "").strip()
-        if st == "deferred":
-            until_ts = parse_iso_utc(until_raw)
-            if until_ts is not None and until_ts > now:
-                fresh.update(runs)
-            else:
+        if runs:
+            if st == "deferred":
+                until_ts = parse_iso_utc(until_raw)
+                if until_ts is not None and until_ts > now:
+                    fresh.update(runs)
+                else:
+                    expired.update(runs)
+            elif reason_raw and not until_raw:
                 expired.update(runs)
-        elif reason_raw and not until_raw:
-            expired.update(runs)
+        run_defers = item.get("runDefers")
+        if isinstance(run_defers, dict):
+            for rid, rdef in run_defers.items():
+                if not isinstance(rid, str) or not rid or not isinstance(rdef, dict):
+                    continue
+                r_until_raw = str(rdef.get("until") or "").strip()
+                r_until_ts = parse_iso_utc(r_until_raw)
+                if r_until_ts is not None and r_until_ts > now:
+                    fresh.add(rid)
+                else:
+                    expired.add(rid)
     return fresh, expired
+
+
+def _resolve_source_repo_for_run(obj: dict, repo_root: Path | None) -> Path | None:
+    if repo_root is not None and repo_root.is_dir():
+        return repo_root
+    pm = obj.get("premerge")
+    if isinstance(pm, dict):
+        pms = str(pm.get("source") or "").strip()
+        if pms and Path(pms).is_dir():
+            return Path(pms)
+    rdir_raw = str(obj.get("dir") or "").strip()
+    if rdir_raw:
+        meta = read_json_file(Path(rdir_raw) / "meta.json")
+        if isinstance(meta, dict):
+            wt = meta.get("worktree")
+            if isinstance(wt, dict):
+                src = str(wt.get("source") or "").strip()
+                if src and Path(src).is_dir():
+                    return Path(src)
+    top = str(obj.get("top") or "").strip()
+    if top and Path(top).is_dir():
+        return Path(top)
+    return None
+
+
+def _git_batch_blobs(source_root: Path, specs: list[str]) -> list[tuple[str, bytes | None]] | None:
+    """Query `git cat-file --batch` (zero index locks) for `<rev>:<path>` specs."""
+    if not specs:
+        return []
+    env = os.environ.copy()
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    stdin_bytes = ("\n".join(specs) + "\n").encode("utf-8", errors="surrogateescape")
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(source_root), "cat-file", "--batch"],
+            input=stdin_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    buf = proc.stdout
+    pos = 0
+    n = len(buf)
+    results: list[tuple[str, bytes | None]] = []
+    for _ in specs:
+        nl = buf.find(b"\n", pos)
+        if nl < 0:
+            return None
+        header = buf[pos:nl]
+        pos = nl + 1
+        if header.endswith(b" missing"):
+            results.append(("missing", None))
+            continue
+        parts = header.split(b" ")
+        if len(parts) != 3:
+            return None
+        obj_type = parts[1].decode("ascii", errors="replace")
+        try:
+            size = int(parts[2])
+        except ValueError:
+            return None
+        if pos + size > n:
+            return None
+        body = buf[pos : pos + size]
+        pos += size
+        if pos < n and buf[pos : pos + 1] == b"\n":
+            pos += 1
+        results.append((obj_type, body))
+    return results
+
+
+def _read_git_head_fast(repo: Path) -> str:
+    """Resolve `HEAD` commit SHA via pure filesystem reads (zero git subprocesses, zero locks)."""
+    dot_git = repo / ".git"
+    try:
+        if dot_git.is_file():
+            raw = dot_git.read_text(encoding="utf-8", errors="replace").strip()
+            if not raw.startswith("gitdir:"):
+                return ""
+            gd = raw.split(":", 1)[1].strip()
+            git_dir = Path(gd) if os.path.isabs(gd) else (repo / gd)
+        elif dot_git.is_dir():
+            git_dir = dot_git
+        else:
+            return ""
+        head_txt = (git_dir / "HEAD").read_text(encoding="utf-8", errors="replace").strip()
+        if not head_txt:
+            return ""
+        if not head_txt.startswith("ref:"):
+            return head_txt
+        ref_name = head_txt.split(":", 1)[1].strip()
+        commondir_file = git_dir / "commondir"
+        common_dir = git_dir
+        if commondir_file.is_file():
+            cd = commondir_file.read_text(encoding="utf-8", errors="replace").strip()
+            if cd:
+                common_dir = Path(cd) if os.path.isabs(cd) else (git_dir / cd)
+        for base_dir in (git_dir, common_dir):
+            ref_file = base_dir / ref_name
+            if ref_file.is_file():
+                sha = ref_file.read_text(encoding="utf-8", errors="replace").strip()
+                if sha:
+                    return sha
+        packed = common_dir / "packed-refs"
+        if packed.is_file():
+            for line in packed.read_text(encoding="utf-8", errors="replace").splitlines():
+                if not line or line.startswith(("#", "^")):
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) == 2 and parts[1].strip() == ref_name:
+                    return parts[0].strip()
+    except OSError:
+        return ""
+    return ""
+
+
+def is_run_verbatim_in_source_head(
+    obj: dict | None,
+    repo_root: Path | None,
+    cache: dict[str, bool],
+) -> bool:
+    """Return True if all of the run's net changes already appear verbatim in source HEAD."""
+    if not isinstance(obj, dict):
+        return False
+    rid = str(obj.get("run") or "").strip()
+    if rid and rid in cache:
+        return cache[rid]
+
+    def _store(val: bool) -> bool:
+        if rid:
+            cache[rid] = val
+        return val
+
+    if obj.get("applied") is True:
+        return _store(True)
+    if str(obj.get("mode") or "") != "write":
+        return _store(False)
+    rdir_raw = str(obj.get("dir") or "").strip()
+    if not rdir_raw:
+        return _store(False)
+    rdir = Path(rdir_raw)
+    source_root = _resolve_source_repo_for_run(obj, repo_root)
+    if source_root is None:
+        return _store(False)
+
+    # Zero-subprocess fast path: a worktree run starts at `netBase` (source HEAD at launch).
+    # If source HEAD has not advanced past `netBase` and no `.sync-base` rebased it, HEAD
+    # cannot contain non-empty diffs against itself.
+    net_base = str(obj.get("netBase") or "").strip()
+    if net_base and not (rdir / ".sync-base").exists():
+        cur_head = _read_git_head_fast(source_root)
+        if cur_head and cur_head == net_base:
+            return _store(False)
+
+    rec = read_json_file(rdir / "changes.json")
+    if not isinstance(rec, dict):
+        return _store(False)
+
+    final_entries = rec.get("finalEntries")
+    if isinstance(final_entries, dict) and final_entries:
+        paths: list[str] = []
+        expected_list: list[dict] = []
+        for path, entry in final_entries.items():
+            if not isinstance(path, str) or not path or not isinstance(entry, dict):
+                return _store(False)
+            mode = str(entry.get("mode") or "")
+            if not mode:
+                return _store(False)
+            paths.append(path)
+            expected_list.append(entry)
+        blobs = _git_batch_blobs(source_root, [f"HEAD:{p}" for p in paths])
+        if blobs is None or len(blobs) != len(paths):
+            return _store(False)
+        for entry, (obj_type, content) in zip(expected_list, blobs):
+            mode = str(entry.get("mode") or "")
+            if mode == "absent":
+                if obj_type != "missing":
+                    return _store(False)
+                continue
+            if obj_type != "blob" or content is None:
+                return _store(False)
+            exp_size = entry.get("size")
+            exp_hash = str(entry.get("hash") or "")
+            if not isinstance(exp_size, int) or len(content) != exp_size:
+                return _store(False)
+            if hashlib.sha1(content).hexdigest() != exp_hash:
+                return _store(False)
+        return _store(True)
+
+    # Fallback for records without `finalEntries`: compare `after` tree blobs against `HEAD`.
+    after_tree = str(rec.get("after") or "").strip()
+    raw_changes = rec.get("changes")
+    if after_tree and isinstance(raw_changes, list) and raw_changes:
+        paths = []
+        for ch in raw_changes:
+            if not isinstance(ch, dict):
+                return _store(False)
+            if ch.get("large") or ch.get("submodule"):
+                return _store(False)
+            p = str(ch.get("path") or "").strip()
+            if not p:
+                return _store(False)
+            paths.append(p)
+        specs = [f"{after_tree}:{p}" for p in paths] + [f"HEAD:{p}" for p in paths]
+        blobs = _git_batch_blobs(source_root, specs)
+        if blobs is None or len(blobs) != 2 * len(paths):
+            return _store(False)
+        half = len(paths)
+        for i in range(half):
+            if blobs[i] != blobs[half + i]:
+                return _store(False)
+        return _store(True)
+
+    return _store(False)
 
 
 def load_queue_items_by_name() -> dict[str, list[dict]] | None:
@@ -1629,6 +1861,7 @@ def is_alert_event_stale(
     replied_parents: set[str],
     resolving: dict[str, dict[str, int]],
     queue_items_by_name: dict[str, list[dict]] | None,
+    verbatim_head_cache: dict[str, bool] | None = None,
 ) -> bool:
     """Return True when an unread alert event has already been resolved or superseded."""
     kind = str(ev.get("kind") or "")
@@ -1682,6 +1915,15 @@ def is_alert_event_stale(
     )
 
     if is_applied or is_cleaned or is_replied:
+        return True
+
+    if (
+        run_obj is not None
+        and verbatim_head_cache is not None
+        and str(run_obj.get("mode") or "") == "write"
+        and str(run_obj.get("state") or "") in ("delivered", "rejected")
+        and is_run_verbatim_in_source_head(run_obj, None, verbatim_head_cache)
+    ):
         return True
 
     # Delivery / question / terminal-outcome events already read by any session (`resultReadAt`).
@@ -1770,6 +2012,7 @@ def check_unread_events(
     replied_parents: set[str],
     cursors_doc: dict,
     liveness: CallerLivenessChecker,
+    verbatim_head_cache: dict[str, bool] | None = None,
 ) -> tuple[str | None, list[str], list[str], int, list[tuple[str, str]]]:
     """Race lock: block if unread delivery/question/attention events exist past the cursor.
     Non-initiator runs only block when the original caller has expired past the orphan timeout;
@@ -1902,6 +2145,8 @@ def check_unread_events(
     adoptable_seen: set[str] = set()
     other_caller_count = 0
 
+    if verbatim_head_cache is None:
+        verbatim_head_cache = {}
     for seq, ev, ev_is_current in candidates:
         if is_alert_event_stale(
             ev,
@@ -1912,6 +2157,7 @@ def check_unread_events(
             replied_parents,
             resolving,
             queue_items_by_name,
+            verbatim_head_cache,
         ):
             continue
 
@@ -2351,6 +2597,7 @@ def evaluate(payload: dict) -> dict | None:
             if isinstance(par, str) and par:
                 replied_parents.add(par)
 
+    verbatim_head_cache: dict[str, bool] = {}
     unread_reason, ev_names, ev_run_ids, _other_ev_count, adoptable_from_events = check_unread_events(
         payload,
         cwd,
@@ -2360,6 +2607,7 @@ def evaluate(payload: dict) -> dict | None:
         replied_parents,
         cursors_doc,
         liveness,
+        verbatim_head_cache,
     )
     if unread_reason:
         reasons.append(unread_reason)
@@ -2479,6 +2727,10 @@ def evaluate(payload: dict) -> dict | None:
                     and (str(obj.get("mode") or "") == "write" or bool(UNMERGED_NEXT_RE.search(next_str)))
                 )
                 if not is_unmerged_candidate:
+                    continue
+
+                # Auto-treat as applied if the run's net changes already appear verbatim in source HEAD.
+                if is_run_verbatim_in_source_head(obj, repo_root, verbatim_head_cache):
                     continue
 
                 # Skip runs currently being applied, merged, premerged, or gated.

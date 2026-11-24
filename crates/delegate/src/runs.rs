@@ -631,6 +631,9 @@ pub fn next_step(
         return Some(format!("验收未完成（排队/基础设施）；重排：{script} reply {name} '<retry>' (no rework round)；或本地：DELEGATE_REMOTE=0 {script} reply {name} '<retry locally>'"));
     }
     match state {
+        "blocked_mainline" => Some(format!(
+            "主干阻塞（主干修复阻塞文件后自动重验；也可 {script} reply {name} '重跑'）"
+        )),
         "rejected" if !sum["protectViolation"].is_null() => Some(format!(
             "protected paths were changed; review protectViolation, restore them, then {script} reply {name} '<what to fix>'"
         )),
@@ -830,6 +833,7 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
             "syncConflictMarkers",
             "shape",
             "accept",
+            "mainlineBlock",
             "card",
             "infrastructureFailure",
             "evidence",

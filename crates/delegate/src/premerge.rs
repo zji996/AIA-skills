@@ -105,6 +105,15 @@ pub fn spawn_worker(source: &Path) {
     if disabled() || !source.is_dir() {
         return;
     }
+    spawn_worker_force(source);
+}
+
+/// Spawn `_merge-worker` even when `DELEGATE_PREMERGE=0` (used for mainline-blocked auto-rerun;
+/// inside the worker, normal premerge still respects `disabled()`).
+pub fn spawn_worker_force(source: &Path) {
+    if !source.is_dir() {
+        return;
+    }
     let canon = canonical_repo(source);
     let mut c = Command::new(script());
     c.arg("_merge-worker")
@@ -572,10 +581,37 @@ pub fn overlay_live_status(
 }
 
 /// Zero-allocation check for a single run inside `status` loops: adds its source repo to
-/// `repos_to_wake` only if it is an unapplied `delivered` write run whose premerge is
-/// stale, crashed, or missing.
+/// `repos_to_wake` if it is an unapplied `delivered` write run whose premerge is stale,
+/// crashed, or missing (when premerge is enabled), OR a `blocked_mainline` run whose source
+/// HEAD has advanced past its last checked commit.
 pub fn collect_stale_repo(run: &Path, status: &Value, repos_to_wake: &mut BTreeSet<PathBuf>) {
-    if b(status, "applied") || s(status, "state") != "delivered" {
+    if b(status, "applied") {
+        return;
+    }
+    let st = s(status, "state");
+    if st == "blocked_mainline" {
+        let mb = &status["mainlineBlock"];
+        if !mb.is_object() || n(mb, "rerunCount") > 0 {
+            return;
+        }
+        let src = s(&json(run.join("meta.json"))["worktree"], "source").to_string();
+        if src.is_empty() {
+            return;
+        }
+        let src_path = PathBuf::from(&src);
+        if !src_path.is_dir() {
+            return;
+        }
+        let cur_head = read_git_head(&src_path).unwrap_or_default();
+        if !cur_head.is_empty()
+            && cur_head != s(mb, "blockedBaseHead")
+            && cur_head != s(mb, "checkedHead")
+        {
+            repos_to_wake.insert(canonical_repo(&src_path));
+        }
+        return;
+    }
+    if disabled() || st != "delivered" {
         return;
     }
     if s(status, "mode") != "write" || s(status, "worktree").is_empty() {
@@ -612,7 +648,7 @@ pub fn collect_stale_repo(run: &Path, status: &Value, repos_to_wake: &mut BTreeS
 /// Spawn `_merge-worker` once per repo in `repos_to_wake` (zero locks, zero writes).
 pub fn wake_repos(repos_to_wake: &BTreeSet<PathBuf>) {
     for repo in repos_to_wake {
-        spawn_worker(repo);
+        spawn_worker_force(repo);
     }
 }
 
@@ -2362,6 +2398,134 @@ fn run_premerge_layers(
     })
 }
 
+fn source_file_blob(source: &Path, head: &str, path: &str) -> String {
+    if head.is_empty() || path.is_empty() {
+        return "absent".into();
+    }
+    git_text(source, &["rev-parse", "-q", "--verify", &format!("{head}:{path}")])
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "absent".into())
+}
+
+fn conflict_source_blobs(
+    source: &Path,
+    head: &str,
+    conflicts: &[String],
+) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for p in conflicts {
+        map.insert(p.clone(), source_file_blob(source, head, p));
+    }
+    map
+}
+
+fn same_conflict_signature(
+    prev_doc: &Value,
+    conf_list: &[String],
+    blobs: &BTreeMap<String, String>,
+) -> bool {
+    if s(prev_doc, "status") != "conflict" || conf_list.is_empty() || blobs.is_empty() {
+        return false;
+    }
+    let prev_confs = strings(&prev_doc["conflicts"]);
+    if prev_confs != conf_list {
+        return false;
+    }
+    let Some(prev_blobs) = prev_doc["conflictSourceBlobs"].as_object() else {
+        return false;
+    };
+    if prev_blobs.len() != blobs.len() {
+        return false;
+    }
+    blobs
+        .iter()
+        .all(|(k, v)| prev_blobs.get(k).and_then(Value::as_str) == Some(v.as_str()))
+}
+
+/// Check if the most recent `premerge_conflict` event for `run_id` (not superseded by a later
+/// `premerge_ready`) already reported the exact same `(conflicts, conflictSourceBlobs)`.
+fn last_premerge_conflict_matches(
+    run_id: &str,
+    conf_list: &[String],
+    blobs: &BTreeMap<String, String>,
+) -> bool {
+    if run_id.is_empty() || conf_list.is_empty() || blobs.is_empty() {
+        return false;
+    }
+    let ev_path = events::events_path();
+    let Ok(f) = File::open(ev_path) else {
+        return false;
+    };
+    let mut last_matched = false;
+    for line in BufReader::new(f).lines().map_while(Result::ok) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.contains(run_id) {
+            continue;
+        }
+        let Ok(ev) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if s(&ev, "run") != run_id {
+            continue;
+        }
+        match s(&ev, "kind") {
+            "premerge_ready" => last_matched = false,
+            "premerge_conflict" => {
+                let pl = &ev["payload"];
+                let ev_confs = strings(&pl["conflicts"]);
+                let ev_blobs = pl["conflictSourceBlobs"].as_object();
+                last_matched = ev_confs == conf_list
+                    && ev_blobs.is_some_and(|eb| {
+                        eb.len() == blobs.len()
+                            && blobs
+                                .iter()
+                                .all(|(k, v)| eb.get(k).and_then(Value::as_str) == Some(v.as_str()))
+                    });
+            }
+            _ => {}
+        }
+    }
+    last_matched
+}
+
+/// If `run` is already in `conflict` status and EVERY conflicted file still has the exact same
+/// git blob in `source_head` (and the run's own `after` tree did not change), refresh
+/// `premerge.json`'s `baseHead` without re-running 3-way merge or emitting another event.
+fn conflict_unchanged_at_head(run: &Path, source_canon: &Path, source_head: &str) -> bool {
+    let mut doc = json(premerge_path(run));
+    if s(&doc, "status") != "conflict" || s(&doc, "baseHead") == source_head {
+        return false;
+    }
+    let confs = strings(&doc["conflicts"]);
+    let Some(prev_blobs) = doc["conflictSourceBlobs"].as_object() else {
+        return false;
+    };
+    if confs.is_empty() || prev_blobs.len() != confs.len() {
+        return false;
+    }
+    let prev_after = s(&doc, "afterTree");
+    if !prev_after.is_empty() {
+        let changes_doc = json(run.join("changes.json"));
+        let cur_after = s(&changes_doc, "after");
+        if !cur_after.is_empty() && cur_after != prev_after {
+            return false;
+        }
+    }
+    let all_same = confs.iter().all(|p| {
+        prev_blobs.get(p).and_then(Value::as_str)
+            == Some(source_file_blob(source_canon, source_head, p).as_str())
+    });
+    if all_same {
+        doc["baseHead"] = json!(source_head);
+        doc["updatedAt"] = json!(iso());
+        let _ = write_json(premerge_path(run), &doc);
+        index::upsert_run(run);
+        return true;
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_one_run(
     run: &Path,
@@ -2376,6 +2540,7 @@ fn process_one_run(
     if should_yield_to_apply(run, source_canon) {
         return Ok(false);
     }
+    let prev_premerge_doc = json(premerge_path(run));
     let meta = json(run.join("meta.json"));
     let sum = json(run.join("summary.json"));
     let run_id = events::run_id_for(run, &meta);
@@ -2525,11 +2690,16 @@ fn process_one_run(
         }
         let elapsed = (t0.elapsed().as_secs_f64() * 100.0).round() / 100.0;
         let now = iso();
+        let conf_blobs = conflict_source_blobs(source_canon, source_head, &conf_list);
+        let is_dup_conflict = same_conflict_signature(&prev_premerge_doc, &conf_list, &conf_blobs)
+            || last_premerge_conflict_matches(&run_id, &conf_list, &conf_blobs);
         let doc = json!({
             "status": "conflict",
             "baseHead": source_head,
+            "afterTree": merge_res.after_tree,
             "acceptOk": false,
             "conflicts": conf_list,
+            "conflictSourceBlobs": conf_blobs,
             "elapsedSeconds": elapsed,
             "log": log_str,
             "error": format!("三方合并冲突：{}", conf_list.join("、")),
@@ -2538,18 +2708,21 @@ fn process_one_run(
             "updatedAt": now,
         });
         let _ = write_json(premerge_path(run), &doc);
-        events::emit(
-            &run_id,
-            repo_str,
-            "premerge_conflict",
-            json!({
-                "name": run_name,
-                "baseHead": source_head,
-                "conflicts": conf_list,
-                "log": log_str,
-                "next": format!("delegate reply --sync=agent {run_id} \"解决预合并冲突\""),
-            }),
-        );
+        if !is_dup_conflict {
+            events::emit(
+                &run_id,
+                repo_str,
+                "premerge_conflict",
+                json!({
+                    "name": run_name,
+                    "baseHead": source_head,
+                    "conflicts": conf_list,
+                    "conflictSourceBlobs": conf_blobs,
+                    "log": log_str,
+                    "next": format!("delegate reply --sync=agent {run_id} \"解决预合并冲突\""),
+                }),
+            );
+        }
         index::upsert_run(run);
         board::refresh_for_run(run);
         return Ok(false);
@@ -2963,6 +3136,271 @@ pub fn worker_command(args: &[String]) -> Res<i32> {
     Ok(0)
 }
 
+fn is_mainline_blocked_candidate(run: &Path, source_head: &str) -> bool {
+    if run.join(".applied").exists() || run.join(".applied-cleaned").exists() {
+        return false;
+    }
+    let sum = json(run.join("summary.json"));
+    if s(&sum, "state") != "blocked_mainline" {
+        return false;
+    }
+    let mb = &sum["mainlineBlock"];
+    if !mb.is_object() || n(mb, "rerunCount") > 0 {
+        return false;
+    }
+    let blocked_base = s(mb, "blockedBaseHead");
+    let checked_head = s(mb, "checkedHead");
+    !source_head.is_empty() && source_head != blocked_base && source_head != checked_head
+}
+
+/// Auto-sync a `blocked_mainline` run cleanly to `source_head` when any recorded blocking file
+/// changed on mainline, then re-run ONLY the failed (and downstream `not_run`) acceptance layers
+/// with zero LLM calls. Transitions to `delivered` on pass or `rejected` on failure / sync conflict.
+fn process_mainline_blocked_run(
+    run: &Path,
+    source_canon: &Path,
+    repo_str: &str,
+    source_head: &str,
+    repo_cfg: &Value,
+) -> Res<bool> {
+    if should_yield_to_apply(run, source_canon) {
+        return Ok(false);
+    }
+    let mut meta = json(run.join("meta.json"));
+    let mut sum = json(run.join("summary.json"));
+    if !meta.is_object() || s(&sum, "state") != "blocked_mainline" {
+        return Ok(false);
+    }
+    let mb = sum["mainlineBlock"].clone();
+    if !mb.is_object() || n(&mb, "rerunCount") > 0 {
+        return Ok(false);
+    }
+    if s(&mb, "blockedBaseHead") == source_head || s(&mb, "checkedHead") == source_head {
+        return Ok(false);
+    }
+
+    let blocking_files = strings(&mb["blockingFiles"]);
+    let blocking_blobs = mb["blockingBlobs"].as_object();
+    if blocking_files.is_empty() {
+        return Ok(false);
+    }
+
+    let mut changed_blocking = Vec::new();
+    for path in &blocking_files {
+        let old_blob = blocking_blobs
+            .and_then(|m| m.get(path))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let new_blob = source_file_blob(source_canon, source_head, path);
+        if new_blob != old_blob {
+            changed_blocking.push(path.clone());
+        }
+    }
+
+    if changed_blocking.is_empty() {
+        sum["mainlineBlock"]["checkedHead"] = json!(source_head);
+        let _ = write_json(run.join("summary.json"), &sum);
+        index::upsert_run(run);
+        return Ok(false);
+    }
+
+    let wt_path = PathBuf::from(s(&meta["worktree"], "path"));
+    if !wt_path.is_dir() {
+        return Ok(false);
+    }
+
+    let run_id = events::run_id_for(run, &meta);
+    let run_name = s(&meta, "name").to_string();
+
+    // Sync worktree cleanly to committed source HEAD (zero LLM calls, never pulls dirty edits).
+    let sync_report = match worktree::sync_to_head(run, &meta) {
+        Ok(rep) => rep,
+        Err(err) => {
+            let now = iso();
+            sum["state"] = json!("rejected");
+            sum["error"] = json!(format!("主干阻塞解除但自动同步失败：{err}"));
+            sum["mainlineBlock"]["blocked"] = json!(false);
+            sum["mainlineBlock"]["rerunCount"] = json!(1);
+            sum["mainlineBlock"]["rerunHead"] = json!(source_head);
+            sum["mainlineBlock"]["rerunAt"] = json!(now);
+            sum["mainlineBlock"]["rerunOk"] = json!(false);
+            sum["mainlineBlock"]["syncError"] = json!(err);
+            crate::card::generate_and_save(run, &meta, &mut sum);
+            write_json(run.join("summary.json"), &sum)?;
+            events::emit(
+                &run_id,
+                repo_str,
+                "accept_rerun",
+                json!({
+                    "name": run_name,
+                    "ok": false,
+                    "baseHead": source_head,
+                    "blockingFiles": blocking_files,
+                    "changedBlockingFiles": changed_blocking,
+                    "syncError": err,
+                }),
+            );
+            events::emit_run_finished(run, &meta, &sum);
+            crate::history::record_finish(run);
+            crate::work::on_run_finished(run, &meta, &sum);
+            board::refresh_for_run(run);
+            index::upsert_run(run);
+            return Ok(false);
+        }
+    };
+
+    if !sync_report.conflicts.is_empty() {
+        let now = iso();
+        let conf_str = sync_report.conflicts.join("、");
+        sum["state"] = json!("rejected");
+        sum["error"] = json!(format!("主干阻塞解除但自动同步冲突：{conf_str}"));
+        sum["mainlineBlock"]["blocked"] = json!(false);
+        sum["mainlineBlock"]["rerunCount"] = json!(1);
+        sum["mainlineBlock"]["rerunHead"] = json!(source_head);
+        sum["mainlineBlock"]["rerunAt"] = json!(now);
+        sum["mainlineBlock"]["rerunOk"] = json!(false);
+        sum["mainlineBlock"]["syncConflicts"] = json!(sync_report.conflicts);
+        crate::card::generate_and_save(run, &meta, &mut sum);
+        write_json(run.join("summary.json"), &sum)?;
+        events::emit(
+            &run_id,
+            repo_str,
+            "accept_rerun",
+            json!({
+                "name": run_name,
+                "ok": false,
+                "baseHead": source_head,
+                "blockingFiles": blocking_files,
+                "changedBlockingFiles": changed_blocking,
+                "syncConflicts": sync_report.conflicts,
+            }),
+        );
+        events::emit_run_finished(run, &meta, &sum);
+        crate::history::record_finish(run);
+        crate::work::on_run_finished(run, &meta, &sum);
+        board::refresh_for_run(run);
+        index::upsert_run(run);
+        return Ok(false);
+    }
+
+    // Update meta netBase & re-record changes against synced worktree.
+    meta["netBase"] = json!(source_head);
+    meta["netBaseRebased"] = json!(true);
+    meta["netBaseAdvanced"] = json!(true);
+    if !sync_report.base_tree.is_empty() {
+        meta["netBaseTree"] = json!(sync_report.base_tree);
+    }
+    let _ = write_json(run.join("meta.json"), &meta);
+    let _ = changes::record(&mut meta, run);
+
+    let mut eval_meta = meta.clone();
+    if eval_meta["acceptRules"].is_null() && repo_cfg["acceptRules"].is_array() {
+        eval_meta["acceptRules"] = repo_cfg["acceptRules"].clone();
+    }
+    if s(&eval_meta, "accept").trim().is_empty() && !s(repo_cfg, "accept").trim().is_empty() {
+        eval_meta["accept"] = repo_cfg["accept"].clone();
+    }
+
+    let failed_layers = strings(&mb["failedLayers"]);
+    let not_run_layers = strings(&mb["notRunLayers"]);
+    let plan = accept::plan_failed_layers_only(
+        &eval_meta,
+        &sum["accept"],
+        &failed_layers,
+        &not_run_layers,
+    );
+
+    let holder = std::sync::atomic::AtomicI32::new(0);
+    let (excluded, before_snap) = accept::snapshot_for_accept(&eval_meta, run);
+    let fast_outcome = if !plan.fast.is_empty() {
+        Some(accept::run_phase(
+            &eval_meta,
+            run,
+            &plan.fast,
+            false,
+            &holder,
+            None,
+            None,
+        ))
+    } else {
+        None
+    };
+    let fast_ok = fast_outcome.as_ref().is_none_or(|f| f.ok);
+    let slow_outcome = if fast_ok && !plan.slow.is_empty() {
+        Some(accept::run_phase(
+            &eval_meta,
+            run,
+            &plan.slow,
+            fast_outcome.is_some(),
+            &holder,
+            None,
+            None,
+        ))
+    } else {
+        None
+    };
+    let (_, after_snap) = accept::snapshot_for_accept(&eval_meta, run);
+    let new_accept = accept::build_accept_summary(
+        &eval_meta,
+        run,
+        &plan,
+        fast_outcome.as_ref(),
+        slow_outcome.as_ref(),
+        false,
+        excluded,
+        before_snap.as_ref(),
+        after_snap.as_ref(),
+    );
+
+    let ok = b(&new_accept, "ok");
+    let now = iso();
+    let ran_layers = strings(&new_accept["ranLayers"]);
+    let accept_label = accept::human_accept_label(&new_accept, b(&new_accept, "infrastructureFailure"));
+
+    sum["accept"] = new_accept.clone();
+    sum["mainlineBlock"]["blocked"] = json!(!ok);
+    sum["mainlineBlock"]["rerunCount"] = json!(1);
+    sum["mainlineBlock"]["rerunHead"] = json!(source_head);
+    sum["mainlineBlock"]["rerunAt"] = json!(now);
+    sum["mainlineBlock"]["rerunOk"] = json!(ok);
+    sum["mainlineBlock"]["ranLayers"] = json!(ran_layers);
+
+    if ok {
+        sum["state"] = json!("delivered");
+        let _ = write(run.join("exit_code"), "0\n");
+        worktree::capture_final_entries(&meta, run);
+    } else {
+        sum["state"] = json!("rejected");
+    }
+    crate::card::generate_and_save(run, &meta, &mut sum);
+    write_json(run.join("summary.json"), &sum)?;
+
+    events::emit(
+        &run_id,
+        repo_str,
+        "accept_rerun",
+        json!({
+            "name": run_name,
+            "ok": ok,
+            "baseHead": source_head,
+            "blockingFiles": blocking_files,
+            "changedBlockingFiles": changed_blocking,
+            "ranLayers": ran_layers,
+            "exitCode": new_accept["exitCode"],
+            "acceptLabel": accept_label,
+        }),
+    );
+    events::emit_run_finished(run, &meta, &sum);
+    crate::history::record_finish(run);
+    crate::work::on_run_finished(run, &meta, &sum);
+    board::refresh_for_run(run);
+    index::upsert_run(run);
+    if ok {
+        crate::dag_queue::advance();
+    }
+    Ok(false)
+}
+
 fn run_worker_passes(source_canon: &Path, repo_str: &str) -> Res<()> {
     let mut consecutive_same_head = 0u32;
     let mut last_head = String::new();
@@ -2996,19 +3434,82 @@ fn run_worker_passes(source_canon: &Path, repo_str: &str) -> Res<()> {
         };
 
         let candidates = discover_runs_for_repo(source_canon);
-        let pending: Vec<PathBuf> = candidates
+
+        // Pass 0 (runs even when DELEGATE_PREMERGE=0): unblock `blocked_mainline` runs whose
+        // blocking files changed on mainline HEAD via zero-LLM auto-sync & failed-layer rerun.
+        let blocked_pending: Vec<PathBuf> = candidates
+            .iter()
+            .filter(|r| is_mainline_blocked_candidate(r, &source_head))
+            .cloned()
+            .collect();
+        let mut unblocked_any = false;
+        let mut head_changed = false;
+        for run in &blocked_pending {
+            if lane::stopped()
+                || !source_canon.is_dir()
+                || crate::source_watch::apply_lock_busy(source_canon)
+            {
+                break;
+            }
+            if read_git_head(source_canon).as_deref() != Some(source_head.as_str()) {
+                head_changed = true;
+                break;
+            }
+            match process_mainline_blocked_run(
+                run,
+                source_canon,
+                repo_str,
+                &source_head,
+                &cfg.value,
+            ) {
+                Ok(true) => {
+                    head_changed = true;
+                    break;
+                }
+                Ok(false) => {
+                    unblocked_any = true;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "delegate _merge-worker mainline-rerun ({}): {err}",
+                        run.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                }
+            }
+        }
+        if head_changed || read_git_head(source_canon).as_deref() != Some(source_head.as_str()) {
+            continue;
+        }
+        if disabled() {
+            break;
+        }
+
+        // Refresh candidates if any mainline-blocked run just transitioned to `delivered`.
+        let premerge_candidates = if unblocked_any {
+            discover_runs_for_repo(source_canon)
+        } else {
+            candidates
+        };
+
+        let pending: Vec<PathBuf> = premerge_candidates
             .into_iter()
             .filter(|r| {
                 let meta = json(r.join("meta.json"));
                 let sum = json(r.join("summary.json"));
-                is_eligible_strict(
+                if !is_eligible_strict(
                     r,
                     &meta,
                     &sum,
                     &cfg.value,
                     &protect_rules,
                     &controller_patterns,
-                ) && run_needs_premerge(r, &source_head)
+                ) || !run_needs_premerge(r, &source_head)
+                {
+                    return false;
+                }
+                // Deduplicate unchanged conflicts: if every conflicted file still has the exact
+                // same blob in `source_head`, bump `baseHead` silently without re-merging/re-emitting.
+                !conflict_unchanged_at_head(r, source_canon, &source_head)
             })
             .collect();
 
@@ -3030,7 +3531,6 @@ fn run_worker_passes(source_canon: &Path, repo_str: &str) -> Res<()> {
         let (wt_path, managed) =
             ensure_integration_worktree(source_canon, &source_head, &work_cfg, &env_cfg)?;
 
-        let mut head_changed = false;
         for run in &pending {
             if lane::stopped()
                 || !source_canon.is_dir()

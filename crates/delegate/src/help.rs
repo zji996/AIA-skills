@@ -175,6 +175,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("config", "Show merged effective configuration, including remote."),
     ("stop", "Terminate runs."),
     ("adopt", "Transfer a run (and every round in its reply chain) to the current caller session."),
+    ("mark-applied", "Mark a manually merged/committed run as applied against a verified source commit."),
     ("clean", "Delete finished runs."),
     ("fit", "Show or update the four-class model suitability card (fit set; fit --json)."),
     (
@@ -445,6 +446,11 @@ pub fn print(command: Option<&str>) -> bool {
         ]),
         "adopt" => ("<run>... [--json]", "Transfer one or more runs (and every round in each run's reply/continuation chain) to the current caller session (DELEGATE_CALLER / CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID / PI_SESSION_ID) and emit an `adopted` event. Useful after `/clear` in Claude Code.", &[
             ("--json", "Print adopted chain metadata as JSON lines."),
+        ]),
+        "mark-applied" => ("<run> [--commit <sha>] [--check-files] [--json]", "Record a run (and unapplied same-worktree ancestors) as manually applied after resolving conflicts or committing outside `delegate apply`. Verifies the commit exists in the source repository (defaulting to source HEAD).", &[
+            ("--commit <sha>", "Source repository commit SHA containing the manual merge (default: HEAD)."),
+            ("--check-files", "Fail if any of the run's net changed files are missing from the target commit."),
+            ("--json", "Print structured JSON summary."),
         ]),
         "protocol" => ("", "Print one JSON line for harness adapters: protocol version, delegate version, the caller session and its source variable, and each agent's tier, resolved binary, version and PATH entries it shadows.", &[]),
         _ => return false,

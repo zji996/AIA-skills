@@ -1842,12 +1842,16 @@ fn rework_used(run: &Path) -> (u64, String) {
     let mut current = run.to_path_buf();
     loop {
         let meta = json(current.join("meta.json"));
-        let changes = &json(current.join("summary.json"))["changes"];
+        let sum = json(current.join("summary.json"));
+        let changes = &sum["changes"];
         let lines =
             changes["added"].as_u64().unwrap_or(0) + changes["deleted"].as_u64().unwrap_or(0);
         match (s(&meta, "continuation"), s(&meta["rework"], "kind")) {
-            _ if b(&json(current.join("summary.json")), "infrastructureFailure") => {}
-            (continuation, _) if runs::interrupted(continuation) => {}
+            _ if b(&sum, "infrastructureFailure")
+                || s(&sum, "state") == "blocked_mainline"
+                || runs::state(&current) == "blocked_mainline" => {}
+            (continuation, _)
+                if runs::interrupted(continuation) || continuation == "blocked_mainline" => {}
             // A round that changed nothing (a question, a failed start) is not rework,
             // and neither is the round after one: that is the first build.
             (_, "rework")
@@ -1880,8 +1884,13 @@ fn delivered(meta: &Value, run: &Path) -> bool {
     if parent.is_empty() {
         return false;
     }
-    let sum = json(run.with_file_name(parent).join("summary.json"));
-    sum["changes"]["files"].as_u64().unwrap_or(0) > 0 && !b(&sum, "question") && !b(&sum, "infrastructureFailure")
+    let parent_dir = run.with_file_name(parent);
+    let sum = json(parent_dir.join("summary.json"));
+    sum["changes"]["files"].as_u64().unwrap_or(0) > 0
+        && !b(&sum, "question")
+        && !b(&sum, "infrastructureFailure")
+        && s(&sum, "state") != "blocked_mainline"
+        && runs::state(&parent_dir) != "blocked_mainline"
 }
 
 /// Rework budget for write conversations (`.delegate.json` `maxRework`, default 1):
@@ -1906,7 +1915,13 @@ fn rework_gate(
         None => Some(1),
     };
     let (used, name) = rework_used(parent);
-    if runs::interrupted(&runs::state(parent)) || b(&json(parent.join("summary.json")), "infrastructureFailure") {
+    let parent_state = runs::state(parent);
+    let parent_sum = json(parent.join("summary.json"));
+    if runs::interrupted(&parent_state)
+        || parent_state == "blocked_mainline"
+        || s(&parent_sum, "state") == "blocked_mainline"
+        || b(&parent_sum, "infrastructureFailure")
+    {
         return Ok(Some(
             json!({"kind":"continuation","used":used,"limit":limit}),
         ));
@@ -1920,7 +1935,6 @@ fn rework_gate(
         }
         return Ok(Some(json!({"kind":"minor","used":used,"limit":limit})));
     }
-    let parent_sum = json(parent.join("summary.json"));
     if b(&parent_sum, "question") || parent_sum["changes"]["files"].as_u64().unwrap_or(0) == 0 {
         // Answering a question or starting the build after a round with no changes.
         return Ok(Some(json!({"kind":"answer","used":used,"limit":limit})));

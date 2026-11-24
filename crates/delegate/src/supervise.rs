@@ -1659,7 +1659,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
             sum["graceSeconds"] = json!(g);
         }
     }
-    if !["delivered", "answered", "rejected", "stopped"].contains(&state.as_str()) {
+    if !["delivered", "answered", "rejected", "stopped", "blocked_mainline"].contains(&state.as_str()) {
         let errors = evs
             .iter()
             .filter(|e| ["turn_error", "tool_error"].contains(&s(e, "e")))

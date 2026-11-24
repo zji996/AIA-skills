@@ -172,6 +172,8 @@ pub fn emit_run_finished(run: &Path, meta: &Value, summary: &Value) {
         "delivered"
     } else if state == "stopped" {
         "stopped"
+    } else if state == "blocked_mainline" {
+        "accept_blocked_mainline"
     } else if state == "rejected" {
         "rejected"
     } else {
@@ -183,6 +185,15 @@ pub fn emit_run_finished(run: &Path, meta: &Value, summary: &Value) {
         "state": state,
         "mode": mode,
     });
+    if state == "blocked_mainline" && summary["mainlineBlock"].is_object() {
+        let mb = &summary["mainlineBlock"];
+        payload["blockingFiles"] = mb["blockingFiles"].clone();
+        payload["failedLayers"] = mb["failedLayers"].clone();
+        payload["baseHead"] = mb["blockedBaseHead"].clone();
+        if !s(mb, "logFile").is_empty() {
+            payload["logFile"] = mb["logFile"].clone();
+        }
+    }
     if b(summary, "policyRefused") {
         payload["policyRefused"] = json!(true);
         payload["reason"] = json!("policyRefused");
@@ -781,6 +792,8 @@ pub fn rebuild_in(state: &Path, extra_runs_dirs: &[PathBuf]) -> Res<Value> {
                 "delivered"
             } else if state_str == "stopped" {
                 "stopped"
+            } else if state_str == "blocked_mainline" {
+                "accept_blocked_mainline"
             } else if state_str == "rejected" {
                 "rejected"
             } else {
@@ -1009,6 +1022,43 @@ pub fn format_human(ev: &Value) -> String {
             segs.join(" · ")
         }
         "question" => "需要主控决定".to_string(),
+        "accept_blocked_mainline" => {
+            let files = strings(&p["blockingFiles"]);
+            let layers = strings(&p["failedLayers"]);
+            let fpart = if files.is_empty() {
+                "主干文件".to_string()
+            } else {
+                files.join("、")
+            };
+            if layers.is_empty() {
+                format!("主干阻塞：{fpart}（主干修复后自动重验）")
+            } else {
+                format!("主干阻塞：{fpart}（层：{}；主干修复后自动重验）", layers.join("、"))
+            }
+        }
+        "accept_rerun" => {
+            let ok = b(p, "ok");
+            let layers = strings(&p["ranLayers"]);
+            let head = s(p, "baseHead");
+            let short = &head[..head.len().min(7)];
+            let lpart = if layers.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", layers.join("、"))
+            };
+            if ok {
+                format!("主干阻塞解除，自动重验通过（基线 {short}{lpart}）")
+            } else if !s(p, "syncError").is_empty() {
+                format!("主干阻塞解除但自动同步失败：{}", clip(s(p, "syncError"), 80))
+            } else if p["syncConflicts"].as_array().is_some_and(|a| !a.is_empty()) {
+                format!(
+                    "主干阻塞解除但自动同步冲突：{}",
+                    strings(&p["syncConflicts"]).join("、")
+                )
+            } else {
+                format!("自动重验仍失败（基线 {short}{lpart}），交主控处理")
+            }
+        }
         "rejected" | "failed" => {
             let err = s(p, "error");
             if err.is_empty() {

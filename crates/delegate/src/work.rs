@@ -312,6 +312,36 @@ impl AutoDispatch {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunDeferral {
+    pub reason: String,
+    pub until: String,
+    pub at: String,
+}
+
+impl RunDeferral {
+    fn from_value(v: &Value) -> Option<Self> {
+        if !v.is_object() {
+            return None;
+        }
+        let reason = s(v, "reason").to_string();
+        let until = s(v, "until").to_string();
+        let at = s(v, "at").to_string();
+        if reason.is_empty() && until.is_empty() {
+            return None;
+        }
+        Some(Self { reason, until, at })
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "reason": self.reason,
+            "until": self.until,
+            "at": self.at,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct WorkItem {
     pub id: String,
@@ -337,6 +367,7 @@ pub struct WorkItem {
     pub defer_reason: String,
     pub defer_until: String,
     pub defer_streak: u32,
+    pub run_defers: BTreeMap<String, RunDeferral>,
     pub created_at: String,
     pub updated_at: String,
     pub state_since: String,
@@ -505,6 +536,18 @@ impl WorkItem {
             defer_reason: s(v, "deferReason").to_string(),
             defer_until: s(v, "deferUntil").to_string(),
             defer_streak: v["deferStreak"].as_u64().unwrap_or(0) as u32,
+            run_defers: v["runDefers"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, val)| {
+                            (!k.is_empty())
+                                .then(|| RunDeferral::from_value(val).map(|rd| (k.clone(), rd)))
+                                .flatten()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             created_at,
             updated_at: s(v, "updatedAt").to_string(),
             state_since,
@@ -577,6 +620,13 @@ impl WorkItem {
         }
         if self.defer_streak > 0 {
             obj["deferStreak"] = json!(self.defer_streak);
+        }
+        if !self.run_defers.is_empty() {
+            let mut m = serde_json::Map::new();
+            for (rid, rd) in &self.run_defers {
+                m.insert(rid.clone(), rd.to_json());
+            }
+            obj["runDefers"] = Value::Object(m);
         }
         if !self.last_reminded_at.is_empty() {
             obj["lastRemindedAt"] = json!(self.last_reminded_at);
@@ -2463,6 +2513,8 @@ fn reconcile_all_locked_full(
                         if !is_applied {
                             live_state = Some("attention".into());
                         }
+                    } else if st == "blocked_mainline" && !is_applied {
+                        live_state = Some("blocked".into());
                     } else if st == "delivered" && !is_applied && s(&meta, "mode") == "write" {
                         if delivered_pending_files(&rdir, &meta, &sum) > 0 {
                             live_state = Some("attention".into());
@@ -3683,7 +3735,7 @@ pub fn on_runs_applied(
         ..Default::default()
     };
     for (run_dir, meta, applied_json) in applied_runs {
-        if s(applied_json, "appliedBy") == "detected" {
+        if matches!(s(applied_json, "appliedBy"), "detected" | "manual") {
             opts.committed_runs.insert(events::run_id_for(run_dir, meta));
         }
     }
@@ -3733,7 +3785,7 @@ pub fn on_runs_applied_with_options(
             }
         }
         let committed = opts.committed_runs.contains(&rid)
-            || s(applied_json, "appliedBy") == "detected";
+            || matches!(s(applied_json, "appliedBy"), "detected" | "manual");
         let verify_failed = opts.verify_failed_runs.contains(&rid);
         effective_runs.push(EffectiveRun {
             rid: rid.clone(),
@@ -3806,6 +3858,10 @@ pub fn on_runs_applied_with_options(
             let w = &mut items[pos];
             w.applied = true;
             w.defer_streak = 0;
+            w.run_defers.remove(&er.rid);
+            for cid in &er.chain_ids {
+                w.run_defers.remove(cid);
+            }
             if let Some(dir) = &er.rdir {
                 w.add_run(&er.rid, Some(dir), None);
             }
@@ -5337,6 +5393,20 @@ fn render_card(item: &WorkItem, all_items: &[WorkItem], state: &Path, now_epoch:
             },
             streak_tag
         ));
+    }
+    if !item.run_defers.is_empty() {
+        for (rid, rd) in &item.run_defers {
+            lines.push(format!(
+                "单 run 暂缓：{} · {}（至 {}）",
+                rid,
+                rd.reason,
+                if rd.until.is_empty() {
+                    "已到期"
+                } else {
+                    rd.until.as_str()
+                }
+            ));
+        }
     }
     if item.state == "done" {
         if item.closed_kind == "dropped" {
@@ -7242,6 +7312,8 @@ fn close_cmd(args: &[String]) -> Res<i32> {
             other => {
                 if id_raw.is_none() {
                     id_raw = Some(other.to_string());
+                } else if evidence.is_none() {
+                    evidence = Some(other.to_string());
                 } else {
                     return Err(format!("unexpected positional argument: {other}"));
                 }
@@ -7250,7 +7322,7 @@ fn close_cmd(args: &[String]) -> Res<i32> {
         i += 1;
     }
 
-    let raw = id_raw.ok_or("usage: delegate work close <Wxx> --evidence \"<commit/测试/截图记录>\"")?;
+    let raw = id_raw.ok_or("usage: delegate work close <Wxx> [--evidence] \"<commit/测试/截图记录>\"")?;
     let norm = normalize_work_id(&raw)
         .ok_or_else(|| format!("invalid work id '{raw}' (expected W001...)"))?;
     let ev = evidence
@@ -7492,17 +7564,24 @@ fn defer_cmd(args: &[String]) -> Res<i32> {
     fs::create_dir_all(&state).map_err(|e| e.to_string())?;
     let now_iso = iso();
 
-    let deferred_item = {
+    let (deferred_item, deferred_run_only): (WorkItem, Option<String>) = {
         let _guard = crate::locks::acquire_state(&state).map_err(|e| e.to_string())?;
         let mut items = load_raw(&state);
         let _ = migrate_legacy_locked(&state, &mut items);
 
-        let pos = if let Some(norm) = normalize_work_id(&raw) {
-            items.iter().position(|w| w.id == norm).ok_or_else(|| {
+        if let Some(norm) = normalize_work_id(&raw) {
+            let pos = items.iter().position(|w| w.id == norm).ok_or_else(|| {
                 format!("work item '{norm}' not found (list with: delegate work --all)")
-            })?
+            })?;
+            items[pos].defer_reason = r;
+            items[pos].defer_until = until_iso;
+            items[pos].defer_streak = items[pos].defer_streak.saturating_add(1);
+            items[pos].set_state("deferred", &now_iso);
+            let snap = items[pos].clone();
+            save_raw(&state, &items)?;
+            (snap, None)
         } else {
-            // Resolve run and materialize into work.jsonl if not yet attached
+            // Target is a run id/name.
             let run_ref = raw.strip_prefix("R:").unwrap_or(&raw);
             let empty_dirs = BTreeMap::new();
             let rdir = find_run_dir(run_ref, &empty_dirs, &state).ok_or_else(|| {
@@ -7511,8 +7590,31 @@ fn defer_cmd(args: &[String]) -> Res<i32> {
             let meta = json(rdir.join("meta.json"));
             let rid = events::run_id_for(&rdir, &meta);
             let repo = events::repo_for_meta(&meta);
-            if let Some(p) = items.iter().position(|w| w.matches_run(&rid)) {
-                p
+            if let Some(pos) = items.iter().position(|w| w.matches_run(&rid)) {
+                let run_only = items[pos].runs.len() > 1 || items[pos].origin != "materialize";
+                if run_only {
+                    // Defer ONLY this run's unmerged reminder; leave the work item's state untouched.
+                    items[pos].run_defers.insert(
+                        rid.clone(),
+                        RunDeferral {
+                            reason: r,
+                            until: until_iso,
+                            at: now_iso.clone(),
+                        },
+                    );
+                    items[pos].updated_at = now_iso;
+                    let snap = items[pos].clone();
+                    save_raw(&state, &items)?;
+                    (snap, Some(rid))
+                } else {
+                    items[pos].defer_reason = r;
+                    items[pos].defer_until = until_iso;
+                    items[pos].defer_streak = items[pos].defer_streak.saturating_add(1);
+                    items[pos].set_state("deferred", &now_iso);
+                    let snap = items[pos].clone();
+                    save_raw(&state, &items)?;
+                    (snap, None)
+                }
             } else {
                 let id = next_id_locked(&state, &items);
                 let (chain_name, _) = notes::chain_display_info(&rdir);
@@ -7525,29 +7627,49 @@ fn defer_cmd(args: &[String]) -> Res<i32> {
                     updated_at: now_iso.clone(),
                     state_since: now_iso.clone(),
                     origin: "materialize".into(),
+                    defer_reason: r,
+                    defer_until: until_iso,
+                    defer_streak: 1,
                     ..Default::default()
                 };
                 w.add_run(&rid, Some(&rdir), Some(&repo));
+                let snap = w.clone();
                 items.push(w);
-                items.len() - 1
+                save_raw(&state, &items)?;
+                (snap, None)
             }
-        };
-
-        items[pos].defer_reason = r;
-        items[pos].defer_until = until_iso;
-        items[pos].defer_streak = items[pos].defer_streak.saturating_add(1);
-        items[pos].set_state("deferred", &now_iso);
-        let snap = items[pos].clone();
-        save_raw(&state, &items)?;
-        snap
+        }
     };
 
-    if !deferred_item.runs.is_empty() {
-        events::mark_runs_read(&deferred_item.runs);
+    if let Some(ref rid) = deferred_run_only {
+        events::mark_runs_read(std::slice::from_ref(rid));
+        crate::hook::record_action("defer", std::slice::from_ref(rid), Some(&deferred_item.id), false);
+    } else {
+        if !deferred_item.runs.is_empty() {
+            events::mark_runs_read(&deferred_item.runs);
+        }
+        crate::hook::record_action("defer", &deferred_item.runs, Some(&deferred_item.id), false);
     }
-    crate::hook::record_action("defer", &deferred_item.runs, Some(&deferred_item.id), false);
     if json_mode {
-        println!("{}", deferred_item.to_json());
+        let mut out = deferred_item.to_json();
+        if let Some(ref rid) = deferred_run_only {
+            out["deferredRun"] = json!(rid);
+            out["runOnly"] = json!(true);
+        }
+        println!("{out}");
+    } else if let Some(ref rid) = deferred_run_only {
+        let rdef = deferred_item.run_defers.get(rid);
+        let until_str = rdef.map(|d| d.until.as_str()).unwrap_or("");
+        let reason_str = rdef.map(|d| d.reason.as_str()).unwrap_or("");
+        println!(
+            "已暂缓 run {} 的待合入提醒至 {}（原因：{}；工作项 [{}] 状态保持 {} 不变，整项暂缓请用 delegate work defer {}）",
+            rid,
+            until_str,
+            reason_str,
+            deferred_item.id,
+            deferred_item.state,
+            deferred_item.id
+        );
     } else {
         println!(
             "已暂缓 [{}] {} · deferred 至 {}（原因：{} · 卡片：delegate work show {}）",

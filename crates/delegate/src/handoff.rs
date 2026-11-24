@@ -24,6 +24,7 @@ fn state_label(status: &Value) -> String {
         "starting" => "启动中",
         "delivered" => "已交付",
         "answered" => "已答复",
+        "blocked_mainline" => "主干阻塞",
         "rejected" => "未通过",
         "timeout" => "超时",
         "stalled" => "卡住",

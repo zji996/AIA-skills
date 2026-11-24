@@ -261,6 +261,7 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
         "starting" => "启动中",
         "delivered" => "已交付",
         "answered" => "已答复",
+        "blocked_mainline" => "主干阻塞",
         "rejected" => "未通过",
         "timeout" => "超时",
         "stalled" => "卡住",
@@ -845,13 +846,20 @@ pub fn human_detail(run: &Path, status: &Value) -> String {
         for layer in acc["layers"].as_array().unwrap() {
             let st = s(layer, "status");
             let st_zh = match st {
-                "passed" => "通过",
-                "failed" => "失败",
-                "skipped" => "跳过",
-                "reused" => "复用",
-                "cancelled" => "取消",
-                "not_run" => "未跑",
-                _ => st,
+                "passed" => "通过".to_string(),
+                "failed" => "失败".to_string(),
+                "skipped" => "跳过".to_string(),
+                "reused" => {
+                    let rn = n(layer, "reusedFromRound");
+                    if rn > 0 {
+                        format!("沿用第 {rn} 轮通过")
+                    } else {
+                        "沿用上轮通过".to_string()
+                    }
+                }
+                "cancelled" => "取消".to_string(),
+                "not_run" => "未跑".to_string(),
+                _ => st.to_string(),
             };
             let lname = s(layer, "name");
             let tier = s(layer, "tier");

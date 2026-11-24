@@ -1806,6 +1806,116 @@ fn adopt_command(args: &[String]) -> Res<i32> {
     Ok(0)
 }
 
+fn mark_applied_command(args: &[String]) -> Res<i32> {
+    let (pos, flags, values) = parse_simple(
+        args,
+        &["--check-files", "--json"],
+        &["--commit"],
+    )?;
+    if has(&flags, "--json") {
+        output::enable_json();
+    }
+    if pos.len() != 1 {
+        return Err(
+            "usage: delegate mark-applied <run> [--commit <sha>] [--check-files] [--json]".into(),
+        );
+    }
+    let resolved = runs::resolve(&pos[0])?;
+    let run = if runs::continues_conversation(&resolved) {
+        runs::latest(resolved)
+    } else {
+        resolved
+    };
+    if runs::active(&runs::state(&run)) {
+        return Err(format!(
+            "{} is still running",
+            run.file_name().unwrap_or_default().to_string_lossy()
+        ));
+    }
+    let commit_arg = value(&values, "--commit");
+    let check_files = has(&flags, "--check-files");
+    let res = worktree::mark_applied(&run, commit_arg, check_files)?;
+
+    let mut applied_ids = Vec::new();
+    let mut committed_runs = std::collections::HashSet::new();
+    for (rdir, meta, applied_doc) in &res.marked_runs {
+        let rid = events::run_id_for(rdir, meta);
+        let arch = archive::status(rdir).map(|m| PathBuf::from(s(&m, "path")));
+        history::record_apply(
+            rdir,
+            meta,
+            s(applied_doc, "at"),
+            &res.commit_sha,
+            "manual",
+            arch.as_deref(),
+        );
+        events::emit(
+            &rid,
+            &events::repo_for_meta(meta),
+            "applied",
+            json!({
+                "name": s(meta, "name"),
+                "head": res.commit_sha,
+                "commit": res.commit_sha,
+                "appliedBy": "manual",
+            }),
+        );
+        events::mark_run_read(&rid);
+        index::upsert_run(rdir);
+        board::refresh_for_run(rdir);
+        applied_ids.push(rid.clone());
+        committed_runs.insert(rid);
+    }
+
+    let work_opts = work::ApplyWorkOptions {
+        committed_runs,
+        ..Default::default()
+    };
+    let work_hints = work::on_runs_applied_with_options(&res.marked_runs, &work_opts);
+    work::check_stale_and_expired();
+    dag_queue::advance();
+    hook::record_action("apply", &applied_ids, None, false);
+    premerge::spawn_worker_force(&res.source);
+
+    let head_meta = json(run.join("meta.json"));
+    let head_id = events::run_id_for(&run, &head_meta);
+    let head_name = s(&head_meta, "name").to_string();
+    let short_sha = &res.commit_sha[..res.commit_sha.len().min(7)];
+
+    if output::json_enabled() {
+        println!(
+            "{}",
+            json!({
+                "run": head_id,
+                "name": head_name,
+                "commit": res.commit_sha,
+                "appliedAt": res.applied_at,
+                "appliedBy": "manual",
+                "markedRuns": applied_ids,
+                "checkedFiles": res.checked_files,
+                "missingFiles": res.missing_files,
+                "workHints": work_hints,
+            })
+        );
+    } else {
+        println!(
+            "已标记为已合入：{}（{}）· commit {}（manual）",
+            head_name, head_id, short_sha
+        );
+        if !res.missing_files.is_empty() {
+            eprintln!(
+                "提示：以下净改动文件未在 commit {} 中出现（可能是拆分提交或手工改名）：{}",
+                short_sha,
+                res.missing_files.join("、")
+            );
+        }
+        for hint in work_hints {
+            println!("{hint}");
+        }
+    }
+    Ok(0)
+}
+
 fn files_command(args: &[String]) -> Res<i32> {
     let (pos, flags, _) = parse_simple(args, &["--json"], &[])?;
     if pos.len() > 1 {
@@ -2085,8 +2195,8 @@ fn apply(args: &[String]) -> Res<i32> {
                         }
                         done[idx].conclusion["apply"]["commitSubject"] = json!(&subject);
                     }
-                    // HEAD advanced: wake `_merge-worker` for any other pending runs in this repo.
-                    premerge::spawn_worker(Path::new(&src));
+                    // HEAD advanced: wake `_merge-worker` for any other pending / blocked_mainline runs in this repo.
+                    premerge::spawn_worker_force(Path::new(&src));
                 }
                 Err(err) => {
                     code = 1;
@@ -3230,6 +3340,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "files" => files_command(rest),
         "patch" => patch(rest),
         "apply" => apply(rest),
+        "mark-applied" => mark_applied_command(rest),
         "adopt" => adopt_command(rest),
         "lane" => lane::lane_command(rest),
         "busy" => {

@@ -415,7 +415,7 @@ class Delegate639Tests(unittest.TestCase):
                 "fix camera",
             )
         )
-        self.assertEqual(r_main["state"], "rejected", r_main)
+        self.assertEqual(r_main["state"], "blocked_mainline", r_main)
         card_a_json = json.loads(self.cli("card", r_main["run"], "--json", cwd=repo, human=True).stdout)
         attr_a = card_a_json["accept"].get("failureAttribution")
         self.assertIsNotNone(attr_a, card_a_json["accept"])

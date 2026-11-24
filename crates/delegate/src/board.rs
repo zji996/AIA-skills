@@ -145,6 +145,9 @@ fn failure_reason(st: &str, sum: &Value) -> String {
     if b(&sum["accept"], "notExecuted") || b(sum, "infrastructureFailure") {
         return format!("{label}：验收未执行（排队/基础设施）");
     }
+    if st == "blocked_mainline" {
+        return format!("{label}：主干阻塞（主干修复后自动重验）");
+    }
     if st == "rejected" && sum["accept"].is_object() && !b(&sum["accept"], "ok") {
         return format!("{label}：验收未通过");
     }
@@ -167,6 +170,7 @@ fn failure_next_short(id: &str, st: &str, sum: &Value) -> String {
         return format!("delegate reply {id} '重试验收'");
     }
     match st {
+        "blocked_mainline" => "等待主干修复后自动重验".to_string(),
         "rejected" | "malformed" => format!("delegate reply {id} '<修正>' 或接手"),
         "timeout" | "stalled" => format!("delegate reply {id} '继续完成'（不计返工）"),
         "stopped" => format!("delegate clean {id}"),

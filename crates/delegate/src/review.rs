@@ -1717,6 +1717,29 @@ fn build_controller_review_json(run: &Path, hit: &ControllerReviewHit) -> Res<Va
     }))
 }
 
+fn apply_accept_failure_state(
+    run: &Path,
+    meta: &Value,
+    accept_doc: &mut Value,
+    state: &mut String,
+    sum: &mut Value,
+) {
+    if lane::stopped() {
+        *state = "stopped".into();
+        sum["state"] = json!("stopped");
+        return;
+    }
+    if crate::accept::is_mainline_blocked(accept_doc) {
+        accept_doc["mainlineBlocked"] = json!(true);
+        sum["mainlineBlock"] = crate::accept::build_mainline_block(run, meta, accept_doc);
+        *state = "blocked_mainline".into();
+        sum["state"] = json!("blocked_mainline");
+    } else {
+        *state = "rejected".into();
+        sum["state"] = json!("rejected");
+    }
+}
+
 fn emit_accept_event(run: &Path, meta: &Value, accept_doc: &Value) {
     let mut payload = json!({
         "name": s(meta, "name"),
@@ -2078,7 +2101,7 @@ pub fn run_accept_and_review(
             None
         };
         let (_, after_snap) = crate::accept::snapshot_for_accept(meta, run);
-        let accept_doc = crate::accept::build_accept_summary(
+        let mut accept_doc = crate::accept::build_accept_summary(
             meta,
             run,
             &plan,
@@ -2089,19 +2112,18 @@ pub fn run_accept_and_review(
             before_snap.as_ref(),
             after_snap.as_ref(),
         );
-        emit_accept_event(run, meta, &accept_doc);
         if b(&accept_doc, "infrastructureFailure") {
             sum["infrastructureFailure"] = json!(true);
             sum["error"] = json!("remote infrastructure failure; retry does not spend a rework round");
         }
-        *state = if b(&accept_doc, "ok") {
-            "delivered"
+        if b(&accept_doc, "ok") {
+            *state = "delivered".into();
+            sum["state"] = json!("delivered");
         } else {
-            "rejected"
+            apply_accept_failure_state(run, meta, &mut accept_doc, state, sum);
         }
-        .into();
+        emit_accept_event(run, meta, &accept_doc);
         sum["accept"] = accept_doc;
-        sum["state"] = json!(*state);
         check_controller_paths_when_review_off(run, meta, state, sum)?;
         return Ok(());
     }
@@ -2150,7 +2172,7 @@ pub fn run_accept_and_review(
                 None
             };
             let (_, after_snap) = crate::accept::snapshot_for_accept(meta, run);
-            let accept_doc = crate::accept::build_accept_summary(
+            let mut accept_doc = crate::accept::build_accept_summary(
                 meta,
                 run,
                 &plan,
@@ -2161,11 +2183,15 @@ pub fn run_accept_and_review(
                 before_snap.as_ref(),
                 after_snap.as_ref(),
             );
-            emit_accept_event(run, meta, &accept_doc);
             let acc_ok = b(&accept_doc, "ok");
+            if acc_ok {
+                *state = "delivered".into();
+                sum["state"] = json!("delivered");
+            } else {
+                apply_accept_failure_state(run, meta, &mut accept_doc, state, sum);
+            }
+            emit_accept_event(run, meta, &accept_doc);
             sum["accept"] = accept_doc;
-            *state = if acc_ok { "delivered" } else { "rejected" }.into();
-            sum["state"] = json!(*state);
             if !acc_ok {
                 return Ok(());
             }
@@ -2284,11 +2310,13 @@ pub fn run_accept_and_review(
         };
         if let Some(fo) = &fast_outcome {
             for (k, v) in &fo.passed_layers {
-                passed_layers.insert(k.clone(), v.clone());
+                let mut entry = v.clone();
+                entry["passedRound"] = json!(round);
+                passed_layers.insert(k.clone(), entry);
             }
             if !fo.ok {
                 let (_, accept_after_snap) = crate::accept::snapshot_for_accept(meta, run);
-                let accept_doc = crate::accept::build_accept_summary(
+                let mut accept_doc = crate::accept::build_accept_summary(
                     meta,
                     run,
                     &plan,
@@ -2299,15 +2327,14 @@ pub fn run_accept_and_review(
                     accept_before_snap.as_ref(),
                     accept_after_snap.as_ref(),
                 );
-                emit_accept_event(run, meta, &accept_doc);
                 if b(&accept_doc, "infrastructureFailure") {
                     sum["infrastructureFailure"] = json!(true);
                     sum["error"] =
                         json!("remote infrastructure failure; retry does not spend a rework round");
                 }
+                apply_accept_failure_state(run, meta, &mut accept_doc, state, sum);
+                emit_accept_event(run, meta, &accept_doc);
                 sum["accept"] = accept_doc;
-                *state = if lane::stopped() { "stopped" } else { "rejected" }.into();
-                sum["state"] = json!(*state);
                 if round > 1 {
                     let now = iso();
                     let mut final_doc = json!({
@@ -3139,11 +3166,13 @@ pub fn run_accept_and_review(
 
         if let Some(so) = &slow_outcome {
             for (k, v) in &so.passed_layers {
-                passed_layers.insert(k.clone(), v.clone());
+                let mut entry = v.clone();
+                entry["passedRound"] = json!(round);
+                passed_layers.insert(k.clone(), entry);
             }
         }
         let (_, accept_after_snap) = crate::accept::snapshot_for_accept(meta, run);
-        let accept_doc = crate::accept::build_accept_summary(
+        let mut accept_doc = crate::accept::build_accept_summary(
             meta,
             run,
             &plan,
@@ -3154,7 +3183,6 @@ pub fn run_accept_and_review(
             accept_before_snap.as_ref(),
             accept_after_snap.as_ref(),
         );
-        emit_accept_event(run, meta, &accept_doc);
         let accept_ok = b(&accept_doc, "ok");
         let accept_cancelled = b(&accept_doc, "cancelled");
         if b(&accept_doc, "infrastructureFailure") {
@@ -3162,6 +3190,10 @@ pub fn run_accept_and_review(
             sum["error"] =
                 json!("remote infrastructure failure; retry does not spend a rework round");
         }
+        if !accept_ok && !accept_cancelled && !lane::stopped() && !rev_outcome.stopped {
+            apply_accept_failure_state(run, meta, &mut accept_doc, state, sum);
+        }
+        emit_accept_event(run, meta, &accept_doc);
         sum["accept"] = accept_doc;
 
         // 1. Supervisor stopped externally.
@@ -3189,8 +3221,10 @@ pub fn run_accept_and_review(
         // 2. Slow acceptance failed (not cancelled by reviewer): NEVER enter delivered,
         //    and a cancelled reviewer MUST NEVER be recorded as PASS.
         if !accept_ok && !accept_cancelled {
-            *state = "rejected".into();
-            sum["state"] = json!("rejected");
+            if state != "blocked_mainline" {
+                *state = "rejected".into();
+                sum["state"] = json!("rejected");
+            }
             let now = iso();
             if rev_outcome.cancelled {
                 let mut round_entry = json!({

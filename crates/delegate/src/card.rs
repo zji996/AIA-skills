@@ -3605,6 +3605,7 @@ pub fn render_card_human(card: &Value) -> String {
         match state {
             "delivered" => "已交付",
             "answered" => "已答复",
+            "blocked_mainline" => "主干阻塞",
             "rejected" => "未通过",
             "running" => "运行中",
             "stopped" => "已停止",
@@ -3973,13 +3974,20 @@ pub fn render_card_human(card: &Value) -> String {
             for layer in layers {
                 let st = s(layer, "status");
                 let st_zh = match st {
-                    "passed" => "通过",
-                    "failed" => "失败",
-                    "skipped" => "跳过",
-                    "reused" => "复用",
-                    "cancelled" => "取消",
-                    "not_run" => "未跑",
-                    _ => st,
+                    "passed" => "通过".to_string(),
+                    "failed" => "失败".to_string(),
+                    "skipped" => "跳过".to_string(),
+                    "reused" => {
+                        let rn = n(layer, "reusedFromRound");
+                        if rn > 0 {
+                            format!("沿用第 {rn} 轮通过")
+                        } else {
+                            "沿用上轮通过".to_string()
+                        }
+                    }
+                    "cancelled" => "取消".to_string(),
+                    "not_run" => "未跑".to_string(),
+                    _ => st.to_string(),
                 };
                 let lname = s(layer, "name");
                 let tier = s(layer, "tier");
@@ -4263,13 +4271,25 @@ pub fn card_command(args: &[String]) -> Res<i32> {
     let meta = json(run.join("meta.json"));
     let sum = json(run.join("summary.json"));
     let card_doc = compute_card(&run, &meta, &sum, round_only)?;
-    // Zero-lock wakeup if premerge is stale or worker died.
-    if card_doc["premerge"].is_object()
-        && matches!(s(&card_doc["premerge"], "status"), "stale" | "crashed")
-    {
-        let src = s(&meta["worktree"], "source");
-        if !src.is_empty() {
-            crate::premerge::spawn_worker(Path::new(src));
+    // Zero-lock wakeup if premerge is stale/crashed or a mainline-blocked run's HEAD advanced.
+    let src = s(&meta["worktree"], "source");
+    if !src.is_empty() {
+        let src_path = Path::new(src);
+        if s(&sum, "state") == "blocked_mainline"
+            && sum["mainlineBlock"].is_object()
+            && n(&sum["mainlineBlock"], "rerunCount") == 0
+        {
+            let cur_head = read_git_head(src_path).unwrap_or_default();
+            if !cur_head.is_empty()
+                && cur_head != s(&sum["mainlineBlock"], "blockedBaseHead")
+                && cur_head != s(&sum["mainlineBlock"], "checkedHead")
+            {
+                crate::premerge::spawn_worker_force(src_path);
+            }
+        } else if card_doc["premerge"].is_object()
+            && matches!(s(&card_doc["premerge"], "status"), "stale" | "crashed")
+        {
+            crate::premerge::spawn_worker(src_path);
         }
     }
     if json_mode {

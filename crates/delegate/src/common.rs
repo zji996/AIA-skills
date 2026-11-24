@@ -1229,6 +1229,16 @@ pub fn finish_run(run: &std::path::Path, mut summary: serde_json::Value, code: i
     crate::dag_queue::advance();
     if spawn_premerge {
         crate::premerge::spawn_worker_for_meta(&meta);
+    } else if s(&summary, "state") == "blocked_mainline" && summary["mainlineBlock"].is_object() {
+        let src = s(&meta["worktree"], "source");
+        if !src.is_empty() {
+            let src_path = std::path::Path::new(src);
+            let cur_head = read_git_head(src_path).unwrap_or_default();
+            let blocked_base = s(&summary["mainlineBlock"], "blockedBaseHead");
+            if !cur_head.is_empty() && cur_head != blocked_base {
+                crate::premerge::spawn_worker_force(src_path);
+            }
+        }
     }
     Ok(())
 }
