@@ -76,6 +76,11 @@ class Delegate626Tests(unittest.TestCase):
         repo = self.repo({"a.txt": "base\n"})
         state = self.run_write(repo, "echo colleague > a.txt", "conflict-abort")
         (repo / "a.txt").write_text("caller\n")
+        subprocess.run(["git", "-C", str(repo), "add", "a.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "caller"],
+            check=True,
+        )
 
         res = self.cli("apply", state["run"], human=True)
         self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
@@ -112,7 +117,7 @@ class Delegate626Tests(unittest.TestCase):
         real_conflict = "```text\n<<<<<<< current\nleft\n=======\nright\n>>>>>>> run-2\n```\n"
         pre2 = f"python3 -c {shlex.quote(f'open(\"docs/notes.md\", \"w\").write({real_conflict!r})')}"
         state2 = self.run_write(repo, pre2, "md-real-conflict")
-        res2 = self.cli("apply", "--json", state2["run"])
+        res2 = self.cli("apply", "--json", "--allow-dirty-overlap", state2["run"])
         self.assertEqual(res2.returncode, 1, res2.stdout + res2.stderr)
         payload2 = self.outcome(res2)
         self.assertFalse(payload2["apply"]["ok"])
@@ -166,7 +171,9 @@ class Delegate626Tests(unittest.TestCase):
         self.assertIn("改动未提交：2 个文件", res.stderr)
         self.assertIn("feat: first change", res.stderr)
         # Last line remains acceptance validity for downstream parsers/tests.
-        self.assertEqual(res.stdout.splitlines()[-1], "验收仍然有效（仓库快照范围）")
+        lines = res.stdout.splitlines()
+        self.assertEqual(lines[-2], "验收仍然有效（仓库快照范围）")
+        self.assertIn(f"delegate files {state['run']}", lines[-1])
 
     def test_apply_commit_flag_squashes_with_titles_and_fails_closed(self):
         repo = self.repo({"a.txt": "a0\n", "b.txt": "b0\n", "other.txt": "o0\n"})

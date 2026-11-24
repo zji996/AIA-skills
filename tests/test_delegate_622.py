@@ -263,7 +263,7 @@ class Delegate622Tests(unittest.TestCase):
         (repo / ".delegate.json").write_text(json.dumps({"worktree": {"cleanOnApply": False}}))
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo v2 > a.txt")
         kept = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "keep-wt"))
-        self.assertEqual(self.cli("apply", "--json", kept["run"]).returncode, 0)
+        self.assertEqual(self.cli("apply", "--json", "--allow-dirty-overlap", kept["run"]).returncode, 0)
         self.assertTrue(Path(kept["worktree"]).is_dir(), "cleanOnApply=false must keep worktree")
 
         # 3. Invalid cleanOnApply fails config validation with exit 2.
@@ -288,7 +288,7 @@ class Delegate622Tests(unittest.TestCase):
         # Once r2 finishes and the chain is applied, archive is written and worktree is deleted.
         gate.touch()
         self.assertEqual(self.cli("wait", r2["run"]).returncode, 0)
-        res = self.cli("apply", "--json", r2["run"])
+        res = self.cli("apply", "--json", "--allow-dirty-overlap", r2["run"])
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertFalse(Path(r1["worktree"]).exists(), "worktree should be deleted once whole chain is applied")
         # 6.33 P1-4: superseded predecessor r1 is auto-cleaned & archived immediately on apply;

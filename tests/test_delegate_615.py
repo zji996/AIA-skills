@@ -131,7 +131,7 @@ class Delegate615Tests(unittest.TestCase):
         self.assertNotIn("+two", self.cli("patch", first["run"]).stdout)
         self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo reply > a.txt")
         reply = self.outcome(self.cli("reply", "--wait", second["run"], "more"))
-        self.assertEqual(self.cli("apply", reply["run"]).returncode, 0)
+        self.assertEqual(self.cli("apply", "--allow-dirty-overlap", reply["run"]).returncode, 0)
         third = self.run_write(repo, "echo three > a.txt", "three")
         self.assertEqual(first["worktree"], third["worktree"])
 

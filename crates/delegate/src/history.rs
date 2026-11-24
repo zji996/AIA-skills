@@ -32,6 +32,7 @@ pub struct HistoryEntry {
     pub model_name: String,
     pub state: String,
     pub question: bool,
+    pub policy_refused: bool,
     pub parent: String,
     pub children: Vec<String>,
     pub prompt_first_line: String,
@@ -105,6 +106,9 @@ impl HistoryEntry {
         obj.insert("state".into(), json!(self.state));
         if self.question {
             obj.insert("question".into(), json!(true));
+        }
+        if self.policy_refused {
+            obj.insert("policyRefused".into(), json!(true));
         }
         if !self.parent.is_empty() {
             obj.insert("parent".into(), json!(self.parent));
@@ -607,6 +611,9 @@ fn build_finish_record(run: &Path) -> Option<(String, Value)> {
     if b(&sum, "question") {
         rec.insert("question".into(), json!(true));
     }
+    if b(&sum, "policyRefused") {
+        rec.insert("policyRefused".into(), json!(true));
+    }
     if !s(&meta, "parent").is_empty() {
         rec.insert("parent".into(), json!(s(&meta, "parent")));
     }
@@ -856,6 +863,7 @@ fn load_entries_from_text(content: &str) -> Vec<HistoryEntry> {
                     entry.state = s(&v, "state").to_string();
                 }
                 entry.question = b(&v, "question");
+                entry.policy_refused = b(&v, "policyRefused");
                 if !s(&v, "parent").is_empty() {
                     entry.parent = s(&v, "parent").to_string();
                 }
@@ -1294,8 +1302,19 @@ pub fn keyword_matches(haystack: &str, keyword: &str) -> bool {
 }
 
 pub fn state_label(state: &str, question: bool, applied: bool) -> String {
+    state_label_full(state, question, false, applied)
+}
+
+pub fn state_label_full(
+    state: &str,
+    question: bool,
+    policy_refused: bool,
+    applied: bool,
+) -> String {
     let base = if question {
         "提问"
+    } else if policy_refused {
+        "结论被模型服务拒绝"
     } else {
         match state {
             "running" => "运行中",
@@ -1315,7 +1334,7 @@ pub fn state_label(state: &str, question: bool, applied: bool) -> String {
             _ => state,
         }
     };
-    if applied && matches!(state, "delivered" | "answered") && !question {
+    if applied && matches!(state, "delivered" | "answered") && !question && !policy_refused {
         format!("{base}/已合入")
     } else {
         base.to_string()
@@ -1391,7 +1410,12 @@ pub fn warn_similar_runs(created_run: &Path, name: &str, raw_prompt: &str) {
             entry.prompt_first_line.as_str()
         };
         if let Some(score) = similarity_score(name, raw_prompt, &entry.name, prompt_cmp) {
-            let label = state_label(&entry.state, entry.question, !entry.applied_at.is_empty());
+            let label = state_label_full(
+                &entry.state,
+                entry.question,
+                entry.policy_refused,
+                !entry.applied_at.is_empty(),
+            );
             hits.push((false, score, ts, entry.run, entry.name, label));
         }
     }
@@ -1454,7 +1478,12 @@ fn compact_changes_label(entry: &HistoryEntry) -> String {
 }
 
 fn matches_state_filter(entry: &HistoryEntry, filter: &str) -> bool {
-    let label = state_label(&entry.state, entry.question, !entry.applied_at.is_empty());
+    let label = state_label_full(
+        &entry.state,
+        entry.question,
+        entry.policy_refused,
+        !entry.applied_at.is_empty(),
+    );
     filter.split(',').map(str::trim).filter(|s| !s.is_empty()).any(|want| {
         let want_lower = want.to_lowercase();
         match want_lower.as_str() {
@@ -1572,7 +1601,12 @@ pub fn history_command(args: &[String]) -> Res<i32> {
             "未知时间".into()
         };
         let clean_name = entry.name.replace(['\n', '\r'], " ");
-        let st_label = state_label(&entry.state, entry.question, !entry.applied_at.is_empty());
+        let st_label = state_label_full(
+            &entry.state,
+            entry.question,
+            entry.policy_refused,
+            !entry.applied_at.is_empty(),
+        );
         let model_label =
             compact_model_label(&entry.agent, &entry.model, &entry.model_name, &entry.tier);
         let changes_label = compact_changes_label(entry);
@@ -1861,6 +1895,7 @@ pub fn show_command(args: &[String]) -> Res<i32> {
         model_name,
         state,
         question,
+        policy_refused,
         prompt_head,
         conclusion,
         files_by_dir,
@@ -1954,6 +1989,7 @@ pub fn show_command(args: &[String]) -> Res<i32> {
             s(&meta, "modelName").to_string(),
             st,
             b(&sum, "question"),
+            b(&sum, "policyRefused"),
             prompt_head,
             conclusion,
             fdir,
@@ -1994,6 +2030,7 @@ pub fn show_command(args: &[String]) -> Res<i32> {
             h.model_name.clone(),
             h.state.clone(),
             h.question,
+            h.policy_refused,
             if !h.prompt_excerpt.is_empty() {
                 h.prompt_excerpt.clone()
             } else {
@@ -2043,6 +2080,7 @@ pub fn show_command(args: &[String]) -> Res<i32> {
             "mode": mode,
             "state": state,
             "question": question,
+            "policyRefused": policy_refused,
             "agent": agent,
             "tier": tier,
             "model": model,
@@ -2075,7 +2113,7 @@ pub fn show_command(args: &[String]) -> Res<i32> {
         return Ok(0);
     }
 
-    let st_label = state_label(&state, question, !applied_at.is_empty());
+    let st_label = state_label_full(&state, question, policy_refused, !applied_at.is_empty());
     let model_label = compact_model_label(&agent, &model, &model_name, &tier);
     let mut header = vec![
         run_id.clone(),

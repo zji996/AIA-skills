@@ -167,6 +167,45 @@ pub fn conversation(v: &Value) -> Option<&str> {
     .filter(|id| !id.is_empty())
 }
 
+/// Short tail-appended prompt sent on the SAME session (preserving prefix cache and model binding)
+/// when the model service blocks the final conclusion with a content-policy refusal.
+/// Intentionally omits sensitive English keywords so the retry prompt itself is not filtered.
+pub const POLICY_REWRITE_PROMPT: &str = "上一条最终结论被模型服务内容策略拦截。工作本身已完成，请仅重写最终结论（不要重复执行任务，不要修改代码）：不要贴出原文片段，也不要在正文中出现可能触发过滤的文件名或敏感路径词，改用「凭据文件」「密钥文件」「配置文件」等泛称概括；简明给出结论、改动要点与验证结果。";
+
+/// Detect Google/Gemini/agy content-policy refusal text in a final answer.
+/// Bounded by length and structure so normal engineering reports mentioning the phrase do not match.
+pub fn is_policy_refusal(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 600 {
+        return false;
+    }
+    if trimmed.lines().count() > 6 || trimmed.contains("```") || trimmed.starts_with("# ") {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let core = lower.strip_prefix("error:").map(str::trim).unwrap_or(&lower);
+    if core.starts_with("the prompt could not be submitted")
+        && (core.contains("prohibited use policy")
+            || core.contains("sensitive words")
+            || core.contains("policy"))
+    {
+        return true;
+    }
+    core.starts_with("the prompt contains sensitive words")
+        && (core.contains("prohibited use policy") || core.contains("policy"))
+}
+
+/// Detect Google/Gemini/agy content-policy refusal text in a provider `turn_error` detail line.
+pub fn is_policy_refusal_error(detail: &str) -> bool {
+    let lower = detail.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    (lower.contains("the prompt could not be submitted")
+        && (lower.contains("prohibited use policy") || lower.contains("sensitive words")))
+        || (lower.contains("sensitive words") && lower.contains("prohibited use policy"))
+}
+
 /// agy links files as `file://<worktree>/path#L1`; the worktree is gone after
 /// apply, so answers keep the repo-relative path.
 pub fn relative_links(text: &str, workdir: &str) -> String {
@@ -444,6 +483,33 @@ mod tests {
             Some("c-8")
         );
         assert_eq!(conversation(&json!({"event":"init","conversation_id":""})), None);
+    }
+
+    #[test]
+    fn policy_refusal_detects_agy_prohibited_use_and_ignores_normal_reports() {
+        assert!(is_policy_refusal(
+            "The prompt could not be submitted. The prompt contains sensitive words that violate Google's Generative AI Prohibited Use policy..."
+        ));
+        assert!(is_policy_refusal(
+            "Error: The prompt could not be submitted. The prompt contains sensitive words that violate Google's Generative AI Prohibited Use policy."
+        ));
+        assert!(is_policy_refusal(
+            "The prompt contains sensitive words that violate Google's Generative AI Prohibited Use policy."
+        ));
+        assert!(!is_policy_refusal(
+            "# Summary\n\nAdded detection for Google's Generative AI Prohibited Use policy refusal."
+        ));
+        assert!(!is_policy_refusal(
+            "Done: handled The prompt could not be submitted / Prohibited Use policy."
+        ));
+        assert!(is_policy_refusal_error(
+            "rpc error: The prompt could not be submitted. The prompt contains sensitive words that violate Google's Generative AI Prohibited Use policy"
+        ));
+        assert!(!is_policy_refusal(POLICY_REWRITE_PROMPT));
+        let lower_prompt = POLICY_REWRITE_PROMPT.to_ascii_lowercase();
+        for word in ["token", "secret", "private.key", "password"] {
+            assert!(!lower_prompt.contains(word), "rewrite prompt must not contain {word}");
+        }
     }
 
     #[test]

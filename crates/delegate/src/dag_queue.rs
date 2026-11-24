@@ -98,6 +98,13 @@ pub fn evaluate_run_outcome(
             state: "question".into(),
         };
     }
+    if b(sum, "policyRefused") {
+        return UpstreamVerdict::Paused {
+            upstream_run: run_id.to_string(),
+            reason: "上游结论被模型服务拒绝，需主控确认".into(),
+            state: "policy_refused".into(),
+        };
+    }
     if review.is_object() {
         let verdict = s(review, "verdict");
         if verdict == "NEEDS_CONTROLLER" {
@@ -204,7 +211,14 @@ fn evaluate_applied_dep(
     items_by_name: &HashMap<String, Value>,
     state: &Path,
     repo: &str,
+    prefetched_applied: &HashMap<(String, String), bool>,
 ) -> UpstreamVerdict {
+    let check_applied = |run_ref: &str| -> bool {
+        if let Some(&cached) = prefetched_applied.get(&(repo.to_string(), run_ref.to_string())) {
+            return cached;
+        }
+        crate::work::is_run_applied(run_ref, state, Some(repo))
+    };
     if let Some(up) = items_by_name.get(dep) {
         let ust = s(up, "status");
         return match ust {
@@ -212,7 +226,7 @@ fn evaluate_applied_dep(
             "dispatched" => {
                 let rid = s(up, "runId");
                 let rdir = s(up, "runDir");
-                if !rid.is_empty() && crate::work::is_run_applied(rid, state, Some(repo)) {
+                if !rid.is_empty() && check_applied(rid) {
                     return UpstreamVerdict::Satisfied;
                 }
                 if !rdir.is_empty() {
@@ -239,7 +253,7 @@ fn evaluate_applied_dep(
             _ => UpstreamVerdict::Waiting,
         };
     }
-    if crate::work::is_run_applied(dep, state, Some(repo)) {
+    if check_applied(dep) {
         return UpstreamVerdict::Satisfied;
     }
     if let Some(dir_str) = after_dirs.get(dep).and_then(Value::as_str) {
@@ -314,6 +328,43 @@ pub fn advance() {
         let to_dispatch: Vec<Value>;
         let mut paused_events: Vec<(String, String, Value)> = Vec::new();
 
+        // Precompute `is_run_applied` (which may inspect git/worktrees) strictly OUTSIDE `.state.lock`.
+        let prefetched_applied: HashMap<(String, String), bool> = {
+            let snap = load_items(&state);
+            let mut snap_by_name: HashMap<String, &Value> = HashMap::new();
+            for item in &snap {
+                if s(item, "status") != "cancelled" {
+                    snap_by_name.insert(s(item, "name").to_string(), item);
+                }
+            }
+            let mut map = HashMap::new();
+            for item in &snap {
+                if s(item, "status") != "pending" {
+                    continue;
+                }
+                let item_repo = s(item, "repo").to_string();
+                for dep in strings(&item["afterApplied"]) {
+                    if let Some(up) = snap_by_name.get(&dep) {
+                        if s(up, "status") == "dispatched" {
+                            let rid = s(up, "runId");
+                            if !rid.is_empty() {
+                                let key = (item_repo.clone(), rid.to_string());
+                                map.entry(key).or_insert_with(|| {
+                                    crate::work::is_run_applied(rid, &state, Some(&item_repo))
+                                });
+                            }
+                        }
+                    } else {
+                        let key = (item_repo.clone(), dep.clone());
+                        map.entry(key).or_insert_with(|| {
+                            crate::work::is_run_applied(&dep, &state, Some(&item_repo))
+                        });
+                    }
+                }
+            }
+            map
+        };
+
         {
             let Ok(_guard) = crate::locks::acquire_state(&state) else {
                 return;
@@ -358,7 +409,14 @@ pub fn advance() {
                 }
                 if paused.is_none() {
                     for dep in &applied_deps {
-                        match evaluate_applied_dep(dep, &item["afterDirs"], &by_name, &state, &item_repo) {
+                        match evaluate_applied_dep(
+                            dep,
+                            &item["afterDirs"],
+                            &by_name,
+                            &state,
+                            &item_repo,
+                            &prefetched_applied,
+                        ) {
                             UpstreamVerdict::Satisfied => {}
                             UpstreamVerdict::Waiting => {
                                 all_satisfied = false;
@@ -1048,6 +1106,18 @@ mod tests {
                 &Value::Null
             ),
             UpstreamVerdict::Paused { .. }
+        ));
+
+        // Policy-refused conclusion -> Paused (not treated as normal delivery)
+        assert!(matches!(
+            evaluate_run_outcome(
+                "r2p",
+                "delivered",
+                &write_meta,
+                &json!({"state": "delivered", "accept": {"ok": true}, "policyRefused": true}),
+                &json!({"verdict": "PASS"})
+            ),
+            UpstreamVerdict::Paused { state, .. } if state == "policy_refused"
         ));
 
         // Rejected -> Paused

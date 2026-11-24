@@ -793,6 +793,9 @@ fn recorded_entries(
     if let Some(entries) = rec["finalEntries"].as_object() {
         return Some(entries.clone());
     }
+    if crate::locks::holding_state_lock() {
+        return None;
+    }
     let top = {
         let p = Path::new(s(rec, "top"));
         if p.is_dir() {
@@ -2172,12 +2175,176 @@ fn reject_existing_markers(run: &Path, meta: &Value, keep_commits: bool) -> Res<
     }
     Ok(checked)
 }
+/// Uncommitted paths in `source` (staged, unstaged, and untracked, excluding `.local/`).
+/// In a freshly initialized repository with no HEAD commit yet, returns empty (no baseline commit
+/// to separate uncommitted hunks against).
+pub(crate) fn source_dirty_paths(source: &Path) -> Vec<String> {
+    if read_git_head(source).is_none() {
+        return Vec::new();
+    }
+    let Ok(raw) = git(
+        source,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+        ],
+    ) else {
+        return Vec::new();
+    };
+    let mut dirty = Vec::new();
+    for entry in raw.split(|b| *b == 0) {
+        if entry.len() <= 3 {
+            continue;
+        }
+        let path = String::from_utf8_lossy(&entry[3..]).into_owned();
+        if path == ".local" || path.starts_with(".local/") {
+            continue;
+        }
+        dirty.push(path);
+    }
+    dirty
+}
+
+fn dirty_path_overlaps(path: &str, dirty: &[String]) -> bool {
+    let a = path.trim_end_matches('/');
+    dirty.iter().any(|d| {
+        let b = d.trim_end_matches('/');
+        a == b
+            || a.strip_prefix(b).is_some_and(|r| r.starts_with('/'))
+            || b.strip_prefix(a).is_some_and(|r| r.starts_with('/'))
+    })
+}
+
+/// Deterministic list of repo-relative files changed by a run (works before apply, after apply,
+/// and after auto-clean archive).
+pub fn run_files(run: &Path) -> Vec<String> {
+    let applied_list = run.join("applied-files.txt");
+    if applied_list.is_file() {
+        let mut files: Vec<String> = read(&applied_list)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        files.sort();
+        files.dedup();
+        return files;
+    }
+    let applied = json(run.join(".applied"));
+    if let Some(arr) = applied["files"].as_array().filter(|a| !a.is_empty()) {
+        let mut files: Vec<String> = arr
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect();
+        files.sort();
+        files.dedup();
+        return files;
+    }
+    let meta = json(run.join("meta.json"));
+    if meta["worktree"].is_object() && s(&meta, "mode") == "write" {
+        if let Some(mut pending) = pending_changed_paths(run, &meta) {
+            if !pending.is_empty() {
+                pending.sort();
+                pending.dedup();
+                return pending;
+            }
+        }
+    }
+    let mut set = std::collections::BTreeSet::<String>::new();
+    let rec = json(run.join("changes.json"));
+    if let Some(arr) = rec["changes"].as_array() {
+        for item in arr {
+            let p = s(item, "path");
+            if !p.is_empty() {
+                set.insert(p.to_string());
+            }
+        }
+    }
+    if let Some(obj) = rec["afterLarge"].as_object() {
+        for k in obj.keys() {
+            if !k.is_empty() {
+                set.insert(k.clone());
+            }
+        }
+    }
+    let sum = json(run.join("summary.json"));
+    if set.is_empty() {
+        for p in strings(&sum["files"]) {
+            if !p.is_empty() {
+                set.insert(p);
+            }
+        }
+    }
+    set.into_iter().collect()
+}
+
+fn record_dirty_overlap_failure(
+    run: &Path,
+    meta: &Value,
+    source: &Path,
+    dirty_overlap: &[String],
+    conclusion: &mut Value,
+) -> ApplyInnerResult {
+    let run_id = {
+        let r = s(meta, "run");
+        if !r.is_empty() {
+            r.to_string()
+        } else {
+            run.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    let commit_cmd = format!(
+        "先提交源工作区现有改动，再运行：{} apply {run_id}",
+        script().display()
+    );
+    let allow_cmd = format!(
+        "{} apply --allow-dirty-overlap {run_id}",
+        script().display()
+    );
+    if !crate::output::json_enabled() {
+        for p in dirty_overlap {
+            println!(" dirty-overlap    {p}");
+        }
+    }
+    eprintln!(
+        "delegate: nothing applied; {} target file(s) already have uncommitted changes in {}: {}.\n  下一步（选项 1，推荐）：{commit_cmd}\n  下一步（选项 2，明确接受合并进未提交改动）：{allow_cmd}",
+        dirty_overlap.len(),
+        source.display(),
+        dirty_overlap.join(", "),
+    );
+    conclusion["apply"]["failedStep"] = json!("dirty-overlap");
+    conclusion["apply"]["failureDetail"] = json!(format!(
+        "{} file(s) already have uncommitted changes in source: {}",
+        dirty_overlap.len(),
+        dirty_overlap.join(", ")
+    ));
+    conclusion["apply"]["dirtyOverlap"] = json!(dirty_overlap);
+    conclusion["apply"]["writtenFiles"] = json!([]);
+    conclusion["apply"]["next"] = json!([commit_cmd, allow_cmd]);
+    conclusion["next"] = json!(commit_cmd);
+    ApplyInnerResult {
+        code: 1,
+        written: vec![],
+        regenerated: vec![],
+        had_dirty_merge: false,
+    }
+}
+
 pub fn apply(
     run: &Path,
     merge: bool,
     dry: bool,
     keep_commits: bool,
     commit_mode: bool,
+    allow_dirty_overlap: bool,
 ) -> Res<ApplyOutcome> {
     let mut meta = json(run.join("meta.json"));
     if s(&meta, "mode") == "read-only" {
@@ -2185,7 +2352,15 @@ pub fn apply(
     }
     let source = PathBuf::from(s(&meta["worktree"], "source"));
     if !source.is_absolute() {
-        return apply_checked(run, merge, dry, keep_commits, commit_mode, &[]);
+        return apply_checked(
+            run,
+            merge,
+            dry,
+            keep_commits,
+            commit_mode,
+            allow_dirty_overlap,
+            &[],
+        );
     }
     if !dry {
         lane::install_signals();
@@ -2235,7 +2410,15 @@ pub fn apply(
         }
         write(run.join("applied.patch"), patch)?;
     }
-    apply_checked(run, merge, dry, keep_commits, commit_mode, &written_paths)
+    apply_checked(
+        run,
+        merge,
+        dry,
+        keep_commits,
+        commit_mode,
+        allow_dirty_overlap,
+        &written_paths,
+    )
 }
 pub(crate) fn collect_commits(run: &Path, meta: &Value) -> Res<Vec<Value>> {
     let worktree = Path::new(s(&meta["worktree"], "path"));
@@ -2564,6 +2747,7 @@ fn apply_checked(
     dry: bool,
     keep_commits: bool,
     commit_mode: bool,
+    allow_dirty_overlap: bool,
     written_paths: &[String],
 ) -> Res<ApplyOutcome> {
     let apply_started_at = iso();
@@ -2617,7 +2801,40 @@ fn apply_checked(
         return Err(format!("--keep-commits requires committed worktree changes; commits differ from the final tree: {}", uncommitted.join(", ")));
     }
     let inner = if keep_commits && !commits.is_empty() {
-        if dry {
+        let mut kc_dirty_overlap: Vec<String> = Vec::new();
+        if !allow_dirty_overlap && !merge && source.is_dir() {
+            let dirty_paths = source_dirty_paths(source);
+            if !dirty_paths.is_empty() {
+                let mut kc_touched = std::collections::BTreeSet::new();
+                for item in &commits {
+                    let hash = s(item, "hash");
+                    let touched = git(
+                        worktree,
+                        &[
+                            "diff-tree",
+                            "--no-commit-id",
+                            "--name-only",
+                            "--no-renames",
+                            "-r",
+                            "-z",
+                            hash,
+                        ],
+                    )
+                    .unwrap_or_default();
+                    for path in touched.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+                        kc_touched.insert(String::from_utf8_lossy(path).into_owned());
+                    }
+                }
+                for path in kc_touched {
+                    if dirty_path_overlaps(&path, &dirty_paths) {
+                        kc_dirty_overlap.push(path);
+                    }
+                }
+            }
+        }
+        if !kc_dirty_overlap.is_empty() {
+            record_dirty_overlap_failure(run, &meta, source, &kc_dirty_overlap, &mut conclusion)
+        } else if dry {
             ApplyInnerResult {
                 code: 0,
                 written: vec![],
@@ -2716,7 +2933,7 @@ fn apply_checked(
                     if !dry && crate::premerge::cancel_for_run(run, source) {
                         conclusion["applyTiming"]["premergeCancelled"] = json!(true);
                     }
-                    apply_inner(run, merge, dry, &mut conclusion)?
+                    apply_inner(run, merge, dry, allow_dirty_overlap, &mut conclusion)?
                 }
             }
             crate::premerge::FastForwardCheck::Miss(miss) => {
@@ -2728,15 +2945,44 @@ fn apply_checked(
                 if !dry && crate::premerge::cancel_for_run(run, source) {
                     conclusion["applyTiming"]["premergeCancelled"] = json!(true);
                 }
-                apply_inner(run, merge, dry, &mut conclusion)?
+                apply_inner(run, merge, dry, allow_dirty_overlap, &mut conclusion)?
             }
         }
     } else {
-        apply_inner(run, merge, dry, &mut conclusion)?
+        apply_inner(run, merge, dry, allow_dirty_overlap, &mut conclusion)?
     };
     let mut code = inner.code;
     let written_files = inner.written;
     let regenerated_files = inner.regenerated;
+    if !dry && code == 0 {
+        let mut all_touched = std::collections::BTreeSet::<String>::new();
+        for p in &written_files {
+            all_touched.insert(p.clone());
+        }
+        for p in &regenerated_files {
+            all_touched.insert(p.clone());
+        }
+        if all_touched.is_empty() {
+            for p in run_files(run) {
+                all_touched.insert(p);
+            }
+        }
+        let applied_files_vec: Vec<String> = all_touched.into_iter().collect();
+        if !applied_files_vec.is_empty() {
+            let _ = write(
+                run.join("applied-files.txt"),
+                format!("{}\n", applied_files_vec.join("\n")),
+            );
+            let applied_path = run.join(".applied");
+            if applied_path.is_file() {
+                let mut st = json(&applied_path);
+                if st.is_object() {
+                    st["files"] = json!(&applied_files_vec);
+                    let _ = write_json(&applied_path, &st);
+                }
+            }
+        }
+    }
     if keep_commits {
         conclusion["apply"]["keepCommits"] = json!(true);
     }
@@ -3280,7 +3526,13 @@ pub fn commit_applied(
     }
     Ok((head, subject))
 }
-fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Res<ApplyInnerResult> {
+fn apply_inner(
+    run: &Path,
+    merge: bool,
+    dry: bool,
+    allow_dirty_overlap: bool,
+    conclusion: &mut Value,
+) -> Res<ApplyInnerResult> {
     let (meta, mut top, _, mut after) = chain_changes(run)?;
     if meta["worktree"].is_null() {
         return Err(format!(
@@ -3335,6 +3587,13 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
         before = total_base.clone();
         changes = tree_changes(&top, &json!({"tree":before}), &json!({"tree":after}), false)?;
     }
+    let allow_dirty = allow_dirty_overlap || merge;
+    let dirty_paths = if allow_dirty {
+        Vec::new()
+    } else {
+        source_dirty_paths(&source)
+    };
+    let mut dirty_overlap = vec![];
     let mut actions = vec![];
     let mut matched = vec![];
     let mut conflicts = vec![];
@@ -3368,82 +3627,92 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
         } else if now == new && now_mode == mode {
             matched.push(path);
             continue;
-        } else if now == old && (now_mode == old_mode || now_mode == mode) {
-            actions.push(Action {
-                kind: if new.is_none() { "deleted" } else { "applied" }.into(),
-                path,
-                target,
-                mode,
-                content: new.unwrap_or_default(),
-            });
-        } else if let (Some(base), Some(theirs), Some(mine)) = (&old, &new, &now) {
-            if [old_mode.as_deref(), mode.as_deref(), now_mode.as_deref()].contains(&Some("120000"))
-                || base.contains(&0)
-                || theirs.contains(&0)
-                || mine.contains(&0)
-            {
-                conflicts.push(path);
+        } else {
+            let own_prev_applied = !s(&applied, "tree").is_empty()
+                && before != total_base
+                && now == old
+                && (now_mode == old_mode || now_mode == mode);
+            if !allow_dirty && !own_prev_applied && dirty_path_overlaps(&path, &dirty_paths) {
+                dirty_overlap.push(path);
                 continue;
             }
-            let scratch = run.join(format!(".merge-{}", std::process::id()));
-            fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
-            let minefile = scratch.join("mine");
-            let basefile = scratch.join("base");
-            let theirfile = scratch.join("theirs");
-            write(&minefile, mine).map_err(|e| format!("{}: {e}", minefile.display()))?;
-            write(&basefile, base).map_err(|e| format!("{}: {e}", basefile.display()))?;
-            write(&theirfile, theirs).map_err(|e| format!("{}: {e}", theirfile.display()))?;
-            let status = git_command()
-                .arg("merge-file")
-                .args([
-                    "-L",
-                    "current",
-                    "-L",
-                    "base",
-                    "-L",
-                    run.file_name().unwrap_or_default().to_str().unwrap_or(""),
-                ])
-                .args([&minefile, &basefile, &theirfile])
-                .status()
-                .map_err(|e| e.to_string())?;
-            let mut clean = status.success();
-            if !clean && matches_rule(&path, &append_only) {
+            if now == old && (now_mode == old_mode || now_mode == mode) {
+                actions.push(Action {
+                    kind: if new.is_none() { "deleted" } else { "applied" }.into(),
+                    path,
+                    target,
+                    mode,
+                    content: new.unwrap_or_default(),
+                });
+            } else if let (Some(base), Some(theirs), Some(mine)) = (&old, &new, &now) {
+                if [old_mode.as_deref(), mode.as_deref(), now_mode.as_deref()].contains(&Some("120000"))
+                    || base.contains(&0)
+                    || theirs.contains(&0)
+                    || mine.contains(&0)
+                {
+                    conflicts.push(path);
+                    continue;
+                }
+                let scratch = run.join(format!(".merge-{}", std::process::id()));
+                fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+                let minefile = scratch.join("mine");
+                let basefile = scratch.join("base");
+                let theirfile = scratch.join("theirs");
                 write(&minefile, mine).map_err(|e| format!("{}: {e}", minefile.display()))?;
-                clean = git_command()
-                    .args(["merge-file", "--union"])
+                write(&basefile, base).map_err(|e| format!("{}: {e}", basefile.display()))?;
+                write(&theirfile, theirs).map_err(|e| format!("{}: {e}", theirfile.display()))?;
+                let status = git_command()
+                    .arg("merge-file")
+                    .args([
+                        "-L",
+                        "current",
+                        "-L",
+                        "base",
+                        "-L",
+                        run.file_name().unwrap_or_default().to_str().unwrap_or(""),
+                    ])
                     .args([&minefile, &basefile, &theirfile])
                     .status()
-                    .map_err(|e| e.to_string())?
-                    .success();
-                if clean {
-                    apply_progress(format!(
-                        "kept both sides / 两边都保留（appendOnly）: {path}"
-                    ));
+                    .map_err(|e| e.to_string())?;
+                let mut clean = status.success();
+                if !clean && matches_rule(&path, &append_only) {
+                    write(&minefile, mine).map_err(|e| format!("{}: {e}", minefile.display()))?;
+                    clean = git_command()
+                        .args(["merge-file", "--union"])
+                        .args([&minefile, &basefile, &theirfile])
+                        .status()
+                        .map_err(|e| e.to_string())?
+                        .success();
+                    if clean {
+                        apply_progress(format!(
+                            "kept both sides / 两边都保留（appendOnly）: {path}"
+                        ));
+                    }
                 }
-            }
-            let merged = fs::read(&minefile).map_err(|e| format!("{}: {e}", minefile.display()))?;
-            fs::remove_dir_all(&scratch).map_err(|e| format!("{}: {e}", scratch.display()))?;
-            if clean {
-                actions.push(Action {
-                    kind: "merged".into(),
-                    path,
-                    target,
-                    mode: if old_mode != mode { mode } else { None },
-                    content: merged,
-                });
-            } else if merge {
-                actions.push(Action {
-                    kind: "conflict-markers".into(),
-                    path,
-                    target,
-                    mode: None,
-                    content: merged,
-                });
+                let merged = fs::read(&minefile).map_err(|e| format!("{}: {e}", minefile.display()))?;
+                fs::remove_dir_all(&scratch).map_err(|e| format!("{}: {e}", scratch.display()))?;
+                if clean {
+                    actions.push(Action {
+                        kind: "merged".into(),
+                        path,
+                        target,
+                        mode: if old_mode != mode { mode } else { None },
+                        content: merged,
+                    });
+                } else if merge {
+                    actions.push(Action {
+                        kind: "conflict-markers".into(),
+                        path,
+                        target,
+                        mode: None,
+                        content: merged,
+                    });
+                } else {
+                    conflicts.push(path);
+                }
             } else {
                 conflicts.push(path);
             }
-        } else {
-            conflicts.push(path);
         }
     }
     if let Some(obj) = large.as_object() {
@@ -3469,6 +3738,19 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
                     == Some(file_hash(&origin)?.as_str())
             {
                 continue;
+            } else if current(&target)
+                == Some(fs::read(&origin).map_err(|e| format!("{}: {e}", origin.display()))?)
+            {
+                matched.push(path.clone());
+            } else if !allow_dirty
+                && !(target.exists()
+                    && !s(&applied, "tree").is_empty()
+                    && before != total_base
+                    && applied["largeHashes"].get(path).and_then(Value::as_str)
+                        == Some(file_hash(&target)?.as_str()))
+                && dirty_path_overlaps(path, &dirty_paths)
+            {
+                dirty_overlap.push(path.clone());
             } else if !target.exists()
                 || applied["largeHashes"].get(path).and_then(Value::as_str)
                     == Some(file_hash(&target)?.as_str())
@@ -3480,14 +3762,21 @@ fn apply_inner(run: &Path, merge: bool, dry: bool, conclusion: &mut Value) -> Re
                     mode: Some("large".into()),
                     content: fs::read(&origin).map_err(|e| format!("{}: {e}", origin.display()))?,
                 });
-            } else if current(&target)
-                != Some(fs::read(&origin).map_err(|e| format!("{}: {e}", origin.display()))?)
-            {
-                conflicts.push(path.clone());
             } else {
-                matched.push(path.clone());
+                conflicts.push(path.clone());
             }
         }
+    }
+    if !dirty_overlap.is_empty() {
+        dirty_overlap.sort();
+        dirty_overlap.dedup();
+        return Ok(record_dirty_overlap_failure(
+            run,
+            &meta,
+            &source,
+            &dirty_overlap,
+            conclusion,
+        ));
     }
     additions.retain(|path| {
         actions

@@ -246,6 +246,9 @@ fn format_status(status: serde_json::Value) -> String {
         "agentBin",
         "tier",
         "mode",
+        "area",
+        "areaGroup",
+        "areaExperiment",
         "parent",
         "redispatch",
         "worktree",
@@ -277,6 +280,8 @@ fn format_status(status: serde_json::Value) -> String {
         "warnings",
         "warning",
         "error",
+        "policyRefused",
+        "policyRewriteAttempted",
         "missingObjects",
         "recovery",
         "last",
@@ -652,14 +657,16 @@ fn collect_timed(
             code = 75;
             continue;
         }
-        if !["delivered", "answered"].contains(&state.as_str()) && code == 0 {
+        let summary = json(run.join("summary.json"));
+        if (!["delivered", "answered"].contains(&state.as_str()) || b(&summary, "policyRefused"))
+            && code == 0
+        {
             code = 1;
         }
         if output::json_enabled() {
             changes::print_changes(run);
             changes::print_shape(run);
         }
-        let summary = json(run.join("summary.json"));
         if let Some(cleanup) = summary
             .get("cleanup")
             .filter(|c| c["terminated"].as_u64().unwrap_or(0) > 0)
@@ -735,7 +742,10 @@ fn collect_timed(
                 touch(run.join(".truncated"));
             } else {
                 fs::remove_file(run.join(".truncated")).ok();
-                if matches!(state.as_str(), "delivered" | "answered") && !b(&summary, "question") {
+                if matches!(state.as_str(), "delivered" | "answered")
+                    && !b(&summary, "question")
+                    && !b(&summary, "policyRefused")
+                {
                     mark_result_read(run);
                 }
             }
@@ -991,7 +1001,10 @@ fn wait_each(
                     println!("{line}");
                     let meta = json(run.join("meta.json"));
                     events::mark_run_read(&events::run_id_for(run, &meta));
-                    if !["delivered", "answered"].contains(&state.as_str()) {
+                    let sum_pol = json(run.join("summary.json"));
+                    if !["delivered", "answered"].contains(&state.as_str())
+                        || b(&sum_pol, "policyRefused")
+                    {
                         code = 1;
                     }
                 }
@@ -1060,7 +1073,11 @@ fn wait_each(
                     }
                     println!("{line}");
                     events::mark_run_read(&id);
-                    if !["delivered", "answered"].contains(&state.as_str()) && code == 0 {
+                    let sum_pol = json(run.join("summary.json"));
+                    if (!["delivered", "answered"].contains(&state.as_str())
+                        || b(&sum_pol, "policyRefused"))
+                        && code == 0
+                    {
                         code = 1;
                     }
                     reported.insert(run.clone());
@@ -1667,6 +1684,47 @@ fn patch(args: &[String]) -> Res<i32> {
     io::stdout().write_all(&filtered).map_err(|e| e.to_string())?;
     Ok(0)
 }
+fn files_command(args: &[String]) -> Res<i32> {
+    let (pos, flags, _) = parse_simple(args, &["--json"], &[])?;
+    if pos.len() > 1 {
+        return Err(format!("unrecognized arguments: {}", pos[1..].join(" ")));
+    }
+    let reference = pos.first().map(String::as_str).unwrap_or("last");
+    let resolved = runs::resolve(reference)?;
+    let run = if runs::continues_conversation(&resolved) {
+        runs::latest(resolved)
+    } else {
+        resolved
+    };
+    let meta = json(run.join("meta.json"));
+    let run_id = {
+        let r = s(&meta, "run");
+        if !r.is_empty() {
+            r.to_string()
+        } else {
+            run.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    let files = worktree::run_files(&run);
+    if has(&flags, "--json") || output::json_enabled() {
+        println!(
+            "{}",
+            json!({
+                "run": run_id,
+                "count": files.len(),
+                "files": files,
+            })
+        );
+    } else {
+        for path in &files {
+            println!("{path}");
+        }
+    }
+    Ok(0)
+}
 fn apply(args: &[String]) -> Res<i32> {
     let apply_started_at = iso();
     let apply_t0 = std::time::Instant::now();
@@ -1675,6 +1733,7 @@ fn apply(args: &[String]) -> Res<i32> {
         &[
             "--dry-run",
             "--merge",
+            "--allow-dirty-overlap",
             "--verify",
             "--no-verify",
             "--keep",
@@ -1749,8 +1808,14 @@ fn apply(args: &[String]) -> Res<i32> {
         let meta = json(run.join("meta.json"));
         let keep_commits =
             !commit_mode && (has(&flags, "--keep-commits") || b(&meta["defaults"], "keepCommits"));
-        let mut outcome =
-            worktree::apply(run, has(&flags, "--merge"), dry, keep_commits, commit_mode)?;
+        let mut outcome = worktree::apply(
+            run,
+            has(&flags, "--merge"),
+            dry,
+            keep_commits,
+            commit_mode,
+            has(&flags, "--allow-dirty-overlap"),
+        )?;
         if !dry && run.join(".applied").exists() {
             if !applied_runs.contains(run) {
                 applied_runs.push(run.clone());
@@ -2037,6 +2102,7 @@ fn apply(args: &[String]) -> Res<i32> {
             if conclusion["apply"]["ok"] == json!(false) {
                 let step = s(&conclusion["apply"], "failedStep");
                 let step_zh = match step {
+                    "dirty-overlap" => "源工作区目标文件已有未提交改动",
                     "conflicts" => "文件冲突",
                     "skipped-conflicts" => "跳过无法合并的文件",
                     "conflict-markers" => "存在冲突标记",
@@ -2185,6 +2251,37 @@ fn apply(args: &[String]) -> Res<i32> {
                 for hint in work_hints {
                     println!("{hint}");
                 }
+            }
+        }
+    }
+    if code == 0 && !dry && !output::json_enabled() {
+        for item in &done {
+            let mut touched = std::collections::BTreeSet::<&str>::new();
+            for p in &item.written_files {
+                touched.insert(p.as_str());
+            }
+            for p in &item.regenerated_files {
+                touched.insert(p.as_str());
+            }
+            let count = if touched.is_empty() {
+                worktree::run_files(&item.run).len()
+            } else {
+                touched.len()
+            };
+            if count > 0 {
+                let run_id = {
+                    let r = s(&item.conclusion, "run");
+                    if !r.is_empty() {
+                        r.to_string()
+                    } else {
+                        item.run
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
+                    }
+                };
+                println!("本 run 改动文件（{count} 个）：delegate files {run_id}");
             }
         }
     }
@@ -2920,6 +3017,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "merge" => merge::command(rest),
         "radar" => radar::command(rest),
         "diff" => diff(rest),
+        "files" => files_command(rest),
         "patch" => patch(rest),
         "apply" => apply(rest),
         "lane" => lane::lane_command(rest),

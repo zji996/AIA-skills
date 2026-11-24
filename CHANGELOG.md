@@ -6,6 +6,8 @@
 
 - `delegate` 6.43.0：`delegate-tui` 账号默认脱敏与多页显示修整——列表、详情标题、总览额度与 24h Token 面板默认只显示账号前 3 字符加 `…`（去掉邮箱列、详情页默认隐藏 `label`），账号页按 `i` 切换当前账号完整名/邮箱/`label`（仅内存态，底栏增 `i 全称`，`y` 仍复制完整账号名）；额度行改按可用宽度计算进度条并与文字留一格空格、不再黏连或行尾溢出；账号详情在跑 `agy` 进程改单行 `pid · run/agent`；全页顶栏统一完整页签名、窄宽先截右侧计数不留悬空 `·`；任务页时间列改按 `finishedAt` 算距今、模型列按 `别名·档位` 显示且只截别名、右侧结论 `render_markdown` 支持对齐渲染 Markdown 表格；总览 24h Token 面板 0 用量账号压成单行「近 24 小时无用量」。
 - `delegate` 6.43.0：额度耗尽预估按窗口选择用量回看期（不再使用 1 小时档）——周额度取近 24 小时平均（24 小时内才开始有记录则按有记录以来的时长平均、至少 1 小时，标 `since:Nh`；24 小时无用量退到 7 天平均），5 小时额度取近 5 小时平均（无用量退到 24 小时平均）；账号级与池级共用 `burn_rate_for_window` / `estimate_window_with_burn_rate`，`delegate-tui` `pace_prefix` 同步展示 `24h` / `5h` / `7d` / `since:Nh` 文案。
+- `delegate`：修复三处实测问题——`apply` 合并前将目标文件与源工作区未提交改动取交集（忽略本 run 自写相同内容），有重叠默认拒绝并列出文件及先提交 / `--allow-dirty-overlap` 两选项，新增 `delegate files [--json] [<run>]`（归档后可用）并于 `apply` 成功末行打印；将 `work` 对账与 `dag_queue::advance` 中 `is_run_applied` / `commit_exists_in_repo` 等 git 慢查预取移到 `state/.state.lock` 外并补锁内防重入保护，消除 `apply` 时 `forbidden slow operation (git/subprocess)` 诊断；识别 Gemini/agy 最终结论的内容策略拒绝，同会话同模型尾部追加 1 次短提示重写（缓存优先），仍失败则写可读说明指向 `review.md` 与 `delegate files <run>` 并将状态标为「结论被模型服务拒绝」（不当作正常结论）。
+- `delegate`：新增仓库级 `.delegate.json` `areas` 块经验 A/B 自动交替（`{"<块名>":{"paths":[...],"l0":"..."}}`，无配置不生效）——`start` 按 brief、`--work` 与 `workdir` 路径命中某块后，按该块在 `<state>/area-ab.json` 的原子派发计数奇偶自动交替分组（奇 `B` 追加该块 L0 指针前 3 条非空行到 brief 末尾，偶 `A` 不注入），并将 `area`/`areaGroup`/`areaExperiment` 写入 `meta.json` 供测量脚本分组。
 
 ## delegate 6.42.0 - 2026-11-24
 

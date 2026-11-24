@@ -15,6 +15,9 @@ fn state_label(status: &Value) -> String {
     if b(status, "question") {
         return "提问".into();
     }
+    if b(status, "policyRefused") {
+        return "结论被模型服务拒绝".into();
+    }
     match s(status, "state") {
         "running" => "运行中",
         "waiting" => "等待中",

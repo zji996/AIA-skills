@@ -1249,6 +1249,8 @@ pub fn run_accept_and_review(
     changed: &mut Vec<String>,
     answer: &mut String,
     attempts: &mut i64,
+    policy_refused: &mut bool,
+    policy_rewrite_attempted: &mut bool,
     holder: Arc<AtomicI32>,
     grace: Arc<Mutex<Option<f64>>>,
 ) -> Res<()> {
@@ -2464,8 +2466,19 @@ pub fn run_accept_and_review(
             holder.clone(),
             grace.clone(),
         );
+        let recovered = supervise::recover_policy_refusal(
+            &author_next,
+            run,
+            (author_verdict, author_answer, next_attempts),
+            holder.clone(),
+            grace.clone(),
+        );
+        (author_verdict, author_answer, next_attempts) =
+            (recovered.verdict, recovered.answer, recovered.attempts);
+        *policy_refused = recovered.refused;
+        *policy_rewrite_attempted |= recovered.rewrite_attempted;
         *attempts = next_attempts;
-        if !author_answer.trim().is_empty() {
+        if !*policy_refused && !author_answer.trim().is_empty() {
             *answer = author_answer;
             let formatted = format!("{}\n", answer.trim_end_matches('\n'));
             write(run.join(format!("round-{}-result.md", round + 1)), &formatted)?;

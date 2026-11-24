@@ -1551,6 +1551,7 @@ pub fn commit_exists_in_repo(repo: &Path, sha: &str) -> bool {
     let obj_dirs = git_object_dirs_fs(&git_dir);
     match sha_prefix_exists_fs(&obj_dirs, &sha_lower) {
         Some(found) => found,
+        None if crate::locks::holding_state_lock() => false,
         None => Command::new("git")
             .arg("--git-dir")
             .arg(&git_dir)
@@ -1563,6 +1564,66 @@ pub fn commit_exists_in_repo(repo: &Path, sha: &str) -> bool {
     }
 }
 
+#[derive(Default)]
+struct ReconcilePrefetch {
+    /// Precomputed `is_run_applied(run_ref, state, repo_hint)` keyed by `(repo, run_ref)`.
+    run_applied: HashMap<(String, String), bool>,
+    /// Precomputed `commit_exists_in_repo(repo, sha)` keyed by `(repo, sha)`.
+    commit_exists: HashMap<(String, String), bool>,
+}
+
+/// Precompute potentially slow git/worktree-backed condition checks (`run_applied:*`,
+/// `commit_exists:*`) strictly OUTSIDE `state/.state.lock` (P8: lock holds only state I/O).
+fn prefetch_reconcile_conditions(
+    state: &Path,
+    items: &[WorkItem],
+    extra: &[(&str, &str)],
+) -> ReconcilePrefetch {
+    let mut out = ReconcilePrefetch::default();
+    let mut record = |repo: &str, cond: &str| {
+        if let Some(run_ref) = cond.strip_prefix("run_applied:") {
+            let key = (repo.to_string(), run_ref.to_string());
+            out.run_applied.entry(key).or_insert_with(|| {
+                let hint = (!repo.is_empty()).then_some(repo);
+                is_run_applied(run_ref, state, hint)
+            });
+        } else if let Some(sha_raw) = cond.strip_prefix("commit_exists:") {
+            let sha = sha_raw.trim();
+            if !sha.is_empty() {
+                let repo_str = if repo.is_empty() {
+                    current_repo_str()
+                } else {
+                    repo.to_string()
+                };
+                let key = (repo_str.clone(), sha.to_string());
+                out.commit_exists
+                    .entry(key)
+                    .or_insert_with(|| commit_exists_in_repo(Path::new(&repo_str), sha));
+            }
+        }
+    };
+    for item in items {
+        if item.state == "done" {
+            continue;
+        }
+        for c in &item.wait_on {
+            record(&item.repo, c);
+        }
+        for c in &item.verify_on {
+            record(&item.repo, c);
+        }
+    }
+    for (repo, cond) in extra {
+        record(repo, cond);
+    }
+    out
+}
+
+fn prefetch_reconcile_for_state(state: &Path, extra: &[(&str, &str)]) -> ReconcilePrefetch {
+    let items = load_raw(state);
+    prefetch_reconcile_conditions(state, &items, extra)
+}
+
 pub fn evaluate_condition(
     cond: &str,
     item: &WorkItem,
@@ -1570,11 +1631,28 @@ pub fn evaluate_condition(
     state: &Path,
     now_epoch: i64,
 ) -> CondEval {
+    evaluate_condition_with_prefetch(cond, item, all_items, state, now_epoch, None)
+}
+
+fn evaluate_condition_with_prefetch(
+    cond: &str,
+    item: &WorkItem,
+    all_items: &[WorkItem],
+    state: &Path,
+    now_epoch: i64,
+    prefetch: Option<&ReconcilePrefetch>,
+) -> CondEval {
     if let Some(run_ref) = cond.strip_prefix("run_applied:") {
         let ok = all_items
             .iter()
             .any(|w| w.applied && w.matches_run(run_ref))
-            || is_run_applied(run_ref, state, Some(&item.repo));
+            || prefetch
+                .and_then(|p| {
+                    p.run_applied
+                        .get(&(item.repo.clone(), run_ref.to_string()))
+                        .copied()
+                })
+                .unwrap_or_else(|| is_run_applied(run_ref, state, Some(&item.repo)));
         return CondEval {
             raw: cond.to_string(),
             satisfied: ok,
@@ -1672,12 +1750,20 @@ pub fn evaluate_condition(
     }
     if let Some(sha_raw) = cond.strip_prefix("commit_exists:") {
         let sha = sha_raw.trim();
-        let repo_path = if item.repo.is_empty() {
-            PathBuf::from(current_repo_str())
+        let repo_str = if item.repo.is_empty() {
+            current_repo_str()
         } else {
-            PathBuf::from(&item.repo)
+            item.repo.clone()
         };
-        let ok = !sha.is_empty() && commit_exists_in_repo(&repo_path, sha);
+        let repo_path = PathBuf::from(&repo_str);
+        let ok = !sha.is_empty()
+            && prefetch
+                .and_then(|p| {
+                    p.commit_exists
+                        .get(&(repo_str.clone(), sha.to_string()))
+                        .copied()
+                })
+                .unwrap_or_else(|| commit_exists_in_repo(&repo_path, sha));
         return CondEval {
             raw: cond.to_string(),
             satisfied: ok,
@@ -1751,13 +1837,14 @@ struct ReconcileOutcome {
 }
 
 fn reconcile_all_locked(state: &Path, items: &mut [WorkItem]) -> ReconcileOutcome {
-    reconcile_all_locked_excluding(state, items, None)
+    reconcile_all_locked_with_prefetch(state, items, None, None)
 }
 
-fn reconcile_all_locked_excluding(
+fn reconcile_all_locked_with_prefetch(
     state: &Path,
     items: &mut [WorkItem],
     exclude_run: Option<&str>,
+    prefetch: Option<&ReconcilePrefetch>,
 ) -> ReconcileOutcome {
     let now_epoch = epoch() as i64;
     let now_iso = iso();
@@ -1837,6 +1924,7 @@ fn reconcile_all_locked_excluding(
                         }
                     };
                     if is_question
+                        || b(&sum, "policyRefused")
                         || review_verdict == "NEEDS_CONTROLLER"
                         || matches!(
                             st.as_str(),
@@ -1877,7 +1965,9 @@ fn reconcile_all_locked_excluding(
                 let evals: Vec<CondEval> = item
                     .wait_on
                     .iter()
-                    .map(|c| evaluate_condition(c, item, &snapshot, state, now_epoch))
+                    .map(|c| {
+                        evaluate_condition_with_prefetch(c, item, &snapshot, state, now_epoch, prefetch)
+                    })
                     .collect();
                 let all_ok = evals.iter().all(|e| e.satisfied);
                 if !all_ok {
@@ -1951,7 +2041,9 @@ fn reconcile_all_locked_excluding(
                 let evals: Vec<CondEval> = item
                     .verify_on
                     .iter()
-                    .map(|c| evaluate_condition(c, item, &snapshot, state, now_epoch))
+                    .map(|c| {
+                        evaluate_condition_with_prefetch(c, item, &snapshot, state, now_epoch, prefetch)
+                    })
                     .collect();
                 if evals.iter().all(|e| e.satisfied) {
                     let evidence = evals
@@ -2251,7 +2343,8 @@ fn load_synced_in(state: &Path) -> Res<Vec<WorkItem>> {
     // return the atomically-written snapshot directly without touching `.state.lock`.
     let needs_mig = needs_legacy_migration(state);
     let mut snapshot = load_raw(state);
-    let preview = reconcile_all_locked(state, &mut snapshot);
+    let prefetch = prefetch_reconcile_conditions(state, &snapshot, &[]);
+    let preview = reconcile_all_locked_with_prefetch(state, &mut snapshot, None, Some(&prefetch));
     if !needs_mig && !preview.changed {
         return Ok(snapshot);
     }
@@ -2262,7 +2355,7 @@ fn load_synced_in(state: &Path) -> Res<Vec<WorkItem>> {
         let _guard = guard;
         let mut items = load_raw(state);
         let mig = migrate_legacy_locked(state, &mut items);
-        let outcome = reconcile_all_locked(state, &mut items);
+        let outcome = reconcile_all_locked_with_prefetch(state, &mut items, None, Some(&prefetch));
         if mig || outcome.changed {
             save_raw(state, &items)?;
         }
@@ -2283,7 +2376,8 @@ pub fn check_stale_and_expired() {
         return;
     }
     let mut snapshot = load_raw(&state);
-    let preview = reconcile_all_locked(&state, &mut snapshot);
+    let prefetch = prefetch_reconcile_conditions(&state, &snapshot, &[]);
+    let preview = reconcile_all_locked_with_prefetch(&state, &mut snapshot, None, Some(&prefetch));
     if !preview.changed {
         return;
     }
@@ -2293,7 +2387,8 @@ pub fn check_stale_and_expired() {
     let outcome = {
         let mut items = load_raw(&state);
         let mig = migrate_legacy_locked(&state, &mut items);
-        let outcome = reconcile_all_locked(&state, &mut items);
+        let outcome =
+            reconcile_all_locked_with_prefetch(&state, &mut items, None, Some(&prefetch));
         if mig || outcome.changed {
             let _ = save_raw(&state, &items);
         }
@@ -2347,6 +2442,7 @@ pub fn on_run_finished(run: &Path, meta: &Value, summary: &Value) {
     let state = state_dir();
     let rid = events::run_id_for(run, meta);
     let work_id = s(meta, "workId").to_string();
+    let prefetch = prefetch_reconcile_for_state(&state, &[]);
     let outcome = {
         let Ok(_guard) = crate::locks::acquire_state(&state) else {
             return;
@@ -2367,6 +2463,7 @@ pub fn on_run_finished(run: &Path, meta: &Value, summary: &Value) {
             let repo = events::repo_for_meta(meta);
             w.add_run(&rid, Some(run), Some(&repo));
             let next_st: Option<&str> = if is_question
+                || b(summary, "policyRefused")
                 || matches!(
                     st,
                     "rejected" | "failed" | "malformed" | "timeout" | "stalled" | "killed" | "crashed"
@@ -2387,7 +2484,7 @@ pub fn on_run_finished(run: &Path, meta: &Value, summary: &Value) {
             }
         }
 
-        let rec = reconcile_all_locked(&state, &mut items);
+        let rec = reconcile_all_locked_with_prefetch(&state, &mut items, None, Some(&prefetch));
         if changed || rec.changed {
             let _ = save_raw(&state, &items);
         }
@@ -2404,9 +2501,14 @@ pub fn on_run_result_read(run: &Path, meta: &Value) {
     let rid = events::run_id_for(run, meta);
     let work_id = s(meta, "workId").to_string();
     let sum = json(run.join("summary.json"));
-    if s(&sum, "state") != "answered" || b(&sum, "question") || s(meta, "mode") == "write" {
+    if s(&sum, "state") != "answered"
+        || b(&sum, "question")
+        || b(&sum, "policyRefused")
+        || s(meta, "mode") == "write"
+    {
         return;
     }
+    let prefetch = prefetch_reconcile_for_state(&state, &[]);
     let outcome = {
         let Ok(_guard) = crate::locks::acquire_state(&state) else {
             return;
@@ -2429,7 +2531,7 @@ pub fn on_run_result_read(run: &Path, meta: &Value) {
                 changed = true;
             }
         }
-        let rec = reconcile_all_locked(&state, &mut items);
+        let rec = reconcile_all_locked_with_prefetch(&state, &mut items, None, Some(&prefetch));
         if changed || rec.changed {
             let _ = save_raw(&state, &items);
         }
@@ -2518,6 +2620,7 @@ pub fn on_runs_applied(
         }
     }
 
+    let prefetch = prefetch_reconcile_for_state(&state, &[]);
     let (outcome, verify_stays, auto_closed) = {
         let Ok(_guard) = crate::locks::acquire_state(&state) else {
             return hints;
@@ -2594,7 +2697,7 @@ pub fn on_runs_applied(
             }
         }
 
-        let rec = reconcile_all_locked(&state, &mut items);
+        let rec = reconcile_all_locked_with_prefetch(&state, &mut items, None, Some(&prefetch));
         stays.retain(|s| {
             items
                 .iter()
@@ -2882,6 +2985,7 @@ pub fn on_run_cleaned(run: &Path, meta: &Value) -> Option<String> {
     let wid = s(meta, "workId").to_string();
     let parent_dir = run.parent();
 
+    let prefetch = prefetch_reconcile_for_state(&state, &[]);
     let (snapshot, outcome) = {
         let Ok(_guard) = crate::locks::acquire_state(&state) else {
             return None;
@@ -2920,7 +3024,12 @@ pub fn on_run_cleaned(run: &Path, meta: &Value) -> Option<String> {
         // so cleaned runs never keep a work item stuck in `attention` and applied runs
         // unlock downstream `run_applied:<rid>` dependencies right away.
         let outcome = if is_applied || target_pos.is_some() {
-            let o = reconcile_all_locked_excluding(&state, &mut items, Some(&rid));
+            let o = reconcile_all_locked_with_prefetch(
+                &state,
+                &mut items,
+                Some(&rid),
+                Some(&prefetch),
+            );
             if o.changed {
                 changed = true;
             }
@@ -5224,6 +5333,13 @@ fn add_cmd(args: &[String]) -> Res<i32> {
         && needs_owner_kind.is_none()
         && matches_owner_wait_keyword(&title, &done_when);
 
+    let extra_conds: Vec<(&str, &str)> = wf
+        .wait_on
+        .iter()
+        .chain(wf.verify_on.iter())
+        .map(|c| (repo.as_str(), c.as_str()))
+        .collect();
+    let prefetch = prefetch_reconcile_for_state(&state, &extra_conds);
     let (created_id, created_owner_id, outcome) = {
         let _guard = crate::locks::acquire_state(&state).map_err(|e| e.to_string())?;
         let mut items = load_raw(&state);
@@ -5351,7 +5467,7 @@ fn add_cmd(args: &[String]) -> Res<i32> {
         }
 
         items.push(item);
-        let rec = reconcile_all_locked(&state, &mut items);
+        let rec = reconcile_all_locked_with_prefetch(&state, &mut items, None, Some(&prefetch));
         save_raw(&state, &items)?;
         (id, created_q, rec)
     };
@@ -5412,6 +5528,21 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
     let recorded_wait_on = !wf.wait_on.is_empty();
     let state = state_dir();
     let now_iso = iso();
+    let wait_prefetch = {
+        let existing = load_raw(&state);
+        let target_repo = existing
+            .iter()
+            .find(|w| w.id == norm)
+            .map(|w| w.repo.as_str())
+            .unwrap_or("");
+        let extra_conds: Vec<(&str, &str)> = wf
+            .wait_on
+            .iter()
+            .chain(wf.verify_on.iter())
+            .map(|c| (target_repo, c.as_str()))
+            .collect();
+        prefetch_reconcile_conditions(&state, &existing, &extra_conds)
+    };
     let outcome = {
         let _guard = crate::locks::acquire_state(&state).map_err(|e| e.to_string())?;
         let mut items = load_raw(&state);
@@ -5482,7 +5613,7 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
         }
         item.updated_at = now_iso;
 
-        let rec = reconcile_all_locked(&state, &mut items);
+        let rec = reconcile_all_locked_with_prefetch(&state, &mut items, None, Some(&wait_prefetch));
         save_raw(&state, &items)?;
         rec
     };
@@ -5559,6 +5690,7 @@ fn close_cmd(args: &[String]) -> Res<i32> {
 
     let state = state_dir();
     let now_iso = iso();
+    let prefetch = prefetch_reconcile_for_state(&state, &[]);
     let (closed_item, outcome) = {
         let _guard = crate::locks::acquire_state(&state).map_err(|e| e.to_string())?;
         let mut items = load_raw(&state);
@@ -5573,7 +5705,7 @@ fn close_cmd(args: &[String]) -> Res<i32> {
         items[pos].defer_streak = 0;
         items[pos].set_state("done", &now_iso);
         let snap = items[pos].clone();
-        let rec = reconcile_all_locked(&state, &mut items);
+        let rec = reconcile_all_locked_with_prefetch(&state, &mut items, None, Some(&prefetch));
         save_raw(&state, &items)?;
         (snap, rec)
     };
@@ -6025,6 +6157,11 @@ fn import_md_cmd(args: &[String]) -> Res<i32> {
     let mut created_ids = Vec::new();
     let mut skipped = 0usize;
 
+    let import_extra: Vec<(&str, &str)> = drafts
+        .iter()
+        .flat_map(|d| d.wait_on.iter().map(|c| (inferred_repo.as_str(), c.as_str())))
+        .collect();
+    let prefetch = prefetch_reconcile_for_state(&state, &import_extra);
     {
         let _guard = crate::locks::acquire_state(&state).map_err(|e| e.to_string())?;
         let mut items = load_raw(&state);
@@ -6054,7 +6191,7 @@ fn import_md_cmd(args: &[String]) -> Res<i32> {
             items.push(item);
             created_ids.push(id);
         }
-        let _ = reconcile_all_locked(&state, &mut items);
+        let _ = reconcile_all_locked_with_prefetch(&state, &mut items, None, Some(&prefetch));
         save_raw(&state, &items)?;
     }
 
@@ -6727,6 +6864,107 @@ mod tests {
         assert!(focus_for_item(&w, std::slice::from_ref(&w), &state, now_ep).contains("反复暂缓"));
         let card = render_card(&w, std::slice::from_ref(&w), &state, now_ep);
         assert!(card.contains("反复暂缓（连续 3 次）"), "{card}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconcile_under_state_lock_never_runs_git_even_without_final_entries() {
+        let dir = temp_dir("reconcile-no-git-under-lock");
+        let state = dir.join("state");
+        let repo = dir.join("repo");
+        let runs_dir = repo.join(".local/run/delegate");
+        let run_dir = runs_dir.join("20261124-120000-r1");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&run_dir).unwrap();
+
+        let run_git = |args: &[&str]| {
+            let st = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Test"]);
+        fs::write(repo.join("a.txt"), "base\n").unwrap();
+        run_git(&["add", "a.txt"]);
+        run_git(&["commit", "-q", "-m", "base"]);
+        let base_tree = git_text(&repo, &["rev-parse", "HEAD^{tree}"]).unwrap();
+
+        fs::write(repo.join("a.txt"), "changed\n").unwrap();
+        run_git(&["add", "a.txt"]);
+        run_git(&["commit", "-q", "-m", "after"]);
+        let after_tree = git_text(&repo, &["rev-parse", "HEAD^{tree}"]).unwrap();
+
+        // Register repo in state/repos.json so `find_live_run_dir` resolves `20261124-120000-r1`.
+        let runs_key = fs::canonicalize(&runs_dir).unwrap().to_string_lossy().into_owned();
+        let repo_key = fs::canonicalize(&repo).unwrap().to_string_lossy().into_owned();
+        write_json(
+            state.join("repos.json"),
+            &json!({"repos": {runs_key.clone(): {"repo": repo_key.clone(), "runs": runs_key}}}),
+        )
+        .unwrap();
+
+        // Legacy run record WITHOUT `finalEntries` in `changes.json`: calling `recorded_entries`
+        // inside `.state.lock` previously invoked `git` and panicked in debug builds / printed
+        // `forbidden slow operation (git/subprocess)` in release builds.
+        write_json(
+            run_dir.join("meta.json"),
+            &json!({
+                "run": "20261124-120000-r1",
+                "mode": "write",
+                "worktree": {"source": repo_key, "path": repo_key},
+                "base": {"tree": base_tree}
+            }),
+        )
+        .unwrap();
+        write_json(
+            run_dir.join("changes.json"),
+            &json!({
+                "top": repo_key,
+                "base": base_tree,
+                "after": after_tree,
+                "changes": [{"path": "a.txt", "status": "M"}]
+            }),
+        )
+        .unwrap();
+        fs::write(run_dir.join("exit_code"), "0\n").unwrap();
+
+        let now_iso = iso();
+        let mut items = vec![WorkItem {
+            id: "W001".into(),
+            title: "downstream".into(),
+            repo: repo_key,
+            state: "blocked".into(),
+            wait_on: vec!["run_applied:20261124-120000-r1".into()],
+            created_at: now_iso.clone(),
+            updated_at: now_iso.clone(),
+            state_since: now_iso,
+            ..Default::default()
+        }];
+
+        // 1. Prefetch outside state lock, then reconcile inside state lock: must NOT panic and MUST unlock W001.
+        let prefetch = prefetch_reconcile_conditions(&state, &items, &[]);
+        {
+            let _guard = crate::locks::acquire_state(&state).unwrap();
+            let rec = reconcile_all_locked_with_prefetch(&state, &mut items, None, Some(&prefetch));
+            assert!(rec.changed);
+            assert_eq!(items[0].state, "ready");
+        }
+
+        // 2. Defense-in-depth: even without prefetch, calling reconcile under `.state.lock` must NOT panic.
+        items[0].state = "blocked".into();
+        {
+            let _guard = crate::locks::acquire_state(&state).unwrap();
+            let _ = reconcile_all_locked(&state, &mut items);
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

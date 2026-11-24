@@ -334,6 +334,95 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
             .map_err(|e| format!("{}: {e}", path.display()))?;
         crate::radar::validate_radar_config(value.get("radar"))
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        validate_areas_config(value.get("areas"))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Validate repository-only `areas` config for deterministic L0 experience A/B alternation:
+/// `{"<area>": {"paths": ["crates/delegate/"], "l0": ".local/notes/areas/delegate.l0.md"}}`
+/// (also accepts single string `"paths"` or `"prefix"`).
+pub fn validate_areas_config(v: Option<&Value>) -> Res<()> {
+    let Some(val) = v else {
+        return Ok(());
+    };
+    if val.is_null() {
+        return Ok(());
+    }
+    let Some(map) = val.as_object() else {
+        return Err("areas must be an object mapping area names to {paths, l0}".into());
+    };
+    for (name, spec) in map {
+        if name.is_empty()
+            || name
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || c == '/')
+        {
+            return Err(format!("areas.{name}: invalid area name"));
+        }
+        let Some(obj) = spec.as_object() else {
+            return Err(format!("areas.{name} must be an object with paths and l0"));
+        };
+        for key in obj.keys() {
+            if !["paths", "prefix", "l0"].contains(&key.as_str()) {
+                return Err(format!("areas.{name}: unknown field '{key}'"));
+            }
+        }
+        let mut prefixes = Vec::new();
+        if let Some(p) = obj.get("paths") {
+            match p {
+                Value::String(s) => prefixes.push(s.as_str()),
+                Value::Array(arr) => {
+                    for item in arr {
+                        let Some(s) = item.as_str() else {
+                            return Err(format!(
+                                "areas.{name}.paths must contain non-empty strings"
+                            ));
+                        };
+                        prefixes.push(s);
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "areas.{name}.paths must be a string or list of strings"
+                    ));
+                }
+            }
+        }
+        if let Some(p) = obj.get("prefix") {
+            let Some(s) = p.as_str() else {
+                return Err(format!("areas.{name}.prefix must be a non-empty string"));
+            };
+            prefixes.push(s);
+        }
+        if prefixes.is_empty() {
+            return Err(format!(
+                "areas.{name} requires non-empty paths (or prefix)"
+            ));
+        }
+        for pref in prefixes {
+            let clean = pref.trim().trim_start_matches("./");
+            if clean.is_empty() || pref.contains('\0') {
+                return Err(format!(
+                    "areas.{name}.paths contains an empty or invalid prefix"
+                ));
+            }
+        }
+        let Some(l0) = obj.get("l0").and_then(Value::as_str) else {
+            return Err(format!("areas.{name}.l0 must be a non-empty path string"));
+        };
+        let l0_trim = l0.trim();
+        if l0_trim.is_empty() || l0.contains('\0') {
+            return Err(format!("areas.{name}.l0 must be a non-empty path string"));
+        }
+        if !Path::new(l0_trim).is_absolute()
+            && Path::new(l0_trim)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!("areas.{name}.l0 must not escape repository root"));
+        }
     }
     Ok(())
 }
@@ -360,6 +449,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
             "mergeAccept",
             "autoMerge",
             "radar",
+            "areas",
         ] {
             if user.get(key).is_some() {
                 ignored.push(key);
@@ -691,6 +781,33 @@ mod tests {
         ] {
             let err = validate(&bad, p, false).unwrap_err();
             assert!(err.contains("agy"), "expected agy error, got {err}");
+        }
+    }
+
+    #[test]
+    fn validate_areas_config_accepts_valid_and_rejects_bad_entries() {
+        let p = Path::new(".delegate.json");
+        assert!(validate(
+            &json!({
+                "areas": {
+                    "delegate": {"paths": ["crates/delegate/", "skills/delegate/"], "l0": ".local/notes/areas/delegate.l0.md"},
+                    "tui": {"prefix": "crates/delegate-tui/", "l0": ".local/notes/areas/tui.l0.md"}
+                }
+            }),
+            p,
+            true
+        )
+        .is_ok());
+        for bad in [
+            json!({"areas": []}),
+            json!({"areas": {"bad/name": {"paths": ["a/"], "l0": "x.md"}}}),
+            json!({"areas": {"a": {"paths": [], "l0": "x.md"}}}),
+            json!({"areas": {"a": {"paths": ["a/"], "l0": ""}}}),
+            json!({"areas": {"a": {"paths": ["a/"], "l0": "../escape.md"}}}),
+            json!({"areas": {"a": {"paths": ["a/"], "l0": "x.md", "extra": 1}}}),
+        ] {
+            let err = validate(&bad, p, true).unwrap_err();
+            assert!(err.contains("areas"), "expected areas error, got {err}");
         }
     }
 }

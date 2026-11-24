@@ -408,6 +408,7 @@ pub fn preserve(run: &Path) -> Res<Option<PathBuf>> {
         "changes.json",
         "changes.patch",
         "applied.patch",
+        "applied-files.txt",
         "review.json",
         "review.md",
         "usage-rounds.jsonl",

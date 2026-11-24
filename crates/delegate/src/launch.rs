@@ -739,6 +739,295 @@ fn standing_text(config: &crate::config::Config, read_only: bool, deny: &Value) 
     (text.join("\n"), sources)
 }
 
+/// Extract normalized repo-relative path tokens from arbitrary text (brief, work item title/notes).
+fn extract_repo_path_tokens(text: &str, repo: &Path) -> Vec<String> {
+    let repo_prefix = {
+        let p = repo.to_string_lossy().trim_end_matches('/').to_string();
+        (!p.is_empty()).then(|| format!("{p}/"))
+    };
+    let mut found = std::collections::BTreeSet::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !(b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'.' | b'+')) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric()
+                || matches!(bytes[i], b'/' | b'_' | b'-' | b'.' | b'+'))
+        {
+            i += 1;
+        }
+        if start >= 1 && bytes[start - 1] == b':' && bytes[start..i].starts_with(b"//") {
+            continue;
+        }
+        let mut token = &text[start..i];
+        while let Some(stripped) = token.strip_prefix("./") {
+            token = stripped;
+        }
+        token = token.trim_end_matches('.');
+        if token.is_empty() {
+            continue;
+        }
+        if token.starts_with('/') {
+            if let Some(prefix) = &repo_prefix {
+                if let Some(rel) = token.strip_prefix(prefix.as_str()) {
+                    token = rel;
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        }
+        let parts = Path::new(token).components().collect::<Vec<_>>();
+        if parts.is_empty()
+            || parts
+                .iter()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            continue;
+        }
+        let norm = parts
+            .iter()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        if !norm.is_empty() {
+            found.insert(norm);
+        }
+    }
+    found.into_iter().collect()
+}
+
+fn area_prefix_matches(candidate: &str, prefix_raw: &str) -> bool {
+    let pref = prefix_raw.trim().trim_start_matches("./");
+    if pref.is_empty() {
+        return false;
+    }
+    if pref.contains('*') || pref.contains('?') {
+        return worktree::matches_rule(candidate, &[pref.to_string()]);
+    }
+    let clean_cand = candidate.trim_start_matches("./").trim_end_matches('/');
+    let clean_pref = pref.trim_end_matches('/');
+    clean_cand == clean_pref
+        || clean_cand
+            .strip_prefix(clean_pref)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn collect_area_prefixes(spec: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(p) = spec.get("paths") {
+        match p {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(arr) => {
+                for item in arr {
+                    if let Some(s) = item.as_str() {
+                        out.push(s.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = spec.get("prefix").and_then(Value::as_str) {
+        out.push(s.to_string());
+    }
+    out
+}
+
+fn read_l0_three_lines(repo: &Path, l0_raw: &str) -> Option<Vec<String>> {
+    let l0_path = {
+        let p = Path::new(l0_raw.trim());
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            repo.join(p)
+        }
+    };
+    let text = fs::read_to_string(&l0_path).ok()?;
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .filter(|l| !l.trim().is_empty())
+        .take(3)
+        .map(str::to_string)
+        .collect();
+    (!lines.is_empty()).then_some(lines)
+}
+
+fn work_item_path_hints(item: &crate::work::WorkItem, repo: &Path) -> Vec<String> {
+    let mut hints = std::collections::BTreeSet::new();
+    for art in &item.artifacts {
+        let clean = art.path.trim().trim_start_matches("./");
+        if !clean.is_empty() {
+            hints.insert(clean.to_string());
+        }
+    }
+    for tok in extract_repo_path_tokens(&item.title, repo)
+        .into_iter()
+        .chain(extract_repo_path_tokens(&item.done_when, repo))
+    {
+        hints.insert(tok);
+    }
+    for f in &item.followups {
+        for tok in extract_repo_path_tokens(&f.text, repo) {
+            hints.insert(tok);
+        }
+    }
+    if !item.brief.trim().is_empty() {
+        let bpath = {
+            let p = Path::new(item.brief.trim());
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                repo.join(p)
+            }
+        };
+        if let Ok(btext) = fs::read_to_string(&bpath) {
+            for tok in extract_repo_path_tokens(&btext, repo) {
+                hints.insert(tok);
+            }
+        }
+    }
+    for rid in &item.runs {
+        if let Some(rdir_str) = item.run_dirs.get(rid) {
+            let rdir = Path::new(rdir_str);
+            for p in worktree::run_files(rdir) {
+                hints.insert(p);
+            }
+        }
+    }
+    hints.into_iter().collect()
+}
+
+/// Match repository `.delegate.json` `areas` against brief, `--work` paths, and `workdir`.
+/// Runs OUTSIDE `state/.state.lock` so reading the L0 pointer file never touches the lock.
+fn match_area_for_start(
+    areas: &Value,
+    repo: &Path,
+    workdir: &Path,
+    prompt: &str,
+    work_item: Option<&crate::work::WorkItem>,
+) -> Option<Value> {
+    let map = areas.as_object()?;
+    if map.is_empty() {
+        return None;
+    }
+    let mut candidates = std::collections::BTreeSet::new();
+    for tok in extract_repo_path_tokens(prompt, repo) {
+        candidates.insert(tok);
+    }
+    if let Some(item) = work_item {
+        for tok in work_item_path_hints(item, repo) {
+            candidates.insert(tok);
+        }
+    }
+    if let Ok(rel_wd) = workdir.strip_prefix(repo) {
+        let rel_s = rel_wd.to_string_lossy().trim_matches('/').to_string();
+        if !rel_s.is_empty() {
+            candidates.insert(rel_s);
+        }
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let mut area_names: Vec<&String> = map.keys().collect();
+    area_names.sort();
+
+    // Deterministic tie-breaking: longest matched prefix > distinct matched paths > area name.
+    let mut best: Option<(usize, usize, String, String, Vec<String>)> = None;
+    for name in area_names {
+        let spec = &map[name];
+        let prefixes = collect_area_prefixes(spec);
+        let l0 = s(spec, "l0").trim();
+        if prefixes.is_empty() || l0.is_empty() {
+            continue;
+        }
+        let mut matched = Vec::new();
+        let mut max_pref_len = 0usize;
+        for cand in &candidates {
+            let mut hit_len = 0usize;
+            for pref in &prefixes {
+                if area_prefix_matches(cand, pref) {
+                    hit_len = hit_len.max(pref.trim().trim_start_matches("./").trim_end_matches('/').len());
+                }
+            }
+            if hit_len > 0 {
+                matched.push(cand.clone());
+                max_pref_len = max_pref_len.max(hit_len);
+            }
+        }
+        if matched.is_empty() {
+            continue;
+        }
+        let replace = match &best {
+            None => true,
+            Some((best_len, best_cnt, best_name, _, _)) => {
+                (max_pref_len, matched.len(), std::cmp::Reverse(name.as_str()))
+                    > (*best_len, *best_cnt, std::cmp::Reverse(best_name.as_str()))
+            }
+        };
+        if replace {
+            best = Some((max_pref_len, matched.len(), name.clone(), l0.to_string(), matched));
+        }
+    }
+
+    let (_, _, area, l0, matched) = best?;
+    let Some(l0_lines) = read_l0_three_lines(repo, &l0) else {
+        eprintln!(
+            "delegate: areas.{area}: L0 指针文件缺失或为空（{l0}），跳过 A/B 分组"
+        );
+        return None;
+    };
+    Some(json!({
+        "area": area,
+        "l0": l0,
+        "l0Lines": l0_lines,
+        "matchedPaths": matched.into_iter().take(10).collect::<Vec<_>>(),
+    }))
+}
+
+/// Atomically advance per-(repo, area) dispatch counter inside `state/.state.lock` and assign
+/// deterministic A/B group by parity: odd `seq` -> `"B"` (treatment, inject L0 3 lines),
+/// even `seq` -> `"A"` (control, unmodified brief).
+fn assign_area_ab_locked(state: &Path, repo_key: &str, candidate: &Value) -> Value {
+    let area = s(candidate, "area");
+    let counter_path = state.join("area-ab.json");
+    let mut doc = json(&counter_path);
+    if !doc.is_object() {
+        doc = json!({});
+    }
+    let repo_bucket = if repo_key.is_empty() {
+        "_default"
+    } else {
+        repo_key
+    };
+    if !doc[repo_bucket].is_object() {
+        doc[repo_bucket] = json!({});
+    }
+    let prev = doc[repo_bucket][area].as_u64().unwrap_or(0);
+    let seq = prev.saturating_add(1);
+    doc[repo_bucket][area] = json!(seq);
+    let _ = write_json(&counter_path, &doc);
+    let group = if seq % 2 == 1 { "B" } else { "A" };
+    let injected = group == "B";
+    json!({
+        "area": area,
+        "group": group,
+        "seq": seq,
+        "l0": candidate["l0"].clone(),
+        "injected": injected,
+        "matchedPaths": candidate["matchedPaths"].clone(),
+        "l0Lines": candidate["l0Lines"].clone(),
+    })
+}
+
 pub(crate) fn protected_paths_in_prompt(
     prompt: &str,
     repo: Option<&Path>,
@@ -1242,9 +1531,11 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     if let Some(e) = nesting_error() {
         return Err(e);
     }
+    let mut work_item: Option<crate::work::WorkItem> = None;
     if let Some(raw_w) = o.work.clone() {
         let item = crate::work::validate_work_id(&raw_w)?;
-        o.work = Some(item.id);
+        o.work = Some(item.id.clone());
+        work_item = Some(item);
     }
     choose_tier(&mut o)?;
     let prompt = read_prompt(&mut o)?;
@@ -1499,6 +1790,17 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         ));
     }
     let mode = if o.read_only { "read-only" } else { "write" };
+    if let Some(top) = &repo {
+        if let Some(cand) = match_area_for_start(
+            &config.value["areas"],
+            top,
+            &workdir,
+            &prompt,
+            work_item.as_ref(),
+        ) {
+            extra["areaCandidate"] = cand;
+        }
+    }
     if !prompt_protected.is_empty() {
         extra["promptProtectedPaths"] = json!(prompt_protected);
     }
@@ -2473,7 +2775,7 @@ pub fn launch(
 
     // Critical section: ONLY capacity/admission checks + run directory & slot registration
     // under the single short-lived `<state>/.state.lock` (<5ms, zero git/subprocess/sleep).
-    let (run, slot_file, deferred, reason, queued_ns, model_cap, started_at, started_epoch, started_ns, queued_at, q_ahead) = {
+    let (run, slot_file, deferred, reason, queued_ns, model_cap, started_at, started_epoch, started_ns, queued_at, q_ahead, area_experiment) = {
         let _state_lock = crate::locks::acquire_state(&slots).map_err(|e| e.to_string())?;
 
         let active_runs = active_machine(&slots);
@@ -2545,6 +2847,11 @@ pub fn launch(
         let started_at = iso();
         let started_epoch = epoch() as i64;
         let started_ns = now_ns() as u64;
+        let area_experiment = if extra["areaCandidate"].is_object() {
+            Some(assign_area_ab_locked(&slots, &repo, &extra["areaCandidate"]))
+        } else {
+            None
+        };
         let mut provisional = json!({
             "run": run.file_name().unwrap_or_default().to_string_lossy(),
             "dir": run,
@@ -2565,6 +2872,10 @@ pub fn launch(
             "startedNs": started_ns,
             "queuedNs": admission["queuedNs"].clone(),
         });
+        if let Some(exp) = &area_experiment {
+            provisional["area"] = exp["area"].clone();
+            provisional["areaGroup"] = exp["group"].clone();
+        }
         let (queued_at, q_ahead, queued_ns) = if deferred {
             touch(run.join(".waiting"));
             crate::queue::enter(&run, &mut provisional)?;
@@ -2597,6 +2908,7 @@ pub fn launch(
             started_ns,
             queued_at,
             q_ahead,
+            area_experiment,
         )
     };
 
@@ -2641,9 +2953,20 @@ pub fn launch(
     let changed =
         parent.is_object() && fork.is_some() && o.accept.as_deref() != parent["accept"].as_str();
     let remaining = o.protect.iter().filter(|rule| !worktree::matches_rule(rule, &o.allow)).cloned().collect::<Vec<_>>();
+    let prompt_with_area: Option<String> = area_experiment.as_ref().and_then(|exp| {
+        if !b(exp, "injected") {
+            return None;
+        }
+        let l0_lines = strings(&exp["l0Lines"]);
+        if l0_lines.is_empty() {
+            return None;
+        }
+        Some(format!("{}\n\n{}", prompt.trim_end(), l0_lines.join("\n")))
+    });
+    let effective_prompt = prompt_with_area.as_deref().unwrap_or(prompt);
     let mut actual = if parent.is_object() && fork.is_some() {
         contract(
-            prompt,
+            effective_prompt,
             if changed && !o.hide_accept {
                 o.accept.as_deref()
             } else {
@@ -2656,7 +2979,7 @@ pub fn launch(
         )
     } else {
         contract(
-            prompt,
+            effective_prompt,
             if o.hide_accept {
                 None
             } else {
@@ -3003,6 +3326,18 @@ pub fn launch(
     if let Some(wid) = &o.work {
         meta["workId"] = json!(wid);
     }
+    if let Some(exp) = &area_experiment {
+        meta["area"] = exp["area"].clone();
+        meta["areaGroup"] = exp["group"].clone();
+        meta["areaExperiment"] = json!({
+            "area": exp["area"],
+            "group": exp["group"],
+            "seq": exp["seq"],
+            "l0": exp["l0"],
+            "injected": exp["injected"],
+            "matchedPaths": exp["matchedPaths"],
+        });
+    }
     meta["userPromptLen"] = json!(prompt.len());
     write_json(run.join("meta.json"), &meta)?;
     if !s(&extra["syncedBase"], "commit").is_empty() {
@@ -3178,5 +3513,72 @@ mod purpose_tests {
             &["apps/api/".to_string()],
         );
         assert_eq!(found, vec!["Cargo.toml", "apps/web/src/App.tsx"]);
+    }
+
+    #[test]
+    fn areas_matching_prefers_longest_prefix_respects_boundaries_and_alternates_ab() {
+        let dir = std::env::temp_dir().join(format!("delegate-area-ab-{}", now_ns()));
+        let repo = dir.join("repo");
+        let state = dir.join("state");
+        fs::create_dir_all(repo.join(".local/notes/areas")).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            repo.join(".local/notes/areas/delegate.l0.md"),
+            "L0-line-1\n\nL0-line-2\nL0-line-3\nL0-line-4-ignored\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join(".local/notes/areas/tui.l0.md"),
+            "TUI-1\nTUI-2\n",
+        )
+        .unwrap();
+
+        let areas = json!({
+            "delegate": {"paths": ["crates/delegate"], "l0": ".local/notes/areas/delegate.l0.md"},
+            "tui": {"paths": ["crates/delegate-tui/"], "l0": ".local/notes/areas/tui.l0.md"}
+        });
+
+        // Boundary check: `crates/delegate-tui/src/app.rs` matches `tui`, NOT `delegate`.
+        let m_tui = match_area_for_start(
+            &areas,
+            &repo,
+            &repo,
+            "修 crates/delegate-tui/src/app.rs 的刷新",
+            None,
+        )
+        .unwrap();
+        assert_eq!(s(&m_tui, "area"), "tui");
+        assert_eq!(strings(&m_tui["l0Lines"]), vec!["TUI-1", "TUI-2"]);
+
+        // 3-line truncation on `delegate` area.
+        let m_del = match_area_for_start(
+            &areas,
+            &repo,
+            &repo,
+            "改 crates/delegate/src/worktree.rs",
+            None,
+        )
+        .unwrap();
+        assert_eq!(s(&m_del, "area"), "delegate");
+        assert_eq!(
+            strings(&m_del["l0Lines"]),
+            vec!["L0-line-1", "L0-line-2", "L0-line-3"]
+        );
+
+        // Unmatched path -> None.
+        assert!(match_area_for_start(&areas, &repo, &repo, "改 docs/readme.md", None).is_none());
+
+        // Deterministic parity alternation per area (odd -> B injected, even -> A control).
+        let repo_key = repo.to_string_lossy().into_owned();
+        let e1 = assign_area_ab_locked(&state, &repo_key, &m_del);
+        let e2 = assign_area_ab_locked(&state, &repo_key, &m_del);
+        let e3 = assign_area_ab_locked(&state, &repo_key, &m_del);
+        let t1 = assign_area_ab_locked(&state, &repo_key, &m_tui);
+        assert_eq!((s(&e1, "group"), b(&e1, "injected"), e1["seq"].as_u64()), ("B", true, Some(1)));
+        assert_eq!((s(&e2, "group"), b(&e2, "injected"), e2["seq"].as_u64()), ("A", false, Some(2)));
+        assert_eq!((s(&e3, "group"), b(&e3, "injected"), e3["seq"].as_u64()), ("B", true, Some(3)));
+        assert_eq!((s(&t1, "group"), b(&t1, "injected"), t1["seq"].as_u64()), ("B", true, Some(1)));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

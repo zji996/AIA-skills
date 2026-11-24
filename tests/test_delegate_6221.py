@@ -57,7 +57,7 @@ class Delegate6221Tests(unittest.TestCase):
         self.assertEqual(total_diff.returncode, 0, total_diff.stderr)
         self.assertIn("+delivered", total_diff.stdout)
 
-        apply_res = self.cli("apply", "--json", run_id)
+        apply_res = self.cli("apply", "--json", "--allow-dirty-overlap", run_id)
         self.assertEqual(apply_res.returncode, 0, apply_res.stdout + apply_res.stderr)
         self.assertEqual((repo / "a.txt").read_text(), "delivered\n")
         self.assertEqual((repo / "added.txt").read_text(), "extra\n")

@@ -166,6 +166,8 @@ pub fn emit_run_finished(run: &Path, meta: &Value, summary: &Value) {
 
     let kind = if question {
         "question"
+    } else if b(summary, "policyRefused") {
+        "needs_attention"
     } else if state == "delivered" || state == "answered" {
         "delivered"
     } else if state == "stopped" {
@@ -181,6 +183,11 @@ pub fn emit_run_finished(run: &Path, meta: &Value, summary: &Value) {
         "state": state,
         "mode": mode,
     });
+    if b(summary, "policyRefused") {
+        payload["policyRefused"] = json!(true);
+        payload["reason"] = json!("policyRefused");
+        payload["detail"] = json!("结论被模型服务拒绝");
+    }
     let change_totals = if summary["pendingChanges"].is_object() {
         &summary["pendingChanges"]
     } else {

@@ -24,7 +24,7 @@ $D wait                                                                  # 放�
 
 总路数、仓库路数、模型并发或内存不足时自动排队、不换模型；`status` 看排队原因与前方人数，`--json` 看 `queue`。只有愿意模型满时改用下一候选才加 `--overflow next`。
 
-每个任务回一条短行（状态、改动、验收、下一步）和答复。写入任务看 `$D diff <name>`，满意后 `$D apply <name>`（默认落为未提交改动并列同事提交标题，`--commit` 仅暂存本批文件压成一条提交，`ok: false` 明报失败阶段与已写入文件）；冲突未解拒绝重叠合入，补丁保留可用 `patch` 恢复；等齐用 `wait --all`，见 [并行合入与只读 shell](references/parallel-safety.md)。清理默认归档忽略的证据文件，细节与上限见 [清理](references/cleanup.md)。
+每个任务回一条短行（状态、改动、验收、下一步）和答复。写入任务看 `$D diff <name>`，满意后 `$D apply <name>`（源工作区有未提交重叠时默认拒绝，加 `--allow-dirty-overlap` 接受合并；末行印 `$D files <run>` 便于 `git add`，`--commit` 仅暂存本批压单提交，`ok: false` 明报失败阶段与已写文件）；未解冲突拒合入，细节见 [并行合入](references/parallel-safety.md) 与 [清理](references/cleanup.md)。
 
 | 想要 | 命令 |
 |---|---|
@@ -76,10 +76,10 @@ $D wait                                                                  # 放�
 
 ## 收结果
 
-- 已交付表示验收通过，改法仍要看 diff；已答复没有验收，关键结论自己核实。
-- 状态为「提问」时保留未执行 lane 作业的原排队时间（不抢占运行者）；同事等你决定：`$D reply <name> "<决定>"` 回答，不算返工；只有改过文件后再要求改才算。`wait --any` 每次列出上次 wait 之后所有终态与提问态 run（首个给全文，其余一行摘要加查看命令）。
-- 验收未执行不算执行失败：按提示重排或本地跑。
-- 同一仓库的写入一次 `apply A B …` 按序合入，成功后默认归档并清理 worktree（`worktree.cleanOnApply`，续做链等整条链合入后再清）；同事在 worktree 里 rebase/merge 源主干后，改动、保护检查、`diff`/`apply` 均按 merge-base（`meta.netBase`）算净改动。验收没法沿用的任务在合并后的主干重跑一次各自的验收，全量检查仍由你按批跑。
-- 每个 run 依赖的快照对象钉在源仓库 `refs/delegate/<run-id>/*` 下（`clean` 时一并移除，仅 `cleanOnApply` 删 worktree 时保留），普通 `git gc` 安全；切勿在有 delegate 记录的仓库执行 `git prune`、`git gc --prune=now|all` 等立即删不可达对象的命令（若 git 提示 `run 'git prune'`，删除 `.git/gc.log` 即可）。旧 run 对象已丢时，`status`/`diff` 会提示并给出 `git -C <worktree> diff HEAD`（未跟踪文件先 `add -N`）救回命令。
+- 已交付表示验收通过，仍看 diff；已答复无验收，关键结论自核；Gemini/agy 结论命中内容策略时自动同会话尾部重写 1 次，仍拒则 `result.md` 指向 `review.md` 与 `delegate files <run>` 并标「结论被模型服务拒绝」。
+- 状态为「提问」时同事等你决定：`$D reply <name> "<决定>"` 不算返工；只有改过文件后再要求改才算。`wait --any` 报齐上次 wait 后所有终态与提问 run（首个全文，其余一行摘要）。
+- 验收未执行不算失败：按提示重排或本地跑。
+- 同一仓库多次写入可 `apply A B …` 按序合入，默认归档清 worktree（`worktree.cleanOnApply`）；worktree 内 rebase/merge 后按 `meta.netBase` 算净改动；验收无法沿用时在主干重跑，全量检查按批跑。
+- 快照对象钉在 `refs/delegate/<run-id>/*`（`clean` 时移除），普通 `git gc` 安全；切勿执行 `git prune` 或 `git gc --prune=now|all`（见 `gc.log` 删该文件即可）。
 
 状态、退出码与等待细节见 [references/reading-results.md](references/reading-results.md)；续接、并行与长时间推进见 [references/practice.md](references/practice.md)、[references/long-run.md](references/long-run.md)；run 目录见 [references/output-and-files.md](references/output-and-files.md)。

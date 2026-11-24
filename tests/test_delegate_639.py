@@ -496,8 +496,10 @@ class Delegate639Tests(unittest.TestCase):
         r = self.outcome(
             self.cli("run", "--worktree", "--workdir", repo, "--name", "conf-run", "--accept", "true", "edit shared")
         )
-        # Concurrent edit on source checkout creates a real conflict.
+        # Concurrent committed edit on source checkout creates a real conflict.
         (repo / "shared.txt").write_text("controller-change\n", encoding="utf-8")
+        self.git(repo, "add", "shared.txt")
+        self.git(repo, "commit", "-qm", "controller-change")
         expected_cmd = f'delegate reply --sync=agent {r["run"]} "rebase 到最新主干并解决冲突（shared.txt）"'
 
         res_human = self.cli("apply", r["run"], cwd=repo, human=True)

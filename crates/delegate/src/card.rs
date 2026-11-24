@@ -2817,6 +2817,7 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
         "run": run_id,
         "name": name,
         "state": state,
+        "policyRefused": b(sum, "policyRefused"),
         "base": base_info,
         "changes": {
             "files": total_files,
@@ -2875,14 +2876,18 @@ pub fn render_card_human(card: &Value) -> String {
     let run_id = s(card, "run");
     let name = s(card, "name").replace(['\n', '\r'], " ");
     let state = s(card, "state");
-    let state_zh = match state {
-        "delivered" => "已交付",
-        "answered" => "已答复",
-        "rejected" => "未通过",
-        "running" => "运行中",
-        "stopped" => "已停止",
-        "failed" => "失败",
-        _ => state,
+    let state_zh = if b(card, "policyRefused") {
+        "结论被模型服务拒绝"
+    } else {
+        match state {
+            "delivered" => "已交付",
+            "answered" => "已答复",
+            "rejected" => "未通过",
+            "running" => "运行中",
+            "stopped" => "已停止",
+            "failed" => "失败",
+            _ => state,
+        }
     };
     let files = n(&card["changes"], "files");
     let added = n(&card["changes"], "added");

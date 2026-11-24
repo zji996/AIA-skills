@@ -225,7 +225,7 @@ pub fn is_eligible_fast(run: &Path, meta: &Value, sum: &Value) -> bool {
     } else {
         runs::state(run)
     };
-    if st != "delivered" || b(sum, "question") {
+    if st != "delivered" || b(sum, "question") || b(sum, "policyRefused") {
         return false;
     }
     if !sum["accept"].is_object() || !b(&sum["accept"], "ok") {

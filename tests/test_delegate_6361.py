@@ -385,7 +385,7 @@ class Delegate6361Tests(unittest.TestCase):
             self.run_delegate(["reply", "--json", r_q["run"], "选 A"], repo, actor_env)
         )
         self.until(lambda: (Path(r_reply["dir"]) / "exit_code").exists(), "reply finished")
-        self.assertEqual(self.run_delegate(["apply", r_reply["run"]], repo, actor_env).returncode, 0)
+        self.assertEqual(self.run_delegate(["apply", "--allow-dirty-overlap", r_reply["run"]], repo, actor_env).returncode, 0)
         self.assertIsNone(self.run_stop_hook(repo, observer_env, session_id="sess-observer"))
 
         # 4) Valid `sign.json` suppresses `needs_attention` / `review_verdict(NEEDS_CONTROLLER)` on that run.

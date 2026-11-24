@@ -693,6 +693,180 @@ pub(crate) fn resume_stalled(
     }
 }
 
+/// Outcome of checking and (at most once) recovering from a Gemini/agy content-policy refusal
+/// at the final conclusion step.
+pub(crate) struct PolicyRecovery {
+    pub(crate) verdict: String,
+    pub(crate) answer: String,
+    pub(crate) attempts: i64,
+    pub(crate) refused: bool,
+    pub(crate) rewrite_attempted: bool,
+}
+
+fn attempt_has_policy_refusal(run: &Path, attempt: i64) -> bool {
+    let evs = runs::events(run);
+    let mut saw_attempt = false;
+    let mut matched = false;
+    for ev in &evs {
+        if ev.get("attempt").and_then(Value::as_i64) == Some(attempt) {
+            saw_attempt = true;
+            if s(ev, "e") == "turn_error"
+                && crate::agy::is_policy_refusal_error(s(ev, "detail"))
+            {
+                matched = true;
+            }
+        }
+    }
+    if saw_attempt {
+        return matched;
+    }
+    evs.iter()
+        .rev()
+        .find(|ev| s(ev, "e") == "turn_error")
+        .is_some_and(|ev| crate::agy::is_policy_refusal_error(s(ev, "detail")))
+}
+
+/// If the final conclusion was blocked by Gemini/agy content-policy filtering, append ONE short
+/// rewrite prompt at the tail of the SAME session (preserving prefix cache & model binding).
+/// Never loops: a second failure marks `refused = true` so callers write a readable fallback and
+/// flag status as 「结论被模型服务拒绝」 instead of treating it as a normal conclusion.
+pub(crate) fn recover_policy_refusal(
+    meta: &Value,
+    run: &Path,
+    first: (String, String, i64),
+    holder: Arc<AtomicI32>,
+    grace: Arc<Mutex<Option<f64>>>,
+) -> PolicyRecovery {
+    let (verdict, answer, attempts) = first;
+    if lane::stopped() {
+        return PolicyRecovery {
+            verdict,
+            answer,
+            attempts,
+            refused: false,
+            rewrite_attempted: false,
+        };
+    }
+    let answer_refused = verdict == "ok" && crate::agy::is_policy_refusal(&answer);
+    let turn_err_refused = verdict == "failed"
+        && answer.trim().is_empty()
+        && attempt_has_policy_refusal(run, attempts);
+    if !answer_refused && !turn_err_refused {
+        return PolicyRecovery {
+            verdict,
+            answer,
+            attempts,
+            refused: false,
+            rewrite_attempted: false,
+        };
+    }
+    let prompt_file = run.join("policy-rewrite-prompt.md");
+    let next = write(&prompt_file, format!("{}\n", crate::agy::POLICY_REWRITE_PROMPT))
+        .ok()
+        .and_then(|()| continuation_with_file(meta, run, &prompt_file));
+    let Some(next) = next else {
+        log_event(
+            run,
+            json!({"e":"policy_rewrite_skipped","reason":"no saved session to continue"}),
+        );
+        return PolicyRecovery {
+            verdict: if answer_refused { "ok".into() } else { verdict },
+            answer: String::new(),
+            attempts,
+            refused: true,
+            rewrite_attempted: false,
+        };
+    };
+    log_event(
+        run,
+        json!({"e":"policy_rewrite","n":1,"detail":"最终结论被模型服务策略拦截，同会话尾部重写 1 次"}),
+    );
+    let next_attempt = attempts + 1;
+    match agents::run_agent(&next, run, next_attempt, holder, grace) {
+        Ok((rv, rtext))
+            if rv == "ok"
+                && !rtext.trim().is_empty()
+                && !crate::agy::is_policy_refusal(&rtext) =>
+        {
+            log_event(
+                run,
+                json!({"e":"policy_rewrite_ok","attempt":next_attempt}),
+            );
+            PolicyRecovery {
+                verdict: rv,
+                answer: rtext,
+                attempts: next_attempt,
+                refused: false,
+                rewrite_attempted: true,
+            }
+        }
+        Ok((rv, _)) => {
+            log_event(
+                run,
+                json!({"e":"policy_rewrite_failed","attempt":next_attempt,"verdict":rv}),
+            );
+            PolicyRecovery {
+                verdict: if answer_refused { "ok".into() } else { verdict },
+                answer: String::new(),
+                attempts: next_attempt,
+                refused: true,
+                rewrite_attempted: true,
+            }
+        }
+        Err(failure) => {
+            let _ = append(
+                run.join("stderr.log"),
+                &format!("supervisor error: {failure}\n"),
+            );
+            log_event(
+                run,
+                json!({"e":"policy_rewrite_failed","attempt":next_attempt,"error":clip(&failure,200)}),
+            );
+            PolicyRecovery {
+                verdict: if answer_refused { "ok".into() } else { verdict },
+                answer: String::new(),
+                attempts: next_attempt,
+                refused: true,
+                rewrite_attempted: true,
+            }
+        }
+    }
+}
+
+fn format_policy_refused_result(
+    run: &Path,
+    meta: &Value,
+    files: &[String],
+    rewrite_attempted: bool,
+) -> String {
+    let run_id = crate::events::run_id_for(run, meta);
+    let review_path = run.join("review.md");
+    let mut lines = vec![if rewrite_attempted {
+        "结论被模型服务拒绝（已在原会话尾部重写 1 次仍被内容策略拦截）；工作区改动已保留，不当作正常结论。".to_string()
+    } else {
+        "结论被模型服务拒绝（被内容策略拦截且无可用会话续写）；工作区改动已保留，不当作正常结论。".to_string()
+    }];
+    if review_path.is_file() {
+        lines.push(format!("- 审查报告：{}", review_path.display()));
+    } else {
+        lines.push("- 审查报告：无（未生成 review.md）".to_string());
+    }
+    if files.is_empty() {
+        lines.push(format!("- 改动文件清单：无改动（或查 `delegate files {run_id}`）"));
+    } else {
+        let preview = if files.len() <= 10 {
+            files.join(", ")
+        } else {
+            format!("{} 等 {} 个文件", files[..10].join(", "), files.len())
+        };
+        lines.push(format!(
+            "- 改动文件清单：`delegate files {run_id}`（{} 个：{preview}）",
+            files.len()
+        ));
+    }
+    format!("{}\n", lines.join("\n"))
+}
+
 /// What a run did after waiting out an upstream outage.
 pub(crate) struct Resumed {
     pub(crate) verdict: String,
@@ -1294,6 +1468,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         ("failed".into(), String::new(), 0)
     };
     let (mut resumes, mut transient_error, mut auth_failed) = (0i64, String::new(), false);
+    let (mut policy_refused, mut policy_rewrite_attempted) = (false, false);
     if setup_error.is_none() {
         let resumed = resume_transient(
             &meta,
@@ -1312,6 +1487,16 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
             holder.clone(),
             grace.clone(),
         );
+        let recovered = recover_policy_refusal(
+            &meta,
+            run,
+            (verdict, answer, attempts),
+            holder.clone(),
+            grace.clone(),
+        );
+        (verdict, answer, attempts) = (recovered.verdict, recovered.answer, recovered.attempts);
+        policy_refused = recovered.refused;
+        policy_rewrite_attempted = recovered.rewrite_attempted;
     }
     let mut pre = settle_pre_accept(
         &mut meta,
@@ -1365,7 +1550,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
     if !transient_error.is_empty() {
         sum["transientError"] = json!(clip(&transient_error, 300));
     }
-    if !answer.trim().is_empty() {
+    if !policy_refused && !answer.trim().is_empty() {
         write(
             run.join("result.md"),
             format!("{}\n", answer.trim_end_matches('\n')),
@@ -1381,6 +1566,8 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         &mut changed,
         &mut answer,
         &mut attempts,
+        &mut policy_refused,
+        &mut policy_rewrite_attempted,
         holder.clone(),
         grace.clone(),
     )?;
@@ -1392,7 +1579,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
     if !transient_error.is_empty() {
         sum["transientError"] = json!(clip(&transient_error, 300));
     }
-    if !answer.trim().is_empty() {
+    if !policy_refused && !answer.trim().is_empty() {
         write(
             run.join("result.md"),
             format!("{}\n", answer.trim_end_matches('\n')),
@@ -1430,6 +1617,16 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
     };
     files.sort();
     files.dedup();
+    if policy_refused {
+        sum["policyRefused"] = json!(true);
+        if policy_rewrite_attempted {
+            sum["policyRewriteAttempted"] = json!(true);
+        }
+        let fallback = format_policy_refused_result(run, &meta, &files, policy_rewrite_attempted);
+        write(run.join("result.md"), &fallback)?;
+    } else if policy_rewrite_attempted {
+        sum["policyRewriteAttempted"] = json!(true);
+    }
     let sessions = evs
         .iter()
         .filter(|x| s(x, "e") == "session" && !s(x, "id").is_empty())

@@ -3,6 +3,7 @@
 ## 合入前后
 
 - `apply`（含 `--merge`、`--keep-commits`、`--dry-run`）先检查本次涉及路径的源文件。行首 `<<<<<<< ` 或 `>>>>>>> ` 表示尚有冲突：列出路径和标记标签（含留下标记的 run），整个 run 不写入源文件；不相关路径仍能合入。同源 apply 自动串行，避免检查与写入交错。
+- `apply` 合并前还会把本 run 改动文件与源工作区未提交改动取交集（忽略本 run 自写的相同内容），有交集默认拒绝并列重叠文件、给出「先提交现有改动再 apply」与 `--allow-dirty-overlap` 两个选项；成功合入后末行打印 `delegate files <run>`（归档后仍可列出本 run 改动文件，便于精确 `git add`）。
 - 新写出的冲突仍返回非零，保留 `conflict-markers` 动作与醒目的 `applied with conflict markers` 结论；`summary.conflictMarkers` 保存待解决路径，`status` 在标记清除前显示「已合入·有冲突待解决」。先解决再合下一路，不能在标记上继续叠三方合并。
 - 成功后释放 worktree / 池槽，但 run 原目录保留 `meta.json`、`result.md`、`summary.json`、`applied.patch` 等轻量记录。`applied.patch` 是该轮相对基线的完整 diff（含大文本与二进制补丁；超出快照范围的大二进制只列清单），不是合并后的源树 diff。
 

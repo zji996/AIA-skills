@@ -32,7 +32,7 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 - `acceptBlind`（glob 数组，仓库覆盖用户）：交付命中仍可交付，但短行、JSON 与 apply 末行提示最多 5 个文件及余数。
 - `resultChars`（正整数，默认 20000，`DELEGATE_RESULT_CHARS` 优先）：答复超 1.25 倍才截断显示头尾；`--max-answer N` 超 1.5 倍自动续接压缩，不计返工。
 - `cleanupKeepExecutables` 追加去重（内置 `sccache`），按可执行文件名豁免回收，不能配路径。
-- `worktree`、`generated`、`applyVerify`、`board`、`mergeAccept`、`autoMerge`、`radar` 只认仓库；用户级忽略并 stderr 提示。
+- `worktree`、`generated`、`applyVerify`、`board`、`mergeAccept`、`autoMerge`、`radar`、`areas` 只认仓库；用户级忽略并 stderr 提示。
 - 两份文件独立校验，错指文件与字段退出 2；meta/summary/`--json` 记 `configSources`。普通 reply 沿用 env/deny/验收/证据，fresh 更新 deny/standing，返工与容量读当前配置。
 
 用户级示例：
@@ -69,3 +69,4 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 - `controllerReviewPaths`：glob 数组（`*`/`?`/`**`/末尾 `/`），仓库优先。命中一律升 `NEEDS_CONTROLLER` 并附 diff 与 SHA-256，主控 `delegate sign <run>` 签字（改一字即失效，`sign --check` 验签），并作为审查卡「模型可见文字」规则源。
 - `mergeAccept` / `autoMerge`（仓库级）：`mergeAccept` 为 `delegate merge` 终验命令（默认等于 `accept`）；`autoMerge` 为 glob 数组（默认空，支持 `!` 排除与 `add:` 纯新增），全改动命中且审查 `PASS` 标「可自主合入」，详见 [合入员与 Radar](merge-and-radar.md)。
 - `radar`（仓库级）：`{"collect":[命令或{"name","command"}],"tier"?:"scout"|"review","model"?,"thinking"?,"timeout"?}`；确定性采集算指纹，未变零 token 退出，变化派只读 scout 更新 `<state>/radar/<repo>/board.md`，见 [合入员与 Radar](merge-and-radar.md)。
+- `areas`（仓库级，默认不生效）：`{"<块名>":{"paths":["路径前缀",...],"l0":".local/notes/areas/<块名>.l0.md"}}`（亦接受单串 `prefix`）；`start` 按 brief、`--work` 与 `workdir` 路径命中某块后，按该块派发计数奇偶（`<state>/area-ab.json`）交替分 `B`（实验组，向 brief 末尾追加该块 `l0` 前 3 条非空行）与 `A`（对照组），并将 `area`/`areaGroup`/`areaExperiment` 写入 `meta.json` 供测量脚本分组。

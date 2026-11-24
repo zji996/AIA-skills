@@ -41,7 +41,9 @@ class DelegateApplyFinishTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(Path(state["dir"]).exists())
             self.assertTrue(Path(state["worktree"]).exists())
-        self.assertEqual(result.stdout.splitlines()[-1], "验收仍然有效（仓库快照范围）")
+        lines = result.stdout.splitlines()
+        self.assertEqual(lines[-2], "验收仍然有效（仓库快照范围）")
+        self.assertIn(f"delegate files {state['run']}", lines[-1])
 
     def test_invalid_acceptance_lists_primary_and_additional_checks(self):
         repo, state = self.task("--accept", "test -f a.txt", "--accept-also", "test -f other.txt")
@@ -49,10 +51,12 @@ class DelegateApplyFinishTests(unittest.TestCase):
         (repo / ".delegate.json").write_text('{"applyVerify": false}')
         result = self.cli("apply", state["run"], human=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        last = result.stdout.splitlines()[-1]
-        self.assertIn("主干已前进，验收快照失效；本仓库配置合入后不自动验收，批量门禁时跑：", last)
-        self.assertNotIn("验收无效", last)
-        self.assertIn("test -f a.txt && test -f other.txt", last)
+        lines = result.stdout.splitlines()
+        summary_line = lines[-2]
+        self.assertIn("主干已前进，验收快照失效；本仓库配置合入后不自动验收，批量门禁时跑：", summary_line)
+        self.assertNotIn("验收无效", summary_line)
+        self.assertIn("test -f a.txt && test -f other.txt", summary_line)
+        self.assertIn(f"delegate files {state['run']}", lines[-1])
 
     def test_failed_apply_preserves_task(self):
         repo, state = self.task()
@@ -71,7 +75,9 @@ class DelegateApplyFinishTests(unittest.TestCase):
         # so docker cleanup errors never block or fail `apply`.
         self.assertTrue(Path(state["dir"]).exists())
         self.assertFalse(Path(state["worktree"]).exists())
-        self.assertIn("任务没有验收命令", result.stdout.splitlines()[-1])
+        lines = result.stdout.splitlines()
+        self.assertIn("任务没有验收命令", lines[-2])
+        self.assertIn(f"delegate files {state['run']}", lines[-1])
 
 
 if __name__ == "__main__":

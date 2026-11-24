@@ -274,6 +274,8 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
     };
     let label = if b(status, "question") {
         "提问"
+    } else if b(status, "policyRefused") {
+        "结论被模型服务拒绝"
     } else {
         label
     };
@@ -651,7 +653,10 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
     } else if !s(status, "next").is_empty() {
         if b(status, "question") {
             format!("回答提问：delegate reply {id} '<决定>'（不计返工）")
-        } else if state == "needs-redispatch" || b(status, "infrastructureFailure") {
+        } else if b(status, "policyRefused")
+            || state == "needs-redispatch"
+            || b(status, "infrastructureFailure")
+        {
             s(status, "next").to_string()
         } else if ["timeout", "stalled"].contains(&state) && s(status, "mode") == "write" {
             format!("改动保留，续做不计返工次数：{}", s(status, "next"))

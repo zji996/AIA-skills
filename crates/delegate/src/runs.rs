@@ -557,6 +557,16 @@ pub fn next_step(
             "the colleague asks for a decision; answer with {script} reply {name} '<decision>' (not rework)"
         ));
     }
+    if b(sum, "policyRefused") {
+        if s(meta, "mode") == "write" && !run.join(".applied").exists() {
+            return Some(format!(
+                "结论被模型服务拒绝；先核对 review.md 与 {script} files {name}，再决定 {script} apply {name} 或 {script} reply {name} '重写结论'"
+            ));
+        }
+        return Some(format!(
+            "结论被模型服务拒绝；查看 {script} files {name} 或用 {script} reply {name} '重写结论'"
+        ));
+    }
     if state == "delivered" || state == "answered" {
         let rev = {
             let f = json(run.join("review.json"));
@@ -682,6 +692,9 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
         "defaults",
         "maxAnswer",
         "resultDisplayChars",
+        "area",
+        "areaGroup",
+        "areaExperiment",
     ] {
         if let Some(value) = meta.get(key).filter(|v| !v.is_null()) {
             out[key] = value.clone();
@@ -820,6 +833,8 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
             "workspaceChanged",
             "escalatedFrom",
             "question",
+            "policyRefused",
+            "policyRewriteAttempted",
             "queuedSeconds",
             "graceSeconds",
             "stall",
@@ -1059,6 +1074,7 @@ pub fn remove_after_apply(run: &Path) -> (Vec<String>, bool) {
         "reply-delivered.json",
         "changes.json",
         "applied.patch",
+        "applied-files.txt",
         "prompt.md",
         "result.md",
         "result-original.md",
