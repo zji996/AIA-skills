@@ -11,5 +11,8 @@
   },
   "appendOnly": [
     "CHANGELOG.md"
+  ],
+  "hotspots": [
+    "README.md"
   ]
 }
