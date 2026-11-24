@@ -37,6 +37,7 @@ const BUILTIN_RULE_IDS: &[&str] = &[
     "concurrency_unsafe",
     "secret_internal",
     "large_deletion",
+    "size_budget",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -89,9 +90,19 @@ pub struct CustomRiskRule {
 }
 
 #[derive(Debug, Clone)]
+pub struct SizeBudgetRule {
+    pub paths: Vec<String>,
+    pub max_lines: Option<usize>,
+    pub max_test_fn_lines: Option<usize>,
+    pub max_tokens: Option<usize>,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct RiskConfig {
     pub disabled: BTreeSet<String>,
     pub large_deletion_lines: usize,
+    pub size_budgets: Vec<SizeBudgetRule>,
     pub extra: Vec<CustomRiskRule>,
 }
 
@@ -100,6 +111,7 @@ impl Default for RiskConfig {
         Self {
             disabled: BTreeSet::new(),
             large_deletion_lines: DEFAULT_LARGE_DELETION_LINES,
+            size_budgets: Vec::new(),
             extra: Vec::new(),
         }
     }
@@ -198,9 +210,9 @@ pub fn validate_risk_rules(value: Option<&Value>) -> Res<()> {
         .as_object()
         .ok_or("riskRules must be an object or array of custom risk rules")?;
     for key in obj.keys() {
-        if !["disable", "largeDeletionLines", "extra"].contains(&key.as_str()) {
+        if !["disable", "largeDeletionLines", "sizeBudgets", "extra"].contains(&key.as_str()) {
             return Err(format!(
-                "riskRules has unknown field {key:?} (allowed: disable, largeDeletionLines, extra)"
+                "riskRules has unknown field {key:?} (allowed: disable, largeDeletionLines, sizeBudgets, extra)"
             ));
         }
     }
@@ -223,6 +235,65 @@ pub fn validate_risk_rules(value: Option<&Value>) -> Res<()> {
     if let Some(ldl) = obj.get("largeDeletionLines") {
         if !ldl.as_u64().is_some_and(|n| n >= 5) {
             return Err("riskRules.largeDeletionLines must be an integer >= 5".into());
+        }
+    }
+    if let Some(sb) = obj.get("sizeBudgets") {
+        let arr = sb
+            .as_array()
+            .ok_or("riskRules.sizeBudgets must be an array of size budget rules")?;
+        for (idx, item) in arr.iter().enumerate() {
+            let entry = item
+                .as_object()
+                .ok_or_else(|| format!("riskRules.sizeBudgets[{idx}] must be an object"))?;
+            for key in entry.keys() {
+                if !["paths", "maxLines", "maxTestFnLines", "maxTokens", "label"]
+                    .contains(&key.as_str())
+                {
+                    return Err(format!(
+                        "riskRules.sizeBudgets[{idx}] has unknown field {key:?} (allowed: paths, maxLines, maxTestFnLines, maxTokens, label)"
+                    ));
+                }
+            }
+            let Some(paths) = entry.get("paths").and_then(Value::as_array) else {
+                return Err(format!(
+                    "riskRules.sizeBudgets[{idx}].paths must be a non-empty array of glob strings"
+                ));
+            };
+            if paths.is_empty()
+                || !paths
+                    .iter()
+                    .all(|x| x.as_str().is_some_and(|s| !s.is_empty() && !s.contains('\0')))
+            {
+                return Err(format!(
+                    "riskRules.sizeBudgets[{idx}].paths must be a non-empty array of non-empty strings"
+                ));
+            }
+            let mut has_limit = false;
+            for lim_key in ["maxLines", "maxTestFnLines", "maxTokens"] {
+                if let Some(lv) = entry.get(lim_key) {
+                    if !lv.as_u64().is_some_and(|n| n >= 1) {
+                        return Err(format!(
+                            "riskRules.sizeBudgets[{idx}].{lim_key} must be a positive integer"
+                        ));
+                    }
+                    has_limit = true;
+                }
+            }
+            if !has_limit {
+                return Err(format!(
+                    "riskRules.sizeBudgets[{idx}] must specify at least one of maxLines, maxTestFnLines, or maxTokens"
+                ));
+            }
+            if let Some(lbl) = entry.get("label") {
+                if !lbl
+                    .as_str()
+                    .is_some_and(|s| !s.trim().is_empty() && !s.contains('\0'))
+                {
+                    return Err(format!(
+                        "riskRules.sizeBudgets[{idx}].label must be a non-empty string"
+                    ));
+                }
+            }
         }
     }
     if let Some(extra) = obj.get("extra") {
@@ -284,6 +355,37 @@ fn parse_risk_config(val: &Value) -> RiskConfig {
         }
         if let Some(n) = val["largeDeletionLines"].as_u64().filter(|&n| n >= 5) {
             cfg.large_deletion_lines = n as usize;
+        }
+        if let Some(arr) = val["sizeBudgets"].as_array() {
+            for item in arr {
+                let paths = strings(&item["paths"]);
+                if paths.is_empty() {
+                    continue;
+                }
+                let max_lines = item["maxLines"].as_u64().filter(|&n| n >= 1).map(|n| n as usize);
+                let max_test_fn_lines = item["maxTestFnLines"]
+                    .as_u64()
+                    .filter(|&n| n >= 1)
+                    .map(|n| n as usize);
+                let max_tokens = item["maxTokens"]
+                    .as_u64()
+                    .filter(|&n| n >= 1)
+                    .map(|n| n as usize);
+                if max_lines.is_none() && max_test_fn_lines.is_none() && max_tokens.is_none() {
+                    continue;
+                }
+                let label = {
+                    let l = s(item, "label").trim();
+                    (!l.is_empty()).then(|| l.to_string())
+                };
+                cfg.size_budgets.push(SizeBudgetRule {
+                    paths,
+                    max_lines,
+                    max_test_fn_lines,
+                    max_tokens,
+                    label,
+                });
+            }
         }
         if let Some(arr) = val["extra"].as_array() {
             parse_extra(arr, &mut cfg.extra);
@@ -1922,6 +2024,561 @@ pub fn detect_rule_risks(
     items
 }
 
+/// Estimate reading token budget using the same formula as `repo-governance/scripts/audit-context.py`.
+pub fn estimate_tokens(text: &str) -> usize {
+    let mut total_chars = 0usize;
+    let mut cjk = 0usize;
+    for ch in text.chars() {
+        total_chars += 1;
+        let cp = ch as u32;
+        if (0x2E80..=0x9FFF).contains(&cp)
+            || (0xAC00..=0xD7AF).contains(&cp)
+            || (0xF900..=0xFAFF).contains(&cp)
+            || (0xFF00..=0xFFEF).contains(&cp)
+            || (0x3000..=0x303F).contains(&cp)
+        {
+            cjk += 1;
+        }
+    }
+    cjk + (total_chars - cjk).div_ceil(4)
+}
+
+fn matches_path_list(patterns: &[String], path: &str) -> Option<bool> {
+    let mut matched = false;
+    let mut exact = false;
+    for raw in patterns {
+        if let Some(neg) = raw.strip_prefix('!') {
+            if glob_match(neg, path) {
+                return None;
+            }
+        } else if glob_match(raw, path) {
+            matched = true;
+            if !raw.contains(['*', '?', '[']) && !raw.ends_with('/') {
+                exact = true;
+            }
+        }
+    }
+    matched.then_some(exact)
+}
+
+#[derive(Debug, Clone, Default)]
+struct EffectiveSizeLimits {
+    max_lines: Option<usize>,
+    max_test_fn_lines: Option<usize>,
+    max_tokens: Option<usize>,
+    label: Option<String>,
+}
+
+fn resolve_size_limits(path: &str, rules: &[SizeBudgetRule]) -> EffectiveSizeLimits {
+    let mut max_lines: Option<(bool, usize)> = None;
+    let mut max_test_fn_lines: Option<(bool, usize)> = None;
+    let mut max_tokens: Option<(bool, usize)> = None;
+    let mut label: Option<(bool, String)> = None;
+
+    let apply = |slot: &mut Option<(bool, usize)>, exact: bool, val: usize| match *slot {
+        None => *slot = Some((exact, val)),
+        Some((prev_exact, _)) => {
+            if exact || !prev_exact {
+                *slot = Some((exact, val));
+            }
+        }
+    };
+
+    for rule in rules {
+        if let Some(exact) = matches_path_list(&rule.paths, path) {
+            if let Some(v) = rule.max_lines {
+                apply(&mut max_lines, exact, v);
+            }
+            if let Some(v) = rule.max_test_fn_lines {
+                apply(&mut max_test_fn_lines, exact, v);
+            }
+            if let Some(v) = rule.max_tokens {
+                apply(&mut max_tokens, exact, v);
+            }
+            if let Some(ref lbl) = rule.label {
+                match &label {
+                    None => label = Some((exact, lbl.clone())),
+                    Some((prev_exact, _)) if exact || !*prev_exact => {
+                        label = Some((exact, lbl.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    EffectiveSizeLimits {
+        max_lines: max_lines.map(|(_, v)| v),
+        max_test_fn_lines: max_test_fn_lines.map(|(_, v)| v),
+        max_tokens: max_tokens.map(|(_, v)| v),
+        label: label.map(|(_, v)| v),
+    }
+}
+
+/// Load token budgets from `<repo>/.repo-governance.json` (if present).
+pub fn load_repo_governance_size_budgets(repo_root: &Path) -> Vec<SizeBudgetRule> {
+    let path = repo_root.join(".repo-governance.json");
+    if !path.is_file() {
+        return Vec::new();
+    }
+    let doc = json(&path);
+    let Some(obj) = doc.as_object() else {
+        return Vec::new();
+    };
+    let mut rules = vec![
+        SizeBudgetRule {
+            paths: vec!["AGENTS.md".into(), "CLAUDE.md".into()],
+            max_lines: None,
+            max_test_fn_lines: None,
+            max_tokens: Some(5000),
+            label: None,
+        },
+        SizeBudgetRule {
+            paths: vec!["docs/current.md".into()],
+            max_lines: None,
+            max_test_fn_lines: None,
+            max_tokens: Some(2500),
+            label: None,
+        },
+    ];
+    if let Some(budgets) = obj.get("budgets").and_then(Value::as_object) {
+        let mut entries: Vec<(&String, usize)> = budgets
+            .iter()
+            .filter_map(|(pat, lim)| {
+                let n = lim.as_u64().filter(|&v| v > 0)? as usize;
+                (!pat.is_empty() && !pat.starts_with('/') && !pat.contains(".."))
+                    .then_some((pat, n))
+            })
+            .collect();
+        // Globs first, exact paths second so exact paths always take precedence.
+        entries.sort_by_key(|(pat, _)| !pat.contains(['*', '?', '[']));
+        for (pat, limit) in entries {
+            rules.push(SizeBudgetRule {
+                paths: vec![pat.clone()],
+                max_lines: None,
+                max_test_fn_lines: None,
+                max_tokens: Some(limit),
+                label: None,
+            });
+        }
+    }
+    rules
+}
+
+fn brace_delta(line: &str, preserve_single_quotes: bool) -> (usize, usize) {
+    let stripped = strip_string_literals(line, preserve_single_quotes);
+    let code = stripped.split("//").next().unwrap_or(&stripped);
+    let opens = code.bytes().filter(|&b| b == b'{').count();
+    let closes = code.bytes().filter(|&b| b == b'}').count();
+    (opens, closes)
+}
+
+fn scan_brace_block_end(lines: &[&str], start_idx: usize, preserve_single_quotes: bool) -> usize {
+    let mut depth: isize = 0;
+    let mut opened = false;
+    for (offset, line) in lines[start_idx..].iter().enumerate() {
+        let (opens, closes) = brace_delta(line, preserve_single_quotes);
+        if opens > 0 {
+            opened = true;
+        }
+        depth += opens as isize - closes as isize;
+        if opened && depth <= 0 {
+            return start_idx + offset;
+        }
+    }
+    lines.len().saturating_sub(1)
+}
+
+fn extract_quoted_arg(text: &str) -> Option<String> {
+    let open = text.find('(')?;
+    let rest = text[open + 1..].trim_start();
+    let quote = rest.chars().next().filter(|&c| c == '"' || c == '\'' || c == '`')?;
+    let end = rest[1..].find(quote)?;
+    let name = rest[1..1 + end].trim();
+    (!name.is_empty()).then(|| clip(name, 50))
+}
+
+/// Extract `(test_fn_name, start_line_1based, line_count)` spans for test functions in a source file.
+pub fn extract_test_fn_spans(path: &str, text: &str) -> Vec<(String, usize, usize)> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let lower = path.to_ascii_lowercase();
+    let mut spans = Vec::new();
+
+    if lower.ends_with(".rs") {
+        let mut i = 0;
+        while i < lines.len() {
+            let trimmed = lines[i].trim();
+            if is_rust_test_attr(trimmed) || trimmed == "#[rstest]" || trimmed.starts_with("#[rstest(") {
+                let mut fn_idx = None;
+                for (k, line) in lines.iter().enumerate().skip(i + 1).take(8) {
+                    if extract_rust_fn_name(line).is_some() {
+                        fn_idx = Some(k);
+                        break;
+                    }
+                    let t = line.trim();
+                    if !t.is_empty() && !t.starts_with("#[") && !t.starts_with("//") {
+                        break;
+                    }
+                }
+                if let Some(start) = fn_idx {
+                    let name = extract_rust_fn_name(lines[start]).unwrap_or_else(|| format!("test@L{}", start + 1));
+                    let end = scan_brace_block_end(&lines, start, true);
+                    spans.push((name, start + 1, end - start + 1));
+                    i = end + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    } else if lower.ends_with(".py") {
+        let mut i = 0;
+        while i < lines.len() {
+            let raw = lines[i];
+            let trimmed = raw.trim_start();
+            let indent = raw.len() - trimmed.len();
+            let def_name = trimmed
+                .strip_prefix("def test_")
+                .or_else(|| trimmed.strip_prefix("async def test_"))
+                .and_then(|rest| {
+                    let n: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    (!n.is_empty()).then(|| format!("test_{n}"))
+                });
+            if let Some(name) = def_name {
+                let mut end = i;
+                for (k, line) in lines.iter().enumerate().skip(i + 1) {
+                    let t = line.trim_start();
+                    if t.is_empty() || t.starts_with('#') {
+                        continue;
+                    }
+                    let cur_indent = line.len() - t.len();
+                    if cur_indent <= indent {
+                        break;
+                    }
+                    end = k;
+                }
+                spans.push((name, i + 1, end - i + 1));
+                i = end + 1;
+                continue;
+            }
+            i += 1;
+        }
+    } else if lower.ends_with(".go") {
+        let mut i = 0;
+        while i < lines.len() {
+            let trimmed = lines[i].trim();
+            if let Some(rest) = trimmed.strip_prefix("func Test") {
+                let name_tail: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !name_tail.is_empty() {
+                    let end = scan_brace_block_end(&lines, i, false);
+                    spans.push((format!("Test{name_tail}"), i + 1, end - i + 1));
+                    i = end + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    } else if lower.ends_with(".js")
+        || lower.ends_with(".jsx")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".tsx")
+        || lower.ends_with(".mjs")
+        || lower.ends_with(".cjs")
+        || lower.ends_with(".mts")
+        || lower.ends_with(".cts")
+    {
+        let mut i = 0;
+        while i < lines.len() {
+            let trimmed = lines[i].trim();
+            if (trimmed.starts_with("it(")
+                || trimmed.starts_with("test(")
+                || trimmed.starts_with("Deno.test("))
+                && trimmed.contains('{')
+            {
+                let name = extract_quoted_arg(trimmed).unwrap_or_else(|| format!("test@L{}", i + 1));
+                let end = scan_brace_block_end(&lines, i, false);
+                spans.push((name, i + 1, end - i + 1));
+                i = end + 1;
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    spans
+}
+
+fn reconstruct_new_file_text(file: &DiffFile) -> String {
+    let mut out = String::new();
+    for hunk in &file.hunks {
+        for l in &hunk.lines {
+            if l.kind == DiffLineKind::Add {
+                out.push_str(&l.text);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// Detect size-budget threshold crossings or further growth on touched files.
+/// Only files touched in `files` are checked; already-over files that are untouched or did not grow
+/// are never flagged.
+pub fn detect_size_budget_risks(
+    files: &[DiffFile],
+    risk_cfg: &RiskConfig,
+    snapshots: &BTreeMap<String, (Option<String>, Option<String>)>,
+) -> Vec<RiskItem> {
+    if risk_cfg.disabled.contains("size_budget") || risk_cfg.size_budgets.is_empty() {
+        return Vec::new();
+    }
+    let mut items = Vec::new();
+
+    for file in files {
+        if file.is_deleted || file.is_binary {
+            continue;
+        }
+        let limits = resolve_size_limits(&file.path, &risk_cfg.size_budgets);
+        if limits.max_lines.is_none()
+            && limits.max_test_fn_lines.is_none()
+            && limits.max_tokens.is_none()
+        {
+            continue;
+        }
+
+        let (before_owned, after_owned): (String, String) = match snapshots.get(&file.path) {
+            Some((b_opt, Some(a))) => (b_opt.clone().unwrap_or_default(), a.clone()),
+            _ if file.is_new => (String::new(), reconstruct_new_file_text(file)),
+            _ => continue,
+        };
+
+        let first_line = file
+            .hunks
+            .first()
+            .map(DiffHunk::first_changed_line)
+            .unwrap_or(1);
+        let first_hunk = (!file.hunks.is_empty()).then_some(0);
+        let label_prefix = limits
+            .label
+            .as_deref()
+            .map(|l| format!("{l}："))
+            .unwrap_or_default();
+
+        if let Some(limit) = limits.max_lines {
+            let before_lines = before_owned.lines().count();
+            let after_lines = after_owned.lines().count();
+            if after_lines > limit {
+                if before_lines <= limit {
+                    let reason = if file.is_new || before_lines == 0 {
+                        format!("{label_prefix}新增文件行数超过阈值（{after_lines} 行，阈值 {limit}）")
+                    } else {
+                        format!("{label_prefix}本改动使文件行数跨过阈值（{before_lines}→{after_lines} 行，阈值 {limit}）")
+                    };
+                    items.push(RiskItem {
+                        severity: Severity::Medium,
+                        file: file.path.clone(),
+                        line: first_line,
+                        rule_id: "size_budget".into(),
+                        category: "体量".into(),
+                        source: "规则".into(),
+                        reason,
+                        hunk_index: first_hunk,
+                        file_level: false,
+                        verdict_file: None,
+                    });
+                } else if after_lines > before_lines {
+                    items.push(RiskItem {
+                        severity: Severity::Low,
+                        file: file.path.clone(),
+                        line: first_line,
+                        rule_id: "size_budget".into(),
+                        category: "体量".into(),
+                        source: "规则".into(),
+                        reason: format!(
+                            "{label_prefix}文件已超行数阈值且本改动继续增长（{before_lines}→{after_lines} 行，阈值 {limit}）"
+                        ),
+                        hunk_index: first_hunk,
+                        file_level: false,
+                        verdict_file: None,
+                    });
+                }
+            }
+        }
+
+        if let Some(limit) = limits.max_tokens {
+            let before_toks = estimate_tokens(&before_owned);
+            let after_toks = estimate_tokens(&after_owned);
+            if after_toks > limit {
+                if before_toks <= limit {
+                    let reason = if file.is_new || before_toks == 0 {
+                        format!("{label_prefix}新增文件估算 token 超过预算（~{after_toks} tokens，阈值 {limit}）")
+                    } else {
+                        format!("{label_prefix}本改动使估算 token 跨过预算（~{before_toks}→~{after_toks} tokens，阈值 {limit}）")
+                    };
+                    items.push(RiskItem {
+                        severity: Severity::Medium,
+                        file: file.path.clone(),
+                        line: first_line,
+                        rule_id: "size_budget".into(),
+                        category: "体量".into(),
+                        source: "规则".into(),
+                        reason,
+                        hunk_index: first_hunk,
+                        file_level: false,
+                        verdict_file: None,
+                    });
+                } else if after_toks > before_toks {
+                    items.push(RiskItem {
+                        severity: Severity::Low,
+                        file: file.path.clone(),
+                        line: first_line,
+                        rule_id: "size_budget".into(),
+                        category: "体量".into(),
+                        source: "规则".into(),
+                        reason: format!(
+                            "{label_prefix}估算 token 已超预算且本改动继续增长（~{before_toks}→~{after_toks} tokens，阈值 {limit}）"
+                        ),
+                        hunk_index: first_hunk,
+                        file_level: false,
+                        verdict_file: None,
+                    });
+                }
+            }
+        }
+
+        if let Some(limit) = limits.max_test_fn_lines {
+            let before_spans = extract_test_fn_spans(&file.path, &before_owned);
+            let after_spans = extract_test_fn_spans(&file.path, &after_owned);
+            let mut before_map: BTreeMap<String, usize> = BTreeMap::new();
+            for (name, _, len) in before_spans {
+                before_map
+                    .entry(name)
+                    .and_modify(|cur| *cur = (*cur).max(len))
+                    .or_insert(len);
+            }
+            for (name, start_line, after_len) in after_spans {
+                if after_len <= limit {
+                    continue;
+                }
+                let end_line = start_line + after_len.saturating_sub(1);
+                let hunk_idx = file
+                    .hunks
+                    .iter()
+                    .position(|h| {
+                        let hs = h.new_start.max(1);
+                        let he = hs + h.new_count.max(1);
+                        hs <= end_line && he >= start_line
+                    })
+                    .or(first_hunk);
+                match before_map.get(&name).copied() {
+                    None => {
+                        items.push(RiskItem {
+                            severity: Severity::Medium,
+                            file: file.path.clone(),
+                            line: start_line,
+                            rule_id: "size_budget".into(),
+                            category: "体量".into(),
+                            source: "规则".into(),
+                            reason: format!(
+                                "新增测试函数 {name} 超过行数阈值（{after_len} 行，阈值 {limit}）"
+                            ),
+                            hunk_index: hunk_idx,
+                            file_level: false,
+                            verdict_file: None,
+                        });
+                    }
+                    Some(b_len) if b_len <= limit => {
+                        items.push(RiskItem {
+                            severity: Severity::Medium,
+                            file: file.path.clone(),
+                            line: start_line,
+                            rule_id: "size_budget".into(),
+                            category: "体量".into(),
+                            source: "规则".into(),
+                            reason: format!(
+                                "本改动使测试函数 {name} 跨过行数阈值（{b_len}→{after_len} 行，阈值 {limit}）"
+                            ),
+                            hunk_index: hunk_idx,
+                            file_level: false,
+                            verdict_file: None,
+                        });
+                    }
+                    Some(b_len) if after_len > b_len => {
+                        items.push(RiskItem {
+                            severity: Severity::Low,
+                            file: file.path.clone(),
+                            line: start_line,
+                            rule_id: "size_budget".into(),
+                            category: "体量".into(),
+                            source: "规则".into(),
+                            reason: format!(
+                                "测试函数 {name} 已超行数阈值且本改动继续增长（{b_len}→{after_len} 行，阈值 {limit}）"
+                            ),
+                            hunk_index: hunk_idx,
+                            file_level: false,
+                            verdict_file: None,
+                        });
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+
+    items
+}
+
+fn git_show_file(top: &Path, tree_ref: &str, path: &str) -> Option<String> {
+    if tree_ref.is_empty() || path.is_empty() {
+        return None;
+    }
+    let spec = format!("{tree_ref}:{path}");
+    let bytes = git(top, &["show", &spec]).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn collect_size_snapshots(
+    files: &[DiffFile],
+    risk_cfg: &RiskConfig,
+    tree_refs: Option<&(PathBuf, String, String)>,
+) -> BTreeMap<String, (Option<String>, Option<String>)> {
+    let mut out = BTreeMap::new();
+    if risk_cfg.disabled.contains("size_budget") || risk_cfg.size_budgets.is_empty() {
+        return out;
+    }
+    let Some((top, before_ref, after_ref)) = tree_refs else {
+        return out;
+    };
+    for file in files {
+        if file.is_deleted || file.is_binary {
+            continue;
+        }
+        let limits = resolve_size_limits(&file.path, &risk_cfg.size_budgets);
+        if limits.max_lines.is_none()
+            && limits.max_test_fn_lines.is_none()
+            && limits.max_tokens.is_none()
+        {
+            continue;
+        }
+        let before = if file.is_new {
+            Some(String::new())
+        } else {
+            git_show_file(top, before_ref, &file.path)
+        };
+        let after = git_show_file(top, after_ref, &file.path);
+        out.insert(file.path.clone(), (before, after));
+    }
+    out
+}
+
 /// Parse the reviewer's one-line conclusion from the verdict markdown (after line 1 verdict word).
 pub fn extract_reviewer_conclusion(verdict_text: &str) -> Option<String> {
     for raw in verdict_text.lines().skip(1) {
@@ -2355,13 +3012,17 @@ pub fn fold_remaining_changes(files: &[DiffFile], risky_files: &BTreeSet<String>
         .collect()
 }
 
-/// Resolve the unified diff text for a run (total net diff by default, matching `apply`/`review`).
-pub fn resolve_diff_text(
+struct ResolvedDiff {
+    diff_text: String,
+    tree_refs: Option<(PathBuf, String, String)>,
+}
+
+fn resolve_diff_and_trees(
     run: &Path,
     meta: &Value,
     round_only: bool,
     context_lines: usize,
-) -> Res<String> {
+) -> Res<ResolvedDiff> {
     let archived_patch = |dir: &Path| -> Option<PathBuf> {
         for name in ["applied.patch", "changes.patch"] {
             let p = dir.join(name);
@@ -2374,7 +3035,10 @@ pub fn resolve_diff_text(
 
     if archive::is_record(run) {
         if let Some(p) = archived_patch(run) {
-            return Ok(read(&p));
+            return Ok(ResolvedDiff {
+                diff_text: read(&p),
+                tree_refs: None,
+            });
         }
     }
 
@@ -2402,7 +3066,10 @@ pub fn resolve_diff_text(
             );
             if !missing.is_empty() {
                 if let Some(p) = archived_patch(run) {
-                    return Ok(read(&p));
+                    return Ok(ResolvedDiff {
+                        diff_text: read(&p),
+                        tree_refs: None,
+                    });
                 }
                 return Err(refs::recovery_message(run, &chain_meta, &missing));
             }
@@ -2420,15 +3087,24 @@ pub fn resolve_diff_text(
                     &after,
                 ],
             )?;
-            Ok(String::from_utf8_lossy(&bytes).into_owned())
+            Ok(ResolvedDiff {
+                diff_text: String::from_utf8_lossy(&bytes).into_owned(),
+                tree_refs: Some((top, before, after)),
+            })
         }
         Err(err) => {
             if let Some(p) = archived_patch(run) {
-                return Ok(read(&p));
+                return Ok(ResolvedDiff {
+                    diff_text: read(&p),
+                    tree_refs: None,
+                });
             }
             // If no changes.json (e.g. read-only run or zero changes), return empty diff instead of erroring.
             if !run.join("changes.json").is_file() && s(meta, "mode") == "read-only" {
-                return Ok(String::new());
+                return Ok(ResolvedDiff {
+                    diff_text: String::new(),
+                    tree_refs: None,
+                });
             }
             Err(err)
         }
@@ -2473,13 +3149,18 @@ fn load_effective_configs(meta: &Value) -> (Vec<String>, Vec<String>, Vec<String
     };
     let allowed_rules = strings(&meta["allow"]);
 
-    let risk_cfg = if !meta["riskRules"].is_null() {
+    let mut risk_cfg = if !meta["riskRules"].is_null() {
         parse_risk_config(&meta["riskRules"])
     } else if let Some(cfg) = &repo_cfg {
         parse_risk_config(&cfg["riskRules"])
     } else {
         RiskConfig::default()
     };
+    if !top_str.is_empty() {
+        let mut combined = load_repo_governance_size_budgets(Path::new(top_str));
+        combined.extend(risk_cfg.size_budgets);
+        risk_cfg.size_budgets = combined;
+    }
 
     (controller_paths, protect_rules, allowed_rules, risk_cfg)
 }
@@ -2670,20 +3351,30 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
         }
     };
 
-    let diff_text = resolve_diff_text(run, meta, round_only, 3).unwrap_or_default();
-    let parsed_files = parse_unified_diff(&diff_text);
+    let resolved = resolve_diff_and_trees(run, meta, round_only, 3).unwrap_or(ResolvedDiff {
+        diff_text: String::new(),
+        tree_refs: None,
+    });
+    let parsed_files = parse_unified_diff(&resolved.diff_text);
     let total_files = parsed_files.len();
     let total_added: usize = parsed_files.iter().map(|f| f.added).sum();
     let total_deleted: usize = parsed_files.iter().map(|f| f.deleted).sum();
 
     let (controller_paths, protect_rules, allowed_rules, risk_cfg) = load_effective_configs(meta);
-    let rule_risks = detect_rule_risks(
+    let mut rule_risks = detect_rule_risks(
         &parsed_files,
         &controller_paths,
         &protect_rules,
         &allowed_rules,
         &risk_cfg,
     );
+    let size_snapshots =
+        collect_size_snapshots(&parsed_files, &risk_cfg, resolved.tree_refs.as_ref());
+    rule_risks.extend(detect_size_budget_risks(
+        &parsed_files,
+        &risk_cfg,
+        &size_snapshots,
+    ));
 
     let review_doc = {
         let f = json(run.join("review.json"));
@@ -3380,16 +4071,23 @@ pub fn render_risky_diff(
     round_only: bool,
     filter_paths: &[String],
 ) -> Res<(String, usize)> {
-    let diff_text = resolve_diff_text(run, meta, round_only, DEFAULT_RISKY_CONTEXT_LINES)?;
-    let parsed_files = parse_unified_diff(&diff_text);
+    let resolved = resolve_diff_and_trees(run, meta, round_only, DEFAULT_RISKY_CONTEXT_LINES)?;
+    let parsed_files = parse_unified_diff(&resolved.diff_text);
     let (controller_paths, protect_rules, allowed_rules, risk_cfg) = load_effective_configs(meta);
-    let rule_risks = detect_rule_risks(
+    let mut rule_risks = detect_rule_risks(
         &parsed_files,
         &controller_paths,
         &protect_rules,
         &allowed_rules,
         &risk_cfg,
     );
+    let size_snapshots =
+        collect_size_snapshots(&parsed_files, &risk_cfg, resolved.tree_refs.as_ref());
+    rule_risks.extend(detect_size_budget_risks(
+        &parsed_files,
+        &risk_cfg,
+        &size_snapshots,
+    ));
     let review_doc = {
         let f = json(run.join("review.json"));
         if f.is_object() {
@@ -3690,7 +4388,7 @@ mod tests {
             &RiskConfig::default(),
         );
         let ids: BTreeSet<&str> = risks.iter().map(|r| r.rule_id.as_str()).collect();
-        for expected in BUILTIN_RULE_IDS {
+        for expected in BUILTIN_RULE_IDS.iter().copied().filter(|id| *id != "size_budget") {
             assert!(ids.contains(expected), "missing rule {expected}, got {ids:?}");
         }
     }
@@ -4082,5 +4780,199 @@ mod tests {
             skipped_rendered.contains("补充审查跳过：Claude 池剩余 5 小时 40% / 本周 60%"),
             "{skipped_rendered}"
         );
+    }
+
+    #[test]
+    fn validates_size_budget_risk_rules_schema() {
+        assert!(validate_risk_rules(Some(&json!({
+            "disable": ["size_budget"],
+            "sizeBudgets": [
+                {"paths": ["crates/**/*.rs", "!**/generated/**"], "maxLines": 1000, "maxTestFnLines": 150},
+                {"paths": ["skills/*/SKILL.md"], "maxTokens": 4000, "label": "Skill 预算"}
+            ]
+        })))
+        .is_ok());
+
+        // Missing any limit must fail
+        assert!(validate_risk_rules(Some(&json!({
+            "sizeBudgets": [{"paths": ["src/**/*.rs"]}]
+        })))
+        .is_err());
+
+        // Zero limit must fail
+        assert!(validate_risk_rules(Some(&json!({
+            "sizeBudgets": [{"paths": ["src/**/*.rs"], "maxLines": 0}]
+        })))
+        .is_err());
+
+        // Empty paths must fail
+        assert!(validate_risk_rules(Some(&json!({
+            "sizeBudgets": [{"paths": [], "maxLines": 100}]
+        })))
+        .is_err());
+
+        // Unknown field must fail
+        assert!(validate_risk_rules(Some(&json!({
+            "sizeBudgets": [{"paths": ["src/**/*.rs"], "maxLines": 100, "bogus": true}]
+        })))
+        .is_err());
+    }
+
+    #[test]
+    fn size_budget_flags_crossing_and_growth_but_skips_untouched_or_shrunk() {
+        let cfg = parse_risk_config(&json!({
+            "sizeBudgets": [
+                {"paths": ["src/**/*.rs", "!src/generated.rs"], "maxLines": 10, "maxTestFnLines": 6},
+                {"paths": ["skills/*/SKILL.md"], "maxTokens": 20}
+            ]
+        }));
+
+        let make_diff = |path: &str| -> DiffFile {
+            DiffFile {
+                path: path.into(),
+                header_lines: vec![],
+                hunks: vec![DiffHunk {
+                    header: "@@ -1,2 +1,3 @@".into(),
+                    old_start: 1,
+                    old_count: 2,
+                    new_start: 1,
+                    new_count: 3,
+                    lines: vec![DiffLine {
+                        kind: DiffLineKind::Add,
+                        old_line: None,
+                        new_line: Some(2),
+                        text: "added".into(),
+                    }],
+                    added: 1,
+                    deleted: 0,
+                }],
+                is_new: false,
+                is_deleted: false,
+                is_binary: false,
+                added: 1,
+                deleted: 0,
+            }
+        };
+
+        let files = vec![
+            make_diff("src/cross.rs"),
+            make_diff("src/grew.rs"),
+            make_diff("src/shrunk.rs"),
+            make_diff("src/generated.rs"),
+            make_diff("skills/demo/SKILL.md"),
+            make_diff("src/tests.rs"),
+        ];
+
+        let mut snapshots = BTreeMap::new();
+        // Crossed 9 -> 11 (> 10): Medium
+        snapshots.insert(
+            "src/cross.rs".into(),
+            (Some("a\n".repeat(9)), Some("a\n".repeat(11))),
+        );
+        // Already over 12 -> 14 (> 10 and grew): Low
+        snapshots.insert(
+            "src/grew.rs".into(),
+            (Some("a\n".repeat(12)), Some("a\n".repeat(14))),
+        );
+        // Already over 15 -> 13 (shrunk): NOT flagged
+        snapshots.insert(
+            "src/shrunk.rs".into(),
+            (Some("a\n".repeat(15)), Some("a\n".repeat(13))),
+        );
+        // Excluded by !src/generated.rs: NOT flagged
+        snapshots.insert(
+            "src/generated.rs".into(),
+            (Some("a\n".repeat(5)), Some("a\n".repeat(50))),
+        );
+        // Untouched file in snapshots (not in `files`): NOT flagged
+        snapshots.insert(
+            "src/untouched.rs".into(),
+            (Some("a\n".repeat(50)), Some("a\n".repeat(50))),
+        );
+        // Token budget crossed: 15 CJK chars (15 tokens) -> 25 CJK chars (25 tokens > 20): Medium
+        snapshots.insert(
+            "skills/demo/SKILL.md".into(),
+            (Some("中".repeat(15)), Some("中".repeat(25))),
+        );
+        // Test function: untouched_big stays 8 lines (not flagged), crossed_fn goes 5 -> 8 (Medium)
+        let before_test = "\
+#[test]
+fn untouched_big() {
+    let a = 1;
+    let b = 2;
+    let c = 3;
+    let d = 4;
+    let e = 5;
+    assert_eq!(a + b + c + d + e, 15);
+}
+
+#[test]
+fn crossed_fn() {
+    let x = 1;
+    let y = 2;
+    assert_eq!(x + y, 3);
+}
+";
+        let after_test = "\
+#[test]
+fn untouched_big() {
+    let a = 1;
+    let b = 2;
+    let c = 3;
+    let d = 4;
+    let e = 5;
+    assert_eq!(a + b + c + d + e, 15);
+}
+
+#[test]
+fn crossed_fn() {
+    let x = 1;
+    let y = 2;
+    let z = 3;
+    let w = 4;
+    let v = 5;
+    assert_eq!(x + y + z + w + v, 15);
+}
+";
+        snapshots.insert(
+            "src/tests.rs".into(),
+            (Some(before_test.into()), Some(after_test.into())),
+        );
+
+        let risks = detect_size_budget_risks(&files, &cfg, &snapshots);
+
+        let cross = risks
+            .iter()
+            .find(|r| r.file == "src/cross.rs")
+            .expect("cross.rs should be flagged");
+        assert_eq!(cross.severity, Severity::Medium);
+        assert_eq!(cross.category, "体量");
+        assert!(cross.reason.contains("跨过阈值"), "{}", cross.reason);
+
+        let grew = risks
+            .iter()
+            .find(|r| r.file == "src/grew.rs")
+            .expect("grew.rs should be flagged");
+        assert_eq!(grew.severity, Severity::Low);
+        assert!(grew.reason.contains("继续增长"), "{}", grew.reason);
+
+        assert!(!risks.iter().any(|r| r.file == "src/shrunk.rs"));
+        assert!(!risks.iter().any(|r| r.file == "src/generated.rs"));
+        assert!(!risks.iter().any(|r| r.file == "src/untouched.rs"));
+
+        let skill = risks
+            .iter()
+            .find(|r| r.file == "skills/demo/SKILL.md")
+            .expect("SKILL.md token crossing should be flagged");
+        assert_eq!(skill.severity, Severity::Medium);
+        assert!(skill.reason.contains("跨过预算"), "{}", skill.reason);
+
+        let test_fn_risks: Vec<&RiskItem> = risks
+            .iter()
+            .filter(|r| r.file == "src/tests.rs" && r.reason.contains("测试函数"))
+            .collect();
+        assert_eq!(test_fn_risks.len(), 1, "{test_fn_risks:?}");
+        assert!(test_fn_risks[0].reason.contains("crossed_fn"));
+        assert_eq!(test_fn_risks[0].severity, Severity::Medium);
     }
 }

@@ -436,6 +436,55 @@ class ScriptTests(unittest.TestCase):
         (repository / "README.md").write_text("# Empty index\n")
         self.assertIn("missing skill index", self.run_script(check).stderr)
 
+    def test_check_budget_overage_warns_and_exits_zero_unless_strict(self):
+        repository = self.work / "budget-repo"
+        (repository / "scripts").mkdir(parents=True)
+        shutil.copy2(CHECK, repository / "scripts/check.sh")
+        gov_scripts = repository / "skills/repo-governance/scripts"
+        gov_scripts.mkdir(parents=True)
+        shutil.copy2(AUDIT, gov_scripts / "audit-context.py")
+        (repository / "evals").mkdir()
+        (repository / "evals/repo-governance.md").write_text("# repo-governance\n")
+        (repository / "README.md").write_text(
+            "| **`repo-governance`** | `skills/repo-governance/` | gov |\n"
+        )
+        (repository / ".repo-governance.json").write_text(
+            json.dumps({"budgets": {"skills/*/SKILL.md": 10}})
+        )
+        skill_file = repository / "skills/repo-governance/SKILL.md"
+        skill_file.write_text(
+            "---\nname: repo-governance\n"
+            "description: 测试时使用。Use when testing.\n"
+            "metadata:\n  version: \"1.0.0\"\n---\n\n"
+            + ("超出预算的内容测试。" * 20) + "\n",
+            encoding="utf-8",
+        )
+        check = repository / "scripts/check.sh"
+
+        # Default: budget overage prints WARN but exits 0.
+        advisory = self.run_script(check)
+        self.assertEqual(advisory.returncode, 0, advisory.stdout + advisory.stderr)
+        self.assertIn("WARN skills/repo-governance/SKILL.md", advisory.stdout)
+
+        # --strict flag: fails with exit 1.
+        strict_flag = self.run_script(check, "--strict")
+        self.assertNotEqual(strict_flag.returncode, 0, strict_flag.stdout)
+        self.assertIn("WARN skills/repo-governance/SKILL.md", strict_flag.stdout)
+
+        # AIA_SKILLS_STRICT_BUDGET=1 env var: fails with exit 1.
+        strict_env = self.run_script(check, env={**os.environ, "AIA_SKILLS_STRICT_BUDGET": "1"})
+        self.assertNotEqual(strict_env.returncode, 0, strict_env.stdout)
+        self.assertIn("WARN skills/repo-governance/SKILL.md", strict_env.stdout)
+
+        # True correctness error (broken link) still fails in default mode.
+        skill_file.write_text(
+            skill_file.read_text(encoding="utf-8") + "\n[broken](missing.md)\n",
+            encoding="utf-8",
+        )
+        broken = self.run_script(check)
+        self.assertNotEqual(broken.returncode, 0)
+        self.assertIn("broken link", broken.stderr)
+
     def test_verify_runs_gates_in_order_and_stops_on_failure(self):
         repo = self.work / "gate"
         (repo / "scripts").mkdir(parents=True)

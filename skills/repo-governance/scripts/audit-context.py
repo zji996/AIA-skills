@@ -87,7 +87,9 @@ def budgeted_files(repo, config, entry_limit, current_limit):
         yield name, kind, estimate_tokens((repo / name).read_text(encoding="utf-8", errors="replace")), limit
 
 
-def selected_kinds(parser, value, option):
+def selected_kinds(parser, value, option, allow_none=False):
+    if allow_none and value.strip().lower() == "none":
+        return set()
     kinds = set(KINDS) if value == "all" else {kind.strip() for kind in value.split(",") if kind.strip()}
     unknown = kinds - set(KINDS)
     if not kinds or unknown:
@@ -194,7 +196,7 @@ def main():
     parser.add_argument("--max-dated-items", type=int)
     parser.add_argument("--report", action="store_true", help="show token budgets and exit 0")
     parser.add_argument("--only", default="all", help=f"run only these comma-separated kinds: {','.join(KINDS)}")
-    parser.add_argument("--fail-on", default="all", help="comma-separated kinds that set exit 1: "
+    parser.add_argument("--fail-on", default="all", help="comma-separated kinds that set exit 1, or 'none': "
                         f"{','.join(KINDS)} (default: all; others are still printed)")
     args = parser.parse_args()
     for flag, limit in (("--max-entry-tokens", args.max_entry_tokens),
@@ -217,7 +219,7 @@ def main():
         print(f"ERROR {exc}", file=sys.stderr)
         return 2
     only = selected_kinds(parser, args.only, "--only")
-    fail_on = selected_kinds(parser, args.fail_on, "--fail-on")
+    fail_on = selected_kinds(parser, args.fail_on, "--fail-on", allow_none=True)
     if args.report:
         for name, _kind, tokens, limit in sorted(budget_rows, key=lambda row: (-row[2] / row[3], row[0])):
             print(f"{name}: ~{tokens} tokens / {limit} ({tokens / limit:.0%})")

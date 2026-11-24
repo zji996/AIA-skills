@@ -2,6 +2,19 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+strict_budget=0
+case "${AIA_SKILLS_STRICT_BUDGET:-0}" in
+  1|true|TRUE|yes|YES) strict_budget=1 ;;
+esac
+for arg in "$@"; do
+  case "$arg" in
+    --strict|--strict-budget) strict_budget=1 ;;
+    *)
+      echo "Unknown option: $arg (supported: --strict)" >&2
+      exit 2
+      ;;
+  esac
+done
 echo "=== Checking AIA-skills repository ==="
 
 if ! python3 - "$REPO_ROOT" <<'PY'
@@ -99,7 +112,11 @@ fi
 
 audit="$REPO_ROOT/skills/repo-governance/scripts/audit-context.py"
 if [ -f "$audit" ]; then
-  python3 "$audit" --repo "$REPO_ROOT" --only budget --fail-on budget
+  if [ "$strict_budget" -eq 1 ]; then
+    python3 "$audit" --repo "$REPO_ROOT" --only budget --fail-on budget
+  else
+    python3 "$audit" --repo "$REPO_ROOT" --only budget --fail-on none
+  fi
 fi
 
 # Unresolved merge conflict markers (apply --merge leaves them in any text file).

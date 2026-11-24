@@ -572,6 +572,70 @@ class Delegate634Tests(unittest.TestCase):
         self.assertEqual(ran.count("rust-fast"), 2, f"rust-fast must rerun on rust rework: {ran}")
         self.assertIn("web", st["accept"].get("reusedLayers", []), st["accept"])
 
+    def test_size_budget_risk_flags_crossing_and_ignores_untouched(self):
+        repo = self.repo({
+            ".delegate.json": json.dumps({
+                "accept": "true",
+                "riskRules": {
+                    "sizeBudgets": [
+                        {"paths": ["src/**/*.rs"], "maxLines": 10, "maxTestFnLines": 6},
+                    ],
+                },
+            }),
+            ".repo-governance.json": json.dumps({
+                "budgets": {
+                    "skills/*/SKILL.md": 20,
+                },
+            }),
+            "src/already_huge_untouched.rs": "".join(f"fn f{i}() {{}}\n" for i in range(30)),
+            "src/cross.rs": "".join(f"fn c{i}() {{}}\n" for i in range(9)),
+            "src/shrunk.rs": "".join(f"fn s{i}() {{}}\n" for i in range(15)),
+            "src/unit_tests.rs": (
+                "#[test]\nfn untouched_big() {\n"
+                "    let a = 1;\n    let b = 2;\n    let c = 3;\n    let d = 4;\n"
+                "    assert_eq!(a + b + c + d, 10);\n}\n\n"
+                "#[test]\nfn small_test() {\n    let x = 1;\n    assert_eq!(x, 1);\n}\n"
+            ),
+            "skills/demo/SKILL.md": "中" * 15 + "\n",
+        })
+
+        # Touch cross.rs (9 -> 12 lines), shrunk.rs (15 -> 12 lines),
+        # unit_tests.rs (small_test 4 -> 8 lines, untouched_big unchanged at 7 lines),
+        # skills/demo/SKILL.md (15 -> 26 tokens); leave already_huge_untouched.rs untouched.
+        self.install_scripted_pi(
+            "Path('src/cross.rs').write_text(''.join(f'fn c{i}() {{}}\\n' for i in range(12)))\n"
+            "Path('src/shrunk.rs').write_text(''.join(f'fn s{i}() {{}}\\n' for i in range(12)))\n"
+            "Path('src/unit_tests.rs').write_text(\n"
+            "    '#[test]\\nfn untouched_big() {\\n'\n"
+            "    '    let a = 1;\\n    let b = 2;\\n    let c = 3;\\n    let d = 4;\\n'\n"
+            "    '    assert_eq!(a + b + c + d, 10);\\n}\\n\\n'\n"
+            "    '#[test]\\nfn small_test() {\\n'\n"
+            "    '    let x = 1;\\n    let y = 2;\\n    let z = 3;\\n    let w = 4;\\n'\n"
+            "    '    let v = 5;\\n    assert_eq!(x + y + z + w + v, 15);\\n}\\n'\n"
+            ")\n"
+            "Path('skills/demo/SKILL.md').write_text('中' * 26 + '\\n', encoding='utf-8')\n"
+            "emit_answer('updated size test files')\n"
+        )
+        st = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "size-budget", "bump files"))
+        self.assertEqual(st["state"], "delivered")
+
+        card = json.loads(self.cli("card", st["run"], "--json", cwd=repo).stdout)
+        size_risks = [r for r in card["risks"] if r["rule"] == "size_budget"]
+        risk_files = {r["file"] for r in size_risks}
+        self.assertIn("src/cross.rs", risk_files, size_risks)
+        self.assertIn("skills/demo/SKILL.md", risk_files, size_risks)
+        self.assertIn("src/unit_tests.rs", risk_files, size_risks)
+        self.assertNotIn("src/already_huge_untouched.rs", risk_files, size_risks)
+        self.assertNotIn("src/shrunk.rs", risk_files, size_risks)
+
+        test_fn_risks = [r for r in size_risks if r["file"] == "src/unit_tests.rs" and "测试函数" in r["reason"]]
+        self.assertEqual(len(test_fn_risks), 1, test_fn_risks)
+        self.assertIn("small_test", test_fn_risks[0]["reason"])
+        self.assertEqual(test_fn_risks[0]["severity"], "medium")
+
+        human = self.cli("card", st["run"], human=True, cwd=repo).stdout
+        self.assertIn("体量", human)
+
 
 if __name__ == "__main__":
     unittest.main()

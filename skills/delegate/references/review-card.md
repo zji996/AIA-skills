@@ -16,7 +16,7 @@
 
 ## 风险规则（内置 + `.delegate.json` `riskRules`）
 
-内置 9 类确定性规则（均由宿主基于 diff 计算）：
+内置 10 类确定性规则（均由宿主基于 diff 计算）：
 1. `model_visible`（模型可见文字，高）：沿用 `controllerReviewPaths`。
 2. `migration_schema`（迁移/Schema，高）：`migrations/**`、`*.sql`、`schema.*`、`*.proto`、`*.graphql` 或 SQL DDL。
 3. `weakened_test`（测试减弱，高）：删除测试文件/测试定义、净删减断言或按语言与语法识别新增跳过标记（Rust `#[ignore]`、Python `@pytest.mark.skip`/`@unittest.skip`、JS/TS `it.skip`/`xit(`、Go `t.Skip`，不误命 `sys.exit`）。
@@ -26,6 +26,7 @@
 7. `concurrency_unsafe`（锁/并发/unsafe，高/中）：`unsafe`、`Mutex`/`RwLock`/`flock`/原子或线程原语。
 8. `secret_internal`（敏感信息/内网，严重）：私钥、常见 Token/硬编码凭据、内网 IP 或内网主机名。
 9. `large_deletion`（大段删除，中）：单 hunk 删除 ≥40 行且净删明显，或整文件删除。
+10. `size_budget`（体量，中/低）：比对改动前后文件总行数（`maxLines`）、单测试函数行数（`maxTestFnLines`）与估算 token（`maxTokens`，自动读取目标仓 `.repo-governance.json` `budgets` 并可由 `.delegate.json` `riskRules.sizeBudgets` 覆盖或补充）；**仅在本次改动使文件或测试函数跨过阈值（中）或已超且继续增长（低）时标出**，已超但未碰或缩小的不标。
 
 仓库可在 `.delegate.json` 配 `riskRules` 定制：
 
@@ -34,6 +35,10 @@
   "riskRules": {
     "disable": ["config_constant"],
     "largeDeletionLines": 50,
+    "sizeBudgets": [
+      {"paths": ["crates/**/*.rs", "!**/generated/**"], "maxLines": 1000, "maxTestFnLines": 150},
+      {"paths": ["skills/*/SKILL.md"], "maxTokens": 4000}
+    ],
     "extra": [
       {
         "id": "sandbox_policy",
