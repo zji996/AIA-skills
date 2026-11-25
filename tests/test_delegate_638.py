@@ -105,7 +105,13 @@ class Delegate638AgyAccountsTests(unittest.TestCase):
             "XDG_STATE_HOME": str(self.home / ".local/state"),
             "XDG_CACHE_HOME": str(self.home / ".cache"),
         }
-        for k in ("DELEGATE_AGY_BIN", "DELEGATE_RUNS", "PI_DELEGATE_RUNS"):
+        for k in (
+            "DELEGATE_AGY_BIN",
+            "DELEGATE_AGY_REAL_HOME",
+            "DELEGATE_AGY_ACCOUNT",
+            "DELEGATE_RUNS",
+            "PI_DELEGATE_RUNS",
+        ):
             self.env.pop(k, None)
 
     def tearDown(self):

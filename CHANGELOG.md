@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `delegate`：agy 同事的 run 不再把临时 HOME 留在 sccache 等常驻进程里（`AgyCredOverlay::apply_env` 在父进程未设置时将 `RUSTUP_HOME`/`CARGO_HOME`/`XDG_DATA_HOME` 锚定到真实 HOME，仅 `HOME` 与 `XDG_CONFIG_HOME` 留在临时目录；`agy account add` 与 `/usage` 隔离临时 HOME 亦补锚 `RUSTUP_HOME`/`CARGO_HOME`）。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
 
 ## delegate 6.45.0 - 2026-11-25

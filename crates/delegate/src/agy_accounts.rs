@@ -821,9 +821,18 @@ fn quota_timeout_secs() -> u64 {
         .unwrap_or(DEFAULT_QUOTA_TIMEOUT_SECS)
 }
 
+fn preserve_real_toolchain_envs(cmd: &mut Command, real_home: &Path) {
+    for (key, rel) in [("RUSTUP_HOME", ".rustup"), ("CARGO_HOME", ".cargo")] {
+        if env::var_os(key).is_none_or(|v| v.is_empty()) {
+            cmd.env(key, real_home.join(rel));
+        }
+    }
+}
+
 fn run_agy_usage_cmd(
     agy_bin: &Path,
     target_home: &Path,
+    real_home: &Path,
     isolated_temp_home: bool,
     timeout_secs: u64,
 ) -> Result<String, String> {
@@ -838,6 +847,7 @@ fn run_agy_usage_cmd(
             .env("XDG_CONFIG_HOME", target_home.join(".config"))
             .env("XDG_CACHE_HOME", target_home.join(".cache"))
             .env("XDG_STATE_HOME", target_home.join(".local/state"));
+        preserve_real_toolchain_envs(&mut cmd, real_home);
     }
     let mut child = cmd
         .spawn()
@@ -932,7 +942,7 @@ fn fetch_quota_for_slot(
     timeout_secs: u64,
 ) -> SlotQuotaFetch {
     if use_real_home {
-        return match run_agy_usage_cmd(agy_bin, real_home, false, timeout_secs) {
+        return match run_agy_usage_cmd(agy_bin, real_home, real_home, false, timeout_secs) {
             Ok(stdout) => SlotQuotaFetch {
                 id: id.to_string(),
                 ok: true,
@@ -992,7 +1002,7 @@ fn fetch_quota_for_slot(
         before.insert(cf.slot_name, bytes);
     }
 
-    let run_res = run_agy_usage_cmd(agy_bin, &temp_home.path, true, timeout_secs);
+    let run_res = run_agy_usage_cmd(agy_bin, &temp_home.path, real_home, true, timeout_secs);
 
     // Check if any credential files under temp HOME (e.g. ~/.gemini/*) were refreshed.
     let mut refreshed: Vec<(&'static str, Vec<u8>)> = Vec::new();
@@ -1758,15 +1768,30 @@ impl AgyCredOverlay {
     }
 
     pub fn apply_env(&self, cmd: &mut Command) {
+        self.apply_env_with(cmd, |k| env::var_os(k));
+    }
+
+    fn apply_env_with<F>(&self, cmd: &mut Command, get_env: F)
+    where
+        F: Fn(&str) -> Option<std::ffi::OsString>,
+    {
         cmd.env("HOME", &self.temp_home.path)
             .env("XDG_CONFIG_HOME", self.temp_home.path.join(".config"))
             .env("DELEGATE_AGY_REAL_HOME", &self.real_home)
             .env("DELEGATE_AGY_ACCOUNT", &self.account_id);
-        if env::var_os("XDG_STATE_HOME").is_none_or(|v| v.is_empty()) {
-            cmd.env("XDG_STATE_HOME", self.real_home.join(".local/state"));
-        }
-        if env::var_os("XDG_CACHE_HOME").is_none_or(|v| v.is_empty()) {
-            cmd.env("XDG_CACHE_HOME", self.real_home.join(".cache"));
+        // Keep non-credential XDG paths and Rust toolchain homes anchored to real_home
+        // so long-lived daemons (e.g. sccache) spawned by child runs never cache paths
+        // under the ephemeral overlay HOME that TempHome::drop removes on exit.
+        for (key, rel) in [
+            ("XDG_STATE_HOME", ".local/state"),
+            ("XDG_CACHE_HOME", ".cache"),
+            ("XDG_DATA_HOME", ".local/share"),
+            ("RUSTUP_HOME", ".rustup"),
+            ("CARGO_HOME", ".cargo"),
+        ] {
+            if get_env(key).is_none_or(|v| v.is_empty()) {
+                cmd.env(key, self.real_home.join(rel));
+            }
         }
     }
 
@@ -2227,6 +2252,7 @@ fn cmd_add(args: &[String]) -> Res<i32> {
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    preserve_real_toolchain_envs(&mut cmd, &real_home);
     let status = cmd
         .status()
         .map_err(|e| format!("failed to run {}: {e}", agy_bin.display()))?;
@@ -3605,11 +3631,131 @@ BadRow\tWeekly Limit Remaining\tnot-a-pct\t2026-11-30T00:00:00Z
             "/repo/.local/run/delegate/20261125-112949-org-step4-signup/review/round-1",
         );
         let (rdir2, role2, round2) = parse_delegate_run_dir(rev);
-        assert_eq!(
-            rdir2,
-            Path::new("/repo/.local/run/delegate/20261125-112949-org-step4-signup")
-        );
+        assert_eq!(rdir2, Path::new("/repo/.local/run/delegate/20261125-112949-org-step4-signup"));
         assert_eq!(role2.as_deref(), Some("reviewer"));
         assert_eq!(round2.as_deref(), Some("round-1"));
+    }
+
+    #[test]
+    fn cred_overlay_apply_env_anchors_toolchain_and_xdg_data_to_real_home() {
+        let base = TempHome::create().unwrap();
+        let real_home = base.path.join("home");
+        let real_cfg = real_home.join(".config");
+        let root = real_cfg.join("delegate/agy-accounts");
+        fs::create_dir_all(real_home.join(".gemini/antigravity-cli")).unwrap();
+
+        let alpha_slot = slot_dir(&root, "alpha");
+        ensure_dir_mode(&alpha_slot, 0o700).unwrap();
+        let alpha_v1 = make_test_token_json("alpha@example.test", "ALPHA-V1", "2026-11-25T10:00:00Z");
+        write_secret_0600(&alpha_slot.join("antigravity-cli-oauth-token"), &alpha_v1, true).unwrap();
+        install_slot_to_home(&alpha_slot, &real_home).unwrap();
+        save_state(
+            &root,
+            &json!({
+                "schemaVersion": SCHEMA_VERSION,
+                "active": "alpha",
+                "accounts": {
+                    "alpha": {"id": "alpha", "email": "alpha@example.test"}
+                }
+            }),
+        )
+        .unwrap();
+
+        let (_, overlay_opt) =
+            AgyCredOverlay::prepare_active_for(&root, &real_home, &real_cfg).unwrap();
+        let overlay = overlay_opt.expect("overlay should be created");
+        let ov_path = overlay.overlay_home().to_path_buf();
+        assert_ne!(ov_path, real_home);
+
+        let collect_envs = |cmd: &Command| -> BTreeMap<String, Option<PathBuf>> {
+            cmd.get_envs()
+                .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(PathBuf::from)))
+                .collect()
+        };
+
+        // 1. When parent env is unset or empty, toolchain & non-credential XDG paths anchor to real_home.
+        let mut cmd_unset = Command::new("true");
+        overlay.apply_env_with(&mut cmd_unset, |k| {
+            if k == "CARGO_HOME" {
+                Some(std::ffi::OsString::new())
+            } else {
+                None
+            }
+        });
+        let envs_unset = collect_envs(&cmd_unset);
+        assert_eq!(envs_unset.get("HOME").and_then(Option::as_deref), Some(ov_path.as_path()));
+        assert_eq!(
+            envs_unset.get("XDG_CONFIG_HOME").and_then(Option::as_deref),
+            Some(ov_path.join(".config").as_path())
+        );
+        for (key, rel) in [
+            ("RUSTUP_HOME", ".rustup"),
+            ("CARGO_HOME", ".cargo"),
+            ("XDG_DATA_HOME", ".local/share"),
+            ("XDG_STATE_HOME", ".local/state"),
+            ("XDG_CACHE_HOME", ".cache"),
+        ] {
+            let val = envs_unset
+                .get(key)
+                .and_then(Option::as_deref)
+                .unwrap_or_else(|| panic!("{key} should be set when parent env is unset/empty"));
+            assert_eq!(val, real_home.join(rel).as_path(), "{key} must point to real_home/{rel}");
+            assert!(
+                !val.starts_with(&ov_path),
+                "{key} ({}) must not point inside temporary overlay HOME ({})",
+                val.display(),
+                ov_path.display()
+            );
+        }
+
+        // 2. When parent env already sets these variables, apply_env preserves parent values.
+        let mut cmd_preset = Command::new("true");
+        overlay.apply_env_with(&mut cmd_preset, |k| {
+            Some(std::ffi::OsString::from(format!("/custom/{k}")))
+        });
+        let envs_preset = collect_envs(&cmd_preset);
+        assert_eq!(envs_preset.get("HOME").and_then(Option::as_deref), Some(ov_path.as_path()));
+        assert_eq!(
+            envs_preset.get("XDG_CONFIG_HOME").and_then(Option::as_deref),
+            Some(ov_path.join(".config").as_path())
+        );
+        for key in [
+            "RUSTUP_HOME",
+            "CARGO_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+        ] {
+            assert!(
+                !envs_preset.contains_key(key),
+                "{key} should not be overridden when already set in parent env"
+            );
+        }
+
+        // 3. Real apply_env delegates consistently against the live process environment.
+        let mut cmd_live = Command::new("true");
+        overlay.apply_env(&mut cmd_live);
+        let envs_live = collect_envs(&cmd_live);
+        assert_eq!(envs_live.get("HOME").and_then(Option::as_deref), Some(ov_path.as_path()));
+        assert_eq!(
+            envs_live.get("XDG_CONFIG_HOME").and_then(Option::as_deref),
+            Some(ov_path.join(".config").as_path())
+        );
+        for (key, rel) in [
+            ("RUSTUP_HOME", ".rustup"),
+            ("CARGO_HOME", ".cargo"),
+            ("XDG_DATA_HOME", ".local/share"),
+        ] {
+            if env::var_os(key).is_none_or(|v| v.is_empty()) {
+                let val = envs_live
+                    .get(key)
+                    .and_then(Option::as_deref)
+                    .unwrap_or_else(|| panic!("{key} should be set by apply_env"));
+                assert_eq!(val, real_home.join(rel).as_path());
+                assert!(!val.starts_with(&ov_path));
+            } else {
+                assert!(!envs_live.contains_key(key));
+            }
+        }
     }
 }
