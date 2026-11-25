@@ -222,6 +222,9 @@ pub struct App {
     pub overview_scroll: usize,
     pub overview_bar_mode: OverviewBarMode,
     pub quota_refreshing: bool,
+    pub quota_last_error: Option<String>,
+    pub show_lane_events: bool,
+    pub hidden_lane_events: usize,
     pub work_rows: Vec<WorkRow>,
     pub selected_work_row: Option<usize>,
     pub work_scroll_line: usize,
@@ -278,6 +281,9 @@ impl App {
             overview_scroll: 0,
             overview_bar_mode: OverviewBarMode::Purpose,
             quota_refreshing: false,
+            quota_last_error: None,
+            show_lane_events: false,
+            hidden_lane_events: 0,
             work_rows: Vec::new(),
             selected_work_row: None,
             work_scroll_line: 0,
@@ -405,6 +411,7 @@ impl App {
                                 let newest_ago = stale
                                     .iter()
                                     .map(|&i| repo.runs[i].last_activity_seconds())
+                                    .filter(|&s| s != u64::MAX)
                                     .min();
                                 rows.push(ListRow::ToggleFold {
                                     repo_idx,
@@ -427,6 +434,7 @@ impl App {
                             let newest_ago = stale
                                 .iter()
                                 .map(|&i| repo.runs[i].last_activity_seconds())
+                                .filter(|&s| s != u64::MAX)
                                 .min();
                             rows.push(ListRow::ToggleFold {
                                 repo_idx,
@@ -463,6 +471,7 @@ impl App {
                         let newest_ago = idxs
                             .iter()
                             .map(|&i| repo.runs[i].last_activity_seconds())
+                            .filter(|&s| s != u64::MAX)
                             .min();
                         rows.push(ListRow::ToggleFold {
                             repo_idx,
@@ -501,15 +510,30 @@ impl App {
         self.rows = rows;
 
         // Rebuild filtered events list and keep follow cursor synced.
+        // Hide noisy `lane_acquired`/`lane_released` events by default unless toggled on (`l`)
+        // or explicitly searched for in `/`.
         let prev_event_seq = self.selected_event_item().map(|e| e.seq);
+        let include_lane = self.show_lane_events
+            || query.contains("lane")
+            || query.contains("占槽")
+            || query.contains("放槽");
+        let mut hidden_lane = 0usize;
         self.filtered_events = self
             .snapshot
             .events
             .iter()
             .enumerate()
-            .filter(|(_, ev)| ev.matches_filter(&query))
+            .filter(|(_, ev)| {
+                let is_lane = matches!(ev.kind.as_str(), "lane_acquired" | "lane_released");
+                if is_lane && !include_lane {
+                    hidden_lane += 1;
+                    return false;
+                }
+                ev.matches_filter(&query)
+            })
             .map(|(i, _)| i)
             .collect();
+        self.hidden_lane_events = hidden_lane;
         if self.filtered_events.is_empty() {
             self.selected_event = None;
             self.events_scroll = 0;
@@ -867,10 +891,12 @@ impl App {
             if roots.is_empty() {
                 continue;
             }
+            let header_idx = rows.len();
             rows.push(WorkRow::GroupHeader {
                 bucket,
                 count: roots.len(),
             });
+            let before_emitted = emitted.len();
             for root in roots {
                 emit_work_subtree(
                     root,
@@ -882,6 +908,10 @@ impl App {
                     &mut emitted,
                     &mut rows,
                 );
+            }
+            let emitted_in_bucket = emitted.len().saturating_sub(before_emitted);
+            if let Some(WorkRow::GroupHeader { count, .. }) = rows.get_mut(header_idx) {
+                *count = emitted_in_bucket;
             }
         }
 
@@ -1805,6 +1835,13 @@ impl App {
                     self.selected_event = Some(self.filtered_events.len() - 1);
                     self.detail_scroll = 0;
                 }
+                self.dirty = true;
+                return AppAction::Redraw;
+            }
+            KeyCode::Char('l') if self.tab == ViewTab::Events => {
+                self.show_lane_events = !self.show_lane_events;
+                self.rebuild_rows(None);
+                self.detail_scroll = 0;
                 self.dirty = true;
                 return AppAction::Redraw;
             }

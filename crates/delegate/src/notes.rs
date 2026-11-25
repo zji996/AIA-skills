@@ -468,6 +468,10 @@ pub fn pending_count_for_run(run: &Path) -> usize {
 /// Return chains stored in `work.jsonl` that still have pending notes and have no
 /// remaining run directory in `all`.
 pub fn cleaned_pending_chains(all: &[PathBuf]) -> Vec<ChainNotes> {
+    cleaned_pending_chains_for_root(&runs_root(), all)
+}
+
+pub fn cleaned_pending_chains_for_root(root: &Path, all: &[PathBuf]) -> Vec<ChainNotes> {
     if !crate::work::any_notes_exist() {
         return Vec::new();
     }
@@ -476,7 +480,7 @@ pub fn cleaned_pending_chains(all: &[PathBuf]) -> Vec<ChainNotes> {
         .map(|p| run_id(p, &json(p.join("meta.json"))))
         .filter(|id| !id.is_empty())
         .collect();
-    crate::work::note_chains_for_current_root(all)
+    crate::work::note_chains_for_root(root, all)
         .into_iter()
         .filter(|c| {
             c.pending_count() > 0

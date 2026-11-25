@@ -1423,6 +1423,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::zombie_processes)] // Reaped directly via raw wait4_blocking(pid) below.
     fn wait4_records_child_tree_cpu_seconds_and_rss() {
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
         let started = Instant::now();

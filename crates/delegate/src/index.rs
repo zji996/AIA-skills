@@ -552,8 +552,9 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
                     st[key] = idx_meta[key].clone();
                 }
             }
-            if !run.join(".generate-pending").exists()
-                && (b(&idx_meta, "appliedCleaned") || !s(&st, "appliedAt").is_empty())
+            if runs::is_applied_marker(run)
+                || (!run.join(".generate-pending").exists()
+                    && (b(&idx_meta, "appliedCleaned") || !s(&st, "appliedAt").is_empty()))
             {
                 st["applied"] = json!(true);
             }
@@ -570,7 +571,8 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
             precomputed_statuses.insert(run.clone(), st.clone());
             run_pairs.push((run.clone(), st));
         }
-        let cleaned_notes: Vec<Value> = crate::notes::cleaned_pending_chains(&run_dirs)
+        let cleaned_notes: Vec<Value> =
+            crate::notes::cleaned_pending_chains_for_root(&runs_dir, &run_dirs)
             .into_iter()
             .map(|c| crate::output::cleaned_note_json(&c))
             .collect();

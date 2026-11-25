@@ -674,6 +674,22 @@ pub fn next_step(
 }
 /// Zero-lock, zero-side-effect run status (does not run `detect_applied` writes or `git cat-file`
 /// object probes unless `check_missing_objects` is explicitly enabled for single-run inspection).
+/// True if the run has a completed `.applied` marker.
+/// An in-progress `delegate apply` writes `.generate-pending` before generation finishes,
+/// which normally suppresses `applied`; however, explicit `mark-applied` (`appliedBy: "manual"`)
+/// or `detect_applied` (`appliedBy: "detected"`) always counts as applied even if a stale
+/// `.generate-pending` file remained from an earlier failed `delegate apply`.
+pub fn is_applied_marker(run: &Path) -> bool {
+    let marker = run.join(".applied");
+    if !marker.exists() {
+        return false;
+    }
+    if !run.join(".generate-pending").exists() {
+        return true;
+    }
+    matches!(s(&json(&marker), "appliedBy"), "manual" | "detected")
+}
+
 pub fn status(run: &Path) -> Value {
     status_with_opts(run, false)
 }
@@ -731,7 +747,7 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
     if !s(&meta, "modelName").is_empty() {
         out["modelName"] = meta["modelName"].clone();
     }
-    if run.join(".applied").exists() && !run.join(".generate-pending").exists() {
+    if is_applied_marker(run) {
         out["applied"] = json!(true);
         out["appliedBy"] = json!(json(run.join(".applied"))["appliedBy"]
             .as_str()
@@ -1953,6 +1969,39 @@ mod agy_conversation_tests {
         let single = collect_result_rounds(&r2, false);
         assert_eq!(single.len(), 1);
         assert_eq!(single[0].path, r2.join("result.md"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn is_applied_marker_accepts_manual_and_detected_even_with_stale_generate_pending() {
+        let base = std::env::temp_dir().join(format!(
+            "delegate-applied-marker-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        // No marker -> false
+        assert!(!is_applied_marker(&base));
+
+        // Normal delegate apply with .generate-pending -> false (still pending generate)
+        fs::write(base.join(".applied"), r#"{"appliedBy":"delegate"}"#).unwrap();
+        fs::write(base.join(".generate-pending"), "pending\n").unwrap();
+        assert!(!is_applied_marker(&base));
+
+        // Manual mark-applied with stale .generate-pending -> true
+        fs::write(base.join(".applied"), r#"{"appliedBy":"manual"}"#).unwrap();
+        assert!(is_applied_marker(&base));
+
+        // Detected applied with stale .generate-pending -> true
+        fs::write(base.join(".applied"), r#"{"appliedBy":"detected"}"#).unwrap();
+        assert!(is_applied_marker(&base));
+
+        // Normal delegate apply once .generate-pending is removed -> true
+        fs::remove_file(base.join(".generate-pending")).unwrap();
+        fs::write(base.join(".applied"), r#"{"appliedBy":"delegate"}"#).unwrap();
+        assert!(is_applied_marker(&base));
 
         let _ = fs::remove_dir_all(&base);
     }

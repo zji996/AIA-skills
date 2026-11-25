@@ -102,6 +102,9 @@ const KEYRING_MARKERS: &[&str] = &[
 pub struct RunningAgy {
     pub pid: u32,
     pub delegate_run: Option<String>,
+    pub run_name: Option<String>,
+    pub role: Option<String>, // "author" | "reviewer"
+    pub round: Option<String>,
     pub account: Option<String>,
     pub cmdline: String,
 }
@@ -485,6 +488,9 @@ pub fn detect_running_agy_for_home(target_home: &Path) -> Vec<RunningAgy> {
         // Scope by HOME (or DELEGATE_AGY_REAL_HOME for delegate's per-process credential overlays)
         // so isolated temp HOMEs (e.g. `agy account add`, quota probes, or other-HOME tests) do not collide.
         let mut delegate_run: Option<String> = None;
+        let mut run_name: Option<String> = None;
+        let mut role: Option<String> = None;
+        let mut round: Option<String> = None;
         let mut account: Option<String> = None;
         if let Ok(raw_env) = fs::read(proc_dir.join("environ")) {
             let mut proc_home: Option<PathBuf> = None;
@@ -504,11 +510,19 @@ pub fn detect_running_agy_for_home(target_home: &Path) -> Vec<RunningAgy> {
                     }
                 } else if let Some(val) = item.strip_prefix(b"DELEGATE_RUN_DIR=") {
                     let p = PathBuf::from(String::from_utf8_lossy(val).into_owned());
-                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                        if !name.is_empty() {
-                            delegate_run = Some(name.to_string());
+                    let (actual_run_dir, detected_role, detected_round) =
+                        parse_delegate_run_dir(&p);
+                    if let Some(id) = actual_run_dir.file_name().and_then(|n| n.to_str()) {
+                        if !id.is_empty() {
+                            delegate_run = Some(id.to_string());
                         }
                     }
+                    let meta_name = s(&json(actual_run_dir.join("meta.json")), "name").to_string();
+                    if !meta_name.is_empty() {
+                        run_name = Some(meta_name);
+                    }
+                    role = detected_role;
+                    round = detected_round;
                 }
             }
             if let Some(ph) = delegate_real_home.or(proc_home) {
@@ -522,6 +536,9 @@ pub fn detect_running_agy_for_home(target_home: &Path) -> Vec<RunningAgy> {
         found.push(RunningAgy {
             pid,
             delegate_run,
+            run_name,
+            role,
+            round,
             account,
             cmdline: clip(&argv.join(" "), 120),
         });
@@ -1254,13 +1271,21 @@ fn snapshot_json_opts(scan_procs: bool) -> Value {
             }
             let files = slot_present_files(&sdir);
             let token_expiry = slot_token_expiry(&sdir).unwrap_or_default();
+            let usage_view = usage_snap.as_ref().and_then(|u| u.per_account.get(id));
+            let stored_last_used = s(entry, "lastUsedAt");
+            let effective_last_used = match usage_view.and_then(|v| v.last_used_at.as_deref()) {
+                Some(u_ts) if !u_ts.is_empty() && (stored_last_used.is_empty() || u_ts > stored_last_used) => {
+                    u_ts.to_string()
+                }
+                _ => stored_last_used.to_string(),
+            };
             let mut item = json!({
                 "id": id,
                 "email": email,
                 "label": s(entry, "label"),
                 "active": is_active,
                 "addedAt": s(entry, "addedAt"),
-                "lastUsedAt": s(entry, "lastUsedAt"),
+                "lastUsedAt": effective_last_used,
                 "lastSyncedAt": s(entry, "lastSyncedAt"),
                 "tokenExpiresAt": token_expiry,
                 "files": files,
@@ -1270,7 +1295,7 @@ fn snapshot_json_opts(scan_procs: bool) -> Value {
             if let Some(q) = enrich_quota_for_snapshot(&quota_cache["accounts"][id], now_ep) {
                 item["quota"] = q;
             }
-            if let Some(view) = usage_snap.as_ref().and_then(|u| u.per_account.get(id)) {
+            if let Some(view) = usage_view {
                 item["usage"] = view.usage.clone();
                 if !view.quota_note.is_null() {
                     item["quotaNote"] = view.quota_note.clone();
@@ -1325,12 +1350,37 @@ fn find_slot_by_email(state: &Value, email: &str) -> Option<String> {
     None
 }
 
+fn parse_delegate_run_dir(p: &Path) -> (PathBuf, Option<String>, Option<String>) {
+    let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let parent_is_review = p
+        .parent()
+        .and_then(|d| d.file_name())
+        .and_then(|n| n.to_str())
+        == Some("review");
+    if parent_is_review {
+        if let Some(run_dir) = p.parent().and_then(|d| d.parent()) {
+            let round = (!fname.is_empty()).then(|| fname.to_string());
+            return (run_dir.to_path_buf(), Some("reviewer".to_string()), round);
+        }
+    }
+    (p.to_path_buf(), Some("author".to_string()), None)
+}
+
 fn running_agy_to_json(p: &RunningAgy) -> Value {
     let mut obj = json!({
         "pid": p.pid,
         "run": p.delegate_run,
         "cmdline": p.cmdline,
     });
+    if let Some(ref name) = p.run_name {
+        obj["runName"] = json!(name);
+    }
+    if let Some(ref role) = p.role {
+        obj["role"] = json!(role);
+    }
+    if let Some(ref round) = p.round {
+        obj["round"] = json!(round);
+    }
     if let Some(ref acct) = p.account {
         obj["account"] = json!(acct);
     }
@@ -3541,5 +3591,25 @@ BadRow\tWeekly Limit Remaining\tnot-a-pct\t2026-11-30T00:00:00Z
         .unwrap();
         assert_eq!(slot_doc["token"]["access_token"], "ALPHA-V3");
         assert_eq!(live_doc["token"]["access_token"], "ALPHA-V3");
+    }
+
+    #[test]
+    fn parse_delegate_run_dir_distinguishes_author_and_reviewer_rounds() {
+        let author = Path::new("/repo/.local/run/delegate/20261125-113402-sit-chair-fix");
+        let (rdir, role, round) = parse_delegate_run_dir(author);
+        assert_eq!(rdir, author);
+        assert_eq!(role.as_deref(), Some("author"));
+        assert_eq!(round, None);
+
+        let rev = Path::new(
+            "/repo/.local/run/delegate/20261125-112949-org-step4-signup/review/round-1",
+        );
+        let (rdir2, role2, round2) = parse_delegate_run_dir(rev);
+        assert_eq!(
+            rdir2,
+            Path::new("/repo/.local/run/delegate/20261125-112949-org-step4-signup")
+        );
+        assert_eq!(role2.as_deref(), Some("reviewer"));
+        assert_eq!(round2.as_deref(), Some("round-1"));
     }
 }

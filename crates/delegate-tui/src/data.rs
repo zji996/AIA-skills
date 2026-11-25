@@ -509,11 +509,12 @@ pub fn parse_snapshot_json(
     };
 
     let work = parse_work_value(&doc["work"]);
-    let events = parse_events_jsonl(&arr_to_jsonl(&doc["events"]));
+    let mut events = parse_events_jsonl(&arr_to_jsonl(&doc["events"]));
     let dag_queue = parse_dag_queue_jsonl(&arr_to_jsonl(&doc["dagQueue"]));
     let merges = parse_merges_jsonl(&arr_to_jsonl(&doc["merges"]));
     let candidates = parse_candidates_jsonl(&arr_to_jsonl(&doc["candidates"]));
-    let agy_accounts = parse_agy_accounts_value(&doc["agyAccounts"]);
+    let mut agy_accounts = parse_agy_accounts_value(&doc["agyAccounts"]);
+    enrich_run_names_from_groups(&groups, &mut events, &mut agy_accounts);
     let analytics = parse_analytics_value(&doc["analytics"]);
     let eta = parse_snapshot_eta_value(&doc["eta"]);
     let host_load = read_host_load();
@@ -2322,6 +2323,71 @@ fn parse_stall_warning(val: Option<&Value>) -> Option<StallWarningInfo> {
     })
 }
 
+/// Replace raw run IDs in event summaries and running agy processes with human-readable
+/// run/chain display names (resolving reply runs like `20261125-115816-7ddc` to their chain
+/// name or `reply to <name>`).
+fn enrich_run_names_from_groups(
+    groups: &[RepoGroup],
+    events: &mut [EventItem],
+    agy_accounts: &mut AgyAccountsState,
+) {
+    let mut id_to_display: HashMap<&str, String> = HashMap::new();
+    for g in groups {
+        for r in &g.runs {
+            let label = if !r.display_name.is_empty() {
+                r.display_name.clone()
+            } else if !r.name.is_empty() {
+                r.name.clone()
+            } else {
+                strip_run_id_timestamp(&r.run).to_string()
+            };
+            id_to_display.insert(r.run.as_str(), label.clone());
+            for cid in &r.chain_ids {
+                id_to_display.entry(cid.as_str()).or_insert_with(|| label.clone());
+            }
+        }
+    }
+    for ev in events.iter_mut() {
+        if ev.run.is_empty() {
+            continue;
+        }
+        let resolved = id_to_display
+            .get(ev.run.as_str())
+            .cloned()
+            .unwrap_or_else(|| {
+                let stripped = strip_run_id_timestamp(&ev.run);
+                if stripped != ev.run && !is_short_hex_hash(stripped) {
+                    stripped.to_string()
+                } else {
+                    ev.run.clone()
+                }
+            });
+        if resolved != ev.run {
+            if ev.summary == ev.run {
+                ev.summary = resolved;
+            } else if let Some(rest) = ev.summary.strip_prefix(&format!("{} · ", ev.run)) {
+                ev.summary = format!("{resolved} · {rest}");
+            }
+        }
+    }
+    for proc in &mut agy_accounts.running_agy {
+        if let Some(ref rid) = proc.run {
+            if let Some(disp) = id_to_display.get(rid.as_str()) {
+                proc.run_name = Some(disp.clone());
+            } else if proc.run_name.is_none() {
+                let stripped = strip_run_id_timestamp(rid);
+                if stripped != rid && !is_short_hex_hash(stripped) {
+                    proc.run_name = Some(stripped.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn is_short_hex_hash(s: &str) -> bool {
+    (4..=8).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 pub fn parse_events_jsonl(raw: &str) -> Vec<EventItem> {
     let mut out = Vec::new();
     for line in raw.lines() {
@@ -3077,8 +3143,30 @@ pub fn parse_agy_accounts_value(v: &Value) -> AgyAccountsState {
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
+            let run_name = p
+                .get("runName")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let role = p
+                .get("role")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let round = p
+                .get("round")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             let cmdline = single_line(p.get("cmdline").and_then(Value::as_str).unwrap_or(""));
-            Some(RunningAgyProc { pid, run, cmdline })
+            Some(RunningAgyProc {
+                pid,
+                run,
+                run_name,
+                role,
+                round,
+                cmdline,
+            })
         })
         .collect();
     let accounts: Vec<AgyAccountItem> = v

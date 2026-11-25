@@ -250,6 +250,20 @@ fn spawn_state_watcher(stop: Arc<AtomicBool>) -> (mpsc::Receiver<()>, bool) {
     (rx, true)
 }
 
+fn fresh_quota_cache_age_secs(state: &AgyAccountsState, max_age_secs: u64) -> Option<u64> {
+    if state.accounts.is_empty() {
+        return None;
+    }
+    let age = state.quota_age_seconds.or_else(|| {
+        state
+            .accounts
+            .iter()
+            .filter_map(|a| a.quota.as_ref().map(|q| q.age_seconds))
+            .min()
+    })?;
+    (age < max_age_secs).then_some(age)
+}
+
 enum QuotaCmd {
     Refresh,
     Shutdown,
@@ -595,16 +609,30 @@ fn main() {
 
     loop {
         // Trigger real quota refresh (`agy -p /usage`) when on Overview or Accounts tab:
-        // once on first entry, then every 10 minutes while TUI is open (never when TUI is closed).
+        // on first entry, reuse cached quota if it was updated within `quota_refresh_every`;
+        // otherwise refresh immediately, and then every 10 minutes while TUI is open.
         let on_quota_tab = matches!(app.tab, ViewTab::Overview | ViewTab::Accounts);
         if on_quota_tab && !quota_in_flight {
             let due = match last_quota_refresh {
-                None => true,
+                None => {
+                    let cached_fresh_age = fresh_quota_cache_age_secs(
+                        &app.snapshot.agy_accounts,
+                        quota_refresh_every.as_secs(),
+                    );
+                    if let Some(age) = cached_fresh_age {
+                        last_quota_refresh =
+                            Some(Instant::now().checked_sub(Duration::from_secs(age)).unwrap_or_else(Instant::now));
+                        false
+                    } else {
+                        true
+                    }
+                }
                 Some(t) => t.elapsed() >= quota_refresh_every,
             };
             if due {
                 quota_in_flight = true;
                 app.quota_refreshing = true;
+                app.quota_last_error = None;
                 app.dirty = true;
                 last_quota_refresh = Some(Instant::now());
                 let _ = tx_quota.send(QuotaCmd::Refresh);
@@ -618,12 +646,14 @@ fn main() {
             last_quota_refresh = Some(Instant::now());
             match qres {
                 Ok(agy_state) => {
+                    app.quota_last_error = None;
                     app.snapshot.agy_accounts = agy_state;
                     app.last_fingerprint = app.snapshot.data_fingerprint();
                     app.rebuild_rows(None);
                     app.dirty = true;
                 }
                 Err(err) => {
+                    app.quota_last_error = Some(err.clone());
                     app.set_toast(format!("额度刷新失败：{err}"));
                     app.dirty = true;
                 }
@@ -798,6 +828,7 @@ fn main() {
                                 if !quota_in_flight {
                                     quota_in_flight = true;
                                     app.quota_refreshing = true;
+                                    app.quota_last_error = None;
                                     last_quota_refresh = Some(Instant::now());
                                     let _ = tx_quota.send(QuotaCmd::Refresh);
                                     // Refreshes account quota via `agy -p /usage`.

@@ -693,7 +693,7 @@ fn snapshot_accounts_tab_active_marker_and_inplace_confirm_modal() {
     assert!(!screen.contains("alice@example.test"), "email hidden by default:\n{screen}");
     assert!(!screen.contains("bob@example.test"), "email hidden by default:\n{screen}");
     assert!(screen.contains("在跑 agy 进程: 1 个"), "{screen}");
-    assert!(screen.contains("4242 · 20261124-030000-demo"), "{screen}");
+    assert!(screen.contains("4242 · demo"), "{screen}");
     assert!(!screen.contains("pid=4242"), "old pid= format should be replaced:\n{screen}");
     assert!(screen.contains("i 全称"), "bottom bar should advertise `i 全称`:\n{screen}");
 
@@ -1450,8 +1450,8 @@ fn accounts_default_masked_and_toggle_full_with_i_while_y_copies_full_id() {
         "liveEmail": "guimondbuchinsky@gmail.com",
         "liveDrifted": false,
         "runningAgy": [
-            {"pid": 33057, "run": "20261124-155318-call-orphan", "cmdline": "/home/zji/.local/libexec/agy --input-format stream-json --output-format stream-json"},
-            {"pid": 2896311, "cmdline": "/bin/sh /home/zji/.local/bin/agy --agent aia-lead"}
+            {"pid": 33057, "run": "20261124-155318-call-orphan", "cmdline": "/home/user/.local/libexec/agy --input-format stream-json --output-format stream-json"},
+            {"pid": 2896311, "cmdline": "/bin/sh /home/user/.local/bin/agy --agent aia-lead"}
         ],
         "accounts": [
             {
@@ -1519,7 +1519,7 @@ fn accounts_default_masked_and_toggle_full_with_i_while_y_copies_full_id() {
     assert!(!masked.contains("Buchinsky Guimond"), "label leaked:\n{masked}");
     assert!(!masked.contains("邮箱"), "email column header should be removed:\n{masked}");
     assert!(masked.contains("i 全称"), "footer should show `i 全称`:\n{masked}");
-    assert!(masked.contains("33057 · 20261124-155318-call-orphan"), "{masked}");
+    assert!(masked.contains("33057 · call-orphan"), "{masked}");
     assert!(masked.contains("2896311 · aia-lead"), "{masked}");
     assert!(!masked.contains("--input-format"), "cmdline should not be printed:\n{masked}");
 
@@ -1966,4 +1966,217 @@ fn tui_eta_overview_runs_work_and_compact_phone_6col_badges() {
     assert!(work_phone.contains("卡所有"), "{work_phone}");
     assert!(!work_phone.contains("卡所有者Q03"), "compact phone view must use 6-col badge:\n{work_phone}");
     assert!(!work_phone.contains("等W012(~05:10)"), "compact phone view must use 6-col badge:\n{work_phone}");
+}
+
+#[test]
+fn tui_polish_1125_fixes_collected_time_narrow_names_tier_dedup_local_time_lane_fold_and_procs() {
+    use delegate_tui::app::ViewTab;
+    use delegate_tui::data::parse_snapshot_json;
+    use delegate_tui::model::shorten_running_cmd;
+
+    // 1. Unit assertions for running-command shortening (Item 3) & UTF-8 safety
+    assert_eq!(
+        shorten_running_cmd("/home/user/.local/bin/delegate lane cargo xtask infra-test"),
+        "cargo xtask infra-test"
+    );
+    assert_eq!(
+        shorten_running_cmd("bash -lc 'TMPDIR=/tmp /home/user/.local/bin/uv run pytest -q'"),
+        "uv run pytest"
+    );
+    assert_eq!(shorten_running_cmd("SCRATCH=/home/user/.gemini/foo"), "");
+    assert_eq!(
+        delegate_tui::model::parse_iso_utc_epoch("2026-11-25T05:18:中文"),
+        None
+    );
+
+    // 2. Full snapshot covering Items 1, 3, 4, 5, 6, 7, 8, 9, 10c
+    let snap_json = r#"{
+        "generatedAt": "2026-11-25T04:15:00Z",
+        "repos": [
+            {
+                "path": "/home/user/norvane",
+                "runs": [
+                    {
+                        "run": "20261125-015401-org-step3-switcher",
+                        "name": "org-step3-switcher",
+                        "state": "delivered",
+                        "mode": "write",
+                        "tier": "write",
+                        "modelName": "neon",
+                        "ageSeconds": 25200,
+                        "finishedAgoSeconds": 25200,
+                        "changes": {"files": 38, "added": 1200, "deleted": 100},
+                        "accept": {"ok": true},
+                        "eta": {"compactBadge": "卡主控", "stoppedClock": true}
+                    },
+                    {
+                        "run": "20261124-222515-org-step3-storage",
+                        "name": "org-step3-storage",
+                        "state": "delivered",
+                        "mode": "write",
+                        "tier": "write",
+                        "modelName": "neon",
+                        "ageSeconds": 39600,
+                        "finishedAgoSeconds": 39600,
+                        "changes": {"files": 32, "added": 900, "deleted": 80},
+                        "accept": {"ok": true}
+                    },
+                    {
+                        "run": "20261125-114020-gate-fix-1125",
+                        "name": "gate-fix-1125",
+                        "state": "running",
+                        "mode": "write",
+                        "tier": "write",
+                        "modelName": "neon",
+                        "ageSeconds": 1800,
+                        "activity": {
+                            "kind": "running_command",
+                            "label": "跑命令",
+                            "cmd": "/home/user/.local/bin/delegate lane cargo xtask infra-test"
+                        },
+                        "eta": {"compactBadge": "~12:45", "stoppedClock": false}
+                    },
+                    {
+                        "run": "20261125-115613-phys2-t02-throughput",
+                        "name": "phys2-t02-throughput",
+                        "state": "delivered",
+                        "mode": "write",
+                        "tier": "write",
+                        "modelName": "neon",
+                        "ageSeconds": 1200,
+                        "finishedAgoSeconds": 900
+                    },
+                    {
+                        "run": "20261125-115816-7ddc",
+                        "name": "reply to phys2-t02-throughput",
+                        "parent": "20261125-115613-phys2-t02-throughput",
+                        "state": "delivered",
+                        "mode": "write",
+                        "tier": "write",
+                        "modelName": "neon",
+                        "ageSeconds": 600,
+                        "finishedAgoSeconds": 300
+                    },
+                    {
+                        "run": "20261125-120500-9abc",
+                        "name": "reply to phys2-t02-throughput",
+                        "parent": "20261125-115816-7ddc",
+                        "state": "running",
+                        "mode": "write",
+                        "tier": "write",
+                        "modelName": "neon",
+                        "ageSeconds": 120
+                    }
+                ],
+                "cleanedNotes": [
+                    {"run": "20261120-010000-old-note", "name": "old-note", "state": "cleaned", "cleaned": true}
+                ]
+            }
+        ],
+        "events": [
+            {"seq": 100, "at": "2026-11-25T04:05:00Z", "kind": "lane_acquired", "repo": "norvane", "run": "20261125-115816-7ddc", "payload": {"label": "cargo test"}},
+            {"seq": 101, "at": "2026-11-25T04:06:00Z", "kind": "lane_released", "repo": "norvane", "run": "20261125-115816-7ddc", "payload": {"label": "cargo test"}},
+            {"seq": 102, "at": "2026-11-25T04:14:00Z", "kind": "delivered", "repo": "norvane", "run": "20261125-115816-7ddc", "payload": {"state": "delivered"}}
+        ],
+        "work": [
+            {
+                "id": "W043",
+                "repo": "/home/user/norvane",
+                "title": "小智搬去 alpha",
+                "state": "blocked",
+                "focus": "暂缓至 2026-11-25T05:18",
+                "waitOn": ["after_time:2026-11-25T05:18:00Z"],
+                "eta": {"focusBadge": "等13:18", "compactBadge": "等13:18", "stoppedClock": true}
+            },
+            {
+                "id": "W110",
+                "repo": "/home/user/norvane",
+                "title": "物理阶段 2",
+                "state": "blocked",
+                "waitOn": ["run_delivered:20261125-115816-7ddc"],
+                "waitOnStatus": [
+                    {"cond": "run_delivered:20261125-115816-7ddc", "satisfied": false, "detail": "等 20261125-115816-7ddc 交付"}
+                ]
+            }
+        ],
+        "agyAccounts": {
+            "active": "guimondbuchinsky",
+            "runningAgy": [
+                {"pid": 2119879, "run": "20261125-015401-org-step3-switcher", "runName": "org-step3-switcher", "role": "reviewer", "round": "round-1", "cmdline": "agy"},
+                {"pid": 539385, "run": "20261125-114020-gate-fix-1125", "runName": "gate-fix-1125", "role": "author", "cmdline": "agy"}
+            ],
+            "accounts": [
+                {
+                    "id": "guimondbuchinsky",
+                    "email": "gui@example.test",
+                    "active": true,
+                    "lastUsedAt": "2026-11-25T04:10:00Z",
+                    "fileCount": 6,
+                    "quota": {
+                        "fetchedAt": "2026-11-25T04:14:00Z",
+                        "ageSeconds": 60,
+                        "ok": true,
+                        "entries": [
+                            {"pool": "Claude/GPT", "window": "fiveHour", "windowLabel": "5-Hour Limit Remaining", "remainingPct": 100.0, "resetInSeconds": 17820}
+                        ]
+                    }
+                }
+            ]
+        }
+    }"#;
+
+    let snap = parse_snapshot_json(snap_json, Some(Path::new("/home/user")), None).unwrap();
+    let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/user/norvane"), 5);
+
+    // Tab 1 wide (160x45):
+    // - Item 1: 已收取 1 条 without bogus 213503982334601 天前
+    // - Item 3: shortened running cmd [cargo xtask infra-test] without /home/user/.local/bin
+    // - Item 5: detail pane shows `neon · write` once (no `write · write`)
+    let runs_wide = render_to_string(&mut app, 160, 45);
+    assert!(runs_wide.contains("已收取 1 条"), "{runs_wide}");
+    assert!(!runs_wide.contains("213503982334601"), "bogus u64::MAX days leaked:\n{runs_wide}");
+    assert!(runs_wide.contains("[cargo"), "short cmd missing:\n{runs_wide}");
+    assert!(!runs_wide.contains("/home/user"), "raw HOME path leaked:\n{runs_wide}");
+    assert!(runs_wide.contains("neon · write"), "{runs_wide}");
+    assert!(!runs_wide.contains("write · write"), "duplicate tier/mode:\n{runs_wide}");
+
+    // Tab 1 narrow (100x30): Item 4 keeps both org-step3-switcher and org-step3-storage distinguishable
+    let runs_narrow = render_to_string(&mut app, 100, 30);
+    assert!(runs_narrow.contains("org-step3-switcher"), "narrow truncated switcher:\n{runs_narrow}");
+    assert!(runs_narrow.contains("org-step3-storage"), "narrow truncated storage:\n{runs_narrow}");
+
+    // Tab 0 narrow (100x30): Item 10c ensures space between `5 小时` and `剩余`
+    app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+    let ov_narrow = render_to_string(&mut app, 100, 30);
+    assert!(!ov_narrow.contains("5 小时剩余"), "quota label glued to 剩余:\n{ov_narrow}");
+    assert!(ov_narrow.contains("5 小时 剩余 100%"), "{ov_narrow}");
+
+    // Tab 2 (Events): Item 8 hides lane_acquired/released by default, shows chain name, local time
+    app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Events);
+    let ev_screen = render_to_string(&mut app, 140, 30);
+    assert!(ev_screen.contains("事件流 (1) · 隐2槽位"), "{ev_screen}");
+    assert!(!ev_screen.contains("占槽"), "lane events should be hidden by default:\n{ev_screen}");
+    assert!(ev_screen.contains("phys2-t02-throughput"), "non-leaf reply run should resolve to chain name:\n{ev_screen}");
+    assert!(!ev_screen.contains("[norvane] 20261125-115816-7ddc"), "non-leaf reply run id leaked in event list:\n{ev_screen}");
+    assert!(!ev_screen.contains("2026-11-25T04:14:00Z"), "detail should use local time:\n{ev_screen}");
+    // Toggle 'l' shows lane events
+    app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+    let ev_with_lane = render_to_string(&mut app, 140, 30);
+    assert!(ev_with_lane.contains("事件流 (3) · 含槽位"), "{ev_with_lane}");
+    assert!(ev_with_lane.contains("占槽"), "{ev_with_lane}");
+
+    // Tab 5 (Work): Item 6 (single local time, no UTC ISO) & Item 7 (run name instead of run id)
+    app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+    let work_screen = render_to_string(&mut app, 140, 30);
+    assert!(!work_screen.contains("2026-11-25T05:18"), "UTC ISO leaked in work row:\n{work_screen}");
+    assert!(!work_screen.contains("等13:18"), "duplicate ETA badge leaked in work row:\n{work_screen}");
+    assert!(work_screen.contains("等 phys2-t02-throughput 交付"), "run name missing:\n{work_screen}");
+    assert!(!work_screen.contains("20261125-115816-7ddc"), "non-leaf reply run id leaked in work row:\n{work_screen}");
+
+    // Tab 6 (Accounts): Item 9 shows run name + role (`审查 round-1`, `作者`)
+    app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
+    let acct_screen = render_to_string(&mut app, 140, 35);
+    assert!(acct_screen.contains("2119879 · org-step3-switcher（审查 round-1）"), "{acct_screen}");
+    assert!(acct_screen.contains("539385 · gate-fix-1125（作者）"), "{acct_screen}");
 }

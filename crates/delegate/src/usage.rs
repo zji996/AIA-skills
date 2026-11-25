@@ -1824,6 +1824,7 @@ pub struct AccountUsageView {
     pub usage: Value,
     pub quota_note: Value,
     pub quota_estimate: Value,
+    pub last_used_at: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -2338,12 +2339,20 @@ pub fn accounts_usage_snapshot(
                 Value::Null
             };
 
+        let last_used_at = acct_entries
+            .iter()
+            .map(|e| e.epoch)
+            .filter(|&ep| ep > 0)
+            .max()
+            .map(|ep| format_epoch(ep, false, "%Y-%m-%dT%H:%M:%SZ"));
+
         per_account.insert(
             id.clone(),
             AccountUsageView {
                 usage,
                 quota_note,
                 quota_estimate,
+                last_used_at,
             },
         );
     }
@@ -2434,20 +2443,46 @@ fn load_trend_records(
                     continue;
                 }
                 let started = iso_epoch(s(&v, "startedAt")).unwrap_or(0);
-                let finished = iso_epoch(s(&v, "finishedAt")).unwrap_or(started);
+                let finished = iso_epoch(s(&v, "finishedAt")).unwrap_or(0);
                 let applied = iso_epoch(s(&v, "appliedAt"));
-                let entry = RunTrendRecord {
+                let mode = s(&v, "mode");
+                let state = s(&v, "state");
+                let parent = s(&v, "parent");
+                let rw = v["reworkCount"].as_u64().unwrap_or(0);
+                // History is an event log (`finish`, `apply`, `clean`, `reply` lines each carry
+                // a subset of fields); fold non-empty fields onto the run's record instead of
+                // overwriting earlier fields with empty values.
+                let rec = map.entry(rid.to_string()).or_insert_with(|| RunTrendRecord {
                     run: rid.to_string(),
-                    mode: s(&v, "mode").to_string(),
-                    state: s(&v, "state").to_string(),
-                    parent: s(&v, "parent").to_string(),
-                    started_epoch: started,
-                    finished_epoch: finished,
-                    applied_epoch: applied,
-                    rework_count: v["reworkCount"].as_u64().unwrap_or(0),
-                };
-                // History is append-only (later lines supersede earlier ones for the same run).
-                map.insert(rid.to_string(), entry);
+                    mode: String::new(),
+                    state: String::new(),
+                    parent: String::new(),
+                    started_epoch: 0,
+                    finished_epoch: 0,
+                    applied_epoch: None,
+                    rework_count: 0,
+                });
+                if !mode.is_empty() {
+                    rec.mode = mode.to_string();
+                }
+                if !state.is_empty() {
+                    rec.state = state.to_string();
+                }
+                if !parent.is_empty() {
+                    rec.parent = parent.to_string();
+                }
+                if started > 0 {
+                    rec.started_epoch = started;
+                }
+                if finished > 0 {
+                    rec.finished_epoch = finished;
+                } else if rec.finished_epoch == 0 && started > 0 {
+                    rec.finished_epoch = started;
+                }
+                if let Some(app_ep) = applied {
+                    rec.applied_epoch = Some(app_ep);
+                }
+                rec.rework_count = rec.rework_count.max(rw);
             }
         }
     }
@@ -2467,7 +2502,7 @@ fn load_trend_records(
                     0
                 }
             });
-        let finished = iso_epoch(s(st, "finishedAt")).unwrap_or(started);
+        let finished = iso_epoch(s(st, "finishedAt")).unwrap_or(0);
         let applied = iso_epoch(s(st, "appliedAt")).or_else(|| {
             if b(st, "applied") {
                 Some(finished.max(started))
@@ -2479,19 +2514,40 @@ fn load_trend_records(
             .as_u64()
             .unwrap_or(0)
             .max(st["review"]["reworkRounds"].as_u64().unwrap_or(0));
-        map.insert(
-            rid.clone(),
-            RunTrendRecord {
-                run: rid.clone(),
-                mode: s(st, "mode").to_string(),
-                state: s(st, "state").to_string(),
-                parent: s(st, "parent").to_string(),
-                started_epoch: started,
-                finished_epoch: finished,
-                applied_epoch: applied,
-                rework_count: rw,
-            },
-        );
+        let rec = map.entry(rid.clone()).or_insert_with(|| RunTrendRecord {
+            run: rid.clone(),
+            mode: String::new(),
+            state: String::new(),
+            parent: String::new(),
+            started_epoch: 0,
+            finished_epoch: 0,
+            applied_epoch: None,
+            rework_count: 0,
+        });
+        let mode = s(st, "mode");
+        let state = s(st, "state");
+        let parent = s(st, "parent");
+        if !mode.is_empty() {
+            rec.mode = mode.to_string();
+        }
+        if !state.is_empty() {
+            rec.state = state.to_string();
+        }
+        if !parent.is_empty() {
+            rec.parent = parent.to_string();
+        }
+        if started > 0 {
+            rec.started_epoch = started;
+        }
+        if finished > 0 {
+            rec.finished_epoch = finished;
+        } else if rec.finished_epoch == 0 && started > 0 {
+            rec.finished_epoch = started;
+        }
+        if let Some(app_ep) = applied {
+            rec.applied_epoch = Some(app_ep);
+        }
+        rec.rework_count = rec.rework_count.max(rw);
     }
 
     map
@@ -2972,7 +3028,7 @@ mod tests {
         assert_eq!(fh_est["estimatedRemainingHours"], round2(6_000_000.0 / 2_800_000.0));
 
         // 2. Account with only 3 hours of records: weekly averages over 3h (`since:3h`), 5h over 5h.
-        let short_entries = vec![
+        let short_entries = [
             make_entry(now - 3 * 3600, 1_500_000),
             make_entry(now - 3600, 1_500_000),
         ];
@@ -2986,14 +3042,14 @@ mod tests {
         assert!((s_fh_rate - 600_000.0).abs() < 1e-6);
 
         // 3. Account with < 1h of records: weekly clamps denominator to 1h (`since:1h`).
-        let tiny_entries = vec![make_entry(now - 1200, 2_000_000)];
+        let tiny_entries = [make_entry(now - 1200, 2_000_000)];
         let tiny_refs: Vec<&UsageEntry> = tiny_entries.iter().collect();
         let (t_wk_rate, t_wk_src) = burn_rate_for_window(&tiny_refs, now, QuotaWindowKind::Weekly);
         assert_eq!(t_wk_src, "since:1h");
         assert!((t_wk_rate - 2_000_000.0).abs() < 1e-6);
 
         // 4. Fallbacks: no 24h usage -> weekly falls back to 7d; no 5h usage -> 5h falls back to 24h.
-        let old_7d_entries = vec![make_entry(now - 48 * 3600, 168_000_000)];
+        let old_7d_entries = [make_entry(now - 48 * 3600, 168_000_000)];
         let old_7d_refs: Vec<&UsageEntry> = old_7d_entries.iter().collect();
         let (f7_rate, f7_src) = burn_rate_for_window(&old_7d_refs, now, QuotaWindowKind::Weekly);
         assert_eq!(f7_src, "7d");
@@ -3003,7 +3059,7 @@ mod tests {
         assert_eq!(f5_none_src, "none");
         assert_eq!(f5_none_rate, 0.0);
 
-        let mid_24h_entries = vec![
+        let mid_24h_entries = [
             make_entry(now - 30 * 3600, 1_000_000),
             make_entry(now - 10 * 3600, 24_000_000),
         ];
@@ -3012,5 +3068,38 @@ mod tests {
             burn_rate_for_window(&mid_24h_refs, now, QuotaWindowKind::FiveHour);
         assert_eq!(f5_24_src, "24h");
         assert!((f5_24_rate - 1_000_000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn load_trend_records_folds_finish_apply_and_clean_events() {
+        let base = std::env::temp_dir().join(format!(
+            "delegate-trend-fold-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let hdir = base.join("history/norvane-test");
+        fs::create_dir_all(&hdir).unwrap();
+        let hist = concat!(
+            r#"{"event":"finish","run":"20261124-100000-feat-a","mode":"write","state":"delivered","startedAt":"2026-11-24T02:00:00Z","finishedAt":"2026-11-24T02:30:00Z","reworkCount":0}"#, "\n",
+            r#"{"event":"apply","run":"20261124-100000-feat-a","appliedAt":"2026-11-24T03:00:00Z"}"#, "\n",
+            r#"{"event":"clean","run":"20261124-100000-feat-a","cleanedAt":"2026-11-24T04:00:00Z"}"#, "\n"
+        );
+        fs::write(hdir.join("history.jsonl"), hist).unwrap();
+
+        let records = load_trend_records(&base, &BTreeMap::new());
+        let rec = records.get("20261124-100000-feat-a").expect("folded record");
+        assert_eq!(rec.mode, "write");
+        assert_eq!(rec.state, "delivered");
+        assert!(rec.started_epoch > 0);
+        assert!(rec.applied_epoch.is_some());
+
+        let now_ep = iso_epoch("2026-11-25T04:00:00Z").unwrap();
+        let daily = compute_daily_7d_trend(&records, now_ep);
+        let d24 = daily.iter().find(|d| s(d, "ymd") == "2026-11-24").unwrap();
+        assert_eq!(d24["mergedCount"].as_u64(), Some(1));
+        assert_eq!(d24["medianMergeSecs"].as_u64(), Some(3600));
+        assert_eq!(d24["firstRoundPass"].as_u64(), Some(1));
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

@@ -4507,15 +4507,19 @@ fn item_belongs_to_runs_root(w: &WorkItem, root: &Path) -> bool {
             }
         }
     }
-    let cur_repo = current_repo_str();
-    if !cur_repo.is_empty() && !w.repo.is_empty() && w.repo == cur_repo {
-        return true;
-    }
     // Check if root is `<w.repo>/.local/run/delegate`
     if !w.repo.is_empty() {
         let candidate = Path::new(&w.repo).join(".local/run/delegate");
         let cc = fs::canonicalize(&candidate).unwrap_or(candidate);
         if cc == root_canon {
+            return true;
+        }
+        // Only match current_repo_str() when `root` IS the current process's runs_root()
+        // (supports custom DELEGATE_RUNS overrides without leaking across repos in snapshot).
+        let cur_root = runs_root();
+        let cur_root_canon = fs::canonicalize(&cur_root).unwrap_or(cur_root);
+        let cur_repo = current_repo_str();
+        if root_canon == cur_root_canon && !cur_repo.is_empty() && w.repo == cur_repo {
             return true;
         }
     }
@@ -4532,11 +4536,14 @@ fn load_items_for_notes(state: &Path) -> Vec<WorkItem> {
 }
 
 pub fn note_chains_for_current_root(all: &[PathBuf]) -> Vec<notes::ChainNotes> {
-    let root = runs_root();
+    note_chains_for_root(&runs_root(), all)
+}
+
+pub fn note_chains_for_root(root: &Path, all: &[PathBuf]) -> Vec<notes::ChainNotes> {
     let items = load_items_for_notes(&state_dir());
     items
         .iter()
-        .filter(|w| !w.followups.is_empty() && item_belongs_to_runs_root(w, &root))
+        .filter(|w| !w.followups.is_empty() && item_belongs_to_runs_root(w, root))
         .filter_map(|w| work_item_to_chain_notes(w, all))
         .collect()
 }

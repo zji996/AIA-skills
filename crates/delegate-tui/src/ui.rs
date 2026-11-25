@@ -440,29 +440,50 @@ struct ColWidths {
 impl ColWidths {
     fn compute(width: usize, has_any_eta: bool) -> Self {
         let show_state = width >= 62;
-        let model_w = if width >= 54 { 7 } else { 6 };
-        let time_w = if width >= 68 { 9 } else { 6 };
-        let eta_w = if has_any_eta && width >= 44 { 6 } else { 0 };
-        let files_w = 4;
-        let bar_w = if width >= 54 { 5 } else { 0 };
-        let protect_w = 3;
-        let accept_w = 4;
+        let mut model_w = if width >= 54 { 7 } else { 6 };
+        let mut time_w = if width >= 68 { 9 } else { 6 };
+        let mut eta_w = if has_any_eta && width >= 58 { 6 } else { 0 };
+        let mut files_w = if width >= 52 { 4 } else { 0 };
+        let mut bar_w = if width >= 56 { 5 } else { 0 };
+        let mut protect_w = if width >= 54 { 3 } else { 0 };
+        let mut accept_w = if width >= 40 { 4 } else { 0 };
 
         let left = 2 + 2 + if show_state { 5 } else { 0 };
-        let eta_total = if eta_w > 0 { 1 + eta_w } else { 0 };
-        let bar_total = if bar_w > 0 { 1 + bar_w } else { 0 };
-        let right = 1
-            + model_w
-            + 1
-            + time_w
-            + eta_total
-            + 1
-            + files_w
-            + bar_total
-            + 1
-            + protect_w
-            + 1
-            + accept_w;
+        let calc_right = |mw: usize, tw: usize, ew: usize, fw: usize, bw: usize, pw: usize, aw: usize| {
+            (if mw > 0 { 1 + mw } else { 0 })
+                + (if tw > 0 { 1 + tw } else { 0 })
+                + (if ew > 0 { 1 + ew } else { 0 })
+                + (if fw > 0 { 1 + fw } else { 0 })
+                + (if bw > 0 { 1 + bw } else { 0 })
+                + (if pw > 0 { 1 + pw } else { 0 })
+                + (if aw > 0 { 1 + aw } else { 0 })
+        };
+
+        // Guarantee task name stays readable on narrow screens by shedding lower-priority columns.
+        let min_name_w = if width >= 36 { 18 } else { 12 };
+        if width.saturating_sub(left + calc_right(model_w, time_w, eta_w, files_w, bar_w, protect_w, accept_w)) < min_name_w {
+            bar_w = 0;
+        }
+        if width.saturating_sub(left + calc_right(model_w, time_w, eta_w, files_w, bar_w, protect_w, accept_w)) < min_name_w {
+            eta_w = 0;
+        }
+        if width.saturating_sub(left + calc_right(model_w, time_w, eta_w, files_w, bar_w, protect_w, accept_w)) < min_name_w {
+            protect_w = 0;
+        }
+        if width.saturating_sub(left + calc_right(model_w, time_w, eta_w, files_w, bar_w, protect_w, accept_w)) < min_name_w {
+            files_w = 0;
+        }
+        if width.saturating_sub(left + calc_right(model_w, time_w, eta_w, files_w, bar_w, protect_w, accept_w)) < min_name_w {
+            time_w = 0;
+        }
+        if width.saturating_sub(left + calc_right(model_w, time_w, eta_w, files_w, bar_w, protect_w, accept_w)) < min_name_w {
+            accept_w = 0;
+        }
+        if width.saturating_sub(left + calc_right(model_w, time_w, eta_w, files_w, bar_w, protect_w, accept_w)) < min_name_w {
+            model_w = 0;
+        }
+
+        let right = calc_right(model_w, time_w, eta_w, files_w, bar_w, protect_w, accept_w);
         let name_w = width.saturating_sub(left + right).max(6);
         Self {
             show_state,
@@ -614,21 +635,31 @@ fn render_col_header(cols: ColWidths, width: usize) -> Line<'static> {
         s.push(' ');
     }
     s.push_str(&pad_right("任务", cols.name_w));
-    s.push(' ');
-    s.push_str(&pad_right("模型", cols.model_w));
-    s.push(' ');
-    s.push_str(&pad_left("时间", cols.time_w));
+    if cols.model_w > 0 {
+        s.push(' ');
+        s.push_str(&pad_right("模型", cols.model_w));
+    }
+    if cols.time_w > 0 {
+        s.push(' ');
+        s.push_str(&pad_left("时间", cols.time_w));
+    }
     if cols.eta_w > 0 {
         s.push(' ');
         s.push_str(&pad_left("预估", cols.eta_w));
     }
-    s.push(' ');
-    let diff_w = cols.files_w + if cols.bar_w > 0 { 1 + cols.bar_w } else { 0 };
-    s.push_str(&pad_left("改动", diff_w));
-    s.push(' ');
-    s.push_str(&pad_right("护", cols.protect_w));
-    s.push(' ');
-    s.push_str(&pad_right("验收", cols.accept_w));
+    if cols.files_w > 0 {
+        s.push(' ');
+        let diff_w = cols.files_w + if cols.bar_w > 0 { 1 + cols.bar_w } else { 0 };
+        s.push_str(&pad_left("改动", diff_w));
+    }
+    if cols.protect_w > 0 {
+        s.push(' ');
+        s.push_str(&pad_right("护", cols.protect_w));
+    }
+    if cols.accept_w > 0 {
+        s.push(' ');
+        s.push_str(&pad_right("验收", cols.accept_w));
+    }
     Line::from(Span::styled(truncate(&s, width), muted()))
 }
 
@@ -673,6 +704,7 @@ fn render_toggle_fold_row(
 ) -> Line<'static> {
     let arrow = if expanded { "▾" } else { "▸" };
     let ago = newest_ago_seconds
+        .filter(|&s| s != u64::MAX)
         .map(|s| format!("（{}）", format_relative_time(Some(s))))
         .unwrap_or_default();
     let label = match kind {
@@ -816,7 +848,12 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
             match act.kind.as_str() {
                 "running_command" => {
                     if let Some(cmd) = &act.cmd {
-                        format!(" [{}]", cmd)
+                        let short = shorten_running_cmd(cmd);
+                        if short.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{short}]")
+                        }
                     } else {
                         String::new()
                     }
@@ -890,13 +927,17 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
             spans.push(Span::styled(format!("{} ", pad_right(run.state_badge(), 4)), rev));
         }
         spans.push(Span::styled(padded_name, rev_bold));
-        spans.push(Span::styled(" ", rev));
-        spans.push(Span::styled(
-            pad_right(&format_model_cell(run, cols.model_w), cols.model_w),
-            rev,
-        ));
-        spans.push(Span::styled(" ", rev));
-        spans.push(Span::styled(pad_left(&time_text, cols.time_w), rev));
+        if cols.model_w > 0 {
+            spans.push(Span::styled(" ", rev));
+            spans.push(Span::styled(
+                pad_right(&format_model_cell(run, cols.model_w), cols.model_w),
+                rev,
+            ));
+        }
+        if cols.time_w > 0 {
+            spans.push(Span::styled(" ", rev));
+            spans.push(Span::styled(pad_left(&time_text, cols.time_w), rev));
+        }
         if cols.eta_w > 0 {
             let eta_text = run
                 .eta_badge()
@@ -905,22 +946,28 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
             spans.push(Span::styled(" ", rev));
             spans.push(Span::styled(pad_left(&eta_text, cols.eta_w), rev));
         }
-        spans.push(Span::styled(" ", rev));
-        spans.push(Span::styled(pad_left(&files_text, cols.files_w), rev));
+        if cols.files_w > 0 {
+            spans.push(Span::styled(" ", rev));
+            spans.push(Span::styled(pad_left(&files_text, cols.files_w), rev));
+        }
         if cols.bar_w > 0 {
             spans.push(Span::styled(" ", rev));
             let filled = add_n + del_n + neu_n;
             let bar = format!("{}{}", "▪".repeat(filled), "·".repeat(empty_n));
             spans.push(Span::styled(bar, rev));
         }
-        spans.push(Span::styled(" ", rev));
-        if let Some((p_text, _, _)) = protect_info {
-            spans.push(Span::styled(pad_right(p_text, cols.protect_w), rev_bold));
-        } else {
-            spans.push(Span::styled(" ".repeat(cols.protect_w), rev));
+        if cols.protect_w > 0 {
+            spans.push(Span::styled(" ", rev));
+            if let Some((p_text, _, _)) = protect_info {
+                spans.push(Span::styled(pad_right(p_text, cols.protect_w), rev_bold));
+            } else {
+                spans.push(Span::styled(" ".repeat(cols.protect_w), rev));
+            }
         }
-        spans.push(Span::styled(" ", rev));
-        spans.push(Span::styled(pad_right(accept_badge, cols.accept_w), rev));
+        if cols.accept_w > 0 {
+            spans.push(Span::styled(" ", rev));
+            spans.push(Span::styled(pad_right(accept_badge, cols.accept_w), rev));
+        }
 
         let used: usize = spans.iter().map(|s| display_width(&s.content)).sum();
         if used < width {
@@ -954,13 +1001,17 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
         ));
     }
     spans.push(Span::styled(padded_name, name_style));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        pad_right(&format_model_cell(run, cols.model_w), cols.model_w),
-        muted(),
-    ));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(pad_left(&time_text, cols.time_w), muted()));
+    if cols.model_w > 0 {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            pad_right(&format_model_cell(run, cols.model_w), cols.model_w),
+            muted(),
+        ));
+    }
+    if cols.time_w > 0 {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(pad_left(&time_text, cols.time_w), muted()));
+    }
     if cols.eta_w > 0 {
         let (eta_text, eta_style) = match run.eta_badge() {
             Some((b, true)) => {
@@ -989,11 +1040,13 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
         spans.push(Span::raw(" "));
         spans.push(Span::styled(pad_left(&eta_text, cols.eta_w), eta_style));
     }
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        pad_left(&files_text, cols.files_w),
-        if files > 0 { primary() } else { muted() },
-    ));
+    if cols.files_w > 0 {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            pad_left(&files_text, cols.files_w),
+            if files > 0 { primary() } else { muted() },
+        ));
+    }
     if cols.bar_w > 0 {
         spans.push(Span::raw(" "));
         if add_n > 0 {
@@ -1009,23 +1062,27 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
             spans.push(Span::styled("·".repeat(empty_n), muted()));
         }
     }
-    spans.push(Span::raw(" "));
-    if let Some((p_text, p_color, bold)) = protect_info {
-        spans.push(Span::styled(
-            pad_right(p_text, cols.protect_w),
-            Style::default()
-                .fg(p_color)
-                .add_modifier(if bold { Modifier::BOLD } else { Modifier::empty() }),
-        ));
-    } else {
-        spans.push(Span::raw(" ".repeat(cols.protect_w)));
+    if cols.protect_w > 0 {
+        spans.push(Span::raw(" "));
+        if let Some((p_text, p_color, bold)) = protect_info {
+            spans.push(Span::styled(
+                pad_right(p_text, cols.protect_w),
+                Style::default()
+                    .fg(p_color)
+                    .add_modifier(if bold { Modifier::BOLD } else { Modifier::empty() }),
+            ));
+        } else {
+            spans.push(Span::raw(" ".repeat(cols.protect_w)));
+        }
     }
-    spans.push(Span::raw(" "));
-    let acc_style = match accept_color {
-        Some(c) => Style::default().fg(c),
-        None => muted(),
-    };
-    spans.push(Span::styled(pad_right(accept_badge, cols.accept_w), acc_style));
+    if cols.accept_w > 0 {
+        spans.push(Span::raw(" "));
+        let acc_style = match accept_color {
+            Some(c) => Style::default().fg(c),
+            None => muted(),
+        };
+        spans.push(Span::styled(pad_right(accept_badge, cols.accept_w), acc_style));
+    }
 
     Line::from(spans)
 }
@@ -1149,9 +1206,10 @@ fn build_detail_lines(app: &App, run: &RunItem, width: usize) -> Vec<Line<'stati
     let tier_part = run
         .tier
         .as_deref()
+        .filter(|t| !t.is_empty())
         .map(|t| format!(" · {t}"))
         .unwrap_or_default();
-    let mode_part = if run.mode.is_empty() {
+    let mode_part = if run.mode.is_empty() || run.tier.as_deref() == Some(run.mode.as_str()) {
         String::new()
     } else {
         format!(" · {}", run.mode)
@@ -1669,7 +1727,7 @@ fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
         left_spans.push(Span::styled(summary, muted()));
     }
     if let Some(strip) = leases_strip {
-        if area.width >= 90 {
+        if area.width >= 115 {
             left_spans.push(Span::styled(" · ", muted()));
             left_spans.push(Span::styled(strip, primary()));
         }
@@ -1759,9 +1817,9 @@ fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
             }
             ViewTab::Events => {
                 if area.width >= 100 {
-                    " jk 选  f 跟随  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
+                    " jk 选  f 跟随  l 槽位  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
                 } else {
-                    " jk选 f跟随 Tab栏 /滤 r刷 ?助 q退"
+                    " jk选 f跟随 l槽位 Tab栏 /滤 r刷 ?助 q退"
                 }
             }
             ViewTab::Merges => {
@@ -2188,22 +2246,33 @@ fn event_kind_color(kind: &str) -> Option<Color> {
     }
 }
 
-fn short_event_hms(at: &str) -> &str {
-    if at.len() >= 19 {
-        &at[11..19]
+fn short_event_time(at: &str, today_ymd: &str) -> String {
+    if let Some(loc) = format_iso_local_short(at, today_ymd) {
+        return loc;
+    }
+    if at.len() >= 16 {
+        at[11..16].to_string()
     } else {
-        at
+        at.to_string()
     }
 }
 
 fn render_events_list_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == FocusPane::List && matches!(app.overlay, Overlay::None);
     let follow_tag = if app.events_follow { " · 跟随" } else { " · 暂停跟随" };
+    let lane_tag = if app.hidden_lane_events > 0 {
+        format!(" · 隐{}槽位", app.hidden_lane_events)
+    } else if app.show_lane_events {
+        " · 含槽位".to_string()
+    } else {
+        String::new()
+    };
     let filter_tag = if app.filter.is_empty() { "" } else { " · 过滤" };
     let title = Line::from(Span::styled(
         format!(
-            " 事件流 ({}){} {} ",
+            " 事件流 ({}){}{}{} ",
             app.filtered_events.len(),
+            lane_tag,
             follow_tag,
             filter_tag
         ),
@@ -2250,10 +2319,11 @@ fn render_events_list_pane(frame: &mut Frame, app: &mut App, area: Rect) {
         let ev = &app.snapshot.events[ev_idx];
         let selected = app.selected_event == Some(pos);
         let color = event_kind_color(&ev.kind);
+        let ev_time = short_event_time(&ev.at, &app.snapshot.today_ymd);
         let prefix = format!(
             "#{:<4} {} {} ",
             ev.seq,
-            short_event_hms(&ev.at),
+            ev_time,
             pad_right(ev.kind_badge(), 4)
         );
         let repo_part = if ev.repo.is_empty() {
@@ -2287,7 +2357,7 @@ fn render_events_list_pane(frame: &mut Frame, app: &mut App, area: Rect) {
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(format!("#{:<4} ", ev.seq), muted()),
-                Span::styled(format!("{} ", short_event_hms(&ev.at)), muted()),
+                Span::styled(format!("{ev_time} "), muted()),
                 Span::styled(format!("{} ", pad_right(ev.kind_badge(), 4)), badge_style),
                 Span::styled(rest, primary()),
             ]));
@@ -2318,7 +2388,9 @@ fn render_event_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
         Span::raw(" "),
         Span::styled(ev.kind.clone(), bold_primary()),
     ]));
-    push_wrapped(&mut out, &format!("时间: {}", ev.at), inner_w, muted());
+    let local_at = format_iso_local_short(&ev.at, &app.snapshot.today_ymd)
+        .unwrap_or_else(|| ev.at.clone());
+    push_wrapped(&mut out, &format!("时间: {local_at}"), inner_w, muted());
     if !ev.repo.is_empty() {
         push_wrapped(&mut out, &format!("仓库: {}", ev.repo), inner_w, muted());
     }
@@ -3299,12 +3371,18 @@ fn work_item_eta_tag(item: &WorkItem, compact: bool) -> Option<(String, Color)> 
 
 fn work_item_tail_tags(
     item: &WorkItem,
+    live_status: &str,
     stale_info: Option<(u64, bool)>,
     compact: bool,
 ) -> Vec<(String, Color)> {
     let mut tags = Vec::new();
     if let Some(eta_tag) = work_item_eta_tag(item, compact) {
-        tags.push(eta_tag);
+        let already_shows_wait_time = (live_status.starts_with("暂缓至 ")
+            || live_status.starts_with("等到 "))
+            && eta_tag.0.trim_start().starts_with('等');
+        if !already_shows_wait_time {
+            tags.push(eta_tag);
+        }
     }
     if let Some((hours, is_2x)) = stale_info {
         let color = if is_2x { STATUS_FAILED } else { STATUS_PENDING };
@@ -3366,7 +3444,7 @@ fn render_work_item_wide(
     } else {
         String::new()
     };
-    let tail_tags = work_item_tail_tags(item, stale_info, false);
+    let tail_tags = work_item_tail_tags(item, live_status, stale_info, false);
     let live_status = dedup_stale_live_status(live_status, stale_info.is_some());
     let tail_w: usize = tail_tags.iter().map(|(t, _)| display_width(t)).sum();
     let extra_w = display_width(&extra_tag);
@@ -3491,7 +3569,7 @@ fn render_work_item_compact(
     let gap1 = width.saturating_sub(2 + display_width(&left_clipped) + state_w);
 
     // Line 2: title · live_status [tail_tags]
-    let tail_tags = work_item_tail_tags(item, stale_info, true);
+    let tail_tags = work_item_tail_tags(item, live_status, stale_info, true);
     let live_status = dedup_stale_live_status(live_status, stale_info.is_some());
     let tail_w: usize = tail_tags.iter().map(|(t, _)| display_width(t)).sum();
     let indent2 = format!("  {}", " ".repeat(display_width(&tree_prefix)));
@@ -4394,19 +4472,29 @@ fn render_quota_gauge_row(frame: &mut Frame, area: Rect, label: &str, entry: &Qu
     let bar_w = preferred_bar_w.min(max_bar_w);
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(5);
-    spans.push(Span::styled(pad_right(label, label_w), primary()));
+    let label_str = pad_right(label, label_w);
+    let needs_sep = !label_str.ends_with(' ');
+    spans.push(Span::styled(label_str, primary()));
     if bar_w > 0 {
+        if needs_sep {
+            spans.push(Span::raw(" "));
+        }
         spans.extend(render_quota_bar_spans(
             ratio,
             bar_w,
             quota_bar_color(entry.remaining_pct_x100),
         ));
         spans.push(Span::raw(" "));
-        let text_budget = avail.saturating_sub(bar_w + 1);
+        let sep_w = usize::from(needs_sep);
+        let text_budget = avail.saturating_sub(bar_w + 1 + sep_w);
         spans.push(Span::styled(truncate(&gauge_lbl, text_budget), bold_primary()));
     } else {
+        if needs_sep {
+            spans.push(Span::raw(" "));
+        }
+        let text_budget = avail.saturating_sub(usize::from(needs_sep));
         spans.push(Span::styled(
-            truncate(&gauge_lbl, avail),
+            truncate(&gauge_lbl, text_budget),
             Style::default().fg(quota_bar_color(entry.remaining_pct_x100)),
         ));
     }
@@ -4571,6 +4659,8 @@ fn render_overview_quota_panel(frame: &mut Frame, app: &App, area: Rect) {
     let state = &app.snapshot.agy_accounts;
     let age_badge = if app.quota_refreshing {
         " · 刷新中…".to_string()
+    } else if app.quota_last_error.is_some() {
+        " · 刷新失败".to_string()
     } else if let Some(age) = state.quota_age_seconds {
         format!(" · {}", format_quota_updated(age))
     } else if let Some(age) = state
@@ -5153,6 +5243,8 @@ fn render_overview_narrow(frame: &mut Frame, app: &mut App, area: Rect) {
     let state = &app.snapshot.agy_accounts;
     let age_badge = if app.quota_refreshing {
         "刷新中…".to_string()
+    } else if app.quota_last_error.is_some() {
+        "刷新失败".to_string()
     } else if let Some(age) = state.quota_age_seconds {
         format_quota_updated(age)
     } else if let Some(age) = state
@@ -5567,7 +5659,7 @@ fn render_accounts_list_pane(frame: &mut Frame, app: &mut App, area: Rect) {
             row_spans.push(Span::styled(pad_left(&u7_txt, u7_w), u7_style));
         }
         if used_w > 0 {
-            let used_short = format_iso_compact(&acct.last_used_at);
+            let used_short = format_iso_compact(&acct.last_used_at, &app.snapshot.today_ymd);
             row_spans.push(Span::raw(" "));
             row_spans.push(Span::styled(pad_left(&used_short, used_w), muted()));
         }
@@ -5628,10 +5720,13 @@ fn format_usage_window_line(label: &str, w: &AccountUsageWindow, include_total: 
     text
 }
 
-fn format_iso_compact(iso: &str) -> String {
+fn format_iso_compact(iso: &str, today_ymd: &str) -> String {
     let t = iso.trim();
     if t.is_empty() {
         return "-".to_string();
+    }
+    if let Some(loc) = format_iso_local_short(t, today_ymd) {
+        return loc;
     }
     if t.len() >= 16 && t.as_bytes()[10] == b'T' {
         return format!("{} {}", &t[5..10], &t[11..16]);
@@ -5640,8 +5735,19 @@ fn format_iso_compact(iso: &str) -> String {
 }
 
 fn format_running_agy_proc(p: &RunningAgyProc) -> String {
-    if let Some(r) = p.run.as_deref().filter(|s| !s.is_empty()) {
-        return format!("{} · {r}", p.pid);
+    let name = p
+        .run_name
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| p.run.as_deref().filter(|s| !s.is_empty()).map(strip_run_id_timestamp));
+    if let Some(n) = name {
+        let role_tag = match (p.role.as_deref(), p.round.as_deref()) {
+            (Some("reviewer"), Some(rd)) if !rd.is_empty() => format!("（审查 {rd}）"),
+            (Some("reviewer"), _) => "（审查）".to_string(),
+            (Some("author"), _) => "（作者）".to_string(),
+            _ => String::new(),
+        };
+        return format!("{} · {n}{role_tag}", p.pid);
     }
     // Non-delegate agy process: extract agent name (e.g. `--agent aia-lead`) or short tag, never dump cmdline.
     let tokens: Vec<&str> = p.cmdline.split_whitespace().collect();
@@ -5669,6 +5775,8 @@ fn render_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
             let disp = a.display_name(app.is_account_revealed(&a.id));
             if app.quota_refreshing {
                 format!(" {disp} · 刷新中… ")
+            } else if app.quota_last_error.is_some() {
+                format!(" {disp} · 刷新失败 ")
             } else if let Some(q) = &a.quota {
                 format!(" {disp} · {} ", format_quota_updated(q.age_seconds))
             } else {
@@ -5796,25 +5904,26 @@ fn render_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
             out.push(Line::from(vec![
                 Span::styled("最后使用: ", muted()),
                 Span::styled(
-                    if acct.last_used_at.is_empty() {
-                        "-"
-                    } else {
-                        acct.last_used_at.as_str()
-                    }
-                    .to_string(),
+                    format_iso_compact(&acct.last_used_at, &app.snapshot.today_ymd),
                     primary(),
                 ),
             ]));
             if !acct.last_synced_at.is_empty() {
                 out.push(Line::from(vec![
                     Span::styled("最近回存: ", muted()),
-                    Span::styled(acct.last_synced_at.clone(), muted()),
+                    Span::styled(
+                        format_iso_compact(&acct.last_synced_at, &app.snapshot.today_ymd),
+                        muted(),
+                    ),
                 ]));
             }
             if !acct.token_expires_at.is_empty() {
                 out.push(Line::from(vec![
                     Span::styled("本地令牌到期: ", muted()),
-                    Span::styled(acct.token_expires_at.clone(), muted()),
+                    Span::styled(
+                        format_iso_compact(&acct.token_expires_at, &app.snapshot.today_ymd),
+                        muted(),
+                    ),
                 ]));
             }
             // Credentials are stored locally with mode 0600 and tokens are never printed.
@@ -5863,11 +5972,11 @@ fn render_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
         if let Some(note) = &acct.quota_note {
             let mut parts = Vec::new();
             if let Some(w) = note.weekly_pct_x100 {
-                let ts = format_iso_compact(&note.weekly_at);
+                let ts = format_iso_compact(&note.weekly_at, &app.snapshot.today_ymd);
                 parts.push(format!("本周剩余 {} ({ts})", format_pct_clean(w)));
             }
             if let Some(fh) = note.five_hour_pct_x100 {
-                let ts = format_iso_compact(&note.five_hour_at);
+                let ts = format_iso_compact(&note.five_hour_at, &app.snapshot.today_ymd);
                 parts.push(format!("5 小时剩余 {} ({ts})", format_pct_clean(fh)));
             }
             if !parts.is_empty() {
@@ -5981,7 +6090,7 @@ fn render_account_detail_wide_visual(frame: &mut Frame, app: &mut App, inner: Re
             if acct.last_used_at.is_empty() {
                 "-".to_string()
             } else {
-                format_iso_compact(&acct.last_used_at)
+                format_iso_compact(&acct.last_used_at, &app.snapshot.today_ymd)
             }
         ));
         meta_parts.push(format!("凭据 {} 份", acct.file_count));

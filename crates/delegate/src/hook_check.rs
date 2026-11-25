@@ -692,8 +692,11 @@ fn overlay_index_meta(cand: &mut Value, idx_meta: &Value, rdir: Option<&Path>) {
             cand[key] = json!(val);
         }
     }
+    let applied_marker = rdir.is_some_and(crate::runs::is_applied_marker);
     let gen_pending = rdir.is_some_and(|d| d.join(".generate-pending").exists());
-    if !gen_pending && (b(idx_meta, "appliedCleaned") || !s(cand, "appliedAt").trim().is_empty()) {
+    if applied_marker
+        || (!gen_pending && (b(idx_meta, "appliedCleaned") || !s(cand, "appliedAt").trim().is_empty()))
+    {
         cand["applied"] = json!(true);
     }
 }
@@ -771,10 +774,10 @@ fn read_run_snapshot(rdir: &Path, now: i64) -> Option<Value> {
         }
     };
 
-    let is_applied = (rdir.join(".applied").exists()
-        || rdir.join(".applied-cleaned").exists()
-        || !s(&meta, "appliedAt").trim().is_empty())
-        && !rdir.join(".generate-pending").exists();
+    let is_applied = crate::runs::is_applied_marker(rdir)
+        || ((rdir.join(".applied-cleaned").exists()
+            || !s(&meta, "appliedAt").trim().is_empty())
+            && !rdir.join(".generate-pending").exists());
 
     let wt_path = s(&meta["worktree"], "path").to_string();
     let pm = json(rdir.join("premerge.json"));
@@ -893,9 +896,9 @@ fn fetch_status(runs_dir: &Path, index_runs: &HashMap<String, Value>, now: i64) 
                         }
                     }
                 } else {
-                    let has_applied_marker = (rdir.join(".applied").exists()
-                        || rdir.join(".applied-cleaned").exists())
-                        && !rdir.join(".generate-pending").exists();
+                    let has_applied_marker = crate::runs::is_applied_marker(&rdir)
+                        || (rdir.join(".applied-cleaned").exists()
+                            && !rdir.join(".generate-pending").exists());
                     if has_applied_marker && !b(&cand, "applied") {
                         stale = true;
                     }
@@ -2150,8 +2153,9 @@ fn inspect_run_resolution(
     if !rdir_str.is_empty() && !(is_applied && is_replied && has_result_read) {
         let rdir = Path::new(rdir_str);
         if !is_applied
-            && (rdir.join(".applied").exists() || rdir.join(".applied-cleaned").exists())
-            && !rdir.join(".generate-pending").exists()
+            && (crate::runs::is_applied_marker(rdir)
+                || (rdir.join(".applied-cleaned").exists()
+                    && !rdir.join(".generate-pending").exists()))
         {
             is_applied = true;
         }

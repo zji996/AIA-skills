@@ -1194,6 +1194,9 @@ pub struct WorkCounts {
 pub struct RunningAgyProc {
     pub pid: u32,
     pub run: Option<String>,
+    pub run_name: Option<String>,
+    pub role: Option<String>,
+    pub round: Option<String>,
     pub cmdline: String,
 }
 
@@ -1588,6 +1591,24 @@ impl AppSnapshot {
         self.work.iter().find(|w| w.id == id)
     }
 
+    /// Resolve a run ID (e.g. `20261125-115613-phys2-t02-throughput` or a reply run
+    /// `20261125-115816-7ddc`) to a human-readable run/chain display name.
+    pub fn resolve_run_display_name(&self, run_id: &str) -> String {
+        for repo in &self.repos {
+            for r in &repo.runs {
+                if r.run == run_id || r.chain_ids.iter().any(|c| c == run_id) {
+                    if !r.display_name.is_empty() {
+                        return r.display_name.clone();
+                    }
+                    if !r.name.is_empty() {
+                        return r.name.clone();
+                    }
+                }
+            }
+        }
+        strip_run_id_timestamp(run_id).to_string()
+    }
+
     /// Synthesize a live one-line status ("此刻在干什么") for a work item, enriched with
     /// live RunItem details when an active or pending run is attached.
     pub fn work_live_status(&self, item: &WorkItem) -> String {
@@ -1624,31 +1645,31 @@ impl AppSnapshot {
             }
         }
 
-        match item.state.as_str() {
+        let raw = match item.state.as_str() {
             "blocked" => {
                 if let Some(ws) = item.wait_on_status.iter().find(|w| !w.satisfied) {
-                    return clean_wait_detail(&ws.detail);
+                    self.replace_run_ids_in_text(&clean_wait_detail(&ws.detail))
+                } else if let Some(raw) = item.wait_on.first() {
+                    self.format_raw_wait(raw)
+                } else if !item.focus.is_empty() {
+                    self.replace_run_ids_in_text(&item.focus)
+                } else {
+                    "等前置".to_string()
                 }
-                if let Some(raw) = item.wait_on.first() {
-                    return format_raw_wait(raw);
-                }
-                if !item.focus.is_empty() {
-                    return item.focus.clone();
-                }
-                "等前置".to_string()
             }
             "verify" => {
                 if let Some(art) = item.artifacts.first() {
-                    return format!("待接线 {}", art.path);
+                    format!("待接线 {}", art.path)
+                } else {
+                    let pending = item.pending_followups();
+                    if pending > 0 {
+                        format!("待办 {pending} 条")
+                    } else if !item.focus.is_empty() {
+                        item.focus.clone()
+                    } else {
+                        "待闭环".to_string()
+                    }
                 }
-                let pending = item.pending_followups();
-                if pending > 0 {
-                    return format!("待办 {pending} 条");
-                }
-                if !item.focus.is_empty() {
-                    return item.focus.clone();
-                }
-                "待闭环".to_string()
             }
             "done" => {
                 if item.closed_kind == "dropped" {
@@ -1661,12 +1682,84 @@ impl AppSnapshot {
             }
             _ => {
                 if !item.focus.is_empty() {
-                    item.focus.clone()
+                    self.replace_run_ids_in_text(&item.focus)
                 } else {
                     item.state_badge().to_string()
                 }
             }
+        };
+        localize_inline_timestamps(&raw, &self.today_ymd)
+    }
+
+    fn format_raw_wait(&self, raw: &str) -> String {
+        if let Some(wid) = raw.strip_prefix("work_closed:") {
+            format!("等 {wid} 关闭")
+        } else if let Some(oref) = raw.strip_prefix("owner:") {
+            format!("等所有者 {oref}")
+        } else if let Some(run_ref) = raw.strip_prefix("run_applied:") {
+            format!("等 {} 合入", self.resolve_run_display_name(run_ref))
+        } else if let Some(run_ref) = raw.strip_prefix("run_delivered:") {
+            format!("等 {} 交付", self.resolve_run_display_name(run_ref))
+        } else if let Some(ts) = raw.strip_prefix("after_time:") {
+            if let Some(loc) = format_iso_local_short(ts, &self.today_ymd) {
+                format!("等到 {loc}")
+            } else {
+                format!("等到 {}", &ts[..ts.len().min(10)])
+            }
+        } else {
+            raw.to_string()
         }
+    }
+
+    fn replace_run_ids_in_text(&self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut cur = text;
+        while let Some(pos) = find_run_id_start(cur) {
+            out.push_str(&cur[..pos]);
+            let rest = &cur[pos..];
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+                .unwrap_or(rest.len());
+            let token = &rest[..end];
+            out.push_str(&self.resolve_run_display_name(token));
+            cur = &rest[end..];
+        }
+        out.push_str(cur);
+        out
+    }
+}
+
+fn find_run_id_start(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 16 {
+        return None;
+    }
+    for i in 0..=bytes.len() - 16 {
+        if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'-' || bytes[i - 1] == b'_') {
+            continue;
+        }
+        if is_run_id_prefix(&bytes[i..i + 16]) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn is_run_id_prefix(b: &[u8]) -> bool {
+    b.len() >= 16
+        && b[0..8].iter().all(u8::is_ascii_digit)
+        && b[8] == b'-'
+        && b[9..15].iter().all(u8::is_ascii_digit)
+        && b[15] == b'-'
+}
+
+/// Strip leading `YYYYMMDD-HHMMSS-` timestamp prefix from a run ID if followed by a non-empty name.
+pub fn strip_run_id_timestamp(id: &str) -> &str {
+    let b = id.as_bytes();
+    if is_run_id_prefix(b) && id.len() > 16 {
+        &id[16..]
+    } else {
+        id
     }
 }
 
@@ -1675,22 +1768,6 @@ fn clean_wait_detail(detail: &str) -> String {
         head.to_string()
     } else {
         detail.to_string()
-    }
-}
-
-fn format_raw_wait(raw: &str) -> String {
-    if let Some(wid) = raw.strip_prefix("work_closed:") {
-        format!("等 {wid} 关闭")
-    } else if let Some(oref) = raw.strip_prefix("owner:") {
-        format!("等所有者 {oref}")
-    } else if let Some(run_ref) = raw.strip_prefix("run_applied:") {
-        format!("等 {run_ref} 合入")
-    } else if let Some(run_ref) = raw.strip_prefix("run_delivered:") {
-        format!("等 {run_ref} 交付")
-    } else if let Some(ts) = raw.strip_prefix("after_time:") {
-        format!("等到 {}", &ts[..ts.len().min(10)])
-    } else {
-        raw.to_string()
     }
 }
 
@@ -1732,8 +1809,12 @@ pub fn live_run_one_liner(run: &RunItem) -> String {
                     {
                         Some("在跑验收".to_string())
                     } else if !cmd.is_empty() {
-                        let first = cmd.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
-                        Some(format!("在跑 {first}"))
+                        let short = shorten_running_cmd(cmd);
+                        if short.is_empty() {
+                            Some("在跑命令".to_string())
+                        } else {
+                            Some(format!("在跑 {short}"))
+                        }
                     } else {
                         Some("在跑命令".to_string())
                     }
@@ -1807,11 +1888,16 @@ pub fn current_utc_epoch() -> i64 {
         .unwrap_or(0)
 }
 
-/// Parse an ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) or date (`YYYY-MM-DD`) to UTC epoch seconds.
+/// Parse an ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`, `YYYY-MM-DDTHH:MMZ`,
+/// `YYYY-MM-DDTHH:MM`, or date `YYYY-MM-DD`) to UTC epoch seconds.
 pub fn parse_iso_utc_epoch(iso: &str) -> Option<i64> {
     let s = iso.trim();
+    if !s.is_ascii() {
+        return None;
+    }
+    let b = s.as_bytes();
     let (y, mo, d, h, mi, sec): (i32, i32, i32, i32, i32, i32) =
-        if s.len() >= 19 && s.ends_with('Z') {
+        if s.len() >= 19 && b[4] == b'-' && b[7] == b'-' && b[10] == b'T' && b[13] == b':' && b[16] == b':' {
             (
                 s[0..4].parse().ok()?,
                 s[5..7].parse().ok()?,
@@ -1820,7 +1906,16 @@ pub fn parse_iso_utc_epoch(iso: &str) -> Option<i64> {
                 s[14..16].parse().ok()?,
                 s[17..19].parse().ok()?,
             )
-        } else if s.len() == 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-' {
+        } else if s.len() >= 16 && b[4] == b'-' && b[7] == b'-' && b[10] == b'T' && b[13] == b':' {
+            (
+                s[0..4].parse().ok()?,
+                s[5..7].parse().ok()?,
+                s[8..10].parse().ok()?,
+                s[11..13].parse().ok()?,
+                s[14..16].parse().ok()?,
+                0,
+            )
+        } else if s.len() == 10 && b[4] == b'-' && b[7] == b'-' {
             (
                 s[0..4].parse().ok()?,
                 s[5..7].parse().ok()?,
@@ -1841,6 +1936,244 @@ pub fn parse_iso_utc_epoch(iso: &str) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era as i64 * 146097 + doe - 719468;
     Some(days * 86400 + h as i64 * 3600 + mi as i64 * 60 + sec as i64)
+}
+
+fn utc_epoch_to_local_tm(utc_secs: i64) -> Option<libc::tm> {
+    let t = utc_secs as libc::time_t;
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            None
+        } else {
+            Some(tm)
+        }
+    }
+}
+
+/// Format an ISO-8601 UTC timestamp in local time:
+/// - today (`YYYY-MM-DD == today_ymd`): `HH:MM`
+/// - other day: `MM-DD HH:MM`
+pub fn format_iso_local_short(iso: &str, today_ymd: &str) -> Option<String> {
+    let s = iso.trim();
+    if s.len() < 16 || !s.contains('T') {
+        return None;
+    }
+    let ep = parse_iso_utc_epoch(s)?;
+    let tm = utc_epoch_to_local_tm(ep)?;
+    let ymd = format!(
+        "{:04}-{:02}-{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday
+    );
+    if !today_ymd.is_empty() && ymd == today_ymd {
+        Some(format!("{:02}:{:02}", tm.tm_hour, tm.tm_min))
+    } else {
+        Some(format!(
+            "{:02}-{:02} {:02}:{:02}",
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min
+        ))
+    }
+}
+
+/// Format an ISO-8601 UTC timestamp in local time with seconds:
+/// - today (`YYYY-MM-DD == today_ymd`): `HH:MM:SS`
+/// - other day: `MM-DD HH:MM:SS`
+pub fn format_iso_local_hms(iso: &str, today_ymd: &str) -> Option<String> {
+    let s = iso.trim();
+    if s.len() < 16 || !s.contains('T') {
+        return None;
+    }
+    let ep = parse_iso_utc_epoch(s)?;
+    let tm = utc_epoch_to_local_tm(ep)?;
+    let ymd = format!(
+        "{:04}-{:02}-{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday
+    );
+    if !today_ymd.is_empty() && ymd == today_ymd {
+        Some(format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec))
+    } else {
+        Some(format!(
+            "{:02}-{:02} {:02}:{:02}:{:02}",
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        ))
+    }
+}
+
+/// Replace any embedded UTC ISO timestamps (`YYYY-MM-DDTHH:MM[:SS][Z]`) inside `text`
+/// with local short timestamps (`HH:MM` for today, `MM-DD HH:MM` for other days).
+pub fn localize_inline_timestamps(text: &str, today_ymd: &str) -> String {
+    let bytes = text.as_bytes();
+    if bytes.len() < 16 {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 16 <= bytes.len()
+            && bytes[i..i + 4].iter().all(u8::is_ascii_digit)
+            && bytes[i + 4] == b'-'
+            && bytes[i + 5..i + 7].iter().all(u8::is_ascii_digit)
+            && bytes[i + 7] == b'-'
+            && bytes[i + 8..i + 10].iter().all(u8::is_ascii_digit)
+            && bytes[i + 10] == b'T'
+            && bytes[i + 11..i + 13].iter().all(u8::is_ascii_digit)
+            && bytes[i + 13] == b':'
+            && bytes[i + 14..i + 16].iter().all(u8::is_ascii_digit)
+        {
+            let mut end = i + 16;
+            if end + 3 <= bytes.len()
+                && bytes[end] == b':'
+                && bytes[end + 1..end + 3].iter().all(u8::is_ascii_digit)
+            {
+                end += 3;
+                // Optional fractional seconds `.123`
+                if end < bytes.len() && bytes[end] == b'.' {
+                    let mut f = end + 1;
+                    while f < bytes.len() && bytes[f].is_ascii_digit() {
+                        f += 1;
+                    }
+                    end = f;
+                }
+            }
+            if end < bytes.len() && bytes[end] == b'Z' {
+                end += 1;
+            }
+            if let Some(loc) = format_iso_local_short(&text[i..end], today_ymd) {
+                out.push_str(&loc);
+                i = end;
+                continue;
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Shorten a raw shell command for compact running-row badges:
+/// - strips leading `KEY=VAL` env assignments (when followed by a command)
+/// - strips `delegate lane` / `/path/to/delegate lane` wrapper (and its flags)
+/// - strips leading `cd <dir> &&` or `bash -lc` wrapper
+/// - replaces absolute paths on the executable with their basename, and strips `/home/<user>/` prefix.
+pub fn shorten_running_cmd(raw: &str) -> String {
+    let mut s = raw.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    // Strip leading `cd ... && ` if present
+    if let Some(rest) = s.strip_prefix("cd ") {
+        if let Some((_, after)) = rest.split_once("&&") {
+            s = after.trim();
+        }
+    }
+    // Strip outer `bash -lc '...'` / `sh -c '...'` (even if closing quote was truncated)
+    for prefix in ["bash -lc ", "bash -c ", "sh -lc ", "sh -c "] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest
+                .trim()
+                .trim_start_matches(['\'', '"'])
+                .trim_end_matches(['\'', '"'])
+                .trim();
+            break;
+        }
+    }
+    s = s.trim_start_matches(['\'', '"']).trim();
+
+    let tokens: Vec<&str> = s.split_whitespace().collect();
+    if tokens.is_empty() {
+        return String::new();
+    }
+    let mut idx = 0;
+    // Skip leading `env` and `FOO=bar` env assignments.
+    if tokens.get(idx).copied() == Some("env") {
+        idx += 1;
+    }
+    while idx < tokens.len()
+        && tokens[idx].contains('=')
+        && !tokens[idx].starts_with('-')
+        && !tokens[idx].starts_with('/')
+    {
+        idx += 1;
+    }
+    if idx >= tokens.len() {
+        return String::new();
+    }
+    // Skip `delegate lane [flags] [--]` wrapper
+    let exe_base = tokens[idx].rsplit('/').next().unwrap_or(tokens[idx]);
+    if exe_base == "delegate" && tokens.get(idx + 1).copied() == Some("lane") {
+        idx += 2;
+        while idx < tokens.len() {
+            let tok = tokens[idx];
+            if tok == "--" {
+                idx += 1;
+                break;
+            } else if tok == "--label" || tok == "--timeout" || tok == "--repo" {
+                idx += 2;
+            } else if tok.starts_with("--") {
+                idx += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    // Skip `bash -lc` / `sh -c` if it appeared after `delegate lane`
+    if matches!(
+        tokens.get(idx).copied(),
+        Some("bash" | "sh")
+    ) && matches!(tokens.get(idx + 1).copied(), Some("-lc" | "-c"))
+    {
+        idx += 2;
+    }
+    if idx >= tokens.len() {
+        return "delegate lane".to_string();
+    }
+
+    // Build compact 3-token command summary with executable basename and stripped HOME prefixes.
+    let mut parts: Vec<String> = Vec::new();
+    for (j, &raw_tok) in tokens[idx..].iter().take(4).enumerate() {
+        let tok = raw_tok.trim_matches(['\'', '"']);
+        if matches!(tok, "&&" | "||" | ";" | "|") {
+            break;
+        }
+        let cleaned = if j == 0 {
+            tok.rsplit('/').next().unwrap_or(tok).to_string()
+        } else if let Some(after_home) = strip_home_prefix(tok) {
+            after_home
+        } else {
+            tok.to_string()
+        };
+        if !cleaned.is_empty() {
+            parts.push(cleaned);
+        }
+        if parts.len() >= 3 {
+            break;
+        }
+    }
+    parts.join(" ")
+}
+
+fn strip_home_prefix(tok: &str) -> Option<String> {
+    if let Some(rest) = tok.strip_prefix("/home/") {
+        if let Some((_, after_user)) = rest.split_once('/') {
+            // If it's a binary in ~/.local/bin/foo, just return foo; otherwise ~/...
+            if let Some(bin) = after_user.strip_prefix(".local/bin/") {
+                return Some(bin.to_string());
+            }
+            return Some(format!("~/{after_user}"));
+        }
+    }
+    None
 }
 
 /// Parse an ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) and convert to local `YYYY-MM-DD`.
