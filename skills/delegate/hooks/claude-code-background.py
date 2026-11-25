@@ -681,6 +681,47 @@ def _parse_int(value: object) -> int | None:
     return None
 
 
+BUILD_WORDS = {"cargo", "pnpm", "npm", "npx", "yarn", "xtask", "make", "vitest", "playwright"}
+CAPPED_BUILD_REASON = (
+    "`{call}` 给编译/测试命令套了前台 timeout。cargo、pnpm 这类命令可能要排队等别的构建释放锁，"
+    "要等多久无法预估，时限一到就杀掉一个健康的等待，只能重跑。去掉 timeout，用 Bash 的 "
+    "run_in_background: true 运行（结束会通知），重的构建用 `delegate lane '<命令>'` 排队。 / "
+    "`{call}` wraps a build/test command in a foreground timeout. cargo/pnpm may queue behind another "
+    "build's lock for an unpredictable time; the timeout kills a healthy wait and forces a rerun. Drop "
+    "the timeout and run it with run_in_background: true (you are notified on exit); queue heavy builds "
+    "with `delegate lane '<cmd>'`.")
+_SEGMENT_SPLIT = re.compile(r"(?:&&|\|\||[;|&(\n])")
+_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def capped_build(command: str) -> str | None:
+    """Return the first foreground `timeout N <build>` call (cargo, pnpm, xtask, delegate lane, ...)."""
+    for segment in _SEGMENT_SPLIT.split(command):
+        try:
+            tokens = shlex.split(segment, comments=True)
+        except ValueError:
+            tokens = segment.split()
+        i = 0
+        while i < len(tokens) and (_ASSIGN.match(tokens[i]) or tokens[i] in ("env", "nice", "time", "command")):
+            i += 1
+        if i >= len(tokens) or tokens[i].rsplit("/", 1)[-1] != "timeout":
+            continue
+        j = i + 1
+        while j < len(tokens) and tokens[j].startswith("-"):
+            j += 2 if tokens[j] in ("-s", "-k", "--signal", "--kill-after") else 1
+        j += 1  # the duration
+        while j < len(tokens) and (_ASSIGN.match(tokens[j]) or tokens[j] == "env"):
+            j += 1
+        if j >= len(tokens):
+            continue
+        word = tokens[j].rsplit("/", 1)[-1]
+        nxt = tokens[j + 1] if j + 1 < len(tokens) else ""
+        if word in BUILD_WORDS or (word in ("delegate", "$D", "${D}") and nxt == "lane") \
+                or (word.startswith("python") and nxt.endswith(("gate.sh", "check.py"))):
+            return " ".join(tokens[i:j + 2])
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     cli_fmt = _parse_format(sys.argv[1:] if argv is None else argv)
     try:
@@ -745,6 +786,9 @@ def main(argv: list[str] | None = None) -> int:
         return allow(fmt)
     if is_bg:
         return allow(fmt)
+    capped = capped_build(command)
+    if capped:
+        return deny(CAPPED_BUILD_REASON.format(call=capped), fmt)
     poll_call = foreground_delegate_poll(command)
     if poll_call:
         return deny(POLL_REASON, fmt)

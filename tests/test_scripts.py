@@ -768,6 +768,27 @@ class ScriptTests(unittest.TestCase):
         self.assertTrue(denied("cd /repo && env A=1 B=2 $D wait job"))
         self.assertFalse(denied("DELEGATE_REMOTE=0 $D reply job 'compose up --wait'"))
 
+    def test_background_hook_denies_foreground_timeout_around_builds(self):
+        hook_env = {k: v for k, v in os.environ.items() if k not in ("PI_DELEGATE_ACTIVE", "DELEGATE_AGENT")}
+        def decision(command, background=False):
+            payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command, "run_in_background": background}})
+            result = subprocess.run([sys.executable, str(BACKGROUND_HOOK)], input=payload, env=hook_env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] if result.stdout else "allow"
+
+        t = "time" + "out"  # keeps this file's own text from looking like an invocation
+        deny = [f"{t} 110 cargo xtask docs-audit 2>&1 | tail -1", f"cd /r && {t} 170 pnpm exec vitest run a.ts",
+                f"{t} -k 5 300 cargo test -p x", f"{t} 900 delegate lane 'pnpm check:web'",
+                f"X=1 {t} 60s env A=2 /usr/bin/cargo build", f"{t} 120 npx playwright test"]
+        allow = [f"{t} 20 delegate status", f"{t} 3000 git fetch", "cargo build -p x",
+                 f"rg -n '{t} 110 cargo' docs", f'git commit -m "no {t} 110 cargo"',
+                 f"cat > n.md <<'EOF'\n{t} 60 cargo test\nEOF"]
+        for command in deny:
+            self.assertEqual(decision(command), "deny", command)
+        for command in allow:
+            self.assertEqual(decision(command), "allow", command)
+        self.assertEqual(decision(f"{t} 900 delegate lane 'pnpm check:web'", background=True), "allow")
+
     def test_background_hook_denies_pgrep_patterns_that_match_their_own_shell(self):
         def decision(command, background=False):
             payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command, "run_in_background": background}})
