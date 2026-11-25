@@ -303,7 +303,27 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
         format!("{label} {elapsed}"),
         agent_label(status),
     ];
-    if let Some(label) = pending_label(&status["pendingReply"]) {
+    if status["appends"].is_object() && n(&status["appends"], "total") > 0 {
+        parts.push(format!(
+            "已追加 {} 条，待投递 {} 条",
+            n(&status["appends"], "total"),
+            n(&status["appends"], "pending")
+        ));
+        let err = {
+            let e = s(&status["appends"], "error");
+            if !e.is_empty() {
+                e
+            } else {
+                s(&status["pendingReply"], "error")
+            }
+        };
+        if !err.is_empty() {
+            parts.push(format!(
+                "续答未发出 / pending reply failed: {}（stop 清除后重发）",
+                clip(err, 160)
+            ));
+        }
+    } else if let Some(label) = pending_label(&status["pendingReply"]) {
         parts.push(label);
     }
     if !s(status, "busy").is_empty() { parts.push(format!("busy: {}", s(status, "busy"))); }

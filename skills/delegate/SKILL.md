@@ -31,7 +31,7 @@ $D wait                                                                  # 放�
 | 读材料、审查、第二意见 | `$D start --read-only "…"`；限篇幅加 `--max-answer 800` |
 | 看截图或设计图 | `$D start --read-only --image shot.png "…"` |
 | 改代码，测试通过才算完 | `$D start --worktree --accept "make test" "…"`；不许碰加 `--protect tests/`，本次放开加 `--allow tests/unit/`（正文提及未放开的保护路径会提示）；验收时限可加 `--accept-timeout` 或在 `.delegate.json` 设 `acceptTimeout` |
-| 追问或返工 | `$D reply <name> "…"`（默认自动把本链同步到当前源基线且保留 slot 缓存，冲突时保旧基线并提示；跳过加 `--no-sync`，冲突交同事解用 `--sync=agent`）；放开受保护路径加 `--allow PATH`；开新会话加 `--fresh`，运行中先记追问加 `--when-done` |
+| 追问或返工 | `$D reply <name> "…"`（运行中默认直接追加，Pi 支持 RPC `steer` 时轮中即注入，否则同 `agy` 本轮末同会话合并接着答，收尾后退回新 round，`status`/`card`/TUI 显「已追加 N 条，待投递 M 条」，`stop` 取消待投递，`--when-done` 兼容；已结束默认同步源基线保 slot 缓存，跳过 `--no-sync`，冲突交同事 `--sync=agent`，放开保护 `--allow PATH`，新会话 `--fresh`） |
 | 审某个已完成任务的工作树 | `$D start --read-only --in <name> "…"`（已清理时自动从归档重建，不可重建则报错退出）；先 `wait` 确认上游结果再派下一步 |
 | 自己跑重检查、测性能 | `$D lane make check`；测量用 `lane --measure` |
 | 节点不稳、换档前先测连通 | `$D probe`：走 Pi 本身（不是裸 HTTP）测各档模型，不建任务、不占名额 |

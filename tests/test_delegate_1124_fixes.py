@@ -72,7 +72,7 @@ class Delegate1124FixesTests(unittest.TestCase):
             f"inv_log = Path({str(log_file)!r})\n"
             "call_idx = int(counter.read_text()) + 1 if counter.exists() else 1\n"
             "counter.write_text(str(call_idx))\n"
-            "raw_in = sys.stdin.read()\n"
+            "raw_in = sys.stdin.readline()\n"
             "msg = json.loads(raw_in.strip().splitlines()[-1]) if raw_in.strip() else {}\n"
             "content = msg.get('message', {}).get('content', '')\n"
             "conv_id = ''\n"

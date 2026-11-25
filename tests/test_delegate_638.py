@@ -494,7 +494,7 @@ class Delegate638AgyAccountsTests(unittest.TestCase):
             f"counter = pathlib.Path({str(call_counter)!r})\n"
             "idx = int(counter.read_text()) + 1 if counter.exists() else 1\n"
             "counter.write_text(str(idx))\n"
-            "_ = sys.stdin.read()\n"
+            "_ = sys.stdin.readline()\n"
             "h = pathlib.Path(os.environ['HOME'])\n"
             "tok_path = h / '.gemini/antigravity-cli/antigravity-oauth-token'\n"
             "tok_doc = json.loads(tok_path.read_text())\n"

@@ -57,7 +57,7 @@ class DelegateReworkFixesTests(unittest.TestCase):
             "if '--version' in args:\n"
             "    print('1.5.15')\n"
             "    sys.exit(0)\n"
-            "raw = sys.stdin.read()\n"
+            "raw = sys.stdin.readline()\n"
             "msg = json.loads(raw.strip().splitlines()[-1]) if raw.strip() else {}\n"
             "content = ''\n"
             "if isinstance(msg, dict) and isinstance(msg.get('message'), dict):\n"

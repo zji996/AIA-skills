@@ -1066,6 +1066,16 @@ fn parse_run_item(
             .and_then(Value::as_str)
             .map(str::to_string),
         pending_reply: v.get("pendingReply").is_some_and(|pr| !pr.is_null()),
+        appended_total: v
+            .get("appends")
+            .and_then(|a| a.get("total"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        appended_pending: v
+            .get("appends")
+            .and_then(|a| a.get("pending"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         queue_reason,
         queue_ahead,
         measure_waiting_ahead,

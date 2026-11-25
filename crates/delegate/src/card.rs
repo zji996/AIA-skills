@@ -3560,6 +3560,9 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
     if sum["tokensDelta"].as_object().is_some_and(|o| !o.is_empty()) {
         card_doc["tokensDelta"] = sum["tokensDelta"].clone();
     }
+    if let Some(appends) = crate::pending_reply::summary_json(run) {
+        card_doc["appends"] = appends;
+    }
     Ok(card_doc)
 }
 
@@ -3764,6 +3767,13 @@ pub fn render_card_human(card: &Value) -> String {
             out.push(format!("预合并：{pm_label}（{}）", extra_parts.join(" · ")));
         }
     }
+    if card["appends"].is_object() && n(&card["appends"], "total") > 0 {
+        out.push(format!(
+            "追加：已追加 {} 条，待投递 {} 条",
+            n(&card["appends"], "total"),
+            n(&card["appends"], "pending")
+        ));
+    }
     out.push(String::new());
 
     // 1. 做了什么
@@ -3813,6 +3823,7 @@ pub fn render_card_human(card: &Value) -> String {
             let rchars = n(r, "totalChars");
             let kind_zh = match s(r, "kind") {
                 "rework" => "返工",
+                "append" => "追加",
                 "reply" => "reply",
                 _ => "初稿",
             };

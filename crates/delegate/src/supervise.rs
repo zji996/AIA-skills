@@ -101,7 +101,7 @@ pub fn log_event(run: &Path, mut event: Value) {
     event["at"] = json!(iso());
     let _ = append(run.join("events.jsonl"), &format!("{event}\n"));
 }
-pub(crate) fn attempts_from(
+fn attempts_raw(
     meta: &Value,
     run: &Path,
     first: i64,
@@ -131,6 +131,102 @@ pub(crate) fn attempts_from(
         }
         log_event(run, json!({"e":"rerun","reason":"malformed answer"}));
     }
+    (verdict, answer, attempt)
+}
+
+/// For Pi runs (which lack live RPC steer), drain any appended follow-up messages at each
+/// turn boundary inside the same run and same forked session before accept/review/compression.
+pub(crate) fn drain_pi_appends(
+    meta: &Value,
+    run: &Path,
+    first: (String, String, i64),
+    holder: Arc<AtomicI32>,
+    grace: Arc<std::sync::Mutex<Option<f64>>>,
+) -> (String, String, i64) {
+    let (mut verdict, mut answer, mut attempts) = first;
+    if crate::agy::is_agy(s(meta, "model"))
+        || b(meta, "isReviewer")
+        || b(meta, "isRework")
+        || b(meta, "noAppend")
+    {
+        return (verdict, answer, attempts);
+    }
+    while verdict == "ok" && !lane::stopped() {
+        let current_round = runs::max_round_result_num(run) + 1;
+        match crate::pending_reply::take_or_close_in_run(run, current_round + 1) {
+            Ok(crate::pending_reply::TakeInRun::Messages(batch)) => {
+                if !answer.trim().is_empty() {
+                    let formatted = format!("{}\n", answer.trim_end_matches('\n'));
+                    let _ = write(
+                        run.join(format!("round-{current_round}-result.md")),
+                        &formatted,
+                    );
+                }
+                let next_round = current_round + 1;
+                let prompt_file = run.join(format!("append-round-{next_round}-prompt.md"));
+                let merged_text = crate::pending_reply::format_merged_followup(&batch);
+                let next = write(&prompt_file, format!("{merged_text}\n"))
+                    .ok()
+                    .and_then(|()| continuation_with_file(meta, run, &prompt_file));
+                let Some(mut next_meta) = next else {
+                    let _ = crate::pending_reply::revert_to_fallback(run, &batch);
+                    break;
+                };
+                next_meta["noAppend"] = json!(true);
+                next_meta["images"] = json!(crate::pending_reply::merged_images(&batch));
+                let seqs: Vec<u64> = batch.iter().map(|it| it.seq).collect();
+                log_event(
+                    run,
+                    json!({
+                        "e": "append_delivered",
+                        "round": next_round,
+                        "seqs": seqs,
+                        "count": batch.len(),
+                        "mode": "in_run",
+                    }),
+                );
+                crate::index::upsert_run(run);
+                crate::board::refresh_for_run(run);
+                let (v, a, att) =
+                    attempts_raw(&next_meta, run, attempts + 1, holder.clone(), grace.clone());
+                let resumed =
+                    resume_transient(&next_meta, run, (v, a, att), holder.clone(), grace.clone());
+                let (v, a, att) = resume_stalled(
+                    &next_meta,
+                    run,
+                    (resumed.verdict, resumed.answer, resumed.attempts),
+                    holder.clone(),
+                    grace.clone(),
+                );
+                verdict = v;
+                answer = a;
+                attempts = att;
+            }
+            Ok(crate::pending_reply::TakeInRun::Closed) | Err(_) => {
+                if current_round > 1 && !answer.trim().is_empty() {
+                    let formatted = format!("{}\n", answer.trim_end_matches('\n'));
+                    let _ = write(
+                        run.join(format!("round-{current_round}-result.md")),
+                        &formatted,
+                    );
+                }
+                break;
+            }
+        }
+    }
+    (verdict, answer, attempts)
+}
+
+pub(crate) fn attempts_from(
+    meta: &Value,
+    run: &Path,
+    first: i64,
+    holder: Arc<AtomicI32>,
+    grace: Arc<std::sync::Mutex<Option<f64>>>,
+) -> (String, String, i64) {
+    let (verdict, answer, attempt) = attempts_raw(meta, run, first, holder.clone(), grace.clone());
+    let (verdict, mut answer, mut attempt) =
+        drain_pi_appends(meta, run, (verdict, answer, attempt), holder.clone(), grace.clone());
     if verdict == "ok" {
         (answer, attempt) = compress_answer(meta, run, answer, attempt, holder, grace);
     }
@@ -169,6 +265,7 @@ fn compress_answer(
         let prompt = run.join("compression-prompt.md");
         write(&prompt, format!("压缩到 {limit} 字以内，保留结论与证据。只答复文字，不执行命令或修改文件。 / Compress your previous answer to at most {limit} characters, preserving conclusions and evidence. Respond with text only.\n"))?;
         continuation["agentPromptFile"] = json!(prompt);
+        continuation["noAppend"] = json!(true);
         log_event(run, json!({"e":"answer_compression","maxAnswer":limit}));
         agents::run_agent(&continuation, run, attempt + 1, holder, grace)
     };
@@ -763,7 +860,11 @@ pub(crate) fn recover_policy_refusal(
     let prompt_file = run.join("policy-rewrite-prompt.md");
     let next = write(&prompt_file, format!("{}\n", crate::agy::POLICY_REWRITE_PROMPT))
         .ok()
-        .and_then(|()| continuation_with_file(meta, run, &prompt_file));
+        .and_then(|()| continuation_with_file(meta, run, &prompt_file))
+        .map(|mut m| {
+            m["noAppend"] = json!(true);
+            m
+        });
     let Some(next) = next else {
         log_event(
             run,
@@ -1487,6 +1588,13 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
             holder.clone(),
             grace.clone(),
         );
+        (verdict, answer, attempts) = drain_pi_appends(
+            &meta,
+            run,
+            (verdict, answer, attempts),
+            holder.clone(),
+            grace.clone(),
+        );
         let recovered = recover_policy_refusal(
             &meta,
             run,
@@ -1497,6 +1605,9 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         (verdict, answer, attempts) = (recovered.verdict, recovered.answer, recovered.attempts);
         policy_refused = recovered.refused;
         policy_rewrite_attempted = recovered.rewrite_attempted;
+    }
+    if setup_error.is_some() || verdict == "ok" || lane::stopped() {
+        let _ = crate::pending_reply::close_in_run(run);
     }
     let mut pre = settle_pre_accept(
         &mut meta,
@@ -1536,6 +1647,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         );
         pre.sum["escalatedFrom"] = json!(original_model);
     }
+    let _ = crate::pending_reply::close_in_run(run);
     let PreAccept {
         mut state,
         mut sum,
@@ -1825,6 +1937,7 @@ pub fn supervise(run: &Path) -> Res<()> {
         }
     });
     if let Err(e) = inner(run, holder, grace) {
+        let _ = crate::pending_reply::close_in_run(run);
         let _ = append(run.join("stderr.log"), &format!("supervisor error: {e}\n"));
         if !run.join("exit_code").exists() {
             let pgid = read(run.join("agent.pid")).trim().parse().unwrap_or(0);

@@ -2823,10 +2823,15 @@ fn main_inner(args: &[String]) -> Res<i32> {
         }
         "reply" => {
             let mut o = launch::parse_launch(rest, true, true)?;
-            if o.when_done && pending_reply::enqueue(rest, &mut o)? {
-                let run = runs::resolve_head(o.run.as_deref().unwrap_or("last"))?;
-                println!("{}", status_line(&run));
-                eprintln!("delegate: pending reply recorded; stop cancels it");
+            if let Some(enqueued) = pending_reply::enqueue(rest, &mut o)? {
+                if output::json_enabled() {
+                    let mut st = runs::status(&enqueued.run);
+                    st["appendDelivery"] = json!(enqueued.mode_str());
+                    st["appendSeq"] = json!(enqueued.seq);
+                    println!("{}", format_status(st));
+                } else {
+                    println!("{}", enqueued.human_line());
+                }
                 return Ok(0);
             }
             let max = o.max;

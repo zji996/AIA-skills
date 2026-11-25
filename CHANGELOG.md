@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `delegate`：支持对运行中任务直接追加问题——`delegate reply <run> "…"` 对运行中任务默认写入只追加信箱（`appends.json`，多条按序编号，`--when-done` 保留为兼容别名）；`agy` 改用管道持有 stdin 在每轮结束合并投递并在空信箱时关闭 stdin；`pi` 自动探测 `--mode rpc` 与 `queue_message(deliverAs: "steer")`（本机 `rpi 0.20.0` 已支持），支持时启用 `--mode rpc` 在当前工具调用结束后实时 `steer` 注入，不支持或带图时回退 `--mode json` 轮末续接；通道关闭后到达的追加自动退回 `pending_reply` 结束后同会话开新 round（多条 fallback 合并保留各条 `--fresh`/`--model`/`--image` 等选项）；最终 `result.md` 为末轮答复、各轮可 `result --round` 查看且验收/审查/预合并只在末轮跑一次；`status`/`card`/TUI 显示「已追加 N 条，待投递 M 条」，`stop` 取消全部待投递追加。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
 
 ## delegate 6.45.2 - 2026-11-25

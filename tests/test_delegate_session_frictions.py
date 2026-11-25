@@ -65,22 +65,27 @@ class DelegateSessionFrictionsTests(unittest.TestCase):
 
     def test_pending_reply_detaches_records_message_and_launches_once(self):
         gate, state = self.gated()
-        refused = self.cli("reply", state["run"], "later")
-        self.assertIn("--when-done", refused.stderr)
-        queued = self.cli("reply", "--when-done", state["run"], "--prompt-file", "-", stdin="follow up\n")
+        # Running reply appends by default (no --when-done required); --when-done is a compatible alias.
+        first = self.cli("reply", state["run"], "first follow up", human=True)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("已追加到", first.stdout)
+        self.assertIn("第 1 条追加", first.stdout)
+        queued = self.cli("reply", "--when-done", state["run"], "--prompt-file", "-", stdin="second follow up\n")
         self.assertEqual(queued.returncode, 0, queued.stderr)
-        self.assertEqual(self.outcome(queued)["pendingReply"]["message"], "follow up\n")
-        self.assertIn("pending reply", self.cli("status", state["run"], human=True).stdout)
-        self.assertEqual(self.cli("reply", "--when-done", state["run"], "duplicate").returncode, 2)
-        # The queuing controller subprocess has already exited; worker still delivers.
+        queued_out = self.outcome(queued)
+        self.assertEqual(queued_out["appends"]["total"], 2)
+        self.assertEqual(queued_out["appends"]["pending"], 2)
+        self.assertIn("已追加 2 条，待投递 2 条", self.cli("status", state["run"], human=True).stdout)
+        # Releasing the gate delivers both merged in round 2 of the SAME run.
+        self.fake_pi([fixtures.answer("round 2 merged answer"), fixtures.SETTLED])
         gate.touch()
-        receipt = Path(state["dir"]) / "reply-delivered.json"
-        self.until(receipt.exists, "pending reply delivered")
-        child = json.loads(receipt.read_text())["run"]
-        result = self.cli("wait", "--all", child)
+        result = self.cli("wait", "--all", state["run"])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("follow up", (Path(child) / "prompt.md").read_text())
-        self.assertFalse((Path(state["dir"]) / "pending-reply.json").exists())
+        run_dir = Path(state["dir"])
+        self.assertEqual((run_dir / "result.md").read_text().strip(), "round 2 merged answer")
+        self.assertFalse((run_dir / "pending-reply.json").exists())
+        self.assertFalse((run_dir / "reply-delivered.json").exists())
+        self.assertIn("已追加 2 条，待投递 0 条", self.cli("status", state["run"], human=True).stdout)
         self.assertEqual(len((self.work / "pi.log").read_text().splitlines()), 2)
 
     def test_any_wait_ignores_stopped_runs(self):
@@ -160,13 +165,23 @@ class DelegateSessionFrictionsTests(unittest.TestCase):
 
     def test_pending_reply_survives_apply_cleanup(self):
         repo = self.repo({"a": "old\n"})
-        gate, state = self.gated(repo)
-        queued = self.cli("reply", "--when-done", state["run"], "follow after apply")
+        accept_ready = self.work / "accept-ready"
+        accept_gate = self.work / "accept-gate"
+        accept_cmd = f"touch {shlex.quote(str(accept_ready))} && while [ ! -f {shlex.quote(str(accept_gate))} ]; do sleep .02; done"
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo new > a")
+        state = self.outcome(
+            self.cli("start", "--workdir", repo, "--worktree", "--accept", accept_cmd, "write task")
+        )
+        self.addCleanup(lambda: (accept_gate.touch(), self.cli("stop", state["run"])))
+        self.until(accept_ready.exists, "run entered accept after closing in-run append channel")
+        # Append arrives after in-run channel closed -> falls back to post-settle pending-reply.json.
+        queued = self.cli("reply", state["run"], "follow after apply")
         self.assertEqual(queued.returncode, 0, queued.stderr)
+        self.assertEqual(self.outcome(queued)["appendDelivery"], "fallback")
         # Hold delivery while applying the just-settled parent, then release it.
         with (Path(state["dir"]) / "reply.lock").open("a+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            gate.touch()
+            accept_gate.touch()
             self.until(lambda: (Path(state["dir"]) / "exit_code").exists(), "parent settled")
             applied = self.cli("apply", state["run"])
             self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)

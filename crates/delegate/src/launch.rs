@@ -1972,7 +1972,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     o.share = strings(&meta["share"]);
     if active(&state(&parent)) {
         return Err(format!(
-            "{} is still running; use reply --when-done to deliver after it settles, or wait before replying",
+            "{} is still running; append directly with `delegate reply` or wait before launching a new round",
             parent.file_name().unwrap_or_default().to_string_lossy()
         ));
     }

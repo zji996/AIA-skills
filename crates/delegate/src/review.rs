@@ -3773,7 +3773,9 @@ pub fn run_accept_and_review(
         };
 
         // Preserve previous round's result before rework overwrites `result.md` (compression as index).
-        let prev_round_result = run.join(format!("round-{round}-result.md"));
+        let prev_max = crate::runs::max_round_result_num(run);
+        let prev_round_num = if prev_max > 0 { prev_max } else { round as usize };
+        let prev_round_result = run.join(format!("round-{prev_round_num}-result.md"));
         if !prev_round_result.is_file() {
             let prev_text = if !answer.trim().is_empty() {
                 format!("{}\n", answer.trim_end_matches('\n'))
@@ -3831,7 +3833,8 @@ pub fn run_accept_and_review(
         if !*policy_refused && !author_answer.trim().is_empty() {
             *answer = author_answer;
             let formatted = format!("{}\n", answer.trim_end_matches('\n'));
-            write(run.join(format!("round-{}-result.md", round + 1)), &formatted)?;
+            let next_round_num = crate::runs::max_round_result_num(run) + 1;
+            write(run.join(format!("round-{next_round_num}-result.md")), &formatted)?;
             write(run.join("result.md"), &formatted)?;
         }
         let pre = supervise::settle_pre_accept(

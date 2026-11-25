@@ -41,7 +41,7 @@
 | `generate.log` | `apply` 执行 `.delegate.json` 的 `generated.command` 时的输出 |
 | `.generate-pending` | 生成未成功，后续 apply 仍须重试；成功后清除 |
 | `session/` / `fork/` | Pi 本轮的会话；`reply` 分叉所用的上一轮会话副本 |
-| `pending-reply.json` / `reply.lock` | 待续答正文/选项与投递取消锁；行为见 [续接](practice.md) |
+| `appends.json` / `pending-reply.json` / `reply.lock` | 运行中只追加信箱（编号、投递状态与关闭标记）、收尾兜底待续答与互斥锁；行为见 [续接](practice.md) |
 | `reply-delivered.json` | 后台待续答成功启动后的子 run 与时间 |
 | `.stopped` | 主控 stop 的标记，避免 wait --any 将取消当作交付 |
 | `bash-env` | 仅同事 Bash 继承的源树误写 DEBUG 检查（见并行安全），验收等主控命令不注入 |

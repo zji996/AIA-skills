@@ -201,7 +201,7 @@ class DelegateAgyControllerBaseTests(unittest.TestCase):
             "    print('1.6.0')\n"
             "    sys.exit(0)\n"
             f"Path({str(dumped_agy)!r}).write_text('\\n'.join(f'{{k}}={{v}}' for k, v in os.environ.items()) + '\\n')\n"
-            "sys.stdin.read()\n"
+            "sys.stdin.readline()\n"
             "print(json.dumps({'event': 'init', 'conversation_id': 'child-conv-1'}), flush=True)\n"
             "print(json.dumps({'event': 'step_update', 'step_update': {'step_index': 1, 'step_type': 'agent_response', 'state': 'DONE', 'text_delta': 'agy ok'}}), flush=True)\n"
             "print(json.dumps({'event': 'result', 'result': {'conversation_id': 'child-conv-1', 'status': 'SUCCESS', 'response': 'agy ok'}}), flush=True)\n",

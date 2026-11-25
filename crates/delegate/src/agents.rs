@@ -979,7 +979,14 @@ fn filter_pi(v: &Value) -> Vec<Value> {
         ],
         "compaction_start" | "compaction_end" => vec![json!({"e":kind,"reason":usage(v,"reason")})],
         // rpi's print mode ends with `result` instead of Pi's `agent_settled`.
-        "agent_settled" => vec![json!({"e":"settled"})],
+        "agent_settled" => {
+            let mut out = vec![];
+            if s(v, "outcome") != "completed" && !s(v, "error").is_empty() {
+                out.push(json!({"e":"turn_error","detail":clip(s(v,"error"),300)}));
+            }
+            out.push(json!({"e":"settled"}));
+            out
+        }
         "result" if s(v, "outcome") == "completed" => vec![json!({"e":"settled"})],
         _ => vec![],
     }
@@ -1000,6 +1007,369 @@ pub(crate) fn stall_seconds(meta: &Value, key: &str) -> Option<f64> {
         return None;
     }
     seconds(&value).ok().filter(|n| *n > 0.0)
+}
+
+fn command_pi_rpc(meta: &Value, session: Option<&str>) -> Vec<String> {
+    let fork = s(meta, "fork");
+    let mut a = vec!["pi".into()];
+    if !fork.is_empty() {
+        a.extend(["--fork".into(), fork.into()]);
+    } else {
+        a.extend(["--session-id".into(), session.unwrap_or("").into()]);
+    }
+    a.extend([
+        "--session-dir".into(),
+        s(meta, "sessionDir").into(),
+        "--mode".into(),
+        "rpc".into(),
+    ]);
+    for key in ["provider", "model", "thinking"] {
+        if !s(meta, key).is_empty() {
+            a.extend([format!("--{key}"), s(meta, key).into()]);
+        }
+    }
+    if s(meta, "mode") == "read-only" {
+        a.extend([
+            "--tools".into(),
+            if b(meta, "shell") {
+                "read,grep,find,ls,bash".into()
+            } else {
+                "read,grep,find,ls".into()
+            },
+        ]);
+    }
+    if !s(meta, "dir").is_empty() {
+        let role = Path::new(s(meta, "dir")).join("colleague.md");
+        a.extend([
+            "--append-system-prompt".into(),
+            role.to_string_lossy().into(),
+        ]);
+    }
+    a
+}
+
+/// Probe whether a `pi` executable (specifically `rpi` or an RPC-capable binary) supports
+/// `--mode rpc` with `queue_message(deliverAs: "steer")`. Cached by binary signature
+/// (`mtime`/`size`/content hash for small scripts). Only probes binaries whose `--version`
+/// identifies `rpi` (or explicitly mentions `rpc`) so legacy/non-`rpi` binaries and test stubs
+/// are never invoked with `--mode rpc`.
+pub fn pi_supports_rpc_steer(bin: &Path, version: Option<&str>) -> bool {
+    let Some(ver) = version else {
+        return false;
+    };
+    let lower = ver.trim().to_ascii_lowercase();
+    if !lower.starts_with("rpi ") && !lower.contains("rpc") {
+        return false;
+    }
+    let key = bin.to_string_lossy().into_owned();
+    let sig = binary_cache_sig(bin, false);
+    if let Some(ref expected) = sig {
+        if let Some(cached) =
+            read_probe_cache("piRpcSteer", &key, expected).and_then(|v| v.as_bool())
+        {
+            return cached;
+        }
+    }
+    crate::locks::assert_not_holding_state_lock("pi_supports_rpc_steer");
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args([
+        "--mode",
+        "rpc",
+        "--no-session",
+        "--offline",
+        "--no-tools",
+        "--no-skills",
+        "--no-context-files",
+        "--no-extensions",
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+    group(&mut cmd);
+    let supported = cmd.spawn().ok().is_some_and(|mut child| {
+        if let Some(mut stdin) = child.stdin.take() {
+            let payload = format!(
+                "{}\n{}\n",
+                json!({"id":"probe-steer","type":"queue_message","deliverAs":"steer","message":"probe"}),
+                json!({"id":"probe-stop","type":"stop"})
+            );
+            let _ = stdin.write_all(payload.as_bytes());
+            let _ = stdin.flush();
+        }
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if started.elapsed() < Duration::from_secs(2) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                _ => {
+                    end_group(child.id() as i32, 0.2);
+                    let _ = child.wait();
+                    return false;
+                }
+            }
+        }
+        child.wait_with_output().ok().is_some_and(|out| {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let mut has_ready_cmds = false;
+            let mut steer_accepted = false;
+            for line in stdout.lines() {
+                let Ok(v) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                if s(&v, "type") == "ready" {
+                    let cmds = strings(&v["supportedCommands"]);
+                    if cmds.iter().any(|c| c == "prompt")
+                        && cmds.iter().any(|c| c == "queue_message")
+                        && cmds.iter().any(|c| c == "get_queue")
+                        && cmds.iter().any(|c| c == "clear_queue")
+                    {
+                        has_ready_cmds = true;
+                    }
+                } else if s(&v, "type") == "response"
+                    && s(&v, "command") == "queue_message"
+                    && s(&v, "id") == "probe-steer"
+                    && b(&v, "success")
+                {
+                    let q = s(&v["data"], "queue");
+                    if matches!(q, "steer" | "steering") {
+                        steer_accepted = true;
+                    }
+                }
+            }
+            has_ready_cmds && steer_accepted
+        })
+    });
+    if let Some(ref expected) = sig {
+        write_probe_cache("piRpcSteer", &key, expected, json!(supported));
+    }
+    supported
+}
+
+struct PiRpcShared {
+    stdin: Option<std::process::ChildStdin>,
+    closed: bool,
+    prompt_sent: bool,
+    /// True from `agent_settled` until either the next `prompt` is sent or `stop` closes the
+    /// channel; blocks `steer_pump` so no `queue_message` can race with `get_queue` / `stop`.
+    settling: bool,
+    next_req: u64,
+    /// `queue_message` requests sent on stdin whose response has not yet arrived (`req_id -> items`).
+    in_flight_steers: std::collections::HashMap<String, Vec<crate::pending_reply::AppendItem>>,
+    /// `queue_message` requests accepted by RPC (`entryId -> items`), retained until `get_queue`
+    /// after `agent_settled` proves they were consumed rather than left queued after turn end.
+    acked_steers: std::collections::HashMap<String, Vec<crate::pending_reply::AppendItem>>,
+    /// Active post-`agent_settled` queue check: `(get_queue_req_id, is_ok_turn)`.
+    pending_queue_check: Option<(String, bool)>,
+}
+
+fn send_pi_rpc_stop(st: &mut PiRpcShared, rpc_input_log: &Path) {
+    if let Some(ref mut stdin_pipe) = st.stdin {
+        let stop_line = format!("{}\n", json!({"id": "stop", "type": "stop"}));
+        let _ = append(rpc_input_log, &stop_line);
+        let _ = stdin_pipe.write_all(stop_line.as_bytes());
+        let _ = stdin_pipe.flush();
+    }
+    st.stdin = None;
+    st.closed = true;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_pi_rpc_turn(
+    shared: &Arc<Mutex<PiRpcShared>>,
+    run: &Path,
+    attempt: i64,
+    rpc_input_log: &Path,
+    log: &mut fs::File,
+    current_round: &mut usize,
+    answer: &str,
+    is_ok_turn: bool,
+    unconsumed: Vec<crate::pending_reply::AppendItem>,
+) -> bool {
+    let mut st = shared.lock().unwrap();
+    if st.stdin.is_none() || st.closed {
+        if !unconsumed.is_empty() {
+            drop(st);
+            let _ = crate::pending_reply::revert_to_fallback(run, &unconsumed);
+        }
+        return false;
+    }
+    if !is_ok_turn {
+        send_pi_rpc_stop(&mut st, rpc_input_log);
+        drop(st);
+        if !unconsumed.is_empty() {
+            let _ = crate::pending_reply::revert_steer_to_in_run(run, &unconsumed);
+        }
+        return false;
+    }
+    let take_res = if unconsumed.is_empty() {
+        crate::pending_reply::take_or_close_in_run(run, *current_round + 1)
+    } else {
+        crate::pending_reply::take_next_round_with_requeued(run, &unconsumed, *current_round + 1)
+    };
+    let batch = match take_res {
+        Ok(crate::pending_reply::TakeInRun::Messages(mut items)) => {
+            let (img_items, text_items): (Vec<_>, Vec<_>) = items
+                .drain(..)
+                .partition(|it| !it.images.is_empty());
+            if !img_items.is_empty() {
+                let _ = crate::pending_reply::promote_items_to_fallback(run, &img_items);
+            }
+            if text_items.is_empty() {
+                match crate::pending_reply::take_or_close_in_run(run, *current_round + 1) {
+                    Ok(crate::pending_reply::TakeInRun::Messages(more)) => more,
+                    _ => Vec::new(),
+                }
+            } else {
+                text_items
+            }
+        }
+        Ok(crate::pending_reply::TakeInRun::Closed) | Err(_) => Vec::new(),
+    };
+    if batch.is_empty() {
+        if *current_round > 1 && !answer.trim().is_empty() {
+            let formatted = format!("{}\n", answer.trim_end_matches('\n'));
+            let _ = write(
+                run.join(format!("round-{current_round}-result.md")),
+                &formatted,
+            );
+        }
+        send_pi_rpc_stop(&mut st, rpc_input_log);
+        return false;
+    }
+    if !answer.trim().is_empty() {
+        let formatted = format!("{}\n", answer.trim_end_matches('\n'));
+        let _ = write(
+            run.join(format!("round-{current_round}-result.md")),
+            &formatted,
+        );
+    }
+    *current_round += 1;
+    st.next_req += 1;
+    let req_id = format!("p-{}", st.next_req);
+    let merged_text = crate::pending_reply::format_merged_followup(&batch);
+    let line = format!(
+        "{}\n",
+        json!({
+            "id": req_id,
+            "type": "prompt",
+            "message": merged_text,
+        })
+    );
+    let _ = append(rpc_input_log, &line);
+    let wrote_ok = if let Some(ref mut stdin_pipe) = st.stdin {
+        stdin_pipe.write_all(line.as_bytes()).is_ok() && stdin_pipe.flush().is_ok()
+    } else {
+        false
+    };
+    if wrote_ok {
+        st.settling = false;
+        drop(st);
+        let seqs: Vec<u64> = batch.iter().map(|it| it.seq).collect();
+        let _ = writeln!(
+            log,
+            "{}",
+            json!({
+                "e": "append_delivered",
+                "round": *current_round,
+                "seqs": seqs,
+                "count": batch.len(),
+                "mode": "in_run",
+                "attempt": attempt,
+                "at": iso(),
+            })
+        );
+        let _ = log.flush();
+        crate::index::upsert_run(run);
+        crate::board::refresh_for_run(run);
+        true
+    } else {
+        st.stdin = None;
+        st.closed = true;
+        drop(st);
+        let _ = crate::pending_reply::revert_to_fallback(run, &batch);
+        false
+    }
+}
+
+fn pump_pi_rpc_steer_once(
+    shared: &Arc<Mutex<PiRpcShared>>,
+    run: &Path,
+    attempt: i64,
+    rpc_input_log: &Path,
+) -> bool {
+    let mut st = shared.lock().unwrap();
+    if st.closed || st.stdin.is_none() {
+        return false;
+    }
+    if !st.prompt_sent || st.settling {
+        return true;
+    }
+    let Ok(batch) = crate::pending_reply::take_pending_in_run_for_steer(run) else {
+        return true;
+    };
+    if batch.is_empty() {
+        return true;
+    }
+    let (img_items, text_items): (Vec<_>, Vec<_>) =
+        batch.into_iter().partition(|it| !it.images.is_empty());
+    if !img_items.is_empty() {
+        let _ = crate::pending_reply::promote_items_to_fallback(run, &img_items);
+    }
+    if text_items.is_empty() {
+        drop(st);
+        crate::index::upsert_run(run);
+        crate::board::refresh_for_run(run);
+        return true;
+    }
+    st.next_req += 1;
+    let req_id = format!("steer-{}", st.next_req);
+    let merged_text = crate::pending_reply::format_merged_followup(&text_items);
+    let line = format!(
+        "{}\n",
+        json!({
+            "id": req_id,
+            "type": "queue_message",
+            "deliverAs": "steer",
+            "message": merged_text,
+        })
+    );
+    let _ = append(rpc_input_log, &line);
+    let wrote_ok = if let Some(ref mut stdin_pipe) = st.stdin {
+        stdin_pipe.write_all(line.as_bytes()).is_ok() && stdin_pipe.flush().is_ok()
+    } else {
+        false
+    };
+    if wrote_ok {
+        let seqs: Vec<u64> = text_items.iter().map(|it| it.seq).collect();
+        let count = text_items.len();
+        st.in_flight_steers.insert(req_id, text_items);
+        drop(st);
+        let _ = append(
+            run.join("events.jsonl"),
+            &format!(
+                "{}\n",
+                json!({
+                    "e": "append_delivered",
+                    "mode": "steer",
+                    "seqs": seqs,
+                    "count": count,
+                    "attempt": attempt,
+                    "at": iso(),
+                })
+            ),
+        );
+        crate::index::upsert_run(run);
+        crate::board::refresh_for_run(run);
+        true
+    } else {
+        st.stdin = None;
+        st.closed = true;
+        drop(st);
+        let _ = crate::pending_reply::revert_to_fallback(run, &text_items);
+        false
+    }
 }
 
 fn command_pi(meta: &Value, session: Option<&str>) -> Vec<String> {
@@ -1191,8 +1561,25 @@ pub fn run_agent_cancellable(
         COLLEAGUE
     };
     write(Path::new(s(meta, "dir")).join("colleague.md"), addendum_text)?;
+    let allow_append =
+        !b(meta, "isReviewer") && !b(meta, "isRework") && !b(meta, "noAppend");
+    let has_images = meta["images"].as_array().is_some_and(|a| !a.is_empty());
+    let pi_bin_path = if !s(meta, "agentBin").is_empty() {
+        Some(PathBuf::from(s(meta, "agentBin")))
+    } else {
+        agent_bin(AGENT)
+    };
+    let pi_ver = Some(s(meta, "agentVersion")).filter(|v| !v.is_empty());
+    let on_pi_rpc = !on_agy
+        && allow_append
+        && !has_images
+        && pi_bin_path
+            .as_deref()
+            .is_some_and(|p| pi_supports_rpc_steer(p, pi_ver));
     let mut args = if on_agy {
         crate::agy::command(meta, Some(s(meta, "fork")))
+    } else if on_pi_rpc {
+        command_pi_rpc(meta, session.as_deref())
     } else {
         command_pi(meta, session.as_deref())
     };
@@ -1203,22 +1590,43 @@ pub fn run_agent_cancellable(
         .as_str()
         .map(PathBuf::from)
         .unwrap_or_else(|| run.join("prompt.md"));
-    let prompt_path = if on_agy {
+    let agy_input_log = run.join(format!("agy-input-{attempt}.jsonl"));
+    let pi_rpc_input_log = run.join(format!("pi-rpc-input-{attempt}.jsonl"));
+    let (prompt_file_stdin, initial_agy_line, initial_pi_rpc_line) = if on_agy {
         // agy takes the prompt as one stream-json message; the addendum Pi gets as a
         // system-prompt append opens a new conversation's first message.
         let task = fs::read_to_string(&prompt_path).map_err(|e| e.to_string())?;
         let addendum = if s(meta, "fork").is_empty() { addendum_text } else { "" };
         let images = meta["images"].as_array().cloned().unwrap_or_default();
-        let input = run.join(format!("agy-input-{attempt}.jsonl"));
-        write(&input, crate::agy::input(addendum, &task, &images))?;
-        input
+        let line = crate::agy::input(addendum, &task, &images);
+        write(&agy_input_log, &line)?;
+        if allow_append {
+            (None, Some(line), None)
+        } else {
+            let f = OpenOptions::new()
+                .read(true)
+                .open(&agy_input_log)
+                .map_err(|e| e.to_string())?;
+            (Some(f), None, None)
+        }
+    } else if on_pi_rpc {
+        let task = fs::read_to_string(&prompt_path).map_err(|e| e.to_string())?;
+        let line = format!(
+            "{}\n",
+            json!({"id": "p-1", "type": "prompt", "message": task})
+        );
+        write(&pi_rpc_input_log, &line)?;
+        (None, None, Some(line))
     } else {
-        prompt_path
+        let f = OpenOptions::new()
+            .read(true)
+            .open(&prompt_path)
+            .map_err(|e| e.to_string())?;
+        (Some(f), None, None)
     };
-    let prompt = OpenOptions::new()
-        .read(true)
-        .open(prompt_path)
-        .map_err(|e| e.to_string())?;
+    if on_pi_rpc {
+        touch(run.join(crate::pending_reply::PI_RPC_STEER_MARKER));
+    }
     let stderr = OpenOptions::new()
         .create(true)
         .append(true)
@@ -1245,7 +1653,10 @@ pub fn run_agent_cancellable(
     let mut c =
         crate::cleanup::scoped_command(run, &format!("agent-{attempt}"), &args[0], &args[1..]);
     c.current_dir(s(meta, "workdir"))
-        .stdin(Stdio::from(prompt))
+        .stdin(match prompt_file_stdin {
+            Some(f) => Stdio::from(f),
+            None => Stdio::piped(),
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr));
     clean_env(&mut c, &meta["env"]);
@@ -1263,6 +1674,42 @@ pub fn run_agent_cancellable(
     c.env("PI_DELEGATE_ACTIVE", "1");
     group(&mut c);
     let mut child = c.spawn().map_err(|e| e.to_string())?;
+    let mut agy_stdin = if on_agy { child.stdin.take() } else { None };
+    if let (Some(line), Some(ref mut stdin_pipe)) = (initial_agy_line, agy_stdin.as_mut()) {
+        if stdin_pipe.write_all(line.as_bytes()).is_err() || stdin_pipe.flush().is_err() {
+            agy_stdin = None;
+        }
+    }
+    let pi_rpc_state = if on_pi_rpc {
+        Some(Arc::new(Mutex::new(PiRpcShared {
+            stdin: child.stdin.take(),
+            closed: false,
+            prompt_sent: false,
+            settling: false,
+            next_req: 1,
+            in_flight_steers: std::collections::HashMap::new(),
+            acked_steers: std::collections::HashMap::new(),
+            pending_queue_check: None,
+        })))
+    } else {
+        None
+    };
+    let steer_stop = Arc::new(AtomicBool::new(false));
+    let steer_pump = pi_rpc_state.as_ref().map(|shared| {
+        let shared = shared.clone();
+        let stop_flag = steer_stop.clone();
+        let pump_run = run.to_path_buf();
+        let pump_log = pi_rpc_input_log.clone();
+        std::thread::spawn(move || {
+            let watcher = crate::inotify::StateWatcher::watch(&pump_run);
+            while !stop_flag.load(Ordering::SeqCst) {
+                if !pump_pi_rpc_steer_once(&shared, &pump_run, attempt, &pump_log) {
+                    break;
+                }
+                crate::inotify::wait_or_sleep(watcher.as_ref(), Duration::from_millis(150));
+            }
+        })
+    });
     let pid = child.id() as i32;
     holder.store(pid, Ordering::SeqCst);
     if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
@@ -1470,6 +1917,7 @@ pub fn run_agent_cancellable(
     let mut turn = Value::Null;
     let mut answer = String::new();
     let mut settled = false;
+    let mut current_round = crate::runs::max_round_result_num(run) + 1;
     let mut agy_filter = crate::agy::Filter::default();
     let mut agy_session = String::new();
     let mut loop_detector = LoopDetector::new(loop_threshold(meta));
@@ -1490,6 +1938,144 @@ pub fn run_agent_cancellable(
             let Ok(event) = serde_json::from_slice::<Value>(&raw) else {
                 continue;
             };
+            if let Some(ref shared) = pi_rpc_state {
+                let ev_type = s(&event, "type");
+                if ev_type == "ready" {
+                    let mut st = shared.lock().unwrap();
+                    if !st.prompt_sent {
+                        if let (Some(ref line), Some(ref mut stdin_pipe)) =
+                            (&initial_pi_rpc_line, st.stdin.as_mut())
+                        {
+                            if stdin_pipe.write_all(line.as_bytes()).is_ok()
+                                && stdin_pipe.flush().is_ok()
+                            {
+                                st.prompt_sent = true;
+                            } else {
+                                st.stdin = None;
+                                st.closed = true;
+                            }
+                        }
+                    }
+                    drop(st);
+                    // Drain any appends that arrived while queued before the first turn started.
+                    pump_pi_rpc_steer_once(shared, run, attempt, &pi_rpc_input_log);
+                } else if ev_type == "response" && s(&event, "command") == "queue_message" {
+                    let req_id = s(&event, "id");
+                    let ok = b(&event, "success");
+                    let entry_id = {
+                        let e = s(&event["data"], "entryId");
+                        if !e.is_empty() {
+                            e.to_string()
+                        } else {
+                            let r = s(&event["result"], "entryId");
+                            if !r.is_empty() {
+                                r.to_string()
+                            } else {
+                                req_id.to_string()
+                            }
+                        }
+                    };
+                    let mut failed_batch = None;
+                    {
+                        let mut st = shared.lock().unwrap();
+                        if let Some(batch) = st.in_flight_steers.remove(req_id) {
+                            if ok {
+                                st.acked_steers.insert(entry_id, batch);
+                            } else {
+                                failed_batch = Some(batch);
+                            }
+                        }
+                    }
+                    if let Some(batch) = failed_batch {
+                        let _ = crate::pending_reply::revert_steer_to_in_run(run, &batch);
+                    }
+                } else if ev_type == "response" && s(&event, "command") == "get_queue" {
+                    let resp_id = s(&event, "id");
+                    let matched = {
+                        let mut st = shared.lock().unwrap();
+                        if st
+                            .pending_queue_check
+                            .as_ref()
+                            .is_some_and(|(qid, _)| qid == resp_id)
+                        {
+                            let (_, is_ok_turn) = st.pending_queue_check.take().unwrap();
+                            let data_obj = if event["data"].is_object() {
+                                &event["data"]
+                            } else {
+                                &event["result"]
+                            };
+                            let items_arr = data_obj["items"]
+                                .as_array()
+                                .cloned()
+                                .unwrap_or_default();
+                            let queued_ids: std::collections::HashSet<String> = items_arr
+                                .iter()
+                                .filter(|it| {
+                                    let status = s(it, "status");
+                                    status.is_empty() || status == "queued"
+                                })
+                                .map(|it| s(it, "entryId").to_string())
+                                .filter(|id| !id.is_empty())
+                                .collect();
+                            let queued_count = data_obj["count"]
+                                .as_u64()
+                                .unwrap_or(queued_ids.len() as u64);
+                            let mut unconsumed: Vec<crate::pending_reply::AppendItem> = Vec::new();
+                            for (eid, batch) in st.acked_steers.drain() {
+                                if queued_ids.contains(&eid)
+                                    || (queued_count > 0 && queued_ids.is_empty())
+                                {
+                                    unconsumed.extend(batch);
+                                }
+                            }
+                            for (_, batch) in st.in_flight_steers.drain() {
+                                unconsumed.extend(batch);
+                            }
+                            unconsumed.sort_by_key(|it| it.seq);
+                            let mut clear_failed = false;
+                            if !unconsumed.is_empty() || queued_count > 0 {
+                                st.next_req += 1;
+                                let clear_line = format!(
+                                    "{}\n",
+                                    json!({"id": format!("clear-{}", st.next_req), "type": "clear_queue"})
+                                );
+                                let _ = append(&pi_rpc_input_log, &clear_line);
+                                if let Some(ref mut stdin_pipe) = st.stdin {
+                                    if stdin_pipe.write_all(clear_line.as_bytes()).is_err()
+                                        || stdin_pipe.flush().is_err()
+                                    {
+                                        st.stdin = None;
+                                        st.closed = true;
+                                        clear_failed = true;
+                                    }
+                                }
+                            }
+                            Some((is_ok_turn, unconsumed, clear_failed))
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some((is_ok_turn, unconsumed, clear_failed)) = matched {
+                        if clear_failed {
+                            if !unconsumed.is_empty() {
+                                let _ = crate::pending_reply::revert_to_fallback(run, &unconsumed);
+                            }
+                        } else if finalize_pi_rpc_turn(
+                            shared,
+                            run,
+                            attempt,
+                            &pi_rpc_input_log,
+                            &mut log,
+                            &mut current_round,
+                            &answer,
+                            is_ok_turn,
+                            unconsumed,
+                        ) {
+                            settled = false;
+                        }
+                    }
+                }
+            }
             let items = if on_agy {
                 if agy_session.is_empty() {
                     if let Some(id) = crate::agy::conversation(&event) {
@@ -1621,7 +2207,182 @@ pub fn run_agent_cancellable(
                     spawn_isolated_loop_review(meta, run, &cmd, count);
                 }
             }
+            // At each agy turn boundary (`result` / `settled`), drain any appended follow-up
+            // messages over the live stdin pipe, or mark the in-run channel closed and drop stdin
+            // so agy finishes cleanly while later arrivals fall back to `_reply-pending`.
+            if on_agy && allow_append && settled && agy_stdin.is_some() {
+                let is_ok_turn = s(&turn, "stopReason") == "stop"
+                    && !lane::stopped()
+                    && !cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst));
+                if is_ok_turn {
+                    match crate::pending_reply::take_or_close_in_run(run, current_round + 1) {
+                        Ok(crate::pending_reply::TakeInRun::Messages(batch)) => {
+                            if !answer.trim().is_empty() {
+                                let formatted = format!("{}\n", answer.trim_end_matches('\n'));
+                                let _ = write(
+                                    run.join(format!("round-{current_round}-result.md")),
+                                    &formatted,
+                                );
+                            }
+                            current_round += 1;
+                            let merged_text =
+                                crate::pending_reply::format_merged_followup(&batch);
+                            let images = crate::pending_reply::merged_images(&batch);
+                            let line = crate::agy::followup_input(&merged_text, &images);
+                            let _ = append(&agy_input_log, &line);
+                            let wrote_ok = if let Some(ref mut stdin_pipe) = agy_stdin {
+                                stdin_pipe.write_all(line.as_bytes()).is_ok()
+                                    && stdin_pipe.flush().is_ok()
+                            } else {
+                                false
+                            };
+                            if wrote_ok {
+                                let seqs: Vec<u64> = batch.iter().map(|it| it.seq).collect();
+                                let _ = writeln!(
+                                    log,
+                                    "{}",
+                                    json!({
+                                        "e": "append_delivered",
+                                        "round": current_round,
+                                        "seqs": seqs,
+                                        "count": batch.len(),
+                                        "mode": "in_run",
+                                        "attempt": attempt,
+                                        "at": iso(),
+                                    })
+                                );
+                                let _ = log.flush();
+                                crate::index::upsert_run(run);
+                                crate::board::refresh_for_run(run);
+                                settled = false;
+                            } else {
+                                let _ = crate::pending_reply::revert_to_fallback(run, &batch);
+                                agy_stdin = None;
+                            }
+                        }
+                        Ok(crate::pending_reply::TakeInRun::Closed) | Err(_) => {
+                            if current_round > 1 && !answer.trim().is_empty() {
+                                let formatted = format!("{}\n", answer.trim_end_matches('\n'));
+                                let _ = write(
+                                    run.join(format!("round-{current_round}-result.md")),
+                                    &formatted,
+                                );
+                            }
+                            agy_stdin = None;
+                        }
+                    }
+                } else {
+                    agy_stdin = None;
+                }
+            }
+            // At each Pi RPC `agent_settled` boundary:
+            // 1. Block `steer_pump` (`settling = true`) so no new `queue_message` races with close.
+            // 2. If any `steer` was sent this turn, query `get_queue` first to verify whether it
+            //    was consumed by the turn or landed after turn end (still `queued`).
+            // 3. Otherwise finalize immediately (send next `prompt` or `stop`).
+            if let Some(ref shared) = pi_rpc_state {
+                if settled {
+                    let is_ok_turn = s(&turn, "stopReason") == "stop"
+                        && !lane::stopped()
+                        && !cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst));
+                    enum SettleAction {
+                        AlreadyHandling,
+                        WaitQueueCheck,
+                        FinalizeNow,
+                        PipeBroken(Vec<crate::pending_reply::AppendItem>),
+                    }
+                    let action = {
+                        let mut st = shared.lock().unwrap();
+                        if st.stdin.is_none() || st.closed || st.pending_queue_check.is_some() {
+                            SettleAction::AlreadyHandling
+                        } else {
+                            st.settling = true;
+                            if !st.in_flight_steers.is_empty() || !st.acked_steers.is_empty() {
+                                st.next_req += 1;
+                                let qid = format!("qcheck-{}", st.next_req);
+                                let qline =
+                                    format!("{}\n", json!({"id": qid, "type": "get_queue"}));
+                                let _ = append(&pi_rpc_input_log, &qline);
+                                let wrote_ok = if let Some(ref mut stdin_pipe) = st.stdin {
+                                    stdin_pipe.write_all(qline.as_bytes()).is_ok()
+                                        && stdin_pipe.flush().is_ok()
+                                } else {
+                                    false
+                                };
+                                if wrote_ok {
+                                    st.pending_queue_check = Some((qid, is_ok_turn));
+                                    SettleAction::WaitQueueCheck
+                                } else {
+                                    st.stdin = None;
+                                    st.closed = true;
+                                    let mut lost: Vec<_> = st
+                                        .in_flight_steers
+                                        .drain()
+                                        .flat_map(|(_, v)| v)
+                                        .collect();
+                                    lost.extend(st.acked_steers.drain().flat_map(|(_, v)| v));
+                                    lost.sort_by_key(|it| it.seq);
+                                    SettleAction::PipeBroken(lost)
+                                }
+                            } else {
+                                SettleAction::FinalizeNow
+                            }
+                        }
+                    };
+                    match action {
+                        SettleAction::AlreadyHandling | SettleAction::WaitQueueCheck => {}
+                        SettleAction::PipeBroken(lost) => {
+                            if !lost.is_empty() {
+                                let _ = crate::pending_reply::revert_to_fallback(run, &lost);
+                            }
+                        }
+                        SettleAction::FinalizeNow => {
+                            if finalize_pi_rpc_turn(
+                                shared,
+                                run,
+                                attempt,
+                                &pi_rpc_input_log,
+                                &mut log,
+                                &mut current_round,
+                                &answer,
+                                is_ok_turn,
+                                Vec::new(),
+                            ) {
+                                settled = false;
+                            }
+                        }
+                    }
+                }
+            }
         }
+    }
+    drop(agy_stdin);
+    steer_stop.store(true, Ordering::SeqCst);
+    if on_pi_rpc {
+        let _ = fs::remove_file(run.join(crate::pending_reply::PI_RPC_STEER_MARKER));
+    }
+    if let Some(ref shared) = pi_rpc_state {
+        let mut leftover: Vec<crate::pending_reply::AppendItem> = {
+            let mut st = shared.lock().unwrap();
+            st.closed = true;
+            st.stdin = None;
+            let mut out: Vec<_> = st
+                .in_flight_steers
+                .drain()
+                .flat_map(|(_, items)| items)
+                .collect();
+            if !settled || st.pending_queue_check.is_some() || !st.acked_steers.is_empty() {
+                out.extend(st.acked_steers.drain().flat_map(|(_, items)| items));
+            }
+            out
+        };
+        leftover.sort_by_key(|it| it.seq);
+        if !leftover.is_empty() {
+            let _ = crate::pending_reply::revert_to_fallback(run, &leftover);
+        }
+    }
+    if let Some(handle) = steer_pump {
+        let _ = handle.join();
     }
     loop {
         let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
@@ -1922,5 +2683,58 @@ mod tests {
             d.record_bash("sleep 1 && cargo test", false, "fail"),
             Some(3)
         );
+    }
+
+    #[test]
+    fn pi_rpc_command_omits_print_flag_and_steer_probe_detects_capability() {
+        let meta = json!({"workdir":"/repo","sessionDir":"/runs/session","mode":"read-only","provider":"p","model":"m","thinking":"high"});
+        let rpc_args = command_pi_rpc(&meta, Some("s-1"));
+        assert!(rpc_args.windows(2).any(|w| w == ["--mode", "rpc"]));
+        assert!(!rpc_args.contains(&"-p".to_string()));
+        assert!(rpc_args.windows(2).any(|w| w == ["--session-id", "s-1"]));
+
+        let dir = std::env::temp_dir().join(format!(
+            "delegate-rpc-probe-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let rpc_bin = dir.join("pi-rpc");
+        fs::write(
+            &rpc_bin,
+            "#!/bin/sh\n\
+             echo '{\"type\":\"ready\",\"supportedCommands\":[\"prompt\",\"queue_message\",\"get_queue\",\"clear_queue\",\"stop\"]}'\n\
+             while IFS= read -r line; do\n\
+               case \"$line\" in\n\
+                 *probe-steer*) echo '{\"type\":\"response\",\"command\":\"queue_message\",\"success\":true,\"id\":\"probe-steer\",\"data\":{\"accepted\":true,\"queue\":\"steer\"}}' ;;\n\
+                 *probe-stop*) echo '{\"type\":\"response\",\"command\":\"stop\",\"success\":true,\"id\":\"probe-stop\"}' ; exit 0 ;;\n\
+               esac\n\
+             done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&rpc_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(pi_supports_rpc_steer(&rpc_bin, Some("rpi 0.20.0")));
+
+        // Legacy fake-pi version string skips RPC probe completely.
+        assert!(!pi_supports_rpc_steer(&rpc_bin, Some("fake-pi 1.0")));
+
+        let no_steer_bin = dir.join("pi-no-steer");
+        fs::write(
+            &no_steer_bin,
+            "#!/bin/sh\n\
+             echo '{\"type\":\"ready\",\"supportedCommands\":[\"prompt\",\"queue_message\",\"stop\"]}'\n\
+             while IFS= read -r line; do\n\
+               case \"$line\" in\n\
+                 *probe-steer*) echo '{\"type\":\"response\",\"command\":\"queue_message\",\"success\":true,\"id\":\"probe-steer\",\"data\":{\"accepted\":true,\"queue\":\"followUp\"}}' ;;\n\
+                 *probe-stop*) echo '{\"type\":\"response\",\"command\":\"stop\",\"success\":true,\"id\":\"probe-stop\"}' ; exit 0 ;;\n\
+               esac\n\
+             done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&no_steer_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!pi_supports_rpc_steer(&no_steer_bin, Some("rpi 0.19.0")));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

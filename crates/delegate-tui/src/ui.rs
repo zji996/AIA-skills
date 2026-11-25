@@ -1244,7 +1244,12 @@ fn build_detail_lines(app: &App, run: &RunItem, width: usize) -> Vec<Line<'stati
         timing_parts.push(format!("{turns} 轮"));
     }
     // `chain_round` is already shown in the detail pane title (`第N轮`).
-    if run.pending_reply {
+    if run.appended_total > 0 {
+        timing_parts.push(format!(
+            "已追加 {} 条，待投递 {} 条",
+            run.appended_total, run.appended_pending
+        ));
+    } else if run.pending_reply {
         timing_parts.push("有待续追问".to_string());
     }
     if !timing_parts.is_empty() {

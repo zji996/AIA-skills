@@ -49,7 +49,7 @@ const COLLECT: &[(&str, &str)] = &[
 ];
 
 const REPLY: &[(&str, &str)] = &[
-    ("run", "Finished parent run to continue. A write timeout continuation does not consume maxRework."),
+    ("run", "Target run to continue (if finished) or append to (if active). A write timeout continuation does not consume maxRework."),
     ("words", "Follow-up message (or use --prompt / --prompt-file)."),
     ("--prompt TEXT", "Follow-up message text."),
     ("--prompt-file FILE", "Read the message from FILE, or - for stdin."),
@@ -71,7 +71,7 @@ const REPLY: &[(&str, &str)] = &[
     ("--sync", "Force-merge the caller's later changes into the conversation worktree before replying; conflicts stop the reply (default auto-sync keeps the old baseline on conflict)."),
     ("--sync=agent", "Hand text conflicts to the colleague to resolve first; remaining markers fail acceptance. Binary/structural conflicts still stop the reply."),
     ("--no-sync", "Skip automatic baseline sync on reply and keep the worktree's existing baseline."),
-    ("--when-done", "Record one pending reply while the run is active; detached delivery survives shell exit. Visible in status; stop cancels it. Cannot combine with --wait."),
+    ("--when-done", "Compatibility alias (default behavior for active runs): append to the running run's mailbox for turn-boundary delivery in the same session, falling back to a new round after settlement if the final turn is already closing. Visible in status/card/TUI; stop cancels pending appends. Cannot combine with --wait."),
     ("--wait", "Wait for the reply's outcome and answer instead of returning after launch."),
     ("--tier scout|review|write", "Continue on this purpose tier; may combine with --model. Ordinary replies keep the saved model and thinking."),
     ("--model ALIAS", "Continue on a registered model alias or full id; unique registry substring accepted."),
@@ -86,7 +86,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("run", "Start, then wait for the outcome and answer."),
     (
         "reply",
-        "Continue a finished run's conversation in the background.",
+        "Append a follow-up to an active run (delivered at turn boundary in the same session), or continue a finished run in the background.",
     ),
     ("wait", "Wait for runs or events (--since SEQ); print outcomes, answers, or new cursor."),
     (

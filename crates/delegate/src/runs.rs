@@ -964,6 +964,7 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
         out["acceptBlind"] = json!(blind);
     }
     if let Some(pending) = crate::pending_reply::status(run) { out["pendingReply"] = pending; }
+    if let Some(appends) = crate::pending_reply::summary_json(run) { out["appends"] = appends; }
     let result = run.join("result.md");
     if meta["agentDeny"]
         .as_array()
@@ -1106,6 +1107,7 @@ pub fn remove_after_apply(run: &Path) -> (Vec<String>, bool) {
     let keep = [
         "meta.json",
         "archive.json",
+        "appends.json",
         "pending-reply.json",
         "reply.lock",
         "reply-delivered.json",
@@ -1698,6 +1700,7 @@ impl ResultRound {
     pub fn kind_zh(&self) -> &'static str {
         match self.kind {
             "rework" => "返工",
+            "append" => "追加",
             "reply" => "reply",
             _ => "初稿",
         }
@@ -1734,6 +1737,18 @@ pub fn parse_round_result_name(name: &str) -> Option<usize> {
 
 pub fn is_round_result_name(name: &str) -> bool {
     parse_round_result_name(name).is_some()
+}
+
+/// Highest existing `round-N-result.md` number in `run`, or `0` if none exist yet.
+pub fn max_round_result_num(run: &Path) -> usize {
+    fs::read_dir(run)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_file())
+        .filter_map(|entry| parse_round_result_name(&entry.file_name().to_string_lossy()))
+        .max()
+        .unwrap_or(0)
 }
 
 /// List preserved result files within a single run directory in ascending round order.
@@ -1843,12 +1858,17 @@ pub fn collect_result_rounds(run: &Path, include_chain: bool) -> Vec<ResultRound
     for (run_idx, dir) in dirs.iter().enumerate() {
         let meta = json(dir.join("meta.json"));
         let rid = crate::notes::run_id(dir, &meta);
+        let append_rounds = crate::pending_reply::append_delivered_rounds(dir);
         for (intra_round, path) in intra_run_result_files(dir) {
             let raw = read(&path);
             let total_lines = raw.lines().count();
             let total_chars = raw.chars().count();
             let kind = if intra_round > 1 {
-                "rework"
+                if append_rounds.contains(&intra_round) {
+                    "append"
+                } else {
+                    "rework"
+                }
             } else if run_idx > 0 {
                 "reply"
             } else {

@@ -402,6 +402,7 @@ pub fn preserve(run: &Path) -> Res<Option<PathBuf>> {
     for name in [
         "meta.json",
         "summary.json",
+        "appends.json",
         "prompt.md",
         "result.md",
         "result-original.md",

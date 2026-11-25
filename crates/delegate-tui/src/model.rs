@@ -586,6 +586,8 @@ pub struct RunItem {
     pub applied: bool,
     pub applied_by: Option<String>,
     pub pending_reply: bool,
+    pub appended_total: u64,
+    pub appended_pending: u64,
     pub queue_reason: Option<String>,
     pub queue_ahead: Option<u64>,
     pub measure_waiting_ahead: Option<u64>,

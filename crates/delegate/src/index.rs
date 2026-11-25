@@ -55,6 +55,7 @@ pub fn run_sig(run: &Path, _work_sig: &str) -> String {
         "stall-warning.json",
         "missing-objects.json",
         "result.md",
+        "appends.json",
         "pending-reply.json",
         "sign.json",
     ]

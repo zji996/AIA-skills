@@ -335,14 +335,55 @@ fn write_actions_only_generate_commands_and_filter_narrows_rows() {
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(app.selected_run().unwrap().run, "20261120-031500-metrics");
 
-    // Verify reply command for running run uses --when-done
+    // Verify reply command for running run appends directly without --when-done
     let (cmd, _) = build_write_command(
         Path::new("delegate"),
         Path::new("/home/dev/demo-api"),
         app.selected_run().unwrap(),
         WriteAction::Reply,
     );
-    assert!(cmd.contains("reply --when-done 20261120-031500-metrics"));
+    assert!(cmd.contains("reply 20261120-031500-metrics"));
+    assert!(!cmd.contains("--when-done"));
+}
+
+#[test]
+fn run_appends_counts_parse_and_render_in_detail_pane() {
+    let raw = r#"{"run":"20261126-022856-design","name":"只读设计","mode":"read-only","state":"running","elapsedSeconds":120,"appends":{"total":2,"delivered":1,"pending":1,"fallbackPending":0,"closed":false}}"#;
+    let repo = parse_status_jsonl(Path::new("/home/dev/demo-api"), "~/demo-api", raw);
+    let run = &repo.runs[0];
+    assert_eq!(run.appended_total, 2);
+    assert_eq!(run.appended_pending, 1);
+
+    let mut app = App::new(
+        AppSnapshot {
+            repos: vec![repo],
+            ..AppSnapshot::default()
+        },
+        PathBuf::from("delegate"),
+        PathBuf::from("/home/dev/demo-api"),
+        30,
+    );
+    app.tab = delegate_tui::app::ViewTab::Runs;
+    let backend = ratatui::backend::TestBackend::new(120, 32);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| delegate_tui::ui::render(f, &mut app))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+    let mut rendered = String::new();
+    for y in 0..32u16 {
+        let mut x = 0u16;
+        while x < 120 {
+            let sym = buf[(x, y)].symbol();
+            rendered.push_str(sym);
+            x = x.saturating_add(delegate_tui::width::display_width(sym).max(1) as u16);
+        }
+        rendered.push('\n');
+    }
+    assert!(
+        rendered.contains("已追加 2 条，待投递 1 条"),
+        "expected append summary in TUI detail pane, got:\n{rendered}"
+    );
 }
 
 #[test]

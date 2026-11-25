@@ -2864,8 +2864,8 @@ pub fn build_write_command(
         WriteAction::Reply => {
             let (cmd, note) = if matches!(run.group, GroupKind::Running | GroupKind::Queued) {
                 (
-                    format!("{bin} reply --when-done {id} '<追问内容>'"),
-                    "运行中使用 --when-done，结束后自动续做。".to_string(),
+                    format!("{bin} reply {id} '<追加问题>'"),
+                    "运行中直接追加，当前轮结束后在同一会话接着答。".to_string(),
                 )
             } else if run.question {
                 (

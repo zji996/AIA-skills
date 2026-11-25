@@ -114,6 +114,28 @@ pub fn input(colleague: &str, prompt: &str, images: &[Value]) -> String {
     )
 }
 
+/// One stream-json follow-up user message sent over an already-open `agy` stdin pipe at a turn
+/// boundary (no colleague addendum repeat; optional images attached by path).
+pub fn followup_input(text: &str, images: &[Value]) -> String {
+    let mut content = text.to_string();
+    let paths = images
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    if !paths.is_empty() {
+        content.push_str("\n\nImages for this follow-up (open them before answering):\n");
+        for path in paths {
+            content.push_str("- ");
+            content.push_str(path);
+            content.push('\n');
+        }
+    }
+    format!(
+        "{}\n",
+        json!({"event":"user","message":{"role":"user","content":content}})
+    )
+}
+
 /// Extract cumulative `(input, output, cache_read)` token counts from any `agy` stream-json
 /// event that carries a usage block (`result.usage`, `step_update.usage`, `step_update.token_usage`,
 /// top-level `usage` / `token_usage`). Returns `None` when no numeric usage fields are present.
@@ -248,10 +270,13 @@ impl Filter {
                         "cacheRead": u["cache_read_tokens"].clone(),
                     },
                 })];
-                let text = if self.tail.trim().is_empty() {
+                let tail = std::mem::take(&mut self.tail);
+                self.started.clear();
+                self.commands.clear();
+                let text = if tail.trim().is_empty() {
                     s(r, "response")
                 } else {
-                    self.tail.as_str()
+                    tail.as_str()
                 };
                 if ok && !text.trim().is_empty() {
                     out.push(json!({"e":"result","text":text}));
@@ -540,5 +565,24 @@ mod tests {
             extract_usage(&json!({"event": "result", "result": {"usage": {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0}}})),
             None
         );
+    }
+
+    #[test]
+    fn followup_input_and_multiturn_filter_reset_between_turns() {
+        let line = followup_input("follow-up body", &[json!("/b.png")]);
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(s(&v, "event"), "user");
+        let text = s(&v["message"], "content");
+        assert!(text.starts_with("follow-up body"));
+        assert!(text.contains("- /b.png"));
+
+        let mut f = Filter::default();
+        f.events(&json!({"event":"step_update","step_update":{"step_index":1,"step_type":"agent_response","state":"ACTIVE","text_delta":"round 1 tail"}}));
+        let r1 = f.events(&json!({"event":"result","result":{"status":"SUCCESS","response":"round 1 resp","usage":{}}}));
+        assert_eq!(r1[1]["text"], "round 1 tail");
+
+        // Turn 2 has no text_delta: must NOT reuse round 1's stale tail.
+        let r2 = f.events(&json!({"event":"result","result":{"status":"SUCCESS","response":"round 2 resp","usage":{}}}));
+        assert_eq!(r2[1]["text"], "round 2 resp");
     }
 }
