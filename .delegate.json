@@ -14,5 +14,8 @@
   ],
   "hotspots": [
     "README.md"
-  ]
+  ],
+  "defaults": {
+    "worktree": true
+  }
 }
