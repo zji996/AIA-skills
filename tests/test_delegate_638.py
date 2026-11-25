@@ -351,7 +351,7 @@ class Delegate638AgyAccountsTests(unittest.TestCase):
             refreshed_beta_acc,
         )
 
-    def test_use_refuses_when_agy_running_in_same_home_and_ignores_other_home(self):
+    def test_use_succeeds_while_agy_running_and_ignores_other_home(self):
         self.seed_agy_swap()
         self.assertEqual(self.run_cli("agy", "account", "import-agy-swap").returncode, 0)
 
@@ -378,12 +378,16 @@ class Delegate638AgyAccountsTests(unittest.TestCase):
         same_proc = None
         try:
             fixtures.wait_until(other_ready.is_file, "other-home fake agy started")
-            # Process in another HOME must NOT block switching in self.home
+            # Process in another HOME is ignored (runningAgyCount == 0)
             ok_sw = self.run_cli("agy", "account", "use", "beta", "--json")
             self.assertEqual(ok_sw.returncode, 0, ok_sw.stderr)
-            self.assertEqual(json.loads(ok_sw.stdout)["active"], "beta")
+            d0 = json.loads(ok_sw.stdout)
+            self.assertTrue(d0["ok"])
+            self.assertEqual(d0["active"], "beta")
+            self.assertEqual(d0["runningAgyCount"], 0)
 
-            # Process in self.home MUST block switching and list PID + delegate run
+            # Process in self.home no longer blocks switching: `use` succeeds and reports the
+            # running process(es) that will finish on their original account.
             same_proc = subprocess.Popen(
                 [str(fake_agy), "--model", "gemini-4-neon"],
                 env={
@@ -397,33 +401,27 @@ class Delegate638AgyAccountsTests(unittest.TestCase):
             )
             fixtures.wait_until(same_ready.is_file, "same-home fake agy started")
 
-            blocked = self.run_cli("agy", "account", "use", "alpha")
-            self.assertEqual(blocked.returncode, 1)
-            self.assertIn(str(same_proc.pid), blocked.stderr)
-            self.assertIn("20261124-030000-testrun", blocked.stderr)
+            sw_human = self.run_cli("agy", "account", "use", "alpha")
+            self.assertEqual(sw_human.returncode, 0, sw_human.stderr)
+            self.assertIn("switched agy account to alpha", sw_human.stdout)
+            self.assertIn("original account", sw_human.stdout)
+            self.assertIn(str(same_proc.pid), sw_human.stdout)
+            self.assertIn("20261124-030000-testrun", sw_human.stdout)
 
-            blocked_json = self.run_cli("agy", "account", "use", "alpha", "--json")
-            self.assertEqual(blocked_json.returncode, 1)
-            bj = json.loads(blocked_json.stdout)
-            self.assertFalse(bj["ok"])
-            self.assertEqual(bj["error"], "running_agy_processes")
-            pids = [p["pid"] for p in bj["runningAgy"]]
+            sw_json = self.run_cli("agy", "account", "use", "beta", "--json")
+            self.assertEqual(sw_json.returncode, 0, sw_json.stderr)
+            sj = json.loads(sw_json.stdout)
+            self.assertTrue(sj["ok"])
+            self.assertEqual(sj["active"], "beta")
+            self.assertEqual(sj["runningAgyCount"], 1)
+            pids = [p["pid"] for p in sj["runningAgy"]]
             self.assertIn(same_proc.pid, pids)
 
-            # Live credentials remained untouched (still beta)
+            # Live credentials switched to beta immediately for subsequent runs
             self.assertEqual(
                 json.loads((self.home / ".gemini/google_accounts.json").read_text())["active"],
                 "beta@example.test",
             )
-
-            # Stop the process group in self.home -> switch now succeeds
-            os.killpg(same_proc.pid, signal.SIGTERM)
-            same_proc.wait(timeout=5)
-            same_proc = None
-
-            unblocked = self.run_cli("agy", "account", "use", "alpha", "--json")
-            self.assertEqual(unblocked.returncode, 0, unblocked.stderr)
-            self.assertEqual(json.loads(unblocked.stdout)["active"], "alpha")
         finally:
             for p in (same_proc, other_proc):
                 if p is not None and p.poll() is None:
@@ -439,6 +437,237 @@ class Delegate638AgyAccountsTests(unittest.TestCase):
                         except ProcessLookupError:
                             pass
                         p.wait(timeout=5)
+
+    def test_live_switch_during_delegated_agy_run_preserves_new_live_creds_and_saves_back_old_slot(self):
+        self.seed_agy_swap()
+        self.assertEqual(self.run_cli("agy", "account", "import-agy-swap").returncode, 0)
+
+        # Create a minimal git repo for delegate runs
+        repo_dir = Path(self._tmp.name) / "repo"
+        repo_dir.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "config", "user.email", "t@example.test"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_dir, check=True)
+        (repo_dir / "README.md").write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "commit", "-qm", "init"], cwd=repo_dir, check=True)
+
+        # Configure agy model in isolated user config
+        cfg_dir = self.home / ".config/delegate"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        (cfg_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "models": {"neon": "agy/gemini-4-neon"},
+                    "tiers": {"scout": "neon", "review": "neon", "write": "neon"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        # Install a fake `agy` binary on PATH that:
+        # - Call 1: records seen overlay HOME/account/creds, writes READY, blocks on FIFO,
+        #   then writes a refreshed alpha token into its overlay HOME and exits.
+        # - Call 2: records seen overlay HOME/account/creds and exits immediately.
+        fake_bin_dir = Path(self._tmp.name) / "agy-bin"
+        fake_bin_dir.mkdir()
+        call_counter = Path(self._tmp.name) / "agy-call-count.txt"
+        run1_ready = Path(self._tmp.name) / "run1-ready.json"
+        run2_seen = Path(self._tmp.name) / "run2-seen.json"
+        gate_fifo = Path(self._tmp.name) / "run1-gate.fifo"
+        os.mkfifo(gate_fifo)
+        refreshed_alpha_token = "SECRET-ACCESS-ALPHA-OVERLAY-V3"
+
+        fake_agy_helper = Path(self._tmp.name) / "agy-helper.py"
+        fake_agy_helper.write_text(
+            "import json, os, pathlib, sys\n"
+            "argv = sys.argv[1:]\n"
+            "if '--version' in argv:\n"
+            "    print('1.6.0')\n"
+            "    sys.exit(0)\n"
+            f"counter = pathlib.Path({str(call_counter)!r})\n"
+            "idx = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+            "counter.write_text(str(idx))\n"
+            "_ = sys.stdin.read()\n"
+            "h = pathlib.Path(os.environ['HOME'])\n"
+            "tok_path = h / '.gemini/antigravity-cli/antigravity-oauth-token'\n"
+            "tok_doc = json.loads(tok_path.read_text())\n"
+            "info = {\n"
+            "    'home': str(h),\n"
+            "    'real_home': os.environ.get('DELEGATE_AGY_REAL_HOME', ''),\n"
+            "    'account_env': os.environ.get('DELEGATE_AGY_ACCOUNT', ''),\n"
+            "    'email': tok_doc.get('id_token_email', ''),\n"
+            "    'access_token': tok_doc.get('token', {}).get('access_token', ''),\n"
+            "    'tok_is_symlink': tok_path.is_symlink(),\n"
+            "}\n"
+            "if idx == 1:\n"
+            f"    ready_tmp = pathlib.Path({str(run1_ready)!r} + '.tmp')\n"
+            "    ready_tmp.write_text(json.dumps(info))\n"
+            f"    os.replace(ready_tmp, {str(run1_ready)!r})\n"
+            f"    with open({str(gate_fifo)!r}, 'r') as gf:\n"
+            "        gf.read()\n"
+            "    # Simulate agy refreshing its OAuth token mid-run and writing to its HOME\n"
+            "    tok_doc['token']['access_token'] = " + repr(refreshed_alpha_token) + "\n"
+            "    tok_doc['token']['expiry'] = '2026-11-25T15:00:00Z'\n"
+            "    tok_path.write_text(json.dumps(tok_doc))\n"
+            "    cid = 'conv-run-1'\n"
+            "else:\n"
+            f"    s_tmp = pathlib.Path({str(run2_seen)!r} + '.tmp')\n"
+            "    s_tmp.write_text(json.dumps(info))\n"
+            f"    os.replace(s_tmp, {str(run2_seen)!r})\n"
+            "    cid = 'conv-run-2'\n"
+            "print(json.dumps({'event': 'init', 'conversation_id': cid}), flush=True)\n"
+            "print(json.dumps({'event': 'step_update', 'step_update': {'step_index': 1, 'step_type': 'agent_response', 'state': 'DONE', 'text_delta': 'ok'}}), flush=True)\n"
+            "print(json.dumps({'event': 'result', 'result': {'conversation_id': cid, 'status': 'SUCCESS', 'response': 'ok', 'usage': {'input_tokens': 150, 'output_tokens': 30, 'cache_read_tokens': 2000}}}), flush=True)\n",
+            encoding="utf-8",
+        )
+        fake_agy = fake_bin_dir / "agy"
+        # Keep `/bin/sh .../agy` alive while python runs (matching real wrapper/binary detection).
+        fake_agy.write_text(
+            f'#!/bin/sh\npython3 "{fake_agy_helper}" "$@"\n',
+            encoding="utf-8",
+        )
+        fake_agy.chmod(0o755)
+
+        run_env = {
+            **self.env,
+            "PATH": f"{fake_bin_dir}:{self.env.get('PATH', '')}",
+        }
+        for k in (
+            "DELEGATE_SCOUT_MODEL",
+            "DELEGATE_REVIEW_MODEL",
+            "DELEGATE_WRITE_MODEL",
+            "DELEGATE_AGENT",
+            "DELEGATE_RUN_DIR",
+            "PI_DELEGATE_ACTIVE",
+            "DELEGATE_CALLER",
+            "ANTIGRAVITY_CONVERSATION_ID",
+            "ANTIGRAVITY_AGENT",
+        ):
+            run_env.pop(k, None)
+
+        # 1. Start delegated run 1 while alpha is active
+        st1 = subprocess.run(
+            [str(fixtures.DELEGATE), "start", "--read-only", "--tier", "scout", "--json", "probe alpha"],
+            cwd=repo_dir,
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(st1.returncode, 0, st1.stderr)
+        run1_id = json.loads(st1.stdout)["run"]
+
+        released = False
+        try:
+            fixtures.wait_until(run1_ready.is_file, "run 1 fake agy ready", timeout=15)
+            info1 = json.loads(run1_ready.read_text(encoding="utf-8"))
+            self.assertEqual(info1["email"], "alpha@example.test")
+            self.assertEqual(info1["account_env"], "alpha")
+            self.assertFalse(info1["tok_is_symlink"], "overlay token file must be a private copy")
+            self.assertNotEqual(Path(info1["home"]).resolve(), self.home.resolve())
+            self.assertEqual(Path(info1["real_home"]).resolve(), self.home.resolve())
+
+            # 2. `status --json` detects the overlay-wrapped delegated agy process
+            status_res = self.run_cli("agy", "account", "status", "--json", env=run_env)
+            self.assertEqual(status_res.returncode, 0, status_res.stderr)
+            st_doc = json.loads(status_res.stdout)
+            running_runs = [p.get("run") for p in st_doc["runningAgy"]]
+            self.assertIn(run1_id, running_runs, f"expected {run1_id} in {st_doc['runningAgy']}")
+
+            # 3. Switch account to beta WHILE run 1 is still running!
+            sw = self.run_cli("agy", "account", "use", "beta", "--json", env=run_env)
+            self.assertEqual(sw.returncode, 0, sw.stderr)
+            sw_doc = json.loads(sw.stdout)
+            self.assertTrue(sw_doc["ok"])
+            self.assertEqual(sw_doc["active"], "beta")
+            self.assertGreaterEqual(sw_doc["runningAgyCount"], 1)
+
+            # Live ~/.gemini is now beta
+            self.assertEqual(
+                json.loads((self.home / ".gemini/antigravity-cli/antigravity-oauth-token").read_text())["id_token_email"],
+                "beta@example.test",
+            )
+
+            # 4. Release run 1 so it refreshes alpha's token inside its overlay and exits
+            with open(gate_fifo, "w", encoding="utf-8") as gf:
+                gf.write("go\n")
+            released = True
+        finally:
+            if not released:
+                try:
+                    fd = os.open(gate_fifo, os.O_WRONLY | os.O_NONBLOCK)
+                    os.close(fd)
+                except OSError:
+                    pass
+
+        w1 = subprocess.run(
+            [str(fixtures.DELEGATE), "wait", run1_id],
+            cwd=repo_dir,
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(w1.returncode, 0, w1.stderr)
+
+        # 5. Run 1 exited: live ~/.gemini must STILL be beta (never clobbered by alpha!)
+        live_cli_tok = json.loads(
+            (self.home / ".gemini/antigravity-cli/antigravity-oauth-token").read_text(encoding="utf-8")
+        )
+        self.assertEqual(live_cli_tok["id_token_email"], "beta@example.test")
+        self.assertEqual(live_cli_tok["token"]["access_token"], "SECRET-ACCESS-BETA-222")
+
+        # Alpha's slot received the refreshed token written by run 1 (mode 0600)!
+        alpha_slot_tok_path = self.home / ".config/delegate/agy-accounts/alpha/antigravity-cli-oauth-token"
+        alpha_slot_tok = json.loads(alpha_slot_tok_path.read_text(encoding="utf-8"))
+        self.assertEqual(alpha_slot_tok["token"]["access_token"], refreshed_alpha_token)
+        self.assertEqual(stat.S_IMODE(alpha_slot_tok_path.stat().st_mode), 0o600)
+
+        # Beta's slot is untouched
+        beta_slot_tok = json.loads(
+            (self.home / ".config/delegate/agy-accounts/beta/antigravity-cli-oauth-token").read_text(encoding="utf-8")
+        )
+        self.assertEqual(beta_slot_tok["token"]["access_token"], "SECRET-ACCESS-BETA-222")
+
+        # Run 1's overlay temp dir was cleaned up
+        self.assertFalse(Path(info1["home"]).exists(), "overlay temp HOME must be removed on exit")
+
+        # 6. Start delegated run 2 -> picks up newly active beta account
+        st2 = subprocess.run(
+            [str(fixtures.DELEGATE), "start", "--read-only", "--tier", "scout", "--json", "probe beta"],
+            cwd=repo_dir,
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(st2.returncode, 0, st2.stderr)
+        run2_id = json.loads(st2.stdout)["run"]
+        w2 = subprocess.run(
+            [str(fixtures.DELEGATE), "wait", run2_id],
+            cwd=repo_dir,
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(w2.returncode, 0, w2.stderr)
+
+        info2 = json.loads(run2_seen.read_text(encoding="utf-8"))
+        self.assertEqual(info2["email"], "beta@example.test")
+        self.assertEqual(info2["account_env"], "beta")
+        self.assertEqual(info2["access_token"], "SECRET-ACCESS-BETA-222")
+
+        # 7. agy-usage.jsonl recorded launch-time accounts (run 1 -> alpha, run 2 -> beta)
+        ledger = self.home / ".local/state/delegate/agy-usage.jsonl"
+        self.assertTrue(ledger.is_file(), "expected agy-usage.jsonl")
+        by_run = {
+            rec["run"]: rec
+            for rec in (json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if line.strip())
+        }
+        self.assertEqual(by_run[run1_id]["account"], "alpha")
+        self.assertEqual(by_run[run2_id]["account"], "beta")
 
     def test_use_concurrent_lock_serializes_switches(self):
         self.seed_agy_swap()

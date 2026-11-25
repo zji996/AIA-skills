@@ -433,7 +433,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("account list [--json]", "List saved slots, active marker, email, last used time, and 5h/7d local usage."),
             ("account status [--json]", "Show active slot, live ~/.gemini email, local usage, running agy processes, and local token expiry."),
             ("account add [<id>] [--label TEXT] [--overwrite] [--agy-bin PATH]", "Run interactive agy login in an isolated temporary HOME and save credentials without affecting the active account."),
-            ("account use <id> [--force] [--json]", "Save back live refreshed tokens to the active slot and atomically switch; refuses while any agy process runs in this HOME."),
+            ("account use <id> [--force] [--json]", "Save back live refreshed tokens to the active slot and atomically switch; safe while agy runs (running runs finish on their original account, new runs/replies use the switched account)."),
             ("account note <id> [--weekly PCT] [--five-hour PCT] [--clear] [--json]", "Record manual remaining-% snapshot on a slot to estimate tokens/1% and remaining runtime from local usage (advisory only; no auto-switch)."),
             ("account remove <id> [--force] [--json]", "Delete a saved account slot without touching live ~/.gemini files."),
             ("account import-agy-swap [--dry-run] [--source DIR] [--overwrite] [--json]", "Import accounts from ~/.gemini/agy-swap/vault.json and accounts.json without printing tokens."),

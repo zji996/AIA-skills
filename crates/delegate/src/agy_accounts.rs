@@ -11,9 +11,15 @@
 //!   stdout, stderr, JSON output, or logs.
 //! - Slot directories are `0700`, credential files and `accounts.json` are `0600`,
 //!   written atomically via `O_CREAT|O_EXCL` mode `0600` temp file + `sync_data` + `rename`.
-//! - `use` refuses to switch while any `agy` process sharing the same `HOME` is running,
-//!   rather than deferring switches to a hidden wrapper hook (`--next-start`), preventing
-//!   split-brain token refreshes and eliminating wrapper complexity.
+//! - `use` can switch accounts even while `agy` processes are running: running processes
+//!   finish undisturbed on their original account, and only subsequent `agy` launches
+//!   (new runs / new `reply` rounds) pick up the newly active account.
+//! - Because `agy` writes refreshed OAuth tokens back to `~/.gemini/antigravity-cli/antigravity-oauth-token`,
+//!   each delegate-launched `agy` process runs with a private credential overlay `HOME`
+//!   (`0700` temp HOME with slot credentials copied `0600` and all other `$HOME` / `~/.gemini` /
+//!   `~/.config` entries symlinked to the real directories). On exit, any refreshed token is
+//!   validated and saved back under `.lock` to that process's own slot without touching another
+//!   account's live `~/.gemini`.
 
 use crate::common::*;
 use crate::{has, parse_simple, value};
@@ -96,6 +102,7 @@ const KEYRING_MARKERS: &[&str] = &[
 pub struct RunningAgy {
     pub pid: u32,
     pub delegate_run: Option<String>,
+    pub account: Option<String>,
     pub cmdline: String,
 }
 
@@ -475,13 +482,26 @@ pub fn detect_running_agy_for_home(target_home: &Path) -> Vec<RunningAgy> {
             continue;
         }
 
-        // Scope by HOME so isolated temp HOMEs (e.g. `agy account add` or tests) do not collide.
+        // Scope by HOME (or DELEGATE_AGY_REAL_HOME for delegate's per-process credential overlays)
+        // so isolated temp HOMEs (e.g. `agy account add`, quota probes, or other-HOME tests) do not collide.
         let mut delegate_run: Option<String> = None;
+        let mut account: Option<String> = None;
         if let Ok(raw_env) = fs::read(proc_dir.join("environ")) {
             let mut proc_home: Option<PathBuf> = None;
+            let mut delegate_real_home: Option<PathBuf> = None;
             for item in raw_env.split(|&b| b == 0) {
                 if let Some(val) = item.strip_prefix(b"HOME=") {
                     proc_home = Some(PathBuf::from(String::from_utf8_lossy(val).into_owned()));
+                } else if let Some(val) = item.strip_prefix(b"DELEGATE_AGY_REAL_HOME=") {
+                    let s = String::from_utf8_lossy(val).into_owned();
+                    if !s.is_empty() {
+                        delegate_real_home = Some(PathBuf::from(s));
+                    }
+                } else if let Some(val) = item.strip_prefix(b"DELEGATE_AGY_ACCOUNT=") {
+                    let s = String::from_utf8_lossy(val).into_owned();
+                    if !s.is_empty() {
+                        account = Some(s);
+                    }
                 } else if let Some(val) = item.strip_prefix(b"DELEGATE_RUN_DIR=") {
                     let p = PathBuf::from(String::from_utf8_lossy(val).into_owned());
                     if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
@@ -491,7 +511,7 @@ pub fn detect_running_agy_for_home(target_home: &Path) -> Vec<RunningAgy> {
                     }
                 }
             }
-            if let Some(ph) = proc_home {
+            if let Some(ph) = delegate_real_home.or(proc_home) {
                 let ph_canon = fs::canonicalize(&ph).unwrap_or(ph);
                 if ph_canon != target_canon {
                     continue;
@@ -502,6 +522,7 @@ pub fn detect_running_agy_for_home(target_home: &Path) -> Vec<RunningAgy> {
         found.push(RunningAgy {
             pid,
             delegate_run,
+            account,
             cmdline: clip(&argv.join(" "), 120),
         });
     }
@@ -1265,16 +1286,7 @@ fn snapshot_json_opts(scan_procs: bool) -> Value {
     let live_drifted = !live.is_empty()
         && (active_id.is_none() || (!active_email.is_empty() && active_email != live));
 
-    let running_json: Vec<Value> = running
-        .iter()
-        .map(|p| {
-            json!({
-                "pid": p.pid,
-                "run": p.delegate_run,
-                "cmdline": p.cmdline,
-            })
-        })
-        .collect();
+    let running_json: Vec<Value> = running.iter().map(running_agy_to_json).collect();
 
     let quota_updated_at = s(&quota_cache, "updatedAt").to_string();
     let quota_updated_ep = quota_cache["updatedEpoch"].as_i64().unwrap_or(0);
@@ -1313,19 +1325,109 @@ fn find_slot_by_email(state: &Value, email: &str) -> Option<String> {
     None
 }
 
+fn running_agy_to_json(p: &RunningAgy) -> Value {
+    let mut obj = json!({
+        "pid": p.pid,
+        "run": p.delegate_run,
+        "cmdline": p.cmdline,
+    });
+    if let Some(ref acct) = p.account {
+        obj["account"] = json!(acct);
+    }
+    obj
+}
+
+fn cred_file_valid_for_email(cf: &CredFile, bytes: &[u8], expected_email: &str) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    if cf.slot_name == "credential-user-scope" {
+        return true;
+    }
+    let Ok(v) = serde_json::from_slice::<Value>(bytes) else {
+        return false;
+    };
+    if !v.is_object() {
+        return false;
+    }
+    let expected = expected_email.trim();
+    if expected.is_empty() {
+        return true;
+    }
+    let file_email = match cf.slot_name {
+        "google_accounts.json" => v.get("active").and_then(Value::as_str),
+        "jetski-standalone-oauth-token"
+        | "antigravity-cli-oauth-token"
+        | "antigravity-oauth-token" => v.get("id_token_email").and_then(Value::as_str),
+        _ => None,
+    };
+    match file_email.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(actual) => actual.eq_ignore_ascii_case(expected),
+        None => true,
+    }
+}
+
+fn extract_token_expiry_epoch(bytes: &[u8]) -> Option<i64> {
+    let v: Value = serde_json::from_slice(bytes).ok()?;
+    if let Some(exp) = v["token"]["expiry"].as_str().and_then(iso_epoch) {
+        return Some(exp);
+    }
+    if let Some(ms) = v["expiry_date"].as_i64().filter(|&ms| ms > 0) {
+        return Some(ms / 1000);
+    }
+    None
+}
+
+fn should_update_slot_file(existing_slot_path: &Path, new_bytes: &[u8]) -> bool {
+    let Ok(existing_bytes) = fs::read(existing_slot_path) else {
+        return true;
+    };
+    if existing_bytes == new_bytes {
+        return false;
+    }
+    if let (Some(old_exp), Some(new_exp)) = (
+        extract_token_expiry_epoch(&existing_bytes),
+        extract_token_expiry_epoch(new_bytes),
+    ) {
+        if old_exp > new_exp {
+            return false;
+        }
+    }
+    true
+}
+
 /// Save back any present live credential files from `$HOME` into `slot_dir`.
 /// Captures tokens refreshed by `agy` since the last switch.
 fn save_live_to_slot(home_dir: &Path, dst_slot: &Path) -> Res<usize> {
+    save_live_to_slot_checked(home_dir, dst_slot, "")
+}
+
+/// Save back live credential files from `$HOME` into `dst_slot`, validating JSON structure
+/// and ensuring files carrying an email match `expected_email` (when non-empty) without
+/// regressing a strictly newer token expiry already stored in the slot.
+fn save_live_to_slot_checked(
+    home_dir: &Path,
+    dst_slot: &Path,
+    expected_email: &str,
+) -> Res<usize> {
     ensure_dir_mode(dst_slot, 0o700)?;
     let mut copied = 0usize;
     for cf in CRED_FILES {
         let src = home_dir.join(cf.home_rel);
         if src.is_file() {
             let bytes = fs::read(&src).map_err(|e| format!("read {}: {e}", src.display()))?;
-            if !bytes.is_empty() {
-                write_secret_0600(&dst_slot.join(cf.slot_name), &bytes, true)?;
-                copied += 1;
+            if bytes.is_empty() {
+                continue;
             }
+            if !cred_file_valid_for_email(cf, &bytes, expected_email) {
+                continue;
+            }
+            let dst = dst_slot.join(cf.slot_name);
+            if !should_update_slot_file(&dst, &bytes) {
+                continue;
+            }
+            write_secret_0600(&dst, &bytes, true)?;
+            copied += 1;
         }
     }
     Ok(copied)
@@ -1351,9 +1453,13 @@ fn install_slot_to_home(src_slot: &Path, home_dir: &Path) -> Res<usize> {
 }
 
 fn format_running_proc_line(p: &RunningAgy) -> String {
-    match &p.delegate_run {
-        Some(run) => format!("  pid={} (delegate run: {}) {}", p.pid, run, p.cmdline),
-        None => format!("  pid={} {}", p.pid, p.cmdline),
+    match (&p.delegate_run, &p.account) {
+        (Some(run), Some(acct)) => {
+            format!("  pid={} (delegate run: {}, account: {}) {}", p.pid, run, acct, p.cmdline)
+        }
+        (Some(run), None) => format!("  pid={} (delegate run: {}) {}", p.pid, run, p.cmdline),
+        (None, Some(acct)) => format!("  pid={} (account: {}) {}", p.pid, acct, p.cmdline),
+        (None, None) => format!("  pid={} {}", p.pid, p.cmdline),
     }
 }
 
@@ -1385,6 +1491,311 @@ impl TempHome {
 impl Drop for TempHome {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn symlink_dir_entries_except(src_dir: &Path, dst_dir: &Path, skip: &[&str]) -> Res<()> {
+    let Ok(entries) = fs::read_dir(src_dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if let Some(s) = name.to_str() {
+            if skip.contains(&s) {
+                continue;
+            }
+        }
+        let dst = dst_dir.join(&name);
+        if fs::symlink_metadata(&dst).is_ok() {
+            continue;
+        }
+        let _ = std::os::unix::fs::symlink(entry.path(), &dst);
+    }
+    Ok(())
+}
+
+/// Private credential overlay HOME for a single delegate-launched `agy` process.
+///
+/// Copies `CRED_FILES` from the active account slot (resolved under `.lock` before spawn)
+/// into a `0700` temporary HOME while symlinking all non-credential entries of `$HOME`,
+/// `$HOME/.gemini`, `$HOME/.gemini/antigravity-cli`, `$HOME/.gemini/antigravity`, and
+/// `$XDG_CONFIG_HOME` back to the real directories so sessions, settings, skills, caches,
+/// and child toolchains (`.cargo`, `.gitconfig`, `.local`, etc.) work transparently.
+///
+/// On exit (`finish()`), any refreshed `CRED_FILES` are validated and atomically saved
+/// back (`0600`) under `.lock` to **this process's own account slot**. Live `~/.gemini`
+/// is only mirrored if this account is still active and undrifted; if the user switched
+/// accounts while the process ran, live `~/.gemini` is never touched.
+pub struct AgyCredOverlay {
+    temp_home: TempHome,
+    real_home: PathBuf,
+    root: PathBuf,
+    account_id: String,
+    account_email: String,
+    before: BTreeMap<&'static str, Option<Vec<u8>>>,
+    finished: bool,
+}
+
+impl AgyCredOverlay {
+    /// Prepare a private credential overlay for the currently active `agy` account slot.
+    ///
+    /// Returns `(resolved_account_id, Some(overlay))` when an active slot with core
+    /// credentials exists. Returns `(None, None)` when no local `agy-accounts` store is
+    /// configured (preserving direct-HOME behavior for single-account setups and tests).
+    pub fn prepare_active() -> Res<(Option<String>, Option<Self>)> {
+        let root = accounts_root();
+        if !accounts_meta_path(&root).is_file() {
+            return Ok((None, None));
+        }
+        let real_home = home();
+        let real_xdg_config = env::var_os("XDG_CONFIG_HOME")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| real_home.join(".config"));
+        Self::prepare_active_for(&root, &real_home, &real_xdg_config)
+    }
+
+    fn prepare_active_for(
+        root: &Path,
+        real_home: &Path,
+        real_xdg_config: &Path,
+    ) -> Res<(Option<String>, Option<Self>)> {
+        let _lock = acquire_accounts_lock(root)?;
+        let mut state = load_state(root);
+        let Some(active_id) = state["active"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        else {
+            return Ok((None, None));
+        };
+        let sdir = slot_dir(root, &active_id);
+        if !slot_has_core_token(&sdir) {
+            return Ok((Some(active_id), None));
+        }
+        let account_email = {
+            let stored = s(&state["accounts"][&active_id], "email");
+            if !stored.is_empty() {
+                stored.to_string()
+            } else {
+                slot_email(&sdir).unwrap_or_default()
+            }
+        };
+
+        // If live ~/.gemini belongs to the active slot and has fresher refreshed tokens
+        // (e.g. from an interactive agy session), sync those newer files into the slot
+        // before seeding the overlay so the child starts with a fresh access token.
+        let live = live_email(real_home).unwrap_or_default();
+        let live_matches = live.is_empty()
+            || account_email.is_empty()
+            || live.eq_ignore_ascii_case(&account_email);
+        if live_matches {
+            let mut synced = 0usize;
+            for cf in CRED_FILES {
+                let live_path = real_home.join(cf.home_rel);
+                let slot_path = sdir.join(cf.slot_name);
+                let Ok(live_meta) = fs::metadata(&live_path) else {
+                    continue;
+                };
+                if !live_meta.is_file() || live_meta.len() == 0 {
+                    continue;
+                }
+                let live_newer = match (
+                    live_meta.modified().ok(),
+                    fs::metadata(&slot_path).and_then(|m| m.modified()).ok(),
+                ) {
+                    (Some(lm), Some(sm)) => lm > sm,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if !live_newer {
+                    continue;
+                }
+                let Ok(bytes) = fs::read(&live_path) else {
+                    continue;
+                };
+                if cred_file_valid_for_email(cf, &bytes, &account_email)
+                    && should_update_slot_file(&slot_path, &bytes)
+                    && write_secret_0600(&slot_path, &bytes, true).is_ok()
+                {
+                    synced += 1;
+                }
+            }
+            if synced > 0 {
+                if let Some(obj) = state["accounts"][&active_id].as_object_mut() {
+                    obj.insert("lastSyncedAt".into(), json!(iso()));
+                }
+                let _ = save_state(root, &state);
+            }
+        }
+
+        let temp_home = TempHome::create()?;
+        let ov = &temp_home.path;
+
+        // 1. Top-level HOME entries (everything except .gemini and .config).
+        symlink_dir_entries_except(real_home, ov, &[".gemini", ".config"])?;
+
+        // 2. .config overlay (isolate only .config/antigravity/credential-user-scope).
+        let ov_cfg = ov.join(".config");
+        let ov_cfg_ag = ov_cfg.join("antigravity");
+        fs::create_dir_all(&ov_cfg_ag)
+            .map_err(|e| format!("create {}: {e}", ov_cfg_ag.display()))?;
+        let _ = fs::set_permissions(&ov_cfg_ag, fs::Permissions::from_mode(0o700));
+        symlink_dir_entries_except(real_xdg_config, &ov_cfg, &["antigravity"])?;
+        symlink_dir_entries_except(
+            &real_xdg_config.join("antigravity"),
+            &ov_cfg_ag,
+            &["credential-user-scope"],
+        )?;
+
+        // 3. .gemini overlay (isolate only the 5 credential files; share sessions/settings/logs).
+        let real_gem = real_home.join(".gemini");
+        let real_cli = real_gem.join("antigravity-cli");
+        let real_ag = real_gem.join("antigravity");
+        // Ensure persistent conversation/brain directories exist in real HOME so newly created
+        // conversations survive overlay cleanup and can be resumed by later `reply` runs.
+        for sub in ["conversations", "brain"] {
+            let _ = fs::create_dir_all(real_cli.join(sub));
+        }
+        let ov_gem = ov.join(".gemini");
+        let ov_cli = ov_gem.join("antigravity-cli");
+        let ov_ag = ov_gem.join("antigravity");
+        fs::create_dir_all(&ov_cli).map_err(|e| format!("create {}: {e}", ov_cli.display()))?;
+        fs::create_dir_all(&ov_ag).map_err(|e| format!("create {}: {e}", ov_ag.display()))?;
+
+        symlink_dir_entries_except(
+            &real_gem,
+            &ov_gem,
+            &[
+                "oauth_creds.json",
+                "google_accounts.json",
+                "jetski-standalone-oauth-token",
+                "antigravity-cli",
+                "antigravity",
+            ],
+        )?;
+        symlink_dir_entries_except(&real_cli, &ov_cli, &["antigravity-oauth-token"])?;
+        symlink_dir_entries_except(&real_ag, &ov_ag, &["antigravity-oauth-token"])?;
+
+        // 4. Copy private 0600 credentials from the selected slot into the overlay.
+        install_slot_to_home(&sdir, ov)?;
+
+        // 5. Snapshot pre-run credential bytes to detect refreshes on exit.
+        let mut before = BTreeMap::new();
+        for cf in CRED_FILES {
+            let bytes = fs::read(ov.join(cf.home_rel)).ok();
+            before.insert(cf.slot_name, bytes);
+        }
+
+        let id_copy = active_id.clone();
+        Ok((
+            Some(id_copy),
+            Some(Self {
+                temp_home,
+                real_home: real_home.to_path_buf(),
+                root: root.to_path_buf(),
+                account_id: active_id,
+                account_email,
+                before,
+                finished: false,
+            }),
+        ))
+    }
+
+    #[cfg(test)]
+    pub fn overlay_home(&self) -> &Path {
+        &self.temp_home.path
+    }
+
+    pub fn apply_env(&self, cmd: &mut Command) {
+        cmd.env("HOME", &self.temp_home.path)
+            .env("XDG_CONFIG_HOME", self.temp_home.path.join(".config"))
+            .env("DELEGATE_AGY_REAL_HOME", &self.real_home)
+            .env("DELEGATE_AGY_ACCOUNT", &self.account_id);
+        if env::var_os("XDG_STATE_HOME").is_none_or(|v| v.is_empty()) {
+            cmd.env("XDG_STATE_HOME", self.real_home.join(".local/state"));
+        }
+        if env::var_os("XDG_CACHE_HOME").is_none_or(|v| v.is_empty()) {
+            cmd.env("XDG_CACHE_HOME", self.real_home.join(".cache"));
+        }
+    }
+
+    /// Save back any credential files refreshed during the child's lifetime into its own
+    /// account slot under `.lock`. Safe to call multiple times (idempotent).
+    pub fn finish(&mut self) -> usize {
+        if self.finished {
+            return 0;
+        }
+        self.finished = true;
+
+        let mut refreshed: Vec<(&CredFile, Vec<u8>)> = Vec::new();
+        for cf in CRED_FILES {
+            let p = self.temp_home.path.join(cf.home_rel);
+            let Ok(after_bytes) = fs::read(&p) else {
+                continue;
+            };
+            if after_bytes.is_empty() {
+                continue;
+            }
+            if self.before.get(cf.slot_name).and_then(Option::as_ref) == Some(&after_bytes) {
+                continue;
+            }
+            if !cred_file_valid_for_email(cf, &after_bytes, &self.account_email) {
+                continue;
+            }
+            refreshed.push((cf, after_bytes));
+        }
+        if refreshed.is_empty() {
+            return 0;
+        }
+
+        let Ok(_lock) = acquire_accounts_lock(&self.root) else {
+            return 0;
+        };
+        let mut state = load_state(&self.root);
+        if state["accounts"].get(&self.account_id).is_none() {
+            return 0;
+        }
+        let sdir = slot_dir(&self.root, &self.account_id);
+        let _ = ensure_dir_mode(&sdir, 0o700);
+        let mut saved = 0usize;
+        let mut saved_files: Vec<(&CredFile, &[u8])> = Vec::new();
+        for (cf, bytes) in &refreshed {
+            let dst = sdir.join(cf.slot_name);
+            if !should_update_slot_file(&dst, bytes) {
+                continue;
+            }
+            if write_secret_0600(&dst, bytes, true).is_ok() {
+                saved += 1;
+                saved_files.push((cf, bytes.as_slice()));
+            }
+        }
+        if saved > 0 {
+            if let Some(obj) = state["accounts"][&self.account_id].as_object_mut() {
+                obj.insert("lastSyncedAt".into(), json!(iso()));
+            }
+            let _ = save_state(&self.root, &state);
+
+            // Mirror back to live ~/.gemini ONLY if this account is still active and live
+            // credentials have not drifted to another email.
+            let still_active = state["active"].as_str() == Some(self.account_id.as_str());
+            if still_active {
+                let live = live_email(&self.real_home).unwrap_or_default();
+                let live_matches = live.is_empty()
+                    || self.account_email.is_empty()
+                    || live.eq_ignore_ascii_case(&self.account_email);
+                if live_matches {
+                    for (cf, bytes) in saved_files {
+                        let _ = write_secret_0600(
+                            &self.real_home.join(cf.home_rel),
+                            bytes,
+                            cf.private_parent,
+                        );
+                    }
+                }
+            }
+        }
+        saved
     }
 }
 
@@ -1886,44 +2297,10 @@ fn cmd_use(args: &[String]) -> Res<i32> {
         ));
     }
 
-    // Refuse switching while any agy process sharing this HOME is running.
+    // Detect any running agy processes (for informational reporting only; switching is allowed
+    // while agy runs — running delegate processes use isolated credential overlays and finish
+    // on their original account, while new runs/replies pick up the newly active account).
     let running = detect_running_agy_for_home(&home_dir);
-    if !running.is_empty() {
-        if json_out {
-            let procs: Vec<Value> = running
-                .iter()
-                .map(|p| {
-                    json!({
-                        "pid": p.pid,
-                        "run": p.delegate_run,
-                        "cmdline": p.cmdline,
-                    })
-                })
-                .collect();
-            println!(
-                "{}",
-                json!({
-                    "ok": false,
-                    "error": "running_agy_processes",
-                    "message": format!(
-                        "cannot switch agy account while {} agy process(es) are running",
-                        running.len()
-                    ),
-                    "runningAgy": procs,
-                })
-            );
-        } else {
-            eprintln!(
-                "delegate agy account use: refused — {} agy process(es) currently running in this HOME:",
-                running.len()
-            );
-            for p in &running {
-                eprintln!("{}", format_running_proc_line(p));
-            }
-            eprintln!("Wait for running agy tasks to finish (or stop them) before switching.");
-        }
-        return Ok(1);
-    }
 
     let prev_active = state["active"]
         .as_str()
@@ -1975,7 +2352,8 @@ fn cmd_use(args: &[String]) -> Res<i32> {
     let mut saved_back_id: Option<String> = None;
     if let Some(owner_id) = save_back_owner {
         let owner_slot = slot_dir(&root, &owner_id);
-        saved_back_files = save_live_to_slot(&home_dir, &owner_slot)?;
+        let owner_email = s(&state["accounts"][&owner_id], "email").to_string();
+        saved_back_files = save_live_to_slot_checked(&home_dir, &owner_slot, &owner_email)?;
         if let Some(obj) = state["accounts"][&owner_id].as_object_mut() {
             obj.insert("lastSyncedAt".into(), json!(now));
             if obj.get("email").and_then(Value::as_str).unwrap_or("").is_empty()
@@ -1998,6 +2376,7 @@ fn cmd_use(args: &[String]) -> Res<i32> {
     save_state(&root, &state)?;
 
     let target_email = s(&state["accounts"][target_id], "email").to_string();
+    let running_json: Vec<Value> = running.iter().map(running_agy_to_json).collect();
     if json_out {
         println!(
             "{}",
@@ -2010,6 +2389,8 @@ fn cmd_use(args: &[String]) -> Res<i32> {
                 "savedBackFiles": saved_back_files,
                 "installedFiles": installed,
                 "lastUsedAt": now,
+                "runningAgyCount": running.len(),
+                "runningAgy": running_json,
             })
         );
     } else {
@@ -2022,6 +2403,15 @@ fn cmd_use(args: &[String]) -> Res<i32> {
         println!(
             "switched agy account to {target_id} ({target_email}, {installed} files installed){saved_note}."
         );
+        if !running.is_empty() {
+            println!(
+                "note: {} running agy process(es) will continue and finish on their original account; new runs/replies will use {target_id}.",
+                running.len()
+            );
+            for p in &running {
+                println!("{}", format_running_proc_line(p));
+            }
+        }
     }
     Ok(0)
 }
@@ -2783,7 +3173,7 @@ fn print_account_help() {
          \x20                                      Show active account, live email, quota, usage, running agy\n\
          \x20 add [<id>] [--label TEXT] [--overwrite] [--agy-bin PATH] [-- <agy-args>...]\n\
          \x20                                      Run interactive agy login in a temp HOME and save slot\n\
-         \x20 use <id> [--force] [--json]          Save back refreshed tokens and switch (refuses if agy running)\n\
+         \x20 use <id> [--force] [--json]          Save back refreshed tokens and switch (safe while agy runs; active runs finish on original account)\n\
          \x20 note <id> [--weekly PCT] [--five-hour PCT] [--clear] [--json]\n\
          \x20                                      Record manual remaining-% snapshot (fallback when real quota absent)\n\
          \x20 remove <id> [--force] [--json]       Delete a saved account slot (alias: rm)\n\
@@ -2967,5 +3357,189 @@ BadRow\tWeekly Limit Remaining\tnot-a-pct\t2026-11-30T00:00:00Z
         assert_eq!(enriched["unknownLines"][0], "Note: beta quota");
         assert_eq!(format_age_compact(185), "3m前");
         assert_eq!(format_countdown_compact(3 * 3600 + 30 * 60), "3h30m");
+    }
+
+    fn make_test_token_json(email: &str, access: &str, expiry: &str) -> Vec<u8> {
+        serde_json::to_vec_pretty(&json!({
+            "auth_method": "consumer",
+            "id_token_email": email,
+            "token": {
+                "access_token": access,
+                "refresh_token": format!("REF-{access}"),
+                "expiry": expiry,
+                "token_type": "Bearer"
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn cred_overlay_isolates_refresh_on_switch_and_saves_back_to_own_slot() {
+        let base = TempHome::create().unwrap();
+        let real_home = base.path.join("home");
+        let real_cfg = real_home.join(".config");
+        let root = real_cfg.join("delegate/agy-accounts");
+        fs::create_dir_all(real_home.join(".gemini/antigravity-cli/conversations")).unwrap();
+        fs::write(real_home.join(".gemini/settings.json"), r#"{"theme":"dark"}"#).unwrap();
+        fs::write(real_home.join(".bashrc"), "# test\n").unwrap();
+        fs::write(
+            real_home.join(".gemini/antigravity-cli/conversations/c1.db"),
+            "conv-data",
+        )
+        .unwrap();
+
+        let alpha_slot = slot_dir(&root, "alpha");
+        let beta_slot = slot_dir(&root, "beta");
+        ensure_dir_mode(&alpha_slot, 0o700).unwrap();
+        ensure_dir_mode(&beta_slot, 0o700).unwrap();
+        let alpha_v1 = make_test_token_json("alpha@example.test", "ALPHA-V1", "2026-11-25T10:00:00Z");
+        let beta_v1 = make_test_token_json("beta@example.test", "BETA-V1", "2026-11-25T10:00:00Z");
+        write_secret_0600(&alpha_slot.join("antigravity-cli-oauth-token"), &alpha_v1, true).unwrap();
+        write_secret_0600(&beta_slot.join("antigravity-cli-oauth-token"), &beta_v1, true).unwrap();
+        install_slot_to_home(&alpha_slot, &real_home).unwrap();
+        save_state(
+            &root,
+            &json!({
+                "schemaVersion": SCHEMA_VERSION,
+                "active": "alpha",
+                "accounts": {
+                    "alpha": {"id": "alpha", "email": "alpha@example.test"},
+                    "beta": {"id": "beta", "email": "beta@example.test"},
+                }
+            }),
+        )
+        .unwrap();
+
+        let (acct, overlay_opt) =
+            AgyCredOverlay::prepare_active_for(&root, &real_home, &real_cfg).unwrap();
+        assert_eq!(acct.as_deref(), Some("alpha"));
+        let mut overlay = overlay_opt.expect("overlay should be created");
+        let ov_path = overlay.overlay_home().to_path_buf();
+        assert_ne!(ov_path, real_home);
+
+        // Non-credential entries are symlinked back to real HOME.
+        assert!(fs::symlink_metadata(ov_path.join(".bashrc"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(fs::symlink_metadata(ov_path.join(".gemini/settings.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(
+            fs::symlink_metadata(ov_path.join(".gemini/antigravity-cli/conversations"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        // Credential file is a private regular 0600 file, NOT a symlink.
+        let ov_tok = ov_path.join(".gemini/antigravity-cli/antigravity-oauth-token");
+        let ov_tok_meta = fs::symlink_metadata(&ov_tok).unwrap();
+        assert!(ov_tok_meta.file_type().is_file());
+        assert_eq!(ov_tok_meta.permissions().mode() & 0o777, 0o600);
+
+        // Simulate `delegate agy account use beta` while alpha's process is running.
+        install_slot_to_home(&beta_slot, &real_home).unwrap();
+        let mut st = load_state(&root);
+        st["active"] = json!("beta");
+        save_state(&root, &st).unwrap();
+
+        // Simulate running alpha process refreshing its token inside its private overlay.
+        let alpha_v2 = make_test_token_json("alpha@example.test", "ALPHA-V2", "2026-11-25T11:00:00Z");
+        fs::write(&ov_tok, &alpha_v2).unwrap();
+
+        // Process exits -> save back to alpha's slot WITHOUT touching live beta credentials.
+        let saved = overlay.finish();
+        assert_eq!(saved, 1);
+        drop(overlay);
+        assert!(!ov_path.exists(), "overlay HOME must be cleaned on drop");
+
+        let live_doc: Value = serde_json::from_slice(
+            &fs::read(real_home.join(".gemini/antigravity-cli/antigravity-oauth-token")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(live_doc["id_token_email"], "beta@example.test");
+        assert_eq!(live_doc["token"]["access_token"], "BETA-V1");
+
+        let alpha_slot_doc: Value = serde_json::from_slice(
+            &fs::read(alpha_slot.join("antigravity-cli-oauth-token")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(alpha_slot_doc["token"]["access_token"], "ALPHA-V2");
+
+        let beta_slot_doc: Value = serde_json::from_slice(
+            &fs::read(beta_slot.join("antigravity-cli-oauth-token")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(beta_slot_doc["token"]["access_token"], "BETA-V1");
+    }
+
+    #[test]
+    fn cred_overlay_mirrors_to_live_when_still_active_and_rejects_corrupt_or_mismatched() {
+        let base = TempHome::create().unwrap();
+        let real_home = base.path.join("home");
+        let real_cfg = real_home.join(".config");
+        let root = real_cfg.join("delegate/agy-accounts");
+        fs::create_dir_all(real_home.join(".gemini/antigravity-cli")).unwrap();
+
+        let alpha_slot = slot_dir(&root, "alpha");
+        ensure_dir_mode(&alpha_slot, 0o700).unwrap();
+        let alpha_v1 = make_test_token_json("alpha@example.test", "ALPHA-V1", "2026-11-25T10:00:00Z");
+        write_secret_0600(&alpha_slot.join("antigravity-cli-oauth-token"), &alpha_v1, true).unwrap();
+        install_slot_to_home(&alpha_slot, &real_home).unwrap();
+        save_state(
+            &root,
+            &json!({
+                "schemaVersion": SCHEMA_VERSION,
+                "active": "alpha",
+                "accounts": {
+                    "alpha": {"id": "alpha", "email": "alpha@example.test"}
+                }
+            }),
+        )
+        .unwrap();
+
+        // 1. Corrupt/truncated JSON or mismatched email must NOT overwrite the slot.
+        let (_, mut ov_bad) = AgyCredOverlay::prepare_active_for(&root, &real_home, &real_cfg).unwrap();
+        let bad = ov_bad.as_mut().unwrap();
+        let bad_tok = bad.overlay_home().join(".gemini/antigravity-cli/antigravity-oauth-token");
+        fs::write(&bad_tok, b"{truncated").unwrap();
+        assert_eq!(bad.finish(), 0);
+        drop(ov_bad);
+
+        let (_, mut ov_mismatch) = AgyCredOverlay::prepare_active_for(&root, &real_home, &real_cfg).unwrap();
+        let mm = ov_mismatch.as_mut().unwrap();
+        let mm_tok = mm.overlay_home().join(".gemini/antigravity-cli/antigravity-oauth-token");
+        fs::write(
+            &mm_tok,
+            make_test_token_json("other@example.test", "OTHER-V2", "2026-11-25T12:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(mm.finish(), 0);
+        drop(ov_mismatch);
+
+        // 2. Valid refresh while still active updates both slot and live ~/.gemini.
+        let (_, mut ov_ok) = AgyCredOverlay::prepare_active_for(&root, &real_home, &real_cfg).unwrap();
+        let ok = ov_ok.as_mut().unwrap();
+        let ok_tok = ok.overlay_home().join(".gemini/antigravity-cli/antigravity-oauth-token");
+        fs::write(
+            &ok_tok,
+            make_test_token_json("alpha@example.test", "ALPHA-V3", "2026-11-25T12:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(ok.finish(), 1);
+        drop(ov_ok);
+
+        let slot_doc: Value = serde_json::from_slice(
+            &fs::read(alpha_slot.join("antigravity-cli-oauth-token")).unwrap(),
+        )
+        .unwrap();
+        let live_doc: Value = serde_json::from_slice(
+            &fs::read(real_home.join(".gemini/antigravity-cli/antigravity-oauth-token")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(slot_doc["token"]["access_token"], "ALPHA-V3");
+        assert_eq!(live_doc["token"]["access_token"], "ALPHA-V3");
     }
 }

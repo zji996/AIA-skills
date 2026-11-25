@@ -5926,9 +5926,9 @@ fn render_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         Style::default().fg(STATUS_RUNNING)
     };
-    // Switching is blocked while any agy process is running to prevent token conflicts.
+    // Switching is allowed while agy runs; active processes finish on their original account.
     let proc_summary = if run_cnt > 0 {
-        format!("在跑 agy 进程: {run_cnt} 个（有进程时无法切换）")
+        format!("在跑 agy 进程: {run_cnt} 个（运行中可切换，在跑进程用原账号跑完）")
     } else {
         "在跑 agy 进程: 0 个".to_string()
     };
@@ -6158,9 +6158,9 @@ fn render_account_detail_wide_visual(frame: &mut Frame, app: &mut App, inner: Re
                 );
             }
             let run_cnt = state.running_agy.len();
-            // Switching is blocked while any agy process is running to prevent token conflicts.
+            // Switching is allowed while agy runs; active processes finish on their original account.
             let proc_summary = if run_cnt > 0 {
-                format!("在跑 agy 进程: {run_cnt} 个（有进程时无法切换）")
+                format!("在跑 agy 进程: {run_cnt} 个（运行中可切换，在跑进程用原账号跑完）")
             } else {
                 "在跑 agy 进程: 0 个".to_string()
             };
@@ -6223,15 +6223,9 @@ fn render_account_switch_modal(
     let modal = centered_rect(area, w, h);
     frame.render_widget(Clear, modal);
 
-    let title_style = if running_count > 0 {
-        Style::default()
-            .fg(STATUS_FAILED)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(STATUS_PENDING)
-            .add_modifier(Modifier::BOLD)
-    };
+    let title_style = Style::default()
+        .fg(STATUS_PENDING)
+        .add_modifier(Modifier::BOLD);
     let block = rounded_block(
         Line::from(Span::styled(" 确认切换 agy 账号 ", title_style)),
         true,
@@ -6271,14 +6265,14 @@ fn render_account_switch_modal(
     }
     if running_count > 0 {
         lines.push(Line::raw(""));
-        let warn = format!(
-            "当前有 {running_count} 个在跑 agy 进程，确认后切换会被拒绝并列出进程。"
+        let note_running = format!(
+            "当前有 {running_count} 个在跑 agy 进程：在跑的用原账号跑完，新运行/reply 使用新账号。"
         );
-        for l in wrap_text(&warn, iw) {
+        for l in wrap_text(&note_running, iw) {
             lines.push(Line::from(Span::styled(
                 l,
                 Style::default()
-                    .fg(STATUS_FAILED)
+                    .fg(STATUS_PENDING)
                     .add_modifier(Modifier::BOLD),
             )));
         }

@@ -1237,6 +1237,11 @@ pub fn run_agent_cancellable(
         )
         .map_err(|e| e.to_string())?;
     }
+    let (agy_account, mut agy_overlay) = if on_agy {
+        crate::agy_accounts::AgyCredOverlay::prepare_active()?
+    } else {
+        (None, None)
+    };
     let mut c =
         crate::cleanup::scoped_command(run, &format!("agent-{attempt}"), &args[0], &args[1..]);
     c.current_dir(s(meta, "workdir"))
@@ -1244,6 +1249,9 @@ pub fn run_agent_cancellable(
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr));
     clean_env(&mut c, &meta["env"]);
+    if let Some(ref overlay) = agy_overlay {
+        overlay.apply_env(&mut c);
+    }
     c.env(
         "CARGO_BUILD_JOBS",
         crate::lane::local_heavy_jobs(Some(run)).to_string(),
@@ -1261,7 +1269,8 @@ pub fn run_agent_cancellable(
         kill_group(pid, 1.0);
     }
     write(run.join("agent.pid"), pid.to_string())?;
-    let mut usage_tracker = crate::usage::LiveTracker::start(meta, run, attempt);
+    let mut usage_tracker =
+        crate::usage::LiveTracker::start_with_account(meta, run, attempt, agy_account);
     let mut attempt_turns: Vec<Value> = Vec::new();
     let timed = Arc::new(AtomicBool::new(false));
     let watch = Arc::new((
@@ -1640,6 +1649,10 @@ pub fn run_agent_cancellable(
     let _ = watcher.join();
     holder.store(0, Ordering::SeqCst);
     let status = child.wait().map_err(|e| e.to_string())?;
+    if let Some(ref mut overlay) = agy_overlay {
+        overlay.finish();
+    }
+    drop(agy_overlay);
     if !on_agy {
         let created = session_files(session_dir)
             .into_iter()

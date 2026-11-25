@@ -291,6 +291,14 @@ fn probe_one(
     let Ok(stdin) = fs::File::open(&prompt) else {
         return result(false, "cannot read the probe prompt".into(), None);
     };
+    let mut agy_overlay = if agy {
+        match crate::agy_accounts::AgyCredOverlay::prepare_active() {
+            Ok((_, ov)) => ov,
+            Err(e) => return result(false, e, None),
+        }
+    } else {
+        None
+    };
     let mut command = Command::new(bin);
     if agy {
         // Lowest effort keeps the probe cheap; agy always thinks.
@@ -315,6 +323,9 @@ fn probe_one(
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr));
     clean_env(&mut command, extra_env);
+    if let Some(ref overlay) = agy_overlay {
+        overlay.apply_env(&mut command);
+    }
     command
         .env("DELEGATE_AGENT", agents::AGENT)
         .env("PI_DELEGATE_ACTIVE", "1");
@@ -396,6 +407,10 @@ fn probe_one(
             }
         }
     };
+    if let Some(ref mut overlay) = agy_overlay {
+        overlay.finish();
+    }
+    drop(agy_overlay);
     let _ = reader.join();
     let stderr = read(&stderr_path)
         .lines()

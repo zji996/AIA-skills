@@ -214,51 +214,59 @@ impl DelegateClient {
             .map_err(|e| format!("无法执行 agy account use: {e}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if let Ok(v) = serde_json::from_str::<Value>(stdout.trim()) {
-            if v.get("ok").and_then(Value::as_bool) == Some(true) {
-                let email = v.get("email").and_then(Value::as_str).unwrap_or("");
-                return if email.is_empty() {
-                    Ok(format!("已切换 agy 账号：{id}"))
-                } else {
-                    Ok(format!("已切换 agy 账号：{id} ({email})"))
-                };
+        parse_switch_agy_account_output(id, &stdout, &stderr, output.status.success(), output.status.code())
+    }
+}
+
+pub fn parse_switch_agy_account_output(
+    id: &str,
+    stdout: &str,
+    stderr: &str,
+    success: bool,
+    exit_code: Option<i32>,
+) -> Result<String, String> {
+    if let Ok(v) = serde_json::from_str::<Value>(stdout.trim()) {
+        if v.get("ok").and_then(Value::as_bool) == Some(true) {
+            let running_cnt = v
+                .get("runningAgyCount")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    v.get("runningAgy")
+                        .and_then(Value::as_array)
+                        .map(|a| a.len() as u64)
+                })
+                .unwrap_or(0);
+            if running_cnt > 0 {
+                return Ok(format!(
+                    "已切到 {id}；在跑的 {running_cnt} 个运行用原账号跑完"
+                ));
             }
-            let msg = v
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("切换失败");
-            if let Some(procs) = v.get("runningAgy").and_then(Value::as_array) {
-                if !procs.is_empty() {
-                    let mut lines = vec![msg.to_string()];
-                    for p in procs.iter().take(6) {
-                        let pid = p.get("pid").and_then(Value::as_u64).unwrap_or(0);
-                        let run = p.get("run").and_then(Value::as_str).unwrap_or("");
-                        let cmd = p.get("cmdline").and_then(Value::as_str).unwrap_or("");
-                        if run.is_empty() {
-                            lines.push(format!("pid={pid} {cmd}"));
-                        } else {
-                            lines.push(format!("pid={pid} (run: {run}) {cmd}"));
-                        }
-                    }
-                    if procs.len() > 6 {
-                        lines.push(format!("… 共 {} 个 agy 进程", procs.len()));
-                    }
-                    return Err(lines.join("\n"));
-                }
-            }
-            return Err(msg.to_string());
-        }
-        if output.status.success() {
-            Ok(format!("已切换 agy 账号：{id}"))
-        } else {
-            let err = single_line(&stderr);
-            if err.is_empty() {
-                Err(format!("切换失败（退出码 {:?}）", output.status.code()))
+            let email = v.get("email").and_then(Value::as_str).unwrap_or("");
+            return if email.is_empty() {
+                Ok(format!("已切到 {id}"))
             } else {
-                Err(err)
-            }
+                Ok(format!("已切到 {id} ({email})"))
+            };
+        }
+        let msg = v
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("切换失败");
+        return Err(msg.to_string());
+    }
+    if success {
+        Ok(format!("已切到 {id}"))
+    } else {
+        let err = single_line(stderr);
+        if err.is_empty() {
+            Err(format!("切换失败（退出码 {:?}）", exit_code))
+        } else {
+            Err(err)
         }
     }
+}
+
+impl DelegateClient {
 
     pub fn fetch_snapshot_fast(
         &self,
@@ -3242,5 +3250,26 @@ mod snapshot_tests {
         assert_eq!(actual_pending, expected_pending);
         assert_eq!(actual_collected, expected_collected);
         assert_eq!(GroupKind::Collected.label(), "已收取");
+    }
+
+    #[test]
+    fn parse_switch_agy_account_output_reports_running_processes_notice() {
+        let with_running = r#"{"ok":true,"active":"beta","email":"beta@example.test","runningAgyCount":2,"runningAgy":[{"pid":101,"run":"r1","cmdline":"agy"},{"pid":102,"run":"r2","cmdline":"agy"}]}"#;
+        assert_eq!(
+            parse_switch_agy_account_output("beta", with_running, "", true, Some(0)).unwrap(),
+            "已切到 beta；在跑的 2 个运行用原账号跑完"
+        );
+
+        let idle = r#"{"ok":true,"active":"beta","email":"beta@example.test","runningAgyCount":0,"runningAgy":[]}"#;
+        assert_eq!(
+            parse_switch_agy_account_output("beta", idle, "", true, Some(0)).unwrap(),
+            "已切到 beta (beta@example.test)"
+        );
+
+        let err_json = r#"{"ok":false,"error":"untracked_live_credentials","message":"live account is untracked"}"#;
+        assert_eq!(
+            parse_switch_agy_account_output("beta", err_json, "", false, Some(1)).unwrap_err(),
+            "live account is untracked"
+        );
     }
 }

@@ -705,6 +705,7 @@ fn snapshot_accounts_tab_active_marker_and_inplace_confirm_modal() {
     assert!(modal_screen.contains("确认切换 agy 账号"), "{modal_screen}");
     assert!(modal_screen.contains("bob (bob@example.test)"), "{modal_screen}");
     assert!(modal_screen.contains("1 个在跑 agy 进程"), "{modal_screen}");
+    assert!(modal_screen.contains("用原账号跑完"), "{modal_screen}");
     assert!(modal_screen.contains("Enter/y 确认切换"), "{modal_screen}");
 
     // Cancel with 'n'
@@ -1185,7 +1186,7 @@ fn snapshot_overview_and_accounts_real_quota_charts_120x40_and_80x24() {
     assert!(acct_wide.contains("按最近 24 小时的平均用量，Gemini 本周额度在重置前用不完"), "{acct_wide}");
     assert!(acct_wide.contains("手动记录: 本周剩余 95% · 5 小时剩余 90%"), "{acct_wide}");
     assert!(acct_wide.contains("近 24 小时 Token"), "{acct_wide}");
-    assert!(acct_wide.contains("在跑 agy 进程: 1 个（有进程时无法切换）"), "{acct_wide}");
+    assert!(acct_wide.contains("在跑 agy 进程: 1 个（运行中可切换，在跑进程用原账号跑完）"), "{acct_wide}");
     for bad in forbidden {
         assert!(!acct_wide.contains(bad), "forbidden copy {bad:?} in acct_wide:\n{acct_wide}");
     }

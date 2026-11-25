@@ -295,7 +295,22 @@ impl Drop for LiveTracker {
 }
 
 impl LiveTracker {
+    #[allow(dead_code)]
     pub fn start(meta: &Value, run_dir: &Path, attempt: i64) -> Self {
+        let acct = if is_agy_meta(meta) {
+            crate::agy_accounts::active_account_id()
+        } else {
+            None
+        };
+        Self::start_with_account(meta, run_dir, attempt, acct)
+    }
+
+    pub fn start_with_account(
+        meta: &Value,
+        run_dir: &Path,
+        attempt: i64,
+        account_override: Option<String>,
+    ) -> Self {
         let is_reviewer = b(meta, "isReviewer");
         let role = if is_reviewer { "reviewer" } else { "author" };
         let mode = {
@@ -327,7 +342,7 @@ impl LiveTracker {
         let rework = !is_reviewer && (b(meta, "isRework") || round > 1);
         let is_agy = is_agy_meta(meta);
         let account = if is_agy {
-            crate::agy_accounts::active_account_id()
+            account_override.or_else(crate::agy_accounts::active_account_id)
         } else {
             None
         };
