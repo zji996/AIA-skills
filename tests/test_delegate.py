@@ -3000,7 +3000,7 @@ db.write_text(json.dumps(units))
             names.append(name)
         elsewhere = self.work / "elsewhere"
         elsewhere.mkdir()
-        self.assertIn("no active or undelivered runs", self.cli("wait", cwd=elsewhere).stderr)  # local only
+        self.assertIn("no active or undelivered runs", self.cli("wait", "--current-repo", cwd=elsewhere).stderr)  # local only
         result = self.cli("wait", "--machine", "--until-all", cwd=elsewhere, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         got = sorted(json.loads(l)["name"] for l in result.stdout.splitlines() if l.startswith('{"run"'))

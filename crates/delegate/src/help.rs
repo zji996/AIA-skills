@@ -257,9 +257,10 @@ pub fn print(command: Option<&str>) -> bool {
         "start" => ("[options] [words ...]", "Launch in the background and return at once.", LAUNCH),
         "run" => ("[options] [words ...]", "Start, then wait for the outcome and answer.", LAUNCH),
         "reply" => ("[options] run [words ...]", "Continue a finished run in the background, inheriting its agent, workdir, and worktree by default. Use --wait to collect its answer.", REPLY),
-        "wait" => ("[options] [runs ...]", "With no run arguments, return once the next run finishes and print its answer. Repeat the same command for the next result. With --since SEQ, wait for new events past SEQ and return the new cursor.", &[
-            ("runs", "Run ids or directories. With no arguments, collect active and undelivered runs from this caller when known; otherwise collect all in this repository."),
+        "wait" => ("[options] [runs ...]", "With no run arguments, return once the next run finishes and print its answer (across all repositories for this session by default; pass --current-repo to limit to this repository). Repeat the same command for the next result. With --since SEQ, wait for new events past SEQ and return the new cursor.", &[
+            ("runs", "Run ids or directories. With no arguments, collect active and undelivered runs from this caller across all repositories when known."),
             ("--since SEQ", "Wait on the machine-wide event stream and return only events with seq > SEQ plus the new cursor (records read cursor for Stop hook)."),
+            ("--current-repo", "Restrict untargeted wait to runs in the current repository only."),
             ("--all", "Select runs regardless of caller (including with --machine); without --any/--stream, also wait for ALL selected runs (up to 50m per call). Timeout lists pending names."),
             ("--machine", "Collect active and waiting runs registered across all repositories on this machine for the current caller (pass --all to include all sessions)."),
             ("--json", "Print complete JSON fields instead of concise status lines. Tasks covered by another live waiter are skipped; exit 76 when all are covered."),
@@ -365,10 +366,11 @@ pub fn print(command: Option<&str>) -> bool {
             ("--json", "Emit structured JSON with round metadata and paths."),
             ("--no-mark", "Read without marking resultReadAt or .delivered (used by read-only viewers)."),
         ]),
-        "card" => ("[--json] [--round] [run]", "Show a deterministic one-screen L1 merge review card: author summary + per-round result pointers, reviewer conclusion + verdict pointer, deduplicated risk items (built-in + .delegate.json riskRules + reviewer focus), test counts & tiered acceptance layers, directory-folded remaining changes, and next commands.", &[
+        "card" => ("[--json] [--round] [--no-mark] [run]", "Show a deterministic one-screen L1 merge review card (and mark finished deliveries read unless --no-mark is given): author summary + per-round result pointers, reviewer conclusion + verdict pointer, deduplicated risk items (built-in + .delegate.json riskRules + reviewer focus), test counts & tiered acceptance layers, directory-folded remaining changes, and next commands.", &[
             ("run", "Run id or directory (default: last)."),
             ("--json", "Emit structured JSON card."),
             ("--round", "Inspect only the last round instead of the chain's net total diff."),
+            ("--no-mark", "Read the card without marking the run as read."),
         ]),
         "diff" => ("[--stat] [--total] [--risky] [--round] [run] [--] [paths...]", "Show a run's changes as a git diff (or L2 --risky for risk-matched hunks only).", &[
             ("run", "Run id or directory (default: last)."),

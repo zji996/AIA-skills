@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `delegate`：统一工作表与 `delegate-tui` 口径并修正 15 处显示与等待问题——总预估与 `wait` 链尾预估剔除暂缓/定时等待项并另列最早恢复时间，CLI 暂缓/等待时间统一转本地短格式、上游依赖展示任务名并区分交付/合入钟点、就绪项改写为「就绪 X · 预计耗时 Y」；`work` 与 `snapshot` 共用统一视图（TUI 工作页同步显示未挂工作项 run 并去重等待徽标、总览卡点对齐 `hook pending`）；`delegate card` 查看即标已读（支持 `--no-mark`）；CLI 工作表按终端宽度动态分列、TUI 状态列不再截断且返工仅显示中文「返工第 N 轮」；总览 Token 分布改横向条形图、7 天交付走势分离数值与柱体；额度预计在重置前耗尽时在 TUI 顶栏、`status` 首行与 Stop 钩子给出只读提醒；陈旧已派队列项与超 7 天无活动非当前仓默认隐藏/折叠（`--all` 可展开）；`delegate wait` 默认跨仓库等本会话在跑任务（新增 `--current-repo` 仅限当前仓）。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
 
 ## delegate 6.46.0 - 2026-11-26

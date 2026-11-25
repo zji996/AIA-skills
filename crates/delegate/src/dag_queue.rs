@@ -981,6 +981,21 @@ fn format_item_human(item: &Value) -> String {
     format!("{name} · {status_zh} · {deps_str} · [{repo}] · {}", s(item, "promptFile"))
 }
 
+fn is_stale_dispatched(item: &Value, now_ts: i64) -> bool {
+    if s(item, "status") != "dispatched" {
+        return false;
+    }
+    let ts_str = {
+        let d = s(item, "dispatchedAt");
+        if !d.is_empty() {
+            d
+        } else {
+            s(item, "createdAt")
+        }
+    };
+    iso_epoch(ts_str).is_some_and(|ep| now_ts.saturating_sub(ep) > 24 * 3600)
+}
+
 fn list_cmd(args: &[String]) -> Res<i32> {
     let mut show_all = false;
     let mut json_mode = crate::output::json_enabled();
@@ -992,20 +1007,39 @@ fn list_cmd(args: &[String]) -> Res<i32> {
         }
     }
     let state = state_dir();
+    let now_ts = epoch() as i64;
     let all_items = load_items(&state);
+    let mut hidden_stale_dispatched = 0usize;
     let items: Vec<Value> = all_items
         .iter()
-        .filter(|i| show_all || s(i, "status") != "cancelled")
+        .filter(|i| {
+            if show_all {
+                return true;
+            }
+            if s(i, "status") == "cancelled" {
+                return false;
+            }
+            if is_stale_dispatched(i, now_ts) {
+                hidden_stale_dispatched += 1;
+                return false;
+            }
+            true
+        })
         .cloned()
         .collect();
     if items.is_empty() {
         if !json_mode {
-            println!("续派队列为空");
+            if hidden_stale_dispatched > 0 {
+                println!(
+                    "续派队列无活跃项（另有 {hidden_stale_dispatched} 条超过 1 天的已派记录，查看全部：delegate queue list --all）"
+                );
+            } else {
+                println!("续派队列为空");
+            }
         }
         return Ok(0);
     }
 
-    let now_ts = epoch() as i64;
     let mut visible_runs = crate::runs::all_runs();
     for mrun in crate::launch::machine_runs(&state) {
         if !visible_runs.contains(&mrun) {
@@ -1032,6 +1066,11 @@ fn list_cmd(args: &[String]) -> Res<i32> {
         }
         for item in &items {
             println!("{}", format_item_human(item));
+        }
+        if hidden_stale_dispatched > 0 {
+            println!(
+                "已隐藏 {hidden_stale_dispatched} 条超过 1 天的已派记录（查看全部：delegate queue list --all）"
+            );
         }
     }
     Ok(0)

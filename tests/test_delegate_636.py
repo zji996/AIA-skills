@@ -284,7 +284,7 @@ class Delegate636Tests(unittest.TestCase):
         self.assertEqual(self.cli("clean", "--force", r0["run"], cwd=repo, human=True).returncode, 0)
         w_after = json.loads(self.cli("work", "show", wid, "--json", cwd=repo, human=True).stdout)
         self.assertEqual(w_after["state"], "blocked", w_after)
-        self.assertIn("2099-01-01", w_after["focus"])
+        self.assertTrue(w_after["focus"].startswith("等到 ") and "01-01" in w_after["focus"], w_after["focus"])
 
         # Live zero-change delivery on a work item without wait_on -> verify + focus `已收取`
         add2 = self.cli("work", "add", "零改动核对", "--repo", repo, "--json", cwd=repo, human=True)

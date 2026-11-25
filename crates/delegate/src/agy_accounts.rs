@@ -1532,6 +1532,257 @@ pub fn snapshot_json_fast() -> Value {
     snapshot_json_opts(has_accounts)
 }
 
+/// Advisory-only quota depletion warning when projected depletion precedes window reset.
+/// Never triggers automatic account switching or throttling.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuotaDepletionWarning {
+    pub account_id: String,
+    pub active: bool,
+    pub pool: String,
+    pub window: String,
+    pub window_label: String,
+    pub remaining_minutes: u64,
+    pub reset_in_seconds: u64,
+    pub remaining_pct: f64,
+}
+
+fn short_pool_label(pool: &str) -> String {
+    let low = pool.to_ascii_lowercase();
+    if low.contains("gemini") {
+        "Gemini".to_string()
+    } else if low.contains("claude") || low.contains("gpt") {
+        "Claude/GPT".to_string()
+    } else if pool.is_empty() {
+        "额度".to_string()
+    } else {
+        pool.to_string()
+    }
+}
+
+pub fn format_minutes_zh_short(mins: u64) -> String {
+    if mins < 60 {
+        return format!("{mins} 分钟");
+    }
+    let hours = mins / 60;
+    let rem_m = mins % 60;
+    if hours < 24 {
+        if rem_m == 0 {
+            format!("{hours} 小时")
+        } else {
+            format!("{hours} 小时 {rem_m} 分钟")
+        }
+    } else {
+        let days = hours / 24;
+        let rem_h = hours % 24;
+        if rem_h == 0 {
+            format!("{days} 天")
+        } else {
+            format!("{days} 天 {rem_h} 小时")
+        }
+    }
+}
+
+pub fn format_reset_zh_short(secs: u64) -> String {
+    let mins = secs / 60;
+    if mins < 60 {
+        format!("{} 分钟", mins.max(1))
+    } else if mins < 48 * 60 {
+        let h = mins / 60;
+        let m = mins % 60;
+        if m == 0 {
+            format!("{h} 小时")
+        } else {
+            format!("{h} 小时 {m} 分钟")
+        }
+    } else {
+        let d = (secs + 43_200) / 86_400;
+        format!("{d} 天")
+    }
+}
+
+/// Extract quota depletion-before-reset warnings from an `agyAccounts` snapshot JSON object.
+/// Sorted with the active account first, then earliest depletion first.
+pub fn detect_quota_depletion_warnings(snap: &Value) -> Vec<QuotaDepletionWarning> {
+    let mut warnings = Vec::new();
+    let Some(accounts) = snap["accounts"].as_array() else {
+        return warnings;
+    };
+    for acct in accounts {
+        let id = s(acct, "id").to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let active = b(acct, "active");
+        let quota = &acct["quota"];
+        if !b(quota, "ok") || b(quota, "identityMismatch") {
+            continue;
+        }
+        let Some(entries) = quota["entries"].as_array() else {
+            continue;
+        };
+        let qest = &acct["quotaEstimate"];
+        if !qest.is_object() {
+            continue;
+        }
+        let find_entry = |window_key: &str, pool_opt: Option<&str>| -> Option<(u64, f64)> {
+            for e in entries {
+                if s(e, "window") != window_key {
+                    continue;
+                }
+                if let Some(p) = pool_opt {
+                    if !p.is_empty() && s(e, "pool") != p {
+                        continue;
+                    }
+                }
+                if let Some(reset_s) = e["resetInSeconds"].as_u64() {
+                    if reset_s > 0 {
+                        let pct = e["remainingPct"].as_f64().unwrap_or(0.0);
+                        return Some((reset_s, pct));
+                    }
+                }
+            }
+            None
+        };
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let mut check_window = |est_obj: &Value, window_key: &str, pool_hint: Option<&str>| {
+            if !est_obj.is_object() {
+                return;
+            }
+            let Some(rem_mins) = est_obj["estimatedRemainingHours"]
+                .as_f64()
+                .filter(|h| h.is_finite() && *h >= 0.0)
+                .map(|h| (h * 60.0).round() as u64)
+                .or_else(|| est_obj["estimatedRemainingMinutes"].as_u64())
+            else {
+                return;
+            };
+            let pool_raw = pool_hint
+                .filter(|p| !p.is_empty())
+                .or_else(|| {
+                    let p = s(est_obj, "pool");
+                    (!p.is_empty()).then_some(p)
+                });
+            let Some((reset_secs, rem_pct)) = find_entry(window_key, pool_raw) else {
+                return;
+            };
+            if rem_mins.saturating_mul(60) >= reset_secs {
+                return;
+            }
+            let pool_disp = short_pool_label(pool_raw.unwrap_or(""));
+            if !seen.insert((pool_disp.clone(), window_key.to_string())) {
+                return;
+            }
+            let window_label = match window_key {
+                "fiveHour" => "5 小时".to_string(),
+                _ => "本周".to_string(),
+            };
+            warnings.push(QuotaDepletionWarning {
+                account_id: id.clone(),
+                active,
+                pool: pool_disp,
+                window: window_key.to_string(),
+                window_label,
+                remaining_minutes: rem_mins,
+                reset_in_seconds: reset_secs,
+                remaining_pct: rem_pct,
+            });
+        };
+
+        if let Some(pools) = qest["pools"].as_array() {
+            for pe in pools {
+                let pname = s(pe, "pool");
+                check_window(&pe["weekly"], "weekly", Some(pname));
+                check_window(&pe["fiveHour"], "fiveHour", Some(pname));
+            }
+        }
+        check_window(&qest["weekly"], "weekly", None);
+        check_window(&qest["fiveHour"], "fiveHour", None);
+    }
+
+    warnings.sort_by(|a, b| {
+        b.active
+            .cmp(&a.active)
+            .then_with(|| a.remaining_minutes.cmp(&b.remaining_minutes))
+            .then_with(|| a.account_id.cmp(&b.account_id))
+    });
+    warnings
+}
+
+/// Lock-free, zero-subprocess quota depletion check scoped to `state` (`<state>/agy-quota.json`).
+/// Returns empty when `<state>/agy-quota.json` does not exist so isolated tests never leak host state.
+pub fn detect_quota_depletion_warnings_in(state: &Path, now_ep: i64) -> Vec<QuotaDepletionWarning> {
+    let qpath = state.join("agy-quota.json");
+    if !qpath.is_file() {
+        return Vec::new();
+    }
+    let quota_cache = json(&qpath);
+    if !quota_cache.is_object() {
+        return Vec::new();
+    }
+    // If querying the active state_dir and configured accounts exist, reuse full accounts metadata.
+    let root = accounts_root();
+    let use_real_accounts = state == state_dir() && accounts_meta_path(&root).is_file();
+    if use_real_accounts {
+        let snap = snapshot_json_opts(false);
+        return detect_quota_depletion_warnings(&snap);
+    }
+    // Isolated state dir (e.g. unit/integration tests): build synthetic snapshot purely from `state`.
+    let mut acct_map = Map::new();
+    let mut active_id = String::new();
+    if let Some(accts) = quota_cache["accounts"].as_object() {
+        for (id, v) in accts {
+            if b(v, "active") && active_id.is_empty() {
+                active_id = id.clone();
+            }
+            acct_map.insert(id.clone(), json!({}));
+        }
+    }
+    if acct_map.is_empty() {
+        return Vec::new();
+    }
+    if active_id.is_empty() {
+        if let Some(first) = acct_map.keys().next() {
+            active_id = first.clone();
+        }
+    }
+    let usage_snap = crate::usage::accounts_usage_snapshot_in(state, &acct_map, &quota_cache, now_ep);
+    let mut items = Vec::new();
+    for id in acct_map.keys() {
+        let mut item = json!({
+            "id": id,
+            "active": id == &active_id,
+        });
+        if let Some(q) = enrich_quota_for_snapshot(&quota_cache["accounts"][id], now_ep) {
+            item["quota"] = q;
+        }
+        if let Some(view) = usage_snap.per_account.get(id) {
+            if !view.quota_estimate.is_null() {
+                item["quotaEstimate"] = view.quota_estimate.clone();
+            }
+        }
+        items.push(item);
+    }
+    detect_quota_depletion_warnings(&json!({ "accounts": items }))
+}
+
+/// Format a prominent single-line warning for `delegate status` (advisory only).
+pub fn format_status_quota_warning_line(warnings: &[QuotaDepletionWarning]) -> Option<String> {
+    let top = warnings.first()?;
+    let role = if top.active { "当前账号 " } else { "账号 " };
+    let rem = format_minutes_zh_short(top.remaining_minutes);
+    let reset = format_reset_zh_short(top.reset_in_seconds);
+    let extra = if warnings.len() > 1 {
+        format!("；另有 {} 项也预计提前用完", warnings.len() - 1)
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "⚠ 额度预警：{role}{} 的 {} {}额度约 {}后用完（{}后重置；不自动换号，请手动切换）{extra}",
+        top.account_id, top.pool, top.window_label, rem, reset
+    ))
+}
+
 fn snapshot_json_opts(scan_procs: bool) -> Value {
     let root = accounts_root();
     let home_dir = home();
@@ -4245,5 +4496,53 @@ Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSum
             json!({"id":"jzy","quota":{"ok":false,"entries":[]}}),
         ];
         assert!(find_duplicate_quota_slot_groups(&empty_accounts).is_empty());
+    }
+
+    #[test]
+    fn detect_quota_depletion_warnings_flags_only_when_earlier_than_reset() {
+        let snap = json!({
+            "accounts": [
+                {
+                    "id": "safe-acct",
+                    "active": false,
+                    "quota": {
+                        "ok": true,
+                        "entries": [
+                            {"pool": "Gemini Models", "window": "weekly", "remainingPct": 90.0, "resetInSeconds": 432000}
+                        ]
+                    },
+                    "quotaEstimate": {
+                        "pools": [
+                            {"pool": "Gemini Models", "weekly": {"estimatedRemainingHours": 333.33}}
+                        ]
+                    }
+                },
+                {
+                    "id": "hot-acct",
+                    "active": true,
+                    "quota": {
+                        "ok": true,
+                        "entries": [
+                            {"pool": "Gemini Models", "window": "weekly", "remainingPct": 42.0, "resetInSeconds": 432000}
+                        ]
+                    },
+                    "quotaEstimate": {
+                        "pools": [
+                            {"pool": "Gemini Models", "weekly": {"estimatedRemainingHours": 11.0}}
+                        ]
+                    }
+                }
+            ]
+        });
+        let warns = detect_quota_depletion_warnings(&snap);
+        assert_eq!(warns.len(), 1);
+        assert_eq!(warns[0].account_id, "hot-acct");
+        assert!(warns[0].active);
+        assert_eq!(warns[0].pool, "Gemini");
+        let line = format_status_quota_warning_line(&warns).expect("warning line");
+        assert!(line.contains("⚠ 额度预警"), "{line}");
+        assert!(line.contains("hot-acct"), "{line}");
+        assert!(line.contains("11 小时"), "{line}");
+        assert!(line.contains("不自动换号，请手动切换"), "{line}");
     }
 }

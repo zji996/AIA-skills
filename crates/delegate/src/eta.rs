@@ -10,7 +10,7 @@ use crate::speed::{
     self, EtaModel, FallbackLevel, RepoFormulaParams, SampleDist,
 };
 use crate::work::WorkItem;
-use crate::{config, dag_queue, fill, has, lane, launch, parse_simple, queue, runs, value, work};
+use crate::{config, dag_queue, fill, has, lane, launch, notes, parse_simple, queue, runs, value, work};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
@@ -142,6 +142,16 @@ pub fn format_clock(ts: i64, now_ts: i64) -> String {
         format_epoch(ts, true, "%m-%d %H:%M")
     } else {
         format_epoch(ts, true, "%H:%M")
+    }
+}
+
+/// Format an epoch as local short time matching TUI (`HH:MM` if same local calendar day,
+/// otherwise `MM-DD HH:MM`).
+pub fn format_local_short(ts: i64, now_ts: i64) -> String {
+    if format_epoch(ts, true, "%Y-%m-%d") == format_epoch(now_ts, true, "%Y-%m-%d") {
+        format_epoch(ts, true, "%H:%M")
+    } else {
+        format_epoch(ts, true, "%m-%d %H:%M")
     }
 }
 
@@ -669,6 +679,10 @@ pub struct DagEtaSummary {
     pub earliest_finish_p75_at: Option<i64>,
     pub critical_path: Vec<String>,
     pub external_wait_count: usize,
+    pub deferred_count: usize,
+    pub earliest_deferred_at: Option<i64>,
+    pub date_wait_count: usize,
+    pub earliest_date_wait_at: Option<i64>,
     pub owner_blocked: Vec<BlockerItem>,
     pub blockers: Vec<BlockerItem>,
     pub is_prior: bool,
@@ -695,6 +709,8 @@ impl DagEtaSummary {
             "devWallRange": format_duration_range(self.dev_wall_p50_sec, self.dev_wall_p75_sec),
             "criticalPath": self.critical_path,
             "externalWaitCount": self.external_wait_count,
+            "deferredCount": self.deferred_count,
+            "dateWaitCount": self.date_wait_count,
             "ownerBlocked": self.owner_blocked.iter().map(|b| b.to_json(self.now_ts)).collect::<Vec<_>>(),
             "blockers": self.blockers.iter().map(|b| b.to_json(self.now_ts)).collect::<Vec<_>>(),
             "isPrior": self.is_prior,
@@ -710,6 +726,14 @@ impl DagEtaSummary {
             let r75 = round_eta_epoch(self.now_ts, p75_at);
             obj["earliestFinishP75At"] = json!(format_epoch(r75, false, "%Y-%m-%dT%H:%M:%SZ"));
             obj["earliestFinishP75Clock"] = json!(format_clock(r75, self.now_ts));
+        }
+        if let Some(dt) = self.earliest_deferred_at {
+            obj["earliestDeferredAt"] = json!(format_epoch(dt, false, "%Y-%m-%dT%H:%M:%SZ"));
+            obj["earliestDeferredClock"] = json!(format_local_short(dt, self.now_ts));
+        }
+        if let Some(wt) = self.earliest_date_wait_at {
+            obj["earliestDateWaitAt"] = json!(format_epoch(wt, false, "%Y-%m-%dT%H:%M:%SZ"));
+            obj["earliestDateWaitClock"] = json!(format_local_short(wt, self.now_ts));
         }
         obj
     }
@@ -963,6 +987,11 @@ impl LiveContext {
         }
         if let Some(pb) = self.run_dir_index.get(rid) {
             if pb.join("meta.json").is_file() {
+                return Some(pb.clone());
+            }
+        }
+        for pb in self.run_dir_index.values() {
+            if pb.file_name().and_then(|n| n.to_str()) == Some(rid) && pb.join("meta.json").is_file() {
                 return Some(pb.clone());
             }
         }
@@ -1411,9 +1440,23 @@ fn estimate_run_inner(
         }
     };
 
-    // 0. Done check: applied write run or answered/delivered read-only run (without question).
+    // 0. Done check: applied write run, stopped/cleaned run, or answered/delivered read-only run (without question).
     let applied = b(status, "applied") || run.join(".applied").exists();
-    if applied || (!is_write && matches!(state.as_str(), "answered" | "delivered") && !b(status, "question")) {
+    let is_stopped_or_cleaned =
+        matches!(state.as_str(), "stopped" | "cleaned") || b(status, "cleaned");
+    if applied
+        || is_stopped_or_cleaned
+        || (!is_write && matches!(state.as_str(), "answered" | "delivered") && !b(status, "question"))
+    {
+        let done_label = if applied {
+            "已合入"
+        } else if state == "stopped" {
+            "已停止"
+        } else if is_stopped_or_cleaned {
+            "已清理"
+        } else {
+            "已答复"
+        };
         return RunEta {
             run: run_id,
             name,
@@ -1439,9 +1482,9 @@ fn estimate_run_inner(
             bucket_key: resolved_bucket.key,
             is_prior: resolved_bucket.level.is_prior(),
             rework_rate,
-            short_text: if applied { "已合入".into() } else { "已答复".into() },
+            short_text: done_label.into(),
             compact_badge: "完成".into(),
-            detail_text: if applied { "已合入".into() } else { "已答复".into() },
+            detail_text: done_label.into(),
             now_ts,
         };
     }
@@ -2247,14 +2290,18 @@ fn estimate_capacity_wait(
 #[derive(Debug, Clone)]
 struct ParsedWaitOn {
     work_deps: Vec<(String, bool)>, // (dep_id, needs_applied)
+    run_deps: Vec<(String, bool)>,  // (run_ref, needs_applied)
     owner_refs: Vec<String>,
     after_time_max: Option<i64>,
+    defer_until_ts: Option<i64>,
 }
 
 fn parse_work_wait_on(item: &WorkItem, all_by_id: &HashMap<String, &WorkItem>, now_ts: i64) -> ParsedWaitOn {
     let mut work_deps = Vec::new();
+    let mut run_deps = Vec::new();
     let mut owner_refs = Vec::new();
     let mut after_time_max: Option<i64> = None;
+    let mut defer_until_ts: Option<i64> = None;
 
     for cond in &item.wait_on {
         if let Some(wid_raw) = cond.strip_prefix("work_applied:") {
@@ -2272,6 +2319,21 @@ fn parse_work_wait_on(item: &WorkItem, all_by_id: &HashMap<String, &WorkItem>, n
                 .is_some_and(|w| w.state == "done" && w.closed_kind != "dropped");
             if !satisfied {
                 work_deps.push((wid, true));
+            }
+        } else if let Some(run_ref_raw) = cond.strip_prefix("run_applied:") {
+            let run_ref = run_ref_raw.trim();
+            if !run_ref.is_empty() {
+                let satisfied = all_by_id
+                    .values()
+                    .any(|w| w.applied && w.matches_run(run_ref));
+                if !satisfied {
+                    run_deps.push((run_ref.to_string(), true));
+                }
+            }
+        } else if let Some(run_ref_raw) = cond.strip_prefix("run_delivered:") {
+            let run_ref = run_ref_raw.trim();
+            if !run_ref.is_empty() {
+                run_deps.push((run_ref.to_string(), false));
             }
         } else if let Some(oref_raw) = cond.strip_prefix("owner:") {
             let oref = oref_raw.trim();
@@ -2295,6 +2357,7 @@ fn parse_work_wait_on(item: &WorkItem, all_by_id: &HashMap<String, &WorkItem>, n
     if !item.defer_until.is_empty() {
         if let Some(ts) = parse_iso_or_date_epoch(&item.defer_until) {
             if ts > now_ts {
+                defer_until_ts = Some(ts);
                 after_time_max = Some(after_time_max.map_or(ts, |prev| prev.max(ts)));
             }
         }
@@ -2302,9 +2365,56 @@ fn parse_work_wait_on(item: &WorkItem, all_by_id: &HashMap<String, &WorkItem>, n
 
     ParsedWaitOn {
         work_deps,
+        run_deps,
         owner_refs,
         after_time_max,
+        defer_until_ts,
     }
+}
+
+fn format_upstream_run_wait_badge(
+    up_re: &RunEta,
+    needs_applied: bool,
+    now_ts: i64,
+) -> (String, String) {
+    let raw_name = if up_re.name.is_empty() {
+        up_re.run.as_str()
+    } else {
+        up_re.name.as_str()
+    };
+    let disp_name = notes::strip_reply_prefixes(raw_name).0;
+    let disp_name = if disp_name.is_empty() { raw_name } else { disp_name };
+
+    if let Some(b) = &up_re.blocker {
+        let badge = format!("等 {disp_name}（{}）", b.kind.compact_badge());
+        return (badge.clone(), badge);
+    }
+
+    let fmt_rng = |r: &EtaRange| -> String {
+        if r.p50_sec < 300.0 {
+            "<5m".to_string()
+        } else {
+            format!("~{}", format_clock(r.rounded_p50_at, now_ts))
+        }
+    };
+
+    let del_clk = up_re.to_delivered.as_ref().map(fmt_rng);
+    let app_clk = up_re.to_applied.as_ref().map(fmt_rng);
+
+    let text = if needs_applied {
+        match (del_clk, app_clk) {
+            (Some(d), Some(a)) if d != a => format!("等 {disp_name}（交付 {d}，合入 {a}）"),
+            (_, Some(a)) => format!("等 {disp_name}（合入 {a}）"),
+            (Some(d), None) => format!("等 {disp_name}（交付 {d}）"),
+            (None, None) => format!("等 {disp_name} 合入"),
+        }
+    } else {
+        match del_clk {
+            Some(d) => format!("等 {disp_name}（交付 {d}）"),
+            None => format!("等 {disp_name} 交付"),
+        }
+    };
+    (text.clone(), text)
 }
 
 fn work_class_to_eta_class(work_class: &str) -> &'static str {
@@ -2359,6 +2469,8 @@ pub fn estimate_work_dag_in(
     // Per-item parsed wait_on + live run ETA + base node duration.
     let mut parsed_map: HashMap<String, ParsedWaitOn> = HashMap::new();
     let mut node_run_eta: HashMap<String, RunEta> = HashMap::new();
+    let mut node_up_run: HashMap<String, (String, bool, RunEta)> = HashMap::new();
+    let mut up_run_cache: HashMap<PathBuf, RunEta> = HashMap::new();
     let mut node_dev_del: HashMap<String, (f64, f64, bool)> = HashMap::new(); // to_delivered (p50, p75, is_prior)
     let mut node_dev_app: HashMap<String, (f64, f64, bool)> = HashMap::new(); // to_applied (p50, p75, is_prior)
 
@@ -2371,17 +2483,39 @@ pub fn estimate_work_dag_in(
             primary_repo = w.repo.clone();
         }
         let pw = parse_work_wait_on(w, &all_by_id, now_ts);
+        // Resolve first unsatisfied upstream live run (`run_applied:` / `run_delivered:`) once per run dir.
+        for (run_ref, needs_applied) in &pw.run_deps {
+            if let Some(rdir) = ctx.resolve_live_run(run_ref, &w.run_dirs) {
+                let up_re = up_run_cache
+                    .entry(rdir.clone())
+                    .or_insert_with(|| estimate_run_in(&rdir, model, ctx))
+                    .clone();
+                let done = if *needs_applied {
+                    up_re.stage == Stage::Done
+                } else {
+                    up_re.stage == Stage::Done
+                        || up_re.to_delivered.as_ref().is_some_and(|r| r.p50_sec == 0.0)
+                };
+                if !done {
+                    node_up_run.insert(w.id.clone(), (run_ref.clone(), *needs_applied, up_re));
+                    break;
+                }
+            }
+        }
         parsed_map.insert(w.id.clone(), pw);
 
-        // Check latest live run attached to this work item.
+        // Check latest live run attached to this work item (skip for deferred items so stale runs
+        // from earlier attempts never pollute live DAG totals or blockers).
         let mut live_eta: Option<RunEta> = None;
-        for rid in w.runs.iter().rev() {
-            if let Some(rdir) = ctx.resolve_live_run(rid, &w.run_dirs) {
-                let re = estimate_run_in(&rdir, model, ctx);
-                // Ignore read-only runs for write-chain estimation.
-                if re.mode == "write" {
-                    live_eta = Some(re);
-                    break;
+        if w.state != "deferred" {
+            for rid in w.runs.iter().rev() {
+                if let Some(rdir) = ctx.resolve_live_run(rid, &w.run_dirs) {
+                    let re = estimate_run_in(&rdir, model, ctx);
+                    // Ignore read-only runs and already-stopped/cleaned runs for write-chain estimation.
+                    if re.mode == "write" && re.stage != Stage::Done {
+                        live_eta = Some(re);
+                        break;
+                    }
                 }
             }
         }
@@ -2432,7 +2566,7 @@ pub fn estimate_work_dag_in(
             let del_d = model.resolve_dist(&w.repo, "write", eta_cls, |b| &b.chain_to_delivered);
             let app_d = model.resolve_dist(&w.repo, "write", eta_cls, |b| &b.chain_to_applied);
             let is_p = del_d.level.is_prior() || app_d.level.is_prior();
-            if is_p {
+            if is_p && w.state != "deferred" {
                 any_prior = true;
             }
             let d50 = del_d.dist.p50_sec.unwrap_or(54.0 * 60.0) + lane_extra_sec;
@@ -2502,6 +2636,25 @@ pub fn estimate_work_dag_in(
         }
     }
 
+    // Propagate schedule holds (deferred items and `after_time:` date-waiting items) transitively
+    // so non-advancing items never distort the active DAG total ETA.
+    let mut schedule_hold: HashSet<String> = HashSet::new();
+    for id in &topo_order {
+        let is_def = all_by_id.get(id).is_some_and(|w| w.state == "deferred");
+        let has_future_time = parsed_map
+            .get(id)
+            .and_then(|p| p.after_time_max)
+            .is_some_and(|t| t > now_ts);
+        let dep_held = parsed_map.get(id).is_some_and(|pw| {
+            pw.work_deps
+                .iter()
+                .any(|(dep, _)| schedule_hold.contains(dep))
+        });
+        if is_def || has_future_time || dep_held {
+            schedule_hold.insert(id.clone());
+        }
+    }
+
     // DP for dev critical path (excluding after_time) and clock finish (including after_time EST).
     let mut cp_depth: HashMap<String, usize> = HashMap::new();
     let mut cp_segs: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
@@ -2521,6 +2674,7 @@ pub fn estimate_work_dag_in(
         let mut best_dep_depth = 0usize;
         let mut best_ef_p50 = now_ts;
         let mut best_ef_p75 = now_ts;
+        let mut up_run_seg: Option<(f64, f64)> = None;
 
         if let Some(pw) = pw {
             for (dep, _) in &pw.work_deps {
@@ -2539,24 +2693,52 @@ pub fn estimate_work_dag_in(
             }
         }
 
-        let mut segs = best_dep
-            .as_ref()
-            .and_then(|d| cp_segs.get(d))
-            .cloned()
-            .unwrap_or_default();
-        let mut path = best_dep
-            .as_ref()
-            .and_then(|d| cp_path.get(d))
-            .cloned()
-            .unwrap_or_default();
+        // Factor upstream live run (`run_applied:` / `run_delivered:`) into start time & critical path.
+        if let Some((_, needs_applied, up_re)) = node_up_run.get(id) {
+            let up_rng = if *needs_applied {
+                up_re.to_applied.as_ref().or(up_re.to_delivered.as_ref())
+            } else {
+                up_re.to_delivered.as_ref()
+            };
+            if let Some(r) = up_rng {
+                best_ef_p50 = best_ef_p50.max(now_ts + r.p50_sec.round() as i64);
+                best_ef_p75 = best_ef_p75.max(now_ts + r.p75_sec.round() as i64);
+                if r.p50_sec > best_dep_p50 {
+                    up_run_seg = Some((r.p50_sec, r.p75_sec));
+                }
+            }
+        }
+
+        let mut segs = if let Some(ur) = up_run_seg {
+            vec![ur]
+        } else {
+            best_dep
+                .as_ref()
+                .and_then(|d| cp_segs.get(d))
+                .cloned()
+                .unwrap_or_default()
+        };
+        let mut path = if up_run_seg.is_some() {
+            Vec::new()
+        } else {
+            best_dep
+                .as_ref()
+                .and_then(|d| cp_path.get(d))
+                .cloned()
+                .unwrap_or_default()
+        };
         if is_work_node {
             segs.push((a50, a75));
         }
         path.push(id.clone());
         let (tot50, tot75) = combine_p50_p75(&segs);
-        let depth_here = best_dep_depth + usize::from(is_work_node);
+        let depth_here = if up_run_seg.is_some() {
+            usize::from(is_work_node)
+        } else {
+            best_dep_depth + usize::from(is_work_node)
+        };
 
-        // External EST from after_time: shifts clock without entering dev_wall!
+        // External EST from after_time / defer_until: shifts per-item clock without entering dev_wall!
         let est = pw
             .and_then(|p| p.after_time_max)
             .unwrap_or(now_ts)
@@ -2583,11 +2765,15 @@ pub fn estimate_work_dag_in(
         ef_p75.insert(id.clone(), finish_p75);
     }
 
-    // Build per-item WorkItemEta and aggregate DAG totals (excluding owner_blocked from dev_wall).
+    // Build per-item WorkItemEta and aggregate DAG totals (excluding owner_blocked and
+    // deferred/date-wait items from active DAG ETA).
     let mut item_etas: Vec<WorkItemEta> = Vec::with_capacity(open_items.len());
     let mut owner_blocked: Vec<BlockerItem> = Vec::new();
     let mut blockers: Vec<BlockerItem> = Vec::new();
-    let mut external_wait_count = 0usize;
+    let mut deferred_count = 0usize;
+    let mut earliest_deferred_at: Option<i64> = None;
+    let mut date_wait_count = 0usize;
+    let mut earliest_date_wait_at: Option<i64> = None;
 
     let mut computable_write_chains = 0usize;
     let mut max_cp_depth = 0usize;
@@ -2608,6 +2794,8 @@ pub fn estimate_work_dag_in(
         let path = cp_path.get(&w.id).cloned().unwrap_or_else(|| vec![w.id.clone()]);
         let est = pw.and_then(|p| p.after_time_max);
         let run_eta = node_run_eta.get(&w.id);
+        let is_deferred = w.state == "deferred";
+        let is_held = schedule_hold.contains(&w.id);
 
         let mut item_blocker: Option<BlockerInfo> = None;
 
@@ -2632,6 +2820,35 @@ pub fn estimate_work_dag_in(
                 blocker: b.clone(),
             });
             item_blocker = Some(b);
+        } else if is_held {
+            // Deferred or date-waiting items are tracked separately and excluded from active DAG totals.
+            if is_deferred {
+                deferred_count += 1;
+                if let Some(dt) = pw.and_then(|p| p.defer_until_ts).or(est) {
+                    earliest_deferred_at = Some(earliest_deferred_at.map_or(dt, |prev| prev.min(dt)));
+                }
+            } else {
+                date_wait_count += 1;
+                if let Some(wt) = est {
+                    earliest_date_wait_at = Some(earliest_date_wait_at.map_or(wt, |prev| prev.min(wt)));
+                }
+            }
+            if let Some(est_ts) = est {
+                let est_clock = format_local_short(est_ts, now_ts);
+                let after_str = format_eta_duration(a50);
+                item_blocker = Some(BlockerInfo {
+                    kind: BlockerKind::ExternalTime,
+                    who: if is_deferred { "暂缓定时" } else { "外部定时" }.into(),
+                    reason: est_clock.clone(),
+                    since_sec: None,
+                    target: Some(est_clock.clone()),
+                    affected_count: None,
+                    unlock_at: Some(est_ts),
+                    after_unlock_p50_sec: Some(a50),
+                    after_unlock_p75_sec: Some(a75),
+                    label: format!("外部等待至 {est_clock}·之后约 {after_str}"),
+                });
+            }
         } else {
             // Check path ① mainline block: depends on an open `class == "unblock"` work item!
             if let Some(pw) = pw {
@@ -2680,28 +2897,7 @@ pub fn estimate_work_dag_in(
                 }
             }
 
-            // External timed wait (`after_time:` / `defer_until`)
-            if let Some(est_ts) = est {
-                external_wait_count += 1;
-                if item_blocker.is_none() {
-                    let est_clock = format_clock(est_ts, now_ts);
-                    let after_str = format_eta_duration(a50);
-                    item_blocker = Some(BlockerInfo {
-                        kind: BlockerKind::ExternalTime,
-                        who: "外部定时".into(),
-                        reason: est_clock.clone(),
-                        since_sec: None,
-                        target: Some(est_clock.clone()),
-                        affected_count: None,
-                        unlock_at: Some(est_ts),
-                        after_unlock_p50_sec: Some(a50),
-                        after_unlock_p75_sec: Some(a75),
-                        label: format!("外部等待至 {est_clock}·之后约 {after_str}"),
-                    });
-                }
-            }
-
-            // Accumulate into computable DAG (T_dev & clock finish).
+            // Accumulate into computable DAG (T_dev & clock finish) — advancing items only!
             if a50 > 0.0 || a75 > 0.0 {
                 computable_write_chains += 1;
                 sum_del_p50 += d50;
@@ -2759,12 +2955,29 @@ pub fn estimate_work_dag_in(
         } else if let Some(rem) = &remaining {
             if w.state == "verify" {
                 (format!("待验证{verify_note}"), "待验".into())
+            } else if let Some((_, needs_applied, up_re)) = node_up_run.get(&w.id) {
+                let (up_short, up_badge) =
+                    format_upstream_run_wait_badge(up_re, *needs_applied, now_ts);
+                let c50 = format_clock(rem.rounded_p50_at, now_ts);
+                let c75 = format_clock(rem.rounded_p75_at, now_ts);
+                (
+                    format!("{up_short}·本项预计 {c50} 合入（p75 {c75}）{verify_note}"),
+                    up_badge,
+                )
             } else if let Some((dep, _)) = pw.and_then(|p| p.work_deps.first()) {
                 let c50 = format_clock(rem.rounded_p50_at, now_ts);
                 let c75 = format_clock(rem.rounded_p75_at, now_ts);
                 (
                     format!("等 {dep}·预计 {c50} 合入（p75 {c75}）{verify_note}"),
                     format!("等{dep}(~{c50})"),
+                )
+            } else if w.state == "ready" && run_eta.is_none() {
+                let dur = format_duration_range(a50, a75);
+                let c50 = format_clock(rem.rounded_p50_at, now_ts);
+                let c75 = format_clock(rem.rounded_p75_at, now_ts);
+                (
+                    format!("预计耗时 {dur}（现派约 {c50} 合入，p75 {c75}）{verify_note}"),
+                    format!("预计耗时 {dur}"),
                 )
             } else {
                 let c50 = format_clock(rem.rounded_p50_at, now_ts);
@@ -2785,9 +2998,24 @@ pub fn estimate_work_dag_in(
 
         let compact_badge = if let Some(b) = &item_blocker {
             b.kind.compact_badge().to_string()
+        } else if let Some((_, needs_applied, up_re)) = node_up_run.get(&w.id) {
+            let up_rng = if *needs_applied {
+                up_re.to_applied.as_ref().or(up_re.to_delivered.as_ref())
+            } else {
+                up_re.to_delivered.as_ref()
+            };
+            if let Some(b) = &up_re.blocker {
+                b.kind.compact_badge().to_string()
+            } else if let Some(r) = up_rng {
+                format_compact_clock(r.rounded_p50_at, now_ts, r.p50_sec)
+            } else {
+                "-".into()
+            }
         } else if let Some(rem) = &remaining {
             if w.state == "verify" {
                 "待验".into()
+            } else if w.state == "ready" && run_eta.is_none() {
+                format!("~{}", format_eta_duration(a50))
             } else {
                 format_compact_clock(rem.rounded_p50_at, now_ts, rem.p50_sec)
             }
@@ -2816,6 +3044,8 @@ pub fn estimate_work_dag_in(
             now_ts,
         });
     }
+
+    let external_wait_count = deferred_count + date_wait_count;
 
     // Compute throughput bound with effective concurrency correction (design.md §3.2).
     let formula_res = model.resolve_formula(&primary_repo);
@@ -2856,7 +3086,10 @@ pub fn estimate_work_dag_in(
         dev_wall_p75,
         finish_p50_at,
         finish_p75_at,
-        external_wait_count,
+        deferred_count,
+        earliest_deferred_at,
+        date_wait_count,
+        earliest_date_wait_at,
         owner_blocked.len(),
         any_prior,
         now_ts,
@@ -2879,6 +3112,10 @@ pub fn estimate_work_dag_in(
         earliest_finish_p75_at: finish_p75_at,
         critical_path,
         external_wait_count,
+        deferred_count,
+        earliest_deferred_at,
+        date_wait_count,
+        earliest_date_wait_at,
         owner_blocked,
         blockers,
         is_prior: any_prior,
@@ -2896,18 +3133,47 @@ fn format_work_dag_headline(
     dev_wall_p75: f64,
     finish_p50_at: Option<i64>,
     finish_p75_at: Option<i64>,
-    external_wait_count: usize,
+    deferred_count: usize,
+    earliest_deferred_at: Option<i64>,
+    date_wait_count: usize,
+    earliest_date_wait_at: Option<i64>,
     owner_blocked_count: usize,
     is_prior: bool,
     now_ts: i64,
 ) -> String {
+    let mut deferred_seg = String::new();
+    if deferred_count > 0 {
+        if let Some(dt) = earliest_deferred_at {
+            deferred_seg = format!(
+                "另有 {deferred_count} 项暂缓（最早 {} 恢复）",
+                format_local_short(dt, now_ts)
+            );
+        } else {
+            deferred_seg = format!("另有 {deferred_count} 项暂缓");
+        }
+    }
+    let mut date_wait_seg = String::new();
+    if date_wait_count > 0 {
+        if let Some(wt) = earliest_date_wait_at {
+            date_wait_seg = format!(
+                "外部等待 {date_wait_count}（最早 {}）",
+                format_local_short(wt, now_ts)
+            );
+        } else {
+            date_wait_seg = format!("外部等待 {date_wait_count}");
+        }
+    }
+
     if write_chains == 0 {
         let mut extras = Vec::new();
         if owner_blocked_count > 0 {
             extras.push(format!("卡所有者 {owner_blocked_count}"));
         }
-        if external_wait_count > 0 {
-            extras.push(format!("外部等待 {external_wait_count}"));
+        if !date_wait_seg.is_empty() {
+            extras.push(date_wait_seg);
+        }
+        if !deferred_seg.is_empty() {
+            extras.push(deferred_seg);
         }
         if extras.is_empty() {
             return "无待推进写链".into();
@@ -2925,8 +3191,11 @@ fn format_work_dag_headline(
     };
     let prior_tag = if is_prior { "(初估)" } else { "" };
     let mut line = format!("推进 {range}（{write_chains}写链/深{depth}{clock_part}）{prior_tag}");
-    if external_wait_count > 0 {
-        line.push_str(&format!(" + 外部等待 {external_wait_count}"));
+    if !date_wait_seg.is_empty() {
+        line.push_str(&format!(" + {date_wait_seg}"));
+    }
+    if !deferred_seg.is_empty() {
+        line.push_str(&format!(" · {deferred_seg}"));
     }
     if owner_blocked_count > 0 {
         line.push_str(&format!(" + 卡所有者 {owner_blocked_count}"));
@@ -3369,6 +3638,10 @@ pub fn estimate_queue_dag_in(
         earliest_finish_p75_at: finish_p75_at,
         critical_path,
         external_wait_count: 0,
+        deferred_count: 0,
+        earliest_deferred_at: None,
+        date_wait_count: 0,
+        earliest_date_wait_at: None,
         owner_blocked: Vec::new(),
         blockers,
         is_prior: any_prior,
@@ -3525,8 +3798,16 @@ pub fn format_wait_tail_eta(
                 )
             };
             let steps = dag.depth.max(1);
-            if let Some(p50_at) = dag.earliest_finish_p50_at {
-                let c50 = format_clock(round_eta_epoch(now_ts, p50_at), now_ts);
+            // Use the critical chain's own tail ETA (matching `delegate eta <tail>`),
+            // never the global DAG max across unrelated/deferred chains.
+            let chain_p50_at = dag
+                .critical_path
+                .last()
+                .and_then(|tail_id| dag.items.iter().find(|it| &it.id == tail_id))
+                .and_then(|it| it.remaining.as_ref().map(|r| r.rounded_p50_at))
+                .or_else(|| dag.earliest_finish_p50_at.map(|t| round_eta_epoch(now_ts, t)));
+            if let Some(p50_at) = chain_p50_at {
+                let c50 = format_clock(p50_at, now_ts);
                 let prior = if dag.is_prior { "(初估)" } else { "" };
                 segs.push(format!("链 [{chain_str}] 剩 {steps} 步，约 {c50} 合入{prior}"));
             }
@@ -4517,26 +4798,36 @@ mod tests {
         ];
 
         let dag = estimate_work_dag_in(&items, None, &model, &ctx);
-        // Only W001 and W002 enter dev_wall (W003 & W004 are stripped into owner_blocked!).
-        assert_eq!(dag.write_chains, 2);
-        assert_eq!(dag.depth, 2);
+        // Only advancing item W001 enters active DAG totals (W002 is held by after_time:,
+        // and W003 & W004 are stripped into owner_blocked!).
+        assert_eq!(dag.write_chains, 1);
+        assert_eq!(dag.depth, 1);
         assert_eq!(dag.external_wait_count, 1);
+        assert_eq!(dag.date_wait_count, 1);
+        assert_eq!(dag.earliest_date_wait_at, Some(now + 5 * 3600));
         assert_eq!(dag.owner_blocked.len(), 2);
         assert!(dag.owner_blocked.iter().any(|b| b.id == "W003" && b.blocker.label.contains("卡在所有者 [Q01]")));
         assert!(dag.owner_blocked.iter().any(|b| b.id == "W004" && b.blocker.label.contains("卡在所有者 [Q01]")));
 
-        // dev_wall must NOT include the 5-hour after_time wait!
+        // Active DAG wall & clock finish must NOT be dragged out by the 5-hour after_time wait!
         assert!(
             dag.dev_wall_p50_sec < 3.0 * 3600.0,
             "dev_wall should exclude 5h external wait, got {}s",
             dag.dev_wall_p50_sec
         );
-        // Clock finish MUST be >= now + 5h + W002_dev!
         let fin50 = dag.earliest_finish_p50_at.expect("clock finish");
         assert!(
-            fin50 >= now + 5 * 3600 + 600,
-            "clock finish must respect after_time EST, got delta={}s",
+            fin50 < now + 3 * 3600,
+            "active DAG clock finish must not be dragged to after_time EST, got delta={}s",
             fin50 - now
+        );
+        // Individual item W002 still preserves its own post-EST clock finish.
+        let w2_eta = dag.items.iter().find(|it| it.id == "W002").expect("W002 item eta");
+        let w2_fin50 = w2_eta.remaining.as_ref().expect("W002 remaining").p50_at;
+        assert!(
+            w2_fin50 >= now + 5 * 3600 + 600,
+            "per-item W002 finish must respect after_time EST, got delta={}s",
+            w2_fin50 - now
         );
 
         let _ = fs::remove_dir_all(&state);
@@ -4879,6 +5170,218 @@ mod tests {
         assert!(line.contains("（feat-a）"), "{line}");
         assert!(line.contains("本波约 "), "{line}");
         assert!(line.contains("；链 [W012→W015] 剩 2 步，约 "), "{line}");
+
+        let _ = fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn deferred_items_do_not_drag_dag_eta_and_are_summarized_separately() {
+        let state = temp_dir("deferred-eta-sep");
+        let now = 1_795_634_100_i64; // Fixed clock: 2026-11-25T19:15:00Z (2026-11-26 03:15+08:00)
+        let repo = "/work/demo";
+        let model = populated_model(&state, repo, now);
+        let ctx = LiveContext {
+            now_ts: now,
+            ..Default::default()
+        };
+
+        let items = vec![
+            WorkItem {
+                id: "W119".into(),
+                title: "推进链第一步".into(),
+                repo: repo.into(),
+                state: "ready".into(),
+                class: "feat".into(),
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W120".into(),
+                title: "推进链第二步".into(),
+                repo: repo.into(),
+                state: "blocked".into(),
+                class: "feat".into(),
+                wait_on: vec!["work_closed:W119".into()],
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W006".into(),
+                title: "暂缓到五天后".into(),
+                repo: repo.into(),
+                state: "deferred".into(),
+                class: "feat".into(),
+                defer_until: format_epoch(now + 5 * 86_400, false, "%Y-%m-%dT%H:%M:%SZ"),
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W064".into(),
+                title: "暂缓到六小时后".into(),
+                repo: repo.into(),
+                state: "deferred".into(),
+                class: "feat".into(),
+                defer_until: format_epoch(now + 6 * 3600, false, "%Y-%m-%dT%H:%M:%SZ"),
+                ..Default::default()
+            },
+        ];
+
+        let dag = estimate_work_dag_in(&items, None, &model, &ctx);
+        assert_eq!(dag.write_chains, 2, "only advancing W119+W120 should count");
+        assert_eq!(dag.depth, 2);
+        assert_eq!(dag.deferred_count, 2);
+        assert_eq!(dag.earliest_deferred_at, Some(now + 6 * 3600));
+        let fin50 = dag.earliest_finish_p50_at.expect("advancing finish");
+        assert!(
+            fin50 < now + 6 * 3600,
+            "active DAG ETA must not be dragged to deferred date, delta={}s",
+            fin50 - now
+        );
+        let earliest_clk = format_local_short(now + 6 * 3600, now);
+        assert!(
+            dag.headline.contains(&format!("另有 2 项暂缓（最早 {earliest_clk} 恢复）")),
+            "headline missing separate deferred summary: {}",
+            dag.headline
+        );
+        // Individual deferred item still keeps its own post-defer ETA for `delegate eta W006`.
+        let w6 = dag.items.iter().find(|it| it.id == "W006").expect("W006 item");
+        assert!(w6.remaining.as_ref().expect("W006 rem").p50_at >= now + 5 * 86_400);
+
+        let _ = fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn wait_tail_eta_uses_chain_own_eta_not_global_or_deferred_max() {
+        let state = temp_dir("wait-tail-chain-own");
+        let now = 1_795_634_100_i64;
+        let repo = "/work/demo";
+        let model = populated_model(&state, repo, now);
+        let ctx = LiveContext {
+            now_ts: now,
+            ..Default::default()
+        };
+
+        // Chain W119 -> W120 plus 8 unrelated ready items (so global throughput bound > W120)
+        // plus a deferred item 5 days in the future.
+        let mut items = vec![
+            WorkItem {
+                id: "W119".into(),
+                title: "链头".into(),
+                repo: repo.into(),
+                state: "ready".into(),
+                class: "feat".into(),
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W120".into(),
+                title: "链尾".into(),
+                repo: repo.into(),
+                state: "blocked".into(),
+                class: "feat".into(),
+                wait_on: vec!["work_closed:W119".into()],
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W006".into(),
+                title: "五天后暂缓".into(),
+                repo: repo.into(),
+                state: "deferred".into(),
+                class: "feat".into(),
+                defer_until: format_epoch(now + 5 * 86_400, false, "%Y-%m-%dT%H:%M:%SZ"),
+                ..Default::default()
+            },
+        ];
+        for i in 1..=8 {
+            items.push(WorkItem {
+                id: format!("W20{i}"),
+                title: format!("并行就绪 {i}"),
+                repo: repo.into(),
+                state: "ready".into(),
+                class: "feat".into(),
+                ..Default::default()
+            });
+        }
+
+        let dag = estimate_work_dag_in(&items, Some(repo), &model, &ctx);
+        let w120_eta = dag
+            .items
+            .iter()
+            .find(|it| it.id == "W120")
+            .and_then(|it| it.remaining.as_ref())
+            .expect("W120 own eta");
+        let expected_w120_clock = format_clock(w120_eta.rounded_p50_at, now);
+
+        let tail = format_wait_tail_eta(&[], &HashSet::new(), &items, Some(repo), &model, &ctx)
+            .expect("tail line");
+        let expected_seg = format!("链 [W119→W120] 剩 2 步，约 {expected_w120_clock} 合入");
+        assert!(
+            tail.contains(&expected_seg),
+            "wait tail must report chain W119->W120's own ETA ({expected_seg}), got: {tail}"
+        );
+
+        let _ = fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn downstream_items_waiting_on_same_run_share_upstream_name_and_eta() {
+        let state = temp_dir("shared-upstream-run");
+        let now = 1_795_634_100_i64;
+        let repo_a = "/work/norvane";
+        let repo_b = "/work/physics-rl";
+        let model = populated_model(&state, repo_a, now);
+
+        let up_id = "20261125-215334-阶段-2---T3.1";
+        let up_dir = state.join(up_id);
+        fs::create_dir_all(&up_dir).unwrap();
+        write_json(
+            up_dir.join("meta.json"),
+            &json!({
+                "run": up_id,
+                "name": "阶段 2 · T3.1",
+                "mode": "write",
+                "class": "build",
+                "workdir": repo_b,
+                "startedAt": format_epoch(now - 600, false, "%Y-%m-%dT%H:%M:%SZ"),
+            }),
+        )
+        .unwrap();
+        fs::write(up_dir.join("supervisor.pid"), std::process::id().to_string()).unwrap();
+
+        let items = vec![
+            WorkItem {
+                id: "W110".into(),
+                title: "上游在 physics-rl，本项在 norvane".into(),
+                repo: repo_a.into(),
+                state: "blocked".into(),
+                class: "hard".into(),
+                wait_on: vec![format!("run_applied:{up_id}")],
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W123".into(),
+                title: "同上游另一项".into(),
+                repo: repo_b.into(),
+                state: "blocked".into(),
+                class: "feat".into(),
+                wait_on: vec![format!("run_applied:{up_id}")],
+                ..Default::default()
+            },
+        ];
+
+        let mut run_dir_index = HashMap::new();
+        run_dir_index.insert(up_id.to_string(), up_dir.clone());
+        let ctx = LiveContext {
+            now_ts: now,
+            run_dir_index,
+            ..Default::default()
+        };
+
+        let dag = estimate_work_dag_in(&items, None, &model, &ctx);
+        let e110 = dag.items.iter().find(|it| it.id == "W110").unwrap();
+        let e123 = dag.items.iter().find(|it| it.id == "W123").unwrap();
+        assert_eq!(
+            e110.focus_badge, e123.focus_badge,
+            "siblings waiting on same upstream run must display identical upstream ETA"
+        );
+        assert!(e110.focus_badge.contains("等 阶段 2 · T3.1"), "{}", e110.focus_badge);
+        assert!(!e110.focus_badge.contains("20261125-215334"), "{}", e110.focus_badge);
 
         let _ = fs::remove_dir_all(&state);
     }

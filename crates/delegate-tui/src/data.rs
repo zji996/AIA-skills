@@ -2085,6 +2085,7 @@ fn parse_single_work_item(v: &Value) -> Option<WorkItem> {
         focus: single_line(v.get("focus").and_then(Value::as_str).unwrap_or("")),
         next: single_line(v.get("next").and_then(Value::as_str).unwrap_or("")),
         applied: v.get("applied").and_then(Value::as_bool).unwrap_or(false),
+        ephemeral: v.get("ephemeral").and_then(Value::as_bool).unwrap_or(false),
         eta: parse_work_eta_value(v.get("eta")),
     })
 }
@@ -2173,6 +2174,16 @@ fn parse_dag_eta_summary(val: Option<&Value>) -> WorkDagEtaSummary {
             .get("externalWaitCount")
             .and_then(Value::as_u64)
             .unwrap_or(0) as usize,
+        deferred_count: v
+            .get("deferredCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize,
+        earliest_deferred_clock: opt_nonempty_str(v.get("earliestDeferredClock")),
+        date_wait_count: v
+            .get("dateWaitCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize,
+        earliest_date_wait_clock: opt_nonempty_str(v.get("earliestDateWaitClock")),
         owner_blocked_count: v
             .get("ownerBlocked")
             .and_then(Value::as_array)

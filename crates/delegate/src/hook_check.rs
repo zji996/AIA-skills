@@ -170,8 +170,8 @@ pub fn classify_pending_runs(runs: &[Value]) -> Vec<String> {
     out
 }
 
-fn is_zero_change_delivery_ref(obj: &Value, all_by_id: &HashMap<String, &Value>) -> bool {
-    if s(obj, "state") != "delivered" {
+pub(crate) fn is_zero_change_delivery_ref(obj: &Value, all_by_id: &HashMap<String, &Value>) -> bool {
+    if !matches!(s(obj, "state"), "delivered" | "answered") {
         return false;
     }
     if s(obj, "mode") != "write" {
@@ -1687,6 +1687,11 @@ fn waiter_covers_run(
             return true;
         }
         if targets.is_empty() {
+            // Untargeted `delegate wait` covers this session's runs across all repos by default;
+            // only `--current-repo` restricts coverage to the waiter's own repo.
+            if !args.iter().any(|a| a == "--current-repo") {
+                return true;
+            }
             if pcwd.is_some() {
                 if cwd_in_repo(pcwd.as_deref(), repo_root) {
                     return true;
@@ -2648,6 +2653,14 @@ enum TemplateKind {
         name: String,
         run: String,
     },
+    QuotaWarning {
+        account: String,
+        pool: String,
+        window_label: String,
+        remaining_text: String,
+        reset_text: String,
+        extra_count: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -2736,6 +2749,9 @@ impl PendingItem {
             TemplateKind::Adopt { run, .. } => {
                 format!("`delegate adopt {run}`")
             }
+            TemplateKind::QuotaWarning { .. } => {
+                "告知所有者评估手动切号（`delegate agy account status`；不自动换号）".to_string()
+            }
         }
     }
 
@@ -2818,6 +2834,23 @@ impl PendingItem {
             }
             TemplateKind::Adopt { name, .. } => {
                 format!("{name} 属同终端/同工作目录已失效会话。下一步：{next}{more}")
+            }
+            TemplateKind::QuotaWarning {
+                account,
+                pool,
+                window_label,
+                remaining_text,
+                reset_text,
+                extra_count,
+            } => {
+                let extra = if *extra_count > 0 {
+                    format!("（另有 {extra_count} 项也预计提前用完）")
+                } else {
+                    String::new()
+                };
+                format!(
+                    "agy 账号 {account} 的 {pool} {window_label}额度按近期速率约 {remaining_text}后用完，但 {reset_text}后才重置{extra}。下一步：{next}{more}"
+                )
             }
         }
     }
@@ -3755,6 +3788,53 @@ fn evaluate_core(
                     title: title_raw,
                     hours,
                     brief: brief.to_string(),
+                },
+            });
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 5b. Advisory quota depletion-before-reset warning (never auto-switches)
+    // ------------------------------------------------------------------
+    let quota_warnings = crate::agy_accounts::detect_quota_depletion_warnings_in(state, now);
+    if let Some(top) = quota_warnings.first() {
+        let cooldown_key = format!("quota:{}:{}:{}", top.account_id, top.pool, top.window);
+        let cooled_down = mode == EvalMode::Check
+            && remind_map
+                .get(&cooldown_key)
+                .and_then(|m| m.get(caller_key))
+                .is_some_and(|&last_rem| (now - last_rem) < cooldown_secs);
+        if !cooled_down {
+            let rem_text = crate::agy_accounts::format_minutes_zh_short(top.remaining_minutes);
+            let reset_text = crate::agy_accounts::format_reset_zh_short(top.reset_in_seconds);
+            let extra_count = quota_warnings.len().saturating_sub(1);
+            let extra_note = if extra_count > 0 {
+                format!("（另有 {extra_count} 项）")
+            } else {
+                String::new()
+            };
+            out_items.push(PendingItem {
+                priority_tier: 7,
+                stall_score: 0,
+                blocked_downstream: Vec::new(),
+                wait_secs: 0,
+                is_orphan: false,
+                hook_kind: "quota",
+                category: "quota_warning",
+                category_label: "额度预警",
+                target_id: cooldown_key.clone(),
+                display_name: format!("{} {} {}", top.account_id, top.pool, top.window_label),
+                repo_root: None,
+                is_current: true,
+                status_text: format!("预计约 {rem_text}后用完，{reset_text}后重置{extra_note}"),
+                work_id_for_cooldown: Some(cooldown_key),
+                template: TemplateKind::QuotaWarning {
+                    account: top.account_id.clone(),
+                    pool: top.pool.clone(),
+                    window_label: top.window_label.clone(),
+                    remaining_text: rem_text,
+                    reset_text,
+                    extra_count,
                 },
             });
         }

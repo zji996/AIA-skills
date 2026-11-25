@@ -401,12 +401,18 @@ class DelegateEtaChain2Tests(unittest.TestCase):
 
         # Owner-blocked item W3 is stripped from devWall into ownerBlocked!
         self.assertTrue(any(b["id"] == w3 and "卡在所有者" in b["blocker"]["label"] for b in dag["ownerBlocked"]), dag)
-        # External timed wait (W2) counted in externalWaitCount, excluded from devWall (< 4h), included in clock finish (>= 6h)
+        # External timed wait (W2) counted in externalWaitCount and excluded from active DAG totals,
+        # while per-item W2 remaining still reflects its >= 6h EST.
         self.assertGreaterEqual(dag["externalWaitCount"], 1)
         self.assertLess(dag["devWallP50Sec"], 4 * 3600, dag)
         fin50_iso = dag["earliestFinishP50At"]
         fin50_ts = int(datetime.datetime.fromisoformat(fin50_iso.replace("Z", "+00:00")).timestamp())
-        self.assertGreaterEqual(fin50_ts, now + 6 * 3600, dag)
+        self.assertLess(fin50_ts, now + 4 * 3600, dag)
+        w2_item = next(it for it in dag["items"] if it["id"] == w2)
+        w2_fin50_ts = int(
+            datetime.datetime.fromisoformat(w2_item["remaining"]["p50At"].replace("Z", "+00:00")).timestamp()
+        )
+        self.assertGreaterEqual(w2_fin50_ts, now + 6 * 3600, w2_item)
 
         # Single work item query for W_dep shows unblock dependency
         dep_res = self.cli("eta", w_dep, "--json", cwd=repo)

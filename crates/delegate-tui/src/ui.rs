@@ -10,7 +10,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::bar;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Bar, BarChart, BarGroup, Block, BorderType, Borders, Clear, Paragraph, Sparkline};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Sparkline};
 use ratatui::Frame;
 
 const NARROW_BREAKPOINT: u16 = 100;
@@ -322,6 +322,68 @@ fn append_fitting_counts(
     }
 }
 
+fn format_compact_depletion_badge(mins: u64) -> String {
+    if mins < 60 {
+        format!("⚠ 额度约{}m用完", mins.max(1))
+    } else if mins < 48 * 60 {
+        let h = (mins + 30) / 60;
+        format!("⚠ 额度约{h}h用完")
+    } else {
+        let d = (mins + 720) / 1440;
+        format!("⚠ 额度约{d}d用完")
+    }
+}
+
+/// Detect the most urgent projected depletion-before-reset warning across configured accounts
+/// (active account prioritized, then earliest remaining time) for prominent display in TUI top bars.
+fn top_bar_quota_warning(state: &AgyAccountsState) -> Option<(String, Style)> {
+    let mut best: Option<(bool, u64)> = None;
+    for acct in &state.accounts {
+        let Some(est) = &acct.quota_estimate else {
+            continue;
+        };
+        let mut check = |win_key: &str, w: &QuotaWindowEstimate| {
+            if let Some(WindowEstimateOutcome::RunsOutIn {
+                mins,
+                before_reset: true,
+            }) = evaluate_window_outcome(acct, win_key, w)
+            {
+                let cand = (acct.active, mins);
+                let better = match best {
+                    None => true,
+                    Some((b_act, b_mins)) => {
+                        (cand.0 && !b_act) || (cand.0 == b_act && cand.1 < b_mins)
+                    }
+                };
+                if better {
+                    best = Some(cand);
+                }
+            }
+        };
+        if let Some(fh) = &est.five_hour {
+            check("fiveHour", fh);
+        }
+        if let Some(wk) = &est.weekly {
+            check("weekly", wk);
+        }
+        for pe in &est.pools {
+            if let Some(fh) = &pe.five_hour {
+                check("fiveHour", fh);
+            }
+            if let Some(wk) = &pe.weekly {
+                check("weekly", wk);
+            }
+        }
+    }
+    let (_, mins) = best?;
+    Some((
+        format_compact_depletion_badge(mins),
+        Style::default()
+            .fg(STATUS_FAILED)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
 fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
     if app.tab == ViewTab::Work {
         render_work_top_bar(frame, app, area);
@@ -343,7 +405,11 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans = build_top_bar_tabs(app, area.width);
     let compact_counts = area.width < NARROW_BREAKPOINT;
 
-    let mut counts: Vec<(String, Style)> = vec![
+    let mut counts: Vec<(String, Style)> = Vec::new();
+    if let Some(warn) = top_bar_quota_warning(&app.snapshot.agy_accounts) {
+        counts.push(warn);
+    }
+    counts.extend([
         (
             if compact_counts {
                 format!("待{pending}")
@@ -394,7 +460,7 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
             },
             muted(),
         ),
-    ];
+    ]);
     if dag_pending > 0 {
         counts.push((
             format!("续派 {dag_pending}"),
@@ -427,6 +493,7 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
 #[derive(Clone, Copy)]
 struct ColWidths {
     show_state: bool,
+    state_w: usize,
     name_w: usize,
     model_w: usize,
     time_w: usize,
@@ -438,17 +505,27 @@ struct ColWidths {
 }
 
 impl ColWidths {
-    fn compute(width: usize, has_any_eta: bool) -> Self {
+    fn compute(
+        width: usize,
+        has_any_eta: bool,
+        has_any_protect: bool,
+        max_state_w: usize,
+    ) -> Self {
         let show_state = width >= 62;
+        let state_w = if show_state {
+            max_state_w.clamp(4, 12)
+        } else {
+            0
+        };
         let mut model_w = if width >= 54 { 7 } else { 6 };
         let mut time_w = if width >= 68 { 9 } else { 6 };
         let mut eta_w = if has_any_eta && width >= 58 { 6 } else { 0 };
         let mut files_w = if width >= 52 { 4 } else { 0 };
         let mut bar_w = if width >= 56 { 5 } else { 0 };
-        let mut protect_w = if width >= 54 { 3 } else { 0 };
+        let mut protect_w = if has_any_protect && width >= 54 { 3 } else { 0 };
         let mut accept_w = if width >= 40 { 4 } else { 0 };
 
-        let left = 2 + 2 + if show_state { 5 } else { 0 };
+        let left = 2 + 2 + if show_state { state_w + 1 } else { 0 };
         let calc_right = |mw: usize, tw: usize, ew: usize, fw: usize, bw: usize, pw: usize, aw: usize| {
             (if mw > 0 { 1 + mw } else { 0 })
                 + (if tw > 0 { 1 + tw } else { 0 })
@@ -487,6 +564,7 @@ impl ColWidths {
         let name_w = width.saturating_sub(left + right).max(6);
         Self {
             show_state,
+            state_w,
             name_w,
             model_w,
             time_w,
@@ -554,7 +632,28 @@ fn render_list_pane(frame: &mut Frame, app: &mut App, area: Rect) {
             false
         }
     });
-    let cols = ColWidths::compute(inner_w, has_any_eta);
+    let has_any_protect = app.rows.iter().any(|row| {
+        if let ListRow::Run { repo_idx, run_idx } = row {
+            let r = &app.snapshot.repos[*repo_idx].runs[*run_idx];
+            r.source_write_violation
+                || !r.protect_violation.is_empty()
+                || !r.prompt_protected_paths.is_empty()
+        } else {
+            false
+        }
+    });
+    let max_state_w = app
+        .rows
+        .iter()
+        .filter_map(|row| match row {
+            ListRow::Run { repo_idx, run_idx } => Some(display_width(
+                &app.snapshot.repos[*repo_idx].runs[*run_idx].state_badge(),
+            )),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(6);
+    let cols = ColWidths::compute(inner_w, has_any_eta, has_any_protect, max_state_w);
     let show_col_header = inner.height >= 4;
     let header_h: usize = if show_col_header { 1 } else { 0 };
     let view_h = (inner.height as usize).saturating_sub(header_h);
@@ -631,7 +730,7 @@ fn render_col_header(cols: ColWidths, width: usize) -> Line<'static> {
     let mut s = String::new();
     s.push_str("    ");
     if cols.show_state {
-        s.push_str(&pad_right("状态", 4));
+        s.push_str(&pad_right("状态", cols.state_w));
         s.push(' ');
     }
     s.push_str(&pad_right("任务", cols.name_w));
@@ -718,6 +817,8 @@ fn render_toggle_fold_row(
         CollapseKind::Collected => format!("{arrow} 已收取 {count} 条{ago}"),
         CollapseKind::MergedUncleaned => format!("{arrow} 已合未清 {count} 条{ago}"),
         CollapseKind::Stopped => format!("{arrow} 已停 {count} 条{ago}"),
+        CollapseKind::DispatchedQueue => format!("{arrow} 已派队列 {count} 条{ago}"),
+        CollapseKind::StaleRepos => format!("{arrow} 陈旧仓库 {count} 个（超过 7 天无动静）"),
     };
 
     if selected {
@@ -728,9 +829,11 @@ fn render_toggle_fold_row(
             CollapseKind::StalePending => Style::default()
                 .fg(STATUS_PENDING)
                 .add_modifier(Modifier::BOLD),
-            CollapseKind::Collected | CollapseKind::MergedUncleaned | CollapseKind::Stopped => {
-                bold_primary()
-            }
+            CollapseKind::Collected
+            | CollapseKind::MergedUncleaned
+            | CollapseKind::Stopped
+            | CollapseKind::DispatchedQueue
+            | CollapseKind::StaleRepos => bold_primary(),
         };
         let avail = width.saturating_sub(2 + hint_w + 1);
         let clipped = truncate(&label, avail);
@@ -924,7 +1027,10 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
         spans.push(Span::styled(" ", rev));
         spans.push(Span::styled(format!("{glyph} "), rev_bold));
         if cols.show_state {
-            spans.push(Span::styled(format!("{} ", pad_right(run.state_badge(), 4)), rev));
+            spans.push(Span::styled(
+                format!("{} ", pad_right(&run.state_badge(), cols.state_w)),
+                rev,
+            ));
         }
         spans.push(Span::styled(padded_name, rev_bold));
         if cols.model_w > 0 {
@@ -996,7 +1102,7 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
     ));
     if cols.show_state {
         spans.push(Span::styled(
-            format!("{} ", pad_right(run.state_badge(), 4)),
+            format!("{} ", pad_right(&run.state_badge(), cols.state_w)),
             state_style,
         ));
     }
@@ -2947,7 +3053,11 @@ fn render_work_top_bar(frame: &mut Frame, app: &App, area: Rect) {
         };
         (format!("{label} {n}"), style)
     };
-    let mut items = vec![
+    let mut items = Vec::new();
+    if let Some(warn) = top_bar_quota_warning(&app.snapshot.agy_accounts) {
+        items.push(warn);
+    }
+    items.extend([
         count_item("等你", c.owner, Some(STATUS_FAILED)),
         count_item("需处理", c.needs_action, Some(STATUS_PENDING)),
         count_item("就绪", c.ready, Some(STATUS_QUEUED)),
@@ -2955,7 +3065,7 @@ fn render_work_top_bar(frame: &mut Frame, app: &App, area: Rect) {
         count_item("等待", c.waiting, None),
         count_item("暂缓", c.deferred, None),
         count_item("今天完成", c.done_today, Some(STATUS_RUNNING)),
-    ];
+    ]);
     if c.stale > 0 {
         items.push(count_item("老化", c.stale, Some(STATUS_PENDING)));
     }
@@ -3018,17 +3128,29 @@ fn render_work_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     let compact = area.width < COMPACT_BREAKPOINT;
     let c = app.snapshot.work_counts();
     let open_total = c.owner + c.needs_action + c.ready + c.in_progress + c.waiting + c.deferred;
-    let work_eta_suffix = if !compact && app.snapshot.eta.work.write_chains > 0 {
+    let work_eta_suffix = if !compact {
         let we = &app.snapshot.eta.work;
-        let clock = we
-            .earliest_finish_p50_clock
-            .as_deref()
-            .map(|c| format!(" · 约 {c}"))
-            .unwrap_or_default();
-        if !we.dev_wall_range.is_empty() {
-            format!(" · 推进 {}{clock}", we.dev_wall_range)
+        let def_note = if we.deferred_count > 0 {
+            match we.earliest_deferred_clock.as_deref() {
+                Some(dc) => format!(" · 另有 {} 暂缓（最早 {dc}）", we.deferred_count),
+                None => format!(" · 另有 {} 暂缓", we.deferred_count),
+            }
         } else {
-            clock
+            String::new()
+        };
+        if we.write_chains > 0 {
+            let clock = we
+                .earliest_finish_p50_clock
+                .as_deref()
+                .map(|c| format!(" · 约 {c}"))
+                .unwrap_or_default();
+            if !we.dev_wall_range.is_empty() {
+                format!(" · 推进 {}{clock}{def_note}", we.dev_wall_range)
+            } else {
+                format!("{clock}{def_note}")
+            }
+        } else {
+            def_note
         }
     } else {
         String::new()
@@ -3139,7 +3261,18 @@ fn render_work_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let mut lines: Vec<Line> = Vec::with_capacity(inner_h);
-    let cols = WorkColWidths::compute(inner_w);
+    let max_id_w = app
+        .work_rows
+        .iter()
+        .filter_map(|r| match r {
+            WorkRow::Item { work_idx, .. } => {
+                Some(display_width(&app.snapshot.work[*work_idx].id))
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(4);
+    let cols = WorkColWidths::compute(inner_w, max_id_w);
     if show_col_header {
         lines.push(render_work_col_header(cols, inner_w));
     }
@@ -3220,12 +3353,18 @@ struct WorkColWidths {
 }
 
 impl WorkColWidths {
-    fn compute(width: usize) -> Self {
-        let id_w = 4;
+    fn compute(width: usize, max_id_w: usize) -> Self {
+        let id_w = if width >= 110 {
+            max_id_w.clamp(4, 14)
+        } else {
+            max_id_w.clamp(4, 8)
+        };
         let repo_w = if width >= 100 { 10 } else { 8 };
         let state_w = 6;
-        let status_w = if width >= 110 {
-            34
+        let status_w = if width >= 140 {
+            46
+        } else if width >= 110 {
+            36
         } else if width >= 92 {
             28
         } else {
@@ -3374,20 +3513,57 @@ fn work_item_eta_tag(item: &WorkItem, compact: bool) -> Option<(String, Color)> 
     Some((format!(" {badge}"), color))
 }
 
-fn work_item_tail_tags(
+/// Combine `live_status` and `eta_tag` cleanly without repeating upstream targets
+/// (e.g. `等 W119 关闭` + `等W119(~04:40)` -> `等 W119 关闭` + ` (~04:40)`;
+/// `等 阶段 2 · T3.1 合入` + `等 阶段 2 · T3.1（交付 ~03:47，合入 ~03:55）` -> single sentence).
+fn merge_work_live_and_eta(
     item: &WorkItem,
     live_status: &str,
-    stale_info: Option<(u64, bool)>,
     compact: bool,
+) -> (String, Option<(String, Color)>) {
+    let Some((raw_tag, color)) = work_item_eta_tag(item, compact) else {
+        return (live_status.to_string(), None);
+    };
+    let badge = raw_tag.trim();
+    if live_status.contains(badge) {
+        return (live_status.to_string(), None);
+    }
+    if (live_status.starts_with("暂缓至 ") || live_status.starts_with("等到 "))
+        && badge.starts_with('等')
+    {
+        return (live_status.to_string(), None);
+    }
+    // Upstream run wait badge already includes full name + delivery/apply times: replace verbose wait status.
+    if item.state == "blocked"
+        && live_status.starts_with("等 ")
+        && badge.starts_with("等 ")
+    {
+        return (badge.to_string(), None);
+    }
+    // Deduplicate `等 W119 关闭` + `等W119(~04:40)` into `等 W119 关闭` + ` (~04:40)`.
+    if let Some(after_wait) = badge.strip_prefix('等') {
+        if let Some(paren_pos) = after_wait.find('(') {
+            let target = after_wait[..paren_pos].trim();
+            let clock_part = &after_wait[paren_pos..];
+            if !target.is_empty() && live_status.contains(target) {
+                return (live_status.to_string(), Some((format!(" {clock_part}"), color)));
+            }
+        }
+    }
+    if item.state == "ready" && badge.starts_with("预计耗时") && !live_status.is_empty() {
+        return (live_status.to_string(), Some((format!(" · {badge}"), color)));
+    }
+    (live_status.to_string(), Some((raw_tag, color)))
+}
+
+fn work_item_tail_tags(
+    item: &WorkItem,
+    eta_tag: Option<(String, Color)>,
+    stale_info: Option<(u64, bool)>,
 ) -> Vec<(String, Color)> {
     let mut tags = Vec::new();
-    if let Some(eta_tag) = work_item_eta_tag(item, compact) {
-        let already_shows_wait_time = (live_status.starts_with("暂缓至 ")
-            || live_status.starts_with("等到 "))
-            && eta_tag.0.trim_start().starts_with('等');
-        if !already_shows_wait_time {
-            tags.push(eta_tag);
-        }
+    if let Some(t) = eta_tag {
+        tags.push(t);
     }
     if let Some((hours, is_2x)) = stale_info {
         let color = if is_2x { STATUS_FAILED } else { STATUS_PENDING };
@@ -3403,7 +3579,7 @@ fn work_item_tail_tags(
 }
 
 /// When the row tail already displays `停 Nh`, drop a trailing ` {N}[smhd]` age from
-/// `可派发 {age}` / `待闭环 {age}` so the same duration is never shown twice on one row.
+/// `可派发 {age}` / `就绪 {age}` / `待闭环 {age}` so the same duration is never shown twice on one row.
 fn dedup_stale_live_status(live_status: &str, has_stale_tag: bool) -> &str {
     if !has_stale_tag {
         return live_status;
@@ -3412,7 +3588,11 @@ fn dedup_stale_live_status(live_status: &str, has_stale_tag: bool) -> &str {
         let is_age_token = tail.len() >= 2
             && matches!(tail.as_bytes().last(), Some(b's' | b'm' | b'h' | b'd'))
             && tail[..tail.len() - 1].bytes().all(|b| b.is_ascii_digit());
-        if is_age_token && (head.ends_with("可派发") || head.ends_with("待闭环")) {
+        if is_age_token
+            && (head.ends_with("可派发")
+                || head.ends_with("就绪")
+                || head.ends_with("待闭环"))
+        {
             return head;
         }
     }
@@ -3449,8 +3629,9 @@ fn render_work_item_wide(
     } else {
         String::new()
     };
-    let tail_tags = work_item_tail_tags(item, live_status, stale_info, false);
-    let live_status = dedup_stale_live_status(live_status, stale_info.is_some());
+    let (merged_live, eta_tag) = merge_work_live_and_eta(item, live_status, false);
+    let tail_tags = work_item_tail_tags(item, eta_tag, stale_info);
+    let live_status = dedup_stale_live_status(&merged_live, stale_info.is_some());
     let tail_w: usize = tail_tags.iter().map(|(t, _)| display_width(t)).sum();
     let extra_w = display_width(&extra_tag);
     let status_avail = cols.status_w.saturating_sub(extra_w + tail_w);
@@ -3574,8 +3755,9 @@ fn render_work_item_compact(
     let gap1 = width.saturating_sub(2 + display_width(&left_clipped) + state_w);
 
     // Line 2: title · live_status [tail_tags]
-    let tail_tags = work_item_tail_tags(item, live_status, stale_info, true);
-    let live_status = dedup_stale_live_status(live_status, stale_info.is_some());
+    let (merged_live, eta_tag) = merge_work_live_and_eta(item, live_status, true);
+    let tail_tags = work_item_tail_tags(item, eta_tag, stale_info);
+    let live_status = dedup_stale_live_status(&merged_live, stale_info.is_some());
     let tail_w: usize = tail_tags.iter().map(|(t, _)| display_width(t)).sum();
     let indent2 = format!("  {}", " ".repeat(display_width(&tree_prefix)));
     let avail2 = width.saturating_sub(display_width(&indent2) + 2 + tail_w);
@@ -4591,6 +4773,13 @@ fn overview_wave_eta_spans(eta: &SnapshotEta, max_width: usize) -> Vec<Span<'sta
             primary(),
         ));
     }
+    if work.deferred_count > 0 {
+        let def_txt = match work.earliest_deferred_clock.as_deref() {
+            Some(c) => format!("另有 {} 项暂缓（最早 {c} 恢复）", work.deferred_count),
+            None => format!("另有 {} 项暂缓", work.deferred_count),
+        };
+        parts.push((def_txt, muted()));
+    }
 
     let mut spans = Vec::new();
     let mut used = 0usize;
@@ -4980,6 +5169,33 @@ fn render_overview_sparkline_panel(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn build_horiz_bar(ratio: f64, width: usize) -> (String, String) {
+    if width == 0 {
+        return (String::new(), String::new());
+    }
+    let clamped = ratio.clamp(0.0, 1.0);
+    let eighths = (clamped * (width as f64) * 8.0).round() as usize;
+    let full = (eighths / 8).min(width);
+    let rem = if full < width { eighths % 8 } else { 0 };
+    let partial = match rem {
+        1 => "▏",
+        2 => "▎",
+        3 => "▍",
+        4 => "▌",
+        5 => "▋",
+        6 => "▊",
+        7 => "▉",
+        _ => "",
+    };
+    let mut filled = "█".repeat(full);
+    if !partial.is_empty() {
+        filled.push_str(partial);
+    }
+    let empty_n = width.saturating_sub(full + usize::from(!partial.is_empty()));
+    let empty = "░".repeat(empty_n);
+    (filled, empty)
+}
+
 fn render_overview_barchart_panel(frame: &mut Frame, app: &App, area: Rect) {
     // Keybind `v 切图` is shown in the bottom bar; panel title states current mode only.
     let mode_label = match app.overview_bar_mode {
@@ -5013,106 +5229,200 @@ fn render_overview_barchart_panel(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let footer_h: u16 = if inner.height >= 7 { 1 } else { 0 };
-    let chart_h = inner.height.saturating_sub(footer_h);
-    let chart_area = Rect::new(inner.x, inner.y, inner.width, chart_h);
-
-    match app.overview_bar_mode {
-        OverviewBarMode::Purpose => {
-            let items = [
-                ("写", bp.write, STATUS_RUNNING),
-                ("审查", bp.review, STATUS_QUEUED),
-                ("返工", bp.rework, STATUS_PENDING),
-                ("只读", bp.read_only, Color::DarkGray),
-            ];
-            let max_v = items.iter().map(|(_, v, _)| *v).max().unwrap_or(1).max(1);
-            let bw: u16 = if inner.width >= 48 { 8 } else { 6 };
-            let bg: u16 = if inner.width >= 48 { 4 } else { 2 };
-            let bars: Vec<Bar> = items
-                .iter()
-                .map(|(lbl, val, color)| {
-                    Bar::default()
-                        .value(*val)
-                        .label(Line::from(*lbl))
-                        .text_value(format_tokens_short(*val))
-                        .style(Style::default().fg(*color))
-                })
-                .collect();
-            let chart = BarChart::default()
-                .data(BarGroup::default().bars(&bars))
-                .bar_width(bw)
-                .bar_gap(bg)
-                .max(max_v)
-                .value_style(bold_primary())
-                .label_style(primary());
-            frame.render_widget(chart, chart_area);
-        }
+    // Horizontal bars + explicit label, token count, and percentage (legible at any height).
+    let (total_all, rows_data): (u64, Vec<(String, u64, Color)>) = match app.overview_bar_mode {
+        OverviewBarMode::Purpose => (
+            total_p,
+            vec![
+                ("写".to_string(), bp.write, STATUS_RUNNING),
+                ("审查".to_string(), bp.review, STATUS_QUEUED),
+                ("返工".to_string(), bp.rework, STATUS_PENDING),
+                ("只读".to_string(), bp.read_only, Color::DarkGray),
+            ],
+        ),
         OverviewBarMode::Model => {
-            let take_n = if inner.width >= 48 { 4 } else { 3 };
-            let shown: Vec<&ModelTokens> = models.iter().take(take_n).collect();
-            let max_v = shown.iter().map(|m| m.tokens).max().unwrap_or(1).max(1);
-            let bw: u16 = if inner.width >= 48 { 10 } else { 8 };
-            let bg: u16 = 2;
-            let colors = [STATUS_RUNNING, STATUS_QUEUED, STATUS_PENDING, Color::DarkGray];
-            let bars: Vec<Bar> = shown
+            let total_m: u64 = models.iter().map(|m| m.tokens).sum();
+            let colors = [
+                STATUS_RUNNING,
+                STATUS_QUEUED,
+                STATUS_PENDING,
+                Color::DarkGray,
+            ];
+            let max_rows = (inner.height as usize).saturating_sub(2).clamp(1, 6);
+            let list = models
                 .iter()
+                .take(max_rows)
                 .enumerate()
                 .map(|(i, m)| {
-                    Bar::default()
-                        .value(m.tokens)
-                        .label(Line::from(truncate(&m.model, bw as usize)))
-                        .text_value(format_tokens_short(m.tokens))
-                        .style(Style::default().fg(colors[i % colors.len()]))
+                    let name = m.model.strip_suffix("-latest").unwrap_or(&m.model);
+                    (name.to_string(), m.tokens, colors[i % colors.len()])
                 })
                 .collect();
-            let chart = BarChart::default()
-                .data(BarGroup::default().bars(&bars))
-                .bar_width(bw)
-                .bar_gap(bg)
-                .max(max_v)
-                .value_style(bold_primary())
-                .label_style(primary());
-            frame.render_widget(chart, chart_area);
+            (total_m, list)
         }
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if inner.height >= (rows_data.len() as u16) + 2 {
+        lines.push(Line::from(Span::styled(
+            truncate(
+                &format!("近 7 天合计 {}", format_tokens_short(total_all)),
+                iw,
+            ),
+            muted(),
+        )));
+    }
+    let label_w: usize = match app.overview_bar_mode {
+        OverviewBarMode::Purpose => 6,
+        OverviewBarMode::Model => iw.clamp(10, 18),
+    };
+    let val_w = 8usize;
+    let pct_w = 5usize;
+    let bar_w = iw
+        .saturating_sub(label_w + 1 + 2 + val_w + 1 + pct_w)
+        .clamp(6, 42);
+    let max_v = rows_data
+        .iter()
+        .map(|(_, v, _)| *v)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let denom = total_all.max(1);
+
+    for (label, val, color) in &rows_data {
+        let ratio = (*val as f64) / (max_v as f64);
+        let pct = (*val * 100 + denom / 2) / denom;
+        let (filled, empty) = build_horiz_bar(ratio, bar_w);
+        let tok_txt = format_tokens_short(*val);
+        let pct_txt = format!("{pct}%");
+        lines.push(Line::from(vec![
+            Span::styled(pad_right(&truncate(label, label_w), label_w), primary()),
+            Span::raw(" "),
+            Span::styled(filled, Style::default().fg(*color)),
+            Span::styled(empty, muted()),
+            Span::raw("  "),
+            Span::styled(pad_left(&tok_txt, val_w), bold_primary()),
+            Span::raw(" "),
+            Span::styled(pad_left(&pct_txt, pct_w), muted()),
+        ]));
     }
 
-    // Footer shows complementary percentages for the active chart mode without duplicating bar values.
-    if footer_h >= 1 {
-        let fy = inner.y + chart_h;
-        let line = match app.overview_bar_mode {
-            OverviewBarMode::Purpose => {
-                let pct = |v: u64| -> u64 { (v * 100 + total_p / 2).checked_div(total_p).unwrap_or(0) };
-                format!(
-                    "占比: 写 {}% · 审查 {}% · 返工 {}% · 只读 {}%",
-                    pct(bp.write),
-                    pct(bp.review),
-                    pct(bp.rework),
-                    pct(bp.read_only),
-                )
-            }
-            OverviewBarMode::Model => {
-                let total_m: u64 = models.iter().map(|m| m.tokens).sum();
-                let parts: Vec<String> = models
-                    .iter()
-                    .take(3)
-                    .map(|m| {
-                        let name = m.model.strip_suffix("-latest").unwrap_or(&m.model);
-                        let p = (m.tokens * 100 + total_m / 2).checked_div(total_m).unwrap_or(0);
-                        format!("{} {}%", truncate(name, 13), p)
-                    })
-                    .collect();
-                if parts.is_empty() {
-                    "暂无模型记录".to_string()
-                } else {
-                    format!("占比: {}", parts.join(" · "))
-                }
-            }
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(truncate(&line, iw), muted()))),
-            Rect::new(inner.x, fy, inner.width, 1),
-        );
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Render a clean vertical column chart with strictly separated bar rows, value row,
+/// and date row so value labels never overlap or collide with `█` bar characters.
+fn render_clean_trend_bars(
+    frame: &mut Frame,
+    area: Rect,
+    items: &[(String, String, u64, Color)], // (date, value_text, value, color)
+    max_val: u64,
+) {
+    if area.width < 12 || area.height < 2 || items.is_empty() {
+        return;
     }
+    let iw = area.width as usize;
+    let n = items.len();
+    // Pick column width + gap that cleanly fits all dates and value labels without colliding.
+    let min_col = items
+        .iter()
+        .map(|(d, v, _, _)| display_width(d).max(display_width(v)))
+        .max()
+        .unwrap_or(5)
+        .max(5);
+    let gap = if n * (min_col + 2) <= iw + 2 { 2 } else { 1 };
+    let col_w = ((iw + gap) / n)
+        .saturating_sub(gap)
+        .clamp(min_col.min(iw / n.max(1)), 10);
+    let bar_w = col_w.clamp(3, 6);
+    let bar_pad_l = (col_w.saturating_sub(bar_w)) / 2;
+    let bar_pad_r = col_w.saturating_sub(bar_w + bar_pad_l);
+
+    let has_bars = area.height >= 3;
+    let bar_rows = if has_bars {
+        (area.height as usize).saturating_sub(2)
+    } else {
+        0
+    };
+    let max_v = max_val.max(1) as f64;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(area.height as usize);
+
+    // Pure bar rows (top to bottom), strictly no text mixed with block characters.
+    for row_idx in 0..bar_rows {
+        let row_from_bottom = bar_rows - 1 - row_idx;
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(n * 4);
+        for (i, (_, _, val, color)) in items.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" ".repeat(gap)));
+            }
+            if bar_pad_l > 0 {
+                spans.push(Span::raw(" ".repeat(bar_pad_l)));
+            }
+            let total_eighths = if *val == 0 {
+                0usize
+            } else {
+                ((*val as f64 / max_v) * (bar_rows as f64) * 8.0)
+                    .round()
+                    .max(1.0) as usize
+            };
+            let cell_base = row_from_bottom * 8;
+            let cell_fill = total_eighths.saturating_sub(cell_base).min(8);
+            let ch = match cell_fill {
+                0 => " ",
+                1 => "▁",
+                2 => "▂",
+                3 => "▃",
+                4 => "▄",
+                5 => "▅",
+                6 => "▆",
+                7 => "▇",
+                _ => "█",
+            };
+            if cell_fill == 0 {
+                spans.push(Span::raw(" ".repeat(bar_w)));
+            } else {
+                spans.push(Span::styled(ch.repeat(bar_w), Style::default().fg(*color)));
+            }
+            if bar_pad_r > 0 {
+                spans.push(Span::raw(" ".repeat(bar_pad_r)));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // Dedicated value row (separated from bars — never overlaps `█`).
+    let mut val_spans: Vec<Span<'static>> = Vec::with_capacity(n * 2);
+    for (i, (_, val_txt, _, _)) in items.iter().enumerate() {
+        if i > 0 {
+            val_spans.push(Span::raw(" ".repeat(gap)));
+        }
+        let clipped = truncate(val_txt, col_w);
+        let pad_l = col_w.saturating_sub(display_width(&clipped)) / 2;
+        let pad_r = col_w.saturating_sub(display_width(&clipped) + pad_l);
+        val_spans.push(Span::styled(
+            format!("{}{clipped}{}", " ".repeat(pad_l), " ".repeat(pad_r)),
+            primary(),
+        ));
+    }
+    lines.push(Line::from(val_spans));
+
+    // Dedicated date row cleanly aligned directly underneath each value.
+    let mut date_spans: Vec<Span<'static>> = Vec::with_capacity(n * 2);
+    for (i, (date, _, _, _)) in items.iter().enumerate() {
+        if i > 0 {
+            date_spans.push(Span::raw(" ".repeat(gap)));
+        }
+        let clipped = truncate(date, col_w);
+        let pad_l = col_w.saturating_sub(display_width(&clipped)) / 2;
+        let pad_r = col_w.saturating_sub(display_width(&clipped) + pad_l);
+        date_spans.push(Span::styled(
+            format!("{}{clipped}{}", " ".repeat(pad_l), " ".repeat(pad_r)),
+            muted(),
+        ));
+    }
+    lines.push(Line::from(date_spans));
+
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_overview_trend_panel(frame: &mut Frame, app: &App, area: Rect) {
@@ -5172,9 +5482,7 @@ fn render_overview_trend_panel(frame: &mut Frame, app: &App, area: Rect) {
             .max()
             .unwrap_or(1)
             .max(1);
-        let bw: u16 = if halves[0].width >= 56 { 6 } else { 5 };
-        let bg: u16 = if halves[0].width >= 56 { 2 } else { 1 };
-        let bars: Vec<Bar> = daily
+        let items: Vec<(String, String, u64, Color)> = daily
             .iter()
             .map(|d| {
                 let mins = d.median_merge_secs.map(|s| (s / 60).max(1)).unwrap_or(0);
@@ -5183,21 +5491,10 @@ fn render_overview_trend_panel(frame: &mut Frame, app: &App, area: Rect) {
                 } else {
                     "-".to_string()
                 };
-                Bar::default()
-                    .value(mins)
-                    .label(Line::from(d.date.clone()))
-                    .text_value(txt)
-                    .style(Style::default().fg(STATUS_QUEUED))
+                (d.date.clone(), txt, mins, STATUS_QUEUED)
             })
             .collect();
-        let chart = BarChart::default()
-            .data(BarGroup::default().bars(&bars))
-            .bar_width(bw)
-            .bar_gap(bg)
-            .max(max_mins)
-            .value_style(primary())
-            .label_style(muted());
-        frame.render_widget(chart, chart_area);
+        render_clean_trend_bars(frame, chart_area, &items, max_mins);
     }
 
     // Lower half: First-round pass rate (%)
@@ -5218,9 +5515,7 @@ fn render_overview_trend_panel(frame: &mut Frame, app: &App, area: Rect) {
             halves[1].width,
             halves[1].height.saturating_sub(1),
         );
-        let bw: u16 = if halves[1].width >= 56 { 6 } else { 5 };
-        let bg: u16 = if halves[1].width >= 56 { 2 } else { 1 };
-        let bars: Vec<Bar> = daily
+        let items: Vec<(String, String, u64, Color)> = daily
             .iter()
             .map(|d| {
                 let val = d.first_round_pass_pct.unwrap_or(0);
@@ -5237,21 +5532,10 @@ fn render_overview_trend_panel(frame: &mut Frame, app: &App, area: Rect) {
                 } else {
                     STATUS_FAILED
                 };
-                Bar::default()
-                    .value(val)
-                    .label(Line::from(d.date.clone()))
-                    .text_value(txt)
-                    .style(Style::default().fg(color))
+                (d.date.clone(), txt, val, color)
             })
             .collect();
-        let chart = BarChart::default()
-            .data(BarGroup::default().bars(&bars))
-            .bar_width(bw)
-            .bar_gap(bg)
-            .max(100)
-            .value_style(primary())
-            .label_style(muted());
-        frame.render_widget(chart, chart_area);
+        render_clean_trend_bars(frame, chart_area, &items, 100);
     }
 }
 

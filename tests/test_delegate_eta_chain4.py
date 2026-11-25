@@ -215,12 +215,13 @@ class DelegateEtaChain4Tests(unittest.TestCase):
         self.assertTrue(live_entry["eta"]["compactBadge"])
         self.assertLessEqual(len(live_entry["eta"]["compactBadge"]), 6)
 
-        # Per-work-item ETA & work DAG summary exposed
+        # Per-work-item ETA & work DAG summary exposed (plus unattached live run as ephemeral R: row)
         self.assertGreaterEqual(doc["eta"]["work"]["writeChains"], 1)
-        self.assertEqual(len(doc["work"]), 1)
-        self.assertIn("eta", doc["work"][0])
-        self.assertTrue(doc["work"][0]["eta"]["compactBadge"])
-        self.assertTrue(doc["work"][0]["eta"]["focusBadge"])
+        real_work = [w for w in doc["work"] if not w.get("ephemeral")]
+        self.assertEqual(len(real_work), 1)
+        self.assertIn("eta", real_work[0])
+        self.assertTrue(real_work[0]["eta"]["compactBadge"])
+        self.assertTrue(real_work[0]["eta"]["focusBadge"])
 
         gate.write_text("go")
 

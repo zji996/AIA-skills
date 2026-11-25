@@ -64,7 +64,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-fn mark_result_read(run: &Path) {
+pub(crate) fn mark_result_read(run: &Path) {
     let meta_path = run.join("meta.json");
     if meta_path.is_file() {
         let mut meta = json(&meta_path);
@@ -803,6 +803,50 @@ fn collect_timed(
     }
     code
 }
+/// Collect active or undelivered runs across all registered repositories (plus live `.slot`
+/// machine runs), deduplicated by canonical path.
+fn cross_repo_wait_runs(session: Option<&str>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::<PathBuf>::new();
+    let mut push_unique = |p: PathBuf| {
+        let key = fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+        if seen.insert(key) {
+            out.push(p);
+        }
+    };
+    let state = state_dir();
+    for r in runs::all_runs() {
+        if runs::active(&runs::state(&r)) || !r.join(".delivered").exists() {
+            push_unique(r);
+        }
+    }
+    for r in launch::machine_runs(&state) {
+        push_unique(r);
+    }
+    if let Some(caller_id) = session {
+        for (_, runs_dir) in work::registered_repo_runs(&state) {
+            if !runs_dir.is_dir() {
+                continue;
+            }
+            for r in runs::all_runs_in(&runs_dir) {
+                let st = runs::state(&r);
+                let live = runs::active(&st);
+                let undelivered = !live
+                    && !r.join(".delivered").exists()
+                    && !r.join(".stopped").exists()
+                    && st != "stopped";
+                if (live || undelivered)
+                    && json(r.join("meta.json"))["caller"].as_str() == Some(caller_id)
+                {
+                    push_unique(r);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// The runs a `wait` collects; the flag is set when a hint about other sessions' runs was printed.
 fn wait_list(pos: &[String], flags: &[String], quiet: bool) -> Res<(Vec<PathBuf>, bool)> {
     if has(flags, "--machine") {
@@ -832,13 +876,18 @@ fn wait_list(pos: &[String], flags: &[String], quiet: bool) -> Res<(Vec<PathBuf>
             false,
         ));
     }
-    let mut v = runs::all_runs()
-        .into_iter()
-        .filter(|r| runs::active(&runs::state(r)) || !r.join(".delivered").exists())
-        .collect::<Vec<_>>();
+    let session = caller();
+    let mut v = if has(flags, "--current-repo") {
+        runs::all_runs()
+            .into_iter()
+            .filter(|r| runs::active(&runs::state(r)) || !r.join(".delivered").exists())
+            .collect::<Vec<_>>()
+    } else {
+        cross_repo_wait_runs(session.as_deref())
+    };
     let mut hinted = false;
     if !has(flags, "--all") {
-        if let Some(caller) = caller() {
+        if let Some(caller) = session {
             let (own, other): (Vec<_>, Vec<_>) = v
                 .into_iter()
                 .partition(|run| json(run.join("meta.json"))["caller"].as_str() == Some(&caller));
@@ -856,12 +905,14 @@ fn wait_remaining_hint(args: &[String]) {
     if output::json_enabled() {
         return;
     }
+    let session = caller();
     let list = if has(args, "--machine") {
         launch::machine_runs(&state_dir())
-    } else {
+    } else if has(args, "--current-repo") {
         runs::all_runs()
+    } else {
+        cross_repo_wait_runs(session.as_deref())
     };
-    let session = caller();
     let left = list
         .iter()
         .filter(|run| runs::active(&runs::state(run)))
@@ -2873,6 +2924,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 &[
                     "--all",
                     "--machine",
+                    "--current-repo",
                     "--no-result",
                     "--full",
                     "--progress",
@@ -3291,6 +3343,13 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 }
                 println!("{}", json!({"statusSummary": summary}));
             } else {
+                let quota_warnings =
+                    agy_accounts::detect_quota_depletion_warnings_in(&state_root, epoch() as i64);
+                if let Some(warn_line) =
+                    agy_accounts::format_status_quota_warning_line(&quota_warnings)
+                {
+                    println!("{warn_line}");
+                }
                 let mut counts = format!(
                     "运行中 {running} · 待合入 {pending_apply} · 待回答 {pending_question} · 排队 {queued}"
                 );

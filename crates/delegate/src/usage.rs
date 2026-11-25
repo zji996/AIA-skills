@@ -822,13 +822,20 @@ pub struct RunningUsageItem {
 }
 
 fn parse_ledger_entries(since_epoch: Option<i64>, include_non_agy: bool) -> (Vec<UsageEntry>, HashSet<String>) {
+    parse_ledger_entries_from(&ledger_path(), since_epoch, include_non_agy)
+}
+
+fn parse_ledger_entries_from(
+    path: &Path,
+    since_epoch: Option<i64>,
+    include_non_agy: bool,
+) -> (Vec<UsageEntry>, HashSet<String>) {
     let mut entries = Vec::new();
     let mut ledger_runs = HashSet::new();
-    let path = ledger_path();
     if !path.is_file() {
         return (entries, ledger_runs);
     }
-    for line in read(&path).lines() {
+    for line in read(path).lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -2094,14 +2101,10 @@ pub fn accounts_usage_snapshot(
     quota_cache: &Value,
 ) -> AccountsUsageSnapshot {
     let now_ep = epoch() as i64;
-    let cutoff_1h = now_ep - ONE_HOUR_SECS;
-    let cutoff_5h = now_ep - FIVE_HOURS_SECS;
     let cutoff_7d = now_ep - SEVEN_DAYS_SECS;
-
     // Fast path: read ledger (`<state>/agy-usage.jsonl`) + active `.slot` runs only.
     let (mut entries, live_running, uncounted_running) =
         collect_all(Some(cutoff_7d), false, false);
-
     for lr in &live_running {
         if let Some(tok) = lr.tokens {
             entries.push(UsageEntry {
@@ -2120,6 +2123,30 @@ pub fn accounts_usage_snapshot(
             });
         }
     }
+    accounts_usage_snapshot_from_entries(accounts_map, quota_cache, now_ep, entries, uncounted_running)
+}
+
+/// Isolated-state variant for lock-free quota depletion checks and deterministic tests.
+pub fn accounts_usage_snapshot_in(
+    state: &Path,
+    accounts_map: &Map<String, Value>,
+    quota_cache: &Value,
+    now_ep: i64,
+) -> AccountsUsageSnapshot {
+    let cutoff_7d = now_ep - SEVEN_DAYS_SECS;
+    let (entries, _) = parse_ledger_entries_from(&state.join("agy-usage.jsonl"), Some(cutoff_7d), false);
+    accounts_usage_snapshot_from_entries(accounts_map, quota_cache, now_ep, entries, Vec::new())
+}
+
+fn accounts_usage_snapshot_from_entries(
+    accounts_map: &Map<String, Value>,
+    quota_cache: &Value,
+    now_ep: i64,
+    entries: Vec<UsageEntry>,
+    uncounted_running: Vec<RunningUsageItem>,
+) -> AccountsUsageSnapshot {
+    let cutoff_1h = now_ep - ONE_HOUR_SECS;
+    let cutoff_5h = now_ep - FIVE_HOURS_SECS;
 
     let mut stats_1h: HashMap<String, BucketStats> = HashMap::new();
     let mut stats_5h: HashMap<String, BucketStats> = HashMap::new();

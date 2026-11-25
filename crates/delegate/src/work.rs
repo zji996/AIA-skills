@@ -1014,7 +1014,7 @@ fn clip_chars(text: &str, max_chars: usize) -> String {
 // Discovery of repos / runs / history for evaluation & migration
 // ---------------------------------------------------------------------------
 
-fn registered_repo_runs(state: &Path) -> Vec<(PathBuf, PathBuf)> {
+pub(crate) fn registered_repo_runs(state: &Path) -> Vec<(PathBuf, PathBuf)> {
     let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
@@ -1926,6 +1926,62 @@ pub fn evaluate_condition(
     evaluate_condition_with_prefetch(cond, item, all_items, state, now_epoch, None)
 }
 
+/// Resolve a run reference (run ID or slug) to a human-readable display name
+/// by checking `<runs_dir>/<run_ref>/meta.json` across registered repos, falling
+/// back to stripping a leading `YYYYMMDD-HHMMSS-` timestamp prefix.
+pub(crate) fn resolve_run_display_name(
+    run_ref: &str,
+    state: &Path,
+    preferred_repo: Option<&str>,
+) -> String {
+    let trimmed = run_ref.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let try_dir = |rdir: &Path| -> Option<String> {
+        let meta = json(rdir.join("meta.json"));
+        let raw_name = s(&meta, "name");
+        if raw_name.is_empty() {
+            return None;
+        }
+        let cleaned = notes::strip_reply_prefixes(raw_name).0.trim();
+        if cleaned.is_empty() {
+            Some(raw_name.to_string())
+        } else {
+            Some(cleaned.to_string())
+        }
+    };
+    if let Some(repo) = preferred_repo {
+        if !repo.is_empty() {
+            let direct = Path::new(repo).join(".local/run/delegate").join(trimmed);
+            if direct.join("meta.json").is_file() {
+                if let Some(nm) = try_dir(&direct) {
+                    return nm;
+                }
+            }
+        }
+    }
+    for (_, runs_dir) in registered_repo_runs(state) {
+        let direct = runs_dir.join(trimmed);
+        if direct.join("meta.json").is_file() {
+            if let Some(nm) = try_dir(&direct) {
+                return nm;
+            }
+        }
+    }
+    // Fallback: strip leading YYYYMMDD-HHMMSS- if present
+    let b = trimmed.as_bytes();
+    if b.len() > 16
+        && b[0..8].iter().all(|c| c.is_ascii_digit())
+        && b[8] == b'-'
+        && b[9..15].iter().all(|c| c.is_ascii_digit())
+        && b[15] == b'-'
+    {
+        return trimmed[16..].to_string();
+    }
+    trimmed.to_string()
+}
+
 fn evaluate_condition_with_prefetch(
     cond: &str,
     item: &WorkItem,
@@ -1945,26 +2001,28 @@ fn evaluate_condition_with_prefetch(
                         .copied()
                 })
                 .unwrap_or_else(|| is_run_applied(run_ref, state, Some(&item.repo)));
+        let disp = resolve_run_display_name(run_ref, state, Some(&item.repo));
         return CondEval {
             raw: cond.to_string(),
             satisfied: ok,
             detail: if ok {
-                format!("上游 {run_ref} 已合入")
+                format!("上游 {disp} 已合入")
             } else {
-                format!("等 {run_ref} 合入")
+                format!("等 {disp} 合入")
             },
             pointer: format!("delegate show {run_ref}"),
         };
     }
     if let Some(run_ref) = cond.strip_prefix("run_delivered:") {
         let ok = is_run_delivered(run_ref, state, Some(&item.repo));
+        let disp = resolve_run_display_name(run_ref, state, Some(&item.repo));
         return CondEval {
             raw: cond.to_string(),
             satisfied: ok,
             detail: if ok {
-                format!("上游 {run_ref} 已交付")
+                format!("上游 {disp} 已交付")
             } else {
-                format!("等 {run_ref} 交付")
+                format!("等 {disp} 交付")
             },
             pointer: format!("delegate show {run_ref}"),
         };
@@ -2091,14 +2149,18 @@ fn evaluate_condition_with_prefetch(
         };
     }
     if let Some(ts_str) = cond.strip_prefix("after_time:") {
-        let ok = parse_iso_or_date_epoch(ts_str).is_some_and(|t| now_epoch >= t);
+        let parsed = parse_iso_or_date_epoch(ts_str);
+        let ok = parsed.is_some_and(|t| now_epoch >= t);
+        let local_t = parsed
+            .map(|t| crate::eta::format_local_short(t, now_epoch))
+            .unwrap_or_else(|| ts_str.to_string());
         return CondEval {
             raw: cond.to_string(),
             satisfied: ok,
             detail: if ok {
-                format!("已到时间 {ts_str}")
+                format!("已到时间 {local_t}")
             } else {
-                format!("等到 {ts_str}")
+                format!("等到 {local_t}")
             },
             pointer: String::new(),
         };
@@ -3023,6 +3085,7 @@ pub fn load_readonly() -> Vec<WorkItem> {
     load_readonly_in(&state_dir())
 }
 
+#[cfg(test)]
 pub fn load_readonly_json(state: &Path) -> Vec<Value> {
     let items = load_readonly_in(state);
     let now_epoch = epoch() as i64;
@@ -4795,7 +4858,7 @@ fn refresh_index_for_chain(chain: &notes::ChainNotes, run_opt: Option<&Path>, al
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
-struct TableRow {
+pub(crate) struct TableRow {
     id: String,
     repo: String,
     title: String,
@@ -4927,9 +4990,9 @@ fn focus_for_item_core(item: &WorkItem, all_items: &[WorkItem], state: &Path, no
             }
             let age = format_age(&item.state_since, now_epoch);
             if age.is_empty() {
-                "可派发".into()
+                "就绪".into()
             } else {
-                format!("可派发 {age}")
+                format!("就绪 {age}")
             }
         }
         "verify" => {
@@ -4960,8 +5023,12 @@ fn focus_for_item_core(item: &WorkItem, all_items: &[WorkItem], state: &Path, no
         }
         "deferred" => {
             if !item.defer_until.is_empty() {
-                let short_t = &item.defer_until[..item.defer_until.len().min(16)];
-                format!("暂缓至 {short_t}")
+                let local_t = parse_iso_or_date_epoch(&item.defer_until)
+                    .map(|ts| crate::eta::format_local_short(ts, now_epoch))
+                    .unwrap_or_else(|| {
+                        item.defer_until[..item.defer_until.len().min(16)].to_string()
+                    });
+                format!("暂缓至 {local_t}")
             } else if !item.defer_reason.is_empty() {
                 clip_chars(&item.defer_reason, 20)
             } else {
@@ -5057,13 +5124,21 @@ fn short_run_id(rid: &str) -> String {
     clip_chars(rid, 14)
 }
 
+/// Extra metadata captured alongside each ephemeral run row for unified snapshot projection.
+pub(crate) struct EphemeralRunInfo {
+    pub(crate) run_dir: PathBuf,
+    pub(crate) repo_path: String,
+    pub(crate) started_at: String,
+    pub(crate) updated_at: String,
+}
+
 /// Collect ephemeral unattached runs (not bound to any work item), folded by reply chain,
-/// returning both the table rows and a map of `run_id -> run_dir` for lock-free ETA projection.
-fn ephemeral_run_rows_with_dirs(
+/// returning both the table rows and a map of `run_id -> EphemeralRunInfo` for lock-free ETA projection.
+fn ephemeral_run_rows_with_info(
     items: &[WorkItem],
     state: &Path,
     now_epoch: i64,
-) -> (Vec<TableRow>, HashMap<String, PathBuf>) {
+) -> (Vec<TableRow>, HashMap<String, EphemeralRunInfo>) {
     let mut attached_runs: HashSet<String> = HashSet::new();
     for w in items {
         for r in &w.runs {
@@ -5075,7 +5150,7 @@ fn ephemeral_run_rows_with_dirs(
     }
 
     let mut rows = Vec::new();
-    let mut run_dirs: HashMap<String, PathBuf> = HashMap::new();
+    let mut run_infos: HashMap<String, EphemeralRunInfo> = HashMap::new();
     let mut seen_run = HashSet::new();
 
     for (repo_root, runs_dir) in registered_repo_runs(state) {
@@ -5114,7 +5189,8 @@ fn ephemeral_run_rows_with_dirs(
             metas.push((r, rid, meta));
         }
 
-        let repo_label = short_repo_name(&repo_root.to_string_lossy()).to_string();
+        let repo_path_str = repo_root.to_string_lossy().into_owned();
+        let repo_label = short_repo_name(&repo_path_str).to_string();
 
         for (r, rid, meta) in &metas {
             if rid.is_empty() || parents.contains(rid) || !seen_run.insert(rid.clone()) {
@@ -5189,6 +5265,9 @@ fn ephemeral_run_rows_with_dirs(
             } else if st == "delivered" && s(meta, "mode") == "write" {
                 let files = delivered_pending_files(r, meta, &sum);
                 if files == 0 {
+                    if !s(meta, "resultReadAt").is_empty() {
+                        continue;
+                    }
                     (
                         "verify".to_string(),
                         "已收取".to_string(),
@@ -5214,6 +5293,9 @@ fn ephemeral_run_rows_with_dirs(
                 st.as_str(),
                 "rejected" | "failed" | "malformed" | "timeout" | "stalled" | "crashed"
             ) {
+                if !s(meta, "resultReadAt").is_empty() {
+                    continue;
+                }
                 (
                     "attention".to_string(),
                     format!("异常 {st}"),
@@ -5225,11 +5307,28 @@ fn ephemeral_run_rows_with_dirs(
             };
 
             let short = short_run_id(rid);
-            run_dirs.insert(rid.clone(), r.clone());
+            let started_at = s(meta, "startedAt").to_string();
+            let updated_at = {
+                let fin = s(&sum, "finishedAt");
+                if !fin.is_empty() {
+                    fin.to_string()
+                } else {
+                    started_at.clone()
+                }
+            };
+            run_infos.insert(
+                rid.clone(),
+                EphemeralRunInfo {
+                    run_dir: r.clone(),
+                    repo_path: repo_path_str.clone(),
+                    started_at,
+                    updated_at,
+                },
+            );
             rows.push(TableRow {
                 id: format!("R:{short}"),
                 repo: repo_label.clone(),
-                title: clip_chars(&chain_name, 30),
+                title: chain_name,
                 state: work_state,
                 focus,
                 next,
@@ -5239,16 +5338,16 @@ fn ephemeral_run_rows_with_dirs(
             });
         }
     }
-    (rows, run_dirs)
+    (rows, run_infos)
 }
 
 #[cfg(test)]
 fn ephemeral_run_rows(items: &[WorkItem], state: &Path, now_epoch: i64) -> Vec<TableRow> {
-    ephemeral_run_rows_with_dirs(items, state, now_epoch).0
+    ephemeral_run_rows_with_info(items, state, now_epoch).0
 }
 
-/// Embed a compact ETA/blocker badge (e.g. `~03:40`, `等W12(~04:30)`, `卡所有者Q03`) into the
-/// L1 `focus` column while keeping it within the 22-char column budget (and 6 columns / 100 chars).
+/// Embed an ETA/blocker badge (e.g. `~03:40`, `等W12(~04:30)`, `预计耗时 1.2–2.7h`, `卡所有者Q03`)
+/// into the `focus` text without prematurely truncating wide-terminal text.
 fn embed_focus_eta(base: &str, state: &str, badge: &str) -> String {
     if badge.is_empty() || badge == "-" {
         return base.to_string();
@@ -5258,7 +5357,7 @@ fn embed_focus_eta(base: &str, state: &str, badge: &str) -> String {
             || badge.starts_with("等")
             || badge.starts_with("卡主干"))
     {
-        return clip_chars(badge, 22);
+        return badge.to_string();
     }
     if !matches!(state, "active" | "ready" | "attention" | "blocked") {
         return base.to_string();
@@ -5269,42 +5368,155 @@ fn embed_focus_eta(base: &str, state: &str, badge: &str) -> String {
     if state == "attention" && badge == "卡主控" && base.contains("卡") {
         return base.to_string();
     }
-    let b_len = badge.chars().count();
-    if b_len >= 22 {
-        return clip_chars(badge, 22);
+    if state == "ready" && badge.starts_with("预计耗时") {
+        if base.is_empty() {
+            return badge.to_string();
+        }
+        return format!("{base}，{badge}");
     }
-    let max_prefix = 22usize.saturating_sub(b_len + 1);
-    if max_prefix == 0 {
-        return clip_chars(badge, 22);
-    }
-    let compact_base = if base.chars().count() > max_prefix && state == "active" {
-        base.replace(" 运行中", "")
-    } else {
-        base.to_string()
-    };
-    let prefix = clip_chars(&compact_base, max_prefix);
-    if prefix.is_empty() {
+    if base.is_empty() {
         badge.to_string()
     } else {
-        format!("{prefix} {badge}")
+        format!("{base} {badge}")
     }
 }
 
-fn format_table_row(row: &TableRow) -> String {
-    let title = clip_chars(&row.title, 26);
-    let focus = clip_chars(&row.focus, 22);
-    let next = clip_chars(&row.next, 32);
-    let line = format!(
-        "[{}] [{}] {} · {} · {} · 下一步：{}",
-        row.id, row.repo, title, row.state, focus, next
-    );
-    if row.missing_class {
-        let suffix = " · 缺类别";
-        let max_body = 100usize.saturating_sub(suffix.chars().count());
-        format!("{}{}", clip_chars(&line, max_body), suffix)
+fn char_display_width(c: char) -> usize {
+    let cp = c as u32;
+    if cp < 0x20 || cp == 0x7f {
+        0
+    } else if (0x1100..=0x115f).contains(&cp)
+        || (0x2e80..=0xa4cf).contains(&cp)
+        || (0xac00..=0xd7a3).contains(&cp)
+        || (0xf900..=0xfaff).contains(&cp)
+        || (0xfe10..=0xfe6f).contains(&cp)
+        || (0xff00..=0xff60).contains(&cp)
+        || (0xffe0..=0xffe6).contains(&cp)
+        || (0x20000..=0x3fffd).contains(&cp)
+    {
+        2
     } else {
-        clip_chars(&line, 100)
+        1
     }
+}
+
+fn str_display_width(s: &str) -> usize {
+    s.chars().map(char_display_width).sum()
+}
+
+fn clip_display_width(s: &str, max_w: usize) -> String {
+    if str_display_width(s) <= max_w {
+        return s.to_string();
+    }
+    if max_w == 0 {
+        return String::new();
+    }
+    if max_w == 1 {
+        return "…".to_string();
+    }
+    let target = max_w - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let cw = char_display_width(c);
+        if used + cw > target {
+            break;
+        }
+        out.push(c);
+        used += cw;
+    }
+    out.push('…');
+    out
+}
+
+/// Detect terminal columns: explicit `COLUMNS` env -> TTY `TIOCGWINSZ` -> fallback 100.
+fn detect_terminal_width() -> usize {
+    if let Ok(raw) = std::env::var("COLUMNS") {
+        if let Ok(n) = raw.trim().parse::<usize>() {
+            if n >= 40 {
+                return n;
+            }
+        }
+    }
+    #[cfg(unix)]
+    unsafe {
+        if libc::isatty(libc::STDOUT_FILENO) == 1 {
+            let mut ws: libc::winsize = std::mem::zeroed();
+            if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col >= 40 {
+                return ws.ws_col as usize;
+            }
+        }
+    }
+    100
+}
+
+#[allow(dead_code)]
+fn format_table_row(row: &TableRow) -> String {
+    format_table_row_with_width(row, 100)
+}
+
+fn format_table_row_with_width(row: &TableRow, term_w: usize) -> String {
+    if term_w <= 100 {
+        // Compact 100-char layout for narrow/piped terminals (keeps exact 6-column contract).
+        let title = clip_chars(&row.title, 26);
+        let focus = clip_chars(&row.focus, 22);
+        let next = clip_chars(&row.next, 32);
+        let line = format!(
+            "[{}] [{}] {} · {} · {} · 下一步：{}",
+            row.id, row.repo, title, row.state, focus, next
+        );
+        return if row.missing_class {
+            let suffix = " · 缺类别";
+            let max_body = 100usize.saturating_sub(suffix.chars().count());
+            format!("{}{}", clip_chars(&line, max_body), suffix)
+        } else {
+            clip_chars(&line, 100)
+        };
+    }
+
+    // Wide terminal layout: allocate budgets dynamically based on terminal width so titles,
+    // focus badges, and next commands stay untruncated whenever space allows.
+    let suffix = if row.missing_class { " · 缺类别" } else { "" };
+    let fixed_prefix = format!("[{}] [{}] ", row.id, row.repo);
+    let fixed_mid = format!(" · {} · ", row.state);
+    let fixed_next = " · 下一步：";
+    let overhead = str_display_width(&fixed_prefix)
+        + str_display_width(&fixed_mid)
+        + str_display_width(fixed_next)
+        + str_display_width(suffix);
+    let avail = term_w.saturating_sub(overhead);
+
+    let tw = str_display_width(&row.title);
+    let fw = str_display_width(&row.focus);
+    let nw = str_display_width(&row.next);
+
+    let (title_s, focus_s, next_s) = if tw + fw + nw <= avail {
+        (row.title.clone(), row.focus.clone(), row.next.clone())
+    } else {
+        // Reserve space for focus and next first (capped when still overflowing), give rest to title.
+        let mut f_cap = fw.min((avail * 32 / 100).max(28));
+        let mut n_cap = nw.min((avail * 28 / 100).max(32));
+        let mut t_cap = avail.saturating_sub(f_cap + n_cap).max(20);
+        // Redistribute unused title budget back to focus and next.
+        if tw < t_cap {
+            let spare = t_cap - tw;
+            t_cap = tw;
+            let f_need = fw.saturating_sub(f_cap);
+            let f_add = spare.min(f_need);
+            f_cap += f_add;
+            let spare2 = spare - f_add;
+            n_cap += spare2.min(nw.saturating_sub(n_cap));
+        }
+        (
+            clip_display_width(&row.title, t_cap),
+            clip_display_width(&row.focus, f_cap),
+            clip_display_width(&row.next, n_cap),
+        )
+    };
+
+    format!(
+        "{fixed_prefix}{title_s}{fixed_mid}{focus_s}{fixed_next}{next_s}{suffix}"
+    )
 }
 
 #[allow(dead_code)]
@@ -6136,90 +6348,31 @@ fn list_cmd(args: &[String]) -> Res<i32> {
     if owner_only {
         return render_owner_list(&items, &state, now_epoch, show_all, state_filter.as_deref(), repo_filter.as_deref(), json_mode);
     }
-    let (mut ephemeral, ephemeral_dirs) = ephemeral_run_rows_with_dirs(&items, &state, now_epoch);
 
-    // Compute lock-free ETA projections once when there is anything to display.
-    let mut dag_eta: Option<crate::eta::DagEtaSummary> = None;
-    let mut ephemeral_etas: HashMap<String, crate::eta::RunEta> = HashMap::new();
-    if !items.is_empty() || !ephemeral.is_empty() {
-        let mut visible_runs: Vec<PathBuf> = ephemeral_dirs.values().cloned().collect();
-        for w in &items {
-            if w.state != "done" {
-                for p in w.run_dirs.values() {
-                    let pb = PathBuf::from(p);
-                    if !visible_runs.contains(&pb) {
-                        visible_runs.push(pb);
-                    }
-                }
-            }
-        }
-        let eta_model = crate::speed::load_or_refresh_eta_model_in(&state, now_epoch, true);
-        let eta_ctx = crate::eta::LiveContext::capture(&state, now_epoch, &visible_runs);
-        if !items.is_empty() {
-            dag_eta = Some(crate::eta::estimate_work_dag_in(
-                &items,
-                repo_filter.as_deref(),
-                &eta_model,
-                &eta_ctx,
-            ));
-        }
-        for row in &mut ephemeral {
-            if let Some(rdir) = ephemeral_dirs.get(&row.run_id) {
-                let re = crate::eta::estimate_run_in(rdir, &eta_model, &eta_ctx);
-                if re.stage != crate::eta::Stage::Done {
-                    row.focus = embed_focus_eta(&row.focus, &row.state, &re.compact_badge);
-                    ephemeral_etas.insert(row.run_id.clone(), re);
-                }
-            }
-        }
-    }
-
+    let visible_runs = visible_runs_for_work(&items, &state, now_epoch);
+    let eta_model = crate::speed::load_or_refresh_eta_model_in(&state, now_epoch, true);
+    let eta_ctx = crate::eta::LiveContext::capture(&state, now_epoch, &visible_runs);
+    let view = build_unified_work_view(
+        items,
+        &state,
+        now_epoch,
+        repo_filter.as_deref(),
+        &eta_model,
+        &eta_ctx,
+        false,
+    );
+    let UnifiedWorkView {
+        items,
+        all_rows,
+        counts,
+        dag_eta,
+        ephemeral_etas,
+        ..
+    } = view;
     let item_eta_by_id: HashMap<&str, &crate::eta::WorkItemEta> = dag_eta
         .as_ref()
         .map(|d| d.items.iter().map(|ie| (ie.id.as_str(), ie)).collect())
         .unwrap_or_default();
-
-    let mut all_rows: Vec<TableRow> = items
-        .iter()
-        .map(|w| {
-            let base_focus = focus_for_item(w, &items, &state, now_epoch);
-            let focus = if w.owner.is_none() {
-                if let Some(ie) = item_eta_by_id.get(w.id.as_str()) {
-                    embed_focus_eta(&base_focus, &w.state, &ie.focus_badge)
-                } else {
-                    base_focus
-                }
-            } else {
-                base_focus
-            };
-            TableRow {
-                id: w.id.clone(),
-                repo: w.repo_label(),
-                title: w.title.clone(),
-                state: w.state.clone(),
-                focus,
-                next: next_action_for(w, &items, &state),
-                is_ephemeral: false,
-                run_id: w.latest_run_id().unwrap_or("").to_string(),
-                missing_class: w.is_missing_class(),
-            }
-        })
-        .collect();
-    all_rows.extend(ephemeral);
-
-    if let Some(rf) = &repo_filter {
-        let rf_low = rf.to_ascii_lowercase();
-        all_rows.retain(|r| r.repo.to_ascii_lowercase().contains(&rf_low));
-    }
-
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for r in &all_rows {
-        for &st in &STATES {
-            if r.state == st {
-                *counts.entry(st).or_insert(0) += 1;
-            }
-        }
-    }
 
     let mut visible: Vec<&TableRow> = all_rows
         .iter()
@@ -6283,12 +6436,13 @@ fn list_cmd(args: &[String]) -> Res<i32> {
         return Ok(0);
     }
 
+    let term_w = detect_terminal_width();
     println!("{}", render_layer0_summary_with_eta(&counts, dag_eta.as_ref()));
     if visible.is_empty() {
         println!("（当前无待处理项）");
     } else {
         for r in &visible {
-            println!("{}", format_table_row(r));
+            println!("{}", format_table_row_with_width(r, term_w));
         }
     }
     if !show_all && state_filter.is_none() {
@@ -6306,6 +6460,207 @@ fn list_cmd(args: &[String]) -> Res<i32> {
     };
     println!("卡片：delegate work show <ID> · 全部：delegate work --all{done_hint}");
     Ok(0)
+}
+
+/// Unified work-table computation shared by both `delegate work` (CLI) and
+/// `delegate snapshot --json` (TUI) so counts, ephemeral unattached runs (`R:`),
+/// and DAG ETA numbers come from a single source of truth.
+pub(crate) struct UnifiedWorkView {
+    pub(crate) items: Vec<WorkItem>,
+    pub(crate) all_rows: Vec<TableRow>,
+    pub(crate) counts: HashMap<&'static str, usize>,
+    pub(crate) dag_eta: Option<crate::eta::DagEtaSummary>,
+    pub(crate) ephemeral_etas: HashMap<String, crate::eta::RunEta>,
+    pub(crate) snapshot_items_json: Vec<Value>,
+}
+
+pub(crate) fn build_unified_work_view(
+    items: Vec<WorkItem>,
+    state: &Path,
+    now_epoch: i64,
+    repo_filter: Option<&str>,
+    eta_model: &crate::speed::EtaModel,
+    eta_ctx: &crate::eta::LiveContext,
+    build_snapshot_json: bool,
+) -> UnifiedWorkView {
+    let (mut ephemeral, ephemeral_infos) = ephemeral_run_rows_with_info(&items, state, now_epoch);
+
+    let dag_eta = if !items.is_empty() {
+        Some(crate::eta::estimate_work_dag_in(
+            &items,
+            repo_filter,
+            eta_model,
+            eta_ctx,
+        ))
+    } else {
+        None
+    };
+
+    let mut ephemeral_etas: HashMap<String, crate::eta::RunEta> = HashMap::new();
+    let mut ephemeral_base_focus: HashMap<String, String> = HashMap::new();
+    for row in &mut ephemeral {
+        ephemeral_base_focus.insert(row.run_id.clone(), row.focus.clone());
+        if let Some(info) = ephemeral_infos.get(&row.run_id) {
+            let re = crate::eta::estimate_run_in(&info.run_dir, eta_model, eta_ctx);
+            if re.stage != crate::eta::Stage::Done {
+                row.focus = embed_focus_eta(&row.focus, &row.state, &re.compact_badge);
+                ephemeral_etas.insert(row.run_id.clone(), re);
+            }
+        }
+    }
+
+    let item_eta_by_id: HashMap<&str, &crate::eta::WorkItemEta> = dag_eta
+        .as_ref()
+        .map(|d| d.items.iter().map(|ie| (ie.id.as_str(), ie)).collect())
+        .unwrap_or_default();
+
+    let mut snapshot_items_json: Vec<Value> = if build_snapshot_json {
+        Vec::with_capacity(items.len() + ephemeral.len())
+    } else {
+        Vec::new()
+    };
+
+    let mut all_rows: Vec<TableRow> = items
+        .iter()
+        .map(|w| {
+            let base_focus = focus_for_item(w, &items, state, now_epoch);
+            let next_act = next_action_for(w, &items, state);
+            let repo_lbl = w.repo_label();
+            let focus = if w.owner.is_none() {
+                if let Some(ie) = item_eta_by_id.get(w.id.as_str()) {
+                    embed_focus_eta(&base_focus, &w.state, &ie.focus_badge)
+                } else {
+                    base_focus.clone()
+                }
+            } else {
+                base_focus.clone()
+            };
+            if build_snapshot_json {
+                let mut obj = w.to_json();
+                obj["repoLabel"] = json!(repo_lbl);
+                obj["focus"] = json!(base_focus);
+                obj["next"] = json!(next_act);
+                if !w.wait_on.is_empty() {
+                    obj["waitOnStatus"] = json!(w
+                        .wait_on
+                        .iter()
+                        .map(|c| {
+                            let ev = evaluate_condition(c, w, &items, state, now_epoch);
+                            json!({
+                                "condition": ev.raw,
+                                "satisfied": ev.satisfied,
+                                "detail": ev.detail,
+                                "pointer": ev.pointer,
+                            })
+                        })
+                        .collect::<Vec<_>>());
+                }
+                if !w.verify_on.is_empty() {
+                    obj["verifyOnStatus"] = json!(w
+                        .verify_on
+                        .iter()
+                        .map(|c| {
+                            let ev = evaluate_condition(c, w, &items, state, now_epoch);
+                            json!({
+                                "condition": ev.raw,
+                                "satisfied": ev.satisfied,
+                                "detail": ev.detail,
+                                "pointer": ev.pointer,
+                            })
+                        })
+                        .collect::<Vec<_>>());
+                }
+                if let Some(ie) = item_eta_by_id.get(w.id.as_str()) {
+                    obj["eta"] = ie.to_json();
+                }
+                snapshot_items_json.push(obj);
+            }
+            TableRow {
+                id: w.id.clone(),
+                repo: repo_lbl,
+                title: w.title.clone(),
+                state: w.state.clone(),
+                focus,
+                next: next_act,
+                is_ephemeral: false,
+                run_id: w.latest_run_id().unwrap_or("").to_string(),
+                missing_class: w.is_missing_class(),
+            }
+        })
+        .collect();
+
+    if build_snapshot_json {
+        for r in &ephemeral {
+            let info = ephemeral_infos.get(&r.run_id);
+            let base_f = ephemeral_base_focus
+                .get(&r.run_id)
+                .map(String::as_str)
+                .unwrap_or(&r.focus);
+            let mut obj = json!({
+                "id": r.id,
+                "ephemeral": true,
+                "title": r.title,
+                "repo": info.map(|i| i.repo_path.as_str()).unwrap_or(""),
+                "repoLabel": r.repo,
+                "state": r.state,
+                "focus": base_f,
+                "next": r.next,
+                "runs": [r.run_id],
+                "run": r.run_id,
+                "createdAt": info.map(|i| i.started_at.as_str()).unwrap_or(""),
+                "updatedAt": info.map(|i| i.updated_at.as_str()).unwrap_or(""),
+                "stateSince": info.map(|i| i.started_at.as_str()).unwrap_or(""),
+            });
+            if let Some(re) = ephemeral_etas.get(&r.run_id) {
+                obj["eta"] = re.to_json();
+            }
+            snapshot_items_json.push(obj);
+        }
+    }
+
+    all_rows.extend(ephemeral);
+
+    if let Some(rf) = repo_filter {
+        let rf_low = rf.to_ascii_lowercase();
+        all_rows.retain(|r| r.repo.to_ascii_lowercase().contains(&rf_low));
+    }
+
+    let mut counts: HashMap<&'static str, usize> = HashMap::new();
+    for r in &all_rows {
+        for &st in &STATES {
+            if r.state == st {
+                *counts.entry(st).or_insert(0) += 1;
+            }
+        }
+    }
+
+    UnifiedWorkView {
+        items,
+        all_rows,
+        counts,
+        dag_eta,
+        ephemeral_etas,
+        snapshot_items_json,
+    }
+}
+
+pub(crate) fn visible_runs_for_work(items: &[WorkItem], state: &Path, now_epoch: i64) -> Vec<PathBuf> {
+    let (_, ephemeral_infos) = ephemeral_run_rows_with_info(items, state, now_epoch);
+    let mut visible_runs: Vec<PathBuf> = ephemeral_infos
+        .values()
+        .map(|i| i.run_dir.clone())
+        .collect();
+    for w in items {
+        if w.state != "done" {
+            for p in w.run_dirs.values() {
+                let pb = PathBuf::from(p);
+                if !visible_runs.contains(&pb) {
+                    visible_runs.push(pb);
+                }
+            }
+        }
+    }
+    visible_runs
 }
 
 fn render_owner_list(
@@ -9192,8 +9547,10 @@ mod tests {
         reconcile_all_locked(&state, &mut items);
 
         assert_eq!(items[0].state, "blocked", "W038 must honor wait_on, not attention");
+        let w38_focus = focus_for_item(&items[0], &items, &state, now_epoch);
         assert!(
-            focus_for_item(&items[0], &items, &state, now_epoch).contains("2099-01-01")
+            w38_focus.starts_with("等到 ") && w38_focus.contains("01-01"),
+            "expected local short date in focus, got: {w38_focus}"
         );
 
         assert_eq!(items[1].state, "verify", "live zero-change delivery should move to verify");
@@ -10186,7 +10543,6 @@ mod tests {
         );
         let active_long = embed_focus_eta("run long-feature-slug 运行中 15m", "active", "~03:40");
         assert!(active_long.contains("~03:40"), "{active_long}");
-        assert!(active_long.chars().count() <= 22, "{active_long}");
 
         let row = TableRow {
             id: "W015".into(),
@@ -10203,6 +10559,12 @@ mod tests {
         assert!(rendered.chars().count() <= 100, "len={} {rendered}", rendered.chars().count());
         assert!(rendered.contains("等W12(~04:30)"), "{rendered}");
         assert!(rendered.ends_with(" · 缺类别"), "{rendered}");
+
+        // Wide terminal (180 cols) keeps full title and full next command without premature clipping.
+        let wide = format_table_row_with_width(&row, 180);
+        assert!(wide.contains("这是一条标题非常长非常长的工作项用来测试一百字上限"), "{wide}");
+        assert!(wide.contains("start --work W015 --prompt-file docs/w015.md"), "{wide}");
+        assert!(wide.ends_with(" · 缺类别"), "{wide}");
     }
 
     #[test]
@@ -10251,6 +10613,154 @@ mod tests {
         assert!(card.contains("上游关键路径：W001 → W002"), "{card}");
         assert!(card.contains("- [W001] 上游底座"), "{card}");
         assert!(card.contains("- [W002] 下游接线"), "{card}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_focus_uses_local_short_time_not_raw_utc_iso() {
+        let dir = std::env::temp_dir().join(format!(
+            "delegate-work-defer-local-{}-{}",
+            std::process::id(),
+            epoch() as u64
+        ));
+        let state = dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+
+        // Fixed clock: 2026-11-25T19:35:00Z
+        let now_ts = parse_iso_or_date_epoch("2026-11-25T19:35:00Z").unwrap();
+        let same_day_iso = "2026-11-26T01:12:00Z";
+        let future_day_iso = "2026-12-01T00:00:00Z";
+        let same_day_ts = parse_iso_or_date_epoch(same_day_iso).unwrap();
+        let future_day_ts = parse_iso_or_date_epoch(future_day_iso).unwrap();
+
+        let w_same = WorkItem {
+            id: "W064".into(),
+            title: "同日暂缓".into(),
+            state: "deferred".into(),
+            defer_until: same_day_iso.into(),
+            ..Default::default()
+        };
+        let w_future = WorkItem {
+            id: "W006".into(),
+            title: "跨日暂缓".into(),
+            state: "deferred".into(),
+            defer_until: future_day_iso.into(),
+            ..Default::default()
+        };
+        let items = vec![w_same, w_future];
+
+        let f_same = focus_for_item(&items[0], &items, &state, now_ts);
+        let expected_same = format!(
+            "暂缓至 {}",
+            crate::eta::format_local_short(same_day_ts, now_ts)
+        );
+        assert_eq!(f_same, expected_same);
+        assert!(!f_same.contains('T'), "must not leak raw UTC ISO: {f_same}");
+
+        let f_future = focus_for_item(&items[1], &items, &state, now_ts);
+        let expected_future = format!(
+            "暂缓至 {}",
+            crate::eta::format_local_short(future_day_ts, now_ts)
+        );
+        assert_eq!(f_future, expected_future);
+        assert!(!f_future.contains('T'), "must not leak raw UTC ISO: {f_future}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unified_work_view_aligns_cli_and_snapshot_counts_including_ephemeral_runs() {
+        let dir = std::env::temp_dir().join(format!(
+            "delegate-work-unified-{}-{}",
+            std::process::id(),
+            epoch() as u64
+        ));
+        let state = dir.join("state");
+        let repo = dir.join("demo-repo");
+        let runs_dir = repo.join(".local/run/delegate");
+        let rdir = runs_dir.join("20261126-033510-unattached-task");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&rdir).unwrap();
+        let now_ts = parse_iso_or_date_epoch("2026-11-25T19:35:00Z").unwrap();
+
+        write_json(
+            state.join("repos.json"),
+            &json!({
+                "repos": {
+                    "demo": {
+                        "repo": repo.to_string_lossy(),
+                        "runs": runs_dir.to_string_lossy(),
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        write_json(
+            rdir.join("meta.json"),
+            &json!({
+                "run": "20261126-033510-unattached-task",
+                "name": "未挂工作项任务",
+                "mode": "write",
+                "workdir": repo.to_string_lossy(),
+                "startedAt": "2026-11-25T19:30:00Z",
+            }),
+        )
+        .unwrap();
+        fs::write(rdir.join("supervisor.pid"), std::process::id().to_string()).unwrap();
+
+        let items = vec![
+            WorkItem {
+                id: "W001".into(),
+                title: "就绪项".into(),
+                repo: repo.to_string_lossy().into_owned(),
+                state: "ready".into(),
+                class: "feat".into(),
+                state_since: "2026-11-25T13:35:00Z".into(),
+                ..Default::default()
+            },
+            WorkItem {
+                id: "W002".into(),
+                title: "暂缓项".into(),
+                repo: repo.to_string_lossy().into_owned(),
+                state: "deferred".into(),
+                class: "feat".into(),
+                defer_until: "2026-12-01T00:00:00Z".into(),
+                ..Default::default()
+            },
+        ];
+
+        let model = crate::speed::build_eta_model_in(&state, now_ts);
+        let ctx = crate::eta::LiveContext {
+            now_ts,
+            ..Default::default()
+        };
+        let view = build_unified_work_view(items, &state, now_ts, None, &model, &ctx, true);
+
+        // Both CLI rows and snapshot JSON include the unattached ephemeral run (`R:...`).
+        assert_eq!(view.counts.get("active").copied().unwrap_or(0), 1);
+        assert_eq!(view.counts.get("ready").copied().unwrap_or(0), 1);
+        assert_eq!(view.counts.get("deferred").copied().unwrap_or(0), 1);
+        assert_eq!(view.all_rows.len(), view.snapshot_items_json.len());
+        let snap_active = view
+            .snapshot_items_json
+            .iter()
+            .filter(|v| s(v, "state") == "active")
+            .count();
+        assert_eq!(snap_active, 1, "snapshot JSON must include unattached active run");
+        assert!(
+            view.snapshot_items_json
+                .iter()
+                .any(|v| b(v, "ephemeral") && s(v, "id").starts_with("R:")),
+            "snapshot JSON missing ephemeral R: item"
+        );
+        // Ready focus wording is unambiguous (`就绪 6h，预计耗时 ...`).
+        let ready_row = view.all_rows.iter().find(|r| r.id == "W001").unwrap();
+        assert!(
+            ready_row.focus.contains("就绪 6h") && ready_row.focus.contains("预计耗时"),
+            "unexpected ready focus: {}",
+            ready_row.focus
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

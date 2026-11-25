@@ -130,7 +130,11 @@ pub enum CollapseKind {
     Collected,
     MergedUncleaned,
     Stopped,
+    DispatchedQueue,
+    StaleRepos,
 }
+
+const GLOBAL_FOLD_SENTINEL: &str = "__global__";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListRow {
@@ -233,6 +237,7 @@ pub struct App {
     pub work_dropped_expanded: bool,
     pub filter: String,
     pub filter_mode: bool,
+    pub show_all: bool,
     pub expanded_folds: HashSet<(PathBuf, CollapseKind)>,
     pub overlay: Overlay,
     pub result_cache: HashMap<String, Result<String, String>>,
@@ -292,6 +297,7 @@ impl App {
             work_dropped_expanded: false,
             filter: String::new(),
             filter_mode: false,
+            show_all: false,
             expanded_folds: HashSet::new(),
             overlay: Overlay::None,
             result_cache: HashMap::new(),
@@ -331,8 +337,13 @@ impl App {
                 Some(SelectionKey::Run(r.repo_path.clone(), r.run.clone()))
             }
             ListRow::ToggleFold { repo_idx, kind, .. } => {
-                let repo = self.snapshot.repos.get(*repo_idx)?;
-                Some(SelectionKey::Fold(repo.path.clone(), *kind))
+                let path = self
+                    .snapshot
+                    .repos
+                    .get(*repo_idx)
+                    .map(|r| r.path.clone())
+                    .unwrap_or_else(|| PathBuf::from(GLOBAL_FOLD_SENTINEL));
+                Some(SelectionKey::Fold(path, *kind))
             }
             ListRow::DagQueueEntry { idx } => {
                 let q = self.snapshot.dag_queue.get(*idx)?;
@@ -346,88 +357,87 @@ impl App {
         self.rebuild_rows_inner(preserve.map(|(p, id)| SelectionKey::Run(p, id)));
     }
 
-    fn rebuild_rows_inner(&mut self, preserve: Option<SelectionKey>) {
-        let query = self.filter.trim().to_lowercase();
-        let filtering = !query.is_empty();
-        let mut rows = Vec::new();
+    fn is_stale_other_repo(&self, repo: &RepoGroup) -> bool {
+        if self.cwd.starts_with(&repo.path) || repo.path.starts_with(&self.cwd) {
+            return false;
+        }
+        if repo
+            .runs
+            .iter()
+            .any(|r| matches!(r.group, GroupKind::Running | GroupKind::Queued))
+        {
+            return false;
+        }
+        let newest = repo
+            .runs
+            .iter()
+            .map(RunItem::last_activity_seconds)
+            .filter(|&s| s != u64::MAX)
+            .min();
+        newest.is_some_and(|s| s > STALE_REPO_SECS)
+    }
 
-        for (repo_idx, repo) in self.snapshot.repos.iter().enumerate() {
-            let mut matching_by_group: Vec<(GroupKind, Vec<usize>)> = Vec::new();
-            for group in GroupKind::ALL {
-                let idxs: Vec<usize> = repo
-                    .runs
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, r)| r.group == group && r.matches_filter(&query))
-                    .map(|(i, _)| i)
-                    .collect();
-                if !idxs.is_empty() {
-                    matching_by_group.push((group, idxs));
-                }
+    fn append_repo_rows(
+        &self,
+        repo_idx: usize,
+        repo: &RepoGroup,
+        query: &str,
+        filtering: bool,
+        rows: &mut Vec<ListRow>,
+    ) {
+        let mut matching_by_group: Vec<(GroupKind, Vec<usize>)> = Vec::new();
+        for group in GroupKind::ALL {
+            let idxs: Vec<usize> = repo
+                .runs
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.group == group && r.matches_filter(query))
+                .map(|(i, _)| i)
+                .collect();
+            if !idxs.is_empty() {
+                matching_by_group.push((group, idxs));
             }
-            if matching_by_group.is_empty() {
+        }
+        if matching_by_group.is_empty() {
+            return;
+        }
+
+        rows.push(ListRow::RepoHeader { repo_idx });
+
+        for (group, idxs) in matching_by_group {
+            if filtering {
+                rows.push(ListRow::GroupHeader {
+                    repo_idx,
+                    group,
+                    count: idxs.len(),
+                });
+                for run_idx in idxs {
+                    rows.push(ListRow::Run { repo_idx, run_idx });
+                }
                 continue;
             }
 
-            rows.push(ListRow::RepoHeader { repo_idx });
-
-            for (group, idxs) in matching_by_group {
-                if filtering {
-                    rows.push(ListRow::GroupHeader {
-                        repo_idx,
-                        group,
-                        count: idxs.len(),
-                    });
+            match group {
+                GroupKind::Pending => {
+                    let mut recent = Vec::new();
+                    let mut stale = Vec::new();
                     for run_idx in idxs {
-                        rows.push(ListRow::Run { repo_idx, run_idx });
-                    }
-                    continue;
-                }
-
-                match group {
-                    GroupKind::Pending => {
-                        let mut recent = Vec::new();
-                        let mut stale = Vec::new();
-                        for run_idx in idxs {
-                            if repo.runs[run_idx].is_stale_pending() {
-                                stale.push(run_idx);
-                            } else {
-                                recent.push(run_idx);
-                            }
+                        if !self.show_all && repo.runs[run_idx].is_stale_pending() {
+                            stale.push(run_idx);
+                        } else {
+                            recent.push(run_idx);
                         }
-                        if !recent.is_empty() {
-                            rows.push(ListRow::GroupHeader {
-                                repo_idx,
-                                group: GroupKind::Pending,
-                                count: recent.len() + stale.len(),
-                            });
-                            for run_idx in recent {
-                                rows.push(ListRow::Run { repo_idx, run_idx });
-                            }
-                            if !stale.is_empty() {
-                                let expanded = self
-                                    .expanded_folds
-                                    .contains(&(repo.path.clone(), CollapseKind::StalePending));
-                                let newest_ago = stale
-                                    .iter()
-                                    .map(|&i| repo.runs[i].last_activity_seconds())
-                                    .filter(|&s| s != u64::MAX)
-                                    .min();
-                                rows.push(ListRow::ToggleFold {
-                                    repo_idx,
-                                    kind: CollapseKind::StalePending,
-                                    count: stale.len(),
-                                    newest_ago_seconds: newest_ago,
-                                    expanded,
-                                    standalone: false,
-                                });
-                                if expanded {
-                                    for run_idx in stale {
-                                        rows.push(ListRow::Run { repo_idx, run_idx });
-                                    }
-                                }
-                            }
-                        } else if !stale.is_empty() {
+                    }
+                    if !recent.is_empty() {
+                        rows.push(ListRow::GroupHeader {
+                            repo_idx,
+                            group: GroupKind::Pending,
+                            count: recent.len() + stale.len(),
+                        });
+                        for run_idx in recent {
+                            rows.push(ListRow::Run { repo_idx, run_idx });
+                        }
+                        if !stale.is_empty() {
                             let expanded = self
                                 .expanded_folds
                                 .contains(&(repo.path.clone(), CollapseKind::StalePending));
@@ -442,7 +452,7 @@ impl App {
                                 count: stale.len(),
                                 newest_ago_seconds: newest_ago,
                                 expanded,
-                                standalone: true,
+                                standalone: false,
                             });
                             if expanded {
                                 for run_idx in stale {
@@ -450,61 +460,170 @@ impl App {
                                 }
                             }
                         }
-                    }
-                    GroupKind::Running | GroupKind::Queued => {
-                        rows.push(ListRow::GroupHeader {
-                            repo_idx,
-                            group,
-                            count: idxs.len(),
-                        });
-                        for run_idx in idxs {
-                            rows.push(ListRow::Run { repo_idx, run_idx });
-                        }
-                    }
-                    GroupKind::Collected | GroupKind::MergedUncleaned | GroupKind::Stopped => {
-                        let kind = match group {
-                            GroupKind::Collected => CollapseKind::Collected,
-                            GroupKind::MergedUncleaned => CollapseKind::MergedUncleaned,
-                            _ => CollapseKind::Stopped,
-                        };
-                        let expanded = self.expanded_folds.contains(&(repo.path.clone(), kind));
-                        let newest_ago = idxs
+                    } else if !stale.is_empty() {
+                        let expanded = self
+                            .expanded_folds
+                            .contains(&(repo.path.clone(), CollapseKind::StalePending));
+                        let newest_ago = stale
                             .iter()
                             .map(|&i| repo.runs[i].last_activity_seconds())
                             .filter(|&s| s != u64::MAX)
                             .min();
                         rows.push(ListRow::ToggleFold {
                             repo_idx,
-                            kind,
-                            count: idxs.len(),
+                            kind: CollapseKind::StalePending,
+                            count: stale.len(),
                             newest_ago_seconds: newest_ago,
                             expanded,
                             standalone: true,
                         });
                         if expanded {
-                            for run_idx in idxs {
+                            for run_idx in stale {
                                 rows.push(ListRow::Run { repo_idx, run_idx });
                             }
                         }
                     }
                 }
+                GroupKind::Running | GroupKind::Queued => {
+                    rows.push(ListRow::GroupHeader {
+                        repo_idx,
+                        group,
+                        count: idxs.len(),
+                    });
+                    for run_idx in idxs {
+                        rows.push(ListRow::Run { repo_idx, run_idx });
+                    }
+                }
+                GroupKind::Collected | GroupKind::MergedUncleaned | GroupKind::Stopped => {
+                    let kind = match group {
+                        GroupKind::Collected => CollapseKind::Collected,
+                        GroupKind::MergedUncleaned => CollapseKind::MergedUncleaned,
+                        _ => CollapseKind::Stopped,
+                    };
+                    let expanded = self.expanded_folds.contains(&(repo.path.clone(), kind));
+                    let newest_ago = idxs
+                        .iter()
+                        .map(|&i| repo.runs[i].last_activity_seconds())
+                        .filter(|&s| s != u64::MAX)
+                        .min();
+                    rows.push(ListRow::ToggleFold {
+                        repo_idx,
+                        kind,
+                        count: idxs.len(),
+                        newest_ago_seconds: newest_ago,
+                        expanded,
+                        standalone: true,
+                    });
+                    if expanded {
+                        for run_idx in idxs {
+                            rows.push(ListRow::Run { repo_idx, run_idx });
+                        }
+                    }
+                }
             }
         }
-        // Append deterministic DAG queue items if any match filter.
-        let matching_queue: Vec<usize> = self
-            .snapshot
-            .dag_queue
-            .iter()
-            .enumerate()
-            .filter(|(_, q)| q.status != "cancelled" && q.matches_filter(&query))
-            .map(|(i, _)| i)
-            .collect();
-        if !matching_queue.is_empty() {
-            rows.push(ListRow::DagQueueHeader {
-                count: matching_queue.len(),
+    }
+
+    fn rebuild_rows_inner(&mut self, preserve: Option<SelectionKey>) {
+        let query = self.filter.trim().to_lowercase();
+        let filtering = !query.is_empty();
+        let mut rows = Vec::new();
+        let mut stale_repo_indices: Vec<usize> = Vec::new();
+
+        for (repo_idx, repo) in self.snapshot.repos.iter().enumerate() {
+            if !self.show_all && !filtering && self.is_stale_other_repo(repo) {
+                stale_repo_indices.push(repo_idx);
+                continue;
+            }
+            self.append_repo_rows(repo_idx, repo, &query, filtering, &mut rows);
+        }
+
+        // Append deterministic DAG queue items: active items shown directly, already-dispatched
+        // items folded by default unless `--all`, filtering, or explicitly expanded.
+        let mut active_queue: Vec<usize> = Vec::new();
+        let mut dispatched_queue: Vec<usize> = Vec::new();
+        for (i, q) in self.snapshot.dag_queue.iter().enumerate() {
+            if q.status == "cancelled" || !q.matches_filter(&query) {
+                continue;
+            }
+            if q.status == "dispatched" {
+                dispatched_queue.push(i);
+            } else {
+                active_queue.push(i);
+            }
+        }
+        let global_path = PathBuf::from(GLOBAL_FOLD_SENTINEL);
+        if !active_queue.is_empty() || !dispatched_queue.is_empty() {
+            let show_dispatched_directly = self.show_all || filtering;
+            let dispatched_expanded = show_dispatched_directly
+                || self
+                    .expanded_folds
+                    .contains(&(global_path.clone(), CollapseKind::DispatchedQueue));
+            let header_count = if show_dispatched_directly || dispatched_expanded {
+                active_queue.len() + dispatched_queue.len()
+            } else {
+                active_queue.len()
+            };
+            if !active_queue.is_empty() || show_dispatched_directly {
+                rows.push(ListRow::DagQueueHeader {
+                    count: header_count,
+                });
+                for idx in &active_queue {
+                    rows.push(ListRow::DagQueueEntry { idx: *idx });
+                }
+            }
+            if !dispatched_queue.is_empty() {
+                if show_dispatched_directly {
+                    for idx in dispatched_queue {
+                        rows.push(ListRow::DagQueueEntry { idx });
+                    }
+                } else {
+                    rows.push(ListRow::ToggleFold {
+                        repo_idx: usize::MAX,
+                        kind: CollapseKind::DispatchedQueue,
+                        count: dispatched_queue.len(),
+                        newest_ago_seconds: None,
+                        expanded: dispatched_expanded,
+                        standalone: active_queue.is_empty(),
+                    });
+                    if dispatched_expanded {
+                        for idx in dispatched_queue {
+                            rows.push(ListRow::DagQueueEntry { idx });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fold stale non-current repos (> 7 days inactive, no active/queued runs) at the bottom.
+        if !stale_repo_indices.is_empty() {
+            let expanded = self
+                .expanded_folds
+                .contains(&(global_path, CollapseKind::StaleRepos));
+            let newest_ago = stale_repo_indices
+                .iter()
+                .flat_map(|&ri| self.snapshot.repos[ri].runs.iter())
+                .map(RunItem::last_activity_seconds)
+                .filter(|&s| s != u64::MAX)
+                .min();
+            rows.push(ListRow::ToggleFold {
+                repo_idx: usize::MAX,
+                kind: CollapseKind::StaleRepos,
+                count: stale_repo_indices.len(),
+                newest_ago_seconds: newest_ago,
+                expanded,
+                standalone: true,
             });
-            for idx in matching_queue {
-                rows.push(ListRow::DagQueueEntry { idx });
+            if expanded {
+                for repo_idx in stale_repo_indices {
+                    self.append_repo_rows(
+                        repo_idx,
+                        &self.snapshot.repos[repo_idx],
+                        &query,
+                        filtering,
+                        &mut rows,
+                    );
+                }
             }
         }
         self.rows = rows;
@@ -647,7 +766,15 @@ impl App {
                     (
                         SelectionKey::Fold(prev_repo, prev_kind),
                         ListRow::ToggleFold { repo_idx, kind, .. },
-                    ) if &self.snapshot.repos[*repo_idx].path == prev_repo && kind == prev_kind => {
+                    ) if self
+                        .snapshot
+                        .repos
+                        .get(*repo_idx)
+                        .map(|r| r.path.as_path())
+                        .unwrap_or_else(|| Path::new(GLOBAL_FOLD_SENTINEL))
+                        == prev_repo.as_path()
+                        && kind == prev_kind =>
+                    {
                         next_sel = Some(row_idx);
                         break;
                     }
@@ -1182,14 +1309,17 @@ impl App {
         let Some(&ListRow::ToggleFold { repo_idx, kind, .. }) = self.rows.get(row_idx) else {
             return false;
         };
-        let Some(repo) = self.snapshot.repos.get(repo_idx) else {
-            return false;
-        };
-        let key = (repo.path.clone(), kind);
+        let path = self
+            .snapshot
+            .repos
+            .get(repo_idx)
+            .map(|r| r.path.clone())
+            .unwrap_or_else(|| PathBuf::from(GLOBAL_FOLD_SENTINEL));
+        let key = (path.clone(), kind);
         if !self.expanded_folds.remove(&key) {
             self.expanded_folds.insert(key);
         }
-        self.rebuild_rows_inner(Some(SelectionKey::Fold(repo.path.clone(), kind)));
+        self.rebuild_rows_inner(Some(SelectionKey::Fold(path, kind)));
         self.dirty = true;
         true
     }

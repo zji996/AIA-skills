@@ -1,9 +1,12 @@
+use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 /// Pending runs inactive for more than 24 hours are folded by default.
 pub const STALE_PENDING_SECS: u64 = 24 * 3600;
+/// Other repositories with no activity for more than 7 days are folded by default.
+pub const STALE_REPO_SECS: u64 = 7 * 24 * 3600;
 /// Default stale thresholds for work items (aligned with `delegate` work.rs).
 pub const WORK_STALE_VERIFY_SECS: u64 = 4 * 3600;
 pub const WORK_STALE_READY_SECS: u64 = 8 * 3600;
@@ -119,14 +122,15 @@ impl ReviewInfo {
                 "审查中".to_string()
             }
         } else if self.status == "reworking" {
-            let r = self.rework_rounds.max(self.round).max(1);
-            format!("REWORK 第{r}轮")
+            // Rework round is rendered once in the Chinese status column (`返工第 N 轮`),
+            // never duplicated in English `[REWORK 第N轮]` next to the task name.
+            String::new()
         } else {
             match self.verdict.as_deref() {
                 Some("PASS") => "PASS".to_string(),
                 Some("REWORK") => {
                     let r = self.rework_rounds.max(self.round).max(1);
-                    format!("REWORK 第{r}轮")
+                    format!("返工第 {r} 轮")
                 }
                 Some("NEEDS_CONTROLLER") => "NEEDS_CONTROLLER".to_string(),
                 Some(other) if !other.is_empty() => other.to_string(),
@@ -144,7 +148,7 @@ impl ReviewInfo {
             }
         } else if self.status == "reworking" {
             let r = self.rework_rounds.max(self.round).max(1);
-            format!("REWORK 第 {r} 轮（返工中）")
+            format!("返工第 {r} 轮（返工中）")
         } else {
             match self.verdict.as_deref() {
                 Some("PASS") => {
@@ -156,7 +160,7 @@ impl ReviewInfo {
                 }
                 Some("REWORK") => {
                     let r = self.rework_rounds.max(self.round).max(1);
-                    format!("REWORK 第 {r} 轮")
+                    format!("返工第 {r} 轮")
                 }
                 Some("NEEDS_CONTROLLER") => {
                     if self.sign_required {
@@ -523,6 +527,10 @@ pub struct WorkDagEtaSummary {
     pub earliest_finish_p50_clock: Option<String>,
     pub earliest_finish_p75_clock: Option<String>,
     pub external_wait_count: usize,
+    pub deferred_count: usize,
+    pub earliest_deferred_clock: Option<String>,
+    pub date_wait_count: usize,
+    pub earliest_date_wait_clock: Option<String>,
     pub owner_blocked_count: usize,
     pub blocker_count: usize,
     pub headline: String,
@@ -661,41 +669,42 @@ impl RunItem {
         self.group == GroupKind::Pending && self.last_activity_seconds() > STALE_PENDING_SECS
     }
 
-    pub fn state_badge(&self) -> &'static str {
+    pub fn state_badge(&self) -> Cow<'static, str> {
         if self.question && !self.applied {
-            return "提问";
+            return Cow::Borrowed("提问");
         }
         if matches!(self.state.as_str(), "running" | "starting") {
             if let Some(rev) = &self.review {
                 if rev.status == "reviewing" {
-                    return "审中";
+                    return Cow::Borrowed("审查中");
                 }
                 if rev.status == "reworking" {
-                    return "返工";
+                    let r = rev.rework_rounds.max(rev.round).max(1);
+                    return Cow::Owned(format!("返工第 {r} 轮"));
                 }
             }
             if self.stall_warning.is_some() {
-                return "卡警";
+                return Cow::Borrowed("卡警");
             }
             if let Some(act) = &self.activity {
-                return match act.kind.as_str() {
-                    "running_command" => "跑命",
+                return Cow::Borrowed(match act.kind.as_str() {
+                    "running_command" => "跑命令",
                     "thinking" => "思考",
                     "waiting" => "等待",
                     "quota" => "配额",
                     "error" => "报错",
                     _ => "运行",
-                };
+                });
             }
         }
         if !self.applied {
             if let Some(rev) = &self.review {
                 if rev.verdict.as_deref() == Some("NEEDS_CONTROLLER") {
-                    return "主审";
+                    return Cow::Borrowed("主审");
                 }
             }
         }
-        match self.state.as_str() {
+        Cow::Borrowed(match self.state.as_str() {
             "running" => "运行",
             "starting" => "启动",
             "waiting" | "queued" => "排队",
@@ -716,7 +725,7 @@ impl RunItem {
             "needs-redispatch" => "重派",
             "cleaned" => "待办",
             _ => "未知",
-        }
+        })
     }
 
     pub fn cache_key(&self) -> String {
@@ -750,7 +759,7 @@ impl RunItem {
             self.repo_label.as_str(),
             self.model.as_str(),
             self.state.as_str(),
-            self.state_badge(),
+            &self.state_badge(),
             self.group.label(),
             self.last_command.as_deref().unwrap_or(""),
             self.activity.as_ref().map(|a| a.label.as_str()).unwrap_or(""),
@@ -1051,6 +1060,7 @@ pub struct WorkItem {
     pub focus: String,
     pub next: String,
     pub applied: bool,
+    pub ephemeral: bool,
     pub eta: Option<WorkEtaInfo>,
 }
 
@@ -1111,7 +1121,7 @@ impl WorkItem {
     }
 
     pub fn is_missing_brief(&self) -> bool {
-        self.owner.is_none() && self.state == "ready" && self.brief.trim().is_empty()
+        !self.ephemeral && self.owner.is_none() && self.state == "ready" && self.brief.trim().is_empty()
     }
 
     pub fn is_missing_owner_advice(&self) -> bool {
@@ -1697,6 +1707,8 @@ impl AppSnapshot {
     fn format_raw_wait(&self, raw: &str) -> String {
         if let Some(wid) = raw.strip_prefix("work_closed:") {
             format!("等 {wid} 关闭")
+        } else if let Some(wid) = raw.strip_prefix("work_applied:") {
+            format!("等 {wid} 合入")
         } else if let Some(oref) = raw.strip_prefix("owner:") {
             format!("等所有者 {oref}")
         } else if let Some(run_ref) = raw.strip_prefix("run_applied:") {
@@ -1721,7 +1733,13 @@ impl AppSnapshot {
             out.push_str(&cur[..pos]);
             let rest = &cur[pos..];
             let end = rest
-                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+                .find(|c: char| {
+                    c.is_whitespace()
+                        || matches!(
+                            c,
+                            '(' | ')' | '（' | '）' | '[' | ']' | ',' | '，' | '·' | '；' | '：'
+                        )
+                })
                 .unwrap_or(rest.len());
             let token = &rest[..end];
             out.push_str(&self.resolve_run_display_name(token));

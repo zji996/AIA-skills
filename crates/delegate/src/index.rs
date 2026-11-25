@@ -585,6 +585,20 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
         });
     }
 
+    // Load work items once so deferred-work runs are excluded from wave blockers and both
+    // `delegate work` and `delegate snapshot --json` share `build_unified_work_view`.
+    let work_struct_items = crate::work::load_readonly_in(&state);
+    let mut deferred_work_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut deferred_run_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for w in &work_struct_items {
+        if w.state == "deferred" {
+            deferred_work_ids.insert(w.id.clone());
+            for rid in &w.runs {
+                deferred_run_ids.insert(rid.clone());
+            }
+        }
+    }
+
     // Strictly zero-lock, zero-disk-write, zero-git ETA projection for snapshot & TUI.
     let eta_model = crate::speed::load_or_refresh_eta_model_in(&state, now_ts, false);
     let eta_ctx = crate::eta::LiveContext::capture_readonly(
@@ -594,6 +608,10 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
         precomputed_statuses,
         Some(&lane),
     );
+    let all_runs_by_id: std::collections::HashMap<String, &Value> = all_seen_runs
+        .iter()
+        .map(|(k, v)| (k.clone(), v))
+        .collect();
     let mut wave_etas: Vec<crate::eta::RunEta> = Vec::new();
     let mut repo_groups = Vec::with_capacity(raw_groups.len());
     for RawSnapshotGroup {
@@ -606,18 +624,45 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
         let mut run_statuses = Vec::with_capacity(run_pairs.len());
         for (run, mut st) in run_pairs {
             let st_str = s(&st, "state");
+            let rid = s(&st, "run").to_string();
             let is_live = runs::active(st_str);
-            let is_unapplied_terminal = !b(&st, "applied")
-                && !b(&st, "cleaned")
-                && matches!(
-                    st_str,
-                    "delivered" | "answered" | "rejected" | "blocked_mainline" | "failed" | "stopped"
-                );
-            if is_live || is_unapplied_terminal {
+            let is_superseded = superseded_ids.contains(&rid);
+            let is_applied = b(&st, "applied") || !s(&st, "appliedAt").trim().is_empty();
+            let is_cleaned = b(&st, "cleaned") || st_str == "cleaned";
+            let is_question = b(&st, "question");
+            let result_read = !s(&st, "resultReadAt").trim().is_empty();
+            let mode = s(&st, "mode");
+            let zero_change = crate::hook_check::is_zero_change_delivery_ref(&st, &all_runs_by_id);
+            let is_actionable_terminal = !is_live
+                && (st_str == "blocked_mainline"
+                    || crate::hook_check::is_run_pending_actionable(
+                        st_str,
+                        mode,
+                        is_applied,
+                        is_cleaned,
+                        is_question,
+                        result_read,
+                        is_superseded,
+                        zero_change,
+                    ));
+            let is_deferred_run = deferred_run_ids.contains(&rid)
+                || (!s(&st, "workId").is_empty() && deferred_work_ids.contains(s(&st, "workId")));
+            if is_live || is_actionable_terminal {
                 let re = crate::eta::estimate_run_with_status(&run, &st, &eta_model, &eta_ctx);
-                st["eta"] = re.to_json();
-                let rid = s(&st, "run");
-                if is_live || !superseded_ids.contains(rid) {
+                let skip_zero_change_merge = zero_change
+                    && re
+                        .blocker
+                        .as_ref()
+                        .is_some_and(|bl| bl.kind == crate::eta::BlockerKind::ControllerMerge);
+                if re.stage != crate::eta::Stage::Done && !skip_zero_change_merge {
+                    st["eta"] = re.to_json();
+                }
+                if is_live
+                    || (is_actionable_terminal
+                        && !is_deferred_run
+                        && re.stage != crate::eta::Stage::Done
+                        && !skip_zero_change_merge)
+                {
                     wave_etas.push(re);
                 }
             }
@@ -642,25 +687,28 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
             .and_then(|e| e["seq"].as_u64())
             .unwrap_or(0),
     );
-    let mut work_items = crate::work::load_readonly_json(&state);
-    let work_struct_items = crate::work::load_readonly_in(&state);
-    let work_dag = crate::eta::estimate_work_dag_in(&work_struct_items, None, &eta_model, &eta_ctx);
-    let work_eta_map: std::collections::HashMap<String, Value> = work_dag
-        .items
-        .iter()
-        .map(|it| (it.id.clone(), it.to_json()))
-        .collect();
-    for item in &mut work_items {
-        let wid = s(item, "id").to_string();
-        if let Some(weta) = work_eta_map.get(&wid) {
-            item["eta"] = weta.clone();
-        }
-    }
+    let unified_work = crate::work::build_unified_work_view(
+        work_struct_items,
+        &state,
+        now_ts,
+        None,
+        &eta_model,
+        &eta_ctx,
+        true,
+    );
+    let work_items = unified_work.snapshot_items_json;
+    let work_dag_json = unified_work
+        .dag_eta
+        .as_ref()
+        .map(crate::eta::DagEtaSummary::to_json)
+        .unwrap_or_else(|| {
+            crate::eta::estimate_work_dag_in(&[], None, &eta_model, &eta_ctx).to_json()
+        });
     let dag_queue = crate::dag_queue::load_items(&state);
     let queue_dag = crate::eta::estimate_queue_dag_in(&dag_queue, None, &eta_model, &eta_ctx);
     let eta_summary = json!({
         "wave": crate::eta::summarize_wave_eta(&wave_etas, now_ts),
-        "work": work_dag.to_json(),
+        "work": work_dag_json,
         "queue": queue_dag.to_json(),
     });
     let merges = crate::merge::load_merge_reports(None);

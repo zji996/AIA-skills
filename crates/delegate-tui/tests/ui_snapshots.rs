@@ -241,9 +241,9 @@ fn snapshot_events_tab_liveness_activity_and_dag_queue() {
     };
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/dev/demo-api"), 5);
 
-    // Runs tab shows liveness badges ("跑命", "卡警"), detail "正在做什么", and DAG queue section!
+    // Runs tab shows full liveness badges ("跑命令", "卡警"), detail "正在做什么", and DAG queue section!
     let runs_screen = render_to_string(&mut app, 140, 32);
-    assert!(runs_screen.contains("跑命"), "{runs_screen}");
+    assert!(runs_screen.contains("跑命令"), "{runs_screen}");
     assert!(runs_screen.contains("卡警"), "{runs_screen}");
     assert!(runs_screen.contains("正在做什么"), "{runs_screen}");
     assert!(runs_screen.contains("续派队列 (1)"), "{runs_screen}");
@@ -287,10 +287,9 @@ fn snapshot_review_states_and_review_events() {
     assert!(screen.contains("主审"), "{screen}");
     assert!(screen.contains("NEEDS_CONTROLLER"), "{screen}");
     assert!(screen.contains("PASS"), "{screen}");
-    assert!(screen.contains("审中"), "{screen}");
     assert!(screen.contains("审查中"), "{screen}");
-    assert!(screen.contains("返工"), "{screen}");
-    assert!(screen.contains("REWORK 第2轮"), "{screen}");
+    assert!(screen.contains("返工第 2 轮"), "{screen}");
+    assert!(!screen.contains("REWORK 第2轮"), "rework must not duplicate English REWORK:\n{screen}");
     assert!(screen.contains("controllerReviewPaths"), "{screen}");
     assert!(screen.contains("sha256:abcdef012345"), "{screen}");
 
@@ -1955,7 +1954,8 @@ fn tui_eta_overview_runs_work_and_compact_phone_6col_badges() {
     assert_lines_fit_width(&work_wide, 140);
     assert!(work_wide.contains("约 05:10"), "{work_wide}");
     assert!(work_wide.contains("~04:30"), "{work_wide}");
-    assert!(work_wide.contains("等W012(~05:10)"), "{work_wide}");
+    assert!(work_wide.contains("等 W012 合入 (~05:10)"), "{work_wide}");
+    assert!(!work_wide.contains("等 W012 合入 等W012"), "duplicate wait badge:\n{work_wide}");
     assert!(work_wide.contains("卡所有者Q03"), "{work_wide}");
 
     // 6. Work compact/phone (60x24 < 70 cols): strictly <= 6 col badges only!
@@ -2205,4 +2205,177 @@ fn quota_identity_mismatch_marks_unupdated_in_overview_and_accounts() {
     assert!(acct_wide.contains("身份不符，未更新"), "accounts wide missing mismatch badge:\n{acct_wide}");
     let acct_narrow = render_to_string(&mut app, 80, 24);
     assert!(acct_narrow.contains("身份不符，未更新"), "accounts narrow missing mismatch badge:\n{acct_narrow}");
+}
+
+#[test]
+fn tui_1126_fixes_ephemeral_work_rework_charts_quota_alert_and_stale_folding() {
+    use delegate_tui::data::parse_snapshot_json;
+
+    let snap_json = r#"{
+        "schemaVersion": 1,
+        "generatedAt": "2026-11-25T19:35:00Z",
+        "seq": 100,
+        "repos": [
+            {
+                "path": "/home/user/norvane",
+                "runsDir": "/home/user/norvane/.local/run/delegate",
+                "runs": [
+                    {
+                        "run": "20261125-193000-rw-task",
+                        "name": "返工测试任务",
+                        "state": "running",
+                        "mode": "write",
+                        "modelName": "neon",
+                        "elapsedSeconds": 300,
+                        "ageSeconds": 300,
+                        "review": {"status": "reworking", "verdict": "REWORK", "round": 1, "reworkRounds": 1}
+                    },
+                    {
+                        "run": "20261125-193400-cmd-task",
+                        "name": "命令测试任务",
+                        "state": "running",
+                        "mode": "write",
+                        "modelName": "neon",
+                        "elapsedSeconds": 60,
+                        "ageSeconds": 60,
+                        "activity": {"kind": "running_command", "cmd": "cargo test", "elapsedSeconds": 10, "label": "在跑命令：cargo test（10秒）"}
+                    }
+                ],
+                "cleanedNotes": []
+            },
+            {
+                "path": "/home/user/whatsapp-bridge",
+                "runsDir": "/home/user/whatsapp-bridge/.local/run/delegate",
+                "runs": [
+                    {
+                        "run": "20261115-100000-old-wa",
+                        "name": "十天前旧任务",
+                        "state": "delivered",
+                        "mode": "write",
+                        "modelName": "neon",
+                        "ageSeconds": 864000,
+                        "finishedAgoSeconds": 864000,
+                        "diff": {"files": 1}
+                    }
+                ],
+                "cleanedNotes": []
+            }
+        ],
+        "work": [
+            {
+                "id": "W119",
+                "title": "推进链第一步",
+                "repo": "/home/user/norvane",
+                "repoLabel": "norvane",
+                "state": "attention",
+                "focus": "预合并中",
+                "eta": {"focusBadge": "~03:42", "compactBadge": "~03:42", "stoppedClock": false}
+            },
+            {
+                "id": "W120",
+                "title": "推进链第二步",
+                "repo": "/home/user/norvane",
+                "repoLabel": "norvane",
+                "state": "blocked",
+                "waitOn": ["work_closed:W119"],
+                "waitOnStatus": [{"condition": "work_closed:W119", "satisfied": false, "detail": "等 W119 关闭"}],
+                "eta": {"focusBadge": "等W119(~04:40)", "compactBadge": "~04:40", "stoppedClock": false}
+            },
+            {
+                "id": "R:cmd-task",
+                "ephemeral": true,
+                "title": "命令测试任务",
+                "repo": "/home/user/norvane",
+                "repoLabel": "norvane",
+                "state": "active",
+                "focus": "运行中 1m",
+                "runs": ["20261125-193400-cmd-task"],
+                "eta": {"compactBadge": "~04:00", "stoppedClock": false}
+            }
+        ],
+        "dagQueue": [
+            {"name": "agy-usage", "status": "dispatched", "repo": "/home/user/aia-skills", "runId": "20261124-040538-agy-usage"}
+        ],
+        "agyAccounts": {
+            "active": "gui",
+            "accounts": [
+                {
+                    "id": "gui",
+                    "email": "gui@example.test",
+                    "active": true,
+                    "quota": {
+                        "fetchedAt": "2026-11-25T19:34:50Z",
+                        "ok": true,
+                        "ageSeconds": 10,
+                        "entries": [
+                            {"pool": "Gemini Models", "window": "weekly", "windowLabel": "Weekly Limit Remaining", "remainingPct": 42.0, "resetInSeconds": 432000}
+                        ]
+                    },
+                    "quotaEstimate": {
+                        "weekly": {"pool": "Gemini Models", "remainingPct": 42.0, "tokensPerPct": 10000000, "estimatedRemainingHours": 11.0, "burnRateSource": "24h"}
+                    }
+                }
+            ]
+        },
+        "analytics": {
+            "byPurpose": {"write": 2540000000, "review": 631900000, "rework": 231600000, "readOnly": 89400000},
+            "byModel": [{"model": "neon", "tokens": 3492900000}],
+            "daily7d": [
+                {"ymd": "2026-11-20", "date": "11-20", "mergedCount": 12, "medianMergeSecs": 12780, "totalChains": 12, "firstRoundPass": 12, "firstRoundPassPct": 100},
+                {"ymd": "2026-11-21", "date": "11-21", "mergedCount": 18, "medianMergeSecs": 5580, "totalChains": 18, "firstRoundPass": 10, "firstRoundPassPct": 55}
+            ]
+        },
+        "eta": {
+            "wave": {"activeCount": 2, "runningCount": 2, "queuedCount": 0, "blockedCount": 0, "earliestP50Clock": "03:42", "waveP50Clock": "04:00", "blockers": []},
+            "work": {"writeChains": 2, "depth": 2, "devWallRange": "1.2–2.0h", "earliestFinishP50Clock": "04:40", "deferredCount": 5, "earliestDeferredClock": "09:12", "ownerBlocked": [], "blockers": []}
+        }
+    }"#;
+
+    let snap = parse_snapshot_json(snap_json, Some(Path::new("/home/user")), None).unwrap();
+    let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/user/norvane"), 5);
+
+    // 1. Tasks tab: `跑命令` untruncated, `返工第 1 轮` once without English REWORK,
+    //    quota alert in top bar, stale repo (>7d) and dispatched queue item folded by default!
+    let tasks = render_to_string(&mut app, 180, 40);
+    assert!(tasks.contains("跑命令"), "expected full 跑命令:\n{tasks}");
+    assert!(tasks.contains("返工第 1 轮"), "expected Chinese rework badge:\n{tasks}");
+    assert!(!tasks.contains("REWORK"), "English REWORK must not appear:\n{tasks}");
+    assert!(tasks.contains("⚠ 额度约11h用完"), "quota warning missing from top bar:\n{tasks}");
+    assert!(tasks.contains("已派队列 1 条"), "dispatched queue should fold by default:\n{tasks}");
+    assert!(!tasks.contains("已派 agy-usage"), "dispatched entry should be hidden while folded:\n{tasks}");
+    assert!(tasks.contains("陈旧仓库 1 个"), "stale other repo should fold by default:\n{tasks}");
+    assert!(!tasks.contains("十天前旧任务"), "stale repo runs should be hidden while folded:\n{tasks}");
+
+    // With show_all = true (`--all`), both dispatched queue and stale repo expand.
+    app.show_all = true;
+    app.rebuild_rows(None);
+    let tasks_all = render_to_string(&mut app, 180, 40);
+    assert!(tasks_all.contains("agy-usage"), "show_all should reveal dispatched queue:\n{tasks_all}");
+    assert!(tasks_all.contains("whatsapp-bridge"), "show_all should reveal stale repo:\n{tasks_all}");
+
+    // 2. Work tab: includes ephemeral `R:cmd-task` (推进中 1), `5工作(3)`, merged wait sentence,
+    //    deferred summary separated from advancing ETA (~04:40), and quota warning in top bar.
+    app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+    let work = render_to_string(&mut app, 180, 40);
+    assert!(work.contains("5工作(3)"), "work tab count must include ephemeral R: row:\n{work}");
+    assert!(work.contains("推进中 1"), "work top bar must count ephemeral active run:\n{work}");
+    assert!(work.contains("R:cmd-task"), "ephemeral run must appear on work page:\n{work}");
+    assert!(work.contains("等 W119 关闭 (~04:40)"), "wait text must be merged into one phrase:\n{work}");
+    assert!(!work.contains("等 W119 关闭 等W119"), "duplicate wait phrase:\n{work}");
+    assert!(work.contains("约 04:40"), "advancing ETA missing:\n{work}");
+    assert!(work.contains("另有 5 暂缓（最早 09:12）"), "separate deferred summary missing:\n{work}");
+    assert!(work.contains("⚠ 额度约11h用完"), "quota warning missing from work top bar:\n{work}");
+
+    // 3. Overview tab: horizontal Token Distribution bars with labels+pcts, zero `分█`/`%█` collision!
+    app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+    let ov = render_to_string(&mut app, 180, 45);
+    assert!(ov.contains("近 7 天合计 3.49B"), "{ov}");
+    assert!(ov.contains("写") && ov.contains("73%"), "{ov}");
+    assert!(ov.contains("审查") && ov.contains("18%"), "{ov}");
+    assert!(ov.contains("返工") && ov.contains("7%"), "{ov}");
+    assert!(ov.contains("只读") && ov.contains("3%"), "{ov}");
+    assert!(ov.contains("213分"), "{ov}");
+    assert!(!ov.contains("213分█"), "value must not collide with bar block:\n{ov}");
+    assert!(!ov.contains("█100%█"), "percent must not collide with bar block:\n{ov}");
+    assert!(ov.contains("另有 5 项暂缓（最早 09:12 恢复）"), "{ov}");
 }

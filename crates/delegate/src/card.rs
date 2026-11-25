@@ -4256,12 +4256,14 @@ pub fn render_risky_diff(
 pub fn card_command(args: &[String]) -> Res<i32> {
     let mut json_mode = output::json_enabled();
     let mut round_only = false;
+    let mut no_mark = false;
     let mut pos: Vec<String> = Vec::new();
     for arg in args {
         match arg.as_str() {
             "--json" => json_mode = true,
             "--round" => round_only = true,
             "--total" => round_only = false,
+            "--no-mark" => no_mark = true,
             other if other.starts_with('-') => {
                 return Err(format!("card: unknown flag {other}"));
             }
@@ -4307,6 +4309,21 @@ pub fn card_command(args: &[String]) -> Res<i32> {
         println!("{}", serde_json::to_string_pretty(&card_doc).unwrap_or_else(|_| card_doc.to_string()));
     } else {
         println!("{}", render_card_human(&card_doc));
+    }
+    // Reading the L1 review card counts as reading the delivery (clears `[未读交付]`),
+    // matching the `下一步：delegate card <run>` affordance unless `--no-mark` is passed.
+    if !no_mark
+        && run.join("meta.json").is_file()
+        && !runs::active(&runs::state(&run))
+        && !b(&sum, "question")
+        && !b(&sum, "policyRefused")
+    {
+        crate::mark_result_read(&run);
+        touch(run.join(".delivered"));
+        crate::board::refresh_for_run(&run);
+        crate::events::mark_run_read(&crate::events::run_id_for(&run, &meta));
+        crate::work::on_run_result_read(&run, &meta);
+        crate::index::upsert_run(&run);
     }
     Ok(0)
 }

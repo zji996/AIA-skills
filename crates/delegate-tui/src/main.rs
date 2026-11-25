@@ -27,6 +27,7 @@ struct CliArgs {
     root: Option<PathBuf>,
     delegate: Option<PathBuf>,
     interval: u64,
+    show_all: bool,
 }
 
 fn print_help() {
@@ -40,6 +41,7 @@ fn print_help() {
          \x20 --root <DIR>        Scan root directory for repos (default: $HOME)\n\
          \x20 --delegate <PATH>   Path to delegate binary\n\
          \x20 --interval <SECS>   Auto-refresh interval in seconds (default: 5)\n\
+         \x20 --all               Show stale repos (>7d inactive) and dispatched queue entries expanded\n\
          \x20 --version           Print version\n\
          \x20 -h, --help          Show this help\n\n\
          Keys:\n\
@@ -54,6 +56,7 @@ fn parse_args() -> Result<Option<CliArgs>, String> {
     let mut root = None;
     let mut delegate = None;
     let mut interval: u64 = 5;
+    let mut show_all = false;
 
     let args: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
@@ -66,6 +69,9 @@ fn parse_args() -> Result<Option<CliArgs>, String> {
             "--version" => {
                 println!("delegate-tui {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
+            }
+            "--all" => {
+                show_all = true;
             }
             "--repo" => {
                 i += 1;
@@ -102,6 +108,7 @@ fn parse_args() -> Result<Option<CliArgs>, String> {
         root,
         delegate,
         interval,
+        show_all,
     }))
 }
 
@@ -573,6 +580,7 @@ fn main() {
         ..AppSnapshot::default()
     };
     let mut app = App::new(initial, delegate_bin, cwd, cli.interval);
+    app.show_all = cli.show_all;
     app.loading = true;
 
     let mut refresh_in_flight = true;
