@@ -346,6 +346,13 @@ publish() {
     git -C "$REPO_ROOT" tag -a "$TAG" -m "$NAME $VERSION"
   fi
   git -C "$REPO_ROOT" push -q origin "$TAG"
+  # Forgejo's push mirror runs on branch pushes only; a tag pushed afterwards waits for the periodic
+  # sync, so the GitHub wait below would time out. Ask Forgejo to mirror now.
+  forgejo_token_over_ssh
+  if [ -n "${FORGEJO_TOKEN:-}" ]; then
+    curl -fsS -o /dev/null -X POST -H "Authorization: token $FORGEJO_TOKEN" "$FORGEJO_API/push_mirrors-sync" \
+      || echo "  [Forgejo] push mirror sync request failed; waiting for the periodic sync" >&2
+  fi
   notes="$NAME $VERSION: static Linux builds (musl). Checksums: skills/$SKILL/bin.sha256 at $TAG."
   if gh auth status >/dev/null 2>&1; then
     # The GitHub mirror receives the tag from the primary repository; wait for it rather than race.
