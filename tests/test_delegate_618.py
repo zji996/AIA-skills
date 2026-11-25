@@ -212,3 +212,100 @@ class Delegate618Tests(unittest.TestCase):
         self.assertIn("binary", result.stderr)
         self.assertEqual((Path(state["worktree"]) / "a.txt").read_text(), "agent\n")
         self.assertFalse((Path(state["worktree"]) / "new.txt").exists())
+
+    def test_archive_excludes_reconstructible_dirs_even_when_dir_mentioned(self):
+        repo = self.repo({
+            "a.txt": "old\n",
+            ".gitignore": ".venv/\ntarget/\nnode_modules/\ndist/\n__pycache__/\n.pytest_cache/\n",
+        })
+        pre = (
+            "mkdir -p .venv/lib/site-packages backend/.venv/lib target/debug node_modules/pkg "
+            "dist __pycache__ .pytest_cache/v/cache backend/notes; "
+            "echo cfg > .venv/pyvenv.cfg; "
+            "echo huge > .venv/lib/site-packages/lib.so; "
+            "echo huge2 > backend/.venv/lib/pkg.py; "
+            "echo explicit > target/mentioned; "
+            "echo bin > target/debug/app; "
+            "echo dep > node_modules/pkg/index.js; "
+            "echo bundle > dist/bundle.js; "
+            "echo pyc > __pycache__/a.pyc; "
+            "echo cache > .pytest_cache/v/cache/lastfailed; "
+            "echo note > backend/notes/summary.txt"
+        )
+        answer = (
+            "Created `.venv/`, ran `backend/`, rebuilt `target/`, `node_modules/`, `dist/`, "
+            "`__pycache__/`, `.pytest_cache/`, and verified `.venv/pyvenv.cfg` and `target/mentioned`."
+        )
+        state = self.run_tree(repo, pre, answer)
+        cleaned = self.clean_outcome(self.cli("clean", "--json", state["run"]))
+        archive = Path(cleaned["archive"])
+        archived_files = sorted(
+            str(p.relative_to(archive / "files"))
+            for p in (archive / "files").rglob("*")
+            if p.is_file()
+        )
+        # Only explicitly named individual files inside reconstructible dirs are kept,
+        # plus non-reconstructible files under mentioned normal dirs (`backend/notes/summary.txt`).
+        self.assertEqual(
+            archived_files,
+            [".venv/pyvenv.cfg", "backend/notes/summary.txt", "target/mentioned"],
+        )
+
+    def test_clean_rescan_archive_recomputes_manifests_and_usage_and_default_warn_is_30gib(self):
+        repo = self.repo({"a.txt": "old\n", ".gitignore": ".local/\n"})
+        st1 = self.run_tree(repo, "mkdir -p .local/big; printf '1234567890' > .local/keep; printf 'aaaaaaaaaaaaaaaaaaaa' > .local/big/drop", ".local/keep")
+        arch1 = Path(self.clean_outcome(self.cli("clean", "--json", st1["run"]))["archive"])
+        st2 = self.run_tree(repo, "mkdir -p .local; printf 'bbbbbbbbbb' > .local/two", ".local/two")
+        arch2 = Path(self.clean_outcome(self.cli("clean", "--json", st2["run"]))["archive"])
+
+        # Default archive warning threshold is 30 GiB when env overrides are absent.
+        self.env.pop("DELEGATE_ARCHIVE_WARN_GIB", None)
+        self.env.pop("DELEGATE_ARCHIVE_WARN_BYTES", None)
+        st_json = self.cli("status")
+        summary = [json.loads(l) for l in st_json.stdout.splitlines() if "statusSummary" in l][-1]["statusSummary"]
+        self.assertEqual(summary["archiveWarnBytes"], 30 * 1024 * 1024 * 1024)
+        self.assertEqual(summary["archiveCount"], 2)
+
+        usage_path = self.work / "cache/delegate/archive/.usage.json"
+        before_usage = json.loads(usage_path.read_text())
+        self.assertEqual(before_usage["count"], 2)
+
+        # Manually delete files inside arch1 and delete arch2 completely, leaving manifests & .usage.json stale.
+        shutil.rmtree(arch1 / "files/.local/big")
+        shutil.rmtree(arch2)
+        stale_manifest = json.loads((arch1 / "manifest.json").read_text())
+        self.assertIn(".local/big/drop", stale_manifest["files"])
+        self.assertEqual(stale_manifest["bytes"], 30)
+
+        # Rescan recomputes manifest.json, record/archive.json, and .usage.json.
+        res = self.cli("clean", "--rescan-archive", "--json")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        payload = json.loads(res.stdout.splitlines()[0])["archiveRescan"]
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["updatedManifests"], 1)
+        self.assertEqual(payload["previousCount"], 2)
+        self.assertEqual(payload["previousBytes"], before_usage["bytes"])
+        self.assertLess(payload["bytes"], before_usage["bytes"])
+
+        fresh_manifest = json.loads((arch1 / "manifest.json").read_text())
+        self.assertEqual(fresh_manifest["files"], [".local/keep"])
+        self.assertEqual(fresh_manifest["bytes"], 10)
+        rec_manifest = json.loads((arch1 / "record/archive.json").read_text())
+        self.assertEqual(rec_manifest["files"], [".local/keep"])
+        self.assertEqual(rec_manifest["bytes"], 10)
+
+        after_usage = json.loads(usage_path.read_text())
+        self.assertEqual(after_usage["count"], 1)
+        self.assertEqual(after_usage["bytes"], fresh_manifest["totalBytes"])
+
+        # Second rescan is idempotent (0 manifests rewritten).
+        res2 = self.cli("clean", "--rescan-archive", "--json")
+        self.assertEqual(res2.returncode, 0, res2.stdout + res2.stderr)
+        payload2 = json.loads(res2.stdout.splitlines()[0])["archiveRescan"]
+        self.assertEqual(payload2["updatedManifests"], 0)
+        self.assertEqual(payload2["bytes"], after_usage["bytes"])
+
+        # Human output works too.
+        res_human = self.cli("clean", "--rescan-archive", human=True)
+        self.assertEqual(res_human.returncode, 0, res_human.stdout + res_human.stderr)
+        self.assertIn("archive rescan: 1 份", res_human.stdout)

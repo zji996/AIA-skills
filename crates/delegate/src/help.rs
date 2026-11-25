@@ -416,13 +416,14 @@ pub fn print(command: Option<&str>) -> bool {
             ("--root DIR", "Optional workspace root hint."),
             ("--events-limit N", "Maximum recent events to include (default: 200; 0 for all)."),
         ]),
-        "clean" => ("[--finished] [--force] [--no-archive] [--sync] [--json] [runs ...]", "Delete finished runs (staged to trash and reclaimed asynchronously by _gc-worker by default; pass --sync for synchronous GC) and their compose containers; reclaim containers whose delegate worktree directory is missing.", &[
+        "clean" => ("[--finished] [--force] [--no-archive] [--sync] [--rescan-archive] [--json] [runs ...]", "Delete finished runs (staged to trash and reclaimed asynchronously by _gc-worker by default; pass --sync for synchronous GC) and their compose containers; reclaim containers whose delegate worktree directory is missing.", &[
             ("runs", "Run ids or directories to remove."),
-            ("--no-archive", "Skip evidence archiving; by default keep ignored non-build outputs and final-answer references under cache/archive/<run>/ (200 MiB/run)."),
+            ("--no-archive", "Skip evidence archiving; by default keep ignored non-build outputs and final-answer references under cache/archive/<run>/."),
             ("--finished", "Select all finished runs that have been reported in full (answers shown truncated are kept until read with result)."),
             ("--force", "With --finished, also select unreported or truncated finished runs."),
             ("--sync", "Run trash/worktree/container garbage collection synchronously before returning."),
-            ("--json", "Print deletion counts and orphan container cleanup as JSON lines."),
+            ("--rescan-archive", "Rescan cache/archive on disk, rewrite stale manifest.json/record/archive.json to match remaining files, and refresh .usage.json (can be run alone or with runs/--finished)."),
+            ("--json", "Print deletion counts, orphan container cleanup, and archive rescan results as JSON lines."),
         ]),
         "tiers" => ("[--scout ALIAS] [--review ALIAS] [--write ALIAS] [--alias NAME=provider/id] [--thinking LEVEL]", "Print each purpose's rules (alias, full id, thinking) and registered aliases with Pi context/images/thinking capabilities. The final line counts unregistered Pi models without listing them. Settings validate and atomically update user config; --alias is repeatable. All three tiers must resolve for start/run/reply. Old tiers and model :thinking suffixes are unsupported: register aliases, configure the three purposes and move suffixes into thinking.", &[]),
         "fit" => ("[--json] | set CLASS ALIAS first|ok|avoid NOTE [--sample FILE]", "Four fixed classes (scout/build/hard/design); user-local fit.json stores only the latest verdict per alias/class, with an 80-character one-line note. Setting first demotes the previous first to ok. Missing evaluations are listed; --json shows full notes and samples.", &[]),

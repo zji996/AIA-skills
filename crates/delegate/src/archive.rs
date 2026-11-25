@@ -13,10 +13,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Default total-archive size anomaly warning threshold for `status` and `board` (5 GiB).
+/// Default total-archive size anomaly warning threshold for `status` and `board` (30 GiB).
 /// Configurable via `DELEGATE_ARCHIVE_WARN_GIB` (`0` disables) or `DELEGATE_ARCHIVE_WARN_BYTES`.
 /// Archives have no hard cap: files are never skipped by size during preservation.
-pub const DEFAULT_ARCHIVE_WARN_GIB: f64 = 5.0;
+pub const DEFAULT_ARCHIVE_WARN_GIB: f64 = 30.0;
 /// Filesystem critical-space watermark (aligned with disk-pressure warning policy):
 /// free space below 10 GiB or below 5% of total filesystem capacity.
 pub const ARCHIVE_FS_CRITICAL_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
@@ -54,9 +54,12 @@ fn build_path(path: &str) -> bool {
                 | ".npm"
                 | ".pnpm-store"
                 | ".venv"
+                | "venv"
+                | ".tox"
+                | ".nox"
                 | ".turbo"
                 | ".parcel-cache"
-        )
+        ) || part.ends_with(".egg-info")
     })
 }
 fn safe_file(root: &Path, name: &str) -> bool {
@@ -94,6 +97,13 @@ fn path_reference(result: &str, name: &str) -> bool {
     })
 }
 fn mentioned(result: &str, name: &str) -> bool {
+    if build_path(name) {
+        // For files inside reconstructible/build directories (e.g. `.venv/`, `target/`,
+        // `node_modules/`, `dist/`, `__pycache__/`, `.pytest_cache/`), only archive a
+        // file when `result.md` names that specific file — never sweep in the whole
+        // directory when an ancestor or build directory itself is mentioned.
+        return path_reference(result, name);
+    }
     path_reference(result, name)
         || Path::new(name)
             .ancestors()
@@ -111,21 +121,53 @@ fn names(bytes: Vec<u8>) -> BTreeSet<String> {
 }
 
 fn dir_bytes(root: &Path) -> u64 {
+    dir_bytes_excluding(root, None)
+}
+
+fn dir_bytes_excluding(root: &Path, skip_top_name: Option<&str>) -> u64 {
     let mut total = 0u64;
     let Ok(entries) = fs::read_dir(root) else {
         return 0;
     };
     for entry in entries.flatten() {
+        if let Some(skip) = skip_top_name {
+            if entry.file_name().to_str() == Some(skip) {
+                continue;
+            }
+        }
         let path = entry.path();
         if let Ok(meta) = fs::symlink_metadata(&path) {
             if meta.is_dir() {
-                total = total.saturating_add(dir_bytes(&path));
+                total = total.saturating_add(dir_bytes_excluding(&path, None));
             } else if meta.is_file() {
                 total = total.saturating_add(meta.len());
             }
         }
     }
     total
+}
+
+fn collect_files(root: &Path, prefix: &str, out: &mut Vec<String>, bytes: &mut u64) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if meta.is_dir() {
+                collect_files(&path, &rel, out, bytes);
+            } else if meta.is_file() {
+                *bytes = bytes.saturating_add(meta.len());
+                out.push(rel);
+            }
+        }
+    }
 }
 
 fn critical_watermarks() -> (u64, u64) {
@@ -490,7 +532,7 @@ fn update_manifest_sizes(archive: &Path, evicted_events: bool, evicted_files: bo
         return;
     }
     let files_bytes = dir_bytes(&archive.join("files"));
-    let record_bytes = dir_bytes(&archive.join("record"));
+    let record_bytes = dir_bytes_excluding(&archive.join("record"), Some("archive.json"));
     manifest["bytes"] = json!(files_bytes);
     manifest["recordBytes"] = json!(record_bytes);
     manifest["totalBytes"] = json!(files_bytes.saturating_add(record_bytes));
@@ -599,5 +641,158 @@ pub fn status(run: &Path) -> Option<Value> {
         Some(manifest)
     } else {
         None
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ArchiveRescan {
+    pub root: PathBuf,
+    pub count: usize,
+    pub bytes: u64,
+    pub updated_manifests: usize,
+    pub previous_bytes: Option<u64>,
+    pub previous_count: Option<usize>,
+}
+
+fn rescan_one(archive: &Path) -> Res<(u64, bool)> {
+    let files_dir = archive.join("files");
+    let record_dir = archive.join("record");
+    let mut actual_files = Vec::new();
+    let mut files_bytes = 0u64;
+    if files_dir.is_dir() {
+        collect_files(&files_dir, "", &mut actual_files, &mut files_bytes);
+        actual_files.sort();
+    }
+    let record_bytes = if record_dir.is_dir() {
+        dir_bytes_excluding(&record_dir, Some("archive.json"))
+    } else {
+        0
+    };
+    let total_bytes = files_bytes.saturating_add(record_bytes);
+
+    let manifest_path = archive.join("manifest.json");
+    let mut manifest = json(&manifest_path);
+    let had_manifest = manifest.is_object();
+    let existing_files = strings(&manifest["files"]);
+    let actual_set: BTreeSet<&str> = actual_files.iter().map(String::as_str).collect();
+    let existing_set: BTreeSet<&str> = existing_files.iter().map(String::as_str).collect();
+    let files_changed = actual_set != existing_set;
+
+    let updated_files: Vec<String> = if files_changed {
+        let mut next: Vec<String> = existing_files
+            .into_iter()
+            .filter(|f| actual_set.contains(f.as_str()))
+            .collect();
+        let next_set: BTreeSet<String> = next.iter().cloned().collect();
+        for f in &actual_files {
+            if !next_set.contains(f) {
+                next.push(f.clone());
+            }
+        }
+        next
+    } else {
+        existing_files
+    };
+
+    let bytes_changed = manifest["bytes"].as_u64() != Some(files_bytes)
+        || manifest["recordBytes"].as_u64() != Some(record_bytes)
+        || manifest["totalBytes"].as_u64() != Some(total_bytes);
+
+    let needs_write = !had_manifest || files_changed || bytes_changed;
+    if needs_write {
+        if !manifest.is_object() {
+            manifest = json!({
+                "path": archive,
+                "skipped": [],
+                "createdAt": iso(),
+            });
+        }
+        if s(&manifest, "path").is_empty() {
+            manifest["path"] = json!(archive);
+        }
+        manifest["bytes"] = json!(files_bytes);
+        manifest["recordBytes"] = json!(record_bytes);
+        manifest["totalBytes"] = json!(total_bytes);
+        manifest["files"] = json!(updated_files);
+        write_json(&manifest_path, &manifest)?;
+        if record_dir.is_dir() {
+            let rec_arch = record_dir.join("archive.json");
+            let _ = write_json(&rec_arch, &manifest);
+        }
+    }
+    Ok((total_bytes, needs_write))
+}
+
+/// Walk `<cache>/delegate/archive` on disk, rewrite any stale `manifest.json` /
+/// `record/archive.json` to match actual remaining files and byte sizes, and refresh
+/// `.usage.json`.
+pub fn rescan() -> Res<ArchiveRescan> {
+    let root = cache_dir().join("archive");
+    let prev = json(root.join(".usage.json"));
+    let previous_bytes = prev["bytes"].as_u64();
+    let previous_count = prev["count"].as_u64().map(|c| c as usize);
+    if !root.is_dir() {
+        return Ok(ArchiveRescan {
+            root,
+            count: 0,
+            bytes: 0,
+            updated_manifests: 0,
+            previous_bytes,
+            previous_count,
+        });
+    }
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    let mut updated_manifests = 0usize;
+    for entry in fs::read_dir(&root).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        count += 1;
+        let (entry_bytes, updated) = rescan_one(&path)?;
+        bytes = bytes.saturating_add(entry_bytes);
+        if updated {
+            updated_manifests += 1;
+        }
+    }
+    write_usage_cache(&root, bytes, count);
+    Ok(ArchiveRescan {
+        root,
+        count,
+        bytes,
+        updated_manifests,
+        previous_bytes,
+        previous_count,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mentioned_inside_build_dir_requires_exact_file_reference() {
+        let result = "Updated `backend/`, rebuilt `.venv/`, `target/`, `node_modules/`, `dist/`, \
+                      `__pycache__/`, `.pytest_cache/`, and checked `.venv/pyvenv.cfg` and `target/mentioned`.";
+        // Explicit individual files inside reconstructible dirs are still archived.
+        assert!(mentioned(result, ".venv/pyvenv.cfg"));
+        assert!(mentioned(result, "target/mentioned"));
+        // Directory mentions (either the build dir itself or an ancestor above it) must NOT
+        // sweep in arbitrary files inside reconstructible dirs.
+        assert!(!mentioned(result, ".venv/lib/python3.11/site-packages/pkg.py"));
+        assert!(!mentioned(result, "backend/.venv/lib/python3.11/site-packages/pkg.py"));
+        assert!(!mentioned(result, "target/debug/app"));
+        assert!(!mentioned(result, "node_modules/pkg/index.js"));
+        assert!(!mentioned(result, "dist/bundle.js"));
+        assert!(!mentioned(result, "__pycache__/mod.cpython-311.pyc"));
+        assert!(!mentioned(result, ".pytest_cache/v/cache/lastfailed"));
+        // Non-reconstructible directory mentions still sweep in their children.
+        assert!(mentioned(result, "backend/report.txt"));
+    }
+
+    #[test]
+    fn default_archive_warn_gib_is_30() {
+        assert!((DEFAULT_ARCHIVE_WARN_GIB - 30.0).abs() < f64::EPSILON);
     }
 }

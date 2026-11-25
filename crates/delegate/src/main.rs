@@ -1263,18 +1263,64 @@ fn completion_timing(already: &std::collections::HashSet<PathBuf>, run: &Path) -
         "finished-during-wait"
     }
 }
+fn print_archive_rescan(res: &archive::ArchiveRescan) {
+    if output::json_enabled() {
+        println!(
+            "{}",
+            json!({
+                "archiveRescan": {
+                    "path": res.root,
+                    "count": res.count,
+                    "bytes": res.bytes,
+                    "updatedManifests": res.updated_manifests,
+                    "previousBytes": res.previous_bytes,
+                    "previousCount": res.previous_count,
+                }
+            })
+        );
+    } else if let (Some(pb), Some(pc)) = (res.previous_bytes, res.previous_count) {
+        println!(
+            "archive rescan: {} 份，共 {}（更新 {} 份 manifest；此前 {} 份 / {}）",
+            res.count,
+            format_bytes(res.bytes),
+            res.updated_manifests,
+            pc,
+            format_bytes(pb),
+        );
+    } else {
+        println!(
+            "archive rescan: {} 份，共 {}（更新 {} 份 manifest）",
+            res.count,
+            format_bytes(res.bytes),
+            res.updated_manifests,
+        );
+    }
+}
 fn clean(args: &[String]) -> Res<i32> {
     let (pos, flags, _) = parse_simple(
         args,
-        &["--finished", "--force", "--json", "--no-archive", "--sync"],
+        &[
+            "--finished",
+            "--force",
+            "--json",
+            "--no-archive",
+            "--sync",
+            "--rescan-archive",
+        ],
         &[],
     )?;
     if has(&flags, "--json") {
         output::enable_json();
     }
     let sync_gc = has(&flags, "--sync");
+    let rescan_archive = has(&flags, "--rescan-archive");
     if pos.is_empty() && !has(&flags, "--finished") {
-        return Err("clean requires runs or --finished".into());
+        if rescan_archive {
+            let res = archive::rescan()?;
+            print_archive_rescan(&res);
+            return Ok(0);
+        }
+        return Err("clean requires runs, --finished, or --rescan-archive".into());
     }
     let mut targets = pos
         .iter()
@@ -1466,6 +1512,10 @@ fn clean(args: &[String]) -> Res<i32> {
         if output::json_enabled() {
             println!("{}", json!({"orphanCleanup":{"async":true}}));
         }
+    }
+    if rescan_archive {
+        let res = archive::rescan()?;
+        print_archive_rescan(&res);
     }
     Ok(0)
 }
