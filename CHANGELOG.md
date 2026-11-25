@@ -2,8 +2,11 @@
 
 ## Unreleased
 
-- `delegate`：修复 `agy` 账号额度串号——`live_email`/`slot_email`/`slot_token_expiry` 改为优先读取 `agy` 实盘刷新的 `.gemini/antigravity-cli/antigravity-oauth-token`（不再被未随刷新的 `google_accounts.json` 掩盖漂移），且 `fetch_quota_for_slot` 改为全部槽位（含活跃槽位）均在隔离临时 `0700` HOME 装载各自槽位凭据跑 `agy -p /usage`，杜绝常驻交互 `agy` 刷新写回实盘导致串号；新增每次 `/usage` 身份核对（凭证邮箱、命令输出与隔离日志均须匹配目标槽位，否则拒存该份额度与回写并在 `list`/`status`/TUI 标「身份不符，未更新」），以及两槽位额度条目逐条（含 `resetAt`）完全相同时在 `list`/`status` 输出一行告警。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
+
+## delegate 6.45.2 - 2026-11-25
+
+- `delegate` 6.45.2：修复 `agy` 账号额度串号——`live_email`/`slot_email`/`slot_token_expiry` 改为优先读取 `agy` 实盘刷新的 `.gemini/antigravity-cli/antigravity-oauth-token`（不再被未随刷新的 `google_accounts.json` 掩盖漂移），且 `fetch_quota_for_slot` 改为全部槽位（含活跃槽位）均在隔离临时 `0700` HOME 装载各自槽位凭据跑 `agy -p /usage`，杜绝常驻交互 `agy` 刷新写回实盘导致串号；新增每次 `/usage` 身份核对（凭证邮箱、命令输出与隔离日志均须匹配目标槽位，否则拒存该份额度与回写并在 `list`/`status`/TUI 标「身份不符，未更新」），以及两槽位额度条目逐条（含 `resetAt`）完全相同时在 `list`/`status` 输出一行告警。
 
 ## delegate 6.45.1 - 2026-11-25
 
