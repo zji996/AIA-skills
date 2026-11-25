@@ -166,12 +166,14 @@ class DelegateQuotaAndInFailClosedTests(unittest.TestCase):
         self.assertTrue(cache_doc["accounts"]["alpha"]["ok"])
         self.assertTrue(cache_doc["accounts"]["beta"]["ok"])
 
-        # Verify active ran in real HOME, standby ran in temp HOME and temp HOME was deleted!
+        # Verify BOTH active and standby ran in isolated temp HOMEs (never real HOME) and both were deleted!
         calls = [json.loads(line) for line in trace_file.read_text().splitlines() if line.strip()]
         by_email = {c["email"]: Path(c["home"]) for c in calls}
-        self.assertEqual(by_email["alpha@example.test"].resolve(), self.fake_home.resolve())
+        self.assertNotEqual(by_email["alpha@example.test"].resolve(), self.fake_home.resolve())
+        self.assertFalse(by_email["alpha@example.test"].exists(), "active temp HOME was not deleted")
         self.assertNotEqual(by_email["beta@example.test"].resolve(), self.fake_home.resolve())
-        self.assertFalse(by_email["beta@example.test"].exists(), "temp HOME was not deleted")
+        self.assertFalse(by_email["beta@example.test"].exists(), "standby temp HOME was not deleted")
+        self.assertNotEqual(by_email["alpha@example.test"].resolve(), by_email["beta@example.test"].resolve())
 
         # Verify standby refreshed credential was written back to beta slot with 0600 mode,
         # while live HOME (alpha) remains untouched!
@@ -405,6 +407,244 @@ class DelegateQuotaAndInFailClosedTests(unittest.TestCase):
         self.assertEqual(observed, "pool-run-1-value")
         self.assertNotIn("pool-run-2-value", observed)
         self.assertNotIn("trunk-after-r1", observed)
+
+    def test_quota_isolation_prevents_live_home_contamination_and_keeps_two_accounts_separate(self):
+        self._seed_accounts()
+        # Simulate a long-lived interactive `agy` process started under `beta` overwriting
+        # live `~/.gemini/antigravity-cli/antigravity-oauth-token` while leaving
+        # `~/.gemini/google_accounts.json` pointing at `alpha`.
+        live_cli_tok = self.fake_home / ".gemini/antigravity-cli/antigravity-oauth-token"
+        live_cli_tok.write_text(
+            json.dumps(
+                {
+                    "auth_method": "consumer",
+                    "id_token_email": "beta@example.test",
+                    "token": {
+                        "access_token": "AT-BETA-LIVE-STALE",
+                        "refresh_token": "RT-BETA-ORIG",
+                        "expiry": "2026-11-25T19:50:07Z",
+                        "token_type": "Bearer",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        live_cli_tok.chmod(0o600)
+
+        # Drift must be detected immediately even though google_accounts.json still says alpha!
+        st_pre = json.loads(self.cli("agy", "account", "status", "--json").stdout)
+        self.assertEqual(st_pre["active"], "alpha")
+        self.assertEqual(st_pre["liveEmail"], "beta@example.test")
+        self.assertTrue(st_pre["liveDrifted"])
+
+        # Mock `agy -p /usage` reads `antigravity-cli/antigravity-oauth-token` (just like real agy)
+        # and writes an isolated auth log line under HOME.
+        mock_agy = self.work / "mock-agy-cli-token"
+        mock_agy.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "home = Path(os.environ['HOME'])\n"
+            "tok = json.loads((home / '.gemini/antigravity-cli/antigravity-oauth-token').read_text())\n"
+            "email = tok['id_token_email']\n"
+            "log_dir = home / '.gemini/antigravity-cli/log'\n"
+            "log_dir.mkdir(parents=True, exist_ok=True)\n"
+            "(log_dir / 'cli-usage.log').write_text(\n"
+            "    f'I1125 19:02:22 server_oauth.go:226] OAuth: authenticated successfully as {email}\\n'\n"
+            ")\n"
+            "if email == 'alpha@example.test':\n"
+            "    print('Gemini Models\\tWeekly Limit Remaining\\t93%\\t2026-11-30T20:03:02Z')\n"
+            "    print('Gemini Models\\tFive Hour Limit Remaining\\t80%\\t2026-11-25T14:28:48Z')\n"
+            "    print('Claude and GPT models\\tWeekly Limit Remaining\\t100%\\t2026-11-30T19:55:32Z')\n"
+            "elif email == 'beta@example.test':\n"
+            "    print('Gemini Models\\tWeekly Limit Remaining\\t50%\\t2026-11-30T20:09:03Z')\n"
+            "    print('Gemini Models\\tFive Hour Limit Remaining\\t100%\\t2026-11-25T12:55:45Z')\n"
+            "    print('Claude and GPT models\\tWeekly Limit Remaining\\t90%\\t2026-11-27T02:47:42Z')\n"
+            "else:\n"
+            "    sys.exit(2)\n",
+            encoding="utf-8",
+        )
+        mock_agy.chmod(0o755)
+        self.env["DELEGATE_AGY_BIN"] = str(mock_agy)
+
+        res = self.cli("agy", "account", "list", "--quota", "--json")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        doc = json.loads(res.stdout)
+        self.assertNotIn("duplicateQuotaGroups", doc)
+
+        alpha = next(a for a in doc["accounts"] if a["id"] == "alpha")
+        beta = next(a for a in doc["accounts"] if a["id"] == "beta")
+        self.assertTrue(alpha["quota"]["ok"])
+        self.assertTrue(beta["quota"]["ok"])
+        self.assertEqual(alpha["quota"]["entries"][0]["remainingPct"], 93.0)
+        self.assertEqual(alpha["quota"]["entries"][0]["resetAt"], "2026-11-30T20:03:02Z")
+        self.assertEqual(beta["quota"]["entries"][0]["remainingPct"], 50.0)
+        self.assertEqual(beta["quota"]["entries"][0]["resetAt"], "2026-11-30T20:09:03Z")
+
+    def test_quota_identity_mismatch_refuses_persist_and_duplicate_entries_warn(self):
+        self._seed_accounts()
+        # 1. Seed a valid baseline quota fetch for both accounts.
+        mock_good = self.work / "mock-agy-good"
+        mock_good.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "home = Path(os.environ['HOME'])\n"
+            "email = json.loads((home / '.gemini/antigravity-cli/antigravity-oauth-token').read_text())['id_token_email']\n"
+            "if email == 'alpha@example.test':\n"
+            "    print('Gemini Models\\tWeekly Limit Remaining\\t93%\\t2026-11-30T20:03:02Z')\n"
+            "else:\n"
+            "    print('Gemini Models\\tWeekly Limit Remaining\\t50%\\t2026-11-30T20:09:03Z')\n",
+            encoding="utf-8",
+        )
+        mock_good.chmod(0o755)
+        self.env["DELEGATE_AGY_BIN"] = str(mock_good)
+        r0 = self.cli("agy", "account", "list", "--quota", "--json")
+        self.assertEqual(r0.returncode, 0, r0.stderr)
+
+        # 2. Simulate agy authenticating as beta while querying alpha (log + refreshed token mismatch).
+        mock_wrong = self.work / "mock-agy-wrong-id"
+        mock_wrong.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "home = Path(os.environ['HOME'])\n"
+            "tok_path = home / '.gemini/antigravity-cli/antigravity-oauth-token'\n"
+            "email = json.loads(tok_path.read_text())['id_token_email']\n"
+            "log_dir = home / '.gemini/antigravity-cli/log'\n"
+            "log_dir.mkdir(parents=True, exist_ok=True)\n"
+            "if email == 'alpha@example.test':\n"
+            "    # Pretend agy silently authenticated as beta and even rewrote the token!\n"
+            "    (log_dir / 'cli-usage.log').write_text(\n"
+            "        'I1125 19:02:06 server_oauth.go:226] OAuth: authenticated successfully as beta@example.test\\n'\n"
+            "    )\n"
+            "    tok_path.write_text(json.dumps({\n"
+            "        'auth_method': 'consumer',\n"
+            "        'id_token_email': 'beta@example.test',\n"
+            "        'token': {'access_token': 'AT-WRONG', 'refresh_token': 'RT-WRONG', 'expiry': '2026-11-26T00:00:00Z'}\n"
+            "    }))\n"
+            "    print('Gemini Models\\tWeekly Limit Remaining\\t50%\\t2026-11-30T20:09:03Z')\n"
+            "else:\n"
+            "    print('Gemini Models\\tWeekly Limit Remaining\\t50%\\t2026-11-30T20:09:03Z')\n",
+            encoding="utf-8",
+        )
+        mock_wrong.chmod(0o755)
+        self.env["DELEGATE_AGY_BIN"] = str(mock_wrong)
+
+        r1 = self.cli("agy", "account", "list", "--quota", "--json")
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        doc1 = json.loads(r1.stdout)
+        alpha1 = next(a for a in doc1["accounts"] if a["id"] == "alpha")
+        self.assertFalse(alpha1["quota"]["ok"])
+        self.assertTrue(alpha1["quota"]["identityMismatch"])
+        self.assertEqual(alpha1["quota"]["observedEmail"], "beta@example.test")
+        # Prior 93% preserved, NEVER overwritten with beta's 50%!
+        self.assertEqual(alpha1["quota"]["entries"][0]["remainingPct"], 93.0)
+        # Mismatched quota must not be appended to history in agy-quota.json either!
+        cache_path = Path(self.env["XDG_STATE_HOME"]) / "delegate/agy-quota.json"
+        cache1 = json.loads(cache_path.read_text(encoding="utf-8"))
+        self.assertEqual([pt["weekly"] for pt in cache1["accounts"]["alpha"]["history"]], [93.0])
+        # Slot credential must NOT be overwritten with beta's token!
+        alpha_slot_tok = json.loads(
+            (self.fake_home / ".config/delegate/agy-accounts/alpha/antigravity-cli-oauth-token").read_text()
+        )
+        self.assertEqual(alpha_slot_tok["id_token_email"], "alpha@example.test")
+
+        # Both `list` and `status` must mark 「身份不符，未更新」.
+        list_txt = self.cli("agy", "account", "list").stdout
+        self.assertIn("身份不符，未更新", list_txt)
+        status_txt = self.cli("agy", "account", "status").stdout
+        self.assertIn("身份不符，未更新", status_txt)
+
+        # 3. With no prior cache and a corrupted slot credential email, mismatch must NOT store entries.
+        cache_path.unlink()
+        beta_slot_tok = self.fake_home / ".config/delegate/agy-accounts/beta/antigravity-cli-oauth-token"
+        beta_slot_tok.write_text(
+            json.dumps(
+                {
+                    "auth_method": "consumer",
+                    "id_token_email": "alpha@example.test",
+                    "token": {
+                        "access_token": "AT-CONTAMINATED",
+                        "refresh_token": "RT-CONTAMINATED",
+                        "expiry": "2026-11-26T00:00:00Z",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.env["DELEGATE_AGY_BIN"] = str(mock_good)
+        r2 = self.cli("agy", "account", "list", "--quota", "--json")
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        doc2 = json.loads(r2.stdout)
+        beta2 = next(a for a in doc2["accounts"] if a["id"] == "beta")
+        self.assertFalse(beta2["quota"]["ok"])
+        self.assertTrue(beta2["quota"]["identityMismatch"])
+        self.assertEqual(beta2["quota"]["entries"], [])
+        cache2 = json.loads(cache_path.read_text(encoding="utf-8"))
+        self.assertEqual(cache2["accounts"]["beta"]["entries"], [])
+        self.assertEqual(cache2["accounts"]["beta"]["history"], [])
+
+        # 4. Duplicate entries across two slots (identical including resetAt) warn in list & status.
+        dup_entries = [
+            {
+                "pool": "Gemini Models",
+                "window": "weekly",
+                "windowLabel": "Weekly Limit Remaining",
+                "remainingPct": 50.0,
+                "resetAt": "2026-11-30T20:09:03Z",
+            },
+            {
+                "pool": "Claude and GPT models",
+                "window": "weekly",
+                "windowLabel": "Weekly Limit Remaining",
+                "remainingPct": 90.0,
+                "resetAt": "2026-11-27T02:47:42Z",
+            },
+        ]
+        now_ep = int(time.time())
+        dup_cache = {
+            "schemaVersion": 1,
+            "updatedAt": "2026-11-25T10:53:05Z",
+            "updatedEpoch": now_ep,
+            "accounts": {
+                "alpha": {
+                    "fetchedAt": "2026-11-25T10:53:05Z",
+                    "fetchedEpoch": now_ep,
+                    "ok": True,
+                    "entries": dup_entries,
+                    "unknownLines": [],
+                    "history": [],
+                },
+                "beta": {
+                    "fetchedAt": "2026-11-25T10:53:05Z",
+                    "fetchedEpoch": now_ep,
+                    "ok": True,
+                    "entries": dup_entries,
+                    "unknownLines": [],
+                    "history": [],
+                },
+            },
+        }
+        cache_path.write_text(json.dumps(dup_cache), encoding="utf-8")
+
+        list_dup = self.cli("agy", "account", "list").stdout
+        status_dup = self.cli("agy", "account", "status").stdout
+        self.assertIn("warning:", list_dup)
+        self.assertIn("alpha, beta", list_dup)
+        self.assertIn("完全相同", list_dup)
+        self.assertIn("warning:", status_dup)
+        self.assertIn("alpha, beta", status_dup)
+        self.assertIn("完全相同", status_dup)
+
+        # Changing only resetAt on beta clears the duplicate warning.
+        dup_cache["accounts"]["beta"]["entries"] = [
+            {**dup_entries[0], "resetAt": "2026-11-30T20:03:02Z"},
+            dup_entries[1],
+        ]
+        cache_path.write_text(json.dumps(dup_cache), encoding="utf-8")
+        self.assertNotIn("完全相同", self.cli("agy", "account", "list").stdout)
+        self.assertNotIn("完全相同", self.cli("agy", "account", "status").stdout)
 
 
 if __name__ == "__main__":

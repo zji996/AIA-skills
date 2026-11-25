@@ -2180,3 +2180,29 @@ fn tui_polish_1125_fixes_collected_time_narrow_names_tier_dedup_local_time_lane_
     assert!(acct_screen.contains("2119879 · org-step3-switcher（审查 round-1）"), "{acct_screen}");
     assert!(acct_screen.contains("539385 · gate-fix-1125（作者）"), "{acct_screen}");
 }
+
+#[test]
+fn quota_identity_mismatch_marks_unupdated_in_overview_and_accounts() {
+    let mut app = make_rich_quota_and_charts_app();
+    if let Some(alpha) = app.snapshot.agy_accounts.accounts.first_mut() {
+        if let Some(q) = alpha.quota.as_mut() {
+            q.ok = false;
+            q.identity_mismatch = true;
+            q.error = Some("身份不符，未更新".to_string());
+        }
+    }
+
+    // Overview wide (120x40) & narrow (80x24)
+    app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+    let ov_wide = render_to_string(&mut app, 120, 40);
+    assert!(ov_wide.contains("身份不符，未更新"), "overview wide missing mismatch badge:\n{ov_wide}");
+    let ov_narrow = render_to_string(&mut app, 80, 24);
+    assert!(ov_narrow.contains("身份不符，未更新"), "overview narrow missing mismatch badge:\n{ov_narrow}");
+
+    // Accounts tab wide (120x40) & narrow (80x24)
+    app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
+    let acct_wide = render_to_string(&mut app, 120, 40);
+    assert!(acct_wide.contains("身份不符，未更新"), "accounts wide missing mismatch badge:\n{acct_wide}");
+    let acct_narrow = render_to_string(&mut app, 80, 24);
+    assert!(acct_narrow.contains("身份不符，未更新"), "accounts narrow missing mismatch badge:\n{acct_narrow}");
+}

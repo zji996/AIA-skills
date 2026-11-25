@@ -1238,6 +1238,7 @@ pub struct AccountRealQuota {
     pub fetched_epoch: i64,
     pub age_seconds: u64,
     pub ok: bool,
+    pub identity_mismatch: bool,
     pub error: Option<String>,
     pub entries: Vec<QuotaPoolEntry>,
     pub unknown_lines: Vec<String>,

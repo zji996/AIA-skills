@@ -4726,7 +4726,18 @@ fn render_overview_quota_panel(frame: &mut Frame, app: &App, area: Rect) {
         y += 1;
 
         if let Some(q) = &acct.quota {
-            if !q.ok {
+            if q.identity_mismatch {
+                if y < max_y {
+                    frame.render_widget(
+                        Paragraph::new(Line::from(Span::styled(
+                            truncate("  ⚠ 身份不符，未更新", iw),
+                            Style::default().fg(STATUS_FAILED),
+                        ))),
+                        Rect::new(inner.x, y, inner.width, 1),
+                    );
+                    y += 1;
+                }
+            } else if !q.ok {
                 if y < max_y {
                     let err_msg = q.error.as_deref().unwrap_or("刷新失败");
                     frame.render_widget(
@@ -5319,7 +5330,15 @@ fn render_overview_narrow(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(truncate(&disp, iw.saturating_sub(4)), bold_primary()),
             ]));
             if let Some(q) = &acct.quota {
-                if !q.ok {
+                if q.identity_mismatch {
+                    push_indented_wrapped(
+                        &mut lines,
+                        "    ",
+                        "⚠ 身份不符，未更新",
+                        iw,
+                        Style::default().fg(STATUS_FAILED),
+                    );
+                } else if !q.ok {
                     push_indented_wrapped(
                         &mut lines,
                         "    ",
@@ -5778,7 +5797,11 @@ fn render_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
             } else if app.quota_last_error.is_some() {
                 format!(" {disp} · 刷新失败 ")
             } else if let Some(q) = &a.quota {
-                format!(" {disp} · {} ", format_quota_updated(q.age_seconds))
+                if q.identity_mismatch {
+                    format!(" {disp} · 身份不符，未更新 ")
+                } else {
+                    format!(" {disp} · {} ", format_quota_updated(q.age_seconds))
+                }
             } else {
                 format!(" {disp} ")
             }
@@ -5845,7 +5868,15 @@ fn render_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
         // Source: `agy -p /usage`; update timestamp is already shown in the pane title.
         if let Some(q) = &acct.quota {
             out.push(section_header("额度"));
-            if !q.ok {
+            if q.identity_mismatch {
+                push_indented_wrapped(
+                    &mut out,
+                    "  ",
+                    "⚠ 身份不符，未更新",
+                    iw,
+                    Style::default().fg(STATUS_FAILED),
+                );
+            } else if !q.ok {
                 let err_msg = q.error.as_deref().unwrap_or("刷新失败");
                 push_indented_wrapped(
                     &mut out,
@@ -6111,7 +6142,18 @@ fn render_account_detail_wide_visual(frame: &mut Frame, app: &mut App, inner: Re
             );
             y += 1;
         }
-        if !q.ok {
+        if q.identity_mismatch {
+            if y < max_y {
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        truncate("  ⚠ 身份不符，未更新", iw),
+                        Style::default().fg(STATUS_FAILED),
+                    ))),
+                    Rect::new(inner.x, y, inner.width, 1),
+                );
+                y += 1;
+            }
+        } else if !q.ok {
             if y < max_y {
                 let err_msg = q.error.as_deref().unwrap_or("刷新失败");
                 frame.render_widget(

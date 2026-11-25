@@ -314,47 +314,49 @@ fn read_email_from_json_file(path: &Path, keys: &[&str]) -> Option<String> {
     None
 }
 
+/// Collect `(home_rel, email)` from all email-bearing credential files under `home_dir`,
+/// prioritized in the order `agy` actually authenticates (`.gemini/antigravity-cli/antigravity-oauth-token`
+/// first; `google_accounts.json` last because `agy` does not update it on token refresh).
+fn collect_home_cred_emails(home_dir: &Path) -> Vec<(&'static str, String)> {
+    const SOURCES: &[(&str, &str)] = &[
+        (".gemini/antigravity-cli/antigravity-oauth-token", "id_token_email"),
+        (".gemini/antigravity/antigravity-oauth-token", "id_token_email"),
+        (".gemini/jetski-standalone-oauth-token", "id_token_email"),
+        (".gemini/google_accounts.json", "active"),
+    ];
+    let mut out = Vec::new();
+    for (rel, key) in SOURCES {
+        if let Some(email) = read_email_from_json_file(&home_dir.join(rel), &[*key]) {
+            out.push((*rel, email));
+        }
+    }
+    out
+}
+
 fn live_email(home_dir: &Path) -> Option<String> {
-    read_email_from_json_file(&home_dir.join(".gemini/google_accounts.json"), &["active"])
-        .or_else(|| {
-            read_email_from_json_file(
-                &home_dir.join(".gemini/jetski-standalone-oauth-token"),
-                &["id_token_email"],
-            )
-        })
-        .or_else(|| {
-            read_email_from_json_file(
-                &home_dir.join(".gemini/antigravity-cli/antigravity-oauth-token"),
-                &["id_token_email"],
-            )
-        })
-        .or_else(|| {
-            read_email_from_json_file(
-                &home_dir.join(".gemini/antigravity/antigravity-oauth-token"),
-                &["id_token_email"],
-            )
-        })
+    collect_home_cred_emails(home_dir)
+        .into_iter()
+        .next()
+        .map(|(_, email)| email)
 }
 
 fn slot_email(dir: &Path) -> Option<String> {
-    read_email_from_json_file(&dir.join("google_accounts.json"), &["active"])
-        .or_else(|| {
-            read_email_from_json_file(&dir.join("jetski-standalone-oauth-token"), &["id_token_email"])
-        })
-        .or_else(|| {
-            read_email_from_json_file(&dir.join("antigravity-cli-oauth-token"), &["id_token_email"])
-        })
+    read_email_from_json_file(&dir.join("antigravity-cli-oauth-token"), &["id_token_email"])
         .or_else(|| {
             read_email_from_json_file(&dir.join("antigravity-oauth-token"), &["id_token_email"])
         })
+        .or_else(|| {
+            read_email_from_json_file(&dir.join("jetski-standalone-oauth-token"), &["id_token_email"])
+        })
+        .or_else(|| read_email_from_json_file(&dir.join("google_accounts.json"), &["active"]))
 }
 
 /// Read only the non-secret `token.expiry` ISO timestamp from local slot files.
 fn slot_token_expiry(dir: &Path) -> Option<String> {
     for name in [
-        "jetski-standalone-oauth-token",
         "antigravity-cli-oauth-token",
         "antigravity-oauth-token",
+        "jetski-standalone-oauth-token",
     ] {
         let p = dir.join(name);
         if let Ok(raw) = fs::read_to_string(&p) {
@@ -807,6 +809,18 @@ pub fn enrich_quota_for_snapshot(raw_acct: &Value, now_ep: i64) -> Option<Value>
         "entries": entries,
         "unknownLines": unknown_lines,
     });
+    if b(raw_acct, "identityMismatch") {
+        out["identityMismatch"] = json!(true);
+    }
+    if let Some(exp) = raw_acct["expectedEmail"].as_str().filter(|e| !e.is_empty()) {
+        out["expectedEmail"] = json!(exp);
+    }
+    if let Some(obs) = raw_acct["observedEmail"].as_str().filter(|e| !e.is_empty()) {
+        out["observedEmail"] = json!(obs);
+    }
+    if let Some(at) = raw_acct["mismatchAt"].as_str().filter(|e| !e.is_empty()) {
+        out["mismatchAt"] = json!(at);
+    }
     if let Some(err) = raw_acct["error"].as_str().filter(|e| !e.is_empty()) {
         out["error"] = json!(err);
     }
@@ -835,7 +849,7 @@ fn run_agy_usage_cmd(
     real_home: &Path,
     isolated_temp_home: bool,
     timeout_secs: u64,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     let mut cmd = Command::new(agy_bin);
     cmd.args(["-p", "/usage"])
         .stdin(Stdio::null())
@@ -903,16 +917,210 @@ fn run_agy_usage_cmd(
         };
         return Err(format!("agy -p /usage failed: {msg}"));
     }
-    Ok(stdout)
+    Ok((stdout, stderr))
+}
+
+const IDENTITY_MISMATCH_MSG: &str = "身份不符，未更新";
+
+fn is_valid_email_token(cand: &str) -> bool {
+    let Some((local, domain)) = cand.split_once('@') else {
+        return false;
+    };
+    if local.is_empty()
+        || domain.is_empty()
+        || domain.contains('@')
+        || local.starts_with('.')
+        || local.ends_with('.')
+        || !local
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'%' | b'+' | b'-'))
+    {
+        return false;
+    }
+    let labels: Vec<&str> = domain.split('.').collect();
+    if labels.len() < 2 {
+        return false;
+    }
+    for label in &labels {
+        if label.is_empty()
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return false;
+        }
+    }
+    let tld = labels[labels.len() - 1];
+    tld.len() >= 2 && tld.bytes().all(|b| b.is_ascii_alphabetic())
+}
+
+fn push_unique_email_ci(dst: &mut Vec<String>, email: &str) {
+    let trimmed = email.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if !dst.iter().any(|e| e.eq_ignore_ascii_case(trimmed)) {
+        dst.push(trimmed.to_string());
+    }
+}
+
+fn extract_email_tokens(line: &str) -> Vec<String> {
+    let clean = strip_ansi(line);
+    let mut found = Vec::new();
+    for raw_tok in clean.split_whitespace() {
+        if raw_tok.contains("://") || raw_tok.contains('/') {
+            continue;
+        }
+        let stripped = raw_tok.trim_matches(|c: char| {
+            matches!(
+                c,
+                '"' | '\'' | ',' | ';' | '(' | ')' | '<' | '>' | '[' | ']' | '{' | '}' | '.'
+            )
+        });
+        let candidate = stripped
+            .rsplit_once('=')
+            .or_else(|| stripped.rsplit_once(':'))
+            .map(|(_, rhs)| rhs)
+            .unwrap_or(stripped)
+            .trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '"' | '\'' | ',' | ';' | '(' | ')' | '<' | '>' | '[' | ']' | '{' | '}' | '.'
+                )
+            });
+        if is_valid_email_token(candidate) {
+            push_unique_email_ci(&mut found, candidate);
+        }
+    }
+    found
+}
+
+/// Extract any identity emails present in `agy -p /usage` stdout/stderr (skipping standard TSV quota rows).
+fn extract_identity_emails_from_output(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let clean = strip_ansi(line);
+        let cols: Vec<&str> = clean.split('\t').map(str::trim).collect();
+        if cols.len() >= 3 && !cols[0].is_empty() && !cols[1].is_empty() && parse_pct_value(cols[2]).is_some() {
+            continue;
+        }
+        for email in extract_email_tokens(&clean) {
+            push_unique_email_ci(&mut found, &email);
+        }
+    }
+    found
+}
+
+/// Extract OAuth authenticated emails written by `agy` to its isolated `TempHome` log directory.
+fn extract_identity_emails_from_agy_logs(temp_home: &Path) -> Vec<String> {
+    let log_dir = temp_home.join(".gemini/antigravity-cli/log");
+    let Ok(entries) = fs::read_dir(&log_dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("log"))
+        .collect();
+    paths.sort();
+    let mut found = Vec::new();
+    for p in paths {
+        let Ok(raw) = fs::read_to_string(&p) else {
+            continue;
+        };
+        for line in raw.lines() {
+            let low = line.to_ascii_lowercase();
+            if low.contains("applyauthresult")
+                || low.contains("authenticated successfully as")
+                || low.contains("oauth: authenticated")
+            {
+                for email in extract_email_tokens(line) {
+                    push_unique_email_ci(&mut found, &email);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Verify that the identity actually used during `/usage` matches `expected_email`.
+/// Returns `Ok(())` when verified, or `Err(observed_email)` (empty string if no identity could be observed).
+fn verify_slot_identity(
+    expected_email: &str,
+    cred_emails: &[(&str, String)],
+    output_emails: &[String],
+    log_emails: &[String],
+) -> Result<(), String> {
+    let expected = expected_email.trim();
+    let mut observed: Vec<String> = Vec::new();
+    for e in log_emails {
+        push_unique_email_ci(&mut observed, e);
+    }
+    for e in output_emails {
+        push_unique_email_ci(&mut observed, e);
+    }
+    for (_, e) in cred_emails {
+        push_unique_email_ci(&mut observed, e);
+    }
+
+    if expected.is_empty() {
+        if observed.len() > 1 {
+            return Err(observed[1].clone());
+        }
+        return Ok(());
+    }
+
+    if observed.is_empty() {
+        return Err(String::new());
+    }
+    for actual in &observed {
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(actual.clone());
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
 struct SlotQuotaFetch {
     id: String,
     ok: bool,
+    identity_mismatch: bool,
+    expected_email: String,
+    observed_email: String,
     error: Option<String>,
     parsed: ParsedAgyUsage,
     refreshed_creds: usize,
+}
+
+impl SlotQuotaFetch {
+    fn error_result(id: &str, expected_email: &str, err: String) -> Self {
+        Self {
+            id: id.to_string(),
+            ok: false,
+            identity_mismatch: false,
+            expected_email: expected_email.to_string(),
+            observed_email: String::new(),
+            error: Some(err),
+            parsed: ParsedAgyUsage::default(),
+            refreshed_creds: 0,
+        }
+    }
+
+    fn mismatch_result(id: &str, expected_email: &str, observed_email: String) -> Self {
+        Self {
+            id: id.to_string(),
+            ok: false,
+            identity_mismatch: true,
+            expected_email: expected_email.to_string(),
+            observed_email,
+            error: Some(IDENTITY_MISMATCH_MSG.to_string()),
+            parsed: ParsedAgyUsage::default(),
+            refreshed_creds: 0,
+        }
+    }
 }
 
 fn seed_keyring_markers(real_home: &Path, temp_home: &Path) {
@@ -928,70 +1136,59 @@ fn seed_keyring_markers(real_home: &Path, temp_home: &Path) {
     }
 }
 
-/// Run `agy -p /usage </dev/null` for a single account slot.
-/// - Active slot (when live `~/.gemini` matches): runs directly in real `HOME`.
-/// - Inactive/standby slot: installs slot creds into a `0700` temporary `HOME`,
-///   runs `agy -p /usage </dev/null`, writes back any refreshed `~/.gemini` credentials
-///   atomically (`0600`) to the slot directory, and deletes the temporary `HOME`.
+/// Run `agy -p /usage </dev/null` for a single account slot in an isolated `0700` temp HOME.
+///
+/// Every slot — including the active slot — runs from its own stored slot credentials in a
+/// fresh `TempHome`, never in real `HOME`, so long-lived interactive `agy` processes refreshing
+/// another account's token into `~/.gemini/antigravity-cli/antigravity-oauth-token` can never
+/// cross-contaminate quota results.
+///
+/// Before accepting quota or writing back refreshed credentials (`0600`, under `.lock`),
+/// verifies that the actual identity (slot credential emails + `agy` output + isolated `agy` log)
+/// equals the target slot's expected email.
 fn fetch_quota_for_slot(
     agy_bin: &Path,
     real_home: &Path,
     root: &Path,
     id: &str,
-    use_real_home: bool,
+    expected_email_in: &str,
     timeout_secs: u64,
 ) -> SlotQuotaFetch {
-    if use_real_home {
-        return match run_agy_usage_cmd(agy_bin, real_home, real_home, false, timeout_secs) {
-            Ok(stdout) => SlotQuotaFetch {
-                id: id.to_string(),
-                ok: true,
-                error: None,
-                parsed: parse_agy_usage_output(&stdout),
-                refreshed_creds: 0,
-            },
-            Err(err) => SlotQuotaFetch {
-                id: id.to_string(),
-                ok: false,
-                error: Some(err),
-                parsed: ParsedAgyUsage::default(),
-                refreshed_creds: 0,
-            },
-        };
-    }
-
     let sdir = slot_dir(root, id);
+    let expected_email = {
+        let trimmed = expected_email_in.trim();
+        if !trimmed.is_empty() {
+            trimmed.to_string()
+        } else {
+            slot_email(&sdir).unwrap_or_default()
+        }
+    };
     if !slot_has_core_token(&sdir) {
-        return SlotQuotaFetch {
-            id: id.to_string(),
-            ok: false,
-            error: Some("slot missing core OAuth credentials".to_string()),
-            parsed: ParsedAgyUsage::default(),
-            refreshed_creds: 0,
-        };
+        return SlotQuotaFetch::error_result(
+            id,
+            &expected_email,
+            "slot missing core OAuth credentials".to_string(),
+        );
     }
 
     let temp_home = match TempHome::create() {
         Ok(t) => t,
-        Err(err) => {
-            return SlotQuotaFetch {
-                id: id.to_string(),
-                ok: false,
-                error: Some(err),
-                parsed: ParsedAgyUsage::default(),
-                refreshed_creds: 0,
-            }
-        }
+        Err(err) => return SlotQuotaFetch::error_result(id, &expected_email, err),
     };
     seed_keyring_markers(real_home, &temp_home.path);
     if let Err(err) = install_slot_to_home(&sdir, &temp_home.path) {
-        return SlotQuotaFetch {
-            id: id.to_string(),
-            ok: false,
-            error: Some(err),
-            parsed: ParsedAgyUsage::default(),
-            refreshed_creds: 0,
-        };
+        return SlotQuotaFetch::error_result(id, &expected_email, err);
+    }
+
+    // Pre-run identity guard: if any email-bearing credential in the slot disagrees with
+    // `expected_email`, refuse before invoking `agy`.
+    let pre_cred_emails = collect_home_cred_emails(&temp_home.path);
+    if !expected_email.is_empty() {
+        for (_, actual) in &pre_cred_emails {
+            if !actual.eq_ignore_ascii_case(&expected_email) {
+                return SlotQuotaFetch::mismatch_result(id, &expected_email, actual.clone());
+            }
+        }
     }
 
     // Snapshot credential bytes before running `agy -p /usage` to detect token refreshes.
@@ -1004,13 +1201,39 @@ fn fetch_quota_for_slot(
 
     let run_res = run_agy_usage_cmd(agy_bin, &temp_home.path, real_home, true, timeout_secs);
 
+    let (stdout, stderr) = match run_res {
+        Ok(pair) => pair,
+        Err(err) => {
+            drop(temp_home);
+            return SlotQuotaFetch::error_result(id, &expected_email, err);
+        }
+    };
+
+    // Post-run identity guard: verify credential files, agy stdout/stderr, and isolated agy logs
+    // all match `expected_email` before persisting quota or writing back refreshed credentials.
+    let post_cred_emails = collect_home_cred_emails(&temp_home.path);
+    let mut output_emails = extract_identity_emails_from_output(&stdout);
+    for e in extract_identity_emails_from_output(&stderr) {
+        push_unique_email_ci(&mut output_emails, &e);
+    }
+    let log_emails = extract_identity_emails_from_agy_logs(&temp_home.path);
+    if let Err(observed) =
+        verify_slot_identity(&expected_email, &post_cred_emails, &output_emails, &log_emails)
+    {
+        drop(temp_home);
+        return SlotQuotaFetch::mismatch_result(id, &expected_email, observed);
+    }
+
     // Check if any credential files under temp HOME (e.g. ~/.gemini/*) were refreshed.
-    let mut refreshed: Vec<(&'static str, Vec<u8>)> = Vec::new();
+    let mut refreshed: Vec<(&CredFile, Vec<u8>)> = Vec::new();
     for cf in CRED_FILES {
         let p = temp_home.path.join(cf.home_rel);
         if let Ok(after_bytes) = fs::read(&p) {
-            if !after_bytes.is_empty() && before.get(cf.slot_name).and_then(Option::as_ref) != Some(&after_bytes) {
-                refreshed.push((cf.slot_name, after_bytes));
+            if !after_bytes.is_empty()
+                && before.get(cf.slot_name).and_then(Option::as_ref) != Some(&after_bytes)
+                && cred_file_valid_for_email(cf, &after_bytes, &expected_email)
+            {
+                refreshed.push((cf, after_bytes));
             }
         }
     }
@@ -1019,8 +1242,10 @@ fn fetch_quota_for_slot(
     if !refreshed.is_empty() {
         if let Ok(_lock) = acquire_accounts_lock(root) {
             let _ = ensure_dir_mode(&sdir, 0o700);
-            for (slot_name, bytes) in &refreshed {
-                if write_secret_0600(&sdir.join(slot_name), bytes, true).is_ok() {
+            for (cf, bytes) in &refreshed {
+                let dst = sdir.join(cf.slot_name);
+                if should_update_slot_file(&dst, bytes) && write_secret_0600(&dst, bytes, true).is_ok()
+                {
                     refreshed_creds += 1;
                 }
             }
@@ -1036,21 +1261,15 @@ fn fetch_quota_for_slot(
 
     drop(temp_home);
 
-    match run_res {
-        Ok(stdout) => SlotQuotaFetch {
-            id: id.to_string(),
-            ok: true,
-            error: None,
-            parsed: parse_agy_usage_output(&stdout),
-            refreshed_creds,
-        },
-        Err(err) => SlotQuotaFetch {
-            id: id.to_string(),
-            ok: false,
-            error: Some(err),
-            parsed: ParsedAgyUsage::default(),
-            refreshed_creds,
-        },
+    SlotQuotaFetch {
+        id: id.to_string(),
+        ok: true,
+        identity_mismatch: false,
+        expected_email,
+        observed_email: String::new(),
+        error: None,
+        parsed: parse_agy_usage_output(&stdout),
+        refreshed_creds,
     }
 }
 
@@ -1109,24 +1328,16 @@ pub fn refresh_all_quotas(agy_bin_opt: Option<&str>) -> Res<Value> {
     let root = accounts_root();
     let real_home = home();
     let state = load_state(&root);
-    let active_id = state["active"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let live = live_email(&real_home).unwrap_or_default();
     let timeout_secs = quota_timeout_secs();
 
-    let mut targets: Vec<(String, bool)> = Vec::new();
+    let mut targets: Vec<(String, String)> = Vec::new();
     if let Some(map) = state["accounts"].as_object() {
         let mut keys: Vec<&String> = map.keys().collect();
         keys.sort();
         for id in keys {
             let entry = &map[id];
-            let email = s(entry, "email");
-            let is_active = active_id.as_deref() == Some(id.as_str());
-            let drifted = !live.is_empty() && !email.is_empty() && !email.eq_ignore_ascii_case(&live);
-            let use_real_home = is_active && !drifted;
-            targets.push((id.clone(), use_real_home));
+            let email = s(entry, "email").to_string();
+            targets.push((id.clone(), email));
         }
     }
 
@@ -1134,13 +1345,15 @@ pub fn refresh_all_quotas(agy_bin_opt: Option<&str>) -> Res<Value> {
     thread::scope(|sc| {
         let handles: Vec<_> = targets
             .iter()
-            .map(|(id, use_real)| {
+            .map(|(id, email)| {
                 let agy_bin = &agy_bin;
                 let real_home = &real_home;
                 let root = &root;
                 let id_str = id.as_str();
-                let ur = *use_real;
-                sc.spawn(move || fetch_quota_for_slot(agy_bin, real_home, root, id_str, ur, timeout_secs))
+                let email_str = email.as_str();
+                sc.spawn(move || {
+                    fetch_quota_for_slot(agy_bin, real_home, root, id_str, email_str, timeout_secs)
+                })
             })
             .collect();
         for h in handles {
@@ -1164,13 +1377,51 @@ pub fn refresh_all_quotas(agy_bin_opt: Option<&str>) -> Res<Value> {
     cache["updatedEpoch"] = json!(now_ep);
 
     for res in results {
-        let mut history: Vec<Value> = cache["accounts"][&res.id]["history"]
+        let prev_acct = cache["accounts"][&res.id].clone();
+        let mut history: Vec<Value> = prev_acct["history"]
             .as_array()
             .cloned()
             .unwrap_or_default()
             .into_iter()
             .filter(|pt| pt["epoch"].as_i64().unwrap_or(0) >= cutoff)
             .collect();
+
+        if res.identity_mismatch {
+            // Identity mismatch: NEVER store the fetched quota entries or append to history.
+            // Preserve prior cached entries/history/timestamp (if any) and mark `identityMismatch`.
+            let prev_entries = prev_acct["entries"].as_array().cloned().unwrap_or_default();
+            let prev_unknown = prev_acct["unknownLines"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let prev_fetched_at = s(&prev_acct, "fetchedAt").to_string();
+            let prev_fetched_ep = prev_acct["fetchedEpoch"].as_i64().unwrap_or(0);
+            let (keep_at, keep_ep) = if !prev_fetched_at.is_empty() || prev_fetched_ep > 0 {
+                (prev_fetched_at, prev_fetched_ep)
+            } else {
+                (now_iso.clone(), now_ep)
+            };
+            let mut acct_doc = json!({
+                "fetchedAt": keep_at,
+                "fetchedEpoch": keep_ep,
+                "ok": false,
+                "identityMismatch": true,
+                "mismatchAt": now_iso,
+                "error": res.error.unwrap_or_else(|| IDENTITY_MISMATCH_MSG.to_string()),
+                "entries": prev_entries,
+                "unknownLines": prev_unknown,
+                "refreshedCreds": 0,
+                "history": history,
+            });
+            if !res.expected_email.is_empty() {
+                acct_doc["expectedEmail"] = json!(res.expected_email);
+            }
+            if !res.observed_email.is_empty() {
+                acct_doc["observedEmail"] = json!(res.observed_email);
+            }
+            cache["accounts"][&res.id] = acct_doc;
+            continue;
+        }
 
         if res.ok {
             if let Some(pt) = build_quota_history_point(now_ep, &res.parsed.entries) {
@@ -1222,6 +1473,56 @@ pub fn refresh_all_quotas(agy_bin_opt: Option<&str>) -> Res<Value> {
 
     save_quota_cache(&cache)?;
     Ok(cache)
+}
+
+type QuotaEntrySig = (String, String, String, i64, String);
+
+fn quota_entries_signature(quota: &Value) -> Option<Vec<QuotaEntrySig>> {
+    let arr = quota["entries"].as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    let mut sig: Vec<QuotaEntrySig> = arr
+        .iter()
+        .map(|e| {
+            let pct_x100 = (e["remainingPct"].as_f64().unwrap_or(0.0) * 100.0).round() as i64;
+            (
+                s(e, "pool").to_string(),
+                s(e, "window").to_string(),
+                s(e, "windowLabel").to_string(),
+                pct_x100,
+                s(e, "resetAt").to_string(),
+            )
+        })
+        .collect();
+    sig.sort();
+    Some(sig)
+}
+
+/// Detect groups of 2+ account slots whose quota `entries` are identical entry-by-entry
+/// (including `resetAt`). Weekly reset timestamps are per-account, so identical entries across
+/// slots strongly indicate cross-account quota contamination.
+fn find_duplicate_quota_slot_groups(accounts: &[Value]) -> Vec<Vec<String>> {
+    let mut by_sig: BTreeMap<Vec<QuotaEntrySig>, Vec<String>> = BTreeMap::new();
+    for item in accounts {
+        let id = s(item, "id");
+        if id.is_empty() || !item["quota"].is_object() {
+            continue;
+        }
+        if let Some(sig) = quota_entries_signature(&item["quota"]) {
+            by_sig.entry(sig).or_default().push(id.to_string());
+        }
+    }
+    let mut groups: Vec<Vec<String>> = by_sig
+        .into_values()
+        .filter(|ids| ids.len() >= 2)
+        .map(|mut ids| {
+            ids.sort();
+            ids
+        })
+        .collect();
+    groups.sort();
+    groups
 }
 
 /// Fast snapshot for `delegate snapshot --json`: skips the `/proc` scan when no local
@@ -1318,8 +1619,11 @@ fn snapshot_json_opts(scan_procs: bool) -> Value {
         }
     }
 
+    let dup_groups = find_duplicate_quota_slot_groups(&items);
+
     let live_drifted = !live.is_empty()
-        && (active_id.is_none() || (!active_email.is_empty() && active_email != live));
+        && (active_id.is_none()
+            || (!active_email.is_empty() && !active_email.eq_ignore_ascii_case(&live)));
 
     let running_json: Vec<Value> = running.iter().map(running_agy_to_json).collect();
 
@@ -1341,6 +1645,9 @@ fn snapshot_json_opts(scan_procs: bool) -> Value {
         "quotaUpdatedAt": quota_updated_at,
         "quotaAgeSeconds": quota_age_secs,
     });
+    if !dup_groups.is_empty() {
+        out["duplicateQuotaGroups"] = json!(dup_groups);
+    }
     if let Some(snap) = usage_snap {
         out["unassignedUsage"] = snap.unassigned;
     }
@@ -1462,24 +1769,46 @@ fn save_live_to_slot(home_dir: &Path, dst_slot: &Path) -> Res<usize> {
     save_live_to_slot_checked(home_dir, dst_slot, "")
 }
 
+fn cred_file_carries_email(cf: &CredFile) -> bool {
+    matches!(
+        cf.slot_name,
+        "google_accounts.json"
+            | "jetski-standalone-oauth-token"
+            | "antigravity-cli-oauth-token"
+            | "antigravity-oauth-token"
+    )
+}
+
 /// Save back live credential files from `$HOME` into `dst_slot`, validating JSON structure
 /// and ensuring files carrying an email match `expected_email` (when non-empty) without
 /// regressing a strictly newer token expiry already stored in the slot.
+/// Email-less files (`oauth_creds.json`, `credential-user-scope`) are only copied when
+/// every email-bearing credential file in `home_dir` agrees with `expected_email`.
 fn save_live_to_slot_checked(
     home_dir: &Path,
     dst_slot: &Path,
     expected_email: &str,
 ) -> Res<usize> {
     ensure_dir_mode(dst_slot, 0o700)?;
+    let expected = expected_email.trim();
+    let home_emails = collect_home_cred_emails(home_dir);
+    let home_consistent = expected.is_empty()
+        || (!home_emails.is_empty()
+            && home_emails
+                .iter()
+                .all(|(_, e)| e.eq_ignore_ascii_case(expected)));
     let mut copied = 0usize;
     for cf in CRED_FILES {
+        if !cred_file_carries_email(cf) && !home_consistent {
+            continue;
+        }
         let src = home_dir.join(cf.home_rel);
         if src.is_file() {
             let bytes = fs::read(&src).map_err(|e| format!("read {}: {e}", src.display()))?;
             if bytes.is_empty() {
                 continue;
             }
-            if !cred_file_valid_for_email(cf, &bytes, expected_email) {
+            if !cred_file_valid_for_email(cf, &bytes, expected) {
                 continue;
             }
             let dst = dst_slot.join(cf.slot_name);
@@ -1913,6 +2242,22 @@ fn resolve_agy_bin(explicit: Option<&str>) -> Res<PathBuf> {
     Err("could not locate executable `agy` (checked ~/.local/libexec/agy and PATH; override with --agy-bin)".into())
 }
 
+fn print_duplicate_quota_warnings(snap: &Value) {
+    if let Some(groups) = snap["duplicateQuotaGroups"].as_array() {
+        for grp in groups {
+            if let Some(ids) = grp.as_array() {
+                let names: Vec<&str> = ids.iter().filter_map(Value::as_str).collect();
+                if names.len() >= 2 {
+                    println!(
+                        "warning: 槽位 {} 额度条目（含 resetAt）完全相同，疑似串号，请核对槽位凭证",
+                        names.join(", ")
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn format_quota_brief(quota: &Value) -> String {
     if !quota.is_object() {
         return String::new();
@@ -1921,6 +2266,13 @@ fn format_quota_brief(quota: &Value) -> String {
         .as_i64()
         .map(format_age_compact)
         .unwrap_or_default();
+    if b(quota, "identityMismatch") {
+        return if age.is_empty() {
+            format!(" quota[{IDENTITY_MISMATCH_MSG}]")
+        } else {
+            format!(" quota[{IDENTITY_MISMATCH_MSG} · {age}]")
+        };
+    }
     if !b(quota, "ok") {
         let err = s(quota, "error");
         let msg = if err.is_empty() { "失败" } else { err };
@@ -2031,6 +2383,7 @@ fn cmd_list(args: &[String]) -> Res<i32> {
             if active.is_empty() { "none" } else { active }
         );
     }
+    print_duplicate_quota_warnings(&snap);
     println!("Next: delegate agy account use <id> | delegate agy account status --quota");
     Ok(0)
 }
@@ -2062,6 +2415,7 @@ fn cmd_status(args: &[String]) -> Res<i32> {
     if b(&snap, "liveDrifted") {
         println!("warning: live credentials differ from active slot");
     }
+    print_duplicate_quota_warnings(&snap);
     if let Some(cur) = accounts.iter().find(|a| b(a, "active")) {
         let last_used = s(cur, "lastUsedAt");
         if !last_used.is_empty() {
@@ -2092,28 +2446,57 @@ fn cmd_status(args: &[String]) -> Res<i32> {
                 .map(format_age_compact)
                 .unwrap_or_else(|| "-".to_string());
             let fetched = s(q, "fetchedAt");
-            println!("real quota (agy -p /usage, {age}, fetched {fetched}):");
-            if !b(q, "ok") {
-                println!("  error: {}", s(q, "error"));
-            }
-            if let Some(entries) = q["entries"].as_array() {
-                for e in entries {
-                    let pool = s(e, "pool");
-                    let wlabel = s(e, "windowLabel");
-                    let pct = e["remainingPct"].as_f64().unwrap_or(0.0);
-                    let reset_part = match (e["resetInSeconds"].as_i64(), s(e, "resetAt")) {
-                        (Some(rem), at) if !at.is_empty() => {
-                            format!(" · reset in {} ({at})", format_countdown_compact(rem))
-                        }
-                        (_, at) if !at.is_empty() => format!(" · reset {at}"),
-                        _ => String::new(),
-                    };
-                    println!("  - {pool} | {wlabel}: {pct:.0}%{reset_part}");
+            let mismatch = b(q, "identityMismatch");
+            if mismatch {
+                let exp = s(q, "expectedEmail");
+                let obs = s(q, "observedEmail");
+                let detail = match (!exp.is_empty(), !obs.is_empty()) {
+                    (true, true) => format!("（期望 {exp}，实际 {obs}）"),
+                    (true, false) => format!("（期望 {exp}，实际身份未知）"),
+                    _ => String::new(),
+                };
+                println!("real quota (agy -p /usage, {IDENTITY_MISMATCH_MSG}):");
+                println!("  warning: {IDENTITY_MISMATCH_MSG}{detail}");
+                if let Some(entries) = q["entries"].as_array().filter(|a| !a.is_empty()) {
+                    println!("  cached prior quota ({age}, fetched {fetched}):");
+                    for e in entries {
+                        let pool = s(e, "pool");
+                        let wlabel = s(e, "windowLabel");
+                        let pct = e["remainingPct"].as_f64().unwrap_or(0.0);
+                        let reset_part = match (e["resetInSeconds"].as_i64(), s(e, "resetAt")) {
+                            (Some(rem), at) if !at.is_empty() => {
+                                format!(" · reset in {} ({at})", format_countdown_compact(rem))
+                            }
+                            (_, at) if !at.is_empty() => format!(" · reset {at}"),
+                            _ => String::new(),
+                        };
+                        println!("  - {pool} | {wlabel}: {pct:.0}%{reset_part}");
+                    }
                 }
-            }
-            if let Some(unk) = q["unknownLines"].as_array() {
-                for line in unk.iter().filter_map(Value::as_str) {
-                    println!("  [raw] {line}");
+            } else {
+                println!("real quota (agy -p /usage, {age}, fetched {fetched}):");
+                if !b(q, "ok") {
+                    println!("  error: {}", s(q, "error"));
+                }
+                if let Some(entries) = q["entries"].as_array() {
+                    for e in entries {
+                        let pool = s(e, "pool");
+                        let wlabel = s(e, "windowLabel");
+                        let pct = e["remainingPct"].as_f64().unwrap_or(0.0);
+                        let reset_part = match (e["resetInSeconds"].as_i64(), s(e, "resetAt")) {
+                            (Some(rem), at) if !at.is_empty() => {
+                                format!(" · reset in {} ({at})", format_countdown_compact(rem))
+                            }
+                            (_, at) if !at.is_empty() => format!(" · reset {at}"),
+                            _ => String::new(),
+                        };
+                        println!("  - {pool} | {wlabel}: {pct:.0}%{reset_part}");
+                    }
+                }
+                if let Some(unk) = q["unknownLines"].as_array() {
+                    for line in unk.iter().filter_map(Value::as_str) {
+                        println!("  [raw] {line}");
+                    }
                 }
             }
         }
@@ -2804,7 +3187,7 @@ fn cmd_import_agy_swap(args: &[String]) -> Res<i32> {
 
                 // If this account is currently live, also capture any newer live token files without mutating live $HOME.
                 if matches_live {
-                    let _ = save_live_to_slot(&home_dir, &sdir)?;
+                    let _ = save_live_to_slot_checked(&home_dir, &sdir, email)?;
                 }
 
                 let existing_added = state["accounts"][&slot_id]["addedAt"]
@@ -3757,5 +4140,110 @@ BadRow\tWeekly Limit Remaining\tnot-a-pct\t2026-11-30T00:00:00Z
                 assert!(!envs_live.contains_key(key));
             }
         }
+    }
+
+    #[test]
+    fn live_email_prioritizes_antigravity_cli_token_over_stale_google_accounts() {
+        let base = TempHome::create().unwrap();
+        let h = &base.path;
+        fs::create_dir_all(h.join(".gemini/antigravity-cli")).unwrap();
+        fs::write(
+            h.join(".gemini/google_accounts.json"),
+            r#"{"active":"jzy@example.test","old":[]}"#,
+        )
+        .unwrap();
+        // Before cli token exists, falls back to google_accounts.json.
+        assert_eq!(live_email(h).as_deref(), Some("jzy@example.test"));
+
+        // When a long-lived agy process overwrites antigravity-cli/antigravity-oauth-token
+        // with another account without touching google_accounts.json, live_email must report it.
+        fs::write(
+            h.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            make_test_token_json("guimond@example.test", "AT-G", "2026-11-25T19:50:07Z"),
+        )
+        .unwrap();
+        assert_eq!(live_email(h).as_deref(), Some("guimond@example.test"));
+        let all = collect_home_cred_emails(h);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].1, "guimond@example.test");
+        assert_eq!(all[1].1, "jzy@example.test");
+    }
+
+    #[test]
+    fn verify_slot_identity_checks_creds_output_and_agy_logs() {
+        let out = "\
+Account: beta@example.test
+Gemini Models\tWeekly Limit Remaining\t50%\t2026-11-30T20:09:03Z
+Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary\"
+";
+        let out_emails = extract_identity_emails_from_output(out);
+        assert_eq!(out_emails, vec!["beta@example.test".to_string()]);
+
+        let base = TempHome::create().unwrap();
+        let log_dir = base.path.join(".gemini/antigravity-cli/log");
+        fs::create_dir_all(&log_dir).unwrap();
+        fs::write(
+            log_dir.join("cli-test.log"),
+            "I1125 19:02:06 server_oauth.go:221] applyAuthResult: email=beta@example.test, authMethod=consumer\n\
+             I1125 19:02:06 server_oauth.go:226] OAuth: authenticated successfully as beta@example.test\n",
+        )
+        .unwrap();
+        let log_emails = extract_identity_emails_from_agy_logs(&base.path);
+        assert_eq!(log_emails, vec!["beta@example.test".to_string()]);
+
+        let alpha_creds = vec![(
+            ".gemini/antigravity-cli/antigravity-oauth-token",
+            "alpha@example.test".to_string(),
+        )];
+        assert!(verify_slot_identity("alpha@example.test", &alpha_creds, &[], &[]).is_ok());
+        // Output or log reporting beta when target is alpha must fail with observed = beta.
+        assert_eq!(
+            verify_slot_identity("alpha@example.test", &alpha_creds, &out_emails, &[]),
+            Err("beta@example.test".to_string())
+        );
+        assert_eq!(
+            verify_slot_identity("alpha@example.test", &alpha_creds, &[], &log_emails),
+            Err("beta@example.test".to_string())
+        );
+        // Zero observed identities when target email is known must fail closed.
+        assert_eq!(
+            verify_slot_identity("alpha@example.test", &[], &[], &[]),
+            Err(String::new())
+        );
+    }
+
+    #[test]
+    fn find_duplicate_quota_slot_groups_requires_exact_match_including_reset_at() {
+        let same_entries = json!([
+            {"pool":"Gemini Models","window":"weekly","windowLabel":"Weekly Limit Remaining","remainingPct":50.0,"resetAt":"2026-11-30T20:09:03Z"},
+            {"pool":"Claude and GPT models","window":"weekly","windowLabel":"Weekly Limit Remaining","remainingPct":90.0,"resetAt":"2026-11-27T02:47:42Z"}
+        ]);
+        let diff_reset = json!([
+            {"pool":"Gemini Models","window":"weekly","windowLabel":"Weekly Limit Remaining","remainingPct":50.0,"resetAt":"2026-11-30T20:03:02Z"},
+            {"pool":"Claude and GPT models","window":"weekly","windowLabel":"Weekly Limit Remaining","remainingPct":90.0,"resetAt":"2026-11-27T02:47:42Z"}
+        ]);
+
+        let dup_accounts = vec![
+            json!({"id":"guimond","quota":{"ok":true,"entries":same_entries}}),
+            json!({"id":"jzy","quota":{"ok":true,"entries":same_entries}}),
+        ];
+        assert_eq!(
+            find_duplicate_quota_slot_groups(&dup_accounts),
+            vec![vec!["guimond".to_string(), "jzy".to_string()]]
+        );
+
+        // Same percentages but different resetAt must NOT trigger duplicate warning.
+        let distinct_accounts = vec![
+            json!({"id":"guimond","quota":{"ok":true,"entries":same_entries}}),
+            json!({"id":"jzy","quota":{"ok":true,"entries":diff_reset}}),
+        ];
+        assert!(find_duplicate_quota_slot_groups(&distinct_accounts).is_empty());
+
+        // Empty entries must NOT trigger duplicate warning.
+        let empty_accounts = vec![
+            json!({"id":"guimond","quota":{"ok":false,"entries":[]}}),
+            json!({"id":"jzy","quota":{"ok":false,"entries":[]}}),
+        ];
+        assert!(find_duplicate_quota_slot_groups(&empty_accounts).is_empty());
     }
 }

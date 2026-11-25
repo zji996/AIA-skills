@@ -2867,6 +2867,10 @@ fn parse_real_quota(v: &Value) -> Option<AccountRealQuota> {
     }
     let age_seconds = v.get("ageSeconds").and_then(Value::as_u64).unwrap_or(0);
     let ok = v.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let identity_mismatch = v
+        .get("identityMismatch")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let error = v
         .get("error")
         .and_then(Value::as_str)
@@ -2909,6 +2913,7 @@ fn parse_real_quota(v: &Value) -> Option<AccountRealQuota> {
         fetched_epoch,
         age_seconds,
         ok,
+        identity_mismatch,
         error,
         entries,
         unknown_lines,
