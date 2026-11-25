@@ -705,6 +705,14 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
     if !next.is_empty() {
         parts.push(format!("下一步：{next}"));
     }
+    if !b(status, "cleaned") && status["eta"].is_object() {
+        let eta_obj = &status["eta"];
+        let eta_stage = s(eta_obj, "stage");
+        let short_text = s(eta_obj, "shortText");
+        if eta_stage != "done" && !short_text.is_empty() {
+            parts.push(short_text.to_string());
+        }
+    }
     parts.join(" · ")
 }
 
@@ -758,6 +766,14 @@ pub fn format_source_drift(drift: &Value) -> Option<String> {
 /// Concise summary line followed by indented path details for `delegate status <run>`.
 pub fn human_detail(run: &Path, status: &Value) -> String {
     let mut lines = vec![human(run, status)];
+    if !b(status, "cleaned") && status["eta"].is_object() {
+        let eta_obj = &status["eta"];
+        let eta_stage = s(eta_obj, "stage");
+        let detail_text = s(eta_obj, "detailText");
+        if eta_stage != "done" && !detail_text.is_empty() {
+            lines.push(format!("  {detail_text}"));
+        }
+    }
     let summary_path = run.join("summary.json");
     let meta = json(run.join("meta.json"));
     if status["stallWarning"].is_object() {
@@ -1169,5 +1185,69 @@ mod tests {
         assert!(detail.contains("待办（未完成 2 / 共 2）"), "{detail}");
         assert!(detail.contains("1. [ ] 换线上服务 (2026-11-22T02:00:00Z)"), "{detail}");
         assert!(detail.contains("2. [ ] 真机验证 (2026-11-22T02:01:00Z)"), "{detail}");
+    }
+
+    #[test]
+    fn eta_appends_one_tail_segment_on_l0_and_breakdown_line_in_detail() {
+        let dummy = Path::new("/nonexistent/delegate-test-eta");
+        let active = json!({
+            "run": "20261125-030000-feat",
+            "name": "feat-eta",
+            "state": "running",
+            "elapsedSeconds": 240,
+            "agent": "pi",
+            "tier": "write",
+            "eta": {
+                "stage": "review_parallel",
+                "shortText": "预计 03:40 交付（p75 04:10）",
+                "detailText": "预估：03:40 交付（p75 04:10）〔慢层+审查 4m，剩 ~6m；返工率 28%〕"
+            }
+        });
+        let l0 = human_line(dummy, &active, true);
+        assert!(l0.ends_with(" · 预计 03:40 交付（p75 04:10）"), "{l0}");
+        let det = human_detail(dummy, &active);
+        let det_lines: Vec<&str> = det.lines().collect();
+        assert_eq!(det_lines.len(), 2, "{det}");
+        assert_eq!(
+            det_lines[1],
+            "  预估：03:40 交付（p75 04:10）〔慢层+审查 4m，剩 ~6m；返工率 28%〕"
+        );
+
+        let blocked = json!({
+            "run": "20261125-030001-sign",
+            "name": "sign-eta",
+            "state": "delivered",
+            "elapsedSeconds": 300,
+            "agent": "pi",
+            "tier": "write",
+            "eta": {
+                "stage": "blocked",
+                "stoppedClock": true,
+                "shortText": "卡在主控·待签字 18m",
+                "detailText": "停表：卡在主控·待签字 18m"
+            }
+        });
+        let l0_blk = human_line(dummy, &blocked, true);
+        assert!(l0_blk.ends_with(" · 卡在主控·待签字 18m"), "{l0_blk}");
+        let det_blk = human_detail(dummy, &blocked);
+        assert!(det_blk.contains("  停表：卡在主控·待签字 18m"), "{det_blk}");
+
+        let done = json!({
+            "run": "20261125-030002-done",
+            "name": "done-eta",
+            "state": "delivered",
+            "applied": true,
+            "elapsedSeconds": 300,
+            "agent": "pi",
+            "tier": "write",
+            "eta": {
+                "stage": "done",
+                "shortText": "已合入",
+                "detailText": "已合入"
+            }
+        });
+        let l0_done = human_line(dummy, &done, true);
+        assert_eq!(l0_done.matches("已合入").count(), 1, "{l0_done}");
+        assert_eq!(human_detail(dummy, &done).lines().count(), 1);
     }
 }

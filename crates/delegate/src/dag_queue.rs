@@ -992,17 +992,44 @@ fn list_cmd(args: &[String]) -> Res<i32> {
         }
     }
     let state = state_dir();
-    let items: Vec<Value> = load_items(&state)
-        .into_iter()
+    let all_items = load_items(&state);
+    let items: Vec<Value> = all_items
+        .iter()
         .filter(|i| show_all || s(i, "status") != "cancelled")
+        .cloned()
         .collect();
-    if json_mode {
-        for item in &items {
-            println!("{item}");
+    if items.is_empty() {
+        if !json_mode {
+            println!("续派队列为空");
         }
-    } else if items.is_empty() {
-        println!("续派队列为空");
+        return Ok(0);
+    }
+
+    let now_ts = epoch() as i64;
+    let mut visible_runs = crate::runs::all_runs();
+    for mrun in crate::launch::machine_runs(&state) {
+        if !visible_runs.contains(&mrun) {
+            visible_runs.push(mrun);
+        }
+    }
+    let eta_model = crate::speed::load_or_refresh_eta_model_in(&state, now_ts, true);
+    let eta_ctx = crate::eta::LiveContext::capture(&state, now_ts, &visible_runs);
+    let dag = crate::eta::estimate_queue_dag_in(&all_items, None, &eta_model, &eta_ctx);
+
+    if json_mode {
+        let by_name: std::collections::HashMap<&str, &crate::eta::WorkItemEta> =
+            dag.items.iter().map(|it| (it.id.as_str(), it)).collect();
+        for item in &items {
+            let mut out = item.clone();
+            if let Some(ie) = by_name.get(s(item, "name")) {
+                out["eta"] = ie.to_json();
+            }
+            println!("{out}");
+        }
     } else {
+        if dag.write_chains > 0 || !dag.blockers.is_empty() {
+            println!("{}", dag.headline);
+        }
         for item in &items {
             println!("{}", format_item_human(item));
         }

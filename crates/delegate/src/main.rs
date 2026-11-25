@@ -2987,12 +2987,26 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 let mut head_cache: std::collections::HashMap<PathBuf, Option<String>> =
                     std::collections::HashMap::new();
                 let mut stale_repos = std::collections::BTreeSet::<PathBuf>::new();
+                let mut eta_env: Option<(speed::EtaModel, eta::LiveContext)> = None;
                 for x in &pos {
                     match runs::resolve_head(x) {
                         Ok(run) => {
                             let mut status = runs::status_detail(&run);
                             premerge::overlay_live_status(&mut status, &run, &mut head_cache);
                             premerge::collect_stale_repo(&run, &status, &mut stale_repos);
+                            let (eta_model, eta_ctx) = eta_env.get_or_insert_with(|| {
+                                let st = state_dir();
+                                let now_ts = epoch() as i64;
+                                let mut vis = runs::all_runs();
+                                if !vis.contains(&run) {
+                                    vis.push(run.clone());
+                                }
+                                (
+                                    speed::load_or_refresh_eta_model_in(&st, now_ts, true),
+                                    eta::LiveContext::capture(&st, now_ts, &vis),
+                                )
+                            });
+                            eta::overlay_status_eta(&mut status, &run, eta_model, eta_ctx);
                             if output::json_enabled() {
                                 if !include_files {
                                     if let Some(obj) = status.as_object_mut() {
@@ -3030,10 +3044,22 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 std::collections::HashMap::new();
             let mut stale_repos = std::collections::BTreeSet::<PathBuf>::new();
             if show_all {
+                let eta_env = if !all.is_empty() {
+                    let now_ts = epoch() as i64;
+                    Some((
+                        speed::load_or_refresh_eta_model_in(&state_root, now_ts, true),
+                        eta::LiveContext::capture(&state_root, now_ts, &all),
+                    ))
+                } else {
+                    None
+                };
                 for run in &all {
                     let mut status = index::status_cached(run, &idx, &wsig);
                     premerge::overlay_live_status(&mut status, run, &mut head_cache);
                     premerge::collect_stale_repo(run, &status, &mut stale_repos);
+                    if let Some((ref eta_model, ref eta_ctx)) = eta_env {
+                        eta::overlay_status_eta(&mut status, run, eta_model, eta_ctx);
+                    }
                     if output::json_enabled() {
                         if !include_files {
                             if let Some(obj) = status.as_object_mut() {
@@ -3209,6 +3235,16 @@ fn main_inner(args: &[String]) -> Res<i32> {
             let concurrency_pool = concurrency_plan
                 .as_ref()
                 .map(|plan| jobserver::inspect_pool_readonly(plan.pool_tokens, plan.budget));
+
+            if !shown.is_empty() {
+                let now_ts = epoch() as i64;
+                let shown_paths: Vec<PathBuf> = shown.iter().map(|(r, _)| r.clone()).collect();
+                let eta_model = speed::load_or_refresh_eta_model_in(&state_root, now_ts, true);
+                let eta_ctx = eta::LiveContext::capture(&state_root, now_ts, &shown_paths);
+                for (run, status) in &mut shown {
+                    eta::overlay_status_eta(status, run, &eta_model, &eta_ctx);
+                }
+            }
 
             if output::json_enabled() {
                 for (_run, status) in &shown {

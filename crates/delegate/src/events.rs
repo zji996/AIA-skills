@@ -1599,6 +1599,11 @@ pub fn wait_since(since: u64, run_filter: &[String], max: Option<f64>) -> Res<i3
         }
         let has_active = !crate::launch::machine_runs(&state_dir()).is_empty()
             || runs::all_runs().iter().any(|r| runs::active(&runs::state(r)));
+        if collected.is_empty() && has_active {
+            if let Some(eta_line) = crate::work::eta_hint_for_wait(&[], &[], None) {
+                println!("{eta_line}");
+            }
+        }
         if has_active {
             println!("继续等：{} wait --since {new_cursor}", script().display());
         }

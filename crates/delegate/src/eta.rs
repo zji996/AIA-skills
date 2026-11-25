@@ -1142,7 +1142,35 @@ fn parse_iso_or_date_epoch(value: &str) -> Option<i64> {
 /// Estimate remaining time for a single run, with stop-clock blocker attribution
 /// and real-time lane/capacity queue adjustment.
 pub fn estimate_run_in(run: &Path, model: &EtaModel, ctx: &LiveContext) -> RunEta {
-    estimate_run_inner(run, model, ctx, false)
+    estimate_run_inner(run, None, model, ctx, false)
+}
+
+/// Estimate remaining time for a single run, reusing an already-computed `status` JSON object
+/// to avoid redundant disk reads on hot read paths (`status`, `work show`).
+pub fn estimate_run_with_status(
+    run: &Path,
+    status: &Value,
+    model: &EtaModel,
+    ctx: &LiveContext,
+) -> RunEta {
+    estimate_run_inner(run, Some(status), model, ctx, false)
+}
+
+/// Overlay a structured `eta` object onto a `status` JSON map (skipping `cleaned`,
+/// `stopped`, and `Stage::Done` runs). Strictly zero-lock and zero-token.
+pub fn overlay_status_eta(
+    status: &mut Value,
+    run: &Path,
+    model: &EtaModel,
+    ctx: &LiveContext,
+) {
+    if !status.is_object() || b(status, "cleaned") || s(status, "state") == "stopped" {
+        return;
+    }
+    let re = estimate_run_with_status(run, status, model, ctx);
+    if re.stage != Stage::Done {
+        status["eta"] = re.to_json();
+    }
 }
 
 /// Convenience wrapper loading `<state>/eta-model.json` (lazily rebuilding if stale)
@@ -1159,13 +1187,21 @@ pub fn estimate_run(run: &Path) -> RunEta {
 
 fn estimate_run_inner(
     run: &Path,
+    precomputed_status: Option<&Value>,
     model: &EtaModel,
     ctx: &LiveContext,
     in_capacity_recursion: bool,
 ) -> RunEta {
     let now_ts = ctx.now_ts;
     let meta = json(run.join("meta.json"));
-    let status = runs::status(run);
+    let owned_status;
+    let status = match precomputed_status {
+        Some(st) => st,
+        None => {
+            owned_status = runs::status(run);
+            &owned_status
+        }
+    };
     let run_id = run_id_from(run, &meta);
     let name = {
         let nm = s(&meta, "name");
@@ -1180,7 +1216,7 @@ fn estimate_run_inner(
     let raw_tier = s(&meta, "tier");
     let (norm_mode, norm_class) = speed::normalize_mode_class(raw_mode, raw_class, raw_tier);
     let is_write = norm_mode == "write";
-    let state = s(&status, "state").to_string();
+    let state = s(status, "state").to_string();
 
     let resolved_bucket = model.resolve_bucket(&repo, &norm_mode, &norm_class);
     let rework_rate = resolved_bucket.bucket.auto_rework_rate;
@@ -1230,8 +1266,8 @@ fn estimate_run_inner(
     };
 
     // 0. Done check: applied write run or answered/delivered read-only run (without question).
-    let applied = b(&status, "applied") || run.join(".applied").exists();
-    if applied || (!is_write && matches!(state.as_str(), "answered" | "delivered") && !b(&status, "question")) {
+    let applied = b(status, "applied") || run.join(".applied").exists();
+    if applied || (!is_write && matches!(state.as_str(), "answered" | "delivered") && !b(status, "question")) {
         return RunEta {
             run: run_id,
             name,
@@ -1265,7 +1301,7 @@ fn estimate_run_inner(
     }
 
     let is_active = runs::active(&state);
-    let finished_ts = iso_epoch(s(&status, "finishedAt"));
+    let finished_ts = iso_epoch(s(status, "finishedAt"));
     let stopped_age = finished_ts.map(|t| (now_ts - t).max(0));
 
     // 1. Stop-clock checks for active runs: stallWarning or memory capacity wait.
@@ -1293,7 +1329,7 @@ fn estimate_run_inner(
 
     // 2. Non-active runs: either S7 premerge running, or stopped-clock attributed to someone.
     if !is_active {
-        if b(&status, "question") || state == "question" {
+        if b(status, "question") || state == "question" {
             let age_str = stopped_age.map(|a| format!(" {}", format_age_short(a))).unwrap_or_default();
             return make_stopped(
                 Stage::Blocked,
@@ -1995,7 +2031,7 @@ fn estimate_capacity_wait(
             if scope_repo && !repo.is_empty() && repo_from_meta(&ometa) != repo {
                 continue;
             }
-            let oeta = estimate_run_inner(other, model, ctx, true);
+            let oeta = estimate_run_inner(other, None, model, ctx, true);
             if let Some(d) = oeta.to_delivered {
                 active_rems.push((d.p50_sec, d.p75_sec));
             }
@@ -3160,6 +3196,170 @@ pub fn estimate_queue_dag_in(
     }
 }
 
+/// Format a single tail ETA line for `delegate wait` / `delegate wait --since` (design.md §4):
+/// e.g. `其余 4 条在跑：最早 02:55（feat-a），本波约 03:40 交付；链 [W12→W15] 剩 2 步，约 06:30 合入`.
+/// Returns `None` when no other runs are active and no open work DAG chains remain.
+pub fn format_wait_tail_eta(
+    active_runs: &[PathBuf],
+    settled_ids: &HashSet<String>,
+    items: &[WorkItem],
+    repo_filter: Option<&str>,
+    model: &EtaModel,
+    ctx: &LiveContext,
+) -> Option<String> {
+    let now_ts = ctx.now_ts;
+    let mut seen_run: HashSet<String> = HashSet::new();
+    let mut active_etas: Vec<RunEta> = Vec::new();
+    for rdir in active_runs {
+        let meta = json(rdir.join("meta.json"));
+        let rid = run_id_from(rdir, &meta);
+        let fname = rdir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        if rid.is_empty()
+            || settled_ids.contains(&rid)
+            || (!fname.is_empty() && settled_ids.contains(&fname))
+            || !seen_run.insert(rid)
+        {
+            continue;
+        }
+        if !runs::active(&runs::state(rdir)) {
+            continue;
+        }
+        let re = estimate_run_in(rdir, model, ctx);
+        if re.stage != Stage::Done {
+            active_etas.push(re);
+        }
+    }
+
+    let mut segs: Vec<String> = Vec::new();
+
+    if !active_etas.is_empty() {
+        let moving: Vec<&RunEta> = active_etas
+            .iter()
+            .filter(|r| r.blocker.is_none() && r.to_delivered.is_some())
+            .collect();
+        let stopped_n = active_etas.len().saturating_sub(moving.len());
+        if active_etas.len() == 1 {
+            if let Some(r) = moving.first() {
+                let d = r.to_delivered.as_ref().unwrap();
+                let verb = if r.mode == "write" { "交付" } else { "答复" };
+                let clk = if d.p50_sec < 300.0 {
+                    "<5m".to_string()
+                } else {
+                    format_clock(d.rounded_p50_at, now_ts)
+                };
+                segs.push(format!(
+                    "其余 1 条在跑：{} 预计 {} {}",
+                    clip(&r.name, 20),
+                    clk,
+                    verb
+                ));
+            } else {
+                let r = &active_etas[0];
+                segs.push(format!(
+                    "其余 1 条在跑：{}（{}）",
+                    clip(&r.name, 20),
+                    r.short_text
+                ));
+            }
+        } else if !moving.is_empty() {
+            let earliest = moving
+                .iter()
+                .min_by(|a, b| {
+                    let da = a.to_delivered.as_ref().unwrap();
+                    let db = b.to_delivered.as_ref().unwrap();
+                    da.rounded_p50_at
+                        .cmp(&db.rounded_p50_at)
+                        .then_with(|| da.p50_sec.total_cmp(&db.p50_sec))
+                        .then_with(|| a.name.cmp(&b.name))
+                })
+                .unwrap();
+            let wave_end = moving
+                .iter()
+                .max_by(|a, b| {
+                    let da = a.to_delivered.as_ref().unwrap();
+                    let db = b.to_delivered.as_ref().unwrap();
+                    da.rounded_p50_at
+                        .cmp(&db.rounded_p50_at)
+                        .then_with(|| da.p50_sec.total_cmp(&db.p50_sec))
+                })
+                .unwrap();
+            let ed = earliest.to_delivered.as_ref().unwrap();
+            let wd = wave_end.to_delivered.as_ref().unwrap();
+            let e_clk = if ed.p50_sec < 300.0 {
+                "<5m".to_string()
+            } else {
+                format_clock(ed.rounded_p50_at, now_ts)
+            };
+            let w_clk = if wd.p50_sec < 300.0 {
+                "<5m".to_string()
+            } else {
+                format_clock(wd.rounded_p50_at, now_ts)
+            };
+            let stopped_note = if stopped_n > 0 {
+                format!("（{stopped_n} 条停表）")
+            } else {
+                String::new()
+            };
+            segs.push(format!(
+                "其余 {} 条在跑：最早 {}（{}），本波约 {} 交付{}",
+                active_etas.len(),
+                e_clk,
+                clip(&earliest.name, 20),
+                w_clk,
+                stopped_note
+            ));
+        } else {
+            let first = &active_etas[0];
+            segs.push(format!(
+                "其余 {} 条在跑均停表：{}（{}）",
+                active_etas.len(),
+                clip(&first.name, 20),
+                first.short_text
+            ));
+        }
+    }
+
+    if !items.is_empty() {
+        let effective_repo = repo_filter.filter(|rf| {
+            items.iter().any(|w| {
+                w.owner.is_none()
+                    && w.state != "done"
+                    && speed::repo_matches_filter(&w.repo, &speed::short_repo_name(&w.repo), rf)
+            })
+        });
+        let dag = estimate_work_dag_in(items, effective_repo, model, ctx);
+        if dag.write_chains > 0 && !dag.critical_path.is_empty() {
+            let chain_str = if dag.critical_path.len() <= 3 {
+                dag.critical_path.join("→")
+            } else {
+                format!(
+                    "{}→…→{}",
+                    dag.critical_path.first().unwrap(),
+                    dag.critical_path.last().unwrap()
+                )
+            };
+            let steps = dag.depth.max(1);
+            if let Some(p50_at) = dag.earliest_finish_p50_at {
+                let c50 = format_clock(round_eta_epoch(now_ts, p50_at), now_ts);
+                let prior = if dag.is_prior { "(初估)" } else { "" };
+                segs.push(format!("链 [{chain_str}] 剩 {steps} 步，约 {c50} 合入{prior}"));
+            }
+        } else if !dag.owner_blocked.is_empty() {
+            segs.push(format!("工作表停表：{} 项卡所有者", dag.owner_blocked.len()));
+        }
+    }
+
+    if segs.is_empty() {
+        None
+    } else {
+        Some(segs.join("；"))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CLI entrypoint: `delegate eta [<run>|<Wxx>] [--work] [--queue] [--repo PATH] [--all] [--json]`
 // ---------------------------------------------------------------------------
@@ -3761,6 +3961,79 @@ mod tests {
         let pdag = estimate_queue_dag_in(&paused_q, None, &model, &ctx);
         assert_eq!(pdag.blockers.len(), 1);
         assert!(pdag.headline.contains("停表"), "got {}", pdag.headline);
+
+        let _ = fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn wait_tail_eta_combines_active_wave_and_work_chain() {
+        let state = temp_dir("wait_tail");
+        let now = 1_800_000_000_i64;
+        let repo = "/work/wrepo";
+        let model = populated_model(&state, repo, now);
+
+        let run_a = state.join("runs/r-a");
+        let run_b = state.join("runs/r-b");
+        fs::create_dir_all(&run_a).unwrap();
+        fs::create_dir_all(&run_b).unwrap();
+        let started_a = format_epoch(now - 900, false, "%Y-%m-%dT%H:%M:%SZ");
+        let started_b = format_epoch(now - 60, false, "%Y-%m-%dT%H:%M:%SZ");
+        write_json(
+            run_a.join("meta.json"),
+            &json!({"run": "r-a", "name": "feat-a", "mode": "write", "class": "build", "top": repo, "startedAt": started_a}),
+        )
+        .unwrap();
+        write_json(
+            run_b.join("meta.json"),
+            &json!({"run": "r-b", "name": "feat-b", "mode": "write", "class": "build", "top": repo, "startedAt": started_b}),
+        )
+        .unwrap();
+        fs::write(run_a.join("supervisor.pid"), std::process::id().to_string()).unwrap();
+        fs::write(run_b.join("supervisor.pid"), std::process::id().to_string()).unwrap();
+
+        let w1 = WorkItem {
+            id: "W012".into(),
+            repo: repo.into(),
+            title: "链1".into(),
+            state: "active".into(),
+            class: "feat".into(),
+            runs: vec!["r-a".into()],
+            run_dirs: BTreeMap::from([("r-a".into(), run_a.to_string_lossy().into_owned())]),
+            ..Default::default()
+        };
+        let w2 = WorkItem {
+            id: "W015".into(),
+            repo: repo.into(),
+            title: "链2".into(),
+            state: "blocked".into(),
+            class: "feat".into(),
+            wait_on: vec!["work_applied:W012".into()],
+            ..Default::default()
+        };
+        let items = vec![w1, w2];
+
+        let mut run_dir_index = HashMap::new();
+        run_dir_index.insert("r-a".into(), run_a.clone());
+        run_dir_index.insert("r-b".into(), run_b.clone());
+        let ctx = LiveContext {
+            now_ts: now,
+            run_dir_index,
+            ..Default::default()
+        };
+
+        let line = format_wait_tail_eta(
+            &[run_a.clone(), run_b.clone()],
+            &HashSet::new(),
+            &items,
+            Some(repo),
+            &model,
+            &ctx,
+        )
+        .expect("should produce tail ETA line");
+        assert!(line.contains("其余 2 条在跑：最早 "), "{line}");
+        assert!(line.contains("（feat-a）"), "{line}");
+        assert!(line.contains("本波约 "), "{line}");
+        assert!(line.contains("；链 [W012→W015] 剩 2 步，约 "), "{line}");
 
         let _ = fs::remove_dir_all(&state);
     }

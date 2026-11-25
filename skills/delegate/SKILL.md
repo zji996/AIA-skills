@@ -43,7 +43,7 @@ $D wait                                                                  # 放�
 | 统一工作表、补位与 Stop 钩子 | `$D work`（6 列紧凑表并入未绑定 run，缺类别标「缺类别」）、`work show/add/wait/close/drop/defer/import-md/import-dag`（`--class feat\|unblock\|infra\|docs`、`import-dag` 批量导依赖图、`--needs-owner` 建 Q、`--after-applied <run\|Wxx>` 合入解锁且默认关项，需验加 `--needs-verify`/`apply --keep-open`）、`start --work <ID>`；`.delegate.json` 配 `fill`/`hotspots` 按价值配额补位（只数写链、避热点），`$D fill stats` 报停止线（不自动降档）；零锁 Stop 钩子（`$D hook check --format claude\|agy\|json` 单件渐进披露与卡链 30m 穿透）+ `$D hook pending`/`stats`，见 [工作表](references/worktable.md) |
 | `/clear` 前交接 / 接手 / 查历史与看板 | `$D handoff` 写交接索引；`/clear` 后 `$D adopt <run>…` 接手整链 caller；`$D history [词…]` / `$D show <run>` / `$D board` |
 | 终端看板与 agy 账号/额度 | `$D tui`（`0`/`O` 总览图表、`6`/`A` 账号与真实额度、`Q` 刷新、`Enter`/`u` 切换）；`$D agy account list\|status [--quota]\|add\|use\|note\|remove\|import-agy-swap\|restore-entry`（经 `agy -p /usage` 取真实额度，不自动换号）；`$D usage [--since 24h\|7d] [--by account\|day\|run\|repo] [--json]`，见 [agy 账号与用量](references/agy-accounts.md) |
-| 工期参数校准 | `$D speed [--since 7d\|14d\|all] [--repo PATH] [--json]` 算 `t_chain`/`t_crit`/`P_eff`/`T_merge` 与漂移，见 [容量与工期](references/capacity.md) |
+| 工期校准与进度预估 | `$D speed [--backtest]` 算 `t_chain`/`t_crit`/`P_eff`/`T_merge` 与回测，`$D eta [<run>\|<Wxx>\|--work\|--queue]` 查预估与停表归责（`status`/`work`/`queue`/`wait` 已直显），见 [容量与工期](references/capacity.md) |
 
 `start`/`run` 派发前比对在跑与近 14 天 `history`，相似时在 stderr 提示最多 3 条（只提示不拦截）。
 

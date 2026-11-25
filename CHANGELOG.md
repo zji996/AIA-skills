@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `delegate`：ETA CLI 展示接入与文档（链 3）——`status` L0 行尾追加单段预估/停表归责、`status <run>` 展开阶段拆解行且 `--json` 附结构化 `eta` 对象；`work` L0 首行追加关键路径研发墙钟汇总与外部等待/所有者计数、L1 守住 6 列与 100 字上限并在 `focus` 列内嵌 `~HH:MM`/`等Wxx(~HH:MM)`/`卡所有者Qxx`、`work show` 列出上游关键路径拆解；`queue list` 顶部展示 `DAG 关键路径`（`--json` 每项附 `eta`）；`wait`/`wait --since` 尾部追加其余在跑波次与剩余工作链预估行；同步更新 `references/capacity.md` 与 `SKILL.md` 同行指针（不增篇幅预算）。
 - `delegate`：ETA 引擎与离线回测（链 2）——新增纯计算零锁无 token 模块 `eta.rs`（单 run 阶段条件剩余寿命与根号 p75 合成、实时重活 lane 排队与容量排队折算、停表归责显示「卡在谁」含提问/预合并冲突/待签字/待合入/主干阻塞两路识别/疑似卡住停表/等内存释放、工作表与 `dag-queue` 拓扑关键路径分离 `after_time` 外部 EST 与 `owner:Qxx` 所有者阻塞、高并发 `P_eff` 封顶与 lane 拥堵附加项）及 `delegate eta` 子命令；`delegate speed` 新增 `--backtest` 严格因果 14 天滚动回测输出起跑/中段/合入链的 p75 覆盖率（65%–85% 健康区间与 `<60%`/`>90%` 告警）与 p50 中位相对偏差，并在常规 `delegate speed` 附回测摘要。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
 

@@ -4038,180 +4038,257 @@ pub fn on_runs_applied_with_options(
     hints
 }
 
-/// Timely tail hints for `delegate wait` / `wait --since` (1–4 lines, each with pointer).
+/// Single-line tail ETA summary for `delegate wait` / `delegate wait --since` (design.md §4).
+/// Lock-free and zero-token; returns `None` when nothing else is active and no open work DAG remains.
+pub fn eta_hint_for_wait(settled_runs: &[PathBuf], extra_settled_ids: &[String], repo_hint: Option<&str>) -> Option<String> {
+    let state = state_dir();
+    let now_ts = epoch() as i64;
+    let mut settled_ids: HashSet<String> = extra_settled_ids.iter().cloned().collect();
+    for rdir in settled_runs {
+        if let Some(fname) = rdir.file_name().and_then(|n| n.to_str()) {
+            if !fname.is_empty() {
+                settled_ids.insert(fname.to_string());
+            }
+        }
+        let meta = json(rdir.join("meta.json"));
+        let rid = events::run_id_for(rdir, &meta);
+        if !rid.is_empty() {
+            settled_ids.insert(rid);
+        }
+    }
+
+    let mut active_runs: Vec<PathBuf> = Vec::new();
+    let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+    for rdir in runs::all_runs().into_iter().chain(crate::launch::machine_runs(&state)) {
+        if seen_paths.insert(rdir.clone()) && runs::active(&runs::state(&rdir)) {
+            let fname = rdir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !settled_ids.contains(fname) {
+                active_runs.push(rdir);
+            }
+        }
+    }
+
+    let items = if work_path(&state).is_file() {
+        load_readonly_in(&state)
+    } else {
+        Vec::new()
+    };
+    let has_open_work = items.iter().any(|w| w.owner.is_none() && w.state != "done");
+    if active_runs.is_empty() && !has_open_work {
+        return None;
+    }
+
+    let model = crate::speed::load_or_refresh_eta_model_in(&state, now_ts, true);
+    let ctx = crate::eta::LiveContext::capture(&state, now_ts, &active_runs);
+    crate::eta::format_wait_tail_eta(&active_runs, &settled_ids, &items, repo_hint, &model, &ctx)
+}
+
+/// Timely tail hints for `delegate wait` / `wait --since` (1–4 lines, each with pointer,
+/// plus a single tail ETA summary line when other runs or work chains remain).
 pub fn hints_for_wait(settled_runs: &[PathBuf]) -> Vec<String> {
     let state = state_dir();
-    if settled_runs.is_empty() || !work_path(&state).is_file() {
+    if settled_runs.is_empty() {
         return Vec::new();
     }
-    let items = load_readonly_in(&state);
-    if items.is_empty() {
-        return Vec::new();
-    }
+    let repo_hint = settled_runs.first().and_then(|r| {
+        let meta = json(r.join("meta.json"));
+        let top = s(&meta, "top");
+        if !top.is_empty() {
+            Some(top.to_string())
+        } else {
+            let wd = s(&meta, "workdir");
+            (!wd.is_empty()).then(|| wd.to_string())
+        }
+    });
 
     let mut hints = Vec::new();
-    let mut seen_work = HashSet::new();
+    if work_path(&state).is_file() {
+        let items = load_readonly_in(&state);
+        if !items.is_empty() {
+            let mut seen_work = HashSet::new();
+            for run_dir in settled_runs {
+                let meta = json(run_dir.join("meta.json"));
+                let rid = events::run_id_for(run_dir, &meta);
+                let wid = s(&meta, "workId");
+                let chain_ids = run_chain_ids_from_dir(run_dir, &state);
 
-    for run_dir in settled_runs {
-        let meta = json(run_dir.join("meta.json"));
-        let rid = events::run_id_for(run_dir, &meta);
-        let wid = s(&meta, "workId");
-        let chain_ids = run_chain_ids_from_dir(run_dir, &state);
+                // 1. Owning work item (1 line, matching across the full parent chain)
+                let mut owning_wids: HashSet<String> = HashSet::new();
+                if !wid.is_empty() {
+                    owning_wids.insert(wid.to_string());
+                }
+                if let Some(w) = items.iter().find(|w| {
+                    (!wid.is_empty() && w.id == wid) || chain_ids.iter().any(|cid| w.matches_run(cid))
+                }) {
+                    owning_wids.insert(w.id.clone());
+                    if seen_work.insert(w.id.clone()) {
+                        let ptr = if !w.brief.is_empty() {
+                            format!("卡片：delegate work show {} · 说明：{}", w.id, w.brief)
+                        } else {
+                            format!("卡片：delegate work show {}", w.id)
+                        };
+                        hints.push(format!(
+                            "所属工作项：[{}] {}（{} · {}）",
+                            w.id,
+                            clip_chars(&w.title, 30),
+                            w.state,
+                            ptr
+                        ));
+                    }
+                }
 
-        // 1. Owning work item (1 line, matching across the full parent chain)
-        let mut owning_wids: HashSet<String> = HashSet::new();
-        if !wid.is_empty() {
-            owning_wids.insert(wid.to_string());
-        }
-        if let Some(w) = items.iter().find(|w| {
-            (!wid.is_empty() && w.id == wid) || chain_ids.iter().any(|cid| w.matches_run(cid))
-        }) {
-            owning_wids.insert(w.id.clone());
-            if seen_work.insert(w.id.clone()) {
-                let ptr = if !w.brief.is_empty() {
-                    format!("卡片：delegate work show {} · 说明：{}", w.id, w.brief)
-                } else {
-                    format!("卡片：delegate work show {}", w.id)
-                };
-                hints.push(format!(
-                    "所属工作项：[{}] {}（{} · {}）",
-                    w.id,
-                    clip_chars(&w.title, 30),
-                    w.state,
-                    ptr
-                ));
+                // 2. Downstream blocked/ready items waiting on this run (or any ancestor in parent chain / owning work)
+                let mut downstream_count = 0usize;
+                for w in &items {
+                    if w.state == "done" || owning_wids.contains(&w.id) || downstream_count >= 3 {
+                        continue;
+                    }
+                    let waiting_applied = w.wait_on.iter().any(|c| {
+                        c.strip_prefix("run_applied:")
+                            .is_some_and(|r| chain_ids.iter().any(|cid| run_id_matches(cid, r)))
+                            || c.strip_prefix("work_applied:")
+                                .and_then(normalize_work_id)
+                                .is_some_and(|u| owning_wids.contains(&u))
+                            || c.strip_prefix("work_closed:")
+                                .and_then(normalize_work_id)
+                                .is_some_and(|u| owning_wids.contains(&u))
+                    });
+                    let waiting_delivered = w.wait_on.iter().any(|c| {
+                        c.strip_prefix("run_delivered:")
+                            .is_some_and(|r| chain_ids.iter().any(|cid| run_id_matches(cid, r)))
+                    });
+                    if !waiting_applied && !waiting_delivered {
+                        continue;
+                    }
+                    if !seen_work.insert(format!("down:{}", w.id)) {
+                        continue;
+                    }
+                    downstream_count += 1;
+                    if waiting_applied {
+                        hints.push(format!(
+                            "关联下游：[{}] {}（等 {} 合入后解锁 · 卡片：delegate work show {}）",
+                            w.id,
+                            clip_chars(&w.title, 28),
+                            rid,
+                            w.id
+                        ));
+                    } else if w.state == "ready" {
+                        hints.push(format!(
+                            "关联下游已就绪：[{}] {} → {}（卡片：delegate work show {}）",
+                            w.id,
+                            clip_chars(&w.title, 26),
+                            ready_command_for(w),
+                            w.id
+                        ));
+                    } else {
+                        hints.push(format!(
+                            "关联下游：[{}] {}（{} · 卡片：delegate work show {}）",
+                            w.id,
+                            clip_chars(&w.title, 28),
+                            w.state,
+                            w.id
+                        ));
+                    }
+                }
             }
-        }
-
-        // 2. Downstream blocked/ready items waiting on this run (or any ancestor in parent chain / owning work)
-        let mut downstream_count = 0usize;
-        for w in &items {
-            if w.state == "done" || owning_wids.contains(&w.id) || downstream_count >= 3 {
-                continue;
-            }
-            let waiting_applied = w.wait_on.iter().any(|c| {
-                c.strip_prefix("run_applied:")
-                    .is_some_and(|r| chain_ids.iter().any(|cid| run_id_matches(cid, r)))
-                    || c.strip_prefix("work_applied:")
-                        .and_then(normalize_work_id)
-                        .is_some_and(|u| owning_wids.contains(&u))
-                    || c.strip_prefix("work_closed:")
-                        .and_then(normalize_work_id)
-                        .is_some_and(|u| owning_wids.contains(&u))
-            });
-            let waiting_delivered = w.wait_on.iter().any(|c| {
-                c.strip_prefix("run_delivered:")
-                    .is_some_and(|r| chain_ids.iter().any(|cid| run_id_matches(cid, r)))
-            });
-            if !waiting_applied && !waiting_delivered {
-                continue;
-            }
-            if !seen_work.insert(format!("down:{}", w.id)) {
-                continue;
-            }
-            downstream_count += 1;
-            if waiting_applied {
-                hints.push(format!(
-                    "关联下游：[{}] {}（等 {} 合入后解锁 · 卡片：delegate work show {}）",
-                    w.id,
-                    clip_chars(&w.title, 28),
-                    rid,
-                    w.id
-                ));
-            } else if w.state == "ready" {
-                hints.push(format!(
-                    "关联下游已就绪：[{}] {} → {}（卡片：delegate work show {}）",
-                    w.id,
-                    clip_chars(&w.title, 26),
-                    ready_command_for(w),
-                    w.id
-                ));
-            } else {
-                hints.push(format!(
-                    "关联下游：[{}] {}（{} · 卡片：delegate work show {}）",
-                    w.id,
-                    clip_chars(&w.title, 28),
-                    w.state,
-                    w.id
-                ));
-            }
+            hints.truncate(4);
         }
     }
 
-    hints.truncate(4);
+    if let Some(eta_line) = eta_hint_for_wait(settled_runs, &[], repo_hint.as_deref()) {
+        hints.push(eta_line);
+    }
     hints
 }
 
 /// Timely tail hints for `delegate wait --since` based on returned events.
 pub fn hints_for_events(evs: &[Value]) -> Vec<String> {
     let state = state_dir();
-    if evs.is_empty() || !work_path(&state).is_file() {
-        return Vec::new();
-    }
-    let items = load_readonly_in(&state);
-    if items.is_empty() {
+    if evs.is_empty() {
         return Vec::new();
     }
     let mut hints = Vec::new();
-    let mut seen = HashSet::new();
+    let mut settled_ids: Vec<String> = Vec::new();
     for ev in evs {
         let kind = s(ev, "kind");
         let rid = s(ev, "run");
-        if matches!(kind, "work_ready" | "work_defer_expired" | "work_stale") {
-            let wid = s(&ev["payload"], "workId");
-            if let Some(w) = items.iter().find(|w| w.id == wid) {
-                if seen.insert(w.id.clone()) {
-                    hints.push(format!(
-                        "工作项 [{}] {}（{}）→ {}（卡片：delegate work show {}）",
-                        w.id,
-                        clip_chars(&w.title, 28),
-                        w.state,
-                        next_action_for(w, &items, &state),
-                        w.id
-                    ));
-                }
-            }
-            continue;
-        }
-        if !matches!(kind, "delivered" | "question" | "rejected" | "failed") || rid.is_empty() {
-            continue;
-        }
-        let repo_hint = {
-            let r = s(ev, "repo");
-            (!r.is_empty()).then_some(r)
-        };
-        let chain_ids = run_chain_ids_for_ref(rid, repo_hint, &state);
-        let owning_wids: HashSet<String> = items
-            .iter()
-            .filter(|w| chain_ids.iter().any(|cid| w.matches_run(cid)))
-            .map(|w| w.id.clone())
-            .collect();
-        for w in &items {
-            if w.state == "done" || owning_wids.contains(&w.id) {
-                continue;
-            }
-            let matches_down = w.wait_on.iter().any(|c| {
-                c.strip_prefix("run_applied:")
-                    .is_some_and(|r| chain_ids.iter().any(|cid| run_id_matches(cid, r)))
-                    || c.strip_prefix("work_applied:")
-                        .and_then(normalize_work_id)
-                        .is_some_and(|u| owning_wids.contains(&u))
-                    || c.strip_prefix("work_closed:")
-                        .and_then(normalize_work_id)
-                        .is_some_and(|u| owning_wids.contains(&u))
-            });
-            if matches_down && seen.insert(format!("down:{}", w.id)) {
-                hints.push(format!(
-                    "关联下游：[{}] {}（等 {} 合入后解锁 · 卡片：delegate work show {}）",
-                    w.id,
-                    clip_chars(&w.title, 28),
-                    rid,
-                    w.id
-                ));
-            }
+        if matches!(
+            kind,
+            "delivered" | "answered" | "rejected" | "failed" | "stopped" | "crashed" | "timeout" | "stalled"
+        ) && !rid.is_empty()
+        {
+            settled_ids.push(rid.to_string());
         }
     }
-    hints.truncate(4);
+
+    if work_path(&state).is_file() {
+        let items = load_readonly_in(&state);
+        if !items.is_empty() {
+            let mut seen = HashSet::new();
+            for ev in evs {
+                let kind = s(ev, "kind");
+                let rid = s(ev, "run");
+                if matches!(kind, "work_ready" | "work_defer_expired" | "work_stale") {
+                    let wid = s(&ev["payload"], "workId");
+                    if let Some(w) = items.iter().find(|w| w.id == wid) {
+                        if seen.insert(w.id.clone()) {
+                            hints.push(format!(
+                                "工作项 [{}] {}（{}）→ {}（卡片：delegate work show {}）",
+                                w.id,
+                                clip_chars(&w.title, 28),
+                                w.state,
+                                next_action_for(w, &items, &state),
+                                w.id
+                            ));
+                        }
+                    }
+                    continue;
+                }
+                if !matches!(kind, "delivered" | "question" | "rejected" | "failed") || rid.is_empty() {
+                    continue;
+                }
+                let repo_hint = {
+                    let r = s(ev, "repo");
+                    (!r.is_empty()).then_some(r)
+                };
+                let chain_ids = run_chain_ids_for_ref(rid, repo_hint, &state);
+                let owning_wids: HashSet<String> = items
+                    .iter()
+                    .filter(|w| chain_ids.iter().any(|cid| w.matches_run(cid)))
+                    .map(|w| w.id.clone())
+                    .collect();
+                for w in &items {
+                    if w.state == "done" || owning_wids.contains(&w.id) {
+                        continue;
+                    }
+                    let matches_down = w.wait_on.iter().any(|c| {
+                        c.strip_prefix("run_applied:")
+                            .is_some_and(|r| chain_ids.iter().any(|cid| run_id_matches(cid, r)))
+                            || c.strip_prefix("work_applied:")
+                                .and_then(normalize_work_id)
+                                .is_some_and(|u| owning_wids.contains(&u))
+                            || c.strip_prefix("work_closed:")
+                                .and_then(normalize_work_id)
+                                .is_some_and(|u| owning_wids.contains(&u))
+                    });
+                    if matches_down && seen.insert(format!("down:{}", w.id)) {
+                        hints.push(format!(
+                            "关联下游：[{}] {}（等 {} 合入后解锁 · 卡片：delegate work show {}）",
+                            w.id,
+                            clip_chars(&w.title, 28),
+                            rid,
+                            w.id
+                        ));
+                    }
+                }
+            }
+            hints.truncate(4);
+        }
+    }
+
+    if let Some(eta_line) = eta_hint_for_wait(&[], &settled_ids, None) {
+        hints.push(eta_line);
+    }
     hints
 }
 
@@ -4973,8 +5050,13 @@ fn short_run_id(rid: &str) -> String {
     clip_chars(rid, 14)
 }
 
-/// Collect ephemeral unattached runs (not bound to any work item), folded by reply chain.
-fn ephemeral_run_rows(items: &[WorkItem], state: &Path, now_epoch: i64) -> Vec<TableRow> {
+/// Collect ephemeral unattached runs (not bound to any work item), folded by reply chain,
+/// returning both the table rows and a map of `run_id -> run_dir` for lock-free ETA projection.
+fn ephemeral_run_rows_with_dirs(
+    items: &[WorkItem],
+    state: &Path,
+    now_epoch: i64,
+) -> (Vec<TableRow>, HashMap<String, PathBuf>) {
     let mut attached_runs: HashSet<String> = HashSet::new();
     for w in items {
         for r in &w.runs {
@@ -4986,6 +5068,7 @@ fn ephemeral_run_rows(items: &[WorkItem], state: &Path, now_epoch: i64) -> Vec<T
     }
 
     let mut rows = Vec::new();
+    let mut run_dirs: HashMap<String, PathBuf> = HashMap::new();
     let mut seen_run = HashSet::new();
 
     for (repo_root, runs_dir) in registered_repo_runs(state) {
@@ -5135,6 +5218,7 @@ fn ephemeral_run_rows(items: &[WorkItem], state: &Path, now_epoch: i64) -> Vec<T
             };
 
             let short = short_run_id(rid);
+            run_dirs.insert(rid.clone(), r.clone());
             rows.push(TableRow {
                 id: format!("R:{short}"),
                 repo: repo_label.clone(),
@@ -5148,7 +5232,55 @@ fn ephemeral_run_rows(items: &[WorkItem], state: &Path, now_epoch: i64) -> Vec<T
             });
         }
     }
-    rows
+    (rows, run_dirs)
+}
+
+#[cfg(test)]
+fn ephemeral_run_rows(items: &[WorkItem], state: &Path, now_epoch: i64) -> Vec<TableRow> {
+    ephemeral_run_rows_with_dirs(items, state, now_epoch).0
+}
+
+/// Embed a compact ETA/blocker badge (e.g. `~03:40`, `等W12(~04:30)`, `卡所有者Q03`) into the
+/// L1 `focus` column while keeping it within the 22-char column budget (and 6 columns / 100 chars).
+fn embed_focus_eta(base: &str, state: &str, badge: &str) -> String {
+    if badge.is_empty() || badge == "-" {
+        return base.to_string();
+    }
+    if state == "blocked"
+        && (badge.starts_with("卡所有者")
+            || badge.starts_with("等")
+            || badge.starts_with("卡主干"))
+    {
+        return clip_chars(badge, 22);
+    }
+    if !matches!(state, "active" | "ready" | "attention" | "blocked") {
+        return base.to_string();
+    }
+    if base.contains(badge) {
+        return base.to_string();
+    }
+    if state == "attention" && badge == "卡主控" && base.contains("卡") {
+        return base.to_string();
+    }
+    let b_len = badge.chars().count();
+    if b_len >= 22 {
+        return clip_chars(badge, 22);
+    }
+    let max_prefix = 22usize.saturating_sub(b_len + 1);
+    if max_prefix == 0 {
+        return clip_chars(badge, 22);
+    }
+    let compact_base = if base.chars().count() > max_prefix && state == "active" {
+        base.replace(" 运行中", "")
+    } else {
+        base.to_string()
+    };
+    let prefix = clip_chars(&compact_base, max_prefix);
+    if prefix.is_empty() {
+        badge.to_string()
+    } else {
+        format!("{prefix} {badge}")
+    }
 }
 
 fn format_table_row(row: &TableRow) -> String {
@@ -5168,8 +5300,16 @@ fn format_table_row(row: &TableRow) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn render_layer0_summary(counts: &HashMap<&str, usize>) -> String {
-    format!(
+    render_layer0_summary_with_eta(counts, None)
+}
+
+fn render_layer0_summary_with_eta(
+    counts: &HashMap<&str, usize>,
+    dag_eta: Option<&crate::eta::DagEtaSummary>,
+) -> String {
+    let mut line = format!(
         "工作表：需处理 {} · 就绪 {} · 待闭环 {} · 推进中 {} · 等待 {} · 暂缓 {}",
         counts.get("attention").copied().unwrap_or(0),
         counts.get("ready").copied().unwrap_or(0),
@@ -5177,7 +5317,13 @@ fn render_layer0_summary(counts: &HashMap<&str, usize>) -> String {
         counts.get("active").copied().unwrap_or(0),
         counts.get("blocked").copied().unwrap_or(0),
         counts.get("deferred").copied().unwrap_or(0),
-    )
+    );
+    if let Some(dag) = dag_eta {
+        if dag.write_chains > 0 || !dag.owner_blocked.is_empty() || dag.external_wait_count > 0 {
+            line.push_str(&format!(" · {}", dag.headline));
+        }
+    }
+    line
 }
 
 fn waiting_work_for_owner<'a>(owner_id: &str, all_items: &'a [WorkItem]) -> Vec<&'a WorkItem> {
@@ -5199,7 +5345,18 @@ fn waiting_work_for_owner<'a>(owner_id: &str, all_items: &'a [WorkItem]) -> Vec<
     waiters
 }
 
+#[allow(dead_code)]
 fn render_card(item: &WorkItem, all_items: &[WorkItem], state: &Path, now_epoch: i64) -> String {
+    render_card_with_eta(item, all_items, state, now_epoch, None)
+}
+
+fn render_card_with_eta(
+    item: &WorkItem,
+    all_items: &[WorkItem],
+    state: &Path,
+    now_epoch: i64,
+    dag_eta: Option<&crate::eta::DagEtaSummary>,
+) -> String {
     let mut lines = Vec::new();
     let age = format_age(&item.state_since, now_epoch);
     let age_str = if age.is_empty() {
@@ -5215,6 +5372,64 @@ fn render_card(item: &WorkItem, all_items: &[WorkItem], state: &Path, now_epoch:
         item.state,
         age_str
     ));
+    if item.owner.is_none() && item.state != "done" {
+        if let Some(dag) = dag_eta {
+            if let Some(ie) = dag.items.iter().find(|x| x.id == item.id) {
+                let prefix = if ie.blocker.is_some() {
+                    "预估（停表）"
+                } else {
+                    "预估"
+                };
+                let own_note = if ie.upstream_path.len() <= 1
+                    && ie.blocker.is_none()
+                    && ie.dev_p50_sec > 0.0
+                {
+                    format!(
+                        "〔本项约 {}〕",
+                        crate::eta::format_duration_range(ie.dev_p50_sec, ie.dev_p75_sec)
+                    )
+                } else {
+                    String::new()
+                };
+                lines.push(format!("{prefix}：{}{own_note}", ie.short_text));
+                if ie.upstream_path.len() > 1 {
+                    lines.push(format!("上游关键路径：{}", ie.upstream_path.join(" → ")));
+                    let by_id: HashMap<&str, &crate::eta::WorkItemEta> =
+                        dag.items.iter().map(|x| (x.id.as_str(), x)).collect();
+                    for uid in &ie.upstream_path {
+                        if let Some(ue) = by_id.get(uid.as_str()) {
+                            let own_part = if ue.dev_p50_sec > 0.0 {
+                                format!(
+                                    "（本项约 {}）",
+                                    crate::eta::format_duration_range(
+                                        ue.dev_p50_sec,
+                                        ue.dev_p75_sec
+                                    )
+                                )
+                            } else {
+                                String::new()
+                            };
+                            lines.push(format!(
+                                "  - [{}] {}：{}{own_part}",
+                                ue.id,
+                                clip_chars(&ue.title, 28),
+                                ue.short_text
+                            ));
+                        } else if let Some(w) = all_items.iter().find(|w| &w.id == uid) {
+                            lines.push(format!(
+                                "  - [{}] {}（{}）",
+                                w.id,
+                                clip_chars(&w.title, 28),
+                                w.state
+                            ));
+                        } else {
+                            lines.push(format!("  - [{uid}]"));
+                        }
+                    }
+                }
+            }
+        }
+    }
     if let Some(ow) = &item.owner {
         lines.push(format!(
             "所有者事项：{}（{}）",
@@ -5914,20 +6129,73 @@ fn list_cmd(args: &[String]) -> Res<i32> {
     if owner_only {
         return render_owner_list(&items, &state, now_epoch, show_all, state_filter.as_deref(), repo_filter.as_deref(), json_mode);
     }
-    let ephemeral = ephemeral_run_rows(&items, &state, now_epoch);
+    let (mut ephemeral, ephemeral_dirs) = ephemeral_run_rows_with_dirs(&items, &state, now_epoch);
+
+    // Compute lock-free ETA projections once when there is anything to display.
+    let mut dag_eta: Option<crate::eta::DagEtaSummary> = None;
+    let mut ephemeral_etas: HashMap<String, crate::eta::RunEta> = HashMap::new();
+    if !items.is_empty() || !ephemeral.is_empty() {
+        let mut visible_runs: Vec<PathBuf> = ephemeral_dirs.values().cloned().collect();
+        for w in &items {
+            if w.state != "done" {
+                for p in w.run_dirs.values() {
+                    let pb = PathBuf::from(p);
+                    if !visible_runs.contains(&pb) {
+                        visible_runs.push(pb);
+                    }
+                }
+            }
+        }
+        let eta_model = crate::speed::load_or_refresh_eta_model_in(&state, now_epoch, true);
+        let eta_ctx = crate::eta::LiveContext::capture(&state, now_epoch, &visible_runs);
+        if !items.is_empty() {
+            dag_eta = Some(crate::eta::estimate_work_dag_in(
+                &items,
+                repo_filter.as_deref(),
+                &eta_model,
+                &eta_ctx,
+            ));
+        }
+        for row in &mut ephemeral {
+            if let Some(rdir) = ephemeral_dirs.get(&row.run_id) {
+                let re = crate::eta::estimate_run_in(rdir, &eta_model, &eta_ctx);
+                if re.stage != crate::eta::Stage::Done {
+                    row.focus = embed_focus_eta(&row.focus, &row.state, &re.compact_badge);
+                    ephemeral_etas.insert(row.run_id.clone(), re);
+                }
+            }
+        }
+    }
+
+    let item_eta_by_id: HashMap<&str, &crate::eta::WorkItemEta> = dag_eta
+        .as_ref()
+        .map(|d| d.items.iter().map(|ie| (ie.id.as_str(), ie)).collect())
+        .unwrap_or_default();
 
     let mut all_rows: Vec<TableRow> = items
         .iter()
-        .map(|w| TableRow {
-            id: w.id.clone(),
-            repo: w.repo_label(),
-            title: w.title.clone(),
-            state: w.state.clone(),
-            focus: focus_for_item(w, &items, &state, now_epoch),
-            next: next_action_for(w, &items, &state),
-            is_ephemeral: false,
-            run_id: w.latest_run_id().unwrap_or("").to_string(),
-            missing_class: w.is_missing_class(),
+        .map(|w| {
+            let base_focus = focus_for_item(w, &items, &state, now_epoch);
+            let focus = if w.owner.is_none() {
+                if let Some(ie) = item_eta_by_id.get(w.id.as_str()) {
+                    embed_focus_eta(&base_focus, &w.state, &ie.focus_badge)
+                } else {
+                    base_focus
+                }
+            } else {
+                base_focus
+            };
+            TableRow {
+                id: w.id.clone(),
+                repo: w.repo_label(),
+                title: w.title.clone(),
+                state: w.state.clone(),
+                focus,
+                next: next_action_for(w, &items, &state),
+                is_ephemeral: false,
+                run_id: w.latest_run_id().unwrap_or("").to_string(),
+                missing_class: w.is_missing_class(),
+            }
         })
         .collect();
     all_rows.extend(ephemeral);
@@ -5967,45 +6235,48 @@ fn list_cmd(args: &[String]) -> Res<i32> {
     if json_mode {
         for r in &visible {
             if r.is_ephemeral {
-                println!(
-                    "{}",
-                    json!({
-                        "id": r.id,
-                        "repo": r.repo,
-                        "title": r.title,
-                        "state": r.state,
-                        "focus": r.focus,
-                        "next": r.next,
-                        "ephemeral": true,
-                        "run": r.run_id,
-                    })
-                );
+                let mut obj = json!({
+                    "id": r.id,
+                    "repo": r.repo,
+                    "title": r.title,
+                    "state": r.state,
+                    "focus": r.focus,
+                    "next": r.next,
+                    "ephemeral": true,
+                    "run": r.run_id,
+                });
+                if let Some(re) = ephemeral_etas.get(&r.run_id) {
+                    obj["eta"] = re.to_json();
+                }
+                println!("{obj}");
             } else if let Some(w) = items.iter().find(|w| w.id == r.id) {
                 let mut obj = w.to_json();
                 obj["repoLabel"] = json!(r.repo);
                 obj["focus"] = json!(r.focus);
                 obj["next"] = json!(r.next);
+                if let Some(ie) = item_eta_by_id.get(w.id.as_str()) {
+                    obj["eta"] = ie.to_json();
+                }
                 println!("{obj}");
             }
         }
-        println!(
-            "{}",
-            json!({
-                "workSummary": {
-                    "attention": counts.get("attention").copied().unwrap_or(0),
-                    "ready": counts.get("ready").copied().unwrap_or(0),
-                    "verify": counts.get("verify").copied().unwrap_or(0),
-                    "active": counts.get("active").copied().unwrap_or(0),
-                    "blocked": counts.get("blocked").copied().unwrap_or(0),
-                    "deferred": counts.get("deferred").copied().unwrap_or(0),
-                    "done": counts.get("done").copied().unwrap_or(0),
-                }
-            })
-        );
+        let mut ws = json!({
+            "attention": counts.get("attention").copied().unwrap_or(0),
+            "ready": counts.get("ready").copied().unwrap_or(0),
+            "verify": counts.get("verify").copied().unwrap_or(0),
+            "active": counts.get("active").copied().unwrap_or(0),
+            "blocked": counts.get("blocked").copied().unwrap_or(0),
+            "deferred": counts.get("deferred").copied().unwrap_or(0),
+            "done": counts.get("done").copied().unwrap_or(0),
+        });
+        if let Some(ref dag) = dag_eta {
+            ws["eta"] = dag.to_json();
+        }
+        println!("{}", json!({"workSummary": ws}));
         return Ok(0);
     }
 
-    println!("{}", render_layer0_summary(&counts));
+    println!("{}", render_layer0_summary_with_eta(&counts, dag_eta.as_ref()));
     if visible.is_empty() {
         println!("（当前无待处理项）");
     } else {
@@ -6266,10 +6537,57 @@ fn show_cmd(args: &[String]) -> Res<i32> {
                 "work item '{norm}' not found (list with: delegate work --all)"
             ));
         };
+        let dag_eta = if item.owner.is_none() && item.state != "done" {
+            let mut visible_runs: Vec<PathBuf> = Vec::new();
+            for w in &items {
+                if w.state != "done" {
+                    for p in w.run_dirs.values() {
+                        let pb = PathBuf::from(p);
+                        if !visible_runs.contains(&pb) {
+                            visible_runs.push(pb);
+                        }
+                    }
+                }
+            }
+            let eta_model = crate::speed::load_or_refresh_eta_model_in(&state, now_epoch, true);
+            let eta_ctx = crate::eta::LiveContext::capture(&state, now_epoch, &visible_runs);
+            Some(crate::eta::estimate_work_dag_in(&items, None, &eta_model, &eta_ctx))
+        } else {
+            None
+        };
         if json_mode {
             let mut obj = item.to_json();
             obj["focus"] = json!(focus_for_item(item, &items, &state, now_epoch));
             obj["next"] = json!(next_action_for(item, &items, &state));
+            if let Some(ref dag) = dag_eta {
+                if let Some(ie) = dag.items.iter().find(|x| x.id == item.id) {
+                    let mut eta_val = ie.to_json();
+                    if ie.upstream_path.len() > 1 {
+                        let by_id: HashMap<&str, &crate::eta::WorkItemEta> =
+                            dag.items.iter().map(|x| (x.id.as_str(), x)).collect();
+                        let breakdown: Vec<Value> = ie
+                            .upstream_path
+                            .iter()
+                            .map(|uid| {
+                                if let Some(ue) = by_id.get(uid.as_str()) {
+                                    json!({
+                                        "id": ue.id,
+                                        "title": ue.title,
+                                        "state": ue.state,
+                                        "shortText": ue.short_text,
+                                        "devP50Sec": crate::speed::round2(ue.dev_p50_sec),
+                                        "devP75Sec": crate::speed::round2(ue.dev_p75_sec),
+                                    })
+                                } else {
+                                    json!({"id": uid})
+                                }
+                            })
+                            .collect();
+                        eta_val["upstreamBreakdown"] = json!(breakdown);
+                    }
+                    obj["eta"] = eta_val;
+                }
+            }
             obj["waitOnStatus"] = json!(item
                 .wait_on
                 .iter()
@@ -6300,7 +6618,7 @@ fn show_cmd(args: &[String]) -> Res<i32> {
             }
             println!("{obj}");
         } else {
-            println!("{}", render_card(item, &items, &state, now_epoch));
+            println!("{}", render_card_with_eta(item, &items, &state, now_epoch, dag_eta.as_ref()));
         }
         return Ok(0);
     }
@@ -6313,7 +6631,10 @@ fn show_cmd(args: &[String]) -> Res<i32> {
             "work item or run '{raw}' not found (list with: delegate work --all)"
         ));
     };
-    let st = runs::status(&rdir);
+    let mut st = runs::status(&rdir);
+    let eta_model = crate::speed::load_or_refresh_eta_model_in(&state, now_epoch, true);
+    let eta_ctx = crate::eta::LiveContext::capture(&state, now_epoch, std::slice::from_ref(&rdir));
+    crate::eta::overlay_status_eta(&mut st, &rdir, &eta_model, &eta_ctx);
     if json_mode {
         println!("{st}");
     } else {
@@ -9842,6 +10163,87 @@ mod tests {
         assert_eq!(picked_ro.len(), 1);
         assert_eq!(picked_ro[0].item.id, "W059");
         assert_eq!(picked_ro[0].active_writes, 5);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn embed_focus_eta_keeps_six_columns_and_100_char_limit() {
+        assert_eq!(
+            embed_focus_eta("等所有者 Q03", "blocked", "卡所有者Q03"),
+            "卡所有者Q03"
+        );
+        assert_eq!(
+            embed_focus_eta("等待 W12 合入", "blocked", "等W12(~04:30)"),
+            "等W12(~04:30)"
+        );
+        let active_long = embed_focus_eta("run long-feature-slug 运行中 15m", "active", "~03:40");
+        assert!(active_long.contains("~03:40"), "{active_long}");
+        assert!(active_long.chars().count() <= 22, "{active_long}");
+
+        let row = TableRow {
+            id: "W015".into(),
+            repo: "aia-skills".into(),
+            title: "这是一条标题非常长非常长的工作项用来测试一百字上限".into(),
+            state: "blocked".into(),
+            focus: embed_focus_eta("等待 W12 合入", "blocked", "等W12(~04:30)"),
+            next: "start --work W015 --prompt-file docs/w015.md".into(),
+            is_ephemeral: false,
+            run_id: String::new(),
+            missing_class: true,
+        };
+        let rendered = format_table_row(&row);
+        assert!(rendered.chars().count() <= 100, "len={} {rendered}", rendered.chars().count());
+        assert!(rendered.contains("等W12(~04:30)"), "{rendered}");
+        assert!(rendered.ends_with(" · 缺类别"), "{rendered}");
+    }
+
+    #[test]
+    fn render_card_with_eta_lists_upstream_critical_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "delegate-work-eta-card-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let state = dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let now = 1_800_000_000_i64;
+        let repo = "/work/demo";
+
+        let w1 = WorkItem {
+            id: "W001".into(),
+            repo: repo.into(),
+            title: "上游底座".into(),
+            state: "ready".into(),
+            class: "feat".into(),
+            ..Default::default()
+        };
+        let w2 = WorkItem {
+            id: "W002".into(),
+            repo: repo.into(),
+            title: "下游接线".into(),
+            state: "blocked".into(),
+            class: "feat".into(),
+            wait_on: vec!["work_applied:W001".into()],
+            ..Default::default()
+        };
+        let items = vec![w1, w2];
+        let model = crate::speed::build_eta_model_in(&state, now);
+        let ctx = crate::eta::LiveContext {
+            now_ts: now,
+            ..Default::default()
+        };
+        let dag = crate::eta::estimate_work_dag_in(&items, None, &model, &ctx);
+
+        let l0 = render_layer0_summary_with_eta(&HashMap::new(), Some(&dag));
+        assert!(l0.contains("推进 "), "{l0}");
+        assert!(l0.contains("2写链/深2"), "{l0}");
+
+        let card = render_card_with_eta(&items[1], &items, &state, now, Some(&dag));
+        assert!(card.contains("预估："), "{card}");
+        assert!(card.contains("上游关键路径：W001 → W002"), "{card}");
+        assert!(card.contains("- [W001] 上游底座"), "{card}");
+        assert!(card.contains("- [W002] 下游接线"), "{card}");
 
         let _ = fs::remove_dir_all(&dir);
     }

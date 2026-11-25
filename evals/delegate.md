@@ -308,3 +308,8 @@
 - reply 正文含 `up -d --wait`、`delegate wait` 或 `--help` 不触发 hook；真正子命令 wait/run 或 reply --wait 仍拦前台，quoted message is data.
 - apply 的远端槽锁排队不耗执行时限；传输未执行给重排/本地跑，程序自身 exit 75 仍判执行失败，queue versus execution.
 - 提问回收未执行作业但保留队龄，回答后重跑同 label 优先于后来排队者、不能抢占已运行者；browser tests 仍共用 heavy lane，避免隐性超配。
+
+## ETA 进度预估与停表归责
+
+- 主控查看 `delegate status` / `status <run>`（含 `--json`）：活跃任务行尾追加单段交付预估（如 `预计 03:40 交付（p75 04:10）` 或 `等 lane(前2)·预计 …`），`status <run>` 展开一行阶段拆解与返工率；提问、待签字、预合并冲突、主干阻塞、疑似卡住或等内存时立即停表显示「卡在谁」，绝不因 ETA 超时停任务。
+- 主控查看 `delegate work` / `work show <Wxx>` / `queue list` / `wait`：工作表 L0 首行追加关键路径研发墙钟与外部等待/所有者计数，L1 仍守 6 列与 100 字上限并在 `focus` 列内嵌 `~HH:MM` / `等Wxx(~HH:MM)` / `卡所有者Qxx`，`work show` 列出上游关键路径拆解，`queue list` 顶部显示 `DAG 关键路径`，`wait`/`wait --since` 尾部追加其余在跑波次与剩余链预估；`delegate speed --backtest` 输出 14 天严格因果滚动回测的 p75 覆盖率与 p50 偏差。
