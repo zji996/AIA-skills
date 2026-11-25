@@ -362,6 +362,7 @@ impl DelegateClient {
             candidates: candidates_list,
             agy_accounts: agy_accounts_state,
             analytics: AnalyticsSnapshot::default(),
+            eta: SnapshotEta::default(),
             host_load,
             generated_epoch: None,
             today_ymd: local_ymd(),
@@ -506,6 +507,7 @@ pub fn parse_snapshot_json(
     let candidates = parse_candidates_jsonl(&arr_to_jsonl(&doc["candidates"]));
     let agy_accounts = parse_agy_accounts_value(&doc["agyAccounts"]);
     let analytics = parse_analytics_value(&doc["analytics"]);
+    let eta = parse_snapshot_eta_value(&doc["eta"]);
     let host_load = read_host_load();
     let today_ymd = doc["generatedAt"]
         .as_str()
@@ -522,6 +524,7 @@ pub fn parse_snapshot_json(
         candidates,
         agy_accounts,
         analytics,
+        eta,
         host_load,
         generated_epoch,
         today_ymd,
@@ -1072,6 +1075,7 @@ fn parse_run_item(
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        eta: parse_run_eta_value(v.get("eta")),
     }
 }
 
@@ -2062,7 +2066,159 @@ fn parse_single_work_item(v: &Value) -> Option<WorkItem> {
         focus: single_line(v.get("focus").and_then(Value::as_str).unwrap_or("")),
         next: single_line(v.get("next").and_then(Value::as_str).unwrap_or("")),
         applied: v.get("applied").and_then(Value::as_bool).unwrap_or(false),
+        eta: parse_work_eta_value(v.get("eta")),
     })
+}
+
+fn opt_nonempty_str(v: Option<&Value>) -> Option<String> {
+    v.and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_run_eta_value(val: Option<&Value>) -> Option<RunEtaInfo> {
+    let v = val.filter(|x| x.is_object())?;
+    let del = v.get("toDelivered").filter(|x| x.is_object());
+    let app = v.get("toApplied").filter(|x| x.is_object());
+    let range = del.or(app);
+    let blk = v.get("blocker").filter(|x| x.is_object());
+    Some(RunEtaInfo {
+        stage: v.get("stage").and_then(Value::as_str).unwrap_or("").to_string(),
+        stage_label: v
+            .get("stageLabel")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        stopped_clock: v
+            .get("stoppedClock")
+            .and_then(Value::as_bool)
+            .unwrap_or(blk.is_some()),
+        short_text: single_line(v.get("shortText").and_then(Value::as_str).unwrap_or("")),
+        compact_badge: single_line(v.get("compactBadge").and_then(Value::as_str).unwrap_or("")),
+        detail_text: single_line(v.get("detailText").and_then(Value::as_str).unwrap_or("")),
+        blocker_kind: opt_nonempty_str(blk.and_then(|b| b.get("kind"))),
+        blocker_who: opt_nonempty_str(blk.and_then(|b| b.get("who"))),
+        blocker_label: opt_nonempty_str(blk.and_then(|b| b.get("label"))),
+        p50_clock: opt_nonempty_str(range.and_then(|r| r.get("p50Clock"))),
+        p75_clock: opt_nonempty_str(range.and_then(|r| r.get("p75Clock"))),
+        anomaly: range
+            .and_then(|r| r.get("anomaly"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        is_prior: v.get("isPrior").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+fn parse_work_eta_value(val: Option<&Value>) -> Option<WorkEtaInfo> {
+    let v = val.filter(|x| x.is_object())?;
+    let rem = v.get("remaining").filter(|x| x.is_object());
+    let blk = v.get("blocker").filter(|x| x.is_object());
+    let focus_badge = single_line(v.get("focusBadge").and_then(Value::as_str).unwrap_or(""));
+    let compact_raw = single_line(v.get("compactBadge").and_then(Value::as_str).unwrap_or(""));
+    let compact_badge = if !compact_raw.is_empty() {
+        compact_raw
+    } else if let Some(c) = opt_nonempty_str(blk.and_then(|b| b.get("compact"))) {
+        c
+    } else {
+        focus_badge.clone()
+    };
+    Some(WorkEtaInfo {
+        stopped_clock: v
+            .get("stoppedClock")
+            .and_then(Value::as_bool)
+            .unwrap_or(blk.is_some()),
+        short_text: single_line(v.get("shortText").and_then(Value::as_str).unwrap_or("")),
+        focus_badge,
+        compact_badge,
+        blocker_kind: opt_nonempty_str(blk.and_then(|b| b.get("kind"))),
+        blocker_label: opt_nonempty_str(blk.and_then(|b| b.get("label"))),
+        p50_clock: opt_nonempty_str(rem.and_then(|r| r.get("p50Clock"))),
+        p75_clock: opt_nonempty_str(rem.and_then(|r| r.get("p75Clock"))),
+        is_prior: v.get("isPrior").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+fn parse_dag_eta_summary(val: Option<&Value>) -> WorkDagEtaSummary {
+    let Some(v) = val.filter(|x| x.is_object()) else {
+        return WorkDagEtaSummary::default();
+    };
+    WorkDagEtaSummary {
+        write_chains: v.get("writeChains").and_then(Value::as_u64).unwrap_or(0) as usize,
+        depth: v.get("depth").and_then(Value::as_u64).unwrap_or(0) as usize,
+        active_count: v.get("activeCount").and_then(Value::as_u64).unwrap_or(0) as usize,
+        dev_wall_range: single_line(v.get("devWallRange").and_then(Value::as_str).unwrap_or("")),
+        earliest_finish_p50_clock: opt_nonempty_str(v.get("earliestFinishP50Clock")),
+        earliest_finish_p75_clock: opt_nonempty_str(v.get("earliestFinishP75Clock")),
+        external_wait_count: v
+            .get("externalWaitCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize,
+        owner_blocked_count: v
+            .get("ownerBlocked")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+        blocker_count: v
+            .get("blockers")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+        headline: single_line(v.get("headline").and_then(Value::as_str).unwrap_or("")),
+        is_prior: v.get("isPrior").and_then(Value::as_bool).unwrap_or(false),
+    }
+}
+
+fn parse_snapshot_eta_value(val: &Value) -> SnapshotEta {
+    if !val.is_object() {
+        return SnapshotEta::default();
+    }
+    let wave = val
+        .get("wave")
+        .filter(|x| x.is_object())
+        .map(|w| {
+            let blockers = w
+                .get("blockers")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|b| {
+                            if !b.is_object() {
+                                return None;
+                            }
+                            Some(WaveBlockerBrief {
+                                run: b.get("run").and_then(Value::as_str).unwrap_or("").to_string(),
+                                name: single_line(
+                                    b.get("name").and_then(Value::as_str).unwrap_or(""),
+                                ),
+                                kind: b.get("kind").and_then(Value::as_str).unwrap_or("").to_string(),
+                                compact: single_line(
+                                    b.get("compact").and_then(Value::as_str).unwrap_or(""),
+                                ),
+                                label: single_line(
+                                    b.get("label").and_then(Value::as_str).unwrap_or(""),
+                                ),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            WaveEtaSummary {
+                active_count: w.get("activeCount").and_then(Value::as_u64).unwrap_or(0) as usize,
+                running_count: w.get("runningCount").and_then(Value::as_u64).unwrap_or(0) as usize,
+                queued_count: w.get("queuedCount").and_then(Value::as_u64).unwrap_or(0) as usize,
+                blocked_count: w.get("blockedCount").and_then(Value::as_u64).unwrap_or(0) as usize,
+                earliest_p50_clock: opt_nonempty_str(w.get("earliestP50Clock")),
+                wave_p50_clock: opt_nonempty_str(w.get("waveP50Clock")),
+                wave_p75_clock: opt_nonempty_str(w.get("waveP75Clock")),
+                is_prior: w.get("isPrior").and_then(Value::as_bool).unwrap_or(false),
+                blockers,
+            }
+        })
+        .unwrap_or_default();
+    SnapshotEta {
+        wave,
+        work: parse_dag_eta_summary(val.get("work")),
+        queue: parse_dag_eta_summary(val.get("queue")),
+    }
 }
 
 /// Pure read-only load of a work item's brief/card markdown file (zero subprocesses, zero writes).

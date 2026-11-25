@@ -462,6 +462,80 @@ impl DagQueueItem {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct RunEtaInfo {
+    pub stage: String,
+    pub stage_label: String,
+    pub stopped_clock: bool,
+    pub short_text: String,
+    pub compact_badge: String,
+    pub detail_text: String,
+    pub blocker_kind: Option<String>,
+    pub blocker_who: Option<String>,
+    pub blocker_label: Option<String>,
+    pub p50_clock: Option<String>,
+    pub p75_clock: Option<String>,
+    pub anomaly: bool,
+    pub is_prior: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct WorkEtaInfo {
+    pub stopped_clock: bool,
+    pub short_text: String,
+    pub focus_badge: String,
+    pub compact_badge: String,
+    pub blocker_kind: Option<String>,
+    pub blocker_label: Option<String>,
+    pub p50_clock: Option<String>,
+    pub p75_clock: Option<String>,
+    pub is_prior: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct WaveBlockerBrief {
+    pub run: String,
+    pub name: String,
+    pub kind: String,
+    pub compact: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct WaveEtaSummary {
+    pub active_count: usize,
+    pub running_count: usize,
+    pub queued_count: usize,
+    pub blocked_count: usize,
+    pub earliest_p50_clock: Option<String>,
+    pub wave_p50_clock: Option<String>,
+    pub wave_p75_clock: Option<String>,
+    pub is_prior: bool,
+    pub blockers: Vec<WaveBlockerBrief>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct WorkDagEtaSummary {
+    pub write_chains: usize,
+    pub depth: usize,
+    pub active_count: usize,
+    pub dev_wall_range: String,
+    pub earliest_finish_p50_clock: Option<String>,
+    pub earliest_finish_p75_clock: Option<String>,
+    pub external_wait_count: usize,
+    pub owner_blocked_count: usize,
+    pub blocker_count: usize,
+    pub headline: String,
+    pub is_prior: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct SnapshotEta {
+    pub wave: WaveEtaSummary,
+    pub work: WorkDagEtaSummary,
+    pub queue: WorkDagEtaSummary,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RunItem {
     pub run: String,
@@ -526,9 +600,25 @@ pub struct RunItem {
     pub tokens_output: Option<u64>,
     pub tokens_cache_read: Option<u64>,
     pub work_id: Option<String>,
+    pub eta: Option<RunEtaInfo>,
 }
 
 impl RunItem {
+    /// Short <= 6-col ETA badge for Runs rows (`~03:40`, `<5m`, `卡主控`, ...).
+    pub fn eta_badge(&self) -> Option<(&str, bool)> {
+        if self.applied || matches!(self.group, GroupKind::Collected | GroupKind::MergedUncleaned) {
+            return None;
+        }
+        let eta = self.eta.as_ref()?;
+        if eta.stage == "done" {
+            return None;
+        }
+        let b = eta.compact_badge.trim();
+        if b.is_empty() || b == "完成" || b == "-" {
+            return None;
+        }
+        Some((b, eta.stopped_clock))
+    }
     /// Effective file count / +/- lines to display in the list row.
     pub fn display_changes(&self) -> (u64, u64, u64) {
         if self.pending_files > 0 {
@@ -959,6 +1049,7 @@ pub struct WorkItem {
     pub focus: String,
     pub next: String,
     pub applied: bool,
+    pub eta: Option<WorkEtaInfo>,
 }
 
 impl WorkItem {
@@ -1323,6 +1414,7 @@ pub struct AppSnapshot {
     pub candidates: Vec<RadarCandidateItem>,
     pub agy_accounts: AgyAccountsState,
     pub analytics: AnalyticsSnapshot,
+    pub eta: SnapshotEta,
     pub host_load: Option<HostLoad>,
     pub generated_epoch: Option<i64>,
     pub today_ymd: String,
@@ -1346,6 +1438,7 @@ impl AppSnapshot {
         self.candidates.hash(&mut h);
         self.agy_accounts.hash(&mut h);
         self.analytics.hash(&mut h);
+        self.eta.hash(&mut h);
         self.host_load.hash(&mut h);
         self.warnings.hash(&mut h);
         h.finish()

@@ -2090,6 +2090,9 @@ pub fn run_accept_and_review(
         return Ok(());
     }
 
+    // Record first-entry accept/review ETA prediction for online milestone calibration.
+    crate::eta::record_pred_accept_review(run, meta);
+
     // Acceptance configured, auto-review OFF: run tiered fast -> slow sequentially.
     if !review_enabled {
         let passed = BTreeMap::new();

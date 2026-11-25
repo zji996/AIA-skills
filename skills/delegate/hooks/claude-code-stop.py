@@ -4,8 +4,8 @@
 Keeps `~/.claude/settings.json` hook path stable while delegating all zero-lock,
 zero-git Stop evaluation (W058 read-state/caller liveness, W060 progressive
 single-item disclosure, stall-chain escalation, cross-repo penetration,
-per-run deferrals, and verbatim source HEAD detection) to
-`delegate hook check --format claude`.
+per-run deferrals, verbatim source HEAD detection, and fastest-ETA clock in
+existing waiter reminders) to `delegate hook check --format claude`.
 """
 
 from __future__ import annotations

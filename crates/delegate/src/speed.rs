@@ -19,6 +19,7 @@ const MAX_OPEN_RUN_SECS: i64 = 4 * 3600;
 
 pub const ETA_MODEL_VERSION: u32 = 1;
 pub const ETA_MODEL_FILE: &str = "eta-model.json";
+pub const ETA_CALIBRATION_FILE: &str = "eta-calibration.jsonl";
 pub const ETA_MODEL_WINDOW_DAYS: i64 = 14;
 #[allow(dead_code)] // Consumed by eta.rs in Chain 2.
 pub const ETA_MODEL_STALE_SECS: i64 = 15 * 60;
@@ -251,6 +252,7 @@ pub struct RepoSpeedReport {
     pub merge_wait: DistStats,
     pub read_only: DistStats,
     pub drift: DriftReport,
+    pub eta_calibration: Option<RepoCalibrationReport>,
 }
 
 impl RepoSpeedReport {
@@ -351,6 +353,9 @@ impl RepoSpeedReport {
             "anyAlert": self.drift.any_alert,
             "metrics": drift_metrics,
         });
+        if let Some(cal) = &self.eta_calibration {
+            doc["etaCalibration"] = cal.to_json();
+        }
         doc
     }
 }
@@ -778,6 +783,7 @@ fn compute_repo_window(
         merge_wait: DistStats::from_secs(merge_wait_secs),
         read_only: DistStats::from_secs(read_only_secs),
         drift: DriftReport::default(),
+        eta_calibration: None,
     }
 }
 
@@ -884,6 +890,7 @@ pub fn analyze_in(
     }
 
     let at_iso = format_epoch(now_ts, false, "%Y-%m-%dT%H:%M:%SZ");
+    let cal_map = analyze_calibration_by_repo(state, now_ts, requested_secs);
     let mut reports = Vec::new();
 
     for (repo, repo_events) in by_repo {
@@ -934,6 +941,7 @@ pub fn analyze_in(
 
         let prev_doc = read_last_json_line(&speed_file);
         report.drift = compute_drift(prev_doc.as_ref(), &report);
+        report.eta_calibration = cal_map.get(&repo).cloned();
 
         if persist {
             fs::create_dir_all(speed_dir(state)).map_err(|e| e.to_string())?;
@@ -1004,7 +1012,7 @@ pub fn format_human(reports: &[RepoSpeedReport], requested_since: &str) -> Strin
 
     out.push('\n');
     out.push_str(&format!(
-        "{:<16} {:<5} {:<8} {:<18} {:<8} {:<13} {:<15} {:<15} {:<7} {:<14} {}\n",
+        "{:<16} {:<5} {:<8} {:<18} {:<8} {:<13} {:<15} {:<15} {:<7} {:<14} {:<14} {}\n",
         "仓库",
         "窗口",
         "写链",
@@ -1015,7 +1023,8 @@ pub fn format_human(reports: &[RepoSpeedReport], requested_since: &str) -> Strin
         "P_eff 均(50/75)",
         "合入/时",
         "T_merge 75(冲)",
-        "只读 50/75(n)"
+        "只读 50/75(n)",
+        "ETA p75覆盖"
     ));
 
     let mut expanded_notes: Vec<String> = Vec::new();
@@ -1075,8 +1084,20 @@ pub fn format_human(reports: &[RepoSpeedReport], requested_since: &str) -> Strin
             "-".to_string()
         };
 
+        let cal_col = r
+            .eta_calibration
+            .as_ref()
+            .and_then(|c| c.primary_metrics())
+            .and_then(|m| {
+                m.p75_coverage.map(|cov| {
+                    let alert = if m.p75_alert { "⚠" } else { "" };
+                    format!("{:.0}%{alert}({})", cov * 100.0, m.count)
+                })
+            })
+            .unwrap_or_else(|| "-".to_string());
+
         out.push_str(&format!(
-            "{:<16} {:<5} {:<8} {:<18} {:<8} {:<13} {:<15} {:<15} {:<7} {:<14} {}\n",
+            "{:<16} {:<5} {:<8} {:<18} {:<8} {:<13} {:<15} {:<15} {:<7} {:<14} {:<14} {}\n",
             clip(&r.repo_name, 16),
             win,
             write_cnt,
@@ -1088,6 +1109,7 @@ pub fn format_human(reports: &[RepoSpeedReport], requested_since: &str) -> Strin
             rate_hr,
             merge_str,
             ro_str,
+            cal_col,
         ));
     }
 
@@ -1129,6 +1151,11 @@ pub fn format_human(reports: &[RepoSpeedReport], requested_since: &str) -> Strin
                 parts.join("  ")
             ));
         }
+        if let Some(cal) = &r.eta_calibration {
+            if let Some(m) = cal.primary_metrics() {
+                out.push_str(&format!("    ETA 在线覆盖：{}\n", fmt_bt_metric_brief(m)));
+            }
+        }
     }
 
     out
@@ -1166,6 +1193,7 @@ pub fn command(args: &[String]) -> Res<i32> {
     let since_str = since_opt.unwrap_or("7d");
     let reports = analyze_in(&state, now_ts, since_str, repo_filter, true)?;
     let bt = backtest_in(&state, now_ts, "14d", repo_filter).ok();
+    let cal = analyze_calibration_in(&state, now_ts, since_str, repo_filter).ok();
 
     if json_out {
         let repos_json: Vec<Value> = reports.iter().map(|r| r.to_full_json()).collect();
@@ -1177,9 +1205,15 @@ pub fn command(args: &[String]) -> Res<i32> {
         if let Some(bt_rep) = bt {
             doc["etaBacktest"] = bt_rep.to_json();
         }
+        if let Some(cal_rep) = cal {
+            doc["etaCalibration"] = cal_rep.to_json();
+        }
         println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
     } else {
         print!("{}", format_human(&reports, since_str));
+        if let Some(cal_rep) = cal.filter(|c| c.total_records > 0) {
+            print!("{}", format_calibration_inline_summary(&cal_rep));
+        }
         if let Some(bt_rep) = bt.filter(|b| b.overall_start.count > 0) {
             print!("{}", format_backtest_inline_summary(&bt_rep));
         }
@@ -1188,12 +1222,275 @@ pub fn command(args: &[String]) -> Res<i32> {
 }
 
 // ---------------------------------------------------------------------------
-// Unified ETA model cache (`<state>/eta-model.json`)
+// Unified ETA model cache (`<state>/eta-model.json`) & online calibration log
 // Built by `speed.rs` from `events.jsonl` and consumed read-only by `eta.rs`.
 // ---------------------------------------------------------------------------
 
 pub fn eta_model_path(state: &Path) -> PathBuf {
     state.join(ETA_MODEL_FILE)
+}
+
+pub fn eta_calibration_path(state: &Path) -> PathBuf {
+    state.join(ETA_CALIBRATION_FILE)
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RepoCalibrationReport {
+    pub repo: String,
+    pub repo_name: String,
+    pub started_delivered: BacktestMetrics,
+    pub accept_delivered: BacktestMetrics,
+    pub started_applied: BacktestMetrics,
+}
+
+impl RepoCalibrationReport {
+    pub fn primary_metrics(&self) -> Option<&BacktestMetrics> {
+        if self.started_delivered.count > 0 {
+            Some(&self.started_delivered)
+        } else if self.accept_delivered.count > 0 {
+            Some(&self.accept_delivered)
+        } else if self.started_applied.count > 0 {
+            Some(&self.started_applied)
+        } else {
+            None
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "repo": self.repo,
+            "repoName": self.repo_name,
+            "startedDelivered": self.started_delivered.to_json(),
+            "acceptDelivered": self.accept_delivered.to_json(),
+            "startedApplied": self.started_applied.to_json(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OnlineCalibrationReport {
+    pub at: String,
+    pub window: String,
+    pub total_records: usize,
+    pub overall_started_delivered: BacktestMetrics,
+    pub overall_accept_delivered: BacktestMetrics,
+    pub overall_started_applied: BacktestMetrics,
+    pub repos: Vec<RepoCalibrationReport>,
+}
+
+impl OnlineCalibrationReport {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "at": self.at,
+            "window": self.window,
+            "totalRecords": self.total_records,
+            "overall": {
+                "startedDelivered": self.overall_started_delivered.to_json(),
+                "acceptDelivered": self.overall_accept_delivered.to_json(),
+                "startedApplied": self.overall_started_applied.to_json(),
+            },
+            "repos": self.repos.iter().map(|r| r.to_json()).collect::<Vec<_>>(),
+        })
+    }
+}
+
+fn parse_fallback_level_str(raw: &str) -> FallbackLevel {
+    match raw {
+        "L1" => FallbackLevel::RepoModeClass,
+        "L2" => FallbackLevel::RepoMode,
+        "L3" => FallbackLevel::GlobalModeClass,
+        "L4" => FallbackLevel::GlobalMode,
+        _ => FallbackLevel::Prior,
+    }
+}
+
+fn read_calibration_records(
+    state: &Path,
+    cutoff_ts: Option<i64>,
+    repo_filter: Option<&str>,
+) -> Vec<(String, String, String, BacktestObs)> {
+    let path = eta_calibration_path(state);
+    let Ok(file) = fs::File::open(&path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if let Some(cut) = cutoff_ts {
+            if let Some(ts) = iso_epoch(s(&v, "at")) {
+                if ts < cut {
+                    continue;
+                }
+            }
+        }
+        let repo = s(&v, "repo").to_string();
+        let rname = short_repo_name(&repo);
+        if let Some(rf) = repo_filter {
+            if !repo_matches_filter(&repo, &rname, rf) {
+                continue;
+            }
+        }
+        let checkpoint = s(&v, "checkpoint").to_string();
+        let milestone = s(&v, "milestone").to_string();
+        let (Some(actual), Some(p50), Some(p75)) = (
+            v["actualSec"].as_f64(),
+            v["predP50Sec"].as_f64(),
+            v["predP75Sec"].as_f64(),
+        ) else {
+            continue;
+        };
+        if !actual.is_finite() || !p50.is_finite() || !p75.is_finite() {
+            continue;
+        }
+        let level = parse_fallback_level_str(s(&v, "fallbackLevel"));
+        out.push((
+            repo,
+            checkpoint,
+            milestone,
+            BacktestObs {
+                actual_sec: actual.max(0.0),
+                pred_p50_sec: p50.max(0.0),
+                pred_p75_sec: p75.max(p50.max(0.0)),
+                level,
+            },
+        ));
+    }
+    out
+}
+
+fn build_calibration_report(
+    records: &[(String, String, String, BacktestObs)],
+    now_ts: i64,
+    window_label: &str,
+) -> OnlineCalibrationReport {
+    let mut all_sd = Vec::new();
+    let mut all_ad = Vec::new();
+    let mut all_sa = Vec::new();
+    let mut by_repo_sd: BTreeMap<String, Vec<BacktestObs>> = BTreeMap::new();
+    let mut by_repo_ad: BTreeMap<String, Vec<BacktestObs>> = BTreeMap::new();
+    let mut by_repo_sa: BTreeMap<String, Vec<BacktestObs>> = BTreeMap::new();
+    let mut repo_keys: BTreeMap<String, ()> = BTreeMap::new();
+
+    for (repo, checkpoint, milestone, obs) in records {
+        repo_keys.insert(repo.clone(), ());
+        match (checkpoint.as_str(), milestone.as_str()) {
+            ("started", "delivered" | "answered") => {
+                all_sd.push(obs.clone());
+                by_repo_sd.entry(repo.clone()).or_default().push(obs.clone());
+            }
+            ("accept_review", "delivered" | "answered") => {
+                all_ad.push(obs.clone());
+                by_repo_ad.entry(repo.clone()).or_default().push(obs.clone());
+            }
+            ("started", "applied") => {
+                all_sa.push(obs.clone());
+                by_repo_sa.entry(repo.clone()).or_default().push(obs.clone());
+            }
+            _ => {}
+        }
+    }
+
+    let mut repos: Vec<RepoCalibrationReport> = repo_keys
+        .into_keys()
+        .map(|repo| {
+            let sd = by_repo_sd.remove(&repo).unwrap_or_default();
+            let ad = by_repo_ad.remove(&repo).unwrap_or_default();
+            let sa = by_repo_sa.remove(&repo).unwrap_or_default();
+            RepoCalibrationReport {
+                repo_name: short_repo_name(&repo),
+                repo,
+                started_delivered: BacktestMetrics::from_obs(&sd),
+                accept_delivered: BacktestMetrics::from_obs(&ad),
+                started_applied: BacktestMetrics::from_obs(&sa),
+            }
+        })
+        .collect();
+    repos.sort_by(|a, b| {
+        b.started_delivered
+            .count
+            .cmp(&a.started_delivered.count)
+            .then_with(|| a.repo_name.cmp(&b.repo_name))
+    });
+
+    OnlineCalibrationReport {
+        at: format_epoch(now_ts, false, "%Y-%m-%dT%H:%M:%SZ"),
+        window: window_label.to_string(),
+        total_records: records.len(),
+        overall_started_delivered: BacktestMetrics::from_obs(&all_sd),
+        overall_accept_delivered: BacktestMetrics::from_obs(&all_ad),
+        overall_started_applied: BacktestMetrics::from_obs(&all_sa),
+        repos,
+    }
+}
+
+fn analyze_calibration_by_repo(
+    state: &Path,
+    now_ts: i64,
+    requested_secs: Option<i64>,
+) -> HashMap<String, RepoCalibrationReport> {
+    // Expand calibration lookback to at least 14d when requested window < 14d so sparse
+    // repos still show coverage cleanly.
+    let cutoff = requested_secs.map(|d| now_ts - d.max(EXPAND_WINDOW_SECS));
+    let records = read_calibration_records(state, cutoff, None);
+    if records.is_empty() {
+        return HashMap::new();
+    }
+    let rep = build_calibration_report(&records, now_ts, "14d");
+    rep.repos
+        .into_iter()
+        .map(|r| (r.repo.clone(), r))
+        .collect()
+}
+
+pub fn analyze_calibration_in(
+    state: &Path,
+    now_ts: i64,
+    since_str: &str,
+    repo_filter: Option<&str>,
+) -> Res<OnlineCalibrationReport> {
+    let (cutoff, label) = if since_str.eq_ignore_ascii_case("all") {
+        (None, "all".to_string())
+    } else {
+        let secs = seconds(since_str)?.round() as i64;
+        if secs <= 0 {
+            return Err(format!("--since must be positive, got {since_str:?}"));
+        }
+        (Some(now_ts - secs.max(EXPAND_WINDOW_SECS)), since_str.to_string())
+    };
+    let records = read_calibration_records(state, cutoff, repo_filter);
+    Ok(build_calibration_report(&records, now_ts, &label))
+}
+
+fn format_calibration_inline_summary(cal: &OnlineCalibrationReport) -> String {
+    let mut out = format!(
+        "\nETA 在线校准（来源 eta-calibration.jsonl，健康 65%–85%，偏差 ±15% 内，共 {} 条）：\n",
+        cal.total_records
+    );
+    if cal.overall_started_delivered.count > 0 {
+        out.push_str(&format!(
+            "  起跑→交付：{}\n",
+            fmt_bt_metric_brief(&cal.overall_started_delivered)
+        ));
+    }
+    if cal.overall_accept_delivered.count > 0 {
+        out.push_str(&format!(
+            "  验收→交付：{}\n",
+            fmt_bt_metric_brief(&cal.overall_accept_delivered)
+        ));
+    }
+    if cal.overall_started_applied.count > 0 {
+        out.push_str(&format!(
+            "  起跑→合入：{}\n",
+            fmt_bt_metric_brief(&cal.overall_started_applied)
+        ));
+    }
+    out
 }
 
 pub fn normalize_mode_class(mode: &str, class: &str, tier: &str) -> (String, String) {
@@ -4494,6 +4791,70 @@ mod tests {
         assert!(opt_m.p75_alert);
         // median((1000 - 400) / 1000) = +0.60
         assert!((opt_m.p50_rel_bias.unwrap() - 0.60).abs() < 1e-6);
+
+        let _ = fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn online_calibration_aggregates_coverage_bias_alerts_and_handles_deletion() {
+        let state = temp_dir_for_bt("online-cal");
+        let now = 1_800_000_000_i64;
+        let repo_a = "/work/healthy-repo";
+        let repo_b = "/work/opt-repo";
+
+        // Seed minimal events so analyze_in produces rows for both repos.
+        let mut evs = Vec::new();
+        for (repo, tag) in [(repo_a, "a"), (repo_b, "b")] {
+            let st = now - 3600;
+            evs.push(json!({"seq": evs.len() + 1, "at": format_epoch(st, false, "%Y-%m-%dT%H:%M:%SZ"), "run": format!("r-{tag}"), "repo": repo, "kind": "started", "payload": {"mode": "write", "class": "build"}}));
+            evs.push(json!({"seq": evs.len() + 1, "at": format_epoch(st + 600, false, "%Y-%m-%dT%H:%M:%SZ"), "run": format!("r-{tag}"), "repo": repo, "kind": "delivered", "payload": {"mode": "write"}}));
+            evs.push(json!({"seq": evs.len() + 1, "at": format_epoch(st + 900, false, "%Y-%m-%dT%H:%M:%SZ"), "run": format!("r-{tag}"), "repo": repo, "kind": "applied", "payload": {}}));
+        }
+        let ev_text = evs.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n";
+        fs::write(state.join("events.jsonl"), ev_text).unwrap();
+
+        // Write online calibration records:
+        // repo_a: 3/4 covered (75% healthy), repo_b: 1/4 covered (25% optimistic alert!)
+        let mut cal_lines = Vec::new();
+        for i in 0..4 {
+            let at = format_epoch(now - 600 + i * 60, false, "%Y-%m-%dT%H:%M:%SZ");
+            let actual_a = if i < 3 { 500.0 } else { 900.0 };
+            cal_lines.push(json!({
+                "at": at, "run": format!("ha-{i}"), "repo": repo_a, "repoName": "healthy-repo",
+                "mode": "write", "class": "build", "checkpoint": "started", "milestone": "delivered",
+                "predP50Sec": 500.0, "predP75Sec": 700.0, "actualSec": actual_a,
+                "fallbackLevel": "L1", "isPrior": false
+            }).to_string());
+            let actual_b = if i == 0 { 500.0 } else { 1200.0 };
+            cal_lines.push(json!({
+                "at": at, "run": format!("ob-{i}"), "repo": repo_b, "repoName": "opt-repo",
+                "mode": "write", "class": "build", "checkpoint": "started", "milestone": "delivered",
+                "predP50Sec": 500.0, "predP75Sec": 700.0, "actualSec": actual_b,
+                "fallbackLevel": "L1", "isPrior": false
+            }).to_string());
+        }
+        fs::write(eta_calibration_path(&state), cal_lines.join("\n") + "\n").unwrap();
+
+        let cal = analyze_calibration_in(&state, now, "14d", None).unwrap();
+        assert_eq!(cal.total_records, 8);
+        assert_eq!(cal.overall_started_delivered.count, 8);
+        assert!((cal.overall_started_delivered.p75_coverage.unwrap() - 0.50).abs() < 1e-6);
+        assert_eq!(cal.overall_started_delivered.p75_status, "optimistic");
+        assert!(cal.overall_started_delivered.p75_alert);
+
+        let reports = analyze_in(&state, now, "14d", None, false).unwrap();
+        let human = format_human(&reports, "14d");
+        assert!(human.contains("ETA p75覆盖"), "{human}");
+        assert!(human.contains("75%(4)"), "{human}");
+        assert!(human.contains("25%⚠(4)"), "{human}");
+
+        // Deleting derived eta-calibration.jsonl degrades cleanly without error.
+        fs::remove_file(eta_calibration_path(&state)).unwrap();
+        let empty_cal = analyze_calibration_in(&state, now, "14d", None).unwrap();
+        assert_eq!(empty_cal.total_records, 0);
+        let reports_after = analyze_in(&state, now, "14d", None, false).unwrap();
+        assert_eq!(reports_after.len(), 2);
+        assert!(reports_after.iter().all(|r| r.eta_calibration.is_none()));
 
         let _ = fs::remove_dir_all(&state);
     }

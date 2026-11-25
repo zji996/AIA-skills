@@ -866,6 +866,7 @@ pub fn mark_merge_run_applied(merge_run: &Path, applied_head: &str) {
             }
             src_meta["appliedViaMerge"] = json!(&merge_id);
             let _ = write_json(src_dir.join("meta.json"), &src_meta);
+            crate::eta::record_calibration_applied(&src_dir, &src_meta, &at);
         }
     }
 }

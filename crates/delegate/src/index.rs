@@ -521,17 +521,30 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
     }
 
     let state = state_dir();
+    let now_ts = epoch() as i64;
     let index = load_index(&state);
     let wsig = work_file_sig(&state);
     let repos = discover_snapshot_repos(&state, &explicit_repos, root.as_deref());
+    let lane = crate::lane::status_json_readonly().unwrap_or_else(|_| json!({}));
 
-    let mut repo_groups = Vec::new();
+    struct RawSnapshotGroup {
+        repo_path: PathBuf,
+        runs_dir: PathBuf,
+        run_pairs: Vec<(PathBuf, Value)>,
+        cleaned_notes: Vec<Value>,
+    }
+
+    let mut raw_groups: Vec<RawSnapshotGroup> = Vec::new();
     let mut all_seen_runs: BTreeMap<String, Value> = BTreeMap::new();
+    let mut all_run_dirs: Vec<PathBuf> = Vec::new();
+    let mut precomputed_statuses: std::collections::HashMap<PathBuf, Value> =
+        std::collections::HashMap::new();
+    let mut superseded_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut head_cache: std::collections::HashMap<PathBuf, Option<String>> =
         std::collections::HashMap::new();
     for (repo_path, runs_dir) in repos {
         let run_dirs = runs::all_runs_in_with_index(&runs_dir, &index);
-        let mut run_statuses = Vec::with_capacity(run_dirs.len());
+        let mut run_pairs = Vec::with_capacity(run_dirs.len());
         for run in &run_dirs {
             let (mut st, idx_meta) = status_and_meta_cached(run, &index, &wsig);
             for key in ["resultReadAt", "appliedAt", "repliedAt"] {
@@ -546,15 +559,67 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
             }
             crate::premerge::overlay_live_status(&mut st, run, &mut head_cache);
             let rid = s(&st, "run").to_string();
+            let parent_id = s(&st, "parent").to_string();
+            if !parent_id.is_empty() {
+                superseded_ids.insert(parent_id);
+            }
             if !rid.is_empty() {
                 all_seen_runs.insert(rid, st.clone());
             }
-            run_statuses.push(st);
+            all_run_dirs.push(run.clone());
+            precomputed_statuses.insert(run.clone(), st.clone());
+            run_pairs.push((run.clone(), st));
         }
         let cleaned_notes: Vec<Value> = crate::notes::cleaned_pending_chains(&run_dirs)
             .into_iter()
             .map(|c| crate::output::cleaned_note_json(&c))
             .collect();
+        raw_groups.push(RawSnapshotGroup {
+            repo_path,
+            runs_dir,
+            run_pairs,
+            cleaned_notes,
+        });
+    }
+
+    // Strictly zero-lock, zero-disk-write, zero-git ETA projection for snapshot & TUI.
+    let eta_model = crate::speed::load_or_refresh_eta_model_in(&state, now_ts, false);
+    let eta_ctx = crate::eta::LiveContext::capture_readonly(
+        &state,
+        now_ts,
+        &all_run_dirs,
+        precomputed_statuses,
+        Some(&lane),
+    );
+    let mut wave_etas: Vec<crate::eta::RunEta> = Vec::new();
+    let mut repo_groups = Vec::with_capacity(raw_groups.len());
+    for RawSnapshotGroup {
+        repo_path,
+        runs_dir,
+        run_pairs,
+        cleaned_notes,
+    } in raw_groups
+    {
+        let mut run_statuses = Vec::with_capacity(run_pairs.len());
+        for (run, mut st) in run_pairs {
+            let st_str = s(&st, "state");
+            let is_live = runs::active(st_str);
+            let is_unapplied_terminal = !b(&st, "applied")
+                && !b(&st, "cleaned")
+                && matches!(
+                    st_str,
+                    "delivered" | "answered" | "rejected" | "blocked_mainline" | "failed" | "stopped"
+                );
+            if is_live || is_unapplied_terminal {
+                let re = crate::eta::estimate_run_with_status(&run, &st, &eta_model, &eta_ctx);
+                st["eta"] = re.to_json();
+                let rid = s(&st, "run");
+                if is_live || !superseded_ids.contains(rid) {
+                    wave_etas.push(re);
+                }
+            }
+            run_statuses.push(st);
+        }
         repo_groups.push(json!({
             "path": repo_path.to_string_lossy(),
             "runsDir": runs_dir.to_string_lossy(),
@@ -574,9 +639,27 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
             .and_then(|e| e["seq"].as_u64())
             .unwrap_or(0),
     );
-    let work_items = crate::work::load_readonly_json(&state);
-    let lane = crate::lane::status_json_readonly().unwrap_or_else(|_| json!({}));
+    let mut work_items = crate::work::load_readonly_json(&state);
+    let work_struct_items = crate::work::load_readonly_in(&state);
+    let work_dag = crate::eta::estimate_work_dag_in(&work_struct_items, None, &eta_model, &eta_ctx);
+    let work_eta_map: std::collections::HashMap<String, Value> = work_dag
+        .items
+        .iter()
+        .map(|it| (it.id.clone(), it.to_json()))
+        .collect();
+    for item in &mut work_items {
+        let wid = s(item, "id").to_string();
+        if let Some(weta) = work_eta_map.get(&wid) {
+            item["eta"] = weta.clone();
+        }
+    }
     let dag_queue = crate::dag_queue::load_items(&state);
+    let queue_dag = crate::eta::estimate_queue_dag_in(&dag_queue, None, &eta_model, &eta_ctx);
+    let eta_summary = json!({
+        "wave": crate::eta::summarize_wave_eta(&wave_etas, now_ts),
+        "work": work_dag.to_json(),
+        "queue": queue_dag.to_json(),
+    });
     let merges = crate::merge::load_merge_reports(None);
     let candidates = crate::radar::load_all_candidates(None);
     let agy_accounts = crate::agy_accounts::snapshot_json_fast();
@@ -595,6 +678,7 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
         "candidates": candidates,
         "agyAccounts": agy_accounts,
         "analytics": analytics,
+        "eta": eta_summary,
     });
     println!("{payload}");
     Ok(0)

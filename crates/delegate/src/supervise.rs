@@ -1785,6 +1785,7 @@ fn admit_waiting(run: &Path, meta: &mut Value) -> Res<bool> {
             );
             crate::index::upsert_run(run);
             crate::board::refresh_for_run(run);
+            crate::eta::record_pred_started(run, meta);
             return Ok(true);
         }
         drop(state_guard);

@@ -1862,6 +1862,7 @@ fn mark_applied_command(args: &[String]) -> Res<i32> {
                 "appliedBy": "manual",
             }),
         );
+        eta::record_calibration_applied(rdir, meta, s(applied_doc, "at"));
         events::mark_run_read(&rid);
         index::upsert_run(rdir);
         board::refresh_for_run(rdir);
@@ -2482,6 +2483,7 @@ fn apply(args: &[String]) -> Res<i32> {
                 "applied",
                 ev_payload,
             );
+            eta::record_calibration_applied(run, &meta, s(&applied, "at"));
             events::mark_run_read(&run_id_ev);
             index::upsert_run(run);
             board::refresh_for_run(run);

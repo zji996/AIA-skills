@@ -145,6 +145,24 @@ pub fn format_clock(ts: i64, now_ts: i64) -> String {
     }
 }
 
+/// Format a compact ETA clock badge guaranteed to stay within <= 6 display columns
+/// for narrow/phone TUI layouts (`<5m`, `~03:40`, `~20h`, `~2d`).
+pub fn format_compact_clock(ts: i64, now_ts: i64, rem_sec: f64) -> String {
+    if rem_sec < 300.0 {
+        return "<5m".to_string();
+    }
+    let delta = (ts - now_ts).max(0);
+    if delta <= 18 * 3600 {
+        format!("~{}", format_epoch(ts, true, "%H:%M"))
+    } else if delta < 48 * 3600 {
+        let h = ((delta as f64) / 3600.0).round() as i64;
+        format!("~{h}h")
+    } else {
+        let d = ((delta as f64) / 86_400.0).round() as i64;
+        format!("~{d}d")
+    }
+}
+
 /// Hysteresis refresh check for write paths (design.md §4):
 /// Refresh `shownP50At` only when:
 /// 1. No prior `shownP50At`,
@@ -575,6 +593,7 @@ pub struct WorkItemEta {
     pub upstream_path: Vec<String>,
     pub short_text: String,
     pub focus_badge: String,
+    pub compact_badge: String,
     pub is_prior: bool,
     pub now_ts: i64,
 }
@@ -595,6 +614,7 @@ impl WorkItemEta {
             "upstreamPath": self.upstream_path,
             "shortText": self.short_text,
             "focusBadge": self.focus_badge,
+            "compactBadge": self.compact_badge,
             "isPrior": self.is_prior,
         });
         if let Some(r) = &self.active_run {
@@ -831,11 +851,42 @@ pub struct LiveContext {
     pub fill_targets: HashMap<String, usize>,
     /// Optional explicit run directories mapped by run id (used in tests & cross-repo lookups).
     pub run_dir_index: HashMap<String, PathBuf>,
+    /// Precomputed run status objects (e.g. from `snapshot --json` or `index.json`), avoiding
+    /// redundant `runs::status` reads on hot zero-lock/zero-git paths.
+    pub precomputed_statuses: HashMap<PathBuf, Value>,
+    /// When `true`, never fall back to `runs::resolve_head` (which may probe git top-level).
+    pub no_git_fallback: bool,
 }
 
 impl LiveContext {
     pub fn capture(state: &Path, now_ts: i64, visible_runs: &[PathBuf]) -> Self {
-        let lane = LiveLaneSnapshot::capture();
+        Self::capture_inner(state, now_ts, visible_runs, HashMap::new(), None, false)
+    }
+
+    /// Strictly zero-lock, zero-disk-write, zero-git live context capture for `snapshot --json`
+    /// and Stop hook evaluation. Reuses an already-read lane status JSON and cached run statuses.
+    pub fn capture_readonly(
+        state: &Path,
+        now_ts: i64,
+        visible_runs: &[PathBuf],
+        precomputed_statuses: HashMap<PathBuf, Value>,
+        lane_json: Option<&Value>,
+    ) -> Self {
+        Self::capture_inner(state, now_ts, visible_runs, precomputed_statuses, lane_json, true)
+    }
+
+    fn capture_inner(
+        state: &Path,
+        now_ts: i64,
+        visible_runs: &[PathBuf],
+        precomputed_statuses: HashMap<PathBuf, Value>,
+        lane_json: Option<&Value>,
+        no_git_fallback: bool,
+    ) -> Self {
+        let lane = match lane_json {
+            Some(v) if v.is_object() => LiveLaneSnapshot::from_status_json(v),
+            _ => LiveLaneSnapshot::capture(),
+        };
         let active_machine_runs = launch::machine_runs(state);
         let mut all_paths: Vec<PathBuf> = Vec::new();
         let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -876,6 +927,8 @@ impl LiveContext {
             repo_mainline_clusters,
             fill_targets,
             run_dir_index,
+            precomputed_statuses,
+            no_git_fallback,
         }
     }
 
@@ -913,9 +966,11 @@ impl LiveContext {
                 return Some(pb.clone());
             }
         }
-        if let Ok(pb) = runs::resolve_head(rid) {
-            if pb.join("meta.json").is_file() {
-                return Some(pb);
+        if !self.no_git_fallback {
+            if let Ok(pb) = runs::resolve_head(rid) {
+                if pb.join("meta.json").is_file() {
+                    return Some(pb);
+                }
             }
         }
         None
@@ -1142,11 +1197,12 @@ fn parse_iso_or_date_epoch(value: &str) -> Option<i64> {
 /// Estimate remaining time for a single run, with stop-clock blocker attribution
 /// and real-time lane/capacity queue adjustment.
 pub fn estimate_run_in(run: &Path, model: &EtaModel, ctx: &LiveContext) -> RunEta {
-    estimate_run_inner(run, None, model, ctx, false)
+    let pre = ctx.precomputed_statuses.get(run);
+    estimate_run_inner(run, pre, model, ctx, false)
 }
 
 /// Estimate remaining time for a single run, reusing an already-computed `status` JSON object
-/// to avoid redundant disk reads on hot read paths (`status`, `work show`).
+/// to avoid redundant disk reads on hot read paths (`status`, `work show`, `snapshot --json`, `hook_check`).
 pub fn estimate_run_with_status(
     run: &Path,
     status: &Value,
@@ -1173,6 +1229,95 @@ pub fn overlay_status_eta(
     }
 }
 
+/// Lightweight zero-git, zero-lock fallback ETA for a live run known only via an
+/// index status object (e.g., when `<run>/meta.json` is unavailable on disk).
+pub fn estimate_live_status_fallback(
+    status: &Value,
+    model: &EtaModel,
+    now_ts: i64,
+) -> Option<RunEta> {
+    let state = s(status, "state").to_string();
+    if !runs::active(&state) || status["stallWarning"].is_object() {
+        return None;
+    }
+    let raw_mode = {
+        let m = s(status, "mode");
+        if m.is_empty() { "write" } else { m }
+    };
+    let raw_class = s(status, "class");
+    let raw_tier = s(status, "tier");
+    let (norm_mode, norm_class) = speed::normalize_mode_class(raw_mode, raw_class, raw_tier);
+    let is_write = norm_mode == "write";
+    let repo = {
+        let r = s(status, "repo");
+        if !r.is_empty() {
+            r.to_string()
+        } else {
+            s(status, "top").to_string()
+        }
+    };
+    let elapsed = status["elapsedSeconds"]
+        .as_f64()
+        .or_else(|| status["ageSeconds"].as_f64())
+        .unwrap_or(0.0)
+        .max(0.0);
+    let resolved_bucket = model.resolve_bucket(&repo, &norm_mode, &norm_class);
+    let work_d = model.resolve_dist(&repo, &norm_mode, &norm_class, |b| &b.agent_work);
+    let (w50, w75, anom) = work_d.dist.conditional_residual(elapsed).unwrap_or(if is_write {
+        (30.0 * 60.0, 45.0 * 60.0, false)
+    } else {
+        (5.0 * 60.0, 10.0 * 60.0, false)
+    });
+    let (rem50, rem75) = if is_write {
+        let suf = model.resolve_dist(&repo, &norm_mode, &norm_class, |b| &b.suffix_after_work);
+        let s50 = suf.dist.p50_sec.unwrap_or(0.0);
+        let s75 = suf.dist.p75_sec.unwrap_or(s50).max(s50);
+        combine_p50_p75(&[(w50, w75), (s50, s75)])
+    } else {
+        (w50, w75)
+    };
+    let to_delivered = EtaRange::from_remaining(now_ts, rem50, rem75, anom);
+    let target_milestone = if is_write { "delivered" } else { "answered" };
+    let verb = if is_write { "交付" } else { "答复" };
+    let compact_badge = format_compact_clock(to_delivered.rounded_p50_at, now_ts, to_delivered.p50_sec);
+    let short_text = format!(
+        "预计 {} {verb}（p75 {}）",
+        format_clock(to_delivered.rounded_p50_at, now_ts),
+        format_clock(to_delivered.rounded_p75_at, now_ts),
+    );
+    let run_id = s(status, "run").to_string();
+    let name = {
+        let nm = s(status, "name");
+        if nm.is_empty() { run_id.clone() } else { nm.to_string() }
+    };
+    Some(RunEta {
+        run: run_id,
+        name,
+        repo,
+        mode: norm_mode,
+        class: norm_class,
+        state,
+        stage: Stage::AgentWork,
+        stage_label: Stage::AgentWork.label_zh().to_string(),
+        stage_elapsed_sec: Some(elapsed),
+        round: status["chainRound"].as_u64().unwrap_or(1).max(1) as usize,
+        target_milestone,
+        to_delivered: Some(to_delivered),
+        to_applied: None,
+        blocker: None,
+        lane_wait: None,
+        capacity_wait: None,
+        fallback_level: work_d.level,
+        bucket_key: work_d.key,
+        is_prior: work_d.level.is_prior(),
+        rework_rate: resolved_bucket.bucket.auto_rework_rate,
+        short_text: short_text.clone(),
+        compact_badge,
+        detail_text: short_text,
+        now_ts,
+    })
+}
+
 /// Convenience wrapper loading `<state>/eta-model.json` (lazily rebuilding if stale)
 /// and capturing live lane/machine context once.
 #[allow(dead_code)] // Consumed by Chain 3/4 callers.
@@ -1195,12 +1340,13 @@ fn estimate_run_inner(
     let now_ts = ctx.now_ts;
     let meta = json(run.join("meta.json"));
     let owned_status;
-    let status = match precomputed_status {
-        Some(st) => st,
-        None => {
-            owned_status = runs::status(run);
-            &owned_status
-        }
+    let status: &Value = if let Some(st) = precomputed_status {
+        st
+    } else if let Some(st) = ctx.precomputed_statuses.get(run) {
+        st
+    } else {
+        owned_status = runs::status(run);
+        &owned_status
     };
     let run_id = run_id_from(run, &meta);
     let name = {
@@ -1304,27 +1450,45 @@ fn estimate_run_inner(
     let finished_ts = iso_epoch(s(status, "finishedAt"));
     let stopped_age = finished_ts.map(|t| (now_ts - t).max(0));
 
-    // 1. Stop-clock checks for active runs: stallWarning or memory capacity wait.
-    if is_active && status["stallWarning"].is_object() {
-        let stall_sec = status["stallWarning"]["elapsedSeconds"]
-            .as_i64()
-            .or_else(|| status["stallWarning"]["idleSeconds"].as_i64());
-        return make_stopped(
-            Stage::Blocked,
-            BlockerInfo {
-                kind: BlockerKind::StallWarning,
-                who: "疑似卡住".into(),
-                reason: "停表".into(),
-                since_sec: stall_sec,
-                target: None,
-                affected_count: None,
-                unlock_at: None,
-                after_unlock_p50_sec: None,
-                after_unlock_p75_sec: None,
-                label: "⚠ 疑似卡住·停表".into(),
-            },
-            false,
-        );
+    // 1. Stop-clock checks for active runs: stallWarning (cached or live file) or memory capacity wait.
+    let live_stall = if is_active && !status["stallWarning"].is_object() {
+        let p = run.join("stall-warning.json");
+        if p.is_file() {
+            let v = json(p);
+            v.is_object().then_some(v)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let stall_obj = if status["stallWarning"].is_object() {
+        Some(&status["stallWarning"])
+    } else {
+        live_stall.as_ref()
+    };
+    if is_active {
+        if let Some(sw) = stall_obj {
+            let stall_sec = sw["elapsedSeconds"]
+                .as_i64()
+                .or_else(|| sw["idleSeconds"].as_i64());
+            return make_stopped(
+                Stage::Blocked,
+                BlockerInfo {
+                    kind: BlockerKind::StallWarning,
+                    who: "疑似卡住".into(),
+                    reason: "停表".into(),
+                    since_sec: stall_sec,
+                    target: None,
+                    affected_count: None,
+                    unlock_at: None,
+                    after_unlock_p50_sec: None,
+                    after_unlock_p75_sec: None,
+                    label: "⚠ 疑似卡住·停表".into(),
+                },
+                false,
+            );
+        }
     }
 
     // 2. Non-active runs: either S7 premerge running, or stopped-clock attributed to someone.
@@ -1460,7 +1624,7 @@ fn estimate_run_inner(
                     format_clock(to_app.rounded_p50_at, now_ts),
                     format_clock(to_app.rounded_p75_at, now_ts),
                 );
-                let compact_badge = format!("~{}", format_clock(to_app.rounded_p50_at, now_ts));
+                let compact_badge = format_compact_clock(to_app.rounded_p50_at, now_ts, to_app.p50_sec);
                 let detail_text = format!(
                     "预估：已交付，预合并中（{}，剩 ~{}），预计 {} 合入（p75 {}）{prior_tag}",
                     format_age_short(pm_elapsed as i64),
@@ -1891,11 +2055,7 @@ fn estimate_run_inner(
         )
     };
 
-    let compact_badge = if to_delivered.p50_sec < 300.0 {
-        "<5m".to_string()
-    } else {
-        format!("~{}", format_clock(to_delivered.rounded_p50_at, now_ts))
-    };
+    let compact_badge = format_compact_clock(to_delivered.rounded_p50_at, now_ts, to_delivered.p50_sec);
 
     let elapsed_part = stage_elapsed_sec
         .map(|e| format!(" {}", format_age_short(e as i64)))
@@ -2031,7 +2191,7 @@ fn estimate_capacity_wait(
             if scope_repo && !repo.is_empty() && repo_from_meta(&ometa) != repo {
                 continue;
             }
-            let oeta = estimate_run_inner(other, None, model, ctx, true);
+            let oeta = estimate_run_inner(other, ctx.precomputed_statuses.get(other), model, ctx, true);
             if let Some(d) = oeta.to_delivered {
                 active_rems.push((d.p50_sec, d.p75_sec));
             }
@@ -2623,6 +2783,18 @@ pub fn estimate_work_dag_in(
             ("-".into(), "-".into())
         };
 
+        let compact_badge = if let Some(b) = &item_blocker {
+            b.kind.compact_badge().to_string()
+        } else if let Some(rem) = &remaining {
+            if w.state == "verify" {
+                "待验".into()
+            } else {
+                format_compact_clock(rem.rounded_p50_at, now_ts, rem.p50_sec)
+            }
+        } else {
+            "-".into()
+        };
+
         item_etas.push(WorkItemEta {
             id: w.id.clone(),
             title: w.title.clone(),
@@ -2639,6 +2811,7 @@ pub fn estimate_work_dag_in(
             upstream_path: path,
             short_text,
             focus_badge,
+            compact_badge,
             is_prior: is_p,
             now_ts,
         });
@@ -3106,6 +3279,14 @@ pub fn estimate_queue_dag_in(
             ("已完成".into(), "完成".into())
         };
 
+        let compact_badge = if let Some(b) = &blk {
+            b.kind.compact_badge().to_string()
+        } else if let Some(r) = &rem {
+            format_compact_clock(r.rounded_p50_at, now_ts, r.p50_sec)
+        } else {
+            "完成".into()
+        };
+
         items_out.push(WorkItemEta {
             id: nm.clone(),
             title: nm.clone(),
@@ -3122,6 +3303,7 @@ pub fn estimate_queue_dag_in(
             upstream_path: cp_path.get(&nm).cloned().unwrap_or_default(),
             short_text,
             focus_badge,
+            compact_badge,
             is_prior: any_prior,
             now_ts,
         });
@@ -3601,6 +3783,502 @@ fn format_dag_human(dag: &DagEtaSummary) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Snapshot wave summary & online milestone calibration
+// ---------------------------------------------------------------------------
+
+pub const ETA_PRED_FILE: &str = "eta-pred.json";
+
+/// Summarize the current live wave of runs for `delegate snapshot --json` (TUI Overview card).
+pub fn summarize_wave_eta(run_etas: &[RunEta], now_ts: i64) -> Value {
+    let mut active_count = 0usize;
+    let mut running_count = 0usize;
+    let mut queued_count = 0usize;
+    let mut blocked_count = 0usize;
+    let mut earliest_p50_at: Option<i64> = None;
+    let mut wave_p50_at: Option<i64> = None;
+    let mut wave_p75_at: Option<i64> = None;
+    let mut is_prior = false;
+    let mut blockers: Vec<Value> = Vec::new();
+
+    for re in run_etas {
+        let is_live = runs::active(&re.state);
+        if is_live {
+            active_count += 1;
+            if re.stage == Stage::CapacityQueue || re.state == "waiting" {
+                queued_count += 1;
+            } else {
+                running_count += 1;
+            }
+        }
+        if let Some(b) = &re.blocker {
+            blocked_count += 1;
+            blockers.push(json!({
+                "run": re.run,
+                "name": re.name,
+                "kind": b.kind.as_str(),
+                "compact": b.kind.compact_badge(),
+                "label": b.label,
+            }));
+        } else if is_live {
+            if let Some(d) = &re.to_delivered {
+                if re.is_prior {
+                    is_prior = true;
+                }
+                earliest_p50_at = Some(match earliest_p50_at {
+                    Some(cur) => cur.min(d.rounded_p50_at),
+                    None => d.rounded_p50_at,
+                });
+                wave_p50_at = Some(match wave_p50_at {
+                    Some(cur) => cur.max(d.rounded_p50_at),
+                    None => d.rounded_p50_at,
+                });
+                wave_p75_at = Some(match wave_p75_at {
+                    Some(cur) => cur.max(d.rounded_p75_at),
+                    None => d.rounded_p75_at,
+                });
+            }
+        }
+    }
+
+    let mut obj = json!({
+        "activeCount": active_count,
+        "runningCount": running_count,
+        "queuedCount": queued_count,
+        "blockedCount": blocked_count,
+        "isPrior": is_prior,
+        "blockers": blockers,
+    });
+    if let Some(t) = earliest_p50_at {
+        obj["earliestP50At"] = json!(format_epoch(t, false, "%Y-%m-%dT%H:%M:%SZ"));
+        obj["earliestP50Clock"] = json!(format_clock(t, now_ts));
+    }
+    if let Some(t) = wave_p50_at {
+        obj["waveP50At"] = json!(format_epoch(t, false, "%Y-%m-%dT%H:%M:%SZ"));
+        obj["waveP50Clock"] = json!(format_clock(t, now_ts));
+    }
+    if let Some(t) = wave_p75_at {
+        obj["waveP75At"] = json!(format_epoch(t, false, "%Y-%m-%dT%H:%M:%SZ"));
+        obj["waveP75Clock"] = json!(format_clock(t, now_ts));
+    }
+    obj
+}
+
+fn pred_path(run: &Path) -> PathBuf {
+    run.join(ETA_PRED_FILE)
+}
+
+/// Record initial ETA prediction into `<run>/eta-pred.json` when a run transitions to `started`.
+/// Strictly lock-free, best-effort, never fails the run.
+pub fn record_pred_started(run: &Path, meta: &Value) {
+    let state = state_dir();
+    let now_ts = epoch() as i64;
+    record_pred_started_in(&state, run, meta, now_ts);
+}
+
+pub fn record_pred_started_in(state: &Path, run: &Path, meta: &Value, now_ts: i64) {
+    let path = pred_path(run);
+    let mut doc = json(&path);
+    if doc.is_object() && doc["started"].is_object() {
+        return;
+    }
+
+    let run_id = run_id_from(run, meta);
+    let repo = repo_from_meta(meta);
+    let raw_mode = {
+        let m = s(meta, "mode");
+        if m.is_empty() { "write" } else { m }
+    };
+    let (norm_mode, norm_class) =
+        speed::normalize_mode_class(raw_mode, s(meta, "class"), s(meta, "tier"));
+    let is_write = norm_mode == "write";
+
+    let model = speed::load_or_refresh_eta_model_in(state, now_ts, false);
+    let e2e = model.resolve_dist(&repo, &norm_mode, &norm_class, |b| &b.run_to_delivered);
+    let (del_p50, del_p75) = match (e2e.dist.p50_sec, e2e.dist.p75_sec) {
+        (Some(a), Some(b)) => (a.max(1.0), b.max(a.max(1.0))),
+        (Some(a), None) => (a.max(1.0), (a * 1.4).max(1.0)),
+        _ if is_write => (35.0 * 60.0, 50.0 * 60.0),
+        _ => (5.0 * 60.0, 10.0 * 60.0),
+    };
+
+    let (app_p50, app_p75) = if is_write {
+        let ap = model.resolve_dist(&repo, "write", &norm_class, |b| &b.chain_to_applied);
+        match (ap.dist.p50_sec, ap.dist.p75_sec) {
+            (Some(a), Some(b)) => (Some(a.max(del_p50)), Some(b.max(a.max(del_p50)))),
+            (Some(a), None) => (Some(a.max(del_p50)), Some((a * 1.38).max(del_p75))),
+            _ => (Some((63.0 * 60.0_f64).max(del_p50)), Some((87.0 * 60.0_f64).max(del_p75))),
+        }
+    } else {
+        (None, None)
+    };
+
+    let started_epoch = meta["startedEpoch"]
+        .as_f64()
+        .map(|f| f.round() as i64)
+        .or_else(|| iso_epoch(s(meta, "startedAt")))
+        .unwrap_or(now_ts);
+    let started_at = format_epoch(started_epoch, false, "%Y-%m-%dT%H:%M:%SZ");
+
+    let mut started_obj = json!({
+        "at": started_at,
+        "epoch": started_epoch,
+        "stage": Stage::AgentWork.as_str(),
+        "fallbackLevel": e2e.level.as_str(),
+        "bucketKey": e2e.key,
+        "isPrior": e2e.level.is_prior(),
+        "toDeliveredP50Sec": speed::round2(del_p50),
+        "toDeliveredP75Sec": speed::round2(del_p75),
+    });
+    if let (Some(a50), Some(a75)) = (app_p50, app_p75) {
+        started_obj["toAppliedP50Sec"] = json!(speed::round2(a50));
+        started_obj["toAppliedP75Sec"] = json!(speed::round2(a75));
+    }
+
+    if !doc.is_object() {
+        doc = json!({
+            "version": 1,
+            "run": run_id,
+            "repo": repo,
+            "repoName": speed::short_repo_name(&repo),
+            "mode": norm_mode,
+            "class": norm_class,
+        });
+        if !s(meta, "parent").is_empty() {
+            doc["parent"] = json!(s(meta, "parent"));
+        }
+    }
+    doc["started"] = started_obj;
+    let _ = write_json(&path, &doc);
+}
+
+/// Record first-entry `accept`/`review` ETA prediction into `<run>/eta-pred.json`.
+/// Strictly lock-free, recorded once per run, best-effort.
+pub fn record_pred_accept_review(run: &Path, meta: &Value) {
+    let state = state_dir();
+    let now_ts = epoch() as i64;
+    record_pred_accept_review_in(&state, run, meta, now_ts);
+}
+
+pub fn record_pred_accept_review_in(state: &Path, run: &Path, meta: &Value, now_ts: i64) {
+    let path = pred_path(run);
+    let mut doc = json(&path);
+    if doc.is_object() && doc["acceptReview"].is_object() {
+        return;
+    }
+
+    let run_id = run_id_from(run, meta);
+    let repo = repo_from_meta(meta);
+    let raw_mode = {
+        let m = s(meta, "mode");
+        if m.is_empty() { "write" } else { m }
+    };
+    let (norm_mode, norm_class) =
+        speed::normalize_mode_class(raw_mode, s(meta, "class"), s(meta, "tier"));
+    let review_enabled = meta["reviewConfig"].is_object() && b(&meta["reviewConfig"], "enabled");
+
+    let model = speed::load_or_refresh_eta_model_in(state, now_ts, false);
+    let (p50, p75, level, key, stage_str) = if review_enabled {
+        let par = model.resolve_dist(&repo, &norm_mode, &norm_class, |b| &b.accept_review_parallel);
+        let a50 = par.dist.p50_sec.unwrap_or(300.0).max(1.0);
+        let a75 = par.dist.p75_sec.unwrap_or(a50 * 1.6).max(a50);
+        let suf = model.resolve_dist(&repo, &norm_mode, &norm_class, |b| &b.suffix_after_review);
+        let s50 = suf.dist.p50_sec.unwrap_or(0.0).max(0.0);
+        let s75 = suf.dist.p75_sec.unwrap_or(s50).max(s50);
+        let (t50, t75) = combine_p50_p75(&[(a50, a75), (s50, s75)]);
+        (t50, t75, par.level, par.key, Stage::ReviewParallel.as_str())
+    } else {
+        let acc = resolve_run_accept_dist(run, meta, &repo, &model);
+        let a50 = acc.dist.p50_sec.unwrap_or(180.0).max(1.0);
+        let a75 = acc.dist.p75_sec.unwrap_or(a50 * 1.6).max(a50);
+        let suf = model.resolve_dist(&repo, &norm_mode, &norm_class, |b| &b.suffix_after_accept);
+        let s50 = suf.dist.p50_sec.unwrap_or(0.0).max(0.0);
+        let s75 = suf.dist.p75_sec.unwrap_or(s50).max(s50);
+        let (t50, t75) = combine_p50_p75(&[(a50, a75), (s50, s75)]);
+        (t50, t75, acc.level, acc.key, Stage::Accept.as_str())
+    };
+
+    if !doc.is_object() {
+        doc = json!({
+            "version": 1,
+            "run": run_id,
+            "repo": repo,
+            "repoName": speed::short_repo_name(&repo),
+            "mode": norm_mode,
+            "class": norm_class,
+        });
+        if !s(meta, "parent").is_empty() {
+            doc["parent"] = json!(s(meta, "parent"));
+        }
+    }
+    doc["acceptReview"] = json!({
+        "at": format_epoch(now_ts, false, "%Y-%m-%dT%H:%M:%SZ"),
+        "epoch": now_ts,
+        "stage": stage_str,
+        "fallbackLevel": level.as_str(),
+        "bucketKey": key,
+        "isPrior": level.is_prior(),
+        "toDeliveredP50Sec": speed::round2(p50),
+        "toDeliveredP75Sec": speed::round2(p75),
+    });
+    let _ = write_json(&path, &doc);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_calibration_record(
+    state: &Path,
+    at_iso: &str,
+    run_id: &str,
+    repo: &str,
+    mode: &str,
+    class: &str,
+    checkpoint: &str,
+    milestone: &str,
+    pred_p50: f64,
+    pred_p75: f64,
+    actual_sec: f64,
+    fallback_level: &str,
+    is_prior: bool,
+) {
+    let actual = actual_sec.max(0.0);
+    let p50 = pred_p50.max(0.0);
+    let p75 = pred_p75.max(p50);
+    let within_p75 = actual <= p75 + 1e-6;
+    let rel_bias = if actual > 0.0 {
+        Some(((actual - p50) / actual * 10000.0).round() / 10000.0)
+    } else {
+        None
+    };
+    let mut rec = json!({
+        "at": at_iso,
+        "run": run_id,
+        "repo": repo,
+        "repoName": speed::short_repo_name(repo),
+        "mode": mode,
+        "class": class,
+        "checkpoint": checkpoint,
+        "milestone": milestone,
+        "predP50Sec": speed::round2(p50),
+        "predP75Sec": speed::round2(p75),
+        "actualSec": speed::round2(actual),
+        "withinP75": within_p75,
+        "fallbackLevel": fallback_level,
+        "isPrior": is_prior,
+    });
+    if let Some(rb) = rel_bias {
+        rec["relBias"] = json!(rb);
+    }
+    let cal_path = speed::eta_calibration_path(state);
+    if let Some(parent) = cal_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = append_synced(&cal_path, &format!("{rec}\n"));
+}
+
+/// Append prediction-vs-actual records to `<state>/eta-calibration.jsonl` when a run delivers.
+/// Strictly lock-free, idempotent via `recordedDelivered`, best-effort.
+pub fn record_calibration_delivered(run: &Path, meta: &Value, summary: &Value) {
+    let state = state_dir();
+    let now_ts = iso_epoch(s(summary, "finishedAt")).unwrap_or_else(|| epoch() as i64);
+    record_calibration_delivered_in(&state, run, meta, summary, now_ts);
+}
+
+pub fn record_calibration_delivered_in(
+    state: &Path,
+    run: &Path,
+    meta: &Value,
+    summary: &Value,
+    finished_ts: i64,
+) {
+    let st = s(summary, "state");
+    if !matches!(st, "delivered" | "answered")
+        || b(summary, "question")
+        || b(summary, "policyRefused")
+    {
+        return;
+    }
+    let path = pred_path(run);
+    let mut doc = json(&path);
+    if !doc.is_object() || b(&doc, "recordedDelivered") {
+        return;
+    }
+    let run_id = {
+        let r = s(&doc, "run");
+        if r.is_empty() { run_id_from(run, meta) } else { r.to_string() }
+    };
+    let repo = {
+        let r = s(&doc, "repo");
+        if r.is_empty() { repo_from_meta(meta) } else { r.to_string() }
+    };
+    let mode = {
+        let m = s(&doc, "mode");
+        if m.is_empty() { "write" } else { m }
+    }
+    .to_string();
+    let class = {
+        let c = s(&doc, "class");
+        if c.is_empty() { "other" } else { c }
+    }
+    .to_string();
+    let milestone = if mode == "write" { "delivered" } else { "answered" };
+    let at_iso = if !s(summary, "finishedAt").is_empty() {
+        s(summary, "finishedAt").to_string()
+    } else {
+        format_epoch(finished_ts, false, "%Y-%m-%dT%H:%M:%SZ")
+    };
+
+    let mut wrote_any = false;
+    if let Some(st_pred) = doc.get("started").filter(|v| v.is_object()) {
+        if let (Some(p50), Some(p75), Some(t0)) = (
+            st_pred["toDeliveredP50Sec"].as_f64(),
+            st_pred["toDeliveredP75Sec"].as_f64(),
+            st_pred["epoch"].as_i64().or_else(|| iso_epoch(s(st_pred, "at"))),
+        ) {
+            let actual = (finished_ts - t0).max(0) as f64;
+            append_calibration_record(
+                state,
+                &at_iso,
+                &run_id,
+                &repo,
+                &mode,
+                &class,
+                "started",
+                milestone,
+                p50,
+                p75,
+                actual,
+                s(st_pred, "fallbackLevel"),
+                b(st_pred, "isPrior"),
+            );
+            wrote_any = true;
+        }
+    }
+    if let Some(ar_pred) = doc.get("acceptReview").filter(|v| v.is_object()) {
+        if let (Some(p50), Some(p75), Some(t0)) = (
+            ar_pred["toDeliveredP50Sec"].as_f64(),
+            ar_pred["toDeliveredP75Sec"].as_f64(),
+            ar_pred["epoch"].as_i64().or_else(|| iso_epoch(s(ar_pred, "at"))),
+        ) {
+            let actual = (finished_ts - t0).max(0) as f64;
+            append_calibration_record(
+                state,
+                &at_iso,
+                &run_id,
+                &repo,
+                &mode,
+                &class,
+                "accept_review",
+                milestone,
+                p50,
+                p75,
+                actual,
+                s(ar_pred, "fallbackLevel"),
+                b(ar_pred, "isPrior"),
+            );
+            wrote_any = true;
+        }
+    }
+    if wrote_any {
+        doc["recordedDelivered"] = json!(true);
+        let _ = write_json(&path, &doc);
+    }
+}
+
+/// Append prediction-vs-actual record to `<state>/eta-calibration.jsonl` when a write run is applied.
+/// Walks `parent` within the same `runs_dir` to measure full chain wall time from chain root.
+/// Strictly lock-free, idempotent via `recordedApplied`, best-effort.
+pub fn record_calibration_applied(run: &Path, meta: &Value, applied_at: &str) {
+    let state = state_dir();
+    let applied_ts = iso_epoch(applied_at).unwrap_or_else(|| epoch() as i64);
+    record_calibration_applied_in(&state, run, meta, applied_at, applied_ts);
+}
+
+pub fn record_calibration_applied_in(
+    state: &Path,
+    run: &Path,
+    meta: &Value,
+    applied_at: &str,
+    applied_ts: i64,
+) {
+    // Walk to chain root within the same runs_dir if the root also has eta-pred.json.
+    let mut target_run = run.to_path_buf();
+    let mut cur_meta = meta.clone();
+    let mut seen: HashSet<String> = HashSet::new();
+    if let Some(runs_dir) = run.parent() {
+        for _ in 0..32 {
+            let parent_id = s(&cur_meta, "parent").to_string();
+            if parent_id.is_empty() || !seen.insert(parent_id.clone()) {
+                break;
+            }
+            let pdir = runs_dir.join(&parent_id);
+            if pdir.join(ETA_PRED_FILE).is_file() {
+                target_run = pdir.clone();
+                cur_meta = json(pdir.join("meta.json"));
+            } else {
+                break;
+            }
+        }
+    }
+
+    let path = pred_path(&target_run);
+    let mut doc = json(&path);
+    if !doc.is_object() || b(&doc, "recordedApplied") {
+        return;
+    }
+    let Some(st_pred) = doc.get("started").filter(|v| v.is_object()) else {
+        return;
+    };
+    let (Some(p50), Some(p75), Some(t0)) = (
+        st_pred["toAppliedP50Sec"].as_f64(),
+        st_pred["toAppliedP75Sec"].as_f64(),
+        st_pred["epoch"].as_i64().or_else(|| iso_epoch(s(st_pred, "at"))),
+    ) else {
+        return;
+    };
+
+    let run_id = {
+        let r = s(&doc, "run");
+        if r.is_empty() { run_id_from(&target_run, &cur_meta) } else { r.to_string() }
+    };
+    let repo = {
+        let r = s(&doc, "repo");
+        if r.is_empty() { repo_from_meta(&cur_meta) } else { r.to_string() }
+    };
+    let mode = {
+        let m = s(&doc, "mode");
+        if m.is_empty() { "write" } else { m }
+    }
+    .to_string();
+    let class = {
+        let c = s(&doc, "class");
+        if c.is_empty() { "other" } else { c }
+    }
+    .to_string();
+    let at_iso = if !applied_at.is_empty() {
+        applied_at.to_string()
+    } else {
+        format_epoch(applied_ts, false, "%Y-%m-%dT%H:%M:%SZ")
+    };
+    let actual = (applied_ts - t0).max(0) as f64;
+    append_calibration_record(
+        state,
+        &at_iso,
+        &run_id,
+        &repo,
+        &mode,
+        &class,
+        "started",
+        "applied",
+        p50,
+        p75,
+        actual,
+        s(st_pred, "fallbackLevel"),
+        b(st_pred, "isPrior"),
+    );
+    doc["recordedApplied"] = json!(true);
+    let _ = write_json(&path, &doc);
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -3961,6 +4639,173 @@ mod tests {
         let pdag = estimate_queue_dag_in(&paused_q, None, &model, &ctx);
         assert_eq!(pdag.blockers.len(), 1);
         assert!(pdag.headline.contains("停表"), "got {}", pdag.headline);
+
+        let _ = fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn format_compact_clock_respects_six_column_budget() {
+        let now = 1_800_000_000_i64;
+        assert_eq!(format_compact_clock(now + 120, now, 120.0), "<5m");
+        let mid = format_compact_clock(now + 1800, now, 1800.0);
+        assert!(mid.starts_with('~') && mid.len() == 6, "got {mid}");
+        let day1 = format_compact_clock(now + 24 * 3600, now, 24.0 * 3600.0);
+        assert_eq!(day1, "~24h");
+        assert!(day1.len() <= 6);
+        let day3 = format_compact_clock(now + 72 * 3600, now, 72.0 * 3600.0);
+        assert_eq!(day3, "~3d");
+        assert!(day3.len() <= 6);
+    }
+
+    #[test]
+    fn summarize_wave_eta_computes_earliest_wave_and_blockers() {
+        let now = 1_800_000_000_i64;
+        let active_fast = RunEta {
+            run: "r1".into(),
+            name: "fast".into(),
+            repo: "/repo".into(),
+            mode: "write".into(),
+            class: "build".into(),
+            state: "running".into(),
+            stage: Stage::AgentWork,
+            stage_label: "模型工作中".into(),
+            stage_elapsed_sec: Some(60.0),
+            round: 1,
+            target_milestone: "delivered",
+            to_delivered: Some(EtaRange::from_remaining(now, 600.0, 900.0, false)),
+            to_applied: None,
+            blocker: None,
+            lane_wait: None,
+            capacity_wait: None,
+            fallback_level: FallbackLevel::RepoModeClass,
+            bucket_key: "repo:write:build".into(),
+            is_prior: false,
+            rework_rate: None,
+            short_text: String::new(),
+            compact_badge: "~01:10".into(),
+            detail_text: String::new(),
+            now_ts: now,
+        };
+        let mut active_slow = active_fast.clone();
+        active_slow.run = "r2".into();
+        active_slow.name = "slow".into();
+        active_slow.state = "waiting".into();
+        active_slow.stage = Stage::CapacityQueue;
+        active_slow.to_delivered = Some(EtaRange::from_remaining(now, 2400.0, 3600.0, false));
+
+        let mut blocked = active_fast.clone();
+        blocked.run = "r3".into();
+        blocked.name = "need-sign".into();
+        blocked.state = "delivered".into();
+        blocked.stage = Stage::Blocked;
+        blocked.to_delivered = None;
+        blocked.blocker = Some(BlockerInfo {
+            kind: BlockerKind::ControllerSign,
+            who: "主控".into(),
+            reason: "待签字".into(),
+            since_sec: Some(600),
+            target: None,
+            affected_count: None,
+            unlock_at: None,
+            after_unlock_p50_sec: None,
+            after_unlock_p75_sec: None,
+            label: "卡在主控·待签字 10m".into(),
+        });
+
+        let w = summarize_wave_eta(&[active_fast, active_slow, blocked], now);
+        assert_eq!(w["activeCount"], 2);
+        assert_eq!(w["runningCount"], 1);
+        assert_eq!(w["queuedCount"], 1);
+        assert_eq!(w["blockedCount"], 1);
+        assert!(w["earliestP50Clock"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(w["waveP50Clock"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(w["waveP75Clock"].as_str().is_some_and(|s| !s.is_empty()));
+        assert_eq!(w["blockers"].as_array().unwrap().len(), 1);
+        assert_eq!(w["blockers"][0]["compact"], "卡主控");
+    }
+
+    #[test]
+    fn online_calibration_records_started_accept_delivered_and_applied_idempotently() {
+        let state = temp_dir("online-cal");
+        let now = 1_800_000_000_i64;
+        let repo = "/work/cal-repo";
+        let model = populated_model(&state, repo, now);
+        speed::write_eta_model_in(&state, &model).unwrap();
+
+        let runs_dir = state.join("runs");
+        let run1 = runs_dir.join("run-root");
+        let run2 = runs_dir.join("run-reply");
+        fs::create_dir_all(&run1).unwrap();
+        fs::create_dir_all(&run2).unwrap();
+
+        let meta1 = json!({
+            "run": "run-root",
+            "mode": "write",
+            "class": "build",
+            "worktree": {"source": repo},
+            "startedEpoch": now as f64,
+            "startedAt": format_epoch(now, false, "%Y-%m-%dT%H:%M:%SZ"),
+        });
+        write_json(run1.join("meta.json"), &meta1).unwrap();
+
+        // 1) Started prediction recorded once; second call is idempotent.
+        record_pred_started_in(&state, &run1, &meta1, now);
+        let pred_after_start = json(run1.join(ETA_PRED_FILE));
+        assert!(pred_after_start["started"]["toDeliveredP50Sec"].as_f64().unwrap() > 0.0);
+        assert!(pred_after_start["started"]["toAppliedP50Sec"].as_f64().unwrap() > 0.0);
+        let first_started_at = pred_after_start["started"]["at"].clone();
+        record_pred_started_in(&state, &run1, &meta1, now + 999);
+        assert_eq!(json(run1.join(ETA_PRED_FILE))["started"]["at"], first_started_at);
+
+        // 2) First entry to accept/review recorded once.
+        record_pred_accept_review_in(&state, &run1, &meta1, now + 600);
+        let pred_after_ar = json(run1.join(ETA_PRED_FILE));
+        assert!(pred_after_ar["acceptReview"]["toDeliveredP50Sec"].as_f64().unwrap() > 0.0);
+        record_pred_accept_review_in(&state, &run1, &meta1, now + 900);
+        assert_eq!(json(run1.join(ETA_PRED_FILE))["acceptReview"]["epoch"], now + 600);
+
+        // 3) Delivered appends both started->delivered and accept_review->delivered, idempotently.
+        let summary1 = json!({
+            "state": "delivered",
+            "finishedAt": format_epoch(now + 850, false, "%Y-%m-%dT%H:%M:%SZ"),
+        });
+        record_calibration_delivered_in(&state, &run1, &meta1, &summary1, now + 850);
+        record_calibration_delivered_in(&state, &run1, &meta1, &summary1, now + 850);
+
+        // 4) Reply run applied walks back to chain root and records started->applied once.
+        let meta2 = json!({
+            "run": "run-reply",
+            "parent": "run-root",
+            "mode": "write",
+            "class": "build",
+            "worktree": {"source": repo},
+        });
+        write_json(run2.join("meta.json"), &meta2).unwrap();
+        let app_iso = format_epoch(now + 1200, false, "%Y-%m-%dT%H:%M:%SZ");
+        record_calibration_applied_in(&state, &run2, &meta2, &app_iso, now + 1200);
+        record_calibration_applied_in(&state, &run2, &meta2, &app_iso, now + 1200);
+
+        let cal_raw = fs::read_to_string(speed::eta_calibration_path(&state)).unwrap();
+        let rows: Vec<Value> = cal_raw
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3, "expected started->delivered, accept_review->delivered, started->applied: {rows:?}");
+        assert_eq!(rows[0]["checkpoint"], "started");
+        assert_eq!(rows[0]["milestone"], "delivered");
+        assert_eq!(rows[0]["actualSec"], 850.0);
+        assert_eq!(rows[1]["checkpoint"], "accept_review");
+        assert_eq!(rows[1]["milestone"], "delivered");
+        assert_eq!(rows[1]["actualSec"], 250.0);
+        assert_eq!(rows[2]["checkpoint"], "started");
+        assert_eq!(rows[2]["milestone"], "applied");
+        assert_eq!(rows[2]["run"], "run-root");
+        assert_eq!(rows[2]["actualSec"], 1200.0);
+
+        // Deleting derived eta-pred.json never crashes delivered/applied recording.
+        let _ = fs::remove_file(run1.join(ETA_PRED_FILE));
+        record_calibration_delivered_in(&state, &run1, &meta1, &summary1, now + 900);
+        record_calibration_applied_in(&state, &run1, &meta1, &app_iso, now + 1300);
 
         let _ = fs::remove_dir_all(&state);
     }

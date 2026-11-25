@@ -1764,3 +1764,205 @@ fn work_owner_missing_advice_tag_and_waiting_work_section_on_q_card() {
     assert!(card_screen.contains("完成条件：灰度与单测全绿"), "{card_screen}");
     assert!(card_screen.contains("说明：docs/plan/routing.md"), "{card_screen}");
 }
+
+#[test]
+fn tui_eta_overview_runs_work_and_compact_phone_6col_badges() {
+    use delegate_tui::data::parse_snapshot_json;
+
+    let raw = r#"{
+        "schemaVersion": 1,
+        "generatedAt": "2026-11-25T03:00:00Z",
+        "seq": 50,
+        "repos": [
+            {
+                "path": "/repo/demo",
+                "runsDir": "/repo/demo/.local/run/delegate",
+                "runs": [
+                    {
+                        "run": "20261125-025000-live-a",
+                        "name": "live-a",
+                        "state": "running",
+                        "agent": "pi",
+                        "mode": "write",
+                        "modelName": "neon",
+                        "elapsedSeconds": 600,
+                        "ageSeconds": 600,
+                        "eta": {
+                            "stage": "agent_work",
+                            "stageLabel": "模型工作中",
+                            "stoppedClock": false,
+                            "shortText": "预计 03:40 交付（p75 04:10）",
+                            "compactBadge": "~03:40",
+                            "detailText": "预估：03:40 交付（p75 04:10）〔模型工作中 10m，剩 ~40m〕",
+                            "toDelivered": {"p50Clock": "03:40", "p75Clock": "04:10", "anomaly": false},
+                            "isPrior": false
+                        }
+                    },
+                    {
+                        "run": "20261125-023000-blocked-b",
+                        "name": "blocked-b",
+                        "state": "delivered",
+                        "agent": "pi",
+                        "mode": "write",
+                        "modelName": "neon",
+                        "elapsedSeconds": 300,
+                        "ageSeconds": 1800,
+                        "question": true,
+                        "eta": {
+                            "stage": "blocked",
+                            "stageLabel": "停表阻塞",
+                            "stoppedClock": true,
+                            "shortText": "卡在主控·提问 12m",
+                            "compactBadge": "卡主控",
+                            "detailText": "停表：卡在主控·提问 12m",
+                            "blocker": {"kind": "controller_question", "who": "主控", "label": "卡在主控·提问 12m", "compact": "卡主控"},
+                            "isPrior": false
+                        }
+                    }
+                ],
+                "cleanedNotes": []
+            }
+        ],
+        "work": [
+            {
+                "id": "W012",
+                "title": "实现缓存层",
+                "repo": "/repo/demo",
+                "repoLabel": "demo",
+                "state": "active",
+                "runs": ["20261125-025000-live-a"],
+                "focus": "在跑",
+                "eta": {
+                    "stoppedClock": false,
+                    "shortText": "预计 04:30 合入（p75 05:00）",
+                    "focusBadge": "~04:30",
+                    "compactBadge": "~04:30",
+                    "remaining": {"p50Clock": "04:30", "p75Clock": "05:00"},
+                    "isPrior": false
+                }
+            },
+            {
+                "id": "W013",
+                "title": "接入下游监控",
+                "repo": "/repo/demo",
+                "repoLabel": "demo",
+                "state": "blocked",
+                "waitOn": ["work_applied:W012"],
+                "focus": "等 W012",
+                "eta": {
+                    "stoppedClock": false,
+                    "shortText": "等 W012·预计 05:10 合入（p75 06:00）",
+                    "focusBadge": "等W012(~05:10)",
+                    "compactBadge": "~05:10",
+                    "remaining": {"p50Clock": "05:10", "p75Clock": "06:00"},
+                    "isPrior": false
+                }
+            },
+            {
+                "id": "W014",
+                "title": "等待所有者拍板",
+                "repo": "/repo/demo",
+                "repoLabel": "demo",
+                "state": "blocked",
+                "waitOn": ["owner:Q03"],
+                "focus": "等所有者 Q03",
+                "eta": {
+                    "stoppedClock": true,
+                    "shortText": "卡在所有者 [Q03]·解锁后约 1.2–1.7h",
+                    "focusBadge": "卡所有者Q03",
+                    "compactBadge": "卡所有",
+                    "blocker": {"kind": "owner", "who": "所有者", "label": "卡在所有者 [Q03]", "compact": "卡所有"},
+                    "isPrior": false
+                }
+            }
+        ],
+        "events": [],
+        "lane": {},
+        "dagQueue": [],
+        "merges": [],
+        "candidates": [],
+        "eta": {
+            "wave": {
+                "activeCount": 1,
+                "runningCount": 1,
+                "queuedCount": 0,
+                "blockedCount": 1,
+                "earliestP50Clock": "03:40",
+                "waveP50Clock": "03:40",
+                "waveP75Clock": "04:10",
+                "isPrior": false,
+                "blockers": [
+                    {"run": "20261125-023000-blocked-b", "name": "blocked-b", "kind": "controller_question", "compact": "卡主控", "label": "卡在主控·提问 12m"}
+                ]
+            },
+            "work": {
+                "writeChains": 2,
+                "depth": 2,
+                "activeCount": 1,
+                "devWallRange": "1.5–2.2h",
+                "earliestFinishP50Clock": "05:10",
+                "earliestFinishP75Clock": "06:00",
+                "externalWaitCount": 0,
+                "ownerBlocked": [{"id": "W014"}],
+                "blockers": [],
+                "headline": "推进 1.5–2.2h（2写链/深2，p50 05:10 / p75 06:00） + 卡所有者 1",
+                "isPrior": false
+            },
+            "queue": {"writeChains": 0, "depth": 0, "activeCount": 0, "devWallRange": "<5m", "ownerBlocked": [], "blockers": [], "headline": ""}
+        }
+    }"#;
+
+    let snap = parse_snapshot_json(raw, None, None).expect("snapshot with eta parses");
+    assert_eq!(snap.eta.wave.active_count, 1);
+    assert_eq!(snap.eta.wave.blocked_count, 1);
+    assert_eq!(snap.eta.work.write_chains, 2);
+
+    let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/repo/demo"), 2);
+
+    // 1. Overview wide (120x40): top wave ETA card with wave clock & blocker count
+    app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+    let ov_wide = render_to_string(&mut app, 120, 40);
+    assert_lines_fit_width(&ov_wide, 120);
+    assert!(ov_wide.contains("当前波次 ETA"), "{ov_wide}");
+    assert!(ov_wide.contains("本波 ~03:40（p75 04:10）"), "{ov_wide}");
+    assert!(ov_wide.contains("卡点 2"), "{ov_wide}");
+
+    // 2. Overview narrow (80x24): shows wave ETA & blocker details
+    let ov_narrow = render_to_string(&mut app, 80, 24);
+    assert_lines_fit_width(&ov_narrow, 80);
+    assert!(ov_narrow.contains("当前波次 ETA"), "{ov_narrow}");
+    assert!(ov_narrow.contains("blocked-b · 卡在主控·提问 12m"), "{ov_narrow}");
+
+    // 3. Runs wide (140x32): shows ~03:40 and 卡主控 + detail ETA line
+    app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+    let runs_wide = render_to_string(&mut app, 140, 32);
+    assert_lines_fit_width(&runs_wide, 140);
+    assert!(runs_wide.contains("预估"), "{runs_wide}");
+    assert!(runs_wide.contains("~03:40"), "{runs_wide}");
+    assert!(runs_wide.contains("卡主控"), "{runs_wide}");
+    assert!(runs_wide.contains("停表：卡在主控·提问 12m"), "{runs_wide}");
+
+    // 4. Runs narrow/phone (60x24 < 70 cols): fits width and embeds <= 6 col badges
+    let runs_phone = render_to_string(&mut app, 60, 24);
+    assert_lines_fit_width(&runs_phone, 60);
+    assert!(runs_phone.contains("~03:40"), "{runs_phone}");
+    assert!(runs_phone.contains("卡主控"), "{runs_phone}");
+
+    // 5. Work wide (140x32): shows wide focusBadge & top bar finish clock
+    app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+    let work_wide = render_to_string(&mut app, 140, 32);
+    assert_lines_fit_width(&work_wide, 140);
+    assert!(work_wide.contains("约 05:10"), "{work_wide}");
+    assert!(work_wide.contains("~04:30"), "{work_wide}");
+    assert!(work_wide.contains("等W012(~05:10)"), "{work_wide}");
+    assert!(work_wide.contains("卡所有者Q03"), "{work_wide}");
+
+    // 6. Work compact/phone (60x24 < 70 cols): strictly <= 6 col badges only!
+    let work_phone = render_to_string(&mut app, 60, 24);
+    assert_lines_fit_width(&work_phone, 60);
+    assert!(work_phone.contains("~04:30"), "{work_phone}");
+    assert!(work_phone.contains("~05:10"), "{work_phone}");
+    assert!(work_phone.contains("卡所有"), "{work_phone}");
+    assert!(!work_phone.contains("卡所有者Q03"), "compact phone view must use 6-col badge:\n{work_phone}");
+    assert!(!work_phone.contains("等W012(~05:10)"), "compact phone view must use 6-col badge:\n{work_phone}");
+}

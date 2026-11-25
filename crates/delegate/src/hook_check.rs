@@ -2613,6 +2613,7 @@ enum TemplateKind {
         count: usize,
         any_current: bool,
         run_ids: Vec<String>,
+        fastest_eta: Option<String>,
     },
     Unmerged {
         name: String,
@@ -2748,8 +2749,24 @@ impl PendingItem {
             TemplateKind::Question { name, .. } => {
                 format!("{name} 在等你决定。下一步：{next}{more}")
             }
-            TemplateKind::Waiter { name, count, .. } => {
-                format!("{name} 等 {count} 个委派在跑，没有挂等待。下一步：{next}{more}")
+            TemplateKind::Waiter {
+                name,
+                count,
+                fastest_eta,
+                ..
+            } => {
+                let tail = match (
+                    fastest_eta.as_deref().filter(|s| !s.is_empty()),
+                    remaining > 0,
+                ) {
+                    (Some(eta), true) => {
+                        format!("（最快预计 {eta}；另有 {remaining} 件：`delegate hook pending`）")
+                    }
+                    (Some(eta), false) => format!("（最快预计 {eta}）"),
+                    (None, true) => more,
+                    (None, false) => String::new(),
+                };
+                format!("{name} 等 {count} 个委派在跑，没有挂等待。下一步：{next}{tail}")
             }
             TemplateKind::Unmerged { name, reason, .. } => {
                 let paren = if reason.is_empty() {
@@ -2818,7 +2835,7 @@ impl PendingItem {
     }
 
     fn to_json(&self, format: HookFormat) -> Value {
-        json!({
+        let mut obj = json!({
             "category": self.category,
             "categoryLabel": self.category_label,
             "hook": self.hook_kind,
@@ -2832,7 +2849,15 @@ impl PendingItem {
             "status": self.status_text,
             "next": self.next_command(format),
             "message": self.format_block_reason(0, format),
-        })
+        });
+        if let TemplateKind::Waiter {
+            fastest_eta: Some(eta),
+            ..
+        } = &self.template
+        {
+            obj["fastestEta"] = json!(eta);
+        }
+        obj
     }
 
     fn stop_log_record(&self, format: HookFormat) -> Value {
@@ -2864,6 +2889,54 @@ impl PendingItem {
             }),
         }
     }
+}
+
+/// Strictly zero-lock, zero-disk-write, zero-git fastest delivery clock for uncovered
+/// live runs in the existing `waiter` reminder (never adds new blocking conditions).
+fn fastest_waiter_eta(
+    state: &Path,
+    now: i64,
+    uncovered: &[(String, String, bool, Option<PathBuf>, Value)],
+) -> Option<String> {
+    if uncovered.is_empty() {
+        return None;
+    }
+    let model = crate::speed::load_or_refresh_eta_model_in(state, now, false);
+    let mut visible: Vec<PathBuf> = Vec::new();
+    let mut precomputed: HashMap<PathBuf, Value> = HashMap::new();
+    for (_, _, _, rdir, obj) in uncovered {
+        if let Some(p) = rdir {
+            visible.push(p.clone());
+            precomputed.insert(p.clone(), obj.clone());
+        }
+    }
+    let ctx = crate::eta::LiveContext::capture_readonly(state, now, &visible, precomputed, None);
+    let mut best: Option<(i64, String)> = None;
+    for (_, _, _, rdir, obj) in uncovered {
+        let re = if let Some(p) = rdir.as_deref().filter(|p| p.join("meta.json").is_file()) {
+            crate::eta::estimate_run_with_status(p, obj, &model, &ctx)
+        } else if let Some(fb) = crate::eta::estimate_live_status_fallback(obj, &model, now) {
+            fb
+        } else {
+            continue;
+        };
+        if re.blocker.is_some() {
+            continue;
+        }
+        let Some(del) = re.to_delivered else {
+            continue;
+        };
+        let verb = if re.mode == "write" { "交付" } else { "答复" };
+        let text = if del.p50_sec < 300.0 {
+            format!("<5m {verb}")
+        } else {
+            format!("{} {verb}", crate::eta::format_clock(del.rounded_p50_at, now))
+        };
+        if best.as_ref().is_none_or(|(ts, _)| del.rounded_p50_at < *ts) {
+            best = Some((del.rounded_p50_at, text));
+        }
+    }
+    best.map(|(_, text)| text)
 }
 
 struct EvalOutput {
@@ -3362,7 +3435,7 @@ fn evaluate_core(
     if !live_current.is_empty() || !live_other.is_empty() {
         let waiters = active_waiters(&procs);
         let locked_inodes = read_locked_inodes();
-        let mut uncovered: Vec<(String, String, bool)> = Vec::new();
+        let mut uncovered: Vec<(String, String, bool, Option<PathBuf>, Value)> = Vec::new();
         for (disp, rid, obj, rroot) in &live_current {
             let rdir_str = s(obj, "dir");
             let rdir = (!rdir_str.is_empty()).then(|| Path::new(rdir_str));
@@ -3375,7 +3448,13 @@ fn evaluate_core(
                 &waiters,
                 locked_inodes.as_ref(),
             ) {
-                uncovered.push((disp.clone(), rid.clone(), true));
+                uncovered.push((
+                    disp.clone(),
+                    rid.clone(),
+                    true,
+                    rdir.map(Path::to_path_buf),
+                    obj.clone(),
+                ));
             }
         }
         for (disp, rid, obj, rroot) in &live_other {
@@ -3390,20 +3469,27 @@ fn evaluate_core(
                 &waiters,
                 locked_inodes.as_ref(),
             ) {
-                uncovered.push((disp.clone(), rid.clone(), false));
+                uncovered.push((
+                    disp.clone(),
+                    rid.clone(),
+                    false,
+                    rdir.map(Path::to_path_buf),
+                    obj.clone(),
+                ));
             }
         }
         if !uncovered.is_empty() {
             uncovered.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
-            let any_current = uncovered.iter().any(|(_, _, cur)| *cur);
+            let any_current = uncovered.iter().any(|(_, _, cur, _, _)| *cur);
             let first_name = uncovered[0].0.clone();
             let count = uncovered.len();
             let run_ids: Vec<String> = uncovered
                 .iter()
                 .take(8)
-                .map(|(_, r, _)| r.clone())
+                .map(|(_, r, _, _, _)| r.clone())
                 .collect();
             let target_id = uncovered[0].1.clone();
+            let fastest_eta = fastest_waiter_eta(state, now, &uncovered);
             out_items.push(PendingItem {
                 priority_tier: 4,
                 stall_score: 0,
@@ -3424,6 +3510,7 @@ fn evaluate_core(
                     count,
                     any_current,
                     run_ids,
+                    fastest_eta,
                 },
             });
         }
@@ -4436,6 +4523,7 @@ mod tests {
             count: 3,
             any_current: true,
             run_ids: vec!["r3".into()],
+            fastest_eta: None,
         });
         assert_eq!(
             t3.format_block_reason(0, HookFormat::Claude),
@@ -4444,6 +4532,21 @@ mod tests {
         assert_eq!(
             t3.format_block_reason(0, HookFormat::Agy),
             "job-1 等 3 个委派在跑，没有挂等待。下一步：run_command 设 WaitMsBeforeAsync=500 后台跑 `delegate wait --any`"
+        );
+        let t3_eta = make(TemplateKind::Waiter {
+            name: "job-1".into(),
+            count: 3,
+            any_current: true,
+            run_ids: vec!["r3".into()],
+            fastest_eta: Some("02:52 交付".into()),
+        });
+        assert_eq!(
+            t3_eta.format_block_reason(0, HookFormat::Claude),
+            "job-1 等 3 个委派在跑，没有挂等待。下一步：后台跑 `delegate wait --any`（最快预计 02:52 交付）"
+        );
+        assert_eq!(
+            t3_eta.format_block_reason(2, HookFormat::Claude),
+            "job-1 等 3 个委派在跑，没有挂等待。下一步：后台跑 `delegate wait --any`（最快预计 02:52 交付；另有 2 件：`delegate hook pending`）"
         );
 
         let t4_plain = make(TemplateKind::Unmerged {

@@ -430,6 +430,7 @@ struct ColWidths {
     name_w: usize,
     model_w: usize,
     time_w: usize,
+    eta_w: usize,
     files_w: usize,
     bar_w: usize,
     protect_w: usize,
@@ -437,24 +438,38 @@ struct ColWidths {
 }
 
 impl ColWidths {
-    fn compute(width: usize) -> Self {
+    fn compute(width: usize, has_any_eta: bool) -> Self {
         let show_state = width >= 62;
         let model_w = if width >= 54 { 7 } else { 6 };
         let time_w = if width >= 68 { 9 } else { 6 };
+        let eta_w = if has_any_eta && width >= 44 { 6 } else { 0 };
         let files_w = 4;
         let bar_w = if width >= 54 { 5 } else { 0 };
         let protect_w = 3;
         let accept_w = 4;
 
         let left = 2 + 2 + if show_state { 5 } else { 0 };
+        let eta_total = if eta_w > 0 { 1 + eta_w } else { 0 };
         let bar_total = if bar_w > 0 { 1 + bar_w } else { 0 };
-        let right = 1 + model_w + 1 + time_w + 1 + files_w + bar_total + 1 + protect_w + 1 + accept_w;
+        let right = 1
+            + model_w
+            + 1
+            + time_w
+            + eta_total
+            + 1
+            + files_w
+            + bar_total
+            + 1
+            + protect_w
+            + 1
+            + accept_w;
         let name_w = width.saturating_sub(left + right).max(6);
         Self {
             show_state,
             name_w,
             model_w,
             time_w,
+            eta_w,
             files_w,
             bar_w,
             protect_w,
@@ -509,7 +524,16 @@ fn render_list_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let inner_w = inner.width as usize;
-    let cols = ColWidths::compute(inner_w);
+    let has_any_eta = app.rows.iter().any(|row| {
+        if let ListRow::Run { repo_idx, run_idx } = row {
+            app.snapshot.repos[*repo_idx].runs[*run_idx]
+                .eta_badge()
+                .is_some()
+        } else {
+            false
+        }
+    });
+    let cols = ColWidths::compute(inner_w, has_any_eta);
     let show_col_header = inner.height >= 4;
     let header_h: usize = if show_col_header { 1 } else { 0 };
     let view_h = (inner.height as usize).saturating_sub(header_h);
@@ -594,6 +618,10 @@ fn render_col_header(cols: ColWidths, width: usize) -> Line<'static> {
     s.push_str(&pad_right("模型", cols.model_w));
     s.push(' ');
     s.push_str(&pad_left("时间", cols.time_w));
+    if cols.eta_w > 0 {
+        s.push(' ');
+        s.push_str(&pad_left("预估", cols.eta_w));
+    }
     s.push(' ');
     let diff_w = cols.files_w + if cols.bar_w > 0 { 1 + cols.bar_w } else { 0 };
     s.push_str(&pad_left("改动", diff_w));
@@ -869,6 +897,14 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
         ));
         spans.push(Span::styled(" ", rev));
         spans.push(Span::styled(pad_left(&time_text, cols.time_w), rev));
+        if cols.eta_w > 0 {
+            let eta_text = run
+                .eta_badge()
+                .map(|(b, _)| truncate(b, cols.eta_w))
+                .unwrap_or_else(|| "-".to_string());
+            spans.push(Span::styled(" ", rev));
+            spans.push(Span::styled(pad_left(&eta_text, cols.eta_w), rev));
+        }
         spans.push(Span::styled(" ", rev));
         spans.push(Span::styled(pad_left(&files_text, cols.files_w), rev));
         if cols.bar_w > 0 {
@@ -925,6 +961,34 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
     ));
     spans.push(Span::raw(" "));
     spans.push(Span::styled(pad_left(&time_text, cols.time_w), muted()));
+    if cols.eta_w > 0 {
+        let (eta_text, eta_style) = match run.eta_badge() {
+            Some((b, true)) => {
+                let severe = run
+                    .eta
+                    .as_ref()
+                    .and_then(|e| e.blocker_kind.as_deref())
+                    .is_some_and(|k| {
+                        matches!(
+                            k,
+                            "premerge_conflict"
+                                | "premerge_failed"
+                                | "mainline_blocked"
+                                | "stall_warning"
+                        )
+                    });
+                let col = if severe { STATUS_FAILED } else { STATUS_PENDING };
+                (
+                    truncate(b, cols.eta_w),
+                    Style::default().fg(col).add_modifier(Modifier::BOLD),
+                )
+            }
+            Some((b, false)) => (truncate(b, cols.eta_w), Style::default().fg(STATUS_QUEUED)),
+            None => ("-".to_string(), muted()),
+        };
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(pad_left(&eta_text, cols.eta_w), eta_style));
+    }
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
         pad_left(&files_text, cols.files_w),
@@ -1055,6 +1119,31 @@ fn build_detail_lines(app: &App, run: &RunItem, width: usize) -> Vec<Line<'stati
             width,
             Style::default().fg(STATUS_QUEUED),
         );
+    }
+    if !run.applied {
+        if let Some(eta) = &run.eta {
+            if eta.stage != "done" && !eta.detail_text.is_empty() {
+                let eta_style = if eta.stopped_clock {
+                    let severe = eta.blocker_kind.as_deref().is_some_and(|k| {
+                        matches!(
+                            k,
+                            "premerge_conflict"
+                                | "premerge_failed"
+                                | "mainline_blocked"
+                                | "stall_warning"
+                        )
+                    });
+                    Style::default()
+                        .fg(if severe { STATUS_FAILED } else { STATUS_PENDING })
+                        .add_modifier(Modifier::BOLD)
+                } else if eta.anomaly {
+                    Style::default().fg(STATUS_PENDING)
+                } else {
+                    Style::default().fg(STATUS_QUEUED)
+                };
+                push_wrapped(&mut out, &eta.detail_text, width, eta_style);
+            }
+        }
     }
 
     let tier_part = run
@@ -2793,6 +2882,17 @@ fn render_work_top_bar(frame: &mut Frame, app: &App, area: Rect) {
     if c.stale > 0 {
         items.push(count_item("老化", c.stale, Some(STATUS_PENDING)));
     }
+    let work_eta = &app.snapshot.eta.work;
+    if work_eta.write_chains > 0 {
+        if let Some(p50) = &work_eta.earliest_finish_p50_clock {
+            items.push((
+                format!("约 {p50}"),
+                Style::default()
+                    .fg(STATUS_QUEUED)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
     let sep = if area.width >= 100 { " · " } else { "·" };
     append_fitting_counts(&mut spans, area.width as usize, items, sep, filter_badge);
 
@@ -2841,10 +2941,28 @@ fn render_work_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     let compact = area.width < COMPACT_BREAKPOINT;
     let c = app.snapshot.work_counts();
     let open_total = c.owner + c.needs_action + c.ready + c.in_progress + c.waiting + c.deferred;
+    let work_eta_suffix = if !compact && app.snapshot.eta.work.write_chains > 0 {
+        let we = &app.snapshot.eta.work;
+        let clock = we
+            .earliest_finish_p50_clock
+            .as_deref()
+            .map(|c| format!(" · 约 {c}"))
+            .unwrap_or_default();
+        if !we.dev_wall_range.is_empty() {
+            format!(" · 推进 {}{clock}", we.dev_wall_range)
+        } else {
+            clock
+        }
+    } else {
+        String::new()
+    };
     let mode_tag = match app.work_filter_mode {
         WorkFilterMode::All => {
             if app.filter.is_empty() {
-                format!(" 工作表 ({open_total} 进行 · {} 完成) ", c.done_total)
+                format!(
+                    " 工作表 ({open_total} 进行 · {} 完成{work_eta_suffix}) ",
+                    c.done_total
+                )
             } else {
                 format!(" 工作表 · 滤:{} ", truncate(&app.filter, 16))
             }
@@ -3141,8 +3259,53 @@ fn format_tree_prefix_compact(depth: usize) -> String {
     format!("{}↳ ", " ".repeat(capped.saturating_sub(1)))
 }
 
-fn work_item_tail_tags(item: &WorkItem, stale_info: Option<(u64, bool)>) -> Vec<(String, Color)> {
+fn work_item_eta_tag(item: &WorkItem, compact: bool) -> Option<(String, Color)> {
+    if item.state == "done" {
+        return None;
+    }
+    let eta = item.eta.as_ref()?;
+    let raw = if compact {
+        eta.compact_badge.trim()
+    } else if !eta.focus_badge.trim().is_empty() {
+        eta.focus_badge.trim()
+    } else {
+        eta.compact_badge.trim()
+    };
+    if raw.is_empty() || raw == "-" || raw == "完成" {
+        return None;
+    }
+    let badge = if compact {
+        truncate(raw, 6)
+    } else {
+        raw.to_string()
+    };
+    let color = if eta.stopped_clock {
+        let severe = eta.blocker_kind.as_deref().is_some_and(|k| {
+            matches!(
+                k,
+                "premerge_conflict" | "premerge_failed" | "mainline_blocked" | "stall_warning"
+            )
+        });
+        if severe {
+            STATUS_FAILED
+        } else {
+            STATUS_PENDING
+        }
+    } else {
+        STATUS_QUEUED
+    };
+    Some((format!(" {badge}"), color))
+}
+
+fn work_item_tail_tags(
+    item: &WorkItem,
+    stale_info: Option<(u64, bool)>,
+    compact: bool,
+) -> Vec<(String, Color)> {
     let mut tags = Vec::new();
+    if let Some(eta_tag) = work_item_eta_tag(item, compact) {
+        tags.push(eta_tag);
+    }
     if let Some((hours, is_2x)) = stale_info {
         let color = if is_2x { STATUS_FAILED } else { STATUS_PENDING };
         tags.push((format!(" 停 {hours}h"), color));
@@ -3203,7 +3366,7 @@ fn render_work_item_wide(
     } else {
         String::new()
     };
-    let tail_tags = work_item_tail_tags(item, stale_info);
+    let tail_tags = work_item_tail_tags(item, stale_info, false);
     let live_status = dedup_stale_live_status(live_status, stale_info.is_some());
     let tail_w: usize = tail_tags.iter().map(|(t, _)| display_width(t)).sum();
     let extra_w = display_width(&extra_tag);
@@ -3328,7 +3491,7 @@ fn render_work_item_compact(
     let gap1 = width.saturating_sub(2 + display_width(&left_clipped) + state_w);
 
     // Line 2: title · live_status [tail_tags]
-    let tail_tags = work_item_tail_tags(item, stale_info);
+    let tail_tags = work_item_tail_tags(item, stale_info, true);
     let live_status = dedup_stale_live_status(live_status, stale_info.is_some());
     let tail_w: usize = tail_tags.iter().map(|(t, _)| display_width(t)).sum();
     let indent2 = format!("  {}", " ".repeat(display_width(&tree_prefix)));
@@ -3503,6 +3666,20 @@ fn build_work_card_lines(app: &App, item: &WorkItem, width: usize) -> Vec<Line<'
         meta_parts.push(format!("仓库: {}", item.repo));
     }
     push_wrapped(&mut out, &meta_parts.join(" · "), width, muted());
+    if item.state != "done" {
+        if let Some(eta) = &item.eta {
+            if !eta.short_text.is_empty() && eta.short_text != "-" {
+                let eta_style = if eta.stopped_clock {
+                    Style::default()
+                        .fg(STATUS_PENDING)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(STATUS_QUEUED)
+                };
+                push_wrapped(&mut out, &format!("预估: {}", eta.short_text), width, eta_style);
+            }
+        }
+    }
 
     // Owner decision card fields
     if let Some(ow) = &item.owner {
@@ -4236,16 +4413,145 @@ fn render_quota_gauge_row(frame: &mut Frame, area: Rect, label: &str, entry: &Qu
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+fn overview_wave_eta_spans(eta: &SnapshotEta, max_width: usize) -> Vec<Span<'static>> {
+    let w = &eta.wave;
+    let work = &eta.work;
+    let mut parts: Vec<(String, Style)> = Vec::new();
+
+    if w.active_count > 0 {
+        let mut head = format!("在跑 {}", w.running_count);
+        if w.queued_count > 0 {
+            head.push_str(&format!(" · 排队 {}", w.queued_count));
+        }
+        parts.push((
+            head,
+            Style::default()
+                .fg(STATUS_RUNNING)
+                .add_modifier(Modifier::BOLD),
+        ));
+        if let Some(early) = &w.earliest_p50_clock {
+            parts.push((format!("最快 ~{early}"), Style::default().fg(STATUS_QUEUED)));
+        }
+        if let Some(p50) = &w.wave_p50_clock {
+            let p75_str = w
+                .wave_p75_clock
+                .as_deref()
+                .map(|c| format!("（p75 {c}）"))
+                .unwrap_or_default();
+            let prior = if w.is_prior { "(初估)" } else { "" };
+            parts.push((
+                format!("本波 ~{p50}{p75_str}{prior}"),
+                Style::default()
+                    .fg(STATUS_QUEUED)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    } else {
+        parts.push(("空闲 · 无在跑任务".to_string(), muted()));
+    }
+
+    let total_blockers = w.blocked_count + work.owner_blocked_count;
+    if total_blockers > 0 {
+        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for b in &w.blockers {
+            let key = if b.compact.is_empty() {
+                "卡点"
+            } else {
+                b.compact.as_str()
+            };
+            *counts.entry(key).or_insert(0) += 1;
+        }
+        if work.owner_blocked_count > 0 {
+            *counts.entry("卡所有").or_insert(0) += work.owner_blocked_count;
+        }
+        let breakdown: Vec<String> = counts
+            .into_iter()
+            .take(3)
+            .map(|(k, n)| format!("{k}×{n}"))
+            .collect();
+        let detail = if breakdown.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", breakdown.join(" "))
+        };
+        parts.push((
+            format!("卡点 {total_blockers}{detail}"),
+            Style::default()
+                .fg(STATUS_FAILED)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        parts.push(("无卡点".to_string(), muted()));
+    }
+
+    if work.write_chains > 0 {
+        let clock = work
+            .earliest_finish_p50_clock
+            .as_deref()
+            .map(|c| format!("，p50 {c}"))
+            .unwrap_or_default();
+        parts.push((
+            format!(
+                "工作表 {}（{}链/深{}{clock}）",
+                work.dev_wall_range, work.write_chains, work.depth
+            ),
+            primary(),
+        ));
+    }
+
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    for (idx, (text, style)) in parts.into_iter().enumerate() {
+        let sep = if idx == 0 { "" } else { " · " };
+        let need = display_width(sep) + display_width(&text);
+        if used + need > max_width {
+            if idx == 0 {
+                spans.push(Span::styled(truncate(&text, max_width), style));
+            }
+            break;
+        }
+        if !sep.is_empty() {
+            spans.push(Span::styled(sep, muted()));
+            used += display_width(sep);
+        }
+        spans.push(Span::styled(text, style));
+        used += display_width(&spans.last().unwrap().content);
+    }
+    spans
+}
+
+fn render_overview_wave_eta_card(frame: &mut Frame, app: &App, area: Rect) {
+    let block = rounded_block(Line::from(Span::styled(" 当前波次 ETA ", bold_primary())), true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let spans = overview_wave_eta_spans(&app.snapshot.eta, inner.width as usize);
+    frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+}
+
 fn render_overview_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     if area.width < NARROW_BREAKPOINT {
         render_overview_narrow(frame, app, area);
         return;
     }
 
+    let grid_area = if area.height >= 14 {
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(10)])
+            .split(area);
+        render_overview_wave_eta_card(frame, app, outer[0]);
+        outer[1]
+    } else {
+        area
+    };
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(54), Constraint::Percentage(46)])
-        .split(area);
+        .split(grid_area);
     let top_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
@@ -4872,6 +5178,31 @@ fn render_overview_narrow(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let iw = inner.width as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // 0. Current Wave ETA & Blockers (shown when active runs, blockers, or work DAG exist)
+    let has_wave_eta = app.snapshot.eta.wave.active_count > 0
+        || app.snapshot.eta.wave.blocked_count > 0
+        || app.snapshot.eta.work.write_chains > 0
+        || app.snapshot.eta.work.owner_blocked_count > 0;
+    if has_wave_eta {
+        lines.push(section_header("当前波次 ETA"));
+        let mut row_spans = vec![Span::raw("  ")];
+        row_spans.extend(overview_wave_eta_spans(
+            &app.snapshot.eta,
+            iw.saturating_sub(2),
+        ));
+        lines.push(Line::from(row_spans));
+        for b in app.snapshot.eta.wave.blockers.iter().take(4) {
+            let line_txt = format!("{} · {}", b.name, b.label);
+            push_indented_wrapped(
+                &mut lines,
+                "    ",
+                &line_txt,
+                iw,
+                Style::default().fg(STATUS_PENDING),
+            );
+        }
+    }
 
     // 1. Account Quota (text degraded; advisory only, never auto-switches accounts)
     lines.push(section_header("账号额度"));

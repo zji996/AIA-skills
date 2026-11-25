@@ -3459,6 +3459,9 @@ pub fn launch(
             initial_status,
         );
     }
+    if !deferred {
+        crate::eta::record_pred_started(&run, &meta);
+    }
     let explicit_startup_timeout = if cfg!(debug_assertions) {
         std::env::var("DELEGATE_TEST_STARTUP_TIMEOUT")
             .ok()
