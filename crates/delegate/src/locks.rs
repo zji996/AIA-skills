@@ -37,6 +37,10 @@ pub enum LockKind {
     Worker = 3,
     /// `<run>/waiter.lock` — outer role-claim lock held across `delegate wait` (non-blocking only).
     WaiterClaim = 5,
+    /// `<run>/apply.lock` — per-run in-flight guard held across `delegate apply`/`land`
+    /// (apply + post-merge verify + commit) so `_gc-worker` / `detect_applied` cannot reclaim
+    /// the run or kill its `verify` scope mid-flight.
+    ApplyRun = 7,
     /// `<run>/reply.lock` — per-run pending-reply mailbox lock (wraps `launch::reply` delivery).
     ReplyMailbox = 8,
     /// `<cache>/pool/.claim.lock` — worktree pool slot claim.
@@ -68,6 +72,7 @@ impl LockKind {
     pub fn name(self) -> &'static str {
         match self {
             LockKind::WaiterClaim => "WaiterClaim",
+            LockKind::ApplyRun => "ApplyRun",
             LockKind::ReplyMailbox => "ReplyMailbox",
             LockKind::State => "State",
             LockKind::LegacyStart => "LegacyStart",
@@ -269,10 +274,11 @@ fn check_order(kind: LockKind, path: &Path) {
     HELD_LOCKS.with(|held| {
         let stack = held.borrow();
         for (held_kind, held_path) in stack.iter() {
-            // Distinct per-run waiter claims, per-run local locks, or lane tickets may coexist.
+            // Distinct per-run waiter claims, apply guards, per-run local locks, or lane tickets may coexist.
             if matches!(
                 (*held_kind, kind),
                 (LockKind::WaiterClaim, LockKind::WaiterClaim)
+                    | (LockKind::ApplyRun, LockKind::ApplyRun)
                     | (LockKind::RunLocal, LockKind::RunLocal)
                     | (LockKind::Lane, LockKind::Lane)
             ) && held_path != path
@@ -707,6 +713,24 @@ mod tests {
         drop(g2);
         drop(g1);
         let _ = fs::remove_dir_all(p1.parent().unwrap());
+    }
+
+    #[test]
+    fn worker_to_multiple_apply_run_to_state_order_is_allowed() {
+        let base = temp_lock("worker.lock");
+        let dir = base.parent().unwrap();
+        let r1 = dir.join("run1-apply.lock");
+        let r2 = dir.join("run2-apply.lock");
+        let st = dir.join("state.lock");
+        let gw = acquire(LockKind::Worker, &base, true).unwrap();
+        let ga1 = acquire(LockKind::ApplyRun, &r1, true).unwrap();
+        let ga2 = acquire(LockKind::ApplyRun, &r2, true).unwrap();
+        let gs = acquire(LockKind::State, &st, true).unwrap();
+        drop(gs);
+        drop(ga2);
+        drop(ga1);
+        drop(gw);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

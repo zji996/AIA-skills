@@ -838,6 +838,93 @@ class Delegate635Tests(unittest.TestCase):
         self.assertTrue(ready_doc["fastForward"]["hit"], ready_doc)
         self.assertEqual(self._validity_sig(live_doc), self._validity_sig(ready_doc))
 
+    def test_apply_lock_blocks_gc_worker_during_verify_and_preserves_applied(self):
+        """Deterministic regression for W213: while `apply` is paused inside post-merge
+        `verify`, running `_gc-worker` must NOT kill `verify`, remove `verify.log`/run files,
+        write `.applied-cleaned`, or overwrite `.applied` with `appliedBy: detected`; once
+        `apply` completes and releases `apply.lock`, reclamation succeeds normally.
+        """
+        gate_armed = self.work / "verify.armed"
+        verify_started = self.work / "verify.started"
+        verify_release = self.work / "verify.release"
+        self.addCleanup(lambda: verify_release.touch())
+
+        verify_cmd = (
+            f"if [ -f {shlex.quote(str(gate_armed))} ]; then "
+            f"touch {shlex.quote(str(verify_started))}; "
+            f"while [ ! -f {shlex.quote(str(verify_release))} ]; do sleep 0.05; done; "
+            f"fi"
+        )
+        repo = self.repo({
+            ".delegate.json": json.dumps({"accept": verify_cmd}),
+            "f1.txt": "base1\n",
+            "other.txt": "orig\n",
+        })
+        self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED], pre="echo new1 > f1.txt")
+        st = self.outcome(
+            self.cli("run", "--worktree", "--workdir", repo, "--name", "gc-race", "edit f1")
+        )
+        run_dir = Path(st["dir"])
+        self.wait_premerge_status(run_dir, {"ready"}, timeout=15.0)
+
+        # Make an unrelated dirty edit so `apply` hits fast-forward on f1.txt, sees
+        # `acceptStillValid: false`, and enters post-merge `verify` (armed by `gate_armed`).
+        (repo / "other.txt").write_text("dirty-unrelated\n")
+        gate_armed.touch()
+
+        proc = subprocess.Popen(
+            [str(fixtures.DELEGATE), "apply", "--json", "--keep", st["run"]],
+            cwd=repo,
+            env=self.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.until(
+                lambda: verify_started.is_file(),
+                "apply entered post-merge verify",
+                timeout=15.0,
+            )
+            self.assertIsNone(proc.poll(), "apply must still be running inside verify")
+            self.assertTrue((run_dir / "apply.lock").is_file())
+            applied_before = json.loads((run_dir / ".applied").read_text())
+            self.assertNotEqual(applied_before.get("appliedBy"), "detected")
+            self.assertTrue(applied_before.get("fastForward"))
+
+            # Run `_gc-worker` synchronously while `apply` holds `<run>/apply.lock` inside `verify`.
+            gc_during = self.cli("_gc-worker", cwd=repo)
+            self.assertEqual(gc_during.returncode, 0, gc_during.stdout + gc_during.stderr)
+
+            # `_gc-worker` must NOT touch the in-flight run, its `.applied`, or kill `verify`!
+            self.assertIsNone(proc.poll(), "_gc-worker must not kill apply/verify")
+            self.assertTrue(run_dir.is_dir())
+            self.assertFalse((run_dir / ".applied-cleaned").exists())
+            self.assertTrue((run_dir / "verify.log").is_file())
+            applied_during = json.loads((run_dir / ".applied").read_text())
+            self.assertEqual(applied_during, applied_before)
+
+            # Release `verify` -> `apply` completes cleanly with `verify.ok == True`!
+            verify_release.touch()
+            out, err = proc.communicate(timeout=15.0)
+            self.assertEqual(proc.returncode, 0, out + err)
+            doc = json.loads([ln for ln in out.splitlines() if ln.strip().startswith("{")][-1])
+            self.assertTrue(doc["fastForward"]["hit"], doc)
+            self.assertIs(doc["acceptStillValid"], False, doc)
+            self.assertTrue(doc["verify"]["ok"], doc)
+        finally:
+            verify_release.touch()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5.0)
+
+        # After `apply` exits and releases `apply.lock`, `_gc-worker` reclaims normally
+        # and keeps `apply.lock` intact on disk.
+        gc_after = self.cli("_gc-worker", cwd=repo)
+        self.assertEqual(gc_after.returncode, 0, gc_after.stdout + gc_after.stderr)
+        self.assertTrue((run_dir / ".applied-cleaned").is_file())
+        self.assertTrue((run_dir / "apply.lock").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2260,6 +2260,21 @@ fn apply_or_land(args: &[String], land_mode: bool) -> Res<i32> {
         None
     };
     let dry = has(&flags, "--dry-run");
+    // Hold per-run `<run>/apply.lock` across apply + post-merge verify + commit so background
+    // `_gc-worker` / `detect_applied` cannot reclaim a run or kill its `verify` scope mid-flight.
+    // Acquire in sorted canonical path order to prevent AB-BA deadlocks across multi-run batches.
+    let mut apply_guards = Vec::new();
+    if !dry {
+        let mut sorted_runs: Vec<PathBuf> = targets
+            .iter()
+            .map(|r| fs::canonicalize(r).unwrap_or_else(|_| r.clone()))
+            .collect();
+        sorted_runs.sort();
+        sorted_runs.dedup();
+        for run in sorted_runs {
+            apply_guards.push(runs::acquire_apply_guard(&run)?);
+        }
+    }
     // Runs apply in the order given and stop at the first that fails; their acceptance
     // reruns once on the merged tree, after the last merge (field notes 16).
     struct DoneApply {
@@ -2973,6 +2988,7 @@ fn apply_or_land(args: &[String], land_mode: bool) -> Res<i32> {
     if !output::json_enabled() && !single_line_only {
         println!("{verdict_line}");
     }
+    drop(apply_guards);
     if code == 0 && !dry && !has(&flags, "--keep") {
         let done_set: std::collections::HashSet<PathBuf> =
             done.iter().map(|item| item.run.clone()).collect();
@@ -2983,7 +2999,9 @@ fn apply_or_land(args: &[String], land_mode: bool) -> Res<i32> {
                 && runs::all_runs().iter().any(|other| {
                     other != run
                         && s(&json(other.join("meta.json"))["worktree"], "path") == wt_path
-                        && (runs::active(&runs::state(other)) || !other.join(".applied").exists())
+                        && (runs::active(&runs::state(other))
+                            || runs::apply_in_flight(other)
+                            || !other.join(".applied").exists())
                 })
         };
 

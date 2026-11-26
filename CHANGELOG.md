@@ -3,6 +3,7 @@
 ## Unreleased
 
 - `delegate`：将带 HTTP 429 的硬额度耗尽报错（`RESOURCE_EXHAUSTED` + `quota reached`/`resets in` 等）纳入 `is_quota_exhausted_error` 且排除瞬时 3 轮退避重跑，失败摘要附切号提示（`delegate agy account use <id|auto>`）；排队追问（`pending_reply`）在父 run 因 `agy` 额度耗尽失败后自动落盘时，`auto` 模式下改为新会话按池重选并带上原追问与「上一会话因额度中断，改动在工作区」事实；`reply --fresh` 在 `auto` 模式下当链上原账号与新选账号不同（即便池指针早已指向新号）时也记录并展示「自动选号：A → B」。
+- `delegate`：修复 `apply`/`land` 与后台 `_gc-worker` 并发竞态导致的合并后验收偶发被 `SIGTERM`（`-15`）杀掉的问题——新增 `LockKind::ApplyRun`（`<run>/apply.lock`）在 `apply`/`land` 合入、合并后验收与提交全过程持有按规范路径排序的每 run 锁，并在 `_gc-worker`（含 `detect_applied` 与水位回收）、`runs::remove_after_apply`/`auto_clean_run` 及 `_merge-worker` 让路判定中跳过 `apply_in_flight` 的 run。
 - `delegate`：派发 worktree 任务时检测说明中引用、源仓库存在且被 git 忽略的相对路径，在不改写原文的前提下于说明末尾附一行源仓库绝对路径提示；修复提问检测（`classify_question` / `is_scout_question`）将同分句否定表述（如「无矛盾需要主控拍板」「没有/不需要 + 拍板/决定/提问」）误判为提问的问题。
 - `delegate`：将上游 TLS 握手/证书校验失败与连接 EOF/reset（含 `broken pipe`）归入可续做的 `Kind::Connection` 瞬时失败，复用现有退避续做、`probe` 恢复与耗尽后换模型路径；首轮握手期尚未落盘会话（`attempts == 1` 且无已存 session）时改用原 prompt 同模型重跑，不再因无会话直接跳过续做。
 - `delegate`：写手消费探路结果（含转入 `scoutQuestion` 或直接开工）及收到 `delegate reply` 时，同步为关联探路 run 写入 `repliedAt` 并刷新索引；`hook pending`、pulse、index 与 TUI 的待处理判定对已有 `repliedAt` 的提问不再计为待答，消除探路提问滞留 `hook pending` 的问题。

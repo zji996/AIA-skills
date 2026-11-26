@@ -165,6 +165,7 @@ fn should_yield_to_apply(run: &Path, source_canon: &Path) -> bool {
     lane::stopped()
         || !run.join("meta.json").is_file()
         || run.join(".applied").exists()
+        || crate::runs::apply_in_flight(run)
         || crate::source_watch::apply_lock_busy(source_canon)
 }
 

@@ -352,6 +352,44 @@ pub fn agent_alive(run: &Path) -> bool {
         .unwrap_or(0);
     pid_alive(pid) && unsafe { libc::getpgid(pid) == pid }
 }
+
+/// Acquire `<run>/apply.lock` while `delegate apply`/`land` is actively applying, verifying,
+/// or committing this run.
+pub fn acquire_apply_guard(run: &Path) -> Res<crate::locks::LockGuard> {
+    crate::locks::acquire(crate::locks::LockKind::ApplyRun, &run.join("apply.lock"), true)
+        .map_err(|e| e.to_string())
+}
+
+/// Non-blocking attempt (`LOCK_NB`) to acquire `<run>/apply.lock`.
+/// Returns `Ok(None)` if `run` is not a directory (avoiding recreating a deleted run dir)
+/// or another holder currently owns the lock (`WouldBlock`).
+pub fn try_acquire_apply_guard(run: &Path) -> std::io::Result<Option<crate::locks::LockGuard>> {
+    if !run.is_dir() {
+        return Ok(None);
+    }
+    match crate::locks::try_acquire(crate::locks::LockKind::ApplyRun, &run.join("apply.lock"), true)
+    {
+        Ok(guard) => Ok(Some(guard)),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Return true when another process currently holds `<run>/apply.lock`.
+/// Uses read-only `/proc/locks` inspection first to avoid contending with `apply`.
+pub fn apply_in_flight(run: &Path) -> bool {
+    let path = run.join("apply.lock");
+    if !path.is_file() {
+        return false;
+    }
+    if let Some(locked) = crate::locks::file_locked_by_other_readonly(&path) {
+        return locked;
+    }
+    matches!(
+        crate::locks::try_acquire_opts(crate::locks::LockKind::ApplyRun, &path, true, false),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+    )
+}
 pub fn legacy_after_waiting(run: &Path) -> bool {
     if run.join("exit_code").is_file() || !run.join(".waiting").exists() {
         return false;
@@ -1276,6 +1314,15 @@ fn sibling_runs(run: &Path) -> Vec<PathBuf> {
 
 /// Returns `(diagnostics, staged_gc)`.
 pub fn remove_after_apply(run: &Path) -> (Vec<String>, bool) {
+    if !run.is_dir() {
+        return (Vec::new(), false);
+    }
+    if active(&state(run)) || agent_alive(run) {
+        return (vec![format!("kept active run {}", run.display())], false);
+    }
+    let Ok(Some(_apply_guard)) = try_acquire_apply_guard(run) else {
+        return (vec![format!("kept active run {}", run.display())], false);
+    };
     if active(&state(run)) || agent_alive(run) {
         return (vec![format!("kept active run {}", run.display())], false);
     }
@@ -1286,7 +1333,9 @@ pub fn remove_after_apply(run: &Path) -> (Vec<String>, bool) {
         && siblings.iter().any(|other| {
             other != run
                 && s(&json(other.join("meta.json"))["worktree"], "path") == path
-                && (active(&state(other)) || !other.join(".applied").exists())
+                && (active(&state(other))
+                    || apply_in_flight(other)
+                    || !other.join(".applied").exists())
         });
     if !shared {
         match crate::archive::preserve(run) {
@@ -1325,6 +1374,7 @@ pub fn remove_after_apply(run: &Path) -> (Vec<String>, bool) {
         "appends.json",
         "pending-reply.json",
         "reply.lock",
+        "apply.lock",
         "reply-delivered.json",
         "changes.json",
         "applied.patch",
@@ -1379,6 +1429,16 @@ pub fn remove_after_apply(run: &Path) -> (Vec<String>, bool) {
 /// refs, stages run + unshared worktree into trash via `gc::stage_clean_to_trash`, records clean
 /// in history/index/board/events.
 pub fn auto_clean_run(run: &Path, remove_worktree: bool, reason: &str) -> Res<Option<PathBuf>> {
+    if !run.is_dir() {
+        return Ok(None);
+    }
+    let st = state(run);
+    if active(&st) || agent_alive(run) {
+        return Err(format!("kept active run {}", run.display()));
+    }
+    let Ok(Some(_apply_guard)) = try_acquire_apply_guard(run) else {
+        return Err(format!("kept active run {}", run.display()));
+    };
     if !run.is_dir() {
         return Ok(None);
     }
@@ -2395,6 +2455,102 @@ mod agy_conversation_tests {
         let tail = re["outputTail"].as_array().expect("outputTail array");
         assert_eq!(tail.len(), 2);
         assert_eq!(tail[1].as_str(), Some("epoch 2 loss=0.3"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn apply_lock_blocks_reclaim_and_survives_remove_after_apply() {
+        let base = std::env::temp_dir().join(format!(
+            "delegate-apply-lock-test-{}-{}",
+            std::process::id(),
+            crate::common::now_ns()
+        ));
+        let run = base.join("20261127-070000-apply-guard");
+        let sibling = base.join("20261127-070001-apply-guard-sibling");
+        let wt_fake = base.join("shared-wt");
+        fs::create_dir_all(&run).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(
+            run.join("meta.json"),
+            json!({
+                "run": "20261127-070000-apply-guard",
+                "name": "apply-guard",
+                "mode": "write",
+                "worktree": {"path": wt_fake, "source": ""}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // Unapplied sibling sharing `worktree.path` keeps `remove_after_apply` hermetic
+        // (skips writing to real user cache archive) while still exercising lock + prune + `keep`.
+        fs::write(
+            sibling.join("meta.json"),
+            json!({
+                "run": "20261127-070001-apply-guard-sibling",
+                "name": "apply-guard-sibling",
+                "mode": "write",
+                "worktree": {"path": wt_fake, "source": ""}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(run.join("exit_code"), "0\n").unwrap();
+        fs::write(run.join(".applied"), r#"{"at":"2026-11-27T00:00:00Z","fastForward":true}"#)
+            .unwrap();
+        fs::write(run.join("verify.log"), "running\n").unwrap();
+
+        // Missing directory must return Ok(None) without recreating the directory.
+        let missing = base.join("missing-run");
+        assert!(try_acquire_apply_guard(&missing).unwrap().is_none());
+        assert!(!missing.exists());
+
+        // Hold `apply.lock` on another thread so `LOCK_NB` sees `WouldBlock`.
+        let (tx_locked, rx_locked) = std::sync::mpsc::channel();
+        let (tx_release, rx_release) = std::sync::mpsc::channel();
+        let run_for_holder = run.clone();
+        let holder = std::thread::spawn(move || {
+            let guard = acquire_apply_guard(&run_for_holder).unwrap();
+            tx_locked.send(()).unwrap();
+            rx_release.recv().unwrap();
+            drop(guard);
+        });
+        rx_locked.recv().unwrap();
+
+        assert!(
+            try_acquire_apply_guard(&run).unwrap().is_none(),
+            "try_acquire_apply_guard must return None while held"
+        );
+        let (diags, staged) = remove_after_apply(&run);
+        assert!(!staged);
+        assert!(
+            diags.iter().any(|d| d.contains("kept active run")),
+            "expected kept active run, got: {diags:?}"
+        );
+        assert!(run.join("verify.log").is_file(), "verify.log must remain untouched");
+        assert!(!run.join(".applied-cleaned").exists());
+
+        let clean_err = auto_clean_run(&run, false, "applied").unwrap_err();
+        assert!(
+            clean_err.contains("kept active run"),
+            "expected kept active run error, got: {clean_err}"
+        );
+        assert!(run.is_dir());
+
+        // Release holder; `remove_after_apply` now succeeds and preserves `apply.lock` in `keep`.
+        tx_release.send(()).unwrap();
+        holder.join().unwrap();
+
+        let (diags_after, _) = remove_after_apply(&run);
+        assert!(
+            !diags_after.iter().any(|d| d.contains("kept active run")),
+            "unexpected active-run refusal after release: {diags_after:?}"
+        );
+        assert!(run.join(".applied-cleaned").is_file());
+        assert!(
+            run.join("apply.lock").is_file(),
+            "remove_after_apply must preserve apply.lock so queued waiters do not lock an unlinked inode"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }

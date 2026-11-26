@@ -1088,8 +1088,19 @@ pub fn detect_applied(run: &Path, meta: &Value) -> bool {
     if run.join(".applied").exists() {
         return true;
     }
+    if crate::runs::apply_in_flight(run) {
+        return false;
+    }
     if !is_applied_in_repo_readonly(run, meta) {
         return false;
+    }
+    // Hold `<run>/apply.lock` (`LOCK_NB`) across `.applied`/`meta.json`/history/events writes
+    // and re-check `.applied` after locking so an `apply` started concurrently cannot race.
+    let Ok(Some(_apply_guard)) = crate::runs::try_acquire_apply_guard(run) else {
+        return false;
+    };
+    if run.join(".applied").exists() {
+        return true;
     }
     let rec = json(run.join("changes.json"));
     let entries = recorded_entries(run, meta, &rec).unwrap_or_default();

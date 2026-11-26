@@ -440,7 +440,10 @@ fn auto_reclaim_applied_and_dropped(state: &Path) {
             {
                 continue;
             }
-            if crate::runs::active(&crate::runs::state(run)) || crate::runs::agent_alive(run) {
+            if crate::runs::active(&crate::runs::state(run))
+                || crate::runs::agent_alive(run)
+                || crate::runs::apply_in_flight(run)
+            {
                 continue;
             }
             let meta = &metas[idx];
@@ -463,7 +466,10 @@ fn auto_reclaim_applied_and_dropped(state: &Path) {
             {
                 continue;
             }
-            if crate::runs::active(&crate::runs::state(run)) || crate::runs::agent_alive(run) {
+            if crate::runs::active(&crate::runs::state(run))
+                || crate::runs::agent_alive(run)
+                || crate::runs::apply_in_flight(run)
+            {
                 continue;
             }
             if busy.contains_key(&idx) {
@@ -483,6 +489,7 @@ fn auto_reclaim_applied_and_dropped(state: &Path) {
                     && other.is_dir()
                     && s(&metas[oi], "parent") == run_id
                     && (crate::runs::active(&crate::runs::state(other))
+                        || crate::runs::apply_in_flight(other)
                         || (!other.join(".applied").exists()
                             && !is_run_dropped(other, &metas[oi], &work_items)))
             });
@@ -498,6 +505,7 @@ fn auto_reclaim_applied_and_dropped(state: &Path) {
                         && other.is_dir()
                         && s(&metas[oi]["worktree"], "path") == wt_str
                         && (crate::runs::active(&crate::runs::state(other))
+                            || crate::runs::apply_in_flight(other)
                             || (!other.join(".applied").exists()
                                 && !is_run_dropped(other, &metas[oi], &work_items)))
                 });
@@ -616,7 +624,8 @@ fn auto_reclaim_unmerged_on_watermark(state: &Path) {
                 oi != idx
                     && other.is_dir()
                     && s(&metas[oi], "parent") == run_id
-                    && crate::runs::active(&crate::runs::state(other))
+                    && (crate::runs::active(&crate::runs::state(other))
+                        || crate::runs::apply_in_flight(other))
             });
             let eligible = run.join("exit_code").is_file()
                 && !run.join(".applied").exists()
@@ -625,6 +634,7 @@ fn auto_reclaim_unmerged_on_watermark(state: &Path) {
                 && crate::pending_reply::status(run).is_none()
                 && !crate::runs::active(&crate::runs::state(run))
                 && !crate::runs::agent_alive(run)
+                && !crate::runs::apply_in_flight(run)
                 && !has_active_child;
 
             if !eligible {
