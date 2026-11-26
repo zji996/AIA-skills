@@ -423,11 +423,13 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<Option<String>> {
         env = json!({});
     }
     let timeout = seconds(&setting("SETUP_TIMEOUT", "10m"))?;
-    let _slot = lane::acquire_shell(
+    let setup_cmds: Vec<&str> = setup.iter().map(String::as_str).collect();
+    let _slot = lane::acquire_shell_for_commands(
         &format!(
             "setup {}",
             run.file_name().unwrap_or_default().to_string_lossy()
         ),
+        &setup_cmds,
         None,
         Some(run),
         |_, _| {},
@@ -3557,7 +3559,8 @@ pub fn run_verify(run: &Path, commands: &[String]) -> Value {
         run.file_name().unwrap_or_default().to_string_lossy()
     );
     apply_progress("verifying merged tree / 正在验收合并结果");
-    let slot = lane::acquire_shell(&label, None, Some(run), |ahead, _| {
+    let verify_cmds: Vec<&str> = commands.iter().map(String::as_str).collect();
+    let slot = lane::acquire_shell_for_commands(&label, &verify_cmds, None, Some(run), |ahead, _| {
         apply_progress(format!("verify queued / 排队中: {ahead} ahead"))
     });
     let retry = format!("验收未完成（排队/基础设施）；重排：{} apply --verify --keep {}；或本地：DELEGATE_REMOTE=0 {} lane {}",
@@ -4430,11 +4433,12 @@ fn apply_inner(
             });
         }
         let gen_queue_t0 = std::time::Instant::now();
-        let _slot = match lane::acquire_shell(
+        let _slot = match lane::acquire_shell_for_commands(
             &format!(
                 "regenerate {}",
                 run.file_name().unwrap_or_default().to_string_lossy()
             ),
+            &[generate_command.as_str()],
             None,
             Some(run),
             |ahead, labels| {

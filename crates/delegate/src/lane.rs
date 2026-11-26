@@ -10,12 +10,49 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneKind {
+    Local,
+    RemoteHeavy,
+    RemoteLight,
+}
+
+impl LaneKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LaneKind::Local => "local",
+            LaneKind::RemoteHeavy => "remote-heavy",
+            LaneKind::RemoteLight => "remote-light",
+        }
+    }
+
+    pub fn is_remote(self) -> bool {
+        !matches!(self, LaneKind::Local)
+    }
+}
+
 thread_local! {
     static SLOT_ENV_STACK: RefCell<Vec<Vec<(String, String)>>> = const { RefCell::new(Vec::new()) };
+    static SLOT_KIND_STACK: RefCell<Vec<LaneKind>> = const { RefCell::new(Vec::new()) };
 }
 
 pub fn current_slot_env() -> Option<Vec<(String, String)>> {
     SLOT_ENV_STACK.with(|s| s.borrow().last().cloned())
+}
+
+pub fn current_lane_held_env() -> &'static str {
+    SLOT_KIND_STACK.with(|s| match s.borrow().last().copied() {
+        Some(LaneKind::RemoteLight) => "remote-light",
+        _ => "1",
+    })
+}
+
+fn already_held_for(kind: LaneKind) -> bool {
+    match std::env::var("DELEGATE_LANE_HELD").ok().as_deref() {
+        None => false,
+        Some("remote-light") => matches!(kind, LaneKind::RemoteLight),
+        Some(_) => true,
+    }
 }
 
 pub static SIGNAL: AtomicI32 = AtomicI32::new(0);
@@ -373,6 +410,12 @@ fn heavy_limit(run: Option<&Path>) -> Res<usize> {
 fn lane_dir() -> PathBuf {
     state_dir().join("lane")
 }
+fn remote_heavy_dir() -> PathBuf {
+    state_dir().join("lane-remote")
+}
+fn remote_light_dir() -> PathBuf {
+    state_dir().join("lane-remote-light")
+}
 fn held(p: &Path) -> bool {
     let Ok(f) = OpenOptions::new().read(true).open(p) else {
         return false;
@@ -405,7 +448,23 @@ pub fn remote_holders() -> Res<Vec<(String, String, bool)>> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let cfg = crate::config::load(git_top(&cwd).as_deref())?;
     let lim = crate::remote::remote_plan(&cfg.value["remote"], false).max_heavy;
-    Ok(tickets_in(&state_dir().join("lane-remote"))
+    Ok(tickets_in(&remote_heavy_dir())
+        .iter()
+        .enumerate()
+        .map(|(i, (_, v))| {
+            (
+                s(v, "label").into(),
+                s(v, "since").into(),
+                lim == 0 || i < lim,
+            )
+        })
+        .collect())
+}
+pub fn remote_light_holders() -> Res<Vec<(String, String, bool)>> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let cfg = crate::config::load(git_top(&cwd).as_deref())?;
+    let lim = crate::remote::max_light(&cfg.value["remote"]);
+    Ok(tickets_in(&remote_light_dir())
         .iter()
         .enumerate()
         .map(|(i, (_, v))| {
@@ -430,6 +489,70 @@ pub fn holders() -> Res<Vec<(String, String, bool)>> {
             )
         })
         .collect())
+}
+
+/// Lock-free lookup of a run's active/queued lane ticket across remote-heavy, remote-light, and local queues.
+pub fn run_active_lane(run: &Path) -> Option<Value> {
+    let run_val = json!(run);
+    let fname = run.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let matches_run = |v: &Value| -> bool {
+        if v["run"] == run_val || v["context"] == run_val {
+            return true;
+        }
+        if !fname.is_empty() {
+            let lbl = s(v, "label");
+            if lbl == format!("accept {fname}")
+                || lbl == format!("verify {fname}")
+                || lbl == format!("setup {fname}")
+                || lbl == format!("regenerate {fname}")
+            {
+                return true;
+            }
+        }
+        false
+    };
+    let cwd = std::env::current_dir().ok();
+    let cfg = cwd
+        .as_deref()
+        .and_then(|d| crate::config::load(git_top_fast(d).as_deref()).ok());
+    let heavy_lim = cfg
+        .as_ref()
+        .map(|c| crate::remote::remote_plan(&c.value["remote"], false).max_heavy)
+        .unwrap_or(4);
+    let light_lim = cfg
+        .as_ref()
+        .map(|c| crate::remote::max_light(&c.value["remote"]))
+        .unwrap_or(crate::remote::DEFAULT_MAX_LIGHT);
+    let local_lim = cfg
+        .as_ref()
+        .and_then(|c| local_plan_for_config(&c.value).ok())
+        .map(|p| p.max_heavy)
+        .unwrap_or_else(default_local_max_heavy);
+
+    let mut found: Option<Value> = None;
+    for (dir, kind, lim) in [
+        (remote_heavy_dir(), LaneKind::RemoteHeavy, heavy_lim),
+        (remote_light_dir(), LaneKind::RemoteLight, light_lim),
+        (lane_dir(), LaneKind::Local, local_lim),
+    ] {
+        for (i, (_, v)) in tickets_in(&dir).into_iter().enumerate() {
+            if matches_run(&v) {
+                let running = b(&v, "running") || lim == 0 || i < lim;
+                let info = json!({
+                    "queue": kind.as_str(),
+                    "running": running,
+                    "label": s(&v, "label"),
+                });
+                if !running {
+                    return Some(info);
+                }
+                if found.is_none() {
+                    found = Some(info);
+                }
+            }
+        }
+    }
+    found
 }
 
 /// Return the processes that currently hold a running heavy-lane slot.
@@ -568,6 +691,7 @@ pub struct Slot {
     _file: Option<File>,
     proxy: Option<crate::jobserver::ProxyGuard>,
     pushed_env: bool,
+    pushed_kind: bool,
     pub queued: f64,
     acquired_at: Option<Instant>,
     rusage_start: Option<ChildRusage>,
@@ -575,7 +699,7 @@ pub struct Slot {
     event_run: String,
     event_repo: String,
     event_label: String,
-    event_remote: bool,
+    event_kind: LaneKind,
 }
 impl Slot {
     pub fn env_vars(&self) -> Option<Vec<(String, String)>> {
@@ -587,6 +711,12 @@ impl Slot {
 }
 impl Drop for Slot {
     fn drop(&mut self) {
+        if self.pushed_kind {
+            SLOT_KIND_STACK.with(|s| {
+                s.borrow_mut().pop();
+            });
+            self.pushed_kind = false;
+        }
         if self.pushed_env {
             SLOT_ENV_STACK.with(|s| {
                 s.borrow_mut().pop();
@@ -619,7 +749,8 @@ impl Drop for Slot {
                     json!({
                         "label": self.event_label,
                         "heldSeconds": held,
-                        "remote": self.event_remote,
+                        "remote": self.event_kind.is_remote(),
+                        "lane": self.event_kind.as_str(),
                         "cpuUserSecs": cpu_user,
                         "cpuSysSecs": cpu_sys,
                         "maxRssKb": max_rss_kb,
@@ -653,7 +784,16 @@ pub fn acquire(
     context: Option<&Path>,
     waiting: impl FnMut(usize, &[String]),
 ) -> Res<Slot> {
-    acquire_in(&lane_dir(), heavy_limit(context)?, label, account, context, false, None, waiting)
+    acquire_in(
+        &lane_dir(),
+        heavy_limit(context)?,
+        label,
+        account,
+        context,
+        LaneKind::Local,
+        None,
+        waiting,
+    )
 }
 pub fn acquire_remote(
     label: &str,
@@ -663,27 +803,55 @@ pub fn acquire_remote(
 ) -> Res<Slot> {
     let plan = crate::remote::remote_plan(remote, true);
     acquire_in(
-        &state_dir().join("lane-remote"),
+        &remote_heavy_dir(),
         plan.max_heavy,
         label,
         account,
         account,
-        true,
+        LaneKind::RemoteHeavy,
         None,
         waiting,
     )
 }
-/// Shell steps use the remote lane, while the public `lane` command stays local.
+pub fn acquire_remote_light(
+    label: &str,
+    account: Option<&Path>,
+    remote: &Value,
+    waiting: impl FnMut(usize, &[String]),
+) -> Res<Slot> {
+    let lim = crate::remote::max_light(remote);
+    acquire_in(
+        &remote_light_dir(),
+        lim,
+        label,
+        account,
+        account,
+        LaneKind::RemoteLight,
+        None,
+        waiting,
+    )
+}
+/// Shell steps use the remote lane (heavy or light), while the public `lane` command stays local.
 pub fn acquire_shell(
     label: &str,
     account: Option<&Path>,
     context: Option<&Path>,
     waiting: impl FnMut(usize, &[String]),
 ) -> Res<Slot> {
-    acquire_shell_cancellable(label, account, context, None, waiting)
+    acquire_shell_for_commands_cancellable(label, &[], account, context, None, waiting)
 }
-pub fn acquire_shell_cancellable(
+pub fn acquire_shell_for_commands(
     label: &str,
+    commands: &[&str],
+    account: Option<&Path>,
+    context: Option<&Path>,
+    waiting: impl FnMut(usize, &[String]),
+) -> Res<Slot> {
+    acquire_shell_for_commands_cancellable(label, commands, account, context, None, waiting)
+}
+pub fn acquire_shell_for_commands_cancellable(
+    label: &str,
+    commands: &[&str],
     account: Option<&Path>,
     context: Option<&Path>,
     cancel: Option<&AtomicBool>,
@@ -696,17 +864,31 @@ pub fn acquire_shell_cancellable(
         .map(|r| json(r.join("meta.json")))
         .unwrap_or(Value::Null);
     if crate::remote::enabled(&meta["remote"]) {
-        let plan = crate::remote::remote_plan(&meta["remote"], true);
-        acquire_in(
-            &state_dir().join("lane-remote"),
-            plan.max_heavy,
-            label,
-            account.or(context),
-            account.or(context),
-            true,
-            cancel,
-            waiting,
-        )
+        if crate::remote::shell_commands_are_light(&meta["remote"], commands) {
+            let lim = crate::remote::max_light(&meta["remote"]);
+            acquire_in(
+                &remote_light_dir(),
+                lim,
+                label,
+                account.or(context),
+                account.or(context),
+                LaneKind::RemoteLight,
+                cancel,
+                waiting,
+            )
+        } else {
+            let plan = crate::remote::remote_plan(&meta["remote"], true);
+            acquire_in(
+                &remote_heavy_dir(),
+                plan.max_heavy,
+                label,
+                account.or(context),
+                account.or(context),
+                LaneKind::RemoteHeavy,
+                cancel,
+                waiting,
+            )
+        }
     } else {
         acquire_in(
             &lane_dir(),
@@ -714,7 +896,7 @@ pub fn acquire_shell_cancellable(
             label,
             account,
             context,
-            false,
+            LaneKind::Local,
             cancel,
             waiting,
         )
@@ -774,16 +956,18 @@ fn acquire_in(
     label: &str,
     account: Option<&Path>,
     context: Option<&Path>,
-    remote: bool,
+    kind: LaneKind,
     cancel: Option<&AtomicBool>,
     mut waiting: impl FnMut(usize, &[String]),
 ) -> Res<Slot> {
-    if std::env::var_os("DELEGATE_LANE_HELD").is_some() {
+    let remote = kind.is_remote();
+    if already_held_for(kind) {
         return Ok(Slot {
             ticket: None,
             _file: None,
             proxy: None,
             pushed_env: false,
+            pushed_kind: false,
             queued: 0.0,
             acquired_at: None,
             rusage_start: None,
@@ -791,7 +975,7 @@ fn acquire_in(
             event_run: String::new(),
             event_repo: String::new(),
             event_label: String::new(),
-            event_remote: remote,
+            event_kind: kind,
         });
     }
     let event_run_path = account.or(context);
@@ -803,11 +987,13 @@ fn acquire_in(
         } else {
             (None, false)
         };
+        SLOT_KIND_STACK.with(|s| s.borrow_mut().push(kind));
         return Ok(Slot {
             ticket: None,
             _file: None,
             proxy,
             pushed_env,
+            pushed_kind: true,
             queued: 0.0,
             acquired_at: None,
             rusage_start: None,
@@ -815,7 +1001,7 @@ fn acquire_in(
             event_run: String::new(),
             event_repo: String::new(),
             event_label: String::new(),
-            event_remote: remote,
+            event_kind: kind,
         });
     }
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -834,7 +1020,18 @@ fn acquire_in(
         });
     let priority = account.map(|r| json(r.join("meta.json"))["lanePriority"][label].as_u64().unwrap_or(0)).unwrap_or(0);
     let stamp = if priority == 0 { stamp_now } else { priority };
-    let mut me = json!({"pid":std::process::id(),"label":label,"since":iso(),"epoch":epoch(),"queuedNs":stamp,"runStartedNs":run_started_ns,"run":account,"running":false});
+    let mut me = json!({
+        "pid": std::process::id(),
+        "label": label,
+        "lane": kind.as_str(),
+        "since": iso(),
+        "epoch": epoch(),
+        "queuedNs": stamp,
+        "runStartedNs": run_started_ns,
+        "run": account,
+        "context": context,
+        "running": false,
+    });
     let ticket;
     let mut file;
     {
@@ -877,6 +1074,7 @@ fn acquire_in(
                         "label": label,
                         "ahead": ahead,
                         "remote": remote,
+                        "lane": kind.as_str(),
                     }),
                 );
             }
@@ -923,6 +1121,7 @@ fn acquire_in(
     } else {
         (None, false)
     };
+    SLOT_KIND_STACK.with(|s| s.borrow_mut().push(kind));
     crate::events::emit(
         &event_run,
         &event_repo,
@@ -931,6 +1130,7 @@ fn acquire_in(
             "label": label,
             "queuedSeconds": (queued * 100.0).round() / 100.0,
             "remote": remote,
+            "lane": kind.as_str(),
         }),
     );
     Ok(Slot {
@@ -938,6 +1138,7 @@ fn acquire_in(
         _file: Some(file),
         proxy,
         pushed_env,
+        pushed_kind: true,
         queued,
         acquired_at: Some(Instant::now()),
         rusage_start: getrusage_children(),
@@ -945,13 +1146,13 @@ fn acquire_in(
         event_run,
         event_repo,
         event_label: label.to_string(),
-        event_remote: remote,
+        event_kind: kind,
     })
 }
 /// Keep only queued jobs, not processes: question cleanup still reclaims every child.
 pub fn save_priority(run: &Path) -> Res<()> {
     let mut priority = json!({});
-    for dir in [lane_dir(), state_dir().join("lane-remote")] {
+    for dir in [lane_dir(), remote_heavy_dir(), remote_light_dir()] {
         if !dir.is_dir() { continue; }
         let _guard = crate::locks::acquire(crate::locks::LockKind::Lane, &dir.join(".lock"), true).map_err(|e| e.to_string())?;
         for (_, ticket) in tickets_in(&dir) {
@@ -990,6 +1191,7 @@ pub fn queued_seconds(run: &Path) -> f64 {
 /// Zero-lock, zero-side-effect JSON snapshot of local + remote lane & jobserver pool state.
 pub fn status_json_readonly() -> Res<Value> {
     let remote = remote_holders().unwrap_or_default();
+    let remote_light = remote_light_holders().unwrap_or_default();
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let cfg = crate::config::load(git_top_fast(&cwd).as_deref())?;
     let plan = local_plan_for_config(&cfg.value)?;
@@ -1023,10 +1225,11 @@ pub fn status_json_readonly() -> Res<Value> {
         .as_ref()
         .map(|p| p.max_heavy)
         .unwrap_or_else(|| cfg.value["remote"]["maxHeavy"].as_u64().unwrap_or(4) as usize);
+    let remote_light_limit = crate::remote::max_light(&cfg.value["remote"]);
     let local_items: Vec<Value> = local_tickets
         .into_iter()
         .map(|(pid, label, since, running)| {
-            let mut item = json!({"label": label, "since": since, "running": running});
+            let mut item = json!({"label": label, "since": since, "running": running, "lane": "local"});
             if running {
                 if let Some(lease) = match_lease(pid, &label) {
                     item["rank"] = json!(lease.rank);
@@ -1041,7 +1244,13 @@ pub fn status_json_readonly() -> Res<Value> {
     let remote_items: Vec<Value> = remote
         .into_iter()
         .map(|(label, since, running)| {
-            json!({"label": label, "since": since, "running": running})
+            json!({"label": label, "since": since, "running": running, "lane": "remote-heavy"})
+        })
+        .collect();
+    let remote_light_items: Vec<Value> = remote_light
+        .into_iter()
+        .map(|(label, since, running)| {
+            json!({"label": label, "since": since, "running": running, "lane": "remote-light"})
         })
         .collect();
     let mut out = json!({
@@ -1059,6 +1268,8 @@ pub fn status_json_readonly() -> Res<Value> {
         "local": local_items,
         "remoteMaxHeavy": remote_limit,
         "remote": remote_items,
+        "remoteMaxLight": remote_light_limit,
+        "remoteLight": remote_light_items,
     });
     if let Some(rp) = remote_plan {
         out["remoteConcurrency"] = rp.to_json();
@@ -1096,6 +1307,7 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
     };
     if words.is_empty() {
         let remote = remote_holders()?;
+        let remote_light = remote_light_holders()?;
         let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
         let cfg = crate::config::load(git_top(&cwd).as_deref())?;
         let plan = local_plan_for_config(&cfg.value)?;
@@ -1129,11 +1341,12 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
             .as_ref()
             .map(|p| p.max_heavy)
             .unwrap_or_else(|| cfg.value["remote"]["maxHeavy"].as_u64().unwrap_or(4) as usize);
+        let remote_light_limit = crate::remote::max_light(&cfg.value["remote"]);
         if json_mode {
             let local_items: Vec<Value> = local_tickets
                 .into_iter()
                 .map(|(pid, label, since, running)| {
-                    let mut item = json!({"label": label, "since": since, "running": running});
+                    let mut item = json!({"label": label, "since": since, "running": running, "lane": "local"});
                     if running {
                         if let Some(lease) = match_lease(pid, &label) {
                             item["rank"] = json!(lease.rank);
@@ -1148,7 +1361,13 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
             let remote_items: Vec<Value> = remote
                 .into_iter()
                 .map(|(label, since, running)| {
-                    json!({"label": label, "since": since, "running": running})
+                    json!({"label": label, "since": since, "running": running, "lane": "remote-heavy"})
+                })
+                .collect();
+            let remote_light_items: Vec<Value> = remote_light
+                .into_iter()
+                .map(|(label, since, running)| {
+                    json!({"label": label, "since": since, "running": running, "lane": "remote-light"})
                 })
                 .collect();
             let mut out = json!({
@@ -1166,6 +1385,8 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
                 "local": local_items,
                 "remoteMaxHeavy": remote_limit,
                 "remote": remote_items,
+                "remoteMaxLight": remote_light_limit,
+                "remoteLight": remote_light_items,
             });
             if let Some(rp) = remote_plan {
                 out["remoteConcurrency"] = rp.to_json();
@@ -1175,11 +1396,28 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
         }
         println!("{}", plan.format_summary_with_pool(&pool));
         if let Some(rp) = remote_plan {
-            println!("remote {}", rp.format_summary());
+            let has_light = !crate::remote::light_patterns(&cfg.value["remote"]).is_empty()
+                || !remote_light.is_empty();
+            if has_light {
+                let light_str = if remote_light_limit == 0 {
+                    "不限".to_string()
+                } else {
+                    format!("{remote_light_limit} 条")
+                };
+                println!("remote {} · 轻队列 {light_str}", rp.format_summary());
+            } else {
+                println!("remote {}", rp.format_summary());
+            }
         }
         for (label, since, running) in remote {
             println!(
-                "remote {:<8} {since}  {label}",
+                "remote {:<8} {since}  [重队列]  {label}",
+                if running { "running" } else { "queued" }
+            );
+        }
+        for (label, since, running) in remote_light {
+            println!(
+                "remote {:<8} {since}  [轻队列]  {label}",
                 if running { "running" } else { "queued" }
             );
         }
@@ -1187,7 +1425,7 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
             if running {
                 if let Some(lease) = match_lease(pid, &label) {
                     println!(
-                        "{:<8} {since}  #{} {}/{}  {label}",
+                        "{:<8} {since}  [本机]  #{} {}/{}  {label}",
                         "running",
                         lease.rank,
                         lease.used_jobs(),
@@ -1197,7 +1435,7 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
                 }
             }
             println!(
-                "{:<8} {since}  {label}",
+                "{:<8} {since}  [本机]  {label}",
                 if running { "running" } else { "queued" }
             );
         }

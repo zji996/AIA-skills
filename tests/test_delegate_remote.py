@@ -42,7 +42,7 @@ with open({str(self.ssh_log)!r}, "a") as log:
 if Path({str(self.work / 'offline')!r}).exists():
     print("test transport offline", file=sys.stderr)
     sys.exit(255)
-assert sys.argv[-2] == "ci", sys.argv
+assert sys.argv[-2] in ("ci", "gpu"), sys.argv
 os.environ["HOME"] = {str(self.remote)!r}
 os.environ["PATH"] = {str(self.remote / 'bin')!r} + ":/usr/bin:/bin"
 script = sys.argv[-1]
@@ -64,7 +64,7 @@ if Path({str(self.work / 'offline')!r}).exists() or Path({str(self.work / 'rsync
 a = sys.argv[1:]
 i = a.index("-e")
 del a[i:i+2]
-a = [s.removeprefix("ci:") for s in a]
+a = [s.removeprefix("ci:").removeprefix("gpu:") for s in a]
 os.execv({real_rsync!r}, ["rsync", *a])
 ''')
         rsync.chmod(0o755)
@@ -516,6 +516,355 @@ os.execvp(a[0],a)
         self.assertEqual(failed["state"], "rejected")
         self.assertTrue(failed["infrastructureFailure"])
         self.assertNotIn("localFallback", failed["accept"])
+
+    def _install_fake_uv(self):
+        heavy_started = self.work / "heavy-started"
+        heavy_release = self.work / "heavy-release"
+        light_started = self.work / "light-started"
+        light_release = self.work / "light-release"
+        uv_remote = self.remote / "bin/uv"
+        uv_remote.write_text(f"#!{sys.executable}\n" + f'''
+import json, os, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+with open({str(self.calls)!r}, "a") as log:
+    log.write(json.dumps({{"program": "uv", "argv": args, "cwd": os.getcwd(), "pid": os.getpid()}}) + "\\n")
+if args == ["--version"]:
+    print("uv fake")
+    sys.exit(0)
+if "train.py" in args:
+    Path({str(heavy_started)!r}).write_text(str(os.getpid()))
+    while not Path({str(heavy_release)!r}).exists():
+        time.sleep(0.02)
+    print("train done")
+    sys.exit(0)
+if "hold-light" in args:
+    Path({str(light_started)!r}).write_text(str(os.getpid()))
+    while not Path({str(light_release)!r}).exists():
+        time.sleep(0.02)
+    print("light held done")
+    sys.exit(0)
+print("uv ok: " + " ".join(args))
+''')
+        uv_remote.chmod(0o755)
+        uv_local = self.bin / "uv"
+        uv_local.write_text(f"#!{sys.executable}\nimport sys\nprint('local-uv:' + ' '.join(sys.argv[1:]))\n")
+        uv_local.chmod(0o755)
+        return heavy_started, heavy_release, light_started, light_release
+
+    def test_remote_light_command_and_acceptance_bypass_heavy_holder_and_display_lanes(self):
+        heavy_started, heavy_release, light_started, light_release = self._install_fake_uv()
+        self.user_config({
+            "models": fixtures.REGISTERED_MODELS,
+            "remote": {"host": "gpu", "root": "build", "programs": ["uv"], "maxHeavy": 1},
+        })
+        repo_cfg = {
+            "remote": {
+                "programs": ["uv"],
+                "maxHeavy": 1,
+                "maxLight": 1,
+                "light": [
+                    "uv run --frozen pytest",
+                    "uv run --frozen python scripts/verify_*",
+                ],
+            }
+        }
+        repo, run_a = self.run_remote(accept="true", config=repo_cfg)
+        _, run_b = self.run_remote(accept="true", config=repo_cfg)
+        env = dict(self.env, DELEGATE_MAX_HEAVY="1")
+        env.pop("DELEGATE_LANE_HELD", None)
+
+        # Hold the sole heavy remote slot with a long training command.
+        def _stop_proc(p, gate=None):
+            if gate is not None:
+                gate.touch()
+            if p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait(timeout=5)
+            for stream in (p.stdout, p.stderr):
+                if stream is not None:
+                    stream.close()
+
+        heavy = subprocess.Popen(
+            [str(fixtures.DELEGATE), "_remote", run_a["dir"], "uv", "run", "--frozen", "python", "train.py"],
+            cwd=run_a["worktree"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(_stop_proc, heavy, heavy_release)
+        fixtures.wait_until(lambda: heavy_started.exists(), "heavy holder started", interval=0.02)
+
+        # 1) Colleague light commands (prefix and wildcard) complete immediately without waiting for heavy.
+        light_pytest = subprocess.run(
+            [str(fixtures.DELEGATE), "_remote", run_b["dir"], "uv", "run", "--frozen", "pytest", "-q"],
+            cwd=run_b["worktree"], env=env, capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(light_pytest.returncode, 0, light_pytest.stdout + light_pytest.stderr)
+        self.assertIn("uv ok: run --frozen pytest -q", light_pytest.stdout)
+
+        light_verify = subprocess.run(
+            [str(fixtures.DELEGATE), "_remote", run_b["dir"], "uv", "run", "--frozen", "python", "scripts/verify_cpu.py"],
+            cwd=run_b["worktree"], env=env, capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(light_verify.returncode, 0, light_verify.stdout + light_verify.stderr)
+        self.assertIn("uv ok: run --frozen python scripts/verify_cpu.py", light_verify.stdout)
+
+        # 2) Acceptance command matching remote.light also bypasses the heavy remote holder.
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
+        acc_res = self.cli(
+            "run", "--worktree", "--workdir", repo,
+            "--accept", "uv run --frozen pytest -q && uv run --frozen python scripts/verify_cpu.py",
+            "cpu accept task",
+            timeout=25,
+        )
+        acc_state = self.outcome(acc_res)
+        self.assertEqual(acc_state["state"], "delivered", acc_state)
+
+        # 3) Hold light slot + local slot simultaneously to inspect status & lane tags for all 3 queues.
+        light_hold = subprocess.Popen(
+            [str(fixtures.DELEGATE), "_remote", run_b["dir"], "uv", "run", "--frozen", "pytest", "hold-light"],
+            cwd=run_b["worktree"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(_stop_proc, light_hold, light_release)
+        fixtures.wait_until(lambda: light_started.exists(), "light holder started", interval=0.02)
+
+        local_gate = self.work / "local-gate"
+        local_started = self.work / "local-started"
+        local_cmd = f"touch {shlex.quote(str(local_started))}; while [ ! -f {shlex.quote(str(local_gate))} ]; do sleep 0.02; done"
+        local_hold = subprocess.Popen(
+            [str(fixtures.DELEGATE), "lane", "--label", "local-check", local_cmd],
+            cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(_stop_proc, local_hold, local_gate)
+        fixtures.wait_until(lambda: local_started.exists(), "local holder started", interval=0.02)
+
+        # Queue a second light command to prove maxLight=1 queues in light queue, not heavy queue.
+        light_queued = subprocess.Popen(
+            [str(fixtures.DELEGATE), "_remote", acc_state["dir"], "uv", "run", "--frozen", "pytest", "-q"],
+            cwd=acc_state["worktree"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(_stop_proc, light_queued)
+        st_b = fixtures.wait_until(
+            lambda: st if (st := self.outcome(self.cli("status", run_b["run"], cwd=repo))).get("remoteLane", {}).get("lightQueued") == 1 else False,
+            "second light command queued",
+            timeout=10,
+            interval=0.02,
+        )
+        self.assertEqual(st_b["remoteLane"]["queued"], 0)
+        self.assertEqual(st_b["remoteLane"]["lightQueued"], 1)
+        self.assertEqual(st_b["lane"]["queue"], "remote-light")
+        self.assertTrue(st_b["lane"]["running"])
+
+        st_a = self.outcome(self.cli("status", run_a["run"], cwd=repo))
+        self.assertEqual(st_a["lane"]["queue"], "remote-heavy")
+        self.assertTrue(st_a["lane"]["running"])
+
+        lane_human = self.cli("lane", cwd=repo).stdout
+        self.assertIn("轻队列 1 条", lane_human)
+        self.assertIn("[重队列]", lane_human)
+        self.assertIn("[轻队列]", lane_human)
+        self.assertIn("[本机]", lane_human)
+        self.assertIn("remote queued", lane_human)
+
+        lane_json = json.loads(self.cli("lane", "--json", cwd=repo).stdout)
+        self.assertEqual(lane_json["remoteMaxLight"], 1)
+        self.assertEqual([x["lane"] for x in lane_json["remote"]], ["remote-heavy"])
+        self.assertEqual([x["lane"] for x in lane_json["remoteLight"]], ["remote-light", "remote-light"])
+        self.assertTrue(any(x["lane"] == "local" for x in lane_json["local"]))
+
+        status_summary_human = self.cli("status", cwd=repo, human=True).stdout
+        self.assertIn("[重队列]", status_summary_human)
+        self.assertIn("[轻队列]", status_summary_human)
+        self.assertIn("[本机]", status_summary_human)
+        status_a_human = self.cli("status", run_a["run"], cwd=repo, human=True).stdout
+        self.assertIn("远端重队列（运行中）", status_a_human)
+        status_b_human = self.cli("status", run_b["run"], cwd=repo, human=True).stdout
+        self.assertIn("远端轻队列（运行中）", status_b_human)
+
+        # Release gates and verify clean completion.
+        light_release.touch()
+        local_gate.touch()
+        heavy_release.touch()
+        out_lq, err_lq = light_queued.communicate(timeout=15)
+        self.assertEqual(light_queued.returncode, 0, out_lq + err_lq)
+        self.assertIn("delegate remote light: queued behind 1", err_lq)
+        light_hold.communicate(timeout=15)
+        self.assertEqual(light_hold.returncode, 0)
+        local_hold.communicate(timeout=15)
+        self.assertEqual(local_hold.returncode, 0)
+        heavy.communicate(timeout=15)
+        self.assertEqual(heavy.returncode, 0)
+
+    def test_remote_light_unset_preserves_existing_heavy_queuing_behavior(self):
+        heavy_started, heavy_release, _, _ = self._install_fake_uv()
+        self.user_config({
+            "models": fixtures.REGISTERED_MODELS,
+            "remote": {"host": "gpu", "root": "build", "programs": ["uv"], "maxHeavy": 1},
+        })
+        repo, run_a = self.run_remote(accept="true")
+        _, run_b = self.run_remote(accept="true")
+        env = dict(self.env)
+        env.pop("DELEGATE_LANE_HELD", None)
+
+        heavy = subprocess.Popen(
+            [str(fixtures.DELEGATE), "_remote", run_a["dir"], "uv", "run", "--frozen", "python", "train.py"],
+            cwd=run_a["worktree"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: (heavy_release.touch(), heavy.poll() is None and heavy.terminate()))
+        fixtures.wait_until(lambda: heavy_started.exists(), "heavy holder started", interval=0.02)
+
+        # Without remote.light configured, pytest still queues behind heavy.
+        pytest_proc = subprocess.Popen(
+            [str(fixtures.DELEGATE), "_remote", run_b["dir"], "uv", "run", "--frozen", "pytest", "-q"],
+            cwd=run_b["worktree"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: pytest_proc.poll() is None and pytest_proc.terminate())
+        st = fixtures.wait_until(
+            lambda: s if (s := self.outcome(self.cli("status", run_b["run"], cwd=repo))).get("remoteLane", {}).get("queued") == 1 else False,
+            "pytest queued behind heavy when remote.light unset",
+            timeout=10,
+            interval=0.02,
+        )
+        self.assertEqual(st["remoteLane"]["lightQueued"], 0)
+        self.assertEqual(st["lane"]["queue"], "remote-heavy")
+        self.assertFalse(st["lane"]["running"])
+        heavy_release.touch()
+        out, err = pytest_proc.communicate(timeout=15)
+        self.assertEqual(pytest_proc.returncode, 0, out + err)
+        self.assertIn("delegate remote: queued behind 1", err)
+        heavy.communicate(timeout=15)
+        self.assertEqual(heavy.returncode, 0)
+
+    def test_no_remote_flag_echoes_off_records_meta_runs_locally_and_inherits_on_reply(self):
+        repo = self.repo({"a.txt": "old\n"})
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
+        started = self.cli(
+            "start", "--worktree", "--workdir", repo, "--no-remote", "--accept", "cargo check", "local start",
+            human=True,
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.assertIn("远程：关", started.stdout)
+        self.assertIn("远程：关", started.stderr)
+        waited = self.cli("wait", "--all", cwd=repo)
+        self.assertEqual(waited.returncode, 0, waited.stdout + waited.stderr)
+        state = self.outcome(waited)
+        self.assertEqual(state["state"], "delivered", state)
+        self.assertEqual(self.records(), [], "--no-remote must not invoke remote")
+        meta = json.loads((Path(state["dir"]) / "meta.json").read_text())
+        self.assertTrue(meta["remoteOff"])
+        self.assertFalse(meta["remote"])
+        self.assertTrue(self.outcome(self.cli("status", state["run"], cwd=repo)).get("remoteOff"))
+        self.assertIn("远程：关", self.cli("status", state["run"], cwd=repo, human=True).stdout)
+
+        # Reply inherits remoteOff without passing --no-remote again; --fresh also inherits.
+        for extra_flags in ((), ("--fresh",)):
+            self.fake_pi([fixtures.answer("continued"), fixtures.SETTLED])
+            rep = self.cli("reply", "--wait", *extra_flags, state["run"], "keep local", cwd=repo)
+            self.assertEqual(rep.returncode, 0, rep.stdout + rep.stderr)
+            self.assertIn("远程：关", rep.stderr)
+            state = self.outcome(rep)
+            meta = json.loads((Path(state["dir"]) / "meta.json").read_text())
+            self.assertTrue(meta["remoteOff"])
+            self.assertFalse(meta["remote"])
+            self.assertEqual(self.records(), [])
+
+        # Explicit DELEGATE_REMOTE=1 overrides inherited remoteOff.
+        self.env["DELEGATE_REMOTE"] = "1"
+        self.fake_pi([fixtures.answer("remote again"), fixtures.SETTLED])
+        rep_on = self.cli("reply", "--wait", state["run"], "enable remote", cwd=repo)
+        self.assertEqual(rep_on.returncode, 0, rep_on.stdout + rep_on.stderr)
+        state = self.outcome(rep_on)
+        meta = json.loads((Path(state["dir"]) / "meta.json").read_text())
+        self.assertFalse(meta["remoteOff"])
+        self.assertEqual(len(self.records()), 1)
+        self.env.pop("DELEGATE_REMOTE", None)
+
+        # reply --no-remote turns remote off again and subsequent reply inherits it.
+        before = len(self.records())
+        self.fake_pi([fixtures.answer("off again"), fixtures.SETTLED])
+        rep_off = self.cli("reply", "--wait", "--no-remote", state["run"], "disable remote", cwd=repo)
+        self.assertEqual(rep_off.returncode, 0, rep_off.stdout + rep_off.stderr)
+        self.assertIn("远程：关", rep_off.stderr)
+        state = self.outcome(rep_off)
+        meta = json.loads((Path(state["dir"]) / "meta.json").read_text())
+        self.assertTrue(meta["remoteOff"])
+        self.assertFalse(meta["remote"])
+        self.assertEqual(len(self.records()), before)
+
+    def test_work_add_auto_passes_no_remote_to_dispatched_run(self):
+        repo = self.repo({"a.txt": "old\n"})
+        self.fake_pi([fixtures.answer("upstream done"), fixtures.SETTLED], pre="echo upstream > a.txt")
+        up_state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--no-remote", "--accept", "cargo check", "upstream"))
+        self.assertEqual(up_state["state"], "delivered", up_state)
+        self.assertEqual(self.records(), [])
+
+        brief = self.work / "auto-brief.md"
+        brief.write_text("Auto dispatched local task\n")
+        added = self.cli(
+            "work", "add", "auto local task",
+            "--json",
+            "--class", "feat",
+            "--brief", str(brief),
+            "--after-applied", up_state["run"],
+            "--auto", "--", "--worktree", "--no-remote", "--accept", "cargo check",
+            cwd=repo,
+        )
+        self.assertEqual(added.returncode, 0, added.stdout + added.stderr)
+        wid = json.loads(added.stdout)["id"]
+        shown = json.loads(self.cli("work", "show", wid, "--json", cwd=repo).stdout)
+        self.assertIn("--no-remote", shown["autoDispatch"]["startArgs"])
+
+        # Applying upstream run triggers auto-dispatch with --no-remote.
+        self.fake_pi([fixtures.answer("auto done"), fixtures.SETTLED])
+        applied = self.cli("apply", up_state["run"], cwd=repo)
+        self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+
+        dispatched_run = fixtures.wait_until(
+            lambda: json.loads(self.cli("work", "show", wid, "--json", cwd=repo).stdout)
+            .get("autoDispatch", {})
+            .get("dispatchedRun") or False,
+            "auto-dispatched run id",
+            timeout=15,
+            interval=0.05,
+        )
+        waited = self.cli("wait", dispatched_run, cwd=repo)
+        self.assertEqual(waited.returncode, 0, waited.stdout + waited.stderr)
+        auto_state = self.outcome(waited)
+        self.assertEqual(auto_state["state"], "delivered", auto_state)
+        auto_meta = json.loads((Path(auto_state["dir"]) / "meta.json").read_text())
+        self.assertTrue(auto_meta["remoteOff"])
+        self.assertFalse(auto_meta["remote"])
+        self.assertEqual(self.records(), [], "auto-dispatched --no-remote run must stay local")
+
+    def test_remote_light_and_max_light_config_validation(self):
+        repo = self.repo({"a.txt": "old\n"})
+        cfg = repo / ".delegate.json"
+        for bad_remote in (
+            {"light": "uv run pytest"},
+            {"light": [""]},
+            {"light": ["uv 'unclosed"]},
+            {"maxLight": -1},
+            {"maxLight": "4"},
+        ):
+            cfg.write_text(json.dumps({"remote": bad_remote}))
+            res = self.cli("config", cwd=repo)
+            self.assertEqual(res.returncode, 2, f"expected error for {bad_remote}: {res.stdout} {res.stderr}")
+            self.assertIn("invalid remote.", res.stderr)
+        cfg.write_text(json.dumps({
+            "remote": {
+                "programs": ["uv"],
+                "maxHeavy": 1,
+                "maxLight": 3,
+                "light": ["uv run --frozen pytest", ["uv", "run", "ruff", "check"]],
+            }
+        }))
+        ok = self.cli("config", cwd=repo)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        parsed = json.loads(ok.stdout)
+        self.assertEqual(parsed["remote"]["maxLight"], 3)
+        self.assertEqual(len(parsed["remote"]["light"]), 2)
 
 
 if __name__ == "__main__":

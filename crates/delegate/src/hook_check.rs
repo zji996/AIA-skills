@@ -1717,7 +1717,7 @@ fn active_lane_state(
         }
     }
     let mut lane_runs = HashSet::new();
-    for sub in ["lane", "lane-remote"] {
+    for sub in ["lane", "lane-remote", "lane-remote-light"] {
         let ldir = state.join(sub);
         let Ok(rd) = fs::read_dir(&ldir) else {
             continue;

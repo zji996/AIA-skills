@@ -583,9 +583,21 @@ pub fn run_phase(
             "accept {}",
             run.file_name().unwrap_or_default().to_string_lossy()
         );
-        match lane::acquire_shell_cancellable(&label, None, Some(run), cancel, |ahead, _| {
-            crate::supervise::log_event(run, json!({"e":"queue","ahead":ahead}));
-        }) {
+        let lane_cmds: Vec<&str> = specs
+            .iter()
+            .filter(|s| s.lane)
+            .map(|s| s.command.as_str())
+            .collect();
+        match lane::acquire_shell_for_commands_cancellable(
+            &label,
+            &lane_cmds,
+            None,
+            Some(run),
+            cancel,
+            |ahead, _| {
+                crate::supervise::log_event(run, json!({"e":"queue","ahead":ahead}));
+            },
+        ) {
             Ok(s) => Some(s),
             Err(err) => {
                 let is_cancel = !lane::stopped()

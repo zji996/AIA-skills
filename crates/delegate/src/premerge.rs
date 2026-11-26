@@ -2223,7 +2223,7 @@ fn run_premerge_layers(
                 run.file_name().unwrap_or_default().to_string_lossy(),
                 spec.name
             );
-            match lane::acquire_shell(&label, None, Some(run), |_, _| {}) {
+            match lane::acquire_shell_for_commands(&label, &[spec.command.as_str()], None, Some(run), |_, _| {}) {
                 Ok(slot) => Some(slot),
                 Err(_) if should_yield_to_apply(run, source) => {
                     return Ok(PremergeLayersOutcome {
@@ -2737,8 +2737,9 @@ fn process_one_run(
             clear_running_marker_if_ours(run);
             return Ok(false);
         }
-        let _slot = match lane::acquire_shell(
+        let _slot = match lane::acquire_shell_for_commands(
             &format!("premerge-generate {run_id}"),
+            &[merge_res.generate_command.as_str()],
             None,
             Some(run),
             |_, _| {},

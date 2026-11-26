@@ -16,13 +16,13 @@
 
 ## Remote 执行与远端 lane
 
-start/reply 保存当次生效配置（remoteOff 随 reply 继承，显式 DELEGATE_REMOTE 可覆盖）；默认 root 是远端 HOME 下 `delegate`、programs 是 `["cargo"]`、maxHeavy 为 4（0 不限）。root/profile 为不越界的相对路径，profile 相对 root，slice 可省。
+start/reply 保存当次生效配置（`--no-remote` 与 `DELEGATE_REMOTE=0` 写入 `remoteOff: true` 并在启动回显标「远程：关」，随 reply 继承，显式 `DELEGATE_REMOTE=1` 可覆盖，且 `work add --auto -- <start-args>` 可透传 `--no-remote`）；默认 root 是远端 HOME 下 `delegate`、programs 是 `["cargo"]`、maxHeavy 为 4、maxLight 为 4（0 不限）。root/profile 为不越界的相对路径，profile 相对 root，slice 可省。
 
 本机与远端需 SSH、rsync，远端需 Linux 的 setsid、程序及其工具链；免交互认证与 profile 由用户准备。meta.env 与 forwardEnv 的本机现值透传，PATH/HOME/PWD/SHELL/TMPDIR、XDG 路径及 DELEGATE 内部标记不透传；远端工具链搜索路径在 profile 配置。profile 在执行程序的 shell 中 source；有 slice 时在 systemd service 的 payload shell 中 source，避免丢掉 profile 的导出变量。
 
 remote 生效时，同事的 argv0 命中 programs 就转给 `_remote`；按名称的 PATH shim 路由，不拦截显式 `/path/to/cargo` 或自行重置 PATH。匹配 measure 的同事命令仍在本机测量，已有 agentDeny 仍可拒绝；其他命令先 agentDeny、再 remote、最后 resources，远端命令不登记本机资源。验收、evidence、setup、生成与合并后 verify 使用只含 remote 规则的 PATH（不应用同事 deny/measure/resources），整个 shell 步骤改占远端 lane；嵌套 `_remote` 通过 `DELEGATE_LANE_HELD` 不重复排队。主控 `lane <cmd>` 不变，仍本机；未实现 `lane --remote`。
 
-`${XDG_STATE_HOME}/delegate/lane-remote/` 复用票 + flock 的 FIFO，宽度独立取 remote.maxHeavy；同事中途编译也排队，stderr 一行提示，等待记入 run 的 lane-wait，排队不计运行超时。`lane`/人读 `status` 列远端 running/queued 持有者；run JSON 的 remoteLane 含 holders 与 queued 人数。每个远端槽的上传/执行/下载再用本机 flock 串行，避免同事并行 bash 互删文件。
+`${XDG_STATE_HOME}/delegate/lane-remote/` 复用票 + flock 的 FIFO，宽度独立取 `remote.maxHeavy`；配置 `remote.light` 时，命中的同事命令与全部子句均命中的验收/verify/evidence/setup/merge/premerge shell 步骤改走独立的 `${XDG_STATE_HOME}/delegate/lane-remote-light/`（宽度 `remote.maxLight`，默认 4），不占 `maxHeavy`；轻队列 shell 注入 `DELEGATE_LANE_HELD=remote-light`，若脚本内部调用未命中 `remote.light` 的重命令仍须排 `lane-remote`（fail-closed）。同事中途执行也排队，stderr 一行提示，等待记入 run 的 `lane-wait`，排队不计运行超时。`lane`/人读 `status` 按 `[重队列]`/`[轻队列]`/`[本机]` 标明队列归属（run 行同步显「远端重队列 / 远端轻队列 / 本机队列」与「远程：关」）；`lane --json` 附每条 `lane` 与 `remoteLight`/`remoteMaxLight`，run JSON 的 `remoteLane` 含 `holders`/`queued`/`lightHolders`/`lightQueued` 且 `lane` 标明本 run 当前队列。每个远端槽的上传/执行/下载再用本机 flock 串行，避免同事并行 bash 互删文件。
 
 槽路径是 `<root>/<repo-key SHA1 前12位>/<worktree目录名>`，repo key 沿用本地 Git common-dir 身份，同仓库池槽保持固定目录与温热缓存。主同步从工作树根双向 `rsync -a --delete --filter=':- .gitignore' --exclude=/.git --exclude=/target` 并排除托管路径；随后处理托管路径以保证远程验收与本地等价：`worktree.copy` 在上限内（默认 50 MiB，`DELEGATE_REMOTE_COPY_MAX_BYTES`）直接无 `.gitignore` 过滤同步；`worktree.link`（含仓内 `--share`）若远端存在同绝对路径则建符号链接，否则体积在上限内时排除 `.git`/`target`/`node_modules` 同步。超过上限且远端缺失时，验收/verify 自动回退到本地执行并在结果 `localFallback` 与状态行写明原因（SSH/rsync 传输故障仍失败关闭、绝不回退）。**不传 .git**（worktree 的 .git 指向本机）：需要 git 的构建命令会失败，这是已知限制。cwd 保持相对工作树根的位置；stdout/stderr 逐行把远端槽绝对路径改成本机路径，参数/环境逐项 shell quote，stdin 转给 SSH，完成后即使命令非零也回传源改动，原样返回程序退出码（包括 255）。
 

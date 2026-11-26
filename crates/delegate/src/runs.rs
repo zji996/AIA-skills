@@ -950,11 +950,23 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
             out.as_object_mut().unwrap().remove("elapsedSeconds");
         }
     }
+    if b(&meta, "remoteOff") {
+        out["remoteOff"] = json!(true);
+    }
     if crate::remote::enabled(&meta["remote"]) {
         out["remote"] = meta["remote"].clone();
         if let Ok(holders) = crate::lane::remote_holders() {
-            out["remoteLane"] = json!({"holders":holders.iter().filter(|h| h.2).map(|h| &h.0).collect::<Vec<_>>(), "queued":holders.iter().filter(|h| !h.2).count()});
+            let light_holders = crate::lane::remote_light_holders().unwrap_or_default();
+            out["remoteLane"] = json!({
+                "holders": holders.iter().filter(|h| h.2).map(|h| &h.0).collect::<Vec<_>>(),
+                "queued": holders.iter().filter(|h| !h.2).count(),
+                "lightHolders": light_holders.iter().filter(|h| h.2).map(|h| &h.0).collect::<Vec<_>>(),
+                "lightQueued": light_holders.iter().filter(|h| !h.2).count(),
+            });
         }
+    }
+    if let Some(lane_info) = crate::lane::run_active_lane(run) {
+        out["lane"] = lane_info;
     }
     if let Some(ahead) = crate::measure::waiting_ahead(run) {
         out["measureWaitingAhead"] = json!(ahead);

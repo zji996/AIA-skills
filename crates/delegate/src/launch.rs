@@ -69,6 +69,7 @@ pub struct Options {
     pub rework: Option<Value>,
     pub max_answer: Option<u64>,
     pub work: Option<String>,
+    pub no_remote: bool,
 }
 impl Options {
     pub fn new() -> Self {
@@ -257,6 +258,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                     o.evidence_set = true;
                     o.evidence = None;
                 }
+                "--no-remote" => o.no_remote = true,
                 "--allow-parallel-writes" => o.parallel = true,
                 "--fresh" => o.fresh = true,
                 "--sync" if reply => o.sync = true,
@@ -1701,8 +1703,14 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
             extra["reviewConfig"] = rc;
         }
     }
-    extra["remoteOff"] = json!(std::env::var("DELEGATE_REMOTE").ok().as_deref() == Some("0"));
-    extra["remote"] = config.value["remote"].clone();
+    let remote_off =
+        o.no_remote || std::env::var("DELEGATE_REMOTE").ok().as_deref() == Some("0");
+    extra["remoteOff"] = json!(remote_off);
+    extra["remote"] = if remote_off {
+        json!(false)
+    } else {
+        config.value["remote"].clone()
+    };
     extra["resources"] = config.value["resources"].clone();
     extra["measure"] = config.value["measure"].clone();
     extra["measureCpus"] = config.value["measureCpus"].clone();
@@ -2417,11 +2425,20 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
             extra["reviewConfig"] = meta["reviewConfig"].clone();
         }
     }
-    extra["remoteOff"] = json!(match std::env::var("DELEGATE_REMOTE") {
-        Ok(value) => value == "0",
-        Err(_) => b(&meta, "remoteOff"),
-    });
-    extra["remote"] = if b(&extra, "remoteOff") { json!(false) } else { config.value["remote"].clone() };
+    let remote_off = if o.no_remote {
+        true
+    } else {
+        match std::env::var("DELEGATE_REMOTE") {
+            Ok(value) => value == "0",
+            Err(_) => b(&meta, "remoteOff"),
+        }
+    };
+    extra["remoteOff"] = json!(remote_off);
+    extra["remote"] = if remote_off {
+        json!(false)
+    } else {
+        config.value["remote"].clone()
+    };
     extra["lanePriority"] = json(parent.join("lane-priority.json"));
     extra["resources"] = meta["resources"].clone();
     extra["measure"] = meta["measure"].clone();
@@ -3169,6 +3186,9 @@ pub fn launch(
     if extra["defaults"].as_object().is_some_and(|d| !d.is_empty()) {
         eprintln!("delegate: 生效默认值及来源 {}", extra["defaults"]);
     }
+    if b(extra, "remoteOff") {
+        eprintln!("delegate: 远程：关");
+    }
     write(
         run.join("prompt.md"),
         if actual.ends_with('\n') {
@@ -3566,6 +3586,8 @@ mod purpose_tests {
         }
         assert!(parse(&["--after", "prev", "task"], false).is_err());
         assert!(parse(&["last", "--allow", "apps/web/", "go"], true).is_ok());
+        assert!(parse(&["--no-remote", "task"], false).unwrap().no_remote);
+        assert!(parse(&["last", "--no-remote", "go"], true).unwrap().no_remote);
     }
 
     #[test]

@@ -54,7 +54,8 @@ fn evidence(meta: &Value, run: &Path, holder: Arc<AtomicI32>) -> Value {
     let path = run.join("evidence.log");
     let mut result = json!({"exit":null,"timedOut":false,"seconds":0,"tail":"","log":path});
     let execute = || -> Res<(i32, bool, f64)> {
-        let _slot = lane::acquire_shell("evidence", Some(run), Some(run), |ahead, _| {
+        let ev_cmd = s(meta, "evidenceCommand");
+        let _slot = lane::acquire_shell_for_commands("evidence", &[ev_cmd], Some(run), Some(run), |ahead, _| {
             log_event(run, json!({"e":"queue","role":"evidence","ahead":ahead}));
         })?;
         if lane::stopped() {
@@ -673,9 +674,15 @@ fn check_generated(
             .filter_map(Value::as_str)
             .map(str::to_string)
             .collect::<Vec<_>>();
-        let _slot = lane::acquire_shell("check protected generation", None, Some(run), |ahead, _| {
-            log_event(run, json!({"e":"queue","ahead":ahead}));
-        })?;
+        let _slot = lane::acquire_shell_for_commands(
+            "check protected generation",
+            &[s(spec, "command")],
+            None,
+            Some(run),
+            |ahead, _| {
+                log_event(run, json!({"e":"queue","ahead":ahead}));
+            },
+        )?;
         if lane::stopped() {
             return Err("stopped before generation check".into());
         }

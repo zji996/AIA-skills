@@ -77,6 +77,28 @@ pub(crate) fn mark_result_read(run: &Path) {
     }
 }
 
+fn print_status_lanes() -> Res<()> {
+    for (label, since, running) in lane::remote_holders()? {
+        println!(
+            "remote {:<8} {since}  [重队列]  {label}",
+            if running { "running" } else { "queued" }
+        );
+    }
+    for (label, since, running) in lane::remote_light_holders()? {
+        println!(
+            "remote {:<8} {since}  [轻队列]  {label}",
+            if running { "running" } else { "queued" }
+        );
+    }
+    for (label, since, running) in lane::holders()? {
+        println!(
+            "local  {:<8} {since}  [本机]  {label}",
+            if running { "running" } else { "queued" }
+        );
+    }
+    Ok(())
+}
+
 fn status_line(run: &Path) -> String {
     output_line(run, runs::status(run))
 }
@@ -3189,12 +3211,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     }
                 }
                 if !output::json_enabled() {
-                    for (label, since, running) in lane::remote_holders()? {
-                        println!(
-                            "remote {:<8} {since}  {label}",
-                            if running { "running" } else { "queued" }
-                        );
-                    }
+                    print_status_lanes()?;
                 }
                 premerge::wake_repos(&stale_repos);
                 return Ok(0);
@@ -3456,12 +3473,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 if !footer_parts.is_empty() {
                     println!("{}", footer_parts.join(" · "));
                 }
-                for (label, since, running) in lane::remote_holders()? {
-                    println!(
-                        "remote {:<8} {since}  {label}",
-                        if running { "running" } else { "queued" }
-                    );
-                }
+                print_status_lanes()?;
             }
             for (run, st, _) in &entries {
                 premerge::collect_stale_repo(run, st, &mut stale_repos);

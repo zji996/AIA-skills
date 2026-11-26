@@ -495,11 +495,13 @@ fn prepare_integration_worktree(
     setup.extend(strings(&work_cfg["writeSetup"]));
     if !setup.is_empty() {
         let timeout = seconds(&setting("SETUP_TIMEOUT", "10m"))?;
-        let _slot = lane::acquire_shell(
+        let setup_cmds: Vec<&str> = setup.iter().map(String::as_str).collect();
+        let _slot = lane::acquire_shell_for_commands(
             &format!(
                 "merge-setup {}",
                 merge_run.file_name().unwrap_or_default().to_string_lossy()
             ),
+            &setup_cmds,
             None,
             Some(merge_run),
             |_, _| {},
@@ -554,7 +556,7 @@ fn run_lane_command(
     timeout: Option<f64>,
     log_path: &Path,
 ) -> Res<(i32, bool)> {
-    let _slot = lane::acquire_shell(label, None, Some(merge_run), |_, _| {})?;
+    let _slot = lane::acquire_shell_for_commands(label, &[command], None, Some(merge_run), |_, _| {})?;
     let mut file = File::create(log_path)
         .map_err(|e| format!("create {}: {e}", log_path.display()))?;
     writeln!(file, "$ {command}").map_err(|e| e.to_string())?;

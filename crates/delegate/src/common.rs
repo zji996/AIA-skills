@@ -1028,7 +1028,12 @@ fn run_shell_inner(
     } else {
         c.env_remove("DELEGATE_REMOTE_FALLBACK_ON_MISSING");
     }
-    c.env("DELEGATE_LANE_HELD", "1")
+    let held_val = if force_local {
+        "1"
+    } else {
+        crate::lane::current_lane_held_env()
+    };
+    c.env("DELEGATE_LANE_HELD", held_val)
         .env("DELEGATE_RUN_DIR", cleanup_dir);
     group(&mut c);
     let started = std::time::Instant::now();

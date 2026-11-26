@@ -20,6 +20,7 @@ const LAUNCH: &[(&str, &str)] = &[
     ("--accept-timeout DURATION", "Optional acceptance command limit (default: .delegate.json acceptTimeout, else unlimited; silent accept emits stall_warning)."),
     ("--evidence COMMAND", "Run after successful acceptance or answer; records evidence without changing state or exit code."),
     ("--no-evidence", "Disable the default evidence command."),
+    ("--no-remote", "Disable SSH remote execution for this run and its replies (same as DELEGATE_REMOTE=0)."),
     ("--evidence-timeout DURATION", "Evidence command limit excluding queue time (default: 30m)."),
     ("--max-answer CHARS", "Ask for this answer length; failed compression displays a bounded excerpt and preserves the full result."),
     ("--timeout DURATION", "Optional limit for each attempt; no default. Stall guards remain active."),
@@ -64,6 +65,7 @@ const REPLY: &[(&str, &str)] = &[
     ("--accept-timeout DURATION", "Optional acceptance command limit (inherited; default: .delegate.json acceptTimeout, else unlimited)."),
     ("--evidence COMMAND", "Replace the inherited evidence command; failure never changes state or exit code."),
     ("--no-evidence", "Remove the inherited evidence command."),
+    ("--no-remote", "Disable SSH remote execution for this reply and follow-up replies (same as DELEGATE_REMOTE=0)."),
     ("--evidence-timeout DURATION", "Evidence command limit (inherited; default: 30m)."),
     ("--max-answer CHARS", "Ask for this answer length; above 1.5 times the limit, continue the session once to compress. Keep the original on failure."),
     ("--timeout DURATION", "Optional limit for the attempt; no default. Stall guards remain active."),
@@ -247,7 +249,7 @@ pub fn print(command: Option<&str>) -> bool {
         println!(".delegate.json agentDeny: argv prefixes by default; exact: true matches the whole argv. No global-option normalization. Acceptance/evidence/setup/apply use remote-only shims when enabled; caller lane stays local. Shims have no environment bypass.");
         let cwd = std::env::current_dir().unwrap_or_default();
         match crate::config::load(crate::common::git_top(&cwd).as_deref()) {
-            Ok(config) => println!("Remote: {} (user remote.host; DELEGATE_REMOTE=0 disables; remote check probes)", config.value["remote"]),
+            Ok(config) => println!("Remote: {} (user remote.host; --no-remote or DELEGATE_REMOTE=0 disables; remote.light routes light commands to an independent remote light lane; remote check probes)", config.value["remote"]),
             Err(error) => eprintln!("delegate config: {error}"),
         }
         println!("Runs: $DELEGATE_RUNS or <git root of cwd>/.local/run/delegate (old .local/run/pi runs remain readable).");

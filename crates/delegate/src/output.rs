@@ -464,6 +464,25 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
     if let Some(ahead) = status["measureWaitingAhead"].as_u64() {
         parts.push(format!("等待测量预约，前面 {ahead} 个"));
     }
+    if b(status, "remoteOff") {
+        parts.push("远程：关".into());
+    }
+    if status["lane"].is_object() {
+        let queue_zh = match s(&status["lane"], "queue") {
+            "remote-heavy" => "远端重队列",
+            "remote-light" => "远端轻队列",
+            "local" => "本机队列",
+            other => other,
+        };
+        if !queue_zh.is_empty() {
+            let state_zh = if b(&status["lane"], "running") {
+                "运行中"
+            } else {
+                "排队中"
+            };
+            parts.push(format!("{queue_zh}（{state_zh}）"));
+        }
+    }
     if status["accept"].is_object() {
         parts.push(crate::accept::human_accept_label(
             &status["accept"],
@@ -1269,5 +1288,45 @@ mod tests {
         let l0_done = human_line(dummy, &done, true);
         assert_eq!(l0_done.matches("已合入").count(), 1, "{l0_done}");
         assert_eq!(human_detail(dummy, &done).lines().count(), 1);
+    }
+
+    #[test]
+    fn remote_off_and_active_lane_render_in_human_line() {
+        let dummy = Path::new("/nonexistent/delegate-test-lane-tag");
+        let st_off = json!({
+            "run": "20261126-100000-off",
+            "name": "local-task",
+            "state": "running",
+            "elapsedSeconds": 10,
+            "agent": "pi",
+            "tier": "write",
+            "remoteOff": true,
+            "lane": {"queue": "local", "running": true, "label": "accept 20261126-100000-off"}
+        });
+        let line_off = human_line(dummy, &st_off, false);
+        assert!(line_off.contains("远程：关"), "{line_off}");
+        assert!(line_off.contains("本机队列（运行中）"), "{line_off}");
+
+        let st_light = json!({
+            "run": "20261126-100001-light",
+            "name": "cpu-check",
+            "state": "running",
+            "elapsedSeconds": 12,
+            "agent": "pi",
+            "tier": "write",
+            "lane": {"queue": "remote-light", "running": true, "label": "accept 20261126-100001-light"}
+        });
+        assert!(human_line(dummy, &st_light, false).contains("远端轻队列（运行中）"));
+
+        let st_heavy = json!({
+            "run": "20261126-100002-heavy",
+            "name": "gpu-train",
+            "state": "running",
+            "elapsedSeconds": 60,
+            "agent": "pi",
+            "tier": "write",
+            "lane": {"queue": "remote-heavy", "running": false, "label": "gpu: uv run train.py"}
+        });
+        assert!(human_line(dummy, &st_heavy, false).contains("远端重队列（排队中）"));
     }
 }

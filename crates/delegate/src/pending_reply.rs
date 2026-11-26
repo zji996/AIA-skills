@@ -270,6 +270,7 @@ pub fn enqueue(args: &[String], o: &mut launch::Options) -> Res<Option<EnqueueOu
         || o.model.is_some()
         || o.tier.is_some()
         || o.thinking_cli.is_some()
+        || o.no_remote
         || (pi_rpc_steer && !o.images.is_empty());
 
     let outcome = {

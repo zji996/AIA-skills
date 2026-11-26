@@ -8,10 +8,11 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 
 ```json
 {"remote":{"host":"ci","root":"build/delegate","programs":["cargo"],"maxHeavy":4,
- "profile":"env.sh","slice":"build.slice","forwardEnv":["RUST_LOG"]}}
+ "profile":"env.sh","slice":"build.slice","forwardEnv":["RUST_LOG"],
+ "light":["uv run --frozen pytest","uv run --frozen python scripts/verify_*"],"maxLight":4}}
 ```
 
-无 host 即关闭。仓库可逐字段覆盖（数组整体替换），但不能设置 host；`remote: false` 关闭本仓库，`DELEGATE_REMOTE=0` 关闭且随 reply 继承，显式变量可覆盖。`config`/`--help` 展示生效值（含主机），`remote check` 一行检测 SSH/rsync/程序版本，失败 75。
+无 host 即关闭。仓库可逐字段覆盖（数组整体替换），但不能设置 host；`remote: false` 关闭本仓库，`--no-remote`（`start`/`reply`/`work add --auto -- <start-args>` 与 `queue add` 均支持，启动回显标「远程：关」）或 `DELEGATE_REMOTE=0` 关闭且随 reply 继承，显式环境变量可覆盖。`remote.light` 为可选的 argv 前缀/通配模式数组（支持空格串或 token 数组，单 token 内支持 `*`/`?`），命中命令仍在远端执行但改走独立轻队列（宽度 `remote.maxLight`，默认 4，0 不限），不占 `remote.maxHeavy`；未配置时行为不变。`config`/`--help` 展示生效值（含主机），`remote check` 一行检测 SSH/rsync/程序版本，失败 75。
 
 环境、profile、依赖与限制见 [runtime.md](runtime.md)。
 

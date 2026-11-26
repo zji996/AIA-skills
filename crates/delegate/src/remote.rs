@@ -46,6 +46,7 @@ pub fn validate(value: Option<&Value>, repo: bool) -> Res<()> {
                         .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
             }),
             "maxHeavy" => v.as_u64().is_some_and(|n| usize::try_from(n).is_ok()),
+            "maxLight" => v.as_u64().is_some_and(|n| usize::try_from(n).is_ok()),
             "heavyJobs" => v
                 .as_u64()
                 .is_some_and(|n| n >= 1 && usize::try_from(n).is_ok()),
@@ -60,6 +61,9 @@ pub fn validate(value: Option<&Value>, repo: bool) -> Res<()> {
                                 .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
                     })
                 })
+            }),
+            "light" => v.as_array().is_some_and(|a| {
+                a.iter().all(|entry| parse_light_entry(entry).is_some())
             }),
             "forwardEnv" => v
                 .as_array()
@@ -88,6 +92,8 @@ pub fn effective(v: &Value) -> Value {
         ("root", json!("delegate")),
         ("programs", json!(["cargo"])),
         ("maxHeavy", json!(4)),
+        ("maxLight", json!(4)),
+        ("light", json!([])),
         ("forwardEnv", json!([])),
     ] {
         if v.get(k).is_none() {
@@ -95,6 +101,370 @@ pub fn effective(v: &Value) -> Value {
         }
     }
     v
+}
+
+pub const DEFAULT_MAX_LIGHT: usize = 4;
+
+pub fn max_light(v: &Value) -> usize {
+    v.get("maxLight")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(DEFAULT_MAX_LIGHT)
+}
+
+fn split_pattern_tokens(s: &str) -> Option<Vec<String>> {
+    if s.contains(['\0', '\n', '\r']) {
+        return None;
+    }
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_token = false;
+    let mut quote: Option<char> = None;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                } else {
+                    cur.push(c);
+                }
+            }
+            Some('"') => {
+                if c == '"' {
+                    quote = None;
+                } else if c == '\\' {
+                    let next = chars.next()?;
+                    cur.push(next);
+                } else {
+                    cur.push(c);
+                }
+            }
+            Some(_) => unreachable!(),
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    in_token = true;
+                }
+                '\\' => {
+                    let next = chars.next()?;
+                    cur.push(next);
+                    in_token = true;
+                }
+                c if c.is_ascii_whitespace() => {
+                    if in_token {
+                        tokens.push(std::mem::take(&mut cur));
+                        in_token = false;
+                    }
+                }
+                _ => {
+                    cur.push(c);
+                    in_token = true;
+                }
+            },
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if in_token {
+        tokens.push(cur);
+    }
+    if tokens.is_empty() || tokens[0].is_empty() {
+        return None;
+    }
+    Some(tokens)
+}
+
+fn parse_light_entry(entry: &Value) -> Option<Vec<String>> {
+    if let Some(s) = entry.as_str() {
+        return split_pattern_tokens(s);
+    }
+    let arr = entry.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    let mut tokens = Vec::with_capacity(arr.len());
+    for item in arr {
+        let s = item.as_str()?;
+        if s.is_empty() || s.contains(['\0', '\n', '\r']) {
+            return None;
+        }
+        tokens.push(s.to_string());
+    }
+    Some(tokens)
+}
+
+pub fn light_patterns(v: &Value) -> Vec<Vec<String>> {
+    if !enabled(v) {
+        return vec![];
+    }
+    v["light"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(parse_light_entry)
+        .collect()
+}
+
+/// Iterative glob match on a single argv token (`*` matches 0+ chars, `?` matches 1 char).
+fn token_glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (None::<usize>, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            pi += 1;
+            star_ti = ti;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn matches_light_argv(patterns: &[Vec<String>], argv: &[&str]) -> bool {
+    patterns.iter().any(|pat| {
+        argv.len() >= pat.len()
+            && pat
+                .iter()
+                .zip(argv.iter())
+                .all(|(p, a)| token_glob_match(p, a))
+    })
+}
+
+pub fn is_light(remote: &Value, program: &str, args: &[String]) -> bool {
+    let patterns = light_patterns(remote);
+    if patterns.is_empty() {
+        return false;
+    }
+    let mut argv = Vec::with_capacity(1 + args.len());
+    argv.push(program);
+    argv.extend(args.iter().map(String::as_str));
+    matches_light_argv(&patterns, &argv)
+}
+
+fn is_env_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    env_name(name)
+}
+
+fn is_redirection_token(word: &str) -> bool {
+    let trimmed = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    trimmed.starts_with('>') || trimmed.starts_with('<')
+}
+
+fn is_standalone_redirection_op(word: &str) -> bool {
+    let trimmed = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    matches!(trimmed, ">" | ">>" | "<" | "<<" | "<>" | ">|" | "&>" | "&>>")
+}
+
+/// Split a shell command string into simple command token lists separated by `&&`, `||`, `;`, `|`, `\n`.
+/// Returns `None` on unquoted subshells/command substitution/backgrounding/unclosed quotes (fail-closed to heavy).
+fn split_shell_segments(cmd: &str) -> Option<Vec<Vec<String>>> {
+    let mut segments: Vec<Vec<String>> = Vec::new();
+    let mut cur_seg: Vec<String> = Vec::new();
+    let mut cur_tok = String::new();
+    let mut in_tok = false;
+    let mut quote: Option<char> = None;
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut i = 0;
+
+    let flush_tok = |in_tok: &mut bool, cur_tok: &mut String, cur_seg: &mut Vec<String>| {
+        if *in_tok {
+            cur_seg.push(std::mem::take(cur_tok));
+            *in_tok = false;
+        }
+    };
+    let flush_seg = |cur_seg: &mut Vec<String>, segments: &mut Vec<Vec<String>>| {
+        if !cur_seg.is_empty() {
+            segments.push(std::mem::take(cur_seg));
+        }
+    };
+
+    while i < chars.len() {
+        let c = chars[i];
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                } else {
+                    cur_tok.push(c);
+                }
+                i += 1;
+            }
+            Some('"') => {
+                if c == '"' {
+                    quote = None;
+                    i += 1;
+                } else if c == '\\' {
+                    if i + 1 >= chars.len() {
+                        return None;
+                    }
+                    cur_tok.push(chars[i + 1]);
+                    i += 2;
+                } else if c == '`' || (c == '$' && chars.get(i + 1) == Some(&'(')) {
+                    return None;
+                } else {
+                    cur_tok.push(c);
+                    i += 1;
+                }
+            }
+            Some(_) => unreachable!(),
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    in_tok = true;
+                    i += 1;
+                }
+                '\\' => {
+                    if i + 1 >= chars.len() {
+                        return None;
+                    }
+                    cur_tok.push(chars[i + 1]);
+                    in_tok = true;
+                    i += 2;
+                }
+                '`' | '(' | ')' | '{' | '}' => return None,
+                '$' if chars.get(i + 1) == Some(&'(') => return None,
+                ';' | '\n' => {
+                    flush_tok(&mut in_tok, &mut cur_tok, &mut cur_seg);
+                    flush_seg(&mut cur_seg, &mut segments);
+                    i += 1;
+                }
+                '&' => {
+                    if chars.get(i + 1) == Some(&'&') {
+                        flush_tok(&mut in_tok, &mut cur_tok, &mut cur_seg);
+                        flush_seg(&mut cur_seg, &mut segments);
+                        i += 2;
+                    } else if cur_tok.ends_with('>') || cur_tok.ends_with('<') {
+                        // Part of redirection like `2>&1` or `>&2`.
+                        cur_tok.push('&');
+                        in_tok = true;
+                        i += 1;
+                    } else if !in_tok && chars.get(i + 1) == Some(&'>') {
+                        // `&>` or `&>>` redirection.
+                        cur_tok.push('&');
+                        in_tok = true;
+                        i += 1;
+                    } else {
+                        // Background operator `&`: fail-closed to heavy.
+                        return None;
+                    }
+                }
+                '|' => {
+                    if chars.get(i + 1) == Some(&'|') {
+                        flush_tok(&mut in_tok, &mut cur_tok, &mut cur_seg);
+                        flush_seg(&mut cur_seg, &mut segments);
+                        i += 2;
+                    } else {
+                        flush_tok(&mut in_tok, &mut cur_tok, &mut cur_seg);
+                        flush_seg(&mut cur_seg, &mut segments);
+                        i += 1;
+                    }
+                }
+                c if c.is_ascii_whitespace() => {
+                    flush_tok(&mut in_tok, &mut cur_tok, &mut cur_seg);
+                    i += 1;
+                }
+                _ => {
+                    cur_tok.push(c);
+                    in_tok = true;
+                    i += 1;
+                }
+            },
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    flush_tok(&mut in_tok, &mut cur_tok, &mut cur_seg);
+    flush_seg(&mut cur_seg, &mut segments);
+    Some(segments)
+}
+
+fn strip_redirections_and_env(seg: &[String]) -> Vec<&str> {
+    let mut clean = Vec::new();
+    let mut skip_next = false;
+    for tok in seg {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if is_standalone_redirection_op(tok) {
+            skip_next = true;
+            continue;
+        }
+        if is_redirection_token(tok) {
+            continue;
+        }
+        clean.push(tok.as_str());
+    }
+    let mut idx = 0;
+    while idx < clean.len() && is_env_assignment(clean[idx]) {
+        idx += 1;
+    }
+    if clean.get(idx) == Some(&"env") {
+        idx += 1;
+        while idx < clean.len() && is_env_assignment(clean[idx]) {
+            idx += 1;
+        }
+    }
+    clean[idx..].to_vec()
+}
+
+const BENIGN_SHELL_BUILTINS: &[&str] = &[
+    "cd", "export", "unset", "set", "true", "false", "echo", "printf", "test", "[", "pwd",
+    "mkdir", "rm", "cp", "mv", "touch", "cat", "head", "tail", "grep", "rg", "wc", "ls", "sleep",
+];
+
+/// Classify whether a shell step command (e.g. acceptance / verify / evidence) belongs on the
+/// remote light queue. Returns `false` whenever `remote.light` is unset/empty or any command
+/// segment cannot be proven light (fail-closed to heavy).
+pub fn shell_command_is_light(remote: &Value, cmd: &str) -> bool {
+    let patterns = light_patterns(remote);
+    if patterns.is_empty() {
+        return false;
+    }
+    let Some(segments) = split_shell_segments(cmd) else {
+        return false;
+    };
+    if segments.is_empty() {
+        return false;
+    }
+    let mut matched_any = false;
+    for seg in &segments {
+        let words = strip_redirections_and_env(seg);
+        if words.is_empty() {
+            continue;
+        }
+        if matches_light_argv(&patterns, &words) {
+            matched_any = true;
+        } else if BENIGN_SHELL_BUILTINS.contains(&words[0]) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    matched_any
+}
+
+pub fn shell_commands_are_light(remote: &Value, cmds: &[&str]) -> bool {
+    !cmds.is_empty() && cmds.iter().all(|cmd| shell_command_is_light(remote, cmd))
 }
 
 const REMOTE_THREADS_PROBE_SH: &str = r#"n=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0)
@@ -563,6 +933,9 @@ fn sync(host: &str, local: &Path, remote: &str, down: bool, excludes: &[String])
     capture(c, 1800.0, true).map(|_| ())
 }
 fn environment(meta: &Value) -> BTreeMap<String, String> {
+    environment_for(meta, false)
+}
+fn environment_for(meta: &Value, light: bool) -> BTreeMap<String, String> {
     let mut vars = BTreeMap::new();
     for (k, v) in meta["env"].as_object().into_iter().flatten() {
         if let Some(v) = v.as_str() {
@@ -597,7 +970,15 @@ fn environment(meta: &Value) -> BTreeMap<String, String> {
             && !k.starts_with("DELEGATE_")
     });
     let plan = remote_plan(&meta["remote"], true);
-    vars.insert("CARGO_BUILD_JOBS".into(), plan.heavy_jobs.to_string());
+    let jobs = if light && !plan.heavy_jobs_explicit && plan.budget > 0 {
+        plan.budget
+            .checked_div(max_light(&meta["remote"]))
+            .map(|j| j.max(1))
+            .unwrap_or(plan.heavy_jobs)
+    } else {
+        plan.heavy_jobs
+    };
+    vars.insert("CARGO_BUILD_JOBS".into(), jobs.to_string());
     vars
 }
 fn relay(
@@ -678,18 +1059,29 @@ fn execute(run: &Path, meta: &Value, program: &str, args: &[String]) -> Res<i32>
     let relative_cwd = cwd.strip_prefix(&top).map_err(|e| e.to_string())?;
     let dest = destination(meta, &top)?;
     crate::lane::install_signals();
+    let light = is_light(remote, program, args);
+    let cmd_preview = if args.is_empty() {
+        program.to_string()
+    } else {
+        clip(&format!("{program} {}", args.join(" ")), 60)
+    };
+    let label = format!("{}: {cmd_preview}", top.display());
     let mut shown = false;
-    let _lane = crate::lane::acquire_remote(
-        &format!("{}: {program}", top.display()),
-        Some(run),
-        remote,
-        |ahead, _| {
+    let _lane = if light {
+        crate::lane::acquire_remote_light(&label, Some(run), remote, |ahead, _| {
+            if !shown {
+                eprintln!("delegate remote light: queued behind {ahead}");
+                shown = true;
+            }
+        })?
+    } else {
+        crate::lane::acquire_remote(&label, Some(run), remote, |ahead, _| {
             if !shown {
                 eprintln!("delegate remote: queued behind {ahead}");
                 shown = true;
             }
-        },
-    )?;
+        })?
+    };
     // Serialise upload/execute/download as one transaction for a warm slot.
     let locks = state_dir().join("lane-remote/slots");
     fs::create_dir_all(&locks).map_err(|e| e.to_string())?;
@@ -767,7 +1159,7 @@ fn execute(run: &Path, meta: &Value, program: &str, args: &[String]) -> Res<i32>
         .join(relative_cwd)
         .to_string_lossy()
         .into_owned();
-    let env = environment(meta)
+    let env = environment_for(meta, light)
         .into_iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>();
@@ -1013,5 +1405,122 @@ pub fn check(args: &[String]) -> Res<i32> {
             unreachable(s(remote, "host"), &reason);
             Ok(75)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_accepts_light_patterns_and_max_light_and_rejects_invalid() {
+        assert!(validate(
+            Some(&json!({
+                "host": "gpu",
+                "programs": ["uv"],
+                "maxHeavy": 1,
+                "maxLight": 4,
+                "light": [
+                    "uv run --frozen pytest",
+                    "uv run --frozen python scripts/verify_*",
+                    ["uv", "run", "ruff", "check"]
+                ]
+            })),
+            false
+        )
+        .is_ok());
+        assert!(validate(Some(&json!({"maxLight": 0, "light": []})), true).is_ok());
+        assert!(validate(Some(&json!({"light": "uv run pytest"})), true).is_err());
+        assert!(validate(Some(&json!({"light": [""]})), true).is_err());
+        assert!(validate(Some(&json!({"light": ["uv 'unclosed"]})), true).is_err());
+        assert!(validate(Some(&json!({"light": [[]]})), true).is_err());
+        assert!(validate(Some(&json!({"maxLight": -1})), true).is_err());
+        assert!(validate(Some(&json!({"maxLight": "4"})), true).is_err());
+    }
+
+    #[test]
+    fn is_light_matches_prefixes_and_wildcards_and_defaults_false_when_unset() {
+        let unset = json!({"host": "gpu", "programs": ["uv"], "maxHeavy": 1});
+        assert!(!is_light(
+            &unset,
+            "uv",
+            &["run".into(), "--frozen".into(), "pytest".into(), "-q".into()]
+        ));
+
+        let cfg = json!({
+            "host": "gpu",
+            "programs": ["uv"],
+            "maxHeavy": 1,
+            "light": [
+                "uv run --frozen pytest",
+                "uv run --frozen python scripts/verify_*",
+                ["uv", "run", "ruff", "check"]
+            ]
+        });
+        assert!(is_light(
+            &cfg,
+            "uv",
+            &["run".into(), "--frozen".into(), "pytest".into(), "-q".into()]
+        ));
+        assert!(is_light(
+            &cfg,
+            "uv",
+            &[
+                "run".into(),
+                "--frozen".into(),
+                "python".into(),
+                "scripts/verify_cpu.py".into(),
+                "--fast".into()
+            ]
+        ));
+        assert!(is_light(
+            &cfg,
+            "uv",
+            &["run".into(), "ruff".into(), "check".into(), "src/".into()]
+        ));
+        assert!(!is_light(
+            &cfg,
+            "uv",
+            &["run".into(), "--frozen".into(), "python".into(), "scripts/train.py".into()]
+        ));
+        assert!(!is_light(
+            &cfg,
+            "uv",
+            &["run".into(), "pytest".into()]
+        ));
+    }
+
+    #[test]
+    fn shell_command_classification_handles_chaining_env_redirs_and_fails_closed() {
+        let cfg = json!({
+            "host": "gpu",
+            "programs": ["uv"],
+            "maxHeavy": 1,
+            "light": [
+                "uv run --frozen pytest",
+                "uv run --frozen python scripts/verify_*"
+            ]
+        });
+        assert!(shell_command_is_light(&cfg, "uv run --frozen pytest -q"));
+        assert!(shell_command_is_light(
+            &cfg,
+            "uv run --frozen pytest -q && uv run --frozen python scripts/verify_all.py"
+        ));
+        assert!(shell_command_is_light(
+            &cfg,
+            "cd sub && CUDA_VISIBLE_DEVICES='' uv run --frozen pytest -q 2>&1"
+        ));
+        // Mixed light + heavy must fail-closed to heavy.
+        assert!(!shell_command_is_light(
+            &cfg,
+            "uv run --frozen pytest -q && uv run python train.py"
+        ));
+        // Arbitrary script or subshell must fail-closed to heavy.
+        assert!(!shell_command_is_light(&cfg, "bash scripts/run.sh"));
+        assert!(!shell_command_is_light(&cfg, "uv run --frozen pytest $(echo -q)"));
+        assert!(!shell_command_is_light(&cfg, "true"));
+        // Unset light config always returns false.
+        let unset = json!({"host": "gpu", "programs": ["uv"], "maxHeavy": 1});
+        assert!(!shell_command_is_light(&unset, "uv run --frozen pytest -q"));
     }
 }

@@ -756,6 +756,8 @@ pub struct LiveLaneSnapshot {
     pub local: Vec<LiveLaneTicket>,
     pub remote_max_heavy: usize,
     pub remote: Vec<LiveLaneTicket>,
+    pub remote_max_light: usize,
+    pub remote_light: Vec<LiveLaneTicket>,
 }
 
 impl LiveLaneSnapshot {
@@ -776,6 +778,8 @@ impl LiveLaneSnapshot {
             local: parse_items(&v["local"]),
             remote_max_heavy: v["remoteMaxHeavy"].as_u64().unwrap_or(1).max(1) as usize,
             remote: parse_items(&v["remote"]),
+            remote_max_light: v["remoteMaxLight"].as_u64().unwrap_or(4).max(1) as usize,
+            remote_light: parse_items(&v["remoteLight"]),
         }
     }
 
@@ -785,6 +789,7 @@ impl LiveLaneSnapshot {
             Err(_) => Self {
                 local_max_heavy: 1,
                 remote_max_heavy: 1,
+                remote_max_light: 4,
                 ..Self::default()
             },
         }
@@ -798,7 +803,13 @@ impl LiveLaneSnapshot {
         now_ts: i64,
     ) -> (usize, Vec<f64>, usize) {
         let (max_h, list) = if is_remote {
-            (self.remote_max_heavy.max(1), &self.remote)
+            let in_light = !label.is_empty()
+                && self.remote_light.iter().any(|t| !t.running && t.label == label);
+            if in_light {
+                (self.remote_max_light.max(1), &self.remote_light)
+            } else {
+                (self.remote_max_heavy.max(1), &self.remote)
+            }
         } else {
             (self.local_max_heavy.max(1), &self.local)
         };
@@ -827,8 +838,12 @@ impl LiveLaneSnapshot {
         if fname.is_empty() {
             return None;
         }
-        let list = if is_remote { &self.remote } else { &self.local };
-        list.iter().find(|t| {
+        let lists: &[&[LiveLaneTicket]] = if is_remote {
+            &[&self.remote, &self.remote_light]
+        } else {
+            &[&self.local]
+        };
+        lists.iter().flat_map(|l| l.iter()).find(|t| {
             t.running
                 && (t.label == format!("accept {fname}")
                     || t.label == fname
@@ -841,16 +856,22 @@ impl LiveLaneSnapshot {
         if fname.is_empty() {
             return None;
         }
-        let list = if is_remote { &self.remote } else { &self.local };
-        let mut q_idx = 0usize;
-        for t in list {
-            if !t.running {
-                q_idx += 1;
-                if t.label == format!("accept {fname}")
-                    || t.label == fname
-                    || t.label.contains(fname)
-                {
-                    return Some((q_idx, t));
+        let lists: &[&[LiveLaneTicket]] = if is_remote {
+            &[&self.remote, &self.remote_light]
+        } else {
+            &[&self.local]
+        };
+        for list in lists {
+            let mut q_idx = 0usize;
+            for t in *list {
+                if !t.running {
+                    q_idx += 1;
+                    if t.label == format!("accept {fname}")
+                        || t.label == fname
+                        || t.label.contains(fname)
+                    {
+                        return Some((q_idx, t));
+                    }
                 }
             }
         }
