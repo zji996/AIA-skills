@@ -1,11 +1,12 @@
 //! Zero-token read-only static preflight check for `delegate start` / `reply` briefs.
 //!
-//! Scans backtick-enclosed repository-relative paths and code symbols against the
-//! source workspace and reports diagnostics to stderr only. Never blocks dispatch,
-//! never modifies the prompt, and never injects anything into model context.
+//! Scans repository-relative paths and code symbols against the source workspace.
+//! Diagnostics go to stderr only and never block dispatch; for worktree dispatches,
+//! `format_git_ignored_paths_note` also surfaces a factual footer line pointing to
+//! git-ignored source files absent from the worktree without rewriting the brief.
 
 use std::collections::HashSet;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -1114,6 +1115,86 @@ pub fn run_and_report(prompt: &str, repo_root: &Path) {
     }
 }
 
+pub const GIT_IGNORED_PATHS_NOTE_PREFIX: &str =
+    "以下文件不在工作区（被 git 忽略），可按绝对路径读：";
+
+/// Detect repository-relative paths mentioned in `prompt` that exist in `source_root`,
+/// are absent from `worktree_root` (when the worktree directory already exists), and are
+/// git-ignored in `source_root`.
+///
+/// Returns a single factual footer line listing their absolute paths in `source_root`,
+/// preserving mention order and deduplicating. Never fails or blocks dispatch.
+pub fn format_git_ignored_paths_note(
+    prompt: &str,
+    source_root: &Path,
+    worktree_root: Option<&Path>,
+) -> Option<String> {
+    if !source_root.is_dir() {
+        return None;
+    }
+    let existing_wt = worktree_root.filter(|wt| wt.is_dir());
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    for m in scan_path_mentions(prompt, &[]) {
+        let rel = m.path.trim_end_matches('/');
+        if rel.is_empty() || !seen.insert(rel.to_string()) {
+            continue;
+        }
+        if !source_root.join(rel).exists() {
+            continue;
+        }
+        if let Some(wt) = existing_wt {
+            if wt.join(rel).exists() {
+                continue;
+            }
+        }
+        candidates.push(rel.to_string());
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let mut child = crate::common::git_command()
+        .arg("-C")
+        .arg(source_root)
+        .args(["check-ignore", "-z", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let mut payload = candidates.join("\0");
+        payload.push('\0');
+        let _ = stdin.write_all(payload.as_bytes());
+    }
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let ignored: HashSet<String> = out
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect();
+    if ignored.is_empty() {
+        return None;
+    }
+    let abs_paths: Vec<String> = candidates
+        .into_iter()
+        .filter(|rel| ignored.contains(rel))
+        .map(|rel| source_root.join(rel).display().to_string())
+        .collect();
+    if abs_paths.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{GIT_IGNORED_PATHS_NOTE_PREFIX}{}",
+        abs_paths.join("、")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1208,5 +1289,83 @@ let ignored = \"src/in_fence.rs\";
         assert!(!by_path.contains_key("example.com/a/b.rs"));
         assert!(!by_path.contains_key("etc/hosts"));
         assert!(!by_path.contains_key("home/file.rs"));
+    }
+
+    #[test]
+    fn format_git_ignored_paths_note_detects_ignored_and_skips_tracked_or_present() {
+        let dir = std::env::temp_dir().join(format!(
+            "delegate-brief-ignored-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = dir.join("src_repo");
+        let wt = dir.join("wt");
+        std::fs::create_dir_all(src.join(".local/plan")).unwrap();
+        std::fs::create_dir_all(src.join("docs")).unwrap();
+        std::fs::create_dir_all(wt.join(".local/plan")).unwrap();
+
+        let run_git = |args: &[&str]| {
+            let status = crate::common::git_command()
+                .arg("-C")
+                .arg(&src)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Test"]);
+        std::fs::write(src.join(".gitignore"), ".local/\n*.local.md\n").unwrap();
+        std::fs::write(src.join(".local/plan/x.md"), "plan x\n").unwrap();
+        std::fs::write(src.join(".local/plan/in_wt.md"), "in wt\n").unwrap();
+        std::fs::write(src.join("notes.local.md"), "notes\n").unwrap();
+        std::fs::write(src.join("tracked.local.md"), "forced\n").unwrap();
+        std::fs::write(src.join("docs/readme.md"), "tracked\n").unwrap();
+        // Present in worktree too -> should be excluded when wt is passed
+        std::fs::write(wt.join(".local/plan/in_wt.md"), "in wt\n").unwrap();
+
+        run_git(&["add", ".gitignore", "docs/readme.md"]);
+        run_git(&["add", "-f", "tracked.local.md"]);
+        run_git(&["commit", "-q", "-m", "init"]);
+
+        let abs_already = src.join(".local/plan/x.md");
+        let prompt = format!(
+            "参考 `.local/plan/x.md`、`notes.local.md`、`.local/plan/x.md:10`、\
+             `.local/plan/in_wt.md`、`tracked.local.md`、`docs/readme.md`、\
+             `.local/plan/missing.md` 与 `{}`。",
+            abs_already.display()
+        );
+
+        let note = format_git_ignored_paths_note(&prompt, &src, Some(&wt)).unwrap();
+        assert_eq!(
+            note,
+            format!(
+                "以下文件不在工作区（被 git 忽略），可按绝对路径读：{}、{}",
+                src.join(".local/plan/x.md").display(),
+                src.join("notes.local.md").display()
+            )
+        );
+
+        // When prompt only mentions tracked or non-existent files -> None
+        assert!(format_git_ignored_paths_note(
+            "只看 `docs/readme.md`、`tracked.local.md` 和 `.local/plan/missing.md`",
+            &src,
+            Some(&wt),
+        )
+        .is_none());
+
+        // When worktree_root is None (not created yet), in_wt.md is also included
+        let note_no_wt =
+            format_git_ignored_paths_note("看 `.local/plan/in_wt.md`", &src, None).unwrap();
+        assert_eq!(
+            note_no_wt,
+            format!(
+                "以下文件不在工作区（被 git 忽略），可按绝对路径读：{}",
+                src.join(".local/plan/in_wt.md").display()
+            )
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

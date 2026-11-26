@@ -1319,6 +1319,9 @@ pub(crate) fn build_writer_handoff_prompt(
                 item.message.trim()
             ));
         }
+        if let Some(note) = crate::pending_reply::merge_git_ignored_notes(&delivered) {
+            lines.push(note);
+        }
         sections.push(format!(
             "## 运行期间已消费的追加指令（必须一并落实）\n\n{}",
             lines.join("\n\n")

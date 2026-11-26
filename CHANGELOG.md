@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `delegate`：派发 worktree 任务时检测说明中引用、源仓库存在且被 git 忽略的相对路径，在不改写原文的前提下于说明末尾附一行源仓库绝对路径提示；修复提问检测（`classify_question` / `is_scout_question`）将同分句否定表述（如「无矛盾需要主控拍板」「没有/不需要 + 拍板/决定/提问」）误判为提问的问题。
 - `delegate`：将上游 TLS 握手/证书校验失败与连接 EOF/reset（含 `broken pipe`）归入可续做的 `Kind::Connection` 瞬时失败，复用现有退避续做、`probe` 恢复与耗尽后换模型路径；首轮握手期尚未落盘会话（`attempts == 1` 且无已存 session）时改用原 prompt 同模型重跑，不再因无会话直接跳过续做。
 - `delegate`：写手消费探路结果（含转入 `scoutQuestion` 或直接开工）及收到 `delegate reply` 时，同步为关联探路 run 写入 `repliedAt` 并刷新索引；`hook pending`、pulse、index 与 TUI 的待处理判定对已有 `repliedAt` 的提问不再计为待答，消除探路提问滞留 `hook pending` 的问题。
 - `delegate`：取消写入任务按「轻任务」自动跳过探路的分支（移除 `is_lightweight_brief`），所有 `--worktree` 写入任务默认均先只读探路再派写手；保留 `--no-scout`、`.delegate.json` `"scoutFirst": false` 与 `DELEGATE_SCOUT_FIRST=0` 显式开关。

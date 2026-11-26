@@ -629,12 +629,60 @@ fn md_fence_marker(line: &str) -> Option<(char, usize)> {
     (count >= 3).then_some((ch, count))
 }
 
+fn clause_has_negation(clause_prefix: &str) -> bool {
+    const NEGATIONS: &[&str] = &[
+        "没有",
+        "不需要",
+        "不需",
+        "无需",
+        "无须",
+        "不必",
+        "不用",
+        "暂无",
+        "并无",
+        "不存在",
+    ];
+    if NEGATIONS.iter().any(|neg| clause_prefix.contains(neg)) {
+        return true;
+    }
+    let mut search = 0;
+    while let Some(rel) = clause_prefix[search..].find('无') {
+        let idx = search + rel;
+        let after = &clause_prefix[idx + '无'.len_utf8()..];
+        let next_ch = after.chars().next();
+        if !matches!(
+            next_ch,
+            Some('法' | '论' | '从' | '权' | '效' | '线' | '限' | '视' | '意' | '关')
+        ) {
+            return true;
+        }
+        search = idx + '无'.len_utf8();
+    }
+    false
+}
+
 fn contains_positive_zh(haystack: &str, phrase: &str) -> bool {
     let mut search_from = 0usize;
     while let Some(rel) = haystack[search_from..].find(phrase) {
         let idx = search_from + rel;
-        let prev_char = haystack[..idx].chars().next_back();
-        if !matches!(prev_char, Some('无' | '不' | '未' | '非' | '没')) {
+        let prefix = &haystack[..idx];
+        let prev_char = prefix.chars().next_back();
+        let clause_prefix = match prefix.rfind([
+            '，', ',', '；', ';', '。', '：', ':', '、', '！', '!', '？', '?',
+        ]) {
+            Some(sep) => {
+                let sep_len = prefix[sep..]
+                    .chars()
+                    .next()
+                    .map(char::len_utf8)
+                    .unwrap_or(1);
+                &prefix[sep + sep_len..]
+            }
+            None => prefix,
+        };
+        if !matches!(prev_char, Some('无' | '不' | '未' | '非' | '没'))
+            && !clause_has_negation(clause_prefix)
+        {
             return true;
         }
         search_from = idx + phrase.len();
@@ -3210,6 +3258,18 @@ mod tests {
             classify_question("已完成调研，无需主控介入，一切正常。", true),
             QuestionKind::None
         );
+        assert_eq!(
+            classify_question("无矛盾需要主控拍板。\n\n### 改动位置\n改 `src/alpha.rs`。", true),
+            QuestionKind::None
+        );
+        assert_eq!(
+            classify_question("不需要主控决定，按原计划推进即可。", true),
+            QuestionKind::None
+        );
+        assert_eq!(
+            classify_question("无法确定实现方式需要主控决定。", true),
+            QuestionKind::Blocking
+        );
 
         // Branch B: files were modified -> only explicit opening stop-to-ask skips accept;
         // trailing natural question produces TrailingNote so accept & review still run.
@@ -3230,6 +3290,10 @@ mod tests {
         );
         assert_eq!(
             classify_question("已完成全部改动，验收全绿，无需主控确认。", false),
+            QuestionKind::None
+        );
+        assert_eq!(
+            classify_question("无矛盾需要主控拍板，已完成全部改动。", false),
             QuestionKind::None
         );
     }

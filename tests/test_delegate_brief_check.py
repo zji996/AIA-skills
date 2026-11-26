@@ -200,6 +200,56 @@ class DelegateBriefCheckTests(unittest.TestCase):
         w2 = self.cli("wait", state2["run"])
         self.assertEqual(w2.returncode, 0, w2.stderr)
 
+    def test_git_ignored_paths_note_appended_for_worktree_only(self):
+        repo = self.repo({
+            ".gitignore": ".local/\n",
+            "src/real.rs": "pub fn real_fn() {}\n",
+        })
+        plan_file = repo / ".local" / "plan" / "x.md"
+        plan_file.parent.mkdir(parents=True, exist_ok=True)
+        plan_file.write_text("# secret plan\n", encoding="utf-8")
+
+        prompt = "按 `.local/plan/x.md` 修改 `src/real.rs`。"
+        expected_note = f"以下文件不在工作区（被 git 忽略），可按绝对路径读：{plan_file}"
+
+        # 1. --worktree (with --no-scout so writer launches directly) appends factual footer
+        #    without modifying the original brief text.
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED])
+        res_wt = self.cli(
+            "start", "--worktree", "--no-scout", "--accept", "true",
+            "--workdir", repo, prompt,
+        )
+        self.assertEqual(res_wt.returncode, 0, res_wt.stderr)
+        state_wt = json.loads(res_wt.stdout.splitlines()[0])
+        w_wt = self.cli("wait", state_wt["run"])
+        self.assertEqual(w_wt.returncode, 0, w_wt.stderr)
+        prompt_wt = self._run_prompt_md(state_wt["run"])
+        self.assertIn(prompt, prompt_wt)
+        self.assertIn(expected_note, prompt_wt)
+        self.assertNotIn(str(repo / "src" / "real.rs"), prompt_wt)
+
+        # 2. Default --read-only (uses read-only worktree) also appends the factual footer.
+        self.fake_pi([fixtures.answer("done-ro"), fixtures.SETTLED])
+        res_ro = self.cli("start", "--read-only", "--workdir", repo, prompt)
+        self.assertEqual(res_ro.returncode, 0, res_ro.stderr)
+        state_ro = json.loads(res_ro.stdout.splitlines()[0])
+        w_ro = self.cli("wait", state_ro["run"])
+        self.assertEqual(w_ro.returncode, 0, w_ro.stderr)
+        prompt_ro = self._run_prompt_md(state_ro["run"])
+        self.assertIn(prompt, prompt_ro)
+        self.assertIn(expected_note, prompt_ro)
+
+        # 3. --in-place runs directly in source repo, so the note must NOT be appended.
+        self.fake_pi([fixtures.answer("done-ip"), fixtures.SETTLED])
+        res_ip = self.cli("start", "--read-only", "--in-place", "--workdir", repo, prompt)
+        self.assertEqual(res_ip.returncode, 0, res_ip.stderr)
+        state_ip = json.loads(res_ip.stdout.splitlines()[0])
+        w_ip = self.cli("wait", state_ip["run"])
+        self.assertEqual(w_ip.returncode, 0, w_ip.stderr)
+        prompt_ip = self._run_prompt_md(state_ip["run"])
+        self.assertIn(prompt, prompt_ip)
+        self.assertNotIn("以下文件不在工作区（被 git 忽略）", prompt_ip)
+
 
 if __name__ == "__main__":
     unittest.main()

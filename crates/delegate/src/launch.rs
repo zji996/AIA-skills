@@ -3272,6 +3272,27 @@ pub fn launch(
     if !o.share.is_empty() {
         actual.push_str(&format!("\n\n可读输入：{}（只读）\n", o.share.join("、")));
     }
+    if extra["worktree"].is_object() {
+        let source_root = {
+            let root = s(extra, "sourceBuildRoot");
+            if root.is_empty() {
+                s(&extra["worktree"], "source")
+            } else {
+                root
+            }
+        };
+        if !source_root.is_empty() {
+            let wt_path = s(&extra["worktree"], "path");
+            let worktree_root = (!wt_path.is_empty()).then(|| Path::new(wt_path));
+            if let Some(note) = crate::brief_check::format_git_ignored_paths_note(
+                base_prompt,
+                Path::new(source_root),
+                worktree_root,
+            ) {
+                actual.push_str(&format!("\n\n{note}\n"));
+            }
+        }
+    }
     if let Some(conflicts) = extra["denyAcceptConflicts"]
         .as_array()
         .filter(|x| !x.is_empty())

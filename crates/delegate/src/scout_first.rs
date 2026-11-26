@@ -705,6 +705,15 @@ mod tests {
         assert!(is_scout_question(
             "### 查证结果\n代码在 `src/alpha.rs` (L1-10)。\n\n综上，请问主控倾向方案 A 还是方案 B？"
         ));
+        assert!(is_scout_question(
+            "auth_providers 表没有 organization_id 列，需要主控决定。"
+        ));
+        assert!(is_scout_question(
+            "不同方案需要主控拍板，请确认选 A 还是 B。"
+        ));
+        assert!(is_scout_question(
+            "无法确定实现方式需要主控决定。"
+        ));
 
         // Normal handoff notes must NOT trigger question
         assert!(!is_scout_question(
@@ -715,6 +724,18 @@ mod tests {
         ));
         assert!(!is_scout_question(
             "现状清晰，无需主控确认，写手可直接按说明修改 `src/alpha.rs`。"
+        ));
+        assert!(!is_scout_question(
+            "无矛盾需要主控拍板。\n\n### 改动位置\n改 `src/alpha.rs`。"
+        ));
+        assert!(!is_scout_question(
+            "现状查清，没有需要主控拍板或决定的分歧，也不需要向主控提问。\n\n### 改动位置\n改 `src/alpha.rs`。"
+        ));
+        assert!(!is_scout_question(
+            "没有问题需要主控决定，写手可直接开工。"
+        ));
+        assert!(!is_scout_question(
+            "不需要主控拍板，按原计划推进即可。"
         ));
         assert!(!is_scout_question(
             "查证完毕，无不符之处。\n\n```md\n需要主控决定（代码块内示例，忽略）\n```\n\n测试命令：`true`。"

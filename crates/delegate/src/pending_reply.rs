@@ -29,6 +29,7 @@ pub const PI_RPC_STEER_MARKER: &str = ".pi-rpc-steer";
 pub struct AppendItem {
     pub seq: u64,
     pub message: String,
+    pub git_ignored_note: Option<String>,
     pub images: Vec<Value>,
     pub args: Vec<String>,
     pub cwd: String,
@@ -111,9 +112,11 @@ fn load_mailbox(run: &Path) -> Value {
 }
 
 fn item_from_value(v: &Value) -> AppendItem {
+    let git_ignored_note = s(v, "gitIgnoredNote");
     AppendItem {
         seq: v["seq"].as_u64().unwrap_or(0),
         message: s(v, "message").to_string(),
+        git_ignored_note: (!git_ignored_note.is_empty()).then(|| git_ignored_note.to_string()),
         images: v["images"].as_array().cloned().unwrap_or_default(),
         args: strings(&v["args"]),
         cwd: s(v, "cwd").to_string(),
@@ -121,8 +124,41 @@ fn item_from_value(v: &Value) -> AppendItem {
     }
 }
 
-/// Format one or more appended messages into the single merged prompt sent at a turn boundary.
-pub fn format_merged_followup(items: &[AppendItem]) -> String {
+/// Merge and deduplicate `git_ignored_note` lines across a batch of appended messages,
+/// preserving mention order into a single factual footer line.
+pub fn merge_git_ignored_notes(items: &[AppendItem]) -> Option<String> {
+    let prefix = crate::brief_check::GIT_IGNORED_PATHS_NOTE_PREFIX;
+    let mut seen_paths = HashSet::new();
+    let mut paths = Vec::new();
+    let mut seen_other = HashSet::new();
+    let mut other = Vec::new();
+    for item in items {
+        let Some(note) = item.git_ignored_note.as_deref() else {
+            continue;
+        };
+        let trimmed = note.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            for p in rest.split('、').map(str::trim).filter(|p| !p.is_empty()) {
+                if seen_paths.insert(p.to_string()) {
+                    paths.push(p.to_string());
+                }
+            }
+        } else if seen_other.insert(trimmed.to_string()) {
+            other.push(trimmed.to_string());
+        }
+    }
+    let mut lines = Vec::new();
+    if !paths.is_empty() {
+        lines.push(format!("{prefix}{}", paths.join("、")));
+    }
+    lines.extend(other);
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+fn format_merged_followup_body(items: &[AppendItem]) -> String {
     let mut text = String::from(APPEND_HEADER);
     text.push_str("\n\n");
     for (idx, item) in items.iter().enumerate() {
@@ -131,6 +167,17 @@ pub fn format_merged_followup(items: &[AppendItem]) -> String {
         }
         let body = item.message.trim_end();
         text.push_str(&format!("{}. {body}", item.seq));
+    }
+    text
+}
+
+/// Format one or more appended messages into the single merged prompt sent at a turn boundary
+/// (or via `steer`), appending a deduplicated git-ignored paths footer when present.
+pub fn format_merged_followup(items: &[AppendItem]) -> String {
+    let mut text = format_merged_followup_body(items);
+    if let Some(note) = merge_git_ignored_notes(items) {
+        text.push_str("\n\n");
+        text.push_str(&note);
     }
     text
 }
@@ -168,7 +215,7 @@ fn format_fallback_message(items: &[AppendItem]) -> String {
     if items.len() == 1 {
         return items[0].message.clone();
     }
-    format_merged_followup(items)
+    format_merged_followup_body(items)
 }
 
 fn write_fallback_file_and_spawn(
@@ -259,8 +306,8 @@ pub fn enqueue(args: &[String], o: &mut launch::Options) -> Res<Option<EnqueueOu
     o.prompt = Some(prompt.clone());
     o.prompt_file = None;
     o.words.clear();
+    let meta = json(run.join("meta.json"));
     if !o.no_brief_check && !o.brief_checked {
-        let meta = json(run.join("meta.json"));
         let check_root = [
             s(&meta["worktree"], "source"),
             s(&meta, "top"),
@@ -279,6 +326,29 @@ pub fn enqueue(args: &[String], o: &mut launch::Options) -> Res<Option<EnqueueOu
             o.brief_checked = true;
         }
     }
+    let git_ignored_note = if meta["worktree"].is_object() {
+        let source_root = {
+            let root = s(&meta, "sourceBuildRoot");
+            if root.is_empty() {
+                s(&meta["worktree"], "source")
+            } else {
+                root
+            }
+        };
+        if !source_root.is_empty() {
+            let wt_path = s(&meta["worktree"], "path");
+            let worktree_root = (!wt_path.is_empty()).then(|| Path::new(wt_path));
+            crate::brief_check::format_git_ignored_paths_note(
+                &prompt,
+                Path::new(source_root),
+                worktree_root,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let cwd = std::env::current_dir()
         .map_err(|e| e.to_string())?
@@ -314,6 +384,7 @@ pub fn enqueue(args: &[String], o: &mut launch::Options) -> Res<Option<EnqueueOu
         let item = json!({
             "seq": seq,
             "message": prompt,
+            "gitIgnoredNote": git_ignored_note,
             "images": images,
             "args": args,
             "cwd": cwd,
@@ -1051,6 +1122,7 @@ mod tests {
             AppendItem {
                 seq: 1,
                 message: "补测空输入\n".into(),
+                git_ignored_note: None,
                 images: vec![],
                 args: vec![],
                 cwd: "/tmp".into(),
@@ -1059,6 +1131,7 @@ mod tests {
             AppendItem {
                 seq: 2,
                 message: "再检查错误码".into(),
+                git_ignored_note: None,
                 images: vec![json!("/tmp/a.png")],
                 args: vec![],
                 cwd: "/tmp".into(),
@@ -1198,5 +1271,91 @@ mod tests {
         assert_eq!(merged.model.as_deref(), Some("neon"));
         assert_eq!(merged.images, vec!["/tmp/a.png", "/tmp/b.png"]);
         assert_eq!(merged.allow, vec!["tests/"]);
+    }
+
+    #[test]
+    fn git_ignored_note_appended_on_in_run_and_omitted_on_fallback_promotion() {
+        let prefix = crate::brief_check::GIT_IGNORED_PATHS_NOTE_PREFIX;
+        let note1 = format!("{prefix}/repo/.local/plan/a.md、/repo/.local/plan/b.md");
+        let note2 = format!("{prefix}/repo/.local/plan/b.md、/repo/.local/plan/c.md");
+
+        let run = temp_run("git-ignored-fallback");
+        write_json(
+            run.join(APPENDS_FILE),
+            &json!({
+                "closed": false,
+                "closedAt": Value::Null,
+                "nextSeq": 3,
+                "items": [
+                    {
+                        "seq": 1,
+                        "message": "按 `.local/plan/a.md` 补测",
+                        "gitIgnoredNote": note1,
+                        "images": [],
+                        "args": ["r1", "按 `.local/plan/a.md` 补测"],
+                        "cwd": "/tmp",
+                        "queuedAt": "t1",
+                        "deliveredAt": Value::Null,
+                        "deliveredRound": Value::Null,
+                        "delivery": "in_run",
+                        "cancelledAt": Value::Null
+                    },
+                    {
+                        "seq": 2,
+                        "message": "再看 `.local/plan/c.md`",
+                        "gitIgnoredNote": note2,
+                        "images": [],
+                        "args": ["r1", "再看 `.local/plan/c.md`"],
+                        "cwd": "/tmp",
+                        "queuedAt": "t2",
+                        "deliveredAt": Value::Null,
+                        "deliveredRound": Value::Null,
+                        "delivery": "in_run",
+                        "cancelledAt": Value::Null
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+
+        // 1. in_run / steer delivery appends a single deduplicated footer line at the end
+        //    without mutating each item's raw `message`.
+        let loaded = load_mailbox(&run);
+        let items: Vec<AppendItem> = loaded["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(item_from_value)
+            .collect();
+        assert_eq!(items[0].message, "按 `.local/plan/a.md` 补测");
+        assert_eq!(items[1].message, "再看 `.local/plan/c.md`");
+        let in_run_text = format_merged_followup(&items);
+        let expected_footer = format!(
+            "{prefix}/repo/.local/plan/a.md、/repo/.local/plan/b.md、/repo/.local/plan/c.md"
+        );
+        assert!(
+            in_run_text.ends_with(&format!("\n\n2. 再看 `.local/plan/c.md`\n\n{expected_footer}")),
+            "unexpected in_run_text:\n{in_run_text}"
+        );
+        assert_eq!(in_run_text.matches(prefix).count(), 1);
+
+        // 2. Promoting unconsumed in_run items via `close_in_run` writes `pending-reply.json`
+        //    with raw messages only (no git-ignored footer, so `launch::reply` adds it once).
+        //    Pre-seed an empty placeholder so `had_active_pending` is true and no worker is spawned.
+        write_json(run.join(PENDING_FILE), &json!({})).unwrap();
+        close_in_run(&run).unwrap();
+
+        let pending = status(&run).expect("pending-reply.json should exist");
+        let fb_msg = s(&pending, "message");
+        assert!(fb_msg.contains("1. 按 `.local/plan/a.md` 补测"));
+        assert!(fb_msg.contains("2. 再看 `.local/plan/c.md`"));
+        assert!(!fb_msg.contains(prefix), "fallback message must not contain footer: {fb_msg}");
+        for entry in pending["messages"].as_array().unwrap() {
+            assert!(!s(entry, "message").contains(prefix));
+        }
+        // Single-item fallback must also keep raw message untouched.
+        assert_eq!(format_fallback_message(&items[..1]), "按 `.local/plan/a.md` 补测");
+
+        let _ = fs::remove_dir_all(&run);
     }
 }
