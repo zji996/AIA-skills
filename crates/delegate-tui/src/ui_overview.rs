@@ -25,18 +25,113 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+fn format_disk_bytes_short(bytes: u64) -> String {
+    const TIB: f64 = 1024.0 * 1024.0 * 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= TIB {
+        format!("{:.1}T", b / TIB)
+    } else if b >= GIB {
+        format!("{:.0}G", b / GIB)
+    } else if b >= MIB {
+        format!("{:.0}M", b / MIB)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
+pub(crate) fn format_overview_disk_line(dh: &DiskHealthSnapshot) -> Option<(String, Color)> {
+    if !dh.should_display_in_overview() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if let Some(ref p) = dh.primary {
+        let pct = (p.used_pct_tenths + 5) / 10;
+        parts.push(format!(
+            "主盘 {pct}%(余{})",
+            format_disk_bytes_short(p.avail_bytes)
+        ));
+    }
+    if let Some(ref o) = dh.overflow {
+        let pct = (o.used_pct_tenths + 5) / 10;
+        parts.push(format!(
+            "溢出盘 {pct}%(余{})",
+            format_disk_bytes_short(o.avail_bytes)
+        ));
+    }
+    if dh.overflow.is_some() || !dh.overflow_slots.is_empty() {
+        parts.push(format!("溢出槽 {}", dh.overflow_slots.len()));
+    }
+    if let Some(top) = dh.stale_runs.first() {
+        let extra = if dh.stale_runs.len() > 1 {
+            format!("+{}", dh.stale_runs.len() - 1)
+        } else {
+            String::new()
+        };
+        parts.push(format!(
+            "⚠占槽>24h: {}({}h/{}){}",
+            top.name,
+            top.idle_hours,
+            format_disk_bytes_short(top.bytes),
+            extra
+        ));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let color = match dh.level.as_str() {
+        "critical" => STATUS_FAILED,
+        "high" | "warn" => STATUS_PENDING,
+        _ if !dh.stale_runs.is_empty() => STATUS_PENDING,
+        _ => Color::DarkGray,
+    };
+    Some((format!("磁盘: {}", parts.join(" · ")), color))
+}
+
 pub(crate) fn render_overview_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     if area.width < NARROW_BREAKPOINT {
         render_overview_narrow(frame, app, area);
         return;
     }
 
+    let disk_strip = app
+        .snapshot
+        .disk_health
+        .as_ref()
+        .and_then(format_overview_disk_line);
+    let body_area = if let Some((ref txt, color)) = disk_strip {
+        if area.height >= 10 {
+            let v = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(8), Constraint::Length(1)])
+                .split(area);
+            let style = if color == Color::DarkGray {
+                muted()
+            } else {
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    truncate(&format!(" {txt}"), v[1].width as usize),
+                    style,
+                ))),
+                v[1],
+            );
+            v[0]
+        } else {
+            area
+        }
+    } else {
+        area
+    };
+
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(53), Constraint::Percentage(47)])
-        .split(area);
+        .split(body_area);
 
-    let h = area.height as usize;
+    let h = body_area.height as usize;
 
     // Gather card contents ahead of layout so heights donate cleanly without blank space.
     let attention_entries = app.overview_attention_entries();
@@ -1230,6 +1325,20 @@ fn render_overview_narrow(frame: &mut Frame, app: &mut App, area: Rect) {
     lines.push(Line::raw(""));
 
     // ④ 额度紧凑单行
+    if let Some((txt, color)) = app
+        .snapshot
+        .disk_health
+        .as_ref()
+        .and_then(format_overview_disk_line)
+    {
+        let style = if color == Color::DarkGray {
+            muted()
+        } else {
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        };
+        lines.push(Line::from(Span::styled(truncate(&format!("▸ {txt}"), inner_w), style)));
+        lines.push(Line::raw(""));
+    }
     let an = &app.snapshot.analytics;
     lines.push(Line::from(Span::styled(
         truncate(

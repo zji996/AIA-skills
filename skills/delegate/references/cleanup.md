@@ -14,9 +14,13 @@
 
 `clean --json` 每个删除结果含 `containersRemoved` 与 `diagnostic`（无诊断为 null），末尾 `orphanCleanup` 含同样字段；文本报告对应数量。
 
+## 磁盘健康
+
+池槽无单槽上限、整盘总水位与三信号在用判活全局 LRU（`delegate disk prune/status`）、第二块盘满载溢出/回迁及用户 `disk` 配置，见 [磁盘健康](disk-health.md)。
+
 ## 磁盘提示
 
-写入 run 结束、验收与证据收尾后用限时 `du -sb` 测一次，占用字节存入 `meta.worktreeBytes`，状态 JSON 同名输出；已有值复用，失败不记录，`status`/`wait` 不测量旧任务。
+写入 run 结束、验收与证据收尾后用限时 `du -sb` 测一次（若 `<worktree>/target` 为外部软链，穿透统计真实构建目录并累加至 `meta.worktreeBytes`，另记 `meta.targetBytes`），状态 JSON 同名输出；已有值复用，失败不记录，`status`/`wait` 不测量旧任务。
 
 本仓库已结束、未清理且有记录的 worktree 按路径去重（运行中的续接目录不计），合计达到默认 20 GiB 时末尾打印一行总量、最大三项与下一步。`DELEGATE_WORKTREE_WARN_GIB` 调整阈值，`0` 关闭。
 

@@ -659,6 +659,46 @@ pub struct SnapshotPulse {
     pub p0_alert: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct DiskVolumeSnapshot {
+    pub root: String,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub avail_bytes: u64,
+    /// Used percentage in tenths (e.g. 852 => 85.2%).
+    pub used_pct_tenths: u32,
+    pub level: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct StaleSlotRunItem {
+    pub run: String,
+    pub name: String,
+    pub slot: String,
+    pub idle_hours: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct DiskHealthSnapshot {
+    pub configured: bool,
+    pub level: String,
+    pub primary: Option<DiskVolumeSnapshot>,
+    pub overflow: Option<DiskVolumeSnapshot>,
+    pub total_slots: usize,
+    pub overflow_slots: Vec<String>,
+    pub stale_runs: Vec<StaleSlotRunItem>,
+}
+
+impl DiskHealthSnapshot {
+    pub fn should_display_in_overview(&self) -> bool {
+        self.configured
+            || !self.overflow_slots.is_empty()
+            || !self.stale_runs.is_empty()
+            || matches!(self.level.as_str(), "warn" | "high" | "critical")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AgyAccountSwitchInfo {
     pub from: String,
@@ -1667,6 +1707,7 @@ pub struct AppSnapshot {
     pub alerts: Vec<ActiveAlertItem>,
     pub alerts_from_snapshot: bool,
     pub eta: SnapshotEta,
+    pub disk_health: Option<DiskHealthSnapshot>,
     pub host_load: Option<HostLoad>,
     pub generated_epoch: Option<i64>,
     pub today_ymd: String,
@@ -1696,6 +1737,7 @@ impl AppSnapshot {
         self.pulse.hash(&mut h);
         self.alerts.hash(&mut h);
         self.eta.hash(&mut h);
+        self.disk_health.hash(&mut h);
         self.host_load.hash(&mut h);
         self.warnings.hash(&mut h);
         h.finish()
@@ -2104,6 +2146,47 @@ impl AppSnapshot {
                 target_tab: 3,
                 target_id: Some(top.run.clone()),
             });
+        }
+
+        if let Some(ref dh) = self.disk_health {
+            if dh.level == "critical" {
+                p0.insert(
+                    0,
+                    ActiveAlertItem {
+                        level: AlertLevel::P0,
+                        kind: "disk_critical".to_string(),
+                        label: "磁盘临界".to_string(),
+                        message: "磁盘水位临界 → 运行 delegate disk prune".to_string(),
+                        target_tab: 1,
+                        target_id: None,
+                    },
+                );
+            } else if dh.level == "high" {
+                p1.push(ActiveAlertItem {
+                    level: AlertLevel::P1,
+                    kind: "disk_high".to_string(),
+                    label: "磁盘高水位".to_string(),
+                    message: "磁盘超过高水位 → 可运行 delegate disk prune".to_string(),
+                    target_tab: 1,
+                    target_id: None,
+                });
+            }
+            if let Some(top) = dh.stale_runs.first() {
+                p1.push(ActiveAlertItem {
+                    level: AlertLevel::P1,
+                    kind: "disk_stale_slot".to_string(),
+                    label: "长期占槽".to_string(),
+                    message: format!(
+                        "{}({}) 已 {}h 无进展占 {:.1} GiB → 检查 apply/clean（不自动删）",
+                        top.name,
+                        top.slot,
+                        top.idle_hours,
+                        top.bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    ),
+                    target_tab: 3,
+                    target_id: Some(top.run.clone()),
+                });
+            }
         }
 
         p0.extend(p1);

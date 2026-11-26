@@ -377,6 +377,7 @@ impl DelegateClient {
             alerts: Vec::new(),
             alerts_from_snapshot: false,
             eta: SnapshotEta::default(),
+            disk_health: None,
             host_load,
             generated_epoch: None,
             today_ymd: local_ymd(),
@@ -535,6 +536,7 @@ pub fn parse_snapshot_json(
     let alerts_from_snapshot = doc["alerts"].is_array();
     let alerts = parse_alerts_value(&doc["alerts"]);
     let eta = parse_snapshot_eta_value(&doc["eta"]);
+    let disk_health = parse_disk_health_value(&doc["diskHealth"]);
     let host_load = read_host_load();
     let today_ymd = doc["generatedAt"]
         .as_str()
@@ -558,6 +560,7 @@ pub fn parse_snapshot_json(
         alerts,
         alerts_from_snapshot,
         eta,
+        disk_health,
         host_load,
         generated_epoch,
         today_ymd,
@@ -2721,6 +2724,76 @@ fn parse_dag_eta_summary(val: Option<&Value>) -> WorkDagEtaSummary {
     }
 }
 
+fn parse_disk_volume(val: &Value) -> Option<DiskVolumeSnapshot> {
+    let obj = val.as_object()?;
+    let pct_f = obj.get("usedPct").and_then(Value::as_f64).unwrap_or(0.0);
+    let used_pct_tenths = (pct_f.clamp(0.0, 100.0) * 10.0).round() as u32;
+    Some(DiskVolumeSnapshot {
+        root: obj
+            .get("root")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        total_bytes: obj.get("totalBytes").and_then(Value::as_u64).unwrap_or(0),
+        used_bytes: obj.get("usedBytes").and_then(Value::as_u64).unwrap_or(0),
+        avail_bytes: obj.get("availBytes").and_then(Value::as_u64).unwrap_or(0),
+        used_pct_tenths,
+        level: obj
+            .get("level")
+            .and_then(Value::as_str)
+            .unwrap_or("ok")
+            .to_string(),
+    })
+}
+
+fn parse_disk_health_value(val: &Value) -> Option<DiskHealthSnapshot> {
+    let obj = val.as_object()?;
+    let overflow_slots = obj
+        .get("overflowSlots")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let stale_runs = obj
+        .get("staleRuns")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let o = item.as_object()?;
+                    Some(StaleSlotRunItem {
+                        run: o.get("run").and_then(Value::as_str).unwrap_or("").to_string(),
+                        name: single_line(o.get("name").and_then(Value::as_str).unwrap_or("")),
+                        slot: o.get("slot").and_then(Value::as_str).unwrap_or("").to_string(),
+                        idle_hours: o.get("idleHours").and_then(Value::as_u64).unwrap_or(0),
+                        bytes: o.get("bytes").and_then(Value::as_u64).unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(DiskHealthSnapshot {
+        configured: obj.get("configured").and_then(Value::as_bool).unwrap_or(false),
+        level: obj
+            .get("level")
+            .and_then(Value::as_str)
+            .unwrap_or("ok")
+            .to_string(),
+        primary: obj.get("primary").and_then(parse_disk_volume),
+        overflow: obj.get("overflow").and_then(parse_disk_volume),
+        total_slots: obj
+            .get("totalSlots")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize,
+        overflow_slots,
+        stale_runs,
+    })
+}
+
 fn parse_snapshot_eta_value(val: &Value) -> SnapshotEta {
     if !val.is_object() {
         return SnapshotEta::default();
@@ -4043,5 +4116,65 @@ mod snapshot_tests {
             parse_switch_agy_account_output("beta", err_json, "", false, Some(1)).unwrap_err(),
             "live account is untracked"
         );
+    }
+
+    #[test]
+    fn parse_snapshot_json_hydrates_disk_health_and_overview_line() {
+        let raw = r#"{
+            "schemaVersion": 1,
+            "seq": 1,
+            "repos": [],
+            "events": [],
+            "lane": {"maxHeavy": 2, "heavyJobs": 4, "active": [], "queued": []},
+            "dagQueue": [],
+            "merges": [],
+            "candidates": [],
+            "diskHealth": {
+                "configured": true,
+                "level": "high",
+                "primary": {
+                    "root": "/path/to/primary",
+                    "totalBytes": 322122547200,
+                    "usedBytes": 279172874240,
+                    "availBytes": 42949672960,
+                    "usedPct": 86.7,
+                    "level": "high"
+                },
+                "overflow": {
+                    "root": "/path/to/overflow",
+                    "totalBytes": 1099511627776,
+                    "usedBytes": 439804651110,
+                    "availBytes": 659706976666,
+                    "usedPct": 40.0,
+                    "level": "ok"
+                },
+                "totalSlots": 4,
+                "overflowSlots": ["repo-3", "repo-4"],
+                "overflowSlotCount": 2,
+                "staleRuns": [
+                    {
+                        "run": "20261125-010000-old",
+                        "name": "old-task",
+                        "slot": "repo-1",
+                        "idleHours": 27,
+                        "bytes": 12884901888
+                    }
+                ]
+            }
+        }"#;
+        let snap = parse_snapshot_json(raw, None, None).expect("snapshot parses");
+        let dh = snap.disk_health.as_ref().expect("diskHealth parsed");
+        assert_eq!(dh.level, "high");
+        assert_eq!(dh.overflow_slots.len(), 2);
+        assert_eq!(dh.stale_runs.len(), 1);
+        assert_eq!(dh.stale_runs[0].name, "old-task");
+        let (line, _) = crate::ui_overview::format_overview_disk_line(dh).expect("overview disk line");
+        assert!(line.contains("主盘 87%"), "line={line}");
+        assert!(line.contains("溢出盘 40%"), "line={line}");
+        assert!(line.contains("溢出槽 2"), "line={line}");
+        assert!(line.contains("old-task"), "line={line}");
+        let alerts = snap.effective_alerts();
+        assert!(alerts.iter().any(|a| a.kind == "disk_high"));
+        assert!(alerts.iter().any(|a| a.kind == "disk_stale_slot"));
     }
 }

@@ -18,7 +18,7 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 
 ## 用户与仓库配置
 
-用户配置 `${XDG_CONFIG_HOME}/delegate/config.json` 支持 `remote`、`agentDeny`、`measure`、`measureCpus`、`env`、`maxRework`、默认 `accept`/`acceptTimeout`/`evidence`、`maxActive`、`maxHeavy`、`heavyJobs`、`repoMaxActive`、`models`/`tiers`/`thinking`、`sourceBuild.paths`、`standing`、`defaults`、`resultChars`、`cleanupKeepExecutables`、`agy`。仓库根 `.delegate.json` 使用相同字段并保存仓库事实。
+用户配置 `${XDG_CONFIG_HOME}/delegate/config.json` 支持 `remote`、`disk`、`agentDeny`、`measure`、`measureCpus`、`env`、`maxRework`、默认 `accept`/`acceptTimeout`/`evidence`、`maxActive`、`maxHeavy`、`heavyJobs`、`repoMaxActive`、`models`/`tiers`/`thinking`、`sourceBuild.paths`、`standing`、`defaults`、`resultChars`、`cleanupKeepExecutables`、`agy`。仓库根 `.delegate.json` 使用相同字段并保存仓库事实（`disk` 与 `remote.host` 仅限用户配置）。
 
 `measure` 是 argv 前缀数组，例如 `{"measure":[["cargo","xtask","bench-concurrency"]]}`；仓库配置覆盖用户配置。`measureCpus` 是预约核列表（如 `"8-11"`），未设置时取最后 `max(2, nproc/3)` 个在线逻辑核。匹配的同事、验收、证据和 lane 命令自动排队到机器级测量预约；预约开始时在跑的 lane 命令会让出预约核，预约期间普通 lane 命令使用其余核。
 

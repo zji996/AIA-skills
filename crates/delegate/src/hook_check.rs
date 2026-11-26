@@ -4242,14 +4242,46 @@ pub fn check_cmd(args: &[String]) -> Res<i32> {
     let cache = cache_dir();
     let now = epoch() as i64;
     let out = evaluate_core(&state, &cache, &payload, &cwd, now, EvalMode::Check);
+    let disk_health = crate::disk::inspect_readonly(&state, &cache, now);
+    let disk_note = disk_health.format_stop_reminder();
 
     let Some(top) = out.items.first() else {
-        emit_allow(format, None);
+        match format {
+            HookFormat::Claude => {
+                if let Some(ref note) = disk_note {
+                    println!("{}", json!({ "systemMessage": note }));
+                }
+            }
+            HookFormat::Agy => {
+                if let Some(ref note) = disk_note {
+                    println!("{}", json!({ "systemMessage": note }));
+                } else {
+                    println!("{{}}");
+                }
+            }
+            HookFormat::Json => {
+                let mut doc = json!({
+                    "decision": "allow",
+                    "reason": "",
+                    "remaining": 0,
+                    "total": 0,
+                    "diskHealth": disk_health.to_json(),
+                });
+                if let Some(ref note) = disk_note {
+                    doc["diskReminder"] = json!(note);
+                }
+                println!("{doc}");
+            }
+        }
         return Ok(0);
     };
 
     let remaining = out.items.len().saturating_sub(1);
-    let reason = top.format_block_reason(remaining, format);
+    let mut reason = top.format_block_reason(remaining, format);
+    if let Some(ref note) = disk_note {
+        reason.push_str(" | ");
+        reason.push_str(note);
+    }
 
     // Requirement E: ONLY the single displayed work item is recorded in `work-remind.json`.
     if let Some(ref wid) = top.work_id_for_cooldown {
@@ -4276,19 +4308,21 @@ pub fn check_cmd(args: &[String]) -> Res<i32> {
             println!("{}", json!({ "decision": "continue", "reason": reason }));
         }
         HookFormat::Json => {
-            println!(
-                "{}",
-                json!({
-                    "decision": "block",
-                    "reason": reason,
-                    "item": top.to_json(format),
-                    "remaining": remaining,
-                    "total": out.items.len(),
-                    "pendingRunCount": out.pending_runs.len(),
-                    "controllerPendingCount": out.controller_pending_runs.len(),
-                    "stalePendingCount": out.stale_pending_runs.len(),
-                })
-            );
+            let mut doc = json!({
+                "decision": "block",
+                "reason": reason,
+                "item": top.to_json(format),
+                "remaining": remaining,
+                "total": out.items.len(),
+                "pendingRunCount": out.pending_runs.len(),
+                "controllerPendingCount": out.controller_pending_runs.len(),
+                "stalePendingCount": out.stale_pending_runs.len(),
+                "diskHealth": disk_health.to_json(),
+            });
+            if let Some(ref note) = disk_note {
+                doc["diskReminder"] = json!(note);
+            }
+            println!("{doc}");
         }
     }
     Ok(0)
@@ -4334,6 +4368,7 @@ pub fn pending_cmd(args: &[String]) -> Res<i32> {
     let now = epoch() as i64;
     let payload = json!({ "cwd": cwd });
     let out = evaluate_core(&state, &cache, &payload, &cwd, now, EvalMode::Pending);
+    let disk_health = crate::disk::inspect_readonly(&state, &cache, now);
 
     if json_mode {
         let items_json: Vec<Value> = out
@@ -4352,14 +4387,21 @@ pub fn pending_cmd(args: &[String]) -> Res<i32> {
                 "stalePendingCount": out.stale_pending_runs.len(),
                 "stalePendingRuns": out.stale_pending_runs,
                 "items": items_json,
+                "diskHealth": disk_health.to_json(),
             })
         );
     } else if out.items.is_empty() {
         println!("当前没有待处理项。");
+        if let Some(note) = disk_health.format_stop_reminder() {
+            println!("{note}");
+        }
     } else {
         println!("待处理 {} 件（按优先级）：", out.items.len());
         for item in &out.items {
             println!("{}", item.format_pending_line());
+        }
+        if let Some(note) = disk_health.format_stop_reminder() {
+            println!("{note}");
         }
     }
     Ok(0)

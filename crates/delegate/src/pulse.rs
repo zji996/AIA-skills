@@ -800,6 +800,66 @@ pub fn compute_pulse_and_alerts(
     (pulse, alerts)
 }
 
+/// Append advisory disk-health P0/P1 alerts (high/critical watermark and >24h/>10 GiB stale
+/// slot-holding runs) onto an already-computed pulse & alert list. Never deletes runs.
+pub fn append_disk_alerts(
+    pulse: &mut SnapshotPulse,
+    alerts: &mut Vec<ActiveAlert>,
+    disk: &crate::disk::DiskHealthSummary,
+) {
+    use crate::disk::DiskLevel;
+    let level = disk.worst_level();
+    if level == DiskLevel::Critical {
+        if let Some(line) = disk.format_compact_line() {
+            alerts.insert(
+                0,
+                ActiveAlert {
+                    level: AlertLevel::P0,
+                    kind: "disk_critical".to_string(),
+                    label: "磁盘临界".to_string(),
+                    message: format!("{line} → 运行 delegate disk prune"),
+                    target_tab: 1,
+                    target_id: None,
+                },
+            );
+            pulse.p0_alert = true;
+        }
+    } else if level == DiskLevel::High {
+        if let Some(line) = disk.format_compact_line() {
+            alerts.push(ActiveAlert {
+                level: AlertLevel::P1,
+                kind: "disk_high".to_string(),
+                label: "磁盘高水位".to_string(),
+                message: format!("{line} → 可运行 delegate disk prune"),
+                target_tab: 1,
+                target_id: None,
+            });
+        }
+    }
+    if let Some(top) = disk.stale_runs.first() {
+        let extra = if disk.stale_runs.len() > 1 {
+            format!(" 等{}个", disk.stale_runs.len())
+        } else {
+            String::new()
+        };
+        alerts.push(ActiveAlert {
+            level: AlertLevel::P1,
+            kind: "disk_stale_slot".to_string(),
+            label: "长期占槽".to_string(),
+            message: format!(
+                "{}({}){} 已 {}h 无进展占 {} → 检查 apply/clean（不自动删）",
+                top.name,
+                top.slot,
+                extra,
+                top.idle_hours,
+                format_bytes(top.bytes)
+            ),
+            target_tab: 3,
+            target_id: Some(top.run.clone()),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

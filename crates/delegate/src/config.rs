@@ -71,6 +71,7 @@ pub fn read_file(path: &Path) -> Res<Option<Value>> {
 pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
     let check = || -> Res<()> {
         crate::remote::validate(value.get("remote"), repo)?;
+        crate::disk::validate_config(value.get("disk"), repo)?;
         if let Some(v) = value.get("agy") {
             let map = v.as_object().ok_or("agy must be an object")?;
             if map.keys().any(|key| key != "agent") {
@@ -659,6 +660,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         "agy",
         "measure",
         "measureCpus",
+        "disk",
     ] {
         if value.get(key).is_none() {
             if let Some(v) = user.as_ref().and_then(|u| u.get(key)) {

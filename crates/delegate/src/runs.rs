@@ -911,6 +911,9 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
     if let Some(bytes) = meta["worktreeBytes"].as_u64() {
         out["worktreeBytes"] = json!(bytes);
     }
+    if let Some(bytes) = meta["targetBytes"].as_u64() {
+        out["targetBytes"] = json!(bytes);
+    }
     let unresolved = sum["conflictMarkers"]
         .as_array()
         .into_iter()
@@ -1369,6 +1372,37 @@ pub fn auto_clean_applied_run(run: &Path, remove_worktree: bool) -> Res<Option<P
     Ok(archived)
 }
 
+fn measure_du_bytes(path: &Path) -> Option<u64> {
+    let mut command = std::process::Command::new("du");
+    command.args(["-sb", "--"]).arg(path);
+    let output =
+        crate::cleanup::bounded_output(command, std::time::Duration::from_secs(20)).ok()?;
+    output
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse::<u64>().ok())
+}
+
+/// Measure a worktree's total bytes, dereferencing `<wt>/target` when it is a symlink to a
+/// dedicated/overflow build root (without blindly dereferencing unrelated managed `link` entries).
+/// Returns `(total_bytes, Some(target_bytes))` when `target` is an external symlink, or
+/// `(total_bytes, None)` otherwise.
+pub fn measure_worktree_bytes(path: &Path) -> Option<(u64, Option<u64>)> {
+    let base = measure_du_bytes(path)?;
+    let target_link = path.join("target");
+    if target_link.is_symlink() {
+        if let Ok(real_target) = fs::canonicalize(&target_link) {
+            let wt_canon = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            if real_target.is_dir() && !real_target.starts_with(&wt_canon) {
+                if let Some(target_bytes) = measure_du_bytes(&real_target) {
+                    return Some((base.saturating_add(target_bytes), Some(target_bytes)));
+                }
+            }
+        }
+    }
+    Some((base, None))
+}
+
 pub fn record_worktree_bytes(run: &Path) {
     let mut meta = json(run.join("meta.json"));
     if s(&meta, "mode") != "write" || meta["worktreeBytes"].as_u64().is_some() {
@@ -1378,18 +1412,12 @@ pub fn record_worktree_bytes(run: &Path) {
     if !path.is_absolute() || !path.is_dir() || path == Path::new(s(&meta["worktree"], "source")) {
         return;
     }
-    let mut command = std::process::Command::new("du");
-    command.args(["-sb", "--"]).arg(path);
-    if let Ok(output) = crate::cleanup::bounded_output(command, std::time::Duration::from_secs(20))
-    {
-        if let Some(bytes) = output
-            .split_whitespace()
-            .next()
-            .and_then(|n| n.parse::<u64>().ok())
-        {
-            meta["worktreeBytes"] = json!(bytes);
-            let _ = write_json(run.join("meta.json"), &meta);
+    if let Some((total, target_bytes)) = measure_worktree_bytes(path) {
+        meta["worktreeBytes"] = json!(total);
+        if let Some(tb) = target_bytes {
+            meta["targetBytes"] = json!(tb);
         }
+        let _ = write_json(run.join("meta.json"), &meta);
     }
 }
 pub fn prune() {
@@ -2184,6 +2212,56 @@ mod agy_conversation_tests {
         fs::write(base.join(".applied"), r#"{"appliedBy":"delegate"}"#).unwrap();
         assert!(is_applied_marker(&base));
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn record_worktree_bytes_follows_target_symlink_without_following_other_links() {
+        let base = std::env::temp_dir().join(format!(
+            "delegate-wt-bytes-symlink-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let source = base.join("source");
+        let wt = base.join("slot-1");
+        let ext_target = base.join("fast-disk/slot-1/target");
+        let ext_weights = base.join("shared-weights");
+        let run = base.join("run-1");
+        for d in [&source, &wt, &ext_target, &ext_weights, &run] {
+            fs::create_dir_all(d).unwrap();
+        }
+        fs::write(wt.join("src.rs"), vec![b'a'; 1024]).unwrap();
+        fs::write(ext_target.join("artifact.rlib"), vec![b'b'; 512 * 1024]).unwrap();
+        fs::write(ext_weights.join("huge.bin"), vec![b'w'; 2 * 1024 * 1024]).unwrap();
+        std::os::unix::fs::symlink(&ext_target, wt.join("target")).unwrap();
+        std::os::unix::fs::symlink(&ext_weights, wt.join("weights")).unwrap();
+
+        write_json(
+            run.join("meta.json"),
+            &json!({
+                "run": "run-1",
+                "mode": "write",
+                "worktree": {"path": wt, "source": source}
+            }),
+        )
+        .unwrap();
+
+        record_worktree_bytes(&run);
+        let meta = json(run.join("meta.json"));
+        let wt_bytes = meta["worktreeBytes"].as_u64().expect("worktreeBytes set");
+        let tgt_bytes = meta["targetBytes"].as_u64().expect("targetBytes set");
+        assert!(
+            tgt_bytes >= 512 * 1024,
+            "targetBytes should measure real symlink target: {tgt_bytes}"
+        );
+        assert!(
+            wt_bytes >= 512 * 1024 + 1024,
+            "worktreeBytes should include dereferenced target bytes: {wt_bytes}"
+        );
+        assert!(
+            wt_bytes < 2 * 1024 * 1024,
+            "worktreeBytes must not follow unrelated managed links: {wt_bytes}"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 

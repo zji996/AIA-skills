@@ -179,6 +179,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("adopt", "Transfer a run (and every round in its reply chain) to the current caller session."),
     ("mark-applied", "Mark a manually merged/committed run as applied against a verified source commit."),
     ("clean", "Delete finished runs."),
+    (
+        "disk",
+        "Check build-cache disk health (disk status) or run liveness-aware zero-cost cleanup and whole-disk global LRU pruning (disk prune [--dry-run] [--json]).",
+    ),
     ("fit", "Show or update the four-class model suitability card (fit set; fit --json)."),
     (
         "tiers",
@@ -473,6 +477,12 @@ pub fn print(command: Option<&str>) -> bool {
             ("--commit <sha>", "Source repository commit SHA containing the manual merge (default: HEAD)."),
             ("--check-files", "Fail if any of the run's net changed files are missing from the target commit."),
             ("--json", "Print structured JSON summary."),
+        ]),
+        "disk" => ("[status|prune] [--dry-run] [--json]", "Inspect primary/overflow build-cache disk watermarks, overflowed pool slots, and stale slot-holding runs (`disk status`), or run three-signal liveness-aware zero-cost cleanup and whole-disk global LRU pruning (`disk prune`, writing <state>/disk-health.json). Configured under `disk` in ~/.config/delegate/config.json.", &[
+            ("status", "Show read-only disk watermarks, overflow slot count, and >24h/>10 GiB stale-slot reminders (default)."),
+            ("prune", "Run zero-cost cleanup on all non-busy targets, then global atime LRU when above high watermark down to target watermark, plus cold-idle overflow migration only at >= migratePct."),
+            ("--dry-run", "With `prune`: preview deletions and projected watermarks without deleting files or writing disk-health.json."),
+            ("--json", "Print structured JSON output."),
         ]),
         "protocol" => ("", "Print one JSON line for harness adapters: protocol version, delegate version, the caller session and its source variable, and each agent's tier, resolved binary, version and PATH entries it shadows.", &[]),
         _ => return false,

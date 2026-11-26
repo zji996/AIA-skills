@@ -1848,7 +1848,7 @@ mod tests {
 
         // Pipe with unclosed idle writer held by self -> false; after writing -> true
         let mut fds = [0 as libc::c_int; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
         let (r, w) = (fds[0], fds[1]);
         assert!(!fd_is_data_source(r), "empty unclosed pipe must return false");
         let msg = b"abc";

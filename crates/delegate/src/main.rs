@@ -13,6 +13,7 @@ mod common;
 mod config;
 mod dag_queue;
 mod deny;
+mod disk;
 mod eta;
 mod events;
 mod fill;
@@ -2002,6 +2003,9 @@ fn mark_applied_command(args: &[String]) -> Res<i32> {
     work::check_stale_and_expired();
     dag_queue::advance();
     hook::record_action("apply", &applied_ids, None, false);
+    for (rdir, _, _) in &res.marked_runs {
+        pool::release_if_applied_chain(rdir);
+    }
     premerge::spawn_worker_force(&res.source);
 
     let head_meta = json(run.join("meta.json"));
@@ -2839,6 +2843,16 @@ fn apply(args: &[String]) -> Res<i32> {
             gc::spawn_worker();
         }
     }
+    // Always release pool slots for runs that wrote `.applied` and have no unapplied/active sharer
+    // left in the chain (even when `verify` failed, `--keep`, or `cleanOnApply: false`).
+    if !dry {
+        for run in &applied_runs {
+            pool::release_if_applied_chain(run);
+        }
+        for item in &done {
+            pool::release_if_applied_chain(&item.run);
+        }
+    }
     Ok(code)
 }
 fn main_inner(args: &[String]) -> Res<i32> {
@@ -3393,6 +3407,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
             let finished_count = finished_ids.len();
 
             let arch_usage = archive::usage();
+            let disk_health = disk::inspect_readonly(&state_root, &cache_dir(), now_ts);
             let concurrency_plan = lane::local_plan(None).ok();
             let concurrency_pool = concurrency_plan
                 .as_ref()
@@ -3437,6 +3452,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     "archiveFsCritical": arch_usage.fs_critical,
                     "archiveSizeWarning": arch_usage.size_warning,
                     "archiveWarnBytes": arch_usage.warn_bytes,
+                    "diskHealth": disk_health.to_json(),
                     "history": "delegate history"
                 });
                 if let Some(ref plan) = concurrency_plan {
@@ -3515,6 +3531,14 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 if !footer_parts.is_empty() {
                     println!("{}", footer_parts.join(" · "));
                 }
+                if disk_health.should_show_in_status() {
+                    if let Some(line) = disk_health.format_compact_line() {
+                        println!("{line}");
+                    }
+                    for line in disk_health.format_stale_lines() {
+                        println!("{line}");
+                    }
+                }
                 print_status_lanes()?;
             }
             for (run, st, _) in &entries {
@@ -3555,6 +3579,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         }
         "stop" => stop(rest),
         "clean" => clean(rest),
+        "disk" => disk::command(rest),
         "tiers" => tiers(rest),
         "fit" => fit::command(rest),
         "handoff" => handoff::command(rest),

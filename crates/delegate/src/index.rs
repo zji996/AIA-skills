@@ -718,13 +718,15 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
         .filter_map(|g| g["runs"].as_array())
         .flatten()
         .collect();
-    let (pulse, alerts) = crate::pulse::compute_pulse_and_alerts(
+    let (mut pulse, mut alerts) = crate::pulse::compute_pulse_and_alerts(
         &all_run_refs,
         &work_items,
         &agy_accounts,
         analytics_bundle.merged_today,
         now_ts,
     );
+    let disk_health = crate::disk::inspect_readonly(&state, &cache_dir(), now_ts);
+    crate::pulse::append_disk_alerts(&mut pulse, &mut alerts, &disk_health);
     let alerts_json: Vec<Value> = alerts
         .iter()
         .map(crate::pulse::ActiveAlert::to_json)
@@ -749,6 +751,7 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
         "pulse": pulse.to_json(),
         "alerts": alerts_json,
         "eta": eta_summary,
+        "diskHealth": disk_health.to_json(),
     });
     println!("{payload}");
     Ok(0)
