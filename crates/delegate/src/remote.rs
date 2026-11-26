@@ -620,8 +620,11 @@ pub fn programs(v: &Value) -> Vec<&str> {
         .filter_map(Value::as_str)
         .collect()
 }
-fn ssh(host: &str, script: &str) -> Command {
+fn ssh_cmd(host: &str, script: &str, no_stdin: bool) -> Command {
     let mut c = Command::new("ssh");
+    if no_stdin {
+        c.arg("-n");
+    }
     c.args([
         "-o",
         "BatchMode=yes",
@@ -631,6 +634,147 @@ fn ssh(host: &str, script: &str) -> Command {
         script,
     ]);
     c
+}
+fn ssh(host: &str, script: &str) -> Command {
+    ssh_cmd(host, script, false)
+}
+fn stdin_is_data_source() -> bool {
+    fd_is_data_source(libc::STDIN_FILENO)
+}
+fn fd_is_data_source(fd: libc::c_int) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return false;
+    }
+    if unsafe { libc::isatty(fd) } != 0 {
+        return false;
+    }
+    match st.st_mode & libc::S_IFMT {
+        libc::S_IFREG => true,
+        libc::S_IFIFO => fifo_has_data_source(fd),
+        _ => false,
+    }
+}
+fn fifo_has_data_source(fd: libc::c_int) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = loop {
+        let r = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break r;
+    };
+    if rc < 0 {
+        return false;
+    }
+    // Unread bytes already buffered (e.g. `echo x | cmd`, `cat f | cmd`, short heredocs).
+    if (pfd.revents & libc::POLLIN) != 0 {
+        return true;
+    }
+    // Empty pipe whose write end is already closed (e.g. Pi/rpi bash tool) or error:
+    // immediate EOF, identical to /dev/null.
+    if (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
+        return false;
+    }
+    // 0 bytes buffered and write end is still open: distinguish a slow sibling pipeline
+    // producer from an unclosed idle harness pipe held by an ancestor. Fail closed when unsure.
+    fifo_has_sibling_writer(fd)
+}
+#[cfg(target_os = "linux")]
+fn parse_proc_stat_ppid_pgrp(pid: u32) -> Option<(u32, i32)> {
+    let raw = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = raw.rsplit_once(')')?.1;
+    let mut fields = after.split_whitespace();
+    let _state = fields.next()?;
+    let ppid = fields.next()?.parse::<u32>().ok()?;
+    let pgrp = fields.next()?.parse::<i32>().ok()?;
+    Some((ppid, pgrp))
+}
+#[cfg(target_os = "linux")]
+fn pid_holds_pipe_writer(pid: u32, target: &std::ffi::OsStr) -> bool {
+    let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(link) = fs::read_link(entry.path()) else {
+            continue;
+        };
+        if link.as_os_str() != target {
+            continue;
+        }
+        let Some(fd_name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(info) = fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd_name}")) else {
+            continue;
+        };
+        for line in info.lines() {
+            if let Some(rest) = line.strip_prefix("flags:") {
+                if let Ok(flags) = u32::from_str_radix(rest.trim(), 8) {
+                    if (flags & (libc::O_ACCMODE as u32)) != (libc::O_RDONLY as u32) {
+                        return true;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    false
+}
+#[cfg(target_os = "linux")]
+fn fifo_has_sibling_writer(fd: libc::c_int) -> bool {
+    let Ok(target) = fs::read_link(format!("/proc/self/fd/{fd}")) else {
+        return false;
+    };
+    let my_pid = std::process::id();
+    let my_pgrp = unsafe { libc::getpgrp() };
+    if my_pgrp <= 0 || pid_holds_pipe_writer(my_pid, target.as_os_str()) {
+        return false;
+    }
+    let mut ancestors = std::collections::HashSet::new();
+    let mut cur = parse_proc_stat_ppid_pgrp(my_pid)
+        .map(|(ppid, _)| ppid)
+        .unwrap_or(0);
+    while cur > 1 && ancestors.insert(cur) {
+        if pid_holds_pipe_writer(cur, target.as_os_str()) {
+            return false;
+        }
+        cur = parse_proc_stat_ppid_pgrp(cur)
+            .map(|(ppid, _)| ppid)
+            .unwrap_or(0);
+    }
+    let Ok(proc_entries) = fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in proc_entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        if pid == my_pid || ancestors.contains(&pid) {
+            continue;
+        }
+        let Some((_, pgrp)) = parse_proc_stat_ppid_pgrp(pid) else {
+            continue;
+        };
+        if pgrp != my_pgrp {
+            continue;
+        }
+        if pid_holds_pipe_writer(pid, target.as_os_str()) {
+            return true;
+        }
+    }
+    false
+}
+#[cfg(not(target_os = "linux"))]
+fn fifo_has_sibling_writer(_fd: libc::c_int) -> bool {
+    false
 }
 fn output(c: Command) -> Res<String> {
     capture(c, 30.0, false)
@@ -1228,10 +1372,15 @@ fn execute(run: &Path, meta: &Value, program: &str, args: &[String]) -> Res<i32>
         shell_quote(&format!("{pidfile}.cancel")),
         shell_quote(&marker)
     );
-    let mut c = ssh(host, &script);
-    c.stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let inherit_stdin = stdin_is_data_source();
+    let mut c = ssh_cmd(host, &script, !inherit_stdin);
+    c.stdin(if inherit_stdin {
+        Stdio::inherit()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
     group(&mut c);
     let mut child = c.spawn().map_err(|e| e.to_string())?;
     shell_status("executing", true);
@@ -1522,5 +1671,66 @@ mod tests {
         // Unset light config always returns false.
         let unset = json!({"host": "gpu", "programs": ["uv"], "maxHeavy": 1});
         assert!(!shell_command_is_light(&unset, "uv run --frozen pytest -q"));
+    }
+
+    #[test]
+    fn fd_is_data_source_classifies_null_file_pipes_and_pty() {
+        use std::os::fd::AsRawFd;
+
+        // /dev/null -> false
+        let devnull = fs::File::open("/dev/null").unwrap();
+        assert!(!fd_is_data_source(devnull.as_raw_fd()));
+
+        // Regular file -> true
+        let tmp = std::env::temp_dir().join(format!(
+            "delegate-remote-stdin-test-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::write(&tmp, b"hello").unwrap();
+        let file = fs::File::open(&tmp).unwrap();
+        assert!(fd_is_data_source(file.as_raw_fd()));
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+
+        // Pipe with unclosed idle writer held by self -> false; after writing -> true
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+        assert!(!fd_is_data_source(r), "empty unclosed pipe must return false");
+        let msg = b"abc";
+        assert_eq!(
+            unsafe { libc::write(w, msg.as_ptr().cast(), msg.len()) },
+            msg.len() as isize
+        );
+        assert!(fd_is_data_source(r), "pipe with buffered data must return true");
+        let mut sink = [0u8; 8];
+        assert_eq!(
+            unsafe { libc::read(r, sink.as_mut_ptr().cast(), sink.len()) },
+            msg.len() as isize
+        );
+        unsafe { libc::close(w) };
+        assert!(!fd_is_data_source(r), "empty closed pipe (POLLHUP) must return false");
+        unsafe { libc::close(r) };
+
+        // PTY -> false
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        if unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            assert!(!fd_is_data_source(slave), "pty must return false");
+            unsafe {
+                libc::close(slave);
+                libc::close(master);
+            }
+        }
     }
 }
