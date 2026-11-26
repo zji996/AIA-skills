@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import threading
 import os
+import pty
 import shlex
 import shutil
 import signal
@@ -85,6 +86,11 @@ if sys.argv[1:2] == ["binary"]:
     os.write(1, b"raw\\xff:" + os.getcwd().encode() + b"/a.txt")
     os.write(2, b"err\\xfe")
     sys.exit(7)
+if sys.argv[1:2] == ["read-stdin"]:
+    data = sys.stdin.buffer.read()
+    sys.stdout.buffer.write(b"stdin:" + data)
+    sys.stdout.buffer.flush()
+    sys.exit(0)
 if sys.argv[1:2] == ["fmt"]:
     Path("a.txt").write_text("formatted\\n")
     Path("added.txt").write_text("new\\n")
@@ -865,6 +871,126 @@ print("uv ok: " + " ".join(args))
         parsed = json.loads(ok.stdout)
         self.assertEqual(parsed["remote"]["maxLight"], 3)
         self.assertEqual(len(parsed["remote"]["light"]), 2)
+
+    def test_remote_unclosed_pipe_stdin_gets_immediate_eof(self):
+        _, state = self.run_remote(accept="true")
+        tree = Path(state["worktree"])
+        self.ssh_log.unlink(missing_ok=True)
+        proc = subprocess.Popen(
+            [str(fixtures.DELEGATE), "_remote", state["dir"], "cargo", "read-stdin"],
+            cwd=tree,
+            env=self.env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            # Keep proc.stdin open and unwritten: remote read-stdin must still exit promptly.
+            rc = proc.wait(timeout=10)
+            out = proc.stdout.read()
+            err = proc.stderr.read()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            if proc.stdin:
+                proc.stdin.close()
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+        self.assertEqual(rc, 0, f"stdout={out!r} stderr={err!r}")
+        self.assertEqual(out, b"stdin:")
+        self.assertEqual([r["argv"] for r in self.records()], [["read-stdin"]])
+        ssh_lines = self.ssh_log.read_text().splitlines()
+        exec_lines = [line for line in ssh_lines if "read-stdin" in line]
+        self.assertEqual(len(exec_lines), 1, ssh_lines)
+        self.assertIn("'-n'", exec_lines[0])
+
+    def test_remote_real_pipe_and_file_stdin_arrive_intact(self):
+        big_payload = ("line-payload-0123456789\n" * 6000)  # ~144 KiB (> 64 KiB pipe buffer)
+        repo = self.repo({
+            "a.txt": "old\n",
+            "input.txt": "from-file\nsecond-line\n",
+            "big.txt": big_payload,
+        })
+        self.fake_pi(
+            [fixtures.answer("done"), fixtures.SETTLED],
+            pre=(
+                'printf "hello\\nworld\\n" | cargo read-stdin > "$DELEGATE_RUN_DIR/out-small"\n'
+                'cat big.txt | cargo read-stdin > "$DELEGATE_RUN_DIR/out-big"\n'
+                '(sleep 0.25; printf "delayed-pipe\\n") | cargo read-stdin > "$DELEGATE_RUN_DIR/out-slow"\n'
+                'cargo read-stdin < input.txt > "$DELEGATE_RUN_DIR/out-file"\n'
+            ),
+        )
+        state = self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "task"))
+        self.assertEqual(state["state"], "delivered", state)
+        run_dir = Path(state["dir"])
+        self.assertEqual((run_dir / "out-small").read_text(), "stdin:hello\nworld\n")
+        self.assertEqual((run_dir / "out-big").read_text(), "stdin:" + big_payload)
+        self.assertEqual((run_dir / "out-slow").read_text(), "stdin:delayed-pipe\n")
+        self.assertEqual((run_dir / "out-file").read_text(), "stdin:from-file\nsecond-line\n")
+        exec_lines = [line for line in self.ssh_log.read_text().splitlines() if "read-stdin" in line]
+        self.assertEqual(len(exec_lines), 4, exec_lines)
+        for line in exec_lines:
+            self.assertNotIn("'-n'", line)
+
+    def test_remote_tty_and_devnull_stdin_do_not_hang(self):
+        _, state = self.run_remote(accept="true")
+        tree = Path(state["worktree"])
+
+        # /dev/null stdin -> immediate EOF, behavior unchanged
+        self.ssh_log.unlink(missing_ok=True)
+        res = subprocess.run(
+            [str(fixtures.DELEGATE), "_remote", state["dir"], "cargo", "read-stdin"],
+            cwd=tree,
+            env=self.env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        self.assertEqual(res.returncode, 0, res.stderr.decode("utf-8", "replace"))
+        self.assertEqual(res.stdout, b"stdin:")
+        exec_lines = [line for line in self.ssh_log.read_text().splitlines() if "read-stdin" in line]
+        self.assertEqual(len(exec_lines), 1)
+        self.assertIn("'-n'", exec_lines[0])
+
+        # PTY stdin (matches agy's run_command): master stays open, remote must still get immediate EOF
+        self.ssh_log.unlink(missing_ok=True)
+        master, slave = pty.openpty()
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                [str(fixtures.DELEGATE), "_remote", state["dir"], "cargo", "read-stdin"],
+                cwd=tree,
+                env=self.env,
+                stdin=slave,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            os.close(slave)
+            slave = -1
+            rc = proc.wait(timeout=10)
+            out = proc.stdout.read()
+            err = proc.stderr.read()
+        finally:
+            if proc is not None:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                if proc.stdout:
+                    proc.stdout.close()
+                if proc.stderr:
+                    proc.stderr.close()
+            if slave >= 0:
+                os.close(slave)
+            os.close(master)
+        self.assertEqual(rc, 0, f"stdout={out!r} stderr={err!r}")
+        self.assertEqual(out, b"stdin:")
+        exec_lines = [line for line in self.ssh_log.read_text().splitlines() if "read-stdin" in line]
+        self.assertEqual(len(exec_lines), 1)
+        self.assertIn("'-n'", exec_lines[0])
 
 
 if __name__ == "__main__":
