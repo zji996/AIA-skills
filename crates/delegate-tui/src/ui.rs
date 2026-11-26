@@ -4928,10 +4928,18 @@ pub(crate) fn format_pct_clean(pct_x100: u32) -> String {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WindowEstimateOutcome {
+    Insufficient,
+    Idle,
     WontRunOut,
-    RunsOutIn { mins: u64, before_reset: bool },
+    RunsOutIn {
+        fast_m: u64,
+        mid_m: u64,
+        slow_m: Option<u64>,
+        reset_secs: Option<u64>,
+        alert: bool,
+    },
 }
 
 fn find_reset_seconds(
@@ -4973,23 +4981,149 @@ fn account_has_multiple_pools(acct: &AgyAccountItem) -> bool {
     false
 }
 
-fn pace_prefix(burn_rate_source: &str) -> String {
-    match burn_rate_source {
-        "24h" => "按最近 24 小时的平均用量".to_string(),
-        "5h" => "按最近 5 小时的平均用量".to_string(),
-        "7d" => "按最近 7 天的平均用量".to_string(),
-        other => {
-            if let Some(hours) = other
-                .strip_prefix("since:")
-                .and_then(|s| s.strip_suffix('h'))
-                .and_then(|n| n.parse::<u64>().ok())
-                .filter(|&n| n > 0)
-            {
-                format!("按最近 {hours} 小时的平均用量")
-            } else {
-                "按当前用量".to_string()
+fn round_eta_minutes(mins: u64) -> u64 {
+    if mins == 0 {
+        return 0;
+    }
+    if mins < 60 {
+        (((mins + 2) / 5) * 5).max(5)
+    } else if mins < 6 * 60 {
+        ((mins + 7) / 15) * 15
+    } else if mins < 48 * 60 {
+        ((mins + 30) / 60) * 60
+    } else {
+        ((mins + 720) / 1440).max(2) * 1440
+    }
+}
+
+fn format_hours_half(mins: u64) -> Option<String> {
+    if !(60..48 * 60).contains(&mins) || !mins.is_multiple_of(30) {
+        return None;
+    }
+    let h = mins / 60;
+    if mins.is_multiple_of(60) {
+        Some(format!("{h}"))
+    } else {
+        Some(format!("{h}.5"))
+    }
+}
+
+fn format_duration_mins_compact(mins: u64) -> String {
+    if mins < 60 {
+        format!("{mins}m")
+    } else if mins < 48 * 60 {
+        let h = mins / 60;
+        let m = mins % 60;
+        if m == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h{m}m")
+        }
+    } else {
+        let d = (mins + 720) / 1440;
+        format!("{d}d")
+    }
+}
+
+pub(crate) fn format_eta_compact(
+    fast_m: u64,
+    mid_m: u64,
+    slow_m: Option<u64>,
+    reset_secs: Option<u64>,
+) -> String {
+    let reset_mins = reset_secs.map(|s| (s / 60).max(1)).unwrap_or(u64::MAX);
+    if mid_m == 0 || reset_mins <= 1 {
+        return "即将用完".to_string();
+    }
+    let max_m = reset_mins.saturating_sub(1).max(1);
+    let slow_eff = slow_m.unwrap_or(reset_mins);
+    let is_wide = (slow_eff.saturating_sub(fast_m)) as f64 / (mid_m as f64) > 0.25;
+    if is_wide {
+        let fast_r = round_eta_minutes(fast_m).max(5).min(max_m).max(1);
+        let slow_r_opt = slow_m.map(round_eta_minutes).filter(|&sr| sr < reset_mins);
+        if let Some(slow_r) = slow_r_opt {
+            if slow_r > fast_r {
+                if fast_r < 60 && slow_r < 60 {
+                    return format!("~{fast_r}-{slow_r}m");
+                }
+                if let (Some(fh), Some(sh)) = (format_hours_half(fast_r), format_hours_half(slow_r)) {
+                    return format!("~{fh}-{sh}h");
+                }
+                if fast_r >= 48 * 60 && slow_r >= 48 * 60 && fast_r.is_multiple_of(1440) && slow_r.is_multiple_of(1440) {
+                    return format!("~{}-{}d", fast_r / 1440, slow_r / 1440);
+                }
             }
         }
+        return format!("~{}", format_duration_mins_compact(fast_r));
+    }
+    let mid_r = round_eta_minutes(mid_m).min(max_m).max(1);
+    format!("~{}", format_duration_mins_compact(mid_r))
+}
+
+pub(crate) fn format_eta_zh_phrase(
+    fast_m: u64,
+    mid_m: u64,
+    slow_m: Option<u64>,
+    reset_secs: Option<u64>,
+) -> String {
+    let reset_mins = reset_secs.map(|s| (s / 60).max(1)).unwrap_or(u64::MAX);
+    if mid_m == 0 || reset_mins <= 1 {
+        return "即将用完".to_string();
+    }
+    let max_m = reset_mins.saturating_sub(1).max(1);
+    let slow_eff = slow_m.unwrap_or(reset_mins);
+    let is_wide = (slow_eff.saturating_sub(fast_m)) as f64 / (mid_m as f64) > 0.25;
+    if is_wide {
+        let fast_r = round_eta_minutes(fast_m).max(5).min(max_m).max(1);
+        let slow_r_opt = slow_m.map(round_eta_minutes).filter(|&sr| sr < reset_mins);
+        match slow_r_opt {
+            None => {
+                if let Some(fh) = format_hours_half(fast_r) {
+                    format!("约 {fh} 小时后到重置前之间用完")
+                } else {
+                    format!("约 {}后到重置前之间用完", format_minutes_zh(fast_r))
+                }
+            }
+            Some(slow_r) if slow_r <= fast_r => {
+                format!("约 {}后用完", format_minutes_zh(fast_r))
+            }
+            Some(slow_r) => {
+                if fast_r < 60 && slow_r < 60 {
+                    format!("约 {fast_r}–{slow_r} 分钟后用完")
+                } else if let (Some(fh), Some(sh)) =
+                    (format_hours_half(fast_r), format_hours_half(slow_r))
+                {
+                    format!("约 {fh}–{sh} 小时后用完")
+                } else if fast_r >= 48 * 60 && slow_r >= 48 * 60 && fast_r.is_multiple_of(1440) && slow_r.is_multiple_of(1440) {
+                    format!("约 {}–{} 天后用完", fast_r / 1440, slow_r / 1440)
+                } else {
+                    format!(
+                        "约 {}–{}后用完",
+                        format_minutes_zh(fast_r),
+                        format_minutes_zh(slow_r)
+                    )
+                }
+            }
+        }
+    } else {
+        let mid_r = round_eta_minutes(mid_m).min(max_m).max(1);
+        format!("约 {}后用完", format_minutes_zh(mid_r))
+    }
+}
+
+fn pace_prefix(est: &QuotaWindowEstimate) -> String {
+    let base = match est.basis.as_str() {
+        "30m" => "按近 30 分钟额度变化",
+        "1h" => "按近 1 小时额度变化",
+        "24h" => "按近 24 小时额度变化",
+        "window" => "按本周期额度变化",
+        "passive" => "已触发额度耗尽",
+        _ => "按当前额度变化",
+    };
+    if est.running_count > 0 && est.basis != "passive" {
+        format!("{base}（在跑 {}）", est.running_count)
+    } else {
+        base.to_string()
     }
 }
 
@@ -4998,20 +5132,31 @@ pub(crate) fn evaluate_window_outcome(
     window_key: &str,
     est: &QuotaWindowEstimate,
 ) -> Option<WindowEstimateOutcome> {
-    let mins = est.estimated_remaining_minutes?;
-    if let Some(reset_secs) = find_reset_seconds(acct, window_key, est.pool.as_deref()) {
-        if mins.saturating_mul(60) >= reset_secs {
-            return Some(WindowEstimateOutcome::WontRunOut);
+    match est.status {
+        QuotaEtaStatus::Insufficient => Some(WindowEstimateOutcome::Insufficient),
+        QuotaEtaStatus::Idle => Some(WindowEstimateOutcome::Idle),
+        QuotaEtaStatus::Safe => Some(WindowEstimateOutcome::WontRunOut),
+        QuotaEtaStatus::Depletes => {
+            let mid_m = est.mid_minutes?;
+            let fast_m = est.fast_minutes.unwrap_or(mid_m).min(mid_m);
+            let reset_secs = est
+                .reset_in_seconds
+                .filter(|&s| s > 0)
+                .or_else(|| find_reset_seconds(acct, window_key, est.pool.as_deref()));
+            if let Some(rs) = reset_secs {
+                if mid_m.saturating_mul(60) >= rs {
+                    return Some(WindowEstimateOutcome::WontRunOut);
+                }
+            }
+            Some(WindowEstimateOutcome::RunsOutIn {
+                fast_m,
+                mid_m,
+                slow_m: est.slow_minutes,
+                reset_secs,
+                alert: est.alert,
+            })
         }
-        return Some(WindowEstimateOutcome::RunsOutIn {
-            mins,
-            before_reset: true,
-        });
     }
-    Some(WindowEstimateOutcome::RunsOutIn {
-        mins,
-        before_reset: false,
-    })
 }
 
 fn format_single_window_conclusion(
@@ -5020,7 +5165,6 @@ fn format_single_window_conclusion(
     win_label: &str,
     multi_pool: bool,
 ) -> (String, bool) {
-    let pace = pace_prefix(&est.burn_rate_source);
     let subject = if multi_pool {
         match est.pool.as_deref() {
             Some(p) if !p.is_empty() => format!("{} {win_label}", short_pool_name(p)),
@@ -5030,19 +5174,55 @@ fn format_single_window_conclusion(
         win_label.to_string()
     };
     match outcome {
+        WindowEstimateOutcome::Insufficient => {
+            let text = match est.reason.as_str() {
+                "too_early" => {
+                    let elapsed = est
+                        .elapsed_minutes
+                        .map(format_minutes_zh)
+                        .unwrap_or_else(|| "不久".to_string());
+                    if let Some(pct_x100) = est.remaining_pct_x100 {
+                        format!(
+                            "{subject}刚重置 {elapsed}（剩 {}），数据不足暂不外推",
+                            format_pct_clean(pct_x100)
+                        )
+                    } else {
+                        format!("{subject}刚重置 {elapsed}，数据不足暂不外推")
+                    }
+                }
+                "not_started" => format!("{subject}额度尚未使用（剩 100%），暂不外推"),
+                "stale" => format!("{subject}额度缓存已过期，暂不外推"),
+                "reset_passed" => format!("{subject}额度已过重置时间，待下次刷新"),
+                _ => format!("{subject}额度数据不足，暂不外推"),
+            };
+            (text, false)
+        }
+        WindowEstimateOutcome::Idle => (format!("当前无在跑任务，{subject}额度保持不变"), false),
         WindowEstimateOutcome::WontRunOut => {
+            let pace = pace_prefix(est);
             (format!("{pace}，{subject}额度在重置前用不完"), false)
         }
-        WindowEstimateOutcome::RunsOutIn { mins, before_reset } => (
-            format!("{pace}，{subject}额度约 {}后用完", format_minutes_zh(mins)),
-            before_reset,
-        ),
+        WindowEstimateOutcome::RunsOutIn {
+            fast_m,
+            mid_m,
+            slow_m,
+            reset_secs,
+            alert,
+        } => {
+            let pace = pace_prefix(est);
+            let eta = format_eta_zh_phrase(fast_m, mid_m, slow_m, reset_secs);
+            let reset_tail = reset_secs
+                .filter(|&s| s > 0)
+                .map(|s| format!("（{}）", format_reset_countdown_zh(Some(s))))
+                .unwrap_or_default();
+            (format!("{pace}，{subject}额度{eta}{reset_tail}"), alert)
+        }
     }
 }
 
 /// Build plain-language depletion conclusion line(s) for an account.
-/// Intermediate `tokens_per_pct` metrics are intentionally omitted from the UI.
-/// Returns `(text, is_warning)` where `is_warning` is true when depletion is projected before reset.
+/// Uses `/usage` same-cycle slope estimates only (no local token calibration).
+/// Returns `(text, is_warning)` where `is_warning` is true when an active alert triggers.
 pub(crate) fn format_quota_estimate_lines(
     acct: &AgyAccountItem,
     single_sentence: bool,
@@ -5061,12 +5241,15 @@ pub(crate) fn format_quota_estimate_lines(
         .and_then(|e| evaluate_window_outcome(acct, "weekly", e).map(|o| (e, o)));
 
     match (fh, wk) {
+        (Some((_, WindowEstimateOutcome::Idle)), Some((_, WindowEstimateOutcome::Idle))) => {
+            vec![("当前无在跑任务，5 小时与本周额度保持不变".to_string(), false)]
+        }
         (
             Some((fe, WindowEstimateOutcome::WontRunOut)),
             Some((we, WindowEstimateOutcome::WontRunOut)),
         ) => {
-            if fe.burn_rate_source == we.burn_rate_source || single_sentence {
-                let pace = pace_prefix(&fe.burn_rate_source);
+            if fe.basis == we.basis && fe.running_count == we.running_count || single_sentence {
+                let pace = pace_prefix(fe);
                 vec![(format!("{pace}，5 小时与本周额度在重置前用不完"), false)]
             } else {
                 vec![
@@ -5076,9 +5259,22 @@ pub(crate) fn format_quota_estimate_lines(
             }
         }
         (
-            Some((fe, fo @ WindowEstimateOutcome::RunsOutIn { .. })),
-            Some((we, wo @ WindowEstimateOutcome::WontRunOut)),
+            Some((fe, fo @ WindowEstimateOutcome::RunsOutIn { alert: fa, mid_m: fm, .. })),
+            Some((we, wo @ WindowEstimateOutcome::RunsOutIn { alert: wa, mid_m: wm, .. })),
         ) => {
+            let line_fh = format_single_window_conclusion(fe, fo, "5 小时", multi_pool);
+            let line_wk = format_single_window_conclusion(we, wo, "本周", multi_pool);
+            if single_sentence {
+                if (fa && !wa) || (fa == wa && fm <= wm) {
+                    vec![line_fh]
+                } else {
+                    vec![line_wk]
+                }
+            } else {
+                vec![line_fh, line_wk]
+            }
+        }
+        (Some((fe, fo @ WindowEstimateOutcome::RunsOutIn { .. })), Some((we, wo))) => {
             let line_fh = format_single_window_conclusion(fe, fo, "5 小时", multi_pool);
             if single_sentence {
                 vec![line_fh]
@@ -5089,10 +5285,7 @@ pub(crate) fn format_quota_estimate_lines(
                 ]
             }
         }
-        (
-            Some((fe, fo @ WindowEstimateOutcome::WontRunOut)),
-            Some((we, wo @ WindowEstimateOutcome::RunsOutIn { .. })),
-        ) => {
+        (Some((fe, fo)), Some((we, wo @ WindowEstimateOutcome::RunsOutIn { .. }))) => {
             let line_wk = format_single_window_conclusion(we, wo, "本周", multi_pool);
             if single_sentence {
                 vec![line_wk]
@@ -5103,20 +5296,15 @@ pub(crate) fn format_quota_estimate_lines(
                 ]
             }
         }
-        (
-            Some((fe, fo @ WindowEstimateOutcome::RunsOutIn { mins: fm, .. })),
-            Some((we, wo @ WindowEstimateOutcome::RunsOutIn { mins: wm, .. })),
-        ) => {
+        (Some((fe, fo)), Some((we, wo))) => {
             let line_fh = format_single_window_conclusion(fe, fo, "5 小时", multi_pool);
-            let line_wk = format_single_window_conclusion(we, wo, "本周", multi_pool);
             if single_sentence {
-                if fm <= wm {
-                    vec![line_fh]
-                } else {
-                    vec![line_wk]
-                }
+                vec![line_fh]
             } else {
-                vec![line_fh, line_wk]
+                vec![
+                    line_fh,
+                    format_single_window_conclusion(we, wo, "本周", multi_pool),
+                ]
             }
         }
         (Some((fe, fo)), None) => {
@@ -5455,16 +5643,39 @@ fn render_account_switch_modal(
 
 #[cfg(test)]
 mod tests {
-    use super::pace_prefix;
+    use super::{format_eta_compact, format_eta_zh_phrase, pace_prefix};
+    use crate::model::QuotaWindowEstimate;
 
     #[test]
-    fn pace_prefix_formats_all_burn_rate_sources() {
-        assert_eq!(pace_prefix("24h"), "按最近 24 小时的平均用量");
-        assert_eq!(pace_prefix("5h"), "按最近 5 小时的平均用量");
-        assert_eq!(pace_prefix("7d"), "按最近 7 天的平均用量");
-        assert_eq!(pace_prefix("since:3h"), "按最近 3 小时的平均用量");
-        assert_eq!(pace_prefix("since:1h"), "按最近 1 小时的平均用量");
-        assert_eq!(pace_prefix("none"), "按当前用量");
-        assert_eq!(pace_prefix("since:0h"), "按当前用量");
+    fn pace_prefix_and_eta_interval_formatting() {
+        let mk = |basis: &str, running: usize| QuotaWindowEstimate {
+            basis: basis.to_string(),
+            running_count: running,
+            ..QuotaWindowEstimate::default()
+        };
+        assert_eq!(pace_prefix(&mk("30m", 2)), "按近 30 分钟额度变化（在跑 2）");
+        assert_eq!(pace_prefix(&mk("1h", 0)), "按近 1 小时额度变化");
+        assert_eq!(pace_prefix(&mk("24h", 1)), "按近 24 小时额度变化（在跑 1）");
+        assert_eq!(pace_prefix(&mk("window", 0)), "按本周期额度变化");
+        assert_eq!(pace_prefix(&mk("passive", 1)), "已触发额度耗尽");
+        assert_eq!(pace_prefix(&mk("", 0)), "按当前额度变化");
+
+        assert_eq!(
+            format_eta_zh_phrase(60, 75, Some(90), Some(14_400)),
+            "约 1–1.5 小时后用完"
+        );
+        assert_eq!(
+            format_eta_zh_phrase(90, 120, None, Some(14_400)),
+            "约 1.5 小时后到重置前之间用完"
+        );
+        assert_eq!(
+            format_eta_compact(60, 75, Some(90), Some(14_400)),
+            "~1-1.5h"
+        );
+        // Tiny reset window (< 5m) must never round above resetAt.
+        assert_eq!(format_eta_zh_phrase(2, 2, Some(2), Some(240)), "约 3 分钟后用完");
+        assert_eq!(format_eta_zh_phrase(2, 2, Some(3), Some(240)), "约 3 分钟后到重置前之间用完");
+        assert_eq!(format_eta_compact(2, 2, Some(3), Some(240)), "~3m");
+        assert_eq!(format_eta_zh_phrase(1, 1, None, Some(90)), "即将用完");
     }
 }

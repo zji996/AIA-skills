@@ -25,7 +25,7 @@
 | `delegate agy account pick [--model <别名>] [--json]` | 只读干跑（`auto` 与固定号模式均可用）：不建任务、不查询额度（只读缓存），打印此刻新会话会选哪个号、各号各池档位与有效 5h/7d、缓存时刻与理由（固定号模式直接报固定号） |
 | `delegate agy account add [<id>] [--label TEXT] [--overwrite]` | 在临时 `0700` HOME 中交互启动 `agy` 登录，退出后把新凭据收进新槽位并销毁临时 HOME；不影响当前活跃账号（`auto` 为保留名不可用作槽位 ID） |
 | `delegate agy account use <id\|auto> [--force] [--json]` | 选 `auto` 时进入新会话自动选号且不改动实盘 `~/.gemini`（实盘保持选 `auto` 之前的号）；选 `<id>` 时排他锁内回存当前实盘账号被 `agy` 刷新过的最新凭据 → 原子替换为目标槽位、切回固定号模式并同步把各额度池指针设为 `<id>`；有在跑 `agy` 时也允许切换（在跑进程与已开始的会话继续用原账号，新 run 与 `--fresh` 使用新选择） |
-| `delegate agy account note <id> [--weekly PCT] [--five-hour PCT] [--clear] [--json]` | 手动登记「周剩余 %」「五小时剩余 %」快照，结合本地用量推算「每 1% 约多少 token」与按当前速度还能跑多久（仅作提示，不自动换号） |
+| `delegate agy account note <id> [--weekly PCT] [--five-hour PCT] [--clear] [--json]` | 手动登记「周剩余 %」「五小时剩余 %」备注快照（仅作展示记录，不参与额度耗尽预测） |
 | `delegate agy account remove <id> [--force]` | 删除槽位（不碰实盘 `~/.gemini`；删除活跃槽位需 `--force`） |
 | `delegate agy account import-agy-swap [--dry-run] [--source DIR] [--overwrite]` | 从 `~/.gemini/agy-swap/vault.json` 与 `accounts.json` 导入槽位（支持 `go-keyring-base64:` 与纯 JSON），绝不打印令牌，不改原目录 |
 | `delegate agy account restore-entry [--dry-run] [--mode wrapper\|symlink]` | 备份原 `~/.local/bin/agy` 到 `~/.local/bin/agy.bak-agy-swap`，替换为直连 `~/.local/libexec/agy` 的最小 `exec` 包装（默认）或符号链接 |
@@ -33,7 +33,7 @@
 
 **真实额度、用量与 TUI**：
 - **真实额度**：仅调用 `agy -p /usage </dev/null`（解析「额度池 × 窗口 → 剩余 % + 重置时刻」，未知行原样保留）。全部槽位均在独立临时 `0700` HOME 装载各自槽位凭据运行（不再在真实 `HOME` 跑，避免被常驻交互 `agy` 每小时刷新令牌写回实盘串号），校验实际身份匹配目标槽位后才落盘并写回刷新凭据（不符则拒存并标「身份不符，未更新」；两槽位条目含 `resetAt` 完全相同时在 `list`/`status` 警告）。缓存于 `<state>/agy-quota.json` 并显数据年龄；CLI 新会话与 TUI 定时刷新共用基于 `fetchedEpoch` ≥15 分钟与跨进程单飞锁（`<state>/agy-quota-refresh.lock`）的入口，仅手动 `--quota` 或 TUI 按 `Q` 强制穿透刷新。
-- **用量与推算**：作者/审查员/返工每轮记录增量 tokens 与活跃槽位 ID（不记邮箱），落 `summary.json` 与 `<state>/agy-usage.jsonl`（运行中实时写 `live-usage.json` 或标「运行中未计」）。真实额度优先于手动 `note`，按近 1h 速率推算每 1% token 与可用时长（仅提醒不自动换号）。
+- **用量与耗尽预测**：作者/审查员/返工每轮记录增量 tokens 与活跃槽位 ID（不记邮箱），落 `summary.json` 与 `<state>/agy-usage.jsonl` 仅用于 Token 统计与图表。耗尽预测与 `auto` 选号共用 `PoolQuotaState`，只用 `<state>/agy-quota.json` 同一 `resetAt` 周期内 `/usage` 剩余 `%` 历史（`history` 附 `fiveHourResetEp`/`weeklyResetEp`，上限 700）做近窗斜率区间与数据不足/空闲门控，结果不超过 `resetAt` 且仅对当前选用账号与池告警（`auto` 同池有绿档可接管时静默）。
 - **TUI**：`0`/`O` 总览页看额度 `Gauge`、按账号 24h `Sparkline`、用途/模型 `BarChart`（`v` 切换）与近 7 天合入耗时/一轮通过率（80 列降级纯文本）；额度/账号页列出全部实号槽位及 `auto` 行（展示各池当前指针、档位与理由）与在跑进程，按 `u` 切号或选中 `auto`、`Enter` 聚焦详情、`Q` 强制刷新。
 
 ## 设计取舍：运行中可切换、会话粘滞与按进程凭据覆盖层

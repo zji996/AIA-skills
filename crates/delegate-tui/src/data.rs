@@ -3627,33 +3627,40 @@ fn parse_quota_window_estimate(v: &Value) -> Option<QuotaWindowEstimate> {
     if !v.is_object() {
         return None;
     }
-    let remaining_pct_x100 = pct_to_x100(v.get("remainingPct"))?;
-    let tokens_per_pct = v.get("tokensPerPct").and_then(Value::as_u64)?;
-    let estimated_remaining_tokens = v
-        .get("estimatedRemainingTokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let estimated_remaining_minutes = v
-        .get("estimatedRemainingHours")
-        .and_then(Value::as_f64)
-        .filter(|h| h.is_finite() && *h >= 0.0)
-        .map(|h| (h * 60.0).round() as u64);
-    let burn_rate_per_hour = v
-        .get("burnRatePerHour")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let method = v
-        .get("method")
+    let status = match v.get("status").and_then(Value::as_str)? {
+        "depletes" => QuotaEtaStatus::Depletes,
+        "safe" => QuotaEtaStatus::Safe,
+        "idle" => QuotaEtaStatus::Idle,
+        "insufficient" => QuotaEtaStatus::Insufficient,
+        _ => return None,
+    };
+    let remaining_pct_x100 = pct_to_x100(v.get("remainingPct"));
+    let effective_pct_x100 = pct_to_x100(v.get("effectivePct"));
+    let alert = v.get("alert").and_then(Value::as_bool).unwrap_or(false);
+    let mid_minutes = v.get("midMinutes").and_then(Value::as_u64);
+    let fast_minutes = v.get("fastMinutes").and_then(Value::as_u64).or(mid_minutes);
+    let slow_minutes = v.get("slowMinutes").and_then(Value::as_u64);
+    let reset_in_seconds = v.get("resetInSeconds").and_then(Value::as_u64);
+    let running_count = v.get("runningCount").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let running_writers = v.get("runningWriters").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let basis = v
+        .get("basis")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let reason = v
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let elapsed_minutes = v.get("elapsedMinutes").and_then(Value::as_u64);
     let source = v
         .get("source")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let burn_rate_source = v
-        .get("burnRateSource")
+    let tier = v
+        .get("tier")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
@@ -3663,14 +3670,21 @@ fn parse_quota_window_estimate(v: &Value) -> Option<QuotaWindowEstimate> {
         .filter(|s| !s.is_empty())
         .map(single_line);
     Some(QuotaWindowEstimate {
+        status,
         remaining_pct_x100,
-        tokens_per_pct,
-        estimated_remaining_tokens,
-        estimated_remaining_minutes,
-        burn_rate_per_hour,
-        method,
+        effective_pct_x100,
+        alert,
+        fast_minutes,
+        mid_minutes,
+        slow_minutes,
+        reset_in_seconds,
+        running_count,
+        running_writers,
+        basis,
+        reason,
+        elapsed_minutes,
         source,
-        burn_rate_source,
+        tier,
         pool,
     })
 }

@@ -17,7 +17,7 @@
 ## agy 按账号与时间段用量统计与余量快照推算
 
 - 换号后查各账号近 24 小时或 7 天用了多少 token：`delegate usage --since 24h --by account` / `--since 7d --by day|run|repo --json`，作者与审查员轮次分列，审查员用量单独落在 `review/round-N/usage.json` 并汇总进 `summary.json`（只记活跃 `agy` 槽位 ID、不记邮箱），运行中拿到累计用量实时更新，拿不到单列「运行中未计」。Summarize local `agy` token usage by account slot, day, run, or repo with author vs reviewer split and uncounted running runs listed separately.
-- TUI 账号页与手动余量快照：`delegate tui` 账号页（`6`/`A`）展示各账号近 5 小时与近 7 天本地用量（不调 Google 额度接口）；可选运行 `delegate agy account note <id> --weekly 95.41 --five-hour 85.10` 登记手动剩余百分比快照，按本地用量推算每 1% 约多少 token 及当前速度还能跑多久（仅提示、不自动换号）。Local 5h/7d usage in TUI Accounts tab and advisory-only manual quota snapshot burn-rate estimation without external API polling or auto-rotation.
+- TUI 额度页与同周期耗尽预测：`delegate tui` 额度页展示各账号近 5h/7d 本地 Token 用量与 `/usage` 剩余额度，基于同一 `resetAt` 周期的 `/usage` 剩余 `%` 历史（不依赖本地 token 标定）结合在跑并发给出近窗斜率区间预测与数据不足/空闲门控，结果不超过 `resetAt` 且仅针对当前选用账号与池告警（`auto` 同池有绿档可接管时静默）；`delegate agy account note <id> --weekly 95.41 --five-hour 85.10` 仅登记手动备注快照。Local 5h/7d token usage charts in TUI Quota tab plus same-cycle `/usage`-only depletion interval forecasting with insufficient-data/idle gates, resetAt capping, and selected-pool-only alerts.
 
 ## 6.38 agy 本地多账号管理与迁移
 

@@ -1440,32 +1440,6 @@ fn format_tok_cell(t: TokenCounts) -> String {
     }
 }
 
-pub fn format_hours_compact(hours: f64) -> String {
-    if !hours.is_finite() || hours < 0.0 {
-        return "-".to_string();
-    }
-    let total_mins = (hours * 60.0).round() as u64;
-    if total_mins < 60 {
-        format!("{total_mins}m")
-    } else if total_mins < 48 * 60 {
-        let h = total_mins / 60;
-        let m = total_mins % 60;
-        if m == 0 {
-            format!("{h}h")
-        } else {
-            format!("{h}h{m:02}m")
-        }
-    } else {
-        let d = total_mins / (24 * 60);
-        let h = (total_mins % (24 * 60)) / 60;
-        if h == 0 {
-            format!("{d}d")
-        } else {
-            format!("{d}d{h}h")
-        }
-    }
-}
-
 fn repo_matches_filter(repo_path: &str, repo_name: &str, filter: &str) -> bool {
     let f = filter.trim();
     if f.is_empty() {
@@ -1733,24 +1707,17 @@ pub fn command(args: &[String]) -> Res<i32> {
 }
 
 // ---------------------------------------------------------------------------
-// Fast Per-Account 5h / 7d Usage + Manual Quota Snapshot Estimation
+// Fast Per-Account 1h / 5h / 7d Token Usage + Manual Quota Notes
+// (Quota depletion forecasting lives solely in `agy_accounts.rs` using `/usage`
+// same-cycle percentage history, never local token calibration.)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
-pub struct QuotaNotePoint {
-    pub epoch: i64,
-    pub weekly: Option<f64>,
-    pub five_hour: Option<f64>,
-}
-
 struct ParsedQuotaNotes {
-    points: Vec<QuotaNotePoint>,
     latest_weekly: Option<(f64, String, i64)>,
     latest_five_hour: Option<(f64, String, i64)>,
 }
 
 fn parse_quota_notes(account_entry: &Value) -> ParsedQuotaNotes {
-    let mut pts = Vec::new();
     let mut latest_weekly: Option<(f64, String, i64)> = None;
     let mut latest_five_hour: Option<(f64, String, i64)> = None;
 
@@ -1763,13 +1730,6 @@ fn parse_quota_notes(account_entry: &Value) -> ParsedQuotaNotes {
                 .unwrap_or(0);
             let weekly = item["weekly"].as_f64().filter(|v| v.is_finite());
             let five_hour = item["fiveHour"].as_f64().filter(|v| v.is_finite());
-            if weekly.is_some() || five_hour.is_some() {
-                pts.push(QuotaNotePoint {
-                    epoch: ep,
-                    weekly,
-                    five_hour,
-                });
-            }
             if let Some(w) = weekly {
                 if latest_weekly.as_ref().is_none_or(|(_, _, prev_ep)| ep >= *prev_ep) {
                     latest_weekly = Some((w, at.clone(), ep));
@@ -1782,9 +1742,7 @@ fn parse_quota_notes(account_entry: &Value) -> ParsedQuotaNotes {
             }
         }
     }
-    pts.sort_by_key(|p| p.epoch);
     ParsedQuotaNotes {
-        points: pts,
         latest_weekly,
         latest_five_hour,
     }
@@ -1794,86 +1752,10 @@ fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
 }
 
-/// Compute local-only quota estimate for one window (`weekly` or `fiveHour`) from
-/// recorded manual snapshots and local usage records.
-/// Never divides by zero or produces NaN/Inf; purely advisory (never triggers switching).
-pub fn estimate_quota_window(
-    notes: &[QuotaNotePoint],
-    extract: impl Fn(&QuotaNotePoint) -> Option<f64>,
-    window_secs: i64,
-    now_ep: i64,
-    acct_entries: &[&UsageEntry],
-    window_total_tokens: i64,
-    burn_rate_per_hour: f64,
-) -> Option<Value> {
-    let mut samples: Vec<(i64, f64)> = notes
-        .iter()
-        .filter_map(|p| extract(p).map(|v| (p.epoch, v)))
-        .collect();
-    samples.sort_by_key(|(ep, _)| *ep);
-    let &(latest_ep, latest_pct) = samples.last()?;
-
-    // 1. Prefer delta calibration between the latest snapshot and an earlier snapshot in the same window.
-    let mut tokens_per_pct: Option<(f64, &'static str)> = None;
-    for &(prev_ep, prev_pct) in samples.iter().rev().skip(1) {
-        if latest_ep - prev_ep > window_secs || latest_ep <= prev_ep {
-            continue;
-        }
-        let drop_pct = prev_pct - latest_pct;
-        if drop_pct < 0.05 {
-            continue;
-        }
-        let delta_tokens: i64 = acct_entries
-            .iter()
-            .filter(|e| e.epoch > prev_ep && e.epoch <= latest_ep)
-            .map(|e| e.tokens.total())
-            .sum();
-        if delta_tokens > 0 {
-            tokens_per_pct = Some((delta_tokens as f64 / drop_pct, "delta"));
-            break;
-        }
-    }
-
-    // 2. Fallback to window calibration (`(100 - latest_pct)` vs local usage recorded in this window).
-    if tokens_per_pct.is_none() {
-        let used_pct = 100.0 - latest_pct;
-        if used_pct >= 0.05 && window_total_tokens > 0 {
-            tokens_per_pct = Some((window_total_tokens as f64 / used_pct, "window"));
-        }
-    }
-
-    let (tpp, method) = tokens_per_pct?;
-    if !tpp.is_finite() || tpp <= 0.0 {
-        return None;
-    }
-
-    let tokens_since_note: i64 = acct_entries
-        .iter()
-        .filter(|e| e.epoch > latest_ep && e.epoch <= now_ep)
-        .map(|e| e.tokens.total())
-        .sum();
-    let est_remaining_tokens = (latest_pct * tpp - tokens_since_note as f64).max(0.0);
-    let est_remaining_hours = if burn_rate_per_hour > 0.0 && burn_rate_per_hour.is_finite() {
-        Some(round2(est_remaining_tokens / burn_rate_per_hour))
-    } else {
-        None
-    };
-
-    Some(json!({
-        "remainingPct": round2(latest_pct),
-        "tokensPerPct": tpp.round() as i64,
-        "estimatedRemainingTokens": est_remaining_tokens.round() as i64,
-        "estimatedRemainingHours": est_remaining_hours,
-        "burnRatePerHour": burn_rate_per_hour.round() as i64,
-        "method": method,
-    }))
-}
-
 #[derive(Debug, Default)]
 pub struct AccountUsageView {
     pub usage: Value,
     pub quota_note: Value,
-    pub quota_estimate: Value,
     pub last_used_at: Option<String>,
 }
 
@@ -1899,87 +1781,6 @@ fn window_json(st: &BucketStats, uncounted: usize) -> Value {
     })
 }
 
-fn model_matches_pool(model: &str, pool: &str) -> bool {
-    if crate::agy_accounts::classify_quota_pool_name(pool).is_none() {
-        return true;
-    }
-    crate::agy_accounts::model_matches_pool(model, pool)
-}
-
-fn parse_real_quota_points_for_pool(acct_quota: &Value, pool: Option<&str>) -> Vec<QuotaNotePoint> {
-    let mut pts = Vec::new();
-    if !acct_quota.is_object() {
-        return pts;
-    }
-    if let Some(hist) = acct_quota["history"].as_array() {
-        for item in hist {
-            let ep = item["epoch"].as_i64().unwrap_or(0);
-            if ep <= 0 {
-                continue;
-            }
-            let (weekly, five_hour) = if let Some(pname) = pool {
-                let p = &item["pools"][pname];
-                (
-                    p["weekly"].as_f64().filter(|v| v.is_finite()),
-                    p["fiveHour"].as_f64().filter(|v| v.is_finite()),
-                )
-            } else {
-                (
-                    item["weekly"].as_f64().filter(|v| v.is_finite()),
-                    item["fiveHour"].as_f64().filter(|v| v.is_finite()),
-                )
-            };
-            if weekly.is_some() || five_hour.is_some() {
-                pts.push(QuotaNotePoint {
-                    epoch: ep,
-                    weekly,
-                    five_hour,
-                });
-            }
-        }
-    }
-    // Always ensure the latest fetched `entries` are represented even if history was empty.
-    if b(acct_quota, "ok") {
-        let fetched_ep = acct_quota["fetchedEpoch"]
-            .as_i64()
-            .or_else(|| iso_epoch(s(acct_quota, "fetchedAt")))
-            .unwrap_or(0);
-        if fetched_ep > 0 {
-            let mut w: Option<f64> = None;
-            let mut fh: Option<f64> = None;
-            if let Some(arr) = acct_quota["entries"].as_array() {
-                for e in arr {
-                    if let Some(pname) = pool {
-                        if s(e, "pool") != pname {
-                            continue;
-                        }
-                    }
-                    let Some(pct) = e["remainingPct"].as_f64().filter(|v| v.is_finite()) else {
-                        continue;
-                    };
-                    match s(e, "window") {
-                        "weekly" => w = Some(w.map_or(pct, |prev| prev.min(pct))),
-                        "fiveHour" => fh = Some(fh.map_or(pct, |prev| prev.min(pct))),
-                        _ => {}
-                    }
-                }
-            }
-            if w.is_some() || fh.is_some() {
-                let already = pts.last().is_some_and(|p| p.epoch == fetched_ep);
-                if !already {
-                    pts.push(QuotaNotePoint {
-                        epoch: fetched_ep,
-                        weekly: w,
-                        five_hour: fh,
-                    });
-                }
-            }
-        }
-    }
-    pts.sort_by_key(|p| p.epoch);
-    pts
-}
-
 fn fill_hourly_24h(entries: &[&UsageEntry], now_ep: i64) -> [u64; 24] {
     let mut buckets = [0u64; 24];
     for e in entries {
@@ -1996,144 +1797,9 @@ fn fill_hourly_24h(entries: &[&UsageEntry], now_ep: i64) -> [u64; 24] {
     buckets
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuotaWindowKind {
-    Weekly,
-    FiveHour,
-}
-
-fn burn_rate_24h(entries: &[&UsageEntry], now_ep: i64) -> Option<(f64, String)> {
-    let cutoff_24h = now_ep - TWENTY_FOUR_HOURS_SECS;
-    let t24: i64 = entries
-        .iter()
-        .filter(|e| e.epoch >= cutoff_24h)
-        .map(|e| e.tokens.total())
-        .sum();
-    if t24 <= 0 {
-        return None;
-    }
-    let earliest_ep = entries
-        .iter()
-        .filter(|e| e.tokens.total() > 0)
-        .map(|e| e.epoch)
-        .min()?;
-    if earliest_ep <= cutoff_24h {
-        Some((t24 as f64 / 24.0, "24h".to_string()))
-    } else {
-        let elapsed_secs = (now_ep - earliest_ep).max(ONE_HOUR_SECS);
-        let elapsed_hours = elapsed_secs as f64 / ONE_HOUR_SECS as f64;
-        let label_hours = (elapsed_hours.round() as i64).clamp(1, 24);
-        if label_hours >= 24 {
-            Some((t24 as f64 / 24.0, "24h".to_string()))
-        } else {
-            Some((t24 as f64 / elapsed_hours, format!("since:{label_hours}h")))
-        }
-    }
-}
-
-/// Compute hourly burn rate `(tokens_per_hour, burn_rate_source)` for a quota window.
-/// Shared by both account-level and pool-level estimation; 1h is never used.
-/// - `Weekly`: last 24h average (or elapsed time since first record, at least 1h, when
-///   all records started within the last 24h), falling back to 7d average.
-/// - `FiveHour`: last 5h average, falling back to 24h average.
-pub fn burn_rate_for_window(
-    entries: &[&UsageEntry],
-    now_ep: i64,
-    kind: QuotaWindowKind,
-) -> (f64, String) {
-    match kind {
-        QuotaWindowKind::Weekly => {
-            if let Some(res) = burn_rate_24h(entries, now_ep) {
-                return res;
-            }
-            let cutoff_7d = now_ep - SEVEN_DAYS_SECS;
-            let t7: i64 = entries
-                .iter()
-                .filter(|e| e.epoch >= cutoff_7d)
-                .map(|e| e.tokens.total())
-                .sum();
-            if t7 > 0 {
-                (t7 as f64 / 168.0, "7d".to_string())
-            } else {
-                (0.0, "none".to_string())
-            }
-        }
-        QuotaWindowKind::FiveHour => {
-            let cutoff_5h = now_ep - FIVE_HOURS_SECS;
-            let t5: i64 = entries
-                .iter()
-                .filter(|e| e.epoch >= cutoff_5h)
-                .map(|e| e.tokens.total())
-                .sum();
-            if t5 > 0 {
-                return (t5 as f64 / 5.0, "5h".to_string());
-            }
-            if let Some(res) = burn_rate_24h(entries, now_ep) {
-                return res;
-            }
-            (0.0, "none".to_string())
-        }
-    }
-}
-
-fn attach_estimate_meta(mut est: Value, source: &str, burn_rate_source: &str, pool: Option<&str>) -> Value {
-    if let Some(obj) = est.as_object_mut() {
-        obj.insert("source".into(), json!(source));
-        obj.insert("burnRateSource".into(), json!(burn_rate_source));
-        if let Some(p) = pool {
-            obj.insert("pool".into(), json!(p));
-        }
-    }
-    est
-}
-
-fn estimate_window_with_burn_rate(
-    notes: &[QuotaNotePoint],
-    kind: QuotaWindowKind,
-    now_ep: i64,
-    entries: &[&UsageEntry],
-    fallback_burn: Option<(f64, &str)>,
-    source: &str,
-    pool: Option<&str>,
-) -> Option<Value> {
-    let (window_secs, extract): (i64, fn(&QuotaNotePoint) -> Option<f64>) = match kind {
-        QuotaWindowKind::Weekly => (SEVEN_DAYS_SECS, |p| p.weekly),
-        QuotaWindowKind::FiveHour => (FIVE_HOURS_SECS, |p| p.five_hour),
-    };
-    let cutoff = now_ep - window_secs;
-    let window_total_tokens: i64 = entries
-        .iter()
-        .filter(|e| e.epoch >= cutoff)
-        .map(|e| e.tokens.total())
-        .sum();
-    let (burn_rate, burn_src) = {
-        let (r, src) = burn_rate_for_window(entries, now_ep, kind);
-        if r > 0.0 {
-            (r, src)
-        } else if let Some((fr, fsrc)) = fallback_burn {
-            (fr, fsrc.to_string())
-        } else {
-            (r, src)
-        }
-    };
-    estimate_quota_window(
-        notes,
-        extract,
-        window_secs,
-        now_ep,
-        entries,
-        window_total_tokens,
-        burn_rate,
-    )
-    .map(|v| attach_estimate_meta(v, source, &burn_src, pool))
-}
-
-/// Lock-free, zero-subprocess local 1h / 5h / 7d usage + 24h hourly series + quota estimates
-/// (real `agy -p /usage` prioritized over manual `note`) for `agy_accounts` and `delegate-tui`.
-pub fn accounts_usage_snapshot(
-    accounts_map: &Map<String, Value>,
-    quota_cache: &Value,
-) -> AccountsUsageSnapshot {
+/// Lock-free, zero-subprocess local 1h / 5h / 7d token usage + 24h hourly series + manual notes
+/// for `agy_accounts` and `delegate-tui` charts/statistics.
+pub fn accounts_usage_snapshot(accounts_map: &Map<String, Value>) -> AccountsUsageSnapshot {
     let now_ep = epoch() as i64;
     let cutoff_7d = now_ep - SEVEN_DAYS_SECS;
     // Fast path: read ledger (`<state>/agy-usage.jsonl`) + active `.slot` runs only.
@@ -2157,24 +1823,11 @@ pub fn accounts_usage_snapshot(
             });
         }
     }
-    accounts_usage_snapshot_from_entries(accounts_map, quota_cache, now_ep, entries, uncounted_running)
-}
-
-/// Isolated-state variant for lock-free quota depletion checks and deterministic tests.
-pub fn accounts_usage_snapshot_in(
-    state: &Path,
-    accounts_map: &Map<String, Value>,
-    quota_cache: &Value,
-    now_ep: i64,
-) -> AccountsUsageSnapshot {
-    let cutoff_7d = now_ep - SEVEN_DAYS_SECS;
-    let (entries, _) = parse_ledger_entries_from(&state.join("agy-usage.jsonl"), Some(cutoff_7d), false);
-    accounts_usage_snapshot_from_entries(accounts_map, quota_cache, now_ep, entries, Vec::new())
+    accounts_usage_snapshot_from_entries(accounts_map, now_ep, entries, uncounted_running)
 }
 
 fn accounts_usage_snapshot_from_entries(
     accounts_map: &Map<String, Value>,
-    quota_cache: &Value,
     now_ep: i64,
     entries: Vec<UsageEntry>,
     uncounted_running: Vec<RunningUsageItem>,
@@ -2229,7 +1882,6 @@ fn accounts_usage_snapshot_from_entries(
         });
 
         let ParsedQuotaNotes {
-            points: note_pts,
             latest_weekly: latest_w,
             latest_five_hour: latest_fh,
         } = parse_quota_notes(entry);
@@ -2248,158 +1900,6 @@ fn accounts_usage_snapshot_from_entries(
             Value::Null
         };
 
-        let (acct_weekly_burn, acct_weekly_bsrc) =
-            burn_rate_for_window(&acct_entries, now_ep, QuotaWindowKind::Weekly);
-        let (acct_5h_burn, acct_5h_bsrc) =
-            burn_rate_for_window(&acct_entries, now_ep, QuotaWindowKind::FiveHour);
-
-        // Real quota takes priority over manual `note`.
-        let acct_quota = &quota_cache["accounts"][id];
-        let mut pool_names: Vec<String> = Vec::new();
-        if b(acct_quota, "ok") {
-            if let Some(arr) = acct_quota["entries"].as_array() {
-                for e in arr {
-                    let pname = s(e, "pool");
-                    if !pname.is_empty() && !pool_names.iter().any(|p| p == pname) {
-                        pool_names.push(pname.to_string());
-                    }
-                }
-            }
-        }
-
-        let mut pool_estimates: Vec<Value> = Vec::new();
-        let mut best_real_weekly: Option<(f64, Value)> = None;
-        let mut best_real_five_hour: Option<(f64, Value)> = None;
-
-        for pname in &pool_names {
-            let real_pts = parse_real_quota_points_for_pool(acct_quota, Some(pname));
-            let matched: Vec<&UsageEntry> = acct_entries
-                .iter()
-                .copied()
-                .filter(|e| model_matches_pool(&e.model, pname))
-                .collect();
-            let use_entries: &[&UsageEntry] = if matched.is_empty() {
-                &acct_entries
-            } else {
-                &matched
-            };
-
-            let pw = estimate_window_with_burn_rate(
-                &real_pts,
-                QuotaWindowKind::Weekly,
-                now_ep,
-                use_entries,
-                Some((acct_weekly_burn, &acct_weekly_bsrc)),
-                "real",
-                Some(pname),
-            );
-            let pfh = estimate_window_with_burn_rate(
-                &real_pts,
-                QuotaWindowKind::FiveHour,
-                now_ep,
-                use_entries,
-                Some((acct_5h_burn, &acct_5h_bsrc)),
-                "real",
-                Some(pname),
-            );
-
-            if let Some(ref wv) = pw {
-                let pct = wv["remainingPct"].as_f64().unwrap_or(100.0);
-                if best_real_weekly.as_ref().is_none_or(|(prev, _)| pct < *prev) {
-                    best_real_weekly = Some((pct, wv.clone()));
-                }
-            }
-            if let Some(ref fhv) = pfh {
-                let pct = fhv["remainingPct"].as_f64().unwrap_or(100.0);
-                if best_real_five_hour
-                    .as_ref()
-                    .is_none_or(|(prev, _)| pct < *prev)
-                {
-                    best_real_five_hour = Some((pct, fhv.clone()));
-                }
-            }
-            if pw.is_some() || pfh.is_some() {
-                let mut pe = json!({ "pool": pname });
-                if let Some(w) = pw {
-                    pe["weekly"] = w;
-                }
-                if let Some(fh) = pfh {
-                    pe["fiveHour"] = fh;
-                }
-                pool_estimates.push(pe);
-            }
-        }
-
-        // If real quota exists across pools, prefer it; otherwise fall back to manual `note`.
-        let est_weekly = best_real_weekly
-            .map(|(_, v)| v)
-            .or_else(|| {
-                let real_all = parse_real_quota_points_for_pool(acct_quota, None);
-                estimate_window_with_burn_rate(
-                    &real_all,
-                    QuotaWindowKind::Weekly,
-                    now_ep,
-                    &acct_entries,
-                    None,
-                    "real",
-                    None,
-                )
-            })
-            .or_else(|| {
-                estimate_window_with_burn_rate(
-                    &note_pts,
-                    QuotaWindowKind::Weekly,
-                    now_ep,
-                    &acct_entries,
-                    None,
-                    "note",
-                    None,
-                )
-            });
-
-        let est_five_hour = best_real_five_hour
-            .map(|(_, v)| v)
-            .or_else(|| {
-                let real_all = parse_real_quota_points_for_pool(acct_quota, None);
-                estimate_window_with_burn_rate(
-                    &real_all,
-                    QuotaWindowKind::FiveHour,
-                    now_ep,
-                    &acct_entries,
-                    None,
-                    "real",
-                    None,
-                )
-            })
-            .or_else(|| {
-                estimate_window_with_burn_rate(
-                    &note_pts,
-                    QuotaWindowKind::FiveHour,
-                    now_ep,
-                    &acct_entries,
-                    None,
-                    "note",
-                    None,
-                )
-            });
-
-        let quota_estimate =
-            if est_weekly.is_some() || est_five_hour.is_some() || !pool_estimates.is_empty() {
-                let mut obj = Map::new();
-                if let Some(w) = est_weekly {
-                    obj.insert("weekly".into(), w);
-                }
-                if let Some(fh) = est_five_hour {
-                    obj.insert("fiveHour".into(), fh);
-                }
-                if !pool_estimates.is_empty() {
-                    obj.insert("pools".into(), Value::Array(pool_estimates));
-                }
-                Value::Object(obj)
-            } else {
-                Value::Null
-            };
-
         let last_used_at = acct_entries
             .iter()
             .map(|e| e.epoch)
@@ -2412,7 +1912,6 @@ fn accounts_usage_snapshot_from_entries(
             AccountUsageView {
                 usage,
                 quota_note,
-                quota_estimate,
                 last_used_at,
             },
         );
@@ -3000,17 +2499,14 @@ mod tests {
         assert_eq!(format_token_compact(850), "850");
         assert_eq!(format_token_compact(12_500), "12.5K");
         assert_eq!(format_token_compact(4_200_000), "4.2M");
-        assert_eq!(format_hours_compact(0.5), "30m");
-        assert_eq!(format_hours_compact(5.25), "5h15m");
-        assert_eq!(format_hours_compact(72.0), "3d");
     }
 
     #[test]
-    fn quota_estimation_supports_window_and_delta_modes_without_nan() {
+    fn accounts_usage_snapshot_aggregates_1h_5h_7d_and_quota_notes() {
         let now = 1_800_000_000i64;
-        let e1 = UsageEntry {
-            epoch: now - 3600,
-            run: "r1".into(),
+        let make_entry = |epoch: i64, total_tokens: i64, live: bool| UsageEntry {
+            epoch,
+            run: format!("r-{epoch}"),
             repo: "/repo".into(),
             repo_name: "repo".into(),
             role: "author".into(),
@@ -3019,71 +2515,33 @@ mod tests {
             model: "agy/gemini-4-neon".into(),
             is_agy: true,
             account: Some("work".into()),
-            tokens: TokenCounts::new(1_000_000, 500_000, 8_500_000), // 10M total
-            live: false,
+            tokens: TokenCounts::new(total_tokens, 0, 0),
+            live,
         };
-        // Single snapshot: 95.0% remaining -> 5.0% used -> 10M / 5 = 2M per 1%.
-        let p1 = QuotaNotePoint {
-            epoch: now - 1800,
-            weekly: Some(95.0),
-            five_hour: Some(80.0),
-        };
-        let est1 = estimate_quota_window(
-            &[p1],
-            |p| p.weekly,
-            SEVEN_DAYS_SECS,
-            now,
-            &[&e1],
-            10_000_000,
-            2_000_000.0,
-        )
-        .unwrap();
-        assert_eq!(est1["method"], "window");
-        assert_eq!(est1["tokensPerPct"], 2_000_000);
-        assert_eq!(est1["estimatedRemainingTokens"], 190_000_000);
-        assert_eq!(est1["estimatedRemainingHours"], 95.0);
-
-        // Two snapshots with 6M tokens spent between them and 2% drop -> 3M per 1% (delta mode).
-        let e2 = UsageEntry {
-            epoch: now - 600,
-            tokens: TokenCounts::new(1_000_000, 0, 5_000_000), // 6M total
-            ..e1.clone()
-        };
-        let p2 = QuotaNotePoint {
-            epoch: now - 300,
-            weekly: Some(93.0),
-            five_hour: Some(70.0),
-        };
-        let est2 = estimate_quota_window(
-            &[p1, p2],
-            |p| p.weekly,
-            SEVEN_DAYS_SECS,
-            now,
-            &[&e1, &e2],
-            16_000_000,
-            3_200_000.0,
-        )
-        .unwrap();
-        assert_eq!(est2["method"], "delta");
-        assert_eq!(est2["tokensPerPct"], 3_000_000);
-        assert_eq!(est2["estimatedRemainingTokens"], 279_000_000);
-
-        // 100% remaining (0% used) -> returns None instead of dividing by zero.
-        let p_full = QuotaNotePoint {
-            epoch: now,
-            weekly: Some(100.0),
-            five_hour: Some(100.0),
-        };
-        assert!(estimate_quota_window(
-            &[p_full],
-            |p| p.weekly,
-            SEVEN_DAYS_SECS,
-            now,
-            &[&e1],
-            10_000_000,
-            2_000_000.0,
-        )
-        .is_none());
+        let mut accounts_map = Map::new();
+        accounts_map.insert(
+            "work".into(),
+            json!({
+                "quotaNotes": [
+                    {"at": "2026-11-24T01:00:00Z", "epoch": now - 1800, "weekly": 95.0, "fiveHour": 80.0},
+                    {"at": "2026-11-24T01:30:00Z", "epoch": now - 300, "weekly": 93.25}
+                ]
+            }),
+        );
+        let entries = vec![
+            make_entry(now - 600, 2_000_000, true),          // 1h + 5h + 7d (live)
+            make_entry(now - 3 * 3600, 4_000_000, false),    // 5h + 7d
+            make_entry(now - 48 * 3600, 10_000_000, false),  // 7d only
+        ];
+        let snap = accounts_usage_snapshot_from_entries(&accounts_map, now, entries, Vec::new());
+        let view = snap.per_account.get("work").expect("work view");
+        assert_eq!(view.usage["oneHour"]["total"], 2_000_000);
+        assert_eq!(view.usage["oneHour"]["liveCounted"], 1);
+        assert_eq!(view.usage["fiveHour"]["total"], 6_000_000);
+        assert_eq!(view.usage["sevenDay"]["total"], 16_000_000);
+        assert_eq!(view.quota_note["weekly"], 93.25);
+        assert_eq!(view.quota_note["fiveHour"], 80.0);
+        assert!(view.last_used_at.is_some());
     }
 
     #[test]
@@ -3169,123 +2627,6 @@ mod tests {
         assert_eq!(today["firstRoundPass"], 1);
         assert_eq!(today["firstRoundPassPct"], 50);
         assert_eq!(today["avgMergeSecs"], 1200);
-    }
-
-    #[test]
-    fn burn_rate_window_selection_and_estimation() {
-        let now = 1_800_000_000i64;
-        let make_entry = |epoch: i64, total_tokens: i64| UsageEntry {
-            epoch,
-            run: format!("r-{epoch}"),
-            repo: "/repo".into(),
-            repo_name: "repo".into(),
-            role: "author".into(),
-            mode: "write".into(),
-            rework: false,
-            model: "agy/gemini-4-neon".into(),
-            is_agy: true,
-            account: Some("alpha".into()),
-            tokens: TokenCounts::new(total_tokens, 0, 0),
-            live: false,
-        };
-
-        // 1. Same fixture: 23h steady (1M/h) + last 1h 10x spike (10M/h), with history > 24h.
-        let mut spike_entries = vec![make_entry(now - 30 * 3600, 1_000_000)];
-        for h in 1..=23 {
-            // hours 1..=23 ago: 1M each
-            spike_entries.push(make_entry(now - h * 3600 - 1800, 1_000_000));
-        }
-        // last 1h: 10x spike (10M)
-        spike_entries.push(make_entry(now - 1800, 10_000_000));
-        let spike_refs: Vec<&UsageEntry> = spike_entries.iter().collect();
-
-        // Weekly uses 24h average: (23M + 10M) / 24 = 1.375M/h (unaffected by 1h spike rate of 10M/h).
-        let (wk_rate, wk_src) = burn_rate_for_window(&spike_refs, now, QuotaWindowKind::Weekly);
-        assert_eq!(wk_src, "24h");
-        assert!((wk_rate - 1_375_000.0).abs() < 1e-6);
-
-        // Five-hour uses 5h average: (4M + 10M) / 5 = 2.8M/h.
-        let (fh_rate, fh_src) = burn_rate_for_window(&spike_refs, now, QuotaWindowKind::FiveHour);
-        assert_eq!(fh_src, "5h");
-        assert!((fh_rate - 2_800_000.0).abs() < 1e-6);
-
-        // Verify end-to-end estimate_window_with_burn_rate for both windows & pool metadata.
-        let note = QuotaNotePoint {
-            epoch: now - 60,
-            weekly: Some(66.0),    // 34% used -> 34M / 34 = 1M/1% -> 66M rem
-            five_hour: Some(30.0), // 70% used -> 14M / 70 = 200K/1% -> 6M rem
-        };
-        let wk_est = estimate_window_with_burn_rate(
-            &[note],
-            QuotaWindowKind::Weekly,
-            now,
-            &spike_refs,
-            None,
-            "real",
-            Some("Gemini Models"),
-        )
-        .unwrap();
-        assert_eq!(wk_est["burnRateSource"], "24h");
-        assert_eq!(wk_est["burnRatePerHour"], 1_375_000);
-        assert_eq!(wk_est["pool"], "Gemini Models");
-        // 66M / 1.375M/h = 48.0h (would have been 6.6h under old 1h spike burn rate).
-        assert_eq!(wk_est["estimatedRemainingHours"], 48.0);
-
-        let fh_est = estimate_window_with_burn_rate(
-            &[note],
-            QuotaWindowKind::FiveHour,
-            now,
-            &spike_refs,
-            None,
-            "real",
-            Some("Gemini Models"),
-        )
-        .unwrap();
-        assert_eq!(fh_est["burnRateSource"], "5h");
-        assert_eq!(fh_est["burnRatePerHour"], 2_800_000);
-        assert_eq!(fh_est["estimatedRemainingHours"], round2(6_000_000.0 / 2_800_000.0));
-
-        // 2. Account with only 3 hours of records: weekly averages over 3h (`since:3h`), 5h over 5h.
-        let short_entries = [
-            make_entry(now - 3 * 3600, 1_500_000),
-            make_entry(now - 3600, 1_500_000),
-        ];
-        let short_refs: Vec<&UsageEntry> = short_entries.iter().collect();
-        let (s_wk_rate, s_wk_src) = burn_rate_for_window(&short_refs, now, QuotaWindowKind::Weekly);
-        assert_eq!(s_wk_src, "since:3h");
-        assert!((s_wk_rate - 1_000_000.0).abs() < 1e-6);
-        let (s_fh_rate, s_fh_src) =
-            burn_rate_for_window(&short_refs, now, QuotaWindowKind::FiveHour);
-        assert_eq!(s_fh_src, "5h");
-        assert!((s_fh_rate - 600_000.0).abs() < 1e-6);
-
-        // 3. Account with < 1h of records: weekly clamps denominator to 1h (`since:1h`).
-        let tiny_entries = [make_entry(now - 1200, 2_000_000)];
-        let tiny_refs: Vec<&UsageEntry> = tiny_entries.iter().collect();
-        let (t_wk_rate, t_wk_src) = burn_rate_for_window(&tiny_refs, now, QuotaWindowKind::Weekly);
-        assert_eq!(t_wk_src, "since:1h");
-        assert!((t_wk_rate - 2_000_000.0).abs() < 1e-6);
-
-        // 4. Fallbacks: no 24h usage -> weekly falls back to 7d; no 5h usage -> 5h falls back to 24h.
-        let old_7d_entries = [make_entry(now - 48 * 3600, 168_000_000)];
-        let old_7d_refs: Vec<&UsageEntry> = old_7d_entries.iter().collect();
-        let (f7_rate, f7_src) = burn_rate_for_window(&old_7d_refs, now, QuotaWindowKind::Weekly);
-        assert_eq!(f7_src, "7d");
-        assert!((f7_rate - 1_000_000.0).abs() < 1e-6);
-        let (f5_none_rate, f5_none_src) =
-            burn_rate_for_window(&old_7d_refs, now, QuotaWindowKind::FiveHour);
-        assert_eq!(f5_none_src, "none");
-        assert_eq!(f5_none_rate, 0.0);
-
-        let mid_24h_entries = [
-            make_entry(now - 30 * 3600, 1_000_000),
-            make_entry(now - 10 * 3600, 24_000_000),
-        ];
-        let mid_24h_refs: Vec<&UsageEntry> = mid_24h_entries.iter().collect();
-        let (f5_24_rate, f5_24_src) =
-            burn_rate_for_window(&mid_24h_refs, now, QuotaWindowKind::FiveHour);
-        assert_eq!(f5_24_src, "24h");
-        assert!((f5_24_rate - 1_000_000.0).abs() < 1e-6);
     }
 
     #[test]

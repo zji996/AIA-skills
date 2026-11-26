@@ -41,12 +41,16 @@ use std::time::{Duration, Instant};
 pub const SCHEMA_VERSION: u64 = 1;
 pub const AUTO_ACCOUNT_ID: &str = "auto";
 pub const QUOTA_CACHE_SCHEMA_VERSION: u64 = 1;
-const QUOTA_HISTORY_LIMIT: usize = 200;
+const QUOTA_HISTORY_LIMIT: usize = 700;
 const QUOTA_HISTORY_RETENTION_SECS: i64 = 7 * 86400;
 const DEFAULT_QUOTA_TIMEOUT_SECS: u64 = 30;
 pub const RESET_AT_BUFFER_SECS: i64 = 60;
 pub const FIVE_HOUR_STALE_SECS: i64 = 2 * 3600;
 pub const WEEKLY_STALE_SECS: i64 = 24 * 3600;
+const ETA_WEEKLY_STALE_SECS: i64 = 12 * 3600;
+const FIVE_HOUR_WINDOW_SECS: i64 = 5 * 3600;
+const WEEKLY_WINDOW_SECS: i64 = 7 * 86400;
+const SAME_CYCLE_TOLERANCE_SECS: i64 = 120;
 pub const PASSIVE_SYNTH_RESET_SECS: i64 = 15 * 60;
 pub const REFRESH_FAILURE_BACKOFF_SECS: i64 = 5 * 60;
 pub const DEFAULT_MIN_REFRESH_SECS: i64 = 15 * 60;
@@ -1297,21 +1301,24 @@ fn build_quota_history_point(now_ep: i64, entries: &[QuotaPoolEntry]) -> Option<
     let mut min_five_hour: Option<f64> = None;
     let mut pools: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
     for e in entries {
+        let reset_ep = (!e.reset_at.is_empty()).then(|| iso_epoch(&e.reset_at)).flatten();
         match e.window.as_str() {
             "weekly" => {
                 min_weekly = Some(min_weekly.map_or(e.remaining_pct, |p| p.min(e.remaining_pct)));
-                pools
-                    .entry(e.pool.clone())
-                    .or_default()
-                    .insert("weekly".into(), json!(e.remaining_pct));
+                let entry = pools.entry(e.pool.clone()).or_default();
+                entry.insert("weekly".into(), json!(e.remaining_pct));
+                if let Some(rep) = reset_ep {
+                    entry.insert("weeklyResetEp".into(), json!(rep));
+                }
             }
             "fiveHour" => {
                 min_five_hour =
                     Some(min_five_hour.map_or(e.remaining_pct, |p| p.min(e.remaining_pct)));
-                pools
-                    .entry(e.pool.clone())
-                    .or_default()
-                    .insert("fiveHour".into(), json!(e.remaining_pct));
+                let entry = pools.entry(e.pool.clone()).or_default();
+                entry.insert("fiveHour".into(), json!(e.remaining_pct));
+                if let Some(rep) = reset_ep {
+                    entry.insert("fiveHourResetEp".into(), json!(rep));
+                }
             }
             _ => {}
         }
@@ -1774,17 +1781,24 @@ pub fn snapshot_json_fast() -> Value {
 }
 
 /// Advisory-only quota depletion warning when projected depletion precedes window reset.
-/// Never triggers automatic account switching or throttling.
+/// Only emitted for currently selected accounts/pools (in `auto` mode, only when all
+/// available accounts in the pool are non-Green and combined capacity cannot reach the earliest reset).
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuotaDepletionWarning {
     pub account_id: String,
     pub active: bool,
+    pub auto_all_low: bool,
+    pub pool_summary: String,
     pub pool: String,
     pub window: String,
     pub window_label: String,
+    pub fast_minutes: u64,
     pub remaining_minutes: u64,
+    pub slow_minutes: Option<u64>,
     pub reset_in_seconds: u64,
     pub remaining_pct: f64,
+    pub running_count: usize,
+    pub basis: String,
 }
 
 fn short_pool_label(pool: &str) -> String {
@@ -1800,13 +1814,45 @@ fn short_pool_label(pool: &str) -> String {
     }
 }
 
+/// Round ETA minutes to human-honest granularity (never overly precise like `3 小时 38 分钟`):
+/// - `< 1h`: nearest 5 minutes (min 5m for non-zero)
+/// - `1h..6h`: nearest 15 minutes
+/// - `6h..48h`: nearest 1 hour
+/// - `>= 48h`: nearest 1 day
+pub fn round_eta_minutes(mins: u64) -> u64 {
+    if mins == 0 {
+        return 0;
+    }
+    if mins < 60 {
+        (((mins + 2) / 5) * 5).max(5)
+    } else if mins < 6 * 60 {
+        ((mins + 7) / 15) * 15
+    } else if mins < 48 * 60 {
+        ((mins + 30) / 60) * 60
+    } else {
+        ((mins + 720) / 1440).max(2) * 1440
+    }
+}
+
+fn format_hours_half_zh(mins: u64) -> Option<String> {
+    if !(60..48 * 60).contains(&mins) || !mins.is_multiple_of(30) {
+        return None;
+    }
+    let h = mins / 60;
+    if mins.is_multiple_of(60) {
+        Some(format!("{h}"))
+    } else {
+        Some(format!("{h}.5"))
+    }
+}
+
 pub fn format_minutes_zh_short(mins: u64) -> String {
     if mins < 60 {
         return format!("{mins} 分钟");
     }
     let hours = mins / 60;
     let rem_m = mins % 60;
-    if hours < 24 {
+    if hours < 48 {
         if rem_m == 0 {
             format!("{hours} 小时")
         } else {
@@ -1820,6 +1866,64 @@ pub fn format_minutes_zh_short(mins: u64) -> String {
         } else {
             format!("{days} 天 {rem_h} 小时")
         }
+    }
+}
+
+/// Format an ETA interval `[fast_m, mid_m, slow_m]` capped strictly below `reset_secs`:
+/// - `mid_m == 0` -> `"即将用完"`
+/// - wide interval (`(slow - fast) / mid > 25%`) -> `"约 1–1.5 小时后用完"` or `"约 1.5 小时后到重置前之间用完"`
+/// - narrow interval -> rounded single value `"约 1 小时 30 分钟后用完"`
+pub fn format_eta_zh_phrase(
+    fast_m: u64,
+    mid_m: u64,
+    slow_m: Option<u64>,
+    reset_secs: u64,
+) -> String {
+    let reset_mins = (reset_secs / 60).max(1);
+    if mid_m == 0 || reset_mins <= 1 {
+        return "即将用完".to_string();
+    }
+    let max_m = reset_mins.saturating_sub(1).max(1);
+    let slow_eff = slow_m.unwrap_or(reset_mins);
+    let is_wide = (slow_eff.saturating_sub(fast_m)) as f64 / (mid_m as f64) > 0.25;
+
+    if is_wide {
+        let fast_r = round_eta_minutes(fast_m).max(5).min(max_m).max(1);
+        let slow_r_opt = slow_m
+            .map(round_eta_minutes)
+            .filter(|&sr| sr < reset_mins);
+        match slow_r_opt {
+            None => {
+                if let Some(fh) = format_hours_half_zh(fast_r) {
+                    format!("约 {fh} 小时后到重置前之间用完")
+                } else {
+                    format!("约 {}后到重置前之间用完", format_minutes_zh_short(fast_r))
+                }
+            }
+            Some(slow_r) if slow_r <= fast_r => {
+                format!("约 {}后用完", format_minutes_zh_short(fast_r))
+            }
+            Some(slow_r) => {
+                if fast_r < 60 && slow_r < 60 {
+                    format!("约 {fast_r}–{slow_r} 分钟后用完")
+                } else if let (Some(fh), Some(sh)) =
+                    (format_hours_half_zh(fast_r), format_hours_half_zh(slow_r))
+                {
+                    format!("约 {fh}–{sh} 小时后用完")
+                } else if fast_r >= 48 * 60 && slow_r >= 48 * 60 && fast_r.is_multiple_of(1440) && slow_r.is_multiple_of(1440) {
+                    format!("约 {}–{} 天后用完", fast_r / 1440, slow_r / 1440)
+                } else {
+                    format!(
+                        "约 {}–{}后用完",
+                        format_minutes_zh_short(fast_r),
+                        format_minutes_zh_short(slow_r)
+                    )
+                }
+            }
+        }
+    } else {
+        let mid_r = round_eta_minutes(mid_m).min(max_m).max(1);
+        format!("约 {}后用完", format_minutes_zh_short(mid_r))
     }
 }
 
@@ -1841,104 +1945,353 @@ pub fn format_reset_zh_short(secs: u64) -> String {
     }
 }
 
+fn find_acct_pool_window_entry(
+    acct: &Value,
+    window_key: &str,
+    pool_opt: Option<&str>,
+) -> Option<(u64, f64)> {
+    find_acct_pool_window_entry_meta(acct, window_key, pool_opt).map(|(rs, pct, _)| (rs, pct))
+}
+
+fn find_acct_pool_window_entry_meta(
+    acct: &Value,
+    window_key: &str,
+    pool_opt: Option<&str>,
+) -> Option<(u64, f64, bool)> {
+    let entries = acct["quota"]["entries"].as_array()?;
+    let target_pool = pool_opt.and_then(classify_quota_pool_name);
+    for e in entries {
+        if s(e, "window") != window_key {
+            continue;
+        }
+        if let Some(tp) = target_pool {
+            if classify_quota_pool_name(s(e, "pool")) != Some(tp) {
+                continue;
+            }
+        } else if let Some(p) = pool_opt.filter(|p| !p.is_empty()) {
+            if s(e, "pool") != p {
+                continue;
+            }
+        }
+        if let Some(reset_s) = e["resetInSeconds"].as_u64() {
+            if reset_s > 0 {
+                let pct = e["remainingPct"].as_f64().unwrap_or(0.0);
+                let is_passive = s(e, "source") == "passive_error";
+                return Some((reset_s, pct, is_passive));
+            }
+        }
+    }
+    None
+}
+
+fn acct_pool_tier(acct: &Value, pool: QuotaPool) -> Option<String> {
+    if let Some(pools) = acct["quotaEstimate"]["pools"].as_array() {
+        for pe in pools {
+            if classify_quota_pool_name(s(pe, "pool")) == Some(pool) {
+                let t = s(pe, "tier");
+                if !t.is_empty() {
+                    return Some(t.to_string());
+                }
+                for wk in ["fiveHour", "weekly"] {
+                    let wt = s(&pe[wk], "tier");
+                    if !wt.is_empty() {
+                        return Some(wt.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+struct ExtractedWindowAlert {
+    pool_raw: String,
+    fast_m: u64,
+    mid_m: u64,
+    slow_m: Option<u64>,
+    reset_secs: u64,
+    rem_pct: f64,
+    running_count: usize,
+    basis: String,
+}
+
+fn extract_window_alert_from_obj(
+    acct: &Value,
+    est_obj: &Value,
+    window_key: &str,
+    pool_hint: Option<&str>,
+) -> Option<ExtractedWindowAlert> {
+    if !est_obj.is_object() {
+        return None;
+    }
+    if s(est_obj, "status") != "depletes" || !b(est_obj, "alert") {
+        return None;
+    }
+    let mid_m = est_obj["midMinutes"].as_u64()?;
+    let fast_m = est_obj["fastMinutes"].as_u64().unwrap_or(mid_m).min(mid_m);
+    let slow_m = est_obj["slowMinutes"].as_u64();
+    let pool_raw = pool_hint
+        .filter(|p| !p.is_empty())
+        .or_else(|| {
+            let p = s(est_obj, "pool");
+            (!p.is_empty()).then_some(p)
+        })
+        .unwrap_or("");
+    let (reset_secs, rem_pct) = find_acct_pool_window_entry(acct, window_key, Some(pool_raw))
+        .or_else(|| {
+            let rs = est_obj["resetInSeconds"].as_u64().filter(|&s| s > 0)?;
+            let pct = est_obj["remainingPct"].as_f64().unwrap_or(0.0);
+            Some((rs, pct))
+        })?;
+    if mid_m.saturating_mul(60) >= reset_secs {
+        return None;
+    }
+    let running_count = est_obj["runningCount"].as_u64().unwrap_or(0) as usize;
+    let basis = s(est_obj, "basis").to_string();
+    Some(ExtractedWindowAlert {
+        pool_raw: pool_raw.to_string(),
+        fast_m,
+        mid_m,
+        slow_m,
+        reset_secs,
+        rem_pct,
+        running_count,
+        basis,
+    })
+}
+
 /// Extract quota depletion-before-reset warnings from an `agyAccounts` snapshot JSON object.
-/// Sorted with the active account first, then earliest depletion first.
+/// Only alerts on currently selected accounts & pools:
+/// - Fixed mode (`mode != "auto"`): checks ONLY the active account (standby accounts never alert).
+/// - `auto` mode (`mode == "auto"`): checks each pool's selected account; suppresses warning if
+///   another healthy account in that pool is Green or resets before current depletion; warns only
+///   when all available accounts in the pool are non-Green and combined capacity cannot reach
+///   the earliest `resetAt`.
 pub fn detect_quota_depletion_warnings(snap: &Value) -> Vec<QuotaDepletionWarning> {
     let mut warnings = Vec::new();
     let Some(accounts) = snap["accounts"].as_array() else {
         return warnings;
     };
-    for acct in accounts {
-        let id = s(acct, "id").to_string();
-        if id.is_empty() {
-            continue;
+    let is_auto = s(snap, "mode") == AUTO_ACCOUNT_ID || b(&snap["autoSwitch"], "enabled");
+    let snap_active = s(snap, "active");
+
+    if !is_auto {
+        for acct in accounts {
+            let id = s(acct, "id").to_string();
+            if id.is_empty() {
+                continue;
+            }
+            let active = b(acct, "active") || (!snap_active.is_empty() && id == snap_active);
+            if !active {
+                continue;
+            }
+            let quota = &acct["quota"];
+            if !b(quota, "ok") || b(quota, "identityMismatch") {
+                continue;
+            }
+            let qest = &acct["quotaEstimate"];
+            if !qest.is_object() {
+                continue;
+            }
+            let mut seen: std::collections::HashSet<(String, String)> =
+                std::collections::HashSet::new();
+            let mut push_win = |est_obj: &Value, window_key: &str, pool_hint: Option<&str>| {
+                let Some(ExtractedWindowAlert {
+                    pool_raw,
+                    fast_m,
+                    mid_m,
+                    slow_m,
+                    reset_secs,
+                    rem_pct,
+                    running_count,
+                    basis,
+                }) = extract_window_alert_from_obj(acct, est_obj, window_key, pool_hint)
+                else {
+                    return;
+                };
+                let pool_disp = short_pool_label(&pool_raw);
+                if !seen.insert((pool_disp.clone(), window_key.to_string())) {
+                    return;
+                }
+                let window_label = match window_key {
+                    "fiveHour" => "5 小时".to_string(),
+                    _ => "本周".to_string(),
+                };
+                warnings.push(QuotaDepletionWarning {
+                    account_id: id.clone(),
+                    active: true,
+                    auto_all_low: false,
+                    pool_summary: String::new(),
+                    pool: pool_disp,
+                    window: window_key.to_string(),
+                    window_label,
+                    fast_minutes: fast_m,
+                    remaining_minutes: mid_m,
+                    slow_minutes: slow_m,
+                    reset_in_seconds: reset_secs,
+                    remaining_pct: rem_pct,
+                    running_count,
+                    basis,
+                });
+            };
+            if let Some(pools) = qest["pools"].as_array() {
+                for pe in pools {
+                    let pname = s(pe, "pool");
+                    push_win(&pe["fiveHour"], "fiveHour", Some(pname));
+                    push_win(&pe["weekly"], "weekly", Some(pname));
+                }
+            }
+            push_win(&qest["fiveHour"], "fiveHour", None);
+            push_win(&qest["weekly"], "weekly", None);
         }
-        let active = b(acct, "active");
-        let quota = &acct["quota"];
-        if !b(quota, "ok") || b(quota, "identityMismatch") {
-            continue;
-        }
-        let Some(entries) = quota["entries"].as_array() else {
-            continue;
-        };
-        let qest = &acct["quotaEstimate"];
-        if !qest.is_object() {
-            continue;
-        }
-        let find_entry = |window_key: &str, pool_opt: Option<&str>| -> Option<(u64, f64)> {
-            for e in entries {
-                if s(e, "window") != window_key {
+    } else {
+        // `auto` mode: evaluate per pool.
+        let healthy_accts: Vec<&Value> = accounts
+            .iter()
+            .filter(|a| {
+                !s(a, "id").is_empty()
+                    && b(&a["quota"], "ok")
+                    && !b(&a["quota"], "identityMismatch")
+            })
+            .collect();
+
+        for pool in QuotaPool::ALL {
+            let pkey = pool.key();
+            let sel_id = {
+                let ps = s(&snap["autoSwitch"]["poolSummary"][pkey], "selected");
+                if !ps.is_empty() {
+                    ps.to_string()
+                } else {
+                    let pc = s(&snap["autoSwitch"]["poolCurrent"], pkey);
+                    if !pc.is_empty() {
+                        pc.to_string()
+                    } else {
+                        snap_active.to_string()
+                    }
+                }
+            };
+            let Some(sel_acct) = healthy_accts
+                .iter()
+                .copied()
+                .find(|a| s(a, "id") == sel_id)
+                .or_else(|| healthy_accts.first().copied())
+            else {
+                continue;
+            };
+            let sel_acct_id = s(sel_acct, "id").to_string();
+
+            for window_key in ["fiveHour", "weekly"] {
+                // Find the selected account's estimate for this (pool, window).
+                let est_obj = sel_acct["quotaEstimate"]["pools"]
+                    .as_array()
+                    .and_then(|arr| {
+                        arr.iter()
+                            .find(|pe| classify_quota_pool_name(s(pe, "pool")) == Some(pool))
+                            .map(|pe| &pe[window_key])
+                    })
+                    .unwrap_or(&Value::Null);
+                let Some(ExtractedWindowAlert {
+                    fast_m,
+                    mid_m,
+                    slow_m,
+                    reset_secs: cur_reset_secs,
+                    rem_pct: cur_pct,
+                    running_count,
+                    basis,
+                    ..
+                }) = extract_window_alert_from_obj(
+                    sel_acct,
+                    est_obj,
+                    window_key,
+                    Some(pool.label()),
+                )
+                else {
+                    continue;
+                };
+
+                // Suppress if ANY other healthy account in this pool is Green or resets before current depletion
+                // (ignoring synthetic `passive_error` resets and accounts whose weekly pool is already Red).
+                let other_can_takeover = healthy_accts.iter().any(|other| {
+                    if s(other, "id") == sel_acct_id {
+                        return false;
+                    }
+                    if acct_pool_tier(other, pool).as_deref() == Some("green") {
+                        return true;
+                    }
+                    if let Some((other_reset_s, _, is_passive)) =
+                        find_acct_pool_window_entry_meta(other, window_key, Some(pool.label()))
+                    {
+                        let weekly_blocked = window_key == "fiveHour"
+                            && find_acct_pool_window_entry(other, "weekly", Some(pool.label()))
+                                .is_some_and(|(_, wpct)| wpct < YELLOW_WEEKLY_MIN_PCT);
+                        if !is_passive && !weekly_blocked && other_reset_s <= mid_m.saturating_mul(60) {
+                            return true;
+                        }
+                    }
+                    false
+                });
+                if other_can_takeover {
                     continue;
                 }
-                if let Some(p) = pool_opt {
-                    if !p.is_empty() && s(e, "pool") != p {
-                        continue;
-                    }
-                }
-                if let Some(reset_s) = e["resetInSeconds"].as_u64() {
-                    if reset_s > 0 {
-                        let pct = e["remainingPct"].as_f64().unwrap_or(0.0);
-                        return Some((reset_s, pct));
-                    }
-                }
-            }
-            None
-        };
-        let mut seen: std::collections::HashSet<(String, String)> =
-            std::collections::HashSet::new();
-        let mut check_window = |est_obj: &Value, window_key: &str, pool_hint: Option<&str>| {
-            if !est_obj.is_object() {
-                return;
-            }
-            let Some(rem_mins) = est_obj["estimatedRemainingHours"]
-                .as_f64()
-                .filter(|h| h.is_finite() && *h >= 0.0)
-                .map(|h| (h * 60.0).round() as u64)
-                .or_else(|| est_obj["estimatedRemainingMinutes"].as_u64())
-            else {
-                return;
-            };
-            let pool_raw = pool_hint
-                .filter(|p| !p.is_empty())
-                .or_else(|| {
-                    let p = s(est_obj, "pool");
-                    (!p.is_empty()).then_some(p)
-                });
-            let Some((reset_secs, rem_pct)) = find_entry(window_key, pool_raw) else {
-                return;
-            };
-            if rem_mins.saturating_mul(60) >= reset_secs {
-                return;
-            }
-            let pool_disp = short_pool_label(pool_raw.unwrap_or(""));
-            if !seen.insert((pool_disp.clone(), window_key.to_string())) {
-                return;
-            }
-            let window_label = match window_key {
-                "fiveHour" => "5 小时".to_string(),
-                _ => "本周".to_string(),
-            };
-            warnings.push(QuotaDepletionWarning {
-                account_id: id.clone(),
-                active,
-                pool: pool_disp,
-                window: window_key.to_string(),
-                window_label,
-                remaining_minutes: rem_mins,
-                reset_in_seconds: reset_secs,
-                remaining_pct: rem_pct,
-            });
-        };
 
-        if let Some(pools) = qest["pools"].as_array() {
-            for pe in pools {
-                let pname = s(pe, "pool");
-                check_window(&pe["weekly"], "weekly", Some(pname));
-                check_window(&pe["fiveHour"], "fiveHour", Some(pname));
+                // All accounts in this pool are non-Green (or single account): check combined capacity vs earliest reset.
+                let mut earliest_reset = cur_reset_secs;
+                let mut combined_pct = cur_pct.max(0.0);
+                let mut parts: Vec<String> = Vec::new();
+                let win_short = if window_key == "fiveHour" { "5h" } else { "周" };
+                for a in &healthy_accts {
+                    let aid = s(a, "id");
+                    if let Some((rs, pct, is_passive)) =
+                        find_acct_pool_window_entry_meta(a, window_key, Some(pool.label()))
+                    {
+                        let weekly_blocked = window_key == "fiveHour"
+                            && find_acct_pool_window_entry(a, "weekly", Some(pool.label()))
+                                .is_some_and(|(_, wpct)| wpct < YELLOW_WEEKLY_MIN_PCT);
+                        if !is_passive && !weekly_blocked && rs > 0 && rs < earliest_reset {
+                            earliest_reset = rs;
+                        }
+                        if aid != sel_acct_id && !weekly_blocked && !is_passive {
+                            combined_pct += pct.max(0.0);
+                        }
+                        parts.push(format!("{aid} {win_short} {:.0}%", pct));
+                    }
+                }
+                let scale = if cur_pct > 0.5 {
+                    (combined_pct / cur_pct).max(1.0)
+                } else {
+                    1.0
+                };
+                let combined_mid_m = ((mid_m as f64) * scale).round() as u64;
+                if combined_mid_m.saturating_mul(60) >= earliest_reset {
+                    continue;
+                }
+                let combined_fast_m = ((fast_m as f64) * scale).round() as u64;
+                let combined_slow_m = slow_m
+                    .map(|sm| ((sm as f64) * scale).round() as u64)
+                    .filter(|&sm| sm.saturating_mul(60) < earliest_reset);
+
+                let window_label = match window_key {
+                    "fiveHour" => "5 小时".to_string(),
+                    _ => "本周".to_string(),
+                };
+                warnings.push(QuotaDepletionWarning {
+                    account_id: sel_acct_id.clone(),
+                    active: true,
+                    auto_all_low: healthy_accts.len() > 1,
+                    pool_summary: parts.join(" / "),
+                    pool: pool.short_label().to_string(),
+                    window: window_key.to_string(),
+                    window_label,
+                    fast_minutes: combined_fast_m.min(combined_mid_m),
+                    remaining_minutes: combined_mid_m,
+                    slow_minutes: combined_slow_m,
+                    reset_in_seconds: earliest_reset,
+                    remaining_pct: cur_pct,
+                    running_count,
+                    basis,
+                });
             }
         }
-        check_window(&qest["weekly"], "weekly", None);
-        check_window(&qest["fiveHour"], "fiveHour", None);
     }
 
     warnings.sort_by(|a, b| {
@@ -1950,8 +2303,118 @@ pub fn detect_quota_depletion_warnings(snap: &Value) -> Vec<QuotaDepletionWarnin
     warnings
 }
 
-/// Lock-free, zero-subprocess quota depletion check scoped to `state` (`<state>/agy-quota.json`).
-/// Returns empty when `<state>/agy-quota.json` does not exist so isolated tests never leak host state.
+fn eta_window_priority(est: &Value) -> (u8, u64) {
+    match s(est, "status") {
+        "depletes" if b(est, "alert") => (0, est["midMinutes"].as_u64().unwrap_or(u64::MAX)),
+        "depletes" => (1, est["midMinutes"].as_u64().unwrap_or(u64::MAX)),
+        "insufficient" if s(est, "reason") == "too_early" => (2, 0),
+        "safe" => (
+            3,
+            (est["remainingPct"].as_f64().unwrap_or(100.0) * 100.0).round() as u64,
+        ),
+        "idle" => (
+            4,
+            (est["remainingPct"].as_f64().unwrap_or(100.0) * 100.0).round() as u64,
+        ),
+        _ => (5, 0),
+    }
+}
+
+fn build_account_quota_estimate_json(
+    acct_quota: &Value,
+    cfg: &AgyAutoSwitchConfig,
+    running_tasks: &BTreeMap<(String, QuotaPool), RunningPoolCounts>,
+    acct_id: &str,
+    selected_by_pool: &BTreeMap<QuotaPool, String>,
+    now_ep: i64,
+) -> Value {
+    if !b(acct_quota, "ok") || b(acct_quota, "identityMismatch") {
+        return Value::Null;
+    }
+    let mut pool_names: Vec<(String, QuotaPool)> = Vec::new();
+    if let Some(arr) = acct_quota["entries"].as_array() {
+        for e in arr {
+            let pname = s(e, "pool");
+            if pname.is_empty() {
+                continue;
+            }
+            if let Some(pool) = classify_quota_pool_name(pname) {
+                if !pool_names.iter().any(|(_, p)| *p == pool) {
+                    pool_names.push((pname.to_string(), pool));
+                }
+            }
+        }
+    }
+    if pool_names.is_empty() {
+        return Value::Null;
+    }
+
+    let mut pool_estimates: Vec<Value> = Vec::new();
+    let mut best_five_hour: Option<((u8, u64), Value)> = None;
+    let mut best_weekly: Option<((u8, u64), Value)> = None;
+
+    for (pname, pool) in &pool_names {
+        let counts = running_tasks
+            .get(&(acct_id.to_string(), *pool))
+            .copied()
+            .unwrap_or_default();
+        let is_selected = selected_by_pool
+            .get(pool)
+            .is_some_and(|sid| sid == acct_id);
+        let st = evaluate_pool_quota(
+            acct_quota,
+            *pool,
+            cfg,
+            counts.writers,
+            counts.total,
+            is_selected,
+            now_ep,
+        );
+        let pfh = st.window_eta_json(pname, "fiveHour");
+        let pw = st.window_eta_json(pname, "weekly");
+        if let Some(ref fhv) = pfh {
+            let prio = eta_window_priority(fhv);
+            if best_five_hour.as_ref().is_none_or(|(bp, _)| prio < *bp) {
+                best_five_hour = Some((prio, fhv.clone()));
+            }
+        }
+        if let Some(ref wv) = pw {
+            let prio = eta_window_priority(wv);
+            if best_weekly.as_ref().is_none_or(|(bp, _)| prio < *bp) {
+                best_weekly = Some((prio, wv.clone()));
+            }
+        }
+        if pfh.is_some() || pw.is_some() {
+            let mut pe = json!({
+                "pool": pname,
+                "tier": st.tier.as_str(),
+            });
+            if let Some(fh) = pfh {
+                pe["fiveHour"] = fh;
+            }
+            if let Some(w) = pw {
+                pe["weekly"] = w;
+            }
+            pool_estimates.push(pe);
+        }
+    }
+
+    if best_five_hour.is_none() && best_weekly.is_none() && pool_estimates.is_empty() {
+        return Value::Null;
+    }
+    let mut obj = Map::new();
+    if let Some((_, fh)) = best_five_hour {
+        obj.insert("fiveHour".into(), fh);
+    }
+    if let Some((_, w)) = best_weekly {
+        obj.insert("weekly".into(), w);
+    }
+    if !pool_estimates.is_empty() {
+        obj.insert("pools".into(), Value::Array(pool_estimates));
+    }
+    Value::Object(obj)
+}
+
 /// Build a lightweight lock-free accounts/quota snapshot for advisory alerts in `state`
 /// without scanning `/proc` (isolated-state safe for unit/integration tests).
 pub fn quota_snapshot_for_alerts_in(state: &Path, now_ep: i64) -> Option<Value> {
@@ -1969,27 +2432,31 @@ pub fn quota_snapshot_for_alerts_in(state: &Path, now_ep: i64) -> Option<Value> 
         return None;
     }
     // Isolated state dir (e.g. unit/integration tests): build synthetic snapshot purely from `state`.
-    let mut acct_map = Map::new();
+    let mut acct_ids: Vec<String> = Vec::new();
     let mut active_id = String::new();
     if let Some(accts) = quota_cache["accounts"].as_object() {
         for (id, v) in accts {
             if b(v, "active") && active_id.is_empty() {
                 active_id = id.clone();
             }
-            acct_map.insert(id.clone(), json!({}));
+            acct_ids.push(id.clone());
         }
     }
-    if acct_map.is_empty() {
+    if acct_ids.is_empty() {
         return None;
     }
+    acct_ids.sort();
     if active_id.is_empty() {
-        if let Some(first) = acct_map.keys().next() {
-            active_id = first.clone();
-        }
+        active_id = acct_ids[0].clone();
     }
-    let usage_snap = crate::usage::accounts_usage_snapshot_in(state, &acct_map, &quota_cache, now_ep);
+    let cfg = AgyAutoSwitchConfig::default();
+    let running_tasks = count_running_pool_tasks(state, None);
+    let mut selected_by_pool = BTreeMap::new();
+    for pool in QuotaPool::ALL {
+        selected_by_pool.insert(pool, active_id.clone());
+    }
     let mut items = Vec::new();
-    for id in acct_map.keys() {
+    for id in &acct_ids {
         let mut item = json!({
             "id": id,
             "active": id == &active_id,
@@ -1997,31 +2464,110 @@ pub fn quota_snapshot_for_alerts_in(state: &Path, now_ep: i64) -> Option<Value> 
         if let Some(q) = enrich_quota_for_snapshot(&quota_cache["accounts"][id], now_ep) {
             item["quota"] = q;
         }
-        if let Some(view) = usage_snap.per_account.get(id) {
-            if !view.quota_estimate.is_null() {
-                item["quotaEstimate"] = view.quota_estimate.clone();
-            }
+        let qest = build_account_quota_estimate_json(
+            &quota_cache["accounts"][id],
+            &cfg,
+            &running_tasks,
+            id,
+            &selected_by_pool,
+            now_ep,
+        );
+        if !qest.is_null() {
+            item["quotaEstimate"] = qest;
         }
         items.push(item);
     }
-    Some(json!({ "active": active_id, "accounts": items }))
+    Some(json!({ "active": active_id, "mode": "fixed", "accounts": items }))
 }
 
 /// Format a prominent single-line warning for `delegate status` (advisory only).
 pub fn format_status_quota_warning_line(warnings: &[QuotaDepletionWarning]) -> Option<String> {
     let top = warnings.first()?;
-    let role = if top.active { "当前账号 " } else { "账号 " };
-    let rem = format_minutes_zh_short(top.remaining_minutes);
+    let eta = format_eta_zh_phrase(
+        top.fast_minutes,
+        top.remaining_minutes,
+        top.slow_minutes,
+        top.reset_in_seconds,
+    );
     let reset = format_reset_zh_short(top.reset_in_seconds);
     let extra = if warnings.len() > 1 {
         format!("；另有 {} 项也预计提前用完", warnings.len() - 1)
     } else {
         String::new()
     };
-    Some(format!(
-        "⚠ 额度预警：{role}{} 的 {} {}额度约 {}后用完（{}后重置；不自动换号，请手动切换）{extra}",
-        top.account_id, top.pool, top.window_label, rem, reset
-    ))
+    if top.auto_all_low && !top.pool_summary.is_empty() {
+        Some(format!(
+            "⚠ 额度预警：auto 模式 {} 池所有可用号均偏低（{}），{}额度{}（最早 {}后重置）{extra}",
+            top.pool, top.pool_summary, top.window_label, eta, reset
+        ))
+    } else {
+        let role = if top.active { "当前账号 " } else { "账号 " };
+        Some(format!(
+            "⚠ 额度预警：{role}{} 的 {} {}额度{}（{}后重置；可手动切号或启用 auto）{extra}",
+            top.account_id, top.pool, top.window_label, eta, reset
+        ))
+    }
+}
+
+fn format_cli_quota_estimate_line(label: &str, est: &Value) -> Option<String> {
+    if !est.is_object() {
+        return None;
+    }
+    let pool = short_pool_label(s(est, "pool"));
+    let basis = s(est, "basis");
+    let running = est["runningCount"].as_u64().unwrap_or(0);
+    let run_note = if running > 0 {
+        format!(", running {running}")
+    } else {
+        String::new()
+    };
+    let status = s(est, "status");
+    let detail = match status {
+        "depletes" => {
+            let mid_m = est["midMinutes"].as_u64().unwrap_or(0);
+            let fast_m = est["fastMinutes"].as_u64().unwrap_or(mid_m);
+            let slow_m = est["slowMinutes"].as_u64();
+            let reset_s = est["resetInSeconds"].as_u64().unwrap_or(u64::MAX);
+            let phrase = format_eta_zh_phrase(fast_m, mid_m, slow_m, reset_s);
+            let basis_note = if basis.is_empty() {
+                String::new()
+            } else {
+                format!("basis {basis}{run_note}")
+            };
+            if basis_note.is_empty() {
+                phrase
+            } else {
+                format!("{phrase} ({basis_note})")
+            }
+        }
+        "safe" => {
+            if basis.is_empty() {
+                "重置前够用".to_string()
+            } else {
+                format!("重置前够用 (basis {basis}{run_note})")
+            }
+        }
+        "idle" => "空闲（无在跑任务）".to_string(),
+        "insufficient" => {
+            let reason = s(est, "reason");
+            match reason {
+                "too_early" => {
+                    let em = est["elapsedMinutes"].as_u64().unwrap_or(0);
+                    let pct = est["remainingPct"].as_f64().unwrap_or(100.0);
+                    format!(
+                        "刚重置 {}（剩 {pct:.0}%），数据不足暂不外推",
+                        format_minutes_zh_short(em)
+                    )
+                }
+                "not_started" => "尚未使用（剩 100%），暂不外推".to_string(),
+                "stale" => "缓存已过期，暂不外推".to_string(),
+                "reset_passed" => "已过重置时间，待下次刷新".to_string(),
+                _ => "数据不足，暂不外推".to_string(),
+            }
+        }
+        _ => return None,
+    };
+    Some(format!("  {label} estimate ({pool}): {detail}"))
 }
 
 fn snapshot_json_opts(scan_procs: bool) -> Value {
@@ -2044,13 +2590,90 @@ fn snapshot_json_opts(scan_procs: bool) -> Value {
     let empty_map = Map::new();
     let accounts_map = state["accounts"].as_object().unwrap_or(&empty_map);
     let usage_snap = if !accounts_map.is_empty() || crate::usage::ledger_path().is_file() {
-        Some(crate::usage::accounts_usage_snapshot(
-            accounts_map,
-            &quota_cache,
-        ))
+        Some(crate::usage::accounts_usage_snapshot(accounts_map))
     } else {
         None
     };
+
+    let auto_cfg = load_agy_auto_switch_config();
+    let auto_mode = is_auto_mode_state(&state);
+    let state_root = state_dir();
+    let pool_cur = load_pool_current_in(&state_root);
+    let running_tasks = count_running_pool_tasks(&state_root, None);
+    let running_writers: BTreeMap<(String, QuotaPool), usize> = running_tasks
+        .iter()
+        .filter_map(|(k, c)| (c.writers > 0).then_some((k.clone(), c.writers)))
+        .collect();
+
+    let mut pool_cur_json = Map::new();
+    let mut pool_summary_json = Map::new();
+    let mut selected_by_pool: BTreeMap<QuotaPool, String> = BTreeMap::new();
+    let mut auto_eval_state = state.clone();
+    auto_eval_state["mode"] = json!(AUTO_ACCOUNT_ID);
+    for pool in QuotaPool::ALL {
+        let cur = pool_cur
+            .get(&pool)
+            .filter(|id| state["accounts"].get(id.as_str()).is_some())
+            .cloned()
+            .or_else(|| active_id.clone());
+        if let Some(id) = cur {
+            pool_cur_json.insert(pool.key().to_string(), json!(id));
+        }
+        let probe_model = match pool {
+            QuotaPool::Gemini => "agy/gemini",
+            QuotaPool::ClaudeGpt => "agy/claude",
+        };
+        let dec = select_account_for_new_session(
+            &root,
+            &auto_eval_state,
+            &quota_cache,
+            &pool_cur,
+            &running_writers,
+            probe_model,
+            &auto_cfg,
+            now_ep,
+        );
+        let cur_id = dec.current_before.clone().unwrap_or_default();
+        let sel_id = dec.selected_id.clone().unwrap_or_default();
+        let effective_sel = if auto_mode {
+            (!sel_id.is_empty()).then_some(sel_id.clone()).or_else(|| active_id.clone())
+        } else {
+            active_id.clone()
+        };
+        if let Some(sid) = effective_sel {
+            selected_by_pool.insert(pool, sid);
+        }
+        let sel_eval = if !sel_id.is_empty() {
+            let counts = running_tasks
+                .get(&(sel_id.clone(), pool))
+                .copied()
+                .unwrap_or_default();
+            Some(evaluate_pool_quota(
+                &quota_cache["accounts"][&sel_id],
+                pool,
+                &auto_cfg,
+                counts.writers,
+                counts.total,
+                true,
+                now_ep,
+            ))
+        } else {
+            None
+        };
+        pool_summary_json.insert(
+            pool.key().to_string(),
+            json!({
+                "pool": pool.key(),
+                "label": pool.short_label(),
+                "current": cur_id,
+                "selected": sel_id,
+                "tier": sel_eval.as_ref().map(|e| e.tier.as_str()).unwrap_or("green"),
+                "tierLabel": sel_eval.as_ref().map(|e| e.tier.label_zh()).unwrap_or("绿"),
+                "wouldSwitch": dec.switched.is_some(),
+                "reason": dec.reason,
+            }),
+        );
+    }
 
     let mut items: Vec<Value> = Vec::new();
     let mut active_email = String::new();
@@ -2103,9 +2726,17 @@ fn snapshot_json_opts(scan_procs: bool) -> Value {
                 if !view.quota_note.is_null() {
                     item["quotaNote"] = view.quota_note.clone();
                 }
-                if !view.quota_estimate.is_null() {
-                    item["quotaEstimate"] = view.quota_estimate.clone();
-                }
+            }
+            let qest = build_account_quota_estimate_json(
+                &quota_cache["accounts"][id],
+                &auto_cfg,
+                &running_tasks,
+                id,
+                &selected_by_pool,
+                now_ep,
+            );
+            if !qest.is_null() {
+                item["quotaEstimate"] = qest;
             }
             items.push(item);
         }
@@ -2127,60 +2758,6 @@ fn snapshot_json_opts(scan_procs: bool) -> Value {
         None
     };
 
-    let auto_cfg = load_agy_auto_switch_config();
-    let auto_mode = is_auto_mode_state(&state);
-    let state_root = state_dir();
-    let pool_cur = load_pool_current_in(&state_root);
-    let running_writers = count_running_writers(&state_root, None);
-    let mut pool_cur_json = Map::new();
-    let mut pool_summary_json = Map::new();
-    let mut auto_eval_state = state.clone();
-    auto_eval_state["mode"] = json!(AUTO_ACCOUNT_ID);
-    for pool in QuotaPool::ALL {
-        let cur = pool_cur
-            .get(&pool)
-            .filter(|id| state["accounts"].get(id.as_str()).is_some())
-            .cloned()
-            .or_else(|| active_id.clone());
-        if let Some(id) = cur {
-            pool_cur_json.insert(pool.key().to_string(), json!(id));
-        }
-        let probe_model = match pool {
-            QuotaPool::Gemini => "agy/gemini",
-            QuotaPool::ClaudeGpt => "agy/claude",
-        };
-        let dec = select_account_for_new_session(
-            &root,
-            &auto_eval_state,
-            &quota_cache,
-            &pool_cur,
-            &running_writers,
-            probe_model,
-            &auto_cfg,
-            now_ep,
-        );
-        let cur_id = dec.current_before.clone().unwrap_or_default();
-        let sel_id = dec.selected_id.clone().unwrap_or_default();
-        let sel_eval = if !sel_id.is_empty() {
-            let k = running_writers.get(&(sel_id.clone(), pool)).copied().unwrap_or(0);
-            Some(evaluate_slot_pool(&quota_cache["accounts"][&sel_id], pool, &auto_cfg, k, now_ep))
-        } else {
-            None
-        };
-        pool_summary_json.insert(
-            pool.key().to_string(),
-            json!({
-                "pool": pool.key(),
-                "label": pool.short_label(),
-                "current": cur_id,
-                "selected": sel_id,
-                "tier": sel_eval.as_ref().map(|e| e.tier.as_str()).unwrap_or("green"),
-                "tierLabel": sel_eval.as_ref().map(|e| e.tier.label_zh()).unwrap_or("绿"),
-                "wouldSwitch": dec.switched.is_some(),
-                "reason": dec.reason,
-            }),
-        );
-    }
     let mut auto_switch_json = auto_cfg.to_json();
     auto_switch_json["enabled"] = json!(auto_mode);
     auto_switch_json["mode"] = json!(if auto_mode { "auto" } else { "fixed" });
@@ -2533,6 +3110,7 @@ pub fn classify_model_pool(model: &str) -> Option<QuotaPool> {
 
 /// Unified matcher used by `agy_accounts`, `usage`, and `review` to check whether a model
 /// belongs to a `/usage` quota pool.
+#[cfg(test)]
 pub fn model_matches_pool(model: &str, pool: &str) -> bool {
     match (classify_model_pool(model), classify_quota_pool_name(pool)) {
         (Some(a), Some(b)) => a == b,
@@ -2566,19 +3144,64 @@ impl QuotaTier {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuotaWindow {
+    FiveHour,
+    Weekly,
+}
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct PoolQuotaEval {
+pub enum QuotaEta {
+    /// Window not started (100% / resetAt=1970-01-01), already reset, stale cache,
+    /// missing resetAt, or too early in the current cycle to extrapolate safely.
+    Insufficient {
+        reason: &'static str,
+        elapsed_mins: Option<u64>,
+    },
+    /// No active burn on this pool right now.
+    Idle,
+    /// Projected to last past `resetAt` (or negligible weekly drop < 3%).
+    SafeBeforeReset {
+        basis_label: String,
+    },
+    /// Projected to deplete before `resetAt`.
+    DepletesIn {
+        fast_m: u64,
+        mid_m: u64,
+        /// `None` when the slow/optimistic bound reaches or exceeds `resetAt` (`~重置前`).
+        slow_m: Option<u64>,
+        /// True when all Step ⑤ alarm gates pass (`k_run > 0`, `mid < 0.85 * reset`, pct/rate gate).
+        alert: bool,
+        basis_label: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunningPoolCounts {
+    pub writers: usize,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PoolQuotaState {
     pub tier: QuotaTier,
     pub raw_five_hour_pct: Option<f64>,
     pub eff_five_hour_pct: Option<f64>,
     pub weekly_pct: Option<f64>,
+    pub observed_five_hour_pct: Option<f64>,
+    pub observed_weekly_pct: Option<f64>,
+    pub reset_in_five_hour_secs: Option<i64>,
+    pub reset_in_weekly_secs: Option<i64>,
     pub running_writers: usize,
+    pub running_all: usize,
     pub passive_exhausted: bool,
     pub unknown: bool,
     pub cache_age_secs: Option<i64>,
+    pub eta_five_hour: QuotaEta,
+    pub eta_weekly: QuotaEta,
 }
 
-impl PoolQuotaEval {
+impl PoolQuotaState {
     pub fn to_quota_json(&self) -> Value {
         let mut obj = Map::new();
         if let Some(v) = self.eff_five_hour_pct {
@@ -2600,6 +3223,78 @@ impl PoolQuotaEval {
             obj.insert("passiveExhausted".into(), json!(true));
         }
         Value::Object(obj)
+    }
+
+    pub fn window_eta_json(&self, pool_name: &str, window: &str) -> Option<Value> {
+        let (eta, raw_pct, eff_pct, reset_secs) = match window {
+            "fiveHour" => (
+                &self.eta_five_hour,
+                self.raw_five_hour_pct.or(self.observed_five_hour_pct),
+                self.eff_five_hour_pct.or(self.observed_five_hour_pct),
+                self.reset_in_five_hour_secs,
+            ),
+            "weekly" => (
+                &self.eta_weekly,
+                self.weekly_pct.or(self.observed_weekly_pct),
+                self.weekly_pct.or(self.observed_weekly_pct),
+                self.reset_in_weekly_secs,
+            ),
+            _ => return None,
+        };
+        if raw_pct.is_none() && matches!(eta, QuotaEta::Insufficient { reason: "no_data", .. }) {
+            return None;
+        }
+        let mut obj = Map::new();
+        obj.insert("pool".into(), json!(pool_name));
+        obj.insert("source".into(), json!("real"));
+        obj.insert("tier".into(), json!(self.tier.as_str()));
+        obj.insert("runningWriters".into(), json!(self.running_writers));
+        obj.insert("runningCount".into(), json!(self.running_all));
+        if let Some(p) = raw_pct {
+            obj.insert("remainingPct".into(), json!((p * 100.0).round() / 100.0));
+        }
+        if let Some(ep) = eff_pct {
+            obj.insert("effectivePct".into(), json!((ep * 100.0).round() / 100.0));
+        }
+        if let Some(rs) = reset_secs.filter(|&s| s > 0) {
+            obj.insert("resetInSeconds".into(), json!(rs));
+        }
+        match eta {
+            QuotaEta::Insufficient {
+                reason,
+                elapsed_mins,
+            } => {
+                obj.insert("status".into(), json!("insufficient"));
+                obj.insert("reason".into(), json!(reason));
+                if let Some(em) = elapsed_mins {
+                    obj.insert("elapsedMinutes".into(), json!(em));
+                }
+            }
+            QuotaEta::Idle => {
+                obj.insert("status".into(), json!("idle"));
+            }
+            QuotaEta::SafeBeforeReset { basis_label } => {
+                obj.insert("status".into(), json!("safe"));
+                obj.insert("basis".into(), json!(basis_label));
+            }
+            QuotaEta::DepletesIn {
+                fast_m,
+                mid_m,
+                slow_m,
+                alert,
+                basis_label,
+            } => {
+                obj.insert("status".into(), json!("depletes"));
+                obj.insert("alert".into(), json!(alert));
+                obj.insert("fastMinutes".into(), json!(fast_m));
+                obj.insert("midMinutes".into(), json!(mid_m));
+                if let Some(sm) = slow_m {
+                    obj.insert("slowMinutes".into(), json!(sm));
+                }
+                obj.insert("basis".into(), json!(basis_label));
+            }
+        }
+        Some(Value::Object(obj))
     }
 
     fn format_short(&self) -> String {
@@ -3098,24 +3793,381 @@ pub fn check_slot_health(
     Ok(())
 }
 
-/// Evaluate one account slot's quota tier for `pool` at `now_ep`, applying:
-/// - `resetAt` + 60s clock-skew buffer (post-reset entries treated as unknown, never hardcoded 100%)
-/// - staleness decay (non-passive 5h > 2h or 7d > 24h treated as unknown)
-/// - `passive_error` hard Red until its `resetAt + 60s`
-/// - virtual concurrency reserve (`eff_5h = raw_5h - perRunReservePct * running_writers`) for Green tier.
-pub fn evaluate_slot_pool(
+fn extract_pool_window_history(
+    acct_quota: &Value,
+    pool: QuotaPool,
+    window: QuotaWindow,
+) -> Vec<(i64, f64, Option<i64>)> {
+    let (win_key, reset_key) = match window {
+        QuotaWindow::FiveHour => ("fiveHour", "fiveHourResetEp"),
+        QuotaWindow::Weekly => ("weekly", "weeklyResetEp"),
+    };
+    let mut pts: Vec<(i64, f64, Option<i64>)> = Vec::new();
+    let Some(hist) = acct_quota["history"].as_array() else {
+        return pts;
+    };
+    for item in hist {
+        let ep = item["epoch"].as_i64().unwrap_or(0);
+        if ep <= 0 {
+            continue;
+        }
+        let mut pct_opt: Option<f64> = None;
+        let mut rep_opt: Option<i64> = None;
+        if let Some(pools_obj) = item["pools"].as_object() {
+            for (pname, pval) in pools_obj {
+                if classify_quota_pool_name(pname) != Some(pool) {
+                    continue;
+                }
+                if let Some(v) = pval[win_key].as_f64().filter(|v| v.is_finite()) {
+                    let take = pct_opt.is_none_or(|cur| v < cur);
+                    if take {
+                        pct_opt = Some(v);
+                        rep_opt = pval[reset_key].as_i64();
+                    }
+                }
+            }
+        }
+        if let Some(pct) = pct_opt {
+            pts.push((ep, pct, rep_opt));
+        }
+    }
+    pts.sort_by_key(|(ep, _, _)| *ep);
+    pts
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_window_eta(
+    acct_quota: &Value,
+    pool: QuotaPool,
+    window: QuotaWindow,
+    obs_meta: Option<(f64, i64, Option<i64>)>,
+    eff_pct_override: Option<f64>,
+    passive_exhausted: bool,
+    passive_reset_ep: Option<i64>,
+    k_run: usize,
+    is_selected_for_pool: bool,
+    now_ep: i64,
+) -> QuotaEta {
+    if passive_exhausted && window == QuotaWindow::FiveHour {
+        let reset_in = passive_reset_ep
+            .map(|r| (r - now_ep).max(0))
+            .unwrap_or(PASSIVE_SYNTH_RESET_SECS);
+        if reset_in == 0 {
+            return QuotaEta::Insufficient {
+                reason: "reset_passed",
+                elapsed_mins: None,
+            };
+        }
+        return QuotaEta::DepletesIn {
+            fast_m: 0,
+            mid_m: 0,
+            slow_m: Some(0),
+            alert: true,
+            basis_label: "passive".to_string(),
+        };
+    }
+
+    let Some((raw_pct, entry_ep, reset_ep_opt)) = obs_meta else {
+        return QuotaEta::Insufficient {
+            reason: "no_data",
+            elapsed_mins: None,
+        };
+    };
+
+    // Step ①: resetAt truncation & freshness gate.
+    let Some(rep) = reset_ep_opt else {
+        return QuotaEta::Insufficient {
+            reason: "no_reset_at",
+            elapsed_mins: None,
+        };
+    };
+    if rep <= 0 {
+        return if k_run == 0 {
+            QuotaEta::Idle
+        } else {
+            QuotaEta::Insufficient {
+                reason: "not_started",
+                elapsed_mins: Some(0),
+            }
+        };
+    }
+    if now_ep >= rep + RESET_AT_BUFFER_SECS {
+        return QuotaEta::Insufficient {
+            reason: "reset_passed",
+            elapsed_mins: None,
+        };
+    }
+    if now_ep >= rep {
+        return QuotaEta::SafeBeforeReset {
+            basis_label: "window".to_string(),
+        };
+    }
+    let reset_in_secs = (rep - now_ep).max(0);
+    if entry_ep <= 0 {
+        return QuotaEta::Insufficient {
+            reason: "no_data",
+            elapsed_mins: None,
+        };
+    }
+    let age_secs = (now_ep - entry_ep).max(0);
+    let max_stale = match window {
+        QuotaWindow::FiveHour => FIVE_HOUR_STALE_SECS,
+        QuotaWindow::Weekly => ETA_WEEKLY_STALE_SECS,
+    };
+    if age_secs > max_stale {
+        return QuotaEta::Insufficient {
+            reason: "stale",
+            elapsed_mins: None,
+        };
+    }
+
+    // Already at 0% before reset.
+    if raw_pct <= 0.0 {
+        if k_run == 0 && !is_selected_for_pool {
+            return QuotaEta::Idle;
+        }
+        return QuotaEta::DepletesIn {
+            fast_m: 0,
+            mid_m: 0,
+            slow_m: Some(0),
+            alert: k_run > 0 || is_selected_for_pool,
+            basis_label: "window".to_string(),
+        };
+    }
+
+    let window_secs = match window {
+        QuotaWindow::FiveHour => FIVE_HOUR_WINDOW_SECS,
+        QuotaWindow::Weekly => WEEKLY_WINDOW_SECS,
+    };
+    let t_start = rep - window_secs;
+    let elapsed_obs_secs = (entry_ep - t_start).max(0);
+    let elapsed_wall_mins = ((now_ep - t_start).max(0) / 60) as u64;
+
+    // Step ②: Same-cycle history & insufficient-data gate.
+    match window {
+        QuotaWindow::FiveHour => {
+            if elapsed_obs_secs < 25 * 60 {
+                return QuotaEta::Insufficient {
+                    reason: "too_early",
+                    elapsed_mins: Some(elapsed_wall_mins),
+                };
+            }
+        }
+        QuotaWindow::Weekly => {
+            if elapsed_obs_secs < 12 * 3600 && raw_pct > 35.0 {
+                return QuotaEta::Insufficient {
+                    reason: "too_early",
+                    elapsed_mins: Some(elapsed_wall_mins),
+                };
+            }
+        }
+    }
+
+    let mut obs: Vec<(i64, f64, Option<i64>)> = extract_pool_window_history(acct_quota, pool, window)
+        .into_iter()
+        .filter(|(ep, _, _)| *ep <= entry_ep)
+        .collect();
+    if let Some(last) = obs.last_mut() {
+        if (entry_ep - last.0).abs() <= 10 {
+            *last = (entry_ep, raw_pct, Some(rep));
+        } else {
+            obs.push((entry_ep, raw_pct, Some(rep)));
+        }
+    } else {
+        obs.push((entry_ep, raw_pct, Some(rep)));
+    }
+
+    let mut cycle_rev: Vec<(i64, f64)> = vec![(entry_ep, raw_pct)];
+    let mut next_pct = raw_pct;
+    for &(ep, pct, pt_rep) in obs.iter().rev().skip(1) {
+        if ep < t_start - SAME_CYCLE_TOLERANCE_SECS {
+            break;
+        }
+        match pt_rep {
+            Some(r) => {
+                if r <= 0 || (r - rep).abs() > SAME_CYCLE_TOLERANCE_SECS {
+                    break;
+                }
+            }
+            None => {
+                if ep < t_start || pct < next_pct - 1.5 {
+                    break;
+                }
+            }
+        }
+        cycle_rev.push((ep, pct));
+        next_pct = pct;
+    }
+    cycle_rev.reverse();
+
+    let recent_step_drop = if cycle_rev.len() >= 2 {
+        Some(cycle_rev[cycle_rev.len() - 2].1 - raw_pct)
+    } else {
+        Some((100.0 - raw_pct).max(0.0))
+    };
+
+    if cycle_rev.is_empty() || t_start < cycle_rev[0].0 {
+        cycle_rev.insert(0, (t_start, 100.0));
+    }
+
+    // Step ③: Idle gate (respects multi-machine remote drop when local k_run == 0).
+    let no_recent_drop = recent_step_drop.is_none_or(|d| d <= 0.0);
+    if k_run == 0 && (no_recent_drop || age_secs >= 20 * 60 || !is_selected_for_pool) {
+        return QuotaEta::Idle;
+    }
+
+    // Step ④: Recent-window slope + uncertainty interval [T_fast, T_slow].
+    let (anc_dt, anc_pct, basis_label) = match window {
+        QuotaWindow::FiveHour => {
+            let best = cycle_rev
+                .iter()
+                .filter_map(|&(ep, pct)| {
+                    let dt = entry_ep - ep;
+                    (20 * 60..=60 * 60)
+                        .contains(&dt)
+                        .then_some(((dt - 30 * 60).abs(), dt, pct))
+                })
+                .min_by_key(|(dist, _, _)| *dist)
+                .or_else(|| {
+                    cycle_rev
+                        .iter()
+                        .filter_map(|&(ep, pct)| {
+                            let dt = entry_ep - ep;
+                            (dt >= 20 * 60).then_some((dt, dt, pct))
+                        })
+                        .min_by_key(|(dt, _, _)| *dt)
+                });
+            let Some((_, dt, pct)) = best else {
+                return QuotaEta::Insufficient {
+                    reason: "too_early",
+                    elapsed_mins: Some(elapsed_wall_mins),
+                };
+            };
+            let lbl = if dt <= 45 * 60 {
+                "30m"
+            } else if dt <= 90 * 60 {
+                "1h"
+            } else {
+                "window"
+            };
+            (dt, pct, lbl.to_string())
+        }
+        QuotaWindow::Weekly => {
+            let best = cycle_rev
+                .iter()
+                .filter_map(|&(ep, pct)| {
+                    let dt = entry_ep - ep;
+                    (dt >= 6 * 3600).then_some(((dt - 24 * 3600).abs(), dt, pct))
+                })
+                .min_by_key(|(dist, _, _)| *dist)
+                .or_else(|| {
+                    cycle_rev
+                        .iter()
+                        .filter_map(|&(ep, pct)| {
+                            let dt = entry_ep - ep;
+                            (dt >= 30 * 60).then_some((dt, dt, pct))
+                        })
+                        .max_by_key(|(dt, _, _)| *dt)
+                });
+            let Some((_, dt, pct)) = best else {
+                return QuotaEta::Insufficient {
+                    reason: "too_early",
+                    elapsed_mins: Some(elapsed_wall_mins),
+                };
+            };
+            let lbl = if dt >= 18 * 3600 { "24h" } else { "window" };
+            (dt, pct, lbl.to_string())
+        }
+    };
+
+    let drop = (anc_pct - raw_pct).max(0.0);
+    if window == QuotaWindow::Weekly && drop < 3.0 {
+        return QuotaEta::SafeBeforeReset { basis_label };
+    }
+    let dt_h = (anc_dt as f64 / 3600.0).max(1.0 / 60.0);
+    let r_rec = drop / dt_h;
+    if r_rec <= 0.0 || !r_rec.is_finite() {
+        return QuotaEta::SafeBeforeReset { basis_label };
+    }
+
+    let elapsed_h = (elapsed_obs_secs as f64 / 3600.0).max(1.0 / 60.0);
+    let r_win = (100.0 - raw_pct).max(0.0) / elapsed_h;
+    let age_h = age_secs as f64 / 3600.0;
+    let reset_in_h = reset_in_secs as f64 / 3600.0;
+
+    let t_mid_h = (raw_pct / r_rec - age_h).max(0.0);
+    if t_mid_h >= reset_in_h {
+        return QuotaEta::SafeBeforeReset { basis_label };
+    }
+
+    let eff_pct = eff_pct_override.unwrap_or(raw_pct);
+    let r_fast = (r_rec + 1.0 / dt_h).max(r_win).max(r_rec);
+    let t_fast_h = (eff_pct / r_fast).max(0.0).min(t_mid_h);
+
+    let r_slow_floor = match window {
+        QuotaWindow::FiveHour => 0.2,
+        QuotaWindow::Weekly => 0.05,
+    };
+    let r_slow_rec = ((drop - 1.0).max(0.0) / dt_h).max(r_slow_floor);
+    let r_slow = if r_win > 0.0 {
+        r_slow_rec.min(r_win.max(r_slow_floor))
+    } else {
+        r_slow_rec
+    };
+    let t_slow_h = (raw_pct / r_slow - age_h).max(t_mid_h);
+
+    let reset_in_mins = (reset_in_secs / 60).max(1) as u64;
+    let cap_mins = reset_in_mins.saturating_sub(1);
+    let mid_m = ((t_mid_h * 60.0).round().max(0.0) as u64).min(cap_mins);
+    let fast_m = ((t_fast_h * 60.0).round().max(0.0) as u64).min(mid_m);
+    let slow_m = if t_slow_h >= reset_in_h {
+        None
+    } else {
+        Some(((t_slow_h * 60.0).round().max(mid_m as f64) as u64).min(cap_mins))
+    };
+
+    // Step ⑤: High-margin anti-false-alarm gate.
+    let under_reset_margin = t_mid_h < 0.85 * reset_in_h;
+    let under_pct_gate = match window {
+        QuotaWindow::FiveHour => eff_pct <= 50.0 || (raw_pct <= 75.0 && r_rec >= 40.0),
+        QuotaWindow::Weekly => raw_pct <= 40.0,
+    };
+    let alert = k_run > 0 && under_reset_margin && under_pct_gate;
+
+    QuotaEta::DepletesIn {
+        fast_m,
+        mid_m,
+        slow_m,
+        alert,
+        basis_label,
+    }
+}
+
+/// Unified single-pool quota evaluator shared by `auto` account selection and depletion forecasting:
+/// - Auto-switch reads `tier` (`Green` / `Yellow` / `Red`), `eff_five_hour_pct`, `weekly_pct`, `unknown`
+///   using the unchanged 5h/7d staleness (`2h` / `24h`), `resetAt + 60s` buffer, `passive_error`, and `5% * k_write` reserve.
+/// - Depletion forecasting reads `eta_five_hour` / `eta_weekly`, computed purely from same-cycle `/usage`
+///   percentage history (`resetAt`-isolated), local running counts (`k_write`, `k_run`), and `12h` weekly ETA freshness.
+pub fn evaluate_pool_quota(
     acct_quota: &Value,
     pool: QuotaPool,
     cfg: &AgyAutoSwitchConfig,
     running_writers: usize,
+    running_all: usize,
+    is_selected_for_pool: bool,
     now_ep: i64,
-) -> PoolQuotaEval {
+) -> PoolQuotaState {
     let acct_fetched_ep = acct_quota["fetchedEpoch"].as_i64().unwrap_or(0);
     let cache_age_secs = (acct_fetched_ep > 0).then(|| (now_ep - acct_fetched_ep).max(0));
 
     let mut raw_5h: Option<f64> = None;
     let mut weekly: Option<f64> = None;
     let mut passive_exhausted = false;
+    let mut passive_reset_ep: Option<i64> = None;
+
+    // Track full observation metadata `(pct, entry_ep, reset_ep)` for ETA (before stale/reset skip).
+    let mut eta_obs_5h: Option<(f64, i64, Option<i64>)> = None;
+    let mut eta_obs_7d: Option<(f64, i64, Option<i64>)> = None;
 
     if let Some(entries) = acct_quota["entries"].as_array() {
         for entry in entries {
@@ -3141,8 +4193,21 @@ pub fn evaluate_slot_pool(
                 if !expired {
                     passive_exhausted = true;
                     raw_5h = Some(0.0);
+                    passive_reset_ep = reset_ep.or_else(|| {
+                        (entry_ep > 0).then_some(entry_ep + PASSIVE_SYNTH_RESET_SECS)
+                    });
                 }
                 continue;
+            }
+
+            match s(entry, "window") {
+                "fiveHour" if eta_obs_5h.is_none_or(|(prev, _, _)| pct < prev) => {
+                    eta_obs_5h = Some((pct, entry_ep, reset_ep));
+                }
+                "weekly" if eta_obs_7d.is_none_or(|(prev, _, _)| pct < prev) => {
+                    eta_obs_7d = Some((pct, entry_ep, reset_ep));
+                }
+                _ => {}
             }
 
             // Past resetAt (+ 60s clock-skew buffer) -> treat window as unknown (not hardcoded 100%).
@@ -3198,36 +4263,105 @@ pub fn evaluate_slot_pool(
         QuotaTier::Red
     };
 
-    PoolQuotaEval {
+    let reset_in_five_hour_secs = if passive_exhausted {
+        passive_reset_ep.map(|r| (r - now_ep).max(0))
+    } else {
+        eta_obs_5h
+            .and_then(|(_, _, rep)| rep)
+            .filter(|&r| r > 0)
+            .map(|r| (r - now_ep).max(0))
+    };
+    let reset_in_weekly_secs = eta_obs_7d
+        .and_then(|(_, _, rep)| rep)
+        .filter(|&r| r > 0)
+        .map(|r| (r - now_ep).max(0));
+
+    let eff_5h_for_eta = eff_5h.or_else(|| {
+        eta_obs_5h.map(|(pct, _, _)| (pct - cfg.per_run_reserve_pct * running_writers as f64).max(0.0))
+    });
+
+    let eta_five_hour = compute_window_eta(
+        acct_quota,
+        pool,
+        QuotaWindow::FiveHour,
+        eta_obs_5h,
+        eff_5h_for_eta,
+        passive_exhausted,
+        passive_reset_ep,
+        running_all,
+        is_selected_for_pool,
+        now_ep,
+    );
+    let eta_weekly = compute_window_eta(
+        acct_quota,
+        pool,
+        QuotaWindow::Weekly,
+        eta_obs_7d,
+        None,
+        false,
+        None,
+        running_all,
+        is_selected_for_pool,
+        now_ep,
+    );
+
+    PoolQuotaState {
         tier,
         raw_five_hour_pct: raw_5h,
         eff_five_hour_pct: eff_5h,
         weekly_pct: weekly,
+        observed_five_hour_pct: raw_5h.or_else(|| eta_obs_5h.map(|(p, _, _)| p)),
+        observed_weekly_pct: weekly.or_else(|| eta_obs_7d.map(|(p, _, _)| p)),
+        reset_in_five_hour_secs,
+        reset_in_weekly_secs,
         running_writers,
+        running_all,
         passive_exhausted,
         unknown,
         cache_age_secs,
+        eta_five_hour,
+        eta_weekly,
     }
 }
 
-/// Count currently running `agy` write runs on this machine grouped by `(account_id, pool)`.
+/// Convenience wrapper for auto-switch tier evaluation (uses the same `PoolQuotaState`).
+pub fn evaluate_slot_pool(
+    acct_quota: &Value,
+    pool: QuotaPool,
+    cfg: &AgyAutoSwitchConfig,
+    running_writers: usize,
+    now_ep: i64,
+) -> PoolQuotaState {
+    evaluate_pool_quota(
+        acct_quota,
+        pool,
+        cfg,
+        running_writers,
+        running_writers,
+        true,
+        now_ep,
+    )
+}
+
+/// Count currently running `agy` tasks on this machine grouped by `(account_id, pool)`:
+/// - `writers`: active write runs (`mode == "write"`, excluding `.waiting` and `.scouting`) — used for 5% reserve.
+/// - `total`: all active `agy` runs (excluding `.waiting`) — used for ETA idle/alert gating.
+///
 /// Pure helper over an explicit run directory list (read-only; never mutates `.slot` files).
-pub fn count_running_writers_in(
+pub fn count_running_pool_tasks_in(
     runs: &[PathBuf],
     exclude_run: Option<&Path>,
-) -> BTreeMap<(String, QuotaPool), usize> {
-    let mut counts: BTreeMap<(String, QuotaPool), usize> = BTreeMap::new();
+) -> BTreeMap<(String, QuotaPool), RunningPoolCounts> {
+    let mut counts: BTreeMap<(String, QuotaPool), RunningPoolCounts> = BTreeMap::new();
     for run in runs {
         if exclude_run.is_some_and(|ex| ex == run.as_path()) {
             continue;
         }
-        if run.join(".waiting").exists() || run.join(".scouting").exists() {
+        if run.join(".waiting").exists() {
             continue;
         }
+        let is_scouting = run.join(".scouting").exists();
         let meta = json(run.join("meta.json"));
-        if s(&meta, "mode") != "write" {
-            continue;
-        }
         let model = s(&meta, "model");
         if !crate::agy::is_agy(model) && s(&meta, "agent") != crate::agy::BIN {
             continue;
@@ -3237,10 +4371,33 @@ pub fn count_running_writers_in(
             continue;
         }
         if let Some(pool) = classify_model_pool(model) {
-            *counts.entry((acct.to_string(), pool)).or_insert(0) += 1;
+            let entry = counts.entry((acct.to_string(), pool)).or_default();
+            entry.total += 1;
+            if !is_scouting && s(&meta, "mode") == "write" {
+                entry.writers += 1;
+            }
         }
     }
     counts
+}
+
+pub fn count_running_pool_tasks(
+    state_root: &Path,
+    exclude_run: Option<&Path>,
+) -> BTreeMap<(String, QuotaPool), RunningPoolCounts> {
+    let runs = crate::launch::machine_runs(state_root);
+    count_running_pool_tasks_in(&runs, exclude_run)
+}
+
+/// Count currently running `agy` write runs on this machine grouped by `(account_id, pool)`.
+pub fn count_running_writers_in(
+    runs: &[PathBuf],
+    exclude_run: Option<&Path>,
+) -> BTreeMap<(String, QuotaPool), usize> {
+    count_running_pool_tasks_in(runs, exclude_run)
+        .into_iter()
+        .filter_map(|(k, c)| (c.writers > 0).then_some((k, c.writers)))
+        .collect()
 }
 
 pub fn count_running_writers(
@@ -3281,7 +4438,7 @@ pub struct AutoSwitchDecision {
     pub reason: String,
 }
 
-fn red_tiebreak_key(eval: &PoolQuotaEval) -> (bool, i64) {
+fn red_tiebreak_key(eval: &PoolQuotaState) -> (bool, i64) {
     if eval.passive_exhausted {
         return (false, 0);
     }
@@ -3516,14 +4673,14 @@ pub fn select_account_for_new_session(
         })
         .unwrap_or_else(|| healthy[0].clone());
 
-    let eval_of = |id: &str| -> PoolQuotaEval {
+    let eval_of = |id: &str| -> PoolQuotaState {
         let k = running_writers.get(&(id.to_string(), pool)).copied().unwrap_or(0);
         evaluate_slot_pool(&quota_cache["accounts"][id], pool, cfg, k, now_ep)
     };
     let cur_eval = eval_of(&current_id);
 
     // 1. Look for candidates with STRICTLY higher tier (`tier(other) > tier(current)`).
-    let mut higher: Vec<(String, PoolQuotaEval)> = healthy
+    let mut higher: Vec<(String, PoolQuotaState)> = healthy
         .iter()
         .filter(|id| *id != &current_id)
         .map(|id| (id.clone(), eval_of(id)))
@@ -3580,7 +4737,7 @@ pub fn select_account_for_new_session(
     // 2. Both/all are Red: pick strictly better `(5h > 0, min(5h, 7d))`.
     if cur_eval.tier == QuotaTier::Red {
         let cur_key = red_tiebreak_key(&cur_eval);
-        let mut better_red: Vec<(String, PoolQuotaEval, (bool, i64))> = healthy
+        let mut better_red: Vec<(String, PoolQuotaState, (bool, i64))> = healthy
             .iter()
             .filter(|id| *id != &current_id)
             .map(|id| {
@@ -3671,7 +4828,7 @@ pub fn select_handoff_target_in(
             .into_iter()
             .find(|id| !slot_has_any_zero_entry(&quota_cache["accounts"][id.as_str()], now_ep));
     };
-    let mut scored: Vec<(String, PoolQuotaEval)> = candidates
+    let mut scored: Vec<(String, PoolQuotaState)> = candidates
         .into_iter()
         .map(|id| {
             let k = running_writers.get(&(id.clone(), pool)).copied().unwrap_or(0);
@@ -4789,18 +5946,8 @@ fn cmd_status(args: &[String]) -> Res<i32> {
         }
         if cur["quotaEstimate"].is_object() {
             for (label, key) in [("weekly", "weekly"), ("five-hour", "fiveHour")] {
-                let est = &cur["quotaEstimate"][key];
-                if est.is_object() {
-                    let tpp = crate::usage::format_token_compact(n(est, "tokensPerPct"));
-                    let rem_h = est["estimatedRemainingHours"]
-                        .as_f64()
-                        .map(crate::usage::format_hours_compact)
-                        .unwrap_or_else(|| "-".to_string());
-                    let src = s(est, "source");
-                    let bsrc = s(est, "burnRateSource");
-                    println!(
-                        "  {label} estimate ({src}, pace {bsrc}): ~{tpp} tok / 1% · est remaining: {rem_h} (advisory only)"
-                    );
+                if let Some(line) = format_cli_quota_estimate_line(label, &cur["quotaEstimate"][key]) {
+                    println!("{line}");
                 }
             }
         }
@@ -6008,15 +7155,8 @@ fn cmd_note(args: &[String]) -> Res<i32> {
         parts.join(", ")
     );
     for (label, key) in [("weekly", "weekly"), ("five-hour", "fiveHour")] {
-        let est = &acct_view["quotaEstimate"][key];
-        if est.is_object() {
-            let tpp = crate::usage::format_token_compact(n(est, "tokensPerPct"));
-            let rem_h = est["estimatedRemainingHours"]
-                .as_f64()
-                .map(crate::usage::format_hours_compact)
-                .unwrap_or_else(|| "-".to_string());
-            let method = s(est, "method");
-            println!("  {label} estimate ({method}): ~{tpp} tok / 1% · est remaining at current pace: {rem_h}");
+        if let Some(line) = format_cli_quota_estimate_line(label, &acct_view["quotaEstimate"][key]) {
+            println!("{line}");
         }
     }
     println!("Next: delegate agy account status | delegate usage --account {id}");
@@ -6972,20 +8112,33 @@ Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSum
     #[test]
     fn detect_quota_depletion_warnings_flags_only_when_earlier_than_reset() {
         let snap = json!({
+            "mode": "fixed",
+            "active": "hot-acct",
             "accounts": [
                 {
-                    "id": "safe-acct",
+                    "id": "standby-hot",
                     "active": false,
                     "quota": {
                         "ok": true,
                         "entries": [
-                            {"pool": "Gemini Models", "window": "weekly", "remainingPct": 90.0, "resetInSeconds": 432000}
+                            {"pool": "Gemini Models", "window": "weekly", "remainingPct": 25.0, "resetInSeconds": 432000}
                         ]
                     },
                     "quotaEstimate": {
-                        "pools": [
-                            {"pool": "Gemini Models", "weekly": {"estimatedRemainingHours": 333.33}}
-                        ]
+                        "pools": [{
+                            "pool": "Gemini Models",
+                            "tier": "yellow",
+                            "weekly": {
+                                "pool": "Gemini Models",
+                                "status": "depletes",
+                                "alert": true,
+                                "fastMinutes": 300,
+                                "midMinutes": 360,
+                                "slowMinutes": 420,
+                                "runningCount": 1,
+                                "basis": "24h"
+                            }
+                        }]
                     }
                 },
                 {
@@ -6994,17 +8147,29 @@ Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSum
                     "quota": {
                         "ok": true,
                         "entries": [
-                            {"pool": "Gemini Models", "window": "weekly", "remainingPct": 42.0, "resetInSeconds": 432000}
+                            {"pool": "Gemini Models", "window": "weekly", "remainingPct": 35.0, "resetInSeconds": 432000}
                         ]
                     },
                     "quotaEstimate": {
-                        "pools": [
-                            {"pool": "Gemini Models", "weekly": {"estimatedRemainingHours": 11.0}}
-                        ]
+                        "pools": [{
+                            "pool": "Gemini Models",
+                            "tier": "yellow",
+                            "weekly": {
+                                "pool": "Gemini Models",
+                                "status": "depletes",
+                                "alert": true,
+                                "fastMinutes": 600,
+                                "midMinutes": 660,
+                                "slowMinutes": 720,
+                                "runningCount": 1,
+                                "basis": "24h"
+                            }
+                        }]
                     }
                 }
             ]
         });
+        // Fixed mode alerts ONLY on active `hot-acct`, never on inactive `standby-hot`.
         let warns = detect_quota_depletion_warnings(&snap);
         assert_eq!(warns.len(), 1);
         assert_eq!(warns[0].account_id, "hot-acct");
@@ -7014,7 +8179,112 @@ Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSum
         assert!(line.contains("⚠ 额度预警"), "{line}");
         assert!(line.contains("hot-acct"), "{line}");
         assert!(line.contains("11 小时"), "{line}");
-        assert!(line.contains("不自动换号，请手动切换"), "{line}");
+        assert!(!line.contains("不自动换号"), "{line}");
+
+        // Auto mode with a Green backup slot suppresses warning.
+        let auto_green_backup = json!({
+            "mode": "auto",
+            "autoSwitch": {
+                "enabled": true,
+                "poolSummary": { "gemini": { "selected": "slot-a" } }
+            },
+            "accounts": [
+                {
+                    "id": "slot-a",
+                    "active": true,
+                    "quota": {
+                        "ok": true,
+                        "entries": [
+                            {"pool": "Gemini Models", "window": "fiveHour", "remainingPct": 25.0, "resetInSeconds": 10800}
+                        ]
+                    },
+                    "quotaEstimate": {
+                        "pools": [{
+                            "pool": "Gemini Models",
+                            "tier": "yellow",
+                            "fiveHour": {
+                                "pool": "Gemini Models",
+                                "status": "depletes",
+                                "alert": true,
+                                "fastMinutes": 35,
+                                "midMinutes": 45,
+                                "slowMinutes": 60,
+                                "runningCount": 1,
+                                "basis": "30m"
+                            }
+                        }]
+                    }
+                },
+                {
+                    "id": "slot-b",
+                    "active": false,
+                    "quota": {
+                        "ok": true,
+                        "entries": [
+                            {"pool": "Gemini Models", "window": "fiveHour", "remainingPct": 95.0, "resetInSeconds": 14400}
+                        ]
+                    },
+                    "quotaEstimate": {
+                        "pools": [{
+                            "pool": "Gemini Models",
+                            "tier": "green",
+                            "fiveHour": { "pool": "Gemini Models", "status": "idle" }
+                        }]
+                    }
+                }
+            ]
+        });
+        assert!(
+            detect_quota_depletion_warnings(&auto_green_backup).is_empty(),
+            "auto mode with green backup must suppress depletion alert"
+        );
+
+        // Auto mode when ALL slots are non-Green and combined capacity won't reach earliest reset -> warns.
+        let mut auto_all_low = auto_green_backup.clone();
+        auto_all_low["accounts"][1]["quota"]["entries"][0]["remainingPct"] = json!(5.0);
+        auto_all_low["accounts"][1]["quotaEstimate"]["pools"][0]["tier"] = json!("red");
+        let auto_warns = detect_quota_depletion_warnings(&auto_all_low);
+        assert_eq!(auto_warns.len(), 1);
+        assert!(auto_warns[0].auto_all_low);
+        let auto_line = format_status_quota_warning_line(&auto_warns).expect("auto warning line");
+        assert!(auto_line.contains("auto 模式 Gemini 池"), "{auto_line}");
+        assert!(auto_line.contains("slot-a 5h 25%"), "{auto_line}");
+        assert!(auto_line.contains("slot-b 5h 5%"), "{auto_line}");
+
+        // Backup with passive_error synthetic 15m reset must NOT suppress auto all-low warning.
+        let mut auto_passive_backup = auto_all_low.clone();
+        auto_passive_backup["accounts"][1]["quota"]["entries"][0]["remainingPct"] = json!(0.0);
+        auto_passive_backup["accounts"][1]["quota"]["entries"][0]["resetInSeconds"] = json!(900);
+        auto_passive_backup["accounts"][1]["quota"]["entries"][0]["source"] = json!("passive_error");
+        let passive_warns = detect_quota_depletion_warnings(&auto_passive_backup);
+        assert_eq!(
+            passive_warns.len(),
+            1,
+            "passive_error synthetic 15m reset on backup must not suppress auto all-low alert"
+        );
+
+        // Backup whose weekly is 0% (Red) must NOT contribute its 5h % to combined capacity
+        // nor suppress auto 5h warning even if its 5h is high (60%) or resets soon.
+        let mut auto_weekly_blocked = auto_all_low.clone();
+        auto_weekly_blocked["accounts"][1]["quota"]["entries"] = json!([
+            {"pool": "Gemini Models", "window": "fiveHour", "remainingPct": 60.0, "resetInSeconds": 1200},
+            {"pool": "Gemini Models", "window": "weekly", "remainingPct": 0.0, "resetInSeconds": 200000}
+        ]);
+        let wb_warns = detect_quota_depletion_warnings(&auto_weekly_blocked);
+        assert_eq!(
+            wb_warns.len(),
+            1,
+            "backup with 0% weekly must not suppress auto 5h alert even if 5h is 60% and resets soon"
+        );
+        assert_eq!(
+            wb_warns[0].remaining_minutes, 45,
+            "weekly-blocked backup's 5h % must not inflate combined_pct"
+        );
+
+        // Tiny reset window (< 5m) must never round ETA above resetAt.
+        assert_eq!(format_eta_zh_phrase(2, 2, Some(2), 240), "约 3 分钟后用完");
+        assert_eq!(format_eta_zh_phrase(2, 2, Some(3), 240), "约 3 分钟后到重置前之间用完");
+        assert_eq!(format_eta_zh_phrase(1, 1, None, 90), "即将用完");
     }
 
     #[test]
@@ -7887,5 +9157,413 @@ Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSum
 
         // `derive_id` never collides with reserved `"auto"`.
         assert_ne!(derive_id("auto@example.test", &Map::new()), "auto");
+    }
+
+    #[test]
+    fn build_quota_history_point_records_reset_epochs_and_isolates_same_cycle() {
+        let now_ep = iso_epoch("2026-11-27T10:00:00Z").unwrap();
+        let reset_5h = "2026-11-27T14:30:00Z";
+        let reset_7d = "2026-12-04T07:00:00Z";
+        let entries = vec![
+            QuotaPoolEntry {
+                pool: "Gemini Models".into(),
+                window: "fiveHour".into(),
+                window_label: "Five Hour Limit Remaining".into(),
+                remaining_pct: 80.0,
+                reset_at: reset_5h.into(),
+            },
+            QuotaPoolEntry {
+                pool: "Gemini Models".into(),
+                window: "weekly".into(),
+                window_label: "Weekly Limit Remaining".into(),
+                remaining_pct: 65.0,
+                reset_at: reset_7d.into(),
+            },
+            QuotaPoolEntry {
+                pool: "Claude and GPT models".into(),
+                window: "fiveHour".into(),
+                window_label: "Five Hour Limit Remaining".into(),
+                remaining_pct: 100.0,
+                reset_at: "1970-01-01T00:00:00Z".into(),
+            },
+        ];
+        let pt = build_quota_history_point(now_ep, &entries).expect("history point");
+        assert_eq!(
+            pt["pools"]["Gemini Models"]["fiveHourResetEp"].as_i64(),
+            iso_epoch(reset_5h)
+        );
+        assert_eq!(
+            pt["pools"]["Gemini Models"]["weeklyResetEp"].as_i64(),
+            iso_epoch(reset_7d)
+        );
+        assert_eq!(
+            pt["pools"]["Claude and GPT models"]["fiveHourResetEp"].as_i64(),
+            Some(0)
+        );
+
+        // Cross-reset contamination test: previous cycle ended 20m ago at 98%, new cycle started 15m ago at 96%.
+        // With `fiveHourResetEp` recorded, previous cycle MUST NOT be mixed into current cycle!
+        let cur_reset_ep = now_ep + 4 * 3600 + 45 * 60; // started 15m ago
+        let prev_reset_ep = now_ep - 20 * 60;
+        let cur_reset_iso = format_epoch(cur_reset_ep, false, "%Y-%m-%dT%H:%M:%SZ");
+        let acct_quota = json!({
+            "ok": true,
+            "fetchedEpoch": now_ep,
+            "entries": [
+                {
+                    "pool": "Gemini Models",
+                    "window": "fiveHour",
+                    "remainingPct": 96.0,
+                    "resetAt": cur_reset_iso
+                }
+            ],
+            "history": [
+                {
+                    "epoch": now_ep - 40 * 60,
+                    "pools": {
+                        "Gemini Models": {
+                            "fiveHour": 98.0,
+                            "fiveHourResetEp": prev_reset_ep
+                        }
+                    }
+                },
+                {
+                    "epoch": now_ep,
+                    "pools": {
+                        "Gemini Models": {
+                            "fiveHour": 96.0,
+                            "fiveHourResetEp": cur_reset_ep
+                        }
+                    }
+                }
+            ]
+        });
+        let cfg = AgyAutoSwitchConfig::default();
+        let st = evaluate_pool_quota(&acct_quota, QuotaPool::Gemini, &cfg, 1, 1, true, now_ep);
+        assert!(
+            matches!(
+                st.eta_five_hour,
+                QuotaEta::Insufficient {
+                    reason: "too_early",
+                    ..
+                }
+            ),
+            "15m into fresh cycle must be Insufficient(too_early), got {:?}",
+            st.eta_five_hour
+        );
+    }
+
+    #[test]
+    fn pool_quota_eta_gates_insufficient_idle_multi_machine_and_cap_at_reset() {
+        let cfg = AgyAutoSwitchConfig::default();
+        let base_ep = iso_epoch("2026-11-27T10:00:00Z").unwrap();
+
+        // 1. Reproduce 03:04 complaint: 20m observed (< 25m), 90% remaining, 27m wall clock -> Insufficient, no alert!
+        let t_start = base_ep - 27 * 60;
+        let reset_ep = t_start + FIVE_HOUR_WINDOW_SECS;
+        let fetched_ep = t_start + 20 * 60;
+        let reset_iso = format_epoch(reset_ep, false, "%Y-%m-%dT%H:%M:%SZ");
+        let fresh_quota = json!({
+            "ok": true,
+            "fetchedEpoch": fetched_ep,
+            "entries": [{
+                "pool": "Gemini Models",
+                "window": "fiveHour",
+                "remainingPct": 90.0,
+                "resetAt": reset_iso
+            }],
+            "history": [{
+                "epoch": fetched_ep,
+                "pools": { "Gemini Models": { "fiveHour": 90.0, "fiveHourResetEp": reset_ep } }
+            }]
+        });
+        let st_fresh = evaluate_pool_quota(&fresh_quota, QuotaPool::Gemini, &cfg, 1, 1, true, base_ep);
+        assert!(matches!(
+            st_fresh.eta_five_hour,
+            QuotaEta::Insufficient {
+                reason: "too_early",
+                elapsed_mins: Some(27)
+            }
+        ));
+
+        // 2. Idle gate vs multi-machine remote burn:
+        //    - k_run == 0 and no recent drop -> Idle
+        //    - k_run == 0, selected, fresh (<20m), recent drop > 0 -> NOT Idle (remote machine is burning)
+        let active_reset_ep = base_ep + 3 * 3600; // started 2h ago
+        let active_reset_iso = format_epoch(active_reset_ep, false, "%Y-%m-%dT%H:%M:%SZ");
+        let steady_idle = json!({
+            "ok": true,
+            "fetchedEpoch": base_ep - 300,
+            "entries": [{
+                "pool": "Gemini Models",
+                "window": "fiveHour",
+                "remainingPct": 40.0,
+                "resetAt": active_reset_iso
+            }],
+            "history": [
+                { "epoch": base_ep - 2100, "pools": { "Gemini Models": { "fiveHour": 55.0, "fiveHourResetEp": active_reset_ep } } },
+                { "epoch": base_ep - 1200, "pools": { "Gemini Models": { "fiveHour": 40.0, "fiveHourResetEp": active_reset_ep } } },
+                { "epoch": base_ep - 300,  "pools": { "Gemini Models": { "fiveHour": 40.0, "fiveHourResetEp": active_reset_ep } } }
+            ]
+        });
+        let st_idle = evaluate_pool_quota(&steady_idle, QuotaPool::Gemini, &cfg, 0, 0, true, base_ep);
+        assert_eq!(st_idle.eta_five_hour, QuotaEta::Idle);
+
+        let remote_burn = json!({
+            "ok": true,
+            "fetchedEpoch": base_ep - 300,
+            "entries": [{
+                "pool": "Gemini Models",
+                "window": "fiveHour",
+                "remainingPct": 35.0,
+                "resetAt": active_reset_iso
+            }],
+            "history": [
+                { "epoch": base_ep - 2100, "pools": { "Gemini Models": { "fiveHour": 55.0, "fiveHourResetEp": active_reset_ep } } },
+                { "epoch": base_ep - 1200, "pools": { "Gemini Models": { "fiveHour": 45.0, "fiveHourResetEp": active_reset_ep } } },
+                { "epoch": base_ep - 300,  "pools": { "Gemini Models": { "fiveHour": 35.0, "fiveHourResetEp": active_reset_ep } } }
+            ]
+        });
+        let st_remote = evaluate_pool_quota(&remote_burn, QuotaPool::Gemini, &cfg, 0, 0, true, base_ep);
+        assert!(
+            matches!(st_remote.eta_five_hour, QuotaEta::DepletesIn { alert: false, .. }),
+            "remote burn with k_run=0 must not be falsely silenced to Idle: {:?}",
+            st_remote.eta_five_hour
+        );
+        // Same state with k_run=2, k_write=2 -> unified eff_5h = 35 - 10 = 25 (Yellow tier) AND alert = true!
+        let st_local = evaluate_pool_quota(&remote_burn, QuotaPool::Gemini, &cfg, 2, 2, true, base_ep);
+        assert_eq!(st_local.tier, QuotaTier::Yellow);
+        assert_eq!(st_local.eff_five_hour_pct, Some(25.0));
+        match st_local.eta_five_hour {
+            QuotaEta::DepletesIn { fast_m, mid_m, alert, .. } => {
+                assert!(alert);
+                assert!(fast_m <= mid_m);
+                assert!(mid_m * 60 < 3 * 3600, "ETA must stay strictly below resetAt");
+            }
+            ref other => panic!("expected DepletesIn(alert=true), got {other:?}"),
+        }
+
+        // 3. Weekly staleness split: 14h old cache -> auto-switch tier STILL sees weekly_pct (24h limit),
+        //    while ETA returns Insufficient("stale") (12h limit)!
+        let wk_reset_ep = base_ep + 5 * 86400;
+        let wk_reset_iso = format_epoch(wk_reset_ep, false, "%Y-%m-%dT%H:%M:%SZ");
+        let wk_14h_old = json!({
+            "ok": true,
+            "fetchedEpoch": base_ep - 14 * 3600,
+            "entries": [{
+                "pool": "Gemini Models",
+                "window": "weekly",
+                "remainingPct": 25.0,
+                "resetAt": wk_reset_iso
+            }],
+            "history": []
+        });
+        let st_wk = evaluate_pool_quota(&wk_14h_old, QuotaPool::Gemini, &cfg, 1, 1, true, base_ep);
+        assert_eq!(st_wk.tier, QuotaTier::Yellow, "24h auto-switch tier must remain unchanged");
+        assert_eq!(st_wk.weekly_pct, Some(25.0));
+        assert!(matches!(
+            st_wk.eta_weekly,
+            QuotaEta::Insufficient { reason: "stale", .. }
+        ));
+    }
+
+    #[test]
+    fn replay_backtest_locks_5h_and_weekly_false_positive_rates() {
+        let raw = include_str!("../tests/fixtures/quota_replay_history.json");
+        assert!(!raw.contains('@'), "public replay fixture must not contain emails");
+        let doc: Value = serde_json::from_str(raw).expect("valid replay fixture JSON");
+        let slots = doc["slots"].as_array().expect("slots array");
+        assert_eq!(slots.len(), 2);
+
+        let cfg = AgyAutoSwitchConfig::default();
+
+        for min_sample_gap_secs in [0i64, 15 * 60i64] {
+            let mut fp_5h = 0usize;
+            let mut total_5h_non_exh = 0usize;
+            let mut fp_7d = 0usize;
+            let mut total_7d = 0usize;
+            let mut saw_true_exh_alert = false;
+            let mut post_reset_90_alerts = 0usize;
+
+            for slot in slots {
+                let hist_all = slot["history"].as_array().expect("history");
+
+                // Replay 5h cycles
+                for cyc in slot["cycles5h"].as_array().expect("cycles5h") {
+                    let s_idx = cyc["startIdx"].as_u64().unwrap() as usize;
+                    let e_idx = cyc["endIdx"].as_u64().unwrap() as usize;
+                    let reset_ep = cyc["resetEp"].as_i64().unwrap();
+                    let completed = b(cyc, "completed");
+                    let exhausted = b(cyc, "exhausted");
+                    let near_zero = b(cyc, "nearZeroManualSwitch");
+                    let true_zero_ep = cyc["trueZeroEp"].as_i64();
+                    let reset_iso = format_epoch(reset_ep, false, "%Y-%m-%dT%H:%M:%SZ");
+
+                    // Apply optional >=15m sampling throttle
+                    let mut sampled: Vec<Value> = Vec::new();
+                    let mut last_kept_ep = 0i64;
+                    for item in &hist_all[..=e_idx] {
+                        let ep = item["epoch"].as_i64().unwrap();
+                        if min_sample_gap_secs > 0 && last_kept_ep > 0 && ep - last_kept_ep < min_sample_gap_secs {
+                            continue;
+                        }
+                        sampled.push(item.clone());
+                        last_kept_ep = ep;
+                    }
+
+                    let seg_start_ep = hist_all[s_idx]["epoch"].as_i64().unwrap();
+                    for (si, pt) in sampled.iter().enumerate() {
+                        let ep = pt["epoch"].as_i64().unwrap();
+                        if ep < seg_start_ep {
+                            continue;
+                        }
+                        let pct = pt["pools"]["Gemini Models"]["fiveHour"].as_f64().unwrap();
+                        if pct <= 0.0 || pct >= 100.0 {
+                            continue;
+                        }
+                        let prev_pct = if si > 0 && sampled[si - 1]["epoch"].as_i64().unwrap() >= seg_start_ep {
+                            sampled[si - 1]["pools"]["Gemini Models"]["fiveHour"].as_f64().unwrap()
+                        } else {
+                            100.0
+                        };
+                        let k_run = usize::from(prev_pct > pct);
+                        let acct_quota = json!({
+                            "ok": true,
+                            "fetchedEpoch": ep,
+                            "entries": [{
+                                "pool": "Gemini Models",
+                                "window": "fiveHour",
+                                "remainingPct": pct,
+                                "resetAt": reset_iso
+                            }],
+                            "history": &sampled[..=si]
+                        });
+                        let st = evaluate_pool_quota(
+                            &acct_quota,
+                            QuotaPool::Gemini,
+                            &cfg,
+                            k_run,
+                            k_run,
+                            true,
+                            ep,
+                        );
+                        let alerted = matches!(st.eta_five_hour, QuotaEta::DepletesIn { alert: true, .. });
+
+                        // Post-reset high-margin check (first 30m with >= 88% remaining -> 0 alerts!)
+                        let elapsed_from_start = ep - (reset_ep - FIVE_HOUR_WINDOW_SECS);
+                        if elapsed_from_start <= 30 * 60 && pct >= 88.0 && alerted {
+                            post_reset_90_alerts += 1;
+                        }
+
+                        if exhausted {
+                            if let Some(tz) = true_zero_ep {
+                                if ep < tz && alerted {
+                                    saw_true_exh_alert = true;
+                                    // At 73% remaining (~93m before T_zero), check ETA accuracy within ±15m!
+                                    if (pct - 73.0).abs() < 0.5 {
+                                        if let QuotaEta::DepletesIn { mid_m, .. } = st.eta_five_hour {
+                                            let actual_m = (tz - ep) / 60;
+                                            let err = (mid_m as i64 - actual_m).abs();
+                                            assert!(
+                                                err <= 15,
+                                                "true depletion ETA error too large at 73%: pred={mid_m}m actual={actual_m}m"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        } else if completed && !near_zero {
+                            total_5h_non_exh += 1;
+                            if alerted {
+                                fp_5h += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Replay weekly cycles
+                for cyc in slot["cycles7d"].as_array().expect("cycles7d") {
+                    let s_idx = cyc["startIdx"].as_u64().unwrap() as usize;
+                    let e_idx = cyc["endIdx"].as_u64().unwrap() as usize;
+                    let reset_ep = cyc["resetEp"].as_i64().unwrap();
+                    let reset_iso = format_epoch(reset_ep, false, "%Y-%m-%dT%H:%M:%SZ");
+
+                    let mut sampled: Vec<Value> = Vec::new();
+                    let mut last_kept_ep = 0i64;
+                    for item in &hist_all[..=e_idx] {
+                        let ep = item["epoch"].as_i64().unwrap();
+                        if min_sample_gap_secs > 0 && last_kept_ep > 0 && ep - last_kept_ep < min_sample_gap_secs {
+                            continue;
+                        }
+                        sampled.push(item.clone());
+                        last_kept_ep = ep;
+                    }
+                    let seg_start_ep = hist_all[s_idx]["epoch"].as_i64().unwrap();
+                    for (si, pt) in sampled.iter().enumerate() {
+                        let ep = pt["epoch"].as_i64().unwrap();
+                        if ep < seg_start_ep {
+                            continue;
+                        }
+                        let pct = pt["pools"]["Gemini Models"]["weekly"].as_f64().unwrap();
+                        if pct <= 0.0 || pct >= 100.0 {
+                            continue;
+                        }
+                        let prev_pct = if si > 0 && sampled[si - 1]["epoch"].as_i64().unwrap() >= seg_start_ep {
+                            sampled[si - 1]["pools"]["Gemini Models"]["weekly"].as_f64().unwrap()
+                        } else {
+                            100.0
+                        };
+                        let k_run = usize::from(prev_pct > pct);
+                        let acct_quota = json!({
+                            "ok": true,
+                            "fetchedEpoch": ep,
+                            "entries": [{
+                                "pool": "Gemini Models",
+                                "window": "weekly",
+                                "remainingPct": pct,
+                                "resetAt": reset_iso
+                            }],
+                            "history": &sampled[..=si]
+                        });
+                        let st = evaluate_pool_quota(
+                            &acct_quota,
+                            QuotaPool::Gemini,
+                            &cfg,
+                            k_run,
+                            k_run,
+                            true,
+                            ep,
+                        );
+                        total_7d += 1;
+                        if matches!(st.eta_weekly, QuotaEta::DepletesIn { alert: true, .. }) {
+                            fp_7d += 1;
+                        }
+                    }
+                }
+            }
+
+            assert!(total_5h_non_exh >= 50, "expected >=50 non-exhausted 5h points, got {total_5h_non_exh}");
+            assert!(total_7d >= 100, "expected >=100 weekly points, got {total_7d}");
+            let fpr_5h = (fp_5h as f64) / (total_5h_non_exh as f64);
+            assert!(
+                fpr_5h <= 0.03,
+                "5h FPR regression (throttle={min_sample_gap_secs}s): {fp_5h}/{total_5h_non_exh} = {:.1}%",
+                fpr_5h * 100.0
+            );
+            assert_eq!(
+                fp_7d, 0,
+                "weekly FPR regression (throttle={min_sample_gap_secs}s): {fp_7d}/{total_7d}"
+            );
+            assert_eq!(
+                post_reset_90_alerts, 0,
+                "post-reset high-margin (>=88% within 30m) must have 0 alerts"
+            );
+            if min_sample_gap_secs == 0 {
+                assert!(
+                    saw_true_exh_alert,
+                    "true exhaustion cycle must trigger a pre-depletion alert"
+                );
+            }
+        }
     }
 }

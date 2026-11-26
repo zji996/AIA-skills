@@ -8,7 +8,7 @@
 use crate::app::{App, FocusPane, Overlay};
 use crate::model::*;
 use crate::ui::{
-    bold_primary, build_horiz_bar, evaluate_window_outcome, format_iso_compact,
+    bold_primary, build_horiz_bar, evaluate_window_outcome, format_eta_compact, format_iso_compact,
     format_quota_estimate_lines, format_quota_updated, format_running_agy_proc,
     format_sparkline_axis, format_tokens_short, inline_spark_text, muted, primary,
     push_indented_wrapped, push_wrapped, render_quota_gauge_row, rounded_block, section_header,
@@ -92,16 +92,35 @@ fn earliest_depletion_cell(acct: &AgyAccountItem) -> (String, Style) {
     let Some(est) = &acct.quota_estimate else {
         return ("-".to_string(), muted());
     };
-    let mut best: Option<(u64, &'static str)> = None;
+    let mut best_alert: Option<(u64, &'static str, String)> = None;
+    let mut has_safe = false;
+    let mut has_idle = false;
+    let mut has_insufficient = false;
     let mut check = |win_key: &str, lbl: &'static str, w: &QuotaWindowEstimate| {
-        if let Some(WindowEstimateOutcome::RunsOutIn {
-            mins,
-            before_reset: true,
-        }) = evaluate_window_outcome(acct, win_key, w)
-        {
-            if best.is_none_or(|(b, _)| mins < b) {
-                best = Some((mins, lbl));
+        match evaluate_window_outcome(acct, win_key, w) {
+            Some(WindowEstimateOutcome::RunsOutIn {
+                fast_m,
+                mid_m,
+                slow_m,
+                reset_secs,
+                alert: true,
+            }) => {
+                if best_alert.as_ref().is_none_or(|(b, _, _)| mid_m < *b) {
+                    let compact = format_eta_compact(fast_m, mid_m, slow_m, reset_secs);
+                    best_alert = Some((mid_m, lbl, compact));
+                }
             }
+            Some(WindowEstimateOutcome::RunsOutIn { alert: false, .. })
+            | Some(WindowEstimateOutcome::Insufficient) => {
+                has_insufficient = true;
+            }
+            Some(WindowEstimateOutcome::WontRunOut) => {
+                has_safe = true;
+            }
+            Some(WindowEstimateOutcome::Idle) => {
+                has_idle = true;
+            }
+            None => {}
         }
     };
     for pe in &est.pools {
@@ -118,20 +137,22 @@ fn earliest_depletion_cell(acct: &AgyAccountItem) -> (String, Style) {
     if let Some(w) = &est.five_hour {
         check("fiveHour", "5h", w);
     }
-    if let Some((mins, lbl)) = best {
-        let txt = if mins == 0 {
-            format!("⚠ {lbl} 即将用完")
-        } else {
-            format!("⚠ {lbl} ~{}", format_duration(Some(mins * 60)))
-        };
+    if let Some((_, lbl, compact)) = best_alert {
+        let txt = format!("⚠ {lbl} {compact}");
         (
             txt,
             Style::default()
                 .fg(STATUS_FAILED)
                 .add_modifier(Modifier::BOLD),
         )
-    } else {
+    } else if has_safe {
         ("重置前够用".to_string(), muted())
+    } else if has_insufficient {
+        ("待观察".to_string(), muted())
+    } else if has_idle {
+        ("空闲".to_string(), muted())
+    } else {
+        ("-".to_string(), muted())
     }
 }
 

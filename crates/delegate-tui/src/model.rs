@@ -1563,16 +1563,32 @@ pub struct QuotaNoteSnapshot {
     pub five_hour_at: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum QuotaEtaStatus {
+    #[default]
+    Insufficient,
+    Idle,
+    Safe,
+    Depletes,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct QuotaWindowEstimate {
-    pub remaining_pct_x100: u32,
-    pub tokens_per_pct: u64,
-    pub estimated_remaining_tokens: u64,
-    pub estimated_remaining_minutes: Option<u64>,
-    pub burn_rate_per_hour: u64,
-    pub method: String,
+    pub status: QuotaEtaStatus,
+    pub remaining_pct_x100: Option<u32>,
+    pub effective_pct_x100: Option<u32>,
+    pub alert: bool,
+    pub fast_minutes: Option<u64>,
+    pub mid_minutes: Option<u64>,
+    pub slow_minutes: Option<u64>,
+    pub reset_in_seconds: Option<u64>,
+    pub running_count: usize,
+    pub running_writers: usize,
+    pub basis: String,
+    pub reason: String,
+    pub elapsed_minutes: Option<u64>,
     pub source: String,
-    pub burn_rate_source: String,
+    pub tier: String,
     pub pool: Option<String>,
 }
 
@@ -2043,7 +2059,10 @@ impl AppSnapshot {
                     }
                     if let Some(est) = &acct.quota_estimate {
                         let check = |win_key: &str, w: &QuotaWindowEstimate| -> bool {
-                            let Some(mins) = w.estimated_remaining_minutes else {
+                            if w.status != QuotaEtaStatus::Depletes || !w.alert {
+                                return false;
+                            }
+                            let Some(mins) = w.mid_minutes else {
                                 return false;
                             };
                             q.entries.iter().any(|e| {
@@ -2055,12 +2074,13 @@ impl AppSnapshot {
                                         .is_some_and(|rs| rs > 0 && mins.saturating_mul(60) < rs)
                             })
                         };
-                        if est.weekly.as_ref().is_some_and(|w| check("weekly", w))
-                            || est.five_hour.as_ref().is_some_and(|w| check("fiveHour", w))
-                            || est.pools.iter().any(|p| {
-                                p.weekly.as_ref().is_some_and(|w| check("weekly", w))
-                                    || p.five_hour.as_ref().is_some_and(|w| check("fiveHour", w))
-                            })
+                        if acct.active
+                            && (est.weekly.as_ref().is_some_and(|w| check("weekly", w))
+                                || est.five_hour.as_ref().is_some_and(|w| check("fiveHour", w))
+                                || est.pools.iter().any(|p| {
+                                    p.weekly.as_ref().is_some_and(|w| check("weekly", w))
+                                        || p.five_hour.as_ref().is_some_and(|w| check("fiveHour", w))
+                                }))
                         {
                             return true;
                         }

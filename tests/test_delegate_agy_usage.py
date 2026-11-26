@@ -376,62 +376,30 @@ class DelegateAgyUsageTests(unittest.TestCase):
         self.assertEqual(alpha["usage"]["sevenDay"]["author"]["total"], 10_000_000)
         self.assertEqual(alpha["usage"]["sevenDay"]["reviewer"]["total"], 40_000_000)
 
-        # 2. Record first manual quota snapshot (single-snapshot window calibration)
+        # 2. Record first manual quota snapshot (quotaNote recorded; local token ledger no longer drives quotaEstimate)
         n1_res = self.cli("agy", "account", "note", "alpha", "--weekly", "95.00", "--five-hour", "80.00", "--json")
         self.assertEqual(n1_res.returncode, 0, n1_res.stderr)
         n1 = json.loads(n1_res.stdout)
         self.assertTrue(n1["ok"])
         self.assertEqual(n1["quotaNote"]["weekly"], 95.0)
         self.assertEqual(n1["quotaNote"]["fiveHour"], 80.0)
-        # 50M / 5% = 10M per 1% weekly; 10M / 20% = 500K per 1% five-hour
-        self.assertEqual(n1["quotaEstimate"]["weekly"]["method"], "window")
-        self.assertEqual(n1["quotaEstimate"]["weekly"]["tokensPerPct"], 10_000_000)
-        self.assertEqual(n1["quotaEstimate"]["fiveHour"]["method"], "window")
-        self.assertEqual(n1["quotaEstimate"]["fiveHour"]["tokensPerPct"], 500_000)
-        self.assertGreater(n1["quotaEstimate"]["fiveHour"]["estimatedRemainingHours"], 0)
+        self.assertIsNone(n1["quotaEstimate"])
 
-        # 3. Verify snapshot --json carries usage, quotaNote, quotaEstimate for TUI (active unchanged!)
+        # 3. Verify snapshot --json carries usage & quotaNote for TUI (active unchanged, no token-calibrated quotaEstimate)
         snap = json.loads(self.cli("snapshot", "--json").stdout)
         self.assertEqual(snap["agyAccounts"]["active"], "alpha")
         snap_alpha = next(a for a in snap["agyAccounts"]["accounts"] if a["id"] == "alpha")
         self.assertEqual(snap_alpha["usage"]["fiveHour"]["total"], 10_000_000)
         self.assertEqual(snap_alpha["usage"]["sevenDay"]["total"], 50_000_000)
         self.assertEqual(snap_alpha["quotaNote"]["weekly"], 95.0)
-        self.assertEqual(snap_alpha["quotaEstimate"]["weekly"]["tokensPerPct"], 10_000_000)
+        self.assertNotIn("quotaEstimate", snap_alpha)
 
-        # 4. Backdate note 1 by 60s, append 6M tokens at +30s, then record note 2 (93.00% -> 2% drop => delta 3M / 1%)
-        acct_file = self.fake_home / ".config/delegate/agy-accounts/accounts.json"
-        acct_doc = json.loads(acct_file.read_text(encoding="utf-8"))
-        note1_epoch = int(acct_doc["accounts"]["alpha"]["quotaNotes"][0]["epoch"]) - 60
-        acct_doc["accounts"]["alpha"]["quotaNotes"][0]["epoch"] = note1_epoch
-        acct_file.write_text(json.dumps(acct_doc), encoding="utf-8")
-        t_between = note1_epoch + 30
-        extra = {
-            "v": 1,
-            "at": "2026-11-24T04:01:00Z",
-            "epoch": t_between,
-            "run": "r-after-n1",
-            "repo": "/tmp/demo",
-            "repoName": "demo",
-            "role": "author",
-            "round": 1,
-            "rework": False,
-            "attempt": 1,
-            "provider": "agy",
-            "model": "agy/gemini-4-neon",
-            "isAgy": True,
-            "account": "alpha",
-            "session": "c4",
-            "tokens": {"input": 1_000_000, "output": 0, "cacheRead": 5_000_000},
-        }
-        with ledger.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(extra) + "\n")
-
+        # 4. Record second manual quota snapshot (updates latest quotaNote; still no token calibration)
         n2_res = self.cli("agy", "account", "note", "alpha", "--weekly", "93.00", "--json")
         self.assertEqual(n2_res.returncode, 0, n2_res.stderr)
         n2 = json.loads(n2_res.stdout)
-        self.assertEqual(n2["quotaEstimate"]["weekly"]["method"], "delta")
-        self.assertEqual(n2["quotaEstimate"]["weekly"]["tokensPerPct"], 3_000_000)
+        self.assertEqual(n2["quotaNote"]["weekly"], 93.0)
+        self.assertIsNone(n2["quotaEstimate"])
 
         # 5. Reject out-of-range percentage & verify --clear removes notes
         bad = self.cli("agy", "account", "note", "alpha", "--weekly", "105")

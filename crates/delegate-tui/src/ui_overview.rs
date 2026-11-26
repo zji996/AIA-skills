@@ -12,11 +12,12 @@
 use crate::app::{App, OverviewAttentionEntry, OverviewFocus, Overlay, WorkRow};
 use crate::model::*;
 use crate::ui::{
-    bold_primary, build_horiz_bar, evaluate_window_outcome, format_quota_updated,
-    format_reset_countdown_zh, format_tokens_short, format_tree_prefix_wide, inline_spark_text,
-    muted, primary, quota_bar_color, render_quota_bar_spans, rounded_block, run_glyph_color,
-    short_pool_name, short_repo_display, work_item_glyph_color, WindowEstimateOutcome,
-    NARROW_BREAKPOINT, STATUS_FAILED, STATUS_PENDING, STATUS_QUEUED, STATUS_RUNNING,
+    bold_primary, build_horiz_bar, evaluate_window_outcome, format_eta_compact,
+    format_quota_updated, format_reset_countdown_zh, format_tokens_short, format_tree_prefix_wide,
+    inline_spark_text, muted, primary, quota_bar_color, render_quota_bar_spans, rounded_block,
+    run_glyph_color, short_pool_name, short_repo_display, work_item_glyph_color,
+    WindowEstimateOutcome, NARROW_BREAKPOINT, STATUS_FAILED, STATUS_PENDING, STATUS_QUEUED,
+    STATUS_RUNNING,
 };
 use crate::width::{display_width, pad_left, pad_right, truncate};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -1236,19 +1237,20 @@ fn find_entry_depletion_note(acct: &AgyAccountItem, entry: &QuotaPoolEntry) -> S
     };
     match evaluate_window_outcome(acct, &entry.window, w) {
         Some(WindowEstimateOutcome::RunsOutIn {
-            mins,
-            before_reset: true,
+            fast_m,
+            mid_m,
+            slow_m,
+            reset_secs,
+            alert: true,
         }) => {
-            if mins == 0 {
+            let compact = format_eta_compact(fast_m, mid_m, slow_m, reset_secs);
+            if mid_m == 0 || compact == "即将用完" {
                 "  ⚠ 即将用完".to_string()
             } else {
-                format!("  ⚠ 约 {} 用完", format_duration(Some(mins * 60)))
+                let stripped = compact.strip_prefix('~').unwrap_or(&compact);
+                format!("  ⚠ 约 {stripped} 用完")
             }
         }
-        Some(WindowEstimateOutcome::RunsOutIn {
-            before_reset: false,
-            ..
-        }) => "  重置前用不完".to_string(),
         _ => String::new(),
     }
 }
@@ -1738,4 +1740,59 @@ fn render_overview_narrow(frame: &mut Frame, app: &mut App, area: Rect) {
         .take(inner_h)
         .collect();
     frame.render_widget(Paragraph::new(visible), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_entry_depletion_note;
+    use crate::model::*;
+
+    #[test]
+    fn find_entry_depletion_note_does_not_duplicate_imminent_wording() {
+        let entry = QuotaPoolEntry {
+            pool: "Gemini Models".to_string(),
+            window: "fiveHour".to_string(),
+            window_label: "5h".to_string(),
+            remaining_pct_x100: 500,
+            reset_at: String::new(),
+            reset_in_seconds: Some(90),
+        };
+        let acct = AgyAccountItem {
+            id: "slot-a".to_string(),
+            email: String::new(),
+            label: String::new(),
+            active: true,
+            added_at: String::new(),
+            last_used_at: String::new(),
+            last_synced_at: String::new(),
+            token_expires_at: String::new(),
+            file_count: 0,
+            files: Vec::new(),
+            source: String::new(),
+            usage: AccountUsageStats::default(),
+            quota: Some(AccountRealQuota {
+                ok: true,
+                entries: vec![entry.clone()],
+                ..AccountRealQuota::default()
+            }),
+            quota_note: None,
+            quota_estimate: Some(QuotaEstimate {
+                five_hour: Some(QuotaWindowEstimate {
+                    status: QuotaEtaStatus::Depletes,
+                    alert: true,
+                    fast_minutes: Some(1),
+                    mid_minutes: Some(1),
+                    slow_minutes: None,
+                    reset_in_seconds: Some(90),
+                    running_count: 1,
+                    basis: "30m".to_string(),
+                    pool: Some("Gemini Models".to_string()),
+                    ..QuotaWindowEstimate::default()
+                }),
+                ..QuotaEstimate::default()
+            }),
+        };
+        let note = find_entry_depletion_note(&acct, &entry);
+        assert_eq!(note, "  ⚠ 即将用完");
+    }
 }

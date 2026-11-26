@@ -827,20 +827,17 @@ fn snapshot_accounts_tab_shows_5h_7d_usage_and_manual_quota_estimates() {
                 },
                 "quotaEstimate": {
                     "weekly": {
+                        "status": "safe",
                         "remainingPct": 95.41,
-                        "tokensPerPct": 10893246,
-                        "estimatedRemainingTokens": 1039324600,
-                        "estimatedRemainingHours": 346.4,
-                        "burnRatePerHour": 3000000,
-                        "method": "window"
+                        "basis": "24h",
+                        "source": "real"
                     },
                     "fiveHour": {
-                        "remainingPct": 85.10,
-                        "tokensPerPct": 1006711,
-                        "estimatedRemainingTokens": 85671140,
-                        "estimatedRemainingHours": 28.6,
-                        "burnRatePerHour": 3000000,
-                        "method": "window"
+                        "status": "insufficient",
+                        "reason": "too_early",
+                        "elapsedMinutes": 27,
+                        "remainingPct": 90.0,
+                        "source": "real"
                     }
                 }
             }
@@ -864,8 +861,8 @@ fn snapshot_accounts_tab_shows_5h_7d_usage_and_manual_quota_estimates() {
     assert!(screen.contains("近 7 天: 输入 2.0M"), "{screen}");
     assert!(screen.contains("本周剩余 95.41%"), "{screen}");
     assert!(screen.contains("5 小时剩余 85.1%"), "{screen}");
-    assert!(screen.contains("按当前用量，5 小时额度约 1 天 4 小时后用完"), "{screen}");
-    assert!(screen.contains("按当前用量，本周额度约 14 天 10 小时后用完"), "{screen}");
+    assert!(screen.contains("刚重置 27 分钟（剩 90%），数据不足暂不外推"), "{screen}");
+    assert!(screen.contains("按近 24 小时额度变化，本周额度在重置前用不完"), "{screen}");
     assert!(!screen.contains("不自动换号") || screen.contains("只提醒不自动换号"), "{screen}");
     assert!(!screen.contains("不调外部额度接口"), "{screen}");
     assert!(!screen.contains("每 1%"), "{screen}");
@@ -997,25 +994,19 @@ fn make_rich_quota_and_charts_app() -> App {
                     },
                     "quotaEstimate": {
                         "fiveHour": {
+                            "status": "safe",
                             "remainingPct": 44.0,
-                            "tokensPerPct": 666667,
-                            "estimatedRemainingTokens": 29333348,
-                            "estimatedRemainingHours": 11.73,
-                            "burnRatePerHour": 2500000,
-                            "method": "delta",
                             "source": "real",
-                            "burnRateSource": "5h",
+                            "basis": "30m",
+                            "runningCount": 1,
                             "pool": "Claude and GPT models"
                         },
                         "weekly": {
+                            "status": "safe",
                             "remainingPct": 91.0,
-                            "tokensPerPct": 6000000,
-                            "estimatedRemainingTokens": 546000000,
-                            "estimatedRemainingHours": 218.4,
-                            "burnRatePerHour": 2500000,
-                            "method": "window",
                             "source": "real",
-                            "burnRateSource": "24h",
+                            "basis": "24h",
+                            "runningCount": 1,
                             "pool": "Gemini Models"
                         }
                     }
@@ -1232,16 +1223,25 @@ fn snapshot_overview_and_accounts_real_quota_charts_120x40_and_80x24() {
 #[test]
 fn quota_estimate_reports_depletion_when_earlier_than_reset() {
     use delegate_tui::app::ViewTab;
+    use delegate_tui::model::QuotaEtaStatus;
 
     let mut app = make_rich_quota_and_charts_app();
     // Make fiveHour run out in 90 minutes (before 2h30m reset) and weekly in 3 days (before 6d9h reset).
     if let Some(alpha) = app.snapshot.agy_accounts.accounts.first_mut() {
         if let Some(est) = alpha.quota_estimate.as_mut() {
             if let Some(fh) = est.five_hour.as_mut() {
-                fh.estimated_remaining_minutes = Some(90);
+                fh.status = QuotaEtaStatus::Depletes;
+                fh.alert = true;
+                fh.fast_minutes = Some(85);
+                fh.mid_minutes = Some(90);
+                fh.slow_minutes = Some(100);
             }
             if let Some(wk) = est.weekly.as_mut() {
-                wk.estimated_remaining_minutes = Some(3 * 24 * 60);
+                wk.status = QuotaEtaStatus::Depletes;
+                wk.alert = true;
+                wk.fast_minutes = Some(3 * 24 * 60);
+                wk.mid_minutes = Some(3 * 24 * 60);
+                wk.slow_minutes = Some(3 * 24 * 60);
             }
         }
     }
@@ -1256,7 +1256,7 @@ fn quota_estimate_reports_depletion_when_earlier_than_reset() {
         "depletion before reset must not trigger top alert strip:\n{ov}"
     );
     assert!(ov.contains("4 额度(!)"), "tab badge should stay:\n{ov}");
-    assert!(ov.contains("⚠ 约 3d0h") && ov.contains("⚠ 约 1h3"), "{ov}");
+    assert!(ov.contains("⚠ 约 3d") && ov.contains("⚠ 约 1h3"), "{ov}");
 
     // Quota tab ('4') shows both windows clearly without truncation, and no top alert strip.
     app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
@@ -1266,10 +1266,10 @@ fn quota_estimate_reports_depletion_when_earlier_than_reset() {
         !acct.contains("▲ 告警"),
         "quota tab must not show top alert strip for depletion:\n{acct}"
     );
-    assert!(acct.contains("按最近 5 小时的平均用量，Claude/GPT 5 小时额度约 1 小时 30"), "{acct}");
+    assert!(acct.contains("按近 30 分钟额度变化（在跑 1），Claude/GPT 5 小时额度约 1 小时 30"), "{acct}");
     assert!(acct.contains("分钟后用完"), "{acct}");
     assert!(
-        acct.contains("按最近 24 小时的平均用量，Gemini 本周额度约 3 天后用完"),
+        acct.contains("按近 24 小时额度变化（在跑 1），Gemini 本周额度约 3 天后用完"),
         "{acct}"
     );
 }
@@ -2351,7 +2351,7 @@ fn tui_1126_fixes_ephemeral_work_rework_charts_quota_alert_and_stale_folding() {
                         ]
                     },
                     "quotaEstimate": {
-                        "weekly": {"pool": "Gemini Models", "remainingPct": 42.0, "tokensPerPct": 10000000, "estimatedRemainingHours": 11.0, "burnRateSource": "24h"}
+                        "weekly": {"pool": "Gemini Models", "status": "depletes", "alert": true, "remainingPct": 35.0, "fastMinutes": 600, "midMinutes": 660, "slowMinutes": 720, "runningCount": 1, "basis": "24h"}
                     }
                 }
             ]
@@ -2573,7 +2573,7 @@ fn global_alert_strip_silent_when_healthy_and_visible_across_all_5_tabs_on_p0_p1
                     ]
                 },
                 "quotaEstimate": {
-                    "fiveHour": {"pool": "Gemini Models", "remainingPct": 12.0, "tokensPerPct": 10000000, "estimatedRemainingHours": 1.2}
+                    "fiveHour": {"pool": "Gemini Models", "status": "depletes", "alert": true, "remainingPct": 12.0, "fastMinutes": 60, "midMinutes": 72, "slowMinutes": 80, "runningCount": 1, "basis": "30m"}
                 }
             }]
         },
@@ -2634,9 +2634,9 @@ fn global_alert_strip_silent_when_healthy_and_visible_across_all_5_tabs_on_p0_p1
                     ]
                 },
                 "quotaEstimate": {
-                    "weekly": {"pool": "Gemini Models", "remainingPct": 63.0, "tokensPerPct": 10000000, "estimatedRemainingHours": 12.95, "burnRateSource": "24h"},
+                    "weekly": {"pool": "Gemini Models", "status": "depletes", "alert": true, "remainingPct": 38.0, "fastMinutes": 720, "midMinutes": 780, "slowMinutes": 840, "runningCount": 1, "basis": "24h"},
                     "pools": [
-                        {"pool": "Gemini Models", "weekly": {"pool": "Gemini Models", "remainingPct": 63.0, "tokensPerPct": 10000000, "estimatedRemainingHours": 12.95, "burnRateSource": "24h"}}
+                        {"pool": "Gemini Models", "tier": "yellow", "weekly": {"pool": "Gemini Models", "status": "depletes", "alert": true, "remainingPct": 38.0, "fastMinutes": 720, "midMinutes": 780, "slowMinutes": 840, "runningCount": 1, "basis": "24h"}}
                     ]
                 }
             }]
@@ -2665,7 +2665,7 @@ fn global_alert_strip_silent_when_healthy_and_visible_across_all_5_tabs_on_p0_p1
     assert_lines_fit_width(&tab4_reminder, 180);
     assert!(!tab4_reminder.contains("▲ 告警"), "tab 4 must not show top alert strip:\n{tab4_reminder}");
     assert!(
-        tab4_reminder.contains("⚠ 周 ~12h57m") && tab4_reminder.contains("用完"),
+        tab4_reminder.contains("⚠ 周 ~13h") && tab4_reminder.contains("用完"),
         "tab 4 must keep depletion reminder:\n{tab4_reminder}"
     );
     if std::env::var("PRINT_TUI_SNAPSHOTS").as_deref() == Ok("1") {

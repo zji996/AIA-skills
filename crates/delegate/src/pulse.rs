@@ -450,6 +450,8 @@ pub fn format_status_quota_alert_line_from_snapshot(agy_accounts_snap: &Value) -
     }
 
     let accounts = agy_accounts_snap["accounts"].as_array()?;
+    let is_auto = s(agy_accounts_snap, "mode") == agy_accounts::AUTO_ACCOUNT_ID
+        || b(&agy_accounts_snap["autoSwitch"], "enabled");
     let active_acct = accounts.iter().find(|a| b(a, "active"));
     let active_id = active_acct
         .map(|a| s(a, "id"))
@@ -471,6 +473,62 @@ pub fn format_status_quota_alert_line_from_snapshot(agy_accounts_snap: &Value) -
             "⚠ 额度提醒：★{active_short} 额度缓存账号身份不匹配（请运行 delegate agy account status 核对，仅提醒不自动切号）"
         ));
     }
+    if is_auto {
+        // In auto mode, only remind on `< 15%` when ALL healthy accounts for that pool are non-Green.
+        let healthy: Vec<&Value> = accounts
+            .iter()
+            .filter(|a| b(&a["quota"], "ok") && !b(&a["quota"], "identityMismatch"))
+            .collect();
+        let mut low_parts = Vec::new();
+        for pool in agy_accounts::QuotaPool::ALL {
+            let any_green = healthy.iter().any(|a| {
+                a["quotaEstimate"]["pools"]
+                    .as_array()
+                    .and_then(|arr| {
+                        arr.iter()
+                            .find(|pe| {
+                                agy_accounts::classify_quota_pool_name(s(pe, "pool")) == Some(pool)
+                            })
+                            .map(|pe| s(pe, "tier") == "green")
+                    })
+                    .unwrap_or(false)
+            });
+            if any_green {
+                continue;
+            }
+            let pkey = pool.key();
+            let sel_id = s(&agy_accounts_snap["autoSwitch"]["poolSummary"][pkey], "selected");
+            let target = healthy
+                .iter()
+                .copied()
+                .find(|a| !sel_id.is_empty() && s(a, "id") == sel_id)
+                .or(active_acct);
+            if let Some(acct) = target {
+                if let Some(entries) = acct["quota"]["entries"].as_array() {
+                    for e in entries {
+                        if agy_accounts::classify_quota_pool_name(s(e, "pool")) != Some(pool) {
+                            continue;
+                        }
+                        let Some(pct) = e["remainingPct"].as_f64() else {
+                            continue;
+                        };
+                        if pct < QUOTA_LOW_REMINDER_PCT {
+                            let pool_short = short_pool_name(s(e, "pool"));
+                            let win_short = short_window_name(s(e, "window"));
+                            low_parts.push(format!("{pool_short}{win_short}仅剩{}%", pct.round() as i64));
+                        }
+                    }
+                }
+            }
+        }
+        if !low_parts.is_empty() {
+            return Some(format!(
+                "⚠ 额度偏低：auto 模式所有可用号 {}（请留意重置时间或调整任务节奏）",
+                low_parts.join("、")
+            ));
+        }
+        return None;
+    }
     if let Some(acct) = active_acct {
         let quota = &acct["quota"];
         if b(quota, "ok") && !b(quota, "identityMismatch") {
@@ -488,7 +546,7 @@ pub fn format_status_quota_alert_line_from_snapshot(agy_accounts_snap: &Value) -
                 }
                 if !low_parts.is_empty() {
                     return Some(format!(
-                        "⚠ 额度偏低：★{active_short} {}（可按需手动切号 delegate agy account use，绝不自动切号）",
+                        "⚠ 额度偏低：★{active_short} {}（可按需切号或启用 auto：delegate agy account use auto）",
                         low_parts.join("、")
                     ));
                 }
@@ -952,7 +1010,17 @@ mod tests {
                 "quotaEstimate": {
                     "pools": [{
                         "pool": "Gemini",
-                        "weekly": { "estimatedRemainingMinutes": 109 }
+                        "tier": "yellow",
+                        "weekly": {
+                            "pool": "Gemini",
+                            "status": "depletes",
+                            "alert": true,
+                            "fastMinutes": 90,
+                            "midMinutes": 109,
+                            "slowMinutes": 120,
+                            "runningCount": 1,
+                            "basis": "24h"
+                        }
                     }]
                 }
             }]
