@@ -1778,6 +1778,66 @@ db.write_text(json.dumps(units))
         self.assertIn('"resume"', (run / "events.jsonl").read_text())
         self.assertEqual((run / "result.md").read_text().strip(), "continued")
 
+    def test_tls_stderr_resumes_the_same_session(self):
+        self.env["DELEGATE_RESUME_BACKOFF"] = "0.1"
+        self.fake_pi(
+            [answer("unused"), SETTLED],
+            [answer("recovered-after-tls"), SETTLED],
+            probe=[answer("ok"), SETTLED],
+            pre='if [ "$n" -eq 1 ]; then echo "tls: failed to verify certificate: x509: certificate signed by unknown authority" >&2; exit 1; fi',
+        )
+        result = self.cli("run", "task")
+        state = self.outcome(result)
+        self.assertEqual(
+            (state.get("state"), state.get("resumes"), state.get("attempts")),
+            ("answered", 1, 2),
+            f"unexpected tls resume outcome: {state}",
+        )
+        self.assertIn("x509: certificate signed by unknown authority", state["transientError"])
+        calls = (self.work / "pi.log").read_text().splitlines()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--fork", calls[1])
+
+    def test_handshake_eof_without_saved_session_retries_and_escalates(self):
+        self.env["DELEGATE_RESUME_BACKOFF"] = "0.1,0.1"
+        # Attempt 1 fails during handshake before saving a session; attempt 2 reruns with the original prompt.
+        self.fake_pi(
+            [answer("unused"), SETTLED],
+            [answer("recovered-after-eof"), SETTLED],
+            probe=[answer("ok"), SETTLED],
+            pre='if [ "$n" -eq 1 ]; then rm -f "$dir"/*.jsonl; echo \'Post "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist": EOF\' >&2; exit 1; fi',
+        )
+        result = self.cli("run", "task")
+        state = self.outcome(result)
+        self.assertEqual(
+            (state.get("state"), state.get("resumes"), state.get("attempts")),
+            ("answered", 1, 2),
+            f"unexpected handshake eof retry outcome: {state}",
+        )
+        self.assertIn('loadCodeAssist": EOF', state["transientError"])
+        calls = (self.work / "pi.log").read_text().splitlines()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--session-id", calls[1])
+        self.assertNotIn("--fork", calls[1])
+
+        # Repeated handshake EOF without session exhausts same-model retry and escalates to the next model in tier.
+        (self.work / "pi.log").unlink()
+        self.user_config(self.purpose_config(review=[{"model": "sol", "maxActive": 10}, "coder"]))
+        self.fake_pi(
+            [answer("unused"), SETTLED],
+            [answer("unused"), SETTLED],
+            [answer("escalated-ok"), SETTLED],
+            probe=[answer("ok"), SETTLED],
+            pre='if [ "$n" -le 2 ]; then rm -f "$dir"/*.jsonl; echo \'Post "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist": EOF\' >&2; exit 1; fi',
+        )
+        esc = self.outcome(self.cli("run", "--read-only", "--tier", "review", "--retries", "0", "task"))
+        self.assertEqual(
+            (esc.get("state"), esc.get("tier"), esc.get("escalatedFrom")),
+            ("answered", "review", "p/review-m"),
+            f"unexpected handshake eof escalate outcome: {esc}",
+        )
+        self.assertIn("--model p/write-m", (self.work / "pi.log").read_text().splitlines()[-1])
+
     def test_write_worktree_keeps_its_changes_across_a_resume(self):
         self.env["DELEGATE_RESUME_BACKOFF"] = "0.1"
         # Each attempt appends to the same file in the worktree: the second sees the first's work.

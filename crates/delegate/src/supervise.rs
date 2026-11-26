@@ -1143,12 +1143,16 @@ pub(crate) fn resume_transient(
             log_event(run, json!({"e":"resume_skipped","n":tried,"error":down}));
             continue;
         }
-        let Some(next) = continuation(meta, run) else {
-            log_event(
-                run,
-                json!({"e":"resume_skipped","n":tried,"error":"no saved session to continue"}),
-            );
-            break;
+        let next = match continuation(meta, run) {
+            Some(next) => next,
+            None if attempts == 1 => meta.clone(),
+            None => {
+                log_event(
+                    run,
+                    json!({"e":"resume_skipped","n":tried,"error":"no saved session to continue"}),
+                );
+                break;
+            }
         };
         resumes += 1;
         attempts += 1;

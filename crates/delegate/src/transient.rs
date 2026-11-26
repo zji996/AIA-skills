@@ -57,6 +57,17 @@ fn has(text: &str, markers: &[&str]) -> bool {
     markers.iter().any(|marker| text.contains(marker))
 }
 
+/// Matches Go/net `...: EOF` connection errors without hitting ordinary words like `typeof`/`thereof`.
+fn has_eof(text: &str) -> bool {
+    text == "eof"
+        || text.match_indices(": eof").any(|(at, _)| {
+            !text[at + 5..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
+
 /// The kind of upstream failure `text` reports, or `None` when the task itself has to change.
 /// Case-insensitive: Pi, rpi and the gateways in front of them word the same failure differently.
 pub fn kind(text: &str) -> Option<Kind> {
@@ -154,8 +165,18 @@ pub fn kind(text: &str) -> Option<Kind> {
             "upstream connect error",
             "upstream request timeout",
             "prematurely closed",
+            "broken pipe",
+            "epipe",
+            "use of closed network connection",
+            "tls: failed to verify certificate",
+            "x509: certificate",
+            "certificate signed by unknown authority",
+            "tls handshake",
+            "remote error: tls:",
+            "ssl handshake",
         ],
-    ) {
+    ) || has_eof(&text)
+    {
         return Some(Kind::Connection);
     }
     if status(&text, "429") || has(&text, &["too many requests", "rate limit", "rate_limit"]) {
@@ -258,6 +279,35 @@ mod tests {
             kind("Request failed: Expected OAuth 2 access token, login cookie or other valid authentication credential"),
             Some(Kind::AuthRefresh)
         );
+        // TLS handshake / certificate verification failures and connection EOF / reset.
+        assert_eq!(
+            kind("Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist\": tls: failed to verify certificate: x509: certificate signed by unknown authority"),
+            Some(Kind::Connection)
+        );
+        assert_eq!(
+            kind("net/http: TLS handshake timeout"),
+            Some(Kind::Connection)
+        );
+        assert_eq!(
+            kind("remote error: tls: handshake failure"),
+            Some(Kind::Connection)
+        );
+        assert_eq!(
+            kind("Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist\": EOF"),
+            Some(Kind::Connection)
+        );
+        assert_eq!(
+            kind("loadCodeAssist: EOF (retryable)"),
+            Some(Kind::Connection)
+        );
+        assert_eq!(
+            kind("read tcp 192.0.2.1:443: connection reset by peer"),
+            Some(Kind::Connection)
+        );
+        assert_eq!(
+            kind("write tcp 192.0.2.1:443: broken pipe"),
+            Some(Kind::Connection)
+        );
         // The caller has to fix these; retrying the same session would just repeat the error.
         assert_eq!(kind("401 Unauthorized: invalid api key"), None);
         assert_eq!(kind("UNAUTHENTICATED: invalid api key"), None);
@@ -266,7 +316,48 @@ mod tests {
         assert_eq!(kind("404 model not found: p/typo"), None);
         assert_eq!(kind("context length exceeded"), None);
         assert_eq!(kind("the tests still fail"), None);
+        // Ordinary words containing "eof" must not trigger EOF matching.
+        assert_eq!(kind("syntax error near typeof x"), None);
+        assert_eq!(kind("terms thereof are invalid"), None);
+        assert_eq!(kind("parse error: eof_marker missing"), None);
         // A number that only looks like a status code is not one.
         assert_eq!(kind("stopped after 1401 tokens"), None);
+    }
+
+    #[test]
+    fn ended_by_kind_reads_tls_and_eof_from_stderr_log() {
+        let base = std::env::temp_dir().join(format!(
+            "delegate-transient-test-{}-{}",
+            std::process::id(),
+            crate::common::epoch()
+        ));
+        let tls_run = base.join("tls");
+        let eof_run = base.join("eof");
+        std::fs::create_dir_all(&tls_run).unwrap();
+        std::fs::create_dir_all(&eof_run).unwrap();
+
+        std::fs::write(
+            tls_run.join("stderr.log"),
+            "initializing client\nError: tls: failed to verify certificate: x509: certificate signed by unknown authority\n",
+        )
+        .unwrap();
+        let found_tls = ended_by_kind(&tls_run, 1);
+        assert!(
+            matches!(found_tls, Some((Kind::Connection, ref msg)) if msg.contains("x509: certificate signed by unknown authority")),
+            "expected Kind::Connection for TLS stderr, got {found_tls:?}"
+        );
+
+        std::fs::write(
+            eof_run.join("stderr.log"),
+            "connecting...\nPost \"https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist\": EOF\n",
+        )
+        .unwrap();
+        let found_eof = ended_by_kind(&eof_run, 1);
+        assert!(
+            matches!(found_eof, Some((Kind::Connection, ref msg)) if msg.contains("loadCodeAssist\": EOF")),
+            "expected Kind::Connection for EOF stderr, got {found_eof:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
