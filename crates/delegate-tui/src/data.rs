@@ -365,11 +365,17 @@ impl DelegateClient {
             work: Vec::new(),
             lane,
             events: events_list,
+            events_has_more: false,
+            events_earliest_seq: None,
             dag_queue: dag_queue_list,
             merges: merges_list,
             candidates: candidates_list,
             agy_accounts: agy_accounts_state,
             analytics: AnalyticsSnapshot::default(),
+            recent_deliveries: Vec::new(),
+            pulse: None,
+            alerts: Vec::new(),
+            alerts_from_snapshot: false,
             eta: SnapshotEta::default(),
             host_load,
             generated_epoch: None,
@@ -467,6 +473,7 @@ pub fn parse_snapshot_json(
     if let Some(repos) = doc["repos"].as_array() {
         for r in repos {
             let repo_path = PathBuf::from(r["path"].as_str().unwrap_or(""));
+            let runs_dir_str = r["runsDir"].as_str().unwrap_or("");
             let label = repo_display_label(&repo_path, home);
             let mut jsonl = String::new();
             if let Some(runs) = r["runs"].as_array() {
@@ -481,7 +488,10 @@ pub fn parse_snapshot_json(
                     jsonl.push('\n');
                 }
             }
-            let group = parse_status_jsonl_at(&repo_path, &label, &jsonl, generated_epoch);
+            let mut group = parse_status_jsonl_at(&repo_path, &label, &jsonl, generated_epoch);
+            if !runs_dir_str.is_empty() {
+                group.runs_dir = PathBuf::from(runs_dir_str);
+            }
             if !group.runs.is_empty() {
                 groups.push(group);
             }
@@ -510,12 +520,20 @@ pub fn parse_snapshot_json(
 
     let work = parse_work_value(&doc["work"]);
     let mut events = parse_events_jsonl(&arr_to_jsonl(&doc["events"]));
+    let events_has_more = doc["eventsHasMore"].as_bool().unwrap_or(false);
+    let events_earliest_seq = doc["eventsEarliestSeq"]
+        .as_u64()
+        .or_else(|| events.first().map(|e| e.seq));
     let dag_queue = parse_dag_queue_jsonl(&arr_to_jsonl(&doc["dagQueue"]));
     let merges = parse_merges_jsonl(&arr_to_jsonl(&doc["merges"]));
     let candidates = parse_candidates_jsonl(&arr_to_jsonl(&doc["candidates"]));
     let mut agy_accounts = parse_agy_accounts_value(&doc["agyAccounts"]);
     enrich_run_names_from_groups(&groups, &mut events, &mut agy_accounts);
     let analytics = parse_analytics_value(&doc["analytics"]);
+    let recent_deliveries = parse_recent_deliveries_value(&doc["recentDeliveries"]);
+    let pulse = parse_pulse_value(&doc["pulse"]);
+    let alerts_from_snapshot = doc["alerts"].is_array();
+    let alerts = parse_alerts_value(&doc["alerts"]);
     let eta = parse_snapshot_eta_value(&doc["eta"]);
     let host_load = read_host_load();
     let today_ymd = doc["generatedAt"]
@@ -528,11 +546,17 @@ pub fn parse_snapshot_json(
         work,
         lane,
         events,
+        events_has_more,
+        events_earliest_seq,
         dag_queue,
         merges,
         candidates,
         agy_accounts,
         analytics,
+        recent_deliveries,
+        pulse,
+        alerts,
+        alerts_from_snapshot,
         eta,
         host_load,
         generated_epoch,
@@ -775,6 +799,7 @@ pub fn parse_status_jsonl_at(
 
     RepoGroup {
         path: repo_path.to_path_buf(),
+        runs_dir: repo_path.join(".local/run/delegate"),
         label: repo_label.to_string(),
         runs,
     }
@@ -1095,7 +1120,200 @@ fn parse_run_item(
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         eta: parse_run_eta_value(v.get("eta")),
+        card_l0: parse_card_l0_value(v.get("card")),
     }
+}
+
+fn parse_card_l0_value(v: Option<&Value>) -> Option<CardL0Info> {
+    let obj = v.filter(|x| x.is_object())?;
+    let risk_count = obj
+        .get("riskTotal")
+        .or_else(|| obj.get("risks"))
+        .or_else(|| obj.get("riskCount"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let max_severity = opt_nonempty_str(obj.get("maxSeverity"));
+    let fast_forward = obj.get("fastForward").and_then(Value::as_bool);
+    let tests_added = obj.get("testsAdded").and_then(Value::as_u64).unwrap_or(0);
+    let explicit_summary = single_line(obj.get("summary").and_then(Value::as_str).unwrap_or(""));
+    let summary = if !explicit_summary.is_empty() {
+        explicit_summary
+    } else if let Some(arr) = obj.get("riskByCategory").and_then(Value::as_array) {
+        let mut parts: Vec<String> = arr
+            .iter()
+            .take(3)
+            .filter_map(|item| {
+                let cat = single_line(item.get("category").and_then(Value::as_str).unwrap_or(""));
+                let cnt = item.get("count").and_then(Value::as_u64).unwrap_or(0);
+                if cat.is_empty() || cnt == 0 {
+                    None
+                } else {
+                    Some(format!("{cat} {cnt}"))
+                }
+            })
+            .collect();
+        if arr.len() > 3 && !parts.is_empty() {
+            if let Some(last) = parts.last_mut() {
+                last.push_str(" 等");
+            }
+        }
+        parts.join("、")
+    } else {
+        String::new()
+    };
+    Some(CardL0Info {
+        risk_count,
+        max_severity,
+        fast_forward,
+        tests_added,
+        summary,
+    })
+}
+
+/// Strictly read-only, zero-subprocess load of a single run's L1 merge review card
+/// from `<runs_dir>/<run_id>/card.json`. Called on demand for the currently selected run.
+pub fn read_run_card_json(runs_dir: &Path, run_id: &str) -> Option<RunCardL1> {
+    if run_id.is_empty() || runs_dir.as_os_str().is_empty() {
+        return None;
+    }
+    let path = runs_dir.join(run_id).join("card.json");
+    let raw = fs::read_to_string(&path).ok()?;
+    let doc: Value = serde_json::from_str(&raw).ok()?;
+    if !doc.is_object() {
+        return None;
+    }
+
+    let mut risks = Vec::new();
+    if let Some(arr) = doc["risks"].as_array() {
+        for r in arr {
+            if !r.is_object() {
+                continue;
+            }
+            let severity = single_line(r.get("severity").and_then(Value::as_str).unwrap_or(""));
+            let category = single_line(
+                r.get("category")
+                    .or_else(|| r.get("label"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            );
+            let mut path_s = single_line(
+                r.get("file")
+                    .or_else(|| r.get("path"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            );
+            let mut line = r
+                .get("line")
+                .or_else(|| r.get("startLine"))
+                .and_then(Value::as_u64);
+            if path_s.is_empty() {
+                if let Some(loc) = r.get("location").and_then(Value::as_str) {
+                    let loc = single_line(loc);
+                    if let Some((f, l)) = loc.rsplit_once(':') {
+                        if let Ok(n) = l.parse::<u64>() {
+                            path_s = f.to_string();
+                            if line.is_none() {
+                                line = Some(n);
+                            }
+                        } else {
+                            path_s = loc;
+                        }
+                    } else {
+                        path_s = loc;
+                    }
+                }
+            }
+            let added = r.get("added").and_then(Value::as_u64).unwrap_or(0);
+            let deleted = r.get("deleted").and_then(Value::as_u64).unwrap_or(0);
+            let reason = single_line(
+                r.get("reason")
+                    .or_else(|| r.get("summary"))
+                    .or_else(|| r.get("detail"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            );
+            let source = single_line(r.get("source").and_then(Value::as_str).unwrap_or(""));
+            risks.push(CardRiskEntry {
+                severity,
+                category,
+                path: path_s,
+                line,
+                added,
+                deleted,
+                reason,
+                source,
+            });
+        }
+    }
+
+    let rule_hits = doc["riskStats"]
+        .get("ruleHits")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| risks.iter().filter(|r| r.source.contains("规则")).count() as u64)
+        as usize;
+    let reviewer_hints = doc["riskStats"]
+        .get("reviewerHints")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| risks.iter().filter(|r| r.source.contains("审查员")).count() as u64)
+        as usize;
+
+    let tests_added = doc["tests"].get("added").and_then(Value::as_u64).unwrap_or(0);
+    let tests_modified = doc["tests"]
+        .get("modified")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let tests_deleted = doc["tests"]
+        .get("deleted")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    let review_verdict = single_line(doc["review"].get("verdict").and_then(Value::as_str).unwrap_or(""));
+    let review_summary = single_line(
+        doc["review"]
+            .get("conclusion")
+            .or_else(|| doc["review"].get("summary"))
+            .or_else(|| doc["review"].get("headline"))
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    );
+    let review_round = doc["review"].get("round").and_then(Value::as_u64).unwrap_or(0);
+    let fast_forward = doc.get("fastForward").and_then(Value::as_bool);
+
+    let accept_ok = doc["accept"].get("ok").and_then(Value::as_bool);
+    let accept_label = single_line(
+        doc["accept"]
+            .get("label")
+            .or_else(|| doc["accept"].get("command"))
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    );
+    let (accept_layers_passed, accept_layers_total) = doc["accept"]["layers"]
+        .as_array()
+        .map(|arr| {
+            let passed = arr
+                .iter()
+                .filter(|l| l.get("status").and_then(Value::as_str) == Some("passed"))
+                .count();
+            (passed, arr.len())
+        })
+        .unwrap_or((0, 0));
+
+    Some(RunCardL1 {
+        risks,
+        rule_hits,
+        reviewer_hints,
+        tests_added,
+        tests_modified,
+        tests_deleted,
+        review_verdict,
+        review_summary,
+        review_round,
+        fast_forward,
+        accept_ok,
+        accept_label,
+        accept_layers_passed,
+        accept_layers_total,
+    })
 }
 
 fn parse_premerge(v: Option<&Value>) -> Option<PremergeInfo> {
@@ -1145,7 +1363,10 @@ fn parse_premerge(v: Option<&Value>) -> Option<PremergeInfo> {
 }
 
 fn is_zero_change_delivery(v: &Value, by_id: &HashMap<String, &Value>) -> bool {
-    if v.get("state").and_then(Value::as_str) != Some("delivered") {
+    if !matches!(
+        v.get("state").and_then(Value::as_str),
+        Some("delivered" | "answered")
+    ) {
         return false;
     }
     if v.get("mode").and_then(Value::as_str) != Some("write") {
@@ -1242,7 +1463,7 @@ pub fn is_run_pending_actionable(
     if question {
         return true;
     }
-    if state == "delivered" && mode == "write" {
+    if matches!(state, "delivered" | "answered") && mode == "write" {
         return if zero_change { !result_read } else { true };
     }
     !result_read
@@ -3125,13 +3346,147 @@ pub fn parse_analytics_value(v: &Value) -> AnalyticsSnapshot {
         })
         .collect();
 
+    let tb = &v["tokenBreakdown"];
+    let token_input_7d = tb.get("input").and_then(Value::as_u64).unwrap_or(0);
+    let token_output_7d = tb.get("output").and_then(Value::as_u64).unwrap_or(0);
+    let token_cache_read_7d = tb.get("cacheRead").and_then(Value::as_u64).unwrap_or(0);
+
     AnalyticsSnapshot {
         hourly_24h_total,
         hourly_24h_by_account,
         by_purpose,
         by_model,
         daily_7d,
+        token_input_7d,
+        token_output_7d,
+        token_cache_read_7d,
     }
+}
+
+pub fn parse_recent_deliveries_value(v: &Value) -> Vec<RecentDeliveryItem> {
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|d| {
+            if !d.is_object() {
+                return None;
+            }
+            let run = d.get("run").and_then(Value::as_str).unwrap_or("").to_string();
+            if run.is_empty() {
+                return None;
+            }
+            let name = single_line(d.get("name").and_then(Value::as_str).unwrap_or(&run));
+            let repo = single_line(d.get("repo").and_then(Value::as_str).unwrap_or(""));
+            let source_root = d
+                .get("sourceRoot")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let applied_at = d
+                .get("appliedAt")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let applied_epoch = d
+                .get("appliedEpoch")
+                .and_then(Value::as_i64)
+                .or_else(|| parse_iso_utc_epoch(&applied_at))
+                .unwrap_or(0);
+            let applied_head = single_line(d.get("appliedHead").and_then(Value::as_str).unwrap_or(""));
+            let changes_files = d.get("changesFiles").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let added = d.get("added").and_then(Value::as_i64).unwrap_or(0);
+            let deleted = d.get("deleted").and_then(Value::as_i64).unwrap_or(0);
+            let elapsed_seconds = d.get("elapsedSeconds").and_then(Value::as_i64).unwrap_or(0);
+            let rounds = d.get("rounds").and_then(Value::as_u64).unwrap_or(1) as usize;
+            let conclusion = d
+                .get("conclusion")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let work_id = opt_nonempty_str(d.get("workId"));
+            let cleaned = d.get("cleaned").and_then(Value::as_bool).unwrap_or(false);
+            Some(RecentDeliveryItem {
+                run,
+                name,
+                repo,
+                source_root,
+                applied_at,
+                applied_epoch,
+                applied_head,
+                changes_files,
+                added,
+                deleted,
+                elapsed_seconds,
+                rounds,
+                conclusion,
+                work_id,
+                cleaned,
+            })
+        })
+        .collect()
+}
+
+pub fn parse_pulse_value(v: &Value) -> Option<SnapshotPulse> {
+    if !v.is_object() {
+        return None;
+    }
+    Some(SnapshotPulse {
+        owner_open: v.get("ownerOpen").and_then(Value::as_u64).unwrap_or(0) as usize,
+        controller_pending: v
+            .get("controllerPending")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize,
+        stale_pending: v.get("stalePending").and_then(Value::as_u64).unwrap_or(0) as usize,
+        running_runs: v.get("runningRuns").and_then(Value::as_u64).unwrap_or(0) as usize,
+        queued_runs: v.get("queuedRuns").and_then(Value::as_u64).unwrap_or(0) as usize,
+        work_active_pool: v
+            .get("workActivePool")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize,
+        work_deferred: v.get("workDeferred").and_then(Value::as_u64).unwrap_or(0) as usize,
+        work_timed: v.get("workTimed").and_then(Value::as_u64).unwrap_or(0) as usize,
+        merged_today: v.get("mergedToday").and_then(Value::as_u64).unwrap_or(0) as usize,
+        pending_has_urgent: v
+            .get("pendingHasUrgent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        quota_alert: v.get("quotaAlert").and_then(Value::as_bool).unwrap_or(false),
+        p0_alert: v.get("p0Alert").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+pub fn parse_alerts_value(v: &Value) -> Vec<ActiveAlertItem> {
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|a| {
+            if !a.is_object() {
+                return None;
+            }
+            let level = match a.get("level").and_then(Value::as_str).unwrap_or("P1") {
+                "P0" => AlertLevel::P0,
+                _ => AlertLevel::P1,
+            };
+            let kind = single_line(a.get("kind").and_then(Value::as_str).unwrap_or(""));
+            let label = single_line(a.get("label").and_then(Value::as_str).unwrap_or(""));
+            let message = single_line(a.get("message").and_then(Value::as_str).unwrap_or(""));
+            if message.is_empty() {
+                return None;
+            }
+            let target_tab = a.get("targetTab").and_then(Value::as_u64).unwrap_or(1) as u8;
+            let target_id = opt_nonempty_str(a.get("targetId"));
+            Some(ActiveAlertItem {
+                level,
+                kind,
+                label,
+                message,
+                target_tab,
+                target_id,
+            })
+        })
+        .collect()
 }
 
 pub fn parse_agy_accounts_value(v: &Value) -> AgyAccountsState {

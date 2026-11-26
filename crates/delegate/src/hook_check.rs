@@ -118,7 +118,7 @@ pub fn is_run_pending_actionable(
     if question {
         return true;
     }
-    if state == "delivered" && mode == "write" {
+    if matches!(state, "delivered" | "answered") && mode == "write" {
         return if zero_change { !result_read } else { true };
     }
     !result_read
@@ -2979,6 +2979,8 @@ fn fastest_waiter_eta(
 struct EvalOutput {
     items: Vec<PendingItem>,
     pending_runs: Vec<String>,
+    controller_pending_runs: Vec<String>,
+    stale_pending_runs: Vec<String>,
     caller_id: String,
 }
 
@@ -3096,6 +3098,8 @@ fn evaluate_core(
     }
 
     let pending_runs = classify_pending_runs(&all_repo_runs_flat);
+    let work_items_json: Vec<Value> = work_items.iter().map(work::WorkItem::to_json).collect();
+    let pending_split = crate::pulse::split_pending_runs(&all_repo_runs_flat, &work_items_json, now);
 
     let mut out_items: Vec<PendingItem> = Vec::new();
     let mut covered_run_ids: HashSet<String> = HashSet::new();
@@ -3863,6 +3867,8 @@ fn evaluate_core(
     EvalOutput {
         items: out_items,
         pending_runs,
+        controller_pending_runs: pending_split.active_pending,
+        stale_pending_runs: pending_split.stale_pending,
         caller_id,
     }
 }
@@ -4353,6 +4359,8 @@ pub fn check_cmd(args: &[String]) -> Res<i32> {
                     "remaining": remaining,
                     "total": out.items.len(),
                     "pendingRunCount": out.pending_runs.len(),
+                    "controllerPendingCount": out.controller_pending_runs.len(),
+                    "stalePendingCount": out.stale_pending_runs.len(),
                 })
             );
         }
@@ -4413,6 +4421,10 @@ pub fn pending_cmd(args: &[String]) -> Res<i32> {
                 "total": out.items.len(),
                 "pendingRunCount": out.pending_runs.len(),
                 "pendingRuns": out.pending_runs,
+                "controllerPendingCount": out.controller_pending_runs.len(),
+                "controllerPendingRuns": out.controller_pending_runs,
+                "stalePendingCount": out.stale_pending_runs.len(),
+                "stalePendingRuns": out.stale_pending_runs,
                 "items": items_json,
             })
         );

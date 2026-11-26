@@ -5,7 +5,8 @@ use crate::runs;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 pub const MAX_HISTORY_LINE_BYTES: usize = 2000;
@@ -2264,6 +2265,264 @@ pub fn show_command(args: &[String]) -> Res<i32> {
     Ok(0)
 }
 
+/// Compact per-run record folded from `<state>/history/*/history.jsonl` in a single tail-chunk pass.
+/// Shared by 7-day trend analytics, `recentDeliveries`, and `mergedToday` without full-file scans.
+#[derive(Debug, Clone, Default)]
+pub struct RecentHistoryRecord {
+    pub run: String,
+    pub name: String,
+    pub repo_label: String,
+    pub source_root: String,
+    pub mode: String,
+    pub state: String,
+    pub parent: String,
+    pub started_epoch: i64,
+    pub finished_epoch: i64,
+    pub applied_epoch: Option<i64>,
+    pub applied_at: String,
+    pub applied_head: String,
+    pub elapsed_seconds: i64,
+    pub rework_count: u64,
+    pub changes_files: usize,
+    pub added: i64,
+    pub deleted: i64,
+    pub conclusion: String,
+    pub cleaned: bool,
+    pub archive: String,
+}
+
+fn repo_label_from_history_dir(dir_name: &str) -> String {
+    if let Some((prefix, suffix)) = dir_name.rsplit_once('-') {
+        if suffix.len() == 12 && suffix.bytes().all(|b| b.is_ascii_hexdigit()) && !prefix.is_empty()
+        {
+            return prefix.to_string();
+        }
+    }
+    dir_name.to_string()
+}
+
+fn fold_history_value_into_recent(
+    map: &mut HashMap<String, RecentHistoryRecord>,
+    v: &Value,
+    fallback_repo: &str,
+) -> Option<i64> {
+    let line_ts = iso_epoch(s(v, "at"))
+        .or_else(|| iso_epoch(s(v, "appliedAt")))
+        .or_else(|| iso_epoch(s(v, "finishedAt")))
+        .or_else(|| iso_epoch(s(v, "startedAt")));
+    let rid = s(v, "run");
+    if rid.is_empty() {
+        return line_ts;
+    }
+    let rec = map
+        .entry(rid.to_string())
+        .or_insert_with(|| RecentHistoryRecord {
+            run: rid.to_string(),
+            repo_label: fallback_repo.to_string(),
+            ..RecentHistoryRecord::default()
+        });
+    if rec.repo_label.is_empty() && !fallback_repo.is_empty() {
+        rec.repo_label = fallback_repo.to_string();
+    }
+    let event = s(v, "event");
+    match event {
+        "" | "finish" => {
+            if !s(v, "name").is_empty() {
+                rec.name = s(v, "name").to_string();
+            }
+            if !s(v, "mode").is_empty() {
+                rec.mode = s(v, "mode").to_string();
+            }
+            if !s(v, "state").is_empty() {
+                rec.state = s(v, "state").to_string();
+            }
+            if !s(v, "parent").is_empty() {
+                rec.parent = s(v, "parent").to_string();
+            }
+            if let Some(st) = iso_epoch(s(v, "startedAt")) {
+                if st > 0 {
+                    rec.started_epoch = st;
+                }
+            }
+            if let Some(fin) = iso_epoch(s(v, "finishedAt")) {
+                if fin > 0 {
+                    rec.finished_epoch = fin;
+                }
+            } else if rec.finished_epoch == 0 && rec.started_epoch > 0 {
+                rec.finished_epoch = rec.started_epoch;
+            }
+            if !s(v, "appliedAt").is_empty() {
+                rec.applied_at = s(v, "appliedAt").to_string();
+                if let Some(app_ep) = iso_epoch(&rec.applied_at) {
+                    rec.applied_epoch = Some(app_ep);
+                }
+            }
+            if !s(v, "appliedHead").is_empty() {
+                rec.applied_head = s(v, "appliedHead").to_string();
+            }
+            if n(v, "elapsedSeconds") > 0 {
+                rec.elapsed_seconds = n(v, "elapsedSeconds");
+            }
+            if let Some(rc) = v["reworkCount"].as_u64() {
+                rec.rework_count = rec.rework_count.max(rc);
+            }
+            if v["changes"].is_object() {
+                rec.changes_files = v["changes"]["files"].as_u64().unwrap_or(0) as usize;
+                rec.added = n(&v["changes"], "added");
+                rec.deleted = n(&v["changes"], "deleted");
+            }
+            if !s(v, "conclusion").is_empty() {
+                rec.conclusion = s(v, "conclusion").to_string();
+            }
+            if b(v, "cleaned") {
+                rec.cleaned = true;
+            }
+            if !s(v, "archive").is_empty() {
+                rec.archive = s(v, "archive").to_string();
+            }
+            if !s(v, "sourceRoot").is_empty() {
+                rec.source_root = s(v, "sourceRoot").to_string();
+                if let Some(base) = Path::new(&rec.source_root).file_name().and_then(|n| n.to_str())
+                {
+                    if !base.is_empty() {
+                        rec.repo_label = base.to_string();
+                    }
+                }
+            }
+        }
+        "apply" => {
+            if !s(v, "appliedAt").is_empty() {
+                rec.applied_at = s(v, "appliedAt").to_string();
+                if let Some(app_ep) = iso_epoch(&rec.applied_at) {
+                    rec.applied_epoch = Some(app_ep);
+                }
+            } else if let Some(at_ep) = iso_epoch(s(v, "at")) {
+                rec.applied_at = s(v, "at").to_string();
+                rec.applied_epoch = Some(at_ep);
+            }
+            if !s(v, "appliedHead").is_empty() {
+                rec.applied_head = s(v, "appliedHead").to_string();
+            }
+            if !s(v, "archive").is_empty() {
+                rec.archive = s(v, "archive").to_string();
+            }
+        }
+        "clean" => {
+            rec.cleaned = true;
+            if !s(v, "archive").is_empty() {
+                rec.archive = s(v, "archive").to_string();
+            }
+        }
+        "reply" => {
+            if let Some(rc) = v["reworkCount"].as_u64() {
+                rec.rework_count = rec.rework_count.max(rc);
+            }
+        }
+        _ => {}
+    }
+    line_ts
+}
+
+fn read_recent_window_file(
+    path: &Path,
+    cutoff_epoch: i64,
+    fallback_repo: &str,
+) -> HashMap<String, RecentHistoryRecord> {
+    let Ok(mut f) = OpenOptions::new().read(true).open(path) else {
+        return HashMap::new();
+    };
+    let Ok(meta) = f.metadata() else {
+        return HashMap::new();
+    };
+    let file_len = meta.len();
+    if file_len == 0 {
+        return HashMap::new();
+    }
+
+    // Margin before `cutoff_epoch` so runs finished slightly before the window and applied inside
+    // it keep their finish metadata without needing an extra pass.
+    let safe_boundary = cutoff_epoch.saturating_sub(2 * 86_400);
+    let mut window_bytes: u64 = 64 * 1024;
+    loop {
+        let start = file_len.saturating_sub(window_bytes);
+        if f.seek(SeekFrom::Start(start)).is_err() {
+            return HashMap::new();
+        }
+        let mut buf = Vec::with_capacity((file_len - start) as usize);
+        if f.read_to_end(&mut buf).is_err() {
+            return HashMap::new();
+        }
+        let slice = if start > 0 {
+            match buf.iter().position(|&b| b == b'\n') {
+                Some(nl) => &buf[nl + 1..],
+                None => &[],
+            }
+        } else {
+            &buf[..]
+        };
+
+        let text = String::from_utf8_lossy(slice);
+        let mut file_map: HashMap<String, RecentHistoryRecord> = HashMap::new();
+        let mut first_line_ts: Option<i64> = None;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+                continue;
+            };
+            let ts = fold_history_value_into_recent(&mut file_map, &v, fallback_repo);
+            if first_line_ts.is_none() {
+                first_line_ts = ts;
+            }
+        }
+
+        if start == 0 {
+            return file_map;
+        }
+        let need_earlier_context = file_map.values().any(|r| {
+            let in_window = r.applied_epoch.is_some_and(|e| e >= cutoff_epoch)
+                || r.finished_epoch >= cutoff_epoch
+                || r.started_epoch >= cutoff_epoch;
+            in_window
+                && (r.started_epoch == 0
+                    || (!r.parent.is_empty() && !file_map.contains_key(&r.parent)))
+        });
+        if !need_earlier_context && first_line_ts.is_some_and(|ts| ts < safe_boundary) {
+            return file_map;
+        }
+        window_bytes = window_bytes.saturating_mul(4);
+    }
+}
+
+/// Lock-free, single-pass tail-chunk reader across all `<state>/history/*/history.jsonl` files
+/// covering `[cutoff_epoch, now]` (plus parent/finish context for chains applied inside the window).
+pub fn read_recent_window_all_repos(
+    state_root: &Path,
+    cutoff_epoch: i64,
+) -> HashMap<String, RecentHistoryRecord> {
+    let mut out: HashMap<String, RecentHistoryRecord> = HashMap::new();
+    let hist_root = state_root.join("history");
+    let Ok(rd) = fs::read_dir(&hist_root) else {
+        return out;
+    };
+    for ent in rd.flatten() {
+        let dir_path = ent.path();
+        let hp = dir_path.join("history.jsonl");
+        if !hp.is_file() {
+            continue;
+        }
+        let dir_name = ent.file_name().to_string_lossy().into_owned();
+        let fallback_repo = repo_label_from_history_dir(&dir_name);
+        let file_map = read_recent_window_file(&hp, cutoff_epoch, &fallback_repo);
+        for (rid, rec) in file_map {
+            out.entry(rid).or_insert(rec);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2397,5 +2656,177 @@ mod tests {
         let raw = "修头像上传\n\n只在当前工作目录内改文件；其他路径只读。\n\n仓库规矩：不要改 Cargo.lock\n";
         let clean = strip_delegate_prompt_suffixes(raw, "仓库规矩：不要改 Cargo.lock");
         assert_eq!(clean, "修头像上传");
+    }
+
+    #[test]
+    fn history_tail_window_and_events_tail_read_match_full_scan() {
+        let tmp = std::env::temp_dir().join(format!(
+            "delegate-tail-test-{}-{}",
+            std::process::id(),
+            epoch()
+        ));
+        let hist_dir = tmp.join("history").join("demo-repo-0123456789ab");
+        fs::create_dir_all(&hist_dir).unwrap();
+
+        let now_ep = 1_764_100_000i64;
+        let cutoff_7d = now_ep - 7 * 86_400;
+
+        // 1. Write 2,500 lines of history.jsonl spanning 30 days (old + recent + multi-round + apply/clean).
+        let mut hist_lines = String::new();
+        for i in 0..2200i64 {
+            let ts_ep = now_ep - 30 * 86_400 + i * 900; // older than 7 days
+            let ts = format_epoch(ts_ep, false, "%Y-%m-%dT%H:%M:%SZ");
+            let rec = json!({
+                "event": "finish",
+                "at": ts,
+                "run": format!("old-run-{i:04}"),
+                "name": format!("old task {i}"),
+                "mode": "write",
+                "state": "delivered",
+                "startedAt": ts,
+                "finishedAt": ts,
+                "appliedAt": ts,
+                "conclusion": "old padding ".repeat(12),
+                "sourceRoot": "/tmp/demo-repo",
+            });
+            hist_lines.push_str(&rec.to_string());
+            hist_lines.push('\n');
+        }
+        // Add a run finished 8 days ago (just outside 7d) that gets applied today.
+        let bridge_start = format_epoch(now_ep - 8 * 86_400, false, "%Y-%m-%dT%H:%M:%SZ");
+        let bridge_apply = format_epoch(now_ep - 3600, false, "%Y-%m-%dT%H:%M:%SZ");
+        hist_lines.push_str(
+            &json!({
+                "event": "finish",
+                "at": bridge_start,
+                "run": "bridge-run",
+                "name": "跨窗交付任务",
+                "mode": "write",
+                "state": "delivered",
+                "startedAt": bridge_start,
+                "finishedAt": bridge_start,
+                "changes": { "files": 4, "added": 100, "deleted": 20 },
+                "conclusion": "跨窗交付结论",
+                "sourceRoot": "/tmp/demo-repo",
+            })
+            .to_string(),
+        );
+        hist_lines.push('\n');
+        for i in 0..120i64 {
+            let ts_ep = now_ep - 6 * 86_400 + i * 4000;
+            let ts = format_epoch(ts_ep, false, "%Y-%m-%dT%H:%M:%SZ");
+            let app_ts = format_epoch(ts_ep + 600, false, "%Y-%m-%dT%H:%M:%SZ");
+            hist_lines.push_str(
+                &json!({
+                    "event": "finish",
+                    "at": ts,
+                    "run": format!("recent-run-{i:03}"),
+                    "name": format!("recent task {i}"),
+                    "mode": "write",
+                    "state": "delivered",
+                    "startedAt": ts,
+                    "finishedAt": ts,
+                    "changes": { "files": 2, "added": 30, "deleted": 5 },
+                    "conclusion": format!("recent conclusion {i}"),
+                    "sourceRoot": "/tmp/demo-repo",
+                })
+                .to_string(),
+            );
+            hist_lines.push('\n');
+            hist_lines.push_str(
+                &json!({
+                    "event": "apply",
+                    "at": app_ts,
+                    "run": format!("recent-run-{i:03}"),
+                    "appliedAt": app_ts,
+                    "appliedHead": format!("abc{i:04}"),
+                })
+                .to_string(),
+            );
+            hist_lines.push('\n');
+            hist_lines.push_str(
+                &json!({
+                    "event": "clean",
+                    "at": app_ts,
+                    "run": format!("recent-run-{i:03}"),
+                })
+                .to_string(),
+            );
+            hist_lines.push('\n');
+        }
+        hist_lines.push_str(
+            &json!({
+                "event": "apply",
+                "at": bridge_apply,
+                "run": "bridge-run",
+                "appliedAt": bridge_apply,
+                "appliedHead": "deadbee",
+            })
+            .to_string(),
+        );
+        hist_lines.push('\n');
+        let hist_path = hist_dir.join("history.jsonl");
+        fs::write(&hist_path, &hist_lines).unwrap();
+        assert!(
+            fs::metadata(&hist_path).unwrap().len() > 512 * 1024,
+            "fixture should exceed initial 64KB chunk"
+        );
+
+        let tail_map = read_recent_window_all_repos(&tmp, cutoff_7d);
+        let full_entries = load_entries_from_text(&hist_lines);
+        // Every run applied within the 7d window must match full scan 100%.
+        let full_recent_applied: HashMap<String, &HistoryEntry> = full_entries
+            .iter()
+            .filter(|e| iso_epoch(&e.applied_at).is_some_and(|ep| ep >= cutoff_7d))
+            .map(|e| (e.run.clone(), e))
+            .collect();
+        assert_eq!(full_recent_applied.len(), 121);
+        for (rid, full_e) in &full_recent_applied {
+            let tail_rec = tail_map
+                .get(rid)
+                .unwrap_or_else(|| panic!("missing recent run {rid} in tail read"));
+            assert_eq!(tail_rec.name, full_e.name);
+            assert_eq!(tail_rec.applied_head, full_e.applied_head);
+            assert_eq!(tail_rec.conclusion, full_e.conclusion);
+            assert_eq!(tail_rec.changes_files, full_e.changes_files);
+            assert_eq!(tail_rec.cleaned, full_e.cleaned);
+        }
+
+        // 2. Write 3,000 events (> 500KB) to events.jsonl and assert read_tail_in matches full scan.
+        let mut ev_lines = String::new();
+        for seq in 1..=3000u64 {
+            let ev = json!({
+                "seq": seq,
+                "at": "2026-11-26T04:00:00Z",
+                "run": format!("run-{seq}"),
+                "repo": "/tmp/demo-repo",
+                "kind": "delivered",
+                "payload": { "msg": "payload ".repeat(20), "seq": seq }
+            });
+            ev_lines.push_str(&ev.to_string());
+            ev_lines.push('\n');
+        }
+        let ev_path = tmp.join("events.jsonl");
+        fs::write(&ev_path, &ev_lines).unwrap();
+        assert!(
+            fs::metadata(&ev_path).unwrap().len() > 512 * 1024,
+            "events fixture should exceed initial 128KB chunk"
+        );
+
+        let full_ev = crate::events::read_since_in(&tmp, 0);
+        let tail_ev = crate::events::read_tail_in(&tmp, 200);
+        assert!(tail_ev.has_earlier);
+        assert_eq!(tail_ev.events.len(), 200);
+        assert_eq!(tail_ev.earliest_seq, Some(2801));
+        assert_eq!(tail_ev.latest_seq, Some(3000));
+        assert_eq!(tail_ev.events, full_ev[full_ev.len() - 200..]);
+
+        // Small limit <= total where full file fits
+        let all_ev = crate::events::read_tail_in(&tmp, 5000);
+        assert!(!all_ev.has_earlier);
+        assert_eq!(all_ev.events.len(), 3000);
+        assert_eq!(all_ev.events, full_ev);
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

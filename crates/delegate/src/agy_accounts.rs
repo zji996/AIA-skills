@@ -1711,21 +1711,21 @@ pub fn detect_quota_depletion_warnings(snap: &Value) -> Vec<QuotaDepletionWarnin
 
 /// Lock-free, zero-subprocess quota depletion check scoped to `state` (`<state>/agy-quota.json`).
 /// Returns empty when `<state>/agy-quota.json` does not exist so isolated tests never leak host state.
-pub fn detect_quota_depletion_warnings_in(state: &Path, now_ep: i64) -> Vec<QuotaDepletionWarning> {
+/// Build a lightweight lock-free accounts/quota snapshot for advisory alerts in `state`
+/// without scanning `/proc` (isolated-state safe for unit/integration tests).
+pub fn quota_snapshot_for_alerts_in(state: &Path, now_ep: i64) -> Option<Value> {
     let qpath = state.join("agy-quota.json");
-    if !qpath.is_file() {
-        return Vec::new();
-    }
-    let quota_cache = json(&qpath);
-    if !quota_cache.is_object() {
-        return Vec::new();
-    }
-    // If querying the active state_dir and configured accounts exist, reuse full accounts metadata.
     let root = accounts_root();
     let use_real_accounts = state == state_dir() && accounts_meta_path(&root).is_file();
     if use_real_accounts {
-        let snap = snapshot_json_opts(false);
-        return detect_quota_depletion_warnings(&snap);
+        return Some(snapshot_json_opts(false));
+    }
+    if !qpath.is_file() {
+        return None;
+    }
+    let quota_cache = json(&qpath);
+    if !quota_cache.is_object() {
+        return None;
     }
     // Isolated state dir (e.g. unit/integration tests): build synthetic snapshot purely from `state`.
     let mut acct_map = Map::new();
@@ -1739,7 +1739,7 @@ pub fn detect_quota_depletion_warnings_in(state: &Path, now_ep: i64) -> Vec<Quot
         }
     }
     if acct_map.is_empty() {
-        return Vec::new();
+        return None;
     }
     if active_id.is_empty() {
         if let Some(first) = acct_map.keys().next() {
@@ -1763,7 +1763,14 @@ pub fn detect_quota_depletion_warnings_in(state: &Path, now_ep: i64) -> Vec<Quot
         }
         items.push(item);
     }
-    detect_quota_depletion_warnings(&json!({ "accounts": items }))
+    Some(json!({ "active": active_id, "accounts": items }))
+}
+
+pub fn detect_quota_depletion_warnings_in(state: &Path, now_ep: i64) -> Vec<QuotaDepletionWarning> {
+    let Some(snap) = quota_snapshot_for_alerts_in(state, now_ep) else {
+        return Vec::new();
+    };
+    detect_quota_depletion_warnings(&snap)
 }
 
 /// Format a prominent single-line warning for `delegate status` (advisory only).

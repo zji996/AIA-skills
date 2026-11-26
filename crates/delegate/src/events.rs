@@ -6,7 +6,7 @@ use crate::runs;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -294,6 +294,97 @@ pub fn read_since_in(state: &Path, since: u64) -> Vec<Value> {
         }
     }
     out
+}
+
+/// Tail window returned by [`read_tail_in`].
+#[derive(Debug, Clone, Default)]
+pub struct EventsTail {
+    pub events: Vec<Value>,
+    /// True when `events.jsonl` contains valid events earlier than the returned window.
+    pub has_earlier: bool,
+    pub earliest_seq: Option<u64>,
+    pub latest_seq: Option<u64>,
+}
+
+/// Read the last `limit` valid events from `<state>/events.jsonl` by reading growing chunks
+/// from EOF instead of deserializing the entire log. When `limit == 0`, reads all events.
+pub fn read_tail_in(state: &Path, limit: usize) -> EventsTail {
+    if limit == 0 {
+        let events = read_since_in(state, 0);
+        let earliest_seq = events.first().and_then(|v| v["seq"].as_u64());
+        let latest_seq = events.last().and_then(|v| v["seq"].as_u64());
+        return EventsTail {
+            events,
+            has_earlier: false,
+            earliest_seq,
+            latest_seq,
+        };
+    }
+
+    let path = state.join("events.jsonl");
+    let Ok(mut f) = OpenOptions::new().read(true).open(&path) else {
+        return EventsTail::default();
+    };
+    let Ok(meta) = f.metadata() else {
+        return EventsTail::default();
+    };
+    let file_len = meta.len();
+    if file_len == 0 {
+        return EventsTail::default();
+    }
+
+    let mut window_bytes: u64 = 128 * 1024;
+    loop {
+        let start = file_len.saturating_sub(window_bytes);
+        if f.seek(SeekFrom::Start(start)).is_err() {
+            return EventsTail::default();
+        }
+        let mut buf = Vec::with_capacity((file_len - start) as usize);
+        if f.read_to_end(&mut buf).is_err() {
+            return EventsTail::default();
+        }
+        let slice = if start > 0 {
+            match buf.iter().position(|&b| b == b'\n') {
+                Some(nl) => &buf[nl + 1..],
+                None => &[],
+            }
+        } else {
+            &buf[..]
+        };
+
+        let text = String::from_utf8_lossy(slice);
+        let mut parsed = Vec::new();
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+                continue;
+            };
+            if v["seq"].as_u64().is_some_and(|seq| seq > 0) {
+                parsed.push(v);
+            }
+        }
+
+        if parsed.len() > limit || start == 0 {
+            let has_earlier = start > 0 || parsed.len() > limit;
+            if parsed.len() > limit {
+                let drain_n = parsed.len() - limit;
+                parsed.drain(0..drain_n);
+            }
+            let earliest_seq = parsed.first().and_then(|v| v["seq"].as_u64());
+            let latest_seq = parsed.last().and_then(|v| v["seq"].as_u64());
+            return EventsTail {
+                events: parsed,
+                has_earlier,
+                earliest_seq,
+                latest_seq,
+            };
+        }
+
+        window_bytes = window_bytes.saturating_mul(4);
+    }
 }
 
 fn load_cursors_doc(state: &Path) -> Value {

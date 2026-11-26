@@ -16,18 +16,70 @@ pub enum FocusPane {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewTab {
     Overview,
-    Runs,
-    Events,
-    Merges,
-    Candidates,
     Work,
-    Accounts,
+    Runs,
+    Quota,
+    Events,
+}
+
+impl ViewTab {
+    pub const ALL: [ViewTab; 5] = [
+        ViewTab::Overview,
+        ViewTab::Work,
+        ViewTab::Runs,
+        ViewTab::Quota,
+        ViewTab::Events,
+    ];
+
+    pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|&t| t == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    pub fn prev(self) -> Self {
+        let idx = Self::ALL.iter().position(|&t| t == self).unwrap_or(0);
+        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OverviewBarMode {
-    Purpose,
-    Model,
+pub enum RunsGroupMode {
+    ByStatus,
+    ByRepo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverviewFocus {
+    Attention,
+    Running,
+    WorkChains,
+    Deliveries,
+}
+
+impl OverviewFocus {
+    pub const ALL: [OverviewFocus; 4] = [
+        OverviewFocus::Attention,
+        OverviewFocus::Running,
+        OverviewFocus::WorkChains,
+        OverviewFocus::Deliveries,
+    ];
+
+    pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|&f| f == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    pub fn prev(self) -> Self {
+        let idx = Self::ALL.iter().position(|&f| f == self).unwrap_or(0);
+        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverviewAttentionEntry {
+    OwnerWork { work_idx: usize },
+    PendingRun { repo_idx: usize, run_idx: usize },
+    StaleFold { count: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +91,8 @@ pub enum WorkFilterMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WorkFoldKind {
+    Deferred,
+    Candidates,
     Done,
     Dropped,
 }
@@ -47,7 +101,9 @@ pub enum WorkFoldKind {
 pub enum WorkRow {
     GroupHeader {
         bucket: WorkBucket,
-        count: usize,
+        own_count: usize,
+        attached_downstream: usize,
+        ephemeral_count: usize,
     },
     Item {
         work_idx: usize,
@@ -63,11 +119,17 @@ pub enum WorkRow {
         count: usize,
         expanded: bool,
     },
+    Candidate {
+        cand_idx: usize,
+    },
 }
 
 impl WorkRow {
     pub fn is_selectable(&self) -> bool {
-        matches!(self, WorkRow::Item { .. } | WorkRow::FoldToggle { .. })
+        matches!(
+            self,
+            WorkRow::Item { .. } | WorkRow::FoldToggle { .. } | WorkRow::Candidate { .. }
+        )
     }
 }
 
@@ -127,6 +189,7 @@ pub enum Overlay {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CollapseKind {
     StalePending,
+    Merges,
     Collected,
     MergedUncleaned,
     Stopped,
@@ -164,13 +227,19 @@ pub enum ListRow {
     DagQueueEntry {
         idx: usize,
     },
+    MergeEntry {
+        idx: usize,
+    },
 }
 
 impl ListRow {
     pub fn is_selectable(&self) -> bool {
         matches!(
             self,
-            ListRow::Run { .. } | ListRow::ToggleFold { .. } | ListRow::DagQueueEntry { .. }
+            ListRow::Run { .. }
+                | ListRow::ToggleFold { .. }
+                | ListRow::DagQueueEntry { .. }
+                | ListRow::MergeEntry { .. }
         )
     }
 }
@@ -180,6 +249,7 @@ enum SelectionKey {
     Run(PathBuf, String),
     Fold(PathBuf, CollapseKind),
     DagQueue(String),
+    Merge(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +277,7 @@ pub struct App {
     pub detail_scroll: usize,
     pub focus: FocusPane,
     pub tab: ViewTab,
+    pub runs_group_mode: RunsGroupMode,
     pub filtered_events: Vec<usize>,
     pub selected_event: Option<usize>,
     pub events_scroll: usize,
@@ -223,8 +294,18 @@ pub struct App {
     pub revealed_accounts: HashSet<String>,
     pub switching_account: Option<String>,
     pub account_switch_error: Option<String>,
+    pub overview_focus: OverviewFocus,
+    pub overview_attention_sel: usize,
+    pub overview_attention_scroll: usize,
+    pub overview_stale_expanded: bool,
+    pub overview_running_sel: usize,
+    pub overview_running_scroll: usize,
+    pub overview_work_sel: usize,
+    pub overview_work_scroll: usize,
+    pub overview_deliveries_sel: usize,
+    pub overview_deliveries_scroll: usize,
     pub overview_scroll: usize,
-    pub overview_bar_mode: OverviewBarMode,
+    pub quota_models_expanded: bool,
     pub quota_refreshing: bool,
     pub quota_last_error: Option<String>,
     pub show_lane_events: bool,
@@ -233,6 +314,8 @@ pub struct App {
     pub selected_work_row: Option<usize>,
     pub work_scroll_line: usize,
     pub work_filter_mode: WorkFilterMode,
+    pub work_deferred_expanded: bool,
+    pub work_candidates_expanded: bool,
     pub work_done_expanded: bool,
     pub work_dropped_expanded: bool,
     pub filter: String,
@@ -242,10 +325,12 @@ pub struct App {
     pub overlay: Overlay,
     pub result_cache: HashMap<String, Result<String, String>>,
     pub diff_cache: HashMap<String, Result<String, String>>,
+    pub card_cache: HashMap<String, Option<RunCardL1>>,
     pub toast: Option<(String, Instant)>,
     pub refresh_interval_secs: u64,
     pub delegate_bin: PathBuf,
     pub cwd: PathBuf,
+    pub last_terminal_width: u16,
     pub loading: bool,
     pub dirty: bool,
 }
@@ -266,7 +351,8 @@ impl App {
             list_scroll: 0,
             detail_scroll: 0,
             focus: FocusPane::List,
-            tab: ViewTab::Runs,
+            tab: ViewTab::Overview,
+            runs_group_mode: RunsGroupMode::ByStatus,
             filtered_events: Vec::new(),
             selected_event: None,
             events_scroll: 0,
@@ -283,8 +369,18 @@ impl App {
             revealed_accounts: HashSet::new(),
             switching_account: None,
             account_switch_error: None,
+            overview_focus: OverviewFocus::Attention,
+            overview_attention_sel: 0,
+            overview_attention_scroll: 0,
+            overview_stale_expanded: false,
+            overview_running_sel: 0,
+            overview_running_scroll: 0,
+            overview_work_sel: 0,
+            overview_work_scroll: 0,
+            overview_deliveries_sel: 0,
+            overview_deliveries_scroll: 0,
             overview_scroll: 0,
-            overview_bar_mode: OverviewBarMode::Purpose,
+            quota_models_expanded: false,
             quota_refreshing: false,
             quota_last_error: None,
             show_lane_events: false,
@@ -293,6 +389,8 @@ impl App {
             selected_work_row: None,
             work_scroll_line: 0,
             work_filter_mode: WorkFilterMode::All,
+            work_deferred_expanded: false,
+            work_candidates_expanded: false,
             work_done_expanded: false,
             work_dropped_expanded: false,
             filter: String::new(),
@@ -302,10 +400,12 @@ impl App {
             overlay: Overlay::None,
             result_cache: HashMap::new(),
             diff_cache: HashMap::new(),
+            card_cache: HashMap::new(),
             toast: None,
             refresh_interval_secs,
             delegate_bin,
             cwd,
+            last_terminal_width: 180,
             loading: false,
             dirty: true,
         };
@@ -348,6 +448,10 @@ impl App {
             ListRow::DagQueueEntry { idx } => {
                 let q = self.snapshot.dag_queue.get(*idx)?;
                 Some(SelectionKey::DagQueue(q.name.clone()))
+            }
+            ListRow::MergeEntry { idx } => {
+                let m = self.snapshot.merges.get(*idx)?;
+                Some(SelectionKey::Merge(m.merge_run.clone()))
             }
             _ => None,
         }
@@ -524,22 +628,260 @@ impl App {
         }
     }
 
+    fn build_runs_rows_by_status(
+        &self,
+        query: &str,
+        filtering: bool,
+        rows: &mut Vec<ListRow>,
+        active_queue: &[usize],
+        dispatched_queue: &[usize],
+        matching_merges: &[usize],
+    ) {
+        let global_path = PathBuf::from(GLOBAL_FOLD_SENTINEL);
+
+        let open_work_ids: HashSet<&str> = self
+            .snapshot
+            .work
+            .iter()
+            .filter(|w| !w.ephemeral && w.state != "done")
+            .map(|w| w.id.as_str())
+            .collect();
+        let open_work_runs: HashSet<&str> = self
+            .snapshot
+            .work
+            .iter()
+            .filter(|w| !w.ephemeral && w.state != "done")
+            .flat_map(|w| w.runs.iter().map(String::as_str))
+            .collect();
+
+        let mut fresh_pending: Vec<(usize, usize)> = Vec::new();
+        let mut stale_pending: Vec<(usize, usize)> = Vec::new();
+        let mut running: Vec<(usize, usize)> = Vec::new();
+        let mut queued: Vec<(usize, usize)> = Vec::new();
+        let mut collected: Vec<(usize, usize)> = Vec::new();
+        let mut merged_uncleaned: Vec<(usize, usize)> = Vec::new();
+        let mut stopped: Vec<(usize, usize)> = Vec::new();
+
+        for (repo_idx, repo) in self.snapshot.repos.iter().enumerate() {
+            for (run_idx, r) in repo.runs.iter().enumerate() {
+                if !r.matches_filter(query) {
+                    continue;
+                }
+                match r.group {
+                    GroupKind::Pending => {
+                        let attached = open_work_runs.contains(r.run.as_str())
+                            || r.work_id
+                                .as_deref()
+                                .is_some_and(|wid| open_work_ids.contains(wid));
+                        if !self.show_all && !filtering && r.is_stale_pending() && !attached {
+                            stale_pending.push((repo_idx, run_idx));
+                        } else {
+                            fresh_pending.push((repo_idx, run_idx));
+                        }
+                    }
+                    GroupKind::Running => running.push((repo_idx, run_idx)),
+                    GroupKind::Queued => queued.push((repo_idx, run_idx)),
+                    GroupKind::Collected => collected.push((repo_idx, run_idx)),
+                    GroupKind::MergedUncleaned => merged_uncleaned.push((repo_idx, run_idx)),
+                    GroupKind::Stopped => stopped.push((repo_idx, run_idx)),
+                }
+            }
+        }
+
+        // Sort each bucket cross-repo: urgent/newest first.
+        fresh_pending.sort_by(|&(ra, ia), &(rb, ib)| {
+            let a = &self.snapshot.repos[ra].runs[ia];
+            let b = &self.snapshot.repos[rb].runs[ib];
+            b.is_urgent_pending()
+                .cmp(&a.is_urgent_pending())
+                .then_with(|| a.last_activity_seconds().cmp(&b.last_activity_seconds()))
+                .then_with(|| b.run.cmp(&a.run))
+        });
+        stale_pending.sort_by(|&(ra, ia), &(rb, ib)| {
+            let a = &self.snapshot.repos[ra].runs[ia];
+            let b = &self.snapshot.repos[rb].runs[ib];
+            a.last_activity_seconds()
+                .cmp(&b.last_activity_seconds())
+                .then_with(|| b.run.cmp(&a.run))
+        });
+        running.sort_by(|&(ra, ia), &(rb, ib)| {
+            let a = &self.snapshot.repos[ra].runs[ia];
+            let b = &self.snapshot.repos[rb].runs[ib];
+            a.idle_seconds
+                .unwrap_or(u64::MAX)
+                .cmp(&b.idle_seconds.unwrap_or(u64::MAX))
+                .then_with(|| b.run.cmp(&a.run))
+        });
+        queued.sort_by(|&(ra, ia), &(rb, ib)| {
+            let a = &self.snapshot.repos[ra].runs[ia];
+            let b = &self.snapshot.repos[rb].runs[ib];
+            a.age_seconds
+                .unwrap_or(u64::MAX)
+                .cmp(&b.age_seconds.unwrap_or(u64::MAX))
+                .then_with(|| b.run.cmp(&a.run))
+        });
+        for list in [&mut collected, &mut merged_uncleaned, &mut stopped] {
+            list.sort_by(|&(ra, ia), &(rb, ib)| {
+                let a = &self.snapshot.repos[ra].runs[ia];
+                let b = &self.snapshot.repos[rb].runs[ib];
+                a.last_activity_seconds()
+                    .cmp(&b.last_activity_seconds())
+                    .then_with(|| b.run.cmp(&a.run))
+            });
+        }
+
+        // 1. 待主控处理
+        if !fresh_pending.is_empty() || !stale_pending.is_empty() {
+            if !fresh_pending.is_empty() {
+                rows.push(ListRow::GroupHeader {
+                    repo_idx: usize::MAX,
+                    group: GroupKind::Pending,
+                    count: fresh_pending.len(),
+                });
+                for (repo_idx, run_idx) in fresh_pending {
+                    rows.push(ListRow::Run { repo_idx, run_idx });
+                }
+            }
+            if !stale_pending.is_empty() {
+                let expanded = self
+                    .expanded_folds
+                    .contains(&(global_path.clone(), CollapseKind::StalePending));
+                let newest_ago = stale_pending
+                    .iter()
+                    .map(|&(ri, rj)| self.snapshot.repos[ri].runs[rj].last_activity_seconds())
+                    .filter(|&s| s != u64::MAX)
+                    .min();
+                rows.push(ListRow::ToggleFold {
+                    repo_idx: usize::MAX,
+                    kind: CollapseKind::StalePending,
+                    count: stale_pending.len(),
+                    newest_ago_seconds: newest_ago,
+                    expanded,
+                    standalone: rows.is_empty(),
+                });
+                if expanded {
+                    for (repo_idx, run_idx) in stale_pending {
+                        rows.push(ListRow::Run { repo_idx, run_idx });
+                    }
+                }
+            }
+        }
+
+        // 2. 运行与返工
+        if !running.is_empty() {
+            rows.push(ListRow::GroupHeader {
+                repo_idx: usize::MAX,
+                group: GroupKind::Running,
+                count: running.len(),
+            });
+            for (repo_idx, run_idx) in running {
+                rows.push(ListRow::Run { repo_idx, run_idx });
+            }
+        }
+
+        // 3. 排队与待续派 (hidden when 0; dispatched items hidden unless filtering / show_all / expanded)
+        let queue_total = queued.len() + active_queue.len();
+        if queue_total > 0 {
+            rows.push(ListRow::GroupHeader {
+                repo_idx: usize::MAX,
+                group: GroupKind::Queued,
+                count: queue_total,
+            });
+            for (repo_idx, run_idx) in queued {
+                rows.push(ListRow::Run { repo_idx, run_idx });
+            }
+            for &idx in active_queue {
+                rows.push(ListRow::DagQueueEntry { idx });
+            }
+        }
+        if !dispatched_queue.is_empty() {
+            let show_dispatched_directly = self.show_all || filtering;
+            let dispatched_expanded = show_dispatched_directly
+                || self
+                    .expanded_folds
+                    .contains(&(global_path.clone(), CollapseKind::DispatchedQueue));
+            if show_dispatched_directly {
+                for &idx in dispatched_queue {
+                    rows.push(ListRow::DagQueueEntry { idx });
+                }
+            } else {
+                rows.push(ListRow::ToggleFold {
+                    repo_idx: usize::MAX,
+                    kind: CollapseKind::DispatchedQueue,
+                    count: dispatched_queue.len(),
+                    newest_ago_seconds: None,
+                    expanded: dispatched_expanded,
+                    standalone: queue_total == 0,
+                });
+                if dispatched_expanded {
+                    for &idx in dispatched_queue {
+                        rows.push(ListRow::DagQueueEntry { idx });
+                    }
+                }
+            }
+        }
+
+        // 4. 合入批次 (hidden when 0)
+        if !matching_merges.is_empty() {
+            let expanded = filtering
+                || self
+                    .expanded_folds
+                    .contains(&(global_path.clone(), CollapseKind::Merges));
+            rows.push(ListRow::ToggleFold {
+                repo_idx: usize::MAX,
+                kind: CollapseKind::Merges,
+                count: matching_merges.len(),
+                newest_ago_seconds: None,
+                expanded,
+                standalone: true,
+            });
+            if expanded {
+                for &idx in matching_merges {
+                    rows.push(ListRow::MergeEntry { idx });
+                }
+            }
+        }
+
+        // 5. 近期已收取 / 已合未清 / 已停止 (folded at bottom)
+        for (kind, list) in [
+            (CollapseKind::Collected, collected),
+            (CollapseKind::MergedUncleaned, merged_uncleaned),
+            (CollapseKind::Stopped, stopped),
+        ] {
+            if list.is_empty() {
+                continue;
+            }
+            let expanded = filtering
+                || self
+                    .expanded_folds
+                    .contains(&(global_path.clone(), kind));
+            let newest_ago = list
+                .iter()
+                .map(|&(ri, rj)| self.snapshot.repos[ri].runs[rj].last_activity_seconds())
+                .filter(|&s| s != u64::MAX)
+                .min();
+            rows.push(ListRow::ToggleFold {
+                repo_idx: usize::MAX,
+                kind,
+                count: list.len(),
+                newest_ago_seconds: newest_ago,
+                expanded,
+                standalone: true,
+            });
+            if expanded {
+                for (repo_idx, run_idx) in list {
+                    rows.push(ListRow::Run { repo_idx, run_idx });
+                }
+            }
+        }
+    }
+
     fn rebuild_rows_inner(&mut self, preserve: Option<SelectionKey>) {
         let query = self.filter.trim().to_lowercase();
         let filtering = !query.is_empty();
         let mut rows = Vec::new();
-        let mut stale_repo_indices: Vec<usize> = Vec::new();
+        let global_path = PathBuf::from(GLOBAL_FOLD_SENTINEL);
 
-        for (repo_idx, repo) in self.snapshot.repos.iter().enumerate() {
-            if !self.show_all && !filtering && self.is_stale_other_repo(repo) {
-                stale_repo_indices.push(repo_idx);
-                continue;
-            }
-            self.append_repo_rows(repo_idx, repo, &query, filtering, &mut rows);
-        }
-
-        // Append deterministic DAG queue items: active items shown directly, already-dispatched
-        // items folded by default unless `--all`, filtering, or explicitly expanded.
         let mut active_queue: Vec<usize> = Vec::new();
         let mut dispatched_queue: Vec<usize> = Vec::new();
         for (i, q) in self.snapshot.dag_queue.iter().enumerate() {
@@ -552,77 +894,124 @@ impl App {
                 active_queue.push(i);
             }
         }
-        let global_path = PathBuf::from(GLOBAL_FOLD_SENTINEL);
-        if !active_queue.is_empty() || !dispatched_queue.is_empty() {
-            let show_dispatched_directly = self.show_all || filtering;
-            let dispatched_expanded = show_dispatched_directly
-                || self
-                    .expanded_folds
-                    .contains(&(global_path.clone(), CollapseKind::DispatchedQueue));
-            let header_count = if show_dispatched_directly || dispatched_expanded {
-                active_queue.len() + dispatched_queue.len()
-            } else {
-                active_queue.len()
-            };
-            if !active_queue.is_empty() || show_dispatched_directly {
-                rows.push(ListRow::DagQueueHeader {
-                    count: header_count,
-                });
-                for idx in &active_queue {
-                    rows.push(ListRow::DagQueueEntry { idx: *idx });
+        let matching_merges: Vec<usize> = self
+            .snapshot
+            .merges
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.matches_filter(&query))
+            .map(|(i, _)| i)
+            .collect();
+
+        if self.runs_group_mode == RunsGroupMode::ByStatus {
+            self.build_runs_rows_by_status(
+                &query,
+                filtering,
+                &mut rows,
+                &active_queue,
+                &dispatched_queue,
+                &matching_merges,
+            );
+        } else {
+            let mut stale_repo_indices: Vec<usize> = Vec::new();
+            for (repo_idx, repo) in self.snapshot.repos.iter().enumerate() {
+                if !self.show_all && !filtering && self.is_stale_other_repo(repo) {
+                    stale_repo_indices.push(repo_idx);
+                    continue;
                 }
+                self.append_repo_rows(repo_idx, repo, &query, filtering, &mut rows);
             }
-            if !dispatched_queue.is_empty() {
-                if show_dispatched_directly {
-                    for idx in dispatched_queue {
-                        rows.push(ListRow::DagQueueEntry { idx });
-                    }
+
+            if !active_queue.is_empty() || !dispatched_queue.is_empty() {
+                let show_dispatched_directly = self.show_all || filtering;
+                let dispatched_expanded = show_dispatched_directly
+                    || self
+                        .expanded_folds
+                        .contains(&(global_path.clone(), CollapseKind::DispatchedQueue));
+                let header_count = if show_dispatched_directly || dispatched_expanded {
+                    active_queue.len() + dispatched_queue.len()
                 } else {
-                    rows.push(ListRow::ToggleFold {
-                        repo_idx: usize::MAX,
-                        kind: CollapseKind::DispatchedQueue,
-                        count: dispatched_queue.len(),
-                        newest_ago_seconds: None,
-                        expanded: dispatched_expanded,
-                        standalone: active_queue.is_empty(),
+                    active_queue.len()
+                };
+                if !active_queue.is_empty() || show_dispatched_directly {
+                    rows.push(ListRow::DagQueueHeader {
+                        count: header_count,
                     });
-                    if dispatched_expanded {
+                    for idx in &active_queue {
+                        rows.push(ListRow::DagQueueEntry { idx: *idx });
+                    }
+                }
+                if !dispatched_queue.is_empty() {
+                    if show_dispatched_directly {
                         for idx in dispatched_queue {
                             rows.push(ListRow::DagQueueEntry { idx });
+                        }
+                    } else {
+                        rows.push(ListRow::ToggleFold {
+                            repo_idx: usize::MAX,
+                            kind: CollapseKind::DispatchedQueue,
+                            count: dispatched_queue.len(),
+                            newest_ago_seconds: None,
+                            expanded: dispatched_expanded,
+                            standalone: active_queue.is_empty(),
+                        });
+                        if dispatched_expanded {
+                            for idx in dispatched_queue {
+                                rows.push(ListRow::DagQueueEntry { idx });
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // Fold stale non-current repos (> 7 days inactive, no active/queued runs) at the bottom.
-        if !stale_repo_indices.is_empty() {
-            let expanded = self
-                .expanded_folds
-                .contains(&(global_path, CollapseKind::StaleRepos));
-            let newest_ago = stale_repo_indices
-                .iter()
-                .flat_map(|&ri| self.snapshot.repos[ri].runs.iter())
-                .map(RunItem::last_activity_seconds)
-                .filter(|&s| s != u64::MAX)
-                .min();
-            rows.push(ListRow::ToggleFold {
-                repo_idx: usize::MAX,
-                kind: CollapseKind::StaleRepos,
-                count: stale_repo_indices.len(),
-                newest_ago_seconds: newest_ago,
-                expanded,
-                standalone: true,
-            });
-            if expanded {
-                for repo_idx in stale_repo_indices {
-                    self.append_repo_rows(
-                        repo_idx,
-                        &self.snapshot.repos[repo_idx],
-                        &query,
-                        filtering,
-                        &mut rows,
-                    );
+            if !matching_merges.is_empty() {
+                let expanded = filtering
+                    || self
+                        .expanded_folds
+                        .contains(&(global_path.clone(), CollapseKind::Merges));
+                rows.push(ListRow::ToggleFold {
+                    repo_idx: usize::MAX,
+                    kind: CollapseKind::Merges,
+                    count: matching_merges.len(),
+                    newest_ago_seconds: None,
+                    expanded,
+                    standalone: true,
+                });
+                if expanded {
+                    for &idx in &matching_merges {
+                        rows.push(ListRow::MergeEntry { idx });
+                    }
+                }
+            }
+
+            if !stale_repo_indices.is_empty() {
+                let expanded = self
+                    .expanded_folds
+                    .contains(&(global_path, CollapseKind::StaleRepos));
+                let newest_ago = stale_repo_indices
+                    .iter()
+                    .flat_map(|&ri| self.snapshot.repos[ri].runs.iter())
+                    .map(RunItem::last_activity_seconds)
+                    .filter(|&s| s != u64::MAX)
+                    .min();
+                rows.push(ListRow::ToggleFold {
+                    repo_idx: usize::MAX,
+                    kind: CollapseKind::StaleRepos,
+                    count: stale_repo_indices.len(),
+                    newest_ago_seconds: newest_ago,
+                    expanded,
+                    standalone: true,
+                });
+                if expanded {
+                    for repo_idx in stale_repo_indices {
+                        self.append_repo_rows(
+                            repo_idx,
+                            &self.snapshot.repos[repo_idx],
+                            &query,
+                            filtering,
+                            &mut rows,
+                        );
+                    }
                 }
             }
         }
@@ -784,6 +1173,12 @@ impl App {
                         next_sel = Some(row_idx);
                         break;
                     }
+                    (SelectionKey::Merge(prev_id), ListRow::MergeEntry { idx })
+                        if &self.snapshot.merges[*idx].merge_run == prev_id =>
+                    {
+                        next_sel = Some(row_idx);
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -814,13 +1209,28 @@ impl App {
         }
     }
 
+    pub fn selected_work_candidate(&self) -> Option<&RadarCandidateItem> {
+        let row_idx = self.selected_work_row?;
+        match self.work_rows.get(row_idx)? {
+            WorkRow::Candidate { cand_idx } => self.snapshot.candidates.get(*cand_idx),
+            _ => None,
+        }
+    }
+
     fn current_work_selection_id(&self) -> Option<String> {
         let row_idx = self.selected_work_row?;
         match self.work_rows.get(row_idx)? {
             WorkRow::Item { work_idx, .. } => {
                 self.snapshot.work.get(*work_idx).map(|w| w.id.clone())
             }
+            WorkRow::Candidate { cand_idx } => self
+                .snapshot
+                .candidates
+                .get(*cand_idx)
+                .map(|c| format!("__cand__{}", c.id)),
             WorkRow::FoldToggle { kind, .. } => Some(match kind {
+                WorkFoldKind::Deferred => "__fold_deferred__".to_string(),
+                WorkFoldKind::Candidates => "__fold_candidates__".to_string(),
                 WorkFoldKind::Done => "__fold_done__".to_string(),
                 WorkFoldKind::Dropped => "__fold_dropped__".to_string(),
             }),
@@ -829,7 +1239,9 @@ impl App {
     }
 
     /// Rebuild the L1 Work View row list with status grouping, owner pinning,
-    /// dependency chain indentation (`work_closed` / `run_applied`), and folded done/dropped sections.
+    /// dependency chain indentation (`work_closed` / `run_applied`), own-bucket counts (never
+    /// absorbing attached downstream waiting items into parent bucket headers), and folded
+    /// deferred/candidates/done/dropped sections.
     pub fn rebuild_work_rows(&mut self, preserve_id: Option<String>) {
         let prev_id = preserve_id.or_else(|| self.current_work_selection_id());
         let query = self.filter.trim().to_lowercase();
@@ -870,7 +1282,9 @@ impl App {
             if !dropped.is_empty() {
                 rows.push(WorkRow::GroupHeader {
                     bucket: WorkBucket::Dropped,
-                    count: dropped.len(),
+                    own_count: dropped.len(),
+                    attached_downstream: 0,
+                    ephemeral_count: 0,
                 });
                 for idx in dropped {
                     rows.push(WorkRow::Item {
@@ -886,9 +1300,10 @@ impl App {
             return;
         }
 
-        // Partition visible indices into Owner (open), Engineering Open, Done, and Dropped.
+        // Partition visible indices into Owner, Engineering Active/Timed, Deferred, Done, and Dropped.
         let mut owner_open: Vec<usize> = Vec::new();
         let mut eng_open: Vec<usize> = Vec::new();
+        let mut deferred_items: Vec<usize> = Vec::new();
         let mut done_items: Vec<usize> = Vec::new();
         let mut dropped_items: Vec<usize> = Vec::new();
 
@@ -896,6 +1311,7 @@ impl App {
             let w = &self.snapshot.work[idx];
             match w.bucket() {
                 WorkBucket::Owner => owner_open.push(idx),
+                WorkBucket::Deferred => deferred_items.push(idx),
                 WorkBucket::Done => done_items.push(idx),
                 WorkBucket::Dropped => dropped_items.push(idx),
                 _ => eng_open.push(idx),
@@ -913,7 +1329,9 @@ impl App {
         if !owner_open.is_empty() {
             rows.push(WorkRow::GroupHeader {
                 bucket: WorkBucket::Owner,
-                count: owner_open.len(),
+                own_count: owner_open.len(),
+                attached_downstream: 0,
+                ephemeral_count: 0,
             });
             for idx in owner_open {
                 rows.push(WorkRow::Item {
@@ -956,7 +1374,9 @@ impl App {
                 } else if let Some(run_ref) = cond.strip_prefix("run_applied:") {
                     dep_count += 1;
                     if first_parent.is_none() {
-                        if let Some(pidx) = find_work_by_run_ref(&self.snapshot.work, &eng_open, run_ref) {
+                        if let Some(pidx) =
+                            find_work_by_run_ref(&self.snapshot.work, &eng_open, run_ref)
+                        {
                             if pidx != idx {
                                 first_parent = Some(pidx);
                             }
@@ -972,7 +1392,6 @@ impl App {
             if let Some(pidx) = first_parent {
                 let p_bucket = self.snapshot.work[pidx].bucket();
                 let c_bucket = w.bucket();
-                // Attach under parent if parent has >= priority (smaller bucket ordinal) or child is Waiting
                 let can_attach = p_bucket <= c_bucket || c_bucket == WorkBucket::Waiting;
                 if can_attach && !creates_parent_cycle(idx, pidx, &parent_of) {
                     parent_of.insert(idx, pidx);
@@ -984,7 +1403,6 @@ impl App {
 
         let item_sort_key = |idx: usize| -> (WorkBucket, u8, String) {
             let w = &self.snapshot.work[idx];
-            // Within NeedsAction, put attention before verify
             let sub = if w.state == "attention" {
                 0
             } else if w.state == "verify" {
@@ -1004,7 +1422,7 @@ impl App {
             WorkBucket::InProgress,
             WorkBucket::Ready,
             WorkBucket::Waiting,
-            WorkBucket::Deferred,
+            WorkBucket::TimedWait,
         ];
         let mut emitted: HashSet<usize> = HashSet::new();
 
@@ -1021,9 +1439,11 @@ impl App {
             let header_idx = rows.len();
             rows.push(WorkRow::GroupHeader {
                 bucket,
-                count: roots.len(),
+                own_count: 0,
+                attached_downstream: 0,
+                ephemeral_count: 0,
             });
-            let before_emitted = emitted.len();
+            let start_row = rows.len();
             for root in roots {
                 emit_work_subtree(
                     root,
@@ -1036,9 +1456,35 @@ impl App {
                     &mut rows,
                 );
             }
-            let emitted_in_bucket = emitted.len().saturating_sub(before_emitted);
-            if let Some(WorkRow::GroupHeader { count, .. }) = rows.get_mut(header_idx) {
-                *count = emitted_in_bucket;
+            // Count ONLY items belonging to `bucket` in `own_count`, and track attached
+            // downstream items from other buckets separately (`阻下游 K`) so header counts
+            // never contradict the top bar or `delegate work` CLI.
+            let mut own = 0usize;
+            let mut downstream = 0usize;
+            let mut eph = 0usize;
+            for r in &rows[start_row..] {
+                if let WorkRow::Item { work_idx, .. } = r {
+                    let w = &self.snapshot.work[*work_idx];
+                    if w.bucket() == bucket {
+                        own += 1;
+                        if w.ephemeral {
+                            eph += 1;
+                        }
+                    } else {
+                        downstream += 1;
+                    }
+                }
+            }
+            if let Some(WorkRow::GroupHeader {
+                own_count,
+                attached_downstream,
+                ephemeral_count,
+                ..
+            }) = rows.get_mut(header_idx)
+            {
+                *own_count = own;
+                *attached_downstream = downstream;
+                *ephemeral_count = eph;
             }
         }
 
@@ -1059,7 +1505,50 @@ impl App {
             });
         }
 
-        // 3. Folded Done section (newest first; expanded when text-filtering or explicitly toggled)
+        // 3. Folded Deferred (暂缓) section — collapsed by default so it stays out of active chain focus
+        deferred_items.sort_by(|&a, &b| {
+            let wa = &self.snapshot.work[a];
+            let wb = &self.snapshot.work[b];
+            wa.defer_until
+                .cmp(&wb.defer_until)
+                .then_with(|| wa.id.cmp(&wb.id))
+        });
+        if !deferred_items.is_empty() {
+            let expanded = self.work_deferred_expanded || filtering;
+            rows.push(WorkRow::FoldToggle {
+                kind: WorkFoldKind::Deferred,
+                count: deferred_items.len(),
+                expanded,
+            });
+            if expanded {
+                for idx in deferred_items {
+                    rows.push(WorkRow::Item {
+                        work_idx: idx,
+                        depth: 0,
+                        branch_guides: Vec::new(),
+                        is_last_sibling: true,
+                        extra_deps: 0,
+                    });
+                }
+            }
+        }
+
+        // 4. Folded Radar Candidates (侦察候选) section — completely hidden when 0!
+        if mode == WorkFilterMode::All && !self.filtered_candidates.is_empty() {
+            let expanded = self.work_candidates_expanded || filtering;
+            rows.push(WorkRow::FoldToggle {
+                kind: WorkFoldKind::Candidates,
+                count: self.filtered_candidates.len(),
+                expanded,
+            });
+            if expanded {
+                for &cand_idx in &self.filtered_candidates {
+                    rows.push(WorkRow::Candidate { cand_idx });
+                }
+            }
+        }
+
+        // 5. Folded Done section (newest first; expanded when text-filtering or explicitly toggled)
         done_items.sort_by(|&a, &b| {
             let wa = &self.snapshot.work[a];
             let wb = &self.snapshot.work[b];
@@ -1087,7 +1576,7 @@ impl App {
             }
         }
 
-        // 4. Folded Dropped (已否) section
+        // 6. Folded Dropped (已否) section
         dropped_items.sort_by(|&a, &b| {
             let wa = &self.snapshot.work[a];
             let wb = &self.snapshot.work[b];
@@ -1132,6 +1621,26 @@ impl App {
                         next_sel = Some(i);
                         break;
                     }
+                    WorkRow::Candidate { cand_idx }
+                        if format!("__cand__{}", self.snapshot.candidates[*cand_idx].id) == *key =>
+                    {
+                        next_sel = Some(i);
+                        break;
+                    }
+                    WorkRow::FoldToggle {
+                        kind: WorkFoldKind::Deferred,
+                        ..
+                    } if key == "__fold_deferred__" => {
+                        next_sel = Some(i);
+                        break;
+                    }
+                    WorkRow::FoldToggle {
+                        kind: WorkFoldKind::Candidates,
+                        ..
+                    } if key == "__fold_candidates__" => {
+                        next_sel = Some(i);
+                        break;
+                    }
                     WorkRow::FoldToggle {
                         kind: WorkFoldKind::Done,
                         ..
@@ -1154,10 +1663,13 @@ impl App {
             next_sel = self
                 .work_rows
                 .iter()
-                .position(|r| matches!(r, WorkRow::Item { .. }))
+                .position(|r| matches!(r, WorkRow::Item { .. } | WorkRow::Candidate { .. }))
                 .or_else(|| self.work_rows.iter().position(WorkRow::is_selectable));
         }
-        self.selected_work_row = next_sel;
+        if next_sel != self.selected_work_row {
+            self.selected_work_row = next_sel;
+            self.detail_scroll = 0;
+        }
         if self.selected_work_row.is_none() {
             self.work_scroll_line = 0;
         }
@@ -1200,6 +1712,14 @@ impl App {
             return false;
         };
         let preserve = match kind {
+            WorkFoldKind::Deferred => {
+                self.work_deferred_expanded = !self.work_deferred_expanded;
+                "__fold_deferred__".to_string()
+            }
+            WorkFoldKind::Candidates => {
+                self.work_candidates_expanded = !self.work_candidates_expanded;
+                "__fold_candidates__".to_string()
+            }
             WorkFoldKind::Done => {
                 self.work_done_expanded = !self.work_done_expanded;
                 "__fold_done__".to_string()
@@ -1214,49 +1734,40 @@ impl App {
         true
     }
 
-    /// Jump from a Work item (or open WorkCard) to its linked Run in the Runs view.
-    pub fn jump_to_work_run(&mut self, work_id: Option<&str>) -> bool {
-        let item = match work_id {
-            Some(id) => self.snapshot.work_item_by_id(id).cloned(),
-            None => self.selected_work_item().cloned(),
-        };
-        let Some(item) = item else {
-            self.set_toast("当前没有选中的工作项");
-            return false;
-        };
-        let Some((repo_idx, run_idx, run_ref)) = self.snapshot.find_run_for_work(&item) else {
-            if let Some(last_rid) = item.runs.last() {
-                self.set_toast(format!("关联 run 已清理（delegate show {last_rid}）"));
-            } else {
-                self.set_toast("该工作项暂无关联 run");
-            }
+    /// Jump directly to a Run by ID in `3 运行`, expanding its fold if collapsed (in either
+    /// `ByStatus` or `ByRepo` mode).
+    pub fn jump_to_run_by_id(&mut self, run_id: &str) -> bool {
+        let Some((repo_idx, run_idx, run_ref)) = self.snapshot.find_run_by_id(run_id) else {
             return false;
         };
         let target_repo = self.snapshot.repos[repo_idx].path.clone();
         let target_run_id = run_ref.run.clone();
         let target_group = run_ref.group;
         let is_stale = run_ref.is_stale_pending();
-
-        // Ensure the run is not hidden inside a collapsed fold or filter
         if !self.filter.is_empty() && !run_ref.matches_filter(&self.filter.trim().to_lowercase()) {
             self.filter.clear();
         }
+        let fold_scope = if self.runs_group_mode == RunsGroupMode::ByStatus {
+            PathBuf::from(GLOBAL_FOLD_SENTINEL)
+        } else {
+            target_repo.clone()
+        };
         match target_group {
             GroupKind::Collected => {
                 self.expanded_folds
-                    .insert((target_repo.clone(), CollapseKind::Collected));
+                    .insert((fold_scope, CollapseKind::Collected));
             }
             GroupKind::MergedUncleaned => {
                 self.expanded_folds
-                    .insert((target_repo.clone(), CollapseKind::MergedUncleaned));
+                    .insert((fold_scope, CollapseKind::MergedUncleaned));
             }
             GroupKind::Stopped => {
                 self.expanded_folds
-                    .insert((target_repo.clone(), CollapseKind::Stopped));
+                    .insert((fold_scope, CollapseKind::Stopped));
             }
             GroupKind::Pending if is_stale => {
                 self.expanded_folds
-                    .insert((target_repo.clone(), CollapseKind::StalePending));
+                    .insert((fold_scope, CollapseKind::StalePending));
             }
             _ => {}
         }
@@ -1283,12 +1794,36 @@ impl App {
         true
     }
 
-    /// Jump to a specific work item ID in the Work tab (expanding done/dropped folds if needed).
+    /// Jump from a Work item (or open WorkCard) to its linked Run in the Runs view.
+    pub fn jump_to_work_run(&mut self, work_id: Option<&str>) -> bool {
+        let item = match work_id {
+            Some(id) => self.snapshot.work_item_by_id(id).cloned(),
+            None => self.selected_work_item().cloned(),
+        };
+        let Some(item) = item else {
+            self.set_toast("当前没有选中的工作项");
+            return false;
+        };
+        let Some((_, _, run_ref)) = self.snapshot.find_run_for_work(&item) else {
+            if let Some(last_rid) = item.runs.last() {
+                self.set_toast(format!("关联 run 已清理（delegate show {last_rid}）"));
+            } else {
+                self.set_toast("该工作项暂无关联 run");
+            }
+            return false;
+        };
+        let target_run_id = run_ref.run.clone();
+        self.jump_to_run_by_id(&target_run_id)
+    }
+
+    /// Jump to a specific work item ID in the Work tab (expanding folds if needed).
     pub fn jump_to_work_id(&mut self, work_id: &str) -> bool {
         let Some(item) = self.snapshot.work_item_by_id(work_id).cloned() else {
             return false;
         };
-        if item.state == "done" {
+        if item.state == "deferred" {
+            self.work_deferred_expanded = true;
+        } else if item.state == "done" {
             if item.closed_kind == "dropped" {
                 self.work_dropped_expanded = true;
             } else {
@@ -1298,6 +1833,8 @@ impl App {
         self.work_filter_mode = WorkFilterMode::All;
         self.rebuild_work_rows(Some(work_id.to_string()));
         self.tab = ViewTab::Work;
+        self.focus = FocusPane::List;
+        self.detail_scroll = 0;
         self.dirty = true;
         true
     }
@@ -1332,6 +1869,187 @@ impl App {
             }
             _ => None,
         }
+    }
+
+    /// Selected run indices `(repo_idx, run_idx)` or fallback to newest run so right pane stays populated.
+    pub fn preview_run_indices(&self) -> Option<(usize, usize)> {
+        if let Some(row_idx) = self.selected_row {
+            match self.rows.get(row_idx) {
+                Some(ListRow::Run { repo_idx, run_idx }) => {
+                    return Some((*repo_idx, *run_idx));
+                }
+                Some(ListRow::MergeEntry { .. } | ListRow::DagQueueEntry { .. }) => {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        // Fallback when no active run is directly selected (e.g. cursor on collapsed fold):
+        // pick the newest Collected or MergedUncleaned (or any) run across repos.
+        let mut best: Option<(u64, usize, usize)> = None;
+        for (ri, repo) in self.snapshot.repos.iter().enumerate() {
+            for (rj, r) in repo.runs.iter().enumerate() {
+                let ago = r.last_activity_seconds();
+                if best.is_none_or(|(b_ago, _, _)| ago < b_ago) {
+                    best = Some((ago, ri, rj));
+                }
+            }
+        }
+        best.map(|(_, ri, rj)| (ri, rj))
+    }
+
+    /// On-demand read + cache of `<runsDir>/<run>/card.json` for a single run (zero snapshot bloat).
+    pub fn get_or_load_run_card(&mut self, repo_idx: usize, run_idx: usize) -> Option<&RunCardL1> {
+        let repo = self.snapshot.repos.get(repo_idx)?;
+        let run = repo.runs.get(run_idx)?;
+        let key = run.cache_key();
+        if !self.card_cache.contains_key(&key) {
+            let runs_dir = repo.effective_runs_dir();
+            let loaded = crate::data::read_run_card_json(&runs_dir, &run.run);
+            self.card_cache.insert(key.clone(), loaded);
+        }
+        self.card_cache.get(&key).and_then(|o| o.as_ref())
+    }
+
+    pub fn selected_merge_row(&self) -> Option<&MergeRunItem> {
+        let row_idx = self.selected_row?;
+        match self.rows.get(row_idx)? {
+            ListRow::MergeEntry { idx } => self.snapshot.merges.get(*idx),
+            _ => None,
+        }
+    }
+
+    /// Interactive entries for `1 总览` card ① (需要关注).
+    pub fn overview_attention_entries(&self) -> Vec<OverviewAttentionEntry> {
+        let mut out = Vec::new();
+        // Owner open items first
+        let mut owners: Vec<usize> = self
+            .snapshot
+            .work
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| !w.ephemeral && w.state != "done" && w.owner.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        owners.sort_by(|&a, &b| {
+            let wa = &self.snapshot.work[a];
+            let wb = &self.snapshot.work[b];
+            wa.owner
+                .as_ref()
+                .map(|o| o.kind)
+                .cmp(&wb.owner.as_ref().map(|o| o.kind))
+                .then_with(|| wa.id.cmp(&wb.id))
+        });
+        for work_idx in owners {
+            out.push(OverviewAttentionEntry::OwnerWork { work_idx });
+        }
+
+        // Fresh pending runs across repos (stale >24h without open work folded into StaleFold)
+        let open_work_ids: HashSet<&str> = self
+            .snapshot
+            .work
+            .iter()
+            .filter(|w| !w.ephemeral && w.state != "done")
+            .map(|w| w.id.as_str())
+            .collect();
+        let open_work_runs: HashSet<&str> = self
+            .snapshot
+            .work
+            .iter()
+            .filter(|w| !w.ephemeral && w.state != "done")
+            .flat_map(|w| w.runs.iter().map(String::as_str))
+            .collect();
+
+        let mut fresh: Vec<(usize, usize)> = Vec::new();
+        let mut stale: Vec<(usize, usize)> = Vec::new();
+        for (ri, repo) in self.snapshot.repos.iter().enumerate() {
+            for (rj, r) in repo.runs.iter().enumerate() {
+                if r.group != GroupKind::Pending {
+                    continue;
+                }
+                let attached = open_work_runs.contains(r.run.as_str())
+                    || r.work_id
+                        .as_deref()
+                        .is_some_and(|wid| open_work_ids.contains(wid));
+                if r.is_stale_pending() && !attached {
+                    stale.push((ri, rj));
+                } else {
+                    fresh.push((ri, rj));
+                }
+            }
+        }
+        fresh.sort_by(|&(ra, ia), &(rb, ib)| {
+            let a = &self.snapshot.repos[ra].runs[ia];
+            let b = &self.snapshot.repos[rb].runs[ib];
+            b.is_urgent_pending()
+                .cmp(&a.is_urgent_pending())
+                .then_with(|| a.last_activity_seconds().cmp(&b.last_activity_seconds()))
+        });
+        for (repo_idx, run_idx) in fresh {
+            out.push(OverviewAttentionEntry::PendingRun { repo_idx, run_idx });
+        }
+        if !stale.is_empty() {
+            out.push(OverviewAttentionEntry::StaleFold { count: stale.len() });
+            if self.overview_stale_expanded {
+                stale.sort_by(|&(ra, ia), &(rb, ib)| {
+                    self.snapshot.repos[ra].runs[ia]
+                        .last_activity_seconds()
+                        .cmp(&self.snapshot.repos[rb].runs[ib].last_activity_seconds())
+                });
+                for (repo_idx, run_idx) in stale {
+                    out.push(OverviewAttentionEntry::PendingRun { repo_idx, run_idx });
+                }
+            }
+        }
+        out
+    }
+
+    /// Interactive entries for `1 总览` card ② (正在运行与波次预估).
+    pub fn overview_running_entries(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (ri, repo) in self.snapshot.repos.iter().enumerate() {
+            for (rj, r) in repo.runs.iter().enumerate() {
+                if matches!(r.group, GroupKind::Running | GroupKind::Queued) {
+                    out.push((ri, rj));
+                }
+            }
+        }
+        out.sort_by(|&(ra, ia), &(rb, ib)| {
+            let a = &self.snapshot.repos[ra].runs[ia];
+            let b = &self.snapshot.repos[rb].runs[ib];
+            a.group
+                .cmp(&b.group)
+                .then_with(|| a.idle_seconds.unwrap_or(u64::MAX).cmp(&b.idle_seconds.unwrap_or(u64::MAX)))
+                .then_with(|| b.run.cmp(&a.run))
+        });
+        out
+    }
+
+    /// Interactive active chain rows for `1 总览` card ③ (工作表推进链): active pool items
+    /// (excluding TimedWait, Deferred, Done, Dropped, and Candidates).
+    pub fn overview_work_chain_rows(&self) -> Vec<WorkRow> {
+        let mut out = Vec::new();
+        for row in &self.work_rows {
+            if let WorkRow::Item { work_idx, .. } = row {
+                let b = self.snapshot.work[*work_idx].bucket();
+                if matches!(
+                    b,
+                    WorkBucket::Owner
+                        | WorkBucket::NeedsAction
+                        | WorkBucket::InProgress
+                        | WorkBucket::Ready
+                        | WorkBucket::Waiting
+                ) {
+                    out.push(row.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Recent deliveries for `1 总览` card ⑤ (最近交付).
+    pub fn overview_delivery_entries(&self) -> Vec<RecentDeliveryItem> {
+        self.snapshot.effective_recent_deliveries()
     }
 
     pub fn selected_dag_queue(&self) -> Option<&DagQueueItem> {
@@ -1821,216 +2539,42 @@ impl App {
     }
 
     fn handle_main_key(&mut self, key: KeyEvent) -> AppAction {
+        // Unified 5-tab navigation: `1`..=`5` and `[` / `]`. Old `0` & `O/w/A/e/m/b` switches removed.
+        let switch_tab = |app: &mut App, next: ViewTab| -> AppAction {
+            if app.tab != next {
+                app.tab = next;
+                app.focus = FocusPane::List;
+                app.detail_scroll = 0;
+                app.dirty = true;
+                if next == ViewTab::Runs && app.needs_selected_result() {
+                    return AppAction::LoadSelectedResult;
+                }
+                return AppAction::Redraw;
+            }
+            AppAction::None
+        };
         match key.code {
-            KeyCode::Char('0') => {
-                if self.tab != ViewTab::Overview {
-                    self.tab = ViewTab::Overview;
-                    self.overview_scroll = 0;
-                    self.detail_scroll = 0;
-                    self.dirty = true;
-                    return AppAction::Redraw;
-                }
-                return AppAction::None;
+            KeyCode::Char('1') => return switch_tab(self, ViewTab::Overview),
+            KeyCode::Char('2') => return switch_tab(self, ViewTab::Work),
+            KeyCode::Char('3') => return switch_tab(self, ViewTab::Runs),
+            KeyCode::Char('4') => return switch_tab(self, ViewTab::Quota),
+            KeyCode::Char('5') => return switch_tab(self, ViewTab::Events),
+            KeyCode::Char('[') => {
+                let prev = self.tab.prev();
+                return switch_tab(self, prev);
             }
-            KeyCode::Char('O') => {
-                self.tab = if self.tab == ViewTab::Overview {
-                    ViewTab::Runs
-                } else {
-                    ViewTab::Overview
-                };
-                self.overview_scroll = 0;
-                self.detail_scroll = 0;
-                self.dirty = true;
-                return AppAction::Redraw;
-            }
-            KeyCode::Char('1') => {
-                if self.tab != ViewTab::Runs {
-                    self.tab = ViewTab::Runs;
-                    self.detail_scroll = 0;
-                    self.dirty = true;
-                    return AppAction::Redraw;
-                }
-                return AppAction::None;
-            }
-            KeyCode::Char('2') => {
-                if self.tab != ViewTab::Events {
-                    self.tab = ViewTab::Events;
-                    self.detail_scroll = 0;
-                    self.dirty = true;
-                    return AppAction::Redraw;
-                }
-                return AppAction::None;
-            }
-            KeyCode::Char('3') => {
-                if self.tab != ViewTab::Merges {
-                    self.tab = ViewTab::Merges;
-                    self.detail_scroll = 0;
-                    self.dirty = true;
-                    return AppAction::Redraw;
-                }
-                return AppAction::None;
-            }
-            KeyCode::Char('4') => {
-                if self.tab != ViewTab::Candidates {
-                    self.tab = ViewTab::Candidates;
-                    self.detail_scroll = 0;
-                    self.dirty = true;
-                    return AppAction::Redraw;
-                }
-                return AppAction::None;
-            }
-            KeyCode::Char('5') => {
-                if self.tab != ViewTab::Work {
-                    self.tab = ViewTab::Work;
-                    self.detail_scroll = 0;
-                    self.dirty = true;
-                    return AppAction::Redraw;
-                }
-                return AppAction::None;
-            }
-            KeyCode::Char('6') => {
-                if self.tab != ViewTab::Accounts {
-                    self.tab = ViewTab::Accounts;
-                    self.detail_scroll = 0;
-                    self.dirty = true;
-                    return AppAction::Redraw;
-                }
-                return AppAction::None;
-            }
-            KeyCode::Char('A') => {
-                self.tab = if self.tab == ViewTab::Accounts {
-                    ViewTab::Runs
-                } else {
-                    ViewTab::Accounts
-                };
-                self.detail_scroll = 0;
-                self.dirty = true;
-                return AppAction::Redraw;
-            }
-            KeyCode::Char('w') => {
-                if self.tab == ViewTab::Work {
-                    self.tab = ViewTab::Runs;
-                    self.detail_scroll = 0;
-                    self.dirty = true;
-                    return AppAction::Redraw;
-                } else {
-                    if self.tab == ViewTab::Runs {
-                        if let Some(run) = self.selected_run().cloned() {
-                            if let Some(wid) = self.snapshot.work_id_for_run(&run) {
-                                if self.jump_to_work_id(&wid) {
-                                    return AppAction::Redraw;
-                                }
-                            }
-                        }
-                    }
-                    self.tab = ViewTab::Work;
-                    self.detail_scroll = 0;
-                    self.dirty = true;
-                    return AppAction::Redraw;
-                }
-            }
-            KeyCode::Char('e') => {
-                self.tab = if self.tab == ViewTab::Events {
-                    ViewTab::Runs
-                } else {
-                    ViewTab::Events
-                };
-                self.detail_scroll = 0;
-                self.dirty = true;
-                return AppAction::Redraw;
-            }
-            KeyCode::Char('m') => {
-                self.tab = if self.tab == ViewTab::Merges {
-                    ViewTab::Runs
-                } else {
-                    ViewTab::Merges
-                };
-                self.detail_scroll = 0;
-                self.dirty = true;
-                return AppAction::Redraw;
-            }
-            KeyCode::Char('b') => {
-                self.tab = if self.tab == ViewTab::Candidates {
-                    ViewTab::Runs
-                } else {
-                    ViewTab::Candidates
-                };
-                self.detail_scroll = 0;
-                self.dirty = true;
-                return AppAction::Redraw;
-            }
-            KeyCode::Char('f') if self.tab == ViewTab::Events => {
-                self.events_follow = !self.events_follow;
-                if self.events_follow && !self.filtered_events.is_empty() {
-                    self.selected_event = Some(self.filtered_events.len() - 1);
-                    self.detail_scroll = 0;
-                }
-                self.dirty = true;
-                return AppAction::Redraw;
-            }
-            KeyCode::Char('l') if self.tab == ViewTab::Events => {
-                self.show_lane_events = !self.show_lane_events;
-                self.rebuild_rows(None);
-                self.detail_scroll = 0;
-                self.dirty = true;
-                return AppAction::Redraw;
+            KeyCode::Char(']') => {
+                let next = self.tab.next();
+                return switch_tab(self, next);
             }
             _ => {}
         }
 
         if self.tab == ViewTab::Overview {
-            return match key.code {
-                KeyCode::Char('q') => AppAction::Quit,
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.overview_scroll = self.overview_scroll.saturating_add(1);
-                    self.dirty = true;
-                    AppAction::Redraw
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.overview_scroll = self.overview_scroll.saturating_sub(1);
-                    self.dirty = true;
-                    AppAction::Redraw
-                }
-                KeyCode::PageDown | KeyCode::Char(' ') => {
-                    self.overview_scroll = self.overview_scroll.saturating_add(8);
-                    self.dirty = true;
-                    AppAction::Redraw
-                }
-                KeyCode::PageUp => {
-                    self.overview_scroll = self.overview_scroll.saturating_sub(8);
-                    self.dirty = true;
-                    AppAction::Redraw
-                }
-                KeyCode::Home | KeyCode::Char('g') => {
-                    self.overview_scroll = 0;
-                    self.dirty = true;
-                    AppAction::Redraw
-                }
-                KeyCode::End | KeyCode::Char('G') => {
-                    self.overview_scroll = usize::MAX / 2;
-                    self.dirty = true;
-                    AppAction::Redraw
-                }
-                KeyCode::Char('v') => {
-                    self.overview_bar_mode = match self.overview_bar_mode {
-                        OverviewBarMode::Purpose => OverviewBarMode::Model,
-                        OverviewBarMode::Model => OverviewBarMode::Purpose,
-                    };
-                    self.dirty = true;
-                    AppAction::Redraw
-                }
-                KeyCode::Char('Q') => AppAction::RefreshQuota,
-                KeyCode::Char('r') => AppAction::Refresh,
-                KeyCode::Char('?') => {
-                    self.overlay = Overlay::Help;
-                    self.dirty = true;
-                    AppAction::Redraw
-                }
-                _ => AppAction::None,
-            };
+            return self.handle_overview_key(key);
         }
 
-        if self.tab == ViewTab::Accounts {
+        if self.tab == ViewTab::Quota {
             return match key.code {
                 KeyCode::Char('q') => AppAction::Quit,
                 KeyCode::Tab | KeyCode::BackTab => {
@@ -2135,8 +2679,23 @@ impl App {
                         AppAction::Redraw
                     }
                 },
-                KeyCode::Enter | KeyCode::Char('u') => {
+                // Enter is pure read-only focus shift to detail; NEVER triggers account switch.
+                KeyCode::Enter => {
+                    self.focus = match self.focus {
+                        FocusPane::List => FocusPane::Detail,
+                        FocusPane::Detail => FocusPane::List,
+                    };
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                // `u` is the sole manual account-switch confirmation trigger.
+                KeyCode::Char('u') => {
                     self.open_account_switch_confirm();
+                    AppAction::Redraw
+                }
+                KeyCode::Char(' ') => {
+                    self.quota_models_expanded = !self.quota_models_expanded;
+                    self.dirty = true;
                     AppAction::Redraw
                 }
                 KeyCode::Char('i') => {
@@ -2199,70 +2758,135 @@ impl App {
         if self.tab == ViewTab::Work {
             return match key.code {
                 KeyCode::Char('q') => AppAction::Quit,
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if self.move_work_selection(1) {
+                KeyCode::Tab | KeyCode::BackTab => {
+                    self.focus = match self.focus {
+                        FocusPane::List => FocusPane::Detail,
+                        FocusPane::Detail => FocusPane::List,
+                    };
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                KeyCode::Down | KeyCode::Char('j') => match self.focus {
+                    FocusPane::List => {
+                        if self.move_work_selection(1) {
+                            self.detail_scroll = 0;
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = self.detail_scroll.saturating_add(1);
                         self.dirty = true;
                         AppAction::Redraw
-                    } else {
-                        AppAction::None
                     }
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if self.move_work_selection(-1) {
+                },
+                KeyCode::Up | KeyCode::Char('k') => match self.focus {
+                    FocusPane::List => {
+                        if self.move_work_selection(-1) {
+                            self.detail_scroll = 0;
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = self.detail_scroll.saturating_sub(1);
                         self.dirty = true;
                         AppAction::Redraw
-                    } else {
-                        AppAction::None
                     }
-                }
-                KeyCode::PageDown => {
-                    if self.move_work_selection(10) {
+                },
+                KeyCode::PageDown => match self.focus {
+                    FocusPane::List => {
+                        if self.move_work_selection(10) {
+                            self.detail_scroll = 0;
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = self.detail_scroll.saturating_add(10);
                         self.dirty = true;
                         AppAction::Redraw
-                    } else {
-                        AppAction::None
                     }
-                }
-                KeyCode::PageUp => {
-                    if self.move_work_selection(-10) {
+                },
+                KeyCode::PageUp => match self.focus {
+                    FocusPane::List => {
+                        if self.move_work_selection(-10) {
+                            self.detail_scroll = 0;
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = self.detail_scroll.saturating_sub(10);
                         self.dirty = true;
                         AppAction::Redraw
-                    } else {
-                        AppAction::None
                     }
-                }
-                KeyCode::Home | KeyCode::Char('g') => {
-                    let first = self.work_rows.iter().position(WorkRow::is_selectable);
-                    if first != self.selected_work_row {
-                        self.selected_work_row = first;
+                },
+                KeyCode::Home | KeyCode::Char('g') => match self.focus {
+                    FocusPane::List => {
+                        let first = self.work_rows.iter().position(WorkRow::is_selectable);
+                        if first != self.selected_work_row {
+                            self.selected_work_row = first;
+                            self.detail_scroll = 0;
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = 0;
                         self.dirty = true;
                         AppAction::Redraw
-                    } else {
-                        AppAction::None
                     }
-                }
-                KeyCode::End | KeyCode::Char('G') => {
-                    let last = self.work_rows.iter().rposition(WorkRow::is_selectable);
-                    if last != self.selected_work_row {
-                        self.selected_work_row = last;
+                },
+                KeyCode::End | KeyCode::Char('G') => match self.focus {
+                    FocusPane::List => {
+                        let last = self.work_rows.iter().rposition(WorkRow::is_selectable);
+                        if last != self.selected_work_row {
+                            self.selected_work_row = last;
+                            self.detail_scroll = 0;
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    FocusPane::Detail => {
+                        self.detail_scroll = usize::MAX / 2;
                         self.dirty = true;
                         AppAction::Redraw
-                    } else {
-                        AppAction::None
                     }
-                }
+                },
                 KeyCode::Enter => {
                     if self.toggle_selected_work_fold() {
                         AppAction::Redraw
-                    } else if let Some(w) = self.selected_work_item().cloned() {
-                        self.overlay = Overlay::WorkCard {
-                            work_id: w.id,
-                            scroll: 0,
+                    } else if self.last_terminal_width < 110 {
+                        if let Some(w) = self.selected_work_item().cloned() {
+                            self.overlay = Overlay::WorkCard {
+                                work_id: w.id,
+                                scroll: 0,
+                            };
+                            self.dirty = true;
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    } else {
+                        self.focus = match self.focus {
+                            FocusPane::List => FocusPane::Detail,
+                            FocusPane::Detail => FocusPane::List,
                         };
                         self.dirty = true;
                         AppAction::Redraw
-                    } else {
-                        AppAction::None
                     }
                 }
                 KeyCode::Char(' ') => {
@@ -2290,6 +2914,7 @@ impl App {
                         WorkFilterMode::OwnerOnly
                     };
                     self.work_scroll_line = 0;
+                    self.detail_scroll = 0;
                     self.rebuild_work_rows(None);
                     self.dirty = true;
                     AppAction::Redraw
@@ -2302,13 +2927,48 @@ impl App {
                             WorkFilterMode::DroppedOnly
                         };
                     self.work_scroll_line = 0;
+                    self.detail_scroll = 0;
                     self.rebuild_work_rows(None);
                     self.dirty = true;
                     AppAction::Redraw
                 }
+                KeyCode::Char('p') => {
+                    if let Some(c) = self.selected_work_candidate().cloned() {
+                        let cmd = format_repo_cmd(
+                            &self.cwd,
+                            &c.repo_path,
+                            &format!(
+                                "{} radar pick {}",
+                                shell_quote(&self.delegate_bin.to_string_lossy()),
+                                shell_quote(&c.id)
+                            ),
+                        );
+                        self.overlay = Overlay::CommandModal {
+                            action_label: "生成任务说明草稿 (radar pick)".to_string(),
+                            command: cmd,
+                            note: String::new(),
+                        };
+                        self.dirty = true;
+                        AppAction::Redraw
+                    } else {
+                        self.set_toast("请先展开并选中一条侦察候选");
+                        AppAction::Redraw
+                    }
+                }
                 KeyCode::Char('y') => {
                     if let Some(w) = self.selected_work_item().cloned() {
                         let cmd = build_work_next_command(&self.delegate_bin, &self.cwd, &w);
+                        AppAction::CopyClipboard(cmd)
+                    } else if let Some(c) = self.selected_work_candidate().cloned() {
+                        let cmd = format_repo_cmd(
+                            &self.cwd,
+                            &c.repo_path,
+                            &format!(
+                                "{} radar pick {}",
+                                shell_quote(&self.delegate_bin.to_string_lossy()),
+                                shell_quote(&c.id)
+                            ),
+                        );
                         AppAction::CopyClipboard(cmd)
                     } else {
                         AppAction::None
@@ -2328,227 +2988,8 @@ impl App {
                         self.rebuild_rows(None);
                         self.dirty = true;
                         AppAction::Redraw
-                    } else {
-                        AppAction::None
-                    }
-                }
-                KeyCode::Char('?') => {
-                    self.overlay = Overlay::Help;
-                    self.dirty = true;
-                    AppAction::Redraw
-                }
-                _ => AppAction::None,
-            };
-        }
-
-        if matches!(self.tab, ViewTab::Merges | ViewTab::Candidates) {
-            let is_merges = self.tab == ViewTab::Merges;
-            return match key.code {
-                KeyCode::Char('q') => AppAction::Quit,
-                KeyCode::Tab | KeyCode::BackTab => {
-                    self.focus = match self.focus {
-                        FocusPane::List => FocusPane::Detail,
-                        FocusPane::Detail => FocusPane::List,
-                    };
-                    self.dirty = true;
-                    AppAction::Redraw
-                }
-                KeyCode::Down | KeyCode::Char('j') => match self.focus {
-                    FocusPane::List => {
-                        let moved = if is_merges {
-                            self.move_merge_selection(1)
-                        } else {
-                            self.move_candidate_selection(1)
-                        };
-                        if moved {
-                            self.dirty = true;
-                            AppAction::Redraw
-                        } else {
-                            AppAction::None
-                        }
-                    }
-                    FocusPane::Detail => {
-                        self.detail_scroll = self.detail_scroll.saturating_add(1);
-                        self.dirty = true;
-                        AppAction::Redraw
-                    }
-                },
-                KeyCode::Up | KeyCode::Char('k') => match self.focus {
-                    FocusPane::List => {
-                        let moved = if is_merges {
-                            self.move_merge_selection(-1)
-                        } else {
-                            self.move_candidate_selection(-1)
-                        };
-                        if moved {
-                            self.dirty = true;
-                            AppAction::Redraw
-                        } else {
-                            AppAction::None
-                        }
-                    }
-                    FocusPane::Detail => {
-                        self.detail_scroll = self.detail_scroll.saturating_sub(1);
-                        self.dirty = true;
-                        AppAction::Redraw
-                    }
-                },
-                KeyCode::PageDown => match self.focus {
-                    FocusPane::List => {
-                        let moved = if is_merges {
-                            self.move_merge_selection(10)
-                        } else {
-                            self.move_candidate_selection(10)
-                        };
-                        if moved {
-                            self.dirty = true;
-                            AppAction::Redraw
-                        } else {
-                            AppAction::None
-                        }
-                    }
-                    FocusPane::Detail => {
-                        self.detail_scroll = self.detail_scroll.saturating_add(10);
-                        self.dirty = true;
-                        AppAction::Redraw
-                    }
-                },
-                KeyCode::PageUp => match self.focus {
-                    FocusPane::List => {
-                        let moved = if is_merges {
-                            self.move_merge_selection(-10)
-                        } else {
-                            self.move_candidate_selection(-10)
-                        };
-                        if moved {
-                            self.dirty = true;
-                            AppAction::Redraw
-                        } else {
-                            AppAction::None
-                        }
-                    }
-                    FocusPane::Detail => {
-                        self.detail_scroll = self.detail_scroll.saturating_sub(10);
-                        self.dirty = true;
-                        AppAction::Redraw
-                    }
-                },
-                KeyCode::Home | KeyCode::Char('g') => match self.focus {
-                    FocusPane::List => {
-                        let has_items = if is_merges {
-                            !self.filtered_merges.is_empty()
-                        } else {
-                            !self.filtered_candidates.is_empty()
-                        };
-                        if has_items {
-                            if is_merges {
-                                self.selected_merge = Some(0);
-                            } else {
-                                self.selected_candidate = Some(0);
-                            }
-                            self.detail_scroll = 0;
-                            self.dirty = true;
-                            AppAction::Redraw
-                        } else {
-                            AppAction::None
-                        }
-                    }
-                    FocusPane::Detail => {
-                        self.detail_scroll = 0;
-                        self.dirty = true;
-                        AppAction::Redraw
-                    }
-                },
-                KeyCode::End | KeyCode::Char('G') => match self.focus {
-                    FocusPane::List => {
-                        let len = if is_merges {
-                            self.filtered_merges.len()
-                        } else {
-                            self.filtered_candidates.len()
-                        };
-                        if len > 0 {
-                            if is_merges {
-                                self.selected_merge = Some(len - 1);
-                            } else {
-                                self.selected_candidate = Some(len - 1);
-                            }
-                            self.detail_scroll = 0;
-                            self.dirty = true;
-                            AppAction::Redraw
-                        } else {
-                            AppAction::None
-                        }
-                    }
-                    FocusPane::Detail => {
-                        self.detail_scroll = usize::MAX / 2;
-                        self.dirty = true;
-                        AppAction::Redraw
-                    }
-                },
-                KeyCode::Char('a') | KeyCode::Enter | KeyCode::Char('y') if is_merges => {
-                    if let Some(m) = self.selected_merge_item().cloned() {
-                        let cmd = format_repo_cmd(
-                            &self.cwd,
-                            &m.repo_path,
-                            &format!(
-                                "{} apply --keep-commits {}",
-                                shell_quote(&self.delegate_bin.to_string_lossy()),
-                                shell_quote(&m.merge_run)
-                            ),
-                        );
-                        let note = if m.applied {
-                            "该合入批次已合回源仓库。".to_string()
-                        } else if !m.merge_accept_ok {
-                            "最终 mergeAccept 未通过，请先排查报告再合回。".to_string()
-                        } else {
-                            // Keeps commits intact on the source branch; push remains a separate manual step.
-                            "把集成提交链落回源仓库，不推送远端。".to_string()
-                        };
-                        self.overlay = Overlay::CommandModal {
-                            action_label: "合回源仓库 (apply --keep-commits)".to_string(),
-                            command: cmd,
-                            note,
-                        };
-                        self.dirty = true;
-                        AppAction::Redraw
-                    } else {
-                        AppAction::None
-                    }
-                }
-                KeyCode::Char('p') | KeyCode::Enter | KeyCode::Char('y') if !is_merges => {
-                    if let Some(c) = self.selected_candidate_item().cloned() {
-                        let cmd = format_repo_cmd(
-                            &self.cwd,
-                            &c.repo_path,
-                            &format!(
-                                "{} radar pick {}",
-                                shell_quote(&self.delegate_bin.to_string_lossy()),
-                                shell_quote(&c.id)
-                            ),
-                        );
-                        // `radar pick` only creates a task brief draft and never dispatches automatically.
-                        self.overlay = Overlay::CommandModal {
-                            action_label: "生成任务说明草稿 (radar pick)".to_string(),
-                            command: cmd,
-                            note: String::new(),
-                        };
-                        self.dirty = true;
-                        AppAction::Redraw
-                    } else {
-                        AppAction::None
-                    }
-                }
-                KeyCode::Char('Q') => AppAction::RefreshQuota,
-                KeyCode::Char('r') => AppAction::Refresh,
-                KeyCode::Char('/') => {
-                    self.filter_mode = true;
-                    self.dirty = true;
-                    AppAction::Redraw
-                }
-                KeyCode::Esc => {
-                    if !self.filter.is_empty() {
-                        self.filter.clear();
-                        self.rebuild_rows(None);
+                    } else if self.focus == FocusPane::Detail {
+                        self.focus = FocusPane::List;
                         self.dirty = true;
                         AppAction::Redraw
                     } else {
@@ -2574,6 +3015,60 @@ impl App {
                     };
                     self.dirty = true;
                     AppAction::Redraw
+                }
+                KeyCode::Char('f') => {
+                    self.events_follow = !self.events_follow;
+                    if self.events_follow && !self.filtered_events.is_empty() {
+                        self.selected_event = Some(self.filtered_events.len() - 1);
+                        self.detail_scroll = 0;
+                    }
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                KeyCode::Char('l') => {
+                    self.show_lane_events = !self.show_lane_events;
+                    self.rebuild_rows(None);
+                    self.detail_scroll = 0;
+                    self.dirty = true;
+                    AppAction::Redraw
+                }
+                KeyCode::Char('t') | KeyCode::Enter => {
+                    if let Some(ev) = self.selected_event_item().cloned() {
+                        if !ev.run.is_empty() && self.jump_to_run_by_id(&ev.run) {
+                            if self.needs_selected_result() {
+                                AppAction::LoadSelectedResult
+                            } else {
+                                AppAction::Redraw
+                            }
+                        } else if !ev.run.is_empty() {
+                            self.set_toast(format!("该运行已清理（delegate show {}）", ev.run));
+                            AppAction::Redraw
+                        } else {
+                            AppAction::None
+                        }
+                    } else {
+                        AppAction::None
+                    }
+                }
+                KeyCode::Char('y') => {
+                    if let Some(ev) = self.selected_event_item().cloned() {
+                        let cmd = if !ev.run.is_empty() {
+                            format!(
+                                "{} show {}",
+                                shell_quote(&self.delegate_bin.to_string_lossy()),
+                                shell_quote(&ev.run)
+                            )
+                        } else {
+                            format!(
+                                "{} events --since {}",
+                                shell_quote(&self.delegate_bin.to_string_lossy()),
+                                ev.seq.saturating_sub(1)
+                            )
+                        };
+                        AppAction::CopyClipboard(cmd)
+                    } else {
+                        AppAction::None
+                    }
                 }
                 KeyCode::Down | KeyCode::Char('j') => match self.focus {
                     FocusPane::List => {
@@ -2697,6 +3192,7 @@ impl App {
             };
         }
 
+        // `3 运行` (`ViewTab::Runs`)
         match key.code {
             KeyCode::Char('q') => AppAction::Quit,
             KeyCode::Tab | KeyCode::BackTab => {
@@ -2705,6 +3201,27 @@ impl App {
                     FocusPane::Detail => FocusPane::List,
                 };
                 self.dirty = true;
+                AppAction::Redraw
+            }
+            KeyCode::Char('v') => {
+                let prev = self.current_selection_key();
+                self.runs_group_mode = match self.runs_group_mode {
+                    RunsGroupMode::ByStatus => RunsGroupMode::ByRepo,
+                    RunsGroupMode::ByRepo => RunsGroupMode::ByStatus,
+                };
+                self.rebuild_rows_inner(prev);
+                self.dirty = true;
+                AppAction::Redraw
+            }
+            KeyCode::Char('w') => {
+                if let Some(run) = self.selected_run().cloned() {
+                    if let Some(wid) = self.snapshot.work_id_for_run(&run) {
+                        if self.jump_to_work_id(&wid) {
+                            return AppAction::Redraw;
+                        }
+                    }
+                }
+                self.set_toast("当前运行未关联工作项");
                 AppAction::Redraw
             }
             KeyCode::Down | KeyCode::Char('j') => match self.focus {
@@ -2832,6 +3349,10 @@ impl App {
                     AppAction::Redraw
                 } else if self.selected_run().is_some() {
                     AppAction::OpenFullResult
+                } else if self.selected_merge_row().is_some() {
+                    self.focus = FocusPane::Detail;
+                    self.dirty = true;
+                    AppAction::Redraw
                 } else {
                     AppAction::None
                 }
@@ -2850,6 +3371,7 @@ impl App {
                     AppAction::None
                 }
             }
+            KeyCode::Char('Q') => AppAction::RefreshQuota,
             KeyCode::Char('r') => AppAction::Refresh,
             KeyCode::Char('/') => {
                 self.filter_mode = true;
@@ -2868,7 +3390,32 @@ impl App {
                 }
             }
             KeyCode::Char('a') => {
-                self.open_command_modal(WriteAction::Apply);
+                if let Some(m) = self.selected_merge_row().cloned() {
+                    let cmd = format_repo_cmd(
+                        &self.cwd,
+                        &m.repo_path,
+                        &format!(
+                            "{} apply --keep-commits {}",
+                            shell_quote(&self.delegate_bin.to_string_lossy()),
+                            shell_quote(&m.merge_run)
+                        ),
+                    );
+                    let note = if m.applied {
+                        "该合入批次已合回源仓库。".to_string()
+                    } else if !m.merge_accept_ok {
+                        "最终 mergeAccept 未通过，请先排查报告再合回。".to_string()
+                    } else {
+                        "把集成提交链落回源仓库，不推送远端。".to_string()
+                    };
+                    self.overlay = Overlay::CommandModal {
+                        action_label: "合回源仓库 (apply --keep-commits)".to_string(),
+                        command: cmd,
+                        note,
+                    };
+                    self.dirty = true;
+                } else {
+                    self.open_command_modal(WriteAction::Apply);
+                }
                 AppAction::Redraw
             }
             KeyCode::Char('c') => {
@@ -2888,10 +3435,429 @@ impl App {
                     let action = recommended_action(&run);
                     let (cmd, _) = build_write_command(&self.delegate_bin, &self.cwd, &run, action);
                     AppAction::CopyClipboard(cmd)
+                } else if let Some(m) = self.selected_merge_row().cloned() {
+                    let cmd = format_repo_cmd(
+                        &self.cwd,
+                        &m.repo_path,
+                        &format!(
+                            "{} apply --keep-commits {}",
+                            shell_quote(&self.delegate_bin.to_string_lossy()),
+                            shell_quote(&m.merge_run)
+                        ),
+                    );
+                    AppAction::CopyClipboard(cmd)
                 } else {
                     AppAction::None
                 }
             }
+            KeyCode::Char('?') => {
+                self.overlay = Overlay::Help;
+                self.dirty = true;
+                AppAction::Redraw
+            }
+            _ => AppAction::None,
+        }
+    }
+
+    fn handle_overview_key(&mut self, key: KeyEvent) -> AppAction {
+        let move_sel = |sel: &mut usize, len: usize, delta: isize| -> bool {
+            if len == 0 {
+                *sel = 0;
+                return false;
+            }
+            let cur = (*sel).min(len - 1);
+            let next = if delta >= 0 {
+                (cur + delta as usize).min(len - 1)
+            } else {
+                cur.saturating_sub((-delta) as usize)
+            };
+            if next != *sel {
+                *sel = next;
+                true
+            } else {
+                false
+            }
+        };
+        let is_narrow = self.last_terminal_width < 110;
+        match key.code {
+            KeyCode::Char('q') => AppAction::Quit,
+            KeyCode::Tab => {
+                self.overview_focus = self.overview_focus.next();
+                self.dirty = true;
+                AppAction::Redraw
+            }
+            KeyCode::BackTab => {
+                self.overview_focus = self.overview_focus.prev();
+                self.dirty = true;
+                AppAction::Redraw
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if is_narrow {
+                    self.overview_scroll = self.overview_scroll.saturating_add(1);
+                    self.dirty = true;
+                    return AppAction::Redraw;
+                }
+                let changed = match self.overview_focus {
+                    OverviewFocus::Attention => {
+                        let len = self.overview_attention_entries().len();
+                        move_sel(&mut self.overview_attention_sel, len, 1)
+                    }
+                    OverviewFocus::Running => {
+                        let len = self.overview_running_entries().len();
+                        move_sel(&mut self.overview_running_sel, len, 1)
+                    }
+                    OverviewFocus::WorkChains => {
+                        let len = self.overview_work_chain_rows().len();
+                        move_sel(&mut self.overview_work_sel, len, 1)
+                    }
+                    OverviewFocus::Deliveries => {
+                        let len = self.overview_delivery_entries().len();
+                        move_sel(&mut self.overview_deliveries_sel, len, 1)
+                    }
+                };
+                if changed {
+                    self.dirty = true;
+                    AppAction::Redraw
+                } else {
+                    AppAction::None
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if is_narrow {
+                    self.overview_scroll = self.overview_scroll.saturating_sub(1);
+                    self.dirty = true;
+                    return AppAction::Redraw;
+                }
+                let changed = match self.overview_focus {
+                    OverviewFocus::Attention => {
+                        let len = self.overview_attention_entries().len();
+                        move_sel(&mut self.overview_attention_sel, len, -1)
+                    }
+                    OverviewFocus::Running => {
+                        let len = self.overview_running_entries().len();
+                        move_sel(&mut self.overview_running_sel, len, -1)
+                    }
+                    OverviewFocus::WorkChains => {
+                        let len = self.overview_work_chain_rows().len();
+                        move_sel(&mut self.overview_work_sel, len, -1)
+                    }
+                    OverviewFocus::Deliveries => {
+                        let len = self.overview_delivery_entries().len();
+                        move_sel(&mut self.overview_deliveries_sel, len, -1)
+                    }
+                };
+                if changed {
+                    self.dirty = true;
+                    AppAction::Redraw
+                } else {
+                    AppAction::None
+                }
+            }
+            KeyCode::PageDown => {
+                if is_narrow {
+                    self.overview_scroll = self.overview_scroll.saturating_add(8);
+                    self.dirty = true;
+                    return AppAction::Redraw;
+                }
+                match self.overview_focus {
+                    OverviewFocus::Attention => {
+                        let len = self.overview_attention_entries().len();
+                        move_sel(&mut self.overview_attention_sel, len, 6);
+                    }
+                    OverviewFocus::Running => {
+                        let len = self.overview_running_entries().len();
+                        move_sel(&mut self.overview_running_sel, len, 6);
+                    }
+                    OverviewFocus::WorkChains => {
+                        let len = self.overview_work_chain_rows().len();
+                        move_sel(&mut self.overview_work_sel, len, 6);
+                    }
+                    OverviewFocus::Deliveries => {
+                        let len = self.overview_delivery_entries().len();
+                        move_sel(&mut self.overview_deliveries_sel, len, 6);
+                    }
+                }
+                self.dirty = true;
+                AppAction::Redraw
+            }
+            KeyCode::PageUp => {
+                if is_narrow {
+                    self.overview_scroll = self.overview_scroll.saturating_sub(8);
+                    self.dirty = true;
+                    return AppAction::Redraw;
+                }
+                match self.overview_focus {
+                    OverviewFocus::Attention => {
+                        let len = self.overview_attention_entries().len();
+                        move_sel(&mut self.overview_attention_sel, len, -6);
+                    }
+                    OverviewFocus::Running => {
+                        let len = self.overview_running_entries().len();
+                        move_sel(&mut self.overview_running_sel, len, -6);
+                    }
+                    OverviewFocus::WorkChains => {
+                        let len = self.overview_work_chain_rows().len();
+                        move_sel(&mut self.overview_work_sel, len, -6);
+                    }
+                    OverviewFocus::Deliveries => {
+                        let len = self.overview_delivery_entries().len();
+                        move_sel(&mut self.overview_deliveries_sel, len, -6);
+                    }
+                }
+                self.dirty = true;
+                AppAction::Redraw
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                if is_narrow {
+                    self.overview_scroll = 0;
+                } else {
+                    match self.overview_focus {
+                        OverviewFocus::Attention => self.overview_attention_sel = 0,
+                        OverviewFocus::Running => self.overview_running_sel = 0,
+                        OverviewFocus::WorkChains => self.overview_work_sel = 0,
+                        OverviewFocus::Deliveries => self.overview_deliveries_sel = 0,
+                    }
+                }
+                self.dirty = true;
+                AppAction::Redraw
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                if is_narrow {
+                    self.overview_scroll = usize::MAX / 2;
+                } else {
+                    match self.overview_focus {
+                        OverviewFocus::Attention => {
+                            self.overview_attention_sel =
+                                self.overview_attention_entries().len().saturating_sub(1);
+                        }
+                        OverviewFocus::Running => {
+                            self.overview_running_sel =
+                                self.overview_running_entries().len().saturating_sub(1);
+                        }
+                        OverviewFocus::WorkChains => {
+                            self.overview_work_sel =
+                                self.overview_work_chain_rows().len().saturating_sub(1);
+                        }
+                        OverviewFocus::Deliveries => {
+                            self.overview_deliveries_sel =
+                                self.overview_delivery_entries().len().saturating_sub(1);
+                        }
+                    }
+                }
+                self.dirty = true;
+                AppAction::Redraw
+            }
+            KeyCode::Char(' ') => {
+                if self.overview_focus == OverviewFocus::Attention {
+                    let entries = self.overview_attention_entries();
+                    if let Some(OverviewAttentionEntry::StaleFold { .. }) =
+                        entries.get(self.overview_attention_sel)
+                    {
+                        self.overview_stale_expanded = !self.overview_stale_expanded;
+                        self.dirty = true;
+                        return AppAction::Redraw;
+                    }
+                }
+                AppAction::None
+            }
+            KeyCode::Enter => match self.overview_focus {
+                OverviewFocus::Attention => {
+                    let entries = self.overview_attention_entries();
+                    match entries.get(self.overview_attention_sel) {
+                        Some(OverviewAttentionEntry::OwnerWork { work_idx }) => {
+                            if let Some(w) = self.snapshot.work.get(*work_idx) {
+                                let wid = w.id.clone();
+                                self.jump_to_work_id(&wid);
+                                return AppAction::Redraw;
+                            }
+                            AppAction::None
+                        }
+                        Some(OverviewAttentionEntry::PendingRun { repo_idx, run_idx }) => {
+                            if let Some(r) = self
+                                .snapshot
+                                .repos
+                                .get(*repo_idx)
+                                .and_then(|rp| rp.runs.get(*run_idx))
+                            {
+                                let rid = r.run.clone();
+                                if self.jump_to_run_by_id(&rid) {
+                                    return if self.needs_selected_result() {
+                                        AppAction::LoadSelectedResult
+                                    } else {
+                                        AppAction::Redraw
+                                    };
+                                }
+                            }
+                            AppAction::None
+                        }
+                        Some(OverviewAttentionEntry::StaleFold { .. }) => {
+                            self.overview_stale_expanded = !self.overview_stale_expanded;
+                            self.dirty = true;
+                            AppAction::Redraw
+                        }
+                        None => AppAction::None,
+                    }
+                }
+                OverviewFocus::Running => {
+                    let entries = self.overview_running_entries();
+                    if let Some(&(ri, rj)) = entries.get(self.overview_running_sel) {
+                        if let Some(r) = self.snapshot.repos.get(ri).and_then(|rp| rp.runs.get(rj))
+                        {
+                            let rid = r.run.clone();
+                            if self.jump_to_run_by_id(&rid) {
+                                return if self.needs_selected_result() {
+                                    AppAction::LoadSelectedResult
+                                } else {
+                                    AppAction::Redraw
+                                };
+                            }
+                        }
+                    }
+                    AppAction::None
+                }
+                OverviewFocus::WorkChains => {
+                    let rows = self.overview_work_chain_rows();
+                    if let Some(WorkRow::Item { work_idx, .. }) = rows.get(self.overview_work_sel) {
+                        if let Some(w) = self.snapshot.work.get(*work_idx) {
+                            let wid = w.id.clone();
+                            self.jump_to_work_id(&wid);
+                            return AppAction::Redraw;
+                        }
+                    }
+                    AppAction::None
+                }
+                OverviewFocus::Deliveries => {
+                    let deliveries = self.overview_delivery_entries();
+                    if let Some(d) = deliveries.get(self.overview_deliveries_sel) {
+                        let when = format_iso_local_short(&d.applied_at, &self.snapshot.today_ymd)
+                            .unwrap_or_else(|| d.applied_at.clone());
+                        let mut body = format!(
+                            "运行: {}\n仓库: {}\n合入时刻: {}{}\n改动: {} 文件 (+{}/-{}) · 耗时 {} · {} 轮\n\n",
+                            d.run,
+                            d.repo,
+                            when,
+                            if d.applied_head.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" · 提交 {}", d.applied_head)
+                            },
+                            d.changes_files,
+                            d.added,
+                            d.deleted,
+                            format_duration(Some(d.elapsed_seconds.max(0) as u64)),
+                            d.rounds.max(1)
+                        );
+                        if d.conclusion.trim().is_empty() {
+                            body.push_str(&format!(
+                                "（历史记录无摘要，完整全文请运行：delegate show {}）",
+                                d.run
+                            ));
+                        } else {
+                            body.push_str(&d.conclusion);
+                        }
+                        self.overlay = Overlay::FullResult {
+                            run_id: d.run.clone(),
+                            title: format!("最近交付 · {}", d.name),
+                            content: body,
+                            scroll: 0,
+                        };
+                        self.dirty = true;
+                        AppAction::Redraw
+                    } else {
+                        AppAction::None
+                    }
+                }
+            },
+            KeyCode::Char('y') => match self.overview_focus {
+                OverviewFocus::Deliveries => {
+                    let deliveries = self.overview_delivery_entries();
+                    if let Some(d) = deliveries.get(self.overview_deliveries_sel) {
+                        let cmd = format!(
+                            "{} show {}",
+                            shell_quote(&self.delegate_bin.to_string_lossy()),
+                            shell_quote(&d.run)
+                        );
+                        AppAction::CopyClipboard(cmd)
+                    } else {
+                        AppAction::None
+                    }
+                }
+                OverviewFocus::Attention => {
+                    let entries = self.overview_attention_entries();
+                    match entries.get(self.overview_attention_sel) {
+                        Some(OverviewAttentionEntry::OwnerWork { work_idx }) => {
+                            if let Some(w) = self.snapshot.work.get(*work_idx) {
+                                let cmd = build_work_next_command(&self.delegate_bin, &self.cwd, w);
+                                AppAction::CopyClipboard(cmd)
+                            } else {
+                                AppAction::None
+                            }
+                        }
+                        Some(OverviewAttentionEntry::PendingRun { repo_idx, run_idx }) => {
+                            if let Some(r) = self
+                                .snapshot
+                                .repos
+                                .get(*repo_idx)
+                                .and_then(|rp| rp.runs.get(*run_idx))
+                            {
+                                let action = recommended_action(r);
+                                let (cmd, _) =
+                                    build_write_command(&self.delegate_bin, &self.cwd, r, action);
+                                AppAction::CopyClipboard(cmd)
+                            } else {
+                                AppAction::None
+                            }
+                        }
+                        _ => AppAction::None,
+                    }
+                }
+                OverviewFocus::WorkChains => {
+                    let rows = self.overview_work_chain_rows();
+                    if let Some(WorkRow::Item { work_idx, .. }) = rows.get(self.overview_work_sel) {
+                        if let Some(w) = self.snapshot.work.get(*work_idx) {
+                            let cmd = build_work_next_command(&self.delegate_bin, &self.cwd, w);
+                            return AppAction::CopyClipboard(cmd);
+                        }
+                    }
+                    AppAction::None
+                }
+                OverviewFocus::Running => {
+                    let entries = self.overview_running_entries();
+                    if let Some(&(ri, rj)) = entries.get(self.overview_running_sel) {
+                        if let Some(r) = self.snapshot.repos.get(ri).and_then(|rp| rp.runs.get(rj))
+                        {
+                            let cmd = format_repo_cmd(
+                                &self.cwd,
+                                &r.repo_path,
+                                &format!(
+                                    "{} status {}",
+                                    shell_quote(&self.delegate_bin.to_string_lossy()),
+                                    shell_quote(&r.run)
+                                ),
+                            );
+                            return AppAction::CopyClipboard(cmd);
+                        }
+                    }
+                    AppAction::None
+                }
+            },
+            KeyCode::Char('/') => {
+                self.filter_mode = true;
+                self.dirty = true;
+                AppAction::Redraw
+            }
+            KeyCode::Esc => {
+                if !self.filter.is_empty() {
+                    self.filter.clear();
+                    self.rebuild_rows(None);
+                    self.dirty = true;
+                    AppAction::Redraw
+                } else {
+                    AppAction::None
+                }
+            }
+            KeyCode::Char('Q') => AppAction::RefreshQuota,
+            KeyCode::Char('r') => AppAction::Refresh,
             KeyCode::Char('?') => {
                 self.overlay = Overlay::Help;
                 self.dirty = true;

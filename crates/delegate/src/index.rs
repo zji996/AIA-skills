@@ -676,17 +676,9 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
         }));
     }
 
-    let mut events_all = crate::events::read_since_in(&state, 0);
-    if events_limit > 0 && events_all.len() > events_limit {
-        let drain_n = events_all.len() - events_limit;
-        events_all.drain(0..drain_n);
-    }
-    let seq = crate::events::latest_seq().max(
-        events_all
-            .last()
-            .and_then(|e| e["seq"].as_u64())
-            .unwrap_or(0),
-    );
+    let events_tail = crate::events::read_tail_in(&state, events_limit);
+    let events_all = events_tail.events;
+    let seq = crate::events::latest_seq().max(events_tail.latest_seq.unwrap_or(0));
     let unified_work = crate::work::build_unified_work_view(
         work_struct_items,
         &state,
@@ -714,7 +706,29 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
     let merges = crate::merge::load_merge_reports(None);
     let candidates = crate::radar::load_all_candidates(None);
     let agy_accounts = crate::agy_accounts::snapshot_json_fast();
-    let analytics = crate::usage::tui_analytics_snapshot(&state, &all_seen_runs);
+    let analytics_bundle = crate::usage::tui_analytics_and_deliveries(
+        &state,
+        &all_seen_runs,
+        &unified_work.items,
+        now_ts,
+    );
+
+    let all_run_refs: Vec<&Value> = repo_groups
+        .iter()
+        .filter_map(|g| g["runs"].as_array())
+        .flatten()
+        .collect();
+    let (pulse, alerts) = crate::pulse::compute_pulse_and_alerts(
+        &all_run_refs,
+        &work_items,
+        &agy_accounts,
+        analytics_bundle.merged_today,
+        now_ts,
+    );
+    let alerts_json: Vec<Value> = alerts
+        .iter()
+        .map(crate::pulse::ActiveAlert::to_json)
+        .collect();
 
     let payload = json!({
         "schemaVersion": SCHEMA_VERSION,
@@ -723,12 +737,17 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
         "repos": repo_groups,
         "work": work_items,
         "events": events_all,
+        "eventsHasMore": events_tail.has_earlier,
+        "eventsEarliestSeq": events_tail.earliest_seq,
         "lane": lane,
         "dagQueue": dag_queue,
         "merges": merges,
         "candidates": candidates,
         "agyAccounts": agy_accounts,
-        "analytics": analytics,
+        "analytics": analytics_bundle.analytics,
+        "recentDeliveries": analytics_bundle.recent_deliveries,
+        "pulse": pulse.to_json(),
+        "alerts": alerts_json,
         "eta": eta_summary,
     });
     println!("{payload}");

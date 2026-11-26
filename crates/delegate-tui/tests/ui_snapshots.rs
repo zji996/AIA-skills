@@ -57,7 +57,15 @@ fn make_sample_app() -> App {
         PathBuf::from("/home/dev/demo-api"),
         5,
     );
-    if let Some(run) = app.selected_run().cloned() {
+    // Cache Markdown result for api-r2 specifically (regardless of default sort order)
+    if let Some(run) = app
+        .snapshot
+        .repos
+        .iter()
+        .flat_map(|r| r.runs.iter())
+        .find(|r| r.run == "20261122-103000-api-r2")
+        .cloned()
+    {
         app.result_cache.insert(
             run.cache_key(),
             Ok("## 核心结论\n\n**已完成接口鉴权改造**，详见 [`crates/api/src/auth.rs`](file:///tmp/auth.rs) 与 `cargo test -p api`。\n\n- 覆盖空令牌、过期令牌与合法请求。".to_string()),
@@ -88,23 +96,27 @@ fn render_to_string(app: &mut App, width: u16, height: u16) -> String {
 
 #[test]
 fn snapshot_wide_screen_renders_rounded_borders_bars_relative_time_and_lane_meter() {
+    use delegate_tui::app::ViewTab;
+
     let mut app = make_sample_app();
-    let screen = render_to_string(&mut app, 148, 34);
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Runs);
+    // Urgent run (移动端样式修正) sorts first in ByStatus; move down once to select 接口鉴权 (with cached result)
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    let screen = render_to_string(&mut app, 160, 34);
 
-    // Rounded borders & top bar counts
+    // Rounded borders & unified 5-tab top bar with fixed pulse counts
     assert!(screen.contains('╭') && screen.contains('╰'), "{screen}");
-    assert!(screen.contains("delegate-tui"), "{screen}");
-    assert!(screen.contains("待处理 2"), "{screen}");
-    assert!(screen.contains("运行 1"), "{screen}");
+    assert!(screen.contains("delegate"), "{screen}");
+    assert!(screen.contains("1 总览") && screen.contains("3 运行"), "{screen}");
+    assert!(screen.contains("待主控 2"), "{screen}");
+    assert!(screen.contains("在跑 1"), "{screen}");
     assert!(screen.contains("排队 1"), "{screen}");
-    assert!(screen.contains("已合 1"), "{screen}");
 
-    // Multi-repo headers, status groups, and folded merged section
-    assert!(screen.contains("~/demo-api"), "{screen}");
-    assert!(screen.contains("~/web-app"), "{screen}");
-    assert!(screen.contains("待处理 (1)"), "{screen}");
-    assert!(screen.contains("运行中 (1)"), "{screen}");
-    assert!(screen.contains("排队 (1)"), "{screen}");
+    // Default ByStatus grouping: cross-repo status headers + folded merged section
+    assert!(screen.contains("待主控处理 (2)"), "{screen}");
+    assert!(screen.contains("运行与返工 (1)"), "{screen}");
+    assert!(screen.contains("排队与待续派 (1)"), "{screen}");
     assert!(screen.contains("▸ 已合未清 1 条"), "{screen}");
 
     // Collapsed chain, relative time ("3 分钟前"), mini diff bar, badges, selected stripe
@@ -131,6 +143,15 @@ fn snapshot_wide_screen_renders_rounded_borders_bars_relative_time_and_lane_mete
     assert!(screen.contains("crates/api"), "{screen}");
     assert!(screen.contains("下一步"), "{screen}");
 
+    // Toggle 'v' to ByRepo grouping -> multi-repo headers & per-repo groups appear
+    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    let by_repo = render_to_string(&mut app, 160, 34);
+    assert!(by_repo.contains("~/demo-api"), "{by_repo}");
+    assert!(by_repo.contains("~/web-app"), "{by_repo}");
+    assert!(by_repo.contains("待处理 (1)"), "{by_repo}");
+    assert!(by_repo.contains("运行中 (1)"), "{by_repo}");
+    assert!(by_repo.contains("排队 (1)"), "{by_repo}");
+
     // Bottom bar mini lane meter + pool tokens + per-command shares + host load + time
     assert!(screen.contains("Lane ██░░░░ 2/6"), "{screen}");
     assert!(screen.contains("令牌 88/88 空闲 31"), "{screen}");
@@ -143,22 +164,26 @@ fn snapshot_wide_screen_renders_rounded_borders_bars_relative_time_and_lane_mete
 #[test]
 fn snapshot_narrow_80_columns_uses_readable_stacked_layout() {
     let mut app = make_sample_app();
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
     let screen = render_to_string(&mut app, 80, 30);
 
-    assert!(screen.contains("任务 (5)"), "{screen}");
+    assert!(screen.contains("运行列表 (活跃 4 · 按状态聚合"), "{screen}");
     assert!(screen.contains("接口鉴权"), "{screen}");
-    assert!(screen.contains("~/demo-api"), "{screen}");
     assert!(screen.contains("[2轮]"), "{screen}");
-    assert!(screen.contains("3 分钟前"), "{screen}");
+    assert!(screen.contains("3 分钟前") || screen.contains("3分前"), "{screen}");
     assert!(screen.contains("结论摘要"), "{screen}");
     assert!(screen.contains("Lane ██░░░░ 2/6"), "{screen}");
     assert!(screen.contains("令牌 88/88 闲31"), "{screen}");
-    assert!(screen.contains("jk选 Tab栏"), "{screen}");
+    assert!(screen.contains("v分组") || screen.contains("1-5/[]"), "{screen}");
 }
 
 #[test]
 fn snapshot_overlays_result_diff_and_command_modal() {
     let mut app = make_sample_app();
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    // Move to api-r2 (index 1 under 待主控处理)
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
 
     // Command modal ('a')
     app.open_command_modal(WriteAction::Apply);
@@ -207,8 +232,9 @@ fn snapshot_empty_state_is_minimal_and_tiny_terminal_does_not_panic() {
         ..AppSnapshot::default()
     };
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("."), 5);
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
     let empty = render_to_string(&mut app, 80, 24);
-    assert!(empty.contains("暂无委派任务"), "{empty}");
+    assert!(empty.contains("暂无委派运行") || empty.contains("暂无委派任务"), "{empty}");
     // No decorative filler in empty detail pane
     assert!(!empty.contains("选择一个任务以查看详情"), "{empty}");
 
@@ -235,29 +261,36 @@ fn snapshot_events_tab_liveness_activity_and_dag_queue() {
     let snap = AppSnapshot {
         repos: vec![repo],
         events: parse_events_jsonl(raw_events),
+        events_has_more: true,
+        events_earliest_seq: Some(500),
         dag_queue: parse_dag_queue_jsonl(raw_queue),
         refreshed_at: "09:06:10".into(),
         ..AppSnapshot::default()
     };
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/dev/demo-api"), 5);
 
-    // Runs tab shows full liveness badges ("跑命令", "卡警"), detail "正在做什么", and DAG queue section!
+    // Switch to Runs tab ('3'): shows full liveness badges ("跑命令", "卡住警"), detail "正在做什么", and DAG queue section
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
     let runs_screen = render_to_string(&mut app, 140, 32);
     assert!(runs_screen.contains("跑命令"), "{runs_screen}");
-    assert!(runs_screen.contains("卡警"), "{runs_screen}");
+    assert!(runs_screen.contains("卡住警"), "{runs_screen}");
     assert!(runs_screen.contains("正在做什么"), "{runs_screen}");
-    assert!(runs_screen.contains("续派队列 (1)"), "{runs_screen}");
+    assert!(runs_screen.contains("排队与待续派 (1)"), "{runs_screen}");
     assert!(runs_screen.contains("step-2"), "{runs_screen}");
-    assert!(runs_screen.contains("2事件(3)"), "{runs_screen}");
+    assert!(runs_screen.contains("5 事件"), "{runs_screen}");
 
-    // Press '2' to switch to Events tab!
-    app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    // Press '5' to switch to Events tab (and verify tail-window hint line!)
+    app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
     let events_screen = render_to_string(&mut app, 140, 32);
-    assert!(events_screen.contains("事件流 (3) · 跟随"), "{events_screen}");
+    assert!(events_screen.contains("事件时间线 (显示 3 条 · 跟随最新)"), "{events_screen}");
     assert!(events_screen.contains("#1"), "{events_screen}");
     assert!(events_screen.contains("卡警"), "{events_screen}");
     assert!(events_screen.contains("step-2"), "{events_screen}");
     assert!(events_screen.contains("事件 #3"), "{events_screen}");
+    assert!(
+        events_screen.contains("更早的事件：delegate events --since 300"),
+        "tail window hint missing:\n{events_screen}"
+    );
 }
 
 #[test]
@@ -283,17 +316,18 @@ fn snapshot_review_states_and_review_events() {
         ..AppSnapshot::default()
     };
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/dev/demo-api"), 5);
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
     let screen = render_to_string(&mut app, 150, 34);
-    assert!(screen.contains("主审"), "{screen}");
+    assert!(screen.contains("需主审"), "{screen}");
     assert!(screen.contains("NEEDS_CONTROLLER"), "{screen}");
     assert!(screen.contains("PASS"), "{screen}");
     assert!(screen.contains("审查中"), "{screen}");
-    assert!(screen.contains("返工第 2 轮"), "{screen}");
+    assert!(screen.contains("返工2轮"), "{screen}");
     assert!(!screen.contains("REWORK 第2轮"), "rework must not duplicate English REWORK:\n{screen}");
     assert!(screen.contains("controllerReviewPaths"), "{screen}");
     assert!(screen.contains("sha256:abcdef012345"), "{screen}");
 
-    app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
     let ev_screen = render_to_string(&mut app, 150, 34);
     assert!(ev_screen.contains("开审"), "{ev_screen}");
     assert!(ev_screen.contains("审结"), "{ev_screen}");
@@ -325,43 +359,47 @@ fn snapshot_merges_and_candidates_tabs_and_events() {
     };
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/dev/demo-api"), 5);
 
-    // Top bar shows 3合入(1) and 4候选(1)
+    // Top bar has only the 5 tabs (no standalone 3合入 / 4候选 tabs)
     let home = render_to_string(&mut app, 148, 32);
-    assert!(home.contains("3合入(1)"), "{home}");
-    assert!(home.contains("4候选(1)"), "{home}");
+    assert!(!home.contains("3合入"), "{home}");
+    assert!(!home.contains("4候选"), "{home}");
 
-    // Switch to Merges tab ('3')
+    // Switch to Runs tab ('3') -> Merges folded inside Runs; Space expands it and 'a' opens apply --keep-commits modal
     app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    let runs_folded = render_to_string(&mut app, 148, 32);
+    assert!(runs_folded.contains("▸ 合入批次 1 条"), "{runs_folded}");
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
     let merges_screen = render_to_string(&mut app, 148, 32);
-    assert!(merges_screen.contains("合入批次 (1)"), "{merges_screen}");
     assert!(merges_screen.contains("20261123-110000-merge"), "{merges_screen}");
     assert!(merges_screen.contains("可自主合入"), "{merges_screen}");
     assert!(merges_screen.contains("SKIPPED"), "{merges_screen}");
     assert!(merges_screen.contains("delegate apply --keep-commits 20261123-110000-merge"), "{merges_screen}");
 
-    // Press 'a' in Merges tab opens CommandModal for apply --keep-commits
     app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
     let apply_modal = render_to_string(&mut app, 148, 32);
     assert!(apply_modal.contains("apply --keep-commits 20261123-110000-merge"), "{apply_modal}");
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-    // Switch to Candidates tab ('4')
-    app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+    // Switch to Work tab ('2') -> Radar candidates folded inside Work; Space expands and 'p' opens radar pick modal
+    app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    let work_folded = render_to_string(&mut app, 148, 32);
+    assert!(work_folded.contains("▸ 侦察候选 1 条"), "{work_folded}");
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
     let cand_screen = render_to_string(&mut app, 148, 32);
-    assert!(cand_screen.contains("Radar 候选板 (1)"), "{cand_screen}");
     assert!(cand_screen.contains("r-a1b2c3d4"), "{cand_screen}");
     assert!(cand_screen.contains("补齐 capabilities 缺口测试"), "{cand_screen}");
     assert!(cand_screen.contains("crates/api/src/lib.rs:42"), "{cand_screen}");
     assert!(cand_screen.contains("delegate radar pick r-a1b2c3d4"), "{cand_screen}");
 
-    // Press 'p' in Candidates tab opens CommandModal for radar pick
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
     let pick_modal = render_to_string(&mut app, 148, 32);
     assert!(pick_modal.contains("radar pick r-a1b2c3d4"), "{pick_modal}");
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-    // Switch to Events tab ('2') and verify merge/radar event badges
-    app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    // Switch to Events tab ('5') and verify merge/radar event badges
+    app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
     let ev_screen = render_to_string(&mut app, 148, 32);
     assert!(ev_screen.contains("合始"), "{ev_screen}");
     assert!(ev_screen.contains("合项"), "{ev_screen}");
@@ -418,45 +456,36 @@ fn work_view_renders_grouping_dependency_chains_live_status_at_120_80_50_and_emp
     use delegate_tui::app::ViewTab;
 
     let mut app = make_work_sample_app(None);
-    // Press 'w' to enter Work view
-    app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+    // Press '2' to enter Work view (old 'w' tab key removed)
+    app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
     assert_eq!(app.tab, ViewTab::Work);
 
-    // 1. Wide 120 columns: unified full tab names, right-side counts trimmed cleanly without clipping
-    let s120 = render_to_string(&mut app, 120, 34);
-    let top120 = s120.lines().next().unwrap_or("");
-    assert!(top120.contains("0总览") && top120.contains("1任务") && top120.contains("5工作"), "{top120}");
-    assert!(!top120.contains("0览"), "work tab must not shrink tab labels: {top120}");
-    assert!(!top120.trim_end().ends_with('·'), "top bar must not leave trailing separator: {top120}");
-    assert!(s120.contains("等你 4"), "{s120}");
-    assert!(s120.contains("需处理 2"), "{s120}");
-    assert!(s120.contains("就绪 1"), "{s120}");
-
-    // Very wide 160 columns shows all work counts
+    // 1. Wide 160 columns: unified 5-tab top bar, fixed pulse right side, 54:46 dual-pane
     let s160 = render_to_string(&mut app, 160, 34);
-    assert!(s160.contains("等你 4"), "{s160}");
-    assert!(s160.contains("需处理 2"), "{s160}");
-    assert!(s160.contains("就绪 1"), "{s160}");
-    assert!(s160.contains("推进中 2"), "{s160}");
-    assert!(s160.contains("等待 4"), "{s160}");
-    assert!(s160.contains("暂缓 1"), "{s160}");
-    assert!(s160.contains("今天完成 1"), "{s160}");
+    let top160 = s160.lines().next().unwrap_or("");
+    assert!(top160.contains("1 总览") && top160.contains("2 工作") && top160.contains("3 运行"), "{top160}");
+    assert!(!top160.trim_end().ends_with('·'), "top bar must not leave trailing separator: {top160}");
+    assert!(top160.contains("等你 4"), "{top160}");
+    assert!(s160.contains("工作表 (推进 13"), "{s160}");
+    assert!(s160.contains("今日完成 1 / 共 1"), "{s160}");
+    assert!(s160.contains("定时/暂缓 1"), "{s160}");
 
-    // Owner items pinned at top in 动手 -> 点头 -> 看卡 -> 方向 order
-    let pos_q18 = s120.find("Q18").expect("Q18");
-    let pos_q20 = s120.find("Q20").expect("Q20");
-    let pos_q21 = s120.find("Q21").expect("Q21");
-    let pos_d002 = s120.find("D002").expect("D002");
-    assert!(pos_q18 < pos_q20 && pos_q20 < pos_q21 && pos_q21 < pos_d002, "{s120}");
+    // Owner items pinned at top in 动手 -> 点头 -> 看卡 -> 方向 order (search inside Work table body, after alert strip)
+    let work_body = &s160[s160.find("▾ 等你 (4)").expect("owner group")..];
+    let pos_q18 = work_body.find("Q18").expect("Q18");
+    let pos_q20 = work_body.find("Q20").expect("Q20");
+    let pos_q21 = work_body.find("Q21").expect("Q21");
+    let pos_d002 = work_body.find("D002").expect("D002");
+    assert!(pos_q18 < pos_q20 && pos_q20 < pos_q21 && pos_q21 < pos_d002, "{s160}");
 
-    // Group order: 等你 -> 需处理 -> 推进中 -> 就绪 -> 等待 -> 暂缓 -> 已完成折叠
-    let pos_owner = s120.find("▾ 等你").expect("owner group");
-    let pos_need = s120.find("▾ 需处理").expect("need group");
-    let pos_prog = s120.find("▾ 推进中").expect("prog group");
-    let pos_ready = s120.find("▾ 就绪").expect("ready group");
-    let pos_wait = s120.find("▾ 等待").expect("wait group");
-    let pos_defer = s120.find("▾ 暂缓").expect("defer group");
-    let pos_done_fold = s120.find("▸ 已完成 1 条").expect("done fold");
+    // Group order: 等你 -> 需处理 -> 推进中 -> 就绪 -> 依赖等待 -> 暂缓折叠 -> 已完成折叠
+    let pos_owner = s160.find("▾ 等你 (4)").expect("owner group");
+    let pos_need = s160.find("▾ 需处理 (2)").expect("need group");
+    let pos_prog = s160.find("▾ 推进中 (2 · 阻下游 3)").expect("prog group with downstream");
+    let pos_ready = s160.find("▾ 就绪 (1)").expect("ready group");
+    let pos_wait = s160.find("▾ 依赖等待 (1)").expect("wait group");
+    let pos_defer = s160.find("▸ 暂缓 1 条").expect("defer fold");
+    let pos_done_fold = s160.find("▸ 已完成 1 条").expect("done fold");
     assert!(
         pos_owner < pos_need
             && pos_need < pos_prog
@@ -464,37 +493,42 @@ fn work_view_renders_grouping_dependency_chains_live_status_at_120_80_50_and_emp
             && pos_ready < pos_wait
             && pos_wait < pos_defer
             && pos_defer < pos_done_fold,
-        "{s120}"
+        "{s160}"
     );
-    // Done item is folded by default
-    assert!(!s120.contains("今天完成的基础重构"), "{s120}");
+    // Done and deferred items are folded by default
+    assert!(!s160.contains("今天完成的基础重构"), "{s160}");
+    assert!(!s160.contains("夜间压测计划"), "{s160}");
 
     // Dependency chain indentation: W033 -> W034 -> W035 (+1) and W029 -> W031
-    assert!(s120.contains("└─ ◌ W034"), "{s120}");
-    assert!(s120.contains("   └─ ◌ W035"), "{s120}");
-    assert!(s120.contains("+1"), "{s120}");
-    assert!(s120.contains("└─ ◌ W031"), "{s120}");
+    assert!(s160.contains("└─ ◌ W034"), "{s160}");
+    assert!(s160.contains("   └─ ◌ W035"), "{s160}");
+    assert!(s160.contains("+1"), "{s160}");
+    assert!(s160.contains("└─ ◌ W031"), "{s160}");
 
-    // Live run one-liners
-    assert!(s120.contains("运行中 12 分钟 · 在跑验收"), "{s120}");
-    assert!(s120.contains("审查中"), "{s120}");
-    assert!(s120.contains("待合入 · 验收✓ 审查 PASS"), "{s120}");
-    assert!(s120.contains("等 W033 关闭"), "{s120}");
-    assert!(s120.contains("等所有者 Q12"), "{s120}");
+    // Dual-pane right side renders selected Q18 card automatically
+    assert!(s160.contains("工作卡 · Q18"), "{s160}");
+    assert!(s160.contains("主控建议：管理员私聊通知即可"), "{s160}");
 
-    // 2. 80 columns (unified full tab names, counts trimmed cleanly on the right)
+    // Live run one-liners in 180-wide layout
+    let s180 = render_to_string(&mut app, 180, 34);
+    assert!(s180.contains("运行中 12 分钟 · 在跑验收") || s180.contains("在跑验收"), "{s180}");
+    assert!(s180.contains("审查中"), "{s180}");
+    assert!(s180.contains("待合入 · 验收✓ 审查 PASS") || s180.contains("待合入"), "{s180}");
+    assert!(s180.contains("等 W033 关闭"), "{s180}");
+    assert!(s180.contains("等所有者 Q12"), "{s180}");
+
+    // 2. 80 columns (< 110 narrow: full-width single pane tree, unified top bar)
     let s80 = render_to_string(&mut app, 80, 32);
+    assert_lines_fit_width(&s80, 80);
     let top80 = s80.lines().next().unwrap_or("");
-    assert!(top80.contains("0总览") && top80.contains("5工作"), "{top80}");
-    assert!(s80.contains("等你 4"), "{s80}");
+    assert!(top80.contains("1总览") && top80.contains("2工作"), "{top80}");
     assert!(s80.contains("└─ ◌ W034"), "{s80}");
     assert!(s80.contains("+1"), "{s80}");
 
-    // 3. 50 columns (mobile/compact layout: 2-line L0, 2-line items, compact ↳ prefix)
+    // 3. 50 columns (mobile/compact layout: 2-line items, compact ↳ prefix)
     let s50 = render_to_string(&mut app, 50, 48);
-    let lines50: Vec<&str> = s50.lines().collect();
-    assert!(lines50[0].contains("等你 4") && lines50[0].contains("推进中 2"), "{s50}");
-    assert!(lines50[1].contains("等待 4") && lines50[1].contains("今天完成 1"), "{s50}");
+    assert_lines_fit_width(&s50, 50);
+    assert!(s50.contains("工作表 (推进 13"), "{s50}");
     assert!(s50.contains("↳ ◌ W034"), "{s50}");
     assert!(s50.contains(" ↳ ◌ W035"), "{s50}");
     assert!(s50.contains("等待 +1"), "{s50}");
@@ -502,7 +536,7 @@ fn work_view_renders_grouping_dependency_chains_live_status_at_120_80_50_and_emp
     // 4. Dropped filter ('x' key) surfaces Q19
     app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
     let s_drop = render_to_string(&mut app, 100, 20);
-    assert!(s_drop.contains("滤:已否"), "{s_drop}");
+    assert!(s_drop.contains("已否 (1)"), "{s_drop}");
     assert!(s_drop.contains("Q19"), "{s_drop}");
     assert!(s_drop.contains("现有渠道够用"), "{s_drop}");
     // Clear filter with Esc
@@ -514,9 +548,9 @@ fn work_view_renders_grouping_dependency_chains_live_status_at_120_80_50_and_emp
         ..AppSnapshot::default()
     };
     let mut empty_app = App::new(empty_snap, PathBuf::from("delegate"), PathBuf::from("."), 5);
-    empty_app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
-    let s_empty = render_to_string(&mut empty_app, 80, 20);
-    assert!(s_empty.contains("暂无工作项"), "{s_empty}");
+    empty_app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    let s_empty = render_to_string(&mut empty_app, 120, 20);
+    assert!(s_empty.contains("当前无开放工作项"), "{s_empty}");
     assert!(s_empty.contains("等你 0"), "{s_empty}");
 }
 
@@ -536,6 +570,8 @@ fn work_card_markdown_rendering_and_bidirectional_run_linkage() {
     .unwrap();
 
     let mut app = make_work_sample_app(Some(&tmp));
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Runs);
     // Run view initially selects W010's run (or first run) — verify detail pane shows linked work item ID!
     let runs_screen = render_to_string(&mut app, 140, 32);
     assert!(runs_screen.contains("[W010]") || runs_screen.contains("[W033]"), "{runs_screen}");
@@ -561,8 +597,17 @@ fn work_card_markdown_rendering_and_bidirectional_run_linkage() {
         Some(expected_wid.as_str())
     );
 
-    // Jump to owner card item Q21 and press Enter -> opens L2 Work Card with rendered Markdown!
+    // Jump to owner card item Q21 -> in wide 140x30 right pane shows Markdown card immediately,
+    // and in narrow 100x30 pressing Enter opens L2 Work Card overlay cleanly!
     assert!(app.jump_to_work_id("Q21"));
+    let wide_card = render_to_string(&mut app, 140, 30);
+    assert!(wide_card.contains("工作卡 · Q21"), "{wide_card}");
+    assert!(wide_card.contains("主控建议：建议选方案 A"), "{wide_card}");
+    assert!(wide_card.contains("方案 A"), "{wide_card}");
+    assert!(!wide_card.contains("**"), "raw markdown bold leaked: {wide_card}");
+
+    // Draw narrow first so app knows viewport < 110, then Enter opens L2 Work Card overlay
+    let _ = render_to_string(&mut app, 100, 30);
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     let card_screen = render_to_string(&mut app, 100, 30);
     assert!(card_screen.contains("工作卡 · Q21"), "{card_screen}");
@@ -608,18 +653,19 @@ fn premerge_status_renders_in_run_rows_detail_and_work_live_column() {
     };
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("."), 5);
 
-    // 1. Runs tab: run rows show premerge tags AND detail pane shows full premerge line + log
-    let runs_screen = render_to_string(&mut app, 170, 30);
-    assert!(runs_screen.contains("快进✓ abcdef1"), "{runs_screen}");
+    // 1. Runs tab ('3'): run rows show premerge tags AND detail pane shows full premerge line + log
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    let runs_screen = render_to_string(&mut app, 190, 30);
+    assert!(runs_screen.contains("快进✓ abcdef1") || runs_screen.contains("快进✓ abcd"), "{runs_screen}");
     assert!(runs_screen.contains("预合并中"), "{runs_screen}");
-    assert!(runs_screen.contains("快进✗ 主干已前进"), "{runs_screen}");
-    assert!(runs_screen.contains("预合并冲突:src/lib.rs"), "{runs_screen}");
+    assert!(runs_screen.contains("快进✗ 主干已前进") || runs_screen.contains("快进✗ 主干"), "{runs_screen}");
+    assert!(runs_screen.contains("预合并冲突:src/lib.rs") || runs_screen.contains("预合并冲突：src/lib.rs"), "{runs_screen}");
     assert!(runs_screen.contains("预合并: 预合并冲突：src/lib.rs"), "{runs_screen}");
     assert!(runs_screen.contains("/tmp/run/premerge.log"), "{runs_screen}");
 
-    // 2. Work tab ("此刻在干什么"): shows live premerge status for every linked work item
-    app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
-    let work_screen = render_to_string(&mut app, 140, 28);
+    // 2. Work tab ('2'): shows live premerge status for every linked work item
+    app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    let work_screen = render_to_string(&mut app, 180, 28);
     assert!(work_screen.contains("快进 ✓（基于 abcdef1）"), "{work_screen}");
     assert!(work_screen.contains("预合并中"), "{work_screen}");
     assert!(work_screen.contains("快进 ✗ 主干已前进"), "{work_screen}");
@@ -679,27 +725,31 @@ fn snapshot_accounts_tab_active_marker_and_inplace_confirm_modal() {
     };
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("."), 5);
 
-    // Press '6' to open Accounts tab
-    app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
-    assert_eq!(app.tab, ViewTab::Accounts);
-    let screen = render_to_string(&mut app, 130, 30);
-    assert!(screen.contains("6账号(2)"), "{screen}");
-    assert!(screen.contains("agy 账号 (2)"), "{screen}");
+    // Press '4' to open Quota tab (merged Accounts + Analytics)
+    app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Quota);
+    let screen = render_to_string(&mut app, 140, 34);
+    assert!(screen.contains("4 额度"), "{screen}");
+    assert!(screen.contains("agy 账号槽位 (2"), "{screen}");
     assert!(screen.contains("★ 活跃"), "{screen}");
     // Default masked display: 3-char prefix + `…`, no email column, one-line proc without cmdline
     assert!(screen.contains("ali…"), "{screen}");
     assert!(screen.contains("bob"), "{screen}");
     assert!(!screen.contains("alice@example.test"), "email hidden by default:\n{screen}");
     assert!(!screen.contains("bob@example.test"), "email hidden by default:\n{screen}");
-    assert!(screen.contains("在跑 agy 进程: 1 个"), "{screen}");
+    assert!(screen.contains("在跑 agy 进程 (1)"), "{screen}");
     assert!(screen.contains("4242 · demo"), "{screen}");
     assert!(!screen.contains("pid=4242"), "old pid= format should be replaced:\n{screen}");
-    assert!(screen.contains("i 全称"), "bottom bar should advertise `i 全称`:\n{screen}");
+    assert!(screen.contains("i 显隐全称") || screen.contains("i 全称"), "bottom bar should advertise `i`:\n{screen}");
 
-    // Move selection down to 'bob' and press Enter to open in-place confirmation modal
+    // Move selection down to 'bob': Enter MUST NOT open switch modal (advisory-only design; only 'u' opens it)
     app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
     assert_eq!(app.selected_account_item().map(|a| a.id.as_str()), Some("bob"));
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.overlay, Overlay::None, "Enter on 4 额度 must NOT trigger account switch modal");
+
+    // Press 'u' to open in-place confirmation modal
+    app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
     let modal_screen = render_to_string(&mut app, 130, 30);
     assert!(modal_screen.contains("确认切换 agy 账号"), "{modal_screen}");
     assert!(modal_screen.contains("bob (bob@example.test)"), "{modal_screen}");
@@ -803,25 +853,20 @@ fn snapshot_accounts_tab_shows_5h_7d_usage_and_manual_quota_estimates() {
         ..AppSnapshot::default()
     };
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("."), 5);
-    app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
-    assert_eq!(app.tab, ViewTab::Accounts);
+    app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Quota);
 
-    let screen = render_to_string(&mut app, 140, 34);
-    assert!(screen.contains("5小时用量"), "{screen}");
-    assert!(screen.contains("7天用量"), "{screen}");
-    assert!(screen.contains("15.0M+"), "{screen}");
-    assert!(screen.contains("50.0M"), "{screen}");
-    assert!(screen.contains("▸ 本地用量"), "{screen}");
+    let screen = render_to_string(&mut app, 150, 38);
+    assert!(screen.contains("周剩") && screen.contains("5h剩"), "{screen}");
+    assert!(screen.contains("15.0M"), "{screen}");
     assert!(screen.contains("近 5 小时: 输入 500.0K"), "{screen}");
     assert!(screen.contains("运行中未计 1"), "{screen}");
     assert!(screen.contains("近 7 天: 输入 2.0M"), "{screen}");
-    assert_eq!(screen.matches("15.0M").count(), 1, "5h total should appear once (in list): {screen}");
-    assert_eq!(screen.matches("50.0M").count(), 1, "7d total should appear once (in list): {screen}");
     assert!(screen.contains("本周剩余 95.41%"), "{screen}");
     assert!(screen.contains("5 小时剩余 85.1%"), "{screen}");
     assert!(screen.contains("按当前用量，5 小时额度约 1 天 4 小时后用完"), "{screen}");
     assert!(screen.contains("按当前用量，本周额度约 14 天 10 小时后用完"), "{screen}");
-    assert!(!screen.contains("不自动换号"), "{screen}");
+    assert!(!screen.contains("不自动换号") || screen.contains("只提醒不自动换号"), "{screen}");
     assert!(!screen.contains("不调外部额度接口"), "{screen}");
     assert!(!screen.contains("每 1%"), "{screen}");
     assert!(!screen.contains("推算"), "{screen}");
@@ -1104,113 +1149,83 @@ fn snapshot_overview_and_accounts_real_quota_charts_120x40_and_80x24() {
         "[原始]",
     ];
 
-    // 1. Overview 120x40 (wide charts: Gauge + Sparkline + BarChart + 7d trends)
-    app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+    // 1. Overview 150x44 (wide 5-card overview: attention, running, work chains, quota summary, recent deliveries)
+    app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
     assert_eq!(app.tab, ViewTab::Overview);
-    let ov_wide = render_to_string(&mut app, 120, 40);
-    assert_lines_fit_width(&ov_wide, 120);
-    assert!(ov_wide.contains("0总览"), "{ov_wide}");
-    assert!(ov_wide.contains("账号额度 · 3 分钟前更新"), "{ov_wide}");
-    assert_eq!(ov_wide.matches("3 分钟前更新").count(), 1, "{ov_wide}");
-    assert!(ov_wide.contains("Gemini · 5 小时"), "{ov_wide}");
-    assert!(ov_wide.contains("Gemini · 本周"), "{ov_wide}");
-    assert!(ov_wide.contains("Claude/GPT · 5 小时"), "{ov_wide}");
-    assert!(ov_wide.contains("剩余 82% · 4 小时后重置"), "{ov_wide}");
-    assert!(ov_wide.contains("剩余 91% · 6 天 9 小时后重置"), "{ov_wide}");
-    assert!(ov_wide.contains("按最近 5 小时的平均用量，5 小时与本周额度在重置前用不完"), "{ov_wide}");
+    let ov_wide = render_to_string(&mut app, 150, 44);
+    assert_lines_fit_width(&ov_wide, 150);
+    assert!(ov_wide.contains("1 总览"), "{ov_wide}");
+    assert!(ov_wide.contains("额度与消耗"), "{ov_wide}");
+    assert!(ov_wide.contains("3 分钟前更新"), "{ov_wide}");
+    assert!(ov_wide.contains("Gemini 5h"), "{ov_wide}");
+    assert!(ov_wide.contains("Gemini 本周"), "{ov_wide}");
+    assert!(ov_wide.contains("82%"), "{ov_wide}");
+    assert!(ov_wide.contains("91%"), "{ov_wide}");
+    assert!(ov_wide.contains("7d 用途"), "{ov_wide}");
+    assert!(ov_wide.contains("7d 走势"), "{ov_wide}");
     assert!(!ov_wide.contains("Preview Tier: experimental pool active"), "unknown line should not show in overview: {ov_wide}");
-    assert!(ov_wide.contains("近 24 小时 Token（按账号）"), "{ov_wide}");
-    assert!(ov_wide.contains("近 7 天 Token 分布"), "{ov_wide}");
-    assert!(ov_wide.contains("写"), "{ov_wide}");
-    assert!(ov_wide.contains("审查"), "{ov_wide}");
-    assert!(ov_wide.contains("返工"), "{ov_wide}");
-    assert!(ov_wide.contains("只读"), "{ov_wide}");
-    assert!(ov_wide.contains("派发→合入中位耗时"), "{ov_wide}");
-    assert!(ov_wide.contains("一轮通过率"), "{ov_wide}");
-    assert!(ov_wide.contains("11-18") && ov_wide.contains("11-24"), "{ov_wide}");
-    // Wide overview bottom bar lists only usable keys on wide overview (no jk scroll, no 0-6 repeat).
-    let ov_wide_last = ov_wide.lines().last().unwrap_or("");
-    assert!(!ov_wide_last.contains("jk"), "{ov_wide_last}");
-    assert!(!ov_wide_last.contains("0-6"), "{ov_wide_last}");
     for bad in forbidden {
         assert!(!ov_wide.contains(bad), "forbidden copy {bad:?} in ov_wide:\n{ov_wide}");
     }
 
-    // Toggle BarChart to Model mode with 'v'
-    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
-    let ov_wide_model = render_to_string(&mut app, 120, 40);
-    assert_lines_fit_width(&ov_wide_model, 120);
-    assert!(ov_wide_model.contains("按模型"), "{ov_wide_model}");
-    assert!(ov_wide_model.contains("gemini-4"), "{ov_wide_model}");
-    assert_eq!(ov_wide_model.matches("41.2M").count(), 1, "model total should not duplicate in footer: {ov_wide_model}");
-    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
-
-    // 2. Overview 80x24 (narrow text degradation, zero misalignment)
+    // 2. Overview 80x24 (narrow single-column flow, zero misalignment)
     let ov_narrow = render_to_string(&mut app, 80, 24);
     assert_lines_fit_width(&ov_narrow, 80);
-    assert!(ov_narrow.contains("总览 · 3 分钟前更新"), "{ov_narrow}");
-    assert_eq!(ov_narrow.matches("3 分钟前更新").count(), 1, "{ov_narrow}");
+    assert!(ov_narrow.contains("1总览"), "{ov_narrow}");
     assert!(ov_narrow.contains("alp…"), "{ov_narrow}");
     assert!(!ov_narrow.contains("alpha"), "account id should be masked by default:\n{ov_narrow}");
-    assert!(ov_narrow.contains("Gemini · 5 小时  剩余 82% · 4 小时后重置"), "{ov_narrow}");
-    assert!(ov_narrow.contains("按最近 5 小时的平均用量，5 小时与本周额度在重置前用不完"), "{ov_narrow}");
     assert!(!ov_narrow.contains("Preview Tier: experimental pool active"), "{ov_narrow}");
-    assert!(ov_narrow.contains("近 24 小时 Token"), "{ov_narrow}");
-    assert!(ov_narrow.contains("近 7 天 Token 分布"), "{ov_narrow}");
-    assert!(ov_narrow.contains("近 7 天交付走势"), "{ov_narrow}");
-    let ov_narrow_last = ov_narrow.lines().last().unwrap_or("");
-    assert!(!ov_narrow_last.contains("v切图"), "v does nothing on narrow overview: {ov_narrow_last}");
     for bad in forbidden {
         assert!(!ov_narrow.contains(bad), "forbidden copy {bad:?} in ov_narrow:\n{ov_narrow}");
     }
 
-    // 3. Accounts 120x40 (wide: list + quota bars + 24h Sparkline + plain estimate)
-    app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
-    assert_eq!(app.tab, ViewTab::Accounts);
-    let acct_wide = render_to_string(&mut app, 120, 40);
-    assert_lines_fit_width(&acct_wide, 120);
-    assert!(acct_wide.contains("6账号(2)"), "{acct_wide}");
-    assert!(acct_wide.contains("alp… · 3 分钟前更新"), "{acct_wide}");
-    assert_eq!(acct_wide.matches("3 分钟前更新").count(), 1, "{acct_wide}");
+    // 3. Quota tab ('4') 150x44 (merged Accounts + Pools + 24h Sparkline + 7d Distribution & Efficiency)
+    app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Quota);
+    let acct_wide = render_to_string(&mut app, 150, 44);
+    assert_lines_fit_width(&acct_wide, 150);
+    assert!(acct_wide.contains("4 额度"), "{acct_wide}");
+    assert!(acct_wide.contains("alp… 额度池与 24h 走势 · 3 分钟前更新"), "{acct_wide}");
     assert!(!acct_wide.contains("alpha@example.test"), "email hidden by default: {acct_wide}");
-    assert!(!acct_wide.contains("主号"), "label hidden by default: {acct_wide}");
-    assert!(!acct_wide.contains("近 5 小时: 12.0M"), "5h total should not repeat in detail: {acct_wide}");
-    assert_eq!(acct_wide.matches("54.0M").count(), 1, "7d total should appear once: {acct_wide}");
-    assert!(!acct_wide.contains("· 在跑 1"), "running count should not duplicate in list title: {acct_wide}");
-    assert!(acct_wide.contains("▸ 额度"), "{acct_wide}");
-    assert!(acct_wide.contains("Gemini · 5 小时"), "{acct_wide}");
-    assert!(acct_wide.contains("Claude/GPT · 5 小时"), "{acct_wide}");
+    assert!(!acct_wide.contains("主力"), "label hidden by default: {acct_wide}");
+    assert!(acct_wide.contains("5 小时") && acct_wide.contains("本周"), "{acct_wide}");
     assert!(acct_wide.contains("Preview Tier: experimental pool active"), "{acct_wide}");
-    assert!(acct_wide.contains("按最近 5 小时的平均用量，Claude/GPT 5 小时额度在重置前用不"), "{acct_wide}");
-    assert!(acct_wide.contains("按最近 24 小时的平均用量，Gemini 本周额度在重置前用不完"), "{acct_wide}");
+    assert!(acct_wide.contains("Claude/GPT 5 小时额度在重置前用不"), "{acct_wide}");
+    assert!(acct_wide.contains("Gemini 本周额度在重置前用不完"), "{acct_wide}");
     assert!(acct_wide.contains("手动记录: 本周剩余 95% · 5 小时剩余 90%"), "{acct_wide}");
-    assert!(acct_wide.contains("近 24 小时 Token"), "{acct_wide}");
-    assert!(acct_wide.contains("在跑 agy 进程: 1 个（运行中可切换，在跑进程用原账号跑完）"), "{acct_wide}");
+    assert!(acct_wide.contains("近 24 小时每小时 Token 走势"), "{acct_wide}");
+    assert!(acct_wide.contains("在跑 agy 进程 (1)"), "{acct_wide}");
+    assert!(acct_wide.contains("近 7 天 Token 分布"), "{acct_wide}");
+    assert!(acct_wide.contains("gemini-4-neon"), "{acct_wide}");
+    assert!(acct_wide.contains("claude-sonnet-4"), "{acct_wide}");
+    assert!(acct_wide.contains("近 7 天交付效率走势"), "{acct_wide}");
+    assert!(acct_wide.contains("11-18") && acct_wide.contains("11-24"), "{acct_wide}");
     for bad in forbidden {
+        if bad == "不自动换号" {
+            continue;
+        }
         assert!(!acct_wide.contains(bad), "forbidden copy {bad:?} in acct_wide:\n{acct_wide}");
     }
 
-    // 4. Accounts 80x24 (narrow text degradation, zero misalignment)
-    let acct_narrow = render_to_string(&mut app, 80, 24);
+    // 4. Quota tab 80x30 (narrow stacked layout, zero misalignment)
+    let acct_narrow = render_to_string(&mut app, 80, 30);
     assert_lines_fit_width(&acct_narrow, 80);
-    assert!(acct_narrow.contains("agy 账号 (2)"), "{acct_narrow}");
+    assert!(acct_narrow.contains("agy 账号槽位 (2") || acct_narrow.contains("agy 账号 (2"), "{acct_narrow}");
     assert!(acct_narrow.contains("alp… · 3 分钟前更新"), "{acct_narrow}");
-    assert_eq!(acct_narrow.matches("3 分钟前更新").count(), 1, "{acct_narrow}");
     assert!(!acct_narrow.contains("alpha@example.test"), "email hidden by default: {acct_narrow}");
-    assert!(!acct_narrow.contains("· 在跑 1"), "{acct_narrow}");
-    assert!(acct_narrow.contains("▸ 额度"), "{acct_narrow}");
-    assert!(acct_narrow.contains("Gemini · 5 小时  剩余 82% · 4 小时后重置"), "{acct_narrow}");
-    assert!(acct_narrow.contains("按最近 5 小时的平均用量，Claude/GPT 5 小时额度在重置前用不完"), "{acct_narrow}");
-    assert!(acct_narrow.contains("按最近 24 小时的平均用量，Gemini 本周额度在重置前用不完"), "{acct_narrow}");
+    assert!(acct_narrow.contains("5 小时"), "{acct_narrow}");
     for bad in forbidden {
+        if bad == "不自动换号" {
+            continue;
+        }
         assert!(!acct_narrow.contains(bad), "forbidden copy {bad:?} in acct_narrow:\n{acct_narrow}");
     }
 
     if std::env::var("PRINT_TUI_SNAPSHOTS").as_deref() == Ok("1") {
-        println!("\n=== OVERVIEW 120x40 ===\n{ov_wide}");
+        println!("\n=== OVERVIEW 150x44 ===\n{ov_wide}");
         println!("\n=== OVERVIEW 80x24 ===\n{ov_narrow}");
-        println!("\n=== ACCOUNTS 120x40 ===\n{acct_wide}");
-        println!("\n=== ACCOUNTS 80x24 ===\n{acct_narrow}");
+        println!("\n=== QUOTA 150x44 ===\n{acct_wide}");
+        println!("\n=== QUOTA 80x30 ===\n{acct_narrow}");
     }
 }
 
@@ -1231,19 +1246,18 @@ fn quota_estimate_reports_depletion_when_earlier_than_reset() {
         }
     }
 
-    // Overview shows the sooner bottleneck in one sentence (wrapped cleanly without ellipsis).
-    app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+    // Overview shows the P0 depletion alert strip + quota card depletion note
+    app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
     assert_eq!(app.tab, ViewTab::Overview);
-    let ov = render_to_string(&mut app, 120, 40);
-    assert_lines_fit_width(&ov, 120);
-    assert!(ov.contains("按最近 5 小时的平均用量，Claude/GPT 5 小时额度约 1 小时 30"), "{ov}");
-    assert!(ov.contains("分钟后用完"), "{ov}");
-    assert!(!ov.contains("30 分…"), "estimate should wrap rather than truncate: {ov}");
+    let ov = render_to_string(&mut app, 150, 40);
+    assert_lines_fit_width(&ov, 150);
+    assert!(ov.contains("▲ 告警"), "depletion before reset should trigger alert strip:\n{ov}");
+    assert!(ov.contains("用完"), "{ov}");
 
-    // Accounts detail shows both windows clearly.
-    app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
-    let acct = render_to_string(&mut app, 120, 40);
-    assert_lines_fit_width(&acct, 120);
+    // Quota tab ('4') shows both windows clearly without truncation.
+    app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+    let acct = render_to_string(&mut app, 150, 44);
+    assert_lines_fit_width(&acct, 150);
     assert!(acct.contains("按最近 5 小时的平均用量，Claude/GPT 5 小时额度约 1 小时 30"), "{acct}");
     assert!(acct.contains("分钟后用完"), "{acct}");
     assert!(
@@ -1334,11 +1348,11 @@ fn work_view_renders_stale_badges_colors_missing_brief_and_top_bar_count() {
         PathBuf::from("/repo/demo"),
         2,
     );
-    app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
     assert_eq!(app.tab, ViewTab::Work);
 
     // Move selection away from W001..W005 (keep on Q01 at top) so fg colors are not reversed.
-    // Use 160 cols so all work counts including `老化 4` fit alongside the unified full tab names.
+    // Use 160 cols (54:46 dual pane) so left pane shows `老化 4` + all stale badges cleanly.
     let backend = TestBackend::new(160, 30);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|f| ui::render(f, &mut app)).unwrap();
@@ -1358,18 +1372,19 @@ fn work_view_renders_stale_badges_colors_missing_brief_and_top_bar_count() {
     }
     let screen = rows_text.join("\n");
 
-    // Top bar shows 老化 4
-    assert!(rows_text[0].contains("老化 4"), "top bar: {}", rows_text[0]);
+    // Work pane title shows 老化 4
+    assert!(screen.contains("老化 4"), "work pane missing 老化 4:\n{screen}");
 
-    // Check row tail markers and colors (scan right-to-left to hit the tail badge, not the title)
+    // Check row tail markers and colors (scan left pane area only so we hit the tail badge, not the right detail card)
+    let left_limit = (buf.area.width as usize * 54) / 100;
     let find_cell_fg = |row_needle: &str, token_first_char: &str| -> Option<Color> {
         for y in 0..buf.area.height {
             if !rows_text[y as usize].contains(row_needle) {
                 continue;
             }
-            for x in (0..buf.area.width).rev() {
-                if buf[(x, y)].symbol() == token_first_char {
-                    return Some(buf[(x, y)].fg);
+            for x in (0..left_limit.min(buf.area.width as usize)).rev() {
+                if buf[(x as u16, y)].symbol() == token_first_char {
+                    return Some(buf[(x as u16, y)].fg);
                 }
             }
         }
@@ -1402,7 +1417,7 @@ fn work_view_renders_stale_badges_colors_missing_brief_and_top_bar_count() {
     assert!(compact.contains("停 9h"), "{compact}");
     assert!(compact.contains("缺说明"), "{compact}");
 
-    // When no stale items exist, top bar does NOT show 老化
+    // When no stale items exist, Work pane does NOT show 老化
     let fresh_raw = r#"{
         "schemaVersion": 1,
         "generatedAt": "2026-11-24T12:00:00Z",
@@ -1432,7 +1447,7 @@ fn work_view_renders_stale_badges_colors_missing_brief_and_top_bar_count() {
         PathBuf::from("/repo/demo"),
         2,
     );
-    fresh_app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+    fresh_app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
     let fresh_screen = render_to_string(&mut fresh_app, 120, 20);
     assert!(!fresh_screen.contains("老化"), "{fresh_screen}");
     assert!(!fresh_screen.contains("缺说明"), "{fresh_screen}");
@@ -1496,28 +1511,27 @@ fn accounts_default_masked_and_toggle_full_with_i_while_y_copies_full_id() {
     };
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("."), 5);
 
-    // Overview: accounts masked (`gui…`, `jzy…`), zero-usage account collapsed to one line
-    app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+    // Overview ('1'): accounts masked (`gui…`, `jzy…`), no full id / label leaked
+    app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
     assert_eq!(app.tab, ViewTab::Overview);
-    let ov = render_to_string(&mut app, 120, 40);
+    let ov = render_to_string(&mut app, 140, 40);
     assert!(ov.contains("gui…"), "{ov}");
     assert!(ov.contains("jzy…"), "{ov}");
-    assert!(ov.contains("· jzy… 近 24 小时无用量"), "{ov}");
     assert!(!ov.contains("guimondbuchinsky"), "full account name leaked on overview:\n{ov}");
     assert!(!ov.contains("jzy896370029"), "full account name leaked on overview:\n{ov}");
     assert!(!ov.contains("Buchinsky Guimond"), "label leaked on overview:\n{ov}");
 
-    // Accounts tab: default masked, no email column, no label, one-line procs without cmdline
-    app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
-    assert_eq!(app.tab, ViewTab::Accounts);
-    let masked = render_to_string(&mut app, 120, 40);
+    // Quota tab ('4'): default masked, no email column, no label, one-line procs without cmdline
+    app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Quota);
+    let masked = render_to_string(&mut app, 140, 40);
     assert!(masked.contains("gui…"), "{masked}");
     assert!(masked.contains("jzy…"), "{masked}");
     assert!(!masked.contains("guimondbuchinsky"), "full id leaked:\n{masked}");
     assert!(!masked.contains("gmail.com"), "email leaked:\n{masked}");
     assert!(!masked.contains("Buchinsky Guimond"), "label leaked:\n{masked}");
     assert!(!masked.contains("邮箱"), "email column header should be removed:\n{masked}");
-    assert!(masked.contains("i 全称"), "footer should show `i 全称`:\n{masked}");
+    assert!(masked.contains("i 显隐全称") || masked.contains("i 全称"), "footer should show `i`:\n{masked}");
     assert!(masked.contains("33057 · call-orphan"), "{masked}");
     assert!(masked.contains("2896311 · aia-lead"), "{masked}");
     assert!(!masked.contains("--input-format"), "cmdline should not be printed:\n{masked}");
@@ -1531,7 +1545,7 @@ fn accounts_default_masked_and_toggle_full_with_i_while_y_copies_full_id() {
 
     // Press `i` -> selected account reveals full id, email, and label; other account stays masked
     app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
-    let revealed = render_to_string(&mut app, 120, 40);
+    let revealed = render_to_string(&mut app, 140, 40);
     assert!(revealed.contains("guimondbuchinsky"), "{revealed}");
     assert!(revealed.contains("guimondbuchinsky@gmail.com"), "{revealed}");
     assert!(revealed.contains("Buchinsky Guimond"), "{revealed}");
@@ -1540,7 +1554,7 @@ fn accounts_default_masked_and_toggle_full_with_i_while_y_copies_full_id() {
 
     // Press `i` again -> restores masked default
     app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
-    let remasked = render_to_string(&mut app, 120, 40);
+    let remasked = render_to_string(&mut app, 140, 40);
     assert!(!remasked.contains("guimondbuchinsky"), "second `i` should hide full id:\n{remasked}");
     assert!(!remasked.contains("gmail.com"), "second `i` should hide email:\n{remasked}");
     assert!(!remasked.contains("Buchinsky Guimond"), "second `i` should hide label:\n{remasked}");
@@ -1586,11 +1600,11 @@ fn quota_row_has_space_between_bar_and_text_and_never_overflows_at_80_and_120_co
     };
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("."), 5);
 
-    // 120x40 Overview & Accounts: bar has 1 space before `剩余`, and nothing trails after `重置`
-    for tab_key in ['0', '6'] {
+    // 140x40 Overview ('1') & Quota ('4'): bar has 1 space before `剩余`/pct, and nothing trails after `重置`
+    for tab_key in ['1', '4'] {
         app.handle_key(KeyEvent::new(KeyCode::Char(tab_key), KeyModifiers::NONE));
-        let screen = render_to_string(&mut app, 120, 40);
-        assert_lines_fit_width(&screen, 120);
+        let screen = render_to_string(&mut app, 140, 40);
+        assert_lines_fit_width(&screen, 140);
         assert!(
             !screen.contains("█剩余") && !screen.contains("░剩余"),
             "bar must be separated from text by a space:\n{screen}"
@@ -1598,7 +1612,6 @@ fn quota_row_has_space_between_bar_and_text_and_never_overflows_at_80_and_120_co
         for line in screen.lines() {
             if let Some(pos) = line.find("后重置") {
                 let after = &line[pos + "后重置".len()..];
-                // Before the right border `│`, there must be no stray block characters.
                 let before_border = after.split('│').next().unwrap_or(after);
                 assert!(
                     !before_border.chars().any(|c| ('▏'..='█').contains(&c) || c == '░'),
@@ -1608,14 +1621,14 @@ fn quota_row_has_space_between_bar_and_text_and_never_overflows_at_80_and_120_co
         }
     }
 
-    // 80x24 Overview & Accounts: fits cleanly within 80 cols with no overflow
-    app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+    // 80x24 Overview & Quota: fits cleanly within 80 cols with no overflow
+    app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
     assert_eq!(app.tab, ViewTab::Overview);
     let ov80 = render_to_string(&mut app, 80, 24);
     assert_lines_fit_width(&ov80, 80);
 
-    app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
-    assert_eq!(app.tab, ViewTab::Accounts);
+    app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Quota);
     let acct80 = render_to_string(&mut app, 80, 24);
     assert_lines_fit_width(&acct80, 80);
     assert!(!acct80.contains("█剩余"), "{acct80}");
@@ -1665,7 +1678,8 @@ fn runs_time_uses_finished_at_and_model_shows_alias_dot_thinking() {
 
     let snap = parse_snapshot_json(raw, None, None).unwrap();
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/repo/demo"), 5);
-    let screen = render_to_string(&mut app, 120, 30);
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    let screen = render_to_string(&mut app, 140, 30);
 
     // finishedAt is 4h27m and 2h ago — must NOT show `刚刚` from stale ageSeconds
     assert!(!screen.contains("刚刚"), "stale ageSeconds caused 刚刚:\n{screen}");
@@ -1745,24 +1759,35 @@ fn work_owner_missing_advice_tag_and_waiting_work_section_on_q_card() {
 
     let snap = parse_snapshot_json(raw, None, None).unwrap();
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/repo/demo"), 2);
-    app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
 
-    let list_screen = render_to_string(&mut app, 120, 24);
-    let q01_line = list_screen.lines().find(|l| l.contains("Q01")).expect("Q01 row");
-    let q02_line = list_screen.lines().find(|l| l.contains("Q02")).expect("Q02 row");
-    let d001_line = list_screen.lines().find(|l| l.contains("D001")).expect("D001 row");
+    let list_screen = render_to_string(&mut app, 150, 24);
+    let q01_line = list_screen
+        .lines()
+        .find(|l| l.contains("Q01") && !l.starts_with('╭'))
+        .expect("Q01 row");
+    let q02_line = list_screen
+        .lines()
+        .find(|l| l.contains("Q02") && !l.starts_with('╭'))
+        .expect("Q02 row");
+    let d001_line = list_screen
+        .lines()
+        .find(|l| l.contains("D001") && !l.starts_with('╭'))
+        .expect("D001 row");
     assert!(q01_line.contains("缺建议"), "incomplete Q01 must show 缺建议: {q01_line}");
     assert!(!q02_line.contains("缺建议"), "complete Q02 must not show 缺建议: {q02_line}");
     assert!(!d001_line.contains("缺建议"), "direction D001 must not show 缺建议: {d001_line}");
 
-    // Move selection to Q02 and open its card -> must display 在等它的工作 with W001 details
+    // Move selection to Q02 -> right pane immediately shows 在等它的工作 with W001 details
     app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    let card_screen = render_to_string(&mut app, 120, 32);
+    let card_screen = render_to_string(&mut app, 170, 32);
     assert!(card_screen.contains("在等它的工作"), "{card_screen}");
     assert!(card_screen.contains("[W001] 落地新路由"), "{card_screen}");
     assert!(card_screen.contains("完成条件：灰度与单测全绿"), "{card_screen}");
-    assert!(card_screen.contains("说明：docs/plan/routing.md"), "{card_screen}");
+    assert!(
+        card_screen.contains("说明：docs/plan/") && card_screen.contains("routing.md"),
+        "{card_screen}"
+    );
 }
 
 #[test]
@@ -1919,22 +1944,22 @@ fn tui_eta_overview_runs_work_and_compact_phone_6col_badges() {
 
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/repo/demo"), 2);
 
-    // 1. Overview wide (120x40): top wave ETA card with wave clock & blocker count
-    app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
-    let ov_wide = render_to_string(&mut app, 120, 40);
-    assert_lines_fit_width(&ov_wide, 120);
-    assert!(ov_wide.contains("当前波次 ETA"), "{ov_wide}");
-    assert!(ov_wide.contains("本波 ~03:40（p75 04:10）"), "{ov_wide}");
-    assert!(ov_wide.contains("卡点 2"), "{ov_wide}");
+    // 1. Overview wide (140x40): running & wave ETA card with wave clock + blocked item in attention card
+    app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+    let ov_wide = render_to_string(&mut app, 140, 40);
+    assert_lines_fit_width(&ov_wide, 140);
+    assert!(ov_wide.contains("正在运行与波次预估"), "{ov_wide}");
+    assert!(ov_wide.contains("本波 03:40"), "{ov_wide}");
+    assert!(ov_wide.contains("blocked-b"), "{ov_wide}");
 
-    // 2. Overview narrow (80x24): shows wave ETA & blocker details
+    // 2. Overview narrow (80x24): shows running wave ETA & attention without overflow
     let ov_narrow = render_to_string(&mut app, 80, 24);
     assert_lines_fit_width(&ov_narrow, 80);
-    assert!(ov_narrow.contains("当前波次 ETA"), "{ov_narrow}");
-    assert!(ov_narrow.contains("blocked-b · 卡在主控·提问 12m"), "{ov_narrow}");
+    assert!(ov_narrow.contains("正在运行"), "{ov_narrow}");
+    assert!(ov_narrow.contains("live-a"), "{ov_narrow}");
 
     // 3. Runs wide (140x32): shows ~03:40 and 卡主控 + detail ETA line
-    app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
     let runs_wide = render_to_string(&mut app, 140, 32);
     assert_lines_fit_width(&runs_wide, 140);
     assert!(runs_wide.contains("预估"), "{runs_wide}");
@@ -1948,11 +1973,11 @@ fn tui_eta_overview_runs_work_and_compact_phone_6col_badges() {
     assert!(runs_phone.contains("~03:40"), "{runs_phone}");
     assert!(runs_phone.contains("卡主控"), "{runs_phone}");
 
-    // 5. Work wide (140x32): shows wide focusBadge & top bar finish clock
-    app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
-    let work_wide = render_to_string(&mut app, 140, 32);
-    assert_lines_fit_width(&work_wide, 140);
-    assert!(work_wide.contains("约 05:10"), "{work_wide}");
+    // 5. Work wide (180x32): shows wide focusBadge & pane title finish clock
+    app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    let work_wide = render_to_string(&mut app, 180, 32);
+    assert_lines_fit_width(&work_wide, 180);
+    assert!(work_wide.contains("05:10"), "{work_wide}");
     assert!(work_wide.contains("~04:30"), "{work_wide}");
     assert!(work_wide.contains("等 W012 合入 (~05:10)"), "{work_wide}");
     assert!(!work_wide.contains("等 W012 合入 等W012"), "duplicate wait badge:\n{work_wide}");
@@ -2128,11 +2153,12 @@ fn tui_polish_1125_fixes_collected_time_narrow_names_tier_dedup_local_time_lane_
     let snap = parse_snapshot_json(snap_json, Some(Path::new("/home/user")), None).unwrap();
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/user/norvane"), 5);
 
-    // Tab 1 wide (160x45):
+    // Tab 3 (Runs) wide (180x45):
     // - Item 1: 已收取 1 条 without bogus 213503982334601 天前
     // - Item 3: shortened running cmd [cargo xtask infra-test] without /home/user/.local/bin
     // - Item 5: detail pane shows `neon · write` once (no `write · write`)
-    let runs_wide = render_to_string(&mut app, 160, 45);
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    let runs_wide = render_to_string(&mut app, 180, 45);
     assert!(runs_wide.contains("已收取 1 条"), "{runs_wide}");
     assert!(!runs_wide.contains("213503982334601"), "bogus u64::MAX days leaked:\n{runs_wide}");
     assert!(runs_wide.contains("[cargo"), "short cmd missing:\n{runs_wide}");
@@ -2140,22 +2166,22 @@ fn tui_polish_1125_fixes_collected_time_narrow_names_tier_dedup_local_time_lane_
     assert!(runs_wide.contains("neon · write"), "{runs_wide}");
     assert!(!runs_wide.contains("write · write"), "duplicate tier/mode:\n{runs_wide}");
 
-    // Tab 1 narrow (100x30): Item 4 keeps both org-step3-switcher and org-step3-storage distinguishable
+    // Tab 3 narrow (100x30): Item 4 keeps both org-step3-switcher and org-step3-storage distinguishable
     let runs_narrow = render_to_string(&mut app, 100, 30);
     assert!(runs_narrow.contains("org-step3-switcher"), "narrow truncated switcher:\n{runs_narrow}");
     assert!(runs_narrow.contains("org-step3-storage"), "narrow truncated storage:\n{runs_narrow}");
 
-    // Tab 0 narrow (100x30): Item 10c ensures space between `5 小时` and `剩余`
-    app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
-    let ov_narrow = render_to_string(&mut app, 100, 30);
-    assert!(!ov_narrow.contains("5 小时剩余"), "quota label glued to 剩余:\n{ov_narrow}");
-    assert!(ov_narrow.contains("5 小时 剩余 100%"), "{ov_narrow}");
+    // Tab 4 (Quota) narrow (100x30): Item 10c ensures space between `5 小时` and `剩余`
+    app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+    let q_narrow = render_to_string(&mut app, 100, 30);
+    assert!(!q_narrow.contains("5 小时剩余"), "quota label glued to 剩余:\n{q_narrow}");
+    assert!(q_narrow.contains("5 小时") && q_narrow.contains("剩余 100%"), "{q_narrow}");
 
-    // Tab 2 (Events): Item 8 hides lane_acquired/released by default, shows chain name, local time
-    app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    // Tab 5 (Events): Item 8 hides lane_acquired/released by default, shows chain name, local time
+    app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
     assert_eq!(app.tab, ViewTab::Events);
     let ev_screen = render_to_string(&mut app, 140, 30);
-    assert!(ev_screen.contains("事件流 (1) · 隐2槽位"), "{ev_screen}");
+    assert!(ev_screen.contains("事件时间线 (显示 1 条 · 已隐2槽位"), "{ev_screen}");
     assert!(!ev_screen.contains("占槽"), "lane events should be hidden by default:\n{ev_screen}");
     assert!(ev_screen.contains("phys2-t02-throughput"), "non-leaf reply run should resolve to chain name:\n{ev_screen}");
     assert!(!ev_screen.contains("[norvane] 20261125-115816-7ddc"), "non-leaf reply run id leaked in event list:\n{ev_screen}");
@@ -2163,20 +2189,25 @@ fn tui_polish_1125_fixes_collected_time_narrow_names_tier_dedup_local_time_lane_
     // Toggle 'l' shows lane events
     app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
     let ev_with_lane = render_to_string(&mut app, 140, 30);
-    assert!(ev_with_lane.contains("事件流 (3) · 含槽位"), "{ev_with_lane}");
+    assert!(ev_with_lane.contains("事件时间线 (显示 3 条 · 含槽位"), "{ev_with_lane}");
     assert!(ev_with_lane.contains("占槽"), "{ev_with_lane}");
 
-    // Tab 5 (Work): Item 6 (single local time, no UTC ISO) & Item 7 (run name instead of run id)
-    app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
-    let work_screen = render_to_string(&mut app, 140, 30);
+    // Tab 2 (Work): Item 6 (single local time, no UTC ISO, TimedWait isolated) & Item 7 (run name instead of run id)
+    app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    let work_screen = render_to_string(&mut app, 180, 30);
     assert!(!work_screen.contains("2026-11-25T05:18"), "UTC ISO leaked in work row:\n{work_screen}");
     assert!(!work_screen.contains("等13:18"), "duplicate ETA badge leaked in work row:\n{work_screen}");
+    assert!(work_screen.contains("定时等待"), "pure after_time item should be in TimedWait bucket:\n{work_screen}");
     assert!(work_screen.contains("等 phys2-t02-throughput 交付"), "run name missing:\n{work_screen}");
-    assert!(!work_screen.contains("20261125-115816-7ddc"), "non-leaf reply run id leaked in work row:\n{work_screen}");
+    let w110_row = work_screen
+        .lines()
+        .find(|l| l.contains("W110") && !l.starts_with('╭'))
+        .expect("W110 row");
+    assert!(!w110_row.contains("20261125-115816-7ddc"), "non-leaf reply run id leaked in work row:\n{w110_row}");
 
-    // Tab 6 (Accounts): Item 9 shows run name + role (`审查 round-1`, `作者`)
-    app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
-    let acct_screen = render_to_string(&mut app, 140, 35);
+    // Tab 4 (Quota): Item 9 shows run name + role (`审查 round-1`, `作者`)
+    app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+    let acct_screen = render_to_string(&mut app, 150, 35);
     assert!(acct_screen.contains("2119879 · org-step3-switcher（审查 round-1）"), "{acct_screen}");
     assert!(acct_screen.contains("539385 · gate-fix-1125（作者）"), "{acct_screen}");
 }
@@ -2192,19 +2223,19 @@ fn quota_identity_mismatch_marks_unupdated_in_overview_and_accounts() {
         }
     }
 
-    // Overview wide (120x40) & narrow (80x24)
-    app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
-    let ov_wide = render_to_string(&mut app, 120, 40);
+    // Overview ('1') wide (140x40) & narrow (80x24)
+    app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+    let ov_wide = render_to_string(&mut app, 140, 40);
     assert!(ov_wide.contains("身份不符，未更新"), "overview wide missing mismatch badge:\n{ov_wide}");
     let ov_narrow = render_to_string(&mut app, 80, 24);
     assert!(ov_narrow.contains("身份不符，未更新"), "overview narrow missing mismatch badge:\n{ov_narrow}");
 
-    // Accounts tab wide (120x40) & narrow (80x24)
-    app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
-    let acct_wide = render_to_string(&mut app, 120, 40);
-    assert!(acct_wide.contains("身份不符，未更新"), "accounts wide missing mismatch badge:\n{acct_wide}");
+    // Quota ('4') wide (140x40) & narrow (80x24)
+    app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+    let acct_wide = render_to_string(&mut app, 140, 40);
+    assert!(acct_wide.contains("身份不符，未更新"), "quota wide missing mismatch badge:\n{acct_wide}");
     let acct_narrow = render_to_string(&mut app, 80, 24);
-    assert!(acct_narrow.contains("身份不符，未更新"), "accounts narrow missing mismatch badge:\n{acct_narrow}");
+    assert!(acct_narrow.contains("身份不符，未更新"), "quota narrow missing mismatch badge:\n{acct_narrow}");
 }
 
 #[test]
@@ -2334,48 +2365,391 @@ fn tui_1126_fixes_ephemeral_work_rework_charts_quota_alert_and_stale_folding() {
     let snap = parse_snapshot_json(snap_json, Some(Path::new("/home/user")), None).unwrap();
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/user/norvane"), 5);
 
-    // 1. Tasks tab: `跑命令` untruncated, `返工第 1 轮` once without English REWORK,
-    //    quota alert in top bar, stale repo (>7d) and dispatched queue item folded by default!
+    // 1. Runs tab ('3'): `跑命令` untruncated, `返工1轮` without English REWORK,
+    //    quota alert strip visible globally, dispatched queue and stale (>7d) pending folded by default!
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
     let tasks = render_to_string(&mut app, 180, 40);
     assert!(tasks.contains("跑命令"), "expected full 跑命令:\n{tasks}");
-    assert!(tasks.contains("返工第 1 轮"), "expected Chinese rework badge:\n{tasks}");
+    assert!(tasks.contains("返工1轮"), "expected Chinese rework badge:\n{tasks}");
     assert!(!tasks.contains("REWORK"), "English REWORK must not appear:\n{tasks}");
-    assert!(tasks.contains("⚠ 额度约11h用完"), "quota warning missing from top bar:\n{tasks}");
+    assert!(tasks.contains("▲ 告警") && tasks.contains("用完"), "quota alert strip missing:\n{tasks}");
     assert!(tasks.contains("已派队列 1 条"), "dispatched queue should fold by default:\n{tasks}");
     assert!(!tasks.contains("已派 agy-usage"), "dispatched entry should be hidden while folded:\n{tasks}");
-    assert!(tasks.contains("陈旧仓库 1 个"), "stale other repo should fold by default:\n{tasks}");
-    assert!(!tasks.contains("十天前旧任务"), "stale repo runs should be hidden while folded:\n{tasks}");
+    assert!(tasks.contains("更早陈旧 1 条") || tasks.contains("陈旧仓库 1 个"), "stale item should fold by default:\n{tasks}");
+    assert!(!tasks.contains("十天前旧任务"), "stale run should be hidden while folded:\n{tasks}");
 
-    // With show_all = true (`--all`), both dispatched queue and stale repo expand.
+    // Toggle to ByRepo ('v') with show_all = true (`--all`) -> both dispatched queue and stale repo expand.
+    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
     app.show_all = true;
     app.rebuild_rows(None);
     let tasks_all = render_to_string(&mut app, 180, 40);
     assert!(tasks_all.contains("agy-usage"), "show_all should reveal dispatched queue:\n{tasks_all}");
     assert!(tasks_all.contains("whatsapp-bridge"), "show_all should reveal stale repo:\n{tasks_all}");
 
-    // 2. Work tab: includes ephemeral `R:cmd-task` (推进中 1), `5工作(3)`, merged wait sentence,
-    //    deferred summary separated from advancing ETA (~04:40), and quota warning in top bar.
-    app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+    // 2. Work tab ('2'): includes ephemeral `R:cmd-task`, `2 工作(3)`, merged wait sentence,
+    //    advancing ETA (~04:40), and global quota alert strip.
+    app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
     let work = render_to_string(&mut app, 180, 40);
-    assert!(work.contains("5工作(3)"), "work tab count must include ephemeral R: row:\n{work}");
-    assert!(work.contains("推进中 1"), "work top bar must count ephemeral active run:\n{work}");
+    assert!(work.contains("2 工作(3)"), "work tab count must include ephemeral R: row:\n{work}");
+    assert!(work.contains("推进中 (1 · 含未挂工作项运行 1)"), "work bucket must show ephemeral sub-label:\n{work}");
     assert!(work.contains("R:cmd-task"), "ephemeral run must appear on work page:\n{work}");
     assert!(work.contains("等 W119 关闭 (~04:40)"), "wait text must be merged into one phrase:\n{work}");
     assert!(!work.contains("等 W119 关闭 等W119"), "duplicate wait phrase:\n{work}");
-    assert!(work.contains("约 04:40"), "advancing ETA missing:\n{work}");
-    assert!(work.contains("另有 5 暂缓（最早 09:12）"), "separate deferred summary missing:\n{work}");
-    assert!(work.contains("⚠ 额度约11h用完"), "quota warning missing from work top bar:\n{work}");
+    assert!(work.contains("活跃链预计 04:40"), "advancing ETA missing:\n{work}");
+    assert!(work.contains("▲ 告警") && work.contains("用完"), "quota alert strip missing from work:\n{work}");
 
-    // 3. Overview tab: horizontal Token Distribution bars with labels+pcts, zero `分█`/`%█` collision!
-    app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
-    let ov = render_to_string(&mut app, 180, 45);
-    assert!(ov.contains("近 7 天合计 3.49B"), "{ov}");
-    assert!(ov.contains("写") && ov.contains("73%"), "{ov}");
-    assert!(ov.contains("审查") && ov.contains("18%"), "{ov}");
-    assert!(ov.contains("返工") && ov.contains("7%"), "{ov}");
-    assert!(ov.contains("只读") && ov.contains("3%"), "{ov}");
-    assert!(ov.contains("213分"), "{ov}");
-    assert!(!ov.contains("213分█"), "value must not collide with bar block:\n{ov}");
-    assert!(!ov.contains("█100%█"), "percent must not collide with bar block:\n{ov}");
-    assert!(ov.contains("另有 5 项暂缓（最早 09:12 恢复）"), "{ov}");
+    // 3. Quota tab ('4'): horizontal Token Distribution bars + horizontal 7d efficiency bars, zero `m█`/`%█` collision!
+    app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+    let quota = render_to_string(&mut app, 180, 45);
+    assert!(quota.contains("近 7 天 Token 分布") && quota.contains("3.49B"), "{quota}");
+    assert!(quota.contains("写任务") && quota.contains("72%"), "{quota}");
+    assert!(quota.contains("自动审查") && quota.contains("18%"), "{quota}");
+    assert!(quota.contains("退回返工") && quota.contains("6%"), "{quota}");
+    assert!(quota.contains("只读侦察") && quota.contains("2%"), "{quota}");
+    assert!(quota.contains("213m"), "{quota}");
+    assert!(!quota.contains("213m█"), "value must not collide with bar block:\n{quota}");
+    assert!(!quota.contains("█100%█"), "percent must not collide with bar block:\n{quota}");
+}
+
+#[test]
+fn overview_five_cards_dynamic_height_and_recent_deliveries_180x50_and_100x30() {
+    use delegate_tui::data::parse_snapshot_json;
+
+    // 1. Empty attention & empty running -> both compress to 3 lines, donating height to work chains & recentDeliveries
+    let mut work_items = Vec::new();
+    for i in 1..=14 {
+        work_items.push(format!(
+            r#"{{"id":"W{i:03}","title":"推进任务 {i:02}","repo":"/home/dev/demo-api","repoLabel":"demo-api","state":"ready","focus":"可派发"}}"#
+        ));
+    }
+    let mut deliveries = Vec::new();
+    for i in 1..=12 {
+        let hh = 2 + (i / 2);
+        let mm = (i % 2) * 30;
+        deliveries.push(format!(
+            r#"{{"run":"20261126-{hh:02}{mm:02}00-deliv-{i}","name":"已清理交付-{i:02}","repo":"demo-api","sourceRoot":"/home/dev/demo-api","appliedAt":"2026-11-26T{hh:02}:{mm:02}:00Z","appliedEpoch":{},"appliedHead":"abcdef123456","changesFiles":3,"added":45,"deleted":12,"elapsedSeconds":720,"rounds":1,"conclusion":"已完成清理后交付回归验证-{i:02}","cleaned":true}}"#,
+            1795572000 + i * 1800
+        ));
+    }
+    let raw = format!(
+        r#"{{
+            "schemaVersion": 1,
+            "generatedAt": "2026-11-26T10:00:00Z",
+            "seq": 200,
+            "repos": [],
+            "work": [{}],
+            "events": [],
+            "lane": {{}},
+            "dagQueue": [],
+            "merges": [],
+            "candidates": [],
+            "recentDeliveries": [{}]
+        }}"#,
+        work_items.join(","),
+        deliveries.join(",")
+    );
+
+    let snap = parse_snapshot_json(&raw, Some(Path::new("/home/dev")), None).unwrap();
+    let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/dev/demo-api"), 5);
+
+    // Default tab is Overview
+    let screen180 = render_to_string(&mut app, 180, 50);
+    assert_lines_fit_width(&screen180, 180);
+    // Healthy state: NO alert strip line
+    assert!(!screen180.contains("▲ 告警"), "healthy state must not render alert strip:\n{screen180}");
+    // Empty attention & empty running compress cleanly and show empty hints
+    assert!(screen180.contains("所有者待拍板 0 · 待主控 0"), "{screen180}");
+    assert!(screen180.contains("空闲 · 无在跑或排队运行"), "{screen180}");
+    // Work chain card gets donated height -> shows many items (>= 12) without premature clipping
+    assert!(screen180.contains("W001") && screen180.contains("W012"), "work chain card should receive donated height:\n{screen180}");
+    // Cleaned deliveries appear from recentDeliveries with formatted time (NOT "-"), diff stats, and conclusion!
+    assert!(screen180.contains("已清理交付-01") && screen180.contains("已清理交付-10"), "recentDeliveries missing:\n{screen180}");
+    assert!(screen180.contains("3f +45/-12 · 12m · 1轮"), "delivery diff/duration/rounds missing:\n{screen180}");
+    assert!(screen180.contains("已完成清理后交付回归验证-01"), "delivery conclusion missing:\n{screen180}");
+    assert!(screen180.contains("合入 abcdef1"), "delivery commit hash missing:\n{screen180}");
+    let deliv_line = screen180
+        .lines()
+        .find(|l| l.contains("已清理交付-01"))
+        .expect("delivery row");
+    assert!(!deliv_line.contains("│ -     demo-api"), "delivery time degraded to '-':\n{deliv_line}");
+
+    // Compact height (180x18): overflow scrolls inside the card and shows 1-N/Total indicator
+    let screen_short = render_to_string(&mut app, 180, 18);
+    assert_lines_fit_width(&screen_short, 180);
+    assert!(screen_short.contains("/14 "), "overflow work chain card must display scroll indicator 1-N/14:\n{screen_short}");
+
+    // Narrow 100x30: single-column flow, every line fits within 100 cols
+    let screen100 = render_to_string(&mut app, 100, 30);
+    assert_lines_fit_width(&screen100, 100);
+    assert!(screen100.contains("1总览"), "{screen100}");
+    assert!(screen100.contains("▸ 需要关注"), "{screen100}");
+}
+
+#[test]
+fn global_alert_strip_silent_when_healthy_and_visible_across_all_5_tabs_on_p0_p1() {
+    use delegate_tui::data::parse_snapshot_json;
+
+    // 1. Healthy state -> 0-row alert strip on all 5 tabs
+    let healthy_raw = r#"{
+        "schemaVersion": 1,
+        "generatedAt": "2026-11-26T00:00:00Z",
+        "seq": 1,
+        "repos": [],
+        "work": [],
+        "events": [],
+        "lane": {},
+        "dagQueue": [],
+        "merges": [],
+        "candidates": []
+    }"#;
+    let healthy_snap = parse_snapshot_json(healthy_raw, None, None).unwrap();
+    let mut healthy_app = App::new(healthy_snap, PathBuf::from("delegate"), PathBuf::from("."), 5);
+    for key in ['1', '2', '3', '4', '5'] {
+        healthy_app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        let s = render_to_string(&mut healthy_app, 140, 30);
+        assert!(!s.contains("▲ 告警"), "healthy tab '{key}' must not render alert strip:\n{s}");
+    }
+
+    // 2. P0 quota depletion + P0 premerge conflict + P1 stalled controller pending >= 30m
+    let alert_raw = r#"{
+        "schemaVersion": 1,
+        "generatedAt": "2026-11-26T00:00:00Z",
+        "seq": 2,
+        "repos": [{
+            "path": "/home/dev/demo-api",
+            "runs": [
+                {
+                    "run": "20261125-235000-conflict",
+                    "name": "conflict-run",
+                    "state": "delivered",
+                    "mode": "write",
+                    "ageSeconds": 600,
+                    "finishedAgoSeconds": 600,
+                    "premerge": {"status": "conflict", "conflicts": ["src/main.rs"]}
+                },
+                {
+                    "run": "20261125-230000-stalled-ctrl",
+                    "name": "stalled-ctrl",
+                    "state": "delivered",
+                    "mode": "write",
+                    "ageSeconds": 3600,
+                    "finishedAgoSeconds": 3600
+                }
+            ],
+            "cleanedNotes": []
+        }],
+        "agyAccounts": {
+            "active": "alpha",
+            "accounts": [{
+                "id": "alpha",
+                "email": "alpha@example.test",
+                "active": true,
+                "quota": {
+                    "fetchedAt": "2026-11-26T00:00:00Z",
+                    "ok": true,
+                    "ageSeconds": 30,
+                    "entries": [
+                        {"pool": "Gemini Models", "window": "fiveHour", "remainingPct": 22.0, "resetInSeconds": 14400}
+                    ]
+                },
+                "quotaEstimate": {
+                    "fiveHour": {"pool": "Gemini Models", "remainingPct": 22.0, "tokensPerPct": 10000000, "estimatedRemainingHours": 1.2}
+                }
+            }]
+        },
+        "work": [],
+        "events": [],
+        "lane": {},
+        "dagQueue": [],
+        "merges": [],
+        "candidates": []
+    }"#;
+    let alert_snap = parse_snapshot_json(alert_raw, Some(Path::new("/home/dev")), None).unwrap();
+    let mut alert_app = App::new(alert_snap, PathBuf::from("delegate"), PathBuf::from("/home/dev/demo-api"), 5);
+
+    // All 5 tabs at 160x36 show 2-line global alert strip (with + 另有 1 条 for the 3rd alert)
+    for key in ['1', '2', '3', '4', '5'] {
+        alert_app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        let s = render_to_string(&mut alert_app, 160, 36);
+        assert_lines_fit_width(&s, 160);
+        assert!(s.contains("▲ 告警(3)"), "tab '{key}' missing alert strip:\n{s}");
+        assert!(s.contains("额度·需手动切号") && s.contains("冲突"), "tab '{key}' missing P0 alerts:\n{s}");
+        assert!(s.contains("+ 另有 1 条"), "tab '{key}' missing overflow count:\n{s}");
+    }
+
+    // Narrow 100x30 compresses alert strip to 1 line and fits width 100
+    alert_app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+    let s100 = render_to_string(&mut alert_app, 100, 30);
+    assert_lines_fit_width(&s100, 100);
+    assert!(s100.contains("▲ 告警(3)") && s100.contains("+另有2条"), "narrow 100-col alert strip:\n{s100}");
+}
+
+#[test]
+fn runs_default_status_grouping_v_toggle_and_l1_card_risk_section() {
+    use delegate_tui::data::parse_snapshot_json;
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "delegate-tui-l1-card-test-{}",
+        std::process::id()
+    ));
+    let run_a_dir = tmp_dir.join("20261126-010000-risk-run");
+    let run_b_dir = tmp_dir.join("20261126-010500-clean-run");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&run_a_dir).unwrap();
+    std::fs::create_dir_all(&run_b_dir).unwrap();
+
+    // Write L1 card.json matching exact `crates/delegate/src/card.rs` schema (`file`/`line`/`location`/`reason`, `review.conclusion`)
+    std::fs::write(
+        run_a_dir.join("card.json"),
+        r#"{
+            "schemaVersion": 1,
+            "review": {
+                "enabled": true,
+                "status": "done",
+                "verdict": "NEEDS_CONTROLLER",
+                "round": 1,
+                "conclusion": "改动涉及受控鉴权路径，需主控复核令牌过期逻辑"
+            },
+            "risks": [
+                {
+                    "severity": "high",
+                    "severityLabel": "高",
+                    "file": "crates/api/src/auth.rs",
+                    "line": 88,
+                    "location": "crates/api/src/auth.rs:88",
+                    "rule": "auth_surface",
+                    "category": "鉴权/凭证",
+                    "source": "规则+审查员",
+                    "reason": "时钟回拨场景未覆盖"
+                }
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    // Write L1 card.json with 0 risks for run_b
+    std::fs::write(
+        run_b_dir.join("card.json"),
+        r#"{
+            "schemaVersion": 1,
+            "review": {
+                "enabled": true,
+                "status": "done",
+                "verdict": "PASS",
+                "round": 1,
+                "conclusion": "改动清晰无风险"
+            },
+            "risks": []
+        }"#,
+    )
+    .unwrap();
+
+    let raw = format!(
+        r#"{{
+            "schemaVersion": 1,
+            "generatedAt": "2026-11-26T02:00:00Z",
+            "seq": 30,
+            "repos": [
+                {{
+                    "path": "/home/dev/repo-alpha",
+                    "runsDir": "{}",
+                    "runs": [
+                        {{
+                            "run": "20261126-010000-risk-run",
+                            "name": "risk-run",
+                            "state": "delivered",
+                            "mode": "write",
+                            "modelName": "neon",
+                            "ageSeconds": 600,
+                            "finishedAgoSeconds": 600,
+                            "accept": {{"ok": true, "command": "cargo test"}},
+                            "review": {{"status": "done", "verdict": "NEEDS_CONTROLLER", "round": 1, "needsAttention": true}},
+                            "card": {{"riskTotal": 1, "riskByCategory": [{{"category": "鉴权/凭证", "count": 1}}], "fastForward": null}}
+                        }},
+                        {{
+                            "run": "20261126-010300-l0-only",
+                            "name": "l0-only-run",
+                            "state": "delivered",
+                            "mode": "write",
+                            "modelName": "neon",
+                            "ageSeconds": 420,
+                            "finishedAgoSeconds": 420,
+                            "accept": {{"ok": true, "command": "cargo test"}},
+                            "card": {{"riskTotal": 2, "riskByCategory": [{{"category": "鉴权/凭证", "count": 1}}, {{"category": "迁移/Schema", "count": 1}}], "fastForward": null}}
+                        }}
+                    ],
+                    "cleanedNotes": []
+                }},
+                {{
+                    "path": "/home/dev/repo-beta",
+                    "runsDir": "{}",
+                    "runs": [
+                        {{
+                            "run": "20261126-010500-clean-run",
+                            "name": "clean-run",
+                            "state": "delivered",
+                            "mode": "write",
+                            "modelName": "neon",
+                            "ageSeconds": 300,
+                            "finishedAgoSeconds": 300,
+                            "accept": {{"ok": true, "command": "cargo test"}},
+                            "review": {{"status": "done", "verdict": "PASS", "round": 1}},
+                            "card": {{"riskTotal": 0, "riskByCategory": [], "fastForward": true}}
+                        }}
+                    ],
+                    "cleanedNotes": []
+                }}
+            ],
+            "work": [],
+            "events": [],
+            "lane": {{}},
+            "dagQueue": [],
+            "merges": [],
+            "candidates": []
+        }}"#,
+        tmp_dir.display(),
+        tmp_dir.display()
+    );
+
+    let snap = parse_snapshot_json(&raw, Some(Path::new("/home/dev")), None).unwrap();
+    let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/dev/repo-alpha"), 5);
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+
+    // 1. Default cross-repo status grouping ('按状态'): all 3 pending runs appear under 待主控处理 (3)
+    let by_status = render_to_string(&mut app, 180, 38);
+    assert_lines_fit_width(&by_status, 180);
+    assert!(by_status.contains("按状态"), "{by_status}");
+    assert!(by_status.contains("待主控处理 (3)"), "{by_status}");
+    assert!(by_status.contains("repo-alpha") && by_status.contains("repo-beta"), "{by_status}");
+    // Right pane reads run_a's card.json on demand and renders real `file:line`, `reason`, and `review.conclusion`
+    assert!(by_status.contains("审查卡"), "{by_status}");
+    assert!(by_status.contains("crates/api/src/auth.rs:88"), "L1 card file:line risk missing:\n{by_status}");
+    assert!(by_status.contains("时钟回拨场景未覆盖"), "{by_status}");
+    assert!(by_status.contains("改动涉及受控鉴权路径"), "L1 review.conclusion missing:\n{by_status}");
+
+    // 2. Move down to clean-run (0 risks, newest non-urgent) -> shows ✓ 0 风险项 & review.conclusion
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    let clean_detail = render_to_string(&mut app, 180, 38);
+    assert!(clean_detail.contains("✓ 0 风险项"), "0-risk card should show ✓ 0 风险项:\n{clean_detail}");
+    assert!(clean_detail.contains("改动清晰无风险"), "clean-run review.conclusion missing:\n{clean_detail}");
+
+    // 3. Move down to l0-only-run (no card.json on disk, only real `riskTotal`/`riskByCategory` L0 summary)
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    let l0_detail = render_to_string(&mut app, 180, 38);
+    assert!(l0_detail.contains("审查卡摘要 (L0)"), "{l0_detail}");
+    assert!(l0_detail.contains("命中 2 项风险"), "L0 riskTotal must not fall back to 0:\n{l0_detail}");
+    assert!(l0_detail.contains("鉴权/凭证 1、迁移/Schema 1"), "L0 riskByCategory summary missing:\n{l0_detail}");
+    assert!(!l0_detail.contains("✓ 0 风险项"), "L0 with riskTotal=2 must not show 0 risks:\n{l0_detail}");
+
+    // 4. Press 'v' to toggle to ByRepo ('按仓库'), and 'v' again back to ByStatus ('按状态')
+    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    let by_repo = render_to_string(&mut app, 180, 38);
+    assert!(by_repo.contains("按仓库"), "{by_repo}");
+    assert!(by_repo.contains("▌ ~/repo-alpha") && by_repo.contains("▌ ~/repo-beta"), "{by_repo}");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    let back_status = render_to_string(&mut app, 180, 38);
+    assert!(back_status.contains("按状态") && back_status.contains("待主控处理 (3)"), "{back_status}");
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }

@@ -38,6 +38,7 @@ mod pool;
 mod premerge;
 mod probe;
 mod process_match;
+mod pulse;
 mod pending_reply;
 mod source_guard;
 mod queue;
@@ -3211,6 +3212,22 @@ fn main_inner(args: &[String]) -> Res<i32> {
             let replied_ids = runs::superseded_by_reply_cached(&entries, &hist_entries);
             let notes_exist = work::any_notes_exist();
 
+            let now_ts = epoch() as i64;
+            let open_work_json = work::load_open_work_json_readonly(&state_root);
+            let all_statuses: Vec<&Value> = entries.iter().map(|(_, st, _)| st).collect();
+            let pending_split =
+                pulse::split_pending_runs_refs(&all_statuses, &open_work_json, now_ts);
+            let active_pending_set: std::collections::HashSet<&str> = pending_split
+                .active_pending
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let stale_pending_set: std::collections::HashSet<&str> = pending_split
+                .stale_pending
+                .iter()
+                .map(String::as_str)
+                .collect();
+
             let mut running = 0usize;
             let mut pending_apply = 0usize;
             let mut pending_question = 0usize;
@@ -3239,9 +3256,6 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 let is_replied = replied_ids.contains(&id);
                 let is_applied =
                     b(status, "applied") || !s(idx_meta, "appliedAt").is_empty();
-                let has_explicit_read = !s(idx_meta, "resultReadAt").is_empty();
-                let is_delivered_read = has_explicit_read
-                    || (b(idx_meta, "delivered") && !b(idx_meta, "truncated"));
                 let unresolved_conflicts = status["conflictMarkers"]
                     .as_array()
                     .into_iter()
@@ -3258,58 +3272,42 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     0
                 };
 
-                let mut keep = if matches!(st, "running" | "starting") {
+                let mut keep = if pulse::is_run_active_running_state(status) {
                     running += 1;
                     true
-                } else if st == "waiting" {
+                } else if pulse::is_run_queued_state(status) {
                     queued += 1;
                     true
-                } else if st == "needs-redispatch" {
-                    other_actionable += 1;
-                    true
-                } else if b(status, "question") {
-                    if is_replied {
-                        false
-                    } else {
-                        pending_question += 1;
-                        true
-                    }
-                } else if matches!(st, "delivered" | "answered") {
-                    let has_worktree_changes =
-                        runs::chain_pending_apply_files_cached(i, &entries) > 0;
-                    let needs_ctrl = s(&status["review"], "verdict") == "NEEDS_CONTROLLER"
-                        && !is_applied
-                        && !is_replied
-                        && !(status["sign"].is_object() && b(&status["sign"], "valid"));
-                    if unresolved_conflicts || (has_worktree_changes && !is_applied && !is_replied)
-                    {
-                        pending_apply += 1;
-                        true
-                    } else if needs_ctrl {
-                        other_actionable += 1;
-                        true
-                    } else if is_applied || is_replied || is_delivered_read {
-                        false
-                    } else {
-                        unread += 1;
-                        true
-                    }
-                } else if st == "rejected" {
-                    if is_replied
-                        || has_explicit_read
-                        || is_applied
-                        || b(idx_meta, "appliedCleaned")
-                    {
-                        false
-                    } else {
-                        rejected += 1;
-                        true
-                    }
-                } else if st == "stopped" || is_replied || is_delivered_read {
+                } else if stale_pending_set.contains(id.as_str()) {
+                    // >24h unattached pending runs are tracked in `stalePending` (same as `SnapshotPulse`)
                     false
-                } else {
-                    other_actionable += 1;
+                } else if active_pending_set.contains(id.as_str()) {
+                    if b(status, "question") {
+                        pending_question += 1;
+                    } else if st == "rejected" {
+                        rejected += 1;
+                    } else if matches!(st, "delivered" | "answered") {
+                        let has_worktree_changes =
+                            runs::chain_pending_apply_files_cached(i, &entries) > 0;
+                        let needs_ctrl = s(&status["review"], "verdict") == "NEEDS_CONTROLLER"
+                            && !is_applied
+                            && !is_replied
+                            && !(status["sign"].is_object() && b(&status["sign"], "valid"));
+                        if unresolved_conflicts
+                            || (has_worktree_changes && !is_applied && !is_replied)
+                        {
+                            pending_apply += 1;
+                        } else if needs_ctrl {
+                            other_actionable += 1;
+                        } else {
+                            unread += 1;
+                        }
+                    } else {
+                        other_actionable += 1;
+                    }
                     true
+                } else {
+                    false
                 };
 
                 if !keep && !is_replied && note_pending > 0 {
@@ -3346,7 +3344,6 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 .map(|plan| jobserver::inspect_pool_readonly(plan.pool_tokens, plan.budget));
 
             if !shown.is_empty() {
-                let now_ts = epoch() as i64;
                 let shown_paths: Vec<PathBuf> = shown.iter().map(|(r, _)| r.clone()).collect();
                 let eta_model = speed::load_or_refresh_eta_model_in(&state_root, now_ts, true);
                 let eta_ctx = eta::LiveContext::capture(&state_root, now_ts, &shown_paths);
@@ -3377,6 +3374,8 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     "rejected": rejected,
                     "pendingNotes": pending_todo,
                     "otherActionable": other_actionable,
+                    "controllerPending": pending_split.active_pending.len(),
+                    "stalePending": pending_split.stale_pending.len(),
                     "finished": finished_count,
                     "archiveBytes": arch_usage.bytes,
                     "archiveCount": arch_usage.count,
@@ -3393,11 +3392,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 }
                 println!("{}", json!({"statusSummary": summary}));
             } else {
-                let quota_warnings =
-                    agy_accounts::detect_quota_depletion_warnings_in(&state_root, epoch() as i64);
-                if let Some(warn_line) =
-                    agy_accounts::format_status_quota_warning_line(&quota_warnings)
-                {
+                if let Some(warn_line) = pulse::format_status_quota_alert_line_in(&state_root, now_ts) {
                     println!("{warn_line}");
                 }
                 let mut counts = format!(

@@ -2435,84 +2435,14 @@ fn short_model_label(raw: &str) -> String {
     stripped.to_string()
 }
 
-#[derive(Debug, Clone)]
-struct RunTrendRecord {
-    run: String,
-    mode: String,
-    state: String,
-    parent: String,
-    started_epoch: i64,
-    finished_epoch: i64,
-    applied_epoch: Option<i64>,
-    rework_count: u64,
-}
-
-fn load_trend_records(
+fn load_recent_history_records(
     state_root: &Path,
     all_seen_runs: &BTreeMap<String, Value>,
-) -> HashMap<String, RunTrendRecord> {
-    let mut map: HashMap<String, RunTrendRecord> = HashMap::new();
-
-    // 1. Lock-free scan of per-repo `<state>/history/*/history.jsonl`.
-    let hist_root = state_root.join("history");
-    if let Ok(rd) = fs::read_dir(&hist_root) {
-        for ent in rd.flatten() {
-            let hp = ent.path().join("history.jsonl");
-            if !hp.is_file() {
-                continue;
-            }
-            for line in read(&hp).lines() {
-                let Ok(v) = serde_json::from_str::<Value>(line) else {
-                    continue;
-                };
-                let rid = s(&v, "run");
-                if rid.is_empty() {
-                    continue;
-                }
-                let started = iso_epoch(s(&v, "startedAt")).unwrap_or(0);
-                let finished = iso_epoch(s(&v, "finishedAt")).unwrap_or(0);
-                let applied = iso_epoch(s(&v, "appliedAt"));
-                let mode = s(&v, "mode");
-                let state = s(&v, "state");
-                let parent = s(&v, "parent");
-                let rw = v["reworkCount"].as_u64().unwrap_or(0);
-                // History is an event log (`finish`, `apply`, `clean`, `reply` lines each carry
-                // a subset of fields); fold non-empty fields onto the run's record instead of
-                // overwriting earlier fields with empty values.
-                let rec = map.entry(rid.to_string()).or_insert_with(|| RunTrendRecord {
-                    run: rid.to_string(),
-                    mode: String::new(),
-                    state: String::new(),
-                    parent: String::new(),
-                    started_epoch: 0,
-                    finished_epoch: 0,
-                    applied_epoch: None,
-                    rework_count: 0,
-                });
-                if !mode.is_empty() {
-                    rec.mode = mode.to_string();
-                }
-                if !state.is_empty() {
-                    rec.state = state.to_string();
-                }
-                if !parent.is_empty() {
-                    rec.parent = parent.to_string();
-                }
-                if started > 0 {
-                    rec.started_epoch = started;
-                }
-                if finished > 0 {
-                    rec.finished_epoch = finished;
-                } else if rec.finished_epoch == 0 && started > 0 {
-                    rec.finished_epoch = started;
-                }
-                if let Some(app_ep) = applied {
-                    rec.applied_epoch = Some(app_ep);
-                }
-                rec.rework_count = rec.rework_count.max(rw);
-            }
-        }
-    }
+    cutoff_7d: i64,
+    now_ep: i64,
+) -> HashMap<String, crate::history::RecentHistoryRecord> {
+    // 1. Lock-free single-pass tail-chunk read of `<state>/history/*/history.jsonl`.
+    let mut map = crate::history::read_recent_window_all_repos(state_root, cutoff_7d);
 
     // 2. Overlay currently known live/uncleaned runs from `snapshot_command`.
     for (rid, st) in all_seen_runs {
@@ -2524,13 +2454,14 @@ fn load_trend_records(
             .unwrap_or_else(|| {
                 let age = st["ageSeconds"].as_i64().unwrap_or(0);
                 if age > 0 {
-                    epoch() as i64 - age
+                    now_ep - age
                 } else {
                     0
                 }
             });
         let finished = iso_epoch(s(st, "finishedAt")).unwrap_or(0);
-        let applied = iso_epoch(s(st, "appliedAt")).or_else(|| {
+        let applied_str = s(st, "appliedAt");
+        let applied = iso_epoch(applied_str).or_else(|| {
             if b(st, "applied") {
                 Some(finished.max(started))
             } else {
@@ -2541,19 +2472,19 @@ fn load_trend_records(
             .as_u64()
             .unwrap_or(0)
             .max(st["review"]["reworkRounds"].as_u64().unwrap_or(0));
-        let rec = map.entry(rid.clone()).or_insert_with(|| RunTrendRecord {
-            run: rid.clone(),
-            mode: String::new(),
-            state: String::new(),
-            parent: String::new(),
-            started_epoch: 0,
-            finished_epoch: 0,
-            applied_epoch: None,
-            rework_count: 0,
-        });
+        let rec = map
+            .entry(rid.clone())
+            .or_insert_with(|| crate::history::RecentHistoryRecord {
+                run: rid.clone(),
+                ..crate::history::RecentHistoryRecord::default()
+            });
         let mode = s(st, "mode");
         let state = s(st, "state");
         let parent = s(st, "parent");
+        let name = s(st, "name");
+        if !name.is_empty() {
+            rec.name = name.to_string();
+        }
         if !mode.is_empty() {
             rec.mode = mode.to_string();
         }
@@ -2573,6 +2504,38 @@ fn load_trend_records(
         }
         if let Some(app_ep) = applied {
             rec.applied_epoch = Some(app_ep);
+            if !applied_str.is_empty() {
+                rec.applied_at = applied_str.to_string();
+            } else if rec.applied_at.is_empty() && app_ep > 0 {
+                rec.applied_at = format_epoch(app_ep, false, "%Y-%m-%dT%H:%M:%SZ");
+            }
+        }
+        let app_head = s(st, "appliedHead");
+        if !app_head.is_empty() {
+            rec.applied_head = app_head.to_string();
+        }
+        let elapsed = st["elapsedSeconds"].as_i64().unwrap_or(0);
+        if elapsed > 0 {
+            rec.elapsed_seconds = elapsed;
+        }
+        if st["changes"].is_object() {
+            let cf = st["changes"]["files"].as_u64().unwrap_or(0) as usize;
+            let add = n(&st["changes"], "added");
+            let del = n(&st["changes"], "deleted");
+            if cf > 0 || add > 0 || del > 0 {
+                rec.changes_files = cf;
+                rec.added = add;
+                rec.deleted = del;
+            }
+        }
+        let src = s(st, "worktreeSource");
+        if !src.is_empty() {
+            rec.source_root = src.to_string();
+            if let Some(base) = Path::new(src).file_name().and_then(|x| x.to_str()) {
+                if !base.is_empty() {
+                    rec.repo_label = base.to_string();
+                }
+            }
         }
         rec.rework_count = rec.rework_count.max(rw);
     }
@@ -2580,7 +2543,12 @@ fn load_trend_records(
     map
 }
 
-fn compute_daily_7d_trend(records: &HashMap<String, RunTrendRecord>, now_ep: i64) -> Vec<Value> {
+fn compute_daily_7d_and_deliveries(
+    records: &HashMap<String, crate::history::RecentHistoryRecord>,
+    work_items: &[crate::work::WorkItem],
+    now_ep: i64,
+    cutoff_7d: i64,
+) -> (Vec<Value>, Vec<Value>, usize) {
     // Build 7 local calendar days: D-6 ..= D-0
     let mut days: Vec<(String, String)> = Vec::with_capacity(7);
     for d in (0..7).rev() {
@@ -2589,11 +2557,20 @@ fn compute_daily_7d_trend(records: &HashMap<String, RunTrendRecord>, now_ep: i64
         let md = format_epoch(ep, true, "%m-%d");
         days.push((ymd, md));
     }
+    let today_ymd = days.last().map(|(y, _)| y.clone()).unwrap_or_default();
     let day_index: HashMap<String, usize> = days
         .iter()
         .enumerate()
         .map(|(i, (ymd, _))| (ymd.clone(), i))
         .collect();
+
+    // Map run_id -> work_id so recent deliveries can show `[Wxx]` badges.
+    let mut run_to_work: HashMap<&str, &str> = HashMap::new();
+    for w in work_items {
+        for rid in &w.runs {
+            run_to_work.entry(rid.as_str()).or_insert(w.id.as_str());
+        }
+    }
 
     // Identify parent runs so we count each reply chain once (at its head/latest run).
     let mut has_child: HashSet<&str> = HashSet::new();
@@ -2607,6 +2584,27 @@ fn compute_daily_7d_trend(records: &HashMap<String, RunTrendRecord>, now_ep: i64
     let mut total_chains_by_day = [0u64; 7];
     let mut first_pass_by_day = [0u64; 7];
 
+    // Deduplicate recent applied deliveries by chain root ID (no hard count cap; 7d window only).
+    struct DeliveryAcc {
+        run: String,
+        name: String,
+        repo: String,
+        source_root: String,
+        applied_at: String,
+        applied_epoch: i64,
+        applied_head: String,
+        changes_files: usize,
+        added: i64,
+        deleted: i64,
+        elapsed_seconds: i64,
+        rounds: usize,
+        conclusion: String,
+        work_id: Option<String>,
+        cleaned: bool,
+    }
+    let mut deliveries_by_root: HashMap<String, DeliveryAcc> = HashMap::new();
+    let mut merged_today_roots: HashSet<String> = HashSet::new();
+
     for rec in records.values() {
         if has_child.contains(rec.run.as_str()) {
             continue;
@@ -2614,18 +2612,55 @@ fn compute_daily_7d_trend(records: &HashMap<String, RunTrendRecord>, now_ep: i64
         if rec.mode != "write" && !rec.mode.is_empty() {
             continue;
         }
-        // Walk up to root of this chain to get initial dispatch timestamp & detect reply rounds.
+        // Walk up to root of this chain to get initial dispatch timestamp, root name, work link & rounds.
+        let mut root_id = rec.run.as_str();
+        let mut root_name = crate::notes::strip_reply_prefixes(&rec.name).0.to_string();
         let mut root_started = rec.started_epoch;
         let mut chain_len = 1usize;
         let mut total_rework = rec.rework_count;
+        let mut work_id: Option<String> = run_to_work.get(rec.run.as_str()).map(|w| (*w).to_string());
+        let mut best_conclusion = rec.conclusion.clone();
+        let mut best_repo = rec.repo_label.clone();
+        let mut best_source = rec.source_root.clone();
+        let mut best_files = rec.changes_files;
+        let mut best_added = rec.added;
+        let mut best_deleted = rec.deleted;
+        let mut total_elapsed = rec.elapsed_seconds.max(0);
         let mut cur_parent = rec.parent.as_str();
         let mut visited = HashSet::new();
         visited.insert(rec.run.as_str());
         while !cur_parent.is_empty() && visited.insert(cur_parent) {
             chain_len += 1;
+            root_id = cur_parent;
+            if work_id.is_none() {
+                work_id = run_to_work.get(cur_parent).map(|w| (*w).to_string());
+            }
             if let Some(p) = records.get(cur_parent) {
+                if !p.name.is_empty() {
+                    let stripped = crate::notes::strip_reply_prefixes(&p.name).0;
+                    if !stripped.is_empty() {
+                        root_name = stripped.to_string();
+                    }
+                }
                 if p.started_epoch > 0 && (root_started == 0 || p.started_epoch < root_started) {
                     root_started = p.started_epoch;
+                }
+                if best_conclusion.is_empty() && !p.conclusion.is_empty() {
+                    best_conclusion = p.conclusion.clone();
+                }
+                if best_repo.is_empty() && !p.repo_label.is_empty() {
+                    best_repo = p.repo_label.clone();
+                }
+                if best_source.is_empty() && !p.source_root.is_empty() {
+                    best_source = p.source_root.clone();
+                }
+                if best_files == 0 && p.changes_files > 0 {
+                    best_files = p.changes_files;
+                    best_added = p.added;
+                    best_deleted = p.deleted;
+                }
+                if p.elapsed_seconds > 0 {
+                    total_elapsed = total_elapsed.saturating_add(p.elapsed_seconds);
                 }
                 total_rework = total_rework.saturating_add(p.rework_count);
                 cur_parent = p.parent.as_str();
@@ -2634,12 +2669,60 @@ fn compute_daily_7d_trend(records: &HashMap<String, RunTrendRecord>, now_ep: i64
             }
         }
 
-        // 1. Dispatch -> merge latency (bucketed by local date of appliedAt)
+        // 1. Dispatch -> merge latency (bucketed by local date of appliedAt) + recentDeliveries
         if let Some(app_ep) = rec.applied_epoch {
             let ymd = format_epoch(app_ep, true, "%Y-%m-%d");
             if let Some(&idx) = day_index.get(&ymd) {
                 if root_started > 0 && app_ep >= root_started {
                     merge_secs_by_day[idx].push((app_ep - root_started) as u64);
+                }
+            }
+            if !today_ymd.is_empty() && ymd == today_ymd {
+                merged_today_roots.insert(root_id.to_string());
+            }
+            if app_ep >= cutoff_7d {
+                let rounds = chain_len.saturating_add(total_rework as usize).max(1);
+                let elapsed = if total_elapsed > 0 {
+                    total_elapsed
+                } else if root_started > 0 && rec.finished_epoch >= root_started {
+                    rec.finished_epoch - root_started
+                } else if root_started > 0 && app_ep >= root_started {
+                    app_ep - root_started
+                } else {
+                    0
+                };
+                let display_name = if root_name.is_empty() {
+                    rec.run.clone()
+                } else {
+                    root_name.clone()
+                };
+                let applied_at = if !rec.applied_at.is_empty() {
+                    rec.applied_at.clone()
+                } else {
+                    format_epoch(app_ep, false, "%Y-%m-%dT%H:%M:%SZ")
+                };
+                let acc = DeliveryAcc {
+                    run: rec.run.clone(),
+                    name: display_name,
+                    repo: best_repo,
+                    source_root: best_source,
+                    applied_at,
+                    applied_epoch: app_ep,
+                    applied_head: rec.applied_head.clone(),
+                    changes_files: best_files,
+                    added: best_added,
+                    deleted: best_deleted,
+                    elapsed_seconds: elapsed,
+                    rounds,
+                    conclusion: best_conclusion,
+                    work_id,
+                    cleaned: rec.cleaned,
+                };
+                let replace = deliveries_by_root
+                    .get(root_id)
+                    .is_none_or(|prev| acc.applied_epoch >= prev.applied_epoch);
+                if replace {
+                    deliveries_by_root.insert(root_id.to_string(), acc);
                 }
             }
         }
@@ -2668,7 +2751,8 @@ fn compute_daily_7d_trend(records: &HashMap<String, RunTrendRecord>, now_ep: i64
         }
     }
 
-    days.into_iter()
+    let daily_7d: Vec<Value> = days
+        .into_iter()
         .enumerate()
         .map(|(i, (ymd, md))| {
             let list = &mut merge_secs_by_day[i];
@@ -2698,15 +2782,58 @@ fn compute_daily_7d_trend(records: &HashMap<String, RunTrendRecord>, now_ep: i64
                 "firstRoundPassPct": pass_pct,
             })
         })
-        .collect()
+        .collect();
+
+    let mut deliveries: Vec<DeliveryAcc> = deliveries_by_root.into_values().collect();
+    deliveries.sort_by(|a, b| {
+        b.applied_epoch
+            .cmp(&a.applied_epoch)
+            .then_with(|| b.run.cmp(&a.run))
+    });
+    let recent_deliveries: Vec<Value> = deliveries
+        .into_iter()
+        .map(|d| {
+            let mut obj = json!({
+                "run": d.run,
+                "name": d.name,
+                "repo": d.repo,
+                "sourceRoot": d.source_root,
+                "appliedAt": d.applied_at,
+                "appliedEpoch": d.applied_epoch,
+                "appliedHead": d.applied_head,
+                "changesFiles": d.changes_files,
+                "added": d.added,
+                "deleted": d.deleted,
+                "elapsedSeconds": d.elapsed_seconds,
+                "rounds": d.rounds,
+                "conclusion": d.conclusion,
+                "cleaned": d.cleaned,
+            });
+            if let Some(wid) = d.work_id {
+                obj["workId"] = json!(wid);
+            }
+            obj
+        })
+        .collect();
+
+    (daily_7d, recent_deliveries, merged_today_roots.len())
 }
 
-/// Lock-free, zero-subprocess analytics bundle embedded in `delegate snapshot --json` for TUI charts:
-/// - Last 24h hourly token series (total + per account)
-/// - Last 7d token breakdown by purpose (`write` / `review` / `rework` / `readOnly`) and by model
-/// - Last 7d daily dispatch->merge latency & first-round pass rate trend
-pub fn tui_analytics_snapshot(state_root: &Path, all_seen_runs: &BTreeMap<String, Value>) -> Value {
-    let now_ep = epoch() as i64;
+/// Combined single-pass output of 7d analytics, 7d recent deliveries (no hard count cap),
+/// and local-today merged chain count.
+pub struct AnalyticsAndDeliveries {
+    pub analytics: Value,
+    pub recent_deliveries: Vec<Value>,
+    pub merged_today: usize,
+}
+
+/// Lock-free, zero-subprocess analytics + recent-deliveries bundle embedded in `delegate snapshot --json`.
+pub fn tui_analytics_and_deliveries(
+    state_root: &Path,
+    all_seen_runs: &BTreeMap<String, Value>,
+    work_items: &[crate::work::WorkItem],
+    now_ep: i64,
+) -> AnalyticsAndDeliveries {
     let cutoff_7d = now_ep - SEVEN_DAYS_SECS;
 
     let (mut entries, live_running, _) = collect_all(Some(cutoff_7d), true, false);
@@ -2737,10 +2864,16 @@ pub fn tui_analytics_snapshot(state_root: &Path, all_seen_runs: &BTreeMap<String
     let mut purpose_review = 0u64;
     let mut purpose_rework = 0u64;
     let mut purpose_readonly = 0u64;
+    let mut tok_input = 0u64;
+    let mut tok_output = 0u64;
+    let mut tok_cache_read = 0u64;
     let mut by_model_map: HashMap<String, u64> = HashMap::new();
 
     for e in &entries {
         let tok = e.tokens.total().max(0) as u64;
+        tok_input = tok_input.saturating_add(e.tokens.input.max(0) as u64);
+        tok_output = tok_output.saturating_add(e.tokens.output.max(0) as u64);
+        tok_cache_read = tok_cache_read.saturating_add(e.tokens.cache_read.max(0) as u64);
         if e.is_agy {
             let acct = e
                 .account
@@ -2774,18 +2907,19 @@ pub fn tui_analytics_snapshot(state_root: &Path, all_seen_runs: &BTreeMap<String
         by_acct_json.insert(acct, json!(fill_hourly_24h(&list, now_ep)));
     }
 
+    // Output all models sorted by tokens descending (no hard truncation cap; UI folds overflow).
     let mut models_vec: Vec<(String, u64)> = by_model_map.into_iter().collect();
     models_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    models_vec.truncate(8);
     let by_model_json: Vec<Value> = models_vec
         .into_iter()
         .map(|(m, t)| json!({"model": m, "tokens": t}))
         .collect();
 
-    let trend_records = load_trend_records(state_root, all_seen_runs);
-    let daily_7d = compute_daily_7d_trend(&trend_records, now_ep);
+    let recent_records = load_recent_history_records(state_root, all_seen_runs, cutoff_7d, now_ep);
+    let (daily_7d, recent_deliveries, merged_today) =
+        compute_daily_7d_and_deliveries(&recent_records, work_items, now_ep, cutoff_7d);
 
-    json!({
+    let analytics = json!({
         "hourly24h": {
             "total": total_hourly_24h,
             "byAccount": Value::Object(by_acct_json),
@@ -2796,9 +2930,26 @@ pub fn tui_analytics_snapshot(state_root: &Path, all_seen_runs: &BTreeMap<String
             "rework": purpose_rework,
             "readOnly": purpose_readonly,
         },
+        "tokenBreakdown": {
+            "input": tok_input,
+            "output": tok_output,
+            "cacheRead": tok_cache_read,
+        },
         "byModel": by_model_json,
         "daily7d": daily_7d,
-    })
+    });
+
+    AnalyticsAndDeliveries {
+        analytics,
+        recent_deliveries,
+        merged_today,
+    }
+}
+
+/// Backward-compatible wrapper returning only the analytics JSON bundle.
+#[allow(dead_code)]
+pub fn tui_analytics_snapshot(state_root: &Path, all_seen_runs: &BTreeMap<String, Value>) -> Value {
+    tui_analytics_and_deliveries(state_root, all_seen_runs, &[], epoch() as i64).analytics
 }
 
 #[cfg(test)]
@@ -2932,7 +3083,7 @@ mod tests {
         // First-round pass merged in 600s today
         recs.insert(
             "run-a".to_string(),
-            RunTrendRecord {
+            crate::history::RecentHistoryRecord {
                 run: "run-a".into(),
                 mode: "write".into(),
                 state: "delivered".into(),
@@ -2941,12 +3092,13 @@ mod tests {
                 finished_epoch: now - 800,
                 applied_epoch: Some(now - 600),
                 rework_count: 0,
+                ..crate::history::RecentHistoryRecord::default()
             },
         );
         // Reworked chain merged in 1800s today (NOT first-round pass)
         recs.insert(
             "run-b-r1".to_string(),
-            RunTrendRecord {
+            crate::history::RecentHistoryRecord {
                 run: "run-b-r1".into(),
                 mode: "write".into(),
                 state: "rejected".into(),
@@ -2955,11 +3107,12 @@ mod tests {
                 finished_epoch: now - 1800,
                 applied_epoch: None,
                 rework_count: 0,
+                ..crate::history::RecentHistoryRecord::default()
             },
         );
         recs.insert(
             "run-b-r2".to_string(),
-            RunTrendRecord {
+            crate::history::RecentHistoryRecord {
                 run: "run-b-r2".into(),
                 mode: "write".into(),
                 state: "delivered".into(),
@@ -2968,10 +3121,14 @@ mod tests {
                 finished_epoch: now - 900,
                 applied_epoch: Some(now - 600),
                 rework_count: 1,
+                ..crate::history::RecentHistoryRecord::default()
             },
         );
-        let daily = compute_daily_7d_trend(&recs, now);
+        let (daily, deliveries, merged_today) =
+            compute_daily_7d_and_deliveries(&recs, &[], now, now - SEVEN_DAYS_SECS);
         assert_eq!(daily.len(), 7);
+        assert_eq!(deliveries.len(), 2);
+        assert_eq!(merged_today, 2);
         let today = daily.last().unwrap();
         assert_eq!(today["mergedCount"], 2);
         assert_eq!(today["totalChains"], 2);
@@ -3113,19 +3270,27 @@ mod tests {
         );
         fs::write(hdir.join("history.jsonl"), hist).unwrap();
 
-        let records = load_trend_records(&base, &BTreeMap::new());
+        let now_ep = iso_epoch("2026-11-25T04:00:00Z").unwrap();
+        let records = load_recent_history_records(
+            &base,
+            &BTreeMap::new(),
+            now_ep - SEVEN_DAYS_SECS,
+            now_ep,
+        );
         let rec = records.get("20261124-100000-feat-a").expect("folded record");
         assert_eq!(rec.mode, "write");
         assert_eq!(rec.state, "delivered");
         assert!(rec.started_epoch > 0);
         assert!(rec.applied_epoch.is_some());
 
-        let now_ep = iso_epoch("2026-11-25T04:00:00Z").unwrap();
-        let daily = compute_daily_7d_trend(&records, now_ep);
+        let (daily, deliveries, _) =
+            compute_daily_7d_and_deliveries(&records, &[], now_ep, now_ep - SEVEN_DAYS_SECS);
         let d24 = daily.iter().find(|d| s(d, "ymd") == "2026-11-24").unwrap();
         assert_eq!(d24["mergedCount"].as_u64(), Some(1));
         assert_eq!(d24["medianMergeSecs"].as_u64(), Some(3600));
         assert_eq!(d24["firstRoundPass"].as_u64(), Some(1));
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0]["cleaned"], true);
 
         let _ = fs::remove_dir_all(&base);
     }

@@ -5528,14 +5528,31 @@ fn render_layer0_summary_with_eta(
     counts: &HashMap<&str, usize>,
     dag_eta: Option<&crate::eta::DagEtaSummary>,
 ) -> String {
+    render_layer0_summary_with_pulse(counts, None, dag_eta)
+}
+
+fn render_layer0_summary_with_pulse(
+    counts: &HashMap<&str, usize>,
+    work_pulse: Option<&crate::pulse::WorkPulseCounts>,
+    dag_eta: Option<&crate::eta::DagEtaSummary>,
+) -> String {
+    let (wait_part, deferred_cnt) = match work_pulse {
+        Some(wp) if wp.timed > 0 => (
+            format!("等待 {} · 定时 {}", wp.waiting_dep, wp.timed),
+            wp.deferred,
+        ),
+        Some(wp) => (format!("等待 {}", wp.waiting_dep), wp.deferred),
+        None => (
+            format!("等待 {}", counts.get("blocked").copied().unwrap_or(0)),
+            counts.get("deferred").copied().unwrap_or(0),
+        ),
+    };
     let mut line = format!(
-        "工作表：需处理 {} · 就绪 {} · 待闭环 {} · 推进中 {} · 等待 {} · 暂缓 {}",
+        "工作表：需处理 {} · 就绪 {} · 待闭环 {} · 推进中 {} · {wait_part} · 暂缓 {deferred_cnt}",
         counts.get("attention").copied().unwrap_or(0),
         counts.get("ready").copied().unwrap_or(0),
         counts.get("verify").copied().unwrap_or(0),
         counts.get("active").copied().unwrap_or(0),
-        counts.get("blocked").copied().unwrap_or(0),
-        counts.get("deferred").copied().unwrap_or(0),
     );
     if let Some(dag) = dag_eta {
         if dag.write_chains > 0 || !dag.owner_blocked.is_empty() || dag.external_wait_count > 0 {
@@ -6365,6 +6382,7 @@ fn list_cmd(args: &[String]) -> Res<i32> {
         items,
         all_rows,
         counts,
+        work_pulse,
         dag_eta,
         ephemeral_etas,
         ..
@@ -6428,6 +6446,10 @@ fn list_cmd(args: &[String]) -> Res<i32> {
             "blocked": counts.get("blocked").copied().unwrap_or(0),
             "deferred": counts.get("deferred").copied().unwrap_or(0),
             "done": counts.get("done").copied().unwrap_or(0),
+            "ownerOpen": work_pulse.owner_open,
+            "activePool": work_pulse.active_pool,
+            "waitingDep": work_pulse.waiting_dep,
+            "timed": work_pulse.timed,
         });
         if let Some(ref dag) = dag_eta {
             ws["eta"] = dag.to_json();
@@ -6437,7 +6459,10 @@ fn list_cmd(args: &[String]) -> Res<i32> {
     }
 
     let term_w = detect_terminal_width();
-    println!("{}", render_layer0_summary_with_eta(&counts, dag_eta.as_ref()));
+    println!(
+        "{}",
+        render_layer0_summary_with_pulse(&counts, Some(&work_pulse), dag_eta.as_ref())
+    );
     if visible.is_empty() {
         println!("（当前无待处理项）");
     } else {
@@ -6469,9 +6494,20 @@ pub(crate) struct UnifiedWorkView {
     pub(crate) items: Vec<WorkItem>,
     pub(crate) all_rows: Vec<TableRow>,
     pub(crate) counts: HashMap<&'static str, usize>,
+    pub(crate) work_pulse: crate::pulse::WorkPulseCounts,
     pub(crate) dag_eta: Option<crate::eta::DagEtaSummary>,
     pub(crate) ephemeral_etas: HashMap<String, crate::eta::RunEta>,
     pub(crate) snapshot_items_json: Vec<Value>,
+}
+
+/// Strictly read-only, zero-lock loader of non-done work items as JSON Values
+/// for shared `pulse::split_pending_runs` alignment in `delegate status`.
+pub(crate) fn load_open_work_json_readonly(state: &Path) -> Vec<Value> {
+    load_readonly_in(state)
+        .into_iter()
+        .filter(|w| w.state != "done")
+        .map(|w| w.to_json())
+        .collect()
 }
 
 pub(crate) fn build_unified_work_view(
@@ -6634,10 +6670,29 @@ pub(crate) fn build_unified_work_view(
         }
     }
 
+    let work_pulse = if build_snapshot_json && repo_filter.is_none() {
+        crate::pulse::count_work_pulse(&snapshot_items_json)
+    } else {
+        let item_by_id: HashMap<&str, &WorkItem> =
+            items.iter().map(|w| (w.id.as_str(), w)).collect();
+        let pulse_items: Vec<Value> = all_rows
+            .iter()
+            .filter_map(|r| {
+                if r.is_ephemeral {
+                    Some(json!({ "id": r.id, "ephemeral": true, "state": r.state }))
+                } else {
+                    item_by_id.get(r.id.as_str()).map(|w| w.to_json())
+                }
+            })
+            .collect();
+        crate::pulse::count_work_pulse(&pulse_items)
+    };
+
     UnifiedWorkView {
         items,
         all_rows,
         counts,
+        work_pulse,
         dag_eta,
         ephemeral_etas,
         snapshot_items_json,

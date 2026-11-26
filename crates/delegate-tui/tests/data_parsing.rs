@@ -137,6 +137,7 @@ fn folds_stale_pending_and_merged_by_default_and_toggles_on_enter() {
         ..AppSnapshot::default()
     };
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/tmp/demo"), 5);
+    app.tab = delegate_tui::app::ViewTab::Runs;
 
     // Only the fresh pending run is visible; stale pending & merged are collapsed into ToggleFold rows.
     let visible_runs: usize = app
@@ -312,6 +313,7 @@ fn write_actions_only_generate_commands_and_filter_narrows_rows() {
         PathBuf::from("/home/dev/other"),
         5,
     );
+    app.tab = delegate_tui::app::ViewTab::Runs;
 
     // Press 'a' -> opens CommandModal with cd prefix (since cwd != repo)
     let action = app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
@@ -407,6 +409,7 @@ fn collected_readonly_and_cleaned_runs_fold_by_default_and_exclude_from_pending(
         PathBuf::from("/home/dev/demo-api"),
         5,
     );
+    app.tab = delegate_tui::app::ViewTab::Runs;
     // Only the 2 Pending runs are visible by default; the 2 Collected runs are folded.
     let visible_runs = app
         .rows

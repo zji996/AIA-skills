@@ -544,6 +544,96 @@ pub struct SnapshotEta {
     pub queue: WorkDagEtaSummary,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct CardL0Info {
+    pub risk_count: usize,
+    pub max_severity: Option<String>,
+    pub fast_forward: Option<bool>,
+    pub tests_added: u64,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct CardRiskEntry {
+    pub severity: String,
+    pub category: String,
+    pub path: String,
+    pub line: Option<u64>,
+    pub added: u64,
+    pub deleted: u64,
+    pub reason: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunCardL1 {
+    pub risks: Vec<CardRiskEntry>,
+    pub rule_hits: usize,
+    pub reviewer_hints: usize,
+    pub tests_added: u64,
+    pub tests_modified: u64,
+    pub tests_deleted: u64,
+    pub review_verdict: String,
+    pub review_summary: String,
+    pub review_round: u64,
+    pub fast_forward: Option<bool>,
+    pub accept_ok: Option<bool>,
+    pub accept_label: String,
+    pub accept_layers_passed: usize,
+    pub accept_layers_total: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct RecentDeliveryItem {
+    pub run: String,
+    pub name: String,
+    pub repo: String,
+    pub source_root: String,
+    pub applied_at: String,
+    pub applied_epoch: i64,
+    pub applied_head: String,
+    pub changes_files: usize,
+    pub added: i64,
+    pub deleted: i64,
+    pub elapsed_seconds: i64,
+    pub rounds: usize,
+    pub conclusion: String,
+    pub work_id: Option<String>,
+    pub cleaned: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AlertLevel {
+    P0,
+    P1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ActiveAlertItem {
+    pub level: AlertLevel,
+    pub kind: String,
+    pub label: String,
+    pub message: String,
+    pub target_tab: u8,
+    pub target_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct SnapshotPulse {
+    pub owner_open: usize,
+    pub controller_pending: usize,
+    pub stale_pending: usize,
+    pub running_runs: usize,
+    pub queued_runs: usize,
+    pub work_active_pool: usize,
+    pub work_deferred: usize,
+    pub work_timed: usize,
+    pub merged_today: usize,
+    pub pending_has_urgent: bool,
+    pub quota_alert: bool,
+    pub p0_alert: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RunItem {
     pub run: String,
@@ -611,6 +701,7 @@ pub struct RunItem {
     pub tokens_cache_read: Option<u64>,
     pub work_id: Option<String>,
     pub eta: Option<RunEtaInfo>,
+    pub card_l0: Option<CardL0Info>,
 }
 
 impl RunItem {
@@ -669,9 +760,40 @@ impl RunItem {
         self.group == GroupKind::Pending && self.last_activity_seconds() > STALE_PENDING_SECS
     }
 
+    pub fn is_urgent_pending(&self) -> bool {
+        if self.group != GroupKind::Pending {
+            return false;
+        }
+        let pm_bad = self
+            .premerge
+            .as_ref()
+            .is_some_and(|p| matches!(p.status.as_str(), "conflict" | "failed"));
+        let state_bad = matches!(
+            self.state.as_str(),
+            "failed" | "crashed" | "timeout" | "stalled" | "malformed" | "rejected"
+        ) && self.result_read_at.is_none();
+        let needs_ctrl = !self.applied
+            && self.review.as_ref().is_some_and(|r| {
+                r.verdict.as_deref() == Some("NEEDS_CONTROLLER") || r.needs_attention
+            });
+        if pm_bad
+            || self.has_protect_violation()
+            || !self.conflict_markers.is_empty()
+            || state_bad
+            || needs_ctrl
+        {
+            return true;
+        }
+        let age = self.last_activity_seconds();
+        if age != u64::MAX {
+            return (self.question && age >= 600) || (!self.question && age >= 1800);
+        }
+        false
+    }
+
     pub fn state_badge(&self) -> Cow<'static, str> {
         if self.question && !self.applied {
-            return Cow::Borrowed("提问");
+            return Cow::Borrowed("等决定");
         }
         if matches!(self.state.as_str(), "running" | "starting") {
             if let Some(rev) = &self.review {
@@ -680,49 +802,59 @@ impl RunItem {
                 }
                 if rev.status == "reworking" {
                     let r = rev.rework_rounds.max(rev.round).max(1);
-                    return Cow::Owned(format!("返工第 {r} 轮"));
+                    return Cow::Owned(format!("返工{r}轮"));
                 }
             }
             if self.stall_warning.is_some() {
-                return Cow::Borrowed("卡警");
+                return Cow::Borrowed("卡住警");
             }
             if let Some(act) = &self.activity {
                 return Cow::Borrowed(match act.kind.as_str() {
                     "running_command" => "跑命令",
-                    "thinking" => "思考",
-                    "waiting" => "等待",
-                    "quota" => "配额",
-                    "error" => "报错",
-                    _ => "运行",
+                    "accepting" | "running_accept" => "跑验收",
+                    "thinking" => "思考中",
+                    "waiting" => "排队中",
+                    "quota" => "限流中",
+                    "error" => "报错中",
+                    _ => "运行中",
                 });
             }
         }
         if !self.applied {
+            if let Some(pm) = &self.premerge {
+                if pm.status == "conflict" {
+                    return Cow::Borrowed("预冲突");
+                }
+                if pm.status == "failed" {
+                    return Cow::Borrowed("预失败");
+                }
+            }
             if let Some(rev) = &self.review {
                 if rev.verdict.as_deref() == Some("NEEDS_CONTROLLER") {
-                    return Cow::Borrowed("主审");
+                    return Cow::Borrowed("需主审");
                 }
             }
         }
         Cow::Borrowed(match self.state.as_str() {
-            "running" => "运行",
-            "starting" => "启动",
-            "waiting" | "queued" => "排队",
-            "delivered" if self.applied => "已合",
-            "delivered" => "待合",
-            "answered" if self.applied => "已合",
-            "answered" if self.pending_files > 0 => "待合",
-            "answered" => "已答",
-            "blocked_mainline" => "主阻",
-            "rejected" => "没过",
+            "running" => "运行中",
+            "starting" => "启动中",
+            "waiting" | "queued" => "排队中",
+            "delivered" if self.applied => "已合入",
+            "delivered" => "待合入",
+            "answered" if self.applied => "已合入",
+            "answered" if self.pending_files > 0 => "待合入",
+            "answered" if self.group == GroupKind::Collected => "已收取",
+            "answered" => "已答复",
+            "blocked_mainline" => "主干阻",
+            "rejected" => "未通过",
             "failed" => "失败",
             "timeout" => "超时",
             "stalled" => "卡住",
             "malformed" => "异常",
             "crashed" => "崩溃",
             "killed" => "强停",
-            "stopped" => "已停",
-            "needs-redispatch" => "重派",
+            "stopped" => "已停止",
+            "needs-redispatch" => "待重派",
             "cleaned" => "待办",
             _ => "未知",
         })
@@ -783,11 +915,20 @@ impl RunItem {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RepoGroup {
     pub path: PathBuf,
+    pub runs_dir: PathBuf,
     pub label: String,
     pub runs: Vec<RunItem>,
 }
 
 impl RepoGroup {
+    pub fn effective_runs_dir(&self) -> PathBuf {
+        if !self.runs_dir.as_os_str().is_empty() {
+            self.runs_dir.clone()
+        } else {
+            self.path.join(".local/run/delegate")
+        }
+    }
+
     pub fn count_group(&self, group: GroupKind) -> usize {
         self.runs.iter().filter(|r| r.group == group).count()
     }
@@ -1005,6 +1146,7 @@ pub enum WorkBucket {
     InProgress,
     Ready,
     Waiting,
+    TimedWait,
     Deferred,
     Done,
     Dropped,
@@ -1017,7 +1159,8 @@ impl WorkBucket {
             Self::NeedsAction => "需处理",
             Self::InProgress => "推进中",
             Self::Ready => "就绪",
-            Self::Waiting => "等待",
+            Self::Waiting => "依赖等待",
+            Self::TimedWait => "定时等待",
             Self::Deferred => "暂缓",
             Self::Done => "已完成",
             Self::Dropped => "已否",
@@ -1065,6 +1208,24 @@ pub struct WorkItem {
 }
 
 impl WorkItem {
+    /// True when this `blocked` item is waiting exclusively on `after_time:...` conditions.
+    pub fn is_pure_timed_wait(&self) -> bool {
+        if self.state != "blocked" {
+            return false;
+        }
+        let unsat: Vec<&str> = self
+            .wait_on_status
+            .iter()
+            .filter(|w| !w.satisfied)
+            .map(|w| w.condition.as_str())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if !unsat.is_empty() {
+            return unsat.iter().all(|c| c.starts_with("after_time:"));
+        }
+        !self.wait_on.is_empty() && self.wait_on.iter().all(|c| c.starts_with("after_time:"))
+    }
+
     pub fn bucket(&self) -> WorkBucket {
         if self.state == "done" {
             if self.closed_kind == "dropped" {
@@ -1079,6 +1240,7 @@ impl WorkItem {
             "attention" | "verify" => WorkBucket::NeedsAction,
             "active" => WorkBucket::InProgress,
             "ready" => WorkBucket::Ready,
+            "blocked" if self.is_pure_timed_wait() => WorkBucket::TimedWait,
             "blocked" => WorkBucket::Waiting,
             "deferred" => WorkBucket::Deferred,
             _ => WorkBucket::Ready,
@@ -1101,6 +1263,7 @@ impl WorkItem {
             "verify" => "待闭环",
             "active" => "推进中",
             "ready" => "就绪",
+            "blocked" if self.is_pure_timed_wait() => "定时",
             "blocked" => "等待",
             "deferred" => "暂缓",
             _ => "工作",
@@ -1195,11 +1358,18 @@ pub struct WorkCounts {
     pub ready: usize,
     pub in_progress: usize,
     pub waiting: usize,
+    pub timed: usize,
     pub deferred: usize,
     pub stale: usize,
     pub done_today: usize,
     pub done_total: usize,
     pub dropped_total: usize,
+}
+
+impl WorkCounts {
+    pub fn active_pool(&self) -> usize {
+        self.owner + self.needs_action + self.in_progress + self.ready + self.waiting
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1417,6 +1587,9 @@ pub struct AnalyticsSnapshot {
     pub by_purpose: PurposeBreakdown,
     pub by_model: Vec<ModelTokens>,
     pub daily_7d: Vec<DailyTrendPoint>,
+    pub token_input_7d: u64,
+    pub token_output_7d: u64,
+    pub token_cache_read_7d: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1425,11 +1598,17 @@ pub struct AppSnapshot {
     pub work: Vec<WorkItem>,
     pub lane: LaneStatus,
     pub events: Vec<EventItem>,
+    pub events_has_more: bool,
+    pub events_earliest_seq: Option<u64>,
     pub dag_queue: Vec<DagQueueItem>,
     pub merges: Vec<MergeRunItem>,
     pub candidates: Vec<RadarCandidateItem>,
     pub agy_accounts: AgyAccountsState,
     pub analytics: AnalyticsSnapshot,
+    pub recent_deliveries: Vec<RecentDeliveryItem>,
+    pub pulse: Option<SnapshotPulse>,
+    pub alerts: Vec<ActiveAlertItem>,
+    pub alerts_from_snapshot: bool,
     pub eta: SnapshotEta,
     pub host_load: Option<HostLoad>,
     pub generated_epoch: Option<i64>,
@@ -1449,11 +1628,16 @@ impl AppSnapshot {
         }
         self.lane.hash(&mut h);
         self.events.hash(&mut h);
+        self.events_has_more.hash(&mut h);
+        self.events_earliest_seq.hash(&mut h);
         self.dag_queue.hash(&mut h);
         self.merges.hash(&mut h);
         self.candidates.hash(&mut h);
         self.agy_accounts.hash(&mut h);
         self.analytics.hash(&mut h);
+        self.recent_deliveries.hash(&mut h);
+        self.pulse.hash(&mut h);
+        self.alerts.hash(&mut h);
         self.eta.hash(&mut h);
         self.host_load.hash(&mut h);
         self.warnings.hash(&mut h);
@@ -1526,6 +1710,7 @@ impl AppSnapshot {
                 WorkBucket::InProgress => c.in_progress += 1,
                 WorkBucket::Ready => c.ready += 1,
                 WorkBucket::Waiting => c.waiting += 1,
+                WorkBucket::TimedWait => c.timed += 1,
                 WorkBucket::Deferred => c.deferred += 1,
                 WorkBucket::Done => {
                     c.done_total += 1;
@@ -1537,6 +1722,454 @@ impl AppSnapshot {
             }
         }
         c
+    }
+
+    /// Single-source-of-truth pulse counters: reads `snapshot["pulse"]` emitted by `crates/delegate`
+    /// when present, and falls back to the exact same definitions for synthetic in-memory fixtures
+    /// or older `delegate` binaries.
+    pub fn effective_pulse(&self) -> SnapshotPulse {
+        if let Some(p) = &self.pulse {
+            return p.clone();
+        }
+        let wc = self.work_counts();
+        let open_work_ids: std::collections::HashSet<&str> = self
+            .work
+            .iter()
+            .filter(|w| !w.ephemeral && w.state != "done")
+            .map(|w| w.id.as_str())
+            .collect();
+        let open_work_runs: std::collections::HashSet<&str> = self
+            .work
+            .iter()
+            .filter(|w| !w.ephemeral && w.state != "done")
+            .flat_map(|w| w.runs.iter().map(String::as_str))
+            .collect();
+
+        let mut controller_pending = 0usize;
+        let mut stale_pending = 0usize;
+        let mut running_runs = 0usize;
+        let mut queued_runs = 0usize;
+        let mut pending_has_urgent = false;
+
+        for repo in &self.repos {
+            for r in &repo.runs {
+                match r.group {
+                    GroupKind::Running => running_runs += 1,
+                    GroupKind::Queued => queued_runs += 1,
+                    GroupKind::Pending => {
+                        let attached = open_work_runs.contains(r.run.as_str())
+                            || r.work_id
+                                .as_deref()
+                                .is_some_and(|wid| open_work_ids.contains(wid));
+                        if r.is_stale_pending() && !attached {
+                            stale_pending += 1;
+                        } else {
+                            controller_pending += 1;
+                            if r.is_urgent_pending() {
+                                pending_has_urgent = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let merged_today = if !self.today_ymd.is_empty() {
+            let from_daily = self
+                .analytics
+                .daily_7d
+                .iter()
+                .find(|d| d.ymd == self.today_ymd)
+                .map(|d| d.merged_count as usize);
+            from_daily.unwrap_or_else(|| {
+                self.recent_deliveries
+                    .iter()
+                    .filter(|d| {
+                        iso_to_local_ymd(&d.applied_at)
+                            .is_some_and(|ymd| ymd == self.today_ymd)
+                    })
+                    .count()
+            })
+        } else {
+            0
+        };
+
+        let alerts = self.effective_alerts();
+        let p0_alert = alerts.iter().any(|a| a.level == AlertLevel::P0);
+        let quota_alert = self.compute_fallback_quota_alert();
+
+        SnapshotPulse {
+            owner_open: wc.owner,
+            controller_pending,
+            stale_pending,
+            running_runs,
+            queued_runs,
+            work_active_pool: wc.active_pool(),
+            work_deferred: wc.deferred,
+            work_timed: wc.timed,
+            merged_today,
+            pending_has_urgent,
+            quota_alert,
+            p0_alert,
+        }
+    }
+
+    fn compute_fallback_quota_alert(&self) -> bool {
+        if self.agy_accounts.live_drifted {
+            return true;
+        }
+        for acct in &self.agy_accounts.accounts {
+            if let Some(q) = &acct.quota {
+                if q.identity_mismatch {
+                    return true;
+                }
+                if q.ok {
+                    if q.entries.iter().any(|e| e.remaining_pct_x100 < 1500) {
+                        return true;
+                    }
+                    if let Some(est) = &acct.quota_estimate {
+                        let check = |win_key: &str, w: &QuotaWindowEstimate| -> bool {
+                            let Some(mins) = w.estimated_remaining_minutes else {
+                                return false;
+                            };
+                            q.entries.iter().any(|e| {
+                                e.window == win_key
+                                    && w.pool
+                                        .as_deref()
+                                        .is_none_or(|p| p.is_empty() || e.pool == p)
+                                    && e.reset_in_seconds
+                                        .is_some_and(|rs| rs > 0 && mins.saturating_mul(60) < rs)
+                            })
+                        };
+                        if est.weekly.as_ref().is_some_and(|w| check("weekly", w))
+                            || est.five_hour.as_ref().is_some_and(|w| check("fiveHour", w))
+                            || est.pools.iter().any(|p| {
+                                p.weekly.as_ref().is_some_and(|w| check("weekly", w))
+                                    || p.five_hour.as_ref().is_some_and(|w| check("fiveHour", w))
+                            })
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Active P0/P1 alerts: reads `snapshot["alerts"]` from `crates/delegate/src/pulse.rs` when
+    /// emitted, or mirrors the exact same P0/P1 rules for synthetic test fixtures.
+    pub fn effective_alerts(&self) -> Vec<ActiveAlertItem> {
+        if self.alerts_from_snapshot {
+            return self.alerts.clone();
+        }
+        let mut p0: Vec<ActiveAlertItem> = Vec::new();
+        let mut p1: Vec<ActiveAlertItem> = Vec::new();
+        let now = self.generated_epoch.unwrap_or_else(current_utc_epoch);
+
+        let open_work_ids: std::collections::HashSet<&str> = self
+            .work
+            .iter()
+            .filter(|w| !w.ephemeral && w.state != "done")
+            .map(|w| w.id.as_str())
+            .collect();
+        let open_work_runs: std::collections::HashSet<&str> = self
+            .work
+            .iter()
+            .filter(|w| !w.ephemeral && w.state != "done")
+            .flat_map(|w| w.runs.iter().map(String::as_str))
+            .collect();
+
+        // P0: unhandled chain-head failure / violation / premerge conflict.
+        let mut stalled: Vec<(&RunItem, u64)> = Vec::new();
+        for repo in &self.repos {
+            for r in &repo.runs {
+                if r.group != GroupKind::Pending {
+                    continue;
+                }
+                let attached = open_work_runs.contains(r.run.as_str())
+                    || r.work_id
+                        .as_deref()
+                        .is_some_and(|wid| open_work_ids.contains(wid));
+                if r.is_stale_pending() && !attached {
+                    continue;
+                }
+                let pm_bad = r
+                    .premerge
+                    .as_ref()
+                    .is_some_and(|p| matches!(p.status.as_str(), "conflict" | "failed"));
+                let state_bad = matches!(
+                    r.state.as_str(),
+                    "failed" | "crashed" | "timeout" | "stalled" | "malformed" | "rejected"
+                ) && r.result_read_at.is_none();
+                if pm_bad || r.has_protect_violation() || !r.conflict_markers.is_empty() || state_bad
+                {
+                    let reason = if let Some(pm) = &r.premerge {
+                        if pm.status == "conflict" {
+                            pm.full_label()
+                        } else if pm.status == "failed" {
+                            "预合并失败".to_string()
+                        } else {
+                            r.state_badge().into_owned()
+                        }
+                    } else if r.has_protect_violation() {
+                        "受控路径违规".to_string()
+                    } else {
+                        r.state_badge().into_owned()
+                    };
+                    p0.push(ActiveAlertItem {
+                        level: AlertLevel::P0,
+                        kind: if pm_bad {
+                            "premerge_conflict".to_string()
+                        } else {
+                            "run_failure".to_string()
+                        },
+                        label: "失败/冲突".to_string(),
+                        message: format!("{} {reason} → 按 3 查审查卡处理", r.display_name),
+                        target_tab: 3,
+                        target_id: Some(r.run.clone()),
+                    });
+                } else {
+                    let age = r.last_activity_seconds();
+                    if age != u64::MAX
+                        && ((r.question && age >= 600) || (!r.question && age >= 1800))
+                    {
+                        stalled.push((r, age));
+                    }
+                }
+            }
+        }
+
+        // P0: active agy account drift, depletion before reset, or <15% (advisory only).
+        if let Some(active) = self.agy_accounts.accounts.iter().find(|a| a.active) {
+            let short = mask_account_name(&active.id);
+            if self.agy_accounts.live_drifted {
+                p0.push(ActiveAlertItem {
+                    level: AlertLevel::P0,
+                    kind: "quota_drift".to_string(),
+                    label: "额度·登录态漂移".to_string(),
+                    message: format!("★{short} 当前本机登录态与记录不一致 → 按 4 核对"),
+                    target_tab: 4,
+                    target_id: Some(active.id.clone()),
+                });
+            } else if active.quota.as_ref().is_some_and(|q| q.identity_mismatch) {
+                p0.push(ActiveAlertItem {
+                    level: AlertLevel::P0,
+                    kind: "quota_drift".to_string(),
+                    label: "额度·身份不匹配".to_string(),
+                    message: format!("★{short} 额度缓存账号身份不匹配 → 按 4 核对"),
+                    target_tab: 4,
+                    target_id: Some(active.id.clone()),
+                });
+            }
+            if let Some(q) = &active.quota {
+                if q.ok && !q.identity_mismatch {
+                    let mut alerted_pools: std::collections::HashSet<(String, String)> =
+                        std::collections::HashSet::new();
+                    if let Some(est) = &active.quota_estimate {
+                        let mut check_win = |win_key: &str, w: &QuotaWindowEstimate| {
+                            let Some(mins) = w.estimated_remaining_minutes else {
+                                return;
+                            };
+                            if let Some(entry) = q.entries.iter().find(|e| {
+                                e.window == win_key
+                                    && w.pool
+                                        .as_deref()
+                                        .is_none_or(|p| p.is_empty() || e.pool == p)
+                                    && e.reset_in_seconds
+                                        .is_some_and(|rs| rs > 0 && mins.saturating_mul(60) < rs)
+                            }) {
+                                let pkey = (entry.pool.clone(), win_key.to_string());
+                                if !alerted_pools.insert(pkey) {
+                                    return;
+                                }
+                                let win_zh = if win_key == "fiveHour" { "5h" } else { "本周" };
+                                let pct = (entry.remaining_pct_x100 + 50) / 100;
+                                let rem = format_duration(Some(mins.saturating_mul(60)));
+                                p0.push(ActiveAlertItem {
+                                    level: AlertLevel::P0,
+                                    kind: "quota_depletion".to_string(),
+                                    label: "额度·需手动切号".to_string(),
+                                    message: format!(
+                                        "★{short} {}{win_zh}剩{pct}%，预计约 {rem} 用完 → 按 4 切号",
+                                        entry.pool
+                                    ),
+                                    target_tab: 4,
+                                    target_id: Some(active.id.clone()),
+                                });
+                            }
+                        };
+                        for pe in &est.pools {
+                            if let Some(w) = &pe.weekly {
+                                check_win("weekly", w);
+                            }
+                            if let Some(w) = &pe.five_hour {
+                                check_win("fiveHour", w);
+                            }
+                        }
+                        if let Some(w) = &est.weekly {
+                            check_win("weekly", w);
+                        }
+                        if let Some(w) = &est.five_hour {
+                            check_win("fiveHour", w);
+                        }
+                    }
+                    for entry in &q.entries {
+                        if entry.remaining_pct_x100 < 1500 {
+                            let pkey = (entry.pool.clone(), entry.window.clone());
+                            if alerted_pools.insert(pkey) {
+                                let win_zh = if entry.window == "fiveHour" {
+                                    "5h"
+                                } else {
+                                    "本周"
+                                };
+                                let pct = (entry.remaining_pct_x100 + 50) / 100;
+                                p0.push(ActiveAlertItem {
+                                    level: AlertLevel::P0,
+                                    kind: "quota_low".to_string(),
+                                    label: "额度偏低·需手动切号".to_string(),
+                                    message: format!(
+                                        "★{short} {}{win_zh}仅剩{pct}% → 按 4 切号",
+                                        entry.pool
+                                    ),
+                                    target_tab: 4,
+                                    target_id: Some(active.id.clone()),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // P1: owner open blocking downstream or > 2h.
+        let mut owner_downstream: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for w in &self.work {
+            if w.ephemeral || w.state == "done" {
+                continue;
+            }
+            for c in &w.wait_on {
+                if let Some(t) = c
+                    .strip_prefix("owner:")
+                    .or_else(|| c.strip_prefix("work:"))
+                    .or_else(|| c.strip_prefix("work_done:"))
+                {
+                    *owner_downstream.entry(t).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut urgent_owners: Vec<(usize, i64, &WorkItem)> = Vec::new();
+        for w in &self.work {
+            if w.ephemeral || w.state == "done" || w.owner.is_none() {
+                continue;
+            }
+            let ds = owner_downstream.get(w.id.as_str()).copied().unwrap_or(0);
+            let since_raw = if !w.state_since.is_empty() {
+                w.state_since.as_str()
+            } else {
+                w.created_at.as_str()
+            };
+            let waited = parse_iso_utc_epoch(since_raw)
+                .map(|ep| (now - ep).max(0))
+                .unwrap_or(0);
+            if ds > 0 || waited > 7200 {
+                urgent_owners.push((ds, waited, w));
+            }
+        }
+        urgent_owners.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        if let Some((ds, waited, top)) = urgent_owners.first() {
+            let detail = if *ds > 0 {
+                format!("阻下游 {ds}")
+            } else {
+                format!("已等 {}", format_duration(Some(*waited as u64)))
+            };
+            p1.push(ActiveAlertItem {
+                level: AlertLevel::P1,
+                kind: "owner_blocked".to_string(),
+                label: "等你拍板".to_string(),
+                message: format!("[{}] {}（{detail}）→ 按 2 处理", top.id, top.display_title()),
+                target_tab: 2,
+                target_id: Some(top.id.clone()),
+            });
+        }
+
+        // P1: controller stalled runs.
+        stalled.sort_by(|a, b| b.0.question.cmp(&a.0.question).then_with(|| b.1.cmp(&a.1)));
+        if let Some((top, age)) = stalled.first() {
+            let dur = format_duration(Some(*age));
+            let extra = if stalled.len() > 1 {
+                format!(" 等{}单", stalled.len())
+            } else {
+                String::new()
+            };
+            let note = if top.question {
+                "提问等决定"
+            } else if top
+                .premerge
+                .as_ref()
+                .is_some_and(|p| p.status == "ready")
+            {
+                "已PASS且快进✓待合入"
+            } else {
+                "待主控处理"
+            };
+            p1.push(ActiveAlertItem {
+                level: AlertLevel::P1,
+                kind: "controller_stalled".to_string(),
+                label: format!("卡主控 {dur}"),
+                message: format!("{}{extra} {note} → 按 3", top.display_name),
+                target_tab: 3,
+                target_id: Some(top.run.clone()),
+            });
+        }
+
+        p0.extend(p1);
+        p0
+    }
+
+    /// Recent deliveries from `snapshot["recentDeliveries"]`, falling back to applied runs in `repos`
+    /// when reading older snapshot versions.
+    pub fn effective_recent_deliveries(&self) -> Vec<RecentDeliveryItem> {
+        if !self.recent_deliveries.is_empty() {
+            return self.recent_deliveries.clone();
+        }
+        let mut out = Vec::new();
+        for repo in &self.repos {
+            let short_repo = repo
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&repo.label)
+                .to_string();
+            for r in &repo.runs {
+                if r.applied {
+                    let (f, add, del) = r.display_changes();
+                    let applied_at = r.finished_at.clone().unwrap_or_default();
+                    let applied_epoch = parse_iso_utc_epoch(&applied_at).unwrap_or(0);
+                    out.push(RecentDeliveryItem {
+                        run: r.run.clone(),
+                        name: r.display_name.clone(),
+                        repo: short_repo.clone(),
+                        source_root: repo.path.to_string_lossy().into_owned(),
+                        applied_at,
+                        applied_epoch,
+                        applied_head: String::new(),
+                        changes_files: f as usize,
+                        added: add as i64,
+                        deleted: del as i64,
+                        elapsed_seconds: r.elapsed_seconds.unwrap_or(0) as i64,
+                        rounds: r.chain_round.max(1),
+                        conclusion: String::new(),
+                        work_id: r.work_id.clone(),
+                        cleaned: false,
+                    });
+                }
+            }
+        }
+        out.sort_by_key(|b| std::cmp::Reverse(b.applied_epoch));
+        out
     }
 
     pub fn find_run_by_id(&self, run_id: &str) -> Option<(usize, usize, &RunItem)> {

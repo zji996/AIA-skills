@@ -619,7 +619,7 @@ fn main() {
         // Trigger real quota refresh (`agy -p /usage`) when on Overview or Accounts tab:
         // on first entry, reuse cached quota if it was updated within `quota_refresh_every`;
         // otherwise refresh immediately, and then every 10 minutes while TUI is open.
-        let on_quota_tab = matches!(app.tab, ViewTab::Overview | ViewTab::Accounts);
+        let on_quota_tab = matches!(app.tab, ViewTab::Overview | ViewTab::Quota);
         if on_quota_tab && !quota_in_flight {
             let due = match last_quota_refresh {
                 None => {
