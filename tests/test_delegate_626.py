@@ -10,7 +10,6 @@ import json
 import shlex
 import subprocess
 import threading
-import time
 import unittest
 from pathlib import Path
 
@@ -259,13 +258,10 @@ class Delegate626Tests(unittest.TestCase):
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
         self.until(gen_started.exists, "apply generator started")
 
-        # While apply is blocked inside generated.command, `start` must complete promptly.
+        # While apply is blocked inside generated.command, `start` must complete without waiting.
         self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED])
-        t0 = time.monotonic()
         started = self.cli("start", "--worktree", "--workdir", repo, "--name", "fast-start", "task", timeout=10)
-        elapsed = time.monotonic() - t0
         self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
-        self.assertLess(elapsed, 5.0, f"start waited too long during apply regeneration: {elapsed:.2f}s")
         # Generator is still running while start already succeeded.
         self.assertIsNone(proc.poll(), "apply generator should still be waiting on gate")
 

@@ -159,21 +159,75 @@ class DelegateApplyRegenTests(unittest.TestCase):
             stderr=subprocess.PIPE,
             text=True,
         )
-        self.addCleanup(lambda: (release_lock(), proc.wait(timeout=10) if proc.poll() is None else None))
+        def cleanup_proc():
+            release_lock()
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None and not stream.closed:
+                    stream.close()
 
-        # Hold the target lock for 0.4s: apply must queue/wait instead of switching to a cold dir.
-        time.sleep(0.4)  # sleep-ok: hold target/.cargo-lock to assert apply waits instead of isolating
+        self.addCleanup(cleanup_proc)
+
+        stdout_chunks: list[str] = []
+        stderr_lines: list[str] = []
+        wait_started = threading.Event()
+        wait_released = threading.Event()
+
+        def read_stdout():
+            assert proc.stdout is not None
+            stdout_chunks.append(proc.stdout.read())
+
+        def read_stderr():
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                stderr_lines.append(line)
+                if "排队等待主仓 target 释放" in line:
+                    wait_started.set()
+                if "已释放（排队等待" in line:
+                    wait_released.set()
+
+        stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+        stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+
+        # Wait for the wait-start progress event rather than sleeping a fixed wall-clock window.
+        self.assertTrue(
+            wait_started.wait(timeout=15),
+            f"apply did not enter main-target wait while lock was held; stderr={''.join(list(stderr_lines))!r}",
+        )
         self.assertIsNone(proc.poll(), "apply must wait while main repo target/.cargo-lock is held")
+        self.assertFalse(target_log.exists(), "regeneration must not start while target/.cargo-lock is held")
+        stderr_snapshot = list(stderr_lines)
+        self.assertFalse(
+            wait_released.is_set() or any("已释放（排队等待" in ln for ln in stderr_snapshot),
+            f"apply reported target released before lock was unlocked: {''.join(stderr_snapshot)!r}",
+        )
         release_lock()
 
-        out, err = proc.communicate(timeout=15)
+        proc.wait(timeout=15)
+        stdout_thread.join(timeout=5)
+        stderr_thread.join(timeout=5)
+        out = "".join(stdout_chunks)
+        err = "".join(stderr_lines)
         self.assertEqual(proc.returncode, 0, out + err)
         doc = json.loads(out.strip().splitlines()[-1])
         self.assertTrue(doc["apply"]["ok"], doc)
         timing = doc.get("applyTiming") or {}
         self.assertTrue(timing.get("targetContended"), doc)
-        self.assertGreaterEqual(timing.get("targetWaitMs", 0), 200, doc)
+        self.assertIsInstance(timing.get("targetWaitMs"), int, doc)
+        self.assertGreaterEqual(timing["targetWaitMs"], 0, doc)
         self.assertFalse(timing.get("regenerateTargetIsolated", False), doc)
+        wait_start_pos = err.find("排队等待主仓 target 释放")
+        wait_end_pos = err.find("主仓 target/ 已释放（排队等待")
+        self.assertGreaterEqual(wait_start_pos, 0, err)
+        self.assertGreater(wait_end_pos, wait_start_pos, err)
         lines = [ln.strip() for ln in target_log.read_text().splitlines() if ln.strip()]
         self.assertEqual(lines, ["MAIN"], f"expected main target dir, got: {lines}")
 

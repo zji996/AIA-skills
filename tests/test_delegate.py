@@ -1137,10 +1137,19 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
 
     def test_acceptance_queues_in_the_lane_and_its_leftovers_are_killed(self):
         self.fake_pi([answer("done"), SETTLED])
-        self.hold_lane(2)
+        holder, lane_gate = self.hold_lane_gated()
         # The accept timeout starts once the lane lets it run, so queueing longer than it is fine.
-        state = self.outcome(self.cli("run", "--accept", "sleep 30 & echo $! > bg.pid; true", "--accept-timeout", "1",
-                                      "task"))
+        started = self.outcome(self.cli("start", "--accept", "sleep 30 & echo $! > bg.pid; true",
+                                        "--accept-timeout", "1", "task"))
+        self.until(
+            lambda: f"accept {started['run']}" in self.cli("lane").stdout and "queued" in self.cli("lane").stdout,
+            "acceptance queued behind lane holder",
+        )
+        release_at = time.monotonic() + 1.2
+        self.until(lambda: time.monotonic() >= release_at, "queue wait exceeds accept timeout")
+        lane_gate.touch()
+        holder.wait(timeout=10)
+        state = self.outcome(self.cli("wait", started["run"]))
         self.assertEqual(state["state"], "delivered")
         self.assertGreaterEqual(state["accept"]["queuedSeconds"], 1)
         self.assertGreaterEqual(state["cleanup"]["terminated"], 1)
@@ -2383,16 +2392,27 @@ db.write_text(json.dumps(units))
 
     def test_wait_completion_timing_and_legacy_finished_at(self):
         self.fake_pi([answer("ok"), SETTLED])
+        cursor = 0
         for name in ("old-a", "old-b"):
             started = self.outcome(self.cli("start", "--read-only", "--name", name, "task"))
-            self.until(lambda: (Path(started["dir"]) / "exit_code").exists(), name)
+            while True:
+                ev_res = self.cli("wait", "--since", str(cursor), started["run"])
+                self.assertEqual(ev_res.returncode, 0, ev_res.stdout + ev_res.stderr)
+                objs = [json.loads(line) for line in ev_res.stdout.splitlines() if line.strip()]
+                cursor = objs[-1]["cursor"]
+                if any(o.get("kind") == "delivered" and o.get("run") == started["run"] for o in objs[:-1]):
+                    break
+                if objs[-1]["count"] == 0:
+                    self.assertTrue((Path(started["dir"]) / "exit_code").exists(), f"{name} stopped without exit_code: {ev_res.stdout}")
+                    break
         old_run = Path(started["dir"])
         summary = json.loads((old_run / "summary.json").read_text())
         self.assertRegex(summary.pop("finishedAt"), r"^\d{4}-\d{2}-\d{2}T")
         (old_run / "summary.json").write_text(json.dumps(summary))
         gate = self.work / "release"
+        self.addCleanup(gate.touch)
         self.fake_pi([answer("new"), SETTLED], pre=f"while [ ! -f {gate} ]; do sleep .05; done")
-        self.cli("start", "--read-only", "--name", "new", "task")
+        new_run = self.outcome(self.cli("start", "--read-only", "--name", "new", "task"))
         old = self.cli("wait", "--any")
         lines = [json.loads(line) for line in old.stdout.splitlines() if line.startswith('{"run"')]
         self.assertEqual([line["name"] for line in lines], ["old-a", "old-b"])
@@ -2402,7 +2422,12 @@ db.write_text(json.dumps(units))
         waiter = subprocess.Popen([str(DELEGATE), "wait", "--json", "--any"], env=self.env,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(waiter.kill)
-        threading.Timer(.5, gate.touch).start()
+        self.wait_text(
+            Path(new_run["dir"]) / "waiter.lock",
+            lambda t: t.strip() == str(waiter.pid),
+            "waiter claimed new run",
+        )
+        gate.touch()
         out, err = waiter.communicate(timeout=10)
         self.assertEqual(waiter.returncode, 0, err)
         self.assertEqual(json.loads(out.splitlines()[0])["completionTiming"], "finished-during-wait")
@@ -3229,10 +3254,10 @@ db.write_text(json.dumps(units))
         self.assertFalse((run / ".applied").exists())
         self.assertFalse((run / ".sync-base").exists())
         self.assertEqual((repo / "src.txt").read_text(), "new\n")
-        started = time.monotonic()
-        lane = self.cli("lane", "true", timeout=5)
+        ticket_lines = [ln for ln in self.cli("lane").stdout.splitlines() if ln.startswith(("running", "queued"))]
+        self.assertEqual(ticket_lines, [], "timed-out generation must release lane immediately")
+        lane = self.cli("lane", "true", timeout=10)
         self.assertEqual(lane.returncode, 0, lane.stderr)
-        self.assertLess(time.monotonic() - started, 3)
         self.assertTrue((run / ".generate-pending").exists())
         pending = self.outcome(self.cli("status", state["run"]))
         self.assertNotIn("applied", pending)

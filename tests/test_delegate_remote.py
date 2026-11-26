@@ -368,6 +368,19 @@ print("local:" + " ".join(sys.argv[1:]))
         second = subprocess.Popen([str(fixtures.DELEGATE), "_remote", str(run), "cargo", "check"],
                                   cwd=state["worktree"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(lambda: second.poll() is None and second.terminate())
+        events_path = Path(self.env["XDG_STATE_HOME"]) / "delegate/events.jsonl"
+
+        def read_events():
+            if not events_path.is_file():
+                return []
+            return [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+
+        def has_remote_queued_event():
+            return any(
+                e.get("kind") == "queued" and e.get("payload", {}).get("remote") is True
+                for e in read_events()
+            )
+
         status = fixtures.wait_until(
             lambda: st if (st := self.outcome(self.cli("status", state["run"]))).get("remoteLane", {}).get("queued") == 1 else False,
             "second remote command queued",
@@ -375,16 +388,28 @@ print("local:" + " ".join(sys.argv[1:]))
             interval=0.02,
         )
         self.assertEqual(status["remoteLane"]["queued"], 1)
+        fixtures.wait_until(has_remote_queued_event, "remote queued event recorded", timeout=10, interval=0.02)
         listing = self.cli("lane", cwd=state["worktree"]).stdout
         self.assertIn("remote running", listing)
         self.assertIn("remote queued", listing)
-        time.sleep(.2)  # sleep-ok: accumulate >0.1s queued wait duration in lane-wait
+        self.assertTrue(list(run.glob("lane-waiting-*")), "queued remote command must hold lane-waiting marker")
         first.terminate()
         first.communicate(timeout=10)
         stdout, stderr = second.communicate(timeout=10)
         self.assertEqual(second.returncode, 0, stdout + stderr)
         self.assertIn(b"queued behind", stderr)
-        self.assertGreater(sum(float(s) for s in (run / "lane-wait").read_text().split()), .1)
+        self.assertFalse(list(run.glob("lane-waiting-*")), "lane-waiting marker must be cleared after acquiring slot")
+        waits = [float(s) for s in (run / "lane-wait").read_text().split()]
+        self.assertGreaterEqual(len(waits), 1)
+        self.assertGreaterEqual(sum(waits), 0.0)
+        evs = read_events()
+        remote_lane_kinds = [
+            e["kind"] for e in evs
+            if e["kind"] in ("queued", "lane_acquired") and e.get("payload", {}).get("remote") is True
+        ]
+        self.assertIn("queued", remote_lane_kinds, evs)
+        queued_idx = remote_lane_kinds.index("queued")
+        self.assertIn("lane_acquired", remote_lane_kinds[queued_idx + 1:], evs)
         local.terminate()
         local.communicate(timeout=10)
 

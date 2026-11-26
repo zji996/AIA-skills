@@ -22,7 +22,6 @@ import shlex
 import signal
 import subprocess
 import sys
-import time
 import unittest
 from pathlib import Path
 
@@ -472,25 +471,28 @@ class Delegate639Tests(unittest.TestCase):
         r_live = self.outcome(self.cli("start", "--read-only", "--workdir", repo, "--name", "other-live", "hold"))
         self.addCleanup(lambda: (gate.touch(), self.cli("stop", r_live["run"], cwd=repo)))
 
-        # 1) Nonexistent run with similar slug -> immediate non-zero error with suggestion!
-        t0 = time.perf_counter()
-        bad = self.cli("wait", "--since", "0", "20261124-025333-room-v1", cwd=repo, human=True)
+        # 1) Nonexistent run with similar slug -> non-zero error with suggestion while other-live is still running!
+        bad = self.cli("wait", "--since", "0", "20261124-025333-room-v1", cwd=repo, human=True, timeout=10)
         self.assertNotEqual(bad.returncode, 0, bad.stdout + bad.stderr)
-        self.assertLess(time.perf_counter() - t0, 3.0)
         self.assertIn("相近 run：", bad.stderr)
         self.assertIn(r_room["run"], bad.stderr)
+        self.assertEqual(self.outcome(self.cli("status", r_live["run"], cwd=repo))["state"], "running")
 
-        # 2) Filtered `wait --since <latest> <finished_run>` MUST return immediately despite `other-live` running!
+        # 2) Filtered `wait --since <latest> <finished_run>` MUST return without waiting for `other-live`!
         evs = [
             json.loads(ln)
             for ln in self.cli("events", "--json", cwd=repo, human=True).stdout.splitlines()
             if ln.strip()
         ]
         max_seq = max((e["seq"] for e in evs), default=0)
-        t1 = time.perf_counter()
-        fin = self.cli("wait", "--since", str(max_seq), r_room["run"], cwd=repo, human=True)
+        fin = self.cli("wait", "--since", str(max_seq), r_room["run"], cwd=repo, human=True, timeout=10)
         self.assertEqual(fin.returncode, 0, fin.stdout + fin.stderr)
-        self.assertLess(time.perf_counter() - t1, 2.0, "filtered wait hung on unrelated active run")
+        self.assertFalse(gate.exists())
+        self.assertEqual(
+            self.outcome(self.cli("status", r_live["run"], cwd=repo))["state"],
+            "running",
+            "filtered wait should return while unrelated active run is still running",
+        )
 
     # ------------------------------------------------------------------
     # P2-7: apply conflict suggests `delegate reply --sync=agent <run> "rebase 到最新主干并解决冲突（<files>）"`
