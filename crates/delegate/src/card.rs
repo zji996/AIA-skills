@@ -2579,24 +2579,175 @@ fn collect_size_snapshots(
     out
 }
 
-/// Parse the reviewer's one-line conclusion from the verdict markdown (after line 1 verdict word).
+fn card_fence_marker(line: &str) -> Option<(char, usize)> {
+    let trimmed = line.trim_start();
+    let ch = trimmed.chars().next()?;
+    if ch != '`' && ch != '~' {
+        return None;
+    }
+    let count = trimmed.chars().take_while(|&c| c == ch).count();
+    (count >= 3).then_some((ch, count))
+}
+
+fn is_bare_verdict_token_line(trimmed: &str) -> bool {
+    let mut s = trimmed.trim().trim_matches([
+        '#', '*', '_', '`', '>', '-', '•', '[', ']', '【', '】', '(', ')', '（', '）', ' ',
+    ]);
+    for lbl in [
+        "最终审查结论",
+        "审查结论",
+        "评审结论",
+        "审核结论",
+        "最终结论",
+        "结论",
+        "审查结果",
+        "Verdict",
+        "verdict",
+        "Conclusion",
+        "conclusion",
+        "Result",
+        "result",
+    ] {
+        if let Some(rest) = s.strip_prefix(lbl) {
+            let r = rest.trim_start_matches(['*', '_', '`', ']', '】', ' ']);
+            if let Some(after) = r
+                .strip_prefix('：')
+                .or_else(|| r.strip_prefix(':'))
+                .or_else(|| r.strip_prefix('—'))
+                .or_else(|| r.strip_prefix('–'))
+                .or_else(|| r.strip_prefix('-'))
+            {
+                s = after.trim().trim_matches([
+                    '*', '_', '`', '[', ']', '【', '】', '(', ')', '（', '）', ' ', '。', '!', '！',
+                ]);
+                break;
+            }
+        }
+    }
+    let s = s.trim_matches(['。', '！', '!', '.', ' ']);
+    if s.is_empty() {
+        return true;
+    }
+    matches!(
+        s.to_ascii_uppercase().as_str(),
+        "PASS" | "PASSED" | "REWORK" | "NEEDS_CONTROLLER"
+    ) || matches!(
+        s,
+        "通过"
+            | "审查通过"
+            | "评审通过"
+            | "审核通过"
+            | "可合入"
+            | "需返工"
+            | "需要返工"
+            | "建议返工"
+            | "返工"
+            | "不通过"
+            | "未通过"
+            | "需主控决定"
+            | "需要主控决定"
+            | "待主控决定"
+    )
+}
+
+fn is_reviewer_conclusion_heading(trimmed: &str) -> bool {
+    if !trimmed.starts_with('#') {
+        return false;
+    }
+    let title = trimmed
+        .trim_start_matches('#')
+        .trim()
+        .trim_matches(['*', '_', '`', '：', ':', ' ']);
+    let lower = title.to_ascii_lowercase();
+    title.contains("结论")
+        || title.contains("总结")
+        || title.contains("审查结果")
+        || lower.contains("verdict")
+        || lower.contains("conclusion")
+        || lower.contains("summary")
+}
+
+fn clean_conclusion_line(trimmed: &str) -> String {
+    trimmed
+        .trim_start_matches(['#', '-', '*', '>', '•', ' '])
+        .replace("**", "")
+        .trim()
+        .to_string()
+}
+
+/// Parse the reviewer's one-line conclusion from the verdict markdown.
+/// Supports both classic `PASS\n<reason>` and natural prose openings (`通过：...`, `## 结论\n...`),
+/// falling back to an excerpt of the raw text when no distinct conclusion line is found.
 pub fn extract_reviewer_conclusion(verdict_text: &str) -> Option<String> {
-    for raw in verdict_text.lines().skip(1) {
+    let mut fence: Option<(char, usize)> = None;
+    let mut lines: Vec<&str> = Vec::new();
+    for raw in verdict_text.lines() {
+        if let Some((fc, flen)) = fence {
+            if let Some((c, len)) = card_fence_marker(raw) {
+                if c == fc && len >= flen && raw.trim_start()[len..].trim().is_empty() {
+                    fence = None;
+                }
+            }
+            continue;
+        } else if let Some(m) = card_fence_marker(raw) {
+            fence = Some(m);
+            continue;
+        }
         let trimmed = raw.trim();
         if trimmed.is_empty() || trimmed == "---" || trimmed == "***" {
             continue;
         }
+        lines.push(trimmed);
+    }
+    if lines.is_empty() {
+        return None;
+    }
+
+    // 1. Prefer a substantive line inside a `## 结论` / `## Conclusion` section if present before focus.
+    for (idx, &line) in lines.iter().enumerate() {
+        if is_focus_heading(line) {
+            break;
+        }
+        if is_reviewer_conclusion_heading(line) {
+            // Check inline text on the heading itself (e.g. `## 结论：通过，无阻塞问题`)
+            if let Some((_, rhs)) = line.split_once('：').or_else(|| line.split_once(':')) {
+                let cleaned = clean_conclusion_line(rhs);
+                if !cleaned.is_empty() && !is_bare_verdict_token_line(&cleaned) {
+                    return Some(clip(&cleaned, 140));
+                }
+            }
+            for &body in lines.iter().skip(idx + 1) {
+                if body.starts_with('#') || is_focus_heading(body) {
+                    break;
+                }
+                if is_bare_verdict_token_line(body) {
+                    continue;
+                }
+                let cleaned = clean_conclusion_line(body);
+                if !cleaned.is_empty() {
+                    return Some(clip(&cleaned, 140));
+                }
+            }
+        }
+    }
+
+    // 2. Scan lines before the focus section, skipping pure headings and bare verdict words.
+    for &trimmed in &lines {
         if is_focus_heading(trimmed) {
             break;
         }
-        if trimmed.starts_with('#') {
+        if trimmed.starts_with('#') || is_bare_verdict_token_line(trimmed) {
             continue;
         }
-        let cleaned = trimmed
-            .trim_start_matches(['-', '*', '>', ' '])
-            .replace("**", "")
-            .trim()
-            .to_string();
+        let cleaned = clean_conclusion_line(trimmed);
+        if !cleaned.is_empty() {
+            return Some(clip(&cleaned, 140));
+        }
+    }
+
+    // 3. Fallback: show raw text excerpt so the card always surfaces something alongside `verdictFile`.
+    for &trimmed in &lines {
+        let cleaned = clean_conclusion_line(trimmed);
         if !cleaned.is_empty() {
             return Some(clip(&cleaned, 140));
         }
@@ -2605,40 +2756,137 @@ pub fn extract_reviewer_conclusion(verdict_text: &str) -> Option<String> {
 }
 
 fn is_focus_heading(line: &str) -> bool {
-    let trimmed = line.trim().trim_start_matches('#').trim();
-    let lower = trimmed.to_ascii_lowercase();
-    trimmed.contains("主控重点看")
-        || trimmed.contains("主控该重点看")
-        || trimmed.contains("重点核查")
+    let trimmed = line.trim();
+    let is_md_heading = trimmed.starts_with('#');
+    let is_bold_standalone = !is_md_heading
+        && trimmed.chars().count() <= 36
+        && strip_list_prefix(trimmed).is_none()
+        && ((trimmed.starts_with("**")
+            && trimmed.trim_end_matches(['：', ':', ' ']).ends_with("**"))
+            || trimmed.ends_with('：')
+            || trimmed.ends_with(':'));
+    if !is_md_heading && !is_bold_standalone {
+        return false;
+    }
+    let body = trimmed
+        .trim_start_matches('#')
+        .trim()
+        .trim_matches(['*', '_', '`', '：', ':', '[', ']', '【', '】', ' ']);
+    if !is_md_heading && (body.contains('。') || body.ends_with('.')) {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    body.contains("主控重点看")
+        || body.contains("主控该重点看")
+        || body.contains("重点核查")
+        || body.contains("重点关注")
+        || body.contains("重点看")
+        || body.contains("重点位置")
+        || body.contains("关注位置")
+        || body.contains("建议核查")
+        || body.contains("建议关注")
+        || body.contains("关键位置")
+        || body.contains("核查位置")
         || lower.contains("focus for controller")
         || lower.contains("controller focus")
         || lower.contains("key review points")
+        || lower.contains("review focus")
+        || lower.contains("areas to check")
+        || lower.contains("what to check")
+        || lower.contains("key locations")
 }
 
-/// Extract `path:line` and trailing reason from a single bullet line in the focus section.
-fn parse_focus_line(raw: &str) -> Option<ReviewerFocusItem> {
-    let mut text = raw.trim();
-    if text.is_empty() || text == "无" || text.eq_ignore_ascii_case("none") {
-        return None;
+fn strip_list_prefix(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+        .or_else(|| trimmed.strip_prefix("• "))
+    {
+        let r = rest.trim();
+        let r = r
+            .strip_prefix("[ ] ")
+            .or_else(|| r.strip_prefix("[x] "))
+            .or_else(|| r.strip_prefix("[X] "))
+            .unwrap_or(r)
+            .trim();
+        return Some(r);
     }
-    // Strip bullet (`- `, `* `) or numbered list (`1. `, `2) `).
-    if let Some(rest) = text.strip_prefix("- ").or_else(|| text.strip_prefix("* ")) {
-        text = rest.trim();
-    } else if let Some(idx) = text.find(['.', ')']) {
-        if idx > 0 && idx <= 3 && text[..idx].bytes().all(|b| b.is_ascii_digit()) {
-            text = text[idx + 1..].trim();
+    if let Some(idx) = trimmed.find(['.', ')']) {
+        if idx > 0
+            && idx <= 3
+            && trimmed[..idx].bytes().all(|b| b.is_ascii_digit())
+            && trimmed[idx + 1..].starts_with(char::is_whitespace)
+        {
+            return Some(trimmed[idx + 1..].trim());
         }
     }
-    if text == "无" || text.eq_ignore_ascii_case("none") {
+    None
+}
+
+fn is_explicit_none_line(text: &str) -> bool {
+    let clean = text
+        .trim()
+        .trim_start_matches(['-', '*', '•', ' '])
+        .trim_matches(['`', '*', '_', '。', '.', ' ']);
+    matches!(
+        clean.to_ascii_lowercase().as_str(),
+        "none" | "n/a" | "no" | "nil"
+    ) || matches!(
+        clean,
+        "无" | "暂无" | "无重点项" | "无重点关注" | "无需重点关注" | "没有"
+    )
+}
+
+fn strip_markdown_links_for_reason(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            if let Some(close_br) = text[i + 1..].find(']') {
+                let after_br = i + 1 + close_br + 1;
+                if bytes.get(after_br) == Some(&b'(') {
+                    if let Some(close_par) = text[after_br + 1..].find(')') {
+                        let label = &text[i + 1..i + 1 + close_br];
+                        out.push_str(label.trim_matches('`'));
+                        i = after_br + 1 + close_par + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Extract `path` + `line` and trailing reason from a focus bullet line.
+/// Supports `path:line`, `path#Lline`, Markdown links `[p](p#L12)` / `[p](file:///.../p#L12)`,
+/// and adjacent line forms like `path (L12-30)` or `path 第 12 行`.
+fn parse_focus_line(raw: &str) -> Option<ReviewerFocusItem> {
+    let mut text = raw.trim();
+    if text.is_empty() || is_explicit_none_line(text) {
+        return None;
+    }
+    if let Some(rest) = strip_list_prefix(text) {
+        text = rest;
+    }
+    if text.is_empty() || is_explicit_none_line(text) {
         return None;
     }
 
     let mut severity = Severity::Medium;
     if let Some(rest) = text.strip_prefix('[') {
         if let Some((tag, after)) = rest.split_once(']') {
-            if let Some(sev) = Severity::parse(tag) {
-                severity = sev;
-                text = after.trim();
+            if !after.starts_with('(') {
+                if let Some(sev) = Severity::parse(tag) {
+                    severity = sev;
+                    text = after.trim();
+                }
             }
         }
     } else if let Some(rest) = text.strip_prefix('【') {
@@ -2648,42 +2896,30 @@ fn parse_focus_line(raw: &str) -> Option<ReviewerFocusItem> {
                 text = after.trim();
             }
         }
+    } else if let Some(rest) = text.strip_prefix("**") {
+        if let Some((tag, after)) = rest.split_once("**") {
+            if let Some(sev) = Severity::parse(tag.trim_matches(['[', ']', '【', '】', ':', '：', ' ']))
+            {
+                severity = sev;
+                text = after.trim_start_matches([':', '：', '—', '–', '-', ' ']).trim();
+            }
+        }
     }
 
-    // Find `path:line` token (optionally wrapped in backticks).
-    let (loc_token, after_loc) = if let Some(rest) = text.strip_prefix('`') {
-        let (inside, after) = rest.split_once('`')?;
-        (inside.trim(), after.trim())
-    } else {
-        let split_at = text
-            .find(|c: char| c.is_whitespace() || c == '—' || c == '：')
-            .unwrap_or(text.len());
-        (&text[..split_at], text[split_at..].trim())
-    };
+    let mentions = crate::brief_check::scan_path_mentions(text, &[]);
+    let first_with_line = mentions.into_iter().find(|m| !m.lines.is_empty())?;
+    let file = first_with_line.path;
+    let line = first_with_line.lines[0].0.max(1);
 
-    let loc_clean = loc_token
-        .trim_matches(|c| c == '`' || c == '*' || c == '(' || c == ')')
-        .trim_end_matches([',', ';', '：', ':']);
-    let (raw_file, raw_line) = loc_clean.rsplit_once(':')?;
-    let file = raw_file.trim().trim_start_matches("./").to_string();
-    if file.is_empty() || file.contains(' ') {
-        return None;
-    }
-    let line_part = raw_line.trim().trim_start_matches(['L', 'l']);
-    let line_digits: String = line_part
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    let line: usize = line_digits.parse().ok()?;
+    // Extract reason: prefer text after `—` / `–` / ` - ` / `：` / `: ` following the location,
+    // otherwise use the cleaned natural sentence.
+    let plain = strip_markdown_links_for_reason(text).replace("**", "");
+    let reason = extract_focus_reason(&plain, &file);
 
-    let reason = after_loc
-        .trim_start_matches(['—', '–', '-', ':', '：', ' '])
-        .trim()
-        .to_string();
     Some(ReviewerFocusItem {
         severity,
         file,
-        line: line.max(1),
+        line,
         reason: if reason.is_empty() {
             "审查员标记需重点核查".into()
         } else {
@@ -2692,25 +2928,98 @@ fn parse_focus_line(raw: &str) -> Option<ReviewerFocusItem> {
     })
 }
 
-/// Parse the `## 主控重点看` section from a reviewer verdict file.
-pub fn parse_reviewer_focus(verdict_text: &str) -> Vec<ReviewerFocusItem> {
-    let mut in_section = false;
-    let mut out = Vec::new();
-    for line in verdict_text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('#') {
-            if is_focus_heading(trimmed) {
-                in_section = true;
-                continue;
-            } else if in_section {
-                break;
+fn extract_focus_reason(plain: &str, file: &str) -> String {
+    let search_start = plain
+        .find(file)
+        .map(|pos| pos + file.len())
+        .unwrap_or(0);
+    let tail = &plain[search_start..];
+    for sep in [" — ", "—", " – ", "–", " - ", "：", ": "] {
+        if let Some(pos) = tail.find(sep) {
+            let candidate = tail[pos + sep.len()..]
+                .trim_start_matches(['—', '–', '-', ':', '：', ' ', '`'])
+                .trim();
+            if !candidate.is_empty() {
+                return candidate.to_string();
             }
         }
-        if !in_section {
+    }
+    // If no explicit separator after the path, strip leading path/line token if it starts the line.
+    let trimmed = plain.trim();
+    if search_start > 0 && plain[..search_start - file.len()].trim_matches(['`', ' ']).is_empty() {
+        let mut after = tail.trim_start_matches('`');
+        // Skip `:12-30` / `#L12-L30` / `(L12-30)` / `第 12 行`
+        if let Some(rest) = after
+            .strip_prefix(':')
+            .or_else(|| after.strip_prefix('#'))
+        {
+            let skip = rest
+                .find(|c: char| c.is_whitespace() || matches!(c, '`' | '—' | '–' | '：'))
+                .unwrap_or(rest.len());
+            after = rest[skip..].trim_start_matches(['`', ' ']);
+        }
+        let after = after
+            .trim_start_matches(['—', '–', '-', ':', '：', ' '])
+            .trim();
+        return after.to_string();
+    }
+    trimmed.to_string()
+}
+
+/// Parse the reviewer's focus items from a verdict file.
+/// First looks under any focus heading (`## 主控重点看`, `## 重点关注位置`, etc.);
+/// if no focus heading exists at all, falls back to bullet items in the body carrying file+line refs.
+pub fn parse_reviewer_focus(verdict_text: &str) -> Vec<ReviewerFocusItem> {
+    let mut fence: Option<(char, usize)> = None;
+    let mut in_section = false;
+    let mut saw_focus_heading = false;
+    let mut out = Vec::new();
+    let mut body_bullets: Vec<String> = Vec::new();
+
+    for line in verdict_text.lines() {
+        if let Some((fc, flen)) = fence {
+            if let Some((c, len)) = card_fence_marker(line) {
+                if c == fc && len >= flen && line.trim_start()[len..].trim().is_empty() {
+                    fence = None;
+                }
+            }
+            continue;
+        } else if let Some(m) = card_fence_marker(line) {
+            fence = Some(m);
             continue;
         }
-        if let Some(item) = parse_focus_line(trimmed) {
-            out.push(item);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if is_focus_heading(trimmed) {
+            saw_focus_heading = true;
+            in_section = true;
+            continue;
+        }
+        if trimmed.starts_with('#') && in_section {
+            in_section = false;
+        }
+        if in_section {
+            if let Some(item) = parse_focus_line(trimmed) {
+                out.push(item);
+            }
+        } else if strip_list_prefix(trimmed).is_some() {
+            body_bullets.push(trimmed.to_string());
+        }
+    }
+
+    if !saw_focus_heading && out.is_empty() {
+        let mut seen = BTreeSet::new();
+        for bullet in body_bullets {
+            if let Some(item) = parse_focus_line(&bullet) {
+                if seen.insert((item.file.clone(), item.line)) {
+                    out.push(item);
+                    if out.len() >= 12 {
+                        break;
+                    }
+                }
+            }
         }
     }
     out
@@ -2906,6 +3215,161 @@ pub fn count_test_changes(files: &[DiffFile]) -> TestChangeStats {
     stats
 }
 
+fn author_heading_level(trimmed: &str) -> Option<(usize, &str)> {
+    let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
+    if (1..=6).contains(&hashes) && trimmed.as_bytes().get(hashes) == Some(&b' ') {
+        Some((hashes, trimmed[hashes + 1..].trim()))
+    } else {
+        None
+    }
+}
+
+fn is_generic_author_heading(trimmed: &str) -> bool {
+    let Some((_, title)) = author_heading_level(trimmed) else {
+        return false;
+    };
+    let clean = title
+        .trim_matches(['*', '_', '`', '：', ':', '[', ']', '【', '】', ' '])
+        .to_ascii_lowercase();
+    matches!(
+        clean.as_str(),
+        "总结"
+            | "结论"
+            | "总结论"
+            | "摘要"
+            | "交付摘要"
+            | "交付总结"
+            | "改动总结"
+            | "改动说明"
+            | "变更总结"
+            | "任务总结"
+            | "完成情况"
+            | "结果"
+            | "汇报"
+            | "报告"
+            | "概述"
+            | "背景"
+            | "说明"
+            | "summary"
+            | "conclusion"
+            | "overview"
+            | "report"
+            | "result"
+            | "results"
+            | "changes"
+            | "background"
+            | "delivery summary"
+            | "tl;dr"
+    )
+}
+
+fn is_author_conclusion_heading(trimmed: &str) -> bool {
+    let Some((_, title)) = author_heading_level(trimmed) else {
+        return false;
+    };
+    let clean = title.trim_matches(['*', '_', '`', '：', ':', ' ']);
+    let lower = clean.to_ascii_lowercase();
+    clean.contains("结论")
+        || clean.contains("总结")
+        || clean.contains("摘要")
+        || lower.contains("conclusion")
+        || lower.contains("summary")
+        || lower.contains("tl;dr")
+}
+
+fn collect_author_summary_lines(raw: &str) -> Vec<String> {
+    let mut fence: Option<(char, usize)> = None;
+    let mut non_code: Vec<&str> = Vec::new();
+    for line in raw.lines() {
+        if let Some((fc, flen)) = fence {
+            if let Some((c, len)) = card_fence_marker(line) {
+                if c == fc && len >= flen && line.trim_start()[len..].trim().is_empty() {
+                    fence = None;
+                }
+            }
+            continue;
+        } else if let Some(m) = card_fence_marker(line) {
+            fence = Some(m);
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "---" || trimmed == "***" {
+            continue;
+        }
+        non_code.push(trimmed);
+    }
+
+    let clean_line = |trimmed: &str| -> String {
+        trimmed
+            .trim_start_matches('#')
+            .trim_start_matches('>')
+            .trim()
+            .replace("**", "")
+    };
+
+    // 1. Prefer lines inside a `结论` / `总结` / `Summary` / `Conclusion` section when present.
+    let mut picked: Vec<String> = Vec::new();
+    if let Some((sec_idx, (sec_lvl, _))) = non_code.iter().enumerate().find_map(|(i, &l)| {
+        if is_author_conclusion_heading(l) {
+            author_heading_level(l).map(|h| (i, h))
+        } else {
+            None
+        }
+    }) {
+        for &trimmed in non_code.iter().skip(sec_idx + 1) {
+            if let Some((lvl, _)) = author_heading_level(trimmed) {
+                if lvl <= sec_lvl && !picked.is_empty() {
+                    break;
+                }
+                if is_generic_author_heading(trimmed) {
+                    continue;
+                }
+            }
+            let cleaned = clean_line(trimmed);
+            if !cleaned.is_empty() {
+                picked.push(clip(&cleaned, 110));
+                if picked.len() >= 3 {
+                    return picked;
+                }
+            }
+        }
+    }
+
+    // 2. Fall back to top lines of the document, skipping generic headings like `# 总结`.
+    if picked.is_empty() {
+        for &trimmed in &non_code {
+            if is_generic_author_heading(trimmed) {
+                continue;
+            }
+            let cleaned = clean_line(trimmed);
+            if !cleaned.is_empty() {
+                picked.push(clip(&cleaned, 110));
+                if picked.len() >= 3 {
+                    return picked;
+                }
+            }
+        }
+    }
+
+    // 3. Final fallback if everything was generic headings or code fences.
+    if picked.is_empty() {
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed == "---" || trimmed == "***" {
+                continue;
+            }
+            let cleaned = clean_line(trimmed);
+            if !cleaned.is_empty() {
+                picked.push(clip(&cleaned, 110));
+                if picked.len() >= 3 {
+                    break;
+                }
+            }
+        }
+    }
+    picked
+}
+
 /// Extract up to 3 summary lines from `result.md` without modifying or truncating the original file,
 /// alongside deterministic pointers to every preserved round result (`round-N-result.md` and/or
 /// reply-chain ancestors).
@@ -2930,30 +3394,7 @@ pub fn extract_author_summary_with_rounds(run: &Path, include_chain: bool) -> Va
     let raw = read(&path);
     let total_lines = raw.lines().count();
     let total_chars = raw.chars().count();
-    let mut picked: Vec<String> = Vec::new();
-    let mut in_code_fence = false;
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
-            in_code_fence = !in_code_fence;
-            continue;
-        }
-        if in_code_fence || trimmed.is_empty() || trimmed == "---" || trimmed == "***" {
-            continue;
-        }
-        let cleaned = trimmed
-            .trim_start_matches('#')
-            .trim_start_matches('>')
-            .trim()
-            .replace("**", "");
-        if cleaned.is_empty() {
-            continue;
-        }
-        picked.push(clip(&cleaned, 110));
-        if picked.len() >= 3 {
-            break;
-        }
-    }
+    let picked = collect_author_summary_lines(&raw);
     json!({
         "lines": picked,
         "path": path.to_string_lossy(),
@@ -3693,6 +4134,9 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
     if let Some(appends) = crate::pending_reply::summary_json(run) {
         card_doc["appends"] = appends;
     }
+    if b(sum, "answerHasQuestion") && !b(sum, "question") {
+        card_doc["answerHasQuestion"] = json!(true);
+    }
     for key in ["agyAccountSwitch", "reviewAgyAccountSwitch"] {
         if meta[key].is_object() {
             card_doc[key] = meta[key].clone();
@@ -3834,6 +4278,8 @@ pub fn render_card_human(card: &Value) -> String {
                 }
                 if format_retry_failed {
                     notes.push("补问 1 次仍无结论".into());
+                } else if b(rev, "formatError") {
+                    notes.push("未识别出明确结论".into());
                 }
                 if extra_disagreed {
                     notes.push("意见不一致".into());
@@ -4067,6 +4513,12 @@ pub fn render_card_human(card: &Value) -> String {
             ));
         }
     }
+    if b(card, "answerHasQuestion") {
+        out.push(
+            "   注：回复含待确认问题（代码已改动并跑完验收，同事回复中包含疑问句，合入前请留意 result.md）"
+                .into(),
+        );
+    }
     if b(rev, "enabled") {
         let verdict = s(rev, "verdict");
         let orig = s(rev, "originalVerdict");
@@ -4137,6 +4589,9 @@ pub fn render_card_human(card: &Value) -> String {
             ));
         } else {
             out.push(format!("   {rev_label}：{v_prefix}{retry_note} — {concl_part}{vf_part}"));
+            if b(rev, "formatError") && !format_retry_failed {
+                out.push(format!("   {}", crate::review::VERDICT_MISSING_NOTE));
+            }
         }
         if rev_extra.is_object() {
             let em = {
@@ -5378,5 +5833,115 @@ fn crossed_fn() {
             "{out}"
         );
         assert!(!out.contains("NEEDS_CONTROLLER"), "{out}");
+    }
+
+    #[test]
+    fn reviewer_conclusion_and_focus_handle_links_prose_headings_and_fallbacks() {
+        // 1. Natural opening verdict + Markdown links + natural focus heading.
+        let natural = "通过：核心逻辑清晰，边界测试齐全。\n\n\
+            ## 重点关注位置\n\
+            - [高] [crates/delegate/src/review.rs](crates/delegate/src/review.rs#L990-L1010) — 确认否定词排除完整\n\
+            - [crates/delegate/src/card.rs](file:///repo/crates/delegate/src/card.rs#L2610) 链接剥离逻辑\n\
+            - `crates/delegate/src/radar.rs` (L415-430) — 核对非 JSON 切块\n";
+        let concl = extract_reviewer_conclusion(natural).unwrap();
+        assert!(concl.contains("核心逻辑清晰"), "{concl}");
+        let focus = parse_reviewer_focus(natural);
+        assert_eq!(focus.len(), 3, "{focus:?}");
+        assert_eq!(focus[0].file, "crates/delegate/src/review.rs");
+        assert_eq!(focus[0].line, 990);
+        assert_eq!(focus[0].severity, Severity::High);
+        assert!(focus[0].reason.contains("否定词排除"), "{:?}", focus[0]);
+        assert_eq!(focus[1].file, "crates/delegate/src/card.rs");
+        assert_eq!(focus[1].line, 2610);
+        assert_eq!(focus[2].file, "crates/delegate/src/radar.rs");
+        assert_eq!(focus[2].line, 415);
+
+        // 2. No focus heading -> fall back to body list items with file+line anchors.
+        let no_heading = "需返工\n\n发现两处问题：\n\
+            1. [src/parser.rs](src/parser.rs#L42) 漏了空输入分支\n\
+            2. `src/runner.rs:88` — 未清理子进程\n";
+        let fb = parse_reviewer_focus(no_heading);
+        assert_eq!(fb.len(), 2, "{fb:?}");
+        assert_eq!(fb[0].file, "src/parser.rs");
+        assert_eq!(fb[0].line, 42);
+        assert_eq!(fb[1].file, "src/runner.rs");
+        assert_eq!(fb[1].line, 88);
+
+        // 3. Explicit `## 主控重点看\n无` must NOT fall back to body refs.
+        let explicit_none = "PASS\n核查了 `src/a.rs:10`，无问题。\n\n- 核对过 `src/a.rs:10` 的实现\n\n## 主控重点看\n无\n";
+        assert!(parse_reviewer_focus(explicit_none).is_empty());
+
+        // 4. Bare verdict text still falls back to raw excerpt instead of None.
+        let bare = "PASS\n";
+        assert_eq!(extract_reviewer_conclusion(bare).as_deref(), Some("PASS"));
+
+        // 5. Long bold summary sentence mentioning `关键位置` must NOT be mistaken for a focus heading,
+        // while a short standalone bold heading like `**重点关注位置**` is still recognized.
+        let bold_sentence = "PASS\n\
+            **经过核查，核心逻辑和关键位置均已覆盖单测，无阻塞问题。**\n\n\
+            **重点关注位置**\n\
+            - `src/main.rs:25` — 核对入口参数\n";
+        let bold_concl = extract_reviewer_conclusion(bold_sentence).unwrap();
+        assert!(bold_concl.contains("核心逻辑和关键位置均已覆盖单测"), "{bold_concl}");
+        let bold_focus = parse_reviewer_focus(bold_sentence);
+        assert_eq!(bold_focus.len(), 1, "{bold_focus:?}");
+        assert_eq!(bold_focus[0].file, "src/main.rs");
+        assert_eq!(bold_focus[0].line, 25);
+    }
+
+    #[test]
+    fn author_summary_skips_generic_headings_and_prefers_conclusion_section() {
+        let dir = std::env::temp_dir().join(format!("delegate-card-author-sum-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("result.md"),
+            "# 背景\n旧背景描述。\n\n## 总结\n已把审查与 Radar 改为自然写宽松读。\n补齐 7 项单元测试。\nverify 全绿。\n\n## 详细改动\n改了 6 个文件。\n",
+        )
+        .unwrap();
+        let sum = extract_author_summary_with_rounds(&dir, false);
+        let lines = strings(&sum["lines"]);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].contains("已把审查与 Radar 改为自然写宽松读"), "{lines:?}");
+        assert!(lines.iter().all(|l| l != "背景" && l != "总结"), "{lines:?}");
+
+        // Without conclusion section, generic `# 总结` heading is still skipped.
+        fs::write(dir.join("result.md"), "# 总结\n\n第一条实质改动。\n第二条实质改动。\n").unwrap();
+        let sum2 = extract_author_summary_with_rounds(&dir, false);
+        let lines2 = strings(&sum2["lines"]);
+        assert_eq!(lines2[0], "第一条实质改动。", "{lines2:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn card_renders_trailing_question_note_and_unrecognized_verdict_note() {
+        let card = json!({
+            "run": "20261127-qnote",
+            "name": "qnote",
+            "state": "delivered",
+            "answerHasQuestion": true,
+            "changes": {"files": 1, "added": 5, "deleted": 0},
+            "l0": {},
+            "author": {"lines": ["改完了，顺便问一句是否删旧字段？"], "path": "/tmp/result.md", "totalLines": 1, "totalChars": 18},
+            "review": {
+                "enabled": true,
+                "status": "done",
+                "verdict": "NEEDS_CONTROLLER",
+                "formatError": true,
+                "upgradedBy": "formatError",
+                "conclusion": "等日志跑完再看",
+                "verdictFile": "/tmp/review.md",
+            },
+            "risks": [],
+            "riskStats": {"total": 0, "ruleHits": 0, "reviewerHints": 0},
+            "tests": {"added": 0, "modified": 0, "deleted": 0, "testFiles": 0},
+            "accept": {"ok": true, "command": "true"},
+            "otherChanges": [],
+            "next": [],
+        });
+        let out = render_card_human(&card);
+        assert!(out.contains("回复含待确认问题"), "{out}");
+        assert!(out.contains("未从审查开头识别出明确的通过/返工结论"), "{out}");
+        assert!(out.contains("/tmp/review.md"), "{out}");
     }
 }

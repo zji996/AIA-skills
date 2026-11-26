@@ -6082,6 +6082,43 @@ fn load_applied_history_records(state: &Path, extra_repo: Option<&str>) -> Vec<V
     out
 }
 
+fn parse_backlog_list_item(trimmed: &str) -> Option<&str> {
+    let rest = if let Some(r) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+    {
+        r.trim()
+    } else {
+        let idx = trimmed.find(['.', ')'])?;
+        if idx > 0
+            && idx <= 4
+            && trimmed[..idx].bytes().all(|b| b.is_ascii_digit())
+            && trimmed[idx + 1..].starts_with(char::is_whitespace)
+        {
+            trimmed[idx + 1..].trim()
+        } else {
+            return None;
+        }
+    };
+
+    // Handle Markdown task checkboxes: skip completed `- [x]` / `- [X]`, strip unchecked `- [ ]`.
+    if let Some(after_done) = rest
+        .strip_prefix("[x]")
+        .or_else(|| rest.strip_prefix("[X]"))
+    {
+        if after_done.is_empty() || after_done.starts_with(char::is_whitespace) {
+            return None;
+        }
+    }
+    let text = if let Some(after_open) = rest.strip_prefix("[ ]") {
+        after_open.trim()
+    } else {
+        rest
+    };
+    (!text.is_empty()).then_some(text)
+}
+
 fn parse_markdown_backlog(
     file: &Path,
     state: &Path,
@@ -6109,21 +6146,36 @@ fn parse_markdown_backlog(
         })
         .collect();
 
+    let mut h2_section = String::new();
     let mut section = String::new();
+    let mut in_fence = false;
     let mut drafts = Vec::new();
 
     for (idx, raw_line) in content.lines().enumerate() {
         let line_no = idx + 1;
         let trimmed = raw_line.trim();
-        if let Some(heading) = trimmed.strip_prefix("## ") {
-            section = heading.trim().to_string();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
             continue;
         }
-        let bullet_text = trimmed
-            .strip_prefix("- ")
-            .or_else(|| trimmed.strip_prefix("* "))
-            .map(str::trim);
-        let Some(text) = bullet_text.filter(|t| !t.is_empty()) else {
+        if in_fence {
+            continue;
+        }
+        if let Some(heading) = trimmed.strip_prefix("### ") {
+            let sub = heading.trim();
+            section = if h2_section.is_empty() {
+                sub.to_string()
+            } else {
+                format!("{h2_section} / {sub}")
+            };
+            continue;
+        }
+        if let Some(heading) = trimmed.strip_prefix("## ") {
+            h2_section = heading.trim().to_string();
+            section = h2_section.clone();
+            continue;
+        }
+        let Some(text) = parse_backlog_list_item(trimmed) else {
             continue;
         };
 
@@ -9417,6 +9469,52 @@ mod tests {
         assert_eq!(drafts[2].state, "ready");
         assert_eq!(drafts[3].owner_ref, "D002");
         assert!(drafts[3].wait_on.contains(&"owner:D002".to_string()));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_md_supports_h3_ordered_lists_and_task_checkboxes() {
+        let dir = temp_dir("import-prose");
+        let state = dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let md = dir.join("backlog.md");
+        fs::write(
+            &md,
+            "# 待办\n\
+             ## 暂缓\n\
+             ### 界面微调\n\
+             1. 调整按钮间距\n\
+             2) 统一图标尺寸\n\
+             ### 清单任务\n\
+             - [ ] 补齐重试日志\n\
+             - [x] 已完成的旧任务（应跳过）\n\
+             - [X] 另一个已完成任务（应跳过）\n\
+             1. [ ] 有序未完成任务\n\
+             2. [x] 有序已完成任务（应跳过）\n\
+             - [x86] 支持 x86 目标检测\n\
+             ```markdown\n\
+             - 代码块里的示例行不应导入\n\
+             ```\n",
+        )
+        .unwrap();
+
+        let drafts = parse_markdown_backlog(&md, &state, None, &[]).unwrap();
+        let titles: Vec<&str> = drafts.iter().map(|d| d.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "调整按钮间距",
+                "统一图标尺寸",
+                "补齐重试日志",
+                "有序未完成任务",
+                "[x86] 支持 x86 目标检测",
+            ],
+            "{drafts:?}"
+        );
+        // Inherits `暂缓` from parent `## 暂缓` under `### 界面微调`.
+        assert_eq!(drafts[0].section, "暂缓 / 界面微调");
+        assert_eq!(drafts[0].state, "deferred");
 
         let _ = fs::remove_dir_all(&dir);
     }

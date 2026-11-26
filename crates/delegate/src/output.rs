@@ -1186,6 +1186,8 @@ pub fn human_detail(run: &Path, status: &Value) -> String {
         }
         if b(rev, "formatRetryFailed") || (b(rev, "formatError") && b(rev, "formatRetried")) {
             info.push("补问 1 次仍无结论".into());
+        } else if b(rev, "formatError") {
+            info.push(crate::review::VERDICT_MISSING_NOTE.into());
         }
         if rev["extra"].is_object() && b(&rev["extra"], "disagreed") {
             info.push("意见不一致".into());

@@ -322,14 +322,32 @@ pub fn prompt_excerpt(prompt: &str) -> String {
     clip_chars(prompt.trim(), PROMPT_EXCERPT_CHARS)
 }
 
-fn is_heading_line(line: &str) -> bool {
+fn parse_heading_line(line: &str) -> Option<(usize, &str)> {
     let trimmed = line.trim_start();
     let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
-    (1..=6).contains(&hashes) && trimmed.as_bytes().get(hashes) == Some(&b' ')
+    if (1..=6).contains(&hashes) && trimmed.as_bytes().get(hashes) == Some(&b' ') {
+        Some((hashes, trimmed[hashes + 1..].trim()))
+    } else {
+        None
+    }
+}
+
+fn is_conclusion_heading_title(title: &str) -> bool {
+    let clean = title.trim_matches(['*', '_', '`', '：', ':', '[', ']', '【', '】', ' ']);
+    let lower = clean.to_ascii_lowercase();
+    clean.contains("结论")
+        || clean.contains("总结")
+        || clean.contains("摘要")
+        || clean.contains("核心发现")
+        || lower.contains("summary")
+        || lower.contains("conclusion")
+        || lower.contains("tl;dr")
+        || lower.contains("verdict")
 }
 
 /// Deterministically extract the conclusion segment from a colleague's answer:
-/// the first markdown heading section if the answer starts with a heading, else the first ~600 chars.
+/// prefers the first heading section whose title mentions conclusion/summary (`结论`/`总结`/`Summary`/`Conclusion`),
+/// falling back to the first ~600 chars when no such section exists.
 pub fn extract_conclusion(result: &str) -> String {
     let normalized = result.replace("\r\n", "\n");
     let trimmed = normalized.trim();
@@ -337,30 +355,54 @@ pub fn extract_conclusion(result: &str) -> String {
         return String::new();
     }
     let lines: Vec<&str> = trimmed.lines().collect();
-    if is_heading_line(lines[0]) {
-        let mut out = Vec::new();
-        let mut in_fence = false;
-        let mut has_body = false;
-        for (i, &line) in lines.iter().enumerate() {
-            let t = line.trim_start();
-            if t.starts_with("```") {
-                in_fence = !in_fence;
-            }
-            if i > 0 && !in_fence && is_heading_line(line) {
-                if has_body {
+
+    // Locate the first conclusion/summary heading outside fenced code blocks.
+    let mut in_fence = false;
+    let mut target: Option<(usize, usize)> = None;
+    for (i, &line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if !in_fence {
+            if let Some((lvl, title)) = parse_heading_line(line) {
+                if is_conclusion_heading_title(title) {
+                    target = Some((i, lvl));
                     break;
                 }
-                // Title heading immediately followed by a sub-heading (e.g. `# Report\n\n## Conclusion`).
-                out.push(line);
-                continue;
             }
-            if i > 0 && !line.trim().is_empty() && !is_heading_line(line) {
+        }
+    }
+
+    if let Some((start_idx, start_lvl)) = target {
+        let mut out = Vec::new();
+        let mut fence = false;
+        let mut has_body = false;
+        for (offset, &line) in lines[start_idx..].iter().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("```") || t.starts_with("~~~") {
+                fence = !fence;
+            }
+            if offset > 0 && !fence {
+                if let Some((lvl, _)) = parse_heading_line(line) {
+                    if lvl <= start_lvl || has_body {
+                        break;
+                    }
+                    out.push(line);
+                    continue;
+                }
+            }
+            if offset > 0 && !line.trim().is_empty() && parse_heading_line(line).is_none() {
                 has_body = true;
             }
             out.push(line);
         }
-        return clip_chars(out.join("\n").trim(), CONCLUSION_MAX_CHARS);
+        if has_body {
+            return clip_chars(out.join("\n").trim(), CONCLUSION_MAX_CHARS);
+        }
     }
+
     clip_chars(trimmed, CONCLUSION_MAX_CHARS)
 }
 
@@ -2640,6 +2682,29 @@ mod tests {
         let c3 = extract_conclusion(&plain);
         assert!(c3.chars().count() <= CONCLUSION_MAX_CHARS + 1);
         assert!(c3.ends_with('…'));
+
+        // First heading `# 背景` must not hijack conclusion when a later `## 总结` / `## Summary` exists.
+        let bg_then_summary = "# 背景\n旧任务上下文说明。\n\n## 总结\n真正的核心交付结论在这里。\n\n## 详细改动\n无关细节。";
+        let c4 = extract_conclusion(bg_then_summary);
+        assert!(c4.contains("真正的核心交付结论在这里"), "{c4}");
+        assert!(!c4.contains("旧任务上下文说明"), "{c4}");
+        assert!(!c4.contains("无关细节"), "{c4}");
+
+        // Without any conclusion/summary heading, fall back to first 600 chars instead of stopping at `# 背景`.
+        let no_concl = "# 背景\n问题背景。\n\n## 实现\n改了核心逻辑。";
+        let c5 = extract_conclusion(no_concl);
+        assert!(c5.contains("问题背景") && c5.contains("改了核心逻辑"), "{c5}");
+
+        // Empty conclusion section immediately followed by a sibling heading must NOT swallow the next section.
+        let empty_concl = "# 背景\n上下文。\n\n## 总结\n## 详细改动\n无关实现细节。";
+        let c6 = extract_conclusion(empty_concl);
+        assert!(c6.contains("# 背景"), "empty ## 总结 should fall back to top 600 chars: {c6}");
+
+        // Conclusion heading followed by a sub-heading (`###`) still collects the sub-section body.
+        let sub_concl = "# 报告\n\n## 总结\n### 核心结论\n已修复边界问题。\n\n## 附录\n额外日志。";
+        let c7 = extract_conclusion(sub_concl);
+        assert!(c7.contains("已修复边界问题"), "{c7}");
+        assert!(!c7.contains("额外日志"), "{c7}");
     }
 
     #[test]

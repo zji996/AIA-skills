@@ -21,9 +21,10 @@ use std::sync::{
 pub const DEFAULT_RUBRIC: &str =
     include_str!("../../../skills/delegate/references/review-rubric.md");
 
-/// Verbatim single tail-appended follow-up prompt when the reviewer's first line is not
-/// `PASS`, `REWORK`, or `NEEDS_CONTROLLER` (reuses the same session and model binding).
-pub const FORMAT_RETRY_PROMPT: &str = "上一条回复缺少结论。验收已由流水线跑完，不用等命令。请直接给出结论：首行只写 PASS、REWORK 或 NEEDS_CONTROLLER，下面写理由，并附「## 主控重点看」。";
+/// Factual note attached when no clear pass/rework/needs-controller verdict is recognized from
+/// the reviewer's opening or conclusion section (no follow-up retry; original `review.md` kept).
+pub const VERDICT_MISSING_NOTE: &str =
+    "注：未从审查开头识别出明确的通过/返工结论，已原样保留 review.md 供主控过目";
 
 /// Single tail-appended follow-up prompt when a reviewer hits the repeated-command / polling
 /// self-check (`loop_stopped`), asking it to conclude directly without running more commands.
@@ -992,16 +993,542 @@ pub enum ParsedVerdict {
     Invalid(String),
 }
 
-/// Strict controlled verdict parser: the very first line must be exactly
-/// `PASS`, `REWORK`, or `NEEDS_CONTROLLER`. Anything else fails closed.
-pub fn parse_verdict(answer: &str) -> ParsedVerdict {
-    let first = answer.lines().next().unwrap_or("").trim();
-    match first {
-        "PASS" => ParsedVerdict::Pass,
-        "REWORK" => ParsedVerdict::Rework,
-        "NEEDS_CONTROLLER" => ParsedVerdict::NeedsController,
-        other => ParsedVerdict::Invalid(clip(other, 120)),
+fn verdict_fence_marker(line: &str) -> Option<(char, usize)> {
+    let trimmed = line.trim_start();
+    let ch = trimmed.chars().next()?;
+    if ch != '`' && ch != '~' {
+        return None;
     }
+    let count = trimmed.chars().take_while(|&c| c == ch).count();
+    (count >= 3).then_some((ch, count))
+}
+
+fn strip_verdict_decor(raw: &str) -> &str {
+    let mut s = raw.trim();
+    loop {
+        let prev = s;
+        s = s.trim_start_matches(['#', '*', '_', '`', '>', '-', '•', ' ']);
+        // Strip leading numbered list marker like `1. ` or `1) `
+        if let Some(idx) = s.find(['.', ')']) {
+            if idx > 0
+                && idx <= 3
+                && s[..idx].bytes().all(|b| b.is_ascii_digit())
+                && s[idx + 1..].starts_with(char::is_whitespace)
+            {
+                s = s[idx + 1..].trim_start();
+            }
+        }
+        s = s.trim_matches(['*', '_', '`', '[', ']', '【', '】', ' ']);
+        if s == prev {
+            break;
+        }
+    }
+    s
+}
+
+fn strip_verdict_label_prefix(raw: &str) -> &str {
+    let mut s = strip_verdict_decor(raw);
+    const ZH_LABELS: &[&str] = &[
+        "最终审查结论",
+        "审查结论",
+        "评审结论",
+        "审核结论",
+        "最终结论",
+        "结论",
+        "审查结果",
+        "评审结果",
+        "结果",
+        "判断",
+    ];
+    const EN_LABELS: &[&str] = &[
+        "review verdict",
+        "final verdict",
+        "verdict",
+        "conclusion",
+        "decision",
+        "result",
+    ];
+    loop {
+        let prev = s;
+        let mut stripped = None;
+        for lbl in ZH_LABELS {
+            if let Some(rest) = s.strip_prefix(lbl) {
+                let r = rest.trim_start_matches(['*', '_', '`', ']', '】', ' ']);
+                if let Some(after) = r
+                    .strip_prefix('：')
+                    .or_else(|| r.strip_prefix(':'))
+                    .or_else(|| r.strip_prefix('—'))
+                    .or_else(|| r.strip_prefix('–'))
+                    .or_else(|| r.strip_prefix('-'))
+                {
+                    stripped = Some(strip_verdict_decor(after));
+                    break;
+                }
+            }
+        }
+        if stripped.is_none() {
+            let lower = s.to_ascii_lowercase();
+            for lbl in EN_LABELS {
+                if lower.starts_with(lbl) {
+                    let rest = &s[lbl.len()..];
+                    let r = rest.trim_start_matches(['*', '_', '`', ']', '】', ' ']);
+                    if let Some(after) = r
+                        .strip_prefix(':')
+                        .or_else(|| r.strip_prefix('：'))
+                        .or_else(|| r.strip_prefix('—'))
+                        .or_else(|| r.strip_prefix('–'))
+                        .or_else(|| r.strip_prefix('-'))
+                    {
+                        stripped = Some(strip_verdict_decor(after));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(next) = stripped {
+            s = next;
+        }
+        if s == prev {
+            break;
+        }
+    }
+    s
+}
+
+fn ends_with_zh_negation(prefix: &str) -> bool {
+    let p = prefix.trim_end();
+    const NEG_SUFFIXES: &[&str] = &[
+        "没有发现",
+        "并未发现",
+        "尚未发现",
+        "未发现",
+        "无发现",
+        "不涉及",
+        "不存在",
+        "不构成",
+        "不需要再",
+        "不需要",
+        "无需再",
+        "不必再",
+        "不用再",
+        "暂无需",
+        "无需",
+        "无须",
+        "不用",
+        "不必",
+        "不再",
+        "没有",
+        "并未",
+        "尚未",
+        "未见",
+        "并无",
+        "均无",
+        "暂不",
+        "不能",
+        "无法",
+        "无",
+        "不",
+        "未",
+        "非",
+        "没",
+    ];
+    if NEG_SUFFIXES.iter().any(|neg| p.ends_with(neg)) {
+        return true;
+    }
+    // Clause-level negation scope: e.g. `通过，未发现任何需要修改的问题` or `没有发现明显需要主控拍板的事项`.
+    let clause = p
+        .rsplit(['，', '。', '；', ';', ',', '.', '：', ':', '\n'])
+        .next()
+        .unwrap_or(p)
+        .trim_start();
+    const CLAUSE_NEG_STARTS: &[&str] = &[
+        "未发现",
+        "没有发现",
+        "无发现",
+        "并未发现",
+        "未见",
+        "不涉及",
+        "不存在",
+        "无需",
+        "无须",
+        "不需要",
+        "并无",
+        "均无",
+        "没有",
+    ];
+    CLAUSE_NEG_STARTS.iter().any(|neg| clause.starts_with(neg))
+        && !clause.contains("但")
+        && !clause.contains("不过")
+        && !clause.contains("然而")
+        && !clause.contains("只是")
+}
+
+fn contains_positive_zh_verdict(text: &str, phrase: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find(phrase) {
+        let idx = from + rel;
+        if !ends_with_zh_negation(&text[..idx]) {
+            return true;
+        }
+        from = idx + phrase.len();
+    }
+    false
+}
+
+fn clause_describes_fixed_issue(prefix: &str) -> bool {
+    let clause = prefix
+        .rsplit(['，', '。', '；', ';', ',', '.', '\n'])
+        .next()
+        .unwrap_or(prefix);
+    const FIXED_CUES: &[&str] = &[
+        "已修复",
+        "修复了",
+        "已解决",
+        "解决了",
+        "已修正",
+        "此前",
+        "之前",
+        "原本",
+        "原先",
+        "上轮",
+    ];
+    FIXED_CUES.iter().any(|cue| clause.contains(cue))
+        && !clause.contains("但")
+        && !clause.contains("仍")
+        && !clause.contains("依然")
+        && !clause.contains("还是")
+}
+
+fn contains_active_zh_fail(text: &str, phrase: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find(phrase) {
+        let idx = from + rel;
+        if !clause_describes_fixed_issue(&text[..idx]) {
+            return true;
+        }
+        from = idx + phrase.len();
+    }
+    false
+}
+
+fn is_ascii_word_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn contains_ascii_word_match(text: &str, word: &str, case_sensitive: bool) -> Vec<usize> {
+    let hay = if case_sensitive {
+        text.to_string()
+    } else {
+        text.to_ascii_lowercase()
+    };
+    let needle = if case_sensitive {
+        word.to_string()
+    } else {
+        word.to_ascii_lowercase()
+    };
+    let bytes = hay.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = hay[from..].find(&needle) {
+        let idx = from + rel;
+        let end = idx + needle.len();
+        let before_ok = idx == 0 || !is_ascii_word_char(bytes[idx - 1]);
+        let after_ok = end == bytes.len() || !is_ascii_word_char(bytes[end]);
+        if before_ok && after_ok {
+            out.push(idx);
+        }
+        from = idx + needle.len();
+    }
+    out
+}
+
+fn ends_with_en_negation(prefix_lower: &str) -> bool {
+    let p = prefix_lower.trim_end();
+    const NEG: &[&str] = &[
+        "did not",
+        "does not",
+        "failed to",
+        "fail to",
+        "cannot",
+        "can't",
+        "won't",
+        "didn't",
+        "doesn't",
+        "don't",
+        "without",
+        "never",
+        "not",
+        "no",
+    ];
+    NEG.iter().any(|neg| {
+        p.ends_with(neg)
+            && (p.len() == neg.len()
+                || !is_ascii_word_char(p.as_bytes()[p.len() - neg.len() - 1]))
+    })
+}
+
+fn contains_positive_ascii_word(text: &str, word: &str, case_sensitive: bool) -> bool {
+    let lower = text.to_ascii_lowercase();
+    for idx in contains_ascii_word_match(text, word, case_sensitive) {
+        if !ends_with_en_negation(&lower[..idx]) {
+            return true;
+        }
+    }
+    false
+}
+
+fn starts_with_token_followed_by_break(s: &str, prefix: &str) -> bool {
+    let Some(rest) = s.strip_prefix(prefix) else {
+        return false;
+    };
+    match rest.chars().next() {
+        None => true,
+        Some(c) => {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '。' | '，'
+                        | ','
+                        | '.'
+                        | '：'
+                        | ':'
+                        | '；'
+                        | ';'
+                        | '!'
+                        | '！'
+                        | '—'
+                        | '–'
+                        | '-'
+                        | '('
+                        | '（'
+                        | ')'
+                        | '）'
+                        | ']'
+                        | '】'
+                )
+        }
+    }
+}
+
+fn is_standalone_zh_pass(s: &str) -> bool {
+    // Match `通过` at the start of the cleaned verdict line followed by end or punctuation/space
+    // (avoiding prepositional `通过检查代码发现...` or conditional `等测试通过后再看`).
+    if starts_with_token_followed_by_break(s, "通过") {
+        return true;
+    }
+    // Also accept short terminal statements like `本次改动通过。` / `可以通过`
+    let trimmed_end = s.trim_end_matches(['。', '！', '!', '.', ' ']);
+    if trimmed_end.chars().count() <= 16 && trimmed_end.ends_with("通过") {
+        let prefix = &trimmed_end[..trimmed_end.len() - "通过".len()];
+        if !ends_with_zh_negation(prefix)
+            && !prefix.contains("等")
+            && !prefix.contains("如果")
+            && !prefix.contains("若")
+            && !prefix.contains("测试")
+            && !prefix.contains("验收")
+            && !prefix.contains("编译")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_standalone_verdict_heading(title: &str) -> bool {
+    let clean = strip_verdict_decor(title).trim_matches(['。', '！', '!', '.', ' ']);
+    matches!(
+        clean.to_ascii_uppercase().as_str(),
+        "PASS" | "PASSED" | "REWORK" | "NEEDS_CONTROLLER"
+    ) || matches!(
+        clean,
+        "通过"
+            | "审查通过"
+            | "评审通过"
+            | "审核通过"
+            | "可合入"
+            | "可以合入"
+            | "需返工"
+            | "需要返工"
+            | "建议返工"
+            | "返工"
+            | "不通过"
+            | "未通过"
+            | "需主控决定"
+            | "需要主控决定"
+            | "待主控决定"
+    )
+}
+
+fn heading_verdict_payload(trimmed: &str) -> Option<&str> {
+    let title = trimmed.trim_start_matches('#').trim();
+    if title.is_empty() {
+        return None;
+    }
+    if is_standalone_verdict_heading(title) {
+        return Some(title);
+    }
+    // If a heading carries a `:` / `：` separator (e.g. `## 结论：通过` or `# Verdict: REWORK`),
+    // only scan the right-hand side so report titles like `# 第 1 轮返工续审` never hijack the verdict.
+    if let Some((_, rhs)) = title.split_once('：').or_else(|| title.split_once(':')) {
+        let rhs = rhs.trim();
+        if !rhs.is_empty() {
+            return Some(rhs);
+        }
+    }
+    None
+}
+
+fn parse_verdict_line(raw: &str) -> Option<ParsedVerdict> {
+    let trimmed = raw.trim();
+    let candidate = if trimmed.starts_with('#') {
+        heading_verdict_payload(trimmed)?
+    } else {
+        trimmed
+    };
+    let s = strip_verdict_label_prefix(candidate);
+    if s.is_empty() {
+        return None;
+    }
+    let lower = s.to_ascii_lowercase();
+
+    let has_needs_controller = contains_positive_ascii_word(s, "NEEDS_CONTROLLER", false)
+        || contains_positive_ascii_word(s, "needs controller", false)
+        || contains_positive_ascii_word(s, "need controller", false)
+        || contains_positive_ascii_word(s, "needs a decision", false)
+        || contains_positive_zh_verdict(s, "需要主控")
+        || contains_positive_zh_verdict(s, "需主控")
+        || contains_positive_zh_verdict(s, "待主控")
+        || contains_positive_zh_verdict(s, "交主控")
+        || contains_positive_zh_verdict(s, "请主控决定")
+        || contains_positive_zh_verdict(s, "请主控拍板");
+
+    // Require uppercase `REWORK` anywhere, or lowercase `rework` / bare `返工` ONLY at the start of
+    // the stripped verdict statement; mid-sentence Chinese rework only matches directive forms
+    // (`需返工`/`建议返工` etc.) so prose like `通过，本轮返工已修复` / `PASS: rework items verified`
+    // is never misclassified as `Rework`.
+    let starts_with_lower_rework = starts_with_token_followed_by_break(&lower, "rework");
+    let starts_with_zh_rework = starts_with_token_followed_by_break(s, "返工");
+
+    let has_rework = contains_positive_ascii_word(s, "REWORK", true)
+        || starts_with_lower_rework
+        || starts_with_zh_rework
+        || lower.contains("not pass")
+        || lower.contains("did not pass")
+        || lower.contains("failed to pass")
+        || contains_active_zh_fail(s, "不通过")
+        || contains_active_zh_fail(s, "未通过")
+        || contains_active_zh_fail(s, "不能通过")
+        || contains_active_zh_fail(s, "无法通过")
+        || contains_active_zh_fail(s, "暂不通过")
+        || contains_positive_zh_verdict(s, "需返工")
+        || contains_positive_zh_verdict(s, "建议返工")
+        || contains_positive_zh_verdict(s, "需要返工")
+        || contains_positive_zh_verdict(s, "打回返工")
+        || contains_positive_zh_verdict(s, "应返工")
+        || contains_positive_zh_verdict(s, "请返工")
+        || contains_positive_zh_verdict(s, "需要修改")
+        || contains_positive_zh_verdict(s, "需修改");
+
+    let starts_with_lower_pass = starts_with_token_followed_by_break(&lower, "pass")
+        || starts_with_token_followed_by_break(&lower, "passed");
+
+    let has_pass = contains_positive_ascii_word(s, "PASS", true)
+        || starts_with_lower_pass
+        || contains_positive_zh_verdict(s, "审查通过")
+        || contains_positive_zh_verdict(s, "评审通过")
+        || contains_positive_zh_verdict(s, "审核通过")
+        || contains_positive_zh_verdict(s, "结论通过")
+        || contains_positive_zh_verdict(s, "直接通过")
+        || contains_positive_zh_verdict(s, "可合入")
+        || contains_positive_zh_verdict(s, "可以合入")
+        || contains_positive_zh_verdict(s, "建议合入")
+        || contains_positive_zh_verdict(s, "无阻塞问题")
+        || contains_positive_zh_verdict(s, "无阻断问题")
+        || is_standalone_zh_pass(s);
+
+    if has_needs_controller && !has_rework {
+        return Some(ParsedVerdict::NeedsController);
+    }
+    if has_rework && !has_needs_controller {
+        return Some(ParsedVerdict::Rework);
+    }
+    if has_needs_controller && has_rework {
+        return Some(ParsedVerdict::NeedsController);
+    }
+    if has_pass {
+        return Some(ParsedVerdict::Pass);
+    }
+    None
+}
+
+fn is_verdict_section_heading(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('#') {
+        return false;
+    }
+    let title = trimmed.trim_start_matches('#').trim();
+    let lower = title.to_ascii_lowercase();
+    title.contains("结论")
+        || title.contains("审查结果")
+        || title.contains("评审结果")
+        || lower.contains("verdict")
+        || lower.contains("conclusion")
+}
+
+/// Relaxed reviewer verdict parser: scans the first 5 non-empty lines and any `结论` / `Verdict`
+/// section heading + first body line, recognizing both English (`PASS`/`REWORK`/`NEEDS_CONTROLLER`)
+/// and Chinese natural verdicts while never guessing `Pass` on ambiguous or negated text.
+pub fn parse_verdict(answer: &str) -> ParsedVerdict {
+    let mut fence: Option<(char, usize)> = None;
+    let mut first_non_empty = String::new();
+    let mut non_empty_count = 0usize;
+    let mut non_code_lines: Vec<&str> = Vec::new();
+
+    for line in answer.lines() {
+        if let Some((fc, flen)) = fence {
+            if let Some((c, len)) = verdict_fence_marker(line) {
+                if c == fc && len >= flen && line.trim_start()[len..].trim().is_empty() {
+                    fence = None;
+                }
+            }
+            continue;
+        } else if let Some(m) = verdict_fence_marker(line) {
+            fence = Some(m);
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "---" || trimmed == "***" {
+            continue;
+        }
+        if first_non_empty.is_empty() {
+            first_non_empty = trimmed.to_string();
+        }
+        non_code_lines.push(trimmed);
+        if non_empty_count < 5 {
+            non_empty_count += 1;
+            if let Some(v) = parse_verdict_line(trimmed) {
+                return v;
+            }
+        }
+    }
+
+    // Fallback: inspect any `## 结论` / `## Verdict` section heading and its first non-empty line.
+    for (idx, &line) in non_code_lines.iter().enumerate() {
+        if is_verdict_section_heading(line) {
+            if let Some(v) = parse_verdict_line(line) {
+                return v;
+            }
+            if let Some(&next_line) = non_code_lines.get(idx + 1) {
+                if !next_line.starts_with('#') {
+                    if let Some(v) = parse_verdict_line(next_line) {
+                        return v;
+                    }
+                }
+            }
+        }
+    }
+
+    ParsedVerdict::Invalid(clip(&first_non_empty, 120))
 }
 
 #[derive(Debug, Clone)]
@@ -2743,16 +3270,17 @@ fn run_agent_and_cleanup(
     res
 }
 
-/// Run a single reviewer attempt; if its first line is not a controlled verdict (`PASS`, `REWORK`,
-/// `NEEDS_CONTROLLER`) and the reply was not a policy refusal or cancellation, append
-/// `FORMAT_RETRY_PROMPT` ONCE at the tail of the same session with the same model binding.
-fn run_reviewer_with_format_retry(
+/// Run a single reviewer attempt without any format-retry follow-up call.
+/// If the reviewer hits the repeated-polling self-check (`loop_stopped`), append
+/// `LOOP_STOP_RETRY_PROMPT` ONCE at the tail of the same session so it can conclude directly.
+/// If no clear verdict is recognized on a normal reply, the caller preserves `review.md` verbatim
+/// and falls back safely to `NEEDS_CONTROLLER` with `VERDICT_MISSING_NOTE`.
+fn run_reviewer_with_loop_stop_retry(
     review_meta: &Value,
     exec_dir: &Path,
     holder: Arc<AtomicI32>,
     grace: Arc<Mutex<Option<f64>>>,
     cancel: Arc<AtomicBool>,
-    allow_format_retry: bool,
 ) -> AgentAttemptWithRetry {
     let wd = Path::new(s(review_meta, "workdir"));
     if wd.as_os_str().is_empty() || !wd.is_dir() {
@@ -2781,37 +3309,15 @@ fn run_reviewer_with_format_retry(
         };
     }
     let is_loop_stopped = matches!(&first, Ok((outcome, _)) if outcome == "loop_stopped");
-    let needs_format_retry = !is_loop_stopped
-        && allow_format_retry
-        && match &first {
-            Ok((outcome, text)) if outcome == "ok" && !crate::agy::is_policy_refusal(text) => {
-                matches!(parse_verdict(text), ParsedVerdict::Invalid(_))
-            }
-            _ => false,
-        };
-    if !is_loop_stopped && !needs_format_retry {
+    if !is_loop_stopped {
         return AgentAttemptWithRetry {
             res: first,
             format_retried: false,
             format_retry_failed: false,
         };
     }
-    let (retry_prompt_file, retry_prompt_text, retry_event, retry_detail) = if is_loop_stopped {
-        (
-            exec_dir.join("loop-stop-retry-prompt.md"),
-            LOOP_STOP_RETRY_PROMPT,
-            "loop_stop_retry",
-            "审查员反复轮询触发自检，已终止轮询并同会话尾部补问 1 次直接给结论",
-        )
-    } else {
-        (
-            exec_dir.join("format-retry-prompt.md"),
-            FORMAT_RETRY_PROMPT,
-            "format_retry",
-            "审查员首行缺少结论，同会话尾部补问 1 次",
-        )
-    };
-    let next_meta = write(&retry_prompt_file, format!("{retry_prompt_text}\n"))
+    let retry_prompt_file = exec_dir.join("loop-stop-retry-prompt.md");
+    let next_meta = write(&retry_prompt_file, format!("{LOOP_STOP_RETRY_PROMPT}\n"))
         .ok()
         .and_then(|()| supervise::continuation_with_file(review_meta, exec_dir, &retry_prompt_file));
     let Some(retry_meta) = next_meta else {
@@ -2823,7 +3329,11 @@ fn run_reviewer_with_format_retry(
     };
     supervise::log_event(
         exec_dir,
-        json!({"e": retry_event, "n": 1, "detail": retry_detail}),
+        json!({
+            "e": "loop_stop_retry",
+            "n": 1,
+            "detail": "审查员反复轮询触发自检，已终止轮询并同会话尾部补问 1 次直接给结论",
+        }),
     );
     let second = run_agent_and_cleanup(&retry_meta, exec_dir, 2, holder, grace, cancel);
     let retry_failed = match &second {
@@ -3633,6 +4143,7 @@ pub fn run_accept_and_review(
             String::new()
         };
         let incremental_rule = "上一轮已 PASS 的部分不重审，只核对本轮改动是否引入问题、是否修好上一轮指出的问题。";
+        let output_guide = "开头先给一句明确结论（通过 / 需返工 / 需主控决定，或 PASS / REWORK / NEEDS_CONTROLLER），下面自然写核查依据与重点关注位置。";
         let prompt_body = if fork_target.is_some() {
             let lead = if round > 1 {
                 format!("作者已完成第 {} 轮返工。下面是仅限本轮相对上一轮已审快照的增量 diff，请基于此前审查结论续审：", round - 1)
@@ -3644,8 +4155,7 @@ pub fn run_accept_and_review(
                  {workdir_note}\
                  - {REVIEW_ACCEPT_OWNED_NOTE}\n\
                  - {incremental_rule}\n\
-                 - 第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`（无前缀、无 Markdown 修饰）。\n\
-                 - 结论正文后附加 `## 主控重点看` 小节（`- [高|中|低] path:line — 理由`，无则写 `无`）。\n\n\
+                 - {output_guide}\n\n\
                  {reply_turn_section}{prev_verdict_section}## 本轮增量 diff（第 {round} 轮审查）\n\n\
                  {diff_section}\n"
             )
@@ -3655,7 +4165,7 @@ pub fn run_accept_and_review(
                  {workdir_note}\
                  {REVIEW_ACCEPT_OWNED_NOTE}\n\
                  {incremental_rule}\n\
-                 输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`。\n\n\
+                 {output_guide}\n\n\
                  ## 审查要点（{rubric_source}）\n\n\
                  {}\n\n\
                  ## 任务说明\n\n\
@@ -3670,7 +4180,7 @@ pub fn run_accept_and_review(
                 "请作为独立只读审查员审查以下写入任务的交付结果。\n\
                  {workdir_note}\
                  {REVIEW_ACCEPT_OWNED_NOTE}\n\
-                 严格遵守：不修改任何文件，不委派子任务；输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`（无前缀、无 Markdown 修饰）。\n\n\
+                 严格遵守：不修改任何文件，不委派子任务；{output_guide}\n\n\
                  ## 审查要点（{rubric_source}）\n\n\
                  {}\n\n\
                  ## 任务说明\n\n\
@@ -3782,7 +4292,7 @@ pub fn run_accept_and_review(
                                 let extra_prompt_body = format!(
                                     "请作为独立只读补充审查员审查以下写入任务的交付结果（提供第二意见）。\n\
                                      {REVIEW_ACCEPT_OWNED_NOTE}\n\
-                                     严格遵守：不修改任何文件，不委派子任务；输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`（无前缀、无 Markdown 修饰）。\n\n\
+                                     严格遵守：不修改任何文件，不委派子任务；{output_guide}\n\n\
                                      ## 审查要点（{rubric_source}）\n\n\
                                      {}\n\n\
                                      ## 任务说明\n\n\
@@ -3917,7 +4427,7 @@ pub fn run_accept_and_review(
                     let ed = extra_dir.clone();
                     let em = extra_meta.clone();
                     Some(scope.spawn(move || {
-                        let attempt = run_reviewer_with_format_retry(&em, &ed, eh, eg, ec.clone(), true);
+                        let attempt = run_reviewer_with_loop_stop_retry(&em, &ed, eh, eg, ec.clone());
                         if ec.load(Ordering::SeqCst) {
                             return ExtraRoundOutcome {
                                 cancelled: true,
@@ -3935,16 +4445,13 @@ pub fn run_accept_and_review(
                                     ParsedVerdict::NeedsController => {
                                         Some("NEEDS_CONTROLLER".to_string())
                                     }
-                                    ParsedVerdict::Invalid(first) => {
+                                    ParsedVerdict::Invalid(_) => {
                                         return ExtraRoundOutcome {
                                             cancelled: false,
                                             verdict: None,
                                             raw_answer: text,
                                             conclusion: None,
-                                            error: Some(clip(
-                                                &format!("格式异常：{first}"),
-                                                MAX_PARSE_ERROR_CHARS,
-                                            )),
+                                            error: Some(VERDICT_MISSING_NOTE.to_string()),
                                         };
                                     }
                                 };
@@ -3988,13 +4495,12 @@ pub fn run_accept_and_review(
             // upstream refusal, quota exhaustion), fall back to `review` tier and record reason.
             let mut active_exec_dir = round_dir.clone();
             let mut active_exec_meta = review_meta.clone();
-            let mut attempt = run_reviewer_with_format_retry(
+            let mut attempt = run_reviewer_with_loop_stop_retry(
                 &active_exec_meta,
                 &active_exec_dir,
                 rev_holder.clone(),
                 grace.clone(),
                 rev_cancel.clone(),
-                true,
             );
             // Reviewers NEVER use writer handoff; if the primary agy reviewer hits hard quota
             // exhaustion and another non-Red account is available, retry ONCE on the other account
@@ -4044,7 +4550,7 @@ pub fn run_accept_and_review(
                                          {retry_workdir_note}\
                                          {REVIEW_ACCEPT_OWNED_NOTE}\n\
                                          {incremental_rule}\n\
-                                         输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`。\n\n\
+                                         {output_guide}\n\n\
                                          ## 审查要点（{rubric_source}）\n\n\
                                          {}\n\n\
                                          ## 任务说明\n\n\
@@ -4059,7 +4565,7 @@ pub fn run_accept_and_review(
                                         "请作为独立只读审查员审查以下写入任务的交付结果。\n\
                                          {retry_workdir_note}\
                                          {REVIEW_ACCEPT_OWNED_NOTE}\n\
-                                         严格遵守：不修改任何文件，不委派子任务；输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`（无前缀、无 Markdown 修饰）。\n\n\
+                                         严格遵守：不修改任何文件，不委派子任务；{output_guide}\n\n\
                                          ## 审查要点（{rubric_source}）\n\n\
                                          {}\n\n\
                                          ## 任务说明\n\n\
@@ -4126,13 +4632,12 @@ pub fn run_accept_and_review(
                             let _ = crate::deny::prepare(&retry_meta, &retry_dir);
                             active_exec_dir = retry_dir;
                             active_exec_meta = retry_meta;
-                            attempt = run_reviewer_with_format_retry(
+                            attempt = run_reviewer_with_loop_stop_retry(
                                 &active_exec_meta,
                                 &active_exec_dir,
                                 rev_holder.clone(),
                                 grace.clone(),
                                 rev_cancel.clone(),
-                                true,
                             );
                             let retry_usage = active_exec_dir.join("usage.json");
                             if retry_usage.is_file() {
@@ -4194,7 +4699,7 @@ pub fn run_accept_and_review(
                                  {fb_workdir_note}\
                                  {REVIEW_ACCEPT_OWNED_NOTE}\n\
                                  {incremental_rule}\n\
-                                 输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`。\n\n\
+                                 {output_guide}\n\n\
                                  ## 审查要点（{rubric_source}）\n\n\
                                  {}\n\n\
                                  ## 任务说明\n\n\
@@ -4222,13 +4727,12 @@ pub fn run_accept_and_review(
                         let _ = crate::deny::prepare(&fb_meta, &fallback_dir);
                         active_exec_dir = fallback_dir;
                         active_exec_meta = fb_meta;
-                        attempt = run_reviewer_with_format_retry(
+                        attempt = run_reviewer_with_loop_stop_retry(
                             &active_exec_meta,
                             &active_exec_dir,
                             rev_holder.clone(),
                             grace.clone(),
                             rev_cancel.clone(),
-                            true,
                         );
                         let fb_usage = active_exec_dir.join("usage.json");
                         if fb_usage.is_file() {
@@ -4330,19 +4834,13 @@ pub fn run_accept_and_review(
                                     format_retry_failed = true;
                                     parse_error = Some(clip(
                                         &format!(
-                                            "补问 1 次仍无结论：首行 {:?}（期望 PASS、REWORK 或 NEEDS_CONTROLLER）",
+                                            "补问 1 次仍无结论：首行 {:?}（期望通过/返工/需主控决定）",
                                             clip(&first, 120)
                                         ),
                                         MAX_PARSE_ERROR_CHARS,
                                     ));
                                 } else {
-                                    parse_error = Some(clip(
-                                        &format!(
-                                            "invalid reviewer verdict first line: {:?} (expected PASS, REWORK, or NEEDS_CONTROLLER)",
-                                            clip(&first, 120)
-                                        ),
-                                        MAX_PARSE_ERROR_CHARS,
-                                    ));
+                                    parse_error = Some(VERDICT_MISSING_NOTE.to_string());
                                 }
                                 upgraded_by = Some("formatError".into());
                                 ("NEEDS_CONTROLLER".to_string(), text)
@@ -5376,7 +5874,7 @@ pub fn run_accept_and_review(
             &author_verdict,
             &None,
             holder.clone(),
-            author_verdict == "ok" && agents::is_question(answer),
+            answer,
         );
         *state = pre.state;
         *rec = pre.rec;
@@ -5550,7 +6048,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_verdict_is_strict_on_first_line() {
+    fn parse_verdict_reads_natural_openings_and_conclusion_sections_safely() {
+        // Classic exact tokens still work.
         assert_eq!(parse_verdict("PASS\nLooks good"), ParsedVerdict::Pass);
         assert_eq!(parse_verdict("PASS\r\nDetails"), ParsedVerdict::Pass);
         assert_eq!(parse_verdict("REWORK\n1. Fix foo"), ParsedVerdict::Rework);
@@ -5558,10 +6057,47 @@ mod tests {
             parse_verdict("NEEDS_CONTROLLER\nAmbiguous spec"),
             ParsedVerdict::NeedsController
         );
-        assert!(matches!(parse_verdict("**PASS**\n"), ParsedVerdict::Invalid(_)));
-        assert!(matches!(parse_verdict("PASS: ok\n"), ParsedVerdict::Invalid(_)));
-        assert!(matches!(parse_verdict("\nPASS\n"), ParsedVerdict::Invalid(_)));
+
+        // Relaxed Markdown/prose openings in first 5 non-empty lines.
+        assert_eq!(parse_verdict("**PASS**\n无阻塞问题"), ParsedVerdict::Pass);
+        assert_eq!(parse_verdict("PASS: ok\n"), ParsedVerdict::Pass);
+        assert_eq!(parse_verdict("\n# 代码审查\n**审查结论**：通过，无需返工。\n"), ParsedVerdict::Pass);
+        assert_eq!(parse_verdict("审查通过，可合入，无阻塞问题。"), ParsedVerdict::Pass);
+        assert_eq!(parse_verdict("结论：需返工 — 边界条件漏了空数组。"), ParsedVerdict::Rework);
+        assert_eq!(parse_verdict("【建议返工】需要修改 parser。"), ParsedVerdict::Rework);
+        assert_eq!(parse_verdict("Verdict: NEEDS_CONTROLLER - schema trade-off"), ParsedVerdict::NeedsController);
+        assert_eq!(parse_verdict("## 审查报告\n\n需主控决定：是否保留旧开关。"), ParsedVerdict::NeedsController);
+
+        // Conclusion section beyond first 5 lines.
+        let late_section = "# 核查记录\n1. 文件 A\n2. 文件 B\n3. 文件 C\n4. 文件 D\n5. 文件 E\n\n## 结论\n审查通过，可合入。\n";
+        assert_eq!(parse_verdict(late_section), ParsedVerdict::Pass);
+
+        // Negations & conflicts must NEVER falsely match Pass!
+        assert_eq!(parse_verdict("不通过，核心边界未处理"), ParsedVerdict::Rework);
+        assert_eq!(parse_verdict("未通过审查，需修改测试"), ParsedVerdict::Rework);
+        assert_eq!(parse_verdict("Verdict: not pass"), ParsedVerdict::Rework);
+        assert_eq!(parse_verdict("核心路径通过，但错误处理需返工"), ParsedVerdict::Rework);
+        assert_eq!(parse_verdict("通过，但边界测试仍未通过"), ParsedVerdict::Rework);
+
+        // Re-review report headings and pass sentences mentioning prior rework/failures must stay Pass.
+        assert_eq!(
+            parse_verdict("# 第 1 轮返工续审\n\n通过，上轮问题已修复。"),
+            ParsedVerdict::Pass
+        );
+        assert_eq!(parse_verdict("# Rework Review\n\nPASS"), ParsedVerdict::Pass);
+        assert_eq!(parse_verdict("# PASS\n无阻塞问题"), ParsedVerdict::Pass);
+        assert_eq!(parse_verdict("## 结论：通过"), ParsedVerdict::Pass);
+        assert_eq!(parse_verdict("通过，本轮返工已修复全部问题。"), ParsedVerdict::Pass);
+        assert_eq!(parse_verdict("PASS: rework items verified."), ParsedVerdict::Pass);
+        assert_eq!(parse_verdict("通过，未发现需要修改的问题。"), ParsedVerdict::Pass);
+        assert_eq!(parse_verdict("通过：已修复此前测试未通过的问题。"), ParsedVerdict::Pass);
+        assert_eq!(parse_verdict("通过，未发现需要主控拍板的事项。"), ParsedVerdict::Pass);
+
+        // Prepositional / conditional / unclear prose must NOT default to Pass.
         assert!(matches!(parse_verdict(""), ParsedVerdict::Invalid(_)));
+        assert!(matches!(parse_verdict("等 clippy 跑完再给结论。"), ParsedVerdict::Invalid(_)));
+        assert!(matches!(parse_verdict("等测试通过后再给结论。"), ParsedVerdict::Invalid(_)));
+        assert!(matches!(parse_verdict("通过读取源码，我注意到以下细节。"), ParsedVerdict::Invalid(_)));
         assert!(matches!(parse_verdict("LGTM\n"), ParsedVerdict::Invalid(_)));
     }
 
@@ -5934,11 +6470,9 @@ mod tests {
     }
 
     #[test]
-    fn format_retry_prompt_is_verbatim() {
-        assert_eq!(
-            FORMAT_RETRY_PROMPT,
-            "上一条回复缺少结论。验收已由流水线跑完，不用等命令。请直接给出结论：首行只写 PASS、REWORK 或 NEEDS_CONTROLLER，下面写理由，并附「## 主控重点看」。"
-        );
+    fn verdict_missing_note_mentions_review_md() {
+        assert!(VERDICT_MISSING_NOTE.contains("review.md"));
+        assert!(VERDICT_MISSING_NOTE.contains("未从审查开头识别出明确的通过/返工结论"));
     }
 
     #[test]

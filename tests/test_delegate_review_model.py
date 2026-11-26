@@ -1,17 +1,11 @@
 """End-to-end tests for review model selection/fallback, --class default thinking,
-reviewer format-error single follow-up, and review.extra supplementary review.
+relaxed prose verdict parsing (no format-retry follow-up), question detection, and review.extra.
 """
 import json
 import unittest
 from pathlib import Path
 
 import test_delegate as fixtures
-
-
-EXPECTED_FORMAT_RETRY_PROMPT = (
-    "上一条回复缺少结论。验收已由流水线跑完，不用等命令。"
-    "请直接给出结论：首行只写 PASS、REWORK 或 NEEDS_CONTROLLER，下面写理由，并附「## 主控重点看」。"
-)
 
 
 class DelegateReviewModelTests(unittest.TestCase):
@@ -321,20 +315,18 @@ class DelegateReviewModelTests(unittest.TestCase):
         efforts = [json.loads(line)["effort"] for line in log_file.read_text().splitlines()]
         self.assertEqual(efforts, ["medium", "high", "medium", "low", "low"])
 
-    def test_reviewer_format_error_retries_once_and_adopts_or_escalates(self):
-        # Case A: First reviewer reply lacks verdict -> retry receives verbatim prompt on same session -> PASS adopted.
-        script_recover = (
+    def test_reviewer_prose_verdict_and_unrecognized_escalates_without_retry(self):
+        # Case A: Reviewer replies with natural Chinese verdict & Markdown link focus -> PASS on 1 call.
+        script_prose = (
             "if '审查以下写入任务' in content:\n"
-            "    emit_ok('等 clippy 跑完再给结论。')\n"
-            "elif '上一条回复缺少结论' in content:\n"
-            "    emit_ok('PASS\\n补问后给出通过结论\\n\\n## 主控重点看\\n无')\n"
+            "    emit_ok('**审查结论**：通过，改动清晰无阻塞问题。\\n\\n## 重点关注位置\\n- [高] [work.txt](work.txt#L1) — 核对文案改动')\n"
             "else:\n"
             "    Path('work.txt').write_text('updated\\n')\n"
-            "    emit_ok('done')\n"
+            "    emit_ok('# 总结\\n\\n已完成 work.txt 更新。')\n"
         )
         models = {"neon": "agy/gemini-4-neon", "hydrogen": "agy/gemini-4-hydrogen"}
         tiers = {"scout": "neon", "review": "neon", "write": "neon"}
-        log_a = self.install_scripted_agy(script_recover, models, tiers)
+        log_a = self.install_scripted_agy(script_prose, models, tiers)
         repo = self.repo(
             {
                 "work.txt": "old\n",
@@ -351,40 +343,97 @@ class DelegateReviewModelTests(unittest.TestCase):
         st_a = json.loads(self.cli("status", "fmt-ok", "--json", cwd=repo).stdout)
         self.assertEqual(st_a["state"], "delivered")
         self.assertEqual(st_a["review"]["verdict"], "PASS")
-        self.assertTrue(st_a["review"].get("formatRetried"))
         self.assertFalse(st_a["review"].get("formatError", False))
 
         calls_a = [json.loads(line) for line in log_a.read_text().splitlines()]
         rev_calls_a = [c for c in calls_a if c["model"] == "gemini-4-hydrogen"]
-        self.assertEqual(len(rev_calls_a), 2, calls_a)
-        self.assertTrue(rev_calls_a[1]["conv_in"], "retry must continue same conversation")
-        self.assertIn(EXPECTED_FORMAT_RETRY_PROMPT, rev_calls_a[1]["content"])
+        self.assertEqual(len(rev_calls_a), 1, calls_a)
+        card_a = self.cli("card", "fmt-ok", cwd=repo)
+        self.assertIn("work.txt:1", card_a.stdout)
+        self.assertIn("改动清晰无阻塞问题", card_a.stdout)
 
-        # Case B: Retry also lacks verdict -> only 1 retry, NEEDS_CONTROLLER (formatError), card notes 补问 1 次仍无结论.
+        # Case B: Unrecognized reviewer reply -> NO follow-up retry, keeps review.md verbatim,
+        # falls back safely to NEEDS_CONTROLLER (never PASS) with factual note on card.
         log_a.unlink()
-        script_fail = (
+        script_unclear = (
             "if '审查以下写入任务' in content:\n"
             "    emit_ok('等 clippy 跑完再给结论。')\n"
-            "elif '上一条回复缺少结论' in content:\n"
-            "    emit_ok('还是先看看日志吧')\n"
             "else:\n"
-            "    Path('work.txt').write_text('updated\\n')\n"
+            "    Path('work.txt').write_text('updated2\\n')\n"
             "    emit_ok('done')\n"
         )
-        log_b = self.install_scripted_agy(script_fail, models, tiers)
+        log_b = self.install_scripted_agy(script_unclear, models, tiers)
         res_b = self.cli("run", "--worktree", "--name", "fmt-fail", "edit work", cwd=repo)
         self.assertEqual(res_b.returncode, 0, res_b.stderr + res_b.stdout)
         st_b = json.loads(self.cli("status", "fmt-fail", "--json", cwd=repo).stdout)
         self.assertEqual(st_b["review"]["verdict"], "NEEDS_CONTROLLER")
         self.assertEqual(st_b["review"]["upgradedBy"], "formatError")
         self.assertTrue(st_b["review"]["formatError"])
-        self.assertTrue(st_b["review"]["formatRetryFailed"])
+        self.assertFalse(st_b["review"].get("formatRetried", False))
+        self.assertIn("未从审查开头识别出明确的通过/返工结论", st_b["review"].get("parseError", ""))
+        review_md = Path(st_b["dir"]) / "review.md"
+        self.assertTrue(review_md.is_file())
+        self.assertEqual(review_md.read_text().strip(), "等 clippy 跑完再给结论。")
         card_b = self.cli("card", "fmt-fail", cwd=repo)
-        self.assertIn("补问 1 次仍无结论", card_b.stdout)
+        self.assertIn("未从审查开头识别出明确的通过/返工结论", card_b.stdout)
 
         calls_b = [json.loads(line) for line in log_b.read_text().splitlines()]
         rev_calls_b = [c for c in calls_b if c["model"] == "gemini-4-hydrogen"]
-        self.assertEqual(len(rev_calls_b), 2, "must retry at most once")
+        self.assertEqual(len(rev_calls_b), 1, "must NOT send a format-retry follow-up")
+
+    def test_question_detection_branches_on_file_changes(self):
+        # 1. Zero file edits + natural question -> pauses in `question` state.
+        # 2. Edited file + trailing casual question -> runs accept normally and attaches card note.
+        script = (
+            "if 'ASK_NO_EDIT' in content:\n"
+            "    emit_ok('查到两处旧配置，请确认是否一并清理？')\n"
+            "elif 'EDIT_WITH_TRAILING_Q' in content:\n"
+            "    Path('work.txt').write_text('edited-with-q\\n')\n"
+            "    emit_ok('已完成修改并自测通过。\\n\\n顺便确认一下，下次是否删除兼容分支？')\n"
+            "else:\n"
+            "    Path('work.txt').write_text('stopped\\n')\n"
+            "    emit_ok('**暂停等主控**\\n改了一半发现接口冲突，选 A 还是 B？')\n"
+        )
+        models = {"neon": "agy/gemini-4-neon"}
+        tiers = {"scout": "neon", "review": "neon", "write": "neon"}
+        self.install_scripted_agy(script, models, tiers)
+        accept_marker = self.work / "accept-ran.txt"
+        repo = self.repo(
+            {
+                "work.txt": "old\n",
+                ".delegate.json": json.dumps(
+                    {
+                        "accept": f"echo ran >> {accept_marker}",
+                        "review": False,
+                    }
+                ),
+            }
+        )
+
+        # Case 1: no file edits -> relaxed natural question pauses in question state without accept.
+        r1 = self.cli("run", "--worktree", "--no-scout", "--name", "q-no-edit", "ASK_NO_EDIT", cwd=repo)
+        self.assertEqual(r1.returncode, 0, r1.stderr + r1.stdout)
+        st1 = json.loads(self.cli("status", "q-no-edit", "--json", cwd=repo).stdout)
+        self.assertTrue(st1.get("question"), st1)
+        self.assertFalse(accept_marker.exists())
+
+        # Case 2: file edited + trailing question -> accept DOES run, state delivered, card notes pending question.
+        r2 = self.cli("run", "--worktree", "--no-scout", "--name", "q-edit-tail", "EDIT_WITH_TRAILING_Q", cwd=repo)
+        self.assertEqual(r2.returncode, 0, r2.stderr + r2.stdout)
+        st2 = json.loads(self.cli("status", "q-edit-tail", "--json", cwd=repo).stdout)
+        self.assertFalse(st2.get("question", False), st2)
+        self.assertEqual(st2["state"], "delivered")
+        self.assertTrue(accept_marker.is_file())
+        card2 = self.cli("card", "q-edit-tail", cwd=repo)
+        self.assertIn("回复含待确认问题", card2.stdout)
+
+        # Case 3: file edited + explicit opening stop signal -> skips accept and pauses as question.
+        accept_marker.unlink()
+        r3 = self.cli("run", "--worktree", "--no-scout", "--name", "q-edit-open", "EDIT_OPEN_STOP", cwd=repo)
+        self.assertEqual(r3.returncode, 0, r3.stderr + r3.stdout)
+        st3 = json.loads(self.cli("status", "q-edit-open", "--json", cwd=repo).stdout)
+        self.assertTrue(st3.get("question"), st3)
+        self.assertFalse(accept_marker.exists())
 
     def test_extra_review_triggers_quota_guard_and_disagreement(self):
         script = (

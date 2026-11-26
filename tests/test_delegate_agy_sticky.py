@@ -303,7 +303,7 @@ class DelegateAgyStickyTests(unittest.TestCase):
         self.assertEqual([c["account"] for c in calls], ["alpha", "alpha", "alpha", "beta"])
         self.assertNotIn("gamma", [c["account"] for c in calls])
 
-    def test_reviewer_session_stays_pinned_across_format_retry_and_rework_after_switch(self):
+    def test_reviewer_session_stays_pinned_across_rework_after_switch(self):
         self._seed_three_accounts()
         repo = self.repo(
             {
@@ -324,14 +324,11 @@ class DelegateAgyStickyTests(unittest.TestCase):
             "    Path('src/app.txt').write_text(f'author-v{call_idx}\\n', encoding='utf-8')\n"
             "    emit_agy(f'author done {call_idx}', cid='conv-author')\n"
             "elif call_idx == 2:\n"
-            "    # Reviewer round 1 attempt 1: switch active account to beta mid-run, then return invalid format\n"
+            "    # Reviewer round 1: switch active account to beta mid-run, then request REWORK\n"
             "    sw_env = dict(os.environ)\n"
             "    sw_env['HOME'] = real_home\n"
             "    sw_env['XDG_CONFIG_HOME'] = real_xdg\n"
             "    subprocess.run([delegate_bin, 'agy', 'account', 'use', 'beta'], env=sw_env, check=True)\n"
-            "    emit_agy('missing verdict line', cid='conv-rev')\n"
-            "elif call_idx == 3:\n"
-            "    # Reviewer round 1 attempt 2 (format retry): request REWORK\n"
             "    emit_agy('REWORK\\nplease polish\\n\\n## 主控重点看\\n无', cid='conv-rev')\n"
             "else:\n"
             "    # Reviewer round 2 (after author rework): PASS\n"
@@ -351,10 +348,10 @@ class DelegateAgyStickyTests(unittest.TestCase):
         st_acct = json.loads(self.cli("agy", "account", "status", "--json").stdout)
         self.assertEqual(st_acct.get("active"), "beta")
 
-        # All 5 calls (author1, rev1-att1, rev1-format-retry, author-rework, rev2) stayed on alpha!
+        # All 4 calls (author1, rev1, author-rework, rev2) stayed on alpha!
         calls = self._read_calls()
-        self.assertEqual(len(calls), 5, f"unexpected calls: {calls}")
-        self.assertEqual([c["account"] for c in calls], ["alpha", "alpha", "alpha", "alpha", "alpha"])
+        self.assertEqual(len(calls), 4, f"unexpected calls: {calls}")
+        self.assertEqual([c["account"] for c in calls], ["alpha", "alpha", "alpha", "alpha"])
         self.assertNotIn("gamma", [c["account"] for c in calls])
 
     def test_fallback_then_rework_after_second_switch_stays_on_fallback_slot(self):

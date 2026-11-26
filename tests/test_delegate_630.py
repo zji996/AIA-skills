@@ -608,6 +608,43 @@ emit_answer('[{"title":"x","evidence":["README.md:1"],"suggestion":"s","cost":"�
         self.assertIn("read-only", res.stderr)
         self.assertFalse((self.state_dir() / "radar" / "radar-ro-fail" / "board.md").exists())
 
+    def test_radar_prose_sections_and_missing_anchors_do_not_fail_round(self):
+        repo = self.make_repo(
+            "radar-prose",
+            {
+                "src/app.py": "def run():\n    return 1\n",
+                ".delegate.json": json.dumps(
+                    {
+                        "remote": False,
+                        "radar": {"collect": ["echo gap-prose-1"]},
+                    }
+                ),
+            },
+        )
+        self.install_scripted_pi(
+            """
+prose = (
+    "### 补齐 run 超时保护\\n"
+    "- 证据：src/app.py:1 缺少超时控制（参见 collect#1:L1）\\n"
+    "- 建议：给 run() 增加超时参数并补单测。\\n"
+    "- 成本：低（15 分钟）\\n"
+    "- 可直接写成任务说明：是（改动集中）\\n\\n"
+    "### 无锚点泛泛建议\\n"
+    "- 建议重构目录结构。\\n"
+)
+emit_answer(prose)
+"""
+        )
+        res = self.cli("radar", "--json", cwd=repo)
+        self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+        data = json.loads(res.stdout)
+        self.assertEqual(data["added"], 1)
+        self.assertEqual(data["droppedNoAnchor"], 1)
+        board_md = Path(data["boardPath"]).read_text()
+        self.assertIn("补齐 run 超时保护", board_md)
+        self.assertNotIn("无锚点泛泛建议", board_md)
+        self.assertIn("last-scout-output.md", board_md)
+
     def test_concurrency_auto_derivation_overrides_env_and_shows_explicit_heavy_jobs(self):
         repo = self.make_repo("conc-demo", {"README.md": "hi\n", ".delegate.json": json.dumps({"remote": False})})
         cfg_file = Path(self.env["XDG_CONFIG_HOME"]) / "delegate/config.json"

@@ -342,7 +342,25 @@ pub fn is_valid_evidence_anchor(text: &str) -> bool {
     if let Some(pos) = trimmed.find('第') {
         let after = trimmed[pos + '第'.len_utf8()..].trim_start();
         let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-        let rest = after[digits.len()..].trim_start();
+        let mut rest = after[digits.len()..].trim_start();
+        if let Some(after_dash) = rest
+            .strip_prefix('-')
+            .or_else(|| rest.strip_prefix('–'))
+            .or_else(|| rest.strip_prefix('—'))
+            .or_else(|| rest.strip_prefix('~'))
+            .or_else(|| rest.strip_prefix('～'))
+            .or_else(|| rest.strip_prefix('至'))
+            .or_else(|| rest.strip_prefix('到'))
+        {
+            let after_dash = after_dash.trim_start();
+            let end_digits: String = after_dash
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if !end_digits.is_empty() {
+                rest = after_dash[end_digits.len()..].trim_start();
+            }
+        }
         if !digits.is_empty()
             && digits.parse::<u64>().is_ok_and(|n| n > 0)
             && rest.starts_with('行')
@@ -387,51 +405,51 @@ pub struct ParsedCandidate {
     pub brief_note: String,
 }
 
-/// Extract a JSON array of candidates from the scout's answer (either raw JSON or inside a
-/// ```json fenced code block).
-pub fn parse_scout_candidates(answer: &str) -> Res<Vec<ParsedCandidate>> {
-    let trimmed = answer.trim();
-    if trimmed.is_empty() {
-        return Err("scout returned empty output".into());
+fn radar_fence_marker(line: &str) -> Option<(char, usize)> {
+    let trimmed = line.trim_start();
+    let ch = trimmed.chars().next()?;
+    if ch != '`' && ch != '~' {
+        return None;
     }
+    let count = trimmed.chars().take_while(|&c| c == ch).count();
+    (count >= 3).then_some((ch, count))
+}
 
-    let mut json_slice: Option<&str> = None;
-    // Try fenced ```json ... ``` first.
-    if let Some(start) = trimmed.find("```json") {
-        let after = &trimmed[start + 7..];
-        if let Some(end) = after.find("```") {
-            json_slice = Some(after[..end].trim());
-        }
-    } else if let Some(start) = trimmed.find("```") {
-        let after = &trimmed[start + 3..];
-        let after = after.split_once('\n').map(|(_, rest)| rest).unwrap_or(after);
-        if let Some(end) = after.find("```") {
-            let candidate = after[..end].trim();
-            if candidate.starts_with('[') || candidate.starts_with('{') {
-                json_slice = Some(candidate);
-            }
-        }
+fn is_radar_none_reply(answer: &str) -> bool {
+    let clean = answer
+        .trim()
+        .trim_matches(['`', '*', '_', '#', '>', '-', '。', '.', '!', '！', ' ']);
+    if clean.is_empty() || clean == "[]" {
+        return true;
     }
+    let lower = clean.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "none"
+            | "no"
+            | "nil"
+            | "n/a"
+            | "no new candidates"
+            | "no candidates"
+            | "nothing new"
+    ) || matches!(
+        clean,
+        "无"
+            | "暂无"
+            | "没有"
+            | "无新增"
+            | "无新候选"
+            | "暂无新候选"
+            | "无值得新增的候选"
+            | "本次无新增候选"
+            | "本次采集没有值得新增的候选"
+    )
+}
 
-    let raw_json = json_slice.unwrap_or_else(|| {
-        if let (Some(l), Some(r)) = (trimmed.find('['), trimmed.rfind(']')) {
-            if l <= r {
-                return &trimmed[l..=r];
-            }
-        }
-        trimmed
-    });
-
-    let val: Value = serde_json::from_str(raw_json)
-        .map_err(|e| format!("failed to parse scout JSON candidates: {e}"))?;
-    let arr = if let Some(a) = val.as_array() {
-        a
-    } else if let Some(a) = val.get("candidates").and_then(Value::as_array) {
-        a
-    } else {
-        return Err("scout JSON must be an array of candidate objects (or {\"candidates\": [...]})".into());
-    };
-
+fn parse_json_candidates(val: &Value) -> Option<Vec<ParsedCandidate>> {
+    let arr = val
+        .as_array()
+        .or_else(|| val.get("candidates").and_then(Value::as_array))?;
     let mut out = Vec::new();
     for item in arr {
         let Some(obj) = item.as_object() else {
@@ -493,7 +511,450 @@ pub fn parse_scout_candidates(answer: &str) -> Res<Vec<ParsedCandidate>> {
             brief_note,
         });
     }
-    Ok(out)
+    Some(out)
+}
+
+fn try_parse_scout_json(trimmed: &str) -> Option<Vec<ParsedCandidate>> {
+    let mut json_slice: Option<&str> = None;
+    if let Some(start) = trimmed.find("```json") {
+        let after = &trimmed[start + 7..];
+        if let Some(end) = after.find("```") {
+            json_slice = Some(after[..end].trim());
+        }
+    } else if let Some(start) = trimmed.find("```") {
+        let after = &trimmed[start + 3..];
+        let after = after.split_once('\n').map(|(_, rest)| rest).unwrap_or(after);
+        if let Some(end) = after.find("```") {
+            let candidate = after[..end].trim();
+            if candidate.starts_with('[') || candidate.starts_with('{') {
+                json_slice = Some(candidate);
+            }
+        }
+    }
+
+    if let Some(slice) = json_slice {
+        if let Ok(val) = serde_json::from_str::<Value>(slice) {
+            if let Some(parsed) = parse_json_candidates(&val) {
+                return Some(parsed);
+            }
+        }
+    }
+
+    if trimmed.starts_with('[') || trimmed.starts_with('{') {
+        if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+            if let Some(parsed) = parse_json_candidates(&val) {
+                return Some(parsed);
+            }
+        }
+    } else if let (Some(l), Some(r)) = (trimmed.find('['), trimmed.rfind(']')) {
+        if l < r {
+            let candidate = &trimmed[l..=r];
+            if candidate.contains("\"title\"") || candidate.trim() == "[]" {
+                if let Ok(val) = serde_json::from_str::<Value>(candidate) {
+                    if let Some(parsed) = parse_json_candidates(&val) {
+                        return Some(parsed);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn strip_ordered_item_prefix(line: &str) -> Option<&str> {
+    if line.starts_with(' ') || line.starts_with('\t') {
+        return None;
+    }
+    let idx = line.find(['.', ')'])?;
+    if idx == 0 || idx > 3 || !line[..idx].bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let after = &line[idx + 1..];
+    if after.starts_with(char::is_whitespace) {
+        Some(after.trim())
+    } else {
+        None
+    }
+}
+
+fn strip_field_label<'a>(line: &'a str, labels: &[&str]) -> Option<&'a str> {
+    let cleaned = line
+        .trim()
+        .trim_start_matches(['-', '*', '•', '+', ' '])
+        .trim();
+    let no_bold = cleaned.trim_start_matches("**");
+    for lbl in labels {
+        if let Some(rest) = no_bold.strip_prefix(lbl) {
+            let r = rest.trim_start_matches(['*', '_', '`', ' ']);
+            if let Some(after) = r
+                .strip_prefix('：')
+                .or_else(|| r.strip_prefix(':'))
+                .or_else(|| r.strip_prefix('—'))
+                .or_else(|| r.strip_prefix('–'))
+            {
+                return Some(after.trim());
+            }
+        }
+        let lower = no_bold.to_ascii_lowercase();
+        if lower.starts_with(&lbl.to_ascii_lowercase()) {
+            let rest = &no_bold[lbl.len()..];
+            let r = rest.trim_start_matches(['*', '_', '`', ' ']);
+            if let Some(after) = r
+                .strip_prefix(':')
+                .or_else(|| r.strip_prefix('：'))
+                .or_else(|| r.strip_prefix('—'))
+                .or_else(|| r.strip_prefix('–'))
+            {
+                return Some(after.trim());
+            }
+        }
+    }
+    None
+}
+
+fn split_prose_title_and_inline(
+    raw_header: &str,
+    is_heading: bool,
+    has_body: bool,
+) -> (String, Option<String>) {
+    let cleaned = raw_header
+        .trim()
+        .trim_start_matches('#')
+        .trim()
+        .trim_matches(['*', '_', ' ']);
+    // Keep section heading titles intact when a body follows (e.g. `### 回归风险：未处理空数组`
+    // must NOT be truncated to `回归风险` and collided across items). Only split inline body on
+    // list items or standalone single-line headers.
+    if !is_heading || !has_body {
+        for sep in ["**：", "**:", " — ", " – ", "："] {
+            if let Some((lhs, rhs)) = raw_header.trim().split_once(sep) {
+                let title = lhs
+                    .trim()
+                    .trim_start_matches('#')
+                    .trim()
+                    .trim_matches(['*', '_', '`', '[', ']', '【', '】', ' '])
+                    .to_string();
+                let rest = rhs.trim().replace("**", "");
+                if !title.is_empty() && !rest.is_empty() {
+                    return (title, Some(rest));
+                }
+            }
+        }
+    }
+    let title = cleaned
+        .replace("**", "")
+        .trim_matches(['[', ']', '【', '】', ' '])
+        .to_string();
+    (title, None)
+}
+
+fn is_candidate_field_line(line: &str) -> bool {
+    strip_field_label(
+        line,
+        &[
+            "证据锚点",
+            "证据",
+            "锚点",
+            "依据",
+            "evidence",
+            "anchor",
+            "建议做法",
+            "建议动作",
+            "建议",
+            "做法",
+            "动作",
+            "修复",
+            "suggestion",
+            "action",
+            "fix",
+            "粗估成本",
+            "成本",
+            "工作量",
+            "耗时",
+            "cost",
+            "effort",
+            "可直接写成任务说明",
+            "可直派",
+            "任务说明",
+            "briefReady",
+            "brief ready",
+            "brief",
+        ],
+    )
+    .is_some()
+}
+
+fn parse_prose_candidate_block(
+    header: &str,
+    body_lines: &[String],
+    is_heading: bool,
+) -> Option<ParsedCandidate> {
+    let has_body = body_lines.iter().any(|l| !l.trim().is_empty());
+    let (title, inline_body) = split_prose_title_and_inline(header, is_heading, has_body);
+    if title.is_empty() || is_radar_none_reply(&title) {
+        return None;
+    }
+
+    let mut all_lines: Vec<String> = Vec::new();
+    if let Some(inline) = inline_body {
+        all_lines.push(inline);
+    }
+    all_lines.extend(body_lines.iter().cloned());
+
+    let mut evidence: Vec<String> = Vec::new();
+    let mut suggestion = String::new();
+    let mut cost = String::new();
+    let mut brief_ready = false;
+    let mut brief_note = String::new();
+    let mut fallback_desc: Vec<String> = Vec::new();
+
+    for raw in &all_lines {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed == "---" || trimmed == "***" {
+            continue;
+        }
+        if let Some(ev_val) = strip_field_label(trimmed, &["证据锚点", "证据", "锚点", "依据", "evidence", "anchor"]) {
+            if !ev_val.is_empty() && is_valid_evidence_anchor(ev_val) && !evidence.contains(&ev_val.to_string()) {
+                evidence.push(ev_val.to_string());
+            }
+            continue;
+        }
+        if let Some(sug_val) = strip_field_label(
+            trimmed,
+            &["建议做法", "建议动作", "建议", "做法", "动作", "修复", "suggestion", "action", "fix"],
+        ) {
+            if suggestion.is_empty() && !sug_val.is_empty() {
+                suggestion = sug_val.replace("**", "").trim().to_string();
+            }
+            if is_valid_evidence_anchor(sug_val) && !evidence.contains(&sug_val.to_string()) {
+                evidence.push(sug_val.to_string());
+            }
+            continue;
+        }
+        if let Some(cost_val) = strip_field_label(trimmed, &["粗估成本", "成本", "工作量", "耗时", "cost", "effort"]) {
+            if cost.is_empty() && !cost_val.is_empty() {
+                cost = cost_val.replace("**", "").trim().to_string();
+            }
+            continue;
+        }
+        if let Some(ready_val) = strip_field_label(
+            trimmed,
+            &["可直接写成任务说明", "可直派", "任务说明", "briefReady", "brief ready", "brief"],
+        ) {
+            let clean = ready_val.replace("**", "").trim().to_string();
+            let lower = clean.to_ascii_lowercase();
+            let neg = lower.starts_with("no")
+                || lower.starts_with("false")
+                || clean.starts_with('否')
+                || clean.starts_with("不能")
+                || clean.starts_with("不可")
+                || clean.starts_with("需细化")
+                || clean.starts_with("暂不能");
+            let pos = lower.starts_with("yes")
+                || lower.starts_with("true")
+                || clean.starts_with('是')
+                || clean.starts_with("可以")
+                || clean.starts_with("可直派")
+                || clean.starts_with("能");
+            if pos && !neg {
+                brief_ready = true;
+            }
+            if let Some((_, note)) = clean
+                .split_once('（')
+                .or_else(|| clean.split_once('('))
+                .or_else(|| clean.split_once('，'))
+                .or_else(|| clean.split_once(','))
+                .or_else(|| clean.split_once('：'))
+            {
+                brief_note = note.trim_end_matches(['）', ')', '。', ' ']).trim().to_string();
+            }
+            continue;
+        }
+
+        let item_clean = trimmed
+            .trim_start_matches(['-', '*', '•', '+', ' '])
+            .replace("**", "")
+            .trim()
+            .to_string();
+        if !item_clean.is_empty() {
+            if is_valid_evidence_anchor(&item_clean) && !evidence.contains(&item_clean) {
+                evidence.push(item_clean.clone());
+            }
+            fallback_desc.push(item_clean);
+        }
+    }
+
+    // Also check if the title itself carried a concrete evidence anchor.
+    if evidence.is_empty() && is_valid_evidence_anchor(&title) {
+        evidence.push(title.clone());
+    }
+
+    if suggestion.is_empty() && !fallback_desc.is_empty() {
+        suggestion = clip(&fallback_desc.into_iter().take(2).collect::<Vec<_>>().join(" "), 240);
+    }
+    if cost.is_empty() {
+        cost = "未估".to_string();
+    }
+
+    Some(ParsedCandidate {
+        title,
+        evidence,
+        suggestion,
+        cost,
+        brief_ready,
+        brief_note,
+    })
+}
+
+fn parse_prose_candidates(answer: &str) -> Vec<ParsedCandidate> {
+    // Strip fenced code blocks first.
+    let mut fence: Option<(char, usize)> = None;
+    let mut lines: Vec<&str> = Vec::new();
+    for line in answer.lines() {
+        if let Some((fc, flen)) = fence {
+            if let Some((c, len)) = radar_fence_marker(line) {
+                if c == fc && len >= flen && line.trim_start()[len..].trim().is_empty() {
+                    fence = None;
+                }
+            }
+            continue;
+        } else if let Some(m) = radar_fence_marker(line) {
+            fence = Some(m);
+            continue;
+        }
+        lines.push(line);
+    }
+
+    // 1. Prefer `### ` sections; if none, try `## ` sections unless the `## ` heading is just a
+    // wrapper around a top-level ordered or multi-item candidate list.
+    let has_h3 = lines.iter().any(|l| l.trim_start().starts_with("### "));
+    let heading_prefix = if has_h3 {
+        Some("### ")
+    } else if lines.iter().any(|l| l.trim_start().starts_with("## ")) {
+        Some("## ")
+    } else {
+        None
+    };
+
+    let mut blocks: Vec<(String, Vec<String>, bool)> = Vec::new();
+    if let Some(prefix) = heading_prefix {
+        let mut cur_header: Option<String> = None;
+        let mut cur_body: Vec<String> = Vec::new();
+        for &line in &lines {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                if let Some(hdr) = cur_header.take() {
+                    blocks.push((hdr, std::mem::take(&mut cur_body), true));
+                }
+                cur_header = Some(rest.trim().to_string());
+            } else if trimmed.starts_with("# ") || (prefix == "### " && trimmed.starts_with("## ")) {
+                if let Some(hdr) = cur_header.take() {
+                    blocks.push((hdr, std::mem::take(&mut cur_body), true));
+                }
+            } else if cur_header.is_some() {
+                cur_body.push(line.to_string());
+            }
+        }
+        if let Some(hdr) = cur_header {
+            blocks.push((hdr, cur_body, true));
+        }
+
+        // If there are no `### ` headings and the `## ` wrapper simply contains an ordered list
+        // (e.g. `## 本次新增候选\n1. ...\n2. ...`) or a single `## ` wraps multiple non-field bullet
+        // candidates, drop the heading wrapper so list splitting extracts every item individually.
+        if prefix == "## " {
+            let ordered_items = lines
+                .iter()
+                .filter(|l| strip_ordered_item_prefix(l).is_some())
+                .count();
+            let single_h2_wraps_bullets = blocks.len() == 1 && {
+                let body = &blocks[0].1;
+                let top_bullets: Vec<&str> = body
+                    .iter()
+                    .filter_map(|l| l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")))
+                    .collect();
+                let non_field_bullets = top_bullets
+                    .iter()
+                    .filter(|b| !is_candidate_field_line(b))
+                    .count();
+                top_bullets.len() >= 2 && non_field_bullets >= 2
+            };
+            if ordered_items >= 2 || (blocks.len() == 1 && ordered_items >= 1) || single_h2_wraps_bullets {
+                blocks.clear();
+            }
+        }
+    }
+
+    // 2. Fallback to top-level ordered list (`1. `, `2) `).
+    if blocks.is_empty() {
+        let mut cur_header: Option<String> = None;
+        let mut cur_body: Vec<String> = Vec::new();
+        for &line in &lines {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                if let Some(hdr) = cur_header.take() {
+                    blocks.push((hdr, std::mem::take(&mut cur_body), false));
+                }
+                continue;
+            }
+            if let Some(rest) = strip_ordered_item_prefix(line) {
+                if let Some(hdr) = cur_header.take() {
+                    blocks.push((hdr, std::mem::take(&mut cur_body), false));
+                }
+                cur_header = Some(rest.to_string());
+            } else if cur_header.is_some() {
+                cur_body.push(line.to_string());
+            }
+        }
+        if let Some(hdr) = cur_header {
+            blocks.push((hdr, cur_body, false));
+        }
+    }
+
+    // 3. Fallback to top-level unordered list (`- ` / `* ` without indentation).
+    if blocks.is_empty() {
+        let mut cur_header: Option<String> = None;
+        let mut cur_body: Vec<String> = Vec::new();
+        for &line in &lines {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                if let Some(hdr) = cur_header.take() {
+                    blocks.push((hdr, std::mem::take(&mut cur_body), false));
+                }
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+                if let Some(hdr) = cur_header.take() {
+                    blocks.push((hdr, std::mem::take(&mut cur_body), false));
+                }
+                cur_header = Some(rest.trim().to_string());
+            } else if cur_header.is_some() {
+                cur_body.push(line.to_string());
+            }
+        }
+        if let Some(hdr) = cur_header {
+            blocks.push((hdr, cur_body, false));
+        }
+    }
+
+    blocks
+        .into_iter()
+        .filter_map(|(hdr, body, is_heading)| parse_prose_candidate_block(&hdr, &body, is_heading))
+        .collect()
+}
+
+/// Extract candidates from the scout's answer: accepts legacy JSON arrays (raw or fenced)
+/// as well as natural prose sections (`### <title>` or top-level ordered/unordered lists).
+/// Never fails the whole run solely because the scout replied in prose instead of JSON.
+pub fn parse_scout_candidates(answer: &str) -> Res<Vec<ParsedCandidate>> {
+    let trimmed = answer.trim();
+    if trimmed.is_empty() || is_radar_none_reply(trimmed) {
+        return Ok(Vec::new());
+    }
+    if let Some(json_items) = try_parse_scout_json(trimmed) {
+        return Ok(json_items);
+    }
+    Ok(parse_prose_candidates(trimmed))
 }
 
 fn resolve_scout_config(config_val: &Value) -> Res<Value> {
@@ -562,16 +1023,8 @@ fn build_scout_prompt(
         "你是发散侦察员（Radar Scout）。请基于本次确定性采集输出与已有候选板，提出值得主控关注的新候选事项（缺口、回归风险、异常、可清理债、待收敛项）。\n\
          严格遵守以下边界：\n\
          1. **只读**：严禁修改、创建或删除任何文件；严禁调用 `delegate` 派发子任务。\n\
-         2. **必须带证据锚点**：每条候选的 `evidence` 至少包含一条可核验的锚点（`文件:行号`、`commit <短哈希>`、或本次采集输出行号如 `collect#1:L12`）。没有锚点的候选会被 Host 自动丢弃。\n\
-         3. **不重复已有候选**：已在上一份候选板中列出的事项不要重复提出。\n\
-         4. **严格输出 JSON 数组**（可用 ```json 代码块包裹），每个元素包含字段：\n\
-            - `title`（string）：简短清晰的标题\n\
-            - `evidence`（string[]）：证据锚点列表（每条含 `文件:行号` / `commit <sha>` / `collect#N:LN`）\n\
-            - `suggestion`（string）：具体建议做法（1-3 句）\n\
-            - `cost`（string）：粗估成本（例如 `低（约 15 分钟 / 1 文件）`、`中（半天 / 3-5 文件）`、`高（多模块）`）\n\
-            - `briefReady`（boolean）：能不能直接写成任务说明交给同事执行\n\
-            - `briefNote`（string，可选）：为何能或不能直接写成任务说明\n\
-         若本次采集没有值得新增的候选，直接输出 `[]`。\n\n\
+         2. **不重复已有候选**：已在上一份候选板中列出的事项不要重复提出。\n\
+         3. **自然小节输出**：每条候选以 `### <简短标题>`（或有序列表 `1. <简短标题>`）开头，自然写清发现的问题、带行号/commit 或采集输出行号（如 `文件:行号`、`commit <短哈希>`、`collect#1:L12`）的证据、建议动作、粗估成本及能否直接写成任务说明；无值得新增的候选直接写「无」。\n\n\
          ## 仓库\n\n`{}`\n\n\
          ## 本次确定性采集输出\n\n{}\n\n\
          ## 上一份候选板\n\n{}\n",
@@ -705,8 +1158,12 @@ fn render_board_md(board: &Value) -> String {
     md.push_str(&format!("- 更新时间：{updated_at}\n"));
     md.push_str(&format!("- 采集指纹：`{collect_fp}`\n"));
     md.push_str(&format!("- 当前候选：{count} 条\n\n"));
+    let last_note = s(board, "lastNote");
     if count == 0 {
         md.push_str("暂无候选事项。\n");
+        if !last_note.is_empty() {
+            md.push_str(&format!("\n> 注：{last_note}\n"));
+        }
         return md;
     }
 
@@ -749,6 +1206,9 @@ fn render_board_md(board: &Value) -> String {
             md.push_str(&format!("- **已生成草稿**：{picked_at}\n"));
         }
         md.push_str(&format!("- **挑选生成草稿**：`delegate radar pick {id}`\n\n"));
+    }
+    if !last_note.is_empty() {
+        md.push_str(&format!("> 注：{last_note}\n"));
     }
     md
 }
@@ -1240,10 +1700,12 @@ fn run_command(args: &[String]) -> Res<i32> {
             return Err(e);
         }
     };
-    let _ = write(radar_dir.join("last-scout-output.md"), &raw_answer);
+    let last_output_path = radar_dir.join("last-scout-output.md");
+    let _ = write(&last_output_path, &raw_answer);
     let _ = fs::remove_dir_all(&run_scratch);
 
     let parsed = parse_scout_candidates(&raw_answer)?;
+    let parsed_empty = parsed.is_empty();
     let now = iso();
     let mut board = load_board_doc(&radar_dir, &repo_canon);
     board["repo"] = json!(&repo_str);
@@ -1323,6 +1785,19 @@ fn run_command(args: &[String]) -> Res<i32> {
     }
 
     board["candidates"] = json!(merged_candidates);
+    if dropped_no_anchor > 0 {
+        board["lastNote"] = json!(format!(
+            "本轮有 {dropped_no_anchor} 条候选未提取到具体证据锚点，已跳过入板；完整侦察原文见 `{}`",
+            last_output_path.display()
+        ));
+    } else if parsed_empty && !raw_answer.trim().is_empty() && !is_radar_none_reply(&raw_answer) {
+        board["lastNote"] = json!(format!(
+            "本轮侦察未提取到带证据锚点的候选条目；完整侦察原文见 `{}`",
+            last_output_path.display()
+        ));
+    } else if let Some(obj) = board.as_object_mut() {
+        obj.remove("lastNote");
+    }
     let total = board["candidates"].as_array().map_or(0, Vec::len);
     let board_path = save_board_doc(&radar_dir, &board)?;
 
@@ -1436,6 +1911,85 @@ mod tests {
 
         let empty = parse_scout_candidates("[]").unwrap();
         assert!(empty.is_empty());
+        assert!(parse_scout_candidates("无").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_scout_candidates_handles_prose_sections_ordered_lists_and_missing_anchors() {
+        let prose = "\
+### 补齐重试退避测试
+- 证据：`src/retry.rs:42-58` 缺少超时退避断言（参见 collect#2:L10）
+- 建议：在 `tests/retry.rs` 增加退避上限单测。
+- 成本：低（15 分钟）
+- 可直接写成任务说明：是（边界明确）
+
+### 没有锚点的模糊想法
+- 感觉这里可以再抽象一层，让代码更好看。
+- 成本：中
+";
+        let items = parse_scout_candidates(prose).unwrap();
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0].title, "补齐重试退避测试");
+        assert!(has_valid_evidence_anchor(&items[0].evidence), "{:?}", items[0]);
+        assert!(items[0].brief_ready);
+        assert_eq!(items[0].brief_note, "边界明确");
+        assert!(items[0].suggestion.contains("退避上限单测"));
+        // Anchorless block does not fail parsing; caller skips it with a factual note.
+        assert_eq!(items[1].title, "没有锚点的模糊想法");
+        assert!(!has_valid_evidence_anchor(&items[1].evidence));
+
+        let ordered = "\
+1. **清理废弃配置**：`crates/delegate/src/config.rs#L120` 仍保留旧字段，建议删除。
+   - 成本：低
+2. 核对提交 commit 61951c8 的兼容逻辑，第 12-30 行存在重复分支。
+";
+        let ord_items = parse_scout_candidates(ordered).unwrap();
+        assert_eq!(ord_items.len(), 2, "{ord_items:?}");
+        assert_eq!(ord_items[0].title, "清理废弃配置");
+        assert!(has_valid_evidence_anchor(&ord_items[0].evidence));
+        assert!(has_valid_evidence_anchor(&ord_items[1].evidence));
+        assert!(is_valid_evidence_anchor("第 12-30 行存在重复分支"));
+
+        // Board markdown renders `lastNote` pointing to `last-scout-output.md`.
+        let md = render_board_md(&json!({
+            "repo": "/tmp/demo",
+            "repoName": "demo",
+            "updatedAt": "2026-11-27T00:00:00Z",
+            "lastFingerprint": "sha256:1234567890abcdef",
+            "candidates": [],
+            "lastNote": "本轮有 1 条候选未提取到具体证据锚点，已跳过入板；完整侦察原文见 `/tmp/last-scout-output.md`",
+        }));
+        assert!(md.contains("last-scout-output.md"), "{md}");
+
+        // `## ` wrapper heading around an ordered list must split each list item, not collapse to 1.
+        let h2_wrapped_ordered = "\
+## 本次新增候选
+
+1. **清理废弃配置**：`crates/delegate/src/config.rs:120` 仍保留旧字段，建议删除。
+2. **补齐超时测试**：`src/retry.rs:42` 缺少超时覆盖，建议补齐单测。
+";
+        let wrapped = parse_scout_candidates(h2_wrapped_ordered).unwrap();
+        assert_eq!(wrapped.len(), 2, "{wrapped:?}");
+        assert_eq!(wrapped[0].title, "清理废弃配置");
+        assert_eq!(wrapped[1].title, "补齐超时测试");
+        assert!(has_valid_evidence_anchor(&wrapped[0].evidence));
+        assert!(has_valid_evidence_anchor(&wrapped[1].evidence));
+
+        // Same-prefix `### 分类：具体标题` sections must keep full titles so they do not collide on dedup.
+        let same_prefix = "\
+### 回归风险：未处理空数组
+- 证据：`src/parser.rs:15` 未判空
+- 建议：补空数组守卫
+
+### 回归风险：缺少超时控制
+- 证据：`src/client.rs:88` 未设超时
+- 建议：加默认超时
+";
+        let prefixed = parse_scout_candidates(same_prefix).unwrap();
+        assert_eq!(prefixed.len(), 2, "{prefixed:?}");
+        assert_eq!(prefixed[0].title, "回归风险：未处理空数组");
+        assert_eq!(prefixed[1].title, "回归风险：缺少超时控制");
+        assert_ne!(normalize_key(&prefixed[0].title), normalize_key(&prefixed[1].title));
     }
 
     #[test]

@@ -313,7 +313,7 @@ pub(crate) fn settle_pre_accept(
     verdict: &str,
     setup_error: &Option<String>,
     holder: Arc<AtomicI32>,
-    question: bool,
+    answer: &str,
 ) -> PreAccept {
     let mut state = if verdict == "ok" {
         "answered".to_string()
@@ -321,10 +321,6 @@ pub(crate) fn settle_pre_accept(
         verdict.into()
     };
     let mut sum = json!({"state":state});
-    if question {
-        // A question waits for the delegator; acceptance and escalation do not apply.
-        sum["question"] = json!(true);
-    }
     if verdict == "stalled" {
         let reason = json(run.join("stall.json"));
         if reason.is_object() {
@@ -365,6 +361,20 @@ pub(crate) fn settle_pre_accept(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let question_kind = if verdict == "ok" {
+        agents::classify_question(answer, changed.is_empty())
+    } else {
+        agents::QuestionKind::None
+    };
+    let question = question_kind == agents::QuestionKind::Blocking;
+    if question {
+        // A blocking question waits for the delegator; acceptance and escalation do not apply.
+        sum["question"] = json!(true);
+    } else if question_kind == agents::QuestionKind::TrailingNote {
+        // Files changed without an opening stop-to-ask signal: run acceptance & review as usual,
+        // and carry a factual note to the card.
+        sum["answerHasQuestion"] = json!(true);
+    }
     let source_changed = crate::source_watch::changed(meta);
     let attributed_source = if s(meta, "mode") == "write" || b(meta, "shell") {
         crate::source_watch::attributed(meta, run, &source_changed)
@@ -2295,7 +2305,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         &verdict,
         &setup_error,
         holder.clone(),
-        verdict == "ok" && agents::is_question(&answer),
+        &answer,
     );
     if !auth_failed && transient_error.is_empty() && verdict == "failed" {
         if let Some((kind, msg)) = transient::ended_by_kind(run, attempts) {
@@ -2323,7 +2333,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
             &verdict,
             &setup_error,
             holder.clone(),
-            verdict == "ok" && agents::is_question(&answer),
+            &answer,
         );
         pre.sum["escalatedFrom"] = json!(original_model);
     }

@@ -599,21 +599,266 @@ pub const COLLEAGUE: &str = "You are a delegated colleague: a delegator gave you
 pub const REVIEWER_COLLEAGUE: &str = "You are an independent read-only code reviewer running in a fresh context.
 - Do not create, modify, or delete any files, and do not delegate subtasks.
 - Acceptance checks are run independently in parallel by the Host (which handles and summarizes the results, and cancels the review automatically if slow acceptance fails). Do not run acceptance commands or poll/wait for writer or acceptance processes (e.g. via `ps`/`sleep`); judge directly from the read-only snapshot and diff.
-- Your VERY FIRST output line MUST be exactly one of: `PASS`, `REWORK`, or `NEEDS_CONTROLLER` (no prefix, no markdown formatting, no extra text on line 1).
-- Use `PASS` when changes satisfy the brief with no blocking defects, regressions, vacuous tests, or out-of-scope edits.
-- Use `REWORK` when concrete fixable issues exist; list each issue with `file:line` evidence and required fix.
-- Use `NEEDS_CONTROLLER` when a requirement ambiguity, architecture trade-off, out-of-authority change, or inability to verify requires the controller's decision.
+- 开头先给一句明确结论（通过 / 需返工 / 需主控决定，或 PASS / REWORK / NEEDS_CONTROLLER），下面自然写核查依据与重点关注位置。
+- 通过 / PASS: changes satisfy the brief with no blocking defects, regressions, vacuous tests, or out-of-scope edits.
+- 需返工 / REWORK: concrete fixable issues exist; list each issue with evidence and required fix.
+- 需主控决定 / NEEDS_CONTROLLER: a requirement ambiguity, architecture trade-off, out-of-authority change, or inability to verify requires the controller's decision.
 - After a context compaction, continue from the summary; do not restart.
 ";
-pub const QUESTION_MARKERS: [&str; 2] = ["需要主控决定", "Needs a decision"];
 
-/// The colleague stopped to ask: its answer opens with a question marker.
-pub fn is_question(answer: &str) -> bool {
-    answer
-        .lines()
-        .map(|line| line.trim().trim_start_matches(['#', '*', '>', ' ']))
-        .find(|line| !line.is_empty())
-        .is_some_and(|line| QUESTION_MARKERS.iter().any(|m| line.starts_with(m)))
+/// Outcome of classifying whether a colleague's answer contains a question for the controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestionKind {
+    /// No pending question detected.
+    None,
+    /// Stop-to-ask (explicit opening signal, or natural question when no files changed):
+    /// pause in `question` state and skip acceptance until `delegate reply`.
+    Blocking,
+    /// Files were edited and the opening did not signal stop-to-ask, but the reply contains a
+    /// natural question: run acceptance and review as usual, and attach a factual note on the card.
+    TrailingNote,
+}
+
+fn md_fence_marker(line: &str) -> Option<(char, usize)> {
+    let trimmed = line.trim_start();
+    let ch = trimmed.chars().next()?;
+    if ch != '`' && ch != '~' {
+        return None;
+    }
+    let count = trimmed.chars().take_while(|&c| c == ch).count();
+    (count >= 3).then_some((ch, count))
+}
+
+fn contains_positive_zh(haystack: &str, phrase: &str) -> bool {
+    let mut search_from = 0usize;
+    while let Some(rel) = haystack[search_from..].find(phrase) {
+        let idx = search_from + rel;
+        let prev_char = haystack[..idx].chars().next_back();
+        if !matches!(prev_char, Some('无' | '不' | '未' | '非' | '没')) {
+            return true;
+        }
+        search_from = idx + phrase.len();
+    }
+    false
+}
+
+fn contains_positive_en(lower_haystack: &str, phrase: &str) -> bool {
+    let mut search_from = 0usize;
+    while let Some(rel) = lower_haystack[search_from..].find(phrase) {
+        let idx = search_from + rel;
+        let prefix = lower_haystack[..idx].trim_end();
+        let negated = prefix.ends_with("no")
+            || prefix.ends_with("not")
+            || prefix.ends_with("don't")
+            || prefix.ends_with("without")
+            || prefix.ends_with("never");
+        if !negated {
+            return true;
+        }
+        search_from = idx + phrase.len();
+    }
+    false
+}
+
+fn strip_question_decor(line: &str) -> &str {
+    line.trim().trim_matches([
+        '#', '*', '_', '`', '>', '-', '•', '[', ']', '【', '】', '(', ')', '（', '）', ' ',
+    ])
+}
+
+fn has_opening_stop_phrase(line: &str) -> bool {
+    let stripped = strip_question_decor(line);
+    if stripped.is_empty() {
+        return false;
+    }
+    const ZH_STOP: &[&str] = &[
+        "需要主控",
+        "需主控",
+        "暂停等主控",
+        "停工等主控",
+        "向主控提问",
+    ];
+    if ZH_STOP.iter().any(|p| contains_positive_zh(stripped, p)) {
+        return true;
+    }
+    let lower = stripped.to_ascii_lowercase();
+    const EN_STOP: &[&str] = &[
+        "needs a decision",
+        "need a decision",
+        "needs controller",
+        "need controller",
+    ];
+    EN_STOP.iter().any(|p| contains_positive_en(&lower, p))
+}
+
+fn has_natural_question_phrase(line: &str) -> bool {
+    if has_opening_stop_phrase(line) {
+        return true;
+    }
+    let stripped = strip_question_decor(line);
+    if stripped.is_empty() {
+        return false;
+    }
+    const ZH_PHRASES: &[&str] = &[
+        "请主控",
+        "待主控",
+        "请拍板",
+        "待拍板",
+        "请确认",
+        "需要确认",
+        "需确认",
+        "请决定",
+        "待决定",
+        "开工前确认",
+        "开工前请",
+    ];
+    if ZH_PHRASES.iter().any(|p| contains_positive_zh(stripped, p)) {
+        return true;
+    }
+    let lower = stripped.to_ascii_lowercase();
+    const EN_PHRASES: &[&str] = &["please confirm", "please decide", "controller decision"];
+    EN_PHRASES.iter().any(|p| contains_positive_en(&lower, p))
+}
+
+fn is_non_heading_question_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return false;
+    }
+    let body = trimmed
+        .trim_end_matches(['”', '"', '\'', '」', '』', ')', '）', '*', '`'])
+        .trim_end();
+    if !(body.ends_with('？') || body.ends_with('?')) {
+        return false;
+    }
+    let last_token = body.split_whitespace().next_back().unwrap_or(body);
+    !(last_token.contains("://") && body.ends_with('?'))
+}
+
+/// Explicit stop-to-ask signal within the first 3 non-empty lines (skipping fenced code blocks).
+/// Used when files have already been edited so trailing casual questions never bypass `accept`.
+pub fn has_opening_stop_question(answer: &str) -> bool {
+    let mut fence: Option<(char, usize)> = None;
+    let mut seen = 0usize;
+    for line in answer.lines() {
+        if let Some((fc, flen)) = fence {
+            if let Some((c, len)) = md_fence_marker(line) {
+                if c == fc && len >= flen && line.trim_start()[len..].trim().is_empty() {
+                    fence = None;
+                }
+            }
+            continue;
+        } else if let Some(m) = md_fence_marker(line) {
+            fence = Some(m);
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "---" || trimmed == "***" {
+            continue;
+        }
+        seen += 1;
+        if has_opening_stop_phrase(trimmed) {
+            return true;
+        }
+        if seen >= 3 {
+            break;
+        }
+    }
+    false
+}
+
+/// Relaxed natural-language question detection across the opening and closing paragraphs
+/// (skipping fenced code blocks). Used when zero files were modified (including read-only scouts)
+/// and for attaching a non-blocking factual note when files were edited.
+pub fn has_natural_question(answer: &str) -> bool {
+    if has_opening_stop_question(answer) {
+        return true;
+    }
+    let mut fence: Option<(char, usize)> = None;
+    let mut paragraphs: Vec<Vec<&str>> = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+
+    for line in answer.lines() {
+        if let Some((fc, flen)) = fence {
+            if let Some((c, len)) = md_fence_marker(line) {
+                if c == fc && len >= flen && line.trim_start()[len..].trim().is_empty() {
+                    fence = None;
+                }
+            }
+            continue;
+        } else if let Some(m) = md_fence_marker(line) {
+            fence = Some(m);
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "---" || trimmed == "***" {
+            if !current.is_empty() {
+                paragraphs.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(trimmed);
+        }
+    }
+    if !current.is_empty() {
+        paragraphs.push(current);
+    }
+    if paragraphs.is_empty() {
+        return false;
+    }
+
+    let mut opening: Vec<&str> = Vec::new();
+    for (p_idx, para) in paragraphs.iter().enumerate() {
+        if p_idx > 0 && opening.iter().any(|l| !l.starts_with('#')) {
+            break;
+        }
+        for &line in para {
+            if p_idx > 0 && line.starts_with('#') && !opening.is_empty() {
+                break;
+            }
+            opening.push(line);
+            if opening.len() >= 6 {
+                break;
+            }
+        }
+        if opening.len() >= 6 {
+            break;
+        }
+    }
+    if opening
+        .iter()
+        .any(|l| has_natural_question_phrase(l) || is_non_heading_question_line(l))
+    {
+        return true;
+    }
+    if paragraphs.len() > 1 {
+        if let Some(last) = paragraphs.last() {
+            if last
+                .iter()
+                .any(|l| has_natural_question_phrase(l) || is_non_heading_question_line(l))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Classify whether a colleague's answer should pause as a blocking question or only carry a
+/// non-blocking factual note, conditioned on whether the workspace had file changes.
+pub fn classify_question(answer: &str, changed_empty: bool) -> QuestionKind {
+    if changed_empty {
+        if has_natural_question(answer) {
+            QuestionKind::Blocking
+        } else {
+            QuestionKind::None
+        }
+    } else if has_opening_stop_question(answer) {
+        QuestionKind::Blocking
+    } else if has_natural_question(answer) {
+        QuestionKind::TrailingNote
+    } else {
+        QuestionKind::None
+    }
 }
 
 fn binary_cache_sig(bin: &Path, include_pi_models_cfg: bool) -> Option<String> {
@@ -2948,5 +3193,44 @@ mod tests {
         assert!(!pi_supports_rpc_steer(&no_steer_bin, Some("rpi 0.19.0")));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classify_question_branches_on_changed_empty() {
+        // Branch A: zero files modified -> relaxed natural question detection pauses as Blocking.
+        assert_eq!(
+            classify_question("查到两处实现冲突，请确认按方案 A 还是 B？", true),
+            QuestionKind::Blocking
+        );
+        assert_eq!(
+            classify_question("## 现状\n已排查完成。\n\n请问是否需要兼容旧字段？", true),
+            QuestionKind::Blocking
+        );
+        assert_eq!(
+            classify_question("已完成调研，无需主控介入，一切正常。", true),
+            QuestionKind::None
+        );
+
+        // Branch B: files were modified -> only explicit opening stop-to-ask skips accept;
+        // trailing natural question produces TrailingNote so accept & review still run.
+        assert_eq!(
+            classify_question("**需要主控决定**\n改到一半发现契约冲突，倾向 A。", false),
+            QuestionKind::Blocking
+        );
+        assert_eq!(
+            classify_question("# 暂停等主控\n是否删除旧配置字段？", false),
+            QuestionKind::Blocking
+        );
+        assert_eq!(
+            classify_question(
+                "已完成改动并跑完单测。\n- 修改了 src/a.rs\n\n顺便确认一下，下次要不要把旧别名一起删掉？",
+                false
+            ),
+            QuestionKind::TrailingNote
+        );
+        assert_eq!(
+            classify_question("已完成全部改动，验收全绿，无需主控确认。", false),
+            QuestionKind::None
+        );
     }
 }

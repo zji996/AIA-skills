@@ -189,7 +189,7 @@ class Delegate629Tests(unittest.TestCase):
             f"    Path('a.txt').write_text('v1\\n')\n"
             f"    emit_answer('done')\n"
             f"else:\n"
-            f"    emit_answer('**PASS**\\nLooks good to me!')\n"
+            f"    emit_answer('等日志跑完再说。\\n暂时还没下结论。')\n"
         )
         run_a = self.outcome(
             self.cli("start", "--workdir", repo, "--worktree", "--name", "bad-fmt", "--accept", "true", "task")
