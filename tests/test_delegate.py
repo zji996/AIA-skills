@@ -3009,24 +3009,41 @@ db.write_text(json.dumps(units))
         self.assertIn("a.txt", refused.stderr)
         self.assertEqual(len((self.work / "pi.log").read_text().splitlines()), calls)
 
-    def test_reply_sync_ignores_unchanged_gitlinks_but_rejects_pointer_changes(self):
+    def test_reply_sync_adopts_unchanged_gitlink_pointer_and_conflicts_when_run_changed(self):
         repo = self.sub_repo()
         init = "git -c protocol.file.allow=always submodule update --init -q vendor"
-        self.fake_pi([answer("one"), SETTLED], pre=init)
+        self.fake_pi([answer("one"), SETTLED], pre=f"{init}; echo r1 >> a.txt")
         self.outcome(self.cli("run", "--worktree", "--workdir", repo, "--name", "conv", "one"))
-        (repo / "a.txt").write_text("a\ncaller\n")
-        self.fake_pi([answer("two"), SETTLED], pre="test -f vendor/lib.txt && cat a.txt > seen.txt")
+        (repo / "b.txt").write_text("b\ncaller\n")
+        self.fake_pi([answer("two"), SETTLED], pre="test -f vendor/lib.txt && cat b.txt > seen.txt")
         second = self.outcome(self.cli("reply", "--wait", "conv", "--sync", "two"))
         self.assertEqual(second["state"], "answered")
-        self.assertEqual((Path(second["worktree"]) / "seen.txt").read_text(), "a\ncaller\n")
-        self.assertEqual(json.loads((Path(second["dir"]) / "sync.json").read_text())["files"], ["a.txt"])
+        self.assertEqual((Path(second["worktree"]) / "seen.txt").read_text(), "b\ncaller\n")
+        self.assertEqual(json.loads((Path(second["dir"]) / "sync.json").read_text())["files"], ["b.txt"])
+        # Source advances the submodule pointer while the run did not touch `vendor`:
+        # `reply --sync` adopts source's pointer and checks it out in the initialized worktree submodule.
         vendor = repo / "vendor"
         (vendor / "lib.txt").write_text("v2\n")
         subprocess.run(["git", "-C", str(vendor), "add", "lib.txt"], check=True)
         subprocess.run(["git", "-C", str(vendor), "-c", "user.name=t", "-c", "user.email=t@t",
                         "commit", "-qm", "v2"], check=True)
+        self.fake_pi([answer("three"), SETTLED], pre="cat vendor/lib.txt > seen_vendor.txt")
+        third = self.outcome(self.cli("reply", "--over-limit", "reply mechanics", "--wait", "conv", "--sync", "three"))
+        self.assertEqual(third["state"], "answered")
+        self.assertEqual((Path(third["worktree"]) / "vendor/lib.txt").read_text(), "v2\n")
+        self.assertEqual((Path(third["worktree"]) / "seen_vendor.txt").read_text(), "v2\n")
+        # Both sides advance `vendor` -> `reply --sync` still rejects with a gitlink conflict.
+        wt_vendor = Path(third["worktree"]) / "vendor"
+        (wt_vendor / "lib.txt").write_text("v3-run\n")
+        subprocess.run(["git", "-C", str(wt_vendor), "add", "lib.txt"], check=True)
+        subprocess.run(["git", "-C", str(wt_vendor), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-qm", "v3-run"], check=True)
+        (vendor / "lib.txt").write_text("v3-caller\n")
+        subprocess.run(["git", "-C", str(vendor), "add", "lib.txt"], check=True)
+        subprocess.run(["git", "-C", str(vendor), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-qm", "v3-caller"], check=True)
         calls = len((self.work / "pi.log").read_text().splitlines())
-        refused = self.cli("reply", "--over-limit", "reply mechanics", "conv", "--sync", "three")
+        refused = self.cli("reply", "--over-limit", "reply mechanics", "conv", "--sync", "four")
         self.assertEqual(refused.returncode, 2)
         self.assertIn("--sync conflict in: vendor", refused.stderr)
         self.assertEqual(len((self.work / "pi.log").read_text().splitlines()), calls)

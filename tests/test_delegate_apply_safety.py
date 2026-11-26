@@ -130,7 +130,10 @@ class DelegateApplySafetyTests(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_1_apply_conflict_commit_exits_3_and_blocks_shell_and_chain(self):
         repo = self.repo({"shared.txt": "base\n"})
-        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo colleague > shared.txt")
+        self.fake_pi(
+            [fixtures.answer("done"), fixtures.SETTLED],
+            pre="echo colleague > shared.txt && git add shared.txt && git -c user.name=t -c user.email=t@t commit -qm 'colleague edit'",
+        )
         run = self.outcome(
             self.cli("run", "--worktree", "--workdir", repo, "--name", "c1", "--accept", "true", "edit")
         )
@@ -154,6 +157,8 @@ class DelegateApplySafetyTests(unittest.TestCase):
             timeout=30,
         )
         self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        first_line = res.stdout.splitlines()[0] if res.stdout.splitlines() else ""
+        self.assertTrue(first_line.startswith("未合入："), f"expected stdout first line '未合入：...', got: {res.stdout!r}")
         self.assertIn("!!! apply 失败（阶段：文件冲突 / conflicts", res.stdout)
         self.assertEqual(self.git(repo, "rev-parse", "HEAD"), head_before)
         self.assertEqual(self.git(repo, "log", "-1", "--pretty=%s"), "original subject")
@@ -163,25 +168,38 @@ class DelegateApplySafetyTests(unittest.TestCase):
         self.assertEqual(merged.returncode, 3, merged.stdout + merged.stderr)
         self.assertIn("<<<<<<< current", (repo / "shared.txt").read_text(encoding="utf-8"))
 
-        # Subsequent apply onto unresolved conflict markers exits 3 as well.
+        # Subsequent apply onto unresolved conflict markers exits 3 as well, with stdout first line `未合入：...`.
         self.fake_pi([fixtures.answer("done2"), fixtures.SETTLED], pre="echo second > shared.txt")
         run2 = self.outcome(
             self.cli("run", "--worktree", "--workdir", repo, "--name", "c2", "--accept", "true", "edit2")
         )
         blocked = self.cli("apply", run2["run"], cwd=repo, human=True)
         self.assertEqual(blocked.returncode, 3, blocked.stdout + blocked.stderr)
+        blocked_first = blocked.stdout.splitlines()[0] if blocked.stdout.splitlines() else ""
+        self.assertTrue(
+            blocked_first.startswith("未合入："),
+            f"expected stdout first line '未合入：...', got: {blocked.stdout!r}",
+        )
         self.assertIn("冲突标记未解决", blocked.stderr)
 
     def test_1b_apply_non_conflict_failure_exits_1_and_merge_conflict_exits_3(self):
-        # Dirty-overlap (non-conflict failure) exits 1.
+        # Dirty-overlap (non-conflict failure) exits 1 and starts stdout with `未合入：...` (never ` commit ...`).
         repo = self.repo({"a.txt": "line1\nline2\nline3\nline4\nline5\n"})
-        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="sed -i s/line1/ONE/ a.txt")
+        self.fake_pi(
+            [fixtures.answer("done"), fixtures.SETTLED],
+            pre="sed -i s/line1/ONE/ a.txt && git add a.txt && git -c user.name=t -c user.email=t@t commit -qm 'edit a'",
+        )
         r_dirty = self.outcome(
             self.cli("run", "--worktree", "--workdir", repo, "--name", "dirty1", "--accept", "true", "edit")
         )
         (repo / "a.txt").write_text("line1\nline2\nline3\nline4\nFIVE\n", encoding="utf-8")
         res_dirty = self.cli("apply", r_dirty["run"], cwd=repo, human=True)
         self.assertEqual(res_dirty.returncode, 1, res_dirty.stdout + res_dirty.stderr)
+        dirty_first = res_dirty.stdout.splitlines()[0] if res_dirty.stdout.splitlines() else ""
+        self.assertTrue(
+            dirty_first.startswith("未合入："),
+            f"expected stdout first line '未合入：...', got: {res_dirty.stdout!r}",
+        )
         self.assertIn("!!! apply 失败", res_dirty.stdout)
 
         # Clean working tree, commit a conflicting change, then test `delegate merge` conflict exit 3.
@@ -193,6 +211,108 @@ class DelegateApplySafetyTests(unittest.TestCase):
         rep = json.loads(res_merge.stdout)
         self.assertEqual(rep["mergedCount"], 0)
         self.assertEqual(rep["skippedCount"], 1)
+
+    def test_1c_apply_ignores_unchanged_gitlink_drift_and_conflicts_when_run_changed_gitlink(self):
+        # Build a repo with a committed submodule `vendor`.
+        repo = self.repo({"a.txt": "a\n", "b.txt": "b\n"})
+        sub = self.work / "sub_lib"
+        git_cfg = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always"]
+        subprocess.run(["git", "init", "-q", str(sub)], check=True)
+        (sub / "lib.txt").write_text("v1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(sub), *git_cfg, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(sub), *git_cfg, "commit", "-qm", "v1"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), *git_cfg, "submodule", "add", "-q", sub.as_uri(), "vendor"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "-C", str(repo), *git_cfg, "commit", "-qm", "add vendor"], check=True)
+
+        # Run only edits `a.txt` and `b.txt`, never touches `vendor`.
+        self.fake_pi(
+            [fixtures.answer("done"), fixtures.SETTLED],
+            pre="echo r1 >> a.txt && echo r1 >> b.txt && git add a.txt b.txt && git -c user.name=t -c user.email=t@t commit -qm 'edit ab'",
+        )
+        run = self.outcome(
+            self.cli("run", "--worktree", "--workdir", repo, "--name", "gitlink-ok", "--accept", "true", "edit")
+        )
+
+        # Source advances `vendor` gitlink pointer to v2 and commits it.
+        vendor = repo / "vendor"
+        (vendor / "lib.txt").write_text("v2\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(vendor), *git_cfg, "add", "lib.txt"], check=True)
+        subprocess.run(["git", "-C", str(vendor), *git_cfg, "commit", "-qm", "v2"], check=True)
+        v2_sha = self.git(vendor, "rev-parse", "HEAD")
+        self.git(repo, "add", "vendor")
+        subprocess.run(["git", "-C", str(repo), *git_cfg, "commit", "-qm", "bump vendor to v2"], check=True)
+
+        # Simulate `.sync-base` recording source's new tree (with vendor=v2) while worktree still has vendor=v1
+        # (reproducing the exact condition where `before..after` saw `vendor` even though `diff --total` did not).
+        src_tree = self.git(repo, "rev-parse", "HEAD^{tree}")
+        run_dir = Path(run["dir"])
+        (run_dir / ".sync-base").write_text(
+            json.dumps({"tree": src_tree, "large": {}, "largeHashes": {}}),
+            encoding="utf-8",
+        )
+
+        # 1) Default `apply` (without `--merge`) MUST write both files and exit 0 with ok:true.
+        res_plain = self.cli("apply", "--keep", "--json", run["run"], cwd=repo)
+        self.assertEqual(res_plain.returncode, 0, res_plain.stdout + res_plain.stderr)
+        doc_plain = self.outcome(res_plain)
+        self.assertTrue(doc_plain["apply"]["ok"])
+        self.assertEqual((repo / "a.txt").read_text(encoding="utf-8"), "a\nr1\n")
+        self.assertEqual((repo / "b.txt").read_text(encoding="utf-8"), "b\nr1\n")
+        self.assertEqual(self.git(vendor, "rev-parse", "HEAD"), v2_sha)
+
+        # 2) `apply --merge` MUST ALSO write both files, exit 0 with ok:true, and NOT report skipped-conflicts.
+        self.git(repo, "checkout", "--", "a.txt", "b.txt")
+        for marker in (".applied", ".applied-cleaned"):
+            p = run_dir / marker
+            if p.exists():
+                p.unlink()
+        (run_dir / ".sync-base").write_text(
+            json.dumps({"tree": src_tree, "large": {}, "largeHashes": {}}),
+            encoding="utf-8",
+        )
+        res_merge = self.cli("apply", "--merge", "--keep", "--json", run["run"], cwd=repo)
+        self.assertEqual(res_merge.returncode, 0, res_merge.stdout + res_merge.stderr)
+        doc_merge = self.outcome(res_merge)
+        self.assertTrue(doc_merge["apply"]["ok"])
+        self.assertIsNone(doc_merge["apply"].get("failedStep"))
+        self.assertEqual((repo / "a.txt").read_text(encoding="utf-8"), "a\nr1\n")
+        self.assertEqual((repo / "b.txt").read_text(encoding="utf-8"), "b\nr1\n")
+        self.assertEqual(self.git(vendor, "rev-parse", "HEAD"), v2_sha)
+
+        # 3) When the run ACTUALLY modifies `vendor` AND source also advances `vendor`, `apply` MUST conflict.
+        self.git(repo, "checkout", "--", "a.txt", "b.txt")
+        self.fake_pi(
+            [fixtures.answer("done"), fixtures.SETTLED],
+            pre=(
+                "git -c protocol.file.allow=always submodule update --init -q vendor && "
+                "echo v3-run > vendor/lib.txt && "
+                "git -C vendor add lib.txt && "
+                "git -C vendor -c user.name=t -c user.email=t@t commit -qm v3-run && "
+                "git add vendor && "
+                "git -c user.name=t -c user.email=t@t commit -qm 'run bump vendor'"
+            ),
+        )
+        run_gl = self.outcome(
+            self.cli("run", "--worktree", "--workdir", repo, "--name", "gitlink-conflict", "--accept", "true", "bump")
+        )
+        (vendor / "lib.txt").write_text("v3-src\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(vendor), *git_cfg, "add", "lib.txt"], check=True)
+        subprocess.run(["git", "-C", str(vendor), *git_cfg, "commit", "-qm", "v3-src"], check=True)
+        self.git(repo, "add", "vendor")
+        subprocess.run(["git", "-C", str(repo), *git_cfg, "commit", "-qm", "src bump vendor"], check=True)
+
+        res_conflict = self.cli("apply", run_gl["run"], cwd=repo, human=True)
+        self.assertEqual(res_conflict.returncode, 3, res_conflict.stdout + res_conflict.stderr)
+        conflict_first = res_conflict.stdout.splitlines()[0] if res_conflict.stdout.splitlines() else ""
+        self.assertTrue(
+            conflict_first.startswith("未合入："),
+            f"expected stdout first line '未合入：...', got: {res_conflict.stdout!r}",
+        )
+        self.assertIn("vendor", res_conflict.stdout)
 
     # ------------------------------------------------------------------
     # 2. `delegate adopt <run>...` & Stop hook `/clear` hint

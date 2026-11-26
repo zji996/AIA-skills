@@ -1821,6 +1821,122 @@ pub fn sync_to_head(run: &Path, meta: &Value) -> Res<SyncReport> {
     sync_with_mode_inner(run, meta, SyncMode::Auto, true)
 }
 
+fn worktree_index_entry(worktree: &Path, path: &str) -> Res<Option<(String, String)>> {
+    let out = git(worktree, &["ls-files", "--stage", "-z", "--", path])?;
+    let text = String::from_utf8_lossy(&out);
+    for rec in text.split('\0').filter(|r| !r.is_empty()) {
+        if let Some((attrs, name)) = rec.split_once('\t') {
+            if name == path {
+                let fields: Vec<_> = attrs.split_whitespace().collect();
+                if fields.len() >= 2 {
+                    return Ok(Some((fields[0].to_string(), fields[1].to_string())));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn worktree_changed_gitlink(
+    worktree: &Path,
+    path: &str,
+    base_gitlink: Option<&str>,
+) -> Res<bool> {
+    let wt_head = gitlink(worktree, "HEAD", path)?;
+    if wt_head.as_deref() != base_gitlink {
+        return Ok(true);
+    }
+    match worktree_index_entry(worktree, path)? {
+        Some((mode, oid)) => {
+            if mode != "160000" || Some(oid.as_str()) != base_gitlink {
+                return Ok(true);
+            }
+        }
+        None => {
+            if base_gitlink.is_some() {
+                return Ok(true);
+            }
+        }
+    }
+    let sub_dir = worktree.join(path);
+    if sub_dir.join(".git").exists() {
+        let Ok(sub_head) = git_text(&sub_dir, &["rev-parse", "-q", "--verify", "HEAD"]) else {
+            return Ok(true);
+        };
+        if Some(sub_head.as_str()) != base_gitlink {
+            return Ok(true);
+        }
+        let status = git(&sub_dir, &["status", "--porcelain"])?;
+        if !status.trim_ascii().is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_submodule_commit(
+    source: &Path,
+    worktree: &Path,
+    path: &str,
+    target_oid: &str,
+) -> Result<(), String> {
+    let sub_dir = worktree.join(path);
+    let spec = format!("{target_oid}^{{commit}}");
+    let has_commit = || {
+        git_command()
+            .arg("-C")
+            .arg(&sub_dir)
+            .args(["cat-file", "-e", &spec])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if has_commit() {
+        return Ok(());
+    }
+    let mut last_err = String::new();
+    if let Ok(out) = git_command()
+        .arg("-C")
+        .arg(&sub_dir)
+        .args(["-c", "protocol.file.allow=always", "fetch", "--no-tags"])
+        .output()
+    {
+        if has_commit() {
+            return Ok(());
+        }
+        if !out.status.success() {
+            last_err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        }
+    }
+    let source_sub = source.join(path);
+    if source_sub.join(".git").exists() {
+        if let Ok(out) = git_command()
+            .arg("-C")
+            .arg(&sub_dir)
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "fetch",
+                "--no-tags",
+                &source_sub.to_string_lossy(),
+                target_oid,
+            ])
+            .output()
+        {
+            if has_commit() {
+                return Ok(());
+            }
+            if !out.status.success() {
+                last_err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            }
+        }
+    }
+    if last_err.is_empty() {
+        Err(format!("commit {target_oid} not found in submodule {path}"))
+    } else {
+        Err(format!("cannot fetch {target_oid} for {path}: {last_err}"))
+    }
+}
+
 fn sync_with_mode_inner(
     run: &Path,
     meta: &Value,
@@ -1870,6 +1986,8 @@ fn sync_with_mode_inner(
     }
     let mut actions = vec![];
     let mut conflicts = vec![];
+    let mut conflict_reasons = std::collections::BTreeMap::<String, String>::new();
+    let mut gitlink_updates: Vec<(String, String, bool)> = vec![];
     let mut paths = vec![];
     for change in changes {
         let path = s(&change, "path").to_string();
@@ -1879,12 +1997,32 @@ fn sync_with_mode_inner(
             conflicts.push(path);
             continue;
         }
-        if b(&change, "submodule") {
-            if gitlink(&source, s(&baseline, "tree"), &path)?
-                != gitlink(&source, s(&current_source, "tree"), &path)?
-            {
-                conflicts.push(path);
+        let base_gitlink = gitlink(&source, s(&baseline, "tree"), &path)?;
+        let source_gitlink = gitlink(&source, s(&current_source, "tree"), &path)?;
+        if b(&change, "submodule") || base_gitlink.is_some() || source_gitlink.is_some() {
+            if base_gitlink == source_gitlink {
+                continue;
             }
+            let Some(target_oid) = source_gitlink else {
+                conflicts.push(path);
+                continue;
+            };
+            if worktree_changed_gitlink(&worktree, &path, base_gitlink.as_deref())? {
+                conflicts.push(path);
+                continue;
+            }
+            let initialized = worktree.join(&path).join(".git").exists();
+            if initialized {
+                if let Err(reason) =
+                    ensure_submodule_commit(&source, &worktree, &path, &target_oid)
+                {
+                    conflict_reasons.insert(path.clone(), reason);
+                    conflicts.push(path);
+                    continue;
+                }
+            }
+            paths.push(path.clone());
+            gitlink_updates.push((path, target_oid, initialized));
             continue;
         }
         if through_symlink(&worktree, &target) || entry_mode(&target).as_deref() == Some("dir") {
@@ -1994,6 +2132,16 @@ fn sync_with_mode_inner(
         }
     }
     if !conflicts.is_empty() {
+        let format_conflicts = || -> String {
+            conflicts
+                .iter()
+                .map(|p| match conflict_reasons.get(p) {
+                    Some(reason) => format!("{p} ({reason})"),
+                    None => p.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         match mode {
             SyncMode::Auto => {
                 return Ok(SyncReport {
@@ -2007,13 +2155,13 @@ fn sync_with_mode_inner(
                 });
             }
             SyncMode::Strict => {
-                return Err(format!("--sync conflict in: {}", conflicts.join(", ")));
+                return Err(format!("--sync conflict in: {}", format_conflicts()));
             }
             SyncMode::Agent => {
                 // Binary, symlink, gitlink and structural conflicts cannot safely be represented
                 // by text markers. Fail atomically rather than silently dropping caller changes.
                 if conflicts.iter().any(|p| !paths.contains(p)) {
-                    return Err(format!("--sync conflict in: {}", conflicts.join(", ")));
+                    return Err(format!("--sync conflict in: {}", format_conflicts()));
                 }
             }
         }
@@ -2093,6 +2241,56 @@ fn sync_with_mode_inner(
     if let Some(head) = &new_wt_head {
         // Mixed reset updates HEAD and index without touching working-tree files or `target/`.
         let _ = git(&worktree, &["reset", "--mixed", "-q", head]);
+    }
+    for (path, target_oid, initialized) in &gitlink_updates {
+        if new_wt_head.is_none() {
+            git(
+                &worktree,
+                &[
+                    "update-index",
+                    "--cacheinfo",
+                    &format!("160000,{target_oid},{path}"),
+                ],
+            )?;
+        }
+        if *initialized {
+            let out = git_command()
+                .arg("-C")
+                .arg(&worktree)
+                .args([
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "update",
+                    "--no-fetch",
+                    "--",
+                    path,
+                ])
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !out.status.success() {
+                let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                let reason = if detail.is_empty() {
+                    String::from_utf8_lossy(&out.stdout).trim().to_string()
+                } else {
+                    detail
+                };
+                if mode == SyncMode::Auto {
+                    return Ok(SyncReport {
+                        synced: false,
+                        paths: vec![],
+                        conflicts: vec![path.clone()],
+                        base_tree: s(&current_source, "tree").to_string(),
+                        base_head: source_head,
+                        base_commit: None,
+                        source_dirty,
+                    });
+                }
+                return Err(format!(
+                    "--sync conflict in: {path} (git submodule update failed: {reason})"
+                ));
+            }
+        }
     }
     let mut large_hashes = serde_json::Map::new();
     if let Some(large) = current_source["large"].as_object() {
@@ -2596,6 +2794,81 @@ pub fn chain_net_files(run: &Path, meta: &Value) -> Option<Vec<String>> {
     Some(files)
 }
 
+fn prior_applied_tree(run: &Path, meta: &Value) -> Option<String> {
+    let state = json(run.join(".applied"));
+    let tree = s(&state, "tree");
+    if !tree.is_empty() {
+        return Some(tree.to_string());
+    }
+    let mut parent = s(meta, "parent").to_string();
+    let mut visited = std::collections::BTreeSet::new();
+    while !parent.is_empty() && visited.insert(parent.clone()) {
+        let Some(pdir) = resolve_parent_run_dir(run, &parent) else {
+            break;
+        };
+        let state = json(pdir.join(".applied"));
+        let tree = s(&state, "tree");
+        if !tree.is_empty() {
+            return Some(tree.to_string());
+        }
+        let parent_meta = json(pdir.join("meta.json"));
+        parent = s(&parent_meta, "parent").to_string();
+    }
+    let applied_base = s(&meta["appliedBase"], "tree");
+    if !applied_base.is_empty() {
+        return Some(applied_base.to_string());
+    }
+    None
+}
+
+/// Net changed path set of a run (matching `diff --total` / `files`, plus any paths
+/// modified relative to a prior `.applied` snapshot if the chain was partially applied
+/// earlier). Paths outside this set — e.g. submodule gitlinks, binaries, or symlinks that
+/// only changed in the source workspace — must not be treated as conflicts or skipped.
+fn run_allowed_apply_paths(
+    run: &Path,
+    meta: &Value,
+    top: &Path,
+    total_base: &str,
+    after: &str,
+    after_large: &Value,
+) -> Option<std::collections::BTreeSet<String>> {
+    if total_base.is_empty() || after.is_empty() {
+        return None;
+    }
+    let before_large = chain_root_base_large(run, meta);
+    let net = tree_changes(
+        top,
+        &json!({"tree": total_base, "large": before_large}),
+        &json!({"tree": after, "large": after_large}),
+        meta["worktree"].is_object(),
+    )
+    .ok()?;
+    let mut allowed: std::collections::BTreeSet<String> = net
+        .into_iter()
+        .map(|c| s(&c, "path").to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if let Some(prev_tree) = prior_applied_tree(run, meta) {
+        if prev_tree != total_base {
+            if let Ok(prev_changes) = tree_changes(
+                top,
+                &json!({"tree": prev_tree, "large": {}}),
+                &json!({"tree": after, "large": after_large}),
+                meta["worktree"].is_object(),
+            ) {
+                for c in prev_changes {
+                    let p = s(&c, "path");
+                    if !p.is_empty() {
+                        allowed.insert(p.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Some(allowed)
+}
+
 fn parse_patch_paths(patch: &str) -> Vec<String> {
     let mut set = std::collections::BTreeSet::<String>::new();
     for line in patch.lines() {
@@ -2742,6 +3015,19 @@ fn record_dirty_overlap_failure(
         script().display()
     );
     if !crate::output::json_enabled() {
+        let files_preview = if dirty_overlap.len() <= 5 {
+            dirty_overlap.join(", ")
+        } else {
+            format!(
+                "{} 等 {} 个文件",
+                dirty_overlap[..5].join(", "),
+                dirty_overlap.len()
+            )
+        };
+        println!(
+            "未合入：{} 个目标文件在源工作区已有未提交改动（{files_preview}）",
+            dirty_overlap.len()
+        );
         for p in dirty_overlap {
             println!(" dirty-overlap    {p}");
         }
@@ -2882,6 +3168,9 @@ pub fn apply(
                 "nothing applied: unresolved conflict markers / 冲突标记未解决: {}",
                 details.join("; ")
             );
+            if !crate::output::json_enabled() {
+                println!("未合入：存在未解决的冲突标记（{}）", details.join("; "));
+            }
             eprintln!("delegate: {msg}");
             let now = iso();
             let mut conclusion = json!({
@@ -3066,12 +3355,17 @@ pub(crate) fn merge_run_into_dir(
     if !missing.is_empty() {
         return Err(crate::refs::recovery_message(run, &meta, &missing));
     }
-    let changes = tree_changes(
+    let allowed_paths =
+        run_allowed_apply_paths(run, &meta, &top, &total_base, &after, &large);
+    let mut changes = tree_changes(
         &top,
         &json!({"tree":before,"large":applied["large"]}),
         &json!({"tree":after,"large":large}),
         false,
     )?;
+    if let Some(allowed) = &allowed_paths {
+        changes.retain(|c| allowed.contains(s(c, "path")));
+    }
 
     let mut actions = vec![];
     let mut matched = vec![];
@@ -3180,6 +3474,11 @@ pub(crate) fn merge_run_into_dir(
     }
     if let Some(obj) = large.as_object() {
         for path in obj.keys() {
+            if let Some(allowed) = &allowed_paths {
+                if !allowed.contains(path) {
+                    continue;
+                }
+            }
             if matches_rule(path, &generated_paths) {
                 continue;
             }
@@ -3338,16 +3637,6 @@ fn apply_checked(
     );
     if !blind.is_empty() {
         conclusion["acceptBlind"] = json!(blind);
-    }
-    if !crate::output::json_enabled() {
-        for item in &commits {
-            println!(
-                " commit {} {} ({} files)",
-                &s(item, "hash")[..7],
-                s(item, "title"),
-                n(item, "files")
-            );
-        }
     }
     if keep_commits && !uncommitted.is_empty() {
         return Err(format!("--keep-commits requires committed worktree changes; commits differ from the final tree: {}", uncommitted.join(", ")));
@@ -3514,6 +3803,16 @@ fn apply_checked(
     let mut code = inner.code;
     let written_files = inner.written;
     let regenerated_files = inner.regenerated;
+    if !crate::output::json_enabled() && (code == 0 || !written_files.is_empty()) {
+        for item in &commits {
+            println!(
+                " commit {} {} ({} files)",
+                &s(item, "hash")[..7],
+                s(item, "title"),
+                n(item, "files")
+            );
+        }
+    }
     if !dry && code == 0 {
         let mut all_touched = std::collections::BTreeSet::<String>::new();
         if let Some(chain_files) = chain_net_files(run, &meta) {
@@ -4292,6 +4591,11 @@ fn apply_inner(
     if !missing.is_empty() {
         return Err(crate::refs::recovery_message(run, &meta, &missing));
     }
+    let allowed_paths = if resume_regenerate {
+        None
+    } else {
+        run_allowed_apply_paths(run, &meta, &top, &total_base, &after, &large)
+    };
     let mut changes = if resume_regenerate {
         Vec::new()
     } else {
@@ -4306,6 +4610,9 @@ fn apply_inner(
         // A repeated apply still detects drift in files merged in an earlier round.
         before = total_base.clone();
         changes = tree_changes(&top, &json!({"tree":before}), &json!({"tree":after}), false)?;
+    }
+    if let Some(allowed) = &allowed_paths {
+        changes.retain(|c| allowed.contains(s(c, "path")));
     }
     let allow_dirty = allow_dirty_overlap || merge;
     let dirty_paths = if allow_dirty {
@@ -4443,6 +4750,11 @@ fn apply_inner(
     }
     if let Some(obj) = large.as_object() {
         for path in obj.keys() {
+            if let Some(allowed) = &allowed_paths {
+                if !allowed.contains(path) {
+                    continue;
+                }
+            }
             if matches_rule(path, &generated_paths) {
                 continue;
             }
@@ -4543,8 +4855,14 @@ fn apply_inner(
             "delegate reply --sync=agent {run_id} \"rebase 到最新主干并解决冲突（{files_preview}）\""
         );
         let merge_cmd = format!("{} apply --merge {run_id}", script().display());
-        for p in &conflicts {
-            println!(" conflict         {p}");
+        if !crate::output::json_enabled() {
+            println!(
+                "未合入：{} 个文件与源工作区冲突（{files_preview}）",
+                conflicts.len()
+            );
+            for p in &conflicts {
+                println!(" conflict         {p}");
+            }
         }
         eprintln!(
             "delegate: nothing applied; {} file(s) were also changed in {} since the run started.\n  下一步（推荐，交同事 rebase 解决冲突）：{rebase_cmd}\n  或本地合并写入冲突标记：{merge_cmd}\n  或查看改动：{} diff {run_id} --total",
