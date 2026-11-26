@@ -738,9 +738,9 @@ wait "$inside" 2>/dev/null || :
     def test_fit_table_lists_unreviewed(self):
         self.fit_set()
         result = self.cli("fit")
-        for text in ("scout", "build", "hard", "design", "ok · good", "—", "还没评过的", "build × ds"):
+        for text in ("scout", "build", "hard", "design", "review", "ok · good", "—", "还没评过的", "build × ds"):
             self.assertIn(text, result.stdout)
-        self.assertEqual(len(result.stdout.splitlines()), 6)
+        self.assertEqual(len(result.stdout.splitlines()), 7)
 
     def fit_start(self, verdict):
         self.fit_set(verdict=verdict, note="too risky")
@@ -764,7 +764,9 @@ wait "$inside" 2>/dev/null || :
         result = self.cli("run", "--model", "main", "task")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("delegate fit", result.stderr)
-        self.assertEqual(self.fit_card(), {})
+        card = self.fit_card()
+        self.assertEqual(set(card.keys()), {"cost"})
+        self.assertFalse((Path(self.env["XDG_CONFIG_HOME"]) / "delegate/fit.json").exists())
 
     def test_scoped_zero_matches_keeps_exit_one_and_silence(self):
         run = self.process_match_fixture("pgrep -f delegate-no-such-process-unique")

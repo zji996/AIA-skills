@@ -2,12 +2,12 @@
 use crate::common::*;
 use serde_json::{json, Value};
 
-pub const CLASSES: [&str; 4] = ["scout", "build", "hard", "design"];
+pub const CLASSES: [&str; 5] = ["scout", "build", "hard", "design", "review"];
 
 /// Default thinking level implied by `--class` when no explicit `--thinking` or `DELEGATE_THINKING` is set.
 pub fn default_thinking(class: &str) -> Option<&'static str> {
     match class {
-        "build" | "design" | "scout" => Some("medium"),
+        "build" | "design" | "scout" | "review" => Some("medium"),
         "hard" => Some("high"),
         _ => None,
     }
@@ -109,7 +109,7 @@ pub fn command(args: &[String]) -> Res<i32> {
     let aliases = aliases(&config.value);
     if args.first().is_some_and(|a| a == "set") {
         if args.len() != 5 && !(args.len() == 7 && args[5] == "--sample") {
-            return Err("use delegate fit set <scout|build|hard|design> <alias> <first|ok|avoid> \"note\" [--sample FILE]".into());
+            return Err("use delegate fit set <scout|build|hard|design|review> <alias> <first|ok|avoid> \"note\" [--sample FILE]".into());
         }
         if !aliases.contains(&args[2]) {
             return Err(format!("unknown alias {}; see delegate tiers", args[2]));
@@ -137,13 +137,30 @@ pub fn command(args: &[String]) -> Res<i32> {
         }
         let card = load()?;
         if args == ["--json"] {
-            println!("{card}");
+            let mut out = card.clone();
+            let mut costs = serde_json::Map::new();
+            for a in &aliases {
+                let val = crate::models::alias_cost(&config.value["models"][a.as_str()])
+                    .map(|c| json!(c))
+                    .unwrap_or(Value::Null);
+                costs.insert(a.clone(), val);
+            }
+            out["cost"] = Value::Object(costs);
+            println!("{out}");
             return Ok(0);
         }
-        // Four rows only; compact each cell for wide model registries. Full notes
+        // Five rows only; compact each cell for wide model registries. Full notes
         // remain available through --json, without growing the summary vertically.
         let width = (100 / aliases.len().max(1)).clamp(10, 85);
-        println!("类别 | {}", aliases.join(" | "));
+        let headers = aliases
+            .iter()
+            .map(|a| {
+                let cost =
+                    crate::models::alias_cost(&config.value["models"][a.as_str()]).unwrap_or("—");
+                format!("{a}〔{cost}〕")
+            })
+            .collect::<Vec<_>>();
+        println!("类别 | {}", headers.join(" | "));
         for class in CLASSES {
             let cells = aliases
                 .iter()
@@ -215,10 +232,11 @@ mod tests {
     }
 
     #[test]
-    fn default_thinking_matches_four_classes() {
+    fn default_thinking_matches_five_classes() {
         assert_eq!(default_thinking("build"), Some("medium"));
         assert_eq!(default_thinking("design"), Some("medium"));
         assert_eq!(default_thinking("scout"), Some("medium"));
+        assert_eq!(default_thinking("review"), Some("medium"));
         assert_eq!(default_thinking("hard"), Some("high"));
         assert_eq!(default_thinking("other"), None);
     }

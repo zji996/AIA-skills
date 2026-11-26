@@ -229,7 +229,7 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
                         .as_object()
                         .unwrap()
                         .keys()
-                        .any(|k| !["model", "thinking"].contains(&k.as_str()))
+                        .any(|k| !["model", "thinking", "cost"].contains(&k.as_str()))
                     {
                         return Err(format!("models.{name}: unknown alias field"));
                     }
@@ -238,9 +238,19 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
                             level.as_str().ok_or("alias thinking must be a string")?,
                         )?;
                     }
+                    if let Some(cost) = id.get("cost") {
+                        let cost_str = cost.as_str().ok_or_else(|| {
+                            format!(
+                                "models.{name}.cost must be a string ({})",
+                                crate::models::COSTS.join("|")
+                            )
+                        })?;
+                        crate::models::validate_cost(cost_str)
+                            .map_err(|e| format!("models.{name}.cost: {e}"))?;
+                    }
                 }
                 let id = crate::models::alias_model(id)
-                    .ok_or("models aliases must map to provider/id strings or {model, thinking}")?;
+                    .ok_or("models aliases must map to provider/id strings or {model, thinking?, cost?}")?;
                 crate::models::validate_model(id)?;
                 if !id.contains('/') {
                     return Err(format!("models.{name}: expected provider/id"));

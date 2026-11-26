@@ -2190,7 +2190,7 @@ db.write_text(json.dumps(units))
         self.assertEqual(shown.returncode, 0, shown.stderr)
         self.assertEqual(shown.stdout.splitlines()[-1], "Pi 里还有 5 个模型未登记")
         self.assertNotIn("x/named", shown.stdout)
-        self.assertIn("sol → p/review-m | 1M | true | true", shown.stdout)
+        self.assertIn("sol → p/review-m | — | 1M | true | true", shown.stdout)
 
     def test_images_guard_never_changes_the_chosen_model(self):
         self.fake_pi([answer("ok"), SETTLED])

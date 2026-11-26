@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 
 pub const TIERS: [&str; 3] = ["scout", "review", "write"];
 pub const THINKING: [&str; 6] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+pub const COSTS: [&str; 3] = ["low", "main", "high"];
 
 #[derive(Debug, Clone)]
 pub struct PiModel {
@@ -54,10 +55,30 @@ pub fn validate_thinking(level: &str) -> Res<()> {
     }
 }
 
+pub fn validate_cost(cost: &str) -> Res<()> {
+    if COSTS.contains(&cost) {
+        Ok(())
+    } else {
+        Err(format!("invalid cost {cost}: use {}", COSTS.join("|")))
+    }
+}
+
 /// The configured alias table is the whole selectable universe. Pi contributes
 /// validation and capability metadata only, never unregistered candidates.
 pub fn alias_model(value: &Value) -> Option<&str> {
     value.as_str().or_else(|| value["model"].as_str())
+}
+
+pub fn alias_cost(value: &Value) -> Option<&str> {
+    value
+        .as_object()
+        .and_then(|m| m.get("cost"))
+        .and_then(Value::as_str)
+}
+
+pub fn model_cost<'a>(alias_or_model: &str, config: &'a Value) -> Option<&'a str> {
+    let alias = selected_alias(alias_or_model, config);
+    config["models"].get(alias).and_then(alias_cost)
 }
 
 /// Preserve exact aliases (including distinct defaults for the same model),
@@ -440,17 +461,41 @@ mod tests {
     #[test]
     fn alias_object_validation_and_resolution() {
         let _guard = ENV.lock().unwrap();
-        let c = json!({"models":{"sol":{"model":"provider/gpt-sol","thinking":"medium"}}});
+        let c = json!({"models":{
+            "cheap-a":"provider/deepseek",
+            "main":{"model":"provider/gpt-sol","thinking":"medium","cost":"main"},
+            "advisor":{"model":"spot/deepseek","cost":"high"}
+        }});
         crate::config::validate(&c, std::path::Path::new("config.json"), false).unwrap();
         assert_eq!(
-            resolve_model("sol", &c, &listed()).unwrap(),
+            resolve_model("main", &c, &listed()).unwrap(),
             "provider/gpt-sol"
         );
         assert_eq!(
             resolve_model("gpt-", &c, &listed()).unwrap(),
             "provider/gpt-sol"
         );
-        assert_eq!(unregistered_count(&c, &listed()), 3);
+        assert_eq!(model_cost("cheap-a", &c), None);
+        assert_eq!(model_cost("main", &c), Some("main"));
+        assert_eq!(model_cost("provider/gpt-sol", &c), Some("main"));
+        assert_eq!(model_cost("advisor", &c), Some("high"));
+        assert_eq!(unregistered_count(&c, &listed()), 1);
+
+        let bad_val = json!({"models":{"cheap-a":{"model":"provider/deepseek","cost":"cheap"}}});
+        let err = crate::config::validate(&bad_val, std::path::Path::new("config.json"), false)
+            .unwrap_err();
+        assert!(err.contains("models.cheap-a.cost"), "{err}");
+        assert!(err.contains("low|main|high"), "{err}");
+
+        let bad_type = json!({"models":{"cheap-a":{"model":"provider/deepseek","cost":1}}});
+        let err = crate::config::validate(&bad_type, std::path::Path::new("config.json"), false)
+            .unwrap_err();
+        assert!(err.contains("models.cheap-a.cost"), "{err}");
+
+        let unknown = json!({"models":{"cheap-a":{"model":"provider/deepseek","price":"low"}}});
+        let err = crate::config::validate(&unknown, std::path::Path::new("config.json"), false)
+            .unwrap_err();
+        assert!(err.contains("models.cheap-a"), "{err}");
     }
     #[test]
     fn alias_default_precedence() {

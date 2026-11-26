@@ -399,7 +399,7 @@ fn require_models(config: &Value, listed: &[models::PiModel]) -> Res<Value> {
 }
 
 /// Thinking override from CLI `--thinking`, falling back to `--class` default thinking
-/// (`build|design|scout` -> `medium`, `hard` -> `high`) when no explicit `--thinking` was given.
+/// (`build|design|scout|review` -> `medium`, `hard` -> `high`) when no explicit `--thinking` was given.
 fn effective_thinking_override(o: &Options) -> Option<&str> {
     o.thinking_cli
         .as_deref()
@@ -3117,6 +3117,18 @@ pub fn launch(
         if inherited { "（已有会话）" } else { "" }
     );
     let model = o.model.as_deref().unwrap_or("（Pi 默认）");
+    let alias_input = o.model_name.as_deref().unwrap_or(model);
+    let resolved_alias = models::selected_alias(alias_input, &extra["tierConfig"]);
+    let model_cost = models::model_cost(alias_input, &extra["tierConfig"]);
+    let model_display = match model_cost {
+        Some(cost) if resolved_alias != model => format!("{resolved_alias}〔{cost}〕（{model}）"),
+        Some(cost) => format!("{model}〔{cost}〕"),
+        None => model.to_string(),
+    };
+    let inferred_name = match model_cost {
+        Some(cost) => format!("{resolved_alias}〔{cost}〕"),
+        None => o.model_name.as_deref().unwrap_or(model).to_string(),
+    };
     let rule = if o.tier_picked {
         models::tier_rules(&extra["tierConfig"], o.tier.as_deref().unwrap_or("review"))
             .into_iter()
@@ -3151,7 +3163,7 @@ pub fn launch(
                 "{}",
                 models::inference_notice(
                     o.tier.as_deref().unwrap_or("review"),
-                    o.model_name.as_deref().unwrap_or(model),
+                    &inferred_name,
                     model,
                     Some(&level)
                 )
@@ -3161,19 +3173,19 @@ pub fn launch(
                 "{}",
                 models::inference_notice(
                     o.tier.as_deref().unwrap_or("review"),
-                    o.model_name.as_deref().unwrap_or(model),
+                    &inferred_name,
                     model,
                     o.thinking.as_deref()
                 ) + &format!("〔{source}〕")
             );
         }
     } else if parent_path.is_some() && !o.tier_picked && !o.agent_pinned {
-        eprintln!("delegate: 沿用原会话的模型 {model}，thinking {level}");
+        eprintln!("delegate: 沿用原会话的模型 {model_display}，thinking {level}");
     } else if o.agent_pinned {
-        eprintln!("delegate: 固定模型 {model}，thinking {level}（--model）");
+        eprintln!("delegate: 固定模型 {model_display}，thinking {level}（--model）");
     } else {
         eprintln!(
-            "delegate: {} 档，模型 {model}，thinking {level}",
+            "delegate: {} 档，模型 {model_display}，thinking {level}",
             o.tier.as_deref().unwrap_or("")
         );
     }

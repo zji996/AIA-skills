@@ -22,7 +22,7 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 
 `measure` 是 argv 前缀数组，例如 `{"measure":[["cargo","xtask","bench-concurrency"]]}`；仓库配置覆盖用户配置。`measureCpus` 是预约核列表（如 `"8-11"`），未设置时取最后 `max(2, nproc/3)` 个在线逻辑核。匹配的同事、验收、证据和 lane 命令自动排队到机器级测量预约；预约开始时在跑的 lane 命令会让出预约核，预约期间普通 lane 命令使用其余核。
 
-- 标量：仓库 > 用户 > 内置默认；`DELEGATE_MAX_ACTIVE`/`MAX_HEAVY`/`HEAVY_JOBS`/`REPO_MAX_ACTIVE` 最高，`0` 不限（`heavyJobs` 须 ≥1）。整机/仓库默认 32/0；**编译并发按线程自动推导与共享令牌池**：可用线程取 `available_parallelism()`、向上查找的 cgroup v2 `cpu.max`（向上取整）与 `nproc` 最小值，`budget = max(1, 线程 − 2)`；`maxHeavy` 默认 `max(2, budget / 12)`（内存/IO 保护）；CPU 由 `<state>/jobserver.fifo`（目标令牌 `budget − maxHeavy`）管理，每条 `lane` 命令由进程内线程维护私有代理 FIFO（注入 `MAKEFLAGS`/`CARGO_MAKEFLAGS` 与 `CARGO_BUILD_JOBS`，覆盖宿主及 `env.CARGO_BUILD_JOBS`），按资历权重 `1, 1/2, 1/4…`（每条保底 2）动态公平分配——每条最多借 `份额 − 1`（另有 cargo 自带 1 个隐含令牌），用不满的份额让给他人，单条结束自动升至满预算，进程被杀或 `lane`/`status` 时自动校正补回；显式上限用 `heavyJobs`（`lane`/`status` 标「显式」）；远端不做代理与 FIFO，探测一次并缓存远端线程按 `budget / remote.maxHeavy` 注入 `CARGO_BUILD_JOBS`（失败回退配置并写诊断）。**未覆盖项**：`cargo test` 测试线程、链接器（如 `mold`）线程不在令牌池内。写入默认 `accept`/`acceptTimeout`/`evidence` 仓库优先、CLI 覆盖或关闭；只读不继承。
+- 标量：仓库 > 用户 > 内置默认；`DELEGATE_MAX_ACTIVE`/`MAX_HEAVY`/`HEAVY_JOBS`/`REPO_MAX_ACTIVE` 最高，`0` 不限（`heavyJobs` 须 ≥1）。整机/仓库默认 32/0；编译并发按可用线程自动推导（`budget = max(1, 线程 − 2)`，`maxHeavy` 默认 `max(2, budget / 12)`），由 `<state>/jobserver.fifo` 共享令牌池按资历权重动态公平分配给各 `lane` 进程（注入 `MAKEFLAGS`/`CARGO_MAKEFLAGS`/`CARGO_BUILD_JOBS`，显式上限用 `heavyJobs`；远端按远端线程 `budget / remote.maxHeavy` 注入，不含 `cargo test`/链接器线程）。写入默认 `accept`/`acceptTimeout`/`evidence` 仓库优先、CLI 覆盖或关闭；只读不继承。
 - 模型选择分为 `tiers.scout/review/write`、`models` 别名与 `thinking`；models/tiers 按键合并，详见 [用途、模型与思维长度](model-routing.md)。
 - 任务测试用可重复的 `--accept-also COMMAND` 以 `&&` 追加到生效 `--accept` 或默认命令（与 `--no-accept` 冲突退出 2）；`--accept` 替换默认命令时 start 提示原命令。
 - `env` 按键合并（仓库优先）；`agentDeny` 按 `(argv, exact)` 去重（缺省 `exact: false`），仓库同键覆盖 hint，仓库可用 `allow: true` 撤销完全匹配的用户规则（用户级禁用 `allow`）。
@@ -40,12 +40,18 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 
 ```json
 {"maxActive":32,"repoMaxActive":0,"maxRework":1,
- "models":{"sol":"provider/code-model","ds":"provider/fast-model"},
+ "models":{"cheap-a":{"model":"provider/fast-model","cost":"low"},
+           "main":{"model":"provider/code-model","thinking":"medium","cost":"main"},
+           "advisor":{"model":"provider/deep-model","cost":"high"}},
  "thinking":"high",
- "tiers":{"scout":"ds","review":"sol","write":[{"model":"sol","maxActive":10},"ds"]},
+ "tiers":{"scout":"cheap-a","review":"main","write":[{"model":"main","maxActive":10},"cheap-a"]},
  "env":{"CUDA_VISIBLE_DEVICES":""},
  "agentDeny":[{"argv":["cargo","xtask","check"],"hint":"主控合入后跑全量；同事改跑 cargo test -p <crate>"}]}
 ```
+
+## 模型价位（cost）
+
+`models.<alias>` 支持可选相对价位档 `cost`（`"low" | "main" | "high"`，不写金额）；旧的字符串写法照常可用，非法值在配置校验时直接报错（退出 2，不静默回退）。`delegate fit`、`delegate tiers` 在每个别名旁显示价位（未设显示 `—`），`delegate fit --json` 带 `cost` 字段；`start`/`reply` 启动回显在模型旁附 `〔<cost>〕`，仅显示不自动换模型、不拦截。五类适配卡与路由规则见 [model-routing.md](model-routing.md)。
 
 ## 同事全量检查拦截（agentDeny）
 
@@ -65,8 +71,8 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 - `stall`：`{"idle":"30m","command":"90m","accept":"10m"}`，`"0"` 关闭；`DELEGATE_STALL_IDLE`/`COMMAND`/`ACCEPT` 优先，均只发 `stall_warning` 不杀进程。
 - `checkIn`：wait 检查线时长，`"0"` 关闭；`DELEGATE_CHECK_IN` 优先。未设置时 Claude Code 使用 50m，其它调用方不设默认。
 - `agy`：`{"agent":"aia"}` 为 agy 同事附加 `--agent <名>`（新会话、续做与 `probe` 生效），名称非空且无空白/控制字符，未设不变。
-- `review`（默认关）：`true` 或 `{"enabled"?,"tier"?:"review"|"scout","model"?,"thinking"?,"rubric"?,"extra"?}`（仓库按字段覆盖用户）。模型优先级：`--review-model` > 仓库 > 用户 > review 档位；不可用回退 review 档并在卡上写 `审查改用 <别名>（原因）`。快层过与慢层并行派只读审查员（[review-rubric.md](review-rubric.md)）；首行缺结论同会话尾部补问 1 次，仍不合格才判 `formatError`；`REWORK` 原样退回续审增量 diff。`review.extra`（`{"model","on":["controllerReviewPaths","risk:high"],"minQuota":{"fiveHour":50,"weekly":30}}`）命中条件且 `agy-quota.json` Claude/GPT 池够用时并行给第二意见（不足则跳过并明报余量，不一致升 `NEEDS_CONTROLLER`），详见 [review-card.md](review-card.md)。
-- `acceptRules` / `riskRules`（可选，向后兼容单条 `accept`）：`acceptRules` 按 glob 分快/慢层并记录跑/跳原因（未命中或改构建配置 fail-closed 跑全量）；`riskRules` 定制审查卡风险规则（`disable`/`largeDeletionLines`/`sizeBudgets`/`extra`，其中 `sizeBudgets` 按路径配 `maxLines`/`maxTestFnLines`/`maxTokens` 并自动叠加目标仓 `.repo-governance.json` 预算），详见 [审查卡与分层验收](review-card.md)。
+- `review`（默认关）：`true` 或 `{"enabled"?,"tier"?:"review"|"scout","model"?,"thinking"?,"rubric"?,"extra"?}`（仓库按字段覆盖用户）。模型按 `--review-model` > 仓库 > 用户 > review 档选，快层过与慢层并行审查（[review-rubric.md](review-rubric.md)），`review.extra` 命中条件且额度够时并行给第二意见，详见 [review-card.md](review-card.md)。
+- `acceptRules` / `riskRules`（可选，向后兼容单条 `accept`）：按路径分快/慢验收层与定制审查卡风险/体量预算规则，详见 [review-card.md](review-card.md)。
 - `controllerReviewPaths`：glob 数组（`*`/`?`/`**`/末尾 `/`），仓库优先。命中一律升 `NEEDS_CONTROLLER` 并附 diff 与 SHA-256，主控 `delegate sign <run>` 签字（改一字即失效，`sign --check` 验签），并作为审查卡「模型可见文字」规则源。
 - `mergeAccept` / `autoMerge`（仓库级）：`mergeAccept` 为 `delegate merge` 终验命令（默认等于 `accept`）；`autoMerge` 为 glob 数组（默认空，支持 `!` 排除与 `add:` 纯新增），全改动命中且审查 `PASS` 标「可自主合入」，详见 [合入员与 Radar](merge-and-radar.md)。
 - `radar`（仓库级）：`{"collect":[命令或{"name","command"}],"tier"?:"scout"|"review","model"?,"thinking"?,"timeout"?}`；确定性采集算指纹，未变零 token 退出，变化派只读 scout 更新 `<state>/radar/<repo>/board.md`，见 [合入员与 Radar](merge-and-radar.md)。

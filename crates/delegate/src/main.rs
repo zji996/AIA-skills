@@ -3697,17 +3697,18 @@ fn tiers(args: &[String]) -> Res<i32> {
         }
         println!("{tier}: {}", descriptions.join(", "));
     }
-    println!("aliases: name → model | context | images | thinking");
+    println!("aliases: name → model | cost | context | images | thinking");
     if let Some(aliases) = config.value["models"].as_object() {
-        for (name, id) in aliases {
-            let id = crate::models::alias_model(id).unwrap_or("");
+        for (name, spec) in aliases {
+            let id = crate::models::alias_model(spec).unwrap_or("");
+            let cost = crate::models::alias_cost(spec).unwrap_or("—");
             if let Some(model) = listed.iter().find(|m| m.name == id) {
                 println!(
-                    "  {name} → {id} | {} | {} | {}",
+                    "  {name} → {id} | {cost} | {} | {} | {}",
                     model.context, model.images, model.thinking
                 );
             } else {
-                println!("  {name} → {id} | unknown | unknown | unknown");
+                println!("  {name} → {id} | {cost} | unknown | unknown | unknown");
             }
         }
     }
