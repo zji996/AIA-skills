@@ -628,7 +628,9 @@ pub fn command(args: &[String]) -> Res<i32> {
     for arg in args {
         match arg.as_str() {
             "--path" => show_path = true,
-            other => return Err(format!("unrecognized arguments: {other}")),
+            other => {
+                return Err(unrecognized_arg(other, &["--path"], "board"));
+            }
         }
     }
     let key = history::current_history_key();

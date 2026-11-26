@@ -516,7 +516,13 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
                     .parse::<usize>()
                     .map_err(|_| format!("invalid --events-limit: {v}"))?;
             }
-            other => return Err(format!("unrecognized arguments: {other}")),
+            other => {
+                return Err(unrecognized_arg(
+                    other,
+                    &["--json", "--repo", "--root", "--events-limit"],
+                    "snapshot",
+                ));
+            }
         }
         i += 1;
     }

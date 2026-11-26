@@ -546,12 +546,12 @@ class DelegateWorkHygieneTests(unittest.TestCase):
         # 1) --wait-manual is removed and rejected as an unrecognized argument on both add and wait
         bad_add = self.cli("work", "add", "旧手动", "--repo", repo, "--wait-manual", "等人工", human=True)
         self.assertNotEqual(bad_add.returncode, 0)
-        self.assertIn("unrecognized arguments: --wait-manual", bad_add.stderr)
+        self.assertIn("unrecognized argument '--wait-manual'", bad_add.stderr)
 
         self.assertEqual(self.cli("work", "add", "待挂前置项", "--repo", repo, "--done-when", "灰度通过", "--brief", "docs/spec.md", human=True).returncode, 0)
         bad_wait = self.cli("work", "wait", "W001", "--wait-manual", "等人工", human=True)
         self.assertNotEqual(bad_wait.returncode, 0)
-        self.assertIn("unrecognized arguments: --wait-manual", bad_wait.stderr)
+        self.assertIn("unrecognized argument '--wait-manual'", bad_wait.stderr)
 
         # 2) `work wait W001 --needs-owner nod` creates Q01 and blocks W001 on owner:Q01
         w_need = self.cli(

@@ -6353,7 +6353,13 @@ fn list_cmd(args: &[String]) -> Res<i32> {
                 };
                 repo_filter = Some(v);
             }
-            other => return Err(format!("unrecognized arguments: {other}")),
+            _ => {
+                return Err(unrecognized_arg(
+                    a,
+                    &["--all", "--owner", "--rebuild", "--json", "--state", "--repo"],
+                    "delegate work [list] [--owner] [--all] [--state ST] [--repo NAME] [--rebuild] [--json]",
+                ));
+            }
         }
         i += 1;
     }
@@ -6942,7 +6948,11 @@ fn show_cmd(args: &[String]) -> Res<i32> {
         if a == "--json" {
             json_mode = true;
         } else if a.starts_with('-') {
-            return Err(format!("unrecognized arguments: {a}"));
+            return Err(unrecognized_arg(
+                a,
+                &["--json"],
+                "delegate work show <Wxx|Qxx|Dxxx|R:id> [--json]",
+            ));
         } else if target.is_none() {
             target = Some(a.clone());
         } else {
@@ -7270,7 +7280,42 @@ fn parse_wait_conditions(args: &[String], allow_clear: bool) -> Res<ParsedWaitAr
                 extra.entry(key.to_string()).or_default().push(raw);
             }
             other if other.starts_with('-') => {
-                return Err(format!("unrecognized arguments: {other}"));
+                let mut valid = vec![
+                    "--json",
+                    "--auto",
+                    "--needs-verify",
+                    "--brief",
+                    "--prompt-file",
+                    "--after-applied",
+                    "--after-delivered",
+                    "--after-work",
+                    "--wait-owner",
+                    "--after-time",
+                    "--verify-on",
+                    "--needs-owner",
+                    "--class",
+                    "--files",
+                    "--done-when",
+                    "--repo",
+                    "--artifact",
+                    "--followup",
+                    "--run",
+                    "--owner-kind",
+                    "--qid",
+                    "--id",
+                    "--ask",
+                    "--recommendation",
+                    "--rec",
+                    "--if-undecided",
+                    "--cost",
+                ];
+                let usage = if allow_clear {
+                    valid.extend_from_slice(&["--no-needs-verify", "--clear"]);
+                    "delegate work wait <Wxx|Qxx|Dxxx> [--class C] [--files P] [--after-applied X] [--after-work W] [--wait-owner Q] [--needs-owner K] [--brief FILE] [--clear] [--json]"
+                } else {
+                    "delegate work add \"<title>\" [--class C] [--files P] [--done-when TEXT] [--repo PATH] [--brief FILE] [--after-applied X] [--needs-owner K] [--json]"
+                };
+                return Err(unrecognized_arg(a, &valid, usage));
             }
             other => positional.push(other.to_string()),
         }
@@ -8038,20 +8083,24 @@ fn close_cmd(args: &[String]) -> Res<i32> {
             .split_once('=')
             .map_or((a.as_str(), None), |(k, v)| (k, Some(v)));
         match key {
-            "--evidence" => {
+            "--evidence" | "--reason" => {
                 evidence = Some(match inline {
                     Some(v) => v.to_string(),
                     None => {
                         i += 1;
                         args.get(i)
                             .cloned()
-                            .ok_or("argument --evidence: expected one argument")?
+                            .ok_or_else(|| format!("argument {key}: expected one argument"))?
                     }
                 });
             }
             "--json" => json_mode = true,
             other if other.starts_with('-') => {
-                return Err(format!("unrecognized arguments: {other}"));
+                return Err(unrecognized_arg(
+                    a,
+                    &["--evidence", "--reason", "--json"],
+                    "delegate work close <Wxx|Qxx|Dxxx> --evidence \"<text>\" [--reason \"<text>\"] [--json]",
+                ));
             }
             other => {
                 if id_raw.is_none() {
@@ -8159,7 +8208,11 @@ fn drop_cmd(args: &[String]) -> Res<i32> {
             }
             "--json" => json_mode = true,
             other if other.starts_with('-') => {
-                return Err(format!("unrecognized arguments: {other}"));
+                return Err(unrecognized_arg(
+                    a,
+                    &["--reason", "--json"],
+                    "delegate work drop <Wxx|Qxx|Dxxx> --reason \"<text>\" [--json]",
+                ));
             }
             other => {
                 if id_raw.is_none() {
@@ -8274,7 +8327,11 @@ fn defer_cmd(args: &[String]) -> Res<i32> {
             }
             "--json" => json_mode = true,
             other if other.starts_with('-') => {
-                return Err(format!("unrecognized arguments: {other}"));
+                return Err(unrecognized_arg(
+                    a,
+                    &["--reason", "--until", "--json"],
+                    "delegate work defer <Wxx|Qxx|Dxxx|run> --reason \"<text>\" --until <4h|24h|YYYY-MM-DD|ISO> [--json]",
+                ));
             }
             other => {
                 if target_raw.is_none() {
@@ -8456,7 +8513,11 @@ fn import_md_cmd(args: &[String]) -> Res<i32> {
                 });
             }
             other if other.starts_with('-') => {
-                return Err(format!("unrecognized arguments: {other}"));
+                return Err(unrecognized_arg(
+                    a,
+                    &["--dry-run", "--include-stale", "--repo", "--json"],
+                    "delegate work import-md <FILE> [--dry-run] [--include-stale] [--repo DIR] [--json]",
+                ));
             }
             other => {
                 if file_raw.is_none() {
@@ -8980,7 +9041,11 @@ fn import_dag_cmd(args: &[String]) -> Res<i32> {
                 repo_arg = Some(v);
             }
             other if other.starts_with('-') => {
-                return Err(format!("unrecognized arguments: {other}"));
+                return Err(unrecognized_arg(
+                    a,
+                    &["--dry-run", "--repo", "--json"],
+                    "delegate work import-dag <FILE> [--dry-run] [--repo DIR] [--json]",
+                ));
             }
             other => {
                 if file_path.is_none() {

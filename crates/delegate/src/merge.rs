@@ -925,7 +925,13 @@ fn list_command(args: &[String]) -> Res<i32> {
         match a.as_str() {
             "--all" => all = true,
             "--json" => json_mode = true,
-            other => return Err(format!("unrecognized arguments: {other}")),
+            other => {
+                return Err(unrecognized_arg(
+                    other,
+                    &["--all", "--json"],
+                    "delegate merge list [--all] [--json]",
+                ));
+            }
         }
     }
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -972,7 +978,7 @@ pub fn command(args: &[String]) -> Res<i32> {
     if matches!(args.first().map(String::as_str), Some("list" | "--list")) {
         return list_command(&args[1..]);
     }
-    let (pos, flags, opts) = parse_simple(args, &["--ready", "--json"], &["--name"])?;
+    let (pos, flags, opts) = parse_simple("merge", args, &["--ready", "--json"], &["--name"])?;
     if has(&flags, "--json") {
         output::enable_json();
     }

@@ -1600,23 +1600,32 @@ fn has_active_waiter_lock(
     let Some(rdir) = run_dir else {
         return false;
     };
-    let lock_path = rdir.join("waiter.lock");
-    if !lock_path.is_file() {
-        return false;
+    for name in ["waiter.lock", "waiter-attach.lock"] {
+        let lock_path = rdir.join(name);
+        if !lock_path.is_file() {
+            continue;
+        }
+        let Ok(md) = fs::metadata(&lock_path) else {
+            continue;
+        };
+        if let Some(inodes) = locked_inodes {
+            let dev = md.dev();
+            let maj = libc::major(dev) as u32;
+            let min = libc::minor(dev) as u32;
+            if inodes.contains(&(maj, min, md.ino())) {
+                return true;
+            }
+            continue;
+        }
+        if read(&lock_path)
+            .lines()
+            .filter_map(|line| line.trim().parse::<i32>().ok())
+            .any(|pid| pid > 0 && pid_alive(pid))
+        {
+            return true;
+        }
     }
-    let Ok(md) = fs::metadata(&lock_path) else {
-        return false;
-    };
-    if let Some(inodes) = locked_inodes {
-        let dev = md.dev();
-        let maj = libc::major(dev) as u32;
-        let min = libc::minor(dev) as u32;
-        return inodes.contains(&(maj, min, md.ino()));
-    }
-    read(&lock_path)
-        .trim()
-        .parse::<i32>()
-        .is_ok_and(|pid| pid > 0 && pid_alive(pid))
+    false
 }
 
 fn active_waiters(procs: &[(Vec<String>, Option<PathBuf>)]) -> Vec<(Vec<String>, Option<PathBuf>)> {
@@ -4208,7 +4217,13 @@ pub fn check_cmd(args: &[String]) -> Res<i32> {
                 cwd_override = Some(raw);
             }
             "--json" => format = HookFormat::Json,
-            other => return Err(format!("unrecognized arguments: {other}")),
+            _ => {
+                return Err(unrecognized_arg(
+                    a,
+                    &["--format", "--cwd", "--json"],
+                    "delegate hook check [--format claude|agy|json] [--cwd PATH] [--json]",
+                ));
+            }
         }
         i += 1;
     }
@@ -4360,7 +4375,13 @@ pub fn pending_cmd(args: &[String]) -> Res<i32> {
                 };
                 cwd_override = Some(raw);
             }
-            other => return Err(format!("unrecognized arguments: {other}")),
+            _ => {
+                return Err(unrecognized_arg(
+                    a,
+                    &["--json", "--cwd"],
+                    "delegate hook pending [--json] [--cwd PATH]",
+                ));
+            }
         }
         i += 1;
     }

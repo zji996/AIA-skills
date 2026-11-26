@@ -96,7 +96,77 @@ impl Options {
         }
     }
 }
+fn launch_valid_flags(reply: bool, collect: bool) -> Vec<&'static str> {
+    let mut flags = vec![
+        "--prompt",
+        "--prompt-file",
+        "--tier",
+        "--name",
+        "--image",
+        "--allow",
+        "--accept",
+        "--accept-also",
+        "--no-accept",
+        "--hide-accept",
+        "--accept-timeout",
+        "--evidence",
+        "--no-evidence",
+        "--evidence-timeout",
+        "--no-remote",
+        "--no-brief-check",
+        "--timeout",
+        "--max-answer",
+        "--model",
+        "--review-model",
+        "--review-full",
+        "--thinking",
+        "--overflow",
+        "--work",
+        "--json",
+    ];
+    if reply {
+        flags.extend_from_slice(&[
+            "--fresh",
+            "--sync",
+            "--sync=agent",
+            "--no-sync",
+            "--wait",
+            "--when-done",
+            "--minor",
+            "--over-limit",
+        ]);
+    } else {
+        flags.extend_from_slice(&[
+            "--workdir",
+            "--share",
+            "--read-only",
+            "--shell",
+            "--in-place",
+            "--worktree",
+            "--in",
+            "--protect",
+            "--protect-reason",
+            "--retries",
+            "--provider",
+            "--class",
+            "--no-scout",
+            "--allow-parallel-writes",
+        ]);
+    }
+    if collect {
+        flags.extend_from_slice(&["--max", "--progress", "--full"]);
+    }
+    flags
+}
+
 pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options> {
+    let cmd_name = if reply {
+        "reply"
+    } else if collect {
+        "run"
+    } else {
+        "start"
+    };
     let mut o = Options::new();
     let mut no_accept = false;
     let mut i = 0;
@@ -122,7 +192,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
             ]
             .contains(&key)
         {
-            return Err(format!("unrecognized arguments: {a}"));
+            return Err(unrecognized_arg(a, &launch_valid_flags(reply, collect), cmd_name));
         }
         if key == "--protect-reason" {
             if inline.is_some() || i + 2 >= args.len() {
@@ -291,7 +361,13 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                     }
                     break;
                 }
-                x if x.starts_with('-') => return Err(format!("unrecognized arguments: {x}")),
+                x if x.starts_with('-') => {
+                    return Err(unrecognized_arg(
+                        x,
+                        &launch_valid_flags(reply, collect),
+                        cmd_name,
+                    ));
+                }
                 _ => {
                     if reply && o.run.is_none() {
                         o.run = Some(a.clone());

@@ -1389,9 +1389,9 @@ fn render_json(
 }
 
 pub fn command(args: &[String]) -> Res<i32> {
-    let (pos, flags, kv) = crate::parse_simple(args, &["--json"], &["--since", "--by"])?;
+    let (pos, flags, kv) = crate::parse_simple("lines", args, &["--json"], &["--since", "--by"])?;
     if let Some(extra) = pos.first() {
-        return Err(format!("unrecognized arguments: {extra}"));
+        return Err(unrecognized_arg(extra, &["--json", "--since", "--by"], "lines"));
     }
     let json_mode = crate::has(&flags, "--json");
     let by_repo = match crate::value(&kv, "--by") {

@@ -257,7 +257,7 @@ pub fn print(command: Option<&str>) -> bool {
             "An interrupted upstream (cut stream, reset or timed-out connection, 502/503/504, a 429 Pi did not retry) is not the task failing: the run waits 15s/45s/120s, checks the model through `probe`'s path, and continues the same session up to 3 times (DELEGATE_RESUME_BACKOFF, `0` off); `status --json` reports `resumes` and `transientError`. Auth failures, 400s and missing models are not retried."
         );
         println!(
-            "Exit: 0 delivered/answered, 1 other finished/failed, 2 usage, 3 conflict or unresolved conflict markers, 75 still running at --max, 76 already covered by another waiter, 77 agentDeny shim refusal."
+            "Exit: 0 delivered/answered, 1 other finished/failed, 2 usage, 3 conflict or unresolved conflict markers, 75 still running at --max, 76 already covered by another waiter (with --exclusive), 77 agentDeny shim refusal."
         );
         println!(".delegate.json agentDeny: argv prefixes by default; exact: true matches the whole argv. No global-option normalization. Acceptance/evidence/setup/apply use remote-only shims when enabled; caller lane stays local. Shims have no environment bypass.");
         let cwd = std::env::current_dir().unwrap_or_default();
@@ -268,7 +268,39 @@ pub fn print(command: Option<&str>) -> bool {
         println!("Runs: $DELEGATE_RUNS or <git root of cwd>/.local/run/delegate (old .local/run/pi runs remain readable).");
         return true;
     };
-    let (usage, description, rows): (&str, &str, &[(&str, &str)]) = match command {
+    let Some((usage, description, rows)) = command_spec(command) else {
+        return false;
+    };
+    println!("Usage: delegate {command} {usage}\n");
+    println!("{description}\n");
+    println!("Options:");
+    options(&[("-h, --help", "Show this help.")]);
+    options(rows);
+    if matches!(command, "start" | "run" | "reply" | "stop") {
+        options(&[(
+            "--json",
+            "Print complete JSON fields instead of concise status lines.",
+        )]);
+    }
+    if matches!(command, "run" | "reply" | "wait") {
+        options(COLLECT);
+    }
+    true
+}
+
+pub fn usage_line(command: &str) -> Option<String> {
+    let (usage, _, _) = command_spec(command)?;
+    if usage.is_empty() {
+        Some(format!("delegate {command}"))
+    } else {
+        Some(format!("delegate {command} {usage}"))
+    }
+}
+
+type CommandSpec = (&'static str, &'static str, &'static [(&'static str, &'static str)]);
+
+fn command_spec(command: &str) -> Option<CommandSpec> {
+    let spec: (&str, &str, &[(&str, &str)]) = match command {
         "start" => ("[options] [words ...]", "Launch in the background and return at once.", LAUNCH),
         "run" => ("[options] [words ...]", "Start, then wait for the outcome and answer.", LAUNCH),
         "reply" => ("[options] run [words ...]", "Continue a finished run in the background, inheriting its agent, workdir, and worktree by default. Use --wait to collect its answer.", REPLY),
@@ -278,7 +310,8 @@ pub fn print(command: Option<&str>) -> bool {
             ("--current-repo", "Restrict untargeted wait to runs in the current repository only."),
             ("--all", "Select runs regardless of caller (including with --machine); without --any/--stream, also wait for ALL selected runs (up to 50m per call). Timeout lists pending names."),
             ("--machine", "Collect active and waiting runs registered across all repositories on this machine for the current caller (pass --all to include all sessions)."),
-            ("--json", "Print complete JSON fields instead of concise status lines. Tasks covered by another live waiter are skipped; exit 76 when all are covered."),
+            ("--exclusive", "Skip runs already waited on by another live waiter and exit 76 when all are covered (default attaches and waits for the same runs)."),
+            ("--json", "Print complete JSON fields instead of concise status lines."),
             ("--no-result", "Print only the outcome line."),
             ("--any", "Return once any selected run finishes or asks a question (the default for no arguments and named runs); lists every run settled since the previous wait (full answer for the first, one-line summary + result command for the rest)."),
             ("--until-all", "Wait until every selected run finishes before returning; Alias of --all for waiting semantics."),
@@ -323,7 +356,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("show <Wxx|Qxx|Dxxx|R:id> [--json]", "Show Layer-2 work item card with class, files, wait_on status, owner details, linked runs, artifacts, followups, and Layer-3 original pointers."),
             ("add \"<title>\" [--class feat|unblock|infra|docs] [--files PATHS] [--done-when TEXT] [--needs-verify] [--brief FILE] [--needs-owner nod|act|card --ask TEXT --recommendation TEXT --if-undecided TEXT --cost TEXT] [--verify-on COND] [--after-applied RUN|Wxx] [--after-delivered RUN] [--after-work Wxx] [--wait-owner Qxx] [--after-time TIME] [--artifact PATH] [--owner-kind act|nod|card|direction] [--qid Qxx|Dxxx] [--ask TEXT] [--recommendation TEXT] [--if-undecided TEXT] [--cost TEXT] [--auto -- <start-args>]", "Create a persistent work item or owner item (Q/D)."),
             ("wait <Wxx|Qxx|Dxxx> [--class feat|unblock|infra|docs] [--files PATHS] [--after-applied RUN|Wxx] [--after-delivered RUN] [--after-work Wxx] [--wait-owner Qxx] [--needs-owner nod|act|card] [--after-time TIME] [--needs-verify|--no-needs-verify] [--verify-on COND] [--brief FILE] [--ask TEXT] [--recommendation TEXT] [--if-undecided TEXT] [--cost TEXT] [--auto -- <start-args>] [--clear]", "Attach or update class / files / wait_on / verify_on / needs_verify / brief, create a linked owner Q item (--needs-owner), or update Q item fields (--ask/--recommendation/--if-undecided/--cost)."),
-            ("close <Wxx|Qxx|Dxxx> --evidence \"<text>\"", "Explicitly close a work item or owner item with evidence (unlocks waiting work items)."),
+            ("close <Wxx|Qxx|Dxxx> --evidence \"<text>\" [--reason \"<text>\"]", "Explicitly close a work item or owner item with evidence (--reason is accepted as an alias for --evidence; unlocks waiting work items)."),
             ("drop <Wxx|Qxx|Dxxx> --reason \"<text>\"", "Explicitly drop/reject a work item or owner item with a recorded reason."),
             ("defer <Wxx|Qxx|Dxxx|run> --reason \"<text>\" --until <4h|24h|YYYY-MM-DD|ISO>", "Defer a work item or unattached run (materializes into work.jsonl) with a reason and expiry time."),
             ("import-md <FILE> [--dry-run] [--include-stale] [--repo DIR] [--json]", "Parse a Markdown backlog, cross-check history.jsonl for already-applied/stale items, and preview (--dry-run) or import."),
@@ -500,21 +533,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("--json", "Print structured JSON output."),
         ]),
         "protocol" => ("", "Print one JSON line for harness adapters: protocol version, delegate version, the caller session and its source variable, and each agent's tier, resolved binary, version and PATH entries it shadows.", &[]),
-        _ => return false,
+        _ => return None,
     };
-    println!("Usage: delegate {command} {usage}\n");
-    println!("{description}\n");
-    println!("Options:");
-    options(&[("-h, --help", "Show this help.")]);
-    options(rows);
-    if matches!(command, "start" | "run" | "reply" | "stop") {
-        options(&[(
-            "--json",
-            "Print complete JSON fields instead of concise status lines.",
-        )]);
-    }
-    if matches!(command, "run" | "reply" | "wait") {
-        options(COLLECT);
-    }
-    true
+    Some(spec)
 }

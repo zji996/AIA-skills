@@ -3043,7 +3043,14 @@ pub fn command(args: &[String]) -> Res<i32> {
         match arg.as_str() {
             "--dry-run" if sub == "prune" => dry_run = true,
             "--json" => json_mode = true,
-            other => return Err(format!("unrecognized arguments: {other}")),
+            other => {
+                let valid: &[&str] = if sub == "prune" {
+                    &["--dry-run", "--json"]
+                } else {
+                    &["--json"]
+                };
+                return Err(unrecognized_arg(other, valid, "disk"));
+            }
         }
     }
 

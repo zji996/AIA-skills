@@ -3850,6 +3850,7 @@ pub fn format_wait_tail_eta(
 
 pub fn command(args: &[String]) -> Res<i32> {
     let (pos, flags, kv) = parse_simple(
+        "eta",
         args,
         &["--work", "--queue", "--all", "--json"],
         &["--repo"],

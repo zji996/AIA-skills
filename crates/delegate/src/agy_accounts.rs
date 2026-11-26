@@ -2804,9 +2804,10 @@ fn format_quota_brief(quota: &Value) -> String {
 }
 
 fn cmd_list(args: &[String]) -> Res<i32> {
-    let (pos, flags, kv) = parse_simple(args, &["--json", "--quota"], &["--agy-bin"])?;
+    let usage = "delegate agy account list [--quota] [--agy-bin PATH] [--json]";
+    let (pos, flags, kv) = parse_simple(usage, args, &["--json", "--quota"], &["--agy-bin"])?;
     if !pos.is_empty() {
-        return Err(format!("unrecognized arguments: {}", pos.join(" ")));
+        return Err(unrecognized_arg(&pos.join(" "), &["--json", "--quota", "--agy-bin"], usage));
     }
     if has(&flags, "--quota") {
         refresh_all_quotas(value(&kv, "--agy-bin"))?;
@@ -2887,9 +2888,10 @@ fn cmd_list(args: &[String]) -> Res<i32> {
 }
 
 fn cmd_status(args: &[String]) -> Res<i32> {
-    let (pos, flags, kv) = parse_simple(args, &["--json", "--quota"], &["--agy-bin"])?;
+    let usage = "delegate agy account status [--quota] [--agy-bin PATH] [--json]";
+    let (pos, flags, kv) = parse_simple(usage, args, &["--json", "--quota"], &["--agy-bin"])?;
     if !pos.is_empty() {
-        return Err(format!("unrecognized arguments: {}", pos.join(" ")));
+        return Err(unrecognized_arg(&pos.join(" "), &["--json", "--quota", "--agy-bin"], usage));
     }
     if has(&flags, "--quota") {
         refresh_all_quotas(value(&kv, "--agy-bin"))?;
@@ -3065,6 +3067,7 @@ fn cmd_add(args: &[String]) -> Res<i32> {
         }
     }
     let (pos, flags, kv) = parse_simple(
+        "delegate agy account add [<id>] [--label TEXT] [--overwrite] [--agy-bin PATH] [--json]",
         &main_args,
         &["--overwrite", "--json"],
         &["--id", "--label", "--agy-bin", "--login-arg"],
@@ -3228,7 +3231,12 @@ fn cmd_add(args: &[String]) -> Res<i32> {
 }
 
 fn cmd_use(args: &[String]) -> Res<i32> {
-    let (pos, flags, _) = parse_simple(args, &["--force", "--json"], &[])?;
+    let (pos, flags, _) = parse_simple(
+        "delegate agy account use <id> [--force] [--json]",
+        args,
+        &["--force", "--json"],
+        &[],
+    )?;
     if pos.len() != 1 {
         return Err("usage: delegate agy account use <id> [--force] [--json]".into());
     }
@@ -3378,7 +3386,12 @@ fn cmd_use(args: &[String]) -> Res<i32> {
 }
 
 fn cmd_remove(args: &[String]) -> Res<i32> {
-    let (pos, flags, _) = parse_simple(args, &["--force", "--json"], &[])?;
+    let (pos, flags, _) = parse_simple(
+        "delegate agy account remove <id> [--force] [--json]",
+        args,
+        &["--force", "--json"],
+        &[],
+    )?;
     if pos.len() != 1 {
         return Err("usage: delegate agy account remove <id> [--force] [--json]".into());
     }
@@ -3520,13 +3533,19 @@ fn synthesize_oauth_creds(vault_obj: &Value) -> Value {
 }
 
 fn cmd_import_agy_swap(args: &[String]) -> Res<i32> {
+    let usage = "delegate agy account import-agy-swap [--dry-run] [--source DIR] [--overwrite] [--json]";
     let (pos, flags, kv) = parse_simple(
+        usage,
         args,
         &["--dry-run", "--overwrite", "--json"],
         &["--source"],
     )?;
     if !pos.is_empty() {
-        return Err(format!("unrecognized arguments: {}", pos.join(" ")));
+        return Err(unrecognized_arg(
+            &pos.join(" "),
+            &["--dry-run", "--overwrite", "--json", "--source"],
+            usage,
+        ));
     }
     let dry_run = has(&flags, "--dry-run");
     let overwrite = has(&flags, "--overwrite");
@@ -3829,13 +3848,19 @@ fn classify_entry(entry: &Path) -> String {
 }
 
 fn cmd_restore_entry(args: &[String]) -> Res<i32> {
+    let usage = "delegate agy account restore-entry [--dry-run] [--force] [--mode wrapper|symlink] [--entry PATH] [--real-bin PATH] [--json]";
     let (pos, flags, kv) = parse_simple(
+        usage,
         args,
         &["--dry-run", "--force", "--json"],
         &["--mode", "--entry", "--real-bin"],
     )?;
     if !pos.is_empty() {
-        return Err(format!("unrecognized arguments: {}", pos.join(" ")));
+        return Err(unrecognized_arg(
+            &pos.join(" "),
+            &["--dry-run", "--force", "--json", "--mode", "--entry", "--real-bin"],
+            usage,
+        ));
     }
     let dry_run = has(&flags, "--dry-run");
     let force = has(&flags, "--force");
@@ -4004,6 +4029,7 @@ fn parse_pct_flag(raw: &str, flag: &str) -> Res<f64> {
 
 fn cmd_note(args: &[String]) -> Res<i32> {
     let (pos, flags, kv) = parse_simple(
+        "delegate agy account note <id> [--weekly PCT] [--five-hour PCT] [--clear] [--json]",
         args,
         &["--clear", "--json"],
         &["--weekly", "--five-hour"],

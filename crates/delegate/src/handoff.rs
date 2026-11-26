@@ -409,7 +409,9 @@ pub fn command(args: &[String]) -> Res<i32> {
                     .ok_or_else(|| format!("argument {}: expected one argument", args[i - 1]))?;
                 out_path = Some(PathBuf::from(value));
             }
-            other => return Err(format!("unrecognized arguments: {other}")),
+            other => {
+                return Err(unrecognized_arg(other, &["--out", "-o"], "handoff"));
+            }
         }
         i += 1;
     }

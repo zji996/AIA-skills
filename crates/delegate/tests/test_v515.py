@@ -307,7 +307,7 @@ cargo test; echo $? > "$DELEGATE_RUN_DIR/denied-code"
         self.addCleanup(lambda: first.poll() is None and first.kill())
         self.wait_text(lock, lambda t: t.strip() == str(first.pid), "waiter lock")
         for args in ((state["run"],), ("--any", state["run"]), ("--stream", state["run"]), ("--machine",)):
-            out = self.cli("wait", *args)
+            out = self.cli("wait", "--exclusive", *args)
             self.assertEqual(out.returncode, 76, out.stderr)
             self.assertEqual(out.stdout, "")
             self.assertIn(f"pid {first.pid}", out.stderr)

@@ -4474,7 +4474,11 @@ pub fn card_command(args: &[String]) -> Res<i32> {
             "--total" => round_only = false,
             "--no-mark" => no_mark = true,
             other if other.starts_with('-') => {
-                return Err(format!("card: unknown flag {other}"));
+                return Err(unrecognized_arg(
+                    other,
+                    &["--json", "--round", "--total", "--no-mark"],
+                    "card",
+                ));
             }
             _ => pos.push(arg.clone()),
         }

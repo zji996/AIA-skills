@@ -446,7 +446,12 @@ fn hint_concurrent_writes(created: &Path) {
 }
 
 pub(crate) type Parsed = (Vec<String>, Vec<String>, Vec<(String, String)>);
-pub(crate) fn parse_simple(args: &[String], flags: &[&str], values: &[&str]) -> Res<Parsed> {
+pub(crate) fn parse_simple(
+    usage: &str,
+    args: &[String],
+    flags: &[&str],
+    values: &[&str],
+) -> Res<Parsed> {
     let mut pos = vec![];
     let mut present = vec![];
     let mut kv = vec![];
@@ -462,7 +467,10 @@ pub(crate) fn parse_simple(args: &[String], flags: &[&str], values: &[&str]) -> 
             }
             kv.push((a.clone(), args[i].clone()));
         } else if a.starts_with('-') && a != "-" {
-            return Err(format!("unrecognized arguments: {a}"));
+            let mut valid = Vec::with_capacity(flags.len() + values.len());
+            valid.extend_from_slice(flags);
+            valid.extend_from_slice(values);
+            return Err(unrecognized_arg(a, &valid, usage));
         } else {
             pos.push(a.clone());
         }
@@ -626,16 +634,18 @@ fn collect(
     show_progress: bool,
     full: bool,
     show_result: bool,
+    exclusive: bool,
     next: &str,
 ) -> i32 {
     let requested = runs;
-    let Ok((runs, _claims)) = waiting::claim(runs) else {
+    let Ok((runs, _claims)) = waiting::claim(runs, exclusive) else {
         return 2;
     };
-    if runs.is_empty()
-        || requested
-            .iter()
-            .any(|r| !runs.contains(r) && runs::active(&runs::state(r)))
+    if exclusive
+        && (runs.is_empty()
+            || requested
+                .iter()
+                .any(|r| !runs.contains(r) && runs::active(&runs::state(r))))
     {
         return waiting::COVERED;
     }
@@ -1012,10 +1022,11 @@ fn wait_each(
     show_progress: bool,
     full: bool,
     show_result: bool,
+    exclusive: bool,
     next: &str,
 ) -> i32 {
     let initial = list.clone();
-    let Ok((claimed, mut claims)) = waiting::claim(&list) else {
+    let Ok((claimed, mut claims)) = waiting::claim(&list, exclusive) else {
         return 2;
     };
     list = claimed;
@@ -1059,7 +1070,8 @@ fn wait_each(
                     if let Ok((fresh, _)) = wait_list(pos, flags, true) {
                         for run in fresh {
                             if !list.contains(&run) && !covered.contains(&run) {
-                                if let Ok((fresh, held)) = waiting::claim(std::slice::from_ref(&run))
+                                if let Ok((fresh, held)) =
+                                    waiting::claim(std::slice::from_ref(&run), exclusive)
                                 {
                                     if fresh.is_empty() {
                                         covered.insert(run);
@@ -1250,7 +1262,9 @@ fn wait_each(
             if let Ok((fresh, _)) = wait_list(pos, flags, true) {
                 for run in fresh {
                     if !list.contains(&run) && !covered.contains(&run) {
-                        if let Ok((fresh, held)) = waiting::claim(std::slice::from_ref(&run)) {
+                        if let Ok((fresh, held)) =
+                            waiting::claim(std::slice::from_ref(&run), exclusive)
+                        {
                             if fresh.is_empty() {
                                 covered.insert(run);
                             }
@@ -1332,6 +1346,7 @@ fn print_archive_rescan(res: &archive::ArchiveRescan) {
 }
 fn clean(args: &[String]) -> Res<i32> {
     let (pos, flags, _) = parse_simple(
+        "clean",
         args,
         &[
             "--finished",
@@ -1554,7 +1569,7 @@ fn clean(args: &[String]) -> Res<i32> {
     Ok(0)
 }
 fn stop(args: &[String]) -> Res<i32> {
-    let (args, flags, _) = parse_simple(args, &["--json"], &[])?;
+    let (args, flags, _) = parse_simple("stop", args, &["--json"], &[])?;
     if has(&flags, "--json") {
         output::enable_json();
     }
@@ -1736,7 +1751,7 @@ fn diff(args: &[String]) -> Res<i32> {
         Some(index) => (&args[..index], &args[index + 1..]),
         None => (args, &[][..]),
     };
-    let (pos, flags, _) = parse_simple(options, &["--stat", "--total", "--risky", "--round"], &[])?;
+    let (pos, flags, _) = parse_simple("diff", options, &["--stat", "--total", "--risky", "--round"], &[])?;
     let reference = pos.first().map(String::as_str).unwrap_or("last");
     let run = match runs::resolve_head(reference) {
         Ok(r) => r,
@@ -1843,7 +1858,7 @@ fn patch(args: &[String]) -> Res<i32> {
     Ok(0)
 }
 fn adopt_command(args: &[String]) -> Res<i32> {
-    let (pos, flags, _) = parse_simple(args, &["--json"], &[])?;
+    let (pos, flags, _) = parse_simple("adopt", args, &["--json"], &[])?;
     if has(&flags, "--json") {
         output::enable_json();
     }
@@ -1945,6 +1960,7 @@ fn adopt_command(args: &[String]) -> Res<i32> {
 
 fn mark_applied_command(args: &[String]) -> Res<i32> {
     let (pos, flags, values) = parse_simple(
+        "mark-applied",
         args,
         &["--check-files", "--json"],
         &["--commit"],
@@ -2058,9 +2074,9 @@ fn mark_applied_command(args: &[String]) -> Res<i32> {
 }
 
 fn files_command(args: &[String]) -> Res<i32> {
-    let (pos, flags, _) = parse_simple(args, &["--json"], &[])?;
+    let (pos, flags, _) = parse_simple("files", args, &["--json"], &[])?;
     if pos.len() > 1 {
-        return Err(format!("unrecognized arguments: {}", pos[1..].join(" ")));
+        return Err(unrecognized_arg(&pos[1..].join(" "), &["--json"], "files"));
     }
     let reference = pos.first().map(String::as_str).unwrap_or("last");
     let resolved = match runs::resolve(reference) {
@@ -2108,6 +2124,7 @@ fn apply(args: &[String]) -> Res<i32> {
     let apply_started_at = iso();
     let apply_t0 = std::time::Instant::now();
     let (pos, flags, kv) = parse_simple(
+        "apply",
         args,
         &[
             "--dry-run",
@@ -2967,6 +2984,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     prog,
                     full,
                     true,
+                    false,
                     &format!(
                         "{} wait {}",
                         script().display(),
@@ -3009,6 +3027,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     prog,
                     full,
                     true,
+                    false,
                     &format!("{} wait {}", script().display(), name),
                 ))
             } else {
@@ -3023,6 +3042,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         }
         "wait" => {
             let (pos, flags, kv) = parse_simple(
+                "wait",
                 rest,
                 &[
                     "--all",
@@ -3034,6 +3054,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     "--any",
                     "--until-all",
                     "--stream",
+                    "--exclusive",
                     "--json",
                 ],
                 &["--max", "--since"],
@@ -3099,6 +3120,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
             if until_all {
                 max = Some(max.unwrap_or(3000.0).min(3000.0));
             }
+            let exclusive = has(&flags, "--exclusive");
             if any || stream {
                 return Ok(wait_each(
                     list,
@@ -3108,6 +3130,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     has(&flags, "--progress"),
                     has(&flags, "--full"),
                     !has(&flags, "--no-result"),
+                    exclusive,
                     &std::iter::once(script().to_string_lossy().into_owned())
                         .chain(std::iter::once("wait".into()))
                         .chain(rest.iter().cloned())
@@ -3122,6 +3145,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 has(&flags, "--progress"),
                 has(&flags, "--full"),
                 !has(&flags, "--no-result"),
+                exclusive,
                 &std::iter::once(script().to_string_lossy().into_owned())
                     .chain(std::iter::once("wait".into()))
                     .chain(rest.iter().cloned())
@@ -3138,7 +3162,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
             Ok(0)
         }
         "status" | "list" => {
-            let (pos, flags, _) = parse_simple(rest, &["--json", "--all", "--files"], &[])?;
+            let (pos, flags, _) = parse_simple("status", rest, &["--json", "--all", "--files"], &[])?;
             if has(&flags, "--json") {
                 output::enable_json();
             }
@@ -3604,7 +3628,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "probe" => probe::command(rest),
         "protocol" => {
             if let Some(arg) = rest.first() {
-                return Err(format!("unrecognized arguments: {arg}"));
+                return Err(unrecognized_arg(arg, &[], "protocol"));
             }
             println!("{}", crate::agents::protocol());
             Ok(0)
@@ -3625,7 +3649,13 @@ fn tiers(args: &[String]) -> Res<i32> {
         let name = key
             .strip_prefix("--")
             .filter(|n| models::TIERS.contains(n) || ["alias", "thinking"].contains(n))
-            .ok_or_else(|| format!("unrecognized arguments: {}", args[i]))?;
+            .ok_or_else(|| {
+                unrecognized_arg(
+                    &args[i],
+                    &["--scout", "--review", "--write", "--alias", "--thinking"],
+                    "tiers",
+                )
+            })?;
         let value = match inline {
             Some(v) => v,
             None => {
@@ -3747,6 +3777,7 @@ fn tiers(args: &[String]) -> Res<i32> {
 
 fn result_command(rest: &[String]) -> Res<i32> {
     let (pos, flags, kv) = parse_simple(
+        "result",
         rest,
         &["--path", "--no-mark", "--all", "--rounds", "--json"],
         &["--round"],

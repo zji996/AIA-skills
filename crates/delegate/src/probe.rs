@@ -48,7 +48,11 @@ fn parse(args: &[String]) -> Res<Args> {
         let name = match key {
             "--tier" | "--model" | "--timeout" => key,
             other if other.starts_with('-') => {
-                return Err(format!("unrecognized arguments: {other}"))
+                return Err(unrecognized_arg(
+                    &args[i],
+                    &["--tier", "--model", "--timeout"],
+                    "probe",
+                ))
             }
             other => return Err(format!("probe takes no arguments: {other}")),
         };

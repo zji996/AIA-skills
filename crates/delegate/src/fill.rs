@@ -724,7 +724,13 @@ fn stats_cmd(args: &[String]) -> Res<i32> {
             "--repo" => repo_arg = Some(take_val(key, &mut i)?),
             "--all" => all_repos = true,
             "--json" => json_mode = true,
-            other => return Err(format!("unrecognized arguments: {other}")),
+            _ => {
+                return Err(unrecognized_arg(
+                    a,
+                    &["--since", "--repo", "--all", "--json"],
+                    "delegate fill stats [--since DURATION|all] [--repo PATH] [--all] [--json]",
+                ));
+            }
         }
         i += 1;
     }

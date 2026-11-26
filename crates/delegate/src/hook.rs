@@ -737,7 +737,13 @@ fn stats_cmd(args: &[String]) -> Res<i32> {
                 }
                 max_weeks = Some(n);
             }
-            other => return Err(format!("unrecognized arguments: {other}")),
+            _ => {
+                return Err(unrecognized_arg(
+                    a,
+                    &["--weeks", "--json"],
+                    "delegate hook stats [--weeks N] [--json]",
+                ));
+            }
         }
         i += 1;
     }

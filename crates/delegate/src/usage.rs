@@ -1485,12 +1485,17 @@ fn repo_matches_filter(repo_path: &str, repo_name: &str, filter: &str) -> bool {
 /// CLI entrypoint: `delegate usage [--since 24h|7d|all] [--by account|day|run|repo] [--account ID] [--repo PATH] [--all] [--json]`
 pub fn command(args: &[String]) -> Res<i32> {
     let (pos, flags, kv) = parse_simple(
+        "usage",
         args,
         &["--json", "--all"],
         &["--since", "--by", "--account", "--repo"],
     )?;
     if !pos.is_empty() {
-        return Err(format!("unrecognized arguments: {}", pos.join(" ")));
+        return Err(unrecognized_arg(
+            &pos.join(" "),
+            &["--json", "--all", "--since", "--by", "--account", "--repo"],
+            "usage",
+        ));
     }
     let json_out = has(&flags, "--json");
     let include_non_agy = has(&flags, "--all");

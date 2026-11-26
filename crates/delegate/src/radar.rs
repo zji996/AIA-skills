@@ -828,7 +828,13 @@ fn list_command(args: &[String]) -> Res<i32> {
         match a.as_str() {
             "--all" => all = true,
             "--json" => json_mode = true,
-            other => return Err(format!("unrecognized arguments: {other}")),
+            other => {
+                return Err(unrecognized_arg(
+                    other,
+                    &["--all", "--json"],
+                    "delegate radar list [--all] [--json]",
+                ));
+            }
         }
     }
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -908,7 +914,12 @@ fn render_pick_draft(candidate: &Value, repo: &str) -> String {
 }
 
 fn pick_command(args: &[String]) -> Res<i32> {
-    let (pos, flags, opts) = parse_simple(args, &["--json"], &["--out", "-o"])?;
+    let (pos, flags, opts) = parse_simple(
+        "delegate radar pick <id> [--out PATH] [--json]",
+        args,
+        &["--json"],
+        &["--out", "-o"],
+    )?;
     if has(&flags, "--json") {
         output::enable_json();
     }
@@ -1020,7 +1031,7 @@ fn pick_command(args: &[String]) -> Res<i32> {
 }
 
 fn schedule_command(args: &[String]) -> Res<i32> {
-    let (_, _, opts) = parse_simple(args, &[], &["--repo"])?;
+    let (_, _, opts) = parse_simple("delegate radar schedule [--repo PATH]", args, &[], &["--repo"])?;
     let cwd = std::env::current_dir().unwrap_or_default();
     let repo = opt(&opts, "--repo")
         .map(PathBuf::from)
@@ -1083,9 +1094,14 @@ fn schedule_command(args: &[String]) -> Res<i32> {
 }
 
 fn run_command(args: &[String]) -> Res<i32> {
-    let (pos, flags, _) = parse_simple(args, &["--force", "--dry-run", "--json"], &[])?;
+    let usage = "delegate radar [run] [--force] [--dry-run] [--json]";
+    let (pos, flags, _) = parse_simple(usage, args, &["--force", "--dry-run", "--json"], &[])?;
     if !pos.is_empty() {
-        return Err(format!("unrecognized arguments: {}", pos.join(" ")));
+        return Err(unrecognized_arg(
+            &pos.join(" "),
+            &["--force", "--dry-run", "--json"],
+            usage,
+        ));
     }
     if has(&flags, "--json") {
         output::enable_json();

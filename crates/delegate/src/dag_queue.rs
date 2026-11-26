@@ -760,7 +760,14 @@ fn add_cmd(args: &[String]) -> Res<i32> {
                 start_args.push(k.to_string());
             }
             other if other.starts_with('-') => {
-                return Err(format!("unrecognized arguments: {other}"));
+                let mut valid = vec!["--after", "--after-applied", "--prompt-file", "--json", "--protect-reason"];
+                valid.extend_from_slice(&value_start_flags);
+                valid.extend_from_slice(&bool_start_flags);
+                return Err(unrecognized_arg(
+                    a,
+                    &valid,
+                    "delegate queue add <name> --after <run|name> --prompt-file <FILE> [start options...]",
+                ));
             }
             other => {
                 if name.is_none() {
@@ -1012,7 +1019,13 @@ fn list_cmd(args: &[String]) -> Res<i32> {
         match a.as_str() {
             "--all" => show_all = true,
             "--json" => json_mode = true,
-            other => return Err(format!("unrecognized arguments: {other}")),
+            other => {
+                return Err(unrecognized_arg(
+                    other,
+                    &["--all", "--json"],
+                    "delegate queue list [--all] [--json]",
+                ));
+            }
         }
     }
     let state = state_dir();
@@ -1092,7 +1105,11 @@ fn remove_cmd(args: &[String]) -> Res<i32> {
         if a == "--json" {
             json_mode = true;
         } else if a.starts_with('-') {
-            return Err(format!("unrecognized arguments: {a}"));
+            return Err(unrecognized_arg(
+                a,
+                &["--json"],
+                "delegate queue remove <name>... [--json]",
+            ));
         } else {
             names.push(a.clone());
         }

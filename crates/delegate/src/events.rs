@@ -1487,7 +1487,13 @@ pub fn command(args: &[String]) -> Res<i32> {
             "--follow" | "-f" => follow = true,
             "--rebuild" => rebuild_flag = true,
             "--json" => json_mode = true,
-            other => return Err(format!("unrecognized arguments: {other}")),
+            other => {
+                return Err(unrecognized_arg(
+                    other,
+                    &["--since", "--follow", "-f", "--rebuild", "--json"],
+                    "events",
+                ));
+            }
         }
         i += 1;
     }

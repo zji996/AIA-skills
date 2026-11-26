@@ -1164,9 +1164,13 @@ pub fn format_human(reports: &[RepoSpeedReport], requested_since: &str) -> Strin
 /// CLI entrypoint: `delegate speed [--since 7d|14d|all] [--repo PATH] [--backtest] [--json]`
 pub fn command(args: &[String]) -> Res<i32> {
     let (pos, flags, kv) =
-        parse_simple(args, &["--json", "--backtest"], &["--since", "--repo"])?;
+        parse_simple("speed", args, &["--json", "--backtest"], &["--since", "--repo"])?;
     if !pos.is_empty() {
-        return Err(format!("unrecognized arguments: {}", pos.join(" ")));
+        return Err(unrecognized_arg(
+            &pos.join(" "),
+            &["--json", "--backtest", "--since", "--repo"],
+            "speed",
+        ));
     }
     let json_out = has(&flags, "--json") || crate::output::json_enabled();
     let backtest_mode = has(&flags, "--backtest");

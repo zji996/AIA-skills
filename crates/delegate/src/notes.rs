@@ -741,7 +741,11 @@ pub fn command(args: &[String]) -> Res<i32> {
             "--all" => all_flag = true,
             "--json" => json_flag = true,
             other if other.starts_with('-') => {
-                return Err(format!("unrecognized arguments: {other}"));
+                return Err(unrecognized_arg(
+                    other,
+                    &["--done", "--all", "--json"],
+                    "note",
+                ));
             }
             _ => positional.push(arg.clone()),
         }

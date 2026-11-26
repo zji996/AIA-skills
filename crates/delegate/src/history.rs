@@ -1553,7 +1553,11 @@ pub fn history_command(args: &[String]) -> Res<i32> {
                 );
             }
             arg if arg.starts_with('-') => {
-                return Err(format!("unrecognized arguments: {arg}"));
+                return Err(unrecognized_arg(
+                    arg,
+                    &["--since", "--state", "--limit", "--json"],
+                    "history",
+                ));
             }
             arg => keywords.push(arg.to_string()),
         }
@@ -1823,7 +1827,7 @@ pub fn show_command(args: &[String]) -> Res<i32> {
         if arg == "--json" {
             json_mode = true;
         } else if arg.starts_with('-') {
-            return Err(format!("unrecognized arguments: {arg}"));
+            return Err(unrecognized_arg(arg, &["--json"], "show"));
         } else {
             pos.push(arg.clone());
         }

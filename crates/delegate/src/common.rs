@@ -1252,6 +1252,121 @@ pub fn finish_run(run: &std::path::Path, mut summary: serde_json::Value, code: i
     Ok(())
 }
 
+pub fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+    for (i, &ac) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &bc) in b.iter().enumerate() {
+            let cost = usize::from(ac != bc);
+            curr[j + 1] = (prev[j + 1] + 1)
+                .min(curr[j] + 1)
+                .min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+const FLAG_SYNONYM_GROUPS: &[&[&str]] = &[
+    &["reason", "evidence", "why"],
+    &["message", "msg", "prompt"],
+    &["file", "prompt-file"],
+    &["dir", "cwd", "workdir", "repo"],
+    &["ro", "readonly", "read-only"],
+    &["wt", "worktree"],
+    &["test", "check", "accept"],
+    &["quiet", "silent", "no-result"],
+    &["verbose", "full"],
+    &["limit", "top", "tail", "events-limit"],
+    &["format", "json"],
+    &["after", "after-applied", "after-delivered", "after-work", "after-time"],
+    &["force", "overwrite"],
+    &["cancel", "delete", "rm", "remove"],
+    &["since", "window"],
+    &["notes", "note"],
+];
+
+fn normalize_flag_key(raw: &str) -> String {
+    let before_eq = raw.split_once('=').map_or(raw, |(k, _)| k);
+    before_eq.trim_start_matches('-').to_ascii_lowercase()
+}
+
+pub fn suggest_flag<'a>(arg: &str, valid_flags: &[&'a str]) -> Option<&'a str> {
+    let arg_is_flag = arg.starts_with('-');
+    let arg_key = normalize_flag_key(arg);
+    if arg_key.is_empty() {
+        return None;
+    }
+
+    // 1. Exact synonym match among valid flags.
+    for group in FLAG_SYNONYM_GROUPS {
+        if group.contains(&arg_key.as_str()) {
+            for &cand in valid_flags {
+                if cand.starts_with('-') != arg_is_flag {
+                    continue;
+                }
+                let cand_key = normalize_flag_key(cand);
+                if cand_key != arg_key && group.contains(&cand_key.as_str()) {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+
+    // 2. Levenshtein distance <= 2 (<= 1 for very short keys; skip 1-char candidates).
+    let max_dist = if arg_key.len() <= 2 { 1 } else { 2 };
+    let mut best: Option<(usize, &'a str)> = None;
+    for &cand in valid_flags {
+        if cand.starts_with('-') != arg_is_flag {
+            continue;
+        }
+        let cand_key = normalize_flag_key(cand);
+        if cand_key.len() < 2 || cand_key == arg_key {
+            continue;
+        }
+        let d = levenshtein(&arg_key, &cand_key);
+        if d <= max_dist && best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, cand));
+        }
+    }
+    best.map(|(_, cand)| cand)
+}
+
+/// Format an unrecognized CLI argument error with nearest-flag / synonym suggestion and 1-line usage.
+/// `usage` may be a top-level command name (resolved via `help::usage_line`) or a full usage line.
+pub fn unrecognized_arg(arg: &str, valid_flags: &[&str], usage: &str) -> String {
+    let head = match suggest_flag(arg, valid_flags) {
+        Some(suggestion) => format!("unrecognized argument '{arg}'; did you mean '{suggestion}'?"),
+        None => format!("unrecognized argument '{arg}'"),
+    };
+    let resolved_usage = if usage.is_empty() {
+        String::new()
+    } else if let Some(stripped) = usage
+        .strip_prefix("usage:")
+        .or_else(|| usage.strip_prefix("Usage:"))
+    {
+        stripped.trim().to_string()
+    } else if !usage.contains(' ') {
+        crate::help::usage_line(usage).unwrap_or_else(|| format!("delegate {usage}"))
+    } else {
+        usage.to_string()
+    };
+    if resolved_usage.is_empty() {
+        head
+    } else {
+        format!("{head}\nusage: {resolved_usage}")
+    }
+}
+
 #[cfg(test)]
 mod git_lock_tests {
     use super::*;
@@ -1335,5 +1450,30 @@ mod git_lock_tests {
             assert_eq!(envs.get(key), Some(&None), "expected {key} to be removed");
         }
         assert_eq!(envs.get("CUSTOM_KEEP"), Some(&Some("yes".into())));
+    }
+
+    #[test]
+    fn unrecognized_arg_suggests_typos_synonyms_and_usage() {
+        assert_eq!(levenshtein("comit", "commit"), 1);
+        assert_eq!(levenshtein("readonl", "read-only"), 2);
+
+        let err = unrecognized_arg("--comit", &["--commit", "--verify", "--json"], "apply");
+        assert!(err.contains("unrecognized argument '--comit'; did you mean '--commit'?"), "{err}");
+        assert!(err.contains("usage: delegate apply "), "{err}");
+
+        let err2 = unrecognized_arg("--readonl", &["--read-only", "--worktree"], "start");
+        assert!(err2.contains("unrecognized argument '--readonl'; did you mean '--read-only'?"), "{err2}");
+        assert!(err2.contains("usage: delegate start "), "{err2}");
+
+        let err3 = unrecognized_arg(
+            "--evidence",
+            &["--reason", "--json"],
+            "delegate work drop <Wxx> --reason <text> [--json]",
+        );
+        assert!(err3.contains("unrecognized argument '--evidence'; did you mean '--reason'?"), "{err3}");
+        assert!(err3.contains("usage: delegate work drop <Wxx>"), "{err3}");
+
+        let err4 = unrecognized_arg("--wait-manual", &["--repo", "--json"], "delegate work add <title>");
+        assert!(err4.starts_with("unrecognized argument '--wait-manual'\nusage: delegate work add <title>"), "{err4}");
     }
 }

@@ -1100,7 +1100,9 @@ pub fn sign_command(args: &[String]) -> Res<i32> {
         match a.as_str() {
             "--check" => check_only = true,
             "--json" => json_mode = true,
-            x if x.starts_with('-') => return Err(format!("unrecognized arguments: {x}")),
+            x if x.starts_with('-') => {
+                return Err(unrecognized_arg(x, &["--check", "--json"], "sign"));
+            }
             _ => pos.push(a.clone()),
         }
     }
