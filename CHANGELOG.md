@@ -2,8 +2,11 @@
 
 ## Unreleased
 
-- `delegate`：`start --worktree`（含 `queue` 与工作表自动派活）写任务默认先起 `tiers.scout` 只读探路出 L0/L1 地图、Host 确定性校验落点锚点与 blob sha 后存 `scout-map.md` 再开新会话派写手（`--no-scout`、`.delegate.json` `"scoutFirst": false` 或 1–3 个已存在路径且无 symbol 提示且 ≤2000 字的极轻任务例外；`queue add` 透传 `--no-scout`）；L0 第 3 节不符时进提问态等主控 `reply` 后再起写手，缺 L0 / 坏锚点 >20% / 探路失败按弃图处理并记 `scout_map_dropped` 不阻塞写入，`summary.json`、审查卡与 `delegate lines` 纳入探路记账与写手 `preEditSteps`。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
+
+## delegate 6.52.0 - 2026-11-26
+
+- `delegate` 6.52.0：`start --worktree`（含 `queue` 与工作表自动派活）写任务默认先起 `tiers.scout` 只读探路出 L0/L1 地图、Host 确定性校验落点锚点与 blob sha 后存 `scout-map.md` 再开新会话派写手（`--no-scout`、`.delegate.json` `"scoutFirst": false` 或 1–3 个已存在路径且无 symbol 提示且 ≤2000 字的极轻任务例外；`queue add` 透传 `--no-scout`）；L0 第 3 节不符时进提问态等主控 `reply` 后再起写手，缺 L0 / 坏锚点 >20% / 探路失败按弃图处理并记 `scout_map_dropped` 不阻塞写入，`summary.json`、审查卡与 `delegate lines` 纳入探路记账与写手 `preEditSteps`。
 
 ## delegate 6.51.0 - 2026-11-26
 
