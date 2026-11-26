@@ -2,8 +2,11 @@
 
 ## Unreleased
 
-- `delegate`：远端 lane 支持 `remote.light`（argv 前缀/通配模式）与 `remote.maxLight`（默认 4，0 不限），命中的同事命令与验收/verify 等 shell 步骤走独立轻队列 `lane-remote-light` 不再排在 `maxHeavy` 远端重任务后（轻队列内调用重命令仍排重队列，未配置行为不变）；`start`/`reply`/`work add --auto -- <start-args>` 与 `queue add` 新增 `--no-remote`（等同 `DELEGATE_REMOTE=0`，随 reply 继承，启动回显标「远程：关」）；`lane` 与 `status` 区分标示 `[重队列]`/`[轻队列]`/`[本机]`。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
+
+## delegate 6.48.0 - 2026-11-26
+
+- `delegate` 6.48.0：远端 lane 支持 `remote.light`（argv 前缀/通配模式）与 `remote.maxLight`（默认 4，0 不限），命中的同事命令与验收/verify 等 shell 步骤走独立轻队列 `lane-remote-light` 不再排在 `maxHeavy` 远端重任务后（轻队列内调用重命令仍排重队列，未配置行为不变）；`start`/`reply`/`work add --auto -- <start-args>` 与 `queue add` 新增 `--no-remote`（等同 `DELEGATE_REMOTE=0`，随 reply 继承，启动回显标「远程：关」）；`lane` 与 `status` 区分标示 `[重队列]`/`[轻队列]`/`[本机]`。
 
 ## delegate 6.47.0 - 2026-11-26
 
