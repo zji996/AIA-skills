@@ -2,12 +2,12 @@
 use crate::common::*;
 use serde_json::{json, Value};
 
-pub const CLASSES: [&str; 5] = ["scout", "build", "hard", "design", "review"];
+pub const CLASSES: [&str; 3] = ["build", "hard", "review"];
 
 /// Default thinking level implied by `--class` when no explicit `--thinking` or `DELEGATE_THINKING` is set.
 pub fn default_thinking(class: &str) -> Option<&'static str> {
     match class {
-        "build" | "design" | "scout" | "review" => Some("medium"),
+        "build" | "review" => Some("medium"),
         "hard" => Some("high"),
         _ => None,
     }
@@ -19,12 +19,20 @@ fn path() -> std::path::PathBuf {
 pub fn validate_class(class: &str) -> Res<()> {
     if CLASSES.contains(&class) {
         Ok(())
+    } else if matches!(class, "scout" | "design") {
+        Err(format!(
+            "class '{class}' was removed; use build (spec'd implementation, incl. UI from the controller's design), hard (ledger/concurrency/sandbox/migration) or review (read-only review)"
+        ))
     } else {
         Err(format!("unknown class {class}; use {}", CLASSES.join("|")))
     }
 }
 fn load() -> Res<Value> {
-    Ok(crate::config::read_file(&path())?.unwrap_or(json!({})))
+    let mut card = crate::config::read_file(&path())?.unwrap_or(json!({}));
+    if let Some(obj) = card.as_object_mut() {
+        obj.retain(|k, _| CLASSES.contains(&k.as_str()));
+    }
+    Ok(card)
 }
 fn aliases(config: &Value) -> Vec<String> {
     config["models"]
@@ -109,8 +117,9 @@ pub fn command(args: &[String]) -> Res<i32> {
     let aliases = aliases(&config.value);
     if args.first().is_some_and(|a| a == "set") {
         if args.len() != 5 && !(args.len() == 7 && args[5] == "--sample") {
-            return Err("use delegate fit set <scout|build|hard|design|review> <alias> <first|ok|avoid> \"note\" [--sample FILE]".into());
+            return Err("use delegate fit set <build|hard|review> <alias> <first|ok|avoid> \"note\" [--sample FILE]".into());
         }
+        validate_class(&args[1])?;
         if !aliases.contains(&args[2]) {
             return Err(format!("unknown alias {}; see delegate tiers", args[2]));
         }
@@ -149,7 +158,7 @@ pub fn command(args: &[String]) -> Res<i32> {
             println!("{out}");
             return Ok(0);
         }
-        // Five rows only; compact each cell for wide model registries. Full notes
+        // Three rows only; compact each cell for wide model registries. Full notes
         // remain available through --json, without growing the summary vertically.
         let width = (100 / aliases.len().max(1)).clamp(10, 85);
         let headers = aliases
@@ -232,12 +241,26 @@ mod tests {
     }
 
     #[test]
-    fn default_thinking_matches_five_classes() {
+    fn default_thinking_matches_three_classes() {
         assert_eq!(default_thinking("build"), Some("medium"));
-        assert_eq!(default_thinking("design"), Some("medium"));
-        assert_eq!(default_thinking("scout"), Some("medium"));
         assert_eq!(default_thinking("review"), Some("medium"));
         assert_eq!(default_thinking("hard"), Some("high"));
+        assert_eq!(default_thinking("design"), None);
+        assert_eq!(default_thinking("scout"), None);
         assert_eq!(default_thinking("other"), None);
+    }
+
+    #[test]
+    fn removed_classes_error_message() {
+        for name in ["scout", "design"] {
+            let err = validate_class(name).unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "class '{name}' was removed; use build (spec'd implementation, incl. UI from the controller's design), hard (ledger/concurrency/sandbox/migration) or review (read-only review)"
+                )
+            );
+        }
+        assert!(validate_class("other").unwrap_err().contains("build|hard|review"));
     }
 }

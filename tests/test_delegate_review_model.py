@@ -285,15 +285,10 @@ class DelegateReviewModelTests(unittest.TestCase):
         self.assertEqual(r_hard.returncode, 0, r_hard.stderr + r_hard.stdout)
         self.assertIn("thinking high〔类别 hard〕", r_hard.stderr)
 
-        # --class design -> medium〔类别 design〕
-        r_design = self.cli("run", "--worktree", "--class", "design", "--name", "cls-design", "task", cwd=repo)
-        self.assertEqual(r_design.returncode, 0, r_design.stderr + r_design.stdout)
-        self.assertIn("thinking medium〔类别 design〕", r_design.stderr)
-
-        # --class scout --read-only -> medium〔类别 scout〕
-        r_scout = self.cli("run", "--read-only", "--class", "scout", "--name", "cls-scout", "read", cwd=repo)
-        self.assertEqual(r_scout.returncode, 0, r_scout.stderr + r_scout.stdout)
-        self.assertIn("thinking medium〔类别 scout〕", r_scout.stderr)
+        # --class review --read-only -> medium〔类别 review〕
+        r_review = self.cli("run", "--read-only", "--class", "review", "--name", "cls-review", "read", cwd=repo)
+        self.assertEqual(r_review.returncode, 0, r_review.stderr + r_review.stdout)
+        self.assertIn("thinking medium〔类别 review〕", r_review.stderr)
 
         # Explicit --thinking overrides --class hard.
         r_cli = self.cli(
@@ -318,7 +313,7 @@ class DelegateReviewModelTests(unittest.TestCase):
         self.assertIn("〔别名〕", r_none.stderr)
 
         efforts = [json.loads(line)["effort"] for line in log_file.read_text().splitlines()]
-        self.assertEqual(efforts, ["medium", "high", "medium", "medium", "low", "low"])
+        self.assertEqual(efforts, ["medium", "high", "medium", "low", "low"])
 
     def test_reviewer_format_error_retries_once_and_adopts_or_escalates(self):
         # Case A: First reviewer reply lacks verdict -> retry receives verbatim prompt on same session -> PASS adopted.

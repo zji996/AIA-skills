@@ -1,5 +1,5 @@
-"""End-to-end tests for model alias cost tiers, fifth fit class (review),
-cost display in fit/tiers, and cost echo on start/reply.
+"""End-to-end tests for model alias cost tiers, three fit classes (build/hard/review),
+removed class errors, legacy fit.json cleanup, cost display in fit/tiers, and cost echo on start/reply.
 """
 import json
 import unittest
@@ -73,10 +73,12 @@ class DelegateFitCostTests(unittest.TestCase):
         table = self.cli("fit")
         self.assertEqual(table.returncode, 0, table.stderr)
         self.assertIn("review |", table.stdout)
+        self.assertNotIn("scout |", table.stdout)
+        self.assertNotIn("design |", table.stdout)
         self.assertIn("first · 抓缺陷稳", table.stdout)
         self.assertIn("avoid · 容易漏边界", table.stdout)
         self.assertIn("review × main", table.stdout)
-        self.assertEqual(len(table.stdout.splitlines()), 7)
+        self.assertEqual(len(table.stdout.splitlines()), 5)
 
         # Setting a new first in review demotes previous first to ok.
         demote = self.cli("fit", "set", "review", "main", "first", "性价比高")
@@ -146,6 +148,75 @@ class DelegateFitCostTests(unittest.TestCase):
         self.assertEqual(plain.returncode, 0, plain.stderr)
         self.assertIn("固定模型 p/m，thinking", plain.stderr)
         self.assertNotIn("〔—〕", plain.stderr)
+
+    def test_removed_classes_exit_2_with_exact_error(self):
+        self.write_user_config(self.matrix_config())
+        expected = lambda name: (
+            f"delegate: class '{name}' was removed; use build (spec'd implementation, "
+            "incl. UI from the controller's design), hard (ledger/concurrency/sandbox/migration) "
+            "or review (read-only review)"
+        )
+
+        # start --class design / scout
+        for removed in ("design", "scout"):
+            res = self.cli("start", "--read-only", "--class", removed, "task")
+            self.assertEqual(res.returncode, 2, res.stderr)
+            self.assertIn(expected(removed), res.stderr)
+
+        # fit set design / scout
+        for removed in ("design", "scout"):
+            res = self.cli("fit", "set", removed, "main", "ok", "legacy note")
+            self.assertEqual(res.returncode, 2, res.stderr)
+            self.assertIn(expected(removed), res.stderr)
+
+        # reply --class design / scout
+        self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED])
+        base = self.cli("run", "--read-only", "--model", "main", "base task")
+        self.assertEqual(base.returncode, 0, base.stderr)
+        run_id = self.outcome(base)["run"]
+        for removed in ("design", "scout"):
+            rep = self.cli("reply", run_id, "--class", removed, "follow up")
+            self.assertEqual(rep.returncode, 2, rep.stderr)
+            self.assertIn(expected(removed), rep.stderr)
+
+    def test_legacy_scout_and_design_entries_silently_ignored_and_dropped(self):
+        self.write_user_config(self.matrix_config())
+        fit_path = Path(self.env["XDG_CONFIG_HOME"]) / "delegate" / "fit.json"
+        fit_path.write_text(
+            json.dumps(
+                {
+                    "scout": {"cheap-a": {"verdict": "first", "note": "旧探路", "date": "2026-11-01"}},
+                    "design": {"main": {"verdict": "first", "note": "旧界面", "date": "2026-11-01"}},
+                    "build": {"main": {"verdict": "first", "note": "保留记录", "date": "2026-11-01"}},
+                }
+            )
+        )
+
+        table = self.cli("fit")
+        self.assertEqual(table.returncode, 0, table.stderr)
+        self.assertEqual(table.stderr, "")
+        self.assertIn("build |", table.stdout)
+        self.assertIn("first · 保留记录", table.stdout)
+        self.assertNotIn("scout", table.stdout)
+        self.assertNotIn("design", table.stdout)
+        self.assertNotIn("旧探路", table.stdout)
+        self.assertNotIn("旧界面", table.stdout)
+        self.assertEqual(len(table.stdout.splitlines()), 5)
+
+        as_json = self.cli("fit", "--json")
+        self.assertEqual(as_json.returncode, 0, as_json.stderr)
+        self.assertEqual(as_json.stderr, "")
+        parsed = json.loads(as_json.stdout)
+        self.assertNotIn("scout", parsed)
+        self.assertNotIn("design", parsed)
+        self.assertIn("build", parsed)
+
+        upd = self.cli("fit", "set", "hard", "advisor", "first", "疑难稳")
+        self.assertEqual(upd.returncode, 0, upd.stderr)
+        saved = json.loads(fit_path.read_text())
+        self.assertEqual(set(saved.keys()), {"build", "hard"})
+        self.assertNotIn("scout", saved)
+        self.assertNotIn("design", saved)
 
 
 if __name__ == "__main__":

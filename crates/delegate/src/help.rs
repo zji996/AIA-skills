@@ -30,7 +30,7 @@ const LAUNCH: &[(&str, &str)] = &[
     ("--review-model ALIAS", "Override the automatic reviewer model for this run (precedence: --review-model > repo review.model > user review.model > review tier). Falls back to review tier with a card notice if unavailable."),
     ("--review-full", "Force full net diff review on every review round of this run instead of incremental review or sync-round skip."),
     ("--overflow next|queue", "At model capacity: queue for the selected model (default), or explicitly allow the next tier candidate. Overrides rule overflow for this launch; pinned --model still queues."),
-    ("--class scout|build|hard|design|review", "Select default thinking when --thinking is omitted (build|design|scout|review -> medium, hard -> high) and show user-local fit card advice (delegate fit)."),
+    ("--class build|hard|review", "Select default thinking when --thinking is omitted (build|review -> medium, hard -> high) and show user-local fit card advice (delegate fit)."),
     ("--thinking LEVEL", "off|minimal|low|medium|high|xhigh. Environment > CLI > tier rule > alias thinking > config thinking > Pi default; independent of the model name."),
     ("--allow-parallel-writes", "Allow concurrent write runs in one workdir."),
     ("--worktree", "Write in a detached git worktree seeded from the current tree; merge with apply."),
@@ -185,7 +185,7 @@ const COMMANDS: &[(&str, &str)] = &[
         "disk",
         "Check build-cache disk health (disk status) or run liveness-aware zero-cost cleanup and whole-disk global LRU pruning (disk prune [--dry-run] [--json]).",
     ),
-    ("fit", "Show or update the five-class model suitability & cost card (fit set; fit --json)."),
+    ("fit", "Show or update the three-class model suitability & cost card (fit set; fit --json)."),
     (
         "tiers",
         "Show purpose rules and registered aliases with Pi capabilities; configure --scout/--review/--write, --alias, --thinking.",
@@ -434,7 +434,7 @@ pub fn print(command: Option<&str>) -> bool {
             ("--json", "Print deletion counts, orphan container cleanup, and archive rescan results as JSON lines."),
         ]),
         "tiers" => ("[--scout ALIAS] [--review ALIAS] [--write ALIAS] [--alias NAME=provider/id] [--thinking LEVEL]", "Print each purpose's rules (alias, full id, thinking) and registered aliases with cost tier (low|main|high|—) and Pi context/images/thinking capabilities. The final line counts unregistered Pi models without listing them. Settings validate and atomically update user config; --alias is repeatable. All three tiers must resolve for start/run/reply. Old tiers and model :thinking suffixes are unsupported: register aliases, configure the three purposes and move suffixes into thinking.", &[]),
-        "fit" => ("[--json] | set CLASS ALIAS first|ok|avoid NOTE [--sample FILE]", "Five fixed classes (scout/build/hard/design/review) plus each alias's configured cost tier (low|main|high|—); user-local fit.json stores only the latest verdict per alias/class, with an 80-character one-line note. Setting first demotes the previous first to ok. Missing evaluations are listed; --json shows full notes, samples, and cost.", &[]),
+        "fit" => ("[--json] | set CLASS ALIAS first|ok|avoid NOTE [--sample FILE]", "Three fixed classes (build/hard/review) plus each alias's configured cost tier (low|main|high|—); user-local fit.json stores only the latest verdict per alias/class, with an 80-character one-line note. Setting first demotes the previous first to ok. Missing evaluations are listed; --json shows full notes, samples, and cost.", &[]),
         "probe" => ("[--tier scout|review|write] [--model ALIAS] [--timeout SECONDS]", "Probe only registered models, deduplicated by full id, through the same Pi binary/environment/providers as start. Show ok/FAIL, elapsed/first-token time, matching tier rules and Pi's first error. No worktree, run directory or capacity slot. Exit 1 if an inferred-purpose pick fails, 0 otherwise, 2 for usage.", &[
             ("--tier scout|review|write", "Probe only this tier's registered candidates, including inactive rules."),
             ("--model ALIAS", "Probe one registered model instead; exclusive with --tier."),

@@ -738,9 +738,11 @@ wait "$inside" 2>/dev/null || :
     def test_fit_table_lists_unreviewed(self):
         self.fit_set()
         result = self.cli("fit")
-        for text in ("scout", "build", "hard", "design", "review", "ok · good", "—", "还没评过的", "build × ds"):
+        for text in ("build", "hard", "review", "ok · good", "—", "还没评过的", "build × ds"):
             self.assertIn(text, result.stdout)
-        self.assertEqual(len(result.stdout.splitlines()), 7)
+        self.assertNotIn("scout |", result.stdout)
+        self.assertNotIn("design |", result.stdout)
+        self.assertEqual(len(result.stdout.splitlines()), 5)
 
     def fit_start(self, verdict):
         self.fit_set(verdict=verdict, note="too risky")
@@ -785,9 +787,9 @@ wait "$inside" 2>/dev/null || :
         self.assertEqual((run / "inside-state").read_text().strip(), "gone")
 
     def test_fit_sample_record(self):
-        result = self.fit_set("design", "main", "first", "good", "--sample", "page-spec.md")
+        result = self.fit_set("build", "main", "first", "good", "--sample", "page-spec.md")
         self.assertEqual(result.returncode, 0, result.stderr)
-        entry = self.fit_card()["design"]["main"]
+        entry = self.fit_card()["build"]["main"]
         self.assertEqual(entry["sample"], "page-spec.md")
         self.assertRegex(entry["date"], r"^\d{4}-\d{2}-\d{2}$")
 
