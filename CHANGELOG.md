@@ -2,10 +2,13 @@
 
 ## Unreleased
 
-- `delegate`：归档排除可重建目录整目录收入——答复引用落在 `.venv`/`venv`/`target`/`node_modules`/`dist`/`build`/`__pycache__`/`.pytest_cache` 等可重建目录内时仅保留被点名的单个文件，不因提及该目录或其父目录而整目录归档；新增 `delegate clean --rescan-archive` 重扫归档磁盘内容以重写过期 `manifest.json`/`record/archive.json` 并刷新 `archive/.usage.json`；默认归档总量告警阈值 `DEFAULT_ARCHIVE_WARN_GIB` 由 5 GiB 调至 30 GiB。
-- `delegate`：重构 `delegate-tui` 为新 5 标签结构（`1 总览` / `2 工作` / `3 运行` / `4 额度` / `5 事件`，默认进总览，删除旧 7 标签切页键，合入批次与侦察候选分别收拢进运行页/工作页折叠区且为 0 时隐藏），新增全局固定脉冲顶栏与条件告警条（仅提醒不自动切号）、总览 5 卡动态让高与近 7 天已合入交付（`recentDeliveries`）、工作页 54:46 双栏与定时等待隔离、运行页默认跨仓按状态聚合（`v` 切换按仓）及按需读取缓存的 L1 `card.json` 风险段、合并后的额度与 7 天横向分布/效率页（输出全部模型、超视口折叠）与事件页尾读回溯提示；同步将 `SnapshotPulse`/`ActiveAlert` 单一事实源下沉至 `crates/delegate/src/pulse.rs`，并将 `history.jsonl`/`events.jsonl` 改为尾部块读单趟产出 7 天趋势、最近交付与今日合入。
-- `delegate`：统一工作表与 `delegate-tui` 口径并修正 15 处显示与等待问题——总预估与 `wait` 链尾预估剔除暂缓/定时等待项并另列最早恢复时间，CLI 暂缓/等待时间统一转本地短格式、上游依赖展示任务名并区分交付/合入钟点、就绪项改写为「就绪 X · 预计耗时 Y」；`work` 与 `snapshot` 共用统一视图（TUI 工作页同步显示未挂工作项 run 并去重等待徽标、总览卡点对齐 `hook pending`）；`delegate card` 查看即标已读（支持 `--no-mark`）；CLI 工作表按终端宽度动态分列、TUI 状态列不再截断且返工仅显示中文「返工第 N 轮」；总览 Token 分布改横向条形图、7 天交付走势分离数值与柱体；额度预计在重置前耗尽时在 TUI 顶栏、`status` 首行与 Stop 钩子给出只读提醒；陈旧已派队列项与超 7 天无活动非当前仓默认隐藏/折叠（`--all` 可展开）；`delegate wait` 默认跨仓库等本会话在跑任务（新增 `--current-repo` 仅限当前仓）。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
+
+## delegate 6.47.0 - 2026-11-26
+
+- `delegate` 6.47.0：归档排除可重建目录整目录收入——答复引用落在 `.venv`/`venv`/`target`/`node_modules`/`dist`/`build`/`__pycache__`/`.pytest_cache` 等可重建目录内时仅保留被点名的单个文件，不因提及该目录或其父目录而整目录归档；新增 `delegate clean --rescan-archive` 重扫归档磁盘内容以重写过期 `manifest.json`/`record/archive.json` 并刷新 `archive/.usage.json`；默认归档总量告警阈值 `DEFAULT_ARCHIVE_WARN_GIB` 由 5 GiB 调至 30 GiB。
+- `delegate` 6.47.0：重构 `delegate-tui` 为新 5 标签结构（`1 总览` / `2 工作` / `3 运行` / `4 额度` / `5 事件`，默认进总览，删除旧 7 标签切页键，合入批次与侦察候选分别收拢进运行页/工作页折叠区且为 0 时隐藏），新增全局固定脉冲顶栏与条件告警条（仅提醒不自动切号）、总览 5 卡动态让高与近 7 天已合入交付（`recentDeliveries`）、工作页 54:46 双栏与定时等待隔离、运行页默认跨仓按状态聚合（`v` 切换按仓）及按需读取缓存的 L1 `card.json` 风险段、合并后的额度与 7 天横向分布/效率页（输出全部模型、超视口折叠）与事件页尾读回溯提示；同步将 `SnapshotPulse`/`ActiveAlert` 单一事实源下沉至 `crates/delegate/src/pulse.rs`，并将 `history.jsonl`/`events.jsonl` 改为尾部块读单趟产出 7 天趋势、最近交付与今日合入。
+- `delegate` 6.47.0：统一工作表与 `delegate-tui` 口径并修正 15 处显示与等待问题——总预估与 `wait` 链尾预估剔除暂缓/定时等待项并另列最早恢复时间，CLI 暂缓/等待时间统一转本地短格式、上游依赖展示任务名并区分交付/合入钟点、就绪项改写为「就绪 X · 预计耗时 Y」；`work` 与 `snapshot` 共用统一视图（TUI 工作页同步显示未挂工作项 run 并去重等待徽标、总览卡点对齐 `hook pending`）；`delegate card` 查看即标已读（支持 `--no-mark`）；CLI 工作表按终端宽度动态分列、TUI 状态列不再截断且返工仅显示中文「返工第 N 轮」；总览 Token 分布改横向条形图、7 天交付走势分离数值与柱体；额度预计在重置前耗尽时在 TUI 顶栏、`status` 首行与 Stop 钩子给出只读提醒；陈旧已派队列项与超 7 天无活动非当前仓默认隐藏/折叠（`--all` 可展开）；`delegate wait` 默认跨仓库等本会话在跑任务（新增 `--current-repo` 仅限当前仓）。
 
 ## delegate 6.46.0 - 2026-11-26
 
