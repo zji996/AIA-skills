@@ -308,6 +308,8 @@ pub struct App {
     pub quota_models_expanded: bool,
     pub quota_refreshing: bool,
     pub quota_last_error: Option<String>,
+    pub lines_refreshing: bool,
+    pub line_stats_error: Option<String>,
     pub show_lane_events: bool,
     pub hidden_lane_events: usize,
     pub work_rows: Vec<WorkRow>,
@@ -383,6 +385,8 @@ impl App {
             quota_models_expanded: false,
             quota_refreshing: false,
             quota_last_error: None,
+            lines_refreshing: false,
+            line_stats_error: None,
             show_lane_events: false,
             hidden_lane_events: 0,
             work_rows: Vec::new(),
@@ -414,9 +418,12 @@ impl App {
     }
 
     /// Apply a newly collected snapshot; returns true if anything changed and a redraw is needed.
-    pub fn apply_snapshot(&mut self, incoming: AppSnapshot, force_update_time: bool) -> bool {
+    pub fn apply_snapshot(&mut self, mut incoming: AppSnapshot, force_update_time: bool) -> bool {
         let was_loading = self.loading;
         self.loading = false;
+        if incoming.line_stats.is_none() && self.snapshot.line_stats.is_some() {
+            incoming.line_stats = self.snapshot.line_stats.clone();
+        }
         let new_fp = incoming.data_fingerprint();
         if new_fp == self.last_fingerprint && !force_update_time && !was_loading {
             return false;

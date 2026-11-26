@@ -1689,6 +1689,42 @@ pub struct AnalyticsSnapshot {
     pub token_cache_read_7d: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct LineCountPair {
+    pub added: u64,
+    pub deleted: u64,
+    pub churn: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct LineStatsWindow {
+    pub key: String,
+    pub label: String,
+    pub code: LineCountPair,
+    pub test: LineCountPair,
+    pub docs: LineCountPair,
+    pub total: LineCountPair,
+    pub delegated_share_pct: Option<u64>,
+    pub lines_per_million_tokens: Option<u64>,
+    pub tokens_total: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct LineStatsDailyPoint {
+    pub date: String,
+    pub added: u64,
+    pub deleted: u64,
+    pub churn: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct LineStatsSnapshot {
+    pub win_24h: LineStatsWindow,
+    pub win_7d: LineStatsWindow,
+    pub daily_7d: Vec<LineStatsDailyPoint>,
+    pub errors: Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppSnapshot {
     pub repos: Vec<RepoGroup>,
@@ -1702,6 +1738,7 @@ pub struct AppSnapshot {
     pub candidates: Vec<RadarCandidateItem>,
     pub agy_accounts: AgyAccountsState,
     pub analytics: AnalyticsSnapshot,
+    pub line_stats: Option<LineStatsSnapshot>,
     pub recent_deliveries: Vec<RecentDeliveryItem>,
     pub pulse: Option<SnapshotPulse>,
     pub alerts: Vec<ActiveAlertItem>,
@@ -1733,6 +1770,7 @@ impl AppSnapshot {
         self.candidates.hash(&mut h);
         self.agy_accounts.hash(&mut h);
         self.analytics.hash(&mut h);
+        self.line_stats.hash(&mut h);
         self.recent_deliveries.hash(&mut h);
         self.pulse.hash(&mut h);
         self.alerts.hash(&mut h);

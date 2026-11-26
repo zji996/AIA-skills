@@ -30,6 +30,7 @@ mod inotify;
 mod jobserver;
 mod lane;
 mod launch;
+mod lines;
 mod locks;
 mod measure;
 mod merge;
@@ -2311,12 +2312,21 @@ fn apply(args: &[String]) -> Res<i32> {
                 .filter(|r| s(&json(r.join("meta.json"))["worktree"], "source") == src)
                 .cloned()
                 .collect();
+            let mut trailer_runs = Vec::<String>::new();
+            for &idx in &indices {
+                let dm = json(done[idx].run.join("meta.json"));
+                let rid = events::run_id_for(&done[idx].run, &dm);
+                if !rid.is_empty() && !trailer_runs.contains(&rid) {
+                    trailer_runs.push(rid);
+                }
+            }
             match worktree::commit_applied(
                 Path::new(&src),
                 &src_runs,
                 &paths,
                 &titles,
                 &run_names,
+                &trailer_runs,
                 dirty_merge,
             ) {
                 Ok((head, subject)) => {
@@ -3556,6 +3566,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "fill" => fill::command(rest),
         "agy" => agy_accounts::command(rest),
         "usage" => usage::command(rest),
+        "lines" => lines::command(rest),
         "speed" => speed::command(rest),
         "eta" => eta::command(rest),
         "hook" => hook::command(rest),

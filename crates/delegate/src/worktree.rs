@@ -3880,6 +3880,7 @@ pub fn commit_applied(
     paths: &[String],
     titles: &[String],
     run_names: &[String],
+    trailer_runs: &[String],
     had_dirty_merge: bool,
 ) -> Res<(String, String)> {
     if paths.is_empty() {
@@ -3903,7 +3904,7 @@ pub fn commit_applied(
                 .into(),
         );
     }
-    let (subject, message) = if titles.len() == 1 {
+    let (subject, mut message) = if titles.len() == 1 {
         (titles[0].clone(), titles[0].clone())
     } else if titles.len() > 1 {
         let body = titles
@@ -3916,6 +3917,22 @@ pub fn commit_applied(
         let fallback = format!("delegate: apply {}", run_names.join(", "));
         (fallback.clone(), fallback)
     };
+    let mut trailers = Vec::new();
+    for rid in trailer_runs {
+        let rid = rid.trim();
+        let line = format!("Delegate-Run: {rid}");
+        if !rid.is_empty()
+            && !trailers.contains(&line)
+            && !message.lines().any(|l| l.trim().eq_ignore_ascii_case(&line))
+        {
+            trailers.push(line);
+        }
+    }
+    if !trailers.is_empty() {
+        message.push_str("\n\n");
+        message.push_str(&trailers.join("\n"));
+        message.push('\n');
+    }
     let head = {
         let _guard = crate::source_watch::guard(source, true)?;
         let add = git_command()

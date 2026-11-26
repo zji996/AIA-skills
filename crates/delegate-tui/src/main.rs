@@ -6,7 +6,7 @@ use crossterm::terminal::{
 };
 use delegate_tui::app::{copy_to_clipboard, App, AppAction, Overlay, ViewTab};
 use delegate_tui::data::{discover_repos, home_dir, local_hms, state_dir, DelegateClient};
-use delegate_tui::model::{AgyAccountsState, AppSnapshot};
+use delegate_tui::model::{AgyAccountsState, AppSnapshot, LineStatsSnapshot};
 use delegate_tui::ui;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -272,25 +272,41 @@ fn fresh_quota_cache_age_secs(state: &AgyAccountsState, max_age_secs: u64) -> Op
 }
 
 enum QuotaCmd {
-    Refresh,
+    RefreshAll,
+    RefreshLinesOnly,
     Shutdown,
+}
+
+enum QuotaEvent {
+    Quota(Result<AgyAccountsState, String>),
+    Lines(Result<LineStatsSnapshot, String>),
 }
 
 fn spawn_quota_worker(
     client: DelegateClient,
 ) -> (
     mpsc::Sender<QuotaCmd>,
-    mpsc::Receiver<Result<AgyAccountsState, String>>,
+    mpsc::Receiver<QuotaEvent>,
     thread::JoinHandle<()>,
 ) {
     let (tx_cmd, rx_cmd) = mpsc::channel::<QuotaCmd>();
-    let (tx_res, rx_res) = mpsc::channel::<Result<AgyAccountsState, String>>();
+    let (tx_res, rx_res) = mpsc::channel::<QuotaEvent>();
     let handle = thread::spawn(move || {
         while let Ok(cmd) = rx_cmd.recv() {
             match cmd {
-                QuotaCmd::Refresh => {
-                    let res = client.refresh_agy_quota();
-                    if tx_res.send(res).is_err() {
+                QuotaCmd::RefreshAll => {
+                    let lres = client.fetch_line_stats();
+                    if tx_res.send(QuotaEvent::Lines(lres)).is_err() {
+                        break;
+                    }
+                    let qres = client.refresh_agy_quota();
+                    if tx_res.send(QuotaEvent::Quota(qres)).is_err() {
+                        break;
+                    }
+                }
+                QuotaCmd::RefreshLinesOnly => {
+                    let lres = client.fetch_line_stats();
+                    if tx_res.send(QuotaEvent::Lines(lres)).is_err() {
                         break;
                     }
                 }
@@ -629,15 +645,22 @@ fn main() {
     let mut last_refresh = Instant::now();
     let mut last_quota_refresh: Option<Instant> = None;
     let mut quota_in_flight = false;
+    let mut lines_in_flight = false;
+    let mut was_on_overview = false;
     let mut print_on_exit: Option<String> = None;
     let mut inflight_results: HashSet<String> = HashSet::new();
     let mut inflight_diffs: HashSet<String> = HashSet::new();
 
     loop {
-        // Trigger real quota refresh (`agy -p /usage`) when on Overview or Accounts tab:
-        // on first entry, reuse cached quota if it was updated within `quota_refresh_every`;
-        // otherwise refresh immediately, and then every 10 minutes while TUI is open.
+        // Trigger real quota refresh (`agy -p /usage`) and line stats (`delegate lines --json`)
+        // when on Overview or Accounts tab: on first entry, reuse cached quota if updated within
+        // `quota_refresh_every`; otherwise refresh both immediately and every 10 minutes.
+        // Entering Overview also refreshes `delegate lines --json` (cached by HEAD in state dir).
+        let on_overview = app.tab == ViewTab::Overview;
+        let entered_overview = on_overview && !was_on_overview;
+        was_on_overview = on_overview;
         let on_quota_tab = matches!(app.tab, ViewTab::Overview | ViewTab::Quota);
+        let mut triggered_all = false;
         if on_quota_tab && !quota_in_flight {
             let due = match last_quota_refresh {
                 None => {
@@ -659,29 +682,58 @@ fn main() {
                 quota_in_flight = true;
                 app.quota_refreshing = true;
                 app.quota_last_error = None;
+                lines_in_flight = true;
+                app.lines_refreshing = true;
                 app.dirty = true;
                 last_quota_refresh = Some(Instant::now());
-                let _ = tx_quota.send(QuotaCmd::Refresh);
+                triggered_all = true;
+                let _ = tx_quota.send(QuotaCmd::RefreshAll);
             }
         }
+        if entered_overview && !triggered_all && !lines_in_flight {
+            lines_in_flight = true;
+            app.lines_refreshing = true;
+            app.dirty = true;
+            let _ = tx_quota.send(QuotaCmd::RefreshLinesOnly);
+        }
 
-        // Drain completed quota refresh results without blocking UI.
-        while let Ok(qres) = rx_quota.try_recv() {
-            quota_in_flight = false;
-            app.quota_refreshing = false;
-            last_quota_refresh = Some(Instant::now());
-            match qres {
-                Ok(agy_state) => {
-                    app.quota_last_error = None;
-                    app.snapshot.agy_accounts = agy_state;
-                    app.last_fingerprint = app.snapshot.data_fingerprint();
-                    app.rebuild_rows(None);
-                    app.dirty = true;
+        // Drain completed quota / line-stats refresh results without blocking UI.
+        while let Ok(qev) = rx_quota.try_recv() {
+            match qev {
+                QuotaEvent::Quota(qres) => {
+                    quota_in_flight = false;
+                    app.quota_refreshing = false;
+                    last_quota_refresh = Some(Instant::now());
+                    match qres {
+                        Ok(agy_state) => {
+                            app.quota_last_error = None;
+                            app.snapshot.agy_accounts = agy_state;
+                            app.last_fingerprint = app.snapshot.data_fingerprint();
+                            app.rebuild_rows(None);
+                            app.dirty = true;
+                        }
+                        Err(err) => {
+                            app.quota_last_error = Some(err.clone());
+                            app.set_toast(format!("额度刷新失败：{err}"));
+                            app.dirty = true;
+                        }
+                    }
                 }
-                Err(err) => {
-                    app.quota_last_error = Some(err.clone());
-                    app.set_toast(format!("额度刷新失败：{err}"));
-                    app.dirty = true;
+                QuotaEvent::Lines(lres) => {
+                    lines_in_flight = false;
+                    app.lines_refreshing = false;
+                    match lres {
+                        Ok(stats) => {
+                            app.line_stats_error = None;
+                            app.snapshot.line_stats = Some(stats);
+                            app.last_fingerprint = app.snapshot.data_fingerprint();
+                            app.dirty = true;
+                        }
+                        Err(err) => {
+                            app.line_stats_error = Some(err);
+                            app.dirty = true;
+                        }
+                    }
                 }
             }
         }
@@ -855,10 +907,12 @@ fn main() {
                                     quota_in_flight = true;
                                     app.quota_refreshing = true;
                                     app.quota_last_error = None;
+                                    lines_in_flight = true;
+                                    app.lines_refreshing = true;
                                     last_quota_refresh = Some(Instant::now());
-                                    let _ = tx_quota.send(QuotaCmd::Refresh);
-                                    // Refreshes account quota via `agy -p /usage`.
-                                    app.set_toast("正在刷新额度…");
+                                    let _ = tx_quota.send(QuotaCmd::RefreshAll);
+                                    // Refreshes account quota via `agy -p /usage` and line stats via `delegate lines --json`.
+                                    app.set_toast("正在刷新额度与代码改动…");
                                 } else {
                                     app.set_toast("额度已在刷新中…");
                                 }

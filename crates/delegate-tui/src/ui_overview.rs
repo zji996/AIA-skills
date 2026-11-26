@@ -173,28 +173,55 @@ pub(crate) fn render_overview_pane(frame: &mut Frame, app: &mut App, area: Rect)
     render_running_card(frame, app, &running_entries, dag_pending_count, left_chunks[1]);
     render_work_chains_card(frame, app, &work_rows, left_chunks[2]);
 
-    // Right column dynamic height allocation:
+    // Right column dynamic height allocation: ④ 额度与消耗, ⑤ 代码改动, ⑥ 最近交付
     let acct_count = app.snapshot.agy_accounts.accounts.len();
     let need_4: usize = if acct_count == 0 {
         4
     } else {
         acct_count * 4 + 3 + 2 // per account (1 header + 3 pool lines) + divider + 2 summary lines + borders
     };
-    let h4 = if need_4 + 7 <= h {
-        need_4
+    let need_lines: usize = if app.snapshot.line_stats.is_some() {
+        10 // header + 4 rows + 2 ratio rows + 1 7d sparkline row + 2 borders
     } else {
-        let cap = (h * 55 / 100).max(4);
-        need_4.min(cap).min(h.saturating_sub(7).max(4))
+        3 // compact loading/empty card + 2 borders
     };
-    let h5 = h.saturating_sub(h4);
+    let min_deliv: usize = if h >= 14 { 5 } else { 3 };
+    let (h4, h_lines, h5) = allocate_right_heights(h, need_4, need_lines, min_deliv);
 
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(h4 as u16), Constraint::Min(h5 as u16)])
+        .constraints([
+            Constraint::Length(h4 as u16),
+            Constraint::Length(h_lines as u16),
+            Constraint::Min(h5 as u16),
+        ])
         .split(cols[1]);
 
     render_quota_summary_card(frame, app, right_chunks[0]);
-    render_recent_deliveries_card(frame, app, &deliveries, right_chunks[1]);
+    render_line_stats_card(frame, app, right_chunks[1]);
+    render_recent_deliveries_card(frame, app, &deliveries, right_chunks[2]);
+}
+
+fn allocate_right_heights(
+    total_h: usize,
+    need_quota: usize,
+    need_lines: usize,
+    min_deliv: usize,
+) -> (usize, usize, usize) {
+    if need_quota + need_lines + min_deliv <= total_h {
+        let h_deliv = total_h.saturating_sub(need_quota + need_lines);
+        return (need_quota, need_lines, h_deliv);
+    }
+    let h_quota = need_quota
+        .min((total_h * 50 / 100).max(4))
+        .min(total_h.saturating_sub(min_deliv + 3).max(4))
+        .min(total_h);
+    let rem = total_h.saturating_sub(h_quota);
+    let h_lines = need_lines
+        .min(rem.saturating_sub(min_deliv).max(3))
+        .min(rem);
+    let h_deliv = total_h.saturating_sub(h_quota + h_lines);
+    (h_quota, h_lines, h_deliv)
 }
 
 /// Dynamic 3-card height donation algorithm for the left column of `1 总览`.
@@ -971,6 +998,210 @@ fn render_quota_summary_card(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(visible), inner);
 }
 
+fn format_commas_u64(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (idx, &b) in bytes.iter().enumerate() {
+        if idx > 0 && (bytes.len() - idx).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
+}
+
+fn pad_center_w(s: &str, width: usize) -> String {
+    let w = display_width(s);
+    if w >= width {
+        s.to_string()
+    } else {
+        let total = width - w;
+        let left = total / 2;
+        let right = total - left;
+        format!("{}{s}{}", " ".repeat(left), " ".repeat(right))
+    }
+}
+
+fn build_line_stats_lines(ls: &LineStatsSnapshot, inner_w: usize, indent: &str) -> Vec<Line<'static>> {
+    const MINUS: char = '\u{2212}';
+    let label_w = display_width("每百万 token");
+    let indent_w = display_width(indent);
+
+    let measure_col = |w: &LineStatsWindow| -> (usize, usize, usize) {
+        let pairs = [&w.code, &w.test, &w.docs, &w.total];
+        let mut plus_w = 0usize;
+        let mut minus_w = 0usize;
+        for p in pairs {
+            plus_w = plus_w.max(format!("+{}", format_commas_u64(p.added)).len());
+            minus_w = minus_w.max(display_width(&format!("{MINUS}{}", format_commas_u64(p.deleted))));
+        }
+        let pair_w = plus_w + 3 + minus_w;
+        let pct_s = w
+            .delegated_share_pct
+            .map(|p| format!("{p}%"))
+            .unwrap_or_else(|| "—".into());
+        let lpm_s = w
+            .lines_per_million_tokens
+            .map(|v| format!("{} 行", format_commas_u64(v)))
+            .unwrap_or_else(|| "—".into());
+        let width = pair_w
+            .max(display_width(&w.label))
+            .max(display_width(&pct_s))
+            .max(display_width(&lpm_s));
+        (plus_w, minus_w, width)
+    };
+
+    let (p24, m24, w24) = measure_col(&ls.win_24h);
+    let (p7d, m7d, w7d) = measure_col(&ls.win_7d);
+    let avail_gap = inner_w.saturating_sub(indent_w + label_w + w24 + w7d);
+    let gap = if avail_gap >= 6 {
+        "   "
+    } else if avail_gap >= 4 {
+        "  "
+    } else {
+        " "
+    };
+
+    let fmt_pair = |c: &LineCountPair, pw: usize, mw: usize, cw: usize| -> String {
+        let left = pad_left(&format!("+{}", format_commas_u64(c.added)), pw);
+        let right = pad_right(&format!("{MINUS}{}", format_commas_u64(c.deleted)), mw);
+        pad_center_w(&format!("{left} / {right}"), cw)
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(8);
+
+    // Header row
+    let hdr = format!(
+        "{indent}{}{gap}{}{gap}{}",
+        " ".repeat(label_w),
+        pad_center_w(
+            if ls.win_24h.label.is_empty() { "24 小时" } else { &ls.win_24h.label },
+            w24
+        ),
+        pad_center_w(
+            if ls.win_7d.label.is_empty() { "7 天" } else { &ls.win_7d.label },
+            w7d
+        ),
+    );
+    lines.push(Line::from(Span::styled(truncate(&hdr, inner_w), muted())));
+
+    // Category + Total rows
+    let rows: [(&str, &LineCountPair, &LineCountPair, bool); 4] = [
+        ("代码", &ls.win_24h.code, &ls.win_7d.code, false),
+        ("测试", &ls.win_24h.test, &ls.win_7d.test, false),
+        ("文档", &ls.win_24h.docs, &ls.win_7d.docs, false),
+        ("合计", &ls.win_24h.total, &ls.win_7d.total, true),
+    ];
+    for (lbl, c24, c7d, is_total) in rows {
+        let row = format!(
+            "{indent}{}{gap}{}{gap}{}",
+            pad_right(lbl, label_w),
+            fmt_pair(c24, p24, m24, w24),
+            fmt_pair(c7d, p7d, m7d, w7d),
+        );
+        let style = if is_total { bold_primary() } else { primary() };
+        lines.push(Line::from(Span::styled(truncate(&row, inner_w), style)));
+    }
+
+    // 委派占比
+    let pct24 = ls
+        .win_24h
+        .delegated_share_pct
+        .map(|p| format!("{p}%"))
+        .unwrap_or_else(|| "—".into());
+    let pct7d = ls
+        .win_7d
+        .delegated_share_pct
+        .map(|p| format!("{p}%"))
+        .unwrap_or_else(|| "—".into());
+    let pct_row = format!(
+        "{indent}{}{gap}{}{gap}{}",
+        pad_right("委派占比", label_w),
+        pad_center_w(&pct24, w24),
+        pad_center_w(&pct7d, w7d),
+    );
+    lines.push(Line::from(Span::styled(truncate(&pct_row, inner_w), muted())));
+
+    // 每百万 token
+    let lpm24 = ls
+        .win_24h
+        .lines_per_million_tokens
+        .map(|v| format!("{} 行", format_commas_u64(v)))
+        .unwrap_or_else(|| "—".into());
+    let lpm7d = ls
+        .win_7d
+        .lines_per_million_tokens
+        .map(|v| format!("{} 行", format_commas_u64(v)))
+        .unwrap_or_else(|| "—".into());
+    let lpm_row = format!(
+        "{indent}{}{gap}{}{gap}{}",
+        pad_right("每百万 token", label_w),
+        pad_center_w(&lpm24, w24),
+        pad_center_w(&lpm7d, w7d),
+    );
+    lines.push(Line::from(Span::styled(truncate(&lpm_row, inner_w), muted())));
+
+    // 7d daily churn sparkline
+    let daily_vals: Vec<u64> = ls.daily_7d.iter().map(|d| d.churn).collect();
+    let spark = inline_spark_text(&daily_vals, daily_vals.len().clamp(1, 7));
+    let peak = daily_vals.iter().copied().max().unwrap_or(0);
+    let range_note = match (ls.daily_7d.first(), ls.daily_7d.last()) {
+        (Some(f), Some(l)) if f.date.len() >= 10 && l.date.len() >= 10 => {
+            format!(" ({}..{} · 峰 {} 行)", &f.date[5..10], &l.date[5..10], format_commas_u64(peak))
+        }
+        _ => String::new(),
+    };
+    let spark_row = format!("{indent}7 天每日  {spark}{range_note}");
+    lines.push(Line::from(Span::styled(
+        truncate(&spark_row, inner_w),
+        Style::default().fg(STATUS_RUNNING),
+    )));
+
+    lines
+}
+
+fn render_line_stats_card(frame: &mut Frame, app: &App, area: Rect) {
+    let title_str = if app.lines_refreshing {
+        " 代码改动 (统计中…) ".to_string()
+    } else if let Some(ref ls) = app.snapshot.line_stats {
+        if ls.errors.is_empty() {
+            " 代码改动 ".to_string()
+        } else {
+            format!(" 代码改动 ({} 仓读取失败) ", ls.errors.len())
+        }
+    } else {
+        " 代码改动 ".to_string()
+    };
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let block = rounded_block(
+        Line::from(Span::styled(truncate(&title_str, inner_w.max(8)), muted())),
+        false,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let lines = if let Some(ref ls) = app.snapshot.line_stats {
+        build_line_stats_lines(ls, inner_w, "")
+    } else if let Some(ref err) = app.line_stats_error {
+        vec![Line::from(Span::styled(
+            truncate(&format!(" 统计失败：{err}"), inner_w),
+            Style::default().fg(STATUS_FAILED),
+        ))]
+    } else if app.lines_refreshing {
+        vec![Line::from(Span::styled(" 统计各仓库默认分支代码改动中…", muted()))]
+    } else {
+        vec![Line::from(Span::styled(" 未加载（按 Q 刷新）", muted()))]
+    };
+
+    let visible: Vec<Line> = lines.into_iter().take(inner_h).collect();
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
 fn find_entry_depletion_note(acct: &AgyAccountItem, entry: &QuotaPoolEntry) -> String {
     let Some(est) = &acct.quota_estimate else {
         return String::new();
@@ -1376,6 +1607,37 @@ fn render_overview_narrow(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             lines.push(Line::from(Span::styled(truncate(&summary, inner_w), primary())));
         }
+    }
+    lines.push(Line::raw(""));
+
+    // ⑤ 代码改动
+    lines.push(Line::from(Span::styled(
+        truncate(
+            if app.lines_refreshing {
+                "▸ 代码改动 (统计中…)"
+            } else {
+                "▸ 代码改动"
+            },
+            inner_w,
+        ),
+        bold_primary(),
+    )));
+    if let Some(ref ls) = app.snapshot.line_stats {
+        lines.extend(build_line_stats_lines(ls, inner_w, "  "));
+    } else if let Some(ref err) = app.line_stats_error {
+        lines.push(Line::from(Span::styled(
+            truncate(&format!("  统计失败：{err}"), inner_w),
+            Style::default().fg(STATUS_FAILED),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            if app.lines_refreshing {
+                "  统计各仓库默认分支代码改动中…"
+            } else {
+                "  未加载（按 Q 刷新）"
+            },
+            muted(),
+        )));
     }
     lines.push(Line::raw(""));
 

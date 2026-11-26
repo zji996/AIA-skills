@@ -920,6 +920,13 @@ fn extract_disk_run_entries(
         let r = s(&meta, "run");
         if !r.is_empty() {
             r.to_string()
+        } else if run_dir.file_name().and_then(|n| n.to_str()) == Some("record") {
+            run_dir
+                .parent()
+                .and_then(|p| p.file_name())
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
         } else {
             run_dir
                 .file_name()
@@ -1071,6 +1078,13 @@ fn inspect_running_dir(
         let r = s(&meta, "run");
         if !r.is_empty() {
             r.to_string()
+        } else if run_dir.file_name().and_then(|n| n.to_str()) == Some("record") {
+            run_dir
+                .parent()
+                .and_then(|p| p.file_name())
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
         } else {
             run_dir
                 .file_name()
@@ -1293,6 +1307,26 @@ fn collect_all(
     }
 
     (entries, live_running, uncounted_running)
+}
+
+/// Return total tokens (`input + output + cacheRead`, across all models including agy and Pi,
+/// author + reviewer, ledger + disk/archive backfill + live) grouped by `run_id`, with no window cutoff.
+pub fn all_run_tokens_map() -> HashMap<String, TokenCounts> {
+    let (entries, live_running, _) = collect_all(None, true, true);
+    let mut by_run: HashMap<String, TokenCounts> = HashMap::new();
+    for e in entries {
+        if !e.run.is_empty() {
+            by_run.entry(e.run).or_default().add(e.tokens);
+        }
+    }
+    for lr in live_running {
+        if let Some(tok) = lr.tokens {
+            if !lr.run.is_empty() {
+                by_run.entry(lr.run).or_default().add(tok);
+            }
+        }
+    }
+    by_run
 }
 
 #[derive(Debug, Default, Clone)]

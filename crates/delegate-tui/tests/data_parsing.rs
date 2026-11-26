@@ -470,3 +470,63 @@ fn parses_remote_exec_and_fallback_lane_and_chain_rounds() {
     assert_eq!(lre.cmd.as_deref(), Some("uv run pytest -q"));
     assert_eq!(lre.elapsed_seconds, Some(30));
 }
+
+#[test]
+fn parse_line_stats_json_reads_windows_daily_and_errors() {
+    use delegate_tui::data::parse_line_stats_json;
+
+    let raw = r#"{
+        "generatedAt": "2026-11-26T13:00:00Z",
+        "generatedEpoch": 1795700000,
+        "windows": [
+            {
+                "key": "24h",
+                "label": "24 小时",
+                "total": {"added": 1940, "deleted": 438, "churn": 2378},
+                "byCategory": {
+                    "code": {"total": {"added": 1204, "deleted": 310, "churn": 1514}},
+                    "test": {"total": {"added": 640, "deleted": 88, "churn": 728}},
+                    "docs": {"total": {"added": 96, "deleted": 40, "churn": 136}}
+                },
+                "delegatedSharePct": 81.6,
+                "tokens": {"input": 1000, "output": 2000, "cacheRead": 50000000, "total": 50003000},
+                "linesPerMillionTokens": 35.4
+            },
+            {
+                "key": "7d",
+                "label": "7 天",
+                "total": {"added": 14808, "deleted": 4667, "churn": 19475},
+                "byCategory": {
+                    "code": {"total": {"added": 9876, "deleted": 3402, "churn": 13278}},
+                    "test": {"total": {"added": 4120, "deleted": 960, "churn": 5080}},
+                    "docs": {"total": {"added": 812, "deleted": 305, "churn": 1117}}
+                },
+                "delegatedSharePct": 77.2,
+                "tokens": {"total": 365000000},
+                "linesPerMillionTokens": 41.1
+            }
+        ],
+        "daily7d": [
+            {"date": "2026-11-20", "added": 500, "deleted": 100, "churn": 600},
+            {"date": "2026-11-21", "added": 1200, "deleted": 300, "churn": 1500},
+            {"date": "2026-11-22", "added": 0, "deleted": 0, "churn": 0},
+            {"date": "2026-11-23", "added": 2100, "deleted": 400, "churn": 2500},
+            {"date": "2026-11-24", "added": 800, "deleted": 200, "churn": 1000},
+            {"date": "2026-11-25", "added": 400, "deleted": 100, "churn": 500},
+            {"date": "2026-11-26", "added": 1940, "deleted": 438, "churn": 2378}
+        ],
+        "errors": [{"repo": "broken", "path": "/tmp/broken", "error": "not a git repo"}]
+    }"#;
+    let ls = parse_line_stats_json(raw).expect("valid line stats json");
+    assert_eq!(ls.win_24h.code.added, 1204);
+    assert_eq!(ls.win_24h.code.deleted, 310);
+    assert_eq!(ls.win_24h.delegated_share_pct, Some(82));
+    assert_eq!(ls.win_24h.lines_per_million_tokens, Some(35));
+    assert_eq!(ls.win_7d.total.added, 14808);
+    assert_eq!(ls.win_7d.total.deleted, 4667);
+    assert_eq!(ls.win_7d.delegated_share_pct, Some(77));
+    assert_eq!(ls.win_7d.lines_per_million_tokens, Some(41));
+    assert_eq!(ls.daily_7d.len(), 7);
+    assert_eq!(ls.daily_7d[6].churn, 2378);
+    assert_eq!(ls.errors, vec![("broken".to_string(), "not a git repo".to_string())]);
+}

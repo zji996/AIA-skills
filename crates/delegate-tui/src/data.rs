@@ -207,6 +207,24 @@ impl DelegateClient {
         Ok(parse_agy_accounts_json(&stdout))
     }
 
+    pub fn fetch_line_stats(&self) -> Result<LineStatsSnapshot, String> {
+        let output = Command::new(&self.bin)
+            .args(["lines", "--json"])
+            .output()
+            .map_err(|e| format!("无法执行 delegate lines --json: {e}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let msg = single_line(&stderr);
+            return Err(if msg.is_empty() {
+                format!("代码改动统计失败（退出码 {:?}）", output.status.code())
+            } else {
+                msg
+            });
+        }
+        parse_line_stats_json(&stdout)
+    }
+
     pub fn switch_agy_account(&self, id: &str) -> Result<String, String> {
         let output = Command::new(&self.bin)
             .args(["agy", "account", "use", id, "--json"])
@@ -372,6 +390,7 @@ impl DelegateClient {
             candidates: candidates_list,
             agy_accounts: agy_accounts_state,
             analytics: AnalyticsSnapshot::default(),
+            line_stats: None,
             recent_deliveries: Vec::new(),
             pulse: None,
             alerts: Vec::new(),
@@ -555,6 +574,7 @@ pub fn parse_snapshot_json(
         candidates,
         agy_accounts,
         analytics,
+        line_stats: None,
         recent_deliveries,
         pulse,
         alerts,
@@ -3984,6 +4004,146 @@ pub fn parse_agy_accounts_value(v: &Value) -> AgyAccountsState {
         quota_updated_at,
         quota_age_seconds,
     }
+}
+
+fn parse_line_count_pair(v: &Value) -> LineCountPair {
+    let added = v.get("added").and_then(Value::as_u64).unwrap_or(0);
+    let deleted = v.get("deleted").and_then(Value::as_u64).unwrap_or(0);
+    let churn = v
+        .get("churn")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| added.saturating_add(deleted));
+    LineCountPair {
+        added,
+        deleted,
+        churn,
+    }
+}
+
+fn parse_line_stats_window(v: &Value) -> LineStatsWindow {
+    let key = v
+        .get("key")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let label = v
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let by_cat = v.get("byCategory");
+    let cat_total = |name: &str| -> LineCountPair {
+        by_cat
+            .and_then(|c| c.get(name))
+            .and_then(|c| c.get("total"))
+            .map(parse_line_count_pair)
+            .unwrap_or_default()
+    };
+    let code = cat_total("code");
+    let test = cat_total("test");
+    let docs = cat_total("docs");
+    let total = v
+        .get("total")
+        .map(parse_line_count_pair)
+        .unwrap_or_default();
+    let delegated_share_pct = v
+        .get("delegatedSharePct")
+        .and_then(Value::as_f64)
+        .filter(|x| x.is_finite() && *x >= 0.0)
+        .map(|x| x.round() as u64);
+    let lines_per_million_tokens = v
+        .get("linesPerMillionTokens")
+        .and_then(Value::as_f64)
+        .filter(|x| x.is_finite() && *x >= 0.0)
+        .map(|x| x.round() as u64);
+    let tokens_total = v
+        .get("tokens")
+        .and_then(|t| t.get("total"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    LineStatsWindow {
+        key,
+        label,
+        code,
+        test,
+        docs,
+        total,
+        delegated_share_pct,
+        lines_per_million_tokens,
+        tokens_total,
+    }
+}
+
+pub fn parse_line_stats_json(raw: &str) -> Result<LineStatsSnapshot, String> {
+    let v: Value = serde_json::from_str(raw.trim())
+        .map_err(|e| format!("解析 delegate lines JSON 失败: {e}"))?;
+    let windows = v
+        .get("windows")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "delegate lines JSON 缺少 windows 字段".to_string())?;
+    let mut win_24h = LineStatsWindow {
+        key: "24h".into(),
+        label: "24 小时".into(),
+        ..LineStatsWindow::default()
+    };
+    let mut win_7d = LineStatsWindow {
+        key: "7d".into(),
+        label: "7 天".into(),
+        ..LineStatsWindow::default()
+    };
+    for (idx, w) in windows.iter().enumerate() {
+        let parsed = parse_line_stats_window(w);
+        if parsed.key == "24h" || (idx == 0 && parsed.key != "7d") {
+            win_24h = parsed;
+        } else if parsed.key == "7d" || idx == 1 {
+            win_7d = parsed;
+        }
+    }
+    let daily_7d = v
+        .get("daily7d")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|d| {
+                    let added = d.get("added").and_then(Value::as_u64).unwrap_or(0);
+                    let deleted = d.get("deleted").and_then(Value::as_u64).unwrap_or(0);
+                    let churn = d
+                        .get("churn")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_else(|| added.saturating_add(deleted));
+                    LineStatsDailyPoint {
+                        date: d
+                            .get("date")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        added,
+                        deleted,
+                        churn,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let errors = v
+        .get("errors")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let repo = e.get("repo")?.as_str()?.to_string();
+                    let err = e.get("error")?.as_str()?.to_string();
+                    Some((repo, err))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(LineStatsSnapshot {
+        win_24h,
+        win_7d,
+        daily_7d,
+        errors,
+    })
 }
 
 #[cfg(test)]

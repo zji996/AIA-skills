@@ -3108,3 +3108,77 @@ fn runs_detail_renders_agy_account_switch_notice() {
         "detail pane should render agy account switch line:\n{rendered}"
     );
 }
+
+#[test]
+fn overview_renders_line_stats_card_wide_and_narrow_and_survives_snapshot_refresh() {
+    use delegate_tui::app::ViewTab;
+    use delegate_tui::data::parse_line_stats_json;
+
+    let raw = r#"{
+        "windows": [
+            {
+                "key": "24h",
+                "label": "24 小时",
+                "total": {"added": 1940, "deleted": 438, "churn": 2378},
+                "byCategory": {
+                    "code": {"total": {"added": 1204, "deleted": 310, "churn": 1514}},
+                    "test": {"total": {"added": 640, "deleted": 88, "churn": 728}},
+                    "docs": {"total": {"added": 96, "deleted": 40, "churn": 136}}
+                },
+                "delegatedSharePct": 82.0,
+                "linesPerMillionTokens": 35.0
+            },
+            {
+                "key": "7d",
+                "label": "7 天",
+                "total": {"added": 14808, "deleted": 4667, "churn": 19475},
+                "byCategory": {
+                    "code": {"total": {"added": 9876, "deleted": 3402, "churn": 13278}},
+                    "test": {"total": {"added": 4120, "deleted": 960, "churn": 5080}},
+                    "docs": {"total": {"added": 812, "deleted": 305, "churn": 1117}}
+                },
+                "delegatedSharePct": 77.0,
+                "linesPerMillionTokens": 41.0
+            }
+        ],
+        "daily7d": [
+            {"date": "2026-11-20", "added": 500, "deleted": 100, "churn": 600},
+            {"date": "2026-11-21", "added": 1200, "deleted": 300, "churn": 1500},
+            {"date": "2026-11-22", "added": 0, "deleted": 0, "churn": 0},
+            {"date": "2026-11-23", "added": 2100, "deleted": 400, "churn": 2500},
+            {"date": "2026-11-24", "added": 800, "deleted": 200, "churn": 1000},
+            {"date": "2026-11-25", "added": 400, "deleted": 100, "churn": 500},
+            {"date": "2026-11-26", "added": 1940, "deleted": 438, "churn": 2378}
+        ],
+        "errors": []
+    }"#;
+    let ls = parse_line_stats_json(raw).unwrap();
+    let mut app = make_sample_app();
+    app.snapshot.line_stats = Some(ls.clone());
+    app.last_fingerprint = app.snapshot.data_fingerprint();
+    app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Overview);
+
+    // Wide overview (right column card)
+    let wide = render_to_string(&mut app, 150, 44);
+    assert_lines_fit_width(&wide, 150);
+    assert!(wide.contains("代码改动"), "{wide}");
+    assert!(wide.contains("+1,204 / \u{2212}310"), "{wide}");
+    assert!(wide.contains("+14,808 / \u{2212}4,667"), "{wide}");
+    assert!(wide.contains("委派占比") && wide.contains("82%") && wide.contains("77%"), "{wide}");
+    assert!(wide.contains("每百万 token") && wide.contains("35 行") && wide.contains("41 行"), "{wide}");
+    assert!(wide.contains("7 天每日") && wide.contains('█'), "{wide}");
+
+    // Narrow overview (single-column flow)
+    let narrow = render_to_string(&mut app, 80, 48);
+    assert_lines_fit_width(&narrow, 80);
+    assert!(narrow.contains("▸ 代码改动"), "{narrow}");
+    assert!(narrow.contains("+1,940 / \u{2212}438"), "{narrow}");
+    assert!(narrow.contains("7 天每日") && narrow.contains('█'), "{narrow}");
+
+    // Applying a new AppSnapshot (whose line_stats is None) preserves existing line_stats.
+    let mut next_snap = app.snapshot.clone();
+    next_snap.line_stats = None;
+    app.apply_snapshot(next_snap, false);
+    assert_eq!(app.snapshot.line_stats.as_ref(), Some(&ls));
+}

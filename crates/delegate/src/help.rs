@@ -205,6 +205,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "Summarize local agy token usage by account, day, run, or repo (author vs reviewer split, uncounted running runs listed separately).",
     ),
     (
+        "lines",
+        "Count added/deleted lines across registered repositories' default branches over 24h and 7d (code/test/docs, delegated share, lines per 1M tokens).",
+    ),
+    (
         "speed",
         "Calibrate wall-clock estimation parameters (t_chain, t_crit, P_eff, T_merge) per repo from events.jsonl, run rolling --backtest, and track drift.",
     ),
@@ -459,6 +463,11 @@ pub fn print(command: Option<&str>) -> bool {
             ("--repo PATH", "Filter to one repository path or basename."),
             ("--all", "Include non-agy (Pi) runs in addition to agy runs."),
             ("--json", "Print structured JSON output."),
+        ]),
+        "lines" => ("[--since DURATION] [--by repo] [--json]", "Count added and deleted lines across registered repositories' default branches (--no-merges -M, excluding binaries, lockfiles, and generated/snapshot files, configurable via .delegate.json lineStats.exclude). Shows 24h and 7d columns by default (or one column with --since), delegated share (commits with Delegate-Run trailer), and lines per million tokens across full reply chains.", &[
+            ("--since DURATION", "Show a single custom window instead of the default 24h + 7d columns (e.g. 12h, 24h, 7d, 30d)."),
+            ("--by repo", "Include a per-repository breakdown sorted by 7d (or window) churn descending."),
+            ("--json", "Print complete structured camelCase JSON output including daily7d totals."),
         ]),
         "speed" => ("[--since 7d|14d|all] [--repo PATH] [--backtest] [--json]", "Calibrate wall-clock estimation parameters (T_dev = max(D*t_crit, N*t_chain/P_eff) + T_merge) per repo from <state_dir>/events.jsonl, refresh <state_dir>/eta-model.json, and track >20% drift. Pass --backtest for a strictly causal rolling offline backtest (p75 coverage & p50 relative bias).", &[
             ("--since 7d|14d|all", "Time window to include (default: 7d, or 14d with --backtest; normal mode auto-expands <14d to 14d when <30 applied write chains)."),

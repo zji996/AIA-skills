@@ -7,6 +7,7 @@
 - `delegate`：`status`/`status --all`/`snapshot` 与 `delegate-tui` 统一按本机登记仓库与活跃 `.slot` 列出全部 run（跨仓库、跨主控会话、含子模块与远端执行），非当前仓在 `status` 标 `[<repo>]`；远端执行记录活动状态与滚动输出尾（`remote-active.json`/`remote-output.log`，并兼容旧 `lane` 票据），在 `status`、TUI 总览与运行页标 `@<host>`、远端命令与已跑时长，详情直接展示远端输出尾部；human `status --all` 与 TUI 列表/总览统一将 reply 链合并为一行「`<原任务名>（第 N 轮）`」，详情展开各轮；并精简 TUI 详情页重复门禁行与运行中任务的无效审查卡标题后缀。
 - `delegate`：`agy` 支持会话粘滞——每个 run（含审查员会话）首轮启动时将所用槽位 ID 钉入 `meta.json`（`agyAccount`/`reviewAgyAccount`，不记邮箱），后续 `reply`/追加/返工/审查补问/`--sync` 沿用钉住槽位起覆盖层，仅在原槽位被删、凭据/身份校验失败或额度快照确认耗尽时回退至当前活跃账号（绝不自动挑选第三账号）并在 `status`/`card`/TUI 显示「本 run 已从 A 换到 B（原因）」；`--fresh` 按新会话取当前活跃账号重新钉住，同步更新 `agy account use` 提示与 `references/agy-accounts.md`。
 - `delegate`：适配卡从五类收为三类（`build`/`hard`/`review`，默认 thinking 为 `build`/`review`→`medium`、`hard`→`high`）；`--class scout`/`design`（`start`/`reply`/`fit set`）退出 2 并提示改用三类，用户 `fit.json` 中旧 `scout`/`design` 记录读取时静默忽略并在下次 `fit set` 写回时丢弃；`--tier scout` 保持不变。
+- `delegate`：新增 `delegate lines [--since <时长>] [--by repo] [--json]` 与 TUI `1 总览`「代码改动」卡片（含 7 天每日改动量 `inline_spark_text` 柱条），确定性统计各已登记仓库默认分支近 24h/7d 增减行数（代码/测试/文档）、委派占比与每百万 token 产出（跨 reply 链与 agy/Pi 全模型），按 `(HEAD, 窗口)` 缓存在 state 目录；支持 `.delegate.json` `lineStats.exclude`（含 `!` 重新纳入、非法配置失败关闭）并为 `apply --commit` 补齐 `Delegate-Run` trailer。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
 
 ## delegate 6.50.0 - 2026-11-26

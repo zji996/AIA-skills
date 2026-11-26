@@ -356,6 +356,8 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
             .map_err(|e| format!("{}: {e}", path.display()))?;
         validate_hotspots_config(value.get("hotspots"))
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        crate::lines::validate_line_stats_config(value.get("lineStats"))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -629,6 +631,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
             "areas",
             "fill",
             "hotspots",
+            "lineStats",
         ] {
             if user.get(key).is_some() {
                 ignored.push(key);
