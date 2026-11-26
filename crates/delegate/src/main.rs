@@ -2113,6 +2113,7 @@ fn apply(args: &[String]) -> Res<i32> {
             "--dry-run",
             "--merge",
             "--allow-dirty-overlap",
+            "--resume-regenerate",
             "--verify",
             "--no-verify",
             "--keep",
@@ -2202,6 +2203,7 @@ fn apply(args: &[String]) -> Res<i32> {
             keep_commits,
             commit_mode,
             has(&flags, "--allow-dirty-overlap"),
+            has(&flags, "--resume-regenerate"),
         )?;
         if !outcome.already_applied && !dry && run.join(".applied").exists() {
             if !applied_runs.contains(run) {

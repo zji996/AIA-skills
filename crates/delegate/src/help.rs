@@ -400,13 +400,14 @@ pub fn print(command: Option<&str>) -> bool {
             ("--json", "Emit JSON {\"run\", \"count\", \"files\"} instead of one path per line."),
         ]),
         "patch" => ("run [-- paths...]", "Print retained applied.patch (or delivered changes.patch before apply), optionally limited to exact paths/directory prefixes. Suitable for git apply --3way.", &[]),
-        "apply" => ("[--merge] [--allow-dirty-overlap] [--dry-run] [--verify|--no-verify] [--keep] [--keep-open] [--keep-commits|--commit] [--closes ID] [--json] [run ...]", "Merge worktree conversations into the source working tree, in the order given; stops at the first that fails. Refuses when target files already have uncommitted changes in source (unless --allow-dirty-overlap).", &[
+        "apply" => ("[--merge] [--allow-dirty-overlap] [--resume-regenerate] [--dry-run] [--verify|--no-verify] [--keep] [--keep-open] [--keep-commits|--commit] [--closes ID] [--json] [run ...]", "Merge worktree conversations into the source working tree, in the order given; stops at the first that fails. Refuses when target files already have uncommitted changes in source (unless --allow-dirty-overlap).", &[
             ("run", "Run ids or directories (default: last)."),
             ("--keep", "Keep the run and worktree after successful apply (default: retain lightweight run and patch, release worktree)."),
             ("--keep-open", "Keep the linked work item open in `verify` instead of auto-closing it on apply."),
             ("--json", "Keep the existing JSON conclusion without the human acceptance reminder."),
             ("--merge", "Write conflict markers instead of stopping."),
             ("--allow-dirty-overlap", "Explicitly allow 3-way merging into target files that already have uncommitted changes in the source workspace."),
+            ("--resume-regenerate", "Resume only the regeneration and `.applied` recording step after a previous apply already wrote files to the source workspace."),
             ("--dry-run", "Check the merge without writing it."),
             ("--verify", "Rerun acceptance on the merged tree even when acceptStillValid is true. Without it, runs whose acceptance does not carry over rerun their own acceptance once, after the last merge (.delegate.json applyVerify: false turns this off, a command replaces it)."),
             ("--no-verify", "Skip the post-merge acceptance."),

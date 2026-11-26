@@ -1075,7 +1075,7 @@ pub fn command(args: &[String]) -> Res<i32> {
     let accept_timeout = cfg.value["acceptTimeout"]
         .as_str()
         .and_then(|d| seconds(d).ok());
-    let generate_timeout = seconds(&setting("GENERATE_TIMEOUT", "10m")).ok();
+    let generate_timeout = worktree::generate_timeout_seconds().ok().flatten();
     let work_cfg = worktree::work_config(&cfg.value, &source_canon.join(".delegate.json"))?;
     let env_cfg = if cfg.value["env"].is_object() {
         cfg.value["env"].clone()

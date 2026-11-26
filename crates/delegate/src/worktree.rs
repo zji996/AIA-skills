@@ -135,6 +135,16 @@ pub fn generated_config(cfg: &Value, file: &Path) -> Res<(Vec<String>, String)> 
     };
     let rules = rule_list(spec, "paths", file)?.unwrap_or_default();
     rule_list(spec, "inputs", file)?;
+    match spec.get("isolateTarget") {
+        None | Some(Value::Null) | Some(Value::Bool(_)) => {}
+        Some(Value::String(v)) if matches!(v.to_ascii_lowercase().as_str(), "always" | "never") => {}
+        _ => {
+            return Err(format!(
+                "{}: generated.isolateTarget must be a boolean, \"always\", or \"never\"",
+                file.display()
+            ));
+        }
+    }
     let command = spec["command"]
         .as_str()
         .filter(|s| !s.contains('\0'))
@@ -145,6 +155,37 @@ pub fn generated_config(cfg: &Value, file: &Path) -> Res<(Vec<String>, String)> 
             )
         })?;
     Ok((rules, command.to_string()))
+}
+/// Whether regeneration should use an isolated `CARGO_TARGET_DIR` instead of waiting for the main
+/// repository's `target/`. Defaults to `false` (prefer queuing for the warm main-repo target);
+/// only returns `true` when explicitly requested via `DELEGATE_APPLY_ISOLATE_TARGET` or
+/// `.delegate.json` `generated.isolateTarget`.
+pub fn generated_isolate_target(source: &Path) -> bool {
+    let env_val = setting("APPLY_ISOLATE_TARGET", "").trim().to_ascii_lowercase();
+    if !env_val.is_empty() {
+        return matches!(env_val.as_str(), "always" | "1" | "true");
+    }
+    let file = source.join(".delegate.json");
+    let Ok(Some(cfg)) = crate::config::read_file(&file) else {
+        return false;
+    };
+    match cfg.get("generated").and_then(|g| g.get("isolateTarget")) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(v)) => v.eq_ignore_ascii_case("always"),
+        _ => false,
+    }
+}
+/// Optional hard execution timeout for `generated.command`. Defaults to `None` (no total time
+/// limit; silent commands emit `stall_warning` instead of being killed). Only returns `Some(secs)`
+/// when `DELEGATE_GENERATE_TIMEOUT` is explicitly set to a positive duration.
+pub(crate) fn generate_timeout_seconds() -> Res<Option<f64>> {
+    let raw = setting("GENERATE_TIMEOUT", "");
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        return Ok(None);
+    }
+    let secs = seconds(trimmed)?;
+    Ok((secs > 0.0).then_some(secs))
 }
 /// Optional `appendOnly` paths: files both sides only add sections to (benchmark logs,
 /// changelogs). A conflict there keeps both sides, current first, instead of stopping.
@@ -1232,6 +1273,7 @@ pub fn mark_applied(
     for rdir in chain {
         let _ = crate::premerge::cancel_for_run(&rdir, &source);
         let _ = fs::remove_file(crate::premerge::premerge_path(&rdir));
+        let _ = fs::remove_file(rdir.join(".generate-pending"));
         let rec = json(rdir.join("changes.json"));
         let applied_doc = json!({
             "at": at,
@@ -2792,6 +2834,7 @@ fn already_applied_outcome(run: &Path, meta: &Value) -> Option<ApplyOutcome> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn apply(
     run: &Path,
     merge: bool,
@@ -2799,6 +2842,7 @@ pub fn apply(
     keep_commits: bool,
     commit_mode: bool,
     allow_dirty_overlap: bool,
+    resume_regenerate: bool,
 ) -> Res<ApplyOutcome> {
     let mut meta = json(run.join("meta.json"));
     if s(&meta, "mode") == "read-only" {
@@ -2816,6 +2860,7 @@ pub fn apply(
             keep_commits,
             commit_mode,
             allow_dirty_overlap,
+            resume_regenerate,
             &[],
         );
     }
@@ -2913,6 +2958,7 @@ pub fn apply(
         keep_commits,
         commit_mode,
         allow_dirty_overlap,
+        resume_regenerate,
         &written_paths,
     )
 }
@@ -3245,6 +3291,7 @@ pub(crate) fn merge_run_into_dir(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_checked(
     run: &Path,
     merge: bool,
@@ -3252,6 +3299,7 @@ fn apply_checked(
     keep_commits: bool,
     commit_mode: bool,
     allow_dirty_overlap: bool,
+    resume_regenerate: bool,
     written_paths: &[String],
 ) -> Res<ApplyOutcome> {
     let apply_started_at = iso();
@@ -3304,7 +3352,12 @@ fn apply_checked(
     if keep_commits && !uncommitted.is_empty() {
         return Err(format!("--keep-commits requires committed worktree changes; commits differ from the final tree: {}", uncommitted.join(", ")));
     }
-    let inner = if keep_commits && !commits.is_empty() {
+    let inner = if resume_regenerate {
+        if !dry && source.is_absolute() && crate::premerge::cancel_for_run(run, source) {
+            conclusion["applyTiming"]["premergeCancelled"] = json!(true);
+        }
+        apply_inner(run, merge, dry, allow_dirty_overlap, true, &mut conclusion)?
+    } else if keep_commits && !commits.is_empty() {
         let mut kc_dirty_overlap: Vec<String> = Vec::new();
         if !allow_dirty_overlap && !merge && source.is_dir() {
             let dirty_paths = source_dirty_paths(source);
@@ -3440,7 +3493,7 @@ fn apply_checked(
                     if !dry && crate::premerge::cancel_for_run(run, source) {
                         conclusion["applyTiming"]["premergeCancelled"] = json!(true);
                     }
-                    apply_inner(run, merge, dry, allow_dirty_overlap, &mut conclusion)?
+                    apply_inner(run, merge, dry, allow_dirty_overlap, false, &mut conclusion)?
                 }
             }
             crate::premerge::FastForwardCheck::Miss(miss) => {
@@ -3452,11 +3505,11 @@ fn apply_checked(
                 if !dry && crate::premerge::cancel_for_run(run, source) {
                     conclusion["applyTiming"]["premergeCancelled"] = json!(true);
                 }
-                apply_inner(run, merge, dry, allow_dirty_overlap, &mut conclusion)?
+                apply_inner(run, merge, dry, allow_dirty_overlap, false, &mut conclusion)?
             }
         }
     } else {
-        apply_inner(run, merge, dry, allow_dirty_overlap, &mut conclusion)?
+        apply_inner(run, merge, dry, allow_dirty_overlap, false, &mut conclusion)?
     };
     let mut code = inner.code;
     let written_files = inner.written;
@@ -3750,6 +3803,8 @@ pub fn run_verify(run: &Path, commands: &[String]) -> Value {
     result.as_object_mut().unwrap().remove("notExecuted");
     result.as_object_mut().unwrap().remove("next");
     let mut code = 0;
+    // Defaults to None (no total time limit; silent verify emits stall_warning);
+    // only enforced when acceptTimeoutSeconds is explicitly configured.
     let accept_timeout = meta["acceptTimeoutSeconds"].as_f64().filter(|t| *t > 0.0);
     for command in commands {
         let _ = writeln!(log, "$ {command}");
@@ -4162,11 +4217,33 @@ pub fn commit_applied(
     }
     Ok((head, subject))
 }
+fn set_regeneration_failure_next(run: &Path, meta: &Value, conclusion: &mut Value) -> (String, String) {
+    let run_id = {
+        let r = s(meta, "run");
+        if !r.is_empty() {
+            r.to_string()
+        } else {
+            run.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    let resume_cmd = format!("delegate apply --resume-regenerate {run_id}");
+    let mark_cmd = format!(
+        "若已手动生成并提交，标记已合入以关闭工作项/解锁下游：delegate mark-applied {run_id}"
+    );
+    conclusion["apply"]["next"] = json!([resume_cmd, mark_cmd]);
+    conclusion["next"] = json!(resume_cmd);
+    (resume_cmd, mark_cmd)
+}
+
 fn apply_inner(
     run: &Path,
     merge: bool,
     dry: bool,
     allow_dirty_overlap: bool,
+    resume_regenerate: bool,
     conclusion: &mut Value,
 ) -> Res<ApplyInnerResult> {
     let (meta, mut top, _, mut after) = chain_changes(run)?;
@@ -4192,6 +4269,9 @@ fn apply_inner(
     };
     let source = PathBuf::from(s(&meta["worktree"], "source"));
     let (generated_paths, generate_command) = generated(&source)?;
+    if resume_regenerate && (generated_paths.is_empty() || generate_command.is_empty()) {
+        return Err("resume-regenerate requires generated.paths and generated.command".into());
+    }
     let append_only = append_only(&source)?;
     let worktree = PathBuf::from(s(&meta["worktree"], "path"));
     let mut large = json(run.join("changes.json"))["afterLarge"].clone();
@@ -4212,13 +4292,17 @@ fn apply_inner(
     if !missing.is_empty() {
         return Err(crate::refs::recovery_message(run, &meta, &missing));
     }
-    let mut changes = tree_changes(
-        &top,
-        &json!({"tree":before,"large":applied["large"]}),
-        &json!({"tree":after,"large":large}),
-        false,
-    )?;
-    if changes.is_empty() && !s(&applied, "tree").is_empty() {
+    let mut changes = if resume_regenerate {
+        Vec::new()
+    } else {
+        tree_changes(
+            &top,
+            &json!({"tree":before,"large":applied["large"]}),
+            &json!({"tree":after,"large":large}),
+            false,
+        )?
+    };
+    if !resume_regenerate && changes.is_empty() && !s(&applied, "tree").is_empty() {
         // A repeated apply still detects drift in files merged in an earlier round.
         before = total_base.clone();
         changes = tree_changes(&top, &json!({"tree":before}), &json!({"tree":after}), false)?;
@@ -4434,7 +4518,7 @@ fn apply_inner(
     if pending_generation && (generated_paths.is_empty() || generate_command.is_empty()) {
         return Err("pending regeneration requires generated.paths and generated.command".into());
     }
-    if actions.is_empty() && conflicts.is_empty() && !pending_generation {
+    if actions.is_empty() && conflicts.is_empty() && !pending_generation && !resume_regenerate {
         eprintln!("delegate: no changes to apply");
         // Still record this round (including zero-change replies) as applied.
     }
@@ -4514,17 +4598,26 @@ fn apply_inner(
         || actions
             .iter()
             .any(|a| matches_rule(&a.path, &generated_inputs));
-    let regenerate = ((!actions.is_empty() && touches_inputs) || pending_generation)
+    let regenerate = ((!actions.is_empty() && touches_inputs) || pending_generation || resume_regenerate)
         && !generated_paths.is_empty()
         && !generate_command.is_empty();
     let skipped_generation = !actions.is_empty()
         && !touches_inputs
         && !pending_generation
+        && !resume_regenerate
         && !generated_paths.is_empty();
     if regenerate && !dry {
         write(run.join(".generate-pending"), "pending\n")?;
     }
-    let mut written = Vec::with_capacity(actions.len());
+    let mut written = if resume_regenerate {
+        chain_net_files(run, &meta)
+            .unwrap_or_else(|| run_files(run))
+            .into_iter()
+            .filter(|p| !matches_rule(p, &generated_paths))
+            .collect()
+    } else {
+        Vec::with_capacity(actions.len())
+    };
     let mut had_dirty_merge = false;
     {
         // Hold the source-watch lock ONLY for the brief write-to-disk + fingerprint-register window
@@ -4607,7 +4700,10 @@ fn apply_inner(
             })
         };
         if let Some(code) = interrupted() {
-            eprintln!("delegate: regeneration interrupted before start");
+            let (resume_cmd, mark_cmd) = set_regeneration_failure_next(run, &meta, conclusion);
+            eprintln!(
+                "delegate: regeneration interrupted before start\n  下一步：{resume_cmd}\n  或：{mark_cmd}"
+            );
             conclusion["apply"]["failedStep"] = json!("regeneration");
             conclusion["apply"]["failureDetail"] = json!("regeneration interrupted before start");
             conclusion["apply"]["writtenFiles"] = json!(&written);
@@ -4617,6 +4713,63 @@ fn apply_inner(
                 regenerated,
                 had_dirty_merge,
             });
+        }
+        let mut gen_env = meta["env"].clone();
+        if !gen_env.is_object() {
+            gen_env = json!({});
+        }
+        let explicit_target = gen_env
+            .get("CARGO_TARGET_DIR")
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.trim().is_empty())
+            || std::env::var_os("CARGO_TARGET_DIR").is_some_and(|v| !v.is_empty());
+        let isolate_target = !explicit_target && generated_isolate_target(&source);
+        if isolate_target {
+            if crate::source_watch::cargo_target_busy(&source) {
+                conclusion["applyTiming"]["targetContended"] = json!(true);
+            }
+            let iso_target = cache_dir()
+                .join("apply-target")
+                .join(crate::premerge::repo_key(&source));
+            let _ = fs::create_dir_all(&iso_target);
+            gen_env["CARGO_TARGET_DIR"] = json!(iso_target.to_string_lossy());
+            conclusion["applyTiming"]["regenerateTargetIsolated"] = json!(true);
+            conclusion["applyTiming"]["regenerateTargetDir"] = json!(iso_target.to_string_lossy());
+            apply_progress(format!(
+                "已显式配置隔离 target，本次 regenerate 使用独立 CARGO_TARGET_DIR={}",
+                iso_target.display()
+            ));
+        } else if !explicit_target {
+            match crate::source_watch::wait_for_cargo_target(&source, || {
+                apply_progress("主仓 target/ 正在被占用，排队等待主仓 target 释放...");
+            }) {
+                Some((true, waited_ms)) => {
+                    conclusion["applyTiming"]["targetContended"] = json!(true);
+                    conclusion["applyTiming"]["targetWaitMs"] = json!(waited_ms);
+                    apply_progress(format!(
+                        "主仓 target/ 已释放（排队等待 {waited_ms}ms），继续使用主仓 target 重新生成"
+                    ));
+                }
+                Some((false, _)) => {}
+                None => {
+                    let code = 128 + lane::SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+                    let (resume_cmd, mark_cmd) =
+                        set_regeneration_failure_next(run, &meta, conclusion);
+                    eprintln!(
+                        "delegate: regeneration interrupted while waiting for main repo target/\n  下一步：{resume_cmd}\n  或：{mark_cmd}"
+                    );
+                    conclusion["apply"]["failedStep"] = json!("regeneration");
+                    conclusion["apply"]["failureDetail"] =
+                        json!("regeneration interrupted while waiting for main repo target/");
+                    conclusion["apply"]["writtenFiles"] = json!(&written);
+                    return Ok(ApplyInnerResult {
+                        code,
+                        written,
+                        regenerated,
+                        had_dirty_merge,
+                    });
+                }
+            }
         }
         let gen_queue_t0 = std::time::Instant::now();
         let _slot = match lane::acquire_shell_for_commands(
@@ -4637,7 +4790,10 @@ fn apply_inner(
             Ok(slot) => slot,
             Err(_) if lane::stopped() => {
                 let code = 128 + lane::SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
-                eprintln!("delegate: regeneration interrupted while queued");
+                let (resume_cmd, mark_cmd) = set_regeneration_failure_next(run, &meta, conclusion);
+                eprintln!(
+                    "delegate: regeneration interrupted while queued\n  下一步：{resume_cmd}\n  或：{mark_cmd}"
+                );
                 conclusion["apply"]["failedStep"] = json!("regeneration");
                 conclusion["apply"]["failureDetail"] = json!("regeneration interrupted while queued");
                 conclusion["apply"]["writtenFiles"] = json!(&written);
@@ -4655,38 +4811,17 @@ fn apply_inner(
         let log = std::path::absolute(run.join("generate.log")).map_err(|e| e.to_string())?;
         let mut file =
             fs::File::create(&log).map_err(|e| format!("apply {}: {e}", log.display()))?;
-        let timeout = seconds(&setting("GENERATE_TIMEOUT", "10m"))?;
-        let mut gen_env = meta["env"].clone();
-        if !gen_env.is_object() {
-            gen_env = json!({});
+        let gen_timeout = generate_timeout_seconds()?;
+        match gen_timeout {
+            Some(timeout) => apply_progress(format!(
+                "generating / 正在生成; log: {}; execution timeout: {timeout}s (queue excluded)",
+                log.display()
+            )),
+            None => apply_progress(format!(
+                "generating / 正在生成; log: {} (no hard timeout / 无总时限，停滞将提醒)",
+                log.display()
+            )),
         }
-        let target_contended = crate::source_watch::cargo_target_busy(&source);
-        let isolate_mode = setting("APPLY_ISOLATE_TARGET", "auto").to_ascii_lowercase();
-        let explicit_target = gen_env
-            .get("CARGO_TARGET_DIR")
-            .and_then(Value::as_str)
-            .is_some_and(|v| !v.trim().is_empty())
-            || std::env::var_os("CARGO_TARGET_DIR").is_some_and(|v| !v.is_empty());
-        if target_contended {
-            conclusion["applyTiming"]["targetContended"] = json!(true);
-        }
-        if !explicit_target && (isolate_mode == "always" || (isolate_mode != "never" && target_contended)) {
-            let iso_target = cache_dir()
-                .join("apply-target")
-                .join(crate::premerge::repo_key(&source));
-            let _ = fs::create_dir_all(&iso_target);
-            gen_env["CARGO_TARGET_DIR"] = json!(iso_target.to_string_lossy());
-            conclusion["applyTiming"]["regenerateTargetIsolated"] = json!(true);
-            conclusion["applyTiming"]["regenerateTargetDir"] = json!(iso_target.to_string_lossy());
-            apply_progress(format!(
-                "主仓 target/ 正在被占用（疑似 post-commit/构建），本次 regenerate 改用独立 CARGO_TARGET_DIR={} 避让",
-                iso_target.display()
-            ));
-        }
-        apply_progress(format!(
-            "generating / 正在生成; log: {}; execution timeout: {timeout}s (queue excluded)",
-            log.display()
-        ));
         let before_gen = {
             let _g = crate::source_watch::guard(&source, false)?;
             crate::source_watch::fingerprint(&source)?
@@ -4697,7 +4832,7 @@ fn apply_inner(
             &source,
             run,
             &gen_env,
-            Some(timeout),
+            gen_timeout,
             &mut file,
             None,
         );
@@ -4717,7 +4852,11 @@ fn apply_inner(
         regenerated = reg?;
         if let Some(signal_code) = stopped {
             let _ = writeln!(file, "\n[interrupted]");
-            eprintln!("delegate: regeneration interrupted; {}", log.display());
+            let (resume_cmd, mark_cmd) = set_regeneration_failure_next(run, &meta, conclusion);
+            eprintln!(
+                "delegate: regeneration interrupted; {}\n  下一步：{resume_cmd}\n  或：{mark_cmd}",
+                log.display()
+            );
             conclusion["apply"]["failedStep"] = json!("regeneration");
             conclusion["apply"]["failureDetail"] =
                 json!(format!("regeneration interrupted; log: {}", log.display()));
@@ -4741,8 +4880,9 @@ fn apply_inner(
                 .chars()
                 .rev()
                 .collect::<String>();
+            let (resume_cmd, mark_cmd) = set_regeneration_failure_next(run, &meta, conclusion);
             eprintln!(
-                "delegate: regeneration {} (exit {code}); {}\n{}",
+                "delegate: regeneration {} (exit {code}); {}\n{}\n  下一步：{resume_cmd}\n  或：{mark_cmd}",
                 if timed { "timed out" } else { "failed" },
                 log.display(),
                 tail
@@ -4888,6 +5028,38 @@ mod tests {
         fs::write(&plain, ">>>>>>> old-run\n").unwrap();
         assert_eq!(conflict_labels(&plain), vec!["old-run"]);
         assert!(has_conflict_markers(&plain));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generate_timeout_defaults_to_unlimited() {
+        std::env::remove_var("DELEGATE_GENERATE_TIMEOUT");
+        std::env::remove_var("PI_DELEGATE_GENERATE_TIMEOUT");
+        assert_eq!(generate_timeout_seconds().unwrap(), None);
+    }
+
+    #[test]
+    fn generated_isolate_target_requires_explicit_opt_in() {
+        std::env::remove_var("DELEGATE_APPLY_ISOLATE_TARGET");
+        std::env::remove_var("PI_DELEGATE_APPLY_ISOLATE_TARGET");
+        let dir = std::env::temp_dir().join(format!("delegate-iso-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        fs::write(
+            dir.join(".delegate.json"),
+            r#"{"generated":{"paths":["gen/"],"command":"true"}}"#,
+        )
+        .unwrap();
+        assert!(!generated_isolate_target(&dir));
+
+        fs::write(
+            dir.join(".delegate.json"),
+            r#"{"generated":{"paths":["gen/"],"command":"true","isolateTarget":true}}"#,
+        )
+        .unwrap();
+        assert!(generated_isolate_target(&dir));
+
+        let bad = json!({"generated":{"paths":["gen/"],"command":"true","isolateTarget":"auto"}});
+        assert!(generated_config(&bad, Path::new(".delegate.json")).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 }

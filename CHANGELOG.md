@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `delegate`：`apply` 重新生成（以及 `apply` 内合并后验收、`merge`/`supervise` 生成）去掉默认 600s 硬超时，改为输出长时间停滞时发 `stall_warning` 事件并在 `status` 展示提醒但不杀进程；主仓 `target/` 被占时默认排队等待释放再复用热缓存，仅在显式配置 `generated.isolateTarget` 或 `DELEGATE_APPLY_ISOLATE_TARGET=always` 时切独立 `CARGO_TARGET_DIR`；重新生成失败 `ok: false` 提示 `delegate apply --resume-regenerate <run>` 与 `delegate mark-applied <run>`（`mark-applied` 同步清理 `.generate-pending` 并解锁下游 `--after-applied` 工作项）。
 - `delegate`：修复跨 run `reply` 增量审查时 `agy` 审查员沿用上一轮已清理只读快照目录的问题——每轮审查前先准备并校验本轮 `review-ro/<run_id>` 只读快照，记录 `reviewWorkdir` 并在审查提示中点明本轮新路径；`agy` 在工作目录变更时不复用绑定旧路径的会话而以本轮快照开启增量审查，Pi 续接会话时切到新路径；只读快照缺失或准备失败时失败关闭为「审查环境错误」（`ENV_ERROR` / `env_error`，与 `NEEDS_CONTROLLER` 区分），在审查卡与状态输出中写明原因与重试命令。
 - `delegate`：`delegate files <run>` 改为按整条 reply 链相对 `effective_total_base`（`meta.netBase` / `chainBase`，与 `diff --total` 同口径，含新增、修改、删除与改名两端）输出净改动文件集合，与 `apply` 实际写入及末行「本 run 改动文件（N 个）」计数一致；已合入（`.applied`）与归档（含未合入归档）后均照旧可查并可从归档重建。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。

@@ -995,7 +995,7 @@ pub(crate) fn stall_seconds(meta: &Value, key: &str) -> Option<f64> {
     let env_name = format!("STALL_{}", key.to_uppercase());
     let default = match key {
         "idle" => "30m",
-        "accept" => "10m",
+        "accept" | "generate" => "10m",
         _ => "90m",
     };
     let configured = meta["stall"]
@@ -2643,7 +2643,11 @@ mod tests {
     fn stall_settings_have_defaults_and_zero_disables() {
         std::env::remove_var("DELEGATE_STALL_IDLE");
         std::env::remove_var("PI_DELEGATE_STALL_IDLE");
+        std::env::remove_var("DELEGATE_STALL_GENERATE");
+        std::env::remove_var("PI_DELEGATE_STALL_GENERATE");
         assert_eq!(stall_seconds(&json!({}), "idle"), Some(1800.0));
+        assert_eq!(stall_seconds(&json!({}), "generate"), Some(600.0));
+        assert_eq!(stall_seconds(&json!({"stall":{"generate":"0"}}), "generate"), None);
         assert_eq!(stall_seconds(&json!({"stall":{"idle":"0"}}), "idle"), None);
         assert_eq!(
             stall_seconds(&json!({"stall":{"command":"2m"}}), "command"),

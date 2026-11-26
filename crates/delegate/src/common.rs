@@ -1038,12 +1038,14 @@ fn run_shell_inner(
     group(&mut c);
     let started = std::time::Instant::now();
     let queued_before = crate::lane::queued_seconds(run);
-    let monitor_accept_stall = matches!(role, "accept" | "verify" | "premerge");
-    let accept_stall_limit = if monitor_accept_stall {
-        crate::agents::stall_seconds(&meta, "accept")
+    let stall_kind = if matches!(role, "accept" | "verify" | "premerge") {
+        Some("accept")
+    } else if role == "generate" || role.starts_with("generate") {
+        Some("generate")
     } else {
         None
     };
+    let stall_limit = stall_kind.and_then(|k| crate::agents::stall_seconds(&meta, k));
     let log_path = run.join(format!("{role}.log"));
     let mut last_log_len = log.metadata().map(|m| m.len()).unwrap_or(0);
     let mut last_output_at = std::time::Instant::now();
@@ -1093,7 +1095,7 @@ fn run_shell_inner(
                 break true;
             }
         }
-        if monitor_accept_stall {
+        if let Some(kind) = stall_kind {
             let cur_len = log.metadata().map(|m| m.len()).unwrap_or(last_log_len);
             if cur_len != last_log_len {
                 last_log_len = cur_len;
@@ -1104,7 +1106,7 @@ fn run_shell_inner(
                     warned_stall = false;
                     last_warn_at = None;
                 }
-            } else if let Some(limit) = accept_stall_limit {
+            } else if let Some(limit) = stall_limit {
                 let silent = (last_output_at.elapsed().as_secs_f64()
                     - (queued - queued_at_last_output).max(0.0))
                 .max(0.0);
@@ -1114,16 +1116,17 @@ fn run_shell_inner(
                     let elapsed = (started.elapsed().as_secs_f64() - queued).max(0.0).round() as u64;
                     let silent_u64 = silent.round() as u64;
                     let last_line = last_non_empty_line(&log_path);
+                    let phase_zh = if kind == "generate" { "生成" } else { "验收" };
                     let detail = if last_line.is_empty() {
-                        format!("验收已跑 {elapsed}s（{silent_u64}s 无新输出）")
+                        format!("{phase_zh}已跑 {elapsed}s（{silent_u64}s 无新输出）")
                     } else {
-                        format!("验收已跑 {elapsed}s（{silent_u64}s 无新输出），最后输出：{last_line}")
+                        format!("{phase_zh}已跑 {elapsed}s（{silent_u64}s 无新输出），最后输出：{last_line}")
                     };
                     let at = iso();
                     let _ = write_json(
                         run.join("stall-warning.json"),
                         &serde_json::json!({
-                            "kind": "accept",
+                            "kind": kind,
                             "cmd": clip(command, 180),
                             "elapsedSeconds": elapsed,
                             "silentSeconds": silent_u64,
@@ -1137,7 +1140,7 @@ fn run_shell_inner(
                         run,
                         serde_json::json!({
                             "e": "stall_warning",
-                            "kind": "accept",
+                            "kind": kind,
                             "cmd": clip(command, 180),
                             "elapsedSeconds": elapsed,
                             "silentSeconds": silent_u64,
@@ -1161,7 +1164,7 @@ fn run_shell_inner(
                         "stall_warning",
                         serde_json::json!({
                             "name": s(&meta, "name"),
-                            "stallKind": "accept",
+                            "stallKind": kind,
                             "cmd": clip(command, 120),
                             "elapsedSeconds": elapsed,
                             "silentSeconds": silent_u64,

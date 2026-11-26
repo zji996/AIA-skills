@@ -693,7 +693,7 @@ fn check_generated(
             top,
             run,
             &meta["env"],
-            Some(seconds(&setting("GENERATE_TIMEOUT", "10m"))?),
+            crate::worktree::generate_timeout_seconds()?,
             &mut log,
             Some(&holder),
         )?;

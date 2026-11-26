@@ -357,7 +357,10 @@ class Delegate639Tests(unittest.TestCase):
         )
         worker_pid = pm_doc["workerPid"]
 
-        # Apply immediately while worker is paused at `pm_gate` AND `<repo>/target/.cargo-lock` is held!
+        # Apply immediately while worker is paused at `pm_gate` AND `<repo>/target/.cargo-lock` is held,
+        # with explicit target isolation enabled (default now waits for main repo target/).
+        self.env["DELEGATE_APPLY_ISOLATE_TARGET"] = "always"
+        self.addCleanup(lambda: self.env.pop("DELEGATE_APPLY_ISOLATE_TARGET", None))
         ap = self.cli("apply", "--json", "--keep", st["run"], cwd=repo, timeout=15)
         self.assertEqual(ap.returncode, 0, ap.stdout + ap.stderr)
         doc = self.outcome(ap)

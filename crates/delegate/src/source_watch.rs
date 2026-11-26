@@ -310,6 +310,23 @@ pub fn cargo_target_busy(source: &Path) -> bool {
     }
     false
 }
+
+/// Wait until `<source>/target`'s Cargo build lock is released by other processes.
+/// Returns `Some((contended, waited_ms))`, or `None` if interrupted by a signal (`lane::stopped()`).
+pub fn wait_for_cargo_target(source: &Path, mut on_wait: impl FnMut()) -> Option<(bool, u64)> {
+    if !cargo_target_busy(source) {
+        return Some((false, 0));
+    }
+    on_wait();
+    let t0 = std::time::Instant::now();
+    while cargo_target_busy(source) {
+        if crate::lane::stopped() {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Some((true, t0.elapsed().as_millis() as u64))
+}
 fn fingerprint_pair(source: &Path) -> Res<(Value, Value)> {
     let data = git(
         source,
