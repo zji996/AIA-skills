@@ -6,7 +6,8 @@
 |---|---|
 | `start [选项] [任务说明]` | 后台启动，立即返回一行状态；派发前预检路径与符号印 stderr，`--no-brief-check` 可关；`--worktree` 写任务默认先派只读探路出地图（极轻任务、`--no-scout`、`.delegate.json` `"scoutFirst": false` 例外），`queue add` 透传 `--no-scout` |
 | `run [选项] [--max <时长>]` | 启动并等到结论 |
-| `reply <run> [消息] [--wait] [--fresh] [--sync\|--sync=agent\|--no-sync] [--allow <path>]` | 续接最新一轮会话后台启动；`--wait` 等到结论。写入 worktree 续做默认三方同步到当前源快照（保池槽 `target/`，冲突时保旧基线并在 stderr 列重叠文件）；`--no-sync` 跳过、`--sync` 遇冲突拒收、`--sync=agent` 留文本标记交同事先解（未清标记拒收，二进制/结构冲突仍拒收）。`--allow` 在保护范围内按链开放路径；`--fresh` 开新会话。验收/证据默认沿用，可覆盖或关闭 |
+| `reply <run> [消息] [--wait] [--fresh] [--sync\|--sync=agent\|--no-sync] [--allow <path>] [--when-done]` | 续接最新一轮会话后台启动（运行中默认直接追加：Pi 支持 RPC `steer` 时轮中即注入，否则同 `agy` 本轮末同会话合并接着答，收尾后退回新 round，`status`/`card`/TUI 显「已追加 N 条，待投递 M 条」，`stop` 取消待投递，`--when-done` 兼容）；`--wait` 等到结论。写入 worktree 续做默认三方同步到当前源快照（保池槽 `target/`，冲突时保旧基线并在 stderr 列重叠文件）；`--no-sync` 跳过、`--sync` 遇冲突拒收、`--sync=agent` 留文本标记交同事先解（未清标记拒收，二进制/结构冲突仍拒收）。`--allow` 在保护范围内按链开放路径；`--fresh` 开新会话。验收/证据默认沿用，可覆盖或关闭 |
+| `card <run>` | L1 一屏审查卡（摘要与各轮原文、风险项、测试与验收、预合并状态、折叠改动）；L2 风险 hunk 用 `diff <run> --risky`，L3 完整改动用 `diff <run>`，详见 [审查卡与预合并](review-card.md) |
 | `patch <run> [-- <path>…]` | 打印保留的完整补丁，可按精确路径/目录前缀过滤，供 `git apply --3way` 恢复 |
 | `diff [<run>] [--stat] [--total] [路径...]` | 以 `git diff` 输出该轮的改动；`--total` 为整段对话；终端下带颜色 |
 | `files [<run>] [--json]` | 每行输出一个本 run 改动的仓库相对路径（归档后仍可用），便于精确 `git add` |
@@ -27,12 +28,16 @@
 | `snapshot --json [--repo <路径>...] [--events-limit N]` | 零锁、零子进程一次输出全机 runs、work、events、lane、queue、merges 与 candidates 快照（供 TUI 与工具使用） |
 | `note [<run> ["<文字>"\|--done [<序号>\|--all]]] [--all] [--json]` | `work.jsonl` 薄壳：追加、查看或完成 run/续做链待办，自动迁入旧 `notes.json`，`clean` 后保留 |
 | `handoff [--out <路径>]` | 生成未清理未合入任务与待办的一页交接索引（默认 `.local/run/delegate/HANDOFF.md`），含净改动、新增 `TODO(master)`、迁移文件与重叠文件 |
+| `adopt <run>…` | `/clear` 后接手整链 caller（已归档时支持从归档续接） |
 | `history [关键词…] [--since <时长>] [--state <状态>] [--limit N] [--json]` | 查本仓库永久追加索引 `history.jsonl`（老的在上新的在下，每条一行指向 `show`）；关键词匹配名字、提示词与结论，中文支持单字加二元组 |
 | `show [<run>] [--json]` | 第二层单 run 摘要：提示词前几行、确定性结论段、验收行、合入后源仓库同文件提交（现查 `git log`）、续做链与归档路径，末行指向 `result`/`patch`/归档原文；clean 后从归档读，归档过期说明「原文已过期，仅剩索引」 |
 | `board [--path]` | 刷新并打印本工作区自动委派看板（默认 `BOARD.md`，`.delegate.json` `board` 可配）；状态变化自动原子重写，写失败只记诊断 |
 | `result [<run>] [--round N\|--all\|--rounds] [--path] [--no-mark] [--json]` | 输出答复；`--round N`/`--all`/`--rounds` 查单轮、全部或索引 |
 | `stop <run>...` | 终止任务及其 scope、进程组 |
-| `clean <run>...\|--finished [--force] [--sync]` | 删除已结束任务（默认原子移入 trash 异步回收，`--sync` 同步；清理前检测是否已进 HEAD 以解锁 `run_applied`）；`--finished` 默认保留未读结果 |
+| `clean <run>...\|--finished [--force] [--sync]` | 删除已结束任务（默认原子移入 trash 异步回收，`--sync` 同步；清理前先归档全文与补丁，并检测是否已进 HEAD 以解锁 `run_applied`）；`.truncated` 不阻止清理，`--finished` 默认保留未合入工作树与未回报结果 |
+| `probe` | 走 Pi/agy 本身测各档已登记模型连通性，不建任务、不占名额 |
+| `tui` | 终端看板（`0`/`O` 总览图表、`6`/`A` 账号与真实额度、`Q` 刷新、`Enter`/`u` 切换） |
+| `eta [<run>\|<Wxx>\|--work\|--queue]` | 查进度预估与停表归责（`status`/`work`/`queue`/`wait` 已直显），见 [容量与工期](capacity.md) |
 | `disk [status\|prune] [--dry-run] [--json]` | 查看主盘/溢出盘水位、溢出槽数与超 24h 占槽提醒（`status`），或按三信号在用判活执行零代价清理、整盘水位全局 LRU 与冷槽溢出/回迁并写 `<state>/disk-health.json`（`prune`，见 [磁盘健康](disk-health.md)） |
 | `lane [--label <文字>] [--measure] [--] <命令>` | 整机重任务队列执行命令，结束时在 `lane_released` 记录子进程树 `cpuUserSecs`/`cpuSysSecs`/`maxRssKb`（`events` 与 `--measure` 摘要显示 CPU user/sys、墙钟与 CPU/墙钟 比）；`--measure` 预约核串行排队，退出码原样返回；无参列占用 |
 | `agy account <list\|status\|add\|use\|note\|remove\|import-agy-swap\|restore-entry>` | 手工管理本地 `agy` 账号槽位与余量快照（不自动轮换、不调额度接口），见 [agy 账号](agy-accounts.md) |

@@ -1011,11 +1011,11 @@ pub fn is_applied_in_repo_readonly(run: &Path, meta: &Value) -> bool {
     entries_match_working_tree(root, &entries) || entries_match_head(root, &entries)
 }
 
-/// Fail-closed check for `_gc-worker`: returns true only if an `.applied-cleaned` run's
-/// applied changes are now committed in source `HEAD` (HEAD has advanced past the uncommitted
-/// apply's `head` AND all recorded changed entries match `HEAD`).
+/// Fail-closed check for `_gc-worker`: returns true only if an applied run's changes are now
+/// committed in source `HEAD` (either detected directly in `HEAD`, or `HEAD` has advanced past
+/// the uncommitted apply's `head` AND all recorded changed entries match `HEAD`).
 pub fn is_applied_committed_in_head(run: &Path, meta: &Value) -> bool {
-    if !run.join(".applied-cleaned").exists() || !run.join(".applied").exists() {
+    if !run.join(".applied").exists() {
         return false;
     }
     if s(meta, "mode") != "write" || !meta["worktree"].is_object() {
@@ -1027,10 +1027,13 @@ pub fn is_applied_committed_in_head(run: &Path, meta: &Value) -> bool {
     }
     let applied = json(run.join(".applied"));
     let applied_head = s(&applied, "head");
+    let detected = s(&applied, "appliedBy") == "detected";
     let Some(current_head) = read_git_head(root) else {
         return false;
     };
-    if current_head.is_empty() || (!applied_head.is_empty() && current_head == applied_head) {
+    if current_head.is_empty()
+        || (!detected && !applied_head.is_empty() && current_head == applied_head)
+    {
         return false;
     }
     let rec = json(run.join("changes.json"));
@@ -1134,10 +1137,84 @@ pub fn detect_applied(run: &Path, meta: &Value) -> bool {
             }),
         );
         let applied_doc = json(run.join(".applied"));
-        let _ = crate::work::on_runs_applied(
-            &[(run.to_path_buf(), updated.clone(), applied_doc)],
-            None,
-        );
+        let mut applied_batch = vec![(run.to_path_buf(), updated.clone(), applied_doc)];
+
+        // Propagate `.applied` to inactive unapplied ancestors sharing the same worktree
+        // (matching `mark_applied` and `apply`) so superseded reply-chain rounds do not
+        // block worktree reclamation.
+        let wt_path = s(&updated["worktree"], "path").to_string();
+        let tail_id = crate::events::run_id_for(run, &updated);
+        let mut cur = run.to_path_buf();
+        let mut cur_meta = updated.clone();
+        let mut seen = std::collections::BTreeSet::new();
+        seen.insert(tail_id.clone());
+        while !s(&cur_meta, "parent").is_empty() {
+            let parent_id = s(&cur_meta, "parent").to_string();
+            if !seen.insert(parent_id.clone()) {
+                break;
+            }
+            let Some(pdir) = cur.parent().map(|d| d.join(&parent_id)) else {
+                break;
+            };
+            if !pdir.join("meta.json").is_file() || pdir.join(".applied").exists() {
+                break;
+            }
+            if crate::runs::active(&crate::runs::state(&pdir)) || crate::runs::agent_alive(&pdir) {
+                break;
+            }
+            let pmeta = json(pdir.join("meta.json"));
+            if !wt_path.is_empty() && s(&pmeta["worktree"], "path") != wt_path {
+                break;
+            }
+            let prec = json(pdir.join("changes.json"));
+            let pdoc = json!({
+                "at": at,
+                "head": head,
+                "tree": prec["after"],
+                "large": prec["afterLarge"],
+                "appliedBy": "detected",
+                "supersededBy": tail_id,
+            });
+            if write_json(pdir.join(".applied"), &pdoc).is_ok() {
+                let mut pupdated = if !crate::archive::is_record(&pdir) {
+                    let mut m = pmeta.clone();
+                    m["appliedAt"] = json!(at);
+                    if !head.is_empty() {
+                        m["appliedHead"] = json!(head);
+                    }
+                    let _ = write_json(pdir.join("meta.json"), &m);
+                    m
+                } else {
+                    pmeta.clone()
+                };
+                if s(&pupdated, "appliedAt").is_empty() {
+                    pupdated["appliedAt"] = json!(at);
+                }
+                if !s(&prec, "after").is_empty() {
+                    crate::refs::pin_slot(&pdir, &pupdated, "applied", s(&prec, "after"));
+                }
+                crate::history::record_apply(&pdir, &pupdated, &at, &head, "detected", None);
+                crate::events::emit(
+                    &crate::events::run_id_for(&pdir, &pupdated),
+                    &crate::events::repo_for_meta(&pupdated),
+                    "applied",
+                    json!({
+                        "name": s(&pupdated, "name"),
+                        "appliedBy": "detected",
+                        "supersededBy": tail_id,
+                        "head": head,
+                    }),
+                );
+                crate::board::refresh_for_run(&pdir);
+                applied_batch.push((pdir.clone(), pupdated.clone(), pdoc));
+                cur = pdir;
+                cur_meta = pupdated;
+            } else {
+                break;
+            }
+        }
+
+        let _ = crate::work::on_runs_applied(&applied_batch, None);
         crate::board::refresh_for_run(run);
     }
     ok

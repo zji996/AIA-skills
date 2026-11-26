@@ -1964,19 +1964,16 @@ db.write_text(json.dumps(units))
         self.assertEqual(self.cli("wait", "pending", "--no-result").returncode, 0)
         self.assertEqual(self.cli("clean", "--finished", "--force").stdout.count("removed"), 2)
 
-    def test_clean_keeps_answers_shown_truncated_until_read_in_full(self):
+    def test_clean_archives_truncated_answers_and_keeps_full_result_readable(self):
         self.fake_pi([answer("x" * 50), SETTLED])
         self.env["DELEGATE_RESULT_CHARS"] = "10"
         run = Path(json.loads(self.cli("start", "--name", "long", "task").stdout)["dir"])
         self.assertIn("省略 41 字符", self.cli("wait", "long").stdout)
-        self.assertIn("only shown truncated", self.cli("clean", "--finished").stderr)
-        self.assertTrue(run.exists())
-        os.utime(run / "exit_code", (1, 1))
-        self.fake_pi([answer("ok"), SETTLED])
-        self.assertEqual(self.cli("run", "--name", "later", "task").returncode, 0)
-        self.assertTrue(run.exists())  # expired but only shown truncated: not pruned
+        self.assertTrue((run / ".truncated").exists())
+        cleaned = self.cli("clean", "--finished")
+        self.assertIn("-long (answered)", cleaned.stdout)
+        self.assertFalse(run.exists())
         self.assertEqual(self.cli("result", "long").stdout.strip(), "x" * 50)
-        self.assertIn("-long (answered)", self.cli("clean", "--finished").stdout)
 
     def test_git_reports_files_changed_outside_edit_tools(self):
         repo = self.work / "repo"

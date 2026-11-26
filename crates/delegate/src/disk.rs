@@ -1393,6 +1393,108 @@ pub fn is_slot_busy(slot: &Path, cfg: &DiskConfig) -> bool {
     !probe_all_busy(&list, Path::new("/proc"), &lane_dir).is_empty()
 }
 
+/// Probe whether any of the given worktree directories are currently in use, reusing the exact
+/// 3-signal liveness detection of `delegate disk prune`:
+/// - Signal A: Cargo `.cargo-lock`/`.cargo-build-lock` flock under `<wt>/target`
+/// - Signal B: `/proc` processes whose `cwd`/`exe`/`fd` references `<wt>` or its external `<wt>/target`
+/// - Signal C: active `lane` tickets whose run/workdir/cwd maps to `<wt>`
+pub fn probe_worktrees_busy(
+    worktrees: &[PathBuf],
+    cfg: &DiskConfig,
+    proc_root: &Path,
+    lane_dir: &Path,
+) -> HashMap<usize, BusyReason> {
+    if worktrees.is_empty() {
+        return HashMap::new();
+    }
+    let mut targets: Vec<ManagedTarget> = Vec::with_capacity(worktrees.len());
+    let mut target_to_wt: Vec<usize> = Vec::with_capacity(worktrees.len());
+    let mut busy: HashMap<usize, BusyReason> = HashMap::new();
+
+    for (wt_idx, wt) in worktrees.iter().enumerate() {
+        if !wt.exists() {
+            continue;
+        }
+        let disk = if path_is_under_overflow(wt, cfg) {
+            DiskRole::Overflow
+        } else {
+            DiskRole::Primary
+        };
+        let wt_canon = fs::canonicalize(wt).unwrap_or_else(|_| wt.clone());
+        targets.push(ManagedTarget {
+            id: format!("wt:{wt_idx}"),
+            target_dir: wt.clone(),
+            canonical_target: wt_canon.clone(),
+            logical_target: wt.clone(),
+            slot_dir: Some(wt.clone()),
+            repo_dir: Some(wt.clone()),
+            disk,
+            is_released_slot: false,
+        });
+        target_to_wt.push(wt_idx);
+
+        if let Some((logical_target, real_target)) = resolve_slot_link(wt) {
+            if real_target.is_dir() {
+                if let Some(reason) = probe_cargo_flock(&real_target) {
+                    busy.entry(wt_idx).or_insert(reason);
+                }
+                let real_canon =
+                    fs::canonicalize(&real_target).unwrap_or_else(|_| real_target.clone());
+                if !real_canon.starts_with(&wt_canon) {
+                    let t_disk = if path_is_under_overflow(&real_target, cfg) {
+                        DiskRole::Overflow
+                    } else {
+                        DiskRole::Primary
+                    };
+                    targets.push(ManagedTarget {
+                        id: format!("wt-target:{wt_idx}"),
+                        target_dir: real_target,
+                        canonical_target: real_canon,
+                        logical_target,
+                        slot_dir: Some(wt.clone()),
+                        repo_dir: Some(wt.clone()),
+                        disk: t_disk,
+                        is_released_slot: false,
+                    });
+                    target_to_wt.push(wt_idx);
+                }
+            }
+        }
+    }
+
+    if !targets.is_empty() {
+        let proc_hits = probe_proc_refs_in(proc_root, &targets, Some(std::process::id()));
+        for (t_idx, reason) in proc_hits {
+            if let Some(&wt_idx) = target_to_wt.get(t_idx) {
+                busy.entry(wt_idx).or_insert(reason);
+            }
+        }
+        let lane_hits = probe_lane_tickets_in(lane_dir, &targets);
+        for (t_idx, reason) in lane_hits {
+            if let Some(&wt_idx) = target_to_wt.get(t_idx) {
+                busy.entry(wt_idx).or_insert(reason);
+            }
+        }
+    }
+    busy
+}
+
+/// Measure disk bytes occupied by a worktree directory (including an external `<wt>/target`
+/// symlink if present).
+pub fn worktree_disk_bytes(wt: &Path) -> u64 {
+    let mut total = dir_disk_bytes(wt);
+    let target_link = wt.join("target");
+    if target_link.is_symlink() {
+        if let Ok(real_target) = fs::canonicalize(&target_link) {
+            let wt_canon = fs::canonicalize(wt).unwrap_or_else(|_| wt.to_path_buf());
+            if real_target.is_dir() && !real_target.starts_with(&wt_canon) {
+                total = total.saturating_add(dir_disk_bytes(&real_target));
+            }
+        }
+    }
+    total
+}
+
 // ---------------------------------------------------------------------------
 // Target discovery
 // ---------------------------------------------------------------------------

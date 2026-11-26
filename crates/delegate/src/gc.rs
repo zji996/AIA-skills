@@ -290,26 +290,10 @@ pub fn spawn_worker() {
     let _ = c.spawn();
 }
 
-/// `delegate _gc-worker` — single-instance short-lived background GC worker.
-/// Acquires `<state>/.gc-worker.lock` non-blocking (`LOCK_NB`); exits immediately if another
-/// worker already holds it. Drains trash jobs, cleans orphan containers, and runs deferred
-/// maintenance (`check_stale_and_expired`, legacy backfill).
-pub fn worker_command(_args: &[String]) -> Res<i32> {
-    let state = state_dir();
-    let _ = fs::create_dir_all(&state);
-    let Ok(_guard) = crate::locks::try_acquire(
-        crate::locks::LockKind::Worker,
-        &state.join(".gc-worker.lock"),
-        true,
-    ) else {
-        // Another `_gc-worker` instance is already draining the queue.
-        return Ok(0);
-    };
-
-    let jobs = jobs_dir();
+fn drain_trash_jobs(jobs: &Path, max_passes: usize) -> bool {
     let mut drained_any = false;
-    for _pass in 0..8 {
-        let mut pending: Vec<PathBuf> = fs::read_dir(&jobs)
+    for _pass in 0..max_passes {
+        let mut pending: Vec<PathBuf> = fs::read_dir(jobs)
             .into_iter()
             .flatten()
             .flatten()
@@ -325,6 +309,29 @@ pub fn worker_command(_args: &[String]) -> Res<i32> {
             drained_any = true;
         }
     }
+    drained_any
+}
+
+/// `delegate _gc-worker` — single-instance short-lived background GC worker.
+/// Acquires `<state>/.gc-worker.lock` non-blocking (`LOCK_NB`); exits immediately if another
+/// worker already holds it. Drains trash jobs, cleans orphan containers, reclaims applied/dropped
+/// worktrees immediately, reclaims unmerged finished worktrees only on whole-disk watermark
+/// pressure (LRU, archive before delete, reusing `disk` liveness signals), and runs deferred
+/// maintenance (`check_stale_and_expired`, legacy backfill).
+pub fn worker_command(_args: &[String]) -> Res<i32> {
+    let state = state_dir();
+    let _ = fs::create_dir_all(&state);
+    let Ok(_guard) = crate::locks::try_acquire(
+        crate::locks::LockKind::Worker,
+        &state.join(".gc-worker.lock"),
+        true,
+    ) else {
+        // Another `_gc-worker` instance is already draining the queue.
+        return Ok(0);
+    };
+
+    let jobs = jobs_dir();
+    let mut drained_any = drain_trash_jobs(&jobs, 8);
 
     // Sweep orphan docker containers for already-deleted worktree directories.
     let _ = crate::cleanup::containers(&cache_dir().join("worktrees"), true);
@@ -334,27 +341,18 @@ pub fn worker_command(_args: &[String]) -> Res<i32> {
     crate::refs::backfill_all();
     crate::history::ensure_backfilled();
 
-    // Auto-clean lightweight `.applied-cleaned` runs whose uncommitted changes have now
-    // landed in source `HEAD` (fail-closed: no pending reply, no conflicts, no unread truncated result).
-    auto_clean_committed_applied_runs(&state);
+    // Immediately archive and reclaim worktrees of applied or dropped runs (`.truncated` does not
+    // block cleanup because `archive::preserve` retains full `result.md` / `result-original.md`).
+    auto_reclaim_applied_and_dropped(&state);
+    if drain_trash_jobs(&jobs, 4) {
+        drained_any = true;
+    }
 
-    // Drain any jobs staged by auto-clean above.
-    for _pass in 0..4 {
-        let mut pending: Vec<PathBuf> = fs::read_dir(&jobs)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
-            .collect();
-        if pending.is_empty() {
-            break;
-        }
-        pending.sort();
-        for job in pending {
-            let _ = execute_job(&job);
-            drained_any = true;
-        }
+    // Reclaim unmerged finished runs ONLY when whole-disk watermark triggers (P9: no fixed TTL or
+    // static GiB cap), evicting least-recently-touched non-busy worktrees first after archiving.
+    auto_reclaim_unmerged_on_watermark(&state);
+    if drain_trash_jobs(&jobs, 4) {
+        drained_any = true;
     }
 
     // P2-1: Cold-start / version-mismatch / corrupt index rebuild in the background worker.
@@ -370,16 +368,74 @@ pub fn worker_command(_args: &[String]) -> Res<i32> {
     Ok(0)
 }
 
-fn auto_clean_committed_applied_runs(state: &Path) {
+fn is_run_dropped(run: &Path, meta: &Value, work_items: &[crate::work::WorkItem]) -> bool {
+    let run_id = crate::notes::run_id(run, meta);
+    let dir_name = run.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let matches = |w: &crate::work::WorkItem| {
+        w.matches_run(&run_id) || (!dir_name.is_empty() && w.matches_run(dir_name))
+    };
+    let in_dropped = work_items
+        .iter()
+        .any(|w| w.state == "done" && w.closed_kind == "dropped" && matches(w));
+    if !in_dropped {
+        return false;
+    }
+    let in_non_dropped = work_items
+        .iter()
+        .any(|w| !(w.state == "done" && w.closed_kind == "dropped") && matches(w));
+    !in_non_dropped
+}
+
+fn run_last_touched_ns(run: &Path) -> u128 {
+    use std::time::UNIX_EPOCH;
+    for name in ["exit_code", "summary.json", "meta.json"] {
+        if let Ok(m) = fs::metadata(run.join(name)) {
+            if let Ok(t) = m.modified() {
+                if let Ok(d) = t.duration_since(UNIX_EPOCH) {
+                    return d.as_nanos();
+                }
+            }
+        }
+    }
+    fs::metadata(run)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+fn auto_reclaim_applied_and_dropped(state: &Path) {
+    let work_items = crate::work::load_readonly_in(state);
+    let disk_cfg = crate::disk::load_config().unwrap_or_default();
+    let lane_dir = state.join("lane");
+    let proc_root = Path::new("/proc");
     let repos = crate::index::discover_snapshot_repos(state, &[], None);
+
     for (_, runs_dir) in repos {
         let all = crate::runs::all_runs_in(&runs_dir);
-        for run in &all {
-            if !run.join(".applied-cleaned").exists() || !run.join(".applied").exists() {
+        let metas: Vec<Value> = all.iter().map(|r| json(r.join("meta.json"))).collect();
+        let wt_paths: Vec<PathBuf> = metas
+            .iter()
+            .map(|m| {
+                let p = s(&m["worktree"], "path");
+                if p.is_empty() {
+                    PathBuf::new()
+                } else {
+                    PathBuf::from(p)
+                }
+            })
+            .collect();
+        let busy = crate::disk::probe_worktrees_busy(&wt_paths, &disk_cfg, proc_root, &lane_dir);
+
+        // Pass 1: Detect manually-landed changes for finished write runs first so `.applied`
+        // propagates to inactive reply-chain ancestors before `shared` / cleanup decisions.
+        for (idx, run) in all.iter().enumerate() {
+            if !run.is_dir() || busy.contains_key(&idx) {
                 continue;
             }
-            if run.join(".generate-pending").exists()
-                || run.join(".truncated").exists()
+            if run.join(".applied").exists()
+                || run.join(".generate-pending").exists()
                 || crate::pending_reply::status(run).is_some()
             {
                 continue;
@@ -387,6 +443,77 @@ fn auto_clean_committed_applied_runs(state: &Path) {
             if crate::runs::active(&crate::runs::state(run)) || crate::runs::agent_alive(run) {
                 continue;
             }
+            let meta = &metas[idx];
+            if is_run_dropped(run, meta, &work_items) {
+                continue;
+            }
+            if s(meta, "mode") == "write" && run.join("exit_code").is_file() {
+                let _ = crate::worktree::detect_applied(run, meta);
+            }
+        }
+
+        // Pass 2: Reclaim applied and dropped runs. When multiple runs share a worktree,
+        // only remove the worktree once no other live run directory still points to it.
+        for (idx, run) in all.iter().enumerate() {
+            if !run.is_dir() {
+                continue;
+            }
+            if run.join(".generate-pending").exists()
+                || crate::pending_reply::status(run).is_some()
+            {
+                continue;
+            }
+            if crate::runs::active(&crate::runs::state(run)) || crate::runs::agent_alive(run) {
+                continue;
+            }
+            if busy.contains_key(&idx) {
+                continue;
+            }
+
+            let meta = &metas[idx];
+            let run_id = crate::notes::run_id(run, meta);
+            let dropped = is_run_dropped(run, meta, &work_items);
+            let is_applied = run.join(".applied").exists();
+            if !is_applied && !dropped {
+                continue;
+            }
+
+            let has_active_child = all.iter().enumerate().any(|(oi, other)| {
+                oi != idx
+                    && other.is_dir()
+                    && s(&metas[oi], "parent") == run_id
+                    && (crate::runs::active(&crate::runs::state(other))
+                        || (!other.join(".applied").exists()
+                            && !is_run_dropped(other, &metas[oi], &work_items)))
+            });
+            if has_active_child {
+                continue;
+            }
+
+            let wt_str = s(&meta["worktree"], "path");
+            let source_str = s(&meta["worktree"], "source");
+            let shared_blocking = !wt_str.is_empty()
+                && all.iter().enumerate().any(|(oi, other)| {
+                    oi != idx
+                        && other.is_dir()
+                        && s(&metas[oi]["worktree"], "path") == wt_str
+                        && (crate::runs::active(&crate::runs::state(other))
+                            || (!other.join(".applied").exists()
+                                && !is_run_dropped(other, &metas[oi], &work_items)))
+                });
+            let any_other_still_present = !wt_str.is_empty()
+                && all.iter().enumerate().any(|(oi, other)| {
+                    oi != idx
+                        && other.is_dir()
+                        && s(&metas[oi]["worktree"], "path") == wt_str
+                });
+            let can_remove_wt = !shared_blocking && !any_other_still_present;
+
+            if dropped && !is_applied {
+                let _ = crate::runs::auto_clean_run(run, can_remove_wt, "dropped");
+                continue;
+            }
+
             if !crate::worktree::clean_on_apply(run) {
                 continue;
             }
@@ -397,28 +524,216 @@ fn auto_clean_committed_applied_runs(state: &Path) {
             {
                 continue;
             }
-            let meta = json(run.join("meta.json"));
-            let run_id = crate::notes::run_id(run, &meta);
-            let has_active_child = all.iter().any(|other| {
-                other != run
-                    && s(&json(other.join("meta.json")), "parent") == run_id
-                    && (crate::runs::active(&crate::runs::state(other))
-                        || !other.join(".applied").exists())
-            });
-            if has_active_child {
+
+            let applied_doc = json(run.join(".applied"));
+            let is_superseded_detected = !s(&applied_doc, "supersededBy").is_empty();
+            if crate::worktree::is_applied_committed_in_head(run, meta)
+                || (is_superseded_detected && !shared_blocking)
+            {
+                let _ = crate::runs::auto_clean_applied_run(run, can_remove_wt);
+            } else if !run.join(".applied-cleaned").exists() {
+                let wt_p = Path::new(wt_str);
+                let has_reclaimable_wt = !wt_str.is_empty()
+                    && wt_p.is_absolute()
+                    && wt_p != Path::new(source_str)
+                    && (wt_p.exists() || crate::pool::is_slot(wt_p));
+                if has_reclaimable_wt && !shared_blocking {
+                    let _ = crate::runs::remove_after_apply(run);
+                    crate::index::upsert_run(run);
+                    crate::board::refresh_for_run(run);
+                }
+            }
+        }
+    }
+}
+
+fn auto_reclaim_unmerged_on_watermark(state: &Path) {
+    use std::collections::BTreeMap;
+
+    let disk_cfg = crate::disk::load_config().unwrap_or_default();
+    let wt_root = cache_dir().join("worktrees");
+    let primary_probe = disk_cfg.primary_probe_path(&wt_root);
+    let primary_need = crate::disk::probe_disk_space(crate::disk::DiskRole::Primary, &primary_probe)
+        .map(|sp| disk_cfg.primary_bytes_to_free(&sp))
+        .unwrap_or(0);
+    let overflow_need = disk_cfg
+        .overflow_root
+        .as_deref()
+        .and_then(|r| crate::disk::probe_disk_space(crate::disk::DiskRole::Overflow, r))
+        .map(|sp| disk_cfg.overflow_bytes_to_free(&sp))
+        .unwrap_or(0);
+
+    if primary_need == 0 && overflow_need == 0 {
+        return;
+    }
+
+    struct WtGroup {
+        wt: PathBuf,
+        disk: crate::disk::DiskRole,
+        runs: Vec<PathBuf>,
+        max_touched_ns: u128,
+        blocked: bool,
+    }
+
+    let repos = crate::index::discover_snapshot_repos(state, &[], None);
+    let mut groups: BTreeMap<PathBuf, WtGroup> = BTreeMap::new();
+
+    for (_, runs_dir) in repos {
+        let all = crate::runs::all_runs_in(&runs_dir);
+        let metas: Vec<Value> = all.iter().map(|r| json(r.join("meta.json"))).collect();
+
+        for (idx, run) in all.iter().enumerate() {
+            if !run.is_dir() {
                 continue;
             }
-            if crate::worktree::is_applied_committed_in_head(run, &meta) {
-                let wt_path = s(&meta["worktree"], "path");
-                let shared = !wt_path.is_empty()
-                    && all.iter().any(|other| {
-                        other != run
-                            && s(&json(other.join("meta.json"))["worktree"], "path") == wt_path
-                            && (crate::runs::active(&crate::runs::state(other))
-                                || !other.join(".applied").exists())
-                    });
-                let _ = crate::runs::auto_clean_applied_run(run, !shared);
+            let meta = &metas[idx];
+            let wt_str = s(&meta["worktree"], "path");
+            let source_str = s(&meta["worktree"], "source");
+            if wt_str.is_empty() {
+                continue;
             }
+            let wt = PathBuf::from(wt_str);
+            if !wt.is_absolute() || wt == Path::new(source_str) || !wt.is_dir() {
+                continue;
+            }
+
+            let wt_key = fs::canonicalize(&wt).unwrap_or_else(|_| wt.clone());
+            let disk = if crate::disk::path_is_under_overflow(&wt, &disk_cfg) {
+                crate::disk::DiskRole::Overflow
+            } else {
+                crate::disk::DiskRole::Primary
+            };
+            let entry = groups.entry(wt_key).or_insert_with(|| WtGroup {
+                wt: wt.clone(),
+                disk,
+                runs: Vec::new(),
+                max_touched_ns: 0,
+                blocked: false,
+            });
+
+            let run_id = crate::notes::run_id(run, meta);
+            let has_active_child = all.iter().enumerate().any(|(oi, other)| {
+                oi != idx
+                    && other.is_dir()
+                    && s(&metas[oi], "parent") == run_id
+                    && crate::runs::active(&crate::runs::state(other))
+            });
+            let eligible = run.join("exit_code").is_file()
+                && !run.join(".applied").exists()
+                && !run.join(".applied-cleaned").exists()
+                && !run.join(".generate-pending").exists()
+                && crate::pending_reply::status(run).is_none()
+                && !crate::runs::active(&crate::runs::state(run))
+                && !crate::runs::agent_alive(run)
+                && !has_active_child;
+
+            if !eligible {
+                // Any active, pending, or applied run sharing this worktree protects the whole group.
+                entry.blocked = true;
+            } else {
+                entry.max_touched_ns = entry.max_touched_ns.max(run_last_touched_ns(run));
+                entry.runs.push(run.clone());
+            }
+        }
+    }
+
+    let candidates: Vec<WtGroup> = groups
+        .into_values()
+        .filter(|g| {
+            if g.blocked || g.runs.is_empty() {
+                return false;
+            }
+            let need_for_disk = match g.disk {
+                crate::disk::DiskRole::Primary => primary_need,
+                crate::disk::DiskRole::Overflow => overflow_need,
+            };
+            need_for_disk > 0
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return;
+    }
+
+    let wt_list: Vec<PathBuf> = candidates.iter().map(|c| c.wt.clone()).collect();
+    let lane_dir = state.join("lane");
+    let busy = crate::disk::probe_worktrees_busy(&wt_list, &disk_cfg, Path::new("/proc"), &lane_dir);
+
+    let mut evictable: Vec<WtGroup> = candidates
+        .into_iter()
+        .enumerate()
+        .filter(|(idx, _)| !busy.contains_key(idx))
+        .map(|(_, g)| g)
+        .collect();
+
+    // Evict least-recently-touched worktree group first (LRU by latest round in the chain).
+    evictable.sort_by(|a, b| {
+        a.max_touched_ns
+            .cmp(&b.max_touched_ns)
+            .then_with(|| a.wt.cmp(&b.wt))
+    });
+
+    let mut primary_freed = 0u64;
+    let mut overflow_freed = 0u64;
+
+    for group in evictable {
+        match group.disk {
+            crate::disk::DiskRole::Primary if primary_freed >= primary_need => continue,
+            crate::disk::DiskRole::Overflow if overflow_freed >= overflow_need => continue,
+            _ => {}
+        }
+        if !group.wt.is_dir() {
+            continue;
+        }
+        let is_pool = crate::pool::is_slot(&group.wt);
+        let before_bytes = crate::disk::worktree_disk_bytes(&group.wt);
+        let live_runs: Vec<PathBuf> = group
+            .runs
+            .into_iter()
+            .filter(|r| r.is_dir())
+            .collect();
+        if live_runs.is_empty() {
+            continue;
+        }
+
+        // Archive and clean every run sharing this worktree; only remove/release the worktree
+        // on the final run so earlier rounds never leave newer siblings dangling.
+        let last_idx = live_runs.len() - 1;
+        let mut all_ok = true;
+        for (i, run) in live_runs.iter().enumerate() {
+            let remove_wt = i == last_idx;
+            if crate::runs::auto_clean_run(run, remove_wt, "disk_watermark").is_err() {
+                all_ok = false;
+                break;
+            }
+        }
+        if !all_ok {
+            continue;
+        }
+
+        // Measure actual bytes reclaimed: pool slots are released (not deleted), so only count
+        // the real delta on disk rather than crediting the entire retained slot/target directory.
+        let freed = if is_pool {
+            let after_bytes = if group.wt.exists() {
+                crate::disk::worktree_disk_bytes(&group.wt)
+            } else {
+                0
+            };
+            before_bytes.saturating_sub(after_bytes)
+        } else {
+            before_bytes.max(1)
+        };
+
+        match group.disk {
+            crate::disk::DiskRole::Primary => {
+                primary_freed = primary_freed.saturating_add(freed);
+            }
+            crate::disk::DiskRole::Overflow => {
+                overflow_freed = overflow_freed.saturating_add(freed);
+            }
+        }
+        if primary_freed >= primary_need && overflow_freed >= overflow_need {
+            break;
         }
     }
 }

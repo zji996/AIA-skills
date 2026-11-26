@@ -8272,6 +8272,7 @@ fn drop_cmd(args: &[String]) -> Res<i32> {
 
     if !dropped_item.runs.is_empty() {
         events::mark_runs_read(&dropped_item.runs);
+        crate::gc::spawn_worker();
     }
     if json_mode {
         println!("{}", dropped_item.to_json());

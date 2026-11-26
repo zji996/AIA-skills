@@ -1386,19 +1386,12 @@ fn clean(args: &[String]) -> Res<i32> {
                 worktree::detect_applied(&run, &m);
             }
             if has(&flags, "--force")
-                || (run.join(".delivered").exists()
-                    && !run.join(".truncated").exists()
-                    && !runs::unmerged(&run))
+                || (run.join(".delivered").exists() && !runs::unmerged(&run))
             {
                 targets.push(run);
             } else if runs::unmerged(&run) {
                 eprintln!(
                     "delegate: keep unmerged worktree run {}; apply it or pass --force",
-                    run.file_name().unwrap_or_default().to_string_lossy()
-                );
-            } else if run.join(".delivered").exists() {
-                eprintln!(
-                    "delegate: keep run {0}; its answer was only shown truncated; read it with `result {0}` or pass --force",
                     run.file_name().unwrap_or_default().to_string_lossy()
                 );
             } else if !runs::active(&runs::state(&run)) {
@@ -2784,7 +2777,8 @@ fn apply(args: &[String]) -> Res<i32> {
         // 1. Chain-tail applied runs (`done`):
         //    Fail-closed full auto-clean when committed (`--commit`/`--keep-commits`) or
         //    `verify.ok == true` or `acceptStillValid == true` (with no conflicts, no pending
-        //    reply, no `.generate-pending`, and no unread truncated result).
+        //    reply, and no `.generate-pending`; `.truncated` no longer blocks because
+        //    `archive::preserve` saves full `result.md` and `result-original.md`).
         //    Otherwise keep lightweight `.applied-cleaned` and stage worktree removal to trash.
         for item in &done {
             if item.already_applied || !worktree::clean_on_apply(&item.run) {
@@ -2799,7 +2793,6 @@ fn apply(args: &[String]) -> Res<i32> {
                     .is_none_or(|a| a.is_empty());
             let no_gen_pending = !item.run.join(".generate-pending").exists();
             let no_pending_reply = pending_reply::status(&item.run).is_none();
-            let not_truncated = !item.run.join(".truncated").exists();
             let not_active =
                 !runs::active(&runs::state(&item.run)) && !runs::agent_alive(&item.run);
             let committed = b(&item.conclusion["apply"], "committed")
@@ -2809,7 +2802,6 @@ fn apply(args: &[String]) -> Res<i32> {
             let should_full_clean = no_conflicts
                 && no_gen_pending
                 && no_pending_reply
-                && not_truncated
                 && not_active
                 && (committed || verify_ok || accept_valid);
 

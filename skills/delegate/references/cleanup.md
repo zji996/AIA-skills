@@ -18,6 +18,13 @@
 
 池槽无单槽上限、整盘总水位与三信号在用判活全局 LRU（`delegate disk prune/status`）、第二块盘满载溢出/回迁及用户 `disk` 配置，见 [磁盘健康](disk-health.md)。
 
+## worktree 自动回收（`_gc-worker`）
+
+- **不设固定 TTL 或容量上限**：不按天数或静态 GiB 上限强制删除未合入任务。
+- **已合入或已 drop 立即回收**：`_gc-worker` 扫描已合入（含已标 `.applied` 或检测到已入源仓工作树/HEAD，且无冲突、非共享、非在用）与已 `work drop` 的终态 run，先 `archive::preserve` 归档全文（`result.md`/`result-original.md`）与补丁，再立即回收 worktree（`--in`/`adopt` 可从归档重建）；已提交进 HEAD 后连轻量记录目录一起清理。
+- **未合入终态按整盘水位 LRU 回收**：仅在整盘水位触发（沿用 `delegate disk prune` 的 `highPct`/`minFreeGib` 水位与三信号在用检测）时，按最久未动（`exit_code` 等 mtime）顺序先归档再回收非在用的未合入终态 worktree，直到释放量满足目标水位；活跃 run、有待投递追问或在用 worktree 绝不触碰。
+- **`.truncated` 不再阻止清理**：`archive::preserve` 已完整保留 `result.md` 与 `result-original.md`，`apply`/`clean --finished`/`_gc-worker` 与自动清理均不再因答复曾截断展示而滞留 worktree，清理后仍可用 `delegate result <run>` 读全文。
+
 ## 磁盘提示
 
 写入 run 结束、验收与证据收尾后用限时 `du -sb` 测一次（若 `<worktree>/target` 为外部软链，穿透统计真实构建目录并累加至 `meta.worktreeBytes`，另记 `meta.targetBytes`），状态 JSON 同名输出；已有值复用，失败不记录，`status`/`wait` 不测量旧任务。

@@ -1267,6 +1267,13 @@ pub fn remove(run: &Path) -> (usize, crate::cleanup::Containers) {
 
 /// Apply cleanup (lightweight retention mode): archives evidence and stages worktree removal
 /// asynchronously via `gc::stage_worktree_only_to_trash`, keeping `.applied-cleaned` + patches.
+fn sibling_runs(run: &Path) -> Vec<PathBuf> {
+    match run.parent() {
+        Some(dir) if dir.is_dir() => all_runs_in(dir),
+        _ => all_runs(),
+    }
+}
+
 /// Returns `(diagnostics, staged_gc)`.
 pub fn remove_after_apply(run: &Path) -> (Vec<String>, bool) {
     if active(&state(run)) || agent_alive(run) {
@@ -1274,8 +1281,9 @@ pub fn remove_after_apply(run: &Path) -> (Vec<String>, bool) {
     }
     let meta = json(run.join("meta.json"));
     let path = s(&meta["worktree"], "path").to_string();
+    let siblings = sibling_runs(run);
     let shared = !path.is_empty()
-        && all_runs().iter().any(|other| {
+        && siblings.iter().any(|other| {
             other != run
                 && s(&json(other.join("meta.json"))["worktree"], "path") == path
                 && (active(&state(other)) || !other.join(".applied").exists())
@@ -1300,7 +1308,7 @@ pub fn remove_after_apply(run: &Path) -> (Vec<String>, bool) {
     if crate::pool::is_slot(Path::new(&path)) {
         // Every applied round sharing the slot must stop holding it, not just the
         // latest reply. Active/unapplied sharers are still protected by `shared`.
-        for other in all_runs()
+        for other in siblings
             .into_iter()
             .filter(|other| other == run || !shared)
         {
@@ -1367,10 +1375,10 @@ pub fn remove_after_apply(run: &Path) -> (Vec<String>, bool) {
     (diagnostics, staged_gc)
 }
 
-/// Fail-closed full automatic clean of an applied run (or superseded predecessor in an applied chain):
-/// preserves archive first, deletes pinned refs, stages run + unshared worktree into trash via
-/// `gc::stage_clean_to_trash`, records clean in history/index/board/events.
-pub fn auto_clean_applied_run(run: &Path, remove_worktree: bool) -> Res<Option<PathBuf>> {
+/// Fail-closed full automatic clean of a finished run: preserves archive first, deletes pinned
+/// refs, stages run + unshared worktree into trash via `gc::stage_clean_to_trash`, records clean
+/// in history/index/board/events.
+pub fn auto_clean_run(run: &Path, remove_worktree: bool, reason: &str) -> Res<Option<PathBuf>> {
     if !run.is_dir() {
         return Ok(None);
     }
@@ -1385,7 +1393,7 @@ pub fn auto_clean_applied_run(run: &Path, remove_worktree: bool) -> Res<Option<P
     let _ = crate::cleanup::reclaim_on_clean(run, false);
     let wt_path = s(&meta["worktree"], "path").to_string();
     if remove_worktree && !wt_path.is_empty() && crate::pool::is_slot(Path::new(&wt_path)) {
-        for other in all_runs() {
+        for other in sibling_runs(run) {
             if other == run {
                 continue;
             }
@@ -1402,18 +1410,23 @@ pub fn auto_clean_applied_run(run: &Path, remove_worktree: bool) -> Res<Option<P
     crate::history::record_clean(run, &meta, archived.as_deref());
     crate::index::remove_run(run);
     crate::board::refresh_for_meta(&meta);
-    crate::events::emit(
-        &run_id_ev,
-        &repo_ev,
-        "cleaned",
-        json!({
-            "name": s(&meta, "name"),
-            "state": st,
-            "autoCleanedOnApply": true,
-            "archive": archived.as_ref().map(|p| p.to_string_lossy().into_owned()),
-        }),
-    );
+    let mut payload = json!({
+        "name": s(&meta, "name"),
+        "state": st,
+        "autoCleaned": true,
+        "reason": reason,
+        "archive": archived.as_ref().map(|p| p.to_string_lossy().into_owned()),
+    });
+    if reason == "applied" {
+        payload["autoCleanedOnApply"] = json!(true);
+    }
+    crate::events::emit(&run_id_ev, &repo_ev, "cleaned", payload);
     Ok(archived)
+}
+
+/// Fail-closed full automatic clean of an applied run (or superseded predecessor in an applied chain).
+pub fn auto_clean_applied_run(run: &Path, remove_worktree: bool) -> Res<Option<PathBuf>> {
+    auto_clean_run(run, remove_worktree, "applied")
 }
 
 fn measure_du_bytes(path: &Path) -> Option<u64> {
@@ -1475,10 +1488,10 @@ pub fn prune() {
         // Archive history follows the archive's own age/LRU policy, not KEEP_DAYS.
         if crate::archive::is_record(&run) { continue; }
         let done = run.join("exit_code");
-        // 只显示过截断答复的 run 不自动清理，全文仍待读取。
+        // `.truncated` no longer blocks pruning: `archive::preserve` retains full
+        // `result.md` and `result-original.md` before removing the run directory.
         if run.join(".delivered").is_file()
             && crate::pending_reply::status(&run).is_none()
-            && !run.join(".truncated").exists()
             && done.is_file()
             && !unmerged(&run)
         {
