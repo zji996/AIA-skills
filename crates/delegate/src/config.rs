@@ -308,6 +308,11 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
                 return Err("acceptBlind must be a list of non-empty globs".into());
             }
         }
+        if let Some(v) = value.get("briefCheck") {
+            if !v.is_boolean() {
+                return Err("briefCheck must be a boolean".into());
+            }
+        }
         crate::review::validate_review_config(value.get("review"))?;
         crate::review::validate_controller_review_paths(value.get("controllerReviewPaths"))?;
         crate::accept::validate_accept_rules(value.get("acceptRules"))?;
@@ -671,6 +676,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         "measure",
         "measureCpus",
         "disk",
+        "briefCheck",
     ] {
         if value.get(key).is_none() {
             if let Some(v) = user.as_ref().and_then(|u| u.get(key)) {
@@ -783,6 +789,13 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         ignored,
         origins,
     })
+}
+
+pub fn brief_check_enabled(value: &Value) -> bool {
+    value
+        .get("briefCheck")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
 }
 
 pub fn capacity(value: &Value, key: &str, name: &str, default: u64) -> Res<u64> {
@@ -1071,6 +1084,27 @@ mod tests {
             assert!(
                 err.contains("hotspots"),
                 "expected hotspots error, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_brief_check_config() {
+        let p = Path::new(".delegate.json");
+        assert!(validate(&json!({"briefCheck": false}), p, true).is_ok());
+        assert!(validate(&json!({"briefCheck": true}), p, false).is_ok());
+        assert!(brief_check_enabled(&json!({})));
+        assert!(brief_check_enabled(&json!({"briefCheck": true})));
+        assert!(!brief_check_enabled(&json!({"briefCheck": false})));
+        for bad in [
+            json!({"briefCheck": "false"}),
+            json!({"briefCheck": 0}),
+            json!({"briefCheck": null}),
+        ] {
+            let err = validate(&bad, p, true).unwrap_err();
+            assert!(
+                err.contains("briefCheck"),
+                "expected briefCheck error, got {err}"
             );
         }
     }

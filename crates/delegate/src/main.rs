@@ -6,6 +6,7 @@ mod agy_accounts;
 mod archive;
 mod usage;
 mod board;
+mod brief_check;
 mod card;
 mod changes;
 mod cleanup;

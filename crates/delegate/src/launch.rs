@@ -71,6 +71,8 @@ pub struct Options {
     pub max_answer: Option<u64>,
     pub work: Option<String>,
     pub no_remote: bool,
+    pub no_brief_check: bool,
+    pub brief_checked: bool,
 }
 impl Options {
     pub fn new() -> Self {
@@ -260,6 +262,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                     o.evidence = None;
                 }
                 "--no-remote" => o.no_remote = true,
+                "--no-brief-check" => o.no_brief_check = true,
                 "--review-full" => o.review_full = true,
                 "--allow-parallel-writes" => o.parallel = true,
                 "--fresh" => o.fresh = true,
@@ -1668,6 +1671,10 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         protected_paths_in_prompt(&prompt, repo.as_deref(), &o.protect, &o.allow)
     };
     note_prompt_protected_paths(&prompt_protected);
+    if !o.no_brief_check && crate::config::brief_check_enabled(&config.value) {
+        let check_root = repo.as_deref().unwrap_or(&workdir);
+        crate::brief_check::run_and_report(&prompt, check_root);
+    }
     let capacities = crate::config::capacities(&config.value)?;
     if !config.ignored.is_empty() {
         eprintln!(
@@ -2138,11 +2145,11 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     if o.max_answer.is_none() {
         o.max_answer = meta["maxAnswer"].as_u64();
     }
-    let prompt = read_prompt(&mut o)?;
+    let raw_prompt = read_prompt(&mut o)?;
     let prompt_protected = if o.read_only {
         Vec::new()
     } else {
-        protected_paths_in_prompt(&prompt, allow_top, &o.protect, &o.allow)
+        protected_paths_in_prompt(&raw_prompt, allow_top, &o.protect, &o.allow)
     };
     note_prompt_protected_paths(&prompt_protected);
     let prompt = if compose_after_apply {
@@ -2150,15 +2157,31 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
             "原任务说明：\n{}\n\n上次答复：\n{}\n\n这次的追加说明：\n{}",
             read(parent.join("prompt.md")).trim(),
             read(parent.join("result.md")).trim(),
-            prompt
+            raw_prompt
         )
     } else {
-        prompt
+        raw_prompt.clone()
     };
     let top = Some(s(&meta["worktree"], "source"))
         .filter(|x| !x.is_empty())
         .unwrap_or(s(&meta, "top"));
     let config = crate::config::load(Some(Path::new(top)))?;
+    if !o.no_brief_check
+        && !o.brief_checked
+        && crate::config::brief_check_enabled(&config.value)
+    {
+        let check_root = [
+            s(&meta["worktree"], "source"),
+            s(&meta, "top"),
+            s(&meta, "workdir"),
+        ]
+        .into_iter()
+        .find(|p| !p.is_empty() && Path::new(p).is_dir())
+        .map(Path::new);
+        if let Some(root) = check_root {
+            crate::brief_check::run_and_report(&raw_prompt, root);
+        }
+    }
     let tier_models = if switching || legacy {
         if requested_model.is_none() {
             o.model = None;
@@ -3619,6 +3642,12 @@ mod purpose_tests {
         assert!(parse(&["last", "--allow", "apps/web/", "go"], true).is_ok());
         assert!(parse(&["--no-remote", "task"], false).unwrap().no_remote);
         assert!(parse(&["last", "--no-remote", "go"], true).unwrap().no_remote);
+        assert!(parse(&["--no-brief-check", "task"], false)
+            .unwrap()
+            .no_brief_check);
+        assert!(parse(&["last", "--no-brief-check", "go"], true)
+            .unwrap()
+            .no_brief_check);
     }
 
     #[test]

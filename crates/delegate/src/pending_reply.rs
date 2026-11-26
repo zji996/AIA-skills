@@ -259,6 +259,26 @@ pub fn enqueue(args: &[String], o: &mut launch::Options) -> Res<Option<EnqueueOu
     o.prompt = Some(prompt.clone());
     o.prompt_file = None;
     o.words.clear();
+    if !o.no_brief_check && !o.brief_checked {
+        let meta = json(run.join("meta.json"));
+        let check_root = [
+            s(&meta["worktree"], "source"),
+            s(&meta, "top"),
+            s(&meta, "workdir"),
+        ]
+        .into_iter()
+        .find(|p| !p.is_empty() && Path::new(p).is_dir())
+        .map(Path::new);
+        if let Some(root) = check_root {
+            let enabled = crate::config::load(Some(root))
+                .map(|cfg| crate::config::brief_check_enabled(&cfg.value))
+                .unwrap_or(true);
+            if enabled {
+                crate::brief_check::run_and_report(&prompt, root);
+            }
+            o.brief_checked = true;
+        }
+    }
 
     let cwd = std::env::current_dir()
         .map_err(|e| e.to_string())?
@@ -829,6 +849,7 @@ fn merge_fallback_options(saved: &Value) -> Res<launch::Options> {
         merged.sync_agent |= next.sync_agent;
         merged.hide_accept |= next.hide_accept;
         merged.review_full |= next.review_full;
+        merged.no_brief_check |= next.no_brief_check;
         merged.minor |= next.minor;
         if next.model.is_some() {
             merged.model = next.model;
@@ -937,6 +958,7 @@ pub fn deliver(run: &Path) -> Res<()> {
     }
     let mut options = merge_fallback_options(&saved)?;
     options.when_done = false;
+    options.no_brief_check = true;
     options.run = Some(run.to_string_lossy().into_owned());
     options.prompt_file = None;
     options.prompt = Some(s(&saved, "message").to_string());

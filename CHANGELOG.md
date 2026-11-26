@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `delegate`：`start`/`reply` 派发前在源仓库工作区执行零 token 只读静态预检，检查说明中反引号仓库相对路径是否存在（`brief: missing path <p>`）并用 `rg -l -w` 统计标识符引用文件数（零引用报 `brief: symbol <s> not found`，引用数 `≥ 路径数 + 5` 报 `brief: symbol <s> is referenced in N files (brief names M)`）；结果只印 stderr、不拦派发不改说明不进模型上下文，单个搜索失败或缺少 `rg` 时跳过并印诊断，支持 `--no-brief-check` 与 `.delegate.json` `"briefCheck": false` 关闭。
+- `delegate`：返工与 `reply` 续做默认只审相对上一轮已审快照的增量 diff，并附上一轮审查结论原文与「上一轮已 PASS 的部分不重审」说明，同时子 run 继承父 run 的已审树与审查会话（`--review-full` 可强制全量）；纯同步主干轮（`git range-diff` 为空且无同文件重叠，或 `--sync=agent` 仅改动冲突块内行）在验收全绿后由宿主确定性跳过审查（零模型调用）并在审查卡标注「同步轮，沿用上一轮审查 PASS」，同文件自动合并或冲突解决改动非冲突行仍按增量审；给审查员的 diff 统一启用 `git diff -M -C -C` 并省略 100% 一致的复制文件，卡片「测试与验收」旁注明本轮审查范围（全量 / 增量（N 个文件）/ 同步轮未审）。
+- `delegate`：`status`/`status --all`/`snapshot` 与 `delegate-tui` 统一按本机登记仓库与活跃 `.slot` 列出全部 run（跨仓库、跨主控会话、含子模块与远端执行），非当前仓在 `status` 标 `[<repo>]`；远端执行记录活动状态与滚动输出尾（`remote-active.json`/`remote-output.log`，并兼容旧 `lane` 票据），在 `status`、TUI 总览与运行页标 `@<host>`、远端命令与已跑时长，详情直接展示远端输出尾部；human `status --all` 与 TUI 列表/总览统一将 reply 链合并为一行「`<原任务名>（第 N 轮）`」，详情展开各轮；并精简 TUI 详情页重复门禁行与运行中任务的无效审查卡标题后缀。
+- `delegate`：`agy` 支持会话粘滞——每个 run（含审查员会话）首轮启动时将所用槽位 ID 钉入 `meta.json`（`agyAccount`/`reviewAgyAccount`，不记邮箱），后续 `reply`/追加/返工/审查补问/`--sync` 沿用钉住槽位起覆盖层，仅在原槽位被删、凭据/身份校验失败或额度快照确认耗尽时回退至当前活跃账号（绝不自动挑选第三账号）并在 `status`/`card`/TUI 显示「本 run 已从 A 换到 B（原因）」；`--fresh` 按新会话取当前活跃账号重新钉住，同步更新 `agy account use` 提示与 `references/agy-accounts.md`。
+- `delegate`：适配卡从五类收为三类（`build`/`hard`/`review`，默认 thinking 为 `build`/`review`→`medium`、`hard`→`high`）；`--class scout`/`design`（`start`/`reply`/`fit set`）退出 2 并提示改用三类，用户 `fit.json` 中旧 `scout`/`design` 记录读取时静默忽略并在下次 `fit set` 写回时丢弃；`--tier scout` 保持不变。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
 
 ## delegate 6.50.0 - 2026-11-26
