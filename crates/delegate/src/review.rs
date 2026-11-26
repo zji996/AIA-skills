@@ -25,6 +25,12 @@ pub const DEFAULT_RUBRIC: &str =
 /// `PASS`, `REWORK`, or `NEEDS_CONTROLLER` (reuses the same session and model binding).
 pub const FORMAT_RETRY_PROMPT: &str = "上一条回复缺少结论。验收已由流水线跑完，不用等命令。请直接给出结论：首行只写 PASS、REWORK 或 NEEDS_CONTROLLER，下面写理由，并附「## 主控重点看」。";
 
+/// Single tail-appended follow-up prompt when a reviewer hits the repeated-command / polling
+/// self-check (`loop_stopped`), asking it to conclude directly without running more commands.
+pub const LOOP_STOP_RETRY_PROMPT: &str = "检测到你连续重复执行轮询或相同命令，已中断这轮命令。验收由 Host 独立并行执行并汇总结果，你不用跑验收，也不用等写手或验收进程。不要再调用命令或工具，直接基于已读快照和 diff 给出结论：能合（PASS）、要返工（REWORK）还是需要主控决定（NEEDS_CONTROLLER），写清理由和主控该重点看哪里。";
+
+const REVIEW_ACCEPT_OWNED_NOTE: &str = "验收由 Host 独立并行执行并汇总结果（慢层验收失败会自动取消本轮审查）；你无需自己跑验收，也不要用 `ps`/`sleep` 等待写手或验收进程，直接基于当前只读快照与 diff 给结论。";
+
 const EXTRA_TRIGGERS: [&str; 3] = ["controllerReviewPaths", "risk:high", "risk:critical"];
 const DEFAULT_EXTRA_MIN_FIVE_HOUR_PCT: f64 = 50.0;
 const DEFAULT_EXTRA_MIN_WEEKLY_PCT: f64 = 30.0;
@@ -634,7 +640,9 @@ pub fn classify_unavailable_reason(
     match res {
         Err(err) => Some(format!("启动失败：{}", clip(err, 80))),
         Ok((outcome, text)) => {
-            if lane::stopped() || matches!(outcome.as_str(), "cancelled" | "timeout") {
+            if lane::stopped()
+                || matches!(outcome.as_str(), "cancelled" | "timeout" | "loop_stopped")
+            {
                 return None;
             }
             if outcome == "ok" {
@@ -1784,6 +1792,7 @@ fn build_reviewer_meta(
         "env": author_meta["env"],
         "agy": author_meta["agy"],
         "stall": author_meta["stall"],
+        "loop": author_meta["loop"],
         "timeoutSeconds": author_meta["timeoutSeconds"],
         "top": author_meta["top"],
         "worktree": author_meta["worktree"],
@@ -2764,28 +2773,45 @@ fn run_reviewer_with_format_retry(
         grace.clone(),
         cancel.clone(),
     );
-    if !allow_format_retry || cancel.load(Ordering::SeqCst) || lane::stopped() {
+    if cancel.load(Ordering::SeqCst) || lane::stopped() {
         return AgentAttemptWithRetry {
             res: first,
             format_retried: false,
             format_retry_failed: false,
         };
     }
-    let needs_retry = match &first {
-        Ok((outcome, text)) if outcome == "ok" && !crate::agy::is_policy_refusal(text) => {
-            matches!(parse_verdict(text), ParsedVerdict::Invalid(_))
-        }
-        _ => false,
+    let is_loop_stopped = matches!(&first, Ok((outcome, _)) if outcome == "loop_stopped");
+    let needs_format_retry = !is_loop_stopped
+        && allow_format_retry
+        && match &first {
+            Ok((outcome, text)) if outcome == "ok" && !crate::agy::is_policy_refusal(text) => {
+                matches!(parse_verdict(text), ParsedVerdict::Invalid(_))
+            }
+            _ => false,
+        };
+    if !is_loop_stopped && !needs_format_retry {
+        return AgentAttemptWithRetry {
+            res: first,
+            format_retried: false,
+            format_retry_failed: false,
+        };
+    }
+    let (retry_prompt_file, retry_prompt_text, retry_event, retry_detail) = if is_loop_stopped {
+        (
+            exec_dir.join("loop-stop-retry-prompt.md"),
+            LOOP_STOP_RETRY_PROMPT,
+            "loop_stop_retry",
+            "审查员反复轮询触发自检，已终止轮询并同会话尾部补问 1 次直接给结论",
+        )
+    } else {
+        (
+            exec_dir.join("format-retry-prompt.md"),
+            FORMAT_RETRY_PROMPT,
+            "format_retry",
+            "审查员首行缺少结论，同会话尾部补问 1 次",
+        )
     };
-    if !needs_retry {
-        return AgentAttemptWithRetry {
-            res: first,
-            format_retried: false,
-            format_retry_failed: false,
-        };
-    }
-    let retry_prompt_file = exec_dir.join("format-retry-prompt.md");
-    let next_meta = write(&retry_prompt_file, format!("{FORMAT_RETRY_PROMPT}\n"))
+    let next_meta = write(&retry_prompt_file, format!("{retry_prompt_text}\n"))
         .ok()
         .and_then(|()| supervise::continuation_with_file(review_meta, exec_dir, &retry_prompt_file));
     let Some(retry_meta) = next_meta else {
@@ -2797,7 +2823,7 @@ fn run_reviewer_with_format_retry(
     };
     supervise::log_event(
         exec_dir,
-        json!({"e": "format_retry", "n": 1, "detail": "审查员首行缺少结论，同会话尾部补问 1 次"}),
+        json!({"e": retry_event, "n": 1, "detail": retry_detail}),
     );
     let second = run_agent_and_cleanup(&retry_meta, exec_dir, 2, holder, grace, cancel);
     let retry_failed = match &second {
@@ -3616,6 +3642,7 @@ pub fn run_accept_and_review(
             format!(
                 "{lead}\n\
                  {workdir_note}\
+                 - {REVIEW_ACCEPT_OWNED_NOTE}\n\
                  - {incremental_rule}\n\
                  - 第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`（无前缀、无 Markdown 修饰）。\n\
                  - 结论正文后附加 `## 主控重点看` 小节（`- [高|中|低] path:line — 理由`，无则写 `无`）。\n\n\
@@ -3626,6 +3653,7 @@ pub fn run_accept_and_review(
             format!(
                 "请作为独立只读审查员进行续审（已提供上下文、上一轮审查结论原文与本轮增量 diff）。\n\
                  {workdir_note}\
+                 {REVIEW_ACCEPT_OWNED_NOTE}\n\
                  {incremental_rule}\n\
                  输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`。\n\n\
                  ## 审查要点（{rubric_source}）\n\n\
@@ -3641,6 +3669,7 @@ pub fn run_accept_and_review(
             format!(
                 "请作为独立只读审查员审查以下写入任务的交付结果。\n\
                  {workdir_note}\
+                 {REVIEW_ACCEPT_OWNED_NOTE}\n\
                  严格遵守：不修改任何文件，不委派子任务；输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`（无前缀、无 Markdown 修饰）。\n\n\
                  ## 审查要点（{rubric_source}）\n\n\
                  {}\n\n\
@@ -3752,6 +3781,7 @@ pub fn run_accept_and_review(
                                 );
                                 let extra_prompt_body = format!(
                                     "请作为独立只读补充审查员审查以下写入任务的交付结果（提供第二意见）。\n\
+                                     {REVIEW_ACCEPT_OWNED_NOTE}\n\
                                      严格遵守：不修改任何文件，不委派子任务；输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`（无前缀、无 Markdown 修饰）。\n\n\
                                      ## 审查要点（{rubric_source}）\n\n\
                                      {}\n\n\
@@ -4012,6 +4042,7 @@ pub fn run_accept_and_review(
                                     format!(
                                         "请作为独立只读审查员进行续审（已提供上下文、上一轮审查结论原文与本轮增量 diff）。\n\
                                          {retry_workdir_note}\
+                                         {REVIEW_ACCEPT_OWNED_NOTE}\n\
                                          {incremental_rule}\n\
                                          输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`。\n\n\
                                          ## 审查要点（{rubric_source}）\n\n\
@@ -4027,6 +4058,7 @@ pub fn run_accept_and_review(
                                     format!(
                                         "请作为独立只读审查员审查以下写入任务的交付结果。\n\
                                          {retry_workdir_note}\
+                                         {REVIEW_ACCEPT_OWNED_NOTE}\n\
                                          严格遵守：不修改任何文件，不委派子任务；输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`（无前缀、无 Markdown 修饰）。\n\n\
                                          ## 审查要点（{rubric_source}）\n\n\
                                          {}\n\n\
@@ -4160,6 +4192,7 @@ pub fn run_accept_and_review(
                             let fb_body = format!(
                                 "请作为独立只读审查员进行第 {round} 轮续审（已回退到备用审查模型，提供完整上下文、上一轮审查结论原文与本轮增量 diff）。\n\
                                  {fb_workdir_note}\
+                                 {REVIEW_ACCEPT_OWNED_NOTE}\n\
                                  {incremental_rule}\n\
                                  输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`。\n\n\
                                  ## 审查要点（{rubric_source}）\n\n\

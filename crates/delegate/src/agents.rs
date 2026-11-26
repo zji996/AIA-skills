@@ -245,18 +245,21 @@ pub(crate) fn is_pure_wait_command(cmd: &str) -> bool {
 
 /// Mechanical repetition detector (ADR 0120): only consecutive identical commands with identical
 /// outcomes count; edits/writes or changed arguments/outcomes reset the streak.
-/// Pure waiting/polling commands (`sleep`, `wait`, `tail` polling) are excluded so polling a
-/// background build/test never triggers false loop warnings.
+/// Pure waiting/polling commands (`sleep`, `wait`, `tail` polling) are excluded for normal writers
+/// so polling a background build/test never triggers false loop warnings; reviewers disable this
+/// exemption (`ignore_wait_exemption = true`) because acceptance is owned by the Host.
 struct LoopDetector {
     threshold: usize,
+    ignore_wait_exemption: bool,
     last_sig: Option<(String, bool, String)>,
     streak: usize,
 }
 
 impl LoopDetector {
-    fn new(threshold: usize) -> Self {
+    fn new(threshold: usize, ignore_wait_exemption: bool) -> Self {
         Self {
             threshold,
+            ignore_wait_exemption,
             last_sig: None,
             streak: 0,
         }
@@ -270,7 +273,10 @@ impl LoopDetector {
     /// Record a completed bash command; returns `Some(count)` when the threshold is reached
     /// and resets the streak so another `threshold` identical repeats are needed to trigger again.
     fn record_bash(&mut self, cmd: &str, ok: bool, detail: &str) -> Option<usize> {
-        if self.threshold == 0 || cmd.trim().is_empty() || is_pure_wait_command(cmd) {
+        if self.threshold == 0
+            || cmd.trim().is_empty()
+            || (!self.ignore_wait_exemption && is_pure_wait_command(cmd))
+        {
             return None;
         }
         let sig = (cmd.trim().to_string(), ok, detail.trim().to_string());
@@ -592,6 +598,7 @@ pub const COLLEAGUE: &str = "You are a delegated colleague: a delegator gave you
 ";
 pub const REVIEWER_COLLEAGUE: &str = "You are an independent read-only code reviewer running in a fresh context.
 - Do not create, modify, or delete any files, and do not delegate subtasks.
+- Acceptance checks are run independently in parallel by the Host (which handles and summarizes the results, and cancels the review automatically if slow acceptance fails). Do not run acceptance commands or poll/wait for writer or acceptance processes (e.g. via `ps`/`sleep`); judge directly from the read-only snapshot and diff.
 - Your VERY FIRST output line MUST be exactly one of: `PASS`, `REWORK`, or `NEEDS_CONTROLLER` (no prefix, no markdown formatting, no extra text on line 1).
 - Use `PASS` when changes satisfy the brief with no blocking defects, regressions, vacuous tests, or out-of-scope edits.
 - Use `REWORK` when concrete fixable issues exist; list each issue with `file:line` evidence and required fix.
@@ -2064,7 +2071,9 @@ pub fn run_agent_cancellable(
     let mut current_round = crate::runs::max_round_result_num(run) + 1;
     let mut agy_filter = crate::agy::Filter::default();
     let mut agy_session = String::new();
-    let mut loop_detector = LoopDetector::new(loop_threshold(meta));
+    let is_reviewer = b(meta, "isReviewer");
+    let mut loop_detector = LoopDetector::new(loop_threshold(meta), is_reviewer);
+    let mut loop_stopped = false;
     let loop_run_id = crate::events::run_id_for(run, meta);
     let loop_repo = crate::events::repo_for_meta(meta);
     let loop_name = s(meta, "name").to_string();
@@ -2321,9 +2330,15 @@ pub fn run_agent_cancellable(
                         "同一命令连续重复 {count} 次且结果相同：{}",
                         clip(&cmd, 80)
                     );
-                    let self_check = format!(
-                        "疑似机械重复（ADR 0120 规则：连续 {count} 次相同命令与结果）；请检查进展或执行 delegate stop {loop_run_id} 后 reply 纠正"
-                    );
+                    let self_check = if is_reviewer {
+                        format!(
+                            "审查员机械重复（ADR 0120 规则：连续 {count} 次相同命令与结果）；已终止当前轮询并补问直接给出结论"
+                        )
+                    } else {
+                        format!(
+                            "疑似机械重复（ADR 0120 规则：连续 {count} 次相同命令与结果）；请检查进展或执行 delegate stop {loop_run_id} 后 reply 纠正"
+                        )
+                    };
                     let warning = json!({
                         "kind": "loop",
                         "cmd": clip(&cmd, 180),
@@ -2354,7 +2369,14 @@ pub fn run_agent_cancellable(
                             "selfCheck": self_check,
                         }),
                     );
-                    spawn_isolated_loop_review(meta, run, &cmd, count);
+                    if is_reviewer {
+                        loop_stopped = true;
+                        crate::cleanup::record(run, pid);
+                        kill_group(pid, 1.0);
+                        break;
+                    } else {
+                        spawn_isolated_loop_review(meta, run, &cmd, count);
+                    }
                 }
             }
             // At each agy turn boundary (`result` / `settled`), drain any appended follow-up
@@ -2586,6 +2608,8 @@ pub fn run_agent_cancellable(
         "cancelled"
     } else if timed.load(Ordering::SeqCst) {
         "timeout"
+    } else if loop_stopped {
+        "loop_stopped"
     } else if !status.success() {
         use std::os::unix::process::ExitStatusExt;
         if status.code() == Some(137) || status.signal() == Some(9) {
@@ -2795,7 +2819,7 @@ mod tests {
 
     #[test]
     fn loop_detector_counts_only_identical_consecutive_commands_and_resets() {
-        let mut d = LoopDetector::new(3);
+        let mut d = LoopDetector::new(3, false);
         assert_eq!(d.record_bash("cargo test", false, "err A"), None);
         assert_eq!(d.record_bash("cargo test", false, "err A"), None);
         // Different error resets streak
@@ -2829,7 +2853,7 @@ mod tests {
                 is_pure_wait_command(cmd),
                 "expected pure wait/poll command: {cmd}"
             );
-            let mut d = LoopDetector::new(3);
+            let mut d = LoopDetector::new(3, false);
             for _ in 0..10 {
                 assert_eq!(
                     d.record_bash(cmd, true, ""),
@@ -2837,6 +2861,15 @@ mod tests {
                     "wait/poll should never trigger loop: {cmd}"
                 );
             }
+            // Reviewers disable the wait/poll exemption so repeated polling triggers self-check.
+            let mut rev_d = LoopDetector::new(3, true);
+            assert_eq!(rev_d.record_bash(cmd, true, ""), None);
+            assert_eq!(rev_d.record_bash(cmd, true, ""), None);
+            assert_eq!(
+                rev_d.record_bash(cmd, true, ""),
+                Some(3),
+                "reviewer loop detector must NOT exempt wait/poll: {cmd}"
+            );
         }
 
         for cmd in [
@@ -2855,7 +2888,7 @@ mod tests {
             );
         }
 
-        let mut d = LoopDetector::new(3);
+        let mut d = LoopDetector::new(3, false);
         assert_eq!(d.record_bash("sleep 1 && cargo test", false, "fail"), None);
         assert_eq!(d.record_bash("sleep 1 && cargo test", false, "fail"), None);
         assert_eq!(

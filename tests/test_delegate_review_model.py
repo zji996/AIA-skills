@@ -466,6 +466,63 @@ class DelegateReviewModelTests(unittest.TestCase):
         self.assertIn("意见不一致", card3.stdout)
         self.assertIn("sonnet", card3.stdout)
 
+    def test_reviewer_repeated_polling_stops_loop_and_recovers_with_tail_retry(self):
+        script = (
+            "import time\n"
+            "if '审查以下写入任务' in content:\n"
+            "    print(json.dumps({'event':'init','conversation_id':conv_id}), flush=True)\n"
+            "    for step in range(1, 5):\n"
+            "        cmd = 'sleep 5 && ps -ef | grep cargo'\n"
+            "        print(json.dumps({'event':'step_update','step_update':{'step_index':step,'step_type':'tool','tool_name':'run_command','state':'ACTIVE','tool_info':{'parameters':{'CommandLine':cmd}}}}), flush=True)\n"
+            "        print(json.dumps({'event':'step_update','step_update':{'step_index':step,'step_type':'tool','tool_name':'run_command','state':'DONE','tool_info':{'parameters':{'CommandLine':cmd}}}}), flush=True)\n"
+            "    time.sleep(30)\n"
+            "elif '检测到你连续重复执行轮询' in content:\n"
+            "    emit_ok('PASS\\n中断轮询后直接给出结论\\n\\n## 主控重点看\\n无')\n"
+            "else:\n"
+            "    Path('work.txt').write_text('updated\\n')\n"
+            "    emit_ok('done')\n"
+        )
+        models = {"neon": "agy/gemini-4-neon", "hydrogen": "agy/gemini-4-hydrogen"}
+        tiers = {"scout": "neon", "review": "neon", "write": "neon"}
+        log_file = self.install_scripted_agy(script, models, tiers)
+        self.env["DELEGATE_LOOP_THRESHOLD"] = "3"
+        repo = self.repo(
+            {
+                "work.txt": "old\n",
+                ".delegate.json": json.dumps(
+                    {
+                        "accept": "true",
+                        "review": {"enabled": True, "model": "hydrogen", "thinking": "high"},
+                    }
+                ),
+            }
+        )
+        res = self.cli("run", "--worktree", "--name", "loop-stop", "edit work", cwd=repo)
+        self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+        st = json.loads(self.cli("status", "loop-stop", "--json", cwd=repo).stdout)
+        self.assertEqual(st["state"], "delivered")
+        self.assertEqual(st["review"]["verdict"], "PASS")
+        self.assertTrue(st["review"].get("formatRetried"))
+        self.assertFalse(st["review"].get("formatError", False))
+
+        calls = [json.loads(line) for line in log_file.read_text().splitlines()]
+        rev_calls = [c for c in calls if c["model"] == "gemini-4-hydrogen"]
+        self.assertEqual(len(rev_calls), 2, calls)
+        self.assertIn("验收由 Host 独立并行执行", rev_calls[0]["content"])
+        self.assertTrue(rev_calls[1]["conv_in"], "loop_stop_retry must continue same conversation")
+        self.assertIn("检测到你连续重复执行轮询", rev_calls[1]["content"])
+
+        round_events_path = Path(st["dir"]) / "review" / "round-1" / "events.jsonl"
+        round_events = [json.loads(line) for line in round_events_path.read_text().splitlines() if line.strip()]
+        self.assertTrue(
+            any(ev.get("e") == "stall_warning" and ev.get("kind") == "loop" for ev in round_events),
+            round_events,
+        )
+        self.assertTrue(
+            any(ev.get("e") == "loop_stop_retry" for ev in round_events),
+            round_events,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
