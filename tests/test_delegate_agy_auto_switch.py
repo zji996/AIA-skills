@@ -1,0 +1,711 @@
+"""End-to-end integration tests for agy dual-account automatic selection,
+`delegate agy account pick`, stickiness vs fresh-session entry points,
+writer mid-run exhaustion handoff (with appends/verdict/segmented tokens),
+read-only rerun, and reviewer full-template retry before fallback.
+
+All tests inject quota cache & scripted fake `agy` (never invokes real `agy`).
+"""
+import json
+import subprocess
+import time
+import unittest
+from pathlib import Path
+
+import test_delegate as fixtures
+import test_delegate_638 as acct_fixtures
+
+
+class DelegateAgyAutoSwitchTests(unittest.TestCase):
+    cli = fixtures.DelegateTests.cli
+    repo = fixtures.DelegateTests.repo
+    until = fixtures.DelegateTests.until
+
+    def setUp(self):
+        fixtures.DelegateTests.setUp(self)
+        self.fake_home = self.work / "home"
+        self.fake_home.mkdir(mode=0o700, exist_ok=True)
+        self.env["HOME"] = str(self.fake_home)
+        self.env["XDG_CONFIG_HOME"] = str(self.fake_home / ".config")
+        self.env.pop("DELEGATE_AGY_BIN", None)
+        self.calls_log = self.work / "agy-calls.jsonl"
+        self.usage_log = self.work / "agy-usage-calls.txt"
+
+    def write_user_config(self, doc: dict) -> None:
+        cfg_dir = Path(self.env["XDG_CONFIG_HOME"]) / "delegate"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        (cfg_dir / "config.json").write_text(json.dumps(doc), encoding="utf-8")
+        for k in ("DELEGATE_SCOUT_MODEL", "DELEGATE_REVIEW_MODEL", "DELEGATE_WRITE_MODEL"):
+            self.env.pop(k, None)
+
+    def _seed_two_accounts(self) -> None:
+        vault_dir = self.fake_home / ".gemini/agy-swap"
+        vault_dir.mkdir(parents=True, exist_ok=True)
+        vault = {
+            "account:alpha@example.test": acct_fixtures._b64_vault_entry(
+                "alpha@example.test", "AT-ALPHA", "RT-ALPHA"
+            ),
+            "account:beta@example.test": acct_fixtures._b64_vault_entry(
+                "beta@example.test", "AT-BETA", "RT-BETA"
+            ),
+        }
+        (vault_dir / "vault.json").write_text(json.dumps(vault), encoding="utf-8")
+        (vault_dir / "accounts.json").write_text(
+            json.dumps(
+                {
+                    "alpha@example.test": {"name": "Alpha"},
+                    "beta@example.test": {"name": "Beta"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        acct_fixtures._write_live_creds(
+            self.fake_home, "alpha@example.test", "AT-ALPHA", "RT-ALPHA"
+        )
+        res = self.cli("agy", "account", "import-agy-swap", "--json")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(json.loads(res.stdout)["active"], "alpha")
+
+    def _enable_auto_mode(self) -> dict:
+        res = self.cli("agy", "account", "use", "auto", "--json")
+        self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+        doc = json.loads(res.stdout)
+        self.assertEqual(doc.get("mode"), "auto")
+        self.assertEqual(doc.get("selected"), "auto")
+        return doc
+
+    def _write_quota_cache(
+        self,
+        alpha_gem=(80.0, 80.0),
+        beta_gem=(80.0, 80.0),
+        alpha_claude=(80.0, 80.0),
+        beta_claude=(80.0, 80.0),
+        fetched_epoch: int | None = None,
+    ) -> Path:
+        now = int(time.time()) if fetched_epoch is None else fetched_epoch
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+        reset_5h = "2099-01-01T00:00:00Z"
+        reset_7d = "2099-01-07T00:00:00Z"
+        quota_path = Path(self.env["XDG_STATE_HOME"]) / "delegate/agy-quota.json"
+        quota_path.parent.mkdir(parents=True, exist_ok=True)
+        doc = {
+            "schemaVersion": 1,
+            "updatedAt": now_iso,
+            "updatedEpoch": now,
+            "accounts": {
+                "alpha": {
+                    "ok": True,
+                    "fetchedAt": now_iso,
+                    "fetchedEpoch": now,
+                    "entries": [
+                        {"pool": "Gemini Models", "window": "fiveHour", "remainingPct": alpha_gem[0], "resetAt": reset_5h},
+                        {"pool": "Gemini Models", "window": "weekly", "remainingPct": alpha_gem[1], "resetAt": reset_7d},
+                        {"pool": "Claude and GPT models", "window": "fiveHour", "remainingPct": alpha_claude[0], "resetAt": reset_5h},
+                        {"pool": "Claude and GPT models", "window": "weekly", "remainingPct": alpha_claude[1], "resetAt": reset_7d},
+                    ],
+                },
+                "beta": {
+                    "ok": True,
+                    "fetchedAt": now_iso,
+                    "fetchedEpoch": now,
+                    "entries": [
+                        {"pool": "Gemini Models", "window": "fiveHour", "remainingPct": beta_gem[0], "resetAt": reset_5h},
+                        {"pool": "Gemini Models", "window": "weekly", "remainingPct": beta_gem[1], "resetAt": reset_7d},
+                        {"pool": "Claude and GPT models", "window": "fiveHour", "remainingPct": beta_claude[0], "resetAt": reset_5h},
+                        {"pool": "Claude and GPT models", "window": "weekly", "remainingPct": beta_claude[1], "resetAt": reset_7d},
+                    ],
+                },
+            },
+        }
+        quota_path.write_text(json.dumps(doc), encoding="utf-8")
+        return quota_path
+
+    def _install_scripted_agy(self, script_body: str, extra_config: dict | None = None) -> Path:
+        bin_dir = self.work / "agy-bin"
+        bin_dir.mkdir(exist_ok=True)
+        agy = bin_dir / "agy"
+        counter_file = self.work / "agy-counter.txt"
+        for p in (counter_file, self.calls_log, self.usage_log):
+            if p.exists():
+                p.unlink()
+        agy.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "argv = sys.argv[1:]\n"
+            "if '--version' in argv or '--help' in argv:\n"
+            "    print('1.6.0')\n"
+            "    sys.exit(0)\n"
+            "if '/usage' in argv:\n"
+            f"    with open({str(self.usage_log)!r}, 'a', encoding='utf-8') as f:\n"
+            "        f.write(os.environ.get('DELEGATE_AGY_ACCOUNT', 'usage') + '\\n')\n"
+            "    print('Gemini Models\\tFive Hour Limit Remaining\\t90%\\t2099-01-01T00:00:00Z')\n"
+            "    print('Gemini Models\\tWeekly Limit Remaining\\t90%\\t2099-01-07T00:00:00Z')\n"
+            "    sys.exit(0)\n"
+            "if not os.environ.get('DELEGATE_RUN_DIR'):\n"
+            "    sys.exit(0)\n"
+            f"counter = Path({str(counter_file)!r})\n"
+            "call_idx = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+            "counter.write_text(str(call_idx))\n"
+            "raw_in = sys.stdin.readline()\n"
+            "msg = json.loads(raw_in.strip().splitlines()[-1]) if raw_in.strip() else {}\n"
+            "content = msg.get('message', {}).get('content', '')\n"
+            "conv_id = ''\n"
+            "model_arg = ''\n"
+            "for i, a in enumerate(argv):\n"
+            "    if a == '--conversation' and i + 1 < len(argv):\n"
+            "        conv_id = argv[i + 1]\n"
+            "    if a == '--model' and i + 1 < len(argv):\n"
+            "        model_arg = argv[i + 1]\n"
+            "tok_path = Path(os.environ['HOME']) / '.gemini/antigravity-cli/antigravity-oauth-token'\n"
+            "tok_doc = json.loads(tok_path.read_text()) if tok_path.is_file() else {}\n"
+            "rec = {\n"
+            "    'call': call_idx,\n"
+            "    'account': os.environ.get('DELEGATE_AGY_ACCOUNT', ''),\n"
+            "    'token': tok_doc.get('token', {}).get('access_token', ''),\n"
+            "    'conv': conv_id,\n"
+            "    'model': model_arg,\n"
+            "    'run_dir': os.environ.get('DELEGATE_RUN_DIR', ''),\n"
+            "    'content': content,\n"
+            "}\n"
+            f"with open({str(self.calls_log)!r}, 'a', encoding='utf-8') as f:\n"
+            "    f.write(json.dumps(rec) + '\\n')\n"
+            "def emit_agy(text, cid=None, inp=100, out=20, cr=500):\n"
+            "    c = conv_id or cid or f'conv-{call_idx}'\n"
+            "    print(json.dumps({'event':'init','conversation_id':c}), flush=True)\n"
+            "    print(json.dumps({'event':'step_update','step_update':{'step_index':1,'step_type':'agent_response','state':'DONE','text_delta':text}}), flush=True)\n"
+            "    print(json.dumps({'event':'result','result':{'conversation_id':c,'status':'SUCCESS','response':text,'usage':{'input_tokens':inp,'output_tokens':out,'cache_read_tokens':cr}}}), flush=True)\n"
+            "def emit_error(err_msg, cid=None, inp=80, out=10, cr=300):\n"
+            "    c = conv_id or cid or f'conv-{call_idx}'\n"
+            "    print(json.dumps({'event':'init','conversation_id':c}), flush=True)\n"
+            "    print(json.dumps({'event':'result','result':{'conversation_id':c,'status':'ERROR','error':err_msg,'response':'','usage':{'input_tokens':inp,'output_tokens':out,'cache_read_tokens':cr}}}), flush=True)\n"
+            "    sys.exit(1)\n"
+            + script_body
+            + "\n",
+            encoding="utf-8",
+        )
+        agy.chmod(0o755)
+        self.env["PATH"] = f"{bin_dir}:{self.env.get('PATH', '')}"
+        cfg = {
+            "models": {
+                "neon": "agy/gemini-4-neon",
+                "opus": "agy/claude-opus-4-6-thinking",
+            },
+            "tiers": {"scout": "neon", "review": "neon", "write": "neon"},
+            "agy": {
+                "autoSwitch": {
+                    "fiveHourMinPct": 30,
+                    "weeklyMinPct": 30,
+                    "refreshMinutes": 15,
+                    "perRunReservePct": 5,
+                }
+            },
+        }
+        if extra_config:
+            cfg.update(extra_config)
+        self.write_user_config(cfg)
+        return agy
+
+    def _read_calls(self) -> list[dict]:
+        if not self.calls_log.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in self.calls_log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def _run_raw(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [str(fixtures.DELEGATE), *args],
+            cwd=self.work,
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    def _parse_run_id(self, stdout: str) -> str:
+        s = stdout.strip()
+        if s.startswith("{"):
+            return json.loads(s)["run"]
+        return s.splitlines()[-1].strip()
+
+    def _start_and_wait(self, repo: Path, prompt: str, *extra: str) -> tuple[str, Path]:
+        res = self.cli("start", "--workdir", str(repo), *extra, prompt)
+        self.assertEqual(res.returncode, 0, f"start failed:\n{res.stdout}\n{res.stderr}")
+        run_id = self._parse_run_id(res.stdout)
+        run_dir = Path(self.env["DELEGATE_RUNS"]) / run_id
+        self.until(lambda: (run_dir / "summary.json").exists(), f"{run_id} finishes", timeout=20)
+        return run_id, run_dir
+
+    def _reply_and_wait(self, parent_id: str, prompt: str, *extra: str) -> tuple[str, Path]:
+        res = self.cli("reply", parent_id, *extra, prompt)
+        self.assertEqual(res.returncode, 0, f"reply failed:\n{res.stdout}\n{res.stderr}")
+        run_id = self._parse_run_id(res.stdout)
+        run_dir = Path(self.env["DELEGATE_RUNS"]) / run_id
+        self.until(lambda: (run_dir / "summary.json").exists(), f"{run_id} finishes", timeout=20)
+        return run_id, run_dir
+
+    def test_pick_cli_readonly_and_repo_config_rejects_auto_switch(self):
+        self._seed_two_accounts()
+        self._install_scripted_agy("emit_agy('unused')")
+        self._write_quota_cache(
+            alpha_gem=(20.0, 80.0),
+            beta_gem=(90.0, 85.0),
+            alpha_claude=(85.0, 90.0),
+            beta_claude=(15.0, 80.0),
+        )
+        runs_dir = Path(self.env["DELEGATE_RUNS"])
+        before_runs = set(runs_dir.iterdir()) if runs_dir.exists() else set()
+
+        # 1. Fixed mode (default / legacy accounts.json without `mode`): `pick` works and reports fixed slot!
+        r_fixed = self._run_raw("agy", "account", "pick", "--model", "neon", "--json")
+        self.assertEqual(r_fixed.returncode, 0, r_fixed.stderr)
+        doc_fixed = json.loads(r_fixed.stdout)
+        self.assertEqual(doc_fixed["mode"], "fixed")
+        self.assertEqual(doc_fixed["selected"], "alpha")
+        self.assertFalse(doc_fixed["wouldSwitch"])
+        self.assertIn("固定号", doc_fixed["reason"])
+
+        # `list` and `status` both show the `auto` row (unselected in fixed mode; `*` on alpha)
+        list_fixed = self._run_raw("agy", "account", "list").stdout
+        self.assertIn("* alpha", list_fixed)
+        self.assertIn("  auto", list_fixed)
+        st_fixed = self._run_raw("agy", "account", "status").stdout
+        self.assertIn("mode: fixed", st_fixed)
+        self.assertIn("auto: [ ] off", st_fixed)
+
+        # 2. Switch to `use auto` -> keeps live ~/.gemini on alpha, marks `* auto` in list/status!
+        live_tok_path = self.fake_home / ".gemini/antigravity-cli/antigravity-oauth-token"
+        live_before = live_tok_path.read_text(encoding="utf-8")
+        self._enable_auto_mode()
+        self.assertEqual(live_tok_path.read_text(encoding="utf-8"), live_before)
+
+        list_auto = self._run_raw("agy", "account", "list").stdout
+        self.assertIn("* auto", list_auto)
+        self.assertIn("Gemini→beta(绿)", list_auto)
+        st_auto = self._run_raw("agy", "account", "status").stdout
+        self.assertIn("selected: auto", st_auto)
+        self.assertIn("auto: [*] on", st_auto)
+
+        # JSON pick for Gemini alias `neon` in auto mode -> picks beta (without calling /usage or creating runs)
+        r_json = self._run_raw("agy", "account", "pick", "--model", "neon", "--json")
+        self.assertEqual(r_json.returncode, 0, r_json.stderr)
+        doc = json.loads(r_json.stdout)
+        self.assertEqual(doc["mode"], "auto")
+        self.assertEqual(doc["selected"], "beta")
+        self.assertTrue(doc["wouldSwitch"])
+        self.assertEqual(doc["pool"], "gemini")
+        self.assertEqual(doc["picks"]["claude_gpt"]["selected"], "alpha")
+        self.assertNotIn("example.test", r_json.stdout)
+
+        # Human pick without --model prints both pools, tiers, cache time, and reasons
+        r_hum = self._run_raw("agy", "account", "pick")
+        self.assertEqual(r_hum.returncode, 0, r_hum.stderr)
+        self.assertIn("模式：auto", r_hum.stdout)
+        self.assertIn("新会话选号 [Gemini]：beta", r_hum.stdout)
+        self.assertIn("新会话选号 [Claude/GPT]：alpha", r_hum.stdout)
+        self.assertIn("缓存:", r_hum.stdout)
+
+        # Strictly read-only: 0 `/usage` calls, 0 runs created, no agy-auto-switch.json written
+        self.assertFalse(self.usage_log.exists(), "pick must NOT query agy -p /usage")
+        after_runs = set(runs_dir.iterdir()) if runs_dir.exists() else set()
+        self.assertEqual(before_runs, after_runs)
+        state_file = Path(self.env["XDG_STATE_HOME"]) / "delegate/agy-auto-switch.json"
+        self.assertFalse(state_file.exists(), "pick must NOT mutate poolCurrent")
+
+        # Repository `.delegate.json` containing `agy.autoSwitch` MUST error immediately!
+        bad_repo = self.repo(
+            {
+                "src/a.txt": "x\n",
+                ".delegate.json": json.dumps({"agy": {"autoSwitch": {"fiveHourMinPct": 30}}}),
+            }
+        )
+        bad_res = self.cli("start", "--workdir", str(bad_repo), "should reject repo autoSwitch")
+        self.assertNotEqual(bad_res.returncode, 0)
+        self.assertIn("autoSwitch", bad_res.stderr + bad_res.stdout)
+
+        # Removed `agy.autoSwitch.enabled` in user config MUST also error with `use auto` hint!
+        (bad_repo / ".delegate.json").unlink()
+        self.write_user_config({"agy": {"autoSwitch": {"enabled": True}}})
+        bad_en = self.cli("start", "--workdir", str(bad_repo), "should reject enabled")
+        self.assertNotEqual(bad_en.returncode, 0)
+        self.assertIn("use auto", bad_en.stderr + bad_en.stdout)
+
+    def test_stickiness_and_new_session_entry_points_and_use_auto_vs_fixed_roundtrip(self):
+        self._seed_two_accounts()
+        repo = self.repo({"src/app.txt": "v0\n"})
+        self._install_scripted_agy(
+            "Path('src/app.txt').write_text(f'v{call_idx}\\n', encoding='utf-8')\n"
+            "emit_agy(f'done {call_idx}')\n"
+        )
+        self._enable_auto_mode()
+        live_tok_path = self.fake_home / ".gemini/antigravity-cli/antigravity-oauth-token"
+        # alpha Gemini is Yellow (20%), beta Gemini is Green (90%) -> new session picks beta
+        # without changing global live ~/.gemini (still alpha)!
+        self._write_quota_cache(alpha_gem=(20.0, 80.0), beta_gem=(90.0, 85.0))
+        run1, dir1 = self._start_and_wait(repo, "start auto switch", "--worktree", "--no-scout")
+        meta1 = json.loads((dir1 / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta1.get("agyAccount"), "beta")
+        self.assertEqual(meta1.get("agyAccountSwitch", {}).get("kind"), "auto")
+        self.assertEqual(meta1.get("agyAccountSwitch", {}).get("from"), "alpha")
+        self.assertEqual(meta1.get("agyAccountSwitch", {}).get("to"), "beta")
+
+        # Global live ~/.gemini is UNCHANGED (still alpha) and mode is still auto
+        acct_st = json.loads(self.cli("agy", "account", "status", "--json").stdout)
+        self.assertEqual(acct_st["active"], "alpha")
+        self.assertEqual(acct_st["mode"], "auto")
+        self.assertIn("AT-ALPHA", live_tok_path.read_text(encoding="utf-8"))
+
+        # `status` and `card` render one-line auto-switch notice; `agy_account_auto` logged
+        self.assertIn("自动选号：alpha → beta", self._run_raw("status", run1).stdout)
+        self.assertIn("自动选号：alpha → beta", self._run_raw("card", run1, "--no-mark").stdout)
+        run1_evs = [
+            json.loads(l)
+            for l in (dir1 / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            if l.strip()
+        ]
+        self.assertTrue(any(e.get("e") == "agy_account_auto" for e in run1_evs))
+
+        # Now flip quotas: beta drops to 0% Red, alpha recovers to 95% Green.
+        # Normal `reply` MUST stay strictly sticky on beta!
+        self._write_quota_cache(alpha_gem=(95.0, 95.0), beta_gem=(0.0, 50.0))
+        run2, dir2 = self._reply_and_wait(run1, "sticky reply on beta", "--minor")
+        meta2 = json.loads((dir2 / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta2.get("agyAccount"), "beta")
+        self.assertNotIn("agyAccountSwitch", meta2)
+
+        # `reply --fresh` is a NEW session in auto mode -> upgrades from Red beta to Green alpha!
+        run3, dir3 = self._reply_and_wait(run2, "fresh reply switches to alpha", "--fresh", "--minor")
+        meta3 = json.loads((dir3 / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta3.get("agyAccount"), "alpha")
+        self.assertEqual(meta3.get("agyAccountSwitch", {}).get("kind"), "auto")
+        self.assertEqual(meta3.get("agyAccountSwitch", {}).get("from"), "beta")
+        self.assertEqual(meta3.get("agyAccountSwitch", {}).get("to"), "alpha")
+
+        # Switch to fixed `use beta` -> turns OFF auto-switch! Even when beta is 10% Yellow & alpha is 95% Green,
+        # a new session MUST stay fixed on beta!
+        self._write_quota_cache(alpha_gem=(95.0, 95.0), beta_gem=(10.0, 80.0))
+        self.assertEqual(self.cli("agy", "account", "use", "beta").returncode, 0)
+        self.assertIn("AT-BETA", live_tok_path.read_text(encoding="utf-8"))
+        run4, dir4 = self._start_and_wait(repo, "start fixed on beta", "--no-scout")
+        meta4 = json.loads((dir4 / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta4.get("agyAccount"), "beta")
+        self.assertNotIn("agyAccountSwitch", meta4)
+
+        # Switch back to `use auto` -> live ~/.gemini stays on beta, and new session upgrades from Yellow beta to Green alpha!
+        self._enable_auto_mode()
+        self.assertIn("AT-BETA", live_tok_path.read_text(encoding="utf-8"))
+        run5, dir5 = self._start_and_wait(repo, "start after re-entering auto", "--no-scout")
+        meta5 = json.loads((dir5 / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta5.get("agyAccount"), "alpha")
+        self.assertEqual(meta5.get("agyAccountSwitch", {}).get("kind"), "auto")
+        self.assertIn("AT-BETA", live_tok_path.read_text(encoding="utf-8"))
+
+        calls = self._read_calls()
+        self.assertEqual([c["account"] for c in calls], ["beta", "beta", "alpha", "beta", "alpha"])
+
+    def test_writer_mid_run_exhaustion_handoff_and_segmented_tokens(self):
+        self._seed_two_accounts()
+        self._enable_auto_mode()
+        repo = self.repo({"src/app.txt": "v0\n"})
+        # Call 1 (alpha): modifies src/app.txt, consumes tokens (120, 30, 1000), then hits insufficient_quota.
+        # Call 2 (handoff on beta): receives handoff prompt (original prompt + modified file index + git status),
+        # finishes edit, emits tokens (60, 15, 400).
+        self._install_scripted_agy(
+            "if call_idx == 1:\n"
+            "    Path('src/app.txt').write_text('partial-from-alpha\\n', encoding='utf-8')\n"
+            "    emit_error('insufficient_quota: five hour limit reached', cid='conv-a', inp=120, out=30, cr=1000)\n"
+            "else:\n"
+            "    Path('src/app.txt').write_text('finished-by-beta\\n', encoding='utf-8')\n"
+            "    emit_agy('handoff completed cleanly', cid='conv-b', inp=60, out=15, cr=400)\n"
+        )
+        self._write_quota_cache(alpha_gem=(80.0, 80.0), beta_gem=(85.0, 85.0))
+
+        run1, dir1 = self._start_and_wait(
+            repo, "write feature handoff", "--worktree", "--no-scout", "--accept", "true"
+        )
+        sum1 = json.loads((dir1 / "summary.json").read_text(encoding="utf-8"))
+        meta1 = json.loads((dir1 / "meta.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(sum1["state"], "delivered", f"summary={sum1}")
+        self.assertEqual(meta1.get("agyAccount"), "beta")
+        self.assertEqual(meta1.get("agyAccountSwitch", {}).get("kind"), "handoff")
+        self.assertEqual(meta1.get("agyAccountSwitch", {}).get("from"), "alpha")
+        self.assertEqual(meta1.get("agyAccountSwitch", {}).get("to"), "beta")
+
+        # Segmented token sum across conv-a (120,30,1000) + conv-b (60,15,400) = (180,45,1400)!
+        self.assertEqual(sum1["tokens"], {"input": 180, "output": 45, "cacheRead": 1400})
+
+        # Verify handoff prompt content (original prompt + modified file index + git status/diff, NO inline diff)
+        calls = self._read_calls()
+        self.assertEqual([c["account"] for c in calls], ["alpha", "beta"])
+        self.assertEqual(calls[1]["conv"], "", "handoff must open a brand-new conversation")
+        self.assertIn("write feature handoff", calls[1]["content"])
+        self.assertIn("`src/app.txt`", calls[1]["content"])
+        self.assertIn("git status", calls[1]["content"])
+        self.assertNotIn("partial-from-alpha", calls[1]["content"])
+
+        # Verify passive exhaustion was marked on alpha in quota cache
+        qcache = json.loads(
+            (Path(self.env["XDG_STATE_HOME"]) / "delegate/agy-quota.json").read_text(encoding="utf-8")
+        )
+        alpha_fh = [
+            e
+            for e in qcache["accounts"]["alpha"]["entries"]
+            if "gemini" in e["pool"].lower() and e["window"] == "fiveHour"
+        ][0]
+        self.assertEqual(alpha_fh["source"], "passive_error")
+        self.assertEqual(alpha_fh["remainingPct"], 0.0)
+
+        # Verify status/card show one-line handoff notice & event logged
+        self.assertIn("中途换号接力：alpha → beta", self._run_raw("status", run1).stdout)
+        self.assertIn("中途换号接力：alpha → beta", self._run_raw("card", run1, "--no-mark").stdout)
+        run_evs = [
+            json.loads(l)
+            for l in (dir1 / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            if l.strip()
+        ]
+        self.assertTrue(any(e.get("e") == "agy_account_handoff" for e in run_evs))
+
+    def test_read_only_mid_run_exhaustion_reruns_original_prompt_once(self):
+        self._seed_two_accounts()
+        self._enable_auto_mode()
+        repo = self.repo({"src/app.txt": "v0\n"})
+        self._install_scripted_agy(
+            "if call_idx == 1:\n"
+            "    emit_error('quota exceeded for this account', cid='conv-ro-a')\n"
+            "else:\n"
+            "    emit_agy('read-only answer from beta', cid='conv-ro-b')\n"
+        )
+        self._write_quota_cache(alpha_gem=(80.0, 80.0), beta_gem=(85.0, 85.0))
+
+        run1, dir1 = self._start_and_wait(repo, "read only inspect code", "--read-only")
+        sum1 = json.loads((dir1 / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(sum1["state"], "answered", f"summary={sum1}")
+        calls = self._read_calls()
+        self.assertEqual([c["account"] for c in calls], ["alpha", "beta"])
+        self.assertIn("read only inspect code", calls[1]["content"])
+        self.assertNotIn("当前工作区已改动文件索引", calls[1]["content"])
+
+    def test_reviewer_exhaustion_uses_full_template_retry_not_handoff_before_fallback(self):
+        self._seed_two_accounts()
+        self._enable_auto_mode()
+        repo = self.repo(
+            {
+                "src/app.txt": "v0\n",
+                ".delegate.json": json.dumps({"review": True}),
+            }
+        )
+        # Call 1: author on alpha succeeds.
+        # Call 2: primary reviewer on alpha hits insufficient_quota.
+        # Call 3: primary reviewer retries ONCE on beta (same model `gemini-4-neon`, NOT fallback `opus`!)
+        #         with full review template (containing rubric + task brief + diff, NO writer handoff text) -> PASS!
+        self._install_scripted_agy(
+            "run_dir = os.environ.get('DELEGATE_RUN_DIR', '')\n"
+            "is_rev = '/review/' in run_dir\n"
+            "if not is_rev:\n"
+            "    Path('src/app.txt').write_text('v1\\n', encoding='utf-8')\n"
+            "    emit_agy('author done', cid='conv-author')\n"
+            "elif call_idx == 2:\n"
+            "    emit_error('insufficient_quota: five hour limit reached', cid='conv-rev-a')\n"
+            "else:\n"
+            "    emit_agy('PASS\\nreviewed on beta\\n\\n## 主控重点看\\n无', cid='conv-rev-b')\n",
+            extra_config={
+                "tiers": {"scout": "neon", "review": "opus", "write": "neon"},
+                "review": {"enabled": True, "model": "neon"},
+            },
+        )
+        self._write_quota_cache(alpha_gem=(80.0, 80.0), beta_gem=(85.0, 85.0))
+
+        run1, dir1 = self._start_and_wait(
+            repo, "review exhaustion full template test", "--worktree", "--no-scout", "--accept", "true"
+        )
+        sum1 = json.loads((dir1 / "summary.json").read_text(encoding="utf-8"))
+        meta1 = json.loads((dir1 / "meta.json").read_text(encoding="utf-8"))
+        rev1 = json.loads((dir1 / "review.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(sum1["state"], "delivered", f"summary={sum1}")
+        self.assertEqual(rev1.get("verdict"), "PASS", f"review={rev1}")
+        self.assertNotIn("fallback", rev1, "same-model retry on beta succeeded, should NOT fall back to opus")
+        self.assertEqual(meta1.get("reviewAgyAccount"), "beta")
+        self.assertEqual(meta1.get("reviewAgyAccountSwitch", {}).get("kind"), "handoff")
+        self.assertEqual(meta1.get("reviewAgyAccountSwitch", {}).get("from"), "alpha")
+        self.assertEqual(meta1.get("reviewAgyAccountSwitch", {}).get("to"), "beta")
+
+        calls = self._read_calls()
+        self.assertEqual([c["account"] for c in calls], ["alpha", "alpha", "beta"])
+        self.assertEqual(calls[2]["conv"], "", "reviewer account retry must be fresh session")
+        self.assertIn("审查要点", calls[2]["content"])
+        self.assertIn("review exhaustion full template test", calls[2]["content"])
+        self.assertNotIn("当前工作区已改动文件索引", calls[2]["content"])
+        self.assertIn("审查换号重审：alpha → beta", self._run_raw("status", run1).stdout)
+        self.assertIn("审查换号重审：alpha → beta", self._run_raw("card", run1, "--no-mark").stdout)
+
+    def test_reviewer_continuation_exhaustion_rebuilds_full_template_and_falls_back_if_other_red(self):
+        self._seed_two_accounts()
+        self._enable_auto_mode()
+        repo = self.repo(
+            {
+                "src/app.txt": "v0\n",
+                ".delegate.json": json.dumps({"review": True}),
+            }
+        )
+        # Round 1: author(alpha) -> rev1(alpha) asks REWORK.
+        # Round 2: author rework(alpha) -> rev2 continuation (fork_target != None, on alpha) hits quota error!
+        #          Retry on beta MUST use FULL review template (contains 审查要点 + 任务说明 + 上一轮审查结论原文).
+        self._install_scripted_agy(
+            "run_dir = os.environ.get('DELEGATE_RUN_DIR', '')\n"
+            "is_rev = '/review/' in run_dir\n"
+            "if not is_rev:\n"
+            "    Path('src/app.txt').write_text(f'v{call_idx}\\n', encoding='utf-8')\n"
+            "    emit_agy(f'author done {call_idx}', cid='conv-author')\n"
+            "elif call_idx == 2:\n"
+            "    emit_agy('REWORK\\nplease add error handling\\n\\n## 主控重点看\\n无', cid='conv-rev')\n"
+            "elif call_idx == 4:\n"
+            "    emit_error('insufficient_quota: five hour limit reached', cid='conv-rev')\n"
+            "else:\n"
+            "    emit_agy('PASS\\nall fixed on beta\\n\\n## 主控重点看\\n无', cid='conv-rev-beta')\n",
+            extra_config={
+                "tiers": {"scout": "neon", "review": "opus", "write": "neon"},
+                "review": {"enabled": True, "model": "neon"},
+            },
+        )
+        self._write_quota_cache(alpha_gem=(80.0, 80.0), beta_gem=(85.0, 85.0))
+
+        run1, dir1 = self._start_and_wait(
+            repo, "incremental reviewer full template retry", "--worktree", "--no-scout", "--accept", "true"
+        )
+        rev1 = json.loads((dir1 / "review.json").read_text(encoding="utf-8"))
+        self.assertEqual(rev1.get("verdict"), "PASS", f"review={rev1}")
+        self.assertNotIn("fallback", rev1)
+
+        calls = self._read_calls()
+        # 1: author(alpha), 2: rev1(alpha REWORK), 3: author-rework(alpha),
+        # 4: rev2-cont(alpha quota err), 5: rev2-retry(beta full template PASS)
+        self.assertEqual([c["account"] for c in calls], ["alpha", "alpha", "alpha", "alpha", "beta"])
+        self.assertNotEqual(calls[3]["conv"], "", "rev2 first try should continue conv-rev")
+        self.assertEqual(calls[4]["conv"], "", "rev2 retry on beta must be fresh session")
+        self.assertIn("审查要点", calls[4]["content"])
+        self.assertIn("incremental reviewer full template retry", calls[4]["content"])
+        self.assertIn("please add error handling", calls[4]["content"])
+
+    def test_writer_rework_exhaustion_handoff_includes_verdict_and_caps_at_one_handoff(self):
+        self._seed_two_accounts()
+        self._enable_auto_mode()
+        repo = self.repo(
+            {
+                "src/app.txt": "v0\n",
+                ".delegate.json": json.dumps({"review": True}),
+            }
+        )
+        # Call 1: author(alpha) succeeds
+        # Call 2: reviewer(alpha) requests REWORK with specific feedback
+        # Call 3: author rework(alpha) hits insufficient_quota
+        # Call 4: handoff on beta receives rework verdict + original prompt, finishes edit
+        # Call 5: reviewer round 2 PASS
+        self._install_scripted_agy(
+            "run_dir = os.environ.get('DELEGATE_RUN_DIR', '')\n"
+            "is_rev = '/review/' in run_dir\n"
+            "if not is_rev and call_idx == 1:\n"
+            "    Path('src/app.txt').write_text('v1\\n', encoding='utf-8')\n"
+            "    emit_agy('author v1', cid='conv-a')\n"
+            "elif is_rev and call_idx == 2:\n"
+            "    emit_agy('REWORK\\nFIX_UNIQUE_VERDICT_MARKER\\n\\n## 主控重点看\\n无', cid='conv-r')\n"
+            "elif not is_rev and call_idx == 3:\n"
+            "    emit_error('insufficient_quota: five hour limit reached', cid='conv-a')\n"
+            "elif not is_rev and call_idx == 4:\n"
+            "    Path('src/app.txt').write_text('v2-fixed\\n', encoding='utf-8')\n"
+            "    emit_agy('rework handoff done', cid='conv-b')\n"
+            "else:\n"
+            "    emit_agy('PASS\\nlooks great\\n\\n## 主控重点看\\n无', cid='conv-r')\n"
+        )
+        self._write_quota_cache(alpha_gem=(80.0, 80.0), beta_gem=(85.0, 85.0))
+
+        run1, dir1 = self._start_and_wait(
+            repo, "rework handoff task", "--worktree", "--no-scout", "--accept", "true"
+        )
+        sum1 = json.loads((dir1 / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(sum1["state"], "delivered", f"summary={sum1}")
+        calls = self._read_calls()
+        # Call 4 is the writer handoff on beta during rework
+        handoff_call = calls[3]
+        self.assertEqual(handoff_call["account"], "beta")
+        self.assertIn("rework handoff task", handoff_call["content"])
+        self.assertIn("FIX_UNIQUE_VERDICT_MARKER", handoff_call["content"])
+        self.assertIn("`src/app.txt`", handoff_call["content"])
+
+    def test_reviewer_falls_back_when_other_account_is_red_and_events_do_not_trigger_stop_hook(self):
+        self._seed_two_accounts()
+        self._enable_auto_mode()
+        repo = self.repo(
+            {
+                "src/app.txt": "v0\n",
+                ".delegate.json": json.dumps({"review": True}),
+            }
+        )
+        # alpha Gemini is 80% Green, beta Gemini is 2% Red; Claude/GPT on both is 85% Green.
+        # Author(alpha) succeeds; primary reviewer(alpha, neon) hits insufficient_quota;
+        # because beta is Red on Gemini pool, reviewer skips beta retry and falls back directly to opus!
+        self._install_scripted_agy(
+            "run_dir = os.environ.get('DELEGATE_RUN_DIR', '')\n"
+            "is_rev = '/review/' in run_dir\n"
+            "if not is_rev:\n"
+            "    Path('src/app.txt').write_text('v1\\n', encoding='utf-8')\n"
+            "    emit_agy('author done', cid='conv-author')\n"
+            "elif 'neon' in model_arg:\n"
+            "    emit_error('insufficient_quota: five hour limit reached', cid='conv-rev-a')\n"
+            "else:\n"
+            "    emit_agy('PASS\\nfallback opus passed\\n\\n## 主控重点看\\n无', cid='conv-rev-fb')\n",
+            extra_config={
+                "tiers": {"scout": "neon", "review": "opus", "write": "neon"},
+                "review": {"enabled": True, "model": "neon"},
+            },
+        )
+        self._write_quota_cache(
+            alpha_gem=(80.0, 80.0),
+            beta_gem=(2.0, 50.0),
+            alpha_claude=(85.0, 85.0),
+            beta_claude=(85.0, 85.0),
+        )
+        run1, dir1 = self._start_and_wait(
+            repo, "fallback when other red", "--worktree", "--no-scout", "--accept", "true"
+        )
+        rev1 = json.loads((dir1 / "review.json").read_text(encoding="utf-8"))
+        self.assertEqual(rev1.get("verdict"), "PASS", f"review={rev1}")
+        self.assertIn("fallback", rev1, "when other account is Red, reviewer must fall back to opus")
+        self.assertEqual(rev1["fallback"]["to"], "opus")
+        calls = self._read_calls()
+        # 1: author(alpha, neon), 2: rev(alpha, neon -> quota err), 3: fallback rev(alpha, opus -> PASS)
+        self.assertEqual(len(calls), 3)
+        self.assertIn("opus", calls[2]["model"])
+
+    def test_single_account_is_noop_even_when_auto_switch_enabled(self):
+        # Configure ONLY ONE account slot (alpha) with autoSwitch enabled -> does nothing.
+        vault_dir = self.fake_home / ".gemini/agy-swap"
+        vault_dir.mkdir(parents=True, exist_ok=True)
+        vault = {
+            "account:alpha@example.test": acct_fixtures._b64_vault_entry(
+                "alpha@example.test", "AT-ALPHA", "RT-ALPHA"
+            ),
+        }
+        (vault_dir / "vault.json").write_text(json.dumps(vault), encoding="utf-8")
+        (vault_dir / "accounts.json").write_text(
+            json.dumps({"alpha@example.test": {"name": "Alpha"}}), encoding="utf-8"
+        )
+        acct_fixtures._write_live_creds(
+            self.fake_home, "alpha@example.test", "AT-ALPHA", "RT-ALPHA"
+        )
+        self.assertEqual(self.cli("agy", "account", "import-agy-swap", "--json").returncode, 0)
+        self._enable_auto_mode()
+        self._install_scripted_agy("emit_agy('single account ok')")
+        repo = self.repo({"src/app.txt": "v0\n"})
+        run1, dir1 = self._start_and_wait(repo, "single account task", "--read-only")
+        meta1 = json.loads((dir1 / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta1.get("agyAccount"), "alpha")
+        self.assertNotIn("agyAccountSwitch", meta1)
+        self.assertFalse(self.usage_log.exists(), "single account must not trigger /usage refresh")
+
+
+if __name__ == "__main__":
+    unittest.main()

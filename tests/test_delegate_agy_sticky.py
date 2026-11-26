@@ -231,7 +231,9 @@ class DelegateAgyStickyTests(unittest.TestCase):
         run1, _ = self._start_and_wait(repo, "start on alpha")
         self.assertEqual(self.cli("agy", "account", "use", "beta").returncode, 0)
 
-        # Mark alpha Gemini quota exhausted (future resetAt) in <state>/agy-quota.json
+        # Mark alpha Gemini quota exhausted (future resetAt) in <state>/agy-quota.json:
+        # strict stickiness MUST keep pinned reply on alpha (never silently switch accounts
+        # while resuming the same conversation).
         quota_path = Path(self.env["XDG_STATE_HOME"]) / "delegate/agy-quota.json"
         quota_path.parent.mkdir(parents=True, exist_ok=True)
         quota_path.write_text(
@@ -261,34 +263,10 @@ class DelegateAgyStickyTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        run2, dir2 = self._reply_and_wait(run1, "reply after alpha exhausted")
+        run2, dir2 = self._reply_and_wait(run1, "reply after alpha exhausted stays sticky")
         meta2 = json.loads((dir2 / "meta.json").read_text(encoding="utf-8"))
-        self.assertEqual(meta2.get("agyAccount"), "beta")
-        self.assertEqual(
-            meta2.get("agyAccountSwitch", {}).get("from"),
-            "alpha",
-        )
-        self.assertEqual(meta2.get("agyAccountSwitch", {}).get("to"), "beta")
-        self.assertEqual(meta2.get("agyAccountSwitch", {}).get("reason"), "额度已耗尽")
-
-        expected_line = "本 run 已从 alpha 换到 beta（额度已耗尽）"
-        st = self._run_raw("status", run2)
-        self.assertEqual(st.returncode, 0, st.stderr)
-        self.assertIn(expected_line, st.stdout)
-
-        card = self._run_raw("card", run2, "--no-mark")
-        self.assertEqual(card.returncode, 0, card.stderr)
-        self.assertIn(expected_line, card.stdout)
-
-        snap = self.cli("snapshot", "--json", "--repo", str(repo))
-        self.assertEqual(snap.returncode, 0, snap.stderr)
-        snap_doc = json.loads(snap.stdout)
-        runs_in_snap = [
-            r for rp in snap_doc.get("repos", []) for r in rp.get("runs", []) if r.get("run") == run2
-        ]
-        self.assertEqual(len(runs_in_snap), 1)
-        self.assertEqual(runs_in_snap[0].get("agyAccountSwitch", {}).get("from"), "alpha")
-        self.assertEqual(runs_in_snap[0].get("agyAccountSwitch", {}).get("to"), "beta")
+        self.assertEqual(meta2.get("agyAccount"), "alpha")
+        self.assertNotIn("agyAccountSwitch", meta2)
 
         # Now test deleted pinned slot: clear quota, start on alpha, switch to beta, remove alpha
         quota_path.unlink()
@@ -300,13 +278,29 @@ class DelegateAgyStickyTests(unittest.TestCase):
         run4, dir4 = self._reply_and_wait(run3, "reply after alpha deleted")
         meta4 = json.loads((dir4 / "meta.json").read_text(encoding="utf-8"))
         self.assertEqual(meta4.get("agyAccount"), "beta")
+        self.assertEqual(meta4.get("agyAccountSwitch", {}).get("from"), "alpha")
+        self.assertEqual(meta4.get("agyAccountSwitch", {}).get("to"), "beta")
         self.assertEqual(meta4.get("agyAccountSwitch", {}).get("reason"), "原槽位已删除")
         expected_del = "本 run 已从 alpha 换到 beta（原槽位已删除）"
-        self.assertIn(expected_del, self._run_raw("status", run4).stdout)
-        self.assertIn(expected_del, self._run_raw("card", run4, "--no-mark").stdout)
+        st = self._run_raw("status", run4)
+        self.assertEqual(st.returncode, 0, st.stderr)
+        self.assertIn(expected_del, st.stdout)
+        card = self._run_raw("card", run4, "--no-mark")
+        self.assertEqual(card.returncode, 0, card.stderr)
+        self.assertIn(expected_del, card.stdout)
+
+        snap = self.cli("snapshot", "--json", "--repo", str(repo))
+        self.assertEqual(snap.returncode, 0, snap.stderr)
+        snap_doc = json.loads(snap.stdout)
+        runs_in_snap = [
+            r for rp in snap_doc.get("repos", []) for r in rp.get("runs", []) if r.get("run") == run4
+        ]
+        self.assertEqual(len(runs_in_snap), 1)
+        self.assertEqual(runs_in_snap[0].get("agyAccountSwitch", {}).get("from"), "alpha")
+        self.assertEqual(runs_in_snap[0].get("agyAccountSwitch", {}).get("to"), "beta")
 
         calls = self._read_calls()
-        self.assertEqual([c["account"] for c in calls], ["alpha", "beta", "alpha", "beta"])
+        self.assertEqual([c["account"] for c in calls], ["alpha", "alpha", "alpha", "beta"])
         self.assertNotIn("gamma", [c["account"] for c in calls])
 
     def test_reviewer_session_stays_pinned_across_format_retry_and_rework_after_switch(self):
@@ -402,36 +396,9 @@ class DelegateAgyStickyTests(unittest.TestCase):
         # 1. Start run1 on alpha (author + reviewer PASS)
         run1, _ = self._start_and_wait(repo, "initial work", "--worktree", "--accept", "true")
 
-        # 2. Switch active to beta and exhaust alpha's Gemini quota
+        # 2. Switch active to beta and delete alpha slot so reply falls back alpha->beta
         self.assertEqual(self.cli("agy", "account", "use", "beta").returncode, 0)
-        quota_path = Path(self.env["XDG_STATE_HOME"]) / "delegate/agy-quota.json"
-        quota_path.parent.mkdir(parents=True, exist_ok=True)
-        quota_path.write_text(
-            json.dumps(
-                {
-                    "schemaVersion": 1,
-                    "updatedAt": "2026-11-26T16:00:00Z",
-                    "updatedEpoch": 1795622400,
-                    "accounts": {
-                        "alpha": {
-                            "ok": True,
-                            "fetchedAt": "2026-11-26T16:00:00Z",
-                            "fetchedEpoch": 1795622400,
-                            "entries": [
-                                {
-                                    "pool": "Gemini Models",
-                                    "window": "fiveHour",
-                                    "windowLabel": "Five Hour Limit Remaining",
-                                    "remainingPct": 0.0,
-                                    "resetAt": "2099-01-01T00:00:00Z",
-                                }
-                            ],
-                        }
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
+        self.assertEqual(self.cli("agy", "account", "remove", "alpha").returncode, 0)
 
         # 3. Reply: author1 falls back alpha->beta; rev1 switches active to gamma & asks REWORK;
         #    author rework & rev2 must BOTH stay on beta (never jump to gamma!).
@@ -441,7 +408,7 @@ class DelegateAgyStickyTests(unittest.TestCase):
         self.assertEqual(meta2.get("reviewAgyAccount"), "beta")
         self.assertEqual(meta2.get("agyAccountSwitch", {}).get("from"), "alpha")
         self.assertEqual(meta2.get("agyAccountSwitch", {}).get("to"), "beta")
-        self.assertEqual(meta2.get("agyAccountSwitch", {}).get("reason"), "额度已耗尽")
+        self.assertEqual(meta2.get("agyAccountSwitch", {}).get("reason"), "原槽位已删除")
 
         # Verify only ONE agy_account_switch event was logged on run2 (no duplicate switch on rework)
         events = [

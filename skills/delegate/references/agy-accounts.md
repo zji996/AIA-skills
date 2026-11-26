@@ -1,12 +1,12 @@
 # agy 多账号管理与从 agy-swap 迁移
 
-`delegate` 内置本地 Antigravity CLI（`agy`）多账号管理，替代闭源且带自更新的 `agy-swap`：纯手工切换、全程文件锁、不做自动轮换、不调任何 Google 内部 HTTP 接口（真实额度仅经官方 `agy -p /usage </dev/null` 获取）、永不打印令牌。
+`delegate` 内置本地 Antigravity CLI（`agy`）多账号管理，替代闭源且带自更新的 `agy-swap`：账号槽位包含全部实号外加 1 个 `auto` 档（默认固定当前号，`use auto` 进入新会话自动选号）、全程文件锁、不调任何 Google 内部 HTTP 接口（真实额度仅经官方 `agy -p /usage </dev/null` 获取）、永不打印令牌。
 
 ## 目录布局与权限
 
 配置根目录遵循 `${XDG_CONFIG_HOME:-$HOME/.config}/delegate/agy-accounts/`（目录 `0700`，元数据与凭据文件 `0600`，写入均用 `O_CREAT|O_EXCL` 临时文件 `0600` → `sync_data` → `rename`）：
 
-- `accounts.json`（`0600`）：槽位索引、当前活跃槽位、各账号最后使用/回存时间（仅存邮箱等元数据，不存令牌）。
+- `accounts.json`（`0600`）：槽位索引、实盘活跃槽位（`active`）、选号模式（`mode`：`fixed` 固定号或 `auto` 自动选号，旧文件缺省该字段视为 `fixed`）、各账号最后使用/回存时间（仅存邮箱等元数据，不存令牌）。
 - `.lock`（`0600`）：所有写操作持排他 `flock` 串行化。
 - `<id>/`（`0700`）：只存 `agy` 本身读写的 6 份凭据文件（存在则保存，均 `0600`）：
   1. `oauth_creds.json` ↔ `~/.gemini/oauth_creds.json`
@@ -20,10 +20,11 @@
 
 | 命令 | 作用 |
 |---|---|
-| `delegate agy account list [--quota] [--json]` | 列出槽位、活跃标记（`*`）、邮箱、文件数、近 5h/7d 用量与真实额度（`--quota` 实时刷新） |
-| `delegate agy account status [--quota] [--json]` | 显示活跃槽位、实盘邮箱（含漂移）、近 1h/5h/7d 用量、真实额度与年龄、手动快照、在跑 `agy` 进程与本地令牌到期时间 |
-| `delegate agy account add [<id>] [--label TEXT] [--overwrite]` | 在临时 `0700` HOME 中交互启动 `agy` 登录，退出后把新凭据收进新槽位并销毁临时 HOME；不影响当前活跃账号 |
-| `delegate agy account use <id> [--force] [--json]` | 排他锁内：回存当前活跃账号被 `agy` 刷新过的最新凭据 → 原子替换为目标槽位（清理目标槽位不存在的残留文件如旧 `credential-user-scope`）；有在跑 `agy` 时也允许切换（在跑进程与已开始的会话继续用原账号，新 run 与 `--fresh` 使用新账号） |
+| `delegate agy account list [--quota\|--quota-if-stale] [--json]` | 列出全部实号槽位与 `auto` 档、当前选中标记（`*`）、邮箱、文件数、近 5h/7d 用量与真实额度（`--quota` 强制刷新；`--quota-if-stale` 按 ≥15 分钟单飞节流刷新） |
+| `delegate agy account status [--quota\|--quota-if-stale] [--json]` | 显示当前选中项（固定号或 `auto`）、实盘槽位与邮箱（含漂移）、各池当前指针与档位、近 1h/5h/7d 用量、真实额度与年龄、手动快照、在跑 `agy` 进程与本地令牌到期时间 |
+| `delegate agy account pick [--model <别名>] [--json]` | 只读干跑（`auto` 与固定号模式均可用）：不建任务、不查询额度（只读缓存），打印此刻新会话会选哪个号、各号各池档位与有效 5h/7d、缓存时刻与理由（固定号模式直接报固定号） |
+| `delegate agy account add [<id>] [--label TEXT] [--overwrite]` | 在临时 `0700` HOME 中交互启动 `agy` 登录，退出后把新凭据收进新槽位并销毁临时 HOME；不影响当前活跃账号（`auto` 为保留名不可用作槽位 ID） |
+| `delegate agy account use <id\|auto> [--force] [--json]` | 选 `auto` 时进入新会话自动选号且不改动实盘 `~/.gemini`（实盘保持选 `auto` 之前的号）；选 `<id>` 时排他锁内回存当前实盘账号被 `agy` 刷新过的最新凭据 → 原子替换为目标槽位、切回固定号模式并同步把各额度池指针设为 `<id>`；有在跑 `agy` 时也允许切换（在跑进程与已开始的会话继续用原账号，新 run 与 `--fresh` 使用新选择） |
 | `delegate agy account note <id> [--weekly PCT] [--five-hour PCT] [--clear] [--json]` | 手动登记「周剩余 %」「五小时剩余 %」快照，结合本地用量推算「每 1% 约多少 token」与按当前速度还能跑多久（仅作提示，不自动换号） |
 | `delegate agy account remove <id> [--force]` | 删除槽位（不碰实盘 `~/.gemini`；删除活跃槽位需 `--force`） |
 | `delegate agy account import-agy-swap [--dry-run] [--source DIR] [--overwrite]` | 从 `~/.gemini/agy-swap/vault.json` 与 `accounts.json` 导入槽位（支持 `go-keyring-base64:` 与纯 JSON），绝不打印令牌，不改原目录 |
@@ -31,17 +32,53 @@
 | `delegate usage [--since 24h\|7d\|all] [--by account\|day\|run\|repo] [--account ID] [--repo PATH] [--all] [--json]` | 按账号槽位 / 日 / run / 仓库汇总本地 `agy` 用量（作者与审查员分列，运行中实时计入或单列「运行中未计」，绝不记邮箱） |
 
 **真实额度、用量与 TUI**：
-- **真实额度**：仅调用 `agy -p /usage </dev/null`（解析「额度池 × 窗口 → 剩余 % + 重置时刻」，未知行原样保留）。全部槽位均在独立临时 `0700` HOME 装载各自槽位凭据运行（不再在真实 `HOME` 跑，避免被常驻交互 `agy` 每小时刷新令牌写回实盘串号），校验实际身份匹配目标槽位后才落盘并写回刷新凭据（不符则拒存并标「身份不符，未更新」；两槽位条目含 `resetAt` 完全相同时在 `list`/`status` 警告）。缓存于 `<state>/agy-quota.json` 并显数据年龄；TUI 打开总览/账号页及之后每 10 分钟刷新（关闭不轮询），也可用 `--quota` 或 `Q` 手动刷新。
+- **真实额度**：仅调用 `agy -p /usage </dev/null`（解析「额度池 × 窗口 → 剩余 % + 重置时刻」，未知行原样保留）。全部槽位均在独立临时 `0700` HOME 装载各自槽位凭据运行（不再在真实 `HOME` 跑，避免被常驻交互 `agy` 每小时刷新令牌写回实盘串号），校验实际身份匹配目标槽位后才落盘并写回刷新凭据（不符则拒存并标「身份不符，未更新」；两槽位条目含 `resetAt` 完全相同时在 `list`/`status` 警告）。缓存于 `<state>/agy-quota.json` 并显数据年龄；CLI 新会话与 TUI 定时刷新共用基于 `fetchedEpoch` ≥15 分钟与跨进程单飞锁（`<state>/agy-quota-refresh.lock`）的入口，仅手动 `--quota` 或 TUI 按 `Q` 强制穿透刷新。
 - **用量与推算**：作者/审查员/返工每轮记录增量 tokens 与活跃槽位 ID（不记邮箱），落 `summary.json` 与 `<state>/agy-usage.jsonl`（运行中实时写 `live-usage.json` 或标「运行中未计」）。真实额度优先于手动 `note`，按近 1h 速率推算每 1% token 与可用时长（仅提醒不自动换号）。
-- **TUI**：`0`/`O` 总览页看额度 `Gauge`、按账号 24h `Sparkline`、用途/模型 `BarChart`（`v` 切换）与近 7 天合入耗时/一轮通过率（80 列降级纯文本）；`6`/`A` 账号页看详情与在跑进程，`Enter`/`u` 切换，`Q` 刷新。
+- **TUI**：`0`/`O` 总览页看额度 `Gauge`、按账号 24h `Sparkline`、用途/模型 `BarChart`（`v` 切换）与近 7 天合入耗时/一轮通过率（80 列降级纯文本）；额度/账号页列出全部实号槽位及 `auto` 行（展示各池当前指针、档位与理由）与在跑进程，按 `u` 切号或选中 `auto`、`Enter` 聚焦详情、`Q` 强制刷新。
 
 ## 设计取舍：运行中可切换、会话粘滞与按进程凭据覆盖层
 
 `use` **允许在有 `agy` 运行时直接切换**：正在跑的进程与已开始的会话继续用原账号（避免同一会话跨账号导致缓存前缀失效），新 run 与 `--fresh` 开的新会话生效新账号。实现依赖三点：
 
-1. **会话粘滞与仅二选一回退**：每个 run（含其审查员会话）在第一轮启动时把所用槽位 ID 记进 `meta.json`（`agyAccount` / `reviewAgyAccount`，不记邮箱）；后续同一会话的每一轮（`reply`、追加、返工、审查补问、`--sync` 续做）沿用钉住的槽位起覆盖层，不看当前活跃账号。只有当钉住的槽位已不可用——被删除、凭据失效/身份校验失败，或现有真实额度快照确认该模型池已耗尽且尚未重置（拿不准时仍沿用钉住的槽位，交由上游报错）——才改用主控手动选定的当前活跃账号（绝不自动挑选第三个账号），同时更新 `meta.json` 并在 `status` / `card` / TUI 显示「本 run 已从 A 换到 B（原因）」。`reply --fresh` 按新会话处理，取当前活跃账号并重新钉住。
-2. **按进程私有凭据覆盖层（防止旧进程令牌刷新覆盖新账号）**：实测 `agy` 在 OAuth 访问令牌到期刷新时会直接截断回写 `~/.gemini/antigravity-cli/antigravity-oauth-token`。因此 `delegate` 启动每个 `agy` 进程前，在 `.lock` 内确定目标槽位（钉住槽位或活跃槽位）并建一个 `0700` 临时 `HOME` 覆盖层：只把该槽位的 6 份凭据文件以 `0600` 独立拷贝进去，`$HOME`、`~/.gemini`（含会话 `conversations/`、`brain/`、`settings.json`、`log/`）与 `~/.config` 的其余条目全部软链回真实目录。进程退出后，在 `.lock` 内把刷新过的有效凭据写回**它自己的槽位**（仅当该账号仍为活跃且未漂移时同步回实盘 `~/.gemini`；钉住的非活跃槽位绝不碰实盘 `~/.gemini`），随后销毁临时目录；即使运行期间切了号，旧进程绝不会覆盖新账号的实盘凭据。
-3. **仅手工切换，无 `--next-start` / 无自动轮换**：仍通过 `/proc/<pid>/environ`（含 `DELEGATE_AGY_REAL_HOME`）列出同机在跑 `agy` 进程并在 CLI/TUI 中提示「在跑的进程与已开始的会话继续用原账号，新 run 用新账号」；`untracked_live_credentials` 与 `--force` 保护保持不变。注：非 `delegate` 启动的交互式 `agy` 仍直读真实 `HOME`，若其跨过 1 小时令牌刷新周期，可能把自身刷新令牌写回实盘 `~/.gemini/antigravity-cli/antigravity-oauth-token`，但 `delegate` 新运行直接从目标槽位建覆盖层并校验邮箱，不会被串号污染。
+1. **会话粘滞与新会话边界**：每个 run（含其审查员会话）在第一轮启动时把所用槽位 ID 记进 `meta.json`（`agyAccount` / `reviewAgyAccount`，不记邮箱）；后续同一会话的每一轮（常规 `reply`、追加、返工、审查续审、`--sync` 续做）严格沿用钉住的槽位起覆盖层，即使缓存额度为 0% 也不静默换号续原会话（仅原槽位被删或本地凭据/身份损坏时回退活跃号）。`start`、`reply --fresh`、模型 `escalate`、探路、非续接审查与额外审查员均作为新会话选号。
+2. **按进程私有凭据覆盖层（防止旧进程令牌刷新覆盖新账号）**：实测 `agy` 在 OAuth 访问令牌到期刷新时会直接截断回写 `~/.gemini/antigravity-cli/antigravity-oauth-token`。因此 `delegate` 启动每个 `agy` 进程前，在 `.lock` 内确定目标槽位（钉住槽位或新会话选定槽位）并建一个 `0700` 临时 `HOME` 覆盖层：只把该槽位的 6 份凭据文件以 `0600` 独立拷贝进去，`$HOME`、`~/.gemini`（含会话 `conversations/`、`brain/`、`settings.json`、`log/`）与 `~/.config` 的其余条目全部软链回真实目录。进程退出后，在 `.lock` 内把刷新过的有效凭据写回**它自己的槽位**（仅当该账号仍为活跃且未漂移时同步回实盘 `~/.gemini`；非活跃槽位绝不碰实盘 `~/.gemini`），随后销毁临时目录；即使运行期间切了号，旧进程绝不会覆盖新账号的实盘凭据。
+3. **只读探活不触发自动选号**：`probe` 探活走 `prepare_active()` 仅测当前活跃号（`AuthRefresh` 重探则测该 run 钉住的槽位），绝不触发自动选号或改池指针。
+
+## 新会话自动选号（`auto` 档）
+
+是否启用自动选号**只由当前选中项是否为 `auto` 决定**（存在 `accounts.json` 的 `mode` 字段，旧文件无此字段视为固定号模式；不再使用 `agy.autoSwitch.enabled`，若在配置中填写 `enabled` 将直接报错）：
+
+- `delegate agy account use auto`：进入自动选号模式，**不改动实盘 `~/.gemini`**（实盘保持选 `auto` 之前的账号）；仅当本机存在 ≥2 个可用槽位时生效，单槽位时沿用唯一槽位。
+- `delegate agy account use <id>`：切回固定号模式并把实盘切换为 `<id>`，新会话始终使用 `<id>` 不自动切（同时把各池指针同步为 `<id>`，便于下次再选 `auto` 时从此号起步）。
+- TUI 额度/账号页同样多一行 `auto`，展示各模型池当前指针、档位与理由，可像普通槽位一样按 `u` 选中；`account list` / `account status` 也会列出 `auto` 行并以 `*` 标出当前选中项。
+
+阈值、刷新间隔与并发预扣参数仅可在用户配置 `~/.config/delegate/config.json` 中调整（仓库 `.delegate.json` 出现 `agy.autoSwitch` 直接报错）：
+
+```json
+{
+  "agy": {
+    "autoSwitch": {
+      "fiveHourMinPct": 30,
+      "weeklyMinPct": 30,
+      "refreshMinutes": 15,
+      "perRunReservePct": 5
+    }
+  }
+}
+```
+
+- **不改实盘凭据，按池独立指针**：`auto` 模式下仅决定每次新会话的凭据覆盖层，绝不改动 `~/.gemini` 实盘凭据。每个模型池（`gemini` / `claude_gpt`）在 `<state>/agy-auto-switch.json` 持久化各自当前号指针（初值 = 实盘活跃号）；手动执行 `delegate agy account use <id>` 会切回固定号并把各池指针同步为 `<id>`。未知模型沿用实盘活跃号（避开 0% 槽位）且不覆写池指针。
+- **三档严格升档滞回 + 并发预扣**：
+  - 有效 5h = `缓存 5h − perRunReservePct × 该号该池当前在跑写手数`（防 15 分钟盲窗内多路并发挤爆余量）。
+  - **绿档**（`有效 5h ≥ fiveHourMinPct && 7d ≥ weeklyMinPct`，或无有效缓存/已重置未知）> **黄档**（`5h ≥ 5% && 7d ≥ 2%` 且无被动耗尽标记）> **红档**（其余）。
+  - **仅当另一健康号档位严格更高时才切换池指针**；同档（含双绿、双黄）绝不切换，避免来回乒乓；双红时仅在另一号满足 `5h > 0` 且 `min(5h, 7d)` 严格更高时切换。
+  - 过期很久的数据（5h `> 2h`、7d `> 24h`，非被动标记）降级为未知以维持当前号；`resetAt` 加 60 秒时钟偏差缓冲后视作未知（不硬赋 100%）；401 登录失效与 `identityMismatch` 槽位自动剔除候选，直至凭据更新或 `/usage` 恢复。
+- **15 分钟单飞刷新与被动耗尽标记**：`auto` 模式下新会话仅在当前池指针缓存过期或非绿档时通过 `<state>/agy-quota-refresh.lock` 单飞刷新过期槽位（查询失败保留旧缓存与旧 `fetchedEpoch` 并进入 5 分钟退避）。运行期收到明确额度耗尽报错（不含瞬时 `429` / RPM 限流）时，直接向缓存软标该号该池 5h 为 `0%`（`source: "passive_error"`，无已知 `resetAt` 时合成 `now + 15m`，不覆盖 `weekly` 与历史）。
+- **中途耗尽兜底（按角色，仅 `auto` 模式）**：
+  - **写手**（每 run 至多 1 次）：同进程内以全新会话换到另一健康号继续（交接提示包含原 `prompt.md`、已消费的 `appends.json` 追加消息、返工轮审查意见及已改文件索引，嘱先看 `git status` / `git diff` 续改，不内联大 diff；`summary.json["tokens"]` 按会话分段累计不丢前半程用量）。
+  - **只读任务（探路等）**：以原 `prompt.md` 换号重跑 1 次。
+  - **审查员**：不走写手接力；主审遇到明确额度耗尽且另一号非红档时，在触发 `review.fallback` 前用 `fork_target = None` 完整审查模板换号重审 1 次。
+- **验证与可见性**：用 `delegate agy account pick [--model <别名>] [--json]` 只读查看当前模式下新会话选号结果与各号各池档位（固定号模式直接报固定号）；换指针写 `agy_account_auto` 事件、中途接力/重审写 `agy_account_handoff` 事件，在 `status` / 卡片 / TUI 各渲染一行（均不进 Stop hook、不提醒所有者、不打印邮箱）。
 
 ## `lan-agent-sync` 调整参考
 

@@ -1900,19 +1900,10 @@ fn window_json(st: &BucketStats, uncounted: usize) -> Value {
 }
 
 fn model_matches_pool(model: &str, pool: &str) -> bool {
-    let p = pool.to_ascii_lowercase();
-    let m = model.to_ascii_lowercase();
-    if p.contains("gemini") {
-        m.contains("gemini") || m.contains("neon") || m.contains("flash") || m.contains("pro")
-    } else if p.contains("claude") || p.contains("gpt") {
-        m.contains("claude")
-            || m.contains("gpt")
-            || m.contains("sonnet")
-            || m.contains("opus")
-            || m.contains("codex")
-    } else {
-        true
+    if crate::agy_accounts::classify_quota_pool_name(pool).is_none() {
+        return true;
     }
+    crate::agy_accounts::model_matches_pool(model, pool)
 }
 
 fn parse_real_quota_points_for_pool(acct_quota: &Value, pool: Option<&str>) -> Vec<QuotaNotePoint> {

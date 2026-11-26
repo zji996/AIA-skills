@@ -272,7 +272,8 @@ fn fresh_quota_cache_age_secs(state: &AgyAccountsState, max_age_secs: u64) -> Op
 }
 
 enum QuotaCmd {
-    RefreshAll,
+    RefreshAuto,
+    RefreshForce,
     RefreshLinesOnly,
     Shutdown,
 }
@@ -294,12 +295,22 @@ fn spawn_quota_worker(
     let handle = thread::spawn(move || {
         while let Ok(cmd) = rx_cmd.recv() {
             match cmd {
-                QuotaCmd::RefreshAll => {
+                QuotaCmd::RefreshAuto => {
                     let lres = client.fetch_line_stats();
                     if tx_res.send(QuotaEvent::Lines(lres)).is_err() {
                         break;
                     }
-                    let qres = client.refresh_agy_quota();
+                    let qres = client.refresh_agy_quota(false);
+                    if tx_res.send(QuotaEvent::Quota(qres)).is_err() {
+                        break;
+                    }
+                }
+                QuotaCmd::RefreshForce => {
+                    let lres = client.fetch_line_stats();
+                    if tx_res.send(QuotaEvent::Lines(lres)).is_err() {
+                        break;
+                    }
+                    let qres = client.refresh_agy_quota(true);
                     if tx_res.send(QuotaEvent::Quota(qres)).is_err() {
                         break;
                     }
@@ -639,7 +650,7 @@ fn main() {
 
     let refresh_every = Duration::from_secs(cli.interval);
     let idle_heartbeat = Duration::from_secs(cli.interval.max(60));
-    let quota_refresh_every = Duration::from_secs(600);
+    let default_quota_refresh_secs: u64 = 900;
     let stop_watcher = Arc::new(AtomicBool::new(false));
     let (rx_notify, inotify_active) = spawn_state_watcher(stop_watcher.clone());
     let mut last_refresh = Instant::now();
@@ -652,10 +663,17 @@ fn main() {
     let mut inflight_diffs: HashSet<String> = HashSet::new();
 
     loop {
-        // Trigger real quota refresh (`agy -p /usage`) and line stats (`delegate lines --json`)
-        // when on Overview or Accounts tab: on first entry, reuse cached quota if updated within
-        // `quota_refresh_every`; otherwise refresh both immediately and every 10 minutes.
-        // Entering Overview also refreshes `delegate lines --json` (cached by HEAD in state dir).
+        // Trigger real quota refresh (`agy -p /usage`) via singleflight `--quota-if-stale`
+        // (aligned to `max(15m, autoSwitch.refreshMinutes)`) and line stats (`delegate lines --json`)
+        // when on Overview or Accounts tab. Only manual `Q` forces an immediate query.
+        let quota_refresh_every = Duration::from_secs(
+            app.snapshot
+                .agy_accounts
+                .auto_switch
+                .refresh_minutes
+                .saturating_mul(60)
+                .max(default_quota_refresh_secs),
+        );
         let on_overview = app.tab == ViewTab::Overview;
         let entered_overview = on_overview && !was_on_overview;
         was_on_overview = on_overview;
@@ -687,7 +705,7 @@ fn main() {
                 app.dirty = true;
                 last_quota_refresh = Some(Instant::now());
                 triggered_all = true;
-                let _ = tx_quota.send(QuotaCmd::RefreshAll);
+                let _ = tx_quota.send(QuotaCmd::RefreshAuto);
             }
         }
         if entered_overview && !triggered_all && !lines_in_flight {
@@ -910,7 +928,7 @@ fn main() {
                                     lines_in_flight = true;
                                     app.lines_refreshing = true;
                                     last_quota_refresh = Some(Instant::now());
-                                    let _ = tx_quota.send(QuotaCmd::RefreshAll);
+                                    let _ = tx_quota.send(QuotaCmd::RefreshForce);
                                     // Refreshes account quota via `agy -p /usage` and line stats via `delegate lines --json`.
                                     app.set_toast("正在刷新额度与代码改动…");
                                 } else {

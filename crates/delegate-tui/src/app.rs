@@ -288,7 +288,7 @@ pub struct App {
     pub filtered_candidates: Vec<usize>,
     pub selected_candidate: Option<usize>,
     pub candidates_scroll: usize,
-    pub filtered_accounts: Vec<usize>,
+    pub filtered_accounts: Vec<AccountRow>,
     pub selected_account: Option<usize>,
     pub accounts_scroll: usize,
     pub revealed_accounts: HashSet<String>,
@@ -1115,17 +1115,40 @@ impl App {
             self.selected_candidate = Some(0);
         }
 
-        // Rebuild filtered agy accounts list preserving selection by account id.
-        let prev_acct_id = self.selected_account_item().map(|a| a.id.clone());
-        self.filtered_accounts = self
+        // Rebuild filtered agy accounts list preserving selection by account id (or `"auto"`).
+        let prev_acct_id: Option<String> = match self.selected_account_row() {
+            Some(AccountRow::Auto) => Some("auto".to_string()),
+            Some(AccountRow::Slot(idx)) => self
+                .snapshot
+                .agy_accounts
+                .accounts
+                .get(idx)
+                .map(|a| a.id.clone()),
+            None => None,
+        };
+        let mut acct_rows: Vec<AccountRow> = self
             .snapshot
             .agy_accounts
             .accounts
             .iter()
             .enumerate()
             .filter(|(_, a)| a.matches_filter(&query))
-            .map(|(i, _)| i)
+            .map(|(i, _)| AccountRow::Slot(i))
             .collect();
+        if !self.snapshot.agy_accounts.accounts.is_empty()
+            && (query.is_empty()
+                || "auto 自动选号".contains(&query)
+                || self
+                    .snapshot
+                    .agy_accounts
+                    .auto_switch
+                    .pool_summary
+                    .iter()
+                    .any(|p| p.selected.to_ascii_lowercase().contains(&query)))
+        {
+            acct_rows.push(AccountRow::Auto);
+        }
+        self.filtered_accounts = acct_rows;
         if self.filtered_accounts.is_empty() {
             self.selected_account = None;
             self.accounts_scroll = 0;
@@ -1133,14 +1156,26 @@ impl App {
             self.selected_account = self
                 .filtered_accounts
                 .iter()
-                .position(|&idx| self.snapshot.agy_accounts.accounts[idx].id == *aid)
+                .position(|row| match row {
+                    AccountRow::Auto => aid == "auto",
+                    AccountRow::Slot(idx) => self.snapshot.agy_accounts.accounts[*idx].id == *aid,
+                })
+                .or(Some(0));
+        } else if self.snapshot.agy_accounts.auto_switch.enabled {
+            self.selected_account = self
+                .filtered_accounts
+                .iter()
+                .position(|row| matches!(row, AccountRow::Auto))
                 .or(Some(0));
         } else {
             // Default select active account if present, else first
             self.selected_account = self
                 .filtered_accounts
                 .iter()
-                .position(|&idx| self.snapshot.agy_accounts.accounts[idx].active)
+                .position(|row| match row {
+                    AccountRow::Slot(idx) => self.snapshot.agy_accounts.accounts[*idx].active,
+                    AccountRow::Auto => false,
+                })
                 .or(Some(0));
         }
 
@@ -2085,10 +2120,16 @@ impl App {
         self.snapshot.candidates.get(idx)
     }
 
-    pub fn selected_account_item(&self) -> Option<&AgyAccountItem> {
+    pub fn selected_account_row(&self) -> Option<AccountRow> {
         let pos = self.selected_account?;
-        let &idx = self.filtered_accounts.get(pos)?;
-        self.snapshot.agy_accounts.accounts.get(idx)
+        self.filtered_accounts.get(pos).copied()
+    }
+
+    pub fn selected_account_item(&self) -> Option<&AgyAccountItem> {
+        match self.selected_account_row()? {
+            AccountRow::Slot(idx) => self.snapshot.agy_accounts.accounts.get(idx),
+            AccountRow::Auto => None,
+        }
     }
 
     pub fn is_account_revealed(&self, id: &str) -> bool {
@@ -2121,19 +2162,44 @@ impl App {
             self.set_toast("正在切换账号，请稍候…");
             return false;
         }
-        let Some(acct) = self.selected_account_item().cloned() else {
-            self.set_toast("当前没有可切换的 agy 账号");
-            return false;
+        let is_auto_now = self.snapshot.agy_accounts.auto_switch.enabled;
+        let current_label = if is_auto_now {
+            Some("auto".to_string())
+        } else {
+            self.snapshot.agy_accounts.active.clone()
         };
-        self.overlay = Overlay::ConfirmAccountSwitch {
-            id: acct.id,
-            email: acct.email,
-            current_active: self.snapshot.agy_accounts.active.clone(),
-            is_already_active: acct.active,
-            running_count: self.snapshot.agy_accounts.running_agy.len(),
-        };
-        self.dirty = true;
-        true
+        match self.selected_account_row() {
+            Some(AccountRow::Auto) => {
+                self.overlay = Overlay::ConfirmAccountSwitch {
+                    id: "auto".to_string(),
+                    email: String::new(),
+                    current_active: current_label,
+                    is_already_active: is_auto_now,
+                    running_count: self.snapshot.agy_accounts.running_agy.len(),
+                };
+                self.dirty = true;
+                true
+            }
+            Some(AccountRow::Slot(idx)) => {
+                let Some(acct) = self.snapshot.agy_accounts.accounts.get(idx).cloned() else {
+                    self.set_toast("当前没有可切换的 agy 账号");
+                    return false;
+                };
+                self.overlay = Overlay::ConfirmAccountSwitch {
+                    id: acct.id,
+                    email: acct.email,
+                    current_active: current_label,
+                    is_already_active: acct.active && !is_auto_now,
+                    running_count: self.snapshot.agy_accounts.running_agy.len(),
+                };
+                self.dirty = true;
+                true
+            }
+            None => {
+                self.set_toast("当前没有可切换的 agy 账号");
+                false
+            }
+        }
     }
 
     pub fn move_merge_selection(&mut self, delta: isize) -> bool {
@@ -2716,18 +2782,28 @@ impl App {
                         AppAction::None
                     }
                 }
-                KeyCode::Char('y') => {
-                    if let Some(a) = self.selected_account_item() {
+                KeyCode::Char('y') => match self.selected_account_row() {
+                    Some(AccountRow::Auto) => {
                         let cmd = format!(
-                            "{} agy account use {}",
+                            "{} agy account use auto",
                             shell_quote(&self.delegate_bin.to_string_lossy()),
-                            shell_quote(&a.id)
                         );
                         AppAction::CopyClipboard(cmd)
-                    } else {
-                        AppAction::None
                     }
-                }
+                    Some(AccountRow::Slot(idx)) => {
+                        if let Some(a) = self.snapshot.agy_accounts.accounts.get(idx) {
+                            let cmd = format!(
+                                "{} agy account use {}",
+                                shell_quote(&self.delegate_bin.to_string_lossy()),
+                                shell_quote(&a.id)
+                            );
+                            AppAction::CopyClipboard(cmd)
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    None => AppAction::None,
+                },
                 KeyCode::Char('Q') => AppAction::RefreshQuota,
                 KeyCode::Char('r') => AppAction::Refresh,
                 KeyCode::Char('/') => {

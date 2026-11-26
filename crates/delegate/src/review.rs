@@ -767,15 +767,25 @@ fn format_quota_pct_label(pct: Option<f64>) -> String {
     }
 }
 
-/// Check cached `agy` Claude/GPT pool quota against `review.extra.minQuota` before launching
+/// Check cached `agy` pool quota against `review.extra.minQuota` before launching
 /// the supplementary reviewer. Never runs a subprocess or refreshes quota; reads cache only.
 pub fn check_extra_quota(
     extra_cfg: &Value,
     quota_cache: &Value,
     active_account: Option<&str>,
 ) -> ExtraQuotaDecision {
+    check_extra_quota_at(extra_cfg, quota_cache, active_account, epoch() as i64)
+}
+
+pub fn check_extra_quota_at(
+    extra_cfg: &Value,
+    quota_cache: &Value,
+    active_account: Option<&str>,
+    now_ep: i64,
+) -> ExtraQuotaDecision {
     let mq = &extra_cfg["minQuota"];
-    let is_agy = crate::agy::is_agy(s(extra_cfg, "model"));
+    let extra_model = s(extra_cfg, "model");
+    let is_agy = crate::agy::is_agy(extra_model);
     let min_5h = mq["fiveHour"]
         .as_f64()
         .or_else(|| is_agy.then_some(DEFAULT_EXTRA_MIN_FIVE_HOUR_PCT));
@@ -814,16 +824,38 @@ pub fn check_extra_quota(
         return ExtraQuotaDecision::Allow;
     };
 
+    let target_pool = crate::agy_accounts::classify_model_pool(extra_model)
+        .unwrap_or(crate::agy_accounts::QuotaPool::ClaudeGpt);
+    let acct_fetched_ep = acct["fetchedEpoch"].as_i64().unwrap_or(0);
     let mut five_hour: Option<f64> = None;
     let mut weekly: Option<f64> = None;
     for entry in acct["entries"].as_array().into_iter().flatten() {
-        let pool_low = s(entry, "pool").to_ascii_lowercase();
-        if !pool_low.contains("claude") && !pool_low.contains("gpt") {
+        if crate::agy_accounts::classify_quota_pool_name(s(entry, "pool")) != Some(target_pool) {
             continue;
         }
-        let Some(pct) = entry["remainingPct"].as_f64() else {
+        let Some(pct) = entry["remainingPct"].as_f64().filter(|v| v.is_finite()) else {
             continue;
         };
+        let is_passive = s(entry, "source") == "passive_error";
+        let reset_at = s(entry, "resetAt");
+        let reset_ep = (!reset_at.is_empty()).then(|| iso_epoch(reset_at)).flatten();
+        if let Some(rep) = reset_ep {
+            if now_ep >= rep + crate::agy_accounts::RESET_AT_BUFFER_SECS {
+                continue;
+            }
+        }
+        let entry_ep = entry["fetchedEpoch"]
+            .as_i64()
+            .filter(|&e| e > 0)
+            .unwrap_or(acct_fetched_ep);
+        if !is_passive && entry_ep > 0 {
+            let age = now_ep - entry_ep;
+            match s(entry, "window") {
+                "fiveHour" if age > crate::agy_accounts::FIVE_HOUR_STALE_SECS => continue,
+                "weekly" if age > crate::agy_accounts::WEEKLY_STALE_SECS => continue,
+                _ => {}
+            }
+        }
         match s(entry, "window") {
             "fiveHour" => five_hour = Some(five_hour.map_or(pct, |cur| cur.min(pct))),
             "weekly" => weekly = Some(weekly.map_or(pct, |cur| cur.min(pct))),
@@ -836,8 +868,12 @@ pub fn check_extra_quota(
     let low_5h = min_5h.is_some_and(|th| five_hour.is_some_and(|v| v < th));
     let low_wk = min_wk.is_some_and(|th| weekly.is_some_and(|v| v < th));
     if low_5h || low_wk {
+        let pool_name = match target_pool {
+            crate::agy_accounts::QuotaPool::ClaudeGpt => "Claude",
+            crate::agy_accounts::QuotaPool::Gemini => "Gemini",
+        };
         let reason = format!(
-            "补充审查跳过：Claude 池剩余 5 小时 {} / 本周 {}",
+            "补充审查跳过：{pool_name} 池剩余 5 小时 {} / 本周 {}",
             format_quota_pct_label(five_hour),
             format_quota_pct_label(weekly),
         );
@@ -848,6 +884,43 @@ pub fn check_extra_quota(
         }
     } else {
         ExtraQuotaDecision::Allow
+    }
+}
+
+fn reviewer_quota_exhausted_error(
+    res: &Res<(String, String)>,
+    round_dir: &Path,
+) -> Option<String> {
+    let mut diag: Vec<String> = Vec::new();
+    match res {
+        Ok((outcome, _)) if outcome == "ok" || outcome == "cancelled" => return None,
+        Ok((_, text)) => {
+            if !text.trim().is_empty() {
+                diag.push(text.clone());
+            }
+        }
+        Err(err) => {
+            diag.push(err.clone());
+        }
+    }
+    for ev in crate::runs::events(round_dir).into_iter().rev() {
+        if s(&ev, "e") == "turn_error" {
+            let det = s(&ev, "detail");
+            if !det.is_empty() {
+                diag.push(det.to_string());
+                break;
+            }
+        }
+    }
+    let stderr_txt = read(round_dir.join("stderr.log"));
+    if !stderr_txt.trim().is_empty() {
+        diag.push(stderr_txt);
+    }
+    let joined = diag.join("\n");
+    if crate::agy_accounts::is_quota_exhausted_error(&joined) {
+        Some(clip(joined.trim(), 300))
+    } else {
+        None
     }
 }
 
@@ -3582,7 +3655,7 @@ pub fn run_accept_and_review(
         let review_prompt_file = round_dir.join("prompt.md");
         write(&review_prompt_file, &prompt_body)?;
 
-        let review_meta = build_reviewer_meta(
+        let mut review_meta = build_reviewer_meta(
             meta,
             &active_review_cfg,
             &round_dir,
@@ -3590,6 +3663,9 @@ pub fn run_accept_and_review(
             &review_prompt_file,
             fork_target.as_deref(),
         );
+        if fork_target.is_none() {
+            review_meta["freshAgySession"] = json!(true);
+        }
         crate::deny::prepare(&review_meta, &round_dir)?;
 
         // Evaluate optional supplementary reviewer (`review.extra`) triggers + quota cache.
@@ -3642,8 +3718,8 @@ pub fn run_accept_and_review(
                         }
                     } else {
                         let quota_cache = crate::agy_accounts::load_quota_cache();
-                        let active_acct = crate::agy_accounts::active_account_id();
-                        match check_extra_quota(extra_cfg, &quota_cache, active_acct.as_deref()) {
+                        let pool_acct = crate::agy_accounts::current_account_for_model(&em_model);
+                        match check_extra_quota(extra_cfg, &quota_cache, pool_acct.as_deref()) {
                             ExtraQuotaDecision::Skip {
                                 five_hour_pct,
                                 weekly_pct,
@@ -3890,6 +3966,150 @@ pub fn run_accept_and_review(
                 rev_cancel.clone(),
                 true,
             );
+            // Reviewers NEVER use writer handoff; if the primary agy reviewer hits hard quota
+            // exhaustion and another non-Red account is available, retry ONCE on the other account
+            // with the FULL review template (`fork_target = None`) before considering `review.fallback`.
+            if is_agy_reviewer
+                && !rev_cancel.load(Ordering::SeqCst)
+                && !lane::stopped()
+                && crate::agy_accounts::is_auto_mode_enabled()
+                && reviewer_quota_exhausted_error(&attempt.res, &active_exec_dir).is_some()
+            {
+                let rev_model = s(&active_review_cfg, "model").to_string();
+                let from_acct = {
+                    let owner_disk = json(run.join("meta.json"));
+                    s(&owner_disk, "reviewAgyAccount").to_string()
+                };
+                if !from_acct.is_empty() {
+                    let _ = crate::agy_accounts::mark_slot_quota_exhausted_passive(
+                        &from_acct,
+                        &rev_model,
+                        epoch() as i64,
+                    );
+                    if let Some(to_acct) = crate::agy_accounts::select_handoff_target(
+                        &from_acct,
+                        &rev_model,
+                        None,
+                        true,
+                    ) {
+                        if let Some(pool) = crate::agy_accounts::classify_model_pool(&rev_model) {
+                            let _ = crate::agy_accounts::set_pool_current_in(
+                                &state_dir(),
+                                pool,
+                                &to_acct,
+                            );
+                        }
+                        let retry_dir = round_dir.join("acct-retry");
+                        if fs::create_dir_all(&retry_dir).is_ok() {
+                            let retry_workdir_note = format_review_workdir_note(
+                                use_ro_workspace,
+                                &reviewer_workdir,
+                                prev_review_workdir.as_deref(),
+                                false,
+                            );
+                            let retry_prompt_file = if fork_target.is_some() {
+                                let full_body = if incremental {
+                                    format!(
+                                        "请作为独立只读审查员进行续审（已提供上下文、上一轮审查结论原文与本轮增量 diff）。\n\
+                                         {retry_workdir_note}\
+                                         {incremental_rule}\n\
+                                         输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`。\n\n\
+                                         ## 审查要点（{rubric_source}）\n\n\
+                                         {}\n\n\
+                                         ## 任务说明\n\n\
+                                         {}\n\n\
+                                         {prev_verdict_section}## 本轮增量 diff\n\n\
+                                         {diff_section}\n",
+                                        rubric_text.trim(),
+                                        task_brief.trim(),
+                                    )
+                                } else {
+                                    format!(
+                                        "请作为独立只读审查员审查以下写入任务的交付结果。\n\
+                                         {retry_workdir_note}\
+                                         严格遵守：不修改任何文件，不委派子任务；输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`（无前缀、无 Markdown 修饰）。\n\n\
+                                         ## 审查要点（{rubric_source}）\n\n\
+                                         {}\n\n\
+                                         ## 任务说明\n\n\
+                                         {}\n\n\
+                                         ## 本链净 diff（diff --total）\n\n\
+                                         {diff_section}\n",
+                                        rubric_text.trim(),
+                                        task_brief.trim(),
+                                    )
+                                };
+                                let p = retry_dir.join("prompt.md");
+                                let _ = write(&p, &full_body);
+                                p
+                            } else {
+                                review_prompt_file.clone()
+                            };
+                            let reason = "审查中额度耗尽，完整模板换号重审".to_string();
+                            let at = iso();
+                            let pool_key = crate::agy_accounts::classify_model_pool(&rev_model)
+                                .map(|p| p.key().to_string());
+                            let mut sw_record = json!({
+                                "kind": "handoff",
+                                "from": from_acct,
+                                "to": to_acct,
+                                "reason": reason,
+                                "at": at,
+                            });
+                            if let Some(ref pk) = pool_key {
+                                sw_record["pool"] = json!(pk);
+                            }
+                            let mut owner_disk = json(run.join("meta.json"));
+                            if owner_disk.is_object() {
+                                owner_disk["reviewAgyAccountSwitch"] = sw_record;
+                                let _ = write_json(run.join("meta.json"), &owner_disk);
+                            }
+                            let mut ev_payload = json!({
+                                "role": "reviewer",
+                                "mode": "review",
+                                "from": from_acct,
+                                "to": to_acct,
+                                "model": rev_model,
+                                "reason": reason,
+                            });
+                            if let Some(ref pk) = pool_key {
+                                ev_payload["pool"] = json!(pk);
+                            }
+                            let mut run_ev = ev_payload.clone();
+                            run_ev["e"] = json!("agy_account_handoff");
+                            run_ev["run"] = json!(&run_id);
+                            supervise::log_event(run, run_ev);
+                            events::emit(&run_id, &repo, "agy_account_handoff", ev_payload);
+
+                            let mut retry_meta = build_reviewer_meta(
+                                meta,
+                                &active_review_cfg,
+                                &retry_dir,
+                                &reviewer_workdir,
+                                &retry_prompt_file,
+                                None,
+                            );
+                            retry_meta["freshAgySession"] = json!(true);
+                            retry_meta["preferredAgyAccount"] = json!(&to_acct);
+                            retry_meta["isAgyHandoff"] = json!(true);
+                            let _ = crate::deny::prepare(&retry_meta, &retry_dir);
+                            active_exec_dir = retry_dir;
+                            active_exec_meta = retry_meta;
+                            attempt = run_reviewer_with_format_retry(
+                                &active_exec_meta,
+                                &active_exec_dir,
+                                rev_holder.clone(),
+                                grace.clone(),
+                                rev_cancel.clone(),
+                                true,
+                            );
+                            let retry_usage = active_exec_dir.join("usage.json");
+                            if retry_usage.is_file() {
+                                let _ = fs::copy(&retry_usage, round_dir.join("usage.json"));
+                            }
+                        }
+                    }
+                }
+            }
             if !rev_cancel.load(Ordering::SeqCst)
                 && !lane::stopped()
                 && active_fallback.is_none()
@@ -5083,6 +5303,14 @@ pub fn run_accept_and_review(
         );
         (author_verdict, author_answer, next_attempts) =
             (resumed.verdict, resumed.answer, resumed.attempts);
+        (author_verdict, author_answer, next_attempts) = supervise::try_agy_exhaustion_handoff(
+            meta,
+            run,
+            (author_verdict, author_answer, next_attempts),
+            Some(&verdict_file),
+            holder.clone(),
+            grace.clone(),
+        );
         (author_verdict, author_answer, next_attempts) = supervise::resume_stalled(
             &author_next,
             run,
@@ -5761,6 +5989,32 @@ mod tests {
         assert!(extra_verdict_disagrees("PASS", Some("NEEDS_CONTROLLER")));
         assert!(extra_verdict_disagrees("REWORK", Some("PASS")));
         assert!(!extra_verdict_disagrees("PASS", None));
+
+        // resetAt + 60s buffer & staleness in check_extra_quota_at:
+        let reset_str = "2026-11-27T12:00:00Z";
+        let reset_ep = iso_epoch(reset_str).unwrap();
+        let cache_with_reset = json!({
+            "accounts": {
+                "acct1": {
+                    "ok": true,
+                    "fetchedEpoch": reset_ep - 600,
+                    "entries": [
+                        {"pool": "Claude and GPT models", "window": "fiveHour", "remainingPct": 10.0, "resetAt": reset_str},
+                        {"pool": "Claude and GPT models", "window": "weekly", "remainingPct": 80.0, "resetAt": "2026-12-04T00:00:00Z"}
+                    ]
+                }
+            }
+        });
+        // Within 60s buffer -> still skips!
+        assert!(matches!(
+            check_extra_quota_at(&extra_cfg, &cache_with_reset, Some("acct1"), reset_ep + 30),
+            ExtraQuotaDecision::Skip { .. }
+        ));
+        // Past resetAt + 60s -> 5h reset (unknown), weekly 80% >= 30% -> allows!
+        assert_eq!(
+            check_extra_quota_at(&extra_cfg, &cache_with_reset, Some("acct1"), reset_ep + 60),
+            ExtraQuotaDecision::Allow
+        );
     }
 
     #[test]

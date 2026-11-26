@@ -142,15 +142,28 @@ fn render_quota_accounts_pane(
     show_procs: bool,
 ) {
     let focused = app.focus == FocusPane::List && matches!(app.overlay, Overlay::None);
-    let total = app.filtered_accounts.len();
+    let slot_count = app
+        .filtered_accounts
+        .iter()
+        .filter(|r| matches!(r, AccountRow::Slot(_)))
+        .count();
+    let has_auto = app
+        .filtered_accounts
+        .iter()
+        .any(|r| matches!(r, AccountRow::Auto));
+    let count_lbl = if has_auto {
+        format!("{slot_count} + auto")
+    } else {
+        format!("{slot_count}")
+    };
     let title_text = if app.filter.is_empty() {
         if area.width >= 56 {
-            format!(" agy 账号槽位 ({total} · 只提醒不自动换号 · 按 u 切号) ")
+            format!(" agy 账号槽位 ({count_lbl} · 按 u 切号/选 auto) ")
         } else {
-            format!(" agy 账号 ({total} · 按 u 切号) ")
+            format!(" agy 账号 ({count_lbl} · 按 u 切号) ")
         }
     } else {
-        format!(" agy 账号 ({total}) · 过滤 ")
+        format!(" agy 账号 ({count_lbl}) · 过滤 ")
     };
     let title = Line::from(Span::styled(
         truncate(&title_text, area.width.saturating_sub(2) as usize),
@@ -246,14 +259,14 @@ fn render_quota_accounts_pane(
         lines.push(Line::from(Span::styled(truncate(&hdr, iw), muted())));
     }
 
-    for (pos, &acct_idx) in app
+    let is_auto_mode = app.snapshot.agy_accounts.auto_switch.enabled;
+    for (pos, &row_kind) in app
         .filtered_accounts
         .iter()
         .enumerate()
         .skip(app.accounts_scroll)
         .take(view_h)
     {
-        let acct = &app.snapshot.agy_accounts.accounts[acct_idx];
         let selected = app.selected_account == Some(pos);
         let stripe = if selected {
             Span::styled(
@@ -265,12 +278,72 @@ fn render_quota_accounts_pane(
         } else {
             Span::raw("  ")
         };
-        let (badge_txt, badge_style) = if acct.active {
+        let acct_idx = match row_kind {
+            AccountRow::Auto => {
+                let (badge_txt, badge_style) = if is_auto_mode {
+                    (
+                        pad_right("★ 自动", status_w),
+                        Style::default()
+                            .fg(STATUS_RUNNING)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    (pad_right("  自动", status_w), muted())
+                };
+                let asw = &app.snapshot.agy_accounts.auto_switch;
+                let summary_txt = if !asw.pool_summary.is_empty() {
+                    asw.pool_summary
+                        .iter()
+                        .map(|p| {
+                            let target = if !p.selected.is_empty() {
+                                &p.selected
+                            } else {
+                                &p.current
+                            };
+                            format!("{}→{}({})", p.label, target, p.tier_label)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else if !asw.pool_current.is_empty() {
+                    asw.pool_current
+                        .iter()
+                        .map(|(k, v)| format!("{k}→{v}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    format!("5h≥{}% 7d≥{}% · {}m", asw.five_hour_min_pct, asw.weekly_min_pct, asw.refresh_minutes)
+                };
+                let rest_w = iw.saturating_sub(2 + status_w + 1);
+                let row_text = format!("auto  {summary_txt}");
+                lines.push(Line::from(vec![
+                    stripe,
+                    Span::styled(badge_txt, badge_style),
+                    Span::raw(" "),
+                    Span::styled(
+                        truncate(&row_text, rest_w),
+                        if selected || is_auto_mode {
+                            bold_primary()
+                        } else {
+                            primary()
+                        },
+                    ),
+                ]));
+                continue;
+            }
+            AccountRow::Slot(idx) => idx,
+        };
+        let acct = &app.snapshot.agy_accounts.accounts[acct_idx];
+        let (badge_txt, badge_style) = if acct.active && !is_auto_mode {
             (
                 pad_right("★ 活跃", status_w),
                 Style::default()
                     .fg(STATUS_RUNNING)
                     .add_modifier(Modifier::BOLD),
+            )
+        } else if acct.active && is_auto_mode {
+            (
+                pad_right("  实盘", status_w),
+                Style::default().fg(STATUS_QUEUED),
             )
         } else {
             (pad_right("  备用", status_w), muted())
@@ -492,8 +565,81 @@ fn format_pct_x100(x100: u32) -> String {
     }
 }
 
+fn render_quota_auto_detail_pane(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
+    let asw = &app.snapshot.agy_accounts.auto_switch;
+    let status_lbl = if asw.enabled { "已启用" } else { "未启用（按 u 切换为 auto）" };
+    let title = format!(" {} auto 自动选号 · {status_lbl} ", if asw.enabled { "★" } else { "·" });
+    let block = rounded_block(
+        Line::from(Span::styled(
+            truncate(&title, area.width.saturating_sub(2) as usize),
+            if focused { bold_primary() } else { muted() },
+        )),
+        focused,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let iw = inner.width as usize;
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let live_slot = app
+        .snapshot
+        .agy_accounts
+        .active
+        .as_deref()
+        .unwrap_or("无");
+    push_wrapped(
+        &mut out,
+        &format!(
+            "阈值：5h≥{}% 7d≥{}% · 刷新 ≥{}m · 在跑写手预扣 {}% · 实盘 ~/.gemini 保持 {live_slot}",
+            asw.five_hour_min_pct,
+            asw.weekly_min_pct,
+            asw.refresh_minutes,
+            asw.per_run_reserve_pct,
+        ),
+        iw,
+        muted(),
+    );
+    if asw.pool_summary.is_empty() {
+        for (pool, cur) in &asw.pool_current {
+            push_wrapped(&mut out, &format!("  {pool}：当前指针 {cur}"), iw, primary());
+        }
+    } else {
+        for ps in &asw.pool_summary {
+            let tier_style = match ps.tier.as_str() {
+                "green" => Style::default().fg(STATUS_RUNNING).add_modifier(Modifier::BOLD),
+                "yellow" => Style::default().fg(STATUS_PENDING).add_modifier(Modifier::BOLD),
+                "red" => Style::default().fg(STATUS_FAILED).add_modifier(Modifier::BOLD),
+                _ => primary(),
+            };
+            let target = if !ps.selected.is_empty() {
+                &ps.selected
+            } else {
+                &ps.current
+            };
+            let head = format!(
+                "{}：当前指针 {} → 下次新会话 {}（{}档）",
+                ps.label,
+                if ps.current.is_empty() { "-" } else { &ps.current },
+                if target.is_empty() { "-" } else { target },
+                if ps.tier_label.is_empty() { "-" } else { &ps.tier_label },
+            );
+            push_wrapped(&mut out, &head, iw, tier_style);
+            if !ps.reason.is_empty() {
+                push_indented_wrapped(&mut out, "  理由：", &ps.reason, iw, muted());
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(out), inner);
+}
+
 fn render_quota_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == FocusPane::Detail && matches!(app.overlay, Overlay::None);
+    if matches!(app.selected_account_row(), Some(AccountRow::Auto)) {
+        render_quota_auto_detail_pane(frame, app, area, focused);
+        return;
+    }
     let Some(acct) = app.selected_account_item().cloned() else {
         let block = rounded_block(Line::from(Span::styled(" 账号额度池 ", muted())), focused);
         let inner = block.inner(area);
@@ -546,8 +692,17 @@ fn render_quota_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect
     } else {
         String::new()
     };
+    let asw = &app.snapshot.agy_accounts.auto_switch;
+    let auto_switch_part = if asw.enabled {
+        format!(
+            " · 自动选号：开（5h≥{}% 7d≥{}% · {}m）",
+            asw.five_hour_min_pct, asw.weekly_min_pct, asw.refresh_minutes
+        )
+    } else {
+        " · 自动选号：关".to_string()
+    };
     let meta_txt = format!(
-        "{label_part}最后使用 {used_at} · 凭据 {} 份 · 在跑 agy 进程 {proc_n} 个（按 u 手动切号，在跑进程用原号跑完）",
+        "{label_part}最后使用 {used_at} · 凭据 {} 份 · 在跑 agy 进程 {proc_n} 个{auto_switch_part}（按 u 手动切号）",
         acct.file_count
     );
     if y < bottom {
@@ -895,7 +1050,37 @@ fn render_quota_narrow_detail(
     let inner_h = area.height.saturating_sub(2) as usize;
 
     let mut out: Vec<Line<'static>> = Vec::new();
-    if let Some(acct) = app.selected_account_item().cloned() {
+    if matches!(app.selected_account_row(), Some(AccountRow::Auto)) {
+        let asw = &app.snapshot.agy_accounts.auto_switch;
+        let badge = if asw.enabled { " ★ auto 已启用 " } else { " · auto 未启用 " };
+        out.push(Line::from(vec![
+            Span::styled(
+                badge,
+                Style::default()
+                    .fg(if asw.enabled { STATUS_RUNNING } else { STATUS_QUEUED })
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!(
+                    "5h≥{}% 7d≥{}% · {}m",
+                    asw.five_hour_min_pct, asw.weekly_min_pct, asw.refresh_minutes
+                ),
+                muted(),
+            ),
+        ]));
+        for ps in &asw.pool_summary {
+            push_wrapped(
+                &mut out,
+                &format!(
+                    "  {}：{} → {}（{}档） {}",
+                    ps.label, ps.current, ps.selected, ps.tier_label, ps.reason
+                ),
+                inner_w,
+                primary(),
+            );
+        }
+    } else if let Some(acct) = app.selected_account_item().cloned() {
         let name = acct.display_name(app.is_account_revealed(&acct.id));
         let prefix = if acct.active { "★ 活跃" } else { "· 备用" };
         let upd = if app.quota_refreshing {

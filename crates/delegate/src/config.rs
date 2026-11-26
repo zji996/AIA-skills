@@ -10,6 +10,79 @@ pub struct Config {
     pub origins: Value,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgyAutoSwitchConfig {
+    pub five_hour_min_pct: f64,
+    pub weekly_min_pct: f64,
+    pub refresh_minutes: u64,
+    pub per_run_reserve_pct: f64,
+}
+
+impl Default for AgyAutoSwitchConfig {
+    fn default() -> Self {
+        Self {
+            five_hour_min_pct: 30.0,
+            weekly_min_pct: 30.0,
+            refresh_minutes: 15,
+            per_run_reserve_pct: 5.0,
+        }
+    }
+}
+
+impl AgyAutoSwitchConfig {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "fiveHourMinPct": self.five_hour_min_pct,
+            "weeklyMinPct": self.weekly_min_pct,
+            "refreshMinutes": self.refresh_minutes,
+            "perRunReservePct": self.per_run_reserve_pct,
+        })
+    }
+}
+
+pub fn parse_agy_auto_switch(v: Option<&Value>) -> AgyAutoSwitchConfig {
+    let mut cfg = AgyAutoSwitchConfig::default();
+    let Some(map) = v.and_then(Value::as_object) else {
+        return cfg;
+    };
+    if let Some(fh) = map
+        .get("fiveHourMinPct")
+        .and_then(Value::as_f64)
+        .filter(|x| x.is_finite() && (0.0..=100.0).contains(x))
+    {
+        cfg.five_hour_min_pct = fh;
+    }
+    if let Some(wk) = map
+        .get("weeklyMinPct")
+        .and_then(Value::as_f64)
+        .filter(|x| x.is_finite() && (0.0..=100.0).contains(x))
+    {
+        cfg.weekly_min_pct = wk;
+    }
+    if let Some(rm) = map
+        .get("refreshMinutes")
+        .and_then(Value::as_u64)
+        .filter(|&x| (1..=1440).contains(&x))
+    {
+        cfg.refresh_minutes = rm;
+    }
+    if let Some(pr) = map
+        .get("perRunReservePct")
+        .and_then(Value::as_f64)
+        .filter(|x| x.is_finite() && (0.0..=100.0).contains(x))
+    {
+        cfg.per_run_reserve_pct = pr;
+    }
+    cfg
+}
+
+pub fn load_agy_auto_switch_config() -> AgyAutoSwitchConfig {
+    let Ok(Some(doc)) = read_file(&user_path()) else {
+        return AgyAutoSwitchConfig::default();
+    };
+    parse_agy_auto_switch(doc.get("agy").and_then(|a| a.get("autoSwitch")))
+}
+
 fn text_value(value: &Value) -> bool {
     value.as_str().is_some_and(|s| !s.contains('\0'))
         || value.as_array().is_some_and(|a| {
@@ -74,12 +147,59 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
         crate::disk::validate_config(value.get("disk"), repo)?;
         if let Some(v) = value.get("agy") {
             let map = v.as_object().ok_or("agy must be an object")?;
-            if map.keys().any(|key| key != "agent") {
+            if map
+                .keys()
+                .any(|key| !["agent", "autoSwitch"].contains(&key.as_str()))
+            {
                 return Err("agy has unknown fields".into());
             }
             if let Some(agent) = map.get("agent") {
                 let name = agent.as_str().ok_or("agy.agent must be a string")?;
                 crate::agy::validate_agent(name)?;
+            }
+            if let Some(asw) = map.get("autoSwitch") {
+                if repo {
+                    return Err(
+                        "agy.autoSwitch is only allowed in user config (~/.config/delegate/config.json), not in repository .delegate.json"
+                            .into(),
+                    );
+                }
+                let amap = asw
+                    .as_object()
+                    .ok_or("agy.autoSwitch must be an object")?;
+                if amap.contains_key("enabled") {
+                    return Err(
+                        "agy.autoSwitch.enabled has been removed; use `delegate agy account use auto` (or `use <id>`) instead"
+                            .into(),
+                    );
+                }
+                let allowed = [
+                    "fiveHourMinPct",
+                    "weeklyMinPct",
+                    "refreshMinutes",
+                    "perRunReservePct",
+                ];
+                if amap.keys().any(|k| !allowed.contains(&k.as_str())) {
+                    return Err("agy.autoSwitch has unknown fields".into());
+                }
+                for key in ["fiveHourMinPct", "weeklyMinPct", "perRunReservePct"] {
+                    if let Some(val) = amap.get(key) {
+                        let ok = val
+                            .as_f64()
+                            .is_some_and(|x| x.is_finite() && (0.0..=100.0).contains(&x));
+                        if !ok {
+                            return Err(format!("agy.autoSwitch.{key} must be a number in 0..=100"));
+                        }
+                    }
+                }
+                if let Some(rm) = amap.get("refreshMinutes") {
+                    let ok = rm.as_u64().is_some_and(|x| (1..=1440).contains(&x));
+                    if !ok {
+                        return Err(
+                            "agy.autoSwitch.refreshMinutes must be an integer in 1..=1440".into(),
+                        );
+                    }
+                }
             }
         }
         if let Some(v) = value.get("stall") {
@@ -997,6 +1117,63 @@ mod tests {
         ] {
             let err = validate(&bad, p, false).unwrap_err();
             assert!(err.contains("agy"), "expected agy error, got {err}");
+        }
+    }
+
+    #[test]
+    fn validate_agy_auto_switch_user_only_and_defaults() {
+        let user_p = Path::new("config.json");
+        let repo_p = Path::new(".delegate.json");
+
+        let def = parse_agy_auto_switch(None);
+        assert_eq!(def.five_hour_min_pct, 30.0);
+        assert_eq!(def.weekly_min_pct, 30.0);
+        assert_eq!(def.refresh_minutes, 15);
+        assert_eq!(def.per_run_reserve_pct, 5.0);
+
+        let valid = json!({
+            "agy": {
+                "agent": "aia",
+                "autoSwitch": {
+                    "fiveHourMinPct": 35,
+                    "weeklyMinPct": 25,
+                    "refreshMinutes": 20,
+                    "perRunReservePct": 7.5
+                }
+            }
+        });
+        assert!(validate(&valid, user_p, false).is_ok());
+        let parsed = parse_agy_auto_switch(Some(&valid["agy"]["autoSwitch"]));
+        assert_eq!(parsed.five_hour_min_pct, 35.0);
+        assert_eq!(parsed.weekly_min_pct, 25.0);
+        assert_eq!(parsed.refresh_minutes, 20);
+        assert_eq!(parsed.per_run_reserve_pct, 7.5);
+
+        // Repo `.delegate.json` MUST reject `agy.autoSwitch`.
+        let repo_err = validate(&valid, repo_p, true).unwrap_err();
+        assert!(
+            repo_err.contains("autoSwitch") && repo_err.contains("user config"),
+            "unexpected repo error: {repo_err}"
+        );
+
+        // `agy.autoSwitch.enabled` was removed in favor of `delegate agy account use auto`.
+        let en_err = validate(&json!({"agy": {"autoSwitch": {"enabled": true}}}), user_p, false).unwrap_err();
+        assert!(en_err.contains("use auto"), "expected use auto hint, got {en_err}");
+
+        for bad in [
+            json!({"agy": {"autoSwitch": true}}),
+            json!({"agy": {"autoSwitch": {"unknown": 1}}}),
+            json!({"agy": {"autoSwitch": {"enabled": false}}}),
+            json!({"agy": {"autoSwitch": {"fiveHourMinPct": -1}}}),
+            json!({"agy": {"autoSwitch": {"fiveHourMinPct": 101}}}),
+            json!({"agy": {"autoSwitch": {"weeklyMinPct": "30"}}}),
+            json!({"agy": {"autoSwitch": {"refreshMinutes": 0}}}),
+            json!({"agy": {"autoSwitch": {"refreshMinutes": 1441}}}),
+            json!({"agy": {"autoSwitch": {"perRunReservePct": -5}}}),
+            json!({"agy": {"autoSwitch": {"perRunReservePct": 120}}}),
+        ] {
+            let err = validate(&bad, user_p, false).unwrap_err();
+            assert!(err.contains("autoSwitch"), "expected autoSwitch error, got {err}");
         }
     }
 

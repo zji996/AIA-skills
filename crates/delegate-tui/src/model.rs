@@ -344,6 +344,8 @@ impl EventItem {
             "premerge_failed" => "预败",
             "radar_unchanged" => "侦静",
             "radar_done" => "侦察",
+            "agy_account_auto" => "选号",
+            "agy_account_handoff" => "接力",
             _ => "事件",
         }
     }
@@ -701,6 +703,7 @@ impl DiskHealthSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AgyAccountSwitchInfo {
+    pub kind: String,
     pub from: String,
     pub to: String,
     pub reason: String,
@@ -708,13 +711,41 @@ pub struct AgyAccountSwitchInfo {
 
 impl AgyAccountSwitchInfo {
     pub fn format_line(&self, is_reviewer: bool) -> String {
-        let detail = match (is_reviewer, self.reason.is_empty()) {
-            (true, true) => "审查员".to_string(),
-            (true, false) => format!("审查员：{}", self.reason),
-            (false, true) => "原槽位不可用".to_string(),
-            (false, false) => self.reason.clone(),
-        };
-        format!("本 run 已从 {} 换到 {}（{detail}）", self.from, self.to)
+        match self.kind.as_str() {
+            "auto" => {
+                let prefix = if is_reviewer {
+                    "审查自动选号"
+                } else {
+                    "自动选号"
+                };
+                if self.reason.is_empty() {
+                    format!("{prefix}：{} → {}", self.from, self.to)
+                } else {
+                    format!("{prefix}：{} → {}（{}）", self.from, self.to, self.reason)
+                }
+            }
+            "handoff" => {
+                let prefix = if is_reviewer {
+                    "审查换号重审"
+                } else {
+                    "中途换号接力"
+                };
+                if self.reason.is_empty() {
+                    format!("{prefix}：{} → {}", self.from, self.to)
+                } else {
+                    format!("{prefix}：{} → {}（{}）", self.from, self.to, self.reason)
+                }
+            }
+            _ => {
+                let detail = match (is_reviewer, self.reason.is_empty()) {
+                    (true, true) => "审查员".to_string(),
+                    (true, false) => format!("审查员：{}", self.reason),
+                    (false, true) => "原槽位不可用".to_string(),
+                    (false, false) => self.reason.clone(),
+                };
+                format!("本 run 已从 {} 换到 {}（{detail}）", self.from, self.to)
+            }
+        }
     }
 }
 
@@ -1630,6 +1661,49 @@ impl AgyAccountItem {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AccountRow {
+    Slot(usize),
+    Auto,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct AgyPoolSummary {
+    pub pool: String,
+    pub label: String,
+    pub current: String,
+    pub selected: String,
+    pub tier: String,
+    pub tier_label: String,
+    pub would_switch: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AgyAutoSwitchInfo {
+    pub enabled: bool,
+    pub five_hour_min_pct: u64,
+    pub weekly_min_pct: u64,
+    pub refresh_minutes: u64,
+    pub per_run_reserve_pct: u64,
+    pub pool_current: Vec<(String, String)>,
+    pub pool_summary: Vec<AgyPoolSummary>,
+}
+
+impl Default for AgyAutoSwitchInfo {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            five_hour_min_pct: 30,
+            weekly_min_pct: 30,
+            refresh_minutes: 15,
+            per_run_reserve_pct: 5,
+            pool_current: Vec::new(),
+            pool_summary: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct AgyAccountsState {
     pub root: String,
@@ -1641,6 +1715,7 @@ pub struct AgyAccountsState {
     pub unassigned_usage: AccountUsageStats,
     pub quota_updated_at: String,
     pub quota_age_seconds: Option<u64>,
+    pub auto_switch: AgyAutoSwitchInfo,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]

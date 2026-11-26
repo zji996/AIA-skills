@@ -611,6 +611,22 @@ pub fn take_or_close_in_run(run: &Path, next_round: usize) -> Res<TakeInRun> {
     Ok(TakeInRun::Closed)
 }
 
+/// Return all `in_run` appended items that were already delivered to an earlier session of `run`,
+/// sorted by `seq`. Used by mid-run account handoff so consumed follow-up messages are never lost
+/// when opening a fresh session on another account.
+pub fn delivered_in_run_items(run: &Path) -> Vec<AppendItem> {
+    let mailbox = load_mailbox(run);
+    let mut out: Vec<AppendItem> = mailbox["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| !item["deliveredAt"].is_null() && item["cancelledAt"].is_null())
+        .map(item_from_value)
+        .collect();
+    out.sort_by_key(|it| it.seq);
+    out
+}
+
 /// Ensure the in-run append channel is marked closed before entering accept/review/settlement.
 /// Any still-undelivered `in_run` items (e.g. if the agent failed or timed out before a turn
 /// boundary) are cancelled when `.stopped` is present, or promoted to post-settle fallback so

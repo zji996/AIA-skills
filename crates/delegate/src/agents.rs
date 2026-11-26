@@ -1649,6 +1649,11 @@ pub fn run_agent_cancellable(
         let is_reviewer = b(meta, "isReviewer");
         let is_extra_reviewer = b(meta, "isExtraReviewer");
         let fresh_agy = b(meta, "freshAgySession");
+        let is_handoff = b(meta, "isAgyHandoff");
+        let preferred_acct = {
+            let p = s(meta, "preferredAgyAccount");
+            (!p.is_empty()).then_some(p)
+        };
         let meta_path = if is_extra_reviewer {
             run.join("meta.json")
         } else if is_reviewer {
@@ -1666,7 +1671,7 @@ pub fn run_agent_cancellable(
         } else {
             ("agyAccount", "agyAccountSwitch")
         };
-        let pinned_id: Option<String> = if fresh_agy {
+        let pinned_id: Option<String> = if fresh_agy || preferred_acct.is_some() {
             None
         } else {
             let disk = json(&meta_path);
@@ -1682,9 +1687,12 @@ pub fn run_agent_cancellable(
                 }
             }
         };
-        let prep = crate::agy_accounts::AgyCredOverlay::prepare_for_session(
+        let prep = crate::agy_accounts::AgyCredOverlay::prepare_for_session_with_opts(
             pinned_id.as_deref(),
             s(meta, "model"),
+            true,
+            preferred_acct,
+            Some(run),
         )?;
         if let Some(ref acct) = prep.account_id {
             if meta_path.is_file() || is_extra_reviewer {
@@ -1699,14 +1707,26 @@ pub fn run_agent_cancellable(
                         disk[pin_key] = json!(acct);
                         dirty = true;
                     }
-                    if let Some(ref sw) = prep.switched {
-                        disk[switch_key] = json!({
-                            "from": sw.from,
-                            "to": sw.to,
-                            "reason": sw.reason,
-                            "at": iso(),
-                        });
-                        dirty = true;
+                    if !is_handoff {
+                        if let Some(ref sw) = prep.switched {
+                            let mut sw_obj = json!({
+                                "kind": sw.kind,
+                                "from": sw.from,
+                                "to": sw.to,
+                                "reason": sw.reason,
+                                "at": iso(),
+                            });
+                            if let Some(ref pool) = sw.pool {
+                                sw_obj["pool"] = json!(pool);
+                            }
+                            disk[switch_key] = sw_obj;
+                            dirty = true;
+                        } else if fresh_agy && disk.get(switch_key).is_some() {
+                            if let Some(obj) = disk.as_object_mut() {
+                                obj.remove(switch_key);
+                                dirty = true;
+                            }
+                        }
                     }
                     if dirty {
                         let _ = write_json(&meta_path, &disk);
@@ -1714,19 +1734,60 @@ pub fn run_agent_cancellable(
                 }
             }
         }
-        if let Some(ref sw) = prep.switched {
-            let _ = writeln!(
-                log,
-                "{}",
-                json!({
-                    "e": "agy_account_switch",
-                    "from": sw.from,
-                    "to": sw.to,
-                    "reason": sw.reason,
-                    "role": if is_reviewer { "reviewer" } else { "author" },
-                    "at": iso(),
-                })
-            );
+        if !is_handoff {
+            if let Some(ref sw) = prep.switched {
+                let role = if is_extra_reviewer {
+                    "extra_reviewer"
+                } else if is_reviewer {
+                    "reviewer"
+                } else {
+                    "author"
+                };
+                let ev_at = iso();
+                if sw.kind == "auto" {
+                    let ev_run_id = crate::events::run_id_for(run, meta);
+                    let ev_repo = crate::events::repo_for_meta(meta);
+                    let mut payload = json!({
+                        "role": role,
+                        "from": sw.from,
+                        "to": sw.to,
+                        "model": s(meta, "model"),
+                        "reason": sw.reason,
+                    });
+                    if let Some(ref pool) = sw.pool {
+                        payload["pool"] = json!(pool);
+                    }
+                    if let Some(ref fq) = sw.from_quota {
+                        payload["fromQuota"] = fq.clone();
+                    }
+                    if let Some(ref tq) = sw.to_quota {
+                        payload["toQuota"] = tq.clone();
+                    }
+                    if let Some(age) = sw.cache_age_secs {
+                        payload["cacheAgeSecs"] = json!(age);
+                    }
+                    let mut run_ev = payload.clone();
+                    run_ev["e"] = json!("agy_account_auto");
+                    run_ev["run"] = json!(&ev_run_id);
+                    run_ev["at"] = json!(&ev_at);
+                    let _ = writeln!(log, "{run_ev}");
+                    crate::events::emit(&ev_run_id, &ev_repo, "agy_account_auto", payload);
+                } else {
+                    let _ = writeln!(
+                        log,
+                        "{}",
+                        json!({
+                            "e": "agy_account_switch",
+                            "kind": sw.kind,
+                            "from": sw.from,
+                            "to": sw.to,
+                            "reason": sw.reason,
+                            "role": role,
+                            "at": ev_at,
+                        })
+                    );
+                }
+            }
         }
         (prep.account_id, prep.overlay)
     } else {
@@ -1799,7 +1860,7 @@ pub fn run_agent_cancellable(
     }
     write(run.join("agent.pid"), pid.to_string())?;
     let mut usage_tracker =
-        crate::usage::LiveTracker::start_with_account(meta, run, attempt, agy_account);
+        crate::usage::LiveTracker::start_with_account(meta, run, attempt, agy_account.clone());
     let mut attempt_turns: Vec<Value> = Vec::new();
     let timed = Arc::new(AtomicBool::new(false));
     let watch = Arc::new((
@@ -1998,6 +2059,7 @@ pub fn run_agent_cancellable(
     });
     let mut turn = Value::Null;
     let mut answer = String::new();
+    let mut last_turn_error = String::new();
     let mut settled = false;
     let mut current_round = crate::runs::max_round_result_num(run) + 1;
     let mut agy_filter = crate::agy::Filter::default();
@@ -2242,7 +2304,13 @@ pub fn run_agent_cancellable(
                     }
                     "result" | "message" => answer = s(&item, "text").into(),
                     "settled" => settled = true,
-                    "turn_error" => turn = json!({"stopReason":"error"}),
+                    "turn_error" => {
+                        let detail = s(&item, "detail");
+                        if !detail.is_empty() {
+                            last_turn_error = detail.to_string();
+                        }
+                        turn = json!({"stopReason":"error"});
+                    }
                     _ => {}
                 }
             }
@@ -2534,6 +2602,31 @@ pub fn run_agent_cancellable(
     } else {
         "failed"
     };
+    if on_agy && verdict == "failed" {
+        if let Some(ref acct) = agy_account {
+            let mut exhausted = crate::agy_accounts::is_quota_exhausted_error(&last_turn_error);
+            if !exhausted {
+                let stderr_txt = read(run.join("stderr.log"));
+                let tail: String = stderr_txt
+                    .lines()
+                    .rev()
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                exhausted = crate::agy_accounts::is_quota_exhausted_error(&tail);
+            }
+            if exhausted {
+                let _ = crate::agy_accounts::mark_slot_quota_exhausted_passive(
+                    acct,
+                    s(meta, "model"),
+                    epoch() as i64,
+                );
+            }
+        }
+    }
     usage_tracker.finish(&attempt_turns, verdict);
     Ok((verdict.into(), answer))
 }

@@ -1220,6 +1220,26 @@ pub fn format_human(ev: &Value) -> String {
             let stop = b(p, "stop");
             format!("自检 stop={stop}: {}", clip(s(p, "reason"), 80))
         }
+        "agy_account_auto" => {
+            let from = s(p, "from");
+            let to = s(p, "to");
+            let reason = s(p, "reason");
+            if reason.is_empty() {
+                format!("自动选号 {from} → {to}")
+            } else {
+                format!("自动选号 {from} → {to}（{}）", clip(reason, 80))
+            }
+        }
+        "agy_account_handoff" => {
+            let from = s(p, "from");
+            let to = s(p, "to");
+            let reason = s(p, "reason");
+            if reason.is_empty() {
+                format!("换号接力 {from} → {to}")
+            } else {
+                format!("换号接力 {from} → {to}（{}）", clip(reason, 80))
+            }
+        }
         "queue_dispatched" => {
             format!("自动续派 {} -> {}", s(p, "queueName"), s(p, "nextRun"))
         }
@@ -1855,5 +1875,21 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn agy_account_auto_and_handoff_are_not_alert_events() {
+        let auto_ev = json!({
+            "kind": "agy_account_auto",
+            "payload": {"from": "acct-a", "to": "acct-b", "reason": "acct-a 黄档"}
+        });
+        let handoff_ev = json!({
+            "kind": "agy_account_handoff",
+            "payload": {"from": "acct-a", "to": "acct-b", "reason": "运行中额度耗尽"}
+        });
+        assert!(!is_alert_event(&auto_ev));
+        assert!(!is_alert_event(&handoff_ev));
+        assert!(format_human(&auto_ev).contains("自动选号 acct-a → acct-b"));
+        assert!(format_human(&handoff_ev).contains("换号接力 acct-a → acct-b"));
     }
 }

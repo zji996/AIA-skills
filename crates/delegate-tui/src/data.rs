@@ -189,11 +189,12 @@ impl DelegateClient {
         parse_agy_accounts_json(&stdout)
     }
 
-    pub fn refresh_agy_quota(&self) -> Result<AgyAccountsState, String> {
+    pub fn refresh_agy_quota(&self, force: bool) -> Result<AgyAccountsState, String> {
+        let quota_flag = if force { "--quota" } else { "--quota-if-stale" };
         let output = Command::new(&self.bin)
-            .args(["agy", "account", "list", "--quota", "--json"])
+            .args(["agy", "account", "list", quota_flag, "--json"])
             .output()
-            .map_err(|e| format!("无法执行 agy account list --quota: {e}"))?;
+            .map_err(|e| format!("无法执行 agy account list {quota_flag}: {e}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1437,6 +1438,12 @@ fn parse_agy_account_switch(val: Option<&Value>) -> Option<AgyAccountSwitchInfo>
     if from.is_empty() || to.is_empty() {
         return None;
     }
+    let kind = obj
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let reason = obj
         .get("reason")
         .and_then(Value::as_str)
@@ -1444,6 +1451,7 @@ fn parse_agy_account_switch(val: Option<&Value>) -> Option<AgyAccountSwitchInfo>
         .trim()
         .to_string();
     Some(AgyAccountSwitchInfo {
+        kind,
         from: from.to_string(),
         to: to.to_string(),
         reason,
@@ -3143,6 +3151,26 @@ fn summarize_event_payload(kind: &str, run: &str, p: &Value) -> String {
             }
         }
         "loop_review" => ps("reason").to_string(),
+        "agy_account_auto" => {
+            let from = ps("from");
+            let to = ps("to");
+            let reason = ps("reason");
+            if reason.is_empty() {
+                format!("{from} → {to}")
+            } else {
+                format!("{from} → {to}（{reason}）")
+            }
+        }
+        "agy_account_handoff" => {
+            let from = ps("from");
+            let to = ps("to");
+            let reason = ps("reason");
+            if reason.is_empty() {
+                format!("{from} → {to}")
+            } else {
+                format!("{from} → {to}（{reason}）")
+            }
+        }
         "queue_dispatched" => format!("-> {}", ps("nextRun")),
         "queue_paused" => ps("reason").to_string(),
         "review_started" => {
@@ -3993,6 +4021,7 @@ pub fn parse_agy_accounts_value(v: &Value) -> AgyAccountsState {
         .unwrap_or("")
         .to_string();
     let quota_age_seconds = v.get("quotaAgeSeconds").and_then(Value::as_u64);
+    let auto_switch = parse_agy_auto_switch(v.get("autoSwitch"));
     AgyAccountsState {
         root,
         active,
@@ -4003,7 +4032,81 @@ pub fn parse_agy_accounts_value(v: &Value) -> AgyAccountsState {
         unassigned_usage,
         quota_updated_at,
         quota_age_seconds,
+        auto_switch,
     }
+}
+
+fn parse_agy_auto_switch(val: Option<&Value>) -> AgyAutoSwitchInfo {
+    let mut info = AgyAutoSwitchInfo::default();
+    let Some(obj) = val.and_then(Value::as_object) else {
+        return info;
+    };
+    if let Some(en) = obj.get("enabled").and_then(Value::as_bool) {
+        info.enabled = en;
+    } else if obj.get("mode").and_then(Value::as_str) == Some("auto") {
+        info.enabled = true;
+    }
+    if let Some(v) = obj.get("fiveHourMinPct").and_then(Value::as_f64) {
+        info.five_hour_min_pct = v.round().clamp(0.0, 100.0) as u64;
+    }
+    if let Some(v) = obj.get("weeklyMinPct").and_then(Value::as_f64) {
+        info.weekly_min_pct = v.round().clamp(0.0, 100.0) as u64;
+    }
+    if let Some(v) = obj.get("refreshMinutes").and_then(Value::as_u64) {
+        if v > 0 {
+            info.refresh_minutes = v;
+        }
+    }
+    if let Some(v) = obj.get("perRunReservePct").and_then(Value::as_f64) {
+        info.per_run_reserve_pct = v.round().clamp(0.0, 100.0) as u64;
+    }
+    if let Some(pc) = obj.get("poolCurrent").and_then(Value::as_object) {
+        let mut pairs: Vec<(String, String)> = pc
+            .iter()
+            .filter_map(|(k, v)| {
+                let id = v.as_str()?.trim();
+                (!id.is_empty()).then(|| (k.clone(), id.to_string()))
+            })
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        info.pool_current = pairs;
+    }
+    if let Some(ps) = obj.get("poolSummary").and_then(Value::as_object) {
+        let mut list: Vec<AgyPoolSummary> = Vec::new();
+        for key in ["gemini", "claude_gpt"] {
+            if let Some(item) = ps.get(key).and_then(Value::as_object) {
+                let str_of = |k: &str| {
+                    item.get(k)
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
+                };
+                list.push(AgyPoolSummary {
+                    pool: key.to_string(),
+                    label: {
+                        let l = str_of("label");
+                        if l.is_empty() {
+                            key.to_string()
+                        } else {
+                            l
+                        }
+                    },
+                    current: str_of("current"),
+                    selected: str_of("selected"),
+                    tier: str_of("tier"),
+                    tier_label: str_of("tierLabel"),
+                    would_switch: item
+                        .get("wouldSwitch")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    reason: single_line(&str_of("reason")),
+                });
+            }
+        }
+        info.pool_summary = list;
+    }
+    info
 }
 
 fn parse_line_count_pair(v: &Value) -> LineCountPair {

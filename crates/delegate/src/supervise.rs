@@ -1041,13 +1041,24 @@ pub(crate) fn resume_transient(
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from)
                 .or_else(|| agents::agent_bin(crate::agy::colleague(s(meta, "model"))));
+            let pinned_acct = {
+                let disk = json(run.join("meta.json"));
+                let d = s(&disk, "agyAccount");
+                if !d.is_empty() {
+                    Some(d.to_string())
+                } else {
+                    let m = s(meta, "agyAccount");
+                    (!m.is_empty()).then(|| m.to_string())
+                }
+            };
             let down = match bin {
-                Some(bin) => probe::recovered(
+                Some(bin) => probe::recovered_for_account(
                     &bin,
                     s(meta, "model"),
                     &meta["env"],
                     &meta["agy"],
                     transient::probe_timeout(),
+                    pinned_acct.as_deref(),
                 ),
                 None => Err("missing required tools: agy".to_string()),
             };
@@ -1056,6 +1067,9 @@ pub(crate) fn resume_transient(
                     run,
                     json!({"e":"resume_skipped","n":tried,"kind":"auth_refresh","error":down}),
                 );
+                if let Some(ref acct) = pinned_acct {
+                    let _ = crate::agy_accounts::mark_slot_auth_failed(acct, epoch() as i64, &down);
+                }
                 auth_failed = true;
                 error.clear();
                 break;
@@ -1156,6 +1170,16 @@ pub(crate) fn resume_transient(
     if lane::stopped() {
         verdict = "stopped".into();
     }
+    if auth_failed && is_agy {
+        let disk = json(run.join("meta.json"));
+        let acct = {
+            let d = s(&disk, "agyAccount");
+            if !d.is_empty() { d } else { s(meta, "agyAccount") }
+        };
+        if !acct.is_empty() {
+            let _ = crate::agy_accounts::mark_slot_auth_failed(acct, epoch() as i64, "agy 401 auth failed");
+        }
+    }
     Resumed {
         verdict,
         answer,
@@ -1203,6 +1227,7 @@ fn escalate(
     meta["tierCandidateIndex"] = next["index"].clone();
     meta["thinking"] = next["thinking"].clone();
     meta["fork"] = Value::Null;
+    meta["freshAgySession"] = json!(true);
     // The next model may run on the other colleague (Pi or agy); a fresh session there.
     let colleague = crate::agy::colleague(s(meta, "model"));
     if s(meta, "agent") != colleague {
@@ -1212,8 +1237,271 @@ fn escalate(
         meta["agentVersion"] = json!(version);
     }
     sync_agy_account_fields(run, meta);
+    if let Some(obj) = meta.as_object_mut() {
+        obj.remove("agyAccount");
+        obj.remove("agyAccountSwitch");
+    }
     write_json(run.join("meta.json"), meta)?;
     Ok(true)
+}
+
+fn collect_modified_files_index(workdir: &Path) -> Vec<String> {
+    let Ok(out) = git(workdir, &["status", "--porcelain"]) else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out);
+    let mut files: Vec<String> = text
+        .lines()
+        .filter_map(|line| {
+            if line.len() < 4 {
+                return None;
+            }
+            let path = line[3..].trim();
+            if path.is_empty() {
+                None
+            } else {
+                Some(path.to_string())
+            }
+        })
+        .collect();
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// Build an index-style handoff prompt when a writer exhausts its `agy` account mid-run.
+/// Includes:
+/// 1. Original `prompt.md`
+/// 2. Already-consumed `in_run` follow-up messages from `appends.json`
+/// 3. Current rework round's `verdict_file` (when in a rework round)
+/// 4. Index of modified files in `workdir` (instructing the new session to run `git status` / `git diff`
+///    and continue without inlining a huge diff).
+pub(crate) fn build_writer_handoff_prompt(
+    run: &Path,
+    workdir: &Path,
+    verdict_file: Option<&Path>,
+) -> String {
+    let mut sections: Vec<String> = Vec::new();
+    sections.push(
+        "上一会话在执行中途遇到账号额度耗尽，已自动切换账号开启新会话接力。\n\
+         当前工作目录与所有已有文件改动均保留在磁盘上。\n\
+         请先执行 `git status` 和 `git diff` 核对已有改动，在此基础上继续完成任务，不要推翻已完成的正确改动。"
+            .to_string(),
+    );
+
+    let orig_prompt = read(run.join("prompt.md"));
+    if !orig_prompt.trim().is_empty() {
+        sections.push(format!("## 原始任务说明\n\n{}", orig_prompt.trim()));
+    }
+
+    let delivered = crate::pending_reply::delivered_in_run_items(run);
+    if !delivered.is_empty() {
+        let mut lines = Vec::new();
+        for item in &delivered {
+            lines.push(format!(
+                "### 追加 #{}（{}）\n\n{}",
+                item.seq,
+                item.queued_at,
+                item.message.trim()
+            ));
+        }
+        sections.push(format!(
+            "## 运行期间已消费的追加指令（必须一并落实）\n\n{}",
+            lines.join("\n\n")
+        ));
+    }
+
+    if let Some(vf) = verdict_file {
+        let verdict_text = read(vf);
+        if !verdict_text.trim().is_empty() {
+            sections.push(format!(
+                "## 本轮返工审查意见（原文：{}）\n\n{}",
+                vf.display(),
+                verdict_text.trim()
+            ));
+        }
+    }
+
+    let modified = collect_modified_files_index(workdir);
+    if modified.is_empty() {
+        sections.push(
+            "## 当前工作区已改动文件索引\n\n（当前无未提交改动，请先运行 `git status` / `git log -n 3` 确认状态后继续）"
+                .to_string(),
+        );
+    } else {
+        let max_show = 40usize;
+        let mut list: Vec<String> = modified
+            .iter()
+            .take(max_show)
+            .map(|p| format!("- `{p}`"))
+            .collect();
+        if modified.len() > max_show {
+            list.push(format!("- … 等共 {} 个文件", modified.len()));
+        }
+        sections.push(format!(
+            "## 当前工作区已改动文件索引（共 {} 个，请先执行 `git status` / `git diff` 查看后再续做）\n\n{}",
+            modified.len(),
+            list.join("\n")
+        ));
+    }
+
+    let max_round = runs::max_round_result_num(run);
+    if max_round > 0 {
+        let mut refs = Vec::new();
+        for r in 1..=max_round {
+            let p = run.join(format!("round-{r}-result.md"));
+            if p.is_file() {
+                refs.push(format!("- `{}`", p.display()));
+            }
+        }
+        if !refs.is_empty() {
+            sections.push(format!(
+                "## 先前轮次答复原文索引（按需查看）\n\n{}",
+                refs.join("\n")
+            ));
+        }
+    }
+
+    format!("{}\n", sections.join("\n\n"))
+}
+
+/// Handle mid-run `agy` quota exhaustion inside the same supervisor process (at most once per run):
+/// - Writer (`mode == "write"`): opens a fresh session on another healthy slot with an index-style
+///   handoff prompt (`prompt.md` + delivered `appends.json` + rework `verdict_file` + modified files index).
+/// - Read-only run (`mode == "read-only"`): reruns the original `prompt.md` once on another slot.
+/// - Reviewers NEVER use this helper (handled by full-template retry in `review.rs`).
+pub(crate) fn try_agy_exhaustion_handoff(
+    meta: &mut Value,
+    run: &Path,
+    first: (String, String, i64),
+    verdict_file: Option<&Path>,
+    holder: Arc<AtomicI32>,
+    grace: Arc<Mutex<Option<f64>>>,
+) -> (String, String, i64) {
+    let (verdict, answer, attempts) = first;
+    if verdict != "failed" || lane::stopped() {
+        return (verdict, answer, attempts);
+    }
+    let model = s(meta, "model").to_string();
+    let is_agy = crate::agy::is_agy(&model) || s(meta, "agent") == crate::agy::BIN;
+    if !is_agy || b(meta, "isReviewer") || b(meta, "isExtraReviewer") {
+        return (verdict, answer, attempts);
+    }
+    sync_agy_account_fields(run, meta);
+    if meta["agyHandoff"].is_object() {
+        return (verdict, answer, attempts);
+    }
+    if !crate::agy_accounts::is_auto_mode_enabled() {
+        return (verdict, answer, attempts);
+    }
+    let Some(err_detail) = crate::agy_accounts::attempt_quota_exhausted_error(run, attempts) else {
+        return (verdict, answer, attempts);
+    };
+    let from_acct = s(meta, "agyAccount").to_string();
+    if from_acct.is_empty() {
+        return (verdict, answer, attempts);
+    }
+    let now_ep = epoch() as i64;
+    let _ = crate::agy_accounts::mark_slot_quota_exhausted_passive(&from_acct, &model, now_ep);
+
+    let Some(to_acct) = crate::agy_accounts::select_handoff_target(&from_acct, &model, Some(run), false) else {
+        return (verdict, answer, attempts);
+    };
+
+    if let Some(pool) = crate::agy_accounts::classify_model_pool(&model) {
+        let _ = crate::agy_accounts::set_pool_current_in(&state_dir(), pool, &to_acct);
+    }
+
+    let mode = s(meta, "mode").to_string();
+    let is_write = mode == "write";
+    let prompt_file = if is_write {
+        let p = run.join("handoff-prompt.md");
+        let body = build_writer_handoff_prompt(run, Path::new(s(meta, "workdir")), verdict_file);
+        if write(&p, body).is_err() {
+            return (verdict, answer, attempts);
+        }
+        p
+    } else {
+        run.join("prompt.md")
+    };
+
+    let reason = if is_write {
+        "运行中额度耗尽，新会话接力".to_string()
+    } else {
+        "运行中额度耗尽，换号重跑".to_string()
+    };
+    let at = iso();
+    let pool_key = crate::agy_accounts::classify_model_pool(&model).map(|p| p.key().to_string());
+    let handoff_record = json!({
+        "from": from_acct,
+        "to": to_acct,
+        "role": "author",
+        "mode": mode,
+        "reason": reason,
+        "error": clip(&err_detail, 200),
+        "at": at,
+    });
+    let mut sw_record = json!({
+        "kind": "handoff",
+        "from": from_acct,
+        "to": to_acct,
+        "reason": reason,
+        "at": at,
+    });
+    if let Some(ref pk) = pool_key {
+        sw_record["pool"] = json!(pk);
+    }
+
+    meta["agyHandoff"] = handoff_record.clone();
+    meta["agyAccountSwitch"] = sw_record.clone();
+    let mut disk = json(run.join("meta.json"));
+    if disk.is_object() {
+        disk["agyHandoff"] = handoff_record;
+        disk["agyAccountSwitch"] = sw_record;
+        let _ = write_json(run.join("meta.json"), &disk);
+    }
+
+    let run_id = crate::events::run_id_for(run, meta);
+    let repo = crate::events::repo_for_meta(meta);
+    let mut ev_payload = json!({
+        "role": "author",
+        "mode": mode,
+        "from": from_acct,
+        "to": to_acct,
+        "model": model,
+        "reason": reason,
+    });
+    if let Some(ref pk) = pool_key {
+        ev_payload["pool"] = json!(pk);
+    }
+    let mut run_ev = ev_payload.clone();
+    run_ev["e"] = json!("agy_account_handoff");
+    run_ev["run"] = json!(&run_id);
+    log_event(run, run_ev);
+    crate::events::emit(&run_id, &repo, "agy_account_handoff", ev_payload);
+
+    let mut next_meta = meta.clone();
+    next_meta["fork"] = Value::Null;
+    next_meta["agentPromptFile"] = json!(prompt_file);
+    next_meta["freshAgySession"] = json!(true);
+    next_meta["preferredAgyAccount"] = json!(&to_acct);
+    next_meta["isAgyHandoff"] = json!(true);
+    if let Some(obj) = next_meta.as_object_mut() {
+        obj.remove("agyAccount");
+    }
+
+    let (v, a, att) = attempts_from(&next_meta, run, attempts + 1, holder.clone(), grace.clone());
+    sync_agy_account_fields(run, meta);
+    let resumed = resume_transient(&next_meta, run, (v, a, att), holder.clone(), grace.clone());
+    let (v, a, att) = resume_stalled(
+        &next_meta,
+        run,
+        (resumed.verdict, resumed.answer, resumed.attempts),
+        holder,
+        grace,
+    );
+    sync_agy_account_fields(run, meta);
+    (v, a, att)
 }
 
 fn sync_agy_account_fields(run: &Path, meta: &mut Value) {
@@ -1224,6 +1512,7 @@ fn sync_agy_account_fields(run: &Path, meta: &mut Value) {
     for key in [
         "agyAccount",
         "agyAccountSwitch",
+        "agyHandoff",
         "reviewAgyAccount",
         "reviewAgyAccountSwitch",
     ] {
@@ -1911,6 +2200,15 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         (resumes, transient_error, auth_failed) =
             (resumed.resumes, resumed.error, resumed.auth_failed);
         sync_agy_account_fields(run, &mut meta);
+        (verdict, answer, attempts) = try_agy_exhaustion_handoff(
+            &mut meta,
+            run,
+            (verdict, answer, attempts),
+            None,
+            holder.clone(),
+            grace.clone(),
+        );
+        sync_agy_account_fields(run, &mut meta);
         (verdict, answer, attempts) = resume_stalled(
             &meta,
             run,
@@ -2083,7 +2381,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
     if !session_id.is_empty() {
         sum["session"] = json!(&session_id);
     }
-    let (tokens, tokens_delta) = compute_tokens(run, &meta, &turns, &session_id);
+    let (tokens, tokens_delta) = compute_tokens_from_events(run, &meta, &evs, &session_id);
     sum["elapsedSeconds"] = json!((epoch() - started) as i64);
     sum["model"] = turns
         .last()
@@ -2306,41 +2604,92 @@ pub fn supervise(run: &Path) -> Res<()> {
 /// `summary.json["tokensDelta"]`.
 ///
 /// Pi reports per-turn delta usage on each `turn` event, so turns are summed.
-/// `agy` reports session-cumulative usage on every `turn` event, so we take the last turn
-/// to avoid double-counting across rework/resume turns, and subtract the parent run's last
-/// turn when a `reply` child continues the same `session` ID.
+/// `agy` reports session-cumulative usage on every `turn` event; when a run spans multiple
+/// `agy` sessions (e.g. mid-run account handoff or model escalation), each session's last
+/// turn is taken and summed across sessions so no tokens from the earlier session are lost.
+fn compute_tokens_from_events(
+    run: &Path,
+    meta: &Value,
+    evs: &[Value],
+    session_id: &str,
+) -> (Value, Option<Value>) {
+    let turns: Vec<&Value> = evs.iter().filter(|x| s(x, "e") == "turn").collect();
+    let is_agy_meta = crate::agy::is_agy(s(meta, "model"))
+        || turns
+            .last()
+            .is_some_and(|x| s(x, "provider") == crate::agy::BIN);
+
+    if !is_agy_meta {
+        let mut tokens = json!({});
+        for key in ["input", "output", "cacheRead"] {
+            tokens[key] = json!(turns.iter().map(|x| n(&x["usage"], key)).sum::<i64>());
+        }
+        return (tokens, None);
+    }
+
+    // Group `agy` turns by active session ID in chronological order so each session takes its
+    // own last cumulative turn, while any Pi turns (e.g. mixed escalation) are summed directly.
+    let mut current_sess = String::new();
+    let mut agy_segments: Vec<(String, crate::usage::TokenCounts)> = Vec::new();
+    let mut pi_extra = crate::usage::TokenCounts::default();
+    for ev in evs {
+        match s(ev, "e") {
+            "session" => {
+                let id = s(ev, "id");
+                if !id.is_empty() {
+                    current_sess = id.to_string();
+                }
+            }
+            "turn" => {
+                let prov = s(ev, "provider");
+                let turn_is_agy = prov == crate::agy::BIN || prov.is_empty();
+                let tc = crate::usage::TokenCounts::from_json(&ev["usage"]);
+                if turn_is_agy {
+                    if let Some((_, last_tc)) =
+                        agy_segments.iter_mut().rev().find(|(sid, _)| sid == &current_sess)
+                    {
+                        *last_tc = tc;
+                    } else {
+                        agy_segments.push((current_sess.clone(), tc));
+                    }
+                } else {
+                    pi_extra.add(tc);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut total = pi_extra;
+    for (_, seg) in &agy_segments {
+        total.add(*seg);
+    }
+
+    // Subtract ancestor session baseline only for segments matching an ancestor run's session.
+    let mut matched_ancestor = false;
+    let mut delta_total = pi_extra;
+    for (sid, seg) in &agy_segments {
+        let lookup_sid = if !sid.is_empty() { sid.as_str() } else { session_id };
+        if let Some(pu) = crate::usage::ancestor_session_usage(run, meta, lookup_sid) {
+            matched_ancestor = true;
+            delta_total.add(seg.sub_clamped(pu));
+        } else {
+            delta_total.add(*seg);
+        }
+    }
+    let delta = matched_ancestor.then(|| delta_total.to_json());
+    (total.to_json(), delta)
+}
+
+#[cfg(test)]
 fn compute_tokens(
     run: &Path,
     meta: &Value,
     turns: &[&Value],
     session_id: &str,
 ) -> (Value, Option<Value>) {
-    let is_agy = crate::agy::is_agy(s(meta, "model"))
-        || turns
-            .last()
-            .is_some_and(|x| s(x, "provider") == crate::agy::BIN);
-    let mut tokens = json!({});
-    if is_agy {
-        let last_usage = turns.last().map(|x| &x["usage"]);
-        for key in ["input", "output", "cacheRead"] {
-            tokens[key] = json!(last_usage.map_or(0, |u| n(u, key)));
-        }
-    } else {
-        for key in ["input", "output", "cacheRead"] {
-            tokens[key] = json!(turns.iter().map(|x| n(&x["usage"], key)).sum::<i64>());
-        }
-    }
-
-    let delta = if is_agy {
-        crate::usage::ancestor_session_usage(run, meta, session_id).map(|pu| {
-            crate::usage::TokenCounts::from_json(&tokens)
-                .sub_clamped(pu)
-                .to_json()
-        })
-    } else {
-        None
-    };
-    (tokens, delta)
+    let evs: Vec<Value> = turns.iter().map(|v| (*v).clone()).collect();
+    compute_tokens_from_events(run, meta, &evs, session_id)
 }
 
 #[cfg(test)]
@@ -2443,6 +2792,147 @@ mod token_tests {
             next.get("freshAgySession").is_none(),
             "continuation must strip freshAgySession so format-retry stays pinned"
         );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn writer_handoff_prompt_includes_prompt_delivered_appends_verdict_and_modified_index() {
+        let base = std::env::temp_dir().join(format!(
+            "delegate-handoff-prompt-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let run = base.join("run");
+        let workdir = base.join("work");
+        fs::create_dir_all(&run).unwrap();
+        fs::create_dir_all(&workdir).unwrap();
+        git(&workdir, &["init", "-q"]).unwrap();
+        git(&workdir, &["config", "user.name", "t"]).unwrap();
+        git(&workdir, &["config", "user.email", "t@t"]).unwrap();
+        write(workdir.join("src.rs"), "fn main() {}\n").unwrap();
+        git(&workdir, &["add", "."]).unwrap();
+        git(&workdir, &["commit", "-q", "-m", "init"]).unwrap();
+        // Modify tracked file and create untracked file with large body (must NOT inline diff!).
+        write(workdir.join("src.rs"), "fn main() { println!(\"UNIQUE_DIFF_BODY_SHOULD_NOT_BE_INLINED\"); }\n").unwrap();
+        write(workdir.join("new_file.rs"), "pub fn extra() {}\n").unwrap();
+
+        write(run.join("prompt.md"), "Implement feature XYZ cleanly.\n").unwrap();
+        write_json(
+            run.join("appends.json"),
+            &json!({
+                "items": [
+                    {
+                        "seq": 1,
+                        "delivery": "in_run",
+                        "message": "Also handle edge case Q.",
+                        "queuedAt": "2026-11-27T10:05:00Z",
+                        "deliveredAt": "2026-11-27T10:06:00Z"
+                    },
+                    {
+                        "seq": 2,
+                        "delivery": "in_run",
+                        "message": "Not yet delivered.",
+                        "queuedAt": "2026-11-27T10:07:00Z",
+                        "deliveredAt": null
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+        let verdict_file = run.join("round-1-verdict.md");
+        write(&verdict_file, "REWORK\nFix missing null check in src.rs.\n").unwrap();
+
+        let prompt = build_writer_handoff_prompt(&run, &workdir, Some(&verdict_file));
+        assert!(prompt.contains("Implement feature XYZ cleanly."), "{prompt}");
+        assert!(prompt.contains("Also handle edge case Q."), "{prompt}");
+        assert!(!prompt.contains("Not yet delivered."), "{prompt}");
+        assert!(prompt.contains("Fix missing null check in src.rs."), "{prompt}");
+        assert!(prompt.contains("`src.rs`"), "{prompt}");
+        assert!(prompt.contains("`new_file.rs`"), "{prompt}");
+        assert!(prompt.contains("git status") && prompt.contains("git diff"), "{prompt}");
+        assert!(
+            !prompt.contains("UNIQUE_DIFF_BODY_SHOULD_NOT_BE_INLINED"),
+            "handoff prompt must index files rather than inlining full diff"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn compute_tokens_segments_across_agy_sessions_and_preserves_reply_delta() {
+        let base = std::env::temp_dir().join(format!(
+            "delegate-tokens-seg-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let parent = base.join("run-parent");
+        let child = base.join("run-child");
+        fs::create_dir_all(&parent).unwrap();
+        fs::create_dir_all(&child).unwrap();
+        write_json(parent.join("summary.json"), &json!({"session": "conv-1"})).unwrap();
+        write(
+            parent.join("events.jsonl"),
+            format!(
+                "{}\n",
+                json!({"e":"turn","provider":"agy","usage":{"input":100,"output":20,"cacheRead":1000}})
+            ),
+        )
+        .unwrap();
+
+        // Child continues parent's conv-1 (2 cumulative turns), then hands off to fresh conv-2 (1 turn).
+        let evs = vec![
+            json!({"e":"session","id":"conv-1","attempt":1}),
+            json!({"e":"turn","provider":"agy","usage":{"input":120,"output":25,"cacheRead":1500}}),
+            json!({"e":"turn","provider":"agy","usage":{"input":150,"output":35,"cacheRead":2000}}),
+            json!({"e":"session","id":"conv-2","attempt":2}),
+            json!({"e":"turn","provider":"agy","usage":{"input":60,"output":15,"cacheRead":500}}),
+        ];
+        let child_meta = json!({"model":"agy/gemini-4-neon","parent":"run-parent"});
+        let (tok, delta) = compute_tokens_from_events(&child, &child_meta, &evs, "conv-2");
+        // Total = last(conv-1) {150,35,2000} + last(conv-2) {60,15,500} = {210,50,2500}
+        assert_eq!(tok, json!({"input": 210, "output": 50, "cacheRead": 2500}));
+        // Delta = (last(conv-1) - parent(conv-1)) {50,15,1000} + last(conv-2) {60,15,500} = {110,30,1500}
+        assert_eq!(
+            delta,
+            Some(json!({"input": 110, "output": 30, "cacheRead": 1500}))
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn escalate_sets_fresh_agy_session_and_clears_stale_account_and_switch() {
+        let base = std::env::temp_dir().join(format!(
+            "delegate-escalate-fresh-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        let mut meta = json!({
+            "model": "agy/gemini-4-neon",
+            "agent": "agy",
+            "tier": "scout",
+            "mode": "read-only",
+            "agyAccount": "acct-a",
+            "agyAccountSwitch": {"kind": "auto", "from": "acct-b", "to": "acct-a", "reason": "old"},
+            "tierCandidates": [
+                {"model": "agy/gemini-4-neon", "name": "neon", "thinking": "high"},
+                {"model": "agy/claude-opus-4-6-thinking", "name": "opus", "thinking": "high"}
+            ],
+            "tierCandidateIndex": 0
+        });
+        write_json(base.join("meta.json"), &meta).unwrap();
+
+        let escalated = escalate(&mut meta, &base, "failed", false, &[], false).unwrap();
+        assert!(escalated);
+        assert_eq!(meta["freshAgySession"], json!(true));
+        assert!(meta.get("agyAccount").is_none());
+        assert!(meta.get("agyAccountSwitch").is_none());
+        let disk = json(base.join("meta.json"));
+        assert_eq!(disk["freshAgySession"], json!(true));
+        assert!(disk.get("agyAccount").is_none());
+        assert!(disk.get("agyAccountSwitch").is_none());
+
         let _ = fs::remove_dir_all(&base);
     }
 }

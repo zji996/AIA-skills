@@ -3110,6 +3110,137 @@ fn runs_detail_renders_agy_account_switch_notice() {
 }
 
 #[test]
+fn runs_detail_and_quota_tab_render_auto_switch_and_handoff_lines() {
+    use delegate_tui::data::parse_snapshot_json;
+
+    let raw = r#"{
+        "seq": 11,
+        "repos": [{
+            "repo": "/home/dev/repo-alpha",
+            "runs": [{
+                "run": "20261127-025500-auto-handoff",
+                "name": "自动选号测试",
+                "state": "delivered",
+                "mode": "write",
+                "model": "agy/gemini-4-neon",
+                "agyAccount": "beta",
+                "agyAccountSwitch": {
+                    "kind": "auto",
+                    "from": "alpha",
+                    "to": "beta",
+                    "reason": "alpha 黄档，改用绿档 beta"
+                },
+                "reviewAgyAccountSwitch": {
+                    "kind": "handoff",
+                    "from": "alpha",
+                    "to": "beta",
+                    "reason": "审查中额度耗尽，完整模板换号重审"
+                }
+            }]
+        }],
+        "agyAccounts": {
+            "active": "alpha",
+            "mode": "auto",
+            "selected": "auto",
+            "liveDrifted": false,
+            "autoSwitch": {
+                "enabled": true,
+                "mode": "auto",
+                "fiveHourMinPct": 30,
+                "weeklyMinPct": 30,
+                "refreshMinutes": 15,
+                "perRunReservePct": 5,
+                "poolCurrent": {"gemini": "beta", "claude_gpt": "alpha"},
+                "poolSummary": {
+                    "gemini": {
+                        "pool": "gemini",
+                        "label": "Gemini",
+                        "current": "beta",
+                        "selected": "beta",
+                        "tier": "green",
+                        "tierLabel": "绿",
+                        "wouldSwitch": false,
+                        "reason": "维持当前号 beta：绿档"
+                    },
+                    "claude_gpt": {
+                        "pool": "claude_gpt",
+                        "label": "Claude/GPT",
+                        "current": "alpha",
+                        "selected": "alpha",
+                        "tier": "green",
+                        "tierLabel": "绿",
+                        "wouldSwitch": false,
+                        "reason": "维持当前号 alpha：绿档"
+                    }
+                }
+            },
+            "accounts": [{
+                "id": "alpha",
+                "email": "secret-alpha@example.test",
+                "active": true,
+                "fileCount": 5
+            }, {
+                "id": "beta",
+                "email": "secret-beta@example.test",
+                "active": false,
+                "fileCount": 5
+            }]
+        },
+        "work": [],
+        "events": [],
+        "lane": {},
+        "dagQueue": [],
+        "merges": [],
+        "candidates": []
+    }"#;
+    let snap = parse_snapshot_json(raw, Some(Path::new("/home/dev")), None).unwrap();
+    assert!(snap.agy_accounts.auto_switch.enabled);
+    assert_eq!(snap.agy_accounts.auto_switch.refresh_minutes, 15);
+    let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/dev/repo-alpha"), 5);
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    let runs_rendered = render_to_string(&mut app, 160, 30);
+    assert!(
+        runs_rendered.contains("自动选号：alpha → beta（alpha 黄档，改用绿档 beta）"),
+        "detail pane should render auto switch line:\n{runs_rendered}"
+    );
+    assert!(
+        runs_rendered.contains("审查换号重审：alpha → beta（审查中额度耗尽，完整模板换号重审）"),
+        "detail pane should render reviewer handoff line:\n{runs_rendered}"
+    );
+    assert!(!runs_rendered.contains("secret-alpha@example.test"));
+
+    // Tab 4 (`4 额度`): in auto mode, default selection lands on the `auto` row!
+    app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+    let quota_rendered = render_to_string(&mut app, 180, 32);
+    assert!(
+        quota_rendered.contains("★ 自动") && quota_rendered.contains("auto"),
+        "quota tab should show active auto row:\n{quota_rendered}"
+    );
+    assert!(
+        quota_rendered.contains("Gemini→beta(绿)") && quota_rendered.contains("Claude/GPT→alpha(绿)"),
+        "auto row should show pool pointers and tiers:\n{quota_rendered}"
+    );
+    assert!(
+        quota_rendered.contains("维持当前号 beta：绿档"),
+        "auto detail pane should show pool reason:\n{quota_rendered}"
+    );
+    assert!(
+        quota_rendered.contains("实盘 ~/.gemini 保持 alpha"),
+        "auto detail pane should show live slot untouched:\n{quota_rendered}"
+    );
+
+    // Pressing `u` on the `auto` row opens confirm modal and confirming emits SwitchAgyAccount("auto").
+    app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+    let modal = render_to_string(&mut app, 130, 30);
+    assert!(modal.contains("auto（按池自动选号"), "{modal}");
+    let act = app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    assert_eq!(
+        act,
+        delegate_tui::app::AppAction::SwitchAgyAccount("auto".to_string())
+    );
+}
+
+#[test]
 fn overview_renders_line_stats_card_wide_and_narrow_and_survives_snapshot_refresh() {
     use delegate_tui::app::ViewTab;
     use delegate_tui::data::parse_line_stats_json;

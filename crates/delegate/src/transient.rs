@@ -78,6 +78,9 @@ pub fn kind(text: &str) -> Option<Kind> {
         return Some(Kind::AuthRefresh);
     }
     // Anything the caller has to fix: waiting and continuing the same session cannot help.
+    if crate::agy_accounts::is_quota_exhausted_error(&text) {
+        return None;
+    }
     if ["400", "401", "403", "404", "422"]
         .iter()
         .any(|code| status(&text, code))

@@ -384,8 +384,34 @@ fn build_top_bar_tabs(app: &App, pulse: &SnapshotPulse, width: u16) -> Vec<Span<
     spans
 }
 
-/// Active account short weekly summary (`★gui… 周41%`) for the fixed top bar.
+/// Active account short weekly summary (`★gui… 周41%` or `★auto`) for the fixed top bar.
 fn top_bar_active_account_summary(state: &AgyAccountsState) -> Option<(String, Style)> {
+    if state.auto_switch.enabled {
+        let gem_cur = state
+            .auto_switch
+            .pool_current
+            .iter()
+            .find(|(k, _)| k == "gemini")
+            .map(|(_, v)| v.as_str());
+        let acct = gem_cur
+            .and_then(|id| state.accounts.iter().find(|a| a.id == id))
+            .or_else(|| state.accounts.iter().find(|a| a.active));
+        let weekly_pct = acct
+            .and_then(|a| a.quota.as_ref())
+            .filter(|q| q.ok && !q.identity_mismatch)
+            .and_then(|q| {
+                q.entries
+                    .iter()
+                    .find(|e| e.window == "weekly" && e.pool.to_ascii_lowercase().contains("gemini"))
+                    .or_else(|| q.entries.iter().find(|e| e.window == "weekly"))
+            })
+            .map(|e| (e.remaining_pct_x100 + 50) / 100);
+        let txt = match weekly_pct {
+            Some(pct) => format!("★auto 周{pct}%"),
+            None => "★auto".to_string(),
+        };
+        return Some((txt, Style::default().fg(STATUS_RUNNING)));
+    }
     let active = state.accounts.iter().find(|a| a.active)?;
     let short = mask_account_name(&active.id);
     let weekly_pct = active
@@ -5384,7 +5410,9 @@ fn render_account_switch_modal(
 
     let iw = inner.width as usize;
     let mut lines: Vec<Line> = Vec::new();
-    let target_desc = if target_email.is_empty() {
+    let target_desc = if target_id == "auto" {
+        "auto（按池自动选号，不改 ~/.gemini 实盘凭据）".to_string()
+    } else if target_email.is_empty() {
         target_id.to_string()
     } else {
         format!("{target_id} ({target_email})")

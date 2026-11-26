@@ -268,6 +268,20 @@ fn probe_one(
     agy_cfg: &Value,
     thinking_off: bool,
 ) -> Outcome {
+    probe_one_for_account(bin, pattern, dir, timeout, extra_env, agy_cfg, thinking_off, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_one_for_account(
+    bin: &Path,
+    pattern: &str,
+    dir: &Path,
+    timeout: f64,
+    extra_env: &Value,
+    agy_cfg: &Value,
+    thinking_off: bool,
+    agy_account: Option<&str>,
+) -> Outcome {
     let started = Instant::now();
     let result = |ok: bool, error: String, first: Option<f64>| Outcome {
         ok,
@@ -296,7 +310,11 @@ fn probe_one(
         return result(false, "cannot read the probe prompt".into(), None);
     };
     let mut agy_overlay = if agy {
-        match crate::agy_accounts::AgyCredOverlay::prepare_active() {
+        let prep_res = match agy_account {
+            Some(acct) => crate::agy_accounts::AgyCredOverlay::prepare_for_account(Some(acct)),
+            None => crate::agy_accounts::AgyCredOverlay::prepare_active(),
+        };
+        match prep_res {
             Ok((_, ov)) => ov,
             Err(e) => return result(false, e, None),
         }
@@ -446,6 +464,17 @@ fn probe_one(
 /// environment and thinking level). A run resuming after an interrupted upstream waits for this
 /// instead of sending the task into a provider that is still down.
 pub fn recovered(bin: &Path, model: &str, env: &Value, agy_cfg: &Value, timeout: f64) -> Result<(), String> {
+    recovered_for_account(bin, model, env, agy_cfg, timeout, None)
+}
+
+pub fn recovered_for_account(
+    bin: &Path,
+    model: &str,
+    env: &Value,
+    agy_cfg: &Value,
+    timeout: f64,
+    agy_account: Option<&str>,
+) -> Result<(), String> {
     // Pi's own default model has no id to probe; nothing to check, so let the resume go out.
     if model.trim().is_empty() {
         return Ok(());
@@ -455,7 +484,16 @@ pub fn recovered(bin: &Path, model: &str, env: &Value, agy_cfg: &Value, timeout:
     let thinking = !agents::pi_models()
         .iter()
         .any(|m| m.name == model_id(model) && !m.thinking);
-    let outcome = probe_one(bin, model, &root.join("m0"), timeout, env, agy_cfg, thinking);
+    let outcome = probe_one_for_account(
+        bin,
+        model,
+        &root.join("m0"),
+        timeout,
+        env,
+        agy_cfg,
+        thinking,
+        agy_account,
+    );
     fs::remove_dir_all(&root).ok();
     if outcome.ok {
         Ok(())

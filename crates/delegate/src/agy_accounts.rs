@@ -23,12 +23,14 @@
 //!   account's live `~/.gemini`.
 
 use crate::common::*;
+use crate::config::{load_agy_auto_switch_config, AgyAutoSwitchConfig};
 use crate::{has, parse_simple, value};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -37,10 +39,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const SCHEMA_VERSION: u64 = 1;
+pub const AUTO_ACCOUNT_ID: &str = "auto";
 pub const QUOTA_CACHE_SCHEMA_VERSION: u64 = 1;
 const QUOTA_HISTORY_LIMIT: usize = 200;
 const QUOTA_HISTORY_RETENTION_SECS: i64 = 7 * 86400;
 const DEFAULT_QUOTA_TIMEOUT_SECS: u64 = 30;
+pub const RESET_AT_BUFFER_SECS: i64 = 60;
+pub const FIVE_HOUR_STALE_SECS: i64 = 2 * 3600;
+pub const WEEKLY_STALE_SECS: i64 = 24 * 3600;
+pub const PASSIVE_SYNTH_RESET_SECS: i64 = 15 * 60;
+pub const REFRESH_FAILURE_BACKOFF_SECS: i64 = 5 * 60;
+pub const DEFAULT_MIN_REFRESH_SECS: i64 = 15 * 60;
+pub const YELLOW_FIVE_HOUR_MIN_PCT: f64 = 5.0;
+pub const YELLOW_WEEKLY_MIN_PCT: f64 = 2.0;
 static TEMP_HOME_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy)]
@@ -262,7 +273,7 @@ pub fn derive_id(email: &str, existing: &Map<String, Value>) -> String {
         }
     }
     let base = base.trim_matches(['-', '.', '_']).to_string();
-    let base = if base.is_empty() {
+    let base = if base.is_empty() || base.eq_ignore_ascii_case(AUTO_ACCOUNT_ID) {
         "account".to_string()
     } else {
         base
@@ -692,13 +703,17 @@ pub fn parse_agy_usage_output(raw: &str) -> ParsedAgyUsage {
     parsed
 }
 
-pub fn quota_cache_path() -> PathBuf {
-    state_dir().join("agy-quota.json")
+pub fn quota_cache_path_in(state_root: &Path) -> PathBuf {
+    state_root.join("agy-quota.json")
 }
 
 /// Lock-free read of `<state>/agy-quota.json`.
 pub fn load_quota_cache() -> Value {
-    let v = json(quota_cache_path());
+    load_quota_cache_in(&state_dir())
+}
+
+pub fn load_quota_cache_in(state_root: &Path) -> Value {
+    let v = json(quota_cache_path_in(state_root));
     if v.is_object() && v["accounts"].is_object() {
         v
     } else {
@@ -711,8 +726,8 @@ pub fn load_quota_cache() -> Value {
     }
 }
 
-fn save_quota_cache(doc: &Value) -> Res<()> {
-    let path = quota_cache_path();
+fn save_quota_cache_in(state_root: &Path, doc: &Value) -> Res<()> {
+    let path = quota_cache_path_in(state_root);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
@@ -1322,24 +1337,162 @@ fn build_quota_history_point(now_ep: i64, entries: &[QuotaPoolEntry]) -> Option<
     Some(Value::Object(pt))
 }
 
-/// Refresh real quota for all configured `agy` account slots via `agy -p /usage </dev/null`
-/// and atomically persist the results + rolling history to `<state>/agy-quota.json`.
-pub fn refresh_all_quotas(agy_bin_opt: Option<&str>) -> Res<Value> {
-    let agy_bin = resolve_agy_bin(agy_bin_opt)?;
-    let root = accounts_root();
-    let real_home = home();
-    let state = load_state(&root);
-    let timeout_secs = quota_timeout_secs();
+#[derive(Debug, Clone)]
+pub struct QuotaRefreshOptions {
+    pub force: bool,
+    pub min_interval_secs: i64,
+    pub failure_backoff_secs: i64,
+    pub lock_wait_timeout: Duration,
+    pub slot_filter: Option<Vec<String>>,
+}
 
-    let mut targets: Vec<(String, String)> = Vec::new();
+impl QuotaRefreshOptions {
+    pub fn forced() -> Self {
+        Self {
+            force: true,
+            min_interval_secs: 0,
+            failure_backoff_secs: 0,
+            lock_wait_timeout: Duration::from_secs(30),
+            slot_filter: None,
+        }
+    }
+
+    pub fn auto_stale(min_interval_secs: i64, slot_filter: Option<Vec<String>>) -> Self {
+        Self {
+            force: false,
+            min_interval_secs: min_interval_secs.max(60),
+            failure_backoff_secs: REFRESH_FAILURE_BACKOFF_SECS,
+            lock_wait_timeout: Duration::from_secs(15),
+            slot_filter,
+        }
+    }
+}
+
+struct QuotaRefreshLockGuard {
+    file: File,
+}
+
+impl Drop for QuotaRefreshLockGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn acquire_quota_refresh_lock(state_root: &Path, timeout: Duration) -> Option<QuotaRefreshLockGuard> {
+    let _ = fs::create_dir_all(state_root);
+    let path = state_root.join("agy-quota-refresh.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Some(QuotaRefreshLockGuard { file });
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn slot_needs_refresh(
+    root: &Path,
+    cache: &Value,
+    id: &str,
+    now_ep: i64,
+    opts: &QuotaRefreshOptions,
+) -> bool {
+    if opts.force {
+        return true;
+    }
+    if !slot_has_core_token(&slot_dir(root, id)) {
+        return false;
+    }
+    let acct = &cache["accounts"][id];
+    let fetched_ep = acct["fetchedEpoch"].as_i64().unwrap_or(0);
+    let last_attempt_ep = acct["lastAttemptEpoch"].as_i64().unwrap_or(0);
+    if last_attempt_ep > 0
+        && !b(acct, "ok")
+        && now_ep - last_attempt_ep < opts.failure_backoff_secs
+    {
+        return false;
+    }
+    if fetched_ep > 0 && now_ep - fetched_ep < opts.min_interval_secs {
+        return false;
+    }
+    true
+}
+
+/// Core testable singleflight quota refresh:
+/// - Skips lock & subprocesses if no target slot is stale (`!force`).
+/// - Serializes concurrent callers via `<state>/agy-quota-refresh.lock` with double-check.
+/// - Preserves prior entries & `fetchedEpoch` on transient/network failure (setting
+///   `lastAttemptEpoch` for 5-minute failure backoff), and marks `authFailedEpoch` on 401.
+fn refresh_quotas_singleflight_in<F, N>(
+    root: &Path,
+    state_root: &Path,
+    opts: &QuotaRefreshOptions,
+    now_fn: N,
+    fetch_fn: F,
+) -> Res<Value>
+where
+    F: Fn(&str, &str) -> SlotQuotaFetch + Sync,
+    N: Fn() -> i64 + Sync,
+{
+    let state = load_state(root);
+    let mut all_targets: Vec<(String, String)> = Vec::new();
     if let Some(map) = state["accounts"].as_object() {
         let mut keys: Vec<&String> = map.keys().collect();
         keys.sort();
         for id in keys {
+            if let Some(ref filter) = opts.slot_filter {
+                if !filter.iter().any(|f| f == id) {
+                    continue;
+                }
+            }
             let entry = &map[id];
             let email = s(entry, "email").to_string();
-            targets.push((id.clone(), email));
+            all_targets.push((id.clone(), email));
         }
+    }
+    if all_targets.is_empty() {
+        return Ok(load_quota_cache_in(state_root));
+    }
+
+    // Fast lock-free pre-check.
+    let pre_cache = load_quota_cache_in(state_root);
+    let pre_now = now_fn();
+    if !opts.force
+        && !all_targets
+            .iter()
+            .any(|(id, _)| slot_needs_refresh(root, &pre_cache, id, pre_now, opts))
+    {
+        return Ok(pre_cache);
+    }
+
+    let Some(_refresh_guard) = acquire_quota_refresh_lock(state_root, opts.lock_wait_timeout) else {
+        // Lock busy past timeout -> degrade cleanly to existing cache.
+        return Ok(load_quota_cache_in(state_root));
+    };
+
+    // Double-check after acquiring the singleflight lock.
+    let mid_cache = load_quota_cache_in(state_root);
+    let mid_now = now_fn();
+    let targets: Vec<(String, String)> = all_targets
+        .into_iter()
+        .filter(|(id, _)| slot_needs_refresh(root, &mid_cache, id, mid_now, opts))
+        .collect();
+    if targets.is_empty() {
+        return Ok(mid_cache);
     }
 
     let mut results: Vec<SlotQuotaFetch> = Vec::with_capacity(targets.len());
@@ -1347,14 +1500,10 @@ pub fn refresh_all_quotas(agy_bin_opt: Option<&str>) -> Res<Value> {
         let handles: Vec<_> = targets
             .iter()
             .map(|(id, email)| {
-                let agy_bin = &agy_bin;
-                let real_home = &real_home;
-                let root = &root;
                 let id_str = id.as_str();
                 let email_str = email.as_str();
-                sc.spawn(move || {
-                    fetch_quota_for_slot(agy_bin, real_home, root, id_str, email_str, timeout_secs)
-                })
+                let fetch_ref = &fetch_fn;
+                sc.spawn(move || fetch_ref(id_str, email_str))
             })
             .collect();
         for h in handles {
@@ -1364,18 +1513,21 @@ pub fn refresh_all_quotas(agy_bin_opt: Option<&str>) -> Res<Value> {
         }
     });
 
-    let now_iso = iso();
-    let now_ep = epoch() as i64;
+    let now_ep = now_fn();
+    let now_iso = format_epoch(now_ep, false, "%Y-%m-%dT%H:%M:%SZ");
     let cutoff = now_ep - QUOTA_HISTORY_RETENTION_SECS;
 
-    let _lock = crate::locks::acquire_state(&state_dir()).ok();
-    let mut cache = load_quota_cache();
+    let _lock = crate::locks::acquire_state(state_root).ok();
+    let mut cache = load_quota_cache_in(state_root);
     if !cache["accounts"].is_object() {
         cache["accounts"] = json!({});
     }
     cache["schemaVersion"] = json!(QUOTA_CACHE_SCHEMA_VERSION);
-    cache["updatedAt"] = json!(now_iso);
-    cache["updatedEpoch"] = json!(now_ep);
+    let any_ok = results.iter().any(|r| r.ok && !r.identity_mismatch);
+    if any_ok || cache["updatedEpoch"].as_i64().unwrap_or(0) == 0 {
+        cache["updatedAt"] = json!(now_iso);
+        cache["updatedEpoch"] = json!(now_ep);
+    }
 
     for res in results {
         let prev_acct = cache["accounts"][&res.id].clone();
@@ -1405,6 +1557,7 @@ pub fn refresh_all_quotas(agy_bin_opt: Option<&str>) -> Res<Value> {
             let mut acct_doc = json!({
                 "fetchedAt": keep_at,
                 "fetchedEpoch": keep_ep,
+                "lastAttemptEpoch": now_ep,
                 "ok": false,
                 "identityMismatch": true,
                 "mismatchAt": now_iso,
@@ -1424,17 +1577,49 @@ pub fn refresh_all_quotas(agy_bin_opt: Option<&str>) -> Res<Value> {
             continue;
         }
 
-        if res.ok {
-            if let Some(pt) = build_quota_history_point(now_ep, &res.parsed.entries) {
-                let dup = history.last().is_some_and(|prev| {
-                    (now_ep - prev["epoch"].as_i64().unwrap_or(0)).abs() <= 10
-                        && prev["weekly"] == pt["weekly"]
-                        && prev["fiveHour"] == pt["fiveHour"]
-                        && prev["pools"] == pt["pools"]
-                });
-                if !dup {
-                    history.push(pt);
-                }
+        if !res.ok {
+            // Query failed (timeout, network error, 401, etc.):
+            // preserve previous entries & `fetchedEpoch` and enter 5m failure backoff.
+            let prev_entries = prev_acct["entries"].as_array().cloned().unwrap_or_default();
+            let prev_unknown = prev_acct["unknownLines"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let prev_fetched_at = s(&prev_acct, "fetchedAt").to_string();
+            let prev_fetched_ep = prev_acct["fetchedEpoch"].as_i64().unwrap_or(0);
+            let err_msg = res.error.clone().unwrap_or_else(|| "quota refresh failed".into());
+            let mut acct_doc = json!({
+                "fetchedAt": prev_fetched_at,
+                "fetchedEpoch": prev_fetched_ep,
+                "lastAttemptEpoch": now_ep,
+                "lastError": err_msg,
+                "ok": false,
+                "error": err_msg,
+                "entries": prev_entries,
+                "unknownLines": prev_unknown,
+                "refreshedCreds": 0,
+                "history": history,
+            });
+            if is_auth_failure_error(&err_msg) {
+                acct_doc["authFailedAt"] = json!(now_iso);
+                acct_doc["authFailedEpoch"] = json!(now_ep);
+            } else if prev_acct["authFailedEpoch"].as_i64().unwrap_or(0) > 0 {
+                acct_doc["authFailedAt"] = prev_acct["authFailedAt"].clone();
+                acct_doc["authFailedEpoch"] = prev_acct["authFailedEpoch"].clone();
+            }
+            cache["accounts"][&res.id] = acct_doc;
+            continue;
+        }
+
+        if let Some(pt) = build_quota_history_point(now_ep, &res.parsed.entries) {
+            let dup = history.last().is_some_and(|prev| {
+                (now_ep - prev["epoch"].as_i64().unwrap_or(0)).abs() <= 10
+                    && prev["weekly"] == pt["weekly"]
+                    && prev["fiveHour"] == pt["fiveHour"]
+                    && prev["pools"] == pt["pools"]
+            });
+            if !dup {
+                history.push(pt);
             }
         }
         if history.len() > QUOTA_HISTORY_LIMIT {
@@ -1457,23 +1642,78 @@ pub fn refresh_all_quotas(agy_bin_opt: Option<&str>) -> Res<Value> {
             })
             .collect();
 
-        let mut acct_doc = json!({
+        let acct_doc = json!({
             "fetchedAt": now_iso,
             "fetchedEpoch": now_ep,
-            "ok": res.ok,
+            "lastAttemptEpoch": now_ep,
+            "ok": true,
             "entries": entries_json,
             "unknownLines": res.parsed.unknown_lines,
             "refreshedCreds": res.refreshed_creds,
             "history": history,
         });
-        if let Some(err) = res.error {
-            acct_doc["error"] = json!(err);
-        }
         cache["accounts"][&res.id] = acct_doc;
     }
 
-    save_quota_cache(&cache)?;
+    save_quota_cache_in(state_root, &cache)?;
     Ok(cache)
+}
+
+pub fn refresh_quotas_singleflight(
+    agy_bin_opt: Option<&str>,
+    opts: &QuotaRefreshOptions,
+) -> Res<Value> {
+    let root = accounts_root();
+    let state_root = state_dir();
+    // Avoid resolving `agy` binary when lock-free check shows cache is already fresh.
+    if !opts.force {
+        let pre_cache = load_quota_cache_in(&state_root);
+        let state = load_state(&root);
+        let now_ep = epoch() as i64;
+        let any_stale = state["accounts"]
+            .as_object()
+            .into_iter()
+            .flat_map(|m| m.keys())
+            .filter(|id| {
+                opts.slot_filter
+                    .as_ref()
+                    .is_none_or(|f| f.iter().any(|x| x == *id))
+            })
+            .any(|id| slot_needs_refresh(&root, &pre_cache, id, now_ep, opts));
+        if !any_stale {
+            return Ok(pre_cache);
+        }
+    }
+    let agy_bin = resolve_agy_bin(agy_bin_opt)?;
+    let real_home = home();
+    let timeout_secs = quota_timeout_secs();
+    refresh_quotas_singleflight_in(
+        &root,
+        &state_root,
+        opts,
+        || epoch() as i64,
+        |id, email| fetch_quota_for_slot(&agy_bin, &real_home, &root, id, email, timeout_secs),
+    )
+}
+
+/// Refresh real quota for all configured `agy` account slots via `agy -p /usage </dev/null`
+/// (forced, used by manual `--quota` / TUI `Q`).
+pub fn refresh_all_quotas(agy_bin_opt: Option<&str>) -> Res<Value> {
+    refresh_quotas_singleflight(agy_bin_opt, &QuotaRefreshOptions::forced())
+}
+
+/// Singleflight refresh only for slots whose cached `fetchedEpoch` is older than `refreshMinutes`
+/// (default 15m), used by TUI periodic refresh and new-session auto-switch.
+pub fn refresh_stale_quotas(
+    agy_bin_opt: Option<&str>,
+    slot_filter: Option<Vec<String>>,
+) -> Res<Value> {
+    let cfg = load_agy_auto_switch_config();
+    let min_secs = (cfg.refresh_minutes as i64 * 60).max(DEFAULT_MIN_REFRESH_SECS);
+    refresh_quotas_singleflight(
+        agy_bin_opt,
+        &QuotaRefreshOptions::auto_stale(min_secs, slot_filter),
+    )
 }
 
 type QuotaEntrySig = (String, String, String, i64, String);
@@ -1887,15 +2127,83 @@ fn snapshot_json_opts(scan_procs: bool) -> Value {
         None
     };
 
+    let auto_cfg = load_agy_auto_switch_config();
+    let auto_mode = is_auto_mode_state(&state);
+    let state_root = state_dir();
+    let pool_cur = load_pool_current_in(&state_root);
+    let running_writers = count_running_writers(&state_root, None);
+    let mut pool_cur_json = Map::new();
+    let mut pool_summary_json = Map::new();
+    let mut auto_eval_state = state.clone();
+    auto_eval_state["mode"] = json!(AUTO_ACCOUNT_ID);
+    for pool in QuotaPool::ALL {
+        let cur = pool_cur
+            .get(&pool)
+            .filter(|id| state["accounts"].get(id.as_str()).is_some())
+            .cloned()
+            .or_else(|| active_id.clone());
+        if let Some(id) = cur {
+            pool_cur_json.insert(pool.key().to_string(), json!(id));
+        }
+        let probe_model = match pool {
+            QuotaPool::Gemini => "agy/gemini",
+            QuotaPool::ClaudeGpt => "agy/claude",
+        };
+        let dec = select_account_for_new_session(
+            &root,
+            &auto_eval_state,
+            &quota_cache,
+            &pool_cur,
+            &running_writers,
+            probe_model,
+            &auto_cfg,
+            now_ep,
+        );
+        let cur_id = dec.current_before.clone().unwrap_or_default();
+        let sel_id = dec.selected_id.clone().unwrap_or_default();
+        let sel_eval = if !sel_id.is_empty() {
+            let k = running_writers.get(&(sel_id.clone(), pool)).copied().unwrap_or(0);
+            Some(evaluate_slot_pool(&quota_cache["accounts"][&sel_id], pool, &auto_cfg, k, now_ep))
+        } else {
+            None
+        };
+        pool_summary_json.insert(
+            pool.key().to_string(),
+            json!({
+                "pool": pool.key(),
+                "label": pool.short_label(),
+                "current": cur_id,
+                "selected": sel_id,
+                "tier": sel_eval.as_ref().map(|e| e.tier.as_str()).unwrap_or("green"),
+                "tierLabel": sel_eval.as_ref().map(|e| e.tier.label_zh()).unwrap_or("绿"),
+                "wouldSwitch": dec.switched.is_some(),
+                "reason": dec.reason,
+            }),
+        );
+    }
+    let mut auto_switch_json = auto_cfg.to_json();
+    auto_switch_json["enabled"] = json!(auto_mode);
+    auto_switch_json["mode"] = json!(if auto_mode { "auto" } else { "fixed" });
+    auto_switch_json["poolCurrent"] = Value::Object(pool_cur_json);
+    auto_switch_json["poolSummary"] = Value::Object(pool_summary_json);
+    let selected_str: Option<String> = if auto_mode {
+        Some(AUTO_ACCOUNT_ID.to_string())
+    } else {
+        active_id.clone()
+    };
+
     let mut out = json!({
         "root": root.to_string_lossy(),
         "active": active_id,
+        "mode": if auto_mode { "auto" } else { "fixed" },
+        "selected": selected_str,
         "liveEmail": live,
         "liveDrifted": live_drifted,
         "runningAgy": running_json,
         "accounts": items,
         "quotaUpdatedAt": quota_updated_at,
         "quotaAgeSeconds": quota_age_secs,
+        "autoSwitch": auto_switch_json,
     });
     if !dup_groups.is_empty() {
         out["duplicateQuotaGroups"] = json!(dup_groups);
@@ -2155,13 +2463,805 @@ fn symlink_dir_entries_except(src_dir: &Path, dst_dir: &Path, skip: &[&str]) -> 
     Ok(())
 }
 
-/// Recorded fallback when a session's pinned `agy` slot became unavailable and
-/// switched to the currently active slot (never picks a third account).
+/// Canonical quota pools returned by `agy -p /usage`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum QuotaPool {
+    Gemini,
+    ClaudeGpt,
+}
+
+impl QuotaPool {
+    pub const ALL: [QuotaPool; 2] = [QuotaPool::Gemini, QuotaPool::ClaudeGpt];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            QuotaPool::Gemini => "gemini",
+            QuotaPool::ClaudeGpt => "claude_gpt",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            QuotaPool::Gemini => "Gemini Models",
+            QuotaPool::ClaudeGpt => "Claude and GPT models",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            QuotaPool::Gemini => "Gemini",
+            QuotaPool::ClaudeGpt => "Claude/GPT",
+        }
+    }
+}
+
+/// Classify a `/usage` pool name (e.g. `"Gemini Models"`, `"Claude and GPT models"`) into a canonical `QuotaPool`.
+pub fn classify_quota_pool_name(pool: &str) -> Option<QuotaPool> {
+    let p = pool.trim().to_ascii_lowercase();
+    if p.contains("gemini") {
+        Some(QuotaPool::Gemini)
+    } else if p.contains("claude") || p.contains("gpt") {
+        Some(QuotaPool::ClaudeGpt)
+    } else {
+        None
+    }
+}
+
+/// Single canonical classifier mapping a model string/alias (e.g. `"agy/gemini-4-neon"`,
+/// `"agy/claude-opus-4-6-thinking"`, `"carbon"`, `"hydrogen"`, `"haiku"`, `"codex"`) to its quota pool.
+pub fn classify_model_pool(model: &str) -> Option<QuotaPool> {
+    let m = model.trim().to_ascii_lowercase();
+    if m.is_empty() {
+        return None;
+    }
+    let id = m.rsplit('/').next().unwrap_or(&m);
+    if ["claude", "gpt", "sonnet", "opus", "haiku", "codex"]
+        .iter()
+        .any(|k| id.contains(k) || m.contains(k))
+    {
+        return Some(QuotaPool::ClaudeGpt);
+    }
+    if m.contains("gemini")
+        || ["gemini", "neon", "carbon", "hydrogen", "flash", "pro"]
+            .iter()
+            .any(|k| id.contains(k))
+    {
+        return Some(QuotaPool::Gemini);
+    }
+    None
+}
+
+/// Unified matcher used by `agy_accounts`, `usage`, and `review` to check whether a model
+/// belongs to a `/usage` quota pool.
+pub fn model_matches_pool(model: &str, pool: &str) -> bool {
+    match (classify_model_pool(model), classify_quota_pool_name(pool)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Three-tier quota health for auto-switch hysteresis: Green > Yellow > Red.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum QuotaTier {
+    Red = 0,
+    Yellow = 1,
+    Green = 2,
+}
+
+impl QuotaTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QuotaTier::Green => "green",
+            QuotaTier::Yellow => "yellow",
+            QuotaTier::Red => "red",
+        }
+    }
+
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            QuotaTier::Green => "绿",
+            QuotaTier::Yellow => "黄",
+            QuotaTier::Red => "红",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PoolQuotaEval {
+    pub tier: QuotaTier,
+    pub raw_five_hour_pct: Option<f64>,
+    pub eff_five_hour_pct: Option<f64>,
+    pub weekly_pct: Option<f64>,
+    pub running_writers: usize,
+    pub passive_exhausted: bool,
+    pub unknown: bool,
+    pub cache_age_secs: Option<i64>,
+}
+
+impl PoolQuotaEval {
+    pub fn to_quota_json(&self) -> Value {
+        let mut obj = Map::new();
+        if let Some(v) = self.eff_five_hour_pct {
+            obj.insert("5h".into(), json!((v * 10.0).round() / 10.0));
+        }
+        if let Some(v) = self.raw_five_hour_pct {
+            if self.running_writers > 0 {
+                obj.insert("raw5h".into(), json!((v * 10.0).round() / 10.0));
+            }
+        }
+        if let Some(v) = self.weekly_pct {
+            obj.insert("7d".into(), json!((v * 10.0).round() / 10.0));
+        }
+        obj.insert("tier".into(), json!(self.tier.as_str()));
+        if self.running_writers > 0 {
+            obj.insert("runningWriters".into(), json!(self.running_writers));
+        }
+        if self.passive_exhausted {
+            obj.insert("passiveExhausted".into(), json!(true));
+        }
+        Value::Object(obj)
+    }
+
+    fn format_short(&self) -> String {
+        if self.passive_exhausted {
+            return "被动耗尽(0%)".to_string();
+        }
+        if self.unknown {
+            return "未知".to_string();
+        }
+        let mut parts = Vec::new();
+        if let Some(eff) = self.eff_five_hour_pct {
+            if self.running_writers > 0 {
+                if let Some(raw) = self.raw_five_hour_pct {
+                    parts.push(format!(
+                        "有效5h {:.0}%({:.0}%-{}写手)",
+                        eff, raw, self.running_writers
+                    ));
+                } else {
+                    parts.push(format!("有效5h {:.0}%", eff));
+                }
+            } else {
+                parts.push(format!("5h {:.0}%", eff));
+            }
+        }
+        if let Some(wk) = self.weekly_pct {
+            parts.push(format!("7d {:.0}%", wk));
+        }
+        if parts.is_empty() {
+            "未知".to_string()
+        } else {
+            parts.join(" / ")
+        }
+    }
+}
+
+pub fn auto_switch_state_path_in(state_root: &Path) -> PathBuf {
+    state_root.join("agy-auto-switch.json")
+}
+
+pub fn load_pool_current_in(state_root: &Path) -> BTreeMap<QuotaPool, String> {
+    let mut out = BTreeMap::new();
+    let doc = json(auto_switch_state_path_in(state_root));
+    let Some(map) = doc["poolCurrent"].as_object() else {
+        return out;
+    };
+    for pool in QuotaPool::ALL {
+        if let Some(id) = map
+            .get(pool.key())
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            out.insert(pool, id.to_string());
+        }
+    }
+    out
+}
+
+pub fn save_pool_current_in(state_root: &Path, map: &BTreeMap<QuotaPool, String>) -> Res<()> {
+    let _lock = crate::locks::acquire_state(state_root).ok();
+    let mut pc = Map::new();
+    for (pool, id) in map {
+        if !id.trim().is_empty() {
+            pc.insert(pool.key().to_string(), json!(id.trim()));
+        }
+    }
+    let doc = json!({
+        "schemaVersion": 1,
+        "updatedAt": iso(),
+        "poolCurrent": Value::Object(pc),
+    });
+    let path = auto_switch_state_path_in(state_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    write_json(&path, &doc)
+}
+
+pub fn set_pool_current_in(state_root: &Path, pool: QuotaPool, account_id: &str) -> Res<()> {
+    let _lock = crate::locks::acquire_state(state_root).ok();
+    let mut map = load_pool_current_in(state_root);
+    map.insert(pool, account_id.to_string());
+    let mut pc = Map::new();
+    for (p, id) in &map {
+        pc.insert(p.key().to_string(), json!(id));
+    }
+    let doc = json!({
+        "schemaVersion": 1,
+        "updatedAt": iso(),
+        "poolCurrent": Value::Object(pc),
+    });
+    let path = auto_switch_state_path_in(state_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    write_json(&path, &doc)
+}
+
+pub fn set_all_pool_currents_in(state_root: &Path, account_id: &str) -> Res<()> {
+    let mut map = BTreeMap::new();
+    for pool in QuotaPool::ALL {
+        map.insert(pool, account_id.to_string());
+    }
+    save_pool_current_in(state_root, &map)
+}
+
+pub fn clear_pool_current_slot_in(state_root: &Path, removed_id: &str) -> Res<()> {
+    let _lock = crate::locks::acquire_state(state_root).ok();
+    let mut map = load_pool_current_in(state_root);
+    let before = map.len();
+    map.retain(|_, v| v != removed_id);
+    if map.len() != before {
+        let mut pc = Map::new();
+        for (p, id) in &map {
+            pc.insert(p.key().to_string(), json!(id));
+        }
+        let doc = json!({
+            "schemaVersion": 1,
+            "updatedAt": iso(),
+            "poolCurrent": Value::Object(pc),
+        });
+        let path = auto_switch_state_path_in(state_root);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        write_json(&path, &doc)?;
+    }
+    Ok(())
+}
+
+/// Whether `accounts.json` is currently in `auto` selection mode.
+/// Backward compatible: legacy files without `"mode"` default to fixed mode (`false`).
+pub fn is_auto_mode_state(state: &Value) -> bool {
+    s(state, "mode") == AUTO_ACCOUNT_ID || s(state, "active") == AUTO_ACCOUNT_ID
+}
+
+pub fn is_auto_mode_enabled() -> bool {
+    let root = accounts_root();
+    if !accounts_meta_path(&root).is_file() {
+        return false;
+    }
+    is_auto_mode_state(&load_state(&root))
+}
+
+/// Return the current effective account slot for `model`'s quota pool:
+/// uses persisted `poolCurrent[pool]` when in `auto` mode and valid, falling back to `active`.
+pub fn current_account_for_model(model: &str) -> Option<String> {
+    current_account_for_model_in(&accounts_root(), &state_dir(), model)
+}
+
+pub fn current_account_for_model_in(
+    root: &Path,
+    state_root: &Path,
+    model: &str,
+) -> Option<String> {
+    let state = load_state(root);
+    let active = state["active"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if !is_auto_mode_state(&state) {
+        return active;
+    }
+    if let Some(pool) = classify_model_pool(model) {
+        let pool_cur = load_pool_current_in(state_root);
+        if let Some(id) = pool_cur.get(&pool) {
+            if state["accounts"].get(id.as_str()).is_some() {
+                return Some(id.clone());
+            }
+        }
+    }
+    active
+}
+
+/// Strict quota-exhaustion detector for passive marking & mid-run handoff.
+/// Explicitly EXCLUDES transient HTTP 429 / RPM rate limits / capacity blips so an occasional
+/// rate limit never falsely marks a healthy account as 0% exhausted.
+pub fn is_quota_exhausted_error(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    let transient_rate_limit = [
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "requests per minute",
+        "per minute",
+        " rpm",
+        "(rpm",
+        " tpm",
+        "(tpm",
+        "retry after",
+        "try again in",
+    ]
+    .iter()
+    .any(|m| lower.contains(m));
+
+    // Unambiguous hard quota exhaustion markers.
+    let hard_markers = [
+        "insufficient_quota",
+        "quota exceeded",
+        "quota_exceeded",
+        "quota exhausted",
+        "quota_exhausted",
+        "exceeded your current quota",
+        "out of quota",
+        "no quota remaining",
+        "insufficient credit",
+        "insufficient_credit",
+        "five hour limit",
+        "weekly limit",
+        "usage limit",
+    ];
+    if hard_markers.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    if !transient_rate_limit
+        && !lower.contains("429")
+        && (lower.contains("resource_exhausted") || lower.contains("limit reached"))
+    {
+        return true;
+    }
+    false
+}
+
+/// Detect OAuth / 401 authentication failure text from `/usage` or `agy` run errors.
+pub fn is_auth_failure_error(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    let has_401 = lower.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == "401");
+    has_401
+        || [
+            "unauthorized",
+            "unauthenticated",
+            "invalid_grant",
+            "token has been expired or revoked",
+            "invalid credentials",
+            "login required",
+            "invalid api key",
+            "authentication failed",
+        ]
+        .iter()
+        .any(|m| lower.contains(m))
+}
+
+/// Inspect `run/events.jsonl` (for `attempt`) and `run/stderr.log` to determine whether the
+/// attempt ended due to a hard quota-exhaustion error (strictly excluding transient 429).
+pub fn attempt_quota_exhausted_error(run: &Path, attempt: i64) -> Option<String> {
+    let evs = crate::runs::events(run);
+    let mut saw_attempt = false;
+    for ev in evs.iter().rev() {
+        if ev.get("attempt").and_then(Value::as_i64) == Some(attempt) {
+            saw_attempt = true;
+            if s(ev, "e") == "turn_error" {
+                let detail = s(ev, "detail");
+                if is_quota_exhausted_error(detail) {
+                    return Some(detail.to_string());
+                }
+            }
+        }
+    }
+    if !saw_attempt {
+        if let Some(ev) = evs.iter().rev().find(|ev| s(ev, "e") == "turn_error") {
+            let detail = s(ev, "detail");
+            if is_quota_exhausted_error(detail) {
+                return Some(detail.to_string());
+            }
+        }
+    }
+    let stderr_txt = read(run.join("stderr.log"));
+    let tail: String = stderr_txt
+        .lines()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if is_quota_exhausted_error(&tail) {
+        return Some(clip(tail.trim(), 300));
+    }
+    None
+}
+
+/// Soft-mark `account_id`'s `fiveHour` entry for `model`'s quota pool as passively exhausted (0%)
+/// in `<state>/agy-quota.json`. Preserves `weekly`, `history`, and account-level `fetchedEpoch`.
+/// Synthesizes `resetAt = now + 15m` when no future `resetAt` is already cached.
+pub fn mark_slot_quota_exhausted_passive_in(
+    state_root: &Path,
+    account_id: &str,
+    model: &str,
+    now_ep: i64,
+) -> Res<()> {
+    let account_id = account_id.trim();
+    if account_id.is_empty() {
+        return Ok(());
+    }
+    let Some(pool) = classify_model_pool(model) else {
+        return Ok(());
+    };
+    let _lock = crate::locks::acquire_state(state_root).ok();
+    let mut cache = load_quota_cache_in(state_root);
+    if !cache["accounts"].is_object() {
+        cache["accounts"] = json!({});
+    }
+    let acct = cache["accounts"]
+        .as_object_mut()
+        .unwrap()
+        .entry(account_id.to_string())
+        .or_insert_with(|| {
+            json!({
+                "fetchedAt": "",
+                "fetchedEpoch": 0,
+                "ok": true,
+                "entries": [],
+                "unknownLines": [],
+                "refreshedCreds": 0,
+                "history": [],
+            })
+        });
+    if !acct["entries"].is_array() {
+        acct["entries"] = json!([]);
+    }
+    let synth_reset = format_epoch(now_ep + PASSIVE_SYNTH_RESET_SECS, false, "%Y-%m-%dT%H:%M:%SZ");
+    let entries = acct["entries"].as_array_mut().unwrap();
+    let mut updated = false;
+    for entry in entries.iter_mut() {
+        if classify_quota_pool_name(s(entry, "pool")) == Some(pool)
+            && s(entry, "window") == "fiveHour"
+        {
+            let existing_reset = s(entry, "resetAt").to_string();
+            let keep_reset = iso_epoch(&existing_reset).is_some_and(|rep| rep > now_ep);
+            entry["remainingPct"] = json!(0.0);
+            entry["source"] = json!("passive_error");
+            entry["fetchedEpoch"] = json!(now_ep);
+            if !keep_reset {
+                entry["resetAt"] = json!(&synth_reset);
+            }
+            updated = true;
+        }
+    }
+    if !updated {
+        entries.push(json!({
+            "pool": pool.label(),
+            "window": "fiveHour",
+            "windowLabel": "Five Hour Limit Remaining",
+            "remainingPct": 0.0,
+            "resetAt": synth_reset,
+            "source": "passive_error",
+            "fetchedEpoch": now_ep,
+        }));
+    }
+    save_quota_cache_in(state_root, &cache)
+}
+
+pub fn mark_slot_quota_exhausted_passive(
+    account_id: &str,
+    model: &str,
+    now_ep: i64,
+) -> Res<()> {
+    mark_slot_quota_exhausted_passive_in(&state_dir(), account_id, model, now_ep)
+}
+
+/// Record OAuth/401 auth failure timestamp on `account_id` in `<state>/agy-quota.json` so
+/// auto-switch excludes this broken slot until credentials are updated or `/usage` succeeds.
+pub fn mark_slot_auth_failed_in(
+    state_root: &Path,
+    account_id: &str,
+    now_ep: i64,
+    reason: &str,
+) -> Res<()> {
+    let account_id = account_id.trim();
+    if account_id.is_empty() {
+        return Ok(());
+    }
+    let _lock = crate::locks::acquire_state(state_root).ok();
+    let mut cache = load_quota_cache_in(state_root);
+    if !cache["accounts"].is_object() {
+        cache["accounts"] = json!({});
+    }
+    let now_iso = format_epoch(now_ep, false, "%Y-%m-%dT%H:%M:%SZ");
+    let acct = cache["accounts"]
+        .as_object_mut()
+        .unwrap()
+        .entry(account_id.to_string())
+        .or_insert_with(|| {
+            json!({
+                "fetchedAt": "",
+                "fetchedEpoch": 0,
+                "ok": false,
+                "entries": [],
+                "unknownLines": [],
+                "refreshedCreds": 0,
+                "history": [],
+            })
+        });
+    acct["authFailedAt"] = json!(now_iso);
+    acct["authFailedEpoch"] = json!(now_ep);
+    if !reason.trim().is_empty() {
+        acct["lastError"] = json!(clip(reason.trim(), 240));
+    }
+    save_quota_cache_in(state_root, &cache)
+}
+
+pub fn mark_slot_auth_failed(account_id: &str, now_ep: i64, reason: &str) -> Res<()> {
+    mark_slot_auth_failed_in(&state_dir(), account_id, now_ep, reason)
+}
+
+fn slot_is_auth_failed(sdir: &Path, acct_quota: &Value) -> bool {
+    let auth_ep = acct_quota["authFailedEpoch"].as_i64().unwrap_or(0);
+    if auth_ep <= 0 {
+        return false;
+    }
+    if b(acct_quota, "ok") && acct_quota["fetchedEpoch"].as_i64().unwrap_or(0) > auth_ep {
+        return false;
+    }
+    // If any core credential file was updated after `authFailedEpoch`, treat as recovered.
+    for cf in CRED_FILES.iter().filter(|c| c.is_core_token) {
+        let p = sdir.join(cf.slot_name);
+        if let Ok(meta) = fs::metadata(&p) {
+            if let Ok(mtime) = meta.modified() {
+                if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                    if dur.as_secs() as i64 > auth_ep {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Check whether a slot is structurally healthy and eligible as an auto-switch candidate.
+pub fn check_slot_health(
+    root: &Path,
+    state: &Value,
+    quota_cache: &Value,
+    id: &str,
+) -> Result<(), String> {
+    if state["accounts"].get(id).is_none() {
+        return Err("原槽位已删除".to_string());
+    }
+    let sdir = slot_dir(root, id);
+    if !sdir.is_dir() {
+        return Err("原槽位已删除".to_string());
+    }
+    if !slot_has_core_token(&sdir) {
+        return Err("凭据失效".to_string());
+    }
+    let expected_email = s(&state["accounts"][id], "email").trim().to_string();
+    let mut valid_core = 0usize;
+    for cf in CRED_FILES {
+        let p = sdir.join(cf.slot_name);
+        let Ok(bytes) = fs::read(&p) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        if !expected_email.is_empty() {
+            if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                let file_email = match cf.slot_name {
+                    "google_accounts.json" => v.get("active").and_then(Value::as_str),
+                    "jetski-standalone-oauth-token"
+                    | "antigravity-cli-oauth-token"
+                    | "antigravity-oauth-token" => v.get("id_token_email").and_then(Value::as_str),
+                    _ => None,
+                };
+                if let Some(actual) = file_email.map(str::trim).filter(|s| !s.is_empty()) {
+                    if !actual.eq_ignore_ascii_case(&expected_email) {
+                        return Err("身份校验失败".to_string());
+                    }
+                }
+            }
+        }
+        if cf.is_core_token && cred_file_valid_for_email(cf, &bytes, &expected_email) {
+            valid_core += 1;
+        }
+    }
+    if valid_core == 0 {
+        return Err("凭据失效".to_string());
+    }
+    let acct_quota = &quota_cache["accounts"][id];
+    if acct_quota.is_object() {
+        if b(acct_quota, "identityMismatch") {
+            return Err("身份校验失败".to_string());
+        }
+        if slot_is_auth_failed(&sdir, acct_quota) {
+            return Err("登录失效(401)".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Evaluate one account slot's quota tier for `pool` at `now_ep`, applying:
+/// - `resetAt` + 60s clock-skew buffer (post-reset entries treated as unknown, never hardcoded 100%)
+/// - staleness decay (non-passive 5h > 2h or 7d > 24h treated as unknown)
+/// - `passive_error` hard Red until its `resetAt + 60s`
+/// - virtual concurrency reserve (`eff_5h = raw_5h - perRunReservePct * running_writers`) for Green tier.
+pub fn evaluate_slot_pool(
+    acct_quota: &Value,
+    pool: QuotaPool,
+    cfg: &AgyAutoSwitchConfig,
+    running_writers: usize,
+    now_ep: i64,
+) -> PoolQuotaEval {
+    let acct_fetched_ep = acct_quota["fetchedEpoch"].as_i64().unwrap_or(0);
+    let cache_age_secs = (acct_fetched_ep > 0).then(|| (now_ep - acct_fetched_ep).max(0));
+
+    let mut raw_5h: Option<f64> = None;
+    let mut weekly: Option<f64> = None;
+    let mut passive_exhausted = false;
+
+    if let Some(entries) = acct_quota["entries"].as_array() {
+        for entry in entries {
+            if classify_quota_pool_name(s(entry, "pool")) != Some(pool) {
+                continue;
+            }
+            let Some(pct) = entry["remainingPct"].as_f64().filter(|v| v.is_finite()) else {
+                continue;
+            };
+            let is_passive = s(entry, "source") == "passive_error";
+            let entry_ep = entry["fetchedEpoch"]
+                .as_i64()
+                .filter(|&e| e > 0)
+                .unwrap_or(acct_fetched_ep);
+            let reset_at = s(entry, "resetAt");
+            let reset_ep = (!reset_at.is_empty()).then(|| iso_epoch(reset_at)).flatten();
+
+            if is_passive {
+                let expired = match reset_ep {
+                    Some(rep) => now_ep >= rep + RESET_AT_BUFFER_SECS,
+                    None => entry_ep > 0 && now_ep >= entry_ep + PASSIVE_SYNTH_RESET_SECS + RESET_AT_BUFFER_SECS,
+                };
+                if !expired {
+                    passive_exhausted = true;
+                    raw_5h = Some(0.0);
+                }
+                continue;
+            }
+
+            // Past resetAt (+ 60s clock-skew buffer) -> treat window as unknown (not hardcoded 100%).
+            if let Some(rep) = reset_ep {
+                if now_ep >= rep + RESET_AT_BUFFER_SECS {
+                    continue;
+                }
+            }
+
+            // Very stale non-passive data -> degrade to unknown so old numbers never trigger switches.
+            if entry_ep <= 0 {
+                continue;
+            }
+            let age = now_ep - entry_ep;
+            match s(entry, "window") {
+                "fiveHour" => {
+                    if age > FIVE_HOUR_STALE_SECS {
+                        continue;
+                    }
+                    raw_5h = Some(raw_5h.map_or(pct, |c| c.min(pct)));
+                }
+                "weekly" => {
+                    if age > WEEKLY_STALE_SECS {
+                        continue;
+                    }
+                    weekly = Some(weekly.map_or(pct, |c| c.min(pct)));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let eff_5h = raw_5h.map(|v| {
+        if passive_exhausted {
+            0.0
+        } else {
+            (v - cfg.per_run_reserve_pct * running_writers as f64).max(0.0)
+        }
+    });
+    let unknown = !passive_exhausted && raw_5h.is_none() && weekly.is_none();
+
+    let tier = if passive_exhausted {
+        QuotaTier::Red
+    } else if eff_5h.is_none_or(|v| v >= cfg.five_hour_min_pct)
+        && weekly.is_none_or(|v| v >= cfg.weekly_min_pct)
+    {
+        QuotaTier::Green
+    } else if raw_5h.is_none_or(|v| v >= YELLOW_FIVE_HOUR_MIN_PCT)
+        && weekly.is_none_or(|v| v >= YELLOW_WEEKLY_MIN_PCT)
+    {
+        QuotaTier::Yellow
+    } else {
+        QuotaTier::Red
+    };
+
+    PoolQuotaEval {
+        tier,
+        raw_five_hour_pct: raw_5h,
+        eff_five_hour_pct: eff_5h,
+        weekly_pct: weekly,
+        running_writers,
+        passive_exhausted,
+        unknown,
+        cache_age_secs,
+    }
+}
+
+/// Count currently running `agy` write runs on this machine grouped by `(account_id, pool)`.
+/// Pure helper over an explicit run directory list (read-only; never mutates `.slot` files).
+pub fn count_running_writers_in(
+    runs: &[PathBuf],
+    exclude_run: Option<&Path>,
+) -> BTreeMap<(String, QuotaPool), usize> {
+    let mut counts: BTreeMap<(String, QuotaPool), usize> = BTreeMap::new();
+    for run in runs {
+        if exclude_run.is_some_and(|ex| ex == run.as_path()) {
+            continue;
+        }
+        if run.join(".waiting").exists() || run.join(".scouting").exists() {
+            continue;
+        }
+        let meta = json(run.join("meta.json"));
+        if s(&meta, "mode") != "write" {
+            continue;
+        }
+        let model = s(&meta, "model");
+        if !crate::agy::is_agy(model) && s(&meta, "agent") != crate::agy::BIN {
+            continue;
+        }
+        let acct = s(&meta, "agyAccount").trim();
+        if acct.is_empty() {
+            continue;
+        }
+        if let Some(pool) = classify_model_pool(model) {
+            *counts.entry((acct.to_string(), pool)).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+pub fn count_running_writers(
+    state_root: &Path,
+    exclude_run: Option<&Path>,
+) -> BTreeMap<(String, QuotaPool), usize> {
+    let runs = crate::launch::machine_runs(state_root);
+    count_running_writers_in(&runs, exclude_run)
+}
+
+/// Recorded account switch (`auto`, `handoff`, or `fallback`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgyAccountSwitch {
+    pub kind: String,
     pub from: String,
     pub to: String,
     pub reason: String,
+    pub pool: Option<String>,
+    pub from_quota: Option<Value>,
+    pub to_quota: Option<Value>,
+    pub cache_age_secs: Option<i64>,
 }
 
 /// Result of resolving an `agy` account slot and preparing its credential overlay.
@@ -2171,8 +3271,474 @@ pub struct PreparedAgyAccount {
     pub switched: Option<AgyAccountSwitch>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AutoSwitchDecision {
+    pub selected_id: Option<String>,
+    pub current_before: Option<String>,
+    pub pool: Option<QuotaPool>,
+    pub pointer_changed: bool,
+    pub switched: Option<AgyAccountSwitch>,
+    pub reason: String,
+}
+
+fn red_tiebreak_key(eval: &PoolQuotaEval) -> (bool, i64) {
+    if eval.passive_exhausted {
+        return (false, 0);
+    }
+    let five_pos = eval.raw_five_hour_pct.unwrap_or(0.0) > 0.0;
+    let min_pct = match (eval.raw_five_hour_pct, eval.weekly_pct) {
+        (Some(f), Some(w)) => f.min(w),
+        (Some(f), None) => f,
+        (None, Some(w)) => w,
+        (None, None) => 0.0,
+    };
+    (five_pos, (min_pct * 100.0).round() as i64)
+}
+
+fn slot_has_any_zero_entry(acct_quota: &Value, now_ep: i64) -> bool {
+    let acct_fetched_ep = acct_quota["fetchedEpoch"].as_i64().unwrap_or(0);
+    for entry in acct_quota["entries"].as_array().into_iter().flatten() {
+        let Some(pct) = entry["remainingPct"].as_f64().filter(|v| v.is_finite()) else {
+            continue;
+        };
+        let is_passive = s(entry, "source") == "passive_error";
+        let entry_ep = entry["fetchedEpoch"]
+            .as_i64()
+            .filter(|&e| e > 0)
+            .unwrap_or(acct_fetched_ep);
+        let reset_at = s(entry, "resetAt");
+        let reset_ep = (!reset_at.is_empty()).then(|| iso_epoch(reset_at)).flatten();
+        if is_passive {
+            let expired = match reset_ep {
+                Some(rep) => now_ep >= rep + RESET_AT_BUFFER_SECS,
+                None => entry_ep > 0 && now_ep >= entry_ep + PASSIVE_SYNTH_RESET_SECS + RESET_AT_BUFFER_SECS,
+            };
+            if !expired {
+                return true;
+            }
+            continue;
+        }
+        if let Some(rep) = reset_ep {
+            if now_ep >= rep + RESET_AT_BUFFER_SECS {
+                continue;
+            }
+        }
+        if entry_ep <= 0 {
+            continue;
+        }
+        let age = now_ep - entry_ep;
+        let stale = match s(entry, "window") {
+            "fiveHour" => age > FIVE_HOUR_STALE_SECS,
+            "weekly" => age > WEEKLY_STALE_SECS,
+            _ => age > WEEKLY_STALE_SECS,
+        };
+        if !stale && pct <= 0.0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Pure three-tier hysteresis selector for a new `agy` session.
+///
+/// Rules:
+/// - If `!cfg.enabled` or `<= 1` configured account: returns `active_id` with zero switches.
+/// - Filters out unhealthy slots (deleted, missing creds, `identityMismatch`, `authFailed`).
+/// - Known model pool (`Gemini` / `ClaudeGpt`):
+///   - Starts from `poolCurrent[pool]` (defaulting to `active_id`).
+///   - Evaluates tiers: Green (`eff_5h >= fiveHourMinPct && 7d >= weeklyMinPct`, or unknown) >
+///     Yellow (`5h >= 5% && 7d >= 2%`, no passive_error) > Red (rest).
+///   - Only upgrades pointer when another healthy slot has a STRICTLY higher tier (`tier(other) > tier(cur)`).
+///   - Same tier (Green/Green or Yellow/Yellow) NEVER switches (full hysteresis, no ping-pong).
+///   - Double-Red: switches only to a slot with strictly better `(5h > 0, min(5h, 7d))`.
+/// - Unknown model: reads `active_id` (avoids 0% slot if another healthy non-0% exists) and
+///   NEVER mutates `poolCurrent`.
+#[allow(clippy::too_many_arguments)]
+pub fn select_account_for_new_session(
+    root: &Path,
+    state: &Value,
+    quota_cache: &Value,
+    pool_current: &BTreeMap<QuotaPool, String>,
+    running_writers: &BTreeMap<(String, QuotaPool), usize>,
+    model: &str,
+    cfg: &AgyAutoSwitchConfig,
+    now_ep: i64,
+) -> AutoSwitchDecision {
+    let active_id = state["active"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let pool = classify_model_pool(model);
+
+    let mut all_ids: Vec<String> = state["accounts"]
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    all_ids.sort();
+
+    if !is_auto_mode_state(state) {
+        let reason = format!(
+            "当前为固定号模式（{}），不自动切号",
+            active_id.as_deref().unwrap_or("none")
+        );
+        return AutoSwitchDecision {
+            selected_id: active_id.clone(),
+            current_before: active_id,
+            pool,
+            pointer_changed: false,
+            switched: None,
+            reason,
+        };
+    }
+
+    if all_ids.len() <= 1 {
+        return AutoSwitchDecision {
+            selected_id: active_id.clone(),
+            current_before: active_id,
+            pool,
+            pointer_changed: false,
+            switched: None,
+            reason: "仅配置 1 个账号，保持不变".to_string(),
+        };
+    }
+
+    let healthy: Vec<String> = all_ids
+        .iter()
+        .filter(|id| check_slot_health(root, state, quota_cache, id).is_ok())
+        .cloned()
+        .collect();
+
+    if healthy.is_empty() {
+        return AutoSwitchDecision {
+            selected_id: active_id.clone(),
+            current_before: active_id,
+            pool,
+            pointer_changed: false,
+            switched: None,
+            reason: "无健康可用账号，沿用活跃号".to_string(),
+        };
+    }
+
+    if healthy.len() == 1 {
+        let only = healthy[0].clone();
+        if active_id.as_deref() == Some(only.as_str()) {
+            return AutoSwitchDecision {
+                selected_id: Some(only.clone()),
+                current_before: Some(only),
+                pool,
+                pointer_changed: false,
+                switched: None,
+                reason: "仅 1 个可用健康账号，保持不变".to_string(),
+            };
+        }
+        let from = active_id.clone().unwrap_or_else(|| only.clone());
+        return AutoSwitchDecision {
+            selected_id: Some(only.clone()),
+            current_before: Some(from.clone()),
+            pool,
+            pointer_changed: pool.is_some(),
+            switched: Some(AgyAccountSwitch {
+                kind: "auto".to_string(),
+                from,
+                to: only,
+                reason: "仅 1 个健康可用号（原号不可用）".to_string(),
+                pool: pool.map(|p| p.key().to_string()),
+                from_quota: None,
+                to_quota: None,
+                cache_age_secs: None,
+            }),
+            reason: "仅 1 个健康可用号（原号不可用）".to_string(),
+        };
+    }
+
+    // Unknown model: stay on `active_id` unless it is at 0%, and NEVER overwrite `poolCurrent`.
+    let Some(pool) = pool else {
+        let base = active_id
+            .as_ref()
+            .filter(|a| healthy.iter().any(|h| h == *a))
+            .cloned()
+            .unwrap_or_else(|| healthy[0].clone());
+        let base_zero = slot_has_any_zero_entry(&quota_cache["accounts"][&base], now_ep);
+        if !base_zero {
+            return AutoSwitchDecision {
+                selected_id: Some(base.clone()),
+                current_before: Some(base),
+                pool: None,
+                pointer_changed: false,
+                switched: None,
+                reason: "未知模型池，沿用活跃号（不改池指针）".to_string(),
+            };
+        }
+        if let Some(alt) = healthy
+            .iter()
+            .find(|id| *id != &base && !slot_has_any_zero_entry(&quota_cache["accounts"][id.as_str()], now_ep))
+        {
+            let reason = format!("未知模型池：{base} 存在 0% 池，改用 {alt}（不改池指针）");
+            return AutoSwitchDecision {
+                selected_id: Some(alt.clone()),
+                current_before: Some(base.clone()),
+                pool: None,
+                pointer_changed: false,
+                switched: Some(AgyAccountSwitch {
+                    kind: "auto".to_string(),
+                    from: base,
+                    to: alt.clone(),
+                    reason: reason.clone(),
+                    pool: None,
+                    from_quota: None,
+                    to_quota: None,
+                    cache_age_secs: None,
+                }),
+                reason,
+            };
+        }
+        return AutoSwitchDecision {
+            selected_id: Some(base.clone()),
+            current_before: Some(base),
+            pool: None,
+            pointer_changed: false,
+            switched: None,
+            reason: "未知模型池，无更优非 0% 槽位，沿用活跃号".to_string(),
+        };
+    };
+
+    // Known pool: resolve current pointer (defaulting to active_id if unset or unhealthy).
+    let stored_ptr = pool_current.get(&pool).cloned();
+    let current_id = stored_ptr
+        .as_ref()
+        .filter(|id| healthy.iter().any(|h| h == *id))
+        .cloned()
+        .or_else(|| {
+            active_id
+                .as_ref()
+                .filter(|id| healthy.iter().any(|h| h == *id))
+                .cloned()
+        })
+        .unwrap_or_else(|| healthy[0].clone());
+
+    let eval_of = |id: &str| -> PoolQuotaEval {
+        let k = running_writers.get(&(id.to_string(), pool)).copied().unwrap_or(0);
+        evaluate_slot_pool(&quota_cache["accounts"][id], pool, cfg, k, now_ep)
+    };
+    let cur_eval = eval_of(&current_id);
+
+    // 1. Look for candidates with STRICTLY higher tier (`tier(other) > tier(current)`).
+    let mut higher: Vec<(String, PoolQuotaEval)> = healthy
+        .iter()
+        .filter(|id| *id != &current_id)
+        .map(|id| (id.clone(), eval_of(id)))
+        .filter(|(_, ev)| ev.tier > cur_eval.tier)
+        .collect();
+
+    if !higher.is_empty() {
+        higher.sort_by(|(id_a, a), (id_b, b)| {
+            b.tier
+                .cmp(&a.tier)
+                .then_with(|| (!b.unknown).cmp(&(!a.unknown)))
+                .then_with(|| {
+                    b.weekly_pct
+                        .unwrap_or(-1.0)
+                        .total_cmp(&a.weekly_pct.unwrap_or(-1.0))
+                })
+                .then_with(|| {
+                    b.eff_five_hour_pct
+                        .unwrap_or(-1.0)
+                        .total_cmp(&a.eff_five_hour_pct.unwrap_or(-1.0))
+                })
+                .then_with(|| id_a.cmp(id_b))
+        });
+        let (best_id, best_eval) = higher.remove(0);
+        let reason = format!(
+            "{} {}档（{}），改用 {}档 {}（{}）",
+            current_id,
+            cur_eval.tier.label_zh(),
+            cur_eval.format_short(),
+            best_eval.tier.label_zh(),
+            best_id,
+            best_eval.format_short(),
+        );
+        let switched = AgyAccountSwitch {
+            kind: "auto".to_string(),
+            from: current_id.clone(),
+            to: best_id.clone(),
+            reason: reason.clone(),
+            pool: Some(pool.key().to_string()),
+            from_quota: Some(cur_eval.to_quota_json()),
+            to_quota: Some(best_eval.to_quota_json()),
+            cache_age_secs: cur_eval.cache_age_secs.or(best_eval.cache_age_secs),
+        };
+        return AutoSwitchDecision {
+            selected_id: Some(best_id),
+            current_before: Some(current_id),
+            pool: Some(pool),
+            pointer_changed: true,
+            switched: Some(switched),
+            reason,
+        };
+    }
+
+    // 2. Both/all are Red: pick strictly better `(5h > 0, min(5h, 7d))`.
+    if cur_eval.tier == QuotaTier::Red {
+        let cur_key = red_tiebreak_key(&cur_eval);
+        let mut better_red: Vec<(String, PoolQuotaEval, (bool, i64))> = healthy
+            .iter()
+            .filter(|id| *id != &current_id)
+            .map(|id| {
+                let ev = eval_of(id);
+                let key = red_tiebreak_key(&ev);
+                (id.clone(), ev, key)
+            })
+            .filter(|(_, _, key)| *key > cur_key)
+            .collect();
+        if !better_red.is_empty() {
+            better_red.sort_by(|(id_a, _, ka), (id_b, _, kb)| kb.cmp(ka).then_with(|| id_a.cmp(id_b)));
+            let (best_id, best_eval, _) = better_red.remove(0);
+            let reason = format!(
+                "双红档：{current_id}（{}），改用 {best_id}（{}）",
+                cur_eval.format_short(),
+                best_eval.format_short(),
+            );
+            let switched = AgyAccountSwitch {
+                kind: "auto".to_string(),
+                from: current_id.clone(),
+                to: best_id.clone(),
+                reason: reason.clone(),
+                pool: Some(pool.key().to_string()),
+                from_quota: Some(cur_eval.to_quota_json()),
+                to_quota: Some(best_eval.to_quota_json()),
+                cache_age_secs: cur_eval.cache_age_secs.or(best_eval.cache_age_secs),
+            };
+            return AutoSwitchDecision {
+                selected_id: Some(best_id),
+                current_before: Some(current_id),
+                pool: Some(pool),
+                pointer_changed: true,
+                switched: Some(switched),
+                reason,
+            };
+        }
+    }
+
+    // 3. Same tier (Green/Green or Yellow/Yellow) or tied Red: stay on current pointer!
+    let reason = format!(
+        "维持当前号 {current_id}：{}档（{}），无严格更高档备选",
+        cur_eval.tier.label_zh(),
+        cur_eval.format_short(),
+    );
+    AutoSwitchDecision {
+        selected_id: Some(current_id.clone()),
+        current_before: Some(current_id),
+        pool: Some(pool),
+        pointer_changed: false,
+        switched: None,
+        reason,
+    }
+}
+
+/// Choose a distinct healthy target slot for mid-run exhaustion handoff or reviewer full-template retry.
+/// - When `require_non_red == true` (reviewer): only accepts Green or Yellow candidates.
+/// - When `require_non_red == false` (writer/read-only): prefers Green > Yellow, or Red with `5h > 0`
+///   and not passively exhausted.
+#[allow(clippy::too_many_arguments)]
+pub fn select_handoff_target_in(
+    root: &Path,
+    state: &Value,
+    quota_cache: &Value,
+    running_writers: &BTreeMap<(String, QuotaPool), usize>,
+    from_id: &str,
+    model: &str,
+    cfg: &AgyAutoSwitchConfig,
+    now_ep: i64,
+    require_non_red: bool,
+) -> Option<String> {
+    if !is_auto_mode_state(state) {
+        return None;
+    }
+    let mut all_ids: Vec<String> = state["accounts"]
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    all_ids.sort();
+    let candidates: Vec<String> = all_ids
+        .into_iter()
+        .filter(|id| id != from_id && check_slot_health(root, state, quota_cache, id).is_ok())
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let Some(pool) = classify_model_pool(model) else {
+        return candidates
+            .into_iter()
+            .find(|id| !slot_has_any_zero_entry(&quota_cache["accounts"][id.as_str()], now_ep));
+    };
+    let mut scored: Vec<(String, PoolQuotaEval)> = candidates
+        .into_iter()
+        .map(|id| {
+            let k = running_writers.get(&(id.clone(), pool)).copied().unwrap_or(0);
+            let ev = evaluate_slot_pool(&quota_cache["accounts"][&id], pool, cfg, k, now_ep);
+            (id, ev)
+        })
+        .filter(|(_, ev)| {
+            if require_non_red {
+                ev.tier > QuotaTier::Red
+            } else {
+                ev.tier > QuotaTier::Red
+                    || (!ev.passive_exhausted && ev.raw_five_hour_pct.unwrap_or(0.0) > 0.0)
+            }
+        })
+        .collect();
+    if scored.is_empty() {
+        return None;
+    }
+    scored.sort_by(|(id_a, a), (id_b, b)| {
+        b.tier
+            .cmp(&a.tier)
+            .then_with(|| (!b.unknown).cmp(&(!a.unknown)))
+            .then_with(|| {
+                b.weekly_pct
+                    .unwrap_or(-1.0)
+                    .total_cmp(&a.weekly_pct.unwrap_or(-1.0))
+            })
+            .then_with(|| {
+                b.eff_five_hour_pct
+                    .unwrap_or(-1.0)
+                    .total_cmp(&a.eff_five_hour_pct.unwrap_or(-1.0))
+            })
+            .then_with(|| id_a.cmp(id_b))
+    });
+    Some(scored.remove(0).0)
+}
+
+pub fn select_handoff_target(
+    from_id: &str,
+    model: &str,
+    exclude_run: Option<&Path>,
+    require_non_red: bool,
+) -> Option<String> {
+    let root = accounts_root();
+    if !accounts_meta_path(&root).is_file() {
+        return None;
+    }
+    let state_root = state_dir();
+    let cfg = load_agy_auto_switch_config();
+    let state = load_state(&root);
+    let quota_cache = load_quota_cache_in(&state_root);
+    let running = count_running_writers(&state_root, exclude_run);
+    select_handoff_target_in(
+        &root,
+        &state,
+        &quota_cache,
+        &running,
+        from_id,
+        model,
+        &cfg,
+        epoch() as i64,
+        require_non_red,
+    )
+}
+
 /// Format a human-readable one-line notice for `status`, `card`, and TUI when a run
-/// fell back from its pinned `agy` slot to the active slot.
+/// switched `agy` accounts (`auto`, `handoff`, or legacy `fallback`). Never prints emails.
 pub fn format_account_switch_line(sw: &Value, is_reviewer: bool) -> Option<String> {
     if !sw.is_object() {
         return None;
@@ -2180,51 +3746,58 @@ pub fn format_account_switch_line(sw: &Value, is_reviewer: bool) -> Option<Strin
     let from = s(sw, "from");
     let to = s(sw, "to");
     let reason = s(sw, "reason");
+    let kind = s(sw, "kind");
     if from.is_empty() || to.is_empty() {
         return None;
     }
-    let detail = match (is_reviewer, reason.is_empty()) {
-        (true, true) => "审查员".to_string(),
-        (true, false) => format!("审查员：{reason}"),
-        (false, true) => "原槽位不可用".to_string(),
-        (false, false) => reason.to_string(),
-    };
-    Some(format!("本 run 已从 {from} 换到 {to}（{detail}）"))
+    match kind {
+        "auto" => {
+            let prefix = if is_reviewer {
+                "审查自动选号"
+            } else {
+                "自动选号"
+            };
+            if reason.is_empty() {
+                Some(format!("{prefix}：{from} → {to}"))
+            } else {
+                Some(format!("{prefix}：{from} → {to}（{reason}）"))
+            }
+        }
+        "handoff" => {
+            let prefix = if is_reviewer {
+                "审查换号重审"
+            } else {
+                "中途换号接力"
+            };
+            if reason.is_empty() {
+                Some(format!("{prefix}：{from} → {to}"))
+            } else {
+                Some(format!("{prefix}：{from} → {to}（{reason}）"))
+            }
+        }
+        _ => {
+            let detail = match (is_reviewer, reason.is_empty()) {
+                (true, true) => "审查员".to_string(),
+                (true, false) => format!("审查员：{reason}"),
+                (false, true) => "原槽位不可用".to_string(),
+                (false, false) => reason.to_string(),
+            };
+            Some(format!("本 run 已从 {from} 换到 {to}（{detail}）"))
+        }
+    }
 }
 
-fn slot_model_pool_matches(model: &str, pool: &str) -> bool {
-    let pool_low = pool.to_ascii_lowercase();
-    let model_low = model.trim().to_ascii_lowercase();
-    if model_low.is_empty() {
-        return true;
-    }
-    if model_low.contains("gemini") {
-        pool_low.contains("gemini")
-    } else if model_low.contains("claude")
-        || model_low.contains("gpt")
-        || model_low.contains("opus")
-        || model_low.contains("sonnet")
-    {
-        pool_low.contains("claude") || pool_low.contains("gpt")
-    } else {
-        // Conservative: if the model does not map clearly to a known quota pool,
-        // do not guess that it is exhausted.
-        false
-    }
-}
-
-/// Check whether a pinned `agy` slot is definitely unavailable.
-/// Returns `Some(reason)` only when the slot is deleted, its credentials/identity are
-/// invalid, or cached real quota shows 0% remaining for an un-reset window of `model`.
-/// When uncertain (missing/stale/errored quota cache), returns `None` so the session
-/// stays on the pinned slot.
+/// Check whether a pinned `agy` slot is structurally unavailable (deleted, missing credentials,
+/// or identity mismatch). Quota 0% NEVER triggers a silent fallback on an already-started session
+/// because sessions are bound to their account; quota exhaustion is handled via explicit mid-run
+/// new-session handoff instead.
 pub(crate) fn check_pinned_slot_unavailability(
     root: &Path,
     state: &Value,
     quota_cache: &Value,
     pinned_id: &str,
-    model: &str,
-    now_ep: i64,
+    _model: &str,
+    _now_ep: i64,
 ) -> Option<String> {
     if state["accounts"].get(pinned_id).is_none() {
         return Some("原槽位已删除".to_string());
@@ -2271,34 +3844,8 @@ pub(crate) fn check_pinned_slot_unavailability(
     }
 
     let acct_quota = &quota_cache["accounts"][pinned_id];
-    if acct_quota.is_object() {
-        if b(acct_quota, "identityMismatch") {
-            return Some("身份校验失败".to_string());
-        }
-        if b(acct_quota, "ok") {
-            if let Some(entries) = acct_quota["entries"].as_array() {
-                for entry in entries {
-                    let pool = s(entry, "pool");
-                    if !slot_model_pool_matches(model, pool) {
-                        continue;
-                    }
-                    let Some(pct) = entry["remainingPct"].as_f64() else {
-                        continue;
-                    };
-                    if pct.is_finite() && pct <= 0.0 {
-                        let reset_at = s(entry, "resetAt");
-                        let not_yet_reset = if reset_at.is_empty() {
-                            true
-                        } else {
-                            iso_epoch(reset_at).is_some_and(|rep| rep > now_ep)
-                        };
-                        if not_yet_reset {
-                            return Some("额度已耗尽".to_string());
-                        }
-                    }
-                }
-            }
-        }
+    if acct_quota.is_object() && b(acct_quota, "identityMismatch") {
+        return Some("身份校验失败".to_string());
     }
     None
 }
@@ -2329,22 +3876,27 @@ pub struct AgyCredOverlay {
 impl AgyCredOverlay {
     /// Prepare a private credential overlay for the currently active `agy` account slot.
     ///
-    /// Returns `(resolved_account_id, Some(overlay))` when an active slot with core
-    /// credentials exists. Returns `(None, None)` when no local `agy-accounts` store is
-    /// configured (preserving direct-HOME behavior for single-account setups and tests).
+    /// NEVER triggers automatic account selection or quota refresh (used by `probe` and
+    /// explicit active-slot tooling).
     pub fn prepare_active() -> Res<(Option<String>, Option<Self>)> {
-        let prep = Self::prepare_for_session(None, "")?;
+        let prep = Self::prepare_for_session_with_opts(None, "", false, None, None)?;
         Ok((prep.account_id, prep.overlay))
     }
 
-    /// Prepare a private credential overlay for a session, preferring `pinned_id` if set.
-    ///
-    /// Falls back to the currently active slot ONLY when `pinned_id` is unavailable
-    /// (deleted, invalid credentials / identity mismatch, or cached real quota exhausted).
-    /// Never chooses a third account.
-    pub fn prepare_for_session(
+    /// Prepare a private credential overlay for an explicit slot (or active if `None`),
+    /// NEVER triggering automatic account selection or quota refresh (used by `AuthRefresh` probe).
+    pub fn prepare_for_account(account_id: Option<&str>) -> Res<(Option<String>, Option<Self>)> {
+        let pinned = account_id.map(str::trim).filter(|s| !s.is_empty());
+        let prep = Self::prepare_for_session_with_opts(pinned, "", false, None, None)?;
+        Ok((prep.account_id, prep.overlay))
+    }
+
+    pub fn prepare_for_session_with_opts(
         pinned_id: Option<&str>,
         model: &str,
+        allow_auto_switch: bool,
+        preferred_account: Option<&str>,
+        current_run_dir: Option<&Path>,
     ) -> Res<PreparedAgyAccount> {
         let root = accounts_root();
         if !accounts_meta_path(&root).is_file() {
@@ -2359,16 +3911,96 @@ impl AgyCredOverlay {
             .filter(|p| !p.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| real_home.join(".config"));
-        let quota_cache = load_quota_cache();
-        Self::prepare_for_session_in(
+        let state_root = state_dir();
+        let cfg = load_agy_auto_switch_config();
+        let pinned = pinned_id.map(str::trim).filter(|s| !s.is_empty());
+        let preferred = preferred_account.map(str::trim).filter(|s| !s.is_empty());
+
+        // Lazy singleflight quota refresh BEFORE taking `accounts/.lock` (only for new sessions
+        // in `auto` mode with >= 2 configured slots).
+        if pinned.is_none() && preferred.is_none() && allow_auto_switch {
+            let pre_state = load_state(&root);
+            let slot_count = pre_state["accounts"].as_object().map_or(0, Map::len);
+            if is_auto_mode_state(&pre_state) && slot_count >= 2 {
+                let pool_cur = load_pool_current_in(&state_root);
+                let running = count_running_writers(&state_root, current_run_dir);
+                let now_ep = epoch() as i64;
+                let min_secs = (cfg.refresh_minutes as i64 * 60).max(60);
+                let pool = classify_model_pool(model);
+                let active_id = pre_state["active"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let current_id = pool
+                    .and_then(|p| pool_cur.get(&p).cloned())
+                    .filter(|id| pre_state["accounts"].get(id.as_str()).is_some())
+                    .or(active_id);
+
+                let pre_cache = load_quota_cache_in(&state_root);
+                let current_is_fresh_green = if let (Some(ref cid), Some(p)) = (&current_id, pool) {
+                    let cur_opts = QuotaRefreshOptions::auto_stale(min_secs, Some(vec![cid.clone()]));
+                    let fresh = !slot_needs_refresh(&root, &pre_cache, cid, now_ep, &cur_opts);
+                    let healthy = check_slot_health(&root, &pre_state, &pre_cache, cid).is_ok();
+                    let k = running.get(&(cid.clone(), p)).copied().unwrap_or(0);
+                    let eval = evaluate_slot_pool(&pre_cache["accounts"][cid], p, &cfg, k, now_ep);
+                    fresh && healthy && eval.tier == QuotaTier::Green
+                } else {
+                    false
+                };
+
+                if !current_is_fresh_green {
+                    // Step 1: refresh current slot first if stale.
+                    if let Some(ref cid) = current_id {
+                        let cur_opts = QuotaRefreshOptions::auto_stale(min_secs, Some(vec![cid.clone()]));
+                        let _ = refresh_quotas_singleflight(None, &cur_opts);
+                    }
+                    // Step 2: check if current slot is now Green; if not, refresh remaining slots.
+                    let after_cur_cache = load_quota_cache_in(&state_root);
+                    let after_now = epoch() as i64;
+                    let now_green = if let (Some(ref cid), Some(p)) = (&current_id, pool) {
+                        let healthy =
+                            check_slot_health(&root, &pre_state, &after_cur_cache, cid).is_ok();
+                        let k = running.get(&(cid.clone(), p)).copied().unwrap_or(0);
+                        let eval = evaluate_slot_pool(
+                            &after_cur_cache["accounts"][cid],
+                            p,
+                            &cfg,
+                            k,
+                            after_now,
+                        );
+                        healthy && eval.tier == QuotaTier::Green
+                    } else {
+                        false
+                    };
+                    if !now_green {
+                        let all_opts = QuotaRefreshOptions::auto_stale(min_secs, None);
+                        let _ = refresh_quotas_singleflight(None, &all_opts);
+                    }
+                }
+            }
+        }
+
+        let quota_cache = load_quota_cache_in(&state_root);
+        let pool_cur = load_pool_current_in(&state_root);
+        let running = count_running_writers(&state_root, current_run_dir);
+        let (prep, pointer_update) = Self::prepare_for_session_full(
             &root,
             &real_home,
             &real_xdg_config,
-            pinned_id,
+            pinned,
+            preferred,
             model,
+            allow_auto_switch,
+            &cfg,
             &quota_cache,
+            &pool_cur,
+            &running,
             epoch() as i64,
-        )
+        )?;
+        if let Some((pool, new_id)) = pointer_update {
+            let _ = set_pool_current_in(&state_root, pool, &new_id);
+        }
+        Ok(prep)
     }
 
     #[cfg(test)]
@@ -2378,18 +4010,24 @@ impl AgyCredOverlay {
         real_xdg_config: &Path,
     ) -> Res<(Option<String>, Option<Self>)> {
         let empty_quota = json!({"accounts": {}});
-        let prep = Self::prepare_for_session_in(
+        let (prep, _) = Self::prepare_for_session_full(
             root,
             real_home,
             real_xdg_config,
             None,
+            None,
             "",
+            false,
+            &AgyAutoSwitchConfig::default(),
             &empty_quota,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             epoch() as i64,
         )?;
         Ok((prep.account_id, prep.overlay))
     }
 
+    #[cfg(test)]
     fn prepare_for_session_in(
         root: &Path,
         real_home: &Path,
@@ -2399,6 +4037,38 @@ impl AgyCredOverlay {
         quota_cache: &Value,
         now_ep: i64,
     ) -> Res<PreparedAgyAccount> {
+        let (prep, _) = Self::prepare_for_session_full(
+            root,
+            real_home,
+            real_xdg_config,
+            pinned_id,
+            None,
+            model,
+            false,
+            &AgyAutoSwitchConfig::default(),
+            quota_cache,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            now_ep,
+        )?;
+        Ok(prep)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_for_session_full(
+        root: &Path,
+        real_home: &Path,
+        real_xdg_config: &Path,
+        pinned_id: Option<&str>,
+        preferred_account: Option<&str>,
+        model: &str,
+        allow_auto_switch: bool,
+        auto_cfg: &AgyAutoSwitchConfig,
+        quota_cache: &Value,
+        pool_current: &BTreeMap<QuotaPool, String>,
+        running_writers: &BTreeMap<(String, QuotaPool), usize>,
+        now_ep: i64,
+    ) -> Res<(PreparedAgyAccount, Option<(QuotaPool, String)>)> {
         let _lock = acquire_accounts_lock(root)?;
         let mut state = load_state(root);
         let active_id = state["active"]
@@ -2407,6 +4077,9 @@ impl AgyCredOverlay {
             .map(str::to_string);
 
         let pinned = pinned_id.map(str::trim).filter(|s| !s.is_empty());
+        let preferred = preferred_account.map(str::trim).filter(|s| !s.is_empty());
+        let mut pointer_update: Option<(QuotaPool, String)> = None;
+
         let (selected_id, switched) = if let Some(pin) = pinned {
             if let Some(reason) =
                 check_pinned_slot_unavailability(root, &state, quota_cache, pin, model, now_ep)
@@ -2421,16 +4094,20 @@ impl AgyCredOverlay {
                     (
                         Some(act.clone()),
                         Some(AgyAccountSwitch {
+                            kind: "fallback".to_string(),
                             from: pin.to_string(),
                             to: act,
                             reason,
+                            pool: classify_model_pool(model).map(|p| p.key().to_string()),
+                            from_quota: None,
+                            to_quota: None,
+                            cache_age_secs: None,
                         }),
                     )
                 } else if state["accounts"].get(pin).is_some()
                     && slot_has_core_token(&slot_dir(root, pin))
                 {
-                    // No distinct active account to fall back to; stay on pinned slot
-                    // (never auto-select a third account).
+                    // No distinct active account to fall back to; stay on pinned slot.
                     (Some(pin.to_string()), None)
                 } else {
                     (None, None)
@@ -2438,24 +4115,53 @@ impl AgyCredOverlay {
             } else {
                 (Some(pin.to_string()), None)
             }
+        } else if let Some(pref) = preferred {
+            if state["accounts"].get(pref).is_some() && slot_has_core_token(&slot_dir(root, pref)) {
+                (Some(pref.to_string()), None)
+            } else {
+                (active_id.clone(), None)
+            }
+        } else if allow_auto_switch && is_auto_mode_state(&state) {
+            let decision = select_account_for_new_session(
+                root,
+                &state,
+                quota_cache,
+                pool_current,
+                running_writers,
+                model,
+                auto_cfg,
+                now_ep,
+            );
+            if decision.pointer_changed {
+                if let (Some(p), Some(ref sel)) = (decision.pool, &decision.selected_id) {
+                    pointer_update = Some((p, sel.clone()));
+                }
+            }
+            (decision.selected_id, decision.switched)
         } else {
             (active_id.clone(), None)
         };
 
         let Some(selected_id) = selected_id else {
-            return Ok(PreparedAgyAccount {
-                account_id: None,
-                overlay: None,
-                switched: None,
-            });
+            return Ok((
+                PreparedAgyAccount {
+                    account_id: None,
+                    overlay: None,
+                    switched: None,
+                },
+                pointer_update,
+            ));
         };
         let sdir = slot_dir(root, &selected_id);
         if !slot_has_core_token(&sdir) {
-            return Ok(PreparedAgyAccount {
-                account_id: Some(selected_id),
-                overlay: None,
-                switched,
-            });
+            return Ok((
+                PreparedAgyAccount {
+                    account_id: Some(selected_id),
+                    overlay: None,
+                    switched,
+                },
+                pointer_update,
+            ));
         }
         let account_email = {
             let stored = s(&state["accounts"][&selected_id], "email");
@@ -2574,19 +4280,22 @@ impl AgyCredOverlay {
         }
 
         let id_copy = selected_id.clone();
-        Ok(PreparedAgyAccount {
-            account_id: Some(id_copy),
-            overlay: Some(Self {
-                temp_home,
-                real_home: real_home.to_path_buf(),
-                root: root.to_path_buf(),
-                account_id: selected_id,
-                account_email,
-                before,
-                finished: false,
-            }),
-            switched,
-        })
+        Ok((
+            PreparedAgyAccount {
+                account_id: Some(id_copy),
+                overlay: Some(Self {
+                    temp_home,
+                    real_home: real_home.to_path_buf(),
+                    root: root.to_path_buf(),
+                    account_id: selected_id,
+                    account_email,
+                    before,
+                    finished: false,
+                }),
+                switched,
+            },
+            pointer_update,
+        ))
     }
 
     #[cfg(test)]
@@ -2804,13 +4513,20 @@ fn format_quota_brief(quota: &Value) -> String {
 }
 
 fn cmd_list(args: &[String]) -> Res<i32> {
-    let usage = "delegate agy account list [--quota] [--agy-bin PATH] [--json]";
-    let (pos, flags, kv) = parse_simple(usage, args, &["--json", "--quota"], &["--agy-bin"])?;
+    let usage = "delegate agy account list [--quota|--quota-if-stale] [--agy-bin PATH] [--json]";
+    let (pos, flags, kv) =
+        parse_simple(usage, args, &["--json", "--quota", "--quota-if-stale"], &["--agy-bin"])?;
     if !pos.is_empty() {
-        return Err(unrecognized_arg(&pos.join(" "), &["--json", "--quota", "--agy-bin"], usage));
+        return Err(unrecognized_arg(
+            &pos.join(" "),
+            &["--json", "--quota", "--quota-if-stale", "--agy-bin"],
+            usage,
+        ));
     }
     if has(&flags, "--quota") {
         refresh_all_quotas(value(&kv, "--agy-bin"))?;
+    } else if has(&flags, "--quota-if-stale") {
+        refresh_stale_quotas(value(&kv, "--agy-bin"), None)?;
     }
     let snap = snapshot_json();
     if has(&flags, "--json") {
@@ -2820,6 +4536,7 @@ fn cmd_list(args: &[String]) -> Res<i32> {
     let accounts = snap["accounts"].as_array().cloned().unwrap_or_default();
     let running = snap["runningAgy"].as_array().map_or(0, Vec::len);
     let active = snap["active"].as_str().unwrap_or("");
+    let is_auto = s(&snap, "mode") == AUTO_ACCOUNT_ID;
     if accounts.is_empty() {
         println!("No agy accounts configured ({}).", s(&snap, "root"));
         println!("Next: delegate agy account add [<id>] | delegate agy account import-agy-swap --dry-run");
@@ -2829,25 +4546,35 @@ fn cmd_list(args: &[String]) -> Res<i32> {
         .as_i64()
         .map(|a| format!(", quota age: {}", format_age_compact(a)))
         .unwrap_or_default();
+    let sel_hdr = if is_auto {
+        format!(
+            "selected: auto [live: {}]",
+            if active.is_empty() { "none" } else { active }
+        )
+    } else {
+        format!("active: {}", if active.is_empty() { "none" } else { active })
+    };
     println!(
-        "agy accounts ({}, active: {}, running agy: {}{age_hdr}):",
+        "agy accounts ({} + auto, {sel_hdr}, running agy: {}{age_hdr}):",
         accounts.len(),
-        if active.is_empty() { "none" } else { active },
         running
     );
     for item in &accounts {
-        let mark = if b(item, "active") { "*" } else { " " };
+        let mark = if !is_auto && b(item, "active") { "*" } else { " " };
         let id = s(item, "id");
         let email = s(item, "email");
         let last_used = s(item, "lastUsedAt");
         let last_str = if last_used.is_empty() { "-" } else { last_used };
         let files = item["fileCount"].as_u64().unwrap_or(0);
         let label = s(item, "label");
-        let label_part = if label.is_empty() {
+        let mut label_part = if label.is_empty() {
             String::new()
         } else {
             format!(" [{label}]")
         };
+        if is_auto && b(item, "active") {
+            label_part.push_str(" [live]");
+        }
         let t5 = n(&item["usage"]["fiveHour"], "total");
         let t7 = n(&item["usage"]["sevenDay"], "total");
         let unc = item["usage"]["fiveHour"]["uncountedRunning"].as_u64().unwrap_or(0);
@@ -2875,6 +4602,28 @@ fn cmd_list(args: &[String]) -> Res<i32> {
         };
         println!("  {mark} {id:<16} {email:<30} last_used={last_str} files={files}{usage_part}{quota_part}{label_part}");
     }
+    // Always list the virtual `auto` slot row and mark `*` when selected.
+    let auto_mark = if is_auto { "*" } else { " " };
+    let mut pool_bits = Vec::new();
+    for pool in QuotaPool::ALL {
+        let ps = &snap["autoSwitch"]["poolSummary"][pool.key()];
+        let sel = s(ps, "selected");
+        let tier = s(ps, "tierLabel");
+        if !sel.is_empty() {
+            pool_bits.push(format!("{}→{sel}({tier})", pool.short_label()));
+        }
+    }
+    let pools_desc = if pool_bits.is_empty() {
+        "按池自动选号".to_string()
+    } else {
+        pool_bits.join(" ")
+    };
+    let auto_tail = if is_auto {
+        format!("(实盘: {})", if active.is_empty() { "none" } else { active })
+    } else {
+        "(执行 `use auto` 开启)".to_string()
+    };
+    println!("  {auto_mark} {:<16} [自动选号] {pools_desc}  {auto_tail}", AUTO_ACCOUNT_ID);
     if b(&snap, "liveDrifted") {
         println!(
             "note: live ~/.gemini account ({}) differs from active slot ({})",
@@ -2883,18 +4632,25 @@ fn cmd_list(args: &[String]) -> Res<i32> {
         );
     }
     print_duplicate_quota_warnings(&snap);
-    println!("Next: delegate agy account use <id> | delegate agy account status --quota");
+    println!("Next: delegate agy account use <id|auto> | delegate agy account pick | delegate agy account status --quota");
     Ok(0)
 }
 
 fn cmd_status(args: &[String]) -> Res<i32> {
-    let usage = "delegate agy account status [--quota] [--agy-bin PATH] [--json]";
-    let (pos, flags, kv) = parse_simple(usage, args, &["--json", "--quota"], &["--agy-bin"])?;
+    let usage = "delegate agy account status [--quota|--quota-if-stale] [--agy-bin PATH] [--json]";
+    let (pos, flags, kv) =
+        parse_simple(usage, args, &["--json", "--quota", "--quota-if-stale"], &["--agy-bin"])?;
     if !pos.is_empty() {
-        return Err(unrecognized_arg(&pos.join(" "), &["--json", "--quota", "--agy-bin"], usage));
+        return Err(unrecognized_arg(
+            &pos.join(" "),
+            &["--json", "--quota", "--quota-if-stale", "--agy-bin"],
+            usage,
+        ));
     }
     if has(&flags, "--quota") {
         refresh_all_quotas(value(&kv, "--agy-bin"))?;
+    } else if has(&flags, "--quota-if-stale") {
+        refresh_stale_quotas(value(&kv, "--agy-bin"), None)?;
     }
     let snap = snapshot_json();
     if has(&flags, "--json") {
@@ -2902,12 +4658,43 @@ fn cmd_status(args: &[String]) -> Res<i32> {
         return Ok(0);
     }
     let active = snap["active"].as_str().unwrap_or("");
+    let is_auto = s(&snap, "mode") == AUTO_ACCOUNT_ID;
     let live = s(&snap, "liveEmail");
     let accounts = snap["accounts"].as_array().cloned().unwrap_or_default();
     let running = snap["runningAgy"].as_array().cloned().unwrap_or_default();
+    if is_auto {
+        println!(
+            "selected: auto (mode: auto; live ~/.gemini slot: {})",
+            if active.is_empty() { "(none)" } else { active }
+        );
+    } else {
+        println!(
+            "selected: {} (mode: fixed)",
+            if active.is_empty() { "(none)" } else { active }
+        );
+    }
     println!(
         "active: {}",
         if active.is_empty() { "(none)" } else { active }
+    );
+    let mut auto_pool_bits = Vec::new();
+    for pool in QuotaPool::ALL {
+        let ps = &snap["autoSwitch"]["poolSummary"][pool.key()];
+        let sel = s(ps, "selected");
+        let tier = s(ps, "tierLabel");
+        if !sel.is_empty() {
+            auto_pool_bits.push(format!("{}→{sel}({tier})", pool.short_label()));
+        }
+    }
+    let auto_mark = if is_auto { "*" } else { " " };
+    println!(
+        "auto: [{auto_mark}] {} ({})",
+        if is_auto { "on" } else { "off" },
+        if auto_pool_bits.is_empty() {
+            "none".to_string()
+        } else {
+            auto_pool_bits.join(" · ")
+        }
     );
     if !live.is_empty() {
         println!("live ~/.gemini email: {live}");
@@ -3079,6 +4866,9 @@ fn cmd_add(args: &[String]) -> Res<i32> {
         .or_else(|| pos.first().map(String::as_str))
         .map(str::to_string);
     if let Some(ref id) = explicit_id {
+        if id.eq_ignore_ascii_case(AUTO_ACCOUNT_ID) {
+            return Err("account slot id \"auto\" is reserved for automatic selection mode".into());
+        }
         validate_id(id)?;
     }
     let label = value(&kv, "--label").unwrap_or("").to_string();
@@ -3238,12 +5028,88 @@ fn cmd_use(args: &[String]) -> Res<i32> {
         &[],
     )?;
     if pos.len() != 1 {
-        return Err("usage: delegate agy account use <id> [--force] [--json]".into());
+        return Err("usage: delegate agy account use <id|auto> [--force] [--json]".into());
     }
     let target_id = &pos[0];
+    let json_out = has(&flags, "--json");
+
+    if target_id == AUTO_ACCOUNT_ID {
+        let root = accounts_root();
+        let home_dir = home();
+        let _lock = acquire_accounts_lock(&root)?;
+        let mut state = load_state(&root);
+        let acct_count = state["accounts"].as_object().map_or(0, Map::len);
+        if acct_count == 0 {
+            return Err(
+                "no agy account slots configured; run `delegate agy account add` or `import-agy-swap`"
+                    .into(),
+            );
+        }
+        let prev_active = state["active"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let prev_mode = if is_auto_mode_state(&state) { "auto" } else { "fixed" };
+        let running = detect_running_agy_for_home(&home_dir);
+
+        // Keep live ~/.gemini untouched on the prior active slot; only switch mode to `auto`.
+        state["schemaVersion"] = json!(SCHEMA_VERSION);
+        state["mode"] = json!(AUTO_ACCOUNT_ID);
+        save_state(&root, &state)?;
+
+        let state_root = state_dir();
+        let pool_cur = load_pool_current_in(&state_root);
+        let mut pc_json = Map::new();
+        for pool in QuotaPool::ALL {
+            let cur = pool_cur
+                .get(&pool)
+                .filter(|id| state["accounts"].get(id.as_str()).is_some())
+                .cloned()
+                .or_else(|| prev_active.clone());
+            if let Some(id) = cur {
+                pc_json.insert(pool.key().to_string(), json!(id));
+            }
+        }
+        let running_json: Vec<Value> = running.iter().map(running_agy_to_json).collect();
+        if json_out {
+            println!(
+                "{}",
+                json!({
+                    "ok": true,
+                    "mode": "auto",
+                    "selected": "auto",
+                    "previousMode": prev_mode,
+                    "active": prev_active,
+                    "liveSlot": prev_active,
+                    "poolCurrent": Value::Object(pc_json),
+                    "runningAgyCount": running.len(),
+                    "runningAgy": running_json,
+                })
+            );
+        } else {
+            let live_lbl = prev_active.as_deref().unwrap_or("none");
+            println!(
+                "switched agy account selection to auto (live ~/.gemini stays on {live_lbl}; new runs will auto-select per quota pool)."
+            );
+            if !running.is_empty() {
+                println!(
+                    "note: {} running agy process(es) and existing sessions will continue on their original account.",
+                    running.len()
+                );
+                for p in &running {
+                    println!("{}", format_running_proc_line(p));
+                }
+            } else {
+                println!(
+                    "note: existing sessions remain pinned; new runs will auto-select per pool. Use `delegate agy account use <id>` to pin a fixed account."
+                );
+            }
+        }
+        return Ok(0);
+    }
+
     validate_id(target_id)?;
     let force = has(&flags, "--force");
-    let json_out = has(&flags, "--json");
 
     let root = accounts_root();
     let home_dir = home();
@@ -3334,11 +5200,14 @@ fn cmd_use(args: &[String]) -> Res<i32> {
 
     state["schemaVersion"] = json!(SCHEMA_VERSION);
     state["active"] = json!(target_id);
+    state["mode"] = json!("fixed");
     if let Some(obj) = state["accounts"][target_id].as_object_mut() {
         obj.insert("lastUsedAt".into(), json!(now));
         obj.insert("lastSyncedAt".into(), json!(now));
     }
     save_state(&root, &state)?;
+    // Sync all per-pool pointers to `target_id` so re-entering `use auto` starts from here.
+    let _ = set_all_pool_currents_in(&state_dir(), target_id);
 
     let target_email = s(&state["accounts"][target_id], "email").to_string();
     let running_json: Vec<Value> = running.iter().map(running_agy_to_json).collect();
@@ -3347,6 +5216,8 @@ fn cmd_use(args: &[String]) -> Res<i32> {
             "{}",
             json!({
                 "ok": true,
+                "mode": "fixed",
+                "selected": target_id,
                 "active": target_id,
                 "email": target_email,
                 "previousActive": prev_active,
@@ -3424,7 +5295,11 @@ fn cmd_remove(args: &[String]) -> Res<i32> {
     if is_active {
         state["active"] = Value::Null;
     }
+    if state["accounts"].as_object().is_none_or(Map::is_empty) {
+        state["mode"] = json!("fixed");
+    }
     save_state(&root, &state)?;
+    let _ = clear_pool_current_slot_in(&state_dir(), id);
 
     if json_out {
         println!(
@@ -4148,19 +6023,337 @@ fn cmd_note(args: &[String]) -> Res<i32> {
     Ok(0)
 }
 
+fn resolve_pick_model_alias(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // Try repo `.delegate.json` first, then user config `models` alias map (strictly read-only).
+    if let Ok(cwd) = env::current_dir() {
+        if let Some(top) = git_top(&cwd) {
+            if let Ok(Some(repo_doc)) = crate::config::read_file(&top.join(".delegate.json")) {
+                if let Some(entry) = repo_doc.get("models").and_then(|m| m.get(trimmed)) {
+                    if let Some(mapped) = crate::models::alias_model(entry) {
+                        return mapped.to_string();
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(Some(user_doc)) = crate::config::read_file(&crate::config::user_path()) {
+        if let Some(entry) = user_doc.get("models").and_then(|m| m.get(trimmed)) {
+            if let Some(mapped) = crate::models::alias_model(entry) {
+                return mapped.to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Strictly read-only dry-run report for `delegate agy account pick [--model <alias>] [--json]`.
+/// Never creates a run, never queries `agy -p /usage`, never mutates state files.
+#[allow(clippy::too_many_arguments)]
+pub fn build_pick_report_in(
+    root: &Path,
+    state: &Value,
+    quota_cache: &Value,
+    pool_current: &BTreeMap<QuotaPool, String>,
+    running_writers: &BTreeMap<(String, QuotaPool), usize>,
+    model_input: Option<&str>,
+    resolved_model: Option<&str>,
+    cfg: &AgyAutoSwitchConfig,
+    now_ep: i64,
+) -> Value {
+    let active_id = state["active"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let mut all_ids: Vec<String> = state["accounts"]
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    all_ids.sort();
+
+    let mut pool_cur_json = Map::new();
+    for pool in QuotaPool::ALL {
+        let cur = pool_current
+            .get(&pool)
+            .filter(|id| state["accounts"].get(id.as_str()).is_some())
+            .cloned()
+            .or_else(|| active_id.clone());
+        if let Some(id) = cur {
+            pool_cur_json.insert(pool.key().to_string(), json!(id));
+        }
+    }
+
+    let mut accounts_json: Vec<Value> = Vec::new();
+    for id in &all_ids {
+        let health = check_slot_health(root, state, quota_cache, id);
+        let acct_quota = &quota_cache["accounts"][id];
+        let fetched_at = s(acct_quota, "fetchedAt").to_string();
+        let fetched_ep = acct_quota["fetchedEpoch"].as_i64().unwrap_or(0);
+        let age_secs = (fetched_ep > 0).then(|| (now_ep - fetched_ep).max(0));
+
+        let mut pools_map = Map::new();
+        for pool in QuotaPool::ALL {
+            let k = running_writers.get(&(id.clone(), pool)).copied().unwrap_or(0);
+            let ev = evaluate_slot_pool(acct_quota, pool, cfg, k, now_ep);
+            pools_map.insert(
+                pool.key().to_string(),
+                json!({
+                    "tier": ev.tier.as_str(),
+                    "tierLabel": ev.tier.label_zh(),
+                    "rawFiveHourPct": ev.raw_five_hour_pct,
+                    "effectiveFiveHourPct": ev.eff_five_hour_pct,
+                    "weeklyPct": ev.weekly_pct,
+                    "runningWriters": ev.running_writers,
+                    "passiveExhausted": ev.passive_exhausted,
+                    "unknown": ev.unknown,
+                }),
+            );
+        }
+        accounts_json.push(json!({
+            "id": id,
+            "active": active_id.as_deref() == Some(id.as_str()),
+            "healthy": health.is_ok(),
+            "unhealthyReason": health.err(),
+            "fetchedAt": fetched_at,
+            "fetchedEpoch": fetched_ep,
+            "ageSeconds": age_secs,
+            "pools": Value::Object(pools_map),
+        }));
+    }
+
+    let mut picks_map = Map::new();
+    for pool in QuotaPool::ALL {
+        let probe_model = match pool {
+            QuotaPool::Gemini => "agy/gemini",
+            QuotaPool::ClaudeGpt => "agy/claude",
+        };
+        let dec = select_account_for_new_session(
+            root,
+            state,
+            quota_cache,
+            pool_current,
+            running_writers,
+            probe_model,
+            cfg,
+            now_ep,
+        );
+        picks_map.insert(
+            pool.key().to_string(),
+            json!({
+                "pool": pool.key(),
+                "poolLabel": pool.short_label(),
+                "current": dec.current_before,
+                "selected": dec.selected_id,
+                "wouldSwitch": dec.switched.is_some(),
+                "pointerChanged": dec.pointer_changed,
+                "reason": dec.reason,
+            }),
+        );
+    }
+
+    let quota_updated_at = s(quota_cache, "updatedAt").to_string();
+    let quota_updated_ep = quota_cache["updatedEpoch"].as_i64().unwrap_or(0);
+    let quota_age_secs = (quota_updated_ep > 0).then(|| (now_ep - quota_updated_ep).max(0));
+    let auto_mode = is_auto_mode_state(state);
+    let mut auto_cfg_json = cfg.to_json();
+    auto_cfg_json["enabled"] = json!(auto_mode);
+    auto_cfg_json["mode"] = json!(if auto_mode { "auto" } else { "fixed" });
+
+    let mut out = json!({
+        "ok": true,
+        "mode": if auto_mode { "auto" } else { "fixed" },
+        "autoSwitch": auto_cfg_json,
+        "active": active_id,
+        "poolCurrent": Value::Object(pool_cur_json),
+        "quotaUpdatedAt": quota_updated_at,
+        "quotaAgeSeconds": quota_age_secs,
+        "picks": Value::Object(picks_map),
+        "accounts": accounts_json,
+    });
+
+    if let Some(raw_m) = model_input.filter(|m| !m.trim().is_empty()) {
+        let res_m = resolved_model.unwrap_or(raw_m);
+        let dec = select_account_for_new_session(
+            root,
+            state,
+            quota_cache,
+            pool_current,
+            running_writers,
+            res_m,
+            cfg,
+            now_ep,
+        );
+        out["model"] = json!(raw_m);
+        out["resolvedModel"] = json!(res_m);
+        out["pool"] = json!(dec.pool.map(QuotaPool::key));
+        out["current"] = json!(dec.current_before);
+        out["selected"] = json!(dec.selected_id);
+        out["wouldSwitch"] = json!(dec.switched.is_some());
+        out["pointerChanged"] = json!(dec.pointer_changed);
+        out["reason"] = json!(dec.reason);
+    }
+    out
+}
+
+fn format_pick_pool_eval_cell(pool_obj: &Value) -> String {
+    let tier = s(pool_obj, "tierLabel");
+    if b(pool_obj, "passiveExhausted") {
+        return format!("{tier}(被动0%)");
+    }
+    if b(pool_obj, "unknown") {
+        return format!("{tier}(未知)");
+    }
+    let eff5 = pool_obj["effectiveFiveHourPct"]
+        .as_f64()
+        .map(|v| format!("{:.0}%", v))
+        .unwrap_or_else(|| "-".to_string());
+    let wk = pool_obj["weeklyPct"]
+        .as_f64()
+        .map(|v| format!("{:.0}%", v))
+        .unwrap_or_else(|| "-".to_string());
+    let rw = pool_obj["runningWriters"].as_u64().unwrap_or(0);
+    if rw > 0 {
+        let raw5 = pool_obj["rawFiveHourPct"]
+            .as_f64()
+            .map(|v| format!("{:.0}%", v))
+            .unwrap_or_else(|| "-".to_string());
+        format!("{tier}(5h:{eff5}[原{raw5},在跑{rw}] 7d:{wk})")
+    } else {
+        format!("{tier}(5h:{eff5} 7d:{wk})")
+    }
+}
+
+fn cmd_pick(args: &[String]) -> Res<i32> {
+    let usage = "delegate agy account pick [--model <alias>] [--json]";
+    let (pos, flags, kv) = parse_simple(usage, args, &["--json"], &["--model"])?;
+    if !pos.is_empty() {
+        return Err(unrecognized_arg(&pos.join(" "), &["--json", "--model"], usage));
+    }
+    let json_out = has(&flags, "--json");
+    let model_input = value(&kv, "--model");
+    let resolved = model_input.map(resolve_pick_model_alias);
+
+    let root = accounts_root();
+    let state_root = state_dir();
+    let state = load_state(&root);
+    let quota_cache = load_quota_cache_in(&state_root);
+    let pool_cur = load_pool_current_in(&state_root);
+    let running = count_running_writers(&state_root, None);
+    let cfg = load_agy_auto_switch_config();
+    let now_ep = epoch() as i64;
+
+    let report = build_pick_report_in(
+        &root,
+        &state,
+        &quota_cache,
+        &pool_cur,
+        &running,
+        model_input,
+        resolved.as_deref(),
+        &cfg,
+        now_ep,
+    );
+
+    if json_out {
+        println!("{report}");
+        return Ok(0);
+    }
+
+    let is_auto = s(&report, "mode") == AUTO_ACCOUNT_ID;
+    let active = report["active"].as_str().unwrap_or("none");
+    let status_lbl = if is_auto {
+        format!(
+            "auto（5h≥{:.0}% 7d≥{:.0}% · {}m · 预扣{:.0}%/写手）",
+            cfg.five_hour_min_pct,
+            cfg.weekly_min_pct,
+            cfg.refresh_minutes,
+            cfg.per_run_reserve_pct,
+        )
+    } else {
+        format!("固定号（{active}；执行 `delegate agy account use auto` 开启自动选号）")
+    };
+    let cache_at = s(&report, "quotaUpdatedAt");
+    let cache_age = report["quotaAgeSeconds"]
+        .as_i64()
+        .map(format_age_compact)
+        .unwrap_or_else(|| "无缓存".to_string());
+    let cache_info = if cache_at.is_empty() {
+        "无缓存".to_string()
+    } else {
+        format!("{cache_at}（{cache_age}）")
+    };
+    println!("模式：{status_lbl} · 实盘号：{active} · 缓存：{cache_info}");
+
+    if let Some(raw_m) = model_input {
+        let sel = report["selected"].as_str().unwrap_or("none");
+        let pool_str = report["pool"].as_str().unwrap_or("unknown");
+        let reason = s(&report, "reason");
+        let res_m = s(&report, "resolvedModel");
+        let model_lbl = if res_m != raw_m && !res_m.is_empty() {
+            format!("{raw_m} -> {res_m}")
+        } else {
+            raw_m.to_string()
+        };
+        println!("新会话选号 [{model_lbl} · 池:{pool_str}]：{sel}（{reason}）");
+    } else {
+        for pool in QuotaPool::ALL {
+            let p = &report["picks"][pool.key()];
+            let sel = p["selected"].as_str().unwrap_or("none");
+            let reason = s(p, "reason");
+            println!("新会话选号 [{}]：{sel}（{reason}）", pool.short_label());
+        }
+    }
+
+    if let Some(accounts) = report["accounts"].as_array() {
+        if accounts.is_empty() {
+            println!("  （未配置 agy 账号槽位）");
+        } else {
+            for acct in accounts {
+                let id = s(acct, "id");
+                let mark = if b(acct, "active") { "*" } else { " " };
+                let health_tag = if b(acct, "healthy") {
+                    String::new()
+                } else {
+                    format!(" [不可用:{}]", s(acct, "unhealthyReason"))
+                };
+                let fetched = s(acct, "fetchedAt");
+                let age = acct["ageSeconds"]
+                    .as_i64()
+                    .map(format_age_compact)
+                    .unwrap_or_else(|| "无缓存".to_string());
+                let g_cell = format_pick_pool_eval_cell(&acct["pools"]["gemini"]);
+                let c_cell = format_pick_pool_eval_cell(&acct["pools"]["claude_gpt"]);
+                let ts_part = if fetched.is_empty() {
+                    "缓存:无".to_string()
+                } else {
+                    format!("缓存:{fetched}({age})")
+                };
+                println!(
+                    "  {mark} {id:<14} Gemini={g_cell}  Claude/GPT={c_cell}  {ts_part}{health_tag}"
+                );
+            }
+        }
+    }
+    Ok(0)
+}
+
 fn print_account_help() {
     println!(
         "Usage: delegate agy account <subcommand> [options]\n\n\
-         Manage local Antigravity CLI (agy) accounts manually (~/.config/delegate/agy-accounts/).\n\
-         No automatic rotation; real quota uses `agy -p /usage </dev/null` only (no internal HTTP APIs).\n\n\
+         Manage local Antigravity CLI (agy) accounts (~/.config/delegate/agy-accounts/).\n\
+         Real quota uses `agy -p /usage </dev/null` only (no internal HTTP APIs).\n\n\
          Subcommands:\n\
-         \x20 list [--quota] [--agy-bin PATH] [--json]\n\
+         \x20 list [--quota|--quota-if-stale] [--agy-bin PATH] [--json]\n\
          \x20                                      List saved account slots, active marker, 5h/7d usage & quota\n\
-         \x20 status [--quota] [--agy-bin PATH] [--json]\n\
+         \x20 status [--quota|--quota-if-stale] [--agy-bin PATH] [--json]\n\
          \x20                                      Show active account, live email, quota, usage, running agy\n\
+         \x20 pick [--model ALIAS] [--json]        Read-only dry-run: show which account a new session would pick from cache\n\
          \x20 add [<id>] [--label TEXT] [--overwrite] [--agy-bin PATH] [-- <agy-args>...]\n\
          \x20                                      Run interactive agy login in a temp HOME and save slot\n\
-         \x20 use <id> [--force] [--json]          Save back refreshed tokens and switch (running processes & existing sessions stay on original account; new runs use new account)\n\
+         \x20 use <id|auto> [--force] [--json]     Switch to a fixed slot (updates ~/.gemini) or `auto` (auto-select per pool without touching ~/.gemini)\n\
          \x20 note <id> [--weekly PCT] [--five-hour PCT] [--clear] [--json]\n\
          \x20                                      Record manual remaining-% snapshot (fallback when real quota absent)\n\
          \x20 remove <id> [--force] [--json]       Delete a saved account slot (alias: rm)\n\
@@ -4204,6 +6397,7 @@ pub fn command(args: &[String]) -> Res<i32> {
     match sub {
         "list" | "ls" => cmd_list(sub_args),
         "status" => cmd_status(sub_args),
+        "pick" => cmd_pick(sub_args),
         "add" => cmd_add(sub_args),
         "use" => cmd_use(sub_args),
         "note" => cmd_note(sub_args),
@@ -4909,11 +7103,13 @@ Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSum
         assert_eq!(fresh.account_id.as_deref(), Some("beta"));
         assert!(fresh.switched.is_none());
 
-        // 3. Quota exhausted on Gemini pool (resetAt in future) -> falls back to active beta, not gamma.
+        // 3. Cached quota 0% on Gemini pool MUST stay strictly sticky on pinned alpha
+        //    (never silently switch accounts while resuming an existing conversation).
         let exhausted_quota = json!({
             "accounts": {
                 "alpha": {
                     "ok": true,
+                    "fetchedEpoch": now_ep,
                     "entries": [
                         {"pool": "Gemini Models", "window": "fiveHour", "remainingPct": 0.0, "resetAt": "2026-11-26T18:00:00Z"},
                         {"pool": "Claude and GPT models", "window": "fiveHour", "remainingPct": 85.0, "resetAt": "2026-11-26T18:00:00Z"}
@@ -4921,7 +7117,7 @@ Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSum
                 }
             }
         });
-        let fb_gemini = AgyCredOverlay::prepare_for_session_in(
+        let keep_sticky_on_zero = AgyCredOverlay::prepare_for_session_in(
             &root,
             &real_home,
             &real_cfg,
@@ -4931,11 +7127,8 @@ Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSum
             now_ep,
         )
         .unwrap();
-        assert_eq!(fb_gemini.account_id.as_deref(), Some("beta"));
-        let sw = fb_gemini.switched.expect("should report switch");
-        assert_eq!(sw.from, "alpha");
-        assert_eq!(sw.to, "beta");
-        assert_eq!(sw.reason, "额度已耗尽");
+        assert_eq!(keep_sticky_on_zero.account_id.as_deref(), Some("alpha"));
+        assert!(keep_sticky_on_zero.switched.is_none());
 
         // 4. Same quota cache, but Claude model -> Claude pool is 85%, so stays on alpha.
         let keep_claude = AgyCredOverlay::prepare_for_session_in(
@@ -5031,5 +7224,668 @@ Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSum
         assert_eq!(sw_del.from, "alpha");
         assert_eq!(sw_del.to, "beta");
         assert_eq!(sw_del.reason, "原槽位已删除");
+    }
+
+    fn setup_two_test_slots() -> (TempHome, PathBuf, PathBuf, PathBuf, Value) {
+        let base = TempHome::create().unwrap();
+        let real_home = base.path.join("home");
+        let real_cfg = real_home.join(".config");
+        let root = real_cfg.join("delegate/agy-accounts");
+        fs::create_dir_all(real_home.join(".gemini/antigravity-cli")).unwrap();
+        for (id, email, tok) in [
+            ("acct-a", "a@example.test", "TOK-A"),
+            ("acct-b", "b@example.test", "TOK-B"),
+        ] {
+            let sdir = slot_dir(&root, id);
+            ensure_dir_mode(&sdir, 0o700).unwrap();
+            let bytes = make_test_token_json(email, tok, "2026-11-27T20:00:00Z");
+            write_secret_0600(&sdir.join("antigravity-cli-oauth-token"), &bytes, true).unwrap();
+        }
+        install_slot_to_home(&slot_dir(&root, "acct-a"), &real_home).unwrap();
+        let state = json!({
+            "schemaVersion": SCHEMA_VERSION,
+            "active": "acct-a",
+            "mode": "auto",
+            "accounts": {
+                "acct-a": {"id": "acct-a", "email": "a@example.test"},
+                "acct-b": {"id": "acct-b", "email": "b@example.test"}
+            }
+        });
+        save_state(&root, &state).unwrap();
+        (base, root, real_home, real_cfg, state)
+    }
+
+    fn mk_pool_quota(
+        now_ep: i64,
+        a_gem: (f64, f64),
+        b_gem: (f64, f64),
+        reset_at: &str,
+    ) -> Value {
+        json!({
+            "schemaVersion": 1,
+            "updatedEpoch": now_ep,
+            "updatedAt": format_epoch(now_ep, false, "%Y-%m-%dT%H:%M:%SZ"),
+            "accounts": {
+                "acct-a": {
+                    "ok": true,
+                    "fetchedEpoch": now_ep,
+                    "fetchedAt": format_epoch(now_ep, false, "%Y-%m-%dT%H:%M:%SZ"),
+                    "entries": [
+                        {"pool": "Gemini Models", "window": "fiveHour", "remainingPct": a_gem.0, "resetAt": reset_at},
+                        {"pool": "Gemini Models", "window": "weekly", "remainingPct": a_gem.1, "resetAt": "2026-12-04T00:00:00Z"}
+                    ]
+                },
+                "acct-b": {
+                    "ok": true,
+                    "fetchedEpoch": now_ep,
+                    "fetchedAt": format_epoch(now_ep, false, "%Y-%m-%dT%H:%M:%SZ"),
+                    "entries": [
+                        {"pool": "Gemini Models", "window": "fiveHour", "remainingPct": b_gem.0, "resetAt": reset_at},
+                        {"pool": "Gemini Models", "window": "weekly", "remainingPct": b_gem.1, "resetAt": "2026-12-04T00:00:00Z"}
+                    ]
+                }
+            }
+        })
+    }
+
+    fn enabled_cfg() -> AgyAutoSwitchConfig {
+        AgyAutoSwitchConfig::default()
+    }
+
+    #[test]
+    fn carbon_counterexample_double_low_no_ping_pong() {
+        let (_base, root, _, _, state) = setup_two_test_slots();
+        let now_ep = iso_epoch("2026-11-27T10:00:00Z").unwrap();
+        let cfg = enabled_cfg();
+        let mut pc = BTreeMap::new();
+        pc.insert(QuotaPool::Gemini, "acct-a".to_string());
+        let rw = BTreeMap::new();
+
+        // Weekend double-low: both Yellow (5h=80%, 7d=25% vs 26%) -> stays on current acct-a.
+        let q1 = mk_pool_quota(now_ep, (80.0, 25.0), (80.0, 26.0), "2026-11-27T15:00:00Z");
+        let d1 = select_account_for_new_session(&root, &state, &q1, &pc, &rw, "agy/gemini-4-neon", &cfg, now_ep);
+        assert_eq!(d1.selected_id.as_deref(), Some("acct-a"));
+        assert!(!d1.pointer_changed);
+        assert!(d1.switched.is_none());
+
+        // 15m later: acct-a drops 2% to 23% (still Yellow) -> still stays on acct-a, no ping-pong.
+        let q2 = mk_pool_quota(now_ep + 900, (78.0, 23.0), (80.0, 26.0), "2026-11-27T15:00:00Z");
+        let d2 = select_account_for_new_session(&root, &state, &q2, &pc, &rw, "agy/gemini-4-neon", &cfg, now_ep + 900);
+        assert_eq!(d2.selected_id.as_deref(), Some("acct-a"));
+        assert!(!d2.pointer_changed);
+    }
+
+    #[test]
+    fn carbon_counterexample_never_switches_to_zero_pct_dead_slot_and_double_red_rule() {
+        let (_base, root, _, _, state) = setup_two_test_slots();
+        let now_ep = iso_epoch("2026-11-27T10:00:00Z").unwrap();
+        let cfg = enabled_cfg();
+        let mut pc = BTreeMap::new();
+        pc.insert(QuotaPool::Gemini, "acct-a".to_string());
+        let rw = BTreeMap::new();
+
+        // A(5h=25%, 7d=60%) is Yellow; B(5h=0%, 7d=75%) is Red -> MUST stay on A, never switch to 0% B!
+        let q = mk_pool_quota(now_ep, (25.0, 60.0), (0.0, 75.0), "2026-11-27T15:00:00Z");
+        let d = select_account_for_new_session(&root, &state, &q, &pc, &rw, "agy/gemini-4-neon", &cfg, now_ep);
+        assert_eq!(d.selected_id.as_deref(), Some("acct-a"));
+        assert!(!d.pointer_changed);
+
+        // Double-Red: A(5h=0%, 7d=80%) vs B(5h=3%, 7d=10%) -> B has 5h > 0, so switches to B.
+        let q_red = mk_pool_quota(now_ep, (0.0, 80.0), (3.0, 10.0), "2026-11-27T15:00:00Z");
+        let d_red = select_account_for_new_session(&root, &state, &q_red, &pc, &rw, "agy/gemini-4-neon", &cfg, now_ep);
+        assert_eq!(d_red.selected_id.as_deref(), Some("acct-b"));
+        assert!(d_red.pointer_changed);
+        assert_eq!(d_red.switched.as_ref().unwrap().kind, "auto");
+
+        // Double-Red both 5h=0%: A(0%, 50%) vs B(0%, 80%) -> both (false, 0) -> stays on current A.
+        let q_both0 = mk_pool_quota(now_ep, (0.0, 50.0), (0.0, 80.0), "2026-11-27T15:00:00Z");
+        let d_both0 = select_account_for_new_session(&root, &state, &q_both0, &pc, &rw, "agy/gemini-4-neon", &cfg, now_ep);
+        assert_eq!(d_both0.selected_id.as_deref(), Some("acct-a"));
+        assert!(!d_both0.pointer_changed);
+    }
+
+    #[test]
+    fn carbon_counterexample_7d_5h_mismatch_stays_on_current() {
+        let (_base, root, _, _, state) = setup_two_test_slots();
+        let now_ep = iso_epoch("2026-11-27T10:00:00Z").unwrap();
+        let cfg = enabled_cfg();
+        let mut pc = BTreeMap::new();
+        pc.insert(QuotaPool::Gemini, "acct-a".to_string());
+        let rw = BTreeMap::new();
+
+        // A(5h=90%, 7d=29%) Yellow vs B(5h=12%, 7d=31%) Yellow -> stays on A!
+        let q = mk_pool_quota(now_ep, (90.0, 29.0), (12.0, 31.0), "2026-11-27T15:00:00Z");
+        let d = select_account_for_new_session(&root, &state, &q, &pc, &rw, "agy/gemini-4-neon", &cfg, now_ep);
+        assert_eq!(d.selected_id.as_deref(), Some("acct-a"));
+        assert!(!d.pointer_changed);
+    }
+
+    #[test]
+    fn carbon_counterexample_manual_use_syncs_all_pool_pointers() {
+        let (base, root, _, _, state) = setup_two_test_slots();
+        let state_root = base.path.join("state");
+        fs::create_dir_all(&state_root).unwrap();
+        let now_ep = iso_epoch("2026-11-27T10:00:00Z").unwrap();
+        let cfg = enabled_cfg();
+
+        // Initially Gemini pointer is acct-a, Claude pointer is acct-a.
+        set_all_pool_currents_in(&state_root, "acct-a").unwrap();
+        assert_eq!(load_pool_current_in(&state_root).get(&QuotaPool::Gemini).map(String::as_str), Some("acct-a"));
+        assert_eq!(load_pool_current_in(&state_root).get(&QuotaPool::ClaudeGpt).map(String::as_str), Some("acct-a"));
+
+        // Manual `use acct-b` syncs BOTH pools to acct-b.
+        set_all_pool_currents_in(&state_root, "acct-b").unwrap();
+        let pc = load_pool_current_in(&state_root);
+        assert_eq!(pc.get(&QuotaPool::Gemini).map(String::as_str), Some("acct-b"));
+        assert_eq!(pc.get(&QuotaPool::ClaudeGpt).map(String::as_str), Some("acct-b"));
+
+        // Both Green -> next new session stays on acct-b (respecting manual `use acct-b`).
+        let q = mk_pool_quota(now_ep, (80.0, 80.0), (80.0, 80.0), "2026-11-27T15:00:00Z");
+        let d = select_account_for_new_session(&root, &state, &q, &pc, &BTreeMap::new(), "agy/gemini-4-neon", &cfg, now_ep);
+        assert_eq!(d.selected_id.as_deref(), Some("acct-b"));
+        assert!(!d.pointer_changed);
+    }
+
+    #[test]
+    fn carbon_counterexample_concurrent_blind_window_virtual_reserve() {
+        let (_base, root, _, _, state) = setup_two_test_slots();
+        let now_ep = iso_epoch("2026-11-27T10:00:00Z").unwrap();
+        let cfg = enabled_cfg(); // perRunReservePct = 5.0
+        let mut pc = BTreeMap::new();
+        pc.insert(QuotaPool::Gemini, "acct-a".to_string());
+        let q = mk_pool_quota(now_ep, (34.0, 80.0), (85.0, 80.0), "2026-11-27T15:00:00Z");
+
+        // k = 0 running writers -> eff_5h = 34 >= 30 (Green) -> stays on acct-a.
+        let d0 = select_account_for_new_session(&root, &state, &q, &pc, &BTreeMap::new(), "agy/gemini-4-neon", &cfg, now_ep);
+        assert_eq!(d0.selected_id.as_deref(), Some("acct-a"));
+
+        // k = 2 running Claude writers on acct-a -> does NOT deduct from Gemini pool!
+        let mut rw_other_pool = BTreeMap::new();
+        rw_other_pool.insert(("acct-a".to_string(), QuotaPool::ClaudeGpt), 2);
+        let d_other = select_account_for_new_session(&root, &state, &q, &pc, &rw_other_pool, "agy/gemini-4-neon", &cfg, now_ep);
+        assert_eq!(d_other.selected_id.as_deref(), Some("acct-a"));
+
+        // k = 2 running Gemini writers on acct-a -> eff_5h = 34 - 10 = 24 < 30 (Yellow) < B(Green) -> switches to acct-b!
+        let mut rw = BTreeMap::new();
+        rw.insert(("acct-a".to_string(), QuotaPool::Gemini), 2);
+        let d2 = select_account_for_new_session(&root, &state, &q, &pc, &rw, "agy/gemini-4-neon", &cfg, now_ep);
+        assert_eq!(d2.selected_id.as_deref(), Some("acct-b"));
+        assert!(d2.pointer_changed);
+        assert_eq!(d2.switched.as_ref().unwrap().kind, "auto");
+    }
+
+    #[test]
+    fn carbon_counterexample_reset_at_60s_buffer_and_post_reset_unknown() {
+        let (_base, root, _, _, state) = setup_two_test_slots();
+        let reset_str = "2026-11-27T12:00:00Z";
+        let reset_ep = iso_epoch(reset_str).unwrap();
+        let cfg = enabled_cfg();
+
+        // A was 0% at reset_ep - 600; B is measured 50%/60% (Green).
+        let q = mk_pool_quota(reset_ep - 600, (0.0, 80.0), (50.0, 60.0), reset_str);
+
+        // At reset_ep + 30 (within 60s buffer): A is STILL Red!
+        let ev_buf = evaluate_slot_pool(&q["accounts"]["acct-a"], QuotaPool::Gemini, &cfg, 0, reset_ep + 30);
+        assert_eq!(ev_buf.tier, QuotaTier::Red);
+        assert_eq!(ev_buf.raw_five_hour_pct, Some(0.0));
+
+        // At reset_ep + 60: A's 5h entry is reset -> treated as None (unknown, NOT 100.0%).
+        let ev_after = evaluate_slot_pool(&q["accounts"]["acct-a"], QuotaPool::Gemini, &cfg, 0, reset_ep + 60);
+        assert_eq!(ev_after.tier, QuotaTier::Green);
+        assert_eq!(ev_after.raw_five_hour_pct, None);
+
+        // When current is B(50%/60%, Green), post-reset A does NOT override measured B!
+        let mut pc = BTreeMap::new();
+        pc.insert(QuotaPool::Gemini, "acct-b".to_string());
+        let d = select_account_for_new_session(&root, &state, &q, &pc, &BTreeMap::new(), "agy/gemini-4-neon", &cfg, reset_ep + 60);
+        assert_eq!(d.selected_id.as_deref(), Some("acct-b"));
+        assert!(!d.pointer_changed);
+    }
+
+    #[test]
+    fn carbon_counterexample_passive_exhausted_excludes_429_and_synthesizes_15m_reset() {
+        // Transient 429 / RPM rate limits MUST NOT trigger passive exhaustion.
+        for non_quota in [
+            "HTTP 429 Too Many Requests",
+            "429 rate limit exceeded",
+            "rate_limit_exceeded: try again in 5s",
+            "429 RESOURCE_EXHAUSTED: requests per minute limit",
+            "capacity temporarily unavailable",
+        ] {
+            assert!(
+                !is_quota_exhausted_error(non_quota),
+                "429/rate-limit must NOT be treated as quota exhaustion: {non_quota}"
+            );
+        }
+        for hard_quota in [
+            "insufficient_quota: plan limit reached",
+            "Error: quota exceeded for this account",
+            "insufficient credit balance",
+            "Five hour limit reached",
+            "usage limit exceeded",
+            "RESOURCE_EXHAUSTED: no tokens left",
+        ] {
+            assert!(
+                is_quota_exhausted_error(hard_quota),
+                "hard quota error should match: {hard_quota}"
+            );
+        }
+
+        // Passive exhaustion with NO prior cache synthesizes resetAt = now + 15m and preserves weekly/history.
+        let base = TempHome::create().unwrap();
+        let state_root = base.path.join("state");
+        fs::create_dir_all(&state_root).unwrap();
+        let now_ep = iso_epoch("2026-11-27T10:00:00Z").unwrap();
+        save_quota_cache_in(
+            &state_root,
+            &json!({
+                "schemaVersion": 1,
+                "updatedEpoch": now_ep - 300,
+                "accounts": {
+                    "acct-a": {
+                        "ok": true,
+                        "fetchedEpoch": now_ep - 300,
+                        "entries": [
+                            {"pool": "Gemini Models", "window": "weekly", "remainingPct": 77.0, "resetAt": "2026-12-04T00:00:00Z"}
+                        ],
+                        "history": [{"epoch": now_ep - 300, "weekly": 77.0}]
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        mark_slot_quota_exhausted_passive_in(&state_root, "acct-a", "agy/gemini-4-neon", now_ep).unwrap();
+        let cache = load_quota_cache_in(&state_root);
+        let acct = &cache["accounts"]["acct-a"];
+        // Preserves original account fetchedEpoch, weekly, and history.
+        assert_eq!(acct["fetchedEpoch"].as_i64(), Some(now_ep - 300));
+        assert_eq!(acct["history"].as_array().unwrap().len(), 1);
+        let fh_entry = acct["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| s(e, "window") == "fiveHour")
+            .expect("synthesized fiveHour passive entry");
+        assert_eq!(s(fh_entry, "source"), "passive_error");
+        assert_eq!(fh_entry["remainingPct"].as_f64(), Some(0.0));
+        let expected_reset = format_epoch(now_ep + 900, false, "%Y-%m-%dT%H:%M:%SZ");
+        assert_eq!(s(fh_entry, "resetAt"), expected_reset);
+
+        // Immediately Red; expires after 15m + 60s buffer so it never permanently locks out.
+        let cfg = enabled_cfg();
+        let ev_now = evaluate_slot_pool(acct, QuotaPool::Gemini, &cfg, 0, now_ep + 60);
+        assert_eq!(ev_now.tier, QuotaTier::Red);
+        assert!(ev_now.passive_exhausted);
+        let ev_expired = evaluate_slot_pool(acct, QuotaPool::Gemini, &cfg, 0, now_ep + 900 + 60);
+        assert!(!ev_expired.passive_exhausted);
+        assert_eq!(ev_expired.tier, QuotaTier::Green);
+    }
+
+    #[test]
+    fn carbon_counterexample_stale_cache_is_unknown_and_401_excludes_slot() {
+        let (_base, root, _, _, state) = setup_two_test_slots();
+        let now_ep = iso_epoch("2026-11-27T10:00:00Z").unwrap();
+        let cfg = enabled_cfg();
+        let mut pc = BTreeMap::new();
+        pc.insert(QuotaPool::Gemini, "acct-a".to_string());
+
+        // acct-a has very stale data (>2h for 5h, >24h for 7d) showing low 5% -> degraded to Unknown (Green),
+        // so it MUST maintain current acct-a instead of switching on stale numbers!
+        let stale_q = json!({
+            "accounts": {
+                "acct-a": {
+                    "ok": true,
+                    "fetchedEpoch": now_ep - 25 * 3600,
+                    "entries": [
+                        {"pool": "Gemini Models", "window": "fiveHour", "remainingPct": 5.0, "resetAt": "2026-11-28T00:00:00Z"},
+                        {"pool": "Gemini Models", "window": "weekly", "remainingPct": 5.0, "resetAt": "2026-12-04T00:00:00Z"}
+                    ]
+                },
+                "acct-b": {
+                    "ok": true,
+                    "fetchedEpoch": now_ep,
+                    "entries": [
+                        {"pool": "Gemini Models", "window": "fiveHour", "remainingPct": 90.0, "resetAt": "2026-11-27T15:00:00Z"},
+                        {"pool": "Gemini Models", "window": "weekly", "remainingPct": 90.0, "resetAt": "2026-12-04T00:00:00Z"}
+                    ]
+                }
+            }
+        });
+        let ev_stale = evaluate_slot_pool(&stale_q["accounts"]["acct-a"], QuotaPool::Gemini, &cfg, 0, now_ep);
+        assert!(ev_stale.unknown);
+        assert_eq!(ev_stale.tier, QuotaTier::Green);
+        let d = select_account_for_new_session(&root, &state, &stale_q, &pc, &BTreeMap::new(), "agy/gemini-4-neon", &cfg, now_ep);
+        assert_eq!(d.selected_id.as_deref(), Some("acct-a"));
+        assert!(!d.pointer_changed);
+
+        // 401 authFailedEpoch excludes acct-a even if old cached quota was 90%.
+        let future_ep = epoch() as i64 + 3600;
+        let auth_failed_q = json!({
+            "accounts": {
+                "acct-a": {
+                    "ok": false,
+                    "fetchedEpoch": now_ep - 600,
+                    "authFailedEpoch": future_ep,
+                    "entries": [
+                        {"pool": "Gemini Models", "window": "fiveHour", "remainingPct": 90.0, "resetAt": "2026-11-27T15:00:00Z"}
+                    ]
+                },
+                "acct-b": {
+                    "ok": true,
+                    "fetchedEpoch": now_ep,
+                    "entries": [
+                        {"pool": "Gemini Models", "window": "fiveHour", "remainingPct": 80.0, "resetAt": "2026-11-27T15:00:00Z"}
+                    ]
+                }
+            }
+        });
+        assert!(check_slot_health(&root, &state, &auth_failed_q, "acct-a").is_err());
+        let d_auth = select_account_for_new_session(&root, &state, &auth_failed_q, &pc, &BTreeMap::new(), "agy/gemini-4-neon", &cfg, now_ep);
+        assert_eq!(d_auth.selected_id.as_deref(), Some("acct-b"));
+    }
+
+    #[test]
+    fn carbon_counterexample_prepare_active_never_triggers_auto_switch() {
+        let (_base, root, real_home, real_cfg, _state) = setup_two_test_slots();
+        let now_ep = iso_epoch("2026-11-27T10:00:00Z").unwrap();
+        let cfg = enabled_cfg();
+        // acct-a (active) is 0% Red, acct-b is 95% Green.
+        let q = mk_pool_quota(now_ep, (0.0, 50.0), (95.0, 95.0), "2026-11-27T15:00:00Z");
+
+        // allow_auto_switch = false (used by `prepare_active` / `probe`) MUST keep active acct-a!
+        let (prep_active, ptr_upd) = AgyCredOverlay::prepare_for_session_full(
+            &root,
+            &real_home,
+            &real_cfg,
+            None,
+            None,
+            "",
+            false,
+            &cfg,
+            &q,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            now_ep,
+        )
+        .unwrap();
+        assert_eq!(prep_active.account_id.as_deref(), Some("acct-a"));
+        assert!(prep_active.switched.is_none());
+        assert!(ptr_upd.is_none());
+
+        // Contrast: allow_auto_switch = true for new session switches to acct-b and updates pointer!
+        let (prep_new, ptr_upd2) = AgyCredOverlay::prepare_for_session_full(
+            &root,
+            &real_home,
+            &real_cfg,
+            None,
+            None,
+            "agy/gemini-4-neon",
+            true,
+            &cfg,
+            &q,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            now_ep,
+        )
+        .unwrap();
+        assert_eq!(prep_new.account_id.as_deref(), Some("acct-b"));
+        assert_eq!(prep_new.switched.as_ref().unwrap().kind, "auto");
+        assert_eq!(ptr_upd2, Some((QuotaPool::Gemini, "acct-b".to_string())));
+    }
+
+    #[test]
+    fn carbon_counterexample_unified_pool_matching_and_unknown_model_safety() {
+        for m in [
+            "agy/gemini-4-neon",
+            "neon",
+            "carbon",
+            "agy/gemini-4-carbon",
+            "hydrogen",
+            "agy/gemini-4-hydrogen",
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+        ] {
+            assert_eq!(classify_model_pool(m), Some(QuotaPool::Gemini), "model={m}");
+            assert!(model_matches_pool(m, "Gemini Models"));
+            assert!(!model_matches_pool(m, "Claude and GPT models"));
+        }
+        for m in [
+            "agy/claude-opus-4-6-thinking",
+            "claude-sonnet-4",
+            "haiku",
+            "openai/gpt-5.4-pro",
+            "codex",
+        ] {
+            assert_eq!(classify_model_pool(m), Some(QuotaPool::ClaudeGpt), "model={m}");
+            assert!(model_matches_pool(m, "Claude and GPT models"));
+            assert!(!model_matches_pool(m, "Gemini Models"));
+        }
+        assert_eq!(classify_model_pool("provider/mystery-v1"), None);
+        assert_eq!(classify_model_pool(""), None);
+
+        // Unknown model reads active_id (avoids 0%) and NEVER mutates poolCurrent!
+        let (_base, root, _, _, state) = setup_two_test_slots();
+        let now_ep = iso_epoch("2026-11-27T10:00:00Z").unwrap();
+        let cfg = enabled_cfg();
+        let mut pc = BTreeMap::new();
+        pc.insert(QuotaPool::Gemini, "acct-b".to_string());
+        let q_ok = mk_pool_quota(now_ep, (60.0, 60.0), (90.0, 90.0), "2026-11-27T15:00:00Z");
+        let d1 = select_account_for_new_session(&root, &state, &q_ok, &pc, &BTreeMap::new(), "agy/mystery-v1", &cfg, now_ep);
+        assert_eq!(d1.selected_id.as_deref(), Some("acct-a")); // active_id, not poolCurrent
+        assert!(!d1.pointer_changed);
+
+        let q_zero = mk_pool_quota(now_ep, (0.0, 60.0), (90.0, 90.0), "2026-11-27T15:00:00Z");
+        let d2 = select_account_for_new_session(&root, &state, &q_zero, &pc, &BTreeMap::new(), "agy/mystery-v1", &cfg, now_ep);
+        assert_eq!(d2.selected_id.as_deref(), Some("acct-b")); // avoids 0% slot
+        assert!(!d2.pointer_changed); // NEVER overwrites poolCurrent
+    }
+
+    #[test]
+    fn singleflight_refresh_dedups_concurrent_callers_respects_15m_and_failure_backoff() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        let (base, root, _, _, _state) = setup_two_test_slots();
+        let state_root = base.path.join("state");
+        fs::create_dir_all(&state_root).unwrap();
+        let now_ep = iso_epoch("2026-11-27T10:00:00Z").unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let opts = QuotaRefreshOptions::auto_stale(900, None);
+
+        // Two threads call refresh simultaneously when cache is empty -> singleflight lock + double-check
+        // guarantees each slot is fetched ONLY ONCE (2 total slot fetches, not 4).
+        thread::scope(|sc| {
+            let mut hs = Vec::new();
+            for _ in 0..2 {
+                let root_ref = &root;
+                let state_ref = &state_root;
+                let opts_ref = &opts;
+                let calls_c = calls.clone();
+                hs.push(sc.spawn(move || {
+                    refresh_quotas_singleflight_in(
+                        root_ref,
+                        state_ref,
+                        opts_ref,
+                        || now_ep,
+                        |id, email| {
+                            calls_c.fetch_add(1, Ordering::SeqCst);
+                            thread::sleep(Duration::from_millis(80));
+                            SlotQuotaFetch {
+                                id: id.to_string(),
+                                ok: true,
+                                identity_mismatch: false,
+                                expected_email: email.to_string(),
+                                observed_email: String::new(),
+                                error: None,
+                                parsed: ParsedAgyUsage {
+                                    entries: vec![QuotaPoolEntry {
+                                        pool: "Gemini Models".into(),
+                                        window: "fiveHour".into(),
+                                        window_label: "Five Hour Limit Remaining".into(),
+                                        remaining_pct: 88.0,
+                                        reset_at: "2026-11-27T15:00:00Z".into(),
+                                    }],
+                                    unknown_lines: vec![],
+                                },
+                                refreshed_creds: 0,
+                            }
+                        },
+                    )
+                    .unwrap()
+                }));
+            }
+            for h in hs {
+                let _ = h.join().unwrap();
+            }
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "2 slots fetched once total across 2 concurrent threads");
+
+        // Within 15m (now + 600s): 0 fetches.
+        let calls_before = calls.load(Ordering::SeqCst);
+        let _ = refresh_quotas_singleflight_in(
+            &root,
+            &state_root,
+            &opts,
+            || now_ep + 600,
+            |id, email| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                SlotQuotaFetch::error_result(id, email, "should not be called".into())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), calls_before);
+
+        // Forced (`--quota` / `Q`): penetrates 15m throttle!
+        let _ = refresh_quotas_singleflight_in(
+            &root,
+            &state_root,
+            &QuotaRefreshOptions::forced(),
+            || now_ep + 600,
+            |id, email| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                SlotQuotaFetch::error_result(id, email, "network timeout".into())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), calls_before + 2);
+        // Failed fetch preserves prior entries & fetchedEpoch, and triggers 5m backoff!
+        let after_fail = load_quota_cache_in(&state_root);
+        assert_eq!(after_fail["accounts"]["acct-a"]["fetchedEpoch"].as_i64(), Some(now_ep));
+        assert_eq!(after_fail["accounts"]["acct-a"]["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(after_fail["accounts"]["acct-a"]["lastAttemptEpoch"].as_i64(), Some(now_ep + 600));
+
+        // Even past 15m from original fetch (now + 950s, but only 350s? wait: 600 + 200 = 800 -> within 5m backoff):
+        // check now_ep + 700 (only 100s after failed attempt at +600) with min_interval=60 -> skipped due to 5m backoff!
+        let backoff_opts = QuotaRefreshOptions::auto_stale(60, None);
+        let calls_before_backoff = calls.load(Ordering::SeqCst);
+        let _ = refresh_quotas_singleflight_in(
+            &root,
+            &state_root,
+            &backoff_opts,
+            || now_ep + 700,
+            |id, email| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                SlotQuotaFetch::error_result(id, email, "should back off".into())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), calls_before_backoff);
+    }
+
+    #[test]
+    fn pick_report_and_format_account_switch_line_cover_all_kinds_without_emails() {
+        let (_base, root, _, _, state) = setup_two_test_slots();
+        let now_ep = iso_epoch("2026-11-27T10:00:00Z").unwrap();
+        let cfg = enabled_cfg();
+        let q = mk_pool_quota(now_ep, (20.0, 80.0), (90.0, 85.0), "2026-11-27T15:00:00Z");
+        let rep = build_pick_report_in(
+            &root,
+            &state,
+            &q,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Some("neon"),
+            Some("agy/gemini-4-neon"),
+            &cfg,
+            now_ep,
+        );
+        assert_eq!(rep["selected"], "acct-b");
+        assert_eq!(rep["wouldSwitch"], true);
+        assert_eq!(rep["pool"], "gemini");
+        assert!(!rep.to_string().contains("example.test"), "pick report must not leak emails");
+
+        let auto_line = format_account_switch_line(
+            &json!({"kind": "auto", "from": "acct-a", "to": "acct-b", "reason": "acct-a 黄档"}),
+            false,
+        )
+        .unwrap();
+        assert!(auto_line.starts_with("自动选号：acct-a → acct-b"));
+        let handoff_line = format_account_switch_line(
+            &json!({"kind": "handoff", "from": "acct-a", "to": "acct-b", "reason": "运行中额度耗尽"}),
+            false,
+        )
+        .unwrap();
+        assert!(handoff_line.starts_with("中途换号接力：acct-a → acct-b"));
+        let rev_handoff = format_account_switch_line(
+            &json!({"kind": "handoff", "from": "acct-a", "to": "acct-b", "reason": "完整模板换号重审"}),
+            true,
+        )
+        .unwrap();
+        assert!(rev_handoff.starts_with("审查换号重审：acct-a → acct-b"));
+    }
+
+    #[test]
+    fn legacy_accounts_json_without_mode_defaults_to_fixed_and_pick_reports_fixed_slot() {
+        let (_base, root, _, _, _) = setup_two_test_slots();
+        let now_ep = iso_epoch("2026-11-27T10:00:00Z").unwrap();
+        let cfg = enabled_cfg();
+        // Legacy accounts.json has NO "mode" field -> must be treated as fixed mode!
+        let legacy_state = json!({
+            "schemaVersion": SCHEMA_VERSION,
+            "active": "acct-a",
+            "accounts": {
+                "acct-a": {"id": "acct-a", "email": "a@example.test"},
+                "acct-b": {"id": "acct-b", "email": "b@example.test"}
+            }
+        });
+        assert!(!is_auto_mode_state(&legacy_state));
+
+        // Even though acct-a is 10% Yellow and acct-b is 95% Green, fixed mode stays on acct-a!
+        let q = mk_pool_quota(now_ep, (10.0, 80.0), (95.0, 95.0), "2026-11-27T15:00:00Z");
+        let d = select_account_for_new_session(
+            &root,
+            &legacy_state,
+            &q,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            "agy/gemini-4-neon",
+            &cfg,
+            now_ep,
+        );
+        assert_eq!(d.selected_id.as_deref(), Some("acct-a"));
+        assert!(!d.pointer_changed);
+        assert!(d.switched.is_none());
+
+        // `pick` in fixed mode works cleanly and reports the fixed active slot.
+        let rep = build_pick_report_in(
+            &root,
+            &legacy_state,
+            &q,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Some("neon"),
+            Some("agy/gemini-4-neon"),
+            &cfg,
+            now_ep,
+        );
+        assert_eq!(rep["mode"], "fixed");
+        assert_eq!(rep["selected"], "acct-a");
+        assert_eq!(rep["wouldSwitch"], false);
+        assert!(s(&rep, "reason").contains("固定号"));
+
+        // `derive_id` never collides with reserved `"auto"`.
+        assert_ne!(derive_id("auto@example.test", &Map::new()), "auto");
     }
 }

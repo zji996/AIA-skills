@@ -36,18 +36,24 @@ class DelegateReviewModelTests(unittest.TestCase):
             self.env.pop(k, None)
 
     def write_quota_cache(self, five_hour: float, weekly: float, account_id: str = "acct1") -> None:
+        import time
+
+        now = int(time.time())
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+        reset_5h = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 4 * 3600))
+        reset_7d = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 6 * 86400))
         sd = self.state_dir()
         sd.mkdir(parents=True, exist_ok=True)
         (sd / "agy-quota.json").write_text(
             json.dumps(
                 {
                     "schemaVersion": 1,
-                    "updatedAt": "2026-11-24T20:00:00Z",
-                    "updatedEpoch": 1795521600,
+                    "updatedAt": now_iso,
+                    "updatedEpoch": now,
                     "accounts": {
                         account_id: {
-                            "fetchedAt": "2026-11-24T20:00:00Z",
-                            "fetchedEpoch": 1795521600,
+                            "fetchedAt": now_iso,
+                            "fetchedEpoch": now,
                             "ok": True,
                             "entries": [
                                 {
@@ -55,21 +61,21 @@ class DelegateReviewModelTests(unittest.TestCase):
                                     "window": "weekly",
                                     "windowLabel": "Weekly Limit Remaining",
                                     "remainingPct": 95.0,
-                                    "resetAt": "2026-12-01T00:00:00Z",
+                                    "resetAt": reset_7d,
                                 },
                                 {
                                     "pool": "Claude and GPT models",
                                     "window": "fiveHour",
                                     "windowLabel": "Five Hour Limit Remaining",
                                     "remainingPct": five_hour,
-                                    "resetAt": "2026-11-25T01:00:00Z",
+                                    "resetAt": reset_5h,
                                 },
                                 {
                                     "pool": "Claude and GPT models",
                                     "window": "weekly",
                                     "windowLabel": "Weekly Limit Remaining",
                                     "remainingPct": weekly,
-                                    "resetAt": "2026-12-01T00:00:00Z",
+                                    "resetAt": reset_7d,
                                 },
                             ],
                         }
