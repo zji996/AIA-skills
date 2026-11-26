@@ -618,6 +618,17 @@ fn build_finish_record(run: &Path) -> Option<(String, Value)> {
     if !s(&meta, "parent").is_empty() {
         rec.insert("parent".into(), json!(s(&meta, "parent")));
     }
+    let scout_run = {
+        let v = s(&sum, "scoutRun");
+        if !v.is_empty() {
+            v
+        } else {
+            s(&meta, "scoutRun")
+        }
+    };
+    if !scout_run.is_empty() {
+        rec.insert("scoutRun".into(), json!(scout_run));
+    }
     if !first_line.is_empty() {
         rec.insert("promptFirstLine".into(), json!(first_line));
     }
@@ -1320,6 +1331,7 @@ pub fn state_label_full(
         match state {
             "running" => "运行中",
             "waiting" => "排队中",
+            "scouting" => "探路中",
             "starting" => "启动中",
             "delivered" => "已交付",
             "answered" => "已答复",

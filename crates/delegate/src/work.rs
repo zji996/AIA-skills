@@ -5249,7 +5249,13 @@ fn ephemeral_run_rows_with_info(
                         "active".to_string(),
                         format!(
                             "{} {elapsed}",
-                            if st == "waiting" { "排队中" } else { "运行中" }
+                            if st == "waiting" {
+                                "排队中"
+                            } else if st == "scouting" {
+                                "探路中"
+                            } else {
+                                "运行中"
+                            }
                         ),
                         format!("wait {}", short_run_id(rid)),
                     )

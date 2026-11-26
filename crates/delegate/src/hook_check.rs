@@ -111,7 +111,7 @@ pub fn is_run_pending_actionable(
     }
     if matches!(
         state,
-        "running" | "starting" | "waiting" | "queued" | "stopped" | "blocked_mainline"
+        "running" | "starting" | "waiting" | "queued" | "scouting" | "stopped" | "blocked_mainline"
     ) {
         return false;
     }
@@ -748,6 +748,8 @@ fn read_run_snapshot(rdir: &Path, now: i64) -> Option<Value> {
                 "failed".to_string()
             }
         }
+    } else if rdir.join(".scouting").exists() {
+        "scouting".to_string()
     } else if rdir.join(".waiting").exists() {
         "waiting".to_string()
     } else {
@@ -883,7 +885,7 @@ fn fetch_status(runs_dir: &Path, index_runs: &HashMap<String, Value>, now: i64) 
                 let mut cand = entry["status"].clone();
                 let st = s(&cand, "state").to_string();
                 let mut stale = false;
-                if matches!(st.as_str(), "running" | "starting" | "waiting" | "queued") {
+                if matches!(st.as_str(), "running" | "starting" | "waiting" | "queued" | "scouting") {
                     if rdir.join("exit_code").is_file() {
                         stale = true;
                     } else {
@@ -913,7 +915,7 @@ fn fetch_status(runs_dir: &Path, index_runs: &HashMap<String, Value>, now: i64) 
                         cand["premerge"] = pm;
                     }
                     overlay_sign_status(&rdir, &mut cand);
-                    if matches!(st.as_str(), "running" | "starting" | "waiting" | "queued")
+                    if matches!(st.as_str(), "running" | "starting" | "waiting" | "queued" | "scouting")
                         && !b(&cand, "isMerge")
                     {
                         let meta = json(rdir.join("meta.json"));
@@ -1321,7 +1323,7 @@ fn trim_ascii_bytes(b: &[u8]) -> &[u8] {
 
 fn get_run_unclaimed_ts(obj: &Value) -> Option<i64> {
     let st = s(obj, "state");
-    let is_active = matches!(st, "running" | "starting" | "waiting" | "queued");
+    let is_active = matches!(st, "running" | "starting" | "waiting" | "queued" | "scouting");
     if !is_active {
         if let Some(fin) = iso_epoch(s(obj, "finishedAt")) {
             return Some(fin);
@@ -2277,7 +2279,7 @@ fn is_alert_event_stale(
         }
         if let Some(ro) = run_obj {
             let rst = s(ro, "state");
-            if !rst.is_empty() && !matches!(rst, "running" | "starting" | "waiting" | "queued") {
+            if !rst.is_empty() && !matches!(rst, "running" | "starting" | "waiting" | "queued" | "scouting") {
                 return true;
             }
         }
@@ -2354,7 +2356,7 @@ fn has_idle_slot(
                 continue;
             }
             let st = s(obj, "state");
-            if matches!(st, "running" | "starting" | "waiting" | "queued") {
+            if matches!(st, "running" | "starting" | "waiting" | "queued" | "scouting") {
                 total_active.insert(rid.to_string());
                 if repo.is_current {
                     cur_active.insert(rid.to_string());
@@ -2378,7 +2380,7 @@ fn has_idle_slot(
             if let Some(snap) = read_run_snapshot(&rdir, now) {
                 let rid = s(&snap, "run").trim();
                 let st = s(&snap, "state");
-                if !rid.is_empty() && matches!(st, "running" | "starting" | "waiting" | "queued") {
+                if !rid.is_empty() && matches!(st, "running" | "starting" | "waiting" | "queued" | "scouting") {
                     total_active.insert(rid.to_string());
                 }
             }
@@ -3122,7 +3124,7 @@ fn evaluate_core(
             if b(obj, "isMerge")
                 && matches!(
                     s(obj, "state"),
-                    "running" | "waiting" | "starting" | "queued"
+                    "running" | "waiting" | "starting" | "queued" | "scouting"
                 )
             {
                 for src in strings(&obj["merge"]["sourceRuns"]) {
@@ -3259,7 +3261,7 @@ fn evaluate_core(
             }
 
             // 2) Live runs -> Tier 4 (collected for waiter check)
-            if matches!(st.as_str(), "running" | "waiting" | "starting" | "queued") {
+            if matches!(st.as_str(), "running" | "waiting" | "starting" | "queued" | "scouting") {
                 record_adoptable();
                 if !adopt_only {
                     if repo.is_current {

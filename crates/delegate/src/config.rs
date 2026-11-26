@@ -313,6 +313,11 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
                 return Err("briefCheck must be a boolean".into());
             }
         }
+        if let Some(v) = value.get("scoutFirst") {
+            if !v.is_boolean() {
+                return Err("scoutFirst must be a boolean".into());
+            }
+        }
         crate::review::validate_review_config(value.get("review"))?;
         crate::review::validate_controller_review_paths(value.get("controllerReviewPaths"))?;
         crate::accept::validate_accept_rules(value.get("acceptRules"))?;
@@ -680,6 +685,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         "measureCpus",
         "disk",
         "briefCheck",
+        "scoutFirst",
     ] {
         if value.get(key).is_none() {
             if let Some(v) = user.as_ref().and_then(|u| u.get(key)) {
@@ -797,6 +803,16 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
 pub fn brief_check_enabled(value: &Value) -> bool {
     value
         .get("briefCheck")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+pub fn scout_first_enabled(value: &Value) -> bool {
+    if std::env::var("DELEGATE_SCOUT_FIRST").ok().as_deref() == Some("0") {
+        return false;
+    }
+    value
+        .get("scoutFirst")
         .and_then(Value::as_bool)
         .unwrap_or(true)
 }

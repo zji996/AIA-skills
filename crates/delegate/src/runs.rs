@@ -451,6 +451,9 @@ pub fn state(run: &Path) -> String {
         return "needs-redispatch".into();
     }
     if supervisor_alive(run) {
+        if run.join(".scouting").exists() {
+            return "scouting".into();
+        }
         if crate::measure::waiting_ahead(run).is_some() {
             return "waiting".into();
         }
@@ -466,7 +469,9 @@ pub fn state(run: &Path) -> String {
         if run.join(pid_file).is_file() {
             if let Ok(pid) = read(run.join(pid_file)).trim().parse::<i32>() {
                 if pid_alive(pid) {
-                    return if run.join(".waiting").exists() {
+                    return if run.join(".scouting").exists() {
+                        "scouting".into()
+                    } else if run.join(".waiting").exists() {
                         "waiting".into()
                     } else {
                         "starting".into()
@@ -481,7 +486,11 @@ pub fn state(run: &Path) -> String {
             .unwrap_or(0.0)
         <= 15.0
     {
-        "starting".into()
+        if run.join(".scouting").exists() {
+            "scouting".into()
+        } else {
+            "starting".into()
+        }
     } else {
         "crashed".into()
     }
@@ -492,7 +501,7 @@ pub fn interrupted(state: &str) -> bool {
     matches!(state, "timeout" | "stalled" | "stopped")
 }
 pub fn active(s: &str) -> bool {
-    s == "running" || s == "starting" || s == "waiting"
+    s == "running" || s == "starting" || s == "waiting" || s == "scouting"
 }
 pub fn age_seconds(meta: &Value) -> Option<i64> {
     meta["startedEpoch"]
@@ -972,6 +981,9 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
     if let Some(pm) = crate::premerge::status_for_run(run, &meta, &sum, None) {
         out["premerge"] = pm;
     }
+    if !s(&meta, "scoutRun").is_empty() {
+        out["scoutRun"] = meta["scoutRun"].clone();
+    }
     if sum.is_object() {
         for key in [
             "finishedAt",
@@ -1000,6 +1012,7 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
             "workspaceChanged",
             "escalatedFrom",
             "question",
+            "scoutQuestion",
             "policyRefused",
             "policyRewriteAttempted",
             "queuedSeconds",
@@ -1009,6 +1022,14 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
             "tokens",
             "tokensDelta",
             "reviewTokens",
+            "scoutRun",
+            "scoutTokens",
+            "scoutMapStatus",
+            "scoutMapDropReason",
+            "scoutBadAnchors",
+            "scoutAnchorsTotal",
+            "scout",
+            "preEditSteps",
             "agyAccount",
             "agyAccountSwitch",
             "reviewAgyAccountSwitch",

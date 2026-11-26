@@ -934,7 +934,7 @@ fn main() {
             .repos
             .iter()
             .flat_map(|g| &g.runs)
-            .any(|r| matches!(r.state.as_str(), "running" | "starting" | "waiting"));
+            .any(|r| matches!(r.state.as_str(), "running" | "starting" | "waiting" | "scouting"));
         let effective_interval = if inotify_active && !has_active_runs {
             idle_heartbeat
         } else {

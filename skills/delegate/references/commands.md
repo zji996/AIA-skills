@@ -4,7 +4,7 @@
 
 | 命令 | 作用 |
 |---|---|
-| `start [选项] [任务说明]` | 后台启动，立即返回一行状态；派发前预检路径与符号印 stderr，--no-brief-check 可关 |
+| `start [选项] [任务说明]` | 后台启动，立即返回一行状态；派发前预检路径与符号印 stderr，`--no-brief-check` 可关；`--worktree` 写任务默认先派只读探路出地图（极轻任务、`--no-scout`、`.delegate.json` `"scoutFirst": false` 例外），`queue add` 透传 `--no-scout` |
 | `run [选项] [--max <时长>]` | 启动并等到结论 |
 | `reply <run> [消息] [--wait] [--fresh] [--sync\|--sync=agent\|--no-sync] [--allow <path>]` | 续接最新一轮会话后台启动；`--wait` 等到结论。写入 worktree 续做默认三方同步到当前源快照（保池槽 `target/`，冲突时保旧基线并在 stderr 列重叠文件）；`--no-sync` 跳过、`--sync` 遇冲突拒收、`--sync=agent` 留文本标记交同事先解（未清标记拒收，二进制/结构冲突仍拒收）。`--allow` 在保护范围内按链开放路径；`--fresh` 开新会话。验收/证据默认沿用，可覆盖或关闭 |
 | `patch <run> [-- <path>…]` | 打印保留的完整补丁，可按精确路径/目录前缀过滤，供 `git apply --3way` 恢复 |

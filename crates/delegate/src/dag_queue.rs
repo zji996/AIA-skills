@@ -666,6 +666,7 @@ fn add_cmd(args: &[String]) -> Res<i32> {
         "--no-accept",
         "--no-evidence",
         "--no-remote",
+        "--no-scout",
         "--allow-parallel-writes",
     ];
 

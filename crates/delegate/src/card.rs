@@ -3563,6 +3563,86 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
     if sum["tokensDelta"].as_object().is_some_and(|o| !o.is_empty()) {
         card_doc["tokensDelta"] = sum["tokensDelta"].clone();
     }
+    if let Some(steps) = sum["preEditSteps"].as_u64() {
+        card_doc["preEditSteps"] = json!(steps);
+    }
+    let scout_src = if sum["scout"].is_object() {
+        &sum["scout"]
+    } else if meta["scout"].is_object() {
+        &meta["scout"]
+    } else {
+        &Value::Null
+    };
+    let scout_run_id = {
+        let a = s(sum, "scoutRun");
+        if !a.is_empty() {
+            a
+        } else {
+            let b_id = s(scout_src, "run");
+            if !b_id.is_empty() {
+                b_id
+            } else {
+                s(meta, "scoutRun")
+            }
+        }
+    };
+    if scout_src.is_object() || !scout_run_id.is_empty() {
+        let map_status = {
+            let v = s(sum, "scoutMapStatus");
+            if !v.is_empty() {
+                v
+            } else {
+                s(scout_src, "status")
+            }
+        };
+        let drop_reason = {
+            let v = s(sum, "scoutMapDropReason");
+            if !v.is_empty() {
+                v
+            } else {
+                s(scout_src, "dropReason")
+            }
+        };
+        let bad_anchors = sum["scoutBadAnchors"]
+            .as_u64()
+            .or_else(|| scout_src["badAnchors"].as_u64())
+            .unwrap_or(0);
+        let total_anchors = sum["scoutAnchorsTotal"]
+            .as_u64()
+            .or_else(|| scout_src["anchorsTotal"].as_u64())
+            .unwrap_or(0);
+        let scout_tokens = if sum["scoutTokens"].as_object().is_some_and(|o| !o.is_empty()) {
+            sum["scoutTokens"].clone()
+        } else if scout_src["tokens"].as_object().is_some_and(|o| !o.is_empty()) {
+            scout_src["tokens"].clone()
+        } else {
+            Value::Null
+        };
+        let mut scout_card = json!({
+            "run": scout_run_id,
+            "mapStatus": map_status,
+            "badAnchors": bad_anchors,
+            "anchorsTotal": total_anchors,
+        });
+        if scout_tokens.is_object() {
+            scout_card["tokens"] = scout_tokens;
+        }
+        if !drop_reason.is_empty() {
+            scout_card["dropReason"] = json!(drop_reason);
+        }
+        if map_status == "dropped" {
+            scout_card["dropped"] = json!(true);
+            scout_card["diagnostic"] = json!("scout_map_dropped");
+        }
+        let map_path = s(scout_src, "mapPath");
+        if !map_path.is_empty() {
+            scout_card["mapPath"] = json!(map_path);
+        }
+        card_doc["scout"] = scout_card;
+        if !scout_run_id.is_empty() {
+            card_doc["scoutRun"] = json!(scout_run_id);
+        }
+    }
     if let Some(appends) = crate::pending_reply::summary_json(run) {
         card_doc["appends"] = appends;
     }
@@ -3621,6 +3701,7 @@ pub fn render_card_human(card: &Value) -> String {
             "blocked_mainline" => "主干阻塞",
             "rejected" => "未通过",
             "running" => "运行中",
+            "scouting" => "探路中",
             "stopped" => "已停止",
             "failed" => "失败",
             _ => state,
@@ -3759,6 +3840,43 @@ pub fn render_card_human(card: &Value) -> String {
         crate::agy_accounts::format_account_switch_line(&card["reviewAgyAccountSwitch"], true)
     {
         out.push(line);
+    }
+    if card["scout"].is_object() {
+        let sc = &card["scout"];
+        let srun = s(sc, "run");
+        let mstatus = s(sc, "mapStatus");
+        let bad = n(sc, "badAnchors");
+        let total = n(sc, "anchorsTotal");
+        let status_label = if mstatus == "dropped" {
+            let reason = s(sc, "dropReason");
+            if reason.is_empty() {
+                "地图弃图（scout_map_dropped）".to_string()
+            } else {
+                format!("地图弃图（scout_map_dropped：{reason}）")
+            }
+        } else {
+            "地图采用".to_string()
+        };
+        let mut segs = Vec::new();
+        if !srun.is_empty() {
+            segs.push(srun.to_string());
+        }
+        segs.push(status_label);
+        if total > 0 || bad > 0 {
+            segs.push(format!("坏锚点 {bad}/{total}"));
+        }
+        if sc["tokens"].as_object().is_some_and(|o| !o.is_empty()) {
+            let st = runs::format_tokens_usage(&sc["tokens"]);
+            if !st.is_empty() {
+                segs.push(format!("探路用量 {st}"));
+            }
+        }
+        if let Some(steps) = card["preEditSteps"].as_u64() {
+            segs.push(format!("首改前 {steps} 步"));
+        }
+        out.push(format!("探路：{}", segs.join(" · ")));
+    } else if let Some(steps) = card["preEditSteps"].as_u64() {
+        out.push(format!("首改前工具步数：{steps}"));
     }
     if rev_extra.is_object() && s(rev_extra, "status") == "skipped" {
         let skip_reason = s(rev_extra, "skipReason");

@@ -308,6 +308,7 @@ pub fn human_line_with_repo(
     let state = s(status, "state");
     let label = match state {
         "running" => "运行中",
+        "scouting" => "探路中",
         "waiting" => "等待中",
         "starting" => "启动中",
         "delivered" => "已交付",

@@ -72,6 +72,7 @@ pub struct Options {
     pub work: Option<String>,
     pub no_remote: bool,
     pub no_brief_check: bool,
+    pub no_scout: bool,
     pub brief_checked: bool,
 }
 impl Options {
@@ -263,6 +264,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                 }
                 "--no-remote" => o.no_remote = true,
                 "--no-brief-check" => o.no_brief_check = true,
+                "--no-scout" => o.no_scout = true,
                 "--review-full" => o.review_full = true,
                 "--allow-parallel-writes" => o.parallel = true,
                 "--fresh" => o.fresh = true,
@@ -1547,6 +1549,75 @@ fn reconstruct_in_snapshot(
     ))
 }
 
+fn launch_scout_for_write(
+    write_o: &Options,
+    raw_brief: &str,
+    workdir: &Path,
+    repo: &Path,
+    config: &crate::config::Config,
+) -> Res<PathBuf> {
+    let mut scout_o = Options::new();
+    scout_o.tier = Some("scout".into());
+    scout_o.read_only = true;
+    scout_o.workdir = Some(workdir.to_string_lossy().into_owned());
+    scout_o.no_brief_check = true;
+    scout_o.no_scout = true;
+    scout_o.no_remote = write_o.no_remote;
+    scout_o.share = write_o.share.clone();
+    let base_name = write_o
+        .name
+        .clone()
+        .unwrap_or_else(|| prompt_name(raw_brief));
+    scout_o.name = Some(format!("探路-{}", clip(&base_name, 18)));
+    choose_tier(&mut scout_o)?;
+    missing_tools(&scout_o.agent)?;
+    let tier_models = apply_tier_model(&mut scout_o, &config.value)?;
+    let defaults = effective_defaults(&mut scout_o, config);
+    let capacities = crate::config::capacities(&config.value)?;
+    let cfg = worktree::work_config(&config.value, &repo.join(".delegate.json"))?;
+    let mut extra = json!({
+        "env": config.value["env"],
+        "agentDeny": config.value["agentDeny"],
+        "configSources": config.sources,
+        "configCapacity": capacities,
+        "tierModels": tier_models,
+        "tierConfig": {
+            "tiers": config.value["tiers"],
+            "models": config.value["models"],
+            "thinking": config.value["thinking"],
+        },
+        "sourceBuild": config.value["sourceBuild"],
+        "sourceBuildRoot": repo,
+        "defaults": defaults,
+        "resultChars": config.value["resultChars"].as_u64().unwrap_or(20000),
+        "cleanupKeepExecutables": config.value["cleanupKeepExecutables"],
+        "share": scout_o.share,
+        "acceptBlind": config.value["acceptBlind"],
+        "controllerReviewPaths": config.value["controllerReviewPaths"],
+        "riskRules": config.value["riskRules"],
+        "resources": config.value["resources"],
+        "measure": config.value["measure"],
+        "measureCpus": config.value["measureCpus"],
+        "stall": config.value["stall"],
+        "checkIn": config.value["checkIn"],
+        "agy": config.value["agy"],
+        "worktree": {"source": repo, "sourceWorkdir": workdir, "config": cfg},
+    });
+    let remote_off =
+        scout_o.no_remote || std::env::var("DELEGATE_REMOTE").ok().as_deref() == Some("0");
+    extra["remoteOff"] = json!(remote_off);
+    extra["remote"] = if remote_off {
+        json!(false)
+    } else {
+        config.value["remote"].clone()
+    };
+    let (standing, sources) = standing_text(config, true, &extra["agentDeny"]);
+    extra["standing"] = json!(standing);
+    extra["standingSources"] = sources;
+    let scout_prompt = crate::scout_first::build_scout_prompt(raw_brief);
+    launch(scout_o, &scout_prompt, workdir, "read-only", &extra, None)
+}
+
 pub fn start(mut o: Options) -> Res<PathBuf> {
     if let Some(e) = nesting_error() {
         return Err(e);
@@ -1671,10 +1742,21 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         protected_paths_in_prompt(&prompt, repo.as_deref(), &o.protect, &o.allow)
     };
     note_prompt_protected_paths(&prompt_protected);
-    if !o.no_brief_check && crate::config::brief_check_enabled(&config.value) {
+    let run_brief_diag = !o.no_brief_check && crate::config::brief_check_enabled(&config.value);
+    let want_scout_check =
+        !o.read_only && !o.no_scout && crate::config::scout_first_enabled(&config.value);
+    let brief_report = if run_brief_diag || want_scout_check {
         let check_root = repo.as_deref().unwrap_or(&workdir);
-        crate::brief_check::run_and_report(&prompt, check_root);
-    }
+        let rep = crate::brief_check::check_detailed(&prompt, check_root);
+        if run_brief_diag {
+            for line in &rep.diagnostics {
+                eprintln!("{line}");
+            }
+        }
+        Some(rep)
+    } else {
+        None
+    };
     let capacities = crate::config::capacities(&config.value)?;
     if !config.ignored.is_empty() {
         eprintln!(
@@ -1842,7 +1924,44 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     if !prompt_protected.is_empty() {
         extra["promptProtectedPaths"] = json!(prompt_protected);
     }
-    launch(o, &prompt, &workdir, mode, &extra, None)
+    let mut scout_echo: Option<String> = None;
+    if !o.read_only && o.worktree {
+        if o.no_scout {
+            scout_echo = Some("探路：跳过（--no-scout）".to_string());
+        } else if !crate::config::scout_first_enabled(&config.value) {
+            scout_echo = Some("探路：跳过（scoutFirst: false）".to_string());
+        } else if brief_report
+            .as_ref()
+            .is_some_and(|r| crate::scout_first::is_lightweight_brief(&prompt, r))
+        {
+            scout_echo = Some("探路：跳过（极轻任务）".to_string());
+        } else if let Some(top) = repo.as_deref() {
+            match launch_scout_for_write(&o, &prompt, &workdir, top, &config) {
+                Ok(scout_dir) => {
+                    let scout_id = scout_dir
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    extra["scoutFirst"] = json!(true);
+                    extra["scoutRun"] = json!(&scout_id);
+                    extra["scoutRunDir"] = json!(&scout_dir);
+                    extra["rawBrief"] = json!(&prompt);
+                    scout_echo = Some(format!("探路：先探路（{scout_id}）"));
+                }
+                Err(err) => {
+                    eprintln!("delegate: 探路启动失败（{err}），跳过探路直接派写手");
+                    extra["scoutLaunchError"] = json!(err);
+                    scout_echo = Some("探路：跳过（探路启动失败）".to_string());
+                }
+            }
+        }
+    }
+    let run = launch(o, &prompt, &workdir, mode, &extra, None)?;
+    if let Some(line) = scout_echo {
+        eprintln!("{line}");
+    }
+    Ok(run)
 }
 /// Lines a `--minor` round may change before it counts as a rework after all.
 const MINOR_LINES: u64 = 60;
@@ -1996,10 +2115,13 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     let summary = json(parent.join("summary.json"));
     let after_apply = parent.join(".applied-cleaned").exists()
         || (crate::archive::is_record(&parent) && parent.join(".applied").exists());
+    let scout_question = b(&meta, "scoutQuestion");
     let compose_after_apply = after_apply && !o.fresh;
     if after_apply {
         o.fresh = true;
         eprintln!("delegate: 原会话已合入，已开新会话续做");
+    } else if scout_question {
+        o.fresh = true;
     }
     let parent_name = crate::notes::run_id(&parent, &meta);
     let existing_child = all_runs().into_iter().find(|run| {
@@ -2052,6 +2174,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         return Err(format!("{} has no saved session to continue (runs before delegate 4.1 kept none); use --fresh to start a new session in the same place",parent.file_name().unwrap_or_default().to_string_lossy()));
     }
     if !after_apply
+        && !scout_question
         && meta["worktree"].is_object()
         && !Path::new(s(&meta["worktree"], "path")).exists()
     {
@@ -2371,6 +2494,34 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
             extra["worktree"] = json!({"source":top,"sourceWorkdir":s(&meta["worktree"],"sourceWorkdir"),
                 "config":worktree::work_config(&config.value, &Path::new(top).join(".delegate.json"))?});
         }
+    } else if scout_question {
+        if meta["worktree"].is_object() {
+            extra["worktree"] = json!({
+                "source": top,
+                "sourceWorkdir": s(&meta["worktree"], "sourceWorkdir"),
+                "config": worktree::work_config(&config.value, &Path::new(top).join(".delegate.json"))?,
+            });
+        }
+        let raw_brief = {
+            let p = parent.join("raw-brief.md");
+            if p.is_file() {
+                read(&p)
+            } else {
+                s(&meta, "rawBrief").to_string()
+            }
+        };
+        extra["scoutReplyCompose"] = json!({
+            "rawBrief": raw_brief,
+            "l0": s(&meta, "scoutL0"),
+            "controllerReply": raw_prompt,
+            "sourceMap": parent.join("scout-map.md"),
+        });
+        if meta["scout"].is_object() {
+            extra["scoutCarried"] = meta["scout"].clone();
+        }
+        if !s(&meta, "scoutRun").is_empty() {
+            extra["scoutRun"] = meta["scoutRun"].clone();
+        }
     }
     extra["protectGenerated"] = meta["protectGenerated"].clone();
     if !added_allow.is_empty() && extra["protectGenerated"].is_object() {
@@ -2598,7 +2749,7 @@ pub fn active_machine(slots: &Path) -> Vec<PathBuf> {
             if p.extension().is_some_and(|x| x == "slot") {
                 let run = PathBuf::from(read(&p).trim());
                 if run.join("meta.json").is_file() && (active(&state(&run)) || agent_alive(&run)) {
-                    if !run.join(".waiting").exists() {
+                    if !run.join(".waiting").exists() && !run.join(".scouting").exists() {
                         out.push(run);
                     }
                 } else {
@@ -2871,13 +3022,16 @@ pub fn launch(
         None
     };
 
+    let scout_first = b(&extra, "scoutFirst");
     // Critical section: ONLY capacity/admission checks + run directory & slot registration
     // under the single short-lived `<state>/.state.lock` (<5ms, zero git/subprocess/sleep).
     let (run, slot_file, deferred, reason, queued_ns, model_cap, started_at, started_epoch, started_ns, queued_at, q_ahead, area_experiment) = {
         let _state_lock = crate::locks::acquire_state(&slots).map_err(|e| e.to_string())?;
 
         let active_runs = active_machine(&slots);
-        capacity(&active_runs, &extra["configCapacity"], &repo)?;
+        if !scout_first {
+            capacity(&active_runs, &extra["configCapacity"], &repo)?;
+        }
         if o.tier_picked && !o.agent_pinned {
             pick_tier_under_cap(&mut o, &mut extra, &active_runs, &listed_pi_models)?;
         }
@@ -2894,7 +3048,11 @@ pub fn launch(
             "parent": extra["parent"]["run"],
             "queuedNs": now_ns() as u64
         });
-        let reason = crate::queue::reason(&admission, &active_runs)?;
+        let reason = if scout_first {
+            None
+        } else {
+            crate::queue::reason(&admission, &active_runs)?
+        };
         let deferred = reason.is_some();
         if !deferred && mode == "write" && !o.parallel && !extra["worktree"].is_object() {
             for existing in all_runs() {
@@ -2974,7 +3132,13 @@ pub fn launch(
             provisional["area"] = exp["area"].clone();
             provisional["areaGroup"] = exp["group"].clone();
         }
-        let (queued_at, q_ahead, queued_ns) = if deferred {
+        let (queued_at, q_ahead, queued_ns) = if scout_first {
+            touch(run.join(".scouting"));
+            provisional["scoutFirst"] = json!(true);
+            provisional["scoutRun"] = extra["scoutRun"].clone();
+            write_json(run.join("meta.json"), &provisional)?;
+            (String::new(), 0usize, admission["queuedNs"].clone())
+        } else if deferred {
             touch(run.join(".waiting"));
             crate::queue::enter(&run, &mut provisional)?;
             let ahead = crate::queue::ahead(&provisional);
@@ -3051,6 +3215,36 @@ pub fn launch(
     let changed =
         parent.is_object() && fork.is_some() && o.accept.as_deref() != parent["accept"].as_str();
     let remaining = o.protect.iter().filter(|rule| !worktree::matches_rule(rule, &o.allow)).cloned().collect::<Vec<_>>();
+    let scout_reply_composed: Option<String> = if extra["scoutReplyCompose"].is_object() {
+        let rc = &extra["scoutReplyCompose"];
+        let raw_brief = s(rc, "rawBrief");
+        let l0 = s(rc, "l0");
+        let ctrl_reply = s(rc, "controllerReply");
+        let src_map = PathBuf::from(s(rc, "sourceMap"));
+        let dest_map = run.join("scout-map.md");
+        let map_path = if src_map.is_file() && fs::copy(&src_map, &dest_map).is_ok() {
+            dest_map.canonicalize().unwrap_or(dest_map)
+        } else if src_map.is_file() {
+            src_map.canonicalize().unwrap_or(src_map)
+        } else {
+            dest_map
+        };
+        let _ = write(run.join("raw-brief.md"), raw_brief);
+        Some(crate::scout_first::build_writer_brief(
+            raw_brief,
+            l0,
+            &map_path,
+            Some(ctrl_reply),
+        ))
+    } else {
+        if scout_first {
+            let raw = s(extra, "rawBrief");
+            let raw = if raw.is_empty() { prompt } else { raw };
+            let _ = write(run.join("raw-brief.md"), raw);
+        }
+        None
+    };
+    let base_prompt = scout_reply_composed.as_deref().unwrap_or(prompt);
     let prompt_with_area: Option<String> = area_experiment.as_ref().and_then(|exp| {
         if !b(exp, "injected") {
             return None;
@@ -3059,9 +3253,9 @@ pub fn launch(
         if l0_lines.is_empty() {
             return None;
         }
-        Some(format!("{}\n\n{}", prompt.trim_end(), l0_lines.join("\n")))
+        Some(format!("{}\n\n{}", base_prompt.trim_end(), l0_lines.join("\n")))
     });
-    let effective_prompt = prompt_with_area.as_deref().unwrap_or(prompt);
+    let effective_prompt = prompt_with_area.as_deref().unwrap_or(base_prompt);
     let mut actual = if parent.is_object() && fork.is_some() {
         contract(
             effective_prompt,
@@ -3268,7 +3462,7 @@ pub fn launch(
     }
     let mut tree = extra["worktree"].clone();
     let mut wd = workdir.to_path_buf();
-    if !deferred {
+    if !deferred && !scout_first {
         allocate_tree(&mut tree, &mut wd, workdir, &run, mode);
     }
     let run_id = run.file_name().unwrap_or_default().to_string_lossy();
@@ -3479,7 +3673,40 @@ pub fn launch(
             "matchedPaths": exp["matchedPaths"],
         });
     }
-    meta["userPromptLen"] = json!(prompt.len());
+    let effective_prompt_split = effective_prompt.trim_end_matches('\n').len();
+    if scout_first {
+        meta["phase"] = json!("scouting");
+        meta["scoutFirst"] = json!(true);
+        meta["scoutRun"] = extra["scoutRun"].clone();
+        meta["scoutRunDir"] = extra["scoutRunDir"].clone();
+        meta["scoutPromptSplit"] = json!(effective_prompt_split);
+    }
+    if !s(extra, "scoutLaunchError").is_empty() {
+        meta["scoutLaunchError"] = extra["scoutLaunchError"].clone();
+    }
+    if extra["scoutCarried"].is_object() {
+        let mut carried = extra["scoutCarried"].clone();
+        if run.join("scout-map.md").is_file() {
+            let abs = run
+                .join("scout-map.md")
+                .canonicalize()
+                .unwrap_or_else(|_| run.join("scout-map.md"));
+            carried["mapPath"] = json!(abs);
+        }
+        meta["scout"] = carried;
+        let carried_run = s(&meta["scout"], "run").to_string();
+        if !carried_run.is_empty() {
+            meta["scoutRun"] = json!(carried_run);
+        } else if !s(extra, "scoutRun").is_empty() {
+            meta["scoutRun"] = extra["scoutRun"].clone();
+        }
+    }
+    let user_prompt_len = if scout_reply_composed.is_some() || prompt_with_area.is_some() {
+        effective_prompt_split
+    } else {
+        prompt.trim_end_matches('\n').len()
+    };
+    meta["userPromptLen"] = json!(user_prompt_len);
     write_json(run.join("meta.json"), &meta)?;
     if !s(&extra["syncedBase"], "commit").is_empty() {
         let commit = s(&extra["syncedBase"], "commit");
@@ -3517,7 +3744,13 @@ pub fn launch(
                 crate::events::started_payload(&meta, false),
             );
         }
-        let initial_state = if deferred { "waiting" } else { "starting" };
+        let initial_state = if scout_first {
+            "scouting"
+        } else if deferred {
+            "waiting"
+        } else {
+            "starting"
+        };
         let initial_status = json!({
             "run": meta["run"],
             "name": meta["name"],
@@ -3533,7 +3766,7 @@ pub fn launch(
             initial_status,
         );
     }
-    if !deferred {
+    if !deferred && !scout_first {
         crate::eta::record_pred_started(&run, &meta);
     }
     let explicit_startup_timeout = if cfg!(debug_assertions) {

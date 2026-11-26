@@ -1888,6 +1888,7 @@ fn build_detail_lines(
             } else {
                 match r.state.as_str() {
                     "running" => "运行中",
+                    "scouting" => "探路中",
                     "waiting" => "等待中",
                     "starting" => "启动中",
                     "delivered" => "已交付",

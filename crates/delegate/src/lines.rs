@@ -784,15 +784,17 @@ fn save_cache(state: &Path, cache: &HashMap<String, RepoCacheEntry>) {
 struct ChainIndex {
     parent_of: HashMap<String, String>,
     children_of: HashMap<String, Vec<String>>,
+    scout_of: HashMap<String, Vec<String>>,
     history_tokens: HashMap<String, TokenCounts>,
 }
 
 impl ChainIndex {
-    /// Build parent/child links across active run directories, `<cache>/archive/*/record/meta.json`,
+    /// Build parent/child & scoutRun links across active run directories, `<cache>/archive/*/record/meta.json`,
     /// and `<state>/history/*/history.jsonl`, plus fallback token totals from `history.jsonl`.
     fn load(state: &Path, runs_dirs: &[PathBuf]) -> Self {
         let mut parent_of: HashMap<String, String> = HashMap::new();
         let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
+        let mut scout_of: HashMap<String, Vec<String>> = HashMap::new();
         let mut history_tokens: HashMap<String, TokenCounts> = HashMap::new();
 
         let mut link = |run_id: String, parent_id: String| {
@@ -805,6 +807,16 @@ impl ChainIndex {
                 if !kids.contains(&run_id) {
                     kids.push(run_id);
                 }
+            }
+        };
+
+        let mut link_scout = |run_id: &str, scout_id: &str| {
+            if run_id.is_empty() || scout_id.is_empty() || run_id == scout_id {
+                return;
+            }
+            let list = scout_of.entry(run_id.to_string()).or_default();
+            if !list.iter().any(|x| x == scout_id) {
+                list.push(scout_id.to_string());
             }
         };
 
@@ -827,6 +839,28 @@ impl ChainIndex {
                     }
                 };
                 let parent = s(&meta, "parent").to_string();
+                let sum = json(run.join("summary.json"));
+                let scout = {
+                    let v = s(&sum, "scoutRun");
+                    if !v.is_empty() {
+                        v.to_string()
+                    } else {
+                        s(&meta, "scoutRun").to_string()
+                    }
+                };
+                let scout_tok = if sum["scoutTokens"].is_object() {
+                    Some(TokenCounts::from_json(&sum["scoutTokens"]))
+                } else if meta["scout"]["tokens"].is_object() {
+                    Some(TokenCounts::from_json(&meta["scout"]["tokens"]))
+                } else {
+                    None
+                };
+                link_scout(&run_id, &scout);
+                if let Some(tok) = scout_tok.filter(|t| !t.is_zero()) {
+                    if !scout.is_empty() {
+                        history_tokens.entry(scout).or_insert(tok);
+                    }
+                }
                 link(run_id, parent);
             }
         }
@@ -856,6 +890,28 @@ impl ChainIndex {
                     }
                 };
                 let parent = s(&meta, "parent").to_string();
+                let sum = json(rec.join("summary.json"));
+                let scout = {
+                    let v = s(&sum, "scoutRun");
+                    if !v.is_empty() {
+                        v.to_string()
+                    } else {
+                        s(&meta, "scoutRun").to_string()
+                    }
+                };
+                let scout_tok = if sum["scoutTokens"].is_object() {
+                    Some(TokenCounts::from_json(&sum["scoutTokens"]))
+                } else if meta["scout"]["tokens"].is_object() {
+                    Some(TokenCounts::from_json(&meta["scout"]["tokens"]))
+                } else {
+                    None
+                };
+                link_scout(&run_id, &scout);
+                if let Some(tok) = scout_tok.filter(|t| !t.is_zero()) {
+                    if !scout.is_empty() {
+                        history_tokens.entry(scout).or_insert(tok);
+                    }
+                }
                 link(run_id, parent);
             }
         }
@@ -877,6 +933,8 @@ impl ChainIndex {
                         continue;
                     }
                     let parent = s(&v, "parent").to_string();
+                    let scout = s(&v, "scoutRun").to_string();
+                    link_scout(&run_id, &scout);
                     link(run_id.clone(), parent);
                     let tok_v = if v["tokensDelta"].is_object() {
                         &v["tokensDelta"]
@@ -894,11 +952,13 @@ impl ChainIndex {
         Self {
             parent_of,
             children_of,
+            scout_of,
             history_tokens,
         }
     }
 
-    /// Expand a set of run IDs to include every round in their reply chains (both ancestors and descendants).
+    /// Expand a set of run IDs to include every round in their reply chains (both ancestors and descendants)
+    /// as well as any associated `scoutRun` read-only scout runs.
     fn expand_chains(&self, seeds: &BTreeSet<String>) -> BTreeSet<String> {
         let mut visited: BTreeSet<String> = BTreeSet::new();
         let mut queue: VecDeque<String> = VecDeque::new();
@@ -917,6 +977,13 @@ impl ChainIndex {
                 for kid in kids {
                     if visited.insert(kid.clone()) {
                         queue.push_back(kid.clone());
+                    }
+                }
+            }
+            if let Some(scouts) = self.scout_of.get(&cur) {
+                for sc in scouts {
+                    if visited.insert(sc.clone()) {
+                        queue.push_back(sc.clone());
                     }
                 }
             }

@@ -339,7 +339,7 @@ pub fn render_for(key: &str, runs_dir: Option<&Path>) -> String {
             }
         }
 
-        if matches!(st.as_str(), "running" | "starting" | "waiting") {
+        if matches!(st.as_str(), "running" | "starting" | "waiting" | "scouting") {
             local_active_paths.push(run.clone());
             let model_label = history::compact_model_label(
                 s(&meta, "agent"),

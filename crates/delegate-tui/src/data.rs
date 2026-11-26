@@ -1051,7 +1051,7 @@ fn build_chain_rounds(
                 .collect();
             let cur_id = v.get("run").and_then(Value::as_str).unwrap_or("");
             let cur_state = v.get("state").and_then(Value::as_str).unwrap_or("");
-            let cur_active = matches!(cur_state, "running" | "waiting" | "starting");
+            let cur_active = matches!(cur_state, "running" | "waiting" | "starting" | "scouting");
             if cur_active && !cur_id.is_empty() && !out.iter().any(|r| r.run == cur_id) {
                 for r in &mut out {
                     r.current = false;
@@ -1782,7 +1782,7 @@ pub fn is_run_pending_actionable(
     }
     if matches!(
         state,
-        "running" | "starting" | "waiting" | "queued" | "stopped" | "blocked_mainline"
+        "running" | "starting" | "waiting" | "queued" | "scouting" | "stopped" | "blocked_mainline"
     ) {
         return false;
     }
@@ -1809,7 +1809,7 @@ fn classify_group(
 ) -> GroupKind {
     match state {
         "waiting" | "queued" | "blocked_mainline" => GroupKind::Queued,
-        "running" | "starting" => {
+        "running" | "starting" | "scouting" => {
             if has_queue {
                 GroupKind::Queued
             } else {

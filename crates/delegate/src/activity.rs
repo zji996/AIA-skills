@@ -309,6 +309,16 @@ pub fn inspect(run: &Path, meta: &Value, state: &str) -> Value {
         sw.is_object().then_some(sw)
     };
 
+    if state == "scouting" || run.join(".scouting").exists() {
+        let srun = s(meta, "scoutRun");
+        let label = if !srun.is_empty() {
+            format!("探路中（{srun}）")
+        } else {
+            "探路中".to_string()
+        };
+        return json!({"kind": "scouting", "label": label});
+    }
+
     // 1. Capacity queue / measurement queue / heavy lane wait -> waiting
     if state == "waiting" || run.join(".waiting").exists() {
         let q = json(run.join("queue.json"));

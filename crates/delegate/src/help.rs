@@ -22,6 +22,7 @@ const LAUNCH: &[(&str, &str)] = &[
     ("--no-evidence", "Disable the default evidence command."),
     ("--no-remote", "Disable SSH remote execution for this run and its replies (same as DELEGATE_REMOTE=0)."),
     ("--no-brief-check", "Skip the read-only static brief preflight check on backtick paths and symbols (also configurable via .delegate.json briefCheck: false)."),
+    ("--no-scout", "Skip the default read-only scout-first map pass for worktree write tasks (also configurable via .delegate.json scoutFirst: false)."),
     ("--evidence-timeout DURATION", "Evidence command limit excluding queue time (default: 30m)."),
     ("--max-answer CHARS", "Ask for this answer length; failed compression displays a bounded excerpt and preserves the full result."),
     ("--timeout DURATION", "Optional limit for each attempt; no default. Stall guards remain active."),

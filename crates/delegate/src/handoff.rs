@@ -20,6 +20,7 @@ fn state_label(status: &Value) -> String {
     }
     match s(status, "state") {
         "running" => "运行中",
+        "scouting" => "探路中",
         "waiting" => "等待中",
         "starting" => "启动中",
         "delivered" => "已交付",

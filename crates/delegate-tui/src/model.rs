@@ -934,6 +934,7 @@ impl RunItem {
         }
         Cow::Borrowed(match self.state.as_str() {
             "running" => "运行中",
+            "scouting" => "探路中",
             "starting" => "启动中",
             "waiting" | "queued" => "排队中",
             "delivered" if self.applied => "已合入",

@@ -321,7 +321,7 @@ pub fn count_work_pulse(work_items_json: &[Value]) -> WorkPulseCounts {
 /// True when a run status JSON is actively executing (running/starting without queue metadata).
 pub fn is_run_active_running_state(st: &Value) -> bool {
     let state = s(st, "state");
-    matches!(state, "running" | "starting") && !run_has_queue(st)
+    matches!(state, "running" | "starting" | "scouting") && !run_has_queue(st)
 }
 
 /// True when a run status JSON is queued/waiting (`waiting`, `queued`, `blocked_mainline`,

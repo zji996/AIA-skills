@@ -239,6 +239,9 @@ class DelegateTests(unittest.TestCase):
                         # Keep background `_merge-worker` off by default for deterministic tests;
                         # premerge/fast-forward tests explicitly pop DELEGATE_PREMERGE and synchronize.
                         DELEGATE_PREMERGE="0",
+                        # Keep two-step scout-first off for existing single-round write fixtures;
+                        # scout-first tests explicitly pop DELEGATE_SCOUT_FIRST.
+                        DELEGATE_SCOUT_FIRST="0",
                         # Synthetic test sessions must not inherit the outer controller harness PID.
                         DELEGATE_SESSION_HARNESS_PID="0",
                         # All tiers equal: tests opt into per-purpose routing.

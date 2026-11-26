@@ -51,6 +51,7 @@ mod resources;
 mod remote;
 mod review;
 mod runs;
+mod scout_first;
 mod source_build;
 mod source_watch;
 mod speed;
@@ -312,6 +313,13 @@ fn format_status(status: serde_json::Value) -> String {
         "graceSeconds",
         "tokens",
         "tokensDelta",
+        "scoutRun",
+        "scoutTokens",
+        "scoutMapStatus",
+        "scoutMapDropReason",
+        "scoutBadAnchors",
+        "scoutAnchorsTotal",
+        "preEditSteps",
         "cleanup",
         "warnings",
         "warning",
