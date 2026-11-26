@@ -6,6 +6,7 @@
 
 ## delegate 6.48.1 - 2026-11-26
 
+- `delegate` 6.48.1：`delegate-tui` 顶部告警条移除额度预计耗尽（`quota_depletion`）与剩余 `<15%`（`quota_low`）两类告警以防布局跳动（`crates/delegate/src/pulse.rs` 与 `crates/delegate-tui/src/model.rs` 同步移除）；`4 额度` 页提醒、总览「额度与消耗」卡提示、`4 额度(!)` 页签角标、`delegate status` 额度行以及登录态漂移（`liveDrifted`）/身份不匹配（`identityMismatch`）顶部告警均保持不变。
 - `delegate` 6.48.1：远端执行（`_remote`）不再无条件继承父进程 stdin——仅当 stdin 为普通文件，或管道已有缓冲数据（`POLLIN`）/存在同进程组非祖先写端（慢生产者真管道）时才透传给 `ssh`；对 tty（如 `agy` 的 PTY）、`/dev/null`、已关闭空管道（如 Pi/`rpi`）以及祖先持有的未关闭空闲管道统一改用 `ssh -n` + `/dev/null` 立即 EOF，避免远端命令误读 stdin 长期挂住并占满远端队列。
 
 ## delegate 6.48.0 - 2026-11-26

@@ -1941,7 +1941,9 @@ impl AppSnapshot {
             }
         }
 
-        // P0: active agy account drift, depletion before reset, or <15% (advisory only).
+        // P0: active agy account drift / identity mismatch only (advisory).
+        // Quota depletion and <15% low quota stay out of the global top alert strip to avoid layout jitter;
+        // they remain visible on the `4 额度` tab, the Overview quota card, and the `4 额度(!)` badge.
         if let Some(active) = self.agy_accounts.accounts.iter().find(|a| a.active) {
             let short = mask_account_name(&active.id);
             if self.agy_accounts.live_drifted {
@@ -1962,84 +1964,6 @@ impl AppSnapshot {
                     target_tab: 4,
                     target_id: Some(active.id.clone()),
                 });
-            }
-            if let Some(q) = &active.quota {
-                if q.ok && !q.identity_mismatch {
-                    let mut alerted_pools: std::collections::HashSet<(String, String)> =
-                        std::collections::HashSet::new();
-                    if let Some(est) = &active.quota_estimate {
-                        let mut check_win = |win_key: &str, w: &QuotaWindowEstimate| {
-                            let Some(mins) = w.estimated_remaining_minutes else {
-                                return;
-                            };
-                            if let Some(entry) = q.entries.iter().find(|e| {
-                                e.window == win_key
-                                    && w.pool
-                                        .as_deref()
-                                        .is_none_or(|p| p.is_empty() || e.pool == p)
-                                    && e.reset_in_seconds
-                                        .is_some_and(|rs| rs > 0 && mins.saturating_mul(60) < rs)
-                            }) {
-                                let pkey = (entry.pool.clone(), win_key.to_string());
-                                if !alerted_pools.insert(pkey) {
-                                    return;
-                                }
-                                let win_zh = if win_key == "fiveHour" { "5h" } else { "本周" };
-                                let pct = (entry.remaining_pct_x100 + 50) / 100;
-                                let rem = format_duration(Some(mins.saturating_mul(60)));
-                                p0.push(ActiveAlertItem {
-                                    level: AlertLevel::P0,
-                                    kind: "quota_depletion".to_string(),
-                                    label: "额度·需手动切号".to_string(),
-                                    message: format!(
-                                        "★{short} {}{win_zh}剩{pct}%，预计约 {rem} 用完 → 按 4 切号",
-                                        entry.pool
-                                    ),
-                                    target_tab: 4,
-                                    target_id: Some(active.id.clone()),
-                                });
-                            }
-                        };
-                        for pe in &est.pools {
-                            if let Some(w) = &pe.weekly {
-                                check_win("weekly", w);
-                            }
-                            if let Some(w) = &pe.five_hour {
-                                check_win("fiveHour", w);
-                            }
-                        }
-                        if let Some(w) = &est.weekly {
-                            check_win("weekly", w);
-                        }
-                        if let Some(w) = &est.five_hour {
-                            check_win("fiveHour", w);
-                        }
-                    }
-                    for entry in &q.entries {
-                        if entry.remaining_pct_x100 < 1500 {
-                            let pkey = (entry.pool.clone(), entry.window.clone());
-                            if alerted_pools.insert(pkey) {
-                                let win_zh = if entry.window == "fiveHour" {
-                                    "5h"
-                                } else {
-                                    "本周"
-                                };
-                                let pct = (entry.remaining_pct_x100 + 50) / 100;
-                                p0.push(ActiveAlertItem {
-                                    level: AlertLevel::P0,
-                                    kind: "quota_low".to_string(),
-                                    label: "额度偏低·需手动切号".to_string(),
-                                    message: format!(
-                                        "★{short} {}{win_zh}仅剩{pct}% → 按 4 切号",
-                                        entry.pool
-                                    ),
-                                    target_tab: 4,
-                                    target_id: Some(active.id.clone()),
-                                });
-                            }
-                        }
-                    }
-                }
             }
         }
 

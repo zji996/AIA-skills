@@ -672,7 +672,10 @@ pub fn compute_pulse_and_alerts(
         p0_alerts.push(alert);
     }
 
-    // 3. Active `agy` account P0 quota / drift alerts (ADVISORY ONLY, never auto-switch).
+    // 3. Active `agy` account P0 drift alerts (ADVISORY ONLY, never auto-switch).
+    //    `quota_depletion` and `quota_low` intentionally stay out of the global top alert banner
+    //    to avoid layout jitter; they remain visible on the `4 额度` tab, the Overview quota card,
+    //    the `4 额度(!)` tab badge (`pulse.quota_alert`), and `delegate status`.
     let quota_alert = compute_quota_alert_flag(agy_accounts_snap);
     if agy_accounts_snap.is_object() {
         let active_acct = agy_accounts_snap["accounts"]
@@ -699,71 +702,6 @@ pub fn compute_pulse_and_alerts(
                 target_tab: 4,
                 target_id: (!active_id.is_empty()).then(|| active_id.to_string()),
             });
-        }
-
-        // Depletion before reset on the ACTIVE account -> P0 advisory reminder.
-        let dep_warnings = agy_accounts::detect_quota_depletion_warnings(agy_accounts_snap);
-        let mut alerted_active_pools: HashSet<(String, String)> = HashSet::new();
-        for w in dep_warnings.iter().filter(|w| w.active) {
-            let short_acct = mask_account_short(&w.account_id);
-            let pool_short = short_pool_name(&w.pool);
-            let win_short = short_window_name(&w.window);
-            alerted_active_pools.insert((pool_short.to_string(), w.window.clone()));
-            let eta_phrase = if w.remaining_minutes == 0 {
-                "按近期速率即将用完（可按 Q 刷新）".to_string()
-            } else {
-                format!(
-                    "预计约 {} 用完",
-                    format_compact_duration((w.remaining_minutes as i64) * 60)
-                )
-            };
-            let reset = agy_accounts::format_reset_zh_short(w.reset_in_seconds);
-            let pct = w.remaining_pct.round() as i64;
-            p0_alerts.push(ActiveAlert {
-                level: AlertLevel::P0,
-                kind: "quota_depletion".to_string(),
-                label: "额度·需手动切号".to_string(),
-                message: format!(
-                    "★{short_acct} {pool_short}{win_short}剩{pct}%({reset}后重置)，{eta_phrase} → 按 4 切号"
-                ),
-                target_tab: 4,
-                target_id: Some(w.account_id.clone()),
-            });
-        }
-
-        // Remaining < 15% on the ACTIVE account (advisory threshold only, never auto-switches).
-        if let Some(acct) = active_acct {
-            let quota = &acct["quota"];
-            if b(quota, "ok") && !b(quota, "identityMismatch") {
-                if let Some(entries) = quota["entries"].as_array() {
-                    for e in entries {
-                        let Some(pct) = e["remainingPct"].as_f64() else {
-                            continue;
-                        };
-                        if pct >= QUOTA_LOW_REMINDER_PCT {
-                            continue;
-                        }
-                        let pool_short = short_pool_name(s(e, "pool"));
-                        let win_key = s(e, "window");
-                        if !alerted_active_pools.insert((pool_short.to_string(), win_key.to_string()))
-                        {
-                            continue;
-                        }
-                        let win_short = short_window_name(win_key);
-                        p0_alerts.push(ActiveAlert {
-                            level: AlertLevel::P0,
-                            kind: "quota_low".to_string(),
-                            label: "额度偏低·需手动切号".to_string(),
-                            message: format!(
-                                "★{active_short} {pool_short}{win_short}仅剩{}% → 按 4 切号",
-                                pct.round() as i64
-                            ),
-                            target_tab: 4,
-                            target_id: (!active_id.is_empty()).then(|| active_id.to_string()),
-                        });
-                    }
-                }
-            }
         }
     }
 
@@ -975,7 +913,10 @@ mod tests {
         assert!(pulse.p0_alert);
 
         assert!(alerts.iter().any(|a| a.level == AlertLevel::P0 && a.kind == "premerge_conflict"));
-        assert!(alerts.iter().any(|a| a.level == AlertLevel::P0 && a.kind == "quota_depletion"));
+        assert!(
+            !alerts.iter().any(|a| a.kind == "quota_depletion"),
+            "quota_depletion must not enter top alert banner: {alerts:?}"
+        );
         assert!(alerts.iter().any(|a| a.level == AlertLevel::P1 && a.kind == "owner_blocked"));
         assert!(alerts.iter().any(|a| a.level == AlertLevel::P1 && a.kind == "controller_stalled"));
     }
@@ -1114,11 +1055,18 @@ mod tests {
         assert_eq!(queued_cnt, pulse.queued_runs);
         assert_eq!(queued_cnt, 2); // queued + blocked_mainline
 
-        // 4. Advisory quota alert parity (`status` <-> `snapshot` P0 `<15%` & `liveDrifted`)
+        // 4. Advisory quota alert parity:
+        //    - `delegate status` still emits the `<15%` advisory line and `pulse.quota_alert` stays true (`4 额度(!)` badge)
+        //    - `quota_low` does NOT enter top `alerts` banner (prevents layout jitter)
+        //    - `liveDrifted` and `identityMismatch` still enter top `alerts` banner as P0 `quota_drift`
         let low_line = format_status_quota_alert_line_from_snapshot(&low_quota_snap)
             .expect("active <15% should produce advisory status reminder");
         assert!(low_line.contains("仅剩12%"), "{low_line}");
-        assert!(alerts.iter().any(|a| a.level == AlertLevel::P0 && a.kind == "quota_low"));
+        assert!(pulse.quota_alert, "active <15% should keep 4 额度(!) badge");
+        assert!(
+            !alerts.iter().any(|a| a.kind == "quota_low"),
+            "quota_low must not enter top alert banner: {alerts:?}"
+        );
 
         let drifted_snap = json!({
             "active": "alpha@example.test",
@@ -1128,5 +1076,29 @@ mod tests {
         let drift_line = format_status_quota_alert_line_from_snapshot(&drifted_snap)
             .expect("liveDrifted should produce advisory status reminder");
         assert!(drift_line.contains("不一致"), "{drift_line}");
+        let (drift_pulse, drift_alerts) =
+            compute_pulse_and_alerts(&[], &[], &drifted_snap, 0, now_ep);
+        assert!(drift_pulse.p0_alert);
+        assert!(drift_pulse.quota_alert);
+        assert!(drift_alerts.iter().any(|a| {
+            a.level == AlertLevel::P0 && a.kind == "quota_drift" && a.label.contains("登录态漂移")
+        }));
+
+        let mismatch_snap = json!({
+            "active": "alpha@example.test",
+            "liveDrifted": false,
+            "accounts": [{
+                "id": "alpha@example.test",
+                "active": true,
+                "quota": { "ok": false, "identityMismatch": true }
+            }]
+        });
+        let (mismatch_pulse, mismatch_alerts) =
+            compute_pulse_and_alerts(&[], &[], &mismatch_snap, 0, now_ep);
+        assert!(mismatch_pulse.p0_alert);
+        assert!(mismatch_pulse.quota_alert);
+        assert!(mismatch_alerts.iter().any(|a| {
+            a.level == AlertLevel::P0 && a.kind == "quota_drift" && a.label.contains("身份不匹配")
+        }));
     }
 }

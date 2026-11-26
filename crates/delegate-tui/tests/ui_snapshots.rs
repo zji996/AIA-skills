@@ -1246,18 +1246,26 @@ fn quota_estimate_reports_depletion_when_earlier_than_reset() {
         }
     }
 
-    // Overview shows the P0 depletion alert strip + quota card depletion note
+    // Overview keeps the quota card depletion note + `4 额度(!)` tab badge, but does NOT show the top alert strip.
     app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
     assert_eq!(app.tab, ViewTab::Overview);
     let ov = render_to_string(&mut app, 150, 40);
     assert_lines_fit_width(&ov, 150);
-    assert!(ov.contains("▲ 告警"), "depletion before reset should trigger alert strip:\n{ov}");
-    assert!(ov.contains("用完"), "{ov}");
+    assert!(
+        !ov.contains("▲ 告警"),
+        "depletion before reset must not trigger top alert strip:\n{ov}"
+    );
+    assert!(ov.contains("4 额度(!)"), "tab badge should stay:\n{ov}");
+    assert!(ov.contains("⚠ 约 3d0h") && ov.contains("⚠ 约 1h3"), "{ov}");
 
-    // Quota tab ('4') shows both windows clearly without truncation.
+    // Quota tab ('4') shows both windows clearly without truncation, and no top alert strip.
     app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
     let acct = render_to_string(&mut app, 150, 44);
     assert_lines_fit_width(&acct, 150);
+    assert!(
+        !acct.contains("▲ 告警"),
+        "quota tab must not show top alert strip for depletion:\n{acct}"
+    );
     assert!(acct.contains("按最近 5 小时的平均用量，Claude/GPT 5 小时额度约 1 小时 30"), "{acct}");
     assert!(acct.contains("分钟后用完"), "{acct}");
     assert!(
@@ -2366,13 +2374,17 @@ fn tui_1126_fixes_ephemeral_work_rework_charts_quota_alert_and_stale_folding() {
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/user/norvane"), 5);
 
     // 1. Runs tab ('3'): `跑命令` untruncated, `返工1轮` without English REWORK,
-    //    quota alert strip visible globally, dispatched queue and stale (>7d) pending folded by default!
+    //    quota depletion stays out of top alert strip (keeps `4 额度(!)` badge), dispatched queue and stale (>7d) pending folded by default!
     app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
     let tasks = render_to_string(&mut app, 180, 40);
     assert!(tasks.contains("跑命令"), "expected full 跑命令:\n{tasks}");
     assert!(tasks.contains("返工1轮"), "expected Chinese rework badge:\n{tasks}");
     assert!(!tasks.contains("REWORK"), "English REWORK must not appear:\n{tasks}");
-    assert!(tasks.contains("▲ 告警") && tasks.contains("用完"), "quota alert strip missing:\n{tasks}");
+    assert!(
+        !tasks.contains("▲ 告警"),
+        "quota depletion must not render top alert strip:\n{tasks}"
+    );
+    assert!(tasks.contains("4 额度(!)"), "quota tab badge missing:\n{tasks}");
     assert!(tasks.contains("已派队列 1 条"), "dispatched queue should fold by default:\n{tasks}");
     assert!(!tasks.contains("已派 agy-usage"), "dispatched entry should be hidden while folded:\n{tasks}");
     assert!(tasks.contains("更早陈旧 1 条") || tasks.contains("陈旧仓库 1 个"), "stale item should fold by default:\n{tasks}");
@@ -2387,7 +2399,7 @@ fn tui_1126_fixes_ephemeral_work_rework_charts_quota_alert_and_stale_folding() {
     assert!(tasks_all.contains("whatsapp-bridge"), "show_all should reveal stale repo:\n{tasks_all}");
 
     // 2. Work tab ('2'): includes ephemeral `R:cmd-task`, `2 工作(3)`, merged wait sentence,
-    //    advancing ETA (~04:40), and global quota alert strip.
+    //    advancing ETA (~04:40), and no top alert strip for quota depletion.
     app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
     let work = render_to_string(&mut app, 180, 40);
     assert!(work.contains("2 工作(3)"), "work tab count must include ephemeral R: row:\n{work}");
@@ -2396,11 +2408,17 @@ fn tui_1126_fixes_ephemeral_work_rework_charts_quota_alert_and_stale_folding() {
     assert!(work.contains("等 W119 关闭 (~04:40)"), "wait text must be merged into one phrase:\n{work}");
     assert!(!work.contains("等 W119 关闭 等W119"), "duplicate wait phrase:\n{work}");
     assert!(work.contains("活跃链预计 04:40"), "advancing ETA missing:\n{work}");
-    assert!(work.contains("▲ 告警") && work.contains("用完"), "quota alert strip missing from work:\n{work}");
+    assert!(
+        !work.contains("▲ 告警"),
+        "quota depletion must not render top alert strip on work tab:\n{work}"
+    );
 
-    // 3. Quota tab ('4'): horizontal Token Distribution bars + horizontal 7d efficiency bars, zero `m█`/`%█` collision!
+    // 3. Quota tab ('4'): horizontal Token Distribution bars + horizontal 7d efficiency bars, zero `m█`/`%█` collision,
+    //    and account-page depletion reminder remains visible!
     app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
     let quota = render_to_string(&mut app, 180, 45);
+    assert!(!quota.contains("▲ 告警"), "quota tab must not show top alert strip:\n{quota}");
+    assert!(quota.contains("用完"), "quota tab must still show depletion reminder:\n{quota}");
     assert!(quota.contains("近 7 天 Token 分布") && quota.contains("3.49B"), "{quota}");
     assert!(quota.contains("写任务") && quota.contains("72%"), "{quota}");
     assert!(quota.contains("自动审查") && quota.contains("18%"), "{quota}");
@@ -2510,7 +2528,8 @@ fn global_alert_strip_silent_when_healthy_and_visible_across_all_5_tabs_on_p0_p1
         assert!(!s.contains("▲ 告警"), "healthy tab '{key}' must not render alert strip:\n{s}");
     }
 
-    // 2. P0 quota depletion + P0 premerge conflict + P1 stalled controller pending >= 30m
+    // 2. P0 liveDrifted + P0 premerge conflict + P1 stalled controller pending >= 30m
+    //    (quota depletion + <15% low quota are ALSO present, and must NOT enter the top alert strip).
     let alert_raw = r#"{
         "schemaVersion": 1,
         "generatedAt": "2026-11-26T00:00:00Z",
@@ -2540,6 +2559,7 @@ fn global_alert_strip_silent_when_healthy_and_visible_across_all_5_tabs_on_p0_p1
         }],
         "agyAccounts": {
             "active": "alpha",
+            "liveDrifted": true,
             "accounts": [{
                 "id": "alpha",
                 "email": "alpha@example.test",
@@ -2549,11 +2569,11 @@ fn global_alert_strip_silent_when_healthy_and_visible_across_all_5_tabs_on_p0_p1
                     "ok": true,
                     "ageSeconds": 30,
                     "entries": [
-                        {"pool": "Gemini Models", "window": "fiveHour", "remainingPct": 22.0, "resetInSeconds": 14400}
+                        {"pool": "Gemini Models", "window": "fiveHour", "remainingPct": 12.0, "resetInSeconds": 14400}
                     ]
                 },
                 "quotaEstimate": {
-                    "fiveHour": {"pool": "Gemini Models", "remainingPct": 22.0, "tokensPerPct": 10000000, "estimatedRemainingHours": 1.2}
+                    "fiveHour": {"pool": "Gemini Models", "remainingPct": 12.0, "tokensPerPct": 10000000, "estimatedRemainingHours": 1.2}
                 }
             }]
         },
@@ -2573,7 +2593,14 @@ fn global_alert_strip_silent_when_healthy_and_visible_across_all_5_tabs_on_p0_p1
         let s = render_to_string(&mut alert_app, 160, 36);
         assert_lines_fit_width(&s, 160);
         assert!(s.contains("▲ 告警(3)"), "tab '{key}' missing alert strip:\n{s}");
-        assert!(s.contains("额度·需手动切号") && s.contains("冲突"), "tab '{key}' missing P0 alerts:\n{s}");
+        assert!(
+            s.contains("额度·登录态漂移") && s.contains("冲突"),
+            "tab '{key}' missing P0 alerts:\n{s}"
+        );
+        assert!(
+            !s.contains("额度·需手动切号") && !s.contains("额度偏低·需手动切号"),
+            "tab '{key}' must not include quota depletion/low in top alert strip:\n{s}"
+        );
         assert!(s.contains("+ 另有 1 条"), "tab '{key}' missing overflow count:\n{s}");
     }
 
@@ -2582,6 +2609,107 @@ fn global_alert_strip_silent_when_healthy_and_visible_across_all_5_tabs_on_p0_p1
     let s100 = render_to_string(&mut alert_app, 100, 30);
     assert_lines_fit_width(&s100, 100);
     assert!(s100.contains("▲ 告警(3)") && s100.contains("+另有2条"), "narrow 100-col alert strip:\n{s100}");
+
+    // 3. Quota depletion + <15% low quota alone -> NO top alert strip on Overview or Quota tab,
+    //    while `4 额度(!)` badge and `4 额度` page reminders stay intact.
+    let quota_only_raw = r#"{
+        "schemaVersion": 1,
+        "generatedAt": "2026-11-26T00:00:00Z",
+        "seq": 3,
+        "repos": [],
+        "agyAccounts": {
+            "active": "jzy-main",
+            "liveDrifted": false,
+            "accounts": [{
+                "id": "jzy-main",
+                "email": "jzy@example.test",
+                "active": true,
+                "quota": {
+                    "fetchedAt": "2026-11-26T00:00:00Z",
+                    "ok": true,
+                    "ageSeconds": 30,
+                    "entries": [
+                        {"pool": "Gemini Models", "window": "weekly", "remainingPct": 63.0, "resetInSeconds": 432000},
+                        {"pool": "Claude/GPT", "window": "fiveHour", "remainingPct": 11.0, "resetInSeconds": 10800}
+                    ]
+                },
+                "quotaEstimate": {
+                    "weekly": {"pool": "Gemini Models", "remainingPct": 63.0, "tokensPerPct": 10000000, "estimatedRemainingHours": 12.95, "burnRateSource": "24h"},
+                    "pools": [
+                        {"pool": "Gemini Models", "weekly": {"pool": "Gemini Models", "remainingPct": 63.0, "tokensPerPct": 10000000, "estimatedRemainingHours": 12.95, "burnRateSource": "24h"}}
+                    ]
+                }
+            }]
+        },
+        "work": [],
+        "events": [],
+        "lane": {},
+        "dagQueue": [],
+        "merges": [],
+        "candidates": []
+    }"#;
+    let quota_only_snap = parse_snapshot_json(quota_only_raw, None, None).unwrap();
+    let mut quota_only_app = App::new(quota_only_snap, PathBuf::from("delegate"), PathBuf::from("."), 5);
+    quota_only_app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+    let ov_no_banner = render_to_string(&mut quota_only_app, 180, 50);
+    assert_lines_fit_width(&ov_no_banner, 180);
+    assert!(
+        !ov_no_banner.contains("▲ 告警"),
+        "quota depletion/low alone must not trigger top alert strip:\n{ov_no_banner}"
+    );
+    assert!(ov_no_banner.contains("4 额度(!)"), "4 额度(!) badge must stay:\n{ov_no_banner}");
+    assert!(ov_no_banner.contains("用完"), "overview quota card hint must stay:\n{ov_no_banner}");
+
+    quota_only_app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+    let tab4_reminder = render_to_string(&mut quota_only_app, 180, 50);
+    assert_lines_fit_width(&tab4_reminder, 180);
+    assert!(!tab4_reminder.contains("▲ 告警"), "tab 4 must not show top alert strip:\n{tab4_reminder}");
+    assert!(
+        tab4_reminder.contains("⚠ 周 ~12h57m") && tab4_reminder.contains("用完"),
+        "tab 4 must keep depletion reminder:\n{tab4_reminder}"
+    );
+    if std::env::var("PRINT_TUI_SNAPSHOTS").as_deref() == Ok("1") {
+        println!("\n=== OVERVIEW_NO_QUOTA_BANNER 180x50 ===\n{ov_no_banner}");
+        println!("\n=== QUOTA_TAB_REMINDER 180x50 ===\n{tab4_reminder}");
+    }
+
+    // 4. identityMismatch alone still triggers the top P0 alert strip.
+    let mismatch_raw = r#"{
+        "schemaVersion": 1,
+        "generatedAt": "2026-11-26T00:00:00Z",
+        "seq": 4,
+        "repos": [],
+        "agyAccounts": {
+            "active": "alpha",
+            "liveDrifted": false,
+            "accounts": [{
+                "id": "alpha",
+                "email": "alpha@example.test",
+                "active": true,
+                "quota": {
+                    "fetchedAt": "2026-11-26T00:00:00Z",
+                    "ok": false,
+                    "identityMismatch": true,
+                    "ageSeconds": 30,
+                    "entries": []
+                }
+            }]
+        },
+        "work": [],
+        "events": [],
+        "lane": {},
+        "dagQueue": [],
+        "merges": [],
+        "candidates": []
+    }"#;
+    let mismatch_snap = parse_snapshot_json(mismatch_raw, None, None).unwrap();
+    let mut mismatch_app = App::new(mismatch_snap, PathBuf::from("delegate"), PathBuf::from("."), 5);
+    mismatch_app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+    let ov_mismatch = render_to_string(&mut mismatch_app, 140, 30);
+    assert!(
+        ov_mismatch.contains("▲ 告警(1)") && ov_mismatch.contains("额度·身份不匹配"),
+        "identityMismatch must still enter top alert strip:\n{ov_mismatch}"
+    );
 }
 
 #[test]
