@@ -1766,13 +1766,6 @@ pub fn quota_snapshot_for_alerts_in(state: &Path, now_ep: i64) -> Option<Value> 
     Some(json!({ "active": active_id, "accounts": items }))
 }
 
-pub fn detect_quota_depletion_warnings_in(state: &Path, now_ep: i64) -> Vec<QuotaDepletionWarning> {
-    let Some(snap) = quota_snapshot_for_alerts_in(state, now_ep) else {
-        return Vec::new();
-    };
-    detect_quota_depletion_warnings(&snap)
-}
-
 /// Format a prominent single-line warning for `delegate status` (advisory only).
 pub fn format_status_quota_warning_line(warnings: &[QuotaDepletionWarning]) -> Option<String> {
     let top = warnings.first()?;
