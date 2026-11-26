@@ -1765,6 +1765,58 @@ fn copy_pi_fork_if_needed(target: &str, dest_dir: &Path, is_agy: bool) -> Res<St
 
 const MAX_PARSE_ERROR_CHARS: usize = 240;
 const RO_VIOLATION_SAMPLE_MAX: usize = 5;
+pub const REVIEW_VERDICT_ENV_ERROR: &str = "ENV_ERROR";
+const REVIEW_ENV_ERROR_PREFIX: &str = "REVIEW_ENV_ERROR:";
+
+pub fn review_env_error_retry_command(run_id: &str) -> String {
+    format!("delegate reply {run_id} --review-full '重跑审查'")
+}
+
+/// Whether the reviewer can safely continue the previous review session on `current_workdir`.
+///
+/// - Different colleague drivers (`agy` vs Pi) can never share a session.
+/// - `agy --conversation <id>` keeps the conversation's original Command Working Directory;
+///   if `current_workdir` changed (e.g. a reply run using a new `review-ro/<run_id>` after the
+///   parent run cleaned up its snapshot), continuing the old conversation causes `run_command`
+///   to fail with `no such directory`. Start a fresh incremental session instead.
+/// - Pi `--fork <session_file>` uses the spawned process's `current_dir`, so it can safely
+///   switch to the new snapshot path (with the prompt explicitly naming the new path).
+pub(crate) fn can_continue_review_session(
+    is_agy_reviewer: bool,
+    prev_continuation_is_agy: bool,
+    prev_workdir: Option<&Path>,
+    current_workdir: &Path,
+) -> bool {
+    if prev_continuation_is_agy != is_agy_reviewer {
+        return false;
+    }
+    if is_agy_reviewer {
+        return prev_workdir == Some(current_workdir);
+    }
+    true
+}
+
+pub(crate) fn format_review_workdir_note(
+    use_ro_workspace: bool,
+    workdir: &Path,
+    prev_workdir: Option<&Path>,
+    continuing_session: bool,
+) -> String {
+    let wd = workdir.display();
+    if use_ro_workspace {
+        if continuing_session && prev_workdir.is_some_and(|p| p != workdir) {
+            format!(
+                "本轮审查工作目录（只读快照，已切换至本轮新路径）：`{wd}`（上一轮快照已清理，请勿访问旧路径）。\n"
+            )
+        } else {
+            format!("本轮审查工作目录（只读快照）：`{wd}`。\n")
+        }
+    } else if continuing_session {
+        format!("本轮审查工作目录：`{wd}`。\n")
+    } else {
+        String::new()
+    }
+}
 
 struct CleanupDir(PathBuf);
 impl Drop for CleanupDir {
@@ -1852,6 +1904,9 @@ pub fn compact_review_summary(doc: &Value) -> Value {
         "tier",
         "fallback",
         "needsAttention",
+        "envError",
+        "error",
+        "retryCommand",
         "upgradedBy",
         "originalVerdict",
         "formatError",
@@ -2168,6 +2223,7 @@ struct InheritedReviewState {
     verdict_text: String,
     continuation: Option<String>,
     continuation_is_agy: bool,
+    review_workdir: Option<PathBuf>,
     agy_account: Option<String>,
 }
 
@@ -2287,6 +2343,10 @@ fn load_inherited_review(run: &Path, meta: &Value) -> Option<InheritedReviewStat
                     continuation = find_session_continuation(&rdir, &probe_meta);
                 }
             }
+            let review_workdir = {
+                let wd = s(&rev, "reviewWorkdir");
+                (!wd.is_empty()).then(|| PathBuf::from(wd))
+            };
             let agy_account = {
                 let a = s(&anc_meta, "reviewAgyAccount");
                 if !a.is_empty() {
@@ -2304,6 +2364,7 @@ fn load_inherited_review(run: &Path, meta: &Value) -> Option<InheritedReviewStat
                 verdict_text,
                 continuation,
                 continuation_is_agy,
+                review_workdir,
                 agy_account,
             });
         }
@@ -2511,6 +2572,7 @@ struct ReviewRoundOutcome {
     format_error: bool,
     format_retried: bool,
     format_retry_failed: bool,
+    env_error: Option<String>,
     parse_error: Option<String>,
     upgraded_by: Option<String>,
     ro_violations: Vec<String>,
@@ -2608,6 +2670,17 @@ fn run_reviewer_with_format_retry(
     cancel: Arc<AtomicBool>,
     allow_format_retry: bool,
 ) -> AgentAttemptWithRetry {
+    let wd = Path::new(s(review_meta, "workdir"));
+    if wd.as_os_str().is_empty() || !wd.is_dir() {
+        return AgentAttemptWithRetry {
+            res: Err(format!(
+                "{REVIEW_ENV_ERROR_PREFIX}只读审查快照缺失（{}）",
+                wd.display()
+            )),
+            format_retried: false,
+            format_retry_failed: false,
+        };
+    }
     let first = run_agent_and_cleanup(
         review_meta,
         exec_dir,
@@ -2939,6 +3012,9 @@ pub fn run_accept_and_review(
     let mut prev_continuation_is_agy: bool = inherited_review
         .as_ref()
         .is_some_and(|inh| inh.continuation_is_agy);
+    let mut prev_review_workdir: Option<PathBuf> = inherited_review
+        .as_ref()
+        .and_then(|inh| inh.review_workdir.clone());
     let mut passed_layers: BTreeMap<String, Value> = BTreeMap::new();
     let mut rework_delta_files: Option<Vec<String>> = None;
     let mut active_review_cfg = review_cfg.clone();
@@ -3163,6 +3239,9 @@ pub fn run_accept_and_review(
                 final_doc["reviewContinuation"] = json!(cont);
                 final_doc["reviewContinuationIsAgy"] = json!(inh.continuation_is_agy);
             }
+            if let Some(wd) = &inh.review_workdir {
+                final_doc["reviewWorkdir"] = json!(wd.to_string_lossy());
+            }
             attach_review_model_fields(&mut final_doc, &active_review_cfg, active_fallback.as_ref());
             write_json(run.join("review.json"), &final_doc)?;
             sum["review"] = compact_review_summary(&final_doc);
@@ -3249,7 +3328,182 @@ pub fn run_accept_and_review(
             }),
         );
 
-        let fork_target = if incremental && prev_continuation_is_agy == is_agy_reviewer {
+        // Prepare isolated read-only workspace whenever running agy OR running in parallel with slow accept.
+        // Do this BEFORE building the prompt and deciding session continuation so we know the exact
+        // workdir for this round and fail closed as `ENV_ERROR` (not `NEEDS_CONTROLLER`) if missing.
+        let parallel_with_slow = !plan.slow.is_empty();
+        let excludes = strings(&meta["snapshotExclude"]);
+        let use_ro_workspace = (is_agy_reviewer || parallel_with_slow)
+            && top.is_dir()
+            && !after_tree.is_empty();
+        let ro_prep_result =
+            if use_ro_workspace {
+                match prepare_ro_workspace(&top, &after_tree, &ro_workspace, &round_dir) {
+                    Ok(()) => {
+                        if !ro_workspace.is_dir() {
+                            Err(format!(
+                                "只读审查快照缺失（{}）",
+                                ro_workspace.display()
+                            ))
+                        } else {
+                            match dir_manifest_for_repo(&ro_workspace, &top) {
+                                Ok(manifest) => Ok((ro_workspace.clone(), None, Some(manifest))),
+                                Err(err) => Err(format!(
+                                    "读取只读审查快照清单失败（{}）：{err}",
+                                    ro_workspace.display()
+                                )),
+                            }
+                        }
+                    }
+                    Err(err) => Err(format!(
+                        "只读审查快照缺失或准备失败（{}）：{err}",
+                        ro_workspace.display()
+                    )),
+                }
+            } else {
+                let wd = PathBuf::from(s(meta, "workdir"));
+                if wd.as_os_str().is_empty() || !wd.is_dir() {
+                    Err(format!("审查工作目录缺失（{}）", wd.display()))
+                } else {
+                    let snap = if top.is_dir() {
+                        changes::snapshot(&top, &round_dir, &excludes)
+                    } else {
+                        None
+                    };
+                    Ok((wd, snap, None))
+                }
+            };
+
+        let (reviewer_workdir, before_pi_snap, before_ro_manifest) = match ro_prep_result {
+            Ok(triple) => triple,
+            Err(env_err) => {
+                // Still run slow acceptance if configured so acceptance status is accurate.
+                let slow_outcome = if parallel_with_slow {
+                    Some(crate::accept::run_phase(
+                        meta,
+                        run,
+                        &plan.slow,
+                        fast_outcome.is_some(),
+                        holder.as_ref(),
+                        None,
+                        None,
+                    ))
+                } else {
+                    None
+                };
+                let (_, accept_after_snap) = crate::accept::snapshot_for_accept(meta, run);
+                let mut accept_doc = crate::accept::build_accept_summary(
+                    meta,
+                    run,
+                    &plan,
+                    fast_outcome.as_ref(),
+                    slow_outcome.as_ref(),
+                    false,
+                    excluded,
+                    accept_before_snap.as_ref(),
+                    accept_after_snap.as_ref(),
+                );
+                let accept_ok = b(&accept_doc, "ok");
+                if b(&accept_doc, "infrastructureFailure") {
+                    sum["infrastructureFailure"] = json!(true);
+                    sum["error"] =
+                        json!("remote infrastructure failure; retry does not spend a rework round");
+                }
+                if !accept_ok {
+                    apply_accept_failure_state(run, meta, &mut accept_doc, state, sum);
+                }
+                emit_accept_event(run, meta, &accept_doc);
+                sum["accept"] = accept_doc;
+
+                let now = iso();
+                let err_short = clip(&env_err, MAX_PARSE_ERROR_CHARS);
+                let retry_cmd = review_env_error_retry_command(&run_id);
+                let round_entry = json!({
+                    "round": round,
+                    "verdict": REVIEW_VERDICT_ENV_ERROR,
+                    "scope": review_scope,
+                    "scopeFiles": scope_files,
+                    "diffFile": diff_file.to_string_lossy(),
+                    "incremental": incremental,
+                    "envError": true,
+                    "error": err_short,
+                    "retryCommand": retry_cmd,
+                    "startedAt": round_started,
+                    "finishedAt": now,
+                });
+                rounds_history.push(round_entry);
+                let mut final_doc = json!({
+                    "status": "env_error",
+                    "verdict": REVIEW_VERDICT_ENV_ERROR,
+                    "envError": true,
+                    "error": err_short,
+                    "parseError": err_short,
+                    "retryCommand": retry_cmd,
+                    "scope": review_scope,
+                    "scopeFiles": scope_files,
+                    "round": round,
+                    "reworkRounds": rework_rounds,
+                    "rubric": rubric_source,
+                    "needsAttention": true,
+                    "rounds": rounds_history,
+                    "startedAt": review_started_at,
+                    "updatedAt": now,
+                    "finishedAt": now,
+                });
+                if let Some(tree) = &last_valid_reviewed_tree {
+                    final_doc["reviewedTree"] = json!(tree);
+                }
+                if let Some(base) = &prev_reviewed_base {
+                    final_doc["reviewedBaseTree"] = json!(base);
+                }
+                attach_review_model_fields(
+                    &mut final_doc,
+                    &active_review_cfg,
+                    active_fallback.as_ref(),
+                );
+                crate::usage::attach_review_totals(&rounds_history, &mut final_doc);
+                write_json(run.join("review.json"), &final_doc)?;
+                sum["review"] = compact_review_summary(&final_doc);
+                events::emit(
+                    &run_id,
+                    &repo,
+                    "review_verdict",
+                    json!({
+                        "name": run_name,
+                        "round": round,
+                        "verdict": REVIEW_VERDICT_ENV_ERROR,
+                        "envError": true,
+                        "error": err_short,
+                        "retryCommand": retry_cmd,
+                    }),
+                );
+                events::emit(
+                    &run_id,
+                    &repo,
+                    "needs_attention",
+                    json!({
+                        "name": run_name,
+                        "round": round,
+                        "reworkRounds": rework_rounds,
+                        "reason": "reviewEnvError",
+                        "verdict": REVIEW_VERDICT_ENV_ERROR,
+                        "detail": err_short,
+                    }),
+                );
+                *state = if accept_ok { "delivered" } else { "rejected" }.into();
+                sum["state"] = json!(*state);
+                break;
+            }
+        };
+
+        let can_continue = incremental
+            && can_continue_review_session(
+                is_agy_reviewer,
+                prev_continuation_is_agy,
+                prev_review_workdir.as_deref(),
+                &reviewer_workdir,
+            );
+        let fork_target = if can_continue {
             match prev_review_continuation.as_deref() {
                 Some(prev) => copy_pi_fork_if_needed(prev, &round_dir, is_agy_reviewer).ok(),
                 None => None,
@@ -3257,6 +3511,12 @@ pub fn run_accept_and_review(
         } else {
             None
         };
+        let workdir_note = format_review_workdir_note(
+            use_ro_workspace,
+            &reviewer_workdir,
+            prev_review_workdir.as_deref(),
+            fork_target.is_some(),
+        );
         let diff_section = format_diff_for_prompt(&diff_text, &diff_file, &top, &diff_from, &after_tree);
         let prev_verdict_section = prev_verdict_text
             .as_deref()
@@ -3280,6 +3540,7 @@ pub fn run_accept_and_review(
             };
             format!(
                 "{lead}\n\
+                 {workdir_note}\
                  - {incremental_rule}\n\
                  - 第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`（无前缀、无 Markdown 修饰）。\n\
                  - 结论正文后附加 `## 主控重点看` 小节（`- [高|中|低] path:line — 理由`，无则写 `无`）。\n\n\
@@ -3288,7 +3549,8 @@ pub fn run_accept_and_review(
             )
         } else if incremental {
             format!(
-                "请作为独立只读审查员进行续审（上轮审查会话不可续接，已提供上下文、上一轮审查结论原文与本轮增量 diff）。\n\
+                "请作为独立只读审查员进行续审（已提供上下文、上一轮审查结论原文与本轮增量 diff）。\n\
+                 {workdir_note}\
                  {incremental_rule}\n\
                  输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`。\n\n\
                  ## 审查要点（{rubric_source}）\n\n\
@@ -3303,6 +3565,7 @@ pub fn run_accept_and_review(
         } else {
             format!(
                 "请作为独立只读审查员审查以下写入任务的交付结果。\n\
+                 {workdir_note}\
                  严格遵守：不修改任何文件，不委派子任务；输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`（无前缀、无 Markdown 修饰）。\n\n\
                  ## 审查要点（{rubric_source}）\n\n\
                  {}\n\n\
@@ -3316,25 +3579,6 @@ pub fn run_accept_and_review(
         };
         let review_prompt_file = round_dir.join("prompt.md");
         write(&review_prompt_file, &prompt_body)?;
-
-        // Prepare isolated read-only workspace whenever running agy OR running in parallel with slow accept.
-        let parallel_with_slow = !plan.slow.is_empty();
-        let excludes = strings(&meta["snapshotExclude"]);
-        let use_ro_workspace = (is_agy_reviewer || parallel_with_slow)
-            && top.is_dir()
-            && !after_tree.is_empty();
-        let (reviewer_workdir, before_pi_snap, before_ro_manifest) = if use_ro_workspace {
-            prepare_ro_workspace(&top, &after_tree, &ro_workspace, &round_dir)?;
-            let manifest = dir_manifest_for_repo(&ro_workspace, &top)?;
-            (ro_workspace.clone(), None, Some(manifest))
-        } else {
-            let snap = if top.is_dir() {
-                changes::snapshot(&top, &round_dir, &excludes)
-            } else {
-                None
-            };
-            (PathBuf::from(s(meta, "workdir")), snap, None)
-        };
 
         let review_meta = build_reviewer_meta(
             meta,
@@ -3442,35 +3686,55 @@ pub fn run_accept_and_review(
                                 );
                                 let extra_prompt_file = extra_dir.join("prompt.md");
                                 write(&extra_prompt_file, &extra_prompt_body)?;
-                                let extra_workdir = if top.is_dir() && !after_tree.is_empty() {
-                                    prepare_ro_workspace(
-                                        &top,
-                                        &after_tree,
-                                        &extra_ro_workspace,
-                                        &extra_dir,
-                                    )?;
-                                    extra_ro_workspace.clone()
-                                } else {
-                                    PathBuf::from(s(meta, "workdir"))
-                                };
-                                let mut extra_meta = build_reviewer_meta(
-                                    meta,
-                                    extra_cfg,
-                                    &extra_dir,
-                                    &extra_workdir,
-                                    &extra_prompt_file,
-                                    None,
-                                );
-                                extra_meta["isExtraReviewer"] = json!(true);
-                                crate::deny::prepare(&extra_meta, &extra_dir)?;
-                                ExtraPreDecision::Run {
-                                    model: em_model,
-                                    model_name: em_name,
-                                    triggers,
-                                    extra_dir,
-                                    extra_meta,
-                                    verdict_file: review_root
-                                        .join(format!("round-{round}-extra-verdict.md")),
+                                let extra_workdir_res: Result<PathBuf, String> =
+                                    if top.is_dir() && !after_tree.is_empty() {
+                                        prepare_ro_workspace(
+                                            &top,
+                                            &after_tree,
+                                            &extra_ro_workspace,
+                                            &extra_dir,
+                                        )
+                                        .and_then(|()| {
+                                            if extra_ro_workspace.is_dir() {
+                                                Ok(extra_ro_workspace.clone())
+                                            } else {
+                                                Err(format!(
+                                                    "补充审查只读快照缺失（{}）",
+                                                    extra_ro_workspace.display()
+                                                ))
+                                            }
+                                        })
+                                    } else {
+                                        Ok(PathBuf::from(s(meta, "workdir")))
+                                    };
+                                match extra_workdir_res {
+                                    Ok(extra_workdir) => {
+                                        let mut extra_meta = build_reviewer_meta(
+                                            meta,
+                                            extra_cfg,
+                                            &extra_dir,
+                                            &extra_workdir,
+                                            &extra_prompt_file,
+                                            None,
+                                        );
+                                        extra_meta["isExtraReviewer"] = json!(true);
+                                        crate::deny::prepare(&extra_meta, &extra_dir)?;
+                                        ExtraPreDecision::Run {
+                                            model: em_model,
+                                            model_name: em_name,
+                                            triggers,
+                                            extra_dir,
+                                            extra_meta,
+                                            verdict_file: review_root
+                                                .join(format!("round-{round}-extra-verdict.md")),
+                                        }
+                                    }
+                                    Err(err) => ExtraPreDecision::Error {
+                                        model: em_model,
+                                        model_name: em_name,
+                                        triggers,
+                                        error: clip(&err, MAX_PARSE_ERROR_CHARS),
+                                    },
                                 }
                             }
                         }
@@ -3656,9 +3920,24 @@ pub fn run_accept_and_review(
                     is_agy_reviewer = crate::agy::is_agy(s(&active_review_cfg, "model"));
                     let fallback_dir = round_dir.join("fallback");
                     if fs::create_dir_all(&fallback_dir).is_ok() {
+                        let fb_workdir = if use_ro_workspace {
+                            ro_workspace.clone()
+                        } else if is_agy_reviewer && top.is_dir() && !after_tree.is_empty() {
+                            let _ = prepare_ro_workspace(&top, &after_tree, &ro_workspace, &fallback_dir);
+                            ro_workspace.clone()
+                        } else {
+                            reviewer_workdir.clone()
+                        };
+                        let fb_workdir_note = format_review_workdir_note(
+                            use_ro_workspace || (is_agy_reviewer && top.is_dir() && !after_tree.is_empty()),
+                            &fb_workdir,
+                            prev_review_workdir.as_deref(),
+                            false,
+                        );
                         let fb_prompt_file = if fork_target.is_some() {
                             let fb_body = format!(
                                 "请作为独立只读审查员进行第 {round} 轮续审（已回退到备用审查模型，提供完整上下文、上一轮审查结论原文与本轮增量 diff）。\n\
+                                 {fb_workdir_note}\
                                  {incremental_rule}\n\
                                  输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`。\n\n\
                                  ## 审查要点（{rubric_source}）\n\n\
@@ -3675,14 +3954,6 @@ pub fn run_accept_and_review(
                             p
                         } else {
                             review_prompt_file.clone()
-                        };
-                        let fb_workdir = if use_ro_workspace {
-                            ro_workspace.clone()
-                        } else if is_agy_reviewer && top.is_dir() && !after_tree.is_empty() {
-                            let _ = prepare_ro_workspace(&top, &after_tree, &ro_workspace, &fallback_dir);
-                            ro_workspace.clone()
-                        } else {
-                            reviewer_workdir.clone()
                         };
                         let mut fb_meta = build_reviewer_meta(
                             meta,
@@ -3726,6 +3997,7 @@ pub fn run_accept_and_review(
                     format_error: false,
                     format_retried: attempt.format_retried,
                     format_retry_failed: false,
+                    env_error: None,
                     parse_error: None,
                     upgraded_by: None,
                     ro_violations: Vec::new(),
@@ -3772,6 +4044,7 @@ pub fn run_accept_and_review(
 
                 let mut format_error = false;
                 let mut format_retry_failed = attempt.format_retry_failed;
+                let mut env_error: Option<String> = None;
                 let mut parse_error: Option<String> = None;
                 let mut upgraded_by: Option<String> = None;
                 let mut raw_first_line = String::new();
@@ -3838,6 +4111,7 @@ pub fn run_accept_and_review(
                                 format_error: false,
                                 format_retried: attempt.format_retried,
                                 format_retry_failed: false,
+                                env_error: None,
                                 parse_error: None,
                                 upgraded_by: None,
                                 ro_violations: Vec::new(),
@@ -3878,7 +4152,12 @@ pub fn run_accept_and_review(
                         }
                     }
                     Err(err) => {
-                        if attempt.format_retried {
+                        if let Some(reason) = err.strip_prefix(REVIEW_ENV_ERROR_PREFIX) {
+                            let msg = clip(reason.trim(), MAX_PARSE_ERROR_CHARS);
+                            env_error = Some(msg.clone());
+                            parse_error = Some(msg);
+                            (REVIEW_VERDICT_ENV_ERROR.to_string(), String::new())
+                        } else if attempt.format_retried {
                             format_error = true;
                             format_retry_failed = true;
                             parse_error = Some(clip(
@@ -3886,16 +4165,32 @@ pub fn run_accept_and_review(
                                 MAX_PARSE_ERROR_CHARS,
                             ));
                             upgraded_by = Some("formatError".into());
+                            ("NEEDS_CONTROLLER".to_string(), String::new())
                         } else {
                             parse_error = Some(clip(
                                 &format!("reviewer execution error: {err}"),
                                 MAX_PARSE_ERROR_CHARS,
                             ));
                             upgraded_by = Some("reviewerError".into());
+                            ("NEEDS_CONTROLLER".to_string(), String::new())
                         }
-                        ("NEEDS_CONTROLLER".to_string(), String::new())
                     }
                 };
+
+                // If the read-only snapshot vanished during review, fail closed as `ENV_ERROR`
+                // instead of letting the reviewer's verdict become `NEEDS_CONTROLLER`.
+                if !stopped_flag && env_error.is_none() && use_ro_workspace && !ro_workspace.is_dir()
+                {
+                    let msg = clip(
+                        &format!("只读审查快照缺失（{}）", ro_workspace.display()),
+                        MAX_PARSE_ERROR_CHARS,
+                    );
+                    env_error = Some(msg.clone());
+                    parse_error = Some(msg);
+                    upgraded_by = None;
+                    format_error = false;
+                    verdict_str = REVIEW_VERDICT_ENV_ERROR.to_string();
+                }
 
                 let mut ro_violation_file: Option<PathBuf> = None;
                 let ro_violation_sample: Vec<String> = ro_violations
@@ -3903,7 +4198,7 @@ pub fn run_accept_and_review(
                     .take(RO_VIOLATION_SAMPLE_MAX)
                     .cloned()
                     .collect();
-                if !ro_violations.is_empty() && !stopped_flag {
+                if !ro_violations.is_empty() && !stopped_flag && env_error.is_none() {
                     let vfile = review_root.join(format!("round-{round}-ro-violations.txt"));
                     let mut body = ro_violations.join("\n");
                     body.push('\n');
@@ -3955,6 +4250,7 @@ pub fn run_accept_and_review(
                     format_error,
                     format_retried: attempt.format_retried,
                     format_retry_failed,
+                    env_error,
                     parse_error,
                     upgraded_by,
                     ro_violations,
@@ -4175,6 +4471,7 @@ pub fn run_accept_and_review(
 
         let mut verdict_str = rev_outcome.verdict_str;
         let mut upgraded_by = rev_outcome.upgraded_by;
+        let env_error = rev_outcome.env_error;
         let parse_error = rev_outcome.parse_error;
         let format_error = rev_outcome.format_error;
         let format_retried = rev_outcome.format_retried;
@@ -4188,6 +4485,93 @@ pub fn run_accept_and_review(
         let conclusion = rev_outcome.conclusion;
         let focus_count = rev_outcome.focus_count;
         let mut original_verdict: Option<String> = None;
+
+        if verdict_str == REVIEW_VERDICT_ENV_ERROR {
+            let err_msg = env_error
+                .clone()
+                .or_else(|| parse_error.clone())
+                .unwrap_or_else(|| "审查环境错误：只读审查快照缺失".to_string());
+            let err_short = clip(&err_msg, MAX_PARSE_ERROR_CHARS);
+            let retry_cmd = review_env_error_retry_command(&run_id);
+            let mut round_entry = json!({
+                "round": round,
+                "verdict": REVIEW_VERDICT_ENV_ERROR,
+                "scope": review_scope,
+                "scopeFiles": scope_files,
+                "verdictFile": verdict_file.to_string_lossy(),
+                "diffFile": rev_outcome.diff_file.to_string_lossy(),
+                "incremental": incremental,
+                "envError": true,
+                "error": err_short,
+                "retryCommand": retry_cmd,
+                "startedAt": rev_outcome.round_started,
+                "finishedAt": round_finished,
+            });
+            crate::usage::attach_reviewer_round_usage(&rev_outcome.usage_dir, &mut round_entry);
+            rounds_history.push(round_entry);
+            let mut final_doc = json!({
+                "status": "env_error",
+                "verdict": REVIEW_VERDICT_ENV_ERROR,
+                "envError": true,
+                "error": err_short,
+                "parseError": err_short,
+                "retryCommand": retry_cmd,
+                "scope": review_scope,
+                "scopeFiles": scope_files,
+                "round": round,
+                "reworkRounds": rework_rounds,
+                "rubric": rubric_source,
+                "verdictFile": verdict_file.to_string_lossy(),
+                "needsAttention": true,
+                "rounds": rounds_history,
+                "startedAt": review_started_at,
+                "updatedAt": round_finished,
+                "finishedAt": round_finished,
+            });
+            if let Some(tree) = &last_valid_reviewed_tree {
+                final_doc["reviewedTree"] = json!(tree);
+            }
+            if let Some(base) = &prev_reviewed_base {
+                final_doc["reviewedBaseTree"] = json!(base);
+            }
+            attach_review_model_fields(
+                &mut final_doc,
+                &active_review_cfg,
+                active_fallback.as_ref(),
+            );
+            crate::usage::attach_review_totals(&rounds_history, &mut final_doc);
+            write_json(run.join("review.json"), &final_doc)?;
+            sum["review"] = compact_review_summary(&final_doc);
+            events::emit(
+                &run_id,
+                &repo,
+                "review_verdict",
+                json!({
+                    "name": run_name,
+                    "round": round,
+                    "verdict": REVIEW_VERDICT_ENV_ERROR,
+                    "envError": true,
+                    "error": err_short,
+                    "retryCommand": retry_cmd,
+                }),
+            );
+            events::emit(
+                &run_id,
+                &repo,
+                "needs_attention",
+                json!({
+                    "name": run_name,
+                    "round": round,
+                    "reworkRounds": rework_rounds,
+                    "reason": "reviewEnvError",
+                    "verdict": REVIEW_VERDICT_ENV_ERROR,
+                    "detail": err_short,
+                }),
+            );
+            *state = if accept_ok { "delivered" } else { "rejected" }.into();
+            sum["state"] = json!(*state);
+            break;
+        }
 
         // Reconcile optional supplementary reviewer (`review.extra`): second opinion only;
         // when both verdicts are valid and disagree, mark `意见不一致` and escalate to NEEDS_CONTROLLER.
@@ -4398,6 +4782,7 @@ pub fn run_accept_and_review(
                 final_doc["reviewContinuation"] = json!(cont);
                 final_doc["reviewContinuationIsAgy"] = json!(prev_continuation_is_agy);
             }
+            final_doc["reviewWorkdir"] = json!(reviewer_workdir.to_string_lossy());
             attach_review_model_fields(&mut final_doc, &active_review_cfg, active_fallback.as_ref());
             if format_retried {
                 final_doc["formatRetried"] = json!(true);
@@ -4492,6 +4877,7 @@ pub fn run_accept_and_review(
                 final_doc["reviewContinuation"] = json!(cont);
                 final_doc["reviewContinuationIsAgy"] = json!(prev_continuation_is_agy);
             }
+            final_doc["reviewWorkdir"] = json!(reviewer_workdir.to_string_lossy());
             attach_review_model_fields(&mut final_doc, &active_review_cfg, active_fallback.as_ref());
             if format_retried {
                 final_doc["formatRetried"] = json!(true);
@@ -4558,6 +4944,8 @@ pub fn run_accept_and_review(
             reworking_doc["reviewContinuation"] = json!(cont);
             reworking_doc["reviewContinuationIsAgy"] = json!(prev_continuation_is_agy);
         }
+        reworking_doc["reviewWorkdir"] = json!(reviewer_workdir.to_string_lossy());
+        prev_review_workdir = Some(reviewer_workdir.clone());
         attach_review_model_fields(&mut reworking_doc, &active_review_cfg, active_fallback.as_ref());
         write_json(run.join("review.json"), &reworking_doc)?;
 
@@ -4632,6 +5020,7 @@ pub fn run_accept_and_review(
                 final_doc["reviewContinuation"] = json!(cont);
                 final_doc["reviewContinuationIsAgy"] = json!(prev_continuation_is_agy);
             }
+            final_doc["reviewWorkdir"] = json!(reviewer_workdir.to_string_lossy());
             attach_review_model_fields(&mut final_doc, &active_review_cfg, active_fallback.as_ref());
             write_json(run.join("review.json"), &final_doc)?;
             sum["review"] = compact_review_summary(&final_doc);
@@ -4757,6 +5146,7 @@ pub fn run_accept_and_review(
                 final_doc["reviewContinuation"] = json!(cont);
                 final_doc["reviewContinuationIsAgy"] = json!(prev_continuation_is_agy);
             }
+            final_doc["reviewWorkdir"] = json!(reviewer_workdir.to_string_lossy());
             attach_review_model_fields(&mut final_doc, &active_review_cfg, active_fallback.as_ref());
             write_json(run.join("review.json"), &final_doc)?;
             new_sum["review"] = compact_review_summary(&final_doc);
@@ -4808,6 +5198,29 @@ pub fn print_delivery_review(run: &Path) {
             println!("{}", diff_text.trim_end_matches('\n'));
         }
         println!("===== end controller-review: {id} =====");
+    } else if s(&review, "verdict") == REVIEW_VERDICT_ENV_ERROR || b(&review, "envError") {
+        let err = {
+            let e = s(&review, "error");
+            if !e.is_empty() {
+                e
+            } else {
+                s(&review, "parseError")
+            }
+        };
+        let retry = {
+            let r = s(&review, "retryCommand");
+            if !r.is_empty() {
+                r.to_string()
+            } else {
+                review_env_error_retry_command(&id)
+            }
+        };
+        println!("\n===== review (审查环境错误 / ENV_ERROR): {id} =====");
+        if !err.is_empty() {
+            println!("原因：{err}");
+        }
+        println!("重试命令：{retry}");
+        println!("===== end review: {id} =====");
     } else if s(&review, "verdict") == "NEEDS_CONTROLLER" {
         let vf = s(&review, "verdictFile");
         println!("\n===== review (NEEDS_CONTROLLER): {id} =====");
@@ -5574,5 +5987,24 @@ mod tests {
             load_inherited_review(&child4, &child4_meta).is_none(),
             "legacy stoppedDuringRework without reviewedTree must not fall back to changes.after"
         );
+    }
+
+    #[test]
+    fn can_continue_review_session_blocks_agy_across_changed_ro_workspace() {
+        let ro1 = Path::new("/tmp/review-ro/run-1");
+        let ro2 = Path::new("/tmp/review-ro/run-2");
+        assert!(can_continue_review_session(true, true, Some(ro1), ro1));
+        assert!(!can_continue_review_session(true, true, Some(ro1), ro2));
+        assert!(!can_continue_review_session(true, true, None, ro2));
+        assert!(can_continue_review_session(false, false, Some(ro1), ro2));
+        assert!(!can_continue_review_session(true, false, Some(ro1), ro1));
+        assert!(!can_continue_review_session(false, true, Some(ro1), ro1));
+
+        let note_switched = format_review_workdir_note(true, ro2, Some(ro1), true);
+        assert!(note_switched.contains("/tmp/review-ro/run-2"), "{note_switched}");
+        assert!(note_switched.contains("新路径"), "{note_switched}");
+
+        let note_fresh = format_review_workdir_note(true, ro2, Some(ro1), false);
+        assert!(note_fresh.contains("/tmp/review-ro/run-2"), "{note_fresh}");
     }
 }

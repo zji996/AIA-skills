@@ -107,6 +107,13 @@ pub fn evaluate_run_outcome(
     }
     if review.is_object() {
         let verdict = s(review, "verdict");
+        if verdict == crate::review::REVIEW_VERDICT_ENV_ERROR || b(review, "envError") {
+            return UpstreamVerdict::Paused {
+                upstream_run: run_id.to_string(),
+                reason: "审查环境错误，需重试审查".into(),
+                state: crate::review::REVIEW_VERDICT_ENV_ERROR.into(),
+            };
+        }
         if verdict == "NEEDS_CONTROLLER" {
             return UpstreamVerdict::Paused {
                 upstream_run: run_id.to_string(),

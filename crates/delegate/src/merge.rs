@@ -343,6 +343,13 @@ fn evaluate_run_for_merge(
                     };
                 }
             }
+            "ENV_ERROR" => {
+                return CheckVerdict {
+                    review_verdict,
+                    signed_hit,
+                    skip_reason: Some("审查环境错误，需重试审查".into()),
+                };
+            }
             "REWORK" => {
                 return CheckVerdict {
                     review_verdict,

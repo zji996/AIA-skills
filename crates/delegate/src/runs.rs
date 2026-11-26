@@ -615,6 +615,28 @@ pub fn next_step(
                 sum["review"].clone()
             }
         };
+        if (s(&rev, "verdict") == crate::review::REVIEW_VERDICT_ENV_ERROR || b(&rev, "envError"))
+            && !run.join(".applied").exists()
+        {
+            let reason = {
+                let e = s(&rev, "error");
+                if !e.is_empty() {
+                    e
+                } else {
+                    let pe = s(&rev, "parseError");
+                    if !pe.is_empty() { pe } else { "只读审查快照缺失" }
+                }
+            };
+            let retry = {
+                let c = s(&rev, "retryCommand");
+                if !c.is_empty() {
+                    c.to_string()
+                } else {
+                    format!("{script} reply {name} --review-full '重跑审查'")
+                }
+            };
+            return Some(format!("审查环境错误（{reason}）；重试：{retry}"));
+        }
         if s(&rev, "verdict") == "NEEDS_CONTROLLER" && !run.join(".applied").exists() {
             if let Some(sign) = crate::review::sign_status(run, meta, &rev, live_worktree) {
                 if b(&sign, "required") && !b(&sign, "valid") {

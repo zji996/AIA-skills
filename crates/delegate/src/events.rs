@@ -1239,16 +1239,30 @@ pub fn format_human(ev: &Value) -> String {
         "review_verdict" => {
             let verdict = s(p, "verdict");
             let round = n(p, "round");
-            let up = s(p, "upgradedBy");
-            let mut msg = if round > 0 {
-                format!("审查判定 {verdict}（第 {round} 轮）")
+            if verdict == crate::review::REVIEW_VERDICT_ENV_ERROR || b(p, "envError") {
+                let err = s(p, "error");
+                let prefix = if round > 0 {
+                    format!("审查环境错误（第 {round} 轮）")
+                } else {
+                    "审查环境错误".to_string()
+                };
+                if err.is_empty() {
+                    prefix
+                } else {
+                    format!("{prefix}：{}", clip(err, 80))
+                }
             } else {
-                format!("审查判定 {verdict}")
-            };
-            if !up.is_empty() {
-                msg.push_str(&format!(" [升级:{up}]"));
+                let up = s(p, "upgradedBy");
+                let mut msg = if round > 0 {
+                    format!("审查判定 {verdict}（第 {round} 轮）")
+                } else {
+                    format!("审查判定 {verdict}")
+                };
+                if !up.is_empty() {
+                    msg.push_str(&format!(" [升级:{up}]"));
+                }
+                msg
             }
-            msg
         }
         "rework_sent" => {
             let round = n(p, "reworkRounds").max(n(p, "round")).max(1);

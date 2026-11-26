@@ -59,7 +59,7 @@ class DelegateIncrementalReviewTests(unittest.TestCase):
             "calls = log_path.read_text().splitlines() if log_path.exists() else []\n"
             "call_idx = len(calls) + 1\n"
             "with log_path.open('a') as f:\n"
-            "    f.write(json.dumps({'idx': call_idx, 'model': model, 'conv_in': conv_in, 'is_reviewer': is_reviewer, 'content': content}) + '\\n')\n"
+            "    f.write(json.dumps({'idx': call_idx, 'model': model, 'conv_in': conv_in, 'cwd': os.getcwd(), 'is_reviewer': is_reviewer, 'content': content}) + '\\n')\n"
             "conv_id = conv_in or f'conv-{model}-{call_idx}'\n"
             "def emit_ok(text, cid=None):\n"
             "    c = cid or conv_id\n"
@@ -172,12 +172,19 @@ class DelegateIncrementalReviewTests(unittest.TestCase):
         c1 = self.cli("card", "chain-rev", cwd=repo)
         self.assertIn("3. 测试与验收（审查范围：全量）", c1.stdout)
 
-        # Reply 1 (default incremental): inherits reviewed tree + reviewer session + prev verdict.
+        # Reply 1 (default incremental): inherits reviewed tree + prev verdict, uses new run's ro snapshot
+        # (does NOT reuse parent agy conversation pinned to cleaned-up parent snapshot cwd).
         r2 = self.cli("reply", "chain-rev", "--wait", "改 b", cwd=repo)
         self.assertEqual(r2.returncode, 0, r2.stderr)
         rev_calls = [c for c in self.read_calls(log_file) if c["model"] == "rev-model"]
         self.assertEqual(len(rev_calls), 2, rev_calls)
-        self.assertTrue(rev_calls[1]["conv_in"], "reply should continue parent reviewer session")
+        self.assertEqual(
+            rev_calls[1]["conv_in"],
+            "",
+            "agy reply reviewer must not reuse conversation bound to cleaned-up parent ro snapshot",
+        )
+        self.assertNotEqual(rev_calls[0]["cwd"], rev_calls[1]["cwd"])
+        self.assertIn(rev_calls[1]["cwd"], rev_calls[1]["content"])
         self.assertIn("初审通过：a.txt 正常", rev_calls[1]["content"])
         self.assertIn("上一轮已 PASS 的部分不重审", rev_calls[1]["content"])
         self.assertIn("b changed", rev_calls[1]["content"])
@@ -333,7 +340,7 @@ class DelegateIncrementalReviewTests(unittest.TestCase):
     def test_stopped_during_rework_preserves_t1_so_reply_reviews_rework_delta(self):
         script = (
             "if model == 'rev-model':\n"
-            "    if not conv_in:\n"
+            "    if 'b-from-failed-rework' not in content:\n"
             "        emit_ok('REWORK\\n请补充 b.txt\\n\\n## 主控重点看\\n- [中] b.txt:1 — 缺失\\n')\n"
             "    else:\n"
             "        emit_ok('PASS\\n返工与续做均已审过\\n\\n## 主控重点看\\n无\\n')\n"
@@ -422,6 +429,103 @@ class DelegateIncrementalReviewTests(unittest.TestCase):
         r2_prompt = rev_calls[1]["content"]
         self.assertIn("a-unreviewed-first-run", r2_prompt, "unreviewed changes from reviewerError run must be included")
         self.assertIn("b-second-run", r2_prompt)
+
+    def test_reply_incremental_review_uses_current_run_ro_snapshot_after_parent_cleanup(self):
+        script = (
+            "if model == 'rev-model':\n"
+            "    if not Path(os.getcwd()).is_dir():\n"
+            "        emit_ok('NEEDS_CONTROLLER\\nmissing cwd')\n"
+            "    else:\n"
+            "        emit_ok('PASS\\n本轮快照核查通过\\n\\n## 主控重点看\\n无\\n')\n"
+            "else:\n"
+            "    if '第二轮' in content:\n"
+            "        Path('b.txt').write_text('b-v2\\n')\n"
+            "        emit_ok('改了 b.txt')\n"
+            "    else:\n"
+            "        Path('a.txt').write_text('a-v1\\n')\n"
+            "        emit_ok('改了 a.txt')\n"
+        )
+        log_file = self.install_scripted_agy(script)
+        repo = self.repo(
+            {
+                "a.txt": "a0\n",
+                "b.txt": "b0\n",
+                ".delegate.json": json.dumps({"accept": "true", "review": True, "maxRework": 5}),
+            }
+        )
+        r1 = self.cli("run", "--name", "ro-chain", "--workdir", str(repo), "--worktree", "第一轮改 a")
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        st1 = json.loads(self.cli("status", "ro-chain", "--json", cwd=repo).stdout)
+        run1_id = st1["run"]
+        rev_calls_1 = [c for c in self.read_calls(log_file) if c["model"] == "rev-model"]
+        self.assertEqual(len(rev_calls_1), 1)
+        ro1 = Path(rev_calls_1[0]["cwd"])
+        self.assertIn("review-ro", str(ro1))
+        self.assertIn(run1_id, str(ro1))
+        # First round's read-only snapshot is cleaned up after round 1 finishes.
+        self.assertFalse(ro1.exists(), f"parent ro snapshot should be cleaned up: {ro1}")
+
+        # Second round (reply): incremental review must run in run2's own ro snapshot, not cleaned-up ro1.
+        r2 = self.cli("reply", "ro-chain", "--wait", "第二轮改 b", cwd=repo)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        st2 = json.loads(self.cli("status", "last", "--json", cwd=repo).stdout)
+        run2_id = st2["run"]
+        self.assertNotEqual(run1_id, run2_id)
+        self.assertEqual(st2["review"]["verdict"], "PASS")
+        self.assertEqual(st2["review"]["scope"], "incremental")
+
+        rev_calls = [c for c in self.read_calls(log_file) if c["model"] == "rev-model"]
+        self.assertEqual(len(rev_calls), 2, rev_calls)
+        ro2 = Path(rev_calls[1]["cwd"])
+        self.assertIn("review-ro", str(ro2))
+        self.assertIn(run2_id, str(ro2))
+        self.assertNotEqual(ro1, ro2)
+        self.assertEqual(rev_calls[1]["conv_in"], "")
+        self.assertIn(str(ro2), rev_calls[1]["content"])
+        self.assertNotIn(str(ro1), rev_calls[1]["content"])
+
+    def test_missing_ro_snapshot_fails_closed_as_review_env_error_and_renders_card(self):
+        script = (
+            "if model == 'rev-model':\n"
+            "    emit_ok('NEEDS_CONTROLLER\\nshould never be invoked when ro snapshot is missing')\n"
+            "else:\n"
+            "    Path('a.txt').write_text('a-changed\\n')\n"
+            "    emit_ok('改了 a.txt')\n"
+        )
+        log_file = self.install_scripted_agy(script)
+        repo = self.repo(
+            {
+                "a.txt": "a0\n",
+                ".delegate.json": json.dumps({"accept": "true", "review": True, "maxRework": 5}),
+            }
+        )
+        # Block `<XDG_CACHE_HOME>/delegate/review-ro` with a regular file so ro snapshot creation fails.
+        ro_parent = Path(self.env["XDG_CACHE_HOME"]) / "delegate" / "review-ro"
+        ro_parent.parent.mkdir(parents=True, exist_ok=True)
+        ro_parent.write_text("blocker-file\n")
+
+        res = self.cli("run", "--name", "ro-missing", "--workdir", str(repo), "--worktree", "改 a")
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        # Reviewer must NOT be launched when ro snapshot is missing/unpreparable.
+        rev_calls = [c for c in self.read_calls(log_file) if c["model"] == "rev-model"]
+        self.assertEqual(len(rev_calls), 0, rev_calls)
+
+        st = json.loads(self.cli("status", "ro-missing", "--json", cwd=repo).stdout)
+        run_id = st["run"]
+        self.assertEqual(st["review"]["status"], "env_error")
+        self.assertEqual(st["review"]["verdict"], "ENV_ERROR")
+        self.assertTrue(st["review"].get("envError"))
+        self.assertNotEqual(st["review"]["verdict"], "NEEDS_CONTROLLER")
+        self.assertIn("只读审查快照", st["review"].get("error", ""))
+        self.assertIn(f"delegate reply {run_id} --review-full", st["review"].get("retryCommand", ""))
+
+        card = self.cli("card", "ro-missing", cwd=repo)
+        self.assertEqual(card.returncode, 0, card.stderr)
+        self.assertIn("审查环境错误", card.stdout)
+        self.assertIn("只读审查快照", card.stdout)
+        self.assertIn(f"delegate reply {run_id} --review-full", card.stdout)
+        self.assertNotIn("NEEDS_CONTROLLER", card.stdout)
 
 
 if __name__ == "__main__":

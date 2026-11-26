@@ -583,6 +583,8 @@ pub fn human_line_with_repo(
         } else if rverdict == "REWORK" {
             let r = rework_rounds.max(round);
             format!("REWORK 第 {r} 轮")
+        } else if rverdict == crate::review::REVIEW_VERDICT_ENV_ERROR || b(rev, "envError") {
+            "审查环境错误".to_string()
         } else if rverdict == "NEEDS_CONTROLLER" {
             let sign = &status["sign"];
             if sign.is_object() && b(sign, "required") {
@@ -773,7 +775,28 @@ pub fn human_line_with_repo(
             format!("改动保留，续做不计返工次数：{}", s(status, "next"))
         } else if matches!(state, "delivered" | "answered") {
             let rverdict = s(&status["review"], "verdict");
-            if rverdict == "NEEDS_CONTROLLER" {
+            if rverdict == crate::review::REVIEW_VERDICT_ENV_ERROR
+                || b(&status["review"], "envError")
+            {
+                let reason = {
+                    let e = s(&status["review"], "error");
+                    if !e.is_empty() {
+                        e
+                    } else {
+                        let pe = s(&status["review"], "parseError");
+                        if !pe.is_empty() { pe } else { "只读审查快照缺失" }
+                    }
+                };
+                let retry = {
+                    let c = s(&status["review"], "retryCommand");
+                    if !c.is_empty() {
+                        c.to_string()
+                    } else {
+                        crate::review::review_env_error_retry_command(id)
+                    }
+                };
+                format!("审查环境错误（{reason}）：delegate card {id}，重试：{retry}")
+            } else if rverdict == "NEEDS_CONTROLLER" {
                 let sign = &status["sign"];
                 if sign.is_object() && b(sign, "required") && !b(sign, "valid") {
                     format!("先看审查卡并签字：delegate card {id}，delegate sign {id}，再 delegate apply {id}")
@@ -1125,6 +1148,23 @@ pub fn human_detail(run: &Path, status: &Value) -> String {
             info.push(format!("状态：审查中（第 {} 轮）", round.max(1)));
         } else if rstatus == "reworking" {
             info.push(format!("状态：REWORK 第 {} 轮（返工中）", rework_rounds.max(round).max(1)));
+        } else if verdict == crate::review::REVIEW_VERDICT_ENV_ERROR
+            || rstatus == "env_error"
+            || b(rev, "envError")
+        {
+            let err = {
+                let e = s(rev, "error");
+                if !e.is_empty() { e } else { s(rev, "parseError") }
+            };
+            if err.is_empty() {
+                info.push("状态：审查环境错误".into());
+            } else {
+                info.push(format!("状态：审查环境错误（{err}）"));
+            }
+            let retry = s(rev, "retryCommand");
+            if !retry.is_empty() {
+                info.push(format!("重试：{retry}"));
+            }
         } else if !verdict.is_empty() {
             info.push(format!("结论：{verdict}（共 {round} 轮，返工 {rework_rounds} 轮）"));
         }

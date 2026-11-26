@@ -3436,6 +3436,9 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
             "scopeFiles",
             "syncSkip",
             "fallback",
+            "envError",
+            "error",
+            "retryCommand",
             "formatError",
             "formatRetried",
             "formatRetryFailed",
@@ -3516,6 +3519,21 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
                 "command": format!("delegate lane {}", shell_quote(failed_cmd)),
             }));
         }
+    }
+    let is_review_env_error = review_doc.is_object()
+        && (s(&review_doc, "verdict") == crate::review::REVIEW_VERDICT_ENV_ERROR
+            || s(&review_doc, "status") == "env_error"
+            || b(&review_doc, "envError"));
+    if is_review_env_error {
+        let retry_cmd = {
+            let c = s(&review_doc, "retryCommand");
+            if !c.is_empty() {
+                c.to_string()
+            } else {
+                crate::review::review_env_error_retry_command(&run_id)
+            }
+        };
+        next_cmds.push(json!({"label": "重试审查（审查环境错误）", "command": retry_cmd}));
     }
     if needs_sign {
         next_cmds.push(json!({"label": "受控路径签字", "command": format!("delegate sign {run_id}")}));
@@ -3753,9 +3771,18 @@ pub fn render_card_human(card: &Value) -> String {
     let format_retry_failed =
         b(rev, "formatRetryFailed") || (b(rev, "formatError") && b(rev, "formatRetried"));
     let sync_skip = b(rev, "syncSkip") || s(rev, "scope") == "sync_skip";
+    let review_env_error = s(rev, "verdict") == crate::review::REVIEW_VERDICT_ENV_ERROR
+        || s(rev, "status") == "env_error"
+        || b(rev, "envError");
     let review_head = if b(rev, "enabled") {
         if sync_skip {
             "同步轮，沿用上一轮审查 PASS".to_string()
+        } else if review_env_error {
+            if !rev_model_label.is_empty() {
+                format!("审查环境错误 · {rev_model_label}")
+            } else {
+                "审查环境错误".to_string()
+            }
         } else {
             let v = s(rev, "verdict");
             let orig = s(rev, "originalVerdict");
@@ -4032,6 +4059,31 @@ pub fn render_card_human(card: &Value) -> String {
         };
         if sync_skip {
             out.push(format!("   审查员：同步轮，沿用上一轮审查 PASS{vf_part}"));
+        } else if review_env_error {
+            let reason = {
+                let e = s(rev, "error");
+                if !e.is_empty() {
+                    e
+                } else {
+                    let pe = s(rev, "parseError");
+                    if !pe.is_empty() {
+                        pe
+                    } else {
+                        "只读审查快照缺失"
+                    }
+                }
+            };
+            let retry_cmd = {
+                let c = s(rev, "retryCommand");
+                if !c.is_empty() {
+                    c.to_string()
+                } else {
+                    crate::review::review_env_error_retry_command(run_id)
+                }
+            };
+            out.push(format!(
+                "   {rev_label}：审查环境错误 — {reason}（重试：{retry_cmd}）"
+            ));
         } else {
             out.push(format!("   {rev_label}：{v_prefix}{retry_note} — {concl_part}{vf_part}"));
         }
@@ -5231,5 +5283,45 @@ fn crossed_fn() {
         })));
         assert!(sync_out.contains("同步轮，沿用上一轮审查 PASS"), "{sync_out}");
         assert!(sync_out.contains("3. 测试与验收（审查范围：同步轮未审）"), "{sync_out}");
+    }
+
+    #[test]
+    fn card_renders_review_env_error_distinct_from_needs_controller() {
+        let card = json!({
+            "run": "20261127-env-err",
+            "name": "env-err-demo",
+            "state": "delivered",
+            "files": [],
+            "stats": {"files": 1, "added": 2, "deleted": 0},
+            "author": {"lines": ["ok"], "path": "", "totalLines": 1, "totalChars": 2},
+            "tests": {"added": 0, "modified": 0, "deleted": 0, "testFiles": 0},
+            "accept": {"ok": true, "command": "true"},
+            "review": {
+                "enabled": true,
+                "status": "env_error",
+                "verdict": "ENV_ERROR",
+                "envError": true,
+                "error": "只读审查快照缺失（/tmp/review-ro/20261127-env-err）",
+                "retryCommand": "delegate reply 20261127-env-err --review-full '重跑审查'",
+                "scope": "incremental",
+                "scopeFiles": 1,
+                "modelName": "hydrogen",
+            },
+            "risks": [],
+            "riskStats": {"total": 0, "ruleHits": 0, "reviewerHints": 0},
+            "fastForward": {"status": "ready", "label": "可快进"},
+            "next": [
+                {"label": "重试审查（审查环境错误）", "command": "delegate reply 20261127-env-err --review-full '重跑审查'"},
+                {"label": "确认无误合入", "command": "delegate apply 20261127-env-err"},
+            ],
+        });
+        let out = render_card_human(&card);
+        assert!(out.contains("审查：审查环境错误 · hydrogen"), "{out}");
+        assert!(out.contains("只读审查快照缺失"), "{out}");
+        assert!(
+            out.contains("delegate reply 20261127-env-err --review-full '重跑审查'"),
+            "{out}"
+        );
+        assert!(!out.contains("NEEDS_CONTROLLER"), "{out}");
     }
 }

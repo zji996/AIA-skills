@@ -851,7 +851,12 @@ fn read_run_snapshot(rdir: &Path, now: i64) -> Option<Value> {
     overlay_sign_status(rdir, &mut obj);
 
     if st == "delivered" && mode == "write" && !is_applied {
-        let next = if s(&obj["review"], "verdict") == "NEEDS_CONTROLLER" {
+        let rev_verdict = s(&obj["review"], "verdict");
+        let next = if rev_verdict == crate::review::REVIEW_VERDICT_ENV_ERROR
+            || b(&obj["review"], "envError")
+        {
+            format!("card {rid}")
+        } else if rev_verdict == "NEEDS_CONTROLLER" {
             format!("review {rid}")
         } else {
             format!("apply {rid}")
