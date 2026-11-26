@@ -3623,12 +3623,22 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
         };
         let bad_anchors = sum["scoutBadAnchors"]
             .as_u64()
-            .or_else(|| scout_src["badAnchors"].as_u64())
-            .unwrap_or(0);
+            .or_else(|| scout_src["badAnchors"].as_u64());
         let total_anchors = sum["scoutAnchorsTotal"]
             .as_u64()
-            .or_else(|| scout_src["anchorsTotal"].as_u64())
-            .unwrap_or(0);
+            .or_else(|| scout_src["anchorsTotal"].as_u64());
+        let paths_total = scout_src["pathsTotal"].as_u64();
+        let existing_paths = scout_src["existingPaths"].as_u64();
+        let missing_paths = strings(&scout_src["missingPaths"]);
+        let changed_paths = strings(&scout_src["changedPaths"]);
+        let drop_details = {
+            let from_sum = strings(&sum["scoutMapDropDetails"]);
+            if !from_sum.is_empty() {
+                from_sum
+            } else {
+                strings(&scout_src["dropDetails"])
+            }
+        };
         let scout_tokens = if sum["scoutTokens"].as_object().is_some_and(|o| !o.is_empty()) {
             sum["scoutTokens"].clone()
         } else if scout_src["tokens"].as_object().is_some_and(|o| !o.is_empty()) {
@@ -3639,14 +3649,33 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
         let mut scout_card = json!({
             "run": scout_run_id,
             "mapStatus": map_status,
-            "badAnchors": bad_anchors,
-            "anchorsTotal": total_anchors,
         });
+        if let Some(pt) = paths_total {
+            scout_card["pathsTotal"] = json!(pt);
+        }
+        if let Some(ep) = existing_paths {
+            scout_card["existingPaths"] = json!(ep);
+        }
+        if !missing_paths.is_empty() {
+            scout_card["missingPaths"] = json!(missing_paths);
+        }
+        if !changed_paths.is_empty() {
+            scout_card["changedPaths"] = json!(changed_paths);
+        }
+        if let Some(ba) = bad_anchors {
+            scout_card["badAnchors"] = json!(ba);
+        }
+        if let Some(ta) = total_anchors {
+            scout_card["anchorsTotal"] = json!(ta);
+        }
         if scout_tokens.is_object() {
             scout_card["tokens"] = scout_tokens;
         }
         if !drop_reason.is_empty() {
             scout_card["dropReason"] = json!(drop_reason);
+        }
+        if !drop_details.is_empty() {
+            scout_card["dropDetails"] = json!(drop_details);
         }
         if map_status == "dropped" {
             scout_card["dropped"] = json!(true);
@@ -3872,12 +3901,13 @@ pub fn render_card_human(card: &Value) -> String {
         let sc = &card["scout"];
         let srun = s(sc, "run");
         let mstatus = s(sc, "mapStatus");
-        let bad = n(sc, "badAnchors");
-        let total = n(sc, "anchorsTotal");
         let status_label = if mstatus == "dropped" {
             let reason = s(sc, "dropReason");
-            if reason.is_empty() {
+            let details = strings(&sc["dropDetails"]);
+            if reason.is_empty() && details.is_empty() {
                 "地图弃图（scout_map_dropped）".to_string()
+            } else if reason.is_empty() {
+                format!("地图弃图（scout_map_dropped：{}）", details.join("、"))
             } else {
                 format!("地图弃图（scout_map_dropped：{reason}）")
             }
@@ -3889,8 +3919,29 @@ pub fn render_card_human(card: &Value) -> String {
             segs.push(srun.to_string());
         }
         segs.push(status_label);
-        if total > 0 || bad > 0 {
-            segs.push(format!("坏锚点 {bad}/{total}"));
+        if let Some(paths_total) = sc["pathsTotal"].as_u64() {
+            if paths_total > 0 {
+                let missing = strings(&sc["missingPaths"]).len();
+                let changed = strings(&sc["changedPaths"]).len();
+                let mut notes = Vec::new();
+                if missing > 0 {
+                    notes.push(format!("基线缺失 {missing}"));
+                }
+                if changed > 0 {
+                    notes.push(format!("基线变动 {changed}"));
+                }
+                if notes.is_empty() {
+                    segs.push(format!("路径 {paths_total}"));
+                } else {
+                    segs.push(format!("路径 {paths_total}（{}）", notes.join("、")));
+                }
+            }
+        } else {
+            let bad = n(sc, "badAnchors");
+            let total = n(sc, "anchorsTotal");
+            if total > 0 || bad > 0 {
+                segs.push(format!("坏锚点 {bad}/{total}"));
+            }
         }
         if sc["tokens"].as_object().is_some_and(|o| !o.is_empty()) {
             let st = runs::format_tokens_usage(&sc["tokens"]);

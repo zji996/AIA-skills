@@ -837,70 +837,6 @@ fn standing_text(config: &crate::config::Config, read_only: bool, deny: &Value) 
     (text.join("\n"), sources)
 }
 
-/// Extract normalized repo-relative path tokens from arbitrary text (brief, work item title/notes).
-fn extract_repo_path_tokens(text: &str, repo: &Path) -> Vec<String> {
-    let repo_prefix = {
-        let p = repo.to_string_lossy().trim_end_matches('/').to_string();
-        (!p.is_empty()).then(|| format!("{p}/"))
-    };
-    let mut found = std::collections::BTreeSet::new();
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if !(b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'.' | b'+')) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < bytes.len()
-            && (bytes[i].is_ascii_alphanumeric()
-                || matches!(bytes[i], b'/' | b'_' | b'-' | b'.' | b'+'))
-        {
-            i += 1;
-        }
-        if start >= 1 && bytes[start - 1] == b':' && bytes[start..i].starts_with(b"//") {
-            continue;
-        }
-        let mut token = &text[start..i];
-        while let Some(stripped) = token.strip_prefix("./") {
-            token = stripped;
-        }
-        token = token.trim_end_matches('.');
-        if token.is_empty() {
-            continue;
-        }
-        if token.starts_with('/') {
-            if let Some(prefix) = &repo_prefix {
-                if let Some(rel) = token.strip_prefix(prefix.as_str()) {
-                    token = rel;
-                } else {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-        }
-        let parts = Path::new(token).components().collect::<Vec<_>>();
-        if parts.is_empty()
-            || parts
-                .iter()
-                .any(|c| !matches!(c, std::path::Component::Normal(_)))
-        {
-            continue;
-        }
-        let norm = parts
-            .iter()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join("/");
-        if !norm.is_empty() {
-            found.insert(norm);
-        }
-    }
-    found.into_iter().collect()
-}
-
 fn area_prefix_matches(candidate: &str, prefix_raw: &str) -> bool {
     let pref = prefix_raw.trim().trim_start_matches("./");
     if pref.is_empty() {
@@ -966,14 +902,14 @@ fn work_item_path_hints(item: &crate::work::WorkItem, repo: &Path) -> Vec<String
             hints.insert(clean.to_string());
         }
     }
-    for tok in extract_repo_path_tokens(&item.title, repo)
+    for tok in crate::brief_check::extract_repo_path_tokens(&item.title, repo)
         .into_iter()
-        .chain(extract_repo_path_tokens(&item.done_when, repo))
+        .chain(crate::brief_check::extract_repo_path_tokens(&item.done_when, repo))
     {
         hints.insert(tok);
     }
     for f in &item.followups {
-        for tok in extract_repo_path_tokens(&f.text, repo) {
+        for tok in crate::brief_check::extract_repo_path_tokens(&f.text, repo) {
             hints.insert(tok);
         }
     }
@@ -987,7 +923,7 @@ fn work_item_path_hints(item: &crate::work::WorkItem, repo: &Path) -> Vec<String
             }
         };
         if let Ok(btext) = fs::read_to_string(&bpath) {
-            for tok in extract_repo_path_tokens(&btext, repo) {
+            for tok in crate::brief_check::extract_repo_path_tokens(&btext, repo) {
                 hints.insert(tok);
             }
         }
@@ -1017,7 +953,7 @@ fn match_area_for_start(
         return None;
     }
     let mut candidates = std::collections::BTreeSet::new();
-    for tok in extract_repo_path_tokens(prompt, repo) {
+    for tok in crate::brief_check::extract_repo_path_tokens(prompt, repo) {
         candidates.insert(tok);
     }
     if let Some(item) = work_item {
@@ -2586,12 +2522,21 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
                 s(&meta, "rawBrief").to_string()
             }
         };
+        let scout_note = {
+            let n = s(&meta, "scoutNote");
+            if !n.is_empty() {
+                n
+            } else {
+                s(&meta, "scoutL0")
+            }
+        };
         extra["scoutReplyCompose"] = json!({
             "rawBrief": raw_brief,
-            "l0": s(&meta, "scoutL0"),
+            "note": scout_note,
             "controllerReply": raw_prompt,
             "sourceMap": parent.join("scout-map.md"),
         });
+        extra["scoutReply"] = json!(true);
         if meta["scout"].is_object() {
             extra["scoutCarried"] = meta["scout"].clone();
         }
@@ -3291,27 +3236,29 @@ pub fn launch(
     let changed =
         parent.is_object() && fork.is_some() && o.accept.as_deref() != parent["accept"].as_str();
     let remaining = o.protect.iter().filter(|rule| !worktree::matches_rule(rule, &o.allow)).cloned().collect::<Vec<_>>();
+    let mut scout_reply_map_end: Option<usize> = None;
     let scout_reply_composed: Option<String> = if extra["scoutReplyCompose"].is_object() {
         let rc = &extra["scoutReplyCompose"];
         let raw_brief = s(rc, "rawBrief");
-        let l0 = s(rc, "l0");
+        let note = {
+            let n = s(rc, "note");
+            if !n.is_empty() {
+                n
+            } else {
+                s(rc, "l0")
+            }
+        };
         let ctrl_reply = s(rc, "controllerReply");
         let src_map = PathBuf::from(s(rc, "sourceMap"));
         let dest_map = run.join("scout-map.md");
-        let map_path = if src_map.is_file() && fs::copy(&src_map, &dest_map).is_ok() {
-            dest_map.canonicalize().unwrap_or(dest_map)
-        } else if src_map.is_file() {
-            src_map.canonicalize().unwrap_or(src_map)
-        } else {
-            dest_map
-        };
+        if src_map.is_file() {
+            let _ = fs::copy(&src_map, &dest_map);
+        }
         let _ = write(run.join("raw-brief.md"), raw_brief);
-        Some(crate::scout_first::build_writer_brief(
-            raw_brief,
-            l0,
-            &map_path,
-            Some(ctrl_reply),
-        ))
+        let (composed, map_end) =
+            crate::scout_first::build_writer_brief_with_end(raw_brief, note, Some(ctrl_reply));
+        scout_reply_map_end = Some(map_end);
+        Some(composed)
     } else {
         if scout_first {
             let raw = s(extra, "rawBrief");
@@ -3646,9 +3593,10 @@ pub fn launch(
     meta["shell"] = json!(o.shell);
     if meta["worktree"].is_object() {
         let source = PathBuf::from(s(&meta["worktree"], "source"));
+        let fresh_wt = b(extra, "newAfterApply") || b(extra, "scoutReply");
         if !s(&extra["syncedBase"], "head").is_empty() {
             meta["netBase"] = extra["syncedBase"]["head"].clone();
-        } else if !b(extra, "newAfterApply") && parent.is_object() && !s(parent, "netBase").is_empty() {
+        } else if !fresh_wt && parent.is_object() && !s(parent, "netBase").is_empty() {
             meta["netBase"] = parent["netBase"].clone();
             if b(parent, "netBaseRebased") {
                 meta["netBaseRebased"] = json!(true);
@@ -3656,8 +3604,10 @@ pub fn launch(
                     meta["netBaseTree"] = parent["netBaseTree"].clone();
                 }
             }
-        } else if let Some(head) = read_git_head(&source) {
-            meta["netBase"] = json!(head);
+        } else if !scout_first {
+            if let Some(head) = read_git_head(&source) {
+                meta["netBase"] = json!(head);
+            }
         }
     }
     meta["agentBin"] = json!(agent_bin);
@@ -3756,6 +3706,12 @@ pub fn launch(
         meta["scoutRun"] = extra["scoutRun"].clone();
         meta["scoutRunDir"] = extra["scoutRunDir"].clone();
         meta["scoutPromptSplit"] = json!(effective_prompt_split);
+    }
+    if b(extra, "scoutReply") {
+        meta["scoutReply"] = json!(true);
+    }
+    if let Some(map_end) = scout_reply_map_end {
+        meta["scoutMapEnd"] = json!(map_end);
     }
     if !s(extra, "scoutLaunchError").is_empty() {
         meta["scoutLaunchError"] = extra["scoutLaunchError"].clone();

@@ -1,35 +1,27 @@
 //! Two-step scout-first orchestration helpers for write tasks:
-//! verbatim scout prompt & writer appendix templates, deterministic L0/L1 splitting,
-//! L0 anchor validation + git blob SHA hashing, section-3 mismatch extraction,
+//! verbatim prose scout prompt & writer appendix templates, loose path/line scanning
+//! against the scout's own snapshot tree (with git blob SHA hashing), factual footnotes
+//! for missing or baseline-changed paths, natural-language scout question detection,
 //! lightweight brief detection, and `preEditSteps` counting.
-use crate::brief_check::CheckReport;
-use crate::common::s;
+use crate::brief_check::{self, CheckReport, PathMention};
+use crate::common::{git_command, s};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
 pub const SCOUT_PROMPT_TEMPLATE: &str = "\
-# 只读探路：为下面这项改动画一张地图
+# 只读探路：为接手改代码的同事写一份交接笔记
 
-接下来另一位同事会在新会话里实现这项改动。它看不到你读过的内容，只拿到你的回答。你的任务是读代码，把它要动的位置找准；不写实现方案，不贴代码（一行函数签名可以）。
+另一位同事将在新会话中完成下面的任务，看不到你读过的过程，只看你的回复。请只读查清现状，用自然语言把下面几件事交代清楚（可用几个简短小标题或列表，不必套固定格式，控制在 1500 字内）：
+- 要改哪些文件、在哪个函数或大致行段、各处为什么要动；
+- 相关的上下游调用、可照搬的现成写法、最快验证改动的测试命令、容易踩的坑（例如需同步改的旧测试）；
+- 如果发现任务说明的前提与代码实际矛盾、写手没法替主控拿主意，在开头直接向主控提问说明矛盾与你的倾向，并附上已查清的事实。
 
-## 要实现的改动
-{{brief}}
+## 任务说明
+{{brief}}";
 
-回答只有两节，标题逐字如下：
-
-## L0
-不超过 1000 字，只写四类事实：
-1. 落点：每条一行，格式 `路径` :: `符号` (L起-L止) — 为什么要动它；不超过 12 条。
-2. 跨文件关系：谁调用谁、数据从哪来；写手要跑的相关测试命令。
-3. 与说明不符之处：说明里假设的东西在代码里实际是什么样；没有就写「无」。
-4. 未核实项：你没查清的点，以及该去哪里查。
-
-## L1
-不超过 6000 字：完整的相关调用表与数据结构位置（路径 :: 符号 (行段)），可参照的同类实现，测试夹具的现成写法，以及「看过但无关」的文件和一句理由。";
-
-pub const WRITER_APPENDIX_HEADER: &str = "\n\n## 已核实的落点（探路地图 L0）\n以下是只读探路对现状的核实结果（与上文冲突时以上文为准）：\n\n";
+pub const WRITER_APPENDIX_HEADER: &str = "\n\n## 探路交接笔记\n以下是只读探路同事对现状的查证笔记（与上文任务说明冲突时以上文为准）：\n\n";
 
 pub const LIGHTWEIGHT_MAX_CHARS: usize = 2000;
 
@@ -37,23 +29,26 @@ pub fn build_scout_prompt(raw_brief: &str) -> String {
     SCOUT_PROMPT_TEMPLATE.replace("{{brief}}", raw_brief)
 }
 
-pub fn build_writer_brief(
+/// Build the writer prompt combining the original brief, the prose scout handoff note
+/// (which may already end with a factual missing-paths footnote), and an optional controller reply.
+/// Returns `(composed_prompt, map_end_byte_offset)` where `map_end_byte_offset` points to the exact
+/// end of the scout handoff note (before any controller reply or contract separator).
+pub fn build_writer_brief_with_end(
     raw_brief: &str,
-    l0: &str,
-    map_path: &Path,
+    note: &str,
     controller_reply: Option<&str>,
-) -> String {
+) -> (String, usize) {
     let mut out = format!(
-        "{}{}{}\n\n完整地图（L1：调用表、同类实现、测试夹具写法、看过但无关的文件）在 `{}`，需要时按节查。",
+        "{}{}{}",
         raw_brief.trim_end(),
         WRITER_APPENDIX_HEADER,
-        l0.trim(),
-        map_path.display()
+        note.trim()
     );
+    let map_end = out.len();
     if let Some(reply) = controller_reply.map(str::trim).filter(|r| !r.is_empty()) {
         out.push_str(&format!("\n\n## 主控对探路发现的答复\n\n{reply}"));
     }
-    out
+    (out, map_end)
 }
 
 /// Lightweight write brief exemption:
@@ -79,11 +74,192 @@ pub fn compute_pre_edit_steps(evs: &[Value]) -> u64 {
     steps
 }
 
+/// Compute git blob SHA-1 (`sha1("blob <len>\0<bytes>")`) deterministically without spawning git.
+pub fn git_blob_sha1(bytes: &[u8]) -> String {
+    let mut hasher = sha1_smol::Sha1::new();
+    let header = format!("blob {}\0", bytes.len());
+    hasher.update(header.as_bytes());
+    hasher.update(bytes);
+    hasher.digest().to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedMap {
-    pub l0: String,
-    pub l1: Option<String>,
-    pub mismatch: Option<String>,
+pub enum TreeEntry {
+    File(String),
+    Dir,
+}
+
+/// Snapshot tree to inspect mentioned paths and compute/compare git blob SHAs against.
+pub enum TreeSource<'a> {
+    /// Read directly from a worktree/directory on disk (fast, zero subprocesses).
+    Dir(&'a Path),
+    /// Read from a git tree object (`meta.base.tree`) in `repo`.
+    GitTree { repo: &'a Path, tree: &'a str },
+}
+
+impl<'a> TreeSource<'a> {
+    /// Inspect the given repo-relative paths and return existing entries with file blob SHAs.
+    pub fn inspect_paths(&self, paths: &[String]) -> BTreeMap<String, TreeEntry> {
+        let mut found = BTreeMap::new();
+        if paths.is_empty() {
+            return found;
+        }
+        match self {
+            TreeSource::Dir(root) => {
+                for p in paths {
+                    if p.starts_with('/') || p.split('/').any(|c| c == "..") {
+                        continue;
+                    }
+                    let full = root.join(p);
+                    if full.is_file() {
+                        if let Ok(bytes) = fs::read(&full) {
+                            found.insert(p.clone(), TreeEntry::File(git_blob_sha1(&bytes)));
+                        }
+                    } else if full.is_dir() || full.exists() {
+                        found.insert(p.clone(), TreeEntry::Dir);
+                    }
+                }
+            }
+            TreeSource::GitTree { repo, tree } => {
+                // Normalize trailing slashes so `git ls-tree` inspects directory entries themselves.
+                let mut norm_to_orig: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                let mut query: Vec<String> = Vec::new();
+                for p in paths {
+                    if p.starts_with('/') || p.split('/').any(|c| c == "..") {
+                        continue;
+                    }
+                    let norm = p.trim_end_matches('/').to_string();
+                    if norm.is_empty() {
+                        continue;
+                    }
+                    let entry = norm_to_orig.entry(norm.clone()).or_default();
+                    if entry.is_empty() {
+                        query.push(norm);
+                    }
+                    if !entry.contains(p) {
+                        entry.push(p.clone());
+                    }
+                }
+                for chunk in query.chunks(200) {
+                    let mut cmd = git_command();
+                    cmd.arg("-C").arg(repo).args(["ls-tree", "-z", tree, "--"]);
+                    for item in chunk {
+                        cmd.arg(item);
+                    }
+                    let Ok(out) = cmd.output() else {
+                        continue;
+                    };
+                    if !out.status.success() {
+                        continue;
+                    }
+                    for rec in out.stdout.split(|&b| b == 0) {
+                        if rec.is_empty() {
+                            continue;
+                        }
+                        let rec_str = String::from_utf8_lossy(rec);
+                        let Some((meta_part, path_part)) = rec_str.split_once('\t') else {
+                            continue;
+                        };
+                        let mut cols = meta_part.split_whitespace();
+                        let _mode = cols.next();
+                        let Some(kind) = cols.next() else {
+                            continue;
+                        };
+                        let Some(sha) = cols.next() else {
+                            continue;
+                        };
+                        let tree_entry = if kind == "blob" {
+                            TreeEntry::File(sha.to_string())
+                        } else {
+                            TreeEntry::Dir
+                        };
+                        if let Some(origs) = norm_to_orig.get(path_part) {
+                            for orig in origs {
+                                found.insert(orig.clone(), tree_entry.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// Compare scout-recorded blob SHAs against this tree and return sorted paths whose content
+    /// changed (or disappeared) after scouting.
+    pub fn diff_blobs(&self, scout_blobs: &BTreeMap<String, String>) -> Vec<String> {
+        if scout_blobs.is_empty() {
+            return Vec::new();
+        }
+        let keys: Vec<String> = scout_blobs.keys().cloned().collect();
+        let current = self.inspect_paths(&keys);
+        let mut changed = Vec::new();
+        for (path, scout_sha) in scout_blobs {
+            match current.get(path) {
+                Some(TreeEntry::File(cur_sha)) if cur_sha == scout_sha => {}
+                _ => changed.push(path.clone()),
+            }
+        }
+        changed.sort();
+        changed
+    }
+}
+
+pub fn format_missing_paths_note(missing: &[String]) -> Option<String> {
+    if missing.is_empty() {
+        return None;
+    }
+    const MAX_LIST: usize = 20;
+    let body = if missing.len() <= MAX_LIST {
+        missing.join("、")
+    } else {
+        format!(
+            "{} 等共 {} 个",
+            missing[..MAX_LIST].join("、"),
+            missing.len()
+        )
+    };
+    Some(format!(
+        "注：探路提及的以下路径在基线中尚不存在（可能是待新建文件或路径笔误）：{body}"
+    ))
+}
+
+pub fn format_changed_paths_note(changed: &[String]) -> Option<String> {
+    if changed.is_empty() {
+        return None;
+    }
+    const MAX_LIST: usize = 20;
+    let body = if changed.len() <= MAX_LIST {
+        changed.join("、")
+    } else {
+        format!(
+            "{} 等共 {} 个",
+            changed[..MAX_LIST].join("、"),
+            changed.len()
+        )
+    };
+    Some(format!(
+        "注：探路后以下文件在当前基线中已变动，行号可能偏移：{body}"
+    ))
+}
+
+/// Insert a factual note line at `map_end` (the exact end of the scout handoff note in `prompt.md`).
+/// Returns `(updated_prompt, inserted_bytes)`. Idempotent if `note` is already present.
+pub fn insert_note_at(prompt_md: &str, map_end: Option<usize>, note: &str) -> (String, usize) {
+    let trimmed_note = note.trim();
+    if trimmed_note.is_empty() || prompt_md.contains(trimmed_note) {
+        return (prompt_md.to_string(), 0);
+    }
+    let pos = map_end
+        .filter(|&idx| idx <= prompt_md.len() && prompt_md.is_char_boundary(idx))
+        .or_else(|| prompt_md.find("\n\n## 主控对探路发现的答复"))
+        .unwrap_or_else(|| prompt_md.trim_end_matches('\n').len());
+    let insertion = format!("\n\n{trimmed_note}");
+    let mut out = String::with_capacity(prompt_md.len() + insertion.len());
+    out.push_str(&prompt_md[..pos]);
+    out.push_str(&insertion);
+    out.push_str(&prompt_md[pos..]);
+    (out, insertion.len())
 }
 
 fn fence_marker(line: &str) -> Option<(char, usize)> {
@@ -96,579 +272,305 @@ fn fence_marker(line: &str) -> Option<(char, usize)> {
     (count >= 3).then_some((first, count))
 }
 
-fn is_level2_heading(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start();
-    let rest = trimmed.strip_prefix("##")?;
-    if rest.starts_with('#') {
-        return None;
+fn contains_positive_phrase(text: &str, phrase: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find(phrase) {
+        let idx = search_from + rel;
+        let prev_char = text[..idx].chars().next_back();
+        if !matches!(prev_char, Some('无' | '不' | '未' | '非' | '没')) {
+            return true;
+        }
+        search_from = idx + phrase.len();
     }
-    let title = rest.trim();
-    (!title.is_empty()).then_some(title)
+    false
 }
 
-fn matches_section_tag(title: &str, tag: &str) -> bool {
-    let Some(after) = title.strip_prefix(tag) else {
+fn has_controller_question_phrase(line: &str) -> bool {
+    let stripped = line
+        .trim()
+        .trim_matches(['#', '*', '>', '-', '`', '[', ']', '【', '】', ' ']);
+    if stripped.is_empty() {
         return false;
-    };
-    match after.chars().next() {
-        None => true,
-        Some(c) => c.is_whitespace() || matches!(c, ':' | '：' | '（' | '(' | '-' | '—' | '·'),
     }
+    const ZH_PHRASES: &[&str] = &[
+        "需要主控",
+        "需主控",
+        "请主控",
+        "待主控",
+        "向主控提问",
+        "请拍板",
+        "待拍板",
+        "请确认",
+        "需要确认",
+        "需确认",
+        "请决定",
+        "待决定",
+        "开工前确认",
+        "开工前请",
+    ];
+    if ZH_PHRASES
+        .iter()
+        .any(|p| contains_positive_phrase(stripped, p))
+    {
+        return true;
+    }
+    let lower = stripped.to_ascii_lowercase();
+    const EN_PHRASES: &[&str] = &[
+        "needs a decision",
+        "need a decision",
+        "needs controller",
+        "need controller",
+        "please confirm",
+        "please decide",
+        "controller decision",
+    ];
+    EN_PHRASES.iter().any(|p| {
+        if let Some(idx) = lower.find(p) {
+            let prefix = lower[..idx].trim_end();
+            !(prefix.ends_with("no") || prefix.ends_with("not") || prefix.ends_with("don't"))
+        } else {
+            false
+        }
+    })
 }
 
-/// Deterministically split scout output into `## L0` and optional `## L1`.
-/// Returns `None` if `## L0` is absent or empty.
-pub fn parse_sections(text: &str) -> Option<ParsedMap> {
-    let mut fence: Option<(char, usize)> = None;
-    let mut current: Option<&str> = None;
-    let mut l0_lines: Vec<&str> = Vec::new();
-    let mut l1_lines: Vec<&str> = Vec::new();
-    let mut saw_l0 = false;
-    let mut saw_l1 = false;
+fn is_non_heading_question_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return false;
+    }
+    let body = trimmed
+        .trim_end_matches(['”', '"', '\'', '」', '』', ')', '）', '*', '`'])
+        .trim_end();
+    if !(body.ends_with('？') || body.ends_with('?')) {
+        return false;
+    }
+    // Exclude trailing URL query strings like `https://example.com/?`
+    let last_token = body.split_whitespace().next_back().unwrap_or(body);
+    !(last_token.contains("://") && body.ends_with('?'))
+}
 
-    for line in text.lines() {
+/// Natural-language detection of whether a read-only scout is asking the controller to decide a
+/// brief-vs-code contradiction. Because scout is strictly read-only (zero file edits), we can use
+/// relaxed natural-language recognition on its opening and closing paragraphs.
+pub fn is_scout_question(raw_map: &str) -> bool {
+    let mut fence: Option<(char, usize)> = None;
+    let mut paragraphs: Vec<Vec<&str>> = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+
+    for line in raw_map.lines() {
         if let Some((fc, flen)) = fence {
             if let Some((c, len)) = fence_marker(line) {
                 if c == fc && len >= flen && line.trim_start()[len..].trim().is_empty() {
                     fence = None;
                 }
             }
+            continue;
         } else if let Some(m) = fence_marker(line) {
             fence = Some(m);
-        } else if let Some(title) = is_level2_heading(line) {
-            if matches_section_tag(title, "L0") {
-                saw_l0 = true;
-                current = Some("L0");
-                continue;
-            } else if matches_section_tag(title, "L1") {
-                saw_l1 = true;
-                current = Some("L1");
-                continue;
-            } else if current.is_some() {
-                current = None;
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "---" || trimmed == "***" {
+            if !current.is_empty() {
+                paragraphs.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(trimmed);
+        }
+    }
+    if !current.is_empty() {
+        paragraphs.push(current);
+    }
+    if paragraphs.is_empty() {
+        return false;
+    }
+
+    // Opening window: first paragraph (and if the first paragraph is just a heading, also the second),
+    // capped to 6 lines total so we only inspect the opening block.
+    let mut opening: Vec<&str> = Vec::new();
+    for (p_idx, para) in paragraphs.iter().enumerate() {
+        if p_idx > 0 && opening.iter().any(|l| !l.starts_with('#')) {
+            break;
+        }
+        for &line in para {
+            if p_idx > 0 && line.starts_with('#') && !opening.is_empty() {
+                break;
+            }
+            opening.push(line);
+            if opening.len() >= 6 {
+                break;
             }
         }
-
-        match current {
-            Some("L0") => l0_lines.push(line),
-            Some("L1") => l1_lines.push(line),
-            _ => {}
+        if opening.len() >= 6 {
+            break;
         }
     }
 
-    if !saw_l0 {
-        return None;
-    }
-    let l0 = l0_lines.join("\n").trim().to_string();
-    if l0.is_empty() {
-        return None;
-    }
-    let l1 = if saw_l1 {
-        let body = l1_lines.join("\n").trim().to_string();
-        (!body.is_empty()).then_some(body)
-    } else {
-        None
-    };
-    let mismatch = extract_mismatch_section(&l0);
-    Some(ParsedMap { l0, l1, mismatch })
-}
-
-fn strip_md_heading_prefix(line: &str) -> &str {
-    let mut s = line.trim();
-    s = s.trim_start_matches('#').trim();
-    if let Some(inner) = s.strip_prefix("**").and_then(|x| x.strip_suffix("**")) {
-        s = inner.trim();
-    }
-    s
-}
-
-fn is_l0_numbered_header(line: &str, num: u8, keywords: &[&str]) -> Option<String> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let is_heading = trimmed.starts_with("###") || trimmed.starts_with("####");
-    let cleaned = strip_md_heading_prefix(trimmed);
-    let prefix_dot = format!("{num}.");
-    let prefix_cn = format!("{num}、");
-    let rest = cleaned
-        .strip_prefix(&prefix_dot)
-        .or_else(|| cleaned.strip_prefix(&prefix_cn))
-        .map(str::trim);
-    let candidate = match rest {
-        Some(r) => r,
-        None if is_heading => cleaned,
-        None => return None,
-    };
-    for kw in keywords {
-        if let Some(after_kw) = candidate.strip_prefix(kw) {
-            let after_kw = after_kw
-                .trim_start()
-                .trim_start_matches("**")
-                .trim_start()
-                .trim_start_matches([':', '：', '-', '—'])
-                .trim();
-            return Some(after_kw.to_string());
-        }
-    }
-    if is_heading && keywords.iter().any(|kw| candidate.contains(kw)) {
-        return Some(String::new());
-    }
-    None
-}
-
-fn is_mismatch_none(body: &str) -> bool {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
+    if opening
+        .iter()
+        .any(|l| has_controller_question_phrase(l) || is_non_heading_question_line(l))
+    {
         return true;
     }
-    // Check single-line or bulleted "无"
-    let meaningful: Vec<&str> = trimmed
-        .lines()
-        .map(|l| {
-            l.trim()
-                .trim_start_matches(['-', '*', '•', '·'])
-                .trim()
-                .trim_matches(['「', '」', '`', '"', '\'', '。', '.', '，', ','])
-                .trim()
-        })
-        .filter(|l| !l.is_empty())
-        .collect();
-    if meaningful.is_empty() {
-        return true;
-    }
-    if meaningful.len() == 1 {
-        let only = meaningful[0];
-        let lower = only.to_ascii_lowercase();
-        if matches!(
-            lower.as_str(),
-            "无" | "暂无" | "没有" | "无不符" | "未发现" | "未发现不符" | "none" | "n/a" | "nil"
-        ) {
-            return true;
-        }
-        if let Some(rest) = only.strip_prefix('无') {
-            if rest
-                .chars()
-                .next()
-                .is_some_and(|c| matches!(c, '。' | '，' | ',' | '（' | '(' | '；' | ';' | ' '))
+
+    // Closing paragraph: check last paragraph if distinct from opening.
+    if paragraphs.len() > 1 {
+        if let Some(last) = paragraphs.last() {
+            if last
+                .iter()
+                .any(|l| has_controller_question_phrase(l) || is_non_heading_question_line(l))
             {
                 return true;
             }
         }
     }
+
     false
 }
 
-/// Extract section 3 ("与说明不符之处") raw text from L0; returns `None` if empty or "无".
-pub fn extract_mismatch_section(l0: &str) -> Option<String> {
-    let mut in_sec3 = false;
-    let mut collected: Vec<String> = Vec::new();
-    let mut fence: Option<(char, usize)> = None;
-
-    for line in l0.lines() {
-        if let Some((fc, flen)) = fence {
-            if let Some((c, len)) = fence_marker(line) {
-                if c == fc && len >= flen && line.trim_start()[len..].trim().is_empty() {
-                    fence = None;
-                }
-            }
-            if in_sec3 {
-                collected.push(line.to_string());
-            }
-            continue;
-        } else if let Some(m) = fence_marker(line) {
-            fence = Some(m);
-            if in_sec3 {
-                collected.push(line.to_string());
-            }
-            continue;
-        }
-
-        if !in_sec3 {
-            if let Some(inline) = is_l0_numbered_header(line, 3, &["与说明不符之处", "与说明不符"]) {
-                in_sec3 = true;
-                if !inline.is_empty() {
-                    collected.push(inline);
-                }
-            }
-        } else {
-            if is_l0_numbered_header(line, 4, &["未核实项", "未核实"]).is_some()
-                || line.trim_start().starts_with("### ")
-                || line.trim_start().starts_with("#### ")
-                || line.trim() == "---"
-            {
-                break;
-            }
-            collected.push(line.to_string());
-        }
-    }
-
-    if !in_sec3 {
-        return None;
-    }
-    let body = collected.join("\n").trim().to_string();
-    if is_mismatch_none(&body) {
-        None
-    } else {
-        Some(body)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedAnchor {
-    pub path: String,
-    pub symbol: String,
-    pub start_line: usize,
-    pub end_line: usize,
-}
-
-fn parse_line_range_paren(s: &str) -> Option<(usize, usize)> {
-    // Find `(Lstart-Lend)` / `(Lstart–Lend)` / `(Lstart-end)` / `(Lstart)` (ASCII or full-width parens)
-    let mut rest = s;
-    while let Some(open_idx) = rest.find(['(', '（']) {
-        let after_open = &rest[open_idx + rest[open_idx..].chars().next()?.len_utf8()..];
-        let Some(close_idx) = after_open.find([')', '）']) else {
-            break;
-        };
-        let inside = after_open[..close_idx].trim();
-        if let Some(range) = parse_line_range_inner(inside) {
-            return Some(range);
-        }
-        rest = &after_open[close_idx + after_open[close_idx..].chars().next()?.len_utf8()..];
-    }
-    None
-}
-
-fn parse_line_range_inner(inside: &str) -> Option<(usize, usize)> {
-    let trimmed = inside.trim();
-    if !trimmed.starts_with(['L', 'l']) {
-        return None;
-    }
-    let cleaned = trimmed.replace(['–', '—', '−'], "-");
-    if let Some((a, b)) = cleaned.split_once('-') {
-        let a = a.trim().trim_start_matches(['L', 'l']);
-        let b = b.trim().trim_start_matches(['L', 'l']);
-        let start = a.parse::<usize>().ok()?;
-        let end = b.parse::<usize>().ok()?;
-        if start > 0 && end >= start {
-            return Some((start, end));
-        }
-    } else {
-        let a = cleaned.trim().trim_start_matches(['L', 'l']);
-        let start = a.parse::<usize>().ok()?;
-        if start > 0 {
-            return Some((start, start));
-        }
-    }
-    None
-}
-
-fn strip_list_prefix(line: &str) -> &str {
-    let t = line.trim();
-    if let Some(rest) = t
-        .strip_prefix("- ")
-        .or_else(|| t.strip_prefix("* "))
-        .or_else(|| t.strip_prefix("• "))
-    {
-        return rest.trim();
-    }
-    let digits = t.bytes().take_while(|b| b.is_ascii_digit()).count();
-    if digits > 0 {
-        let after = &t[digits..];
-        if let Some(rest) = after.strip_prefix(". ").or_else(|| after.strip_prefix(") ")) {
-            return rest.trim();
-        }
-    }
-    t
-}
-
-fn extract_leading_token(s: &str) -> (&str, &str) {
-    let t = s.trim_start();
-    if let Some(after) = t.strip_prefix('`') {
-        if let Some(end) = after.find('`') {
-            return (after[..end].trim(), after[end + 1..].trim_start());
-        }
-    }
-    // Unquoted token up to whitespace or `::` or `(`
-    let end = t
-        .find(|c: char| c.is_whitespace() || c == '(' || c == '（')
-        .unwrap_or(t.len());
-    (t[..end].trim(), t[end..].trim_start())
-}
-
-fn looks_like_repo_path(p: &str) -> bool {
-    if p.is_empty() || p.contains(char::is_whitespace) || p.contains("://") {
+/// Returns true if the task brief itself names at least one existing path in `tree`.
+pub fn brief_has_existing_paths(
+    raw_brief: &str,
+    tree: &TreeSource<'_>,
+    strip_roots: &[&Path],
+) -> bool {
+    let mentions = brief_check::scan_path_mentions(raw_brief, strip_roots);
+    if mentions.is_empty() {
         return false;
     }
-    p.contains('/') || p.contains('.')
-}
-
-/// Parse one L0 anchor line: `` `路径` :: `符号` (L起-L止) `` (with optional list marker & description).
-pub fn parse_anchor_line(line: &str) -> Option<ParsedAnchor> {
-    let body = strip_list_prefix(line);
-    // Split off trailing description after ` — ` or ` - ` if present, only after `)`
-    let (path_raw, after_path) = extract_leading_token(body);
-    let path_clean = path_raw
-        .trim_start_matches("./")
-        .trim_end_matches(':')
-        .to_string();
-    if !looks_like_repo_path(&path_clean) {
-        return None;
-    }
-    if let Some(after_colons) = after_path.strip_prefix("::") {
-        let (sym_raw, after_sym) = extract_leading_token(after_colons);
-        let (start_line, end_line) = parse_line_range_paren(after_sym)?;
-        let symbol = sym_raw.trim().to_string();
-        if symbol.is_empty() {
-            return None;
-        }
-        return Some(ParsedAnchor {
-            path: path_clean,
-            symbol,
-            start_line,
-            end_line,
-        });
-    }
-    // Also support path-only anchor like `` `skills/delegate/SKILL.md` (L65) ``
-    if after_path.starts_with(['(', '（']) {
-        let (start_line, end_line) = parse_line_range_paren(after_path)?;
-        return Some(ParsedAnchor {
-            path: path_clean,
-            symbol: String::new(),
-            start_line,
-            end_line,
-        });
-    }
-    None
-}
-
-/// Extract anchors from L0 section 1 ("落点"), or across L0 if section headings are omitted.
-pub fn extract_l0_anchors(l0: &str) -> Vec<ParsedAnchor> {
-    let mut sec1_lines: Vec<&str> = Vec::new();
-    let mut in_sec1 = false;
-    let mut saw_sec1 = false;
-    let mut fence: Option<(char, usize)> = None;
-
-    for line in l0.lines() {
-        if let Some((fc, flen)) = fence {
-            if let Some((c, len)) = fence_marker(line) {
-                if c == fc && len >= flen && line.trim_start()[len..].trim().is_empty() {
-                    fence = None;
-                }
-            }
-            continue;
-        } else if let Some(m) = fence_marker(line) {
-            fence = Some(m);
-            continue;
-        }
-
-        if !saw_sec1 {
-            if let Some(inline) = is_l0_numbered_header(line, 1, &["落点"]) {
-                saw_sec1 = true;
-                in_sec1 = true;
-                if !inline.is_empty() {
-                    // Wait: inline could be an anchor if single-line
-                    if let Some(a) = parse_anchor_line(&inline) {
-                        sec1_lines.push(line);
-                        let _ = a;
-                    }
-                }
-                continue;
-            }
-        } else if in_sec1 {
-            if is_l0_numbered_header(line, 2, &["跨文件关系", "跨文件"]).is_some()
-                || is_l0_numbered_header(line, 3, &["与说明不符之处", "与说明不符"]).is_some()
-                || line.trim_start().starts_with("### ")
-                || line.trim_start().starts_with("#### ")
-            {
-                in_sec1 = false;
-                continue;
-            }
-            sec1_lines.push(line);
-        }
-    }
-
-    let source_lines: Vec<&str> = if saw_sec1 {
-        sec1_lines
-    } else {
-        l0.lines().collect()
-    };
-
-    let mut out = Vec::new();
-    for line in source_lines {
-        if let Some(anchor) = parse_anchor_line(line) {
-            out.push(anchor);
-        }
-    }
-    out
-}
-
-/// Compute git blob SHA-1 (`sha1("blob <len>\0<bytes>")`) deterministically without spawning git.
-pub fn git_blob_sha1(bytes: &[u8]) -> String {
-    let mut hasher = sha1_smol::Sha1::new();
-    let header = format!("blob {}\0", bytes.len());
-    hasher.update(header.as_bytes());
-    hasher.update(bytes);
-    hasher.digest().to_string()
-}
-
-fn symbol_matches_window(symbol: &str, window_text: &str) -> bool {
-    if symbol.is_empty() {
-        return true;
-    }
-    let clean = symbol
-        .trim()
-        .trim_start_matches("fn ")
-        .trim_start_matches("pub fn ")
-        .trim_start_matches("def ")
-        .trim_start_matches("class ")
-        .trim_start_matches("struct ")
-        .trim_start_matches("enum ")
-        .trim_start_matches("impl ")
-        .trim();
-    let base = clean.split('(').next().unwrap_or(clean).trim();
-    if base.is_empty() {
-        return true;
-    }
-    if window_text.contains(base) {
-        return true;
-    }
-    // For qualified names like `ChainIndex::load` or `DelegateTests.setUp`, check the leaf identifier.
-    if let Some(leaf) = base.rsplit("::").next().filter(|x| !x.is_empty() && *x != base) {
-        if window_text.contains(leaf) {
-            return true;
-        }
-    }
-    if let Some(leaf) = base.rsplit('.').next().filter(|x| !x.is_empty() && *x != base) {
-        if window_text.contains(leaf) {
-            return true;
-        }
-    }
-    false
+    let paths: Vec<String> = mentions.into_iter().map(|m| m.path).collect();
+    !tree.inspect_paths(&paths).is_empty()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AnchorValidation {
-    pub total: usize,
-    pub bad: usize,
+pub struct MapCheck {
+    pub mentions: Vec<PathMention>,
+    pub existing_paths: Vec<String>,
+    pub missing_paths: Vec<String>,
     pub blobs: BTreeMap<String, String>,
-    pub bad_details: Vec<String>,
-}
-
-impl AnchorValidation {
-    /// Drop map when strictly more than 20% of anchors are bad (`bad / total > 0.20`).
-    pub fn should_drop(&self) -> bool {
-        self.total > 0 && self.bad * 5 > self.total
-    }
-}
-
-pub fn validate_l0_anchors(l0: &str, repo_root: &Path) -> AnchorValidation {
-    let anchors = extract_l0_anchors(l0);
-    let mut validation = AnchorValidation {
-        total: anchors.len(),
-        ..Default::default()
-    };
-    let mut file_cache: BTreeMap<String, Option<String>> = BTreeMap::new();
-
-    for anchor in anchors {
-        if anchor.path.starts_with('/') || anchor.path.split('/').any(|c| c == "..") {
-            validation.bad += 1;
-            validation
-                .bad_details
-                .push(format!("非法路径 {}", anchor.path));
-            continue;
-        }
-        let text_opt = file_cache
-            .entry(anchor.path.clone())
-            .or_insert_with(|| {
-                let full = repo_root.join(&anchor.path);
-                if !full.is_file() {
-                    return None;
-                }
-                let bytes = fs::read(&full).ok()?;
-                validation
-                    .blobs
-                    .insert(anchor.path.clone(), git_blob_sha1(&bytes));
-                Some(String::from_utf8_lossy(&bytes).into_owned())
-            })
-            .clone();
-        let Some(text) = text_opt else {
-            validation.bad += 1;
-            validation
-                .bad_details
-                .push(format!("路径不存在 {}", anchor.path));
-            continue;
-        };
-        let lines: Vec<&str> = text.lines().collect();
-        let total_lines = lines.len();
-        if total_lines == 0 || anchor.start_line == 0 || anchor.start_line > total_lines {
-            validation.bad += 1;
-            validation.bad_details.push(format!(
-                "行号越界 {} (L{}-L{}, 共 {} 行)",
-                anchor.path, anchor.start_line, anchor.end_line, total_lines
-            ));
-            continue;
-        }
-        let win_start = anchor.start_line.saturating_sub(5).max(1);
-        let win_end = anchor.end_line.saturating_add(5).min(total_lines);
-        let window_text = lines[win_start - 1..win_end].join("\n");
-        if !symbol_matches_window(&anchor.symbol, &window_text) {
-            validation.bad += 1;
-            validation.bad_details.push(format!(
-                "符号未命中 {} :: {} (L{}-L{})",
-                anchor.path, anchor.symbol, anchor.start_line, anchor.end_line
-            ));
-        }
-    }
-    validation
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MapOutcome {
     Accepted {
-        l0: String,
-        l1: Option<String>,
-        mismatch: Option<String>,
-        validation: AnchorValidation,
+        note: String,
+        is_question: bool,
+        check: MapCheck,
     },
     Dropped {
         code: &'static str,
         reason: String,
-        bad_anchors: usize,
-        total_anchors: usize,
+        details: Vec<String>,
         blobs: BTreeMap<String, String>,
     },
 }
 
-pub fn evaluate_map(raw_map: &str, repo_root: &Path) -> MapOutcome {
-    let Some(parsed) = parse_sections(raw_map) else {
+fn is_suffix_of_any(candidate: &str, existing: &[String]) -> bool {
+    let clean = candidate.trim_end_matches('/');
+    existing.iter().any(|ex| {
+        let ex_clean = ex.trim_end_matches('/');
+        ex_clean == clean
+            || ex_clean
+                .strip_suffix(clean)
+                .is_some_and(|prefix| prefix.ends_with('/'))
+    })
+}
+
+/// Loosely evaluate a prose scout handoff note against the scout's own snapshot tree.
+///
+/// Never drops on formatting or missing files alone; only drops when:
+/// 1. Output is empty or a content-policy refusal (no usable text);
+/// 2. Extreme wrong-repo guard: >= 5 repo-style paths mentioned, 0 exist in the snapshot tree,
+///    AND the task brief itself named at least one existing path.
+pub fn evaluate_map(
+    raw_map: &str,
+    tree: &TreeSource<'_>,
+    strip_roots: &[&Path],
+    brief_has_existing: bool,
+) -> MapOutcome {
+    if raw_map.trim().is_empty() {
         return MapOutcome::Dropped {
-            code: "missing_l0",
-            reason: "缺 L0".to_string(),
-            bad_anchors: 0,
-            total_anchors: 0,
+            code: "empty_map",
+            reason: "探路输出为空".to_string(),
+            details: Vec::new(),
             blobs: BTreeMap::new(),
         };
-    };
-    let validation = validate_l0_anchors(&parsed.l0, repo_root);
-    if validation.should_drop() {
-        let pct = (validation.bad * 100) / validation.total.max(1);
+    }
+    if crate::agy::is_policy_refusal(raw_map) {
         return MapOutcome::Dropped {
-            code: "bad_anchors",
-            reason: format!(
-                "坏锚点比例过高（{}/{}，{}%）",
-                validation.bad, validation.total, pct
-            ),
-            bad_anchors: validation.bad,
-            total_anchors: validation.total,
-            blobs: validation.blobs,
+            code: "policy_refusal",
+            reason: "探路被内容策略拦截".to_string(),
+            details: Vec::new(),
+            blobs: BTreeMap::new(),
         };
     }
+
+    let mentions = brief_check::scan_path_mentions(raw_map, strip_roots);
+    let paths: Vec<String> = mentions.iter().map(|m| m.path.clone()).collect();
+    let inspected = tree.inspect_paths(&paths);
+
+    let mut existing_paths = Vec::new();
+    let mut blobs = BTreeMap::new();
+    for p in &paths {
+        if let Some(entry) = inspected.get(p) {
+            existing_paths.push(p.clone());
+            if let TreeEntry::File(sha) = entry {
+                blobs.insert(p.clone(), sha.clone());
+            }
+        }
+    }
+
+    let mut missing_paths = Vec::new();
+    for p in &paths {
+        if inspected.contains_key(p) {
+            continue;
+        }
+        // Only treat repo-style file paths (with `/` and a recognized extension, not a shorthand
+        // suffix of an already-found existing path) as missing baseline files.
+        if !p.contains('/') || !brief_check::has_known_file_extension(p) {
+            continue;
+        }
+        if is_suffix_of_any(p, &existing_paths) {
+            continue;
+        }
+        missing_paths.push(p.clone());
+    }
+
+    if existing_paths.is_empty() && missing_paths.len() >= 5 && brief_has_existing {
+        let preview = missing_paths
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("、");
+        return MapOutcome::Dropped {
+            code: "wrong_repo_paths",
+            reason: format!(
+                "探路提及 {} 个仓内样式路径但基线中现存 0 个（任务说明含现存文件）：{preview}",
+                missing_paths.len()
+            ),
+            details: missing_paths,
+            blobs,
+        };
+    }
+
+    let mut note = raw_map.trim().to_string();
+    if let Some(footnote) = format_missing_paths_note(&missing_paths) {
+        note.push_str("\n\n");
+        note.push_str(&footnote);
+    }
+    let is_question = is_scout_question(raw_map);
+
     MapOutcome::Accepted {
-        l0: parsed.l0,
-        l1: parsed.l1,
-        mismatch: parsed.mismatch,
-        validation,
+        note,
+        is_question,
+        check: MapCheck {
+            mentions,
+            existing_paths,
+            missing_paths,
+            blobs,
+        },
     }
 }
 
@@ -676,86 +578,340 @@ pub fn evaluate_map(raw_map: &str, repo_root: &Path) -> MapOutcome {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::PathBuf;
 
-    #[test]
-    fn parses_l0_l1_and_detects_missing_l0() {
-        let doc = "## L0\n### 1. 落点\n1. `src/a.rs` :: `foo` (L1-L3) — edit\n### 3. 与说明不符之处\n无\n\n## L1\ndetails\n";
-        let p = parse_sections(doc).unwrap();
-        assert!(p.l0.contains("`src/a.rs`"));
-        assert_eq!(p.l1.as_deref(), Some("details"));
-        assert!(p.mismatch.is_none());
-
-        assert!(parse_sections("just prose without headings").is_none());
-        assert!(parse_sections("## L1\nonly l1\n").is_none());
+    fn temp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "delegate-scout-prose-{}-{}-{}",
+            tag,
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
-    #[test]
-    fn ignores_headings_inside_fenced_blocks() {
-        let doc = "## L0\n```md\n## L1\nfake\n```\n### 3. 与说明不符之处\n无\n## L1\nreal l1\n";
-        let p = parse_sections(doc).unwrap();
-        assert!(p.l0.contains("fake"));
-        assert_eq!(p.l1.as_deref(), Some("real l1"));
-    }
-
-    #[test]
-    fn mismatch_section_detects_real_diff_and_ignores_none_variants() {
-        for none_case in [
-            "### 3. 与说明不符之处\n无\n### 4. 未核实项\n无",
-            "### 3. 与说明不符之处\n- 无。\n### 4. 未核实项\n无",
-            "3. 与说明不符之处：「无」\n4. 未核实项：无",
-            "### 3. 与说明不符之处\n无（全部一致）\n### 4. 未核实项\n无",
-        ] {
-            assert_eq!(extract_mismatch_section(none_case), None, "case: {none_case}");
+    fn write_files(root: &Path, paths: &[&str]) {
+        for rel in paths {
+            let full = root.join(rel);
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&full, format!("// fixture {rel}\n")).unwrap();
         }
-        let real = "### 3. 与说明不符之处\n1. `work start` 不存在，实际是 `dispatch_work_auto`\n### 4. 未核实项\n无";
-        let m = extract_mismatch_section(real).unwrap();
-        assert!(m.contains("dispatch_work_auto"));
-        assert!(!m.contains("未核实项"));
-
-        let tricky = "3. 与说明不符之处：无此函数，实际叫 bar\n4. 未核实项：无";
-        assert!(extract_mismatch_section(tricky).is_some());
     }
 
     #[test]
-    fn validates_anchors_window_and_bad_ratio() {
-        let dir = std::env::temp_dir().join(format!("delegate-scout-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(dir.join("src")).unwrap();
-        let file_content = "line1\nline2\nfn alpha() {}\nline4\nline5\nline6\nline7\nline8\nline9\nfn beta() {}\n";
-        fs::write(dir.join("src/lib.rs"), file_content).unwrap();
+    fn scout_prompt_matches_verbatim_prose_handoff_spec() {
+        let prompt = build_scout_prompt("修复某处竞态");
+        assert!(prompt.starts_with("# 只读探路：为接手改代码的同事写一份交接笔记\n"));
+        assert!(prompt.contains("控制在 1500 字内"));
+        assert!(prompt.contains("## 任务说明\n修复某处竞态"));
+        assert!(!prompt.contains("## L0"));
+        assert!(!prompt.contains("## L1"));
+        assert!(!prompt.contains("::"));
+    }
 
-        // 1/5 bad = 20% -> accepted
-        let l0_ok = "\
-### 1. 落点
-1. `src/lib.rs` :: `alpha` (L3-L4) — exact
-2. `src/lib.rs` :: `alpha` (L7-L8) — within start-5 window (7-5=2 <= 3)
-3. `src/lib.rs` :: `beta` (L6-L6) — within end+5 window (6+5=11 >= 10)
-4. `src/lib.rs` :: `Mod::beta` (L10-L10) — qualified leaf match
-5. `src/missing.rs` :: `nope` (L1-L2) — missing file
-";
-        let v_ok = validate_l0_anchors(l0_ok, &dir);
-        assert_eq!(v_ok.total, 5);
-        assert_eq!(v_ok.bad, 1);
-        assert!(!v_ok.should_drop());
-        assert_eq!(
-            v_ok.blobs.get("src/lib.rs").map(String::as_str),
-            Some(git_blob_sha1(file_content.as_bytes()).as_str())
+    #[test]
+    fn real_discard_fixtures_are_all_accepted_with_paths_extracted() {
+        let dm_gc = include_str!("../../../tests/fixtures/scout/dm-gc.md");
+        let agy_auto = include_str!("../../../tests/fixtures/scout/agy-auto-switch.md");
+        let dev_heal = include_str!("../../../tests/fixtures/scout/dev-self-heal.md");
+        let ops_login = include_str!("../../../tests/fixtures/scout/ops-auth-provider.md");
+
+        // 1. dm-gc (against aia-skills style repo)
+        let dir_dm = temp_dir("dm-gc");
+        write_files(
+            &dir_dm,
+            &[
+                "crates/delegate/src/main.rs",
+                "crates/delegate/src/gc.rs",
+                "crates/delegate/src/runs.rs",
+                "crates/delegate/src/work.rs",
+                "crates/delegate/src/disk.rs",
+                "skills/delegate/SKILL.md",
+                "skills/delegate/references/commands.md",
+                "skills/delegate/references/model-routing.md",
+                "tests/test_delegate.py",
+                "CHANGELOG.md",
+            ],
         );
+        match evaluate_map(dm_gc, &TreeSource::Dir(&dir_dm), &[dir_dm.as_path()], true) {
+            MapOutcome::Accepted {
+                note,
+                is_question,
+                check,
+            } => {
+                assert!(!is_question, "dm-gc should not be flagged as question");
+                for expected in [
+                    "crates/delegate/src/main.rs",
+                    "crates/delegate/src/gc.rs",
+                    "crates/delegate/src/runs.rs",
+                    "crates/delegate/src/disk.rs",
+                    "skills/delegate/SKILL.md",
+                    "CHANGELOG.md",
+                ] {
+                    assert!(
+                        check.blobs.contains_key(expected),
+                        "dm-gc missing blob for {expected}; got {:?}",
+                        check.blobs.keys().collect::<Vec<_>>()
+                    );
+                }
+                assert!(
+                    check
+                        .missing_paths
+                        .contains(&"tests/test_delegate_auto_gc.py".to_string()),
+                    "dm-gc should note pending new test file: {:?}",
+                    check.missing_paths
+                );
+                assert!(note.contains("注：探路提及的以下路径在基线中尚不存在"));
+                assert!(note.contains("tests/test_delegate_auto_gc.py"));
+                // Shorthand `references/commands.md` is a suffix of existing `skills/delegate/references/commands.md`
+                assert!(
+                    !check
+                        .missing_paths
+                        .contains(&"references/commands.md".to_string())
+                );
+            }
+            MapOutcome::Dropped { reason, .. } => panic!("dm-gc unexpectedly dropped: {reason}"),
+        }
+        let _ = fs::remove_dir_all(&dir_dm);
 
-        // 2/4 bad = 50% -> dropped
-        let l0_bad = "\
-### 1. 落点
-1. `src/lib.rs` :: `alpha` (L3-L4) — ok
-2. `src/lib.rs` :: `beta` (L10-L10) — ok
-3. `src/lib.rs` :: `ghost` (L1-L5) — missing symbol
-4. `src/missing.rs` :: `foo` (L1-L2) — missing file
-";
-        let v_bad = validate_l0_anchors(l0_bad, &dir);
-        assert_eq!(v_bad.total, 4);
-        assert_eq!(v_bad.bad, 2);
-        assert!(v_bad.should_drop());
+        // 2. agy-auto-switch (Markdown links + file:// + multi-range)
+        let dir_agy = temp_dir("agy-auto");
+        write_files(
+            &dir_agy,
+            &[
+                "crates/delegate/src/config.rs",
+                "crates/delegate/src/agy_accounts.rs",
+                "crates/delegate/src/agents.rs",
+                "crates/delegate/src/supervise.rs",
+                "crates/delegate/src/review.rs",
+                "crates/delegate/src/usage.rs",
+                "crates/delegate-tui/src/main.rs",
+                "crates/delegate-tui/src/model.rs",
+                "tests/test_delegate_agy_sticky.py",
+                "skills/delegate/references/agy-accounts.md",
+                "CHANGELOG.md",
+            ],
+        );
+        match evaluate_map(
+            agy_auto,
+            &TreeSource::Dir(&dir_agy),
+            &[dir_agy.as_path()],
+            true,
+        ) {
+            MapOutcome::Accepted {
+                is_question, check, ..
+            } => {
+                assert!(!is_question, "agy-auto should not be flagged as question");
+                for expected in [
+                    "crates/delegate/src/config.rs",
+                    "crates/delegate/src/agy_accounts.rs",
+                    "crates/delegate/src/supervise.rs",
+                    "crates/delegate-tui/src/main.rs",
+                    "crates/delegate-tui/src/model.rs",
+                ] {
+                    assert!(
+                        check.blobs.contains_key(expected),
+                        "agy-auto missing blob for {expected}"
+                    );
+                }
+            }
+            MapOutcome::Dropped { reason, .. } => panic!("agy-auto unexpectedly dropped: {reason}"),
+        }
+        let _ = fs::remove_dir_all(&dir_agy);
+
+        // 3. dev-self-heal (norvane repo)
+        let dir_dev = temp_dir("dev-heal");
+        write_files(
+            &dir_dev,
+            &[
+                "manage.sh",
+                "scripts/run-delegated.sh",
+                "apps/aiaxiom-server/src/server/threads/harness_change.rs",
+                "apps/aiaxiom-server/src/server/error_log.rs",
+                "apps/web/src/lib/devLogin.ts",
+                "apps/web/src/pages/Auth.tsx",
+                "apps/web/src/pages/home/AccountMenu.tsx",
+                "apps/web/src/i18n/zh/Auth.ts",
+                "apps/web/src/i18n/en/Auth.ts",
+                "docs/reference/dev-maintenance.md",
+            ],
+        );
+        match evaluate_map(
+            dev_heal,
+            &TreeSource::Dir(&dir_dev),
+            &[dir_dev.as_path()],
+            true,
+        ) {
+            MapOutcome::Accepted {
+                is_question, check, ..
+            } => {
+                assert!(!is_question, "dev-heal should not be flagged as question");
+                for expected in [
+                    "manage.sh",
+                    "scripts/run-delegated.sh",
+                    "apps/aiaxiom-server/src/server/threads/harness_change.rs",
+                    "apps/web/src/pages/Auth.tsx",
+                    "docs/reference/dev-maintenance.md",
+                ] {
+                    assert!(
+                        check.blobs.contains_key(expected),
+                        "dev-heal missing blob for {expected}"
+                    );
+                }
+            }
+            MapOutcome::Dropped { reason, .. } => panic!("dev-heal unexpectedly dropped: {reason}"),
+        }
+        let _ = fs::remove_dir_all(&dir_dev);
+
+        // 4. ops-auth-provider (norvane repo, backticks + pending new module)
+        let dir_ops = temp_dir("ops-login");
+        write_files(
+            &dir_ops,
+            &[
+                "apps/aiaxiom-server/src/server/ops.rs",
+                "apps/aiaxiom-server/src/server/oauth/mod.rs",
+                "crates/control-plane/src/oauth/mod.rs",
+                "scripts/alpha.sh",
+                "docs/reference/dev-maintenance.md",
+            ],
+        );
+        match evaluate_map(
+            ops_login,
+            &TreeSource::Dir(&dir_ops),
+            &[dir_ops.as_path()],
+            true,
+        ) {
+            MapOutcome::Accepted {
+                note,
+                is_question,
+                check,
+            } => {
+                assert!(!is_question, "ops-login should not be flagged as question");
+                for expected in [
+                    "apps/aiaxiom-server/src/server/ops.rs",
+                    "crates/control-plane/src/oauth/mod.rs",
+                    "scripts/alpha.sh",
+                    "docs/reference/dev-maintenance.md",
+                ] {
+                    assert!(
+                        check.blobs.contains_key(expected),
+                        "ops-login missing blob for {expected}"
+                    );
+                }
+                assert!(
+                    check
+                        .missing_paths
+                        .contains(&"apps/aiaxiom-server/src/server/ops/auth_provider.rs".to_string())
+                );
+                assert!(note.contains("apps/aiaxiom-server/src/server/ops/auth_provider.rs"));
+            }
+            MapOutcome::Dropped { reason, .. } => {
+                panic!("ops-login unexpectedly dropped: {reason}")
+            }
+        }
+        let _ = fs::remove_dir_all(&dir_ops);
+    }
+
+    #[test]
+    fn wrong_repo_drop_requires_5_missing_zero_existing_and_brief_existing() {
+        let dir = temp_dir("wrong-repo");
+        write_files(&dir, &["src/real.rs"]);
+        let map5 = "要改 `other/a.rs`、`other/b.rs`、`other/c.rs`、`other/d.rs` 和 `other/e.rs`。";
+
+        // 5 missing + 0 existing + brief has existing -> DROPPED with concrete details
+        match evaluate_map(map5, &TreeSource::Dir(&dir), &[dir.as_path()], true) {
+            MapOutcome::Dropped {
+                code,
+                reason,
+                details,
+                ..
+            } => {
+                assert_eq!(code, "wrong_repo_paths");
+                assert!(reason.contains("5 个仓内样式路径"));
+                assert_eq!(details.len(), 5);
+                assert!(details.contains(&"other/a.rs".to_string()));
+            }
+            MapOutcome::Accepted { .. } => panic!("expected wrong_repo_paths drop"),
+        }
+
+        // Brief has NO existing paths -> ACCEPTED (might be a brand-new scaffold task)
+        assert!(matches!(
+            evaluate_map(map5, &TreeSource::Dir(&dir), &[dir.as_path()], false),
+            MapOutcome::Accepted { .. }
+        ));
+
+        // Only 4 missing paths -> ACCEPTED with factual footnote
+        let map4 = "要改 `other/a.rs`、`other/b.rs`、`other/c.rs`、`other/d.rs`。";
+        assert!(matches!(
+            evaluate_map(map4, &TreeSource::Dir(&dir), &[dir.as_path()], true),
+            MapOutcome::Accepted { .. }
+        ));
+
+        // At least 1 existing path -> ACCEPTED even with 5 missing
+        let map5_plus_1 = format!("{map5}\n参考 `src/real.rs`。");
+        assert!(matches!(
+            evaluate_map(&map5_plus_1, &TreeSource::Dir(&dir), &[dir.as_path()], true),
+            MapOutcome::Accepted { .. }
+        ));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scout_question_detects_natural_questions_and_avoids_false_positives() {
+        // Explicit & natural questions
+        assert!(is_scout_question("需要主控决定\n说明说改 old_alpha，但代码只有 alpha_fn。"));
+        assert!(is_scout_question("## **Needs a decision**\nShould we drop `--org`?"));
+        assert!(is_scout_question(
+            "开工前请主控确认：auth_providers 表没有 organization_id 列，是否去掉 --org？\n\n### 已查清的事实\n..."
+        ));
+        assert!(is_scout_question(
+            "发现任务前提与现状矛盾：alpha.sh 没有 ops 子命令，倾向改用 alpha server ops，请问按哪种方案推进？\n\n细节如下。"
+        ));
+        assert!(is_scout_question(
+            "### 查证结果\n代码在 `src/alpha.rs` (L1-10)。\n\n综上，请问主控倾向方案 A 还是方案 B？"
+        ));
+
+        // Normal handoff notes must NOT trigger question
+        assert!(!is_scout_question(
+            "### 改动位置\n1. `src/alpha.rs` 的 `alpha_fn` (L1-3)：更新返回值。\n\n### 测试\n运行 `cargo test`。"
+        ));
+        assert!(!is_scout_question(
+            "### 为什么需要改这里？\n因为旧接口会丢掉错误信息。\n\n### 落点\n改 `src/alpha.rs`。"
+        ));
+        assert!(!is_scout_question(
+            "现状清晰，无需主控确认，写手可直接按说明修改 `src/alpha.rs`。"
+        ));
+        assert!(!is_scout_question(
+            "查证完毕，无不符之处。\n\n```md\n需要主控决定（代码块内示例，忽略）\n```\n\n测试命令：`true`。"
+        ));
+    }
+
+    #[test]
+    fn insert_note_at_respects_map_end_even_with_horizontal_rules_inside_map() {
+        let (composed, map_end) = build_writer_brief_with_end(
+            "任务说明",
+            "第一段\n\n---\n\n第二段",
+            Some("主控答复内容"),
+        );
+        let full = format!("{composed}\n\n---\n合同内容\n");
+        let changed_note = format_changed_paths_note(&["src/alpha.rs".into()]).unwrap();
+        let (updated, delta) = insert_note_at(&full, Some(map_end), &changed_note);
+        assert!(delta > 0);
+        let idx_second = updated.find("第二段").unwrap();
+        let idx_note = updated.find(&changed_note).unwrap();
+        let idx_reply = updated.find("## 主控对探路发现的答复").unwrap();
+        assert!(idx_second < idx_note && idx_note < idx_reply);
+        // Idempotent on second call
+        let (updated2, delta2) = insert_note_at(&updated, Some(map_end + delta), &changed_note);
+        assert_eq!(delta2, 0);
+        assert_eq!(updated2, updated);
     }
 
     #[test]

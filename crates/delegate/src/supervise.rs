@@ -1725,6 +1725,7 @@ fn prepare_run_in_supervisor(run: &Path, meta: &mut Value) -> Res<()> {
             }
         }
 
+        let mut is_new_tree = false;
         if meta["worktree"]["in"].is_null() {
             let run_id = run.file_name().unwrap_or_default().to_string_lossy();
             let claimed_slot = b(&meta["worktree"], "pooled")
@@ -1732,6 +1733,7 @@ fn prepare_run_in_supervisor(run: &Path, meta: &mut Value) -> Res<()> {
             let wt_path = PathBuf::from(s(&meta["worktree"], "path"));
             let new_tree = meta["worktree"].is_object()
                 && (claimed_slot || !wt_path.exists());
+            is_new_tree = new_tree;
             let snap_top = if meta["worktree"].is_object() {
                 if wt_path.exists() && !claimed_slot {
                     Some(wt_path.clone())
@@ -1775,10 +1777,66 @@ fn prepare_run_in_supervisor(run: &Path, meta: &mut Value) -> Res<()> {
         if meta["worktree"].is_object() {
             let source = PathBuf::from(s(&meta["worktree"], "source"));
             meta["sourceStatusBaseline"] = crate::source_watch::baseline(&source)?;
-            if s(meta, "netBase").is_empty() {
+            let refresh_net_base = s(meta, "netBase").is_empty()
+                || (is_new_tree && (b(meta, "scoutFirst") || b(meta, "scoutReply")));
+            if refresh_net_base {
                 if let Ok(head) = git_text(&source, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]) {
                     if !head.is_empty() {
                         meta["netBase"] = json!(head);
+                    }
+                }
+            }
+        }
+
+        // Compare scout-recorded file blobs against the writer's freshly snapped baseline tree.
+        // Never drop the map on drift; append one factual line to the end of the scout note in prompt.md.
+        if meta["scout"].is_object() && s(&meta["scout"], "status") == "accepted" {
+            let scout_blobs: std::collections::BTreeMap<String, String> = meta["scout"]["blobs"]
+                .as_object()
+                .map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !scout_blobs.is_empty() {
+                let writer_tree = s(&meta["base"], "tree").to_string();
+                let source_root = {
+                    let src = s(&meta["worktree"], "source");
+                    if !src.is_empty() {
+                        PathBuf::from(src)
+                    } else {
+                        PathBuf::from(s(meta, "workdir"))
+                    }
+                };
+                let changed = if !writer_tree.is_empty() && source_root.is_dir() {
+                    crate::scout_first::TreeSource::GitTree {
+                        repo: &source_root,
+                        tree: &writer_tree,
+                    }
+                    .diff_blobs(&scout_blobs)
+                } else {
+                    crate::scout_first::TreeSource::Dir(&source_root).diff_blobs(&scout_blobs)
+                };
+                if !changed.is_empty() {
+                    meta["scout"]["changedPaths"] = json!(&changed);
+                    if let Some(note_line) =
+                        crate::scout_first::format_changed_paths_note(&changed)
+                    {
+                        let prompt_path = run.join("prompt.md");
+                        let prompt_text = read(&prompt_path);
+                        let map_end = meta["scoutMapEnd"].as_u64().map(|v| v as usize);
+                        let (updated, delta) =
+                            crate::scout_first::insert_note_at(&prompt_text, map_end, &note_line);
+                        if delta > 0 {
+                            write(&prompt_path, &updated)?;
+                            if let Some(end) = map_end {
+                                meta["scoutMapEnd"] = json!(end + delta);
+                            }
+                            if let Some(ulen) = meta["userPromptLen"].as_u64() {
+                                meta["userPromptLen"] = json!(ulen + delta as u64);
+                            }
+                        }
                     }
                 }
             }
@@ -1835,31 +1893,29 @@ fn emit_scout_map_dropped(
     scout_id: &str,
     code: &str,
     reason: &str,
-    bad_anchors: usize,
-    total_anchors: usize,
+    details: &[String],
 ) {
-    log_event(
-        run,
-        json!({
-            "e": "scout_map_dropped",
-            "scoutRun": scout_id,
-            "code": code,
-            "reason": reason,
-            "badAnchors": bad_anchors,
-            "anchorsTotal": total_anchors,
-        }),
-    );
+    let mut ev_log = json!({
+        "e": "scout_map_dropped",
+        "scoutRun": scout_id,
+        "code": code,
+        "reason": reason,
+    });
+    let mut ev_global = json!({
+        "scoutRun": scout_id,
+        "code": code,
+        "reason": reason,
+    });
+    if !details.is_empty() {
+        ev_log["details"] = json!(details);
+        ev_global["details"] = json!(details);
+    }
+    log_event(run, ev_log);
     crate::events::emit(
         &crate::events::run_id_for(run, meta),
         &crate::events::repo_for_meta(meta),
         "scout_map_dropped",
-        json!({
-            "scoutRun": scout_id,
-            "code": code,
-            "reason": reason,
-            "badAnchors": bad_anchors,
-            "anchorsTotal": total_anchors,
-        }),
+        ev_global,
     );
 }
 
@@ -1894,6 +1950,12 @@ fn apply_scout_summary(meta: &Value, sum: &mut Value) {
     if !reason.is_empty() {
         sum["scoutMapDropReason"] = json!(reason);
     }
+    if scout["dropDetails"]
+        .as_array()
+        .is_some_and(|a| !a.is_empty())
+    {
+        sum["scoutMapDropDetails"] = scout["dropDetails"].clone();
+    }
     if let Some(bad) = scout["badAnchors"].as_u64() {
         sum["scoutBadAnchors"] = json!(bad);
     }
@@ -1904,8 +1966,9 @@ fn apply_scout_summary(meta: &Value, sum: &mut Value) {
 }
 
 /// Execute the scouting phase for a two-step write run:
-/// wait for the read-only scout run, deterministically split/validate L0/L1,
-/// save `scout-map.md`, enter `question` state on mismatch, or transition to writer admission.
+/// wait for the read-only scout run, loosely scan paths & record git blob SHAs against the
+/// scout's own snapshot tree (before marking scout consumed), save `scout-map.md`, enter
+/// `question` state when scout asks the controller to decide, or transition to writer admission.
 /// Returns `Ok(Some(()))` if the write run has already finished (stopped or question);
 /// returns `Ok(None)` to proceed with writer execution.
 fn run_scout_phase(run: &Path, meta: &mut Value) -> Res<Option<()>> {
@@ -1928,8 +1991,10 @@ fn run_scout_phase(run: &Path, meta: &mut Value) -> Res<Option<()>> {
         return Ok(Some(()));
     }
 
-    mark_scout_consumed(&scout_dir);
+    // Read scout artifacts and inspect its own snapshot tree BEFORE calling `mark_scout_consumed`,
+    // so concurrent GC cannot reclaim the scout worktree while we read files/blobs from it.
     let scout_state = runs::state(&scout_dir);
+    let scout_meta = json(scout_dir.join("meta.json"));
     let scout_sum = json(scout_dir.join("summary.json"));
     let scout_result = read(scout_dir.join("result.md"));
     let scout_tokens = if scout_sum["tokens"]
@@ -1944,7 +2009,7 @@ fn run_scout_phase(run: &Path, meta: &mut Value) -> Res<Option<()>> {
         let _ = write(run.join("scout-map.md"), &scout_result);
     }
 
-    let repo_root = {
+    let source_repo = {
         let src = s(&meta["worktree"], "source");
         if !src.is_empty() {
             PathBuf::from(src)
@@ -1952,81 +2017,130 @@ fn run_scout_phase(run: &Path, meta: &mut Value) -> Res<Option<()>> {
             PathBuf::from(s(meta, "workdir"))
         }
     };
+    let scout_wt = PathBuf::from(s(&scout_meta["worktree"], "path"));
+    let scout_tree = s(&scout_meta["base"], "tree").to_string();
+    let tree_source = if !scout_wt.as_os_str().is_empty() && scout_wt.is_dir() {
+        crate::scout_first::TreeSource::Dir(&scout_wt)
+    } else if !scout_tree.is_empty() && source_repo.is_dir() {
+        crate::scout_first::TreeSource::GitTree {
+            repo: &source_repo,
+            tree: &scout_tree,
+        }
+    } else {
+        crate::scout_first::TreeSource::Dir(&source_repo)
+    };
 
-    if !["answered", "delivered"].contains(&scout_state.as_str()) || scout_result.trim().is_empty() {
-        let reason = if !["answered", "delivered"].contains(&scout_state.as_str()) {
-            format!("探路失败（{scout_state}）")
+    let mut root_bufs: Vec<PathBuf> = Vec::new();
+    for p in [&scout_wt, &source_repo] {
+        if !p.as_os_str().is_empty() {
+            if !root_bufs.contains(p) {
+                root_bufs.push(p.clone());
+            }
+            if let Ok(canon) = fs::canonicalize(p) {
+                if !root_bufs.contains(&canon) {
+                    root_bufs.push(canon);
+                }
+            }
+        }
+    }
+    let strip_roots: Vec<&Path> = root_bufs.iter().map(PathBuf::as_path).collect();
+
+    let prompt_md = read(run.join("prompt.md"));
+    let split = meta["scoutPromptSplit"]
+        .as_u64()
+        .map(|v| v as usize)
+        .filter(|&n| n <= prompt_md.len() && prompt_md.is_char_boundary(n));
+    let orig_brief_owned = if let Some(idx) = split {
+        prompt_md[..idx].to_string()
+    } else {
+        read(run.join("raw-brief.md"))
+    };
+
+    if !["answered", "delivered"].contains(&scout_state.as_str())
+        || scout_result.trim().is_empty()
+        || b(&scout_sum, "policyRefusal")
+    {
+        mark_scout_consumed(&scout_dir);
+        let (code, reason) = if b(&scout_sum, "policyRefusal") {
+            ("policy_refusal", "探路被内容策略拦截".to_string())
+        } else if !["answered", "delivered"].contains(&scout_state.as_str()) {
+            ("scout_failed", format!("探路失败（{scout_state}）"))
         } else {
-            "探路输出为空".to_string()
+            ("empty_map", "探路输出为空".to_string())
         };
-        emit_scout_map_dropped(run, meta, &scout_id, "scout_failed", &reason, 0, 0);
+        emit_scout_map_dropped(run, meta, &scout_id, code, &reason, &[]);
         meta["scout"] = json!({
             "run": scout_id,
             "status": "dropped",
-            "dropCode": "scout_failed",
+            "dropCode": code,
             "dropReason": reason,
-            "badAnchors": 0,
-            "anchorsTotal": 0,
+            "dropDetails": [],
             "tokens": scout_tokens,
         });
     } else {
-        match crate::scout_first::evaluate_map(&scout_result, &repo_root) {
+        let brief_has_existing = crate::scout_first::brief_has_existing_paths(
+            &orig_brief_owned,
+            &tree_source,
+            &strip_roots,
+        );
+        let outcome = crate::scout_first::evaluate_map(
+            &scout_result,
+            &tree_source,
+            &strip_roots,
+            brief_has_existing,
+        );
+        mark_scout_consumed(&scout_dir);
+        match outcome {
             crate::scout_first::MapOutcome::Dropped {
                 code,
                 reason,
-                bad_anchors,
-                total_anchors,
+                details,
                 blobs,
             } => {
-                emit_scout_map_dropped(
-                    run,
-                    meta,
-                    &scout_id,
-                    code,
-                    &reason,
-                    bad_anchors,
-                    total_anchors,
-                );
+                emit_scout_map_dropped(run, meta, &scout_id, code, &reason, &details);
                 meta["scout"] = json!({
                     "run": scout_id,
                     "status": "dropped",
                     "dropCode": code,
                     "dropReason": reason,
-                    "badAnchors": bad_anchors,
-                    "anchorsTotal": total_anchors,
+                    "dropDetails": details,
                     "blobs": blobs,
                     "tokens": scout_tokens,
                 });
             }
             crate::scout_first::MapOutcome::Accepted {
-                l0,
-                mismatch,
-                validation,
-                ..
+                note,
+                is_question,
+                check,
             } => {
                 let map_abs = run
                     .join("scout-map.md")
                     .canonicalize()
                     .unwrap_or_else(|_| run.join("scout-map.md"));
-                meta["scout"] = json!({
+                let paths_total = check.existing_paths.len() + check.missing_paths.len();
+                let mut scout_doc = json!({
                     "run": scout_id,
                     "status": "accepted",
-                    "badAnchors": validation.bad,
-                    "anchorsTotal": validation.total,
-                    "blobs": validation.blobs,
+                    "pathsTotal": paths_total,
+                    "existingPaths": check.existing_paths.len(),
+                    "blobs": check.blobs,
                     "tokens": scout_tokens,
                     "mapPath": map_abs,
                 });
-                if let Some(mismatch_text) = mismatch {
+                if !check.missing_paths.is_empty() {
+                    scout_doc["missingPaths"] = json!(check.missing_paths);
+                }
+                meta["scout"] = scout_doc;
+                if is_question || b(&scout_sum, "question") {
                     let run_id = crate::events::run_id_for(run, meta);
                     meta["scoutQuestion"] = json!(true);
-                    meta["scoutL0"] = json!(&l0);
+                    meta["scoutNote"] = json!(&note);
                     meta["scoutMapPath"] = json!(&map_abs);
                     meta["phase"] = json!("finished");
                     write_json(run.join("meta.json"), meta)?;
                     let q_text = format!(
                         "{}\n\n回复后起写手：delegate reply {run_id} \"<修正或决定>\"\n",
-                        mismatch_text.trim()
+                        note.trim()
                     );
                     write(run.join("result.md"), &q_text)?;
                     let _ = fs::remove_file(run.join(".scouting"));
@@ -2045,16 +2159,11 @@ fn run_scout_phase(run: &Path, meta: &mut Value) -> Res<Option<()>> {
                     finish_run(run, sum, 0)?;
                     return Ok(Some(()));
                 }
-                let prompt_md = read(run.join("prompt.md"));
-                let split = meta["scoutPromptSplit"]
-                    .as_u64()
-                    .map(|v| v as usize)
-                    .filter(|&n| n <= prompt_md.len() && prompt_md.is_char_boundary(n));
                 if let Some(idx) = split {
                     let orig_brief = &prompt_md[..idx];
                     let suffix = &prompt_md[idx..];
-                    let composed =
-                        crate::scout_first::build_writer_brief(orig_brief, &l0, &map_abs, None);
+                    let (composed, map_end) =
+                        crate::scout_first::build_writer_brief_with_end(orig_brief, &note, None);
                     let suffix_body = suffix.trim_start_matches('\n');
                     let rewritten = if suffix_body.is_empty() {
                         format!("{}\n", composed.trim_end_matches('\n'))
@@ -2062,11 +2171,20 @@ fn run_scout_phase(run: &Path, meta: &mut Value) -> Res<Option<()>> {
                         format!("{}\n\n{suffix_body}", composed.trim_end_matches('\n'))
                     };
                     write(run.join("prompt.md"), rewritten)?;
+                    meta["scoutMapEnd"] = json!(map_end);
+                    meta["userPromptLen"] = json!(composed.trim_end_matches('\n').len());
                 } else {
-                    let orig_brief = read(run.join("raw-brief.md"));
-                    let composed =
-                        crate::scout_first::build_writer_brief(&orig_brief, &l0, &map_abs, None);
-                    write(run.join("prompt.md"), format!("{}\n", composed.trim_end_matches('\n')))?;
+                    let (composed, map_end) = crate::scout_first::build_writer_brief_with_end(
+                        &orig_brief_owned,
+                        &note,
+                        None,
+                    );
+                    write(
+                        run.join("prompt.md"),
+                        format!("{}\n", composed.trim_end_matches('\n')),
+                    )?;
+                    meta["scoutMapEnd"] = json!(map_end);
+                    meta["userPromptLen"] = json!(composed.trim_end_matches('\n').len());
                 }
             }
         }
@@ -2101,13 +2219,12 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
     } else if !s(&meta, "scoutLaunchError").is_empty() && !meta["scout"].is_object() {
         let err = s(&meta, "scoutLaunchError").to_string();
         let reason = format!("探路启动失败（{err}）");
-        emit_scout_map_dropped(run, &meta, "", "scout_launch_failed", &reason, 0, 0);
+        emit_scout_map_dropped(run, &meta, "", "scout_launch_failed", &reason, &[]);
         meta["scout"] = json!({
             "status": "dropped",
             "dropCode": "scout_launch_failed",
             "dropReason": reason,
-            "badAnchors": 0,
-            "anchorsTotal": 0,
+            "dropDetails": [],
         });
         let _ = write_json(run.join("meta.json"), &meta);
     }
