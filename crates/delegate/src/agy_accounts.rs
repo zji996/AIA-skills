@@ -3500,6 +3500,10 @@ pub fn is_quota_exhausted_error(text: &str) -> bool {
         "quota_exceeded",
         "quota exhausted",
         "quota_exhausted",
+        "quota reached",
+        "quota_reached",
+        "quota limit",
+        "quota will reset",
         "exceeded your current quota",
         "out of quota",
         "no quota remaining",
@@ -3510,6 +3514,14 @@ pub fn is_quota_exhausted_error(text: &str) -> bool {
         "usage limit",
     ];
     if hard_markers.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    if !transient_rate_limit
+        && lower.contains("resource_exhausted")
+        && (lower.contains("quota")
+            || lower.contains("resets in")
+            || lower.contains("upgrade your subscription"))
+    {
         return true;
     }
     if !transient_rate_limit
@@ -8734,6 +8746,9 @@ Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSum
             "Five hour limit reached",
             "usage limit exceeded",
             "RESOURCE_EXHAUSTED: no tokens left",
+            "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h6m5s.",
+            r#"AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h6m5s.","status":"RESOURCE_EXHAUSTED","error_code":429,"code_kind":"http","retryable":true}"#,
+            "429 RESOURCE_EXHAUSTED: quota reached",
         ] {
             assert!(
                 is_quota_exhausted_error(hard_quota),

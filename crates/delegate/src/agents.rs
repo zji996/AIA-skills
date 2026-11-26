@@ -1994,6 +1994,35 @@ pub fn run_agent_cancellable(
             preferred_acct,
             Some(run),
         )?;
+        let effective_switched = if prep.switched.is_some() {
+            prep.switched.clone()
+        } else if !is_handoff
+            && !is_reviewer
+            && !is_extra_reviewer
+            && pinned_id.is_none()
+            && preferred_acct.is_none()
+            && crate::agy_accounts::is_auto_mode_enabled()
+        {
+            let parent_acct = s(meta, "parentAgyAccount");
+            match (parent_acct, prep.account_id.as_deref()) {
+                (from, Some(to)) if !from.is_empty() && from != to => {
+                    Some(crate::agy_accounts::AgyAccountSwitch {
+                        kind: "auto".to_string(),
+                        from: from.to_string(),
+                        to: to.to_string(),
+                        reason: "新会话按 auto 选号".to_string(),
+                        pool: crate::agy_accounts::classify_model_pool(s(meta, "model"))
+                            .map(|p| p.key().to_string()),
+                        from_quota: None,
+                        to_quota: None,
+                        cache_age_secs: None,
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         if let Some(ref acct) = prep.account_id {
             if meta_path.is_file() || is_extra_reviewer {
                 let mut disk = if meta_path.is_file() {
@@ -2008,7 +2037,7 @@ pub fn run_agent_cancellable(
                         dirty = true;
                     }
                     if !is_handoff {
-                        if let Some(ref sw) = prep.switched {
+                        if let Some(ref sw) = effective_switched {
                             let mut sw_obj = json!({
                                 "kind": sw.kind,
                                 "from": sw.from,
@@ -2035,7 +2064,7 @@ pub fn run_agent_cancellable(
             }
         }
         if !is_handoff {
-            if let Some(ref sw) = prep.switched {
+            if let Some(ref sw) = effective_switched {
                 let role = if is_extra_reviewer {
                     "extra_reviewer"
                 } else if is_reviewer {

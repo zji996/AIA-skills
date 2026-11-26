@@ -2546,7 +2546,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     } else {
         config.value["agy"].clone()
     };
-    if !o.fresh && session.is_some() && crate::agy::is_agy(o.model.as_deref().unwrap_or("")) {
+    if crate::agy::is_agy(o.model.as_deref().unwrap_or("")) {
         let pinned = s(&meta, "agyAccount");
         let inherited = if !pinned.is_empty() {
             pinned
@@ -2554,7 +2554,11 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
             s(&summary, "agyAccount")
         };
         if !inherited.is_empty() {
-            extra["agyAccount"] = json!(inherited);
+            if !o.fresh && session.is_some() {
+                extra["agyAccount"] = json!(inherited);
+            } else if o.fresh {
+                extra["parentAgyAccount"] = json!(inherited);
+            }
         }
     }
     if o.fresh {
@@ -3608,6 +3612,9 @@ pub fn launch(
     }
     if !s(extra, "agyAccount").is_empty() {
         meta["agyAccount"] = extra["agyAccount"].clone();
+    }
+    if !s(extra, "parentAgyAccount").is_empty() {
+        meta["parentAgyAccount"] = extra["parentAgyAccount"].clone();
     }
     meta["resultDisplayChars"] = extra["resultChars"].clone();
     if let Some(limit) = o.max_answer {

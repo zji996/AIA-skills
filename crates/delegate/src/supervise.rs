@@ -2509,8 +2509,15 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
             .rev()
             .collect::<Vec<_>>()
             .join("; ");
+        let is_agy_run =
+            crate::agy::is_agy(s(&meta, "model")) || s(&meta, "agent") == crate::agy::BIN;
+        let quota_exhausted = state == "failed"
+            && is_agy_run
+            && crate::agy_accounts::attempt_quota_exhausted_error(run, attempts).is_some();
         let hint = if auth_failed && state == "failed" {
             "agy 登录失效，`delegate agy account status`".into()
+        } else if quota_exhausted {
+            "agy 账号额度耗尽，请切换账号（`delegate agy account use <id|auto>`）".into()
         } else {
             match state.as_str() {
                 "malformed" => "answer was empty or a leaked tool call".into(),

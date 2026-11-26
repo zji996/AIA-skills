@@ -706,6 +706,259 @@ class DelegateAgyAutoSwitchTests(unittest.TestCase):
         self.assertNotIn("agyAccountSwitch", meta1)
         self.assertFalse(self.usage_log.exists(), "single account must not trigger /usage refresh")
 
+    def test_reply_fresh_shows_auto_switch_line_even_when_pool_current_already_switched(self):
+        self._seed_two_accounts()
+        self._enable_auto_mode()
+        repo = self.repo({"src/app.txt": "v0\n"})
+        self._install_scripted_agy(
+            "Path('src/app.txt').write_text(f'v{call_idx}\\n', encoding='utf-8')\n"
+            "emit_agy(f'done {call_idx}')\n"
+        )
+        # 1. Start chain run1 on alpha (alpha Green 90%, beta Yellow 20%).
+        self._write_quota_cache(alpha_gem=(90.0, 90.0), beta_gem=(20.0, 80.0))
+        run1, dir1 = self._start_and_wait(repo, "chain on alpha", "--worktree", "--no-scout")
+        meta1 = json.loads((dir1 / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta1.get("agyAccount"), "alpha")
+
+        # 2. Flip quotas: alpha drops to Red 0%, beta rises to Green 95%.
+        #    Run an unrelated `start` first so `poolCurrent[gemini]` is ALREADY switched to beta!
+        self._write_quota_cache(alpha_gem=(0.0, 50.0), beta_gem=(95.0, 95.0))
+        run_other, dir_other = self._start_and_wait(repo, "unrelated run moves poolCurrent", "--read-only")
+        meta_other = json.loads((dir_other / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta_other.get("agyAccount"), "beta")
+        self.assertEqual(meta_other.get("agyAccountSwitch", {}).get("kind"), "auto")
+
+        # 3. Normal `reply` on run1 MUST stay sticky on alpha.
+        run_sticky, dir_sticky = self._reply_and_wait(run1, "sticky reply stays on alpha", "--minor")
+        meta_sticky = json.loads((dir_sticky / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta_sticky.get("agyAccount"), "alpha")
+        self.assertNotIn("agyAccountSwitch", meta_sticky)
+
+        # 4. `reply --fresh` on run1 (chain records alpha, poolCurrent is already beta):
+        #    MUST pick beta AND record/render `自动选号：alpha → beta` in meta, status, and card!
+        run_fresh, dir_fresh = self._reply_and_wait(
+            run1, "fresh reply after poolCurrent already beta", "--fresh", "--minor"
+        )
+        meta_fresh = json.loads((dir_fresh / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta_fresh.get("agyAccount"), "beta")
+        self.assertEqual(meta_fresh.get("agyAccountSwitch", {}).get("kind"), "auto")
+        self.assertEqual(meta_fresh.get("agyAccountSwitch", {}).get("from"), "alpha")
+        self.assertEqual(meta_fresh.get("agyAccountSwitch", {}).get("to"), "beta")
+        self.assertIn("自动选号：alpha → beta", self._run_raw("card", run_fresh, "--no-mark").stdout)
+        self.assertIn("自动选号：alpha → beta", self._run_raw("status", run_fresh).stdout)
+
+        # 5. In fixed mode (`use beta`), `reply --fresh` on run1 picks beta WITHOUT `自动选号`.
+        self.assertEqual(self.cli("agy", "account", "use", "beta").returncode, 0)
+        run_fixed, dir_fixed = self._reply_and_wait(
+            run1, "fresh reply in fixed mode", "--fresh", "--minor"
+        )
+        meta_fixed = json.loads((dir_fixed / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta_fixed.get("agyAccount"), "beta")
+        self.assertNotIn("agyAccountSwitch", meta_fixed)
+        self.assertNotIn("自动选号", self._run_raw("card", run_fixed, "--no-mark").stdout)
+
+    def _seed_three_accounts(self) -> None:
+        vault_dir = self.fake_home / ".gemini/agy-swap"
+        vault_dir.mkdir(parents=True, exist_ok=True)
+        vault = {
+            "account:alpha@example.test": acct_fixtures._b64_vault_entry(
+                "alpha@example.test", "AT-ALPHA", "RT-ALPHA"
+            ),
+            "account:beta@example.test": acct_fixtures._b64_vault_entry(
+                "beta@example.test", "AT-BETA", "RT-BETA"
+            ),
+            "account:gamma@example.test": acct_fixtures._b64_vault_entry(
+                "gamma@example.test", "AT-GAMMA", "RT-GAMMA"
+            ),
+        }
+        (vault_dir / "vault.json").write_text(json.dumps(vault), encoding="utf-8")
+        (vault_dir / "accounts.json").write_text(
+            json.dumps(
+                {
+                    "alpha@example.test": {"name": "Alpha"},
+                    "beta@example.test": {"name": "Beta"},
+                    "gamma@example.test": {"name": "Gamma"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        acct_fixtures._write_live_creds(
+            self.fake_home, "alpha@example.test", "AT-ALPHA", "RT-ALPHA"
+        )
+        res = self.cli("agy", "account", "import-agy-swap", "--json")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(json.loads(res.stdout)["active"], "alpha")
+
+    def _write_three_account_quota_cache(
+        self, alpha_gem=(80.0, 80.0), beta_gem=(85.0, 85.0), gamma_gem=(90.0, 90.0)
+    ) -> None:
+        now = int(time.time())
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+        reset_5h = "2099-01-01T00:00:00Z"
+        reset_7d = "2099-01-07T00:00:00Z"
+        quota_path = Path(self.env["XDG_STATE_HOME"]) / "delegate/agy-quota.json"
+        quota_path.parent.mkdir(parents=True, exist_ok=True)
+        def entry(gem):
+            return {
+                "ok": True,
+                "fetchedAt": now_iso,
+                "fetchedEpoch": now,
+                "entries": [
+                    {"pool": "Gemini Models", "window": "fiveHour", "remainingPct": gem[0], "resetAt": reset_5h},
+                    {"pool": "Gemini Models", "window": "weekly", "remainingPct": gem[1], "resetAt": reset_7d},
+                    {"pool": "Claude and GPT models", "window": "fiveHour", "remainingPct": 80.0, "resetAt": reset_5h},
+                    {"pool": "Claude and GPT models", "window": "weekly", "remainingPct": 80.0, "resetAt": reset_7d},
+                ],
+            }
+        doc = {
+            "schemaVersion": 1,
+            "updatedAt": now_iso,
+            "updatedEpoch": now,
+            "accounts": {
+                "alpha": entry(alpha_gem),
+                "beta": entry(beta_gem),
+                "gamma": entry(gamma_gem),
+            },
+        }
+        quota_path.write_text(json.dumps(doc), encoding="utf-8")
+
+    def test_pending_reply_after_parent_quota_exhausted_auto_reselects_fresh_session(self):
+        self._seed_three_accounts()
+        self._enable_auto_mode()
+        self.env["DELEGATE_RESUME_BACKOFF"] = "1,1,1"
+        repo = self.repo({"src/app.txt": "v0\n"})
+        gate = self.work / "gate-auto.flag"
+        ready = self.work / "ready-auto.flag"
+        quota_err = (
+            'AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. '
+            'Please upgrade your subscription to increase your limits. Resets in 1h6m5s.",'
+            '"status":"RESOURCE_EXHAUSTED","error_code":429,"code_kind":"http","retryable":true}'
+        )
+        # Call 1 (alpha): writes partial edit, waits on gate so we can queue follow-up, then hits 429 quota reached.
+        # Call 2 (mid-run handoff on beta): also hits 429 quota reached -> parent ends `failed` on beta (no 3x retry).
+        # Call 3 (pending_reply fallback in auto mode): must NOT stick to beta; opens fresh session on gamma
+        #         with workspace interruption fact + original follow-up and succeeds.
+        self._install_scripted_agy(
+            "import time\n"
+            "acct = os.environ.get('DELEGATE_AGY_ACCOUNT', '')\n"
+            f"if call_idx == 1:\n"
+            "    Path('src/app.txt').write_text('partial-from-alpha\\n', encoding='utf-8')\n"
+            f"    Path({str(ready)!r}).write_text('1', encoding='utf-8')\n"
+            f"    while not Path({str(gate)!r}).exists():\n"
+            "        time.sleep(0.05)\n"
+            f"    emit_error({quota_err!r}, cid='conv-alpha')\n"
+            "elif call_idx == 2:\n"
+            f"    emit_error({quota_err!r}, cid='conv-beta')\n"
+            "else:\n"
+            "    Path('src/app.txt').write_text('finished-by-gamma\\n', encoding='utf-8')\n"
+            "    emit_agy('fallback fresh done on gamma', cid='conv-gamma')\n"
+        )
+        self._write_three_account_quota_cache(
+            alpha_gem=(80.0, 80.0), beta_gem=(95.0, 95.0), gamma_gem=(85.0, 85.0)
+        )
+        started = self.cli(
+            "start", "--workdir", str(repo), "--worktree", "--no-scout", "--accept", "true",
+            "parent task with queued reply",
+        )
+        self.assertEqual(started.returncode, 0, started.stderr + started.stdout)
+        parent_id = self._parse_run_id(started.stdout)
+        parent_dir = Path(self.env["DELEGATE_RUNS"]) / parent_id
+        self.until(lambda: ready.exists(), "parent did not start", timeout=20.0)
+
+        # Queue a normal follow-up (NO --fresh) while parent is active.
+        qres = self.cli("reply", parent_id, "补充：检查边界条件")
+        self.assertEqual(qres.returncode, 0, qres.stderr + qres.stdout)
+
+        # Release parent to fail on alpha -> handoff beta -> fail on beta.
+        gate.write_text("go", encoding="utf-8")
+        self.until(lambda: (parent_dir / "summary.json").is_file(), "parent did not settle", timeout=30.0)
+        parent_sum = json.loads((parent_dir / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(parent_sum["state"], "failed", f"parent_sum={parent_sum}")
+        self.assertNotIn("resumes", parent_sum, "quota exhaustion must not trigger 3-round transient retries")
+
+        # Wait for pending_reply to deliver the child run and for the child run to settle.
+        delivered_file = parent_dir / "reply-delivered.json"
+        self.until(
+            lambda: delivered_file.is_file(),
+            f"pending reply not delivered; pending={parent_dir / 'pending-reply.json'}",
+            timeout=30.0,
+        )
+        child_dir = Path(json.loads(delivered_file.read_text(encoding="utf-8"))["run"])
+        child_id = child_dir.name
+        self.until(lambda: (child_dir / "summary.json").is_file(), "child run did not settle", timeout=30.0)
+        child_sum = json.loads((child_dir / "summary.json").read_text(encoding="utf-8"))
+        child_meta = json.loads((child_dir / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(child_sum["state"], "delivered", f"child_sum={child_sum}")
+        self.assertEqual(child_meta.get("agyAccount"), "gamma")
+        self.assertEqual(child_meta.get("agyAccountSwitch", {}).get("kind"), "auto")
+        self.assertEqual(child_meta.get("agyAccountSwitch", {}).get("from"), "beta")
+        self.assertEqual(child_meta.get("agyAccountSwitch", {}).get("to"), "gamma")
+        self.assertIn("自动选号：beta → gamma", self._run_raw("card", child_id, "--no-mark").stdout)
+
+        calls = self._read_calls()
+        self.assertEqual([c["account"] for c in calls], ["alpha", "beta", "gamma"])
+        self.assertEqual(calls[2]["conv"], "", "fallback after quota exhaustion must open a fresh session")
+        self.assertIn("上一会话因账号额度用尽中断，这是新会话；已有改动在工作区", calls[2]["content"])
+        self.assertIn("补充：检查边界条件", calls[2]["content"])
+
+    def test_pending_reply_after_parent_quota_exhausted_fixed_mode_fails_fast_with_hint(self):
+        self._seed_two_accounts()
+        # Fixed single-account mode on alpha (auto mode OFF).
+        self.assertEqual(self.cli("agy", "account", "use", "alpha").returncode, 0)
+        self.env["DELEGATE_RESUME_BACKOFF"] = "1,1,1"
+        repo = self.repo({"src/app.txt": "v0\n"})
+        gate = self.work / "gate-fixed.flag"
+        ready = self.work / "ready-fixed.flag"
+        quota_err = (
+            'AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. '
+            'Please upgrade your subscription to increase your limits. Resets in 1h6m5s.",'
+            '"status":"RESOURCE_EXHAUSTED","error_code":429,"code_kind":"http","retryable":true}'
+        )
+        self._install_scripted_agy(
+            "import time\n"
+            f"if call_idx == 1:\n"
+            f"    Path({str(ready)!r}).write_text('1', encoding='utf-8')\n"
+            f"    while not Path({str(gate)!r}).exists():\n"
+            "        time.sleep(0.05)\n"
+            f"emit_error({quota_err!r}, cid='conv-fixed-alpha')\n"
+        )
+        self._write_quota_cache(alpha_gem=(80.0, 80.0), beta_gem=(95.0, 95.0))
+        started = self.cli(
+            "start", "--workdir", str(repo), "--worktree", "--no-scout",
+            "fixed mode parent task",
+        )
+        self.assertEqual(started.returncode, 0, started.stderr + started.stdout)
+        parent_id = self._parse_run_id(started.stdout)
+        parent_dir = Path(self.env["DELEGATE_RUNS"]) / parent_id
+        self.until(lambda: ready.exists(), "parent did not start", timeout=20.0)
+
+        qres = self.cli("reply", parent_id, "补充：固定号继续")
+        self.assertEqual(qres.returncode, 0, qres.stderr + qres.stdout)
+
+        gate.write_text("go", encoding="utf-8")
+        self.until(lambda: (parent_dir / "summary.json").is_file(), "parent did not settle", timeout=30.0)
+        parent_sum = json.loads((parent_dir / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(parent_sum["state"], "failed")
+        self.assertEqual(parent_sum.get("attempts"), 1)
+        self.assertNotIn("resumes", parent_sum)
+        self.assertIn("delegate agy account use", parent_sum.get("error", ""))
+
+        delivered_file = parent_dir / "reply-delivered.json"
+        self.until(lambda: delivered_file.is_file(), "fixed-mode pending reply not delivered", timeout=30.0)
+        child_dir = Path(json.loads(delivered_file.read_text(encoding="utf-8"))["run"])
+        self.until(lambda: (child_dir / "summary.json").is_file(), "fixed-mode child did not settle", timeout=30.0)
+        child_sum = json.loads((child_dir / "summary.json").read_text(encoding="utf-8"))
+        child_meta = json.loads((child_dir / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(child_sum["state"], "failed")
+        self.assertEqual(child_meta.get("agyAccount"), "alpha")
+        self.assertEqual(child_sum.get("attempts"), 1, f"must not spin 3 retries: {child_sum}")
+        self.assertNotIn("resumes", child_sum, f"must not spin 3 retries: {child_sum}")
+        self.assertIn("delegate agy account use", child_sum.get("error", ""))
+
+        calls = self._read_calls()
+        # Exactly 1 call for parent + 1 call for child, both on alpha (zero transient retries).
+        self.assertEqual([c["account"] for c in calls], ["alpha", "alpha"])
+
 
 if __name__ == "__main__":
     unittest.main()

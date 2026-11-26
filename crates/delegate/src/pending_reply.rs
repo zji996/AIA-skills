@@ -1006,6 +1006,41 @@ fn merge_fallback_options(saved: &Value) -> Res<launch::Options> {
     Ok(merged)
 }
 
+/// Return `(parent_account, parent_model, parent_mode)` when `run` is an `agy` run that ended in
+/// `failed` due to hard quota exhaustion (e.g. `429 RESOURCE_EXHAUSTED` / `quota reached`).
+fn parent_failed_with_agy_quota(run: &Path) -> Option<(String, String, String)> {
+    if runs::state(run) != "failed" {
+        return None;
+    }
+    let meta = json(run.join("meta.json"));
+    let model = s(&meta, "model").to_string();
+    let is_agy = crate::agy::is_agy(&model) || s(&meta, "agent") == crate::agy::BIN;
+    if !is_agy {
+        return None;
+    }
+    let summary = json(run.join("summary.json"));
+    let exhausted = crate::agy_accounts::is_quota_exhausted_error(s(&summary, "error"))
+        || crate::agy_accounts::is_quota_exhausted_error(s(&summary, "transientError"))
+        || crate::agy_accounts::attempt_quota_exhausted_error(
+            run,
+            n(&summary, "attempts").max(1),
+        )
+        .is_some();
+    if !exhausted {
+        return None;
+    }
+    let acct = {
+        let a = s(&meta, "agyAccount");
+        if !a.is_empty() {
+            a.to_string()
+        } else {
+            s(&summary, "agyAccount").to_string()
+        }
+    };
+    let mode = s(&meta, "mode").to_string();
+    Some((acct, model, mode))
+}
+
 /// Detached worker (`_reply-pending <run>`) delivering post-settle fallback messages once the
 /// parent run finishes.
 pub fn deliver(run: &Path) -> Res<()> {
@@ -1050,6 +1085,32 @@ pub fn deliver(run: &Path) -> Res<()> {
     options.prompt_file = None;
     options.prompt = Some(s(&saved, "message").to_string());
     options.words.clear();
+    if !options.fresh {
+        if let Some((parent_acct, parent_model, parent_mode)) = parent_failed_with_agy_quota(run) {
+            if !parent_acct.is_empty() {
+                let _ = crate::agy_accounts::mark_slot_quota_exhausted_passive(
+                    &parent_acct,
+                    &parent_model,
+                    epoch() as i64,
+                );
+            }
+            if crate::agy_accounts::is_auto_mode_enabled() {
+                options.fresh = true;
+                let orig = options.prompt.take().unwrap_or_default();
+                let prefix = if parent_mode == "write" {
+                    "上一会话因账号额度用尽中断，这是新会话；已有改动在工作区（`git status`、`git diff` 可见）。追问如下："
+                } else {
+                    "上一会话因账号额度用尽中断，这是新会话。追问如下："
+                };
+                let wrapped = if orig.trim().is_empty() {
+                    prefix.to_string()
+                } else {
+                    format!("{prefix}\n\n{}", orig.trim())
+                };
+                options.prompt = Some(wrapped);
+            }
+        }
+    }
     std::env::set_current_dir(s(&saved, "cwd")).map_err(|e| e.to_string())?;
     // Leave a durable diagnostic instead of silently losing a failed launch.
     match launch::reply(options) {
@@ -1355,6 +1416,54 @@ mod tests {
         }
         // Single-item fallback must also keep raw message untouched.
         assert_eq!(format_fallback_message(&items[..1]), "按 `.local/plan/a.md` 补测");
+
+        let _ = fs::remove_dir_all(&run);
+    }
+
+    #[test]
+    fn detects_parent_failed_with_agy_quota_exhaustion() {
+        let run = temp_run("quota-parent");
+        write_json(
+            run.join("meta.json"),
+            &json!({
+                "name": "demo",
+                "model": "agy/gemini-4-neon",
+                "agent": "agy",
+                "mode": "write",
+                "agyAccount": "alpha"
+            }),
+        )
+        .unwrap();
+        write_json(
+            run.join("summary.json"),
+            &json!({
+                "state": "failed",
+                "attempts": 1,
+                "error": r#"AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 1h.","status":"RESOURCE_EXHAUSTED","error_code":429}"#
+            }),
+        )
+        .unwrap();
+        let detected = parent_failed_with_agy_quota(&run);
+        assert_eq!(
+            detected,
+            Some((
+                "alpha".to_string(),
+                "agy/gemini-4-neon".to_string(),
+                "write".to_string()
+            ))
+        );
+
+        // Non-quota failure must NOT match.
+        write_json(
+            run.join("summary.json"),
+            &json!({
+                "state": "failed",
+                "attempts": 1,
+                "error": "HTTP 429 Too Many Requests"
+            }),
+        )
+        .unwrap();
+        assert_eq!(parent_failed_with_agy_quota(&run), None);
 
         let _ = fs::remove_dir_all(&run);
     }

@@ -211,6 +211,9 @@ pub fn ended_by_kind(run: &Path, attempt: i64) -> Option<(Kind, String)> {
             .collect::<Vec<_>>(),
     );
     for text in texts.iter().rev() {
+        if crate::agy_accounts::is_quota_exhausted_error(text) {
+            return None;
+        }
         let Some(found) = kind(text) else { continue };
         if found == Kind::RateLimit
             && mine().iter().any(|event| {
@@ -316,6 +319,15 @@ mod tests {
         assert_eq!(kind("404 model not found: p/typo"), None);
         assert_eq!(kind("context length exceeded"), None);
         assert_eq!(kind("the tests still fail"), None);
+        // Hard quota exhaustion carrying HTTP 429 / RESOURCE_EXHAUSTED must NOT be retried as RateLimit.
+        assert_eq!(
+            kind("Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h6m5s."),
+            None
+        );
+        assert_eq!(
+            kind(r#"AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h6m5s.","status":"RESOURCE_EXHAUSTED","error_code":429,"retryable":true}"#),
+            None
+        );
         // Ordinary words containing "eof" must not trigger EOF matching.
         assert_eq!(kind("syntax error near typeof x"), None);
         assert_eq!(kind("terms thereof are invalid"), None);
