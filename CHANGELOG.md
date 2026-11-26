@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `delegate`：`delegate files <run>` 改为按整条 reply 链相对 `effective_total_base`（`meta.netBase` / `chainBase`，与 `diff --total` 同口径，含新增、修改、删除与改名两端）输出净改动文件集合，与 `apply` 实际写入及末行「本 run 改动文件（N 个）」计数一致；已合入（`.applied`）与归档（含未合入归档）后均照旧可查并可从归档重建。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
 
 ## delegate 6.52.0 - 2026-11-26

@@ -452,6 +452,7 @@ pub fn preserve(run: &Path) -> Res<Option<PathBuf>> {
         "changes.patch",
         "applied.patch",
         "applied-files.txt",
+        "chain-files.txt",
         "review.json",
         "review.md",
         "usage-rounds.jsonl",
@@ -465,6 +466,17 @@ pub fn preserve(run: &Path) -> Res<Option<PathBuf>> {
     ] {
         if run.join(name).is_file() {
             fs::copy(run.join(name), record.join(name)).map_err(|e| e.to_string())?;
+        }
+    }
+    if !record.join("applied-files.txt").is_file() && !record.join("chain-files.txt").is_file() {
+        let chain_files = crate::worktree::run_files(run);
+        if !chain_files.is_empty() || run.join("changes.json").is_file() {
+            let content = if chain_files.is_empty() {
+                String::new()
+            } else {
+                format!("{}\n", chain_files.join("\n"))
+            };
+            let _ = write(record.join("chain-files.txt"), content);
         }
     }
     if let Ok(entries) = fs::read_dir(run) {

@@ -2444,19 +2444,211 @@ fn dirty_path_overlaps(path: &str, dirty: &[String]) -> bool {
     })
 }
 
-/// Deterministic list of repo-relative files changed by a run (works before apply, after apply,
-/// and after auto-clean archive).
+fn read_file_list(path: &Path) -> Option<Vec<String>> {
+    if !path.is_file() {
+        return None;
+    }
+    let mut files: Vec<String> = read(path)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    files.sort();
+    files.dedup();
+    Some(files)
+}
+
+fn resolve_parent_run_dir(run: &Path, parent_id: &str) -> Option<PathBuf> {
+    if parent_id.is_empty() {
+        return None;
+    }
+    if let Some(dir) = run.parent().map(|p| p.join(parent_id)).filter(|p| p.is_dir()) {
+        return Some(dir);
+    }
+    let applied_sib = runs_root().join(".applied").join(parent_id);
+    if applied_sib.is_dir() {
+        return Some(applied_sib);
+    }
+    let archived = cache_dir().join("archive").join(parent_id).join("record");
+    if archived.is_dir() {
+        return Some(archived);
+    }
+    None
+}
+
+fn chain_root_base_large(run: &Path, meta: &Value) -> Value {
+    if b(meta, "netBaseRebased") {
+        return json!({});
+    }
+    let mut cur_dir = run.to_path_buf();
+    let mut cur_meta = meta.clone();
+    let mut visited = std::collections::BTreeSet::<String>::new();
+    let self_id = s(&cur_meta, "run").to_string();
+    if !self_id.is_empty() {
+        visited.insert(self_id);
+    }
+    while !s(&cur_meta, "parent").is_empty() {
+        let parent_id = s(&cur_meta, "parent").to_string();
+        if !visited.insert(parent_id.clone()) {
+            break;
+        }
+        let Some(pdir) = resolve_parent_run_dir(&cur_dir, &parent_id) else {
+            break;
+        };
+        let pmeta = json(pdir.join("meta.json"));
+        if pmeta.is_null() {
+            break;
+        }
+        cur_dir = pdir;
+        cur_meta = pmeta;
+    }
+    if cur_meta["base"]["large"].is_object() {
+        cur_meta["base"]["large"].clone()
+    } else {
+        json!({})
+    }
+}
+
+/// Net changed paths of a run's entire reply chain relative to `effective_total_base`
+/// (same baseline and `--no-renames` semantics as `delegate diff <run> --total`:
+/// additions, modifications, deletions, and both ends of renames).
+/// Works before apply, after apply (`.applied`), and after worktree removal / archive
+/// as long as the git objects remain reachable in `worktree.source` or `top`.
+pub fn chain_net_files(run: &Path, meta: &Value) -> Option<Vec<String>> {
+    let rec = json(run.join("changes.json"));
+    if rec.is_null() {
+        return None;
+    }
+    let after = s(&rec, "after");
+    if after.is_empty() {
+        return None;
+    }
+    let top = [
+        s(&rec, "top"),
+        s(&meta["worktree"], "source"),
+        s(meta, "top"),
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|p| !p.as_os_str().is_empty() && p.is_dir())?;
+
+    let (mut base_tree, _) = effective_total_base(&top, meta);
+    if base_tree.is_empty() {
+        base_tree = s(&rec, "base").to_string();
+    }
+    if base_tree.is_empty() {
+        return None;
+    }
+    let before_large = chain_root_base_large(run, meta);
+    let before = json!({"tree": base_tree, "large": before_large});
+    let after_val = json!({"tree": after, "large": rec["afterLarge"]});
+    let changes = tree_changes(&top, &before, &after_val, meta["worktree"].is_object()).ok()?;
+    let mut files: Vec<String> = changes
+        .into_iter()
+        .map(|c| s(&c, "path").to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    files.sort();
+    files.dedup();
+    Some(files)
+}
+
+fn parse_patch_paths(patch: &str) -> Vec<String> {
+    let mut set = std::collections::BTreeSet::<String>::new();
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            if let Some((a, b)) = rest.split_once(" b/") {
+                if !a.is_empty() {
+                    set.insert(a.to_string());
+                }
+                if !b.is_empty() {
+                    set.insert(b.to_string());
+                }
+            }
+        } else if let Some(p) = line.strip_prefix("rename from ") {
+            if !p.is_empty() {
+                set.insert(p.to_string());
+            }
+        } else if let Some(p) = line.strip_prefix("rename to ") {
+            if !p.is_empty() {
+                set.insert(p.to_string());
+            }
+        }
+    }
+    set.into_iter().collect()
+}
+
+fn collect_round_recorded_files(run: &Path, set: &mut std::collections::BTreeSet<String>) {
+    let mut found = false;
+    let rec = json(run.join("changes.json"));
+    if let Some(arr) = rec["changes"].as_array() {
+        for item in arr {
+            let p = s(item, "path");
+            if !p.is_empty() {
+                set.insert(p.to_string());
+                found = true;
+            }
+        }
+    }
+    if let Some(obj) = rec["afterLarge"].as_object() {
+        for k in obj.keys() {
+            if !k.is_empty() {
+                set.insert(k.clone());
+                found = true;
+            }
+        }
+    }
+    if !found {
+        for patch_name in ["applied.patch", "changes.patch"] {
+            let patch_path = run.join(patch_name);
+            if patch_path.is_file() {
+                for p in parse_patch_paths(&read(&patch_path)) {
+                    set.insert(p);
+                    found = true;
+                }
+                if found {
+                    break;
+                }
+            }
+        }
+    }
+    if !found {
+        let sum = json(run.join("summary.json"));
+        for p in strings(&sum["files"]) {
+            if !p.is_empty() {
+                set.insert(p);
+            }
+        }
+    }
+}
+
+fn collect_chain_fallback_files(run: &Path) -> Vec<String> {
+    let mut set = std::collections::BTreeSet::<String>::new();
+    let mut visited = std::collections::BTreeSet::<String>::new();
+    let mut cur = Some(run.to_path_buf());
+    while let Some(dir) = cur {
+        let meta = json(dir.join("meta.json"));
+        let rid = s(&meta, "run").to_string();
+        if !rid.is_empty() && !visited.insert(rid) {
+            break;
+        }
+        collect_round_recorded_files(&dir, &mut set);
+        let parent_id = s(&meta, "parent").to_string();
+        cur = if parent_id.is_empty() {
+            None
+        } else {
+            resolve_parent_run_dir(&dir, &parent_id)
+        };
+    }
+    set.into_iter().collect()
+}
+
+/// Deterministic list of repo-relative files changed by a run's entire chain
+/// (matches `delegate diff <run> --total` and `delegate apply <run>`).
+/// Works before apply, after apply (`.applied`), and after auto-clean archive.
 pub fn run_files(run: &Path) -> Vec<String> {
-    let applied_list = run.join("applied-files.txt");
-    if applied_list.is_file() {
-        let mut files: Vec<String> = read(&applied_list)
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect();
-        files.sort();
-        files.dedup();
+    if let Some(files) = read_file_list(&run.join("applied-files.txt")).filter(|v| !v.is_empty()) {
         return files;
     }
     let applied = json(run.join(".applied"));
@@ -2472,41 +2664,13 @@ pub fn run_files(run: &Path) -> Vec<String> {
         return files;
     }
     let meta = json(run.join("meta.json"));
-    if meta["worktree"].is_object() && s(&meta, "mode") == "write" {
-        if let Some(mut pending) = pending_changed_paths(run, &meta) {
-            if !pending.is_empty() {
-                pending.sort();
-                pending.dedup();
-                return pending;
-            }
-        }
+    if let Some(files) = chain_net_files(run, &meta) {
+        return files;
     }
-    let mut set = std::collections::BTreeSet::<String>::new();
-    let rec = json(run.join("changes.json"));
-    if let Some(arr) = rec["changes"].as_array() {
-        for item in arr {
-            let p = s(item, "path");
-            if !p.is_empty() {
-                set.insert(p.to_string());
-            }
-        }
+    if let Some(files) = read_file_list(&run.join("chain-files.txt")) {
+        return files;
     }
-    if let Some(obj) = rec["afterLarge"].as_object() {
-        for k in obj.keys() {
-            if !k.is_empty() {
-                set.insert(k.clone());
-            }
-        }
-    }
-    let sum = json(run.join("summary.json"));
-    if set.is_empty() {
-        for p in strings(&sum["files"]) {
-            if !p.is_empty() {
-                set.insert(p);
-            }
-        }
-    }
-    set.into_iter().collect()
+    collect_chain_fallback_files(run)
 }
 
 fn record_dirty_overlap_failure(
@@ -3299,6 +3463,11 @@ fn apply_checked(
     let regenerated_files = inner.regenerated;
     if !dry && code == 0 {
         let mut all_touched = std::collections::BTreeSet::<String>::new();
+        if let Some(chain_files) = chain_net_files(run, &meta) {
+            for p in chain_files {
+                all_touched.insert(p);
+            }
+        }
         for p in &written_files {
             all_touched.insert(p.clone());
         }

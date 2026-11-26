@@ -2063,7 +2063,13 @@ fn files_command(args: &[String]) -> Res<i32> {
         return Err(format!("unrecognized arguments: {}", pos[1..].join(" ")));
     }
     let reference = pos.first().map(String::as_str).unwrap_or("last");
-    let resolved = runs::resolve(reference)?;
+    let resolved = match runs::resolve(reference) {
+        Ok(r) => r,
+        Err(err) => match history::resolve_archive_record(reference) {
+            Some(rec) => rec,
+            None => return Err(err),
+        },
+    };
     let run = if runs::continues_conversation(&resolved) {
         runs::latest(resolved)
     } else {
@@ -2724,18 +2730,7 @@ fn apply(args: &[String]) -> Res<i32> {
             if item.already_applied {
                 continue;
             }
-            let mut touched = std::collections::BTreeSet::<&str>::new();
-            for p in &item.written_files {
-                touched.insert(p.as_str());
-            }
-            for p in &item.regenerated_files {
-                touched.insert(p.as_str());
-            }
-            let count = if touched.is_empty() {
-                worktree::run_files(&item.run).len()
-            } else {
-                touched.len()
-            };
+            let count = worktree::run_files(&item.run).len();
             if count > 0 {
                 let run_id = {
                     let r = s(&item.conclusion, "run");

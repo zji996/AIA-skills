@@ -1299,6 +1299,7 @@ pub fn remove_after_apply(run: &Path) -> (Vec<String>, bool) {
         "changes.json",
         "applied.patch",
         "applied-files.txt",
+        "chain-files.txt",
         "prompt.md",
         "result.md",
         "result-original.md",
