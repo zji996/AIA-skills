@@ -52,6 +52,7 @@ pub struct Options {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub review_model: Option<String>,
+    pub review_full: bool,
     pub thinking: Option<String>,
     pub parallel: bool,
     pub fresh: bool,
@@ -259,6 +260,7 @@ pub fn parse_launch(args: &[String], reply: bool, collect: bool) -> Res<Options>
                     o.evidence = None;
                 }
                 "--no-remote" => o.no_remote = true,
+                "--review-full" => o.review_full = true,
                 "--allow-parallel-writes" => o.parallel = true,
                 "--fresh" => o.fresh = true,
                 "--sync" if reply => o.sync = true,
@@ -3396,6 +3398,9 @@ pub fn launch(
         "agy",
     ] {
         meta[key] = extra[key].clone();
+    }
+    if o.review_full {
+        meta["reviewFull"] = json!(true);
     }
     if !s(extra, "agyAccount").is_empty() {
         meta["agyAccount"] = extra["agyAccount"].clone();

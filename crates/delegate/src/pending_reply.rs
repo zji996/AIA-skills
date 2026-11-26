@@ -828,6 +828,7 @@ fn merge_fallback_options(saved: &Value) -> Res<launch::Options> {
         merged.sync |= next.sync;
         merged.sync_agent |= next.sync_agent;
         merged.hide_accept |= next.hide_accept;
+        merged.review_full |= next.review_full;
         merged.minor |= next.minor;
         if next.model.is_some() {
             merged.model = next.model;

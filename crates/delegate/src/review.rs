@@ -1285,6 +1285,183 @@ fn original_task_brief(run: &Path, meta: &Value) -> String {
     sections.join("\n\n")
 }
 
+fn split_diff_stanzas(diff: &str) -> Vec<&str> {
+    let mut stanzas = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut offset = 0usize;
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            if let Some(s_idx) = start {
+                stanzas.push(&diff[s_idx..offset]);
+            }
+            start = Some(offset);
+        }
+        offset += line.len();
+    }
+    if let Some(s_idx) = start {
+        stanzas.push(&diff[s_idx..]);
+    }
+    stanzas
+}
+
+fn is_identical_copy_stanza(stanza: &str) -> bool {
+    let mut has_sim_100 = false;
+    let mut has_copy_from = false;
+    let mut has_copy_to = false;
+    for (idx, raw) in stanza.lines().enumerate() {
+        let line = raw.trim_end_matches('\r');
+        if idx == 0 {
+            if !line.starts_with("diff --git ") {
+                return false;
+            }
+            continue;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        if line == "similarity index 100%" {
+            has_sim_100 = true;
+        } else if line.starts_with("copy from ") {
+            has_copy_from = true;
+        } else if line.starts_with("copy to ") {
+            has_copy_to = true;
+        } else {
+            return false;
+        }
+    }
+    has_sim_100 && has_copy_from && has_copy_to
+}
+
+fn unquote_git_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        trimmed[1..trimmed.len() - 1]
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn stanza_dest_path(stanza: &str) -> Option<String> {
+    for line in stanza.lines() {
+        let l = line.trim_end_matches('\r');
+        if let Some(rest) = l.strip_prefix("copy to ") {
+            return Some(unquote_git_path(rest));
+        }
+        if let Some(rest) = l.strip_prefix("rename to ") {
+            return Some(unquote_git_path(rest));
+        }
+        if let Some(rest) = l.strip_prefix("+++ b/") {
+            return Some(unquote_git_path(rest));
+        }
+    }
+    let first = stanza.lines().next()?.trim_end_matches('\r');
+    let rest = first.strip_prefix("diff --git ")?;
+    if let Some((_, b_part)) = rest.rsplit_once(" b/") {
+        return Some(unquote_git_path(b_part));
+    }
+    None
+}
+
+/// Strip 100%-identical pure-copy stanzas (`similarity index 100%` + `copy from`/`copy to` with
+/// no hunks or mode changes) from a `git diff -M -C -C` output so directory copies only surface
+/// files that actually changed. Returns `(filtered_diff, shown_file_count, omitted_copy_count)`.
+pub fn strip_identical_copy_stanzas(diff: &str) -> (String, usize, usize) {
+    let stanzas = split_diff_stanzas(diff);
+    if stanzas.is_empty() {
+        return (diff.to_string(), 0, 0);
+    }
+    let mut kept = Vec::new();
+    let mut omitted = 0usize;
+    for st in stanzas {
+        if is_identical_copy_stanza(st) {
+            omitted += 1;
+        } else {
+            kept.push(st);
+        }
+    }
+    let shown = kept.len();
+    let mut out = String::new();
+    if omitted > 0 {
+        if shown > 0 {
+            out.push_str(&format!(
+                "# 已省略 {omitted} 个与源文件 100% 完全一致的复制文件，以下仅显示有改动的文件\n\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "# 所有 {omitted} 个新增文件均为 100% 完全一致的复制，无内容改动\n"
+            ));
+        }
+    }
+    for st in kept {
+        out.push_str(st);
+    }
+    (out, shown, omitted)
+}
+
+fn filter_diff_excluding_paths(diff: &str, excluded: &BTreeSet<String>) -> (String, usize) {
+    if excluded.is_empty() {
+        let count = split_diff_stanzas(diff).len();
+        return (diff.to_string(), count);
+    }
+    let stanzas = split_diff_stanzas(diff);
+    if stanzas.is_empty() {
+        return (diff.to_string(), 0);
+    }
+    let mut out = String::new();
+    // Preserve any leading comment header before the first `diff --git `.
+    if let Some(pos) = diff.find("diff --git ") {
+        if pos > 0 {
+            out.push_str(&diff[..pos]);
+        }
+    }
+    let mut shown = 0usize;
+    for st in stanzas {
+        let drop_it = stanza_dest_path(st).is_some_and(|p| excluded.contains(&p));
+        if !drop_it {
+            out.push_str(st);
+            shown += 1;
+        }
+    }
+    (out, shown)
+}
+
+/// Generate a reviewer-facing diff with rename & copy detection (`git diff -M -C -C`),
+/// stripping 100%-identical pure copies and optionally excluding pure-mainline-advance files.
+pub fn generate_reviewer_diff(
+    top: &Path,
+    from_tree: &str,
+    to_tree: &str,
+    exclude_paths: Option<&BTreeSet<String>>,
+) -> (String, usize) {
+    if !top.is_dir() || from_tree.is_empty() || to_tree.is_empty() {
+        return (String::new(), 0);
+    }
+    let raw = git(
+        top,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--color=never",
+            "-M",
+            "-C",
+            "-C",
+            from_tree,
+            to_tree,
+        ],
+    )
+    .map(|b| String::from_utf8_lossy(&b).into_owned())
+    .unwrap_or_default();
+    let (stripped, shown, _) = strip_identical_copy_stanzas(&raw);
+    if let Some(ex) = exclude_paths.filter(|s| !s.is_empty()) {
+        filter_diff_excluding_paths(&stripped, ex)
+    } else {
+        (stripped, shown)
+    }
+}
+
 fn format_diff_for_prompt(diff_text: &str, diff_file: &Path, top: &Path, from_tree: &str, to_tree: &str) -> String {
     if diff_text.trim().is_empty() {
         return "（无改动 / empty diff）".to_string();
@@ -1296,7 +1473,7 @@ fn format_diff_for_prompt(diff_text: &str, diff_file: &Path, top: &Path, from_tr
             diff_text.trim_end_matches('\n')
         )
     } else {
-        let stat = git_text(top, &["diff", "--stat", "--no-renames", from_tree, to_tree])
+        let stat = git_text(top, &["diff", "--stat", "-M", "-C", "-C", from_tree, to_tree])
             .unwrap_or_default();
         let excerpt: String = diff_text.chars().take(60_000).collect();
         format!(
@@ -1664,6 +1841,9 @@ pub fn compact_review_summary(doc: &Value) -> Value {
     for key in [
         "status",
         "verdict",
+        "scope",
+        "scopeFiles",
+        "syncSkip",
         "round",
         "reworkRounds",
         "model",
@@ -1821,6 +2001,443 @@ fn diff_tree_paths(top: &Path, from_tree: &str, to_tree: &str) -> Option<Vec<Str
             .map(str::to_string)
             .collect(),
     )
+}
+
+fn synthetic_commit_tree(top: &Path, tree: &str, parent: Option<&str>) -> Option<String> {
+    let mut cmd = git_command();
+    cmd.arg("-C").arg(top).arg("commit-tree").arg(tree);
+    if let Some(p) = parent {
+        cmd.args(["-p", p]);
+    }
+    cmd.args(["-m", "delegate-range-diff"]);
+    for who in ["AUTHOR", "COMMITTER"] {
+        cmd.env(format!("GIT_{who}_NAME"), "delegate")
+            .env(format!("GIT_{who}_EMAIL"), "delegate@localhost")
+            .env(format!("GIT_{who}_DATE"), "2020-01-01T00:00:00Z");
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+/// Deterministic Host check (zero LLM calls): returns `true` iff `git range-diff`
+/// between `<old_base>..<old_head>` and `<new_base>..<new_head>` has no patch differences.
+pub fn range_diff_is_empty(
+    top: &Path,
+    old_base: &str,
+    old_head: &str,
+    new_base: &str,
+    new_head: &str,
+) -> bool {
+    if !top.is_dir()
+        || old_base.is_empty()
+        || old_head.is_empty()
+        || new_base.is_empty()
+        || new_head.is_empty()
+    {
+        return false;
+    }
+    if old_base == old_head && new_base == new_head {
+        return true;
+    }
+    let Some(cb1) = synthetic_commit_tree(top, old_base, None) else {
+        return false;
+    };
+    let Some(ch1) = synthetic_commit_tree(top, old_head, Some(&cb1)) else {
+        return false;
+    };
+    let Some(cb2) = synthetic_commit_tree(top, new_base, None) else {
+        return false;
+    };
+    let Some(ch2) = synthetic_commit_tree(top, new_head, Some(&cb2)) else {
+        return false;
+    };
+    let Ok(out) = git_command()
+        .arg("-C")
+        .arg(top)
+        .args([
+            "range-diff",
+            "--no-color",
+            &format!("{cb1}..{ch1}"),
+            &format!("{cb2}..{ch2}"),
+        ])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut saw_equal = false;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Indented lines are diff hunks; `!`, `<`, `>` indicate changed/added/removed commits.
+        if line.starts_with(' ') || line.starts_with('\t') {
+            return false;
+        }
+        if line.contains(" ! ") || line.contains(" < ") || line.contains(" > ") {
+            return false;
+        }
+        if line.contains(" = ") {
+            saw_equal = true;
+        } else {
+            return false;
+        }
+    }
+    saw_equal
+}
+
+/// Deterministic Host check for `--sync=agent` conflict resolution:
+/// returns `true` iff `before_bytes` had conflict markers (`<<<<<<< ... ======= ... >>>>>>>`),
+/// `after_bytes` has NO remaining conflict markers, and EVERY non-conflict line segment outside
+/// the conflict blocks is preserved verbatim in `after_bytes` in the exact same order.
+pub fn conflict_resolution_only_touched_conflicts(
+    before_bytes: &[u8],
+    after_bytes: &[u8],
+) -> bool {
+    if !worktree::conflict_labels_in_bytes(Path::new("conflict.txt"), after_bytes).is_empty() {
+        return false;
+    }
+    let before = String::from_utf8_lossy(before_bytes);
+    let after = String::from_utf8_lossy(after_bytes);
+    let mut segments: Vec<Vec<&str>> = vec![Vec::new()];
+    let mut in_conflict = false;
+    let mut saw_divider = false;
+    let mut conflict_count = 0usize;
+    for line in before.lines() {
+        if !in_conflict {
+            if line.starts_with("<<<<<<< ") {
+                in_conflict = true;
+                saw_divider = false;
+            } else {
+                segments.last_mut().unwrap().push(line);
+            }
+        } else if line == "=======" {
+            saw_divider = true;
+        } else if line.starts_with(">>>>>>> ") && saw_divider {
+            in_conflict = false;
+            saw_divider = false;
+            conflict_count += 1;
+            segments.push(Vec::new());
+        }
+    }
+    if in_conflict || conflict_count == 0 {
+        return false;
+    }
+    let after_lines: Vec<&str> = after.lines().collect();
+    let first = &segments[0];
+    let last = segments.last().unwrap();
+    if after_lines.len() < first.len() + last.len() {
+        return false;
+    }
+    if &after_lines[..first.len()] != first.as_slice() {
+        return false;
+    }
+    let end_limit = after_lines.len() - last.len();
+    if &after_lines[end_limit..] != last.as_slice() {
+        return false;
+    }
+    let mut pos = first.len();
+    for seg in &segments[1..segments.len() - 1] {
+        if seg.is_empty() {
+            continue;
+        }
+        let Some(rel) = after_lines[pos..end_limit]
+            .windows(seg.len())
+            .position(|w| w == seg.as_slice())
+        else {
+            return false;
+        };
+        pos += rel + seg.len();
+    }
+    true
+}
+
+#[derive(Debug, Clone)]
+struct InheritedReviewState {
+    reviewed_tree: String,
+    reviewed_base_tree: String,
+    verdict: String,
+    verdict_file: Option<String>,
+    verdict_text: String,
+    continuation: Option<String>,
+    continuation_is_agy: bool,
+    agy_account: Option<String>,
+}
+
+/// Walk the `reply` ancestor chain (stopping at `newAfterApply`) to inherit the latest
+/// completed review's reviewed tree, baseline tree, verdict text, and reviewer session (P10).
+fn load_inherited_review(run: &Path, meta: &Value) -> Option<InheritedReviewState> {
+    if b(meta, "newAfterApply") {
+        return None;
+    }
+    let chain = crate::runs::chain_ancestors_to_run(run);
+    if chain.len() <= 1 {
+        return None;
+    }
+    for anc in chain[..chain.len() - 1].iter().rev() {
+        let anc_meta = json(anc.join("meta.json"));
+        let rev = {
+            let f = json(anc.join("review.json"));
+            if f.is_object() {
+                f
+            } else {
+                json(anc.join("summary.json"))["review"].clone()
+            }
+        };
+        let verdict = s(&rev, "verdict").to_string();
+        if rev.is_object() && matches!(verdict.as_str(), "PASS" | "REWORK" | "NEEDS_CONTROLLER") {
+            let is_sync_skip = b(&rev, "syncSkip") || s(&rev, "scope") == "sync_skip";
+            let upgraded = s(&rev, "upgradedBy");
+            let explicit_tree = s(&rev, "reviewedTree");
+            let has_no_executed_rounds = !is_sync_skip
+                && (n(&rev, "round") == 0
+                    || rev
+                        .get("rounds")
+                        .and_then(Value::as_array)
+                        .is_some_and(|a| a.is_empty()));
+            let is_unreviewed_error = matches!(
+                upgraded,
+                "rubricError" | "reviewerError" | "formatError" | "readOnlyViolation"
+            ) || b(&rev, "formatError");
+            if has_no_executed_rounds
+                || (explicit_tree.is_empty()
+                    && (b(&rev, "stoppedDuringRework") || is_unreviewed_error))
+            {
+                if b(&anc_meta, "newAfterApply") {
+                    break;
+                }
+                continue;
+            }
+            let anc_changes = json(anc.join("changes.json"));
+            let reviewed_tree = if !explicit_tree.is_empty() {
+                explicit_tree.to_string()
+            } else {
+                s(&anc_changes, "after").to_string()
+            };
+            if reviewed_tree.is_empty() {
+                if b(&anc_meta, "newAfterApply") {
+                    break;
+                }
+                continue;
+            }
+            let anc_top = {
+                let t = PathBuf::from(s(&anc_changes, "top"));
+                if t.is_dir() {
+                    t
+                } else {
+                    PathBuf::from(s(&anc_meta, "top"))
+                }
+            };
+            let reviewed_base_tree = {
+                let t = s(&rev, "reviewedBaseTree");
+                if !t.is_empty() {
+                    t.to_string()
+                } else if anc_top.is_dir() {
+                    worktree::effective_total_base(&anc_top, &anc_meta).0
+                } else {
+                    s(&anc_meta, "chainBase").to_string()
+                }
+            };
+            let verdict_file = {
+                let vf = s(&rev, "verdictFile");
+                if !vf.is_empty() && Path::new(vf).is_file() {
+                    Some(vf.to_string())
+                } else {
+                    let fallback = anc.join("review.md");
+                    fallback
+                        .is_file()
+                        .then(|| fallback.to_string_lossy().into_owned())
+                }
+            };
+            let verdict_text = verdict_file
+                .as_deref()
+                .map(read)
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| {
+                    let c = s(&rev, "conclusion");
+                    if !c.is_empty() {
+                        format!("{verdict}\n{c}")
+                    } else {
+                        verdict.clone()
+                    }
+                });
+            let mut continuation = {
+                let c = s(&rev, "reviewContinuation");
+                (!c.is_empty()).then(|| c.to_string())
+            };
+            let continuation_is_agy = rev["reviewContinuationIsAgy"]
+                .as_bool()
+                .unwrap_or_else(|| crate::agy::is_agy(s(&rev, "model")));
+            if continuation.is_none() {
+                let last_round = n(&rev, "round");
+                if last_round > 0 {
+                    let rdir = anc.join("review").join(format!("round-{last_round}"));
+                    let probe_meta = json!({
+                        "agent": if continuation_is_agy { "agy" } else { agents::AGENT },
+                        "model": rev["model"],
+                        "sessionDir": rdir.join("session"),
+                    });
+                    continuation = find_session_continuation(&rdir, &probe_meta);
+                }
+            }
+            let agy_account = {
+                let a = s(&anc_meta, "reviewAgyAccount");
+                if !a.is_empty() {
+                    Some(a.to_string())
+                } else {
+                    let ra = s(&rev, "agyAccount");
+                    (!ra.is_empty()).then(|| ra.to_string())
+                }
+            };
+            return Some(InheritedReviewState {
+                reviewed_tree,
+                reviewed_base_tree,
+                verdict,
+                verdict_file,
+                verdict_text,
+                continuation,
+                continuation_is_agy,
+                agy_account,
+            });
+        }
+        if b(&anc_meta, "newAfterApply") {
+            break;
+        }
+    }
+    None
+}
+
+/// Deterministic Host decision (zero LLM calls) for whether a child run is a pure sync round
+/// that may skip review and carry forward the parent's `PASS` (only after acceptance is all green).
+fn evaluate_pure_sync_round(
+    top: &Path,
+    run: &Path,
+    inherited: &InheritedReviewState,
+    before_tree: &str,
+    after_tree: &str,
+    new_base_tree: &str,
+    review_full: bool,
+) -> bool {
+    if review_full || inherited.verdict != "PASS" {
+        return false;
+    }
+    if !top.is_dir()
+        || inherited.reviewed_base_tree.is_empty()
+        || inherited.reviewed_tree.is_empty()
+        || new_base_tree.is_empty()
+        || after_tree.is_empty()
+    {
+        return false;
+    }
+    // Must actually be a baseline advance (sync).
+    if inherited.reviewed_base_tree == new_base_tree {
+        return false;
+    }
+    let Some(mainline_files) = diff_tree_paths(top, &inherited.reviewed_base_tree, new_base_tree)
+    else {
+        return false;
+    };
+    let Some(branch_files) =
+        diff_tree_paths(top, &inherited.reviewed_base_tree, &inherited.reviewed_tree)
+    else {
+        return false;
+    };
+    let mainline_set: BTreeSet<String> = mainline_files.into_iter().collect();
+    let branch_set: BTreeSet<String> = branch_files.into_iter().collect();
+    let overlap: BTreeSet<String> = mainline_set.intersection(&branch_set).cloned().collect();
+
+    let sync_doc = json(run.join("sync.json"));
+    let sync_conflicts: BTreeSet<String> = strings(&sync_doc["conflicts"]).into_iter().collect();
+
+    if sync_conflicts.is_empty() {
+        // Mainline and branch touched the same file (even if auto-merged cleanly) -> incremental review.
+        if !overlap.is_empty() {
+            return false;
+        }
+        return range_diff_is_empty(
+            top,
+            &inherited.reviewed_base_tree,
+            &inherited.reviewed_tree,
+            new_base_tree,
+            after_tree,
+        );
+    }
+
+    // Conflict resolution (`--sync=agent`):
+    // 1. Any non-conflict overlapping file still requires incremental review.
+    if overlap.iter().any(|p| !sync_conflicts.contains(p)) {
+        return false;
+    }
+    // 2. Author may only touch the conflicted files between post-sync `before_tree` and `after_tree`.
+    if before_tree.is_empty() {
+        return false;
+    }
+    let Some(author_changed) = diff_tree_paths(top, before_tree, after_tree) else {
+        return false;
+    };
+    if author_changed.iter().any(|p| !sync_conflicts.contains(p)) {
+        return false;
+    }
+    // 3. Inside every conflicted file, no non-conflict line may be modified.
+    for path in &sync_conflicts {
+        let Ok(before_bytes) = git(top, &["show", &format!("{before_tree}:{path}")]) else {
+            return false;
+        };
+        let Ok(after_bytes) = git(top, &["show", &format!("{after_tree}:{path}")]) else {
+            return false;
+        };
+        if !conflict_resolution_only_touched_conflicts(&before_bytes, &after_bytes) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Files introduced solely by a clean mainline baseline advance (touched in `old_base..new_base`,
+/// not touched by our branch `old_base..old_head`, and not touched by the author in `before..after`).
+/// Excluded from incremental sync-round diffs so unrelated mainline commits don't pollute review.
+fn pure_mainline_advance_paths(
+    top: &Path,
+    old_base: &str,
+    old_head: &str,
+    new_base: &str,
+    before_tree: &str,
+    after_tree: &str,
+) -> BTreeSet<String> {
+    if !top.is_dir()
+        || old_base.is_empty()
+        || new_base.is_empty()
+        || old_base == new_base
+        || old_head.is_empty()
+    {
+        return BTreeSet::new();
+    }
+    let Some(mainline) = diff_tree_paths(top, old_base, new_base) else {
+        return BTreeSet::new();
+    };
+    let branch: BTreeSet<String> = diff_tree_paths(top, old_base, old_head)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let author: BTreeSet<String> = if !before_tree.is_empty() && !after_tree.is_empty() {
+        diff_tree_paths(top, before_tree, after_tree)
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    mainline
+        .into_iter()
+        .filter(|p| !branch.contains(p) && !author.contains(p))
+        .collect()
 }
 
 fn check_controller_paths_when_review_off(
@@ -2284,12 +2901,44 @@ pub fn run_accept_and_review(
     };
 
     let task_brief = original_task_brief(run, meta);
+    let review_full = b(meta, "reviewFull");
+    let inherited_review = (!review_full)
+        .then(|| load_inherited_review(run, meta))
+        .flatten();
+    if let Some(acct) = inherited_review
+        .as_ref()
+        .and_then(|inh| inh.agy_account.as_deref())
+    {
+        if s(meta, "reviewAgyAccount").is_empty() {
+            meta["reviewAgyAccount"] = json!(acct);
+            let _ = write_json(run.join("meta.json"), meta);
+        }
+    }
+
     let review_started_at = iso();
     let mut rounds_history: Vec<Value> = Vec::new();
     let mut round: u64 = 1;
     let mut rework_rounds: u64 = 0;
-    let mut prev_reviewed_tree: Option<String> = None;
-    let mut prev_review_continuation: Option<String> = None;
+    let mut prev_reviewed_tree: Option<String> = inherited_review
+        .as_ref()
+        .map(|inh| inh.reviewed_tree.clone());
+    let mut last_valid_reviewed_tree: Option<String> = prev_reviewed_tree.clone();
+    let mut prev_reviewed_base: Option<String> = inherited_review
+        .as_ref()
+        .map(|inh| inh.reviewed_base_tree.clone());
+    let mut last_valid_verdict_file: Option<String> = inherited_review
+        .as_ref()
+        .and_then(|inh| inh.verdict_file.clone());
+    let mut prev_verdict_text: Option<String> = inherited_review
+        .as_ref()
+        .map(|inh| inh.verdict_text.clone())
+        .filter(|t| !t.trim().is_empty());
+    let mut prev_review_continuation: Option<String> = inherited_review
+        .as_ref()
+        .and_then(|inh| inh.continuation.clone());
+    let mut prev_continuation_is_agy: bool = inherited_review
+        .as_ref()
+        .is_some_and(|inh| inh.continuation_is_agy);
     let mut passed_layers: BTreeMap<String, Value> = BTreeMap::new();
     let mut rework_delta_files: Option<Vec<String>> = None;
     let mut active_review_cfg = review_cfg.clone();
@@ -2388,6 +3037,19 @@ pub fn run_accept_and_review(
                         "updatedAt": now,
                         "finishedAt": now,
                     });
+                    if let Some(tree) = &last_valid_reviewed_tree {
+                        final_doc["reviewedTree"] = json!(tree);
+                    }
+                    if let Some(base) = &prev_reviewed_base {
+                        final_doc["reviewedBaseTree"] = json!(base);
+                    }
+                    if let Some(vf) = &last_valid_verdict_file {
+                        final_doc["verdictFile"] = json!(vf);
+                    }
+                    if let Some(cont) = &prev_review_continuation {
+                        final_doc["reviewContinuation"] = json!(cont);
+                        final_doc["reviewContinuationIsAgy"] = json!(prev_continuation_is_agy);
+                    }
                     attach_review_model_fields(
                         &mut final_doc,
                         &active_review_cfg,
@@ -2400,15 +3062,164 @@ pub fn run_accept_and_review(
             }
         }
 
-        // Fast layers passed (or none configured). Prepare review round inputs.
+        // Fast layers passed (or none configured). Resolve trees & check pure sync-round skip.
+        let changes_doc = json(run.join("changes.json"));
+        let top = {
+            let t = PathBuf::from(s(&changes_doc, "top"));
+            if t.is_dir() {
+                t
+            } else {
+                PathBuf::from(s(meta, "top"))
+            }
+        };
+        let before_tree = s(&changes_doc, "base").to_string();
+        let after_tree = s(&changes_doc, "after").to_string();
+        let (current_total_base, _) = if top.is_dir() {
+            worktree::effective_total_base(&top, meta)
+        } else {
+            (s(meta, "chainBase").to_string(), "chain-base")
+        };
+
+        // Pure sync round (Host deterministic check, zero LLM calls):
+        // Run slow acceptance WITHOUT launching the reviewer; only pass straight through when
+        // acceptance is ALL GREEN.
+        let is_pure_sync = round == 1
+            && inherited_review.as_ref().is_some_and(|inh| {
+                evaluate_pure_sync_round(
+                    &top,
+                    run,
+                    inh,
+                    &before_tree,
+                    &after_tree,
+                    &current_total_base,
+                    review_full,
+                )
+            });
+        if is_pure_sync {
+            let slow_outcome = if !plan.slow.is_empty() {
+                Some(crate::accept::run_phase(
+                    meta,
+                    run,
+                    &plan.slow,
+                    fast_outcome.is_some(),
+                    holder.as_ref(),
+                    None,
+                    None,
+                ))
+            } else {
+                None
+            };
+            let (_, accept_after_snap) = crate::accept::snapshot_for_accept(meta, run);
+            let mut accept_doc = crate::accept::build_accept_summary(
+                meta,
+                run,
+                &plan,
+                fast_outcome.as_ref(),
+                slow_outcome.as_ref(),
+                false,
+                excluded,
+                accept_before_snap.as_ref(),
+                accept_after_snap.as_ref(),
+            );
+            let accept_ok = b(&accept_doc, "ok");
+            if b(&accept_doc, "infrastructureFailure") {
+                sum["infrastructureFailure"] = json!(true);
+                sum["error"] =
+                    json!("remote infrastructure failure; retry does not spend a rework round");
+            }
+            if !accept_ok {
+                apply_accept_failure_state(run, meta, &mut accept_doc, state, sum);
+                emit_accept_event(run, meta, &accept_doc);
+                sum["accept"] = accept_doc;
+                break;
+            }
+            emit_accept_event(run, meta, &accept_doc);
+            sum["accept"] = accept_doc;
+
+            let now = iso();
+            let inh = inherited_review.as_ref().unwrap();
+            let mut final_doc = json!({
+                "status": "done",
+                "verdict": "PASS",
+                "scope": "sync_skip",
+                "scopeFiles": 0,
+                "syncSkip": true,
+                "round": 0,
+                "reworkRounds": 0,
+                "rubric": rubric_source,
+                "reviewedTree": after_tree,
+                "reviewedBaseTree": current_total_base,
+                "conclusion": "同步轮，沿用上一轮审查 PASS",
+                "needsAttention": false,
+                "rounds": [],
+                "startedAt": review_started_at,
+                "updatedAt": now,
+                "finishedAt": now,
+            });
+            if let Some(vf) = &inh.verdict_file {
+                final_doc["verdictFile"] = json!(vf);
+            }
+            if let Some(cont) = &inh.continuation {
+                final_doc["reviewContinuation"] = json!(cont);
+                final_doc["reviewContinuationIsAgy"] = json!(inh.continuation_is_agy);
+            }
+            attach_review_model_fields(&mut final_doc, &active_review_cfg, active_fallback.as_ref());
+            write_json(run.join("review.json"), &final_doc)?;
+            sum["review"] = compact_review_summary(&final_doc);
+            events::emit(
+                &run_id,
+                &repo,
+                "review_verdict",
+                json!({
+                    "name": run_name,
+                    "round": 0,
+                    "verdict": "PASS",
+                    "scope": "sync_skip",
+                    "syncSkip": true,
+                    "reworkRounds": 0,
+                }),
+            );
+            *state = "delivered".into();
+            sum["state"] = json!("delivered");
+            break;
+        }
+
+        // Prepare review round inputs.
         let round_dir = review_root.join(format!("round-{round}"));
         fs::create_dir_all(&round_dir).map_err(|e| e.to_string())?;
         let round_started = iso();
-        let incremental = round > 1 && prev_reviewed_tree.is_some();
+        let incremental = !review_full && prev_reviewed_tree.is_some();
+        let review_scope = if incremental { "incremental" } else { "full" };
+
+        let (diff_from, diff_label) = if incremental {
+            (prev_reviewed_tree.clone().unwrap(), "incremental")
+        } else {
+            (current_total_base.clone(), "total")
+        };
+        let exclude_mainline = if incremental {
+            prev_reviewed_base.as_deref().map(|old_base| {
+                pure_mainline_advance_paths(
+                    &top,
+                    old_base,
+                    &diff_from,
+                    &current_total_base,
+                    &before_tree,
+                    &after_tree,
+                )
+            })
+        } else {
+            None
+        };
+        let (diff_text, scope_files) =
+            generate_reviewer_diff(&top, &diff_from, &after_tree, exclude_mainline.as_ref());
+        let diff_file = round_dir.join(format!("{diff_label}.diff"));
+        write(&diff_file, &diff_text)?;
 
         let mut live_review = json!({
             "status": "reviewing",
             "verdict": if rework_rounds > 0 { json!("REWORK") } else { Value::Null },
+            "scope": review_scope,
+            "scopeFiles": scope_files,
             "round": round,
             "reworkRounds": rework_rounds,
             "rubric": rubric_source,
@@ -2429,6 +3240,8 @@ pub fn run_accept_and_review(
                 "round": round,
                 "reworkRounds": rework_rounds,
                 "incremental": incremental,
+                "scope": review_scope,
+                "scopeFiles": scope_files,
                 "model": active_review_cfg["model"],
                 "modelName": active_review_cfg["modelName"],
                 "tier": active_review_cfg["tier"],
@@ -2436,44 +3249,7 @@ pub fn run_accept_and_review(
             }),
         );
 
-        let changes_doc = json(run.join("changes.json"));
-        let top = {
-            let t = PathBuf::from(s(&changes_doc, "top"));
-            if t.is_dir() {
-                t
-            } else {
-                PathBuf::from(s(meta, "top"))
-            }
-        };
-        let after_tree = s(&changes_doc, "after").to_string();
-        let (diff_from, diff_label) = if let Some(prev_tree) = prev_reviewed_tree.as_deref() {
-            (prev_tree.to_string(), "incremental")
-        } else {
-            let (total_base, _) = worktree::effective_total_base(&top, meta);
-            (total_base, "total")
-        };
-        let diff_text = if !top.is_dir() || diff_from.is_empty() || after_tree.is_empty() {
-            String::new()
-        } else {
-            git(
-                &top,
-                &[
-                    "diff",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "--no-renames",
-                    "--color=never",
-                    &diff_from,
-                    &after_tree,
-                ],
-            )
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-            .unwrap_or_default()
-        };
-        let diff_file = round_dir.join(format!("{diff_label}.diff"));
-        write(&diff_file, &diff_text)?;
-
-        let fork_target = if incremental {
+        let fork_target = if incremental && prev_continuation_is_agy == is_agy_reviewer {
             match prev_review_continuation.as_deref() {
                 Some(prev) => copy_pi_fork_if_needed(prev, &round_dir, is_agy_reviewer).ok(),
                 None => None,
@@ -2482,25 +3258,44 @@ pub fn run_accept_and_review(
             None
         };
         let diff_section = format_diff_for_prompt(&diff_text, &diff_file, &top, &diff_from, &after_tree);
+        let prev_verdict_section = prev_verdict_text
+            .as_deref()
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| format!("## 上一轮审查结论原文\n\n{}\n\n", t.trim()))
+            .unwrap_or_default();
+        let reply_turn_section = if round == 1
+            && inherited_review.is_some()
+            && !task_brief.trim().is_empty()
+        {
+            format!("## 任务说明\n\n{}\n\n", task_brief.trim())
+        } else {
+            String::new()
+        };
+        let incremental_rule = "上一轮已 PASS 的部分不重审，只核对本轮改动是否引入问题、是否修好上一轮指出的问题。";
         let prompt_body = if fork_target.is_some() {
+            let lead = if round > 1 {
+                format!("作者已完成第 {} 轮返工。下面是仅限本轮相对上一轮已审快照的增量 diff，请基于此前审查结论续审：", round - 1)
+            } else {
+                "本轮为上一轮审查之后的续做（reply）。下面是仅限本轮相对上一轮已审快照的增量 diff，请基于此前审查结论续审：".to_string()
+            };
             format!(
-                "作者已完成第 {} 轮返工。下面是仅限本轮返工的增量 diff，请基于此前审查结论续审：\n\
-                 - 核实上轮指出的问题是否全部真正修复，且未引入新回归或范围外改动。\n\
+                "{lead}\n\
+                 - {incremental_rule}\n\
                  - 第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`（无前缀、无 Markdown 修饰）。\n\
                  - 结论正文后附加 `## 主控重点看` 小节（`- [高|中|低] path:line — 理由`，无则写 `无`）。\n\n\
-                 ## 本轮增量 diff（第 {round} 轮审查）\n\n\
-                 {diff_section}\n",
-                round - 1
+                 {reply_turn_section}{prev_verdict_section}## 本轮增量 diff（第 {round} 轮审查）\n\n\
+                 {diff_section}\n"
             )
         } else if incremental {
             format!(
-                "请作为独立只读审查员进行第 {round} 轮续审（上轮审查会话不可续接，已提供完整上下文与本轮增量 diff）。\n\
+                "请作为独立只读审查员进行续审（上轮审查会话不可续接，已提供上下文、上一轮审查结论原文与本轮增量 diff）。\n\
+                 {incremental_rule}\n\
                  输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`。\n\n\
                  ## 审查要点（{rubric_source}）\n\n\
                  {}\n\n\
                  ## 任务说明\n\n\
                  {}\n\n\
-                 ## 本轮增量 diff\n\n\
+                 {prev_verdict_section}## 本轮增量 diff\n\n\
                  {diff_section}\n",
                 rubric_text.trim(),
                 task_brief.trim(),
@@ -2618,11 +3413,16 @@ pub fn run_accept_and_review(
                             ExtraQuotaDecision::Allow => {
                                 let extra_dir = round_dir.join("extra");
                                 fs::create_dir_all(&extra_dir).map_err(|e| e.to_string())?;
-                                let extra_diff_file = extra_dir.join("total.diff");
-                                write(&extra_diff_file, &total_diff_for_extra)?;
                                 let (total_base, _) = worktree::effective_total_base(&top, meta);
+                                let (extra_rev_diff, _) = if diff_label == "total" {
+                                    (diff_text.clone(), scope_files)
+                                } else {
+                                    generate_reviewer_diff(&top, &total_base, &after_tree, None)
+                                };
+                                let extra_diff_file = extra_dir.join("total.diff");
+                                write(&extra_diff_file, &extra_rev_diff)?;
                                 let extra_diff_sec = format_diff_for_prompt(
-                                    &total_diff_for_extra,
+                                    &extra_rev_diff,
                                     &extra_diff_file,
                                     &top,
                                     &total_base,
@@ -2858,13 +3658,14 @@ pub fn run_accept_and_review(
                     if fs::create_dir_all(&fallback_dir).is_ok() {
                         let fb_prompt_file = if fork_target.is_some() {
                             let fb_body = format!(
-                                "请作为独立只读审查员进行第 {round} 轮续审（已回退到备用审查模型，提供完整上下文与本轮增量 diff）。\n\
+                                "请作为独立只读审查员进行第 {round} 轮续审（已回退到备用审查模型，提供完整上下文、上一轮审查结论原文与本轮增量 diff）。\n\
+                                 {incremental_rule}\n\
                                  输出第一行必须且只能是 `PASS`、`REWORK` 或 `NEEDS_CONTROLLER`。\n\n\
                                  ## 审查要点（{rubric_source}）\n\n\
                                  {}\n\n\
                                  ## 任务说明\n\n\
                                  {}\n\n\
-                                 ## 本轮增量 diff\n\n\
+                                 {prev_verdict_section}## 本轮增量 diff\n\n\
                                  {diff_section}\n",
                                 rubric_text.trim(),
                                 task_brief.trim(),
@@ -3364,11 +4165,13 @@ pub fn run_accept_and_review(
 
         if let Some(cont) = rev_outcome.next_continuation {
             prev_review_continuation = Some(cont);
+            prev_continuation_is_agy = is_agy_reviewer;
         }
 
         // Write exact raw reviewer verdict file (never modified or paraphrased).
-        write(&rev_outcome.verdict_file, &rev_outcome.raw_answer)?;
-        let _ = write(run.join("review.md"), &rev_outcome.raw_answer);
+        let round_raw_answer = rev_outcome.raw_answer;
+        write(&rev_outcome.verdict_file, &round_raw_answer)?;
+        let _ = write(run.join("review.md"), &round_raw_answer);
 
         let mut verdict_str = rev_outcome.verdict_str;
         let mut upgraded_by = rev_outcome.upgraded_by;
@@ -3506,6 +4309,8 @@ pub fn run_accept_and_review(
         let mut round_entry = json!({
             "round": round,
             "verdict": verdict_str,
+            "scope": review_scope,
+            "scopeFiles": scope_files,
             "rawFirstLine": raw_first_line,
             "verdictFile": verdict_file.to_string_lossy(),
             "diffFile": rev_outcome.diff_file.to_string_lossy(),
@@ -3575,16 +4380,24 @@ pub fn run_accept_and_review(
             let mut final_doc = json!({
                 "status": "done",
                 "verdict": "PASS",
+                "scope": review_scope,
+                "scopeFiles": scope_files,
                 "round": round,
                 "reworkRounds": rework_rounds,
                 "rubric": rubric_source,
                 "verdictFile": verdict_file.to_string_lossy(),
+                "reviewedTree": after_tree,
+                "reviewedBaseTree": current_total_base,
                 "needsAttention": rework_rounds >= NEEDS_ATTENTION_REWORK_ROUND,
                 "rounds": rounds_history,
                 "startedAt": review_started_at,
                 "updatedAt": round_finished,
                 "finishedAt": round_finished,
             });
+            if let Some(cont) = &prev_review_continuation {
+                final_doc["reviewContinuation"] = json!(cont);
+                final_doc["reviewContinuationIsAgy"] = json!(prev_continuation_is_agy);
+            }
             attach_review_model_fields(&mut final_doc, &active_review_cfg, active_fallback.as_ref());
             if format_retried {
                 final_doc["formatRetried"] = json!(true);
@@ -3639,9 +4452,16 @@ pub fn run_accept_and_review(
             }
             events::emit(&run_id, &repo, "needs_attention", att_ev);
 
+            let round_review_valid = !format_error
+                && !matches!(
+                    upgraded_by.as_deref(),
+                    Some("reviewerError" | "formatError" | "rubricError" | "readOnlyViolation")
+                );
             let mut final_doc = json!({
                 "status": "done",
                 "verdict": "NEEDS_CONTROLLER",
+                "scope": review_scope,
+                "scopeFiles": scope_files,
                 "round": round,
                 "reworkRounds": rework_rounds,
                 "rubric": rubric_source,
@@ -3653,6 +4473,25 @@ pub fn run_accept_and_review(
                 "updatedAt": round_finished,
                 "finishedAt": round_finished,
             });
+            if round_review_valid {
+                if !after_tree.is_empty() {
+                    final_doc["reviewedTree"] = json!(after_tree);
+                }
+                if !current_total_base.is_empty() {
+                    final_doc["reviewedBaseTree"] = json!(current_total_base);
+                }
+            } else {
+                if let Some(tree) = &last_valid_reviewed_tree {
+                    final_doc["reviewedTree"] = json!(tree);
+                }
+                if let Some(base) = &prev_reviewed_base {
+                    final_doc["reviewedBaseTree"] = json!(base);
+                }
+            }
+            if let Some(cont) = &prev_review_continuation {
+                final_doc["reviewContinuation"] = json!(cont);
+                final_doc["reviewContinuationIsAgy"] = json!(prev_continuation_is_agy);
+            }
             attach_review_model_fields(&mut final_doc, &active_review_cfg, active_fallback.as_ref());
             if format_retried {
                 final_doc["formatRetried"] = json!(true);
@@ -3702,15 +4541,23 @@ pub fn run_accept_and_review(
         let mut reworking_doc = json!({
             "status": "reworking",
             "verdict": "REWORK",
+            "scope": review_scope,
+            "scopeFiles": scope_files,
             "round": round,
             "reworkRounds": rework_rounds,
             "rubric": rubric_source,
             "verdictFile": verdict_file.to_string_lossy(),
+            "reviewedTree": after_tree,
+            "reviewedBaseTree": current_total_base,
             "needsAttention": attention_now,
             "rounds": rounds_history,
             "startedAt": review_started_at,
             "updatedAt": iso(),
         });
+        if let Some(cont) = &prev_review_continuation {
+            reworking_doc["reviewContinuation"] = json!(cont);
+            reworking_doc["reviewContinuationIsAgy"] = json!(prev_continuation_is_agy);
+        }
         attach_review_model_fields(&mut reworking_doc, &active_review_cfg, active_fallback.as_ref());
         write_json(run.join("review.json"), &reworking_doc)?;
 
@@ -3744,7 +4591,17 @@ pub fn run_accept_and_review(
         }
 
         let prev_tree_for_delta = (!after_tree.is_empty()).then_some(after_tree.clone());
-        prev_reviewed_tree = prev_tree_for_delta.clone();
+        last_valid_reviewed_tree = prev_tree_for_delta.clone();
+        last_valid_verdict_file = Some(verdict_file.to_string_lossy().into_owned());
+        prev_reviewed_tree = if review_full {
+            None
+        } else {
+            prev_tree_for_delta.clone()
+        };
+        prev_reviewed_base = (!current_total_base.is_empty()).then_some(current_total_base.clone());
+        if !round_raw_answer.trim().is_empty() {
+            prev_verdict_text = Some(round_raw_answer);
+        }
 
         let Some(mut author_next) = supervise::continuation_with_file(meta, run, &verdict_file) else {
             let err = "author has no saved session to continue for rework";
@@ -3765,6 +4622,16 @@ pub fn run_accept_and_review(
                 "updatedAt": now,
                 "finishedAt": now,
             });
+            if let Some(tree) = &last_valid_reviewed_tree {
+                final_doc["reviewedTree"] = json!(tree);
+            }
+            if let Some(base) = &prev_reviewed_base {
+                final_doc["reviewedBaseTree"] = json!(base);
+            }
+            if let Some(cont) = &prev_review_continuation {
+                final_doc["reviewContinuation"] = json!(cont);
+                final_doc["reviewContinuationIsAgy"] = json!(prev_continuation_is_agy);
+            }
             attach_review_model_fields(&mut final_doc, &active_review_cfg, active_fallback.as_ref());
             write_json(run.join("review.json"), &final_doc)?;
             sum["review"] = compact_review_summary(&final_doc);
@@ -3880,6 +4747,16 @@ pub fn run_accept_and_review(
                 "updatedAt": now,
                 "finishedAt": now,
             });
+            if let Some(tree) = &last_valid_reviewed_tree {
+                final_doc["reviewedTree"] = json!(tree);
+            }
+            if let Some(base) = &prev_reviewed_base {
+                final_doc["reviewedBaseTree"] = json!(base);
+            }
+            if let Some(cont) = &prev_review_continuation {
+                final_doc["reviewContinuation"] = json!(cont);
+                final_doc["reviewContinuationIsAgy"] = json!(prev_continuation_is_agy);
+            }
             attach_review_model_fields(&mut final_doc, &active_review_cfg, active_fallback.as_ref());
             write_json(run.join("review.json"), &final_doc)?;
             new_sum["review"] = compact_review_summary(&final_doc);
@@ -4469,5 +5346,233 @@ mod tests {
         assert!(extra_verdict_disagrees("PASS", Some("NEEDS_CONTROLLER")));
         assert!(extra_verdict_disagrees("REWORK", Some("PASS")));
         assert!(!extra_verdict_disagrees("PASS", None));
+    }
+
+    #[test]
+    fn dir_copy_reviewer_diff_shows_only_modified_files() {
+        let tmp = std::env::temp_dir().join(format!(
+            "delegate-dir-copy-diff-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let _guard = CleanupDir(tmp.clone());
+        fs::create_dir_all(tmp.join("v1")).unwrap();
+        git(&tmp, &["init", "-q"]).unwrap();
+        git(&tmp, &["config", "user.name", "t"]).unwrap();
+        git(&tmp, &["config", "user.email", "t@t"]).unwrap();
+        for i in 0..4 {
+            write(
+                tmp.join(format!("v1/f{i}.txt")),
+                format!("line1\nline2\nline3\nline4\ncontent {i}\n"),
+            )
+            .unwrap();
+        }
+        git(&tmp, &["add", "."]).unwrap();
+        git(&tmp, &["commit", "-q", "-m", "init"]).unwrap();
+        let t1 = git_text(&tmp, &["rev-parse", "HEAD^{tree}"]).unwrap();
+
+        fs::create_dir_all(tmp.join("v2")).unwrap();
+        for i in 0..4 {
+            let mut body = format!("line1\nline2\nline3\nline4\ncontent {i}\n");
+            if i == 2 {
+                body.push_str("only-changed-line\n");
+            }
+            write(tmp.join(format!("v2/f{i}.txt")), body).unwrap();
+        }
+        git(&tmp, &["add", "."]).unwrap();
+        let t2 = git_text(&tmp, &["write-tree"]).unwrap();
+
+        let (diff, count) = generate_reviewer_diff(&tmp, &t1, &t2, None);
+        assert_eq!(count, 1, "expected only 1 modified file in diff:\n{diff}");
+        assert!(diff.contains("v2/f2.txt"), "{diff}");
+        assert!(diff.contains("+only-changed-line"), "{diff}");
+        assert!(!diff.contains("v2/f0.txt"), "identical copy should be omitted:\n{diff}");
+        assert!(!diff.contains("v2/f1.txt"), "identical copy should be omitted:\n{diff}");
+        assert!(!diff.contains("v2/f3.txt"), "identical copy should be omitted:\n{diff}");
+    }
+
+    #[test]
+    fn range_diff_is_empty_distinguishes_pure_sync_from_extra_edits() {
+        let tmp = std::env::temp_dir().join(format!(
+            "delegate-range-diff-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let _guard = CleanupDir(tmp.clone());
+        fs::create_dir_all(&tmp).unwrap();
+        git(&tmp, &["init", "-q"]).unwrap();
+        git(&tmp, &["config", "user.name", "t"]).unwrap();
+        git(&tmp, &["config", "user.email", "t@t"]).unwrap();
+        write(tmp.join("a.txt"), "a1\n").unwrap();
+        write(tmp.join("b.txt"), "b1\n").unwrap();
+        git(&tmp, &["add", "."]).unwrap();
+        git(&tmp, &["commit", "-q", "-m", "base1"]).unwrap();
+        let base1 = git_text(&tmp, &["rev-parse", "HEAD^{tree}"]).unwrap();
+
+        write(tmp.join("a.txt"), "a1\na2\n").unwrap();
+        git(&tmp, &["add", "."]).unwrap();
+        let head1 = git_text(&tmp, &["write-tree"]).unwrap();
+
+        write(tmp.join("a.txt"), "a1\n").unwrap();
+        write(tmp.join("b.txt"), "b1\nb2\n").unwrap();
+        git(&tmp, &["add", "."]).unwrap();
+        let base2 = git_text(&tmp, &["write-tree"]).unwrap();
+
+        write(tmp.join("a.txt"), "a1\na2\n").unwrap();
+        write(tmp.join("b.txt"), "b1\nb2\n").unwrap();
+        git(&tmp, &["add", "."]).unwrap();
+        let head2_clean = git_text(&tmp, &["write-tree"]).unwrap();
+
+        write(tmp.join("a.txt"), "a1\na2\na3\n").unwrap();
+        git(&tmp, &["add", "."]).unwrap();
+        let head2_extra = git_text(&tmp, &["write-tree"]).unwrap();
+
+        assert!(range_diff_is_empty(&tmp, &base1, &head1, &base2, &head2_clean));
+        assert!(!range_diff_is_empty(&tmp, &base1, &head1, &base2, &head2_extra));
+    }
+
+    #[test]
+    fn conflict_resolution_detects_non_conflict_line_edits() {
+        let before = b"header 1\nheader 2\n<<<<<<< worktree\nours\n=======\ntheirs\n>>>>>>> caller\nfooter 1\nfooter 2\n";
+        let resolved_only = b"header 1\nheader 2\nours + theirs\nfooter 1\nfooter 2\n";
+        let resolved_with_extra_footer = b"header 1\nheader 2\nours\nfooter 1\nfooter 2 tweaked\n";
+        let resolved_with_extra_header = b"header 0\nheader 1\nheader 2\nours\nfooter 1\nfooter 2\n";
+        let unresolved = b"header 1\nheader 2\n<<<<<<< worktree\nours\n=======\ntheirs\n>>>>>>> caller\nfooter 1\nfooter 2\n";
+
+        assert!(conflict_resolution_only_touched_conflicts(before, resolved_only));
+        assert!(!conflict_resolution_only_touched_conflicts(before, resolved_with_extra_footer));
+        assert!(!conflict_resolution_only_touched_conflicts(before, resolved_with_extra_header));
+        assert!(!conflict_resolution_only_touched_conflicts(before, unresolved));
+    }
+
+    #[test]
+    fn load_inherited_review_skips_unreviewed_ancestors_and_preserves_stopped_rework_tree() {
+        let tmp = std::env::temp_dir().join(format!(
+            "delegate-inherit-review-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let _guard = CleanupDir(tmp.clone());
+        let runs_dir = tmp.join("runs");
+        fs::create_dir_all(&runs_dir).unwrap();
+
+        let mk_run = |id: &str, parent: Option<&str>, after: &str, rev: Option<Value>| {
+            let d = runs_dir.join(id);
+            fs::create_dir_all(&d).unwrap();
+            let mut m = json!({"run": id, "dir": d, "chainBase": "base0"});
+            if let Some(p) = parent {
+                m["parent"] = json!(p);
+            }
+            write_json(d.join("meta.json"), &m).unwrap();
+            write_json(d.join("changes.json"), &json!({"after": after})).unwrap();
+            if let Some(r) = rev {
+                write_json(d.join("review.json"), &r).unwrap();
+            }
+            (d, m)
+        };
+
+        // 1. Unreviewed rubricError / reviewerError / review-off controllerReviewPaths -> returns None.
+        let (_, _) = mk_run(
+            "r-rubric",
+            None,
+            "tree-unreviewed-1",
+            Some(json!({
+                "verdict": "NEEDS_CONTROLLER",
+                "upgradedBy": "rubricError",
+                "round": 1,
+                "rounds": []
+            })),
+        );
+        let (_, _) = mk_run(
+            "r-off-cr",
+            Some("r-rubric"),
+            "tree-unreviewed-2",
+            Some(json!({
+                "verdict": "NEEDS_CONTROLLER",
+                "upgradedBy": "controllerReviewPaths",
+                "round": 0,
+                "rounds": []
+            })),
+        );
+        let (_, _) = mk_run(
+            "r-err",
+            Some("r-off-cr"),
+            "tree-unreviewed-3",
+            Some(json!({
+                "verdict": "NEEDS_CONTROLLER",
+                "upgradedBy": "reviewerError",
+                "round": 1,
+                "rounds": [{"round": 1, "verdict": "NEEDS_CONTROLLER"}]
+            })),
+        );
+        let (child1, child1_meta) = mk_run("r-child1", Some("r-err"), "tree-child1", None);
+        assert!(
+            load_inherited_review(&child1, &child1_meta).is_none(),
+            "unreviewed ancestors must not be inherited"
+        );
+
+        // 2. Valid PASS ancestor followed by reviewerError ancestor -> skips failed ancestor, inherits PASS tree!
+        let (_, _) = mk_run(
+            "r-pass",
+            None,
+            "tree-pass",
+            Some(json!({
+                "verdict": "PASS",
+                "round": 1,
+                "reviewedTree": "tree-pass",
+                "reviewedBaseTree": "base0",
+                "rounds": [{"round": 1, "verdict": "PASS"}]
+            })),
+        );
+        let (_, _) = mk_run(
+            "r-err-after-pass",
+            Some("r-pass"),
+            "tree-unreviewed-after-pass",
+            Some(json!({
+                "verdict": "NEEDS_CONTROLLER",
+                "upgradedBy": "reviewerError",
+                "round": 1,
+                "rounds": [{"round": 1, "verdict": "NEEDS_CONTROLLER"}]
+            })),
+        );
+        let (child2, child2_meta) = mk_run("r-child2", Some("r-err-after-pass"), "tree-child2", None);
+        let inh2 = load_inherited_review(&child2, &child2_meta).expect("should inherit r-pass");
+        assert_eq!(inh2.reviewed_tree, "tree-pass");
+
+        // 3. stoppedDuringRework with explicit reviewedTree T1 (changes.after is unreviewed T2) -> inherits T1!
+        let (_, _) = mk_run(
+            "r-stopped-rework",
+            None,
+            "tree-T2-unreviewed",
+            Some(json!({
+                "verdict": "REWORK",
+                "round": 1,
+                "stoppedDuringRework": true,
+                "reviewedTree": "tree-T1-reviewed",
+                "reviewedBaseTree": "base0",
+                "rounds": [{"round": 1, "verdict": "REWORK"}]
+            })),
+        );
+        let (child3, child3_meta) = mk_run("r-child3", Some("r-stopped-rework"), "tree-T3", None);
+        let inh3 = load_inherited_review(&child3, &child3_meta).expect("should inherit T1");
+        assert_eq!(inh3.reviewed_tree, "tree-T1-reviewed");
+
+        // 4. Legacy stoppedDuringRework without reviewedTree -> must NOT fall back to unreviewed changes.after!
+        let (_, _) = mk_run(
+            "r-legacy-stopped",
+            None,
+            "tree-T2-unreviewed",
+            Some(json!({
+                "verdict": "REWORK",
+                "round": 1,
+                "stoppedDuringRework": true,
+                "rounds": [{"round": 1, "verdict": "REWORK"}]
+            })),
+        );
+        let (child4, child4_meta) = mk_run("r-child4", Some("r-legacy-stopped"), "tree-T3", None);
+        assert!(
+            load_inherited_review(&child4, &child4_meta).is_none(),
+            "legacy stoppedDuringRework without reviewedTree must not fall back to changes.after"
+        );
     }
 }

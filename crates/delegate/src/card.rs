@@ -3432,6 +3432,9 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
             "verdictFile": rev_verdict_file,
         });
         for key in [
+            "scope",
+            "scopeFiles",
+            "syncSkip",
             "fallback",
             "formatError",
             "formatRetried",
@@ -3668,44 +3671,49 @@ pub fn render_card_human(card: &Value) -> String {
     let extra_disagreed = rev_extra.is_object() && b(rev_extra, "disagreed");
     let format_retry_failed =
         b(rev, "formatRetryFailed") || (b(rev, "formatError") && b(rev, "formatRetried"));
+    let sync_skip = b(rev, "syncSkip") || s(rev, "scope") == "sync_skip";
     let review_head = if b(rev, "enabled") {
-        let v = s(rev, "verdict");
-        let orig = s(rev, "originalVerdict");
-        let st = s(rev, "status");
-        let base = if st == "cancelled" {
-            format!("已取消（{}）", s(rev, "cancelledBy"))
-        } else if !v.is_empty() {
-            let up = s(rev, "upgradedBy");
-            let has_orig = !orig.is_empty() && orig != v;
-            let mut notes = Vec::new();
-            if has_orig {
-                notes.push(format!("原判 {orig}"));
-            }
-            if !up.is_empty() {
+        if sync_skip {
+            "同步轮，沿用上一轮审查 PASS".to_string()
+        } else {
+            let v = s(rev, "verdict");
+            let orig = s(rev, "originalVerdict");
+            let st = s(rev, "status");
+            let base = if st == "cancelled" {
+                format!("已取消（{}）", s(rev, "cancelledBy"))
+            } else if !v.is_empty() {
+                let up = s(rev, "upgradedBy");
+                let has_orig = !orig.is_empty() && orig != v;
+                let mut notes = Vec::new();
                 if has_orig {
-                    notes.push(format!("经 {up} 升级"));
-                } else {
-                    notes.push(up.to_string());
+                    notes.push(format!("原判 {orig}"));
                 }
-            }
-            if format_retry_failed {
-                notes.push("补问 1 次仍无结论".into());
-            }
-            if extra_disagreed {
-                notes.push("意见不一致".into());
-            }
-            if notes.is_empty() {
-                v.to_string()
+                if !up.is_empty() {
+                    if has_orig {
+                        notes.push(format!("经 {up} 升级"));
+                    } else {
+                        notes.push(up.to_string());
+                    }
+                }
+                if format_retry_failed {
+                    notes.push("补问 1 次仍无结论".into());
+                }
+                if extra_disagreed {
+                    notes.push("意见不一致".into());
+                }
+                if notes.is_empty() {
+                    v.to_string()
+                } else {
+                    format!("{v}（{}）", notes.join("，"))
+                }
             } else {
-                format!("{v}（{}）", notes.join("，"))
+                st.to_string()
+            };
+            if !rev_model_label.is_empty() {
+                format!("{base} · {rev_model_label}")
+            } else {
+                base
             }
-        } else {
-            st.to_string()
-        };
-        if !rev_model_label.is_empty() {
-            format!("{base} · {rev_model_label}")
-        } else {
-            base
         }
     } else {
         "未启用".into()
@@ -3904,7 +3912,11 @@ pub fn render_card_human(card: &Value) -> String {
         } else {
             ""
         };
-        out.push(format!("   {rev_label}：{v_prefix}{retry_note} — {concl_part}{vf_part}"));
+        if sync_skip {
+            out.push(format!("   审查员：同步轮，沿用上一轮审查 PASS{vf_part}"));
+        } else {
+            out.push(format!("   {rev_label}：{v_prefix}{retry_note} — {concl_part}{vf_part}"));
+        }
         if rev_extra.is_object() {
             let em = {
                 let n = s(rev_extra, "modelName");
@@ -3981,7 +3993,17 @@ pub fn render_card_human(card: &Value) -> String {
     out.push(String::new());
 
     // 3. 测试与验收
-    out.push("3. 测试与验收".into());
+    let review_scope_suffix = if b(rev, "enabled") {
+        match s(rev, "scope") {
+            "full" => "（审查范围：全量）".to_string(),
+            "incremental" => format!("（审查范围：增量（{} 个文件））", n(rev, "scopeFiles")),
+            "sync_skip" => "（审查范围：同步轮未审）".to_string(),
+            _ => String::new(),
+        }
+    } else {
+        String::new()
+    };
+    out.push(format!("3. 测试与验收{review_scope_suffix}"));
     let t = &card["tests"];
     out.push(format!(
         "   测试变化：新增 +{} / 修改 ~{} / 删除 -{}（涉及 {} 个测试文件）",
@@ -5039,5 +5061,57 @@ fn crossed_fn() {
         assert_eq!(test_fn_risks.len(), 1, "{test_fn_risks:?}");
         assert!(test_fn_risks[0].reason.contains("crossed_fn"));
         assert_eq!(test_fn_risks[0].severity, Severity::Medium);
+    }
+
+    #[test]
+    fn card_renders_review_scope_full_incremental_and_sync_skip() {
+        let mk = |review: Value| {
+            json!({
+                "run": "20261126-scope",
+                "name": "scope-demo",
+                "state": "delivered",
+                "files": [],
+                "stats": {"files": 1, "added": 3, "deleted": 1},
+                "author": {"lines": ["ok"], "path": "", "totalLines": 1, "totalChars": 2},
+                "tests": {"added": 0, "modified": 0, "deleted": 0, "testFiles": 0},
+                "accept": {"ok": true, "command": "true"},
+                "review": review,
+                "risks": [],
+                "riskStats": {"total": 0, "ruleHits": 0, "reviewerHints": 0},
+                "fastForward": {"status": "ready", "label": "可快进"},
+            })
+        };
+
+        let full_out = render_card_human(&mk(json!({
+            "enabled": true,
+            "status": "done",
+            "verdict": "PASS",
+            "scope": "full",
+            "scopeFiles": 4,
+            "modelName": "rev",
+        })));
+        assert!(full_out.contains("3. 测试与验收（审查范围：全量）"), "{full_out}");
+
+        let inc_out = render_card_human(&mk(json!({
+            "enabled": true,
+            "status": "done",
+            "verdict": "PASS",
+            "scope": "incremental",
+            "scopeFiles": 2,
+            "modelName": "rev",
+        })));
+        assert!(inc_out.contains("3. 测试与验收（审查范围：增量（2 个文件））"), "{inc_out}");
+
+        let sync_out = render_card_human(&mk(json!({
+            "enabled": true,
+            "status": "done",
+            "verdict": "PASS",
+            "scope": "sync_skip",
+            "scopeFiles": 0,
+            "syncSkip": true,
+            "modelName": "rev",
+        })));
+        assert!(sync_out.contains("同步轮，沿用上一轮审查 PASS"), "{sync_out}");
+        assert!(sync_out.contains("3. 测试与验收（审查范围：同步轮未审）"), "{sync_out}");
     }
 }
