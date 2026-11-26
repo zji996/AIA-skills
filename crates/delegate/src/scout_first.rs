@@ -2,8 +2,8 @@
 //! verbatim prose scout prompt & writer appendix templates, loose path/line scanning
 //! against the scout's own snapshot tree (with git blob SHA hashing), factual footnotes
 //! for missing or baseline-changed paths, natural-language scout question detection,
-//! lightweight brief detection, and `preEditSteps` counting.
-use crate::brief_check::{self, CheckReport, PathMention};
+//! and `preEditSteps` counting.
+use crate::brief_check::{self, PathMention};
 use crate::common::{git_command, s};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -22,8 +22,6 @@ pub const SCOUT_PROMPT_TEMPLATE: &str = "\
 {{brief}}";
 
 pub const WRITER_APPENDIX_HEADER: &str = "\n\n## 探路交接笔记\n以下是只读探路同事对现状的查证笔记（与上文任务说明冲突时以上文为准）：\n\n";
-
-pub const LIGHTWEIGHT_MAX_CHARS: usize = 2000;
 
 pub fn build_scout_prompt(raw_brief: &str) -> String {
     SCOUT_PROMPT_TEMPLATE.replace("{{brief}}", raw_brief)
@@ -49,16 +47,6 @@ pub fn build_writer_brief_with_end(
         out.push_str(&format!("\n\n## 主控对探路发现的答复\n\n{reply}"));
     }
     (out, map_end)
-}
-
-/// Lightweight write brief exemption:
-/// 1-3 repo-relative paths named in the brief, all existing, zero symbol hints, and <= 2000 chars.
-pub fn is_lightweight_brief(prompt: &str, report: &CheckReport) -> bool {
-    let n = report.paths.len();
-    (1..=3).contains(&n)
-        && report.missing_paths.is_empty()
-        && !report.has_symbol_hints
-        && prompt.chars().count() <= LIGHTWEIGHT_MAX_CHARS
 }
 
 /// Count tool invocations (`read`/`bash`/`tool`) before the first `edit`/`write` event.
@@ -928,33 +916,5 @@ mod tests {
             json!({"e":"write","path":"c.rs"}),
         ];
         assert_eq!(compute_pre_edit_steps(&evs), 3);
-    }
-
-    #[test]
-    fn lightweight_brief_checks_all_conditions() {
-        let ok = CheckReport {
-            paths: vec!["a.rs".into(), "b.rs".into()],
-            missing_paths: vec![],
-            has_symbol_hints: false,
-            diagnostics: vec![],
-        };
-        assert!(is_lightweight_brief("short brief", &ok));
-        assert!(!is_lightweight_brief(&"x".repeat(2001), &ok));
-
-        let mut no_paths = ok.clone();
-        no_paths.paths.clear();
-        assert!(!is_lightweight_brief("short", &no_paths));
-
-        let mut four_paths = ok.clone();
-        four_paths.paths = vec!["a.rs".into(), "b.rs".into(), "c.rs".into(), "d.rs".into()];
-        assert!(!is_lightweight_brief("short", &four_paths));
-
-        let mut missing = ok.clone();
-        missing.missing_paths = vec!["a.rs".into()];
-        assert!(!is_lightweight_brief("short", &missing));
-
-        let mut sym_hint = ok.clone();
-        sym_hint.has_symbol_hints = true;
-        assert!(!is_lightweight_brief("short", &sym_hint));
     }
 }

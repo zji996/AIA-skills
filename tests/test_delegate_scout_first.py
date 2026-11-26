@@ -13,7 +13,7 @@ Covers:
   an existing file) record concrete `dropReason` & `dropDetails` in meta, summary, card, and events
 - Natural-language scout question enters `scoutQuestion` (not rework) with reply hint; `delegate reply`
   launches fresh writer with controller answer appended and drift checked against updated baseline
-- Three exceptions (`--no-scout`, `.delegate.json` `"scoutFirst": false`, lightweight brief) + counter-cases
+- Explicit opt-outs (`--no-scout`, `.delegate.json` `"scoutFirst": false`) skip scout, while short/targeted write briefs still scout by default
 - Read-only / `--tier scout|review` / `reply` never scout
 - Fake `agy`: writer is a brand-new conversation (no `--conversation` continuing scout), `preEditSteps` counting
 - `delegate lines`: includes `scoutRun` tokens in write task's per-million-token metric
@@ -154,7 +154,7 @@ class DelegateScoutFirstTests(unittest.TestCase):
         repo = self._base_repo()
         subprocess.run(["git", "-C", repo, "config", "user.name", "Test"], check=True)
         subprocess.run(["git", "-C", repo, "config", "user.email", "test@example.com"], check=True)
-        # Brief has 0 explicit paths -> NOT lightweight -> triggers scout-first by default.
+        # Write tasks trigger scout-first by default.
         brief = "重构 alpha 与 beta 的实现并返回新值"
         res = self.cli("start", "--worktree", "--workdir", repo, "--accept", "true", brief)
         self.assertEqual(res.returncode, 0, res.stderr)
@@ -581,64 +581,21 @@ class DelegateScoutFirstTests(unittest.TestCase):
         self.assertNotIn("scoutRun", st1)
         self.assertEqual(self.cli("wait", st1["run"]).returncode, 0)
 
-        # 2. Lightweight brief (1-3 existing paths, no symbol hints, <= 2000 chars)
-        self.fake_pi([fixtures.answer("direct 2"), fixtures.SETTLED], pre='echo "// 2" >> src/alpha.rs')
+        # 2. Short, targeted brief (1-3 existing paths, no symbol hints, <= 2000 chars) STILL scouts by default
+        self.fake_pi(
+            [fixtures.answer(PROSE_MAP), fixtures.SETTLED],
+            [fixtures.answer("wrote 2"), fixtures.SETTLED],
+            pre='if [ -f "$DELEGATE_RUN_DIR/scout-map.md" ]; then echo "// 2" >> src/alpha.rs; fi',
+        )
         res = self.cli(
             "start", "--worktree", "--workdir", repo, "--accept", "true",
             "只改 `src/alpha.rs` 与 `src/beta.rs` 里的 `alpha_fn` 返回值",
         )
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("探路：跳过（极轻任务）", res.stderr)
+        self.assertIn("探路：先探路（", res.stderr)
         st2 = json.loads(res.stdout.splitlines()[0])
-        self.assertNotIn("scoutRun", st2)
+        self.assertTrue(st2.get("scoutRun"))
         self.assertEqual(self.cli("wait", st2["run"]).returncode, 0)
-
-        # Counter-case: > 3 paths (4 existing paths) is NOT lightweight -> must scout!
-        self.fake_pi(
-            [fixtures.answer(PROSE_MAP), fixtures.SETTLED],
-            [fixtures.answer("wrote 4"), fixtures.SETTLED],
-            pre='if [ -f "$DELEGATE_RUN_DIR/scout-map.md" ]; then echo "// 4" >> src/alpha.rs; fi',
-        )
-        res = self.cli(
-            "start", "--worktree", "--workdir", repo, "--accept", "true",
-            "同时改 `src/alpha.rs`、`src/beta.rs`、`src/gamma.rs`、`src/delta.rs`",
-        )
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("探路：先探路（", res.stderr)
-        st_4 = json.loads(res.stdout.splitlines()[0])
-        self.assertTrue(st_4.get("scoutRun"))
-        self.assertEqual(self.cli("wait", st_4["run"]).returncode, 0)
-
-        # Counter-case: symbol hint (missing symbol) is NOT lightweight -> must scout!
-        self.fake_pi(
-            [fixtures.answer(PROSE_MAP), fixtures.SETTLED],
-            [fixtures.answer("wrote sym"), fixtures.SETTLED],
-            pre='if [ -f "$DELEGATE_RUN_DIR/scout-map.md" ]; then echo "// s" >> src/alpha.rs; fi',
-        )
-        res = self.cli(
-            "start", "--worktree", "--workdir", repo, "--accept", "true",
-            "改 `src/alpha.rs` 里的 `nonexistent_sym_xyz`",
-        )
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("探路：先探路（", res.stderr)
-        st_sym = json.loads(res.stdout.splitlines()[0])
-        self.assertTrue(st_sym.get("scoutRun"))
-        self.assertEqual(self.cli("wait", st_sym["run"]).returncode, 0)
-
-        # Counter-case: > 2000 chars is NOT lightweight -> must scout!
-        self.fake_pi(
-            [fixtures.answer(PROSE_MAP), fixtures.SETTLED],
-            [fixtures.answer("wrote long"), fixtures.SETTLED],
-            pre='if [ -f "$DELEGATE_RUN_DIR/scout-map.md" ]; then echo "// l" >> src/alpha.rs; fi',
-        )
-        long_brief = "改 `src/alpha.rs` " + ("说明内容" * 520)
-        self.assertGreater(len(long_brief), 2000)
-        res = self.cli("start", "--worktree", "--workdir", repo, "--accept", "true", long_brief)
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("探路：先探路（", res.stderr)
-        st_long = json.loads(res.stdout.splitlines()[0])
-        self.assertTrue(st_long.get("scoutRun"))
-        self.assertEqual(self.cli("wait", st_long["run"]).returncode, 0)
 
         # 3. .delegate.json "scoutFirst": false
         Path(repo, ".delegate.json").write_text(json.dumps({"scoutFirst": False}), encoding="utf-8")

@@ -1754,21 +1754,10 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
         protected_paths_in_prompt(&prompt, repo.as_deref(), &o.protect, &o.allow)
     };
     note_prompt_protected_paths(&prompt_protected);
-    let run_brief_diag = !o.no_brief_check && crate::config::brief_check_enabled(&config.value);
-    let want_scout_check =
-        !o.read_only && !o.no_scout && crate::config::scout_first_enabled(&config.value);
-    let brief_report = if run_brief_diag || want_scout_check {
+    if !o.no_brief_check && crate::config::brief_check_enabled(&config.value) {
         let check_root = repo.as_deref().unwrap_or(&workdir);
-        let rep = crate::brief_check::check_detailed(&prompt, check_root);
-        if run_brief_diag {
-            for line in &rep.diagnostics {
-                eprintln!("{line}");
-            }
-        }
-        Some(rep)
-    } else {
-        None
-    };
+        crate::brief_check::run_and_report(&prompt, check_root);
+    }
     let capacities = crate::config::capacities(&config.value)?;
     if !config.ignored.is_empty() {
         eprintln!(
@@ -1942,11 +1931,6 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
             scout_echo = Some("探路：跳过（--no-scout）".to_string());
         } else if !crate::config::scout_first_enabled(&config.value) {
             scout_echo = Some("探路：跳过（scoutFirst: false）".to_string());
-        } else if brief_report
-            .as_ref()
-            .is_some_and(|r| crate::scout_first::is_lightweight_brief(&prompt, r))
-        {
-            scout_echo = Some("探路：跳过（极轻任务）".to_string());
         } else if let Some(top) = repo.as_deref() {
             match launch_scout_for_write(&o, &prompt, &workdir, top, &config) {
                 Ok(scout_dir) => {

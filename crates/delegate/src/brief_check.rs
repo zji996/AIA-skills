@@ -1047,25 +1047,13 @@ pub fn extract(prompt: &str) -> Extracted {
     Extracted { paths, symbols }
 }
 
-/// Structured result from static read-only brief preflight checks.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CheckReport {
-    pub paths: Vec<String>,
-    pub missing_paths: Vec<String>,
-    pub has_symbol_hints: bool,
-    pub diagnostics: Vec<String>,
-}
-
-/// Run static read-only brief checks in `repo_root` and return structured details + diagnostics.
-pub fn check_detailed(prompt: &str, repo_root: &Path) -> CheckReport {
+/// Run static read-only brief checks in `repo_root` and return diagnostic lines.
+pub fn check(prompt: &str, repo_root: &Path) -> Vec<String> {
     let extracted = extract(prompt);
     let mut lines = Vec::new();
-    let mut missing_paths = Vec::new();
-    let mut has_symbol_hints = false;
 
     for p in &extracted.paths {
         if !repo_root.join(p).exists() {
-            missing_paths.push(p.clone());
             lines.push(format!("brief: missing path {p}"));
         }
     }
@@ -1082,12 +1070,10 @@ pub fn check_detailed(prompt: &str, repo_root: &Path) -> CheckReport {
         match output {
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 lines.push("brief: rg not found; skipping symbol checks".to_string());
-                has_symbol_hints = true;
                 break;
             }
             Err(e) => {
                 lines.push(format!("brief: symbol {sym} search failed ({e}); skipping"));
-                has_symbol_hints = true;
             }
             Ok(out) => match out.status.code() {
                 Some(0) => {
@@ -1096,24 +1082,20 @@ pub fn check_detailed(prompt: &str, repo_root: &Path) -> CheckReport {
                         .filter(|l| !l.trim().is_empty())
                         .count();
                     if count == 0 {
-                        has_symbol_hints = true;
                         lines.push(format!("brief: symbol {sym} not found"));
                     } else if count >= wide_threshold {
-                        has_symbol_hints = true;
                         lines.push(format!(
                             "brief: symbol {sym} is referenced in {count} files (brief names {brief_paths})"
                         ));
                     }
                 }
                 Some(1) => {
-                    has_symbol_hints = true;
                     lines.push(format!("brief: symbol {sym} not found"));
                 }
                 other => {
                     let code = other
                         .map(|c| c.to_string())
                         .unwrap_or_else(|| "signal".to_string());
-                    has_symbol_hints = true;
                     lines.push(format!(
                         "brief: symbol {sym} search failed (rg exit {code}); skipping"
                     ));
@@ -1122,17 +1104,7 @@ pub fn check_detailed(prompt: &str, repo_root: &Path) -> CheckReport {
         }
     }
 
-    CheckReport {
-        paths: extracted.paths,
-        missing_paths,
-        has_symbol_hints,
-        diagnostics: lines,
-    }
-}
-
-/// Run static read-only brief checks in `repo_root` and return diagnostic lines.
-pub fn check(prompt: &str, repo_root: &Path) -> Vec<String> {
-    check_detailed(prompt, repo_root).diagnostics
+    lines
 }
 
 /// Run the static brief preflight check and print diagnostics to stderr only.
