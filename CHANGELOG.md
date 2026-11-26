@@ -5,6 +5,7 @@
 - `delegate`：取消写入任务按「轻任务」自动跳过探路的分支（移除 `is_lightweight_brief`），所有 `--worktree` 写入任务默认均先只读探路再派写手；保留 `--no-scout`、`.delegate.json` `"scoutFirst": false` 与 `DELEGATE_SCOUT_FIRST=0` 显式开关。
 - `delegate`：修复 `apply --commit` / `land` 在自动提交阶段失败时因 `.applied` 已写入而仍触发 `work::on_runs_applied` 自动关闭关联工作项（或提前推进 `dag_queue`）的问题，排除提交失败及后续未提交来源仓库的 run。
 - `delegate`：审查员系统段、审查提示与默认 rubric 明确说明验收由 Host 独立并行执行并汇总结果、无需运行验收或用 `ps`/`sleep` 等待写手或验收进程；审查员模式下的 `LoopDetector` 取消纯等待/轮询命令豁免并在触发重复轮询自检时终止当前循环、通过同会话尾部补问（`loop_stop_retry`）让审查员直接给出结论。
+- `delegate`：`reply --sync=agent` 遇到子模块指针（gitlink）冲突时默认取主干版本（含强制更新已初始化子模块检出与主干删除子模块）并在提示词与 stderr 告知同事核对；遇到 `.delegate.json` `generated.paths` 生成文件冲突时不写入冲突标记也不中断整轮，而是记录到 `sync.json` 独立字段并在提示词提示运行 `generated.command` 重新生成；其余未配置为生成物的二进制/结构冲突仍原子拒收。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
 
 ## delegate 6.53.0 - 2026-11-27

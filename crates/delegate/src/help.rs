@@ -75,7 +75,7 @@ const REPLY: &[(&str, &str)] = &[
     ("--timeout DURATION", "Optional limit for the attempt; no default. Stall guards remain active."),
     ("--fresh", "Start a new session with only this message; after apply, a new worktree starts from current HEAD."),
     ("--sync", "Force-merge the caller's later changes into the conversation worktree before replying; conflicts stop the reply (default auto-sync keeps the old baseline on conflict)."),
-    ("--sync=agent", "Hand text conflicts to the colleague to resolve first; remaining markers fail acceptance. Binary/structural conflicts still stop the reply."),
+    ("--sync=agent", "Hand text conflicts to the colleague to resolve first (remaining markers fail acceptance); gitlink conflicts default to mainline, generated-file conflicts prompt regeneration, and other binary/structural conflicts still stop the reply."),
     ("--no-sync", "Skip automatic baseline sync on reply and keep the worktree's existing baseline."),
     ("--review-full", "Force full net diff review for this reply instead of incremental review or sync-round skip."),
     ("--when-done", "Compatibility alias (default behavior for active runs): append to the running run's mailbox for turn-boundary delivery in the same session, falling back to a new round after settlement if the final turn is already closing. Visible in status/card/TUI; stop cancels pending appends. Cannot combine with --wait."),

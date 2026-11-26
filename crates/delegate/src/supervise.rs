@@ -1563,90 +1563,34 @@ fn prepare_run_in_supervisor(run: &Path, meta: &mut Value) -> Res<()> {
         let parent_meta = json(parent_dir.join("meta.json"));
         let report = worktree::sync_with_mode(&parent_dir, &parent_meta, mode)?;
         let prompt_path = run.join("prompt.md");
-        let mut prompt_text = read(&prompt_path);
-        let is_zh = prompt_text
-            .chars()
-            .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
-        let short_head = if !report.source_dirty && !report.base_head.is_empty() {
-            Some(&report.base_head[..report.base_head.len().min(7)])
-        } else {
-            None
-        };
-        if report.synced {
-            let notice = if let Some(short) = short_head {
-                format!(
-                    "delegate: 基线已同步到主干 {short}（同步 {} 个文件）",
-                    report.paths.len()
-                )
-            } else {
-                format!(
-                    "delegate: 基线已同步到当前源快照（同步 {} 个文件）",
-                    report.paths.len()
-                )
-            };
+        let prompt_text = read(&prompt_path);
+        let (notices, updated_prompt) = worktree::format_sync_feedback(mode, &report, &prompt_text);
+        for notice in notices {
             append_prepare_notice(run, &notice);
-            if mode == worktree::SyncMode::Auto {
-                let fact = match (is_zh, short_head) {
-                    (true, Some(short)) => format!(
-                        "基线已同步到主干 {short}（同步 {} 个文件）。",
-                        report.paths.len()
-                    ),
-                    (true, None) => format!(
-                        "基线已同步到当前源快照（同步 {} 个文件）。",
-                        report.paths.len()
-                    ),
-                    (false, Some(short)) => format!(
-                        "Baseline synced to main {short} ({} file(s) updated).",
-                        report.paths.len()
-                    ),
-                    (false, None) => format!(
-                        "Baseline synced to current source snapshot ({} file(s) updated).",
-                        report.paths.len()
-                    ),
-                };
-                prompt_text = format!("{}\n\n{fact}\n", prompt_text.trim_end());
-            } else if is_zh {
-                let base_note = short_head
-                    .map(|short| format!("；基线已同步到主干 {short}"))
-                    .unwrap_or_default();
-                prompt_text = format!(
-                    "{}\n\n主控在上一轮之后的改动已同步进工作目录：{}{base_note}\n",
-                    prompt_text.trim_end(),
-                    if report.paths.is_empty() {
-                        "（无）".to_string()
-                    } else {
-                        report.paths.join("、")
-                    }
-                );
+        }
+        if report.synced {
+            let prompt_with_nl = if updated_prompt.ends_with('\n') {
+                updated_prompt
             } else {
-                let base_note = short_head
-                    .map(|short| format!(" (baseline synced to main {short})"))
-                    .unwrap_or_default();
-                prompt_text = format!(
-                    "{}\n\nThe caller's changes since the previous round have been synced into the workdir: {}{base_note}\n",
-                    prompt_text.trim_end(),
-                    if report.paths.is_empty() {
-                        "(none)".to_string()
-                    } else {
-                        report.paths.join(", ")
-                    }
-                );
-            }
-            if !report.conflicts.is_empty() {
-                prompt_text = format!(
-                    "Resolve these sync conflicts FIRST before any other work: {}. Remove all conflict markers; acceptance fails while any remain.\n\n{}",
-                    report.conflicts.join(", "),
-                    prompt_text
-                );
-            }
-            write(&prompt_path, &prompt_text)?;
+                format!("{updated_prompt}\n")
+            };
+            write(&prompt_path, &prompt_with_nl)?;
 
-            let sync_doc = json!({
+            let mut sync_doc = json!({
                 "paths": report.paths,
                 "conflicts": report.conflicts,
                 "mode": mode_str,
                 "baseHead": report.base_head,
             });
+            if !report.gitlink_mainline.is_empty() {
+                sync_doc["gitlinkMainline"] = json!(report.gitlink_mainline);
+            }
+            if !report.regenerate_paths.is_empty() {
+                sync_doc["regeneratePaths"] = json!(report.regenerate_paths);
+                if !report.generate_command.is_empty() {
+                    sync_doc["generateCommand"] = json!(report.generate_command);
+                }
+            }
             write_json(run.join("sync.json"), &sync_doc)?;
             if !report.base_tree.is_empty() {
                 meta["chainBase"] = json!(report.base_tree);
@@ -1671,27 +1615,13 @@ fn prepare_run_in_supervisor(run: &Path, meta: &mut Value) -> Res<()> {
                     meta["netBaseTree"] = refreshed_parent["netBaseTree"].clone();
                 }
             }
-        } else if mode == worktree::SyncMode::Auto && !report.conflicts.is_empty() {
-            append_prepare_notice(
-                run,
-                &format!(
-                    "delegate: 主干改动与本链存在冲突，保持旧基线继续；重叠文件：{}（可用 --no-sync 跳过同步，或用 --sync=agent 写入冲突标记交同事解决）",
-                    report.conflicts.join("、")
-                ),
-            );
         } else if mode != worktree::SyncMode::Auto {
-            if is_zh {
-                prompt_text = format!(
-                    "{}\n\n主控在上一轮之后的改动已同步进工作目录：（无）\n",
-                    prompt_text.trim_end()
-                );
+            let prompt_with_nl = if updated_prompt.ends_with('\n') {
+                updated_prompt
             } else {
-                prompt_text = format!(
-                    "{}\n\nThe caller's changes since the previous round have been synced into the workdir: (none)\n",
-                    prompt_text.trim_end()
-                );
-            }
-            write(&prompt_path, &prompt_text)?;
+                format!("{updated_prompt}\n")
+            };
+            write(&prompt_path, &prompt_with_nl)?;
         }
         if let Some(obj) = meta.as_object_mut() {
             obj.remove("pendingSync");

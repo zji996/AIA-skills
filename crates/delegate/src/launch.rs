@@ -2369,96 +2369,11 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     };
     let mut prompt = prompt;
     if let Some((mode, report)) = &synced {
-        let is_zh = prompt
-            .chars()
-            .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
-        let short_head = if !report.source_dirty && !report.base_head.is_empty() {
-            Some(&report.base_head[..report.base_head.len().min(7)])
-        } else {
-            None
-        };
-        if report.synced {
-            if let Some(short) = short_head {
-                eprintln!(
-                    "delegate: 基线已同步到主干 {short}（同步 {} 个文件）",
-                    report.paths.len()
-                );
-            } else {
-                eprintln!(
-                    "delegate: 基线已同步到当前源快照（同步 {} 个文件）",
-                    report.paths.len()
-                );
-            }
-            if *mode == worktree::SyncMode::Auto {
-                let fact = match (is_zh, short_head) {
-                    (true, Some(short)) => {
-                        format!("基线已同步到主干 {short}（同步 {} 个文件）。", report.paths.len())
-                    }
-                    (true, None) => {
-                        format!("基线已同步到当前源快照（同步 {} 个文件）。", report.paths.len())
-                    }
-                    (false, Some(short)) => format!(
-                        "Baseline synced to main {short} ({} file(s) updated).",
-                        report.paths.len()
-                    ),
-                    (false, None) => format!(
-                        "Baseline synced to current source snapshot ({} file(s) updated).",
-                        report.paths.len()
-                    ),
-                };
-                prompt = format!("{}\n\n{fact}", prompt.trim_end());
-            } else if is_zh {
-                let base_note = short_head
-                    .map(|short| format!("；基线已同步到主干 {short}"))
-                    .unwrap_or_default();
-                prompt = format!(
-                    "{}\n\n主控在上一轮之后的改动已同步进工作目录：{}{base_note}",
-                    prompt.trim_end(),
-                    if report.paths.is_empty() {
-                        "（无）".to_string()
-                    } else {
-                        report.paths.join("、")
-                    }
-                );
-            } else {
-                let base_note = short_head
-                    .map(|short| format!(" (baseline synced to main {short})"))
-                    .unwrap_or_default();
-                prompt = format!(
-                    "{}\n\nThe caller's changes since the previous round have been synced into the workdir: {}{base_note}",
-                    prompt.trim_end(),
-                    if report.paths.is_empty() {
-                        "(none)".to_string()
-                    } else {
-                        report.paths.join(", ")
-                    }
-                );
-            }
-            if !report.conflicts.is_empty() {
-                prompt = format!(
-                    "Resolve these sync conflicts FIRST before any other work: {}. Remove all conflict markers; acceptance fails while any remain.\n\n{}",
-                    report.conflicts.join(", "),
-                    prompt
-                );
-            }
-        } else if *mode == worktree::SyncMode::Auto && !report.conflicts.is_empty() {
-            eprintln!(
-                "delegate: 主干改动与本链存在冲突，保持旧基线继续；重叠文件：{}（可用 --no-sync 跳过同步，或用 --sync=agent 写入冲突标记交同事解决）",
-                report.conflicts.join("、")
-            );
-        } else if *mode != worktree::SyncMode::Auto {
-            if is_zh {
-                prompt = format!(
-                    "{}\n\n主控在上一轮之后的改动已同步进工作目录：（无）",
-                    prompt.trim_end()
-                );
-            } else {
-                prompt = format!(
-                    "{}\n\nThe caller's changes since the previous round have been synced into the workdir: (none)",
-                    prompt.trim_end()
-                );
-            }
+        let (notices, updated_prompt) = worktree::format_sync_feedback(*mode, report, &prompt);
+        for notice in notices {
+            eprintln!("{notice}");
         }
+        prompt = updated_prompt;
     }
     // A conversation continues only on the colleague that holds it (Pi or agy).
     let session = match session {
@@ -2698,12 +2613,22 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
                 "commit": report.base_commit,
                 "dirty": report.source_dirty,
             });
-            extra["sync"] = json!({
+            let mut sync_doc = json!({
                 "files": report.paths,
                 "conflicts": report.conflicts,
                 "agent": o.sync_agent,
                 "auto": mode == worktree::SyncMode::Auto,
             });
+            if !report.gitlink_mainline.is_empty() {
+                sync_doc["gitlinkMainline"] = json!(report.gitlink_mainline);
+            }
+            if !report.regenerate_paths.is_empty() {
+                sync_doc["regeneratePaths"] = json!(report.regenerate_paths);
+                if !report.generate_command.is_empty() {
+                    sync_doc["generateCommand"] = json!(report.generate_command);
+                }
+            }
+            extra["sync"] = sync_doc;
         } else if mode != worktree::SyncMode::Auto {
             extra["sync"] = json!({
                 "files": report.paths,

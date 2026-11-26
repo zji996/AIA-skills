@@ -1787,7 +1787,7 @@ pub enum SyncMode {
     Auto,
     /// Explicit `--sync`: fail with an error on any conflict.
     Strict,
-    /// Explicit `--sync=agent`: write text conflict markers for the agent; fail on non-text conflict.
+    /// Explicit `--sync=agent`: write text conflict markers for the agent; take mainline on gitlink conflicts, defer generated-file conflicts for regeneration, and fail on other non-text conflicts.
     Agent,
 }
 
@@ -1795,10 +1795,173 @@ pub struct SyncReport {
     pub synced: bool,
     pub paths: Vec<String>,
     pub conflicts: Vec<String>,
+    pub gitlink_mainline: Vec<String>,
+    pub regenerate_paths: Vec<String>,
+    pub generate_command: String,
     pub base_tree: String,
     pub base_head: String,
     pub base_commit: Option<String>,
     pub source_dirty: bool,
+}
+
+pub fn format_sync_feedback(
+    mode: SyncMode,
+    report: &SyncReport,
+    prompt: &str,
+) -> (Vec<String>, String) {
+    let mut notices = vec![];
+    let mut out = prompt.to_string();
+    let is_zh = prompt
+        .chars()
+        .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+    let short_head = if !report.source_dirty && !report.base_head.is_empty() {
+        Some(&report.base_head[..report.base_head.len().min(7)])
+    } else {
+        None
+    };
+    if report.synced {
+        if let Some(short) = short_head {
+            notices.push(format!(
+                "delegate: 基线已同步到主干 {short}（同步 {} 个文件）",
+                report.paths.len()
+            ));
+        } else {
+            notices.push(format!(
+                "delegate: 基线已同步到当前源快照（同步 {} 个文件）",
+                report.paths.len()
+            ));
+        }
+        if !report.gitlink_mainline.is_empty() {
+            notices.push(format!(
+                "delegate: 子模块指针冲突已默认取主干：{}",
+                report.gitlink_mainline.join("、")
+            ));
+        }
+        if !report.regenerate_paths.is_empty() {
+            if !report.generate_command.is_empty() {
+                notices.push(format!(
+                    "delegate: 生成文件冲突未合并，已提示同事运行 `{}` 重新生成：{}",
+                    report.generate_command,
+                    report.regenerate_paths.join("、")
+                ));
+            } else {
+                notices.push(format!(
+                    "delegate: 生成文件冲突未合并，已提示同事重新生成：{}",
+                    report.regenerate_paths.join("、")
+                ));
+            }
+        }
+        if mode == SyncMode::Auto {
+            let fact = match (is_zh, short_head) {
+                (true, Some(short)) => {
+                    format!("基线已同步到主干 {short}（同步 {} 个文件）。", report.paths.len())
+                }
+                (true, None) => {
+                    format!("基线已同步到当前源快照（同步 {} 个文件）。", report.paths.len())
+                }
+                (false, Some(short)) => format!(
+                    "Baseline synced to main {short} ({} file(s) updated).",
+                    report.paths.len()
+                ),
+                (false, None) => format!(
+                    "Baseline synced to current source snapshot ({} file(s) updated).",
+                    report.paths.len()
+                ),
+            };
+            out = format!("{}\n\n{fact}", out.trim_end());
+        } else if is_zh {
+            let base_note = short_head
+                .map(|short| format!("；基线已同步到主干 {short}"))
+                .unwrap_or_default();
+            out = format!(
+                "{}\n\n主控在上一轮之后的改动已同步进工作目录：{}{base_note}",
+                out.trim_end(),
+                if report.paths.is_empty() {
+                    "（无）".to_string()
+                } else {
+                    report.paths.join("、")
+                }
+            );
+        } else {
+            let base_note = short_head
+                .map(|short| format!(" (baseline synced to main {short})"))
+                .unwrap_or_default();
+            out = format!(
+                "{}\n\nThe caller's changes since the previous round have been synced into the workdir: {}{base_note}",
+                out.trim_end(),
+                if report.paths.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    report.paths.join(", ")
+                }
+            );
+        }
+        let mut banners = vec![];
+        if !report.conflicts.is_empty() {
+            banners.push(format!(
+                "Resolve these sync conflicts FIRST before any other work: {}. Remove all conflict markers; acceptance fails while any remain.",
+                report.conflicts.join(", ")
+            ));
+        }
+        if !report.regenerate_paths.is_empty() {
+            let banner = match (is_zh, report.generate_command.is_empty()) {
+                (true, false) => format!(
+                    "以下生成文件在同步时存在冲突，未自动合并也未写入冲突标记，请勿手改，先运行 `{}` 重新生成：{}。",
+                    report.generate_command,
+                    report.regenerate_paths.join("、")
+                ),
+                (true, true) => format!(
+                    "以下生成文件在同步时存在冲突，未自动合并也未写入冲突标记，请勿手改，请按项目方式重新生成：{}。",
+                    report.regenerate_paths.join("、")
+                ),
+                (false, false) => format!(
+                    "Regenerate these conflicted generated files (not auto-merged, no conflict markers written; do not hand-edit) by running `{}`: {}.",
+                    report.generate_command,
+                    report.regenerate_paths.join(", ")
+                ),
+                (false, true) => format!(
+                    "Regenerate these conflicted generated files using the project's generator (not auto-merged, no conflict markers written; do not hand-edit): {}.",
+                    report.regenerate_paths.join(", ")
+                ),
+            };
+            banners.push(banner);
+        }
+        if !report.gitlink_mainline.is_empty() {
+            let banner = if is_zh {
+                format!(
+                    "以下子模块指针（gitlink）在同步时存在冲突，已默认取主干版本，如需调整请自行核对：{}。",
+                    report.gitlink_mainline.join("、")
+                )
+            } else {
+                format!(
+                    "Submodule pointer (gitlink) conflicts defaulted to mainline; verify if your task needs changes: {}.",
+                    report.gitlink_mainline.join(", ")
+                )
+            };
+            banners.push(banner);
+        }
+        if !banners.is_empty() {
+            out = format!("{}\n\n{}", banners.join("\n"), out);
+        }
+    } else if mode == SyncMode::Auto && !report.conflicts.is_empty() {
+        notices.push(format!(
+            "delegate: 主干改动与本链存在冲突，保持旧基线继续；重叠文件：{}（可用 --no-sync 跳过同步，或用 --sync=agent 写入冲突标记交同事解决）",
+            report.conflicts.join("、")
+        ));
+    } else if mode != SyncMode::Auto {
+        if is_zh {
+            out = format!(
+                "{}\n\n主控在上一轮之后的改动已同步进工作目录：（无）",
+                out.trim_end()
+            );
+        } else {
+            out = format!(
+                "{}\n\nThe caller's changes since the previous round have been synced into the workdir: (none)",
+                out.trim_end()
+            );
+        }
+    }
+    (notices, out)
 }
 
 fn replay_commits_onto_base(
@@ -2055,20 +2218,32 @@ fn sync_with_mode_inner(
             synced: false,
             paths: vec![],
             conflicts: vec![],
+            gitlink_mainline: vec![],
+            regenerate_paths: vec![],
+            generate_command: String::new(),
             base_tree: s(&current_source, "tree").to_string(),
             base_head: source_head,
             base_commit: None,
             source_dirty,
         });
     }
+    let (generated_paths, generate_command) = if agent {
+        generated(&source)?
+    } else {
+        (vec![], String::new())
+    };
     let mut actions = vec![];
     let mut conflicts = vec![];
     let mut conflict_reasons = std::collections::BTreeMap::<String, String>::new();
-    let mut gitlink_updates: Vec<(String, String, bool)> = vec![];
+    let mut gitlink_updates: Vec<(String, String, bool, bool)> = vec![];
+    let mut gitlink_removals: Vec<String> = vec![];
+    let mut gitlink_mainline: Vec<String> = vec![];
+    let mut regenerate_paths: Vec<String> = vec![];
     let mut paths = vec![];
     for change in changes {
         let path = s(&change, "path").to_string();
         let target = worktree.join(&path);
+        let is_generated = agent && matches_rule(&path, &generated_paths);
         // Auto-sync never pulls unresolved conflict markers from the source workspace into a worktree.
         if mode == SyncMode::Auto && !conflict_labels(&source.join(&path)).is_empty() {
             conflicts.push(path);
@@ -2080,11 +2255,43 @@ fn sync_with_mode_inner(
             if base_gitlink == source_gitlink {
                 continue;
             }
+            let wt_non_gitlink = if through_symlink(&worktree, &target) {
+                true
+            } else {
+                match fs::symlink_metadata(&target) {
+                    Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_dir() => true,
+                    Ok(_) if target.join(".git").exists() => false,
+                    Ok(_) => fs::read_dir(&target)
+                        .map_err(|e| format!("{}: {e}", target.display()))?
+                        .next()
+                        .transpose()
+                        .map_err(|e| format!("{}: {e}", target.display()))?
+                        .is_some(),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(e) => return Err(format!("{}: {e}", target.display())),
+                }
+            };
+            if wt_non_gitlink {
+                conflicts.push(path);
+                continue;
+            }
+            let wt_changed = worktree_changed_gitlink(&worktree, &path, base_gitlink.as_deref())?;
             let Some(target_oid) = source_gitlink else {
+                let source_has_entry = !git(
+                    &source,
+                    &["ls-tree", "-z", s(&current_source, "tree"), "--", &path],
+                )?
+                .is_empty();
+                if agent && !source_has_entry {
+                    paths.push(path.clone());
+                    gitlink_removals.push(path.clone());
+                    gitlink_mainline.push(path);
+                    continue;
+                }
                 conflicts.push(path);
                 continue;
             };
-            if worktree_changed_gitlink(&worktree, &path, base_gitlink.as_deref())? {
+            if wt_changed && !agent {
                 conflicts.push(path);
                 continue;
             }
@@ -2099,11 +2306,18 @@ fn sync_with_mode_inner(
                 }
             }
             paths.push(path.clone());
-            gitlink_updates.push((path, target_oid, initialized));
+            gitlink_updates.push((path.clone(), target_oid, initialized, wt_changed && agent));
+            if wt_changed && agent {
+                gitlink_mainline.push(path);
+            }
             continue;
         }
         if through_symlink(&worktree, &target) || entry_mode(&target).as_deref() == Some("dir") {
-            conflicts.push(path);
+            if is_generated {
+                regenerate_paths.push(path);
+            } else {
+                conflicts.push(path);
+            }
             continue;
         }
         if b(&change, "large") {
@@ -2113,7 +2327,11 @@ fn sync_with_mode_inner(
                 continue;
             }
             if baseline["large"].get(&path).is_some() || target.exists() || target.is_symlink() {
-                conflicts.push(path);
+                if is_generated {
+                    regenerate_paths.push(path);
+                } else {
+                    conflicts.push(path);
+                }
             } else if let Some(content) = content {
                 paths.push(path.clone());
                 actions.push(Action {
@@ -2123,6 +2341,8 @@ fn sync_with_mode_inner(
                     mode: entry_mode(&origin),
                     content,
                 });
+            } else if is_generated {
+                regenerate_paths.push(path);
             } else {
                 conflicts.push(path);
             }
@@ -2137,7 +2357,11 @@ fn sync_with_mode_inner(
                 .is_none_or(|v| ["100644", "100755", "120000"].contains(&v))
         };
         if !valid(&old_mode) || !valid(&mode_str) {
-            conflicts.push(path);
+            if is_generated {
+                regenerate_paths.push(path);
+            } else {
+                conflicts.push(path);
+            }
         } else if now == new && now_mode == mode_str {
             continue;
         } else if now == old && (now_mode == old_mode || now_mode == mode_str) {
@@ -2149,6 +2373,8 @@ fn sync_with_mode_inner(
                 mode: mode_str,
                 content: new.unwrap_or_default(),
             });
+        } else if is_generated {
+            regenerate_paths.push(path);
         } else if agent || (old.is_some() && new.is_some() && now.is_some()) {
             let base = old.as_deref().unwrap_or_default();
             let theirs = new.as_deref().unwrap_or_default();
@@ -2225,6 +2451,9 @@ fn sync_with_mode_inner(
                     synced: false,
                     paths: vec![],
                     conflicts,
+                    gitlink_mainline: vec![],
+                    regenerate_paths: vec![],
+                    generate_command: String::new(),
                     base_tree: s(&current_source, "tree").to_string(),
                     base_head: source_head,
                     base_commit: None,
@@ -2235,8 +2464,8 @@ fn sync_with_mode_inner(
                 return Err(format!("--sync conflict in: {}", format_conflicts()));
             }
             SyncMode::Agent => {
-                // Binary, symlink, gitlink and structural conflicts cannot safely be represented
-                // by text markers. Fail atomically rather than silently dropping caller changes.
+                // Binary, symlink and structural conflicts (outside gitlink/generated) cannot safely
+                // be represented by text markers. Fail atomically rather than silently dropping changes.
                 if conflicts.iter().any(|p| !paths.contains(p)) {
                     return Err(format!("--sync conflict in: {}", format_conflicts()));
                 }
@@ -2291,6 +2520,9 @@ fn sync_with_mode_inner(
                             synced: false,
                             paths: vec![],
                             conflicts: paths,
+                            gitlink_mainline: vec![],
+                            regenerate_paths: vec![],
+                            generate_command: String::new(),
                             base_tree: s(&current_source, "tree").to_string(),
                             base_head: source_head,
                             base_commit: None,
@@ -2319,8 +2551,26 @@ fn sync_with_mode_inner(
         // Mixed reset updates HEAD and index without touching working-tree files or `target/`.
         let _ = git(&worktree, &["reset", "--mixed", "-q", head]);
     }
-    for (path, target_oid, initialized) in &gitlink_updates {
-        if new_wt_head.is_none() {
+    for path in &gitlink_removals {
+        git(
+            &worktree,
+            &["rm", "-rf", "--cached", "--ignore-unmatch", "--", path],
+        )?;
+        let target = worktree.join(path);
+        match fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_dir() => {
+                fs::remove_dir_all(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+            }
+            Ok(_) => {
+                fs::remove_file(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{}: {e}", target.display())),
+        }
+        remove_empty_parents(&target, &worktree);
+    }
+    for (path, target_oid, initialized, force) in &gitlink_updates {
+        if new_wt_head.is_none() || *force {
             git(
                 &worktree,
                 &[
@@ -2331,18 +2581,22 @@ fn sync_with_mode_inner(
             )?;
         }
         if *initialized {
+            let mut args = vec![
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--no-fetch",
+            ];
+            if *force {
+                args.push("--force");
+            }
+            args.push("--");
+            args.push(path);
             let out = git_command()
                 .arg("-C")
                 .arg(&worktree)
-                .args([
-                    "-c",
-                    "protocol.file.allow=always",
-                    "submodule",
-                    "update",
-                    "--no-fetch",
-                    "--",
-                    path,
-                ])
+                .args(&args)
                 .output()
                 .map_err(|e| e.to_string())?;
             if !out.status.success() {
@@ -2357,6 +2611,9 @@ fn sync_with_mode_inner(
                         synced: false,
                         paths: vec![],
                         conflicts: vec![path.clone()],
+                        gitlink_mainline: vec![],
+                        regenerate_paths: vec![],
+                        generate_command: String::new(),
                         base_tree: s(&current_source, "tree").to_string(),
                         base_head: source_head,
                         base_commit: None,
@@ -2400,6 +2657,9 @@ fn sync_with_mode_inner(
         synced: true,
         paths,
         conflicts,
+        gitlink_mainline,
+        regenerate_paths,
+        generate_command,
         base_tree: s(&current_source, "tree").to_string(),
         base_head: source_head,
         base_commit: synced_base_commit,

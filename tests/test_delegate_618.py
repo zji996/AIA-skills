@@ -2,6 +2,7 @@
 import json
 import shlex
 import shutil
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -309,3 +310,262 @@ class Delegate618Tests(unittest.TestCase):
         res_human = self.cli("clean", "--rescan-archive", human=True)
         self.assertEqual(res_human.returncode, 0, res_human.stdout + res_human.stderr)
         self.assertIn("archive rescan: 1 份", res_human.stdout)
+
+    def _add_submodule(self, repo, name="vendor", sub_dir_name="sub_lib"):
+        sub = self.work / sub_dir_name
+        git_cfg = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always"]
+        subprocess.run(["git", "init", "-q", str(sub)], check=True)
+        (sub / "lib.txt").write_text("v1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(sub), *git_cfg, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(sub), *git_cfg, "commit", "-qm", "v1"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), *git_cfg, "submodule", "add", "-q", sub.as_uri(), name],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "-C", str(repo), *git_cfg, "commit", "-qm", f"add {name}"], check=True)
+        return git_cfg
+
+    def test_sync_agent_gitlink_conflict_takes_mainline_and_notifies(self):
+        repo = self.repo({"a.txt": "base\n"})
+        git_cfg = self._add_submodule(repo, "vendor", "sub_sync_agent_gl")
+        state = self.run_tree(
+            repo,
+            (
+                "git -c protocol.file.allow=always submodule update --init -q vendor && "
+                "echo v2-wt > vendor/lib.txt && "
+                "git -C vendor add lib.txt && "
+                "git -C vendor -c user.name=t -c user.email=t@t commit -qm v2-wt && "
+                "git add vendor && "
+                "git -c user.name=t -c user.email=t@t commit -qm 'wt bump vendor' && "
+                "echo dirty-wt >> vendor/lib.txt"
+            ),
+        )
+        vendor = repo / "vendor"
+        (vendor / "lib.txt").write_text("v2-src\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(vendor), *git_cfg, "add", "lib.txt"], check=True)
+        subprocess.run(["git", "-C", str(vendor), *git_cfg, "commit", "-qm", "v2-src"], check=True)
+        v2_src = subprocess.run(
+            ["git", "-C", str(vendor), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "-C", str(repo), "add", "vendor"], check=True)
+        subprocess.run(["git", "-C", str(repo), *git_cfg, "commit", "-qm", "src bump vendor"], check=True)
+
+        strict = self.cli("reply", state["run"], "--sync", "continue")
+        self.assertEqual(strict.returncode, 2, strict.stdout + strict.stderr)
+
+        self.fake_pi([fixtures.answer("checked vendor"), fixtures.SETTLED])
+        res = self.cli("reply", "--wait", state["run"], "--sync=agent", "--accept", "true", "continue")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        delivered = self.outcome(res)
+        self.assertEqual(delivered["state"], "delivered")
+        wt = Path(state["worktree"])
+        wt_sub_head = subprocess.run(
+            ["git", "-C", str(wt / "vendor"), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(wt_sub_head, v2_src)
+        self.assertEqual((wt / "vendor" / "lib.txt").read_text(encoding="utf-8"), "v2-src\n")
+        wt_index = subprocess.run(
+            ["git", "-C", str(wt), "ls-files", "--stage", "--", "vendor"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        self.assertIn(v2_src, wt_index)
+        sync_doc = json.loads((Path(delivered["dir"]) / "sync.json").read_text(encoding="utf-8"))
+        self.assertEqual(sync_doc["conflicts"], [])
+        self.assertEqual(sync_doc["gitlinkMainline"], ["vendor"])
+        prompt = (Path(delivered["dir"]) / "prompt.md").read_text(encoding="utf-8")
+        self.assertIn("gitlink", prompt)
+        self.assertIn("vendor", prompt)
+        self.assertIn("子模块指针冲突已默认取主干：vendor", res.stderr)
+
+    def test_sync_agent_generated_conflicts_prompt_regeneration_without_markers(self):
+        repo = self.repo({
+            "a.txt": "base\n",
+            "gen.txt": "base-gen\n",
+            ".delegate.json": json.dumps({
+                "generated": {
+                    "paths": ["gen.bin", "gen.txt"],
+                    "command": "make gen",
+                }
+            }),
+        })
+        (repo / "gen.bin").write_bytes(b"base\0bin")
+        git_cfg = ["-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run(["git", "-C", str(repo), "add", "gen.bin"], check=True)
+        subprocess.run(["git", "-C", str(repo), *git_cfg, "commit", "-qm", "add gen.bin"], check=True)
+
+        state = self.run_tree(repo, "printf 'agent\\0bin' > gen.bin && echo agent-gen > gen.txt")
+        (repo / "gen.bin").write_bytes(b"caller\0bin")
+        (repo / "gen.txt").write_text("caller-gen\n", encoding="utf-8")
+
+        strict = self.cli("reply", state["run"], "--sync", "continue")
+        self.assertEqual(strict.returncode, 2, strict.stdout + strict.stderr)
+
+        self.fake_pi([fixtures.answer("regenerated"), fixtures.SETTLED])
+        res = self.cli("reply", "--wait", state["run"], "--sync=agent", "--accept", "true", "继续")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        delivered = self.outcome(res)
+        self.assertEqual(delivered["state"], "delivered")
+        wt = Path(state["worktree"])
+        self.assertEqual((wt / "gen.bin").read_bytes(), b"agent\0bin")
+        self.assertEqual((wt / "gen.txt").read_text(encoding="utf-8"), "agent-gen\n")
+        self.assertNotIn("<<<<<<<", (wt / "gen.txt").read_text(encoding="utf-8"))
+        sync_doc = json.loads((Path(delivered["dir"]) / "sync.json").read_text(encoding="utf-8"))
+        self.assertEqual(sync_doc["conflicts"], [])
+        self.assertEqual(sync_doc["regeneratePaths"], ["gen.bin", "gen.txt"])
+        self.assertEqual(sync_doc["generateCommand"], "make gen")
+        prompt = (Path(delivered["dir"]) / "prompt.md").read_text(encoding="utf-8")
+        self.assertIn("make gen", prompt)
+        self.assertIn("gen.bin", prompt)
+        self.assertIn("gen.txt", prompt)
+        self.assertIn("make gen", res.stderr)
+
+    def test_sync_agent_mixed_text_gitlink_and_generated_conflicts(self):
+        repo = self.repo({
+            "a.txt": "base\n",
+            ".delegate.json": json.dumps({
+                "generated": {
+                    "paths": ["gen.bin"],
+                    "command": "scripts/gen.sh",
+                }
+            }),
+        })
+        (repo / "gen.bin").write_bytes(b"base\0bin")
+        git_cfg = self._add_submodule(repo, "vendor", "sub_sync_agent_mixed")
+        subprocess.run(["git", "-C", str(repo), "add", "gen.bin"], check=True)
+        subprocess.run(["git", "-C", str(repo), *git_cfg, "commit", "-qm", "add gen.bin"], check=True)
+
+        state = self.run_tree(
+            repo,
+            (
+                "echo agent > a.txt && "
+                "printf 'agent\\0bin' > gen.bin && "
+                "git -c protocol.file.allow=always submodule update --init -q vendor && "
+                "echo v2-wt > vendor/lib.txt && "
+                "git -C vendor add lib.txt && "
+                "git -C vendor -c user.name=t -c user.email=t@t commit -qm v2-wt && "
+                "git add vendor"
+            ),
+        )
+        (repo / "a.txt").write_text("caller\n", encoding="utf-8")
+        (repo / "gen.bin").write_bytes(b"caller\0bin")
+        vendor = repo / "vendor"
+        (vendor / "lib.txt").write_text("v2-src\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(vendor), *git_cfg, "add", "lib.txt"], check=True)
+        subprocess.run(["git", "-C", str(vendor), *git_cfg, "commit", "-qm", "v2-src"], check=True)
+        v2_src = subprocess.run(
+            ["git", "-C", str(vendor), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "-C", str(repo), "add", "vendor"], check=True)
+        subprocess.run(["git", "-C", str(repo), *git_cfg, "commit", "-qm", "src bump vendor"], check=True)
+
+        self.fake_pi([fixtures.answer("did not resolve"), fixtures.SETTLED])
+        res = self.cli("reply", "--wait", state["run"], "--sync=agent", "--accept", "true", "resolve all")
+        rejected = self.outcome(res)
+        self.assertEqual(rejected["state"], "rejected")
+        self.assertEqual(rejected["syncConflictMarkers"], ["a.txt"])
+        wt = Path(state["worktree"])
+        self.assertIn("<<<<<<< worktree", (wt / "a.txt").read_text(encoding="utf-8"))
+        self.assertEqual((wt / "gen.bin").read_bytes(), b"agent\0bin")
+        wt_sub_head = subprocess.run(
+            ["git", "-C", str(wt / "vendor"), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(wt_sub_head, v2_src)
+        sync_doc = json.loads((Path(rejected["dir"]) / "sync.json").read_text(encoding="utf-8"))
+        self.assertEqual(sync_doc["conflicts"], ["a.txt"])
+        self.assertEqual(sync_doc["gitlinkMainline"], ["vendor"])
+        self.assertEqual(sync_doc["regeneratePaths"], ["gen.bin"])
+        prompt = (Path(rejected["dir"]) / "prompt.md").read_text(encoding="utf-8")
+        self.assertTrue(prompt.startswith("Resolve these sync conflicts FIRST"), prompt)
+        self.assertIn("scripts/gen.sh", prompt)
+        self.assertIn("vendor", prompt)
+
+    def test_sync_agent_gitlink_deleted_on_mainline_removes_submodule(self):
+        repo = self.repo({"a.txt": "base\n"})
+        git_cfg = self._add_submodule(repo, "vendor", "sub_sync_agent_del")
+        state = self.run_tree(
+            repo,
+            (
+                "git -c protocol.file.allow=always submodule update --init -q vendor && "
+                "echo v2-wt > vendor/lib.txt && "
+                "git -C vendor add lib.txt && "
+                "git -C vendor -c user.name=t -c user.email=t@t commit -qm v2-wt && "
+                "git add vendor && "
+                "echo dirty-wt >> vendor/lib.txt"
+            ),
+        )
+        subprocess.run(["git", "-C", str(repo), "rm", "-rf", "-q", "vendor"], check=True)
+        subprocess.run(["git", "-C", str(repo), *git_cfg, "commit", "-qm", "remove vendor"], check=True)
+
+        self.fake_pi([fixtures.answer("noted removal"), fixtures.SETTLED])
+        res = self.cli("reply", "--wait", state["run"], "--sync=agent", "--accept", "true", "continue")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        delivered = self.outcome(res)
+        self.assertEqual(delivered["state"], "delivered")
+        wt = Path(state["worktree"])
+        self.assertFalse((wt / "vendor").exists())
+        wt_index = subprocess.run(
+            ["git", "-C", str(wt), "ls-files", "--stage", "--", "vendor"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(wt_index, "")
+        sync_doc = json.loads((Path(delivered["dir"]) / "sync.json").read_text(encoding="utf-8"))
+        self.assertEqual(sync_doc["conflicts"], [])
+        self.assertEqual(sync_doc["gitlinkMainline"], ["vendor"])
+        prompt = (Path(delivered["dir"]) / "prompt.md").read_text(encoding="utf-8")
+        self.assertIn("vendor", prompt)
+        self.assertIn("子模块指针冲突已默认取主干：vendor", res.stderr)
+
+    def test_sync_agent_gitlink_replaced_by_file_refuses_atomically(self):
+        repo = self.repo({"a.txt": "base\n"})
+        git_cfg = self._add_submodule(repo, "vendor", "sub_type_change_file")
+        st = self.run_tree(repo, "echo wt > a.txt")
+        subprocess.run(["git", "-C", str(repo), "rm", "-rf", "-q", "vendor"], check=True)
+        (repo / "vendor").write_text("now a file\n", encoding="utf-8")
+        (repo / "other.txt").write_text("other\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "vendor", "other.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), *git_cfg, "commit", "-qm", "replace vendor with file"], check=True)
+
+        r = self.cli("reply", "--sync=agent", st["run"], "continue")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("vendor", r.stderr)
+        self.assertFalse((Path(st["worktree"]) / "other.txt").exists())
+
+    def test_sync_agent_gitlink_replaced_by_dir_refuses_atomically(self):
+        repo = self.repo({"a.txt": "base\n"})
+        git_cfg = self._add_submodule(repo, "vendor", "sub_type_change_dir")
+        st = self.run_tree(repo, "echo wt > a.txt")
+        subprocess.run(["git", "-C", str(repo), "rm", "-rf", "-q", "vendor"], check=True)
+        (repo / "vendor").mkdir()
+        (repo / "vendor" / "foo.txt").write_text("inside dir\n", encoding="utf-8")
+        (repo / "other2.txt").write_text("other2\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "vendor/foo.txt", "other2.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), *git_cfg, "commit", "-qm", "replace vendor with dir"], check=True)
+
+        r = self.cli("reply", "--sync=agent", st["run"], "continue")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("vendor", r.stderr)
+        self.assertFalse((Path(st["worktree"]) / "other2.txt").exists())
+        self.assertFalse((Path(st["worktree"]) / "vendor" / "foo.txt").exists())
+
+    def test_sync_agent_worktree_gitlink_replaced_by_file_refuses_atomically(self):
+        repo = self.repo({"a.txt": "base\n"})
+        git_cfg = self._add_submodule(repo, "vendor", "sub_type_change_wt")
+        st = self.run_tree(repo, "rm -rf vendor && echo wt-file > vendor")
+        vendor = repo / "vendor"
+        (vendor / "lib.txt").write_text("v2-src\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(vendor), *git_cfg, "add", "lib.txt"], check=True)
+        subprocess.run(["git", "-C", str(vendor), *git_cfg, "commit", "-qm", "v2-src"], check=True)
+        (repo / "other3.txt").write_text("other3\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "vendor", "other3.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), *git_cfg, "commit", "-qm", "bump vendor"], check=True)
+
+        r = self.cli("reply", "--sync=agent", st["run"], "continue")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("vendor", r.stderr)
+        self.assertEqual((Path(st["worktree"]) / "vendor").read_text(encoding="utf-8"), "wt-file\n")
+        self.assertFalse((Path(st["worktree"]) / "other3.txt").exists())
