@@ -162,8 +162,12 @@ const COMMANDS: &[(&str, &str)] = &[
     ("files", "List repo-relative files changed by a run (one per line, works after apply/clean)."),
     ("patch", "Print retained patch, optionally filtered by path."),
     (
+        "land",
+        "One-step apply -> verify (mergeAccept or accept) -> stage full chain files -> commit with Delegate-Run trailer -> clean worktree.",
+    ),
+    (
         "apply",
-        "Merge a worktree conversation into the source tree.",
+        "Merge a worktree conversation into the source tree (uncommitted by default; pass --commit to squash-commit).",
     ),
     (
         "merge",
@@ -433,7 +437,22 @@ fn command_spec(command: &str) -> Option<CommandSpec> {
             ("--json", "Emit JSON {\"run\", \"count\", \"files\"} instead of one path per line."),
         ]),
         "patch" => ("run [-- paths...]", "Print retained applied.patch (or delivered changes.patch before apply), optionally limited to exact paths/directory prefixes. Suitable for git apply --3way.", &[]),
-        "apply" => ("[--merge] [--allow-dirty-overlap] [--resume-regenerate] [--dry-run] [--verify|--no-verify] [--keep] [--keep-open] [--keep-commits|--commit] [--closes ID] [--json] [run ...]", "Merge worktree conversations into the source working tree, in the order given; stops at the first that fails. Refuses when target files already have uncommitted changes in source (unless --allow-dirty-overlap).", &[
+        "land" => ("[-m MSG | --message MSG | -F FILE] [--no-verify|--verify] [--merge] [--allow-dirty-overlap] [--resume-regenerate] [--dry-run] [--keep] [--keep-open] [--closes ID] [--json] [run ...]", "Apply worktree changes into the source workspace, run repository acceptance (.delegate.json mergeAccept, falling back to run accept; skips when acceptStillValid unless mergeAccept differs or --verify; ignores applyVerify: false), stage only the full-chain file set (same as `delegate files`), commit with automatic `Delegate-Run:` trailer (preserving colleague titles when -m/-F is omitted), and clean the worktree on success. Human stdout starts and ends with `LAND OK <run>` or `LAND FAILED（<stage>） <run>`; on failure written files and staged index entries are kept intact with a resume command. Value options require space-separated form (`-m MSG`, `--message MSG`, `-F FILE`; attached `-mMSG` and `--message=MSG` are not supported).", &[
+            ("run", "Run ids or directories (default: last)."),
+            ("-m MSG, --message MSG", "Custom commit message (space-separated only; repeatable for paragraphs; Delegate-Run trailer is always appended; omit to reuse colleague commit title(s))."),
+            ("-F FILE", "Read commit message from FILE (`-` for stdin; space-separated only; exclusive with -m/--message; Delegate-Run trailer is always appended)."),
+            ("--no-verify", "Skip post-merge acceptance and report the skip in output."),
+            ("--verify", "Force running acceptance even when acceptStillValid is true."),
+            ("--merge", "Write conflict markers instead of stopping."),
+            ("--allow-dirty-overlap", "Explicitly allow 3-way merging into target files that already have uncommitted changes in the source workspace."),
+            ("--resume-regenerate", "Resume only the regeneration and `.applied` recording step after a previous apply already wrote files to the source workspace."),
+            ("--dry-run", "Check the merge without writing or committing."),
+            ("--keep", "Keep the run and worktree after successful land."),
+            ("--keep-open", "Keep the linked work item open in `verify` instead of auto-closing it on land."),
+            ("--closes ID", "Explicitly close work item ID (e.g. W019) with this land's commit/run evidence."),
+            ("--json", "Emit structured JSON conclusions instead of human output."),
+        ]),
+        "apply" => ("[--merge] [--allow-dirty-overlap] [--resume-regenerate] [--dry-run] [--verify|--no-verify] [--keep] [--keep-open] [--keep-commits|--commit [-m MSG | --message MSG | -F FILE]] [--closes ID] [--json] [run ...]", "Merge worktree conversations into the source working tree, in the order given; stops at the first that fails. Refuses when target files already have uncommitted changes in source (unless --allow-dirty-overlap). Human stdout starts and ends with `APPLY OK <run>` or `APPLY FAILED（<stage>） <run>`. Value options require space-separated form (`-m MSG`, `--message MSG`, `-F FILE`; attached `-mMSG` and `--message=MSG` are not supported).", &[
             ("run", "Run ids or directories (default: last)."),
             ("--keep", "Keep the run and worktree after successful apply (default: retain lightweight run and patch, release worktree)."),
             ("--keep-open", "Keep the linked work item open in `verify` instead of auto-closing it on apply."),
@@ -445,7 +464,9 @@ fn command_spec(command: &str) -> Option<CommandSpec> {
             ("--verify", "Rerun acceptance on the merged tree even when acceptStillValid is true. Without it, runs whose acceptance does not carry over rerun their own acceptance once, after the last merge (.delegate.json applyVerify: false turns this off, a command replaces it)."),
             ("--no-verify", "Skip the post-merge acceptance."),
             ("--keep-commits", "Cherry-pick the colleague's commits instead of applying the final tree; refuses uncommitted files (listed in commitsDiffer)."),
-            ("--commit", "Stage only the applied paths and create one squash commit using the colleague's commit title(s); refuses when the source index already has staged changes or a 3-way merged file had local uncommitted edits."),
+            ("--commit", "Stage only the full-chain changed paths (same as `delegate files`) and create one squash commit using -m/--message/-F or the colleague's commit title(s) plus Delegate-Run trailer; refuses when the source index already has staged changes or a 3-way merged file had local uncommitted edits (unstages on git commit failure)."),
+            ("-m MSG, --message MSG", "With --commit: custom commit message (space-separated only; repeatable for paragraphs; Delegate-Run trailer is always appended)."),
+            ("-F FILE", "With --commit: read commit message from FILE (`-` for stdin; space-separated only; exclusive with -m/--message)."),
             ("--closes ID", "Explicitly close work item ID (e.g. W019) with this apply's commit/run evidence."),
         ]),
         "config" => ("", "Show merged effective configuration (including the remote host).", &[]),

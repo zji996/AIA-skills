@@ -3102,7 +3102,11 @@ fn evaluate_core(
     };
     let applying_procs: Vec<(Vec<String>, Option<PathBuf>)> = procs
         .iter()
-        .filter_map(|(argv, pcwd)| match_delegate_subcmd(argv, "apply").map(|a| (a, pcwd.clone())))
+        .filter_map(|(argv, pcwd)| {
+            match_delegate_subcmd(argv, "apply")
+                .or_else(|| match_delegate_subcmd(argv, "land"))
+                .map(|a| (a, pcwd.clone()))
+        })
         .collect();
     let merging_procs: Vec<(Vec<String>, Option<PathBuf>)> = procs
         .iter()

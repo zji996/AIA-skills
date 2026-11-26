@@ -1,5 +1,9 @@
 # delegate
 
+## 一站式合入提交 `delegate land` 与 `apply`/`land` 首末行契约
+
+- 一条命令完成合入、验收、按全链文件集提交与清理：`delegate land <run> [-m "<标题>" | --message "<标题>" | -F <文件>] [--no-verify]` 复用 `apply` 管道合入源工作区，按 `.delegate.json` `mergeAccept` 优先（回退 run `accept`，忽略 `applyVerify: false`；`acceptStillValid` 且未换命令时写「沿用交付时验收」；`--no-verify` 显式跳过并写明）跑验收，仅暂存与 `delegate files` 同口径的全链文件集（含删除）并自动附加 `Delegate-Run:` trailer，成功后自动清理 worktree；任一步失败在人读 stdout 首行与末行固定输出 `LAND FAILED（<阶段>） <run>`（`apply` 同理 `APPLY OK|FAILED`），保留已写入与暂存并给续做命令；`apply --commit` 同步支持 `-m`/`--message`/`-F`（空格形式）及全链暂存（提交失败仍取消暂存）。One-step `delegate land` (apply -> mergeAccept/accept verify -> full-chain staging -> commit with `Delegate-Run:` trailer -> auto-clean worktree), fixed `APPLY|LAND OK|FAILED` first/last stdout line contract, and `-m`/`--message`/`-F` support on both `land` and `apply --commit`.
+
 ## 依赖图导入、价值配额补位与停止线统计
 
 - 批量导入任务 DAG 并按价值配额无模型补位：`work add/wait --class feat|unblock|infra|docs` 标价值类别（缺类别不参与补位且 `work` 行尾标「缺类别」）；`delegate work import-dag <FILE> [--dry-run]` 读 JSON 批量建工作项（`after` 转 `work_closed:`、`files` 存路径前缀并附 `--auto` 参数，重 key/成环/brief 缺失整批拒绝）；`.delegate.json` 配 `fill: {"target": 6, "maxInfraDocsShare": 0.3}` 与 `hotspots` 在 `reconcile` 按类别/出度/就绪时间补位（只数写链、跳过热点冲突、记 `work_dispatched` `reason: "fill"`）；`delegate fill stats [--since 24h]` 统计冲突率/返工率/未合入峰值/lane 排队占比/每 10 交付 agy 周额度与只读占比并给出停止线提醒（不自动降档）。Batch-import JSON task DAGs with `work import-dag`, value-class auto-fill dispatch with `fill`/`hotspots` (counting write chains only), and advisory stop-line metrics via `delegate fill stats`.

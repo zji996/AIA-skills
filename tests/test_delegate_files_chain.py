@@ -83,11 +83,13 @@ class DelegateFilesChainTests(unittest.TestCase):
         self.assertEqual(diff_total.returncode, 0, diff_total.stderr)
         self.assertEqual(_parse_diff_filenames(diff_total.stdout), set(expected))
 
-        # 2. Apply with --keep: last line count matches the exact chain set (3).
+        # 2. Apply with --keep: files count matches the exact chain set (3), wrapped by APPLY OK.
         applied = self.cli("apply", "--keep", r2["run"], cwd=repo, human=True)
         self.assertEqual(applied.returncode, 0, applied.stderr + applied.stdout)
         lines = [ln for ln in applied.stdout.splitlines() if ln.strip()]
-        self.assertEqual(lines[-1], f"本 run 改动文件（3 个）：delegate files {r2['run']}")
+        self.assertEqual(lines[0], f"APPLY OK {r2['run']}")
+        self.assertEqual(lines[-2], f"本 run 改动文件（3 个）：delegate files {r2['run']}")
+        self.assertEqual(lines[-1], f"APPLY OK {r2['run']}")
         self.assertEqual((repo / "a.txt").read_text().strip(), "mod_a")
         self.assertEqual((repo / "b.txt").read_text().strip(), "new_b")
         self.assertEqual((repo / "c.txt").read_text().strip(), "mod_c")
@@ -160,7 +162,9 @@ class DelegateFilesChainTests(unittest.TestCase):
         applied = self.cli("apply", r2["run"], cwd=repo, human=True)
         self.assertEqual(applied.returncode, 0, applied.stderr + applied.stdout)
         lines = [ln for ln in applied.stdout.splitlines() if ln.strip()]
-        self.assertEqual(lines[-1], f"本 run 改动文件（4 个）：delegate files {r2['run']}")
+        self.assertEqual(lines[0], f"APPLY OK {r2['run']}")
+        self.assertEqual(lines[-2], f"本 run 改动文件（4 个）：delegate files {r2['run']}")
+        self.assertEqual(lines[-1], f"APPLY OK {r2['run']}")
         self.assertFalse((repo / "remove_me.txt").exists())
         self.assertFalse((repo / "old_name.txt").exists())
         self.assertTrue((repo / "new_name.txt").is_file())

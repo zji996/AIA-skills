@@ -1166,11 +1166,16 @@ pub(crate) fn apply_fast_forward(
     }
 
     let mut written = Vec::with_capacity(ops.len());
+    let mut stdout_lines = Vec::with_capacity(ops.len());
     if dry {
         for op in &ops {
             match op {
-                FfOp::Write { path, .. } => println!(" {:<16} {path}", "fast-forward"),
-                FfOp::Delete { path, .. } => println!(" {:<16} {path}", "deleted"),
+                FfOp::Write { path, .. } => {
+                    stdout_lines.push(format!(" {:<16} {path}", "fast-forward"));
+                }
+                FfOp::Delete { path, .. } => {
+                    stdout_lines.push(format!(" {:<16} {path}", "deleted"));
+                }
             }
         }
         eprintln!("delegate: dry run; nothing written");
@@ -1204,7 +1209,7 @@ pub(crate) fn apply_fast_forward(
                             }
                             return Err(format!("apply fast-forward {}: {e}", target.display()));
                         }
-                        println!(" {:<16} {path}", "fast-forward");
+                        stdout_lines.push(format!(" {:<16} {path}", "fast-forward"));
                     }
                     FfOp::Delete { path, target } => {
                         written.push(path.clone());
@@ -1219,7 +1224,7 @@ pub(crate) fn apply_fast_forward(
                             }
                             worktree::remove_empty_parents(&target, source);
                         }
-                        println!(" {:<16} {path}", "deleted");
+                        stdout_lines.push(format!(" {:<16} {path}", "deleted"));
                     }
                 }
             }
@@ -1288,6 +1293,7 @@ pub(crate) fn apply_fast_forward(
         written,
         regenerated: vec![],
         had_dirty_merge: false,
+        stdout_lines,
     }))
 }
 

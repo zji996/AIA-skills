@@ -42,8 +42,10 @@ class DelegateApplyFinishTests(unittest.TestCase):
             self.assertTrue(Path(state["dir"]).exists())
             self.assertTrue(Path(state["worktree"]).exists())
         lines = result.stdout.splitlines()
-        self.assertEqual(lines[-2], "验收仍然有效（仓库快照范围）")
-        self.assertIn(f"delegate files {state['run']}", lines[-1])
+        self.assertEqual(lines[0], f"APPLY OK {state['run']}")
+        self.assertEqual(lines[-3], "验收仍然有效（仓库快照范围）")
+        self.assertIn(f"delegate files {state['run']}", lines[-2])
+        self.assertEqual(lines[-1], f"APPLY OK {state['run']}")
 
     def test_invalid_acceptance_lists_primary_and_additional_checks(self):
         repo, state = self.task("--accept", "test -f a.txt", "--accept-also", "test -f other.txt")
@@ -52,11 +54,13 @@ class DelegateApplyFinishTests(unittest.TestCase):
         result = self.cli("apply", state["run"], human=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = result.stdout.splitlines()
-        summary_line = lines[-2]
+        self.assertEqual(lines[0], f"APPLY OK {state['run']}")
+        summary_line = lines[-3]
         self.assertIn("主干已前进，验收快照失效；本仓库配置合入后不自动验收，批量门禁时跑：", summary_line)
         self.assertNotIn("验收无效", summary_line)
         self.assertIn("test -f a.txt && test -f other.txt", summary_line)
-        self.assertIn(f"delegate files {state['run']}", lines[-1])
+        self.assertIn(f"delegate files {state['run']}", lines[-2])
+        self.assertEqual(lines[-1], f"APPLY OK {state['run']}")
 
     def test_failed_apply_preserves_task(self):
         repo, state = self.task()
@@ -76,8 +80,10 @@ class DelegateApplyFinishTests(unittest.TestCase):
         self.assertTrue(Path(state["dir"]).exists())
         self.assertFalse(Path(state["worktree"]).exists())
         lines = result.stdout.splitlines()
-        self.assertIn("任务没有验收命令", lines[-2])
-        self.assertIn(f"delegate files {state['run']}", lines[-1])
+        self.assertEqual(lines[0], f"APPLY OK {state['run']}")
+        self.assertIn("任务没有验收命令", lines[-3])
+        self.assertIn(f"delegate files {state['run']}", lines[-2])
+        self.assertEqual(lines[-1], f"APPLY OK {state['run']}")
 
 
 if __name__ == "__main__":

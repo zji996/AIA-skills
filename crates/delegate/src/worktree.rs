@@ -2416,12 +2416,14 @@ pub struct ApplyOutcome {
     pub regenerated_files: Vec<String>,
     pub had_dirty_merge: bool,
     pub already_applied: bool,
+    pub stdout_lines: Vec<String>,
 }
 pub(crate) struct ApplyInnerResult {
     pub code: i32,
     pub written: Vec<String>,
     pub regenerated: Vec<String>,
     pub had_dirty_merge: bool,
+    pub stdout_lines: Vec<String>,
 }
 fn apply_progress(message: impl std::fmt::Display) {
     eprintln!("delegate: {message}");
@@ -3070,6 +3072,7 @@ fn record_dirty_overlap_failure(
     meta: &Value,
     source: &Path,
     dirty_overlap: &[String],
+    cmd_name: &str,
     conclusion: &mut Value,
 ) -> ApplyInnerResult {
     let run_id = {
@@ -3084,13 +3087,14 @@ fn record_dirty_overlap_failure(
         }
     };
     let commit_cmd = format!(
-        "先提交源工作区现有改动，再运行：{} apply {run_id}",
+        "先提交源工作区现有改动，再运行：{} {cmd_name} {run_id}",
         script().display()
     );
     let allow_cmd = format!(
-        "{} apply --allow-dirty-overlap {run_id}",
+        "{} {cmd_name} --allow-dirty-overlap {run_id}",
         script().display()
     );
+    let mut stdout_lines = Vec::new();
     if !crate::output::json_enabled() {
         let files_preview = if dirty_overlap.len() <= 5 {
             dirty_overlap.join(", ")
@@ -3101,12 +3105,12 @@ fn record_dirty_overlap_failure(
                 dirty_overlap.len()
             )
         };
-        println!(
+        stdout_lines.push(format!(
             "未合入：{} 个目标文件在源工作区已有未提交改动（{files_preview}）",
             dirty_overlap.len()
-        );
+        ));
         for p in dirty_overlap {
-            println!(" dirty-overlap    {p}");
+            stdout_lines.push(format!(" dirty-overlap    {p}"));
         }
     }
     eprintln!(
@@ -3130,6 +3134,7 @@ fn record_dirty_overlap_failure(
         written: vec![],
         regenerated: vec![],
         had_dirty_merge: false,
+        stdout_lines,
     }
 }
 
@@ -3194,6 +3199,7 @@ fn already_applied_outcome(run: &Path, meta: &Value) -> Option<ApplyOutcome> {
         regenerated_files: Vec::new(),
         had_dirty_merge: false,
         already_applied: true,
+        stdout_lines: Vec::new(),
     })
 }
 
@@ -3206,7 +3212,9 @@ pub fn apply(
     commit_mode: bool,
     allow_dirty_overlap: bool,
     resume_regenerate: bool,
+    land_mode: bool,
 ) -> Res<ApplyOutcome> {
+    let cmd_name = if land_mode { "land" } else { "apply" };
     let mut meta = json(run.join("meta.json"));
     if s(&meta, "mode") == "read-only" {
         return Err("read-only snapshot: nothing to apply / 只读任务禁止 apply".into());
@@ -3224,6 +3232,7 @@ pub fn apply(
             commit_mode,
             allow_dirty_overlap,
             resume_regenerate,
+            cmd_name,
             &[],
         );
     }
@@ -3245,13 +3254,26 @@ pub fn apply(
                 "nothing applied: unresolved conflict markers / 冲突标记未解决: {}",
                 details.join("; ")
             );
+            let run_id = run
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let retry_cmd = format!(
+                "解决源工作区冲突标记后重新运行：{} {cmd_name} {run_id}",
+                script().display()
+            );
+            let mut stdout_lines = Vec::new();
             if !crate::output::json_enabled() {
-                println!("未合入：存在未解决的冲突标记（{}）", details.join("; "));
+                stdout_lines.push(format!(
+                    "未合入：存在未解决的冲突标记（{}）",
+                    details.join("; ")
+                ));
             }
             eprintln!("delegate: {msg}");
             let now = iso();
             let mut conclusion = json!({
-                "run": run.file_name().unwrap_or_default().to_string_lossy(),
+                "run": run_id,
                 "operation": "apply",
                 "apply": {
                     "ok": false,
@@ -3260,6 +3282,7 @@ pub fn apply(
                     "failureDetail": msg,
                     "conflictMarkers": paths,
                     "writtenFiles": [],
+                    "next": [retry_cmd],
                 },
                 "startedAt": now,
                 "finishedAt": now,
@@ -3275,6 +3298,7 @@ pub fn apply(
                 regenerated_files: vec![],
                 had_dirty_merge: false,
                 already_applied: false,
+                stdout_lines,
             });
         }
     };
@@ -3325,6 +3349,7 @@ pub fn apply(
         commit_mode,
         allow_dirty_overlap,
         resume_regenerate,
+        cmd_name,
         &written_paths,
     )
 }
@@ -3676,6 +3701,7 @@ fn apply_checked(
     commit_mode: bool,
     allow_dirty_overlap: bool,
     resume_regenerate: bool,
+    cmd_name: &str,
     written_paths: &[String],
 ) -> Res<ApplyOutcome> {
     let apply_started_at = iso();
@@ -3722,7 +3748,15 @@ fn apply_checked(
         if !dry && source.is_absolute() && crate::premerge::cancel_for_run(run, source) {
             conclusion["applyTiming"]["premergeCancelled"] = json!(true);
         }
-        apply_inner(run, merge, dry, allow_dirty_overlap, true, &mut conclusion)?
+        apply_inner(
+            run,
+            merge,
+            dry,
+            allow_dirty_overlap,
+            true,
+            cmd_name,
+            &mut conclusion,
+        )?
     } else if keep_commits && !commits.is_empty() {
         let mut kc_dirty_overlap: Vec<String> = Vec::new();
         if !allow_dirty_overlap && !merge && source.is_dir() {
@@ -3756,18 +3790,27 @@ fn apply_checked(
             }
         }
         if !kc_dirty_overlap.is_empty() {
-            record_dirty_overlap_failure(run, &meta, source, &kc_dirty_overlap, &mut conclusion)
+            record_dirty_overlap_failure(
+                run,
+                &meta,
+                source,
+                &kc_dirty_overlap,
+                cmd_name,
+                &mut conclusion,
+            )
         } else if dry {
             ApplyInnerResult {
                 code: 0,
                 written: vec![],
                 regenerated: vec![],
                 had_dirty_merge: false,
+                stdout_lines: vec![],
             }
         } else {
             let mut written_set = std::collections::BTreeSet::new();
             let mut applied_commits = Vec::new();
             let mut failed_commit: Option<(String, String)> = None;
+            let mut kc_stdout_lines = Vec::new();
             let code = {
                 let _guard = crate::source_watch::guard(source, true)?;
                 let before = crate::source_watch::fingerprint(source)?;
@@ -3791,13 +3834,19 @@ fn apply_checked(
                     for path in touched.split(|b| *b == 0).filter(|p| !p.is_empty()) {
                         written_set.insert(String::from_utf8_lossy(path).into_owned());
                     }
-                    let status = git_command()
+                    let out = git_command()
                         .arg("-C")
                         .arg(source)
                         .args(["cherry-pick", "--no-edit", hash])
-                        .status()
+                        .output()
                         .map_err(|e| e.to_string())?;
-                    if !status.success() {
+                    for line in String::from_utf8_lossy(&out.stdout).lines() {
+                        kc_stdout_lines.push(line.to_string());
+                    }
+                    if !out.stderr.is_empty() {
+                        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+                    }
+                    if !out.status.success() {
                         eprintln!("delegate: cherry-pick stopped at {hash}; resolve conflicts in {}, then continue with git cherry-pick --continue", source.display());
                         failed_commit = Some((hash.to_string(), title.to_string()));
                         let has_unmerged = git(source, &["diff", "--name-only", "--diff-filter=U"])
@@ -3841,6 +3890,7 @@ fn apply_checked(
                 written,
                 regenerated: vec![],
                 had_dirty_merge: false,
+                stdout_lines: kc_stdout_lines,
             }
         }
     } else if source.is_absolute() && !meta["worktree"].is_null() {
@@ -3859,7 +3909,15 @@ fn apply_checked(
                     if !dry && crate::premerge::cancel_for_run(run, source) {
                         conclusion["applyTiming"]["premergeCancelled"] = json!(true);
                     }
-                    apply_inner(run, merge, dry, allow_dirty_overlap, false, &mut conclusion)?
+                    apply_inner(
+                        run,
+                        merge,
+                        dry,
+                        allow_dirty_overlap,
+                        false,
+                        cmd_name,
+                        &mut conclusion,
+                    )?
                 }
             }
             crate::premerge::FastForwardCheck::Miss(miss) => {
@@ -3871,23 +3929,40 @@ fn apply_checked(
                 if !dry && crate::premerge::cancel_for_run(run, source) {
                     conclusion["applyTiming"]["premergeCancelled"] = json!(true);
                 }
-                apply_inner(run, merge, dry, allow_dirty_overlap, false, &mut conclusion)?
+                apply_inner(
+                    run,
+                    merge,
+                    dry,
+                    allow_dirty_overlap,
+                    false,
+                    cmd_name,
+                    &mut conclusion,
+                )?
             }
         }
     } else {
-        apply_inner(run, merge, dry, allow_dirty_overlap, false, &mut conclusion)?
+        apply_inner(
+            run,
+            merge,
+            dry,
+            allow_dirty_overlap,
+            false,
+            cmd_name,
+            &mut conclusion,
+        )?
     };
     let mut code = inner.code;
     let written_files = inner.written;
     let regenerated_files = inner.regenerated;
+    let mut stdout_lines = inner.stdout_lines;
     if !crate::output::json_enabled() && (code == 0 || !written_files.is_empty()) {
         for item in &commits {
-            println!(
+            stdout_lines.push(format!(
                 " commit {} {} ({} files)",
                 &s(item, "hash")[..7],
                 s(item, "title"),
                 n(item, "files")
-            );
+            ));
         }
     }
     if !dry && code == 0 {
@@ -4005,6 +4080,7 @@ fn apply_checked(
         regenerated_files,
         had_dirty_merge: inner.had_dirty_merge,
         already_applied: false,
+        stdout_lines,
     })
 }
 fn accept_validity(run: &Path, dry: bool, conclusion: &mut Value) {
@@ -4140,6 +4216,76 @@ pub fn verify_plan(run: &Path, forced: Option<bool>, conclusion: &mut Value) -> 
     }
     if commands.is_empty() {
         conclusion["verify"] = json!({"skipped":"no acceptance command"});
+    }
+    Ok(commands)
+}
+/// Post-merge acceptance plan for `delegate land`:
+/// 1. `--no-verify` (`forced == Some(false)`) skips and records `skipped: "no-verify"`.
+/// 2. `.delegate.json`'s `applyVerify: false` only affects `apply`, NEVER `land`.
+/// 3. Uses `.delegate.json`'s `mergeAccept` if configured; otherwise falls back to the run's
+///    recorded `accept` (and `acceptAlso`), then `.delegate.json`'s `accept`.
+/// 4. When `acceptStillValid == true` (and not `--verify`) and either `mergeAccept` is absent
+///    or identical to the run's already-accepted command, skips and records `skipped: "acceptStillValid"`.
+pub fn verify_plan_for_land(
+    run: &Path,
+    forced: Option<bool>,
+    conclusion: &mut Value,
+) -> Res<Vec<String>> {
+    if conclusion["apply"]["ok"] != json!(true) || conclusion["apply"]["dryRun"] == json!(true) {
+        return Ok(vec![]);
+    }
+    if forced == Some(false) {
+        conclusion["verify"] = json!({"skipped": "no-verify"});
+        return Ok(vec![]);
+    }
+    let meta = json(run.join("meta.json"));
+    let source = s(&meta["worktree"], "source");
+    if source.is_empty() {
+        return Ok(vec![]);
+    }
+    let file = Path::new(source).join(".delegate.json");
+    let raw = if file.is_file() {
+        serde_json::from_str::<Value>(&read(&file))
+            .map_err(|e| format!("cannot read {}: {e}", file.display()))?
+    } else {
+        json!({})
+    };
+    crate::merge::validate_merge_accept(raw.get("mergeAccept"))
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    let merge_accept = raw
+        .get("mergeAccept")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let run_accept = acceptance(&meta);
+    let mut commands = if let Some(ref ma) = merge_accept {
+        vec![ma.clone()]
+    } else {
+        run_accept.clone()
+    };
+    if commands.is_empty() {
+        if let Some(command) = raw
+            .get("accept")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            commands.push(command.to_string());
+        }
+    }
+    if commands.is_empty() {
+        conclusion["verify"] = json!({"skipped": "no acceptance command"});
+        return Ok(vec![]);
+    }
+    let can_reuse_delivery_accept =
+        merge_accept.is_none() || (!run_accept.is_empty() && run_accept == commands);
+    if forced != Some(true)
+        && conclusion["acceptStillValid"] == json!(true)
+        && can_reuse_delivery_accept
+    {
+        conclusion["verify"] = json!({"skipped": "acceptStillValid"});
+        return Ok(vec![]);
     }
     Ok(commands)
 }
@@ -4471,9 +4617,22 @@ fn numbered_conflicts(
         })
         .collect())
 }
-/// Stage only the applied paths and create one squash commit on the source checkout.
+pub struct CommitAppliedOptions<'a> {
+    pub custom_message: Option<&'a str>,
+    pub keep_staged_on_error: bool,
+    pub message_file_on_error: Option<&'a Path>,
+}
+
+pub struct CommitAppliedError {
+    pub detail: String,
+    pub staged_kept: bool,
+    pub msg_file: Option<PathBuf>,
+}
+
+/// Stage only the full-chain applied paths and create one squash commit on the source checkout.
 /// Fails closed if the source index already has staged changes or a 3-way merged file
 /// contained pre-existing local uncommitted edits.
+#[allow(clippy::too_many_arguments)]
 pub fn commit_applied(
     source: &Path,
     runs: &[PathBuf],
@@ -4482,29 +4641,70 @@ pub fn commit_applied(
     run_names: &[String],
     trailer_runs: &[String],
     had_dirty_merge: bool,
-) -> Res<(String, String)> {
+    opts: &CommitAppliedOptions<'_>,
+) -> Result<(String, String, usize), CommitAppliedError> {
+    let pre_err = |detail: String| CommitAppliedError {
+        detail,
+        staged_kept: false,
+        msg_file: None,
+    };
     if paths.is_empty() {
-        return Err("no written files to commit".into());
+        return Err(pre_err("no written files to commit".into()));
     }
     if had_dirty_merge {
-        return Err(
+        return Err(pre_err(
             "refusing --commit: a 3-way merged file already had uncommitted local edits in the source workspace; review and commit manually"
                 .into(),
-        );
+        ));
     }
     let cached = git_command()
         .arg("-C")
         .arg(source)
         .args(["diff", "--cached", "--quiet"])
         .status()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| pre_err(e.to_string()))?;
     if !cached.success() {
-        return Err(
+        return Err(pre_err(
             "refusing --commit: source index already has staged changes; commit or unstage them first"
                 .into(),
-        );
+        ));
     }
-    let (subject, mut message) = if titles.len() == 1 {
+    // Filter out ghost paths that exist neither on disk nor in git's index (e.g. already removed),
+    // while preserving tracked deletions so `git add -A --` stages them cleanly.
+    let mut tracked = std::collections::HashSet::<String>::new();
+    if let Ok(out) = git_command()
+        .arg("-C")
+        .arg(source)
+        .args(["ls-files", "-z", "--"])
+        .args(paths)
+        .output()
+    {
+        if out.status.success() {
+            for raw in out.stdout.split(|b| *b == 0) {
+                if !raw.is_empty() {
+                    tracked.insert(String::from_utf8_lossy(raw).into_owned());
+                }
+            }
+        }
+    }
+    let stage_paths: Vec<String> = paths
+        .iter()
+        .filter(|p| source.join(p).symlink_metadata().is_ok() || tracked.contains(p.as_str()))
+        .cloned()
+        .collect();
+    if stage_paths.is_empty() {
+        return Err(pre_err("no written files to commit".into()));
+    }
+    let (subject, mut message) = if let Some(custom) = opts.custom_message {
+        let trimmed = custom.trim();
+        let subj = trimmed
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        (subj, trimmed.to_string())
+    } else if titles.len() == 1 {
         (titles[0].clone(), titles[0].clone())
     } else if titles.len() > 1 {
         let body = titles
@@ -4534,40 +4734,57 @@ pub fn commit_applied(
         message.push('\n');
     }
     let head = {
-        let _guard = crate::source_watch::guard(source, true)?;
+        let _guard = crate::source_watch::guard(source, true).map_err(pre_err)?;
         let add = git_command()
             .arg("-C")
             .arg(source)
             .args(["add", "-A", "--"])
-            .args(paths)
+            .args(&stage_paths)
             .output()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| pre_err(e.to_string()))?;
         if !add.status.success() {
-            return Err(format!(
+            return Err(pre_err(format!(
                 "git add failed: {}",
                 String::from_utf8_lossy(&add.stderr).trim()
-            ));
+            )));
         }
         let commit = git_command()
             .arg("-C")
             .arg(source)
             .args(["commit", "-m", &message])
             .output()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| CommitAppliedError {
+                detail: e.to_string(),
+                staged_kept: opts.keep_staged_on_error,
+                msg_file: None,
+            })?;
         if !commit.status.success() {
-            let _ = git_command()
-                .arg("-C")
-                .arg(source)
-                .args(["reset", "-q", "--"])
-                .args(paths)
-                .status();
+            let mut saved_msg_file = None;
+            if opts.keep_staged_on_error {
+                if let Some(msg_path) = opts.message_file_on_error {
+                    if write(msg_path, &message).is_ok() {
+                        saved_msg_file = Some(msg_path.to_path_buf());
+                    }
+                }
+            } else {
+                let _ = git_command()
+                    .arg("-C")
+                    .arg(source)
+                    .args(["reset", "-q", "--"])
+                    .args(&stage_paths)
+                    .status();
+            }
             let detail = String::from_utf8_lossy(&commit.stderr);
             let detail = if detail.trim().is_empty() {
                 String::from_utf8_lossy(&commit.stdout).trim().to_string()
             } else {
                 detail.trim().to_string()
             };
-            return Err(format!("git commit failed: {detail}"));
+            return Err(CommitAppliedError {
+                detail: format!("git commit failed: {detail}"),
+                staged_kept: opts.keep_staged_on_error,
+                msg_file: saved_msg_file,
+            });
         }
         git_text(source, &["rev-parse", "HEAD"]).unwrap_or_default()
     };
@@ -4591,7 +4808,7 @@ pub fn commit_applied(
             }
         }
     }
-    Ok((head, subject))
+    Ok((head, subject, stage_paths.len()))
 }
 fn set_regeneration_failure_next(run: &Path, meta: &Value, conclusion: &mut Value) -> (String, String) {
     let run_id = {
@@ -4620,6 +4837,7 @@ fn apply_inner(
     dry: bool,
     allow_dirty_overlap: bool,
     resume_regenerate: bool,
+    cmd_name: &str,
     conclusion: &mut Value,
 ) -> Res<ApplyInnerResult> {
     let (meta, mut top, _, mut after) = chain_changes(run)?;
@@ -4890,6 +5108,7 @@ fn apply_inner(
             &meta,
             &source,
             &dirty_overlap,
+            cmd_name,
             conclusion,
         ));
     }
@@ -4911,6 +5130,7 @@ fn apply_inner(
         eprintln!("delegate: no changes to apply");
         // Still record this round (including zero-change replies) as applied.
     }
+    let mut stdout_lines = Vec::new();
     if !conflicts.is_empty() && !merge {
         let run_id = {
             let r = s(&meta, "run");
@@ -4931,14 +5151,14 @@ fn apply_inner(
         let rebase_cmd = format!(
             "delegate reply --sync=agent {run_id} \"rebase 到最新主干并解决冲突（{files_preview}）\""
         );
-        let merge_cmd = format!("{} apply --merge {run_id}", script().display());
+        let merge_cmd = format!("{} {cmd_name} --merge {run_id}", script().display());
         if !crate::output::json_enabled() {
-            println!(
+            stdout_lines.push(format!(
                 "未合入：{} 个文件与源工作区冲突（{files_preview}）",
                 conflicts.len()
-            );
+            ));
             for p in &conflicts {
-                println!(" conflict         {p}");
+                stdout_lines.push(format!(" conflict         {p}"));
             }
         }
         eprintln!(
@@ -4962,6 +5182,7 @@ fn apply_inner(
             written: vec![],
             regenerated: vec![],
             had_dirty_merge: false,
+            stdout_lines,
         });
     }
     for action in &mut actions {
@@ -5063,30 +5284,33 @@ fn apply_inner(
                     return Err(format!("apply {}: {e}", a.target.display()));
                 }
             }
-            println!(" {:<16} {}", a.kind, a.path);
+            stdout_lines.push(format!(" {:<16} {}", a.kind, a.path));
         }
         if let Some(before) = &before_actions {
             crate::source_watch::register_matching(&source, before, &written, &matched)?;
         }
     }
     for p in &conflicts {
-        println!(
+        stdout_lines.push(format!(
             " {:<16} {p}  (binary, symlink, type change or large; take it from {})",
             "skipped",
             worktree.display()
-        );
+        ));
     }
     if skipped_generation {
-        println!(
+        stdout_lines.push(format!(
             " {:<16} no merged path under generated.inputs",
             "not regenerated"
-        );
+        ));
     }
     let mut regenerated = Vec::new();
     if dry {
         eprintln!("delegate: dry run; nothing written");
         if regenerate {
-            println!(" regenerated      {} (dry run)", generated_paths.join(", "));
+            stdout_lines.push(format!(
+                " regenerated      {} (dry run)",
+                generated_paths.join(", ")
+            ));
         }
     } else if regenerate {
         let interrupted = || -> Option<i32> {
@@ -5107,6 +5331,7 @@ fn apply_inner(
                 written,
                 regenerated,
                 had_dirty_merge,
+                stdout_lines,
             });
         }
         let mut gen_env = meta["env"].clone();
@@ -5162,6 +5387,7 @@ fn apply_inner(
                         written,
                         regenerated,
                         had_dirty_merge,
+                        stdout_lines,
                     });
                 }
             }
@@ -5197,6 +5423,7 @@ fn apply_inner(
                     written,
                     regenerated,
                     had_dirty_merge,
+                    stdout_lines,
                 });
             }
             Err(error) => return Err(error),
@@ -5262,6 +5489,7 @@ fn apply_inner(
                 written,
                 regenerated,
                 had_dirty_merge,
+                stdout_lines,
             });
         }
         writeln!(file, "\n[exit {code}]").map_err(|e| format!("apply {}: {e}", log.display()))?;
@@ -5296,6 +5524,7 @@ fn apply_inner(
                 written,
                 regenerated,
                 had_dirty_merge,
+                stdout_lines,
             });
         }
         for marker in markers.iter().filter(|marker| marker.exists()) {
@@ -5305,7 +5534,7 @@ fn apply_inner(
             "generation complete / 生成完成; log: {}",
             log.display()
         ));
-        println!(" regenerated      {}", generated_paths.join(", "));
+        stdout_lines.push(format!(" regenerated      {}", generated_paths.join(", ")));
     }
     // Conflict markers still land every change, so record it; only skipped files keep the run unapplied.
     if !dry && conflicts.is_empty() {
@@ -5377,6 +5606,7 @@ fn apply_inner(
         written,
         regenerated,
         had_dirty_merge,
+        stdout_lines,
     })
 }
 

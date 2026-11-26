@@ -40,7 +40,7 @@ $D land <run> -m "提交说明"                    # 后续命令用 && 不要�
 
 1. 默认档位、思考深度、只读探路、基线同步与合入后清理都已自动选好，常规任务**不要传额外选项**；多行说明用 `--prompt-file -` 加 heredoc。
 2. 同事看不到你的上下文：写清目标、范围、验收命令和已知事实；看到 `提问` 状态用 `reply` 回答（不算返工）。
-3. `land`/`apply` 首行报 `FAILED（未合入）` 时按提示处理，不要继续在旧代码上跑测试；不要给 `land`/`apply` 套短 `timeout`。
+3. `land`/`apply` 最后一行是结论，`FAILED（未合入）` 时按提示处理，不要在旧代码上跑测试；不要给 `land`/`apply` 套短 `timeout`。
 
 > 快照对象钉在 `refs/delegate/<run-id>/*`（`clean` 时移除），普通 `git gc` 安全；切勿执行 `git prune` 或 `git gc --prune=now|all`（见 `gc.log` 删该文件即可）。
 

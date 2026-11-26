@@ -69,7 +69,10 @@ class Delegate615Tests(unittest.TestCase):
         first = self.run_write(repo, "printf '%s\\n' '<<<<<<< current' 'oops' '>>>>>>> earlier-run' > a.txt")
         applied = self.cli("apply", first["run"])
         self.assertEqual(applied.returncode, 3, applied.stderr)
-        self.assertIn("applied with conflict markers", applied.stdout.splitlines()[-1])
+        applied_lines = applied.stdout.splitlines()
+        self.assertTrue(applied_lines[0].startswith("APPLY FAILED（"), applied.stdout)
+        self.assertIn("applied with conflict markers", applied_lines[-2])
+        self.assertEqual(applied_lines[-1], applied_lines[0])
         self.assertEqual(json.loads((Path(first["dir"]) / "summary.json").read_text())["conflictMarkers"], ["a.txt"])
 
     def test_marker_preflight_includes_delete_and_keep_commits(self):
@@ -90,7 +93,10 @@ class Delegate615Tests(unittest.TestCase):
         subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "caller"], check=True)
         result = self.cli("apply", "--keep-commits", first["run"])
         self.assertEqual(result.returncode, 3, result.stderr)
-        self.assertIn("applied with conflict markers", result.stdout.splitlines()[-1])
+        result_lines = result.stdout.splitlines()
+        self.assertTrue(result_lines[0].startswith("APPLY FAILED（"), result.stdout)
+        self.assertIn("applied with conflict markers", result_lines[-2])
+        self.assertEqual(result_lines[-1], result_lines[0])
         self.assertEqual(json.loads((Path(first["dir"]) / "summary.json").read_text())["conflictMarkers"], ["a.txt"])
         self.assertIn("已合入·有冲突待解决", self.cli("status", first["run"], human=True).stdout)
 

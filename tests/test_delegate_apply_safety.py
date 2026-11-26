@@ -157,8 +157,14 @@ class DelegateApplySafetyTests(unittest.TestCase):
             timeout=30,
         )
         self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
-        first_line = res.stdout.splitlines()[0] if res.stdout.splitlines() else ""
-        self.assertTrue(first_line.startswith("未合入："), f"expected stdout first line '未合入：...', got: {res.stdout!r}")
+        lines = res.stdout.splitlines()
+        first_line = lines[0] if lines else ""
+        last_line = lines[-1] if lines else ""
+        self.assertTrue(
+            first_line.startswith("APPLY FAILED（未合入："),
+            f"expected stdout first line 'APPLY FAILED（未合入：...', got: {res.stdout!r}",
+        )
+        self.assertEqual(last_line, first_line)
         self.assertIn("!!! apply 失败（阶段：文件冲突 / conflicts", res.stdout)
         self.assertEqual(self.git(repo, "rev-parse", "HEAD"), head_before)
         self.assertEqual(self.git(repo, "log", "-1", "--pretty=%s"), "original subject")
@@ -168,22 +174,24 @@ class DelegateApplySafetyTests(unittest.TestCase):
         self.assertEqual(merged.returncode, 3, merged.stdout + merged.stderr)
         self.assertIn("<<<<<<< current", (repo / "shared.txt").read_text(encoding="utf-8"))
 
-        # Subsequent apply onto unresolved conflict markers exits 3 as well, with stdout first line `未合入：...`.
+        # Subsequent apply onto unresolved conflict markers exits 3 as well, with stdout first/last line `APPLY FAILED（未合入：...`.
         self.fake_pi([fixtures.answer("done2"), fixtures.SETTLED], pre="echo second > shared.txt")
         run2 = self.outcome(
             self.cli("run", "--worktree", "--workdir", repo, "--name", "c2", "--accept", "true", "edit2")
         )
         blocked = self.cli("apply", run2["run"], cwd=repo, human=True)
         self.assertEqual(blocked.returncode, 3, blocked.stdout + blocked.stderr)
-        blocked_first = blocked.stdout.splitlines()[0] if blocked.stdout.splitlines() else ""
+        blocked_lines = blocked.stdout.splitlines()
+        blocked_first = blocked_lines[0] if blocked_lines else ""
         self.assertTrue(
-            blocked_first.startswith("未合入："),
-            f"expected stdout first line '未合入：...', got: {blocked.stdout!r}",
+            blocked_first.startswith("APPLY FAILED（未合入："),
+            f"expected stdout first line 'APPLY FAILED（未合入：...', got: {blocked.stdout!r}",
         )
+        self.assertEqual(blocked_lines[-1], blocked_first)
         self.assertIn("冲突标记未解决", blocked.stderr)
 
     def test_1b_apply_non_conflict_failure_exits_1_and_merge_conflict_exits_3(self):
-        # Dirty-overlap (non-conflict failure) exits 1 and starts stdout with `未合入：...` (never ` commit ...`).
+        # Dirty-overlap (non-conflict failure) exits 1 and starts/ends stdout with `APPLY FAILED（未合入：...` (never ` commit ...`).
         repo = self.repo({"a.txt": "line1\nline2\nline3\nline4\nline5\n"})
         self.fake_pi(
             [fixtures.answer("done"), fixtures.SETTLED],
@@ -195,11 +203,13 @@ class DelegateApplySafetyTests(unittest.TestCase):
         (repo / "a.txt").write_text("line1\nline2\nline3\nline4\nFIVE\n", encoding="utf-8")
         res_dirty = self.cli("apply", r_dirty["run"], cwd=repo, human=True)
         self.assertEqual(res_dirty.returncode, 1, res_dirty.stdout + res_dirty.stderr)
-        dirty_first = res_dirty.stdout.splitlines()[0] if res_dirty.stdout.splitlines() else ""
+        dirty_lines = res_dirty.stdout.splitlines()
+        dirty_first = dirty_lines[0] if dirty_lines else ""
         self.assertTrue(
-            dirty_first.startswith("未合入："),
-            f"expected stdout first line '未合入：...', got: {res_dirty.stdout!r}",
+            dirty_first.startswith("APPLY FAILED（未合入："),
+            f"expected stdout first line 'APPLY FAILED（未合入：...', got: {res_dirty.stdout!r}",
         )
+        self.assertEqual(dirty_lines[-1], dirty_first)
         self.assertIn("!!! apply 失败", res_dirty.stdout)
 
         # Clean working tree, commit a conflicting change, then test `delegate merge` conflict exit 3.
@@ -307,11 +317,13 @@ class DelegateApplySafetyTests(unittest.TestCase):
 
         res_conflict = self.cli("apply", run_gl["run"], cwd=repo, human=True)
         self.assertEqual(res_conflict.returncode, 3, res_conflict.stdout + res_conflict.stderr)
-        conflict_first = res_conflict.stdout.splitlines()[0] if res_conflict.stdout.splitlines() else ""
+        conflict_lines = res_conflict.stdout.splitlines()
+        conflict_first = conflict_lines[0] if conflict_lines else ""
         self.assertTrue(
-            conflict_first.startswith("未合入："),
-            f"expected stdout first line '未合入：...', got: {res_conflict.stdout!r}",
+            conflict_first.startswith("APPLY FAILED（未合入："),
+            f"expected stdout first line 'APPLY FAILED（未合入：...', got: {res_conflict.stdout!r}",
         )
+        self.assertEqual(conflict_lines[-1], conflict_first)
         self.assertIn("vendor", res_conflict.stdout)
 
     # ------------------------------------------------------------------

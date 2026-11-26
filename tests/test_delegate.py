@@ -3481,8 +3481,10 @@ db.write_text(json.dumps(units))
         self.assertEqual(((repo / "a.txt").read_text(), (repo / "b.txt").read_text()), ("A\n", "B\n"))
         self.assertEqual(counter.read_text(), "x\n")  # the shared acceptance ran once, on the merged tree
         lines = result.stdout.splitlines()
+        self.assertEqual(lines[0], f"APPLY OK {first['run']} {second['run']}")
         self.assertIn("合并后验收通过", "\n".join(lines))
-        self.assertIn(f"delegate files {second['run']}", lines[-1])
+        self.assertIn(f"delegate files {second['run']}", lines[-2])
+        self.assertEqual(lines[-1], f"APPLY OK {first['run']} {second['run']}")
         self.assertFalse(Path(first["worktree"]).exists())
         self.assertFalse(Path(second["worktree"]).exists())
 

@@ -171,10 +171,12 @@ class Delegate626Tests(unittest.TestCase):
         self.assertIn("docs: second change", res.stdout)
         self.assertIn("改动未提交：2 个文件", res.stderr)
         self.assertIn("feat: first change", res.stderr)
-        # Last line remains acceptance validity for downstream parsers/tests.
+        # First and last lines carry the fixed APPLY OK verdict; files & acceptance lines precede it.
         lines = res.stdout.splitlines()
-        self.assertEqual(lines[-2], "验收仍然有效（仓库快照范围）")
-        self.assertIn(f"delegate files {state['run']}", lines[-1])
+        self.assertEqual(lines[0], f"APPLY OK {state['run']}")
+        self.assertEqual(lines[-3], "验收仍然有效（仓库快照范围）")
+        self.assertIn(f"delegate files {state['run']}", lines[-2])
+        self.assertEqual(lines[-1], f"APPLY OK {state['run']}")
 
     def test_apply_commit_flag_squashes_with_titles_and_fails_closed(self):
         repo = self.repo({"a.txt": "a0\n", "b.txt": "b0\n", "other.txt": "o0\n"})

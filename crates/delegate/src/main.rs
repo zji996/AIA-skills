@@ -2114,11 +2114,40 @@ fn files_command(args: &[String]) -> Res<i32> {
     Ok(0)
 }
 fn apply(args: &[String]) -> Res<i32> {
+    apply_or_land(args, false)
+}
+fn land(args: &[String]) -> Res<i32> {
+    apply_or_land(args, true)
+}
+fn apply_step_label_zh(step: &str) -> &'static str {
+    match step {
+        "dirty-overlap" => "源工作区目标文件已有未提交改动",
+        "conflicts" => "文件冲突",
+        "skipped-conflicts" => "跳过无法合并的文件",
+        "conflict-markers" => "存在冲突标记",
+        "regeneration" => "重新生成生成物",
+        "cherry-pick" => "cherry-pick 保留提交",
+        "commit" => "自动提交",
+        _ => "应用",
+    }
+}
+fn apply_or_land(args: &[String], land_mode: bool) -> Res<i32> {
     let apply_started_at = iso();
     let apply_t0 = std::time::Instant::now();
-    let (pos, flags, kv) = parse_simple(
-        "apply",
-        args,
+    let apply_flags: &[&str] = if land_mode {
+        &[
+            "--dry-run",
+            "--merge",
+            "--allow-dirty-overlap",
+            "--resume-regenerate",
+            "--verify",
+            "--no-verify",
+            "--keep",
+            "--keep-open",
+            "--force",
+            "--json",
+        ]
+    } else {
         &[
             "--dry-run",
             "--merge",
@@ -2132,8 +2161,13 @@ fn apply(args: &[String]) -> Res<i32> {
             "--keep-commits",
             "--commit",
             "--json",
-        ],
-        &["--closes"],
+        ]
+    };
+    let (pos, flags, kv) = parse_simple(
+        if land_mode { "land" } else { "apply" },
+        args,
+        apply_flags,
+        &["--closes", "-m", "--message", "-F"],
     )?;
     let closes_work = value(&kv, "--closes").map(str::to_string);
     if let Some(ref raw_w) = closes_work {
@@ -2150,9 +2184,50 @@ fn apply(args: &[String]) -> Res<i32> {
     if has(&flags, "--verify") && has(&flags, "--no-verify") {
         return Err("--verify and --no-verify are exclusive".into());
     }
-    let commit_mode = has(&flags, "--commit");
-    if commit_mode && has(&flags, "--keep-commits") {
+    let commit_mode = land_mode || has(&flags, "--commit");
+    if !land_mode && commit_mode && has(&flags, "--keep-commits") {
         return Err("--commit and --keep-commits are exclusive".into());
+    }
+    let mut msg_parts = Vec::<String>::new();
+    let mut msg_files = Vec::<String>::new();
+    for (k, v) in &kv {
+        match k.as_str() {
+            "-m" | "--message" => msg_parts.push(v.clone()),
+            "-F" => msg_files.push(v.clone()),
+            _ => {}
+        }
+    }
+    if !msg_parts.is_empty() && !msg_files.is_empty() {
+        return Err("-m/--message and -F are exclusive".into());
+    }
+    if msg_files.len() > 1 {
+        return Err("-F may only be specified once".into());
+    }
+    let custom_message: Option<String> = if !msg_parts.is_empty() {
+        let joined = msg_parts.join("\n\n");
+        if joined.trim().is_empty() {
+            return Err("commit message must not be empty".into());
+        }
+        Some(joined)
+    } else if let Some(path) = msg_files.first() {
+        let raw = if path == "-" {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                .map_err(|e| format!("read commit message from stdin: {e}"))?;
+            buf
+        } else {
+            fs::read_to_string(path)
+                .map_err(|e| format!("read commit message file {path}: {e}"))?
+        };
+        if raw.trim().is_empty() {
+            return Err(format!("commit message file is empty: {path}"));
+        }
+        Some(raw)
+    } else {
+        None
+    };
+    if !land_mode && custom_message.is_some() && !commit_mode {
+        return Err("-m/--message/-F require --commit (or use delegate land)".into());
     }
     let names = if pos.is_empty() {
         vec!["last".to_string()]
@@ -2197,6 +2272,8 @@ fn apply(args: &[String]) -> Res<i32> {
         regenerated_files: Vec<String>,
         had_dirty_merge: bool,
         already_applied: bool,
+        stdout_lines: Vec<String>,
+        committed_count: Option<usize>,
     }
     let mut done: Vec<DoneApply> = Vec::new();
     let mut applied_runs = Vec::new();
@@ -2214,6 +2291,7 @@ fn apply(args: &[String]) -> Res<i32> {
             commit_mode,
             has(&flags, "--allow-dirty-overlap"),
             has(&flags, "--resume-regenerate"),
+            land_mode,
         )?;
         if !outcome.already_applied && !dry && run.join(".applied").exists() {
             if !applied_runs.contains(run) {
@@ -2255,7 +2333,12 @@ fn apply(args: &[String]) -> Res<i32> {
             }
         }
         if outcome.code == 0 && (!outcome.already_applied || (forced == Some(true) && !dry)) {
-            for command in worktree::verify_plan(run, forced, &mut outcome.conclusion)? {
+            let verify_cmds = if land_mode {
+                worktree::verify_plan_for_land(run, forced, &mut outcome.conclusion)?
+            } else {
+                worktree::verify_plan(run, forced, &mut outcome.conclusion)?
+            };
+            for command in verify_cmds {
                 if !plan.contains(&command) {
                     plan.push(command);
                 }
@@ -2274,6 +2357,8 @@ fn apply(args: &[String]) -> Res<i32> {
             regenerated_files: outcome.regenerated_files,
             had_dirty_merge: outcome.had_dirty_merge,
             already_applied: outcome.already_applied,
+            stdout_lines: outcome.stdout_lines,
+            committed_count: None,
         });
         if code != 0 {
             break;
@@ -2310,6 +2395,10 @@ fn apply(args: &[String]) -> Res<i32> {
                     continue;
                 }
                 indices.push(idx);
+                // Stage the full chain net-changed file set (identical to `delegate files` / `diff --total`).
+                for p in worktree::run_files(&item.run) {
+                    paths_set.insert(p);
+                }
                 for p in &item.written_files {
                     paths_set.insert(p.clone());
                 }
@@ -2346,6 +2435,14 @@ fn apply(args: &[String]) -> Res<i32> {
                     trailer_runs.push(rid);
                 }
             }
+            let msg_file_path = land_mode
+                .then(|| indices.last().map(|&i| done[i].run.join("land-commit-msg.txt")))
+                .flatten();
+            let commit_opts = worktree::CommitAppliedOptions {
+                custom_message: custom_message.as_deref(),
+                keep_staged_on_error: land_mode,
+                message_file_on_error: msg_file_path.as_deref(),
+            };
             match worktree::commit_applied(
                 Path::new(&src),
                 &src_runs,
@@ -2354,14 +2451,16 @@ fn apply(args: &[String]) -> Res<i32> {
                 &run_names,
                 &trailer_runs,
                 dirty_merge,
+                &commit_opts,
             ) {
-                Ok((head, subject)) => {
+                Ok((head, subject, staged_count)) => {
                     for idx in indices {
                         done[idx].conclusion["apply"]["committed"] = json!(true);
                         if !head.is_empty() {
                             done[idx].conclusion["apply"]["commit"] = json!(&head);
                         }
                         done[idx].conclusion["apply"]["commitSubject"] = json!(&subject);
+                        done[idx].committed_count = Some(staged_count);
                     }
                     // HEAD advanced: wake `_merge-worker` for any other pending / blocked_mainline runs in this repo.
                     premerge::spawn_worker_force(Path::new(&src));
@@ -2371,222 +2470,348 @@ fn apply(args: &[String]) -> Res<i32> {
                     if let Some(&last_idx) = indices.last() {
                         done[last_idx].conclusion["apply"]["ok"] = json!(false);
                         done[last_idx].conclusion["apply"]["failedStep"] = json!("commit");
-                        done[last_idx].conclusion["apply"]["failureDetail"] = json!(err);
+                        done[last_idx].conclusion["apply"]["failureDetail"] = json!(err.detail);
                         done[last_idx].conclusion["apply"]["writtenFiles"] = json!(&paths);
+                        let next_cmds = if err.staged_kept {
+                            if let Some(msg_file) = err.msg_file {
+                                vec![format!(
+                                    "已写入与暂存保持原样；修复后直接续做提交：git -C {} commit -F {}",
+                                    shell_quote(&src),
+                                    shell_quote(&msg_file.to_string_lossy()),
+                                )]
+                            } else {
+                                vec![format!(
+                                    "已写入与暂存保持原样；修复后直接运行 git -C {} commit（附 Delegate-Run: {}）",
+                                    shell_quote(&src),
+                                    trailer_runs.join(", "),
+                                )]
+                            }
+                        } else {
+                            let dm = json(done[last_idx].run.join("meta.json"));
+                            let last_rid = events::run_id_for(&done[last_idx].run, &dm);
+                            vec![format!(
+                                "已写入文件保持原样；处理暂存区后按全链文件集提交：git -C {} add -A -- $({} files {last_rid}) && git -C {} commit",
+                                shell_quote(&src),
+                                shell_quote(&script().to_string_lossy()),
+                                shell_quote(&src),
+                            )]
+                        };
+                        done[last_idx].conclusion["apply"]["next"] = json!(next_cmds);
                     }
                     break;
                 }
             }
         }
     }
-    for item in &done {
-        let run = &item.run;
-        let conclusion = &item.conclusion;
-        let commands = &item.commands;
-        if item.already_applied {
-            let run_id = s(conclusion, "run");
-            let at = s(&conclusion["apply"], "appliedAt");
-            if output::json_enabled() {
-                println!("{}", format_status(conclusion.clone()));
-                eprintln!("delegate: {run_id} 已于 {at} 合入");
-            } else {
-                println!("{run_id} 已于 {at} 合入");
+    // Invariant: whenever any run reported `apply.ok == false`, a `failedStep`, unresolved
+    // conflict markers, or a failed verify step, `apply`/`land` MUST NOT exit 0 (3 for conflicts /
+    // unresolved conflict markers, 1 for other failures; signal codes >= 128 are preserved).
+    {
+        let mut has_conflict = false;
+        let mut has_failure = !verify.is_null() && verify["ok"] != json!(true);
+        for item in &done {
+            let ap = &item.conclusion["apply"];
+            let step = s(ap, "failedStep");
+            let has_markers = ap["conflictMarkers"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty());
+            if has_markers || matches!(step, "conflicts" | "skipped-conflicts" | "conflict-markers")
+            {
+                has_conflict = true;
             }
-            continue;
+            if ap["ok"] == json!(false) || !step.is_empty() {
+                has_failure = true;
+            }
         }
-        let final_line = if conclusion["acceptStillValid"] == json!(true) {
-            "验收仍然有效（仓库快照范围）".to_string()
-        } else if conclusion["apply"]["ok"] == json!(true)
-            && !dry
-            && !verify.is_null()
-            && conclusion["verify"].get("skipped").is_none()
-        {
-            String::new()
-        } else if conclusion["apply"]["ok"] == json!(true)
-            && !dry
-            && b(conclusion, "applyVerifyDisabled")
-            && conclusion["acceptStillValid"] == json!(false)
-            && !b(conclusion, "acceptPending")
-            && s(conclusion, "acceptValidityReason") != "acceptance failed"
-        {
-            if commands.is_empty() {
-                "主干已前进，验收快照失效；本仓库配置合入后不自动验收（任务没有验收命令）"
-                    .to_string()
+        if has_conflict && code < 128 {
+            code = worktree::EXIT_CONFLICT;
+        } else if has_failure && code == 0 {
+            code = 1;
+        }
+    }
+    let verb = if land_mode { "LAND" } else { "APPLY" };
+    let cmd_lower = if land_mode { "land" } else { "apply" };
+    let run_id_of = |item: &DoneApply| -> String {
+        let r = s(&item.conclusion, "run");
+        if !r.is_empty() {
+            r.to_string()
+        } else {
+            item.run
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    let (verdict_line, single_line_only) = if code == 0 {
+        if done.len() == 1 && done[0].already_applied {
+            let rid = run_id_of(&done[0]);
+            let at = s(&done[0].conclusion["apply"], "appliedAt");
+            (format!("{verb} OK {rid}（已于 {at} 合入）"), true)
+        } else {
+            let ids = done.iter().map(&run_id_of).collect::<Vec<_>>().join(" ");
+            (format!("{verb} OK {ids}"), false)
+        }
+    } else {
+        let failing_item = done
+            .iter()
+            .rev()
+            .find(|item| {
+                let ap = &item.conclusion["apply"];
+                ap["ok"] == json!(false)
+                    || !s(ap, "failedStep").is_empty()
+                    || ap["conflictMarkers"]
+                        .as_array()
+                        .is_some_and(|a| !a.is_empty())
+            })
+            .or_else(|| done.last());
+        let rid = failing_item.map(&run_id_of).unwrap_or_default();
+        let reason = if !verify.is_null() && verify["ok"] != json!(true) {
+            if b(&verify, "notExecuted") || b(&verify, "infrastructureFailure") {
+                "验收未完成".to_string()
             } else {
-                format!(
-                    "主干已前进，验收快照失效；本仓库配置合入后不自动验收，批量门禁时跑：{}",
-                    commands.join("；")
-                )
+                "验收失败".to_string()
+            }
+        } else if let Some(item) = failing_item {
+            let ap = &item.conclusion["apply"];
+            let step = s(ap, "failedStep");
+            let zh = apply_step_label_zh(step);
+            let written_empty = strings(&ap["writtenFiles"]).is_empty();
+            if written_empty && matches!(step, "conflicts" | "dirty-overlap" | "conflict-markers") {
+                format!("未合入：{zh}")
+            } else {
+                zh.to_string()
             }
         } else {
-            let validity = if b(conclusion, "acceptPending") {
-                "验收未完成（排队/基础设施）"
-            } else if conclusion["acceptStillValid"] == json!(false) {
-                "验收无效"
-            } else {
-                "验收有效性未确认"
-            };
-            if commands.is_empty() {
-                format!("{validity}；任务没有验收命令")
-            } else if b(conclusion, "acceptPending") {
-                format!("{validity}；重排：{} apply --verify --keep {}；或本地：DELEGATE_REMOTE=0 {} lane {}",
-                    shell_quote(&script().to_string_lossy()), run.file_name().unwrap_or_default().to_string_lossy(),
-                    shell_quote(&script().to_string_lossy()), shell_quote(&commands.join(" && ")))
-            } else {
-                format!("{validity}；需要在主干重跑：{}", commands.join("；"))
-            }
+            "应用".to_string()
         };
-        let blind_note = output::blind_note(&conclusion["acceptBlind"]);
-        println!("{}", format_status(conclusion.clone()));
-        if !output::json_enabled() && conclusion["fastForward"].is_object() {
-            let ff = &conclusion["fastForward"];
-            if b(ff, "hit") {
-                let bh = s(ff, "baseHead");
-                let short = &bh[..7.min(bh.len())];
-                let ms = ff["ms"].as_u64().unwrap_or(0);
-                if dry {
-                    println!("快进预演 ✓（基于 {short}）");
-                } else if conclusion["acceptStillValid"] == json!(true) {
-                    println!("快进合入 ✓（基于 {short}，跳过重跑验收，{ms}ms）");
-                } else {
-                    println!("快进合入 ✓（基于 {short}，{ms}ms）");
-                }
-            } else {
-                let reason = s(ff, "reason");
-                if !reason.is_empty() && s(ff, "missCode") != "missing_premerge" {
-                    println!("{reason}");
-                }
-            }
-        }
-        if !output::json_enabled() && !dry && conclusion["apply"]["ok"] == json!(true) {
-            let mut touched = std::collections::BTreeSet::<&str>::new();
-            for p in &item.written_files {
-                touched.insert(p.as_str());
-            }
-            for p in &item.regenerated_files {
-                touched.insert(p.as_str());
-            }
-            let count = touched.len();
-            if b(&conclusion["apply"], "committed") {
-                let hash = s(&conclusion["apply"], "commit");
-                let short = &hash[..7.min(hash.len())];
-                let subject = s(&conclusion["apply"], "commitSubject");
-                println!("已提交 {short} {subject}（{count} 个文件）");
-            } else if !b(&conclusion["apply"], "keepCommits") && count > 0 {
-                let titles: Vec<&str> = conclusion["commits"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|c| s(c, "title"))
-                    .filter(|t| !t.is_empty())
-                    .collect();
-                if titles.is_empty() {
-                    println!("改动未提交：{count} 个文件");
-                } else if titles.len() == 1 {
-                    println!("改动未提交：{count} 个文件；同事原提交标题：{}", titles[0]);
-                } else {
-                    println!("改动未提交：{count} 个文件；同事原提交标题：");
-                    for title in titles {
-                        println!("  - {title}");
-                    }
-                }
-            }
-        }
-        if !output::json_enabled() && !(final_line.is_empty() && blind_note.is_empty()) {
-            println!(
-                "{final_line}{}",
-                if blind_note.is_empty() || final_line.is_empty() {
-                    blind_note.clone()
-                } else {
-                    format!("；{blind_note}")
-                }
-            );
-        }
-    }
-    if !output::json_enabled() && !verify.is_null() {
-        println!(
-            "{}",
-            if verify["ok"] == json!(true) {
-                format!("合并后验收通过：{}", plan.join("；"))
-            } else if b(&verify, "notExecuted") || b(&verify, "infrastructureFailure") {
-                format!("合并已写入；{}；日志 {}", s(&verify, "next"), s(&verify, "log"))
-            } else {
-                format!(
-                    "合并后验收失败：{}；合并已写入主干，在主干修或 reply 同事；日志 {}",
-                    s(&verify, "command"),
-                    s(&verify, "log")
-                )
-            }
-        );
-    }
+        (format!("{verb} FAILED（{reason}） {rid}"), false)
+    };
     if !output::json_enabled() {
+        println!("{verdict_line}");
+    }
+    if output::json_enabled() || !single_line_only {
         for item in &done {
+            for line in &item.stdout_lines {
+                println!("{line}");
+            }
+            let run = &item.run;
             let conclusion = &item.conclusion;
-            if conclusion["apply"]["ok"] == json!(false) {
-                let step = s(&conclusion["apply"], "failedStep");
-                let step_zh = match step {
-                    "dirty-overlap" => "源工作区目标文件已有未提交改动",
-                    "conflicts" => "文件冲突",
-                    "skipped-conflicts" => "跳过无法合并的文件",
-                    "conflict-markers" => "存在冲突标记",
-                    "regeneration" => "重新生成生成物",
-                    "cherry-pick" => "cherry-pick 保留提交",
-                    "commit" => "自动提交",
-                    _ => "应用",
-                };
-                let detail = s(&conclusion["apply"], "failureDetail");
-                let written = strings(&conclusion["apply"]["writtenFiles"]);
-                let written_note = if written.is_empty() {
-                    "未写入源工作区".to_string()
+            let commands = &item.commands;
+            if item.already_applied {
+                let run_id = s(conclusion, "run");
+                let at = s(&conclusion["apply"], "appliedAt");
+                if output::json_enabled() {
+                    println!("{}", format_status(conclusion.clone()));
+                    eprintln!("delegate: {run_id} 已于 {at} 合入");
                 } else {
-                    let shown: Vec<_> = written.iter().take(10).cloned().collect();
-                    if written.len() > 10 {
-                        format!(
-                            "以下 {} 个文件已写入源工作区：{} 等",
-                            written.len(),
-                            shown.join("、")
-                        )
-                    } else {
-                        format!(
-                            "以下 {} 个文件已写入源工作区：{}",
-                            written.len(),
-                            shown.join("、")
-                        )
-                    }
+                    println!("{run_id} 已于 {at} 合入");
+                }
+                continue;
+            }
+            let final_line = if land_mode && conclusion["verify"]["skipped"] == json!("no-verify") {
+                "已跳过验收（--no-verify）".to_string()
+            } else if land_mode && conclusion["verify"]["skipped"] == json!("acceptStillValid") {
+                "沿用交付时验收（仓库快照范围）".to_string()
+            } else if conclusion["apply"]["ok"] == json!(true)
+                && !dry
+                && !verify.is_null()
+                && conclusion["verify"].get("skipped").is_none()
+            {
+                String::new()
+            } else if conclusion["acceptStillValid"] == json!(true) {
+                "验收仍然有效（仓库快照范围）".to_string()
+            } else if conclusion["apply"]["ok"] == json!(true)
+                && !dry
+                && b(conclusion, "applyVerifyDisabled")
+                && conclusion["acceptStillValid"] == json!(false)
+                && !b(conclusion, "acceptPending")
+                && s(conclusion, "acceptValidityReason") != "acceptance failed"
+            {
+                if commands.is_empty() {
+                    "主干已前进，验收快照失效；本仓库配置合入后不自动验收（任务没有验收命令）"
+                        .to_string()
+                } else {
+                    format!(
+                        "主干已前进，验收快照失效；本仓库配置合入后不自动验收，批量门禁时跑：{}",
+                        commands.join("；")
+                    )
+                }
+            } else {
+                let validity = if b(conclusion, "acceptPending") {
+                    "验收未完成（排队/基础设施）"
+                } else if conclusion["acceptStillValid"] == json!(false) {
+                    "验收无效"
+                } else {
+                    "验收有效性未确认"
                 };
-                println!(
-                    "!!! apply 失败（阶段：{step_zh} / {step}{}）；{written_note}",
-                    if detail.is_empty() {
-                        String::new()
+                if commands.is_empty() {
+                    format!("{validity}；任务没有验收命令")
+                } else if b(conclusion, "acceptPending") {
+                    format!("{validity}；重排：{} apply --verify --keep {}；或本地：DELEGATE_REMOTE=0 {} lane {}",
+                        shell_quote(&script().to_string_lossy()), run.file_name().unwrap_or_default().to_string_lossy(),
+                        shell_quote(&script().to_string_lossy()), shell_quote(&commands.join(" && ")))
+                } else {
+                    format!("{validity}；需要在主干重跑：{}", commands.join("；"))
+                }
+            };
+            let blind_note = output::blind_note(&conclusion["acceptBlind"]);
+            println!("{}", format_status(conclusion.clone()));
+            if !output::json_enabled() && conclusion["fastForward"].is_object() {
+                let ff = &conclusion["fastForward"];
+                if b(ff, "hit") {
+                    let bh = s(ff, "baseHead");
+                    let short = &bh[..7.min(bh.len())];
+                    let ms = ff["ms"].as_u64().unwrap_or(0);
+                    if dry {
+                        println!("快进预演 ✓（基于 {short}）");
+                    } else if conclusion["acceptStillValid"] == json!(true) {
+                        println!("快进合入 ✓（基于 {short}，跳过重跑验收，{ms}ms）");
                     } else {
-                        format!("；{detail}")
+                        println!("快进合入 ✓（基于 {short}，{ms}ms）");
+                    }
+                } else {
+                    let reason = s(ff, "reason");
+                    if !reason.is_empty() && s(ff, "missCode") != "missing_premerge" {
+                        println!("{reason}");
+                    }
+                }
+            }
+            if !output::json_enabled() && !dry && conclusion["apply"]["ok"] == json!(true) {
+                let mut touched = std::collections::BTreeSet::<&str>::new();
+                for p in &item.written_files {
+                    touched.insert(p.as_str());
+                }
+                for p in &item.regenerated_files {
+                    touched.insert(p.as_str());
+                }
+                let count = item.committed_count.unwrap_or(touched.len());
+                if b(&conclusion["apply"], "committed") {
+                    let hash = s(&conclusion["apply"], "commit");
+                    let short = &hash[..7.min(hash.len())];
+                    let subject = s(&conclusion["apply"], "commitSubject");
+                    println!("已提交 {short} {subject}（{count} 个文件）");
+                } else if !b(&conclusion["apply"], "keepCommits") && count > 0 {
+                    let titles: Vec<&str> = conclusion["commits"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|c| s(c, "title"))
+                        .filter(|t| !t.is_empty())
+                        .collect();
+                    if titles.is_empty() {
+                        println!("改动未提交：{count} 个文件");
+                    } else if titles.len() == 1 {
+                        println!("改动未提交：{count} 个文件；同事原提交标题：{}", titles[0]);
+                    } else {
+                        println!("改动未提交：{count} 个文件；同事原提交标题：");
+                        for title in titles {
+                            println!("  - {title}");
+                        }
+                    }
+                }
+            }
+            if !output::json_enabled() && !(final_line.is_empty() && blind_note.is_empty()) {
+                println!(
+                    "{final_line}{}",
+                    if blind_note.is_empty() || final_line.is_empty() {
+                        blind_note.clone()
+                    } else {
+                        format!("；{blind_note}")
                     }
                 );
-                if let Some(nexts) = conclusion["apply"]["next"].as_array() {
-                    for next_cmd in nexts.iter().filter_map(serde_json::Value::as_str) {
-                        if !next_cmd.is_empty() {
-                            println!("  下一步：{next_cmd}");
+            }
+        }
+        if !output::json_enabled() && !verify.is_null() {
+            println!(
+                "{}",
+                if verify["ok"] == json!(true) {
+                    format!("合并后验收通过：{}", plan.join("；"))
+                } else if b(&verify, "notExecuted") || b(&verify, "infrastructureFailure") {
+                    format!("合并已写入；{}；日志 {}", s(&verify, "next"), s(&verify, "log"))
+                } else {
+                    format!(
+                        "合并后验收失败：{}；合并已写入主干，在主干修或 reply 同事；日志 {}",
+                        s(&verify, "command"),
+                        s(&verify, "log")
+                    )
+                }
+            );
+            if land_mode && verify["ok"] != json!(true) {
+                if let Some(last) = done.last() {
+                    let last_rid = run_id_of(last);
+                    if b(&verify, "notExecuted") || b(&verify, "infrastructureFailure") {
+                        println!("  下一步：{}", s(&verify, "next"));
+                    } else {
+                        println!(
+                            "  下一步：在源工作区修复后重跑验收并提交（文件清单：{} files {last_rid}），或 {} reply {last_rid} \"修复验收失败\"",
+                            shell_quote(&script().to_string_lossy()),
+                            shell_quote(&script().to_string_lossy()),
+                        );
+                    }
+                }
+            }
+        }
+        if !output::json_enabled() {
+            for item in &done {
+                let conclusion = &item.conclusion;
+                if conclusion["apply"]["ok"] == json!(false) {
+                    let step = s(&conclusion["apply"], "failedStep");
+                    let step_zh = apply_step_label_zh(step);
+                    let detail = s(&conclusion["apply"], "failureDetail");
+                    let written = strings(&conclusion["apply"]["writtenFiles"]);
+                    let written_note = if written.is_empty() {
+                        "未写入源工作区".to_string()
+                    } else {
+                        let shown: Vec<_> = written.iter().take(10).cloned().collect();
+                        if written.len() > 10 {
+                            format!(
+                                "以下 {} 个文件已写入源工作区：{} 等",
+                                written.len(),
+                                shown.join("、")
+                            )
+                        } else {
+                            format!(
+                                "以下 {} 个文件已写入源工作区：{}",
+                                written.len(),
+                                shown.join("、")
+                            )
+                        }
+                    };
+                    println!(
+                        "!!! {cmd_lower} 失败（阶段：{step_zh} / {step}{}）；{written_note}",
+                        if detail.is_empty() {
+                            String::new()
+                        } else {
+                            format!("；{detail}")
+                        }
+                    );
+                    if let Some(nexts) = conclusion["apply"]["next"].as_array() {
+                        for next_cmd in nexts.iter().filter_map(serde_json::Value::as_str) {
+                            if !next_cmd.is_empty() {
+                                println!("  下一步：{next_cmd}");
+                            }
                         }
                     }
                 }
             }
         }
-    }
-    if !output::json_enabled() && !dry {
-        for item in &done {
-            let conclusion = &item.conclusion;
-            if let Some(paths) = conclusion["apply"]["conflictMarkers"]
-                .as_array()
-                .filter(|p| !p.is_empty())
-            {
-                println!(
-                    "!!! applied with conflict markers / 有冲突待解决: {}",
-                    paths
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
+        if !output::json_enabled() && !dry {
+            for item in &done {
+                let conclusion = &item.conclusion;
+                if let Some(paths) = conclusion["apply"]["conflictMarkers"]
+                    .as_array()
+                    .filter(|p| !p.is_empty())
+                {
+                    println!(
+                        "!!! applied with conflict markers / 有冲突待解决: {}",
+                        paths
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
             }
         }
     }
@@ -2711,32 +2936,6 @@ fn apply(args: &[String]) -> Res<i32> {
             }
         }
     }
-    // Invariant: whenever any run reported `apply.ok == false`, a `failedStep`, unresolved
-    // conflict markers, or a failed verify step, `apply` MUST NOT exit 0 (3 for conflicts /
-    // unresolved conflict markers, 1 for other failures; signal codes >= 128 are preserved).
-    {
-        let mut has_conflict = false;
-        let mut has_failure = !verify.is_null() && verify["ok"] != json!(true);
-        for item in &done {
-            let ap = &item.conclusion["apply"];
-            let step = s(ap, "failedStep");
-            let has_markers = ap["conflictMarkers"]
-                .as_array()
-                .is_some_and(|a| !a.is_empty());
-            if has_markers || matches!(step, "conflicts" | "skipped-conflicts" | "conflict-markers")
-            {
-                has_conflict = true;
-            }
-            if ap["ok"] == json!(false) || !step.is_empty() {
-                has_failure = true;
-            }
-        }
-        if has_conflict && code < 128 {
-            code = worktree::EXIT_CONFLICT;
-        } else if has_failure && code == 0 {
-            code = 1;
-        }
-    }
     if code == 0 && !dry && !output::json_enabled() {
         for item in &done {
             if item.already_applied {
@@ -2744,21 +2943,13 @@ fn apply(args: &[String]) -> Res<i32> {
             }
             let count = worktree::run_files(&item.run).len();
             if count > 0 {
-                let run_id = {
-                    let r = s(&item.conclusion, "run");
-                    if !r.is_empty() {
-                        r.to_string()
-                    } else {
-                        item.run
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned()
-                    }
-                };
+                let run_id = run_id_of(item);
                 println!("本 run 改动文件（{count} 个）：delegate files {run_id}");
             }
         }
+    }
+    if !output::json_enabled() && !single_line_only {
+        println!("{verdict_line}");
     }
     if code == 0 && !dry && !has(&flags, "--keep") {
         let done_set: std::collections::HashSet<PathBuf> =
@@ -3601,6 +3792,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "files" => files_command(rest),
         "patch" => patch(rest),
         "apply" => apply(rest),
+        "land" => land(rest),
         "mark-applied" => mark_applied_command(rest),
         "adopt" => adopt_command(rest),
         "lane" => lane::lane_command(rest),

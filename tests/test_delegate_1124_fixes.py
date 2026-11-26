@@ -139,10 +139,13 @@ class Delegate1124FixesTests(unittest.TestCase):
         # 1. Apply A cleanly (leaves uncommitted changes in source, auto-cleans & archives run A).
         ap_a = self.cli("apply", "--keep", run_a["run"], human=True)
         self.assertEqual(ap_a.returncode, 0, ap_a.stdout + ap_a.stderr)
+        ap_a_lines = ap_a.stdout.splitlines()
+        self.assertEqual(ap_a_lines[0], f"APPLY OK {run_a['run']}")
         self.assertEqual(
-            ap_a.stdout.splitlines()[-1],
+            ap_a_lines[-2],
             f"本 run 改动文件（2 个）：delegate files {run_a['run']}",
         )
+        self.assertEqual(ap_a_lines[-1], f"APPLY OK {run_a['run']}")
         # `delegate files <runA>` returns exact repo-relative paths (one per line).
         files_a = self.cli("files", run_a["run"], cwd=repo)
         self.assertEqual(files_a.returncode, 0, files_a.stderr)
@@ -155,10 +158,13 @@ class Delegate1124FixesTests(unittest.TestCase):
         # 3. Disjoint run C applies normally even though shared.rs & a_only.rs are dirty!
         ap_c = self.cli("apply", run_c["run"], human=True)
         self.assertEqual(ap_c.returncode, 0, ap_c.stdout + ap_c.stderr)
+        ap_c_lines = ap_c.stdout.splitlines()
+        self.assertEqual(ap_c_lines[0], f"APPLY OK {run_c['run']}")
         self.assertEqual(
-            ap_c.stdout.splitlines()[-1],
+            ap_c_lines[-2],
             f"本 run 改动文件（1 个）：delegate files {run_c['run']}",
         )
+        self.assertEqual(ap_c_lines[-1], f"APPLY OK {run_c['run']}")
         # Even AFTER auto-clean archived run C, `delegate files <runC>` still works!
         self.assertFalse(Path(run_c["dir"]).exists())
         files_c = self.cli("files", run_c["run"], cwd=repo)
@@ -185,10 +191,13 @@ class Delegate1124FixesTests(unittest.TestCase):
         self.assertEqual(ok_b.returncode, 0, ok_b.stdout + ok_b.stderr)
         self.assertEqual((repo / "shared.rs").read_text(), "from_A\nline2\nline3\nline4\nfrom_B\n")
         self.assertEqual((repo / "b_only.rs").read_text(), "b_only\n")
+        ok_b_lines = ok_b.stdout.splitlines()
+        self.assertEqual(ok_b_lines[0], f"APPLY OK {run_b['run']}")
         self.assertEqual(
-            ok_b.stdout.splitlines()[-1],
+            ok_b_lines[-2],
             f"本 run 改动文件（2 个）：delegate files {run_b['run']}",
         )
+        self.assertEqual(ok_b_lines[-1], f"APPLY OK {run_b['run']}")
         files_b_json = self.cli("files", "--json", run_b["run"], cwd=repo)
         self.assertEqual(files_b_json.returncode, 0, files_b_json.stderr)
         doc_b = json.loads(files_b_json.stdout)
