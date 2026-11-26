@@ -402,7 +402,8 @@ pub fn split_pending_runs_refs(
         let mode = s(st, "mode");
         let applied = b(st, "applied") || !s(st, "appliedAt").trim().is_empty();
         let cleaned = b(st, "cleaned") || state == "cleaned";
-        let question = b(st, "question");
+        let replied = !s(st, "repliedAt").trim().is_empty();
+        let question = b(st, "question") && !replied;
         let result_read = !s(st, "resultReadAt").trim().is_empty();
         let zero_change = hook_check::is_zero_change_delivery_ref(st, &by_id);
         if !hook_check::is_run_pending_actionable(
@@ -587,7 +588,8 @@ pub fn compute_pulse_and_alerts(
         let state = s(st, "state");
         let applied = b(st, "applied") || !s(st, "appliedAt").trim().is_empty();
         let cleaned = b(st, "cleaned") || state == "cleaned";
-        let question = b(st, "question");
+        let replied = !s(st, "repliedAt").trim().is_empty();
+        let question = b(st, "question") && !replied;
         let result_read = !s(st, "resultReadAt").trim().is_empty();
         let age_secs = run_last_activity_secs(st, now_ep);
         let name = run_display_name(st);

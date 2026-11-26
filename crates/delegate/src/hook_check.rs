@@ -150,7 +150,8 @@ pub fn classify_pending_runs(runs: &[Value]) -> Vec<String> {
         let mode = s(obj, "mode");
         let applied = b(obj, "applied") || !s(obj, "appliedAt").trim().is_empty();
         let cleaned = b(obj, "cleaned") || state == "cleaned";
-        let question = b(obj, "question");
+        let replied = !s(obj, "repliedAt").trim().is_empty();
+        let question = b(obj, "question") && !replied;
         let result_read = !s(obj, "resultReadAt").trim().is_empty();
         let zero_change = is_zero_change_delivery_ref(obj, &by_id);
         if is_run_pending_actionable(
@@ -3163,7 +3164,8 @@ fn evaluate_core(
             let run_mode = s(&obj, "mode").to_string();
             let is_applied = b(&obj, "applied") || !s(&obj, "appliedAt").trim().is_empty();
             let is_cleaned = b(&obj, "cleaned") || st == "cleaned";
-            let is_question = b(&obj, "question");
+            let is_replied = !s(&obj, "repliedAt").trim().is_empty();
+            let is_question = b(&obj, "question") && !is_replied;
             if is_cleaned || is_applied {
                 continue;
             }
@@ -4694,6 +4696,31 @@ mod tests {
         assert_eq!(
             t7.format_block_reason(0, HookFormat::Claude),
             "[W054] 真机验过 待闭环 5 小时。下一步：`delegate work close W054 --evidence \"…\"`"
+        );
+    }
+
+    #[test]
+    fn replied_question_with_result_read_is_not_pending() {
+        let runs = vec![
+            json!({
+                "run": "scout-replied",
+                "state": "answered",
+                "mode": "read-only",
+                "question": true,
+                "resultReadAt": "2026-11-27T05:00:00Z",
+                "repliedAt": "2026-11-27T05:00:01Z",
+            }),
+            json!({
+                "run": "scout-unreplied",
+                "state": "answered",
+                "mode": "read-only",
+                "question": true,
+                "resultReadAt": "2026-11-27T05:00:00Z",
+            }),
+        ];
+        assert_eq!(
+            classify_pending_runs(&runs),
+            vec!["scout-unreplied".to_string()]
         );
     }
 }

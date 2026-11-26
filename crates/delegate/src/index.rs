@@ -635,7 +635,8 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
             let is_superseded = superseded_ids.contains(&rid);
             let is_applied = b(&st, "applied") || !s(&st, "appliedAt").trim().is_empty();
             let is_cleaned = b(&st, "cleaned") || st_str == "cleaned";
-            let is_question = b(&st, "question");
+            let is_replied = !s(&st, "repliedAt").trim().is_empty();
+            let is_question = b(&st, "question") && !is_replied;
             let result_read = !s(&st, "resultReadAt").trim().is_empty();
             let mode = s(&st, "mode");
             let zero_change = crate::hook_check::is_zero_change_delivery_ref(&st, &all_runs_by_id);

@@ -567,6 +567,70 @@ class DelegateScoutFirstTests(unittest.TestCase):
         self.assertIn(ctrl_decision, extracted_prefix)
         self.assertFalse(extracted_prefix.rstrip().endswith("---"))
 
+    def test_scout_decision_question_cleared_from_hook_pending_after_reply(self):
+        repo = self._base_repo()
+        subprocess.run(["git", "-C", repo, "config", "user.name", "Test"], check=True)
+        subprocess.run(["git", "-C", repo, "config", "user.email", "test@example.com"], check=True)
+        # Starts with `需要主控决定` so the scout's own summary.json has `question: true`
+        decision_scout_note = (
+            "需要主控决定\n\n"
+            "说明里提到的 `old_alpha` 在仓内不存在，只有 [src/alpha.rs](src/alpha.rs#L1-L3) 的 `alpha_fn`。\n"
+            "我倾向直接改 `alpha_fn`，请确认。\n"
+        )
+        self.fake_pi(
+            [fixtures.answer(decision_scout_note), fixtures.SETTLED],
+            [fixtures.answer("writer completed after decision"), fixtures.SETTLED],
+            pre='if [ "$DELEGATE_MODE" = "write" ]; then echo "// decided" >> src/alpha.rs; fi',
+        )
+        res = self.cli(
+            "start",
+            "--worktree",
+            "--workdir",
+            repo,
+            "--accept",
+            "true",
+            "修改 `old_alpha` 逻辑",
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        run1 = json.loads(res.stdout.splitlines()[0])["run"]
+        w1 = self.cli("wait", run1)
+        self.assertEqual(w1.returncode, 0, w1.stderr)
+
+        sum1 = json.loads((self._run_dir(run1) / "summary.json").read_text(encoding="utf-8"))
+        self.assertTrue(sum1.get("question"))
+        self.assertTrue(sum1.get("scoutQuestion"))
+        scout_run = sum1["scoutRun"]
+        scout_dir = self._run_dir(scout_run)
+        scout_sum = json.loads((scout_dir / "summary.json").read_text(encoding="utf-8"))
+        self.assertTrue(scout_sum.get("question"), "scout summary.json should record question=true")
+
+        # Writer already consumed the scout question: scout meta has repliedAt and hook pending lists only run1.
+        scout_meta_before = json.loads((scout_dir / "meta.json").read_text(encoding="utf-8"))
+        self.assertTrue(scout_meta_before.get("repliedAt"))
+        pend_before = self.cli("hook", "pending", "--json", cwd=repo)
+        self.assertEqual(pend_before.returncode, 0, pend_before.stderr)
+        pending_ids_before = [it.get("target") for it in json.loads(pend_before.stdout).get("items", [])]
+        self.assertIn(run1, pending_ids_before)
+        self.assertNotIn(scout_run, pending_ids_before)
+
+        # Simulate a legacy scout run whose repliedAt was not yet written before `reply` runs.
+        scout_meta_before.pop("repliedAt", None)
+        (scout_dir / "meta.json").write_text(json.dumps(scout_meta_before), encoding="utf-8")
+
+        rep = self.cli("reply", run1, "直接改 alpha_fn。")
+        self.assertEqual(rep.returncode, 0, rep.stderr)
+        run2 = json.loads(rep.stdout.splitlines()[0])["run"]
+        w2 = self.cli("wait", run2)
+        self.assertEqual(w2.returncode, 0, w2.stderr)
+
+        scout_meta_after = json.loads((scout_dir / "meta.json").read_text(encoding="utf-8"))
+        self.assertTrue(scout_meta_after.get("repliedAt"), "reply must mark linked scout repliedAt")
+        pend_after = self.cli("hook", "pending", "--json", cwd=repo)
+        self.assertEqual(pend_after.returncode, 0, pend_after.stderr)
+        pending_ids_after = [it.get("target") for it in json.loads(pend_after.stdout).get("items", [])]
+        self.assertNotIn(scout_run, pending_ids_after)
+        self.assertNotIn(run1, pending_ids_after)
+
     def test_three_exceptions_and_non_write_skip_scout(self):
         repo = self._base_repo()
         subprocess.run(["git", "-C", repo, "config", "user.name", "Test"], check=True)

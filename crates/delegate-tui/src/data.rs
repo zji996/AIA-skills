@@ -1185,7 +1185,11 @@ fn parse_run_item(
         .to_string();
     let applied = v.get("applied").and_then(Value::as_bool).unwrap_or(false);
     let cleaned = v.get("cleaned").and_then(Value::as_bool).unwrap_or(false) || state == "cleaned";
-    let question = v.get("question").and_then(Value::as_bool).unwrap_or(false);
+    let replied = v
+        .get("repliedAt")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty());
+    let question = v.get("question").and_then(Value::as_bool).unwrap_or(false) && !replied;
     let result_read_at = v
         .get("resultReadAt")
         .and_then(Value::as_str)
@@ -4439,5 +4443,55 @@ mod snapshot_tests {
         let alerts = snap.effective_alerts();
         assert!(alerts.iter().any(|a| a.kind == "disk_high"));
         assert!(alerts.iter().any(|a| a.kind == "disk_stale_slot"));
+    }
+
+    #[test]
+    fn replied_question_with_result_read_is_collected_not_pending() {
+        let raw = r#"{
+            "schemaVersion": 1,
+            "seq": 1,
+            "repos": [{
+                "path": "/tmp/demo",
+                "runs": [
+                    {
+                        "run": "20261127-050000-scout-replied",
+                        "name": "scout-replied",
+                        "state": "answered",
+                        "mode": "read-only",
+                        "question": true,
+                        "resultReadAt": "2026-11-27T05:00:00Z",
+                        "repliedAt": "2026-11-27T05:00:01Z"
+                    },
+                    {
+                        "run": "20261127-050001-scout-unreplied",
+                        "name": "scout-unreplied",
+                        "state": "answered",
+                        "mode": "read-only",
+                        "question": true,
+                        "resultReadAt": "2026-11-27T05:00:00Z"
+                    }
+                ]
+            }],
+            "events": [],
+            "lane": {"maxHeavy": 2, "heavyJobs": 4, "active": [], "queued": []},
+            "dagQueue": [],
+            "merges": [],
+            "candidates": []
+        }"#;
+        let snap = parse_snapshot_json(raw, None, None).expect("snapshot parses");
+        let runs = &snap.repos[0].runs;
+        let replied = runs
+            .iter()
+            .find(|r| r.run == "20261127-050000-scout-replied")
+            .expect("replied scout run");
+        assert_eq!(replied.group, GroupKind::Collected);
+        assert!(!replied.question);
+
+        let unreplied = runs
+            .iter()
+            .find(|r| r.run == "20261127-050001-scout-unreplied")
+            .expect("unreplied scout run");
+        assert_eq!(unreplied.group, GroupKind::Pending);
+        assert!(unreplied.question);
     }
 }

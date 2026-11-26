@@ -2666,10 +2666,41 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         parent_meta["repliedAt"] = json!(iso());
         let _ = write_json(parent.join("meta.json"), &parent_meta);
     }
+    if let Some(scout_dir) = resolve_linked_scout_dir(&parent, &meta) {
+        crate::supervise::mark_scout_consumed(&scout_dir);
+    }
     let rc = rework_count(&child);
     crate::history::record_reply(&meta, &child, rc);
     crate::board::refresh_for_run(&child);
     Ok(child)
+}
+
+fn resolve_linked_scout_dir(parent: &Path, meta: &Value) -> Option<PathBuf> {
+    let scout_dir = s(meta, "scoutRunDir").trim();
+    if !scout_dir.is_empty() {
+        let p = PathBuf::from(scout_dir);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    let scout_id = {
+        let direct = s(meta, "scoutRun").trim();
+        if !direct.is_empty() {
+            direct
+        } else {
+            s(&meta["scout"], "run").trim()
+        }
+    };
+    if scout_id.is_empty() {
+        return None;
+    }
+    if let Some(runs_dir) = parent.parent() {
+        let sibling = runs_dir.join(scout_id);
+        if sibling.is_dir() {
+            return Some(sibling);
+        }
+    }
+    runs::resolve(scout_id).ok().filter(|p| p.is_dir())
 }
 pub fn active_machine(slots: &Path) -> Vec<PathBuf> {
     let mut out = vec![];

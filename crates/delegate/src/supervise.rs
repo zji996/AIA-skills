@@ -1821,14 +1821,36 @@ fn stop_scout_run(scout_dir: &Path) {
     }
 }
 
-fn mark_scout_consumed(scout_dir: &Path) {
+pub(crate) fn mark_scout_consumed(scout_dir: &Path) {
     if !scout_dir.is_dir() {
         return;
     }
-    crate::mark_result_read(scout_dir);
+    let meta_path = scout_dir.join("meta.json");
+    if meta_path.is_file() && !crate::archive::is_record(scout_dir) {
+        let mut smeta = json(&meta_path);
+        if smeta.is_object() {
+            let now = iso();
+            let mut changed = false;
+            if s(&smeta, "repliedAt").trim().is_empty() {
+                smeta["repliedAt"] = json!(&now);
+                changed = true;
+            }
+            if s(&smeta, "resultReadAt").trim().is_empty() {
+                smeta["resultReadAt"] = json!(&now);
+                changed = true;
+            }
+            if changed {
+                let _ = write_json(&meta_path, &smeta);
+            }
+            crate::index::upsert_run(scout_dir);
+        }
+    } else {
+        crate::mark_result_read(scout_dir);
+    }
     touch(scout_dir.join(".delivered"));
-    let smeta = json(scout_dir.join("meta.json"));
+    let smeta = json(&meta_path);
     crate::events::mark_run_read(&crate::events::run_id_for(scout_dir, &smeta));
+    crate::board::refresh_for_run(scout_dir);
 }
 
 fn emit_scout_map_dropped(
