@@ -2374,6 +2374,7 @@ fn apply_or_land(args: &[String], land_mode: bool) -> Res<i32> {
             last.conclusion["verify"] = verify.clone();
         }
     }
+    let mut commit_failed_sources = std::collections::HashSet::<String>::new();
     if code == 0 && !dry && commit_mode {
         let mut sources = Vec::<String>::new();
         for item in &done {
@@ -2384,14 +2385,14 @@ fn apply_or_land(args: &[String], land_mode: bool) -> Res<i32> {
                 sources.push(item.source.clone());
             }
         }
-        for src in sources {
+        for (src_idx, src) in sources.iter().enumerate() {
             let mut paths_set = std::collections::BTreeSet::<String>::new();
             let mut titles = Vec::<String>::new();
             let mut run_names = Vec::<String>::new();
             let mut dirty_merge = false;
             let mut indices = Vec::new();
             for (idx, item) in done.iter().enumerate() {
-                if item.already_applied || item.source != src {
+                if item.already_applied || item.source != *src {
                     continue;
                 }
                 indices.push(idx);
@@ -2424,7 +2425,7 @@ fn apply_or_land(args: &[String], land_mode: bool) -> Res<i32> {
             }
             let src_runs: Vec<PathBuf> = applied_runs
                 .iter()
-                .filter(|r| s(&json(r.join("meta.json"))["worktree"], "source") == src)
+                .filter(|r| s(&json(r.join("meta.json"))["worktree"], "source") == src.as_str())
                 .cloned()
                 .collect();
             let mut trailer_runs = Vec::<String>::new();
@@ -2444,7 +2445,7 @@ fn apply_or_land(args: &[String], land_mode: bool) -> Res<i32> {
                 message_file_on_error: msg_file_path.as_deref(),
             };
             match worktree::commit_applied(
-                Path::new(&src),
+                Path::new(src),
                 &src_runs,
                 &paths,
                 &titles,
@@ -2463,10 +2464,13 @@ fn apply_or_land(args: &[String], land_mode: bool) -> Res<i32> {
                         done[idx].committed_count = Some(staged_count);
                     }
                     // HEAD advanced: wake `_merge-worker` for any other pending / blocked_mainline runs in this repo.
-                    premerge::spawn_worker_force(Path::new(&src));
+                    premerge::spawn_worker_force(Path::new(src));
                 }
                 Err(err) => {
                     code = 1;
+                    for failed_src in &sources[src_idx..] {
+                        commit_failed_sources.insert(failed_src.clone());
+                    }
                     if let Some(&last_idx) = indices.last() {
                         done[last_idx].conclusion["apply"]["ok"] = json!(false);
                         done[last_idx].conclusion["apply"]["failedStep"] = json!("commit");
@@ -2476,13 +2480,13 @@ fn apply_or_land(args: &[String], land_mode: bool) -> Res<i32> {
                             if let Some(msg_file) = err.msg_file {
                                 vec![format!(
                                     "已写入与暂存保持原样；修复后直接续做提交：git -C {} commit -F {}",
-                                    shell_quote(&src),
+                                    shell_quote(src),
                                     shell_quote(&msg_file.to_string_lossy()),
                                 )]
                             } else {
                                 vec![format!(
                                     "已写入与暂存保持原样；修复后直接运行 git -C {} commit（附 Delegate-Run: {}）",
-                                    shell_quote(&src),
+                                    shell_quote(src),
                                     trailer_runs.join(", "),
                                 )]
                             }
@@ -2491,9 +2495,9 @@ fn apply_or_land(args: &[String], land_mode: bool) -> Res<i32> {
                             let last_rid = events::run_id_for(&done[last_idx].run, &dm);
                             vec![format!(
                                 "已写入文件保持原样；处理暂存区后按全链文件集提交：git -C {} add -A -- $({} files {last_rid}) && git -C {} commit",
-                                shell_quote(&src),
+                                shell_quote(src),
                                 shell_quote(&script().to_string_lossy()),
-                                shell_quote(&src),
+                                shell_quote(src),
                             )]
                         };
                         done[last_idx].conclusion["apply"]["next"] = json!(next_cmds);
@@ -2893,45 +2897,63 @@ fn apply_or_land(args: &[String], land_mode: bool) -> Res<i32> {
                 &apply_finished_at,
                 apply_elapsed_ms,
             );
-            let mut committed_runs = std::collections::HashSet::new();
-            let mut committed_worktrees = std::collections::HashSet::new();
-            let mut verify_failed_runs = std::collections::HashSet::new();
-            let post_verify_failed = !verify.is_null() && verify["ok"] == json!(false);
-            for d in &done {
-                let is_committed = b(&d.conclusion["apply"], "committed")
-                    || b(&d.conclusion["apply"], "keepCommits");
-                if is_committed {
-                    let dm = json(d.run.join("meta.json"));
-                    committed_runs.insert(events::run_id_for(&d.run, &dm));
-                    let wt = s(&dm["worktree"], "path");
-                    if !wt.is_empty() {
-                        committed_worktrees.insert(wt.to_string());
+            let work_records: Vec<(PathBuf, Value, Value)> = if commit_failed_sources.is_empty() {
+                applied_records
+            } else {
+                applied_records
+                    .into_iter()
+                    .filter(|(_, m, _)| {
+                        !commit_failed_sources.contains(s(&m["worktree"], "source"))
+                    })
+                    .collect()
+            };
+            if !work_records.is_empty() {
+                let mut committed_runs = std::collections::HashSet::new();
+                let mut committed_worktrees = std::collections::HashSet::new();
+                let mut verify_failed_runs = std::collections::HashSet::new();
+                let post_verify_failed = !verify.is_null() && verify["ok"] == json!(false);
+                for d in &done {
+                    let is_committed = b(&d.conclusion["apply"], "committed")
+                        || b(&d.conclusion["apply"], "keepCommits");
+                    if is_committed {
+                        let dm = json(d.run.join("meta.json"));
+                        committed_runs.insert(events::run_id_for(&d.run, &dm));
+                        let wt = s(&dm["worktree"], "path");
+                        if !wt.is_empty() {
+                            committed_worktrees.insert(wt.to_string());
+                        }
                     }
                 }
-            }
-            for (r, m, _) in &applied_records {
-                let rid = events::run_id_for(r, m);
-                let wt = s(&m["worktree"], "path");
-                if !wt.is_empty() && committed_worktrees.contains(wt) {
-                    committed_runs.insert(rid.clone());
+                for (r, m, _) in &work_records {
+                    let rid = events::run_id_for(r, m);
+                    let wt = s(&m["worktree"], "path");
+                    if !wt.is_empty() && committed_worktrees.contains(wt) {
+                        committed_runs.insert(rid.clone());
+                    }
+                    if post_verify_failed {
+                        verify_failed_runs.insert(rid);
+                    }
                 }
-                if post_verify_failed {
-                    verify_failed_runs.insert(rid);
+                let work_opts = work::ApplyWorkOptions {
+                    closes_work_id: if commit_failed_sources.is_empty() {
+                        closes_work.clone()
+                    } else {
+                        None
+                    },
+                    keep_open,
+                    forced: force_apply,
+                    committed_runs,
+                    verify_failed_runs,
+                };
+                let work_hints = work::on_runs_applied_with_options(&work_records, &work_opts);
+                work::check_stale_and_expired();
+                if commit_failed_sources.is_empty() {
+                    dag_queue::advance();
                 }
-            }
-            let work_opts = work::ApplyWorkOptions {
-                closes_work_id: closes_work.clone(),
-                keep_open,
-                forced: force_apply,
-                committed_runs,
-                verify_failed_runs,
-            };
-            let work_hints = work::on_runs_applied_with_options(&applied_records, &work_opts);
-            work::check_stale_and_expired();
-            dag_queue::advance();
-            if !output::json_enabled() {
-                for hint in work_hints {
-                    println!("{hint}");
+                if !output::json_enabled() {
+                    for hint in work_hints {
+                        println!("{hint}");
+                    }
                 }
             }
         }

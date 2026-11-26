@@ -348,6 +348,48 @@ class DelegateLandTests(unittest.TestCase):
         self.assertEqual(self.git(repo, "diff", "--cached", "--name-only"), "other.txt")
         self.assertEqual((repo / "a.txt").read_text(encoding="utf-8"), "a1\n")
 
+    def test_7_commit_failure_does_not_auto_close_work_item(self):
+        repo = self.repo({"a.txt": "a0\n", "b.txt": "b0\n"})
+        hook_path = repo / ".git" / "hooks" / "pre-commit"
+        hook_path.write_text("#!/bin/sh\necho 'hook blocked' >&2\nexit 1\n", encoding="utf-8")
+        hook_path.chmod(hook_path.stat().st_mode | stat.S_IXUSR)
+
+        # 7a) `land` commit failure MUST NOT trigger on_runs_applied / auto-close linked work item.
+        self.assertEqual(self.cli("work", "add", "land提交失败不关项", "--repo", repo, human=True).returncode, 0)
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo a1 > a.txt")
+        r_land = self.outcome(
+            self.cli(
+                "run", "--worktree", "--no-scout", "--workdir", repo,
+                "--name", "land-hook-work", "--work", "W001", "--accept", "true", "t1",
+            )
+        )
+        res_land = self.cli("land", r_land["run"], "-m", "feat: hook fail", cwd=repo, human=True)
+        self.assertEqual(res_land.returncode, 1, res_land.stdout + res_land.stderr)
+        card1 = json.loads(self.cli("work", "show", "W001", "--json", human=True).stdout)
+        self.assertNotEqual(card1["state"], "done", card1)
+        self.assertEqual(card1.get("closedKind", ""), "", card1)
+
+        # Unstage a.txt so apply --commit starts with a clean index before hitting pre-commit hook.
+        self.git(repo, "reset", "HEAD", "--", "a.txt")
+
+        # 7b) `apply --commit --closes W002` commit failure MUST NOT close work item either.
+        self.assertEqual(self.cli("work", "add", "apply提交失败不关项", "--repo", repo, human=True).returncode, 0)
+        self.fake_pi([fixtures.answer("done"), fixtures.SETTLED], pre="echo b1 > b.txt")
+        r_apply = self.outcome(
+            self.cli(
+                "run", "--worktree", "--no-scout", "--workdir", repo,
+                "--name", "apply-hook-work", "--work", "W002", "--accept", "true", "t2",
+            )
+        )
+        res_apply = self.cli(
+            "apply", "--commit", "--closes", "W002", "-m", "feat: apply hook fail", r_apply["run"],
+            cwd=repo, human=True,
+        )
+        self.assertEqual(res_apply.returncode, 1, res_apply.stdout + res_apply.stderr)
+        card2 = json.loads(self.cli("work", "show", "W002", "--json", human=True).stdout)
+        self.assertNotEqual(card2["state"], "done", card2)
+        self.assertEqual(card2.get("closedKind", ""), "", card2)
+
 
 if __name__ == "__main__":
     unittest.main()
