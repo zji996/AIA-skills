@@ -1646,7 +1646,89 @@ pub fn run_agent_cancellable(
         .map_err(|e| e.to_string())?;
     }
     let (agy_account, mut agy_overlay) = if on_agy {
-        crate::agy_accounts::AgyCredOverlay::prepare_active()?
+        let is_reviewer = b(meta, "isReviewer");
+        let is_extra_reviewer = b(meta, "isExtraReviewer");
+        let fresh_agy = b(meta, "freshAgySession");
+        let meta_path = if is_extra_reviewer {
+            run.join("meta.json")
+        } else if is_reviewer {
+            let owner = s(meta, "ownerRunDir");
+            if !owner.is_empty() {
+                PathBuf::from(owner).join("meta.json")
+            } else {
+                run.join("meta.json")
+            }
+        } else {
+            run.join("meta.json")
+        };
+        let (pin_key, switch_key) = if is_reviewer && !is_extra_reviewer {
+            ("reviewAgyAccount", "reviewAgyAccountSwitch")
+        } else {
+            ("agyAccount", "agyAccountSwitch")
+        };
+        let pinned_id: Option<String> = if fresh_agy {
+            None
+        } else {
+            let disk = json(&meta_path);
+            let from_disk = s(&disk, pin_key);
+            if !from_disk.is_empty() {
+                Some(from_disk.to_string())
+            } else {
+                let from_meta = s(meta, pin_key);
+                if !from_meta.is_empty() {
+                    Some(from_meta.to_string())
+                } else {
+                    None
+                }
+            }
+        };
+        let prep = crate::agy_accounts::AgyCredOverlay::prepare_for_session(
+            pinned_id.as_deref(),
+            s(meta, "model"),
+        )?;
+        if let Some(ref acct) = prep.account_id {
+            if meta_path.is_file() || is_extra_reviewer {
+                let mut disk = if meta_path.is_file() {
+                    json(&meta_path)
+                } else {
+                    json!({})
+                };
+                if disk.is_object() {
+                    let mut dirty = false;
+                    if s(&disk, pin_key) != acct.as_str() {
+                        disk[pin_key] = json!(acct);
+                        dirty = true;
+                    }
+                    if let Some(ref sw) = prep.switched {
+                        disk[switch_key] = json!({
+                            "from": sw.from,
+                            "to": sw.to,
+                            "reason": sw.reason,
+                            "at": iso(),
+                        });
+                        dirty = true;
+                    }
+                    if dirty {
+                        let _ = write_json(&meta_path, &disk);
+                    }
+                }
+            }
+        }
+        if let Some(ref sw) = prep.switched {
+            let _ = writeln!(
+                log,
+                "{}",
+                json!({
+                    "e": "agy_account_switch",
+                    "from": sw.from,
+                    "to": sw.to,
+                    "reason": sw.reason,
+                    "role": if is_reviewer { "reviewer" } else { "author" },
+                    "at": iso(),
+                })
+            );
+        }
+        (prep.account_id, prep.overlay)
     } else {
         (None, None)
     };

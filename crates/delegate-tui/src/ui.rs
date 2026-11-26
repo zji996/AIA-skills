@@ -1753,6 +1753,22 @@ fn build_detail_lines(
             push_wrapped(&mut out, &format!("  自检: {sc}"), width, muted());
         }
     }
+    if let Some(sw) = &run.agy_account_switch {
+        push_wrapped(
+            &mut out,
+            &sw.format_line(false),
+            width,
+            Style::default().fg(STATUS_PENDING),
+        );
+    }
+    if let Some(sw) = &run.review_agy_account_switch {
+        push_wrapped(
+            &mut out,
+            &sw.format_line(true),
+            width,
+            Style::default().fg(STATUS_PENDING),
+        );
+    }
 
     // Queue info
     if run.queue_reason.is_some()
@@ -5225,7 +5241,7 @@ fn render_account_switch_modal(
     if running_count > 0 {
         lines.push(Line::raw(""));
         let note_running = format!(
-            "当前有 {running_count} 个在跑 agy 进程：在跑的用原账号跑完，新运行/reply 使用新账号。"
+            "当前有 {running_count} 个在跑 agy 进程：在跑的进程与已开始的会话继续用原账号，新 run 用新账号。"
         );
         for l in wrap_text(&note_running, iw) {
             lines.push(Line::from(Span::styled(

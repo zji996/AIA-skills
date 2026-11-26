@@ -1121,7 +1121,29 @@ fn parse_run_item(
             .map(str::to_string),
         eta: parse_run_eta_value(v.get("eta")),
         card_l0: parse_card_l0_value(v.get("card")),
+        agy_account_switch: parse_agy_account_switch(v.get("agyAccountSwitch")),
+        review_agy_account_switch: parse_agy_account_switch(v.get("reviewAgyAccountSwitch")),
     }
+}
+
+fn parse_agy_account_switch(val: Option<&Value>) -> Option<AgyAccountSwitchInfo> {
+    let obj = val?.as_object()?;
+    let from = obj.get("from").and_then(Value::as_str)?.trim();
+    let to = obj.get("to").and_then(Value::as_str)?.trim();
+    if from.is_empty() || to.is_empty() {
+        return None;
+    }
+    let reason = obj
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    Some(AgyAccountSwitchInfo {
+        from: from.to_string(),
+        to: to.to_string(),
+        reason,
+    })
 }
 
 fn parse_card_l0_value(v: Option<&Value>) -> Option<CardL0Info> {

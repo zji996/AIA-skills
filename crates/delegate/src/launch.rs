@@ -2450,6 +2450,17 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     } else {
         config.value["agy"].clone()
     };
+    if !o.fresh && session.is_some() && crate::agy::is_agy(o.model.as_deref().unwrap_or("")) {
+        let pinned = s(&meta, "agyAccount");
+        let inherited = if !pinned.is_empty() {
+            pinned
+        } else {
+            s(&summary, "agyAccount")
+        };
+        if !inherited.is_empty() {
+            extra["agyAccount"] = json!(inherited);
+        }
+    }
     if o.fresh {
         extra["agentDeny"] = config.value["agentDeny"].clone();
         let (text, sources) = standing_text(
@@ -3373,6 +3384,9 @@ pub fn launch(
         "agy",
     ] {
         meta[key] = extra[key].clone();
+    }
+    if !s(extra, "agyAccount").is_empty() {
+        meta["agyAccount"] = extra["agyAccount"].clone();
     }
     meta["resultDisplayChars"] = extra["resultChars"].clone();
     if let Some(limit) = o.max_answer {

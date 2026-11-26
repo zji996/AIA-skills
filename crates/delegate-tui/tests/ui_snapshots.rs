@@ -754,7 +754,7 @@ fn snapshot_accounts_tab_active_marker_and_inplace_confirm_modal() {
     assert!(modal_screen.contains("确认切换 agy 账号"), "{modal_screen}");
     assert!(modal_screen.contains("bob (bob@example.test)"), "{modal_screen}");
     assert!(modal_screen.contains("1 个在跑 agy 进程"), "{modal_screen}");
-    assert!(modal_screen.contains("用原账号跑完"), "{modal_screen}");
+    assert!(modal_screen.contains("继续用原账号"), "{modal_screen}");
     assert!(modal_screen.contains("Enter/y 确认切换"), "{modal_screen}");
 
     // Cancel with 'n'
@@ -2880,4 +2880,48 @@ fn runs_default_status_grouping_v_toggle_and_l1_card_risk_section() {
     assert!(back_status.contains("按状态") && back_status.contains("待主控处理 (3)"), "{back_status}");
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn runs_detail_renders_agy_account_switch_notice() {
+    use delegate_tui::data::parse_snapshot_json;
+
+    let raw = r#"{
+        "seq": 10,
+        "repos": [{
+            "repo": "/home/dev/repo-alpha",
+            "runs": [{
+                "run": "20261126-155900-sticky-reply",
+                "name": "粘滞续做测试",
+                "state": "delivered",
+                "mode": "write",
+                "model": "agy/gemini-4-neon",
+                "agyAccount": "beta",
+                "agyAccountSwitch": {
+                    "from": "alpha",
+                    "to": "beta",
+                    "reason": "额度已耗尽"
+                }
+            }]
+        }],
+        "agyAccounts": {
+            "active": "beta",
+            "liveDrifted": false,
+            "accounts": []
+        },
+        "work": [],
+        "events": [],
+        "lane": {},
+        "dagQueue": [],
+        "merges": [],
+        "candidates": []
+    }"#;
+    let snap = parse_snapshot_json(raw, Some(Path::new("/home/dev")), None).unwrap();
+    let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("/home/dev/repo-alpha"), 5);
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    let rendered = render_to_string(&mut app, 160, 30);
+    assert!(
+        rendered.contains("本 run 已从 alpha 换到 beta（额度已耗尽）"),
+        "detail pane should render agy account switch line:\n{rendered}"
+    );
 }

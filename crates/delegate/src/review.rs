@@ -1510,6 +1510,7 @@ fn build_reviewer_meta(
 ) -> Value {
     let mut m = json!({
         "run": author_meta["run"],
+        "ownerRunDir": author_meta["dir"],
         "name": format!("{} [review]", s(author_meta, "name")),
         "dir": review_dir,
         "workdir": workdir,
@@ -1538,6 +1539,17 @@ fn build_reviewer_meta(
     });
     if s(&m, "agent").is_empty() {
         m["agent"] = json!(agents::AGENT);
+    }
+    if fork.is_some() {
+        let owner_dir = s(author_meta, "dir");
+        let pinned = if !owner_dir.is_empty() {
+            s(&json(Path::new(owner_dir).join("meta.json")), "reviewAgyAccount").to_string()
+        } else {
+            s(author_meta, "reviewAgyAccount").to_string()
+        };
+        if !pinned.is_empty() {
+            m["reviewAgyAccount"] = json!(pinned);
+        }
     }
     m
 }
@@ -2641,7 +2653,7 @@ pub fn run_accept_and_review(
                                 } else {
                                     PathBuf::from(s(meta, "workdir"))
                                 };
-                                let extra_meta = build_reviewer_meta(
+                                let mut extra_meta = build_reviewer_meta(
                                     meta,
                                     extra_cfg,
                                     &extra_dir,
@@ -2649,6 +2661,7 @@ pub fn run_accept_and_review(
                                     &extra_prompt_file,
                                     None,
                                 );
+                                extra_meta["isExtraReviewer"] = json!(true);
                                 crate::deny::prepare(&extra_meta, &extra_dir)?;
                                 ExtraPreDecision::Run {
                                     model: em_model,
@@ -2870,7 +2883,7 @@ pub fn run_accept_and_review(
                         } else {
                             reviewer_workdir.clone()
                         };
-                        let fb_meta = build_reviewer_meta(
+                        let mut fb_meta = build_reviewer_meta(
                             meta,
                             &active_review_cfg,
                             &fallback_dir,
@@ -2878,6 +2891,7 @@ pub fn run_accept_and_review(
                             &fb_prompt_file,
                             None,
                         );
+                        fb_meta["freshAgySession"] = json!(true);
                         let _ = crate::deny::prepare(&fb_meta, &fallback_dir);
                         active_exec_dir = fallback_dir;
                         active_exec_meta = fb_meta;

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `delegate`：`agy` 支持会话粘滞——每个 run（含审查员会话）首轮启动时将所用槽位 ID 钉入 `meta.json`（`agyAccount`/`reviewAgyAccount`，不记邮箱），后续 `reply`/追加/返工/审查补问/`--sync` 沿用钉住槽位起覆盖层，仅在原槽位被删、凭据/身份校验失败或额度快照确认耗尽时回退至当前活跃账号（绝不自动挑选第三账号）并在 `status`/`card`/TUI 显示「本 run 已从 A 换到 B（原因）」；`--fresh` 按新会话取当前活跃账号重新钉住，同步更新 `agy account use` 提示与 `references/agy-accounts.md`。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
 
 ## delegate 6.48.1 - 2026-11-26

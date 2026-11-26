@@ -829,6 +829,16 @@ pub fn human_detail(run: &Path, status: &Value) -> String {
     if let Some(drift_line) = format_source_drift(&status["sourceDrift"]) {
         lines.push(format!("  {drift_line}"));
     }
+    if let Some(line) =
+        crate::agy_accounts::format_account_switch_line(&status["agyAccountSwitch"], false)
+    {
+        lines.push(format!("  {line}"));
+    }
+    if let Some(line) =
+        crate::agy_accounts::format_account_switch_line(&status["reviewAgyAccountSwitch"], true)
+    {
+        lines.push(format!("  {line}"));
+    }
     if b(&meta, "netBaseRebased") && !s(&meta, "netBase").is_empty() {
         let sha = s(&meta, "netBase");
         lines.push(format!("  netBase: {}", &sha[..sha.len().min(7)]));

@@ -745,13 +745,17 @@ pub fn summarize_run_into_summary(run: &Path, meta: &Value, sum: &mut Value) {
         author_total = TokenCounts::default();
     }
 
-    // Determine active agy account slot ID (never email).
+    // Determine agy account slot ID (never email).
     if last_agy_account.is_none() && is_agy_meta(meta) {
         let live = json(run.join("live-usage.json"));
         last_agy_account = live["agyAccount"]
             .as_str()
             .filter(|x| !x.is_empty())
             .map(str::to_string)
+            .or_else(|| {
+                let pinned = s(meta, "agyAccount");
+                (!pinned.is_empty()).then(|| pinned.to_string())
+            })
             .or_else(crate::agy_accounts::active_account_id);
     }
 

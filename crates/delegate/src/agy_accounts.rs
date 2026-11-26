@@ -12,8 +12,9 @@
 //! - Slot directories are `0700`, credential files and `accounts.json` are `0600`,
 //!   written atomically via `O_CREAT|O_EXCL` mode `0600` temp file + `sync_data` + `rename`.
 //! - `use` can switch accounts even while `agy` processes are running: running processes
-//!   finish undisturbed on their original account, and only subsequent `agy` launches
-//!   (new runs / new `reply` rounds) pick up the newly active account.
+//!   and already-started sessions stay pinned to their original account (falling back to
+//!   the active account only if the pinned slot is deleted, invalid, or quota-exhausted),
+//!   while new runs (and `--fresh` sessions) pick up the newly active account.
 //! - Because `agy` writes refreshed OAuth tokens back to `~/.gemini/antigravity-cli/antigravity-oauth-token`,
 //!   each delegate-launched `agy` process runs with a private credential overlay `HOME`
 //!   (`0700` temp HOME with slot credentials copied `0600` and all other `$HOME` / `~/.gemini` /
@@ -2154,9 +2155,157 @@ fn symlink_dir_entries_except(src_dir: &Path, dst_dir: &Path, skip: &[&str]) -> 
     Ok(())
 }
 
+/// Recorded fallback when a session's pinned `agy` slot became unavailable and
+/// switched to the currently active slot (never picks a third account).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgyAccountSwitch {
+    pub from: String,
+    pub to: String,
+    pub reason: String,
+}
+
+/// Result of resolving an `agy` account slot and preparing its credential overlay.
+pub struct PreparedAgyAccount {
+    pub account_id: Option<String>,
+    pub overlay: Option<AgyCredOverlay>,
+    pub switched: Option<AgyAccountSwitch>,
+}
+
+/// Format a human-readable one-line notice for `status`, `card`, and TUI when a run
+/// fell back from its pinned `agy` slot to the active slot.
+pub fn format_account_switch_line(sw: &Value, is_reviewer: bool) -> Option<String> {
+    if !sw.is_object() {
+        return None;
+    }
+    let from = s(sw, "from");
+    let to = s(sw, "to");
+    let reason = s(sw, "reason");
+    if from.is_empty() || to.is_empty() {
+        return None;
+    }
+    let detail = match (is_reviewer, reason.is_empty()) {
+        (true, true) => "审查员".to_string(),
+        (true, false) => format!("审查员：{reason}"),
+        (false, true) => "原槽位不可用".to_string(),
+        (false, false) => reason.to_string(),
+    };
+    Some(format!("本 run 已从 {from} 换到 {to}（{detail}）"))
+}
+
+fn slot_model_pool_matches(model: &str, pool: &str) -> bool {
+    let pool_low = pool.to_ascii_lowercase();
+    let model_low = model.trim().to_ascii_lowercase();
+    if model_low.is_empty() {
+        return true;
+    }
+    if model_low.contains("gemini") {
+        pool_low.contains("gemini")
+    } else if model_low.contains("claude")
+        || model_low.contains("gpt")
+        || model_low.contains("opus")
+        || model_low.contains("sonnet")
+    {
+        pool_low.contains("claude") || pool_low.contains("gpt")
+    } else {
+        // Conservative: if the model does not map clearly to a known quota pool,
+        // do not guess that it is exhausted.
+        false
+    }
+}
+
+/// Check whether a pinned `agy` slot is definitely unavailable.
+/// Returns `Some(reason)` only when the slot is deleted, its credentials/identity are
+/// invalid, or cached real quota shows 0% remaining for an un-reset window of `model`.
+/// When uncertain (missing/stale/errored quota cache), returns `None` so the session
+/// stays on the pinned slot.
+pub(crate) fn check_pinned_slot_unavailability(
+    root: &Path,
+    state: &Value,
+    quota_cache: &Value,
+    pinned_id: &str,
+    model: &str,
+    now_ep: i64,
+) -> Option<String> {
+    if state["accounts"].get(pinned_id).is_none() {
+        return Some("原槽位已删除".to_string());
+    }
+    let sdir = slot_dir(root, pinned_id);
+    if !sdir.is_dir() {
+        return Some("原槽位已删除".to_string());
+    }
+    if !slot_has_core_token(&sdir) {
+        return Some("凭据失效".to_string());
+    }
+    let expected_email = s(&state["accounts"][pinned_id], "email").trim().to_string();
+    let mut valid_core = 0usize;
+    for cf in CRED_FILES {
+        let p = sdir.join(cf.slot_name);
+        let Ok(bytes) = fs::read(&p) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        if !expected_email.is_empty() {
+            if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                let file_email = match cf.slot_name {
+                    "google_accounts.json" => v.get("active").and_then(Value::as_str),
+                    "jetski-standalone-oauth-token"
+                    | "antigravity-cli-oauth-token"
+                    | "antigravity-oauth-token" => v.get("id_token_email").and_then(Value::as_str),
+                    _ => None,
+                };
+                if let Some(actual) = file_email.map(str::trim).filter(|s| !s.is_empty()) {
+                    if !actual.eq_ignore_ascii_case(&expected_email) {
+                        return Some("身份校验失败".to_string());
+                    }
+                }
+            }
+        }
+        if cf.is_core_token && cred_file_valid_for_email(cf, &bytes, &expected_email) {
+            valid_core += 1;
+        }
+    }
+    if valid_core == 0 {
+        return Some("凭据失效".to_string());
+    }
+
+    let acct_quota = &quota_cache["accounts"][pinned_id];
+    if acct_quota.is_object() {
+        if b(acct_quota, "identityMismatch") {
+            return Some("身份校验失败".to_string());
+        }
+        if b(acct_quota, "ok") {
+            if let Some(entries) = acct_quota["entries"].as_array() {
+                for entry in entries {
+                    let pool = s(entry, "pool");
+                    if !slot_model_pool_matches(model, pool) {
+                        continue;
+                    }
+                    let Some(pct) = entry["remainingPct"].as_f64() else {
+                        continue;
+                    };
+                    if pct.is_finite() && pct <= 0.0 {
+                        let reset_at = s(entry, "resetAt");
+                        let not_yet_reset = if reset_at.is_empty() {
+                            true
+                        } else {
+                            iso_epoch(reset_at).is_some_and(|rep| rep > now_ep)
+                        };
+                        if not_yet_reset {
+                            return Some("额度已耗尽".to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Private credential overlay HOME for a single delegate-launched `agy` process.
 ///
-/// Copies `CRED_FILES` from the active account slot (resolved under `.lock` before spawn)
+/// Copies `CRED_FILES` from the selected account slot (resolved under `.lock` before spawn)
 /// into a `0700` temporary HOME while symlinking all non-credential entries of `$HOME`,
 /// `$HOME/.gemini`, `$HOME/.gemini/antigravity-cli`, `$HOME/.gemini/antigravity`, and
 /// `$XDG_CONFIG_HOME` back to the real directories so sessions, settings, skills, caches,
@@ -2165,7 +2314,8 @@ fn symlink_dir_entries_except(src_dir: &Path, dst_dir: &Path, skip: &[&str]) -> 
 /// On exit (`finish()`), any refreshed `CRED_FILES` are validated and atomically saved
 /// back (`0600`) under `.lock` to **this process's own account slot**. Live `~/.gemini`
 /// is only mirrored if this account is still active and undrifted; if the user switched
-/// accounts while the process ran, live `~/.gemini` is never touched.
+/// accounts while the process ran (or this session is pinned to a non-active slot),
+/// live `~/.gemini` is never touched.
 pub struct AgyCredOverlay {
     temp_home: TempHome,
     real_home: PathBuf,
@@ -2183,38 +2333,132 @@ impl AgyCredOverlay {
     /// credentials exists. Returns `(None, None)` when no local `agy-accounts` store is
     /// configured (preserving direct-HOME behavior for single-account setups and tests).
     pub fn prepare_active() -> Res<(Option<String>, Option<Self>)> {
+        let prep = Self::prepare_for_session(None, "")?;
+        Ok((prep.account_id, prep.overlay))
+    }
+
+    /// Prepare a private credential overlay for a session, preferring `pinned_id` if set.
+    ///
+    /// Falls back to the currently active slot ONLY when `pinned_id` is unavailable
+    /// (deleted, invalid credentials / identity mismatch, or cached real quota exhausted).
+    /// Never chooses a third account.
+    pub fn prepare_for_session(
+        pinned_id: Option<&str>,
+        model: &str,
+    ) -> Res<PreparedAgyAccount> {
         let root = accounts_root();
         if !accounts_meta_path(&root).is_file() {
-            return Ok((None, None));
+            return Ok(PreparedAgyAccount {
+                account_id: None,
+                overlay: None,
+                switched: None,
+            });
         }
         let real_home = home();
         let real_xdg_config = env::var_os("XDG_CONFIG_HOME")
             .filter(|p| !p.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| real_home.join(".config"));
-        Self::prepare_active_for(&root, &real_home, &real_xdg_config)
+        let quota_cache = load_quota_cache();
+        Self::prepare_for_session_in(
+            &root,
+            &real_home,
+            &real_xdg_config,
+            pinned_id,
+            model,
+            &quota_cache,
+            epoch() as i64,
+        )
     }
 
+    #[cfg(test)]
     fn prepare_active_for(
         root: &Path,
         real_home: &Path,
         real_xdg_config: &Path,
     ) -> Res<(Option<String>, Option<Self>)> {
+        let empty_quota = json!({"accounts": {}});
+        let prep = Self::prepare_for_session_in(
+            root,
+            real_home,
+            real_xdg_config,
+            None,
+            "",
+            &empty_quota,
+            epoch() as i64,
+        )?;
+        Ok((prep.account_id, prep.overlay))
+    }
+
+    fn prepare_for_session_in(
+        root: &Path,
+        real_home: &Path,
+        real_xdg_config: &Path,
+        pinned_id: Option<&str>,
+        model: &str,
+        quota_cache: &Value,
+        now_ep: i64,
+    ) -> Res<PreparedAgyAccount> {
         let _lock = acquire_accounts_lock(root)?;
         let mut state = load_state(root);
-        let Some(active_id) = state["active"]
+        let active_id = state["active"]
             .as_str()
             .filter(|s| !s.is_empty())
-            .map(str::to_string)
-        else {
-            return Ok((None, None));
+            .map(str::to_string);
+
+        let pinned = pinned_id.map(str::trim).filter(|s| !s.is_empty());
+        let (selected_id, switched) = if let Some(pin) = pinned {
+            if let Some(reason) =
+                check_pinned_slot_unavailability(root, &state, quota_cache, pin, model, now_ep)
+            {
+                let can_fallback_to_active = active_id.as_deref().is_some_and(|act| {
+                    act != pin
+                        && state["accounts"].get(act).is_some()
+                        && slot_has_core_token(&slot_dir(root, act))
+                });
+                if can_fallback_to_active {
+                    let act = active_id.clone().unwrap();
+                    (
+                        Some(act.clone()),
+                        Some(AgyAccountSwitch {
+                            from: pin.to_string(),
+                            to: act,
+                            reason,
+                        }),
+                    )
+                } else if state["accounts"].get(pin).is_some()
+                    && slot_has_core_token(&slot_dir(root, pin))
+                {
+                    // No distinct active account to fall back to; stay on pinned slot
+                    // (never auto-select a third account).
+                    (Some(pin.to_string()), None)
+                } else {
+                    (None, None)
+                }
+            } else {
+                (Some(pin.to_string()), None)
+            }
+        } else {
+            (active_id.clone(), None)
         };
-        let sdir = slot_dir(root, &active_id);
+
+        let Some(selected_id) = selected_id else {
+            return Ok(PreparedAgyAccount {
+                account_id: None,
+                overlay: None,
+                switched: None,
+            });
+        };
+        let sdir = slot_dir(root, &selected_id);
         if !slot_has_core_token(&sdir) {
-            return Ok((Some(active_id), None));
+            return Ok(PreparedAgyAccount {
+                account_id: Some(selected_id),
+                overlay: None,
+                switched,
+            });
         }
         let account_email = {
-            let stored = s(&state["accounts"][&active_id], "email");
+            let stored = s(&state["accounts"][&selected_id], "email");
             if !stored.is_empty() {
                 stored.to_string()
             } else {
@@ -2222,50 +2466,52 @@ impl AgyCredOverlay {
             }
         };
 
-        // If live ~/.gemini belongs to the active slot and has fresher refreshed tokens
-        // (e.g. from an interactive agy session), sync those newer files into the slot
-        // before seeding the overlay so the child starts with a fresh access token.
-        let live = live_email(real_home).unwrap_or_default();
-        let live_matches = live.is_empty()
-            || account_email.is_empty()
-            || live.eq_ignore_ascii_case(&account_email);
-        if live_matches {
-            let mut synced = 0usize;
-            for cf in CRED_FILES {
-                let live_path = real_home.join(cf.home_rel);
-                let slot_path = sdir.join(cf.slot_name);
-                let Ok(live_meta) = fs::metadata(&live_path) else {
-                    continue;
-                };
-                if !live_meta.is_file() || live_meta.len() == 0 {
-                    continue;
+        // Only sync fresher refreshed tokens from live ~/.gemini when the selected slot
+        // IS the currently active slot (never cross-sync live creds into a non-active pinned slot).
+        let is_selected_active = active_id.as_deref() == Some(selected_id.as_str());
+        if is_selected_active {
+            let live = live_email(real_home).unwrap_or_default();
+            let live_matches = live.is_empty()
+                || account_email.is_empty()
+                || live.eq_ignore_ascii_case(&account_email);
+            if live_matches {
+                let mut synced = 0usize;
+                for cf in CRED_FILES {
+                    let live_path = real_home.join(cf.home_rel);
+                    let slot_path = sdir.join(cf.slot_name);
+                    let Ok(live_meta) = fs::metadata(&live_path) else {
+                        continue;
+                    };
+                    if !live_meta.is_file() || live_meta.len() == 0 {
+                        continue;
+                    }
+                    let live_newer = match (
+                        live_meta.modified().ok(),
+                        fs::metadata(&slot_path).and_then(|m| m.modified()).ok(),
+                    ) {
+                        (Some(lm), Some(sm)) => lm > sm,
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
+                    if !live_newer {
+                        continue;
+                    }
+                    let Ok(bytes) = fs::read(&live_path) else {
+                        continue;
+                    };
+                    if cred_file_valid_for_email(cf, &bytes, &account_email)
+                        && should_update_slot_file(&slot_path, &bytes)
+                        && write_secret_0600(&slot_path, &bytes, true).is_ok()
+                    {
+                        synced += 1;
+                    }
                 }
-                let live_newer = match (
-                    live_meta.modified().ok(),
-                    fs::metadata(&slot_path).and_then(|m| m.modified()).ok(),
-                ) {
-                    (Some(lm), Some(sm)) => lm > sm,
-                    (Some(_), None) => true,
-                    _ => false,
-                };
-                if !live_newer {
-                    continue;
+                if synced > 0 {
+                    if let Some(obj) = state["accounts"][&selected_id].as_object_mut() {
+                        obj.insert("lastSyncedAt".into(), json!(iso()));
+                    }
+                    let _ = save_state(root, &state);
                 }
-                let Ok(bytes) = fs::read(&live_path) else {
-                    continue;
-                };
-                if cred_file_valid_for_email(cf, &bytes, &account_email)
-                    && should_update_slot_file(&slot_path, &bytes)
-                    && write_secret_0600(&slot_path, &bytes, true).is_ok()
-                {
-                    synced += 1;
-                }
-            }
-            if synced > 0 {
-                if let Some(obj) = state["accounts"][&active_id].as_object_mut() {
-                    obj.insert("lastSyncedAt".into(), json!(iso()));
-                }
-                let _ = save_state(root, &state);
             }
         }
 
@@ -2327,19 +2573,20 @@ impl AgyCredOverlay {
             before.insert(cf.slot_name, bytes);
         }
 
-        let id_copy = active_id.clone();
-        Ok((
-            Some(id_copy),
-            Some(Self {
+        let id_copy = selected_id.clone();
+        Ok(PreparedAgyAccount {
+            account_id: Some(id_copy),
+            overlay: Some(Self {
                 temp_home,
                 real_home: real_home.to_path_buf(),
                 root: root.to_path_buf(),
-                account_id: active_id,
+                account_id: selected_id,
                 account_email,
                 before,
                 finished: false,
             }),
-        ))
+            switched,
+        })
     }
 
     #[cfg(test)]
@@ -3008,8 +3255,8 @@ fn cmd_use(args: &[String]) -> Res<i32> {
     }
 
     // Detect any running agy processes (for informational reporting only; switching is allowed
-    // while agy runs — running delegate processes use isolated credential overlays and finish
-    // on their original account, while new runs/replies pick up the newly active account).
+    // while agy runs — running processes and existing sessions continue on their original account,
+    // while new runs pick up the newly active account).
     let running = detect_running_agy_for_home(&home_dir);
 
     let prev_active = state["active"]
@@ -3115,12 +3362,16 @@ fn cmd_use(args: &[String]) -> Res<i32> {
         );
         if !running.is_empty() {
             println!(
-                "note: {} running agy process(es) will continue and finish on their original account; new runs/replies will use {target_id}.",
+                "note: {} running agy process(es) and existing sessions will continue on their original account; new runs will use {target_id}.",
                 running.len()
             );
             for p in &running {
                 println!("{}", format_running_proc_line(p));
             }
+        } else {
+            println!(
+                "note: running processes and existing sessions continue on their original account; new runs will use {target_id}."
+            );
         }
     }
     Ok(0)
@@ -3883,7 +4134,7 @@ fn print_account_help() {
          \x20                                      Show active account, live email, quota, usage, running agy\n\
          \x20 add [<id>] [--label TEXT] [--overwrite] [--agy-bin PATH] [-- <agy-args>...]\n\
          \x20                                      Run interactive agy login in a temp HOME and save slot\n\
-         \x20 use <id> [--force] [--json]          Save back refreshed tokens and switch (safe while agy runs; active runs finish on original account)\n\
+         \x20 use <id> [--force] [--json]          Save back refreshed tokens and switch (running processes & existing sessions stay on original account; new runs use new account)\n\
          \x20 note <id> [--weekly PCT] [--five-hour PCT] [--clear] [--json]\n\
          \x20                                      Record manual remaining-% snapshot (fallback when real quota absent)\n\
          \x20 remove <id> [--force] [--json]       Delete a saved account slot (alias: rm)\n\
@@ -4544,5 +4795,215 @@ Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSum
         assert!(line.contains("hot-acct"), "{line}");
         assert!(line.contains("11 小时"), "{line}");
         assert!(line.contains("不自动换号，请手动切换"), "{line}");
+    }
+
+    #[test]
+    fn sticky_session_keeps_pinned_slot_and_only_falls_back_to_active_when_unavailable() {
+        let base = TempHome::create().unwrap();
+        let real_home = base.path.join("home");
+        let real_cfg = real_home.join(".config");
+        let root = real_cfg.join("delegate/agy-accounts");
+        fs::create_dir_all(real_home.join(".gemini/antigravity-cli")).unwrap();
+
+        for (id, email, tok) in [
+            ("alpha", "alpha@example.test", "ALPHA-V1"),
+            ("beta", "beta@example.test", "BETA-V1"),
+            ("gamma", "gamma@example.test", "GAMMA-V1"),
+        ] {
+            let sdir = slot_dir(&root, id);
+            ensure_dir_mode(&sdir, 0o700).unwrap();
+            let bytes = make_test_token_json(email, tok, "2026-11-26T20:00:00Z");
+            write_secret_0600(&sdir.join("antigravity-cli-oauth-token"), &bytes, true).unwrap();
+        }
+        // Live ~/.gemini holds beta (current active).
+        install_slot_to_home(&slot_dir(&root, "beta"), &real_home).unwrap();
+        save_state(
+            &root,
+            &json!({
+                "schemaVersion": SCHEMA_VERSION,
+                "active": "beta",
+                "accounts": {
+                    "alpha": {"id": "alpha", "email": "alpha@example.test"},
+                    "beta": {"id": "beta", "email": "beta@example.test"},
+                    "gamma": {"id": "gamma", "email": "gamma@example.test"}
+                }
+            }),
+        )
+        .unwrap();
+
+        let now_ep = iso_epoch("2026-11-26T16:00:00Z").unwrap();
+        let empty_quota = json!({"accounts": {}});
+
+        // 1. Pinned alpha stays on alpha even though active is beta; refresh writes back to alpha only.
+        let prep = AgyCredOverlay::prepare_for_session_in(
+            &root,
+            &real_home,
+            &real_cfg,
+            Some("alpha"),
+            "agy/gemini-4-neon",
+            &empty_quota,
+            now_ep,
+        )
+        .unwrap();
+        assert_eq!(prep.account_id.as_deref(), Some("alpha"));
+        assert!(prep.switched.is_none());
+        let mut ov = prep.overlay.expect("overlay for alpha");
+        let refreshed_alpha =
+            make_test_token_json("alpha@example.test", "ALPHA-V2", "2026-11-26T22:00:00Z");
+        write_secret_0600(
+            &ov.overlay_home()
+                .join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            &refreshed_alpha,
+            false,
+        )
+        .unwrap();
+        assert_eq!(ov.finish(), 1);
+        let alpha_slot_doc: Value = serde_json::from_slice(
+            &fs::read(slot_dir(&root, "alpha").join("antigravity-cli-oauth-token")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(alpha_slot_doc["token"]["access_token"], "ALPHA-V2");
+        let live_doc: Value = serde_json::from_slice(
+            &fs::read(real_home.join(".gemini/antigravity-cli/antigravity-oauth-token")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(live_doc["token"]["access_token"], "BETA-V1");
+
+        // 2. Fresh session (pinned = None) uses active beta.
+        let fresh = AgyCredOverlay::prepare_for_session_in(
+            &root,
+            &real_home,
+            &real_cfg,
+            None,
+            "agy/gemini-4-neon",
+            &empty_quota,
+            now_ep,
+        )
+        .unwrap();
+        assert_eq!(fresh.account_id.as_deref(), Some("beta"));
+        assert!(fresh.switched.is_none());
+
+        // 3. Quota exhausted on Gemini pool (resetAt in future) -> falls back to active beta, not gamma.
+        let exhausted_quota = json!({
+            "accounts": {
+                "alpha": {
+                    "ok": true,
+                    "entries": [
+                        {"pool": "Gemini Models", "window": "fiveHour", "remainingPct": 0.0, "resetAt": "2026-11-26T18:00:00Z"},
+                        {"pool": "Claude and GPT models", "window": "fiveHour", "remainingPct": 85.0, "resetAt": "2026-11-26T18:00:00Z"}
+                    ]
+                }
+            }
+        });
+        let fb_gemini = AgyCredOverlay::prepare_for_session_in(
+            &root,
+            &real_home,
+            &real_cfg,
+            Some("alpha"),
+            "agy/gemini-4-neon",
+            &exhausted_quota,
+            now_ep,
+        )
+        .unwrap();
+        assert_eq!(fb_gemini.account_id.as_deref(), Some("beta"));
+        let sw = fb_gemini.switched.expect("should report switch");
+        assert_eq!(sw.from, "alpha");
+        assert_eq!(sw.to, "beta");
+        assert_eq!(sw.reason, "额度已耗尽");
+
+        // 4. Same quota cache, but Claude model -> Claude pool is 85%, so stays on alpha.
+        let keep_claude = AgyCredOverlay::prepare_for_session_in(
+            &root,
+            &real_home,
+            &real_cfg,
+            Some("alpha"),
+            "agy/claude-opus-4-6",
+            &exhausted_quota,
+            now_ep,
+        )
+        .unwrap();
+        assert_eq!(keep_claude.account_id.as_deref(), Some("alpha"));
+        assert!(keep_claude.switched.is_none());
+
+        // 5. Past resetAt -> stale 0% is ignored, stays on alpha.
+        let past_reset_quota = json!({
+            "accounts": {
+                "alpha": {
+                    "ok": true,
+                    "entries": [
+                        {"pool": "Gemini Models", "window": "fiveHour", "remainingPct": 0.0, "resetAt": "2026-11-26T15:00:00Z"}
+                    ]
+                }
+            }
+        });
+        let keep_past = AgyCredOverlay::prepare_for_session_in(
+            &root,
+            &real_home,
+            &real_cfg,
+            Some("alpha"),
+            "agy/gemini-4-neon",
+            &past_reset_quota,
+            now_ep,
+        )
+        .unwrap();
+        assert_eq!(keep_past.account_id.as_deref(), Some("alpha"));
+        assert!(keep_past.switched.is_none());
+
+        // 6. Active is STILL alpha while alpha is exhausted -> NEVER auto-rotates to beta or gamma.
+        save_state(
+            &root,
+            &json!({
+                "schemaVersion": SCHEMA_VERSION,
+                "active": "alpha",
+                "accounts": {
+                    "alpha": {"id": "alpha", "email": "alpha@example.test"},
+                    "beta": {"id": "beta", "email": "beta@example.test"},
+                    "gamma": {"id": "gamma", "email": "gamma@example.test"}
+                }
+            }),
+        )
+        .unwrap();
+        let no_auto_rotate = AgyCredOverlay::prepare_for_session_in(
+            &root,
+            &real_home,
+            &real_cfg,
+            Some("alpha"),
+            "agy/gemini-4-neon",
+            &exhausted_quota,
+            now_ep,
+        )
+        .unwrap();
+        assert_eq!(no_auto_rotate.account_id.as_deref(), Some("alpha"));
+        assert!(no_auto_rotate.switched.is_none());
+
+        // 7. Deleted pinned slot while active is beta -> falls back to active beta, never gamma.
+        save_state(
+            &root,
+            &json!({
+                "schemaVersion": SCHEMA_VERSION,
+                "active": "beta",
+                "accounts": {
+                    "beta": {"id": "beta", "email": "beta@example.test"},
+                    "gamma": {"id": "gamma", "email": "gamma@example.test"}
+                }
+            }),
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(slot_dir(&root, "alpha"));
+        let fb_deleted = AgyCredOverlay::prepare_for_session_in(
+            &root,
+            &real_home,
+            &real_cfg,
+            Some("alpha"),
+            "agy/gemini-4-neon",
+            &empty_quota,
+            now_ep,
+        )
+        .unwrap();
+        assert_eq!(fb_deleted.account_id.as_deref(), Some("beta"));
+        let sw_del = fb_deleted.switched.expect("switch on deleted slot");
+        assert_eq!(sw_del.from, "alpha");
+        assert_eq!(sw_del.to, "beta");
+        assert_eq!(sw_del.reason, "原槽位已删除");
     }
 }

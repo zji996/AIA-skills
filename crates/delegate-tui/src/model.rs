@@ -635,6 +635,25 @@ pub struct SnapshotPulse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AgyAccountSwitchInfo {
+    pub from: String,
+    pub to: String,
+    pub reason: String,
+}
+
+impl AgyAccountSwitchInfo {
+    pub fn format_line(&self, is_reviewer: bool) -> String {
+        let detail = match (is_reviewer, self.reason.is_empty()) {
+            (true, true) => "审查员".to_string(),
+            (true, false) => format!("审查员：{}", self.reason),
+            (false, true) => "原槽位不可用".to_string(),
+            (false, false) => self.reason.clone(),
+        };
+        format!("本 run 已从 {} 换到 {}（{detail}）", self.from, self.to)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RunItem {
     pub run: String,
     pub name: String,
@@ -702,6 +721,8 @@ pub struct RunItem {
     pub work_id: Option<String>,
     pub eta: Option<RunEtaInfo>,
     pub card_l0: Option<CardL0Info>,
+    pub agy_account_switch: Option<AgyAccountSwitchInfo>,
+    pub review_agy_account_switch: Option<AgyAccountSwitchInfo>,
 }
 
 impl RunItem {

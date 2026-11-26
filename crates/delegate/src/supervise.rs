@@ -745,6 +745,11 @@ pub(crate) fn continuation_with_file(meta: &Value, run: &Path, prompt_file: &Pat
     // The images went out with the first message and stay in the session; attaching them to a
     // continuation would send them a second time for no reason.
     next["images"] = json!([]);
+    // Same-session continuations (e.g. reviewer format-retry after a fallback model start)
+    // must keep the slot pinned by the first attempt rather than re-running as a fresh session.
+    if let Some(obj) = next.as_object_mut() {
+        obj.remove("freshAgySession");
+    }
     Some(next)
 }
 
@@ -1206,8 +1211,27 @@ fn escalate(
         meta["agentBin"] = json!(bin);
         meta["agentVersion"] = json!(version);
     }
+    sync_agy_account_fields(run, meta);
     write_json(run.join("meta.json"), meta)?;
     Ok(true)
+}
+
+fn sync_agy_account_fields(run: &Path, meta: &mut Value) {
+    let disk = json(run.join("meta.json"));
+    if !disk.is_object() {
+        return;
+    }
+    for key in [
+        "agyAccount",
+        "agyAccountSwitch",
+        "reviewAgyAccount",
+        "reviewAgyAccountSwitch",
+    ] {
+        let v = &disk[key];
+        if !v.is_null() && !v.as_str().is_some_and(str::is_empty) {
+            meta[key] = v.clone();
+        }
+    }
 }
 fn append_prepare_notice(run: &Path, line: &str) {
     let _ = append(run.join("prepare-notices.txt"), &format!("{line}\n"));
@@ -1578,6 +1602,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
     let (mut resumes, mut transient_error, mut auth_failed) = (0i64, String::new(), false);
     let (mut policy_refused, mut policy_rewrite_attempted) = (false, false);
     if setup_error.is_none() {
+        sync_agy_account_fields(run, &mut meta);
         let resumed = resume_transient(
             &meta,
             run,
@@ -1588,6 +1613,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
         (verdict, answer, attempts) = (resumed.verdict, resumed.answer, resumed.attempts);
         (resumes, transient_error, auth_failed) =
             (resumed.resumes, resumed.error, resumed.auth_failed);
+        sync_agy_account_fields(run, &mut meta);
         (verdict, answer, attempts) = resume_stalled(
             &meta,
             run,
@@ -1602,6 +1628,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
             holder.clone(),
             grace.clone(),
         );
+        sync_agy_account_fields(run, &mut meta);
         let recovered = recover_policy_refusal(
             &meta,
             run,
@@ -1675,6 +1702,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
             format!("{}\n", answer.trim_end_matches('\n')),
         )?;
     }
+    sync_agy_account_fields(run, &mut meta);
     crate::review::run_accept_and_review(
         &mut meta,
         run,
@@ -1704,6 +1732,7 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
             format!("{}\n", answer.trim_end_matches('\n')),
         )?;
     }
+    sync_agy_account_fields(run, &mut meta);
     if ["delivered", "answered"].contains(&state.as_str())
         && !s(&meta, "evidenceCommand").is_empty()
     {
@@ -1843,6 +1872,12 @@ fn inner(run: &Path, holder: Arc<AtomicI32>, grace: Arc<Mutex<Option<f64>>>) -> 
     let warnings = json(run.join("warnings.json"));
     if warnings.is_array() && !warnings.as_array().unwrap().is_empty() {
         sum["warnings"] = warnings;
+    }
+    sync_agy_account_fields(run, &mut meta);
+    for key in ["agyAccountSwitch", "reviewAgyAccountSwitch"] {
+        if meta[key].is_object() {
+            sum[key] = meta[key].clone();
+        }
     }
     worktree::capture_final_entries(&meta, run);
     crate::card::generate_and_save(run, &meta, &mut sum);
@@ -2078,6 +2113,35 @@ mod token_tests {
         let (_, fresh_delta) = compute_tokens(&child, &child_meta, &[&ct], "conv-99");
         assert!(fresh_delta.is_none());
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn continuation_with_file_clears_fresh_agy_session() {
+        let base = std::env::temp_dir().join(format!(
+            "delegate-cont-fresh-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        write(
+            base.join("events.jsonl"),
+            format!("{}\n", json!({"e":"session","id":"conv-fb-1"})),
+        )
+        .unwrap();
+        let prompt_file = base.join("format-retry-prompt.md");
+        write(&prompt_file, "retry\n").unwrap();
+        let meta = json!({
+            "model": "agy/gemini-4-neon",
+            "freshAgySession": true,
+            "isReviewer": true
+        });
+        let next = continuation_with_file(&meta, &base, &prompt_file).expect("continuation meta");
+        assert_eq!(s(&next, "fork"), "conv-fb-1");
+        assert!(
+            next.get("freshAgySession").is_none(),
+            "continuation must strip freshAgySession so format-retry stays pinned"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 }

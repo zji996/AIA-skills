@@ -3563,6 +3563,13 @@ pub fn compute_card(run: &Path, meta: &Value, sum: &Value, round_only: bool) -> 
     if let Some(appends) = crate::pending_reply::summary_json(run) {
         card_doc["appends"] = appends;
     }
+    for key in ["agyAccountSwitch", "reviewAgyAccountSwitch"] {
+        if meta[key].is_object() {
+            card_doc[key] = meta[key].clone();
+        } else if sum[key].is_object() {
+            card_doc[key] = sum[key].clone();
+        }
+    }
     Ok(card_doc)
 }
 
@@ -3734,6 +3741,16 @@ pub fn render_card_human(card: &Value) -> String {
                 out.push(format!("审查改用 {to}（{reason}）"));
             }
         }
+    }
+    if let Some(line) =
+        crate::agy_accounts::format_account_switch_line(&card["agyAccountSwitch"], false)
+    {
+        out.push(line);
+    }
+    if let Some(line) =
+        crate::agy_accounts::format_account_switch_line(&card["reviewAgyAccountSwitch"], true)
+    {
+        out.push(line);
     }
     if rev_extra.is_object() && s(rev_extra, "status") == "skipped" {
         let skip_reason = s(rev_extra, "skipReason");

@@ -823,6 +823,17 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
     if stall_warning.is_object() {
         out["stallWarning"] = stall_warning;
     }
+    for key in ["agyAccount", "reviewAgyAccount"] {
+        let val = s(&meta, key);
+        if !val.is_empty() {
+            out[key] = json!(val);
+        }
+    }
+    for key in ["agyAccountSwitch", "reviewAgyAccountSwitch"] {
+        if meta[key].is_object() {
+            out[key] = meta[key].clone();
+        }
+    }
     let review_doc = {
         let f = json(run.join("review.json"));
         if f.is_object() {
@@ -880,6 +891,8 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
             "tokensDelta",
             "reviewTokens",
             "agyAccount",
+            "agyAccountSwitch",
+            "reviewAgyAccountSwitch",
             "cleanup",
             "warnings",
             "warning",
