@@ -45,24 +45,40 @@ pub fn all_runs() -> Vec<PathBuf> {
     v.sort_by_cached_key(|p| json(p.join("meta.json"))["startedNs"].as_u64().unwrap_or(0));
     v
 }
-pub fn all_runs_sorted_with_index(index: &Value) -> Vec<PathBuf> {
-    let mut roots = vec![runs_root()];
+/// Collect `(repo_root, run_dir)` across all repositories registered on this machine
+/// (current repo / `DELEGATE_RUNS`, `state/repos.json`, and live `state/*.slot` files),
+/// deduplicated by canonical run path and sorted by `startedNs`.
+pub fn all_machine_runs_sorted_with_index(state: &Path, index: &Value) -> Vec<(PathBuf, PathBuf)> {
+    let mut repos = crate::index::discover_snapshot_repos(state, &[], None);
     if let Some(old) = legacy_runs_root() {
-        roots.push(old);
+        if old.is_dir() && !repos.iter().any(|(_, r)| r == &old) {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let cur_repo = git_top_fast(&cwd).unwrap_or(cwd);
+            repos.push((cur_repo, old));
+        }
     }
-    let mut v = roots
-        .into_iter()
-        .filter_map(|root| fs::read_dir(root).ok())
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.join("meta.json").is_file())
-        .collect::<Vec<_>>();
-    v.sort_by_cached_key(|p| {
+    let mut seen = std::collections::HashSet::<PathBuf>::new();
+    let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (repo_root, runs_dir) in repos {
+        let Ok(rd) = fs::read_dir(&runs_dir) else {
+            continue;
+        };
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if !p.join("meta.json").is_file() {
+                continue;
+            }
+            let canon = fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+            if seen.insert(canon) {
+                out.push((repo_root.clone(), p));
+            }
+        }
+    }
+    out.sort_by_cached_key(|(_, p)| {
         crate::index::cached_started_ns(p, index)
             .unwrap_or_else(|| json(p.join("meta.json"))["startedNs"].as_u64().unwrap_or(0))
     });
-    v
+    out
 }
 pub fn archived_runs() -> Vec<PathBuf> {
     let roots = all_runs_roots();
@@ -130,12 +146,18 @@ pub fn resolve(reference: &str) -> Res<PathBuf> {
     {
         return Ok(exact.clone());
     }
-    // An active run started from another repository is still reachable by its id.
+    // An active or finished run started from another registered repository is still reachable by its id.
     if let Some(active) = crate::launch::machine_runs(&crate::common::state_dir())
         .into_iter()
         .find(|p| p.file_name().is_some_and(|name| name == reference))
     {
         return Ok(active);
+    }
+    for (_, runs_dir) in crate::work::registered_repo_runs(&crate::common::state_dir()) {
+        let cand = runs_dir.join(reference);
+        if cand.join("meta.json").is_file() {
+            return Ok(cand);
+        }
     }
     let named = runs
         .iter()
@@ -698,6 +720,100 @@ pub fn status_detail(run: &Path) -> Value {
     status_with_opts(run, true)
 }
 
+fn build_remote_exec(run: &Path, meta: &Value, lane_info: Option<&Value>) -> Option<Value> {
+    let remote_enabled = crate::remote::enabled(&meta["remote"]);
+    let active_doc = json(run.join("remote-active.json"));
+    let active_doc_live = active_doc.is_object()
+        && active_doc["pid"]
+            .as_i64()
+            .is_none_or(|p| p > 0 && crate::cleanup::alive(p as i32));
+    let lane_remote = lane_info
+        .filter(|l| s(l, "queue").starts_with("remote-"));
+
+    if !remote_enabled && !active_doc_live && lane_remote.is_none() {
+        return None;
+    }
+
+    let raw_host = if active_doc_live && !s(&active_doc, "host").is_empty() {
+        s(&active_doc, "host").to_string()
+    } else {
+        crate::remote::host_alias(s(&meta["remote"], "host"))
+    };
+
+    let queue = if active_doc_live && !s(&active_doc, "queue").is_empty() {
+        s(&active_doc, "queue").to_string()
+    } else if let Some(l) = lane_remote {
+        s(l, "queue").to_string()
+    } else {
+        String::new()
+    };
+
+    let cmd = if active_doc_live && !s(&active_doc, "cmd").is_empty() {
+        s(&active_doc, "cmd").to_string()
+    } else if let Some(l) = lane_remote {
+        let c = s(l, "cmd");
+        if !c.is_empty() {
+            c.to_string()
+        } else {
+            s(l, "label").to_string()
+        }
+    } else {
+        String::new()
+    };
+
+    let active = active_doc_live || lane_remote.is_some();
+    let running = active_doc_live || lane_remote.is_some_and(|l| b(l, "running"));
+
+    let since = if active_doc_live && !s(&active_doc, "since").is_empty() {
+        s(&active_doc, "since").to_string()
+    } else if let Some(l) = lane_remote {
+        s(l, "since").to_string()
+    } else {
+        String::new()
+    };
+
+    let elapsed_secs = if active_doc_live {
+        active_doc["startedEpoch"]
+            .as_i64()
+            .map(|ep| (epoch() as i64 - ep).max(0))
+            .or_else(|| iso_epoch(&since).map(|ep| (epoch() as i64 - ep).max(0)))
+    } else if let Some(l) = lane_remote {
+        l["elapsedSeconds"]
+            .as_i64()
+            .or_else(|| iso_epoch(&since).map(|ep| (epoch() as i64 - ep).max(0)))
+    } else {
+        None
+    };
+
+    let log_path = run.join("remote-output.log");
+    let output_tail = crate::remote::read_output_tail(run, 15, 2400);
+
+    let mut obj = json!({
+        "host": raw_host,
+        "active": active,
+        "running": running,
+    });
+    if !queue.is_empty() {
+        obj["queue"] = json!(queue);
+    }
+    if !cmd.is_empty() {
+        obj["cmd"] = json!(cmd);
+    }
+    if !since.is_empty() {
+        obj["since"] = json!(since);
+    }
+    if let Some(secs) = elapsed_secs {
+        obj["elapsedSeconds"] = json!(secs);
+    }
+    if log_path.is_file() {
+        obj["logPath"] = json!(log_path.to_string_lossy());
+    }
+    if !output_tail.is_empty() {
+        obj["outputTail"] = json!(output_tail);
+    }
+    Some(obj)
+}
+
 pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
     let meta = json(run.join("meta.json"));
     let st = state(run);
@@ -981,6 +1097,9 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
     if let Some(lane_info) = crate::lane::run_active_lane(run) {
         out["lane"] = lane_info;
     }
+    if let Some(remote_exec) = build_remote_exec(run, &meta, out.get("lane")) {
+        out["remoteExec"] = remote_exec;
+    }
     if let Some(ahead) = crate::measure::waiting_ahead(run) {
         out["measureWaitingAhead"] = json!(ahead);
     }
@@ -1043,6 +1162,23 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
         if chain_round > 1 {
             out["chainName"] = json!(chain_name);
             out["chainRound"] = json!(chain_round);
+        }
+    }
+    if !s(&meta, "parent").is_empty() || max_round_result_num(run) > 0 {
+        let rounds = collect_result_rounds(run, true);
+        if rounds.len() > 1 || (!rounds.is_empty() && !s(&meta, "parent").is_empty()) {
+            out["authorRounds"] = json!(rounds
+                .iter()
+                .map(|r| json!({
+                    "round": r.round,
+                    "run": r.run_id,
+                    "kind": r.kind,
+                    "path": r.path.to_string_lossy(),
+                    "totalLines": r.total_lines,
+                    "totalChars": r.total_chars,
+                    "current": r.current,
+                }))
+                .collect::<Vec<_>>());
         }
     }
     if crate::work::any_notes_exist() {
@@ -2047,6 +2183,83 @@ mod agy_conversation_tests {
         fs::remove_file(base.join(".generate-pending")).unwrap();
         fs::write(base.join(".applied"), r#"{"appliedBy":"delegate"}"#).unwrap();
         assert!(is_applied_marker(&base));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn machine_runs_include_other_repos_sessions_and_remote_exec_tail() {
+        let base = std::env::temp_dir().join(format!(
+            "delegate-machine-runs-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let state = base.join("state");
+        let repo_a = base.join("repo-a");
+        let repo_b = base.join("repo-b");
+        let runs_a = repo_a.join(".local/run/delegate");
+        let runs_b = repo_b.join(".local/run/delegate");
+        let run_a = runs_a.join("20261126-010000-local");
+        let run_b = runs_b.join("20261126-020000-remote-train");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&run_a).unwrap();
+        fs::create_dir_all(&run_b).unwrap();
+
+        fs::write(
+            run_a.join("meta.json"),
+            r#"{"run":"20261126-010000-local","name":"local-task","caller":"sess-1","startedNs":100}"#,
+        )
+        .unwrap();
+        fs::write(
+            run_b.join("meta.json"),
+            r#"{"run":"20261126-020000-remote-train","name":"train-m4","caller":"sess-2","startedNs":200,"remote":{"host":"dev@gpu-1"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            run_b.join("remote-active.json"),
+            format!(
+                r#"{{"host":"gpu-1","queue":"remote-heavy","cmd":"uv run python train.py","pid":{},"startedEpoch":1000,"since":"2026-11-26T08:00:00Z"}}"#,
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            run_b.join("remote-output.log"),
+            "epoch 1 loss=0.5\nepoch 2 loss=0.3\n",
+        )
+        .unwrap();
+
+        let repos_doc = json!({
+            "repos": {
+                runs_a.to_string_lossy().to_string(): {"repo": repo_a, "runs": runs_a},
+                runs_b.to_string_lossy().to_string(): {"repo": repo_b, "runs": runs_b},
+            }
+        });
+        fs::write(state.join("repos.json"), repos_doc.to_string()).unwrap();
+
+        let found = all_machine_runs_sorted_with_index(&state, &json!({}));
+        let names: Vec<String> = found
+            .iter()
+            .filter_map(|(_, p)| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "20261126-010000-local"),
+            "missing repo-a run: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "20261126-020000-remote-train"),
+            "missing repo-b remote run: {names:?}"
+        );
+
+        let st = status(&run_b);
+        let re = &st["remoteExec"];
+        assert_eq!(s(re, "host"), "gpu-1");
+        assert!(b(re, "active"));
+        assert!(b(re, "running"));
+        assert_eq!(s(re, "cmd"), "uv run python train.py");
+        let tail = re["outputTail"].as_array().expect("outputTail array");
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[1].as_str(), Some("epoch 2 loss=0.3"));
 
         let _ = fs::remove_dir_all(&base);
     }

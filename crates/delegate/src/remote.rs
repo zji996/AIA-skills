@@ -1125,6 +1125,142 @@ fn environment_for(meta: &Value, light: bool) -> BTreeMap<String, String> {
     vars.insert("CARGO_BUILD_JOBS".into(), jobs.to_string());
     vars
 }
+/// Sanitized display alias for a configured remote host (strips any `user@` prefix).
+pub fn host_alias(host: &str) -> String {
+    let trimmed = host.trim();
+    match trimmed.rsplit_once('@') {
+        Some((_, alias)) if !alias.trim().is_empty() => alias.trim().to_string(),
+        _ => trimmed.to_string(),
+    }
+}
+
+const REMOTE_LOG_MAX_BYTES: usize = 256 * 1024;
+const REMOTE_LOG_KEEP_BYTES: usize = 32 * 1024;
+
+struct TailLogWriter {
+    path: PathBuf,
+    file: Option<fs::File>,
+    written: usize,
+    ring: Vec<u8>,
+}
+
+impl TailLogWriter {
+    fn create(path: PathBuf) -> Self {
+        let file = fs::File::create(&path).ok();
+        Self {
+            path,
+            file,
+            written: 0,
+            ring: Vec::new(),
+        }
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.ring.extend_from_slice(bytes);
+        if self.ring.len() > REMOTE_LOG_KEEP_BYTES {
+            let drain = self.ring.len() - REMOTE_LOG_KEEP_BYTES;
+            self.ring.drain(..drain);
+        }
+        if let Some(ref mut f) = self.file {
+            if f.write_all(bytes).is_ok() {
+                self.written += bytes.len();
+                if self.written > REMOTE_LOG_MAX_BYTES {
+                    let tmp_path = self.path.with_file_name(format!(
+                        ".{}.tmp.{}",
+                        self.path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("remote-output.log"),
+                        std::process::id()
+                    ));
+                    if let Ok(mut tmp) = fs::File::create(&tmp_path) {
+                        if tmp.write_all(&self.ring).is_ok()
+                            && tmp.flush().is_ok()
+                            && fs::rename(&tmp_path, &self.path).is_ok()
+                        {
+                            self.written = self.ring.len();
+                            self.file = Some(tmp);
+                        } else {
+                            let _ = fs::remove_file(&tmp_path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Lock-free read of the trailing lines of `<run>/remote-output.log` for status/TUI display.
+pub fn read_output_tail(run: &Path, max_lines: usize, max_bytes: usize) -> Vec<String> {
+    if max_lines == 0 || max_bytes == 0 {
+        return Vec::new();
+    }
+    let path = run.join("remote-output.log");
+    let Ok(mut f) = fs::File::open(&path) else {
+        return Vec::new();
+    };
+    let Ok(meta) = f.metadata() else {
+        return Vec::new();
+    };
+    let len = meta.len();
+    if len == 0 {
+        return Vec::new();
+    }
+    use std::io::Seek;
+    let read_len = len.min(max_bytes as u64);
+    if len > read_len && f.seek(std::io::SeekFrom::End(-(read_len as i64))).is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::with_capacity(read_len as usize);
+    if f.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(|l| l.trim_end_matches('\r').to_string())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if lines.len() > max_lines {
+        lines.drain(..lines.len() - max_lines);
+    }
+    lines
+}
+
+struct ActiveRemoteGuard {
+    path: PathBuf,
+}
+
+impl ActiveRemoteGuard {
+    fn start(run: &Path, host: &str, queue: &str, cmd: &str, log_path: &Path) -> Self {
+        let path = run.join("remote-active.json");
+        let now_ep = epoch() as i64;
+        let since = format_time(false, "%Y-%m-%dT%H:%M:%SZ");
+        let _ = write_json(
+            &path,
+            &json!({
+                "host": host_alias(host),
+                "queue": queue,
+                "cmd": cmd,
+                "pid": std::process::id(),
+                "startedEpoch": now_ep,
+                "since": since,
+                "log": log_path,
+            }),
+        );
+        Self { path }
+    }
+}
+
+impl Drop for ActiveRemoteGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 fn relay(
     reader: impl Read,
     stderr: bool,
@@ -1132,6 +1268,7 @@ fn relay(
     local: String,
     marker: String,
     exit: Arc<AtomicI32>,
+    log: Option<Arc<std::sync::Mutex<TailLogWriter>>>,
 ) {
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::new();
@@ -1167,6 +1304,11 @@ fn relay(
             rest = &rest[pos + remote.len()..];
         }
         text.extend_from_slice(rest);
+        if let Some(ref sink) = log {
+            if let Ok(mut guard) = sink.lock() {
+                guard.append(&text);
+            }
+        }
         if stderr {
             let _ = std::io::stderr().write_all(&text);
         } else {
@@ -1384,6 +1526,15 @@ fn execute(run: &Path, meta: &Value, program: &str, args: &[String]) -> Res<i32>
     group(&mut c);
     let mut child = c.spawn().map_err(|e| e.to_string())?;
     shell_status("executing", true);
+    let log_path = run.join("remote-output.log");
+    let queue_name = if light { "remote-light" } else { "remote-heavy" };
+    let full_cmd = if args.is_empty() {
+        program.to_string()
+    } else {
+        clip(&format!("{program} {}", args.join(" ")), 160)
+    };
+    let _active_remote = ActiveRemoteGuard::start(run, host, queue_name, &full_cmd, &log_path);
+    let log_writer = Arc::new(std::sync::Mutex::new(TailLogWriter::create(log_path)));
     let code = Arc::new(AtomicI32::new(-1));
     let out = child.stdout.take().unwrap();
     let err = child.stderr.take().unwrap();
@@ -1392,15 +1543,17 @@ fn execute(run: &Path, meta: &Value, program: &str, args: &[String]) -> Res<i32>
         top.to_string_lossy().into_owned(),
         marker.clone(),
         code.clone(),
+        Some(log_writer.clone()),
     );
-    let stdout = std::thread::spawn(move || relay(out, false, a.0, a.1, a.2, a.3));
+    let stdout = std::thread::spawn(move || relay(out, false, a.0, a.1, a.2, a.3, a.4));
     let a = (
         absolute.clone(),
         top.to_string_lossy().into_owned(),
         marker,
         code.clone(),
+        Some(log_writer),
     );
-    let stderr = std::thread::spawn(move || relay(err, true, a.0, a.1, a.2, a.3));
+    let stderr = std::thread::spawn(move || relay(err, true, a.0, a.1, a.2, a.3, a.4));
     let status = loop {
         if crate::lane::stopped() {
             stop(host, &id, &pidfile, slice);
@@ -1732,5 +1885,29 @@ mod tests {
                 libc::close(master);
             }
         }
+    }
+
+    #[test]
+    fn host_alias_strips_user_and_tail_log_reads_last_lines() {
+        assert_eq!(host_alias("gpu-1"), "gpu-1");
+        assert_eq!(host_alias("dev@gpu-1"), "gpu-1");
+        assert_eq!(host_alias("  worker-a  "), "worker-a");
+
+        let base = std::env::temp_dir().join(format!(
+            "delegate-remote-tail-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let mut writer = TailLogWriter::create(base.join("remote-output.log"));
+        for i in 1..=20 {
+            writer.append(format!("step {i} loss=0.{i:02}\n").as_bytes());
+        }
+        let tail = read_output_tail(&base, 3, 2048);
+        assert_eq!(
+            tail,
+            vec!["step 18 loss=0.18", "step 19 loss=0.19", "step 20 loss=0.20"]
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 }

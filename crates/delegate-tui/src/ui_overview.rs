@@ -282,7 +282,7 @@ fn render_attention_card(
                     "{glyph} {} {} {}{wid_tag}  {meta_str}",
                     pad_right(&r.state_badge(), 6),
                     pad_right(&truncate(&short_repo, 10), 10),
-                    r.display_name
+                    r.display_name_with_round()
                 );
                 style_overview_row(&txt, col.unwrap_or(STATUS_PENDING), is_sel, inner_w)
             }
@@ -436,25 +436,80 @@ fn render_running_card(
             .eta_badge()
             .map(|(b, _)| b.to_string())
             .unwrap_or_else(|| "-".to_string());
-        let act_text = r
-            .activity
-            .as_ref()
-            .map(|a| {
-                if let Some(cmd) = &a.cmd {
-                    let sc = shorten_running_cmd(cmd);
-                    if !sc.is_empty() {
-                        return format!("跑 {sc}");
-                    }
+        let local_act_text = r.activity.as_ref().map(|a| {
+            if let Some(cmd) = &a.cmd {
+                let sc = shorten_running_cmd(cmd);
+                if !sc.is_empty() {
+                    return format!("跑 {sc}");
                 }
-                a.label.clone()
-            })
-            .unwrap_or_else(|| "-".to_string());
+            }
+            a.label.clone()
+        });
+        let act_text = if let Some(re) = r.remote_exec.as_ref().filter(|re| re.active) {
+            let cmd_s = re
+                .cmd
+                .as_deref()
+                .map(shorten_running_cmd)
+                .filter(|s| !s.is_empty());
+            let dur_s = re.elapsed_seconds.map(|s| format_duration(Some(s)));
+            if re.running {
+                match (cmd_s, dur_s) {
+                    (Some(c), Some(d)) => format!("@{} {c} {d}", re.host),
+                    (Some(c), None) => format!("@{} {c}", re.host),
+                    (None, Some(d)) => format!("@{} {d}", re.host),
+                    (None, None) => format!("@{}", re.host),
+                }
+            } else {
+                match cmd_s {
+                    Some(c) => format!("@{} 排队 {c}", re.host),
+                    None => format!("@{} 排队", re.host),
+                }
+            }
+        } else if let Some(act) = local_act_text {
+            act
+        } else if let Some(re) = &r.remote_exec {
+            format!("@{}", re.host)
+        } else {
+            "-".to_string()
+        };
+
+        let mut task_label = r.display_name_with_round();
+        if act_w == 0 {
+            if let Some(re) = &r.remote_exec {
+                let full_tag = if re.active && re.running {
+                    let cmd_s = re
+                        .cmd
+                        .as_deref()
+                        .map(shorten_running_cmd)
+                        .filter(|s| !s.is_empty())
+                        .map(|c| format!(" {c}"))
+                        .unwrap_or_default();
+                    format!(" [@{}{cmd_s}]", re.host)
+                } else if re.active {
+                    format!(" [@{} 排队]", re.host)
+                } else {
+                    format!(" [@{}]", re.host)
+                };
+                let short_tag = format!(" [@{}]", re.host);
+                let chosen_tag = if display_width(&full_tag) + 4 <= name_w {
+                    &full_tag
+                } else if display_width(&short_tag) + 2 <= name_w {
+                    &short_tag
+                } else {
+                    ""
+                };
+                if !chosen_tag.is_empty() {
+                    let tw = display_width(chosen_tag);
+                    task_label = format!("{}{chosen_tag}", truncate(&task_label, name_w - tw));
+                }
+            }
+        }
 
         let mut row_txt = format!(
             "{glyph} {} {} {}",
             pad_right(&r.state_badge(), state_w),
             pad_right(&truncate(&short_repo, repo_w), repo_w),
-            pad_right(&truncate(&r.display_name, name_w), name_w),
+            pad_right(&truncate(&task_label, name_w), name_w),
         );
         if act_w > 0 {
             row_txt.push(' ');
@@ -1104,7 +1159,7 @@ fn render_overview_narrow(frame: &mut Frame, app: &mut App, area: Rect) {
                         "  ◆ {} {} {}",
                         r.state_badge(),
                         short_repo_display(&r.repo_path, &r.repo_label),
-                        r.display_name
+                        r.display_name_with_round()
                     )
                 }
                 OverviewAttentionEntry::StaleFold { count } => {
@@ -1143,11 +1198,31 @@ fn render_overview_narrow(frame: &mut Frame, app: &mut App, area: Rect) {
             let r = &app.snapshot.repos[ri].runs[rj];
             let eta = r.eta_badge().map(|(b, _)| b).unwrap_or("-");
             let elapsed = format_duration(r.elapsed_seconds.or(r.age_seconds));
+            let remote_tag = r
+                .remote_exec
+                .as_ref()
+                .map(|re| {
+                    if re.active && re.running {
+                        let c = re
+                            .cmd
+                            .as_deref()
+                            .map(shorten_running_cmd)
+                            .filter(|s| !s.is_empty())
+                            .map(|s| format!(" {s}"))
+                            .unwrap_or_default();
+                        format!(" [@{}{c}]", re.host)
+                    } else if re.active {
+                        format!(" [@{} 排队]", re.host)
+                    } else {
+                        format!(" [@{}]", re.host)
+                    }
+                })
+                .unwrap_or_default();
             let txt = format!(
-                "  ● {} {} {} ({elapsed} {eta})",
+                "  ● {} {} {}{remote_tag} ({elapsed} {eta})",
                 r.state_badge(),
                 short_repo_display(&r.repo_path, &r.repo_label),
-                r.display_name
+                r.display_name_with_round()
             );
             lines.push(Line::from(Span::styled(truncate(&txt, inner_w), primary())));
         }

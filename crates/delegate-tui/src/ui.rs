@@ -1112,10 +1112,43 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
     };
     let row_tag_snippet = format!("{review_snippet}{premerge_snippet}");
 
-    let full_name = if let (GroupKind::Running, Some(act)) = (run.group, run.activity.as_ref()) {
-        let snippet = if !review_snippet.is_empty() {
-            review_snippet
+    let active_remote_snippet = run.remote_exec.as_ref().and_then(|re| {
+        if !re.active {
+            return None;
+        }
+        Some(if re.running {
+            let cmd_s = re
+                .cmd
+                .as_deref()
+                .map(shorten_running_cmd)
+                .filter(|s| !s.is_empty());
+            let dur_s = re.elapsed_seconds.map(|s| format_duration(Some(s)));
+            match (cmd_s, dur_s) {
+                (Some(c), Some(d)) => format!(" [@{} {c} {d}]", re.host),
+                (Some(c), None) => format!(" [@{} {c}]", re.host),
+                (None, Some(d)) => format!(" [@{} {d}]", re.host),
+                (None, None) => format!(" [@{}]", re.host),
+            }
         } else {
+            format!(" [@{} 排队]", re.host)
+        })
+    });
+    let idle_remote_tag = run.remote_exec.as_ref().and_then(|re| {
+        (!re.active).then(|| format!(" [@{}]", re.host))
+    });
+
+    let round_suffix = if run.chain_round > 1 {
+        format!("（第{}轮）", run.chain_round)
+    } else {
+        String::new()
+    };
+
+    let full_name = if matches!(run.group, GroupKind::Running | GroupKind::Queued) {
+        let mut snippet = if let Some(ref rs) = active_remote_snippet {
+            rs.clone()
+        } else if !review_snippet.is_empty() {
+            review_snippet
+        } else if let Some(act) = run.activity.as_ref() {
             match act.kind.as_str() {
                 "running_command" => {
                     if let Some(cmd) = &act.cmd {
@@ -1133,19 +1166,33 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
                 _ if run.stall_warning.is_some() => " [卡住提醒]".to_string(),
                 _ => String::new(),
             }
+        } else {
+            String::new()
         };
+        if active_remote_snippet.is_none() {
+            if let Some(ref tag) = idle_remote_tag {
+                if snippet.is_empty() {
+                    snippet = tag.clone();
+                } else if cols.name_w >= display_width(&snippet) + display_width(tag) + 10 {
+                    snippet.push_str(tag);
+                }
+            }
+        }
         if !snippet.is_empty() && cols.name_w > 10 {
-            let base = if run.chain_round > 1 {
-                format!("{} [{}轮]", run.display_name, run.chain_round)
+            let base = format!("{}{round_suffix}", run.display_name);
+            let snip_w = display_width(&snippet);
+            if cols.name_w >= snip_w + 8 {
+                format!("{}{snippet}", truncate(&base, cols.name_w - snip_w))
             } else {
-                run.display_name.clone()
-            };
-            truncate(&format!("{base}{snippet}"), cols.name_w)
-        } else if run.chain_round > 1 {
-            let suffix = format!(" [{}轮]", run.chain_round);
-            let sw = display_width(&suffix);
+                truncate(&format!("{base}{snippet}"), cols.name_w)
+            }
+        } else if !round_suffix.is_empty() {
+            let sw = display_width(&round_suffix);
             if cols.name_w > sw + 2 {
-                format!("{}{suffix}", truncate(&run.display_name, cols.name_w - sw))
+                format!(
+                    "{}{round_suffix}",
+                    truncate(&run.display_name, cols.name_w - sw)
+                )
             } else {
                 truncate(&run.display_name, cols.name_w)
             }
@@ -1153,11 +1200,7 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
             truncate(&run.display_name, cols.name_w)
         }
     } else if !row_tag_snippet.is_empty() && cols.name_w > 10 {
-        let base = if run.chain_round > 1 {
-            format!("{} [{}轮]", run.display_name, run.chain_round)
-        } else {
-            run.display_name.clone()
-        };
+        let base = format!("{}{round_suffix}", run.display_name);
         let tag_w = display_width(&row_tag_snippet);
         if cols.name_w >= tag_w + 8 {
             let name_avail = cols.name_w - tag_w;
@@ -1165,11 +1208,13 @@ fn render_run_row(run: &RunItem, selected: bool, cols: ColWidths, width: usize) 
         } else {
             truncate(&format!("{base}{row_tag_snippet}"), cols.name_w)
         }
-    } else if run.chain_round > 1 {
-        let suffix = format!(" [{}轮]", run.chain_round);
-        let sw = display_width(&suffix);
+    } else if !round_suffix.is_empty() {
+        let sw = display_width(&round_suffix);
         if cols.name_w > sw + 2 {
-            format!("{}{suffix}", truncate(&run.display_name, cols.name_w - sw))
+            format!(
+                "{}{round_suffix}",
+                truncate(&run.display_name, cols.name_w - sw)
+            )
         } else {
             truncate(&run.display_name, cols.name_w)
         }
@@ -1412,7 +1457,9 @@ fn render_detail_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         String::new()
     };
-    let card_tag = if card_l1.is_some() || run.card_l0.is_some() {
+    let card_tag = if card_l1.is_some()
+        || (run.card_l0.is_some() && run.group != GroupKind::Running)
+    {
         " [L1 审查卡 · 按 d 看 Diff]"
     } else {
         ""
@@ -1770,6 +1817,119 @@ fn build_detail_lines(
         );
     }
 
+    // Remote execution details & output tail (no ssh required)
+    if let Some(re) = &run.remote_exec {
+        let queue_zh = match re.queue.as_deref() {
+            Some("remote-light") => "轻队列",
+            Some("remote-heavy") => "重队列",
+            _ => "远端",
+        };
+        let header_line = if re.active {
+            let st_zh = if re.running { "运行中" } else { "排队中" };
+            let dur_s = re
+                .elapsed_seconds
+                .map(|s| format!(" · 已跑 {}", format_duration_zh(Some(s))))
+                .unwrap_or_default();
+            format!("远端执行: @{} · {queue_zh} · {st_zh}{dur_s}", re.host)
+        } else {
+            format!("远端机器: @{}", re.host)
+        };
+        let re_style = if re.active && re.running {
+            Style::default()
+                .fg(STATUS_RUNNING)
+                .add_modifier(Modifier::BOLD)
+        } else if re.active {
+            Style::default()
+                .fg(STATUS_QUEUED)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            muted()
+        };
+        push_wrapped(&mut out, &header_line, width, re_style);
+        if let Some(cmd) = &re.cmd {
+            push_indented_wrapped(&mut out, "  命令: ", cmd, width, primary());
+        }
+        if !re.output_tail.is_empty() {
+            out.push(Line::raw(""));
+            out.push(section_header(&format!(
+                "远端输出尾部 (最近 {} 行)",
+                re.output_tail.len()
+            )));
+            for line in &re.output_tail {
+                push_indented_wrapped(&mut out, "  ", line, width, muted());
+            }
+        }
+    }
+
+    // Reply / rework / append rounds (aligned with `delegate card` each-round original pointers)
+    if run.chain_rounds.len() > 1 {
+        let total_rounds = run.chain_rounds.len().max(run.chain_round);
+        let multi_run = run
+            .chain_rounds
+            .iter()
+            .map(|r| r.run.as_str())
+            .filter(|id| !id.is_empty())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            > 1;
+        out.push(Line::raw(""));
+        out.push(section_header(&format!(
+            "会话轮次与各轮原文 (共 {total_rounds} 轮)"
+        )));
+        for r in &run.chain_rounds {
+            let kind_zh = match r.kind.as_str() {
+                "rework" => "返工",
+                "append" => "追加",
+                "reply" => "reply",
+                _ => "初稿",
+            };
+            let st_zh = if r.question {
+                "提问"
+            } else {
+                match r.state.as_str() {
+                    "running" => "运行中",
+                    "waiting" => "等待中",
+                    "starting" => "启动中",
+                    "delivered" => "已交付",
+                    "answered" => "已答复",
+                    "rejected" => "未通过",
+                    "stopped" => "已停止",
+                    "failed" => "失败",
+                    "archived" => "已归档",
+                    _ => "",
+                }
+            };
+            let mut tags = Vec::new();
+            if multi_run && !r.run.is_empty() {
+                tags.push(r.run.clone());
+            }
+            tags.push(kind_zh.to_string());
+            if !st_zh.is_empty() {
+                tags.push(st_zh.to_string());
+            }
+            let tag_str = if r.current {
+                format!("{}，当前", tags.join(" · "))
+            } else {
+                tags.join(" · ")
+            };
+            let dur = r
+                .elapsed_seconds
+                .map(|s| format!(" · {}", format_duration_zh(Some(s))))
+                .unwrap_or_default();
+            let header = format!("第 {} 轮（{tag_str}）{dur}", r.round);
+            let style = if r.current { primary() } else { muted() };
+            push_indented_wrapped(&mut out, "  - ", &header, width, style);
+            if let Some(ref p) = r.path {
+                let stats = match (r.total_lines, r.total_chars) {
+                    (Some(l), Some(c)) => format!("（共 {l} 行 / {c} 字）"),
+                    (None, Some(c)) => format!("（共 {c} 字）"),
+                    _ => String::new(),
+                };
+                push_indented_wrapped(&mut out, "    └ ", &format!("{p}{stats}"), width, muted());
+            }
+        }
+    }
+
     // Queue info
     if run.queue_reason.is_some()
         || run.queue_ahead.is_some()
@@ -1790,16 +1950,17 @@ fn build_detail_lines(
         );
     }
 
-    // Acceptance (only shown when configured)
+    // Acceptance (only expand when there is command/failure detail beyond the `门禁:` bar)
     match &run.accept {
-        AcceptStatus::Passed { command } => {
-            let text = if command.is_empty() {
-                "验收 ✓ 通过".to_string()
-            } else {
-                format!("验收 ✓ {command}")
-            };
-            push_wrapped(&mut out, &text, width, Style::default().fg(STATUS_RUNNING));
+        AcceptStatus::Passed { command } if !command.is_empty() => {
+            push_wrapped(
+                &mut out,
+                &format!("验收 ✓ {command}"),
+                width,
+                Style::default().fg(STATUS_RUNNING),
+            );
         }
+        AcceptStatus::Passed { .. } => {}
         AcceptStatus::Failed { command, exit_code } => {
             let code_s = exit_code.map(|c| format!(" exit={c}")).unwrap_or_default();
             push_wrapped(
@@ -1823,10 +1984,18 @@ fn build_detail_lines(
         AcceptStatus::None => {}
     }
 
-    // Review status (6.29)
+    // Review status (only expand when actionable or carrying extra detail beyond `门禁:`)
     if let Some(rev) = &run.review {
         let label = rev.detail_label();
-        if !label.is_empty() {
+        let has_extra = rev.upgraded_by.is_some()
+            || !rev.controller_paths.is_empty()
+            || rev.sign_hash.is_some()
+            || (rev.needs_attention && rev.verdict.as_deref() != Some("PASS"));
+        let is_plain_pass = rev.verdict.as_deref() == Some("PASS")
+            && rev.status != "reviewing"
+            && rev.status != "reworking"
+            && !has_extra;
+        if !label.is_empty() && !is_plain_pass {
             let (rev_color, bold) = if rev.status == "reviewing" {
                 (STATUS_QUEUED, true)
             } else if rev.status == "reworking" || rev.verdict.as_deref() == Some("REWORK") {
@@ -1877,11 +2046,11 @@ fn build_detail_lines(
         }
     }
 
-    // Premerge / fast-forward status (6.35)
+    // Premerge / fast-forward status (only expand on stale/conflict/failed; ready/running is already in `门禁:`)
     if !run.applied {
         if let Some(pm) = &run.premerge {
             let lbl = pm.full_label();
-            if !lbl.is_empty() {
+            if !lbl.is_empty() && matches!(pm.status.as_str(), "stale" | "conflict" | "failed") {
                 let (pm_color, bold) = match pm.status.as_str() {
                     "ready" => (STATUS_RUNNING, false),
                     "running" | "pending" => (STATUS_QUEUED, true),

@@ -23,7 +23,7 @@
 | `sign [--check] [--json] [<run>]` | 记录或校验 `controllerReviewPaths` diff 的 SHA-256 签字（`sign.json`）；改一字即失效（`--check` 有效退出 0，未签/失效退出 1），供合入员验签，不改 `apply` 语义 |
 | `merge [--ready\|<run>...] [--name <名>] [--json]` | 独立集成 worktree 串行 3-way 合入（重生、逐个 `accept`、末尾 `mergeAccept`，按 `autoMerge` 出 `merge-report.md` 供 `apply --keep-commits` 落回）；`merge list [--all]` 查批次，见 [合入员与 Radar](merge-and-radar.md) |
 | `radar [run\|list\|board\|pick\|schedule]` | 跑 `radar.collect` 算指纹，变化时派只读 scout 去重写 `<state>/radar/<repo>/board.md`；`pick <id>` 出草稿，`schedule` 给定时说明，见 [合入员与 Radar](merge-and-radar.md) |
-| `status [<run>...] [--all] [--json] [--files]` | 首行计数并只列待处理任务与未完成待办（零锁零副作用直读 `<state>/index.json`；续做链折末环，详情看 `status <run>`，`--all` 全量，`--json --files` 带文件数组），末行指向 `history` |
+| `status [<run>...] [--all] [--json] [--files]` | 跨本机已登记仓库（`repos.json` 与活跃 `*.slot`，非当前仓标 `[<repo>]`；远端执行标 `远端:@<host>`/命令/时长，不跨机聚合远端机器本地独立 run）首行计数并列待处理任务与未完成待办（零锁直读 `index.json`；人读默认与 `--all` 均将 reply 链折为末环一行「`<名>（第 N 轮）`」，`--json` 保留每轮，`--json --files` 带文件数组），`status <run>` 展开各轮原文与远端输出尾部，末行指向 `history` |
 | `snapshot --json [--repo <路径>...] [--events-limit N]` | 零锁、零子进程一次输出全机 runs、work、events、lane、queue、merges 与 candidates 快照（供 TUI 与工具使用） |
 | `note [<run> ["<文字>"\|--done [<序号>\|--all]]] [--all] [--json]` | `work.jsonl` 薄壳：追加、查看或完成 run/续做链待办，自动迁入旧 `notes.json`，`clean` 后保留 |
 | `handoff [--out <路径>]` | 生成未清理未合入任务与待办的一页交接索引（默认 `.local/run/delegate/HANDOFF.md`），含净改动、新增 `TODO(master)`、迁移文件与重叠文件 |

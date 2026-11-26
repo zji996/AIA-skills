@@ -121,7 +121,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "status",
-        "Show counts and concise one-line status for runs/chains needing action (status <run> adds path and note details); --all lists every round.",
+        "Show counts and concise one-line status across registered repos (status <run> expands rounds, paths, and remote tail); --all lists all chains (collapsed in human output; --json keeps every round).",
     ),
     ("list", "Alias of status."),
     (
@@ -301,7 +301,7 @@ pub fn print(command: Option<&str>) -> bool {
         ]),
         "status" | "list" => ("[--all] [--json] [--files] [runs ...]", "Show a counts line plus concise one-line status for runs needing action (running/queued, questions, unapplied or unread results, unhandled rejections, and pending todos; collapsing reply chains to their latest round) and a footer pointing to delegate history. Passing run names appends indented path and todo details.", &[
             ("runs", "Run ids or directories (default: actionable runs and pending todos)."),
-            ("--all", "List every run and every round regardless of handled or cleanup state."),
+            ("--all", "List all runs across registered repositories (human output collapses reply chains to one line; --json emits every round)."),
             ("--json", "Print JSON status without the files array (pass --files to include files)."),
             ("--files", "With --json, include the full files array."),
         ]),

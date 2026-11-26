@@ -319,14 +319,32 @@ fn spawn_worker(
         while let Ok(cmd) = rx_cmd.recv() {
             match cmd {
                 WorkerCmd::Refresh { force } => {
-                    let repos = resolve_repos(
-                        &explicit_repos,
-                        explicit_root.as_ref(),
-                        home.as_ref(),
-                        &cwd,
-                    );
-                    let snapshot =
-                        client.collect_snapshot(&repos, home.as_deref(), Some(&cwd));
+                    let snapshot = if explicit_repos.is_empty() && explicit_root.is_none() {
+                        // Let `delegate snapshot --json` discover every repo registered in
+                        // `state/repos.json`, live `state/*.slot`, and cwd without pruning or
+                        // walking `$HOME` (which would miss repos outside `$HOME` or behind symlinks).
+                        if let Some(snap) =
+                            client.fetch_snapshot_fast(&[], home.as_deref(), Some(&cwd))
+                        {
+                            snap
+                        } else {
+                            let repos = resolve_repos(
+                                &explicit_repos,
+                                explicit_root.as_ref(),
+                                home.as_ref(),
+                                &cwd,
+                            );
+                            client.collect_snapshot(&repos, home.as_deref(), Some(&cwd))
+                        }
+                    } else {
+                        let repos = resolve_repos(
+                            &explicit_repos,
+                            explicit_root.as_ref(),
+                            home.as_ref(),
+                            &cwd,
+                        );
+                        client.collect_snapshot(&repos, home.as_deref(), Some(&cwd))
+                    };
                     if tx_ev
                         .send(WorkerEvent::Snapshot {
                             snapshot: Box::new(snapshot),

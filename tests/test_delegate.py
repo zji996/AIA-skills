@@ -43,16 +43,54 @@ if not os.access(DELEGATE, os.X_OK):
     raise RuntimeError(f"{DELEGATE} is missing: install cargo, set DELEGATE_BIN, or run scripts/fetch-binary.sh delegate")
 
 
+def _live_state_workers(state_home: Path) -> list[int]:
+    """Return PIDs of detached `delegate` background workers (`_gc-worker`, `_merge-worker`,
+    `_supervise`, etc.) still running against this test's isolated `XDG_STATE_HOME`.
+    Catches workers that were just spawned and have not yet acquired `.gc-worker.lock`."""
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return []
+    needle = f"XDG_STATE_HOME={state_home}\0".encode()
+    self_pid = os.getpid()
+    live = []
+    try:
+        entries = os.listdir(proc)
+    except OSError:
+        return []
+    for name in entries:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid == self_pid:
+            continue
+        try:
+            comm = (proc / name / "comm").read_bytes().strip()
+            if not comm.startswith(b"delegate"):
+                continue
+            env = (proc / name / "environ").read_bytes()
+            if needle in env:
+                live.append(pid)
+        except OSError:
+            continue
+    return live
+
+
 def settle_supervisors(runs_dir, seconds=10.0):
     deadline = time.monotonic() + seconds
+    work_dir = Path(runs_dir).parent
+    state_home = work_dir / "state"
     pids = list(Path(runs_dir).glob("*/pid")) if Path(runs_dir).is_dir() else []
     while pids and time.monotonic() < deadline:
         pids = [p for p in pids if not process_gone(p)]
         if pids:
             time.sleep(0.05)
-    gc_lock = Path(runs_dir).parent / "state" / "delegate" / ".gc-worker.lock"
-    premerge_locks = list((Path(runs_dir).parent / "state" / "delegate" / "premerge").glob("*.lock")) \
-        if (Path(runs_dir).parent / "state" / "delegate" / "premerge").is_dir() else []
+    # Wait for detached background workers (`_gc-worker`, `_merge-worker`, etc.) bound to this
+    # test's isolated XDG_STATE_HOME — even if they have not yet created `.gc-worker.lock`.
+    while time.monotonic() < deadline and _live_state_workers(state_home):
+        time.sleep(0.03)
+    gc_lock = state_home / "delegate" / ".gc-worker.lock"
+    premerge_locks = list((state_home / "delegate" / "premerge").glob("*.lock")) \
+        if (state_home / "delegate" / "premerge").is_dir() else []
     lock_files = [p for p in [gc_lock, *premerge_locks] if p.is_file()]
     if lock_files:
         import fcntl
@@ -67,6 +105,8 @@ def settle_supervisors(runs_dir, seconds=10.0):
                     time.sleep(0.03)
                 except OSError:
                     break
+    while time.monotonic() < deadline and _live_state_workers(state_home):
+        time.sleep(0.03)
 
 
 def process_gone(pid_file):

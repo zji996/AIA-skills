@@ -834,6 +834,282 @@ fn trace_chain(head_id: &str, by_id: &HashMap<String, &Value>) -> (Vec<String>, 
     (ids, depth, root_name)
 }
 
+fn sanitize_remote_host(raw: &str) -> String {
+    let trimmed = raw.trim();
+    match trimmed.rsplit_once('@') {
+        Some((_, alias)) if !alias.trim().is_empty() => alias.trim().to_string(),
+        _ => trimmed.to_string(),
+    }
+}
+
+fn parse_remote_exec(v: &Value, now_epoch: Option<i64>) -> Option<RemoteExecInfo> {
+    if let Some(re) = v.get("remoteExec").filter(|x| x.is_object()) {
+        let host = re
+            .get("host")
+            .and_then(Value::as_str)
+            .map(sanitize_remote_host)
+            .unwrap_or_default();
+        if !host.is_empty() {
+            let active = re.get("active").and_then(Value::as_bool).unwrap_or(false);
+            let running = re.get("running").and_then(Value::as_bool).unwrap_or(false);
+            let queue = re
+                .get("queue")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let cmd = re
+                .get("cmd")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(single_line);
+            let elapsed_seconds = re
+                .get("elapsedSeconds")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    re.get("since")
+                        .and_then(Value::as_str)
+                        .and_then(parse_iso_utc_epoch)
+                        .map(|ep| {
+                            let now = now_epoch.unwrap_or_else(current_utc_epoch);
+                            (now - ep).max(0) as u64
+                        })
+                });
+            let output_tail = re
+                .get("outputTail")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(|s| s.trim_end_matches('\r').to_string())
+                        .filter(|s| !s.trim().is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            return Some(RemoteExecInfo {
+                host,
+                active,
+                running,
+                queue,
+                cmd,
+                elapsed_seconds,
+                output_tail,
+            });
+        }
+    }
+    // Backwards-compatible fallback for snapshots from older `delegate` binaries that emit `remote` + `lane`.
+    let host = v
+        .get("remote")
+        .and_then(|r| r.get("host"))
+        .and_then(Value::as_str)
+        .map(sanitize_remote_host)
+        .unwrap_or_default();
+    let lane = v.get("lane").filter(|l| {
+        l.get("queue")
+            .and_then(Value::as_str)
+            .is_some_and(|q| q.starts_with("remote-"))
+    });
+    if host.is_empty() && lane.is_none() {
+        return None;
+    }
+    let active = lane.is_some();
+    let running = lane
+        .and_then(|l| l.get("running"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let queue = lane
+        .and_then(|l| l.get("queue"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let cmd = lane
+        .and_then(|l| {
+            l.get("cmd")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .or_else(|| l.get("label").and_then(Value::as_str))
+        })
+        .map(|raw| {
+            let trimmed = match raw.split_once(": ") {
+                Some((prefix, rest))
+                    if !rest.trim().is_empty()
+                        && (prefix.starts_with('/') || prefix.contains("worktrees")) =>
+                {
+                    rest.trim()
+                }
+                _ => raw.trim(),
+            };
+            single_line(trimmed)
+        })
+        .filter(|s| !s.is_empty());
+    let elapsed_seconds = lane.and_then(|l| {
+        l.get("elapsedSeconds")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                l.get("since")
+                    .and_then(Value::as_str)
+                    .and_then(parse_iso_utc_epoch)
+                    .map(|ep| {
+                        let now = now_epoch.unwrap_or_else(current_utc_epoch);
+                        (now - ep).max(0) as u64
+                    })
+            })
+    });
+    Some(RemoteExecInfo {
+        host,
+        active,
+        running,
+        queue,
+        cmd,
+        elapsed_seconds,
+        output_tail: Vec::new(),
+    })
+}
+
+fn build_chain_rounds(
+    v: &Value,
+    chain_ids: &[String],
+    chain_round: usize,
+    by_id: &HashMap<String, &Value>,
+) -> Vec<ChainRoundInfo> {
+    if let Some(arr) = v.get("authorRounds").and_then(Value::as_array) {
+        if !arr.is_empty() {
+            let mut out: Vec<ChainRoundInfo> = arr
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    let rid = item
+                        .get("run")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let rv = by_id.get(&rid).copied();
+                    ChainRoundInfo {
+                        round: item
+                            .get("round")
+                            .and_then(Value::as_u64)
+                            .map(|n| n as usize)
+                            .unwrap_or(i + 1),
+                        run: rid,
+                        kind: item
+                            .get("kind")
+                            .and_then(Value::as_str)
+                            .unwrap_or(if i == 0 { "initial" } else { "reply" })
+                            .to_string(),
+                        state: rv
+                            .and_then(|x| x.get("state"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        question: rv
+                            .and_then(|x| x.get("question"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        elapsed_seconds: rv
+                            .and_then(|x| x.get("elapsedSeconds"))
+                            .and_then(Value::as_u64),
+                        path: item
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string),
+                        total_lines: item
+                            .get("totalLines")
+                            .and_then(Value::as_u64)
+                            .map(|n| n as usize),
+                        total_chars: item
+                            .get("totalChars")
+                            .and_then(Value::as_u64)
+                            .map(|n| n as usize),
+                        current: item
+                            .get("current")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    }
+                })
+                .collect();
+            let cur_id = v.get("run").and_then(Value::as_str).unwrap_or("");
+            let cur_state = v.get("state").and_then(Value::as_str).unwrap_or("");
+            let cur_active = matches!(cur_state, "running" | "waiting" | "starting");
+            if cur_active && !cur_id.is_empty() && !out.iter().any(|r| r.run == cur_id) {
+                for r in &mut out {
+                    r.current = false;
+                }
+                out.push(ChainRoundInfo {
+                    round: out.len() + 1,
+                    run: cur_id.to_string(),
+                    kind: "reply".to_string(),
+                    state: cur_state.to_string(),
+                    question: false,
+                    elapsed_seconds: v.get("elapsedSeconds").and_then(Value::as_u64),
+                    path: None,
+                    total_lines: None,
+                    total_chars: None,
+                    current: true,
+                });
+            }
+            if out.len() > 1 {
+                return out;
+            }
+        }
+    }
+    if chain_ids.len() <= 1 {
+        return Vec::new();
+    }
+    let start_round = chain_round.saturating_sub(chain_ids.len()) + 1;
+    let last_idx = chain_ids.len().saturating_sub(1);
+    chain_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let kind = if start_round + i == 1 {
+                "initial"
+            } else {
+                "reply"
+            };
+            if let Some(rv) = by_id.get(id) {
+                ChainRoundInfo {
+                    round: start_round + i,
+                    run: id.clone(),
+                    kind: kind.to_string(),
+                    state: rv
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    question: rv
+                        .get("question")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    elapsed_seconds: rv.get("elapsedSeconds").and_then(Value::as_u64),
+                    path: rv
+                        .get("result")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                    total_lines: None,
+                    total_chars: rv
+                        .get("resultChars")
+                        .and_then(Value::as_u64)
+                        .map(|n| n as usize),
+                    current: i == last_idx,
+                }
+            } else {
+                ChainRoundInfo {
+                    round: start_round + i,
+                    run: id.clone(),
+                    kind: kind.to_string(),
+                    state: "archived".to_string(),
+                    question: false,
+                    elapsed_seconds: None,
+                    path: None,
+                    total_lines: None,
+                    total_chars: None,
+                    current: i == last_idx,
+                }
+            }
+        })
+        .collect()
+}
+
 fn strip_reply_prefixes(s: &str) -> String {
     let mut cur = s.trim();
     while let Some(rest) = cur.strip_prefix("reply to ") {
@@ -1035,6 +1311,9 @@ fn parse_run_item(
         })
     };
 
+    let remote_exec = parse_remote_exec(v, now_epoch);
+    let chain_rounds = build_chain_rounds(v, &chain_ids, chain_round, by_id);
+
     RunItem {
         run,
         name: raw_name,
@@ -1121,6 +1400,8 @@ fn parse_run_item(
             .map(str::to_string),
         eta: parse_run_eta_value(v.get("eta")),
         card_l0: parse_card_l0_value(v.get("card")),
+        remote_exec,
+        chain_rounds,
         agy_account_switch: parse_agy_account_switch(v.get("agyAccountSwitch")),
         review_agy_account_switch: parse_agy_account_switch(v.get("reviewAgyAccountSwitch")),
     }

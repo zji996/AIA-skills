@@ -87,6 +87,31 @@ pub struct ActivityInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RemoteExecInfo {
+    pub host: String,
+    pub active: bool,
+    pub running: bool,
+    pub queue: Option<String>,
+    pub cmd: Option<String>,
+    pub elapsed_seconds: Option<u64>,
+    pub output_tail: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ChainRoundInfo {
+    pub round: usize,
+    pub run: String,
+    pub kind: String,
+    pub state: String,
+    pub question: bool,
+    pub elapsed_seconds: Option<u64>,
+    pub path: Option<String>,
+    pub total_lines: Option<usize>,
+    pub total_chars: Option<usize>,
+    pub current: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StallWarningInfo {
     pub kind: String,
     pub cmd: Option<String>,
@@ -721,11 +746,22 @@ pub struct RunItem {
     pub work_id: Option<String>,
     pub eta: Option<RunEtaInfo>,
     pub card_l0: Option<CardL0Info>,
+    pub remote_exec: Option<RemoteExecInfo>,
+    pub chain_rounds: Vec<ChainRoundInfo>,
     pub agy_account_switch: Option<AgyAccountSwitchInfo>,
     pub review_agy_account_switch: Option<AgyAccountSwitchInfo>,
 }
 
 impl RunItem {
+    /// Original task name plus `（第 N 轮）` when part of a multi-round reply chain.
+    pub fn display_name_with_round(&self) -> String {
+        if self.chain_round > 1 {
+            format!("{}（第 {} 轮）", self.display_name, self.chain_round)
+        } else {
+            self.display_name.clone()
+        }
+    }
+
     /// Short <= 6-col ETA badge for Runs rows (`~03:40`, `<5m`, `卡主控`, ...).
     pub fn eta_badge(&self) -> Option<(&str, bool)> {
         if self.applied || matches!(self.group, GroupKind::Collected | GroupKind::MergedUncleaned) {

@@ -242,14 +242,13 @@ class Delegate625Tests(unittest.TestCase):
         self.assertNotIn("提问", run_lines[0])
         self.assertNotIn("未通过", run_lines[0])
 
-        # `status --all` (human): shows every round individually.
+        # `status --all` (human): collapses reply chain to one line (`<name>（第 3 轮）`).
         all_out = self.cli("status", "--all", human=True)
         self.assertEqual(all_out.returncode, 0, all_out.stderr)
         all_lines = [ln for ln in all_out.stdout.splitlines() if ln.strip()]
-        self.assertEqual(len(all_lines), 3, all_out.stdout)
-        self.assertIn("提问", all_out.stdout)
-        self.assertIn("未通过", all_out.stdout)
-        self.assertIn("已交付", all_out.stdout)
+        self.assertEqual(len(all_lines), 1, all_out.stdout)
+        self.assertTrue(all_lines[0].startswith("合入员（第 3 轮） · 已交付"), all_lines[0])
+        self.assertNotIn("reply to ", all_out.stdout)
 
         # `status --json` returns actionable leaf + statusSummary; `status --all --json` returns all 3 rounds.
         json_out = self.cli("status")

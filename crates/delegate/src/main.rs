@@ -3170,7 +3170,28 @@ fn main_inner(args: &[String]) -> Res<i32> {
             let state_root = state_dir();
             let idx = index::load_index(&state_root);
             let wsig = index::work_file_sig(&state_root);
-            let all = runs::all_runs_sorted_with_index(&idx);
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let cur_repo_canon = {
+                let raw = git_top_fast(&cwd).unwrap_or_else(|| cwd.clone());
+                fs::canonicalize(&raw).unwrap_or(raw)
+            };
+            let all_with_repos = runs::all_machine_runs_sorted_with_index(&state_root, &idx);
+            let mut repo_tag_by_run: std::collections::HashMap<PathBuf, String> =
+                std::collections::HashMap::new();
+            let all: Vec<PathBuf> = all_with_repos
+                .into_iter()
+                .map(|(repo_root, run_dir)| {
+                    let repo_canon = fs::canonicalize(&repo_root).unwrap_or(repo_root);
+                    if repo_canon != cur_repo_canon {
+                        if let Some(name) = repo_canon.file_name().and_then(|n| n.to_str()) {
+                            if !name.is_empty() {
+                                repo_tag_by_run.insert(run_dir.clone(), name.to_string());
+                            }
+                        }
+                    }
+                    run_dir
+                })
+                .collect();
             let cleaned_notes = notes::cleaned_pending_chains(&all);
             let mut head_cache: std::collections::HashMap<PathBuf, Option<String>> =
                 std::collections::HashMap::new();
@@ -3185,6 +3206,8 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 } else {
                     None
                 };
+                let mut rows: Vec<(&PathBuf, Value)> = Vec::with_capacity(all.len());
+                let mut superseded_parents = std::collections::HashSet::<String>::new();
                 for run in &all {
                     let mut status = index::status_cached(run, &idx, &wsig);
                     premerge::overlay_live_status(&mut status, run, &mut head_cache);
@@ -3192,6 +3215,13 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     if let Some((ref eta_model, ref eta_ctx)) = eta_env {
                         eta::overlay_status_eta(&mut status, run, eta_model, eta_ctx);
                     }
+                    let parent_id = s(&status, "parent");
+                    if !parent_id.is_empty() {
+                        superseded_parents.insert(parent_id.to_string());
+                    }
+                    rows.push((run, status));
+                }
+                for (run, mut status) in rows {
                     if output::json_enabled() {
                         if !include_files {
                             if let Some(obj) = status.as_object_mut() {
@@ -3200,7 +3230,15 @@ fn main_inner(args: &[String]) -> Res<i32> {
                         }
                         println!("{}", format_status(status));
                     } else {
-                        println!("{}", output::human_line(run, &status, false));
+                        let rid = s(&status, "run");
+                        if !rid.is_empty() && superseded_parents.contains(rid) {
+                            continue;
+                        }
+                        let repo_tag = repo_tag_by_run.get(run).map(String::as_str);
+                        println!(
+                            "{}",
+                            output::human_line_with_repo(run, &status, true, repo_tag)
+                        );
                     }
                 }
                 for chain in &cleaned_notes {
@@ -3429,7 +3467,11 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 }
                 println!("{counts}");
                 for (run, status) in &shown {
-                    println!("{}", output::human_line(run, status, true));
+                    let repo_tag = repo_tag_by_run.get(run).map(String::as_str);
+                    println!(
+                        "{}",
+                        output::human_line_with_repo(run, status, true, repo_tag)
+                    );
                 }
                 for chain in &cleaned_notes {
                     println!("{}", output::human_cleaned_note(chain, false));

@@ -53,6 +53,7 @@
 | `protect-generate.log` | 收尾复跑受保护生成物命令的输出 |
 | `agent-shims/` / `denied.log` | 同事专用程序 shim / 每次拒绝追加一行 `1`，结论统计为 `denied` |
 | `lane-wait` / `lane-waiting-*` | 同事在 lane 中已排队的秒数 / 正在排队的标记 |
+| `remote-active.json` / `remote-output.log` | 远端执行中状态（主机别名、队列、命令、PID、开始时间，结束自动移除）/ 远端命令滚动输出尾（超 256 KiB 裁保留末 32 KiB），供 `status`/TUI 无 ssh 查看（远端机器本地直接派发的 run 暂不跨机聚合） |
 | `stderr.log` | 同事 CLI 的标准错误 |
 | `exit_code` | 结束标记：`0` 为 delivered/answered，`1` 为其他结局；运行中不存在 |
 | `.delivered` | 结果已被 `run`/`wait`/`result` 读取过 |

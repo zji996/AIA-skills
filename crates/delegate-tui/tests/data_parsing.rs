@@ -436,3 +436,37 @@ fn collected_readonly_and_cleaned_runs_fold_by_default_and_exclude_from_pending(
         .count();
     assert_eq!(visible_after, 4);
 }
+
+#[test]
+fn parses_remote_exec_and_fallback_lane_and_chain_rounds() {
+    let raw = r#"
+{"run":"20261126-010000-r1","name":"核心任务","state":"answered","question":true,"elapsedSeconds":90}
+{"run":"20261126-020000-r2","name":"reply to 核心任务","parent":"20261126-010000-r1","chainName":"核心任务","chainRound":2,"state":"running","elapsedSeconds":150,"remoteExec":{"host":"dev@gpu-box","active":true,"running":true,"queue":"remote-heavy","cmd":"uv run pytest","elapsedSeconds":60,"outputTail":["line a","line b"]}}
+{"run":"20261126-030000-legacy","name":"旧格式远端","state":"running","elapsedSeconds":200,"remote":{"host":"worker-2"},"lane":{"queue":"remote-light","running":true,"label":"/tmp/worktrees/wt: uv run pytest -q","elapsedSeconds":30}}
+"#;
+    let group = parse_status_jsonl(Path::new("/home/dev/repo"), "~/repo", raw);
+    assert_eq!(group.runs.len(), 2, "reply chain must collapse to 1 row");
+
+    let chain = group.runs.iter().find(|r| r.run == "20261126-020000-r2").unwrap();
+    assert_eq!(chain.display_name, "核心任务");
+    assert_eq!(chain.display_name_with_round(), "核心任务（第 2 轮）");
+    assert_eq!(chain.chain_rounds.len(), 2);
+    assert_eq!(chain.chain_rounds[0].round, 1);
+    assert!(chain.chain_rounds[0].question);
+    assert_eq!(chain.chain_rounds[1].round, 2);
+
+    let re = chain.remote_exec.as_ref().expect("remoteExec parsed");
+    assert_eq!(re.host, "gpu-box");
+    assert!(re.active && re.running);
+    assert_eq!(re.cmd.as_deref(), Some("uv run pytest"));
+    assert_eq!(re.elapsed_seconds, Some(60));
+    assert_eq!(re.output_tail, vec!["line a", "line b"]);
+
+    let legacy = group.runs.iter().find(|r| r.run == "20261126-030000-legacy").unwrap();
+    let lre = legacy.remote_exec.as_ref().expect("legacy remote+lane parsed");
+    assert_eq!(lre.host, "worker-2");
+    assert!(lre.active && lre.running);
+    assert_eq!(lre.queue.as_deref(), Some("remote-light"));
+    assert_eq!(lre.cmd.as_deref(), Some("uv run pytest -q"));
+    assert_eq!(lre.elapsed_seconds, Some(30));
+}

@@ -121,7 +121,7 @@ fn snapshot_wide_screen_renders_rounded_borders_bars_relative_time_and_lane_mete
 
     // Collapsed chain, relative time ("3 分钟前"), mini diff bar, badges, selected stripe
     assert!(screen.contains('▎'), "{screen}");
-    assert!(screen.contains("[2轮]"), "{screen}");
+    assert!(screen.contains("（第2轮）"), "{screen}");
     assert!(screen.contains("3 分钟前"), "{screen}");
     assert!(screen.contains('▪'), "{screen}");
     assert!(screen.contains("保?"), "{screen}");
@@ -170,7 +170,7 @@ fn snapshot_narrow_80_columns_uses_readable_stacked_layout() {
 
     assert!(screen.contains("运行列表 (活跃 4 · 按状态聚合"), "{screen}");
     assert!(screen.contains("接口鉴权"), "{screen}");
-    assert!(screen.contains("[2轮]"), "{screen}");
+    assert!(screen.contains("（第2轮）"), "{screen}");
     assert!(screen.contains("3 分钟前") || screen.contains("3分前"), "{screen}");
     assert!(screen.contains("结论摘要"), "{screen}");
     assert!(screen.contains("Lane ██░░░░ 2/6"), "{screen}");
@@ -2880,6 +2880,189 @@ fn runs_default_status_grouping_v_toggle_and_l1_card_risk_section() {
     assert!(back_status.contains("按状态") && back_status.contains("待主控处理 (3)"), "{back_status}");
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn remote_exec_cross_repo_and_reply_chain_at_80_and_120_cols() {
+    let snap_raw = r#"{
+        "schemaVersion": 1,
+        "generatedEpoch": 1795681000,
+        "repos": [
+            {
+                "path": "/home/dev/main-app",
+                "runs": [
+                    {"run":"20261126-010000-distill-r1","name":"模型蒸馏架构","state":"answered","mode":"read-only","modelName":"neon","elapsedSeconds":120,"ageSeconds":3600,"caller":"session-a"},
+                    {"run":"20261126-020000-distill-r2","name":"reply to 模型蒸馏架构","parent":"20261126-010000-distill-r1","state":"answered","mode":"read-only","modelName":"neon","elapsedSeconds":180,"ageSeconds":2400,"caller":"session-a"},
+                    {"run":"20261126-030000-distill-r3","name":"reply to reply to 模型蒸馏架构","parent":"20261126-020000-distill-r2","chainName":"模型蒸馏架构","chainRound":3,"state":"delivered","mode":"write","modelName":"neon","elapsedSeconds":240,"ageSeconds":600,"caller":"session-a","changes":{"files":2,"added":50,"deleted":10},"authorRounds":[
+                        {"round":1,"run":"20261126-010000-distill-r1","kind":"initial","path":"/home/dev/.cache/delegate/archive/20261126-010000-distill-r1/record/result.md","totalLines":42,"totalChars":1200,"current":false},
+                        {"round":2,"run":"20261126-020000-distill-r2","kind":"rework","path":"/home/dev/main-app/.local/run/delegate/20261126-020000-distill-r2/round-2-result.md","totalLines":30,"totalChars":900,"current":false},
+                        {"round":3,"run":"20261126-030000-distill-r3","kind":"reply","path":"/home/dev/main-app/.local/run/delegate/20261126-030000-distill-r3/result.md","totalLines":55,"totalChars":1800,"current":true}
+                    ]}
+                ]
+            },
+            {
+                "path": "/home/dev/main-app/tools/rl-sim",
+                "runs": [
+                    {
+                        "run": "20261126-031000-train-m4",
+                        "name": "底盘蒸馏 M4",
+                        "state": "running",
+                        "mode": "write",
+                        "modelName": "neon",
+                        "caller": "other-session-b",
+                        "elapsedSeconds": 900,
+                        "ageSeconds": 900,
+                        "remote": {"host": "gpu-1"},
+                        "remoteExec": {
+                            "host": "gpu-1",
+                            "active": true,
+                            "running": true,
+                            "queue": "remote-heavy",
+                            "cmd": "uv run --frozen --extra gpu python scripts/train.py",
+                            "elapsedSeconds": 420,
+                            "outputTail": [
+                                "epoch 10 loss=0.142",
+                                "epoch 11 loss=0.118"
+                            ]
+                        }
+                    }
+                ]
+            }
+        ],
+        "lane": {
+            "maxHeavy": 4,
+            "remoteMaxHeavy": 1,
+            "local": [],
+            "remote": [
+                {"label": "/tmp/wt/train-m4: uv run --frozen --extra gpu python scripts/train.py", "running": true, "since": "2026-11-26T08:00:00Z"}
+            ]
+        },
+        "events": [],
+        "work": []
+    }"#;
+    let snap = delegate_tui::data::parse_snapshot_json(
+        snap_raw,
+        Some(Path::new("/home/dev")),
+        Some(Path::new("/home/dev/main-app")),
+    )
+    .expect("snapshot parses");
+    let mut app = App::new(
+        snap,
+        PathBuf::from("delegate"),
+        PathBuf::from("/home/dev/main-app"),
+        5,
+    );
+
+    // Overview tab (120 cols & 80 cols): shows remote run with host alias and collapsed reply chain
+    let ov120 = render_to_string(&mut app, 120, 34);
+    assert_lines_fit_width(&ov120, 120);
+    assert!(ov120.contains("底盘蒸馏 M4"), "remote run missing from 120-col overview:\n{ov120}");
+    assert!(ov120.contains("@gpu-1"), "remote host alias missing from 120-col overview:\n{ov120}");
+    assert!(ov120.contains("模型蒸馏架构（第 3 轮）"), "collapsed reply chain missing from 120-col overview:\n{ov120}");
+    assert!(!ov120.contains("reply to "), "raw reply prefix leaked in overview:\n{ov120}");
+
+    let ov80 = render_to_string(&mut app, 80, 34);
+    assert_lines_fit_width(&ov80, 80);
+    assert!(ov80.contains("底盘蒸馏 M4"), "remote run missing from 80-col overview:\n{ov80}");
+    assert!(ov80.contains("@gpu-1"), "remote host alias missing from 80-col overview:\n{ov80}");
+    assert!(!ov80.contains("reply to "), "raw reply prefix leaked in 80-col overview:\n{ov80}");
+
+    // Runs tab (120 cols): reply chain takes 1 row, remote run shows @gpu-1 + cmd + tail in detail
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    let runs120 = render_to_string(&mut app, 120, 36);
+    assert_lines_fit_width(&runs120, 120);
+    assert!(runs120.contains("模型蒸馏架构（第3轮）"), "reply chain missing in 120-col runs:\n{runs120}");
+    assert!(!runs120.contains("reply to "), "raw reply prefix leaked in runs:\n{runs120}");
+    assert!(runs120.contains("底盘蒸馏 M4"), "remote run missing in 120-col runs:\n{runs120}");
+    assert!(runs120.contains("@gpu-1"), "remote host alias missing in 120-col runs:\n{runs120}");
+    assert!(runs120.contains("会话轮次与各轮原文 (共 3 轮)"), "expanded reply rounds missing in detail:\n{runs120}");
+    assert!(runs120.contains("round-2-result.md"), "intra-run rework result path missing in detail:\n{runs120}");
+    assert!(runs120.contains("共 42 行") && runs120.contains("1200 字"), "round stats missing in detail:\n{runs120}");
+
+    // Select the remote run (next row down) -> detail pane shows remote command & output tail
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    let remote_detail_120 = render_to_string(&mut app, 120, 36);
+    assert_lines_fit_width(&remote_detail_120, 120);
+    assert!(remote_detail_120.contains("远端执行: @gpu-1"), "remote detail header missing:\n{remote_detail_120}");
+    assert!(remote_detail_120.contains("scripts/train.py"), "remote cmd missing:\n{remote_detail_120}");
+    assert!(remote_detail_120.contains("远端输出尾部 (最近 2 行)"), "remote tail header missing:\n{remote_detail_120}");
+    assert!(remote_detail_120.contains("epoch 11 loss=0.118"), "remote tail content missing:\n{remote_detail_120}");
+
+    // Runs tab at 80 cols
+    let remote_detail_80 = render_to_string(&mut app, 80, 36);
+    assert_lines_fit_width(&remote_detail_80, 80);
+    assert!(remote_detail_80.contains("@gpu-1"), "remote host missing at 80 cols:\n{remote_detail_80}");
+    assert!(remote_detail_80.contains("epoch 11 loss=0.118"), "remote tail missing at 80 cols:\n{remote_detail_80}");
+}
+
+#[test]
+fn idle_remote_exec_does_not_shadow_review_or_activity_and_narrow_preserves_host() {
+    let snap_raw = r#"{
+        "schemaVersion": 1,
+        "generatedEpoch": 1795681000,
+        "repos": [
+            {
+                "path": "/home/dev/rl-sim",
+                "runs": [
+                    {
+                        "run": "20261126-040000-reviewing-remote",
+                        "name": "远端配置审查中任务",
+                        "state": "running",
+                        "mode": "write",
+                        "modelName": "neon",
+                        "elapsedSeconds": 300,
+                        "ageSeconds": 300,
+                        "review": {"status": "reviewing", "round": 1, "reworkRounds": 0},
+                        "activity": {"kind": "thinking", "label": "在思考"},
+                        "remoteExec": {"host": "gpu-1", "active": false, "running": false}
+                    },
+                    {
+                        "run": "20261126-040100-active-local-cmd",
+                        "name": "长名字测试任务用于验证窄列保留主机别名",
+                        "state": "running",
+                        "mode": "write",
+                        "modelName": "neon",
+                        "elapsedSeconds": 180,
+                        "ageSeconds": 180,
+                        "activity": {"kind": "running_command", "cmd": "pytest -q", "label": "在跑命令：pytest -q"},
+                        "remoteExec": {"host": "gpu-2", "active": false, "running": false}
+                    }
+                ]
+            }
+        ],
+        "lane": {"maxHeavy": 4, "local": [], "remote": []},
+        "events": [],
+        "work": []
+    }"#;
+    let snap = delegate_tui::data::parse_snapshot_json(
+        snap_raw,
+        Some(Path::new("/home/dev")),
+        Some(Path::new("/home/dev/rl-sim")),
+    )
+    .expect("snapshot parses");
+    let mut app = App::new(
+        snap,
+        PathBuf::from("delegate"),
+        PathBuf::from("/home/dev/rl-sim"),
+        5,
+    );
+
+    // Overview at 120 cols (narrow left card, act_w == 0): preserves @gpu-2 even with long task name
+    let ov120 = render_to_string(&mut app, 120, 30);
+    assert_lines_fit_width(&ov120, 120);
+    assert!(ov120.contains("[@gpu-2]"), "narrow overview dropped @gpu-2:\n{ov120}");
+
+    // Overview at 180 cols (wide left card, act_w > 0): preserves local activity (`跑 pytest` / `在思考`) instead of shadowing with `@gpu-1`
+    let ov180 = render_to_string(&mut app, 180, 30);
+    assert_lines_fit_width(&ov180, 180);
+    assert!(ov180.contains("在思考") || ov180.contains("pytest"), "idle remote shadowed local activity in overview:\n{ov180}");
+
+    // Runs tab at 120 cols: preserves `[审查中]` and `[pytest -q]` instead of shadowing with `[@gpu-1]`
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    let runs120 = render_to_string(&mut app, 120, 30);
+    assert_lines_fit_width(&runs120, 120);
+    assert!(runs120.contains("[审查中]"), "idle remote shadowed review_snippet:\n{runs120}");
+    assert!(runs120.contains("pytest"), "idle remote shadowed local activity cmd:\n{runs120}");
 }
 
 #[test]

@@ -254,6 +254,57 @@ pub fn human(run: &Path, status: &Value) -> String {
 }
 
 pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
+    human_line_with_repo(run, status, collapse_chain, None)
+}
+
+fn format_short_duration_zh(seconds: i64) -> String {
+    let s = seconds.max(0);
+    if s < 60 {
+        format!("{s} 秒")
+    } else if s < 3600 {
+        format!("{} 分钟", s / 60)
+    } else {
+        format!("{} 小时 {} 分", s / 3600, (s % 3600) / 60)
+    }
+}
+
+fn remote_exec_inline(status: &Value, state: &str) -> Option<String> {
+    let re = status.get("remoteExec").filter(|v| v.is_object())?;
+    let host = s(re, "host");
+    if host.is_empty() {
+        return None;
+    }
+    let active = b(re, "active");
+    let running = b(re, "running");
+    let cmd = s(re, "cmd");
+    if active {
+        let short_cmd = if cmd.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", clip(&cmd.replace(['\n', '\r'], " "), 40))
+        };
+        let dur = re["elapsedSeconds"]
+            .as_i64()
+            .map(|sec| format!(" {}", format_short_duration_zh(sec)))
+            .unwrap_or_default();
+        if running {
+            Some(format!("远端:@{host}{short_cmd}{dur}"))
+        } else {
+            Some(format!("远端:@{host} 排队{short_cmd}"))
+        }
+    } else if runs::active(state) {
+        Some(format!("远端:@{host}"))
+    } else {
+        None
+    }
+}
+
+pub fn human_line_with_repo(
+    run: &Path,
+    status: &Value,
+    collapse_chain: bool,
+    repo_tag: Option<&str>,
+) -> String {
     let state = s(status, "state");
     let label = match state {
         "running" => "运行中",
@@ -286,7 +337,7 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
     } else {
         format!("{} 分钟", seconds / 60)
     };
-    let display_name = if collapse_chain
+    let base_name = if collapse_chain
         && n(status, "chainRound") > 1
         && !s(status, "chainName").is_empty()
     {
@@ -298,11 +349,18 @@ pub fn human_line(run: &Path, status: &Value, collapse_chain: bool) -> String {
     } else {
         s(status, "name").replace(['\n', '\r'], " ")
     };
+    let display_name = match repo_tag.filter(|t| !t.is_empty()) {
+        Some(tag) => format!("[{tag}] {base_name}"),
+        None => base_name,
+    };
     let mut parts = vec![
         display_name,
         format!("{label} {elapsed}"),
         agent_label(status),
     ];
+    if let Some(remote_part) = remote_exec_inline(status, state) {
+        parts.push(remote_part);
+    }
     if status["appends"].is_object() && n(&status["appends"], "total") > 0 {
         parts.push(format!(
             "已追加 {} 条，待投递 {} 条",
@@ -804,7 +862,128 @@ pub fn format_source_drift(drift: &Value) -> Option<String> {
 
 /// Concise summary line followed by indented path details for `delegate status <run>`.
 pub fn human_detail(run: &Path, status: &Value) -> String {
-    let mut lines = vec![human(run, status)];
+    let mut lines = vec![human_line(run, status, true)];
+    if status["remoteExec"].is_object() {
+        let re = &status["remoteExec"];
+        let host = s(re, "host");
+        if !host.is_empty() {
+            let queue_zh = match s(re, "queue") {
+                "remote-light" => "轻队列",
+                "remote-heavy" => "重队列",
+                _ => "远端",
+            };
+            let cmd = s(re, "cmd");
+            let dur = re["elapsedSeconds"]
+                .as_i64()
+                .map(|sec| format!("（已跑 {}）", format_short_duration_zh(sec)))
+                .unwrap_or_default();
+            if b(re, "active") {
+                let state_zh = if b(re, "running") { "运行中" } else { "排队中" };
+                let cmd_part = if cmd.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", cmd.replace(['\n', '\r'], " "))
+                };
+                lines.push(format!(
+                    "  远端执行：@{host} · {queue_zh} · {state_zh}{cmd_part}{dur}"
+                ));
+            } else {
+                lines.push(format!("  远端机器：@{host}"));
+            }
+            if let Some(tail) = re["outputTail"].as_array().filter(|a| !a.is_empty()) {
+                lines.push(format!("  远端输出尾部（最近 {} 行）：", tail.len()));
+                for item in tail {
+                    if let Some(line) = item.as_str() {
+                        lines.push(format!("    {line}"));
+                    }
+                }
+            }
+        }
+    }
+    let author_rounds: Vec<Value> = if let Some(arr) = status["authorRounds"].as_array() {
+        arr.clone()
+    } else if run.join("meta.json").is_file() {
+        runs::collect_result_rounds(run, true)
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "round": r.round,
+                    "run": r.run_id,
+                    "kind": r.kind,
+                    "path": r.path.to_string_lossy(),
+                    "totalLines": r.total_lines,
+                    "totalChars": r.total_chars,
+                    "current": r.current,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let cur_run_id = s(status, "run");
+    let cur_is_active = runs::active(s(status, "state"));
+    let cur_missing_from_rounds = cur_is_active
+        && !cur_run_id.is_empty()
+        && !author_rounds.iter().any(|r| s(r, "run") == cur_run_id);
+    let total_rounds = author_rounds.len() + usize::from(cur_missing_from_rounds);
+    if total_rounds > 1 {
+        let mut unique_runs: std::collections::BTreeSet<&str> = author_rounds
+            .iter()
+            .map(|r| s(r, "run"))
+            .filter(|id| !id.is_empty())
+            .collect();
+        if cur_missing_from_rounds {
+            unique_runs.insert(cur_run_id);
+        }
+        let multi_run = unique_runs.len() > 1;
+        let hint = if !cur_run_id.is_empty() && !author_rounds.is_empty() {
+            format!(
+                "，查看：delegate result {cur_run_id} --round <1..={}> / --all",
+                author_rounds.len()
+            )
+        } else {
+            String::new()
+        };
+        lines.push(format!("  各轮原文（共 {total_rounds} 轮{hint}）："));
+        for r in &author_rounds {
+            let rn = n(r, "round");
+            let rpath = s(r, "path");
+            let rlines = n(r, "totalLines");
+            let rchars = n(r, "totalChars");
+            let kind_zh = match s(r, "kind") {
+                "rework" => "返工",
+                "append" => "追加",
+                "reply" => "reply",
+                _ => "初稿",
+            };
+            let is_cur = b(r, "current") && !cur_missing_from_rounds;
+            let mut tags = Vec::new();
+            if multi_run {
+                let rid = s(r, "run");
+                if !rid.is_empty() {
+                    tags.push(rid.to_string());
+                }
+            }
+            tags.push(kind_zh.to_string());
+            let tag_str = if is_cur {
+                format!("{}，当前", tags.join(" · "))
+            } else {
+                tags.join(" · ")
+            };
+            lines.push(format!(
+                "    - 第 {rn} 轮（{tag_str}）：{rpath}（共 {rlines} 行 / {rchars} 字）"
+            ));
+        }
+        if cur_missing_from_rounds {
+            let rn = author_rounds.len() + 1;
+            let tag_str = if multi_run {
+                format!("{cur_run_id} · reply，进行中")
+            } else {
+                "reply，进行中".to_string()
+            };
+            lines.push(format!("    - 第 {rn} 轮（{tag_str}）：尚未产出原文"));
+        }
+    }
     if !b(status, "cleaned") && status["eta"].is_object() {
         let eta_obj = &status["eta"];
         let eta_stage = s(eta_obj, "stage");
@@ -1338,5 +1517,39 @@ mod tests {
             "lane": {"queue": "remote-heavy", "running": false, "label": "gpu: uv run train.py"}
         });
         assert!(human_line(dummy, &st_heavy, false).contains("远端重队列（排队中）"));
+
+        let st_remote = json!({
+            "run": "20261126-100003-m4",
+            "name": "reply to 底盘蒸馏 M4",
+            "chainName": "底盘蒸馏 M4",
+            "chainRound": 2,
+            "state": "running",
+            "elapsedSeconds": 300,
+            "agent": "agy",
+            "tier": "write",
+            "remoteExec": {
+                "host": "gpu-1",
+                "active": true,
+                "running": true,
+                "queue": "remote-heavy",
+                "cmd": "uv run python train.py",
+                "elapsedSeconds": 120,
+                "outputTail": ["epoch 1 loss=0.4", "epoch 2 loss=0.2"]
+            },
+            "authorRounds": [
+                {"round": 1, "run": "20261126-090000-m4-r1", "kind": "initial", "path": "/tmp/archive/m4-r1/record/result.md", "totalLines": 20, "totalChars": 600, "current": false},
+                {"round": 2, "run": "20261126-090000-m4-r1", "kind": "rework", "path": "/tmp/archive/m4-r1/record/round-2-result.md", "totalLines": 25, "totalChars": 750, "current": false}
+            ]
+        });
+        let line = super::human_line_with_repo(dummy, &st_remote, true, Some("rl-sim"));
+        assert!(line.starts_with("[rl-sim] 底盘蒸馏 M4（第 2 轮）"), "{line}");
+        assert!(line.contains("远端:@gpu-1 uv run python train.py 2 分钟"), "{line}");
+        let detail = super::human_detail(dummy, &st_remote);
+        assert!(detail.contains("远端执行：@gpu-1 · 重队列 · 运行中 · uv run python train.py（已跑 2 分钟）"), "{detail}");
+        assert!(detail.contains("远端输出尾部（最近 2 行）"), "{detail}");
+        assert!(detail.contains("epoch 2 loss=0.2"), "{detail}");
+        assert!(detail.contains("各轮原文（共 3 轮"), "{detail}");
+        assert!(detail.contains("round-2-result.md（共 25 行 / 750 字）"), "{detail}");
+        assert!(detail.contains("第 3 轮（20261126-100003-m4 · reply，进行中）"), "{detail}");
     }
 }

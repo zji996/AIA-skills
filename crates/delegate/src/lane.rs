@@ -538,11 +538,33 @@ pub fn run_active_lane(run: &Path) -> Option<Value> {
         for (i, (_, v)) in tickets_in(&dir).into_iter().enumerate() {
             if matches_run(&v) {
                 let running = b(&v, "running") || lim == 0 || i < lim;
-                let info = json!({
+                let raw_label = s(&v, "label");
+                let cmd = match raw_label.split_once(": ") {
+                    Some((prefix, rest))
+                        if !rest.trim().is_empty()
+                            && (prefix.starts_with('/') || prefix.contains("worktrees")) =>
+                    {
+                        rest.trim()
+                    }
+                    _ => raw_label.trim(),
+                };
+                let since = s(&v, "since");
+                let elapsed_secs = v["epoch"]
+                    .as_f64()
+                    .map(|ep| (epoch() - ep).max(0.0) as i64)
+                    .or_else(|| iso_epoch(since).map(|ep| (epoch() as i64 - ep).max(0)));
+                let mut info = json!({
                     "queue": kind.as_str(),
                     "running": running,
-                    "label": s(&v, "label"),
+                    "label": raw_label,
+                    "cmd": cmd,
                 });
+                if !since.is_empty() {
+                    info["since"] = json!(since);
+                }
+                if let Some(secs) = elapsed_secs {
+                    info["elapsedSeconds"] = json!(secs);
+                }
                 if !running {
                     return Some(info);
                 }
