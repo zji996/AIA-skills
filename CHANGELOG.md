@@ -2,8 +2,11 @@
 
 ## Unreleased
 
-- `delegate`：远端执行（`_remote`）不再无条件继承父进程 stdin——仅当 stdin 为普通文件，或管道已有缓冲数据（`POLLIN`）/存在同进程组非祖先写端（慢生产者真管道）时才透传给 `ssh`；对 tty（如 `agy` 的 PTY）、`/dev/null`、已关闭空管道（如 Pi/`rpi`）以及祖先持有的未关闭空闲管道统一改用 `ssh -n` + `/dev/null` 立即 EOF，避免远端命令误读 stdin 长期挂住并占满远端队列。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
+
+## delegate 6.48.1 - 2026-11-26
+
+- `delegate` 6.48.1：远端执行（`_remote`）不再无条件继承父进程 stdin——仅当 stdin 为普通文件，或管道已有缓冲数据（`POLLIN`）/存在同进程组非祖先写端（慢生产者真管道）时才透传给 `ssh`；对 tty（如 `agy` 的 PTY）、`/dev/null`、已关闭空管道（如 Pi/`rpi`）以及祖先持有的未关闭空闲管道统一改用 `ssh -n` + `/dev/null` 立即 EOF，避免远端命令误读 stdin 长期挂住并占满远端队列。
 
 ## delegate 6.48.0 - 2026-11-26
 
