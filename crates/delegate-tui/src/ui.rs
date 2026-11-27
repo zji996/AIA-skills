@@ -384,7 +384,7 @@ fn build_top_bar_tabs(app: &App, pulse: &SnapshotPulse, width: u16) -> Vec<Span<
     spans
 }
 
-/// Active account short weekly summary (`★gui… 周41%` or `★auto`) for the fixed top bar.
+/// Active account short weekly summary (`★nov… 周41%` or `★auto`) for the fixed top bar.
 fn top_bar_active_account_summary(state: &AgyAccountsState) -> Option<(String, Style)> {
     if state.auto_switch.enabled {
         let gem_cur = state

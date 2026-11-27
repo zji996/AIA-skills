@@ -1468,8 +1468,8 @@ fn accounts_default_masked_and_toggle_full_with_i_while_y_copies_full_id() {
 
     let raw_accounts = r#"{
         "root": "/tmp/fake-home/.config/delegate/agy-accounts",
-        "active": "guimondbuchinsky",
-        "liveEmail": "guimondbuchinsky@gmail.com",
+        "active": "nova-primary",
+        "liveEmail": "nova@example.test",
         "liveDrifted": false,
         "runningAgy": [
             {"pid": 33057, "run": "20261124-155318-call-orphan", "cmdline": "/home/user/.local/libexec/agy --input-format stream-json --output-format stream-json"},
@@ -1477,9 +1477,9 @@ fn accounts_default_masked_and_toggle_full_with_i_while_y_copies_full_id() {
         ],
         "accounts": [
             {
-                "id": "guimondbuchinsky",
-                "email": "guimondbuchinsky@gmail.com",
-                "label": "Buchinsky Guimond",
+                "id": "nova-primary",
+                "email": "nova@example.test",
+                "label": "Orbit Tester",
                 "active": true,
                 "lastUsedAt": "2026-11-24T00:08:00Z",
                 "fileCount": 6,
@@ -1500,8 +1500,8 @@ fn accounts_default_masked_and_toggle_full_with_i_while_y_copies_full_id() {
                 }
             },
             {
-                "id": "jzy896370029",
-                "email": "jzy896370029@gmail.com",
+                "id": "orbit-backup",
+                "email": "orbit@example.test",
                 "label": "",
                 "active": false,
                 "lastUsedAt": "",
@@ -1519,25 +1519,25 @@ fn accounts_default_masked_and_toggle_full_with_i_while_y_copies_full_id() {
     };
     let mut app = App::new(snap, PathBuf::from("delegate"), PathBuf::from("."), 5);
 
-    // Overview ('1'): accounts masked (`gui…`, `jzy…`), no full id / label leaked
+    // Overview ('1'): accounts masked (`nov…`, `orb…`), no full id / label leaked
     app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
     assert_eq!(app.tab, ViewTab::Overview);
     let ov = render_to_string(&mut app, 140, 40);
-    assert!(ov.contains("gui…"), "{ov}");
-    assert!(ov.contains("jzy…"), "{ov}");
-    assert!(!ov.contains("guimondbuchinsky"), "full account name leaked on overview:\n{ov}");
-    assert!(!ov.contains("jzy896370029"), "full account name leaked on overview:\n{ov}");
-    assert!(!ov.contains("Buchinsky Guimond"), "label leaked on overview:\n{ov}");
+    assert!(ov.contains("nov…"), "{ov}");
+    assert!(ov.contains("orb…"), "{ov}");
+    assert!(!ov.contains("nova-primary"), "full account name leaked on overview:\n{ov}");
+    assert!(!ov.contains("orbit-backup"), "full account name leaked on overview:\n{ov}");
+    assert!(!ov.contains("Orbit Tester"), "label leaked on overview:\n{ov}");
 
     // Quota tab ('4'): default masked, no email column, no label, one-line procs without cmdline
     app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
     assert_eq!(app.tab, ViewTab::Quota);
     let masked = render_to_string(&mut app, 140, 40);
-    assert!(masked.contains("gui…"), "{masked}");
-    assert!(masked.contains("jzy…"), "{masked}");
-    assert!(!masked.contains("guimondbuchinsky"), "full id leaked:\n{masked}");
-    assert!(!masked.contains("gmail.com"), "email leaked:\n{masked}");
-    assert!(!masked.contains("Buchinsky Guimond"), "label leaked:\n{masked}");
+    assert!(masked.contains("nov…"), "{masked}");
+    assert!(masked.contains("orb…"), "{masked}");
+    assert!(!masked.contains("nova-primary"), "full id leaked:\n{masked}");
+    assert!(!masked.contains("example.test"), "email leaked:\n{masked}");
+    assert!(!masked.contains("Orbit Tester"), "label leaked:\n{masked}");
     assert!(!masked.contains("邮箱"), "email column header should be removed:\n{masked}");
     assert!(masked.contains("i 显隐全称") || masked.contains("i 全称"), "footer should show `i`:\n{masked}");
     assert!(masked.contains("33057 · call-orphan"), "{masked}");
@@ -1548,24 +1548,24 @@ fn accounts_default_masked_and_toggle_full_with_i_while_y_copies_full_id() {
     let y_act = app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
     assert_eq!(
         y_act,
-        AppAction::CopyClipboard("delegate agy account use guimondbuchinsky".to_string())
+        AppAction::CopyClipboard("delegate agy account use nova-primary".to_string())
     );
 
     // Press `i` -> selected account reveals full id, email, and label; other account stays masked
     app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
     let revealed = render_to_string(&mut app, 140, 40);
-    assert!(revealed.contains("guimondbuchinsky"), "{revealed}");
-    assert!(revealed.contains("guimondbuchinsky@gmail.com"), "{revealed}");
-    assert!(revealed.contains("Buchinsky Guimond"), "{revealed}");
-    assert!(revealed.contains("jzy…"), "{revealed}");
-    assert!(!revealed.contains("jzy896370029"), "unselected account must stay masked:\n{revealed}");
+    assert!(revealed.contains("nova-primary"), "{revealed}");
+    assert!(revealed.contains("nova@example.test"), "{revealed}");
+    assert!(revealed.contains("Orbit Tester"), "{revealed}");
+    assert!(revealed.contains("orb…"), "{revealed}");
+    assert!(!revealed.contains("orbit-backup"), "unselected account must stay masked:\n{revealed}");
 
     // Press `i` again -> restores masked default
     app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
     let remasked = render_to_string(&mut app, 140, 40);
-    assert!(!remasked.contains("guimondbuchinsky"), "second `i` should hide full id:\n{remasked}");
-    assert!(!remasked.contains("gmail.com"), "second `i` should hide email:\n{remasked}");
-    assert!(!remasked.contains("Buchinsky Guimond"), "second `i` should hide label:\n{remasked}");
+    assert!(!remasked.contains("nova-primary"), "second `i` should hide full id:\n{remasked}");
+    assert!(!remasked.contains("example.test"), "second `i` should hide email:\n{remasked}");
+    assert!(!remasked.contains("Orbit Tester"), "second `i` should hide label:\n{remasked}");
 }
 
 #[test]
@@ -1575,14 +1575,14 @@ fn quota_row_has_space_between_bar_and_text_and_never_overflows_at_80_and_120_co
 
     let raw_accounts = r#"{
         "root": "/tmp/fake-home/.config/delegate/agy-accounts",
-        "active": "guimondbuchinsky",
-        "liveEmail": "guimondbuchinsky@gmail.com",
+        "active": "nova-primary",
+        "liveEmail": "nova@example.test",
         "liveDrifted": false,
         "runningAgy": [],
         "accounts": [
             {
-                "id": "guimondbuchinsky",
-                "email": "guimondbuchinsky@gmail.com",
+                "id": "nova-primary",
+                "email": "nova@example.test",
                 "active": true,
                 "fileCount": 6,
                 "quota": {
@@ -2133,15 +2133,15 @@ fn tui_polish_1125_fixes_collected_time_narrow_names_tier_dedup_local_time_lane_
             }
         ],
         "agyAccounts": {
-            "active": "guimondbuchinsky",
+            "active": "nova-primary",
             "runningAgy": [
                 {"pid": 2119879, "run": "20261125-015401-org-step3-switcher", "runName": "org-step3-switcher", "role": "reviewer", "round": "round-1", "cmdline": "agy"},
                 {"pid": 539385, "run": "20261125-114020-gate-fix-1125", "runName": "gate-fix-1125", "role": "author", "cmdline": "agy"}
             ],
             "accounts": [
                 {
-                    "id": "guimondbuchinsky",
-                    "email": "gui@example.test",
+                    "id": "nova-primary",
+                    "email": "nova@example.test",
                     "active": true,
                     "lastUsedAt": "2026-11-25T04:10:00Z",
                     "fileCount": 6,
@@ -2336,11 +2336,11 @@ fn tui_1126_fixes_ephemeral_work_rework_charts_quota_alert_and_stale_folding() {
             {"name": "agy-usage", "status": "dispatched", "repo": "/home/user/aia-skills", "runId": "20261124-040538-agy-usage"}
         ],
         "agyAccounts": {
-            "active": "gui",
+            "active": "nova",
             "accounts": [
                 {
-                    "id": "gui",
-                    "email": "gui@example.test",
+                    "id": "nova",
+                    "email": "nova@example.test",
                     "active": true,
                     "quota": {
                         "fetchedAt": "2026-11-25T19:34:50Z",
@@ -2618,11 +2618,11 @@ fn global_alert_strip_silent_when_healthy_and_visible_across_all_5_tabs_on_p0_p1
         "seq": 3,
         "repos": [],
         "agyAccounts": {
-            "active": "jzy-main",
+            "active": "nova-main",
             "liveDrifted": false,
             "accounts": [{
-                "id": "jzy-main",
-                "email": "jzy@example.test",
+                "id": "nova-main",
+                "email": "nova@example.test",
                 "active": true,
                 "quota": {
                     "fetchedAt": "2026-11-26T00:00:00Z",

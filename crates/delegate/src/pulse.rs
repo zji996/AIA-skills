@@ -123,7 +123,7 @@ pub fn is_pure_timed_wait_work_json(w: &Value) -> bool {
     false
 }
 
-/// Mask an account ID (usually an email) into a short recognizable label like `gui…`.
+/// Mask an account ID (usually an email) into a short recognizable label like `nov…`.
 fn mask_account_short(id: &str) -> String {
     let trimmed = id.trim();
     if trimmed.is_empty() {

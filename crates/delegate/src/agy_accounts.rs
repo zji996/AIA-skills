@@ -9133,24 +9133,24 @@ BadRow\tWeekly Limit Remaining\tnot-a-pct\t2026-11-30T00:00:00Z
         fs::create_dir_all(h.join(".gemini/antigravity-cli")).unwrap();
         fs::write(
             h.join(".gemini/google_accounts.json"),
-            r#"{"active":"jzy@example.test","old":[]}"#,
+            r#"{"active":"orbit@example.test","old":[]}"#,
         )
         .unwrap();
         // Before cli token exists, falls back to google_accounts.json.
-        assert_eq!(live_email(h).as_deref(), Some("jzy@example.test"));
+        assert_eq!(live_email(h).as_deref(), Some("orbit@example.test"));
 
         // When a long-lived agy process overwrites antigravity-cli/antigravity-oauth-token
         // with another account without touching google_accounts.json, live_email must report it.
         fs::write(
             h.join(".gemini/antigravity-cli/antigravity-oauth-token"),
-            make_test_token_json("guimond@example.test", "AT-G", "2026-11-25T19:50:07Z"),
+            make_test_token_json("nova@example.test", "AT-G", "2026-11-25T19:50:07Z"),
         )
         .unwrap();
-        assert_eq!(live_email(h).as_deref(), Some("guimond@example.test"));
+        assert_eq!(live_email(h).as_deref(), Some("nova@example.test"));
         let all = collect_home_cred_emails(h);
         assert_eq!(all.len(), 2);
-        assert_eq!(all[0].1, "guimond@example.test");
-        assert_eq!(all[1].1, "jzy@example.test");
+        assert_eq!(all[0].1, "nova@example.test");
+        assert_eq!(all[1].1, "orbit@example.test");
     }
 
     #[test]
@@ -9208,25 +9208,25 @@ Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSum
         ]);
 
         let dup_accounts = vec![
-            json!({"id":"guimond","quota":{"ok":true,"entries":same_entries}}),
-            json!({"id":"jzy","quota":{"ok":true,"entries":same_entries}}),
+            json!({"id":"nova","quota":{"ok":true,"entries":same_entries}}),
+            json!({"id":"orbit","quota":{"ok":true,"entries":same_entries}}),
         ];
         assert_eq!(
             find_duplicate_quota_slot_groups(&dup_accounts),
-            vec![vec!["guimond".to_string(), "jzy".to_string()]]
+            vec![vec!["nova".to_string(), "orbit".to_string()]]
         );
 
         // Same percentages but different resetAt must NOT trigger duplicate warning.
         let distinct_accounts = vec![
-            json!({"id":"guimond","quota":{"ok":true,"entries":same_entries}}),
-            json!({"id":"jzy","quota":{"ok":true,"entries":diff_reset}}),
+            json!({"id":"nova","quota":{"ok":true,"entries":same_entries}}),
+            json!({"id":"orbit","quota":{"ok":true,"entries":diff_reset}}),
         ];
         assert!(find_duplicate_quota_slot_groups(&distinct_accounts).is_empty());
 
         // Empty entries must NOT trigger duplicate warning.
         let empty_accounts = vec![
-            json!({"id":"guimond","quota":{"ok":false,"entries":[]}}),
-            json!({"id":"jzy","quota":{"ok":false,"entries":[]}}),
+            json!({"id":"nova","quota":{"ok":false,"entries":[]}}),
+            json!({"id":"orbit","quota":{"ok":false,"entries":[]}}),
         ];
         assert!(find_duplicate_quota_slot_groups(&empty_accounts).is_empty());
     }
@@ -11211,26 +11211,26 @@ Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSum
     fn format_delegation_and_live_lines_match_verbatim_spec() {
         let snap = json!({
             "mode": "auto",
-            "active": "guimond",
+            "active": "nova",
             "autoSwitch": {
                 "poolSummary": {
-                    "gemini": {"selected": "jzy"},
-                    "claude_gpt": {"selected": "jzy"}
+                    "gemini": {"selected": "orbit"},
+                    "claude_gpt": {"selected": "orbit"}
                 }
             },
             "runningAgy": [
-                {"pid": 1, "account": "jzy"},
-                {"pid": 2, "account": "jzy"},
+                {"pid": 1, "account": "orbit"},
+                {"pid": 2, "account": "orbit"},
                 {"pid": 3, "account": "alpha"}
             ]
         });
         assert_eq!(
             format_delegation_selection_line(&snap),
-            "委派选号：auto · Gemini → jzy · Claude/GPT → jzy（在跑 3 个：jzy ×2，alpha ×1）"
+            "委派选号：auto · Gemini → orbit · Claude/GPT → orbit（在跑 3 个：orbit ×2，alpha ×1）"
         );
         assert_eq!(
             format_live_slot_line(&snap),
-            "本机实盘：guimond（只给手动运行的 agy 用，auto 不改它）"
+            "本机实盘：nova（只给手动运行的 agy 用，auto 不改它）"
         );
     }
 }
