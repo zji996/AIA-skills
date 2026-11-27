@@ -1,6 +1,7 @@
 import json
 import shlex
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -181,6 +182,97 @@ class DelegateWaitDefaultsTests(unittest.TestCase):
         self.assertIn('"stall_warning"', run_events)
         self.assertIn("sleep 0.4", run_events)
         self.assertFalse((Path(state["dir"]) / "stall-warning.json").exists())
+
+    def test_command_growing_remote_output_does_not_stall_until_stopped(self):
+        self.env["DELEGATE_STALL_IDLE"] = "0"
+        self.env["DELEGATE_STALL_COMMAND"] = ".35s"
+        event = {"type": "tool_execution_start", "toolName": "bash", "args": {"command": "uv run train_ppo.py"}}
+        done_ev = {"type": "tool_execution_end", "toolName": "bash", "isError": False}
+        state, gate = self.start_gated(
+            "task",
+            attempts=([done_ev, fixtures.answer("training done"), fixtures.SETTLED],),
+            pre=f"printf '%s\\n' {shlex.quote(json.dumps(event))}",
+        )
+        run_dir = Path(state["dir"])
+        self.wait_text(run_dir / "events.jsonl", "uv run train_ppo.py", "bash event recorded")
+        remote_log = run_dir / "remote-output.log"
+        # Continuously grow remote-output.log (including a TailLogWriter-style rename/shrink)
+        # well past DELEGATE_STALL_COMMAND: must not emit stall_warning.
+        deadline = time.monotonic() + 0.85
+        step = 0
+        while time.monotonic() < deadline:
+            step += 1
+            if step == 6:
+                tmp = run_dir / ".remote-output.log.tmp"
+                tmp.write_text("tail\n")
+                tmp.replace(remote_log)
+            else:
+                with remote_log.open("a") as f:
+                    f.write(f"iter {step} reward={step * 0.1:.2f}\n")
+            time.sleep(0.05)  # sleep-ok: stream periodic remote output past stall threshold
+        self.assertNotIn('"stall_warning"', (run_dir / "events.jsonl").read_text())
+        self.assertFalse((run_dir / "stall-warning.json").exists())
+        machine_events_path = Path(self.env["XDG_STATE_HOME"]) / "delegate" / "events.jsonl"
+        if machine_events_path.exists():
+            self.assertNotIn('"stall_warning"', machine_events_path.read_text())
+
+        # Once remote-output.log stops growing, stall_warning must fire normally.
+        self.wait_text(run_dir / "events.jsonl", '"stall_warning"', "stall_warning after remote output stops")
+        self.assertIn("uv run train_ppo.py", (run_dir / "events.jsonl").read_text())
+        self.assertTrue((run_dir / "stall-warning.json").exists())
+
+        # Resuming output clears stall-warning.json before the command even finishes.
+        with remote_log.open("a") as f:
+            f.write("iter resumed\n")
+        self.until(
+            lambda: not (run_dir / "stall-warning.json").exists(),
+            "stall-warning.json cleared after remote output resumes",
+        )
+        gate.touch()
+        waited = self.outcome(self.cli("wait", state["run"]))
+        self.assertEqual(waited["state"], "answered")
+
+    def test_command_growing_local_output_does_not_stall_until_stopped(self):
+        self.env["DELEGATE_STALL_IDLE"] = "0"
+        self.env["DELEGATE_STALL_COMMAND"] = ".35s"
+        start_ev = {"type": "tool_execution_start", "toolName": "bash", "args": {"command": "python3 train.py"}}
+        update_ev = {
+            "type": "tool_execution_update",
+            "toolName": "bash",
+            "partialResult": {"content": [{"type": "text", "text": "epoch progress"}]},
+        }
+        done_ev = {"type": "tool_execution_end", "toolName": "bash", "isError": False}
+        pre_script = (
+            f"printf '%s\\n' {shlex.quote(json.dumps(start_ev))}; "
+            f"i=0; while [ $i -lt 11 ]; do sleep 0.05; "
+            f"printf '%s\\n' {shlex.quote(json.dumps(update_ev))}; i=$((i+1)); done; "
+            ': > "$DELEGATE_RUN_DIR/.updates-done"'
+        )
+        state, gate = self.start_gated(
+            "task",
+            attempts=([done_ev, fixtures.answer("local training done"), fixtures.SETTLED],),
+            pre=pre_script,
+        )
+        run_dir = Path(state["dir"])
+        self.until(lambda: (run_dir / ".updates-done").exists(), "streaming tool_execution_update phase finished")
+        self.assertNotIn('"stall_warning"', (run_dir / "events.jsonl").read_text())
+
+        # Also keep stderr.log growing past threshold; still no stall_warning.
+        stderr_log = run_dir / "stderr.log"
+        deadline = time.monotonic() + 0.55
+        step = 0
+        while time.monotonic() < deadline:
+            step += 1
+            with stderr_log.open("a") as f:
+                f.write(f"stderr progress {step}\n")
+            time.sleep(0.05)  # sleep-ok: stream periodic stderr output past stall threshold
+        self.assertNotIn('"stall_warning"', (run_dir / "events.jsonl").read_text())
+
+        # Once output stops, stall_warning must fire normally.
+        self.wait_text(run_dir / "events.jsonl", '"stall_warning"', "stall_warning after local output stops")
+        gate.touch()
+        waited = self.outcome(self.cli("wait", state["run"]))
+        self.assertEqual(waited["state"], "answered")
 
     def test_legacy_stalled_run_remains_readable(self):
         self.fake_pi([fixtures.answer("ok"), fixtures.SETTLED])

@@ -21,10 +21,32 @@ struct WatchState {
     // Lane queue seconds already counted when the command started; queueing
     // for the heavy lane is not the command being stuck.
     command_queued: f64,
+    // Last time the running command showed output progress (streaming stdout
+    // events or remote-output.log / stderr.log growth) and lane queue seconds
+    // at that moment.
+    command_output_at: Option<Instant>,
+    command_output_queued: f64,
+    command_remote_log: Option<FileFingerprint>,
+    command_stderr_log: Option<FileFingerprint>,
     command: String,
     // Rate-limit stall reminders so we warn once per stall interval without spinning or killing.
     idle_warned_at: Option<Instant>,
     command_warned_at: Option<Instant>,
+}
+
+fn is_command_output_event(on_agy: bool, event: &Value) -> bool {
+    if on_agy {
+        if s(event, "event") != "step_update" {
+            return false;
+        }
+        let u = &event["step_update"];
+        s(u, "step_type") == "tool"
+            && s(u, "tool_name") == "run_command"
+            && s(u, "state") == "ACTIVE"
+    } else {
+        s(event, "type") == "tool_execution_update"
+            && matches!(s(event, "toolName"), "bash" | "")
+    }
 }
 
 /// Split a shell command string on `;`, `&&`, `||`, `|`, and `\n` while respecting single/double quotes.
@@ -2199,6 +2221,10 @@ pub fn run_agent_cancellable(
             commands: 0,
             command_started: None,
             command_queued: 0.0,
+            command_output_at: None,
+            command_output_queued: 0.0,
+            command_remote_log: file_fingerprint(&run.join("remote-output.log")),
+            command_stderr_log: file_fingerprint(&run.join("stderr.log")),
             command: String::new(),
             idle_warned_at: None,
             command_warned_at: None,
@@ -2223,6 +2249,8 @@ pub fn run_agent_cancellable(
     let watcher = std::thread::spawn(move || {
         let (mutex, changed) = &*watcher_state;
         let mut state = mutex.lock().unwrap();
+        let remote_log_path = runpath.join("remote-output.log");
+        let stderr_log_path = runpath.join("stderr.log");
         loop {
             if state.finished {
                 break;
@@ -2231,10 +2259,30 @@ pub fn run_agent_cancellable(
             let queued = lane::queued_seconds(&runpath);
             let spent = start.elapsed().as_secs_f64() - queued;
             let idle = state.last.elapsed().as_secs_f64();
-            let command_idle = idle - (queued - state.command_queued).max(0.0);
-            let command_age = state
-                .command_started
-                .map(|at| at.elapsed().as_secs_f64() - (queued - state.command_queued).max(0.0));
+            if state.command_started.is_some() {
+                let remote_grew =
+                    file_output_advanced(&remote_log_path, &mut state.command_remote_log);
+                let stderr_grew =
+                    file_output_advanced(&stderr_log_path, &mut state.command_stderr_log);
+                if remote_grew || stderr_grew {
+                    state.command_output_at = Some(Instant::now());
+                    state.command_output_queued = queued;
+                    if state.command_warned_at.take().is_some() {
+                        let _ = fs::remove_file(runpath.join("stall-warning.json"));
+                    }
+                }
+            }
+            let command_idle = state
+                .command_output_at
+                .or(state.command_started)
+                .map(|at| {
+                    (at.elapsed().as_secs_f64() - (queued - state.command_output_queued).max(0.0))
+                        .max(0.0)
+                })
+                .unwrap_or(0.0);
+            let command_age = state.command_started.map(|at| {
+                (at.elapsed().as_secs_f64() - (queued - state.command_queued).max(0.0)).max(0.0)
+            });
             if let Some(limit) = stall_idle {
                 let due = state.commands == 0
                     && idle >= limit
@@ -2287,13 +2335,19 @@ pub fn run_agent_cancellable(
                         .is_none_or(|w| w.elapsed().as_secs_f64() >= limit);
                 if due {
                     let elapsed = command_age.unwrap_or(0.0).round() as u64;
+                    let silent = command_idle.round() as u64;
                     let at = iso();
                     let cmd = state.command.clone();
-                    let detail = format!("命令 {} 已运行 {elapsed} 秒无新输出", clip(&cmd, 80));
+                    let detail = if elapsed > silent {
+                        format!("命令 {} 已运行 {elapsed} 秒（{silent} 秒无新输出）", clip(&cmd, 80))
+                    } else {
+                        format!("命令 {} 已运行 {elapsed} 秒无新输出", clip(&cmd, 80))
+                    };
                     let warning = json!({
                         "kind": "command",
                         "cmd": cmd,
                         "seconds": elapsed,
+                        "silentSeconds": silent,
                         "limitSeconds": limit,
                         "detail": detail,
                         "at": at,
@@ -2307,7 +2361,7 @@ pub fn run_agent_cancellable(
                         let _ = writeln!(
                             log,
                             "{}",
-                            json!({"e":"stall_warning","kind":"command","cmd":cmd,"seconds":elapsed,"limitSeconds":limit,"detail":detail,"at":at})
+                            json!({"e":"stall_warning","kind":"command","cmd":cmd,"seconds":elapsed,"silentSeconds":silent,"limitSeconds":limit,"detail":detail,"at":at})
                         );
                     }
                     crate::events::emit(
@@ -2319,6 +2373,7 @@ pub fn run_agent_cancellable(
                             "stallKind": "command",
                             "cmd": cmd,
                             "seconds": elapsed,
+                            "silentSeconds": silent,
                             "limitSeconds": limit,
                             "detail": detail,
                         }),
@@ -2369,7 +2424,9 @@ pub fn run_agent_cancellable(
                         Some(w) => limit - w.elapsed().as_secs_f64(),
                         None => limit - command_idle,
                     };
-                    delay = delay.min(rem.max(0.05));
+                    delay = delay
+                        .min(rem.max(0.05))
+                        .min((limit / 4.0).clamp(0.05, 60.0));
                 }
             }
             if watcher_cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
@@ -2583,6 +2640,18 @@ pub fn run_agent_cancellable(
                     }
                 }
             }
+            if items.is_empty() && is_command_output_event(on_agy, &event) {
+                let (mutex, changed) = &*watch;
+                let mut state = mutex.lock().unwrap();
+                if state.commands > 0 {
+                    state.command_output_at = Some(Instant::now());
+                    state.command_output_queued = lane::queued_seconds(run);
+                    if state.command_warned_at.take().is_some() {
+                        let _ = fs::remove_file(run.join("stall-warning.json"));
+                    }
+                    changed.notify_one();
+                }
+            }
             let mut bash_done_in_batch: Option<(String, bool)> = None;
             let mut bash_err_in_batch = String::new();
             for mut item in items {
@@ -2597,15 +2666,25 @@ pub fn run_agent_cancellable(
                         let _ = fs::remove_file(run.join("stall-warning.json"));
                     }
                     if kind == "bash" {
+                        let now = Instant::now();
+                        let queued = lane::queued_seconds(run);
                         state.commands += 1;
-                        state.command_started = Some(Instant::now());
-                        state.command_queued = lane::queued_seconds(run);
+                        state.command_started = Some(now);
+                        state.command_queued = queued;
+                        state.command_output_at = Some(now);
+                        state.command_output_queued = queued;
+                        state.command_remote_log =
+                            file_fingerprint(&run.join("remote-output.log"));
+                        state.command_stderr_log = file_fingerprint(&run.join("stderr.log"));
                         state.command = s(&item, "cmd").to_string();
-                        state.command_warned_at = None;
+                        if state.command_warned_at.take().is_some() {
+                            let _ = fs::remove_file(run.join("stall-warning.json"));
+                        }
                     } else if kind == "bash_done" {
                         state.commands = (state.commands - 1).max(0);
                         if state.commands == 0 {
                             state.command_started = None;
+                            state.command_output_at = None;
                             if state.command_warned_at.take().is_some() {
                                 let _ = fs::remove_file(run.join("stall-warning.json"));
                             }
@@ -3325,5 +3404,77 @@ mod tests {
             classify_question("无矛盾需要主控拍板，已完成全部改动。", false),
             QuestionKind::None
         );
+    }
+
+    #[test]
+    fn file_output_advanced_tracks_growth_and_tail_rotation() {
+        let dir = std::env::temp_dir().join(format!(
+            "delegate-output-fp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("remote-output.log");
+
+        // Missing file -> no progress.
+        let mut prev = file_fingerprint(&log);
+        assert!(prev.is_none());
+        assert!(!file_output_advanced(&log, &mut prev));
+
+        // Creating an empty file (TailLogWriter::create before any output) is not progress.
+        fs::write(&log, b"").unwrap();
+        assert!(!file_output_advanced(&log, &mut prev));
+        assert!(prev.is_some());
+
+        // Appending bytes counts as progress; unchanged second poll does not.
+        fs::write(&log, b"epoch 1 loss=0.5\n").unwrap();
+        assert!(file_output_advanced(&log, &mut prev));
+        assert!(!file_output_advanced(&log, &mut prev));
+
+        // TailLogWriter rotation: rename a smaller temp file over the log (len shrinks, ino changes).
+        let tmp = dir.join(".remote-output.log.tmp");
+        fs::write(&tmp, b"tail\n").unwrap();
+        fs::rename(&tmp, &log).unwrap();
+        assert!(file_output_advanced(&log, &mut prev));
+        assert!(!file_output_advanced(&log, &mut prev));
+
+        // Truncating to 0 (new command starting) updates baseline without counting as progress.
+        fs::write(&log, b"").unwrap();
+        assert!(!file_output_advanced(&log, &mut prev));
+        assert!(!file_output_advanced(&log, &mut prev));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_output_event_matches_pi_and_agy_streaming_updates() {
+        assert!(is_command_output_event(
+            false,
+            &json!({"type": "tool_execution_update", "toolName": "bash", "partialResult": {"content": [{"text": "step 1"}]}})
+        ));
+        assert!(!is_command_output_event(
+            false,
+            &json!({"type": "tool_execution_update", "toolName": "read"})
+        ));
+        assert!(!is_command_output_event(
+            false,
+            &json!({"type": "tool_execution_start", "toolName": "bash"})
+        ));
+
+        assert!(is_command_output_event(
+            true,
+            &json!({"event": "step_update", "step_update": {"step_type": "tool", "tool_name": "run_command", "state": "ACTIVE"}})
+        ));
+        assert!(!is_command_output_event(
+            true,
+            &json!({"event": "step_update", "step_update": {"step_type": "tool", "tool_name": "run_command", "state": "DONE"}})
+        ));
+        assert!(!is_command_output_event(
+            true,
+            &json!({"event": "step_update", "step_update": {"step_type": "agent_response", "text_delta": "hi"}})
+        ));
     }
 }

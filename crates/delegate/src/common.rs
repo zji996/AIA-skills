@@ -1047,7 +1047,9 @@ fn run_shell_inner(
     };
     let stall_limit = stall_kind.and_then(|k| crate::agents::stall_seconds(&meta, k));
     let log_path = run.join(format!("{role}.log"));
-    let mut last_log_len = log.metadata().map(|m| m.len()).unwrap_or(0);
+    let remote_log_path = run.join("remote-output.log");
+    let mut last_log_fp = file_handle_fingerprint(log);
+    let mut last_remote_log_fp = file_fingerprint(&remote_log_path);
     let mut last_output_at = std::time::Instant::now();
     let mut queued_at_last_output = 0.0_f64;
     let mut last_warn_at: Option<std::time::Instant> = None;
@@ -1096,9 +1098,9 @@ fn run_shell_inner(
             }
         }
         if let Some(kind) = stall_kind {
-            let cur_len = log.metadata().map(|m| m.len()).unwrap_or(last_log_len);
-            if cur_len != last_log_len {
-                last_log_len = cur_len;
+            let log_grew = file_handle_output_advanced(log, &mut last_log_fp);
+            let remote_grew = file_output_advanced(&remote_log_path, &mut last_remote_log_fp);
+            if log_grew || remote_grew {
                 last_output_at = std::time::Instant::now();
                 queued_at_last_output = queued;
                 if warned_stall {
@@ -1202,6 +1204,61 @@ fn run_shell_inner(
     }
     Ok((code, timed))
 }
+/// Metadata fingerprint of a log file used to detect new output even across
+/// tail-log truncation/rename (where file size shrinks and inode changes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileFingerprint {
+    pub len: u64,
+    pub modified: Option<std::time::SystemTime>,
+    pub ino: u64,
+}
+
+fn fingerprint_from_meta(meta: &fs::Metadata) -> FileFingerprint {
+    use std::os::unix::fs::MetadataExt;
+    FileFingerprint {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+        ino: meta.ino(),
+    }
+}
+
+fn fingerprint_advanced(
+    cur: Option<FileFingerprint>,
+    prev: &mut Option<FileFingerprint>,
+) -> bool {
+    if cur == *prev {
+        return false;
+    }
+    let grew = cur.is_some_and(|fp| fp.len > 0);
+    *prev = cur;
+    grew
+}
+
+pub(crate) fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    fs::metadata(path).ok().map(|m| fingerprint_from_meta(&m))
+}
+
+pub(crate) fn file_handle_fingerprint(file: &File) -> Option<FileFingerprint> {
+    file.metadata().ok().map(|m| fingerprint_from_meta(&m))
+}
+
+/// Returns true if `path` has new non-empty output since `prev`, updating `prev`
+/// in place. Creating or truncating a file to 0 bytes updates `prev` without
+/// counting as progress.
+pub(crate) fn file_output_advanced(path: &Path, prev: &mut Option<FileFingerprint>) -> bool {
+    fingerprint_advanced(file_fingerprint(path), prev)
+}
+
+/// Same as `file_output_advanced`, but inspects an already-open `File` handle
+/// directly (so callers using custom log filenames like `protect-generate.log`
+/// are tracked accurately).
+pub(crate) fn file_handle_output_advanced(
+    file: &File,
+    prev: &mut Option<FileFingerprint>,
+) -> bool {
+    fingerprint_advanced(file_handle_fingerprint(file), prev)
+}
+
 /// A queue/transport interruption is not evidence that the acceptance command failed.
 pub fn shell_outcome(run: &Path, role: &str, code: i32, timed: bool) -> Value {
     let status = json(run.join(format!("{role}.remote.json")));
@@ -1475,5 +1532,69 @@ mod git_lock_tests {
 
         let err4 = unrecognized_arg("--wait-manual", &["--repo", "--json"], "delegate work add <title>");
         assert!(err4.starts_with("unrecognized argument '--wait-manual'\nusage: delegate work add <title>"), "{err4}");
+    }
+
+    #[test]
+    fn file_handle_and_run_shell_track_custom_log_filename_progress() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!(
+            "delegate-custom-log-fp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        // Direct handle test with a non-{role}.log filename.
+        let custom_log_path = dir.join("protect-generate.log");
+        let mut handle = File::create(&custom_log_path).unwrap();
+        let mut prev = file_handle_fingerprint(&handle);
+        assert!(prev.is_some());
+        assert!(!file_handle_output_advanced(&handle, &mut prev));
+        writeln!(handle, "building target").unwrap();
+        handle.flush().unwrap();
+        assert!(file_handle_output_advanced(&handle, &mut prev));
+        assert!(!file_handle_output_advanced(&handle, &mut prev));
+
+        // End-to-end run_shell test: role="generate" with custom log file
+        // `protect-generate.log` (while `generate.log` does not exist) must not
+        // emit stall_warning while stdout keeps growing past stall.generate.
+        write_json(
+            dir.join("meta.json"),
+            &serde_json::json!({
+                "run": "test-custom-log",
+                "name": "custom-log",
+                "workdir": dir.to_string_lossy(),
+                "stall": {"generate": ".2s"}
+            }),
+        )
+        .unwrap();
+        let mut shell_log = File::create(&custom_log_path).unwrap();
+        let (code, timed) = run_shell_with(
+            (
+                "i=0; while [ $i -lt 9 ]; do echo step $i; sleep 0.05; i=$((i+1)); done",
+                "generate",
+            ),
+            &dir,
+            &dir,
+            &serde_json::json!({}),
+            None,
+            &mut shell_log,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!((code, timed), (0, false));
+        assert!(!dir.join("generate.log").exists());
+        assert!(!dir.join("stall-warning.json").exists());
+        let events = fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default();
+        assert!(
+            !events.contains("stall_warning"),
+            "unexpected stall_warning while custom log file was growing: {events}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
