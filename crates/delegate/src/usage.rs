@@ -1456,7 +1456,116 @@ fn repo_matches_filter(repo_path: &str, repo_name: &str, filter: &str) -> bool {
     false
 }
 
-/// CLI entrypoint: `delegate usage [--since 24h|7d|all] [--by account|day|run|repo] [--account ID] [--repo PATH] [--all] [--json]`
+struct CmdOutRunInfo {
+    group: String,
+    triggers: u64,
+    truncated_bytes: u64,
+    author_steps: u64,
+    compile_test_steps: u64,
+    author_input_tokens: i64,
+    has_accept: bool,
+    accept_first_pass: bool,
+}
+
+fn inspect_cmd_out_run(rdir: &Path) -> Option<(String, CmdOutRunInfo)> {
+    let meta = json(rdir.join("meta.json"));
+    let sum = json(rdir.join("summary.json"));
+    let group = {
+        let g = s(&meta, "cmdOutGroup");
+        if !g.is_empty() {
+            g.to_string()
+        } else {
+            s(&sum["cmdOut"], "group").to_string()
+        }
+    };
+    if group.is_empty() {
+        return None;
+    }
+    let run_id = {
+        let r = s(&meta, "run");
+        if !r.is_empty() {
+            r.to_string()
+        } else if rdir.file_name().and_then(|n| n.to_str()) == Some("record") {
+            rdir.parent()
+                .and_then(|p| p.file_name())
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            rdir.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    let (triggers, truncated_bytes) = if sum["cmdOut"].is_object() {
+        (
+            sum["cmdOut"]["triggers"].as_u64().unwrap_or(0),
+            sum["cmdOut"]["truncatedBytes"].as_u64().unwrap_or(0),
+        )
+    } else {
+        let st = crate::cmd_out::count_stats(rdir);
+        (st.triggers, st.truncated_bytes)
+    };
+    let (author_steps, compile_test_steps) =
+        if sum["cmdOut"]["authorSteps"].as_u64().is_some() {
+            (
+                sum["cmdOut"]["authorSteps"].as_u64().unwrap_or(0),
+                sum["cmdOut"]["compileTestSteps"].as_u64().unwrap_or(0),
+            )
+        } else {
+            let configured = crate::cmd_out::parse_commands(&meta["cmdOut"]["commands"]);
+            crate::cmd_out::count_author_steps(rdir, &configured)
+        };
+    let author_input_tokens = runs::effective_tokens_delta(&sum)
+        .map(|tok| n(&tok, "input").saturating_add(n(&tok, "cacheRead")))
+        .unwrap_or(0);
+    let is_first_round = s(&meta, "parent").is_empty() && meta["rework"].is_null();
+    let has_accept =
+        is_first_round && sum["accept"].is_object() && !b(&sum["accept"], "notExecuted");
+    let accept_first_pass = has_accept
+        && b(&sum["accept"], "ok")
+        && sum["review"]["reworkRounds"].as_u64().unwrap_or(0) == 0;
+    Some((
+        run_id,
+        CmdOutRunInfo {
+            group,
+            triggers,
+            truncated_bytes,
+            author_steps,
+            compile_test_steps,
+            author_input_tokens,
+            has_accept,
+            accept_first_pass,
+        },
+    ))
+}
+
+fn collect_cmd_out_run_info(state: &Path) -> HashMap<String, CmdOutRunInfo> {
+    let mut map = HashMap::new();
+    let repos = crate::index::discover_snapshot_repos(state, &[], None);
+    for (_, runs_dir) in repos {
+        for rdir in runs::all_runs_in(&runs_dir) {
+            if let Some((id, info)) = inspect_cmd_out_run(&rdir) {
+                map.entry(id).or_insert(info);
+            }
+        }
+    }
+    let arch_root = cache_dir().join("archive");
+    if let Ok(rd) = fs::read_dir(&arch_root) {
+        for ent in rd.flatten() {
+            let rec = ent.path().join("record");
+            if rec.is_dir() {
+                if let Some((id, info)) = inspect_cmd_out_run(&rec) {
+                    map.entry(id).or_insert(info);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// CLI entrypoint: `delegate usage [--since 24h|7d|all] [--by account|day|run|repo|cmd-out] [--account ID] [--repo PATH] [--all] [--json]`
 pub fn command(args: &[String]) -> Res<i32> {
     let (pos, flags, kv) = parse_simple(
         "usage",
@@ -1475,9 +1584,9 @@ pub fn command(args: &[String]) -> Res<i32> {
     let include_non_agy = has(&flags, "--all");
     let since_str = value(&kv, "--since").unwrap_or("24h");
     let by = value(&kv, "--by").unwrap_or("account");
-    if !matches!(by, "account" | "day" | "run" | "repo") {
+    if !matches!(by, "account" | "day" | "run" | "repo" | "cmd-out") {
         return Err(format!(
-            "--by must be one of account|day|run|repo, got {by:?}"
+            "--by must be one of account|day|run|repo|cmd-out, got {by:?}"
         ));
     }
     let account_filter = value(&kv, "--account");
@@ -1527,10 +1636,21 @@ pub fn command(args: &[String]) -> Res<i32> {
         }
     }
 
+    let cmd_out_info = if by == "cmd-out" {
+        collect_cmd_out_run_info(&state_dir())
+    } else {
+        HashMap::new()
+    };
+
     let mut grand = BucketStats::default();
     let mut buckets: BTreeMap<String, BucketStats> = BTreeMap::new();
+    let mut author_input_by_run: HashMap<String, i64> = HashMap::new();
     for e in &entries {
         grand.add_entry(e);
+        if e.role != "reviewer" {
+            *author_input_by_run.entry(e.run.clone()).or_insert(0) +=
+                e.tokens.input.saturating_add(e.tokens.cache_read);
+        }
         let key = match by {
             "account" => e
                 .account
@@ -1539,14 +1659,47 @@ pub fn command(args: &[String]) -> Res<i32> {
             "day" => format_epoch(e.epoch, true, "%Y-%m-%d"),
             "run" => e.run.clone(),
             "repo" => e.repo_name.clone(),
+            "cmd-out" => cmd_out_info
+                .get(&e.run)
+                .map(|i| i.group.clone())
+                .unwrap_or_else(|| "(none)".to_string()),
             _ => unreachable!(),
         };
         buckets.entry(key).or_default().add_entry(e);
     }
 
+    let mut cmd_out_ab: BTreeMap<String, crate::cmd_out::CmdOutGroupMetrics> = BTreeMap::new();
+    if by == "cmd-out" {
+        let mut seen_runs: HashSet<String> = HashSet::new();
+        for e in &entries {
+            if !seen_runs.insert(e.run.clone()) {
+                continue;
+            }
+            if let Some(info) = cmd_out_info.get(&e.run) {
+                let m = cmd_out_ab.entry(info.group.clone()).or_default();
+                m.runs += 1;
+                m.triggers = m.triggers.saturating_add(info.triggers);
+                m.truncated_bytes = m.truncated_bytes.saturating_add(info.truncated_bytes);
+                m.author_steps = m.author_steps.saturating_add(info.author_steps);
+                m.compile_test_steps = m.compile_test_steps.saturating_add(info.compile_test_steps);
+                let run_in = author_input_by_run
+                    .get(&e.run)
+                    .copied()
+                    .unwrap_or(info.author_input_tokens);
+                m.author_input_tokens = m.author_input_tokens.saturating_add(run_in);
+                if info.has_accept {
+                    m.accept_total += 1;
+                    if info.accept_first_pass {
+                        m.accept_first_pass += 1;
+                    }
+                }
+            }
+        }
+    }
+
     let mut rows: Vec<(String, BucketStats)> = buckets.into_iter().collect();
     match by {
-        "day" => rows.sort_by(|a, b| a.0.cmp(&b.0)),
+        "day" | "cmd-out" => rows.sort_by(|a, b| a.0.cmp(&b.0)),
         "run" => rows.sort_by(|a, b| {
             b.1.latest_epoch
                 .cmp(&a.1.latest_epoch)
@@ -1579,6 +1732,10 @@ pub fn command(args: &[String]) -> Res<i32> {
                 } else if by == "repo" {
                     if let Some(ref p) = st.repo {
                         obj["repoPath"] = json!(p);
+                    }
+                } else if by == "cmd-out" {
+                    if let Some(m) = cmd_out_ab.get(k) {
+                        obj["cmdOut"] = m.to_json();
                     }
                 }
                 obj
@@ -1615,20 +1772,25 @@ pub fn command(args: &[String]) -> Res<i32> {
                 })
             })
             .collect();
-        println!(
-            "{}",
-            json!({
-                "since": since_str,
-                "sinceIso": since_iso,
-                "by": by,
-                "provider": if include_non_agy { "all" } else { "agy" },
-                "generatedAt": iso(),
-                "totals": grand.to_json(),
-                "groups": groups_json,
-                "liveRunning": live_json,
-                "uncountedRunning": uncounted_json,
-            })
-        );
+        let mut out_doc = json!({
+            "since": since_str,
+            "sinceIso": since_iso,
+            "by": by,
+            "provider": if include_non_agy { "all" } else { "agy" },
+            "generatedAt": iso(),
+            "totals": grand.to_json(),
+            "groups": groups_json,
+            "liveRunning": live_json,
+            "uncountedRunning": uncounted_json,
+        });
+        if by == "cmd-out" {
+            let ab_map: Map<String, Value> = cmd_out_ab
+                .iter()
+                .map(|(k, v)| (k.clone(), v.to_json()))
+                .collect();
+            out_doc["cmdOutAb"] = Value::Object(ab_map);
+        }
+        println!("{}", out_doc);
         return Ok(0);
     }
 
@@ -1644,6 +1806,7 @@ pub fn command(args: &[String]) -> Res<i32> {
             "day" => "日期",
             "run" => "Run",
             "repo" => "仓库",
+            "cmd-out" => "cmdOut分组",
             _ => "分组",
         };
         let key_w = rows
@@ -1684,6 +1847,9 @@ pub fn command(args: &[String]) -> Res<i32> {
         if grand.live_counted > 0 {
             println!("  * 含 {} 个运行中实时计入（来自 agy 输出累计用量）", grand.live_counted);
         }
+    }
+    if by == "cmd-out" && !cmd_out_ab.is_empty() {
+        print!("{}", crate::cmd_out::format_ab_summary_human(&cmd_out_ab));
     }
 
     if !uncounted_running.is_empty() {

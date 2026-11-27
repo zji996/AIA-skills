@@ -10,6 +10,7 @@ mod brief_check;
 mod card;
 mod changes;
 mod cleanup;
+mod cmd_out;
 mod common;
 mod config;
 mod dag_queue;
@@ -286,6 +287,8 @@ fn format_status(status: serde_json::Value) -> String {
         "area",
         "areaGroup",
         "areaExperiment",
+        "cmdOutGroup",
+        "cmdOut",
         "parent",
         "redispatch",
         "worktree",
@@ -3157,6 +3160,11 @@ fn main_inner(args: &[String]) -> Res<i32> {
         let run = rest.first().ok_or("missing measurement run")?;
         let real = rest.get(1).ok_or("missing measured executable")?;
         return measure::execute_argv(Path::new(run), real, &rest[2..]);
+    }
+    if command == "_cmd-out" {
+        let run = rest.first().ok_or("missing cmd-out run")?;
+        let real = rest.get(1).ok_or("missing cmd-out executable")?;
+        return cmd_out::execute_argv(Path::new(run), real, &rest[2..]);
     }
     if command == "_process-match" {
         return process_match::command(rest);

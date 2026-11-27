@@ -1270,20 +1270,42 @@ pub fn shell_outcome(run: &Path, role: &str, code: i32, timed: bool) -> Value {
 pub fn finish_run(run: &std::path::Path, mut summary: serde_json::Value, code: i32) -> Res<()> {
     crate::runs::record_worktree_bytes(run);
     crate::source_build::record(run);
-    if let Some(sources) = json(run.join("meta.json")).get("configSources") {
+    let meta = json(run.join("meta.json"));
+    if let Some(sources) = meta.get("configSources") {
         summary["configSources"] = sources.clone();
     }
-    if json(run.join("meta.json"))["agentDeny"]
+    if meta["agentDeny"]
         .as_array()
         .is_some_and(|rules| !rules.is_empty())
     {
         summary["denied"] = serde_json::json!(crate::deny::count(run));
     }
+    if meta["cmdOut"].is_object() || !s(&meta, "cmdOutGroup").is_empty() {
+        let group = {
+            let g = s(&meta, "cmdOutGroup");
+            if !g.is_empty() {
+                g
+            } else {
+                s(&meta["cmdOut"], "group")
+            }
+        };
+        let stats = crate::cmd_out::count_stats(run);
+        let configured = crate::cmd_out::parse_commands(&meta["cmdOut"]["commands"]);
+        let (author_steps, compile_test_steps) =
+            crate::cmd_out::count_author_steps(run, &configured);
+        summary["cmdOut"] = serde_json::json!({
+            "group": group,
+            "enabled": b(&meta["cmdOut"], "enabled"),
+            "triggers": stats.triggers,
+            "truncatedBytes": stats.truncated_bytes,
+            "authorSteps": author_steps,
+            "compileTestSteps": compile_test_steps,
+        });
+    }
     summary["finishedAt"] = serde_json::json!(iso());
     write_json(run.join("summary.json"), &summary)?;
     crate::refs::mark_finished(run);
     write(run.join("exit_code"), format!("{code}\n"))?;
-    let meta = json(run.join("meta.json"));
     let spawn_premerge = crate::premerge::mark_pending_before_finish(run, &meta, &summary);
     crate::history::record_finish(run);
     crate::board::refresh_for_run(run);

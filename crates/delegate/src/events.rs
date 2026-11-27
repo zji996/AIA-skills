@@ -183,6 +183,34 @@ pub fn emit_in(state: &Path, run: &str, repo: &str, kind: &str, payload: Value) 
     Ok(next_seq)
 }
 
+fn build_cmd_out_event_payload(meta: &Value, summary: &Value) -> Option<Value> {
+    let co = &summary["cmdOut"];
+    if !co.is_object() {
+        return None;
+    }
+    let author_input_tokens = crate::runs::effective_tokens_delta(summary)
+        .map(|tok| n(&tok, "input").saturating_add(n(&tok, "cacheRead")))
+        .unwrap_or(0);
+    let is_first_round = s(meta, "parent").is_empty() && meta["rework"].is_null();
+    let has_accept = is_first_round
+        && summary["accept"].is_object()
+        && !b(&summary["accept"], "notExecuted");
+    let accept_first_pass = has_accept
+        && b(&summary["accept"], "ok")
+        && summary["review"]["reworkRounds"].as_u64().unwrap_or(0) == 0;
+    Some(json!({
+        "group": co["group"],
+        "enabled": co["enabled"],
+        "triggers": co["triggers"],
+        "truncatedBytes": co["truncatedBytes"],
+        "authorSteps": co["authorSteps"],
+        "compileTestSteps": co["compileTestSteps"],
+        "authorInputTokens": author_input_tokens,
+        "hasAccept": has_accept,
+        "acceptFirstPass": accept_first_pass,
+    }))
+}
+
 /// Emit the terminal run event for `finish_run` (`delivered` / `question` / `rejected` / `stopped` / `failed`).
 pub fn emit_run_finished(run: &Path, meta: &Value, summary: &Value) {
     let run_id = run_id_for(run, meta);
@@ -253,6 +281,9 @@ pub fn emit_run_finished(run: &Path, meta: &Value, summary: &Value) {
     }
     if summary["card"].is_object() {
         payload["card"] = summary["card"].clone();
+    }
+    if let Some(co) = build_cmd_out_event_payload(meta, summary) {
+        payload["cmdOut"] = co;
     }
     if let Some(pm) = crate::premerge::status_for_run(run, meta, summary, None) {
         payload["premerge"] = pm;
@@ -939,6 +970,9 @@ pub fn rebuild_in(state: &Path, extra_runs_dirs: &[PathBuf]) -> Res<Value> {
             }
             if question {
                 payload["question"] = json!(true);
+            }
+            if let Some(co) = build_cmd_out_event_payload(&meta, &sum) {
+                payload["cmdOut"] = co;
             }
             raw.push((
                 fin_ts,

@@ -1198,6 +1198,7 @@ pub fn command(args: &[String]) -> Res<i32> {
     let reports = analyze_in(&state, now_ts, since_str, repo_filter, true)?;
     let bt = backtest_in(&state, now_ts, "14d", repo_filter).ok();
     let cal = analyze_calibration_in(&state, now_ts, since_str, repo_filter).ok();
+    let cmd_out_ab = analyze_cmd_out_ab_in(&state, now_ts, since_str, repo_filter).unwrap_or_default();
 
     if json_out {
         let repos_json: Vec<Value> = reports.iter().map(|r| r.to_full_json()).collect();
@@ -1212,9 +1213,19 @@ pub fn command(args: &[String]) -> Res<i32> {
         if let Some(cal_rep) = cal {
             doc["etaCalibration"] = cal_rep.to_json();
         }
+        if !cmd_out_ab.is_empty() {
+            let ab_map: serde_json::Map<String, Value> = cmd_out_ab
+                .iter()
+                .map(|(k, v)| (k.clone(), v.to_json()))
+                .collect();
+            doc["cmdOutAb"] = Value::Object(ab_map);
+        }
         println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
     } else {
         print!("{}", format_human(&reports, since_str));
+        if !cmd_out_ab.is_empty() {
+            print!("{}", crate::cmd_out::format_ab_summary_human(&cmd_out_ab));
+        }
         if let Some(cal_rep) = cal.filter(|c| c.total_records > 0) {
             print!("{}", format_calibration_inline_summary(&cal_rep));
         }
@@ -1223,6 +1234,76 @@ pub fn command(args: &[String]) -> Res<i32> {
         }
     }
     Ok(0)
+}
+
+pub fn analyze_cmd_out_ab_in(
+    state: &Path,
+    now_ts: i64,
+    since_str: &str,
+    repo_filter: Option<&str>,
+) -> Res<BTreeMap<String, crate::cmd_out::CmdOutGroupMetrics>> {
+    let cutoff = if since_str.eq_ignore_ascii_case("all") {
+        None
+    } else {
+        let secs = seconds(since_str)? as i64;
+        Some(now_ts - secs)
+    };
+    let raw = events::read_since_in(state, 0);
+    let mut by_run: HashMap<String, Value> = HashMap::new();
+    for ev in raw {
+        let co = &ev["payload"]["cmdOut"];
+        if !co.is_object() {
+            continue;
+        }
+        let ts = iso_epoch(s(&ev, "at")).unwrap_or(0);
+        if let Some(cut) = cutoff {
+            if ts < cut {
+                continue;
+            }
+        }
+        let repo = s(&ev, "repo");
+        let name = short_repo_name(repo);
+        if let Some(rf) = repo_filter {
+            if !repo_matches_filter(repo, &name, rf) {
+                continue;
+            }
+        }
+        let run_id = s(&ev, "run");
+        if !run_id.is_empty() {
+            by_run.insert(run_id.to_string(), co.clone());
+        }
+    }
+    let mut groups: BTreeMap<String, crate::cmd_out::CmdOutGroupMetrics> = BTreeMap::new();
+    for co in by_run.values() {
+        let group = s(co, "group");
+        if group.is_empty() {
+            continue;
+        }
+        let m = groups.entry(group.to_string()).or_default();
+        m.runs += 1;
+        m.triggers = m
+            .triggers
+            .saturating_add(co["triggers"].as_u64().unwrap_or(0));
+        m.truncated_bytes = m
+            .truncated_bytes
+            .saturating_add(co["truncatedBytes"].as_u64().unwrap_or(0));
+        m.author_steps = m
+            .author_steps
+            .saturating_add(co["authorSteps"].as_u64().unwrap_or(0));
+        m.compile_test_steps = m
+            .compile_test_steps
+            .saturating_add(co["compileTestSteps"].as_u64().unwrap_or(0));
+        m.author_input_tokens = m
+            .author_input_tokens
+            .saturating_add(n(co, "authorInputTokens"));
+        if b(co, "hasAccept") {
+            m.accept_total += 1;
+            if b(co, "acceptFirstPass") {
+                m.accept_first_pass += 1;
+            }
+        }
+    }
+    Ok(groups)
 }
 
 // ---------------------------------------------------------------------------

@@ -1062,6 +1062,35 @@ fn assign_area_ab_locked(state: &Path, repo_key: &str, candidate: &Value) -> Val
     })
 }
 
+/// Atomically advance per-repo cmdOut A/B dispatch counter inside `state/.state.lock` and assign
+/// deterministic A/B group by parity: odd `seq` -> `"B"` (treatment, enable cmdOut wrapping),
+/// even `seq` -> `"A"` (control, no wrapping).
+fn assign_cmd_out_ab_locked(state: &Path, repo_key: &str, candidate: &Value) -> Value {
+    let counter_path = state.join("cmd-out-ab.json");
+    let mut doc = json(&counter_path);
+    if !doc.is_object() {
+        doc = json!({});
+    }
+    let repo_bucket = if repo_key.is_empty() {
+        "_default"
+    } else {
+        repo_key
+    };
+    let prev = doc[repo_bucket].as_u64().unwrap_or(0);
+    let seq = prev.saturating_add(1);
+    doc[repo_bucket] = json!(seq);
+    let _ = write_json(&counter_path, &doc);
+    let group = if seq % 2 == 1 { "B" } else { "A" };
+    let enabled = group == "B";
+    json!({
+        "group": group,
+        "seq": seq,
+        "enabled": enabled,
+        "commands": candidate["commands"].clone(),
+        "maxBytes": candidate["maxBytes"].clone(),
+    })
+}
+
 pub(crate) fn protected_paths_in_prompt(
     prompt: &str,
     repo: Option<&Path>,
@@ -1922,6 +1951,11 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
             extra["areaCandidate"] = cand;
         }
     }
+    if !o.read_only {
+        if let Some(cand) = crate::cmd_out::resolve_config(&config.value) {
+            extra["cmdOutCandidate"] = cand;
+        }
+    }
     if !prompt_protected.is_empty() {
         extra["promptProtectedPaths"] = json!(prompt_protected);
     }
@@ -2459,6 +2493,9 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         extra["promptProtectedPaths"] = json!(prompt_protected);
     }
     extra["agentDeny"] = meta["agentDeny"].clone();
+    if !o.read_only && meta["cmdOut"].is_object() && crate::cmd_out::resolve_config(&config.value).is_some() {
+        extra["cmdOutInherited"] = meta["cmdOut"].clone();
+    }
     extra["defaults"] = meta["defaults"].clone();
     if let Some(defaults) = extra["defaults"].as_object_mut() {
         if timeout_overridden {
@@ -2990,7 +3027,7 @@ pub fn launch(
     let scout_first = b(&extra, "scoutFirst");
     // Critical section: ONLY capacity/admission checks + run directory & slot registration
     // under the single short-lived `<state>/.state.lock` (<5ms, zero git/subprocess/sleep).
-    let (run, slot_file, deferred, reason, queued_ns, model_cap, started_at, started_epoch, started_ns, queued_at, q_ahead, area_experiment) = {
+    let (run, slot_file, deferred, reason, queued_ns, model_cap, started_at, started_epoch, started_ns, queued_at, q_ahead, area_experiment, cmd_out_experiment) = {
         let _state_lock = crate::locks::acquire_state(&slots).map_err(|e| e.to_string())?;
 
         let active_runs = active_machine(&slots);
@@ -3073,6 +3110,13 @@ pub fn launch(
         } else {
             None
         };
+        let cmd_out_experiment = if extra["cmdOutInherited"].is_object() {
+            Some(extra["cmdOutInherited"].clone())
+        } else if extra["cmdOutCandidate"].is_object() {
+            Some(assign_cmd_out_ab_locked(&slots, &repo, &extra["cmdOutCandidate"]))
+        } else {
+            None
+        };
         let mut provisional = json!({
             "run": run.file_name().unwrap_or_default().to_string_lossy(),
             "dir": run,
@@ -3096,6 +3140,9 @@ pub fn launch(
         if let Some(exp) = &area_experiment {
             provisional["area"] = exp["area"].clone();
             provisional["areaGroup"] = exp["group"].clone();
+        }
+        if let Some(exp) = &cmd_out_experiment {
+            provisional["cmdOutGroup"] = exp["group"].clone();
         }
         let (queued_at, q_ahead, queued_ns) = if scout_first {
             touch(run.join(".scouting"));
@@ -3136,6 +3183,7 @@ pub fn launch(
             queued_at,
             q_ahead,
             area_experiment,
+            cmd_out_experiment,
         )
     };
 
@@ -3667,6 +3715,10 @@ pub fn launch(
             "matchedPaths": exp["matchedPaths"],
         });
     }
+    if let Some(exp) = &cmd_out_experiment {
+        meta["cmdOutGroup"] = exp["group"].clone();
+        meta["cmdOut"] = exp.clone();
+    }
     let effective_prompt_split = effective_prompt.trim_end_matches('\n').len();
     if scout_first {
         meta["phase"] = json!("scouting");
@@ -3959,6 +4011,26 @@ mod purpose_tests {
         assert_eq!((s(&e3, "group"), b(&e3, "injected"), e3["seq"].as_u64()), ("B", true, Some(3)));
         assert_eq!((s(&t1, "group"), b(&t1, "injected"), t1["seq"].as_u64()), ("B", true, Some(1)));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cmd_out_ab_alternates_per_repo() {
+        let dir = std::env::temp_dir().join(format!(
+            "delegate-cmd-out-ab-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let cand = crate::cmd_out::resolve_config(&json!({})).unwrap();
+        let a1 = assign_cmd_out_ab_locked(&dir, "/repo/a", &cand);
+        let a2 = assign_cmd_out_ab_locked(&dir, "/repo/a", &cand);
+        let a3 = assign_cmd_out_ab_locked(&dir, "/repo/a", &cand);
+        let b1 = assign_cmd_out_ab_locked(&dir, "/repo/b", &cand);
+        assert_eq!((s(&a1, "group"), b(&a1, "enabled"), a1["seq"].as_u64()), ("B", true, Some(1)));
+        assert_eq!((s(&a2, "group"), b(&a2, "enabled"), a2["seq"].as_u64()), ("A", false, Some(2)));
+        assert_eq!((s(&a3, "group"), b(&a3, "enabled"), a3["seq"].as_u64()), ("B", true, Some(3)));
+        assert_eq!((s(&b1, "group"), b(&b1, "enabled"), b1["seq"].as_u64()), ("B", true, Some(1)));
         let _ = fs::remove_dir_all(&dir);
     }
 }

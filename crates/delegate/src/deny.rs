@@ -82,10 +82,10 @@ fn resolve(program: &str, path: &std::ffi::OsStr, cwd: &Path) -> Option<PathBuf>
 
 pub fn prepare(meta: &Value, run: &Path) -> Res<()> {
     let rules = validate(meta.get("agentDeny"))?;
-    let mut programs = BTreeMap::<&str, Vec<&Value>>::new();
+    let mut programs = BTreeMap::<String, Vec<&Value>>::new();
     for rule in rules.as_array().unwrap() {
         programs
-            .entry(rule["argv"][0].as_str().unwrap())
+            .entry(rule["argv"][0].as_str().unwrap().to_string())
             .or_default()
             .push(rule);
     }
@@ -107,15 +107,30 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<()> {
             }
         }
     }
+    let mut cmd_outs = BTreeMap::<String, Vec<Vec<String>>>::new();
+    if b(&meta["cmdOut"], "enabled") && s(meta, "mode") != "read-only" {
+        for argv in crate::cmd_out::parse_commands(&meta["cmdOut"]["commands"]) {
+            if let Some(program) = argv.first() {
+                cmd_outs.entry(program.clone()).or_default().push(argv);
+            }
+        }
+    }
     let remote_programs = crate::remote::programs(&meta["remote"]);
     for program in &remote_programs {
-        programs.entry(program).or_default();
+        programs.entry((*program).to_string()).or_default();
     }
     for program in resources.keys() {
-        programs.entry(program).or_default();
+        programs.entry((*program).to_string()).or_default();
     }
     for program in measures.keys() {
-        programs.entry(program).or_default();
+        programs.entry((*program).to_string()).or_default();
+    }
+    let path = original_path(meta);
+    let workdir = Path::new(s(meta, "workdir"));
+    for program in cmd_outs.keys() {
+        if programs.contains_key(program) || resolve(program, &path, workdir).is_some() {
+            programs.entry(program.clone()).or_default();
+        }
     }
     let dir = run.join("agent-shims");
     fs::create_dir(&dir).map_err(|e| e.to_string())?;
@@ -125,9 +140,9 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<()> {
     fs::create_dir(&measure_dir).map_err(|e| e.to_string())?;
     let remote_dir = run.join("remote-shims");
     fs::create_dir_all(&remote_dir).map_err(|e| e.to_string())?;
-    let path = original_path(meta);
     crate::process_match::prepare(run, &path)?;
     for (program, rules) in programs {
+        let program = program.as_str();
         let mut body = "#!/bin/sh\n".to_string();
         for rule in &rules {
             let args = rule["argv"].as_array().unwrap();
@@ -151,7 +166,7 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<()> {
         let real = if ["pkill", "killall", "pgrep"].contains(&program) {
             Some(dir.join(format!(".process-{program}")))
         } else {
-            resolve(program, &path, Path::new(s(meta, "workdir")))
+            resolve(program, &path, workdir)
         };
         let remote_invoke = remote_programs.contains(&program).then(|| {
             format!(
@@ -167,6 +182,34 @@ pub fn prepare(meta: &Value, run: &Path) -> Res<()> {
             write(&shim, format!("#!/bin/sh\n{invoke}"))?;
             fs::set_permissions(shim, fs::Permissions::from_mode(0o700))
                 .map_err(|e| e.to_string())?;
+        }
+        if remote_invoke.is_none() {
+            if let (Some(cmd_list), Some(real)) = (cmd_outs.get(program), &real) {
+                let target = if resources.contains_key(program) {
+                    resource_dir.join(program)
+                } else {
+                    real.clone()
+                };
+                for argv in cmd_list {
+                    let mut condition = format!(
+                        "[ -z \"${{{}:-}}\" ] && [ \"$#\" -ge {} ]",
+                        crate::cmd_out::ACTIVE_ENV,
+                        argv.len() - 1
+                    );
+                    for (i, arg) in argv.iter().enumerate().skip(1) {
+                        condition.push_str(&format!(
+                            " && [ \"${{{i}}}\" = {} ]",
+                            shell_quote(arg)
+                        ));
+                    }
+                    body.push_str(&format!(
+                        "if {condition}; then\n  exec {} _cmd-out {} {} \"$@\"\nfi\n",
+                        shell_quote(&script().to_string_lossy()),
+                        shell_quote(&run.to_string_lossy()),
+                        shell_quote(&target.to_string_lossy()),
+                    ));
+                }
+            }
         }
         let mut resource_body = "#!/bin/sh\n".to_string();
         for (name, argv) in resources.get(program).into_iter().flatten() {
@@ -391,4 +434,81 @@ pub fn count(run: &Path) -> usize {
         .lines()
         .filter(|line| *line == "1")
         .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepare_wraps_cmd_out_only_when_enabled_in_write_mode() {
+        let base = std::env::temp_dir().join(format!(
+            "delegate-deny-cmd-out-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let bin_dir = base.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let fake_cargo = bin_dir.join("cargo");
+        write(&fake_cargo, "#!/bin/sh\necho ok\n").unwrap();
+        fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let run_on = base.join("run-on");
+        fs::create_dir_all(&run_on).unwrap();
+        let meta_on = json!({
+            "mode": "write",
+            "workdir": base.to_string_lossy(),
+            "env": {"PATH": bin_dir.to_string_lossy()},
+            "cmdOutGroup": "B",
+            "cmdOut": {
+                "group": "B",
+                "enabled": true,
+                "commands": [["cargo"], ["go", "test"]],
+                "maxBytes": 12288,
+            },
+        });
+        prepare(&meta_on, &run_on).unwrap();
+        let cargo_shim = read(run_on.join("agent-shims").join("cargo"));
+        assert!(cargo_shim.contains("_cmd-out"));
+        assert!(cargo_shim.contains(crate::cmd_out::ACTIVE_ENV));
+        // `go` is not in fake PATH, so no broken shim should be created for it.
+        assert!(!run_on.join("agent-shims").join("go").exists());
+
+        // Group A (enabled: false) -> no cmdOut shim created
+        let run_off = base.join("run-off");
+        fs::create_dir_all(&run_off).unwrap();
+        let meta_off = json!({
+            "mode": "write",
+            "workdir": base.to_string_lossy(),
+            "env": {"PATH": bin_dir.to_string_lossy()},
+            "cmdOutGroup": "A",
+            "cmdOut": {
+                "group": "A",
+                "enabled": false,
+                "commands": [["cargo"]],
+                "maxBytes": 12288,
+            },
+        });
+        prepare(&meta_off, &run_off).unwrap();
+        assert!(!run_off.join("agent-shims").join("cargo").exists());
+
+        // Read-only mode -> never wrapped even if cmdOut.enabled is true
+        let run_ro = base.join("run-ro");
+        fs::create_dir_all(&run_ro).unwrap();
+        let meta_ro = json!({
+            "mode": "read-only",
+            "workdir": base.to_string_lossy(),
+            "env": {"PATH": bin_dir.to_string_lossy()},
+            "cmdOut": {
+                "group": "B",
+                "enabled": true,
+                "commands": [["cargo"]],
+                "maxBytes": 12288,
+            },
+        });
+        prepare(&meta_ro, &run_ro).unwrap();
+        assert!(!run_ro.join("agent-shims").join("cargo").exists());
+
+        let _ = fs::remove_dir_all(&base);
+    }
 }

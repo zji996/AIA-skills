@@ -438,6 +438,7 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
                 return Err("scoutFirst must be a boolean".into());
             }
         }
+        crate::cmd_out::validate_config(value.get("cmdOut"))?;
         crate::review::validate_review_config(value.get("review"))?;
         crate::review::validate_controller_review_paths(value.get("controllerReviewPaths"))?;
         crate::accept::validate_accept_rules(value.get("acceptRules"))?;
@@ -806,6 +807,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
         "disk",
         "briefCheck",
         "scoutFirst",
+        "cmdOut",
     ] {
         if value.get(key).is_none() {
             if let Some(v) = user.as_ref().and_then(|u| u.get(key)) {

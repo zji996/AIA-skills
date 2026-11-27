@@ -907,6 +907,8 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
         "area",
         "areaGroup",
         "areaExperiment",
+        "cmdOutGroup",
+        "cmdOut",
     ] {
         if let Some(value) = meta.get(key).filter(|v| !v.is_null()) {
             out[key] = value.clone();

@@ -521,9 +521,9 @@ fn command_spec(command: &str) -> Option<CommandSpec> {
             ("account import-agy-swap [--dry-run] [--source DIR] [--overwrite] [--json]", "Import accounts from ~/.gemini/agy-swap/vault.json and accounts.json without printing tokens."),
             ("account restore-entry [--dry-run] [--mode wrapper|symlink] [--entry PATH] [--real-bin PATH]", "Replace the agy-swap ~/.local/bin/agy wrapper with a direct exec wrapper or symlink (backs up old file)."),
         ]),
-        "usage" => ("[--since DURATION|all] [--by account|day|run|repo] [--account ID] [--repo PATH] [--all] [--json]", "Summarize local token usage (default: agy runs over the last 24h) grouped by account slot id, local calendar day, run, or repository. Splits author and reviewer tokens, folds in live-reported agy cumulative usage, and lists running runs without live usage separately as 运行中未计.", &[
+        "usage" => ("[--since DURATION|all] [--by account|day|run|repo|cmd-out] [--account ID] [--repo PATH] [--all] [--json]", "Summarize local token usage (default: agy runs over the last 24h) grouped by account slot id, local calendar day, run, repository, or cmdOut A/B group. Splits author and reviewer tokens, folds in live-reported agy cumulative usage, and lists running runs without live usage separately as 运行中未计.", &[
             ("--since DURATION|all", "Time window to include (default: 24h; e.g. 5h, 24h, 7d, 30d, all)."),
-            ("--by account|day|run|repo", "Grouping key (default: account)."),
+            ("--by account|day|run|repo|cmd-out", "Grouping key (default: account). `cmd-out` also summarizes A/B avg input per step, compile/test steps, and first-pass accept rate."),
             ("--account ID", "Filter to one agy account slot id."),
             ("--repo PATH", "Filter to one repository path or basename."),
             ("--all", "Include non-agy (Pi) runs in addition to agy runs."),
