@@ -133,7 +133,8 @@ cd AIA-skills
 
 - 每个技能的 `metadata.version` 按语义化版本维护：只改文档写法升修订号，新增能力升次版本号，命令、参数或文件格式不兼容时升主版本号。
 - **版本号延迟分配**：开发与委派同事不改 `SKILL.md` / `Cargo.toml` / `Cargo.lock` 的版本号，只把改动条目追加到 [CHANGELOG.md](CHANGELOG.md) 顶部的 `## Unreleased` 段（`- \`<技能>\`：...`），避免并发任务互撞版本号。
-- 主控发版时运行 `./scripts/release-binary.sh bump <技能> <X.Y.Z|patch|minor|major>` 统一更新 `SKILL.md`、关联 crate 的 `Cargo.toml`/`Cargo.lock` 并把 `## Unreleased` 落成版本段；带二进制的技能再依次执行 `build`、提交并推送、`publish`；全仓发版可再打 `git tag vX.Y.Z`。
+- **一步发版（带二进制的技能）**：运行 `./scripts/release-binary.sh release <技能> <X.Y.Z|patch|minor|major>`，依次执行 `bump` → `build` → 提交版本文件 → `git push origin HEAD:main` → `publish` → `./scripts/install.sh` → `./scripts/sync-hosts.sh`；任一步失败立即停止并打印续跑命令，可用 `./scripts/release-binary.sh release <技能> --from <step>` 从中断步骤续跑。
+- **分步发版与失败关闭**：也可手动分步执行 `bump` / `build` / `verify` / `publish`（纯文档技能执行 `bump`、提交并推送即可；全仓发版可再打 `git tag vX.Y.Z`）。`publish` 在打标签与上传前会先 `git fetch origin`，确认 `HEAD` 已推到 `origin/main`（是 `origin/main` 的祖先或等于）且本地同名标签未指向其他提交（指向 `HEAD` 则复用），否则直接报错退出，不打标签、不上传。
 - 拷贝安装的机器更新到某个版本：`git checkout vX.Y.Z && ./scripts/install.sh --copy`。
 
 ### 验证

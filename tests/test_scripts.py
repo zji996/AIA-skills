@@ -291,6 +291,178 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(ok_doc.returncode, 0, ok_doc.stdout + ok_doc.stderr)
         self.assertIn('version: "0.1.1"', (other_skill / "SKILL.md").read_text(encoding="utf-8"))
 
+    def make_origin_bare(self, repo, name):
+        origin = self.work / f"{name}-origin.git"
+        subprocess.run(["git", "init", "--bare", "-q", str(origin)], check=True)
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(origin)], check=True)
+        subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
+        subprocess.run(["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"], check=True)
+        return origin
+
+    def test_release_publish_rejects_unpushed_head_and_tag_conflict_and_reuses_head_tag(self):
+        repo, _, _, _, _ = self.binary_fixture("release-publish-guard")
+        origin = self.make_origin_bare(repo, "release-publish-guard")
+        # Create a second local commit that has NOT been pushed to origin/main.
+        self.git_commit(repo)
+
+        fake = self.work / "fake-gh-publish"
+        fake.mkdir()
+        gh_log = self.work / "gh-publish.log"
+        gh = fake / "gh"
+        gh.write_text(f"#!/bin/sh\necho \"$*\" >> {gh_log}\nexit 1\n")
+        gh.chmod(0o755)
+        fake_home = self.work / "home-publish"
+        fake_home.mkdir()
+        env = {
+            **os.environ,
+            "HOME": str(fake_home),
+            "PATH": f"{fake}:{os.environ['PATH']}",
+            "AIA_SKILLS_REPO_ROOT": str(repo),
+            "FORGEJO_TOKEN": "",
+            "FORGEJO_TOKEN_SSH": "",
+        }
+
+        # 1. HEAD is ahead of origin/main -> publish must refuse without tagging or uploading.
+        res = self.run_script(RELEASE, "publish", "demo", env=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("当前提交还没推到 origin/main，先推送再 publish", res.stderr)
+        local_tags = subprocess.run(["git", "-C", str(repo), "tag", "-l", "demo-v1.2.3"],
+                                    capture_output=True, text=True, check=True)
+        self.assertEqual(local_tags.stdout.strip(), "")
+        remote_tags = subprocess.run(["git", "--git-dir", str(origin), "tag", "-l", "demo-v1.2.3"],
+                                     capture_output=True, text=True, check=True)
+        self.assertEqual(remote_tags.stdout.strip(), "")
+        self.assertFalse(gh_log.exists())
+
+        # 2. Push HEAD to origin/main, then create a conflicting tag pointing to HEAD~1 -> must refuse.
+        subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", "HEAD:main"], check=True)
+        subprocess.run(["git", "-C", str(repo), "tag", "demo-v1.2.3", "HEAD~1"], check=True)
+        conflict = self.run_script(RELEASE, "publish", "demo", env=env)
+        self.assertNotEqual(conflict.returncode, 0)
+        self.assertIn("Tag demo-v1.2.3 does not point to HEAD", conflict.stderr)
+        remote_tags = subprocess.run(["git", "--git-dir", str(origin), "tag", "-l", "demo-v1.2.3"],
+                                     capture_output=True, text=True, check=True)
+        self.assertEqual(remote_tags.stdout.strip(), "")
+        self.assertFalse(gh_log.exists())
+
+        # 3. Point existing local tag to HEAD -> publish reuses it and pushes the tag to origin.
+        subprocess.run(["git", "-C", str(repo), "tag", "-f", "-a", "demo-v1.2.3", "-m", "existing-tag", "HEAD"],
+                       check=True)
+        ok = self.run_script(RELEASE, "publish", "demo", env=env)
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        head_sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+        remote_tag_sha = subprocess.run(["git", "--git-dir", str(origin), "rev-parse", "refs/tags/demo-v1.2.3^{}"],
+                                        capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(remote_tag_sha, head_sha)
+        tag_msg = subprocess.run(["git", "-C", str(repo), "tag", "-l", "-n1", "demo-v1.2.3"],
+                                 capture_output=True, text=True, check=True).stdout
+        self.assertIn("existing-tag", tag_msg)
+
+    def test_release_one_step_stops_on_push_failure_and_resumes_with_from(self):
+        repo, skill, crate, _, _ = self.binary_fixture("release-one-step")
+        (crate / "Cargo.lock").write_text('version = 4\n\n[[package]]\nname = "demo"\nversion = "1.2.3"\n')
+        (repo / "CHANGELOG.md").write_text(
+            "# Changelog\n\n## Unreleased\n\n- `demo`：一步发版测试。\n",
+            encoding="utf-8",
+        )
+        (repo / ".gitignore").write_text("target/\ndist/\n")
+        (repo / "other.txt").write_text("base\n")
+        scripts_dir = repo / "scripts"
+        scripts_dir.mkdir()
+        trace = self.work / "release-trace.log"
+        for script_name in ("install.sh", "sync-hosts.sh"):
+            p = scripts_dir / script_name
+            p.write_text(f"#!/bin/sh\necho {script_name} >> {trace}\n")
+            p.chmod(0o755)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", ".gitignore", "crates/demo/Cargo.lock", "CHANGELOG.md", "other.txt", "scripts"],
+                       check=True)
+        self.git_commit(repo)
+        origin = self.make_origin_bare(repo, "release-one-step")
+
+        # Add unrelated dirty changes (both modified tracked and untracked) that commit step must NOT include.
+        (repo / "other.txt").write_text("unrelated-edit\n")
+        (repo / "notes.txt").write_text("untracked\n")
+
+        # Fake rustup, cargo, and gh.
+        fake = self.work / "fake-release-bin"
+        fake.mkdir()
+        (fake / "rustup").write_text("#!/bin/sh\nexit 0\n")
+        (fake / "rustup").chmod(0o755)
+        (fake / "cargo").write_text(
+            "#!/bin/sh\n"
+            "target=''\n"
+            "while [ $# -gt 0 ]; do\n"
+            "  if [ \"$1\" = '--target' ]; then target=\"$2\"; shift 2; else shift; fi\n"
+            "done\n"
+            "mkdir -p \"target/$target/release\"\n"
+            "printf 'bin-%s' \"$target\" > \"target/$target/release/demo\"\n"
+        )
+        (fake / "cargo").chmod(0o755)
+        (fake / "gh").write_text("#!/bin/sh\nexit 1\n")
+        (fake / "gh").chmod(0o755)
+
+        fake_home = self.work / "home-release"
+        fake_home.mkdir()
+        env = {
+            **os.environ,
+            "HOME": str(fake_home),
+            "PATH": f"{fake}:{os.environ['PATH']}",
+            "AIA_SKILLS_REPO_ROOT": str(repo),
+            "FORGEJO_TOKEN": "",
+            "FORGEJO_TOKEN_SSH": "",
+        }
+
+        # Install a failing pre-push hook to simulate push failure.
+        hook = repo / ".git/hooks/pre-push"
+        hook.write_text("#!/bin/sh\necho 'pre-push blocked' >&2\nexit 1\n")
+        hook.chmod(0o755)
+
+        res = self.run_script(RELEASE, "release", "demo", "minor", env=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("failed at step 'push'", res.stderr)
+        self.assertIn("--from push", res.stderr)
+
+        # Verify bump/build/commit happened and ONLY version files were committed.
+        self.assertIn('version: "1.3.0"', (skill / "SKILL.md").read_text(encoding="utf-8"))
+        committed = subprocess.run(["git", "-C", str(repo), "show", "--name-only", "--pretty=format:", "HEAD"],
+                                   capture_output=True, text=True, check=True).stdout.splitlines()
+        committed_set = {line.strip() for line in committed if line.strip()}
+        self.assertEqual(
+            committed_set,
+            {
+                "CHANGELOG.md",
+                "crates/demo/Cargo.lock",
+                "crates/demo/Cargo.toml",
+                "skills/demo/SKILL.md",
+                "skills/demo/bin.sha256",
+            },
+        )
+        # Verify publish, install, and sync did NOT run.
+        local_tags = subprocess.run(["git", "-C", str(repo), "tag", "-l", "demo-v1.3.0"],
+                                    capture_output=True, text=True, check=True)
+        self.assertEqual(local_tags.stdout.strip(), "")
+        remote_tags = subprocess.run(["git", "--git-dir", str(origin), "tag", "-l", "demo-v1.3.0"],
+                                     capture_output=True, text=True, check=True)
+        self.assertEqual(remote_tags.stdout.strip(), "")
+        self.assertFalse(trace.exists())
+
+        # Remove the failing hook and resume from push -> completes push, publish, install, sync.
+        hook.unlink()
+        resumed = self.run_script(RELEASE, "release", "demo", "--from", "push", env=env)
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        head_sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+        remote_main = subprocess.run(["git", "--git-dir", str(origin), "rev-parse", "refs/heads/main"],
+                                     capture_output=True, text=True, check=True).stdout.strip()
+        remote_tag = subprocess.run(["git", "--git-dir", str(origin), "rev-parse", "refs/tags/demo-v1.3.0^{}"],
+                                    capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(remote_main, head_sha)
+        self.assertEqual(remote_tag, head_sha)
+        self.assertEqual(trace.read_text(encoding="utf-8").splitlines(), ["install.sh", "sync-hosts.sh"])
+
     def test_fetch_binary_fallback_marks_unverified_and_strict_mode_preserves_old(self):
         repo, skill, crate, _, _ = self.binary_fixture("fetch-fallback")
         fake = self.work / "fake-bin"

@@ -7,7 +7,12 @@
 #                                       ## Unreleased entries into a versioned section
 #   release-binary.sh build <skill>     build into dist/ and write skills/<skill>/bin.sha256
 #   (commit bin.sha256 with the version bump and push)
-#   release-binary.sh publish <skill>   tag that commit and upload dist/ to the releases
+#   release-binary.sh publish <skill>   fetch origin, verify HEAD is on origin/main and tag matches HEAD,
+#                                       then tag that commit and upload dist/ to the releases
+#   release-binary.sh release <skill> <ver|patch|minor|major> [--allow-empty] [--from <step>]
+#   release-binary.sh release <skill> --from <step>
+#                                       one-step release: bump -> build -> commit -> push -> publish -> install -> sync
+#                                       stops immediately on any failure and prints the --from <step> resume command
 #
 # publish needs `gh` logged in for GitHub (the primary download source). FORGEJO_TOKEN (write:repository)
 # also publishes to the Forgejo instance, which fetch-binary.sh tries second; without it that is skipped.
@@ -44,6 +49,8 @@ forgejo_token_over_ssh() {
 usage() {
   echo "usage: release-binary.sh bump <skill> <X.Y.Z|patch|minor|major> [--allow-empty]" >&2
   echo "       release-binary.sh build|verify|publish <skill>" >&2
+  echo "       release-binary.sh release <skill> <X.Y.Z|patch|minor|major> [--allow-empty] [--from <step>]" >&2
+  echo "       release-binary.sh release <skill> --from <step>" >&2
   exit 2
 }
 (( $# >= 2 )) || usage
@@ -53,9 +60,25 @@ DIR="$REPO_ROOT/skills/$SKILL"
 frontmatter_value() {
   sed -n '/^---$/,/^---$/p' "$1" | sed -n "s/^[[:space:]]*$2:[[:space:]]*//p" | head -1 | tr -d '"'
 }
-NAME="$(frontmatter_value "$DIR/SKILL.md" binary)"
-EXTRA_BINARIES="$(frontmatter_value "$DIR/SKILL.md" extra-binaries | tr ',[]' '   ')"
-VERSION="$(frontmatter_value "$DIR/SKILL.md" version)"
+refresh_meta() {
+  NAME="$(frontmatter_value "$DIR/SKILL.md" binary)"
+  EXTRA_BINARIES="$(frontmatter_value "$DIR/SKILL.md" extra-binaries | tr ',[]' '   ')"
+  VERSION="$(frontmatter_value "$DIR/SKILL.md" version)"
+  BINARIES=()
+  if [ -n "$NAME" ]; then
+    BINARIES=("$NAME")
+    local extra
+    for extra in $EXTRA_BINARIES; do
+      BINARIES+=("$extra")
+    done
+    TAG="$NAME-v$VERSION"
+    DIST="$REPO_ROOT/dist/$TAG"
+  else
+    TAG=""
+    DIST=""
+  fi
+}
+refresh_meta
 
 bump() {
   local target_spec="${1:-}" allow_empty="0"
@@ -271,14 +294,7 @@ if [ "$ACTION" = "bump" ]; then
   exit 0
 fi
 
-(( $# == 2 )) || usage
 [ -n "$NAME" ] || { echo "skills/$SKILL declares no binary" >&2; exit 2; }
-BINARIES=("$NAME")
-for extra in $EXTRA_BINARIES; do
-  BINARIES+=("$extra")
-done
-TAG="$NAME-v$VERSION"
-DIST="$REPO_ROOT/dist/$TAG"
 
 build() {
   local bin crate target
@@ -299,8 +315,37 @@ build() {
   echo "Next: commit skills/$SKILL/bin.sha256 with the version bump, push, then: $0 publish $SKILL"
 }
 
+check_tag_points_to_head() {
+  local head tag_commit
+  head="$(git -C "$REPO_ROOT" rev-parse HEAD)" || return 1
+  if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/tags/$TAG"; then
+    tag_commit="$(git -C "$REPO_ROOT" rev-parse "refs/tags/$TAG^{}")" || return 1
+    if [ "$tag_commit" != "$head" ]; then
+      echo "Tag $TAG does not point to HEAD (tag: $tag_commit, HEAD: $head)" >&2
+      return 1
+    fi
+  fi
+}
+
+check_head_on_origin_main() {
+  local head origin_main
+  git -C "$REPO_ROOT" fetch -q origin || {
+    echo "Failed to fetch origin; cannot verify whether HEAD is on origin/main" >&2
+    return 1
+  }
+  head="$(git -C "$REPO_ROOT" rev-parse HEAD)" || return 1
+  if ! origin_main="$(git -C "$REPO_ROOT" rev-parse -q --verify refs/remotes/origin/main 2>/dev/null)"; then
+    echo "当前提交还没推到 origin/main，先推送再 publish（缺少 origin/main）" >&2
+    return 1
+  fi
+  if ! git -C "$REPO_ROOT" merge-base --is-ancestor "$head" "$origin_main"; then
+    echo "当前提交还没推到 origin/main，先推送再 publish (HEAD=${head:0:7}, origin/main=${origin_main:0:7})" >&2
+    return 1
+  fi
+}
+
 verify() {
-  local bin crate cargo_version head tag_commit
+  local bin crate cargo_version head
   local dirty_paths=("skills/$SKILL")
   local tracked_files=("skills/$SKILL/bin.sha256")
   for bin in "${BINARIES[@]}"; do
@@ -332,20 +377,20 @@ PY
     echo "dist/ does not match committed bin.sha256" >&2; return 1;
   }
   head="$(git -C "$REPO_ROOT" rev-parse HEAD)" || return 1
-  if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/tags/$TAG"; then
-    tag_commit="$(git -C "$REPO_ROOT" rev-parse "refs/tags/$TAG^{}")" || return 1
-    [ "$tag_commit" = "$head" ] || { echo "Tag $TAG does not point to HEAD" >&2; return 1; }
-  fi
+  check_tag_points_to_head || return 1
   echo "Verified $TAG at $head"
 }
 
 publish() {
   local file notes
-  verify
-  if ! git -C "$REPO_ROOT" rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-    git -C "$REPO_ROOT" tag -a "$TAG" -m "$NAME $VERSION"
+  verify || return $?
+  check_head_on_origin_main || return $?
+  # Re-check after fetch in case origin already carried a tag pointing elsewhere.
+  check_tag_points_to_head || return $?
+  if ! git -C "$REPO_ROOT" show-ref --verify --quiet "refs/tags/$TAG"; then
+    git -C "$REPO_ROOT" tag -a "$TAG" -m "$NAME $VERSION" || return $?
   fi
-  git -C "$REPO_ROOT" push -q origin "$TAG"
+  git -C "$REPO_ROOT" push -q origin "$TAG" || return $?
   # Forgejo's push mirror runs on branch pushes only; a tag pushed afterwards waits for the periodic
   # sync, so the GitHub wait below would time out. Ask Forgejo to mirror now.
   forgejo_token_over_ssh
@@ -397,9 +442,126 @@ publish() {
   fi
 }
 
+commit_release() {
+  local bin
+  local files=("skills/$SKILL/SKILL.md" "skills/$SKILL/bin.sha256")
+  for bin in "${BINARIES[@]}"; do
+    files+=("crates/$bin/Cargo.toml")
+    if [ -f "$REPO_ROOT/crates/$bin/Cargo.lock" ]; then
+      files+=("crates/$bin/Cargo.lock")
+    fi
+  done
+  if [ -f "$REPO_ROOT/CHANGELOG.md" ] && git -C "$REPO_ROOT" ls-files --error-unmatch CHANGELOG.md >/dev/null 2>&1; then
+    files+=("CHANGELOG.md")
+  fi
+  git -C "$REPO_ROOT" add -- "${files[@]}"
+  git -C "$REPO_ROOT" commit -m "release($SKILL): $VERSION" -- "${files[@]}"
+}
+
+push_release() {
+  git -C "$REPO_ROOT" push origin HEAD:main
+}
+
+install_release() {
+  "$REPO_ROOT/scripts/install.sh"
+}
+
+sync_release() {
+  "$REPO_ROOT/scripts/sync-hosts.sh"
+}
+
+RELEASE_STEPS=(bump build commit push publish install sync)
+
+release_step_index() {
+  local want="$1" i
+  for i in "${!RELEASE_STEPS[@]}"; do
+    if [ "${RELEASE_STEPS[$i]}" = "$want" ]; then
+      echo "$i"
+      return 0
+    fi
+  done
+  return 1
+}
+
+release() {
+  local target_spec="" allow_empty="0" from_step="bump"
+  while (( $# > 0 )); do
+    case "$1" in
+      --allow-empty) allow_empty="1"; shift ;;
+      --from)
+        (( $# >= 2 )) || usage
+        from_step="$2"
+        shift 2
+        ;;
+      --from=*)
+        from_step="${1#--from=}"
+        shift
+        ;;
+      -*) usage ;;
+      *)
+        if [ -n "$target_spec" ]; then
+          usage
+        fi
+        target_spec="$1"
+        shift
+        ;;
+    esac
+  done
+
+  local start_idx
+  if ! start_idx="$(release_step_index "$from_step")"; then
+    echo "Invalid --from step: $from_step (valid: ${RELEASE_STEPS[*]})" >&2
+    exit 2
+  fi
+  if (( start_idx == 0 )) && [ -z "$target_spec" ]; then
+    usage
+  fi
+
+  local idx step rc resume_cmd
+  for (( idx = start_idx; idx < ${#RELEASE_STEPS[@]}; idx++ )); do
+    step="${RELEASE_STEPS[$idx]}"
+    echo "==> [release:$SKILL] step: $step"
+    rc=0
+    set +e
+    case "$step" in
+      bump)
+        if [ "$allow_empty" = "1" ]; then
+          ( set -euo pipefail; bump "$target_spec" --allow-empty )
+        else
+          ( set -euo pipefail; bump "$target_spec" )
+        fi
+        rc=$?
+        ;;
+      build)   ( set -euo pipefail; build ); rc=$? ;;
+      commit)  ( set -euo pipefail; commit_release ); rc=$? ;;
+      push)    ( set -euo pipefail; push_release ); rc=$? ;;
+      publish) ( set -euo pipefail; publish ); rc=$? ;;
+      install) ( set -euo pipefail; install_release ); rc=$? ;;
+      sync)    ( set -euo pipefail; sync_release ); rc=$? ;;
+    esac
+    set -e
+    if (( rc != 0 )); then
+      if [ "$step" = "bump" ]; then
+        resume_cmd="$0 release $SKILL $target_spec"
+        [ "$allow_empty" = "1" ] && resume_cmd+=" --allow-empty"
+      else
+        resume_cmd="$0 release $SKILL --from $step"
+      fi
+      echo "[release] failed at step '$step' (exit $rc)." >&2
+      echo "[release] resume with: $resume_cmd" >&2
+      return "$rc"
+    fi
+    if [ "$step" = "bump" ]; then
+      refresh_meta
+    fi
+  done
+  echo "==> [release:$SKILL] completed $TAG"
+}
+
 case "$ACTION" in
-  build) build ;;
-  verify) verify ;;
-  publish) publish ;;
+  build)   (( $# == 2 )) || usage; build ;;
+  verify)  (( $# == 2 )) || usage; verify ;;
+  publish) (( $# == 2 )) || usage; publish ;;
+  release) shift 2; release "$@" ;;
   *) usage ;;
 esac
