@@ -488,14 +488,35 @@ pub fn preserve(run: &Path) -> Res<Option<PathBuf>> {
             }
         }
     }
+    let rework_rounds: std::collections::HashSet<String> = {
+        let rev = json(run.join("review.json"));
+        rev["rounds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| s(r, "verdict").eq_ignore_ascii_case("REWORK"))
+            .filter_map(|r| r["round"].as_u64().map(|n| format!("round-{n}")))
+            .collect()
+    };
     if let Ok(entries) = fs::read_dir(run.join("review")) {
         for entry in entries.flatten() {
             let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let dir_name = entry.file_name().to_string_lossy().into_owned();
             let ufile = p.join("usage.json");
-            if p.is_dir() && ufile.is_file() {
-                let dst = record.join("review").join(entry.file_name());
+            let total_diff = p.join("total.diff");
+            let copy_total_diff = rework_rounds.contains(&dir_name) && total_diff.is_file();
+            if ufile.is_file() || copy_total_diff {
+                let dst = record.join("review").join(&dir_name);
                 fs::create_dir_all(&dst).map_err(|e| e.to_string())?;
-                fs::copy(&ufile, dst.join("usage.json")).map_err(|e| e.to_string())?;
+                if ufile.is_file() {
+                    fs::copy(&ufile, dst.join("usage.json")).map_err(|e| e.to_string())?;
+                }
+                if copy_total_diff {
+                    fs::copy(&total_diff, dst.join("total.diff")).map_err(|e| e.to_string())?;
+                }
             }
         }
     }

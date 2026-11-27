@@ -13,7 +13,7 @@ pub fn default_thinking(class: &str) -> Option<&'static str> {
     }
 }
 
-fn path() -> std::path::PathBuf {
+pub(crate) fn path() -> std::path::PathBuf {
     crate::config::user_path().with_file_name("fit.json")
 }
 pub fn validate_class(class: &str) -> Res<()> {
@@ -27,14 +27,14 @@ pub fn validate_class(class: &str) -> Res<()> {
         Err(format!("unknown class {class}; use {}", CLASSES.join("|")))
     }
 }
-fn load() -> Res<Value> {
+pub(crate) fn load() -> Res<Value> {
     let mut card = crate::config::read_file(&path())?.unwrap_or(json!({}));
     if let Some(obj) = card.as_object_mut() {
         obj.retain(|k, _| CLASSES.contains(&k.as_str()));
     }
     Ok(card)
 }
-fn aliases(config: &Value) -> Vec<String> {
+pub(crate) fn aliases(config: &Value) -> Vec<String> {
     config["models"]
         .as_object()
         .into_iter()
@@ -49,7 +49,7 @@ fn unreviewed(card: &Value, class: &str, aliases: &[String]) -> Vec<String> {
         .cloned()
         .collect()
 }
-fn set(
+pub(crate) fn set(
     card: &mut Value,
     class: &str,
     alias: &str,
@@ -146,9 +146,14 @@ pub fn command(args: &[String]) -> Res<i32> {
             println!("{alias} 自动降为 ok");
         }
         println!("已记录 {} × {}；查看：delegate fit", args[1], args[2]);
+    } else if args.first().is_some_and(|a| a == "bench") {
+        return crate::fit_bench::command(&args[1..], &config.value);
     } else {
         if !args.is_empty() && args != ["--json"] {
-            return Err("use delegate fit [--json] or delegate fit set …".into());
+            return Err(
+                "use delegate fit [--json] | delegate fit set … | delegate fit bench review …"
+                    .into(),
+            );
         }
         let card = load()?;
         if args == ["--json"] {

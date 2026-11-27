@@ -1198,12 +1198,12 @@ fn validate_allow(allow: &mut Vec<String>, repo: Option<&Path>, protect: &[Strin
     Ok(())
 }
 
-struct ReconstructedInSnapshot {
-    origin_repo: PathBuf,
-    tree_sha: String,
-    base_commit: Option<String>,
-    archive_dir: Option<PathBuf>,
-    summary: String,
+pub(crate) struct ReconstructedInSnapshot {
+    pub(crate) origin_repo: PathBuf,
+    pub(crate) tree_sha: String,
+    pub(crate) base_commit: Option<String>,
+    pub(crate) archive_dir: Option<PathBuf>,
+    pub(crate) summary: String,
 }
 
 struct TempRebuildDir {
@@ -1246,7 +1246,7 @@ fn is_upstream_worktree_live(upstream: &Path, prior: &Value) -> bool {
     true
 }
 
-fn git_object_type(repo: &Path, sha: &str) -> Option<String> {
+pub(crate) fn git_object_type(repo: &Path, sha: &str) -> Option<String> {
     if sha.is_empty() {
         return None;
     }
@@ -1263,7 +1263,7 @@ fn git_object_type(repo: &Path, sha: &str) -> Option<String> {
     }
 }
 
-fn resolve_upstream_archive_dir(upstream: &Path, prior: &Value) -> Option<PathBuf> {
+pub(crate) fn resolve_upstream_archive_dir(upstream: &Path, prior: &Value) -> Option<PathBuf> {
     if crate::archive::is_record(upstream) {
         if let Some(parent) = upstream.parent() {
             if parent.is_dir() {
@@ -1300,7 +1300,7 @@ fn resolve_upstream_archive_dir(upstream: &Path, prior: &Value) -> Option<PathBu
     None
 }
 
-fn find_upstream_record_file(
+pub(crate) fn find_upstream_record_file(
     upstream: &Path,
     archive_dir: Option<&Path>,
     name: &str,
@@ -1330,7 +1330,7 @@ fn fail_closed_in_err(run_id: &str, wt_path: &str, reason: &str) -> String {
     )
 }
 
-fn apply_patch_onto_base(
+pub(crate) fn apply_patch_onto_base(
     origin_git_dir: &Path,
     base_sha: &str,
     patch_bytes: &[u8],
@@ -1347,6 +1347,7 @@ fn apply_patch_onto_base(
             .arg("--work-tree")
             .arg(&wt)
             .env("GIT_INDEX_FILE", &idx)
+            .current_dir(&wt)
             .args(args);
         if stdin_data.is_some() {
             cmd.stdin(Stdio::piped())
@@ -1376,10 +1377,8 @@ fn apply_patch_onto_base(
 
     run_git(&["read-tree", base_sha], None)
         .map_err(|e| format!("read-tree {base_sha}: {e}"))?;
-    run_git(&["checkout-index", "-a", "-f"], None)
-        .map_err(|e| format!("checkout-index {base_sha}: {e}"))?;
     if !patch_bytes.is_empty() {
-        run_git(&["apply", "--index", "--binary"], Some(patch_bytes))
+        run_git(&["apply", "--cached", "--binary"], Some(patch_bytes))
             .map_err(|e| format!("git apply 失败: {e}"))?;
     }
     let tree_bytes = run_git(&["write-tree"], None)
@@ -1393,7 +1392,7 @@ fn apply_patch_onto_base(
 
 /// Fail-closed reconstruction of an upstream run's read-only snapshot when its original
 /// worktree has been cleaned, archived, or released from a pool slot.
-fn reconstruct_in_snapshot(
+pub(crate) fn reconstruct_in_snapshot(
     upstream: &Path,
     prior: &Value,
     fallback_workdir: &Path,

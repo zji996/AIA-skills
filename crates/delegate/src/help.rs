@@ -196,7 +196,7 @@ const COMMANDS: &[(&str, &str)] = &[
         "disk",
         "Check build-cache disk health (disk status) or run liveness-aware zero-cost cleanup and whole-disk global LRU pruning (disk prune [--dry-run] [--json]).",
     ),
-    ("fit", "Show or update the three-class model suitability & cost card (fit set; fit --json)."),
+    ("fit", "Show or update the three-class model suitability & cost card (fit set; fit bench review; fit --json)."),
     (
         "tiers",
         "Show purpose rules and registered aliases with Pi capabilities; configure --scout/--review/--write, --alias, --thinking.",
@@ -509,7 +509,14 @@ fn command_spec(command: &str) -> Option<CommandSpec> {
             ("--json", "Print deletion counts, orphan container cleanup, and archive rescan results as JSON lines."),
         ]),
         "tiers" => ("[--scout ALIAS] [--review ALIAS] [--write ALIAS] [--alias NAME=provider/id] [--thinking LEVEL] [--json]", "Print each purpose's rules (alias, full id, thinking), registered aliases with cost tier (low|main|high|—) and Pi context/images/thinking capabilities, unregistered Pi model count, and advisory hints when review/scout costs more than write or write lacks a build fit record. Pass --json for structured output including hints. Settings validate and atomically update user config; --alias is repeatable. All three tiers must resolve for start/run/reply. Old tiers and model :thinking suffixes are unsupported: register aliases, configure the three purposes and move suffixes into thinking.", &[]),
-        "fit" => ("[--json] | set CLASS ALIAS first|ok|avoid NOTE [--sample FILE]", "Three fixed classes (build/hard/review) plus each alias's configured cost tier (low|main|high|—); user-local fit.json stores only the latest verdict per alias/class, with an 80-character one-line note. Setting first demotes the previous first to ok. Missing evaluations are listed; --json shows full notes, samples, and cost.", &[]),
+        "fit" => ("[--json] | set CLASS ALIAS first|ok|avoid NOTE [--sample FILE] | bench review ALIAS [--since 30d] [-n 10] [--estimate] [--yes] [--json]", "Three fixed classes (build/hard/review) plus each alias's configured cost tier (low|main|high|—); user-local fit.json stores only the latest verdict per alias/class, with an 80-character one-line note. Setting first demotes the previous first to ok. Missing evaluations are listed; --json shows full notes, samples, and cost. `fit bench review` replays historical runs with known review outcomes (missed/caught) on a candidate alias using archived snapshots, estimates cost first (--estimate or requires --yes), and records a summary note in fit.json.", &[
+            ("bench review ALIAS", "Replay historical write runs with known review outcomes against candidate ALIAS."),
+            ("--since DURATION|all", "History window for bench sampling (default: 30d)."),
+            ("-n N", "Maximum number of historical runs to sample (default: 10, balanced missed/caught)."),
+            ("--estimate", "Estimate tokens and duration from original review usage without invoking any model."),
+            ("--yes", "Confirm dispatching candidate model calls after printing the estimate."),
+            ("--json", "Print structured JSON output."),
+        ]),
         "probe" => ("[--tier scout|review|write] [--model ALIAS] [--timeout SECONDS]", "Probe only registered models, deduplicated by full id, through the same Pi binary/environment/providers as start. Show ok/FAIL, elapsed/first-token time, matching tier rules and Pi's first error. No worktree, run directory or capacity slot. Exit 1 if an inferred-purpose pick fails, 0 otherwise, 2 for usage.", &[
             ("--tier scout|review|write", "Probe only this tier's registered candidates, including inactive rules."),
             ("--model ALIAS", "Probe one registered model instead; exclusive with --tier."),

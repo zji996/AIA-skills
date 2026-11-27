@@ -21,6 +21,7 @@ mod eta;
 mod events;
 mod fill;
 mod fit;
+mod fit_bench;
 mod gc;
 mod handoff;
 mod help;

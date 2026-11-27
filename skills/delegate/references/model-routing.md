@@ -16,6 +16,7 @@
 - 两步探路默认走 `tiers.scout` 档，让探路用自然语言写交接笔记（不要求 L0/L1 或固定锚点语法），Host 对照探路自身快照树宽松提取路径与 blob sha、留档 `scout-map.md` 后直接附给新会话写手；不存在的路径与探路后基线已变动的文件仅在地图末附一行事实提示而不弃图（仅空/失败/策略拦截或提及 ≥5 个仓内样式路径且现存 0 个且说明点名现存文件时弃图记 `scout_map_dropped` 并写明原因），开头向主控提问矛盾时进 `scoutQuestion` 等 `reply` 后再起写手；可用 `--no-scout` 或 `.delegate.json` `"scoutFirst": false` 关闭。
 - 首次遇到同类任务可把同份规格各派一路对比 → `delegate fit set <类别> <别名> first|ok|avoid "一句话" [--sample <规格文件>]` 记结论（每格仅留最新一句，上限 80 字符；设 `first` 时同类别原 `first` 自动降为 `ok`）。记录存放在用户配置目录的 `fit.json`（旧 `scout`/`design` 记录读取时忽略，下次写回时丢弃）。
 - `delegate fit` 以表格展示三类质量与每个别名的价位（`alias〔cost〕`，未设显示 `—`）及未评项；`delegate fit --json` 输出完整 note、sample 与 `cost` 映射。配置新增别名会列为未评，用各类别记录的 sample 重跑即可。
+- 评估候选审查模型用 `delegate fit bench review <别名> [--since 30d] [-n 10] [--estimate] [--yes] [--json]`：从本机 `history` 挑选最多 n 条有确定结论的写入任务（漏检与检出尽量各半，优先近期、不同仓库），按 `--in <run>` 同口径从归档重建只读快照与 diff 重审，统计命中率、漏检数、误报数与总用量，并把结论写入 `fit.json`（沿用 80 字符上限与 `sample` 字段）；`--estimate` 仅按原审查用量估算 token 与时长且不起模型调用，正式派发需显式加 `--yes`，不可重建的 run 跳过并计数不中断。
 - `start`/`reply` 启动回显在模型旁显示已配价位（如 `main〔main〕`），仅提示，不自动换模型、不拦截。
 
 ## 换模型

@@ -4,6 +4,7 @@
 
 - `delegate`：新增漏网缺陷记账约定（修复提交附 `Fixes-Run: <原 run-id>`，支持多行；`apply --commit` 不自动添加且原样保留）与 `delegate escapes [--since 30d] [--repo PATH] [--json]` 命令，按 `Delegate-Run:`/`Fixes-Run:` trailer 读取活跃或归档 run meta，按审查模型、写手模型与类别统计合入数、漏出数及比例，未找到 meta 的单独计入「未知 run」。
 - `delegate`：`delegate tiers`（查看、修改档位及新增 `--json` 输出的 `hints` 字段）按别名 `cost` 档位与 `fit.json` 适配卡在末尾给出只读配置提示（审查档/探路档比写入档贵、写入档缺少 `build` 适配卡记录），并在 `skills/delegate/references/model-routing.md` 新增「换模型」角色分配与验证指南。
+- `delegate`：新增 `delegate fit bench review <别名> [--since 30d] [-n 10] [--estimate] [--yes] [--json]`，从本机 history 选取最多 n 条有确定审查结论（漏检/检出尽量各半，优先近期与不同仓库）的写入任务，复用 `--in <run>` 归档重建只读快照与 diff 并用候选模型只读重审，输出命中率、漏检数、误报数与总用量并写入 `fit.json`（沿用 80 字符上限与 `sample` 字段）；`--estimate` 仅按原审查用量估算且不起模型调用，缺 `--yes` 仅打印估算不派发，不可重建 run 跳过并计数不中断。
 
 - `delegate`：新增额度预报软门控影子模式——基于 `agy_accounts` 同周期窗口估算与近 14 天写任务中位数耗时（`history.jsonl`）提供零子进程、只读缓存的余量判断（缓存超 20 分钟视为未知）；在自动补位（`fill` / `work --auto`）与 DAG 续派（`queue`）派发写任务时若预计装不下「在跑写数 + 1」仅记录 `quota_would_hold` 事件（不进 Stop hook、不拦截、手动 `start` 不记不打印），并新增 `delegate quota-shadow [--since 72h] [--window MINS] [--json]` 按事件与真实 429 `RESOURCE_EXHAUSTED` 失败对账输出召回率与误报率。
 

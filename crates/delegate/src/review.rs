@@ -2096,6 +2096,40 @@ fn format_diff_for_prompt(diff_text: &str, diff_file: &Path, top: &Path, from_tr
     }
 }
 
+/// Build the full-scope initial review prompt (shared by `review.rs` and `fit_bench.rs`
+/// so benchmark replays pass the exact same wording, workdir note, and diff formatting).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_full_review_prompt(
+    use_ro_workspace: bool,
+    workdir: &Path,
+    diff_file: &Path,
+    diff_text: &str,
+    top: &Path,
+    from_tree: &str,
+    to_tree: &str,
+    rubric_source: &str,
+    rubric_text: &str,
+    task_brief: &str,
+) -> String {
+    let workdir_note = format_review_workdir_note(use_ro_workspace, workdir, None, false);
+    let diff_section = format_diff_for_prompt(diff_text, diff_file, top, from_tree, to_tree);
+    let output_guide = "开头先给一句明确结论（通过 / 需返工 / 需主控决定，或 PASS / REWORK / NEEDS_CONTROLLER），下面自然写核查依据与重点关注位置。";
+    format!(
+        "请作为独立只读审查员审查以下写入任务的交付结果。\n\
+         {workdir_note}\
+         {REVIEW_ACCEPT_OWNED_NOTE}\n\
+         严格遵守：不修改任何文件，不委派子任务；{output_guide}\n\n\
+         ## 审查要点（{rubric_source}）\n\n\
+         {}\n\n\
+         ## 任务说明\n\n\
+         {}\n\n\
+         ## 本链净 diff（diff --total）\n\n\
+         {diff_section}\n",
+        rubric_text.trim(),
+        task_brief.trim(),
+    )
+}
+
 /// Build an isolated read-only checkout of `tree` for `agy` reviewers/scouts (which lack `--tools`).
 pub(crate) fn prepare_ro_workspace(top: &Path, tree: &str, dest: &Path, scratch: &Path) -> Res<()> {
     if dest.exists() {
@@ -2287,7 +2321,7 @@ pub(crate) fn diff_manifests(before: &BTreeMap<String, String>, after: &BTreeMap
         .collect()
 }
 
-fn build_reviewer_meta(
+pub(crate) fn build_reviewer_meta(
     author_meta: &Value,
     review_cfg: &Value,
     review_dir: &Path,
@@ -3233,8 +3267,8 @@ enum ExtraPreDecision {
     },
 }
 
-struct AgentAttemptWithRetry {
-    res: Res<(String, String)>,
+pub(crate) struct AgentAttemptWithRetry {
+    pub(crate) res: Res<(String, String)>,
     format_retried: bool,
     format_retry_failed: bool,
 }
@@ -3275,7 +3309,7 @@ fn run_agent_and_cleanup(
 /// `LOOP_STOP_RETRY_PROMPT` ONCE at the tail of the same session so it can conclude directly.
 /// If no clear verdict is recognized on a normal reply, the caller preserves `review.md` verbatim
 /// and falls back safely to `NEEDS_CONTROLLER` with `VERDICT_MISSING_NOTE`.
-fn run_reviewer_with_loop_stop_retry(
+pub(crate) fn run_reviewer_with_loop_stop_retry(
     review_meta: &Value,
     exec_dir: &Path,
     holder: Arc<AtomicI32>,
@@ -4176,19 +4210,17 @@ pub fn run_accept_and_review(
                 task_brief.trim(),
             )
         } else {
-            format!(
-                "请作为独立只读审查员审查以下写入任务的交付结果。\n\
-                 {workdir_note}\
-                 {REVIEW_ACCEPT_OWNED_NOTE}\n\
-                 严格遵守：不修改任何文件，不委派子任务；{output_guide}\n\n\
-                 ## 审查要点（{rubric_source}）\n\n\
-                 {}\n\n\
-                 ## 任务说明\n\n\
-                 {}\n\n\
-                 ## 本链净 diff（diff --total）\n\n\
-                 {diff_section}\n",
-                rubric_text.trim(),
-                task_brief.trim(),
+            build_full_review_prompt(
+                use_ro_workspace,
+                &reviewer_workdir,
+                &diff_file,
+                &diff_text,
+                &top,
+                &diff_from,
+                &after_tree,
+                &rubric_source,
+                &rubric_text,
+                &task_brief,
             )
         };
         let review_prompt_file = round_dir.join("prompt.md");
@@ -5443,6 +5475,26 @@ pub fn run_accept_and_review(
             }
         }
 
+        if verdict_str == "REWORK" && incremental && !current_total_base.is_empty() && !after_tree.is_empty() {
+            let total_diff_path = round_dir.join("total.diff");
+            if !total_diff_path.is_file() {
+                if let Ok(raw) = git(
+                    &top,
+                    &[
+                        "diff",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--color=never",
+                        "--binary",
+                        &current_total_base,
+                        &after_tree,
+                    ],
+                ) {
+                    let _ = write(&total_diff_path, String::from_utf8_lossy(&raw).as_ref());
+                }
+            }
+        }
+
         let mut round_entry = json!({
             "round": round,
             "verdict": verdict_str,
@@ -5455,6 +5507,12 @@ pub fn run_accept_and_review(
             "startedAt": rev_outcome.round_started,
             "finishedAt": round_finished,
         });
+        if !after_tree.is_empty() {
+            round_entry["reviewedTree"] = json!(after_tree);
+        }
+        if !current_total_base.is_empty() {
+            round_entry["reviewedBaseTree"] = json!(current_total_base);
+        }
         if format_error {
             round_entry["formatError"] = json!(true);
         }
