@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "delegate-tui"
-version = "6.53.0"
+version = "6.54.0"
 dependencies = [
  "crossterm",
  "libc",
