@@ -181,8 +181,14 @@ pub(crate) fn render_overview_pane(frame: &mut Frame, app: &mut App, area: Rect)
     } else {
         acct_count * 4 + 3 + 2 // per account (1 header + 3 pool lines) + divider + 2 summary lines + borders
     };
-    let need_lines: usize = if app.snapshot.line_stats.is_some() {
-        10 // header + 4 rows + 2 ratio rows + 1 7d sparkline row + 2 borders
+    let need_lines: usize = if let Some(ref ls) = app.snapshot.line_stats {
+        let extra = match ls.total_lines.as_ref() {
+            Some(tl) if tl.counts.total > 0 || !tl.by_repo.is_empty() => {
+                1 + tl.by_repo.len().min(4) + usize::from(tl.by_repo.len() > 4)
+            }
+            _ => 0,
+        };
+        10 + extra // header + 4 rows + 2 ratio rows + 1 7d sparkline + total summary + per-repo rows + 2 borders
     } else {
         3 // compact loading/empty card + 2 borders
     };
@@ -1040,6 +1046,22 @@ fn pad_center_w(s: &str, width: usize) -> String {
     }
 }
 
+pub(crate) fn format_lines_compact(n: u64) -> String {
+    if n >= 10_000 {
+        format!("{:.1} 万行", n as f64 / 10_000.0)
+    } else {
+        format!("{} 行", format_commas_u64(n))
+    }
+}
+
+fn format_lines_short(n: u64) -> String {
+    if n >= 10_000 {
+        format!("{:.1}万", n as f64 / 10_000.0)
+    } else {
+        format_commas_u64(n)
+    }
+}
+
 fn build_line_stats_lines(ls: &LineStatsSnapshot, inner_w: usize, indent: &str) -> Vec<Line<'static>> {
     const MINUS: char = '\u{2212}';
     let label_w = display_width("每百万 token");
@@ -1086,7 +1108,35 @@ fn build_line_stats_lines(ls: &LineStatsSnapshot, inner_w: usize, indent: &str) 
         pad_center_w(&format!("{left} / {right}"), cw)
     };
 
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(8);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(14);
+
+    // Global total lines summary alongside 24h/7d diff counts
+    if let Some(ref tl) = ls.total_lines {
+        if tl.counts.total > 0 || !tl.by_repo.is_empty() {
+            let trend_note = match (tl.daily_totals.first(), tl.daily_totals.last()) {
+                (Some(f), Some(l)) if tl.daily_totals.len() >= 2 && f.total != l.total => {
+                    if l.total > f.total {
+                        format!(" (+{})", format_lines_short(l.total - f.total))
+                    } else {
+                        format!(" ({MINUS}{})", format_lines_short(f.total - l.total))
+                    }
+                }
+                _ => String::new(),
+            };
+            let summary = format!(
+                "{indent}总 {}{trend_note} · 24h +{}/{MINUS}{} · 7d +{}/{MINUS}{}",
+                format_lines_compact(tl.counts.total),
+                format_commas_u64(ls.win_24h.total.added),
+                format_commas_u64(ls.win_24h.total.deleted),
+                format_commas_u64(ls.win_7d.total.added),
+                format_commas_u64(ls.win_7d.total.deleted),
+            );
+            lines.push(Line::from(Span::styled(
+                truncate(&summary, inner_w),
+                bold_primary(),
+            )));
+        }
+    }
 
     // Header row
     let hdr = format!(
@@ -1174,6 +1224,38 @@ fn build_line_stats_lines(ls: &LineStatsSnapshot, inner_w: usize, indent: &str) 
         truncate(&spark_row, inner_w),
         Style::default().fg(STATUS_RUNNING),
     )));
+
+    // Compact per-repo total lines & category breakdown
+    if let Some(ref tl) = ls.total_lines {
+        if !tl.by_repo.is_empty() {
+            let shown: Vec<&RepoTotalLines> = tl.by_repo.iter().take(4).collect();
+            let repo_w = shown
+                .iter()
+                .map(|r| display_width(&r.repo).min(14))
+                .max()
+                .unwrap_or(4);
+            let tot_w = shown
+                .iter()
+                .map(|r| display_width(&format_lines_short(r.counts.total)))
+                .max()
+                .unwrap_or(1);
+            for r in &shown {
+                let rname = pad_right(&truncate(&r.repo, 14), repo_w);
+                let rtot = pad_left(&format_lines_short(r.counts.total), tot_w);
+                let row = format!(
+                    "{indent}{rname}  {rtot} · 代码 {} 测试 {} 文档 {}",
+                    format_lines_short(r.counts.code),
+                    format_lines_short(r.counts.test),
+                    format_lines_short(r.counts.docs),
+                );
+                lines.push(Line::from(Span::styled(truncate(&row, inner_w), muted())));
+            }
+            if tl.by_repo.len() > 4 {
+                let more = format!("{indent}… 其余 {} 仓", tl.by_repo.len() - 4);
+                lines.push(Line::from(Span::styled(truncate(&more, inner_w), muted())));
+            }
+        }
+    }
 
     lines
 }

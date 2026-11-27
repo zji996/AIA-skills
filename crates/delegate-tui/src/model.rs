@@ -1811,10 +1811,40 @@ pub struct LineStatsDailyPoint {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct TotalLineCounts {
+    pub total: u64,
+    pub code: u64,
+    pub test: u64,
+    pub docs: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct RepoTotalLines {
+    pub repo: String,
+    pub path: String,
+    pub head: String,
+    pub counts: TotalLineCounts,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct DailyTotalLinesPoint {
+    pub date: String,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct TotalLinesSnapshot {
+    pub counts: TotalLineCounts,
+    pub by_repo: Vec<RepoTotalLines>,
+    pub daily_totals: Vec<DailyTotalLinesPoint>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct LineStatsSnapshot {
     pub win_24h: LineStatsWindow,
     pub win_7d: LineStatsWindow,
     pub daily_7d: Vec<LineStatsDailyPoint>,
+    pub total_lines: Option<TotalLinesSnapshot>,
     pub errors: Vec<(String, String)>,
 }
 

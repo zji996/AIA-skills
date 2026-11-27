@@ -528,5 +528,63 @@ fn parse_line_stats_json_reads_windows_daily_and_errors() {
     assert_eq!(ls.win_7d.lines_per_million_tokens, Some(41));
     assert_eq!(ls.daily_7d.len(), 7);
     assert_eq!(ls.daily_7d[6].churn, 2378);
+    assert!(ls.total_lines.is_none());
     assert_eq!(ls.errors, vec![("broken".to_string(), "not a git repo".to_string())]);
+}
+
+#[test]
+fn parse_line_stats_json_reads_total_lines_by_repo_and_daily_totals() {
+    use delegate_tui::data::parse_line_stats_json;
+
+    let raw = r#"{
+        "totalLines": {
+            "total": 412345,
+            "code": 310000,
+            "test": 82000,
+            "docs": 20345,
+            "byRepo": [
+                {
+                    "repo": "repo-alpha",
+                    "path": "/tmp/repo-alpha",
+                    "head": "aaa111",
+                    "total": 350000,
+                    "code": 260000,
+                    "test": 75000,
+                    "docs": 15000
+                },
+                {
+                    "repo": "repo-beta",
+                    "path": "/tmp/repo-beta",
+                    "head": "bbb222",
+                    "total": 62345,
+                    "code": 50000,
+                    "test": 7000,
+                    "docs": 5345
+                }
+            ],
+            "dailyTotals": [
+                {"date": "2026-11-26", "total": 410000, "code": 308000, "test": 81655, "docs": 20345},
+                {"date": "2026-11-27", "total": 412345, "code": 310000, "test": 82000, "docs": 20345}
+            ]
+        },
+        "windows": [
+            {"key": "24h", "label": "24 小时", "total": {"added": 100, "deleted": 20, "churn": 120}},
+            {"key": "7d", "label": "7 天", "total": {"added": 500, "deleted": 100, "churn": 600}}
+        ],
+        "daily7d": [],
+        "errors": []
+    }"#;
+    let ls = parse_line_stats_json(raw).expect("valid line stats with totalLines");
+    let tl = ls.total_lines.expect("total_lines present");
+    assert_eq!(tl.counts.total, 412345);
+    assert_eq!(tl.counts.code, 310000);
+    assert_eq!(tl.counts.test, 82000);
+    assert_eq!(tl.counts.docs, 20345);
+    assert_eq!(tl.by_repo.len(), 2);
+    assert_eq!(tl.by_repo[0].repo, "repo-alpha");
+    assert_eq!(tl.by_repo[0].counts.total, 350000);
+    assert_eq!(tl.by_repo[1].repo, "repo-beta");
+    assert_eq!(tl.daily_totals.len(), 2);
+    assert_eq!(tl.daily_totals[0].total, 410000);
+    assert_eq!(tl.daily_totals[1].total, 412345);
 }

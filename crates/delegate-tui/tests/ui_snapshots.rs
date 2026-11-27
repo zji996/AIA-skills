@@ -3317,3 +3317,110 @@ fn overview_renders_line_stats_card_wide_and_narrow_and_survives_snapshot_refres
     app.apply_snapshot(next_snap, false);
     assert_eq!(app.snapshot.line_stats.as_ref(), Some(&ls));
 }
+
+#[test]
+fn overview_and_runs_render_total_lines_summary_and_per_repo_breakdown() {
+    use delegate_tui::app::{RunsGroupMode, ViewTab};
+    use delegate_tui::data::parse_line_stats_json;
+
+    let mut app = make_sample_app();
+    let sample_repo_path = app.snapshot.repos[0].path.display().to_string();
+    let sample_repo_label = app.snapshot.repos[0].label.clone();
+
+    let raw = format!(
+        r#"{{
+            "totalLines": {{
+                "total": 412345,
+                "code": 310000,
+                "test": 82000,
+                "docs": 20345,
+                "byRepo": [
+                    {{
+                        "repo": "{sample_repo_label}",
+                        "path": "{sample_repo_path}",
+                        "head": "aaa111",
+                        "total": 350000,
+                        "code": 260000,
+                        "test": 75000,
+                        "docs": 15000
+                    }},
+                    {{
+                        "repo": "aia-skills",
+                        "path": "/tmp/aia-skills",
+                        "head": "bbb222",
+                        "total": 62345,
+                        "code": 50000,
+                        "test": 7000,
+                        "docs": 5345
+                    }}
+                ],
+                "dailyTotals": [
+                    {{"date": "2026-11-26", "total": 410000, "code": 308000, "test": 81655, "docs": 20345}},
+                    {{"date": "2026-11-27", "total": 412345, "code": 310000, "test": 82000, "docs": 20345}}
+                ]
+            }},
+            "windows": [
+                {{
+                    "key": "24h",
+                    "label": "24 小时",
+                    "total": {{"added": 3120, "deleted": 870, "churn": 3990}},
+                    "byCategory": {{
+                        "code": {{"total": {{"added": 2000, "deleted": 600, "churn": 2600}}}},
+                        "test": {{"total": {{"added": 900, "deleted": 200, "churn": 1100}}}},
+                        "docs": {{"total": {{"added": 220, "deleted": 70, "churn": 290}}}}
+                    }},
+                    "delegatedSharePct": 85.0,
+                    "linesPerMillionTokens": 42.0
+                }},
+                {{
+                    "key": "7d",
+                    "label": "7 天",
+                    "total": {{"added": 14808, "deleted": 4667, "churn": 19475}},
+                    "byCategory": {{
+                        "code": {{"total": {{"added": 9876, "deleted": 3402, "churn": 13278}}}},
+                        "test": {{"total": {{"added": 4120, "deleted": 960, "churn": 5080}}}},
+                        "docs": {{"total": {{"added": 812, "deleted": 305, "churn": 1117}}}}
+                    }},
+                    "delegatedSharePct": 77.0,
+                    "linesPerMillionTokens": 41.0
+                }}
+            ],
+            "daily7d": [
+                {{"date": "2026-11-26", "added": 1000, "deleted": 200, "churn": 1200}},
+                {{"date": "2026-11-27", "added": 3120, "deleted": 870, "churn": 3990}}
+            ],
+            "errors": []
+        }}"#
+    );
+    let ls = parse_line_stats_json(&raw).unwrap();
+    app.snapshot.line_stats = Some(ls);
+    app.last_fingerprint = app.snapshot.data_fingerprint();
+
+    // 1. Overview wide: header summary + per-repo category rows
+    app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Overview);
+    let wide = render_to_string(&mut app, 150, 48);
+    assert_lines_fit_width(&wide, 150);
+    assert!(wide.contains("总 41.2 万行"), "{wide}");
+    assert!(wide.contains("+3,120/\u{2212}870"), "{wide}");
+    assert!(wide.contains("35.0万") && wide.contains("代码 26.0万") && wide.contains("测试 7.5万"), "{wide}");
+    assert!(wide.contains("aia-skills") && wide.contains("6.2万"), "{wide}");
+
+    // 2. Overview narrow: single-column flow also includes total lines
+    let narrow = render_to_string(&mut app, 80, 52);
+    assert_lines_fit_width(&narrow, 80);
+    assert!(narrow.contains("总 41.2 万行"), "{narrow}");
+    assert!(narrow.contains("aia-skills"), "{narrow}");
+
+    // 3. Runs tab (3 运行) grouped by repo shows brief total lines next to repo header
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Runs);
+    app.runs_group_mode = RunsGroupMode::ByRepo;
+    app.rebuild_rows(None);
+    let runs_view = render_to_string(&mut app, 140, 36);
+    assert_lines_fit_width(&runs_view, 140);
+    assert!(
+        runs_view.contains(&format!("▌ {sample_repo_label} · 总 35.0 万行")),
+        "{runs_view}"
+    );
+}

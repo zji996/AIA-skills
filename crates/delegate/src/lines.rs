@@ -6,7 +6,9 @@ use crate::usage::{self, TokenCounts};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 pub const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
     "**/*.lock",
@@ -32,7 +34,8 @@ const TEST_GLOBS: &[&str] = &[
 
 const DAY_SECS: i64 = 86_400;
 const SEVEN_DAYS_SECS: i64 = 7 * DAY_SECS;
-const CACHE_VERSION: u64 = 1;
+const CACHE_VERSION: u64 = 2;
+const MAX_DAILY_TOTAL_POINTS: usize = 90;
 const MINUS_SIGN: char = '\u{2212}'; // U+2212 '−'
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,12 +212,104 @@ impl CommitStat {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TotalLineCounts {
+    pub code: u64,
+    pub test: u64,
+    pub docs: u64,
+}
+
+impl TotalLineCounts {
+    pub fn total(self) -> u64 {
+        self.code
+            .saturating_add(self.test)
+            .saturating_add(self.docs)
+    }
+
+    pub fn add(&mut self, other: Self) {
+        self.code = self.code.saturating_add(other.code);
+        self.test = self.test.saturating_add(other.test);
+        self.docs = self.docs.saturating_add(other.docs);
+    }
+
+    pub fn to_json(self) -> Value {
+        json!({
+            "total": self.total(),
+            "code": self.code,
+            "test": self.test,
+            "docs": self.docs,
+        })
+    }
+
+    pub fn from_json(v: &Value) -> Option<Self> {
+        Some(Self {
+            code: v.get("code")?.as_u64()?,
+            test: v.get("test")?.as_u64()?,
+            docs: v.get("docs")?.as_u64()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DailyTotalPoint {
+    date: String,
+    head: String,
+    counts: TotalLineCounts,
+}
+
+impl DailyTotalPoint {
+    fn to_json(&self) -> Value {
+        json!({
+            "date": self.date,
+            "head": self.head,
+            "code": self.counts.code,
+            "test": self.counts.test,
+            "docs": self.counts.docs,
+        })
+    }
+
+    fn from_json(v: &Value) -> Option<Self> {
+        let date = v.get("date")?.as_str()?.to_string();
+        if date.is_empty() {
+            return None;
+        }
+        let head = v
+            .get("head")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let counts = TotalLineCounts::from_json(v)?;
+        Some(Self { date, head, counts })
+    }
+}
+
+fn upsert_daily_total(
+    points: &mut Vec<DailyTotalPoint>,
+    date: String,
+    head: String,
+    counts: TotalLineCounts,
+) {
+    if let Some(existing) = points.iter_mut().find(|p| p.date == date) {
+        existing.head = head;
+        existing.counts = counts;
+    } else {
+        points.push(DailyTotalPoint { date, head, counts });
+        points.sort_by(|a, b| a.date.cmp(&b.date));
+    }
+    if points.len() > MAX_DAILY_TOTAL_POINTS {
+        let drop_n = points.len() - MAX_DAILY_TOTAL_POINTS;
+        points.drain(0..drop_n);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RepoCacheEntry {
     head: String,
     exclude_rules: Vec<String>,
     covered_since: i64,
     commits: Vec<CommitStat>,
+    total_lines: TotalLineCounts,
+    daily_totals: Vec<DailyTotalPoint>,
 }
 
 impl RepoCacheEntry {
@@ -224,6 +319,8 @@ impl RepoCacheEntry {
             "excludeRules": self.exclude_rules,
             "coveredSince": self.covered_since,
             "commits": self.commits.iter().map(CommitStat::to_json).collect::<Vec<_>>(),
+            "totalLines": self.total_lines.to_json(),
+            "dailyTotals": self.daily_totals.iter().map(DailyTotalPoint::to_json).collect::<Vec<_>>(),
         })
     }
 
@@ -246,11 +343,19 @@ impl RepoCacheEntry {
             .iter()
             .filter_map(CommitStat::from_json)
             .collect();
+        let total_lines = TotalLineCounts::from_json(v.get("totalLines")?)?;
+        let daily_totals = v
+            .get("dailyTotals")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().filter_map(DailyTotalPoint::from_json).collect())
+            .unwrap_or_default();
         Some(Self {
             head,
             exclude_rules,
             covered_since,
             commits,
+            total_lines,
+            daily_totals,
         })
     }
 }
@@ -745,6 +850,282 @@ fn fetch_repo_commits_git(
     Ok(parse_git_log_numstat_z(&out.stdout, exclude_rules))
 }
 
+/// Parse `git ls-tree -r -z <head>` output into `(blob_oid, path)` pairs.
+/// Keeps only regular file blobs (`100644`/`100755`), automatically skipping submodules (`160000`)
+/// and symlinks (`120000`), and applies `is_excluded`.
+fn parse_ls_tree_z(raw: &[u8], exclude_rules: &[String]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for rec in raw.split(|&b| b == 0) {
+        if rec.is_empty() {
+            continue;
+        }
+        let Some(tab_pos) = rec.iter().position(|&b| b == b'\t') else {
+            continue;
+        };
+        let meta = std::str::from_utf8(&rec[..tab_pos]).unwrap_or("");
+        let mut parts = meta.split(' ');
+        let Some(mode) = parts.next() else {
+            continue;
+        };
+        let Some(kind) = parts.next() else {
+            continue;
+        };
+        let Some(oid) = parts.next() else {
+            continue;
+        };
+        if kind != "blob" || (mode != "100644" && mode != "100755") {
+            continue;
+        }
+        let path = String::from_utf8_lossy(&rec[tab_pos + 1..]);
+        if is_excluded(&path, exclude_rules) {
+            continue;
+        }
+        out.push((oid.to_string(), path.into_owned()));
+    }
+    out
+}
+
+/// Exclude paths marked with git attributes `binary`, `linguist-generated`, `linguist-vendored`,
+/// `generated`, or `vendored` in a single `git check-attr --stdin -z` invocation.
+fn filter_git_attr_excluded(
+    repo: &Path,
+    candidates: Vec<(String, String)>,
+) -> Res<Vec<(String, String)>> {
+    if candidates.is_empty() {
+        return Ok(candidates);
+    }
+    let mut child = git_command()
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "check-attr",
+            "--stdin",
+            "-z",
+            "binary",
+            "linguist-generated",
+            "linguist-vendored",
+            "generated",
+            "vendored",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git check-attr 启动失败：{e}"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "git check-attr stdin 不可用".to_string())?;
+    let paths_for_writer: Vec<String> = candidates.iter().map(|(_, p)| p.clone()).collect();
+    let writer = std::thread::spawn(move || {
+        for p in &paths_for_writer {
+            if stdin.write_all(p.as_bytes()).is_err() || stdin.write_all(&[0]).is_err() {
+                break;
+            }
+        }
+        let _ = stdin.flush();
+    });
+
+    let mut stdout_bytes = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_end(&mut stdout_bytes);
+    }
+    let mut stderr_bytes = Vec::new();
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_end(&mut stderr_bytes);
+    }
+    let _ = writer.join();
+    let status = child
+        .wait()
+        .map_err(|e| format!("git check-attr 等待失败：{e}"))?;
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("git check-attr 失败（退出码 {:?}）", status.code())
+        } else {
+            stderr
+        });
+    }
+
+    let mut excluded_paths: HashSet<String> = HashSet::new();
+    let fields: Vec<&[u8]> = stdout_bytes.split(|&b| b == 0).collect();
+    let mut idx = 0usize;
+    while idx + 2 < fields.len() {
+        let path_b = fields[idx];
+        let attr_b = fields[idx + 1];
+        let info_b = fields[idx + 2];
+        idx += 3;
+        if path_b.is_empty() {
+            continue;
+        }
+        let info = std::str::from_utf8(info_b).unwrap_or("");
+        let attr = std::str::from_utf8(attr_b).unwrap_or("");
+        let is_set = info == "set" || info.eq_ignore_ascii_case("true");
+        if is_set
+            && matches!(
+                attr,
+                "binary" | "linguist-generated" | "linguist-vendored" | "generated" | "vendored"
+            )
+        {
+            excluded_paths.insert(String::from_utf8_lossy(path_b).into_owned());
+        }
+    }
+
+    if excluded_paths.is_empty() {
+        Ok(candidates)
+    } else {
+        Ok(candidates
+            .into_iter()
+            .filter(|(_, p)| !excluded_paths.contains(p))
+            .collect())
+    }
+}
+
+/// Stream-count lines of candidate blobs via a single `git cat-file --batch` invocation.
+/// Skips blobs containing NUL in the first 8KB (same binary heuristic as git).
+fn count_blobs_lines(repo: &Path, entries: &[(String, String)]) -> Res<TotalLineCounts> {
+    if entries.is_empty() {
+        return Ok(TotalLineCounts::default());
+    }
+    let mut child = git_command()
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git cat-file 启动失败：{e}"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "git cat-file stdin 不可用".to_string())?;
+    let oids: Vec<String> = entries.iter().map(|(oid, _)| oid.clone()).collect();
+    let writer = std::thread::spawn(move || {
+        for oid in &oids {
+            if stdin.write_all(oid.as_bytes()).is_err() || stdin.write_all(b"\n").is_err() {
+                break;
+            }
+        }
+        let _ = stdin.flush();
+    });
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "git cat-file stdout 不可用".to_string())?;
+    let mut reader = BufReader::with_capacity(64 * 1024, stdout);
+    let mut hdr = String::new();
+    let mut buf = [0u8; 65536];
+    let mut totals = TotalLineCounts::default();
+
+    for (_oid, path) in entries {
+        hdr.clear();
+        let n = reader
+            .read_line(&mut hdr)
+            .map_err(|e| format!("读取 git cat-file 头失败：{e}"))?;
+        if n == 0 {
+            break;
+        }
+        let trimmed = hdr.trim_end_matches(['\r', '\n']);
+        let mut parts = trimmed.split(' ');
+        let _id = parts.next();
+        let kind = parts.next().unwrap_or("");
+        let size_str = parts.next().unwrap_or("");
+        if kind != "blob" {
+            continue;
+        }
+        let Ok(size) = size_str.parse::<u64>() else {
+            continue;
+        };
+
+        let mut remaining = size;
+        let mut seen: u64 = 0;
+        let mut is_binary = false;
+        let mut newlines: u64 = 0;
+        let mut last_byte: u8 = 0;
+
+        while remaining > 0 {
+            let want = (remaining as usize).min(buf.len());
+            reader
+                .read_exact(&mut buf[..want])
+                .map_err(|e| format!("读取 git blob 内容失败：{e}"))?;
+            if !is_binary && seen < 8192 {
+                let check_len = want.min((8192 - seen) as usize);
+                if buf[..check_len].contains(&0u8) {
+                    is_binary = true;
+                }
+            }
+            if !is_binary {
+                newlines += buf[..want].iter().filter(|&&b| b == b'\n').count() as u64;
+            }
+            last_byte = buf[want - 1];
+            seen += want as u64;
+            remaining -= want as u64;
+        }
+
+        // Consume trailing LF emitted by `git cat-file --batch` after each object.
+        let mut lf = [0u8; 1];
+        let _ = reader.read_exact(&mut lf);
+
+        if is_binary {
+            continue;
+        }
+        let file_lines = newlines + u64::from(seen > 0 && last_byte != b'\n');
+        match classify_path(path) {
+            LineCategory::Code => totals.code = totals.code.saturating_add(file_lines),
+            LineCategory::Test => totals.test = totals.test.saturating_add(file_lines),
+            LineCategory::Docs => totals.docs = totals.docs.saturating_add(file_lines),
+        }
+    }
+
+    let mut stderr_bytes = Vec::new();
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_end(&mut stderr_bytes);
+    }
+    let _ = writer.join();
+    let status = child
+        .wait()
+        .map_err(|e| format!("git cat-file 等待失败：{e}"))?;
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("git cat-file 失败（退出码 {:?}）", status.code())
+        } else {
+            stderr
+        });
+    }
+    Ok(totals)
+}
+
+/// Compute total tracked non-binary, non-excluded lines at `head_sha` using the same 3-category
+/// classification (`code` / `test` / `docs`) and exclusion rules as diff line stats.
+fn compute_repo_total_lines(
+    repo: &Path,
+    head_sha: &str,
+    exclude_rules: &[String],
+) -> Res<TotalLineCounts> {
+    let out = git_command()
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-tree", "-r", "-z", head_sha])
+        .output()
+        .map_err(|e| format!("git ls-tree 启动失败：{e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("git ls-tree 失败（退出码 {:?}）", out.status.code())
+        } else {
+            stderr
+        });
+    }
+    let candidates = parse_ls_tree_z(&out.stdout, exclude_rules);
+    let filtered = filter_git_attr_excluded(repo, candidates)?;
+    count_blobs_lines(repo, &filtered)
+}
+
 fn cache_path(state: &Path) -> PathBuf {
     state.join("line-stats-cache.json")
 }
@@ -997,6 +1378,60 @@ struct RepoData {
     path: PathBuf,
     head: String,
     commits: Vec<CommitStat>,
+    total_lines: TotalLineCounts,
+    daily_totals: Vec<DailyTotalPoint>,
+}
+
+struct RepoTotalResult {
+    label: String,
+    path: PathBuf,
+    head: String,
+    counts: TotalLineCounts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GlobalDailyTotal {
+    date: String,
+    counts: TotalLineCounts,
+}
+
+/// Aggregate per-repo cached daily totals without backfilling history.
+/// Only emits dates `>= max(first_cached_date)` across repos that have cached points,
+/// so adding a newly registered repository later never causes a synthetic step jump.
+fn aggregate_global_daily_totals(per_repo: &[&[DailyTotalPoint]]) -> Vec<GlobalDailyTotal> {
+    let Some(min_common_date) = per_repo
+        .iter()
+        .filter_map(|pts| pts.first().map(|p| p.date.as_str()))
+        .max()
+    else {
+        return Vec::new();
+    };
+    let mut dates: BTreeSet<String> = BTreeSet::new();
+    for pts in per_repo {
+        for pt in *pts {
+            if pt.date.as_str() >= min_common_date {
+                dates.insert(pt.date.clone());
+            }
+        }
+    }
+    dates
+        .into_iter()
+        .map(|date| {
+            let mut sum = TotalLineCounts::default();
+            for pts in per_repo {
+                if let Some(pt) = pts.iter().rev().find(|p| p.date.as_str() <= date.as_str()) {
+                    sum.add(pt.counts);
+                }
+            }
+            GlobalDailyTotal { date, counts: sum }
+        })
+        .collect()
+}
+
+struct TotalLinesSummary {
+    counts: TotalLineCounts,
+    by_repo: Vec<RepoTotalResult>,
+    daily_totals: Vec<GlobalDailyTotal>,
 }
 
 struct RepoError {
@@ -1160,12 +1595,22 @@ fn pad_center(s: &str, width: usize) -> String {
 
 fn render_human(
     windows: &[WindowResult],
+    totals: &TotalLinesSummary,
     by_repo: bool,
     repo_order: &[String],
     errors: &[RepoError],
 ) -> String {
     let mut out = String::new();
     out.push_str("代码改动（各仓库默认分支，不含合并提交与生成文件）\n");
+    if totals.counts.total() > 0 || !totals.by_repo.is_empty() {
+        out.push_str(&format!(
+            "当前总量  {} 行（代码 {} · 测试 {} · 文档 {}）\n",
+            format_commas(totals.counts.total()),
+            format_commas(totals.counts.code),
+            format_commas(totals.counts.test),
+            format_commas(totals.counts.docs),
+        ));
+    }
 
     let mut label_w = display_width("每百万 token");
     if by_repo {
@@ -1297,6 +1742,26 @@ fn render_human(
         out.push('\n');
     }
 
+    if by_repo && !totals.by_repo.is_empty() {
+        out.push_str("各仓总量\n");
+        let total_w = totals
+            .by_repo
+            .iter()
+            .map(|r| format_commas(r.counts.total()).len())
+            .max()
+            .unwrap_or(1);
+        for r in &totals.by_repo {
+            let lbl = pad_right(&format!("[{}]", r.label), label_w);
+            let tot = pad_left(&format_commas(r.counts.total()), total_w);
+            out.push_str(&format!(
+                "{lbl}{col_gap}{tot} 行（代码 {} · 测试 {} · 文档 {}）\n",
+                format_commas(r.counts.code),
+                format_commas(r.counts.test),
+                format_commas(r.counts.docs),
+            ));
+        }
+    }
+
     for err in errors {
         out.push_str(&format!("（{} 读取失败：{}）\n", err.label, err.error));
     }
@@ -1322,6 +1787,7 @@ fn render_json(
     now_ep: i64,
     windows: &[WindowResult],
     daily_7d: &[DailyPoint],
+    totals: &TotalLinesSummary,
     errors: &[RepoError],
 ) -> Value {
     let windows_json: Vec<Value> = windows
@@ -1369,6 +1835,42 @@ fn render_json(
             })
         })
         .collect();
+    let total_by_repo_json: Vec<Value> = totals
+        .by_repo
+        .iter()
+        .map(|r| {
+            json!({
+                "repo": r.label,
+                "path": r.path.display().to_string(),
+                "head": r.head,
+                "total": r.counts.total(),
+                "code": r.counts.code,
+                "test": r.counts.test,
+                "docs": r.counts.docs,
+            })
+        })
+        .collect();
+    let daily_totals_json: Vec<Value> = totals
+        .daily_totals
+        .iter()
+        .map(|d| {
+            json!({
+                "date": d.date,
+                "total": d.counts.total(),
+                "code": d.counts.code,
+                "test": d.counts.test,
+                "docs": d.counts.docs,
+            })
+        })
+        .collect();
+    let total_lines_json = json!({
+        "total": totals.counts.total(),
+        "code": totals.counts.code,
+        "test": totals.counts.test,
+        "docs": totals.counts.docs,
+        "byRepo": total_by_repo_json,
+        "dailyTotals": daily_totals_json,
+    });
     let errors_json: Vec<Value> = errors
         .iter()
         .map(|e| {
@@ -1382,6 +1884,7 @@ fn render_json(
     json!({
         "generatedAt": format_epoch(now_ep, false, "%Y-%m-%dT%H:%M:%SZ"),
         "generatedEpoch": now_ep,
+        "totalLines": total_lines_json,
         "windows": windows_json,
         "daily7d": daily_json,
         "errors": errors_json,
@@ -1469,6 +1972,7 @@ pub fn command(args: &[String]) -> Res<i32> {
         .unwrap_or(now_ep - SEVEN_DAYS_SECS)
         .min(now_ep - SEVEN_DAYS_SECS);
 
+    let today_ymd = format_epoch(now_ep, true, "%Y-%m-%d");
     let mut cache = load_cache(&state);
     let mut cache_dirty = false;
     let mut repos_data: Vec<RepoData> = Vec::new();
@@ -1496,33 +2000,32 @@ pub fn command(args: &[String]) -> Res<i32> {
                 path: repo,
                 head: String::new(),
                 commits: Vec::new(),
+                total_lines: TotalLineCounts::default(),
+                daily_totals: Vec::new(),
             });
             continue;
         };
 
         let cache_key = repo.display().to_string();
-        let cached_hit = cache.get(&cache_key).filter(|ent| {
-            ent.head == head_sha
-                && ent.exclude_rules == exclude_rules
-                && ent.covered_since <= earliest_needed
-        });
-        let commits = if let Some(ent) = cached_hit {
-            ent.commits.clone()
+        let existing_entry = cache.get(&cache_key).cloned();
+        let head_and_rules_match = existing_entry
+            .as_ref()
+            .is_some_and(|ent| ent.head == head_sha && ent.exclude_rules == exclude_rules);
+        let commits_hit = head_and_rules_match
+            && existing_entry
+                .as_ref()
+                .is_some_and(|ent| ent.covered_since <= earliest_needed);
+
+        let (commits, total_lines, daily_totals) = if commits_hit {
+            let ent = existing_entry.as_ref().unwrap();
+            (
+                ent.commits.clone(),
+                ent.total_lines,
+                ent.daily_totals.clone(),
+            )
         } else {
-            match fetch_repo_commits_git(&repo, &head_sha, earliest_needed, &exclude_rules) {
-                Ok(list) => {
-                    cache.insert(
-                        cache_key,
-                        RepoCacheEntry {
-                            head: head_sha.clone(),
-                            exclude_rules,
-                            covered_since: earliest_needed,
-                            commits: list.clone(),
-                        },
-                    );
-                    cache_dirty = true;
-                    list
-                }
+            let commits = match fetch_repo_commits_git(&repo, &head_sha, earliest_needed, &exclude_rules) {
+                Ok(list) => list,
                 Err(err) => {
                     errors.push(RepoError {
                         label,
@@ -1531,7 +2034,48 @@ pub fn command(args: &[String]) -> Res<i32> {
                     });
                     continue;
                 }
-            }
+            };
+            let (total_lines, daily_totals) = if head_and_rules_match {
+                let ent = existing_entry.as_ref().unwrap();
+                (ent.total_lines, ent.daily_totals.clone())
+            } else {
+                let total_lines = match compute_repo_total_lines(&repo, &head_sha, &exclude_rules) {
+                    Ok(t) => t,
+                    Err(err) => {
+                        errors.push(RepoError {
+                            label,
+                            path: repo,
+                            error: err,
+                        });
+                        continue;
+                    }
+                };
+                let mut daily_totals = existing_entry
+                    .as_ref()
+                    .filter(|ent| ent.exclude_rules == exclude_rules)
+                    .map(|ent| ent.daily_totals.clone())
+                    .unwrap_or_default();
+                upsert_daily_total(
+                    &mut daily_totals,
+                    today_ymd.clone(),
+                    head_sha.clone(),
+                    total_lines,
+                );
+                (total_lines, daily_totals)
+            };
+            cache.insert(
+                cache_key,
+                RepoCacheEntry {
+                    head: head_sha.clone(),
+                    exclude_rules,
+                    covered_since: earliest_needed,
+                    commits: commits.clone(),
+                    total_lines,
+                    daily_totals: daily_totals.clone(),
+                },
+            );
+            cache_dirty = true;
+            (commits, total_lines, daily_totals)
         };
 
         repos_data.push(RepoData {
@@ -1539,6 +2083,8 @@ pub fn command(args: &[String]) -> Res<i32> {
             path: repo,
             head: head_sha,
             commits,
+            total_lines,
+            daily_totals,
         });
     }
 
@@ -1690,10 +2236,45 @@ pub fn command(args: &[String]) -> Res<i32> {
         });
     }
 
+    // Aggregate total lines across repos + cached daily trend points (never backfilling history).
+    let mut global_totals = TotalLineCounts::default();
+    let mut repo_totals: Vec<RepoTotalResult> = Vec::with_capacity(repos_data.len());
+    for rd in &repos_data {
+        global_totals.add(rd.total_lines);
+        repo_totals.push(RepoTotalResult {
+            label: rd.label.clone(),
+            path: rd.path.clone(),
+            head: rd.head.clone(),
+            counts: rd.total_lines,
+        });
+    }
+    repo_totals.sort_by(|a, b| {
+        b.counts
+            .total()
+            .cmp(&a.counts.total())
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    let per_repo_daily: Vec<&[DailyTotalPoint]> = repos_data
+        .iter()
+        .map(|rd| rd.daily_totals.as_slice())
+        .collect();
+    let global_daily_totals = aggregate_global_daily_totals(&per_repo_daily);
+    let total_summary = TotalLinesSummary {
+        counts: global_totals,
+        by_repo: repo_totals,
+        daily_totals: global_daily_totals,
+    };
+
     if json_mode {
-        println!("{}", render_json(now_ep, &results, &daily_7d, &errors));
+        println!(
+            "{}",
+            render_json(now_ep, &results, &daily_7d, &total_summary, &errors)
+        );
     } else {
-        print!("{}", render_human(&results, by_repo, &repo_order, &errors));
+        print!(
+            "{}",
+            render_human(&results, &total_summary, by_repo, &repo_order, &errors)
+        );
     }
     Ok(0)
 }
@@ -1827,12 +2408,114 @@ mod tests {
             lines_per_million_tokens: Some(35.0),
             by_repo: vec![],
         };
-        let rendered = render_human(&[w24], false, &[], &[]);
+        let totals = TotalLinesSummary {
+            counts: TotalLineCounts {
+                code: 10000,
+                test: 3000,
+                docs: 500,
+            },
+            by_repo: vec![],
+            daily_totals: vec![],
+        };
+        let rendered = render_human(&[w24], &totals, false, &[], &[]);
         assert!(rendered.starts_with("代码改动（各仓库默认分支，不含合并提交与生成文件）\n"));
+        assert!(
+            rendered.contains("当前总量  13,500 行（代码 10,000 · 测试 3,000 · 文档 500）"),
+            "{rendered}"
+        );
         assert!(rendered.contains("+1,204 / \u{2212}310"), "{rendered}");
         assert!(rendered.contains("委派占比"), "{rendered}");
         assert!(rendered.contains("82%"), "{rendered}");
         assert!(rendered.contains("每百万 token"), "{rendered}");
         assert!(rendered.contains("35 行"), "{rendered}");
+    }
+
+    #[test]
+    fn parse_ls_tree_z_skips_submodules_symlinks_and_excluded_files() {
+        let raw = concat!(
+            "100644 blob 1111111111111111111111111111111111111111\tsrc/main.rs\0",
+            "100755 blob 2222222222222222222222222222222222222222\tscripts/verify.sh\0",
+            "160000 commit 3333333333333333333333333333333333333333\tthird_party/pi-kit\0",
+            "120000 blob 4444444444444444444444444444444444444444\tlink.rs\0",
+            "100644 blob 5555555555555555555555555555555555555555\tCargo.lock\0",
+            "100644 blob 6666666666666666666666666666666666666666\ttests/foo.rs\0",
+            "100644 blob 7777777777777777777777777777777777777777\tREADME.md\0",
+        )
+        .as_bytes();
+        let parsed = parse_ls_tree_z(raw, &[]);
+        let paths: Vec<&str> = parsed.iter().map(|(_, p)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["src/main.rs", "scripts/verify.sh", "tests/foo.rs", "README.md"]
+        );
+    }
+
+    #[test]
+    fn upsert_daily_total_deduplicates_by_date_and_sorts() {
+        let mut pts = Vec::new();
+        let c1 = TotalLineCounts { code: 100, test: 20, docs: 5 };
+        let c2 = TotalLineCounts { code: 120, test: 25, docs: 5 };
+        let c3 = TotalLineCounts { code: 90, test: 10, docs: 5 };
+        upsert_daily_total(&mut pts, "2026-11-27".into(), "h1".into(), c1);
+        upsert_daily_total(&mut pts, "2026-11-25".into(), "h0".into(), c3);
+        upsert_daily_total(&mut pts, "2026-11-27".into(), "h2".into(), c2);
+        assert_eq!(pts.len(), 2);
+        assert_eq!(pts[0].date, "2026-11-25");
+        assert_eq!(pts[0].counts, c3);
+        assert_eq!(pts[1].date, "2026-11-27");
+        assert_eq!(pts[1].head, "h2");
+        assert_eq!(pts[1].counts, c2);
+    }
+
+    #[test]
+    fn aggregate_global_daily_totals_aligns_to_common_start_date_across_repos() {
+        let repo_a = vec![
+            DailyTotalPoint {
+                date: "2026-11-25".into(),
+                head: "a1".into(),
+                counts: TotalLineCounts { code: 40_000, test: 8_000, docs: 2_000 },
+            },
+            DailyTotalPoint {
+                date: "2026-11-27".into(),
+                head: "a2".into(),
+                counts: TotalLineCounts { code: 41_000, test: 8_000, docs: 2_000 },
+            },
+        ];
+        // Repo B was registered later on 2026-11-27: must not emit 2026-11-25 (50k -> 401k jump).
+        let repo_b_late = vec![DailyTotalPoint {
+            date: "2026-11-27".into(),
+            head: "b1".into(),
+            counts: TotalLineCounts { code: 300_000, test: 40_000, docs: 10_000 },
+        }];
+        let empty_repo: Vec<DailyTotalPoint> = Vec::new();
+        let aligned = aggregate_global_daily_totals(&[
+            repo_a.as_slice(),
+            repo_b_late.as_slice(),
+            empty_repo.as_slice(),
+        ]);
+        assert_eq!(aligned.len(), 1);
+        assert_eq!(aligned[0].date, "2026-11-27");
+        assert_eq!(aligned[0].counts.total(), 401_000);
+
+        // When repo B also has a point on 2026-11-26, both 11-26 (carry-forward A from 11-25)
+        // and 11-27 are emitted accurately.
+        let repo_b_two = vec![
+            DailyTotalPoint {
+                date: "2026-11-26".into(),
+                head: "b0".into(),
+                counts: TotalLineCounts { code: 299_000, test: 40_000, docs: 10_000 },
+            },
+            DailyTotalPoint {
+                date: "2026-11-27".into(),
+                head: "b1".into(),
+                counts: TotalLineCounts { code: 300_000, test: 40_000, docs: 10_000 },
+            },
+        ];
+        let two_days = aggregate_global_daily_totals(&[repo_a.as_slice(), repo_b_two.as_slice()]);
+        assert_eq!(two_days.len(), 2);
+        assert_eq!(two_days[0].date, "2026-11-26");
+        assert_eq!(two_days[0].counts.total(), 399_000);
+        assert_eq!(two_days[1].date, "2026-11-27");
+        assert_eq!(two_days[1].counts.total(), 401_000);
     }
 }

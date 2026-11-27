@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `delegate`：`delegate lines` 与 TUI 新增各已登记仓库默认分支 HEAD 总行数统计（复用 `code`/`test`/`docs` 三类口径与现有排除规则，并排除二进制、`git check-attr` 标记的 `binary`/`generated`/`vendored` 文件及 `160000` 子模块），按 `(HEAD, excludeRules)` 缓存至 `<state>/line-stats-cache.json`（命中零 git 子进程）并按日沉淀已缓存走势点 `dailyTotals`；`delegate lines --json` 新增 `totalLines` 字段，TUI 总览「代码改动」卡片首行并列展示全局总行数与 24h/7d 改动并在卡片内紧凑列出各仓分类，「3 运行」按仓分组标题旁附简短总行数。
 - `delegate`：审查员任务说明（`original_task_brief`）补齐本链全部已投递的运行中追加（`in_run`/`steer` `appends.json`，排除已转为子 run 的 `fallback` 项），与各轮 `reply` 按时间序拼接并显式标明「后来的决定覆盖原说明、冲突时在结论里明说依据哪条」，同步更新默认审查要点（`review-rubric.md`），避免审查员只看原说明误判返工。
 - `delegate`：新增无记忆新手回放脚本 `scripts/eval-novice.py` 与 4 场景夹具 `evals/novice-fixtures/`（S1 黄金路径、S2 冲突恢复、S3 并行等待、S4 提问与工作项闭环），在隔离临时仓与 `fake_pi` 下确定性检出无效步数（`exit 2`、`exit 76`、手写轮询、未合入旧树跑测试、缺 `Delegate-Run:` trailer、重复读文件）；默认零 token 脚本化回放纳入 `scripts/verify.sh`，真实模型回放经 `--model` 按需触发。
 - `delegate`：新增漏网缺陷记账约定（修复提交附 `Fixes-Run: <原 run-id>`，支持多行；`apply --commit` 不自动添加且原样保留）与 `delegate escapes [--since 30d] [--repo PATH] [--json]` 命令，按 `Delegate-Run:`/`Fixes-Run:` trailer 读取活跃或归档 run meta，按审查模型、写手模型与类别统计合入数、漏出数及比例，未找到 meta 的单独计入「未知 run」。

@@ -400,8 +400,70 @@ class DelegateLinesTests(unittest.TestCase):
             self.assertEqual(r2.returncode, 0, r2.stderr)
             d2 = json.loads(r2.stdout)
             self.assertEqual(d2["windows"][0]["total"], {"added": 3, "deleted": 0, "churn": 3})
+            # seed.txt (1 line) + x.rs (3 lines) = 4 lines
+            self.assertEqual(d2["totalLines"]["total"], 4)
+            self.assertEqual(d2["totalLines"]["code"], 4)
         finally:
             self.env["PATH"] = old_path
+
+    def test_total_lines_excludes_binary_gitattrs_locks_and_submodules(self):
+        now = int(time.time())
+        sub = _init_repo(self.work / "sub-dep", now - 20 * 86400)
+        _commit_files(sub, {"dep.rs": "1\n2\n3\n4\n5\n"}, "init sub", now - 10 * 86400)
+
+        repo = _init_repo(self.work / "repo-total", now - 10 * 86400)
+        (repo / ".gitattributes").write_text(
+            "auto.rs linguist-generated=true\n"
+            "vendor.rs vendored\n"
+            "marked.dat binary\n",
+            encoding="utf-8",
+        )
+        (repo / "src").mkdir(parents=True, exist_ok=True)
+        (repo / "src/app.rs").write_text("fn main() {}\n// line2\n// line3", encoding="utf-8")  # 3 lines (no trailing LF)
+        (repo / "tests").mkdir(parents=True, exist_ok=True)
+        (repo / "tests/t.rs").write_text("a\nb\n", encoding="utf-8")  # 2 lines
+        (repo / "README.md").write_text("# Doc\nline2\nline3\nline4\n", encoding="utf-8")  # 4 lines
+        (repo / "Cargo.lock").write_text("lock1\nlock2\nlock3\n", encoding="utf-8")  # excluded by default glob
+        (repo / "auto.rs").write_text("gen1\ngen2\n", encoding="utf-8")  # excluded by linguist-generated
+        (repo / "vendor.rs").write_text("v1\nv2\n", encoding="utf-8")  # excluded by vendored
+        (repo / "marked.dat").write_text("m1\nm2\n", encoding="utf-8")  # excluded by binary attr
+        (repo / "raw.bin").write_bytes(b"abc\x00def\nline2\n")  # excluded by NUL byte check
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-m", "feat: seed files", commit_ts=now - 600)
+        # Add a gitlink submodule under third_party/sub-dep (mode 160000)
+        _git(
+            repo,
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            str(sub),
+            "third_party/sub-dep",
+        )
+        _git(repo, "commit", "-m", "chore: add submodule", commit_ts=now - 300)
+        # seed.txt (1) + .gitattributes (3) + .gitmodules (3) + src/app.rs (3) = 10 code lines
+        self._register_repos([repo])
+
+        res = self.cli("lines", "--json", cwd=self.work)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        data = json.loads(res.stdout)
+        tl = data["totalLines"]
+        self.assertEqual(tl["test"], 2)
+        self.assertEqual(tl["docs"], 4)
+        # code = seed.txt (1) + src/app.rs (3) + .gitattributes (3) + .gitmodules (3) = 10;
+        # excludes Cargo.lock, auto.rs, vendor.rs, marked.dat, raw.bin, and third_party/sub-dep/dep.rs
+        self.assertEqual(tl["code"], 10)
+        self.assertEqual(tl["total"], 16)
+        self.assertEqual(len(tl["byRepo"]), 1)
+        self.assertEqual(tl["byRepo"][0]["repo"], "repo-total")
+        self.assertEqual(tl["byRepo"][0]["total"], 16)
+        self.assertEqual(len(tl["dailyTotals"]), 1)
+        self.assertEqual(tl["dailyTotals"][0]["total"], 16)
+
+        hres = self.cli("lines", "--by", "repo", cwd=self.work)
+        self.assertEqual(hres.returncode, 0, hres.stderr)
+        self.assertIn("当前总量  16 行（代码 10 · 测试 2 · 文档 4）", hres.stdout)
+        self.assertIn("各仓总量", hres.stdout)
 
     def test_apply_commit_writes_delegate_run_trailer(self):
         repo = self.repo({"seed.txt": "seed\n"})

@@ -5,7 +5,7 @@ use crate::app::{
 use crate::data::read_work_brief_markdown;
 use crate::markdown::render_markdown;
 use crate::model::*;
-use crate::ui_overview::render_overview_pane;
+use crate::ui_overview::{format_lines_compact, render_overview_pane};
 use crate::ui_quota::render_quota_tab;
 use crate::width::{display_width, pad_left, pad_right, truncate, wrap_text};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -827,7 +827,20 @@ fn render_list_pane(frame: &mut Frame, app: &mut App, area: Rect) {
         let selected = app.selected_row == Some(row_idx);
         let line = match *row {
             ListRow::RepoHeader { repo_idx } => {
-                render_repo_header(&app.snapshot.repos[repo_idx], inner_w)
+                let repo = &app.snapshot.repos[repo_idx];
+                let repo_total = app
+                    .snapshot
+                    .line_stats
+                    .as_ref()
+                    .and_then(|ls| ls.total_lines.as_ref())
+                    .and_then(|tl| {
+                        tl.by_repo
+                            .iter()
+                            .find(|r| !r.path.is_empty() && r.path == repo.path)
+                            .or_else(|| tl.by_repo.iter().find(|r| r.repo == repo.label))
+                            .map(|r| r.counts.total)
+                    });
+                render_repo_header(repo, repo_total, inner_w)
             }
             ListRow::GroupHeader {
                 repo_idx,
@@ -944,7 +957,7 @@ fn render_col_header(cols: ColWidths, width: usize) -> Line<'static> {
     Line::from(Span::styled(truncate(&s, width), muted()))
 }
 
-fn render_repo_header(repo: &RepoGroup, width: usize) -> Line<'static> {
+fn render_repo_header(repo: &RepoGroup, total_lines: Option<u64>, width: usize) -> Line<'static> {
     let counts = format!(
         "待{} 运{} 排{} 合{}",
         repo.count_group(GroupKind::Pending),
@@ -954,15 +967,30 @@ fn render_repo_header(repo: &RepoGroup, width: usize) -> Line<'static> {
     );
     let counts_w = display_width(&counts);
     let prefix = "▌ ";
-    let avail_label = width.saturating_sub(display_width(prefix) + counts_w + 2);
+    let lines_note = total_lines
+        .filter(|&n| n > 0)
+        .map(|n| format!(" · 总 {}", format_lines_compact(n)))
+        .unwrap_or_default();
+    let note_w = display_width(&lines_note);
+    let avail_without_note = width.saturating_sub(display_width(prefix) + counts_w + 2);
+    let show_note = note_w > 0 && avail_without_note > note_w + 4;
+    let used_note = if show_note { lines_note } else { String::new() };
+    let used_note_w = display_width(&used_note);
+    let avail_label = avail_without_note.saturating_sub(used_note_w);
     let label = truncate(&repo.label, avail_label);
-    let gap = width.saturating_sub(display_width(prefix) + display_width(&label) + counts_w);
-    Line::from(vec![
+    let gap = width.saturating_sub(
+        display_width(prefix) + display_width(&label) + used_note_w + counts_w,
+    );
+    let mut spans = vec![
         Span::styled(prefix, muted()),
         Span::styled(label, bold_primary()),
-        Span::raw(" ".repeat(gap)),
-        Span::styled(counts, muted()),
-    ])
+    ];
+    if !used_note.is_empty() {
+        spans.push(Span::styled(used_note, muted()));
+    }
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.push(Span::styled(counts, muted()));
+    Line::from(spans)
 }
 
 fn render_group_header(group: GroupKind, count: usize, cross_repo: bool, width: usize) -> Line<'static> {

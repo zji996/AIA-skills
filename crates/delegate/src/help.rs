@@ -215,7 +215,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "lines",
-        "Count added/deleted lines across registered repositories' default branches over 24h and 7d (code/test/docs, delegated share, lines per 1M tokens).",
+        "Count total HEAD lines and 24h/7d added/deleted lines across registered repositories' default branches (code/test/docs, delegated share, lines per 1M tokens).",
     ),
     (
         "escapes",
@@ -540,10 +540,10 @@ fn command_spec(command: &str) -> Option<CommandSpec> {
             ("--all", "Include non-agy (Pi) runs in addition to agy runs."),
             ("--json", "Print structured JSON output."),
         ]),
-        "lines" => ("[--since DURATION] [--by repo] [--json]", "Count added and deleted lines across registered repositories' default branches (--no-merges -M, excluding binaries, lockfiles, and generated/snapshot files, configurable via .delegate.json lineStats.exclude). Shows 24h and 7d columns by default (or one column with --since), delegated share (commits with Delegate-Run trailer), and lines per million tokens across full reply chains.", &[
+        "lines" => ("[--since DURATION] [--by repo] [--json]", "Count total tracked HEAD lines and added/deleted lines across registered repositories' default branches (--no-merges -M, excluding binaries, gitattributes generated/vendored/binary, submodules, lockfiles, and generated/snapshot files, configurable via .delegate.json lineStats.exclude). Shows total lines plus 24h and 7d columns by default (or one column with --since), delegated share (commits with Delegate-Run trailer), and lines per million tokens across full reply chains.", &[
             ("--since DURATION", "Show a single custom window instead of the default 24h + 7d columns (e.g. 12h, 24h, 7d, 30d)."),
-            ("--by repo", "Include a per-repository breakdown sorted by 7d (or window) churn descending."),
-            ("--json", "Print complete structured camelCase JSON output including daily7d totals."),
+            ("--by repo", "Include a per-repository breakdown sorted by 7d (or window) churn descending plus per-repo total lines."),
+            ("--json", "Print complete structured camelCase JSON output including totalLines (byRepo, dailyTotals) and daily7d."),
         ]),
         "escapes" => ("[--since DURATION|all] [--repo PATH] [--json]", "Scan git log for `Delegate-Run:` and `Fixes-Run:` trailers, resolve each referenced run's author model, reviewer model, and class (including archived runs), and report merged count, escaped count, and escape rate per reviewer/author model and class. Unresolvable `Fixes-Run:` targets are counted separately as unknown runs.", &[
             ("--since DURATION|all", "Time window to scan in git log (default: 30d; e.g. 7d, 30d, 90d, all)."),

@@ -4252,6 +4252,77 @@ pub fn parse_line_stats_json(raw: &str) -> Result<LineStatsSnapshot, String> {
                 .collect()
         })
         .unwrap_or_default();
+    let total_lines = v.get("totalLines").and_then(Value::as_object).map(|tl| {
+        let code = tl.get("code").and_then(Value::as_u64).unwrap_or(0);
+        let test = tl.get("test").and_then(Value::as_u64).unwrap_or(0);
+        let docs = tl.get("docs").and_then(Value::as_u64).unwrap_or(0);
+        let total = tl
+            .get("total")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| code.saturating_add(test).saturating_add(docs));
+        let by_repo = tl
+            .get("byRepo")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| {
+                        let repo = r.get("repo")?.as_str()?.to_string();
+                        let path = r
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let head = r
+                            .get("head")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let rc = r.get("code").and_then(Value::as_u64).unwrap_or(0);
+                        let rt = r.get("test").and_then(Value::as_u64).unwrap_or(0);
+                        let rd = r.get("docs").and_then(Value::as_u64).unwrap_or(0);
+                        let rtot = r
+                            .get("total")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_else(|| rc.saturating_add(rt).saturating_add(rd));
+                        Some(RepoTotalLines {
+                            repo,
+                            path,
+                            head,
+                            counts: TotalLineCounts {
+                                total: rtot,
+                                code: rc,
+                                test: rt,
+                                docs: rd,
+                            },
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let daily_totals = tl
+            .get("dailyTotals")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|d| {
+                        let date = d.get("date")?.as_str()?.to_string();
+                        let dt = d.get("total").and_then(Value::as_u64)?;
+                        Some(DailyTotalLinesPoint { date, total: dt })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        TotalLinesSnapshot {
+            counts: TotalLineCounts {
+                total,
+                code,
+                test,
+                docs,
+            },
+            by_repo,
+            daily_totals,
+        }
+    });
     let errors = v
         .get("errors")
         .and_then(Value::as_array)
@@ -4269,6 +4340,7 @@ pub fn parse_line_stats_json(raw: &str) -> Result<LineStatsSnapshot, String> {
         win_24h,
         win_7d,
         daily_7d,
+        total_lines,
         errors,
     })
 }

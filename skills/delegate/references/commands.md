@@ -43,7 +43,7 @@
 | `lane [--label <文字>] [--measure] [--] <命令>` | 整机重任务队列执行命令，结束时在 `lane_released` 记录子进程树 `cpuUserSecs`/`cpuSysSecs`/`maxRssKb`（`events` 与 `--measure` 摘要显示 CPU user/sys、墙钟与 CPU/墙钟 比）；`--measure` 预约核串行排队，退出码原样返回；无参列占用 |
 | `agy account <list\|status\|add\|use\|note\|remove\|import-agy-swap\|restore-entry>` | 手工管理本地 `agy` 账号槽位与余量快照（不自动轮换、不调额度接口），见 [agy 账号](agy-accounts.md) |
 | `usage [--since 24h\|7d] [--by account\|day\|run\|repo] [--account ID] [--repo PATH] [--all] [--json]` | 按账号/日/run/仓库汇总本地 `agy` 用量（作者与审查员分列，运行中未计单列） |
-| `lines [--since <时长>] [--by repo] [--json]` | 统计各已登记仓库默认分支近 24h/7d 增减行数（代码/测试/文档、委派占比与每百万 token 产出，按 HEAD 缓存，支持 `.delegate.json` `lineStats.exclude`） |
+| `lines [--since <时长>] [--by repo] [--json]` | 统计各已登记仓库默认分支当前总行数与近 24h/7d 增减行数（代码/测试/文档、各仓明细与缓存日走势、委派占比与每百万 token 产出，按 HEAD 缓存，支持 `.delegate.json` `lineStats.exclude`） |
 | `escapes [--since 30d] [--repo PATH] [--json]` | 按 `Delegate-Run:` 与 `Fixes-Run:` trailer 统计合入后漏网缺陷（按审查模型、写手模型与类别汇总合入数、漏出数与比例，支持已归档 run，未知 run 单列计数） |
 | `speed [--since 7d\|14d\|all] [--repo PATH] [--json]` | 从 `events.jsonl` 按仓库校准工期参数（`t_chain`/`t_crit`/`P_eff`/`T_merge`、返工率、只读链），写 `<state>/speed/<repo-slug>.jsonl` 并标 `±20%` 漂移，见 [容量与工期](capacity.md) |
 
