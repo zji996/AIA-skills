@@ -29,7 +29,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -7204,6 +7204,14 @@ fn cmd_status(args: &[String]) -> Res<i32> {
     Ok(0)
 }
 
+fn temp_home_has_core_token(temp_home: &Path) -> bool {
+    CRED_FILES.iter().any(|cf| {
+        cf.is_core_token
+            && fs::metadata(temp_home.join(cf.home_rel))
+                .is_ok_and(|m| m.is_file() && m.len() > 0)
+    })
+}
+
 fn cmd_add(args: &[String]) -> Res<i32> {
     let mut main_args = Vec::new();
     let mut passthrough_args = Vec::new();
@@ -7293,15 +7301,34 @@ fn cmd_add(args: &[String]) -> Res<i32> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     preserve_real_toolchain_envs(&mut cmd, &real_home);
-    let status = cmd
-        .status()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("failed to run {}: {e}", agy_bin.display()))?;
+    let mut prompted_logged_in = false;
+    let status = loop {
+        if let Some(st) = child
+            .try_wait()
+            .map_err(|e| format!("failed while waiting for {}: {e}", agy_bin.display()))?
+        {
+            break st;
+        }
+        if !json_out && !prompted_logged_in && temp_home_has_core_token(&temp_home.path) {
+            prompted_logged_in = true;
+            let mut err = std::io::stderr().lock();
+            if err.is_terminal() {
+                let _ = write!(
+                    err,
+                    "\r\n\x1b[1;32m>>> 已登录，按两次 Ctrl+D 退出 agy 即保存 <<<\x1b[0m\r\n"
+                );
+            } else {
+                let _ = writeln!(err, ">>> 已登录，按两次 Ctrl+D 退出 agy 即保存 <<<");
+            }
+            let _ = err.flush();
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
 
-    let has_core = CRED_FILES.iter().any(|cf| {
-        cf.is_core_token
-            && fs::metadata(temp_home.path.join(cf.home_rel))
-                .is_ok_and(|m| m.is_file() && m.len() > 0)
-    });
+    let has_core = temp_home_has_core_token(&temp_home.path);
     if !has_core {
         return Err(format!(
             "agy exited ({}) without writing OAuth credential files in temporary HOME; no account saved",
@@ -7381,6 +7408,7 @@ fn cmd_add(args: &[String]) -> Res<i32> {
             files.len(),
             state["active"].as_str().unwrap_or("none")
         );
+        println!("其他机器跑 lan-agent-sync 同步新槽位。");
         println!("Next: delegate agy account use {id}");
     }
     Ok(0)
@@ -8701,7 +8729,8 @@ fn cmd_pick(args: &[String]) -> Res<i32> {
 
 fn print_account_help() {
     println!(
-        "Usage: delegate agy account <subcommand> [options]\n\n\
+        "Usage: delegate agy account <subcommand> [options]\n\
+         \x20      delegate agy login [<id>] [--label TEXT] [--overwrite] [--agy-bin PATH] [-- <agy-args>...]\n\n\
          Manage local Antigravity CLI (agy) accounts (~/.config/delegate/agy-accounts/).\n\
          Real quota uses `agy -p /usage </dev/null` only (no internal HTTP APIs).\n\n\
          Subcommands:\n\
@@ -8711,7 +8740,7 @@ fn print_account_help() {
          \x20                                      Show active account, live email, quota, usage, running agy\n\
          \x20 pick [--model ALIAS] [--json]        Read-only dry-run: show which account a new session would pick from cache\n\
          \x20 add [<id>] [--label TEXT] [--overwrite] [--agy-bin PATH] [-- <agy-args>...]\n\
-         \x20                                      Run interactive agy login in a temp HOME and save slot\n\
+         \x20                                      Run interactive agy login in a temp HOME and save slot (alias: `delegate agy login`)\n\
          \x20 use <id|auto> [--force] [--json]     Switch to a fixed slot (updates ~/.gemini) or `auto` (auto-select per pool without touching ~/.gemini)\n\
          \x20 note <id> [--weekly PCT] [--five-hour PCT] [--clear] [--json]\n\
          \x20                                      Record manual remaining-% snapshot (fallback when real quota absent)\n\
@@ -8732,9 +8761,20 @@ pub fn command(args: &[String]) -> Res<i32> {
         print_account_help();
         return Ok(0);
     }
+    if first == "login" {
+        let sub_args = &args[1..];
+        if sub_args
+            .first()
+            .is_some_and(|a| matches!(a.as_str(), "-h" | "--help" | "help"))
+        {
+            print_account_help();
+            return Ok(0);
+        }
+        return cmd_add(sub_args);
+    }
     if !matches!(first, "account" | "accounts") {
         return Err(format!(
-            "unknown agy subcommand {first:?} (expected: account)"
+            "unknown agy subcommand {first:?} (expected: account, login)"
         ));
     }
     let rest = &args[1..];
@@ -11329,5 +11369,35 @@ Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSum
             format_live_slot_line(&snap),
             "本机实盘：nova（只给手动运行的 agy 用，auto 不改它）"
         );
+    }
+
+    #[test]
+    fn temp_home_core_token_detection_accepts_two_file_minimal_login() {
+        let th = TempHome::create().unwrap();
+        assert!(!temp_home_has_core_token(&th.path));
+
+        // Non-core file alone is not enough.
+        let scope = th.path.join(".config/antigravity/credential-user-scope");
+        fs::create_dir_all(scope.parent().unwrap()).unwrap();
+        fs::write(&scope, "scope-only").unwrap();
+        assert!(!temp_home_has_core_token(&th.path));
+
+        // Empty core token file is not enough.
+        let tok = th.path.join(".gemini/antigravity-cli/antigravity-oauth-token");
+        fs::create_dir_all(tok.parent().unwrap()).unwrap();
+        fs::write(&tok, "").unwrap();
+        assert!(!temp_home_has_core_token(&th.path));
+
+        // Non-empty antigravity-cli token satisfies core check (new agy 2-file login).
+        fs::write(&tok, r#"{"id_token_email":"danny@example.test","token":{"access_token":"x"}}"#)
+            .unwrap();
+        assert!(temp_home_has_core_token(&th.path));
+    }
+
+    #[test]
+    fn agy_login_alias_help_and_unknown_subcommand_error() {
+        assert_eq!(command(&["login".into(), "--help".into()]).unwrap(), 0);
+        let err = command(&["bogus".into()]).unwrap_err();
+        assert!(err.contains("expected: account, login"), "unexpected err: {err}");
     }
 }

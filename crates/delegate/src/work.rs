@@ -1521,21 +1521,88 @@ fn find_archived_record(run_ref: &str) -> Option<PathBuf> {
     (matches.len() == 1).then(|| matches.remove(0))
 }
 
-/// Pure deterministic read-only check: has `run_ref` been applied?
-/// Never writes files or acquires locks.
+fn is_single_run_dir_applied(dir: &Path) -> bool {
+    if dir.join(".applied").exists() || dir.join(".applied-cleaned").exists() {
+        return true;
+    }
+    let meta = json(dir.join("meta.json"));
+    if !s(&meta, "appliedAt").is_empty() {
+        return true;
+    }
+    !runs::active(&runs::state(dir))
+        && crate::worktree::is_applied_in_repo_readonly(dir, &meta)
+}
+
+/// Collect strict descendants of `dir` in its reply/rework chain, ordered chronologically
+/// (matching `runs::chain_rounds`). Strictly read-only, zero git subprocesses, zero locks.
+fn run_descendants_chronological(dir: &Path) -> Vec<PathBuf> {
+    let chain = runs::chain_rounds(dir);
+    if chain.len() <= 1 {
+        return Vec::new();
+    }
+    let id_of = |d: &Path| -> String {
+        let m = json(d.join("meta.json"));
+        let r = s(&m, "run");
+        if !r.is_empty() {
+            r.to_string()
+        } else {
+            d.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    let root_id = id_of(dir);
+    if root_id.is_empty() {
+        return Vec::new();
+    }
+    let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
+    for r in &chain {
+        let m = json(r.join("meta.json"));
+        let rid = id_of(r);
+        let par = s(&m, "parent").to_string();
+        if !rid.is_empty() && !par.is_empty() {
+            children_of.entry(par).or_default().push(rid);
+        }
+    }
+    let mut desc_ids: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = vec![root_id];
+    while let Some(cur) = stack.pop() {
+        if let Some(kids) = children_of.get(&cur) {
+            for kid in kids {
+                if desc_ids.insert(kid.clone()) {
+                    stack.push(kid.clone());
+                }
+            }
+        }
+    }
+    if desc_ids.is_empty() {
+        return Vec::new();
+    }
+    chain
+        .into_iter()
+        .filter(|r| desc_ids.contains(&id_of(r)))
+        .collect()
+}
+
+/// Pure deterministic read-only check: has `run_ref` (including the final round of its
+/// reply/rework chain) been applied? Never writes files or acquires locks.
 pub fn is_run_applied(run_ref: &str, state: &Path, repo_hint: Option<&str>) -> bool {
     let empty_dirs = BTreeMap::new();
     if let Some(dir) = find_run_dir(run_ref, &empty_dirs, state) {
-        if dir.join(".applied").exists() || dir.join(".applied-cleaned").exists() {
-            return true;
+        let descendants = run_descendants_chronological(&dir);
+        if !descendants.is_empty() {
+            if descendants.iter().any(|d| runs::active(&runs::state(d))) {
+                return false;
+            }
+            return descendants
+                .last()
+                .is_some_and(|latest| is_single_run_dir_applied(latest));
         }
-        let meta = json(dir.join("meta.json"));
-        if !s(&meta, "appliedAt").is_empty() {
-            return true;
+        if runs::active(&runs::state(&dir)) {
+            return false;
         }
-        if !runs::active(&runs::state(&dir))
-            && crate::worktree::is_applied_in_repo_readonly(&dir, &meta)
-        {
+        if is_single_run_dir_applied(&dir) {
             return true;
         }
     }
@@ -11100,6 +11167,204 @@ mod tests {
             "unexpected ready focus: {}",
             ready_row.focus
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn after_applied_blocks_during_scout_and_question_and_unblocks_after_reply_chain_applied() {
+        let dir = temp_dir("after-applied-scout-question-reply-chain");
+        let state = dir.join("state");
+        let repo = dir.join("repo");
+        let wt_dir = dir.join("wt-reply");
+        let runs_dir = repo.join(".local/run/delegate");
+        let r1 = runs_dir.join("20261127-220108-parent-task");
+        let r2 = runs_dir.join("20261127-221702-reply-round");
+        let r3 = runs_dir.join("20261127-223000-rework-round");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&r1).unwrap();
+
+        let run_git = |cwd: &Path, args: &[&str]| {
+            let st = Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} in {} failed", cwd.display());
+        };
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_git(&repo, &["config", "user.name", "Test"]);
+        fs::write(repo.join("f.txt"), "v0\n").unwrap();
+        run_git(&repo, &["add", "f.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "init"]);
+        let base_sha = git_text(&repo, &["rev-parse", "HEAD"]).unwrap();
+
+        let runs_key = fs::canonicalize(&runs_dir).unwrap().to_string_lossy().into_owned();
+        let repo_key = fs::canonicalize(&repo).unwrap().to_string_lossy().into_owned();
+        write_json(
+            state.join("repos.json"),
+            &json!({"repos": {runs_key.clone(): {"repo": repo_key.clone(), "runs": runs_key}}}),
+        )
+        .unwrap();
+
+        // Defense-in-depth check: empty path must never resolve cwd's git HEAD.
+        assert_eq!(read_git_head(Path::new("")), None);
+
+        // 1. Scouting phase: `.scouting` present, no worktree.path, no netBase -> must NOT be applied.
+        write_json(
+            r1.join("meta.json"),
+            &json!({
+                "run": "20261127-220108-parent-task",
+                "mode": "write",
+                "startedNs": 1000u64,
+                "worktree": {"source": repo_key},
+                "netBase": null,
+            }),
+        )
+        .unwrap();
+        fs::write(r1.join(".scouting"), "1").unwrap();
+        fs::write(r1.join("supervisor.pid"), std::process::id().to_string()).unwrap();
+
+        let now_iso = iso();
+        let mut items = vec![WorkItem {
+            id: "W227".into(),
+            title: "downstream-after-applied".into(),
+            repo: repo_key.clone(),
+            state: "blocked".into(),
+            wait_on: vec!["run_applied:20261127-220108-parent-task".into()],
+            created_at: now_iso.clone(),
+            updated_at: now_iso.clone(),
+            state_since: now_iso,
+            ..Default::default()
+        }];
+
+        assert!(!is_run_applied("20261127-220108-parent-task", &state, Some(&repo_key)));
+        let prefetch = prefetch_reconcile_conditions(&state, &items, &[]);
+        {
+            let _guard = crate::locks::acquire_state(&state).unwrap();
+            let rec = reconcile_all_locked_with_prefetch(&state, &mut items, None, Some(&prefetch));
+            assert!(!rec.changed);
+            assert_eq!(items[0].state, "blocked");
+        }
+
+        // 2. Scout returned a question (`scoutQuestion: true`, `summary.json` answered/question,
+        //    `exit_code = 0`, `worktree.path` missing, `netBase: null`) -> must NOT be applied.
+        let _ = fs::remove_file(r1.join(".scouting"));
+        let _ = fs::remove_file(r1.join("supervisor.pid"));
+        let r1_meta = json!({
+            "run": "20261127-220108-parent-task",
+            "mode": "write",
+            "scoutQuestion": true,
+            "startedNs": 1000u64,
+            "worktree": {"source": repo_key},
+            "netBase": null,
+        });
+        write_json(r1.join("meta.json"), &r1_meta).unwrap();
+        write_json(
+            r1.join("summary.json"),
+            &json!({"state": "answered", "question": true, "scoutQuestion": true}),
+        )
+        .unwrap();
+        fs::write(r1.join("exit_code"), "0\n").unwrap();
+
+        assert!(!crate::worktree::is_applied_in_repo_readonly(&r1, &r1_meta));
+        assert!(!is_run_applied("20261127-220108-parent-task", &state, Some(&repo_key)));
+        let prefetch = prefetch_reconcile_conditions(&state, &items, &[]);
+        {
+            let _guard = crate::locks::acquire_state(&state).unwrap();
+            let rec = reconcile_all_locked_with_prefetch(&state, &mut items, None, Some(&prefetch));
+            assert!(!rec.changed);
+            assert_eq!(items[0].state, "blocked");
+        }
+
+        // 3. Reply round `r2` starts in a real worktree -> still running, must NOT unblock.
+        run_git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "wt-reply-branch", wt_dir.to_str().unwrap()],
+        );
+        let wt_key = fs::canonicalize(&wt_dir).unwrap().to_string_lossy().into_owned();
+        fs::create_dir_all(&r2).unwrap();
+        write_json(
+            r2.join("meta.json"),
+            &json!({
+                "run": "20261127-221702-reply-round",
+                "parent": "20261127-220108-parent-task",
+                "mode": "write",
+                "startedNs": 2000u64,
+                "worktree": {"source": repo_key, "path": wt_key},
+                "netBase": base_sha,
+            }),
+        )
+        .unwrap();
+        fs::write(r2.join("supervisor.pid"), std::process::id().to_string()).unwrap();
+        assert!(!is_run_applied("20261127-220108-parent-task", &state, Some(&repo_key)));
+
+        // 4. `r2` commits in worktree and finishes (not yet merged into source) -> still blocked.
+        let _ = fs::remove_file(r2.join("supervisor.pid"));
+        fs::write(wt_dir.join("f.txt"), "v1-from-reply\n").unwrap();
+        run_git(&wt_dir, &["add", "f.txt"]);
+        run_git(&wt_dir, &["commit", "-q", "-m", "reply work"]);
+        let r2_head = git_text(&wt_dir, &["rev-parse", "HEAD"]).unwrap();
+        write_json(
+            r2.join("summary.json"),
+            &json!({"state": "delivered", "question": false}),
+        )
+        .unwrap();
+        fs::write(r2.join("exit_code"), "0\n").unwrap();
+        assert!(!is_run_applied("20261127-220108-parent-task", &state, Some(&repo_key)));
+
+        // 5. Rework round `r3` (child of `r2`) exists and is unapplied -> even if `r2` had `.applied`,
+        //    chain is not finally applied until `r3` is applied.
+        fs::create_dir_all(&r3).unwrap();
+        write_json(
+            r3.join("meta.json"),
+            &json!({
+                "run": "20261127-223000-rework-round",
+                "parent": "20261127-221702-reply-round",
+                "mode": "write",
+                "startedNs": 3000u64,
+                "worktree": {"source": repo_key, "path": wt_key},
+                "netBase": base_sha,
+            }),
+        )
+        .unwrap();
+        write_json(
+            r3.join("summary.json"),
+            &json!({"state": "delivered", "question": false}),
+        )
+        .unwrap();
+        fs::write(r3.join("exit_code"), "0\n").unwrap();
+        assert!(!is_run_applied("20261127-220108-parent-task", &state, Some(&repo_key)));
+
+        // 6. Merge the reply/rework branch into source repo HEAD -> `is_run_applied` on parent `r1`
+        //    now returns true and W227 transitions to `ready`.
+        run_git(&repo, &["merge", "--ff-only", "-q", &r2_head]);
+        assert!(is_run_applied("20261127-220108-parent-task", &state, Some(&repo_key)));
+        let prefetch = prefetch_reconcile_conditions(&state, &items, &[]);
+        {
+            let _guard = crate::locks::acquire_state(&state).unwrap();
+            let rec = reconcile_all_locked_with_prefetch(&state, &mut items, None, Some(&prefetch));
+            assert!(rec.changed);
+            assert_eq!(items[0].state, "ready");
+        }
+
+        // 7. `detect_applied` on `r3` also propagates `.applied` all the way up to `r2` and `r1`
+        //    (even though `r1` is a `scoutQuestion` parent with no `worktree.path`).
+        let r3_meta = json(r3.join("meta.json"));
+        assert!(crate::worktree::detect_applied(&r3, &r3_meta));
+        assert!(r3.join(".applied").is_file());
+        assert!(r2.join(".applied").is_file());
+        assert!(
+            r1.join(".applied").is_file(),
+            "scoutQuestion parent without worktree.path must receive propagated .applied"
+        );
+        assert!(!s(&json(r1.join("meta.json")), "appliedAt").is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }

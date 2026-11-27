@@ -522,10 +522,11 @@ fn command_spec(command: &str) -> Option<CommandSpec> {
             ("--model ALIAS", "Probe one registered model instead; exclusive with --tier."),
             ("--timeout SECONDS", "Limit per model (default: 60)."),
         ]),
-        "agy" => ("account <list|status|add|use|note|remove|import-agy-swap|restore-entry> [options]", "Manage local Antigravity CLI (agy) credential slots under ~/.config/delegate/agy-accounts/ (0700 dirs, 0600 files). Manual switching only — no automatic rotation and no external quota API calls.", &[
+        "agy" => ("account <list|status|add|use|note|remove|import-agy-swap|restore-entry> [options] | login [<id>] [options]", "Manage local Antigravity CLI (agy) credential slots under ~/.config/delegate/agy-accounts/ (0700 dirs, 0600 files). Manual switching only — no automatic rotation and no external quota API calls.", &[
+            ("login [<id>] [--label TEXT] [--overwrite] [--agy-bin PATH]", "Alias for `account add`: run interactive agy login in an isolated temporary HOME and save credentials."),
             ("account list [--json]", "List saved slots, active marker, email, last used time, and 5h/7d local usage."),
             ("account status [--json]", "Show active slot, live ~/.gemini email, local usage, running agy processes, and local token expiry."),
-            ("account add [<id>] [--label TEXT] [--overwrite] [--agy-bin PATH]", "Run interactive agy login in an isolated temporary HOME and save credentials without affecting the active account."),
+            ("account add [<id>] [--label TEXT] [--overwrite] [--agy-bin PATH]", "Run interactive agy login in an isolated temporary HOME and save credentials without affecting the active account (alias: `delegate agy login`)."),
             ("account use <id> [--force] [--json]", "Save back live refreshed tokens to the active slot and atomically switch; running processes and existing sessions continue on their original account, while new runs use the switched account."),
             ("account note <id> [--weekly PCT] [--five-hour PCT] [--clear] [--json]", "Record manual remaining-% snapshot on a slot to estimate tokens/1% and remaining runtime from local usage (advisory only; no auto-switch)."),
             ("account remove <id> [--force] [--json]", "Delete a saved account slot without touching live ~/.gemini files."),

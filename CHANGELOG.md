@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `delegate`：修复 `work add --after-applied <run>` 在上游仍处于探路或提问阶段时误判已合入提前派发的问题（`read_git_head` 拒绝空路径、`is_applied_in_repo_readonly` 排除探路/提问态且要求非空 worktree 路径与基准提交、`is_run_applied` 按 reply/返工链最终轮次判定，`.applied` 同步向无 `worktree.path` 的提问父 run 传播）；`delegate agy account add`（新增别名 `delegate agy login [<id>]`）在登录期间检测到令牌文件落盘后于终端醒目提示一次「已登录，按两次 Ctrl+D 退出 agy 即保存」，保存成功后打印槽位名、识别邮箱、文件数及「其他机器跑 `lan-agent-sync`」，同步更新 `references/agy-accounts.md` 凭据说明（存在则保存，最少需要 `antigravity-cli` 令牌）。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
 
 ## delegate 6.56.0 - 2026-11-27

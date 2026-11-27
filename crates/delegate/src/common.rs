@@ -714,6 +714,9 @@ pub fn git_common_dir_fast(path: &Path) -> Option<PathBuf> {
 }
 /// Pure-filesystem resolution of `HEAD` commit SHA (<0.1ms, zero git subprocesses).
 pub fn read_git_head(repo: &Path) -> Option<String> {
+    if repo.as_os_str().is_empty() {
+        return None;
+    }
     let top = git_top_fast(repo)?;
     let dot_git = top.join(".git");
     let git_dir = if dot_git.is_dir() {

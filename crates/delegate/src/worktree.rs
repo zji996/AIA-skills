@@ -972,34 +972,49 @@ pub fn is_applied_in_repo_readonly(run: &Path, meta: &Value) -> bool {
         || !meta["worktree"].is_object()
         || !run.join("exit_code").is_file()
         || run.join(".generate-pending").exists()
+        || run.join(".scouting").exists()
+        || b(meta, "scoutQuestion")
     {
         return false;
+    }
+    let sum_path = run.join("summary.json");
+    if sum_path.is_file() {
+        let sum = json(&sum_path);
+        if b(&sum, "question") || b(&sum, "scoutQuestion") {
+            return false;
+        }
     }
     let root = Path::new(s(&meta["worktree"], "source"));
     if !root.is_dir() {
         return false;
     }
     let rec = json(run.join("changes.json"));
+    let wt_base = read(run.join("worktree-base-commit")).trim().to_string();
+    let base_head = if !wt_base.is_empty() {
+        wt_base.clone()
+    } else {
+        s(meta, "netBase").to_string()
+    };
     let wt_head = {
         let recorded = s(&rec, "worktreeHead").to_string();
         if !recorded.is_empty() {
             recorded
         } else {
-            let wt_dir = Path::new(s(&meta["worktree"], "path"));
-            read_git_head(wt_dir)
-                .filter(|h| h != s(meta, "netBase") && h != read(run.join("worktree-base-commit")).trim())
-                .unwrap_or_default()
+            let wt_path = s(&meta["worktree"], "path");
+            if wt_path.is_empty() {
+                String::new()
+            } else {
+                read_git_head(Path::new(wt_path))
+                    .filter(|h| h != s(meta, "netBase") && h.as_str() != wt_base.as_str())
+                    .unwrap_or_default()
+            }
         }
     };
-    let base_head = {
-        let wt_base = read(run.join("worktree-base-commit")).trim().to_string();
-        if !wt_base.is_empty() {
-            wt_base
-        } else {
-            s(meta, "netBase").to_string()
-        }
-    };
-    if !wt_head.is_empty() && commit_contained_in_head(root, &wt_head, &base_head) {
+    if !wt_head.is_empty()
+        && !base_head.is_empty()
+        && wt_head != base_head
+        && commit_contained_in_head(root, &wt_head, &base_head)
+    {
         return true;
     }
     let Some(entries) = recorded_entries(run, meta, &rec) else {
@@ -1175,7 +1190,10 @@ pub fn detect_applied(run: &Path, meta: &Value) -> bool {
                 break;
             }
             let pmeta = json(pdir.join("meta.json"));
-            if !wt_path.is_empty() && s(&pmeta["worktree"], "path") != wt_path {
+            let pwt_path = s(&pmeta["worktree"], "path");
+            let parent_has_no_wt = pwt_path.is_empty()
+                && (b(&pmeta, "scoutQuestion") || !pdir.join("changes.json").is_file());
+            if !wt_path.is_empty() && pwt_path != wt_path && !parent_has_no_wt {
                 break;
             }
             let prec = json(pdir.join("changes.json"));
@@ -1350,7 +1368,10 @@ pub fn mark_applied(
             break;
         }
         let pmeta = json(pdir.join("meta.json"));
-        if !wt_path.is_empty() && s(&pmeta["worktree"], "path") != wt_path {
+        let pwt_path = s(&pmeta["worktree"], "path");
+        let parent_has_no_wt = pwt_path.is_empty()
+            && (b(&pmeta, "scoutQuestion") || !pdir.join("changes.json").is_file());
+        if !wt_path.is_empty() && pwt_path != wt_path && !parent_has_no_wt {
             break;
         }
         chain.push(pdir.clone());

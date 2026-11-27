@@ -816,6 +816,56 @@ class Delegate638AgyAccountsTests(unittest.TestCase):
         self.assertEqual(entry.resolve(), real_bin.resolve())
         self.assertEqual(backup.read_text(), orig_wrapper)
 
+    def test_agy_login_alias_prompts_once_and_saves_two_file_minimal_creds(self):
+        fake_agy = self.home / "fake-agy-login.sh"
+        fake_agy.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "mkdir -p \"$HOME/.gemini/antigravity-cli\" \"$HOME/.config/antigravity\"\n"
+            "cat > \"$HOME/.gemini/antigravity-cli/antigravity-oauth-token\" <<'EOF'\n"
+            "{\n"
+            "  \"auth_method\": \"consumer\",\n"
+            "  \"id_token_email\": \"danny@example.test\",\n"
+            "  \"token\": {\n"
+            "    \"access_token\": \"DANNY-ACC-SECRET\",\n"
+            "    \"refresh_token\": \"DANNY-REF-SECRET\",\n"
+            "    \"expires_in\": 3599,\n"
+            "    \"expiry\": \"2026-11-28T05:00:00Z\",\n"
+            "    \"token_type\": \"Bearer\"\n"
+            "  }\n"
+            "}\n"
+            "EOF\n"
+            "printf 'scope-danny' > \"$HOME/.config/antigravity/credential-user-scope\"\n"
+            "sleep 0.6\n",
+            encoding="utf-8",
+        )
+        fake_agy.chmod(0o755)
+
+        res = self.run_cli("agy", "login", "danny", "--agy-bin", str(fake_agy))
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        hint = "已登录，按两次 Ctrl+D 退出 agy 即保存"
+        self.assertEqual(
+            res.stderr.count(hint),
+            1,
+            f"expected login hint exactly once in stderr, got:\n{res.stderr}",
+        )
+        self.assertIn("danny", res.stdout)
+        self.assertIn("danny@example.test", res.stdout)
+        self.assertIn("2 files", res.stdout)
+        self.assertIn("其他机器跑 lan-agent-sync", res.stdout)
+        # Tokens must never leak to stdout or stderr
+        self.assertNotIn("DANNY-ACC-SECRET", res.stdout + res.stderr)
+        self.assertNotIn("DANNY-REF-SECRET", res.stdout + res.stderr)
+
+        slot = self.home / ".config/delegate/agy-accounts/danny"
+        self.assertTrue((slot / "antigravity-cli-oauth-token").is_file())
+        self.assertTrue((slot / "credential-user-scope").is_file())
+        self.assertFalse((slot / "oauth_creds.json").exists())
+        self.assertEqual(stat.S_IMODE((slot / "antigravity-cli-oauth-token").stat().st_mode), 0o600)
+        state = json.loads((self.home / ".config/delegate/agy-accounts/accounts.json").read_text())
+        self.assertEqual(state["accounts"]["danny"]["email"], "danny@example.test")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2345,32 +2345,72 @@ fn apply_or_land(args: &[String], land_mode: bool) -> Res<i32> {
             }
             let path = s(&run_meta["worktree"], "path").to_string();
             let run_ns = run_meta["startedNs"].as_u64().unwrap_or(0);
-            for other in runs::all_runs() {
-                if other == *run {
-                    continue;
+            let mut propagate_targets: Vec<PathBuf> = Vec::new();
+            if !path.is_empty() {
+                for other in runs::all_runs() {
+                    if other == *run {
+                        continue;
+                    }
+                    let other_meta = json(other.join("meta.json"));
+                    let other_ns = other_meta["startedNs"].as_u64().unwrap_or(0);
+                    if s(&other_meta["worktree"], "path") == path
+                        && !runs::active(&runs::state(&other))
+                        && (other_ns <= run_ns || !runs::continues_conversation(&other))
+                    {
+                        propagate_targets.push(other);
+                    }
                 }
+            }
+            // Also propagate along inactive `parent` ancestors (including scoutQuestion parents
+            // that never created a worktree path).
+            let mut cur_dir = run.clone();
+            let mut cur_meta = run_meta.clone();
+            let mut seen_anc = std::collections::BTreeSet::new();
+            seen_anc.insert(events::run_id_for(run, &run_meta));
+            while !s(&cur_meta, "parent").is_empty() {
+                let parent_id = s(&cur_meta, "parent").to_string();
+                if !seen_anc.insert(parent_id.clone()) {
+                    break;
+                }
+                let Some(pdir) = cur_dir.parent().map(|d| d.join(&parent_id)) else {
+                    break;
+                };
+                if !pdir.join("meta.json").is_file() || pdir.join(".applied").exists() {
+                    break;
+                }
+                if runs::active(&runs::state(&pdir)) || runs::agent_alive(&pdir) {
+                    break;
+                }
+                let pmeta = json(pdir.join("meta.json"));
+                let pwt = s(&pmeta["worktree"], "path");
+                let parent_has_no_wt = pwt.is_empty()
+                    && (b(&pmeta, "scoutQuestion") || !pdir.join("changes.json").is_file());
+                if !path.is_empty() && pwt != path && !parent_has_no_wt {
+                    break;
+                }
+                if !propagate_targets.contains(&pdir) {
+                    propagate_targets.push(pdir.clone());
+                }
+                cur_dir = pdir;
+                cur_meta = pmeta;
+            }
+            for other in propagate_targets {
                 let mut other_meta = json(other.join("meta.json"));
-                let other_ns = other_meta["startedNs"].as_u64().unwrap_or(0);
-                if s(&other_meta["worktree"], "path") == path
-                    && !runs::active(&runs::state(&other))
-                    && (other_ns <= run_ns || !runs::continues_conversation(&other))
-                {
-                    let _ = write(other.join(".applied"), read(run.join(".applied")));
-                    if !s(&applied_json, "at").is_empty() {
-                        other_meta["appliedAt"] = applied_json["at"].clone();
-                    }
-                    if !s(&applied_json, "head").is_empty() {
-                        other_meta["appliedHead"] = applied_json["head"].clone();
-                    }
-                    let _ = write_json(other.join("meta.json"), &other_meta);
-                    if run.join(".sync-base").is_file() {
-                        let _ = write(other.join(".sync-base"), read(run.join(".sync-base")));
-                    }
-                    refs::pin_run(&other, &other_meta);
-                    index::upsert_run(&other);
-                    if !applied_runs.contains(&other) {
-                        applied_runs.push(other);
-                    }
+                let _ = write(other.join(".applied"), read(run.join(".applied")));
+                if !s(&applied_json, "at").is_empty() {
+                    other_meta["appliedAt"] = applied_json["at"].clone();
+                }
+                if !s(&applied_json, "head").is_empty() {
+                    other_meta["appliedHead"] = applied_json["head"].clone();
+                }
+                let _ = write_json(other.join("meta.json"), &other_meta);
+                if run.join(".sync-base").is_file() {
+                    let _ = write(other.join(".sync-base"), read(run.join(".sync-base")));
+                }
+                refs::pin_run(&other, &other_meta);
+                index::upsert_run(&other);
+                if !applied_runs.contains(&other) {
+                    applied_runs.push(other);
                 }
             }
         }

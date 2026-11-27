@@ -23,7 +23,7 @@
 
 ## 6.38 agy 本地多账号管理与迁移
 
-- 管理多个 `agy` 账号替代 `agy-swap`：`delegate agy account add <id>` 在隔离临时 HOME 跑交互登录并将 6 份凭据文件（`0700`/`0600`）收入 `~/.config/delegate/agy-accounts/<id>/`，不影响当前活跃账号；`list`/`status` 展示活跃槽位、最后使用时间与在跑 `agy` 进程，永不打印令牌、不调外部 Google 额度接口、不做自动轮换。Local manual `agy` multi-account slots with 0700/0600 permissions, isolated temp-HOME login, no auto-rotation, and no external quota polling.
+- 管理多个 `agy` 账号替代 `agy-swap`：`delegate agy account add <id>`（别名 `delegate agy login <id>`）在隔离临时 HOME 跑交互登录，检测到令牌落盘后在终端提示按两次 Ctrl+D 退出保存，按存在将凭据文件（最少需要 `antigravity-cli` 令牌，`0700`/`0600`）收入 `~/.config/delegate/agy-accounts/<id>/`，不影响当前活跃账号并提示其他机器跑 `lan-agent-sync`；`list`/`status` 展示活跃槽位、最后使用时间与在跑 `agy` 进程，永不打印令牌、不调外部 Google 额度接口、不做自动轮换。Local manual `agy` multi-account slots with 0700/0600 permissions, isolated temp-HOME login (`agy login` alias, Ctrl+D save hint), no auto-rotation, and no external quota polling.
 - 手动切换与防竞态：`delegate agy account use <id>` 持排他锁，先将当前活跃账号被 `agy` 刷新过的最新凭据回存到原槽位再原子替换并清理残留 `credential-user-scope`；同 HOME 存在在跑 `agy` 进程时拒绝切换并列出 PID 与 delegate run。File-locked manual account switch saving back refreshed tokens first and refusing while `agy` processes run in the same HOME.
 - 迁移与 TUI：`delegate agy account import-agy-swap --dry-run` 预览从 `agy-swap` vault/accounts 导入的槽位且不打印令牌，`restore-entry --dry-run` 预览备份并恢复 `~/.local/bin/agy` 为直连 `~/.local/libexec/agy` 的最小包装或符号链接；`delegate tui` 新增「6账号」页（`6`/`A` 切页、活跃标记、`Enter`/`u` 就地确认切换）。Dry-run/execute `agy-swap` import, entry-point restoration, and TUI Accounts tab with in-place switch confirmation.
 
