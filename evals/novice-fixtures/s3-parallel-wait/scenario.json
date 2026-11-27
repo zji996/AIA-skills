@@ -1,0 +1,59 @@
+{
+  "id": "s3-parallel-wait",
+  "title": "S3 并行等待",
+  "description": "同时派 2 个写手分别实现 mod_a.py（alpha 返回 done-a）和 mod_b.py（beta 返回 done-b），使用 delegate wait 等待结果（不自写 sleep/while 轮询，不撞 exit 76），然后依次 land 提交两个改动并通过全量测试。",
+  "test_cmd": "python3 -m unittest -q",
+  "fake_pi_rules": [
+    {
+      "match": ["mod_a.py"],
+      "writes": {
+        "mod_a.py": "def alpha() -> str:\n    return \"done-a\"\n"
+      },
+      "answer": "已更新 mod_a.py，alpha() 返回 done-a。"
+    },
+    {
+      "match": ["mod_b.py"],
+      "writes": {
+        "mod_b.py": "def beta() -> str:\n    return \"done-b\"\n"
+      },
+      "answer": "已更新 mod_b.py，beta() 返回 done-b。"
+    }
+  ],
+  "scripted_steps": [
+    {
+      "op": "start_worktree",
+      "accept": "python3 -m unittest test_all.AllTest.test_alpha -q",
+      "prompt": "修改 mod_a.py 使 alpha() 返回 \"done-a\"",
+      "save_as": "run_a"
+    },
+    {
+      "op": "start_worktree",
+      "accept": "python3 -m unittest test_all.AllTest.test_beta -q",
+      "prompt": "修改 mod_b.py 使 beta() 返回 \"done-b\"",
+      "save_as": "run_b"
+    },
+    {
+      "op": "wait_concurrent",
+      "runs": ["{run_a}", "{run_b}"]
+    },
+    {
+      "op": "land",
+      "run": "{run_a}",
+      "message": "feat: implement mod_a alpha"
+    },
+    {
+      "op": "land",
+      "run": "{run_b}",
+      "message": "feat: implement mod_b beta"
+    }
+  ],
+  "verify": {
+    "expected_files": {
+      "mod_a.py": ["return \"done-a\""],
+      "mod_b.py": ["return \"done-b\""]
+    },
+    "min_trailer_commits": 2,
+    "test_must_pass": true,
+    "worktrees_cleaned": true
+  }
+}

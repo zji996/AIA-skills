@@ -1,0 +1,59 @@
+{
+  "id": "s4-question-and-work",
+  "title": "S4 提问与工作项闭环",
+  "description": "派写手调整 config.py 中的默认超时配置并完成工作项 {work_id}。同事遇到不明确选项时会返回「需要主控决定」进入提问态，主控需用 delegate reply 回答选择方案 A（30 秒），等待完成后 land 提交，并执行 delegate work close 关闭工作项。",
+  "test_cmd": "python3 -m unittest -q",
+  "work_item": "调整默认超时配置",
+  "fake_pi_rules": [
+    {
+      "match": ["方案 A", "30"],
+      "writes": {
+        "config.py": "DEFAULT_TIMEOUT_SECONDS = 30\n"
+      },
+      "answer": "已按方案 A 将 DEFAULT_TIMEOUT_SECONDS 更新为 30，并通过 test_config.py。"
+    },
+    {
+      "match": ["调整 config.py"],
+      "answer": "需要主控决定\nconfig.py 的默认超时应设为多少？\n- 方案 A（倾向）：30 秒，与 test_config.py 预期一致。\n- 方案 B：60 秒，需要同步修改测试。"
+    }
+  ],
+  "scripted_steps": [
+    {
+      "op": "start_worktree",
+      "accept": "python3 -m unittest -q",
+      "prompt": "调整 config.py 中的 DEFAULT_TIMEOUT_SECONDS 默认超时并通过 test_config.py",
+      "save_as": "write_run"
+    },
+    {
+      "op": "wait"
+    },
+    {
+      "op": "reply",
+      "run": "{write_run}",
+      "prompt": "选方案 A：将 DEFAULT_TIMEOUT_SECONDS 设为 30 秒",
+      "save_as": "reply_run"
+    },
+    {
+      "op": "wait"
+    },
+    {
+      "op": "land",
+      "run": "{reply_run}",
+      "message": "feat: set default timeout to 30s"
+    },
+    {
+      "op": "work_close",
+      "work_id": "{work_id}",
+      "reason": "已按方案 A 完成配置调整并通过测试"
+    }
+  ],
+  "verify": {
+    "expected_files": {
+      "config.py": ["DEFAULT_TIMEOUT_SECONDS = 30"]
+    },
+    "min_trailer_commits": 1,
+    "test_must_pass": true,
+    "worktrees_cleaned": true,
+    "work_item_done": true
+  }
+}

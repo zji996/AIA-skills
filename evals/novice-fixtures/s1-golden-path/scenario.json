@@ -1,0 +1,55 @@
+{
+  "id": "s1-golden-path",
+  "title": "S1 黄金路径",
+  "description": "先用只读侦察定位 app.py 中 add 函数的错误实现，再派写手在隔离 worktree 中修复并通过 `python3 -m unittest -q` 验收，等结果后看改动并一站式 land 提交。",
+  "test_cmd": "python3 -m unittest -q",
+  "fake_pi_rules": [
+    {
+      "match": ["定位"],
+      "answer": "结论：app.py:2 的 `add(a, b)` 错误地返回了 `a - b`，应改为 `a + b`。\n\n证据：app.py:1-2 与 test_app.py:7-8。"
+    },
+    {
+      "match": ["修复"],
+      "writes": {
+        "app.py": "def add(a: int, b: int) -> int:\n    return a + b\n"
+      },
+      "answer": "已将 app.py:2 的 `a - b` 修复为 `a + b`，并通过 `python3 -m unittest -q`。"
+    }
+  ],
+  "scripted_steps": [
+    {
+      "op": "start_read_only",
+      "prompt": "只读定位 app.py 中 add 函数为何未通过 test_app.py",
+      "save_as": "scout_run"
+    },
+    {
+      "op": "wait"
+    },
+    {
+      "op": "start_worktree",
+      "accept": "python3 -m unittest -q",
+      "prompt": "修复 app.py 中 add 函数的实现（将 a - b 改为 a + b），确保 test_app.py 通过",
+      "save_as": "write_run"
+    },
+    {
+      "op": "wait"
+    },
+    {
+      "op": "card",
+      "run": "{write_run}"
+    },
+    {
+      "op": "land",
+      "run": "{write_run}",
+      "message": "fix: return a + b in add"
+    }
+  ],
+  "verify": {
+    "expected_files": {
+      "app.py": ["return a + b"]
+    },
+    "min_trailer_commits": 1,
+    "test_must_pass": true,
+    "worktrees_cleaned": true
+  }
+}

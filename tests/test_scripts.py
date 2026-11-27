@@ -722,20 +722,30 @@ class ScriptTests(unittest.TestCase):
         (repo / "scripts").mkdir(parents=True)
         (repo / "crates/delegate").mkdir(parents=True)
         shutil.copy2(VERIFY, repo / "scripts/verify.sh")
+        (repo / "scripts/eval-novice.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
         check = repo / "scripts/check.sh"
         check.write_text('#!/bin/sh\necho check >> "$GATE_LOG"\n[ "$FAIL_GATE" != check ]\n')
         check.chmod(0o755)
         fake = self.work / "gate-bin"
         fake.mkdir()
-        for name in ("python3", "cargo"):
-            script = fake / name
-            script.write_text(f'#!/bin/sh\necho {name} >> "$GATE_LOG"\n[ "$FAIL_GATE" != {name} ]\n')
-            script.chmod(0o755)
+        py = fake / "python3"
+        py.write_text(
+            '#!/bin/sh\n'
+            'gate=python3\n'
+            'case "$1" in *eval-novice.py) gate=novice ;; esac\n'
+            'echo "$gate" >> "$GATE_LOG"\n'
+            '[ "$FAIL_GATE" != "$gate" ]\n'
+        )
+        py.chmod(0o755)
+        cargo = fake / "cargo"
+        cargo.write_text('#!/bin/sh\necho cargo >> "$GATE_LOG"\n[ "$FAIL_GATE" != cargo ]\n')
+        cargo.chmod(0o755)
         log = self.work / "gate.log"
         env = {**os.environ, "PATH": f"{fake}:{os.environ['PATH']}", "GATE_LOG": str(log)}
         for failure, expected in (("check", ["check"]), ("python3", ["check", "python3"]),
-                                  ("cargo", ["check", "python3", "cargo"]),
-                                  ("none", ["check", "python3", "cargo"])):
+                                  ("novice", ["check", "python3", "novice"]),
+                                  ("cargo", ["check", "python3", "novice", "cargo"]),
+                                  ("none", ["check", "python3", "novice", "cargo"])):
             with self.subTest(failure=failure):
                 log.unlink(missing_ok=True)
                 result = self.run_script(repo / "scripts/verify.sh", env={**env, "FAIL_GATE": failure})

@@ -1,0 +1,68 @@
+{
+  "id": "s2-conflict-recovery",
+  "title": "S2 冲突恢复",
+  "description": "派写手修改 app.py 中 greet 函数返回 `hello, {name}!`。写手完成后主干会被推进到 BANNER = \"v1\" 并触碰 app.py 导致 land 冲突；看到 `LAND FAILED（未合入：文件冲突）` 后不得在旧代码上跑测试，应按提示走 `reply --sync=agent` 解决冲突后重新 land 提交。",
+  "test_cmd": "python3 -m unittest -q",
+  "fake_pi_rules": [
+    {
+      "match": ["rebase", "解决冲突"],
+      "writes": {
+        "app.py": "BANNER = \"v1\"\n\n\ndef greet(name: str) -> str:\n    return f\"hello, {name}!\"\n"
+      },
+      "answer": "已基于主干 BANNER = \"v1\" 解决 app.py 冲突并保留 greet 返回 `hello, {name}!`。"
+    },
+    {
+      "match": ["修改 app.py"],
+      "writes": {
+        "app.py": "BANNER = \"v0-colleague\"\n\n\ndef greet(name: str) -> str:\n    return f\"hello, {name}!\"\n"
+      },
+      "advance_mainline": {
+        "files": {
+          "app.py": "BANNER = \"v1\"\n\n\ndef greet(name: str) -> str:\n    return f\"hi {name}\"\n"
+        },
+        "commit_message": "chore: bump banner to v1 on mainline"
+      },
+      "answer": "已更新 app.py 中 greet 函数并通过测试。"
+    }
+  ],
+  "scripted_steps": [
+    {
+      "op": "start_worktree",
+      "accept": "python3 -m unittest -q",
+      "prompt": "修改 app.py 中 greet 函数使其返回 `hello, {name}!` 并通过 test_app.py",
+      "save_as": "write_run"
+    },
+    {
+      "op": "wait"
+    },
+    {
+      "op": "land",
+      "run": "{write_run}",
+      "message": "feat: update greet format",
+      "expect_conflict": true
+    },
+    {
+      "op": "reply",
+      "run": "{write_run}",
+      "sync": "agent",
+      "prompt": "rebase 到最新主干并解决冲突（app.py），保留主干 BANNER = \"v1\" 与新的 greet 实现",
+      "save_as": "sync_run"
+    },
+    {
+      "op": "wait"
+    },
+    {
+      "op": "land",
+      "run": "{sync_run}",
+      "message": "feat: update greet format"
+    }
+  ],
+  "verify": {
+    "expected_files": {
+      "app.py": ["BANNER = \"v1\"", "return f\"hello, {name}!\""]
+    },
+    "min_trailer_commits": 1,
+    "test_must_pass": true,
+    "worktrees_cleaned": true
+  }
+}

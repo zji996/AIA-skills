@@ -32,6 +32,9 @@ step() {
 }
 step check scripts/check.sh "${check_args[@]}"
 step tests python3 scripts/run-tests.py
+if [ -f "$REPO_ROOT/scripts/eval-novice.py" ]; then
+  step novice python3 scripts/eval-novice.py
+fi
 if command -v cargo >/dev/null 2>&1; then
   step clippy bash -c 'cd crates/delegate && cargo clippy -- -D warnings'
   if [ -d "$REPO_ROOT/crates/delegate-tui" ]; then
