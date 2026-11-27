@@ -5,7 +5,7 @@
 - `tiers.scout`（只读侦察/摘要/文案）、`tiers.review`（只读严密审查/根因/第二意见）、`tiers.write`（改代码带验收）都必须可解析，否则 start/run/reply 退出 2 并给配置引导。不兼容旧档名：把 cheap/strong/default 改为三用途档，将模型放进 models，`:high` 等后缀拆到 thinking。`--model` 可与 `--tier` 同用：用途决定模式，model 固定模型；scout/review 自动只读。未给二者时写入推断 write、只读推断 review，stderr 明确提醒，meta `tierInferred: true`，status 标「推断」。普通 reply 沿用原模型与思维长度；带 `--tier`/`--model` 可换模型，`--thinking` 可独立改长度。
 - 档位可为别名/已登记完整名，或规则列表：`"write": [{"model":"sol","days":"mon-fri","hours":"09:00-12:00,14:00-18:00","thinking":"high"},"ds"]`。按调用时本机星期/时间取首条命中；`days` 是 mon…sun 的列表/区间，`hours` 是逗号分隔 HH:MM-HH:MM（结束不含，可跨午夜）。`maxActive` 为正整数：启动锁内按解析后的完整模型统计本机活动任务，达到上限默认排队等原模型；仅条目显式 `"overflow":"next"` 时跳到下一候选，`--overflow next|queue` 覆盖本次选择，未知值在加载时报错。排队及等待上游的任务不计数。条件需全部命中，末项是无条件模型字符串；中间条目至少带一个条件或 thinking。启动与显式换档续做重新取值，普通续做不重选；瞬时失败自动换本档列表里当前模型之后第一个不同模型（每 run 最多一次），没有则不换；模型与思维长度候选记入 meta `tierCandidates`。同一完整模型在多个档声明上限时取最小值，`--model`、环境指定模型与普通 reply 也计数并受限，不因别名、用途或时段绕过该模型的上限。
 - 思维长度独立字段：`DELEGATE_THINKING` > CLI `--thinking` > `--class`（`build`/`review` → `medium`，`hard` → `high`，启动回显 `thinking <档>〔类别 <类>〕`；未传 `--class` 保持原规则）> 规则条目 `thinking` > 别名默认 `thinking` > 顶层 `thinking` > 不传（Pi 默认），级别为 off/minimal/low/medium/high/xhigh。`DELEGATE_SCOUT_MODEL` / `DELEGATE_REVIEW_MODEL` / `DELEGATE_WRITE_MODEL` 覆盖对应整个档位，仍必须是已登记模型；模型名里的 thinking 后缀报错，CLI 用 `--thinking`，配置用 thinking 字段。强模型按任务性质选思考档，不是一律 high：规格写死的实现（前端、逐项改批量、修测试、只读查代码）用 `medium`，内核/账本、并发时序、沙箱安全、迁移、找根因用 `high`；便宜模型保持配置默认；拿不准先 `medium`，返工一次就升 `high`。
-- `delegate tiers` 列各档规则（别名 → 完整名、thinking）和已登记别名的价位（`cost`，未设显示 `—`）及 context/images/thinking 能力，末行只写 Pi 中还有多少模型未登记，不列出它们。设置用 `--alias name=provider/id`（可重复）、`--scout/--review/--write <别名或已登记完整名>`、`--thinking <级别>`，校验后原子写入用户配置；`probe` 仅探测登记模型，按完整名去重。
+- `delegate tiers` 列各档规则（别名 → 完整名、thinking）、已登记别名的价位（`cost`，未设显示 `—`）与 context/images/thinking 能力，末行统计 Pi 未登记模型数，并按价位与适配卡在末尾附只读配置提示（传 `--json` 输出结构化 JSON 含 `hints` 数组）。设置用 `--alias name=provider/id`（可重复）、`--scout/--review/--write <别名或已登记完整名>`、`--thinking <级别>`，校验后原子写入用户配置；`probe` 仅探测登记模型，按完整名去重。
 - `--image` 从不影响选模型：最终模型在 Pi 列表里 images=no 时退出 2，提示在 Pi models.json 给该模型 input 加 image，或用 `--model` 换能看图的模型；Pi 列表为空时跳过此守卫。
 
 用户级与仓库级配置示例见 [configuration.md](configuration.md)。
@@ -17,6 +17,34 @@
 - 首次遇到同类任务可把同份规格各派一路对比 → `delegate fit set <类别> <别名> first|ok|avoid "一句话" [--sample <规格文件>]` 记结论（每格仅留最新一句，上限 80 字符；设 `first` 时同类别原 `first` 自动降为 `ok`）。记录存放在用户配置目录的 `fit.json`（旧 `scout`/`design` 记录读取时忽略，下次写回时丢弃）。
 - `delegate fit` 以表格展示三类质量与每个别名的价位（`alias〔cost〕`，未设显示 `—`）及未评项；`delegate fit --json` 输出完整 note、sample 与 `cost` 映射。配置新增别名会列为未评，用各类别记录的 sample 重跑即可。
 - `start`/`reply` 启动回显在模型旁显示已配价位（如 `main〔main〕`），仅提示，不自动换模型、不拦截。
+
+## 换模型
+
+路由机制只认用途档（`scout` / `review` / `write`）与别名价位（`cost`: `low` / `main` / `high`），不认具体模型名。切换为自己的模型组合时，按四个角色分工配置：
+
+- **写入（`tiers.write`）**：放手头最强的中价模型（`cost: "main"`），承担日常按规格实现、改代码与补测试。
+- **审查（`tiers.review`）**：放便宜一档的模型（`cost: "low"`）即可，负责常规只读 diff 审查；是否漏检靠后续 `Fixes-Run` 统计持续盯盘，出现漏检趋势再调整。
+- **探路（`tiers.scout`）**：放中价模型（`cost: "main"`）配中等思考（`thinking: "medium"`），只读不写、快速摸清文件与符号地图。
+- **参谋（高价模型，`cost: "high"`）**：单独登记为别名，不必挂到常规三档，只在大设计、疑难根因或高风险方案评审时通过 `--model <别名>` 点名调用。
+
+### 登记与配置
+
+先用 `delegate tiers` 一次登记别名并分配三档（`--alias` 可重复，下面占位符换成自己的 `provider/id`）：
+
+```sh
+delegate tiers \
+  --alias cheap=provider/low-model \
+  --alias main=provider/main-model \
+  --alias advisor=provider/high-model \
+  --scout main --review cheap --write main
+```
+
+随后打开 `delegate tiers` 输出中 `config:` 指向的用户配置文件，为各别名补上 `cost`（`low|main|high`）和默认 `thinking`（例如 `{"model": "provider/main-model", "thinking": "medium", "cost": "main"}`）。再次运行 `delegate tiers`（或 `delegate tiers --json`），系统会在末尾按价位与适配卡给出只读提示（例如审查档或探路档比写入档贵、写入档尚未做 `build` 适配卡对比）。
+
+### 用适配卡与基准验证
+
+- **写入档验证**：新模型长期挂到 `write` 档前，先拿一份真实规格同题对比，用 `delegate fit set build <别名> first|ok|avoid "一句话" --sample <规格文件>` 记入适配卡，通过 `delegate fit` 复查结果。
+- **审查档验证**：日常盯 `Fixes-Run` 返修统计；后续可用 `delegate fit bench review` 对固定样本集跑审查基准，按数据确认便宜档的召回与误报后再定型。
 
 ## agy 同事
 

@@ -3871,13 +3871,60 @@ fn main_inner(args: &[String]) -> Res<i32> {
         _ => Err(format!("invalid choice: {command}")),
     }
 }
+fn tiers_hints(config: &Value, listed: &[models::PiModel]) -> Res<Vec<String>> {
+    let active_alias = |tier: &str| -> Option<String> {
+        if models::tier_rules(config, tier).is_empty() {
+            return None;
+        }
+        let pick = models::pick(config, tier, None, listed, agents::local_clock(), &|_| 0).ok()?;
+        Some(models::selected_alias(&pick.name, config).to_string())
+    };
+    let mut hints = Vec::new();
+    let Some(write) = active_alias("write") else {
+        return Ok(hints);
+    };
+    let wc = models::model_cost(&write, config);
+    if let Some(review) = active_alias("review") {
+        let rc = models::model_cost(&review, config);
+        if let (Some(rc), Some(wc)) = (rc, wc) {
+            if models::cost_rank(rc).zip(models::cost_rank(wc)).is_some_and(|(r, w)| r > w) {
+                hints.push(format!(
+                    "提示：审查档 {review}（价位 {rc}）比写入档 {write}（价位 {wc}）贵；审查一般用便宜一档的模型就够，漏检靠 Fixes-Run 统计盯（见 references/model-routing.md「换模型」）。"
+                ));
+            }
+        }
+    }
+    if !fit::has_record("build", &write, config)? {
+        hints.push(format!(
+            "提示：写入档 {write} 还没有 build 类适配卡记录；先拿一份规格同题对比再长期用（delegate fit）。"
+        ));
+    }
+    if let Some(scout) = active_alias("scout") {
+        let sc = models::model_cost(&scout, config);
+        if let (Some(sc), Some(wc)) = (sc, wc) {
+            if models::cost_rank(sc).zip(models::cost_rank(wc)).is_some_and(|(s, w)| s > w) {
+                hints.push(format!(
+                    "提示：探路档 {scout}（价位 {sc}）比写入档 {write}（价位 {wc}）贵；探路只读不写，一般用中价模型加中等思考。"
+                ));
+            }
+        }
+    }
+    Ok(hints)
+}
+
 /// Show the model tiers, or write them to the user config.
 fn tiers(args: &[String]) -> Res<i32> {
     let path = config::user_path();
     let mut user = config::read_file(&path)?.unwrap_or_else(|| json!({}));
     let mut changed = false;
+    let mut want_json = output::json_enabled();
     let mut i = 0;
     while i < args.len() {
+        if args[i] == "--json" {
+            want_json = true;
+            i += 1;
+            continue;
+        }
         let (key, inline) = args[i]
             .split_once('=')
             .map_or((args[i].as_str(), None), |(k, v)| (k, Some(v.to_string())));
@@ -3887,7 +3934,14 @@ fn tiers(args: &[String]) -> Res<i32> {
             .ok_or_else(|| {
                 unrecognized_arg(
                     &args[i],
-                    &["--scout", "--review", "--write", "--alias", "--thinking"],
+                    &[
+                        "--scout",
+                        "--review",
+                        "--write",
+                        "--alias",
+                        "--thinking",
+                        "--json",
+                    ],
                     "tiers",
                 )
             })?;
@@ -3958,14 +4012,18 @@ fn tiers(args: &[String]) -> Res<i32> {
     let top = git_top(&env::current_dir().unwrap_or_default());
     let config = config::load(top.as_deref())?;
     let mut missing = false;
+    let mut tier_lines = Vec::new();
+    let mut tiers_json = serde_json::Map::new();
     for tier in models::TIERS {
         let rules = models::tier_rules(&config.value, tier);
         if rules.is_empty() {
-            println!("{tier}: (not set)");
+            tier_lines.push(format!("{tier}: (not set)"));
+            tiers_json.insert(tier.into(), json!([]));
             missing = true;
             continue;
         }
         let mut descriptions = Vec::new();
+        let mut rule_items = Vec::new();
         for rule in rules {
             let pick = models::candidate(&rule, &config.value, None, &listed)?;
             let conditions = agents::describe_tier(&json!([rule.clone()])).unwrap_or_default();
@@ -3976,37 +4034,94 @@ fn tiers(args: &[String]) -> Res<i32> {
                 pick.thinking.as_deref().unwrap_or("Pi default"),
                 conditions
             ));
+            rule_items.push(json!({
+                "name": pick.name,
+                "model": pick.model,
+                "thinking": pick.thinking,
+                "conditions": conditions,
+            }));
         }
-        println!("{tier}: {}", descriptions.join(", "));
+        tier_lines.push(format!("{tier}: {}", descriptions.join(", ")));
+        tiers_json.insert(tier.into(), Value::Array(rule_items));
     }
-    println!("aliases: name → model | cost | context | images | thinking");
+    let mut alias_lines = Vec::new();
+    let mut aliases_json = serde_json::Map::new();
     if let Some(aliases) = config.value["models"].as_object() {
         for (name, spec) in aliases {
             let id = crate::models::alias_model(spec).unwrap_or("");
-            let cost = crate::models::alias_cost(spec).unwrap_or("—");
+            let cost = crate::models::alias_cost(spec);
+            let cost_display = cost.unwrap_or("—");
             if let Some(model) = listed.iter().find(|m| m.name == id) {
-                println!(
-                    "  {name} → {id} | {cost} | {} | {} | {}",
+                alias_lines.push(format!(
+                    "  {name} → {id} | {cost_display} | {} | {} | {}",
                     model.context, model.images, model.thinking
+                ));
+                aliases_json.insert(
+                    name.clone(),
+                    json!({
+                        "model": id,
+                        "cost": cost,
+                        "context": model.context,
+                        "images": model.images,
+                        "thinking": model.thinking,
+                    }),
                 );
             } else {
-                println!("  {name} → {id} | {cost} | unknown | unknown | unknown");
+                alias_lines.push(format!(
+                    "  {name} → {id} | {cost_display} | unknown | unknown | unknown"
+                ));
+                aliases_json.insert(
+                    name.clone(),
+                    json!({
+                        "model": id,
+                        "cost": cost,
+                        "context": Value::Null,
+                        "images": Value::Null,
+                        "thinking": Value::Null,
+                    }),
+                );
             }
         }
     }
-    if missing {
+    let unregistered = models::unregistered_count(&config.value, &listed);
+    let hints = tiers_hints(&config.value, &listed)?;
+    if want_json {
         println!(
-            "Pi 里还有 {} 个模型未登记",
-            models::unregistered_count(&config.value, &listed)
+            "{}",
+            json!({
+                "tiers": Value::Object(tiers_json),
+                "aliases": Value::Object(aliases_json),
+                "config": path.display().to_string(),
+                "unregistered": unregistered,
+                "hints": hints,
+            })
         );
+        if missing {
+            eprintln!("{}", agents::tiers_guide(&config.value));
+            return Ok(1);
+        }
+        return Ok(0);
+    }
+    for line in &tier_lines {
+        println!("{line}");
+    }
+    println!("aliases: name → model | cost | context | images | thinking");
+    for line in &alias_lines {
+        println!("{line}");
+    }
+    if missing {
+        println!("Pi 里还有 {unregistered} 个模型未登记");
+        for hint in &hints {
+            println!("{hint}");
+        }
         eprintln!("{}", agents::tiers_guide(&config.value));
         return Ok(1);
     }
     println!("config: {}", path.display());
-    println!(
-        "Pi 里还有 {} 个模型未登记",
-        models::unregistered_count(&config.value, &listed)
-    );
+    println!("Pi 里还有 {unregistered} 个模型未登记");
+    for hint in &hints {
+        println!("{hint}");
+    }
     Ok(0)
 }
 

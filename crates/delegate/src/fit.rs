@@ -86,6 +86,12 @@ fn set(
     Ok(demoted)
 }
 
+pub fn has_record(class: &str, alias_or_model: &str, config: &Value) -> Res<bool> {
+    let card = load()?;
+    let alias = crate::models::selected_alias(alias_or_model, config);
+    Ok(!card[class][alias].is_null())
+}
+
 pub fn notices(class: &str, alias: &str, config: &Value) -> Res<Vec<String>> {
     let card = load()?;
     let alias = crate::models::selected_alias(alias, config);

@@ -63,6 +63,10 @@ pub fn validate_cost(cost: &str) -> Res<()> {
     }
 }
 
+pub fn cost_rank(cost: &str) -> Option<usize> {
+    COSTS.iter().position(|&c| c == cost)
+}
+
 /// The configured alias table is the whole selectable universe. Pi contributes
 /// validation and capability metadata only, never unregistered candidates.
 pub fn alias_model(value: &Value) -> Option<&str> {

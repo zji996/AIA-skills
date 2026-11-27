@@ -2272,7 +2272,7 @@ db.write_text(json.dumps(units))
             self.assertIn("tiers --alias name=provider/id", refused.stderr)
         shown = self.cli("tiers")
         self.assertEqual(shown.returncode, 0, shown.stderr)
-        self.assertEqual(shown.stdout.splitlines()[-1], "Pi 里还有 5 个模型未登记")
+        self.assertIn("Pi 里还有 5 个模型未登记", shown.stdout.splitlines())
         self.assertNotIn("x/named", shown.stdout)
         self.assertIn("sol → p/review-m | — | 1M | true | true", shown.stdout)
 

@@ -218,6 +218,77 @@ class DelegateFitCostTests(unittest.TestCase):
         self.assertNotIn("scout", saved)
         self.assertNotIn("design", saved)
 
+    def test_tiers_hints_all_three_and_json_and_after_update(self):
+        self.fake_pi([])
+        cfg = self.matrix_config()
+        cfg["tiers"] = {"scout": "advisor", "review": "advisor", "write": "main"}
+        self.write_user_config(cfg)
+
+        expected = [
+            "提示：审查档 advisor（价位 high）比写入档 main（价位 main）贵；审查一般用便宜一档的模型就够，漏检靠 Fixes-Run 统计盯（见 references/model-routing.md「换模型」）。",
+            "提示：写入档 main 还没有 build 类适配卡记录；先拿一份规格同题对比再长期用（delegate fit）。",
+            "提示：探路档 advisor（价位 high）比写入档 main（价位 main）贵；探路只读不写，一般用中价模型加中等思考。",
+        ]
+
+        res = self.cli("tiers")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        lines = res.stdout.splitlines()
+        self.assertEqual(lines[-3:], expected)
+
+        as_json = self.cli("tiers", "--json")
+        self.assertEqual(as_json.returncode, 0, as_json.stderr)
+        payload = json.loads(as_json.stdout)
+        self.assertEqual(payload["hints"], expected)
+        self.assertIn("tiers", payload)
+        self.assertIn("aliases", payload)
+        self.assertIn("unregistered", payload)
+
+        # Updating tiers via CLI also prints hints in both text and --json modes.
+        updated = self.cli("tiers", "--scout", "cheap-a")
+        self.assertEqual(updated.returncode, 0, updated.stderr)
+        self.assertEqual(updated.stdout.splitlines()[-2:], expected[:2])
+        self.assertNotIn("提示：探路档", updated.stdout)
+
+        updated_json = self.cli("tiers", "--review", "cheap-a", "--json")
+        self.assertEqual(updated_json.returncode, 0, updated_json.stderr)
+        self.assertEqual(json.loads(updated_json.stdout)["hints"], [expected[1]])
+
+    def test_tiers_hints_none_when_clean_and_skip_incomparable_costs(self):
+        self.fake_pi([])
+        cfg = self.matrix_config()
+        cfg["tiers"] = {"scout": "main", "review": "cheap-a", "write": "main"}
+        self.write_user_config(cfg)
+
+        fit_res = self.cli("fit", "set", "build", "main", "first", "规格实现稳")
+        self.assertEqual(fit_res.returncode, 0, fit_res.stderr)
+
+        clean = self.cli("tiers")
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        self.assertNotIn("提示：", clean.stdout)
+
+        clean_json = self.cli("tiers", "--json")
+        self.assertEqual(clean_json.returncode, 0, clean_json.stderr)
+        self.assertEqual(json.loads(clean_json.stdout)["hints"], [])
+
+        # Incomparable cost: review/scout has no cost ("plain") -> no cost hints.
+        cfg["tiers"] = {"scout": "plain", "review": "plain", "write": "main"}
+        self.write_user_config(cfg)
+        incomp = self.cli("tiers")
+        self.assertEqual(incomp.returncode, 0, incomp.stderr)
+        self.assertNotIn("提示：", incomp.stdout)
+        self.assertEqual(json.loads(self.cli("tiers", "--json").stdout)["hints"], [])
+
+        # Incomparable cost: write has no cost ("plain") -> no cost hints even when review/scout are high,
+        # but missing build fit record for plain still triggers the build fit hint.
+        cfg["tiers"] = {"scout": "advisor", "review": "advisor", "write": "plain"}
+        self.write_user_config(cfg)
+        incomp_write = self.cli("tiers", "--json")
+        self.assertEqual(incomp_write.returncode, 0, incomp_write.stderr)
+        self.assertEqual(
+            json.loads(incomp_write.stdout)["hints"],
+            ["提示：写入档 plain 还没有 build 类适配卡记录；先拿一份规格同题对比再长期用（delegate fit）。"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
