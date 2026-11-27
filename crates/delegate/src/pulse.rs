@@ -249,6 +249,12 @@ pub fn compute_quota_alert_flag(agy_accounts_snap: &Value) -> bool {
     if b(agy_accounts_snap, "liveDrifted") {
         return true;
     }
+    if agy_accounts_snap["rateShifts"]
+        .as_array()
+        .is_some_and(|a| !a.is_empty())
+    {
+        return true;
+    }
     if !agy_accounts::detect_quota_depletion_warnings(agy_accounts_snap).is_empty() {
         return true;
     }
@@ -432,9 +438,30 @@ pub fn split_pending_runs_refs(
     out
 }
 
+/// Format a single-line advisory quota rate-shift alert (when any account has an active drift).
+pub fn format_rate_shift_alert_line_in(state_root: &Path, now_ep: i64) -> Option<String> {
+    let shifts = crate::quota_rate::load_cached_shifts_in(state_root, now_ep);
+    if shifts.is_empty() {
+        return None;
+    }
+    let snap = json!({ "rateShifts": shifts });
+    format_rate_shift_alert_line_from_snapshot(&snap)
+}
+
+pub fn format_rate_shift_alert_line_from_snapshot(agy_accounts_snap: &Value) -> Option<String> {
+    let shifts = agy_accounts_snap["rateShifts"].as_array()?;
+    let first = shifts.first()?;
+    let mut line = crate::quota_rate::format_shift_one_line(first, true);
+    if shifts.len() > 1 {
+        line.push_str(&format!("（另有 {} 个账号费率漂移）", shifts.len() - 1));
+    }
+    Some(line)
+}
+
 /// Format the advisory-only single-line quota alert for `delegate status`, using the exact same
 /// active-account P0 rules as `compute_pulse_and_alerts`:
-/// depletion before reset, `< 15%` remaining reminder, and `liveDrifted` / `identityMismatch`.
+/// depletion before reset, `< 15%` remaining reminder, `liveDrifted` / `identityMismatch`,
+/// and quota rate drift.
 pub fn format_status_quota_alert_line_in(state_root: &Path, now_ep: i64) -> Option<String> {
     let agy_snap = agy_accounts::quota_snapshot_for_alerts_in(state_root, now_ep)?;
     format_status_quota_alert_line_from_snapshot(&agy_snap)
@@ -527,7 +554,7 @@ pub fn format_status_quota_alert_line_from_snapshot(agy_accounts_snap: &Value) -
                 low_parts.join("、")
             ));
         }
-        return None;
+        return format_rate_shift_alert_line_from_snapshot(agy_accounts_snap);
     }
     if let Some(acct) = active_acct {
         let quota = &acct["quota"];
@@ -553,7 +580,7 @@ pub fn format_status_quota_alert_line_from_snapshot(agy_accounts_snap: &Value) -
             }
         }
     }
-    None
+    format_rate_shift_alert_line_from_snapshot(agy_accounts_snap)
 }
 
 /// Compute unified `SnapshotPulse` + ordered `Vec<ActiveAlert>` from the snapshot inputs.
@@ -762,6 +789,26 @@ pub fn compute_pulse_and_alerts(
                 target_tab: 4,
                 target_id: (!active_id.is_empty()).then(|| active_id.to_string()),
             });
+        }
+        if let Some(shifts) = agy_accounts_snap["rateShifts"].as_array() {
+            if let Some(first) = shifts.first() {
+                let acct = s(first, "account");
+                let mut msg = crate::quota_rate::format_shift_one_line(first, true)
+                    .trim_start_matches("⚠ 费率漂移：")
+                    .to_string();
+                if shifts.len() > 1 {
+                    msg.push_str(&format!(" 等{}号", shifts.len()));
+                }
+                msg.push_str(" → 按 4 查");
+                p1_alerts.push(ActiveAlert {
+                    level: AlertLevel::P1,
+                    kind: "quota_rate_shift".to_string(),
+                    label: "额度·费率漂移".to_string(),
+                    message: msg,
+                    target_tab: 4,
+                    target_id: (!acct.is_empty()).then(|| acct.to_string()),
+                });
+            }
         }
     }
 
@@ -1229,6 +1276,39 @@ mod tests {
         assert!(mismatch_pulse.quota_alert);
         assert!(mismatch_alerts.iter().any(|a| {
             a.level == AlertLevel::P0 && a.kind == "quota_drift" && a.label.contains("身份不匹配")
+        }));
+
+        let rate_shift_snap = json!({
+            "active": "acct-alpha",
+            "liveDrifted": false,
+            "accounts": [{ "id": "acct-alpha", "active": true, "quota": { "ok": true, "entries": [] } }],
+            "rateShifts": [{
+                "account": "acct-alpha",
+                "pool": "gemini",
+                "poolLabel": "Gemini",
+                "window": "weekly",
+                "windowLabel": "周额度",
+                "baselineRate": 4_000_000.0,
+                "currentRate": 1_000_000.0,
+                "ratio": 4.0,
+                "baselineAgyVersions": ["1.5.16"],
+                "currentAgyVersions": ["1.5.17"],
+                "note": "可能含本机未记录的用量"
+            }]
+        });
+        let rs_line = format_status_quota_alert_line_from_snapshot(&rate_shift_snap)
+            .expect("rateShifts should produce advisory status line");
+        assert!(rs_line.contains("费率漂移"));
+        assert!(rs_line.contains("1.5.16→1.5.17"));
+        assert!(rs_line.contains("可能含本机未记录的用量"));
+        let (rs_pulse, rs_alerts) =
+            compute_pulse_and_alerts(&[], &[], &rate_shift_snap, 0, now_ep);
+        assert!(rs_pulse.quota_alert, "rateShifts must light up 4 额度(!) badge");
+        assert!(!rs_pulse.p0_alert, "rateShifts is advisory P1, not P0");
+        assert!(rs_alerts.iter().any(|a| {
+            a.level == AlertLevel::P1
+                && a.kind == "quota_rate_shift"
+                && a.message.contains("可能含本机未记录的用量")
         }));
     }
 }

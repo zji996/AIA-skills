@@ -4111,6 +4111,7 @@ pub fn parse_agy_accounts_value(v: &Value) -> AgyAccountsState {
         .to_string();
     let quota_age_seconds = v.get("quotaAgeSeconds").and_then(Value::as_u64);
     let auto_switch = parse_agy_auto_switch(v.get("autoSwitch"));
+    let rate_shifts = parse_quota_rate_shifts(v.get("rateShifts"));
     AgyAccountsState {
         root,
         active,
@@ -4122,7 +4123,60 @@ pub fn parse_agy_accounts_value(v: &Value) -> AgyAccountsState {
         quota_updated_at,
         quota_age_seconds,
         auto_switch,
+        rate_shifts,
     }
+}
+
+fn parse_quota_rate_shifts(val: Option<&Value>) -> Vec<QuotaRateShiftItem> {
+    let Some(arr) = val.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|item| {
+            let account = item.get("account").and_then(Value::as_str)?.trim();
+            if account.is_empty() {
+                return None;
+            }
+            let str_of = |k: &str| {
+                item.get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            };
+            let baseline_rate = item
+                .get("baselineRate")
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .map(|v| v.round() as u64)
+                .unwrap_or(0);
+            let current_rate = item
+                .get("currentRate")
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .map(|v| v.round() as u64)
+                .unwrap_or(0);
+            let ratio_x100 = item
+                .get("ratio")
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .map(|v| (v * 100.0).round() as u64)
+                .unwrap_or(0);
+            Some(QuotaRateShiftItem {
+                account: account.to_string(),
+                pool: str_of("pool"),
+                pool_label: str_of("poolLabel"),
+                window: str_of("window"),
+                window_label: str_of("windowLabel"),
+                baseline_rate,
+                current_rate,
+                ratio_x100,
+                baseline_agy_versions: string_list(item.get("baselineAgyVersions")),
+                current_agy_versions: string_list(item.get("currentAgyVersions")),
+                note: str_of("note"),
+            })
+        })
+        .collect()
 }
 
 fn parse_agy_auto_switch(val: Option<&Value>) -> AgyAutoSwitchInfo {

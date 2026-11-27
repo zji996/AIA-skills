@@ -3424,3 +3424,82 @@ fn overview_and_runs_render_total_lines_summary_and_per_repo_breakdown() {
         "{runs_view}"
     );
 }
+
+#[test]
+fn quota_tab_and_pulse_render_rate_shift_single_line_warning() {
+    use delegate_tui::app::ViewTab;
+    use delegate_tui::data::parse_snapshot_json;
+
+    let raw = r#"{
+        "seq": 12,
+        "repos": [],
+        "work": [],
+        "events": [{
+            "seq": 12,
+            "at": "2026-11-28T01:00:00Z",
+            "run": "",
+            "repo": "",
+            "kind": "quota_rate_shift",
+            "summary": "费率漂移：acct-alpha Gemini(周额度) 4.00M→1.00M/1%（降为1/4.00 · agy 1.5.16→1.5.17；可能含本机未记录的用量）"
+        }],
+        "lane": {},
+        "dagQueue": [],
+        "merges": [],
+        "candidates": [],
+        "agyAccounts": {
+            "active": "acct-alpha",
+            "liveDrifted": false,
+            "accounts": [{
+                "id": "acct-alpha",
+                "active": true,
+                "quota": {
+                    "ok": true,
+                    "ageSeconds": 60,
+                    "entries": [{
+                        "pool": "Gemini Models",
+                        "window": "weekly",
+                        "remainingPct": 70.0,
+                        "resetInSeconds": 259200
+                    }]
+                }
+            }],
+            "rateShifts": [{
+                "account": "acct-alpha",
+                "pool": "gemini",
+                "poolLabel": "Gemini",
+                "window": "weekly",
+                "windowLabel": "周额度",
+                "baselineRate": 4000000.0,
+                "currentRate": 1000000.0,
+                "ratio": 4.0,
+                "baselineAgyVersions": ["1.5.16"],
+                "currentAgyVersions": ["1.5.17"],
+                "note": "可能含本机未记录的用量"
+            }]
+        }
+    }"#;
+    let snap = parse_snapshot_json(raw, None, None).expect("snapshot parses");
+    assert_eq!(snap.agy_accounts.rate_shifts.len(), 1);
+    assert!(snap.effective_pulse().quota_alert);
+    assert_eq!(snap.events[0].kind_badge(), "费率");
+
+    let mut app = App::new(
+        snap,
+        PathBuf::from("delegate"),
+        PathBuf::from("/tmp/demo"),
+        5,
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+    assert_eq!(app.tab, ViewTab::Quota);
+
+    let wide = render_to_string(&mut app, 150, 36);
+    assert_lines_fit_width(&wide, 150);
+    assert!(wide.contains("4 额度(!)"), "badge should light up:\n{wide}");
+    assert!(wide.contains("费率漂移"), "quota tab should show rate shift:\n{wide}");
+    assert!(wide.contains("1.5.16→1.5.17"), "version transition should be shown:\n{wide}");
+    assert!(wide.contains("可能含本机未记录的用量"), "unrecorded usage note missing:\n{wide}");
+
+    let narrow = render_to_string(&mut app, 80, 30);
+    assert_lines_fit_width(&narrow, 80);
+    assert!(narrow.contains("费率漂移"), "narrow quota tab should show rate shift:\n{narrow}");
+}

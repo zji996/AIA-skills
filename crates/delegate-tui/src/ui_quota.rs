@@ -683,6 +683,18 @@ fn render_quota_auto_detail_pane(frame: &mut Frame, app: &App, area: Rect, focus
     let mut out: Vec<Line<'static>> = Vec::new();
     push_wrapped(&mut out, &format_tui_delegation_line(agy), iw, bold_primary());
     push_wrapped(&mut out, &format_tui_live_line(agy), iw, muted());
+    if let Some(first_shift) = agy.rate_shifts.first() {
+        let mut txt = first_shift.format_one_line(true);
+        if agy.rate_shifts.len() > 1 {
+            txt.push_str(&format!("（另有{}号）", agy.rate_shifts.len() - 1));
+        }
+        out.push(Line::from(Span::styled(
+            truncate(&txt, iw),
+            Style::default()
+                .fg(STATUS_PENDING)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
     push_wrapped(
         &mut out,
         &format!(
@@ -818,6 +830,26 @@ fn render_quota_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect
                 Paragraph::new(Line::from(Span::styled(
                     truncate(&format!("⚠ 切换失败：{err}"), iw),
                     Style::default().fg(STATUS_FAILED),
+                ))),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+            y += 1;
+        }
+    }
+    if let Some(shift) = app
+        .snapshot
+        .agy_accounts
+        .rate_shifts
+        .iter()
+        .find(|s| s.account == acct.id)
+    {
+        if y < bottom {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    truncate(&shift.format_one_line(false), iw),
+                    Style::default()
+                        .fg(STATUS_PENDING)
+                        .add_modifier(Modifier::BOLD),
                 ))),
                 Rect::new(inner.x, y, inner.width, 1),
             );
@@ -1182,6 +1214,14 @@ fn render_quota_narrow_detail(
         ]));
         push_wrapped(&mut out, &format_tui_delegation_line(agy), inner_w, bold_primary());
         push_wrapped(&mut out, &format_tui_live_line(agy), inner_w, muted());
+        if let Some(first_shift) = agy.rate_shifts.first() {
+            out.push(Line::from(Span::styled(
+                truncate(&first_shift.format_one_line(true), inner_w),
+                Style::default()
+                    .fg(STATUS_PENDING)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
         for ps in &asw.pool_summary {
             push_wrapped(
                 &mut out,
@@ -1222,6 +1262,14 @@ fn render_quota_narrow_detail(
             Span::styled(name, bold_primary()),
             Span::styled(format!(" · {upd}"), muted()),
         ]));
+        if let Some(shift) = agy.rate_shifts.iter().find(|s| s.account == acct.id) {
+            out.push(Line::from(Span::styled(
+                truncate(&shift.format_one_line(false), inner_w),
+                Style::default()
+                    .fg(STATUS_PENDING)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
 
         if let Some(q) = &acct.quota {
             if q.identity_mismatch {

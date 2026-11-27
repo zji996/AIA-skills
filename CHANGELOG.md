@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `delegate`：新增额度费率漂移检测与提醒——`agy-usage.jsonl` 记录按二进制 mtime 缓存的 `agyVersion`（旧记录作未知），在额度刷新与 `_gc-worker` 写路径按账号/Gemini 池分别计算 5h 与周额度加权 token/1% 费率（7 天基线 vs 近 24h，满足 ≥5% 下降且 ≥20 条记录、低于基线 1/1.5 时记 `quota_rate_shift` 事件并落盘 `<state>/quota-rate-shift.json`，每账号每天至多一条，不进 Stop hook，提醒注明「可能含本机未记录的用量」）；TUI 额度页与 pulse 只读单行展示，并新增 `delegate usage --by quota-rate [--since 7d] [--json]` 每日费率表。
 - `delegate`：`reply` 非 `--fresh` 续接不再从父 `meta["agy"]` 继承旧 `agy.agent`（一律改取当前配置，`agy` 其余键照常继承）；配置非空 `agy.agent` 时 `start`/`reply`/`probe` 在 stderr 打印额度代价提示且 `delegate tiers` 附同条 `hints`（仅提示不拦）；`reply --fresh` 新会话提示词自动依次附上抬头、链首 `raw-brief.md`（缺省回退提取自 `prompt.md`）、链首 `scout-map.md`（如有）及本次追问，归档同步保留 `raw-brief.md` 与 `scout-map.md`。
 
 - `delegate`：配置说明注明 `agy.agent` 的额度代价（agy 1.5.17 起自定义 agent 按更高费率扣额度），默认不设，同事规则改写进 `~/.gemini/GEMINI.md`。

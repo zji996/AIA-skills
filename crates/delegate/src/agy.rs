@@ -7,9 +7,139 @@
 use crate::common::*;
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::time::UNIX_EPOCH;
 
 pub const BIN: &str = "agy";
 const PREFIX: &str = "agy/";
+const VERSION_CACHE_FILE: &str = "agy-version-cache.json";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VersionCacheEntry {
+    path: String,
+    len: u64,
+    mtime_secs: u64,
+    mtime_nanos: u32,
+    version: String,
+}
+
+static AGY_VERSION_MEM: OnceLock<Mutex<Option<VersionCacheEntry>>> = OnceLock::new();
+
+fn bin_fingerprint(bin: &Path) -> Option<(String, u64, u64, u32)> {
+    // `fs::metadata` follows symlinks so upgrading the underlying target updates mtime/len.
+    let meta = fs::metadata(bin).ok()?;
+    let canon = fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
+    let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some((
+        canon.to_string_lossy().into_owned(),
+        meta.len(),
+        modified.as_secs(),
+        modified.subsec_nanos(),
+    ))
+}
+
+fn parse_agy_version_output(raw: &str) -> Option<String> {
+    let line = raw
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())?;
+    let stripped = line
+        .strip_prefix("agy ")
+        .or_else(|| line.strip_prefix("AGY "))
+        .unwrap_or(line)
+        .trim();
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped.to_string())
+    }
+}
+
+/// Resolve and cache `agy --version` keyed by resolved binary `(path, size, mtime)`.
+///
+/// Only intended for colleague launch paths (never called on read-only snapshot/pulse/TUI paths).
+pub fn cached_version() -> Option<String> {
+    let bin = crate::agy_accounts::resolve_agy_bin(None).ok()?;
+    let cache_file = cache_dir().join(VERSION_CACHE_FILE);
+    cached_version_with(&bin, &cache_file)
+}
+
+pub(crate) fn cached_version_with(bin: &Path, cache_file: &Path) -> Option<String> {
+    let (path_str, len, mtime_secs, mtime_nanos) = bin_fingerprint(bin)?;
+    let mem = AGY_VERSION_MEM.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = mem.lock() {
+        if let Some(ref entry) = *guard {
+            if entry.path == path_str
+                && entry.len == len
+                && entry.mtime_secs == mtime_secs
+                && entry.mtime_nanos == mtime_nanos
+            {
+                return Some(entry.version.clone());
+            }
+        }
+    }
+
+    if cache_file.is_file() {
+        let doc = json(cache_file);
+        if s(&doc, "path") == path_str
+            && doc["len"].as_u64() == Some(len)
+            && doc["mtimeSecs"].as_u64() == Some(mtime_secs)
+            && doc["mtimeNanos"].as_u64() == Some(mtime_nanos as u64)
+        {
+            let ver = s(&doc, "version").trim();
+            if !ver.is_empty() {
+                let version = ver.to_string();
+                if let Ok(mut guard) = mem.lock() {
+                    *guard = Some(VersionCacheEntry {
+                        path: path_str,
+                        len,
+                        mtime_secs,
+                        mtime_nanos,
+                        version: version.clone(),
+                    });
+                }
+                return Some(version);
+            }
+        }
+    }
+
+    let out = Command::new(bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let version = parse_agy_version_output(&String::from_utf8_lossy(&out.stdout))?;
+
+    if let Some(parent) = cache_file.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let doc = json!({
+        "path": path_str,
+        "len": len,
+        "mtimeSecs": mtime_secs,
+        "mtimeNanos": mtime_nanos,
+        "version": version,
+    });
+    let _ = atomic_write(cache_file, format!("{doc}\n"));
+    if let Ok(mut guard) = mem.lock() {
+        *guard = Some(VersionCacheEntry {
+            path: path_str,
+            len,
+            mtime_secs,
+            mtime_nanos,
+            version: version.clone(),
+        });
+    }
+    Some(version)
+}
 
 /// Whether a registered model id (`provider/id`) runs on agy.
 pub fn is_agy(model: &str) -> bool {
@@ -617,6 +747,46 @@ mod tests {
         // Turn 2 has no text_delta: must NOT reuse round 1's stale tail.
         let r2 = f.events(&json!({"event":"result","result":{"status":"SUCCESS","response":"round 2 resp","usage":{}}}));
         assert_eq!(r2[1]["text"], "round 2 resp");
+    }
+
+    #[test]
+    fn cached_version_caches_by_binary_mtime_and_avoids_repeat_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!(
+            "delegate-agy-ver-cache-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        let bin = tmp.join("fake-agy");
+        let hits = tmp.join("hits.log");
+        let cache = tmp.join("agy-version-cache.json");
+        let script1 = format!(
+            "#!/bin/sh\necho hit >> '{}'\necho '1.5.17'\n",
+            hits.display()
+        );
+        fs::write(&bin, &script1).unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let v1 = cached_version_with(&bin, &cache);
+        assert_eq!(v1.as_deref(), Some("1.5.17"));
+        let v2 = cached_version_with(&bin, &cache);
+        assert_eq!(v2.as_deref(), Some("1.5.17"));
+        let hit_lines = fs::read_to_string(&hits).unwrap().lines().count();
+        assert_eq!(hit_lines, 1, "cache hit must not spawn subprocess again");
+
+        // Update binary content (changes size & mtime) -> cache invalidates and re-runs.
+        let script2 = format!(
+            "#!/bin/sh\necho hit >> '{}'\necho 'agy 1.5.18-extra'\n",
+            hits.display()
+        );
+        fs::write(&bin, &script2).unwrap();
+        let v3 = cached_version_with(&bin, &cache);
+        assert_eq!(v3.as_deref(), Some("1.5.18-extra"));
+        let hit_lines2 = fs::read_to_string(&hits).unwrap().lines().count();
+        assert_eq!(hit_lines2, 2, "changed binary must refresh version cache");
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

@@ -364,6 +364,9 @@ pub fn worker_command(_args: &[String]) -> Res<i32> {
     // Keep `<state>/eta-model.json` fresh in the background so read-only `snapshot --json`
     // never has to full-scan `events.jsonl`.
     let _ = crate::speed::load_or_refresh_eta_model_in(&state, epoch() as i64, true);
+    // Recompute quota rate drift cache & emit `quota_rate_shift` (at most 1/account/day)
+    // in the background so read paths stay strictly lock-free and zero-subprocess.
+    let _ = crate::quota_rate::refresh_and_emit_in(&state, epoch() as i64);
 
     // P1-2: Keep `<cache>/delegate/archive/.usage.json` warm and accurate.
     if !crate::archive::usage_cache_path().is_file() || drained_any {

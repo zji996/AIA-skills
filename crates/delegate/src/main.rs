@@ -46,6 +46,7 @@ mod probe;
 mod process_match;
 mod pulse;
 mod pending_reply;
+mod quota_rate;
 mod source_guard;
 mod queue;
 mod radar;
@@ -3798,8 +3799,14 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 }
                 println!("{}", json!({"statusSummary": summary}));
             } else {
-                if let Some(warn_line) = pulse::format_status_quota_alert_line_in(&state_root, now_ts) {
-                    println!("{warn_line}");
+                let warn_line = pulse::format_status_quota_alert_line_in(&state_root, now_ts);
+                if let Some(ref line) = warn_line {
+                    println!("{line}");
+                }
+                if let Some(rs_line) = pulse::format_rate_shift_alert_line_in(&state_root, now_ts) {
+                    if warn_line.as_deref() != Some(rs_line.as_str()) {
+                        println!("{rs_line}");
+                    }
                 }
                 let mut counts = format!(
                     "运行中 {running} · 待合入 {pending_apply} · 待回答 {pending_question} · 排队 {queued}"

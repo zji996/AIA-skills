@@ -1663,6 +1663,8 @@ where
     }
 
     save_quota_cache_in(state_root, &cache)?;
+    drop(_lock);
+    crate::quota_rate::refresh_and_emit_in(state_root, now_ep);
     Ok(cache)
 }
 
@@ -2568,7 +2570,12 @@ pub fn quota_snapshot_for_alerts_in(state: &Path, now_ep: i64) -> Option<Value> 
         }
         items.push(item);
     }
-    Some(json!({ "active": active_id, "mode": "fixed", "accounts": items }))
+    let mut snap = json!({ "active": active_id, "mode": "fixed", "accounts": items });
+    let rate_shifts = crate::quota_rate::load_cached_shifts_in(state, now_ep);
+    if !rate_shifts.is_empty() {
+        snap["rateShifts"] = Value::Array(rate_shifts);
+    }
+    Some(snap)
 }
 
 /// Maximum quota cache age (seconds) for shadow-mode headroom checks; older caches are treated as unknown.
@@ -3724,6 +3731,10 @@ fn snapshot_json_opts(
     if let Some(snap) = usage_snap {
         out["unassignedUsage"] = snap.unassigned;
     }
+    let rate_shifts = crate::quota_rate::load_cached_shifts_in(&state_dir(), now_ep);
+    if !rate_shifts.is_empty() {
+        out["rateShifts"] = Value::Array(rate_shifts);
+    }
     out
 }
 
@@ -4320,7 +4331,7 @@ impl QuotaTier {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QuotaWindow {
+pub(crate) enum QuotaWindow {
     FiveHour,
     Weekly,
 }
@@ -4980,7 +4991,7 @@ pub fn check_slot_health(
     Ok(())
 }
 
-fn extract_pool_window_history(
+pub(crate) fn extract_pool_window_history(
     acct_quota: &Value,
     pool: QuotaPool,
     window: QuotaWindow,
@@ -6758,7 +6769,7 @@ fn is_executable_file(p: &Path) -> bool {
         && fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
 }
 
-fn resolve_agy_bin(explicit: Option<&str>) -> Res<PathBuf> {
+pub(crate) fn resolve_agy_bin(explicit: Option<&str>) -> Res<PathBuf> {
     if let Some(p) = explicit.filter(|s| !s.trim().is_empty()) {
         let pb = PathBuf::from(p);
         if is_executable_file(&pb) {

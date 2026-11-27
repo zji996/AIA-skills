@@ -276,6 +276,7 @@ pub struct LiveTracker {
     provider: String,
     model: String,
     account: Option<String>,
+    agy_version: Option<String>,
     session: String,
     started_at: String,
     meta: Value,
@@ -346,6 +347,11 @@ impl LiveTracker {
         } else {
             None
         };
+        let agy_version = if is_agy {
+            crate::agy::cached_version()
+        } else {
+            None
+        };
         let run_id = {
             let r = s(meta, "run");
             if !r.is_empty() {
@@ -387,6 +393,7 @@ impl LiveTracker {
             provider,
             model,
             account,
+            agy_version,
             session: s(meta, "fork").to_string(),
             started_at,
             meta: meta.clone(),
@@ -477,6 +484,9 @@ impl LiveTracker {
             "startedAt": self.started_at,
             "updatedAt": iso(),
         });
+        if let Some(ref ver) = self.agy_version {
+            doc["agyVersion"] = json!(ver);
+        }
         if let Some(tok) = delta {
             doc["tokens"] = tok.to_json();
         }
@@ -535,6 +545,9 @@ impl LiveTracker {
             if let Some(ref acct) = self.account {
                 rdoc["agyAccount"] = json!(acct);
             }
+            if let Some(ref ver) = self.agy_version {
+                rdoc["agyVersion"] = json!(ver);
+            }
             if let Some(cum) = cumulative {
                 rdoc["cumulativeTokens"] = cum.to_json();
             }
@@ -565,6 +578,9 @@ impl LiveTracker {
             "tokens": delta.to_json(),
             "status": status,
         });
+        if let Some(ref ver) = self.agy_version {
+            rec["agyVersion"] = json!(ver);
+        }
         if let Some(cum) = cumulative {
             rec["cumulativeTokens"] = cum.to_json();
         }
@@ -804,6 +820,7 @@ pub struct UsageEntry {
     pub model: String,
     pub is_agy: bool,
     pub account: Option<String>,
+    pub agy_version: Option<String>,
     pub tokens: TokenCounts,
     pub live: bool,
 }
@@ -829,7 +846,7 @@ fn parse_ledger_entries(since_epoch: Option<i64>, include_non_agy: bool) -> (Vec
     parse_ledger_entries_from(&ledger_path(), since_epoch, include_non_agy)
 }
 
-fn parse_ledger_entries_from(
+pub(crate) fn parse_ledger_entries_from(
     path: &Path,
     since_epoch: Option<i64>,
     include_non_agy: bool,
@@ -886,6 +903,11 @@ fn parse_ledger_entries_from(
             .as_str()
             .filter(|a| !a.is_empty())
             .map(str::to_string);
+        let agy_version = v["agyVersion"]
+            .as_str()
+            .map(str::trim)
+            .filter(|ver| !ver.is_empty())
+            .map(str::to_string);
         entries.push(UsageEntry {
             epoch: ep,
             run,
@@ -897,6 +919,7 @@ fn parse_ledger_entries_from(
             model,
             is_agy,
             account,
+            agy_version,
             tokens,
             live: false,
         });
@@ -985,6 +1008,7 @@ fn extract_disk_run_entries(
                 model: author_model.clone(),
                 is_agy,
                 account: acct.clone(),
+                agy_version: None,
                 tokens: author_tok,
                 live: false,
             });
@@ -1021,6 +1045,11 @@ fn extract_disk_run_entries(
                     .filter(|a| !a.is_empty())
                     .map(str::to_string)
                     .or_else(|| acct.clone()),
+                agy_version: rv["agyVersion"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|ver| !ver.is_empty())
+                    .map(str::to_string),
                 tokens: rtok,
                 live: false,
             });
@@ -1050,6 +1079,7 @@ fn extract_disk_run_entries(
                         .filter(|a| !a.is_empty())
                         .map(str::to_string)
                         .or(acct),
+                    agy_version: None,
                     tokens: rtok,
                     live: false,
                 });
@@ -1582,13 +1612,13 @@ pub fn command(args: &[String]) -> Res<i32> {
     }
     let json_out = has(&flags, "--json");
     let include_non_agy = has(&flags, "--all");
-    let since_str = value(&kv, "--since").unwrap_or("24h");
     let by = value(&kv, "--by").unwrap_or("account");
-    if !matches!(by, "account" | "day" | "run" | "repo" | "cmd-out") {
+    if !matches!(by, "account" | "day" | "run" | "repo" | "cmd-out" | "quota-rate") {
         return Err(format!(
-            "--by must be one of account|day|run|repo|cmd-out, got {by:?}"
+            "--by must be one of account|day|run|repo|cmd-out|quota-rate, got {by:?}"
         ));
     }
+    let since_str = value(&kv, "--since").unwrap_or(if by == "quota-rate" { "7d" } else { "24h" });
     let account_filter = value(&kv, "--account");
     let repo_filter = value(&kv, "--repo");
 
@@ -1600,6 +1630,17 @@ pub fn command(args: &[String]) -> Res<i32> {
         let cutoff = now_ep - dur;
         (Some(cutoff), format_epoch(cutoff, false, "%Y-%m-%dT%H:%M:%SZ"))
     };
+
+    if by == "quota-rate" {
+        return crate::quota_rate::run_cli_quota_rate(
+            since_str,
+            since_epoch,
+            &since_iso,
+            account_filter,
+            json_out,
+            now_ep,
+        );
+    }
 
     let (mut entries, mut live_running, mut uncounted_running) =
         collect_all(since_epoch, include_non_agy, true);
@@ -1630,6 +1671,7 @@ pub fn command(args: &[String]) -> Res<i32> {
                 model: lr.model.clone(),
                 is_agy: lr.is_agy,
                 account: lr.account.clone(),
+                agy_version: None,
                 tokens: tok,
                 live: true,
             });
@@ -1987,6 +2029,7 @@ pub fn collect_snapshot_usage_7d(now_ep: i64) -> PrecollectedUsage {
                 model: lr.model.clone(),
                 is_agy: lr.is_agy,
                 account: lr.account.clone(),
+                agy_version: None,
                 tokens: tok,
                 live: true,
             });
@@ -2020,6 +2063,7 @@ pub fn accounts_usage_snapshot(accounts_map: &Map<String, Value>) -> AccountsUsa
                 model: lr.model.clone(),
                 is_agy: lr.is_agy,
                 account: lr.account.clone(),
+                agy_version: None,
                 tokens: tok,
                 live: true,
             });
@@ -2730,6 +2774,7 @@ mod tests {
             model: "agy/gemini-4-neon".into(),
             is_agy: true,
             account: Some("work".into()),
+            agy_version: None,
             tokens: TokenCounts::new(total_tokens, 0, 0),
             live,
         };
@@ -2774,6 +2819,7 @@ mod tests {
             model: "agy/gemini-4-neon".into(),
             is_agy: true,
             account: Some("alpha".into()),
+            agy_version: None,
             tokens: TokenCounts::new(1000, 0, 0),
             live: false,
         };

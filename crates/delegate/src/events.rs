@@ -1297,6 +1297,11 @@ pub fn format_human(ev: &Value) -> String {
                 "影子门控{src_part} {pool} 预计余 {rem}m < 需 {req}m（在跑写 {aw}，缓存 {age_m}m）"
             )
         }
+        "quota_rate_shift" => {
+            crate::quota_rate::format_shift_one_line(p, true)
+                .trim_start_matches("⚠ ")
+                .to_string()
+        }
         "queue_dispatched" => {
             format!("自动续派 {} -> {}", s(p, "queueName"), s(p, "nextRun"))
         }
@@ -1944,9 +1949,30 @@ mod tests {
             "kind": "agy_account_handoff",
             "payload": {"from": "acct-a", "to": "acct-b", "reason": "运行中额度耗尽"}
         });
+        let rate_shift_ev = json!({
+            "kind": "quota_rate_shift",
+            "payload": {
+                "account": "acct-a",
+                "pool": "gemini",
+                "poolLabel": "Gemini",
+                "window": "weekly",
+                "windowLabel": "周额度",
+                "baselineRate": 4_000_000.0,
+                "currentRate": 1_000_000.0,
+                "ratio": 4.0,
+                "baselineAgyVersions": ["1.5.16"],
+                "currentAgyVersions": ["1.5.17"],
+                "note": "可能含本机未记录的用量"
+            }
+        });
         assert!(!is_alert_event(&auto_ev));
         assert!(!is_alert_event(&handoff_ev));
+        assert!(!is_alert_event(&rate_shift_ev));
         assert!(format_human(&auto_ev).contains("自动选号 acct-a → acct-b"));
         assert!(format_human(&handoff_ev).contains("换号接力 acct-a → acct-b"));
+        let rs_txt = format_human(&rate_shift_ev);
+        assert!(rs_txt.contains("费率漂移：acct-a"));
+        assert!(rs_txt.contains("1.5.16→1.5.17"));
+        assert!(rs_txt.contains("可能含本机未记录的用量"));
     }
 }
