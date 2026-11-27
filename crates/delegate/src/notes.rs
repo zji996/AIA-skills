@@ -475,12 +475,30 @@ pub fn cleaned_pending_chains_for_root(root: &Path, all: &[PathBuf]) -> Vec<Chai
     if !crate::work::any_notes_exist() {
         return Vec::new();
     }
+    let chains = crate::work::note_chains_for_root(root, all);
+    filter_cleaned_pending_chains(all, chains)
+}
+
+pub fn cleaned_pending_chains_for_root_with_items(
+    root: &Path,
+    all: &[PathBuf],
+    items: &[crate::work::WorkItem],
+    any_notes: bool,
+) -> Vec<ChainNotes> {
+    if !any_notes {
+        return Vec::new();
+    }
+    let chains = crate::work::note_chains_for_root_with_items(root, all, items);
+    filter_cleaned_pending_chains(all, chains)
+}
+
+fn filter_cleaned_pending_chains(all: &[PathBuf], chains: Vec<ChainNotes>) -> Vec<ChainNotes> {
     let live_ids: BTreeSet<String> = all
         .iter()
         .map(|p| run_id(p, &json(p.join("meta.json"))))
         .filter(|id| !id.is_empty())
         .collect();
-    crate::work::note_chains_for_root(root, all)
+    chains
         .into_iter()
         .filter(|c| {
             c.pending_count() > 0

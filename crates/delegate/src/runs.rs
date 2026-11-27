@@ -883,7 +883,25 @@ fn build_remote_exec(run: &Path, meta: &Value, lane_info: Option<&Value>) -> Opt
     Some(obj)
 }
 
+pub struct StatusWorkCtx<'a> {
+    pub items: &'a [crate::work::WorkItem],
+    pub any_notes: bool,
+    pub all_runs: &'a [PathBuf],
+}
+
 pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
+    status_with_opts_and_work(run, check_missing_objects, None)
+}
+
+pub fn status_with_work_ctx(run: &Path, work_ctx: &StatusWorkCtx<'_>) -> Value {
+    status_with_opts_and_work(run, false, Some(work_ctx))
+}
+
+fn status_with_opts_and_work(
+    run: &Path,
+    check_missing_objects: bool,
+    work_ctx: Option<&StatusWorkCtx<'_>>,
+) -> Value {
     let meta = json(run.join("meta.json"));
     let st = state(run);
     let sum = json(run.join("summary.json"));
@@ -1267,7 +1285,18 @@ pub fn status_with_opts(run: &Path, check_missing_objects: bool) -> Value {
                 .collect::<Vec<_>>());
         }
     }
-    if crate::work::any_notes_exist() {
+    if let Some(wctx) = work_ctx {
+        if wctx.any_notes {
+            if let Some(chain_notes) =
+                crate::work::note_chain_for_run_with_items(run, wctx.all_runs, wctx.items)
+            {
+                if !chain_notes.items.is_empty() {
+                    out["notes"] = chain_notes.items_json();
+                    out["pendingNotes"] = json!(chain_notes.pending_count());
+                }
+            }
+        }
+    } else if crate::work::any_notes_exist() {
         if let Some(chain_notes) = crate::notes::for_run_lazy(run) {
             if !chain_notes.items.is_empty() {
                 out["notes"] = chain_notes.items_json();
@@ -1367,6 +1396,9 @@ pub fn remove_after_apply(run: &Path) -> (Vec<String>, bool) {
             if s(&released["worktree"], "path") == path && !active(&state(&other)) {
                 released["worktree"]["path"] = json!(format!("{path}#released"));
                 let _ = write_json(other.join("meta.json"), &released);
+                if other != run {
+                    crate::index::upsert_run(&other);
+                }
             }
         }
     }
@@ -1416,6 +1448,7 @@ pub fn remove_after_apply(run: &Path) -> (Vec<String>, bool) {
     let _ = write(run.join(".applied-cleaned"), "1\n");
     let _ = fs::remove_file(run.join("exit_code"));
     let _ = write(run.join("exit_code"), "0\n");
+    crate::index::upsert_run(run);
     if !shared
         && !crate::pool::is_slot(Path::new(&path))
         && Path::new(&path).is_absolute()
@@ -1463,6 +1496,7 @@ pub fn auto_clean_run(run: &Path, remove_worktree: bool, reason: &str) -> Res<Op
             if s(&released["worktree"], "path") == wt_path && !active(&state(&other)) {
                 released["worktree"]["path"] = json!(format!("{wt_path}#released"));
                 let _ = write_json(other.join("meta.json"), &released);
+                crate::index::upsert_run(&other);
             }
         }
     }

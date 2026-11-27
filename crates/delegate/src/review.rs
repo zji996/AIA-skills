@@ -1832,6 +1832,7 @@ pub fn sign_command(args: &[String]) -> Res<i32> {
     if !run.join("controller-review.diff").is_file() && !hit.diff.is_empty() {
         let _ = write(run.join("controller-review.diff"), &hit.diff);
     }
+    crate::index::upsert_run(&run);
     crate::premerge::on_sign_success(&run, &meta);
     if json_mode {
         let mut out = sign_doc;

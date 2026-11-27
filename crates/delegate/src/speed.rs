@@ -3348,13 +3348,16 @@ pub fn load_eta_model_in(state: &Path) -> Option<EtaModel> {
 
 /// Load cached `<state>/eta-model.json` or lazily rebuild from `events.jsonl` when missing,
 /// corrupt, or older than 15 minutes with `events.seq` advanced.
+/// Read-only callers (`allow_write == false`, e.g. `snapshot --json`) reuse a stale cached model
+/// rather than re-scanning the entire `events.jsonl` on every tick; writable callers and
+/// `_gc-worker` refresh and persist it atomically.
 #[allow(dead_code)] // Consumed by eta.rs in Chain 2.
 pub fn load_or_refresh_eta_model_in(state: &Path, now_ts: i64, allow_write: bool) -> EtaModel {
     let cur_seq = events::latest_seq_in(state);
     if let Some(cached) = load_eta_model_in(state) {
         let age = now_ts - cached.generated_epoch;
         let stale = age > ETA_MODEL_STALE_SECS && cur_seq > cached.events_seq;
-        if !stale {
+        if !stale || !allow_write {
             return cached;
         }
     }

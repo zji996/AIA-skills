@@ -877,6 +877,7 @@ pub fn mark_merge_run_applied(merge_run: &Path, applied_head: &str) {
             let _ = write_json(src_dir.join("meta.json"), &src_meta);
             crate::eta::record_calibration_applied(&src_dir, &src_meta, &at);
         }
+        crate::index::upsert_run(&src_dir);
     }
 }
 
@@ -1870,6 +1871,7 @@ pub fn command(args: &[String]) -> Res<i32> {
     write_json(merge_run.join("summary.json"), &sum)?;
     write(merge_run.join("exit_code"), format!("{exit_code}\n"))?;
     refs::pin_run(&merge_run, &meta);
+    crate::index::upsert_run(&merge_run);
     save_merge_state_record(&report);
 
     events::emit(

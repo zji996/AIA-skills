@@ -14,7 +14,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: u64 = 1;
+pub const SCHEMA_VERSION: u64 = 2;
 
 pub fn index_path(state: &Path) -> PathBuf {
     state.join("index.json")
@@ -145,7 +145,17 @@ pub fn cached_started_ns(run: &Path, index: &Value) -> Option<u64> {
 /// Fast lock-free, zero-side-effect `(status, meta)` lookup backed by `index.json`.
 /// Uses cached entry for finished runs whose stat `sig` still matches; recomputes in-memory
 /// for active runs, missing entries, or runs edited externally / by an older CLI.
+#[allow(dead_code)]
 pub fn status_and_meta_cached(run: &Path, index: &Value, work_sig: &str) -> (Value, Value) {
+    status_and_meta_cached_with_work(run, index, work_sig, None)
+}
+
+fn status_and_meta_cached_with_work(
+    run: &Path,
+    index: &Value,
+    work_sig: &str,
+    work_ctx: Option<&runs::StatusWorkCtx<'_>>,
+) -> (Value, Value) {
     let raw = run.to_string_lossy();
     let entry = index["runs"]
         .get(raw.as_ref())
@@ -168,7 +178,11 @@ pub fn status_and_meta_cached(run: &Path, index: &Value, work_sig: &str) -> (Val
             return (entry["status"].clone(), entry["meta"].clone());
         }
     }
-    (runs::status(run), runs::index_meta(run))
+    let st = match work_ctx {
+        Some(ctx) => runs::status_with_work_ctx(run, ctx),
+        None => runs::status(run),
+    };
+    (st, runs::index_meta(run))
 }
 
 /// Fast lock-free, zero-side-effect status lookup backed by `index.json`.
@@ -541,6 +555,11 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
         cleaned_notes: Vec<Value>,
     }
 
+    // Load work.jsonl once up front so the runs loop, cleaned notes, wave blockers, and
+    // `build_unified_work_view` all share the same in-memory snapshot.
+    let work_struct_items = crate::work::load_readonly_in(&state);
+    let any_notes_exist = work_struct_items.iter().any(|w| !w.followups.is_empty());
+
     let mut raw_groups: Vec<RawSnapshotGroup> = Vec::new();
     let mut all_seen_runs: BTreeMap<String, Value> = BTreeMap::new();
     let mut all_run_dirs: Vec<PathBuf> = Vec::new();
@@ -551,9 +570,15 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
         std::collections::HashMap::new();
     for (repo_path, runs_dir) in repos {
         let run_dirs = runs::all_runs_in_with_index(&runs_dir, &index);
+        let work_ctx = runs::StatusWorkCtx {
+            items: &work_struct_items,
+            any_notes: any_notes_exist,
+            all_runs: &run_dirs,
+        };
         let mut run_pairs = Vec::with_capacity(run_dirs.len());
         for run in &run_dirs {
-            let (mut st, idx_meta) = status_and_meta_cached(run, &index, &wsig);
+            let (mut st, idx_meta) =
+                status_and_meta_cached_with_work(run, &index, &wsig, Some(&work_ctx));
             for key in ["resultReadAt", "appliedAt", "repliedAt"] {
                 if s(&st, key).is_empty() && !s(&idx_meta, key).is_empty() {
                     st[key] = idx_meta[key].clone();
@@ -578,11 +603,15 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
             precomputed_statuses.insert(run.clone(), st.clone());
             run_pairs.push((run.clone(), st));
         }
-        let cleaned_notes: Vec<Value> =
-            crate::notes::cleaned_pending_chains_for_root(&runs_dir, &run_dirs)
-            .into_iter()
-            .map(|c| crate::output::cleaned_note_json(&c))
-            .collect();
+        let cleaned_notes: Vec<Value> = crate::notes::cleaned_pending_chains_for_root_with_items(
+            &runs_dir,
+            &run_dirs,
+            &work_struct_items,
+            any_notes_exist,
+        )
+        .into_iter()
+        .map(|c| crate::output::cleaned_note_json(&c))
+        .collect();
         raw_groups.push(RawSnapshotGroup {
             repo_path,
             runs_dir,
@@ -591,9 +620,6 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
         });
     }
 
-    // Load work items once so deferred-work runs are excluded from wave blockers and both
-    // `delegate work` and `delegate snapshot --json` share `build_unified_work_view`.
-    let work_struct_items = crate::work::load_readonly_in(&state);
     let mut deferred_work_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut deferred_run_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for w in &work_struct_items {
@@ -712,12 +738,14 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
     });
     let merges = crate::merge::load_merge_reports(None);
     let candidates = crate::radar::load_all_candidates(None);
-    let agy_accounts = crate::agy_accounts::snapshot_json_fast();
-    let analytics_bundle = crate::usage::tui_analytics_and_deliveries(
+    let precollected_usage = crate::usage::collect_snapshot_usage_7d(now_ts);
+    let agy_accounts = crate::agy_accounts::snapshot_json_fast_with_usage(Some(&precollected_usage));
+    let analytics_bundle = crate::usage::tui_analytics_and_deliveries_with_usage(
         &state,
         &all_seen_runs,
         &unified_work.items,
         now_ts,
+        Some(&precollected_usage),
     );
 
     let all_run_refs: Vec<&Value> = repo_groups

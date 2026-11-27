@@ -194,7 +194,126 @@ fn resolve_repos(
     discover_repos(&root, Some(cwd))
 }
 
-/// Spawn a Linux `inotify` thread watching `<state>` (`events.seq`, `index.json`, `work.jsonl`).
+const STATE_WATCH_EXACT_NAMES: &[&str] = &[
+    "events.seq",
+    "index.json",
+    "work.jsonl",
+    "dag-queue.json",
+    "agy-quota.json",
+];
+const STATE_WATCH_SUFFIXES: &[&str] = &[".slot"];
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct StateWatchHit {
+    events_seq: bool,
+    other_watched: bool,
+}
+
+impl StateWatchHit {
+    fn merge(&mut self, other: Self) {
+        self.events_seq |= other.events_seq;
+        self.other_watched |= other.other_watched;
+    }
+
+    fn any(self) -> bool {
+        self.events_seq || self.other_watched
+    }
+}
+
+fn is_watched_state_file(name: &str) -> bool {
+    if name.is_empty() || name.ends_with(".tmp") {
+        return false;
+    }
+    STATE_WATCH_EXACT_NAMES.contains(&name)
+        || STATE_WATCH_SUFFIXES.iter().any(|suf| name.ends_with(suf))
+}
+
+fn parse_inotify_buffer(buf: &[u8]) -> StateWatchHit {
+    let mut hit = StateWatchHit::default();
+    let header_size = std::mem::size_of::<libc::inotify_event>();
+    let mut offset = 0usize;
+    while offset + header_size <= buf.len() {
+        // SAFETY: `offset + header_size <= buf.len()` and `read_unaligned` handles arbitrary alignment.
+        let ev = unsafe {
+            std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const libc::inotify_event)
+        };
+        let name_len = ev.len as usize;
+        let next = match offset
+            .checked_add(header_size)
+            .and_then(|v| v.checked_add(name_len))
+        {
+            Some(n) if n <= buf.len() => n,
+            _ => break,
+        };
+        if (ev.mask & libc::IN_Q_OVERFLOW) != 0 {
+            hit.other_watched = true;
+        }
+        if name_len > 0 {
+            let raw_name = &buf[offset + header_size..next];
+            let nul_pos = raw_name
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(raw_name.len());
+            if let Ok(name) = std::str::from_utf8(&raw_name[..nul_pos]) {
+                if name == "events.seq" {
+                    hit.events_seq = true;
+                } else if is_watched_state_file(name) {
+                    hit.other_watched = true;
+                }
+            }
+        }
+        offset = next;
+    }
+    hit
+}
+
+fn drain_inotify_hits(fd: libc::c_int, buf: &mut [u8]) -> StateWatchHit {
+    let mut hit = StateWatchHit::default();
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n <= 0 {
+            break;
+        }
+        hit.merge(parse_inotify_buffer(&buf[..n as usize]));
+    }
+    hit
+}
+
+fn effective_refresh_interval(
+    inotify_active: bool,
+    has_active_runs: bool,
+    refresh_every: Duration,
+    idle_heartbeat: Duration,
+) -> Duration {
+    if inotify_active && !has_active_runs {
+        idle_heartbeat
+    } else {
+        refresh_every
+    }
+}
+
+fn compute_poll_timeout(
+    effective_interval: Duration,
+    elapsed_since_refresh: Duration,
+    refresh_in_flight: bool,
+    busy_ui: bool,
+) -> Duration {
+    let cap = if busy_ui {
+        Duration::from_millis(40)
+    } else {
+        Duration::from_millis(200)
+    };
+    if refresh_in_flight {
+        cap
+    } else {
+        effective_interval
+            .saturating_sub(elapsed_since_refresh)
+            .min(cap)
+    }
+}
+
+/// Spawn a Linux `inotify` thread watching `<state>` for allowlisted state files
+/// (`events.seq`, `index.json`, `work.jsonl`, `dag-queue.json`, `agy-quota.json`, `*.slot`).
 /// Returns `(rx_notify, active)` so the UI refreshes immediately on state changes without
 /// periodically spawning subprocesses when idle.
 fn spawn_state_watcher(stop: Arc<AtomicBool>) -> (mpsc::Receiver<()>, bool) {
@@ -229,24 +348,31 @@ fn spawn_state_watcher(stop: Arc<AtomicBool>) -> (mpsc::Receiver<()>, bool) {
             if rc <= 0 {
                 continue;
             }
-            // Drain all buffered events and debounce slightly to coalesce paired writes.
-            loop {
-                let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-                if n <= 0 {
-                    break;
-                }
+            // Drain all buffered events and ignore non-allowlisted files (locks/caches/logs/tmp).
+            let mut hit = drain_inotify_hits(fd, &mut buf);
+            if !hit.any() {
+                continue;
             }
+            // Debounce slightly to coalesce paired atomic writes.
             thread::sleep(Duration::from_millis(60));
-            loop {
-                let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-                if n <= 0 {
-                    break;
+            hit.merge(drain_inotify_hits(fd, &mut buf));
+            let should_notify = if hit.other_watched {
+                if hit.events_seq {
+                    last_seq = std::fs::read_to_string(dir.join("events.seq")).unwrap_or_default();
                 }
-            }
-            let cur_seq = std::fs::read_to_string(dir.join("events.seq")).unwrap_or_default();
-            let _ = (&last_seq, &cur_seq);
-            last_seq = cur_seq;
-            if tx.send(()).is_err() {
+                true
+            } else if hit.events_seq {
+                let cur_seq = std::fs::read_to_string(dir.join("events.seq")).unwrap_or_default();
+                if cur_seq != last_seq {
+                    last_seq = cur_seq;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if should_notify && tx.send(()).is_err() {
                 break;
             }
         }
@@ -842,8 +968,30 @@ fn main() {
             app.dirty = false;
         }
 
-        let until_refresh = refresh_every.saturating_sub(last_refresh.elapsed());
-        let poll_timeout = until_refresh.min(Duration::from_millis(40));
+        let has_active_runs = app
+            .snapshot
+            .repos
+            .iter()
+            .flat_map(|g| &g.runs)
+            .any(|r| matches!(r.state.as_str(), "running" | "starting" | "waiting" | "scouting"));
+        let effective_interval = effective_refresh_interval(
+            inotify_active,
+            has_active_runs,
+            refresh_every,
+            idle_heartbeat,
+        );
+        let busy_ui = refresh_in_flight
+            || quota_in_flight
+            || lines_in_flight
+            || !inflight_results.is_empty()
+            || !inflight_diffs.is_empty()
+            || app.toast.is_some();
+        let poll_timeout = compute_poll_timeout(
+            effective_interval,
+            last_refresh.elapsed(),
+            refresh_in_flight,
+            busy_ui,
+        );
 
         if event::poll(poll_timeout).unwrap_or(false) {
             if let Ok(ev) = event::read() {
@@ -947,17 +1095,6 @@ fn main() {
             }
         }
 
-        let has_active_runs = app
-            .snapshot
-            .repos
-            .iter()
-            .flat_map(|g| &g.runs)
-            .any(|r| matches!(r.state.as_str(), "running" | "starting" | "waiting" | "scouting"));
-        let effective_interval = if inotify_active && !has_active_runs {
-            idle_heartbeat
-        } else {
-            refresh_every
-        };
         if !refresh_in_flight && last_refresh.elapsed() >= effective_interval {
             refresh_in_flight = true;
             let _ = tx_worker.send(WorkerCmd::Refresh { force: false });
@@ -974,5 +1111,139 @@ fn main() {
     drop(quota_handle);
     if let Some(cmd) = print_on_exit {
         println!("{cmd}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn push_inotify_event(buf: &mut Vec<u8>, mask: u32, name: &str) {
+        let name_bytes = name.as_bytes();
+        let padded_len = if name_bytes.is_empty() {
+            0
+        } else {
+            ((name_bytes.len() + 1) + 3) & !3
+        };
+        let ev = libc::inotify_event {
+            wd: 1,
+            mask,
+            cookie: 0,
+            len: padded_len as u32,
+        };
+        let header = unsafe {
+            std::slice::from_raw_parts(
+                (&ev as *const libc::inotify_event).cast::<u8>(),
+                std::mem::size_of::<libc::inotify_event>(),
+            )
+        };
+        buf.extend_from_slice(header);
+        if padded_len > 0 {
+            buf.extend_from_slice(name_bytes);
+            buf.resize(buf.len() + (padded_len - name_bytes.len()), 0);
+        }
+    }
+
+    #[test]
+    fn idle_poll_timeout_stays_nonzero_past_active_refresh_interval() {
+        let refresh_every = Duration::from_secs(5);
+        let idle_heartbeat = Duration::from_secs(60);
+        let effective = effective_refresh_interval(true, false, refresh_every, idle_heartbeat);
+        assert_eq!(effective, idle_heartbeat);
+
+        // Regression lock: when no active run exists and elapsed > refresh_every (e.g. 10s > 5s),
+        // poll_timeout must remain > 0 so the main loop never busy-spins at 0ms.
+        let timeout_idle = compute_poll_timeout(effective, Duration::from_secs(10), false, false);
+        assert!(
+            timeout_idle > Duration::ZERO,
+            "idle poll timeout must be > 0, got {timeout_idle:?}"
+        );
+        assert_eq!(timeout_idle, Duration::from_millis(200));
+
+        let timeout_busy = compute_poll_timeout(effective, Duration::from_secs(10), false, true);
+        assert_eq!(timeout_busy, Duration::from_millis(40));
+
+        // Once the full idle heartbeat elapses, poll_timeout drops to 0 so the heartbeat fires.
+        let timeout_due = compute_poll_timeout(effective, Duration::from_secs(60), false, false);
+        assert_eq!(timeout_due, Duration::ZERO);
+
+        // While a refresh is already in flight, never busy-spin at 0ms.
+        let timeout_inflight = compute_poll_timeout(effective, Duration::from_secs(65), true, true);
+        assert_eq!(timeout_inflight, Duration::from_millis(40));
+    }
+
+    #[test]
+    fn state_watcher_whitelist_matches_expected_files_and_ignores_noise() {
+        for allowed in [
+            "events.seq",
+            "index.json",
+            "work.jsonl",
+            "dag-queue.json",
+            "agy-quota.json",
+            "slot-0.slot",
+            "abc123.slot",
+        ] {
+            assert!(
+                is_watched_state_file(allowed),
+                "{allowed} should be allowlisted"
+            );
+        }
+
+        for ignored in [
+            "",
+            ".state.lock",
+            "line-stats-cache.json",
+            "eta-model.json",
+            "history-7d-cache.json",
+            "hook-actions.jsonl",
+            "events.jsonl",
+            "index.json.tmp",
+            "events.seq.tmp",
+            "slot-0.slot.tmp",
+        ] {
+            assert!(
+                !is_watched_state_file(ignored),
+                "{ignored} should be ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_inotify_buffer_classifies_allowlisted_and_ignored_events() {
+        let mut ignored_buf = Vec::new();
+        push_inotify_event(&mut ignored_buf, libc::IN_CLOSE_WRITE, ".state.lock");
+        push_inotify_event(&mut ignored_buf, libc::IN_MOVED_TO, "eta-model.json");
+        push_inotify_event(&mut ignored_buf, libc::IN_MOVED_TO, "index.json.tmp");
+        assert_eq!(parse_inotify_buffer(&ignored_buf), StateWatchHit::default());
+
+        let mut seq_only = Vec::new();
+        push_inotify_event(&mut seq_only, libc::IN_MOVED_TO, "events.seq");
+        assert_eq!(
+            parse_inotify_buffer(&seq_only),
+            StateWatchHit {
+                events_seq: true,
+                other_watched: false,
+            }
+        );
+
+        let mut slot_buf = Vec::new();
+        push_inotify_event(&mut slot_buf, libc::IN_CREATE, "worker-1.slot");
+        assert_eq!(
+            parse_inotify_buffer(&slot_buf),
+            StateWatchHit {
+                events_seq: false,
+                other_watched: true,
+            }
+        );
+
+        let mut overflow_buf = Vec::new();
+        push_inotify_event(&mut overflow_buf, libc::IN_Q_OVERFLOW, "");
+        assert_eq!(
+            parse_inotify_buffer(&overflow_buf),
+            StateWatchHit {
+                events_seq: false,
+                other_watched: true,
+            }
+        );
     }
 }

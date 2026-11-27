@@ -1465,22 +1465,56 @@ fn history_entry_for_run(run_ref: &str, state: &Path, repo_hint: Option<&str>) -
     None
 }
 
+struct ArchiveDirIndex {
+    root: PathBuf,
+    dir_mtime: Option<(i64, i64)>,
+    entries: Vec<String>,
+}
+
+fn archive_dir_mtime(arch_root: &Path) -> Option<(i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::metadata(arch_root).ok()?;
+    Some((m.mtime(), m.mtime_nsec()))
+}
+
 /// Find archived run record directory under `<cache>/archive/<run>/record`.
+/// Uses a directory-mtime-keyed index so repeated lookups never re-scan the archive root
+/// unless `<cache>/archive` itself changes.
 fn find_archived_record(run_ref: &str) -> Option<PathBuf> {
     let arch_root = cache_dir().join("archive");
     let exact = arch_root.join(run_ref).join("record");
     if exact.join("meta.json").is_file() {
         return Some(exact);
     }
-    let rd = fs::read_dir(&arch_root).ok()?;
+    let cur_mtime = archive_dir_mtime(&arch_root)?;
+    static ARCHIVE_INDEX: std::sync::OnceLock<std::sync::Mutex<Option<ArchiveDirIndex>>> =
+        std::sync::OnceLock::new();
+    let lock = ARCHIVE_INDEX.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let need_rebuild = match guard.as_ref() {
+        Some(idx) => idx.root != arch_root || idx.dir_mtime != Some(cur_mtime),
+        None => true,
+    };
+    if need_rebuild {
+        let rd = fs::read_dir(&arch_root).ok()?;
+        let entries: Vec<String> = rd
+            .flatten()
+            .map(|ent| ent.file_name().to_string_lossy().into_owned())
+            .collect();
+        *guard = Some(ArchiveDirIndex {
+            root: arch_root.clone(),
+            dir_mtime: Some(cur_mtime),
+            entries,
+        });
+    }
+    let idx = guard.as_ref()?;
     let mut matches = Vec::new();
-    for ent in rd.flatten() {
-        let rec = ent.path().join("record");
-        if !rec.join("meta.json").is_file() {
+    for dir_name in &idx.entries {
+        if !run_id_matches(dir_name, run_ref) {
             continue;
         }
-        let dir_name = ent.file_name().to_string_lossy().into_owned();
-        if run_id_matches(&dir_name, run_ref) {
+        let rec = arch_root.join(dir_name).join("record");
+        if rec.join("meta.json").is_file() {
             matches.push(rec);
         }
     }
@@ -4656,8 +4690,11 @@ pub fn note_chains_for_current_root(all: &[PathBuf]) -> Vec<notes::ChainNotes> {
     note_chains_for_root(&runs_root(), all)
 }
 
-pub fn note_chains_for_root(root: &Path, all: &[PathBuf]) -> Vec<notes::ChainNotes> {
-    let items = load_items_for_notes(&state_dir());
+pub fn note_chains_for_root_with_items(
+    root: &Path,
+    all: &[PathBuf],
+    items: &[WorkItem],
+) -> Vec<notes::ChainNotes> {
     items
         .iter()
         .filter(|w| !w.followups.is_empty() && item_belongs_to_runs_root(w, root))
@@ -4665,13 +4702,26 @@ pub fn note_chains_for_root(root: &Path, all: &[PathBuf]) -> Vec<notes::ChainNot
         .collect()
 }
 
-pub fn note_chain_for_run(run: &Path, all: &[PathBuf]) -> Option<notes::ChainNotes> {
-    let (_, _, members, _) = notes::chain_info_for(run, all);
+pub fn note_chains_for_root(root: &Path, all: &[PathBuf]) -> Vec<notes::ChainNotes> {
     let items = load_items_for_notes(&state_dir());
+    note_chains_for_root_with_items(root, all, &items)
+}
+
+pub fn note_chain_for_run_with_items(
+    run: &Path,
+    all: &[PathBuf],
+    items: &[WorkItem],
+) -> Option<notes::ChainNotes> {
+    let (_, _, members, _) = notes::chain_info_for(run, all);
     items
         .iter()
         .find(|w| !w.followups.is_empty() && members.iter().any(|m| w.matches_run(m)))
         .and_then(|w| work_item_to_chain_notes(w, all))
+}
+
+pub fn note_chain_for_run(run: &Path, all: &[PathBuf]) -> Option<notes::ChainNotes> {
+    let items = load_items_for_notes(&state_dir());
+    note_chain_for_run_with_items(run, all, &items)
 }
 
 pub fn note_add_for_run(
@@ -6674,6 +6724,7 @@ pub(crate) fn build_unified_work_view(
         Vec::new()
     };
 
+    let mut cond_cache: HashMap<(String, String), CondEval> = HashMap::new();
     let mut all_rows: Vec<TableRow> = items
         .iter()
         .map(|w| {
@@ -6694,12 +6745,17 @@ pub(crate) fn build_unified_work_view(
                 obj["repoLabel"] = json!(repo_lbl);
                 obj["focus"] = json!(base_focus);
                 obj["next"] = json!(next_act);
-                if !w.wait_on.is_empty() {
+                let is_closed = w.state == "done" || w.closed_kind == "dropped";
+                if !is_closed && !w.wait_on.is_empty() {
                     obj["waitOnStatus"] = json!(w
                         .wait_on
                         .iter()
                         .map(|c| {
-                            let ev = evaluate_condition(c, w, &items, state, now_epoch);
+                            let ev = cond_cache
+                                .entry((w.repo.clone(), c.clone()))
+                                .or_insert_with(|| {
+                                    evaluate_condition(c, w, &items, state, now_epoch)
+                                });
                             json!({
                                 "condition": ev.raw,
                                 "satisfied": ev.satisfied,
@@ -6709,12 +6765,16 @@ pub(crate) fn build_unified_work_view(
                         })
                         .collect::<Vec<_>>());
                 }
-                if !w.verify_on.is_empty() {
+                if !is_closed && !w.verify_on.is_empty() {
                     obj["verifyOnStatus"] = json!(w
                         .verify_on
                         .iter()
                         .map(|c| {
-                            let ev = evaluate_condition(c, w, &items, state, now_epoch);
+                            let ev = cond_cache
+                                .entry((w.repo.clone(), c.clone()))
+                                .or_insert_with(|| {
+                                    evaluate_condition(c, w, &items, state, now_epoch)
+                                });
                             json!({
                                 "condition": ev.raw,
                                 "satisfied": ev.satisfied,

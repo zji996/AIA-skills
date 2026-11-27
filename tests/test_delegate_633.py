@@ -424,14 +424,97 @@ class Delegate633Tests(unittest.TestCase):
         idx_file.write_text("{corrupt")
         self.run_gc_worker_sync(repo)
         repaired = json.loads(idx_file.read_text())
-        self.assertEqual(repaired["schemaVersion"], 1)
+        self.assertEqual(repaired["schemaVersion"], 2)
         self.assertIsInstance(repaired["runs"], dict)
 
         # Wrong schemaVersion -> `_gc-worker` rebuilds it
         idx_file.write_text(json.dumps({"schemaVersion": 999, "runs": {}}))
         self.run_gc_worker_sync(repo)
         rebuilt = json.loads(idx_file.read_text())
-        self.assertEqual(rebuilt["schemaVersion"], 1)
+        self.assertEqual(rebuilt["schemaVersion"], 2)
+
+    @staticmethod
+    def _compute_run_sig(run_dir: Path) -> str:
+        names = [
+            "meta.json",
+            "summary.json",
+            "exit_code",
+            ".applied",
+            ".applied-cleaned",
+            ".delivered",
+            ".truncated",
+            ".sync-base",
+            ".generate-pending",
+            ".waiting",
+            "review.json",
+            "card.json",
+            "premerge.json",
+            "stall-warning.json",
+            "missing-objects.json",
+            "result.md",
+            "appends.json",
+            "pending-reply.json",
+            "sign.json",
+        ]
+        tokens = []
+        for name in names:
+            p = run_dir / name
+            try:
+                st = p.stat()
+                tokens.append(f"{int(st.st_mtime)}.{st.st_mtime_ns % 1_000_000_000}:{st.st_size}")
+            except FileNotFoundError:
+                tokens.append("-")
+        return "|".join(tokens)
+
+    def _assert_index_sig_fresh(self, run_dir: Path, label: str) -> None:
+        idx_doc = json.loads((self.state_dir() / "index.json").read_text(encoding="utf-8"))
+        key = str(run_dir.resolve())
+        entry = idx_doc["runs"].get(key)
+        self.assertIsNotNone(entry, f"{label}: missing index.json entry for {key}")
+        self.assertEqual(
+            entry["sig"],
+            self._compute_run_sig(run_dir),
+            f"{label}: index.json sig stale for {key}",
+        )
+
+    def test_write_paths_keep_index_sig_fresh(self):
+        repo = self.repo({"a.txt": "v0\n"})
+        self.fake_pi([fixtures.answer("first answer"), fixtures.SETTLED], pre="echo v1 > a.txt")
+        r1 = self.outcome(
+            self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "--name", "sig-r1", "edit")
+        )
+        r1_dir = Path(r1["dir"])
+
+        # 1. `delegate result` touches `.delivered` and marks `resultReadAt`: index sig must match.
+        res = self.cli("result", r1["run"], cwd=repo)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue((r1_dir / ".delivered").exists())
+        self._assert_index_sig_fresh(r1_dir, "after delegate result")
+
+        # 2. `delegate reply` updates parent `meta.json` (`repliedAt`): parent index sig must match.
+        self.fake_pi([fixtures.answer("second answer"), fixtures.SETTLED], pre="echo v2 > a.txt")
+        r2 = self.outcome(
+            self.cli("reply", r1["run"], "follow up", cwd=repo)
+        )
+        r2_dir = Path(r2["dir"])
+        self._assert_index_sig_fresh(r1_dir, "parent after delegate reply")
+        w_res = self.cli("wait", r2["run"], cwd=repo)
+        self.assertEqual(w_res.returncode, 0, w_res.stderr)
+        self._assert_index_sig_fresh(r2_dir, "child after wait")
+
+        # 3. `detect_applied` (via `delegate handoff` on finished r3):
+        # apply r3's exact tree change manually in source repo, then invoke `handoff`
+        # so `detect_applied` marks r3 `.applied` and upserts index.json.
+        self.fake_pi([fixtures.answer("third answer"), fixtures.SETTLED], pre="echo v3 > a.txt")
+        r3 = self.outcome(
+            self.cli("run", "--worktree", "--workdir", repo, "--accept", "true", "--name", "sig-r3", "edit3")
+        )
+        r3_dir = Path(r3["dir"])
+        (repo / "a.txt").write_text("v3\n", encoding="utf-8")
+        ho_res = self.cli("handoff", cwd=repo)
+        self.assertEqual(ho_res.returncode, 0, ho_res.stderr)
+        self.assertTrue((r3_dir / ".applied").exists(), "detect_applied should mark r3 .applied")
+        self._assert_index_sig_fresh(r3_dir, "main run after detect_applied")
 
 
 if __name__ == "__main__":

@@ -361,6 +361,9 @@ pub fn worker_command(_args: &[String]) -> Res<i32> {
     if crate::index::needs_rebuild(&state) {
         crate::index::rebuild_all();
     }
+    // Keep `<state>/eta-model.json` fresh in the background so read-only `snapshot --json`
+    // never has to full-scan `events.jsonl`.
+    let _ = crate::speed::load_or_refresh_eta_model_in(&state, epoch() as i64, true);
 
     // P1-2: Keep `<cache>/delegate/archive/.usage.json` warm and accurate.
     if !crate::archive::usage_cache_path().is_file() || drained_any {

@@ -1268,6 +1268,7 @@ pub(crate) fn apply_fast_forward(
                     &[("applied", &after_tree), ("sync-base", &after_tree)],
                 );
             }
+            index::upsert_run(&chain);
             let parent = s(&chain_meta, "parent").to_string();
             if parent.is_empty()
                 || !chain

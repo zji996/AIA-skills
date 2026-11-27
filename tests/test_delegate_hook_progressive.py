@@ -207,7 +207,7 @@ class DelegateHookProgressiveTests(unittest.TestCase):
                 "meta": meta_obj,
             }
         (sdir / "index.json").write_text(
-            json.dumps({"schemaVersion": 1, "updatedAt": iso_ago(0.01), "seq": 0, "runs": runs_map}),
+            json.dumps({"schemaVersion": 2, "updatedAt": iso_ago(0.01), "seq": 0, "runs": runs_map}),
             encoding="utf-8",
         )
 

@@ -1845,12 +1845,13 @@ pub(crate) fn mark_scout_consumed(scout_dir: &Path) {
             if changed {
                 let _ = write_json(&meta_path, &smeta);
             }
+            touch(scout_dir.join(".delivered"));
             crate::index::upsert_run(scout_dir);
         }
     } else {
+        touch(scout_dir.join(".delivered"));
         crate::mark_result_read(scout_dir);
     }
-    touch(scout_dir.join(".delivered"));
     let smeta = json(&meta_path);
     crate::events::mark_run_read(&crate::events::run_id_for(scout_dir, &smeta));
     crate::board::refresh_for_run(scout_dir);

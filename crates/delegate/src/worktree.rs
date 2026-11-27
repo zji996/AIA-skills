@@ -1136,6 +1136,7 @@ pub fn detect_applied(run: &Path, meta: &Value) -> bool {
             updated["appliedAt"] = json!(at);
         }
         crate::refs::pin_slot(run, &updated, "applied", s(&rec, "after"));
+        crate::index::upsert_run(run);
         crate::history::record_apply(run, &updated, &at, &head, "detected", None);
         crate::events::emit(
             &crate::events::run_id_for(run, &updated),
@@ -1204,6 +1205,7 @@ pub fn detect_applied(run: &Path, meta: &Value) -> bool {
                 if !s(&prec, "after").is_empty() {
                     crate::refs::pin_slot(&pdir, &pupdated, "applied", s(&prec, "after"));
                 }
+                crate::index::upsert_run(&pdir);
                 crate::history::record_apply(&pdir, &pupdated, &at, &head, "detected", None);
                 crate::events::emit(
                     &crate::events::run_id_for(&pdir, &pupdated),
@@ -1384,6 +1386,7 @@ pub fn mark_applied(
         if !s(&rec, "after").is_empty() {
             crate::refs::pin_slot(&rdir, &updated_meta, "applied", s(&rec, "after"));
         }
+        crate::index::upsert_run(&rdir);
         marked_runs.push((rdir, updated_meta, applied_doc));
     }
 
@@ -2652,6 +2655,7 @@ fn sync_with_mode_inner(
         write_json(chain.join(".sync-base"), &state)?;
         let chain_meta = json(chain.join("meta.json"));
         crate::refs::pin_slot(&chain, &chain_meta, "sync-base", s(&current_source, "tree"));
+        crate::index::upsert_run(&chain);
         let parent = s(&chain_meta, "parent").to_string();
         if parent.is_empty()
             || !chain
@@ -4146,6 +4150,7 @@ fn apply_checked(
                 }
                 let _ = write_json(run.join("meta.json"), &updated);
                 crate::refs::pin_slot(run, &meta, "applied", s(&meta["base"], "tree"));
+                crate::index::upsert_run(run);
                 crate::premerge::spawn_worker_force(source);
             } else if let Some((hash, title)) = failed_commit {
                 let short = &hash[..7.min(hash.len())];
@@ -5837,6 +5842,7 @@ fn apply_inner(
                 &chain_meta,
                 &[("applied", &after), ("sync-base", &after)],
             );
+            crate::index::upsert_run(&chain);
             let parent = s(&chain_meta, "parent").to_string();
             if parent.is_empty()
                 || !chain

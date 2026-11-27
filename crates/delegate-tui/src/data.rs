@@ -6,6 +6,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, OnceLock};
 
 const PRUNE_DIRS: &[&str] = &[".cache", "target", "node_modules", "third_party", ".git"];
 const MAX_WALK_DEPTH: usize = 6;
@@ -13,19 +14,17 @@ const MAX_WALK_DEPTH: usize = 6;
 #[derive(Debug, Clone)]
 pub struct DelegateClient {
     pub bin: PathBuf,
-    lane_json_supported: bool,
-    result_no_mark_supported: bool,
+    lane_json_supported: Arc<OnceLock<bool>>,
+    result_no_mark_supported: Arc<OnceLock<bool>>,
 }
 
 impl DelegateClient {
     pub fn discover(explicit: Option<PathBuf>) -> Self {
         let bin = resolve_delegate_bin(explicit);
-        let lane_json_supported = probe_help_contains(&bin, "lane", "--json");
-        let result_no_mark_supported = probe_help_contains(&bin, "result", "--no-mark");
         Self {
             bin,
-            lane_json_supported,
-            result_no_mark_supported,
+            lane_json_supported: Arc::new(OnceLock::new()),
+            result_no_mark_supported: Arc::new(OnceLock::new()),
         }
     }
 
@@ -34,11 +33,27 @@ impl DelegateClient {
         lane_json_supported: bool,
         result_no_mark_supported: bool,
     ) -> Self {
+        let lane = OnceLock::new();
+        let _ = lane.set(lane_json_supported);
+        let result = OnceLock::new();
+        let _ = result.set(result_no_mark_supported);
         Self {
             bin,
-            lane_json_supported,
-            result_no_mark_supported,
+            lane_json_supported: Arc::new(lane),
+            result_no_mark_supported: Arc::new(result),
         }
+    }
+
+    fn lane_json_supported(&self) -> bool {
+        *self
+            .lane_json_supported
+            .get_or_init(|| probe_help_contains(&self.bin, "lane", "--json"))
+    }
+
+    fn result_no_mark_supported(&self) -> bool {
+        *self
+            .result_no_mark_supported
+            .get_or_init(|| probe_help_contains(&self.bin, "result", "--no-mark"))
     }
 
     pub fn fetch_repo_status(&self, repo: &Path, home: Option<&Path>) -> Result<RepoGroup, String> {
@@ -61,9 +76,10 @@ impl DelegateClient {
     }
 
     pub fn fetch_lane(&self) -> Result<LaneStatus, String> {
+        let json_supported = self.lane_json_supported();
         let mut cmd = Command::new(&self.bin);
         cmd.arg("lane");
-        if self.lane_json_supported {
+        if json_supported {
             cmd.arg("--json");
         }
         let output = cmd
@@ -74,7 +90,7 @@ impl DelegateClient {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!("lane 失败: {}", single_line(&stderr)));
         }
-        if self.lane_json_supported {
+        if json_supported {
             parse_lane_json(&stdout).or_else(|_| Ok(parse_lane_text(&stdout)))
         } else {
             Ok(parse_lane_text(&stdout))
@@ -84,7 +100,7 @@ impl DelegateClient {
     pub fn fetch_result(&self, repo: &Path, run_id: &str) -> Result<String, String> {
         let mut cmd = Command::new(&self.bin);
         cmd.arg("result");
-        if self.result_no_mark_supported {
+        if self.result_no_mark_supported() {
             cmd.arg("--no-mark");
         }
         cmd.arg(run_id).current_dir(repo);
@@ -496,20 +512,17 @@ pub fn parse_snapshot_json(
             let repo_path = PathBuf::from(r["path"].as_str().unwrap_or(""));
             let runs_dir_str = r["runsDir"].as_str().unwrap_or("");
             let label = repo_display_label(&repo_path, home);
-            let mut jsonl = String::new();
-            if let Some(runs) = r["runs"].as_array() {
-                for item in runs {
-                    jsonl.push_str(&item.to_string());
-                    jsonl.push('\n');
-                }
-            }
-            if let Some(cleaned) = r["cleanedNotes"].as_array() {
-                for item in cleaned {
-                    jsonl.push_str(&item.to_string());
-                    jsonl.push('\n');
-                }
-            }
-            let mut group = parse_status_jsonl_at(&repo_path, &label, &jsonl, generated_epoch);
+            let runs_slice = r["runs"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+            let cleaned_slice = r["cleanedNotes"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let mut group = parse_status_values_at(
+                &repo_path,
+                &label,
+                runs_slice.iter().chain(cleaned_slice.iter()),
+                generated_epoch,
+            );
             if !runs_dir_str.is_empty() {
                 group.runs_dir = PathBuf::from(runs_dir_str);
             }
@@ -521,33 +534,40 @@ pub fn parse_snapshot_json(
     sort_repos_for_cwd(&mut groups, cwd);
 
     let lane = if doc["lane"].is_object() && !doc["lane"].as_object().is_none_or(|m| m.is_empty()) {
-        parse_lane_json(&doc["lane"].to_string()).unwrap_or_default()
+        parse_lane_value(&doc["lane"])
     } else {
         LaneStatus::default()
     };
 
-    let arr_to_jsonl = |val: &Value| -> String {
-        val.as_array()
-            .map(|items| {
-                let mut out = String::new();
-                for it in items {
-                    out.push_str(&it.to_string());
-                    out.push('\n');
-                }
-                out
-            })
-            .unwrap_or_default()
-    };
-
     let work = parse_work_value(&doc["work"]);
-    let mut events = parse_events_jsonl(&arr_to_jsonl(&doc["events"]));
+    let mut events = parse_events_values(
+        doc["events"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+    );
     let events_has_more = doc["eventsHasMore"].as_bool().unwrap_or(false);
     let events_earliest_seq = doc["eventsEarliestSeq"]
         .as_u64()
         .or_else(|| events.first().map(|e| e.seq));
-    let dag_queue = parse_dag_queue_jsonl(&arr_to_jsonl(&doc["dagQueue"]));
-    let merges = parse_merges_jsonl(&arr_to_jsonl(&doc["merges"]));
-    let candidates = parse_candidates_jsonl(&arr_to_jsonl(&doc["candidates"]));
+    let dag_queue = parse_dag_queue_values(
+        doc["dagQueue"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+    );
+    let merges = parse_merges_values(
+        doc["merges"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+    );
+    let candidates = parse_candidates_values(
+        doc["candidates"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+    );
     let mut agy_accounts = parse_agy_accounts_value(&doc["agyAccounts"]);
     enrich_run_names_from_groups(&groups, &mut events, &mut agy_accounts);
     let analytics = parse_analytics_value(&doc["analytics"]);
@@ -740,7 +760,7 @@ pub fn parse_status_jsonl_at(
     raw: &str,
     now_epoch: Option<i64>,
 ) -> RepoGroup {
-    let mut raw_items: Vec<Value> = Vec::new();
+    let mut parsed_items: Vec<Value> = Vec::new();
     for line in raw.lines() {
         let trimmed = line.trim();
         if !trimmed.starts_with('{') {
@@ -749,6 +769,19 @@ pub fn parse_status_jsonl_at(
         let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
+        parsed_items.push(v);
+    }
+    parse_status_values_at(repo_path, repo_label, parsed_items.iter(), now_epoch)
+}
+
+fn parse_status_values_at<'a>(
+    repo_path: &Path,
+    repo_label: &str,
+    items: impl IntoIterator<Item = &'a Value>,
+    now_epoch: Option<i64>,
+) -> RepoGroup {
+    let mut raw_items: Vec<&'a Value> = Vec::new();
+    for v in items {
         // Skip non-run metadata objects (worktreeDisk, sourceBuildDisk, statusSummary).
         let run_id = v.get("run").and_then(Value::as_str).unwrap_or("");
         let state = v.get("state").and_then(Value::as_str).unwrap_or("");
@@ -759,9 +792,9 @@ pub fn parse_status_jsonl_at(
     }
 
     // Build parent map to collapse reply chains to their latest run.
-    let mut by_id: HashMap<String, &Value> = HashMap::new();
+    let mut by_id: HashMap<String, &'a Value> = HashMap::new();
     let mut parents: HashSet<String> = HashSet::new();
-    for item in &raw_items {
+    for &item in &raw_items {
         if let Some(id) = item.get("run").and_then(Value::as_str) {
             by_id.insert(id.to_string(), item);
         }
@@ -775,7 +808,7 @@ pub fn parse_status_jsonl_at(
     }
 
     let mut runs = Vec::new();
-    for item in &raw_items {
+    for &item in &raw_items {
         let run_id = item
             .get("run")
             .and_then(Value::as_str)
@@ -2152,6 +2185,10 @@ fn string_list(val: Option<&Value>) -> Vec<String> {
 /// Parse `delegate lane --json` output.
 pub fn parse_lane_json(raw: &str) -> Result<LaneStatus, String> {
     let v: Value = serde_json::from_str(raw.trim()).map_err(|e| e.to_string())?;
+    Ok(parse_lane_value(&v))
+}
+
+fn parse_lane_value(v: &Value) -> LaneStatus {
     let parse_entries = |key: &str, remote: bool| -> Vec<LaneEntry> {
         v.get(key)
             .and_then(Value::as_array)
@@ -2186,7 +2223,7 @@ pub fn parse_lane_json(raw: &str) -> Result<LaneStatus, String> {
             })
         })
         .collect();
-    Ok(LaneStatus {
+    LaneStatus {
         max_heavy: v.get("maxHeavy").and_then(Value::as_u64).map(|n| n as usize),
         heavy_jobs: v
             .get("heavyJobs")
@@ -2222,7 +2259,7 @@ pub fn parse_lane_json(raw: &str) -> Result<LaneStatus, String> {
             .map(|n| n as usize),
         local: parse_entries("local", false),
         remote: parse_entries("remote", true),
-    })
+    }
 }
 
 /// Parse plain-text `delegate lane` output (works on all delegate versions).
@@ -3039,15 +3076,22 @@ fn is_short_hex_hash(s: &str) -> bool {
 }
 
 pub fn parse_events_jsonl(raw: &str) -> Vec<EventItem> {
-    let mut out = Vec::new();
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with('{') {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
+    let vals: Vec<Value> = raw
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('{') {
+                return None;
+            }
+            serde_json::from_str::<Value>(trimmed).ok()
+        })
+        .collect();
+    parse_events_values(&vals)
+}
+
+fn parse_events_values(items: &[Value]) -> Vec<EventItem> {
+    let mut out = Vec::with_capacity(items.len());
+    for v in items {
         let Some(seq) = v.get("seq").and_then(Value::as_u64) else {
             continue;
         };
@@ -3291,15 +3335,22 @@ fn summarize_event_payload(kind: &str, run: &str, p: &Value) -> String {
 }
 
 pub fn parse_dag_queue_jsonl(raw: &str) -> Vec<DagQueueItem> {
-    let mut out = Vec::new();
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with('{') {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
+    let vals: Vec<Value> = raw
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('{') {
+                return None;
+            }
+            serde_json::from_str::<Value>(trimmed).ok()
+        })
+        .collect();
+    parse_dag_queue_values(&vals)
+}
+
+fn parse_dag_queue_values(items: &[Value]) -> Vec<DagQueueItem> {
+    let mut out = Vec::with_capacity(items.len());
+    for v in items {
         let name = v
             .get("name")
             .and_then(Value::as_str)
@@ -3349,15 +3400,22 @@ pub fn parse_dag_queue_jsonl(raw: &str) -> Vec<DagQueueItem> {
 }
 
 pub fn parse_merges_jsonl(raw: &str) -> Vec<MergeRunItem> {
-    let mut out = Vec::new();
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with('{') {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
+    let vals: Vec<Value> = raw
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('{') {
+                return None;
+            }
+            serde_json::from_str::<Value>(trimmed).ok()
+        })
+        .collect();
+    parse_merges_values(&vals)
+}
+
+fn parse_merges_values(items: &[Value]) -> Vec<MergeRunItem> {
+    let mut out = Vec::with_capacity(items.len());
+    for v in items {
         let Some(merge_run) = v.get("mergeRun").and_then(Value::as_str) else {
             continue;
         };
@@ -3411,15 +3469,22 @@ pub fn parse_merges_jsonl(raw: &str) -> Vec<MergeRunItem> {
 }
 
 pub fn parse_candidates_jsonl(raw: &str) -> Vec<RadarCandidateItem> {
-    let mut out = Vec::new();
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with('{') {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
+    let vals: Vec<Value> = raw
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('{') {
+                return None;
+            }
+            serde_json::from_str::<Value>(trimmed).ok()
+        })
+        .collect();
+    parse_candidates_values(&vals)
+}
+
+fn parse_candidates_values(items: &[Value]) -> Vec<RadarCandidateItem> {
+    let mut out = Vec::with_capacity(items.len());
+    for v in items {
         let Some(id) = v.get("id").and_then(Value::as_str) else {
             continue;
         };

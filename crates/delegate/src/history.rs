@@ -2554,8 +2554,76 @@ fn read_recent_window_file(
     }
 }
 
+const HISTORY_7D_CACHE_FILE: &str = "history-7d-cache.json";
+const HISTORY_7D_CACHE_VERSION: u64 = 1;
+const HISTORY_7D_CACHE_SLACK_SECS: i64 = 3600;
+
+impl RecentHistoryRecord {
+    fn to_json(&self) -> Value {
+        json!({
+            "run": self.run,
+            "name": self.name,
+            "repoLabel": self.repo_label,
+            "sourceRoot": self.source_root,
+            "mode": self.mode,
+            "state": self.state,
+            "parent": self.parent,
+            "startedEpoch": self.started_epoch,
+            "finishedEpoch": self.finished_epoch,
+            "appliedEpoch": self.applied_epoch,
+            "appliedAt": self.applied_at,
+            "appliedHead": self.applied_head,
+            "elapsedSeconds": self.elapsed_seconds,
+            "reworkCount": self.rework_count,
+            "changesFiles": self.changes_files,
+            "added": self.added,
+            "deleted": self.deleted,
+            "conclusion": self.conclusion,
+            "cleaned": self.cleaned,
+            "archive": self.archive,
+        })
+    }
+
+    fn from_json(v: &Value) -> Option<Self> {
+        let run = s(v, "run");
+        if run.is_empty() {
+            return None;
+        }
+        Some(Self {
+            run: run.to_string(),
+            name: s(v, "name").to_string(),
+            repo_label: s(v, "repoLabel").to_string(),
+            source_root: s(v, "sourceRoot").to_string(),
+            mode: s(v, "mode").to_string(),
+            state: s(v, "state").to_string(),
+            parent: s(v, "parent").to_string(),
+            started_epoch: v["startedEpoch"].as_i64().unwrap_or(0),
+            finished_epoch: v["finishedEpoch"].as_i64().unwrap_or(0),
+            applied_epoch: v["appliedEpoch"].as_i64(),
+            applied_at: s(v, "appliedAt").to_string(),
+            applied_head: s(v, "appliedHead").to_string(),
+            elapsed_seconds: v["elapsedSeconds"].as_i64().unwrap_or(0),
+            rework_count: v["reworkCount"].as_u64().unwrap_or(0),
+            changes_files: v["changesFiles"].as_u64().unwrap_or(0) as usize,
+            added: v["added"].as_i64().unwrap_or(0),
+            deleted: v["deleted"].as_i64().unwrap_or(0),
+            conclusion: s(v, "conclusion").to_string(),
+            cleaned: b(v, "cleaned"),
+            archive: s(v, "archive").to_string(),
+        })
+    }
+}
+
+fn history_file_sig(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::metadata(path).ok()?;
+    Some(format!("{}.{}:{}", m.mtime(), m.mtime_nsec(), m.len()))
+}
+
 /// Lock-free, single-pass tail-chunk reader across all `<state>/history/*/history.jsonl` files
 /// covering `[cutoff_epoch, now]` (plus parent/finish context for chains applied inside the window).
+/// Caches per-file parsed records in `<state>/history-7d-cache.json` keyed by `(mtime, size)` so
+/// unchanged `history.jsonl` files are never re-read across snapshot ticks.
 pub fn read_recent_window_all_repos(
     state_root: &Path,
     cutoff_epoch: i64,
@@ -2565,19 +2633,106 @@ pub fn read_recent_window_all_repos(
     let Ok(rd) = fs::read_dir(&hist_root) else {
         return out;
     };
+
+    let mut current_files: Vec<(String, PathBuf, String)> = Vec::new();
     for ent in rd.flatten() {
         let dir_path = ent.path();
         let hp = dir_path.join("history.jsonl");
         if !hp.is_file() {
             continue;
         }
+        let Some(sig) = history_file_sig(&hp) else {
+            continue;
+        };
         let dir_name = ent.file_name().to_string_lossy().into_owned();
+        current_files.push((dir_name, hp, sig));
+    }
+    if current_files.is_empty() {
+        return out;
+    }
+
+    // Only read/write `history-7d-cache.json` for ~7-day snapshot windows so 14d/30d/all
+    // callers (e.g. quota shadow, fit bench) never overwrite and thrash the 7d snapshot cache.
+    let now_ep = epoch() as i64;
+    let seven_days = 7 * 86_400;
+    let use_7d_cache = cutoff_epoch > 0
+        && (now_ep - cutoff_epoch - seven_days).abs() <= HISTORY_7D_CACHE_SLACK_SECS * 2;
+    if !use_7d_cache {
+        for (dir_name, hp, _) in current_files {
+            let fallback_repo = repo_label_from_history_dir(&dir_name);
+            let file_map = read_recent_window_file(&hp, cutoff_epoch, &fallback_repo);
+            for (rid, rec) in file_map {
+                out.entry(rid).or_insert(rec);
+            }
+        }
+        return out;
+    }
+
+    let cache_path = state_root.join(HISTORY_7D_CACHE_FILE);
+    let cached_doc = json(&cache_path);
+    let cached_cutoff = cached_doc["cutoffEpoch"].as_i64();
+    let cache_window_valid = cached_doc["schemaVersion"].as_u64() == Some(HISTORY_7D_CACHE_VERSION)
+        && cached_doc["files"].is_object()
+        && cached_cutoff.is_some_and(|cc| {
+            cc <= cutoff_epoch && cc >= cutoff_epoch - HISTORY_7D_CACHE_SLACK_SECS * 2
+        });
+    let cached_files = if cache_window_valid {
+        cached_doc["files"].as_object()
+    } else {
+        None
+    };
+
+    let effective_cutoff = if cache_window_valid {
+        cached_cutoff.unwrap_or(cutoff_epoch - HISTORY_7D_CACHE_SLACK_SECS)
+    } else {
+        cutoff_epoch - HISTORY_7D_CACHE_SLACK_SECS
+    };
+
+    let mut next_files = serde_json::Map::new();
+    let mut dirty = !cache_window_valid
+        || cached_files.is_some_and(|m| m.len() != current_files.len());
+
+    for (dir_name, hp, sig) in current_files {
+        let hit = cached_files
+            .and_then(|m| m.get(&dir_name))
+            .filter(|entry| s(entry, "sig") == sig && entry["records"].is_array());
+        if let Some(entry) = hit {
+            if let Some(arr) = entry["records"].as_array() {
+                for item in arr {
+                    if let Some(rec) = RecentHistoryRecord::from_json(item) {
+                        out.entry(rec.run.clone()).or_insert(rec);
+                    }
+                }
+            }
+            next_files.insert(dir_name, entry.clone());
+            continue;
+        }
+
+        dirty = true;
         let fallback_repo = repo_label_from_history_dir(&dir_name);
-        let file_map = read_recent_window_file(&hp, cutoff_epoch, &fallback_repo);
+        let file_map = read_recent_window_file(&hp, effective_cutoff, &fallback_repo);
+        let records_json: Vec<Value> = file_map.values().map(RecentHistoryRecord::to_json).collect();
         for (rid, rec) in file_map {
             out.entry(rid).or_insert(rec);
         }
+        next_files.insert(
+            dir_name,
+            json!({
+                "sig": sig,
+                "records": records_json,
+            }),
+        );
     }
+
+    if dirty {
+        let doc = json!({
+            "schemaVersion": HISTORY_7D_CACHE_VERSION,
+            "cutoffEpoch": effective_cutoff,
+            "files": next_files,
+        });
+        let _ = write_json(&cache_path, &doc);
+    }
+
     out
 }
 

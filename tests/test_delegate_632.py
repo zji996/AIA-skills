@@ -405,7 +405,7 @@ class Delegate632Tests(unittest.TestCase):
         idx_file = state / "index.json"
         self.assertTrue(idx_file.is_file())
         idx_doc = json.loads(idx_file.read_text(encoding="utf-8"))
-        self.assertEqual(idx_doc["schemaVersion"], 1)
+        self.assertEqual(idx_doc["schemaVersion"], 2)
 
         # Verify all read commands recover and succeed cleanly after SIGKILL.
         for cmd in (["status", "--json", "--all"], ["work", "--json"], ["events", "--json"], ["snapshot", "--json"]):
@@ -623,7 +623,7 @@ class Delegate632Tests(unittest.TestCase):
         snap_res = self.cli("snapshot", "--json", cwd=repo)
         self.assertEqual(snap_res.returncode, 0, snap_res.stderr)
         snap = json.loads(snap_res.stdout)
-        self.assertEqual(snap["schemaVersion"], 1)
+        self.assertEqual(snap["schemaVersion"], 2)
         self.assertGreaterEqual(snap["seq"], 1)
         self.assertTrue(any(r["run"] == r1["run"] for g in snap["repos"] for r in g["runs"]))
         self.assertIn("work", snap)

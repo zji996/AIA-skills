@@ -580,7 +580,7 @@ pub fn active_account_id() -> Option<String> {
 /// `delegate snapshot --json`, `delegate agy account list/status`, and `delegate-tui`.
 /// Never reads or exposes secret tokens.
 pub fn snapshot_json() -> Value {
-    snapshot_json_opts(true)
+    snapshot_json_opts(RunningAgyScanMode::FullProc, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -1773,11 +1773,102 @@ fn find_duplicate_quota_slot_groups(accounts: &[Value]) -> Vec<Vec<String>> {
     groups
 }
 
-/// Fast snapshot for `delegate snapshot --json`: skips the `/proc` scan when no local
-/// `agy-accounts/accounts.json` exists yet so snapshot stays well under 20 ms.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunningAgyScanMode {
+    FullProc,
+    KnownRunsOnly,
+    Skip,
+}
+
+fn read_pid_file(path: &Path) -> Option<u32> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&p| p > 0)
+}
+
+/// Fast running-agy lookup for `delegate snapshot --json`: checks only active runs recorded in
+/// `<state>/*.slot` + their recorded `pid` files (O(active runs), zero `/proc` directory scan).
+pub fn detect_running_agy_from_known_runs(state_root: &Path) -> Vec<RunningAgy> {
+    let mut found = Vec::new();
+    let mut seen_pids = std::collections::HashSet::new();
+    for run in crate::launch::machine_runs(state_root) {
+        if run.join(".waiting").exists() {
+            continue;
+        }
+        let meta = json(run.join("meta.json"));
+        let model = s(&meta, "model");
+        if !crate::agy::is_agy(model) && s(&meta, "agent") != crate::agy::BIN {
+            continue;
+        }
+        let pid = read_pid_file(&run.join("agent.pid"))
+            .or_else(|| read_pid_file(&run.join("pid")));
+        let Some(pid) = pid else {
+            continue;
+        };
+        if !crate::cleanup::alive(pid as i32) || !seen_pids.insert(pid) {
+            continue;
+        }
+        let delegate_run = run
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let run_name = {
+            let n = s(&meta, "name");
+            (!n.is_empty()).then(|| n.to_string())
+        };
+        let account = {
+            let a = s(&meta, "agyAccount").trim();
+            (!a.is_empty()).then(|| a.to_string())
+        };
+        let cmdline = fs::read(format!("/proc/{pid}/cmdline"))
+            .ok()
+            .map(|raw| {
+                raw.split(|&b| b == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "agy (run {})",
+                    delegate_run.as_deref().unwrap_or("unknown")
+                )
+            });
+        found.push(RunningAgy {
+            pid,
+            delegate_run,
+            run_name,
+            role: Some("author".to_string()),
+            round: None,
+            account,
+            cmdline,
+        });
+    }
+    found.sort_by_key(|r| r.pid);
+    found
+}
+
+/// Fast snapshot for `delegate snapshot --json`: never full-scans `/proc`; when local
+/// `agy-accounts/accounts.json` exists, checks only recorded active run PIDs.
+#[allow(dead_code)]
 pub fn snapshot_json_fast() -> Value {
+    snapshot_json_fast_with_usage(None)
+}
+
+pub fn snapshot_json_fast_with_usage(
+    precollected_usage: Option<&crate::usage::PrecollectedUsage>,
+) -> Value {
     let has_accounts = accounts_meta_path(&accounts_root()).is_file();
-    snapshot_json_opts(has_accounts)
+    let mode = if has_accounts {
+        RunningAgyScanMode::KnownRunsOnly
+    } else {
+        RunningAgyScanMode::Skip
+    };
+    snapshot_json_opts(mode, precollected_usage)
 }
 
 /// Advisory-only quota depletion warning when projected depletion precedes window reset.
@@ -2422,7 +2513,7 @@ pub fn quota_snapshot_for_alerts_in(state: &Path, now_ep: i64) -> Option<Value> 
     let root = accounts_root();
     let use_real_accounts = state == state_dir() && accounts_meta_path(&root).is_file();
     if use_real_accounts {
-        return Some(snapshot_json_opts(false));
+        return Some(snapshot_json_opts(RunningAgyScanMode::Skip, None));
     }
     if !qpath.is_file() {
         return None;
@@ -3409,19 +3500,23 @@ fn format_cli_quota_estimate_line(label: &str, est: &Value) -> Option<String> {
     Some(format!("  {label} estimate ({pool}): {detail}"))
 }
 
-fn snapshot_json_opts(scan_procs: bool) -> Value {
+fn snapshot_json_opts(
+    scan_mode: RunningAgyScanMode,
+    precollected_usage: Option<&crate::usage::PrecollectedUsage>,
+) -> Value {
     let root = accounts_root();
     let home_dir = home();
+    let state_root = state_dir();
     let state = load_state(&root);
     let active_id = state["active"]
         .as_str()
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     let live = live_email(&home_dir).unwrap_or_default();
-    let running = if scan_procs {
-        detect_running_agy_for_home(&home_dir)
-    } else {
-        Vec::new()
+    let running = match scan_mode {
+        RunningAgyScanMode::FullProc => detect_running_agy_for_home(&home_dir),
+        RunningAgyScanMode::KnownRunsOnly => detect_running_agy_from_known_runs(&state_root),
+        RunningAgyScanMode::Skip => Vec::new(),
     };
 
     let now_ep = epoch() as i64;
@@ -3429,14 +3524,16 @@ fn snapshot_json_opts(scan_procs: bool) -> Value {
     let empty_map = Map::new();
     let accounts_map = state["accounts"].as_object().unwrap_or(&empty_map);
     let usage_snap = if !accounts_map.is_empty() || crate::usage::ledger_path().is_file() {
-        Some(crate::usage::accounts_usage_snapshot(accounts_map))
+        Some(match precollected_usage {
+            Some(pre) => crate::usage::accounts_usage_snapshot_from_precollected(accounts_map, pre),
+            None => crate::usage::accounts_usage_snapshot(accounts_map),
+        })
     } else {
         None
     };
 
     let auto_cfg = load_agy_auto_switch_config();
     let auto_mode = is_auto_mode_state(&state);
-    let state_root = state_dir();
     let pool_cur = load_pool_current_in(&state_root);
     let running_tasks = count_running_pool_tasks(&state_root, None);
     let running_writers: BTreeMap<(String, QuotaPool), usize> = running_tasks

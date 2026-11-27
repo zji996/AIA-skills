@@ -2705,6 +2705,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         let mut parent_meta = json(parent.join("meta.json"));
         parent_meta["repliedAt"] = json!(iso());
         let _ = write_json(parent.join("meta.json"), &parent_meta);
+        crate::index::upsert_run(&parent);
     }
     if let Some(scout_dir) = resolve_linked_scout_dir(&parent, &meta) {
         crate::supervise::mark_scout_consumed(&scout_dir);

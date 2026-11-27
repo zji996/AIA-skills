@@ -1193,8 +1193,10 @@ fn wait_each(
                         }
                         touch(run.join(".truncated"));
                         touch(run.join(".delivered"));
+                        index::upsert_run(run);
                     } else if !has_result {
                         touch(run.join(".delivered"));
+                        index::upsert_run(run);
                     }
                     println!("{line}");
                     events::mark_run_read(&id);
@@ -1655,6 +1657,7 @@ fn stop(args: &[String]) -> Res<i32> {
         if !run.join("result.md").exists() {
             touch(run.join(".delivered"));
         }
+        index::upsert_run(&run);
         board::refresh_for_run(&run);
         println!("{}", status_line(&run));
     }
@@ -2364,6 +2367,7 @@ fn apply_or_land(args: &[String], land_mode: bool) -> Res<i32> {
                         let _ = write(other.join(".sync-base"), read(run.join(".sync-base")));
                     }
                     refs::pin_run(&other, &other_meta);
+                    index::upsert_run(&other);
                     if !applied_runs.contains(&other) {
                         applied_runs.push(other);
                     }
@@ -4415,13 +4419,17 @@ fn result_command(rest: &[String]) -> Res<i32> {
         if wrote_full_current {
             fs::remove_file(run.join(".truncated")).ok();
             if !is_active {
+                touch(run.join(".delivered"));
                 mark_result_read(&run);
             }
         } else if want_path && !is_active && !run.join(".truncated").exists() {
+            touch(run.join(".delivered"));
             mark_result_read(&run);
+        } else if !is_active {
+            touch(run.join(".delivered"));
+            index::upsert_run(&run);
         }
         if !is_active {
-            touch(run.join(".delivered"));
             board::refresh_for_run(&run);
             events::mark_run_read(&events::run_id_for(&run, &run_meta));
             work::on_run_result_read(&run, &run_meta);

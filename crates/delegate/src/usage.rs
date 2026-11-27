@@ -1963,6 +1963,42 @@ fn fill_hourly_24h(entries: &[&UsageEntry], now_ep: i64) -> [u64; 24] {
     buckets
 }
 
+/// Single-pass 7-day usage collection shared between `agy_accounts::snapshot_json_fast_with_usage`
+/// and `tui_analytics_and_deliveries_with_usage` so `agy-usage.jsonl` is read only once per snapshot.
+pub struct PrecollectedUsage {
+    pub now_ep: i64,
+    entries: Vec<UsageEntry>,
+    uncounted_running: Vec<RunningUsageItem>,
+}
+
+pub fn collect_snapshot_usage_7d(now_ep: i64) -> PrecollectedUsage {
+    let cutoff_7d = now_ep - SEVEN_DAYS_SECS;
+    let (mut entries, live_running, uncounted_running) = collect_all(Some(cutoff_7d), true, false);
+    for lr in &live_running {
+        if let Some(tok) = lr.tokens {
+            entries.push(UsageEntry {
+                epoch: now_ep,
+                run: lr.run.clone(),
+                repo: lr.repo.clone(),
+                repo_name: lr.repo_name.clone(),
+                role: lr.role.clone(),
+                mode: lr.mode.clone(),
+                rework: lr.rework,
+                model: lr.model.clone(),
+                is_agy: lr.is_agy,
+                account: lr.account.clone(),
+                tokens: tok,
+                live: true,
+            });
+        }
+    }
+    PrecollectedUsage {
+        now_ep,
+        entries,
+        uncounted_running,
+    }
+}
+
 /// Lock-free, zero-subprocess local 1h / 5h / 7d token usage + 24h hourly series + manual notes
 /// for `agy_accounts` and `delegate-tui` charts/statistics.
 pub fn accounts_usage_snapshot(accounts_map: &Map<String, Value>) -> AccountsUsageSnapshot {
@@ -1989,14 +2025,26 @@ pub fn accounts_usage_snapshot(accounts_map: &Map<String, Value>) -> AccountsUsa
             });
         }
     }
-    accounts_usage_snapshot_from_entries(accounts_map, now_ep, entries, uncounted_running)
+    let entry_refs: Vec<&UsageEntry> = entries.iter().collect();
+    let unc_refs: Vec<&RunningUsageItem> = uncounted_running.iter().collect();
+    accounts_usage_snapshot_from_entries(accounts_map, now_ep, &entry_refs, &unc_refs)
+}
+
+pub fn accounts_usage_snapshot_from_precollected(
+    accounts_map: &Map<String, Value>,
+    pre: &PrecollectedUsage,
+) -> AccountsUsageSnapshot {
+    let entry_refs: Vec<&UsageEntry> = pre.entries.iter().filter(|e| e.is_agy).collect();
+    let unc_refs: Vec<&RunningUsageItem> =
+        pre.uncounted_running.iter().filter(|u| u.is_agy).collect();
+    accounts_usage_snapshot_from_entries(accounts_map, pre.now_ep, &entry_refs, &unc_refs)
 }
 
 fn accounts_usage_snapshot_from_entries(
     accounts_map: &Map<String, Value>,
     now_ep: i64,
-    entries: Vec<UsageEntry>,
-    uncounted_running: Vec<RunningUsageItem>,
+    entries: &[&UsageEntry],
+    uncounted_running: &[&RunningUsageItem],
 ) -> AccountsUsageSnapshot {
     let cutoff_1h = now_ep - ONE_HOUR_SECS;
     let cutoff_5h = now_ep - FIVE_HOURS_SECS;
@@ -2006,7 +2054,7 @@ fn accounts_usage_snapshot_from_entries(
     let mut stats_7d: HashMap<String, BucketStats> = HashMap::new();
     let mut uncounted_by_acct: HashMap<String, usize> = HashMap::new();
 
-    for e in &entries {
+    for &e in entries {
         let key = e
             .account
             .clone()
@@ -2019,7 +2067,7 @@ fn accounts_usage_snapshot_from_entries(
             stats_1h.entry(key).or_default().add_entry(e);
         }
     }
-    for u in &uncounted_running {
+    for &u in uncounted_running {
         let key = u
             .account
             .clone()
@@ -2036,6 +2084,7 @@ fn accounts_usage_snapshot_from_entries(
 
         let acct_entries: Vec<&UsageEntry> = entries
             .iter()
+            .copied()
             .filter(|e| e.account.as_deref() == Some(id.as_str()))
             .collect();
         let hourly_24h = fill_hourly_24h(&acct_entries, now_ep);
@@ -2101,6 +2150,7 @@ fn accounts_usage_snapshot_from_entries(
         .unwrap_or(0);
     let unassigned_entries: Vec<&UsageEntry> = entries
         .iter()
+        .copied()
         .filter(|e| e.account.is_none())
         .collect();
     let unassigned = json!({
@@ -2527,33 +2577,32 @@ pub struct AnalyticsAndDeliveries {
 }
 
 /// Lock-free, zero-subprocess analytics + recent-deliveries bundle embedded in `delegate snapshot --json`.
+#[allow(dead_code)]
 pub fn tui_analytics_and_deliveries(
     state_root: &Path,
     all_seen_runs: &BTreeMap<String, Value>,
     work_items: &[crate::work::WorkItem],
     now_ep: i64,
 ) -> AnalyticsAndDeliveries {
+    tui_analytics_and_deliveries_with_usage(state_root, all_seen_runs, work_items, now_ep, None)
+}
+
+pub fn tui_analytics_and_deliveries_with_usage(
+    state_root: &Path,
+    all_seen_runs: &BTreeMap<String, Value>,
+    work_items: &[crate::work::WorkItem],
+    now_ep: i64,
+    precollected: Option<&PrecollectedUsage>,
+) -> AnalyticsAndDeliveries {
     let cutoff_7d = now_ep - SEVEN_DAYS_SECS;
 
-    let (mut entries, live_running, _) = collect_all(Some(cutoff_7d), true, false);
-    for lr in &live_running {
-        if let Some(tok) = lr.tokens {
-            entries.push(UsageEntry {
-                epoch: now_ep,
-                run: lr.run.clone(),
-                repo: lr.repo.clone(),
-                repo_name: lr.repo_name.clone(),
-                role: lr.role.clone(),
-                mode: lr.mode.clone(),
-                rework: lr.rework,
-                model: lr.model.clone(),
-                is_agy: lr.is_agy,
-                account: lr.account.clone(),
-                tokens: tok,
-                live: true,
-            });
-        }
-    }
+    let owned_pre;
+    let entries: &[UsageEntry] = if let Some(pre) = precollected {
+        &pre.entries
+    } else {
+        owned_pre = collect_snapshot_usage_7d(now_ep);
+        &owned_pre.entries
+    };
 
     let entry_refs: Vec<&UsageEntry> = entries.iter().collect();
     let total_hourly_24h = fill_hourly_24h(&entry_refs, now_ep);
@@ -2568,7 +2617,7 @@ pub fn tui_analytics_and_deliveries(
     let mut tok_cache_read = 0u64;
     let mut by_model_map: HashMap<String, u64> = HashMap::new();
 
-    for e in &entries {
+    for e in entries {
         let tok = e.tokens.total().max(0) as u64;
         tok_input = tok_input.saturating_add(e.tokens.input.max(0) as u64);
         tok_output = tok_output.saturating_add(e.tokens.output.max(0) as u64);
@@ -2699,7 +2748,8 @@ mod tests {
             make_entry(now - 3 * 3600, 4_000_000, false),    // 5h + 7d
             make_entry(now - 48 * 3600, 10_000_000, false),  // 7d only
         ];
-        let snap = accounts_usage_snapshot_from_entries(&accounts_map, now, entries, Vec::new());
+        let entry_refs: Vec<&UsageEntry> = entries.iter().collect();
+        let snap = accounts_usage_snapshot_from_entries(&accounts_map, now, &entry_refs, &[]);
         let view = snap.per_account.get("work").expect("work view");
         assert_eq!(view.usage["oneHour"]["total"], 2_000_000);
         assert_eq!(view.usage["oneHour"]["liveCounted"], 1);

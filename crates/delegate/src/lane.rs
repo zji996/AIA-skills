@@ -273,6 +273,7 @@ pub fn detect_cgroup_v2_cpu_limit() -> Option<usize> {
     detect_cgroup_v2_cpu_limit_in(Path::new("/sys/fs/cgroup"), &proc_cg)
 }
 
+#[allow(dead_code)]
 pub fn detect_nproc() -> Option<usize> {
     let out = Command::new("nproc").output().ok()?;
     if !out.status.success() {
@@ -301,10 +302,12 @@ pub fn effective_threads(
 }
 
 pub fn detect_local_threads() -> usize {
-    let avail = std::thread::available_parallelism().ok().map(|n| n.get());
-    let cgroup = detect_cgroup_v2_cpu_limit();
-    let nproc_val = detect_nproc();
-    effective_threads(avail, cgroup, nproc_val)
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let avail = std::thread::available_parallelism().ok().map(|n| n.get());
+        let cgroup = detect_cgroup_v2_cpu_limit();
+        effective_threads(avail, cgroup, None)
+    })
 }
 
 /// Derive local build concurrency from available threads and optional explicit `maxHeavy` / `heavyJobs`:
