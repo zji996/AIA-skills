@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `delegate`：`reply` 非 `--fresh` 续接不再从父 `meta["agy"]` 继承旧 `agy.agent`（一律改取当前配置，`agy` 其余键照常继承）；配置非空 `agy.agent` 时 `start`/`reply`/`probe` 在 stderr 打印额度代价提示且 `delegate tiers` 附同条 `hints`（仅提示不拦）；`reply --fresh` 新会话提示词自动依次附上抬头、链首 `raw-brief.md`（缺省回退提取自 `prompt.md`）、链首 `scout-map.md`（如有）及本次追问，归档同步保留 `raw-brief.md` 与 `scout-map.md`。
+
 - `delegate`：配置说明注明 `agy.agent` 的额度代价（agy 1.5.17 起自定义 agent 按更高费率扣额度），默认不设，同事规则改写进 `~/.gemini/GEMINI.md`。
 
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。

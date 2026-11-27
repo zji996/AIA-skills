@@ -3943,6 +3943,9 @@ fn tiers_hints(config: &Value, listed: &[models::PiModel]) -> Res<Vec<String>> {
         Some(models::selected_alias(&pick.name, config).to_string())
     };
     let mut hints = Vec::new();
+    if let Some(warn) = crate::agy::agent_cost_warning(&config["agy"]) {
+        hints.push(warn);
+    }
     let Some(write) = active_alias("write") else {
         return Ok(hints);
     };

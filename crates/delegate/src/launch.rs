@@ -618,7 +618,11 @@ pub fn contract(
     protect: &[String],
     reasons: &std::collections::BTreeMap<String, String>,
 ) -> String {
-    let zh = prompt.chars().any(|c| {
+    let lang_sample = prompt
+        .strip_prefix(FRESH_REPLY_HEADER)
+        .unwrap_or(prompt)
+        .replace("\n\n## 探路交接笔记\n", "\n\n");
+    let zh = lang_sample.chars().any(|c| {
         (0x3040..=0x30ff).contains(&(c as u32)) || (0x4e00..=0x9fff).contains(&(c as u32))
     });
     let mut notes = vec![];
@@ -1762,6 +1766,9 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     o.share.sort();
     o.share.dedup();
     let config = crate::config::load(repo.as_deref())?;
+    if let Some(warn) = crate::agy::agent_cost_warning(&config.value["agy"]) {
+        eprintln!("{warn}");
+    }
     let tier_models = apply_tier_model(&mut o, &config.value)?;
     let defaults = effective_defaults(&mut o, &config);
     let mut defaults = defaults;
@@ -2118,6 +2125,42 @@ fn rework_gate(
     Ok(Some(record))
 }
 
+const FRESH_REPLY_HEADER: &str = "（这是同一任务的新会话：原任务说明附在下面，worktree 里保留着前几轮的改动，先看清现状再接着做。）";
+
+/// Compose the prompt for a `--fresh` reply: header, root run's original brief
+/// (`raw-brief.md`, falling back to extracted `prompt.md` when non-scout-first),
+/// root run's `scout-map.md` if present, and finally the current reply text.
+fn compose_fresh_reply_prompt(parent: &Path, parent_meta: &Value, raw_prompt: &str) -> String {
+    let ancestors = crate::runs::chain_ancestors_to_run(parent);
+    let root = ancestors.first().map(PathBuf::as_path).unwrap_or(parent);
+    let root_meta = if root == parent {
+        parent_meta.clone()
+    } else {
+        json(root.join("meta.json"))
+    };
+    let raw_brief = read(root.join("raw-brief.md"));
+    let brief = if !raw_brief.trim().is_empty() {
+        raw_brief.trim().to_string()
+    } else {
+        crate::history::extract_user_prompt(root, &root_meta)
+    };
+    let scout_map = if s(&root_meta["scout"], "status") == "dropped" {
+        String::new()
+    } else {
+        read(root.join("scout-map.md"))
+    };
+    let scout_map = scout_map.trim();
+    let mut parts = vec![FRESH_REPLY_HEADER.to_string()];
+    if !brief.is_empty() {
+        parts.push(brief);
+    }
+    if !scout_map.is_empty() {
+        parts.push(format!("## 探路交接笔记\n{scout_map}"));
+    }
+    parts.push(raw_prompt.to_string());
+    parts.join("\n\n")
+}
+
 pub fn reply(mut o: Options) -> Res<PathBuf> {
     let timeout_overridden = o.timeout.is_some();
     let evidence_overridden = o.evidence_set;
@@ -2311,6 +2354,8 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
             read(parent.join("result.md")).trim(),
             raw_prompt
         )
+    } else if o.fresh && !scout_question {
+        compose_fresh_reply_prompt(&parent, &meta, &raw_prompt)
     } else {
         raw_prompt.clone()
     };
@@ -2318,6 +2363,9 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
         .filter(|x| !x.is_empty())
         .unwrap_or(s(&meta, "top"));
     let config = crate::config::load(Some(Path::new(top)))?;
+    if let Some(warn) = crate::agy::agent_cost_warning(&config.value["agy"]) {
+        eprintln!("{warn}");
+    }
     if !o.no_brief_check
         && !o.brief_checked
         && crate::config::brief_check_enabled(&config.value)
@@ -2369,7 +2417,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     o.rework = if after_apply {
         None
     } else {
-        rework_gate(&parent, &meta, &o, &prompt, &config.value)?
+        rework_gate(&parent, &meta, &o, &raw_prompt, &config.value)?
     };
     if o.sync && !meta["worktree"].is_object() {
         return Err("--sync requires a worktree conversation".into());
@@ -2577,11 +2625,7 @@ pub fn reply(mut o: Options) -> Res<PathBuf> {
     extra["measureCpus"] = meta["measureCpus"].clone();
     extra["stall"] = meta["stall"].clone();
     extra["checkIn"] = meta["checkIn"].clone();
-    extra["agy"] = if !o.fresh && meta["agy"].is_object() {
-        meta["agy"].clone()
-    } else {
-        config.value["agy"].clone()
-    };
+    extra["agy"] = crate::agy::inherit_for_reply(o.fresh, &meta["agy"], &config.value["agy"]);
     if crate::agy::is_agy(o.model.as_deref().unwrap_or("")) {
         let pinned = s(&meta, "agyAccount");
         let inherited = if !pinned.is_empty() {
@@ -4031,6 +4075,78 @@ mod purpose_tests {
         assert_eq!((s(&a2, "group"), b(&a2, "enabled"), a2["seq"].as_u64()), ("A", false, Some(2)));
         assert_eq!((s(&a3, "group"), b(&a3, "enabled"), a3["seq"].as_u64()), ("B", true, Some(3)));
         assert_eq!((s(&b1, "group"), b(&b1, "enabled"), b1["seq"].as_u64()), ("B", true, Some(1)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compose_fresh_reply_prompt_includes_header_root_raw_brief_scout_map_and_reply_in_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "delegate-fresh-brief-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let root = dir.join("20261128-010000-root");
+        let mid = dir.join("20261128-010500-mid");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&mid).unwrap();
+        write_json(root.join("meta.json"), &json!({"run": "20261128-010000-root"})).unwrap();
+        write(root.join("raw-brief.md"), "原任务详细规格 FULL-BRIEF\n第二行").unwrap();
+        write(root.join("scout-map.md"), "探路定位：foo.rs:42").unwrap();
+        let mid_meta = json!({"run": "20261128-010500-mid", "parent": "20261128-010000-root"});
+        write_json(mid.join("meta.json"), &mid_meta).unwrap();
+
+        let composed = compose_fresh_reply_prompt(&mid, &mid_meta, "请继续完成阶段 2");
+        let p_hdr = composed.find(FRESH_REPLY_HEADER).expect("header missing");
+        let p_brief = composed.find("原任务详细规格 FULL-BRIEF\n第二行").expect("raw-brief missing");
+        let p_map = composed.find("探路定位：foo.rs:42").expect("scout-map missing");
+        let p_reply = composed.find("请继续完成阶段 2").expect("reply missing");
+        assert!(p_hdr < p_brief && p_brief < p_map && p_map < p_reply, "wrong order:\n{composed}");
+
+        // Without raw-brief.md or scout-map.md: falls back to root prompt.md user prompt.
+        fs::remove_file(root.join("raw-brief.md")).unwrap();
+        fs::remove_file(root.join("scout-map.md")).unwrap();
+        write(root.join("prompt.md"), "无探路原任务\n\n完成标准：true\n").unwrap();
+        let fallback = compose_fresh_reply_prompt(&mid, &mid_meta, "补测");
+        assert!(fallback.contains(FRESH_REPLY_HEADER));
+        assert!(fallback.contains("无探路原任务"));
+        assert!(!fallback.contains("完成标准："));
+        assert!(!fallback.contains("探路交接笔记"));
+        assert!(fallback.ends_with("补测"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compose_fresh_reply_prompt_skips_dropped_scout_map() {
+        let dir = std::env::temp_dir().join(format!(
+            "delegate-fresh-dropped-scout-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let root = dir.join("20261128-020000-root");
+        let mid = dir.join("20261128-020500-mid");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&mid).unwrap();
+        write_json(
+            root.join("meta.json"),
+            &json!({
+                "run": "20261128-020000-root",
+                "scout": {"status": "dropped", "dropCode": "hallucinated_paths"}
+            }),
+        )
+        .unwrap();
+        write(root.join("raw-brief.md"), "原任务详细规格 ONLY-BRIEF").unwrap();
+        write(root.join("scout-map.md"), "已丢弃的错误探路笔记 DROPPED-MAP").unwrap();
+        let mid_meta = json!({"run": "20261128-020500-mid", "parent": "20261128-020000-root"});
+        write_json(mid.join("meta.json"), &mid_meta).unwrap();
+
+        let composed = compose_fresh_reply_prompt(&mid, &mid_meta, "请按原说明继续");
+        assert!(composed.contains(FRESH_REPLY_HEADER));
+        assert!(composed.contains("原任务详细规格 ONLY-BRIEF"));
+        assert!(!composed.contains("DROPPED-MAP"));
+        assert!(!composed.contains("探路交接笔记"));
+        assert!(composed.ends_with("请按原说明继续"));
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

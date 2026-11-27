@@ -103,6 +103,8 @@ class DelegateAgyStickyTests(unittest.TestCase):
             "    'email': tok_doc.get('id_token_email', ''),\n"
             "    'token': tok_doc.get('token', {}).get('access_token', ''),\n"
             "    'conv': conv_id,\n"
+            "    'argv': argv,\n"
+            "    'content': content,\n"
             "    'run_dir': os.environ.get('DELEGATE_RUN_DIR', ''),\n"
             "}\n"
             f"with open({str(self.calls_log)!r}, 'a', encoding='utf-8') as f:\n"
@@ -427,6 +429,109 @@ class DelegateAgyStickyTests(unittest.TestCase):
             f"unexpected calls: {calls}",
         )
         self.assertNotIn("gamma", [c["account"] for c in calls])
+
+    def test_reply_does_not_inherit_old_agy_agent_from_parent_meta(self):
+        """Regression: non-fresh reply always takes agy.agent from current config,
+        never inheriting an old agy.agent from parent meta, while keeping other agy keys."""
+        self._seed_three_accounts()
+        repo = self.repo({"a.txt": "base\n"})
+        self._install_scripted_agy(
+            "Path('a.txt').write_text(f'v{call_idx}\\n', encoding='utf-8')\n"
+            "emit_agy(f'done {call_idx}', cid='conv-agent-1')\n"
+        )
+        # Start run1 with agy.agent="aia" and agy.autoSwitch configured.
+        self.write_user_config(
+            {
+                "models": {"neon": "agy/gemini-4-neon"},
+                "tiers": {"scout": "neon", "review": "neon", "write": "neon"},
+                "agy": {"agent": "aia", "autoSwitch": {"weeklyMinPct": 25}},
+            }
+        )
+        expected_warn = (
+            "agy.agent=aia：agy 1.5.17 起自定义 agent 的对话按更高费率扣额度"
+            "（上游实测约 4 倍），不需要时删掉这一项，规则写进 ~/.gemini/GEMINI.md。"
+        )
+        start_res = self.cli("start", "--workdir", str(repo), "--worktree", "--no-scout", "--accept", "true", "initial task")
+        self.assertEqual(start_res.returncode, 0, start_res.stderr)
+        self.assertIn(expected_warn, start_res.stderr)
+        run1 = self._parse_run_id(start_res.stdout)
+        dir1 = Path(self.env["DELEGATE_RUNS"]) / run1
+        self.until(lambda: (dir1 / "summary.json").exists(), f"{run1} finishes", timeout=20)
+        meta1 = json.loads((dir1 / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta1.get("agy"), {"agent": "aia", "autoSwitch": {"weeklyMinPct": 25}})
+
+        # Reply while agy.agent is still set: stderr prints warning.
+        reply_warn = self.cli("reply", "--over-limit", "test", run1, "still has agent")
+        self.assertEqual(reply_warn.returncode, 0, reply_warn.stderr)
+        self.assertIn(expected_warn, reply_warn.stderr)
+        run_mid = self._parse_run_id(reply_warn.stdout)
+        dir_mid = Path(self.env["DELEGATE_RUNS"]) / run_mid
+        self.until(lambda: (dir_mid / "summary.json").exists(), f"{run_mid} finishes", timeout=20)
+
+        # Now remove agy.agent from current config (parent meta still has agent="aia").
+        self.write_user_config(
+            {
+                "models": {"neon": "agy/gemini-4-neon"},
+                "tiers": {"scout": "neon", "review": "neon", "write": "neon"},
+            }
+        )
+        reply_clean = self.cli("reply", "--over-limit", "test", run_mid, "continue without agent")
+        self.assertEqual(reply_clean.returncode, 0, reply_clean.stderr)
+        self.assertNotIn("agy.agent=", reply_clean.stderr)
+        run2 = self._parse_run_id(reply_clean.stdout)
+        dir2 = Path(self.env["DELEGATE_RUNS"]) / run2
+        self.until(lambda: (dir2 / "summary.json").exists(), f"{run2} finishes", timeout=20)
+
+        meta2 = json.loads((dir2 / "meta.json").read_text(encoding="utf-8"))
+        self.assertNotIn("agent", meta2.get("agy") or {})
+        self.assertEqual(meta2.get("agy"), {"autoSwitch": {"weeklyMinPct": 25}})
+
+        calls = self._read_calls()
+        self.assertEqual(len(calls), 3)
+        self.assertIn("--agent", calls[0]["argv"])
+        self.assertIn("aia", calls[0]["argv"])
+        self.assertNotIn("--agent", calls[2]["argv"], f"resumed call must not pass --agent: {calls[2]['argv']}")
+        self.assertEqual(calls[2]["conv"], "conv-agent-1")
+
+    def test_fresh_reply_attaches_header_root_raw_brief_and_scout_map(self):
+        """Regression (W235): reply --fresh includes header, root raw-brief.md,
+        root scout-map.md (if present), and then this reply's text; non-fresh reply does not."""
+        self._seed_three_accounts()
+        repo = self.repo({"a.txt": "base\n"})
+        self._install_scripted_agy(
+            "Path('a.txt').write_text(f'v{call_idx}\\n', encoding='utf-8')\n"
+            "emit_agy(f'done {call_idx}', cid=f'conv-fresh-{call_idx}')\n"
+        )
+        run1, dir1 = self._start_and_wait(
+            repo, "ORIGINAL-RAW-BRIEF-W235", "--worktree", "--no-scout", "--accept", "true"
+        )
+        # Seed root raw-brief.md and scout-map.md as scout-first does on the chain root.
+        (dir1 / "raw-brief.md").write_text("ORIGINAL-RAW-BRIEF-W235\n详细要求：阶段 1 + 阶段 2\n", encoding="utf-8")
+        (dir1 / "scout-map.md").write_text("SCOUT-MAP-W235：关键文件 a.txt\n", encoding="utf-8")
+
+        # Ordinary non-fresh reply must NOT prepend the fresh header or raw-brief.md.
+        run2, dir2 = self._reply_and_wait(run1, "NORMAL-REPLY-ROUND2", "--minor")
+        prompt2 = (dir2 / "prompt.md").read_text(encoding="utf-8")
+        header = "（这是同一任务的新会话：原任务说明附在下面，worktree 里保留着前几轮的改动，先看清现状再接着做。）"
+        self.assertNotIn(header, prompt2)
+        self.assertNotIn("ORIGINAL-RAW-BRIEF-W235", prompt2)
+        self.assertIn("NORMAL-REPLY-ROUND2", prompt2)
+
+        # Fresh reply on child run2 (also with --minor to verify rework length checks raw reply).
+        run3, dir3 = self._reply_and_wait(run2, "FRESH-FOLLOWUP-ROUND3", "--fresh", "--minor")
+        prompt3 = (dir3 / "prompt.md").read_text(encoding="utf-8")
+        p_hdr = prompt3.find(header)
+        p_brief = prompt3.find("ORIGINAL-RAW-BRIEF-W235\n详细要求：阶段 1 + 阶段 2")
+        p_map = prompt3.find("SCOUT-MAP-W235：关键文件 a.txt")
+        p_reply = prompt3.find("FRESH-FOLLOWUP-ROUND3")
+        self.assertTrue(
+            0 <= p_hdr < p_brief < p_map < p_reply,
+            f"expected header < raw-brief < scout-map < reply in prompt3:\n{prompt3}",
+        )
+        calls = self._read_calls()
+        self.assertEqual(calls[-1]["conv"], "")
+        self.assertIn(header, calls[-1]["content"])
+        self.assertIn("ORIGINAL-RAW-BRIEF-W235", calls[-1]["content"])
 
 
 if __name__ == "__main__":

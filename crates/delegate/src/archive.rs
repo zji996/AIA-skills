@@ -446,6 +446,8 @@ pub fn preserve(run: &Path) -> Res<Option<PathBuf>> {
         "summary.json",
         "appends.json",
         "prompt.md",
+        "raw-brief.md",
+        "scout-map.md",
         "result.md",
         "result-original.md",
         "changes.json",

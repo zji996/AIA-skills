@@ -157,6 +157,20 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(unset.returncode, 2)
         self.assertIn("no model to probe", unset.stderr)
 
+    def test_probe_warns_on_stderr_when_agy_agent_is_configured(self):
+        self.fake_pi([ANSWER, SETTLED])
+        self.user_config({
+            "tiers": {"scout": "p/m", "review": "p/m", "write": "p/m"},
+            "agy": {"agent": "aia"},
+        })
+        result = self.cli("probe")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        expected = (
+            "agy.agent=aia：agy 1.5.17 起自定义 agent 的对话按更高费率扣额度"
+            "（上游实测约 4 倍），不需要时删掉这一项，规则写进 ~/.gemini/GEMINI.md。"
+        )
+        self.assertIn(expected, result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

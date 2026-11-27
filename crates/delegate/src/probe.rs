@@ -508,6 +508,9 @@ pub fn command(args: &[String]) -> Res<i32> {
     let o = parse(args)?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let config = config::load(git_top(&cwd).as_deref())?;
+    if let Some(warn) = crate::agy::agent_cost_warning(&config.value["agy"]) {
+        eprintln!("{warn}");
+    }
     let active = crate::launch::active_machine(&state_dir());
     let busy: Vec<String> = active
         .iter()

@@ -52,6 +52,39 @@ pub fn validate_agent(name: &str) -> Res<()> {
     Ok(())
 }
 
+/// Advisory warning when `agy.agent` is configured: custom agents bill at a higher quota rate
+/// since agy 1.5.17. Inform only; never blocks execution.
+pub fn agent_cost_warning(agy_cfg: &Value) -> Option<String> {
+    let name = s(agy_cfg, "agent");
+    if name.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "agy.agent={name}：agy 1.5.17 起自定义 agent 的对话按更高费率扣额度（上游实测约 4 倍），不需要时删掉这一项，规则写进 ~/.gemini/GEMINI.md。"
+    ))
+}
+
+/// Resolve `agy` settings for a `reply` run: non-`--fresh` replies inherit other keys from
+/// the parent run's `meta["agy"]`, but `agy.agent` always comes from the current config so
+/// removing it takes effect on continuation without paying the custom-agent quota rate.
+pub fn inherit_for_reply(fresh: bool, parent_agy: &Value, config_agy: &Value) -> Value {
+    if fresh || !parent_agy.is_object() {
+        return config_agy.clone();
+    }
+    let mut map = parent_agy.as_object().cloned().unwrap_or_default();
+    let cfg_agent = s(config_agy, "agent");
+    if !cfg_agent.is_empty() {
+        map.insert("agent".into(), json!(cfg_agent));
+    } else {
+        map.remove("agent");
+    }
+    if map.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(map)
+    }
+}
+
 /// The command line. The prompt goes on stdin as one stream-json message
 /// (see `input`), so its size is not bound by argv.
 pub fn command(meta: &Value, conversation: Option<&str>) -> Vec<String> {
@@ -584,5 +617,43 @@ mod tests {
         // Turn 2 has no text_delta: must NOT reuse round 1's stale tail.
         let r2 = f.events(&json!({"event":"result","result":{"status":"SUCCESS","response":"round 2 resp","usage":{}}}));
         assert_eq!(r2[1]["text"], "round 2 resp");
+    }
+
+    #[test]
+    fn agent_cost_warning_warns_only_when_agent_is_configured() {
+        assert_eq!(agent_cost_warning(&Value::Null), None);
+        assert_eq!(agent_cost_warning(&json!({})), None);
+        assert_eq!(agent_cost_warning(&json!({"autoSwitch": {"weeklyMinPct": 20}})), None);
+        assert_eq!(
+            agent_cost_warning(&json!({"agent": "aia"})).as_deref(),
+            Some("agy.agent=aia：agy 1.5.17 起自定义 agent 的对话按更高费率扣额度（上游实测约 4 倍），不需要时删掉这一项，规则写进 ~/.gemini/GEMINI.md。")
+        );
+    }
+
+    #[test]
+    fn inherit_for_reply_takes_agent_from_current_config_and_preserves_other_keys() {
+        // Parent had agent + autoSwitch; current config has no agent -> drop agent, keep autoSwitch.
+        let parent = json!({"agent": "aia", "autoSwitch": {"weeklyMinPct": 25}});
+        assert_eq!(
+            inherit_for_reply(false, &parent, &Value::Null),
+            json!({"autoSwitch": {"weeklyMinPct": 25}})
+        );
+        // Parent had only agent; current config has no agent -> Null (no --agent on resume).
+        let only_agent = json!({"agent": "aia"});
+        let inherited = inherit_for_reply(false, &only_agent, &Value::Null);
+        assert_eq!(inherited, Value::Null);
+        let cmd = command(&json!({"model": "agy/m", "agy": inherited}), Some("c-9"));
+        assert!(!cmd.contains(&"--agent".into()));
+        assert!(cmd.windows(2).any(|w| w == ["--conversation", "c-9"]));
+        // Current config sets a different agent -> use current config's agent, keep parent other keys.
+        assert_eq!(
+            inherit_for_reply(false, &parent, &json!({"agent": "custom2"})),
+            json!({"agent": "custom2", "autoSwitch": {"weeklyMinPct": 25}})
+        );
+        // Fresh reply uses current config wholesale.
+        assert_eq!(
+            inherit_for_reply(true, &parent, &json!({"autoSwitch": {"weeklyMinPct": 10}})),
+            json!({"autoSwitch": {"weeklyMinPct": 10}})
+        );
     }
 }

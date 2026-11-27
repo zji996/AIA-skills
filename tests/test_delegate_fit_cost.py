@@ -289,6 +289,31 @@ class DelegateFitCostTests(unittest.TestCase):
             ["提示：写入档 plain 还没有 build 类适配卡记录；先拿一份规格同题对比再长期用（delegate fit）。"],
         )
 
+    def test_tiers_hints_warns_when_agy_agent_is_configured(self):
+        self.fake_pi([])
+        expected = (
+            "agy.agent=aia：agy 1.5.17 起自定义 agent 的对话按更高费率扣额度"
+            "（上游实测约 4 倍），不需要时删掉这一项，规则写进 ~/.gemini/GEMINI.md。"
+        )
+        # Even without write tier configured, agy.agent warning still appears in hints.
+        self.write_user_config({"agy": {"agent": "aia"}})
+        res_missing = self.cli("tiers", "--json")
+        self.assertEqual(res_missing.returncode, 1, res_missing.stderr)
+        self.assertIn(expected, json.loads(res_missing.stdout)["hints"])
+
+        cfg = self.matrix_config()
+        cfg["tiers"] = {"scout": "main", "review": "cheap-a", "write": "main"}
+        cfg["agy"] = {"agent": "aia"}
+        self.write_user_config(cfg)
+        self.assertEqual(self.cli("fit", "set", "build", "main", "first", "稳").returncode, 0)
+
+        res_text = self.cli("tiers")
+        self.assertEqual(res_text.returncode, 0, res_text.stderr)
+        self.assertIn(expected, res_text.stdout.splitlines())
+        res_json = self.cli("tiers", "--json")
+        self.assertEqual(res_json.returncode, 0, res_json.stderr)
+        self.assertEqual(json.loads(res_json.stdout)["hints"], [expected])
+
 
 if __name__ == "__main__":
     unittest.main()
