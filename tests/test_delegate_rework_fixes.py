@@ -27,6 +27,8 @@ class DelegateReworkFixesTests(unittest.TestCase):
     cli = fixtures.DelegateTests.cli
     outcome = fixtures.DelegateTests.outcome
     repo = fixtures.DelegateTests.repo
+    until = fixtures.DelegateTests.until
+    user_config = fixtures.DelegateTests.user_config
 
     def write_agy_config(self):
         for k in ("DELEGATE_SCOUT_MODEL", "DELEGATE_REVIEW_MODEL", "DELEGATE_WRITE_MODEL"):
@@ -225,6 +227,110 @@ class DelegateReworkFixesTests(unittest.TestCase):
         self.assertIn("按方案 A 实现 src/mode.rs", rev_prompt)
         self.assertIn("主控拍板：改为方案 B", rev_prompt)
         self.assertLess(rev_prompt.index("按方案 A 实现"), rev_prompt.index("主控拍板：改为方案 B"))
+
+    def test_3b_review_reads_in_run_appends_and_does_not_rework_on_overridden_rule(self):
+        repo = self.repo(
+            {
+                "src/rule.rs": 'pub const RULE: &str = "INIT";\n',
+                ".delegate.json": json.dumps(
+                    {
+                        "review": {"enabled": True, "tier": "review"},
+                        "accept": "true",
+                        "scoutFirst": False,
+                    }
+                ),
+            }
+        )
+        turn1_ready = self.work / "append-review-turn1-ready"
+        turn1_go = self.work / "append-review-turn1-go"
+
+        fake_agy = self.bin / "agy"
+        fake_agy.write_text(
+            f"#!{sys.executable}\n"
+            "import json, sys, time\n"
+            "from pathlib import Path\n"
+            "if '--version' in sys.argv[1:]:\n"
+            "    print('1.6.0')\n"
+            "    sys.exit(0)\n"
+            f"turn1_ready = Path({str(turn1_ready)!r})\n"
+            f"turn1_go = Path({str(turn1_go)!r})\n"
+            "conv_id = 'conv-append-review'\n"
+            "print(json.dumps({'event': 'init', 'conversation_id': conv_id}), flush=True)\n"
+            "turn = 0\n"
+            "for raw in sys.stdin:\n"
+            "    line = raw.strip()\n"
+            "    if not line:\n"
+            "        continue\n"
+            "    turn += 1\n"
+            "    if turn == 1:\n"
+            "        turn1_ready.touch()\n"
+            "        while not turn1_go.exists():\n"
+            "            time.sleep(0.02)\n"
+            "        Path('src/rule.rs').write_text('pub const RULE: &str = \"A\";\\n', encoding='utf-8')\n"
+            "        print(json.dumps({'event': 'result', 'result': {'conversation_id': conv_id, 'status': 'SUCCESS', 'response': '按原说明实现规则 A', 'usage': {'input_tokens': 50, 'output_tokens': 10, 'cache_read_tokens': 0}}}), flush=True)\n"
+            "    elif turn == 2:\n"
+            "        Path('src/rule.rs').write_text('pub const RULE: &str = \"B\";\\n', encoding='utf-8')\n"
+            "        print(json.dumps({'event': 'result', 'result': {'conversation_id': conv_id, 'status': 'SUCCESS', 'response': '按主控追加决定改为规则 B', 'usage': {'input_tokens': 80, 'output_tokens': 20, 'cache_read_tokens': 20}}}), flush=True)\n",
+            encoding="utf-8",
+        )
+        fake_agy.chmod(0o755)
+        self.env["DELEGATE_AGY_BIN"] = str(fake_agy)
+        self.user_config(
+            {
+                "models": {
+                    **fixtures.REGISTERED_MODELS,
+                    "agywrite": "agy/gemini-4-neon",
+                }
+            }
+        )
+
+        # Reviewer runs on pi: if the appended override B is missing from the review prompt,
+        # reviewer would falsely judge REWORK for violating original rule A.
+        self.install_scripted_pi(
+            "has_a = '按规则 A 实现' in stdin_text\n"
+            "has_b = '改为规则 B' in stdin_text\n"
+            "has_rule = '后来的决定覆盖原说明' in stdin_text\n"
+            "if has_a and has_b and has_rule and stdin_text.index('按规则 A 实现') < stdin_text.index('改为规则 B'):\n"
+            "    emit_answer('PASS\\n依据主控追加 #1（改为规则 B），原说明 A 已被覆盖，当前实现符合规则 B。\\n\\n## 主控重点看\\n无')\n"
+            "else:\n"
+            "    emit_answer('REWORK\\ndiff 实现了 RULE=B，不符合原说明 A，请回退到规则 A。\\n\\n## 主控重点看\\n无')\n"
+        )
+
+        started = self.outcome(
+            self.cli(
+                "start",
+                "--worktree",
+                "--workdir",
+                repo,
+                "--model",
+                "agywrite",
+                "--name",
+                "append-review-override",
+                "按规则 A 实现 src/rule.rs（写 RULE=A）",
+            )
+        )
+        run_id = started["run"]
+        run_dir = Path(started["dir"])
+        self.addCleanup(lambda: (turn1_go.touch(), self.cli("stop", run_id)))
+
+        self.until(turn1_ready.exists, "agy turn 1 started")
+        app = self.cli("reply", run_id, "主控新决定：改为规则 B（写 RULE=B），覆盖原说明 A", human=True)
+        self.assertEqual(app.returncode, 0, app.stdout + app.stderr)
+        self.assertIn("已追加到", app.stdout)
+
+        turn1_go.touch()
+        waited = self.cli("wait", "--all", run_id)
+        self.assertEqual(waited.returncode, 0, waited.stdout + waited.stderr)
+        final_state = self.outcome(waited)
+        self.assertEqual(final_state["state"], "delivered", final_state)
+        self.assertEqual(final_state["review"]["verdict"], "PASS", final_state)
+
+        rev_prompt = (run_dir / "review/round-1/prompt.md").read_text(encoding="utf-8")
+        self.assertIn("按规则 A 实现 src/rule.rs（写 RULE=A）", rev_prompt)
+        self.assertIn("主控新决定：改为规则 B（写 RULE=B），覆盖原说明 A", rev_prompt)
+        self.assertIn("后来的决定覆盖原说明", rev_prompt)
+        self.assertIn("原说明与追加/续做冲突时，在审查结论里明说依据哪条", rev_prompt)
+        self.assertLess(rev_prompt.index("按规则 A 实现"), rev_prompt.index("改为规则 B"))
 
     # ------------------------------------------------------------------
     # Item 4: agy OAuth2 401 backs off & re-probes once; still failing -> permanent failure

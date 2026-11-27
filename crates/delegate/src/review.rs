@@ -1847,22 +1847,31 @@ pub fn sign_command(args: &[String]) -> Res<i32> {
     Ok(0)
 }
 
-/// Extract the complete chronological task brief across the `reply` chain (root -> each reply ->
-/// current run, including archived ancestors). Single runs return their brief directly; multi-round
-/// reply chains concatenate every round in order and mark the latest round so reviewers judge by
-/// the latest decisions and direction changes rather than stale root instructions.
+/// Extract the complete chronological task brief across the `reply` chain (root -> each run's
+/// delivered in-run/steer appends -> each reply -> current run, including archived ancestors).
+/// Single runs with no delivered appends return their brief directly; chains with any appends or
+/// replies concatenate every item in chronological order with an explicit precedence rule stating
+/// that later controller decisions override earlier instructions.
 fn original_task_brief(run: &Path, meta: &Value) -> String {
+    enum BriefKind {
+        Root,
+        Reply(usize),
+        Append(usize),
+    }
+
     let mut chain = crate::runs::chain_ancestors_to_run(run);
     if chain.is_empty() {
         chain.push(run.to_path_buf());
     }
-    let mut briefs: Vec<(String, String)> = Vec::new();
+    let mut entries: Vec<(BriefKind, String, String)> = Vec::new();
+    let mut reply_idx = 0usize;
     for dir in &chain {
         let node_meta = if dir == run && meta.is_object() {
             meta.clone()
         } else {
             json(dir.join("meta.json"))
         };
+        let rid = crate::notes::run_id(dir, &node_meta);
         let extracted = crate::history::extract_user_prompt(dir, &node_meta);
         let text = if !extracted.trim().is_empty() {
             extracted.trim().to_string()
@@ -1870,25 +1879,52 @@ fn original_task_brief(run: &Path, meta: &Value) -> String {
             read(dir.join("prompt.md")).trim().to_string()
         };
         if !text.is_empty() {
-            let rid = crate::notes::run_id(dir, &node_meta);
-            briefs.push((rid, text));
+            let kind = if entries.is_empty() {
+                BriefKind::Root
+            } else {
+                reply_idx += 1;
+                BriefKind::Reply(reply_idx)
+            };
+            entries.push((kind, rid.clone(), text));
+        }
+        let delivered_appends = crate::pending_reply::delivered_in_run_items(dir);
+        for (idx, item) in delivered_appends.into_iter().enumerate() {
+            let msg = item.message.trim();
+            if !msg.is_empty() {
+                let seq = if item.seq > 0 {
+                    item.seq as usize
+                } else {
+                    idx + 1
+                };
+                entries.push((BriefKind::Append(seq), rid.clone(), msg.to_string()));
+            }
         }
     }
-    if briefs.is_empty() {
+    if entries.is_empty() {
         return String::new();
     }
-    if briefs.len() == 1 {
-        return briefs.remove(0).1;
+    if entries.len() == 1 && matches!(entries[0].0, BriefKind::Root) {
+        return entries.remove(0).2;
     }
-    let last_idx = briefs.len() - 1;
-    let mut sections = Vec::with_capacity(briefs.len());
-    for (idx, (rid, text)) in briefs.into_iter().enumerate() {
-        let heading = if idx == 0 {
-            format!("### 初始说明（{rid}）")
-        } else if idx == last_idx {
-            format!("### 续做说明 #{idx}（{rid}，最新——以本轮拍板/方向为准）")
-        } else {
-            format!("### 续做说明 #{idx}（{rid}）")
+    let last_idx = entries.len() - 1;
+    let mut sections = Vec::with_capacity(entries.len() + 1);
+    sections.push(
+        "> 规则：以下按时间顺序列出初始说明与主控全部追加/续做回复，**后来的决定覆盖原说明**，\
+         审查以最新决定为准；原说明与追加/续做冲突时，在审查结论里明说依据哪条。"
+            .to_string(),
+    );
+    for (idx, (kind, rid, text)) in entries.into_iter().enumerate() {
+        let is_last = idx == last_idx;
+        let heading = match kind {
+            BriefKind::Root => format!("### 初始说明（{rid}）"),
+            BriefKind::Reply(n) if is_last => {
+                format!("### 续做说明 #{n}（{rid}，最新——以本轮拍板/方向为准）")
+            }
+            BriefKind::Reply(n) => format!("### 续做说明 #{n}（{rid}）"),
+            BriefKind::Append(seq) if is_last => {
+                format!("### 主控追加 #{seq}（{rid}，最新——以本条决定/方向为准）")
+            }
+            BriefKind::Append(seq) => format!("### 主控追加 #{seq}（{rid}）"),
         };
         sections.push(format!("{heading}\n\n{text}"));
     }
@@ -6427,6 +6463,135 @@ mod tests {
         assert!(chain_brief.contains("初始说明（20261123-100000-root）"));
         assert!(chain_brief.contains("续做说明 #1（20261123-110000-mid）"));
         assert!(chain_brief.contains("续做说明 #2（20261123-121617-c9cb，最新"));
+        assert!(chain_brief.contains("后来的决定覆盖原说明"));
+        assert!(chain_brief.contains("原说明与追加/续做冲突时，在审查结论里明说依据哪条"));
+
+        let _ = fs::remove_dir_all(&root_tmp);
+    }
+
+    #[test]
+    fn original_task_brief_includes_delivered_in_run_and_steer_appends_and_excludes_fallback() {
+        let root_tmp = std::env::temp_dir().join(format!(
+            "delegate-brief-appends-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let runs_dir = root_tmp.join("runs");
+        let r1 = runs_dir.join("20261127-144457-root");
+        let r2 = runs_dir.join("20261127-150000-reply");
+        fs::create_dir_all(&r1).unwrap();
+        fs::create_dir_all(&r2).unwrap();
+
+        let m1 = json!({"run": "20261127-144457-root"});
+        write_json(r1.join("meta.json"), &m1).unwrap();
+        write(r1.join("prompt.md"), "原说明 A：句首名字不算直呼").unwrap();
+        write_json(
+            r1.join("appends.json"),
+            &json!({
+                "closed": true,
+                "nextSeq": 6,
+                "items": [
+                    {
+                        "seq": 2,
+                        "message": "追加决定 B2：同时补单测",
+                        "delivery": "steer",
+                        "deliveredAt": "2026-11-27T14:46:00Z",
+                        "cancelledAt": null
+                    },
+                    {
+                        "seq": 1,
+                        "message": "追加决定 B1：句首名字一律算直呼",
+                        "delivery": "in_run",
+                        "deliveredAt": "2026-11-27T14:45:30Z",
+                        "cancelledAt": null
+                    },
+                    {
+                        "seq": 3,
+                        "message": "已取消追加：不应出现",
+                        "delivery": "in_run",
+                        "deliveredAt": "2026-11-27T14:46:30Z",
+                        "cancelledAt": "2026-11-27T14:46:40Z"
+                    },
+                    {
+                        "seq": 4,
+                        "message": "未投递追加：不应出现",
+                        "delivery": "in_run",
+                        "deliveredAt": null,
+                        "cancelledAt": null
+                    },
+                    {
+                        "seq": 5,
+                        "message": "续做说明 C：顺便清理注释",
+                        "delivery": "fallback",
+                        "deliveredAt": "2026-11-27T15:00:00Z",
+                        "cancelledAt": null
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+
+        // Single run with delivered in_run + steer appends: sorted by seq, includes precedence rule,
+        // excludes cancelled/undelivered/fallback items.
+        let single_with_appends = original_task_brief(&r1, &m1);
+        assert!(single_with_appends.contains("后来的决定覆盖原说明"));
+        assert!(single_with_appends.contains("原说明与追加/续做冲突时，在审查结论里明说依据哪条"));
+        let pa = single_with_appends
+            .find("原说明 A：句首名字不算直呼")
+            .expect("root prompt missing");
+        let pb1 = single_with_appends
+            .find("追加决定 B1：句首名字一律算直呼")
+            .expect("in_run append missing");
+        let pb2 = single_with_appends
+            .find("追加决定 B2：同时补单测")
+            .expect("steer append missing");
+        assert!(pa < pb1 && pb1 < pb2, "order broken: {single_with_appends}");
+        assert!(single_with_appends.contains("初始说明（20261127-144457-root）"));
+        assert!(single_with_appends.contains("主控追加 #1（20261127-144457-root）"));
+        assert!(single_with_appends.contains("主控追加 #2（20261127-144457-root，最新"));
+        assert!(!single_with_appends.contains("已取消追加"));
+        assert!(!single_with_appends.contains("未投递追加"));
+        assert!(!single_with_appends.contains("续做说明 C"));
+
+        // Multi-run chain where r1's fallback became r2's prompt.md, plus r2 has its own append.
+        let m2 = json!({"run": "20261127-150000-reply", "parent": "20261127-144457-root"});
+        write_json(r2.join("meta.json"), &m2).unwrap();
+        write(r2.join("prompt.md"), "续做说明 C：顺便清理注释").unwrap();
+        write_json(
+            r2.join("appends.json"),
+            &json!({
+                "closed": true,
+                "nextSeq": 2,
+                "items": [
+                    {
+                        "seq": 1,
+                        "message": "追加决定 D：保留英文注释",
+                        "delivery": "in_run",
+                        "deliveredAt": "2026-11-27T15:01:00Z",
+                        "cancelledAt": null
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+
+        let chain_brief = original_task_brief(&r2, &m2);
+        assert_eq!(
+            chain_brief.matches("续做说明 C：顺便清理注释").count(),
+            1,
+            "fallback item must not be duplicated: {chain_brief}"
+        );
+        let p1 = chain_brief.find("原说明 A").unwrap();
+        let p2 = chain_brief.find("追加决定 B1").unwrap();
+        let p3 = chain_brief.find("追加决定 B2").unwrap();
+        let p4 = chain_brief.find("续做说明 C").unwrap();
+        let p5 = chain_brief.find("追加决定 D").unwrap();
+        assert!(
+            p1 < p2 && p2 < p3 && p3 < p4 && p4 < p5,
+            "chain chronological order broken: {chain_brief}"
+        );
+        assert!(chain_brief.contains("续做说明 #1（20261127-150000-reply）"));
+        assert!(chain_brief.contains("主控追加 #1（20261127-150000-reply，最新"));
 
         let _ = fs::remove_dir_all(&root_tmp);
     }

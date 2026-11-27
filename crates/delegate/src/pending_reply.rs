@@ -682,16 +682,21 @@ pub fn take_or_close_in_run(run: &Path, next_round: usize) -> Res<TakeInRun> {
     Ok(TakeInRun::Closed)
 }
 
-/// Return all `in_run` appended items that were already delivered to an earlier session of `run`,
-/// sorted by `seq`. Used by mid-run account handoff so consumed follow-up messages are never lost
-/// when opening a fresh session on another account.
+/// Return all `in_run` / `steer` appended items that were already delivered to an earlier session
+/// of `run`, sorted by `seq` (excluding post-settle `fallback` items, which become child runs).
+/// Used by mid-run account handoff and review prompt assembly so consumed follow-up messages are
+/// never lost.
 pub fn delivered_in_run_items(run: &Path) -> Vec<AppendItem> {
     let mailbox = load_mailbox(run);
     let mut out: Vec<AppendItem> = mailbox["items"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|item| !item["deliveredAt"].is_null() && item["cancelledAt"].is_null())
+        .filter(|item| {
+            s(item, "delivery") != "fallback"
+                && !item["deliveredAt"].is_null()
+                && item["cancelledAt"].is_null()
+        })
         .map(item_from_value)
         .collect();
     out.sort_by_key(|it| it.seq);

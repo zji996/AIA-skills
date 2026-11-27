@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- `delegate`：审查员任务说明（`original_task_brief`）补齐本链全部已投递的运行中追加（`in_run`/`steer` `appends.json`，排除已转为子 run 的 `fallback` 项），与各轮 `reply` 按时间序拼接并显式标明「后来的决定覆盖原说明、冲突时在结论里明说依据哪条」，同步更新默认审查要点（`review-rubric.md`），避免审查员只看原说明误判返工。
+- `delegate`：新增漏网缺陷记账约定（修复提交附 `Fixes-Run: <原 run-id>`，支持多行；`apply --commit` 不自动添加且原样保留）与 `delegate escapes [--since 30d] [--repo PATH] [--json]` 命令，按 `Delegate-Run:`/`Fixes-Run:` trailer 读取活跃或归档 run meta，按审查模型、写手模型与类别统计合入数、漏出数及比例，未找到 meta 的单独计入「未知 run」。
+- `delegate`：`delegate tiers`（查看、修改档位及新增 `--json` 输出的 `hints` 字段）按别名 `cost` 档位与 `fit.json` 适配卡在末尾给出只读配置提示（审查档/探路档比写入档贵、写入档缺少 `build` 适配卡记录），并在 `skills/delegate/references/model-routing.md` 新增「换模型」角色分配与验证指南。
+- `delegate`：新增 `delegate fit bench review <别名> [--since 30d] [-n 10] [--estimate] [--yes] [--json]`，从本机 history 选取最多 n 条有确定审查结论（漏检/检出尽量各半，优先近期与不同仓库）的写入任务，复用 `--in <run>` 归档重建只读快照与 diff 并用候选模型只读重审，输出命中率、漏检数、误报数与总用量并写入 `fit.json`（沿用 80 字符上限与 `sample` 字段）；`--estimate` 仅按原审查用量估算且不起模型调用，缺 `--yes` 仅打印估算不派发，不可重建 run 跳过并计数不中断。
+
+- `delegate`：新增额度预报软门控影子模式——基于 `agy_accounts` 同周期窗口估算与近 14 天写任务中位数耗时（`history.jsonl`）提供零子进程、只读缓存的余量判断（缓存超 20 分钟视为未知）；在自动补位（`fill` / `work --auto`）与 DAG 续派（`queue`）派发写任务时若预计装不下「在跑写数 + 1」仅记录 `quota_would_hold` 事件（不进 Stop hook、不拦截、手动 `start` 不记不打印），并新增 `delegate quota-shadow [--since 72h] [--window MINS] [--json]` 按事件与真实 429 `RESOURCE_EXHAUSTED` 失败对账输出召回率与误报率。
+
+- `delegate`：写手命令封装层（`agent-shims` + `_cmd-out`）新增大输出落盘回指针 A/B 实验：按仓库交替分组（奇 B 开启、偶 A 对照，reply 继承父分组，`.delegate.json` `cmdOut: false` 可整体关闭），默认封装 `cargo`/`pnpm`/`npm`/`pytest`/`python -m pytest`/`go test`（可配置），≤12KB 原样透传，>12KB 全文落盘 `<run>/cmd-out/<序号>.log` 并原样透传退出码，只向同事返回说明行、首个错误块 40 行与末尾 40 行；单 run 在 `summary.json` 记录触发次数、截断字节与步数，`delegate usage --by cmd-out` 与 `delegate speed` 支持按分组查看平均每步输入、编译测试步数与验收一次通过率。
+- `delegate`：将带 HTTP 429 的硬额度耗尽报错（`RESOURCE_EXHAUSTED` + `quota reached`/`resets in` 等）纳入 `is_quota_exhausted_error` 且排除瞬时 3 轮退避重跑，失败摘要附切号提示（`delegate agy account use <id|auto>`）；排队追问（`pending_reply`）在父 run 因 `agy` 额度耗尽失败后自动落盘时，`auto` 模式下改为新会话按池重选并带上原追问与「上一会话因额度中断，改动在工作区」事实；`reply --fresh` 在 `auto` 模式下当链上原账号与新选账号不同（即便池指针早已指向新号）时也记录并展示「自动选号：A → B」。
+- `delegate`：修复 `apply`/`land` 与后台 `_gc-worker` 并发竞态导致的合并后验收偶发被 `SIGTERM`（`-15`）杀掉的问题——新增 `LockKind::ApplyRun`（`<run>/apply.lock`）在 `apply`/`land` 合入、合并后验收与提交全过程持有按规范路径排序的每 run 锁，并在 `_gc-worker`（含 `detect_applied` 与水位回收）、`runs::remove_after_apply`/`auto_clean_run` 及 `_merge-worker` 让路判定中跳过 `apply_in_flight` 的 run。
+- `delegate`：命令卡住判定（`stall_command`）将持续输出增长计为进展——远端观测 `remote-output.log`（兼容 `TailLogWriter` 截断重命名）、本地观测 `stderr.log` 与流式输出事件（Pi `tool_execution_update` / Agy `ACTIVE` `step_update`），并在 `common::shell` 复用同一文件指纹检查；输出持续增长期间不发 `stall_warning`、恢复输出时自动清理 `stall-warning.json`，输出真正停止超过阈值后照常提醒。
+
+- `delegate`：派发 worktree 任务时检测说明中引用、源仓库存在且被 git 忽略的相对路径，在不改写原文的前提下于说明末尾附一行源仓库绝对路径提示；修复提问检测（`classify_question` / `is_scout_question`）将同分句否定表述（如「无矛盾需要主控拍板」「没有/不需要 + 拍板/决定/提问」）误判为提问的问题。
+- `delegate`：将上游 TLS 握手/证书校验失败与连接 EOF/reset（含 `broken pipe`）归入可续做的 `Kind::Connection` 瞬时失败，复用现有退避续做、`probe` 恢复与耗尽后换模型路径；首轮握手期尚未落盘会话（`attempts == 1` 且无已存 session）时改用原 prompt 同模型重跑，不再因无会话直接跳过续做。
+- `delegate`：写手消费探路结果（含转入 `scoutQuestion` 或直接开工）及收到 `delegate reply` 时，同步为关联探路 run 写入 `repliedAt` 并刷新索引；`hook pending`、pulse、index 与 TUI 的待处理判定对已有 `repliedAt` 的提问不再计为待答，消除探路提问滞留 `hook pending` 的问题。
+- `delegate`：取消写入任务按「轻任务」自动跳过探路的分支（移除 `is_lightweight_brief`），所有 `--worktree` 写入任务默认均先只读探路再派写手；保留 `--no-scout`、`.delegate.json` `"scoutFirst": false` 与 `DELEGATE_SCOUT_FIRST=0` 显式开关。
+- `delegate`：修复 `apply --commit` / `land` 在自动提交阶段失败时因 `.applied` 已写入而仍触发 `work::on_runs_applied` 自动关闭关联工作项（或提前推进 `dag_queue`）的问题，排除提交失败及后续未提交来源仓库的 run。
+- `delegate`：审查员系统段、审查提示与默认 rubric 明确说明验收由 Host 独立并行执行并汇总结果、无需运行验收或用 `ps`/`sleep` 等待写手或验收进程；审查员模式下的 `LoopDetector` 取消纯等待/轮询命令豁免并在触发重复轮询自检时终止当前循环、通过同会话尾部补问（`loop_stop_retry`）让审查员直接给出结论。
+- `delegate`：`reply --sync=agent` 遇到子模块指针（gitlink）冲突时默认取主干版本（含强制更新已初始化子模块检出与主干删除子模块）并在提示词与 stderr 告知同事核对；遇到 `.delegate.json` `generated.paths` 生成文件冲突时不写入冲突标记也不中断整轮，而是记录到 `sync.json` 独立字段并在提示词提示运行 `generated.command` 重新生成；其余未配置为生成物的二进制/结构冲突仍原子拒收。
+- `delegate`：将审查结论、审查要点/交付摘要/历史结论、提问检测、Radar 候选与 `work import-md` 统一改为「自然写、宽松读」——审查提示词改为开头一句自然结论（中英均可）并移除 `FORMAT_RETRY_PROMPT` 同会话补问（保留重复轮询中断后的 `loop_stop_retry`），Host 宽松读前 5 个非空行与结论小节，读不出时不默认 `PASS` 而原样留档 `review.md` 落 `NEEDS_CONTROLLER` 并附事实提示；审查要点、一句话结论、交付摘要与 `history::extract_conclusion` 兼容 Markdown 链接/多种行号写法与自然小标题并兜底展示原文摘要；提问检测按工作树是否改文件分级（零改动宽松识别自然问句进提问态，已改文件仅开头 3 行明确停工信号才跳验收，文末疑问照跑验收并在卡片附「回复含待确认问题」提示）；Radar 去掉强制 JSON（保留兼容）改按自然小节/列表切块并复用 `is_valid_evidence_anchor`，缺锚点不炸整轮并附看板事实提示指向 `last-scout-output.md`；`work import-md` 补齐 `### `、有序列表与任务框（跳过 `- [x]`）。
+- `delegate`：重写 `agy` 额度耗尽预测——彻底移除本地 token 账本标定（`usage.rs` 的 `tokensPerPct` 与 `live_running` 双重扣减），改为在 `agy_accounts.rs` 统一 `PoolQuotaState` 中基于同一 `resetAt` 周期的 `/usage` 剩余 `%` 历史（`history` 增存 `fiveHourResetEp`/`weeklyResetEp` 且上限升至 700）做近窗斜率区间、数据不足/空闲门控与 `resetAt` 截断，告警仅针对当前选用账号与池（`auto` 档同池有绿档可接管时静默），同步更新 `pulse.rs`、`delegate-tui` 并新增脱敏历史回放测试锁住 5h/周误报率。
+- `release-binary.sh`：`publish` 在打标签与上传前先 `git fetch origin` 校验 `HEAD` 已推到 `origin/main` 且同名标签未指向其他提交（指向 `HEAD` 则复用）；新增一步发版子命令 `release <skill> <ver|patch|minor|major>`（`bump`→`build`→`commit`→`push`→`publish`→`install`→`sync`），任一步失败即停并支持 `--from <step>` 续跑。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
 
 ## delegate 6.55.0 - 2026-11-27
