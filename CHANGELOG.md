@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `delegate`：配置说明注明 `agy.agent` 的额度代价（agy 1.5.17 起自定义 agent 按更高费率扣额度），默认不设，同事规则改写进 `~/.gemini/GEMINI.md`。
+
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
 
 ## delegate 6.57.0 - 2026-11-28
