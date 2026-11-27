@@ -7,6 +7,7 @@
 ## 依赖图导入、价值配额补位与停止线统计
 
 - 批量导入任务 DAG 并按价值配额无模型补位：`work add/wait --class feat|unblock|infra|docs` 标价值类别（缺类别不参与补位且 `work` 行尾标「缺类别」）；`delegate work import-dag <FILE> [--dry-run]` 读 JSON 批量建工作项（`after` 转 `work_closed:`、`files` 存路径前缀并附 `--auto` 参数，重 key/成环/brief 缺失整批拒绝）；`.delegate.json` 配 `fill: {"target": 6, "maxInfraDocsShare": 0.3}` 与 `hotspots` 在 `reconcile` 按类别/出度/就绪时间补位（只数写链、跳过热点冲突、记 `work_dispatched` `reason: "fill"`）；`delegate fill stats [--since 24h]` 统计冲突率/返工率/未合入峰值/lane 排队占比/每 10 交付 agy 周额度与只读占比并给出停止线提醒（不自动降档）。Batch-import JSON task DAGs with `work import-dag`, value-class auto-fill dispatch with `fill`/`hotspots` (counting write chains only), and advisory stop-line metrics via `delegate fill stats`.
+- 额度预报软门控影子模式与对账：自动补位（`fill`/`work --auto`）与 DAG 续派（`queue`）派发 `agy` 写任务前只读本地缓存（>20 分钟视为未知）判断目标池预计剩余时间是否装得下「在跑写数 + 1」× 近 14 天写任务中位数耗时，装不下时不拦截仅记 `quota_would_hold` 事件（手动 `start` 不记不拦不打印）；用 `delegate quota-shadow [--since 72h] [--window MINS] [--json]` 对账影子事件与真实 429 `RESOURCE_EXHAUSTED` 失败，输出召回率与误报率。Shadow-mode quota headroom check on auto-fill and DAG queue dispatches (cache-only, >20m stale treated as unknown, emitting `quota_would_hold` without blocking, manual `start` untouched) plus `delegate quota-shadow` recall/false-positive reconciliation against real 429 quota failures.
 
 ## 审查模型可配置、按类别选 thinking、格式补问与补充审查
 

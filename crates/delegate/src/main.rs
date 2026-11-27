@@ -3816,6 +3816,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "result" => result_command(rest),
         "work" => work::command(rest),
         "fill" => fill::command(rest),
+        "quota-shadow" => agy_accounts::quota_shadow_command(rest),
         "agy" => agy_accounts::command(rest),
         "usage" => usage::command(rest),
         "lines" => lines::command(rest),

@@ -26,7 +26,7 @@ use crate::common::*;
 use crate::config::{load_agy_auto_switch_config, AgyAutoSwitchConfig};
 use crate::{has, parse_simple, value};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -2478,6 +2478,845 @@ pub fn quota_snapshot_for_alerts_in(state: &Path, now_ep: i64) -> Option<Value> 
         items.push(item);
     }
     Some(json!({ "active": active_id, "mode": "fixed", "accounts": items }))
+}
+
+/// Maximum quota cache age (seconds) for shadow-mode headroom checks; older caches are treated as unknown.
+pub const SHADOW_HEADROOM_MAX_CACHE_AGE_SECS: i64 = 20 * 60;
+const MEDIAN_WRITE_LOOKBACK_SECS: i64 = 14 * 86400;
+const SHADOW_DEFAULT_WINDOW_MINS: u64 = 120;
+const SHADOW_MIN_WINDOW_MINS: u64 = 30;
+const SHADOW_MAX_WINDOW_MINS: u64 = 240;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadroomUnknownReason {
+    NoSnapshot,
+    NoAccount,
+    StaleCache,
+    NoEstimate,
+    NoWriteMedian,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadroomDecision {
+    pub pool: QuotaPool,
+    pub account_id: String,
+    pub window: String,
+    pub remaining_minutes: u64,
+    pub required_minutes: u64,
+    pub median_write_minutes: u64,
+    pub active_writes: usize,
+    pub cache_age_seconds: i64,
+}
+
+impl HeadroomDecision {
+    pub fn event_payload(
+        &self,
+        source: &str,
+        work_id: Option<&str>,
+        queue_name: Option<&str>,
+    ) -> Value {
+        let mut obj = json!({
+            "pool": self.pool.key(),
+            "poolLabel": self.pool.short_label(),
+            "account": self.account_id,
+            "window": self.window,
+            "remainingMinutes": self.remaining_minutes,
+            "requiredMinutes": self.required_minutes,
+            "medianWriteMinutes": self.median_write_minutes,
+            "activeWrites": self.active_writes,
+            "cacheAgeSeconds": self.cache_age_seconds,
+            "source": source,
+        });
+        if let Some(wid) = work_id.filter(|s| !s.is_empty()) {
+            obj["workId"] = json!(wid);
+        }
+        if let Some(qn) = queue_name.filter(|s| !s.is_empty()) {
+            obj["queueName"] = json!(qn);
+        }
+        obj
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadroomCheck {
+    Fits,
+    WouldHold(HeadroomDecision),
+    Unknown(HeadroomUnknownReason),
+}
+
+/// Whether `start_args` describe a read-only task (`--read-only` or `--tier scout|review`).
+pub fn is_readonly_start_args(args: &[String]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--read-only" {
+            return true;
+        }
+        if let Some(val) = a.strip_prefix("--tier=") {
+            if matches!(val, "scout" | "review") {
+                return true;
+            }
+        } else if a == "--tier" {
+            if let Some(val) = args.get(i + 1) {
+                if matches!(val.as_str(), "scout" | "review") {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Zero-subprocess resolution of target `agy` quota pool from `start_args` and optional `repo`.
+/// Never invokes `pi --list-models` or any child process.
+pub fn resolve_start_args_quota_pool(
+    start_args: &[String],
+    repo: Option<&Path>,
+) -> Option<QuotaPool> {
+    let mut model_arg: Option<&str> = None;
+    let mut tier_arg: Option<&str> = None;
+    let mut i = 0;
+    while i < start_args.len() {
+        let a = start_args[i].as_str();
+        if let Some(val) = a.strip_prefix("--model=") {
+            if !val.is_empty() {
+                model_arg = Some(val);
+            }
+        } else if a == "--model" {
+            if let Some(val) = start_args.get(i + 1) {
+                if !val.is_empty() {
+                    model_arg = Some(val.as_str());
+                }
+            }
+            i += 1;
+        } else if let Some(val) = a.strip_prefix("--tier=") {
+            if !val.is_empty() {
+                tier_arg = Some(val);
+            }
+        } else if a == "--tier" {
+            if let Some(val) = start_args.get(i + 1) {
+                if !val.is_empty() {
+                    tier_arg = Some(val.as_str());
+                }
+            }
+            i += 1;
+        }
+        i += 1;
+    }
+
+    let cfg = crate::config::load(repo).ok()?.value;
+    let resolved_model = if let Some(m) = model_arg {
+        crate::models::resolve_model(m, &cfg, &[])
+            .ok()
+            .or_else(|| crate::agy::is_agy(m).then(|| m.to_string()))?
+    } else {
+        let tier = tier_arg.unwrap_or("write");
+        crate::models::pick(
+            &cfg,
+            tier,
+            None,
+            &[],
+            crate::agents::local_clock(),
+            &|_| 0,
+        )
+        .ok()
+        .map(|p| p.model)
+        .or_else(|| {
+            crate::models::tier_rules(&cfg, tier)
+                .first()
+                .and_then(|r| {
+                    let name = r.as_str().unwrap_or_else(|| s(r, "model"));
+                    (!name.is_empty()).then_some(name)
+                })
+                .and_then(|name| crate::models::resolve_model(name, &cfg, &[]).ok())
+        })?
+    };
+
+    if !crate::agy::is_agy(&resolved_model) {
+        return None;
+    }
+    classify_model_pool(&resolved_model)
+}
+
+/// Compute the median write-task duration (in minutes, min 1) over the past 14 days from
+/// `<state>/history/*/history.jsonl`. Returns `None` when there are no write samples.
+pub fn median_write_duration_mins_in(state: &Path, now_ep: i64) -> Option<u64> {
+    let cutoff = now_ep.saturating_sub(MEDIAN_WRITE_LOOKBACK_SECS);
+    let records = crate::history::read_recent_window_all_repos(state, cutoff);
+    let mut secs: Vec<i64> = records
+        .values()
+        .filter(|rec| {
+            let ts = if rec.finished_epoch > 0 {
+                rec.finished_epoch
+            } else {
+                rec.started_epoch
+            };
+            rec.mode == "write"
+                && rec.elapsed_seconds > 0
+                && ts >= cutoff
+                && matches!(rec.state.as_str(), "delivered" | "failed")
+        })
+        .map(|rec| rec.elapsed_seconds)
+        .collect();
+    if secs.is_empty() {
+        return None;
+    }
+    secs.sort_unstable();
+    let mid_secs = if secs.len() % 2 == 1 {
+        secs[secs.len() / 2]
+    } else {
+        (secs[secs.len() / 2 - 1] + secs[secs.len() / 2]) / 2
+    };
+    Some(((mid_secs + 30) / 60).max(1) as u64)
+}
+
+fn quota_cache_age_secs(acct: &Value, now_ep: i64) -> Option<i64> {
+    let q = &acct["quota"];
+    if !q.is_object() {
+        return None;
+    }
+    if let Some(fep) = q["fetchedEpoch"].as_i64().filter(|&e| e > 0) {
+        return Some((now_ep - fep).max(0));
+    }
+    q["ageSeconds"].as_i64().filter(|&a| a >= 0)
+}
+
+fn find_pool_window_estimate<'a>(
+    acct: &'a Value,
+    pool: QuotaPool,
+    window_key: &str,
+) -> &'a Value {
+    acct["quotaEstimate"]["pools"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|pe| classify_quota_pool_name(s(pe, "pool")) == Some(pool))
+                .map(|pe| &pe[window_key])
+        })
+        .unwrap_or(&Value::Null)
+}
+
+/// Pure, zero-subprocess check of whether `pool` has enough estimated remaining time
+/// to fit `active_writes + 1` write tasks of duration `median_write_mins`.
+pub fn check_write_quota_headroom_from_snapshot(
+    snap: &Value,
+    pool: QuotaPool,
+    running_writers: &BTreeMap<(String, QuotaPool), usize>,
+    median_write_mins: Option<u64>,
+    now_ep: i64,
+) -> HeadroomCheck {
+    let Some(accounts) = snap["accounts"].as_array() else {
+        return HeadroomCheck::Unknown(HeadroomUnknownReason::NoSnapshot);
+    };
+    let is_auto = s(snap, "mode") == AUTO_ACCOUNT_ID || b(&snap["autoSwitch"], "enabled");
+    let snap_active = s(snap, "active");
+
+    if !is_auto {
+        let Some(acct) = accounts.iter().find(|a| {
+            let id = s(a, "id");
+            !id.is_empty() && (b(a, "active") || (!snap_active.is_empty() && id == snap_active))
+        }) else {
+            return HeadroomCheck::Unknown(HeadroomUnknownReason::NoAccount);
+        };
+        if !b(&acct["quota"], "ok") || b(&acct["quota"], "identityMismatch") {
+            return HeadroomCheck::Unknown(HeadroomUnknownReason::NoAccount);
+        }
+        let Some(cache_age_secs) = quota_cache_age_secs(acct, now_ep) else {
+            return HeadroomCheck::Unknown(HeadroomUnknownReason::StaleCache);
+        };
+        if cache_age_secs > SHADOW_HEADROOM_MAX_CACHE_AGE_SECS {
+            return HeadroomCheck::Unknown(HeadroomUnknownReason::StaleCache);
+        }
+        let Some(median_mins) = median_write_mins.filter(|&m| m > 0) else {
+            return HeadroomCheck::Unknown(HeadroomUnknownReason::NoWriteMedian);
+        };
+        let acct_id = s(acct, "id").to_string();
+        let active_writes = running_writers
+            .get(&(acct_id.clone(), pool))
+            .copied()
+            .unwrap_or(0);
+        let required_mins = median_mins.saturating_mul(active_writes as u64 + 1);
+
+        let mut tightest: Option<(&'static str, u64)> = None;
+        let mut saw_known_ok = false;
+        for window_key in ["fiveHour", "weekly"] {
+            let est = find_pool_window_estimate(acct, pool, window_key);
+            if !est.is_object() {
+                continue;
+            }
+            match s(est, "status") {
+                "depletes" => {
+                    if let Some(mid_m) = est["midMinutes"].as_u64() {
+                        if tightest.is_none_or(|(_, prev)| mid_m < prev) {
+                            tightest = Some((window_key, mid_m));
+                        }
+                    }
+                }
+                "safe" | "idle" => {
+                    saw_known_ok = true;
+                }
+                _ => {}
+            }
+        }
+        match tightest {
+            Some((win, rem_m)) if rem_m < required_mins => {
+                HeadroomCheck::WouldHold(HeadroomDecision {
+                    pool,
+                    account_id: acct_id,
+                    window: win.to_string(),
+                    remaining_minutes: rem_m,
+                    required_minutes: required_mins,
+                    median_write_minutes: median_mins,
+                    active_writes,
+                    cache_age_seconds: cache_age_secs,
+                })
+            }
+            Some(_) => HeadroomCheck::Fits,
+            None if saw_known_ok => HeadroomCheck::Fits,
+            None => HeadroomCheck::Unknown(HeadroomUnknownReason::NoEstimate),
+        }
+    } else {
+        let healthy_accts: Vec<&Value> = accounts
+            .iter()
+            .filter(|a| {
+                !s(a, "id").is_empty()
+                    && b(&a["quota"], "ok")
+                    && !b(&a["quota"], "identityMismatch")
+            })
+            .collect();
+        let pkey = pool.key();
+        let sel_id = {
+            let ps = s(&snap["autoSwitch"]["poolSummary"][pkey], "selected");
+            if !ps.is_empty() {
+                ps.to_string()
+            } else {
+                let pc = s(&snap["autoSwitch"]["poolCurrent"], pkey);
+                if !pc.is_empty() {
+                    pc.to_string()
+                } else {
+                    snap_active.to_string()
+                }
+            }
+        };
+        let Some(sel_acct) = healthy_accts
+            .iter()
+            .copied()
+            .find(|a| s(a, "id") == sel_id)
+            .or_else(|| healthy_accts.first().copied())
+        else {
+            return HeadroomCheck::Unknown(HeadroomUnknownReason::NoAccount);
+        };
+        let Some(cache_age_secs) = quota_cache_age_secs(sel_acct, now_ep) else {
+            return HeadroomCheck::Unknown(HeadroomUnknownReason::StaleCache);
+        };
+        if cache_age_secs > SHADOW_HEADROOM_MAX_CACHE_AGE_SECS {
+            return HeadroomCheck::Unknown(HeadroomUnknownReason::StaleCache);
+        }
+        let Some(median_mins) = median_write_mins.filter(|&m| m > 0) else {
+            return HeadroomCheck::Unknown(HeadroomUnknownReason::NoWriteMedian);
+        };
+        let sel_acct_id = s(sel_acct, "id").to_string();
+        let active_writes: usize = healthy_accts
+            .iter()
+            .map(|a| {
+                running_writers
+                    .get(&(s(a, "id").to_string(), pool))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .sum();
+        let required_mins = median_mins.saturating_mul(active_writes as u64 + 1);
+
+        let mut tightest: Option<(&'static str, u64)> = None;
+        let mut saw_known_ok = false;
+
+        for window_key in ["fiveHour", "weekly"] {
+            let est = find_pool_window_estimate(sel_acct, pool, window_key);
+            if !est.is_object() {
+                continue;
+            }
+            match s(est, "status") {
+                "safe" | "idle" => {
+                    saw_known_ok = true;
+                }
+                "depletes" => {
+                    let Some(mid_m) = est["midMinutes"].as_u64() else {
+                        continue;
+                    };
+                    let other_can_takeover = healthy_accts.iter().any(|other| {
+                        if s(other, "id") == sel_acct_id {
+                            return false;
+                        }
+                        if acct_pool_tier(other, pool).as_deref() == Some("green") {
+                            return true;
+                        }
+                        if let Some((other_reset_s, _, is_passive)) =
+                            find_acct_pool_window_entry_meta(other, window_key, Some(pool.label()))
+                        {
+                            let weekly_blocked = window_key == "fiveHour"
+                                && find_acct_pool_window_entry(other, "weekly", Some(pool.label()))
+                                    .is_some_and(|(_, wpct)| wpct < YELLOW_WEEKLY_MIN_PCT);
+                            if !is_passive
+                                && !weekly_blocked
+                                && other_reset_s <= mid_m.saturating_mul(60)
+                            {
+                                return true;
+                            }
+                        }
+                        false
+                    });
+                    if other_can_takeover {
+                        saw_known_ok = true;
+                        continue;
+                    }
+
+                    let (cur_reset_secs, cur_pct) =
+                        find_acct_pool_window_entry(sel_acct, window_key, Some(pool.label()))
+                            .unwrap_or_else(|| {
+                                (
+                                    est["resetInSeconds"].as_u64().unwrap_or(0),
+                                    est["remainingPct"].as_f64().unwrap_or(0.0),
+                                )
+                            });
+                    let mut earliest_reset = cur_reset_secs;
+                    let mut combined_pct = cur_pct.max(0.0);
+                    for a in &healthy_accts {
+                        let aid = s(a, "id");
+                        if let Some((rs, pct, is_passive)) =
+                            find_acct_pool_window_entry_meta(a, window_key, Some(pool.label()))
+                        {
+                            let weekly_blocked = window_key == "fiveHour"
+                                && find_acct_pool_window_entry(a, "weekly", Some(pool.label()))
+                                    .is_some_and(|(_, wpct)| wpct < YELLOW_WEEKLY_MIN_PCT);
+                            if !is_passive
+                                && !weekly_blocked
+                                && rs > 0
+                                && (earliest_reset == 0 || rs < earliest_reset)
+                            {
+                                earliest_reset = rs;
+                            }
+                            if aid != sel_acct_id && !weekly_blocked && !is_passive {
+                                combined_pct += pct.max(0.0);
+                            }
+                        }
+                    }
+                    let scale = if cur_pct > 0.5 {
+                        (combined_pct / cur_pct).max(1.0)
+                    } else {
+                        1.0
+                    };
+                    let combined_mid_m = ((mid_m as f64) * scale).round() as u64;
+                    if earliest_reset > 0 && combined_mid_m.saturating_mul(60) >= earliest_reset {
+                        saw_known_ok = true;
+                        continue;
+                    }
+                    if tightest.is_none_or(|(_, prev)| combined_mid_m < prev) {
+                        tightest = Some((window_key, combined_mid_m));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        match tightest {
+            Some((win, rem_m)) if rem_m < required_mins => {
+                HeadroomCheck::WouldHold(HeadroomDecision {
+                    pool,
+                    account_id: sel_acct_id,
+                    window: win.to_string(),
+                    remaining_minutes: rem_m,
+                    required_minutes: required_mins,
+                    median_write_minutes: median_mins,
+                    active_writes,
+                    cache_age_seconds: cache_age_secs,
+                })
+            }
+            Some(_) => HeadroomCheck::Fits,
+            None if saw_known_ok => HeadroomCheck::Fits,
+            None => HeadroomCheck::Unknown(HeadroomUnknownReason::NoEstimate),
+        }
+    }
+}
+
+/// Cache-only, zero-subprocess write-task quota headroom check for `pool` in `state`.
+pub fn check_write_quota_headroom_in(
+    state: &Path,
+    pool: QuotaPool,
+    now_ep: i64,
+) -> HeadroomCheck {
+    let Some(snap) = quota_snapshot_for_alerts_in(state, now_ep) else {
+        return HeadroomCheck::Unknown(HeadroomUnknownReason::NoSnapshot);
+    };
+    let running_writers = count_running_writers(state, None);
+    let median_mins = median_write_duration_mins_in(state, now_ep);
+    check_write_quota_headroom_from_snapshot(&snap, pool, &running_writers, median_mins, now_ep)
+}
+
+#[derive(Debug, Clone)]
+pub struct QuotaShadowPoolStats {
+    pub pool: QuotaPool,
+    pub holds: usize,
+    pub true_positive_holds: usize,
+    pub false_positive_holds: usize,
+    pub false_positive_rate: Option<f64>,
+    pub failures: usize,
+    pub predicted_failures: usize,
+    pub missed_failures: usize,
+    pub recall: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuotaShadowReport {
+    pub since_label: String,
+    pub since_epoch: i64,
+    pub window_override_mins: Option<u64>,
+    pub total_holds: usize,
+    pub true_positive_holds: usize,
+    pub false_positive_holds: usize,
+    pub false_positive_rate: Option<f64>,
+    pub total_failures: usize,
+    pub predicted_failures: usize,
+    pub missed_failures: usize,
+    pub recall: Option<f64>,
+    pub by_pool: Vec<QuotaShadowPoolStats>,
+}
+
+#[derive(Debug, Clone)]
+struct ShadowHoldRecord {
+    at_ep: i64,
+    run: String,
+    pool: QuotaPool,
+    horizon_secs: i64,
+}
+
+#[derive(Debug, Clone)]
+struct QuotaFailureRecord {
+    at_ep: i64,
+    run: String,
+    pool: Option<QuotaPool>,
+}
+
+fn hold_matches_failure(h: &ShadowHoldRecord, f: &QuotaFailureRecord) -> bool {
+    if f.at_ep < h.at_ep {
+        return false;
+    }
+    if !h.run.is_empty() && h.run == f.run {
+        return true;
+    }
+    f.pool == Some(h.pool) && f.at_ep <= h.at_ep.saturating_add(h.horizon_secs)
+}
+
+/// Pure reconciliation of `quota_would_hold` shadow events against subsequent real
+/// quota-exhaustion failures (`failed` events whose error matches `is_quota_exhausted_error`).
+pub fn compute_quota_shadow_report(
+    events: &[Value],
+    since_label: &str,
+    since_ep: i64,
+    window_override_mins: Option<u64>,
+) -> QuotaShadowReport {
+    let mut run_pool: HashMap<String, QuotaPool> = HashMap::new();
+    for ev in events {
+        let kind = s(ev, "kind");
+        let run = s(ev, "run");
+        if run.is_empty() {
+            continue;
+        }
+        if kind == "started" {
+            let model = s(&ev["payload"], "model");
+            if let Some(pool) = classify_model_pool(model) {
+                run_pool.insert(run.to_string(), pool);
+            }
+        } else if kind == "quota_would_hold" {
+            if let Some(pool) = classify_quota_pool_name(s(&ev["payload"], "pool")) {
+                run_pool.entry(run.to_string()).or_insert(pool);
+            }
+        }
+    }
+
+    let mut all_holds: Vec<ShadowHoldRecord> = Vec::new();
+    let mut window_holds: Vec<ShadowHoldRecord> = Vec::new();
+    let mut all_failures: Vec<QuotaFailureRecord> = Vec::new();
+    let mut window_failures: Vec<QuotaFailureRecord> = Vec::new();
+
+    for ev in events {
+        let Some(at_ep) = iso_epoch(s(ev, "at")) else {
+            continue;
+        };
+        let kind = s(ev, "kind");
+        let run = s(ev, "run").to_string();
+        let p = &ev["payload"];
+        match kind {
+            "quota_would_hold" => {
+                let Some(pool) = classify_quota_pool_name(s(p, "pool"))
+                    .or_else(|| classify_quota_pool_name(s(p, "poolLabel")))
+                else {
+                    continue;
+                };
+                let horizon_mins = window_override_mins.unwrap_or_else(|| {
+                    p["requiredMinutes"]
+                        .as_u64()
+                        .filter(|&m| m > 0)
+                        .unwrap_or(SHADOW_DEFAULT_WINDOW_MINS)
+                        .clamp(SHADOW_MIN_WINDOW_MINS, SHADOW_MAX_WINDOW_MINS)
+                });
+                let rec = ShadowHoldRecord {
+                    at_ep,
+                    run,
+                    pool,
+                    horizon_secs: (horizon_mins as i64).saturating_mul(60),
+                };
+                if at_ep >= since_ep {
+                    window_holds.push(rec.clone());
+                }
+                all_holds.push(rec);
+            }
+            "failed" => {
+                let err = s(p, "error");
+                if !is_quota_exhausted_error(err) {
+                    continue;
+                }
+                let pool = (!run.is_empty())
+                    .then(|| run_pool.get(&run).copied())
+                    .flatten()
+                    .or_else(|| classify_quota_pool_name(s(p, "pool")));
+                let rec = QuotaFailureRecord { at_ep, run, pool };
+                if at_ep >= since_ep {
+                    window_failures.push(rec.clone());
+                }
+                all_failures.push(rec);
+            }
+            _ => {}
+        }
+    }
+
+    let total_holds = window_holds.len();
+    let true_positive_holds = window_holds
+        .iter()
+        .filter(|h| all_failures.iter().any(|f| hold_matches_failure(h, f)))
+        .count();
+    let false_positive_holds = total_holds.saturating_sub(true_positive_holds);
+    let false_positive_rate = (total_holds > 0)
+        .then(|| false_positive_holds as f64 / total_holds as f64);
+
+    let total_failures = window_failures.len();
+    let predicted_failures = window_failures
+        .iter()
+        .filter(|f| all_holds.iter().any(|h| hold_matches_failure(h, f)))
+        .count();
+    let missed_failures = total_failures.saturating_sub(predicted_failures);
+    let recall = (total_failures > 0)
+        .then(|| predicted_failures as f64 / total_failures as f64);
+
+    let mut by_pool = Vec::new();
+    for pool in QuotaPool::ALL {
+        let p_holds: Vec<&ShadowHoldRecord> =
+            window_holds.iter().filter(|h| h.pool == pool).collect();
+        let p_fails: Vec<&QuotaFailureRecord> = window_failures
+            .iter()
+            .filter(|f| f.pool == Some(pool))
+            .collect();
+        if p_holds.is_empty() && p_fails.is_empty() {
+            continue;
+        }
+        let tp = p_holds
+            .iter()
+            .filter(|h| all_failures.iter().any(|f| hold_matches_failure(h, f)))
+            .count();
+        let fp = p_holds.len().saturating_sub(tp);
+        let pred = p_fails
+            .iter()
+            .filter(|f| all_holds.iter().any(|h| hold_matches_failure(h, f)))
+            .count();
+        let missed = p_fails.len().saturating_sub(pred);
+        by_pool.push(QuotaShadowPoolStats {
+            pool,
+            holds: p_holds.len(),
+            true_positive_holds: tp,
+            false_positive_holds: fp,
+            false_positive_rate: (!p_holds.is_empty()).then(|| fp as f64 / p_holds.len() as f64),
+            failures: p_fails.len(),
+            predicted_failures: pred,
+            missed_failures: missed,
+            recall: (!p_fails.is_empty()).then(|| pred as f64 / p_fails.len() as f64),
+        });
+    }
+
+    QuotaShadowReport {
+        since_label: since_label.to_string(),
+        since_epoch: since_ep,
+        window_override_mins,
+        total_holds,
+        true_positive_holds,
+        false_positive_holds,
+        false_positive_rate,
+        total_failures,
+        predicted_failures,
+        missed_failures,
+        recall,
+        by_pool,
+    }
+}
+
+impl QuotaShadowReport {
+    pub fn to_json(&self) -> Value {
+        let round4 = |v: f64| (v * 10000.0).round() / 10000.0;
+        let pools: Vec<Value> = self
+            .by_pool
+            .iter()
+            .map(|p| {
+                json!({
+                    "pool": p.pool.key(),
+                    "label": p.pool.short_label(),
+                    "holds": p.holds,
+                    "truePositiveHolds": p.true_positive_holds,
+                    "falsePositiveHolds": p.false_positive_holds,
+                    "falsePositiveRate": p.false_positive_rate.map(round4),
+                    "quotaFailures": p.failures,
+                    "predictedFailures": p.predicted_failures,
+                    "missedFailures": p.missed_failures,
+                    "recall": p.recall.map(round4),
+                })
+            })
+            .collect();
+        json!({
+            "since": self.since_label,
+            "sinceEpoch": self.since_epoch,
+            "windowMinutes": self.window_override_mins,
+            "holds": self.total_holds,
+            "truePositiveHolds": self.true_positive_holds,
+            "falsePositiveHolds": self.false_positive_holds,
+            "falsePositiveRate": self.false_positive_rate.map(round4),
+            "quotaFailures": self.total_failures,
+            "predictedFailures": self.predicted_failures,
+            "missedFailures": self.missed_failures,
+            "recall": self.recall.map(round4),
+            "byPool": pools,
+        })
+    }
+
+    pub fn format_human(&self) -> String {
+        let fmt_pct = |v: Option<f64>| match v {
+            Some(r) => format!("{:.1}%", r * 100.0),
+            None => "N/A".to_string(),
+        };
+        let win_desc = match self.window_override_mins {
+            Some(m) => format!("固定窗 {m}m"),
+            None => format!(
+                "事件 requiredMinutes（限 {}–{}m，默认 {}m）",
+                SHADOW_MIN_WINDOW_MINS, SHADOW_MAX_WINDOW_MINS, SHADOW_DEFAULT_WINDOW_MINS
+            ),
+        };
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "额度预报影子模式对账（近 {} · 匹配窗：{}）",
+            self.since_label, win_desc
+        ));
+        lines.push(format!(
+            "  召回率：{}（提前命中 {} / 真实额度失败 {}，漏报 {}）",
+            fmt_pct(self.recall),
+            self.predicted_failures,
+            self.total_failures,
+            self.missed_failures,
+        ));
+        lines.push(format!(
+            "  误报率：{}（后续无失败 {} / 影子触发 {}，命中 {}）",
+            fmt_pct(self.false_positive_rate),
+            self.false_positive_holds,
+            self.total_holds,
+            self.true_positive_holds,
+        ));
+        for p in &self.by_pool {
+            lines.push(format!(
+                "  - {}：召回 {}（{}/{}），误报 {}（{}/{}）",
+                p.pool.short_label(),
+                fmt_pct(p.recall),
+                p.predicted_failures,
+                p.failures,
+                fmt_pct(p.false_positive_rate),
+                p.false_positive_holds,
+                p.holds,
+            ));
+        }
+        let verdict = match (self.recall, self.false_positive_rate) {
+            (Some(rec), Some(fpr)) if rec >= 0.70 && fpr < 0.20 => {
+                "参考门槛（召回 ≥ 70% 且误报 < 20%）：已达标，可评估转为真拦截"
+            }
+            (Some(_), Some(_)) => {
+                "参考门槛（召回 ≥ 70% 且误报 < 20%）：暂未达标，继续观察或调参"
+            }
+            _ => "参考门槛（召回 ≥ 70% 且误报 < 20%）：样本不足（需同时有影子事件与真实 429 失败）",
+        };
+        lines.push(format!("  {verdict}"));
+        lines.join("\n")
+    }
+}
+
+/// CLI entrypoint for `delegate quota-shadow [--since 72h|DURATION|all] [--window MINS] [--json]`.
+pub fn quota_shadow_command(args: &[String]) -> Res<i32> {
+    let mut since_raw = "72h".to_string();
+    let mut window_mins: Option<u64> = None;
+    let mut json_mode = crate::output::json_enabled();
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let (key, inline) = if a.starts_with("--") {
+            a.split_once('=')
+                .map_or((a.as_str(), None), |(k, v)| (k, Some(v)))
+        } else {
+            (a.as_str(), None)
+        };
+        let take_val = |k: &str, idx: &mut usize| -> Res<String> {
+            match inline {
+                Some(v) => Ok(v.to_string()),
+                None => {
+                    *idx += 1;
+                    args.get(*idx)
+                        .cloned()
+                        .ok_or_else(|| format!("argument {k}: expected one argument"))
+                }
+            }
+        };
+        match key {
+            "--since" => since_raw = take_val(key, &mut i)?,
+            "--window" => {
+                let raw = take_val(key, &mut i)?;
+                let parsed = raw
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&m| m > 0)
+                    .ok_or_else(|| format!("invalid --window '{raw}' (expected positive integer minutes)"))?;
+                window_mins = Some(parsed);
+            }
+            "--json" => json_mode = true,
+            _ => {
+                return Err(unrecognized_arg(
+                    a,
+                    &["--since", "--window", "--json"],
+                    "delegate quota-shadow [--since 72h|DURATION|all] [--window MINS] [--json]",
+                ));
+            }
+        }
+        i += 1;
+    }
+
+    let (since_label, since_secs) = crate::fill::parse_since_arg(&since_raw)?;
+    let now_ep = epoch() as i64;
+    let since_ep = since_secs.map(|s| now_ep.saturating_sub(s)).unwrap_or(0);
+
+    let state = state_dir();
+    let evs = crate::events::read_since_in(&state, 0);
+    let report = compute_quota_shadow_report(&evs, &since_label, since_ep, window_mins);
+
+    if json_mode {
+        println!("{}", report.to_json());
+    } else {
+        println!("{}", report.format_human());
+    }
+    Ok(0)
 }
 
 /// Format a prominent single-line warning for `delegate status` (advisory only).
@@ -9580,5 +10419,453 @@ Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSum
                 );
             }
         }
+    }
+
+    fn mk_shadow_snap(
+        mode: &str,
+        active: &str,
+        accounts: Value,
+        auto_switch: Option<Value>,
+    ) -> Value {
+        let mut v = json!({
+            "mode": mode,
+            "active": active,
+            "accounts": accounts,
+        });
+        if let Some(asw) = auto_switch {
+            v["autoSwitch"] = asw;
+        }
+        v
+    }
+
+    #[test]
+    fn shadow_headroom_fits_when_remaining_covers_writers_plus_one() {
+        let now_ep: i64 = 1_780_000_000;
+        let snap = mk_shadow_snap(
+            "fixed",
+            "work",
+            json!([{
+                "id": "work",
+                "active": true,
+                "quota": {
+                    "ok": true,
+                    "fetchedEpoch": now_ep - 300,
+                    "entries": [{
+                        "pool": "Gemini Models",
+                        "window": "fiveHour",
+                        "remainingPct": 40.0,
+                        "resetInSeconds": 10800
+                    }]
+                },
+                "quotaEstimate": {
+                    "pools": [{
+                        "pool": "Gemini Models",
+                        "tier": "yellow",
+                        "fiveHour": {
+                            "status": "depletes",
+                            "alert": true,
+                            "midMinutes": 100
+                        },
+                        "weekly": {
+                            "status": "safe"
+                        }
+                    }]
+                }
+            }]),
+            None,
+        );
+        let mut writers = BTreeMap::new();
+        writers.insert(("work".to_string(), QuotaPool::Gemini), 1);
+        // active_writes = 1 -> needs (1 + 1) * 45 = 90m <= 100m -> Fits
+        let res = check_write_quota_headroom_from_snapshot(
+            &snap,
+            QuotaPool::Gemini,
+            &writers,
+            Some(45),
+            now_ep,
+        );
+        assert_eq!(res, HeadroomCheck::Fits);
+
+        // Safe-only window also fits.
+        let safe_snap = mk_shadow_snap(
+            "fixed",
+            "work",
+            json!([{
+                "id": "work",
+                "active": true,
+                "quota": { "ok": true, "fetchedEpoch": now_ep - 60, "entries": [] },
+                "quotaEstimate": {
+                    "pools": [{
+                        "pool": "Gemini Models",
+                        "tier": "green",
+                        "fiveHour": { "status": "safe" },
+                        "weekly": { "status": "idle" }
+                    }]
+                }
+            }]),
+            None,
+        );
+        assert_eq!(
+            check_write_quota_headroom_from_snapshot(
+                &safe_snap,
+                QuotaPool::Gemini,
+                &writers,
+                Some(45),
+                now_ep,
+            ),
+            HeadroomCheck::Fits
+        );
+    }
+
+    #[test]
+    fn shadow_headroom_would_hold_when_remaining_below_required() {
+        let now_ep: i64 = 1_780_000_000;
+        let snap = mk_shadow_snap(
+            "fixed",
+            "work",
+            json!([{
+                "id": "work",
+                "active": true,
+                "quota": {
+                    "ok": true,
+                    "fetchedEpoch": now_ep - 420,
+                    "entries": [{
+                        "pool": "Gemini Models",
+                        "window": "fiveHour",
+                        "remainingPct": 25.0,
+                        "resetInSeconds": 9000
+                    }]
+                },
+                "quotaEstimate": {
+                    "pools": [{
+                        "pool": "Gemini Models",
+                        "tier": "yellow",
+                        "fiveHour": {
+                            "status": "depletes",
+                            "alert": true,
+                            "midMinutes": 75
+                        },
+                        "weekly": {
+                            "status": "depletes",
+                            "alert": false,
+                            "midMinutes": 200
+                        }
+                    }]
+                }
+            }]),
+            None,
+        );
+        let mut writers = BTreeMap::new();
+        writers.insert(("work".to_string(), QuotaPool::Gemini), 1);
+        // active_writes = 1 -> required = (1 + 1) * 45 = 90m > 75m -> WouldHold
+        let res = check_write_quota_headroom_from_snapshot(
+            &snap,
+            QuotaPool::Gemini,
+            &writers,
+            Some(45),
+            now_ep,
+        );
+        assert_eq!(
+            res,
+            HeadroomCheck::WouldHold(HeadroomDecision {
+                pool: QuotaPool::Gemini,
+                account_id: "work".to_string(),
+                window: "fiveHour".to_string(),
+                remaining_minutes: 75,
+                required_minutes: 90,
+                median_write_minutes: 45,
+                active_writes: 1,
+                cache_age_seconds: 420,
+            })
+        );
+
+        // Auto mode: another healthy Green account can take over -> Fits.
+        let auto_green_snap = mk_shadow_snap(
+            "auto",
+            "a",
+            json!([
+                {
+                    "id": "a",
+                    "active": true,
+                    "quota": {
+                        "ok": true,
+                        "fetchedEpoch": now_ep - 180,
+                        "entries": [{
+                            "pool": "Gemini Models",
+                            "window": "fiveHour",
+                            "remainingPct": 15.0,
+                            "resetInSeconds": 9000
+                        }]
+                    },
+                    "quotaEstimate": {
+                        "pools": [{
+                            "pool": "Gemini Models",
+                            "tier": "yellow",
+                            "fiveHour": { "status": "depletes", "alert": true, "midMinutes": 30 }
+                        }]
+                    }
+                },
+                {
+                    "id": "b",
+                    "active": false,
+                    "quota": {
+                        "ok": true,
+                        "fetchedEpoch": now_ep - 180,
+                        "entries": [{
+                            "pool": "Gemini Models",
+                            "window": "fiveHour",
+                            "remainingPct": 90.0,
+                            "resetInSeconds": 14400
+                        }]
+                    },
+                    "quotaEstimate": {
+                        "pools": [{
+                            "pool": "Gemini Models",
+                            "tier": "green",
+                            "fiveHour": { "status": "safe" }
+                        }]
+                    }
+                }
+            ]),
+            Some(json!({
+                "enabled": true,
+                "poolSummary": { "gemini": { "selected": "a" } }
+            })),
+        );
+        assert_eq!(
+            check_write_quota_headroom_from_snapshot(
+                &auto_green_snap,
+                QuotaPool::Gemini,
+                &writers,
+                Some(45),
+                now_ep,
+            ),
+            HeadroomCheck::Fits
+        );
+
+        // Auto mode: both accounts yellow, combined 15% + 15% = 30% -> scale 2.0 -> 30m * 2 = 60m < 90m -> WouldHold.
+        let auto_both_low_snap = mk_shadow_snap(
+            "auto",
+            "a",
+            json!([
+                {
+                    "id": "a",
+                    "active": true,
+                    "quota": {
+                        "ok": true,
+                        "fetchedEpoch": now_ep - 180,
+                        "entries": [{
+                            "pool": "Gemini Models",
+                            "window": "fiveHour",
+                            "remainingPct": 15.0,
+                            "resetInSeconds": 9000
+                        }]
+                    },
+                    "quotaEstimate": {
+                        "pools": [{
+                            "pool": "Gemini Models",
+                            "tier": "yellow",
+                            "fiveHour": { "status": "depletes", "alert": true, "midMinutes": 30 }
+                        }]
+                    }
+                },
+                {
+                    "id": "b",
+                    "active": false,
+                    "quota": {
+                        "ok": true,
+                        "fetchedEpoch": now_ep - 180,
+                        "entries": [{
+                            "pool": "Gemini Models",
+                            "window": "fiveHour",
+                            "remainingPct": 15.0,
+                            "resetInSeconds": 9000
+                        }]
+                    },
+                    "quotaEstimate": {
+                        "pools": [{
+                            "pool": "Gemini Models",
+                            "tier": "yellow",
+                            "fiveHour": { "status": "depletes", "alert": true, "midMinutes": 30 }
+                        }]
+                    }
+                }
+            ]),
+            Some(json!({
+                "enabled": true,
+                "poolSummary": { "gemini": { "selected": "a" } }
+            })),
+        );
+        let mut auto_writers = BTreeMap::new();
+        auto_writers.insert(("a".to_string(), QuotaPool::Gemini), 1);
+        match check_write_quota_headroom_from_snapshot(
+            &auto_both_low_snap,
+            QuotaPool::Gemini,
+            &auto_writers,
+            Some(45),
+            now_ep,
+        ) {
+            HeadroomCheck::WouldHold(d) => {
+                assert_eq!(d.remaining_minutes, 60);
+                assert_eq!(d.required_minutes, 90);
+                assert_eq!(d.active_writes, 1);
+            }
+            other => panic!("expected WouldHold in auto all-low, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shadow_headroom_unknown_when_cache_older_than_20m() {
+        let now_ep: i64 = 1_780_000_000;
+        let mk = |age: i64| {
+            mk_shadow_snap(
+                "fixed",
+                "work",
+                json!([{
+                    "id": "work",
+                    "active": true,
+                    "quota": {
+                        "ok": true,
+                        "fetchedEpoch": now_ep - age,
+                        "entries": [{
+                            "pool": "Gemini Models",
+                            "window": "fiveHour",
+                            "remainingPct": 10.0,
+                            "resetInSeconds": 9000
+                        }]
+                    },
+                    "quotaEstimate": {
+                        "pools": [{
+                            "pool": "Gemini Models",
+                            "tier": "yellow",
+                            "fiveHour": { "status": "depletes", "alert": true, "midMinutes": 15 }
+                        }]
+                    }
+                }]),
+                None,
+            )
+        };
+        let writers = BTreeMap::new();
+        // 20m + 1s = 1201s -> StaleCache (must NOT emit WouldHold)
+        assert_eq!(
+            check_write_quota_headroom_from_snapshot(
+                &mk(SHADOW_HEADROOM_MAX_CACHE_AGE_SECS + 1),
+                QuotaPool::Gemini,
+                &writers,
+                Some(45),
+                now_ep,
+            ),
+            HeadroomCheck::Unknown(HeadroomUnknownReason::StaleCache)
+        );
+        // Exactly 20m = 1200s -> still fresh, triggers WouldHold
+        assert!(matches!(
+            check_write_quota_headroom_from_snapshot(
+                &mk(SHADOW_HEADROOM_MAX_CACHE_AGE_SECS),
+                QuotaPool::Gemini,
+                &writers,
+                Some(45),
+                now_ep,
+            ),
+            HeadroomCheck::WouldHold(_)
+        ));
+    }
+
+    #[test]
+    fn shadow_headroom_median_write_duration_from_history() {
+        let base = env::temp_dir().join(format!(
+            "delegate-shadow-median-{}-{}",
+            std::process::id(),
+            TEMP_HOME_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let state = base.join("state");
+        let hdir = state.join("history").join("demo-0123456789ab");
+        fs::create_dir_all(&hdir).unwrap();
+
+        let now_ep = iso_epoch("2026-11-27T10:00:00Z").unwrap();
+        // Recent writes: 20m (1200s), 50m (3000s), 80m (4800s) -> median 50m.
+        // Ignored: read-only 5m (300s), >14d old write 200m (12000s), 0s write.
+        let lines = [
+            json!({"event":"finish","run":"r1","mode":"write","state":"delivered","finishedAt":"2026-11-26T10:00:00Z","elapsedSeconds":1200}),
+            json!({"event":"finish","run":"r2","mode":"write","state":"delivered","finishedAt":"2026-11-25T10:00:00Z","elapsedSeconds":4800}),
+            json!({"event":"finish","run":"r3","mode":"write","state":"failed","finishedAt":"2026-11-24T10:00:00Z","elapsedSeconds":3000}),
+            json!({"event":"finish","run":"r4","mode":"read","state":"answered","finishedAt":"2026-11-26T12:00:00Z","elapsedSeconds":300}),
+            json!({"event":"finish","run":"r5","mode":"write","state":"delivered","finishedAt":"2026-11-01T10:00:00Z","elapsedSeconds":12000}),
+            json!({"event":"finish","run":"r6","mode":"write","state":"delivered","finishedAt":"2026-11-26T11:00:00Z","elapsedSeconds":0}),
+        ];
+        let body = lines
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(hdir.join("history.jsonl"), body).unwrap();
+
+        assert_eq!(median_write_duration_mins_in(&state, now_ep), Some(50));
+
+        // Empty state returns None.
+        let empty = base.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        assert_eq!(median_write_duration_mins_in(&empty, now_ep), None);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn quota_shadow_reconcile_recall_and_false_positive_rate() {
+        let since_ep = iso_epoch("2026-11-24T00:00:00Z").unwrap();
+        let truncated_429 = "API Error: 429 RESOURCE_EXHAUSTED: You have exhausted your capacity on this model. Your quota will reset after 2h15m. Please upgrade your subscription or wait for reset (truncated at 200 chars...";
+        assert!(
+            is_quota_exhausted_error(truncated_429),
+            "truncated 200-char 429 RESOURCE_EXHAUSTED error must match is_quota_exhausted_error"
+        );
+
+        let events = vec![
+            // Run 1: Gemini started + shadow hold at 10:00 -> real 429 at 10:40 (TP hold + predicted failure)
+            json!({"seq":1,"at":"2026-11-26T10:00:00Z","run":"run-1","repo":"/r","kind":"started","payload":{"model":"agy/gemini-4-neon","mode":"write"}}),
+            json!({"seq":2,"at":"2026-11-26T10:00:01Z","run":"run-1","repo":"/r","kind":"quota_would_hold","payload":{"pool":"gemini","poolLabel":"Gemini","remainingMinutes":30,"requiredMinutes":90,"activeWrites":1,"cacheAgeSeconds":120,"source":"fill"}}),
+            json!({"seq":3,"at":"2026-11-26T10:40:00Z","run":"run-1","repo":"/r","kind":"failed","payload":{"error":truncated_429}}),
+            // Run 2: Gemini started + shadow hold at 14:00 -> no subsequent Gemini 429 (FP hold)
+            json!({"seq":4,"at":"2026-11-26T14:00:00Z","run":"run-2","repo":"/r","kind":"started","payload":{"model":"agy/gemini-4-neon","mode":"write"}}),
+            json!({"seq":5,"at":"2026-11-26T14:00:01Z","run":"run-2","repo":"/r","kind":"quota_would_hold","payload":{"pool":"gemini","poolLabel":"Gemini","remainingMinutes":40,"requiredMinutes":90,"activeWrites":1,"cacheAgeSeconds":200,"source":"dag"}}),
+            // Run 3: Claude/GPT 429 at 14:20 -> different pool, must NOT match run-2's Gemini hold; counts as missed failure
+            json!({"seq":6,"at":"2026-11-26T14:10:00Z","run":"run-3","repo":"/r","kind":"started","payload":{"model":"agy/claude-4-sonnet","mode":"write"}}),
+            json!({"seq":7,"at":"2026-11-26T14:20:00Z","run":"run-3","repo":"/r","kind":"failed","payload":{"error":"RESOURCE_EXHAUSTED (code 429): quota reached, resets in 1h"}}),
+            // Run 4: Transient rate limit 429 -> must NOT be counted as real quota failure
+            json!({"seq":8,"at":"2026-11-26T14:30:00Z","run":"run-4","repo":"/r","kind":"started","payload":{"model":"agy/gemini-4-neon","mode":"write"}}),
+            json!({"seq":9,"at":"2026-11-26T14:35:00Z","run":"run-4","repo":"/r","kind":"failed","payload":{"error":"HTTP 429 Too Many Requests: rate limit exceeded, try again in 30s"}}),
+            // Run 5: Another Gemini 429 at 20:00 with no prior hold -> missed failure
+            json!({"seq":10,"at":"2026-11-26T19:30:00Z","run":"run-5","repo":"/r","kind":"started","payload":{"model":"agy/gemini-4-neon","mode":"write"}}),
+            json!({"seq":11,"at":"2026-11-26T20:00:00Z","run":"run-5","repo":"/r","kind":"failed","payload":{"error":"quota_exhausted"}}),
+        ];
+
+        let rep = compute_quota_shadow_report(&events, "72h", since_ep, None);
+        // Holds: 2 (run-1 TP, run-2 FP) -> FPR = 1/2 = 0.5
+        assert_eq!(rep.total_holds, 2);
+        assert_eq!(rep.true_positive_holds, 1);
+        assert_eq!(rep.false_positive_holds, 1);
+        assert!((rep.false_positive_rate.unwrap() - 0.5).abs() < 1e-9);
+        // Real quota failures: 3 (run-1 predicted, run-3 missed, run-5 missed; run-4 transient ignored) -> recall = 1/3
+        assert_eq!(rep.total_failures, 3);
+        assert_eq!(rep.predicted_failures, 1);
+        assert_eq!(rep.missed_failures, 2);
+        assert!((rep.recall.unwrap() - (1.0 / 3.0)).abs() < 1e-9);
+
+        let j = rep.to_json();
+        assert_eq!(j["holds"], 2);
+        assert_eq!(j["quotaFailures"], 3);
+        assert_eq!(j["predictedFailures"], 1);
+        assert_eq!(j["falsePositiveHolds"], 1);
+
+        let human = rep.format_human();
+        assert!(human.contains("召回率：33.3%"));
+        assert!(human.contains("误报率：50.0%"));
+
+        // Empty events -> None / null / N/A
+        let empty = compute_quota_shadow_report(&[], "72h", since_ep, None);
+        assert_eq!(empty.recall, None);
+        assert_eq!(empty.false_positive_rate, None);
+        assert!(empty.to_json()["recall"].is_null());
+        assert!(empty.to_json()["falsePositiveRate"].is_null());
+        assert!(empty.format_human().contains("N/A"));
     }
 }

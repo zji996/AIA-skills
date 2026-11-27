@@ -2874,7 +2874,34 @@ fn emit_reconcile_events_and_dispatch(
         let Some(ad) = &item.auto_dispatch else {
             continue;
         };
+        let shadow_hold = if !is_readonly_start_args(&ad.start_args) {
+            let repo_hint = (!ad.repo.is_empty())
+                .then(|| Path::new(ad.repo.as_str()))
+                .or_else(|| (!item.repo.is_empty()).then(|| Path::new(item.repo.as_str())));
+            crate::agy_accounts::resolve_start_args_quota_pool(&ad.start_args, repo_hint).and_then(
+                |pool| match crate::agy_accounts::check_write_quota_headroom_in(
+                    state,
+                    pool,
+                    epoch() as i64,
+                ) {
+                    crate::agy_accounts::HeadroomCheck::WouldHold(d) => Some(d),
+                    _ => None,
+                },
+            )
+        } else {
+            None
+        };
         let res = dispatch_work_auto(item, ad);
+        if let Some(d) = shadow_hold {
+            let run_id = res.as_deref().unwrap_or("");
+            let _ = events::emit_in(
+                state,
+                run_id,
+                &item.repo,
+                "quota_would_hold",
+                d.event_payload("work_auto", Some(&item.id), None),
+            );
+        }
         match &res {
             Ok(new_run) => {
                 // Record dispatchedRun on the work item
@@ -2926,7 +2953,34 @@ fn emit_reconcile_events_and_dispatch(
         if !try_claim_fill_item(state, &item.id) {
             continue;
         }
+        let shadow_hold = if !is_readonly_start_args(&ad.start_args) {
+            let repo_hint = (!ad.repo.is_empty())
+                .then(|| Path::new(ad.repo.as_str()))
+                .or_else(|| (!item.repo.is_empty()).then(|| Path::new(item.repo.as_str())));
+            crate::agy_accounts::resolve_start_args_quota_pool(&ad.start_args, repo_hint).and_then(
+                |pool| match crate::agy_accounts::check_write_quota_headroom_in(
+                    state,
+                    pool,
+                    epoch() as i64,
+                ) {
+                    crate::agy_accounts::HeadroomCheck::WouldHold(d) => Some(d),
+                    _ => None,
+                },
+            )
+        } else {
+            None
+        };
         let res = dispatch_work_auto(item, ad);
+        if let Some(d) = shadow_hold {
+            let run_id = res.as_deref().unwrap_or("");
+            let _ = events::emit_in(
+                state,
+                run_id,
+                &item.repo,
+                "quota_would_hold",
+                d.event_payload("fill", Some(&item.id), None),
+            );
+        }
         match &res {
             Ok(new_run) => {
                 if let Ok(_guard) = crate::locks::acquire_state(state) {

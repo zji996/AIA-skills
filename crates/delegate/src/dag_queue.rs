@@ -515,6 +515,24 @@ fn dispatch_one(state: &Path, item: &Value) {
     let prompt_file = s(item, "promptFile");
     let start_args = strings(&item["startArgs"]);
 
+    let shadow_hold = if !crate::agy_accounts::is_readonly_start_args(&start_args) {
+        let repo_hint = (!repo.is_empty())
+            .then(|| Path::new(repo.as_str()))
+            .or_else(|| (!cwd.is_empty()).then(|| Path::new(cwd)));
+        crate::agy_accounts::resolve_start_args_quota_pool(&start_args, repo_hint).and_then(
+            |pool| match crate::agy_accounts::check_write_quota_headroom_in(
+                state,
+                pool,
+                epoch() as i64,
+            ) {
+                crate::agy_accounts::HeadroomCheck::WouldHold(d) => Some(d),
+                _ => None,
+            },
+        )
+    } else {
+        None
+    };
+
     let mut cmd = Command::new(script());
     cmd.arg("start")
         .arg("--json")
@@ -561,6 +579,17 @@ fn dispatch_one(state: &Path, item: &Value) {
         }
         Err("delegate start produced no run JSON".into())
     })();
+
+    if let Some(d) = shadow_hold {
+        let run_id = result.as_ref().map(|(rid, _)| rid.as_str()).unwrap_or("");
+        let _ = events::emit_in(
+            state,
+            run_id,
+            &repo,
+            "quota_would_hold",
+            d.event_payload("dag", None, Some(&qname)),
+        );
+    }
 
     let Ok(_guard) = crate::locks::acquire_state(state) else {
         return;

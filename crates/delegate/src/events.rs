@@ -1240,6 +1240,29 @@ pub fn format_human(ev: &Value) -> String {
                 format!("换号接力 {from} → {to}（{}）", clip(reason, 80))
             }
         }
+        "quota_would_hold" => {
+            let pool = {
+                let lbl = s(p, "poolLabel");
+                if !lbl.is_empty() {
+                    lbl
+                } else {
+                    s(p, "pool")
+                }
+            };
+            let rem = n(p, "remainingMinutes");
+            let req = n(p, "requiredMinutes");
+            let aw = n(p, "activeWrites");
+            let age_m = n(p, "cacheAgeSeconds") / 60;
+            let src = s(p, "source");
+            let src_part = if src.is_empty() {
+                String::new()
+            } else {
+                format!(" [{src}]")
+            };
+            format!(
+                "影子门控{src_part} {pool} 预计余 {rem}m < 需 {req}m（在跑写 {aw}，缓存 {age_m}m）"
+            )
+        }
         "queue_dispatched" => {
             format!("自动续派 {} -> {}", s(p, "queueName"), s(p, "nextRun"))
         }

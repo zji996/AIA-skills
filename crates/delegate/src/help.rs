@@ -105,6 +105,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "Inspect auto-fill concurrency statistics and stop-line alerts (fill stats [--since 24h]).",
     ),
     (
+        "quota-shadow",
+        "Reconcile shadow-mode quota_would_hold events against real 429 quota failures (recall & false-positive rate).",
+    ),
+    (
         "hook",
         "Zero-lock Stop hook kernel (hook check --format claude|agy|json), prioritized pending backlog (hook pending), and weekly telemetry (hook stats).",
     ),
@@ -371,6 +375,11 @@ fn command_spec(command: &str) -> Option<CommandSpec> {
             ("--since DURATION|all", "Time window to analyze (default: 24h)."),
             ("--repo PATH", "Repository to inspect (default: current git repository)."),
             ("--all", "Aggregate across all repositories."),
+            ("--json", "Print structured JSON output."),
+        ]),
+        "quota-shadow" => ("[--since 72h|DURATION|all] [--window MINS] [--json]", "Reconcile shadow-mode quota_would_hold events emitted by fill/work/queue against subsequent real 429 RESOURCE_EXHAUSTED quota failures, reporting recall and false-positive rate.", &[
+            ("--since DURATION|all", "Time window to reconcile (default: 72h)."),
+            ("--window MINS", "Override per-event lookahead window in minutes (default: event requiredMinutes clamped to 30–240m, fallback 120m)."),
             ("--json", "Print structured JSON output."),
         ]),
         "hook" => ("<check|pending|stats> [options]", "Zero-lock, zero-git Stop hook kernel: single-item turn-end guard (hook check), full prioritized backlog (hook pending), and weekly statistics (hook stats).", &[

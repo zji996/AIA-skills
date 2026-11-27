@@ -667,7 +667,7 @@ fn load_usage_rows(state: &Path) -> Vec<UsageRow> {
     rows
 }
 
-fn parse_since_arg(raw: &str) -> Res<(String, Option<i64>)> {
+pub(crate) fn parse_since_arg(raw: &str) -> Res<(String, Option<i64>)> {
     let t = raw.trim();
     if t.eq_ignore_ascii_case("all") || t == "0" {
         return Ok(("all".to_string(), None));
