@@ -1541,23 +1541,39 @@ fn clean(args: &[String]) -> Res<i32> {
     }
     if sync_gc {
         let orphans = cleanup::containers(&cache_dir().join("worktrees"), true);
+        let agy_orphans = agy_accounts::cleanup_orphan_agy_homes();
         if output::json_enabled() {
-            println!("{}", json!({"orphanCleanup":orphans.json()}));
-        } else if orphans.removed > 0 {
             println!(
-                "清理：删除了孤儿容器 {}（worktree 目录已不存在）",
-                orphans.removed_names.join("、")
+                "{}",
+                json!({"orphanCleanup": orphans.json(), "agyHomeCleanup": agy_orphans.json()})
             );
+        } else {
+            if orphans.removed > 0 {
+                println!(
+                    "清理：删除了孤儿容器 {}（worktree 目录已不存在）",
+                    orphans.removed_names.join("、")
+                );
+            }
+            if agy_orphans.removed > 0 {
+                println!("清理：删除了 {} 个孤儿 agy 临时目录", agy_orphans.removed);
+            }
         }
         orphans.warn_kept();
     } else {
+        let agy_orphans = agy_accounts::cleanup_orphan_agy_homes();
+        if !output::json_enabled() && agy_orphans.removed > 0 {
+            println!("清理：删除了 {} 个孤儿 agy 临时目录", agy_orphans.removed);
+        }
         // Always kick off detached `_gc-worker` so trash removal, `git worktree prune`,
         // and orphan container sweeps run asynchronously without blocking foreground `clean`.
         if staged_any || has(&flags, "--finished") {
             gc::spawn_worker();
         }
         if output::json_enabled() {
-            println!("{}", json!({"orphanCleanup":{"async":true}}));
+            println!(
+                "{}",
+                json!({"orphanCleanup":{"async":true}, "agyHomeCleanup": agy_orphans.json()})
+            );
         }
     }
     if rescan_archive {
@@ -1587,6 +1603,7 @@ fn stop(args: &[String]) -> Res<i32> {
                 .unwrap_or(0);
             cleanup::record(&run, pid);
             kill_group(pid, 1.0);
+            agy_accounts::cleanup_run_agy_home(&run);
         }
         if runs::active(&old) || runs::supervisor_alive(&run) {
             let pid = read(run.join("pid")).trim().parse::<i32>().unwrap_or(0);
@@ -1613,6 +1630,7 @@ fn stop(args: &[String]) -> Res<i32> {
                     }
                 }
                 cleanup::record(&run, 0);
+                agy_accounts::cleanup_run_agy_home(&run);
                 let mut sum = json!({"state":"stopped"});
                 if let Some(cleanup) = cleanup::summary(&run) {
                     sum["cleanup"] = cleanup;

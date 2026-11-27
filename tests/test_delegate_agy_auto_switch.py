@@ -6,6 +6,7 @@ read-only rerun, and reviewer full-template retry before fallback.
 All tests inject quota cache & scripted fake `agy` (never invokes real `agy`).
 """
 import json
+import os
 import subprocess
 import time
 import unittest
@@ -272,8 +273,8 @@ class DelegateAgyAutoSwitchTests(unittest.TestCase):
         self.assertIn("* alpha", list_fixed)
         self.assertIn("  auto", list_fixed)
         st_fixed = self._run_raw("agy", "account", "status").stdout
-        self.assertIn("mode: fixed", st_fixed)
-        self.assertIn("auto: [ ] off", st_fixed)
+        self.assertTrue(st_fixed.splitlines()[0].startswith("委派选号：固定 alpha"), st_fixed)
+        self.assertIn("本机实盘：alpha", st_fixed)
 
         # 2. Switch to `use auto` -> keeps live ~/.gemini on alpha, marks `* auto` in list/status!
         live_tok_path = self.fake_home / ".gemini/antigravity-cli/antigravity-oauth-token"
@@ -282,11 +283,19 @@ class DelegateAgyAutoSwitchTests(unittest.TestCase):
         self.assertEqual(live_tok_path.read_text(encoding="utf-8"), live_before)
 
         list_auto = self._run_raw("agy", "account", "list").stdout
+        self.assertTrue(
+            list_auto.splitlines()[0].startswith("委派选号：auto · Gemini → beta · Claude/GPT → alpha"),
+            list_auto,
+        )
+        self.assertIn("本机实盘：alpha（只给手动运行的 agy 用，auto 不改它）", list_auto)
         self.assertIn("* auto", list_auto)
         self.assertIn("Gemini→beta(绿)", list_auto)
         st_auto = self._run_raw("agy", "account", "status").stdout
-        self.assertIn("selected: auto", st_auto)
-        self.assertIn("auto: [*] on", st_auto)
+        self.assertTrue(
+            st_auto.splitlines()[0].startswith("委派选号：auto · Gemini → beta · Claude/GPT → alpha"),
+            st_auto,
+        )
+        self.assertIn("本机实盘：alpha（只给手动运行的 agy 用，auto 不改它）", st_auto)
 
         # JSON pick for Gemini alias `neon` in auto mode -> picks beta (without calling /usage or creating runs)
         r_json = self._run_raw("agy", "account", "pick", "--model", "neon", "--json")
@@ -958,6 +967,128 @@ class DelegateAgyAutoSwitchTests(unittest.TestCase):
         calls = self._read_calls()
         # Exactly 1 call for parent + 1 call for child, both on alpha (zero transient retries).
         self.assertEqual([c["account"] for c in calls], ["alpha", "alpha"])
+
+    def test_agy_auto_status_separates_delegation_and_live_and_real_quota(self):
+        """Auto mode status/list puts delegation selection first, live slot on its own line, and labels real quota."""
+        self._seed_two_accounts()
+        self._write_quota_cache(
+            alpha_gem=(15.0, 20.0),
+            beta_gem=(90.0, 88.0),
+            alpha_claude=(85.0, 82.0),
+            beta_claude=(25.0, 30.0),
+        )
+        self._enable_auto_mode()
+
+        st = self._run_raw("agy", "account", "status")
+        self.assertEqual(st.returncode, 0, st.stderr)
+        lines = st.stdout.splitlines()
+        self.assertEqual(
+            lines[0],
+            "委派选号：auto · Gemini → beta · Claude/GPT → alpha（在跑 0 个）",
+            st.stdout,
+        )
+        self.assertEqual(
+            lines[1],
+            "本机实盘：alpha（只给手动运行的 agy 用，auto 不改它）",
+            st.stdout,
+        )
+        self.assertIn("alpha 的实时额度（agy -p /usage，", st.stdout)
+
+        lst = self._run_raw("agy", "account", "list")
+        self.assertEqual(lst.returncode, 0, lst.stderr)
+        list_lines = lst.stdout.splitlines()
+        self.assertEqual(
+            list_lines[0],
+            "委派选号：auto · Gemini → beta · Claude/GPT → alpha（在跑 0 个）",
+            lst.stdout,
+        )
+        self.assertEqual(
+            list_lines[1],
+            "本机实盘：alpha（只给手动运行的 agy 用，auto 不改它）",
+            lst.stdout,
+        )
+
+    def test_agy_home_cleaned_on_task_end_and_clean_sweeps_orphans(self):
+        """Per-task delegate-agy-home-* is deleted on task finish/stop, and `clean` sweeps orphans safely."""
+        self._seed_two_accounts()
+        repo = self.repo({"README.md": "hi\n"})
+        recorded_homes = self.work / "recorded_homes.txt"
+        self._write_quota_cache(alpha_gem=(85.0, 85.0), beta_gem=(90.0, 90.0))
+        self._enable_auto_mode()
+
+        # 1. Task finishes normally -> overlay HOME created under self.runtime and removed on exit.
+        self._install_scripted_agy(
+            f"with open({str(recorded_homes)!r}, 'a', encoding='utf-8') as f:\n"
+            "    f.write(os.environ.get('HOME', '') + '\\n')\n"
+            "emit_agy('done', cid='conv-home-ok')\n"
+        )
+        started = self.cli("start", "--workdir", str(repo), "--worktree", "--no-scout", "ok task")
+        self.assertEqual(started.returncode, 0, started.stderr + started.stdout)
+        run_id = self._parse_run_id(started.stdout)
+        run_dir = Path(self.env["DELEGATE_RUNS"]) / run_id
+        self.until(lambda: (run_dir / "summary.json").is_file(), "ok task did not settle", timeout=30.0)
+
+        homes = [line.strip() for line in recorded_homes.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertGreaterEqual(len(homes), 1)
+        for h in homes:
+            hp = Path(h)
+            self.assertEqual(hp.parent, self.runtime, f"overlay must live under isolated XDG_RUNTIME_DIR: {hp}")
+            self.assertTrue(hp.name.startswith("delegate-agy-home-"), hp.name)
+            self.assertFalse(hp.exists(), f"per-task agy home must be removed after task exit: {hp}")
+
+        # 2. Task fails -> overlay HOME is also removed.
+        recorded_homes.unlink()
+        self._install_scripted_agy(
+            f"with open({str(recorded_homes)!r}, 'a', encoding='utf-8') as f:\n"
+            "    f.write(os.environ.get('HOME', '') + '\\n')\n"
+            "sys.exit(2)\n"
+        )
+        started_fail = self.cli("start", "--workdir", str(repo), "--worktree", "--no-scout", "fail task")
+        self.assertEqual(started_fail.returncode, 0, started_fail.stderr + started_fail.stdout)
+        fail_id = self._parse_run_id(started_fail.stdout)
+        fail_dir = Path(self.env["DELEGATE_RUNS"]) / fail_id
+        self.until(lambda: (fail_dir / "summary.json").is_file(), "fail task did not settle", timeout=30.0)
+        for h in [line.strip() for line in recorded_homes.read_text(encoding="utf-8").splitlines() if line.strip()]:
+            self.assertFalse(Path(h).exists(), f"per-task agy home must be removed after failed task: {h}")
+
+        # 3. `delegate clean --finished --sync` removes orphan delegate dirs and leaves non-delegate / live dirs untouched.
+        dead_gem = self.runtime / "delegate-agy-home-999999-0-0000000000000001"
+        (dead_gem / ".gemini").mkdir(parents=True)
+        (dead_gem / ".gemini" / "google_accounts.json").write_text('{"active":"x@test"}', encoding="utf-8")
+
+        dead_empty = self.runtime / "delegate-agy-home-999999-1-0000000000000002"
+        dead_empty.mkdir(mode=0o700)
+
+        live_dir = self.runtime / f"delegate-agy-home-{os.getpid()}-2-0000000000000003"
+        (live_dir / ".gemini").mkdir(parents=True)
+
+        non_delegate = self.runtime / "user-custom-dir"
+        (non_delegate / ".gemini").mkdir(parents=True)
+
+        bad_format = self.runtime / "delegate-agy-home-not-ours"
+        (bad_format / ".gemini").mkdir(parents=True)
+
+        victim = self.runtime / "symlink-victim"
+        (victim / ".gemini").mkdir(parents=True)
+        sym = self.runtime / "delegate-agy-home-999999-3-0000000000000004"
+        sym.symlink_to(victim)
+
+        clean_res = self.cli("clean", "--finished", "--force", "--sync", "--json")
+        self.assertEqual(clean_res.returncode, 0, clean_res.stderr + clean_res.stdout)
+        self.assertFalse(dead_gem.exists(), "dead delegate-agy-home-* with .gemini must be removed")
+        self.assertFalse(dead_empty.exists(), "dead empty 0700 delegate-agy-home-* must be removed")
+        self.assertTrue(live_dir.is_dir(), "live-pid delegate-agy-home-* must be kept")
+        self.assertTrue(non_delegate.is_dir(), "non-delegate dir must be kept")
+        self.assertTrue(bad_format.is_dir(), "bad-format dir must be kept")
+        self.assertTrue(sym.is_symlink(), "symlink must not be removed")
+        self.assertTrue(victim.is_dir(), "symlink target must not be touched")
+
+        # 4. `_gc-worker` also sweeps orphan delegate-agy-home-* directories.
+        gc_orphan = self.runtime / "delegate-agy-home-999999-4-0000000000000005"
+        (gc_orphan / ".gemini").mkdir(parents=True)
+        gc_res = self.cli("_gc-worker")
+        self.assertEqual(gc_res.returncode, 0, gc_res.stderr)
+        self.assertFalse(gc_orphan.exists(), "_gc-worker must sweep orphan delegate-agy-home-* dirs")
 
 
 if __name__ == "__main__":

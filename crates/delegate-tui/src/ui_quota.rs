@@ -586,8 +586,85 @@ fn format_pct_x100(x100: u32) -> String {
     }
 }
 
+fn format_tui_age_compact(age_secs: u64) -> String {
+    if age_secs < 60 {
+        format!("{age_secs}s")
+    } else if age_secs < 3600 {
+        format!("{}m", age_secs / 60)
+    } else if age_secs < 86400 {
+        format!("{}h", age_secs / 3600)
+    } else {
+        format!("{}d", age_secs / 86400)
+    }
+}
+
+fn format_tui_running_breakdown(agy: &AgyAccountsState) -> String {
+    let n = agy.running_agy.len();
+    if n == 0 {
+        return "在跑 0 个".to_string();
+    }
+    let active = agy.active.as_deref().unwrap_or("");
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for p in &agy.running_agy {
+        let acct = p
+            .account
+            .as_deref()
+            .filter(|a| !a.is_empty())
+            .or_else(|| (!active.is_empty()).then_some(active))
+            .unwrap_or("未知");
+        *counts.entry(acct.to_string()).or_insert(0) += 1;
+    }
+    let mut pairs: Vec<(String, usize)> = counts.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let items: Vec<String> = pairs
+        .into_iter()
+        .map(|(id, k)| format!("{id} ×{k}"))
+        .collect();
+    format!("在跑 {n} 个：{}", items.join("，"))
+}
+
+fn tui_pool_selected_id(agy: &AgyAccountsState, pool_key: &str) -> String {
+    let asw = &agy.auto_switch;
+    if let Some(ps) = asw.pool_summary.iter().find(|p| p.pool == pool_key) {
+        if !ps.selected.is_empty() {
+            return ps.selected.clone();
+        }
+        if !ps.current.is_empty() {
+            return ps.current.clone();
+        }
+    }
+    if let Some((_, cur)) = asw.pool_current.iter().find(|(k, _)| k == pool_key) {
+        if !cur.is_empty() {
+            return cur.clone();
+        }
+    }
+    "-".to_string()
+}
+
+fn format_tui_delegation_line(agy: &AgyAccountsState) -> String {
+    let running_desc = format_tui_running_breakdown(agy);
+    if agy.auto_switch.enabled {
+        let gem = tui_pool_selected_id(agy, "gemini");
+        let cg = tui_pool_selected_id(agy, "claude_gpt");
+        format!("委派选号：auto · Gemini → {gem} · Claude/GPT → {cg}（{running_desc}）")
+    } else {
+        let slot = agy.active.as_deref().filter(|s| !s.is_empty()).unwrap_or("无");
+        format!("委派选号：固定 {slot}（{running_desc}）")
+    }
+}
+
+fn format_tui_live_line(agy: &AgyAccountsState) -> String {
+    let slot = agy.active.as_deref().filter(|s| !s.is_empty()).unwrap_or("无");
+    if agy.auto_switch.enabled {
+        format!("本机实盘：{slot}（只给手动运行的 agy 用，auto 不改它）")
+    } else {
+        format!("本机实盘：{slot}")
+    }
+}
+
 fn render_quota_auto_detail_pane(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
-    let asw = &app.snapshot.agy_accounts.auto_switch;
+    let agy = &app.snapshot.agy_accounts;
+    let asw = &agy.auto_switch;
     let status_lbl = if asw.enabled { "已启用" } else { "未启用（按 u 切换为 auto）" };
     let title = format!(" {} auto 自动选号 · {status_lbl} ", if asw.enabled { "★" } else { "·" });
     let block = rounded_block(
@@ -604,16 +681,12 @@ fn render_quota_auto_detail_pane(frame: &mut Frame, app: &App, area: Rect, focus
     }
     let iw = inner.width as usize;
     let mut out: Vec<Line<'static>> = Vec::new();
-    let live_slot = app
-        .snapshot
-        .agy_accounts
-        .active
-        .as_deref()
-        .unwrap_or("无");
+    push_wrapped(&mut out, &format_tui_delegation_line(agy), iw, bold_primary());
+    push_wrapped(&mut out, &format_tui_live_line(agy), iw, muted());
     push_wrapped(
         &mut out,
         &format!(
-            "阈值：5h≥{}% 7d≥{}% · 刷新 ≥{}m · 在跑写手预扣 {}% · 实盘 ~/.gemini 保持 {live_slot}",
+            "阈值：5h≥{}% 7d≥{}% · 刷新 ≥{}m · 在跑写手预扣 {}%",
             asw.five_hour_min_pct,
             asw.weekly_min_pct,
             asw.refresh_minutes,
@@ -675,9 +748,15 @@ fn render_quota_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect
         return;
     };
 
+    let is_auto_mode = app.snapshot.agy_accounts.auto_switch.enabled;
     let revealed = app.is_account_revealed(&acct.id);
     let name = acct.display_name(revealed);
-    let prefix = if acct.active { "★ " } else { "· " };
+    let prefix = if acct.active && !is_auto_mode { "★ " } else { "· " };
+    let role_tag = if acct.active && is_auto_mode {
+        "（本机实盘）"
+    } else {
+        ""
+    };
     let upd = if app.quota_refreshing {
         "刷新中…".to_string()
     } else if let Some(q) = &acct.quota {
@@ -687,7 +766,7 @@ fn render_quota_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect
     } else {
         "未刷新".to_string()
     };
-    let title = format!(" {prefix}{name} 额度池与 24h 走势 · {upd} ");
+    let title = format!(" {prefix}{name}{role_tag} 额度池与 24h 走势 · {upd} ");
     let block = rounded_block(
         Line::from(Span::styled(
             truncate(&title, area.width.saturating_sub(2) as usize),
@@ -748,6 +827,15 @@ fn render_quota_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect
 
     // Pool gauge rows
     if let Some(q) = &acct.quota {
+        if y < bottom {
+            let age = format_tui_age_compact(q.age_seconds);
+            let qtitle = format!("{name} 的实时额度（agy -p /usage，{age}）");
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(truncate(&qtitle, iw), muted()))),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+            y += 1;
+        }
         if q.identity_mismatch {
             if y < bottom {
                 frame.render_widget(
@@ -1071,8 +1159,10 @@ fn render_quota_narrow_detail(
     let inner_h = area.height.saturating_sub(2) as usize;
 
     let mut out: Vec<Line<'static>> = Vec::new();
+    let agy = &app.snapshot.agy_accounts;
+    let is_auto_mode = agy.auto_switch.enabled;
     if matches!(app.selected_account_row(), Some(AccountRow::Auto)) {
-        let asw = &app.snapshot.agy_accounts.auto_switch;
+        let asw = &agy.auto_switch;
         let badge = if asw.enabled { " ★ auto 已启用 " } else { " · auto 未启用 " };
         out.push(Line::from(vec![
             Span::styled(
@@ -1090,6 +1180,8 @@ fn render_quota_narrow_detail(
                 muted(),
             ),
         ]));
+        push_wrapped(&mut out, &format_tui_delegation_line(agy), inner_w, bold_primary());
+        push_wrapped(&mut out, &format_tui_live_line(agy), inner_w, muted());
         for ps in &asw.pool_summary {
             push_wrapped(
                 &mut out,
@@ -1103,7 +1195,13 @@ fn render_quota_narrow_detail(
         }
     } else if let Some(acct) = app.selected_account_item().cloned() {
         let name = acct.display_name(app.is_account_revealed(&acct.id));
-        let prefix = if acct.active { "★ 活跃" } else { "· 备用" };
+        let prefix = if acct.active && is_auto_mode {
+            "· 实盘"
+        } else if acct.active {
+            "★ 活跃"
+        } else {
+            "· 备用"
+        };
         let upd = if app.quota_refreshing {
             "刷新中…".to_string()
         } else if let Some(q) = &acct.quota {

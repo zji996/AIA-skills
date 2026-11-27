@@ -3828,6 +3828,15 @@ fn format_running_proc_line(p: &RunningAgy) -> String {
     }
 }
 
+/// Base directory for per-task ephemeral `agy` HOME overlays.
+fn temp_home_base_dir() -> PathBuf {
+    env::var_os("XDG_RUNTIME_DIR")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(env::temp_dir)
+}
+
 /// RAII temporary HOME directory cleaned up automatically on drop.
 struct TempHome {
     path: PathBuf,
@@ -3835,11 +3844,7 @@ struct TempHome {
 
 impl TempHome {
     fn create() -> Res<Self> {
-        let base = env::var_os("XDG_RUNTIME_DIR")
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .filter(|p| p.is_dir())
-            .unwrap_or_else(env::temp_dir);
+        let base = temp_home_base_dir();
         let seq = TEMP_HOME_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = base.join(format!(
             "delegate-agy-home-{}-{seq}-{:016x}",
@@ -3857,6 +3862,240 @@ impl Drop for TempHome {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+/// Result of sweeping orphan `delegate-agy-home-*` directories.
+#[derive(Debug, Default, Clone)]
+pub struct AgyHomeCleanupReport {
+    pub removed: usize,
+    pub removed_names: Vec<String>,
+    pub failed: usize,
+}
+
+impl AgyHomeCleanupReport {
+    pub fn json(&self) -> Value {
+        json!({
+            "removed": self.removed,
+            "removedNames": self.removed_names,
+            "failed": self.failed,
+        })
+    }
+}
+
+/// Parse `<pid>` from a strict `delegate-agy-home-<pid>-<seq>-<16hex>` directory name.
+fn parse_delegate_agy_home_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("delegate-agy-home-")?;
+    let mut parts = rest.split('-');
+    let pid_str = parts.next()?;
+    let seq_str = parts.next()?;
+    let hex_str = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if pid_str.is_empty() || !pid_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if seq_str.is_empty() || !seq_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if hex_str.len() != 16
+        || !hex_str
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    let pid = pid_str.parse::<u32>().ok()?;
+    let _seq = seq_str.parse::<u64>().ok()?;
+    (pid > 0).then_some(pid)
+}
+
+/// Confirm `path` is a real directory owned by the current uid with strict delegate naming
+/// and expected overlay structure (never follows symlinks).
+fn is_delegate_agy_home_dir(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    let pid = parse_delegate_agy_home_pid(name)?;
+    let meta = fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_dir() {
+        return None;
+    }
+    let my_uid = unsafe { libc::geteuid() };
+    if meta.uid() != my_uid {
+        return None;
+    }
+    // Primary structure check: `.gemini` is a real subdirectory created by delegate.
+    if fs::symlink_metadata(path.join(".gemini"))
+        .map(|m| m.file_type().is_dir())
+        .unwrap_or(false)
+    {
+        return Some(pid);
+    }
+    // Secondary structure check for mid-setup kills before `.gemini` was created:
+    // require strict 0700 mode AND (empty OR only `.config` real dir + symlinks).
+    if (meta.mode() & 0o777) != 0o700 {
+        return None;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return None;
+    };
+    let mut count = 0usize;
+    let mut all_valid = true;
+    for entry in entries.flatten() {
+        count += 1;
+        let Ok(em) = fs::symlink_metadata(entry.path()) else {
+            all_valid = false;
+            break;
+        };
+        if em.file_type().is_symlink() {
+            continue;
+        }
+        if entry.file_name() == ".config" && em.file_type().is_dir() {
+            continue;
+        }
+        all_valid = false;
+        break;
+    }
+    if count == 0 || all_valid {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
+fn pid_alive_non_zombie(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+    if !proc_dir.is_dir() {
+        return false;
+    }
+    let stat = read(proc_dir.join("stat"));
+    if let Some((_, tail)) = stat.rsplit_once(") ") {
+        if tail.starts_with('Z') {
+            return false;
+        }
+    }
+    true
+}
+
+/// Collect `HOME=` paths of all live processes owned by the current uid that reference a
+/// `delegate-agy-home-*` directory.
+fn collect_active_agy_home_paths() -> std::collections::HashSet<PathBuf> {
+    let mut active = std::collections::HashSet::new();
+    let my_uid = unsafe { libc::geteuid() };
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return active;
+    };
+    let needle = b"delegate-agy-home-";
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let Some(name) = fname.to_str() else {
+            continue;
+        };
+        if !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let proc_dir = entry.path();
+        let Ok(meta) = fs::metadata(&proc_dir) else {
+            continue;
+        };
+        if meta.uid() != my_uid {
+            continue;
+        }
+        let stat = read(proc_dir.join("stat"));
+        if let Some((_, tail)) = stat.rsplit_once(") ") {
+            if tail.starts_with('Z') {
+                continue;
+            }
+        }
+        let Ok(raw_env) = fs::read(proc_dir.join("environ")) else {
+            continue;
+        };
+        if !raw_env.windows(needle.len()).any(|w| w == needle) {
+            continue;
+        }
+        for item in raw_env.split(|&b| b == 0) {
+            if let Some(val) = item.strip_prefix(b"HOME=") {
+                let p = PathBuf::from(String::from_utf8_lossy(val).into_owned());
+                if let Ok(canon) = fs::canonicalize(&p) {
+                    active.insert(canon);
+                }
+                active.insert(p);
+                break;
+            }
+        }
+    }
+    active
+}
+
+/// Remove orphan `delegate-agy-home-*` directories in `base` that belong to delegate and
+/// have no live creator process and no live process using them as `HOME`.
+pub fn cleanup_orphan_agy_homes_in(base: &Path) -> AgyHomeCleanupReport {
+    let mut report = AgyHomeCleanupReport::default();
+    let Ok(entries) = fs::read_dir(base) else {
+        return report;
+    };
+    let mut candidates: Vec<(PathBuf, String, u32)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+            continue;
+        };
+        if let Some(pid) = is_delegate_agy_home_dir(&path) {
+            candidates.push((path, name, pid));
+        }
+    }
+    if candidates.is_empty() {
+        return report;
+    }
+    let active_homes = collect_active_agy_home_paths();
+    for (path, name, pid) in candidates {
+        if pid_alive_non_zombie(pid) {
+            continue;
+        }
+        let canon = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if active_homes.contains(&path) || active_homes.contains(&canon) {
+            continue;
+        }
+        match fs::remove_dir_all(&path) {
+            Ok(()) => {
+                report.removed += 1;
+                report.removed_names.push(name);
+            }
+            Err(_) => {
+                report.failed += 1;
+            }
+        }
+    }
+    report.removed_names.sort();
+    report
+}
+
+/// Sweep orphan `delegate-agy-home-*` directories under the configured runtime/temp base dir.
+pub fn cleanup_orphan_agy_homes() -> AgyHomeCleanupReport {
+    cleanup_orphan_agy_homes_in(&temp_home_base_dir())
+}
+
+/// Clean up a specific run's recorded per-task `agy_home` directory (used when a run is
+/// force-killed and its `TempHome::drop` could not execute).
+pub fn cleanup_run_agy_home(run_dir: &Path) {
+    let marker = run_dir.join("agy_home");
+    let raw = read(&marker);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        let _ = fs::remove_file(&marker);
+        return;
+    }
+    let path = PathBuf::from(trimmed);
+    if is_delegate_agy_home_dir(&path).is_some() {
+        let active_homes = collect_active_agy_home_paths();
+        let canon = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if !active_homes.contains(&path) && !active_homes.contains(&canon) {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+    let _ = fs::remove_file(&marker);
 }
 
 fn symlink_dir_entries_except(src_dir: &Path, dst_dir: &Path, skip: &[&str]) -> Res<()> {
@@ -6306,7 +6545,6 @@ impl AgyCredOverlay {
         ))
     }
 
-    #[cfg(test)]
     pub fn overlay_home(&self) -> &Path {
         &self.temp_home.path
     }
@@ -6520,6 +6758,73 @@ fn format_quota_brief(quota: &Value) -> String {
     format!(" quota[{} · {age}]", parts.join(", "))
 }
 
+fn format_running_agy_breakdown(snap: &Value) -> String {
+    let running = snap["runningAgy"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let n = running.len();
+    if n == 0 {
+        return "在跑 0 个".to_string();
+    }
+    let active = snap["active"].as_str().unwrap_or("");
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for p in running {
+        let acct = p["account"]
+            .as_str()
+            .filter(|a| !a.is_empty())
+            .or_else(|| (!active.is_empty()).then_some(active))
+            .unwrap_or("未知");
+        *counts.entry(acct.to_string()).or_insert(0) += 1;
+    }
+    let mut pairs: Vec<(String, usize)> = counts.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let items: Vec<String> = pairs
+        .into_iter()
+        .map(|(id, k)| format!("{id} ×{k}"))
+        .collect();
+    format!("在跑 {n} 个：{}", items.join("，"))
+}
+
+fn pool_selected_id(snap: &Value, pool: QuotaPool) -> String {
+    let ps = &snap["autoSwitch"]["poolSummary"][pool.key()];
+    let sel = s(ps, "selected");
+    if !sel.is_empty() {
+        return sel.to_string();
+    }
+    let cur = s(ps, "current");
+    if !cur.is_empty() {
+        return cur.to_string();
+    }
+    let pc = s(&snap["autoSwitch"]["poolCurrent"], pool.key());
+    if !pc.is_empty() {
+        return pc.to_string();
+    }
+    "-".to_string()
+}
+
+fn format_delegation_selection_line(snap: &Value) -> String {
+    let is_auto = s(snap, "mode") == AUTO_ACCOUNT_ID;
+    let running_desc = format_running_agy_breakdown(snap);
+    if is_auto {
+        let gem = pool_selected_id(snap, QuotaPool::Gemini);
+        let cg = pool_selected_id(snap, QuotaPool::ClaudeGpt);
+        format!("委派选号：auto · Gemini → {gem} · Claude/GPT → {cg}（{running_desc}）")
+    } else {
+        let active = snap["active"].as_str().unwrap_or("");
+        let slot = if active.is_empty() { "无" } else { active };
+        format!("委派选号：固定 {slot}（{running_desc}）")
+    }
+}
+
+fn format_live_slot_line(snap: &Value) -> String {
+    let is_auto = s(snap, "mode") == AUTO_ACCOUNT_ID;
+    let active = snap["active"].as_str().unwrap_or("");
+    let slot = if active.is_empty() { "无" } else { active };
+    if is_auto {
+        format!("本机实盘：{slot}（只给手动运行的 agy 用，auto 不改它）")
+    } else {
+        format!("本机实盘：{slot}")
+    }
+}
+
 fn cmd_list(args: &[String]) -> Res<i32> {
     let usage = "delegate agy account list [--quota|--quota-if-stale] [--agy-bin PATH] [--json]";
     let (pos, flags, kv) =
@@ -6554,16 +6859,10 @@ fn cmd_list(args: &[String]) -> Res<i32> {
         .as_i64()
         .map(|a| format!(", quota age: {}", format_age_compact(a)))
         .unwrap_or_default();
-    let sel_hdr = if is_auto {
-        format!(
-            "selected: auto [live: {}]",
-            if active.is_empty() { "none" } else { active }
-        )
-    } else {
-        format!("active: {}", if active.is_empty() { "none" } else { active })
-    };
+    println!("{}", format_delegation_selection_line(&snap));
+    println!("{}", format_live_slot_line(&snap));
     println!(
-        "agy accounts ({} + auto, {sel_hdr}, running agy: {}{age_hdr}):",
+        "agy accounts ({} + auto, running agy: {}{age_hdr}):",
         accounts.len(),
         running
     );
@@ -6581,7 +6880,7 @@ fn cmd_list(args: &[String]) -> Res<i32> {
             format!(" [{label}]")
         };
         if is_auto && b(item, "active") {
-            label_part.push_str(" [live]");
+            label_part.push_str(" [实盘]");
         }
         let t5 = n(&item["usage"]["fiveHour"], "total");
         let t7 = n(&item["usage"]["sevenDay"], "total");
@@ -6627,11 +6926,11 @@ fn cmd_list(args: &[String]) -> Res<i32> {
         pool_bits.join(" ")
     };
     let auto_tail = if is_auto {
-        format!("(实盘: {})", if active.is_empty() { "none" } else { active })
+        String::new()
     } else {
-        "(执行 `use auto` 开启)".to_string()
+        "  (执行 `use auto` 开启)".to_string()
     };
-    println!("  {auto_mark} {:<16} [自动选号] {pools_desc}  {auto_tail}", AUTO_ACCOUNT_ID);
+    println!("  {auto_mark} {:<16} [自动选号] {pools_desc}{auto_tail}", AUTO_ACCOUNT_ID);
     if b(&snap, "liveDrifted") {
         println!(
             "note: live ~/.gemini account ({}) differs from active slot ({})",
@@ -6665,45 +6964,11 @@ fn cmd_status(args: &[String]) -> Res<i32> {
         println!("{snap}");
         return Ok(0);
     }
-    let active = snap["active"].as_str().unwrap_or("");
-    let is_auto = s(&snap, "mode") == AUTO_ACCOUNT_ID;
     let live = s(&snap, "liveEmail");
     let accounts = snap["accounts"].as_array().cloned().unwrap_or_default();
     let running = snap["runningAgy"].as_array().cloned().unwrap_or_default();
-    if is_auto {
-        println!(
-            "selected: auto (mode: auto; live ~/.gemini slot: {})",
-            if active.is_empty() { "(none)" } else { active }
-        );
-    } else {
-        println!(
-            "selected: {} (mode: fixed)",
-            if active.is_empty() { "(none)" } else { active }
-        );
-    }
-    println!(
-        "active: {}",
-        if active.is_empty() { "(none)" } else { active }
-    );
-    let mut auto_pool_bits = Vec::new();
-    for pool in QuotaPool::ALL {
-        let ps = &snap["autoSwitch"]["poolSummary"][pool.key()];
-        let sel = s(ps, "selected");
-        let tier = s(ps, "tierLabel");
-        if !sel.is_empty() {
-            auto_pool_bits.push(format!("{}→{sel}({tier})", pool.short_label()));
-        }
-    }
-    let auto_mark = if is_auto { "*" } else { " " };
-    println!(
-        "auto: [{auto_mark}] {} ({})",
-        if is_auto { "on" } else { "off" },
-        if auto_pool_bits.is_empty() {
-            "none".to_string()
-        } else {
-            auto_pool_bits.join(" · ")
-        }
-    );
+    println!("{}", format_delegation_selection_line(&snap));
+    println!("{}", format_live_slot_line(&snap));
     if !live.is_empty() {
         println!("live ~/.gemini email: {live}");
     }
@@ -6712,6 +6977,7 @@ fn cmd_status(args: &[String]) -> Res<i32> {
     }
     print_duplicate_quota_warnings(&snap);
     if let Some(cur) = accounts.iter().find(|a| b(a, "active")) {
+        let cur_id = s(cur, "id");
         let last_used = s(cur, "lastUsedAt");
         if !last_used.is_empty() {
             println!("last used: {last_used}");
@@ -6750,7 +7016,7 @@ fn cmd_status(args: &[String]) -> Res<i32> {
                     (true, false) => format!("（期望 {exp}，实际身份未知）"),
                     _ => String::new(),
                 };
-                println!("real quota (agy -p /usage, {IDENTITY_MISMATCH_MSG}):");
+                println!("{cur_id} 的实时额度（agy -p /usage，{age}）");
                 println!("  warning: {IDENTITY_MISMATCH_MSG}{detail}");
                 if let Some(entries) = q["entries"].as_array().filter(|a| !a.is_empty()) {
                     println!("  cached prior quota ({age}, fetched {fetched}):");
@@ -6769,7 +7035,7 @@ fn cmd_status(args: &[String]) -> Res<i32> {
                     }
                 }
             } else {
-                println!("real quota (agy -p /usage, {age}, fetched {fetched}):");
+                println!("{cur_id} 的实时额度（agy -p /usage，{age}）");
                 if !b(q, "ok") {
                     println!("  error: {}", s(q, "error"));
                 }
@@ -6825,10 +7091,15 @@ fn cmd_status(args: &[String]) -> Res<i32> {
     for p in &running {
         let pid = p["pid"].as_u64().unwrap_or(0);
         let cmd = s(p, "cmdline");
-        if let Some(run) = p["run"].as_str().filter(|r| !r.is_empty()) {
-            println!("  pid={pid} (delegate run: {run}) {cmd}");
-        } else {
-            println!("  pid={pid} {cmd}");
+        let run_opt = p["run"].as_str().filter(|r| !r.is_empty());
+        let acct_opt = p["account"].as_str().filter(|a| !a.is_empty());
+        match (run_opt, acct_opt) {
+            (Some(run), Some(acct)) => {
+                println!("  pid={pid} (delegate run: {run}, account: {acct}) {cmd}");
+            }
+            (Some(run), None) => println!("  pid={pid} (delegate run: {run}) {cmd}"),
+            (None, Some(acct)) => println!("  pid={pid} (account: {acct}) {cmd}"),
+            (None, None) => println!("  pid={pid} {cmd}"),
         }
     }
     println!("store: {}", s(&snap, "root"));
@@ -10867,5 +11138,99 @@ Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSum
         assert!(empty.to_json()["recall"].is_null());
         assert!(empty.to_json()["falsePositiveRate"].is_null());
         assert!(empty.format_human().contains("N/A"));
+    }
+
+    #[test]
+    fn parse_delegate_agy_home_pid_strictly_validates_format() {
+        assert_eq!(
+            parse_delegate_agy_home_pid("delegate-agy-home-12345-0-0123456789abcdef"),
+            Some(12345)
+        );
+        assert_eq!(parse_delegate_agy_home_pid("delegate-agy-home-0-0-0123456789abcdef"), None);
+        assert_eq!(parse_delegate_agy_home_pid("delegate-agy-home-12345-0-0123456789ABCDEF"), None);
+        assert_eq!(parse_delegate_agy_home_pid("delegate-agy-home-12345-0-0123"), None);
+        assert_eq!(parse_delegate_agy_home_pid("delegate-agy-home-abc-0-0123456789abcdef"), None);
+        assert_eq!(parse_delegate_agy_home_pid("other-dir-12345-0-0123456789abcdef"), None);
+        assert_eq!(
+            parse_delegate_agy_home_pid("delegate-agy-home-12345-0-0123456789abcdef-extra"),
+            None
+        );
+    }
+
+    #[test]
+    fn cleanup_orphan_agy_homes_only_removes_dead_delegate_dirs() {
+        let base = TempHome::create().unwrap();
+        let root = &base.path;
+
+        // 1. Dead-pid delegate dir with `.gemini` -> removed
+        let dead_gem = root.join("delegate-agy-home-99999999-0-0000000000000001");
+        fs::create_dir_all(dead_gem.join(".gemini")).unwrap();
+        fs::write(dead_gem.join(".gemini/google_accounts.json"), "{}").unwrap();
+
+        // 2. Dead-pid empty 0700 delegate dir -> removed
+        let dead_empty = root.join("delegate-agy-home-99999999-1-0000000000000002");
+        fs::create_dir(&dead_empty).unwrap();
+        fs::set_permissions(&dead_empty, fs::Permissions::from_mode(0o700)).unwrap();
+
+        // 3. Live-pid delegate dir (current process pid) -> kept
+        let live_dir = root.join(format!(
+            "delegate-agy-home-{}-2-0000000000000003",
+            std::process::id()
+        ));
+        fs::create_dir_all(live_dir.join(".gemini")).unwrap();
+
+        // 4. Non-delegate dir with `.gemini` -> kept
+        let other_dir = root.join("not-delegate-home");
+        fs::create_dir_all(other_dir.join(".gemini")).unwrap();
+
+        // 5. Symlink with delegate-like name pointing to real dir -> symlink & target kept
+        let target_dir = root.join("victim-dir");
+        fs::create_dir_all(target_dir.join(".gemini")).unwrap();
+        let sym = root.join("delegate-agy-home-99999999-3-0000000000000004");
+        std::os::unix::fs::symlink(&target_dir, &sym).unwrap();
+
+        // 6. Dead-pid delegate-named dir with arbitrary non-delegate file and no `.gemini` -> kept
+        let alien_dir = root.join("delegate-agy-home-99999999-4-0000000000000005");
+        fs::create_dir(&alien_dir).unwrap();
+        fs::set_permissions(&alien_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(alien_dir.join("user-notes.txt"), "keep me").unwrap();
+
+        let report = cleanup_orphan_agy_homes_in(root);
+        assert_eq!(report.removed, 2);
+        assert_eq!(report.failed, 0);
+        assert!(!dead_gem.exists());
+        assert!(!dead_empty.exists());
+        assert!(live_dir.is_dir());
+        assert!(other_dir.is_dir());
+        assert!(fs::symlink_metadata(&sym).is_ok());
+        assert!(target_dir.is_dir());
+        assert!(alien_dir.is_dir());
+    }
+
+    #[test]
+    fn format_delegation_and_live_lines_match_verbatim_spec() {
+        let snap = json!({
+            "mode": "auto",
+            "active": "guimond",
+            "autoSwitch": {
+                "poolSummary": {
+                    "gemini": {"selected": "jzy"},
+                    "claude_gpt": {"selected": "jzy"}
+                }
+            },
+            "runningAgy": [
+                {"pid": 1, "account": "jzy"},
+                {"pid": 2, "account": "jzy"},
+                {"pid": 3, "account": "alpha"}
+            ]
+        });
+        assert_eq!(
+            format_delegation_selection_line(&snap),
+            "委派选号：auto · Gemini → jzy · Claude/GPT → jzy（在跑 3 个：jzy ×2，alpha ×1）"
+        );
+        assert_eq!(
+            format_live_slot_line(&snap),
+            "本机实盘：guimond（只给手动运行的 agy 用，auto 不改它）"
+        );
     }
 }

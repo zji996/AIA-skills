@@ -2155,6 +2155,10 @@ pub fn run_agent_cancellable(
         .stderr(Stdio::from(stderr));
     clean_env(&mut c, &meta["env"]);
     if let Some(ref overlay) = agy_overlay {
+        let _ = write(
+            run.join("agy_home"),
+            overlay.overlay_home().to_string_lossy().as_ref(),
+        );
         overlay.apply_env(&mut c);
     }
     c.env(
@@ -3015,6 +3019,7 @@ pub fn run_agent_cancellable(
         overlay.finish();
     }
     drop(agy_overlay);
+    let _ = fs::remove_file(run.join("agy_home"));
     if !on_agy {
         let created = session_files(session_dir)
             .into_iter()

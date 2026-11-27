@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `delegate`：`agy account status`/`list` 与 TUI 额度页拆分展示「委派选号」（`auto` 模式首行列出 Gemini、Claude/GPT 选号及在跑各号个数）与「本机实盘（只给手动运行的 agy 用，auto 不改它）」，实时额度块标题显式标明账号；强化每任务 `delegate-agy-home-*` 临时目录在任务结束/强停时的删除，并由 `clean` 与 `_gc-worker` 校验前缀与结构后清理无在跑进程的孤儿目录；修复单测未隔离 `XDG_RUNTIME_DIR` 导致测试假号目录泄漏到宿主 `/run/user/<uid>` 的问题。
+
 - `delegate`：新增漏网缺陷记账约定（修复提交附 `Fixes-Run: <原 run-id>`，支持多行；`apply --commit` 不自动添加且原样保留）与 `delegate escapes [--since 30d] [--repo PATH] [--json]` 命令，按 `Delegate-Run:`/`Fixes-Run:` trailer 读取活跃或归档 run meta，按审查模型、写手模型与类别统计合入数、漏出数及比例，未找到 meta 的单独计入「未知 run」。
 - `delegate`：`delegate tiers`（查看、修改档位及新增 `--json` 输出的 `hints` 字段）按别名 `cost` 档位与 `fit.json` 适配卡在末尾给出只读配置提示（审查档/探路档比写入档贵、写入档缺少 `build` 适配卡记录），并在 `skills/delegate/references/model-routing.md` 新增「换模型」角色分配与验证指南。
 - `delegate`：新增 `delegate fit bench review <别名> [--since 30d] [-n 10] [--estimate] [--yes] [--json]`，从本机 history 选取最多 n 条有确定审查结论（漏检/检出尽量各半，优先近期与不同仓库）的写入任务，复用 `--in <run>` 归档重建只读快照与 diff 并用候选模型只读重审，输出命中率、漏检数、误报数与总用量并写入 `fit.json`（沿用 80 字符上限与 `sample` 字段）；`--estimate` 仅按原审查用量估算且不起模型调用，缺 `--yes` 仅打印估算不派发，不可重建 run 跳过并计数不中断。

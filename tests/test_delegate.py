@@ -226,6 +226,8 @@ class DelegateTests(unittest.TestCase):
         self.addCleanup(settle_supervisors, self.work / "runs")
         self.bin = self.work / "bin"
         self.bin.mkdir()
+        self.runtime = self.work / "runtime"
+        self.runtime.mkdir(mode=0o700)
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(("DELEGATE_", "PI_DELEGATE_", "ANTIGRAVITY_")) and k not in CALLER_ENV}
         # Nested test runs must resolve real tools, not another run's private shims.
@@ -235,6 +237,7 @@ class DelegateTests(unittest.TestCase):
                         DELEGATE_RUNS=str(self.work / "runs"), XDG_STATE_HOME=str(self.work / "state"),
                         XDG_CACHE_HOME=str(self.work / "cache"),
                         XDG_CONFIG_HOME=str(self.work / "config"),
+                        XDG_RUNTIME_DIR=str(self.runtime),
                         PI_LOG=str(self.work / "pi.log"),
                         # Keep background `_merge-worker` off by default for deterministic tests;
                         # premerge/fast-forward tests explicitly pop DELEGATE_PREMERGE and synchronize.

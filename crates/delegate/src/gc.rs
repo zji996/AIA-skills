@@ -335,6 +335,8 @@ pub fn worker_command(_args: &[String]) -> Res<i32> {
 
     // Sweep orphan docker containers for already-deleted worktree directories.
     let _ = crate::cleanup::containers(&cache_dir().join("worktrees"), true);
+    // Sweep orphan per-task agy temporary HOME directories whose processes have exited.
+    let _ = crate::agy_accounts::cleanup_orphan_agy_homes();
 
     // Opportunistic maintenance moved out of read paths.
     crate::work::check_stale_and_expired();

@@ -887,10 +887,26 @@ fn render_quota_summary_card(frame: &mut Frame, app: &App, area: Rect) {
             muted(),
         )));
     } else {
+        let is_auto_mode = agy.auto_switch.enabled;
         let mut sorted: Vec<&AgyAccountItem> = agy.accounts.iter().collect();
         sorted.sort_by(|a, b| b.active.cmp(&a.active).then_with(|| a.id.cmp(&b.id)));
         for acct in sorted {
-            let role = if acct.active {
+            let acct_procs = agy
+                .running_agy
+                .iter()
+                .filter(|p| p.account.as_deref() == Some(acct.id.as_str()))
+                .count();
+            let role = if is_auto_mode {
+                if acct.active && acct_procs > 0 {
+                    format!("实盘·{acct_procs}进程")
+                } else if acct.active {
+                    "实盘".to_string()
+                } else if acct_procs > 0 {
+                    format!("在跑·{acct_procs}进程")
+                } else {
+                    "备用".to_string()
+                }
+            } else if acct.active {
                 if agy.running_agy.is_empty() {
                     "活跃".to_string()
                 } else {
@@ -899,7 +915,7 @@ fn render_quota_summary_card(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 "备用".to_string()
             };
-            let prefix = if acct.active { "★" } else { "·" };
+            let prefix = if acct.active && !is_auto_mode { "★" } else { "·" };
             let name = acct.display_name(app.is_account_revealed(&acct.id));
             let u24: u64 = acct.usage.hourly_24h.iter().sum();
             let spark = inline_spark_text(&acct.usage.hourly_24h, 10);

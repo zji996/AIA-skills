@@ -3225,7 +3225,11 @@ fn runs_detail_and_quota_tab_render_auto_switch_and_handoff_lines() {
         "auto detail pane should show pool reason:\n{quota_rendered}"
     );
     assert!(
-        quota_rendered.contains("实盘 ~/.gemini 保持 alpha"),
+        quota_rendered.contains("委派选号：auto · Gemini → beta · Claude/GPT → alpha"),
+        "auto detail pane should show delegation selection first:\n{quota_rendered}"
+    );
+    assert!(
+        quota_rendered.contains("本机实盘：alpha（只给手动运行的 agy 用，auto 不改它）"),
         "auto detail pane should show live slot untouched:\n{quota_rendered}"
     );
 

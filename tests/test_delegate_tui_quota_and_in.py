@@ -214,7 +214,7 @@ class DelegateQuotaAndInFailClosedTests(unittest.TestCase):
         # 2. Verify `status --quota` human output includes real quota, unknown line, age, and estimate
         st_res = self.cli("agy", "account", "status", "--quota")
         self.assertEqual(st_res.returncode, 0, st_res.stderr)
-        self.assertIn("real quota (agy -p /usage", st_res.stdout)
+        self.assertIn("alpha 的实时额度（agy -p /usage，", st_res.stdout)
         self.assertIn("Gemini Models", st_res.stdout)
         self.assertIn("[raw] Notice: unknown preview banner line", st_res.stdout)
         self.assertIn("fallback; real quota takes priority", st_res.stdout)

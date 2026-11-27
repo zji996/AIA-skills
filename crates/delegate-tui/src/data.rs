@@ -3981,6 +3981,11 @@ pub fn parse_agy_accounts_value(v: &Value) -> AgyAccountsState {
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
+            let account = p
+                .get("account")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             let cmdline = single_line(p.get("cmdline").and_then(Value::as_str).unwrap_or(""));
             Some(RunningAgyProc {
                 pid,
@@ -3988,6 +3993,7 @@ pub fn parse_agy_accounts_value(v: &Value) -> AgyAccountsState {
                 run_name,
                 role,
                 round,
+                account,
                 cmdline,
             })
         })

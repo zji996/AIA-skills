@@ -98,12 +98,15 @@ class Delegate638AgyAccountsTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(prefix="delegate-agy-acct-")
         self.home = Path(self._tmp.name) / "home"
         self.home.mkdir(mode=0o700)
+        self.runtime = Path(self._tmp.name) / "runtime"
+        self.runtime.mkdir(mode=0o700)
         self.env = {
             **os.environ,
             "HOME": str(self.home),
             "XDG_CONFIG_HOME": str(self.home / ".config"),
             "XDG_STATE_HOME": str(self.home / ".local/state"),
             "XDG_CACHE_HOME": str(self.home / ".cache"),
+            "XDG_RUNTIME_DIR": str(self.runtime),
         }
         for k in (
             "DELEGATE_AGY_BIN",

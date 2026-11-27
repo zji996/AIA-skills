@@ -1508,6 +1508,7 @@ pub struct RunningAgyProc {
     pub run_name: Option<String>,
     pub role: Option<String>,
     pub round: Option<String>,
+    pub account: Option<String>,
     pub cmdline: String,
 }
 
