@@ -48,4 +48,4 @@ $D land <run> -m "提交说明"                    # 后续命令用 && 不要�
 
 - 命令全表、选项与示例：[命令与选项](references/commands.md)、[示例](references/recipes.md)、[收结果与状态](references/reading-results.md)、[目录与产物](references/output-and-files.md)（全部选项另见 `$D --help`）
 - 档位、模型适配卡与配置：[模型路由与适配卡](references/model-routing.md)、[配置](references/configuration.md)、[运行与远端](references/runtime.md)、[agy 账号与用量](references/agy-accounts.md)
-- 审查、合入、工作表与清理：[审查卡与预合并](references/review-card.md)、[审查要点](references/review-rubric.md)、[并行合入](references/parallel-safety.md)、[合入员与 Radar](references/merge-and-radar.md)、[工作表](references/worktable.md)、[清理与回收](references/cleanup.md)、[磁盘健康](references/disk-health.md)、[容量与工期](references/capacity.md)、[续接与长跑](references/practice.md)、[长时间推进](references/long-run.md)
+- 审查、合入、工作表与清理：[审查卡、预合并与 `Fixes-Run` 漏网记账](references/review-card.md)、[审查要点](references/review-rubric.md)、[并行合入](references/parallel-safety.md)、[合入员与 Radar](references/merge-and-radar.md)、[工作表](references/worktable.md)、[清理与回收](references/cleanup.md)、[磁盘健康](references/disk-health.md)、[容量与工期](references/capacity.md)、[续接与长跑](references/practice.md)、[长时间推进](references/long-run.md)

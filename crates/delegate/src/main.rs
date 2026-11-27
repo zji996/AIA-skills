@@ -16,6 +16,7 @@ mod config;
 mod dag_queue;
 mod deny;
 mod disk;
+mod escapes;
 mod eta;
 mod events;
 mod fill;
@@ -3828,6 +3829,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "agy" => agy_accounts::command(rest),
         "usage" => usage::command(rest),
         "lines" => lines::command(rest),
+        "escapes" => escapes::command(rest),
         "speed" => speed::command(rest),
         "eta" => eta::command(rest),
         "hook" => hook::command(rest),

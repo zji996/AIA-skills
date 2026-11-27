@@ -82,3 +82,9 @@
 3. **按层验收与产物**：集成树与原已验树完全一致时直接复用原验收结果，否则只跑命中的 `acceptRules` 层（未配时跑 `accept`，无超时/轮数上限，停滞沿用 `stall_warning`）；成功后在源仓钉 `refs/delegate/premerge/<run>` 并原子写 `premerge.json`（含 `baseHead`、`mergedTree`、`changedPaths`、跑过的层与耗时）；冲突或验收失败则写 `premerge_conflict` / `premerge_failed` 事件（带冲突文件与 `premerge.log` 指针），交主控决定 `reply`。
 4. **快进 `apply`（<2s）**：所有写源工作区操作严格发生在 `apply.lock` 内。命中「源 `HEAD == baseHead` 且源工作树在 `changedPaths` 上无脏改」时，直接把 `mergedTree` 的这些路径写入源工作区（保持未提交语义，不碰 git index）并跳过重跑验收；任一条件不满足则失败关闭回退到三方合并，并输出一行原因（如「主干已前进 2 个提交，走三方合并」）。
 5. **展示联动**：L0（`status`/`wait`/`events`）、L1（`card`）以及 `delegate-tui` 的 run 行、详情栏和工作表「此刻在干什么」列实时展示 `预合并中`、`快进 ✓（基于 <short>）`、`快进 ✗ 主干已前进`、`预合并冲突：<文件>` 与 `预合并失败`。
+
+## 漏网缺陷记账（`Fixes-Run`）
+
+合入后才发现由某个已合入委派任务引入的缺陷时，在修复提交的提交说明末尾追加 `Fixes-Run: <原 run-id>` trailer（一次修复涉及多个原任务时可写多行）；`delegate apply --commit` 不自动添加该 trailer，手动写在提交说明里时原样保留。
+
+用 `delegate escapes [--since 30d] [--repo PATH] [--json]` 扫描仓库 `git log` 中的 `Delegate-Run:` 与 `Fixes-Run:`，按原 run（含已清理后的归档记录）汇总各审查模型、写手模型与任务类别的合入数、漏出数及比例，找不到 meta 的单独计入「未知 run」。

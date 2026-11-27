@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `delegate`：新增漏网缺陷记账约定（修复提交附 `Fixes-Run: <原 run-id>`，支持多行；`apply --commit` 不自动添加且原样保留）与 `delegate escapes [--since 30d] [--repo PATH] [--json]` 命令，按 `Delegate-Run:`/`Fixes-Run:` trailer 读取活跃或归档 run meta，按审查模型、写手模型与类别统计合入数、漏出数及比例，未找到 meta 的单独计入「未知 run」。
 - `delegate`：新增额度预报软门控影子模式——基于 `agy_accounts` 同周期窗口估算与近 14 天写任务中位数耗时（`history.jsonl`）提供零子进程、只读缓存的余量判断（缓存超 20 分钟视为未知）；在自动补位（`fill` / `work --auto`）与 DAG 续派（`queue`）派发写任务时若预计装不下「在跑写数 + 1」仅记录 `quota_would_hold` 事件（不进 Stop hook、不拦截、手动 `start` 不记不打印），并新增 `delegate quota-shadow [--since 72h] [--window MINS] [--json]` 按事件与真实 429 `RESOURCE_EXHAUSTED` 失败对账输出召回率与误报率。
 
 - `delegate`：写手命令封装层（`agent-shims` + `_cmd-out`）新增大输出落盘回指针 A/B 实验：按仓库交替分组（奇 B 开启、偶 A 对照，reply 继承父分组，`.delegate.json` `cmdOut: false` 可整体关闭），默认封装 `cargo`/`pnpm`/`npm`/`pytest`/`python -m pytest`/`go test`（可配置），≤12KB 原样透传，>12KB 全文落盘 `<run>/cmd-out/<序号>.log` 并原样透传退出码，只向同事返回说明行、首个错误块 40 行与末尾 40 行；单 run 在 `summary.json` 记录触发次数、截断字节与步数，`delegate usage --by cmd-out` 与 `delegate speed` 支持按分组查看平均每步输入、编译测试步数与验收一次通过率。

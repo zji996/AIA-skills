@@ -218,6 +218,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "Count added/deleted lines across registered repositories' default branches over 24h and 7d (code/test/docs, delegated share, lines per 1M tokens).",
     ),
     (
+        "escapes",
+        "Summarize post-merge escaped defects from `Fixes-Run:` trailers by reviewer model, author model, and task class.",
+    ),
+    (
         "speed",
         "Calibrate wall-clock estimation parameters (t_chain, t_crit, P_eff, T_merge) per repo from events.jsonl, run rolling --backtest, and track drift.",
     ),
@@ -533,6 +537,11 @@ fn command_spec(command: &str) -> Option<CommandSpec> {
             ("--since DURATION", "Show a single custom window instead of the default 24h + 7d columns (e.g. 12h, 24h, 7d, 30d)."),
             ("--by repo", "Include a per-repository breakdown sorted by 7d (or window) churn descending."),
             ("--json", "Print complete structured camelCase JSON output including daily7d totals."),
+        ]),
+        "escapes" => ("[--since DURATION|all] [--repo PATH] [--json]", "Scan git log for `Delegate-Run:` and `Fixes-Run:` trailers, resolve each referenced run's author model, reviewer model, and class (including archived runs), and report merged count, escaped count, and escape rate per reviewer/author model and class. Unresolvable `Fixes-Run:` targets are counted separately as unknown runs.", &[
+            ("--since DURATION|all", "Time window to scan in git log (default: 30d; e.g. 7d, 30d, 90d, all)."),
+            ("--repo PATH", "Target git repository path (default: current repository)."),
+            ("--json", "Print structured camelCase JSON output."),
         ]),
         "speed" => ("[--since 7d|14d|all] [--repo PATH] [--backtest] [--json]", "Calibrate wall-clock estimation parameters (T_dev = max(D*t_crit, N*t_chain/P_eff) + T_merge) per repo from <state_dir>/events.jsonl, refresh <state_dir>/eta-model.json, and track >20% drift. Pass --backtest for a strictly causal rolling offline backtest (p75 coverage & p50 relative bias).", &[
             ("--since 7d|14d|all", "Time window to include (default: 7d, or 14d with --backtest; normal mode auto-expands <14d to 14d when <30 applied write chains)."),
