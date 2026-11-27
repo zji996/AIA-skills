@@ -24,6 +24,7 @@
 | `settle_supervisors(runs_dir)` | `tests/test_delegate.py` | 确定性等待残留 supervisor 与后台锁退出 |
 | `DELEGATE_MEASURE_STATE_LOCK=1` | `crates/delegate/src/locks.rs` | 在 stderr 输出 `STATE_LOCK_ATTEMPT` / `STATE_LOCK_HOLD_MS` 验证无锁读 |
 | `DELEGATE_TEST_PREMERGE_GATE=<path>` | `crates/delegate/src/premerge.rs` | 仅 debug 构建生效，把 `_merge-worker` 确定性停在 `running` 态 |
+| `DELEGATE_TEST_AGENT_CLOCK=<path>` | `crates/delegate/src/agents.rs` | 仅 debug 构建生效，从文件读取已消耗秒数替代 watcher 墙钟，并在首次进入宽限时写 `.test-grace-entered` |
 | `_stress_serial = True` / `--repeat N` | `scripts/run-tests.py` | 含 `ThreadPoolExecutor` 或打标的压测自动拆出 8-worker 池串行跑 |
 
 ## 静态门禁（`scripts/check.sh`）

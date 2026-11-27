@@ -1201,22 +1201,37 @@ print(str(json.loads(os.environ["TEST_DU_SIZES"]).get(path.name, 20) * 1024**3) 
     def test_timeout_grace_while_at_work_and_queue_time_is_free(self):
         start = {"type": "tool_execution_start", "toolName": "bash", "args": {"command": "make check"}}
         end = {"type": "tool_execution_end", "toolName": "bash"}
-        # With --timeout 2 the work must still be running past 2s but finish before the 100% grace limit (4s).
-        lines = ["#!/bin/sh", '[ "$1" = --version ] && { echo "fake-pi 1.0"; exit 0; }', "cat > /dev/null",
-                 f"printf '%s\\n' {shlex.quote(json.dumps(start))}", "sleep 3",
-                 f"printf '%s\\n' {' '.join(shlex.quote(json.dumps(e)) for e in (end, answer('checked'), SETTLED))}"]
-        pi = self.bin / "pi"
-        tmp = self.bin / f".pi.{os.getpid()}.{time.monotonic_ns()}.tmp"
-        tmp.write_text("\n".join(lines) + "\n")
-        tmp.chmod(0o755)
-        os.replace(tmp, pi)
+        clock = self.work / "agent-clock"
+        clock.write_text("0\n")
+        self.env["DELEGATE_TEST_AGENT_CLOCK"] = str(clock)
         # A command in progress at the timeout earns up to DELEGATE_TIMEOUT_GRACE percent more.
         self.env["DELEGATE_TIMEOUT_GRACE"] = "100"
-        state = self.outcome(self.cli("run", "--timeout", "2", "task"))
+        started, gate = self.start_gated(
+            "--timeout", "2", "task",
+            attempts=([end, answer("checked"), SETTLED],),
+            pre=f"printf '%s\\n' {shlex.quote(json.dumps(start))}",
+        )
+        run_dir = Path(started["dir"])
+        self.wait_text(run_dir / "events.jsonl", '"e":"bash"', "bash tool start recorded")
+        clock.write_text("2.5\n")
+        self.until(lambda: (run_dir / ".test-grace-entered").is_file(), "grace period entered")
+        gate.touch()
+        state = self.outcome(self.cli("wait", started["dir"]))
         self.assertEqual(state["state"], "answered")
-        self.assertGreaterEqual(state["graceSeconds"], 0)
+        self.assertEqual(state["graceSeconds"], 0.5)
+        # With 0% grace, crossing the timeout while a command is running times out immediately.
+        clock.write_text("0\n")
         self.env["DELEGATE_TIMEOUT_GRACE"] = "0"
-        self.assertEqual(self.outcome(self.cli("run", "--timeout", "2", "task"))["state"], "timeout")
+        started2, _gate2 = self.start_gated(
+            "--timeout", "2", "task",
+            attempts=([end, answer("checked"), SETTLED],),
+            pre=f"printf '%s\\n' {shlex.quote(json.dumps(start))}",
+        )
+        run_dir2 = Path(started2["dir"])
+        self.wait_text(run_dir2 / "events.jsonl", '"e":"bash"', "bash tool start recorded (no grace)")
+        clock.write_text("2.5\n")
+        self.assertEqual(self.outcome(self.cli("wait", started2["dir"]))["state"], "timeout")
+        self.env.pop("DELEGATE_TEST_AGENT_CLOCK", None)
         # Waiting in the lane for its own check does not use up the agent's time.
         holder, lane_gate = self.hold_lane_gated()
         self.fake_pi([answer("checked"), SETTLED], pre=f"{DELEGATE} lane --label agent-check true")

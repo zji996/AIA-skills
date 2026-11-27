@@ -2246,18 +2246,39 @@ pub fn run_agent_cancellable(
     let watcher_repo = crate::events::repo_for_meta(meta);
     let watcher_name = s(meta, "name").to_string();
     let watcher_cancel = cancel.clone();
+    let test_clock: Option<PathBuf> = if cfg!(debug_assertions) {
+        std::env::var("DELEGATE_TEST_AGENT_CLOCK")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    } else {
+        None
+    };
     let watcher = std::thread::spawn(move || {
         let (mutex, changed) = &*watcher_state;
         let mut state = mutex.lock().unwrap();
         let remote_log_path = runpath.join("remote-output.log");
         let stderr_log_path = runpath.join("stderr.log");
+        let mut last_clock = 0.0_f64;
+        let mut grace_marked = false;
         loop {
             if state.finished {
                 break;
             }
             crate::source_watch::observe(&source_meta, &runpath);
             let queued = lane::queued_seconds(&runpath);
-            let spent = start.elapsed().as_secs_f64() - queued;
+            let elapsed = if let Some(ref clock_path) = test_clock {
+                if let Some(secs) = fs::read_to_string(clock_path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                {
+                    last_clock = secs;
+                }
+                last_clock
+            } else {
+                start.elapsed().as_secs_f64()
+            };
+            let spent = elapsed - queued;
             let idle = state.last.elapsed().as_secs_f64();
             if state.command_started.is_some() {
                 let remote_grew =
@@ -2387,6 +2408,10 @@ pub fn run_agent_cancellable(
                         if let Ok(mut x) = go.lock() {
                             *x = Some(((spent - soft) * 10.0).round() / 10.0);
                         }
+                        if test_clock.is_some() && !grace_marked {
+                            let _ = fs::write(runpath.join(".test-grace-entered"), "");
+                            grace_marked = true;
+                        }
                     } else {
                         t.store(true, Ordering::SeqCst);
                         crate::cleanup::record(&runpath, pid);
@@ -2436,6 +2461,9 @@ pub fn run_agent_cancellable(
             }
             if watcher_cancel.is_some() {
                 delay = delay.min(0.05);
+            }
+            if test_clock.is_some() {
+                delay = delay.min(0.02);
             }
             state = changed
                 .wait_timeout(state, Duration::from_secs_f64(delay.max(0.001)))
