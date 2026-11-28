@@ -8743,7 +8743,8 @@ fn cmd_pick(args: &[String]) -> Res<i32> {
 fn print_account_help() {
     println!(
         "Usage: delegate agy account <subcommand> [options]\n\
-         \x20      delegate agy login [<id>] [--label TEXT] [--overwrite] [--agy-bin PATH] [-- <agy-args>...]\n\n\
+         \x20      delegate agy login [<id>] [--label TEXT] [--overwrite] [--agy-bin PATH] [-- <agy-args>...]\n\
+         \x20      delegate agy quota-rate ack [<id>|--all] [--json]\n\n\
          Manage local Antigravity CLI (agy) accounts (~/.config/delegate/agy-accounts/).\n\
          Real quota uses `agy -p /usage </dev/null` only (no internal HTTP APIs).\n\n\
          Subcommands:\n\
@@ -8761,7 +8762,8 @@ fn print_account_help() {
          \x20 import-agy-swap [--dry-run] [--source DIR] [--overwrite] [--json]\n\
          \x20                                      Import accounts from ~/.gemini/agy-swap without printing tokens\n\
          \x20 restore-entry [--dry-run] [--mode wrapper|symlink] [--entry PATH] [--real-bin PATH] [--force] [--json]\n\
-         \x20                                      Replace agy-swap wrapper with direct exec wrapper or symlink"
+         \x20                                      Replace agy-swap wrapper with direct exec wrapper or symlink\n\
+         \x20 quota-rate ack [<id>|--all] [--json] Acknowledge current quota rate shift(s); re-shows if 24h rate changes >1.5x again"
     );
 }
 
@@ -8785,9 +8787,12 @@ pub fn command(args: &[String]) -> Res<i32> {
         }
         return cmd_add(sub_args);
     }
+    if first == "quota-rate" {
+        return crate::quota_rate::command(&args[1..]);
+    }
     if !matches!(first, "account" | "accounts") {
         return Err(format!(
-            "unknown agy subcommand {first:?} (expected: account, login)"
+            "unknown agy subcommand {first:?} (expected: account, login, quota-rate)"
         ));
     }
     let rest = &args[1..];

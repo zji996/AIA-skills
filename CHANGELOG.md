@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `delegate`：额度费率变化降级为只读事实提示并支持确认——`pulse` 与 TUI 不再把 `quota_rate_shift` 推进顶部告警栏、不点亮 `4 额度(!)` 徽标且不进 `delegate status` 告警行（Stop hook 照旧不进），仅在 TUI `4 额度` 页以次要色显示无 `⚠` 单行事实（多账号同行加「等 N 号」，`delegate usage --by quota-rate` 不变）；新增 `delegate agy quota-rate ack [<账号>|--all] [--json]`（持久化至 `<state>/quota-rate-ack.json`）与 TUI 额度页按 `a` 确认 / `e` 展收「已确认 N 条」，同账号同池近 24h 费率相对已确认值再变化超 1.5 倍时自动重新显示。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
 
 ## delegate 6.62.0 - 2026-11-28

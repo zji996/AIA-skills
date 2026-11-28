@@ -662,6 +662,69 @@ fn format_tui_live_line(agy: &AgyAccountsState) -> String {
     }
 }
 
+fn build_quota_rate_shift_lines(
+    agy: &AgyAccountsState,
+    selected_account_id: Option<&str>,
+    acked_expanded: bool,
+    max_w: usize,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let global_unacked_count = agy.rate_shifts.iter().filter(|s| !s.acked).count();
+
+    let (unacked, acked): (Vec<&QuotaRateShiftItem>, Vec<&QuotaRateShiftItem>) =
+        match selected_account_id {
+            None => (
+                agy.rate_shifts.iter().filter(|s| !s.acked).collect(),
+                agy.rate_shifts.iter().filter(|s| s.acked).collect(),
+            ),
+            Some(acct_id) => (
+                agy.rate_shifts
+                    .iter()
+                    .filter(|s| s.account == acct_id && !s.acked)
+                    .collect(),
+                agy.rate_shifts
+                    .iter()
+                    .filter(|s| s.account == acct_id && s.acked)
+                    .collect(),
+            ),
+        };
+
+    if let Some(first) = unacked.first() {
+        let mut txt = first.format_fact_line(true);
+        let multi_cnt = if selected_account_id.is_none() {
+            unacked.len()
+        } else {
+            global_unacked_count
+        };
+        if multi_cnt > 1 {
+            txt.push_str(&format!(" 等 {} 号", multi_cnt));
+        }
+        lines.push(Line::from(Span::styled(truncate(&txt, max_w), muted())));
+    }
+
+    if !acked.is_empty() {
+        let prefix = if unacked.is_empty() {
+            "费率变化："
+        } else {
+            ""
+        };
+        let header = if acked_expanded {
+            format!("▾ {prefix}已确认 {} 条（按 e 收起）", acked.len())
+        } else {
+            format!("▸ {prefix}已确认 {} 条（按 e 展开）", acked.len())
+        };
+        lines.push(Line::from(Span::styled(truncate(&header, max_w), muted())));
+        if acked_expanded {
+            for item in &acked {
+                let row = format!("  {}", item.format_fact_line(true));
+                lines.push(Line::from(Span::styled(truncate(&row, max_w), muted())));
+            }
+        }
+    }
+
+    lines
+}
+
 fn render_quota_auto_detail_pane(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     let agy = &app.snapshot.agy_accounts;
     let asw = &agy.auto_switch;
@@ -683,18 +746,12 @@ fn render_quota_auto_detail_pane(frame: &mut Frame, app: &App, area: Rect, focus
     let mut out: Vec<Line<'static>> = Vec::new();
     push_wrapped(&mut out, &format_tui_delegation_line(agy), iw, bold_primary());
     push_wrapped(&mut out, &format_tui_live_line(agy), iw, muted());
-    if let Some(first_shift) = agy.rate_shifts.first() {
-        let mut txt = first_shift.format_one_line(true);
-        if agy.rate_shifts.len() > 1 {
-            txt.push_str(&format!("（另有{}号）", agy.rate_shifts.len() - 1));
-        }
-        out.push(Line::from(Span::styled(
-            truncate(&txt, iw),
-            Style::default()
-                .fg(STATUS_PENDING)
-                .add_modifier(Modifier::BOLD),
-        )));
-    }
+    out.extend(build_quota_rate_shift_lines(
+        agy,
+        None,
+        app.quota_acked_shifts_expanded,
+        iw,
+    ));
     push_wrapped(
         &mut out,
         &format!(
@@ -836,21 +893,15 @@ fn render_quota_account_detail_pane(frame: &mut Frame, app: &mut App, area: Rect
             y += 1;
         }
     }
-    if let Some(shift) = app
-        .snapshot
-        .agy_accounts
-        .rate_shifts
-        .iter()
-        .find(|s| s.account == acct.id)
-    {
+    for shift_line in build_quota_rate_shift_lines(
+        &app.snapshot.agy_accounts,
+        Some(&acct.id),
+        app.quota_acked_shifts_expanded,
+        iw,
+    ) {
         if y < bottom {
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    truncate(&shift.format_one_line(false), iw),
-                    Style::default()
-                        .fg(STATUS_PENDING)
-                        .add_modifier(Modifier::BOLD),
-                ))),
+                Paragraph::new(shift_line),
                 Rect::new(inner.x, y, inner.width, 1),
             );
             y += 1;
@@ -1214,14 +1265,12 @@ fn render_quota_narrow_detail(
         ]));
         push_wrapped(&mut out, &format_tui_delegation_line(agy), inner_w, bold_primary());
         push_wrapped(&mut out, &format_tui_live_line(agy), inner_w, muted());
-        if let Some(first_shift) = agy.rate_shifts.first() {
-            out.push(Line::from(Span::styled(
-                truncate(&first_shift.format_one_line(true), inner_w),
-                Style::default()
-                    .fg(STATUS_PENDING)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        }
+        out.extend(build_quota_rate_shift_lines(
+            agy,
+            None,
+            app.quota_acked_shifts_expanded,
+            inner_w,
+        ));
         for ps in &asw.pool_summary {
             push_wrapped(
                 &mut out,
@@ -1262,14 +1311,12 @@ fn render_quota_narrow_detail(
             Span::styled(name, bold_primary()),
             Span::styled(format!(" · {upd}"), muted()),
         ]));
-        if let Some(shift) = agy.rate_shifts.iter().find(|s| s.account == acct.id) {
-            out.push(Line::from(Span::styled(
-                truncate(&shift.format_one_line(false), inner_w),
-                Style::default()
-                    .fg(STATUS_PENDING)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        }
+        out.extend(build_quota_rate_shift_lines(
+            agy,
+            Some(&acct.id),
+            app.quota_acked_shifts_expanded,
+            inner_w,
+        ));
 
         if let Some(q) = &acct.quota {
             if q.identity_mismatch {

@@ -251,6 +251,70 @@ impl DelegateClient {
         let stderr = String::from_utf8_lossy(&output.stderr);
         parse_switch_agy_account_output(id, &stdout, &stderr, output.status.success(), output.status.code())
     }
+
+    pub fn ack_quota_rate_shift(&self, account: Option<&str>) -> Result<String, String> {
+        let mut args: Vec<&str> = vec!["agy", "quota-rate", "ack"];
+        if let Some(acct) = account {
+            args.push(acct);
+        } else {
+            args.push("--all");
+        }
+        args.push("--json");
+        let output = Command::new(&self.bin)
+            .args(&args)
+            .output()
+            .map_err(|e| format!("无法执行 agy quota-rate ack: {e}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        parse_ack_quota_rate_shift_output(
+            account,
+            &stdout,
+            &stderr,
+            output.status.success(),
+            output.status.code(),
+        )
+    }
+}
+
+pub fn parse_ack_quota_rate_shift_output(
+    account: Option<&str>,
+    stdout: &str,
+    stderr: &str,
+    success: bool,
+    exit_code: Option<i32>,
+) -> Result<String, String> {
+    if let Ok(v) = serde_json::from_str::<Value>(stdout.trim()) {
+        if v.get("ok").and_then(Value::as_bool) == Some(true) {
+            let cnt = v.get("ackedCount").and_then(Value::as_u64).unwrap_or(0);
+            if cnt == 0 {
+                return Ok(match account {
+                    Some(acct) => format!("账号 {acct} 当前无未确认的费率变化"),
+                    None => "当前无未确认的费率变化".to_string(),
+                });
+            }
+            return Ok(match account {
+                Some(acct) if cnt == 1 => format!("已确认 {acct} 的费率变化"),
+                _ => format!("已确认 {cnt} 条费率变化"),
+            });
+        }
+        if let Some(err) = v.get("error").and_then(Value::as_str) {
+            return Err(err.to_string());
+        }
+    }
+    if success {
+        let msg = single_line(stdout);
+        return Ok(if msg.is_empty() {
+            "已确认费率变化".to_string()
+        } else {
+            msg
+        });
+    }
+    let err = single_line(stderr);
+    Err(if err.is_empty() {
+        format!("确认费率变化失败（退出码 {exit_code:?}）")
+    } else {
+        err
+    })
 }
 
 pub fn parse_switch_agy_account_output(
@@ -4174,6 +4238,7 @@ fn parse_quota_rate_shifts(val: Option<&Value>) -> Vec<QuotaRateShiftItem> {
                 baseline_agy_versions: string_list(item.get("baselineAgyVersions")),
                 current_agy_versions: string_list(item.get("currentAgyVersions")),
                 note: str_of("note"),
+                acked: item.get("acked").and_then(Value::as_bool).unwrap_or(false),
             })
         })
         .collect()

@@ -1735,6 +1735,7 @@ pub struct QuotaRateShiftItem {
     pub baseline_agy_versions: Vec<String>,
     pub current_agy_versions: Vec<String>,
     pub note: String,
+    pub acked: bool,
 }
 
 impl QuotaRateShiftItem {
@@ -1748,17 +1749,7 @@ impl QuotaRateShiftItem {
         }
     }
 
-    fn format_vers(vers: &[String]) -> String {
-        if vers.is_empty() {
-            return "未知".to_string();
-        }
-        vers.iter()
-            .map(|v| if v == "unknown" || v.is_empty() { "未知" } else { v.as_str() })
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-
-    pub fn format_one_line(&self, include_account: bool) -> String {
+    pub fn format_fact_line(&self, include_account: bool) -> String {
         let pool = if self.pool_label.is_empty() {
             self.pool.as_str()
         } else {
@@ -1769,30 +1760,13 @@ impl QuotaRateShiftItem {
         } else {
             self.window_label.as_str()
         };
-        let ratio = self.ratio_x100 as f64 / 100.0;
-        let ver_part = if self.baseline_agy_versions.is_empty() && self.current_agy_versions.is_empty() {
-            String::new()
-        } else {
-            let b = Self::format_vers(&self.baseline_agy_versions);
-            let c = Self::format_vers(&self.current_agy_versions);
-            if b == c {
-                format!(" · agy {c}")
-            } else {
-                format!(" · agy {b}→{c}")
-            }
-        };
-        let note = if self.note.is_empty() {
-            "可能含本机未记录的用量"
-        } else {
-            self.note.as_str()
-        };
         let acct_part = if include_account && !self.account.is_empty() {
             format!("{} ", self.account)
         } else {
             String::new()
         };
         format!(
-            "⚠ 费率漂移：{acct_part}{pool}({win}) {}→{}/1%（降为1/{ratio:.2}{ver_part}；{note}）",
+            "费率变化：{acct_part}{pool} {win} {}→{}/1%（近 24h 对比 7 天）",
             Self::format_rate(self.baseline_rate),
             Self::format_rate(self.current_rate),
         )
@@ -2155,7 +2129,7 @@ impl AppSnapshot {
     }
 
     fn compute_fallback_quota_alert(&self) -> bool {
-        if self.agy_accounts.live_drifted || !self.agy_accounts.rate_shifts.is_empty() {
+        if self.agy_accounts.live_drifted {
             return true;
         }
         for acct in &self.agy_accounts.accounts {
@@ -2359,25 +2333,6 @@ impl AppSnapshot {
                 message: format!("[{}] {}（{detail}）→ 按 2 处理", top.id, top.display_title()),
                 target_tab: 2,
                 target_id: Some(top.id.clone()),
-            });
-        }
-
-        if let Some(first) = self.agy_accounts.rate_shifts.first() {
-            let mut msg = first
-                .format_one_line(true)
-                .trim_start_matches("⚠ 费率漂移：")
-                .to_string();
-            if self.agy_accounts.rate_shifts.len() > 1 {
-                msg.push_str(&format!(" 等{}号", self.agy_accounts.rate_shifts.len()));
-            }
-            msg.push_str(" → 按 4 查");
-            p1.push(ActiveAlertItem {
-                level: AlertLevel::P1,
-                kind: "quota_rate_shift".to_string(),
-                label: "额度·费率漂移".to_string(),
-                message: msg,
-                target_tab: 4,
-                target_id: (!first.account.is_empty()).then(|| first.account.clone()),
             });
         }
 

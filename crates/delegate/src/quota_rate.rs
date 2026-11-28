@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 
 pub const QUOTA_RATE_SHIFT_FILE: &str = "quota-rate-shift.json";
 pub const QUOTA_RATE_SHIFT_SCHEMA_VERSION: u64 = 1;
+pub const QUOTA_RATE_ACK_FILE: &str = "quota-rate-ack.json";
+pub const QUOTA_RATE_ACK_SCHEMA_VERSION: u64 = 1;
 pub const RATE_SHIFT_THRESHOLD: f64 = 1.5;
 pub const MIN_CURRENT_DROP_PCT: f64 = 5.0;
 pub const MIN_CURRENT_RECORDS: usize = 20;
@@ -42,6 +44,133 @@ pub fn weighted_tokens(tok: TokenCounts) -> f64 {
 
 pub fn rate_shift_cache_path(state_root: &Path) -> PathBuf {
     state_root.join(QUOTA_RATE_SHIFT_FILE)
+}
+
+pub fn rate_shift_ack_path(state_root: &Path) -> PathBuf {
+    state_root.join(QUOTA_RATE_ACK_FILE)
+}
+
+fn ack_key(account: &str, pool: &str, window: &str) -> String {
+    format!("{account}|{pool}|{window}")
+}
+
+/// Returns `true` when `current_rate` is still within `RATE_SHIFT_THRESHOLD` (1.5x)
+/// of `acked_rate` in both directions. Any further shift exceeding 1.5x in either
+/// direction is treated as a new drift (`false`).
+pub fn is_shift_acked_by(current_rate: f64, acked_rate: f64) -> bool {
+    if !current_rate.is_finite()
+        || !acked_rate.is_finite()
+        || current_rate <= 0.0
+        || acked_rate <= 0.0
+    {
+        return false;
+    }
+    !(current_rate * RATE_SHIFT_THRESHOLD < acked_rate
+        || acked_rate * RATE_SHIFT_THRESHOLD < current_rate)
+}
+
+#[derive(Debug, Clone)]
+struct RateShiftAckEntry {
+    account: String,
+    pool: String,
+    window: String,
+    acked_rate: f64,
+    acked_at: String,
+    acked_epoch: i64,
+}
+
+impl RateShiftAckEntry {
+    fn to_json(&self) -> Value {
+        json!({
+            "account": self.account,
+            "pool": self.pool,
+            "window": self.window,
+            "ackedRate": self.acked_rate.round(),
+            "ackedAt": self.acked_at,
+            "ackedEpoch": self.acked_epoch,
+        })
+    }
+}
+
+fn load_ack_map_in(state_root: &Path) -> BTreeMap<String, RateShiftAckEntry> {
+    let mut out = BTreeMap::new();
+    let path = rate_shift_ack_path(state_root);
+    if !path.is_file() {
+        return out;
+    }
+    let doc = json(&path);
+    let Some(acks) = doc["acks"].as_object() else {
+        return out;
+    };
+    for (k, v) in acks {
+        let Some(obj) = v.as_object() else {
+            continue;
+        };
+        let account = obj
+            .get("account")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let pool = obj
+            .get("pool")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let window = obj
+            .get("window")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let acked_rate = obj
+            .get("ackedRate")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        if account.is_empty() || pool.is_empty() || window.is_empty() || acked_rate <= 0.0 {
+            continue;
+        }
+        let acked_at = obj
+            .get("ackedAt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let acked_epoch = obj.get("ackedEpoch").and_then(Value::as_i64).unwrap_or(0);
+        let key = if k.is_empty() {
+            ack_key(&account, &pool, &window)
+        } else {
+            k.clone()
+        };
+        out.insert(
+            key,
+            RateShiftAckEntry {
+                account,
+                pool,
+                window,
+                acked_rate,
+                acked_at,
+                acked_epoch,
+            },
+        );
+    }
+    out
+}
+
+fn save_ack_map_in(state_root: &Path, acks: &BTreeMap<String, RateShiftAckEntry>) -> Res<()> {
+    let path = rate_shift_ack_path(state_root);
+    let acks_obj: Map<String, Value> = acks
+        .iter()
+        .map(|(k, entry)| (k.clone(), entry.to_json()))
+        .collect();
+    let doc = json!({
+        "schemaVersion": QUOTA_RATE_ACK_SCHEMA_VERSION,
+        "acks": acks_obj,
+    });
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create ack dir: {e}"))?;
+    }
+    atomic_write(&path, format!("{doc}\n")).map_err(|e| format!("write ack state: {e}"))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -337,8 +466,16 @@ pub fn refresh_and_emit_in(state_root: &Path, now_ep: i64) -> Vec<QuotaRateShift
         }
     }
 
+    let ack_map = load_ack_map_in(state_root);
     let today_ymd = format_epoch(now_ep, true, "%Y-%m-%d");
     for shift in &shifts {
+        let key = ack_key(&shift.account, &shift.pool, &shift.window);
+        if ack_map
+            .get(&key)
+            .is_some_and(|a| is_shift_acked_by(shift.current_rate, a.acked_rate))
+        {
+            continue;
+        }
         let already = emitted_by_acct
             .get(&shift.account)
             .is_some_and(|d| d == &today_ymd);
@@ -375,7 +512,8 @@ pub fn refresh_and_emit_in(state_root: &Path, now_ep: i64) -> Vec<QuotaRateShift
     shifts
 }
 
-/// Strictly read-only, zero-lock, zero-subprocess loader of active cached rate shifts.
+/// Strictly read-only, zero-lock, zero-subprocess loader of active cached rate shifts,
+/// enriched with ack state from `<state>/quota-rate-ack.json`.
 pub fn load_cached_shifts_in(state_root: &Path, now_ep: i64) -> Vec<Value> {
     let cache_path = rate_shift_cache_path(state_root);
     if !cache_path.is_file() {
@@ -385,19 +523,210 @@ pub fn load_cached_shifts_in(state_root: &Path, now_ep: i64) -> Vec<Value> {
     let Some(arr) = doc["shifts"].as_array() else {
         return Vec::new();
     };
+    let ack_map = load_ack_map_in(state_root);
     arr.iter()
-        .filter(|item| {
-            if !item.is_object() {
-                return false;
-            }
-            let det = item["detectedEpoch"].as_i64().unwrap_or(0);
+        .filter_map(|item| {
+            let mut obj = item.as_object()?.clone();
+            let det = obj
+                .get("detectedEpoch")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
             if now_ep > 0 && det > 0 && now_ep - det > CACHED_SHIFT_MAX_AGE_SECS {
-                return false;
+                return None;
             }
-            true
+            let acct = obj.get("account").and_then(Value::as_str).unwrap_or("");
+            let pool = obj.get("pool").and_then(Value::as_str).unwrap_or("");
+            let win = obj.get("window").and_then(Value::as_str).unwrap_or("");
+            let cur_rate = obj
+                .get("currentRate")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let key = ack_key(acct, pool, win);
+            if let Some(ack) = ack_map.get(&key) {
+                if is_shift_acked_by(cur_rate, ack.acked_rate) {
+                    obj.insert("acked".to_string(), json!(true));
+                    obj.insert("ackedRate".to_string(), json!(ack.acked_rate.round()));
+                    if !ack.acked_at.is_empty() {
+                        obj.insert("ackedAt".to_string(), json!(ack.acked_at));
+                    }
+                } else {
+                    obj.insert("acked".to_string(), json!(false));
+                }
+            } else {
+                obj.insert("acked".to_string(), json!(false));
+            }
+            Some(Value::Object(obj))
         })
-        .cloned()
         .collect()
+}
+
+/// Acknowledge active cached quota rate shifts in `<state>/quota-rate-ack.json`.
+/// When `account_filter` is `Some(id)`, only shifts for that account are acknowledged;
+/// when `None`, all unacknowledged active shifts are acknowledged.
+pub fn ack_shifts_in(
+    state_root: &Path,
+    account_filter: Option<&str>,
+    now_ep: i64,
+) -> Res<Vec<Value>> {
+    let shifts = load_cached_shifts_in(state_root, now_ep);
+    let mut ack_map = load_ack_map_in(state_root);
+    let acked_at = format_epoch(now_ep, false, "%Y-%m-%dT%H:%M:%SZ");
+    let mut acked_items: Vec<Value> = Vec::new();
+
+    for sh in &shifts {
+        let acct = s(sh, "account");
+        if acct.is_empty() {
+            continue;
+        }
+        if let Some(filter) = account_filter {
+            if acct != filter {
+                continue;
+            }
+        }
+        if b(sh, "acked") {
+            continue;
+        }
+        let pool = s(sh, "pool");
+        let win = s(sh, "window");
+        let cur_rate = sh["currentRate"].as_f64().unwrap_or(0.0);
+        if pool.is_empty() || win.is_empty() || cur_rate <= 0.0 || !cur_rate.is_finite() {
+            continue;
+        }
+        let entry = RateShiftAckEntry {
+            account: acct.to_string(),
+            pool: pool.to_string(),
+            window: win.to_string(),
+            acked_rate: cur_rate,
+            acked_at: acked_at.clone(),
+            acked_epoch: now_ep,
+        };
+        let key = ack_key(&entry.account, &entry.pool, &entry.window);
+        ack_map.insert(key, entry);
+        let pool_label = {
+            let lbl = s(sh, "poolLabel");
+            if lbl.is_empty() { pool } else { lbl }
+        };
+        let window_label = {
+            let lbl = s(sh, "windowLabel");
+            if lbl.is_empty() { win } else { lbl }
+        };
+        acked_items.push(json!({
+            "account": acct,
+            "pool": pool,
+            "poolLabel": pool_label,
+            "window": win,
+            "windowLabel": window_label,
+            "ackedRate": cur_rate.round(),
+            "ackedAt": acked_at,
+            "ackedEpoch": now_ep,
+        }));
+    }
+
+    if !acked_items.is_empty() {
+        save_ack_map_in(state_root, &ack_map)?;
+    }
+    Ok(acked_items)
+}
+
+fn print_quota_rate_help() {
+    println!(
+        "Usage: delegate agy quota-rate <subcommand> [options]\n\n\
+         Subcommands:\n\
+         \x20 ack [<account>|--all] [--json]   Acknowledge current quota rate drift(s);\n\
+         \x20                                   re-surfaces automatically if 24h rate changes >1.5x again."
+    );
+}
+
+pub fn command(args: &[String]) -> Res<i32> {
+    let Some(sub) = args.first().map(String::as_str) else {
+        print_quota_rate_help();
+        return Ok(0);
+    };
+    if matches!(sub, "-h" | "--help" | "help") {
+        print_quota_rate_help();
+        return Ok(0);
+    }
+    match sub {
+        "ack" => cmd_ack(&args[1..]),
+        other => Err(format!(
+            "unknown `delegate agy quota-rate` subcommand {other:?} (expected: ack)"
+        )),
+    }
+}
+
+fn cmd_ack(args: &[String]) -> Res<i32> {
+    let mut all = false;
+    let mut json_out = false;
+    let mut account: Option<String> = None;
+
+    for arg in args {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_quota_rate_help();
+                return Ok(0);
+            }
+            "--all" => all = true,
+            "--json" => json_out = true,
+            other if other.starts_with('-') => {
+                return Err(format!(
+                    "unknown option {other:?} for `delegate agy quota-rate ack` (expected: [<account>|--all] [--json])"
+                ));
+            }
+            other => {
+                if account.is_some() {
+                    return Err(
+                        "usage: delegate agy quota-rate ack [<account>|--all] [--json]".to_string(),
+                    );
+                }
+                account = Some(other.to_string());
+            }
+        }
+    }
+    if all && account.is_some() {
+        return Err("cannot combine <account> with --all".to_string());
+    }
+
+    let now_ep = epoch() as i64;
+    let state = state_dir();
+    let acked = ack_shifts_in(&state, account.as_deref(), now_ep)?;
+
+    if json_out {
+        println!(
+            "{}",
+            json!({
+                "ok": true,
+                "ackedCount": acked.len(),
+                "acked": acked,
+            })
+        );
+        return Ok(0);
+    }
+
+    if acked.is_empty() {
+        if let Some(ref acct) = account {
+            println!("账号 {acct} 当前无未确认的额度费率变化");
+        } else {
+            println!("当前无未确认的额度费率变化");
+        }
+        return Ok(0);
+    }
+
+    if acked.len() == 1 {
+        let item = &acked[0];
+        let acct = s(item, "account");
+        let pool = s(item, "poolLabel");
+        let win = s(item, "windowLabel");
+        let rate = format_rate_compact(item["ackedRate"].as_f64().unwrap_or(0.0));
+        println!("已确认额度费率变化：{acct} {pool} {win}（当前 {rate}/1%，再变化超 1.5 倍时重新显示）");
+    } else {
+        let names: Vec<&str> = acked.iter().map(|i| s(i, "account")).collect();
+        println!(
+            "已确认 {} 条额度费率变化：{}（再变化超 1.5 倍时重新显示）",
+            acked.len(),
+            names.join("、")
+        );
+    }
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1057,5 +1386,100 @@ mod tests {
             .filter(|e| !e.run.starts_with("c-") || e.run[2..].parse::<usize>().unwrap() < 19)
             .collect();
         assert!(detect_shifts(&qc_low_recs, &entries_19, base_ep).is_empty());
+    }
+
+    #[test]
+    fn ack_persists_state_folds_shift_and_resurfaces_beyond_threshold() {
+        let now_ep = 1_795_860_000i64;
+        let tmp = std::env::temp_dir().join(format!(
+            "delegate-quota-rate-ack-test-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        let write_cache = |alpha_cur: f64, beta_cur: f64| {
+            let doc = json!({
+                "schemaVersion": 1,
+                "computedAt": "2026-11-28T10:00:00Z",
+                "computedEpoch": now_ep,
+                "shifts": [
+                    {
+                        "account": "acct-alpha",
+                        "pool": "gemini",
+                        "poolLabel": "Gemini",
+                        "window": "weekly",
+                        "windowLabel": "周额度",
+                        "baselineRate": 4_000_000.0,
+                        "currentRate": alpha_cur,
+                        "ratio": (4_000_000.0 / alpha_cur * 100.0).round() / 100.0,
+                        "detectedAt": "2026-11-28T10:00:00Z",
+                        "detectedEpoch": now_ep,
+                    },
+                    {
+                        "account": "acct-beta",
+                        "pool": "gemini",
+                        "poolLabel": "Gemini",
+                        "window": "fiveHour",
+                        "windowLabel": "5h额度",
+                        "baselineRate": 3_000_000.0,
+                        "currentRate": beta_cur,
+                        "ratio": (3_000_000.0 / beta_cur * 100.0).round() / 100.0,
+                        "detectedAt": "2026-11-28T10:00:00Z",
+                        "detectedEpoch": now_ep,
+                    }
+                ]
+            });
+            atomic_write(rate_shift_cache_path(&tmp), format!("{doc}\n")).unwrap();
+        };
+
+        write_cache(2_000_000.0, 1_500_000.0);
+        let initial = load_cached_shifts_in(&tmp, now_ep + 10);
+        assert_eq!(initial.len(), 2);
+        assert!(!b(&initial[0], "acked"));
+        assert!(!b(&initial[1], "acked"));
+
+        // Ack only acct-alpha.
+        let acked1 = ack_shifts_in(&tmp, Some("acct-alpha"), now_ep + 20).unwrap();
+        assert_eq!(acked1.len(), 1);
+        assert_eq!(s(&acked1[0], "account"), "acct-alpha");
+        assert!(rate_shift_ack_path(&tmp).is_file());
+
+        let after_one = load_cached_shifts_in(&tmp, now_ep + 30);
+        assert!(b(&after_one[0], "acked"), "acct-alpha should be acked");
+        assert!(!b(&after_one[1], "acked"), "acct-beta should stay unacked");
+
+        // Within 1.5x of 2.00M (1.60M => 1.25x): remains acked.
+        write_cache(1_600_000.0, 1_500_000.0);
+        let within = load_cached_shifts_in(&tmp, now_ep + 40);
+        assert!(b(&within[0], "acked"), "1.25x drift must stay acked");
+
+        // Drop > 1.5x below 2.00M (1.20M => 1.67x): treated as new drift.
+        write_cache(1_200_000.0, 1_500_000.0);
+        let dropped_again = load_cached_shifts_in(&tmp, now_ep + 50);
+        assert!(
+            !b(&dropped_again[0], "acked"),
+            "further >1.5x drop must resurface as unacked"
+        );
+
+        // Rise > 1.5x above 2.00M (3.20M => 1.60x): also treated as new drift.
+        write_cache(3_200_000.0, 1_500_000.0);
+        let rose_again = load_cached_shifts_in(&tmp, now_ep + 60);
+        assert!(
+            !b(&rose_again[0], "acked"),
+            "further >1.5x rebound must resurface as unacked"
+        );
+
+        // Ack all unacked shifts.
+        let acked_all = ack_shifts_in(&tmp, None, now_ep + 70).unwrap();
+        assert_eq!(acked_all.len(), 2);
+        let after_all = load_cached_shifts_in(&tmp, now_ep + 80);
+        assert!(after_all.iter().all(|v| b(v, "acked")));
+
+        // Repeating ack all is a no-op.
+        let noop = ack_shifts_in(&tmp, None, now_ep + 90).unwrap();
+        assert!(noop.is_empty());
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

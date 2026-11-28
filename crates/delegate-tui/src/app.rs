@@ -263,6 +263,7 @@ pub enum AppAction {
     CopyClipboard(String),
     OpenPager(String),
     SwitchAgyAccount(String),
+    AckQuotaRateShift(Option<String>),
     RefreshQuota,
     Quit,
     QuitAndPrint(String),
@@ -306,6 +307,7 @@ pub struct App {
     pub overview_deliveries_scroll: usize,
     pub overview_scroll: usize,
     pub quota_models_expanded: bool,
+    pub quota_acked_shifts_expanded: bool,
     pub quota_refreshing: bool,
     pub quota_last_error: Option<String>,
     pub lines_refreshing: bool,
@@ -383,6 +385,7 @@ impl App {
             overview_deliveries_scroll: 0,
             overview_scroll: 0,
             quota_models_expanded: false,
+            quota_acked_shifts_expanded: false,
             quota_refreshing: false,
             quota_last_error: None,
             lines_refreshing: false,
@@ -2132,6 +2135,34 @@ impl App {
         }
     }
 
+    /// Returns `(unacked, acked)` quota rate shift counts relevant to the currently selected
+    /// row on the Quota tab (`Auto` aggregates all accounts; `Slot` scopes to that account).
+    pub fn selected_quota_shift_counts(&self) -> (usize, usize) {
+        let shifts = &self.snapshot.agy_accounts.rate_shifts;
+        match self.selected_account_row() {
+            Some(AccountRow::Auto) => {
+                let unacked = shifts.iter().filter(|s| !s.acked).count();
+                let acked = shifts.iter().filter(|s| s.acked).count();
+                (unacked, acked)
+            }
+            Some(AccountRow::Slot(idx)) => {
+                let Some(acct) = self.snapshot.agy_accounts.accounts.get(idx) else {
+                    return (0, 0);
+                };
+                let unacked = shifts
+                    .iter()
+                    .filter(|s| s.account == acct.id && !s.acked)
+                    .count();
+                let acked = shifts
+                    .iter()
+                    .filter(|s| s.account == acct.id && s.acked)
+                    .count();
+                (unacked, acked)
+            }
+            None => (0, 0),
+        }
+    }
+
     pub fn is_account_revealed(&self, id: &str) -> bool {
         self.revealed_accounts.contains(id)
     }
@@ -2765,6 +2796,54 @@ impl App {
                 KeyCode::Char('u') => {
                     self.open_account_switch_confirm();
                     AppAction::Redraw
+                }
+                KeyCode::Char('a') => match self.selected_account_row() {
+                    Some(AccountRow::Auto) => {
+                        if self.snapshot.agy_accounts.rate_shifts.iter().any(|s| !s.acked) {
+                            AppAction::AckQuotaRateShift(None)
+                        } else {
+                            self.set_toast("当前无未确认的费率变化");
+                            AppAction::Redraw
+                        }
+                    }
+                    Some(AccountRow::Slot(idx)) => {
+                        if let Some(acct) = self.snapshot.agy_accounts.accounts.get(idx) {
+                            if self
+                                .snapshot
+                                .agy_accounts
+                                .rate_shifts
+                                .iter()
+                                .any(|s| s.account == acct.id && !s.acked)
+                            {
+                                AppAction::AckQuotaRateShift(Some(acct.id.clone()))
+                            } else if self
+                                .snapshot
+                                .agy_accounts
+                                .rate_shifts
+                                .iter()
+                                .any(|s| !s.acked)
+                            {
+                                self.set_toast("该账号无未确认的费率变化（选 auto 按 a 可全部确认）");
+                                AppAction::Redraw
+                            } else {
+                                self.set_toast("当前无未确认的费率变化");
+                                AppAction::Redraw
+                            }
+                        } else {
+                            AppAction::None
+                        }
+                    }
+                    None => AppAction::None,
+                },
+                KeyCode::Char('e') => {
+                    let (_, acked_cnt) = self.selected_quota_shift_counts();
+                    if acked_cnt > 0 || self.quota_acked_shifts_expanded {
+                        self.quota_acked_shifts_expanded = !self.quota_acked_shifts_expanded;
+                        self.dirty = true;
+                        AppAction::Redraw
+                    } else {
+                        AppAction::None
+                    }
                 }
                 KeyCode::Char(' ') => {
                     self.quota_models_expanded = !self.quota_models_expanded;

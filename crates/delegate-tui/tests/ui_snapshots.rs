@@ -3426,30 +3426,13 @@ fn overview_and_runs_render_total_lines_summary_and_per_repo_breakdown() {
 }
 
 #[test]
-fn quota_tab_and_pulse_render_rate_shift_single_line_warning() {
-    use delegate_tui::app::ViewTab;
+fn quota_tab_and_pulse_render_rate_shift_fact_line_without_alert() {
+    use delegate_tui::app::{AppAction, ViewTab};
     use delegate_tui::data::parse_snapshot_json;
 
-    let raw = r#"{
-        "seq": 12,
-        "repos": [],
-        "work": [],
-        "events": [{
-            "seq": 12,
-            "at": "2026-11-28T01:00:00Z",
-            "run": "",
-            "repo": "",
-            "kind": "quota_rate_shift",
-            "summary": "费率漂移：acct-alpha Gemini(周额度) 4.00M→1.00M/1%（降为1/4.00 · agy 1.5.16→1.5.17；可能含本机未记录的用量）"
-        }],
-        "lane": {},
-        "dagQueue": [],
-        "merges": [],
-        "candidates": [],
-        "agyAccounts": {
-            "active": "acct-alpha",
-            "liveDrifted": false,
-            "accounts": [{
+    let make_snap = |shifts_json: &str, multi_account: bool| {
+        let accounts_json = if multi_account {
+            r#"[{
                 "id": "acct-alpha",
                 "active": true,
                 "quota": {
@@ -3462,25 +3445,83 @@ fn quota_tab_and_pulse_render_rate_shift_single_line_warning() {
                         "resetInSeconds": 259200
                     }]
                 }
-            }],
-            "rateShifts": [{
-                "account": "acct-alpha",
-                "pool": "gemini",
-                "poolLabel": "Gemini",
-                "window": "weekly",
-                "windowLabel": "周额度",
-                "baselineRate": 4000000.0,
-                "currentRate": 1000000.0,
-                "ratio": 4.0,
-                "baselineAgyVersions": ["1.5.16"],
-                "currentAgyVersions": ["1.5.17"],
-                "note": "可能含本机未记录的用量"
-            }]
-        }
-    }"#;
-    let snap = parse_snapshot_json(raw, None, None).expect("snapshot parses");
+            }, {
+                "id": "acct-beta",
+                "active": false,
+                "quota": {
+                    "ok": true,
+                    "ageSeconds": 60,
+                    "entries": [{
+                        "pool": "Gemini Models",
+                        "window": "weekly",
+                        "remainingPct": 80.0,
+                        "resetInSeconds": 259200
+                    }]
+                }
+            }]"#
+        } else {
+            r#"[{
+                "id": "acct-alpha",
+                "active": true,
+                "quota": {
+                    "ok": true,
+                    "ageSeconds": 60,
+                    "entries": [{
+                        "pool": "Gemini Models",
+                        "window": "weekly",
+                        "remainingPct": 70.0,
+                        "resetInSeconds": 259200
+                    }]
+                }
+            }]"#
+        };
+        let raw = format!(
+            r#"{{
+                "seq": 12,
+                "repos": [],
+                "work": [],
+                "events": [{{
+                    "seq": 12,
+                    "at": "2026-11-28T01:00:00Z",
+                    "run": "",
+                    "repo": "",
+                    "kind": "quota_rate_shift",
+                    "summary": "费率漂移：acct-alpha Gemini(周额度) 3.04M→2.00M/1%（降为1/1.52 · agy 1.5.16→1.5.17；可能含本机未记录的用量）"
+                }}],
+                "lane": {{}},
+                "dagQueue": [],
+                "merges": [],
+                "candidates": [],
+                "agyAccounts": {{
+                    "active": "acct-alpha",
+                    "liveDrifted": false,
+                    "accounts": {accounts_json},
+                    "rateShifts": {shifts_json}
+                }}
+            }}"#
+        );
+        parse_snapshot_json(&raw, None, None).expect("snapshot parses")
+    };
+
+    // 1. Unacked single-account shift: NO top alert banner, NO `4 额度(!)` badge,
+    //    only a muted fact line on the Quota tab without `⚠`.
+    let snap = make_snap(
+        r#"[{
+            "account": "acct-alpha",
+            "pool": "gemini",
+            "poolLabel": "Gemini",
+            "window": "weekly",
+            "windowLabel": "周额度",
+            "baselineRate": 3040000.0,
+            "currentRate": 2000000.0,
+            "ratio": 1.52,
+            "acked": false
+        }]"#,
+        false,
+    );
     assert_eq!(snap.agy_accounts.rate_shifts.len(), 1);
-    assert!(snap.effective_pulse().quota_alert);
+    assert!(!snap.effective_pulse().quota_alert, "rate shift must not light up quota badge");
+    assert!(snap.effective_alerts().is_empty(), "rate shift must stay out of top alert banner");
     assert_eq!(snap.events[0].kind_badge(), "费率");
 
     let mut app = App::new(
@@ -3489,17 +3530,151 @@ fn quota_tab_and_pulse_render_rate_shift_single_line_warning() {
         PathBuf::from("/tmp/demo"),
         5,
     );
+    let overview = render_to_string(&mut app, 150, 36);
+    assert!(
+        !overview.contains("▲ 告警") && !overview.contains("费率漂移"),
+        "overview/top alert bar must not show rate shift:\n{overview}"
+    );
+
     app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
     assert_eq!(app.tab, ViewTab::Quota);
 
     let wide = render_to_string(&mut app, 150, 36);
     assert_lines_fit_width(&wide, 150);
-    assert!(wide.contains("4 额度(!)"), "badge should light up:\n{wide}");
-    assert!(wide.contains("费率漂移"), "quota tab should show rate shift:\n{wide}");
-    assert!(wide.contains("1.5.16→1.5.17"), "version transition should be shown:\n{wide}");
-    assert!(wide.contains("可能含本机未记录的用量"), "unrecorded usage note missing:\n{wide}");
+    assert!(!wide.contains("▲ 告警"), "alert strip must be absent:\n{wide}");
+    assert!(!wide.contains("4 额度(!)"), "badge must not light up:\n{wide}");
+    assert!(
+        wide.contains("费率变化：acct-alpha Gemini 周额度 3.04M→2.00M/1%（近 24h 对比 7 天）"),
+        "quota tab should show clean fact line:\n{wide}"
+    );
+    assert!(
+        !wide.contains("⚠ 费率"),
+        "quota tab fact line must not include warning icon:\n{wide}"
+    );
+    assert!(
+        wide.contains("a 确认费率"),
+        "footer should advertise ack key when selected row has unacked shift:\n{wide}"
+    );
 
     let narrow = render_to_string(&mut app, 80, 30);
     assert_lines_fit_width(&narrow, 80);
-    assert!(narrow.contains("费率漂移"), "narrow quota tab should show rate shift:\n{narrow}");
+    assert!(
+        narrow.contains("费率变化：acct-alpha Gemini 周额度 3.04M→2.00M/1%"),
+        "narrow quota tab should show clean fact line:\n{narrow}"
+    );
+    assert!(narrow.contains("a确认"), "narrow footer should advertise ack key:\n{narrow}");
+
+    // Pressing `a` on selected account emits AckQuotaRateShift for that account.
+    assert_eq!(
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        AppAction::AckQuotaRateShift(Some("acct-alpha".to_string()))
+    );
+
+    // 2. Multi-account unacked shifts: single line appends `等 2 号`; `a` on auto row acks all.
+    let snap_multi = make_snap(
+        r#"[{
+            "account": "acct-alpha",
+            "pool": "gemini",
+            "poolLabel": "Gemini",
+            "window": "weekly",
+            "windowLabel": "周额度",
+            "baselineRate": 3040000.0,
+            "currentRate": 2000000.0,
+            "ratio": 1.52,
+            "acked": false
+        }, {
+            "account": "acct-beta",
+            "pool": "gemini",
+            "poolLabel": "Gemini",
+            "window": "weekly",
+            "windowLabel": "周额度",
+            "baselineRate": 3000000.0,
+            "currentRate": 1500000.0,
+            "ratio": 2.0,
+            "acked": false
+        }]"#,
+        true,
+    );
+    app.apply_snapshot(snap_multi, true);
+    let multi_wide = render_to_string(&mut app, 150, 36);
+    assert!(
+        multi_wide.contains("费率变化：acct-alpha Gemini 周额度 3.04M→2.00M/1%（近 24h 对比 7 天） 等 2 号"),
+        "multi-account shift line should append 等 2 号:\n{multi_wide}"
+    );
+    // Navigate down to `auto` row (acct-alpha -> acct-beta -> auto).
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert_eq!(
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        AppAction::AckQuotaRateShift(None)
+    );
+
+    // 3. After ack: folded as `已确认 1 条` (no standalone drift line), expandable with `e`.
+    let snap_acked = make_snap(
+        r#"[{
+            "account": "acct-alpha",
+            "pool": "gemini",
+            "poolLabel": "Gemini",
+            "window": "weekly",
+            "windowLabel": "周额度",
+            "baselineRate": 3040000.0,
+            "currentRate": 2000000.0,
+            "ratio": 1.52,
+            "acked": true
+        }]"#,
+        false,
+    );
+    app.apply_snapshot(snap_acked, true);
+    let acked_folded = render_to_string(&mut app, 150, 36);
+    assert!(
+        acked_folded.contains("已确认 1 条"),
+        "acked shift should fold into 已确认 1 条:\n{acked_folded}"
+    );
+    assert!(
+        !acked_folded.contains("3.04M→2.00M/1%"),
+        "acked shift details should stay hidden while folded:\n{acked_folded}"
+    );
+    assert!(
+        acked_folded.contains("e 展开已确认"),
+        "footer should advertise expand key:\n{acked_folded}"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+    let acked_expanded = render_to_string(&mut app, 150, 36);
+    assert!(
+        acked_expanded.contains("3.04M→2.00M/1%"),
+        "expanding acked fold should reveal shift details:\n{acked_expanded}"
+    );
+    assert!(
+        acked_expanded.contains("e 收起已确认"),
+        "footer should advertise collapse key when expanded:\n{acked_expanded}"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+
+    // 4. Subsequent >1.5x drift re-surfaces as unacked fact line (still out of alert bar).
+    let snap_resurfaced = make_snap(
+        r#"[{
+            "account": "acct-alpha",
+            "pool": "gemini",
+            "poolLabel": "Gemini",
+            "window": "weekly",
+            "windowLabel": "周额度",
+            "baselineRate": 3040000.0,
+            "currentRate": 1000000.0,
+            "ratio": 3.04,
+            "acked": false
+        }]"#,
+        false,
+    );
+    app.apply_snapshot(snap_resurfaced, true);
+    let resurfaced = render_to_string(&mut app, 150, 36);
+    assert!(!resurfaced.contains("▲ 告警"), "resurfaced drift must still stay out of alert bar:\n{resurfaced}");
+    assert!(
+        resurfaced.contains("费率变化：acct-alpha Gemini 周额度 3.04M→1.00M/1%（近 24h 对比 7 天）"),
+        "resurfaced drift should show standalone fact line again:\n{resurfaced}"
+    );
+    assert!(
+        !resurfaced.contains("已确认 1 条"),
+        "resurfaced drift must not stay folded:\n{resurfaced}"
+    );
 }

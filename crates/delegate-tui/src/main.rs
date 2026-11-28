@@ -151,6 +151,9 @@ enum WorkerCmd {
     SwitchAgyAccount {
         id: String,
     },
+    AckQuotaRateShift {
+        account: Option<String>,
+    },
     Shutdown,
 }
 
@@ -174,6 +177,9 @@ enum WorkerEvent {
     },
     AgyAccountSwitched {
         id: String,
+        result: Result<String, String>,
+    },
+    QuotaRateShiftAcked {
         result: Result<String, String>,
     },
 }
@@ -200,6 +206,8 @@ const STATE_WATCH_EXACT_NAMES: &[&str] = &[
     "work.jsonl",
     "dag-queue.json",
     "agy-quota.json",
+    "quota-rate-shift.json",
+    "quota-rate-ack.json",
 ];
 const STATE_WATCH_SUFFIXES: &[&str] = &[".slot"];
 
@@ -552,6 +560,15 @@ fn spawn_worker(
                     let result = client.switch_agy_account(&id);
                     if tx_ev
                         .send(WorkerEvent::AgyAccountSwitched { id, result })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                WorkerCmd::AckQuotaRateShift { account } => {
+                    let result = client.ack_quota_rate_shift(account.as_deref());
+                    if tx_ev
+                        .send(WorkerEvent::QuotaRateShiftAcked { result })
                         .is_err()
                     {
                         break;
@@ -952,6 +969,20 @@ fn main() {
                         last_refresh = Instant::now();
                     }
                 }
+                WorkerEvent::QuotaRateShiftAcked { result } => {
+                    match result {
+                        Ok(msg) => app.set_toast(msg),
+                        Err(err) => {
+                            let first_line = err.lines().next().unwrap_or("确认失败");
+                            app.set_toast(format!("确认费率变化失败：{first_line}"));
+                        }
+                    }
+                    if !refresh_in_flight {
+                        refresh_in_flight = true;
+                        let _ = tx_worker.send(WorkerCmd::Refresh { force: true });
+                        last_refresh = Instant::now();
+                    }
+                }
             }
         }
 
@@ -1067,6 +1098,13 @@ fn main() {
                             AppAction::SwitchAgyAccount(id) => {
                                 app.set_toast(format!("正在切换到 agy 账号 {id}…"));
                                 let _ = tx_worker.send(WorkerCmd::SwitchAgyAccount { id });
+                            }
+                            AppAction::AckQuotaRateShift(account) => {
+                                match account.as_deref() {
+                                    Some(acct) => app.set_toast(format!("正在确认 {acct} 的费率变化…")),
+                                    None => app.set_toast("正在确认全部费率变化…"),
+                                }
+                                let _ = tx_worker.send(WorkerCmd::AckQuotaRateShift { account });
                             }
                             AppAction::RefreshQuota => {
                                 if !quota_in_flight {

@@ -2510,46 +2510,67 @@ fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
         ))
     } else {
         // Bottom bar lists only keys that actually act on the current page.
-        let keys = match app.tab {
+        let keys: String = match app.tab {
             ViewTab::Overview => {
                 if area.width >= NARROW_BREAKPOINT {
-                    " 1-5/[] 切页  jk 选择  Tab 切区  Enter 跳详情/看结论  Space 折叠  Q 刷额度  r 刷新  ? 帮助  q 退出"
+                    " 1-5/[] 切页  jk 选择  Tab 切区  Enter 跳详情/看结论  Space 折叠  Q 刷额度  r 刷新  ? 帮助  q 退出".to_string()
                 } else {
-                    " 1-5切页 jk滚 Tab切区 Enter下钻 Q刷额度 r刷 ?助 q退"
+                    " 1-5切页 jk滚 Tab切区 Enter下钻 Q刷额度 r刷 ?助 q退".to_string()
                 }
             }
             ViewTab::Work => {
                 if area.width >= NARROW_BREAKPOINT {
-                    " 1-5 切页  jk 选  Space 折叠  Tab 滚右卡  t 跳运行  o 等你  x 已否  p 挑候选  / 过滤  y 复制  ? 帮助  q 退出"
+                    " 1-5 切页  jk 选  Space 折叠  Tab 滚右卡  t 跳运行  o 等你  x 已否  p 挑候选  / 过滤  y 复制  ? 帮助  q 退出".to_string()
                 } else if area.width >= COMPACT_BREAKPOINT {
-                    " 1-5切页 jk选 Enter卡 Space折 t跳运行 o等你 x已否 /滤 y复 ?助 q退"
+                    " 1-5切页 jk选 Enter卡 Space折 t跳运行 o等你 x已否 /滤 y复 ?助 q退".to_string()
                 } else {
-                    " ↑↓选 Enter卡 t运行 o等你 x已否 1-5页 q退"
+                    " ↑↓选 Enter卡 t运行 o等你 x已否 1-5页 q退".to_string()
                 }
             }
             ViewTab::Runs => {
                 if area.width >= NARROW_BREAKPOINT {
-                    " 1-5 切页  jk 选  Tab 切栏  v 按态/按仓  Enter 全文  d diff  w 跳工作  a/c/s/p 命令  y 复制  ? 帮助  q 退出"
+                    " 1-5 切页  jk 选  Tab 切栏  v 按态/按仓  Enter 全文  d diff  w 跳工作  a/c/s/p 命令  y 复制  ? 帮助  q 退出".to_string()
                 } else {
-                    " 1-5切页 jk选 Tab栏 v分组 Enter文 d diff w工作 a/c/s/p ?助 q退"
+                    " 1-5切页 jk选 Tab栏 v分组 Enter文 d diff w工作 a/c/s/p ?助 q退".to_string()
                 }
             }
             ViewTab::Quota => {
+                let (unacked_cnt, acked_cnt) = app.selected_quota_shift_counts();
                 if area.width >= NARROW_BREAKPOINT {
-                    " 1-5 切页  jk 选账号  u 手动切号  i 显隐全称  Space 展开模型  Q 刷新额度  y 复制  Tab 切栏  ? 帮助  q 退出"
+                    let mut s = " 1-5 切页  jk 选账号  u 手动切号  i 显隐全称  Space 展开模型  Q 刷新额度".to_string();
+                    if unacked_cnt > 0 {
+                        s.push_str("  a 确认费率");
+                    }
+                    if acked_cnt > 0 || app.quota_acked_shifts_expanded {
+                        if app.quota_acked_shifts_expanded {
+                            s.push_str("  e 收起已确认");
+                        } else {
+                            s.push_str("  e 展开已确认");
+                        }
+                    }
+                    s.push_str("  y 复制  Tab 切栏  ? 帮助  q 退出");
+                    s
                 } else {
-                    " 1-5切页 jk选 u切号 i全称 Space模型 Q刷额度 Tab栏 ?助 q退"
+                    let mut s = " 1-5切页 jk选 u切号 i全称 Space模型 Q刷额度".to_string();
+                    if unacked_cnt > 0 {
+                        s.push_str(" a确认");
+                    }
+                    if acked_cnt > 0 || app.quota_acked_shifts_expanded {
+                        s.push_str(" e已确认");
+                    }
+                    s.push_str(" Tab栏 ?助 q退");
+                    s
                 }
             }
             ViewTab::Events => {
                 if area.width >= NARROW_BREAKPOINT {
-                    " 1-5 切页  jk 选  f 跟随  l 显隐槽位  t/Enter 跳运行  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出"
+                    " 1-5 切页  jk 选  f 跟随  l 显隐槽位  t/Enter 跳运行  Tab 切栏  / 过滤  r 刷新  ? 帮助  q 退出".to_string()
                 } else {
-                    " 1-5切页 jk选 f跟随 l槽位 t/Enter运行 Tab栏 /滤 ?助 q退"
+                    " 1-5切页 jk选 f跟随 l槽位 t/Enter运行 Tab栏 /滤 ?助 q退".to_string()
                 }
             }
         };
-        Line::from(Span::styled(truncate(keys, w), muted()))
+        Line::from(Span::styled(truncate(&keys, w), muted()))
     };
     frame.render_widget(Paragraph::new(line2), rows[1]);
 }
@@ -2724,7 +2745,7 @@ fn render_help_modal(frame: &mut Frame, area: Rect) {
         ("o / x / p", "工作页：仅看等你 / 仅看已否 / 挑候选草稿"),
         ("v / d", "运行页：切按状态·按仓库分组 / 打开 Diff 浮层"),
         ("a / c / s / p", "运行页：apply / clean / stop / reply 命令弹窗"),
-        ("u / i", "额度页：手动切号确认（绝不自动换号） / 显隐全称"),
+        ("u / i / a / e", "额度页：手动切号 / 显隐全称 / 确认费率变化 / 展收已确认"),
         ("f / l", "事件页：开关跟随最新 / 显隐槽位事件"),
         ("? / q / Ctrl-C", "帮助 / 关闭浮层或退出"),
     ];

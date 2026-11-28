@@ -3967,11 +3967,6 @@ fn main_inner(args: &[String]) -> Res<i32> {
                 if let Some(ref line) = warn_line {
                     println!("{line}");
                 }
-                if let Some(rs_line) = pulse::format_rate_shift_alert_line_in(&state_root, now_ts) {
-                    if warn_line.as_deref() != Some(rs_line.as_str()) {
-                        println!("{rs_line}");
-                    }
-                }
                 let mut counts = format!(
                     "运行中 {running} · 待合入 {pending_apply} · 待回答 {pending_question} · 排队 {queued}"
                 );
