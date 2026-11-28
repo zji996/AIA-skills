@@ -2,9 +2,12 @@
 
 ## Unreleased
 
-- `delegate`：`delegate lane` 新增长时间无进展卡住检测与提醒（不自动 kill、不设超时）——`_cmd-out` 运行期节流更新 `<run>/cmd-out/.active` 累计字节数（退出清理），`lane` 沿用 `Stdio::inherit` 并在现有等待循环中按 `<state>/events.jsonl` 同仓+归一化命令前缀 `lane_released` 历史 p75×2（冷启动回退 `stall.accept`，支持 `DELEGATE_LANE_STALL_MULTIPLIER` / `DELEGATE_LANE_STALL_WINDOW`）与近窗口进程树 CPU 增量 <1% 且 `.active` 字节未变判定疑似卡住；触发时写手侧 stderr 打印中文提示并写 `kind:"lane"` `stall-warning.json`（与 `agents.rs` 警告互不覆盖、恢复或退出时清理），`delegate status` 标「疑似卡住」并展示最深阻塞进程 PID/comm/wchan，`delegate wait --machine` 立即唤醒输出事件与下一步并按 seq/时间戳去重。
-- `delegate`：修复 `clean --finished` 与后台 `_gc-worker` 并发检测/回收同一 run 时的偶发竞态——为 `<run>/apply.lock` 区分 `apply` 与 `maintenance` 持有者角色，使 `detect_applied` 与前台 `clean` 遇到 `_gc-worker` 持锁时阻塞等其释放再查 `.applied`（不按次数或时长截断），遇到真实前台 `apply`/`land` 持锁则判为未定并跳过留待下次清理、绝不误判为未合入，同时移除 `runs::remove_after_apply` 中多余的 `remove_file("exit_code")` 以消除瞬时误判 `"starting"` 的窗口。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
+
+## delegate 6.59.0 - 2026-11-28
+
+- `delegate` 6.59.0：`delegate lane` 新增长时间无进展卡住检测与提醒（不自动 kill、不设超时）——`_cmd-out` 运行期节流更新 `<run>/cmd-out/.active` 累计字节数（退出清理），`lane` 沿用 `Stdio::inherit` 并在现有等待循环中按 `<state>/events.jsonl` 同仓+归一化命令前缀 `lane_released` 历史 p75×2（冷启动回退 `stall.accept`，支持 `DELEGATE_LANE_STALL_MULTIPLIER` / `DELEGATE_LANE_STALL_WINDOW`）与近窗口进程树 CPU 增量 <1% 且 `.active` 字节未变判定疑似卡住；触发时写手侧 stderr 打印中文提示并写 `kind:"lane"` `stall-warning.json`（与 `agents.rs` 警告互不覆盖、恢复或退出时清理），`delegate status` 标「疑似卡住」并展示最深阻塞进程 PID/comm/wchan，`delegate wait --machine` 立即唤醒输出事件与下一步并按 seq/时间戳去重。
+- `delegate` 6.59.0：修复 `clean --finished` 与后台 `_gc-worker` 并发检测/回收同一 run 时的偶发竞态——为 `<run>/apply.lock` 区分 `apply` 与 `maintenance` 持有者角色，使 `detect_applied` 与前台 `clean` 遇到 `_gc-worker` 持锁时阻塞等其释放再查 `.applied`（不按次数或时长截断），遇到真实前台 `apply`/`land` 持锁则判为未定并跳过留待下次清理、绝不误判为未合入，同时移除 `runs::remove_after_apply` 中多余的 `remove_file("exit_code")` 以消除瞬时误判 `"starting"` 的窗口。
 
 ## delegate 6.58.0 - 2026-11-28
 
