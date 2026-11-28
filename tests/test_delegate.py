@@ -4085,6 +4085,7 @@ cargo check --package small; echo $? > "$DELEGATE_RUN_DIR/prefix-code"
         self.assertNotIn("applied", self.outcome(self.cli("status", state["run"])))
         # clean --finished keeps it because "later" does not match frozen final file "task".
         self.assertEqual(self.cli("clean", "--finished").returncode, 0)
+        settle_supervisors(self.work / "runs")
         self.assertTrue(Path(state["dir"]).is_dir())
         (repo / "a.txt").write_text("task\n")
         run = Path(state["dir"])
@@ -4119,6 +4120,7 @@ cargo check --package small; echo $? > "$DELEGATE_RUN_DIR/prefix-code"
         second = self.outcome(self.cli("reply", "--wait", first["run"], "continue"))
         (repo / "b.txt").write_text("second\n")
         self.assertEqual(self.cli("clean", "--finished").returncode, 0)
+        settle_supervisors(self.work / "runs")
         self.assertTrue(Path(second["dir"]).is_dir())  # a.txt not yet merged
         (repo / "a.txt").write_text("first\n")
         self.assertEqual(self.cli("clean", "--finished").returncode, 0)

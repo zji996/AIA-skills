@@ -1506,9 +1506,27 @@ fn clean(args: &[String]) -> Res<i32> {
             if archive::is_record(&run) {
                 continue;
             }
+            if runs::settled_apply_lock_owner(&run) == runs::ApplyLockOwner::Apply {
+                eprintln!(
+                    "delegate: skip run {} (apply in flight)",
+                    run.file_name().unwrap_or_default().to_string_lossy()
+                );
+                continue;
+            }
             if !runs::active(&runs::state(&run)) {
                 let m = json(run.join("meta.json"));
-                worktree::detect_applied(&run, &m);
+                if worktree::detect_applied_outcome(&run, &m)
+                    == worktree::DetectAppliedOutcome::Undecided
+                {
+                    eprintln!(
+                        "delegate: skip run {} (apply in flight)",
+                        run.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                    continue;
+                }
+            }
+            if !run.is_dir() {
+                continue;
             }
             if has(&flags, "--force")
                 || (run.join(".delivered").exists() && !runs::unmerged(&run))
@@ -1548,6 +1566,9 @@ fn clean(args: &[String]) -> Res<i32> {
             }
             continue;
         }
+        if !run.is_dir() {
+            continue;
+        }
         let st = runs::state(&run);
         let name = run.file_name().unwrap_or_default().to_string_lossy().into_owned();
         if pending_reply::status(&run).is_some() && !has(&flags, "--force") {
@@ -1565,7 +1586,36 @@ fn clean(args: &[String]) -> Res<i32> {
         // W026 fix: detect if changes are already in working tree or HEAD BEFORE archiving/removing,
         // even under `clean --force`, so `run_applied` dependencies unlock cleanly!
         let pre_meta = json(run.join("meta.json"));
-        worktree::detect_applied(&run, &pre_meta);
+        if worktree::detect_applied_outcome(&run, &pre_meta)
+            == worktree::DetectAppliedOutcome::Undecided
+        {
+            eprintln!("delegate: skip active run {name} (apply in flight)");
+            continue;
+        }
+        // Serialize archive + trash staging against `_gc-worker` (`remove_after_apply` /
+        // `auto_clean_run`) and skip runs with an active foreground `delegate apply`/`land`.
+        let _clean_apply_guard = match runs::acquire_apply_guard_for_maintenance(&run) {
+            Ok(Some(guard)) => guard,
+            Ok(None) | Err(_) => {
+                if !run.is_dir() {
+                    continue;
+                }
+                eprintln!("delegate: skip active run {name} (apply in flight)");
+                continue;
+            }
+        };
+        if !run.is_dir() {
+            continue;
+        }
+        let st = runs::state(&run);
+        if runs::active(&st) || runs::agent_alive(&run) {
+            if runs::active(&st) {
+                eprintln!("delegate: skip active run {name}");
+            } else {
+                eprintln!("delegate: skip active run {name} (its agent outlived the supervisor; stop it first: {} stop {name})",script().display());
+            }
+            continue;
+        }
         let note = if runs::unmerged(&run) {
             "; its worktree was never applied"
         } else {
@@ -1620,6 +1670,7 @@ fn clean(args: &[String]) -> Res<i32> {
             }),
         );
         events::mark_run_read(&run_id_for_ev);
+        drop(_clean_apply_guard);
 
         let containers = if sync_gc {
             let _ = gc::execute_job_inner(&job_path, false);

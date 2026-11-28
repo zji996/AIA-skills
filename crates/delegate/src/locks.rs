@@ -322,6 +322,24 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+/// Open (or create) `path` WITHOUT creating missing parent directories.
+/// Returns `io::ErrorKind::NotFound` if the parent directory has been removed or renamed away.
+fn open_lock_file_existing_parent(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+}
+
+fn same_inode(f: &File, path: &Path) -> bool {
+    match (f.metadata(), fs::metadata(path)) {
+        (Ok(fm), Ok(pm)) => fm.dev() == pm.dev() && fm.ino() == pm.ino(),
+        _ => false,
+    }
+}
+
 fn current_cmdline() -> String {
     let args: Vec<String> = std::env::args().collect();
     if args.is_empty() {
@@ -337,13 +355,16 @@ fn current_cmdline() -> String {
     }
 }
 
-fn write_owner_metadata(f: &mut File, kind: LockKind) {
-    let payload = json!({
+fn write_owner_metadata_with_role(f: &mut File, kind: LockKind, role: Option<&str>) {
+    let mut payload = json!({
         "pid": std::process::id(),
         "cmd": current_cmdline(),
         "kind": kind.name(),
         "at": iso(),
     });
+    if let Some(role) = role {
+        payload["role"] = json!(role);
+    }
     let text = format!("{payload}\n");
     if f.seek(SeekFrom::Start(0)).is_ok() && f.set_len(0).is_ok() {
         let _ = f.write_all(text.as_bytes());
@@ -472,6 +493,99 @@ fn read_owner_file(path: &Path) -> Option<(u32, String)> {
     Some((pid, cmd))
 }
 
+/// Observed owner of an advisory lock file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LockOwner {
+    /// No process currently holds the advisory lock (or lock file does not exist).
+    Unlocked,
+    /// A live holder holds the lock and its owner metadata is visible.
+    Held { role: Option<String>, cmd: String },
+    /// A live holder holds the kernel lock, but its owner metadata has not been updated yet.
+    Initializing,
+}
+
+fn parse_owner_metadata(path: &Path) -> Option<(u32, Option<String>, String)> {
+    let text = fs::read_to_string(path).ok()?;
+    let v = serde_json::from_str::<Value>(text.trim()).ok()?;
+    let pid = v.get("pid")?.as_u64()? as u32;
+    let role = v.get("role").and_then(Value::as_str).map(str::to_string);
+    let cmd = v
+        .get("cmd")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Some((pid, role, cmd))
+}
+
+/// Non-`/proc/locks` fallback for `inspect_owner`: verifies whether another open file description
+/// actually holds `flock` via a non-blocking zero-write probe (without creating missing parents)
+/// before trusting the owner JSON file.
+fn inspect_owner_via_flock_probe(path: &Path) -> LockOwner {
+    let Ok(probe) = OpenOptions::new().read(true).write(true).open(path) else {
+        return LockOwner::Unlocked;
+    };
+    match flock_raw(probe.as_raw_fd(), true, true) {
+        Ok(()) => {
+            drop(probe);
+            LockOwner::Unlocked
+        }
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            if let Some((owner_pid, role, cmd)) = parse_owner_metadata(path) {
+                if crate::common::pid_alive(owner_pid as i32) {
+                    return LockOwner::Held { role, cmd };
+                }
+            }
+            LockOwner::Initializing
+        }
+        Err(_) => LockOwner::Unlocked,
+    }
+}
+
+/// Read-only lookup of a current `/proc/locks` holder's command line for `path` (if available).
+pub fn holder_cmdline_readonly(path: &Path) -> Option<String> {
+    let meta = fs::metadata(path).ok()?;
+    let content = fs::read_to_string("/proc/locks").ok()?;
+    let dev = meta.dev();
+    let major = libc::major(dev) as u64;
+    let minor = libc::minor(dev) as u64;
+    let ino = meta.ino();
+    for pid in parse_proc_locks_holders(&content, major, minor, ino) {
+        if let Some(cmd) = read_proc_cmdline(pid) {
+            if !cmd.is_empty() {
+                return Some(cmd);
+            }
+        }
+    }
+    None
+}
+
+/// Inspect the current owner of `path`, verifying against `/proc/locks` when readable so stale
+/// owner metadata from an earlier holder cannot be misattributed to a newly-arrived holder.
+pub fn inspect_owner(path: &Path) -> LockOwner {
+    if !path.is_file() {
+        return LockOwner::Unlocked;
+    }
+
+    if let (Ok(meta), Ok(content)) = (fs::metadata(path), fs::read_to_string("/proc/locks")) {
+        let dev = meta.dev();
+        let major = libc::major(dev) as u64;
+        let minor = libc::minor(dev) as u64;
+        let ino = meta.ino();
+        let holders = parse_proc_locks_holders(&content, major, minor, ino);
+        if holders.is_empty() {
+            return LockOwner::Unlocked;
+        }
+        if let Some((owner_pid, role, cmd)) = parse_owner_metadata(path) {
+            if holders.contains(&owner_pid) {
+                return LockOwner::Held { role, cmd };
+            }
+        }
+        return LockOwner::Initializing;
+    }
+
+    inspect_owner_via_flock_probe(path)
+}
+
 /// Build a human-readable diagnostic describing who holds `path` (report only, never kill).
 pub fn describe_holder(file: &File, path: &Path) -> String {
     let proc_holders = proc_locks_holders(file);
@@ -548,12 +662,22 @@ pub fn try_acquire_opts(
     exclusive: bool,
     record_owner: bool,
 ) -> io::Result<LockGuard> {
+    try_acquire_inner(kind, path, exclusive, record_owner, None)
+}
+
+fn try_acquire_inner(
+    kind: LockKind,
+    path: &Path,
+    exclusive: bool,
+    record_owner: bool,
+    role: Option<&str>,
+) -> io::Result<LockGuard> {
     trace_state_lock_attempt(kind, "try");
     check_order(kind, path);
     let mut f = open_lock_file(path)?;
     flock_raw(f.as_raw_fd(), exclusive, true)?;
     if exclusive && record_owner {
-        write_owner_metadata(&mut f, kind);
+        write_owner_metadata_with_role(&mut f, kind, role);
     }
     push_held(kind, path.to_path_buf());
     Ok(LockGuard {
@@ -590,12 +714,111 @@ pub fn acquire(kind: LockKind, path: &Path, exclusive: bool) -> io::Result<LockG
     acquire_opts(kind, path, exclusive, exclusive)
 }
 
+/// Blocking acquisition recording an explicit `"role"` in owner metadata.
+pub fn acquire_with_role(
+    kind: LockKind,
+    path: &Path,
+    exclusive: bool,
+    role: &str,
+) -> io::Result<LockGuard> {
+    acquire_inner(kind, path, exclusive, exclusive, Some(role))
+}
+
+/// Non-blocking single attempt (`LOCK_NB`) on an existing parent directory (never calls
+/// `create_dir_all`), verifying `(dev, ino)` before writing owner metadata.
+/// - Returns `Ok(None)` if the parent directory is missing or moved away before/during lock.
+/// - Returns `Err(WouldBlock)` if another holder owns the lock or the path inode changed.
+pub fn try_acquire_existing_parent_with_role(
+    kind: LockKind,
+    path: &Path,
+    exclusive: bool,
+    role: &str,
+) -> io::Result<Option<LockGuard>> {
+    trace_state_lock_attempt(kind, "try");
+    check_order(kind, path);
+    let mut f = match open_lock_file_existing_parent(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    flock_raw(f.as_raw_fd(), exclusive, true)?;
+    if !path.parent().is_some_and(Path::is_dir) {
+        return Ok(None);
+    }
+    if !same_inode(&f, path) {
+        return if path.parent().is_some_and(Path::is_dir) {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        } else {
+            Ok(None)
+        };
+    }
+    if exclusive {
+        write_owner_metadata_with_role(&mut f, kind, Some(role));
+    }
+    push_held(kind, path.to_path_buf());
+    Ok(Some(LockGuard {
+        file: f,
+        kind,
+        path: path.to_path_buf(),
+    }))
+}
+
+/// True kernel-blocking `flock` acquisition (no retry-count or duration cutoff) on an existing
+/// parent directory (never calls `create_dir_all`), verifying `(dev, ino)` after waking up and
+/// before writing owner metadata.
+/// - Returns `Ok(None)` if the parent directory disappeared or was renamed away before/while waiting.
+/// - Returns `Err(WouldBlock)` if the parent still exists but `path` now points to a different inode.
+pub fn acquire_blocking_existing_parent_with_role(
+    kind: LockKind,
+    path: &Path,
+    exclusive: bool,
+    role: &str,
+) -> io::Result<Option<LockGuard>> {
+    trace_state_lock_attempt(kind, "acquire");
+    check_order(kind, path);
+    let mut f = match open_lock_file_existing_parent(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    flock_raw(f.as_raw_fd(), exclusive, false)?;
+    if !path.parent().is_some_and(Path::is_dir) {
+        return Ok(None);
+    }
+    if !same_inode(&f, path) {
+        return if path.parent().is_some_and(Path::is_dir) {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        } else {
+            Ok(None)
+        };
+    }
+    if exclusive {
+        write_owner_metadata_with_role(&mut f, kind, Some(role));
+    }
+    push_held(kind, path.to_path_buf());
+    Ok(Some(LockGuard {
+        file: f,
+        kind,
+        path: path.to_path_buf(),
+    }))
+}
+
 /// Blocking acquisition with explicit control over whether owner metadata is written into the file.
 pub fn acquire_opts(
     kind: LockKind,
     path: &Path,
     exclusive: bool,
     record_owner: bool,
+) -> io::Result<LockGuard> {
+    acquire_inner(kind, path, exclusive, record_owner, None)
+}
+
+fn acquire_inner(
+    kind: LockKind,
+    path: &Path,
+    exclusive: bool,
+    record_owner: bool,
+    role: Option<&str>,
 ) -> io::Result<LockGuard> {
     trace_state_lock_attempt(kind, "acquire");
     check_order(kind, path);
@@ -604,7 +827,7 @@ pub fn acquire_opts(
     match flock_raw(f.as_raw_fd(), exclusive, true) {
         Ok(()) => {
             if exclusive && record_owner {
-                write_owner_metadata(&mut f, kind);
+                write_owner_metadata_with_role(&mut f, kind, role);
             }
             push_held(kind, path.to_path_buf());
             return Ok(LockGuard {
@@ -630,7 +853,7 @@ pub fn acquire_opts(
         match flock_raw(f.as_raw_fd(), exclusive, true) {
             Ok(()) => {
                 if exclusive && record_owner {
-                    write_owner_metadata(&mut f, kind);
+                    write_owner_metadata_with_role(&mut f, kind, role);
                 }
                 push_held(kind, path.to_path_buf());
                 return Ok(LockGuard {
@@ -777,6 +1000,98 @@ mod tests {
         assert_eq!(kind, io::ErrorKind::WouldBlock);
         assert!(elapsed < Duration::from_secs(2));
         drop(holder);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn inspect_owner_distinguishes_apply_maintenance_and_unlocked() {
+        let path = temp_lock("role.lock");
+        assert_eq!(inspect_owner(&path), LockOwner::Unlocked);
+
+        let guard = acquire_with_role(LockKind::ApplyRun, &path, true, "apply").unwrap();
+        assert!(matches!(
+            inspect_owner(&path),
+            LockOwner::Held { ref role, .. } if role.as_deref() == Some("apply")
+        ));
+        drop(guard);
+        assert_eq!(inspect_owner(&path), LockOwner::Unlocked);
+
+        let mguard = try_acquire_existing_parent_with_role(
+            LockKind::ApplyRun,
+            &path,
+            true,
+            "maintenance",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            inspect_owner(&path),
+            LockOwner::Held { ref role, .. } if role.as_deref() == Some("maintenance")
+        ));
+        drop(mguard);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn inspect_owner_via_flock_probe_handles_stale_live_pid_dead_pid_and_held_lock() {
+        use std::sync::mpsc;
+
+        let path = temp_lock("probe.lock");
+        // 1. After dropping a guard held by this (still-alive!) process, probe must see Unlocked,
+        //    not falsely report Held based on `pid_alive`.
+        let guard = acquire_with_role(LockKind::ApplyRun, &path, true, "apply").unwrap();
+        drop(guard);
+        assert_eq!(inspect_owner_via_flock_probe(&path), LockOwner::Unlocked);
+
+        // 2. Stale dead-PID metadata on an unlocked file must also report Unlocked.
+        fs::write(
+            &path,
+            r#"{"pid":999999999,"cmd":"delegate apply","kind":"ApplyRun","role":"apply"}"#,
+        )
+        .unwrap();
+        assert_eq!(inspect_owner_via_flock_probe(&path), LockOwner::Unlocked);
+
+        // 3. Actively held lock by another thread with role="apply" reports Held.
+        let (tx_locked, rx_locked) = mpsc::channel();
+        let (tx_release, rx_release) = mpsc::channel();
+        let p_holder = path.clone();
+        let holder = std::thread::spawn(move || {
+            let g = acquire_with_role(LockKind::ApplyRun, &p_holder, true, "apply").unwrap();
+            tx_locked.send(()).unwrap();
+            rx_release.recv().unwrap();
+            drop(g);
+        });
+        rx_locked.recv().unwrap();
+        assert!(matches!(
+            inspect_owner_via_flock_probe(&path),
+            LockOwner::Held { ref role, .. } if role.as_deref() == Some("apply")
+        ));
+        tx_release.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(inspect_owner_via_flock_probe(&path), LockOwner::Unlocked);
+
+        // 4. Actively held lock with empty file (no owner JSON yet) reports Initializing.
+        let (tx_raw, rx_raw) = mpsc::channel();
+        let (tx_raw_rel, rx_raw_rel) = mpsc::channel();
+        let p_raw = path.clone();
+        let raw_holder = std::thread::spawn(move || {
+            let f = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&p_raw)
+                .unwrap();
+            flock_raw(f.as_raw_fd(), true, false).unwrap();
+            tx_raw.send(()).unwrap();
+            rx_raw_rel.recv().unwrap();
+            drop(f);
+        });
+        rx_raw.recv().unwrap();
+        assert_eq!(inspect_owner_via_flock_probe(&path), LockOwner::Initializing);
+        tx_raw_rel.send(()).unwrap();
+        raw_holder.join().unwrap();
+
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }

@@ -1095,28 +1095,45 @@ pub fn is_applied_committed_in_head(run: &Path, meta: &Value) -> bool {
     entries_match_head(root, &entries)
 }
 
+/// Outcome of write-path manual-merge detection (`detect_applied_outcome`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetectAppliedOutcome {
+    /// Confirmed applied (already had `.applied`, or just detected and persisted `.applied`).
+    Applied,
+    /// Confirmed not applied in the source repository.
+    NotApplied,
+    /// Foreground `delegate apply`/`land` currently holds `<run>/apply.lock`; status is
+    /// undecided right now — caller must skip and defer to a later `clean`, never classify
+    /// the run as unmerged.
+    Undecided,
+}
+
 /// Write-path detection: checks if `run`'s changes are already in the source repo (working tree
 /// or HEAD), and if so persists `.applied`, updates `meta.json`, history, events, work table,
 /// and board. Must ONLY be called from write paths (`clean`, `apply`, `merge`, workers) — never
 /// from read paths (`status`, `work`, `events`, `snapshot`).
 pub fn detect_applied(run: &Path, meta: &Value) -> bool {
-    if run.join(".applied").exists() {
-        return true;
+    detect_applied_outcome(run, meta) == DetectAppliedOutcome::Applied
+}
+
+pub fn detect_applied_outcome(run: &Path, meta: &Value) -> DetectAppliedOutcome {
+    if !run.is_dir() {
+        return DetectAppliedOutcome::NotApplied;
     }
-    if crate::runs::apply_in_flight(run) {
-        return false;
+    if run.join(".applied").exists() {
+        return DetectAppliedOutcome::Applied;
+    }
+    if crate::runs::settled_apply_lock_owner(run) == crate::runs::ApplyLockOwner::Apply {
+        return DetectAppliedOutcome::Undecided;
     }
     if !is_applied_in_repo_readonly(run, meta) {
-        return false;
+        if crate::runs::settled_apply_lock_owner(run) == crate::runs::ApplyLockOwner::Apply {
+            return DetectAppliedOutcome::Undecided;
+        }
+        return DetectAppliedOutcome::NotApplied;
     }
-    // Hold `<run>/apply.lock` (`LOCK_NB`) across `.applied`/`meta.json`/history/events writes
-    // and re-check `.applied` after locking so an `apply` started concurrently cannot race.
-    let Ok(Some(_apply_guard)) = crate::runs::try_acquire_apply_guard(run) else {
-        return false;
-    };
-    if run.join(".applied").exists() {
-        return true;
-    }
+    // Prepare payload before acquiring `<run>/apply.lock` so `.applied` is written immediately
+    // after locking and the critical section stays minimal.
     let rec = json(run.join("changes.json"));
     let entries = recorded_entries(run, meta, &rec).unwrap_or_default();
     let root = Path::new(s(&meta["worktree"], "source"));
@@ -1126,10 +1143,32 @@ pub fn detect_applied(run: &Path, meta: &Value) -> bool {
             large_hashes.insert(path.clone(), entry["hash"].clone());
         }
     }
-    let at = iso();
     let head = read_git_head(root)
         .or_else(|| git_text(root, &["rev-parse", "HEAD"]).ok())
         .unwrap_or_default();
+    // Hold `<run>/apply.lock` across `.applied`/`meta.json`/history/events writes and re-check
+    // `.applied` and `run.is_dir()` after locking:
+    // - If another maintenance caller (e.g. `_gc-worker`'s `detect_applied`) holds the lock,
+    //   block until it releases and then observe `.applied` (P9: no retry count or timeout).
+    // - If the run directory was moved/removed while waiting, bail without resurrecting it.
+    // - If foreground `delegate apply`/`land` holds the lock (`role == "apply"`), return
+    //   `Undecided` so `clean` skips this run without misclassifying it as unmerged.
+    let Ok(Some(_apply_guard)) = crate::runs::acquire_apply_guard_for_maintenance(run) else {
+        return if !run.is_dir() {
+            DetectAppliedOutcome::NotApplied
+        } else if run.join(".applied").exists() {
+            DetectAppliedOutcome::Applied
+        } else {
+            DetectAppliedOutcome::Undecided
+        };
+    };
+    if !run.is_dir() {
+        return DetectAppliedOutcome::NotApplied;
+    }
+    if run.join(".applied").exists() {
+        return DetectAppliedOutcome::Applied;
+    }
+    let at = iso();
     let ok = write_json(
         run.join(".applied"),
         &json!({"at":at,"head":head,"tree":rec["after"],"large":rec["afterLarge"],"largeHashes":large_hashes,"appliedBy":"detected"}),
@@ -1248,7 +1287,11 @@ pub fn detect_applied(run: &Path, meta: &Value) -> bool {
         let _ = crate::work::on_runs_applied(&applied_batch, None);
         crate::board::refresh_for_run(run);
     }
-    ok
+    if ok {
+        DetectAppliedOutcome::Applied
+    } else {
+        DetectAppliedOutcome::NotApplied
+    }
 }
 
 pub struct MarkAppliedResult {
@@ -5984,5 +6027,243 @@ mod tests {
         let bad = json!({"generated":{"paths":["gen/"],"command":"true","isolateTarget":"auto"}});
         assert!(generated_config(&bad, Path::new(".delegate.json")).is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detect_applied_blocks_on_maintenance_holder_and_returns_undecided_for_apply_holder() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Arc,
+        };
+        use std::time::{Duration, Instant};
+
+        let base = std::env::temp_dir().join(format!(
+            "delegate-detect-applied-race-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let repo = base.join("repo");
+        let run = base.join("runs/20261128-134500-race");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&run).unwrap();
+        let content = b"first\n";
+        fs::write(repo.join("a.txt"), content).unwrap();
+        let entry = final_entry(&repo, "a.txt").expect("final_entry for a.txt");
+        let meta = json!({
+            "run": "20261128-134500-race",
+            "name": "race",
+            "mode": "write",
+            "worktree": {"path": base.join("wt"), "source": repo}
+        });
+        fs::write(run.join("meta.json"), meta.to_string()).unwrap();
+        fs::write(run.join("exit_code"), "0\n").unwrap();
+        fs::write(
+            run.join("changes.json"),
+            json!({"finalEntries": {"a.txt": entry}}).to_string(),
+        )
+        .unwrap();
+
+        // 1. Foreground `apply` holds `apply.lock` (`role == "apply"`): `detect_applied_outcome`
+        //    must classify the run as `Undecided` immediately (never `NotApplied` / unmerged),
+        //    without blocking or writing `.applied`.
+        {
+            let (tx_locked, rx_locked) = mpsc::channel();
+            let (tx_release, rx_release) = mpsc::channel();
+            let run_holder = run.clone();
+            let holder = std::thread::spawn(move || {
+                let guard = crate::runs::acquire_apply_guard(&run_holder).unwrap();
+                tx_locked.send(()).unwrap();
+                rx_release.recv().unwrap();
+                drop(guard);
+            });
+            rx_locked.recv().unwrap();
+
+            let t0 = Instant::now();
+            assert_eq!(
+                detect_applied_outcome(&run, &meta),
+                DetectAppliedOutcome::Undecided,
+                "detect_applied_outcome must return Undecided while foreground apply holds apply.lock"
+            );
+            assert!(
+                t0.elapsed() < Duration::from_secs(1),
+                "detect_applied_outcome should return promptly on apply role, took {:?}",
+                t0.elapsed()
+            );
+            assert!(!run.join(".applied").exists());
+
+            tx_release.send(()).unwrap();
+            holder.join().unwrap();
+        }
+
+        // 2. Another maintenance caller (`_gc-worker`'s `detect_applied`) holds `apply.lock`
+        //    (`role == "maintenance"`), writes `.applied`, and releases: `detect_applied` must
+        //    block until release (no count/duration cutoff) and return `true`.
+        {
+            let (tx_locked, rx_locked) = mpsc::channel();
+            let released = Arc::new(AtomicBool::new(false));
+            let released_holder = Arc::clone(&released);
+            let run_holder = run.clone();
+            let holder = std::thread::spawn(move || {
+                let guard = crate::runs::try_acquire_apply_guard(&run_holder)
+                    .unwrap()
+                    .expect("acquire maintenance guard");
+                tx_locked.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(80));
+                write_json(
+                    run_holder.join(".applied"),
+                    &json!({"at": iso(), "appliedBy": "detected"}),
+                )
+                .unwrap();
+                released_holder.store(true, Ordering::Release);
+                drop(guard);
+            });
+            rx_locked.recv().unwrap();
+
+            assert!(
+                detect_applied(&run, &meta),
+                "detect_applied must block on maintenance holder and observe .applied == true"
+            );
+            assert!(
+                released.load(Ordering::Acquire),
+                "detect_applied must wait for the maintenance holder to release apply.lock"
+            );
+            holder.join().unwrap();
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn detect_applied_does_not_resurrect_run_moved_while_waiting_and_handles_initializing_apply() {
+        use std::os::fd::AsRawFd;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let base = std::env::temp_dir().join(format!(
+            "delegate-detect-applied-move-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let repo = base.join("repo");
+        let run_move = base.join("runs/20261128-142000-move");
+        let trash_dst = base.join("trash/20261128-142000-move");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&run_move).unwrap();
+        fs::create_dir_all(trash_dst.parent().unwrap()).unwrap();
+        fs::write(repo.join("a.txt"), b"first\n").unwrap();
+        let entry = final_entry(&repo, "a.txt").expect("final_entry for a.txt");
+        let meta = json!({
+            "run": "20261128-142000-move",
+            "name": "move",
+            "mode": "write",
+            "worktree": {"path": base.join("wt"), "source": repo}
+        });
+        fs::write(run_move.join("meta.json"), meta.to_string()).unwrap();
+        fs::write(run_move.join("exit_code"), "0\n").unwrap();
+        fs::write(
+            run_move.join("changes.json"),
+            json!({"finalEntries": {"a.txt": entry}}).to_string(),
+        )
+        .unwrap();
+
+        // 1. Another maintenance caller holds `apply.lock`, renames `run_move` into trash (like
+        //    `gc::stage_clean_to_trash`), and releases: `detect_applied` blocked on `flock` must
+        //    return `false` (`NotApplied`) and NEVER recreate `run_move` or write `.applied`.
+        {
+            let (tx_locked, rx_locked) = mpsc::channel();
+            let run_holder = run_move.clone();
+            let trash_holder = trash_dst.clone();
+            let holder = std::thread::spawn(move || {
+                let guard = crate::runs::try_acquire_apply_guard(&run_holder)
+                    .unwrap()
+                    .expect("acquire maintenance guard");
+                tx_locked.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(60));
+                fs::rename(&run_holder, &trash_holder).unwrap();
+                drop(guard);
+            });
+            rx_locked.recv().unwrap();
+
+            assert_eq!(
+                detect_applied_outcome(&run_move, &meta),
+                DetectAppliedOutcome::NotApplied
+            );
+            holder.join().unwrap();
+            assert!(
+                !run_move.exists(),
+                "detect_applied must NOT resurrect a run directory moved into trash"
+            );
+            assert!(
+                !trash_dst.join(".applied").exists(),
+                "detect_applied must NOT write .applied into a moved-away run"
+            );
+            // Missing run directory before locking must also never be recreated.
+            assert!(crate::runs::acquire_apply_guard_for_maintenance(&run_move)
+                .unwrap()
+                .is_none());
+            assert!(!run_move.exists());
+        }
+
+        // 2. Foreground `apply` just acquired `flock` and has not written owner JSON yet
+        //    (`Initializing` window) while working tree does NOT match yet: `detect_applied_outcome`
+        //    must settle owner and return `Undecided`, NEVER `NotApplied` (unmerged).
+        {
+            let run_init = base.join("runs/20261128-142001-init");
+            fs::create_dir_all(&run_init).unwrap();
+            let init_meta = json!({
+                "run": "20261128-142001-init",
+                "name": "init",
+                "mode": "write",
+                "worktree": {"path": base.join("wt2"), "source": repo}
+            });
+            fs::write(run_init.join("meta.json"), init_meta.to_string()).unwrap();
+            fs::write(run_init.join("exit_code"), "0\n").unwrap();
+            fs::write(
+                run_init.join("changes.json"),
+                json!({"finalEntries": {"a.txt": {"mode":"100644","size":9,"hash":"0000000000000000000000000000000000000000"}}}).to_string(),
+            )
+            .unwrap();
+
+            let (tx_locked, rx_locked) = mpsc::channel();
+            let (tx_release, rx_release) = mpsc::channel();
+            let lock_path = run_init.join("apply.lock");
+            let holder = std::thread::spawn(move || {
+                use std::io::Write;
+                let mut f = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)
+                    .unwrap();
+                let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+                assert_eq!(rc, 0);
+                // Signal while file is still empty (`Initializing`).
+                tx_locked.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(10));
+                let payload = json!({
+                    "pid": std::process::id(),
+                    "cmd": "delegate apply",
+                    "kind": "ApplyRun",
+                    "role": "apply",
+                    "at": iso(),
+                });
+                f.write_all(format!("{payload}\n").as_bytes()).unwrap();
+                f.flush().unwrap();
+                rx_release.recv().unwrap();
+                drop(f);
+            });
+            rx_locked.recv().unwrap();
+
+            assert_eq!(
+                detect_applied_outcome(&run_init, &init_meta),
+                DetectAppliedOutcome::Undecided,
+                "detect_applied_outcome must settle Initializing -> Apply and return Undecided"
+            );
+            tx_release.send(()).unwrap();
+            holder.join().unwrap();
+        }
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

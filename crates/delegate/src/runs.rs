@@ -356,22 +356,156 @@ pub fn agent_alive(run: &Path) -> bool {
 /// Acquire `<run>/apply.lock` while `delegate apply`/`land` is actively applying, verifying,
 /// or committing this run.
 pub fn acquire_apply_guard(run: &Path) -> Res<crate::locks::LockGuard> {
-    crate::locks::acquire(crate::locks::LockKind::ApplyRun, &run.join("apply.lock"), true)
-        .map_err(|e| e.to_string())
+    crate::locks::acquire_with_role(
+        crate::locks::LockKind::ApplyRun,
+        &run.join("apply.lock"),
+        true,
+        "apply",
+    )
+    .map_err(|e| e.to_string())
 }
 
-/// Non-blocking attempt (`LOCK_NB`) to acquire `<run>/apply.lock`.
-/// Returns `Ok(None)` if `run` is not a directory (avoiding recreating a deleted run dir)
-/// or another holder currently owns the lock (`WouldBlock`).
+/// Non-blocking attempt (`LOCK_NB`) to acquire `<run>/apply.lock` for a short-lived maintenance
+/// operation (`detect_applied`, `remove_after_apply`, `auto_clean_run`, `clean`).
+/// Never creates missing `<run>` directories; returns `Ok(None)` if `run` is gone or another
+/// holder currently owns the lock (`WouldBlock`).
 pub fn try_acquire_apply_guard(run: &Path) -> std::io::Result<Option<crate::locks::LockGuard>> {
     if !run.is_dir() {
         return Ok(None);
     }
-    match crate::locks::try_acquire(crate::locks::LockKind::ApplyRun, &run.join("apply.lock"), true)
-    {
-        Ok(guard) => Ok(Some(guard)),
+    match crate::locks::try_acquire_existing_parent_with_role(
+        crate::locks::LockKind::ApplyRun,
+        &run.join("apply.lock"),
+        true,
+        "maintenance",
+    ) {
+        Ok(guard) => Ok(guard),
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+/// Observed owner category of `<run>/apply.lock`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplyLockOwner {
+    /// Lock is not held (or lock file absent).
+    Unlocked,
+    /// Foreground `delegate apply` / `delegate land` holds the lock.
+    Apply,
+    /// Short-lived maintenance (`_gc-worker`, `detect_applied`, `remove_after_apply`, `clean`).
+    Maintenance,
+    /// Holder acquired `flock` moments ago and has not finished updating owner metadata yet.
+    Initializing,
+}
+
+/// Inspect who currently holds `<run>/apply.lock`.
+pub fn apply_lock_owner(run: &Path) -> ApplyLockOwner {
+    match crate::locks::inspect_owner(&run.join("apply.lock")) {
+        crate::locks::LockOwner::Unlocked => ApplyLockOwner::Unlocked,
+        crate::locks::LockOwner::Initializing => ApplyLockOwner::Initializing,
+        crate::locks::LockOwner::Held { role, cmd } => match role.as_deref() {
+            Some("apply") => ApplyLockOwner::Apply,
+            Some("maintenance") => ApplyLockOwner::Maintenance,
+            _ => {
+                // Compatibility fallback for older binaries without `"role"` metadata.
+                let is_maint = cmd
+                    .split_whitespace()
+                    .any(|tok| matches!(tok, "_gc-worker" | "clean" | "handoff"));
+                if is_maint {
+                    ApplyLockOwner::Maintenance
+                } else {
+                    ApplyLockOwner::Apply
+                }
+            }
+        },
+    }
+}
+
+/// Inspect `<run>/apply.lock` owner, waiting briefly when a holder just acquired `flock` and is
+/// mid-write of its owner JSON (`Initializing`). If an external holder never writes JSON, inspect
+/// `/proc/<pid>/cmdline` when available or conservatively report `Apply` (undecided) so callers
+/// never misclassify an in-flight `apply` as unmerged and never spin indefinitely.
+pub fn settled_apply_lock_owner(run: &Path) -> ApplyLockOwner {
+    match apply_lock_owner(run) {
+        ApplyLockOwner::Initializing => {}
+        other => return other,
+    }
+    let lock_path = run.join("apply.lock");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        match apply_lock_owner(run) {
+            ApplyLockOwner::Initializing => {
+                if std::time::Instant::now() >= deadline {
+                    if let Some(cmd) = crate::locks::holder_cmdline_readonly(&lock_path) {
+                        if cmd
+                            .split_whitespace()
+                            .any(|tok| matches!(tok, "_gc-worker" | "clean" | "handoff"))
+                        {
+                            return ApplyLockOwner::Maintenance;
+                        }
+                    }
+                    return ApplyLockOwner::Apply;
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Acquire `<run>/apply.lock` for foreground maintenance (`detect_applied`, `clean`) using
+/// owner-aware blocking rather than arbitrary retry counts or timeouts (P9), and without ever
+/// recreating a removed/renamed `<run>` directory:
+/// - If uncontended: acquires immediately with `role = "maintenance"`.
+/// - If held by foreground `delegate apply`/`land` (`ApplyLockOwner::Apply`): returns `Ok(None)`
+///   immediately so callers treat the run as undecided and defer to a later `clean`.
+/// - If held by another short-lived maintenance caller (`ApplyLockOwner::Maintenance`, e.g.
+///   `_gc-worker`'s `detect_applied` or `remove_after_apply`): blocks in kernel `flock` until it
+///   releases (no count or duration cutoff), then verifies `<run>` still exists and matches the
+///   locked inode before writing owner metadata.
+pub fn acquire_apply_guard_for_maintenance(
+    run: &Path,
+) -> std::io::Result<Option<crate::locks::LockGuard>> {
+    let lock_path = run.join("apply.lock");
+    loop {
+        if !run.is_dir() {
+            return Ok(None);
+        }
+        match crate::locks::try_acquire_existing_parent_with_role(
+            crate::locks::LockKind::ApplyRun,
+            &lock_path,
+            true,
+            "maintenance",
+        ) {
+            Ok(Some(guard)) => return Ok(Some(guard)),
+            Ok(None) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
+        }
+        if !run.is_dir() {
+            return Ok(None);
+        }
+        match settled_apply_lock_owner(run) {
+            ApplyLockOwner::Apply | ApplyLockOwner::Initializing => return Ok(None),
+            ApplyLockOwner::Maintenance => {
+                match crate::locks::acquire_blocking_existing_parent_with_role(
+                    crate::locks::LockKind::ApplyRun,
+                    &lock_path,
+                    true,
+                    "maintenance",
+                ) {
+                    Ok(Some(guard)) => return Ok(Some(guard)),
+                    Ok(None) => return Ok(None),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Lock file was replaced with a new inode while waiting; loop and re-check.
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            ApplyLockOwner::Unlocked => {
+                // Holder released between `LOCK_NB` and owner inspection; re-attempt immediately.
+            }
+        }
     }
 }
 
@@ -1446,7 +1580,6 @@ pub fn remove_after_apply(run: &Path) -> (Vec<String>, bool) {
         }
     }
     let _ = write(run.join(".applied-cleaned"), "1\n");
-    let _ = fs::remove_file(run.join("exit_code"));
     let _ = write(run.join("exit_code"), "0\n");
     crate::index::upsert_run(run);
     if !shared
