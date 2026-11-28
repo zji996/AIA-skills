@@ -1344,6 +1344,7 @@ fn command_pi_rpc(meta: &Value, session: Option<&str>) -> Vec<String> {
         s(meta, "sessionDir").into(),
         "--mode".into(),
         "rpc".into(),
+        "--no-skills".into(),
     ]);
     for key in ["provider", "model", "thinking"] {
         if !s(meta, key).is_empty() {
@@ -1708,6 +1709,7 @@ fn command_pi(meta: &Value, session: Option<&str>) -> Vec<String> {
         s(meta, "sessionDir").into(),
         "--mode".into(),
         "json".into(),
+        "--no-skills".into(),
     ]);
     for key in ["provider", "model", "thinking"] {
         if !s(meta, key).is_empty() {

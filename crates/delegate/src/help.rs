@@ -110,7 +110,15 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "hook",
-        "Zero-lock Stop hook kernel (hook check --format claude|agy|json), prioritized pending backlog (hook pending), and weekly telemetry (hook stats).",
+        "Zero-lock Stop hook kernel (hook check --format claude|agy|codex|json), prioritized pending backlog (hook pending), and weekly telemetry (hook stats).",
+    ),
+    (
+        "hosts",
+        "Print the controller host capability and protocol table (claude, agy, codex, pi, plus ignored skill-only hosts).",
+    ),
+    (
+        "install-hooks",
+        "Idempotently install or uninstall delegate Stop/PreToolUse hooks for a supported controller host (--host claude|agy|codex|pi).",
     ),
     (
         "events",
@@ -387,13 +395,22 @@ fn command_spec(command: &str) -> Option<CommandSpec> {
             ("--json", "Print structured JSON output."),
         ]),
         "hook" => ("<check|pending|stats> [options]", "Zero-lock, zero-git Stop hook kernel: single-item turn-end guard (hook check), full prioritized backlog (hook pending), and weekly statistics (hook stats).", &[
-            ("check", "Evaluate Stop hook and emit at most one highest-priority item (--format claude|agy|json, --cwd PATH)."),
+            ("check", "Evaluate Stop hook and emit at most one highest-priority item (--format claude|agy|codex|json, --cwd PATH)."),
             ("pending", "List all actionable pending items across categories in priority order (--json, --cwd PATH)."),
             ("stats", "Aggregate weekly Stop hook triggers and outcomes (--weeks N, --json)."),
-            ("--format FORMAT", "Output format for `hook check`: claude (default), agy, or json."),
+            ("--format FORMAT", "Output format for `hook check`: claude (default), agy, codex, or json."),
             ("--cwd PATH", "Override working directory for `hook check` / `hook pending`."),
             ("--weeks N", "Show only the most recent N weeks for `hook stats`."),
             ("--json", "Print structured JSON output."),
+        ]),
+        "hosts" => ("[--json]", "Print the single-source controller host table: detection rules, caller env/payload keys, skill dirs, hook config paths, Stop/PreToolUse protocols, and capabilities for claude, agy, codex, pi, plus skill-only ignored hosts (cursor, kilo).", &[
+            ("--json", "Print structured JSON host table."),
+        ]),
+        "install-hooks" => ("--host <claude|agy|codex|pi> [--path PATH] [--stop-only] [--uninstall]", "Idempotently install or uninstall delegate Stop and PreToolUse hooks for a supported controller host, preserving unrelated user entries and writing a .bak backup before modifying an existing file.", &[
+            ("--host NAME", "Target controller host: claude, agy, codex, or pi (skill-only no-op)."),
+            ("--path PATH", "Override the host's default hook configuration file path."),
+            ("--stop-only", "Only install or remove the Stop hook; leave PreToolUse untouched."),
+            ("--uninstall", "Remove delegate hook entries while keeping all other user entries."),
         ]),
         "note" => ("[<run> [text ... | --done [<index> ... | --all]]] [--all] [--json]", "Thin compatibility wrapper over the unified work table (<state>/work.jsonl) for attaching, listing, or completing post-merge todos on a run or reply chain.", &[
             ("run", "Run id, name, or unique fragment (works after clean while pending todos remain). Omit to list all chains with pending todos."),
@@ -565,7 +582,7 @@ fn command_spec(command: &str) -> Option<CommandSpec> {
             ("--all", "Include all repositories instead of scoping to the current repository."),
             ("--json", "Print structured ETA JSON."),
         ]),
-        "adopt" => ("<run>... [--json]", "Transfer one or more runs (and every round in each run's reply/continuation chain) to the current caller session (DELEGATE_CALLER / ANTIGRAVITY_CONVERSATION_ID / CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID / PI_SESSION_ID) and emit an `adopted` event. Useful after `/clear` in Claude Code or starting a new conversation in agy.", &[
+        "adopt" => ("<run>... [--json]", "Transfer one or more runs (and every round in each run's reply/continuation chain) to the current caller session (DELEGATE_CALLER / ANTIGRAVITY_CONVERSATION_ID / CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID / CODEX_SESSION_ID / PI_SESSION_ID / RPI_SESSION_ID) and emit an `adopted` event. Useful after `/clear` in Claude Code or starting a new conversation in agy/Codex.", &[
             ("--json", "Print adopted chain metadata as JSON lines."),
         ]),
         "mark-applied" => ("<run> [--commit <sha>] [--check-files] [--json]", "Record a run (and unapplied same-worktree ancestors) as manually applied after resolving conflicts or committing outside `delegate apply`. Verifies the commit exists in the source repository (defaulting to source HEAD).", &[

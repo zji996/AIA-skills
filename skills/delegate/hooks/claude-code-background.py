@@ -53,7 +53,49 @@ AGY_POLL_REASON = (
     " Do not poll delegate output or run directories in a foreground while/until sleep loop; "
     "run `delegate wait --any` alone with `run_command` (`WaitMsBeforeAsync: 500, IsDaemon: false`) "
     "so Reactive Wakeup notifies you on completion.")
+CODEX_POLL_REASON = (
+    "不要用 while/until + sleep 轮询 delegate 输出或 run 目录；Codex 下请直接前台分段跑 "
+    "`delegate wait --any --max 5m`（到期后再续挂）。"
+    " Do not poll delegate output or run directories in a while/until sleep loop; "
+    "in Codex run `delegate wait --any --max 5m` in the foreground and rerun if still running.")
 AGY_MAX_BG_WAIT_MS = 2000
+
+# Host table mirror (single source of truth is `delegate hosts --json` in crates/delegate/src/hosts.rs).
+# Conformance tests verify this table matches `delegate hosts --json`.
+IGNORED_HOST_ENV = (
+    "CURSOR_VERSION",
+    "CURSOR_PROJECT_DIR",
+    "CURSOR_TRACE_ID",
+    "KILO_SESSION_ID",
+    "KILOCODE_VERSION",
+    "KILO_VERSION",
+)
+IGNORED_HOST_PAYLOAD = (
+    "cursor_version",
+    "workspace_roots",
+    "conversation_id",
+    "kilo_version",
+)
+HOST_PROFILES = {
+    "claude": {
+        "tool_name": "Bash",
+        "bg_wakes_controller": True,
+        "allow_output": "",
+        "deny_style": "claude_pre_tool",
+    },
+    "agy": {
+        "tool_name": "run_command",
+        "bg_wakes_controller": True,
+        "allow_output": '{"decision": "allow"}',
+        "deny_style": "agy",
+    },
+    "codex": {
+        "tool_name": "Bash",
+        "bg_wakes_controller": False,
+        "allow_output": "",
+        "deny_style": "claude_pre_tool",
+    },
+}
 DELEGATE_RUN_ARTIFACTS = (
     "exit_code", "result.md", "summary.json", "events.jsonl",
     "meta.json", "changes.json", ".waiting", ".delivered", "accept.log",
@@ -200,13 +242,16 @@ def blocking_calls(command: str) -> tuple[list[str], bool]:
 
 
 def allow(fmt: str = "claude") -> int:
-    if fmt == "agy":
-        json.dump({"decision": "allow"}, sys.stdout, ensure_ascii=False)
+    profile = HOST_PROFILES.get(fmt, HOST_PROFILES["claude"])
+    out = profile["allow_output"]
+    if out:
+        sys.stdout.write(out)
     return 0
 
 
 def deny(reason: str, fmt: str = "claude") -> int:
-    if fmt == "agy":
+    profile = HOST_PROFILES.get(fmt, HOST_PROFILES["claude"])
+    if profile["deny_style"] == "agy":
         json.dump({"decision": "deny", "reason": reason}, sys.stdout, ensure_ascii=False)
         return 0
     json.dump(
@@ -649,15 +694,57 @@ def _parse_format(argv: list[str]) -> str | None:
         arg = argv[i]
         if arg == "--format" and i + 1 < len(argv):
             val = argv[i + 1].strip().lower()
-            if val in ("claude", "agy"):
+            if val in HOST_PROFILES:
                 return val
             i += 2
             continue
         if arg.startswith("--format="):
             val = arg.split("=", 1)[1].strip().lower()
-            if val in ("claude", "agy"):
+            if val in HOST_PROFILES:
                 return val
         i += 1
+    return None
+
+
+def _has_present_payload_key(payload: dict, key: str) -> bool:
+    if key not in payload:
+        return False
+    val = payload[key]
+    if val is None:
+        return False
+    if isinstance(val, str):
+        return bool(val.strip())
+    if isinstance(val, (list, dict)):
+        return bool(val)
+    return True
+
+
+def _is_ignored_host(payload: dict) -> bool:
+    for key in IGNORED_HOST_PAYLOAD:
+        if _has_present_payload_key(payload, key):
+            return True
+    for key in IGNORED_HOST_ENV:
+        if os.environ.get(key, "").strip():
+            return True
+    return False
+
+
+def _detect_host(payload: dict, cli_fmt: str | None) -> str | None:
+    if _is_ignored_host(payload):
+        return None
+    if cli_fmt in HOST_PROFILES:
+        return cli_fmt
+    if isinstance(payload.get("toolCall"), dict):
+        return "agy"
+    if (
+        _has_present_payload_key(payload, "turn_id")
+        or os.environ.get("CODEX_THREAD_ID", "").strip()
+        or os.environ.get("CODEX_SESSION_ID", "").strip()
+        or os.environ.get("CODEX_VERSION", "").strip()
+    ):
+        return "codex"
+    if payload.get("tool_name") == "Bash" or os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip():
+        return "claude"
     return None
 
 
@@ -698,6 +785,12 @@ AGY_CAPPED_BUILD_REASON = (
     "build's lock for an unpredictable time; the timeout kills a healthy wait and forces a rerun. Drop "
     "the timeout and run it with run_command (WaitMsBeforeAsync: 500, IsDaemon: false) so Reactive "
     "Wakeup notifies you on exit; queue heavy builds with `delegate lane '<cmd>'`.")
+CODEX_CAPPED_BUILD_REASON = (
+    "`{call}` 给编译/测试命令套了 timeout。cargo、pnpm 这类命令可能要排队等别的构建释放锁，"
+    "要等多久无法预估，时限一到就杀掉一个健康的等待，只能重跑。去掉 timeout，重的构建用 `delegate lane '<命令>'` 排队。 / "
+    "`{call}` wraps a build/test command in timeout. cargo/pnpm may queue behind another "
+    "build's lock for an unpredictable time; the timeout kills a healthy wait and forces a rerun. Drop "
+    "the timeout and queue heavy builds with `delegate lane '<cmd>'`.")
 _SEGMENT_SPLIT = re.compile(r"(?:&&|\|\||[;|&(\n])")
 _ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
@@ -730,19 +823,13 @@ def capped_build(command: str) -> str | None:
     return None
 
 
-def main(argv: list[str] | None = None) -> int:
-    cli_fmt = _parse_format(sys.argv[1:] if argv is None else argv)
-    try:
-        payload = json.load(sys.stdin)
-    except ValueError:
-        return allow(cli_fmt or "claude")
-    if not isinstance(payload, dict):
-        return allow(cli_fmt or "claude")
-    fmt = cli_fmt or ("agy" if isinstance(payload.get("toolCall"), dict) else "claude")
+def evaluate_pre_tool(payload: dict, fmt: str) -> tuple[str, str]:
+    """Compute host-neutral PreToolUse verdict: ('allow', '') or ('deny', reason)."""
+    profile = HOST_PROFILES[fmt]
     if fmt == "agy":
         tool_call = payload.get("toolCall")
-        if not isinstance(tool_call, dict) or tool_call.get("name") != "run_command":
-            return allow(fmt)
+        if not isinstance(tool_call, dict) or tool_call.get("name") != profile["tool_name"]:
+            return ("allow", "")
         tool_args = tool_call.get("args")
         if not isinstance(tool_args, dict):
             tool_args = {}
@@ -752,60 +839,73 @@ def main(argv: list[str] | None = None) -> int:
         is_bg = wait_ms is not None and wait_ms <= AGY_MAX_BG_WAIT_MS and not is_daemon
     else:
         tool_input = payload.get("tool_input") or {}
-        if payload.get("tool_name") != "Bash":
-            return allow(fmt)
+        if payload.get("tool_name") != profile["tool_name"]:
+            return ("allow", "")
         raw_command = str(tool_input.get("command", ""))
-        wait_ms = None
-        is_daemon = False
-        is_bg = bool(tool_input.get("run_in_background"))
+        is_bg = bool(tool_input.get("run_in_background")) if profile["bg_wakes_controller"] else False
+
     command = strip_heredocs(raw_command)
     call = self_matching_pgrep(command)
     if call:
-        return deny(SELF_MATCH_REASON.format(call=call), fmt)
+        return ("deny", SELF_MATCH_REASON.format(call=call))
     prune_call = dangerous_git_prune(command, str(payload.get("cwd") or os.getcwd()))
     if prune_call:
-        return deny(PRUNE_REASON.format(call=prune_call), fmt)
+        return ("deny", PRUNE_REASON.format(call=prune_call))
     if _is_colleague_process():
-        return allow(fmt)
+        return ("allow", "")
+
+    if not profile["bg_wakes_controller"]:
+        # Hosts without background auto-wakeup (e.g. Codex): allow foreground `delegate wait`,
+        # still guard against `timeout <build>` and hand-written `while/sleep` polling.
+        capped = capped_build(command)
+        if capped:
+            return ("deny", CODEX_CAPPED_BUILD_REASON.format(call=capped))
+        poll_call = foreground_delegate_poll(command)
+        if poll_call:
+            return ("deny", CODEX_POLL_REASON)
+        return ("allow", "")
+
     if fmt == "agy":
         calls, mixed = blocking_calls(command)
         if calls:
             wait_command = calls[0]
             if mixed:
-                return deny(
+                return (
+                    "deny",
                     f"把 wait 单独作为一条后台命令发出：{wait_command}"
                     "（run_command 设 WaitMsBeforeAsync: 500, IsDaemon: false）；其余部分另发一条。",
-                    fmt,
                 )
             if not is_bg:
-                return deny(
+                return (
+                    "deny",
                     "delegate wait/run/reply --wait blocks until colleagues finish. Rerun the same "
                     "command alone with run_command WaitMsBeforeAsync: 500, IsDaemon: false; the "
                     "system wakes you automatically when it exits (Reactive Wakeup), or after 50 "
                     "minutes with a progress glance. Use start (or reply without --wait) to launch, "
                     "then one background wait.",
-                    fmt,
                 )
-            return allow(fmt)
+            return ("allow", "")
         if not is_bg:
             capped = capped_build(command)
             if capped:
-                return deny(AGY_CAPPED_BUILD_REASON.format(call=capped), fmt)
+                return ("deny", AGY_CAPPED_BUILD_REASON.format(call=capped))
             poll_call = foreground_delegate_poll(command)
             if poll_call:
-                return deny(AGY_POLL_REASON, fmt)
-        return allow(fmt)
+                return ("deny", AGY_POLL_REASON)
+        return ("allow", "")
+
+    # Claude Code
     if is_bg:
-        return allow(fmt)
+        return ("allow", "")
     capped = capped_build(command)
     if capped:
-        return deny(CAPPED_BUILD_REASON.format(call=capped), fmt)
+        return ("deny", CAPPED_BUILD_REASON.format(call=capped))
     poll_call = foreground_delegate_poll(command)
     if poll_call:
-        return deny(POLL_REASON, fmt)
+        return ("deny", POLL_REASON)
     calls, mixed = blocking_calls(command)
     if not calls:
-        return allow(fmt)
+        return ("allow", "")
     wait_command = calls[0]
     reason = (f"把 wait 单独作为一条后台命令发出：{wait_command}；其余部分另发一条。"
               if mixed else
@@ -815,7 +915,25 @@ def main(argv: list[str] | None = None) -> int:
               "--wait) to launch, then one background wait. To look at each run as it finishes, "
               "run `wait --stream` under the Monitor tool (one notification per run), or run "
               "`wait --any` in the background and repeat it after each notification.")
-    return deny(reason, fmt)
+    return ("deny", reason)
+
+
+def main(argv: list[str] | None = None) -> int:
+    cli_fmt = _parse_format(sys.argv[1:] if argv is None else argv)
+    try:
+        payload = json.load(sys.stdin)
+    except ValueError:
+        return allow(cli_fmt or "claude")
+    if not isinstance(payload, dict):
+        return allow(cli_fmt or "claude")
+    fmt = _detect_host(payload, cli_fmt)
+    if fmt is None:
+        # Unsupported / unrecognized host (e.g., Cursor, Kilo): silently allow with empty stdout.
+        return 0
+    decision, reason = evaluate_pre_tool(payload, fmt)
+    if decision == "deny":
+        return deny(reason, fmt)
+    return allow(fmt)
 
 
 if __name__ == "__main__":

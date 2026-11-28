@@ -137,7 +137,7 @@ class Delegate6361Tests(unittest.TestCase):
             ).returncode,
             0,
         )
-        # Seed an earlier cursor for this session (simulating the 6.36.0 stuck-at-309 scenario).
+        # Seed an earlier cursor for both delegate-using sessions (simulating the 6.36.0 stuck-at-309 scenario).
         sdir = self.state_dir()
         sdir.mkdir(parents=True, exist_ok=True)
         (sdir / "cursors.json").write_text(
@@ -153,6 +153,10 @@ class Delegate6361Tests(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
+        sessions_p = sdir / "sessions.json"
+        sdoc = json.loads(sessions_p.read_text(encoding="utf-8")) if sessions_p.is_file() else {}
+        sdoc[other_sid] = {"lastSeenAt": "2099-01-01T00:00:00Z", "repos": [str(repo.resolve())]}
+        sessions_p.write_text(json.dumps(sdoc) + "\n", encoding="utf-8")
 
         # Closing W001 unlocks W002 (`ready`) and emits `work_ready`.
         self.assertEqual(
@@ -424,6 +428,10 @@ class Delegate6361Tests(unittest.TestCase):
         cdoc = self.read_cursors() or {"default": {"seq": 0, "readRuns": {}}, "callers": {}}
         cdoc.setdefault("callers", {})["sess-observer"] = {"seq": delivered_seq, "readRuns": {}}
         cpath.write_text(json.dumps(cdoc) + "\n", encoding="utf-8")
+        spath = self.state_dir() / "sessions.json"
+        sdoc = json.loads(spath.read_text(encoding="utf-8")) if spath.is_file() else {}
+        sdoc["sess-observer"] = {"lastSeenAt": "2099-01-01T00:00:00Z", "repos": [str(repo.resolve())]}
+        spath.write_text(json.dumps(sdoc) + "\n", encoding="utf-8")
         # Both `needs_attention` and `review_verdict(NEEDS_CONTROLLER)` are > delivered_seq, yet suppressed by valid sign.json!
         self.assertIsNone(self.run_stop_hook(repo, observer_env, session_id="sess-observer"))
 

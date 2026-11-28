@@ -78,3 +78,12 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 - `radar`（仓库级）：`{"collect":[命令或{"name","command"}],"tier"?:"scout"|"review","model"?,"thinking"?,"timeout"?}`；确定性采集算指纹，未变零 token 退出，变化派只读 scout 更新 `<state>/radar/<repo>/board.md`，见 [合入员与 Radar](merge-and-radar.md)。
 - `areas`（仓库级，默认关）：`{"<块名>":{"paths":["前缀",...],"l0":"..."}}`（或单串 `prefix`）；`start` 命中后按 `<state>/area-ab.json` 奇偶交替分 `B`（末尾追加 `l0` 前 3 非空行）与 `A`，写 `area`/`areaGroup`/`areaExperiment` 进 `meta.json`。
 - `fill` / `hotspots`（仓库级，默认关）：`fill: {"target":6,"maxInfraDocsShare":0.3}`（`target=0` 关）在 `reconcile` 写链 `< target` 时无模型补位（不计只读）；`hotspots: ["README.md",...]` 仅避让同撞热点的候选项，其余路径不互斥，见 [容量](capacity.md)。
+
+## 主控宿主与钩子安装
+
+主控宿主表由 `delegate hosts [--json]` 统一维护；正式支持 4 个主控（`claude`、`agy`、`codex`、`pi`），Cursor 与 Kilo 只装 Skill、不接钩子、任何钩子调用均静默放行：
+
+- **安装 / 卸载钩子**：`delegate install-hooks --host <claude|agy|codex|pi> [--path PATH] [--stop-only] [--uninstall]`（幂等合并、写前备份 `.bak`、保留用户其他条目）。`scripts/install.sh` 检测到 `~/.claude`、`~/.gemini`、`~/.codex` 时自动调用。
+- **Codex（`codex-cli 0.171.0`）**：支持 `~/.codex/hooks.json` 的 `Stop` 与 `PreToolUse`（`--format codex`；无后台唤醒，PreToolUse 不拦前台 `delegate wait`，收结果用前台分段 `delegate wait --max <分钟>`；首次交互启动需确认信任 `hooks.json`）。
+- **Pi / rpi（`rpi 0.20.0`）**：扩展需编译 Rust cdylib，只装 Skill（`~/.agents/skills` 与 `~/.rpi/agent/skills`）并标能力位；delegate 启动的 Pi 同事通过 `--no-skills` 与 `DELEGATE_AGENT` 隔离，主控收结果用前台分段 `delegate wait --max <分钟>`。
+- **收工拦截范围**：仅拦截本会话自己派的任务（caller 匹配）；跨会话 30 分钟卡链穿透与孤儿接盘只投给本仓库在 `sessions.json` 有记录（用过 delegate）的会话，从没派过活的会话与宿主表外工具（Cursor/Kilo 等）一律静默放行。

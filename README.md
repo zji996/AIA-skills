@@ -108,8 +108,8 @@ cd AIA-skills
 ./scripts/install.sh --uninstall [<skill>...]         # 只删除本仓库安装的条目
 ./scripts/install.sh repo-governance --force          # 替换指向其他来源的同名符号链接
 ./scripts/install-git-hooks.sh                         # 本仓库启用 pre-push 门禁
-./scripts/install-claude-hooks.sh                      # 写入 ~/.claude/settings.json 的 delegate Stop / PreToolUse hooks
-./scripts/install-agy-hooks.sh                         # 写入 ~/.gemini/config/hooks.json 的 delegate Stop / PreToolUse hooks（检测到 ~/.gemini 时 install.sh 自动调用）
+./scripts/install-claude-hooks.sh                      # 写入 ~/.claude/settings.json（薄壳，调用 delegate install-hooks --host claude）
+./scripts/install-agy-hooks.sh                         # 写入 ~/.gemini/config/hooks.json（薄壳，调用 delegate install-hooks --host agy）
 ./scripts/sync-hosts.sh                               # 经 SSH 并行更新其他机器（列表在 ~/.config/aia-skills/hosts）
 ```
 
@@ -122,8 +122,9 @@ cd AIA-skills
 | `~/.agents/skills/` | Pi、Codex、Cursor、Kilo |
 | `~/.claude/skills/` | Claude Code |
 | `~/.gemini/config/skills/` | Antigravity CLI（agy） |
+| `~/.rpi/agent/skills/` | rpi（Pi fork） |
 
-普通技能只装到这三个目录（检测到 `~/.gemini` 且安装了 `delegate` 时，`install.sh` 顺带调用 `install-agy-hooks.sh`；`--uninstall` 一并清理）。在 frontmatter `metadata.exclude-agents` 中声明了排除对象的技能（目前只有 `delegate` 排除了 `pi`，防止 Pi 调度自己）会跳过 `~/.agents/skills/`，改为装到其余 Agent 各自的目录：`~/.codex/skills/`、`~/.cursor/skills/`、`~/.kilo/skills/`。
+普通技能装到这四个目录；安装了 `delegate` 时，`install.sh` 对本机已存在的正式主控目录（`~/.claude`、`~/.gemini`、`~/.codex`）自动调用 `delegate install-hooks --host <名>` 接好钩子（`--uninstall` 一并清理；Cursor 与 Kilo 只装 Skill 不接钩子；Pi 同事由 `--no-skills` 隔离）。在 frontmatter `metadata.exclude-agents` 中声明了排除对象的技能会跳过对应共享目录，改装到其余 Agent 各自的目录：`~/.codex/skills/`、`~/.cursor/skills/`、`~/.kilo/skills/`。
 
 安装脚本只处理本仓库安装的条目：不会覆盖别人的目录；会移除多余位置上的旧条目，也会清理源技能已删除的条目。退役技能时直接从 `skills/` 删除，重新运行安装脚本即可清理干净。
 

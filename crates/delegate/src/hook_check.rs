@@ -76,12 +76,7 @@ fn kind_label(kind: &str) -> &str {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HookFormat {
-    Claude,
-    Agy,
-    Json,
-}
+pub use crate::hosts::HookFormat;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EvalMode {
@@ -274,6 +269,7 @@ fn bool_or_true_str(v: &Value) -> bool {
 
 /// Entry guards evaluated BEFORE touching disk:
 /// - Colleague env (`PI_DELEGATE_ACTIVE`, `DELEGATE_AGENT`, `DELEGATE_RUN_DIR`) -> allow
+/// - Unsupported / external host (Cursor, Kilo, or unrecognized foreign payload) -> allow
 /// - Loop guard (`stop_hook_active` or `continuationActive`) -> allow
 /// - `agy` `terminationReason` non-empty and != `"NO_TOOL_CALL"` -> allow
 pub fn check_entry_guards(payload: &Value, format: HookFormat) -> Option<&'static str> {
@@ -290,6 +286,18 @@ fn check_entry_guards_with(
         || get_env("DELEGATE_RUN_DIR").is_some()
     {
         return Some("colleague");
+    }
+    match crate::hosts::detect_host_with(payload, &get_env) {
+        crate::hosts::DetectedHost::Ignored(_) => return Some("unsupported_host"),
+        crate::hosts::DetectedHost::Unknown => {
+            if format != HookFormat::Json
+                && crate::hosts::payload_has_non_cwd_keys(payload)
+                && get_env("DELEGATE_CALLER").is_none()
+            {
+                return Some("unsupported_host");
+            }
+        }
+        crate::hosts::DetectedHost::Supported(_) => {}
     }
     if bool_or_true_str(&payload["stop_hook_active"])
         || bool_or_true_str(&payload["continuationActive"])
@@ -316,38 +324,7 @@ fn resolve_caller_with(
     payload: &Value,
     get_env: impl Fn(&str) -> Option<String>,
 ) -> (String, String) {
-    if let Some(val) = get_env("DELEGATE_CALLER") {
-        return (val, "DELEGATE_CALLER".to_string());
-    }
-    let sid = s(payload, "session_id").trim();
-    if !sid.is_empty() {
-        return (sid.to_string(), "CLAUDE_CODE_SESSION_ID".to_string());
-    }
-    let conv = s(payload, "conversationId").trim();
-    if !conv.is_empty() {
-        return (conv.to_string(), "ANTIGRAVITY_CONVERSATION_ID".to_string());
-    }
-    let order: [&str; 4] = if is_antigravity_agent_with(&get_env) {
-        [
-            "ANTIGRAVITY_CONVERSATION_ID",
-            "CLAUDE_CODE_SESSION_ID",
-            "CODEX_THREAD_ID",
-            "PI_SESSION_ID",
-        ]
-    } else {
-        [
-            "CLAUDE_CODE_SESSION_ID",
-            "CODEX_THREAD_ID",
-            "PI_SESSION_ID",
-            "ANTIGRAVITY_CONVERSATION_ID",
-        ]
-    };
-    for key in order {
-        if let Some(val) = get_env(key) {
-            return (val, key.to_string());
-        }
-    }
-    (String::new(), String::new())
+    crate::hosts::resolve_hook_caller_with(payload, get_env)
 }
 
 fn norm_path_str(raw: &str) -> String {
@@ -1165,15 +1142,20 @@ fn touch_caller_session_for(
     if caller_id.is_empty() || !write_disk {
         return (harness_pt, cur_tty, cur_cwd);
     }
-    let _ = fs::create_dir_all(state);
     let path = state.join("sessions.json");
     let mut doc = json(&path);
     if !doc.is_object() {
-        doc = json!({});
+        return (harness_pt, cur_tty, cur_cwd);
     }
     let cutoff = now - 14 * 86_400;
+    let mut updated = false;
     if let Some(map) = doc.as_object_mut() {
-        let prev = map.get(caller_id).cloned().unwrap_or(Value::Null);
+        // NEVER register a brand-new session from Stop hook: only refresh sessions
+        // that have already invoked delegate, so stranger sessions stay outside
+        // cross-session penetration/takeover scope.
+        let Some(prev) = map.get(caller_id).cloned() else {
+            return (harness_pt, cur_tty, cur_cwd);
+        };
         let mut rec = json!({
             "lastSeenAt": format_epoch(now, false, "%Y-%m-%dT%H:%M:%SZ"),
         });
@@ -1204,22 +1186,39 @@ fn touch_caller_session_for(
                 cur_tty = prev_tty.to_string();
             }
         }
+        let prev_cwd = s(&prev, "cwd").trim();
+        let mut prev_repos = strings(&prev["repos"]);
+        // Legacy sessions.json entries only stored `cwd` (no `repos`). Migrate the
+        // previous `cwd` into `repos` BEFORE updating `rec["cwd"] = cur_cwd`, so
+        // refreshing `lastSeenAt` in a new unrelated repo never overwrites the
+        // original repo or grants cross-session scope to `cur_cwd`.
+        if prev_repos.is_empty() && !prev_cwd.is_empty() {
+            let migrated = git_toplevel_pure(prev_cwd)
+                .map(|p| norm_path_str(&p.to_string_lossy()))
+                .unwrap_or_else(|| norm_path_str(prev_cwd));
+            if !migrated.is_empty() {
+                prev_repos.push(migrated);
+            }
+        }
         if !cur_cwd.is_empty() {
             rec["cwd"] = json!(cur_cwd);
-        } else {
-            let prev_cwd = s(&prev, "cwd").trim();
-            if !prev_cwd.is_empty() {
-                let nc = norm_path_str(prev_cwd);
-                rec["cwd"] = json!(nc);
-                cur_cwd = nc;
-            }
+        } else if !prev_cwd.is_empty() {
+            let nc = norm_path_str(prev_cwd);
+            rec["cwd"] = json!(nc);
+            cur_cwd = nc;
+        }
+        if !prev_repos.is_empty() {
+            rec["repos"] = json!(prev_repos);
         }
         map.insert(caller_id.to_string(), rec);
         map.retain(|k, v| {
             k == caller_id || iso_epoch(s(v, "lastSeenAt")).is_none_or(|ts| ts >= cutoff)
         });
+        updated = true;
     }
-    let _ = write_json(&path, &doc);
+    if updated {
+        let _ = write_json(&path, &doc);
+    }
     (harness_pt, cur_tty, cur_cwd)
 }
 
@@ -2721,12 +2720,7 @@ impl PendingItem {
                 } else {
                     "delegate wait --machine"
                 };
-                match format {
-                    HookFormat::Agy => {
-                        format!("run_command 设 WaitMsBeforeAsync=500 后台跑 `{wcmd}`")
-                    }
-                    HookFormat::Claude | HookFormat::Json => format!("后台跑 `{wcmd}`"),
-                }
+                crate::hosts::waiter_next_command_hint(format, wcmd)
             }
             TemplateKind::Unmerged { run, .. } => {
                 let card_cmd = repo_prefix_cmd(
@@ -2887,11 +2881,7 @@ impl PendingItem {
     }
 
     fn stop_log_record(&self, format: HookFormat) -> Value {
-        let fmt_str = match format {
-            HookFormat::Claude => "claude",
-            HookFormat::Agy => "agy",
-            HookFormat::Json => "json",
-        };
+        let fmt_str = format.as_str();
         match &self.template {
             TemplateKind::Waiter { run_ids, .. } => json!({
                 "hook": self.hook_kind,
@@ -2971,6 +2961,108 @@ struct EvalOutput {
     controller_pending_runs: Vec<String>,
     stale_pending_runs: Vec<String>,
     caller_id: String,
+    allow_cross_session: bool,
+}
+
+/// Whether `caller_id` has actually used delegate in the current repo (recorded in
+/// `sessions.json` for this repo, or owns a run/work item in this repo). Sessions
+/// that have never used delegate in this repo never receive cross-session penetration,
+/// orphan takeover, adoptable, or ownerless reminders.
+fn session_used_delegate_in_repo(
+    caller_id: &str,
+    sessions: &serde_json::Map<String, Value>,
+    current_repo_str: &str,
+    cur_cwd: &str,
+    repo_items: &[(DiscoveredRepo, Vec<Value>)],
+    work_items: &[WorkItem],
+) -> bool {
+    if caller_id.is_empty() {
+        return true;
+    }
+    if let Some(rec) = sessions.get(caller_id) {
+        let rec_repos = strings(&rec["repos"]);
+        if !rec_repos.is_empty() {
+            if current_repo_str.is_empty() && cur_cwd.is_empty() {
+                return true;
+            }
+            let matched = if !current_repo_str.is_empty() {
+                rec_repos
+                    .iter()
+                    .any(|r| norm_path_str(r) == current_repo_str)
+            } else {
+                rec_repos.iter().any(|r| {
+                    let nr = norm_path_str(r);
+                    !nr.is_empty()
+                        && (nr == cur_cwd || cur_cwd.starts_with(&format!("{nr}/")))
+                })
+            };
+            if matched {
+                return true;
+            }
+        } else {
+            let rec_cwd = norm_path_str(s(rec, "cwd"));
+            if current_repo_str.is_empty() && cur_cwd.is_empty() {
+                return true;
+            }
+            if !rec_cwd.is_empty() {
+                let matched = if !current_repo_str.is_empty() {
+                    rec_cwd == current_repo_str
+                        || rec_cwd.starts_with(&format!("{current_repo_str}/"))
+                } else {
+                    rec_cwd == cur_cwd
+                };
+                if matched {
+                    return true;
+                }
+            }
+        }
+    }
+    for (repo, items) in repo_items {
+        if !repo.is_current {
+            continue;
+        }
+        if items.iter().any(|obj| {
+            if get_run_caller_readonly(obj) != caller_id {
+                return false;
+            }
+            if current_repo_str.is_empty() {
+                return true;
+            }
+            let raw_wd = {
+                let direct = s(obj, "workdir").trim();
+                if !direct.is_empty() {
+                    direct.to_string()
+                } else {
+                    let rdir = s(obj, "dir").trim();
+                    if !rdir.is_empty() {
+                        s(&json(Path::new(rdir).join("meta.json")), "workdir")
+                            .trim()
+                            .to_string()
+                    } else {
+                        String::new()
+                    }
+                }
+            };
+            if raw_wd.is_empty() {
+                return true;
+            }
+            let wd_repo = git_toplevel_pure(&raw_wd)
+                .map(|p| norm_path_str(&p.to_string_lossy()))
+                .unwrap_or_else(|| norm_path_str(&raw_wd));
+            wd_repo == current_repo_str
+        }) {
+            return true;
+        }
+    }
+    if work_items.iter().any(|w| {
+        w.caller.trim() == caller_id && {
+            let wr = norm_path_str(&w.repo);
+            current_repo_str.is_empty() || wr.is_empty() || wr == current_repo_str
+        }
+    }) {
+        return true;
+    }
+    false
 }
 
 fn evaluate_core(
@@ -3089,6 +3181,22 @@ fn evaluate_core(
     let pending_runs = classify_pending_runs(&all_repo_runs_flat);
     let work_items_json: Vec<Value> = work_items.iter().map(work::WorkItem::to_json).collect();
     let pending_split = crate::pulse::split_pending_runs(&all_repo_runs_flat, &work_items_json, now);
+
+    let current_repo = git_toplevel_pure(cwd);
+    let current_repo_str = current_repo
+        .as_deref()
+        .map(|p| norm_path_str(&p.to_string_lossy()))
+        .unwrap_or_default();
+    let caller_used_delegate = session_used_delegate_in_repo(
+        &caller_id,
+        &liveness.sessions,
+        &current_repo_str,
+        &liveness.cur_cwd,
+        &repo_items,
+        &work_items,
+    );
+    let allow_cross_session =
+        mode == EvalMode::Pending || caller_id.is_empty() || caller_used_delegate;
 
     let mut out_items: Vec<PendingItem> = Vec::new();
     let mut covered_run_ids: HashSet<String> = HashSet::new();
@@ -3209,13 +3317,14 @@ fn evaluate_core(
                 continue;
             }
             let caller_dead = !run_caller.is_empty() && !liveness.is_alive(&run_caller);
-            let stall_penetrates = is_unmerged_write
+            let stall_penetrates = allow_cross_session
+                && is_unmerged_write
                 && !blocked_downstream.is_empty()
                 && !is_deferred_chain
                 && (caller_dead || wait_secs >= stall_penetrate_secs);
 
             if !in_normal_scope
-                && !(is_adoptable && liveness.same_terminal(&run_caller))
+                && !(allow_cross_session && is_adoptable && liveness.same_terminal(&run_caller))
                 && !stall_penetrates
             {
                 continue;
@@ -3224,7 +3333,13 @@ fn evaluate_core(
             let mut adopt_only = false;
             let mut is_orphan = false;
             let mut disp = base_disp.clone();
+            if run_caller.is_empty() && !allow_cross_session {
+                continue;
+            }
             if !run_caller.is_empty() && run_caller != caller_id {
+                if !allow_cross_session {
+                    continue;
+                }
                 if stall_penetrates {
                     // Cross-session stall-chain penetration: directly blocks active controller!
                     if caller_dead {
@@ -3433,6 +3548,7 @@ fn evaluate_core(
         cwd,
         now,
         current_only,
+        allow_cross_session,
         &caller_id,
         &cursors_doc,
         &work_by_id,
@@ -3588,11 +3704,6 @@ fn evaluate_core(
     //    - `ready` missing brief (>= 1h grace period, gated by has_idle_slot) -> Tier 7
     //    - `blocked` items NEVER alert (only the upstream item blocking them alerts).
     // ------------------------------------------------------------------
-    let current_repo = git_toplevel_pure(cwd);
-    let current_repo_str = current_repo
-        .as_deref()
-        .map(|p| norm_path_str(&p.to_string_lossy()))
-        .unwrap_or_default();
     let idle_slot = has_idle_slot(state, current_repo.as_deref(), &repo_items, now);
     let remind_map = if mode == EvalMode::Check {
         load_work_remind(state)
@@ -3667,7 +3778,13 @@ fn evaluate_core(
             }
             let caller_dead = !item_caller.is_empty() && !liveness.is_alive(item_caller);
             let mut is_orphan = false;
+            if item_caller.is_empty() && !allow_cross_session {
+                continue;
+            }
             if !item_caller.is_empty() && item_caller != caller_id {
+                if !allow_cross_session {
+                    continue;
+                }
                 let penetrates = is_blocking && (caller_dead || age_secs >= stall_penetrate_secs);
                 if penetrates {
                     is_orphan = caller_dead;
@@ -3731,8 +3848,11 @@ fn evaluate_core(
             continue;
         }
         let mut is_orphan = false;
+        if item_caller.is_empty() && !allow_cross_session {
+            continue;
+        }
         if !item_caller.is_empty() && item_caller != caller_id {
-            if !liveness.can_takeover(item_caller, since_ts) {
+            if !allow_cross_session || !liveness.can_takeover(item_caller, since_ts) {
                 continue;
             }
             is_orphan = true;
@@ -3818,6 +3938,7 @@ fn evaluate_core(
         controller_pending_runs: pending_split.active_pending,
         stale_pending_runs: pending_split.stale_pending,
         caller_id,
+        allow_cross_session,
     }
 }
 
@@ -3828,6 +3949,7 @@ fn collect_unread_events(
     cwd: &str,
     now: i64,
     current_only: bool,
+    allow_cross_session: bool,
     caller_id: &str,
     cursors_doc: &Value,
     work_by_id: &HashMap<String, &WorkItem>,
@@ -3980,19 +4102,30 @@ fn collect_unread_events(
             let wid = s(pl, "workId").trim();
             if let Some(w) = (!wid.is_empty()).then(|| work_by_id.get(wid)).flatten() {
                 let w_caller = w.caller.trim();
+                if w_caller.is_empty() && !allow_cross_session {
+                    continue;
+                }
                 if !w_caller.is_empty() && w_caller != caller_id {
                     let since_ts = iso_epoch(w.state_since.trim()).or(ev_ts);
-                    if liveness.can_takeover(w_caller, since_ts) {
+                    if allow_cross_session && liveness.can_takeover(w_caller, since_ts) {
                         is_orphan = true;
                     } else {
                         continue;
                     }
                 }
+            } else if !allow_cross_session {
+                continue;
             }
         } else if !rid.is_empty() && !matches!(kind, "work_ready" | "work_defer_expired") {
             if let Some(run_obj) = all_runs_by_id.get(&rid) {
                 let run_caller = get_run_caller_readonly(run_obj);
+                if run_caller.is_empty() && !allow_cross_session {
+                    continue;
+                }
                 if !run_caller.is_empty() && run_caller != caller_id {
+                    if !allow_cross_session {
+                        continue;
+                    }
                     let adoptable = liveness.is_adoptable(&run_caller);
                     if !ev_is_current && !(adoptable && liveness.same_terminal(&run_caller)) {
                         continue;
@@ -4025,7 +4158,11 @@ fn collect_unread_events(
                         continue;
                     }
                 }
+            } else if !allow_cross_session {
+                continue;
             }
+        } else if !allow_cross_session {
+            continue;
         }
 
         // Deduplicate against runs already emitted in Tier 1 (question) or Tier 2 (stall_unmerged)
@@ -4160,25 +4297,16 @@ fn collect_unread_events(
 }
 
 fn emit_allow(format: HookFormat, guard: Option<&str>) {
-    match format {
-        HookFormat::Claude => {}
-        HookFormat::Agy => println!("{{}}"),
-        HookFormat::Json => {
-            let mut doc = json!({
-                "decision": "allow",
-                "reason": "",
-                "remaining": 0,
-                "total": 0,
-            });
-            if let Some(g) = guard {
-                doc["guard"] = json!(g);
-            }
-            println!("{doc}");
-        }
+    let decision = crate::hosts::StopDecision::Allow {
+        guard: guard.map(str::to_string),
+        disk_reminder: None,
+    };
+    if let Some(line) = crate::hosts::render_stop_decision(format, &decision, None) {
+        println!("{line}");
     }
 }
 
-/// CLI entrypoint for `delegate hook check [--format claude|agy|json] [--cwd PATH]`.
+/// CLI entrypoint for `delegate hook check [--format claude|agy|codex|json] [--cwd PATH]`.
 pub fn check_cmd(args: &[String]) -> Res<i32> {
     let mut format = HookFormat::Claude;
     let mut cwd_override: Option<String> = None;
@@ -4196,19 +4324,12 @@ pub fn check_cmd(args: &[String]) -> Res<i32> {
                         i += 1;
                         args.get(i)
                             .cloned()
-                            .ok_or("argument --format: expected claude|agy|json")?
+                            .ok_or("argument --format: expected claude|agy|codex|json")?
                     }
                 };
-                format = match raw.as_str() {
-                    "claude" => HookFormat::Claude,
-                    "agy" => HookFormat::Agy,
-                    "json" => HookFormat::Json,
-                    other => {
-                        return Err(format!(
-                            "invalid --format '{other}' (expected: claude, agy, json)"
-                        ));
-                    }
-                };
+                format = HookFormat::parse(&raw).ok_or_else(|| {
+                    format!("invalid --format '{raw}' (expected: claude, agy, codex, json)")
+                })?;
             }
             "--cwd" => {
                 let raw = match inline {
@@ -4227,7 +4348,7 @@ pub fn check_cmd(args: &[String]) -> Res<i32> {
                 return Err(unrecognized_arg(
                     a,
                     &["--format", "--cwd", "--json"],
-                    "delegate hook check [--format claude|agy|json] [--cwd PATH] [--json]",
+                    "delegate hook check [--format claude|agy|codex|json] [--cwd PATH] [--json]",
                 ));
             }
         }
@@ -4271,36 +4392,28 @@ pub fn check_cmd(args: &[String]) -> Res<i32> {
     let now = epoch() as i64;
     let out = evaluate_core(&state, &cache, &payload, &cwd, now, EvalMode::Check);
     let disk_health = crate::disk::inspect_readonly(&state, &cache, now);
-    let disk_note = disk_health.format_stop_reminder();
+    let disk_note = if out.allow_cross_session {
+        disk_health.format_stop_reminder()
+    } else {
+        None
+    };
 
     let Some(top) = out.items.first() else {
-        match format {
-            HookFormat::Claude => {
-                if let Some(ref note) = disk_note {
-                    println!("{}", json!({ "systemMessage": note }));
-                }
-            }
-            HookFormat::Agy => {
-                println!("{{}}");
-            }
-            HookFormat::Json => {
-                let mut doc = json!({
-                    "decision": "allow",
-                    "reason": "",
-                    "remaining": 0,
-                    "total": 0,
-                    "diskHealth": disk_health.to_json(),
-                });
-                if let Some(ref note) = disk_note {
-                    doc["diskReminder"] = json!(note);
-                }
-                println!("{doc}");
-            }
+        let decision = crate::hosts::StopDecision::Allow {
+            guard: None,
+            disk_reminder: disk_note,
+        };
+        let extra = json!({
+            "diskHealth": disk_health.to_json(),
+        });
+        if let Some(line) = crate::hosts::render_stop_decision(format, &decision, Some(&extra)) {
+            println!("{line}");
         }
         return Ok(0);
     };
 
     let remaining = out.items.len().saturating_sub(1);
+    let next_cmd = top.next_command(format);
     let mut reason = top.format_block_reason(remaining, format);
     if let Some(ref note) = disk_note {
         reason.push_str(" | ");
@@ -4324,30 +4437,24 @@ pub fn check_cmd(args: &[String]) -> Res<i32> {
 
     append_stop_log(&state, top.stop_log_record(format), now);
 
-    match format {
-        HookFormat::Claude => {
-            println!("{}", json!({ "decision": "block", "reason": reason }));
-        }
-        HookFormat::Agy => {
-            println!("{}", json!({ "decision": "continue", "reason": reason }));
-        }
-        HookFormat::Json => {
-            let mut doc = json!({
-                "decision": "block",
-                "reason": reason,
-                "item": top.to_json(format),
-                "remaining": remaining,
-                "total": out.items.len(),
-                "pendingRunCount": out.pending_runs.len(),
-                "controllerPendingCount": out.controller_pending_runs.len(),
-                "stalePendingCount": out.stale_pending_runs.len(),
-                "diskHealth": disk_health.to_json(),
-            });
-            if let Some(ref note) = disk_note {
-                doc["diskReminder"] = json!(note);
-            }
-            println!("{doc}");
-        }
+    let decision = crate::hosts::StopDecision::Block {
+        reason,
+        next_cmd,
+        remaining,
+        total: out.items.len(),
+    };
+    let mut extra = json!({
+        "item": top.to_json(format),
+        "pendingRunCount": out.pending_runs.len(),
+        "controllerPendingCount": out.controller_pending_runs.len(),
+        "stalePendingCount": out.stale_pending_runs.len(),
+        "diskHealth": disk_health.to_json(),
+    });
+    if let Some(ref note) = disk_note {
+        extra["diskReminder"] = json!(note);
+    }
+    if let Some(line) = crate::hosts::render_stop_decision(format, &decision, Some(&extra)) {
+        println!("{line}");
     }
     Ok(0)
 }
@@ -4627,6 +4734,10 @@ mod tests {
             t3.format_block_reason(0, HookFormat::Agy),
             "job-1 等 3 个委派在跑，没有挂等待。下一步：run_command 设 WaitMsBeforeAsync=500 后台跑 `delegate wait --any`"
         );
+        assert_eq!(
+            t3.format_block_reason(0, HookFormat::Codex),
+            "job-1 等 3 个委派在跑，没有挂等待。下一步：前台分段跑 `delegate wait --any --max 5m`"
+        );
         let t3_eta = make(TemplateKind::Waiter {
             name: "job-1".into(),
             count: 3,
@@ -4718,5 +4829,131 @@ mod tests {
             classify_pending_runs(&runs),
             vec!["scout-unreplied".to_string()]
         );
+    }
+
+    #[test]
+    fn entry_guards_allow_cursor_by_env_or_payload_and_unknown_hosts() {
+        let empty = json!({});
+        // Cursor via env only
+        assert_eq!(
+            check_entry_guards_with(&empty, HookFormat::Claude, |k| {
+                (k == "CURSOR_VERSION").then(|| "0.50.0".into())
+            }),
+            Some("unsupported_host")
+        );
+        assert_eq!(
+            check_entry_guards_with(&empty, HookFormat::Claude, |k| {
+                (k == "CURSOR_PROJECT_DIR").then(|| "/tmp/p".into())
+            }),
+            Some("unsupported_host")
+        );
+        // Cursor via payload only (clean env)
+        assert_eq!(
+            check_entry_guards_with(
+                &json!({"cursor_version": "0.50.0", "cwd": "/tmp/p"}),
+                HookFormat::Claude,
+                |_| None
+            ),
+            Some("unsupported_host")
+        );
+        assert_eq!(
+            check_entry_guards_with(
+                &json!({"workspace_roots": ["/tmp/p"], "conversation_id": "c-1"}),
+                HookFormat::Claude,
+                |_| None
+            ),
+            Some("unsupported_host")
+        );
+        // Unknown foreign host payload -> allowed
+        assert_eq!(
+            check_entry_guards_with(
+                &json!({"cwd": "/tmp/p", "foreign_tool_version": "1.2"}),
+                HookFormat::Claude,
+                |_| None
+            ),
+            Some("unsupported_host")
+        );
+        // Codex payload resolves caller to CODEX_THREAD_ID and is NOT blocked by entry guard
+        let codex_payload = json!({
+            "cwd": "/tmp/p",
+            "session_id": "01a22178-test",
+            "turn_id": "turn-1",
+            "stop_hook_active": false,
+        });
+        assert_eq!(
+            check_entry_guards_with(&codex_payload, HookFormat::Codex, |_| None),
+            None
+        );
+        assert_eq!(
+            resolve_caller_with(&codex_payload, |_| None),
+            ("01a22178-test".into(), "CODEX_THREAD_ID".into())
+        );
+    }
+
+    #[test]
+    fn stranger_session_not_in_sessions_json_does_not_get_cross_session_scope() {
+        let mut sessions = serde_json::Map::new();
+        sessions.insert(
+            "used-in-a".into(),
+            json!({ "lastSeenAt": "2026-11-28T09:00:00Z", "repos": ["/repo/a"] }),
+        );
+        sessions.insert(
+            "legacy-in-a".into(),
+            json!({ "lastSeenAt": "2026-11-28T09:00:00Z", "cwd": "/repo/a/sub" }),
+        );
+        sessions.insert(
+            "used-in-parent-non-git".into(),
+            json!({ "lastSeenAt": "2026-11-28T09:00:00Z", "repos": ["/tmp/parent"] }),
+        );
+        assert!(!session_used_delegate_in_repo(
+            "stranger",
+            &sessions,
+            "/repo/a",
+            "/repo/a",
+            &[],
+            &[],
+        ));
+        assert!(session_used_delegate_in_repo(
+            "used-in-a",
+            &sessions,
+            "/repo/a",
+            "/repo/a",
+            &[],
+            &[],
+        ));
+        assert!(!session_used_delegate_in_repo(
+            "used-in-a",
+            &sessions,
+            "/repo/b",
+            "/repo/b",
+            &[],
+            &[],
+        ));
+        assert!(session_used_delegate_in_repo(
+            "legacy-in-a",
+            &sessions,
+            "/repo/a",
+            "/repo/a",
+            &[],
+            &[],
+        ));
+        // Ancestor non-git dir (e.g. $HOME or /tmp/parent) must NOT penetrate child git repos.
+        assert!(!session_used_delegate_in_repo(
+            "used-in-parent-non-git",
+            &sessions,
+            "/tmp/parent/repo-b",
+            "/tmp/parent/repo-b",
+            &[],
+            &[],
+        ));
+        // When outside any git repo, non-git subdir fallback still matches.
+        assert!(session_used_delegate_in_repo(
+            "used-in-parent-non-git",
+            &sessions,
+            "",
+            "/tmp/parent/sub",
+            &[],
+            &[],
+        ));
     }
 }

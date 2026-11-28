@@ -926,6 +926,13 @@ class DelegateHookProgressiveTests(unittest.TestCase):
         self.assertEqual(doc_c["decision"], "block")
         self.assertIn("后台跑 `delegate wait --any`", doc_c["reason"])
 
+        # Register agy-c1 as a delegate-using session in this repo so it receives the ownerless live-run block
+        sdir = self.state_dir()
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / "sessions.json").write_text(
+            json.dumps({"agy-c1": {"lastSeenAt": iso_ago_mins(1), "repos": [str(repo.resolve())]}}),
+            encoding="utf-8",
+        )
         blk_agy = self.run_hook_check(
             "agy",
             {"cwd": str(repo), "conversationId": "agy-c1", "continuationActive": False, "terminationReason": "NO_TOOL_CALL"},

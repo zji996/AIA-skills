@@ -394,8 +394,24 @@ class DelegateStopHookReadStateTests(unittest.TestCase):
             return by_run.get(r_ro["run"]) == "answered" and by_run.get(r_wr["run"]) == "delivered"
         self.until(_both_flushed, "both runs flushed to events.jsonl and index.json")
 
+        # Stranger session that has NEVER used delegate in this repo is NEVER blocked,
+        # even when dead_sid's runs are past orphan timeout!
         self.write_sessions_json({dead_sid: {"pid": self.get_dead_pid(), "lastSeenAt": iso_ago(3.5)}})
         self.backdate_events_and_runs(3.0, [Path(r_ro["dir"]), Path(r_wr["dir"])])
+        self.assertIsNone(
+            self.run_stop_hook(
+                repo,
+                chat_env,
+                session_id=chat_sid,
+                extra_env={"DELEGATE_ORPHAN_TAKEOVER_HOURS": "2"},
+            )
+        )
+
+        # Register chat_sid as a session that has used delegate in this repo.
+        self.write_sessions_json({
+            dead_sid: {"pid": self.get_dead_pid(), "lastSeenAt": iso_ago(3.5), "repos": [str(repo.resolve())]},
+            chat_sid: {"lastSeenAt": iso_ago(0.1), "repos": [str(repo.resolve())]},
+        })
 
         # 3h < default 6h -> NOT yet eligible for takeover.
         self.assertIsNone(self.run_stop_hook(repo, chat_env, session_id=chat_sid))
@@ -531,8 +547,11 @@ class DelegateStopHookReadStateTests(unittest.TestCase):
 
         # Reset work.jsonl with W001 (owned by living owner_sid, stale 10h),
         # W002 (owned by dead gone_sid, stale 10h), W003 (no caller recorded, stale 9h).
+        # Preserve chat_sid & third_sid in sessions.json (they ran `delegate events` above).
         self.spawn_alive_caller(owner_sid)
-        self.write_sessions_json({gone_sid: {"pid": self.get_dead_pid(), "lastSeenAt": iso_ago(10)}})
+        existing_sessions = json.loads((self.state_dir() / "sessions.json").read_text(encoding="utf-8"))
+        existing_sessions[gone_sid] = {"pid": self.get_dead_pid(), "lastSeenAt": iso_ago(10)}
+        self.write_sessions_json(existing_sessions)
         (self.state_dir() / "work.jsonl").write_text(
             "".join(
                 json.dumps(it, ensure_ascii=False) + "\n"

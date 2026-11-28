@@ -5,20 +5,26 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SKILLS_SRC="$REPO_ROOT/skills"
 MARKER=".aia-skills-install"
 
-# Record whether ~/.gemini existed before install.sh creates any skill directories.
+# Record which host config directories already existed before install.sh creates skill dirs.
+HAD_CLAUDE=0
+[ -d "$HOME/.claude" ] && HAD_CLAUDE=1
 HAD_GEMINI=0
 [ -d "$HOME/.gemini" ] && HAD_GEMINI=1
+HAD_CODEX=0
+[ -d "$HOME/.codex" ] && HAD_CODEX=1
 
 # Shared directories and the agents that scan each of them.
 PRIMARY_DIRS=(
   "$HOME/.agents/skills"
   "$HOME/.claude/skills"
   "$HOME/.gemini/config/skills"
+  "$HOME/.rpi/agent/skills"
 )
 declare -A READERS=(
   ["$HOME/.agents/skills"]="pi codex cursor kilo"
   ["$HOME/.claude/skills"]="claude"
   ["$HOME/.gemini/config/skills"]="agy"
+  ["$HOME/.rpi/agent/skills"]="pi"
 )
 # Agent-specific directories, used only when a skill must skip a shared directory.
 declare -A OWN_DIR=(
@@ -27,6 +33,23 @@ declare -A OWN_DIR=(
   [kilo]="$HOME/.kilo/skills"
 )
 MANAGED_DIRS=("${PRIMARY_DIRS[@]}" "$HOME/.codex/skills" "$HOME/.cursor/skills" "$HOME/.kilo/skills")
+
+find_delegate_bin() {
+  local cand
+  for cand in \
+    "${DELEGATE_BIN:-}" \
+    "$SKILLS_SRC/delegate/bin/delegate" \
+    "${CARGO_TARGET_DIR:-$REPO_ROOT/crates/delegate/target}/debug/delegate" \
+    "$HOME/.agents/skills/delegate/bin/delegate" \
+    "$HOME/.claude/skills/delegate/bin/delegate" \
+    "$(command -v delegate 2>/dev/null || true)"; do
+    if [ -n "$cand" ] && [ -x "$cand" ]; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
 
 usage() {
   cat >&2 <<'EOF'
@@ -133,9 +156,12 @@ if [ "$ACTION" = uninstall ]; then
     removed=$((removed + 1))
     echo "  [Removed] $entry"
   done < <(owned_entries)
-  if [ -f "$HOME/.gemini/config/hooks.json" ] && [ -x "$REPO_ROOT/scripts/install-agy-hooks.sh" ]; then
-    if [ ${#SELECTED_SKILLS[@]} -eq 0 ] || [[ " ${SELECTED_SKILLS[*]} " == *" delegate "* ]]; then
-      "$REPO_ROOT/scripts/install-agy-hooks.sh" --uninstall
+  if [ ${#SELECTED_SKILLS[@]} -eq 0 ] || [[ " ${SELECTED_SKILLS[*]} " == *" delegate "* ]]; then
+    delegate_bin="$(find_delegate_bin || true)"
+    if [ -n "$delegate_bin" ]; then
+      [ -f "$HOME/.claude/settings.json" ] && "$delegate_bin" install-hooks --host claude --uninstall
+      [ -f "$HOME/.gemini/config/hooks.json" ] && "$delegate_bin" install-hooks --host agy --uninstall
+      [ -f "$HOME/.codex/hooks.json" ] && "$delegate_bin" install-hooks --host codex --uninstall
     fi
   fi
   echo "Done! Removed $removed entries."
@@ -277,15 +303,19 @@ while IFS= read -r entry; do
   echo "  [Pruned] $entry (source skill no longer exists)"
 done < <(owned_entries)
 
-# When ~/.gemini already exists and delegate is installed, wire agy Stop/PreToolUse hooks.
-if [ "$HAD_GEMINI" -eq 1 ] && [ -x "$REPO_ROOT/scripts/install-agy-hooks.sh" ]; then
-  for skill in "${SELECTED_SKILLS[@]}"; do
-    if [ "$skill" = delegate ]; then
-      "$REPO_ROOT/scripts/install-agy-hooks.sh"
-      break
+# When a supported controller config dir already existed and delegate is installed,
+# wire its Stop/PreToolUse hooks via the single `delegate install-hooks` entrypoint.
+for skill in "${SELECTED_SKILLS[@]}"; do
+  if [ "$skill" = delegate ]; then
+    delegate_bin="$(find_delegate_bin || true)"
+    if [ -n "$delegate_bin" ]; then
+      [ "$HAD_CLAUDE" -eq 1 ] && "$delegate_bin" install-hooks --host claude
+      [ "$HAD_GEMINI" -eq 1 ] && "$delegate_bin" install-hooks --host agy
+      [ "$HAD_CODEX" -eq 1 ] && "$delegate_bin" install-hooks --host codex
     fi
-  done
-fi
+    break
+  fi
+done
 
 # Warm up delegate's state index and archive usage cache asynchronously on install/upgrade.
 if [ -z "${AIA_SKILLS_SKIP_BINARIES:-}" ]; then

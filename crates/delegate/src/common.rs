@@ -30,58 +30,22 @@ pub const GUARDS: [&str; 7] = [
     "PI_DELEGATE_AGENT",
     "PI_DELEGATE_PARENT_RUN",
 ];
-/// Parent-controller session variables stripped when launching colleagues so nested
-/// Claude / Codex / Pi invocations never cross-talk with the parent session identity.
-/// Antigravity runtime variables (`ANTIGRAVITY_*`) are stripped by prefix in `clean_env`.
-pub const CONTROLLER_ENV: [&str; 4] = [
-    "CLAUDE_CODE_SESSION_ID",
-    "CODEX_THREAD_ID",
-    "PI_SESSION_ID",
-    "DELEGATE_CALLER",
-];
-/// Where the caller's session id comes from: an explicit id from any harness,
-/// then Antigravity (prioritized when `ANTIGRAVITY_AGENT` is active), Claude Code,
-/// Codex and Pi session variables.
-pub const CALLER_ENV: [&str; 5] = [
-    "DELEGATE_CALLER",
-    "ANTIGRAVITY_CONVERSATION_ID",
-    "CLAUDE_CODE_SESSION_ID",
-    "CODEX_THREAD_ID",
-    "PI_SESSION_ID",
-];
+/// Parent-controller session variables stripped when launching colleagues (from `hosts.rs`).
+pub const CONTROLLER_ENV: &[&str] = &crate::hosts::CONTROLLER_STRIP_ENV;
+/// Where the caller's session id comes from (from `hosts.rs`).
+pub const CALLER_ENV: &[&str] = &crate::hosts::CALLER_ENV_ALL;
 fn env_nonempty(name: &str) -> Option<String> {
     env::var(name)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
-pub(crate) fn is_antigravity_agent_with(get: impl Fn(&str) -> Option<String>) -> bool {
-    get("ANTIGRAVITY_AGENT")
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .is_some_and(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-}
 pub fn caller_source() -> Option<(String, &'static str)> {
-    caller_source_with(env_nonempty)
+    crate::hosts::caller_source_with(env_nonempty)
 }
+#[cfg(test)]
 fn caller_source_with(get: impl Fn(&str) -> Option<String>) -> Option<(String, &'static str)> {
-    let order: [&str; 5] = if is_antigravity_agent_with(&get) {
-        CALLER_ENV
-    } else {
-        [
-            "DELEGATE_CALLER",
-            "CLAUDE_CODE_SESSION_ID",
-            "CODEX_THREAD_ID",
-            "PI_SESSION_ID",
-            "ANTIGRAVITY_CONVERSATION_ID",
-        ]
-    };
-    order.into_iter().find_map(|name| {
-        get(name)
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .map(|value| (value, name))
-    })
+    crate::hosts::caller_source_with(get)
 }
 pub fn caller() -> Option<String> {
     caller_source().map(|(id, _)| id)
@@ -167,40 +131,7 @@ fn is_harness_cmdline(pid: u32, source: Option<&str>) -> bool {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(first);
-    let matches_direct = match source {
-        Some("CLAUDE_CODE_SESSION_ID") => matches!(base, "claude"),
-        Some("ANTIGRAVITY_CONVERSATION_ID") => matches!(base, "agy" | "antigravity"),
-        Some("CODEX_THREAD_ID") => matches!(base, "codex"),
-        Some("PI_SESSION_ID") => matches!(base, "pi" | "rpi"),
-        _ => matches!(
-            base,
-            "claude" | "codex" | "pi" | "rpi" | "agy" | "antigravity"
-        ),
-    };
-    if matches_direct {
-        return true;
-    }
-    if matches!(base, "node" | "bun" | "deno") {
-        return tokens.iter().skip(1).take(3).any(|arg| {
-            let lower = arg.to_ascii_lowercase();
-            match source {
-                Some("CLAUDE_CODE_SESSION_ID") => lower.contains("claude"),
-                Some("ANTIGRAVITY_CONVERSATION_ID") => lower.contains("antigravity"),
-                Some("CODEX_THREAD_ID") => lower.contains("codex"),
-                Some("PI_SESSION_ID") => {
-                    lower.ends_with("/pi") || lower.contains("pi-coding-agent")
-                }
-                _ => {
-                    lower.contains("claude")
-                        || lower.contains("codex")
-                        || lower.ends_with("/pi")
-                        || lower.contains("pi-coding-agent")
-                        || lower.contains("antigravity")
-                }
-            }
-        });
-    }
-    false
+    crate::hosts::matches_harness_process(base, &tokens, source)
 }
 
 pub(crate) fn find_session_harness_pid(source: Option<&str>) -> Option<(u32, u64, i32)> {
@@ -257,10 +188,15 @@ fn current_cwd_canonical() -> Option<String> {
 }
 
 /// Lock-free best-effort recording of the caller's activity timestamp, terminal, cwd,
-/// and enclosing harness PID (when detected) into `<state>/sessions.json` so the Stop
-/// hook can tell whether a session is still live using delegate's own timestamps and
-/// suggest `delegate adopt <run>` after `/clear` in the same terminal or working directory.
+/// repos where delegate was used, and enclosing harness PID (when detected) into
+/// `<state>/sessions.json` so the Stop hook can tell whether a session is still live
+/// using delegate's own timestamps, gate cross-session penetration to sessions that
+/// actually used delegate in this repo, and suggest `delegate adopt <run>` after `/clear`.
 pub fn touch_caller_session() {
+    touch_caller_session_for_repo(None);
+}
+
+pub fn touch_caller_session_for_repo(explicit_repo: Option<&Path>) {
     let Some((id, source)) = caller_source() else {
         return;
     };
@@ -278,6 +214,26 @@ pub fn touch_caller_session() {
     let harness = find_session_harness_pid(Some(source));
     let tty = current_terminal_id(harness.map_or(0, |(_, _, tty_nr)| tty_nr));
     let cwd = current_cwd_canonical();
+    let mut repo_entries: Vec<String> = Vec::new();
+    let mut push_entry = |root: PathBuf| {
+        let s = root.to_string_lossy().into_owned();
+        if !s.is_empty() && !repo_entries.contains(&s) {
+            repo_entries.push(s);
+        }
+    };
+    if let Some(er) = explicit_repo {
+        let root = git_top_fast(er)
+            .unwrap_or_else(|| fs::canonicalize(er).unwrap_or_else(|_| er.to_path_buf()));
+        push_entry(root);
+    }
+    // Only record `cwd` into `repos` when `cwd` is inside a git repository, so commands
+    // run from a non-git directory (e.g. `$HOME` with `--workdir` or `events`) never
+    // pollute `repos` with an ancestor directory.
+    if let Some(ref c) = cwd {
+        if let Some(cwd_repo) = git_top_fast(Path::new(c)) {
+            push_entry(cwd_repo);
+        }
+    }
     if let Some(map) = doc.as_object_mut() {
         let prev = map.get(&id).cloned().unwrap_or(Value::Null);
         map.retain(|k, v| {
@@ -310,6 +266,36 @@ pub fn touch_caller_session() {
         }
         if let Some(c) = cwd {
             rec["cwd"] = serde_json::json!(c);
+        } else {
+            let old = s(&prev, "cwd");
+            if !old.is_empty() {
+                rec["cwd"] = serde_json::json!(old);
+            }
+        }
+        let mut repos: Vec<String> = strings(&prev["repos"]);
+        if repos.is_empty() {
+            let old_cwd = s(&prev, "cwd").trim();
+            if !old_cwd.is_empty() {
+                let p = Path::new(old_cwd);
+                let migrated = git_top_fast(p)
+                    .unwrap_or_else(|| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()));
+                let ms = migrated.to_string_lossy().into_owned();
+                if !ms.is_empty() {
+                    repos.push(ms);
+                }
+            }
+        }
+        for r in repo_entries {
+            if !repos.contains(&r) {
+                repos.push(r);
+            }
+        }
+        if repos.len() > 64 {
+            let keep_from = repos.len() - 64;
+            repos = repos.split_off(keep_from);
+        }
+        if !repos.is_empty() {
+            rec["repos"] = serde_json::json!(repos);
         }
         map.insert(id, rec);
     }
@@ -815,7 +801,11 @@ where
     S: AsRef<std::ffi::OsStr>,
 {
     for k in host_keys {
-        if k.as_ref().to_string_lossy().starts_with("ANTIGRAVITY_") {
+        let ks = k.as_ref().to_string_lossy();
+        if crate::hosts::CONTROLLER_STRIP_PREFIXES
+            .iter()
+            .any(|p| ks.starts_with(p))
+        {
             c.env_remove(k.as_ref());
         }
     }
@@ -1583,7 +1573,7 @@ mod git_lock_tests {
                 )
             })
             .collect();
-        for key in CONTROLLER_ENV {
+        for &key in CONTROLLER_ENV {
             assert_eq!(envs.get(key), Some(&None), "expected {key} to be removed");
         }
         for key in [

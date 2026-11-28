@@ -205,7 +205,9 @@ CALLER_ENV = (
     "ANTIGRAVITY_CONVERSATION_ID",
     "CLAUDE_CODE_SESSION_ID",
     "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
     "PI_SESSION_ID",
+    "RPI_SESSION_ID",
 )
 SETTLED = {"type": "agent_settled"}
 # Verbatim shape of a real failure: the model printed its tool call as text and stopped.

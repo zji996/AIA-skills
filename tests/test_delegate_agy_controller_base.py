@@ -39,7 +39,9 @@ CONTROLLER_STRIPPED_VARS = (
     "ANTIGRAVITY_FUTURE_CUSTOM",
     "CLAUDE_CODE_SESSION_ID",
     "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
     "PI_SESSION_ID",
+    "RPI_SESSION_ID",
     "DELEGATE_CALLER",
 )
 
@@ -580,6 +582,20 @@ class DelegateAgyControllerBaseTests(unittest.TestCase):
                     entry["status"]["startedAt"] = old_iso
             idx_p.write_text(json.dumps(idx) + "\n", encoding="utf-8")
 
+        # Stranger agy session (never used delegate in this repo) is NOT blocked even past 6h!
+        self.assertIsNone(run_stop(agy2_env))
+
+        # Once agy-bystander-ts has used delegate in this repo, orphan takeover fires!
+        sessions_path.write_text(
+            json.dumps(
+                {
+                    "agy-owner-ts": {"lastSeenAt": old_iso, "repos": [str(repo.resolve())]},
+                    "agy-bystander-ts": {"lastSeenAt": iso_ago(0.1), "repos": [str(repo.resolve())]},
+                },
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
         blk = run_stop(agy2_env)
         self.assertIsNotNone(blk)
         self.assertIn("接盘", blk["reason"])

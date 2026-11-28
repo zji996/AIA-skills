@@ -29,6 +29,23 @@ BACKGROUND_HOOK = ROOT / "skills/delegate/hooks/claude-code-background.py"
 ADR_INDEX = ROOT / "skills/repo-governance/scripts/adr-index.py"
 ADR_ARCHIVE = ROOT / "skills/repo-governance/scripts/adr-archive.py"
 
+_DELEGATE_BIN_CACHE: Path | None = None
+
+
+def _delegate_bin() -> Path:
+    global _DELEGATE_BIN_CACHE
+    if _DELEGATE_BIN_CACHE is not None:
+        return _DELEGATE_BIN_CACHE
+    if os.environ.get("DELEGATE_BIN"):
+        _DELEGATE_BIN_CACHE = Path(os.environ["DELEGATE_BIN"]).resolve()
+        return _DELEGATE_BIN_CACHE
+    tests_dir = str(Path(__file__).resolve().parent)
+    if tests_dir not in sys.path:
+        sys.path.insert(0, tests_dir)
+    import test_delegate as delegate_fixtures
+    _DELEGATE_BIN_CACHE = delegate_fixtures.DELEGATE
+    return _DELEGATE_BIN_CACHE
+
 
 class ScriptTests(unittest.TestCase):
     def setUp(self):
@@ -38,8 +55,10 @@ class ScriptTests(unittest.TestCase):
 
     def run_script(self, script, *args, env=None, input=None):
         # The installer's own tests must not reach the network or a compiler for delegate's binary.
-        env = {**(env if env is not None else os.environ), "AIA_SKILLS_SKIP_BINARIES": "1"}
-        return subprocess.run([str(script), *map(str, args)], cwd=self.work, env=env, input=input,
+        base = dict(env if env is not None else os.environ)
+        base["AIA_SKILLS_SKIP_BINARIES"] = "1"
+        base.setdefault("DELEGATE_BIN", str(_delegate_bin()))
+        return subprocess.run([str(script), *map(str, args)], cwd=self.work, env=base, input=input,
                               capture_output=True, text=True, timeout=15)
 
     def test_sync_hosts_runs_each_host_and_reports_failures(self):
@@ -102,13 +121,13 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(self.run_script(INSTALL, "agent-handoff", "--force", env=env).returncode, 0)
         self.assertEqual(link.resolve(), ROOT / "skills/agent-handoff")
 
-    def test_install_keeps_delegate_out_of_pi_directories(self):
+    def test_install_installs_delegate_to_all_primary_dirs_and_respects_exclude_agents_pi(self):
         home = self.work / "home"
         shared = home / ".agents/skills"
         shared.mkdir(parents=True)
-        (shared / "delegate").symlink_to(ROOT / "skills/delegate")
         (shared / "agent-delegation").symlink_to(ROOT / "skills/agent-delegation")
         (home / ".codex/skills").mkdir(parents=True)
+        (home / ".codex/skills/delegate").symlink_to(ROOT / "skills/delegate")
         # Pre-4.0 name whose checkout still holds a cache directory after the rename.
         leftover = ROOT / f"skills/zz-renamed-skill-test-{os.getpid()}"
         (leftover / "scripts/__pycache__").mkdir(parents=True)
@@ -117,14 +136,39 @@ class ScriptTests(unittest.TestCase):
         env = {**os.environ, "HOME": str(home)}
         result = self.run_script(INSTALL, "delegate", "repo-governance", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse((shared / "delegate").is_symlink())
+        # delegate now installs into all primary skill dirs (including ~/.agents/skills & ~/.rpi/agent/skills)
+        # and prunes old redundant per-agent links + renamed leftovers.
+        for primary in (".agents/skills", ".claude/skills", ".gemini/config/skills", ".rpi/agent/skills"):
+            self.assertEqual((home / primary / "delegate").resolve(), ROOT / "skills/delegate")
+            self.assertEqual((home / primary / "repo-governance").resolve(), ROOT / "skills/repo-governance")
+        self.assertFalse((home / ".codex/skills/delegate").is_symlink())
         self.assertFalse((home / ".codex/skills/pi-delegation").is_symlink())
         self.assertFalse((shared / "agent-delegation").is_symlink())
-        self.assertEqual((shared / "repo-governance").resolve(), ROOT / "skills/repo-governance")
-        for directory in (".codex", ".cursor", ".claude", ".kilo"):
-            self.assertEqual((home / directory / "skills/delegate").resolve(), ROOT / "skills/delegate")
         self.assertFalse((home / ".codex/skills/repo-governance").exists())
         self.assertFalse((home / ".kilo/skills/repo-governance").exists())
+        # Pre-existing ~/.codex triggers Codex hook installation automatically.
+        codex_hooks = home / ".codex/hooks.json"
+        self.assertTrue(codex_hooks.is_file(), "expected ~/.codex/hooks.json when ~/.codex pre-existed")
+        codex_doc = json.loads(codex_hooks.read_text(encoding="utf-8"))
+        self.assertIn("Stop", codex_doc["hooks"])
+        self.assertIn("PreToolUse", codex_doc["hooks"])
+
+        # Skills declaring `exclude-agents: pi` still skip ~/.agents/skills and ~/.rpi/agent/skills.
+        mini_repo = self.work / "mini-pi-exclude"
+        (mini_repo / "scripts").mkdir(parents=True)
+        shutil.copy2(INSTALL, mini_repo / "scripts/install.sh")
+        (mini_repo / "skills/no-pi").mkdir(parents=True)
+        (mini_repo / "skills/no-pi/SKILL.md").write_text(
+            "---\nname: no-pi\ndescription: 测试时使用。Use when testing.\n"
+            "metadata:\n  version: \"1.0.0\"\n  exclude-agents: pi\n---\n"
+        )
+        home_ex = self.work / "home-ex-pi"
+        res_ex = self.run_script(mini_repo / "scripts/install.sh", "no-pi", env={**os.environ, "HOME": str(home_ex)})
+        self.assertEqual(res_ex.returncode, 0, res_ex.stdout + res_ex.stderr)
+        self.assertFalse((home_ex / ".agents/skills/no-pi").exists())
+        self.assertFalse((home_ex / ".rpi/agent/skills/no-pi").exists())
+        for directory in (".codex", ".cursor", ".claude", ".kilo"):
+            self.assertEqual((home_ex / directory / "skills/no-pi").resolve(), mini_repo / "skills/no-pi")
 
     def test_install_removes_redundant_links_and_uninstalls_only_owned(self):
         home = self.work / "home"

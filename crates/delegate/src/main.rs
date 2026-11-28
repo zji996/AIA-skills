@@ -28,6 +28,7 @@ mod help;
 mod history;
 mod hook;
 mod hook_check;
+mod hosts;
 mod index;
 mod inotify;
 mod jobserver;
@@ -119,13 +120,7 @@ fn output_line(run: &Path, status: serde_json::Value) -> String {
 }
 
 fn default_check_in_with(get: impl Fn(&str) -> Option<String>) -> Option<f64> {
-    if get("CLAUDE_CODE_SESSION_ID").is_some_and(|v| !v.trim().is_empty())
-        || get("ANTIGRAVITY_CONVERSATION_ID").is_some_and(|v| !v.trim().is_empty())
-    {
-        Some(50.0 * 60.0)
-    } else {
-        None
-    }
+    hosts::check_in_50m_with(get)
 }
 
 fn check_in(max: Option<f64>, runs: &[PathBuf]) -> Option<f64> {
@@ -2054,10 +2049,10 @@ fn adopt_command(args: &[String]) -> Res<i32> {
         return Err("adopt requires at least one run (usage: delegate adopt <run>...)".into());
     }
     let Some((new_caller, new_source)) = caller_source() else {
-        return Err(
-            "adopt requires an active caller session (DELEGATE_CALLER / ANTIGRAVITY_CONVERSATION_ID / CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID / PI_SESSION_ID)"
-                .into(),
-        );
+        return Err(format!(
+            "adopt requires an active caller session ({})",
+            hosts::caller_env_display_list()
+        ));
     };
     touch_caller_session();
 
@@ -4072,6 +4067,8 @@ fn main_inner(args: &[String]) -> Res<i32> {
         "speed" => speed::command(rest),
         "eta" => eta::command(rest),
         "hook" => hook::command(rest),
+        "hosts" => hosts::hosts_command(rest),
+        "install-hooks" => hosts::install_hooks_command(rest),
         "events" => events::command(rest),
         "queue" => dag_queue::command(rest),
         "sign" => review::sign_command(rest),

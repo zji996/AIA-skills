@@ -418,7 +418,8 @@ class DelegateApplySafetyTests(unittest.TestCase):
         sdir.mkdir(parents=True, exist_ok=True)
         dead_pid = self.get_dead_pid()
 
-        # Case A: Dead caller in SAME cwd (only 5 minutes ago, << 6h) -> Stop hook prompts `delegate adopt <run>`!
+        # Case A: Dead caller in SAME cwd (only 5 minutes ago, << 6h):
+        # First, if `new_sid` has NEVER used delegate in this repo, Stop hook stays silent!
         (sdir / "sessions.json").write_text(
             json.dumps(
                 {
@@ -428,6 +429,36 @@ class DelegateApplySafetyTests(unittest.TestCase):
                         "tty": "tmux:%1",
                         "lastSeenAt": iso_ago(0.08),
                     }
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertIsNone(
+            self.run_stop_hook(
+                repo,
+                new_env,
+                session_id=new_sid,
+                extra_env={"TMUX_PANE": "%99"},
+            )
+        )
+
+        # Once `new_sid` is recorded in `sessions.json` for this repo, Stop hook prompts `delegate adopt <run>`!
+        (sdir / "sessions.json").write_text(
+            json.dumps(
+                {
+                    old_sid: {
+                        "pid": dead_pid,
+                        "cwd": str(repo.resolve()),
+                        "tty": "tmux:%1",
+                        "lastSeenAt": iso_ago(0.08),
+                    },
+                    new_sid: {
+                        "cwd": str(repo.resolve()),
+                        "repos": [str(repo.resolve())],
+                        "lastSeenAt": iso_ago(0.01),
+                    },
                 },
                 indent=2,
             )
@@ -455,7 +486,12 @@ class DelegateApplySafetyTests(unittest.TestCase):
                         "cwd": str(other_dir.resolve()),
                         "tty": "tmux:%1",
                         "lastSeenAt": iso_ago(0.08),
-                    }
+                    },
+                    new_sid: {
+                        "cwd": str(repo.resolve()),
+                        "repos": [str(repo.resolve())],
+                        "lastSeenAt": iso_ago(0.01),
+                    },
                 },
                 indent=2,
             )
