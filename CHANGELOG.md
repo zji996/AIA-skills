@@ -2,8 +2,11 @@
 
 ## Unreleased
 
-- `delegate`：主控宿主解耦为单一来源宿主表（`crates/delegate/src/hosts.rs`），正式支持 `claude`、`agy`、`codex`、`pi` 四个主控并新增 `delegate hosts [--json]` 与 `delegate install-hooks --host <名> [--path] [--stop-only] [--uninstall]`；`hook check` 与 `claude-code-background.py` 改为先出中立判定再按宿主表渲染（新增 `--format codex`，`install-claude-hooks.sh`/`install-agy-hooks.sh` 改为薄壳，`install.sh` 纳入 `~/.rpi/agent/skills` 并联动接好本机已存在主控的钩子）；收工拦截与护盾识别并静默放行 Cursor/Kilo 及未知宿主（环境变量与 payload 字段任一命中即放行），跨会话 30 分钟穿透与孤儿接盘仅投给 `sessions.json` 本仓库有记录的会话且 `hook check` 不再为陌生会话建记录；`SKILL.md` 移除 `exclude-agents: pi`，Pi/rpi 同事改由 `--no-skills` 与 `DELEGATE_AGENT` 隔离。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
+
+## delegate 6.62.0 - 2026-11-28
+
+- `delegate` 6.62.0：主控宿主解耦为单一来源宿主表（`crates/delegate/src/hosts.rs`），正式支持 `claude`、`agy`、`codex`、`pi` 四个主控并新增 `delegate hosts [--json]` 与 `delegate install-hooks --host <名> [--path] [--stop-only] [--uninstall]`；`hook check` 与 `claude-code-background.py` 改为先出中立判定再按宿主表渲染（新增 `--format codex`，`install-claude-hooks.sh`/`install-agy-hooks.sh` 改为薄壳，`install.sh` 纳入 `~/.rpi/agent/skills` 并联动接好本机已存在主控的钩子）；收工拦截与护盾识别并静默放行 Cursor/Kilo 及未知宿主（环境变量与 payload 字段任一命中即放行），跨会话 30 分钟穿透与孤儿接盘仅投给 `sessions.json` 本仓库有记录的会话且 `hook check` 不再为陌生会话建记录；`SKILL.md` 移除 `exclude-agents: pi`，Pi/rpi 同事改由 `--no-skills` 与 `DELEGATE_AGENT` 隔离。
 
 ## delegate 6.61.0 - 2026-11-28
 
