@@ -105,7 +105,31 @@ pub(crate) fn proc_stat_state_ppid_ticks_tty(pid: u32) -> Option<(char, u32, u64
     Some((state, ppid, ticks, tty_nr))
 }
 
-pub(crate) fn pid_alive_with_ticks(pid: u32, expected_ticks: Option<u64>) -> bool {
+/// Write `<run>/stall-warning.json` unless an active warning of a different `kind` is present.
+pub fn write_stall_warning_for_kind(run: &Path, kind: &str, warning: &Value) -> bool {
+    let path = run.join("stall-warning.json");
+    if path.is_file() {
+        let existing = json(&path);
+        let existing_kind = s(&existing, "kind");
+        if !existing_kind.is_empty() && existing_kind != kind {
+            return false;
+        }
+    }
+    write_json(path, warning).is_ok()
+}
+
+/// Remove `<run>/stall-warning.json` only if its `kind` matches `kind`.
+pub fn clear_stall_warning_for_kind(run: &Path, kind: &str) {
+    let path = run.join("stall-warning.json");
+    if path.is_file() {
+        let existing = json(&path);
+        if s(&existing, "kind") == kind {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+pub fn pid_alive_with_ticks(pid: u32, expected_ticks: Option<u64>) -> bool {
     if !pid_alive(pid as i32) {
         return false;
     }

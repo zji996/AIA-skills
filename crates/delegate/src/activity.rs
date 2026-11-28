@@ -300,6 +300,19 @@ fn inspect_transcript_tail(meta: &Value) -> TranscriptTail {
     out
 }
 
+fn format_stall_suffix(sw: &Value) -> String {
+    if s(sw, "kind") == "lane" || sw["pid"].as_u64().is_some() {
+        let proc_info = crate::output::format_stall_proc(sw);
+        if proc_info.is_empty() {
+            " · 疑似卡住".into()
+        } else {
+            format!(" · 疑似卡住（{proc_info}）")
+        }
+    } else {
+        " · 卡住提醒".into()
+    }
+}
+
 /// Inspect a live run's activity from the tail of `events.jsonl`, session transcript,
 /// `stderr.log`, queue markers, and `stall-warning.json`.
 pub fn inspect(run: &Path, meta: &Value, state: &str) -> Value {
@@ -503,7 +516,10 @@ pub fn inspect(run: &Path, meta: &Value, state: &str) -> Value {
         let elapsed = (now - started_ts).max(0);
         let cmd = shorten_cmd(&raw_cmd, meta, 56);
         let dur = format_short_duration(elapsed);
-        let suffix = if stall_warning.is_some() { " · 卡住提醒" } else { "" };
+        let suffix = stall_warning
+            .as_ref()
+            .map(format_stall_suffix)
+            .unwrap_or_default();
         let mut out = json!({
             "kind": "running_command",
             "cmd": cmd,
@@ -528,11 +544,10 @@ pub fn inspect(run: &Path, meta: &Value, state: &str) -> Value {
                 .unwrap_or_else(|| (now - started).max(0));
             let cmd = shorten_cmd(s(meta, "accept"), meta, 56);
             let dur = format_short_duration(elapsed);
-            let suffix = if stall_warning.is_some() {
-                " · 卡住提醒"
-            } else {
-                ""
-            };
+            let suffix = stall_warning
+                .as_ref()
+                .map(format_stall_suffix)
+                .unwrap_or_default();
             let mut out = json!({
                 "kind": "running_command",
                 "cmd": cmd,

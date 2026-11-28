@@ -6,10 +6,13 @@ use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_MAX_BYTES: usize = 12 * 1024;
 pub const BLOCK_LINES: usize = 40;
 pub const ACTIVE_ENV: &str = "DELEGATE_CMD_OUT_ACTIVE";
+const ACTIVE_FILE_NAME: &str = ".active";
+const ACTIVE_THROTTLE: Duration = Duration::from_millis(100);
 
 const ERROR_MARKERS: &[&str] = &["error[", "error:", "FAILED", "panicked"];
 
@@ -253,9 +256,68 @@ fn cloexec_pipe() -> Res<(File, File)> {
     Ok((reader, writer))
 }
 
-fn run_captured(real: &str, args: &[String]) -> Res<CapturedOutput> {
+struct ActiveOutputTracker {
+    out_dir: PathBuf,
+    active_path: PathBuf,
+    tmp_path: PathBuf,
+    last_write: Instant,
+    last_bytes: usize,
+}
+
+impl ActiveOutputTracker {
+    fn start(run: &Path) -> Option<Self> {
+        let out_dir = run.join("cmd-out");
+        fs::create_dir_all(&out_dir).ok()?;
+        let active_path = out_dir.join(ACTIVE_FILE_NAME);
+        let tmp_path = out_dir.join(format!(".active.tmp.{}", std::process::id()));
+        let mut tracker = Self {
+            out_dir,
+            active_path,
+            tmp_path,
+            last_write: Instant::now(),
+            last_bytes: 0,
+        };
+        tracker.write_bytes(0);
+        Some(tracker)
+    }
+
+    fn write_bytes(&mut self, total_bytes: usize) {
+        if fs::write(&self.tmp_path, format!("{total_bytes}\n")).is_ok() {
+            let _ = fs::rename(&self.tmp_path, &self.active_path);
+        }
+        self.last_bytes = total_bytes;
+        self.last_write = Instant::now();
+    }
+
+    fn note_bytes(&mut self, total_bytes: usize) {
+        if total_bytes == self.last_bytes {
+            return;
+        }
+        if self.last_bytes > 0 && self.last_write.elapsed() < ACTIVE_THROTTLE {
+            return;
+        }
+        self.write_bytes(total_bytes);
+    }
+}
+
+impl Drop for ActiveOutputTracker {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.tmp_path);
+        let _ = fs::remove_file(&self.active_path);
+        let _ = fs::remove_dir(&self.out_dir);
+    }
+}
+
+/// Read the cumulative captured bytes from `<run>/cmd-out/.active` while `_cmd-out` is active.
+pub fn read_active_bytes(run: &Path) -> Option<u64> {
+    let raw = fs::read_to_string(run.join("cmd-out").join(ACTIVE_FILE_NAME)).ok()?;
+    raw.trim().parse::<u64>().ok()
+}
+
+fn run_captured(real: &str, args: &[String], active_run: Option<&Path>) -> Res<CapturedOutput> {
     let (out_r, out_w) = cloexec_pipe()?;
     let (err_r, err_w) = cloexec_pipe()?;
+    let mut active_tracker = active_run.and_then(ActiveOutputTracker::start);
 
     let mut child = Command::new(real)
         .args(args)
@@ -310,6 +372,9 @@ fn run_captured(real: &str, args: &[String]) -> Res<CapturedOutput> {
                         stderr.extend_from_slice(chunk);
                     }
                     merged.extend_from_slice(chunk);
+                    if let Some(tracker) = active_tracker.as_mut() {
+                        tracker.note_bytes(merged.len());
+                    }
                 } else if n == 0 {
                     pfd.fd = -1;
                 } else {
@@ -325,6 +390,7 @@ fn run_captured(real: &str, args: &[String]) -> Res<CapturedOutput> {
     drop(err_r);
 
     let status = child.wait().map_err(|e| e.to_string())?;
+    drop(active_tracker);
     let code = status.code().unwrap_or_else(|| {
         use std::os::unix::process::ExitStatusExt;
         status.signal().map(|sig| 128 + sig).unwrap_or(1)
@@ -354,7 +420,7 @@ pub fn execute_argv_with_limit(
     args: &[String],
     max_bytes: usize,
 ) -> Res<i32> {
-    let captured = run_captured(real, args)?;
+    let captured = run_captured(real, args, Some(run))?;
     if captured.merged.len() <= max_bytes {
         if !captured.stdout.is_empty() {
             let mut stdout = io::stdout().lock();
@@ -723,7 +789,7 @@ mod tests {
         write(&small_script, "#!/bin/sh\necho 'hello stdout'\necho 'hello stderr' >&2\nexit 7\n").unwrap();
         fs::set_permissions(&small_script, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let cap = run_captured(small_script.to_str().unwrap(), &[]).unwrap();
+        let cap = run_captured(small_script.to_str().unwrap(), &[], None).unwrap();
         assert_eq!(cap.code, 7);
         assert_eq!(String::from_utf8_lossy(&cap.stdout).trim(), "hello stdout");
         assert_eq!(String::from_utf8_lossy(&cap.stderr).trim(), "hello stderr");
@@ -789,6 +855,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(count_author_steps(&dir, &cfg), (5, 2));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_file_tracks_bytes_during_execution_and_cleans_up() {
+        let dir = temp_dir("active");
+        let run_dir = dir.join("run");
+        fs::create_dir_all(&run_dir).unwrap();
+        let gate = dir.join("gate");
+        let script = dir.join("stream.sh");
+        write(
+            &script,
+            format!(
+                "#!/bin/sh\necho 'line-one-payload'\nwhile [ ! -f '{}' ]; do sleep 0.02; done\necho 'line-two-payload'\n",
+                gate.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let run_bg = run_dir.clone();
+        let script_bg = script.to_string_lossy().into_owned();
+        let handle = std::thread::spawn(move || {
+            execute_argv_with_limit(&run_bg, &script_bg, &[], DEFAULT_MAX_BYTES)
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut observed = None;
+        while Instant::now() < deadline {
+            if let Some(bytes) = read_active_bytes(&run_dir) {
+                if bytes > 0 {
+                    observed = Some(bytes);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = fs::write(&gate, "go\n");
+        let code = handle.join().unwrap().unwrap();
+        assert_eq!(code, 0);
+        assert!(
+            observed.is_some_and(|b| b >= 16),
+            "expected positive active bytes during run, got {observed:?}"
+        );
+        // Cleaned up after exit, and empty cmd-out dir removed when <= max_bytes.
+        assert!(read_active_bytes(&run_dir).is_none());
+        assert!(!run_dir.join("cmd-out").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

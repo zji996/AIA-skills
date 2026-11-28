@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `delegate`：`delegate lane` 新增长时间无进展卡住检测与提醒（不自动 kill、不设超时）——`_cmd-out` 运行期节流更新 `<run>/cmd-out/.active` 累计字节数（退出清理），`lane` 沿用 `Stdio::inherit` 并在现有等待循环中按 `<state>/events.jsonl` 同仓+归一化命令前缀 `lane_released` 历史 p75×2（冷启动回退 `stall.accept`，支持 `DELEGATE_LANE_STALL_MULTIPLIER` / `DELEGATE_LANE_STALL_WINDOW`）与近窗口进程树 CPU 增量 <1% 且 `.active` 字节未变判定疑似卡住；触发时写手侧 stderr 打印中文提示并写 `kind:"lane"` `stall-warning.json`（与 `agents.rs` 警告互不覆盖、恢复或退出时清理），`delegate status` 标「疑似卡住」并展示最深阻塞进程 PID/comm/wchan，`delegate wait --machine` 立即唤醒输出事件与下一步并按 seq/时间戳去重。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
 
 ## delegate 6.58.0 - 2026-11-28

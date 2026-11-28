@@ -12,6 +12,46 @@ pub fn enable_json() {
 pub fn json_enabled() -> bool {
     JSON.load(Ordering::Relaxed)
 }
+
+/// Format the deepest blocked process metadata from a `stall-warning.json` object.
+pub fn format_stall_proc(sw: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(pid) = sw["pid"].as_u64() {
+        parts.push(format!("pid={pid}"));
+    }
+    let comm = s(sw, "comm");
+    if !comm.is_empty() {
+        parts.push(format!("comm={comm}"));
+    }
+    let wchan = s(sw, "wchan");
+    if !wchan.is_empty() {
+        parts.push(format!("wchan={wchan}"));
+    }
+    parts.join(" ")
+}
+
+fn format_stall_warning_part(sw: &Value, act_label: &str) -> Option<String> {
+    let det = s(sw, "detail");
+    if s(sw, "kind") == "lane" || sw["pid"].as_u64().is_some() {
+        if act_label.contains("疑似卡住") {
+            return None;
+        }
+        let proc_info = format_stall_proc(sw);
+        if !proc_info.is_empty() {
+            Some(format!("⚠ 疑似卡住（{proc_info}）"))
+        } else if !det.is_empty() {
+            Some(format!("⚠ 疑似卡住：{}", clip(det, 60)))
+        } else {
+            Some("⚠ 疑似卡住（lane）".into())
+        }
+    } else if det.is_empty() {
+        Some(format!("⚠ 卡住提醒（{}）", s(sw, "kind")))
+    } else if !act_label.contains("卡住提醒") {
+        Some(format!("⚠ 卡住提醒：{}", clip(det, 60)))
+    } else {
+        None
+    }
+}
 fn glob_match(pattern: &[u8], path: &[u8]) -> bool {
     if pattern.is_empty() {
         return path.is_empty();
@@ -512,12 +552,10 @@ pub fn human_line_with_repo(
         }
     }
     if status["stallWarning"].is_object() {
-        let sw = &status["stallWarning"];
-        let det = s(sw, "detail");
-        if det.is_empty() {
-            parts.push(format!("⚠ 卡住提醒（{}）", s(sw, "kind")));
-        } else if !s(&status["activity"], "label").contains("卡住提醒") {
-            parts.push(format!("⚠ 卡住提醒：{}", clip(det, 60)));
+        if let Some(part) =
+            format_stall_warning_part(&status["stallWarning"], s(&status["activity"], "label"))
+        {
+            parts.push(part);
         }
     }
     if let Some(ahead) = status["measureWaitingAhead"].as_u64() {
@@ -1022,7 +1060,18 @@ pub fn human_detail(run: &Path, status: &Value) -> String {
         let sw = &status["stallWarning"];
         let det = s(sw, "detail");
         let sc = s(sw, "selfCheck");
-        if !det.is_empty() {
+        if s(sw, "kind") == "lane" || sw["pid"].as_u64().is_some() {
+            let proc_info = format_stall_proc(sw);
+            let mut msg = String::from("  ⚠ 疑似卡住（lane");
+            if !proc_info.is_empty() {
+                msg.push_str(&format!("，{proc_info}"));
+            }
+            msg.push('）');
+            if !det.is_empty() {
+                msg.push_str(&format!("：{det}"));
+            }
+            lines.push(msg);
+        } else if !det.is_empty() {
             lines.push(format!("  ⚠ 卡住提醒（{}）：{det}", s(sw, "kind")));
         }
         if !sc.is_empty() {

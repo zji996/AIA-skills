@@ -1,8 +1,9 @@
 use crate::common::*;
 use serde_json::{json, Value};
 use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, BufRead, BufReader};
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
@@ -1561,8 +1562,15 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
     group(&mut c);
     let child = c.spawn().map_err(|e| e.to_string())?;
     let pid = child.id() as i32;
+    let mut stall_monitor = LaneStallMonitor::new(
+        pid as u32,
+        account.as_deref(),
+        &slot.event_repo,
+        &command,
+    );
     loop {
         if let Some((status, rusage)) = try_wait4(pid).map_err(|e| e.to_string())? {
+            drop(stall_monitor);
             slot.set_rusage(rusage);
             let sig = SIGNAL.load(Ordering::SeqCst);
             if let Some(dir) = &temporary {
@@ -1576,6 +1584,7 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
         }
         let sig = SIGNAL.load(Ordering::SeqCst);
         if sig != 0 {
+            drop(stall_monitor);
             end_group(pid, 3.0);
             if let Ok((_, rusage)) = wait4_blocking(pid) {
                 slot.set_rusage(rusage);
@@ -1585,7 +1594,479 @@ pub fn lane_command(args: &[String]) -> Res<i32> {
             }
             return Ok(128 + sig);
         }
+        if let Some(monitor) = stall_monitor.as_mut() {
+            monitor.poll(pid as u32);
+        }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+const LANE_STALL_MIN_PREFIX_SAMPLES: usize = 3;
+const LANE_STALL_DEFAULT_MULTIPLIER: f64 = 2.0;
+const LANE_STALL_DEFAULT_WINDOW_SECS: f64 = 60.0;
+const LANE_STALL_CPU_RATIO_LIMIT: f64 = 0.01;
+
+fn is_env_assignment(tok: &str) -> bool {
+    let Some((k, _)) = tok.split_once('=') else {
+        return false;
+    };
+    !k.is_empty()
+        && k.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn token_basename(tok: &str) -> &str {
+    let trimmed = tok.trim_matches(|c| c == '\'' || c == '"');
+    if trimmed.contains('/') {
+        Path::new(trimmed)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(trimmed)
+    } else {
+        trimmed
+    }
+}
+
+/// Normalize a `lane_released` label or raw shell command into a stable command prefix
+/// (e.g. `"norvane: cd foo && cargo test -p xtask"` -> `"cargo test"`).
+pub(crate) fn normalize_command_prefix(raw: &str) -> String {
+    let mut text = raw.trim();
+    if let Some((prefix, rest)) = text.split_once(": ") {
+        if !prefix.is_empty() && !prefix.chars().any(char::is_whitespace) {
+            text = rest.trim();
+        }
+    }
+    let mut chosen_tokens: Vec<String> = Vec::new();
+    for seg in text.split(&[';', '|'][..]).flat_map(|s| s.split("&&")) {
+        let mut iter = seg.split_whitespace().peekable();
+        while let Some(&tok) = iter.peek() {
+            if is_env_assignment(tok) {
+                iter.next();
+            } else {
+                break;
+            }
+        }
+        let Some(first_raw) = iter.next() else {
+            continue;
+        };
+        let first = token_basename(first_raw);
+        if matches!(first, "cd" | "export" | "set" | "true" | ":" | "unset") {
+            continue;
+        }
+        chosen_tokens.push(first.to_string());
+        if let Some(second_raw) = iter.next() {
+            let second = second_raw.trim_matches(|c| c == '\'' || c == '"');
+            if !second.is_empty() && !second.starts_with('-') && !is_env_assignment(second) {
+                chosen_tokens.push(token_basename(second).to_string());
+            }
+        }
+        break;
+    }
+    chosen_tokens.join(" ")
+}
+
+fn percentile_75(samples: &mut [f64]) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_by(f64::total_cmp);
+    if samples.len() == 1 {
+        return Some(samples[0]);
+    }
+    let pos = (samples.len() - 1) as f64 * 0.75;
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    let frac = pos - lo as f64;
+    Some(samples[lo] + (samples[hi] - samples[lo]) * frac)
+}
+
+fn lane_stall_multiplier() -> Option<f64> {
+    let raw = setting("LANE_STALL_MULTIPLIER", "2");
+    if raw.trim() == "0" {
+        return None;
+    }
+    Some(
+        raw.trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|&v| v > 0.0 && v.is_finite())
+            .unwrap_or(LANE_STALL_DEFAULT_MULTIPLIER),
+    )
+}
+
+fn lane_stall_window_secs() -> f64 {
+    let raw = setting("LANE_STALL_WINDOW", "60");
+    raw.trim()
+        .parse::<f64>()
+        .ok()
+        .or_else(|| seconds(&raw).ok())
+        .filter(|&v| v > 0.0 && v.is_finite())
+        .unwrap_or(LANE_STALL_DEFAULT_WINDOW_SECS)
+}
+
+pub(crate) fn lane_stall_threshold_secs(
+    events_path: &Path,
+    repo: &str,
+    command: &str,
+    meta: &Value,
+) -> Option<f64> {
+    let multiplier = lane_stall_multiplier()?;
+    let target_prefix = normalize_command_prefix(command);
+    let mut prefix_samples = Vec::new();
+    let mut repo_samples = Vec::new();
+    if let Ok(f) = File::open(events_path) {
+        let reader = BufReader::new(f);
+        for line in reader.lines().map_while(Result::ok) {
+            if !line.contains("\"lane_released\"") {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if s(&v, "kind") != "lane_released" {
+                continue;
+            }
+            if !repo.is_empty() && s(&v, "repo") != repo {
+                continue;
+            }
+            let Some(held) = v["payload"]["heldSeconds"]
+                .as_f64()
+                .filter(|&h| h > 0.0 && h.is_finite())
+            else {
+                continue;
+            };
+            repo_samples.push(held);
+            if !target_prefix.is_empty()
+                && normalize_command_prefix(s(&v["payload"], "label")) == target_prefix
+            {
+                prefix_samples.push(held);
+            }
+        }
+    }
+    let mut chosen = if prefix_samples.len() >= LANE_STALL_MIN_PREFIX_SAMPLES {
+        prefix_samples
+    } else if !repo_samples.is_empty() {
+        repo_samples
+    } else {
+        return crate::agents::stall_seconds(meta, "accept");
+    };
+    let p75 = percentile_75(&mut chosen)?;
+    Some(p75 * multiplier)
+}
+
+#[derive(Debug, Clone)]
+struct DeepestProc {
+    pid: u32,
+    comm: String,
+    wchan: String,
+}
+
+#[derive(Debug, Clone)]
+struct ProcessTreeSample {
+    total_cpu_ticks: u64,
+    deepest: DeepestProc,
+}
+
+fn clk_tck() -> f64 {
+    let v = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if v > 0 { v as f64 } else { 100.0 }
+}
+
+fn parse_proc_stat_cpu(txt: &str) -> Option<(char, u32, u64)> {
+    let rparen = txt.rfind(')')?;
+    let fields: Vec<&str> = txt.get(rparen + 2..)?.split_whitespace().collect();
+    let state = fields.first()?.chars().next()?;
+    let ppid = fields.get(1)?.parse::<u32>().ok()?;
+    let utime = fields.get(11)?.parse::<u64>().ok()?;
+    let stime = fields.get(12)?.parse::<u64>().ok()?;
+    let cutime = fields.get(13)?.parse::<u64>().unwrap_or(0);
+    let cstime = fields.get(14)?.parse::<u64>().unwrap_or(0);
+    Some((
+        state,
+        ppid,
+        utime
+            .saturating_add(stime)
+            .saturating_add(cutime)
+            .saturating_add(cstime),
+    ))
+}
+
+fn read_proc_comm_wchan(pid: u32) -> (String, String) {
+    let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let wchan = fs::read_to_string(format!("/proc/{pid}/wchan"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if !wchan.is_empty() && wchan != "0" {
+        return (if comm.is_empty() { "?".into() } else { comm }, wchan);
+    }
+    if let Ok(rd) = fs::read_dir(format!("/proc/{pid}/task")) {
+        for ent in rd.flatten() {
+            let tid_path = ent.path();
+            let tw = fs::read_to_string(tid_path.join("wchan"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            if !tw.is_empty() && tw != "0" {
+                let tc = fs::read_to_string(tid_path.join("comm"))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                let final_comm = if !tc.is_empty() {
+                    tc
+                } else if !comm.is_empty() {
+                    comm
+                } else {
+                    "?".into()
+                };
+                return (final_comm, tw);
+            }
+        }
+    }
+    (
+        if comm.is_empty() { "?".into() } else { comm },
+        if wchan.is_empty() { "-".into() } else { wchan },
+    )
+}
+
+fn inspect_process_tree(root_pid: u32) -> Option<ProcessTreeSample> {
+    let mut info: HashMap<u32, (char, u64)> = HashMap::new();
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let Ok(rd) = fs::read_dir("/proc") else {
+        return None;
+    };
+    for ent in rd.flatten() {
+        let Some(name) = ent.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some((state, ppid, ticks)) = parse_proc_stat_cpu(&stat) else {
+            continue;
+        };
+        info.insert(pid, (state, ticks));
+        children.entry(ppid).or_default().push(pid);
+    }
+    if !info.contains_key(&root_pid) {
+        return None;
+    }
+    let mut total_cpu_ticks = 0u64;
+    let mut best: Option<(bool, usize, bool, u32)> = None;
+    let mut queue = VecDeque::new();
+    queue.push_back((root_pid, 0usize));
+    while let Some((pid, depth)) = queue.pop_front() {
+        if let Some(&(state, ticks)) = info.get(&pid) {
+            total_cpu_ticks = total_cpu_ticks.saturating_add(ticks);
+            let non_zombie = state != 'Z';
+            let blocked = matches!(state, 'S' | 'D');
+            let key = (non_zombie, depth, blocked, pid);
+            if best.is_none_or(|b| key > b) {
+                best = Some(key);
+            }
+        }
+        if let Some(kids) = children.get(&pid) {
+            for &kid in kids {
+                queue.push_back((kid, depth + 1));
+            }
+        }
+    }
+    let deepest_pid = best.map(|b| b.3).unwrap_or(root_pid);
+    let (comm, wchan) = read_proc_comm_wchan(deepest_pid);
+    Some(ProcessTreeSample {
+        total_cpu_ticks,
+        deepest: DeepestProc {
+            pid: deepest_pid,
+            comm,
+            wchan,
+        },
+    })
+}
+
+struct LaneStallMonitor {
+    started: Instant,
+    threshold_secs: f64,
+    window_secs: f64,
+    sample_interval: Duration,
+    clk_tck: f64,
+    last_sample: Instant,
+    history: VecDeque<(Instant, u64, Option<u64>)>,
+    warned: bool,
+    run_dir: Option<PathBuf>,
+    run_id: String,
+    repo: String,
+    run_name: String,
+    command: String,
+}
+
+impl LaneStallMonitor {
+    fn new(
+        root_pid: u32,
+        run_dir: Option<&Path>,
+        repo: &str,
+        command: &str,
+    ) -> Option<Self> {
+        let meta = run_dir
+            .map(|r| json(r.join("meta.json")))
+            .unwrap_or(Value::Null);
+        let threshold_secs =
+            lane_stall_threshold_secs(&crate::events::events_path(), repo, command, &meta)?;
+        let window_secs = lane_stall_window_secs();
+        let sample_interval = Duration::from_secs_f64((window_secs / 4.0).clamp(0.05, 2.0));
+        let now = Instant::now();
+        let mut history = VecDeque::new();
+        if let Some(sample) = inspect_process_tree(root_pid) {
+            let active = run_dir.and_then(crate::cmd_out::read_active_bytes);
+            history.push_back((now, sample.total_cpu_ticks, active));
+        }
+        let run_id = run_dir
+            .map(|r| crate::events::run_id_for(r, &meta))
+            .unwrap_or_default();
+        let run_name = s(&meta, "name").to_string();
+        Some(Self {
+            started: now,
+            threshold_secs,
+            window_secs,
+            sample_interval,
+            clk_tck: clk_tck(),
+            last_sample: now,
+            history,
+            warned: false,
+            run_dir: run_dir.map(Path::to_path_buf),
+            run_id,
+            repo: repo.to_string(),
+            run_name,
+            command: command.to_string(),
+        })
+    }
+
+    fn poll(&mut self, root_pid: u32) {
+        if self.last_sample.elapsed() < self.sample_interval {
+            return;
+        }
+        let now = Instant::now();
+        self.last_sample = now;
+        let Some(sample) = inspect_process_tree(root_pid) else {
+            return;
+        };
+        let active_bytes = self
+            .run_dir
+            .as_deref()
+            .and_then(crate::cmd_out::read_active_bytes);
+        self.history
+            .push_back((now, sample.total_cpu_ticks, active_bytes));
+        while self.history.len() > 2
+            && now.duration_since(self.history[1].0).as_secs_f64() >= self.window_secs
+        {
+            self.history.pop_front();
+        }
+        let Some(&(old_at, old_ticks, old_active)) = self.history.front() else {
+            return;
+        };
+        let window_elapsed = now.duration_since(old_at).as_secs_f64();
+        if window_elapsed < self.window_secs {
+            return;
+        }
+        let cpu_delta_secs =
+            sample.total_cpu_ticks.saturating_sub(old_ticks) as f64 / self.clk_tck;
+        let cpu_low = (cpu_delta_secs / window_elapsed) < LANE_STALL_CPU_RATIO_LIMIT;
+        let active_unchanged = match (old_active, active_bytes) {
+            (Some(old), Some(cur)) => old == cur,
+            (None, None) => true,
+            _ => false,
+        };
+        let stalled_now = cpu_low && active_unchanged;
+        let elapsed_secs = self.started.elapsed().as_secs_f64();
+        if stalled_now && elapsed_secs >= self.threshold_secs {
+            if !self.warned {
+                self.emit_warning(&sample.deepest, elapsed_secs, window_elapsed);
+                self.warned = true;
+            }
+        } else if !stalled_now && self.warned {
+            if let Some(ref run) = self.run_dir {
+                clear_stall_warning_for_kind(run, "lane");
+            }
+            self.warned = false;
+        }
+    }
+
+    fn emit_warning(&self, proc: &DeepestProc, elapsed_secs: f64, window_elapsed: f64) {
+        let elapsed_u64 = elapsed_secs.round() as u64;
+        let window_u64 = window_elapsed.round().max(1.0) as u64;
+        let threshold_u64 = self.threshold_secs.round() as u64;
+        eprintln!(
+            "delegate lane: 疑似卡住（pid={} comm={} wchan={}，已运行 {}s，近 {}s 无明显 CPU/输出进展；不会自动终止）",
+            proc.pid, proc.comm, proc.wchan, elapsed_u64, window_u64
+        );
+        let Some(ref run) = self.run_dir else {
+            return;
+        };
+        let at = iso();
+        let detail = format!(
+            "pid={} comm={} wchan={}，已运行 {}s（近 {}s CPU <1% 且无新输出）",
+            proc.pid, proc.comm, proc.wchan, elapsed_u64, window_u64
+        );
+        let seq = crate::events::emit(
+            &self.run_id,
+            &self.repo,
+            "stall_warning",
+            json!({
+                "name": self.run_name,
+                "stallKind": "lane",
+                "cmd": clip(&self.command, 120),
+                "pid": proc.pid,
+                "comm": proc.comm,
+                "wchan": proc.wchan,
+                "elapsedSeconds": elapsed_u64,
+                "windowSeconds": window_u64,
+                "thresholdSeconds": threshold_u64,
+                "detail": detail,
+            }),
+        );
+        let mut warning = json!({
+            "kind": "lane",
+            "cmd": clip(&self.command, 180),
+            "pid": proc.pid,
+            "comm": proc.comm,
+            "wchan": proc.wchan,
+            "elapsedSeconds": elapsed_u64,
+            "windowSeconds": window_u64,
+            "thresholdSeconds": threshold_u64,
+            "detail": detail,
+            "at": at,
+        });
+        if let Some(seq_num) = seq {
+            warning["seq"] = json!(seq_num);
+        }
+        write_stall_warning_for_kind(run, "lane", &warning);
+        crate::supervise::log_event(
+            run,
+            json!({
+                "e": "stall_warning",
+                "kind": "lane",
+                "cmd": clip(&self.command, 180),
+                "pid": proc.pid,
+                "comm": proc.comm,
+                "wchan": proc.wchan,
+                "elapsedSeconds": elapsed_u64,
+                "windowSeconds": window_u64,
+                "thresholdSeconds": threshold_u64,
+                "detail": detail,
+                "at": at,
+            }),
+        );
+    }
+}
+
+impl Drop for LaneStallMonitor {
+    fn drop(&mut self) {
+        if self.warned {
+            if let Some(ref run) = self.run_dir {
+                clear_stall_warning_for_kind(run, "lane");
+            }
+        }
     }
 }
 
@@ -1770,5 +2251,123 @@ mod tests {
         });
         let line_null = crate::events::format_human(&ev_null);
         assert!(line_null.contains("(持 1s)"), "line_null={line_null}");
+    }
+
+    #[test]
+    fn normalize_command_prefix_and_threshold_from_history() {
+        assert_eq!(
+            normalize_command_prefix("norvane: cd crates && cargo test -p xtask"),
+            "cargo test"
+        );
+        assert_eq!(
+            normalize_command_prefix("RUST_LOG=debug ./scripts/verify.sh --fast"),
+            "verify.sh"
+        );
+        assert_eq!(
+            normalize_command_prefix("python3 scripts/run-tests.py -k lane"),
+            "python3 run-tests.py"
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "delegate-lane-hist-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let ev_path = dir.join("events.jsonl");
+
+        // Cold start (no events file): falls back to stall_seconds(meta, "accept").
+        let meta = json!({"stall": {"accept": "45s"}});
+        assert_eq!(
+            lane_stall_threshold_secs(&ev_path, "/repo/a", "cargo test -p foo", &meta),
+            Some(45.0)
+        );
+
+        // Seed 3 prefix-matching events (10, 20, 30 -> p75 = 25) and 1 other-prefix event (200).
+        let lines = [
+            json!({"kind":"lane_released","repo":"/repo/a","payload":{"label":"a: cargo test -p x","heldSeconds":10.0}}),
+            json!({"kind":"lane_released","repo":"/repo/a","payload":{"label":"a: cargo test -p y","heldSeconds":20.0}}),
+            json!({"kind":"lane_released","repo":"/repo/a","payload":{"label":"a: cargo test -p z","heldSeconds":30.0}}),
+            json!({"kind":"lane_released","repo":"/repo/a","payload":{"label":"a: pnpm build","heldSeconds":200.0}}),
+            json!({"kind":"lane_released","repo":"/repo/b","payload":{"label":"b: cargo test","heldSeconds":999.0}}),
+        ];
+        let body = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&ev_path, body).unwrap();
+
+        // Prefix match (>=3 samples): p75(10, 20, 30) = 25 * 2 = 50.
+        let t_prefix =
+            lane_stall_threshold_secs(&ev_path, "/repo/a", "cargo test -p xtask", &meta).unwrap();
+        assert!((t_prefix - 50.0).abs() < 1e-6, "t_prefix={t_prefix}");
+
+        // Insufficient prefix samples (<3 for pnpm build): falls back to all repo /repo/a samples (10, 20, 30, 200).
+        // pos = 3 * 0.75 = 2.25 => 30 + (200 - 30) * 0.25 = 72.5; * 2 = 145.0.
+        let t_fallback =
+            lane_stall_threshold_secs(&ev_path, "/repo/a", "pnpm build", &meta).unwrap();
+        assert!((t_fallback - 145.0).abs() < 1e-6, "t_fallback={t_fallback}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inspect_process_tree_finds_deepest_blocked_child() {
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 20"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sh sleep");
+        let root_pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut found = None;
+        while Instant::now() < deadline {
+            if let Some(sample) = inspect_process_tree(root_pid) {
+                if sample.deepest.pid != root_pid && sample.deepest.comm == "sleep" {
+                    found = Some(sample);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let sample = found.expect("expected deepest child to be sleep");
+        assert_eq!(sample.deepest.comm, "sleep");
+        assert!(!sample.deepest.wchan.is_empty());
+        assert_ne!(sample.deepest.wchan, "-");
+    }
+
+    #[test]
+    fn stall_warning_kind_isolation() {
+        let dir = std::env::temp_dir().join(format!(
+            "delegate-stall-iso-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(write_stall_warning_for_kind(
+            &dir,
+            "lane",
+            &json!({"kind": "lane", "pid": 42})
+        ));
+        // A different kind must not overwrite an active lane warning.
+        assert!(!write_stall_warning_for_kind(
+            &dir,
+            "command",
+            &json!({"kind": "command"})
+        ));
+        assert_eq!(s(&json(dir.join("stall-warning.json")), "kind"), "lane");
+        // Clearing a different kind must not remove the lane warning.
+        clear_stall_warning_for_kind(&dir, "command");
+        assert!(dir.join("stall-warning.json").is_file());
+        // Clearing matching kind removes it.
+        clear_stall_warning_for_kind(&dir, "lane");
+        assert!(!dir.join("stall-warning.json").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

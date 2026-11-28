@@ -2293,7 +2293,7 @@ pub fn run_agent_cancellable(
                     state.command_output_at = Some(Instant::now());
                     state.command_output_queued = queued;
                     if state.command_warned_at.take().is_some() {
-                        let _ = fs::remove_file(runpath.join("stall-warning.json"));
+                        clear_stall_warning_for_kind(&runpath, "command");
                     }
                 }
             }
@@ -2325,7 +2325,7 @@ pub fn run_agent_cancellable(
                         "detail": detail,
                         "at": at,
                     });
-                    let _ = write_json(runpath.join("stall-warning.json"), &warning);
+                    write_stall_warning_for_kind(&runpath, "idle", &warning);
                     if let Ok(mut log) = OpenOptions::new()
                         .create(true)
                         .append(true)
@@ -2377,7 +2377,7 @@ pub fn run_agent_cancellable(
                         "detail": detail,
                         "at": at,
                     });
-                    let _ = write_json(runpath.join("stall-warning.json"), &warning);
+                    write_stall_warning_for_kind(&runpath, "command", &warning);
                     if let Ok(mut log) = OpenOptions::new()
                         .create(true)
                         .append(true)
@@ -2679,7 +2679,7 @@ pub fn run_agent_cancellable(
                     state.command_output_at = Some(Instant::now());
                     state.command_output_queued = lane::queued_seconds(run);
                     if state.command_warned_at.take().is_some() {
-                        let _ = fs::remove_file(run.join("stall-warning.json"));
+                        clear_stall_warning_for_kind(run, "command");
                     }
                     changed.notify_one();
                 }
@@ -2695,7 +2695,7 @@ pub fn run_agent_cancellable(
                     let mut state = mutex.lock().unwrap();
                     state.last = Instant::now();
                     if state.idle_warned_at.take().is_some() {
-                        let _ = fs::remove_file(run.join("stall-warning.json"));
+                        clear_stall_warning_for_kind(run, "idle");
                     }
                     if kind == "bash" {
                         let now = Instant::now();
@@ -2710,7 +2710,7 @@ pub fn run_agent_cancellable(
                         state.command_stderr_log = file_fingerprint(&run.join("stderr.log"));
                         state.command = s(&item, "cmd").to_string();
                         if state.command_warned_at.take().is_some() {
-                            let _ = fs::remove_file(run.join("stall-warning.json"));
+                            clear_stall_warning_for_kind(run, "command");
                         }
                     } else if kind == "bash_done" {
                         state.commands = (state.commands - 1).max(0);
@@ -2718,7 +2718,7 @@ pub fn run_agent_cancellable(
                             state.command_started = None;
                             state.command_output_at = None;
                             if state.command_warned_at.take().is_some() {
-                                let _ = fs::remove_file(run.join("stall-warning.json"));
+                                clear_stall_warning_for_kind(run, "command");
                             }
                         }
                         if !state.command.is_empty() {

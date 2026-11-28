@@ -1016,6 +1016,104 @@ fn until_finished(run: &Path, poll: f64) {
         }
     }
 }
+fn stall_warning_key(sw: &serde_json::Value) -> String {
+    if let Some(seq) = sw["seq"].as_u64() {
+        return format!("seq:{seq}");
+    }
+    let at = s(sw, "at");
+    if !at.is_empty() {
+        return format!("at:{at}");
+    }
+    format!("kind:{}:{}", s(sw, "kind"), s(sw, "detail"))
+}
+
+fn check_new_stall_warning(
+    run: &Path,
+    machine: bool,
+    reported_stalls: &mut std::collections::HashMap<PathBuf, String>,
+) -> Option<serde_json::Value> {
+    let path = run.join("stall-warning.json");
+    if !path.is_file() {
+        return None;
+    }
+    let sw = json(&path);
+    if !sw.is_object() {
+        return None;
+    }
+    if !machine && s(&sw, "kind") != "lane" {
+        return None;
+    }
+    let key = stall_warning_key(&sw);
+    if reported_stalls.get(run).is_some_and(|k| k == &key) {
+        return None;
+    }
+    let marker = run.join(".stall-warning-reported");
+    if read(&marker).trim() == key {
+        reported_stalls.insert(run.to_path_buf(), key);
+        return None;
+    }
+    let _ = write(&marker, format!("{key}\n"));
+    reported_stalls.insert(run.to_path_buf(), key);
+    Some(sw)
+}
+
+fn format_wait_stall_warning(run: &Path, sw: &serde_json::Value, next: &str) -> String {
+    let run_id = run
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let meta = json(run.join("meta.json"));
+    let name = s(&meta, "name");
+    let pid = sw["pid"].as_u64();
+    let suggestion = if let Some(p) = pid {
+        format!(
+            "{} reply {run_id} \"...\" 或查看进程 ps -fp {p} / {} status {run_id}",
+            script().display(),
+            script().display()
+        )
+    } else {
+        format!(
+            "{} reply {run_id} \"...\" 或 {} status {run_id}",
+            script().display(),
+            script().display()
+        )
+    };
+    if output::json_enabled() {
+        let mut obj = json!({
+            "event": "stall_warning",
+            "run": run_id,
+            "name": name,
+            "state": runs::state(run),
+            "stallWarning": sw,
+            "next": next,
+            "suggestion": suggestion,
+        });
+        if let Some(p) = pid {
+            obj["pid"] = json!(p);
+        }
+        return obj.to_string();
+    }
+    let name_part = if name.is_empty() {
+        String::new()
+    } else {
+        format!("（{name}）")
+    };
+    let proc_info = output::format_stall_proc(sw);
+    let det = s(sw, "detail");
+    if !proc_info.is_empty() {
+        let det_part = if det.is_empty() {
+            String::new()
+        } else {
+            format!("（{det}）")
+        };
+        format!("⚠ 疑似卡住 {run_id}{name_part}：{proc_info}{det_part} · 下一步：{suggestion}")
+    } else {
+        let body = if det.is_empty() { s(sw, "kind") } else { det };
+        format!("⚠ 疑似卡住 {run_id}{name_part}：{body} · 下一步：{suggestion}")
+    }
+}
+
 /// `wait --any` reports the runs finished when the first one ends; `wait --stream` prints one
 /// outcome line per run as each ends and exits once none is left. A stream started without
 /// run arguments also picks up runs this caller starts while it waits.
@@ -1025,6 +1123,7 @@ fn wait_each(
     rescan: Option<(&[String], &[String])>,
     max: Option<f64>,
     stream: bool,
+    machine: bool,
     show_progress: bool,
     full: bool,
     show_result: bool,
@@ -1053,6 +1152,7 @@ fn wait_each(
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let mut watched = std::collections::HashSet::new();
     let mut reported = std::collections::HashSet::new();
+    let mut reported_stalls = std::collections::HashMap::<PathBuf, String>::new();
     let mut code = 0;
     let mut delivered = false;
     loop {
@@ -1224,6 +1324,21 @@ fn wait_each(
         if pending.is_empty() {
             break;
         }
+        let mut stall_emitted = false;
+        for run in &pending {
+            if runs::active(&runs::state(run)) {
+                if let Some(sw) = check_new_stall_warning(run, machine, &mut reported_stalls) {
+                    println!("{}", format_wait_stall_warning(run, &sw, next));
+                    stall_emitted = true;
+                    if !stream {
+                        break;
+                    }
+                }
+            }
+        }
+        if stall_emitted && !stream {
+            break;
+        }
         let left = max.map(|m| m - begin.elapsed().as_secs_f64());
         if left.is_some_and(|l| l <= 0.0) {
             for run in list
@@ -1252,6 +1367,8 @@ fn wait_each(
             }
         }
         let mut wake = left;
+        let stall_poll = poll.min(1.0);
+        wake = Some(wake.map_or(stall_poll, |l| l.min(stall_poll)));
         if show_progress {
             wake = Some(wake.map_or(poll, |l| l.min(poll)));
         }
@@ -3423,6 +3540,7 @@ fn main_inner(args: &[String]) -> Res<i32> {
                     pos.is_empty().then_some((pos.as_slice(), flags.as_slice())),
                     max,
                     stream,
+                    has(&flags, "--machine"),
                     has(&flags, "--progress"),
                     has(&flags, "--full"),
                     !has(&flags, "--no-result"),
